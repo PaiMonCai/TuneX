@@ -1,6 +1,6 @@
 /**
  * Worker —— BullMQ 队列 + 10 个 cron 任务
- * 依据: relayx-worker-cross-validation-report.md §cron 任务表
+ * 依据: worker-cross-validation-report.md §cron 任务表
  *
  * 任务名单（原版确认为 10 个）：
  *   cron_delete_tunnel_traffic   0 0 * * *        过期流量清理
@@ -14,7 +14,8 @@
  *   cron_reset_table_order       重置表排序
  *   cron_push_node_config        推送节点配置
  *
- * W1 仅注册任务骨架与调度（handler 打日志 + 计数），业务逻辑在 W2-W5 填充。
+ * 全部 10 个 cron 任务均已注册调度；各 handler 当前为占位实现（仅打日志/计数），
+ * 真正的业务逻辑（流量入库、DNS 同步、自动续费等）待后续迭代补齐。
  */
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
@@ -36,29 +37,29 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
-const queue = new Queue("relayx-cron", { connection });
+const queue = new Queue("tunex-cron", { connection });
 
 const worker = new Worker(
-  "relayx-cron",
+  "tunex-cron",
   async (job: Job) => {
     const started = Date.now();
     switch (job.name) {
       case "cron_save_traffic": {
-        // W4 实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany
+        // 待实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany
         const pending = await redis.keys("tunnel:traffic:*");
-        return { pending: pending.length, note: "W4: buffer→DB" };
+        return { pending: pending.length, note: "buffer→DB" };
       }
       case "cron_delete_tunnel_traffic": {
-        // W4 实现：按 TUNNEL_TRAFFIC_RETENTION_DAYS 清理
+        // 待实现：按 TUNNEL_TRAFFIC_RETENTION_DAYS 清理
         const days = await db.systemConfig.findUnique({ where: { name: "TUNNEL_TRAFFIC_RETENTION_DAYS" } });
         return { retention_days: days?.value ?? "30" };
       }
       case "cron_push_node_config":
-        return { nodes: await db.node.count(), note: "W3: sha256 增量推送" };
+        return { nodes: await db.node.count(), note: "sha256 incremental push" };
       case "cron_update_agent":
         return { auto_update: await db.systemConfig.findUnique({ where: { name: "AUTO_UPDATE_AGENT" } }) };
       default:
-        return { note: "W1 skeleton", ms: Date.now() - started };
+        return { note: "cron handler not yet implemented", ms: Date.now() - started };
     }
   },
   { connection, concurrency: 5 },

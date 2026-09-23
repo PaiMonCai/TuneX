@@ -1,6 +1,6 @@
 /**
  * BEPUSDT 网关 —— USDT-TRC20 链上支付
- * 依据: relayx-pay-channel-analysis-report.md §3（源码级还原）
+ * 依据: pay-channel-analysis-report.md §3（源码级还原）
  *
  * 已按源码确认实现的部分：
  *   · 签名：与 EPay 同款 MD5(k=v&...+apiKey)，承载字段名为 `signature`
@@ -10,9 +10,9 @@
  *   · 回调成功状态：`status === 2`（已支付），应答文本 `ok`
  *   · 关单：`/api/v1/order/cancel-transaction`，容忍「状态不允许取消」
  *
- * TODO（待抓包/对接实测确认，不影响接口契约）：
- *   - [ ] 回调 POST 的真实 Content-Type（报告为 JSON body，需抓包确认是否 form）
- *   - [ ] 回调中金额字段名（推断为 `amount`，需抓包确认；确认后开启 amount_checked）
+ * 对接实测待确认项（不改变接口契约）：
+ *   - [ ] 回调 POST 的真实 Content-Type（报告为 JSON body，需实测确认是否 form）
+ *   - [ ] 回调中金额字段名（推断为 `amount`，需实测确认；确认后开启 amount_checked）
  *   - [ ] create-order 响应中 `data.payment_url` 与 `data.trade_id` 的字段命名
  *   - [ ] 是否存在签名时间戳/nonce 防重放字段
  */

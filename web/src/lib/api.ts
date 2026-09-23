@@ -94,7 +94,7 @@ function applyMockSessionCookie(session: AuthSession | null): void {
 /** 退出登录：清掉会话 cookie（两种模式都要做，mock 下没有后端清 cookie） */
 export function clearMockSessionCookie(): void {
   if (typeof document === "undefined") return;
-  document.cookie = "relayx_session=; Path=/; Max-Age=0; SameSite=Lax";
+  document.cookie = "tunex_session=; Path=/; Max-Age=0; SameSite=Lax";
 }
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {

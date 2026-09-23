@@ -3,11 +3,11 @@
 // It connects to the control plane over Engine.IO v4 / Socket.IO (the `register`
 // / `sysinfo` / `listen` events), receives a Fernet-encrypted gost config on the
 // `config` event, and runs the described listeners/forwarders. It is a clean-room
-// re-implementation of the original relayx-agent v0.13.22, built to interoperate
-// with the relayx-clone server (see ../../ docker-compose.yaml).
+// re-implementation of the original tunex-agent v0.13.22, built to interoperate
+// with the tunex-clone server (see ../../ docker-compose.yaml).
 //
 // Wire facts this agent relies on (all verified against the original binary and
-// the relayx-clone server code, see the repo reports):
+// the tunex-clone server code, see the repo reports):
 //
 //   - Engine.IO v4 open packet: 0{"sid":..,"pingInterval":..,"pingTimeout":..}
 //   - Socket.IO CONNECT:       40{"token":"<node_group.token>"}
@@ -34,9 +34,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/relayx/agent/internal/agent"
-	"github.com/relayx/agent/internal/agentconfig"
-	"github.com/relayx/agent/internal/logx"
+	"github.com/tunex/agent/internal/agent"
+	"github.com/tunex/agent/internal/agentconfig"
+	"github.com/tunex/agent/internal/logx"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=..".

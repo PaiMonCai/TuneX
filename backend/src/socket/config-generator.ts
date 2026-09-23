@@ -7,17 +7,17 @@
  * `getInNodeConfig` / `getOutNodeConfig` 输出**形状与字节**。
  *
  * ── 权威依据 ──
- *  · 原版服务端反编译源：`/tmp/relayx_src2/src__services__tunnel.ts`
+ *  · 原版服务端反编译源：`tunnel.ts`
  *    （`pushNodeConfig` / `getInNodeConfig` / `getOutNodeConfig` /
  *      `filterAvailableTunnels` / `computeAllLimits` / `getConnectIP` /
  *      `getTunnelChainsFromTunnel`）
  *  · agent 二进制实测：`WAIT_LISTEN` 占位符解析、`4x["config","<fernet>"]` 裸字符串载荷
- *    （`/tmp/relayx-agent-reports/01-config-e2e.md`）
+ *    （`config-e2e.md`）
  *
  * ── 三条硬约束（违反任一条 → 原版 agent 进程级 panic）──
  *  ① `42["config","<密文>"]` 载荷是**裸字符串**，不是数组。本模块只产出**明文配置对象**
  *     （{@link generateNodeConfig}），加密与帧封装交给 `crypto/node-config.ts`
- *     （`encryptNodeConfig` / `buildConfigFrame`）以及 W2 的 config-pusher。
+ *     （`encryptNodeConfig` / `buildConfigFrame`）以及 config-pusher。
  *  ② 入口（in）节点的 `observers` **必须非空**。本模块恒注入指向 `${SITE_URL}/api/tunnel/observer`
  *     的 default observer。出口（out）节点配置**原版不带 `observers` 字段**（见下）。
  *  ③ `WAIT_LISTEN` 后**紧跟端口段、不带花括号**：`:WAIT_LISTEN20000-30000`。
@@ -123,7 +123,7 @@ export interface AvailableUser {
  * 参与配置生成的隧道。字段全部取自 `tunnel` 表（含需要的关系展开）。
  * JSON 列（`listen_protocol` / `forward_addresses` / `forward_addresses_protocol`）
  * 用 `unknown` 承载 —— 本模块做形态归一化（既支持原版的**对象**形态，
- * 也支持 W1 隧道接口写入的**字符串数组**形态）。
+ * 也支持 Tunnel interface写入的**字符串数组**形态）。
  */
 export interface AvailableTunnel {
   id: number;
@@ -219,7 +219,7 @@ export interface ForwardAddress {
 /**
  * 归一化 `forward_addresses`。
  *  · 原版：`[{ address, host?, weight }]`
- *  · W1 隧道接口：`["host:port", ...]`（weight 缺省 1）
+ *  · Tunnel interface：`["host:port", ...]`（weight 缺省 1）
  */
 export function normalizeForwardAddresses(v: unknown): ForwardAddress[] {
   if (!Array.isArray(v)) return [];
@@ -252,7 +252,7 @@ export interface ProtocolInfo {
 /**
  * 归一化 `forward_addresses_protocol` / `listen_protocol` 的**类型段**。
  *  · 原版：`{ type, username?, password? }`
- *  · W1 隧道接口：`["tcp"]` / `"tcp"`（取首个字符串作为 type）
+ *  · Tunnel interface：`["tcp"]` / `"tcp"`（取首个字符串作为 type）
  */
 export function normalizeProtocol(v: unknown): ProtocolInfo {
   if (v === null || v === undefined) return {};
@@ -294,7 +294,7 @@ export type ForwarderMode = "plain" | "proxy";
  * 判定转发模式（原版 `!forwarder_addresses_protocol?.type ? dict-forwarder : hop-forwarder`）。
  *
  *  · **对象形态**（原版 / 手工导入）：完全照搬原版 —— `{type}` 非空即视为代理转发。
- *  · **数组 / 字符串形态**（W1 `routes/tunnels.ts` 写入的 `[tunnel_type]`）：该形态语义是
+ *  · **数组 / 字符串形态**（tunnel route write `[tunnel_type]`）：该形态语义是
  *    「每个转发地址的传输类型」，**不是**上游代理；仅当其值为已知代理协议时才走代理，
  *    否则按标准 L4 `forwarder` 处理（否则会丢掉 agent 实际路由所需的 forwarder 字典）。
  */
@@ -357,7 +357,7 @@ export function waitListenAddr(prefix: string, portRange: string | null | undefi
 }
 
 /* ================================================================== */
-/* 工具：uuid v5（relayx dialer metadata.key 用）                      */
+/* 工具：uuid v5（tunex dialer metadata.key 用）                        */
 /* ================================================================== */
 
 function uuidToBytes(uuid: string): Buffer {
@@ -654,7 +654,7 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
           },
           dialer: {
             type: tunnel.tunnel_type,
-            ...(tunnel.tunnel_type === TunnelType.relayx
+            ...(tunnel.tunnel_type === TunnelType.tunex
               ? { metadata: { key: uuidv5(input.siteUrl), host: safeHost(input.siteUrl) } }
               : undefined),
           },
@@ -1033,7 +1033,7 @@ export function buildOutNodeConfig(input: OutConfigInput): NodeConfig {
         type: tunnelType,
         metadata: {
           ...(tunnelType === TunnelType.udp ? { keepalive: true } : undefined),
-          ...(tunnelType === TunnelType.relayx ? { key: uuidv5(input.siteUrl) } : undefined),
+          ...(tunnelType === TunnelType.tunex ? { key: uuidv5(input.siteUrl) } : undefined),
         },
       },
     } as ServiceConfig);
@@ -1059,7 +1059,7 @@ export function buildOutNodeConfig(input: OutConfigInput): NodeConfig {
         connector: { type: "relay", metadata: { nodelay: true } },
         dialer: {
           type: tunnel.tunnel_type,
-          ...(tunnel.tunnel_type === TunnelType.relayx
+          ...(tunnel.tunnel_type === TunnelType.tunex
             ? { metadata: { key: uuidv5(input.siteUrl), host: safeHost(input.siteUrl) } }
             : undefined),
         },

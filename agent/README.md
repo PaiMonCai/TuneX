@@ -1,17 +1,17 @@
 # TuneX agent (`agent/`)
 
 Go node agent for the TuneX control plane. It is a from-scratch,
-**standard-library-only** re-implementation of the original `relayx-agent`
+**standard-library-only** re-implementation of the original `tunex-agent`
 v0.13.22: it speaks the same Engine.IO v4 / Socket.IO control protocol, decrypts
 the same Fernet-encrypted gost config, and reports the same `register`/`sysinfo`
-payloads, so it interoperates with the `relayx-clone` server unchanged.
+payloads, so it interoperates with the `tunex-clone` server unchanged.
 
 ## Build
 
 ```bash
 cd agent
 go build -o tunex-agent .          # no third-party modules; works offline
-go test ./...                       # unit tests (fernet / relayx token / smux / config)
+go test ./...                       # unit tests (fernet / tunex token / smux / config)
 ```
 
 ## Run
@@ -23,8 +23,8 @@ go test ./...                       # unit tests (fernet / relayx token / smux /
 
 All original flags are supported (`-s/-t` required; `-n -i -l -r -o -I -d
 --pprof-port` and the nine per-protocol port flags; `-v` prints the version).
-A flat `$HOME/.relayx-agent.yaml` (or `--config`) is read for defaults; explicit
-flags override it. `RELAYX_SERVER` and `RELAYX_TOKEN` are honoured as env
+A flat `$HOME/.tunex-agent.yaml` (or `--config`) is read for defaults; explicit
+flags override it. `TUNEX_SERVER` and `TUNEX_TOKEN` are honoured as env
 overrides.
 
 Two per-installation keys are required and have no built-in default:
@@ -35,9 +35,9 @@ export TUNEX_LICENSE_KEY="<your install license key>"  # verifies the register A
 ```
 
 Both are 32-byte base64url Fernet keys generated per deployment by the TuneX
-control plane. The legacy names `RELAYX_CONFIG_KEY` and `RELAYX_LICENSE_KEY`
-are still accepted as a fallback while migrating an existing install. An agent
-started without either key exits immediately instead of using a shared default.
+control plane. There is no legacy fallback: the `TUNEX_CONFIG_KEY` and
+`TUNEX_LICENSE_KEY` variables are the only names consulted. An agent started
+without either key exits immediately instead of using a shared default.
 
 ## What it does
 
@@ -65,7 +65,7 @@ started without either key exits immediately instead of using a shared default.
 | `internal/netutil` | `/proc` metrics, public-IP detection, free-port/range |
 | `internal/engine` | gost config model + listener/forwarder runtime |
 | `internal/mux` | xtaci/smux v1 stream multiplexing |
-| `internal/relayx` | relayx tunnel: HKDF auth, 56-byte token, WS handshake |
+| `internal/tunex` | tunex tunnel: HKDF auth, 56-byte token, WS handshake |
 
 ## Wire facts worth remembering
 
@@ -75,16 +75,16 @@ started without either key exits immediately instead of using a shared default.
 - the Socket.IO CONNECT packet for the default namespace omits the `/` prefix.
 - the license `expired_at` is an int64 Unix timestamp; `site_url` must equal the
   agent's `-s` value byte-for-byte.
-- the relayx tunnel token is exactly **56 bytes** (`nonce[16] ‖ unixNano[8] BE ‖
+- the tunex tunnel token is exactly **56 bytes** (`nonce[16] ‖ unixNano[8] BE ‖
   HMAC-SHA256(authKey, nonce‖ts)[32]`), `authKey = HKDF-SHA256(secret,
-  info="relayx-auth-v1")`, accepted within a ±300 s window.
+  info="tunex-auth-v1")`, accepted within a ±300 s window.
 
 ## Notes / limits
 
 - Auto-upgrade (the `upgrade` event) is intentionally a logged no-op: the
   original verifies a minisign signature before replacing its own binary, which
   is a remote-code-execution surface. Wire it in deliberately if required.
-- The `relayx` dialer/listener packages cover the WebSocket + Bearer-token +
+- The `tunex` dialer/listener packages cover the WebSocket + Bearer-token +
   smux layer. `uTLS` / `REALITY` / `mieru` / WireGuard / QUIC carrier wrapping is
   not implemented (they require large third-party forks).
 - `traffic_*` metrics use cumulative interface counters from `/proc/net/dev` as a

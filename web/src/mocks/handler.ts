@@ -41,7 +41,7 @@ export interface MockResponse {
   body: unknown;
 }
 
-const SESSION_COOKIE = "relayx_session";
+const SESSION_COOKIE = "tunex_session";
 const GB = 1024 * 1024 * 1024;
 
 /** 会话 cookie 值：`u<id>` 指定用户；用 id 而非邮箱，避免用户改邮箱后会话失效 */
@@ -325,7 +325,7 @@ function adminStats(db: Store) {
         .toFixed(2),
     ),
     today_traffic: seed.mockTrafficPoints[seed.mockTrafficPoints.length - 1]?.traffic ?? 0,
-    tunnel_type_distribution: ["tcp", "mtcp", "udp", "relayx", "mtls", "mwss", "wss", "tls", "quic"].map((type) => ({
+    tunnel_type_distribution: ["tcp", "mtcp", "udp", "tunex", "mtls", "mwss", "wss", "tls", "quic"].map((type) => ({
       type,
       count: db.tunnels.filter((t) => t.tunnel_type === type).length,
     })),

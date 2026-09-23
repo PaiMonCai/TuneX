@@ -45,9 +45,9 @@ export interface MockStore {
   boot_at: string;
 }
 
-const STORE_KEY = "__relayx_mock_store_v1__";
+const STORE_KEY = "__tunex_mock_store_v1__";
 
-type GlobalWithStore = typeof globalThis & { __relayx_mock_store_v1__?: MockStore };
+type GlobalWithStore = typeof globalThis & { __tunex_mock_store_v1__?: MockStore };
 
 function clone<T>(value: T): T {
   return structuredClone(value);

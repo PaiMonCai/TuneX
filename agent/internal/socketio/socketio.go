@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/relayx/agent/internal/ws"
+	"github.com/tunex/agent/internal/ws"
 )
 
 // Packet type constants.
@@ -243,7 +243,7 @@ func (c *Client) Done() <-chan struct{} { return c.closed }
 
 // pingLoop replies to engine.io pings (type '2') with pongs ('3') and keeps the
 // read side fresh. It is conservative: it does not send unsolicited pings
-// because the relayx-clone Socket.IO server sends its own pings.
+// because the tunex-clone Socket.IO server sends its own pings.
 func (c *Client) pingLoop() {
 	interval := time.Duration(c.open.PingInterval) * time.Millisecond
 	if interval <= 0 {

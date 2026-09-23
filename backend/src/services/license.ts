@@ -10,8 +10,8 @@ export interface LicenseInfo {
 }
 
 /**
- * License 服务（W1 简化版）
- * 原版从远程 LICENSE_URL 拉取并缓存 Redis；W1 用 env + Redis 覆盖模拟，
+ * License 服务
+ * 原版从远程 LICENSE_URL 拉取并缓存 Redis；本实现用 env + Redis 覆盖模拟，
  * 保留 getLicense / isBusinessLicense / businessLicenseRequired 的语义。
  */
 class LicenseService {

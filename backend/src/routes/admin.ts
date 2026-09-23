@@ -1,5 +1,5 @@
 /**
- * 管理端路由（W1 骨架）
+ * 管理端路由
  * 全部挂载在 /api/admin/* 之下，由 app.ts 统一施加
  *   adminRequired → adminPermissionGuard
  * 具体资源路径需与 permissions.ts 的 apiPrefixes 对齐，否则 fail-closed 403。

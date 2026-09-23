@@ -212,7 +212,7 @@ enum TunnelType {
   tcp
   mtcp
   udp
-  relayx
+  tunex
   mtls
   mwss
   wss
@@ -699,8 +699,8 @@ model DNSProvider {
   @@map("dns_provider")
 }
 
-/// W1 新增：密码凭证表。
-/// 原版 `user` 表无密码列（Stack Auth 托管），本复刻自实现 JWT 需本地凭证，
+/// 密码凭证表。
+/// 原版 `user` 表无密码列（Stack Auth 托管），本实现自签本地 JWT 需本地凭证，
 /// 故拆表存放，`user` 表列结构保持与原版 100% 一致（零列改动）。
 model UserCredential {
   id         Int      @id @default(autoincrement())

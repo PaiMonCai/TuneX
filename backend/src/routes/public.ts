@@ -1,6 +1,6 @@
 /**
  * 免认证端点：支付回调 / 隧道观测 / 站点配置 / license
- * 对应 noAuthPaths 白名单中的业务路径（W1 仅搭骨架，W4/W5 补实现）
+ * 对应 noAuthPaths 白名单中的业务路径（部分端点仍为占位实现）。
  */
 import { Hono } from "hono";
 import { redis, RedisKeys } from "../redis.ts";
@@ -14,7 +14,7 @@ publicRoutes.post("/tunnel/observer", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json({ error: "invalid json" }, 400);
 
-  // W1 仅接收并写 Redis 缓冲；W4 落地为 HINCRBYFLOAT + cron 归档
+  // Writes to Redis buffer; DB persistence via HINCRBYFLOAT + cron archiving.
   try {
     await redis.rpush(
       `${RedisKeys.observerBuffer}:raw`,

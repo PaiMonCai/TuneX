@@ -1,7 +1,7 @@
 services:
   mysql:
     image: mysql:8.4.11
-    container_name: relayx-clone-mysql
+    container_name: tunex-mysql
     restart: always
     command: --skip-log-bin --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
@@ -18,15 +18,15 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
-    networks: [relayx]
+    networks: [tunex]
 
   redis:
     image: redis:7.4-alpine
-    container_name: relayx-clone-redis
+    container_name: tunex-redis
     restart: always
     command: ["redis-server", "--appendonly", "yes"]
     # 主机端口仅用于本机调试；容器间通过 compose 网络直连（redis:6379）。
-    # 默认值保持 W1 规格；若本机 6380 已被占用可用 REDIS_HOST_PORT 覆盖。
+    # 默认主机端口 6380；若本机已被占用可用 REDIS_HOST_PORT 覆盖。
     ports:
       - "${REDIS_HOST_PORT:-6380}:6379"
     volumes:
@@ -36,14 +36,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    networks: [relayx]
+    networks: [tunex]
 
   db-migrate:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: relayx-clone-backend:latest
-    container_name: relayx-clone-db-migrate
+    image: tunex-backend:latest
+    container_name: tunex-db-migrate
     env_file: [.env]
     environment:
       ADMIN_CREDENTIALS_PATH: /host/.admin-credentials
@@ -56,14 +56,14 @@ services:
       redis:
         condition: service_healthy
     restart: "no"
-    networks: [relayx]
+    networks: [tunex]
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: relayx-clone-backend:latest
-    container_name: relayx-clone-backend
+    image: tunex-backend:latest
+    container_name: tunex-backend
     restart: always
     env_file: [.env]
     ports:
@@ -82,14 +82,14 @@ services:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
-    networks: [relayx]
+    networks: [tunex]
 
   worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: relayx-clone-backend:latest
-    container_name: relayx-clone-worker
+    image: tunex-backend:latest
+    container_name: tunex-worker
     restart: always
     env_file: [.env]
     command: ["bun", "src/worker.ts"]
@@ -100,7 +100,7 @@ services:
         condition: service_healthy
       db-migrate:
         condition: service_completed_successfully
-    networks: [relayx]
+    networks: [tunex]
 
   web:
     # Next.js 16 前端：多阶段构建（见 web/Dockerfile），运行 `next start -p 3000`。
@@ -108,8 +108,8 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-    image: relayx-clone-web:latest
-    container_name: relayx-clone-web
+    image: tunex-web:latest
+    container_name: tunex-web
     restart: always
     environment:
       NODE_ENV: production
@@ -131,14 +131,14 @@ services:
     depends_on:
       backend:
         condition: service_started
-    networks: [relayx]
+    networks: [tunex]
 
   caddy:
     image: caddy:latest
-    container_name: relayx-clone-caddy
+    container_name: tunex-caddy
     restart: always
     ports:
-      # W1 主机端口：9090/9443 已被其它栈（W5）占用，故改用 9091/9445。
+      # 默认主机端口 9091/9445（避开本机可能已被占用的 9090/9443）。
       # 可用 CADDY_HTTP_PORT / CADDY_HTTPS_PORT 覆盖。
       - "${CADDY_HTTP_PORT:-9091}:80"
       - "${CADDY_HTTPS_PORT:-9445}:443"
@@ -151,19 +151,19 @@ services:
         condition: service_started
       web:
         condition: service_started
-    networks: [relayx]
+    networks: [tunex]
 
 volumes:
   mysql_data:
-    name: relayx-clone-mysql-data
+    name: tunex-mysql-data
   redis_data:
-    name: relayx-clone-redis-data
+    name: tunex-redis-data
   caddy_data:
-    name: relayx-clone-caddy-data
+    name: tunex-caddy-data
   caddy_config:
-    name: relayx-clone-caddy-config
+    name: tunex-caddy-config
 
 networks:
-  relayx:
-    name: relayx-clone
+  tunex:
+    name: tunex
     driver: bridge

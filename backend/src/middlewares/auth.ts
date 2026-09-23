@@ -1,7 +1,7 @@
 /**
  * 中间件链 —— authRequired / adminRequired / adminPermissionGuard /
  * superAdminRequired (roles independent of billing/license)
- * 依据: relayx-auth-rbac-source-verification-report.md §1-§3
+ * 依据: auth-rbac-source-verification-report.md §1-§3
  */
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";

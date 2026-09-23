@@ -3,7 +3,7 @@
  *
  * 职责：
  *  ① 初始化 config 表（33 项枚举默认值，仅插入缺失项，并迁移旧品牌默认文案）
- *  ② 超管用户（admin@relayx.local）+ 密码凭证（user_credential）
+ *  ② 超管用户（admin@tunex.local）+ 密码凭证（user_credential）
  *     - 邮箱/密码可通过 SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD 覆盖
  *     - 未设置 SEED_ADMIN_PASSWORD 时随机生成强口令并写入凭证文件
  *  ③ 3 个套餐（体验 / 标准 / 专业）
@@ -16,8 +16,8 @@
  *  - plan.bandwidth_limit  : Mbps（10 / 100 / 500）
  *  - plan.max_tunnels      : 条
  *
- * 依据: relayx_db_schema_report.md §3.1（config 枚举）、
- *       relayx-auth-rbac-source-verification-report.md、
+ * 依据: db_schema_report.md §3.1（config 枚举）、
+ *       auth-rbac-source-verification-report.md、
  *       reports/reference-schema.sql（plan / node_group / node / plan_node_group）
  */
 import { db } from "../src/db.ts";
@@ -74,7 +74,7 @@ const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
   ENABLE_SUBSCRIPTION: "true",
 };
 
-const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? "admin@relayx.local";
+const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? "admin@tunex.local";
 const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? generatePassword(24);
 const CREDENTIALS_PATH =
   process.env.ADMIN_CREDENTIALS_PATH ?? "/host/.admin-credentials";
@@ -164,7 +164,7 @@ async function seedConfig(): Promise<{ inserted: number; total: number }> {
       data: toInsert.map((name) => ({ name, value: DEFAULT_CONFIG[name] })),
     });
   }
-  // 仅迁移旧版品牌默认值；管理员自定义的站点名称和描述保持不变。
+  // 仅迁移旧版（RelayX）品牌默认值；管理员自定义的站点名称和描述保持不变。
   await db.systemConfig.updateMany({
     where: { name: "SITE_NAME", value: "RelayX" },
     data: { value: DEFAULT_CONFIG.SITE_NAME },

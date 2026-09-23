@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/relayx/agent/internal/logx"
-	"github.com/relayx/agent/internal/netutil"
+	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/netutil"
 )
 
 // WaitListen is the dynamic-port placeholder token (the original emits

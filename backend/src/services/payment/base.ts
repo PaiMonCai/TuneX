@@ -1,6 +1,6 @@
 /**
  * BaseGateway —— 支付网关抽象基类 + 通用签名/费用工具
- * 依据: relayx-pay-channel-analysis-report.md §1（BasePay 源码级还原）
+ * 依据: pay-channel-analysis-report.md §1（BasePay 源码级还原）
  *
  * 本文件**不依赖任何 Web 框架**（不 import hono），只依赖 node:crypto，
  * 因此签名/费用逻辑可离线单元测试。
@@ -116,7 +116,7 @@ export function toNumber(v: unknown): number | null {
 }
 
 /**
- * 金额一致性校验（W5 修复的原版缺陷）。
+ * 金额一致性校验（修复原版缺陷）。
  * 原版只验签 + 判状态，**不回校回调金额与订单应付金额**（见交叉验证报告 §问题 13）。
  * 这里要求回调金额 >= 应付金额且不超过容差（默认 0.01，允许分位舍入差）。
  */

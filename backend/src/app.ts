@@ -1,6 +1,6 @@
 /**
  * Hono 应用装配 —— 中间件链顺序严格对齐原版 src/app.ts
- * 依据: relayx-auth-rbac-source-verification-report.md §1
+ * 依据: auth-rbac-source-verification-report.md §1
  *
  * 链序：
  *   ① getRequestIP + requestLogger
@@ -73,7 +73,7 @@ export function createApp() {
   });
 
   // ③ 健康检查（免认证）
-  app.get("/healthz", (c) => c.json({ status: "ok", service: "tunex-backend", w: "W1" }));
+  app.get("/healthz", (c) => c.json({ status: "ok", service: "tunex-backend" }));
   app.get("/readyz", async (c) => {
     const checks: Record<string, boolean> = {};
     try {
@@ -119,7 +119,7 @@ export function createApp() {
   app.route("/api/admin", nodeGrantRoutes);
   app.route("/api/admin", adminExtendedRoutes);
 
-  app.get("/", (c) => c.json({ service: "tunex-backend", week: "W1", site_url: env.siteUrl }));
+  app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 
   return app;
 }

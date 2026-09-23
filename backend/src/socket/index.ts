@@ -11,9 +11,9 @@ import { pushNodeConfig } from "./config-pusher.ts";
 const SOCKET_PORT = Number(process.env.SOCKET_PORT ?? 3001);
 
 /**
- * Socket.IO agent 接入层（W2）
+ * Socket.IO agent 接入层
  *
- * 协议事实（全部实测验证，见 /tmp/relayx-agent-reports/01-config-e2e.md）：
+ * 协议事实（全部实测验证，见 config-e2e.md）：
  *  - Engine.IO v4，agent CONNECT 载荷 {"token": "<node_group.token>"}
  *  - register ACK 格式必须是 43<id>[json]（43=ACK；44 是 ERROR 包）
  *  - ACK 载荷 {license, site_url, type, now}；license 内层是 int64 unix 秒
@@ -183,7 +183,7 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
       // 防抖标记：TTL 60s 内重连则视为同一节点（worker 侧消费）
       const marker = `dc:${groupId}:${nodeId}`;
       await redis.set(marker, String(Date.now()), "EX", DISCONNECT_DEBOUNCE_MS / 1000);
-      // 完整实现用 BullMQ delay job；此处标记供 worker 扫描（W4 接入）
+      // 完整实现用 BullMQ delay job；此处标记供 worker 扫描（待接入消费端）
     });
   });
 

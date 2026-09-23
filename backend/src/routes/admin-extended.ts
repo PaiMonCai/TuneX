@@ -1,5 +1,5 @@
 /**
- * 管理端扩展路由（W1）—— 前端 api.admin.* 中 admin.ts 未覆盖的 CRUD 与列表
+ * 管理端扩展路由—— 前端 api.admin.* 中 admin.ts 未覆盖的 CRUD 与列表
  *
  * 挂载（app.ts）：app.route("/api/admin", adminExtendedRoutes);
  * 中间件由 app.ts 统一施加，与 adminRoutes 相同：

@@ -373,7 +373,7 @@ DROP TABLE IF EXISTS `tunnel`;
 CREATE TABLE `tunnel` (
   `id` int NOT NULL AUTO_INCREMENT,
   `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `tunnel_type` enum('tcp','mtcp','udp','relayx','mtls','mwss','wss','tls','quic') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'wss',
+  `tunnel_type` enum('tcp','mtcp','udp','tunex','mtls','mwss','wss','tls','quic') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'wss',
   `listen_ip` varchar(191) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `listen_port` int DEFAULT NULL,
   `status` enum('active','inactive') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'active',

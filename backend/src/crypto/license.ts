@@ -1,5 +1,5 @@
 /**
- * RelayX — License 自签模块
+ * TuneX — License 自签模块
  *
  * 原版 agent（v0.13.22）的 license 校验**全部在客户端**（逆向实测）：
  *   解密 Fernet(license_key, token) → `License.expired_at` 未过期
@@ -7,7 +7,8 @@
  *                                   → `License.type` ∈ {business, personal}
  * 这三项全过则日志打印 `License loaded successfully`，然后开始收 config。
  *
- * 因为密钥是硬编码在客户端的全局对称密钥，服务端可以**无限期自签** license。
+ * 因为原版把 license 密钥硬编码在客户端（上游设计缺陷），服务端可以无限期自签 license；
+ * TuneX 已移除该固定密钥，改为每个部署独立的 `TUNEX_LICENSE_KEY`。
  *
  * ── 三个实测踩坑（每一条都曾让真实 agent 崩溃）──
  *
@@ -20,7 +21,7 @@
  *    不一致 → agent panic：`License site_url ... does not match server ...`（socket.go:49）。
  *    本库无法替你校验（它不知道 agent 的 `-s`），**调用方必须保证**：
  *      license.siteUrl === config.SITE_URL === agent `-s` 参数
- *    建议在 W2 里只从一个地方取 SITE_URL，任何地方都不要另写字符串字面量。
+ *    建议只从一个地方取 SITE_URL（如 `env.siteUrl`），任何地方都不要另写字符串字面量。
  *
  * ③ `type` 只能是 `"business"` / `"personal"`；写 `"pro"` 之类的值会被拒。
  */
@@ -61,7 +62,7 @@ export interface SignLicenseInput {
 }
 
 export interface VerifyLicenseOptions {
-  /** license 密钥。默认取 `TUNEX_LICENSE_KEY`（可用 `RELAYX_LICENSE_KEY` 覆盖）。 */
+  /** license 密钥。默认取环境变量 `TUNEX_LICENSE_KEY`。 */
   key?: string;
   /** 校验 TTL / 过期（默认 `false`：license 是否过期由调用方决定是否拒绝）。 */
   checkExpiry?: boolean;
@@ -237,7 +238,7 @@ export interface RegisterAckLicense {
 }
 
 /**
- * 直接构造 register ACK 的载荷 —— W2 的 `register` handler 可直接用。
+ * 直接构造 register ACK 的载荷 —— `register` handler 可直接用。
  *
  * 实测 ACK 线格式：`430[{license, site_url, type, now}]`
  * （帧前缀 `43` + ackId `0`，**不是** `440[...]` —— `44` 是 Socket.IO 的 ERROR 包）

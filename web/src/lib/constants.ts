@@ -1,4 +1,4 @@
-export const TUNNEL_TYPES = ["tcp", "mtcp", "udp", "relayx", "mtls", "mwss", "wss", "tls", "quic"] as const;
+export const TUNNEL_TYPES = ["tcp", "mtcp", "udp", "tunex", "mtls", "mwss", "wss", "tls", "quic"] as const;
 
 export const LOAD_BALANCE_TYPES = ["round", "rand", "fifo", "hash", "ll", "lc"] as const;
 

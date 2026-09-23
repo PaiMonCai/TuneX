@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/relayx/agent/internal/fernet"
+	"github.com/tunex/agent/internal/fernet"
 )
 
 // There is no default key. Each TuneX installation generates its own Fernet

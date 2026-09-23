@@ -1,11 +1,11 @@
 /**
- * 轻量 i18n：中英字典 + Cookie 持久化（relayx_locale）。
+ * 轻量 i18n：中英字典 + Cookie 持久化（tunex_locale）。
  * 服务端用 getDictionary(locale) 直接取词条，客户端用 useI18n().t()。
  * 这样 curl 带 Cookie 即可验证中英切换是否真的生效（SSR 输出不同文案）。
  */
 export type Locale = "zh" | "en";
 
-export const LOCALE_COOKIE = "relayx_locale";
+export const LOCALE_COOKIE = "tunex_locale";
 export const DEFAULT_LOCALE: Locale = "zh";
 export const LOCALES: { value: Locale; label: string }[] = [
   { value: "zh", label: "中文" },

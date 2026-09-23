@@ -29,7 +29,7 @@
 
 ### 1.1 运行环境
 - 主机：`hkthyear-1043084428`（Linux 6.8, x86_64），root
-- 编排：`/opt/relayx-clone/docker-compose.yaml`
+- 编排：`/opt/TuneX/docker-compose.yaml`
 - 关键容器（实测 `docker ps`）：
 
 | 容器 | 镜像 | 端口 | 状态 |

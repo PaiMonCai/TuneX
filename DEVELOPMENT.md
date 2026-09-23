@@ -7,7 +7,7 @@
 
 ---
 
-> 品牌展示名为 **TuneX**。`relayx` 隧道类型、`RELAYX_*` 环境变量、Cookie、数据库及容器资源名暂保留以兼容现有协议和部署。重新运行 seed 只会迁移站点配置中的旧默认品牌文案，不覆盖管理员自定义内容。
+> 品牌展示名为 **TuneX**。隧道类型、环境变量、Cookie、数据库及容器资源名均已统一为 `tunex`。重新运行 seed 只会迁移站点配置中的旧默认品牌文案，不覆盖管理员自定义内容。
 
 ## 1. 项目概况
 
@@ -26,7 +26,7 @@ TuneX 定位为个人与团队使用的多租户 SaaS：注册/创建工作空�
 ### 1.2 目录结构
 
 ```
-/opt/relayx-clone/
+/opt/TuneX/
 ├── docker-compose.yaml       # 7 个服务：mysql/redis/db-migrate/backend/worker/web/caddy
 ├── .env                      # 所有配置，勿提交
 ├── Caddyfile                 # 反向代理：/api/* 和 /healthz → backend，其余 → web
@@ -47,7 +47,7 @@ TuneX 定位为个人与团队使用的多租户 SaaS：注册/创建工作空�
 │   └── src/app/              # 12 页面 + src/components/ + src/lib/api.ts
 ├── agent/
 │   ├── main.go
-│   ├── go.mod                # module github.com/relayx/agent，零依赖
+│   ├── go.mod                # module github.com/tunex/agent，零依赖
 │   └── internal/             # 10 个包
 └── reports/                  # 验证报告
 ```
@@ -65,7 +65,7 @@ TuneX 定位为个人与团队使用的多租户 SaaS：注册/创建工作空�
 ### 2.2 一键启动
 
 ```bash
-cd /opt/relayx-clone
+cd /opt/TuneX
 docker compose up -d --build
 ```
 
@@ -108,13 +108,13 @@ docker compose logs -f backend
 docker compose exec backend sh
 
 # 跑 agent（本地测试）
-/tmp/relayx-agent -s http://127.0.0.1:8788 -t <group-token> -d
+/tmp/tunex-agent -s http://127.0.0.1:8788 -t <group-token> -d
 
 # 数据库
-docker compose exec mysql mysql -uroot -p relayx
+docker compose exec mysql mysql -uroot -p tunex
 
 # 编译 agent
-cd agent && go build -o /tmp/relayx-agent .
+cd agent && go build -o /tmp/tunex-agent .
 ```
 
 ---
@@ -126,21 +126,21 @@ cd agent && go build -o /tmp/relayx-agent .
 **Backend 改动**：
 
 ```bash
-cd /opt/relayx-clone/backend
+cd /opt/TuneX/backend
 bun build src/index.ts --target=bun --external external   # 必须 exit 0
 ```
 
 **Web 改动**：
 
 ```bash
-cd /opt/relayx-clone/web
+cd /opt/TuneX/web
 bun run typecheck   # tsc --noEmit
 ```
 
 **Agent 改动**：
 
 ```bash
-cd /opt/relayx-clone/agent
+cd /opt/TuneX/agent
 go build ./...      # 必须 exit 0
 go vet ./...        # 必须无输出
 ```
@@ -158,8 +158,8 @@ go vet ./...        # 必须无输出
 
 ### 3.3 禁止事项
 
-1. **不要改 `.env` 里的 `SITE_URL` 为 `https://relayx.local`** — 当前是测试值 `http://127.0.0.1:8788`，改了 agent license 校验会失败（agent `-s` 参数必须与 `SITE_URL` 一致）。
-2. **不要动 `docker-compose.yaml` 的端口映射** — 9091/9445 是被 W5 栈占用后的既定选择。
+1. **不要改 `.env` 里的 `SITE_URL` 为 `https://tunex.local`** — 当前是测试值 `http://127.0.0.1:8788`，改了 agent license 校验会失败（agent `-s` 参数必须与 `SITE_URL` 一致）。
+2. **不要动 `docker-compose.yaml` 的端口映射** — 9091/9445 是为避开本机已占用端口而设定的默认值。
 3. **使用 Git 管理变更** — 项目已初始化 `main` 分支；改动需经过 CI 验证，严禁提交 `.env`、凭证与构建产物。
 4. **不要 Node 的 `aes-128-cbc` 自动 padding** — Fernet 必须手动 PKCS7 + `setAutoPadding(false)`（见 §4.3）。
 5. **不要把 `public/` 加入 `.dockerignore`** — Dockerfile 有 `COPY public ./public`。
@@ -223,7 +223,7 @@ const ciphertext = Buffer.concat([cipher.update(padded), cipher.final()]);
 | License（register ACK）| `TUNEX_LICENSE_KEY` | 由本部署签发与校验，代码内无默认值 |
 | Config（gost 配置）| `TUNEX_CONFIG_KEY` | 由本部署加密下发，Agent 经环境变量读取 |
 
-> 历史版本曾内置上游通用密钥，现已移除：缺失上述变量时后端/Agent 快速失败。迁移期仍接受 `RELAYX_CONFIG_KEY` / `RELAYX_LICENSE_KEY` 作为回退。
+> 历史版本曾内置上游通用密钥，现已移除：缺失上述变量时后端/Agent 快速失败。不存在任何回退密钥名。
 
 ### 4.4 配置生成与推送
 
@@ -482,7 +482,7 @@ docker compose logs --tail=20 caddy
 
 ## 9. 联系与参考
 
-- 验证报告：`/opt/relayx-clone/reports/multi-node-verification.md`
+- 验证报告：`/opt/TuneX/reports/multi-node-verification.md`
 - 子代理派发规范：`/root/.hermes/skills/main-session-delegation/SKILL.md`
 - 本项目的 Agent 对接设计文档：本文档 §4
 
@@ -497,14 +497,14 @@ docker compose logs --tail=20 caddy
 | `SITE_URL` | **http://127.0.0.1:8788** | ⚠️ 测试值，agent license 依赖 |
 | `PORT` | 3000 | backend 容器内端口 |
 | `MYSQL_ROOT_PASSWORD` | --- | |
-| `MYSQL_DATABASE` | relayx | |
-| `DATABASE_URL` | mysql://root:***@mysql:3306/relayx | |
+| `MYSQL_DATABASE` | tunex | |
+| `DATABASE_URL` | mysql://root:***@mysql:3306/tunex | |
 | `REDIS_URL` | redis://redis:6379 | |
 | `AUTH_SECRET` | --- | JWT 签名密钥 |
-| `JWT_ISSUER` | relayx | |
+| `JWT_ISSUER` | tunex | |
 | `JWT_TTL_SECONDS` | 3600 | |
 | `COOKIE_SECURE` | **false** | ⚠️ HTTP 测试栈必须 false |
-| `COOKIE_NAME` | relayx_access | |
+| `COOKIE_NAME` | access | |
 | `ALLOW_REGISTER_FALLBACK` | — | |
 | `LICENSE_TYPE` | business | 空则 `loadAvailableTunnels` 返回 [] |
 | `LICENSE_EXPIRED_AT` | 0 | 0 = 不过期 |

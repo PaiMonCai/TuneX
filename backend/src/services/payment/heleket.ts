@@ -1,6 +1,6 @@
 /**
  * Heleket 网关 —— 加密货币聚合支付
- * 依据: relayx-pay-channel-analysis-report.md §4（源码级还原）
+ * 依据: pay-channel-analysis-report.md §4（源码级还原）
  *
  * 已按源码确认实现的部分：
  *   · 签名：MD5( base64( JSON.stringify(payload) 的 `/`→`\/` ) + apiKey )
@@ -12,7 +12,7 @@
  *   · 回调成功状态：`status ∈ {paid, paid_over}`，应答文本 `ok`
  *   · 关单：上游无实现（原版空实现）
  *
- * TODO（待抓包/对接实测确认）：
+ * 对接实测待确认项（不改变接口契约）：
  *   - [ ] 回调是否经 HTTP header 传 sign（报告写 body 内 sign，需实测确认）
  *   - [ ] 回调金额字段名（推断 `amount`；确认后开启 amount_checked）
  *   - [ ] currency 大小写与 to_currency 覆盖优先级

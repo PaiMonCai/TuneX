@@ -1,7 +1,7 @@
 /**
  * RBAC 资源权限表 —— 严格复刻原版 `packages/shared/src/permissions.ts`
  * 19 个资源键 + 2 个特殊键，来源：
- * /root/relayx-reports/deep-analysis/relayx-auth-rbac-source-verification-report.md §4
+ * auth-rbac-source-verification-report.md §4
  */
 
 export type PermissionLevel = "read" | "write";
@@ -116,7 +116,7 @@ export interface AccessUserLike {
  * 多角色权限合并：write 优先，read 不降级；super_admin 全量 write。
  * 与原版语义一致（顺序无关）。
  */
-export function getEffectiveAccess(user: AccessUserLike): Map<string, PermissionLevel> {
+export function getEffectiveAccess(user: AccessUserLike | null | undefined): Map<string, PermissionLevel> {
   const access = new Map<string, PermissionLevel>();
 
   if (user?.super_admin) {

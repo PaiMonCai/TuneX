@@ -2,13 +2,13 @@ import { PrismaClient } from "@prisma/client";
 
 declare global {
   // eslint-disable-next-line no-var
-  var __relayxPrisma: PrismaClient | undefined;
+  var __tunexPrisma: PrismaClient | undefined;
 }
 
 export const db: PrismaClient =
-  globalThis.__relayxPrisma ??
+  globalThis.__tunexPrisma ??
   new PrismaClient({
     log: ["warn", "error"],
   });
 
-if (!globalThis.__relayxPrisma) globalThis.__relayxPrisma = db;
+if (!globalThis.__tunexPrisma) globalThis.__tunexPrisma = db;

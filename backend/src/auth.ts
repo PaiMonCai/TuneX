@@ -1,6 +1,6 @@
 /**
  * 认证核心 —— 双通道：Cookie JWT (jose/HS256) + Bearer API Key (uuid v4)
- * 依据: relayx-auth-rbac-source-verification-report.md §2
+ * 依据: auth-rbac-source-verification-report.md §2
  *
  * 原版用 StackAuth 远端 JWKS；本复刻改用本地 HS256 签发（jose），
  * 保留 cookie 名为 `access`、TTL 12h、Bearer api_key 直查 user.api_key 的通道语义。

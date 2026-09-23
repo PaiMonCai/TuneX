@@ -1,5 +1,5 @@
 /**
- * 与 /opt/relayx-clone/backend/prisma/schema.prisma 对齐的前端类型定义。
+ * 与 backend/prisma/schema.prisma 对齐的前端类型定义。
  * 命名保持 Prisma 原样（snake_case），避免与后端 JSON 字段不一致。
  */
 
@@ -7,7 +7,7 @@ export type ID = number;
 
 export type Status = "active" | "inactive";
 export type NodeType = "in" | "out";
-export type TunnelType = "tcp" | "mtcp" | "udp" | "relayx" | "mtls" | "mwss" | "wss" | "tls" | "quic";
+export type TunnelType = "tcp" | "mtcp" | "udp" | "tunex" | "mtls" | "mwss" | "wss" | "tls" | "quic";
 export type LoadBalanceType = "round" | "rand" | "fifo" | "hash" | "ll" | "lc";
 export type IpType = "auto" | "ipv4" | "ipv6";
 export type TunnelCategory = "port_forward" | "remote_port_forward";
@@ -49,7 +49,7 @@ export interface AdminRole {
   updated_at: string;
 }
 
-/** 登录响应：原版使用 Stack Auth 托管，复刻版自实现 JWT（W1） */
+/** 登录响应：原版使用托管认证，本实现自签本地 JWT */
 export interface AuthSession {
   user: User;
   token?: string;
@@ -333,7 +333,7 @@ export interface ListQuery {
 }
 
 /* ------------------------------------------------------------------ *
- * 写操作的请求体类型：与后端 REST 契约对齐（W2 前端表单直接复用）
+ * 写操作的请求体类型：与后端 REST 契约对齐（前端表单直接复用）
  * ------------------------------------------------------------------ */
 
 /** 隧道可更新字段（PATCH /tunnels/:id） */

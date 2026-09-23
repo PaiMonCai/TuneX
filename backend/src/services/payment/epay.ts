@@ -1,6 +1,6 @@
 /**
  * EPay 网关 —— 完整实现（支付宝/微信等通用企业支付）
- * 依据: relayx-pay-channel-analysis-report.md §2（源码级还原，无推测）
+ * 依据: pay-channel-analysis-report.md §2（源码级还原，无推测）
  *
  * 协议要点：
  *   · 下单：POST {url}/mapi.php，application/x-www-form-urlencoded
@@ -10,7 +10,7 @@
  *   · 应答：纯文本 `success`
  *   · 关单：上游不支持（原版空实现）
  *
- * W5 增强（修复原版缺陷，见交叉验证报告 §问题 13）：
+ * 增强（修复原版缺陷，见交叉验证报告 §问题 13）：
  *   `verifyCallback` 返回回调金额，由上层 `order.ts` 与订单应付金额做一致性校验；
  *   金额不一致时拒绝入账并记录日志。
  */

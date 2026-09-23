@@ -1,6 +1,6 @@
 /**
  * 手写 mock 数据集 —— 字段严格对齐 backend/prisma/schema.prisma。
- * 后端（W1/W5）尚未就绪，前端全部走这里；切换真实后端只需删掉 NEXT_PUBLIC_API_MOCK。
+ * 前端默认走这里；切换真实后端只需删掉 NEXT_PUBLIC_API_MOCK。
  */
 import type {
   AdminDashboardStats,
@@ -103,7 +103,7 @@ export const mockNodeGroups: NodeGroup[] = [
     load_balance_type: "lc",
     allow_listen_protocol: false,
     allow_listen_protocols: null,
-    allow_tunnel_types: ["tcp", "udp", "relayx", "quic"],
+    allow_tunnel_types: ["tcp", "udp", "tunex", "quic"],
     bypass_type: "whitelist",
     bypass_list: ["80", "443", "8080"],
     admission: false,
