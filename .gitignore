@@ -1,0 +1,24 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+.admin-credentials
+*.pem
+*.key
+
+# Dependency/build artifacts
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/coverage/
+**/.turbo/
+**/*.tsbuildinfo
+
+# Local tools and logs
+*.log
+.DS_Store
+Thumbs.db
+agent/tunex-agent
+agent/relayx-agent

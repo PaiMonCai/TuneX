@@ -1,0 +1,588 @@
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../node_modules/.prisma/client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum NodeType {
+  in
+  out
+}
+
+enum Status {
+  active
+  inactive
+}
+
+enum BypassType {
+  whitelist
+  blacklist
+}
+
+model NodeGroup {
+  id                     Int             @id @default(autoincrement())
+  token                  String          @unique @default(uuid())
+  name                   String          @db.VarChar(255)
+  port_range             String?         @db.VarChar(255)
+  connect_ip             String?         @db.VarChar(255)
+  node_type              NodeType
+  load_balance_type      LoadBalanceType @default(round)
+  allow_listen_protocol  Boolean         @default(false)
+  allow_listen_protocols Json?
+  allow_tunnel_types     Json?
+  bypass_type            BypassType      @default(blacklist)
+  bypass_list            Json?           @db.Json
+  admission              Boolean         @default(false)
+  block_protocols        Json?
+  traffic_rate           Float           @default(1)
+  need_out_node_group    Boolean         @default(true)
+  allow_out_node_groups  Json?
+  allow_in_node_groups   Json?
+  order_by               Float           @default(1000)
+  created_at             DateTime        @default(now())
+  updated_at             DateTime        @updatedAt
+  user_id                Int
+  user                   User            @relation(fields: [user_id], references: [id])
+
+  in_tunnels        Tunnel[]         @relation("in_node_group")
+  out_tunnels       Tunnel[]         @relation("out_node_group")
+  nodes             Node[]
+  plans             PlanNodeGroup[]
+  tunnel_chains     TunnelChain[]
+  in_node_group_dns InNodeGroupDNS[]
+
+  @@map("node_group")
+}
+
+model Node {
+  id          Int      @id @default(autoincrement())
+  weight      Int      @default(1)
+  status      Status   @default(active)
+  node_id     String   @unique @db.VarChar(255)
+  connect_ip  String   @db.VarChar(255)
+  version     String   @default("unknown") @db.VarChar(255)
+  backup      Boolean  @default(false)
+  order_by    Float    @default(1000)
+  custom_line String?  @db.VarChar(255)
+  dns_status  Boolean  @default(false)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  node_group_id Int
+  node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
+
+  @@map("node")
+}
+
+enum LoadBalanceType {
+  round
+  rand
+  fifo
+  hash
+  ll
+  lc
+}
+
+enum TunnelType {
+  tcp
+  mtcp
+  udp
+  relayx
+  mtls
+  mwss
+  wss
+  tls
+  quic
+}
+
+enum IpType {
+  auto
+  ipv4
+  ipv6
+}
+
+enum TunnelCategory {
+  port_forward
+  remote_port_forward
+}
+
+model Tunnel {
+  id                         Int             @id @default(autoincrement())
+  name                       String          @db.VarChar(255)
+  tunnel_type                TunnelType      @default(wss)
+  category                   TunnelCategory  @default(port_forward)
+  listen_ip                  String?
+  listen_port                Int?
+  listen_protocol            Json?
+  port_conflict_at           DateTime?
+  status                     Status          @default(active)
+  forward_addresses          Json
+  forward_addresses_protocol Json?
+  load_balance_type          LoadBalanceType
+  ip_type                    IpType          @default(ipv4)
+  order_by                   Float           @default(1000)
+  ip_limit                   Int?
+  client_limit               Int?
+  bandwidth_limit            Int?
+  traffic                    Float           @default(0)
+  traffic_cost               Float           @default(0)
+  proxy_protocol             Boolean         @default(false)
+  created_at                 DateTime        @default(now())
+  updated_at                 DateTime        @updatedAt
+  in_node_group_id           Int
+  in_node_group              NodeGroup       @relation("in_node_group", fields: [in_node_group_id], references: [id])
+  out_node_group_id          Int?
+  out_node_group             NodeGroup?      @relation("out_node_group", fields: [out_node_group_id], references: [id])
+  user_id                    Int
+  user                       User            @relation(fields: [user_id], references: [id])
+
+  tunnel_traffic TunnelTraffic[]
+  tunnel_chains  TunnelChain[]
+
+  @@unique([listen_port, in_node_group_id])
+  @@map("tunnel")
+}
+
+model TunnelChain {
+  id            Int       @id @default(autoincrement())
+  tunnel_id     Int
+  tunnel        Tunnel    @relation(fields: [tunnel_id], references: [id])
+  node_type     NodeType
+  node_group_id Int
+  node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
+
+  @@map("tunnel_chain")
+}
+
+model User {
+  id                       Int                @id @default(autoincrement())
+  super_admin              Boolean            @default(false)
+  email                    String             @unique
+  balance                  Float              @default(0)
+  commission_balance       Float              @default(0)
+  tg_id                    String?
+  uid                      String?
+  note                     String?
+  tunnels                  Tunnel[]
+  parent_id                Int?
+  parent                   User?              @relation("UserReferral", fields: [parent_id], references: [id])
+  children                 User[]             @relation("UserReferral")
+  referral_commission_rate Float?
+  referral_first_only      Boolean?
+  auto_renew               Boolean            @default(false)
+  api_key                  String             @unique @default(uuid())
+  subscription_key         String             @unique @default(uuid())
+  notify_subscriptions     Json?
+  admin_notify_subscriptions Json?
+  node_groups              NodeGroup[]
+  status                   Status             @default(active)
+  created_at               DateTime           @default(now())
+  updated_at               DateTime           @updatedAt
+  orders                   PlanOrder[]
+  topups                   TopupOrder[]
+  user_plan                UserPlan?
+  balance_logs             BalanceLog[]
+  commission_logs          CommissionLog[]
+  tickets                  Ticket[]
+  ticket_replies           TicketReply[]
+  withdraw_requests        WithdrawRequest[]
+  dns_providers            DNSProvider[]
+  admin_roles              AdminRole[]
+  credential               UserCredential?
+
+  @@map("user")
+}
+
+model AdminRole {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique @db.VarChar(255)
+  description String?  @db.Text
+  permissions Json
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+  users       User[]
+
+  @@map("admin_role")
+}
+
+model UserPlan {
+  id            Int       @id @default(autoincrement())
+  user_id       Int       @unique
+  user          User      @relation(fields: [user_id], references: [id])
+  traffic       Float?
+  traffic_used  Float     @default(0)
+  max_tunnels   Int?
+  whitelist_ips Json?
+  expired_at    DateTime?
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+  plan_id       Int
+  plan          Plan      @relation(fields: [plan_id], references: [id])
+
+  @@map("user_plan")
+}
+
+enum BillingCycle {
+  month
+  quarter
+  half_year
+  year
+  lifetime
+}
+
+model Plan {
+  id                          Int          @id @default(autoincrement())
+  name                        String       @db.VarChar(255)
+  description                 String?
+  original_price              Float?
+  price                       Float
+  max_tunnels                 Int?
+  traffic                     Int?
+  ip_limit                    Int?
+  client_limit                Int?
+  bandwidth_limit             Int?
+  whitelist_limit             Int?
+  allow_custom_in_node_group  Boolean
+  allow_custom_out_node_group Boolean
+  all_in_node_groups          Boolean
+  all_out_node_groups         Boolean
+  setup_fee                   Float?
+  billing_cycle               BillingCycle @default(month)
+  status                      Status       @default(active)
+  renewable                   Boolean      @default(true)
+  stock                       Int?
+  order_by                    Float        @default(1000)
+  created_at                  DateTime     @default(now())
+  updated_at                  DateTime     @updatedAt
+
+  node_groups PlanNodeGroup[]
+  orders      PlanOrder[]
+  user_plans  UserPlan[]
+
+  @@map("plan")
+}
+
+model PlanNodeGroup {
+  id            Int       @id @default(autoincrement())
+  plan_id       Int
+  node_group_id Int
+  node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  plan Plan @relation(fields: [plan_id], references: [id])
+
+  @@map("plan_node_group")
+}
+
+model PlanOrder {
+  id         Int         @id @default(autoincrement())
+  user_id    Int
+  user       User        @relation(fields: [user_id], references: [id])
+  plan_id    Int
+  plan       Plan        @relation(fields: [plan_id], references: [id])
+  price      Float
+  balance    Float
+  coupon_id  Int?
+  coupon     PlanCoupon? @relation(fields: [coupon_id], references: [id])
+  created_at DateTime    @default(now())
+  updated_at DateTime    @updatedAt
+
+  @@map("plan_order")
+}
+
+enum TopupOrderStatus {
+  pending
+  success
+  cancelled
+}
+
+model TopupOrder {
+  id         Int              @id @default(autoincrement())
+  user_id    Int
+  user       User             @relation(fields: [user_id], references: [id])
+  price      Float
+  balance    Float            @default(0)
+  bonus      Float            @default(0)
+  payment_id Int
+  payment    Payment          @relation(fields: [payment_id], references: [id])
+  pay_url    String           @db.Text
+  status     TopupOrderStatus @default(pending)
+  order_id   String           @unique @db.VarChar(255)
+  trade_id   String?          @unique @db.VarChar(255)
+  created_at DateTime         @default(now())
+  updated_at DateTime         @updatedAt
+
+  @@map("topup_order")
+}
+
+enum TopupActivityType {
+  percentage
+  fixed
+}
+
+model TopupActivity {
+  id          Int               @id @default(autoincrement())
+  type        TopupActivityType
+  value       Float
+  min_amount  Float?
+  max_amount  Float?
+  valid_start DateTime?
+  valid_end   DateTime?
+  created_at  DateTime          @default(now())
+  updated_at  DateTime          @updatedAt
+
+  @@map("topup_activity")
+}
+
+model TunnelTraffic {
+  id           Int      @id @default(autoincrement())
+  tunnel_id    Int
+  tunnel       Tunnel   @relation(fields: [tunnel_id], references: [id])
+  traffic      Float
+  traffic_cost Float
+  date         DateTime
+
+  @@index([date])
+  @@map("tunnel_traffic")
+}
+
+enum SystemConfigName {
+  MIN_TOPUP_AMOUNT
+  NOTICE
+  NOTICE_POPUP
+  NOTICE_POPUP_INTERVAL_HOURS
+  SITE_NAME
+  SITE_DESCRIPTION
+  ALLOW_REGISTER
+  LOGO_URL
+  HIDE_NODE_STATUS
+  AUTO_UPDATE_AGENT
+  CHATWOOT_BASE_URL
+  CHATWOOT_TOKEN
+  TUNNEL_TRAFFIC_RETENTION_DAYS
+  HIDE_FOOTER
+  HIDE_DOCS
+  LANDING_PAGE_URL
+  REFERRAL_COMMISSION_RATE
+  REFERRAL_FIRST_ONLY
+  REFERRAL_MODE
+  OBSERVER_PERIOD
+  EMAIL_PROVIDER
+  SMTP_HOST
+  SMTP_PORT
+  SMTP_SECURE
+  SMTP_USER
+  SMTP_PASS
+  SMTP_FROM
+  RESEND_API_KEY
+  RESEND_FROM
+  MIN_WITHDRAW_AMOUNT
+  WITHDRAW_METHODS
+  LIMIT_SCOPE
+  ENABLE_SUBSCRIPTION
+}
+
+model SystemConfig {
+  id         Int              @id @default(autoincrement())
+  name       SystemConfigName @unique
+  value      String           @db.Text
+  created_at DateTime         @default(now())
+  updated_at DateTime         @updatedAt
+
+  @@map("config")
+}
+
+enum PaymentMethod {
+  epay
+  bepusdt
+  heleket
+}
+
+model Payment {
+  id          Int           @id @default(autoincrement())
+  fixed_fee   Float?
+  percent_fee Float?
+  name        String        @db.VarChar(255)
+  url         String        @db.VarChar(255)
+  config      Json
+  method      PaymentMethod
+  type        String?       @db.VarChar(255)
+  status      Status        @default(active)
+  order_by    Float         @default(1000)
+  created_at  DateTime      @default(now())
+  updated_at  DateTime      @updatedAt
+  topups      TopupOrder[]
+
+  @@map("payment")
+}
+
+enum CouponType {
+  percentage
+  fixed
+}
+
+model PlanCoupon {
+  id               Int           @id @default(autoincrement())
+  code             String        @db.VarChar(255)
+  type             CouponType
+  valid_cycle      BillingCycle?
+  value            Float
+  valid_start      DateTime?
+  valid_end        DateTime?
+  max_use          Int?
+  max_use_per_user Int?
+  created_at       DateTime      @default(now())
+  updated_at       DateTime      @updatedAt
+
+  orders PlanOrder[]
+
+  @@map("plan_coupon")
+}
+
+enum BalanceLogType {
+  topup
+  plan
+  commission_transfer
+  admin_adjust
+}
+
+model BalanceLog {
+  id         Int            @id @default(autoincrement())
+  user_id    Int
+  user       User           @relation(fields: [user_id], references: [id])
+  balance    Float
+  amount     Float
+  type       BalanceLogType
+  created_at DateTime       @default(now())
+  updated_at DateTime       @updatedAt
+
+  @@map("balance_log")
+}
+
+enum CommissionLogType {
+  referral
+  transfer
+  withdraw
+  admin_adjust
+}
+
+model CommissionLog {
+  id         Int               @id @default(autoincrement())
+  user_id    Int
+  user       User              @relation(fields: [user_id], references: [id])
+  balance    Float
+  amount     Float
+  type       CommissionLogType
+  created_at DateTime          @default(now())
+  updated_at DateTime          @updatedAt
+
+  @@map("commission_log")
+}
+
+enum WithdrawStatus {
+  pending
+  approved
+  rejected
+}
+
+model WithdrawRequest {
+  id         Int            @id @default(autoincrement())
+  user_id    Int
+  user       User           @relation(fields: [user_id], references: [id])
+  amount     Float
+  method     String         @db.VarChar(255)
+  account    String         @db.Text
+  status     WithdrawStatus @default(pending)
+  remark     String?        @db.Text
+  created_at DateTime       @default(now())
+  updated_at DateTime       @updatedAt
+
+  @@map("withdraw_request")
+}
+
+enum TicketStatus {
+  open
+  closed
+}
+
+model Ticket {
+  id         Int           @id @default(autoincrement())
+  title      String        @db.VarChar(255)
+  content    String        @db.Text
+  status     TicketStatus  @default(open)
+  user_id    Int
+  user       User          @relation(fields: [user_id], references: [id])
+  created_at DateTime      @default(now())
+  updated_at DateTime      @updatedAt
+  replies    TicketReply[]
+
+  @@map("ticket")
+}
+
+model TicketReply {
+  id         Int      @id @default(autoincrement())
+  content    String   @db.Text
+  is_admin   Boolean  @default(false)
+  ticket_id  Int
+  ticket     Ticket   @relation(fields: [ticket_id], references: [id])
+  user_id    Int
+  user       User     @relation(fields: [user_id], references: [id])
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("ticket_reply")
+}
+
+model InNodeGroupDNS {
+  id               Int         @id @default(autoincrement())
+  in_node_group_id Int
+  in_node_group    NodeGroup   @relation(fields: [in_node_group_id], references: [id])
+  dns_provider_id  Int
+  dns_provider     DNSProvider @relation(fields: [dns_provider_id], references: [id])
+  ttl              Int         @default(60)
+  ipv6             Boolean     @default(false)
+  status           Status      @default(active)
+  created_at       DateTime    @default(now())
+  updated_at       DateTime    @updatedAt
+
+  @@map("in_node_group_dns")
+}
+
+enum DNSProviderType {
+  cloudflare
+  huawei
+}
+
+model DNSProvider {
+  id                Int              @id @default(autoincrement())
+  name              String           @db.VarChar(255)
+  type              DNSProviderType
+  config            Json
+  user_id           Int
+  user              User             @relation(fields: [user_id], references: [id])
+  created_at        DateTime         @default(now())
+  updated_at        DateTime         @updatedAt
+  in_node_group_dns InNodeGroupDNS[]
+
+  @@map("dns_provider")
+}
+
+/// W1 新增：密码凭证表。
+/// 原版 `user` 表无密码列（Stack Auth 托管），本复刻自实现 JWT 需本地凭证，
+/// 故拆表存放，`user` 表列结构保持与原版 100% 一致（零列改动）。
+model UserCredential {
+  id         Int      @id @default(autoincrement())
+  user_id    Int      @unique
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  password   String   @db.VarChar(255)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("user_credential")
+}

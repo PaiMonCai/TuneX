@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: oklch(0.99 0.002 250);
+  --foreground: oklch(0.21 0.02 260);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.02 260);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.02 260);
+  --primary: oklch(0.55 0.19 258);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.96 0.005 260);
+  --secondary-foreground: oklch(0.3 0.02 260);
+  --muted: oklch(0.96 0.005 260);
+  --muted-foreground: oklch(0.55 0.02 260);
+  --accent: oklch(0.95 0.02 258);
+  --accent-foreground: oklch(0.3 0.04 258);
+  --destructive: oklch(0.58 0.22 27);
+  --destructive-foreground: oklch(0.99 0 0);
+  --success: oklch(0.6 0.16 150);
+  --border: oklch(0.92 0.005 260);
+  --input: oklch(0.92 0.005 260);
+  --ring: oklch(0.55 0.19 258);
+  --radius: 0.65rem;
+  /* 图表分类色板（OKLCH）：供 recharts 等纯客户端图表通过 var(--chart-n) 取色 */
+  --chart-1: oklch(0.55 0.19 258);
+  --chart-2: oklch(0.62 0.16 150);
+  --chart-3: oklch(0.72 0.18 70);
+  --chart-4: oklch(0.62 0.2 25);
+  --chart-5: oklch(0.6 0.15 200);
+  color-scheme: light;
+}
+
+.dark {
+  --background: oklch(0.19 0.015 260);
+  --foreground: oklch(0.96 0.005 260);
+  --card: oklch(0.23 0.018 260);
+  --card-foreground: oklch(0.96 0.005 260);
+  --popover: oklch(0.23 0.018 260);
+  --popover-foreground: oklch(0.96 0.005 260);
+  --primary: oklch(0.65 0.17 258);
+  --primary-foreground: oklch(0.15 0.02 260);
+  --secondary: oklch(0.28 0.02 260);
+  --secondary-foreground: oklch(0.96 0.005 260);
+  --muted: oklch(0.28 0.02 260);
+  --muted-foreground: oklch(0.7 0.02 260);
+  --accent: oklch(0.31 0.03 258);
+  --accent-foreground: oklch(0.96 0.005 260);
+  --destructive: oklch(0.6 0.2 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --success: oklch(0.65 0.15 150);
+  --border: oklch(0.3 0.02 260);
+  --input: oklch(0.32 0.02 260);
+  --ring: oklch(0.65 0.17 258);
+  /* 暗色下提高亮度，保证浅色背景上的对比度 */
+  --chart-1: oklch(0.68 0.17 258);
+  --chart-2: oklch(0.7 0.15 150);
+  --chart-3: oklch(0.78 0.16 70);
+  --chart-4: oklch(0.68 0.19 25);
+  --chart-5: oklch(0.68 0.14 200);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 0.2rem);
+  --radius-sm: calc(var(--radius) - 0.35rem);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+      "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@utility card {
+  @apply rounded-[var(--radius)] border border-[var(--border)] bg-[var(--card)] text-[var(--card-foreground)] shadow-sm;
+}
+
+@utility card-pad {
+  @apply p-5;
+}
+
+@utility field-label {
+  @apply text-xs font-medium text-[var(--muted-foreground)];
+}
+
+@utility field-hint {
+  @apply text-xs text-[var(--muted-foreground)];
+}
+
+@utility section-title {
+  @apply text-base font-semibold;
+}
+

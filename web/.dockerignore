@@ -1,0 +1,13 @@
+# 构建上下文裁剪：避免把本机依赖/产物/密钥塞进镜像
+node_modules
+.next
+.git
+.gitignore
+*.log
+.env
+.env.*
+.DS_Store
+tools
+tsconfig.tsbuildinfo
+AGENTS.md
+CLAUDE.md

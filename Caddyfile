@@ -1,0 +1,20 @@
+# RelayX clone — Caddy 入口
+# W1：http 端口做反向代理（/api/* + /healthz → backend，其余 → Next.js web）
+# W7：接入真实域名 + 自动 HTTPS
+
+:80 {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy backend:3000
+	}
+
+	handle /healthz {
+		reverse_proxy backend:3000
+	}
+
+	# 其余请求 → Next.js 前端（next start 监听 3000）
+	handle {
+		reverse_proxy web:3000
+	}
+}
