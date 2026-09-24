@@ -10,7 +10,7 @@ import { test, expect, describe, beforeEach, mock } from "bun:test";
  * TEN-02：键名带 scope 前缀，room 也带 scope —— 本文件同时验证跨租户隔离：
  * workspace A 的指纹不能影响 workspace B 的下发判定。
  */
-const ROOT = "/opt/TuneX-email-auth/backend/src";
+const ROOT = new URL("../..", import.meta.url).pathname;
 
 // ── 可控状态 ──
 let fingerprint = "fp-1";

@@ -16,7 +16,7 @@
  */
 import { test, expect, describe, mock } from "bun:test";
 
-const ROOT = "/opt/TuneX-email-auth/backend/src";
+const ROOT = new URL("..", import.meta.url).pathname;
 
 // env.ts 顶部会 fail-fast 校验 DATABASE_URL / AUTH_SECRET 等，屏蔽掉。
 mock.module(`${ROOT}/env.ts`, () => ({

@@ -8,7 +8,7 @@ import { test, expect, describe, mock } from "bun:test";
  * 用 Bun 的 `mock.module` 屏蔽 db/redis/env/license/config，使这条**纯函数**
  * 路径无需数据库即可离线跑通。
  */
-const ROOT = "/opt/TuneX/backend/src";
+const ROOT = new URL("../..", import.meta.url).pathname;
 mock.module(`${ROOT}/db.ts`, () => ({ db: {} }));
 mock.module(`${ROOT}/redis.ts`, () => ({
   redis: {

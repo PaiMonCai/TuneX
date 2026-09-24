@@ -19,7 +19,7 @@ import type {
   TrafficInsertRow,
 } from "../services/traffic-archive.ts";
 
-const ROOT = "/opt/TuneX-email-auth/backend/src";
+const ROOT = new URL("..", import.meta.url).pathname;
 
 // env.ts 顶层 fail-fast 校验 secret —— 屏蔽掉（redis-scope.test.ts 同一套路）。
 mock.module(`${ROOT}/env.ts`, () => ({

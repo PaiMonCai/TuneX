@@ -24,7 +24,7 @@
  */
 import { test, expect, describe, mock, beforeAll } from "bun:test";
 
-const ROOT = "/opt/TuneX-email-auth/backend/src";
+const ROOT = new URL("..", import.meta.url).pathname;
 
 /* ------------------------------------------------------------------ */
 /* 假数据库                                                            */

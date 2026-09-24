@@ -15,7 +15,7 @@ import type { EffectivePolicy, PolicyAssignment, PolicyRecord } from "../../serv
  *
  * 用 `mock.module` 屏蔽 db/redis/env/config，使纯函数路径离线可跑。
  */
-const ROOT = "/opt/TuneX/backend/src";
+const ROOT = new URL("../..", import.meta.url).pathname;
 mock.module(`${ROOT}/db.ts`, () => ({ db: {} }));
 mock.module(`${ROOT}/redis.ts`, () => ({
   redis: {
