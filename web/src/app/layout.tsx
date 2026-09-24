@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { cookies } from "next/headers";
 import { LOCALE_COOKIE, getDictionary, normalizeLocale } from "@/lib/i18n";
 import { AppProviders } from "@/components/providers";
+import { WorkspaceProvider } from "@/components/workspace/workspace-context";
 import { Toaster } from "sonner";
 import "./globals.css";
 
@@ -48,7 +49,8 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     <html lang={locale === "zh" ? "zh-CN" : "en"} suppressHydrationWarning>
       <body className="min-h-screen bg-[var(--background)] text-[var(--foreground)] antialiased">
         <AppProviders locale={locale} dict={dict}>
-          {children}
+          {/* TEN-01：workspace 上下文挂在根布局，让顶栏切换器、成员页、邀请弹窗共享同一份状态 */}
+          <WorkspaceProvider>{children}</WorkspaceProvider>
           <Toaster richColors position="top-center" />
         </AppProviders>
       </body>

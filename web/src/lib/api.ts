@@ -1,6 +1,8 @@
 /**
  * API 层：统一 fetch wrapper。
  * - 自动携带 Cookie（credentials: "include"，兼容 SSR 转发 cookie）
+ * - SEC-02 CSRF：所有写操作统一带 `X-CSRF-Token: 1` 自定义头
+ *   （后端 middlewares/csrf.ts 凭此 + Origin/Referer 挡跨站写）
  * - 401/403 时跳转登录页（携带 next 参数）
  * - NEXT_PUBLIC_API_MOCK=1 时改为调用 src/mocks/handler.ts 的手写响应
  */
@@ -37,6 +39,12 @@ import type {
   TunnelCreateInput,
   TunnelUpdateInput,
   User,
+  Workspace,
+  WorkspaceAcceptInviteResult,
+  WorkspaceCreateInput,
+  WorkspaceInvite,
+  WorkspaceInviteInput,
+  WorkspaceMember,
 } from "./types";
 
 export const API_MOCK = process.env.NEXT_PUBLIC_API_MOCK === "1";
@@ -48,6 +56,45 @@ export const API_MOCK = process.env.NEXT_PUBLIC_API_MOCK === "1";
 const SERVER_BASE = process.env.SERVER_API_BASE ?? "http://backend:3000";
 export const API_BASE =
   API_MOCK ? "" : typeof window === "undefined" ? SERVER_BASE : "";
+
+/**
+ * TEN-01：当前工作空间 ID。
+ * 后端（services/workspace.ts resolveWorkspaceAccess）对 /api/tunnels、/api/node-groups、
+ * /api/dashboard 等都按请求头 `x-workspace-id` 解析作用域；缺省 = 个人空间。
+ * 因此切换工作空间时必须让后续请求带上这个头，否则读写的仍是个人空间的资源。
+ *
+ * 存储策略：
+ *   - 浏览器：模块级单例（client bundle 内所有客户端组件共享同一实例），切换即生效；
+ *   - 服务端：读 `tunex_workspace` cookie（切换时一并写入），保证 SSR 首次渲染就是目标空间。
+ * 两者都缺失时 = 不带头 = 后端回落到个人空间。
+ */
+export const WORKSPACE_HEADER = "x-workspace-id";
+export const WORKSPACE_COOKIE = "tunex_workspace";
+
+let activeWorkspaceId: number | null = null;
+
+/** 切换 workspace 时调用（浏览器侧）；同时由调用方写入 cookie 以覆盖 SSR */
+export function setActiveWorkspace(id: number | null): void {
+  activeWorkspaceId = id && Number.isFinite(id) && id > 0 ? id : null;
+}
+
+/** 当前 workspace（客户端单例） */
+export function getActiveWorkspace(): number | null {
+  return activeWorkspaceId;
+}
+
+/** 服务端组件读 cookie 里的 workspace（`w<id>`，解析失败返回 null） */
+export function workspaceIdFromCookie(cookie: string): number | null {
+  const m = new RegExp(`${WORKSPACE_COOKIE}=w(\\d+)`).exec(cookie);
+  if (!m) return null;
+  const id = Number(m[1]);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/** 切换 workspace 时写入 cookie（供 SSR / 后续刷新使用） */
+export function workspaceCookieString(id: number): string {
+  return `${WORKSPACE_COOKIE}=w${id}; Path=/; Max-Age=${60 * 60 * 24 * 365}; SameSite=Lax`;
+}
 
 
 export class ApiError extends Error {
@@ -70,7 +117,24 @@ export interface RequestOptions {
   /** 401 时不跳转（用于登录接口自身、静默探测） */
   noRedirect?: boolean;
   cache?: RequestCache;
+  /** TEN-01：显式指定作用域工作空间（服务端组件用；缺失时后端回落个人空间 */
+  workspaceId?: number;
 }
+
+/* ================================================================== */
+/* SEC-02：CSRF 防护                                                      */
+/* ================================================================== */
+
+/**
+ * 写操作携带的自定义头（`X-CSRF-Token: 1`）。
+ *
+ * 后端 middlewares/csrf.ts 对「非安全方法 + 携带会话 cookie」的请求做 CSRF
+ * 判定：带此自定义头即放行，否则要求 Origin/Referer 的 host 与请求 Host 一致。
+ * 跨站页面无法在不触发 CORS 预检的情况下设置自定义头，而生产环境 CORS 关闭、
+ * 预检必败——因此「这个头存在」本身就是凭证。值固定为 1（无需与任何服务端
+ * 状态绑定，也就不存在令牌被读走/过期/轮换的问题）。
+ */
+export const CSRF_TOKEN_HEADER = "X-CSRF-Token";
 
 function buildQuery(query?: ListQuery): string {
   if (!query) return "";
@@ -108,7 +172,7 @@ export function clearMockSessionCookie(): void {
 }
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, query, cookie, noRedirect, cache } = options;
+  const { method = "GET", body, query, cookie, noRedirect, cache, workspaceId } = options;
   const url = `/api${path.startsWith("/") ? path : `/${path}`}${buildQuery(query)}`;
 
   if (API_MOCK) {
@@ -120,12 +184,24 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     if (res.status >= 400) {
       throw new ApiError(res.status, (res.body as { message?: string })?.message ?? "Request failed", res.body);
     }
+    // mock 响应没有 { data } 包装，直接用 body（与既有接口约定一致）
     return res.body as T;
   }
 
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (cookie) headers["Cookie"] = cookie;
+  // TEN-01：把当前 workspace 作为请求头传给后端（resolveWorkspaceAccess 的作用域）。
+  // 优先级：显式 workspaceId > 浏览器单例。SSR 未指定时不带头 = 后端回落个人空间。
+  const wsId = workspaceId ?? (typeof window !== "undefined" ? activeWorkspaceId : null);
+  if (wsId !== null) headers[WORKSPACE_HEADER] = String(wsId);
+
+  // SEC-02 CSRF：写操作带上自定义头凭证。后端 middlewares/csrf.ts 对
+  // 「非安全方法 + 携带会话 cookie」的请求要求它（或同源 Origin）。
+  const isMutating = method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+  if (isMutating) headers[CSRF_TOKEN_HEADER] = "1";
 
   const res = await fetch(`${API_BASE}${url}`, {
     method,
@@ -135,6 +211,11 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     cache: cache ?? "no-store",
   });
 
+  return await finalize<T>(res, noRedirect);
+}
+
+/** 统一解析响应：错误时抛 ApiError，成功时剥掉一层 { data }。 */
+async function finalize<T>(res: Response, noRedirect?: boolean): Promise<T> {
   if (res.status === 401 || res.status === 403) {
     if (!noRedirect) redirectToLogin();
   }
@@ -154,7 +235,11 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
         : null) ?? `Request failed with status ${res.status}`;
     throw new ApiError(res.status, msg, data);
   }
-  // 真实后端把业务数据包在 { data: T } 里，mock 模式没有这层包装，按有无 data 字段兼容
+  return unwrapData<T>(data);
+}
+
+/** 剥掉后端的一层 { data }（mock 模式没有这层，按有无 data 字段兼容）。 */
+function unwrapData<T>(data: unknown): T {
   const payload =
     data && typeof data === "object" && "data" in (data as Record<string, unknown>)
       ? (data as Record<string, unknown>).data
@@ -170,8 +255,29 @@ const put = <T>(path: string, body?: unknown, cookie?: string) => request<T>(pat
 const patch = <T>(path: string, body?: unknown, cookie?: string) =>
   request<T>(path, { method: "PATCH", body, cookie });
 const del = <T>(path: string, cookie?: string) => request<T>(path, { method: "DELETE", cookie });
-
 export const api = {
+  // ---- TEN-01 工作空间（个人/团队切换、成员、邀请）----
+  // 对应 backend/src/routes/workspaces.ts（挂载于 /api/workspaces）。
+  // 这几个端点全部按「会话 cookie」鉴权（Bearer token 会被后端 403 拒绝），
+  // 因此浏览器侧请求不要带 Authorization 头。
+  workspaces: {
+    /** 当前用户可见的全部工作空间（含个人空间），带上各自角色 */
+    list: (cookie?: string) => get<Workspace[]>("/workspaces", undefined, cookie),
+    /** 创建团队空间（后端事务内发放默认策略），创建者成为 owner */
+    create: (input: WorkspaceCreateInput, cookie?: string) =>
+      post<Workspace>("/workspaces", input, cookie),
+    members: (id: number, cookie?: string) =>
+      get<WorkspaceMember[]>(`/workspaces/${id}/members`, undefined, cookie),
+    /** 邀请成员；返回的 token 只出现一次，需当场展示 */
+    invite: (id: number, input: WorkspaceInviteInput, cookie?: string) =>
+      post<WorkspaceInvite>(`/workspaces/${id}/invites`, input, cookie),
+    /** 用邀请 token 加入团队（按当前登录用户邮箱匹配） */
+    acceptInvite: (token: string, cookie?: string) =>
+      post<WorkspaceAcceptInviteResult>("/workspaces/invites/accept", { token }, cookie),
+    /** 移除成员（owner 不可移除；也可用于「退出」：actor == targetId 时无需 manage 权限） */
+    removeMember: (id: number, userId: number, cookie?: string) =>
+      del<{ ok: boolean }>(`/workspaces/${id}/members/${userId}`, cookie),
+  },
   // 认证
   auth: {
     session: async (cookie?: string): Promise<AuthSession> => {

@@ -32,8 +32,12 @@ export interface User {
   parent_id: ID | null;
   referral_commission_rate: number | null;
   auto_renew: boolean;
-  api_key: string;
-  subscription_key: string;
+  /**
+   * 密钥字段：后端哈希化后，profile 读取一律返回 null（明文只在轮换端点出现一次）。
+   * 前端不得依赖该值做展示或拼接订阅地址，统一走 null 兜底分支。
+   */
+  api_key: string | null;
+  subscription_key: string | null;
   status: Status;
   created_at: string;
   updated_at: string;
@@ -71,6 +75,62 @@ export interface AdminResourceMeta {
   business: boolean;
   apiPrefixes: string[];
   granted: PermissionLevel | null;
+}
+
+/* ------------------------------------------------------------------ *
+ * TEN-01 工作空间（Workspace / Membership / Invite）
+ * 字段与 backend/prisma/schema.prisma 及 backend/src/routes/workspaces.ts 对齐。
+ * ------------------------------------------------------------------ */
+
+/** personal = 注册时自动创建的个人空间；team = 手动创建的团队空间 */
+export type WorkspaceKind = "personal" | "team";
+/** 固定四角色（services/workspace.ts 的 canWorkspaceAction 决定各动作权限） */
+export type WorkspaceRole = "owner" | "admin" | "member" | "viewer";
+
+/** GET /api/workspaces 的一行：工作空间 + 当前用户在该空间的角色 */
+export interface Workspace {
+  id: ID;
+  name: string;
+  slug: string;
+  kind: WorkspaceKind;
+  role: WorkspaceRole;
+  created_at: string;
+}
+
+/** GET /api/workspaces/:id/members 的一行（user.email 被拍平成 email） */
+export interface WorkspaceMember {
+  user_id: ID;
+  email: string;
+  role: WorkspaceRole;
+  created_at: string;
+}
+
+/** POST /api/workspaces 的载荷（团队空间名，1–120 字符） */
+export interface WorkspaceCreateInput {
+  name: string;
+}
+
+/** POST /api/workspaces/:id/invites 的载荷（受邀角色不含 owner） */
+export interface WorkspaceInviteInput {
+  email: string;
+  role: Exclude<WorkspaceRole, "owner">;
+}
+
+/**
+ * 邀请响应：`token` 只在创建时返回一次（后端仅存 sha256），
+ * 因此必须当场展示/复制，刷新后无法再找回。
+ */
+export interface WorkspaceInvite {
+  id: ID;
+  email: string;
+  role: WorkspaceRole;
+  expires_at: string;
+  token: string;
+}
+
+/** POST /api/workspaces/invites/accept 的响应 */
+export interface WorkspaceAcceptInviteResult {
+  workspace_id: ID;
 }
 
 /** 系统配置项（config 表一行） */

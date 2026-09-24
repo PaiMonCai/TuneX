@@ -23,21 +23,45 @@ function KeyRow({
   regenerating,
 }: {
   label: string;
-  value: string;
+  /** null = 后端哈希化后不再返回明文（不可信/已隐藏），走占位兜底 */
+  value: string | null;
   onRegenerate: () => void;
   regenerating: boolean;
 }) {
   const { t } = useI18n();
   const [visible, setVisible] = useState(false);
-  const masked = value.length > 8 ? `${value.slice(0, 6)}••••••${value.slice(-4)}` : "••••••";
+  const key = value ?? "";
+  const masked = key.length > 8 ? `${key.slice(0, 6)}••••••${key.slice(-4)}` : "••••••";
 
   async function copy() {
+    if (!key) return;
     try {
-      await navigator.clipboard.writeText(value);
+      await navigator.clipboard.writeText(key);
       toast.success(t("common.copied"));
     } catch {
-      toast.error(value);
+      toast.error(key);
     }
+  }
+
+  if (value === null) {
+    // 密钥只哈希存储：profile 读不到明文，不能再渲染 "null"
+    return (
+      <div className="flex flex-col gap-1.5">
+        <span className="field-label">{label}</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <code
+            className="min-w-0 flex-1 overflow-x-auto rounded-md border border-dashed border-[var(--input)] bg-[var(--muted)] px-3 py-2 font-mono text-xs text-[var(--muted-foreground)]"
+            data-testid="key-empty"
+          >
+            {t("settings.keyNotSet")}
+          </code>
+          <Button variant="outline" size="sm" onClick={onRegenerate} disabled={regenerating} data-testid={`regen-${label}`}>
+            {regenerating ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+            {t("common.regenerate")}
+          </Button>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -45,7 +69,7 @@ function KeyRow({
       <span className="field-label">{label}</span>
       <div className="flex flex-wrap items-center gap-2">
         <code className="min-w-0 flex-1 overflow-x-auto rounded-md border border-[var(--input)] bg-[var(--muted)] px-3 py-2 font-mono text-xs">
-          {visible ? value : masked}
+          {visible ? key : masked}
         </code>
         <Button variant="ghost" size="icon" onClick={() => setVisible((v) => !v)} aria-label={visible ? t("common.hide") : t("common.show")}>
           {visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
@@ -56,6 +80,43 @@ function KeyRow({
         <Button variant="outline" size="sm" onClick={onRegenerate} disabled={regenerating} data-testid={`regen-${label}`}>
           {regenerating ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
           {t("common.regenerate")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** 轮换后的一次性明文展示区：仅本次生成可取，离开/刷新即消失 */
+function OneTimeKeyBanner({ kind, value }: { kind: "api" | "sub"; value: string }) {
+  const { t } = useI18n();
+  const title = kind === "api" ? t("settings.newApiKey") : t("settings.newSubKey");
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(t("settings.keyCopied"));
+    } catch {
+      // 剪贴板被拒（非安全上下文/权限）时保留输入框供手动复制
+      toast.error(t("settings.keyCopyFailed"));
+    }
+  }
+
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-md border border-[var(--warning,#eab308)]/60 bg-[var(--warning,#eab308)]/10 px-4 py-3"
+      role="alert"
+      data-testid="one-time-key"
+    >
+      <div className="flex flex-col gap-0.5">
+        <p className="text-sm font-medium text-[var(--warning,#eab308)]">{t("settings.keyOnceTitle")}</p>
+        <p className="text-xs text-[var(--muted-foreground)]">{t("settings.keyOnceHint")}</p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="field-label">{title}</span>
+        <Input readOnly value={value} className="min-w-0 flex-1 font-mono text-xs" data-testid="one-time-key-input" />
+        <Button variant="outline" size="sm" onClick={copy} data-testid="one-time-key-copy">
+          <Copy className="size-4" />
+          {t("common.copy")}
         </Button>
       </div>
     </div>
@@ -77,6 +138,8 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
   // 密钥
   const [regenKey, setRegenKey] = useState<"api" | "sub" | null>(null);
   const [confirmRegen, setConfirmRegen] = useState<"api" | "sub" | null>(null);
+  // 轮换后的一次性明文（仅本次会话可见，刷新即丢）
+  const [freshKey, setFreshKey] = useState<{ kind: "api" | "sub"; value: string } | null>(null);
 
   // 密码
   const [currentPassword, setCurrentPassword] = useState("");
@@ -113,8 +176,17 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
   async function regenerate(kind: "api" | "sub") {
     setRegenKey(kind);
     try {
-      const res = kind === "api" ? await api.settings.regenerateApiKey() : await api.settings.regenerateSubscriptionKey();
-      setUser(res.user);
+      // 明文只此一次：落到一次性展示区，不写回 user 状态（哈希化后 user 里的字段为 null/不可信）。
+      // 两个响应形状不同，分分支 await 让 TS 各自收窄到 { api_key } / { subscription_key }。
+      if (kind === "api") {
+        const res = await api.settings.regenerateApiKey();
+        setUser(res.user);
+        setFreshKey({ kind, value: res.api_key });
+      } else {
+        const res = await api.settings.regenerateSubscriptionKey();
+        setUser(res.user);
+        setFreshKey({ kind, value: res.subscription_key });
+      }
       toast.success(t("settings.keyRegenerated"));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t("settings.keyRegenerateFailed"));
@@ -178,7 +250,11 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
   useEffect(() => {
     setOrigin(window.location.origin);
   }, []);
-  const subscriptionPath = `/api/tunnel/subscription?token=${user.subscription_key}`;
+  // subscription_key 哈希化后不可信（可能为 null）：拼不出可用地址，只展示路径提示
+  const hasSubKey = typeof user.subscription_key === "string" && user.subscription_key.length > 0;
+  const subscriptionPath = hasSubKey
+    ? `/api/tunnel/subscription?token=${user.subscription_key}`
+    : "/api/tunnel/subscription?token=…";
   const subscriptionUrl = origin ? `${origin}${subscriptionPath}` : subscriptionPath;
 
   return (
@@ -255,6 +331,7 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
           <CardDescription>{t("settings.keysDesc")}</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
+          {freshKey && <OneTimeKeyBanner kind={freshKey.kind} value={freshKey.value} />}
           <KeyRow
             label={t("settings.apiKey")}
             value={user.api_key}
