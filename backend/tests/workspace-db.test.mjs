@@ -32,13 +32,25 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     const result = await response.json();
     assert.equal(response.status, 201, JSON.stringify(result));
     const id = result.data.id;
-    const apiKey = result.data.api_key;
     ids.push(id);
     const login = await request("/api/auth/login", "POST", "", { email, password });
     assert.equal(login.status, 200);
     const cookie = login.headers.get("set-cookie")?.split(";")[0];
     assert.ok(cookie?.startsWith("access="));
-    return { id, cookie, apiKey };
+
+    // SEC-02: account credentials are hash-only at rest; plaintext is exposed
+    // exactly once by the rotation endpoints, so tests must capture it there.
+    const apiKeyResponse = await request("/api/settings/api-key", "POST", cookie);
+    assert.equal(apiKeyResponse.status, 200);
+    const apiKey = (await apiKeyResponse.json()).data.api_key;
+    assert.ok(apiKey);
+
+    const subscriptionKeyResponse = await request("/api/settings/subscription-key", "POST", cookie);
+    assert.equal(subscriptionKeyResponse.status, 200);
+    const subscriptionKey = (await subscriptionKeyResponse.json()).data.subscription_key;
+    assert.ok(subscriptionKey);
+
+    return { id, cookie, apiKey, subscriptionKey };
   }
 
   // 显式放宽超时：本用例串起 2 次注册（每次注册含 user + credential + workspace +
@@ -79,8 +91,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       const personalTunnel = await request("/api/tunnels", "POST", a.cookie, { name: "Personal TCP", tunnel_type: "tcp", in_node_group_id: (await personalGroup.json()).data.id, forward_addresses: ["127.0.0.1:8081"] });
       assert.equal(personalTunnel.status, 200, JSON.stringify(await personalTunnel.clone().json()));
       const personalTunnelId = (await personalTunnel.json()).data.id;
-      const subscriptionKey = (await db.user.findUniqueOrThrow({ where: { id: a.id }, select: { subscription_key: true } })).subscription_key;
-      const legacySubscription = await request(`/api/tunnel/subscription?token=${subscriptionKey}`, "GET", "", undefined, teamId);
+      const legacySubscription = await request(`/api/tunnel/subscription?token=${a.subscriptionKey}`, "GET", "", undefined, teamId);
       assert.equal(legacySubscription.status, 200);
       assert.deepEqual((await legacySubscription.json()).data.tunnels.map((t) => t.id), [personalTunnelId], "account subscription must never include team tunnels");
       assert.equal((await request("/api/tunnel/subscription?token=invalid", "GET", "")).status, 401);
