@@ -184,7 +184,7 @@ go vet ./...        # 必须无输出
 - **两者均可用环境变量关闭**：`AUDIT_LOG_ENABLED=false`、`RATE_LIMIT_ENABLED=false`（默认开启）。
 - 限流规则表在 `middlewares/rate-limit.ts#GLOBAL_RATE_LIMIT_RULES`；计数 key `ratelimit:<rule>:<identity>`，
   身份 `user:<id>` 优先、未登录回退 `ip:<ip>`。登录/注册按 IP，全站兜底按用户。
-- 审计写入在 `middlewares/audit.ts`（响应后 fire-and-forget），纯逻辑/写入器在 `services/audit.ts`；
+- 审计写入在 `middlewares/audit.ts`（响应后写入，失败吞掉、不阻断主响应），纯逻辑/写入器在 `services/audit.ts`；
   **永不写请求体**，敏感路径（password/token/callback/login…）强制丢弃 metadata。
 
 ---
@@ -445,7 +445,7 @@ mock 端点（`web/src/mocks/handler.ts`）已为上述页面补齐：
 | ~~`listen_error` 服务端 handler~~ | 后端 | ✅ 已补（`socket/listen-events.ts`）：`ERR_PORT_IN_USE` → 隧道置 `inactive` + 写 `port_conflict_at`（复刻上游语义）；`listen` 回填遇 `P2002` 也记 `port_conflict_at` 并重推该组 |
 | ~~`pushNodeConfig` 增量去重~~ | 后端 | ✅ 已落地：`config-pusher.ts` 默认路径用 `fingerprint` 与 Redis `node_group:config_hash` 比对，未变则跳过 `emit`（不加密/不下发）；`force:true`（隧道/register）仍强制下发并落缓存。Redis 故障 fail-open（照样推）。单测 `config-pusher-dedup.test.ts`（10 例） |
 | ~~全局限流~~ | 后端 | ✅ 已落地：`middlewares/rate-limit.ts` 固定窗口 + Redis Lua 原子计数（`ratelimit:<rule>:<identity>`），规则表覆盖登录/注册/找回/支付回调/全站 `api-global`；超限 429 + `Retry-After`，Redis 故障 fail-open。单测 `rate-limit.test.ts`（18 例） |
-| ~~审计日志~~ | 后端 | ✅ 已落地：`middlewares/audit.ts` + `services/audit.ts`，响应后 fire-and-forget 落 `audit_log` 表（新迁移）；非 GET 全记 + 管理端 GET + 敏感端点，**不落请求体**；`GET /api/admin/audit-logs`（仅超管）+ 前端 `/admin/audit-logs` 只读页。单测 `audit.test.ts`（24 例） |
+| ~~审计日志~~ | 后端 | ✅ 已落地：`middlewares/audit.ts` + `services/audit.ts`，响应后落 `audit_log` 表（新迁移）；非 GET 全记 + 管理端 GET + 敏感端点，**不落请求体**；`GET /api/admin/audit-logs`（仅超管）+ 前端 `/admin/audit-logs` 只读页。单测 `audit.test.ts`（24 例） |
 | ~~`port_conflict_at` 落库~~ | 后端 | ✅ 已落库：`listen` 回填 P2002 冲突、`listen_error` 端口占用两条路径都会写 `port_conflict_at` |
 
 ### 已验证可用的机制（2026-09-24 实测）
