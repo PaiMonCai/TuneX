@@ -31,6 +31,7 @@ import type {
   WorkspaceInvite,
   WorkspaceMember,
   WorkspaceRole,
+  WorkspaceTrafficSummary,
 } from "@/lib/types";
 import * as seed from "./data";
 import { getStore, resetStore, type MockWorkspaceInvite } from "./state";
@@ -845,6 +846,49 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           })
           .sort((a, b) => a.user_id - b.user_id);
         return ok(rows);
+      }
+
+      // GET /:id/traffic：workspace 流量聚合（OPS-03，与后端 /workspaces/:id/traffic 同构）
+      if (method === "GET" && seg[2] === "traffic") {
+        const days = Math.max(1, Math.min(90, Number(q?.days ?? 14) || 14));
+        // mock 里没有 workspace_id 归属的隧道集合，用 demo 用户的隧道近似：
+        // 按隧道累计流量 {traffic, traffic_cost} 拆分到各隧道分组 + 补齐日界序列。
+        const mine = db.tunnels.filter((t) => t.user_id === user.id);
+        const rows: WorkspaceTrafficSummary["by_tunnel"] = mine.map((t) => ({
+          tunnel_id: t.id,
+          name: t.name,
+          tunnel_type: t.tunnel_type,
+          in_node_group_id: t.in_node_group_id,
+          in_node_group_name: t.in_node_group?.name ?? null,
+          traffic: Number((t.traffic / GB).toFixed(2)),
+          traffic_cost: Number((t.traffic_cost ?? t.traffic / GB).toFixed(2)),
+        }));
+        const by_tunnel: WorkspaceTrafficSummary["by_tunnel"] = [...rows].sort(
+          (a, b) => b.traffic - a.traffic || a.tunnel_id - b.tunnel_id,
+        );
+        const total_traffic = Number(by_tunnel.reduce((s, x) => s + x.traffic, 0).toFixed(2));
+        const total_traffic_cost = Number(by_tunnel.reduce((s, x) => s + x.traffic_cost, 0).toFixed(2));
+        const gb = (n: number) => Math.round(n * 1024 * 1024 * 1024);
+        const by_day = Array.from({ length: days }, (_, i) => {
+          const wave = 0.6 + Math.abs(Math.sin(i * 0.9)) * 0.8;
+          const t = gb(Number(((total_traffic / days) * wave).toFixed(3)));
+          return {
+            date: new Date(seed.now.getTime() - (days - 1 - i) * 86400000).toISOString().slice(0, 10),
+            traffic: t,
+            traffic_cost: Number(((total_traffic_cost / days) * wave).toFixed(4)),
+          };
+        });
+        const summary: WorkspaceTrafficSummary = {
+          workspace_id: id,
+          period: "total",
+          since: new Date(seed.now.getTime() - (days - 1) * 86400000).toISOString(),
+          total_traffic: gb(total_traffic),
+          total_traffic_cost: total_traffic_cost,
+          by_tunnel: by_tunnel.map((x) => ({ ...x, traffic: gb(x.traffic), traffic_cost: x.traffic_cost })),
+          by_day,
+          orphan_rows: 0,
+        };
+        return ok(summary);
       }
 
       // POST /:id/invites：仅 team + owner/admin；重复邮箱 409；成员+待接受邀请上限 5

@@ -6,9 +6,15 @@
 # 写入 scripts/net01-e2e/.env.net01（权限 600，含密钥，勿提交）。
 #
 # 幂等：可重复执行。重复执行会复用已有数据卷，仅补齐缺失对象。
+#
+# CI 适配（GitHub Actions ubuntu-latest，PR 事件无 images job）：
+#   · TUNEX_BACKEND_IMAGE 指定镜像；未指定且本地没有该镜像时，从
+#     $REPO/backend 现构建一个（PR 上 registry 里可能没有最新后端镜像，
+#     拉到的会是旧代码 → 测试的是旧行为，宁可本地构建）。
+#     CI 侧也可以 `export BUILD_BACKEND_IMAGE=1` 强制构建。
 set -euo pipefail
 
-REPO=${REPO:-/opt/TuneX-email-auth}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/net01-e2e"
 cd "$REPO"
 
@@ -45,6 +51,25 @@ JWT_ISSUER=net01
 SITE_URL=$SITE_URL
 EOF
   chmod 600 "$ENVF"
+fi
+
+# ---- 控制面镜像 ------------------------------------------------------------
+# CI / 首次运行：本地可能没有 ghcr.io/paimoncai/tunex-backend:latest（PR 事件
+# 没有 images job 推送新镜像）。此时从本仓库 backend/ 构建一个 net01-backend:ci
+# 并用 TUNEX_BACKEND_IMAGE 指过去，确保测的是当前 checkout 的代码。
+if [[ "${BUILD_BACKEND_IMAGE:-}" == "1" ]]; then
+  say "构建控制面镜像（BUILD_BACKEND_IMAGE=1）"
+  docker build -t net01-backend:ci "$REPO/backend"
+  export TUNEX_BACKEND_IMAGE=net01-backend:ci
+elif [[ -n "${TUNEX_BACKEND_IMAGE:-}" ]]; then
+  say "使用指定镜像 TUNEX_BACKEND_IMAGE=$TUNEX_BACKEND_IMAGE"
+  docker image inspect "$TUNEX_BACKEND_IMAGE" >/dev/null || die "镜像不存在: $TUNEX_BACKEND_IMAGE"
+else
+  if ! docker image inspect ghcr.io/paimoncai/tunex-backend:latest >/dev/null 2>&1; then
+    say "本地没有 ghcr.io/paimoncai/tunex-backend:latest，改为本地构建"
+    docker build -t net01-backend:ci "$REPO/backend"
+    export TUNEX_BACKEND_IMAGE=net01-backend:ci
+  fi
 fi
 
 # ---- 拉起数据服务 ----------------------------------------------------------

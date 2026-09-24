@@ -11,7 +11,7 @@
 # 依赖 config/license 密钥与 SITE_URL 来自 scripts/net01-e2e/.env.net01。
 set -euo pipefail
 
-REPO=${REPO:-/opt/TuneX-email-auth}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/net01-e2e"
 AGENT_BIN=${AGENT_BIN:-/tmp/tunex-agent-net01}
 SITE_URL=${SITE_URL:-http://127.0.0.1:8788}

@@ -13,7 +13,7 @@
 # 输出：scripts/net01-e2e/state.json（verify.sh 与 agent 启动脚本都从这里读）
 set -euo pipefail
 
-REPO=${REPO:-/opt/TuneX-email-auth}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/net01-e2e"
 API=${API:-http://127.0.0.1:8787}
 ENVF="$HERE/.env.net01"

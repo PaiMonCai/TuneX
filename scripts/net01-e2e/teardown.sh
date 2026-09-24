@@ -5,7 +5,7 @@
 # 不动 relayx 栈、不动 /opt/TuneX 栈、不动其它任何容器。
 set -euo pipefail
 
-REPO=${REPO:-/opt/TuneX-email-auth}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/net01-e2e"
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }

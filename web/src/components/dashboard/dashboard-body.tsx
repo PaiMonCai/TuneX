@@ -6,18 +6,28 @@ import { StatCard } from "@/components/stat-card";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle, Progress } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { api } from "@/lib/api";
+import { api, workspaceIdFromCookie } from "@/lib/api";
 import { serverT } from "@/lib/server-i18n";
 import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
-import type { DashboardStats, TrafficPoint, Tunnel } from "@/lib/types";
+import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
+import type { DashboardStats, Tunnel } from "@/lib/types";
 
 /** 仪表盘数据体（服务端组件，AppShell 内由 Suspense 包裹） */
 export async function DashboardBody() {
   const cookie = (await cookies()).toString();
   const { t, dict } = await serverT();
+
+  // OPS-03：流量改为 workspace 级聚合（/workspaces/:id/traffic）。workspace id
+  // 从 `tunex_workspace` cookie 解析（顶栏切换器切换时写入，与客户端上下文同源），
+  // 缺失时不猜个人空间、直接进入空态——让页面显示「未选择空间」而非别的空间的流量。
+  const workspaceId = workspaceIdFromCookie(cookie);
+
   const [stats, traffic, tunnels] = await Promise.all([
     api.dashboard.stats(cookie).catch(() => null as DashboardStats | null),
-    api.dashboard.traffic(14, cookie).catch(() => [] as TrafficPoint[]),
+    loadDashboardTraffic({
+      workspaceId,
+      fetchTraffic: (id, days) => api.workspaces.traffic(id, { days }),
+    }).catch(() => null),
     api.tunnels
       .list({ page: 1, page_size: 5 }, cookie)
       .catch(() => ({ data: [] as Tunnel[], total: 0, page: 1, page_size: 5 })),
@@ -44,8 +54,8 @@ export async function DashboardBody() {
         />
         <StatCard
           title={t("dashboard.monthTraffic")}
-          value={formatBytes(stats?.month_traffic ?? 0)}
-          hint={paymentsEnabled ? `${t("dashboard.trafficUsed")}: ${formatBytes(stats?.traffic_limit ?? 0)}` : undefined}
+          value={formatBytes(traffic?.summary?.total_traffic ?? stats?.month_traffic ?? 0)}
+          hint={traffic?.summary ? `${t("dashboard.trafficPeriod")}: ${t(`dashboard.period.${traffic.summary.period}`)}` : undefined}
           icon={Waves}
           testId="stat-traffic"
         />
@@ -62,9 +72,31 @@ export async function DashboardBody() {
         <Card className={paymentsEnabled ? "lg:col-span-2" : "lg:col-span-3"}>
           <CardHeader>
             <CardTitle>{t("dashboard.trafficTrend")}</CardTitle>
-            <CardDescription>{t("dashboard.subtitle")}</CardDescription>
+            <CardDescription>
+              {traffic?.status === "error"
+                ? traffic.message ?? dict.common.noData
+                : t("dashboard.trafficTrendDesc", { days: TRAFFIC_TREND_DAYS })}
+            </CardDescription>
           </CardHeader>
-          <CardContent>{traffic.length > 0 ? <TrafficChart data={traffic} /> : <div className="h-64 rounded-md bg-[var(--muted)]" />}</CardContent>
+          <CardContent>
+            {traffic && traffic.points.length > 0 ? (
+              <TrafficChart data={traffic.points} />
+            ) : traffic?.status === "error" ? (
+              <div
+                className="flex h-64 items-center justify-center rounded-md border border-dashed border-[var(--border)] text-sm text-[var(--muted-foreground)]"
+                data-testid="traffic-error"
+              >
+                {traffic.message ?? dict.common.noData}
+              </div>
+            ) : (
+              <div
+                className="flex h-64 items-center justify-center rounded-md border border-dashed border-[var(--border)] text-sm text-[var(--muted-foreground)]"
+                data-testid="traffic-empty"
+              >
+                {dict.common.noData}
+              </div>
+            )}
+          </CardContent>
         </Card>
 
         {paymentsEnabled && <Card>
@@ -110,8 +142,12 @@ export async function DashboardBody() {
       <Card>
         <CardHeader className="flex-row items-start justify-between">
           <div>
-            <CardTitle>{t("dashboard.recentTunnels")}</CardTitle>
-            <CardDescription>{dict.common.tagline}</CardDescription>
+            <CardTitle>{t("dashboard.tunnelRanking")}</CardTitle>
+            <CardDescription>
+              {traffic?.summary
+                ? `${t("dashboard.totalTraffic")}: ${formatBytes(traffic.summary.total_traffic)}`
+                : dict.common.tagline}
+            </CardDescription>
           </div>
           <Button size="sm" variant="outline" asChild>
             <Link href="/tunnels">{t("common.tunnels")}</Link>

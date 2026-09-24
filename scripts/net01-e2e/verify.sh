@@ -13,7 +13,7 @@
 # 输出：PASS/FAIL 逐项 + 退出码（0 = 全过）；证据落 scripts/net01-e2e/evidence/。
 set -uo pipefail
 
-REPO=${REPO:-/opt/TuneX-email-auth}
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/net01-e2e"
 API=${API:-http://127.0.0.1:8787}
 LOG_A=/tmp/net01/tenantA/agent.log
@@ -47,8 +47,10 @@ assert_status_in() { # <actual> <allowed...> "label"
 }
 # state <tenant> <field>
 state() { python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d[sys.argv[2]][sys.argv[3]])" "$HERE/state.json" "$1" "$2"; }
-mysqlc() { docker exec net01-mysql mysql -uroot -p"$(grep MYSQL_ROOT_PASSWORD "$HERE/.env.net01" | cut -d= -f2)" \
-           tunex -N -e "$1" 2>/dev/null | tail -1; }
+# mysqlc() 从 net01-mysql 容器读 root 口令（不依赖 .env.net01 文件是否还在：
+# teardown 之后验证脚本单独跑时 .env.net01 已被删，从容器环境变量取更稳）。
+mysqlc() { docker exec net01-mysql sh -c \
+           'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" tunex -N -e "$0"' "$1" 2>/dev/null | tail -1; }
 
 WA=$(state tenantA listenPort); PA=39001
 WB=$(state tenantB listenPort); PB=39002

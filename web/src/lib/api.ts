@@ -45,6 +45,7 @@ import type {
   WorkspaceInvite,
   WorkspaceInviteInput,
   WorkspaceMember,
+  WorkspaceTrafficSummary,
 } from "./types";
 
 export const API_MOCK = process.env.NEXT_PUBLIC_API_MOCK === "1";
@@ -277,6 +278,19 @@ export const api = {
     /** 移除成员（owner 不可移除；也可用于「退出」：actor == targetId 时无需 manage 权限） */
     removeMember: (id: number, userId: number, cookie?: string) =>
       del<{ ok: boolean }>(`/workspaces/${id}/members/${userId}`, cookie),
+    /**
+     * OPS-03：workspace 流量聚合（按 workspace 归属，口径与策略流量一致）。
+     * 返回总流量 + 按隧道排行 + 按日界补齐的趋势序列。
+     * @param id workspace id（TEN-01 切换空间时必须传当前空间）
+     * @param params.days 趋势天数（1–90，默认 14，后端 `TRAFFIC_DEFAULT_DAYS`）
+     * @param params.period 计量周期（day/month/total）；缺省取该空间生效策略的 traffic_period
+     */
+    traffic: (
+      id: number,
+      params?: { days?: number; period?: "day" | "month" | "total" },
+      cookie?: string,
+    ) =>
+      get<WorkspaceTrafficSummary>(`/workspaces/${id}/traffic`, params as ListQuery, cookie),
   },
   // 认证
   auth: {
