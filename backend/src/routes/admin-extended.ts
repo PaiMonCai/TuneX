@@ -1,5 +1,5 @@
 /**
- * 管理端扩展路由（W1）—— 前端 api.admin.* 中 admin.ts 未覆盖的 CRUD 与列表
+ * 管理端扩展路由—— 前端 api.admin.* 中 admin.ts 未覆盖的 CRUD 与列表
  *
  * 挂载（app.ts）：app.route("/api/admin", adminExtendedRoutes);
  * 中间件由 app.ts 统一施加，与 adminRoutes 相同：
@@ -1211,6 +1211,51 @@ adminExtendedRoutes.get("/tickets", async (c) => {
       },
     }),
     db.ticket.count({ where }),
+  ]);
+
+  return listJson(c, rows, total, page, limit);
+});
+
+/* ================================================================== */
+/* 审计日志 —— /api/admin/audit-logs                                   */
+/* 仅超管可读：permissions.ts 的 ADMIN_ROUTE_TABLE 未登记本前缀 →        */
+/* adminPermissionGuard 对非超管 403（fail-closed）。超级管理员在守卫   */
+/* 中直接放行，故这里不再叠加权限中间件。                               */
+/* ================================================================== */
+
+adminExtendedRoutes.get("/audit-logs", async (c) => {
+  const { page, limit, skip, take, keyword } = readPage(c);
+  const q = c.req.query();
+
+  const actorId = numOrNull(q.actor_id);
+  const status = numOrNull(q.status);
+  const actorType =
+    q.actor_type && ["user", "super_admin", "admin", "system", "anonymous"].includes(String(q.actor_type))
+      ? (String(q.actor_type) as Prisma.AuditLogWhereInput["actor_type"])
+      : undefined;
+  const method = q.method ? String(q.method).toUpperCase() : undefined;
+
+  const where = {
+    ...(actorId !== null ? { actor_id: actorId } : {}),
+    ...(actorType ? { actor_type: actorType } : {}),
+    ...(method ? { method } : {}),
+    ...(status !== null ? { status } : {}),
+    ...(q.resource ? { resource: { contains: String(q.resource) } } : {}),
+    ...(keyword
+      ? {
+          OR: [
+            { path: { contains: keyword } },
+            { action: { contains: keyword } },
+            { actor_email: { contains: keyword } },
+            { resource: { contains: keyword } },
+          ],
+        }
+      : {}),
+  } as Prisma.AuditLogWhereInput;
+
+  const [rows, total] = await Promise.all([
+    db.auditLog.findMany({ where, orderBy: { id: "desc" }, skip, take }),
+    db.auditLog.count({ where }),
   ]);
 
   return listJson(c, rows, total, page, limit);

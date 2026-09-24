@@ -2,13 +2,25 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
   pull_request:
 
 permissions:
   contents: read
+  packages: write
+
+env:
+  IMAGE_NAMESPACE: ghcr.io/paimoncai/tunex
 
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - name: Scan tracked files for leaked secrets
+        run: bun scripts/ci/secret-scan.mjs
+
   backend:
     runs-on: ubuntu-latest
     services:
@@ -30,10 +42,14 @@ jobs:
           --health-cmd="redis-cli ping" --health-interval=10s
           --health-timeout=5s --health-retries=12
     env:
-      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci
+      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci # secret-scan:allow (CI-only fixture, not a real secret)
       REDIS_URL: redis://127.0.0.1:6379
-      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production
-      LICENSE_SECRET: ci-only-license-secret-must-not-be-used-in-production
+      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
+      LICENSE_SECRET: ci-only-license-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
+      # Per-install Fernet keys: src/env.ts fails fast at startup unless both are
+      # present and valid 32-byte base64url keys. CI-only values, never deployed.
+      TUNEX_CONFIG_KEY: Y2ktb25seS1jb25maWcta2V5LW11c3Qtbm90LXByb2Q= # secret-scan:allow (CI-only fixture, not a real secret)
+      TUNEX_LICENSE_KEY: Y2ktb25seS1saWNlbnNlLWtleS1tdXN0LW5vdC1wcm8= # secret-scan:allow (CI-only fixture, not a real secret)
       PAYMENTS_ENABLED: "false"
     defaults:
       run:
@@ -60,7 +76,7 @@ jobs:
       - name: Migrate and verify existing two-user database
         run: |
           bunx prisma db execute --schema prisma/schema.prisma --file tests/fixtures/create-upgrade-db.sql
-          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci # secret-scan:allow (CI-only fixture, not a real secret)
           temp_dir=$(mktemp -d)
           cp prisma/schema.prisma "$temp_dir/schema.prisma"
           mkdir -p "$temp_dir/migrations"
@@ -105,3 +121,51 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: go build -buildvcs=false ./...
+      - name: Cross-compile release binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-linux-arm64 .
+          # Windows target intentionally omitted: the agent uses Linux-only syscalls
+          # (netutil/statfs.go -> syscall.Statfs), so GOOS=windows fails to build.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunex-agent
+          path: agent/dist/
+          retention-days: 14
+
+  images:
+    needs: [secret-scan, backend, web, agent]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAMESPACE }}-backend:latest
+            ${{ env.IMAGE_NAMESPACE }}-backend:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+      - name: Build & push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./web
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAMESPACE }}-web:latest
+            ${{ env.IMAGE_NAMESPACE }}-web:${{ github.sha }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web

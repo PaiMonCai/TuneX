@@ -11,7 +11,7 @@ export default async function LandingPage() {
   const store = await cookies();
   const locale = normalizeLocale(store.get(LOCALE_COOKIE)?.value);
   const t = getDictionary(locale);
-  const loggedIn = !!store.get("relayx_session");
+  const loggedIn = !!store.get("tunex_session");
 
   const features = [
     { icon: Network, title: t.landing.feature1Title, desc: t.landing.feature1Desc },

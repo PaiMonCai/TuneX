@@ -54,8 +54,11 @@ export interface ConfigRefreshDataSource {
 
 export interface ConfigRefreshDeps {
   dataSource?: ConfigRefreshDataSource;
-  /** 推送函数（默认 {@link pushNodeConfig}）。 */
-  pusher?: (groupId: number) => Promise<void>;
+  /**
+   * 推送函数（默认 {@link pushNodeConfig}）。
+   * 返回 `false` 表示本次因指纹去重被跳过；`true`/`void` 视为已下发。
+   */
+  pusher?: (groupId: number) => Promise<boolean | void>;
 }
 
 const defaultDataSource: ConfigRefreshDataSource = {
@@ -203,7 +206,9 @@ export async function collectAffectedNodeGroupsForPlans(
 
 /**
  * 把给定节点组集合的配置重新生成并推送给各自 room 内的在线 agent。
- * 逐组独立、异常吞掉；返回**实际尝试推送**的去重后组 id 列表。
+ * 逐组独立、异常吞掉。
+ *
+ * @returns **实际发生下发**的组 id 列表（去重命中而被跳过的组不计入）。
  */
 export async function refreshNodeGroups(
   groupIds: Iterable<number | null | undefined>,
@@ -212,16 +217,16 @@ export async function refreshNodeGroups(
   const ids = normalizeGroupIds(groupIds);
   if (ids.length === 0) return [];
   const push = deps.pusher ?? pushNodeConfig;
-  const results: number[] = [];
+  const pushed: number[] = [];
   for (const id of ids) {
     try {
-      await push(id);
-      results.push(id);
+      const didPush = await push(id);
+      if (didPush) pushed.push(id);
     } catch {
       /* 单组失败不影响其余 */
     }
   }
-  return results;
+  return pushed;
 }
 
 /* ------------------------------------------------------------------ */

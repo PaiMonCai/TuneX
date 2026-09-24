@@ -1,6 +1,6 @@
 /**
  * 支付路由 —— 用户侧下单 + 网关异步回调
- * 依据: relayx-pay-channel-analysis-report.md §6-§7（源码级还原 rurets/pay.ts + routes/topup.ts）
+ * 依据: pay-channel-analysis-report.md §6-§7（源码级还原 rurets/pay.ts + routes/topup.ts）
  *
  * 端点：
  *   GET  /api/pay                      支付方式列表（仅非敏感字段，需认证）
@@ -13,7 +13,7 @@
  *   import { payRoutes } from "./routes/pay.ts";
  *   app.route("/api/pay", payRoutes);
  *
- * 免认证依赖 W1 白名单正则 `/^\/api\/pay\/[^/]+\/callback$/`（已存在）。
+ * 免认证依赖 Whitelist regex `/^\/api\/pay\/[^/]+\/callback$/`（已存在）。
  *
  * 框架依赖：仅 Hono 的**类型与异常**（HTTPException）+ zod 入参校验。
  * 业务逻辑全部在 services/payment/**，路由层只做适配。

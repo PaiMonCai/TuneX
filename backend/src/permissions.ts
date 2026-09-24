@@ -1,7 +1,7 @@
 /**
  * RBAC 资源权限表 —— 严格复刻原版 `packages/shared/src/permissions.ts`
  * 19 个资源键 + 2 个特殊键，来源：
- * /root/relayx-reports/deep-analysis/relayx-auth-rbac-source-verification-report.md §4
+ * auth-rbac-source-verification-report.md §4
  */
 
 export type PermissionLevel = "read" | "write";
@@ -43,6 +43,7 @@ export const ADMIN_RESOURCES: AdminResource[] = [
   { key: "tickets", label: "工单管理", group: "用户", url: "/admin/tickets", business: true, apiPrefixes: ["/admin/ticket", "/admin/tickets"] },
   { key: "settings", label: "系统设置", group: "系统", url: "/admin/settings", business: false, apiPrefixes: ["/admin/system/config"] },
   { key: "license", label: "License 管理", group: "系统", url: "/admin/license", business: false, apiPrefixes: ["/admin/license"] },
+  { key: "audit", label: "审计日志", group: "系统", url: "/admin/audit-logs", business: false, apiPrefixes: ["/admin/audit-logs"] },
 ];
 
 export const ADMIN_RESOURCE_KEYS: string[] = ADMIN_RESOURCES.map((r) => r.key);
@@ -116,7 +117,7 @@ export interface AccessUserLike {
  * 多角色权限合并：write 优先，read 不降级；super_admin 全量 write。
  * 与原版语义一致（顺序无关）。
  */
-export function getEffectiveAccess(user: AccessUserLike): Map<string, PermissionLevel> {
+export function getEffectiveAccess(user: AccessUserLike | null | undefined): Map<string, PermissionLevel> {
   const access = new Map<string, PermissionLevel>();
 
   if (user?.super_admin) {

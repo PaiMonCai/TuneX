@@ -5,6 +5,8 @@
  * AUTH_SECRET, LICENSE_SECRET, TUNEX_CONFIG_KEY and TUNEX_LICENSE_KEY.
  * Missing secrets fail fast instead of silently using a shared value.
  */
+import { configKey, licenseKey } from "./crypto/keys.ts";
+
 function requireSecret(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required and has no default`);
@@ -20,8 +22,7 @@ export const env = {
   redisUrl: process.env.REDIS_URL ?? "redis://redis:6379",
 
   authSecret: requireSecret("AUTH_SECRET"),
-  // Keep legacy issuer as default so existing sessions survive this release.
-  jwtIssuer: process.env.JWT_ISSUER ?? "relayx-clone",
+  jwtIssuer: process.env.JWT_ISSUER ?? "tunex",
   /** Cookie `access` 的 JWT 有效期：12h（与原版会话对齐） */
   jwtTtlSeconds: Number(process.env.JWT_TTL_SECONDS ?? 12 * 60 * 60),
 
@@ -39,3 +40,11 @@ export const env = {
   /** Optional billing integration; off by default, independent of RBAC. */
   paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
 } as const;
+
+// Fail fast at startup: validate the per-install Fernet keys as soon as this
+// module is loaded, instead of lazily on first use. A deployment missing either
+// key cannot boot, so a key leaked from one install can never be reused.
+if (process.env.NODE_ENV !== "test") {
+  configKey();
+  licenseKey();
+}

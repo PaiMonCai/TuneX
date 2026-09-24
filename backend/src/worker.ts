@@ -1,6 +1,6 @@
 /**
  * Worker —— BullMQ 队列 + 10 个 cron 任务
- * 依据: relayx-worker-cross-validation-report.md §cron 任务表
+ * 依据: worker-cross-validation-report.md §cron 任务表
  *
  * 任务名单（原版确认为 10 个）：
  *   cron_delete_tunnel_traffic   0 0 * * *        过期流量清理
@@ -13,14 +13,18 @@
  *   cron_reset_expired_tunnel    重置过期隧道
  *   cron_reset_table_order       重置表排序
  *   cron_push_node_config        推送节点配置
+ *   cron_check_node_offline      离线检测：消费 `dc:*` 标记，防抖到点置 inactive
  *
- * W1 仅注册任务骨架与调度（handler 打日志 + 计数），业务逻辑在 W2-W5 填充。
+ * 原版 10 个 cron 任务均已注册调度；各 handler 当前为占位实现（仅打日志/计数），
+ * 真正的业务逻辑（流量入库、DNS 同步、自动续费等）待后续迭代补齐。
+ * `cron_check_node_offline` 为 TuneX 新增（第 11 个），补上离线检测闭环（已实现）。
  */
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import { env } from "./env.ts";
 import { db } from "./db.ts";
 import { redis } from "./redis.ts";
+import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步" },
@@ -33,32 +37,49 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
   { name: "cron_reset_expired_tunnel", everyMs: 60_000, desc: "重置过期隧道" },
   { name: "cron_reset_table_order", everyMs: 86_400_000, desc: "重置表排序" },
   { name: "cron_push_node_config", everyMs: 5_000, desc: "推送节点配置" },
+  { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
-const queue = new Queue("relayx-cron", { connection });
+const queue = new Queue("tunex-cron", { connection });
 
 const worker = new Worker(
-  "relayx-cron",
+  "tunex-cron",
   async (job: Job) => {
     const started = Date.now();
     switch (job.name) {
       case "cron_save_traffic": {
-        // W4 实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany
+        // 待实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany
         const pending = await redis.keys("tunnel:traffic:*");
-        return { pending: pending.length, note: "W4: buffer→DB" };
+        return { pending: pending.length, note: "buffer→DB" };
       }
       case "cron_delete_tunnel_traffic": {
-        // W4 实现：按 TUNNEL_TRAFFIC_RETENTION_DAYS 清理
+        // 待实现：按 TUNNEL_TRAFFIC_RETENTION_DAYS 清理
         const days = await db.systemConfig.findUnique({ where: { name: "TUNNEL_TRAFFIC_RETENTION_DAYS" } });
         return { retention_days: days?.value ?? "30" };
       }
       case "cron_push_node_config":
-        return { nodes: await db.node.count(), note: "W3: sha256 增量推送" };
+        return { nodes: await db.node.count(), note: "sha256 incremental push" };
+      case "cron_check_node_offline": {
+        // 消费 `dc:<gid>:<nodeId>` 标记：防抖（60s）到点且无心跳 → 节点置 inactive。
+        // 幂等：重复消费/多 worker 并存均不会重复翻转（updateMany where status=active）。
+        const r = await runOfflineCheck(defaultOfflineDeps());
+        const summary = {
+          scanned: r.scanned,
+          flipped: r.flipped,
+          skipped: r.skippedWithinDebounce + r.skippedHeartbeatAlive,
+          cleared_groups: r.clearedGroups,
+          errors: r.errors,
+        };
+        if (r.flipped > 0 || r.errors > 0) {
+          console.log("[worker] cron_check_node_offline:", JSON.stringify(summary));
+        }
+        return summary;
+      }
       case "cron_update_agent":
         return { auto_update: await db.systemConfig.findUnique({ where: { name: "AUTO_UPDATE_AGENT" } }) };
       default:
-        return { note: "W1 skeleton", ms: Date.now() - started };
+        return { note: "cron handler not yet implemented", ms: Date.now() - started };
     }
   },
   { connection, concurrency: 5 },

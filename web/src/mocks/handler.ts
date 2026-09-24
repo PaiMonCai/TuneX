@@ -10,6 +10,7 @@
  * create/update/delete 的结果在同一次 dev/build 运行期间持续可见。
  */
 import type {
+  AdminRole,
   BillingCycle,
   BalanceLog,
   ID,
@@ -41,7 +42,7 @@ export interface MockResponse {
   body: unknown;
 }
 
-const SESSION_COOKIE = "relayx_session";
+const SESSION_COOKIE = "tunex_session";
 const GB = 1024 * 1024 * 1024;
 
 /** 会话 cookie 值：`u<id>` 指定用户；用 id 而非邮箱，避免用户改邮箱后会话失效 */
@@ -62,6 +63,44 @@ const COUPONS: Record<string, { type: "percent" | "amount"; value: number }> = {
   TUNEX10: { type: "percent", value: 10 },
   TUNEX50: { type: "amount", value: 50 },
 };
+
+/**
+ * 权限元数据（镜像 backend/src/permissions.ts 的 ADMIN_RESOURCES）。
+ * mock 只用于渲染角色编辑器的资源清单，键必须与后端一致。
+ */
+const ADMIN_RESOURCES: { key: string; label: string; group: string; url: string; business: boolean }[] = [
+  { key: "dashboard", label: "首页", group: "概览", url: "/admin", business: false },
+  { key: "node_groups", label: "节点组配置", group: "基础", url: "/admin/node-groups", business: false },
+  { key: "nodes", label: "节点配置", group: "基础", url: "/admin/nodes", business: false },
+  { key: "plans", label: "套餐配置", group: "基础", url: "/admin/plans", business: false },
+  { key: "plan_coupons", label: "优惠券配置", group: "财务", url: "/admin/plan-coupons", business: true },
+  { key: "payments", label: "支付配置", group: "财务", url: "/admin/payments", business: true },
+  { key: "topups", label: "充值记录", group: "财务", url: "/admin/topups", business: true },
+  { key: "topup_activities", label: "充值活动", group: "财务", url: "/admin/topup-activities", business: true },
+  { key: "orders", label: "购买记录", group: "财务", url: "/admin/orders", business: false },
+  { key: "balance_logs", label: "余额记录", group: "财务", url: "/admin/balance-logs", business: false },
+  { key: "commission_logs", label: "佣金记录", group: "推广", url: "/admin/commission-logs", business: true },
+  { key: "withdraw", label: "提现管理", group: "推广", url: "/admin/withdraw", business: true },
+  { key: "users", label: "用户管理", group: "用户", url: "/admin/users", business: false },
+  { key: "user_plans", label: "用户套餐", group: "用户", url: "/admin/user-plans", business: false },
+  { key: "tunnels", label: "用户隧道", group: "用户", url: "/admin/tunnels", business: false },
+  { key: "tunnel_stats", label: "隧道统计", group: "用户", url: "/admin/tunnels/stats", business: false },
+  { key: "tickets", label: "工单管理", group: "用户", url: "/admin/tickets", business: true },
+  { key: "settings", label: "系统设置", group: "系统", url: "/admin/settings", business: false },
+  { key: "license", label: "License 管理", group: "系统", url: "/admin/license", business: false },
+  { key: "audit", label: "审计日志", group: "系统", url: "/admin/audit-logs", business: false },
+];
+const ADMIN_RESOURCE_KEYS = ADMIN_RESOURCES.map((r) => r.key);
+
+/** 角色权限入库前清洗：仅保留已知 key 且值为 read/write */
+function sanitizePermissions(input: unknown): Record<string, "read" | "write"> {
+  const result: Record<string, "read" | "write"> = {};
+  if (!input || typeof input !== "object" || Array.isArray(input)) return result;
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    if (ADMIN_RESOURCE_KEYS.includes(k) && (v === "read" || v === "write")) result[k] = v;
+  }
+  return result;
+}
 
 /** 新建充值单后多久自动「收到支付回调」（毫秒），0 表示关闭自动结算 */
 const TOPUP_AUTO_SETTLE_MS = (() => {
@@ -325,7 +364,7 @@ function adminStats(db: Store) {
         .toFixed(2),
     ),
     today_traffic: seed.mockTrafficPoints[seed.mockTrafficPoints.length - 1]?.traffic ?? 0,
-    tunnel_type_distribution: ["tcp", "mtcp", "udp", "relayx", "mtls", "mwss", "wss", "tls", "quic"].map((type) => ({
+    tunnel_type_distribution: ["tcp", "mtcp", "udp", "tunex", "mtls", "mwss", "wss", "tls", "quic"].map((type) => ({
       type,
       count: db.tunnels.filter((t) => t.tunnel_type === type).length,
     })),
@@ -525,10 +564,12 @@ export async function handleMock(method: string, path: string, req: MockRequest)
 
   // ---------- auth ----------
   if (seg[0] === "auth") {
-    if (seg[1] === "session" && method === "GET") {
+    // api 层用 `GET /auth/me`（与真实后端对齐），返回裸用户；`/auth/session` 为兼容旧调用返回 { user }
+    if ((seg[1] === "session" || seg[1] === "me") && method === "GET") {
       if (!logged) return fail(401, "Unauthorized");
       const u = userFromCookie(db, req.cookie);
-      return ok({ user: { ...u, user_plan: db.userPlans.find((p) => p.user_id === u.id) ?? null } });
+      const withPlan = { ...u, user_plan: db.userPlans.find((p) => p.user_id === u.id) ?? null };
+      return ok(seg[1] === "me" ? withPlan : { user: withPlan });
     }
     if (seg[1] === "login" && method === "POST") {
       const body = asRecord(req.body);
@@ -1070,6 +1111,114 @@ export async function handleMock(method: string, path: string, req: MockRequest)
 
     if (seg[1] === "stats" && method === "GET") return ok(adminStats(db));
 
+    // ----- meta/resources（权限元数据，渲染角色编辑器） -----
+    if (seg[1] === "meta" && seg[2] === "resources" && method === "GET") {
+      const isSuper = user.super_admin;
+      return ok({
+        resources: ADMIN_RESOURCES.map((r) => ({
+          ...r,
+          apiPrefixes: [] as string[],
+          granted: isSuper ? "write" : null,
+        })),
+      });
+    }
+
+    // ----- role（RBAC 角色，仅超管） -----
+    if (seg[1] === "role") {
+      const userCount = (roleId: number) => db.users.filter((u) => (u.admin_roles ?? []).some((r) => r.id === roleId)).length;
+      if (method === "GET" && seg[2] === undefined) {
+        return ok(db.adminRoles.map((r) => ({ ...r, _count: { users: userCount(r.id) } })));
+      }
+      if (method === "POST" && seg[2] === undefined) {
+        const body = asRecord(req.body);
+        const name = reqStr(body.name);
+        if (!name) return badRequest("名称不能为空");
+        if (db.adminRoles.some((r) => r.name === name)) return fail(409, "角色名称已存在");
+        const role: AdminRole = {
+          id: nextId(db.adminRoles),
+          name,
+          description: reqStr(body.description) || null,
+          permissions: sanitizePermissions(body.permissions),
+          _count: { users: 0 },
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        };
+        db.adminRoles.push(role);
+        return ok(role);
+      }
+      const rid = parseId(seg[2]);
+      if (rid !== null) {
+        const role = db.adminRoles.find((r) => r.id === rid);
+        if (!role) return notFound("角色不存在");
+        if (method === "PUT" || method === "PATCH") {
+          const body = asRecord(req.body);
+          if (body.name !== undefined) {
+            const name = reqStr(body.name);
+            if (!name) return badRequest("名称不能为空");
+            if (db.adminRoles.some((r) => r.id !== rid && r.name === name)) return fail(409, "角色名称已存在");
+            role.name = name;
+          }
+          if (body.description !== undefined) role.description = reqStr(body.description) || null;
+          if (body.permissions !== undefined) role.permissions = sanitizePermissions(body.permissions);
+          role.updated_at = nowIso();
+          return ok(role);
+        }
+        if (method === "DELETE") {
+          const using = userCount(rid);
+          if (using > 0) return fail(409, `该角色仍被 ${using} 个用户使用，请先解除分配`);
+          db.adminRoles.splice(db.adminRoles.indexOf(role), 1);
+          return ok({ ok: true, id: rid });
+        }
+      }
+    }
+
+    // ----- user/:id/roles（给用户分配角色，仅超管） -----
+    if (seg[1] === "user" && parseId(seg[2]) !== null && seg[3] === "roles" && (method === "PUT" || method === "PATCH")) {
+      const uid = parseId(seg[2])!;
+      const target = db.users.find((u) => u.id === uid);
+      if (!target) return notFound("用户不存在");
+      const body = asRecord(req.body);
+      const ids: number[] = Array.isArray(body.admin_role_ids) ? (body.admin_role_ids as number[]) : [];
+      target.admin_roles = db.adminRoles.filter((r) => ids.includes(r.id));
+      target.updated_at = nowIso();
+      return ok({ id: target.id, admin_roles: target.admin_roles });
+    }
+
+    // ----- system/config（系统设置） -----
+    if (seg[1] === "system" && seg[2] === "config") {
+      if (method === "GET" && seg[3] === undefined) return ok(db.systemConfig);
+      if (method === "PUT" && seg[3] !== undefined) {
+        const name = seg[3];
+        const body = asRecord(req.body);
+        if (typeof body.value !== "string") return badRequest("value 必须为字符串");
+        const row = db.systemConfig.find((c) => c.name === name);
+        if (row) {
+          row.value = body.value;
+          row.updated_at = nowIso();
+          return ok({ name, value: body.value });
+        }
+        const created = {
+          id: nextId(db.systemConfig),
+          name,
+          value: body.value,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        };
+        db.systemConfig.push(created);
+        return ok({ name, value: body.value });
+      }
+    }
+
+    // ----- license -----
+    if (seg[1] === "license" && seg[2] === undefined && method === "GET") {
+      return ok(db.license ?? { type: "none" });
+    }
+
+    // ----- balance-logs（管理端全量余额流水） -----
+    if (seg[1] === "balance-logs" && method === "GET") {
+      return ok(paginate(filterByStatus(db.balanceLogs, q), q));
+    }
+
     // ----- users -----
     if (seg[1] === "users") {
       if (method === "GET" && seg[2] === undefined) {
@@ -1411,6 +1560,24 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     // ----- balance logs -----
     if (seg[1] === "balance-logs" && method === "GET") {
       return ok(paginate(db.balanceLogs, q));
+    }
+
+    // ----- audit-logs（审计日志，只读；列表倒序）-----
+    if (seg[1] === "audit-logs" && method === "GET" && seg[2] === undefined) {
+      let items = [...db.auditLogs].sort((a, b) => b.id - a.id);
+      const kw = String(q?.keyword ?? "").trim().toLowerCase();
+      if (kw) {
+        items = items.filter((a) =>
+          [a.path, a.action, a.actor_email ?? "", a.resource].some((v) =>
+            String(v).toLowerCase().includes(kw),
+          ),
+        );
+      }
+      const actorType = q?.actor_type;
+      if (actorType && actorType !== "all") items = items.filter((a) => a.actor_type === actorType);
+      const meth = q?.method;
+      if (meth && meth !== "all") items = items.filter((a) => a.method === meth);
+      return ok(paginate(items, q));
     }
 
     return notFound(`Mock route not found: ${method} /${clean}`);

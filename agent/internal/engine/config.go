@@ -2,7 +2,7 @@
 // config pushed by the control plane and runs the described listeners and
 // forwarders.
 //
-// Config shape (from relayx-clone src/crypto/node-config.ts and the original
+// Config shape (from tunex-clone src/crypto/node-config.ts and the original
 // server's getInNodeConfig / getOutNodeConfig):
 //
 //	{
@@ -101,7 +101,7 @@ type Selector struct {
 	Strategy string `json:"strategy,omitempty"`
 }
 
-// ChainConfig is a named chain of hops (used by relayx/hop chains).
+// ChainConfig is a named chain of hops (used by tunex/hop chains).
 type ChainConfig struct {
 	Name string `json:"name"`
 	Hops []*Hop `json:"hops,omitempty"`

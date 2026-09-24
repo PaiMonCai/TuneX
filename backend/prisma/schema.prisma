@@ -212,7 +212,7 @@ enum TunnelType {
   tcp
   mtcp
   udp
-  relayx
+  tunex
   mtls
   mwss
   wss
@@ -699,8 +699,54 @@ model DNSProvider {
   @@map("dns_provider")
 }
 
-/// W1 新增：密码凭证表。
-/// 原版 `user` 表无密码列（Stack Auth 托管），本复刻自实现 JWT 需本地凭证，
+/// 审计事件里的操作者类型。
+enum AuditActorType {
+  /// 普通登录用户
+  user
+  /// 平台超级管理员
+  super_admin
+  /// 具备后台角色的管理员
+  admin
+  /// 系统/后台任务（worker、cron）
+  system
+  /// 未认证请求（登录/注册/支付回调等）
+  anonymous
+}
+
+/// 操作审计日志（append-only）。
+///
+/// 写入由 `src/middlewares/audit.ts` 在响应后 fire-and-forget 完成；
+/// 记录「谁（actor）在什么上下文（ip/ua）对什么资源（resource/id）做了什么
+/// （action＝`METHOD 归一化路径`）以及结果（status）」。
+/// 不落请求体：避免把密码/卡片等敏感字段带进日志。
+model AuditLog {
+  id          Int            @id @default(autoincrement())
+  actor_type  AuditActorType @default(anonymous)
+  actor_id    Int?
+  actor_email String?        @db.VarChar(255)
+  /// 形如 `POST /api/admin/users/:id`（数字段归一化为 :id）
+  action      String         @db.VarChar(191)
+  /// 资源名，如 `admin/users`、`tunnels`、`auth/login`
+  resource    String         @db.VarChar(64)
+  /// 资源主键（路径中首个数字段），无则为 null
+  resource_id String?        @db.VarChar(64)
+  method      String         @db.VarChar(10)
+  path        String         @db.VarChar(255)
+  status      Int
+  ip          String?        @db.VarChar(64)
+  user_agent  String?        @db.VarChar(255)
+  /// 附加结构化信息（默认 null；不要让调用方写入敏感字段）
+  metadata    Json?
+  created_at  DateTime       @default(now())
+
+  @@index([actor_id])
+  @@index([resource, resource_id])
+  @@index([created_at])
+  @@map("audit_log")
+}
+
+/// 密码凭证表。
+/// 原版 `user` 表无密码列（Stack Auth 托管），本实现自签本地 JWT 需本地凭证，
 /// 故拆表存放，`user` 表列结构保持与原版 100% 一致（零列改动）。
 model UserCredential {
   id         Int      @id @default(autoincrement())

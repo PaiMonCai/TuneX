@@ -8,7 +8,7 @@ export interface ServerI18n {
   t: (key: string, params?: Record<string, string | number>) => string;
 }
 
-/** 服务端组件统一入口：按 Cookie 里的 relayx_locale 取词典（curl 带 cookie 即可验证中英切换） */
+/** 服务端组件统一入口：按 Cookie 里的 tunex_locale 取词典（curl 带 cookie 即可验证中英切换） */
 export async function serverT(): Promise<ServerI18n> {
   const store = await cookies();
   const locale = normalizeLocale(store.get(LOCALE_COOKIE)?.value);

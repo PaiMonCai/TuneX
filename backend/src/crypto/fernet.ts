@@ -1,5 +1,5 @@
 /**
- * RelayX — Fernet 实现（AES-128-CBC + HMAC-SHA256）
+ * TuneX — Fernet 实现（AES-128-CBC + HMAC-SHA256）
  *
  * 零外部依赖：只用 node:crypto（也可被 Bun / Node 22+ 直接运行）。
  *

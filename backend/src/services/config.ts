@@ -4,7 +4,7 @@ import type { SystemConfigName } from "@prisma/client";
 
 /**
  * 系统配置读取（config 表，34 项）
- * 原版无缓存层（每次读 DB）；W1 加 5s 短缓存降低压力，语义保持一致。
+ * 原版无缓存层（每次读 DB）；本实现加 5s 短缓存降低 DB 压力，语义保持一致。
  */
 const CACHE_TTL_MS = 5_000;
 const cache = new Map<string, { value: string | null; at: number }>();

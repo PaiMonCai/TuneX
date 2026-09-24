@@ -37,7 +37,7 @@ export async function shellI18n(): Promise<{ locale: Locale; dict: Dictionary; t
 
 /**
  * 应用外壳（服务端组件）：侧边栏 + 顶栏，用户端/管理端共用。
- * 会话从 cookie 解析；mock 模式下 cookie=relayx_session 即视为已登录。
+ * 会话从 cookie 解析；mock 模式下 cookie=tunex_session 即视为已登录。
  *
  * 传给客户端组件的 props 必须可序列化：`Sidebar` 收到的是 `iconKey` 字符串，
  * 不能是 React 组件函数（否则整页 500）。

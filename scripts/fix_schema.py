@@ -7,11 +7,11 @@
 import re
 import sys
 
-P = "/opt/relayx-clone/backend/prisma/schema.prisma"
+P = "/opt/TuneX/backend/prisma/schema.prisma"
 s = open(P).read()
 
 # 1. 砍掉之前追加的块
-marker = "\n/// W1 新增"
+marker = "\n/// 密码凭证表。"
 if marker in s:
     s = s[: s.index(marker)].rstrip() + "\n"
     print("[1] removed previously appended block")
@@ -28,8 +28,8 @@ print("[2] added User.credential virtual relation")
 
 # 3. 追加 UserCredential
 s += '''
-/// W1 新增：密码凭证表。
-/// 原版 `user` 表无密码列（Stack Auth 托管），本复刻自实现 JWT 需本地凭证，
+/// 密码凭证表。
+/// 原版 `user` 表无密码列（Stack Auth 托管），本实现自签本地 JWT 需本地凭证，
 /// 故拆表存放，`user` 表列结构保持与原版 100% 一致（零列改动）。
 model UserCredential {
   id         Int      @id @default(autoincrement())

@@ -1,5 +1,5 @@
 /**
- * RelayX — relayx-auth 数据面认证
+ * TuneX — tunex-auth 数据面认证
  *
  * 复刻原版 dialer/listener 的隧道 token 方案（逆向确认，见报告 02/03）。
  *
@@ -19,7 +19,7 @@
  *
  * ── 密钥派生 ──
  *
- *   authKey = HKDF-SHA256(secret, salt = nil, info = "relayx-auth-v1", L = 32)
+ *   authKey = HKDF-SHA256(secret, salt = nil, info = "tunex-auth-v1", L = 32)
  *   mac     = HMAC-SHA256(authKey, nonce ‖ timestamp)
  *
  * ── 校验链（listener 侧 serveHTTP）──
@@ -33,16 +33,16 @@
 
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
-  RELAYX_AUTH_HKDF_INFO,
-  RELAYX_AUTH_TOKEN_BYTES,
-  RELAYX_AUTH_TOKEN_OFFSETS,
-  RELAYX_AUTH_WINDOW_SECONDS,
+  TUNEX_AUTH_HKDF_INFO,
+  TUNEX_AUTH_TOKEN_BYTES,
+  TUNEX_AUTH_TOKEN_OFFSETS,
+  TUNEX_AUTH_WINDOW_SECONDS,
 } from './keys.ts';
 
-export const TOKEN_BYTES = RELAYX_AUTH_TOKEN_BYTES; // 56
-export const OFFSETS = RELAYX_AUTH_TOKEN_OFFSETS;
-export const HKDF_INFO = RELAYX_AUTH_HKDF_INFO;
-export const DEFAULT_WINDOW_SECONDS = RELAYX_AUTH_WINDOW_SECONDS;
+export const TOKEN_BYTES = TUNEX_AUTH_TOKEN_BYTES; // 56
+export const OFFSETS = TUNEX_AUTH_TOKEN_OFFSETS;
+export const HKDF_INFO = TUNEX_AUTH_HKDF_INFO;
+export const DEFAULT_WINDOW_SECONDS = TUNEX_AUTH_WINDOW_SECONDS;
 
 /**
  * 会话复用标志在首字节中的位号。
@@ -59,11 +59,11 @@ export type AuthKey = Uint8Array;
 /**
  * HKDF-SHA256 派生 authKey。
  * @param secret 节点组 token（`node_group.token`）
- * @param info   HKDF info（默认 `relayx-auth-v1`）
+ * @param info   HKDF info（默认 `tunex-auth-v1`）
  */
 export function deriveAuthKey(secret: string | Uint8Array, info: string = HKDF_INFO): Buffer {
   const ikm = typeof secret === 'string' ? Buffer.from(secret, 'utf8') : Buffer.from(secret);
-  if (ikm.length === 0) throw new TypeError('relayx-auth: secret must not be empty');
+  if (ikm.length === 0) throw new TypeError('tunex-auth: secret must not be empty');
   return Buffer.from(hkdfSync('sha256', ikm, Buffer.alloc(0), Buffer.from(info, 'utf8'), 32));
 }
 
@@ -89,22 +89,22 @@ export function currentUnixNanos(): bigint {
 function resolveAuthKey(opts: { authKey?: string | Uint8Array; secret?: string | Uint8Array }): Buffer {
   if (opts.authKey !== undefined) {
     const k = typeof opts.authKey === 'string' ? Buffer.from(opts.authKey, 'utf8') : Buffer.from(opts.authKey);
-    if (k.length === 0) throw new TypeError('relayx-auth: authKey must not be empty');
+    if (k.length === 0) throw new TypeError('tunex-auth: authKey must not be empty');
     return k;
   }
   if (opts.secret !== undefined) return deriveAuthKey(opts.secret);
-  throw new TypeError('relayx-auth: either authKey or secret is required');
+  throw new TypeError('tunex-auth: either authKey or secret is required');
 }
 
 /**
  * 构造 56 字节 token。
  *
  * ```ts
- * const token = buildRelayxToken({ secret: nodeGroupToken });
+ * const token = buildTunexToken({ secret: nodeGroupToken });
  * // → Authorization: Bearer <base64(token)>
  * ```
  */
-export function buildRelayxToken(opts: BuildTokenOptions): Buffer {
+export function buildTunexToken(opts: BuildTokenOptions): Buffer {
   const authKey = resolveAuthKey(opts);
   const reuse = opts.reuse ?? false;
 
@@ -112,7 +112,7 @@ export function buildRelayxToken(opts: BuildTokenOptions): Buffer {
   if (opts.nonce !== undefined) {
     nonce = Buffer.from(opts.nonce);
     if (nonce.length !== 16) {
-      throw new TypeError(`relayx-auth: nonce must be 16 bytes, got ${nonce.length}`);
+      throw new TypeError(`tunex-auth: nonce must be 16 bytes, got ${nonce.length}`);
     }
   } else {
     nonce = randomBytes(16);
@@ -126,10 +126,10 @@ export function buildRelayxToken(opts: BuildTokenOptions): Buffer {
 
   const tsNanos = opts.timestampNanos ?? currentUnixNanos();
   if (typeof tsNanos !== 'bigint') {
-    throw new TypeError('relayx-auth: timestampNanos must be a bigint');
+    throw new TypeError('tunex-auth: timestampNanos must be a bigint');
   }
   if (tsNanos < 0n || tsNanos > MAX_INT64) {
-    throw new RangeError(`relayx-auth: timestampNanos ${tsNanos} out of int64 range`);
+    throw new RangeError(`tunex-auth: timestampNanos ${tsNanos} out of int64 range`);
   }
   const tsBuf = Buffer.alloc(8);
   tsBuf.writeBigInt64BE(tsNanos);
@@ -140,7 +140,7 @@ export function buildRelayxToken(opts: BuildTokenOptions): Buffer {
   const token = Buffer.concat([nonce, tsBuf, mac]);
   /* c8 ignore next */
   if (token.length !== TOKEN_BYTES) {
-    throw new Error(`relayx-auth: internal — built token has ${token.length} bytes, expected ${TOKEN_BYTES}`);
+    throw new Error(`tunex-auth: internal — built token has ${token.length} bytes, expected ${TOKEN_BYTES}`);
   }
   return token;
 }
@@ -149,7 +149,7 @@ export function buildRelayxToken(opts: BuildTokenOptions): Buffer {
 export function tokenTimestampNanos(token: Uint8Array): bigint {
   const buf = Buffer.isBuffer(token) ? token : Buffer.from(token);
   if (buf.length < OFFSETS.timestamp + 8) {
-    throw new TypeError('relayx-auth: token too short to read timestamp');
+    throw new TypeError('tunex-auth: token too short to read timestamp');
   }
   return buf.readBigInt64BE(OFFSETS.timestamp);
 }
@@ -157,7 +157,7 @@ export function tokenTimestampNanos(token: Uint8Array): bigint {
 /** 读取会话复用标志（首字节 bit0）。 */
 export function tokenReuseFlag(token: Uint8Array): boolean {
   const buf = Buffer.isBuffer(token) ? token : Buffer.from(token);
-  if (buf.length < 1) throw new TypeError('relayx-auth: empty token');
+  if (buf.length < 1) throw new TypeError('tunex-auth: empty token');
   return (buf[0]! & (1 << REUSE_FLAG_BIT)) !== 0;
 }
 
@@ -215,7 +215,7 @@ export class InMemoryReplayCache implements ReplayCache {
   constructor(opts: ReplayCacheOptions = {}) {
     const slots = opts.slots ?? 128;
     if (!Number.isInteger(slots) || slots < 2) {
-      throw new TypeError(`relayx-auth: slots must be an integer ≥ 2, got ${slots}`);
+      throw new TypeError(`tunex-auth: slots must be an integer ≥ 2, got ${slots}`);
     }
     this.slots = slots;
     this.windowNanos = opts.windowNanos ?? BigInt(DEFAULT_WINDOW_SECONDS) * NANOS_PER_SECOND;
@@ -243,7 +243,7 @@ export class InMemoryReplayCache implements ReplayCache {
 
   checkAndRemember(nonce: Uint8Array, timestampNanos: bigint, _nowNanos?: bigint): boolean {
     if (typeof timestampNanos !== 'bigint') {
-      throw new TypeError('relayx-auth: timestampNanos must be a bigint');
+      throw new TypeError('tunex-auth: timestampNanos must be a bigint');
     }
     const key = Buffer.from(nonce).toString('hex');
     const w = this.windowNanos;
@@ -319,10 +319,10 @@ export type VerifyResult = VerifySuccess | VerifyFailure;
 /** 解析 `Authorization` 头 → token 原始字节。 */
 export function parseAuthorizationHeader(header: string | null | undefined): Buffer {
   if (!header || typeof header !== 'string') {
-    throw new Error('relayx-auth: missing Authorization header');
+    throw new Error('tunex-auth: missing Authorization header');
   }
   const m = /^Bearer\s+(.+)$/i.exec(header.trim());
-  if (!m) throw new Error('relayx-auth: Authorization must be `Bearer <token>`');
+  if (!m) throw new Error('tunex-auth: Authorization must be `Bearer <token>`');
   const b64 = m[1]!.trim();
   let raw: Buffer;
   // 与原版一致：base64 标准字母表（Go base64.StdEncoding，带 `=` 填充）
@@ -330,7 +330,7 @@ export function parseAuthorizationHeader(header: string | null | undefined): Buf
     if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) throw new Error('non-base64 char');
     raw = Buffer.from(b64, 'base64');
   } catch {
-    throw new Error('relayx-auth: token is not valid base64');
+    throw new Error('tunex-auth: token is not valid base64');
   }
   return raw;
 }
@@ -363,7 +363,7 @@ export interface VerifyTokenOptions {
  * 校验 token。**永不抛异常**——所有失败都通过 `{ok:false, reason}` 返回，
  * 便于 listener 侧直接把失败映射成 serveNotFound（对探测者不泄露失败原因）。
  */
-export function verifyRelayxToken(
+export function verifyTunexToken(
   token: string | Uint8Array,
   opts: VerifyTokenOptions,
 ): VerifyResult {
@@ -389,7 +389,7 @@ export function verifyRelayxToken(
       return {
         ok: false,
         reason: 'bad-length',
-        message: `relayx-auth: token must be ${TOKEN_BYTES} bytes, got ${raw.length}`,
+        message: `tunex-auth: token must be ${TOKEN_BYTES} bytes, got ${raw.length}`,
       };
     }
 
@@ -415,14 +415,14 @@ export function verifyRelayxToken(
     const macOk = macEqual(expectedMac, macGiven);
 
     if (!macOk) {
-      return { ok: false, reason: 'bad-mac', message: 'relayx-auth: token MAC mismatch' };
+      return { ok: false, reason: 'bad-mac', message: 'tunex-auth: token MAC mismatch' };
     }
     if (outsideWindow) {
       return {
         ok: false,
         reason: 'outside-window',
         message:
-          `relayx-auth: token outside ±${window}s window ` +
+          `tunex-auth: token outside ±${window}s window ` +
           `(skew ${Number(delta) / 1e9}s)`,
       };
     }
@@ -430,7 +430,7 @@ export function verifyRelayxToken(
     if (opts.replay) {
       const fresh = opts.replay.checkAndRemember(Buffer.from(nonce), tsNanos, nowNanos);
       if (!fresh) {
-        return { ok: false, reason: 'replay', message: 'relayx-auth: token replay' };
+        return { ok: false, reason: 'replay', message: 'tunex-auth: token replay' };
       }
     }
 
@@ -451,17 +451,17 @@ export function verifyRelayxToken(
  * 一体化入口：解析 `Authorization` 头 → 校验 → （可选）重放检查。
  * 这是 listener `serveHTTP` 里 `validateToken(auth)` 的对应实现。
  */
-export function authenticateRelayxRequest(
+export function authenticateTunexRequest(
   authorizationHeader: string | null | undefined,
   opts: VerifyTokenOptions,
 ): VerifyResult {
-  return verifyRelayxToken(authorizationHeader ?? '', opts);
+  return verifyTunexToken(authorizationHeader ?? '', opts);
 }
 
 /** 便捷：只问"这个 token 现在是否有效"（不关心失败原因）。 */
-export function isRelayxTokenValid(
+export function isTunexTokenValid(
   token: string | Uint8Array,
   opts: VerifyTokenOptions,
 ): boolean {
-  return verifyRelayxToken(token, opts).ok;
+  return verifyTunexToken(token, opts).ok;
 }

@@ -1,5 +1,5 @@
 // Package mux is a minimal, dependency-free implementation of the xtaci/smux
-// version-1 stream multiplexing protocol, which the relayx tunnel uses on top of
+// version-1 stream multiplexing protocol, which the tunex tunnel uses on top of
 // the (WebSocket-wrapped) carrier connection.
 //
 // Frame header (8 bytes):

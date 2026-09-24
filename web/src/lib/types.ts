@@ -1,5 +1,5 @@
 /**
- * 与 /opt/relayx-clone/backend/prisma/schema.prisma 对齐的前端类型定义。
+ * 与 backend/prisma/schema.prisma 对齐的前端类型定义。
  * 命名保持 Prisma 原样（snake_case），避免与后端 JSON 字段不一致。
  */
 
@@ -7,7 +7,7 @@ export type ID = number;
 
 export type Status = "active" | "inactive";
 export type NodeType = "in" | "out";
-export type TunnelType = "tcp" | "mtcp" | "udp" | "relayx" | "mtls" | "mwss" | "wss" | "tls" | "quic";
+export type TunnelType = "tcp" | "mtcp" | "udp" | "tunex" | "mtls" | "mwss" | "wss" | "tls" | "quic";
 export type LoadBalanceType = "round" | "rand" | "fifo" | "hash" | "ll" | "lc";
 export type IpType = "auto" | "ipv4" | "ipv6";
 export type TunnelCategory = "port_forward" | "remote_port_forward";
@@ -17,6 +17,8 @@ export type TopupOrderStatus = "pending" | "success" | "cancelled";
 export type TicketStatus = "open" | "closed";
 export type PaymentMethod = "epay" | "bepusdt" | "heleket";
 export type BalanceLogType = "topup" | "plan" | "commission_transfer" | "admin_adjust";
+export type PermissionLevel = "read" | "write";
+export type LicenseType = "none" | "personal" | "business";
 
 export interface User {
   id: ID;
@@ -38,18 +40,105 @@ export interface User {
   // 关联（可选，由后端 include 决定）
   user_plan?: UserPlan | null;
   roles?: AdminRole[];
+  admin_roles?: AdminRole[];
 }
 
 export interface AdminRole {
   id: ID;
   name: string;
   description: string | null;
-  permissions: string[];
+  permissions: Record<string, PermissionLevel>;
+  _count?: { users: number };
   created_at: string;
   updated_at: string;
 }
 
-/** 登录响应：原版使用 Stack Auth 托管，复刻版自实现 JWT（W1） */
+/** 角色新建/编辑载荷（PUT /admin/role/:id、POST /admin/role） */
+export interface AdminRoleInput {
+  name: string;
+  description: string | null;
+  permissions: Record<string, PermissionLevel>;
+}
+
+/** 权限元数据资源项（GET /admin/meta/resources） */
+export interface AdminResourceMeta {
+  key: string;
+  label: string;
+  group: string;
+  url: string;
+  business: boolean;
+  apiPrefixes: string[];
+  granted: PermissionLevel | null;
+}
+
+/** 系统配置项（config 表一行） */
+export interface SystemConfigItem {
+  id: ID;
+  name: string;
+  value: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 授权信息（GET /admin/license） */
+export interface LicenseInfo {
+  type: LicenseType;
+  [key: string]: unknown;
+}
+
+/** 审计日志一行（GET /admin/audit-logs，仅超级管理员可读） */
+export interface AuditLog {
+  id: ID;
+  actor_type: "user" | "super_admin" | "admin" | "system" | "anonymous";
+  actor_id: number | null;
+  actor_email: string | null;
+  /** 形如 `POST /api/admin/users/:id` */
+  action: string;
+  resource: string;
+  resource_id: string | null;
+  method: string;
+  path: string;
+  status: number;
+  ip: string | null;
+  user_agent: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
+/** 通用列表查询（管理端各处复用） */
+export interface AdminListInput {
+  page?: number;
+  page_size?: number;
+  keyword?: string;
+  status?: string;
+  kind?: string;
+  user_id?: number;
+}
+
+/** 审计日志查询（GET /admin/audit-logs） */
+export interface AuditLogQuery extends AdminListInput {
+  actor_type?: string;
+  method?: string;
+  resource?: string;
+}
+
+/** 只读资源的分页列表查询（供只读表格组件复用，含 page_size） */
+export interface AdminListQuery {
+  page?: number;
+  page_size?: number;
+  keyword?: string;
+  status?: string;
+  kind?: string;
+  user_id?: number;
+}
+
+/** 切换开关载荷（通用 PUT/PATCH body） */
+export interface ToggleInput {
+  status?: Status;
+  [key: string]: unknown;
+}
+
+/** 登录响应：原版使用托管认证，本实现自签本地 JWT */
 export interface AuthSession {
   user: User;
   token?: string;
@@ -333,7 +422,7 @@ export interface ListQuery {
 }
 
 /* ------------------------------------------------------------------ *
- * 写操作的请求体类型：与后端 REST 契约对齐（W2 前端表单直接复用）
+ * 写操作的请求体类型：与后端 REST 契约对齐（前端表单直接复用）
  * ------------------------------------------------------------------ */
 
 /** 隧道可更新字段（PATCH /tunnels/:id） */

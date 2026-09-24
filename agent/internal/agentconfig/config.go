@@ -1,7 +1,7 @@
 // Package agentconfig parses the agent's command line (and optional YAML config
 // file) using only the standard library.
 //
-// Flag names, short names and defaults match the original relayx-agent v0.13.22
+// Flag names, short names and defaults match the original tunex-agent v0.13.22
 // so existing service units / install scripts keep working. The original used
 // cobra+viper; here we use `flag` plus a tiny YAML reader (see yaml.go).
 package agentconfig
@@ -30,15 +30,15 @@ type Config struct {
 	PprofPort       int
 
 	// Per-protocol fixed listen ports (0 = dynamic / WAIT_LISTEN).
-	TCPPort    int
-	UDPPort    int
-	TLSPort    int
-	WSSPort    int
-	MTCPPort   int
-	MTLSPort   int
-	MWSSPort   int
-	QUICPort   int
-	RelayxPort int
+	TCPPort   int
+	UDPPort   int
+	TLSPort   int
+	WSSPort   int
+	MTCPPort  int
+	MTLSPort  int
+	MWSSPort  int
+	QUICPort  int
+	TunexPort int
 
 	ShowVersion bool
 	ConfigFile  string
@@ -50,7 +50,7 @@ func DefaultConfigFile() string {
 	if err != nil || home == "" {
 		home = "."
 	}
-	return filepath.Join(home, ".relayx-agent.yaml")
+	return filepath.Join(home, ".tunex-agent.yaml")
 }
 
 // Parse turns argv (without the program name) into a Config.
@@ -59,7 +59,7 @@ func DefaultConfigFile() string {
 // It returns flag.ErrHelp when -h/--help was requested (the usage text is
 // printed to stdout) so main can exit 0.
 func Parse(args []string, version string) (*Config, error) {
-	fs := flag.NewFlagSet("relayx-agent", flag.ContinueOnError)
+	fs := flag.NewFlagSet("tunex-agent", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
 	fs.Usage = func() {
 		printUsage(fs.Output(), version)
@@ -75,7 +75,7 @@ func Parse(args []string, version string) (*Config, error) {
 	pre := preScan(args)
 	file := pre["config"]
 	if file == "" {
-		file = os.Getenv("RELAYX_CONFIG")
+		file = os.Getenv("TUNEX_CONFIG")
 	}
 	if file == "" {
 		file = cfg.ConfigFile
@@ -109,7 +109,7 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.IntVar(&cfg.MTLSPort, "mtls-port", cfg.MTLSPort, "MTLS port")
 	fs.IntVar(&cfg.MWSSPort, "mwss-port", cfg.MWSSPort, "MWSS port")
 	fs.IntVar(&cfg.QUICPort, "quic-port", cfg.QUICPort, "QUIC port")
-	fs.IntVar(&cfg.RelayxPort, "relayx-port", cfg.RelayxPort, "RelayX port")
+	fs.IntVar(&cfg.TunexPort, "tunex-port", cfg.TunexPort, "TuneX port")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "version for TuneX agent")
 	fs.BoolVar(&cfg.ShowVersion, "v", false, "version for TuneX agent (shorthand)")
 
@@ -126,10 +126,10 @@ func Parse(args []string, version string) (*Config, error) {
 	}
 	// Environment overrides for the two required values (nice for containers).
 	if cfg.Server == "" {
-		cfg.Server = os.Getenv("RELAYX_SERVER")
+		cfg.Server = os.Getenv("TUNEX_SERVER")
 	}
 	if cfg.Token == "" {
-		cfg.Token = os.Getenv("RELAYX_TOKEN")
+		cfg.Token = os.Getenv("TUNEX_TOKEN")
 	}
 
 	if cfg.ShowVersion {
@@ -156,7 +156,7 @@ func Parse(args []string, version string) (*Config, error) {
 		if h, err := os.Hostname(); err == nil {
 			cfg.NodeID = h
 		} else {
-			cfg.NodeID = "relayx-agent"
+			cfg.NodeID = "tunex-agent"
 		}
 	}
 	return cfg, nil
@@ -205,14 +205,14 @@ func applyDefaults(cfg *Config, file string) {
 			applyYAML(cfg, string(data))
 		}
 	}
-	// Environment (kebab-case keys upper-cased with RELAYX_ prefix).
+	// Environment (kebab-case keys upper-cased with TUNEX_ prefix).
 	envStr := func(key string, dst *string) {
-		if v := os.Getenv("RELAYX_" + key); v != "" {
+		if v := os.Getenv("TUNEX_" + key); v != "" {
 			*dst = v
 		}
 	}
 	envInt := func(key string, dst *int) {
-		if v := os.Getenv("RELAYX_" + key); v != "" {
+		if v := os.Getenv("TUNEX_" + key); v != "" {
 			var n int
 			if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
 				*dst = n
@@ -234,7 +234,7 @@ Usage:
   tunex-agent [flags]
 
 Flags:
-  -c, --config string             Config file (default $HOME/.relayx-agent.yaml)
+  -c, --config string             Config file (default $HOME/.tunex-agent.yaml)
   -i, --connect-ip strings        Connect IP list (repeatable; auto-detected when empty)
   -d, --debug                     Enable debug mode
   -h, --help                      help for TuneX agent
@@ -247,7 +247,7 @@ Flags:
   -r, --port-range string         Port range, e.g. 80,443,30000-30010
       --pprof-port int            Pprof port on 127.0.0.1 only (0 disables) (default 6060)
       --quic-port int             QUIC port
-      --relayx-port int           RelayX port
+      --tunex-port int           TuneX port
   -s, --server string             Server address, like http://localhost:3000 (required)
       --tcp-port int              TCP port
       --tls-port int              TLS port

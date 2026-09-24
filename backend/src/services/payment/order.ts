@@ -1,9 +1,9 @@
 /**
  * TopupOrderService —— 充值订单状态机 + 余额入账事务 + 10 分钟超时取消
  * 依据:
- *   · relayx-pay-channel-analysis-report.md §6-§7（回调入账 / 下单 / 自动取消，源码级还原）
- *   · relayx-billing-source-verification-report.md §2（processReferralCommission 挂载点）
- *   · RelayX-最终交叉验证汇总报告.md 问题 13/14/15（原版缺陷，W5 修复）
+ *   · pay-channel-analysis-report.md §6-§7（回调入账 / 下单 / 自动取消，源码级还原）
+ *   · billing-source-verification-report.md §2（processReferralCommission 挂载点）
+ *   · TuneX-最终交叉验证汇总报告.md 问题 13/14/15（原版缺陷，已修复）
  *
  * 修复的三处原版缺陷：
  *   【缺陷 13】回调不回校金额一致性 → `assertAmountConsistent`，
@@ -291,7 +291,7 @@ export class TopupOrderService {
         this.logger.warn(`callback on ${order.status} order -> success: ${notify.order_id} (${decision.warn})`);
       }
 
-      // ③ 金额一致性校验（W5 修复原版缺陷 13）
+      // ③ 金额一致性校验（修复原版缺陷 13）
       if (notify.amount_checked) {
         const tolerance = Number(payment.config && (payment.config as Record<string, unknown>).amount_tolerance);
         const tol = Number.isFinite(tolerance) && tolerance >= 0 ? tolerance : 0.01;

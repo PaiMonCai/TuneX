@@ -1,6 +1,6 @@
 /**
  * 支付网关抽象层 —— 类型定义
- * 依据: relayx-pay-channel-analysis-report.md §1-§5（源码级还原）
+ * 依据: pay-channel-analysis-report.md §1-§5（源码级还原）
  *
  * 复刻原版 `packages/shared/src/pay.ts` 的 BasePay 抽象 + 三种实现，
  * 但做了三点工程化增强：
@@ -27,7 +27,7 @@ export interface PaymentConfig {
   network?: string;
   /** Heleket 目标币种 */
   to_currency?: string;
-  /** 金额一致性校验容差（W5 新增；回调金额与订单应付金额允许的最大偏差） */
+  /** 金额一致性校验容差（回调金额与订单应付金额允许的最大偏差） */
   amount_tolerance?: number;
   [key: string]: unknown;
 }
@@ -102,7 +102,7 @@ export type HttpFetch = (
 /**
  * 统一支付网关接口（三种实现共同契约）。
  *
- * 命名对齐 W5 任务书：createPayment / cancelPayment / verifyCallback。
+ * 命名对齐任务规范：createPayment / cancelPayment / verifyCallback。
  * 实现类同时保留原版方法名 `pay` / `cancelOrder` / `notify` 作为别名，
  * 以保证与逆向报告中的源码语义 1:1 对应（便于后续对照审查）。
  */

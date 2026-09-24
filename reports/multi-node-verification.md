@@ -29,7 +29,7 @@
 
 ### 1.1 运行环境
 - 主机：`hkthyear-1043084428`（Linux 6.8, x86_64），root
-- 编排：`/opt/relayx-clone/docker-compose.yaml`
+- 编排：`/opt/TuneX/docker-compose.yaml`
 - 关键容器（实测 `docker ps`）：
 
 | 容器 | 镜像 | 端口 | 状态 |
@@ -241,6 +241,8 @@ FANOUT-3: config_frames=3
 - 现有 `disconnect` handler 只写了 `dc:<groupId>:<socketId>` 标记（`D-dc-keys.txt` 命中 1 个），注释自述“完整实现用 BullMQ delay job；此处标记供 worker 扫描（W4 接入）”——**worker 侧未实现扫描**，且该标记 key 与 node 无关联，无法反查节点。
 - 该标记还是**按 `socket.id`** 而非 `node_id`，重连即换 id，无法可靠对应节点。
 
+> **✅ 已修复（2026-09-24，后于本报告）**：`disconnect` 标记已改为按 `node_id`（`dc:<groupId>:<nodeId>`），并新增消费端 `backend/src/socket/offline-detector.ts` + worker cron `cron_check_node_offline`（每 30s）：防抖 60s 到点且 `sysinfo` 心跳缺失 → `node.status` 置 `inactive` 并清理 `alive_groups`；节点重连（`register`/`sysinfo`）自动删除标记并把节点拉回 `active`。实现细节见 `DEVELOPMENT.md` §4.7。原 §6.2 的证据（`kill -9` 后 36s 仍 active）描述的是修复前行为。
+
 ### 6.3 附加验证（Phase E）
 | 子场景 | 结果 | 证据 |
 |---|---|---|
@@ -266,6 +268,7 @@ FANOUT-3: config_frames=3
 ## 8. 修复建议（按优先级）
 
 1. **离线检测闭环（#1）**：worker 增 cron（如 `cron_check_node_offline`，30-60s）扫描 `node`：对无 `sysinfo:<gid>:<node_id>` key 的 `active` 节点置 `inactive` 并清 `alive_groups`；把 `disconnect` 标记改为按 `node_id` 且由 worker 消费（或直接用“心跳 TTL 缺失”判定，弃用 socket.id 标记）。
+   → **✅ 已按建议 1 落地**：本项已实现（`socket/offline-detector.ts` + `cron_check_node_offline`），采用「`dc:<gid>:<nodeId>` 标记消费 + 心跳双重确认」方案。详见 `DEVELOPMENT.md` §4.7。
 2. **统一出口端口缓存契约（#2）**：确定单一 Redis 结构（建议 `tunnel:out_listen`，field=`<nodeId>:<type>`，value=port），**写入端**（`socket/index.ts` 的 `listen` handler）改为同时 `HSET tunnel:out_listen <nodeId>:<type> <port>`；或反之统一到按组。写入端需拿到 `nodeId`（`listen` 载荷已带 `node_id`）。
 3. **补 `listen_error` handler（#3）**：`socket.on("listen_error", …)` → 记录并（可选）写隧道 `port_conflict_at`/发通知，形成运行时冲突闭环。
 4. **增量下发（#4）**：`pushNodeConfig` 计算/复用 `fingerprint`，与 `node_group:<gid>:config_hash` 比对，未变则跳过 `emit`。

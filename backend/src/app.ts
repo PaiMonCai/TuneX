@@ -1,6 +1,6 @@
 /**
  * Hono 应用装配 —— 中间件链顺序严格对齐原版 src/app.ts
- * 依据: relayx-auth-rbac-source-verification-report.md §1
+ * 依据: auth-rbac-source-verification-report.md §1
  *
  * 链序：
  *   ① getRequestIP + requestLogger
@@ -24,6 +24,8 @@ import {
   extractIp,
   type AppVariables,
 } from "./middlewares/auth.ts";
+import { createAuditMiddleware } from "./middlewares/audit.ts";
+import { createRateLimitMiddleware } from "./middlewares/rate-limit.ts";
 import { authRoutes } from "./routes/auth.ts";
 import { adminRoutes } from "./routes/admin.ts";
 import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
@@ -73,7 +75,7 @@ export function createApp() {
   });
 
   // ③ 健康检查（免认证）
-  app.get("/healthz", (c) => c.json({ status: "ok", service: "tunex-backend", w: "W1" }));
+  app.get("/healthz", (c) => c.json({ status: "ok", service: "tunex-backend" }));
   app.get("/readyz", async (c) => {
     const checks: Record<string, boolean> = {};
     try {
@@ -98,7 +100,13 @@ export function createApp() {
   // ④ 全局认证（白名单在 authRequired 内部短路）
   app.use("*", authRequired);
 
-  // ⑤ 管理端两道闸
+  // ⑤ 审计日志 + 全局限流
+  //   审计在限流之前：被限流的请求也要留痕；两者对免认证白名单同样生效
+  //   （登录/注册/支付回调的滥用同样进入审计与限流规则）。
+  app.use("*", createAuditMiddleware());
+  app.use("*", createRateLimitMiddleware());
+
+  // ⑥ 管理端两道闸
   app.use("/api/admin/*", adminRequired);
   app.use("/api/admin/*", adminPermissionGuard);
 
@@ -119,7 +127,7 @@ export function createApp() {
   app.route("/api/admin", nodeGrantRoutes);
   app.route("/api/admin", adminExtendedRoutes);
 
-  app.get("/", (c) => c.json({ service: "tunex-backend", week: "W1", site_url: env.siteUrl }));
+  app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 
   return app;
 }

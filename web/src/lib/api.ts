@@ -6,9 +6,17 @@
  */
 import type {
   AdminDashboardStats,
+  AdminListInput,
+  AdminResourceMeta,
+  AdminRole,
+  AdminRoleInput,
   AdminUserInput,
+  AuditLog,
+  AuditLogQuery,
   AuthSession,
+  BalanceLog,
   DashboardStats,
+  LicenseInfo,
   ListQuery,
   Node,
   NodeGroup,
@@ -16,10 +24,12 @@ import type {
   NodeInput,
   Paginated,
   PasswordChangeInput,
+  Payment,
   Plan,
   PlanInput,
   PlanOrder,
   ProfileUpdateInput,
+  SystemConfigItem,
   Ticket,
   TopupOrder,
   TrafficPoint,
@@ -94,7 +104,7 @@ function applyMockSessionCookie(session: AuthSession | null): void {
 /** 退出登录：清掉会话 cookie（两种模式都要做，mock 下没有后端清 cookie） */
 export function clearMockSessionCookie(): void {
   if (typeof document === "undefined") return;
-  document.cookie = "relayx_session=; Path=/; Max-Age=0; SameSite=Lax";
+  document.cookie = "tunex_session=; Path=/; Max-Age=0; SameSite=Lax";
 }
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -266,6 +276,34 @@ export const api = {
     tunnels: (query?: ListQuery, cookie?: string) => get<Paginated<Tunnel>>("/admin/tunnels", query, cookie),
     orders: (query?: ListQuery, cookie?: string) => get<Paginated<PlanOrder | TopupOrder>>("/admin/orders", query, cookie),
     tickets: (query?: ListQuery, cookie?: string) => get<Paginated<Ticket>>("/admin/tickets", query, cookie),
+    /** 只读资源写操作（有对应后端端点时使用；无端点时由界面提示只读） */
+    updateTunnel: (id: number, input: TunnelUpdateInput, cookie?: string) =>
+      patch<Tunnel>(`/admin/tunnels/${id}`, input, cookie),
+    removeTunnel: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/tunnels/${id}`, cookie),
+    /** 余额流水（管理端全量） */
+    balanceLogs: (query?: AdminListInput, cookie?: string) =>
+      get<Paginated<BalanceLog>>("/admin/balance-logs", query as ListQuery, cookie),
+    /** 支付方式列表（管理端） */
+    payments: (cookie?: string) => get<Payment[]>("/payments", undefined, cookie),
+    // —— RBAC 角色（仅超管）——
+    roles: (cookie?: string) => get<AdminRole[]>("/admin/role", undefined, cookie),
+    createRole: (input: AdminRoleInput, cookie?: string) => post<AdminRole>("/admin/role", input, cookie),
+    updateRole: (id: number, input: Partial<AdminRoleInput>, cookie?: string) =>
+      put<AdminRole>(`/admin/role/${id}`, input, cookie),
+    removeRole: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/role/${id}`, cookie),
+    updateUserRoles: (id: number, admin_role_ids: number[], cookie?: string) =>
+      put<{ id: number; admin_roles: AdminRole[] }>(`/admin/user/${id}/roles`, { admin_role_ids }, cookie),
+    /** 权限元数据（渲染角色编辑器） */
+    metaResources: (cookie?: string) =>
+      get<{ resources: AdminResourceMeta[] }>("/admin/meta/resources", undefined, cookie),
+    // —— 系统配置 / License（仅具权限者）——
+    systemConfig: (cookie?: string) => get<SystemConfigItem[]>("/admin/system/config", undefined, cookie),
+    setSystemConfig: (name: string, value: string, cookie?: string) =>
+      put<{ name: string; value: string }>(`/admin/system/config/${name}`, { value }, cookie),
+    license: (cookie?: string) => get<LicenseInfo>("/admin/license", undefined, cookie),
+    /** 审计日志（仅超级管理员可读） */
+    auditLogs: (query?: AuditLogQuery, cookie?: string) =>
+      get<Paginated<AuditLog>>("/admin/audit-logs", query as ListQuery, cookie),
   },
 };
 

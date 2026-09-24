@@ -1,4 +1,4 @@
-module github.com/relayx/agent
+module github.com/tunex/agent
 
 go 1.22
 

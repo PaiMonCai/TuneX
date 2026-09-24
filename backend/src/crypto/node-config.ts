@@ -1,5 +1,5 @@
 /**
- * RelayX — 节点配置生成（gost config JSON）+ Fernet 加密下发
+ * TuneX — 节点配置生成（gost config JSON）+ Fernet 加密下发
  *
  * 复刻的是原版 `getNodeConfig(nodeGroup)` 的输出形状与**线上字节**。
  * 生成的 JSON 用 **config 密钥**（`TUNEX_CONFIG_KEY`）加密后，通过

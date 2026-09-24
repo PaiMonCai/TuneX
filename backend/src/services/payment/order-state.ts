@@ -1,6 +1,6 @@
 /**
  * topup_order 状态机 —— 纯函数实现（零 DB / 零框架依赖，可离线全路径测试）
- * 依据: relayx-pay-channel-analysis-report.md §6-§7 + RelayX-最终交叉验证汇总报告.md §问题 13/14/15
+ * 依据: pay-channel-analysis-report.md §6-§7 + TuneX-最终交叉验证汇总报告.md §问题 13/14/15
  *
  * 持久化状态（Prisma enum TopupOrderStatus）：pending | success | cancelled
  *
@@ -18,7 +18,7 @@
  *   success   → success    ✅ 幂等（重复回调，**不得重复入账**）
  *   cancelled → cancelled  ✅ 幂等
  *   cancelled → success    ⚠️ 原版允许（用户已付款但订单被自动取消）
- *                             W5 默认保留（收到真金白银应入账），但强制记录 WARN；
+ *                             默认保留（收到真金白银应入账），但强制记录 WARN；
  *                             `strictCancelled` 选项可改为拒绝
  *   success   → cancelled  ❌ 非法（已入账不可取消，需人工冲正）
  *   cancelled → pending    ❌ 非法（订单不可复活）
@@ -104,7 +104,7 @@ export function evaluateTransition(
     };
   }
 
-  // cancelled → success：原版允许；W5 可收紧
+  // cancelled → success：原版允许；可通过 strictCancelled 收紧
   if (from === "cancelled" && to === "success") {
     if (opts.strictCancelled) {
       return {

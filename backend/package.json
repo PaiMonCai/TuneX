@@ -1,12 +1,15 @@
 {
   "name": "tunex-backend",
-  "version": "0.1.0-w1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "worker": "bun src/worker.ts",
+    "build": "bun build src/index.ts --target=bun --external external --outdir=dist && tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
     "generate": "prisma generate",

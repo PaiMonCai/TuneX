@@ -7,9 +7,9 @@ import (
 
 // applyYAML applies a *minimal* subset of YAML to cfg.
 //
-// Supported (enough for $HOME/.relayx-agent.yaml):
+// Supported (enough for $HOME/.tunex-agent.yaml):
 //
-//	server: https://relayx.example.com:3000
+//	server: https://tunex.example.com:3000
 //	token: xxxxxxxx
 //	node-id: node-01
 //	debug: true
@@ -114,8 +114,8 @@ func setScalar(cfg *Config, key, val string) {
 		cfg.MWSSPort = atoi(val)
 	case "quic-port":
 		cfg.QUICPort = atoi(val)
-	case "relayx-port":
-		cfg.RelayxPort = atoi(val)
+	case "tunex-port":
+		cfg.TunexPort = atoi(val)
 	case "connect-ip", "connect_ip":
 		cfg.ConnectIP = []string{val}
 	}

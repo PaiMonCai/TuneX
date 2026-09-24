@@ -13,27 +13,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/relayx/agent/internal/agentconfig"
-	"github.com/relayx/agent/internal/engine"
-	"github.com/relayx/agent/internal/fernet"
-	"github.com/relayx/agent/internal/license"
-	"github.com/relayx/agent/internal/logx"
-	"github.com/relayx/agent/internal/netutil"
-	"github.com/relayx/agent/internal/socketio"
+	"github.com/tunex/agent/internal/agentconfig"
+	"github.com/tunex/agent/internal/engine"
+	"github.com/tunex/agent/internal/fernet"
+	"github.com/tunex/agent/internal/license"
+	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/netutil"
+	"github.com/tunex/agent/internal/socketio"
 )
 
 // version is the reported agent version; overridable from main.
 var version = "0.13.22"
 
-// keyFromEnv resolves an installation key, preferring the TuneX variable name
-// and falling back to the legacy RELAYX name during migration. No key is ever
+// keyFromEnv resolves an installation key from the environment. No key is ever
 // compiled into the binary.
-func keyFromEnv(primary, legacy string) string {
-	if v := strings.TrimSpace(os.Getenv(primary)); v != "" {
-		return v
-	}
-	return strings.TrimSpace(os.Getenv(legacy))
+func keyFromEnv(name string) string {
+	return strings.TrimSpace(os.Getenv(name))
 }
+
 // SetVersion overrides the reported version (called from main).
 func SetVersion(v string) {
 	if v != "" {
@@ -65,11 +62,11 @@ type Agent struct {
 
 // New builds an Agent from config.
 func New(cfg *agentconfig.Config) (*Agent, error) {
-	configKey, err := license.DecodeConfigKey(keyFromEnv(license.EnvConfigKey, "RELAYX_CONFIG_KEY"))
+	configKey, err := license.DecodeConfigKey(keyFromEnv(license.EnvConfigKey))
 	if err != nil {
 		return nil, fmt.Errorf("agent: config key: %w", err)
 	}
-	licKey, err := license.DecodeLicenseKey(keyFromEnv(license.EnvLicenseKey, "RELAYX_LICENSE_KEY"))
+	licKey, err := license.DecodeLicenseKey(keyFromEnv(license.EnvLicenseKey))
 	if err != nil {
 		return nil, fmt.Errorf("agent: license key: %w", err)
 	}
@@ -95,7 +92,7 @@ func New(cfg *agentconfig.Config) (*Agent, error) {
 
 	// Server URL: the license site_url must match this exactly.
 	a.serverURL = cfg.Server
-	if dir := os.Getenv("RELAYX_SITE_URL"); dir != "" {
+	if dir := os.Getenv("TUNEX_SITE_URL"); dir != "" {
 		a.serverURL = strings.TrimRight(dir, "/")
 	}
 	return a, nil
@@ -190,7 +187,7 @@ func (a *Agent) register(client *socketio.Client) error {
 		"ports": map[string]int{
 			"tcp": a.cfg.TCPPort, "udp": a.cfg.UDPPort, "tls": a.cfg.TLSPort,
 			"wss": a.cfg.WSSPort, "mtcp": a.cfg.MTCPPort, "mtls": a.cfg.MTLSPort,
-			"mwss": a.cfg.MWSSPort, "quic": a.cfg.QUICPort, "relayx": a.cfg.RelayxPort,
+			"mwss": a.cfg.MWSSPort, "quic": a.cfg.QUICPort, "tunex": a.cfg.TunexPort,
 		},
 		"sysinfo": basic,
 		"version": versionString(),
@@ -218,7 +215,7 @@ func (a *Agent) register(client *socketio.Client) error {
 		return fmt.Errorf("register rejected: %s", resp.Error)
 	}
 
-	info, err := license.Verify(resp.License, keyFromEnv(license.EnvLicenseKey, "RELAYX_LICENSE_KEY"), a.serverURL)
+	info, err := license.Verify(resp.License, keyFromEnv(license.EnvLicenseKey), a.serverURL)
 	if err != nil {
 		return fmt.Errorf("register: license: %w", err)
 	}

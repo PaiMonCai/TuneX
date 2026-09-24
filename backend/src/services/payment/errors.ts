@@ -2,7 +2,7 @@
  * 支付模块结构化错误
  *
  * 原版缺陷：验签失败抛裸 `Error`，被 app.ts 的 onError 当作 500 处理并上报 sentry，
- * 恶意伪造回调可制造日志/告警噪音。W5 改为结构化错误，路由层据此返回明确状态码，
+ * 恶意伪造回调可制造日志/告警噪音。本实现改为结构化错误，路由层据此返回明确状态码，
  * 且不触发 5xx 告警。
  */
 
@@ -30,7 +30,7 @@ export class SignatureError extends PaymentError {
   }
 }
 
-/** 回调金额与订单应付金额不一致（W5 修复的原版缺陷） */
+/** 回调金额与订单应付金额不一致（已修复的原版缺陷） */
 export class AmountMismatchError extends PaymentError {
   readonly expected: number;
   readonly actual: number;

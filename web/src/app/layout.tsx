@@ -6,7 +6,7 @@ import { Toaster } from "sonner";
 import "./globals.css";
 
 /**
- * 元信息跟随语言 cookie：`<title>` / description 在 SSR 阶段就按 relayx_locale 输出，
+ * 元信息跟随语言 cookie：`<title>` / description 在 SSR 阶段就按 tunex_locale 输出，
  * 与页面正文语言保持一致（curl 带 Cookie 即可验证中英切换）。
  */
 export async function generateMetadata(): Promise<Metadata> {
@@ -35,7 +35,7 @@ export const viewport: Viewport = {
 /**
  * 根布局（服务端组件）。
  *
- * - `<html lang>` 与词典都由 relayx_locale cookie 决定 → 中英切换体现在 SSR 输出里；
+ * - `<html lang>` 与词典都由 tunex_locale cookie 决定 → 中英切换体现在 SSR 输出里；
  * - `suppressHydrationWarning` 是 next-themes（class 策略暗色模式）在 <html> 上注入 class 所必需的；
  * - Toaster 全局只挂载一次，AppShell 内不再重复挂载（避免重复弹窗）。
  */

@@ -17,22 +17,22 @@ function requiredKey(name: "TUNEX_CONFIG_KEY" | "TUNEX_LICENSE_KEY"): string {
 }
 
 /**
- * relayx-auth HKDF info constant.
+ * Data-plane auth HKDF info constant.
  *
- * This is a protocol label (not a secret) kept for wire compatibility with
- * nodes using the `relayx` tunnel type: HKDF-SHA256(authKey, salt=nil,
- * info="relayx-auth-v1", L=32).
+ * This is a protocol label (not a secret) that participates in the data-plane
+ * tunnel token derivation: HKDF-SHA256(authKey, salt=nil, info="tunex-auth-v1",
+ * L=32), used by nodes whose tunnel type is `tunex`.
  */
-export const RELAYX_AUTH_HKDF_INFO = 'relayx-auth-v1';
+export const TUNEX_AUTH_HKDF_INFO = 'tunex-auth-v1';
 
 /** Data-plane token time window, in seconds. */
-export const RELAYX_AUTH_WINDOW_SECONDS = 300;
+export const TUNEX_AUTH_WINDOW_SECONDS = 300;
 
 /** Data-plane token length: nonce(16) + UnixNano(8) + HMAC-SHA256(32) = 56 bytes. */
-export const RELAYX_AUTH_TOKEN_BYTES = 56;
+export const TUNEX_AUTH_TOKEN_BYTES = 56;
 
 /** Field offsets in the 56-byte token. */
-export const RELAYX_AUTH_TOKEN_OFFSETS = {
+export const TUNEX_AUTH_TOKEN_OFFSETS = {
   nonce: 0,
   timestamp: 16,
   mac: 24,

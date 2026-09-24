@@ -1,10 +1,10 @@
-// Package relayx implements the RelayX tunnel protocol: a WebSocket-framed,
+// Package tunex implements the TuneX tunnel protocol: a WebSocket-framed,
 // smux-multiplexed, Bearer-token-authenticated port-forwarding channel, used
 // between agent nodes.
 //
 // Authentication (verified from the original binary):
 //
-//	authKey   = HKDF-SHA256(secret, salt=nil, info="relayx-auth-v1", L=32)
+//	authKey   = HKDF-SHA256(secret, salt=nil, info="tunex-auth-v1", L=32)
 //	token(56) = nonce[16] || unixNano[8] BE || HMAC-SHA256(authKey, nonce||ts)[32]
 //	header    = Authorization: Bearer <base64(token)>
 //
@@ -22,7 +22,7 @@
 //
 // The optional request header "X-Gost-Target" tells a listener which tunnel a
 // stream belongs to.
-package relayx
+package tunex
 
 import (
 	"bytes"
@@ -38,12 +38,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/relayx/agent/internal/mux"
-	"github.com/relayx/agent/internal/ws"
+	"github.com/tunex/agent/internal/mux"
+	"github.com/tunex/agent/internal/ws"
 )
 
 // HKDFInfo is the fixed HKDF info string.
-const HKDFInfo = "relayx-auth-v1"
+const HKDFInfo = "tunex-auth-v1"
 
 // TokenBytes is the exact token length the listener enforces.
 const TokenBytes = 56
@@ -52,7 +52,7 @@ const TokenBytes = 56
 const WindowSeconds = 300
 
 // DeriveAuthKey derives the 32-byte auth key from a secret using
-// HKDF-SHA256(secret, salt=nil, info="relayx-auth-v1", L=32).
+// HKDF-SHA256(secret, salt=nil, info="tunex-auth-v1", L=32).
 func DeriveAuthKey(secret string) []byte {
 	return hkdfSHA256([]byte(secret), nil, []byte(HKDFInfo), 32)
 }
@@ -151,7 +151,7 @@ func ParseBearer(header string) ([]byte, bool) {
 	return raw, true
 }
 
-// DialOptions configures a relayx client dial.
+// DialOptions configures a tunex client dial.
 type DialOptions struct {
 	// WSURL is the full ws:// or wss:// URL of the listener (including a random
 	// path). Callers build it from the node address + port.
@@ -165,7 +165,7 @@ type DialOptions struct {
 	RandPath bool
 }
 
-// Dial connects to a relayx listener and returns an established, multiplexed
+// Dial connects to a tunex listener and returns an established, multiplexed
 // stream ready for bidirectional forwarding.
 func Dial(opts DialOptions) (*mux.Stream, *mux.Session, error) {
 	if opts.Timeout <= 0 {
@@ -187,7 +187,7 @@ func Dial(opts DialOptions) (*mux.Stream, *mux.Session, error) {
 
 	conn, err := ws.Dial(opts.WSURL, headers, opts.Timeout)
 	if err != nil {
-		return nil, nil, fmt.Errorf("relayx: ws dial: %w", err)
+		return nil, nil, fmt.Errorf("tunex: ws dial: %w", err)
 	}
 
 	// Read and discard the server's random padding frame (must be non-empty).
@@ -195,11 +195,11 @@ func Dial(opts DialOptions) (*mux.Stream, *mux.Session, error) {
 	_, padding, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("relayx: read padding: %w", err)
+		return nil, nil, fmt.Errorf("tunex: read padding: %w", err)
 	}
 	if len(padding) == 0 {
 		conn.Close()
-		return nil, nil, fmt.Errorf("relayx: empty mux signal")
+		return nil, nil, fmt.Errorf("tunex: empty mux signal")
 	}
 	conn.SetReadDeadline(time.Time{})
 

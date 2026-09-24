@@ -1,9 +1,9 @@
 /**
  * 支付网关工厂 + 注册表
- * 依据: relayx-pay-channel-analysis-report.md §0 getPay()（源码确认）
+ * 依据: pay-channel-analysis-report.md §0 getPay()（源码确认）
  *
  * 原版行为：switch(payment.method) 分发，**default 回落 EPay**。
- * W5 保留该回落语义（兼容 method 字段异常的历史数据），但显式记录告警。
+ * 保留该回落语义（兼容 method 字段异常的历史数据），但显式记录告警。
  *
  * 扩展点：`registerGateway(method, factory)` 可注入自定义实现（测试/新网关），
  * 不改动本文件即可扩展。

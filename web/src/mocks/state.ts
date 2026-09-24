@@ -10,12 +10,15 @@
  */
 import type {
   AdminRole,
+  AuditLog,
   BalanceLog,
+  LicenseInfo,
   Node,
   NodeGroup,
   Payment,
   Plan,
   PlanOrder,
+  SystemConfigItem,
   Ticket,
   TopupOrder,
   Tunnel,
@@ -41,13 +44,19 @@ export interface MockStore {
   planOrders: PlanOrder[];
   tickets: Ticket[];
   balanceLogs: BalanceLog[];
+  /** 系统配置（config 表） */
+  systemConfig: SystemConfigItem[];
+  /** 授权信息 */
+  license: LicenseInfo;
+  /** 审计日志（只读） */
+  auditLogs: AuditLog[];
   /** 单例创建时间，便于调试 */
   boot_at: string;
 }
 
-const STORE_KEY = "__relayx_mock_store_v1__";
+const STORE_KEY = "__tunex_mock_store_v1__";
 
-type GlobalWithStore = typeof globalThis & { __relayx_mock_store_v1__?: MockStore };
+type GlobalWithStore = typeof globalThis & { __tunex_mock_store_v1__?: MockStore };
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -78,7 +87,7 @@ function build(): MockStore {
     user: users[0],
     users,
     passwords: { [users[0].id]: seed.DEMO_CREDENTIALS.password },
-    adminRoles: clone([seed.mockAdminRole]),
+    adminRoles: clone(seed.mockAdminRoles),
     userPlans,
     nodeGroups,
     nodes,
@@ -89,6 +98,9 @@ function build(): MockStore {
     planOrders: clone(seed.mockPlanOrders),
     tickets: clone(seed.mockTickets),
     balanceLogs: clone(seed.mockBalanceLogs),
+    systemConfig: clone(seed.mockSystemConfig),
+    license: clone(seed.mockLicense),
+    auditLogs: clone(seed.mockAuditLogs),
     boot_at: new Date().toISOString(),
   };
 }

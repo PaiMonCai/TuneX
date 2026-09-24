@@ -11,7 +11,7 @@ redis.on("error", (e) => {
   console.error("[redis] error:", e?.message ?? e);
 });
 
-/** W1 用到的键空间（与原版前缀风格保持一致） */
+/** 应用使用的 Redis 键空间（与原版前缀风格保持一致） */
 export const RedisKeys = {
   license: "license",
   userSub: (sub: string) => `user:sub:${sub}`,

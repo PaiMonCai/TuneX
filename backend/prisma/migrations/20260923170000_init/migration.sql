@@ -51,7 +51,7 @@ CREATE TABLE `node` (
 CREATE TABLE `tunnel` (
     `id` INTEGER NOT NULL AUTO_INCREMENT,
     `name` VARCHAR(255) NOT NULL,
-    `tunnel_type` ENUM('tcp', 'mtcp', 'udp', 'relayx', 'mtls', 'mwss', 'wss', 'tls', 'quic') NOT NULL DEFAULT 'wss',
+    `tunnel_type` ENUM('tcp', 'mtcp', 'udp', 'tunex', 'mtls', 'mwss', 'wss', 'tls', 'quic') NOT NULL DEFAULT 'wss',
     `category` ENUM('port_forward', 'remote_port_forward') NOT NULL DEFAULT 'port_forward',
     `listen_ip` VARCHAR(191) NULL,
     `listen_port` INTEGER NULL,
