@@ -993,45 +993,55 @@ Next unlock after Gate F1:
 - `go build ./...`
 - Linux amd64 / arm64 release build
 
-### 阶段验收
+### 集成验收
 
-S3 起必须增加真实网络测试，不能只依赖 mock。
-S8 之前 RELAY 不得作为默认公开能力。
+- WP5 起的数据平面能力必须增加真实网络测试，不能只依赖 mock。
+- WP14 Real E2E Gate 通过之前，RELAY 不得作为默认公开能力。
+- 并行 PR 各自 CI 通过不等于集成完成；跨 Track 能力必须在对应 Integration Gate 再验一次。
 
 ---
 
 ## 10. 分支、PR 与提交约定
 
-分支名必须与当前 Step 对应，优先使用本文件第 7 节给出的固定名称，例如：
+分支名必须与 Work Package 对应，使用第 7 节统一命名，例如：
 
 ```text
-feature/v3-s1a-schema
-feature/v3-s1b-backfill
-feature/v3-s2-port-lease
-feature/v3-s3a-agent-runtime
-feature/v3-s3b-relay-dataplane
-feature/v3-s4a-control-protocol
-feature/v3-s4b-node-session
-...
+feature/v3-wp1-schema
+feature/v3-wp2-backfill
+feature/v3-wp3-port-lease
+feature/v3-wp4-agent-runtime
+feature/v3-wp5-relay-dataplane
+feature/v3-wp6-control-contract
+feature/v3-wp7-node-session
+feature/v3-wp8-orchestrator
+feature/v3-wp9-reconciler
+feature/v3-wp10-admin-api
+feature/v3-wp11-tunnel-api
+feature/v3-wp12-admin-web
+feature/v3-wp13-tunnel-web
+test/v3-wp14-e2e-harness
 ```
 
-不得创建“下一阶段总分支”一次堆多个 Step。
+禁止创建“v3-next”“v3-all”“next-stage”这类把多个 WP 混在一起的总分支。
 
 PR 标题：
 
 ```text
-feat(v3-s3): implement TCP relay data plane
+feat(v3-wp5): implement TCP relay data plane
 ```
 
 PR 描述必须包含：
 
-- 所属切片。
-- 改动范围。
-- 未实现范围。
+- Work Package / Track。
+- Depends-On / Blocks。
+- Contract Changes。
+- 改动范围与明确未实现范围。
 - 数据迁移影响。
 - 回滚方式。
 - 测试证据。
 - 是否改变 v3map 约束；正常情况下答案必须是“否”。
+
+并行 PR 可以同时存在，但只有依赖已经进入 main、分支已经更新到最新 main、完整 CI 重新通过以后才允许合并。
 
 ---
 
