@@ -42,10 +42,14 @@ jobs:
           --health-cmd="redis-cli ping" --health-interval=10s
           --health-timeout=5s --health-retries=12
     env:
-      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci
+      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci # secret-scan:allow (CI-only fixture, not a real secret)
       REDIS_URL: redis://127.0.0.1:6379
-      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production
-      LICENSE_SECRET: ci-only-license-secret-must-not-be-used-in-production
+      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
+      LICENSE_SECRET: ci-only-license-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
+      # Per-install Fernet keys: src/env.ts fails fast at startup unless both are
+      # present and valid 32-byte base64url keys. CI-only values, never deployed.
+      TUNEX_CONFIG_KEY: Y2ktb25seS1jb25maWcta2V5LW11c3Qtbm90LXByb2Q= # secret-scan:allow (CI-only fixture, not a real secret)
+      TUNEX_LICENSE_KEY: Y2ktb25seS1saWNlbnNlLWtleS1tdXN0LW5vdC1wcm8= # secret-scan:allow (CI-only fixture, not a real secret)
       PAYMENTS_ENABLED: "false"
     defaults:
       run:
@@ -72,7 +76,7 @@ jobs:
       - name: Migrate and verify existing two-user database
         run: |
           bunx prisma db execute --schema prisma/schema.prisma --file tests/fixtures/create-upgrade-db.sql
-          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci # secret-scan:allow (CI-only fixture, not a real secret)
           temp_dir=$(mktemp -d)
           cp prisma/schema.prisma "$temp_dir/schema.prisma"
           mkdir -p "$temp_dir/migrations"
@@ -122,7 +126,9 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-linux-amd64 .
           CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-linux-arm64 .
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-windows-amd64.exe .
+          # Windows target intentionally omitted: the agent uses Linux-only syscalls
+          # (netutil/statfs.go -> syscall.Statfs), so GOOS=windows fails to build.
+
       - uses: actions/upload-artifact@v4
         with:
           name: tunex-agent
