@@ -1,8 +1,10 @@
 # TuneX 开发方案：个人与团队 SaaS
 
-> 状态：规划稿，基于当前仓库静态审查。本文中的“已有”指代码入口存在，不代表在真实网络或生产环境通过验收。
+> 状态：执行中。本文中的"已有"指代码入口存在，不代表在真实网络或生产环境通过验收。
 > 产品决策：**TuneX 是多租户 SaaS**；个人用户和团队共享托管控制面，部署自己的节点。产品以隧道可用性、协作与资源管理为核心；支付等强商业模块降级为可选扩展，默认关闭，**不是删除项目的 SaaS 属性**。
 > `DEVELOPMENT.md` 是现有实现/运维记录；`reports/` 中的结论须重测。方案执行中，每个阶段完成后回填本文件的验收状态。
+>
+> **2026-09-24 进度回填**：SEC-01/SEC-02（部分）/TEN-01（后端）/TEN-02（部分）/AUTHZ-01/AUTHZ-02（策略模型部分）/PAY-01/QA-01 已完成并合入 main（CI 全绿，含真实 MySQL 迁移验证）；详见 `reports/tunex-vs-relayx-diff.md` 与 §6 工作包状态列。**重要修正**：原版 RelayX 的 agent 数据面同样只有裸 TCP/UDP，mtls/quic 等协议枚举两边均未实现——差距在流量计量与验证深度，不在协议引擎。
 
 ## 1. 产品定位、场景与边界
 
@@ -170,23 +172,25 @@ RelayX 的[产品功能概览](https://docs.relayx.cc/guide/intro/)、[版本对
 
 ## 6. 可直接建 Issue 的工作包
 
-| 编号 | 级别 | 交付成果 | 代码落点 / 依赖 | 验收凭证 |
-| --- | --- | --- | --- | --- |
-| SEC-01 | P0 | 来源/许可证审查；移除上游固定密钥/授权依赖 | `backend/src/crypto/`、`agent/internal/`；公开前 | 来源清单、独立协议及配置密钥测试 |
-| SEC-02 | P0 | 生产配置检查、用户认证/限流/CSRF、邀请与密钥轮换 | `backend/src/env.ts`、`backend/src/routes/auth.ts` | 弱配置启动失败，登录安全测试 |
-| TEN-01 | P0 | Workspace/Membership/Invite 迁移和平台管理员分离 | Prisma、`backend/src/middlewares/`、Web | 个人+团队创建、权限矩阵和回滚脚本 |
-| TEN-02 | P0 | API/Redis/Queue/Socket/Agent 全链路租户作用域 | `backend/src/routes/`、`backend/src/socket/`、`backend/src/worker.ts` | 越权探针、同 ID 资源和重连隔离用例 |
-| NET-01 | P0 | 自有 TCP 反向数据通道与节点身份验证 | `agent/internal/`、后端配置分发；依赖 TEN-01 | 私网无入站、双租户双链路真实测试 |
-| NET-02 | P0 | 幂等配置 ACK、冲突处理、监听失败反馈 | Agent、`backend/src/socket/`、Web | 失败/恢复/并发端口用例 |
-| AUTHZ-01 | P0 | RBAC 去商业授权闸门，建立 workspace 角色/资源/动作矩阵 | `backend/src/middlewares/auth.ts`、Prisma、Web | 未付费的 owner/成员按角色管理资源，无越权 |
-| AUTHZ-02 | P0 | CapabilityPolicy + Assignment + NodeGroupGrant，替换 UserPlan 过滤依赖 | `backend/src/socket/config-generator.ts`、隧道路由、Prisma | 无订单可建隧道；空白名单拒绝；撤权立即生效 |
-| SOFT-01 | P0 | 策略额度原子判定、到期/流量耗尽处理 | 策略/额度服务（待建）、Prisma、Web | 并发限额不越界，拒绝原因可解释 |
-| PAY-01 | P0 | 关闭支付写入口和回调但保留历史数据 | `backend/src/routes/`、`web/src/lib/nav.ts`、Worker | 直接调用与伪造回调均拒绝，旧数据可查 |
-| OPS-01 | P0 | 离线状态、流量聚合与任务幂等 | `backend/src/worker.ts`、Agent 观测 | 断线与恢复目标、聚合不重复 |
-| QA-01 | P0 | Linux CI、空库升级迁移、双租户网络+浏览器 E2E | `.github/workflows/` 与测试目录（待建） | 每次 PR 自动通过、失败可复现 |
-| OPS-02 | P1 | SaaS 部署/备份/告警/容量基线与回滚 | Compose 生产配置、Caddy、文档 | 新装、备份恢复和回滚演练 |
-| TEAM-01 | P1 | 自定义团队角色与细粒度审计（基础权限先在 P0 落地） | Prisma、后台权限、Web 设置 | 固定角色及自定义角色权限全覆盖 |
-| BILL-01 | P2 | 独立可选计费适配层（有需求后再排） | 不污染核心隧道域 | 关闭时主流程保持可用，开启时财务/安全评审 |
+| 编号 | 级别 | 状态 | 交付成果 | 代码落点 / 依赖 | 验收凭证 |
+| --- | --- | --- | --- | --- | --- |
+| SEC-01 | P0 | ✅ 完成 | 来源/许可证审查；移除上游固定密钥/授权依赖 | `backend/src/crypto/`、`agent/internal/` | main 已合入；密钥缺失启动 fail-fast |
+| SEC-02 | P0 | 🟡 部分 | 生产配置检查、用户认证/限流/CSRF、邀请与密钥轮换 | `backend/src/env.ts`、`backend/src/routes/auth.ts`、`middlewares/rate-limit.ts` | fail-fast ✅、限流 ✅；CSRF/密钥轮换待做 |
+| TEN-01 | P0 | 🟡 后端完成 | Workspace/Membership/Invite 迁移和平台管理员分离 | Prisma、`backend/src/routes/workspaces.ts`、`services/workspace.ts` | CI 迁移升级验证 ✅；**前端与邮箱验证待做** |
+| TEN-02 | P0 | 🟡 部分 | API/Redis/Queue/Socket/Agent 全链路租户作用域 | `routes/`、`socket/`、`worker.ts` | 隧道/节点组查询已带 workspace；Redis key 作用域未统一 |
+| NET-01 | P0 | 🟡 部分 | 自有 TCP 反向数据通道与节点身份验证 | `agent/internal/`、后端配置分发 | 单节点主链路实测通；双租户真实网络 E2E 待做 |
+| NET-02 | P0 | ✅ 完成 | 幂等配置 ACK、冲突处理、监听失败反馈 | `socket/listen-events.ts`、`port-allocator.ts`、`config-pusher.ts` | 离线测试 30+ 用例全过 |
+| AUTHZ-01 | P0 | ✅ 完成 | RBAC 去商业授权闸门，建立 workspace 角色/资源/动作矩阵 | `middlewares/auth.ts`、`services/node-group-policy.ts` | 未付费 owner 按角色管理资源，CI 通过 |
+| AUTHZ-02 | P0 | 🟡 大部分 | CapabilityPolicy + Assignment + NodeGroupGrant，替换 UserPlan 过滤依赖 | `services/capability-policy.ts`、`policy-service.ts`、`socket/config-generator.ts` | 策略体系与 NodeGroupGrant ✅；**config-generator 的 user_plan 依赖替换待收尾** |
+| SOFT-01 | P0 | 🟡 大部分 | 策略额度原子判定、到期/流量耗尽处理 | `services/policy-service.ts`（FOR UPDATE 并发锁已实现） | 服务层就绪；**路由接线与并发用例待收尾** |
+| PAY-01 | P0 | ✅ 完成 | 关闭支付写入口和回调但保留历史数据 | `middlewares/payments-gate.ts`、前端开关 | 直接调用与伪造回调均 403，CI 通过 |
+| OPS-01 | P0 | 🟡 部分 | 离线状态、流量聚合与任务幂等 | `worker.ts`、`socket/offline-detector.ts` | 离线检测闭环 ✅；**流量入库/聚合仍空壳** |
+| QA-01 | P0 | ✅ 完成 | Linux CI、空库升级迁移、双租户网络+浏览器 E2E | `.github/workflows/ci.yml` | 真实 MySQL CI + 秘密扫描 + GHCR 镜像 ✅；**双租户 E2E 待做** |
+| OPS-02 | P1 | ⚪ 未开始 | SaaS 部署/备份/告警/容量基线与回滚 | Compose 生产配置、Caddy、文档 | GHCR 预构建镜像已就位；备份/告警待做 |
+| TEAM-01 | P1 | ⚪ 未开始 | 自定义团队角色与细粒度审计（基础权限先在 P0 落地） | Prisma、后台权限、Web 设置 | 固定四角色已落地 |
+| BILL-01 | P2 | ⚪ 未开始 | 独立可选计费适配层（有需求后再排） | 不污染核心隧道域 | 支付关闭状态已满足前置 |
+| OPS-03 | P0 | ⚪ 新增 | 流量计量链路：agent 上报 → Redis 缓冲 → MySQL 入库 → 按 workspace 聚合展示 | `worker.ts` cron_save_traffic、`services/`、Web 仪表盘 | 采集入库不重复，聚合口径与策略流量一致 |
+| TEN-03 | P0 | ⚪ 新增 | 邮箱验证与密码重置 | `routes/auth.ts`、邮件服务 | 注册验证邮件、重置链接单次使用/过期 |
 
 每个工作包需写清：状态迁移、API 契约、跨租户负面用例、可观测性、开发配置、回滚方法。P0 未完成不可公开对外提供多租户服务。
 
