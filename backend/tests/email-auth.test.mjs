@@ -33,6 +33,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   });
 
   const { db } = await import("../src/db.ts");
+  const { redis } = await import("../src/redis.ts");
   const { hashEmailToken } = await import("../src/services/mail-tokens.ts");
   const { getEffectivePolicy } = await import("../src/services/policy-service.ts");
 
@@ -42,6 +43,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
 
   after(async () => {
     mailModule.setMailTransportForTest(null);
+    redis.disconnect();
+    await db.$disconnect();
   });
 
   const nonce = randomUUID().slice(0, 12);
