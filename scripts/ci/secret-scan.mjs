@@ -21,6 +21,14 @@ const ALLOW = /(secret-scan:allow|gitleaks:allow)/;
 /** 占位符/模板值：出现这些字样视为“不是真密钥”。 */
 const PLACEHOLDER = /(replace-with|change-me|changeme|placeholder|example|<[^>]+>|\$\{|xxx+|your[-_]?|\.\.\.)/i;
 
+/**
+ * 纯变量引用/命令替换：值为 `$VAR`、`${VAR}`、`"$(cmd)"` 等，secret 本身在
+ * 别处（运行时生成的环境文件），不构成硬编码。修正 assigned-secret 规则的
+ * 实际行为：原注释声明“不是纯变量引用”应跳过，但实现未做该判断，导致
+ * NET-01 e2e 脚本里的 `AUTH_SECRET=$AUTH_SECRET` 误报使 CI 失败。
+ */
+const PURE_REFERENCE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$|^\$\((?:.|\n)*\)$/;
+
 /** 二进制/体积过大的文件直接跳过。 */
 const MAX_BYTES = 512 * 1024;
 
@@ -93,8 +101,16 @@ function main() {
         if (!m) continue;
         if (rule.severity === "error" && allowed) continue;
         if (rule.valueGroup) {
-          const value = (m[rule.valueGroup] ?? "").trim();
+          let value = (m[rule.valueGroup] ?? "").trim();
+          // 剥掉一层包裹的引号再判断：`KEY="$VAR"` 与 `KEY=$VAR` 同样是引用。
+          if (
+            (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+            (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+          ) {
+            value = value.slice(1, -1);
+          }
           if (!value || PLACEHOLDER.test(value)) continue;
+          if (PURE_REFERENCE.test(value)) continue;
         }
         const rec = { file, line: i + 1, rule: rule.id, text: line.trim().slice(0, 160) };
         (rule.severity === "error" ? errors : warnings).push(rec);
