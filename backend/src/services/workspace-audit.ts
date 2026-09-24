@@ -138,7 +138,8 @@ export async function queryWorkspaceAudit(
       orderBy: { created_at: "desc" },
       skip: (page - 1) * page_size,
       take: page_size,
-      include: { actor: { select: { email: true } } },
+      // 注意：AuditEvent 的 actor_user_id 只是裸 Int? 标量列（schema 里没有到
+      // User 的 relation），无法 join 出 actor_email，统一留 null。
     }),
     db.auditEvent.count({ where: eventWhere }),
   ]);
@@ -148,7 +149,8 @@ export async function queryWorkspaceAudit(
     source: "event" as const,
     created_at: r.created_at,
     actor_user_id: r.actor_user_id,
-    actor_email: r.actor?.email ?? null,
+    // AuditEvent 无到 User 的 relation，actor_email 无法从库里 join 出来。
+    actor_email: null,
     action: r.action,
     resource_type: r.resource_type,
     resource_id: r.resource_id,
