@@ -84,6 +84,8 @@ const zh = {
   workspace: {
     title: "工作空间",
     subtitle: "切换个人与团队空间，管理成员与邀请",
+    detailId: "空间 ID：",
+    memberCount: "成员数：",
     switch: "切换工作空间",
     manage: "工作空间管理",
     create: "创建团队空间",
@@ -534,6 +536,8 @@ const en: Dict = {
   workspace: {
     title: "Workspaces",
     subtitle: "Switch between personal and team workspaces, manage members and invites",
+    detailId: "Workspace ID: ",
+    memberCount: "Members: ",
     switch: "Switch workspace",
     manage: "Manage workspace",
     create: "Create team workspace",
