@@ -70,6 +70,9 @@ export function isNoAuthPath(path: string): boolean {
 export const IMPERSONATION_HEADER = "x-impersonation";
 export const IMPERSONATION_TTL_SECONDS = 2 * 60 * 60;
 
+// TEN-02：冒充票据是 token 自作用域（token 全局唯一、值只描述「哪个用户」），
+// 键走 `ws:global:impersonation:<token>`。
+
 async function resolveImpersonation(
   headers: Headers,
   user: NonNullable<AuthedUser>,
@@ -111,6 +114,8 @@ export const authRequired = createMiddleware<{ Variables: AppVariables }>(async 
     if (!Number.isInteger(userId)) throw new HTTPException(401, { message: "Unauthorized" });
 
     // ① Redis 映射缓存（sub → user.id）
+    // TEN-02：JWT sub 映射是**账户**数据（一个用户可属于多个 workspace），
+    // 不属于任何单个租户 → `ws:global:user:<sub>:id`。
     let user: NonNullable<AuthedUser> | null = null;
     try {
       const cachedId = await redis.get(RedisKeys.userSub(payload.sub));

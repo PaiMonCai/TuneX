@@ -17,7 +17,7 @@
  */
 import { db } from "../../db.ts";
 import { env } from "../../env.ts";
-import { redis } from "../../redis.ts";
+import { redis, RedisKeys } from "../../redis.ts";
 import { assertAmountConsistent, getRealPrice } from "./base.ts";
 import {
   AmountMismatchError,
@@ -482,7 +482,8 @@ export class TopupOrderService {
 
   /** 单用户互斥锁（Redis SET NX EX；Redis 不可用时降级为直通，与原版 Redlock 语义近似） */
   private async withUserLock<T>(userId: number, fn: () => Promise<T>): Promise<T> {
-    const key = `topup:order:${userId}`;
+    // TEN-02：锁是账户级资源（一个用户可属多个 workspace），走 `ws:global:topup:order:<userId>`。
+    const key = RedisKeys.topupOrderLock(userId);
     let acquired = false;
     try {
       acquired = (await redis.set(key, String(Date.now()), "EX", USER_LOCK_TTL_SECONDS, "NX")) === "OK";

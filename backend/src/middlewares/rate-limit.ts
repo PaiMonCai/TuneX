@@ -18,9 +18,15 @@
  *  · **纯逻辑与副作用分离**：{@link selectRule} / {@link identityOf} /
  *    {@link evaluate} 均为纯函数，可离线单测（见 `__tests__/rate-limit.test.ts`）；
  *    {@link createRateLimitMiddleware} 负责接线。
+ *
+ * TEN-02 键作用域：限流计数键经 {@link scopedKey} 生成，走平台段
+ * `ws:global:ratelimit:<rule>:<identity>`。identity 已含 `user:<id>` 或
+ * `ip:<addr>`，键值只是一个整数计数、不描述任何租户资产，因此归入 global
+ * 段而非 workspace 段——但前缀仍然要带，保证全站键位一个规范。
  */
 import { createMiddleware } from "hono/factory";
 import type { AppVariables } from "./auth.ts";
+import { RedisKeys } from "../redis.ts";
 
 /* ================================================================== */
 /* 类型                                                               */
@@ -188,9 +194,13 @@ export function identityOf(
   return ctx.userId ? `user:${ctx.userId}` : `ip:${ip}`;
 }
 
-/** 组装 Redis key。 */
+/**
+ * 组装 Redis key。
+ *
+ * TEN-02：经 {@link RedisKeys.rateLimit} 生成，带 `ws:global:` 前缀。
+ */
 export function rateLimitKey(ruleName: string, identity: string): string {
-  return `ratelimit:${ruleName}:${identity}`;
+  return RedisKeys.rateLimit(ruleName, identity);
 }
 
 /**
