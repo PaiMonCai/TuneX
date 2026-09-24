@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/card";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { LocaleSwitcher } from "@/components/locale-switcher";
+import { WorkspaceSwitcher } from "@/components/workspace/workspace-switcher";
 import { useI18n } from "@/components/providers";
 
 /**
@@ -23,6 +24,8 @@ export function Topbar({ title, subtitle, adminMode = false }: { title: string; 
         {subtitle && <p className="truncate text-xs text-[var(--muted-foreground)]">{subtitle}</p>}
       </div>
       <div className="flex shrink-0 items-center gap-1">
+        {/* TEN-01：工作空间切换器（用户端；管理后台不参与 workspace 作用域） */}
+        {!adminMode && <WorkspaceSwitcher />}
         <Button variant="ghost" size="icon" aria-label={t("common.tickets")} className="hidden sm:inline-flex">
           <Bell className="size-4" />
         </Button>

@@ -32,6 +32,21 @@ export const env = {
 
   allowRegisterFallback: (process.env.ALLOW_REGISTER_FALLBACK ?? "true") === "true",
 
+  /** TEN-03 邮件服务（SMTP）。全部未配置 → 邮件内容落日志（开发环境可用）。 */
+  mail: {
+    host: process.env.SMTP_HOST ?? "",
+    port: Number(process.env.SMTP_PORT ?? 465),
+    user: process.env.SMTP_USER ?? "",
+    pass: process.env.SMTP_PASS ?? "",
+    from: process.env.SMTP_FROM ?? "",
+    /** STARTTLS（587）默认开；465 隐式 TLS 自动识别。置 false 走明文（测试）。 */
+    secure: (process.env.SMTP_SECURE ?? "true") === "true",
+  },
+  /** 邮箱验证 token 有效期：24h（重置 token 固定 1h，见 services/mail-tokens.ts）。 */
+  emailVerifyTtlSeconds: Number(process.env.EMAIL_VERIFY_TTL_SECONDS ?? 24 * 60 * 60),
+  /** 重新发送验证邮件的间隔：60s（限流中间件之外的应用层节流）。 */
+  resendVerificationIntervalSeconds: Number(process.env.RESEND_VERIFICATION_INTERVAL ?? 60),
+
   licenseType: process.env.LICENSE_TYPE ?? "business",
   licenseExpiredAt: Number(process.env.LICENSE_EXPIRED_AT ?? 0),
   licenseSecret: requireSecret("LICENSE_SECRET"),

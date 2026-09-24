@@ -9,7 +9,8 @@ import { getCookie } from "hono/cookie";
 import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
 import { env } from "../env.ts";
-import { verifyAccessToken, isUUID, safeEqual } from "../auth.ts";
+import { verifyAccessToken, isUUID } from "../auth.ts";
+import { resolveUserByKey } from "../services/user-keys.ts";
 import {
   getEffectiveAccess,
   resolveAdminRoute,
@@ -93,7 +94,8 @@ async function resolveImpersonation(
 /**
  * authRequired —— 双通道认证
  * 通道 A: Cookie `access`（JWT，HS256）
- * 通道 B: Authorization: Bearer <uuid v4>（user.api_key）
+ * 通道 B: Authorization: Bearer <uuid v4>（查 user.api_key_hash，见 services/user-keys.ts：
+ *   新凭据只落 sha256 哈希，旧明文行在首次认证时惰性迁移）
  */
 export const authRequired = createMiddleware<{ Variables: AppVariables }>(async (c, next) => {
   const path = c.req.path;
@@ -141,14 +143,10 @@ export const authRequired = createMiddleware<{ Variables: AppVariables }>(async 
 
   if (!isUUID(bearer)) throw new HTTPException(401, { message: "Unauthorized" });
 
-  const user = await db.user.findUnique({
-    where: { api_key: bearer },
-    include: { admin_roles: true },
-  });
+  // SEC-02：凭据哈希化。先查哈希列，未命中再查明文列（惰性迁移命中时同事务写哈希清
+  // 明文）；恒定时间复核已由 hash 唯一索引等值匹配 + 迁移路径内的 safeEqual 覆盖。
+  const user = await resolveUserByKey("api_key", bearer);
   if (!user) throw new HTTPException(401, { message: "Unauthorized" });
-
-  // 恒定时间比较复核（防时序侧信道）
-  if (!safeEqual(user.api_key, bearer)) throw new HTTPException(401, { message: "Unauthorized" });
 
   if (user.status === "inactive") throw new HTTPException(403, { message: "用户账户已被封禁" });
 

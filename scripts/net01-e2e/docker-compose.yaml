@@ -1,0 +1,126 @@
+# NET-01 双租户 E2E —— 独立编排（一次性环境）
+#
+# 与生产栈（/opt/relayx、/opt/TuneX）完全隔离：
+#   · 独立 bridge 网络 net01_net（不挂 relayx_default / tunex）
+#   · 独立容器名 net01-*、独立数据卷 net01-mysql-data
+#   · 独立端口：mysql 13310、redis 13311、HTTP API 8787、Socket.IO 8788
+#   · 独立密钥（env / .env 提供，不读任何其它栈的 .env）
+#
+# 用法：
+#   cd /opt/TuneX-email-auth
+#   bash scripts/net01-e2e/setup.sh        # 建环境 + 建两个租户
+#   bash scripts/net01-e2e/verify.sh       # 跑双租户隔离验证
+#   bash scripts/net01-e2e/teardown.sh     # 整体销毁
+name: net01
+
+services:
+  mysql:
+    image: mysql:8.4.11
+    container_name: net01-mysql
+    restart: unless-stopped
+    command: --skip-log-bin --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-tunex}
+    ports:
+      - "13310:3306"
+    volumes:
+      - net01_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:?required}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [net01]
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: net01-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "13311:6379"
+    volumes:
+      - net01_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [net01]
+
+  # 控制面（HTTP API :3000 + Socket.IO :3001）。host 网络不可用于 compose 单服务
+  # 端口映射，故两条端口分别暴露；容器内 DATABASE_URL/REDIS_URL 走服务名直连。
+  backend:
+    image: ghcr.io/paimoncai/tunex-backend:latest
+    container_name: net01-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      SOCKET_PORT: "3001"
+      TZ: Asia/Shanghai
+      SITE_URL: ${SITE_URL:?required}
+      DATABASE_URL: ${DATABASE_URL:?required}
+      REDIS_URL: redis://redis:6379
+      AUTH_SECRET: ${AUTH_SECRET:?required}
+      LICENSE_SECRET: ${LICENSE_SECRET:?required}
+      TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
+      TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
+      JWT_ISSUER: ${JWT_ISSUER:-net01}
+      JWT_TTL_SECONDS: "43200"
+      COOKIE_SECURE: "false"
+      ALLOW_REGISTER_FALLBACK: "true"
+      DISABLE_WORKER: "false"
+      RATE_LIMIT_ENABLED: "true"
+      AUDIT_LOG_ENABLED: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8787:3000"
+      - "8788:3001"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+    networks: [net01]
+
+  # db-migrate：跑 migrate deploy + seed（一次性，成功后退出）
+  db-migrate:
+    image: ghcr.io/paimoncai/tunex-backend:latest
+    container_name: net01-db-migrate
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?required}
+      REDIS_URL: redis://redis:6379
+      SITE_URL: ${SITE_URL:?required}
+      AUTH_SECRET: ${AUTH_SECRET:?required}
+      LICENSE_SECRET: ${LICENSE_SECRET:?required}
+      TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
+      TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
+      JWT_ISSUER: ${JWT_ISSUER:-net01}
+    command: ["sh", "-c", "bunx prisma migrate deploy && bun prisma/seed.ts"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+    networks: [net01]
+
+volumes:
+  net01_mysql_data:
+    name: net01_mysql_data
+  net01_redis_data:
+    name: net01_redis_data
+
+networks:
+  net01:
+    name: net01_net
+    driver: bridge

@@ -2,13 +2,16 @@
  * 个人设置路由（用户侧）—— 前端 api.settings.*
  *
  * 端点：
- *   GET    /api/settings/profile             当前用户资料（含 api_key / subscription_key）
+ *   GET    /api/settings/profile             当前用户资料（凭据字段一律不返回）
  *   PATCH  /api/settings/profile             更新 email / note / tg_id / auto_renew
  *   POST   /api/settings/password            修改密码（校验旧密码）
  *   POST   /api/settings/api-key             重新生成 API Key（UUID，供 Bearer 通道）
  *   POST   /api/settings/api-key/regenerate  同上（兼容旧客户端）
  *   POST   /api/settings/subscription-key            重新生成订阅密钥
  *   POST   /api/settings/subscription-key/regenerate 同上（兼容旧客户端）
+ *
+ * SEC-02：两个 regenerate 端点走 services/user-keys.ts 的 rotateKey ——
+ * 新明文只在本响应体出现一次，DB 里只有 sha256 哈希。
  *
  * 挂载方式（由 app.ts 的收尾子代理执行，本模块不修改 app.ts）：
  *   import { settingsRoutes } from "./routes/settings.ts";
@@ -23,9 +26,9 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { randomUUID } from "node:crypto";
 import { db } from "../db.ts";
 import { hashPassword, verifyPassword } from "../auth.ts";
+import { rotateKey } from "../services/user-keys.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const settingsRoutes = new Hono<{ Variables: AppVariables }>();
@@ -40,9 +43,27 @@ function requireUser(c: Context<{ Variables: AppVariables }>): NonNullable<AppVa
   return user;
 }
 
-/** 对外用户视图：剔除 credential 等敏感关联（c.get("user") 本身已不含 credential） */
+/**
+ * 对外用户视图：剔除所有凭据相关字段。
+ *
+ * SEC-02：哈希列（`api_key_hash` / `subscription_key_hash`）同样不可下发 ——
+ * 它不是明文，但它是「可直接用于认证的等价物」（哈希值一泄露，攻击者拿它
+ * 无法反推明文，却可以直接判断某把钥匙是否存在；更重要的是它没有任何理由
+ * 出现在客户端）。管理员列表（routes/admin*）已按同一口径剔除。
+ */
 function publicUser(u: Record<string, unknown>) {
-  return u;
+  const {
+    api_key,
+    subscription_key,
+    api_key_hash,
+    subscription_key_hash,
+    ...rest
+  } = u;
+  void api_key;
+  void subscription_key;
+  void api_key_hash;
+  void subscription_key_hash;
+  return rest;
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -126,10 +147,13 @@ settingsRoutes.post("/password", async (c) => {
 
 async function regenerateApiKey(c: Context<{ Variables: AppVariables }>) {
   const user = requireUser(c);
-  // 必须为 UUID：承载 Bearer 认证通道（middlewares/auth.ts 走 isUUID）
-  const key = randomUUID();
-  const updated = await db.user.update({ where: { id: user.id }, data: { api_key: key } });
-  return c.json({ data: { ok: true, api_key: key, user: updated } });
+  // SEC-02：轮换 = 新 UUID 覆盖 api_key_hash、清空 legacy 明文列。旧凭据立即失效
+  // （哈希被覆盖，明文列为空）；新明文只在本响应体里出现一次，不再落库。
+  const { plaintext } = await rotateKey("api_key", user.id);
+  const updated = await db.user.findUniqueOrThrow({ where: { id: user.id } });
+  // `plaintext` 是本端点**唯一**返回新凭据的地方（前端 OneTimeKeyBanner 展示一次）。
+  // user 对象走 publicUser 剥离，含哈希列。
+  return c.json({ data: { ok: true, api_key: plaintext, user: publicUser(updated as never) } });
 }
 
 settingsRoutes.post("/api-key", regenerateApiKey);
@@ -141,12 +165,10 @@ settingsRoutes.post("/api-key/regenerate", regenerateApiKey);
 
 async function regenerateSubscriptionKey(c: Context<{ Variables: AppVariables }>) {
   const user = requireUser(c);
-  const key = randomUUID();
-  const updated = await db.user.update({
-    where: { id: user.id },
-    data: { subscription_key: key },
-  });
-  return c.json({ data: { ok: true, subscription_key: key, user: updated } });
+  // SEC-02：与 api_key 同一策略 —— 覆盖哈希列、清空 legacy 明文列，明文一次性返回。
+  const { plaintext } = await rotateKey("subscription_key", user.id);
+  const updated = await db.user.findUniqueOrThrow({ where: { id: user.id } });
+  return c.json({ data: { ok: true, subscription_key: plaintext, user: publicUser(updated as never) } });
 }
 
 settingsRoutes.post("/subscription-key", regenerateSubscriptionKey);

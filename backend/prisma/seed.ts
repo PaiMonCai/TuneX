@@ -23,6 +23,7 @@
 import { db } from "../src/db.ts";
 import { createPersonalWorkspace, ensurePersonalWorkspace } from "../src/services/workspace.ts";
 import { hashPassword, generatePassword, newApiKey, verifyPassword } from "../src/auth.ts";
+import { hashKey } from "../src/services/user-keys.ts";
 import { writeFileSync, chmodSync } from "node:fs";
 import {
   NodeType,
@@ -210,7 +211,10 @@ async function seedSuperAdmin(): Promise<{
       data: {
         email: ADMIN_EMAIL,
         super_admin: true,
-        api_key: newApiKey(),
+        // SEC-02：种子账号同样只落 api_key 的 sha256 哈希（不落明文）。
+        // 明文只会出现在 seed 写出的凭据文件里，DB 无明文。
+        api_key: null,
+        api_key_hash: hashKey(newApiKey()),
       },
     });
     await tx.userCredential.create({

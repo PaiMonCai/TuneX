@@ -19,10 +19,11 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   const password = "ci-only-password-12";
   const ids = [];
 
+  let requestSeq = 0;
   async function request(path, method, cookie, body, workspaceId) {
     return app.request(`http://localhost${path}`, {
       method,
-      headers: { ...(cookie ? { cookie } : {}), ...(workspaceId ? { "x-workspace-id": String(workspaceId) } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+      headers: { "x-forwarded-for": `203.0.113.${++requestSeq}`, ...(cookie ? { cookie, "x-csrf-token": "test" } : {}), ...(workspaceId ? { "x-workspace-id": String(workspaceId) } : {}), ...(body ? { "content-type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
   }
@@ -31,16 +32,35 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     const result = await response.json();
     assert.equal(response.status, 201, JSON.stringify(result));
     const id = result.data.id;
-    const apiKey = result.data.api_key;
     ids.push(id);
     const login = await request("/api/auth/login", "POST", "", { email, password });
     assert.equal(login.status, 200);
     const cookie = login.headers.get("set-cookie")?.split(";")[0];
     assert.ok(cookie?.startsWith("access="));
-    return { id, cookie, apiKey };
+
+    // SEC-02: account credentials are hash-only at rest; plaintext is exposed
+    // exactly once by the rotation endpoints, so tests must capture it there.
+    const apiKeyResponse = await request("/api/settings/api-key", "POST", cookie);
+    assert.equal(apiKeyResponse.status, 200);
+    const apiKey = (await apiKeyResponse.json()).data.api_key;
+    assert.ok(apiKey);
+
+    const subscriptionKeyResponse = await request("/api/settings/subscription-key", "POST", cookie);
+    assert.equal(subscriptionKeyResponse.status, 200);
+    const subscriptionKey = (await subscriptionKeyResponse.json()).data.subscription_key;
+    assert.ok(subscriptionKey);
+
+    return { id, cookie, apiKey, subscriptionKey };
   }
 
-  test("personal workspaces, two-user isolation, team invitation and revocation", async () => {
+  // 显式放宽超时：本用例串起 2 次注册（每次注册含 user + credential + workspace +
+  // member + 免费策略发放 + 验证邮件 token）、建团、建组、建隧道与邀请全流程。
+  // 策略发放为同事务内的额外查询；CI 的 node --test 每文件单进程隔离，本地
+  // bun test 多文件共享进程，默认 5s 在累积执行下会偶发触顶。
+  test(
+    "personal workspaces, two-user isolation, team invitation and revocation",
+    { timeout: 30_000 },
+    async () => {
     let teamId;
     try {
       const a = await register(aEmail);
@@ -71,8 +91,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       const personalTunnel = await request("/api/tunnels", "POST", a.cookie, { name: "Personal TCP", tunnel_type: "tcp", in_node_group_id: (await personalGroup.json()).data.id, forward_addresses: ["127.0.0.1:8081"] });
       assert.equal(personalTunnel.status, 200, JSON.stringify(await personalTunnel.clone().json()));
       const personalTunnelId = (await personalTunnel.json()).data.id;
-      const subscriptionKey = (await db.user.findUniqueOrThrow({ where: { id: a.id }, select: { subscription_key: true } })).subscription_key;
-      const legacySubscription = await request(`/api/tunnel/subscription?token=${subscriptionKey}`, "GET", "", undefined, teamId);
+      const legacySubscription = await request(`/api/tunnel/subscription?token=${a.subscriptionKey}`, "GET", "", undefined, teamId);
       assert.equal(legacySubscription.status, 200);
       assert.deepEqual((await legacySubscription.json()).data.tunnels.map((t) => t.id), [personalTunnelId], "account subscription must never include team tunnels");
       assert.equal((await request("/api/tunnel/subscription?token=invalid", "GET", "")).status, 401);

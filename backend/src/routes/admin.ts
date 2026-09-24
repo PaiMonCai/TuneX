@@ -68,8 +68,11 @@ adminRoutes.get("/user", async (c) => {
     }),
     db.user.count(),
   ]);
-  // api_key 脱敏（原版列表响应剔除 api_key）
-  const data = rows.map(({ api_key, ...rest }) => rest);
+  // api_key 脱敏（原版列表响应剔除 api_key）；SEC-02 起哈希列同样剔除——
+  // 管理端列表绝不下发任何可用凭据或其摘要。
+  const data = rows.map(
+    ({ api_key, subscription_key, api_key_hash, subscription_key_hash, ...rest }) => rest,
+  );
   return c.json({ data, total, page, limit });
 });
 

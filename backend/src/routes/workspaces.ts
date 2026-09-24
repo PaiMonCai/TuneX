@@ -6,6 +6,8 @@ import { z } from "zod";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { canWorkspaceAction } from "../services/workspace.ts";
+import { assignDefaultPolicy, getEffectivePolicy } from "../services/policy-service.ts";
+import { checkMemberAddition } from "../services/capability-policy.ts";
 
 export const workspaceRoutes = new Hono<{ Variables: AppVariables }>();
 // Legacy account-wide API keys are not scoped to a workspace. Team management
@@ -67,6 +69,7 @@ workspaceRoutes.post("/", async (c) => {
       },
       select: { id: true, name: true, slug: true, kind: true, created_at: true },
     });
+    await assignDefaultPolicy(tx, { id: workspace.id, kind: "team" });
     await tx.auditEvent.create({ data: { workspace_id: workspace.id, actor_user_id: userId, action: "workspace.created", resource_type: "workspace", resource_id: String(workspace.id) } });
     return workspace;
   });
@@ -99,6 +102,18 @@ workspaceRoutes.post("/:id/invites", async (c) => {
   const { email, role } = parsed.data;
   const existing = await db.workspaceMember.findFirst({ where: { workspace_id: member.workspace_id, user: { email }, active: true } });
   if (existing) return c.json({ error: "该用户已经是工作空间成员" }, 409);
+
+  // 成员额度：active 成员 + 未过期未使用的邀请，合计不得越过策略上限。
+  const policy = await getEffectivePolicy(member.workspace_id);
+  const [memberCount, pendingInvites] = await Promise.all([
+    db.workspaceMember.count({ where: { workspace_id: member.workspace_id, active: true } }),
+    db.workspaceInvite.count({ where: { workspace_id: member.workspace_id, accepted_at: null, revoked_at: null, expires_at: { gt: new Date() } } }),
+  ]);
+  const decision = checkMemberAddition(policy, memberCount + pendingInvites);
+  if (!decision.allowed) {
+    return c.json({ error: decision.message, code: decision.reason, limit: policy.limits.max_members }, 403);
+  }
+
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + 7 * 86400_000);
   const invite = await db.$transaction(async (tx) => {

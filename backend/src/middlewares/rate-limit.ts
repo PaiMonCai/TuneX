@@ -84,6 +84,7 @@ const isPost = (method: string) => method === "POST";
  *
  * 阈值取值说明：
  *  · 登录 / 注册 / 找回：按 IP，60s 内 10 / 5 / 5 次 —— 抵御撞库与批量注册；
+ *  · 密钥轮换：按用户，60s 内 5 次 —— 防骚扰式轮换与凭据探测；
  *  · 支付回调：按 IP，60s 内 60 次 —— 给第三方重试留足余量，仅挡明显刷量；
  *  · 全站 API 兜底：按登录用户（未登录回退 IP），60s 内 600 次 —— 约 10 QPS，
  *    正常控制台轮询（5–30s 一次）远达不到，异常脚本会先撞线。
@@ -111,7 +112,12 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     max: 5,
     methods: ["POST"],
     match: (p, m) =>
-      isPost(m) && (p === "/api/auth/forgot" || p === "/api/auth/reset" || p === "/api/auth/reset-password"),
+      isPost(m) &&
+      (p === "/api/auth/forgot" ||
+        p === "/api/auth/forgot-password" ||
+        p === "/api/auth/reset" ||
+        p === "/api/auth/reset-password" ||
+        p === "/api/auth/resend-verification"),
     scope: "ip",
   },
   {
@@ -120,6 +126,22 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     max: 60,
     match: (p) => /^\/api\/pay\/[^/]+\/callback$/.test(p),
     scope: "ip",
+  },
+  {
+    name: "key-rotation",
+    windowSeconds: 60,
+    max: 5,
+    methods: ["POST"],
+    // SEC-02：轮换端点单独限流（按登录用户）。60s 内 5 次远多于真人操作，
+    // 但挡住了「反复轮换把某账号凭据打失效」的骚扰与枚举式探测；
+    // 无需按 IP——这些端点必须已认证。
+    match: (p, m) =>
+      isPost(m) &&
+      (p === "/api/settings/api-key" ||
+        p === "/api/settings/api-key/regenerate" ||
+        p === "/api/settings/subscription-key" ||
+        p === "/api/settings/subscription-key/regenerate"),
+    scope: "user",
   },
   {
     name: "api-global",

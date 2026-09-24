@@ -27,6 +27,8 @@ export const userNav: NavItem[] = [
     : []),
   { href: "/tickets", labelKey: "common.tickets", iconKey: "tickets" },
   { href: "/settings", labelKey: "common.settings", iconKey: "settings" },
+  // TEN-01：团队空间成员管理（与「设置」同级，切换器下拉亦可进入）
+  { href: "/settings/workspace", labelKey: "common.workspace", iconKey: "workspace" },
 ];
 
 export const adminNav: NavItem[] = [
