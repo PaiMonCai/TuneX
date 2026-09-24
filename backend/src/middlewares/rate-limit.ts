@@ -150,6 +150,16 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     scope: "user",
   },
   {
+    name: "agent-traffic",
+    // OPS-03：agent 流量上报按 IP 限流。观测周期默认 5s、每轮只上报增量，
+    // 120/min 对正常节点是数千倍余量；对「伪造 node_id 刷量」则是硬顶。
+    windowSeconds: 60,
+    max: 120,
+    methods: ["POST"],
+    match: (p, m) => isPost(m) && p === "/api/tunnel/traffic",
+    scope: "ip",
+  },
+  {
     name: "api-global",
     windowSeconds: 60,
     max: 600,

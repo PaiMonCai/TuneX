@@ -10,9 +10,10 @@
  */
 import { Hono } from "hono";
 import { db } from "../db.ts";
-import { redis, RedisKeys, observerBufferKey, OBSERVER_BUFFER_MAX } from "../redis.ts";
+import { redis, RedisKeys, observerBufferKey, OBSERVER_BUFFER_MAX, trafficBufferKey } from "../redis.ts";
 import { systemConfig } from "../services/config.ts";
 import { resolveUserByKey } from "../services/user-keys.ts";
+import { decideTrafficReport, accumulateTraffic } from "../services/traffic-archive.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const publicRoutes = new Hono<{ Variables: AppVariables }>();
@@ -54,6 +55,89 @@ publicRoutes.post("/tunnel/observer", async (c) => {
     /* Redis 故障返回 200 避免 agent 重试风暴 */
   }
   return c.json({ data: { ok: true } });
+});
+
+/**
+ * POST /api/tunnel/traffic —— agent 隧道流量上报（免认证，凭 node_id 归属）
+ *
+ * OPS-03 采集入口。载荷：`{ items: [{ tunnel_id, bytes }, ...] }`，`bytes` 是
+ * **本轮新增字节数**（不是累计值）—— agent 侧按上报周期取差。
+ *
+ * 归属判定与 observer 同源：node_id → node → node_group → workspace，
+ * 解析不出归属一律丢弃（返回 200 而非 4xx，见 observer 的批注）。隧道必须
+ * 属于该 workspace（`tunnel.workspace_id === group.workspace_id`），否则
+ * 拒绝该条：节点不能靠改 tunnel_id 往别人的桶里写流量。
+ *
+ * 写入 Redis hash（`ws:<scope>:tunnel:traffic:<tunnelId>`，field = 本地日界
+ * `YYYY-MM-DD`，HINCRBYFLOAT 累加），不直接落库 —— 落库由 worker 的
+ * `cron_save_traffic` 批量归档（OPS-01，幂等）。上报端失败不影响 agent，
+ * Redis 故障同样返回 200（重试只会让己方日志变多，不会让数据变对）。
+ */
+publicRoutes.post("/tunnel/traffic", async (c) => {
+  const nodeId = c.req.query("node_id") ?? "";
+  const body = await c.req.json().catch(() => null);
+  if (!nodeId || !body) return c.json({ error: "missing node_id or body" }, 400);
+
+  // node_id → 组 → workspace（与 observer 同一套反查；失败即丢弃）。
+  let workspaceId: number | null = null;
+  try {
+    const node = await db.node.findUnique({
+      where: { node_id: nodeId },
+      select: { node_group: { select: { workspace_id: true } } },
+    });
+    workspaceId = node?.node_group?.workspace_id ?? null;
+  } catch {
+    /* DB 不可用按下方丢弃处理 */
+  }
+  if (workspaceId === null) {
+    return c.json({ data: { ok: true, dropped: "unknown node" } });
+  }
+
+  const rawItems = (body as { items?: unknown }).items;
+  let decided: ReturnType<typeof decideTrafficReport>;
+  try {
+    // 归属白名单：该 workspace 下的隧道 id 集合。查不到任何隧道 → 空集合，
+    // 所有上报条都会被判 tunnel_not_in_scope（fail-closed）。
+    const tunnels = await db.tunnel.findMany({
+      where: { workspace_id: workspaceId },
+      select: { id: true },
+    });
+    decided = decideTrafficReport(rawItems, new Set(tunnels.map((t) => t.id)));
+  } catch {
+    return c.json({ data: { ok: true, dropped: "unavailable" } });
+  }
+
+  if (decided.accepted.length === 0) {
+    // 没有可写入的增量：不写缓冲。响应里带上拒绝原因，便于 agent 侧排错。
+    return c.json({
+      data: {
+        ok: true,
+        accepted: 0,
+        rejected: decided.rejected,
+      },
+    });
+  }
+
+  try {
+    const n = await accumulateTraffic(
+      workspaceId,
+      decided.accepted.map((a) => a.tunnel_id),
+      decided.accepted.map((a) => a.bytes),
+      {
+        hincrBy: (key, field, by) => redis.hincrbyfloat(key, field, by),
+      },
+    );
+    return c.json({
+      data: {
+        ok: true,
+        accepted: n,
+        rejected: decided.rejected,
+      },
+    });
+  } catch {
+    // Redis 故障：返回 200 避免 agent 重试风暴（同 observer 的取向）。
+    return c.json({ data: { ok: true, dropped: "buffer unavailable" } });
+  }
 });
 
 /** GET /api/tunnel/subscription —— 订阅式配置分发（免认证，凭 subscription_key） */

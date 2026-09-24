@@ -47,11 +47,17 @@ export function extractIp(headers: Headers): string {
  * 免认证路径白名单（原版 noAuthPathsRegex，本次任务指定集合）
  * /api/auth/*、/api/pay/*\/callback、/api/tunnel/observer、/healthz
  * 另保留原版的 /api/system/config/site、/api/tunnel/subscription、/api/license
+ *
+ * OPS-03：`/api/tunnel/traffic`（agent 流量上报）同属免认证白名单 —— 它与
+ * observer 一样是机器端点，归属由 node_id → 组 → workspace 反查决定（见
+ * routes/public.ts）。**它必须在任何依赖用户身份的路由之前被白名单短路**，
+ * 否则 agent 的全部上报都会 401。
  */
 const NO_AUTH_PATTERNS: RegExp[] = [
   /^\/api\/auth\/.*/,
   /^\/api\/pay\/[^/]+\/callback$/,
   /^\/api\/tunnel\/observer$/,
+  /^\/api\/tunnel\/traffic$/,
   /^\/api\/tunnel\/subscription$/,
   /^\/api\/system\/config\/site$/,
   /^\/api\/license(\/.*)?$/,

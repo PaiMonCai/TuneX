@@ -51,6 +51,7 @@ const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 export const CSRF_EXEMPT_PATTERNS: RegExp[] = [
   /^\/api\/pay\/[^/]+\/callback$/,
   /^\/api\/tunnel\/observer$/,
+  /^\/api\/tunnel\/traffic$/,
   /^\/api\/tunnel\/subscription$/,
 ];
 

@@ -71,6 +71,8 @@ describe("checkCsrf — 豁免路径", () => {
     expect(isCsrfExempt("/api/pay/epay")).toBe(false);
     expect(isCsrfExempt("/api/pay/epay/callback/extra")).toBe(false);
     expect(isCsrfExempt("/api/tunnel/observer/x")).toBe(false);
+    // OPS-03：agent 流量上报也是豁免项，但只锚定确切路径
+    expect(isCsrfExempt("/api/tunnel/traffic/x")).toBe(false);
     expect(isCsrfExempt("/api/tunnel/subscriptions")).toBe(false);
     expect(isCsrfExempt("/api/tunnels")).toBe(false);
   });
@@ -80,6 +82,7 @@ describe("checkCsrf — 豁免路径", () => {
       "/api/pay/epay/callback",
       "/api/tunnel/observer",
       "/api/tunnel/subscription",
+      "/api/tunnel/traffic",
     ]) {
       const d = checkCsrf({ ...base, path, origin: "https://evil.example" });
       expect(d.allowed).toBe(true);
@@ -87,11 +90,16 @@ describe("checkCsrf — 豁免路径", () => {
     }
   });
 
-  test("CSRF_EXEMPT_PATTERNS 精确等于任务指定的三条（锚定全路径）", () => {
-    expect(CSRF_EXEMPT_PATTERNS).toHaveLength(3);
+  test("CSRF_EXEMPT_PATTERNS 集合（机器端点豁免：支付回调/观测/订阅/流量上报）", () => {
+    expect(CSRF_EXEMPT_PATTERNS).toHaveLength(4);
     expect(CSRF_EXEMPT_PATTERNS[0]?.test("/api/pay/any-channel/callback")).toBe(true);
     expect(CSRF_EXEMPT_PATTERNS[1]?.test("/api/tunnel/observer")).toBe(true);
-    expect(CSRF_EXEMPT_PATTERNS[2]?.test("/api/tunnel/subscription")).toBe(true);
+    expect(CSRF_EXEMPT_PATTERNS[2]?.test("/api/tunnel/traffic")).toBe(true);
+    expect(CSRF_EXEMPT_PATTERNS[3]?.test("/api/tunnel/subscription")).toBe(true);
+    // 反锚定：多一段 / 少一段都不算豁免（防路径前缀误放行）
+    for (const bad of ["/api/tunnel/traffics", "/api/tunnel/traffic/1", "/api/tunnel/subscribe"]) {
+      for (const p of CSRF_EXEMPT_PATTERNS) expect(p.test(bad)).toBe(false);
+    }
   });
 });
 

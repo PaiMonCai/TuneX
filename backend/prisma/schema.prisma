@@ -591,6 +591,7 @@ model TunnelTraffic {
   date         DateTime
 
   @@index([date])
+  @@unique([tunnel_id, date])
   @@map("tunnel_traffic")
 }
 

@@ -158,6 +158,34 @@ export function trafficBufferPrefix(scope: number | null | undefined): string {
   return scopedKey(scope, "tunnel", "traffic");
 }
 
+/**
+ * 流量缓冲 hash 键：`ws:<scope>:tunnel:traffic:<tunnelId>`。
+ * field = 本地计量日界 `YYYY-MM-DD`，value = 该日界累计字节（HINCRBYFLOAT）。
+ * 与 {@link trafficBufferPrefix} 的区别：prefix 供 worker 全量 SCAN 用，
+ * 本函数供「写入侧」（agent 上报）与「解析侧」（worker 逐键读）精确定位。
+ */
+export function trafficBufferKey(
+  scope: number | null | undefined,
+  tunnelId: number | string,
+): string {
+  return `${trafficBufferPrefix(scope)}:${escapeSegment(String(tunnelId))}`;
+}
+
+/** 解析 {@link trafficBufferKey}；非本模块形态返回 null。 */
+export function parseTrafficBufferKey(
+  key: string,
+): { scope: number; tunnelId: string } | null {
+  const parsed = parseScopedKey(key);
+  if (!parsed) return null;
+  const [kind, ...rest] = parsed.segments;
+  if (kind !== "tunnel" || rest.length !== 2) return null;
+  // 段位固定为 traffic:<tunnelId>（tunnelId 不可能含分隔符 —— 它是自增整数）
+  if (rest[0] !== "traffic") return null;
+  const tunnelId = rest[1]!;
+  if (!/^\d+$/.test(tunnelId)) return null;
+  return { scope: parsed.scope, tunnelId };
+}
+
 /** 观测回传缓冲（agent → 控制面，list）。 */
 export function observerBufferKey(scope: number | null | undefined): string {
   return scopedKey(scope, "tunnel", "observer", "raw");

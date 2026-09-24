@@ -9,6 +9,7 @@ import {
   registerBlockKey,
   scopedKey,
   trafficBufferPrefix,
+  trafficBufferKey,
 } from "./tenant-scope.ts";
 
 export const redis = new Redis(env.redisUrl, {
@@ -56,6 +57,7 @@ export {
   configHashKey,
   outListenKey,
   trafficBufferPrefix,
+  trafficBufferKey,
   observerBufferKey,
   aliveGroupsKey,
   registerBlockKey,
