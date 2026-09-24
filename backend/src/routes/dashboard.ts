@@ -21,6 +21,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
+import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const dashboardRoutes = new Hono<{ Variables: AppVariables }>();
@@ -57,14 +58,15 @@ function dayKeys(days: number): string[] {
 /* ------------------------------------------------------------------ */
 
 dashboardRoutes.get("/traffic", async (c) => {
-  const user = requireUser(c);
+  requireUser(c);
+  const workspace = await resolveWorkspaceAccess(c, "read");
   const days = Math.max(1, Math.min(90, Number(c.req.query("days") ?? 14) || 14));
   const since = startOfToday();
   since.setDate(since.getDate() - (days - 1));
 
-  // 聚合本人全部隧道的每日流量
+  // Only count tunnels in the selected, authorized workspace.
   const rows = await db.tunnelTraffic.findMany({
-    where: { date: { gte: since }, tunnel: { user_id: user.id } },
+    where: { date: { gte: since }, tunnel: { workspace_id: workspace.id } },
     orderBy: { date: "asc" },
   });
 
@@ -96,12 +98,20 @@ dashboardRoutes.get("/traffic", async (c) => {
 dashboardRoutes.get("/stats", async (c) => {
   const user = requireUser(c);
 
-  const [userPlan, tunnelCount, nodes, todayAgg] = await Promise.all([
-    db.userPlan.findUnique({ where: { user_id: user.id }, include: { plan: true } }),
-    db.tunnel.count({ where: { user_id: user.id } }),
-    db.node.findMany({ select: { status: true } }),
+  const workspace = await resolveWorkspaceAccess(c, "read");
+  const monthStart = startOfToday();
+  monthStart.setDate(1);
+
+  const [userPlan, tunnelCount, nodes, todayAgg, monthAgg] = await Promise.all([
+    workspace.kind === "personal" ? db.userPlan.findUnique({ where: { user_id: user.id }, include: { plan: true } }) : null,
+    db.tunnel.count({ where: { workspace_id: workspace.id } }),
+    db.node.findMany({ where: { node_group: { workspace_id: workspace.id } }, select: { status: true } }),
     db.tunnelTraffic.aggregate({
-      where: { date: { gte: startOfToday() }, tunnel: { user_id: user.id } },
+      where: { date: { gte: startOfToday() }, tunnel: { workspace_id: workspace.id } },
+      _sum: { traffic: true },
+    }),
+    db.tunnelTraffic.aggregate({
+      where: { date: { gte: monthStart }, tunnel: { workspace_id: workspace.id } },
       _sum: { traffic: true },
     }),
   ]);
@@ -110,8 +120,8 @@ dashboardRoutes.get("/stats", async (c) => {
   const totalNodes = nodes.length;
 
   const stats = {
-    balance: user.balance,
-    commission_balance: user.commission_balance,
+    balance: workspace.kind === "personal" ? user.balance : 0,
+    commission_balance: workspace.kind === "personal" ? user.commission_balance : 0,
     tunnel_count: tunnelCount,
     max_tunnels: userPlan?.max_tunnels ?? userPlan?.plan?.max_tunnels ?? null,
     traffic_used: userPlan?.traffic_used ?? 0,
@@ -121,8 +131,7 @@ dashboardRoutes.get("/stats", async (c) => {
     active_nodes: activeNodes,
     total_nodes: totalNodes,
     today_traffic: todayAgg._sum.traffic ?? 0,
-    // 「本月流量」= 套餐已用流量（与原版 / mock 口径一致，单位字节）
-    month_traffic: userPlan?.traffic_used ?? 0,
+    month_traffic: monthAgg._sum.traffic ?? 0,
   };
 
   return c.json({ data: stats });

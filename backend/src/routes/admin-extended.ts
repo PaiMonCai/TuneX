@@ -378,8 +378,12 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
   if (!target) return bad(c, "用户不存在", 404);
 
   // Team assets must be transferred/revoked explicitly, never deleted with an account.
-  const teams = await db.workspaceMember.count({ where: { user_id: id, workspace: { kind: "team" } } });
+  const teams = await db.workspaceMember.count({ where: { user_id: id, active: true, workspace: { kind: "team" } } });
   if (teams) return bad(c, "请先退出或转移用户所在的团队空间", 409);
+
+  // An inactive membership does not authorize deletion of team-owned assets.
+  const teamGroups = await db.nodeGroup.count({ where: { user_id: id, workspace: { kind: "team" } } });
+  if (teamGroups) return bad(c, "请先转移或删除该用户创建的团队节点组", 409);
 
   const tunnelCount = await db.tunnel.count({ where: { user_id: id } });
   if (tunnelCount > 0) {

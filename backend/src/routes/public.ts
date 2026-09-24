@@ -33,7 +33,11 @@ publicRoutes.get("/tunnel/subscription", async (c) => {
   const { db } = await import("../db.ts");
   const user = await db.user.findUnique({ where: { subscription_key: key } });
   if (!user) return c.json({ error: "Unauthorized" }, 401);
-  return c.json({ data: { tunnels: await db.tunnel.findMany({ where: { user_id: user.id } }) } });
+  // The legacy subscription key belongs to the account, not to a team. It must never
+  // grant access to team assets even when the account created those assets.
+  const personal = await db.workspace.findUnique({ where: { personal_user_id: user.id }, select: { id: true } });
+  if (!personal) return c.json({ error: "Unauthorized" }, 401);
+  return c.json({ data: { tunnels: await db.tunnel.findMany({ where: { workspace_id: personal.id } }) } });
 });
 
 /** GET /api/system/config/site —— 站点公开配置（免认证） */

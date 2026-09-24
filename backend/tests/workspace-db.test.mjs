@@ -62,10 +62,38 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       const tunnelPayload = await ownTunnel.json();
       assert.equal(ownTunnel.status, 200, JSON.stringify(tunnelPayload));
       const tunnelId = tunnelPayload.data.id;
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      await db.tunnelTraffic.create({ data: { tunnel_id: tunnelId, traffic: 8192, traffic_cost: 0, date: today } });
+      await db.node.create({ data: { node_group_id: groupData.id, node_id: `ci-${nonce}`, connect_ip: "127.0.0.1", status: "active" } });
+      const personalGroup = await request("/api/node-groups", "POST", a.cookie, { name: "Personal ingress", node_type: "in" });
+      assert.equal(personalGroup.status, 201);
+      const personalTunnel = await request("/api/tunnels", "POST", a.cookie, { name: "Personal TCP", tunnel_type: "tcp", in_node_group_id: (await personalGroup.json()).data.id, forward_addresses: ["127.0.0.1:8081"] });
+      assert.equal(personalTunnel.status, 200, JSON.stringify(await personalTunnel.clone().json()));
+      const personalTunnelId = (await personalTunnel.json()).data.id;
+      const subscriptionKey = (await db.user.findUniqueOrThrow({ where: { id: a.id }, select: { subscription_key: true } })).subscription_key;
+      const legacySubscription = await request(`/api/tunnel/subscription?token=${subscriptionKey}`, "GET", "", undefined, teamId);
+      assert.equal(legacySubscription.status, 200);
+      assert.deepEqual((await legacySubscription.json()).data.tunnels.map((t) => t.id), [personalTunnelId], "account subscription must never include team tunnels");
+      assert.equal((await request("/api/tunnel/subscription?token=invalid", "GET", "")).status, 401);
+      const personalStats = (await (await request("/api/dashboard/stats", "GET", a.cookie)).json()).data;
+      const teamStats = (await (await request("/api/dashboard/stats", "GET", a.cookie, undefined, teamId)).json()).data;
+      assert.equal(personalStats.tunnel_count, 1);
+      assert.equal(personalStats.total_nodes, 0);
+      assert.equal(personalStats.today_traffic, 0);
+      assert.equal(teamStats.tunnel_count, 1);
+      assert.equal(teamStats.active_nodes, 1);
+      assert.equal(teamStats.today_traffic, 8192);
+      assert.equal(teamStats.month_traffic, 8192);
+      const personalTraffic = (await (await request("/api/dashboard/traffic", "GET", a.cookie)).json()).data;
+      const teamTraffic = (await (await request("/api/dashboard/traffic", "GET", a.cookie, undefined, teamId)).json()).data;
+      assert.equal(personalTraffic.reduce((sum, row) => sum + row.traffic, 0), 0);
+      assert.equal(teamTraffic.reduce((sum, row) => sum + row.traffic, 0), 8192);
+      assert.equal((await request("/api/dashboard/stats", "GET", b.cookie, undefined, teamId)).status, 404);
       const personalTunnelList = await request("/api/tunnels", "GET", a.cookie);
-      assert.equal((await personalTunnelList.json()).data.total, 0);
+      assert.equal((await personalTunnelList.json()).data.total, 1);
       const personalGroups = await request("/api/node-groups", "GET", a.cookie);
-      assert.equal((await personalGroups.json()).data.total, 0);
+      assert.equal((await personalGroups.json()).data.total, 1);
       assert.equal((await request(`/api/workspaces/${teamId}`, "GET", b.cookie)).status, 404);
       const invited = await request(`/api/workspaces/${teamId}/invites`, "POST", a.cookie, { email: bEmail, role: "viewer" });
       assert.equal(invited.status, 201);
@@ -86,6 +114,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       const teamTunnelList = await request("/api/tunnels", "GET", b.cookie, undefined, teamId);
       assert.equal((await teamTunnelList.json()).data.total, 1);
       assert.equal((await request(`/api/tunnels/${tunnelId}`, "GET", b.cookie, undefined, teamId)).status, 200);
+      assert.equal((await (await request("/api/dashboard/stats", "GET", b.cookie, undefined, teamId)).json()).data.today_traffic, 8192);
       assert.equal((await request(`/api/tunnels/${tunnelId}`, "PATCH", b.cookie, { name: "Forbidden" }, teamId)).status, 403);
       assert.equal((await request("/api/node-groups", "POST", b.cookie, { name: "Forbidden", node_type: "in" }, teamId)).status, 403);
       const bearer = await app.request("http://localhost/api/tunnels", { headers: { authorization: `Bearer ${b.apiKey}`, "x-workspace-id": String(teamId) } });
@@ -95,14 +124,19 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       assert.equal(removed.status, 200);
       assert.equal((await request(`/api/workspaces/${teamId}`, "GET", b.cookie)).status, 404);
       assert.equal((await request("/api/tunnels", "GET", b.cookie, undefined, teamId)).status, 404);
+      assert.equal((await request("/api/dashboard/stats", "GET", b.cookie, undefined, teamId)).status, 404);
       assert.ok((await db.auditEvent.count({ where: { workspace_id: teamId } })) >= 3);
     } finally {
       if (teamId) {
+        await db.tunnelTraffic.deleteMany({ where: { tunnel: { workspace_id: teamId } } });
         await db.tunnel.deleteMany({ where: { workspace_id: teamId } });
+        await db.node.deleteMany({ where: { node_group: { workspace_id: teamId } } });
         await db.nodeGroup.deleteMany({ where: { workspace_id: teamId } });
         await db.workspace.deleteMany({ where: { id: teamId } });
       }
       if (ids.length) {
+        await db.tunnel.deleteMany({ where: { workspace: { personal_user_id: { in: ids } } } });
+        await db.nodeGroup.deleteMany({ where: { workspace: { personal_user_id: { in: ids } } } });
         await db.workspace.deleteMany({ where: { personal_user_id: { in: ids } } });
         await db.userCredential.deleteMany({ where: { user_id: { in: ids } } });
         await db.user.deleteMany({ where: { id: { in: ids } } });
