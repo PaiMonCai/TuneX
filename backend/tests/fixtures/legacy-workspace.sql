@@ -1,4 +1,4 @@
-﻿-- Pre-workspace fixture: two separate accounts, with one owning a node group and TCP tunnel.
+-- Pre-workspace fixture: two separate accounts, with one owning a node group and TCP tunnel.
 INSERT INTO `user` (`id`, `email`, `api_key`, `subscription_key`, `created_at`, `updated_at`)
 VALUES
   (701, 'upgrade-a@example.test', '00000000-0000-4000-8000-000000000701', 'subscription-701', CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3)),
