@@ -238,6 +238,6 @@ TuneX 能称为“个人与团队 SaaS Beta”的条件不是把原项目换一�
 
 - 旧账户订阅密钥限定为个人空间（团队订阅须独立工作空间凭证），仪表盘流量、隧道和节点统计按已授权空间隔离；已补真实 MySQL 越权/撤员回归测试，待新一轮 CI 运行确认。
 - 已移除后台 RBAC、API Key、工单对商业 License 的闸门；**只解决平台级权限的一部分**，workspace 角色矩阵尚未开始，AUTHZ-01 未完成。
-- 新增按用户/节点组/入口或出口的 NodeGroupGrant 迁移和管理端授权接口；隧道创建、修改和配置下发按所有权或显式授权检查；无套餐用户的自有隧道不再被配置生成跳过。当前仍保留 UserPlan 的历史额度限制，CapabilityPolicy/WorkspacePolicyAssignment/工作空间隔离尚未完成，AUTHZ-02 未完成。旧套餐中共享节点组关系**不会自动升级**为显式授权，管理员必须审核后逐项发放。
+- 新增按用户/节点组/入口或出口的 NodeGroupGrant 迁移和管理端授权接口；隧道创建、修改和配置下发按所有权或显式授权检查；无套餐用户的自有隧道不再被配置生成跳过。AUTHZ-02 已完成：CapabilityPolicy/WorkspacePolicyAssignment/工作空间隔离落地，config-generator 的 user_plan 依赖已全部替换为 CapabilityPolicy/NodeGroupGrant（配额、白名单、限额与默认拒绝均来自策略体系）。UserPlan 仅作为 legacy 兼容表保留。旧套餐中共享节点组关系**不会自动升级**为显式授权，管理员必须审核后逐项发放。
 - 支付默认关闭；服务端拦截支付写入口和网关回调，历史记录读取保留；前端默认隐藏购买/充值导航。PAY-01 仍需真实 HTTP、伪造回调及 worker 验收（worker 现为占位骨架）。
 - 已增加 `.github/workflows/ci.yml`，提交 `d39465a` 的 GitHub Actions 运行 `35958068306` 三个作业（backend/web/agent）全部成功：MySQL 8.4 空库迁移、Prisma 生成与类型检查、支付/授权测试、Web 生产构建、Go vet/test/build。另本机已验证 Prisma Schema 与迁移差异、Backend tsc、Web 构建及策略/HTTP 冒烟。未验证：**既有生产库升级与回滚**、Linux 多节点、双租户 E2E、支付开启场景及备份恢复；不得将以上标记为 SaaS Beta 验收通过。本机无 Docker CLI。
