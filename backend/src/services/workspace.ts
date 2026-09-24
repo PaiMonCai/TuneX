@@ -3,10 +3,11 @@ import { db } from "../db.ts";
 import { HTTPException } from "hono/http-exception";
 import type { Context } from "hono";
 import type { AppVariables } from "../middlewares/auth.ts";
+import { assignDefaultPolicy } from "./policy-service.ts";
 
-/** Every new account gets an owned personal workspace in the SAME transaction. */
+/** Every new account gets an owned personal workspace + free policy in the SAME transaction. */
 export async function createPersonalWorkspace(tx: Prisma.TransactionClient, user: { id: number; email: string }) {
-  return tx.workspace.create({
+  const workspace = await tx.workspace.create({
     data: {
       slug: `personal-${user.id}`,
       name: `Personal ${user.id}`,
@@ -16,12 +17,14 @@ export async function createPersonalWorkspace(tx: Prisma.TransactionClient, user
       members: { create: { user_id: user.id, role: "owner" } },
     },
   });
+  await assignDefaultPolicy(tx, workspace);
+  return workspace;
 }
 
 /** Idempotent seed repair for preexisting administrator accounts. */
 export async function ensurePersonalWorkspace(user: { id: number; email: string }) {
-  return db.$transaction(async (tx) => {
-    const workspace = await tx.workspace.upsert({
+  const workspace = await db.$transaction(async (tx) => {
+    const ws = await tx.workspace.upsert({
       where: { personal_user_id: user.id },
       create: {
         slug: `personal-${user.id}`,
@@ -33,12 +36,14 @@ export async function ensurePersonalWorkspace(user: { id: number; email: string 
       update: {},
     });
     await tx.workspaceMember.upsert({
-      where: { workspace_id_user_id: { workspace_id: workspace.id, user_id: user.id } },
-      create: { workspace_id: workspace.id, user_id: user.id, role: "owner" },
+      where: { workspace_id_user_id: { workspace_id: ws.id, user_id: user.id } },
+      create: { workspace_id: ws.id, user_id: user.id, role: "owner" },
       update: { active: true, role: "owner" },
     });
-    return workspace;
+    await assignDefaultPolicy(tx, ws);
+    return ws;
   });
+  return workspace;
 }
 
 export type WorkspaceAction = "read" | "create" | "update" | "delete" | "manage";

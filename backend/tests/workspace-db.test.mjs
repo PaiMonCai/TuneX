@@ -40,7 +40,14 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     return { id, cookie, apiKey };
   }
 
-  test("personal workspaces, two-user isolation, team invitation and revocation", async () => {
+  // 显式放宽超时：本用例串起 2 次注册（每次注册含 user + credential + workspace +
+  // member + 免费策略发放 + 验证邮件 token）、建团、建组、建隧道与邀请全流程。
+  // 策略发放为同事务内的额外查询；CI 的 node --test 每文件单进程隔离，本地
+  // bun test 多文件共享进程，默认 5s 在累积执行下会偶发触顶。
+  test(
+    "personal workspaces, two-user isolation, team invitation and revocation",
+    { timeout: 30_000 },
+    async () => {
     let teamId;
     try {
       const a = await register(aEmail);

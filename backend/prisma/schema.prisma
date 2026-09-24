@@ -36,6 +36,22 @@ enum WorkspaceRole {
   viewer
 }
 
+/// 策略来源：系统默认（免费基础能力）/ 管理员授予 / 试用 / 付费发放。
+/// 支付只影响“哪一条策略被发放”，不参与权限与额度判定本身。
+enum PolicySource {
+  system_default
+  admin_grant
+  trial
+  purchase
+}
+
+/// 流量额度计量周期。
+enum TrafficPeriod {
+  total
+  month
+  day
+}
+
 model Workspace {
   id               Int               @id @default(autoincrement())
   slug             String            @unique @db.VarChar(191)
@@ -52,6 +68,7 @@ model Workspace {
   audit_events     AuditEvent[]
   node_groups      NodeGroup[]
   tunnels          Tunnel[]
+  policy_assignments WorkspacePolicyAssignment[]
 
   @@map("workspace")
 }
@@ -120,6 +137,88 @@ model AuditEvent {
 
   @@index([workspace_id, created_at])
   @@map("audit_event")
+}
+
+/// 能力策略模板：与价格/订单彻底解耦的「功能准入 + 资源额度」事实源。
+///
+/// 字段语义（PLAN §4.2）：
+///   · `0` = 禁止；`null` = 无额外额度限制（仅平台硬上限仍生效）
+///   · 空白名单（`[]`）= 无访问；`allow_all` 必须显式为真
+///   · 绝不因「没有套餐 / 名单为空」默认放行
+model CapabilityPolicy {
+  id          Int          @id @default(autoincrement())
+  key         String       @unique @db.VarChar(120)
+  name        String       @db.VarChar(120)
+  description String?      @db.Text
+  source      PolicySource @default(system_default)
+  /// 新建 workspace 时自动发放的免费模板（个人 / 团队各一条）
+  is_default  Boolean      @default(false)
+  /// 仅对某类 workspace 生效；null = 个人与团队通用
+  applies_to  WorkspaceKind?
+  /// 平台硬上限模板：额度作为所有 workspace 的绝对上界，不直接发放
+  is_ceiling  Boolean      @default(false)
+  status      Status       @default(active)
+  /// 策略内容版本；任一字段变化时自增，用于 `policy_revision` 与缓存失效
+  revision    Int          @default(1)
+
+  // —— 功能准入（Entitlement）——
+  /// 允许的隧道协议；[] = 不允许任何协议
+  tunnel_types           Json    @default("[]")
+  allow_custom_in_group  Boolean @default(false)
+  allow_custom_out_group Boolean @default(false)
+  /// 显式允许使用的共享入口/出口节点组 id；null = 仅自有节点组
+  allowed_in_group_ids   Json?
+  allowed_out_group_ids  Json?
+  allow_shared_entry     Boolean @default(false)
+
+  // —— 资源额度（Quota）——
+  max_tunnels     Int?
+  max_nodes       Int?
+  max_members     Int?
+  /// 流量额度（字节）；配合 `traffic_period`
+  traffic_limit   Float?
+  traffic_period  TrafficPeriod @default(total)
+  /// 带宽上限（Mbps）
+  bandwidth_limit Int?
+  /// 单隧道并发客户端上限
+  client_limit    Int?
+  /// 单隧道 IP 上限
+  ip_limit        Int?
+  /// 入口 admission 白名单（IP/CIDR）；null = 不启用
+  whitelist_ips   Json?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  assignments WorkspacePolicyAssignment[]
+
+  @@index([source, status])
+  @@map("capability_policy")
+}
+
+/// 把策略模板发放给某个 workspace，并记录来源 / 生效 / 截止 / 撤销。
+/// 支付若启用，只负责产生一条 `purchase` 来源的发放记录；
+/// 停用支付不影响 `system_default` / `admin_grant` 的既有发放。
+model WorkspacePolicyAssignment {
+  id           Int              @id @default(autoincrement())
+  workspace_id Int
+  workspace    Workspace        @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  policy_id    Int
+  policy       CapabilityPolicy @relation(fields: [policy_id], references: [id], onDelete: Cascade)
+  source       PolicySource     @default(system_default)
+  effective_at DateTime         @default(now())
+  /// null = 不设截止（仅管理员显式赋予）
+  expires_at   DateTime?
+  /// 显式撤销：立即生效，无宽限期
+  revoked_at   DateTime?
+  granted_by_id Int?
+  note         String?          @db.VarChar(255)
+  created_at   DateTime         @default(now())
+  updated_at   DateTime         @updatedAt
+
+  @@unique([workspace_id, policy_id])
+  @@index([workspace_id, revoked_at])
+  @@map("workspace_policy_assignment")
 }
 
 model NodeGroup {
