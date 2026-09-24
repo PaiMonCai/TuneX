@@ -4,7 +4,7 @@
 > 产品决策：**TuneX 是多租户 SaaS**；个人用户和团队共享托管控制面，部署自己的节点。产品以隧道可用性、协作与资源管理为核心；支付等强商业模块降级为可选扩展，默认关闭，**不是删除项目的 SaaS 属性**。
 > `DEVELOPMENT.md` 是现有实现/运维记录；`reports/` 中的结论须重测。方案执行中，每个阶段完成后回填本文件的验收状态。
 >
-> **2026-09-24 进度回填**：SEC-01/SEC-02/TEN-01（后端 + 前端）/TEN-02（部分）/AUTHZ-01/AUTHZ-02（策略模型部分）/PAY-01/QA-01 已完成并合入 main（CI 全绿，含真实 MySQL 迁移验证）；详见 `reports/tunex-vs-relayx-diff.md` 与 §6 工作包状态列。**重要修正**：原版 RelayX 的 agent 数据面同样只有裸 TCP/UDP，mtls/quic 等协议枚举两边均未实现——差距在流量计量与验证深度，不在协议引擎。
+> **2026-09-24 进度回填**：SEC-01/SEC-02/TEN-01（后端）/TEN-02（部分）/AUTHZ-01/AUTHZ-02（策略体系与 config-generator 的 user_plan 依赖替换均已完成）/PAY-01/QA-01 已完成并合入 main（CI 全绿，含真实 MySQL 迁移验证）；详见 `reports/tunex-vs-relayx-diff.md` 与 §6 工作包状态列。**重要修正**：原版 RelayX 的 agent 数据面同样只有裸 TCP/UDP，mtls/quic 等协议枚举两边均未实现——差距在流量计量与验证深度，不在协议引擎。
 
 ## 1. 产品定位、场景与边界
 
@@ -96,7 +96,7 @@ RelayX 的[产品功能概览](https://docs.relayx.cc/guide/intro/)、[版本对
 **从当前代码迁移的准确落点**：
 
 1. `backend/src/middlewares/auth.ts` 的 `adminRequired`/`adminPermissionGuard` 当前检查 `licenseService.isBusinessLicense()`，会使角色管理依赖“商业授权”。改为平台管理员权限或 workspace 角色校验；**不要通过把全部安装都伪装成 business 来绕过**。
-2. `backend/src/socket/config-generator.ts` 的 `filterAvailableTunnels()` 依赖 `user.user_plan`，没有时会跳过隧道；把这部分改为 `getEffectivePolicy()`。当前白名单分支仅在 `groups.length > 0` 时才拒绝未授权组，空名单可能形成放行路径；按“默认拒绝”增加回归测试。
+2. ~~`backend/src/socket/config-generator.ts` 的 `filterAvailableTunnels()` 依赖 `user.user_plan`，没有时会跳过隧道；把这部分改为 `getEffectivePolicy()`。~~ **已落地（AUTHZ-02）**：`filterAvailableTunnels` / `computeAllLimits` / `buildInNodeConfig` / `loadAvailableTunnels` 已全部改为读取 `PolicyContext`（`getEffectivePolicies` 批量合成 + 按周期汇总 `tunnel_traffic`），不再 join `user_plan`；无生效策略（含到期超出宽限）时按默认拒绝整组不下发，回归测试见 `backend/src/socket/__tests__/config-generator-policy.test.ts`。
 3. `backend/src/routes/plans.ts` 当前把购买、余额和 `UserPlan` 写入绑在一起。新用户创建 workspace 时**事务性发放免费策略**，无需购买订单；避免只给某个 UserPlan 导致团队成员权益不一致。
 4. 原有 `AdminRole` 只描述平台后台资源；团队角色另建独立作用域，不把平台超管权限等同于租户 owner；权限变化需要使配置/缓存立即失效并推送 Agent。
 
@@ -181,7 +181,7 @@ RelayX 的[产品功能概览](https://docs.relayx.cc/guide/intro/)、[版本对
 | NET-01 | P0 | ✅ 完成 | 自有 TCP 反向数据通道与节点身份验证 | `agent/internal/`、后端配置分发 | 单节点主链路实测通；**双租户真实网络 E2E 通过（36/36）**，见 `scripts/net01-e2e/README.md` |
 | NET-02 | P0 | ✅ 完成 | 幂等配置 ACK、冲突处理、监听失败反馈 | `socket/listen-events.ts`、`port-allocator.ts`、`config-pusher.ts` | 离线测试 30+ 用例全过 |
 | AUTHZ-01 | P0 | ✅ 完成 | RBAC 去商业授权闸门，建立 workspace 角色/资源/动作矩阵 | `middlewares/auth.ts`、`services/node-group-policy.ts` | 未付费 owner 按角色管理资源，CI 通过 |
-| AUTHZ-02 | P0 | 🟡 大部分 | CapabilityPolicy + Assignment + NodeGroupGrant，替换 UserPlan 过滤依赖 | `services/capability-policy.ts`、`policy-service.ts`、`socket/config-generator.ts` | 策略体系与 NodeGroupGrant ✅；**config-generator 的 user_plan 依赖替换待收尾** |
+| AUTHZ-02 | P0 | ✅ 完成 | CapabilityPolicy + Assignment + NodeGroupGrant，替换 UserPlan 过滤依赖 | `services/capability-policy.ts`、`policy-service.ts`、`socket/config-generator.ts` | 策略体系与 NodeGroupGrant ✅；config-generator 的 user_plan 依赖替换 ✅ |
 | SOFT-01 | P0 | 🟡 大部分 | 策略额度原子判定、到期/流量耗尽处理 | `services/policy-service.ts`（FOR UPDATE 并发锁已实现） | 服务层就绪；**路由接线与并发用例待收尾** |
 | PAY-01 | P0 | ✅ 完成 | 关闭支付写入口和回调但保留历史数据 | `middlewares/payments-gate.ts`、前端开关 | 直接调用与伪造回调均 403，CI 通过 |
 | OPS-01 | P0 | 🟡 部分 | 离线状态、流量聚合与任务幂等 | `worker.ts`、`socket/offline-detector.ts` | 离线检测闭环 ✅；**流量入库/聚合仍空壳** |
