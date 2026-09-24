@@ -13,6 +13,13 @@
 #   bash scripts/net01-e2e/teardown.sh     # 整体销毁
 name: net01
 
+# TUNEX_BACKEND_IMAGE：控制面镜像来源。
+#   · 本地：默认 ghcr.io/paimoncai/tunex-backend:latest（images job 已推送）
+#   · CI：先 `docker build -t net01-backend-local:ci ./backend`，再 export
+#     TUNEX_BACKEND_IMAGE=net01-backend-local:ci —— PR 事件没有 images job，
+#     不能依赖 registry 里已有镜像。
+# 注意：不写 build 段——两个服务共用同一镜像，本地由 setup.sh / CI 自行构建。
+
 services:
   mysql:
     image: mysql:8.4.11
@@ -53,7 +60,7 @@ services:
   # 控制面（HTTP API :3000 + Socket.IO :3001）。host 网络不可用于 compose 单服务
   # 端口映射，故两条端口分别暴露；容器内 DATABASE_URL/REDIS_URL 走服务名直连。
   backend:
-    image: ghcr.io/paimoncai/tunex-backend:latest
+    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
     container_name: net01-backend
     restart: unless-stopped
     environment:
@@ -93,7 +100,7 @@ services:
 
   # db-migrate：跑 migrate deploy + seed（一次性，成功后退出）
   db-migrate:
-    image: ghcr.io/paimoncai/tunex-backend:latest
+    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
     container_name: net01-db-migrate
     environment:
       NODE_ENV: production

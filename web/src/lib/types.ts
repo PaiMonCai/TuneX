@@ -440,6 +440,41 @@ export interface TrafficPoint {
   traffic_cost: number;
 }
 
+/**
+ * OPS-03：workspace 级流量聚合（对应 GET /api/workspaces/:id/traffic，
+ * 后端 services/traffic.ts 的 WorkspaceTrafficSummary）。
+ *
+ * 与旧的 `dashboard.traffic`（用户级、无归属过滤）的区别：
+ *   · 带 `workspace_id` 与策略周期口径（`period`），与「流量耗尽」判定同源；
+ *   · 同时给 `by_tunnel`（排行）与 `by_day`（趋势，缺日子补 0）。
+ */
+export type TrafficPeriod = "day" | "month" | "total";
+
+/** 单隧道流量排行项（后端按 traffic 降序返回）。 */
+export interface TunnelTrafficGroup {
+  tunnel_id: ID;
+  name: string;
+  tunnel_type: TunnelType;
+  in_node_group_id: ID | null;
+  in_node_group_name: string | null;
+  traffic: number;
+  traffic_cost: number;
+}
+
+export interface WorkspaceTrafficSummary {
+  workspace_id: ID;
+  /** 生效策略的流量计量周期（聚合窗口口径）。 */
+  period: TrafficPeriod;
+  /** 窗口起点 ISO 串；`total` 周期为 null（不限窗口）。 */
+  since: string | null;
+  total_traffic: number;
+  total_traffic_cost: number;
+  by_tunnel: TunnelTrafficGroup[];
+  /** 按日界补齐的序列（缺日子补 0，前端图表点数稳定）。 */
+  by_day: TrafficPoint[];
+  orphan_rows: number;
+}
+
 export interface DashboardStats {
   balance: number;
   commission_balance: number;

@@ -99,8 +99,12 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run typecheck
+      # OPS-03：仪表盘流量装配纯逻辑单测（bun test，无 DB/浏览器依赖）
+      - name: Unit tests (dashboard traffic + api mocks)
+        run: bun test src/components/dashboard/__tests__/
       - name: Build with optional billing disabled
         run: npm run build
         env:

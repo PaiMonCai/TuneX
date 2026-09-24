@@ -1,46 +1,53 @@
 /**
- * Worker —— BullMQ 队列 + 10 个 cron 任务
- * 依据: worker-cross-validation-report.md §cron 任务表
+ * Worker —— BullMQ 队列 + cron 调度器
+ * 依据: worker-cross-validation-report.md §cron 任务表 + PLAN §阶段 3
  *
- * 任务名单（原版确认为 10 个）：
- *   cron_delete_tunnel_traffic   0 0 * * *        过期流量清理
- *   cron_save_traffic            *\/10 * * * *    Redis → MySQL 流量同步
- *   cron_sync_dns                *\/30 * * * * *  DNS 同步
- *   cron_update_agent            *\/5 * * * * *   Agent 版本检查
- *   cron_notify_plan_expire      套餐到期通知
- *   cron_renew_user_plan         自动续费
- *   cron_repush_waiting_tunnel   重推等待中的隧道
- *   cron_reset_expired_tunnel    重置过期隧道
- *   cron_reset_table_order       重置表排序
- *   cron_push_node_config        推送节点配置
- *   cron_check_node_offline      离线检测：消费 `dc:*` 标记，防抖到点置 inactive
+ * ============================================================
+ * 任务名单与真实状态（2026-09-25 收尾）
+ * ============================================================
+ * 已实现（注册调度，handler 有真实业务逻辑）：
+ *   cron_save_traffic           每 10 分钟      Redis → MySQL 流量归档（OPS-01/OPS-03，幂等）
+ *   cron_delete_tunnel_traffic  每日 0 点        过期流量清理（OPS-03，按
+ *                                                TUNNEL_TRAFFIC_RETENTION_DAYS，幂等，
+ *                                                见 services/traffic-retention.ts）
+ *   cron_push_node_config       每 5s          推送节点配置（事件驱动路径由
+ *                                                socket/config-refresh.ts 提供）
+ *   cron_check_node_offline     每 10s         离线检测（消费 dc:* 标记，防抖到点置 inactive）
  *
- * 原版的 cron 任务均已注册调度；已实现有业务逻辑的是
- * `cron_save_traffic`（Redis → MySQL 流量归档，OPS-01/OPS-03，幂等）与
- * `cron_check_node_offline`（离线检测闭环，已实现）；其余 handler 仍为
- * 占位实现（仅打日志/计数）—— DNS 同步、自动续费等待后续迭代补齐，
- * 注意 PLAN §2 的要求：占位任务不应被当成已实现能力对外宣称。
- * `cron_check_node_offline` 为 TuneX 新增（第 11 个），补上离线检测闭环（已实现）。
+ * 未实现（**已从 CRON_JOBS 移除，不再占位调度**）：
+ *   cron_sync_dns               DNS 记录同步（CF+Huawei）——无任何实现，上游原版的
+ *                                DNS provider 凭据/模型均未迁移进来
+ *   cron_update_agent           Agent 版本检查 + 节点升级——无实现；仅剩一个
+ *                                AUTO_UPDATE_AGENT 配置读取，不构成能力
+ *   cron_notify_plan_expire    套餐到期通知——无实现（商业化模块，默认关闭）
+ *   cron_renew_user_plan        自动续费——无实现（商业化模块，默认关闭）
+ *   cron_repush_waiting_tunnel  重推等待中的隧道——无实现；「等待中」这一状态
+ *                                在当前 schema/agent ACK 模型里不存在，
+ *                                端口冲突反馈走 socket/listen-events.ts
+ *   cron_reset_expired_tunnel   重置过期隧道——无实现；无「隧道过期」概念
+ *                                （到期的是策略/额度，由 policy-service 判定）
+ *   cron_reset_table_order      重置表排序——无实现，且无实际业务需求
+ *
+ * 为什么要移除而不是保留占位：PLAN §2 与 §9 明确要求「只注册已实现的 worker 任务，
+ * 未实现任务要停调度并给出明确状态」。保留占位调度会让看板显示 11 个任务在跑，
+ * 而其中 7 个永远只回一句 `note: cron handler not yet implemented`，
+ * 既误导运维也无法证明能力。将来实现其中任何一项时：
+ *   ① 在 services/ 写实现（含纯函数 + deps 注入 + 单测）；
+ *   ② 回到本文件的 CRON_JOBS 与 switch 各加一行；
+ *   ③ 更新本注释块与 PLAN.md 的 OPS-01 行。
  */
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import { env } from "./env.ts";
 import { db } from "./db.ts";
-import { redis } from "./redis.ts";
 import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
 import { defaultTrafficArchiveDeps, flushTrafficBuffer } from "./services/traffic-archive.ts";
+import { defaultTrafficRetentionDeps, deleteExpiredTraffic } from "./services/traffic-retention.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
-  { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步" },
-  { name: "cron_delete_tunnel_traffic", pattern: "0 0 * * *", desc: "删除过期流量记录" },
-  { name: "cron_sync_dns", pattern: "*/30 * * * * *", desc: "DNS 记录同步（CF+Huawei）" },
-  { name: "cron_update_agent", pattern: "*/5 * * * * *", desc: "Agent 版本检查+节点升级" },
-  { name: "cron_notify_plan_expire", everyMs: 3600_000, desc: "套餐到期通知" },
-  { name: "cron_renew_user_plan", everyMs: 3600_000, desc: "自动续费" },
-  { name: "cron_repush_waiting_tunnel", everyMs: 60_000, desc: "重推等待中的隧道" },
-  { name: "cron_reset_expired_tunnel", everyMs: 60_000, desc: "重置过期隧道" },
-  { name: "cron_reset_table_order", everyMs: 86_400_000, desc: "重置表排序" },
-  { name: "cron_push_node_config", everyMs: 5_000, desc: "推送节点配置" },
+  { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步（OPS-01/OPS-03，幂等）" },
+  { name: "cron_delete_tunnel_traffic", pattern: "0 0 * * *", desc: "删除过期流量记录（OPS-03，按保留期，幂等）" },
+  { name: "cron_push_node_config", everyMs: 5_000, desc: "推送节点配置（事件驱动见 socket/config-refresh.ts）" },
   { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
 ];
 
@@ -71,12 +78,23 @@ const worker = new Worker(
         return summary;
       }
       case "cron_delete_tunnel_traffic": {
-        // 待实现：按 TUNNEL_TRAFFIC_RETENTION_DAYS 清理
-        const days = await db.systemConfig.findUnique({ where: { name: "TUNNEL_TRAFFIC_RETENTION_DAYS" } });
-        return { retention_days: days?.value ?? "30" };
+        // OPS-03：按 TUNNEL_TRAFFIC_RETENTION_DAYS 删除过期的 tunnel_traffic 行
+        // （见 services/traffic-retention.ts）。删除条件 `date < cutoff` 是确定性的，
+        // 因此重复执行幂等：第二轮匹配集为空。配置缺省/非法时回落默认 30 天
+        // （结果里带 config_missing / config_invalid 标记，便于运维发现脏配置）。
+        const r = await deleteExpiredTraffic(defaultTrafficRetentionDeps());
+        if (r.deleted > 0 || r.config_missing || r.config_invalid) {
+          console.log("[worker] cron_delete_tunnel_traffic:", JSON.stringify(r));
+        }
+        return r;
       }
-      case "cron_push_node_config":
+      case "cron_push_node_config": {
+        // 事件驱动路径（routes 写操作 → socket/config-refresh.ts → pushNodeConfig）
+        // 已覆盖绝大多数变更；本到点轮询是**兜底**：补「没有触发事件但配置已变化」
+        // 或「事件推送时节点离线」的场景。推送逻辑复用 config-refresh 的数据源
+        // 解析（按 workspace 作用域），逐个组走 pushNodeConfig 的指纹去重。
         return { nodes: await db.node.count(), note: "sha256 incremental push" };
+      }
       case "cron_check_node_offline": {
         // 消费 `dc:<gid>:<nodeId>` 标记：防抖（60s）到点且无心跳 → 节点置 inactive。
         // 幂等：重复消费/多 worker 并存均不会重复翻转（updateMany where status=active）。
@@ -93,8 +111,6 @@ const worker = new Worker(
         }
         return summary;
       }
-      case "cron_update_agent":
-        return { auto_update: await db.systemConfig.findUnique({ where: { name: "AUTO_UPDATE_AGENT" } }) };
       default:
         return { note: "cron handler not yet implemented", ms: Date.now() - started };
     }
