@@ -39,6 +39,7 @@ import { NodeType, TunnelCategory, TunnelType, IpType } from "@prisma/client";
 import type { LoadBalanceType } from "@prisma/client";
 import { db } from "../db.ts";
 import { redis } from "../redis.ts";
+import { GLOBAL_SCOPE, outListenKey, scopeId } from "../tenant-scope.ts";
 import { env } from "../env.ts";
 import { systemConfig } from "../services/config.ts";
 import {
@@ -55,8 +56,14 @@ import { resolveDynamicServicePorts, type TunnelPortInfo } from "./port-allocato
 /* 常量                                                               */
 /* ================================================================== */
 
-/** 出口端口缓存（Redis hash）：field = `${nodeId}:${type}`，value = 端口。 */
-export const OUT_LISTEN_KEY = "tunnel:out_listen";
+/**
+ * 出口端口缓存（Redis hash）：field = `${nodeId}:${type}`，value = 端口。
+ *
+ * TEN-02：键名由 {@link outListenKey} 按 workspace 作用域生成
+ * （`ws:<scope>:tunnel:out_listen`）。裸名时代两个租户的出口端口写进同一个
+ * hash，任何一方的 `out_hops` 都可能拼到对方的地址——现在是分键的。
+ */
+export const OUT_LISTEN_KEY_BASE = "tunnel:out_listen";
 
 /** agent 动态选端口占位符前缀（原版字节级一致：`:WAIT_LISTEN` 12 字节）。 */
 export const WAIT_LISTEN = "WAIT_LISTEN";
@@ -562,10 +569,18 @@ export function computeAllLimits(
 /* 工具：读 Redis / 系统配置                                           */
 /* ================================================================== */
 
-/** 出口端口缓存（`tunnel:out_listen`）。Redis 不可用时返回空表（退化为无出口链路）。 */
-export async function loadOutListens(): Promise<OutListens> {
+/**
+ * 出口端口缓存（`ws:<scope>:tunnel:out_listen`）。
+ * Redis 不可用时返回空表（退化为无出口链路）。
+ *
+ * TEN-02：`scope` 由调用方按「正在生成的节点组所属 workspace」解析
+ * （见 `generateNodeConfig` / `generateAllNodeConfigs`）；缺省为平台作用域。
+ */
+export async function loadOutListens(
+  scope: number | null | undefined = GLOBAL_SCOPE,
+): Promise<OutListens> {
   try {
-    return (await redis.hgetall(OUT_LISTEN_KEY)) as OutListens;
+    return (await redis.hgetall(outListenKey(scope))) as OutListens;
   } catch {
     return {};
   }
@@ -1413,17 +1428,26 @@ export async function generateNodeConfig(
 
   const group = await db.nodeGroup.findUnique({
     where: { id: nodeGroupId },
-    select: { id: true, node_type: true, port_range: true, allow_listen_protocol: true },
+    select: {
+      id: true,
+      node_type: true,
+      port_range: true,
+      allow_listen_protocol: true,
+      workspace_id: true,
+    },
   });
   if (!group) {
     throw new Error(`config-generator: node group ${nodeGroupId} not found`);
   }
 
+  // TEN-02：出口端口缓存按该组所属 workspace 分段读取。
+  const scope = scopeId(group.workspace_id);
+
   const [observerPeriod, limitScope, allTunnels, outListens] = await Promise.all([
     loadObserverPeriod(options.observerPeriod),
     options.limitScope ?? systemConfig.getConfig("LIMIT_SCOPE"),
     options.allTunnels ?? loadAvailableTunnels(),
-    options.outListens ?? loadOutListens(),
+    options.outListens ?? loadOutListens(scope),
   ]);
 
   // AUTHZ-02：额度/白名单/默认拒绝全部来自 CapabilityPolicy，不再读 user_plan。
@@ -1469,11 +1493,19 @@ export async function generateNodeConfig(
  */
 export async function generateAllNodeConfigs(): Promise<GeneratedNodeConfig[]> {
   const groups = await db.nodeGroup.findMany({
-    select: { id: true },
+    select: { id: true, workspace_id: true },
     where: { nodes: { some: { status: "active" } } },
   });
   const shared = await loadAvailableTunnels().catch(() => [] as AvailableTunnel[]);
-  const outListens = await loadOutListens();
+  // TEN-02：出口端口缓存必须按组所在 workspace 分段读取；旧版一次性读一个全局
+  // hash，等于把所有租户的 out_hops 地址混在一起下发。
+  const outListensByScope = new Map<number, OutListens>();
+  for (const g of groups) {
+    const scope = scopeId(g.workspace_id);
+    if (!outListensByScope.has(scope)) {
+      outListensByScope.set(scope, await loadOutListens(scope));
+    }
+  }
   const limitScope = (await systemConfig.getConfig("LIMIT_SCOPE")) ?? undefined;
   const policyContext = await loadPolicyContext(shared);
   const tunnelLimits = computeAllLimits(shared, limitScope, policyContext);
@@ -1485,7 +1517,7 @@ export async function generateAllNodeConfigs(): Promise<GeneratedNodeConfig[]> {
       results.push(
         await generateNodeConfig(g.id, {
           allTunnels: shared,
-          outListens,
+          outListens: outListensByScope.get(scopeId(g.workspace_id)) ?? {},
           limitScope,
           tunnelLimits,
           policyContext,

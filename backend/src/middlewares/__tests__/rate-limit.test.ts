@@ -137,7 +137,17 @@ describe("checkRateLimit (memory store)", () => {
 });
 
 describe("rateLimitKey", () => {
-  test("namespaced key", () => {
-    expect(rateLimitKey("auth-login", "ip:1.2.3.4")).toBe("ratelimit:auth-login:ip:1.2.3.4");
+  test("namespaced key (TEN-02：带 ws:global: 前缀)", () => {
+    expect(rateLimitKey("auth-login", "1.2.3.4")).toBe(
+      "ws:global:ratelimit:auth-login:1.2.3.4",
+    );
+  });
+
+  test("identity 含冒号时被转义（不能伪造出新的段）", () => {
+    // escapeSegment 把 `:` 转成 `\:`：否则 `ip:1.2.3.4` 里的冒号会被
+    // 解析成额外段，同 key 前缀下不同 rule/identity 可能串味。
+    expect(rateLimitKey("auth-login", "ip:1.2.3.4")).toBe(
+      "ws:global:ratelimit:auth-login:ip\\:1.2.3.4",
+    );
   });
 });

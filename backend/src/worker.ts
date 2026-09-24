@@ -25,6 +25,7 @@ import { env } from "./env.ts";
 import { db } from "./db.ts";
 import { redis } from "./redis.ts";
 import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
+import { GLOBAL_SCOPE, trafficBufferPrefix } from "./tenant-scope.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步" },
@@ -49,8 +50,10 @@ const worker = new Worker(
     const started = Date.now();
     switch (job.name) {
       case "cron_save_traffic": {
-        // 待实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany
-        const pending = await redis.keys("tunnel:traffic:*");
+        // 待实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany。
+        // TEN-02：流量缓冲键按 scope 命名（`ws:<scope>:tunnel:traffic:*`），
+        // 归档时须按 workspace 归属写入 tunnel_traffic（经 tunnel.workspace_id 关联）。
+        const pending = await redis.keys(`${trafficBufferPrefix(GLOBAL_SCOPE)}*`);
         return { pending: pending.length, note: "buffer→DB" };
       }
       case "cron_delete_tunnel_traffic": {

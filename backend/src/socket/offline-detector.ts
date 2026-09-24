@@ -1,19 +1,21 @@
 /**
- * 离线检测 —— 消费 Redis `dc:*` 标记，60s 防抖后将节点置 `inactive`
+ * 离线检测 —— 消费 Redis 离线标记，60s 防抖后将节点置 `inactive`
  *
  * ── 背景 ──
  * `socket/index.ts` 的 `disconnect` handler 已能写离线标记
- * `dc:<groupId>:<nodeId>`（值 = 断开时刻的毫秒时间戳），但**一直没有消费端**：
- * 节点崩溃/失联后 `node.status` 永远停在 `active`，导致 `online_node_count`、
- * 隧道 online 标记、`config-generator` 的 `status=active` 过滤全部失真
- * （见 reports/multi-node-verification.md §7 缺陷#1、tunex-technical-analysis.md §4.7）。
+ * `ws:<scope>:node:<groupId>:<nodeId>:offline`（值 = 断开时刻的毫秒时间戳），
+ * 本模块是它的消费端：节点崩溃/失联后 `node.status` 从 `active` 翻到
+ * `inactive`，`online_node_count`、隧道 online 标记、`config-generator` 的
+ * `status=active` 过滤才不失真（见 reports/multi-node-verification.md §7
+ * 缺陷#1、tunex-technical-analysis.md §4.7）。
  *
- * 本模块补上消费端，形成完整闭环：
+ * 完整闭环：
  *
- *   1. 节点断开 → `disconnect` 写 `dc:<gid>:<nodeId>`（TTL = 防抖窗口 + 宽限期）
+ *   1. 节点断开 → `disconnect` 写 `...:offline`（TTL = 防抖窗口 + 宽限期）
  *   2. 节点在防抖窗口内重连 → `register` / `sysinfo` **删除**该标记（取消待处理离线）
  *   3. worker 定时调用 {@link runOfflineCheck}：
- *        扫描 `dc:*` → 逐条判定 → 防抖到点且无心跳 → `node.status=inactive`
+ *        扫描 `ws:*:node:*:*:offline` → 逐条判定 → 防抖到点且无心跳
+ *        （`...:node:{gid}:{nodeId}:heartbeat` 已失效）→ `node.status=inactive`
  *
  * ── 60s 防抖 ──
  * 判定「离线」必须同时满足：
@@ -37,12 +39,8 @@
  * {@link defaultOfflineDeps} 的懒加载）。
  */
 
-/** 离线标记 key 前缀：`dc:<groupId>:<nodeId>`。 */
-export const DISCONNECT_MARKER_PREFIX = "dc:";
-/** 心跳 key 前缀：`sysinfo:<groupId>:<nodeId>`（写端见 socket/index.ts sysinfo）。 */
-export const SYSINFO_KEY_PREFIX = "sysinfo:";
-/** 活跃节点组集合（sysinfo 时 sadd，本模块在组内无 active 节点时 srem）。 */
-export const ALIVE_GROUPS_KEY = "alive_groups";
+/** 平台/全局作用域（`ws:global:`）。 */
+export const GLOBAL_SCOPE_TAG = "global";
 
 /** 防抖窗口：断开后 60s 内重连视为未离线。 */
 export const DISCONNECT_DEBOUNCE_MS = 60_000;
@@ -52,29 +50,56 @@ export const DISCONNECT_MARKER_GRACE_S = 120;
 export const DISCONNECT_MARKER_TTL_S =
   DISCONNECT_DEBOUNCE_MS / 1000 + DISCONNECT_MARKER_GRACE_S;
 
-/** 离线标记 key。 */
-export function disconnectMarkerKey(groupId: number, nodeId: string): string {
-  return `${DISCONNECT_MARKER_PREFIX}${groupId}:${nodeId}`;
-}
+/* ── TEN-02 ────────────────────────────────────────────────────────────
+ * 键工厂从 tenant-scope 单一真相源导入，本地用完之后再转发导出，保持既有
+ * import 路径（../offline-detector.ts）可用，业务代码不应再自行拼装 key。
+ */
+import {
+  disconnectMarkerKey,
+  heartbeatKey,
+  heartbeatPattern,
+  parseHeartbeatKey,
+  parseDisconnectMarkerKey,
+  offlinePattern,
+  aliveGroupsKey,
+} from "../tenant-scope.ts";
 
-/** 心跳 key（与 socket/index.ts 写端口径一致）。 */
-export function sysinfoKey(groupId: number, nodeId: string): string {
-  return `${SYSINFO_KEY_PREFIX}${groupId}:${nodeId}`;
-}
+export {
+  disconnectMarkerKey,
+  heartbeatKey,
+  heartbeatPattern,
+  parseHeartbeatKey,
+  parseDisconnectMarkerKey,
+  offlinePattern,
+  aliveGroupsKey,
+};
 
-/** 解析离线标记 key；非 `dc:<int>:<nodeId>` 形态返回 `null`。 */
-export function parseDisconnectMarkerKey(
+/** 旧的无作用域标记前缀（迁移兼容用；新键见 {@link disconnectMarkerKey}）。 */
+export const DISCONNECT_MARKER_PREFIX_LEGACY = "dc:";
+
+/**
+ * 解析离线标记 key；非 `ws:<scope>:node:<groupId>:<nodeId>:offline` 返回 `null`。
+ *
+ * scope>0 时为 workspace id；`ws:global:` 折叠为 `GLOBAL_SCOPE`(0)。
+ */
+export function parseDisconnectMarkerKeyLocal(
   key: string,
-): { groupId: number; nodeId: string } | null {
-  const m = /^dc:(\d+):(.+)$/.exec(key);
+): { scope: number; groupId: number; nodeId: string } | null {
+  const m =
+    /^ws:([^:]+):node:(\d+):(.+):offline$/.exec(key);
   if (!m) return null;
-  return { groupId: Number(m[1]), nodeId: m[2] };
+  const [, scopeTag, gid, nodeId] = m;
+  const scope = scopeTag === GLOBAL_SCOPE_TAG ? 0 : Number(scopeTag);
+  if (!Number.isInteger(scope)) return null;
+  return { scope, groupId: Number(gid), nodeId };
 }
 
 /** 一条离线标记。 */
 export interface DisconnectMarker {
-  /** Redis key。 */
+  /** Redis key（形如 `ws:<scope>:node:<gid>:<node>:offline`）。 */
   key: string;
+  /** 所属 workspace scope。 */
+  scope: number;
   groupId: number;
   nodeId: string;
   /** 标记写入时刻（毫秒）；值非法时回退为 0（视为早已到点）。 */
@@ -83,11 +108,12 @@ export interface DisconnectMarker {
 
 /** 从 key/value 解析标记；key 形态不合法返回 `null`。 */
 export function parseMarker(key: string, value: string): DisconnectMarker | null {
-  const parsed = parseDisconnectMarkerKey(key);
+  const parsed = parseDisconnectMarkerKeyLocal(key);
   if (!parsed) return null;
   const n = Number(value);
   return {
     key,
+    scope: parsed.scope,
     groupId: parsed.groupId,
     nodeId: parsed.nodeId,
     markedAt: Number.isFinite(n) && n > 0 ? n : 0,
@@ -133,10 +159,13 @@ export function decideOffline(marker: DisconnectMarker, ctx: OfflineContext): Of
 
 /** 副作用依赖（生产用 {@link defaultOfflineDeps}；测试注入 fake）。 */
 export interface OfflineCheckDeps {
-  /** 扫描全部离线标记（key + value）。 */
+  /** 扫描全部离线标记（key + value），跨租户全部返回。 */
   listMarkers(): Promise<Array<{ key: string; value: string }>>;
-  /** 是否仍有心跳。 */
-  hasHeartbeat(groupId: number, nodeId: string): Promise<boolean>;
+  /**
+   * 是否仍有心跳。scope 必须取标记解析出的 scope——否则别租户的心跳
+   * （同 groupId/nodeId 但不同 workspace）会让本租户节点逃过离线判定。
+   */
+  hasHeartbeat(scope: number, groupId: number, nodeId: string): Promise<boolean>;
   /** 查询节点状态；不存在返回 `missing`。 */
   getNodeStatus(nodeId: string): Promise<"active" | "inactive" | "missing">;
   /** 置 inactive（仅当当前为 active）；返回是否真正更新。 */
@@ -145,8 +174,8 @@ export interface OfflineCheckDeps {
   clearMarker(key: string): Promise<void>;
   /** 该组是否仍有 active 节点（用于 alive_groups 清理）。 */
   groupHasActiveNode(groupId: number): Promise<boolean>;
-  /** 从 alive_groups 移除该组。 */
-  removeAliveGroup(groupId: number): Promise<void>;
+  /** 从**指定 scope 的** alive_groups 移除该组。 */
+  removeAliveGroup(scope: number, groupId: number): Promise<void>;
   /** 当前毫秒时间戳。 */
   now(): number;
   /** 防抖窗口覆盖；默认 {@link DISCONNECT_DEBOUNCE_MS}。 */
@@ -165,8 +194,8 @@ export interface OfflineCheckResult {
   skippedHeartbeatAlive: number;
   alreadyInactive: number;
   nodeMissing: number;
-  /** 因组内已无 active 节点而从 alive_groups 移除的组 id。 */
-  clearedGroups: number[];
+  /** 因组内已无 active 节点而从 alive_groups 移除的组；形如 `<scope>:<groupId>`。 */
+  clearedGroups: string[];
   /** 处理失败的标记数（异常已吞，仅计数）。 */
   errors: number;
 }
@@ -179,10 +208,11 @@ export function defaultOfflineDeps(): OfflineCheckDeps {
       const out: Array<{ key: string; value: string }> = [];
       let cursor = "0";
       do {
+        // 跨租户全扫：键里带 scope 段，靠后面的 parse 把每条的归属还原出来。
         const [next, keys] = await redis.scan(
           cursor,
           "MATCH",
-          `${DISCONNECT_MARKER_PREFIX}*`,
+          offlinePattern(),
           "COUNT",
           200,
         );
@@ -194,9 +224,9 @@ export function defaultOfflineDeps(): OfflineCheckDeps {
       } while (cursor !== "0");
       return out;
     },
-    async hasHeartbeat(groupId, nodeId) {
+    async hasHeartbeat(scope, groupId, nodeId) {
       const { redis } = await import("../redis.ts");
-      return (await redis.exists(sysinfoKey(groupId, nodeId))) === 1;
+      return (await redis.exists(heartbeatKey(scope, groupId, nodeId))) === 1;
     },
     async getNodeStatus(nodeId) {
       const { db } = await import("../db.ts");
@@ -224,9 +254,9 @@ export function defaultOfflineDeps(): OfflineCheckDeps {
       const c = await db.node.count({ where: { node_group_id: groupId, status: "active" } });
       return c > 0;
     },
-    async removeAliveGroup(groupId) {
+    async removeAliveGroup(scope, groupId) {
       const { redis } = await import("../redis.ts");
-      await redis.srem(ALIVE_GROUPS_KEY, String(groupId));
+      await redis.srem(aliveGroupsKey(scope), String(groupId));
     },
     now: () => Date.now(),
     log: (message, meta) => console.warn(message, meta),
@@ -255,7 +285,8 @@ export async function runOfflineCheck(deps: OfflineCheckDeps): Promise<OfflineCh
   };
 
   const markers = await deps.listMarkers();
-  const groupsToReap = new Set<number>();
+  // 去重键 = `<scope>:<groupId>`：同 groupId 在不同 workspace 是不同组，各自 reap。
+  const groupsToReap = new Map<string, { scope: number; groupId: number }>();
 
   for (const raw of markers) {
     const marker = parseMarker(raw.key, raw.value);
@@ -264,7 +295,7 @@ export async function runOfflineCheck(deps: OfflineCheckDeps): Promise<OfflineCh
 
     try {
       const [hasHeartbeat, nodeStatus] = await Promise.all([
-        deps.hasHeartbeat(marker.groupId, marker.nodeId),
+        deps.hasHeartbeat(marker.scope, marker.groupId, marker.nodeId),
         deps.getNodeStatus(marker.nodeId),
       ]);
       const decision = decideOffline(marker, { now, debounceMs, hasHeartbeat, nodeStatus });
@@ -291,10 +322,14 @@ export async function runOfflineCheck(deps: OfflineCheckDeps): Promise<OfflineCh
           const flipped = await deps.markInactive(marker.nodeId);
           if (flipped) {
             result.flipped++;
-            groupsToReap.add(marker.groupId);
+            groupsToReap.set(`${marker.scope}:${marker.groupId}`, {
+              scope: marker.scope,
+              groupId: marker.groupId,
+            });
             log("[offline] node marked inactive", {
               node_id: marker.nodeId,
               group_id: marker.groupId,
+              scope: marker.scope,
               offline_for_ms: now - marker.markedAt,
             });
           } else {
@@ -313,17 +348,18 @@ export async function runOfflineCheck(deps: OfflineCheckDeps): Promise<OfflineCh
     }
   }
 
-  // alive_groups 清理：组内再无 active 节点 → 从活跃集合移除。
-  for (const gid of groupsToReap) {
+  // alive_groups 清理：组内再无 active 节点 → 从**该 scope 的**活跃集合移除。
+  for (const [reapKey, g] of groupsToReap) {
     try {
-      if (!(await deps.groupHasActiveNode(gid))) {
-        await deps.removeAliveGroup(gid);
-        result.clearedGroups.push(gid);
+      if (!(await deps.groupHasActiveNode(g.groupId))) {
+        await deps.removeAliveGroup(g.scope, g.groupId);
+        result.clearedGroups.push(reapKey);
       }
     } catch (e) {
       result.errors++;
       log("[offline] failed to reap alive group", {
-        group_id: gid,
+        group_id: g.groupId,
+        scope: g.scope,
         err: (e as Error)?.message,
       });
     }
