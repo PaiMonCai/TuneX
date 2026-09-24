@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -54,6 +54,22 @@ jobs:
           bunx tsc --noEmit
       - name: Authorization and payment HTTP tests
         run: bun run test
+        env:
+          TUNEX_DB_TEST: "1"
+          ALLOW_REGISTER_FALLBACK: "true"
+      - name: Migrate and verify existing two-user database
+        run: |
+          bunx prisma db execute --schema prisma/schema.prisma --file tests/fixtures/create-upgrade-db.sql
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci
+          temp_dir=$(mktemp -d)
+          cp prisma/schema.prisma "$temp_dir/schema.prisma"
+          mkdir -p "$temp_dir/migrations"
+          cp -R prisma/migrations/20260923170000_init "$temp_dir/migrations/"
+          cp -R prisma/migrations/20260924100000_node_group_grant "$temp_dir/migrations/"
+          bunx prisma migrate deploy --schema "$temp_dir/schema.prisma"
+          bunx prisma db execute --schema "$temp_dir/schema.prisma" --file tests/fixtures/legacy-workspace.sql
+          bunx prisma migrate deploy --schema prisma/schema.prisma
+          node tests/verify-workspace-upgrade.mjs
 
   web:
     runs-on: ubuntu-latest

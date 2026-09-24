@@ -21,6 +21,7 @@
  *       reports/reference-schema.sql（plan / node_group / node / plan_node_group）
  */
 import { db } from "../src/db.ts";
+import { createPersonalWorkspace, ensurePersonalWorkspace } from "../src/services/workspace.ts";
 import { hashPassword, generatePassword, newApiKey, verifyPassword } from "../src/auth.ts";
 import { writeFileSync, chmodSync } from "node:fs";
 import {
@@ -189,6 +190,7 @@ async function seedSuperAdmin(): Promise<{
 
   // —— 用户已存在：保留用户本身，仅确保凭证可用 ——
   if (existing) {
+    await ensurePersonalWorkspace(existing);
     if (!existing.credential) {
       await db.userCredential.create({
         data: { user_id: existing.id, password: await hashPassword(ADMIN_PASSWORD) },
@@ -214,6 +216,7 @@ async function seedSuperAdmin(): Promise<{
     await tx.userCredential.create({
       data: { user_id: created.id, password: await hashPassword(ADMIN_PASSWORD) },
     });
+    await createPersonalWorkspace(tx, created);
     return created;
   });
 
@@ -275,12 +278,14 @@ async function seedPlans(): Promise<Map<string, number>> {
 /** 节点组：按 token 幂等 upsert，归属超管用户。 */
 async function seedNodeGroups(adminUserId: number): Promise<Map<string, number>> {
   const ids = new Map<string, number>();
+  const workspace = await db.workspace.findUniqueOrThrow({ where: { personal_user_id: adminUserId } });
   for (const g of NODE_GROUPS) {
     const shared = {
       name: g.name,
       node_type: g.nodeType,
       load_balance_type: g.loadBalanceType,
       user_id: adminUserId,
+      workspace_id: workspace.id,
       connect_ip: NODE_CONNECT_IP,
     };
     const ng = await db.nodeGroup.upsert({

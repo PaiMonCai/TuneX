@@ -21,6 +21,7 @@ import {
   newApiKey,
 } from "../auth.ts";
 import { systemConfig } from "../services/config.ts";
+import { createPersonalWorkspace } from "../services/workspace.ts";
 import { licenseService } from "../services/license.ts";
 import { loadUserWithRoles, type AppVariables } from "../middlewares/auth.ts";
 
@@ -89,6 +90,7 @@ authRoutes.post("/register", async (c) => {
     await tx.userCredential.create({
       data: { user_id: created.id, password: passwordHash },
     });
+    await createPersonalWorkspace(tx, created);
     return created;
   });
 

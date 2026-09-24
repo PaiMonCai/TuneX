@@ -27,6 +27,7 @@ import {
 import { authRoutes } from "./routes/auth.ts";
 import { adminRoutes } from "./routes/admin.ts";
 import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
+import { workspaceRoutes } from "./routes/workspaces.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { payRoutes } from "./routes/pay.ts";
@@ -106,6 +107,7 @@ export function createApp() {
   app.route("/api/pay", payRoutes);
   app.route("/api/dashboard", dashboardRoutes);
   app.route("/api/tunnels", tunnelsRoutes);
+  app.route("/api/workspaces", workspaceRoutes);
   app.route("/api/plans", plansRoutes);
   app.route("/api/topups", topupsRoutes);
   app.route("/api/payments", paymentsRoutes);

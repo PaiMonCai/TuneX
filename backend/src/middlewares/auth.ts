@@ -24,6 +24,7 @@ export type AuthedUser = Awaited<ReturnType<typeof loadUserWithRoles>>;
 export interface AppVariables {
   user?: NonNullable<AuthedUser>;
   ip?: string;
+  workspace?: import("../services/workspace.ts").WorkspaceAccess;
 }
 
 /** 统一加载用户（含 admin_roles） */

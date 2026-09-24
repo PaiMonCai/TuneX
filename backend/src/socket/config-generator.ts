@@ -82,6 +82,7 @@ export interface AvailableNode {
 export interface AvailableNodeGroup {
   id: number;
   user_id: number;
+  workspace_id: number;
   node_type: NodeType;
   load_balance_type: LoadBalanceType;
   nodes: AvailableNode[];
@@ -113,6 +114,7 @@ export interface AvailableUserPlan {
 
 export interface AvailableUser {
   id: number;
+  personal_workspace?: { id: number } | null;
   node_group_grants?: { node_group_id: number; direction: NodeType; active: boolean }[];
   user_plan: AvailableUserPlan | null;
 }
@@ -143,6 +145,7 @@ export interface AvailableTunnel {
   in_node_group_id: number;
   out_node_group_id: number | null;
   user_id: number;
+  workspace_id: number;
   in_node_group?: AvailableNodeGroup;
   out_node_group?: AvailableNodeGroup | null;
   tunnel_chains?: AvailableTunnelChain[];
@@ -422,7 +425,7 @@ export function filterAvailableTunnels(
 export function canUseTunnelGroup(tunnel: AvailableTunnel, groupId: number, kind: "in" | "out"): boolean {
   const group = kind === "in" ? tunnel.in_node_group : tunnel.out_node_group;
   if (!group || group.id !== groupId) return false;
-  return isNodeGroupGranted(tunnel.user_id, group, kind, tunnel.user?.node_group_grants ?? []);
+  return isNodeGroupGranted(tunnel.user_id, group, kind, tunnel.user?.node_group_grants ?? [], tunnel.workspace_id, tunnel.user?.personal_workspace?.id);
 }
 
 /** Reject the whole tunnel when any primary or multi-hop group is not authorized. */
@@ -432,7 +435,7 @@ export function hasAuthorizedTopology(tunnel: AvailableTunnel): boolean {
   return (tunnel.tunnel_chains ?? []).every((chain) =>
     chain.node_group?.id === chain.node_group_id &&
     chain.node_group.node_type === chain.node_type &&
-    isNodeGroupGranted(tunnel.user_id, chain.node_group, chain.node_type, tunnel.user?.node_group_grants ?? [])
+    isNodeGroupGranted(tunnel.user_id, chain.node_group, chain.node_type, tunnel.user?.node_group_grants ?? [], tunnel.workspace_id, tunnel.user?.personal_workspace?.id)
   );
 }
 
@@ -1195,6 +1198,7 @@ export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
       user: {
         include: {
           node_group_grants: { where: { active: true } },
+          personal_workspace: { select: { id: true } },
           user_plan: {
             include: {
               plan: { include: { node_groups: true } },

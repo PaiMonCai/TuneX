@@ -24,6 +24,104 @@ enum BypassType {
   blacklist
 }
 
+enum WorkspaceKind {
+  personal
+  team
+}
+
+enum WorkspaceRole {
+  owner
+  admin
+  member
+  viewer
+}
+
+model Workspace {
+  id               Int               @id @default(autoincrement())
+  slug             String            @unique @db.VarChar(191)
+  name             String            @db.VarChar(120)
+  kind             WorkspaceKind
+  personal_user_id Int?              @unique
+  personal_user    User?             @relation("PersonalWorkspace", fields: [personal_user_id], references: [id], onDelete: Restrict)
+  created_by_id    Int
+  created_at       DateTime          @default(now())
+  updated_at       DateTime          @updatedAt
+  members          WorkspaceMember[]
+  invites          WorkspaceInvite[]
+  api_keys         WorkspaceApiKey[]
+  audit_events     AuditEvent[]
+  node_groups      NodeGroup[]
+  tunnels          Tunnel[]
+
+  @@map("workspace")
+}
+
+model WorkspaceMember {
+  id           Int           @id @default(autoincrement())
+  workspace_id Int
+  workspace    Workspace     @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  user_id      Int
+  user         User          @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  role         WorkspaceRole
+  active       Boolean       @default(true)
+  created_at   DateTime      @default(now())
+  updated_at   DateTime      @updatedAt
+
+  @@unique([workspace_id, user_id])
+  @@index([user_id, active])
+  @@map("workspace_member")
+}
+
+model WorkspaceInvite {
+  id            Int           @id @default(autoincrement())
+  workspace_id  Int
+  workspace     Workspace     @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  email         String        @db.VarChar(191)
+  role          WorkspaceRole
+  token_hash    String        @unique @db.Char(64)
+  invited_by_id Int
+  expires_at    DateTime
+  accepted_at   DateTime?
+  revoked_at    DateTime?
+  created_at    DateTime      @default(now())
+
+  @@index([workspace_id, email])
+  @@map("workspace_invite")
+}
+
+model WorkspaceApiKey {
+  id           Int        @id @default(autoincrement())
+  workspace_id Int
+  workspace    Workspace  @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  name         String     @db.VarChar(120)
+  key_hash     String     @unique @db.Char(64)
+  prefix       String     @db.VarChar(20)
+  scopes       Json
+  expires_at   DateTime?
+  revoked_at   DateTime?
+  created_by_id Int
+  created_at   DateTime   @default(now())
+
+  @@index([workspace_id, revoked_at])
+  @@map("workspace_api_key")
+}
+
+model AuditEvent {
+  id            BigInt      @id @default(autoincrement())
+  workspace_id  Int
+  workspace     Workspace   @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  actor_user_id Int?
+  action        String      @db.VarChar(100)
+  resource_type String      @db.VarChar(80)
+  resource_id   String?     @db.VarChar(191)
+  ip            String?     @db.VarChar(80)
+  detail        Json?
+  created_at    DateTime    @default(now())
+
+  @@index([workspace_id, created_at])
+  @@map("audit_event")
+}
+
 model NodeGroup {
   id                     Int             @id @default(autoincrement())
   token                  String          @unique @default(uuid())
@@ -48,6 +146,8 @@ model NodeGroup {
   updated_at             DateTime        @updatedAt
   user_id                Int
   user                   User            @relation(fields: [user_id], references: [id])
+  workspace_id           Int
+  workspace              Workspace       @relation(fields: [workspace_id], references: [id])
 
   in_tunnels        Tunnel[]         @relation("in_node_group")
   out_tunnels       Tunnel[]         @relation("out_node_group")
@@ -57,6 +157,7 @@ model NodeGroup {
   tunnel_chains     TunnelChain[]
   in_node_group_dns InNodeGroupDNS[]
 
+  @@index([workspace_id])
   @@map("node_group")
 }
 
@@ -159,11 +260,14 @@ model Tunnel {
   out_node_group             NodeGroup?      @relation("out_node_group", fields: [out_node_group_id], references: [id])
   user_id                    Int
   user                       User            @relation(fields: [user_id], references: [id])
+  workspace_id               Int
+  workspace                  Workspace       @relation(fields: [workspace_id], references: [id])
 
   tunnel_traffic TunnelTraffic[]
   tunnel_chains  TunnelChain[]
 
   @@unique([listen_port, in_node_group_id])
+  @@index([workspace_id])
   @@map("tunnel")
 }
 
@@ -199,6 +303,8 @@ model User {
   notify_subscriptions     Json?
   admin_notify_subscriptions Json?
   node_groups              NodeGroup[]
+  personal_workspace       Workspace?       @relation("PersonalWorkspace")
+  workspace_memberships    WorkspaceMember[]
   node_group_grants        NodeGroupGrant[]
   status                   Status             @default(active)
   created_at               DateTime           @default(now())

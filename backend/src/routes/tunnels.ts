@@ -29,8 +29,16 @@ import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { pushNodeConfig } from "../socket/config-pusher.ts";
 import { canUseNodeGroup } from "../services/node-group-access.ts";
+import { canWorkspaceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
 
 export const tunnelsRoutes = new Hono<{ Variables: AppVariables }>();
+
+// Every user route selects a verified workspace; missing header means personal space.
+tunnelsRoutes.use("*", async (c, next) => {
+  const isCreate = c.req.method === "POST" && /^\/api\/tunnels\/?$/.test(c.req.path);
+  c.set("workspace", await resolveWorkspaceAccess(c, isCreate ? "create" : "read"));
+  await next();
+});
 
 /**
  * 推送隧道所属节点组的配置（节点在线时立即生效）。
@@ -53,6 +61,12 @@ function pushTunnelConfig(t: {
 /* ------------------------------------------------------------------ */
 
 type Ctx = Context<{ Variables: AppVariables }>;
+
+function selectedWorkspace(c: Ctx): NonNullable<AppVariables["workspace"]> {
+  const workspace = c.get("workspace");
+  if (!workspace) throw new HTTPException(403, { message: "工作空间未授权" });
+  return workspace;
+}
 
 function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
   const user = c.get("user");
@@ -130,8 +144,9 @@ tunnelsRoutes.get("/", async (c) => {
   const user = requireUser(c);
   const { keyword, status, skip, take } = readPage(c);
 
+  const workspace = selectedWorkspace(c);
   const where = {
-    user_id: user.id,
+    workspace_id: workspace.id,
     ...(status ? { status: status as "active" | "inactive" } : {}),
     ...(keyword ? { name: { contains: keyword } } : {}),
   };
@@ -159,6 +174,9 @@ tunnelsRoutes.get("/", async (c) => {
 
 tunnelsRoutes.post("/", async (c) => {
   const user = requireUser(c);
+  const workspace = selectedWorkspace(c);
+  // Route-level check, independent of Hono mount-path normalization.
+  if (!canWorkspaceAction(workspace.role, "create")) return c.json({ error: "无权创建团队隧道" }, 403);
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
   if (!body || typeof body !== "object") return c.json({ error: "参数错误" }, 400);
 
@@ -170,7 +188,7 @@ tunnelsRoutes.post("/", async (c) => {
   if (!Number.isInteger(inGroupId)) return c.json({ error: "必须指定入口节点组" }, 400);
   const inGroup = await db.nodeGroup.findUnique({ where: { id: inGroupId } });
   if (!inGroup) return c.json({ error: "入口节点组不存在" }, 404);
-  if (inGroup.node_type !== "in" || !(await canUseNodeGroup(user.id, inGroup, "in")))
+  if (inGroup.node_type !== "in" || !(await canUseNodeGroup(user.id, inGroup, "in", workspace.id, workspace.personalWorkspaceId)))
     return c.json({ error: "无权使用入口节点组" }, 403);
 
   let outGroupId: number | null = null;
@@ -179,7 +197,7 @@ tunnelsRoutes.post("/", async (c) => {
     if (!Number.isInteger(parsed)) return c.json({ error: "出口节点组非法" }, 400);
     const outGroup = await db.nodeGroup.findUnique({ where: { id: parsed } });
     if (!outGroup) return c.json({ error: "出口节点组不存在" }, 404);
-    if (outGroup.node_type !== "out" || !(await canUseNodeGroup(user.id, outGroup, "out")))
+    if (outGroup.node_type !== "out" || !(await canUseNodeGroup(user.id, outGroup, "out", workspace.id, workspace.personalWorkspaceId)))
       return c.json({ error: "无权使用出口节点组" }, 403);
     outGroupId = outGroup.id;
   }
@@ -229,6 +247,7 @@ tunnelsRoutes.post("/", async (c) => {
       in_node_group_id: inGroup.id,
       out_node_group_id: outGroupId,
       user_id: user.id,
+      workspace_id: workspace.id,
     },
     include: {
       in_node_group: { select: { id: true, name: true, node_type: true } },
@@ -251,7 +270,7 @@ tunnelsRoutes.get("/:id/traffic", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, user_id: user.id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
 
   const days = Math.max(1, Math.min(90, Number(c.req.query("days") ?? 14) || 14));
@@ -302,7 +321,7 @@ tunnelsRoutes.get("/:id", async (c) => {
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
   const tunnel = await db.tunnel.findFirst({
-    where: { id, user_id: user.id },
+    where: { id, workspace_id: selectedWorkspace(c).id },
     include: {
       in_node_group: { select: { id: true, name: true, node_type: true } },
       out_node_group: { select: { id: true, name: true, node_type: true } },
@@ -319,11 +338,14 @@ tunnelsRoutes.get("/:id", async (c) => {
 
 tunnelsRoutes.patch("/:id", async (c) => {
   const user = requireUser(c);
+  const workspace = selectedWorkspace(c);
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, user_id: user.id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
+  if (!canWorkspaceAction(selectedWorkspace(c).role, "update", tunnel.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道" }, 403);
 
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
   if (!body || typeof body !== "object") return c.json({ error: "参数错误" }, 400);
@@ -341,7 +363,7 @@ tunnelsRoutes.patch("/:id", async (c) => {
     const gid = Number(body.in_node_group_id);
     const g = Number.isInteger(gid) ? await db.nodeGroup.findUnique({ where: { id: gid } }) : null;
     if (!g) return c.json({ error: "入口节点组不存在" }, 404);
-    if (g.node_type !== "in" || !(await canUseNodeGroup(user.id, g, "in")))
+    if (g.node_type !== "in" || !(await canUseNodeGroup(user.id, g, "in", workspace.id, workspace.personalWorkspaceId)))
       return c.json({ error: "无权使用入口节点组" }, 403);
     data.in_node_group_id = g.id;
   }
@@ -352,7 +374,7 @@ tunnelsRoutes.patch("/:id", async (c) => {
       const oid = Number(body.out_node_group_id);
       const g = Number.isInteger(oid) ? await db.nodeGroup.findUnique({ where: { id: oid } }) : null;
       if (!g) return c.json({ error: "出口节点组不存在" }, 404);
-      if (g.node_type !== "out" || !(await canUseNodeGroup(user.id, g, "out")))
+      if (g.node_type !== "out" || !(await canUseNodeGroup(user.id, g, "out", workspace.id, workspace.personalWorkspaceId)))
         return c.json({ error: "无权使用出口节点组" }, 403);
       data.out_node_group_id = g.id;
     }
@@ -449,8 +471,10 @@ tunnelsRoutes.post("/:id/toggle", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, user_id: user.id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
+  if (!canWorkspaceAction(selectedWorkspace(c).role, "update", tunnel.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道" }, 403);
 
   const next = tunnel.status === "active" ? "inactive" : "active";
   const updated = await db.tunnel.update({
@@ -477,8 +501,10 @@ tunnelsRoutes.post("/:id/reset-traffic", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, user_id: user.id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
+  if (!canWorkspaceAction(selectedWorkspace(c).role, "update", tunnel.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道" }, 403);
 
   const updated = await db.tunnel.update({
     where: { id: tunnel.id },
@@ -500,8 +526,10 @@ tunnelsRoutes.delete("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, user_id: user.id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
+  if (!canWorkspaceAction(selectedWorkspace(c).role, "delete", tunnel.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道" }, 403);
 
   await db.$transaction([
     db.tunnelChain.deleteMany({ where: { tunnel_id: tunnel.id } }),

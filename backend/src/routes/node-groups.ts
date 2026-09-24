@@ -15,12 +15,19 @@
  * 可见范围：仅自有或显式授权节点组；不通过套餐隐式授权。
  */
 import { Hono } from "hono";
+import { z } from "zod";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
+import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const nodeGroupsRoutes = new Hono<{ Variables: AppVariables }>();
+
+nodeGroupsRoutes.use("*", async (c, next) => {
+  c.set("workspace", await resolveWorkspaceAccess(c, c.req.method === "POST" ? "manage" : "read"));
+  await next();
+});
 
 type Ctx = Context<{ Variables: AppVariables }>;
 
@@ -32,13 +39,19 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
 
 nodeGroupsRoutes.get("/", async (c) => {
   const user = requireUser(c);
+  const workspace = c.get("workspace")!;
 
   const q = c.req.query();
   const page = Math.max(1, Number(q.page ?? 1) || 1);
   const page_size = Math.min(200, Math.max(1, Number(q.page_size ?? 20) || 20));
   const keyword = String(q.keyword ?? "").trim();
   const where = {
-    OR: [{ user_id: user.id }, { grants: { some: { user_id: user.id, active: true } } }],
+    OR: [
+      { workspace_id: workspace.id },
+      ...(workspace.id === workspace.personalWorkspaceId
+        ? [{ grants: { some: { user_id: user.id, active: true } } }]
+        : []),
+    ],
     ...(keyword ? { name: { contains: keyword } } : {}),
   };
 
@@ -70,4 +83,31 @@ nodeGroupsRoutes.get("/", async (c) => {
   }));
 
   return c.json({ data: { data, total, page, page_size } });
+});
+
+const CreateNodeGroup = z.object({
+  name: z.string().trim().min(1).max(60),
+  node_type: z.enum(["in", "out"]),
+  port_range: z.string().regex(/^\d{1,5}-\d{1,5}$/).optional(),
+});
+
+/** Team owners/admins can deploy their own groups; the Agent token is shown only once. */
+nodeGroupsRoutes.post("/", async (c) => {
+  const user = requireUser(c);
+  const workspace = c.get("workspace")!;
+  const parsed = CreateNodeGroup.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "节点组名称、方向或端口范围不合法" }, 400);
+  const { name, node_type, port_range } = parsed.data;
+  if (port_range) {
+    const [start, end] = port_range.split("-").map(Number);
+    if (start < 1 || end > 65535 || start > end) return c.json({ error: "端口范围不合法" }, 400);
+  }
+  const group = await db.nodeGroup.create({
+    data: { name, node_type, port_range, workspace_id: workspace.id, user_id: user.id },
+    select: { id: true, name: true, node_type: true, token: true, workspace_id: true },
+  });
+  await db.auditEvent.create({
+    data: { workspace_id: workspace.id, actor_user_id: user.id, action: "node_group.created", resource_type: "node_group", resource_id: String(group.id) },
+  });
+  return c.json({ data: group }, 201);
 });

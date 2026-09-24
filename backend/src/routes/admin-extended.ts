@@ -42,6 +42,7 @@ import { HTTPException } from "hono/http-exception";
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { hashPassword, newApiKey } from "../auth.ts";
+import { createPersonalWorkspace } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import {
   collectAffectedNodeGroupsForUserDeletion,
@@ -250,6 +251,7 @@ adminExtendedRoutes.post("/users", async (c) => {
           api_key: newApiKey(),
         } as Prisma.UserUncheckedCreateInput,
       });
+      await createPersonalWorkspace(tx, user);
       if (passwordHash) {
         await tx.userCredential.create({ data: { user_id: user.id, password: passwordHash } });
       }
@@ -375,6 +377,10 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
   const target = await db.user.findUnique({ where: { id } });
   if (!target) return bad(c, "用户不存在", 404);
 
+  // Team assets must be transferred/revoked explicitly, never deleted with an account.
+  const teams = await db.workspaceMember.count({ where: { user_id: id, workspace: { kind: "team" } } });
+  if (teams) return bad(c, "请先退出或转移用户所在的团队空间", 409);
+
   const tunnelCount = await db.tunnel.count({ where: { user_id: id } });
   if (tunnelCount > 0) {
     return bad(c, `该用户仍有 ${tunnelCount} 条隧道，请先删除隧道`, 409);
@@ -406,6 +412,8 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     await tx.node.deleteMany({ where: { node_group: { user_id: id } } });
     await tx.planNodeGroup.deleteMany({ where: { node_group: { user_id: id } } });
     await tx.nodeGroup.deleteMany({ where: { user_id: id } });
+    // Personal workspace records cascade after owned assets are removed.
+    await tx.workspace.deleteMany({ where: { personal_user_id: id } });
 
     // 财务记录
     await tx.userPlan.deleteMany({ where: { user_id: id } });
@@ -666,10 +674,12 @@ adminExtendedRoutes.post("/node-groups", async (c) => {
   const trafficRate = numOrNull(body.traffic_rate);
   if (trafficRate !== null && trafficRate < 0) return bad(c, "流量倍率不合法");
 
+  const personalWorkspace = await db.workspace.findUniqueOrThrow({ where: { personal_user_id: actor.id } });
   const created = await db.nodeGroup.create({
     data: {
       name,
       user_id: actor.id,
+      workspace_id: personalWorkspace.id,
       ...(token !== null ? { token } : {}),
       node_type: nodeType ?? "in",
       load_balance_type: loadBalance ?? "round",
