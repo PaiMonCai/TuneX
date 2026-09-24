@@ -231,4 +231,4 @@ TuneX 能称为“个人与团队 SaaS Beta”的条件不是把原项目换一�
 - 已移除后台 RBAC、API Key、工单对商业 License 的闸门；**只解决平台级权限的一部分**，workspace 角色矩阵尚未开始，AUTHZ-01 未完成。
 - 新增按用户/节点组/入口或出口的 NodeGroupGrant 迁移和管理端授权接口；隧道创建、修改和配置下发按所有权或显式授权检查；无套餐用户的自有隧道不再被配置生成跳过。当前仍保留 UserPlan 的历史额度限制，CapabilityPolicy/WorkspacePolicyAssignment/工作空间隔离尚未完成，AUTHZ-02 未完成。旧套餐中共享节点组关系**不会自动升级**为显式授权，管理员必须审核后逐项发放。
 - 支付默认关闭；服务端拦截支付写入口和网关回调，历史记录读取保留；前端默认隐藏购买/充值导航。PAY-01 仍需真实 HTTP、伪造回调及 worker 验收（worker 现为占位骨架）。
-- 已增加 `.github/workflows/ci.yml`，包含 Linux MySQL 空库迁移、后端/前端与 Go 门槛；**CI 尚待远端实际运行验收**。已验证：Prisma Schema validate/generate、与旧 Schema 对比的迁移 SQL、Backend tsc、Web tsc/生产构建、Node 策略单测、多跳节点授权测试及 Hono 支付回调 HTTP 冒烟测试。未验证：**真实 MySQL 空库迁移**、Linux 多节点、双租户 E2E、支付开启场景及备份恢复；不得将以上标记为 SaaS Beta 验收通过。本机无 Docker CLI。
+- 已增加 `.github/workflows/ci.yml`，提交 `d39465a` 的 GitHub Actions 运行 `35958068306` 三个作业（backend/web/agent）全部成功：MySQL 8.4 空库迁移、Prisma 生成与类型检查、支付/授权测试、Web 生产构建、Go vet/test/build。另本机已验证 Prisma Schema 与迁移差异、Backend tsc、Web 构建及策略/HTTP 冒烟。未验证：**既有生产库升级与回滚**、Linux 多节点、双租户 E2E、支付开启场景及备份恢复；不得将以上标记为 SaaS Beta 验收通过。本机无 Docker CLI。
