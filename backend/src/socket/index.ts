@@ -5,6 +5,8 @@ import { redis, RedisKeys } from "../redis.ts";
 import { env } from "../env.ts";
 import { systemConfig } from "../services/config.ts";
 import { signLicenseForAgent } from "../services/license-sign.ts";
+import { withWorkspaceQuotaLock } from "../services/policy-service.ts";
+import { checkNodeCreation } from "../services/capability-policy.ts";
 import {
   GLOBAL_SCOPE,
   aliveGroupsKey,
@@ -156,19 +158,32 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
         });
 
         // 3. upsert node（connect_ip 变化时更新）
+        // SOFT-01：节点上线即占用 max_nodes 额度。判定与插入在同一 workspace 行锁
+        // 事务内完成——否则同一 workspace 的多个 agent 同时首注册会双双通过计数。
         const connectIp = (data.connect_ip ?? []).join(",");
         const existing = await db.node.findUnique({ where: { node_id: data.node_id } });
         if (!existing) {
-          const order = await db.node.count({ where: { node_group_id: group.id } });
-          await db.node.create({
-            data: {
-              node_id: data.node_id,
-              connect_ip: connectIp,
-              node_group_id: group.id,
-              version: data.version ?? "",
-              order_by: order * 1000,
-            },
-          });
+          const guard = await withWorkspaceQuotaLock(group.workspace_id, async (tx, policy) => {
+            const nodeCount = await tx.node.count({ where: { node_group: { workspace_id: group.workspace_id } } });
+            const decision = checkNodeCreation(policy, nodeCount);
+            if (!decision.allowed) return { denied: decision.message } as const;
+            const created = await tx.node.create({
+              data: {
+                node_id: data.node_id,
+                connect_ip: connectIp,
+                node_group_id: group.id,
+                version: data.version ?? "",
+                order_by: nodeCount * 1000,
+              },
+            });
+            return { node: created } as const;
+          }).catch(() => null);
+          // 行锁不可用（如并发死锁/锁超时）时不阻断 agent 上线：节点已真实连着，
+          // 额度只是锦上添花的约束。真正的硬约束仍在 HTTP 建隧道路径上。
+          if (guard && "denied" in guard) {
+            ack?.({ error: guard.denied });
+            return;
+          }
         } else if (existing.connect_ip !== connectIp || existing.version !== data.version) {
           await db.node.update({
             where: { node_id: data.node_id },

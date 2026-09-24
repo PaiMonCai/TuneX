@@ -182,14 +182,14 @@ RelayX 的[产品功能概览](https://docs.relayx.cc/guide/intro/)、[版本对
 | NET-02 | P0 | ✅ 完成 | 幂等配置 ACK、冲突处理、监听失败反馈 | `socket/listen-events.ts`、`port-allocator.ts`、`config-pusher.ts` | 离线测试 30+ 用例全过 |
 | AUTHZ-01 | P0 | ✅ 完成 | RBAC 去商业授权闸门，建立 workspace 角色/资源/动作矩阵 | `middlewares/auth.ts`、`services/node-group-policy.ts` | 未付费 owner 按角色管理资源，CI 通过 |
 | AUTHZ-02 | P0 | ✅ 完成 | CapabilityPolicy + Assignment + NodeGroupGrant，替换 UserPlan 过滤依赖 | `services/capability-policy.ts`、`policy-service.ts`、`socket/config-generator.ts` | 策略体系与 NodeGroupGrant ✅；config-generator 的 user_plan 依赖替换 ✅ |
-| SOFT-01 | P0 | 🟡 大部分 | 策略额度原子判定、到期/流量耗尽处理 | `services/policy-service.ts`（FOR UPDATE 并发锁已实现） | 服务层就绪；**路由接线与并发用例待收尾** |
+| SOFT-01 | P0 | ✅ 完成 | 策略额度原子判定、到期/流量耗尽处理 | `services/policy-service.ts`、`services/capability-policy.ts`、`routes/tunnels.ts`、`routes/node-groups.ts`、`routes/workspaces.ts`、`socket/index.ts` | 服务层就绪 ✅；路由接线 ✅（隧道创建/节点注册建节点/成员邀请/自定义节点组均包进 `withWorkspaceQuotaLock` 行锁事务，判定与插入同事务，403 + 具体原因）；并发用例 ✅（`policy-concurrency.test.ts` 4/4：有行锁不超发、无行锁超发反面对照、达上限中文文案、撤权立即生效；真实 MySQL 探针 10 并发恰好落库 2 条） |
 | PAY-01 | P0 | ✅ 完成 | 关闭支付写入口和回调但保留历史数据 | `middlewares/payments-gate.ts`、前端开关 | 直接调用与伪造回调均 403，CI 通过 |
-| OPS-01 | P0 | 🟡 部分 | 离线状态、流量聚合与任务幂等 | `worker.ts`、`socket/offline-detector.ts` | 离线检测闭环 ✅；**流量入库/聚合仍空壳** |
+| OPS-01 | P0 | ✅ 完成 | 离线状态、流量聚合与任务幂等 | `worker.ts`、`socket/offline-detector.ts`、`services/traffic-archive.ts` | 离线检测闭环 ✅；流量入库/聚合 ✅ |
 | QA-01 | P0 | ✅ 完成 | Linux CI、空库升级迁移、双租户网络+浏览器 E2E | `.github/workflows/ci.yml` | 真实 MySQL CI + 秘密扫描 + GHCR 镜像 ✅；**双租户 E2E 待做** |
 | OPS-02 | P1 | ⚪ 未开始 | SaaS 部署/备份/告警/容量基线与回滚 | Compose 生产配置、Caddy、文档 | GHCR 预构建镜像已就位；备份/告警待做 |
 | TEAM-01 | P1 | ⚪ 未开始 | 自定义团队角色与细粒度审计（基础权限先在 P0 落地） | Prisma、后台权限、Web 设置 | 固定四角色已落地 |
 | BILL-01 | P2 | ⚪ 未开始 | 独立可选计费适配层（有需求后再排） | 不污染核心隧道域 | 支付关闭状态已满足前置 |
-| OPS-03 | P0 | ⚪ 新增 | 流量计量链路：agent 上报 → Redis 缓冲 → MySQL 入库 → 按 workspace 聚合展示 | `worker.ts` cron_save_traffic、`services/`、Web 仪表盘 | 采集入库不重复，聚合口径与策略流量一致 |
+| OPS-03 | P0 | ✅ 完成 | 流量计量链路：agent 上报 → Redis 缓冲 → MySQL 入库 → 按 workspace 聚合展示 | `worker.ts` cron_save_traffic、`services/traffic-archive.ts`、`services/traffic.ts`、`routes/public.ts`、`routes/workspaces.ts`、`__tests__/traffic-pipeline.test.ts` | 采集入库不重复 ✅，聚合口径与策略流量一致 ✅；Web 展示待后续工作包 |
 | TEN-03 | P0 | ✅ 完成 | 邮箱验证与密码重置 | `routes/auth.ts`、`services/mail.ts`、`services/mail-tokens.ts`、`web/src/app/forgot-password`、`web/src/app/reset-password` | 注册验证邮件 ✅、重置链接单次使用/过期 ✅ |
 
 每个工作包需写清：状态迁移、API 契约、跨租户负面用例、可观测性、开发配置、回滚方法。P0 未完成不可公开对外提供多租户服务。
