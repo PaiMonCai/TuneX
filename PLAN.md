@@ -4,7 +4,7 @@
 > 产品决策：**TuneX 是多租户 SaaS**；个人用户和团队共享托管控制面，部署自己的节点。产品以隧道可用性、协作与资源管理为核心；支付等强商业模块降级为可选扩展，默认关闭，**不是删除项目的 SaaS 属性**。
 > `DEVELOPMENT.md` 是现有实现/运维记录；`reports/` 中的结论须重测。方案执行中，每个阶段完成后回填本文件的验收状态。
 >
-> **2026-09-24 进度回填**：SEC-01/SEC-02/TEN-01（后端）/TEN-02（部分）/AUTHZ-01/AUTHZ-02（策略体系与 config-generator 的 user_plan 依赖替换均已完成）/PAY-01/QA-01 已完成并合入 main（CI 全绿，含真实 MySQL 迁移验证）；详见 `reports/tunex-vs-relayx-diff.md` 与 §6 工作包状态列。**重要修正**：原版 RelayX 的 agent 数据面同样只有裸 TCP/UDP，mtls/quic 等协议枚举两边均未实现——差距在流量计量与验证深度，不在协议引擎。
+> **2026-09-24 进度回填**：SEC-01/SEC-02/TEN-01（后端 + 前端）/TEN-02（部分）/AUTHZ-01/AUTHZ-02（策略体系与 config-generator 的 user_plan 依赖替换均已完成）/PAY-01/QA-01 已完成并合入 main（CI 全绿，含真实 MySQL 迁移验证）；详见 `reports/tunex-vs-relayx-diff.md` 与 §6 工作包状态列。**重要修正**：原版 RelayX 的 agent 数据面同样只有裸 TCP/UDP，mtls/quic 等协议枚举两边均未实现——差距在流量计量与验证深度，不在协议引擎。
 
 ## 1. 产品定位、场景与边界
 
