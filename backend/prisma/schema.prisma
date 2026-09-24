@@ -69,6 +69,7 @@ model Workspace {
   node_groups      NodeGroup[]
   tunnels          Tunnel[]
   policy_assignments WorkspacePolicyAssignment[]
+  custom_roles     WorkspaceCustomRole[]
 
   @@map("workspace")
 }
@@ -79,14 +80,53 @@ model WorkspaceMember {
   workspace    Workspace     @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
   user_id      Int
   user         User          @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  /// 基础角色（始终非空）：自定义角色未生效时的回落值，也是「越权判定」的兜底。
+  /// role_id 为 NULL 时它单独决定权限；非空时权限由 custom_role.permissions 决定，
+  /// 本列退化为 fail-closed 的兜底（自定义角色被删时回落，见迁移里的 SET NULL）。
   role         WorkspaceRole
+  /// TEAM-01：自定义角色外键。NULL = 使用固定四角色；非空 = 以自定义角色权限为准。
+  /// 用外键而不是把 `custom:<id>` 塞进 role 枚举列：枚举列改字符串会破坏全仓
+  /// `role === "owner"` 的类型与比较，且悬挂字符串等于「无权限」而非报错。
+  role_id      Int?
+  custom_role  WorkspaceCustomRole? @relation(fields: [role_id], references: [id], onDelete: SetNull)
   active       Boolean       @default(true)
   created_at   DateTime      @default(now())
   updated_at   DateTime      @updatedAt
 
   @@unique([workspace_id, user_id])
   @@index([user_id, active])
+  @@index([role_id])
   @@map("workspace_member")
+}
+
+/// TEAM-01 自定义团队角色：在固定四角色之上按「资源 × 动作」细粒度授权。
+///
+/// 权限模型（services/workspace.ts 的 WORKSPACE_PERMISSIONS 为单一真相源）：
+///   tunnel:read / tunnel:create / tunnel:update / tunnel:delete
+///   node:read / node:manage
+///   member:read / member:manage
+///   settings:read / settings:manage
+///   audit:read
+///
+/// 存储形态是**白名单后的布尔映射**（未知键在写入前被丢弃，与 permissions.ts 的
+/// sanitizePermissions 同取向），因此 permissions 里只会出现上表 11 个键。
+/// 判定侧对「缺键 / 非布尔 / 角色不存在」一律 fail-closed（拒绝），不默认放行。
+model WorkspaceCustomRole {
+  id            Int              @id @default(autoincrement())
+  workspace_id  Int
+  workspace     Workspace        @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  name          String           @db.VarChar(60)
+  description   String?          @db.VarChar(255)
+  permissions   Json
+  created_by_id Int
+  created_by    User             @relation("WorkspaceCustomRoleCreator", fields: [created_by_id], references: [id], onDelete: Cascade)
+  created_at    DateTime         @default(now())
+  updated_at    DateTime         @updatedAt
+  members       WorkspaceMember[]
+
+  @@unique([workspace_id, name])
+  @@index([workspace_id])
+  @@map("workspace_custom_role")
 }
 
 model WorkspaceInvite {
@@ -419,6 +459,7 @@ model User {
   personal_workspace       Workspace?       @relation("PersonalWorkspace")
   workspace_memberships    WorkspaceMember[]
   node_group_grants        NodeGroupGrant[]
+  created_custom_roles     WorkspaceCustomRole[] @relation("WorkspaceCustomRoleCreator")
   status                   Status             @default(active)
   created_at               DateTime           @default(now())
   updated_at               DateTime           @updatedAt
