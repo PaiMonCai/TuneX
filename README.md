@@ -407,15 +407,15 @@ TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
 
 TuneX 的部分产品场景和历史兼容行为参考了 RelayX 的公开产品/部署资料，但 TuneX 的目标是独立实现个人与团队多租户 SaaS 控制面，不是 RelayX 的分发版，也不应依赖其固定密钥、授权机制或未确认来源的资产。
 
-相关来源、差异与迁移风险记录在 [PLAN.md](PLAN.md) 和 [reports/](reports/) 中。
+后续开发方向统一记录在 [DEVELOPMENT.md](DEVELOPMENT.md)；历史验证、差异与测试证据保留在 [reports/](reports/) 中。
 
 ## 文档
 
-- [PLAN.md](PLAN.md)：产品定位、路线图、工作包和发布门槛
-- [DEVELOPMENT.md](DEVELOPMENT.md)：开发规范、Agent/Socket 协议、常见坑
+- [DEVELOPMENT.md](DEVELOPMENT.md)：**唯一开发方案**；后续 v3 阶段、迁移规则、DoD 与工程约束均以此为准
+- [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：v3 目标架构约束，不作为第二套执行路线
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署/备份/恢复/回滚/告警运维手册
-- [scripts/net01-e2e/README.md](scripts/net01-e2e/README.md)：NET-01 网络 E2E
-- [reports/](reports/)：历史验证、差异分析和测试证据
+- [scripts/net01-e2e/README.md](scripts/net01-e2e/README.md)：NET-01 网络 E2E 工具说明
+- [reports/](reports/)：历史验证、差异分析和测试证据，不作为未来路线
 
 ## 贡献流程
 
