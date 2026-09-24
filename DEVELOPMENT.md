@@ -354,7 +354,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP | 工作包 | Track | 可以开始开发 | 可以合并 main |
 |---|---|---|---|---|
 | WP0 | 架构/文档冻结 | Shared | 已完成 | ✅ 已完成 |
-| WP1 | v3 Schema 契约 | A | WP0 | ✅ 已完成（PR #10） |
+| WP1 | v3 Schema 契约 | A | WP0 | ✅ 已完成（分支 `feature/v3-wp1-schema` 已 push，CI 全绿） |
 | WP2 | Legacy Backfill / Upgrade | A | WP1 schema 设计冻结后 | **WP1 已合并** |
 | WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | **WP1 已合并** |
 | WP4 | Agent v3 Runtime 骨架 | B | WP0；不依赖 DB 实现 | WP1 已合并或确认无 schema 耦合 |
@@ -434,6 +434,11 @@ WP1 已合并，Prisma 类型已生成，可按最终字段开发；仍需满足
 ```
 
 WP1 已合并（见 §7.4），WP2 + WP3 已解锁；WP5/WP7/WP8 的合并门槛不变。
+
+> 注：本节措辞里的「已合并」指代码已交付并 CI 全绿。WP1 尚未由 maintainer
+> 合入 `main`——本仓库的 PAT 无建 PR 权限，需在 Web 端开
+> `feature/v3-wp1-schema → main` 的 PR。合入前 WP2/WP3 的 PR 可以开发评审，
+> 但按 §7.2 的硬门槛不得合入 main。
 
 ---
 
