@@ -316,791 +316,621 @@ NodePortLease
 
 ---
 
-## 7. 固定开发执行流水线
+## 7. 并行开发执行矩阵
 
-> **本节不是建议顺序，而是强制执行顺序。**
+> **本节是强制开发编排规则。**
 >
-> 后续所有开发都必须从当前步骤向下推进。除安全漏洞、主支阻断性 bug 外，**Step N 未合并到 main 且 main CI 未全绿，不得开始 Step N+1**。
+> TuneX v3 不采用“全团队 Step N 做完才能开始 Step N+1”的单线程模式。后续采用：
 >
-> 每一步都从最新 `main` 新建分支；通过评审和完整 CI 后 squash merge；合并后再创建下一步分支。禁止长期堆积多个相互依赖的未合并功能分支。
+> **契约先冻结 → 多工作流并行开发 → 依赖门控合并 → 集成 Gate 验收。**
+>
+> Step 编号继续保留，但它表示 **Work Package（WP，工作包）ID**，不是全团队唯一执行游标。
+>
+> 核心原则：
+>
+> - **可以并行开发，不代表可以无依赖合并。**
+> - 每个 WP 只对自己的范围负责。
+> - 依赖未满足时，PR 可以提前开发、提前评审，但必须标记 blocked，不得合入 main。
+> - 合并前必须基于最新 main rebase/merge-base 校验，并重新跑完整 CI。
+> - 任何共享契约一旦冻结，修改它必须显式通知所有依赖 Track，并更新本文件。
 
-### 7.1 总顺序
+### 7.1 四条长期并行 Track
 
-| Step | 对应阶段 | 目标 | 主要产物 |
-|---|---|---|---|
-| 0 | S0 | 架构与文档冻结 | 本文件 + v3map 约束 |
-| 1 | S1-A | 定义 v3 数据模型 | Prisma schema + additive migration |
-| 2 | S1-B | 存量数据回填与升级验证 | legacy fixture + backfill tests |
-| 3 | S2 | 统一物理端口所有权 | NodePortLease + allocator service |
-| 4 | S3-A | Agent 运行时骨架 | Forwarder / TunnelManager / EgressManager |
-| 5 | S3-B | TCP RELAY 数据面 | RelayForwarder / EgressForwarder + 本地网络测试 |
-| 6 | S4-A | v3 命令协议 | command envelope + revision + ACK |
-| 7 | S4-B | 节点身份与重连 | per-node credential + state report + replay |
-| 8 | S5-A | 调度与 RELAY 编排 | scheduler + orchestrator |
-| 9 | S5-B | Reconciler 与恢复 | retry / reconcile / restart recovery |
-| 10 | S6-A | 管理端 Node/Egress API | role / pool / target CRUD |
-| 11 | S6-B | 用户 Tunnel API | direct/relay create/update/retry/suspend |
-| 12 | S7-A | 管理端 Web | Node role + Egress target UI |
-| 13 | S7-B | 用户 Tunnel Web | DIRECT/RELAY UI + runtime state |
-| 14 | S8 | 三机真实 E2E 与灰度 | real network acceptance + relay flag |
-| 15 | S9 | DIRECT v3 化 | DIRECT 迁入统一 runtime |
-| 16+ | S10 | 协议与高级能力 | UDP → WS/TLS → QUIC → advanced LB → DNS → HA → multi-hop |
+TuneX v3 团队按以下 Track 并行推进：
 
-下面每一步都定义“允许做什么”和“禁止顺手做什么”。
+| Track | 负责范围 | 主要目录 |
+|---|---|---|
+| **Track A — Data / Backend Foundation** | Schema、迁移、端口所有权、基础服务 | `backend/prisma`、`backend/src/services` |
+| **Track B — Agent / Data Plane** | Agent runtime、RELAY、协议执行、运行态 | `agent/` |
+| **Track C — Control Plane / API** | 控制协议、节点会话、编排、Reconciler、API | `backend/src/socket`、`backend/src/routes`、相关 services |
+| **Track D — Web / QA / Release** | 管理端/用户端 UI、E2E、灰度、发布验收 | `web/`、`scripts/`、CI、reports |
 
----
-
-### Step 0 — 文档与架构冻结
-
-**状态：✅ 已完成。**
-
-已经完成：
-
-- `DEVELOPMENT.md` 成为唯一开发方案。
-- `docs/tunex-devmap-v3.md` 只作为目标约束。
-- 删除旧 `PLAN.md` 和旧 migration plan。
-- 固化 v3 的关键原则：
-  - Node role 是节点能力真相源；
-  - Tunnel 持久绑定 ingress / egress Node；
-  - 端口物理唯一；
-  - desired state + revision + ACK；
-  - Agent 主动出站连接控制面；
-  - RELAY 先出口后入口；
-  - 数据库 expand-and-contract。
-
-**进入 Step 1 的条件：** main CI 全绿。
+同一时间允许多个 Track 活跃，只要满足依赖矩阵。
 
 ---
 
-### Step 1 — V3-S1A：只建立 v3 Schema
+### 7.2 Work Package 依赖矩阵
 
-**建议分支：** `feature/v3-s1a-schema`
+| WP | 工作包 | Track | 可以开始开发 | 可以合并 main |
+|---|---|---|---|---|
+| WP0 | 架构/文档冻结 | Shared | 已完成 | ✅ 已完成 |
+| WP1 | v3 Schema 契约 | A | WP0 | WP0 |
+| WP2 | Legacy Backfill / Upgrade | A | WP1 schema 设计冻结后 | **WP1 已合并** |
+| WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | **WP1 已合并** |
+| WP4 | Agent v3 Runtime 骨架 | B | WP0；不依赖 DB 实现 | WP1 已合并或确认无 schema 耦合 |
+| WP5 | TCP RELAY Data Plane | B | **WP4 接口冻结** | WP4 已合并 |
+| WP6 | v3 Command / Revision / ACK 协议 | B/C | WP0；协议字段冻结即可 | WP1 已合并；WP4 接口兼容 |
+| WP7 | Node Credential / Session / State Report | B/C | WP6 协议冻结 | WP6 已合并 |
+| WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并** |
+| WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
+| WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并 |
+| WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并** |
+| WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | WP10 已合并 |
+| WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | WP11 已合并 |
+| WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | **WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 + WP13 已合并** |
+| WP15 | DIRECT v3 Migration | B/C | WP14 验收方案冻结 | WP14 验收通过 |
+| WP16+ | UDP / WS/TLS / QUIC / Advanced | 多 Track | WP14 后按独立 RFC/contract | 各自前置 Gate 通过 |
 
-**目标：** 先把以后所有模块依赖的数据契约定死，不写业务编排。
-
-#### 只允许修改
-
-- `backend/prisma/schema.prisma`
-- 新 Prisma migration
-- 必要的 migration fixture 定义
-- 与 schema 编译直接相关的类型测试
-
-#### 必须新增
-
-**Node：**
-
-- `role: ingress | egress | both`
-- credential hash / credential version / revoked_at（具体字段名可按现有 user-key 设计统一）
-- `last_seen_at` 若当前模型没有可靠运行态时间
-
-**Tunnel：**
-
-- `tunnel_mode: direct | relay`
-- `ingress_node_id`
-- `egress_node_id`
-- `egress_pool_id`
-- `ingress_port`
-- `egress_port`
-- `desired_status`
-- `apply_status`
-- `config_revision`
-- `applied_revision`（若决定放运行态表，需在本步一次定型）
-- `apply_error_code`
-- `apply_error`
-- `last_applied_at`
-
-**新增模型：**
-
-- `EgressPool`
-- `EgressTarget`
-- `NodePortLease`
-
-#### Schema 硬约束
-
-- `NodePortLease @@unique([node_id, port])`
-- 一个 `EgressPool` 只能属于一个 Node。
-- Tunnel 的 ingress/egress 外键必须能明确恢复实际运行实例。
-- DIRECT 允许 `egress_node_id / egress_pool_id / egress_port = null`。
-- RELAY 所需字段是否暂时 nullable 由迁移兼容决定，但服务层最终必须校验完整。
-- 所有新增列/表都是 additive，不删除旧列，不改旧 DIRECT 的实际行为。
-
-#### 本步禁止
-
-- 不写 Agent。
-- 不写 port allocator。
-- 不改 Tunnel API 行为。
-- 不改 Web。
-- 不启用 RELAY。
-- 不改现有 DIRECT config-generator。
-
-#### DoD
-
-- 空库 `prisma migrate deploy` 通过。
-- `prisma generate` / `tsc --noEmit` 通过。
-- migration 不 DROP 任何 legacy 列。
-- schema review 明确所有唯一约束与 onDelete 行为。
-- main CI 全绿后才能进入 Step 2。
+**重要：** “可以开始开发”是允许团队成员创建分支、写代码、开 Draft PR；“可以合并 main”才是硬门槛。
 
 ---
 
-### Step 2 — V3-S1B：存量数据回填与升级兼容
+### 7.3 当前并行开发窗口
 
-**建议分支：** `feature/v3-s1b-backfill`
+当前已完成 WP0，**WP1 尚未完成**。
 
-**目标：** 证明真实旧库能安全升级，而不是只证明空库能创建。
+所以现在团队可以同时启动：
 
-#### 主要工作
+#### Track A
+`feature/v3-wp1-schema`
 
-- 扩展现有 `tests/fixtures/create-upgrade-db.sql` 或增加专用 v3 legacy fixture。
-- 回填存量 Tunnel：
-  - `tunnel_mode = direct`
-  - 保留原 listen/forward 语义
-  - 不凭空指定错误的 ingress Node
-- 回填 Node.role：
-  - 能根据旧 `NodeGroup.node_type` 唯一确定的才自动映射；
-  - 无法确定的保持需要管理员确认的安全状态；
-  - 不允许“猜” BOTH。
-- 为已有入口监听建立兼容端口占用基线；如果此时不正式写 NodePortLease，则必须留下明确迁移标记供 Step 3 接管。
-- 写升级巡检 SQL / 自动测试。
+负责 WP1，优先级最高，是当前唯一 Foundation Gate。
 
-#### 必须验证
+#### Track B
+`feature/v3-wp4-agent-runtime`
 
-升级前后：
+可以同步开发 Agent runtime 骨架，但必须满足：
 
-- Tunnel 总数相同。
-- ACTIVE DIRECT 数量相同。
-- 原 listen_port 不变化。
-- `forward_addresses` 不变化。
-- Workspace / user / policy 外键关系不变化。
-- 旧 Agent 继续能读到旧配置。
+- 不依赖未落库的具体 Prisma 字段。
+- 不改 legacy DIRECT 行为。
+- runtime interface 使用 v3map / DEVELOPMENT 已冻结的语义。
+- 如果最终需要 WP1 字段生成类型，则 PR 标记 `blocked-by: WP1`，WP1 合并后 rebase 再合。
 
-#### 本步禁止
+#### Track C
+`feature/v3-wp6-control-contract`
 
-- 不让新字段参与运行时选择。
-- 不切控制通道。
-- 不开始 RELAY。
+可以同步定义：
 
-#### DoD
+- command envelope；
+- revision 语义；
+- ACK/error contract；
+- transport-agnostic types/tests。
 
-至少同时通过：
+但暂不实现最终 orchestrator，不要求 Panel 主动连 Agent。
 
-1. 空库 migrate；
-2. 当前 CI legacy fixture migrate；
-3. v3 特殊 legacy fixture migrate；
-4. upgrade verification script；
-5. 完整 backend tests。
+#### Track D
+`test/v3-wp14-e2e-harness`
 
-通过后，**v3 schema 才算真正成立**。
+可以提前搭建不依赖功能实现的测试基础设施：
 
----
+- 三机拓扑脚本；
+- Target A/B 测试服务；
+- NAT/仅出站 Agent 场景；
+- 日志/指标采集；
+- E2E fixture。
 
-### Step 3 — V3-S2：统一物理端口所有权
+该分支不得伪造“功能已通过”，只交付测试 harness。
 
-**建议分支：** `feature/v3-s2-port-lease`
-
-**目标：** 在任何 RELAY 代码出现之前，先解决“哪个 Node 的哪个端口属于谁”。
-
-#### 实现
-
-新增类似：
-
-`backend/src/services/node-port-lease.ts`
-
-核心 API 应保持小而稳定：
-
-- `acquire(nodeId, tunnelId, kind, range, preferred?)`
-- `release(...)`
-- `renew/reserve(...)`
-- `holder(nodeId, port)`
-- `reconcile(...)`
-
-#### 一致性规则
-
-- DB `UNIQUE(node_id, port)` 是最终真相。
-- Redis NX 用于并发优化，不替代 DB 唯一约束。
-- ingress 与 egress **不能分物理 namespace**。
-- BOTH Node 的同一 port 永远只能有一个 listener owner。
-- 用户指定端口和自动分配端口必须走同一服务。
-- PORT_BLACKLIST 统一定义，API 与 service 双重检查。
-
-#### 存量处理
-
-- 已运行的 legacy DIRECT 端口不能被新分配器抢占。
-- 可以通过初始化 lease、legacy reservation 或查询兼容层实现，但最终不能存在两个 allocator 都认为自己有分配权。
-
-#### 测试
-
-- 100+ 并发申请同一小区间不重复。
-- Redis 丢锁时 DB unique 仍能兜底。
-- ingress/egress 同 Node 同 port 冲突。
-- 不同 Node 同 port 合法。
-- release 只能释放自己的 lease。
-- crash 后 reconcile 能识别孤儿 lease。
-
-#### 本步禁止
-
-- 不写 RELAY forwarder。
-- 不改 Web。
-- 不切 DIRECT。
-
----
-
-### Step 4 — V3-S3A：Agent v3 Runtime 骨架
-
-**建议分支：** `feature/v3-s3a-agent-runtime`
-
-**目标：** 建立新 Agent runtime 的内部边界，但先不做完整 RELAY 网络链路。
-
-#### 新模块
-
-建议：
+**当前建议团队分工：**
 
 ```text
-agent/internal/v3/
-├─ forwarder/
-│  └─ interface.go
-├─ manager/
-│  ├─ tunnel.go
-│  ├─ egress.go
-│  └─ ports.go
-└─ state/
-   └─ revision.go
+开发者 A → WP1 Schema
+开发者 B → WP4 Agent Runtime
+开发者 C → WP6 Control Contract
+开发者 D → WP14 E2E Harness / QA infrastructure
 ```
 
-允许根据当前仓库组织调整目录，但职责不能混回 legacy engine。
-
-#### 本步实现
-
-- Forwarder interface：Start / Stop / Stats / Mode。
-- TunnelManager：按 tunnel_id 管理运行实例。
-- EgressManager：管理目标池 snapshot。
-- 本地 used-port 二次保护。
-- revision state 存储接口。
-- graceful stop 与进程退出清理。
-
-#### 本步禁止
-
-- 不接 Panel command。
-- 不改 Socket.IO 协议。
-- 不改 legacy engine。
-- 不写 Web/API。
-
-#### DoD
-
-Go 单测覆盖：
-
-- Add / duplicate Add；
-- Stop 幂等；
-- 同 port 冲突；
-- manager 并发安全；
-- stale revision 状态接口。
+WP1 合并后立即扩展并行窗口到 WP2 + WP3，同时 B/C Track 继续推进。
 
 ---
 
-### Step 5 — V3-S3B：TCP RELAY 数据面
+### 7.4 WP1 — v3 Schema 契约
 
-**建议分支：** `feature/v3-s3b-relay-dataplane`
+**Track：A**
 
-**目标：** 不依赖控制面，先证明 Agent 数据面本身正确。
+目标：一次定清后续所有模块依赖的数据结构。
 
-#### 实现
+必须包含：
 
-- RelayForwarder：
-  `listen ingressPort → dial egress nextHop`
-- EgressForwarder：
-  `listen egressPort → choose target → dial target`
-- 双向 copy + cancellation。
-- round / rand / weighted_round。
-- 目标池原子热更新。
+- Node.role = ingress / egress / both
+- per-node credential 所需字段
+- Tunnel.tunnel_mode
+- Tunnel.ingress_node_id
+- Tunnel.egress_node_id
+- Tunnel.egress_pool_id
+- Tunnel.ingress_port / egress_port
+- desired/apply 状态
+- config_revision / applied_revision
+- apply_error_code / apply_error / last_applied_at
+- EgressPool
+- EgressTarget
+- NodePortLease
+- `UNIQUE(node_id, port)`
 
-#### 本地验收拓扑
+只做 additive migration，不删除 legacy 字段，不改变现有 DIRECT runtime。
+
+DoD：
+
+- empty DB migrate；
+- Prisma generate；
+- backend typecheck；
+- schema review；
+- full CI green。
+
+---
+
+### 7.5 WP2 — Legacy Backfill / Upgrade
+
+**Track：A，可与 WP3/WP4/WP6 并行。**
+
+目标：证明现有数据库升级不破坏 DIRECT。
+
+必须验证：
+
+- 存量 Tunnel → direct；
+- tunnel 数量不变；
+- listen port 不变；
+- forward_addresses 不变；
+- workspace/user/policy 关系不变；
+- Node.role 只能做确定性回填，不能猜 BOTH；
+- 旧 Agent 仍能获取 legacy config。
+
+DoD：empty DB + legacy fixture + v3 upgrade fixture 全部通过。
+
+---
+
+### 7.6 WP3 — NodePortLease / Port Allocator
+
+**Track：A/C，可与 WP2/WP4/WP6 并行。**
+
+DB `UNIQUE(node_id, port)` 是最终真相；Redis NX 只做并发协调。
+
+必须实现：
+
+- acquire / release / holder / reconcile；
+- ingress/egress 共用同一物理 namespace；
+- BOTH Node 同 port 冲突；
+- legacy DIRECT port 不可被抢占；
+- user-specified port 与 auto port 走同一规则。
+
+DoD：
+
+- 并发分配无重复；
+- Redis 丢锁后 DB unique 兜底；
+- orphan lease 可 reconcile；
+- 完整 backend tests。
+
+---
+
+### 7.7 WP4 — Agent v3 Runtime 骨架
+
+**Track：B，可与 WP1/WP6 并行开发。**
+
+建立：
+
+- Forwarder interface
+- TunnelManager
+- EgressManager
+- local port guard
+- revision state interface
+- graceful stop
+
+禁止：
+
+- 不改 legacy engine；
+- 不接最终 Panel orchestration；
+- 不实现 Web/API。
+
+DoD：Go 单测覆盖 start/stop/idempotency/concurrency/stale revision state。
+
+---
+
+### 7.8 WP5 — TCP RELAY Data Plane
+
+**Track：B；依赖 WP4。**
+
+实现：
 
 ```text
-test client
-   ↓
-Ingress Agent process
-   ↓
-Egress Agent process
-   ↓
-Target A / Target B
+Client
+→ Ingress RelayForwarder
+→ Egress EgressForwarder
+→ Target Pool
 ```
 
-必须是实际 TCP socket，不允许只有 mock Conn。
+首批策略：
 
-#### DoD
+- round
+- rand
+- weighted_round
 
-- 大小数据双向收发正确。
-- 客户端主动断开无 goroutine 泄漏。
-- Target A 下线时错误可观测。
-- 热更新 target 不关闭 listener。
-- weighted_round 有统计测试。
-- BOTH 节点端口冲突被拒绝。
-- `go test -race` 若 CI 环境允许，应纳入该模块测试。
+必须支持 Target snapshot 热更新而不中断 listener。
+
+DoD：
+
+- 真实 TCP 双进程测试；
+- 双向大/小流量；
+- disconnect cleanup；
+- target fail 可观测；
+- hot update；
+- BOTH port conflict；
+- 无 goroutine 泄漏。
 
 ---
 
-### Step 6 — V3-S4A：结构化控制协议 + Revision + ACK
+### 7.9 WP6 — Command / Revision / ACK Contract
 
-**建议分支：** `feature/v3-s4a-control-protocol`
+**Track：B/C，可与 WP1/WP4 并行。**
 
-**目标：** 在现有 Agent 主动出站连接上增加 v3 命令协议，不建立 Panel→Agent 公网 HTTP 依赖。
+统一命令：
 
-#### 命令
+- apply_tunnel
+- remove_tunnel
+- update_targets
+- suspend_tunnel
+- state_request
+- command_ack
 
-至少：
-
-- `apply_tunnel`
-- `remove_tunnel`
-- `update_targets`
-- `suspend_tunnel`
-- `state_request`
-
-统一 envelope 必须包含：
+统一字段：
 
 - command_id
-- resource / resource_id
+- resource/resource_id
 - revision
 - action
 - expires_at
 - payload
-
-#### Agent ACK
-
-至少：
-
-- command_id
-- resource_id
-- received_revision
 - applied_revision
 - status
-- error_code
-- error
+- error_code/error
 
-#### 硬规则
+硬规则：
 
-- stale revision 拒绝。
-- equal revision 幂等 ACK。
-- newer revision 原子 apply。
-- 命令过期拒绝。
-- malformed payload fail closed。
-- apply 完成以后再更新 applied_revision。
+- stale revision reject；
+- equal revision idempotent ACK；
+- newer revision atomic apply；
+- expired command reject。
 
-#### 本步禁止
-
-- 还不由用户 API 直接创建 RELAY。
-- 不做最终 orchestrator。
-- 不做 Web。
+控制 transport 仍由 Agent 主动出站，不引入公网 Agent HTTP 管理依赖。
 
 ---
 
-### Step 7 — V3-S4B：节点身份、认证、重连与 State Report
+### 7.10 WP7 — Node Credential / Session / State Report
 
-**建议分支：** `feature/v3-s4b-node-session`
+**Track：B/C；依赖 WP6。**
 
-**目标：** 让“谁在连控制面”与“这台 Agent 当前真正运行什么”都可信。
+实现：
 
-#### 实现
+- per-node credential；
+- hash at rest；
+- rotate / revoke；
+- server-side node identity；
+- state report；
+- reconnect snapshot。
 
-- 每 Node 独立 credential。
-- credential hash at rest。
-- rotate / revoke。
-- Agent handshake 由 credential 映射到 server-side Node identity。
-- 不信任 payload 自报 node_id。
-- Agent 周期 state report：
-  - version
-  - role
-  - active tunnel ids
-  - active ports
-  - applied revisions
-- reconnect 后控制面获得完整 runtime snapshot。
+DoD：
 
-#### DoD
-
-- A Node token 不能冒充 B Node。
-- revoked credential 重连失败。
-- rotate 后旧 credential 失效。
-- token 不出现在日志。
-- NAT/私网 Agent 只靠出站连接即可工作。
+- A token 不能冒充 B；
+- revoked token 不能重连；
+- rotate 后旧 token 失效；
+- token 不写日志；
+- NAT Agent 只靠出站连接工作。
 
 ---
 
-### Step 8 — V3-S5A：Node Scheduler + RELAY Orchestrator
+### 7.11 WP8 — Scheduler + RELAY Orchestrator
 
-**建议分支：** `feature/v3-s5a-orchestrator`
+**Track：C；集成型工作包。**
 
-**目标：** 第一次把 DB desired state、port lease、Agent command 串起来。
+开发可以在 WP3/WP5/WP7 接口冻结后提前开始，但**不得在这些依赖合并前进入 main**。
 
-#### Scheduler
-
-负责：
-
-- 从 NodeGroup 候选中挑选实际 ingress Node。
-- 检查 Node.role。
-- 检查 active/last_seen。
-- explicit node 优先。
-- 自动选择规则必须 deterministic，可解释。
-- 选中后立即写入 `Tunnel.ingress_node_id`。
-- RELAY 同理绑定 `egress_node_id`。
-
-#### Orchestrator 创建顺序
+创建顺序固定：
 
 ```text
-1 DB quota/auth validation
-2 create desired Tunnel = pending
-3 bind ingress / egress Node
-4 acquire ingress / egress port leases
-5 increment config_revision
-6 send Egress apply
-7 wait Egress ACK
-8 send Ingress apply
-9 wait Ingress ACK
-10 mark active
+auth/quota
+→ desired Tunnel=pending
+→ bind ingress/egress Node
+→ acquire ports
+→ revision++
+→ apply Egress
+→ Egress ACK
+→ apply Ingress
+→ Ingress ACK
+→ active
 ```
 
 任何失败：
 
 - 保留 Tunnel；
-- `apply_status=error`；
-- 写结构化 error；
-- 补偿已应用的一端；
-- 释放不再使用的 lease；
-- 不物理删除 Tunnel。
-
-#### DoD
-
-用 fake transport + real DB 测试顺序：
-
-- Egress ACK 前绝不 apply Ingress。
-- Egress fail → Ingress 不启动。
-- Ingress fail → Egress 被补偿。
-- retry 不产生第二个 lease。
-- 同一 request 重试不重复创建 runtime。
+- apply_status=error；
+- 写结构化错误；
+- 执行补偿；
+- 不物理删除。
 
 ---
 
-### Step 9 — V3-S5B：Reconciler、Retry 与重启恢复
+### 7.12 WP9 — Reconciler / Retry / Recovery
 
-**建议分支：** `feature/v3-s5b-reconciler`
+**Track：C；依赖 WP8。**
 
-**目标：** 让系统不依赖“一次请求必须成功”。
+对比：
 
-#### Reconciler 对比
+- DB desired state
+- config revision
+- Agent applied state
+- NodePortLease
+- Node online state
 
-- DB desired state。
-- Tunnel revision。
-- Agent state report。
-- NodePortLease。
-- Node online state。
+只允许自动：
 
-#### 只允许的自动动作
+- 重发相同 desired revision；
+- 补齐缺失 runtime；
+- 清理确认无主 lease；
+- 记录 error/warning。
 
-- 重发相同 desired revision。
-- 补齐 Agent 缺失 runtime。
-- 清理确认无主的 lease。
-- 将异常记录为 error / warning。
+默认禁止自动：
 
-#### 默认不允许
-
-- 自动换 Node。
-- 自动换端口。
-- 自动迁移用户隧道。
-- 因心跳短暂丢失删除 Tunnel。
-
-#### Restart 恢复
-
-Agent 重启后只能恢复：
-
-`Tunnel.ingress_node_id == self.id`
-
-或者：
-
-`Tunnel.egress_node_id == self.id`
-
-禁止再按整个 NodeGroup 把隧道恢复到每台机器。
-
-#### DoD
-
-- Agent kill → restart 后恢复。
-- 控制连接断开 → reconnect 后 converge。
-- control plane restart 后 converge。
-- 多次 reconcile 幂等。
-- NodeGroup 多 Node 不重复监听。
+- 换 Node；
+- 换端口；
+- 迁移用户 Tunnel；
+- 心跳超时即删除资源。
 
 ---
 
-### Step 10 — V3-S6A：管理端 Node / Egress API
+### 7.13 WP10 / WP11 — API Track
 
-**建议分支：** `feature/v3-s6a-admin-api`
+**Track：C。**
 
-**目标：** 先让管理员能够正确配置 v3 基础资源。
+#### WP10 Admin API
 
-#### API
+可以在 WP1 合并后较早开始：
 
-- Node role read/update。
-- credential rotate/revoke。
-- EgressPool CRUD。
-- EgressTarget CRUD。
-- target status / weight / order。
-- Node runtime/state report 查询。
+- Node role；
+- credential rotate/revoke；
+- EgressPool / EgressTarget CRUD；
+- runtime/state query。
 
-#### 权限
+credential 相关 endpoint 的合并依赖 WP7。
 
-仍走现有平台 admin / workspace 权限体系，不创建 v3 私有权限旁路。
+#### WP11 Tunnel RELAY API
 
-#### DoD
+依赖 WP8/WP9：
 
-- workspace / admin 权限负面测试。
-- 非 egress/both Node 不能启用 EgressPool。
-- 最后一个 active target 不能被无保护地停用。
-- target 热更新能产生正确 revision/command。
+- DIRECT / RELAY mode；
+- explicit ingress；
+- egress/pool；
+- retry/suspend/resume/delete；
+- 所有运行操作统一走 orchestrator。
 
----
-
-### Step 11 — V3-S6B：Tunnel RELAY API
-
-**建议分支：** `feature/v3-s6b-tunnel-api`
-
-**目标：** 到这一步，用户 API 才第一次正式允许创建 RELAY。
-
-#### POST /api/tunnels
-
-新增：
-
-- tunnel_mode
-- explicit ingress_node_id（可选）
-- egress_node_id / egress_pool_id（RELAY）
-- 继续兼容 legacy DIRECT 请求体
-
-#### 操作
-
-- create
-- update target/pool/node
-- retry
-- suspend
-- resume
-- delete
-
-所有动作都调用 orchestrator，不允许 route 自己写一套下发逻辑。
-
-#### 安全
-
-必须继续经过：
-
-```text
-workspace membership
-→ role permission
-→ capability policy
-→ node-group grant
-→ node role
-→ port ownership
-→ orchestrator
-```
-
-#### DoD
-
-- 跨 workspace 读写拒绝。
-- viewer 写操作拒绝。
-- policy 不允许 relay 时拒绝。
-- 无可用 Egress/Target 时明确 4xx。
-- create 成功返回的是 desired/runtime 状态，而不是假定“写 DB = 在线”。
+禁止 route 自己写第二套下发逻辑。
 
 ---
 
-### Step 12 — V3-S7A：管理端 Web
+### 7.14 WP12 / WP13 — Web Track
 
-**建议分支：** `feature/v3-s7a-admin-web`
+**Track：D。**
 
-只实现管理员需要的 v3 配置：
+Frontend **允许在后端实现未完成时提前并行开发**，条件是使用已经冻结的 API contract + mock。
 
-- Node role Badge / 编辑。
-- credential rotation 状态。
-- Egress Pool / Target 编辑器。
-- Node 在线、revision、active tunnel/port 诊断。
+#### WP12 Admin Web
 
-**禁止同时改用户 Tunnel 创建页。**
+- Node role；
+- credential state；
+- Egress Pool/Target；
+- runtime diagnostics。
 
-DoD：
+可在 WP10 contract freeze 后开始，合并依赖 WP10。
 
-- typecheck。
-- unit tests。
-- production build。
-- 空态、错误态、离线态完整。
+#### WP13 Tunnel Web
 
----
+- DIRECT / RELAY；
+- ingress / egress；
+- pool；
+- pending/applying/active/error/suspended；
+- retry；
+- runtime binding/port。
 
-### Step 13 — V3-S7B：用户 Tunnel Web
+可在 WP11 contract freeze 后开始，合并依赖 WP11。
 
-**建议分支：** `feature/v3-s7b-tunnel-web`
-
-实现：
-
-- DIRECT / RELAY 模式切换。
-- Ingress / Egress 选择。
-- Target Pool 选择。
-- pending / applying / active / error / suspended。
-- retry。
-- 实际 ingress/egress Node 与端口展示。
-- apply_error 可读提示。
-
-UI 不自行判断授权，以 capabilities + 服务端响应为准。
+**前端不得自己发明字段或临时 API。** Contract 改动必须回到对应 Backend WP。
 
 ---
 
-### Step 14 — V3-S8：真实三机 E2E + 灰度发布
+### 7.15 WP14 — Real E2E / Grey Release
 
-**建议分支：** `feature/v3-s8-e2e`
+**Track：D/Shared。**
 
-最低环境：
+测试 harness 可以从当前阶段提前并行开发；正式验收必须等待所有核心 WP 合入。
+
+最低拓扑：
 
 ```text
 Control Plane
-Ingress Node
-Egress Node
+Ingress Agent
+Egress Agent
 Target A
 Target B
 ```
 
-至少一个 Agent 必须放在 NAT/私网，只能主动出站。
+至少一个 Agent 必须位于 NAT/私网，仅可主动出站。
 
-#### 必跑场景
+正式 Gate 必测：
 
-1. legacy DIRECT 创建/访问不回归。
-2. TCP RELAY 连通。
-3. Egress-before-Ingress 时序。
-4. weighted target 流量分布。
-5. target 热更新。
-6. Agent 重启恢复。
-7. Agent 网络断开/恢复。
-8. Panel 重启恢复。
-9. stale revision。
-10. credential revoke。
-11. port conflict。
-12. port exhaustion。
-13. 两 workspace 隔离。
-14. BOTH Node。
-15. suspend/resume。
-16. 修改 Egress Node。
-17. 备份 → 恢复 → DIRECT/RELAY 状态检查。
-18. 旧版本 Agent 与新 Panel 的兼容行为。
+- legacy DIRECT no regression；
+- TCP RELAY；
+- Egress-before-Ingress；
+- weighted target；
+- hot update；
+- Agent restart；
+- control reconnect；
+- Panel restart；
+- stale revision；
+- credential revoke；
+- port conflict/exhaustion；
+- workspace isolation；
+- BOTH Node；
+- suspend/resume；
+- change Egress；
+- backup/restore；
+- old Agent compatibility。
 
-#### 灰度规则
-
-- 默认 `relay_enabled=false`。
-- 第一轮只对白名单 workspace/node 开放。
-- 观察错误率、端口冲突、ACK 延迟、流量一致性。
-- 验收通过后才允许默认开启。
-
-这一步不过，**不允许开始 DIRECT v3 化**。
+只有 WP14 通过后，relay 才允许从白名单灰度扩大。
 
 ---
 
-### Step 15 — V3-S9：DIRECT 迁入 v3 Runtime
+### 7.16 WP15 — DIRECT v3 Migration
 
-**建议分支：** `feature/v3-s9-direct-runtime`
+**Track：B/C；依赖 WP14。**
 
-顺序：
+迁移顺序：
 
-1. 新建 DIRECT 可选择 v3 runtime，但 feature flag 默认关闭。
-2. 对照 legacy DIRECT 的 TCP 功能。
-3. 灰度新建 DIRECT。
-4. 停止让 legacy allocator 为新 Tunnel 分配端口。
-5. 存量 DIRECT 分批迁移。
-6. 至少一个稳定发布周期后，才允许删除 legacy read/write path。
+1. 新建 DIRECT 可选择 v3 runtime，flag 默认关闭。
+2. 对照 legacy DIRECT。
+3. 灰度新 DIRECT。
+4. legacy allocator 不再负责新 Tunnel。
+5. 分批迁移存量 DIRECT。
+6. 稳定一个发布周期。
+7. 最后才删除 legacy path。
 
-在确认所有存量实例迁完之前：
-
-- 不删 `forward_addresses`。
-- 不删旧 engine。
-- 不删旧 config generator。
-- 不做 destructive migration。
+禁止为了回滚方便做 destructive DB downgrade。
 
 ---
 
-### Step 16+ — V3-S10：协议与高级能力逐项开发
+### 7.17 WP16+ — 后续协议与高级能力
 
-S10 不允许一次性“全做完”，每一项重新走：
+WP14 之后按独立工作包继续并行，但每个能力必须自己走：
 
 ```text
-设计约束
-→ schema/API（如需要）
-→ Agent
+contract
+→ implementation
 → tests
 → real E2E
 → feature flag
-→ 灰度
-→ 稳定
+→ grey release
+→ stable
 ```
 
-固定顺序：
+优先顺序仍为：
 
-1. **UDP**
-2. **WS/TLS**
-3. **QUIC**
-4. **高级 LB**：least_conn → least_traffic → ip_hash
-5. **DNS**
-6. **多入口 HA / 手动故障迁移**
-7. **自动故障迁移**（只有监控与状态机足够稳定后）
-8. **多跳 / Tunnel Chain**（只有明确产品需求后）
+1. UDP
+2. WS/TLS
+3. QUIC
+4. advanced LB
+5. DNS
+6. multi-ingress HA
+7. automatic failover
+8. multi-hop
 
-任何后项不得因为“顺手”提前塞进前项 PR。
+同一底层模块冲突严重的能力不得强行并行。
 
 ---
 
-### 7.2 每一步统一工作流程
+### 7.18 PR / Branch 并行规则
 
-每个 Step 都严格执行：
-
-```text
-A. 从最新 main 创建对应 feature/v3-* 分支
-B. 只实现该 Step 的范围
-C. 本地/分支测试
-D. 创建 PR
-E. 对照本文件逐条 review
-F. CI 全绿
-G. squash merge main
-H. main push CI 再次全绿
-I. 更新本文件中的“当前执行步骤”
-J. 删除/停止使用已合并源分支
-K. 才能创建下一 Step 分支
-```
-
-如果 PR 出现以下任意情况，**不合并**：
-
-- 属于后续 Step 的功能提前进入。
-- 新增第二套开发计划/roadmap。
-- 用新字段重新推断实际 Node，而不是使用明确 binding。
-- 绕过统一 port lease。
-- 绕过 Workspace RBAC / CapabilityPolicy / NodeGroupGrant。
-- 要求公网开放 Agent 管理端口才能工作。
-- 没有 revision/ACK 就声称控制面可靠。
-- 测试或 CI 失败。
-- 破坏 legacy DIRECT 且没有对应迁移步骤。
-- 数据库回滚依赖 DROP 列才能恢复代码。
-
-### 7.3 当前执行游标
-
-开发文档里必须始终只保留一个“当前执行游标”。
-
-**当前：Step 1 — V3-S1A Schema。**
-
-因此当前允许创建的下一条开发分支只有：
+推荐命名：
 
 ```text
-feature/v3-s1a-schema
+feature/v3-wp1-schema
+feature/v3-wp2-backfill
+feature/v3-wp3-port-lease
+feature/v3-wp4-agent-runtime
+feature/v3-wp5-relay-dataplane
+feature/v3-wp6-control-contract
+feature/v3-wp7-node-session
+feature/v3-wp8-orchestrator
+feature/v3-wp9-reconciler
+feature/v3-wp10-admin-api
+feature/v3-wp11-tunnel-api
+feature/v3-wp12-admin-web
+feature/v3-wp13-tunnel-web
+test/v3-wp14-e2e-harness
 ```
 
-在它合入并且 main CI 全绿前，Step 2 及以后全部视为“未授权提前开发”。
+PR 必须写：
+
+```text
+Work Package: WPx
+Track: A/B/C/D
+Depends-On: WP...
+Blocks: WP...
+Contract Changes: yes/no
+Runtime Changes: yes/no
+Migration Impact:
+Rollback:
+Tests:
+```
+
+如果依赖未合并：
+
+- PR 标记 Draft 或 blocked；
+- 可以 review；
+- 可以跑自己的 CI；
+- **不能 merge**。
+
+依赖合并后：
+
+1. 更新到最新 main；
+2. 解决 contract drift；
+3. 重跑完整 CI；
+4. review 依赖是否已满足；
+5. 才能 merge。
+
+---
+
+### 7.19 Integration Gate，而不是“单一游标”
+
+项目不再维护“全团队唯一当前 Step”，改为维护 **Integration Gate + Active WP Set**。
+
+Gate 定义：
+
+```text
+Gate F0  文档/架构冻结                 ✅
+Gate F1  Schema Contract merged         ⏳
+Gate F2  Runtime Foundations merged     ⏳
+Gate F3  RELAY Control Plane integrated ⏳
+Gate F4  API/Web integrated             ⏳
+Gate F5  Real E2E passed                ⏳
+Gate F6  DIRECT v3 migrated             ⏳
+```
+
+当前：
+
+```text
+Active WP:
+- WP1 Schema
+- WP4 Agent Runtime（可并行，受 WP1 merge gate 约束）
+- WP6 Control Contract（可并行，受 WP1/WP4 compatibility gate 约束）
+- WP14 E2E Harness（仅测试基础设施）
+
+Next unlock after Gate F1:
+- WP2 Backfill
+- WP3 Port Lease
+- WP10 Admin API foundation
+```
+
+这就是后续团队开发的统一并行模型。
 
 
 ---
 
 ## 8. 开发硬规则
 
-### 8.1 一次只做一个切片
+### 8.1 一个 PR 只做一个 Work Package
 
-- PR 必须写明 `V3-Sx`。
-- 禁止在 S2 PR 顺手开发 S7 UI 或 S10 协议。
-- blocker 修复可以跨切片，但必须在 PR 说明原因。
+- 团队可以同时开发多个 WP，但**单个 PR 只能属于一个 WP**。
+- 禁止在 WP3 PR 顺手开发 WP12 UI，也禁止在 WP6 PR 顺手实现 WP8 orchestrator。
+- 跨 Track 的共享 contract 改动必须单独说明影响面。
+- blocker 修复可以跨 WP，但必须是独立 PR，并标明受影响 WP。
+- 并行开发以“低耦合”为前提；如果两个 PR 长期修改同一核心文件，应重新拆接口，而不是靠反复解决冲突维持并行。
 
 ### 8.2 Schema 优先且只做兼容迁移
 
@@ -1226,33 +1056,36 @@ PR 描述必须包含：
 
 ---
 
-## 12. 当前下一步
+## 12. 当前开发状态
 
-**当前执行游标：Step 1 — V3-S1A Schema。**
+当前已经进入 **并行开发模式**，不再使用单一 Step 游标。
 
-当前唯一允许的新功能分支：
+### 当前 Integration Gate
 
 ```text
-feature/v3-s1a-schema
+Gate F0  文档/架构冻结                 ✅
+Gate F1  Schema Contract merged         ⏳ 当前关键 Gate
+Gate F2  Runtime Foundations merged     ⏳
+Gate F3  RELAY Control Plane integrated ⏳
+Gate F4  API/Web integrated             ⏳
+Gate F5  Real E2E passed                ⏳
+Gate F6  DIRECT v3 migrated             ⏳
 ```
 
-这一 PR **只做数据模型与 additive migration**：
+### 当前允许并行启动
 
-1. 定义 Node.role 与节点 credential 字段。
-2. 定义 Tunnel 的 mode、实际 ingress/egress binding、端口、desired/apply 状态与 revision 字段。
-3. 新增 EgressPool / EgressTarget / NodePortLease。
-4. 补齐唯一约束、外键和安全的 onDelete 行为。
-5. 通过空库 migrate、Prisma generate、TypeScript typecheck 和完整 CI。
+```text
+Track A: feature/v3-wp1-schema
+Track B: feature/v3-wp4-agent-runtime
+Track C: feature/v3-wp6-control-contract
+Track D: test/v3-wp14-e2e-harness
+```
 
-这一 PR **不做**：
+其中：
 
-- legacy backfill（属于 Step 2）；
-- port allocator（Step 3）；
-- Agent runtime / RELAY（Step 4–5）；
-- 控制协议（Step 6–7）；
-- API / Web（Step 10–13）；
-- DIRECT 迁移、UDP、QUIC、支付等后续能力。
+- **WP1 是当前最高优先级合并 Gate**。
+- WP4/WP6 可以立即开发和评审，但如果最终依赖 WP1 的 contract，必须等待 WP1 合并、更新到最新 main 后才能合并。
+- WP14 当前只允许建设测试 harness，不得提前宣称 RELAY 验收完成。
+- Gate F1 通过后，立即解锁 WP2、WP3、WP10 foundation，并继续保持 Track B/C 并行。
 
-Step 1 合并到 main 且 main push CI 再次全绿以后，才把执行游标更新为 **Step 2 — V3-S1B Backfill**。
-
-从现在开始，后续全部开发都以第 7 节的 Step 顺序为准。
+后续开发、分支、PR 和合并判断全部以第 7 节的 **依赖矩阵 + Integration Gate** 为准。
