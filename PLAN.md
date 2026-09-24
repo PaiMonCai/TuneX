@@ -118,7 +118,7 @@ RelayX 的[产品功能概览](https://docs.relayx.cc/guide/intro/)、[版本对
 
 ### 4.5 SaaS 运营基础
 
-- 控制面生产环境最少独立 TLS、专用数据库账号、非公网 MySQL/Redis、限流与审计、按 workspace 的容量限制。当前 Compose 宿主机映射是开发默认，必须有独立的生产配置。
+- 控制面生产环境最少独立 TLS、专用数据库账号、非公网 MySQL/Redis、限流与审计、按 workspace 的容量限制。开发栈 `docker-compose.yaml` 的主机端口映射仅供本机调试；**生产必须改用 `docker-compose.prod.yaml`**（数据/控制端口不外露、入口统一 TLS、镜像按 git sha 钉版本、容器资源限额，见 `docs/production-deploy.md`）。
 - 后台指标最少包括租户数/活跃隧道数、Agent 在线率、配置失败率、连接成功率、隔离拒绝次数和资源容量；指标不含明文 token/敏感目标地址。
 - 提供数据保留、导出、工作空间删除与备份恢复流程；隐私/服务条款在对外开放注册前确定，第三方遥测默认关闭或明确披露。
 
@@ -186,7 +186,7 @@ RelayX 的[产品功能概览](https://docs.relayx.cc/guide/intro/)、[版本对
 | PAY-01 | P0 | ✅ 完成 | 关闭支付写入口和回调但保留历史数据 | `middlewares/payments-gate.ts`、前端开关 | 直接调用与伪造回调均 403，CI 通过 |
 | OPS-01 | P0 | ✅ 完成 | 离线状态、流量聚合与任务幂等 | `worker.ts`、`socket/offline-detector.ts`、`services/traffic-archive.ts` | 离线检测闭环 ✅；流量入库/聚合 ✅ |
 | QA-01 | P0 | ✅ 完成 | Linux CI、空库升级迁移、双租户网络+浏览器 E2E | `.github/workflows/ci.yml` | 真实 MySQL CI + 秘密扫描 + GHCR 镜像 ✅；**双租户 E2E 待做** |
-| OPS-02 | P1 | ⚪ 未开始 | SaaS 部署/备份/告警/容量基线与回滚 | Compose 生产配置、Caddy、文档 | GHCR 预构建镜像已就位；备份/告警待做 |
+| OPS-02 | P1 | 🟡 进行中 | SaaS 部署/备份/告警/容量基线与回滚 | `docker-compose.prod.yaml`、`Caddyfile.prod`、`scripts/ops/`、`docs/production-deploy.md` | 脚本集 5 件就位 ✅；生产 compose/env 模板/文档 ✅（CI 36042339078 通过）；**生产机部署与恢复/回滚演练未做**（见 `docs/production-deploy.md` 第 10 节） |
 | TEAM-01 | P1 | ⚪ 未开始 | 自定义团队角色与细粒度审计（基础权限先在 P0 落地） | Prisma、后台权限、Web 设置 | 固定四角色已落地 |
 | BILL-01 | P2 | ⚪ 未开始 | 独立可选计费适配层（有需求后再排） | 不污染核心隧道域 | 支付关闭状态已满足前置 |
 | OPS-03 | P0 | ✅ 完成 | 流量计量链路：agent 上报 → Redis 缓冲 → MySQL 入库 → 按 workspace 聚合展示 | `worker.ts` cron_save_traffic、`services/traffic-archive.ts`、`services/traffic.ts`、`routes/public.ts`、`routes/workspaces.ts`、`__tests__/traffic-pipeline.test.ts` | 采集入库不重复 ✅，聚合口径与策略流量一致 ✅；Web 展示待后续工作包 |
@@ -241,3 +241,5 @@ TuneX 能称为“个人与团队 SaaS Beta”的条件不是把原项目换一�
 - 新增按用户/节点组/入口或出口的 NodeGroupGrant 迁移和管理端授权接口；隧道创建、修改和配置下发按所有权或显式授权检查；无套餐用户的自有隧道不再被配置生成跳过。AUTHZ-02 已完成：CapabilityPolicy/WorkspacePolicyAssignment/工作空间隔离落地，config-generator 的 user_plan 依赖已全部替换为 CapabilityPolicy/NodeGroupGrant（配额、白名单、限额与默认拒绝均来自策略体系）。UserPlan 仅作为 legacy 兼容表保留。旧套餐中共享节点组关系**不会自动升级**为显式授权，管理员必须审核后逐项发放。
 - 支付默认关闭；服务端拦截支付写入口和网关回调，历史记录读取保留；前端默认隐藏购买/充值导航。PAY-01 仍需真实 HTTP、伪造回调及 worker 验收（worker 现为占位骨架）。
 - 已增加 `.github/workflows/ci.yml`，提交 `d39465a` 的 GitHub Actions 运行 `35958068306` 三个作业（backend/web/agent）全部成功：MySQL 8.4 空库迁移、Prisma 生成与类型检查、支付/授权测试、Web 生产构建、Go vet/test/build。另本机已验证 Prisma Schema 与迁移差异、Backend tsc、Web 构建及策略/HTTP 冒烟。未验证：**既有生产库升级与回滚**、Linux 多节点、双租户 E2E、支付开启场景及备份恢复；不得将以上标记为 SaaS Beta 验收通过。本机无 Docker CLI。
+
+- OPS-02 部署侧交付（分支 `feature/ops02-deploy`，CI 运行 `36042339078`）：新增 `docker-compose.prod.yaml`（MySQL/Redis **不映射主机端口**、backend/web 不映射主机端口、只经 Caddy 80/443 出入、`/socket.io/* → backend:3001`、全 GHCR 预构建镜像按 git sha 钉版本、每容器 CPU/内存上限与日志轮转、`no-new-privileges`、独立 `*-prod` 数据卷，compose 项目名保持 `tunex` 以对齐 ops 脚本的 `-p tunex`）、`.env.production.example`、`Caddyfile.prod`（真实域名 + ACME + HTTPS 跳转 + 安全响应头，`caddy validate` 通过）、`docs/production-deploy.md`，并补齐 `scripts/ops/{alert,backup,restore,rollback,capacity}.sh`（端口探测改用 `ps --format` 解析以兼容 compose v2.28、BGSAVE 等待条件修正为"in_progress:0 且 last_save 前进"、备份产物自检补 `Dump completed` 与五张关键表 DDL、加密算法改为 openssl CLI 实际支持的 `aes-256-cbc + PBKDF2 200k` 并对口令错误做 gzip 魔术头兜底、回滚前备份的 `BACKUP_PASSPHRASE` 需导出的坑已修）。**Redis 持久化口径已实测钉死：AOF 必须关闭**——本机复现 Redis 7 `appendonly yes` 下"停容器→替换 dump.rdb→启动"后 key 仍是旧值（AOF 优先加载），即"恢复假成功"；已在 `docker-compose.prod.yaml` 显式关闭 AOF 并给 `restore.sh` 加 `appendonlydir` 守卫（检测到即拒绝假恢复）。**仍未做**：真实生产机的首次部署、备份→恢复→回滚三段演练与异地备份链路（演练清单见 `docs/production-deploy.md` 第 10 节）；OPS-02 保持 🟡 不得标 ✅。

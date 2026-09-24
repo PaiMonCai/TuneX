@@ -350,10 +350,15 @@ TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
 
 ```text
 .
-├── .github/workflows/ci.yml       # CI / image publishing
-├── .env.example                   # 环境变量模板
-├── Caddyfile                      # Web/API 反向代理
-├── docker-compose.yaml            # 本地/自托管基础栈
+├── .github/workflows/ci.yml        # CI / image publishing
+├── .env.example                    # 开发/本地环境变量模板
+├── .env.production.example         # 生产环境变量模板（复制为 .env）
+├── Caddyfile                      # 开发用反代（HTTP）
+├── Caddyfile.prod                 # 生产入口（域名 + ACME + TLS）
+├── docker-compose.yaml            # 开发/自托管基础栈
+├── docker-compose.prod.yaml       # 生产栈（端口不外泄/TLS/限额）
+├── docs/                          # 部署与运维手册
+│   └── production-deploy.md       # 生产部署/备份/恢复/回滚手册
 ├── PLAN.md                        # 产品定位、里程碑、发布门槛
 ├── DEVELOPMENT.md                 # 深入开发规范与协议说明
 ├── backend/
@@ -376,7 +381,7 @@ TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
 ├── scripts/
 │   ├── ci/                        # CI helpers
 │   ├── net01-e2e/                 # network E2E harness
-│   └── ops/                       # backup / restore / rollback / alerts
+│   └── ops/                       # alert / backup / restore / rollback / capacity
 └── reports/                       # 验证与差异报告
 ```
 
@@ -392,6 +397,10 @@ TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
 6. 保持 `PAYMENTS_ENABLED=false`，除非计费链路已完成独立审查和验收；
 7. 按 [PLAN.md](PLAN.md) 的 P0 发布门槛完成租户隔离与真实网络验证。
 
+生产部署使用 `docker-compose.prod.yaml` + `Caddyfile.prod` + `.env.production.example`，
+完整步骤、巡检阈值、备份/恢复/回滚操作与演练清单见
+[docs/production-deploy.md](docs/production-deploy.md)。
+
 仓库已提供 `scripts/ops/` 下的备份、恢复、回滚和告警脚本基础，但生产策略仍应根据实际部署环境审查和演练。
 
 ## 与参考项目的关系
@@ -404,6 +413,7 @@ TuneX 的部分产品场景和历史兼容行为参考了 RelayX 的公开产品
 
 - [PLAN.md](PLAN.md)：产品定位、路线图、工作包和发布门槛
 - [DEVELOPMENT.md](DEVELOPMENT.md)：开发规范、Agent/Socket 协议、常见坑
+- [docs/production-deploy.md](docs/production-deploy.md)：生产部署/备份/恢复/回滚/告警运维手册
 - [scripts/net01-e2e/README.md](scripts/net01-e2e/README.md)：NET-01 网络 E2E
 - [reports/](reports/)：历史验证、差异分析和测试证据
 

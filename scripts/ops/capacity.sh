@@ -64,7 +64,6 @@ if svc_running "$MYSQL_SERVICE"; then
   TRAFFIC_ROWS="$(MYSQLQ 'SELECT COUNT(*) FROM tunnel_traffic')"
   AUDIT_ROWS="$(MYSQLQ 'SELECT COUNT(*) FROM audit_log')"
   BPOOL_MB="$(MYSQLQ "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024)")"
-  MYSQL_RSS_MB="$(docker stats --no-stream --format '{{.MemUsage}}' "$("${COMPOSE[@]}" ps -q "$MYSQL_SERVICE")" 2>/dev/null | awk '{print $1}')"
   log "  库体积 ${DB_MB}MB | workspace $WS | user $USERS | tunnel $TUNNELS"
   log "  流量记录 $TRAFFIC_ROWS | 审计 $AUDIT_ROWS | buffer pool ${BPOOL_MB}MB"
 
@@ -172,5 +171,5 @@ jq -nc \
 cp "$CAP_FILE" "$CAP_HIST.tmp" 2>/dev/null || true
 cat "$CAP_FILE" >> "$CAP_HIST"
 log "已写入 $CAP_FILE"
-[[ "${1:-}" == "--baseline" && -s "$CAP_HIST" ]] && { echo; log "历史采样点："; wc -l < "$CAP_HIST" | xargs log; }
+[[ "${1:-}" == "--baseline" && -s "$CAP_HIST" ]] && { echo; log "历史采样点：$(wc -l < "$CAP_HIST") 条"; }
 log "✅ 完成"

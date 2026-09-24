@@ -45,7 +45,10 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_ROOT/docker-compose.yaml}"
 OPS_DIR="${OPS_DIR:-$PROJECT_ROOT/var/ops}"
 BACKEND_IMAGE_DEFAULT="ghcr.io/paimoncai/tunex-backend:latest"
-WEB_IMAGE_DEFAULT="ghcr.io/paimoncai/tunex-web:latest"
+# shellcheck disable=SC2034  # 由 backend tag 推导，仅作文档化后备
+WEB_IMAGE_DEFAULT="ghcr.io/paimoncai/tunex-web:latest"  # @unused: 推导所用
+# shellcheck disable=SC2034  # 兜底已知良好版本（见 docs/production-deploy.md）
+KNOWN_GOOD_IMAGE="${ROLLBACK_KNOWN_GOOD_IMAGE:-}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"
 
 log()  { printf '[rollback] %s\n' "$*"; }
@@ -58,13 +61,12 @@ HISTORY="$OPS_DIR/deploy-history.jsonl"
 [[ -f "$HISTORY" ]] || touch "$HISTORY"
 
 # --- 参数 --------------------------------------------------------------------
-TARGET=""; ASSUME_YES=0; DO_DATA=0; DO_APPLY=0; DO_VERIFY=0; DO_LIST=0; DO_BACKUP=1
+TARGET=""; ASSUME_YES=0; DO_DATA=0; DO_VERIFY=0; DO_LIST=0; DO_BACKUP=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list)       DO_LIST=1 ;;
     --to)         TARGET="${2:?--to 需要参数}"; shift ;;
     --data)       DO_DATA=1 ;;
-    --apply)      DO_APPLY=1 ;;
     --verify)     DO_VERIFY=1; TARGET="${2:?--verify 需要参数}"; shift ;;
     --yes|-y)     ASSUME_YES=1 ;;
     --no-backup)  DO_BACKUP=0 ;;
@@ -174,11 +176,19 @@ fi
 # --- 2. 备份现状 -------------------------------------------------------------
 if [[ $DO_BACKUP -eq 1 ]]; then
   log "[2/6] 回滚前备份现状（备份失败即终止回滚）"
-  if ! BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}" "$SCRIPT_DIR/backup.sh" \
-        ${BACKUP_PASSPHRASE:+} > "$OPS_DIR/pre-rollback-backup.log" 2>&1; then
-    if [[ -z "${BACKUP_PASSPHRASE:-}" ]]; then
-      warn "备份需要口令。设置 BACKUP_PASSPHRASE 或手动执行 backup.sh 后重试。"
+  # 备份口令必须**导出**到子进程。历史写法 `BACKUP_PASSPHRASE=x script.sh ${VAR:+}`
+  # 是无效的：`VAR=val cmd` 形式只在 cmd 的环境里生效，而这里 `${BACKUP_PASSPHRASE:+}`
+  # 展开为空串却让 shellcheck 误判为「参数」；更关键的是若父环境没有该变量，
+  # backup.sh 会走到交互式 read，而在非 tty 的日志重定向下直接挂住/失败。
+  if [[ -z "${BACKUP_PASSPHRASE:-}" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -s -p "备份加密口令（回滚前备份需要，输入不可见）: " BACKUP_PASSPHRASE; echo
+    else
+      die "回滚前备份需要 BACKUP_PASSPHRASE（cron/管道环境无法交互输入）。设置后重试，或确认已有备份后加 --no-backup。" 2
     fi
+  fi
+  export BACKUP_PASSPHRASE
+  if ! "$SCRIPT_DIR/backup.sh" > "$OPS_DIR/pre-rollback-backup.log" 2>&1; then
     tail -5 "$OPS_DIR/pre-rollback-backup.log" >&2
     die "回滚前备份失败 —— 已终止（不留无保护的回滚窗口）" 1
   fi
