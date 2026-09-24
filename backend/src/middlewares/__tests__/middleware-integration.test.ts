@@ -1,6 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
+import type { AppVariables } from "../auth.ts";
 import {
   createRateLimitMiddleware,
   memoryRateLimitStore,
@@ -16,11 +17,11 @@ import { setAuditSink, resetAuditSink, type AuditEntry } from "../../services/au
  */
 
 function buildApp(rules: RateLimitRule[], ip = "9.9.9.9") {
-  const app = new Hono();
+  const app = new Hono<{ Variables: AppVariables }>();
   // 模拟 app.ts 链序：先注入 ip + 假用户，再审计、再限流，最后路由。
   app.use("*", async (c, next) => {
     c.set("ip", ip);
-    c.set("user", { id: 42, email: "u@tunex.local", super_admin: false, admin_roles: [] });
+    c.set("user", { id: 42, email: "u@tunex.local", super_admin: false, admin_roles: [] } as never);
     await next();
   });
   app.use("*", createAuditMiddleware({ enabled: true }));
