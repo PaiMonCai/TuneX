@@ -26,7 +26,9 @@ import { withWorkspaceQuotaLock } from "../services/policy-service.ts";
 export const nodeGroupsRoutes = new Hono<{ Variables: AppVariables }>();
 
 nodeGroupsRoutes.use("*", async (c, next) => {
-  c.set("workspace", await resolveWorkspaceAccess(c, c.req.method === "POST" ? "manage" : "read"));
+  // TEAM-01：resource="node" 让自建节点组的 manage 动作落到 node:manage 权限上，
+  // 否则自定义角色无法被授予「管理节点但不碰隧道」这类组合。
+  c.set("workspace", await resolveWorkspaceAccess(c, c.req.method === "POST" ? "manage" : "read", "node"));
   await next();
 });
 
