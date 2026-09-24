@@ -20,8 +20,7 @@
 #   3. 解密（openssl aes-256-cbc + PBKDF2，同 backup 口令；算法见 backup.sh，勿用 GCM）
 #   4. MySQL：先 DROP+DATABASE 重建，再灌入 dump（含 _prisma_migrations，
 #      恢复后 prisma migrate deploy 应为 "No pending migrations"）
-#   5. Redis：FLUSHALL + 停 AOF 上下文恢复 RDB（SHUTDOWN NOSAVE 后替换卷文件再启动），
-#      或 DEBUG LOAD 方式；默认走「替换 dump.rdb 卷文件 + 重启 redis」。
+#   5. Redis：停 AOF 上下文恢复 RDB（替换卷内 dump.rdb 再启动；AOF 已启用则拒绝执行）
 #   6. 恢复后自检：表数量、关键表行数、租户数（workspace/user/tunnel）与 manifest 对齐
 #
 # 前置：目标服务当前运行中（compose up 过）。恢复前强烈建议先对现状做一次备份。
@@ -220,8 +219,17 @@ if [[ $DO_REDIS -eq 1 ]]; then
   "${COMPOSE[@]}" stop "$REDIS_SERVICE" >/dev/null
   if [[ -n "$VOL" ]]; then
     if [[ -d "/var/lib/docker/volumes/$VOL/_data" ]]; then
+      # AOF 守卫：Redis 7 若启用 appendonly，数据从 appendonlydir/*.aof 加载，
+      # 替换 dump.rdb 会被静默忽略（恢复"成功"但 key 没变，即假恢复）。
+      # 先确认卷内不存在 appendonlydir；存在即停下让运维显式决策。
+      if [[ -d "/var/lib/docker/volumes/$VOL/_data/appendonlydir" ]]; then
+        die "检测到 /var/lib/docker/volumes/$VOL/_data/appendonlydir —— 本栈 Redis 启用了 AOF，AOF 优先于 dump.rdb，替换 RDB 不会生效（假恢复）。请改用 FLUSHALL + AOF 重建，或临时以 --appendonly no 启动 redis 后再恢复。" 1
+      fi
       cp "$WORK/redis.rdb" "/var/lib/docker/volumes/$VOL/_data/dump.rdb"
     elif [[ -d "$VOL" ]]; then
+      if [[ -d "$VOL/appendonlydir" ]]; then
+        die "检测到 $VOL/appendonlydir —— 本栈 Redis 启用了 AOF，替换 dump.rdb 不会生效（假恢复）。请改用 FLUSHALL + AOF 重建，或临时以 --appendonly no 启动 redis 后再恢复。" 1
+      fi
       cp "$WORK/redis.rdb" "$VOL/dump.rdb"
     else
       die "无法定位 redis 数据卷: $VOL"

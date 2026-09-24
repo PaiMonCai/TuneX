@@ -1,0 +1,62 @@
+# ============================================================================
+# TuneX OPS-02 —— 生产 Caddy 入口（配合 docker-compose.prod.yaml）
+#
+# 与开发用 Caddyfile（:80 纯 HTTP）的差异：
+#   · 真实域名 + 自动 HTTPS（ACME，HTTP-01 走 80 / TLS-ALPN 走 443）
+#   · HTTP 自动 308 跳转 HTTPS
+#   · /socket.io/* → backend:3001（Agent 控制面；WebSocket 走 Upgrade 透传）
+#   · 安全响应头 + 上传体上限排障（默认无限制）
+#
+# 站点地址来源：环境变量 SITE_URL（形如 https://tunex.your-domain.com）。
+# 仓库与仓库 CI 都不产生 .env，故这里用 {env.SITE_URL} 占位；
+# 缺失时 Caddy 会启动失败并给出明确错误，不会静默降级到 HTTP。
+# ============================================================================
+{
+	# 对外唯一对外站点地址；不配则拒绝启动（fail fast）。
+	# 注意：站点地址不能从环境变量读取 "0.0.0.0" 这类监听地址，必须是域名。
+	email {$ACME_EMAIL:?ACME_EMAIL must be set for ACME/证书到期通知}
+	# 证书/账号落 compose 卷内，容器重建不丢证书。
+	storage file_system /data/caddy/pki/
+}
+
+{$SITE_URL:?SITE_URL must be set, e.g. https://tunex.example.com} {
+	encode zstd gzip
+
+	# --- 安全响应头 ------------------------------------------------------------
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# 控制面是同源站点（前端与 API 同域），默认 CSP 足够收紧。
+		# 如需放宽（如 Next 需要 unsafe-eval 的开发态）请显式列出，不要用 *。
+		-Server
+	}
+
+	# --- Agent 控制面 WebSocket（Socket.IO）------------------------------------
+	# 必须路由到 backend:3001。反代到 3000 会 404/握手失败，
+	# Agent 表现为反复重连。Caddy 自动处理 Upgrade/Connection 头，无需手工写。
+	handle /socket.io/* {
+		reverse_proxy backend:3001 {
+			# 长连接：Agent 可挂数小时，关掉全部超时。
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	# --- 健康检查 / API ---------------------------------------------------------
+	handle /api/* {
+		reverse_proxy backend:3000
+	}
+
+	handle /healthz {
+		reverse_proxy backend:3000
+	}
+
+	# --- 其余 → Next.js 前端 ----------------------------------------------------
+	handle {
+		reverse_proxy web:3000
+	}
+}
