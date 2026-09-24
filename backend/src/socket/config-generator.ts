@@ -47,6 +47,7 @@ import {
   type NodeConfig,
   type ServiceConfig,
 } from "../crypto/node-config.ts";
+import { resolveDynamicServicePorts, type TunnelPortInfo } from "./port-allocator.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -354,6 +355,26 @@ export function getConnectIP(connectIp: string | null | undefined, ipType: IpTyp
  */
 export function waitListenAddr(prefix: string, portRange: string | null | undefined): string {
   return `${prefix}:${WAIT_LISTEN}${portRange ?? ""}`;
+}
+
+/**
+ * 把入口配置里**动态端口**服务的 `addr` 从 `WAIT_LISTEN<range>` 占位符替换为
+ * 控制面分配的**唯一固定端口**（多节点端口竞争修复）。
+ *
+ * 复用 {@link resolveDynamicServicePorts}（纯函数、可单测）。
+ */
+export function resolveInServicePorts(
+  services: readonly ServiceConfig[],
+  tunnels: readonly AvailableTunnel[],
+  portRange: string | null | undefined,
+  listenIPs: ReadonlyMap<number, string> = new Map(),
+): ServiceConfig[] {
+  const infos: TunnelPortInfo[] = tunnels.map((t) => ({
+    id: t.id,
+    listen_port: t.listen_port,
+    listen_ip: t.listen_ip ?? listenIPs.get(t.id) ?? "",
+  }));
+  return resolveDynamicServicePorts(services, infos, portRange, WAIT_LISTEN);
 }
 
 /* ================================================================== */
@@ -953,6 +974,9 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
       ]
     : [];
 
+  // 多节点端口竞争修复：动态端口由控制面确定性分配后写死进 addr。
+  const servicesWithPorts = resolveInServicePorts(services, portForwardTunnels, portRange);
+
   const config: NodeConfig = {
     log: { level: DEFAULT_LOG_LEVEL },
     tls: {
@@ -960,7 +984,7 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
       commonName: safeHost(input.siteUrl),
       organization: safeHost(input.siteUrl),
     },
-    services,
+    services: servicesWithPorts,
     chains,
     climiters: Array.from(climiters.values()),
     limiters: Array.from(limiters.values()),

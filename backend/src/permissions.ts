@@ -43,6 +43,7 @@ export const ADMIN_RESOURCES: AdminResource[] = [
   { key: "tickets", label: "工单管理", group: "用户", url: "/admin/tickets", business: true, apiPrefixes: ["/admin/ticket", "/admin/tickets"] },
   { key: "settings", label: "系统设置", group: "系统", url: "/admin/settings", business: false, apiPrefixes: ["/admin/system/config"] },
   { key: "license", label: "License 管理", group: "系统", url: "/admin/license", business: false, apiPrefixes: ["/admin/license"] },
+  { key: "audit", label: "审计日志", group: "系统", url: "/admin/audit-logs", business: false, apiPrefixes: ["/admin/audit-logs"] },
 ];
 
 export const ADMIN_RESOURCE_KEYS: string[] = ADMIN_RESOURCES.map((r) => r.key);

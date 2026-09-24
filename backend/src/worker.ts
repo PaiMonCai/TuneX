@@ -13,15 +13,18 @@
  *   cron_reset_expired_tunnel    重置过期隧道
  *   cron_reset_table_order       重置表排序
  *   cron_push_node_config        推送节点配置
+ *   cron_check_node_offline      离线检测：消费 `dc:*` 标记，防抖到点置 inactive
  *
- * 全部 10 个 cron 任务均已注册调度；各 handler 当前为占位实现（仅打日志/计数），
+ * 原版 10 个 cron 任务均已注册调度；各 handler 当前为占位实现（仅打日志/计数），
  * 真正的业务逻辑（流量入库、DNS 同步、自动续费等）待后续迭代补齐。
+ * `cron_check_node_offline` 为 TuneX 新增（第 11 个），补上离线检测闭环（已实现）。
  */
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import { env } from "./env.ts";
 import { db } from "./db.ts";
 import { redis } from "./redis.ts";
+import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步" },
@@ -34,6 +37,7 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
   { name: "cron_reset_expired_tunnel", everyMs: 60_000, desc: "重置过期隧道" },
   { name: "cron_reset_table_order", everyMs: 86_400_000, desc: "重置表排序" },
   { name: "cron_push_node_config", everyMs: 5_000, desc: "推送节点配置" },
+  { name: "cron_check_node_offline", everyMs: 30_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
@@ -56,6 +60,22 @@ const worker = new Worker(
       }
       case "cron_push_node_config":
         return { nodes: await db.node.count(), note: "sha256 incremental push" };
+      case "cron_check_node_offline": {
+        // 消费 `dc:<gid>:<nodeId>` 标记：防抖（60s）到点且无心跳 → 节点置 inactive。
+        // 幂等：重复消费/多 worker 并存均不会重复翻转（updateMany where status=active）。
+        const r = await runOfflineCheck(defaultOfflineDeps());
+        const summary = {
+          scanned: r.scanned,
+          flipped: r.flipped,
+          skipped: r.skippedWithinDebounce + r.skippedHeartbeatAlive,
+          cleared_groups: r.clearedGroups,
+          errors: r.errors,
+        };
+        if (r.flipped > 0 || r.errors > 0) {
+          console.log("[worker] cron_check_node_offline:", JSON.stringify(summary));
+        }
+        return summary;
+      }
       case "cron_update_agent":
         return { auto_update: await db.systemConfig.findUnique({ where: { name: "AUTO_UPDATE_AGENT" } }) };
       default:

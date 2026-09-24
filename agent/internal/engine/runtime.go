@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,10 @@ import (
 // "<ip>:WAIT_LISTEN<range>", e.g. ":WAIT_LISTEN20000-30000").
 const WaitListen = "WAIT_LISTEN"
 
+// errNoFreePort is returned by startService when a dynamic (WAIT_LISTEN) service
+// cannot find any free port in the configured range or on the host.
+var errNoFreePort = fmt.Errorf("no free port available")
+
 // Runtime applies configs and owns the running listeners.
 type Runtime struct {
 	listenIP  string
@@ -32,7 +37,17 @@ type Runtime struct {
 	services map[string]*runningService
 	chains   map[string]*ChainConfig
 
-	usedPorts map[int]bool
+	// usedPorts tracks ports already bound by this process, keyed by
+	// "<network>:<port>" (e.g. "tcp:19000" / "udp:19000"). Keying by network
+	// lets the same port be reused on the *other* protocol only when we really
+	// intend it; in practice every listener gets a distinct port, which keeps
+	// tcp and udp services of the same tunnel from colliding inside one agent.
+	usedPorts map[string]bool
+}
+
+// portKey builds the usedPorts key for a bound port.
+func portKey(network string, port int) string {
+	return network + ":" + strconv.Itoa(port)
 }
 
 // NewRuntime builds a runtime. portRange may be empty.
@@ -43,7 +58,7 @@ func NewRuntime(listenIP, portRange string) *Runtime {
 		portRange: pr,
 		services:  make(map[string]*runningService),
 		chains:    make(map[string]*ChainConfig),
-		usedPorts: make(map[int]bool),
+		usedPorts: make(map[string]bool),
 	}
 }
 
@@ -83,6 +98,14 @@ func (rt *Runtime) Reload(raw []byte) (int, error) {
 		}
 		desired[svc.Name] = svc
 	}
+	// Deterministic start order: iterate services by name (cfg.Services order is
+	// server-controlled but a stable sort makes dynamic port assignment below
+	// reproducible across reloads even if the server reorders the array).
+	order := make([]string, 0, len(desired))
+	for name := range desired {
+		order = append(order, name)
+	}
+	sort.Strings(order)
 
 	// Stop services that are gone.
 	for name, rs := range rt.services {
@@ -94,7 +117,8 @@ func (rt *Runtime) Reload(raw []byte) (int, error) {
 	}
 
 	// Start / refresh services.
-	for name, svc := range desired {
+	for _, name := range order {
+		svc := desired[name]
 		existing := rt.services[name]
 		if existing != nil && serviceEqual(existing.cfg, svc) {
 			continue // unchanged
@@ -108,6 +132,9 @@ func (rt *Runtime) Reload(raw []byte) (int, error) {
 			logx.Error("failed to start service", "name", name, "err", err.Error())
 			if isAddrInUse(err) && rt.OnListenError != nil {
 				rt.OnListenError(name, "ERR_PORT_IN_USE")
+			} else if err == errNoFreePort && rt.OnListenError != nil {
+				// Dynamic port exhaustion: tell the control plane instead of failing silently.
+				rt.OnListenError(name, "ERR_NO_FREE_PORT")
 			}
 			continue
 		}
@@ -149,9 +176,9 @@ func (rt *Runtime) startService(name string, svc *ServiceConfig) (*runningServic
 	// Determine the port to bind.
 	var port int
 	if dynamic {
-		port = rt.allocatePort(addr)
+		port = rt.allocatePort(network)
 		if port == 0 {
-			return nil, fmt.Errorf("no free port available")
+			return nil, errNoFreePort
 		}
 		addr = replacePort(addr, port)
 	} else {
@@ -184,7 +211,7 @@ func (rt *Runtime) startService(name string, svc *ServiceConfig) (*runningServic
 	}
 
 	if port > 0 {
-		rt.usedPorts[port] = true
+		rt.usedPorts[portKey(network, port)] = true
 	}
 	if rt.OnListen != nil && dynamic && port > 0 {
 		rt.OnListen(name, port, svcProtocol(svc))
@@ -202,7 +229,7 @@ func (rt *Runtime) stopService(rs *runningService) {
 		c.Close()
 	}
 	if rs.port > 0 {
-		delete(rt.usedPorts, rs.port)
+		delete(rt.usedPorts, portKey(rs.network, rs.port))
 	}
 }
 
@@ -249,13 +276,34 @@ func (rt *Runtime) resolveListenAddr(svc *ServiceConfig) (network, addr string, 
 	return network, net.JoinHostPort(host, port), false
 }
 
-func (rt *Runtime) allocatePort(addr string) int {
+func (rt *Runtime) allocatePort(network string) int {
+	exclude := rt.usedPortNumbers()
 	if rt.portRange != nil && !rt.portRange.Empty() {
-		if p := rt.portRange.GetFreePortByRange(rt.usedPorts); p != 0 {
-			return p
+		// A range is configured but every port in it is taken: return 0 so the
+		// caller emits ERR_NO_FREE_PORT. We deliberately do NOT silently fall
+		// back to an arbitrary ephemeral port — with control-plane port
+		// assignment that would reintroduce cross-node collisions and hide a
+		// real capacity problem from the operator.
+		return rt.portRange.GetFreePortByRangeProto(network, exclude)
+	}
+	return netutil.GetFreePortProto(network)
+}
+
+// usedPortNumbers returns every port number already bound by this process,
+// regardless of protocol. Excluding by number (not just per-network) guarantees
+// that the tcp and udp listeners of the same tunnel never share a port number.
+func (rt *Runtime) usedPortNumbers() map[int]bool {
+	out := make(map[int]bool, len(rt.usedPorts))
+	for k := range rt.usedPorts {
+		i := strings.IndexByte(k, ':')
+		if i < 0 {
+			continue
+		}
+		if p, err := strconv.Atoi(k[i+1:]); err == nil {
+			out[p] = true
 		}
 	}
-	return netutil.GetFreePort()
+	return out
 }
 
 // ---------------------------------------------------------------------------

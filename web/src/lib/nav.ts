@@ -38,10 +38,14 @@ export const adminNav: NavItem[] = [
     : []),
   { href: "/admin/tunnels", labelKey: "admin.tunnels", iconKey: "adminTunnels" },
   { href: "/admin/users", labelKey: "admin.users", iconKey: "users" },
+  { href: "/admin/roles", labelKey: "admin.roles", iconKey: "roles" },
   ...(process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true"
     ? ([{ href: "/admin/orders", labelKey: "admin.orders", iconKey: "orders" }] satisfies NavItem[])
     : []),
   { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
+  { href: "/admin/settings", labelKey: "admin.settings", iconKey: "settings" },
+  { href: "/admin/audit-logs", labelKey: "admin.auditLogs", iconKey: "license" },
+  { href: "/admin/license", labelKey: "admin.license", iconKey: "license" },
 ];
 
 /** 服务端可用：把 labelKey 解析成当前语言 */

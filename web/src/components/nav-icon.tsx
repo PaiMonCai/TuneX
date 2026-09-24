@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  BadgeCheck,
   BarChart3,
   Boxes,
   CreditCard,
@@ -10,6 +11,7 @@ import {
   Package,
   Server,
   Settings,
+  Shield,
   ShoppingCart,
   Users,
   Waypoints,
@@ -37,8 +39,10 @@ export const NAV_ICONS = {
   nodeGroups: Boxes,
   adminTunnels: Network,
   users: Users,
+  roles: Shield,
   orders: ShoppingCart,
   adminTickets: LifeBuoy,
+  license: BadgeCheck,
 } satisfies Record<string, LucideIcon>;
 
 export type IconKey = keyof typeof NAV_ICONS;

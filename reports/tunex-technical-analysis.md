@@ -140,7 +140,7 @@ Backend ─Fernet 加密 gost 配置─> Agent ─> 用户内网服务
 ### 4.7 未实现/半成品汇总
 
 1. worker 10 个 cron **全部占位**（流量入库、DNS 同步、自动续费、套餐到期通知、过期清理…）。
-2. **离线检测闭环缺失**：`dc:<gid>:<nodeId>` 标记能写，但**无 worker 消费**，节点崩溃后 DB 状态永远 `active`；`listen_error` 也无服务端 handler。
+2. **离线检测闭环缺失**：`dc:<gid>:<nodeId>` 标记能写，但**无 worker 消费**，节点崩溃后 DB 状态永远 `active`；`listen_error` 也无服务端 handler。→ **✅ 已修复（后于本报告）**：`listen_error` handler 已补（`socket/listen-events.ts`）；离线检测消费端已实现（`socket/offline-detector.ts` + worker cron `cron_check_node_offline`，30s 一轮，防抖 60s → `inactive`），详见 `DEVELOPMENT.md` §4.7。
 3. 动态端口冲突：`usedPorts` 仅进程内，跨 agent 二次刷新会撞 tcp/udp 同号。
 4. `port_conflict_at` 只返 400，不落库；全局限流仅在 register 有 block。
 5. 审计日志：**无**（`PLAN.md` 亦确认）。

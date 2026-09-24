@@ -256,6 +256,14 @@ func (pr *PortRange) Contains(port int) bool {
 
 // GetFreePortByRange finds a free TCP port inside the range (0 if none).
 func (pr *PortRange) GetFreePortByRange(exclude map[int]bool) int {
+	return pr.GetFreePortByRangeProto("tcp", exclude)
+}
+
+// GetFreePortByRangeProto finds a free port inside the range for the given
+// network ("tcp" or "udp"). Probing is done on the *same* protocol, so a UDP
+// listener will never be handed a port that merely happens to be free on TCP
+// (the kernel keeps independent tcp/udp port spaces). Returns 0 if none free.
+func (pr *PortRange) GetFreePortByRangeProto(network string, exclude map[int]bool) int {
 	if pr == nil {
 		return 0
 	}
@@ -264,7 +272,7 @@ func (pr *PortRange) GetFreePortByRange(exclude map[int]bool) int {
 			if exclude != nil && exclude[p] {
 				continue
 			}
-			if isPortFree(p) {
+			if isPortFreeProto(network, p) {
 				return p
 			}
 		}
@@ -274,6 +282,22 @@ func (pr *PortRange) GetFreePortByRange(exclude map[int]bool) int {
 
 // GetFreePort asks the kernel for an ephemeral free TCP port.
 func GetFreePort() int {
+	return GetFreePortProto("tcp")
+}
+
+// GetFreePortProto asks the kernel for an ephemeral free port on the network.
+func GetFreePortProto(network string) int {
+	if network == "" {
+		network = "tcp"
+	}
+	if network == "udp" {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+		if err != nil {
+			return 0
+		}
+		defer c.Close()
+		return c.LocalAddr().(*net.UDPAddr).Port
+	}
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		return 0
@@ -286,6 +310,22 @@ func GetFreePort() int {
 }
 
 func isPortFree(port int) bool {
+	return isPortFreeProto("tcp", port)
+}
+
+// isPortFreeProto probes whether a port is bindable on the given network.
+func isPortFreeProto(network string, port int) bool {
+	if network == "" {
+		network = "tcp"
+	}
+	if network == "udp" {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	}
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return false
