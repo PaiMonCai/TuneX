@@ -20,6 +20,7 @@ export const env = {
   redisUrl: process.env.REDIS_URL ?? "redis://redis:6379",
 
   authSecret: requireSecret("AUTH_SECRET"),
+  // Keep legacy issuer as default so existing sessions survive this release.
   jwtIssuer: process.env.JWT_ISSUER ?? "relayx-clone",
   /** Cookie `access` 的 JWT 有效期：12h（与原版会话对齐） */
   jwtTtlSeconds: Number(process.env.JWT_TTL_SECONDS ?? 12 * 60 * 60),
@@ -35,4 +36,6 @@ export const env = {
   licenseSecret: requireSecret("LICENSE_SECRET"),
 
   disableWorker: (process.env.DISABLE_WORKER ?? "false") === "true",
+  /** Optional billing integration; off by default, independent of RBAC. */
+  paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
 } as const;

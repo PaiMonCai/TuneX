@@ -123,6 +123,7 @@ adminRoutes.get("/license", async (c) => {
  * ------------------------------------------------------------------ */
 adminRoutes.get("/meta/resources", async (c) => {
   const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
   const access = getEffectiveAccess(user);
   return c.json({
     data: {

@@ -13,9 +13,6 @@
  *   import { ticketsRoutes } from "./routes/tickets.ts";
  *   app.route("/api/tickets", ticketsRoutes);
  *
- * 商务授权：原版对 /ticket/* 施加 businessLicenseRequired（个人授权 403）。
- * 这里沿用同一中间件；无 license 时放行，故默认部署无影响。
- *
  * 响应封装：前端 request() 剥掉 **一层** 顶层 data —— 列表返回
  *   { data: { data: rows, total, page, page_size } }，单对象返回 { data: obj }。
  */
@@ -23,12 +20,9 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
-import { businessLicenseRequired, type AppVariables } from "../middlewares/auth.ts";
+import type { AppVariables } from "../middlewares/auth.ts";
 
 export const ticketsRoutes = new Hono<{ Variables: AppVariables }>();
-
-// 原版对工单施加商务授权闸门（无 license 放行 / 个人授权 403）
-ticketsRoutes.use("*", businessLicenseRequired);
 
 type Ctx = Context<{ Variables: AppVariables }>;
 

@@ -22,43 +22,44 @@ export async function DashboardBody() {
       .list({ page: 1, page_size: 5 }, cookie)
       .catch(() => ({ data: [] as Tunnel[], total: 0, page: 1, page_size: 5 })),
   ]);
+  const paymentsEnabled = process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true";
   const usedPct = stats?.traffic_limit ? (stats.traffic_used / stats.traffic_limit) * 100 : 0;
 
   return (
     <div className="flex flex-col gap-5" data-testid="dashboard-body">
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard
+      <div className={`grid gap-4 sm:grid-cols-2 ${paymentsEnabled ? "xl:grid-cols-4" : "xl:grid-cols-3"}`}>
+        {paymentsEnabled && <StatCard
           title={t("dashboard.balance")}
           value={formatMoney(stats?.balance ?? 0)}
           hint={`${t("dashboard.commission")}: ${formatMoney(stats?.commission_balance ?? 0)}`}
           icon={CreditCard}
           testId="stat-balance"
-        />
+        />}
         <StatCard
           title={t("dashboard.tunnelCount")}
           value={`${stats?.tunnel_count ?? 0}${stats?.max_tunnels ? ` / ${stats.max_tunnels}` : ""}`}
-          hint={`${t("dashboard.currentPlan")}: ${stats?.plan_name ?? t("dashboard.noPlan")}`}
+          hint={paymentsEnabled ? `${t("dashboard.currentPlan")}: ${stats?.plan_name ?? t("dashboard.noPlan")}` : undefined}
           icon={Waypoints}
           testId="stat-tunnels"
         />
         <StatCard
           title={t("dashboard.monthTraffic")}
           value={formatBytes(stats?.month_traffic ?? 0)}
-          hint={`${t("dashboard.trafficUsed")}: ${formatBytes(stats?.traffic_limit ?? 0)}`}
+          hint={paymentsEnabled ? `${t("dashboard.trafficUsed")}: ${formatBytes(stats?.traffic_limit ?? 0)}` : undefined}
           icon={Waves}
           testId="stat-traffic"
         />
         <StatCard
           title={t("dashboard.nodesOnline")}
           value={`${stats?.active_nodes ?? 0} / ${stats?.total_nodes ?? 0}`}
-          hint={`${t("dashboard.expiresAt")}: ${formatDate(stats?.expired_at ?? null)}`}
+          hint={paymentsEnabled ? `${t("dashboard.expiresAt")}: ${formatDate(stats?.expired_at ?? null)}` : undefined}
           icon={Package}
           testId="stat-nodes"
         />
       </div>
 
       <div className="grid gap-5 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
+        <Card className={paymentsEnabled ? "lg:col-span-2" : "lg:col-span-3"}>
           <CardHeader>
             <CardTitle>{t("dashboard.trafficTrend")}</CardTitle>
             <CardDescription>{t("dashboard.subtitle")}</CardDescription>
@@ -66,7 +67,7 @@ export async function DashboardBody() {
           <CardContent>{traffic.length > 0 ? <TrafficChart data={traffic} /> : <div className="h-64 rounded-md bg-[var(--muted)]" />}</CardContent>
         </Card>
 
-        <Card>
+        {paymentsEnabled && <Card>
           <CardHeader>
             <CardTitle>{t("dashboard.currentPlan")}</CardTitle>
             <CardDescription>{stats?.plan_name ?? t("dashboard.noPlan")}</CardDescription>
@@ -103,7 +104,7 @@ export async function DashboardBody() {
               </Button>
             </div>
           </CardContent>
-        </Card>
+        </Card>}
       </div>
 
       <Card>

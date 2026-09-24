@@ -59,6 +59,7 @@ function toHttpException(e: unknown): never {
 
 paymentsRoutes.get("/", async (c) => {
   requireUser(c);
+  if (!env.paymentsEnabled) return c.json({ data: [] });
   const rows = await db.payment.findMany({
     where: { status: "active" },
     orderBy: [{ order_by: "desc" }, { id: "desc" }],

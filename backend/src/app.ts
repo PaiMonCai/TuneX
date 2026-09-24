@@ -14,6 +14,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import { env } from "./env.ts";
+import { isBillingBlocked } from "./services/billing-access.ts";
 import { db } from "./db.ts";
 import { redisPing } from "./redis.ts";
 import {
@@ -25,6 +26,7 @@ import {
 } from "./middlewares/auth.ts";
 import { authRoutes } from "./routes/auth.ts";
 import { adminRoutes } from "./routes/admin.ts";
+import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { payRoutes } from "./routes/pay.ts";
@@ -84,6 +86,14 @@ export function createApp() {
     return c.json({ status: ok ? "ok" : "degraded", checks }, ok ? 200 : 503);
   });
 
+  // Billing is opt-in; deny callbacks and writes before auth or route handlers.
+  app.use("*", async (c, next) => {
+    if (isBillingBlocked(c.req.path, c.req.method, env.paymentsEnabled)) {
+      return c.json({ error: "支付功能未启用" }, 403);
+    }
+    await next();
+  });
+
   // ④ 全局认证（白名单在 authRequired 内部短路）
   app.use("*", authRequired);
 
@@ -104,6 +114,7 @@ export function createApp() {
   app.route("/api/node-groups", nodeGroupsRoutes);
   app.route("/api", publicRoutes);
   app.route("/api/admin", adminRoutes);
+  app.route("/api/admin", nodeGrantRoutes);
   app.route("/api/admin", adminExtendedRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", week: "W1", site_url: env.siteUrl }));

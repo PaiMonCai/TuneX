@@ -103,6 +103,7 @@ export async function parseCallbackPayload(c: {
 /* ------------------------------------------------------------------ */
 
 payRoutes.get("/", async (c) => {
+  if (!env.paymentsEnabled) return c.json({ data: [] });
   // 与原版一致：**不返回 url / config**（含 api_key / pid / merchant_uuid 等敏感配置）
   const payments = await db.payment.findMany({
     where: { status: "active" },

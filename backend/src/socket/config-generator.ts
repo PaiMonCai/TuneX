@@ -31,6 +31,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isNodeGroupGranted } from "../services/node-group-policy.ts";
 import { isIPv4, isIPv6 } from "node:net";
 import { NodeType, TunnelCategory, TunnelType, IpType } from "@prisma/client";
 import type { LoadBalanceType } from "@prisma/client";
@@ -38,7 +39,6 @@ import { db } from "../db.ts";
 import { redis } from "../redis.ts";
 import { env } from "../env.ts";
 import { systemConfig } from "../services/config.ts";
-import { licenseService } from "../services/license.ts";
 import {
   DEFAULT_OBSERVER_NAME,
   DEFAULT_OBSERVER_PERIOD,
@@ -81,6 +81,7 @@ export interface AvailableNode {
 
 export interface AvailableNodeGroup {
   id: number;
+  user_id: number;
   node_type: NodeType;
   load_balance_type: LoadBalanceType;
   nodes: AvailableNode[];
@@ -112,6 +113,7 @@ export interface AvailableUserPlan {
 
 export interface AvailableUser {
   id: number;
+  node_group_grants?: { node_group_id: number; direction: NodeType; active: boolean }[];
   user_plan: AvailableUserPlan | null;
 }
 
@@ -383,10 +385,8 @@ export function uuidv5(name: string, namespace: string = UUID_NAMESPACE_URL): st
 /* ================================================================== */
 
 /**
- * 复刻原版 `filterAvailableTunnels`：
- *  · 套餐未 `all_in_node_groups` 时，按 `plan_node_group` 白名单过滤入口组；
- *  · 出口组同理（`all_out_node_groups`）；
- *  · 再按用户套餐的 `max_tunnels` / `traffic` 上限逐条放行。
+ * 节点组归属或显式准入与购买无关；历史 UserPlan 存在时暂保留额度限制。
+ * 无套餐的新用户可使用自有节点组（后续迁移到 CapabilityPolicy）。
  */
 export function filterAvailableTunnels(
   tunnels: AvailableTunnel[],
@@ -397,29 +397,18 @@ export function filterAvailableTunnels(
   const userTunnelCount: Record<number, number> = {};
 
   const filtered = tunnels.filter((tunnel) => {
-    const plan = tunnel.user?.user_plan?.plan;
-    if (inNodeGroupId && !isOwnGroup(tunnel, inNodeGroupId, "in")) {
-      if (!plan?.all_in_node_groups) {
-        const groups = plan?.node_groups ?? [];
-        if (groups.length > 0 && !groups.some((g) => g.node_group_id === inNodeGroupId)) return false;
-      }
-    }
-    if (outNodeGroupId && !isOwnGroup(tunnel, outNodeGroupId, "out")) {
-      if (!plan?.all_out_node_groups) {
-        const groups = plan?.node_groups ?? [];
-        if (groups.length > 0 && !groups.some((g) => g.node_group_id === outNodeGroupId)) return false;
-      }
-    }
+    if (!hasAuthorizedTopology(tunnel)) return false;
+    if (inNodeGroupId && !canUseTunnelGroup(tunnel, inNodeGroupId, "in")) return false;
+    if (outNodeGroupId && !canUseTunnelGroup(tunnel, outNodeGroupId, "out")) return false;
     return true;
   });
 
   for (const tunnel of filtered) {
     const userId = tunnel.user_id;
     const userPlan = tunnel.user?.user_plan;
-    if (!userPlan) continue;
-    const trafficUsed = userPlan.traffic_used ?? 0;
-    const maxTunnels = userPlan.max_tunnels ?? userPlan.plan?.max_tunnels ?? null;
-    const traffic = userPlan.traffic ?? userPlan.plan?.traffic ?? null;
+    const trafficUsed = userPlan?.traffic_used ?? 0;
+    const maxTunnels = userPlan?.max_tunnels ?? userPlan?.plan?.max_tunnels ?? null;
+    const traffic = userPlan?.traffic ?? userPlan?.plan?.traffic ?? null;
     const used = userTunnelCount[userId] ?? 0;
     if (maxTunnels != null && used >= maxTunnels) continue;
     if (traffic != null && trafficUsed >= traffic) continue;
@@ -429,14 +418,22 @@ export function filterAvailableTunnels(
   return available;
 }
 
-/** 判断 in/out 组是否属于该隧道自身的用户（克隆结构无分组 owner 字段时视为「自有」）。 */
-function isOwnGroup(tunnel: AvailableTunnel, groupId: number, kind: "in" | "out"): boolean {
+/** Missing group/owner data fails closed. Purchases never grant shared group access. */
+export function canUseTunnelGroup(tunnel: AvailableTunnel, groupId: number, kind: "in" | "out"): boolean {
   const group = kind === "in" ? tunnel.in_node_group : tunnel.out_node_group;
-  // 原版用 node_group.user_id 与 tunnel.user_id 比较；克隆的 AvailableNodeGroup 未展开 user_id，
-  // 缺省按「自有」处理（不额外收紧），与原版在用户自有节点组下的行为一致。
-  const owner = (group as unknown as { user_id?: number } | undefined)?.user_id;
-  if (owner === undefined) return true;
-  return owner === tunnel.user_id;
+  if (!group || group.id !== groupId) return false;
+  return isNodeGroupGranted(tunnel.user_id, group, kind, tunnel.user?.node_group_grants ?? []);
+}
+
+/** Reject the whole tunnel when any primary or multi-hop group is not authorized. */
+export function hasAuthorizedTopology(tunnel: AvailableTunnel): boolean {
+  if (!canUseTunnelGroup(tunnel, tunnel.in_node_group_id, "in")) return false;
+  if (tunnel.out_node_group_id && !canUseTunnelGroup(tunnel, tunnel.out_node_group_id, "out")) return false;
+  return (tunnel.tunnel_chains ?? []).every((chain) =>
+    chain.node_group?.id === chain.node_group_id &&
+    chain.node_group.node_type === chain.node_type &&
+    isNodeGroupGranted(tunnel.user_id, chain.node_group, chain.node_type, tunnel.user?.node_group_grants ?? [])
+  );
 }
 
 function minLimit(a: number | null | undefined, b: number | null | undefined): number | undefined {
@@ -923,7 +920,7 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
     }
   }
 
-  const existsInChains = allTunnels.some((t) =>
+  const existsInChains = filterAvailableTunnels(allTunnels).some((t) =>
     (t.tunnel_chains ?? []).some(
       (c) => c.node_group_id === inNodeGroupId && c.node_group?.node_type === NodeType.in,
     ),
@@ -1009,7 +1006,7 @@ export function buildOutNodeConfig(input: OutConfigInput): NodeConfig {
   const portForwardTunnels = tunnels.filter((t) => t.category === TunnelCategory.port_forward);
   const tunnelTypes = new Set<TunnelType>(portForwardTunnels.map((t) => t.tunnel_type));
 
-  const existsInChains = allTunnels.some((t) =>
+  const existsInChains = filterAvailableTunnels(allTunnels).some((t) =>
     (t.tunnel_chains ?? []).some(
       (c) => c.node_group_id === outNodeGroupId && c.node_group?.node_type === NodeType.out,
     ),
@@ -1190,18 +1187,14 @@ async function loadGroupBlockProtocols(groupId: number): Promise<unknown> {
  * 复刻原版 `getAllAvailableTunnels`：拉取「有效」隧道（active 状态 + 用户 active +
  * 套餐未过期）并展开生成配置所需的关系。
  *
- * 授权门：与原版一致 —— 无 license 时返回 `[]`（不下发任何隧道）。
+ * 不依赖 License 或购买；按节点组所有权/显式准入过滤。
  */
 export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
-  const license = await licenseService.getLicense();
-  if (!license) return [];
-  const expiredAt = Number(license.expired_at ?? 0);
-  if (expiredAt > 0 && expiredAt < Math.floor(Date.now() / 1000)) return [];
-
   const rows = await db.tunnel.findMany({
     include: {
       user: {
         include: {
+          node_group_grants: { where: { active: true } },
           user_plan: {
             include: {
               plan: { include: { node_groups: true } },
@@ -1227,12 +1220,7 @@ export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
     orderBy: { id: "asc" },
     where: {
       status: "active",
-      user: {
-        status: "active",
-        user_plan: {
-          OR: [{ expired_at: { gt: new Date() } }, { expired_at: null }],
-        },
-      },
+      user: { status: "active" },
     },
   });
 
@@ -1243,7 +1231,7 @@ export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
   });
   for (const g of blockProtocols) blockProtocolsByGroup.set(g.id, g.block_protocols ?? undefined);
 
-  return (rows as unknown as AvailableTunnel[]).map((t) => ({
+  return (rows as unknown as AvailableTunnel[]).filter(hasAuthorizedTopology).map((t) => ({
     ...t,
     in_node_group_block_protocols: blockProtocolsByGroup.get(t.in_node_group_id),
   }));

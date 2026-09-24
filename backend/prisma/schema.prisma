@@ -53,10 +53,29 @@ model NodeGroup {
   out_tunnels       Tunnel[]         @relation("out_node_group")
   nodes             Node[]
   plans             PlanNodeGroup[]
+  grants            NodeGroupGrant[]
   tunnel_chains     TunnelChain[]
   in_node_group_dns InNodeGroupDNS[]
 
   @@map("node_group")
+}
+
+// Shared node groups require an explicit per-user, per-direction grant.
+// Ownership is handled separately; no purchase or license relationship.
+model NodeGroupGrant {
+  id            Int       @id @default(autoincrement())
+  user_id       Int
+  user          User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  node_group_id Int
+  node_group    NodeGroup @relation(fields: [node_group_id], references: [id], onDelete: Cascade)
+  direction     NodeType
+  active        Boolean   @default(true)
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  @@unique([user_id, node_group_id, direction])
+  @@index([node_group_id, active])
+  @@map("node_group_grant")
 }
 
 model Node {
@@ -180,6 +199,7 @@ model User {
   notify_subscriptions     Json?
   admin_notify_subscriptions Json?
   node_groups              NodeGroup[]
+  node_group_grants        NodeGroupGrant[]
   status                   Status             @default(active)
   created_at               DateTime           @default(now())
   updated_at               DateTime           @updatedAt

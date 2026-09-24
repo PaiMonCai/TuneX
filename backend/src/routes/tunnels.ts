@@ -28,6 +28,7 @@ import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { pushNodeConfig } from "../socket/config-pusher.ts";
+import { canUseNodeGroup } from "../services/node-group-access.ts";
 
 export const tunnelsRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -169,6 +170,8 @@ tunnelsRoutes.post("/", async (c) => {
   if (!Number.isInteger(inGroupId)) return c.json({ error: "必须指定入口节点组" }, 400);
   const inGroup = await db.nodeGroup.findUnique({ where: { id: inGroupId } });
   if (!inGroup) return c.json({ error: "入口节点组不存在" }, 404);
+  if (inGroup.node_type !== "in" || !(await canUseNodeGroup(user.id, inGroup, "in")))
+    return c.json({ error: "无权使用入口节点组" }, 403);
 
   let outGroupId: number | null = null;
   if (body.out_node_group_id !== undefined && body.out_node_group_id !== null && body.out_node_group_id !== "") {
@@ -176,6 +179,8 @@ tunnelsRoutes.post("/", async (c) => {
     if (!Number.isInteger(parsed)) return c.json({ error: "出口节点组非法" }, 400);
     const outGroup = await db.nodeGroup.findUnique({ where: { id: parsed } });
     if (!outGroup) return c.json({ error: "出口节点组不存在" }, 404);
+    if (outGroup.node_type !== "out" || !(await canUseNodeGroup(user.id, outGroup, "out")))
+      return c.json({ error: "无权使用出口节点组" }, 403);
     outGroupId = outGroup.id;
   }
 
@@ -336,6 +341,8 @@ tunnelsRoutes.patch("/:id", async (c) => {
     const gid = Number(body.in_node_group_id);
     const g = Number.isInteger(gid) ? await db.nodeGroup.findUnique({ where: { id: gid } }) : null;
     if (!g) return c.json({ error: "入口节点组不存在" }, 404);
+    if (g.node_type !== "in" || !(await canUseNodeGroup(user.id, g, "in")))
+      return c.json({ error: "无权使用入口节点组" }, 403);
     data.in_node_group_id = g.id;
   }
   if (body.out_node_group_id !== undefined) {
@@ -345,6 +352,8 @@ tunnelsRoutes.patch("/:id", async (c) => {
       const oid = Number(body.out_node_group_id);
       const g = Number.isInteger(oid) ? await db.nodeGroup.findUnique({ where: { id: oid } }) : null;
       if (!g) return c.json({ error: "出口节点组不存在" }, 404);
+      if (g.node_type !== "out" || !(await canUseNodeGroup(user.id, g, "out")))
+        return c.json({ error: "无权使用出口节点组" }, 403);
       data.out_node_group_id = g.id;
     }
   }

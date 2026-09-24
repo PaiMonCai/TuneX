@@ -1,0 +1,90 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-only-password
+          MYSQL_DATABASE: tunex_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent -h 127.0.0.1 -pci-only-password"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=10s
+          --health-timeout=5s --health-retries=12
+    env:
+      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci
+      REDIS_URL: redis://127.0.0.1:6379
+      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production
+      LICENSE_SECRET: ci-only-license-secret-must-not-be-used-in-production
+      PAYMENTS_ENABLED: "false"
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@v2
+      - name: Install locked backend dependencies
+        run: bun ci
+      - name: Apply migrations on an empty MySQL database
+        run: bunx prisma migrate deploy
+      - name: Generate Prisma Client and typecheck
+        run: |
+          bunx prisma generate
+          bunx tsc --noEmit
+      - name: Authorization and payment HTTP tests
+        run: bun run test
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Build with optional billing disabled
+        run: npm run build
+        env:
+          NEXT_PUBLIC_PAYMENTS_ENABLED: "false"
+          NEXT_PUBLIC_API_MOCK: "1"
+
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: agent/go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build -buildvcs=false ./...

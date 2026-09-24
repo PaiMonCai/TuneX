@@ -19,8 +19,12 @@ export interface NavItem {
 export const userNav: NavItem[] = [
   { href: "/dashboard", labelKey: "common.dashboard", iconKey: "dashboard" },
   { href: "/tunnels", labelKey: "common.tunnels", iconKey: "tunnels" },
-  { href: "/plans", labelKey: "common.plans", iconKey: "plans" },
-  { href: "/topup", labelKey: "common.topup", iconKey: "topup" },
+  ...(process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true"
+    ? ([
+        { href: "/plans", labelKey: "common.plans", iconKey: "plans" },
+        { href: "/topup", labelKey: "common.topup", iconKey: "topup" },
+      ] satisfies NavItem[])
+    : []),
   { href: "/tickets", labelKey: "common.tickets", iconKey: "tickets" },
   { href: "/settings", labelKey: "common.settings", iconKey: "settings" },
 ];
@@ -29,10 +33,14 @@ export const adminNav: NavItem[] = [
   { href: "/admin", labelKey: "admin.dashboard", iconKey: "adminDashboard" },
   { href: "/admin/nodes", labelKey: "admin.nodes", iconKey: "nodes" },
   { href: "/admin/node-groups", labelKey: "admin.nodeGroups", iconKey: "nodeGroups" },
-  { href: "/admin/plans", labelKey: "admin.plans", iconKey: "plans" },
+  ...(process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true"
+    ? ([{ href: "/admin/plans", labelKey: "admin.plans", iconKey: "plans" }] satisfies NavItem[])
+    : []),
   { href: "/admin/tunnels", labelKey: "admin.tunnels", iconKey: "adminTunnels" },
   { href: "/admin/users", labelKey: "admin.users", iconKey: "users" },
-  { href: "/admin/orders", labelKey: "admin.orders", iconKey: "orders" },
+  ...(process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true"
+    ? ([{ href: "/admin/orders", labelKey: "admin.orders", iconKey: "orders" }] satisfies NavItem[])
+    : []),
   { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
 ];
 

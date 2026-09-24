@@ -1,6 +1,6 @@
 /**
  * 中间件链 —— authRequired / adminRequired / adminPermissionGuard /
- * superAdminRequired / businessLicenseRequired
+ * superAdminRequired (roles independent of billing/license)
  * 依据: relayx-auth-rbac-source-verification-report.md §1-§3
  */
 import { createMiddleware } from "hono/factory";
@@ -10,7 +10,6 @@ import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
 import { env } from "../env.ts";
 import { verifyAccessToken, isUUID, safeEqual } from "../auth.ts";
-import { licenseService } from "../services/license.ts";
 import {
   getEffectiveAccess,
   resolveAdminRoute,
@@ -141,12 +140,6 @@ export const authRequired = createMiddleware<{ Variables: AppVariables }>(async 
 
   if (!isUUID(bearer)) throw new HTTPException(401, { message: "Unauthorized" });
 
-  // 个人授权禁用 API Key（原版语义）
-  const license = await licenseService.getLicense();
-  if (license && license.type !== "business") {
-    throw new HTTPException(403, { message: "请购买商业授权" });
-  }
-
   const user = await db.user.findUnique({
     where: { api_key: bearer },
     include: { admin_roles: true },
@@ -166,11 +159,7 @@ export const authRequired = createMiddleware<{ Variables: AppVariables }>(async 
 export const adminRequired = createMiddleware<{ Variables: AppVariables }>(async (c, next) => {
   const user = c.get("user");
   if (user?.super_admin) return await next();
-  if (
-    user?.admin_roles?.length &&
-    (await licenseService.isBusinessLicense()) &&
-    getEffectiveAccess(user).size > 0
-  ) {
+  if (user && user.admin_roles.length > 0 && getEffectiveAccess(user).size > 0) {
     return await next();
   }
   throw new HTTPException(403, { message: "Forbidden" });
@@ -179,6 +168,7 @@ export const adminRequired = createMiddleware<{ Variables: AppVariables }>(async
 /** adminPermissionGuard —— 细粒度资源闸门 */
 export const adminPermissionGuard = createMiddleware<{ Variables: AppVariables }>(async (c, next) => {
   const user = c.get("user");
+  if (!user) throw new HTTPException(401, { message: "Unauthorized" });
   if (user?.super_admin) return await next();
 
   // 路由挂载带 /api 前缀；权限表按原版以 /admin/* 为键，故先剥离 /api
@@ -187,10 +177,6 @@ export const adminPermissionGuard = createMiddleware<{ Variables: AppVariables }
   if (!entry) throw new HTTPException(403, { message: "无权访问该功能" });
   if (entry.key === SUPER_ADMIN_KEY) throw new HTTPException(403, { message: "Forbidden" });
   if (entry.key === STAFF_SHARED_KEY) return await next();
-
-  if (!(await licenseService.isBusinessLicense())) {
-    throw new HTTPException(403, { message: "无权访问该功能" });
-  }
 
   const granted = getEffectiveAccess(user).get(entry.key);
   const required = requiredLevel(c.req.method);
@@ -204,14 +190,3 @@ export const superAdminRequired = createMiddleware<{ Variables: AppVariables }>(
   if (c.get("user")?.super_admin) return await next();
   throw new HTTPException(403, { message: "Forbidden" });
 });
-
-/** businessLicenseRequired —— 无 license 放行，个人授权 403 */
-export const businessLicenseRequired = createMiddleware<{ Variables: AppVariables }>(
-  async (c, next) => {
-    const license = await licenseService.getLicense();
-    if (license && license.type !== "business") {
-      throw new HTTPException(403, { message: "请购买商业授权" });
-    }
-    return await next();
-  },
-);

@@ -12,8 +12,7 @@
  *   { data: { data: rows, total, page, page_size } }
  * 前端拿到即为 Paginated<NodeGroup>（用于创建隧道时的入口/出口节点组下拉）。
  *
- * 可见范围：与原版/前端 mock 一致，返回全部 active 节点组（节点组属基础设施，
- * 非用户私有数据）；运营如需按套餐限制可见性，可在此叠加 plan 过滤。
+ * 可见范围：仅自有或显式授权节点组；不通过套餐隐式授权。
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -32,16 +31,14 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
 }
 
 nodeGroupsRoutes.get("/", async (c) => {
-  requireUser(c);
+  const user = requireUser(c);
 
   const q = c.req.query();
   const page = Math.max(1, Number(q.page ?? 1) || 1);
   const page_size = Math.min(200, Math.max(1, Number(q.page_size ?? 20) || 20));
   const keyword = String(q.keyword ?? "").trim();
-  const status = q.status && q.status !== "all" ? String(q.status) : undefined;
-
   const where = {
-    ...(status ? { status: status as "active" | "inactive" } : {}),
+    OR: [{ user_id: user.id }, { grants: { some: { user_id: user.id, active: true } } }],
     ...(keyword ? { name: { contains: keyword } } : {}),
   };
 
@@ -65,7 +62,8 @@ nodeGroupsRoutes.get("/", async (c) => {
   });
   const onlineMap = new Map(onlineCounts.map((r) => [r.node_group_id, r._count._all]));
 
-  const data = rows.map(({ _count, ...g }) => ({
+  // A shared group grant allows tunnel use, not possession of its Agent registration token.
+  const data = rows.map(({ _count, token: _token, ...g }) => ({
     ...g,
     node_count: _count.nodes,
     online_node_count: onlineMap.get(g.id) ?? 0,

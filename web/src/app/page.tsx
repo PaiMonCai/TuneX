@@ -24,7 +24,7 @@ export default async function LandingPage() {
       <header className="flex h-14 items-center justify-between border-b border-[var(--border)] px-6">
         <div className="flex items-center gap-2">
           <div className="grid size-8 place-items-center rounded-md bg-[var(--primary)] text-sm font-bold text-[var(--primary-foreground)]">
-            R
+            T
           </div>
           <span className="text-sm font-semibold">{t.common.siteName}</span>
         </div>
@@ -58,7 +58,9 @@ export default async function LandingPage() {
               </Link>
             </Button>
             <Button size="lg" variant="outline" asChild>
-              <Link href="/plans">{t.landing.ctaSecondary}</Link>
+              <Link href={process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? "/plans" : "/tunnels"}>
+                {process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? t.landing.ctaSecondary : t.common.tunnels}
+              </Link>
             </Button>
           </div>
         </div>

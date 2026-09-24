@@ -10,7 +10,9 @@
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
     "generate": "prisma generate",
-    "seed": "bun prisma/seed.ts"
+    "seed": "bun prisma/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test tests/*.test.mjs"
   },
   "dependencies": {
     "@prisma/client": "6.13.0",
