@@ -1172,15 +1172,20 @@ S8 之前 RELAY 不得作为默认公开能力。
 
 ## 10. 分支、PR 与提交约定
 
-推荐：
+分支名必须与当前 Step 对应，优先使用本文件第 7 节给出的固定名称，例如：
 
 ```text
-feature/v3-s1-schema
+feature/v3-s1a-schema
+feature/v3-s1b-backfill
 feature/v3-s2-port-lease
-feature/v3-s3-relay-agent
-feature/v3-s4-control-protocol
+feature/v3-s3a-agent-runtime
+feature/v3-s3b-relay-dataplane
+feature/v3-s4a-control-protocol
+feature/v3-s4b-node-session
 ...
 ```
+
+不得创建“下一阶段总分支”一次堆多个 Step。
 
 PR 标题：
 
@@ -1223,15 +1228,31 @@ PR 描述必须包含：
 
 ## 12. 当前下一步
 
-当前主线从 **V3-S1 Schema** 开始。
+**当前执行游标：Step 1 — V3-S1A Schema。**
 
-在 S1 完成之前，不开发 v3 UI、不切新 DIRECT、不加入 UDP/QUIC，也不扩大支付/工单/返佣等非核心模块。
+当前唯一允许的新功能分支：
 
-S1 的第一份 PR 应只完成：
+```text
+feature/v3-s1a-schema
+```
 
-1. v3 schema additive migration。
-2. legacy 数据安全回填。
-3. Prisma / migration 测试。
-4. 不接 Agent、不改 UI、不启用 RELAY。
+这一 PR **只做数据模型与 additive migration**：
 
-这将作为 TuneX 后续所有 v3 开发的统一起点。
+1. 定义 Node.role 与节点 credential 字段。
+2. 定义 Tunnel 的 mode、实际 ingress/egress binding、端口、desired/apply 状态与 revision 字段。
+3. 新增 EgressPool / EgressTarget / NodePortLease。
+4. 补齐唯一约束、外键和安全的 onDelete 行为。
+5. 通过空库 migrate、Prisma generate、TypeScript typecheck 和完整 CI。
+
+这一 PR **不做**：
+
+- legacy backfill（属于 Step 2）；
+- port allocator（Step 3）；
+- Agent runtime / RELAY（Step 4–5）；
+- 控制协议（Step 6–7）；
+- API / Web（Step 10–13）；
+- DIRECT 迁移、UDP、QUIC、支付等后续能力。
+
+Step 1 合并到 main 且 main push CI 再次全绿以后，才把执行游标更新为 **Step 2 — V3-S1B Backfill**。
+
+从现在开始，后续全部开发都以第 7 节的 Step 顺序为准。
