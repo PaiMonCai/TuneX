@@ -354,7 +354,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP | 工作包 | Track | 可以开始开发 | 可以合并 main |
 |---|---|---|---|---|
 | WP0 | 架构/文档冻结 | Shared | 已完成 | ✅ 已完成 |
-| WP1 | v3 Schema 契约 | A | WP0 | WP0 |
+| WP1 | v3 Schema 契约 | A | WP0 | ✅ 已完成（PR #10） |
 | WP2 | Legacy Backfill / Upgrade | A | WP1 schema 设计冻结后 | **WP1 已合并** |
 | WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | **WP1 已合并** |
 | WP4 | Agent v3 Runtime 骨架 | B | WP0；不依赖 DB 实现 | WP1 已合并或确认无 schema 耦合 |
@@ -377,24 +377,27 @@ TuneX v3 团队按以下 Track 并行推进：
 
 ### 7.3 当前并行开发窗口
 
-当前已完成 WP0，**WP1 尚未完成**。
+WP1 已完成（见 §7.4 交付记录）。当前同步窗口为：
 
-所以现在团队可以同时启动：
+WP1 合并后立即扩展并行窗口到 **WP2 + WP3**，B/C Track 继续推进：
 
 #### Track A
-`feature/v3-wp1-schema`
+`feature/v3-wp2-legacy-backfill`（WP2）、`feature/v3-wp3-port-lease`（WP3）
 
-负责 WP1，优先级最高，是当前唯一 Foundation Gate。
+依赖已满足（WP1 已合并）。注意：
+
+- WP2 只能做**确定性**回填，不得猜测 Node.role（WP1 的 `role` 列可空正是为此留的）。
+- WP3 的端口所有权以 `NodePortLease.UNIQUE(node_id, port)` 为最终真相，
+  Redis NX 抢占锁统一取 `RedisKeys.portLeaseLock`（见 `src/tenant-scope.ts`）。
 
 #### Track B
 `feature/v3-wp4-agent-runtime`
 
-可以同步开发 Agent runtime 骨架，但必须满足：
+WP1 已合并，Prisma 类型已生成，可按最终字段开发；仍需满足：
 
 - 不依赖未落库的具体 Prisma 字段。
 - 不改 legacy DIRECT 行为。
 - runtime interface 使用 v3map / DEVELOPMENT 已冻结的语义。
-- 如果最终需要 WP1 字段生成类型，则 PR 标记 `blocked-by: WP1`，WP1 合并后 rebase 再合。
 
 #### Track C
 `feature/v3-wp6-control-contract`
@@ -424,13 +427,13 @@ TuneX v3 团队按以下 Track 并行推进：
 **当前建议团队分工：**
 
 ```text
-开发者 A → WP1 Schema
-开发者 B → WP4 Agent Runtime
-开发者 C → WP6 Control Contract
+开发者 A → WP2 Legacy Backfill → WP3 NodePortLease / Port Allocator
+开发者 B → WP4 Agent v3 Runtime（WP5 依赖它）
+开发者 C → WP6 Control / Revision / ACK 协议 → WP7 Node Credential
 开发者 D → WP14 E2E Harness / QA infrastructure
 ```
 
-WP1 合并后立即扩展并行窗口到 WP2 + WP3，同时 B/C Track 继续推进。
+WP1 已合并（见 §7.4），WP2 + WP3 已解锁；WP5/WP7/WP8 的合并门槛不变。
 
 ---
 
@@ -459,13 +462,59 @@ WP1 合并后立即扩展并行窗口到 WP2 + WP3，同时 B/C Track 继续推�
 
 只做 additive migration，不删除 legacy 字段，不改变现有 DIRECT runtime。
 
+**已决定项（契约，后续模块不得偏离）：**
+
+- 三张新表与 Node/Tunnel 的 v3 增量列**全部可空**或随新表新建，无一处
+  `MODIFY` 旧列，因此 §6 的回滚路径（保留新增 schema，回滚镜像）成立。
+- `Node.role` 可空且**不回填**：存量角色不可确定性推断，`role === null` 表示
+  「尚未声明」，v3 代码不得把它默认成 ingress。WP2 同样禁止猜 BOTH。
+- `NodePortLease` 的 `UNIQUE(node_id, port)` 是端口所有权唯一真相，
+  `lease_type` 只是元数据（否则 BOTH 节点同端口双绑）。Redis NX 抢占锁只是
+  短事务协调（见 `tenant-scope.ts` 的 `portLeaseLockKey` 使用约束）。
+- 新表**不冗余 `workspace_id`**：归属沿 `Node → node_group → workspace_id`
+  单向上查，DB 里只存一份归属真相；scope 统一经 `nodeScope()` 派生。
+- `Tunnel.remote_host / remote_port` 由存量 `forward_addresses[0]` 幂等回填
+  （字符串数组 / 对象数组两种历史形态；解析不出即留 NULL，不写 0 端口）。
+  RELAY 隧道不填这两列——目标在 `EgressTarget` 上。
+- `desired_status / apply_status` 用 `VARCHAR(20)` 而非枚举：DB 列先落地，
+  应用层状态机（§4.1 的 pending/applying/active/error/suspended）随 WP8 编排器
+  一起收敛，避免现在加枚举、WP8 又要 `ALTER` 改它。
+
 DoD：
 
-- empty DB migrate；
-- Prisma generate；
-- backend typecheck；
-- schema review；
-- full CI green。
+- empty DB migrate；✅（迁移 `20260926040000_v3_schema_contract` 在空库全量通过）
+- Prisma generate；✅
+- backend typecheck；✅（`tsc --noEmit`，0 error）
+- schema review；✅（下方评审记录）
+- full CI green。⏳ 等 push 后的 CI 验证
+
+**已知留白（有意，非缺口）：**
+
+- `per-node credential` 字段（§7.4 要求）由 **WP7** 落地：本包只冻结了
+  credential 的**作用域语义**（`nodeRegisterBlockKey` 走 global 段，
+  因为防爆破发生在身份解析之前）。建列等 WP7 的 schema 一起，避免现在加一列
+  没人写、也没法验证。
+- `ingress_node_id / ingress_port` 没有新增列：`tunnel.in_node_group_id` +
+  `tunnel.listen_port` 已是既有的等价物（入口组授权 + 用户可见端口）。
+  但 §2.1「禁止只保存 NodeGroup、不保存实际 ingress Node」的**实际入口节点**
+  仍未落列——它属于 WP8 Scheduler 的产出，WP1 只加 `egress_node_id`
+  （RELAY 必需的出口侧）。这一条必须在 WP8 schema 设计时补齐，不能沿用
+  NodeGroup 顶替。
+
+**Schema review 记录（WP1 自查，逐条对着 §2.1/§2.2/§4.1/§5.1 核过）：**
+
+| 审查项 | 结论 |
+|---|---|
+| `Node.role` 是节点能力最终真相源（§2.1） | ✅ 新增可空枚举列 + 索引；NodeGroup.node_type 保持 legacy 不动 |
+| 只保存 NodeGroup、不保存实际 ingress Node 的禁令 | ⚠️ `egress_node_id` 已落；`ingress_node_id` 属 WP8（见上「已知留白」） |
+| `EgressPool → EgressTarget[]` 层级（§2.2） | ✅ 新表 + `UNIQUE(node_id, name)`（每节点含自动 `default` 池唯一） |
+| 目标热更新不重建隧道（§2.2） | ✅ 池无 revision 列，版本由 `Tunnel.config_revision` 驱动 |
+| 至少一个 active 且 weight>0 的目标才允许应用（§2.2） | ✅ 应用层不变式（schema 注释已标注），不在 DB 层强约束 |
+| Tunnel 是期望状态而非一次 HTTP 操作（§4.1） | ✅ desired/apply/revision/error 全套落列；失败不删记录 |
+| 单物理端口一个 owner（§5.1） | ✅ `UNIQUE(node_id, port)`，方向只是元数据；实测同节点同端口不同方向的插入被拒 |
+| 删节点不物理删用户隧道（v3 铁律） | ✅ `tunnel_egress_node_id` / `tunnel_egress_pool_id` 均 `ON DELETE SET NULL`；实测删节点后隧道行保留、指针置 NULL |
+| expand-and-contract（§6） | ✅ 迁移内零 `DROP`、零 `MODIFY` 旧列；回滚只需回滚镜像 |
+| 存量 DIRECT 零影响（§7.5） | ✅ 只加列/表/索引；配置生成路径（config-generator / port-allocator）未改一行 |
 
 ---
 

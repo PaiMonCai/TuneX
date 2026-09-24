@@ -4,8 +4,12 @@ import {
   GLOBAL_SCOPE,
   aliveGroupsKey,
   configHashKey,
+  nodeRegisterBlockKey,
   observerBufferKey,
   outListenKey,
+  parsePortLeaseLockKey,
+  portLeaseLockKey,
+  portLeaseLockPattern,
   registerBlockKey,
   scopedKey,
   trafficBufferPrefix,
@@ -33,12 +37,14 @@ redis.on("error", (e) => {
  * 段位判定规则：**键的值是否描述某个 workspace 的资产**。
  *
  *   ws:<workspaceId>:...   租户数据。心跳、离线标记、出口端口表、流量缓冲、
- *                          observer 回传原文——内容属于某个 workspace。
+ *                          observer 回传原文、v3 端口租约锁（WP1）——
+ *                          内容属于某个 workspace。
  *   ws:global:...          平台共享数据。值只描述「平台侧/账户侧」的东西：
  *                          node_group.token 防爆破键（token 全局唯一）、
  *                          license 快照（实例级配置）、支付回调留痕、
  *                          JWT sub 映射（一个用户可属多个 workspace）、
- *                          冒充票据（token 全局唯一）。
+ *                          冒充票据（token 全局唯一）、节点凭据防爆破键
+ *                          （身份解析前发生，此时还不知道租户归属）。
  *
  * 注意「全局」在这里是显式选择（调用方显式传 0 或不传），而不是漏写 scope 的
  * 结果：漏写 scope 与「这就是全局键」在裸名时代无法区分，那正是本任务要堵的洞。
@@ -61,6 +67,11 @@ export {
   observerBufferKey,
   aliveGroupsKey,
   registerBlockKey,
+  nodeRegisterBlockKey,
+  nodeScope,
+  portLeaseLockKey,
+  portLeaseLockPattern,
+  parsePortLeaseLockKey,
   socketRoom,
 } from "./tenant-scope.ts";
 
@@ -94,6 +105,28 @@ export const RedisKeys = {
 
   /** 近期有心跳的节点组 id 集合（set；成员只有整数 id）。 */
   aliveNodeGroups: (scope?: number | null) => aliveGroupsKey(scope),
+
+  /**
+   * v3 端口租约抢占锁（WP1，`ws:<scope>:node_port_lease:lock:<nodeId>:<port>`）。
+   *
+   * 只用于**短事务并发协调**：端口所有权的长期真相是 DB 的
+   * `UNIQUE(node_id, port)`，锁丢失由 DB unique 兜底。见
+   * {@link portLeaseLockKey} 的三条使用约束（必带 TTL 等）。
+   */
+  portLeaseLock: (scope: number | null | undefined, nodeId: string, port: number) =>
+    portLeaseLockKey(scope, nodeId, port),
+
+  /** v3 端口租约锁扫描（WP3 reconciler 对账孤儿锁用）。 */
+  portLeaseLockScan: (scope?: number | null) => portLeaseLockPattern(scope),
+
+  /**
+   * v3 节点凭据注册防爆破键（`ws:global:node_register_block:<fingerprint>`）。
+   *
+   * global 段的理由同 {@link RedisKeys.registerBlock}：防爆破发生在身份解析
+   * 之前，还不知道节点属于哪个租户；键值只描述「这次失败尝试」。
+   */
+  nodeRegisterBlock: (credentialFingerprint: string) =>
+    nodeRegisterBlockKey(credentialFingerprint),
 
   /* ---- 账户数据（user 段，不属于任何单个 workspace） ---- */
 

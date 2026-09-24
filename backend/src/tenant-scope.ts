@@ -16,6 +16,13 @@
  *   某个真实租户——它只会落进 platform bucket，而 platform bucket 里的内容
  *   按定义就不含任何租户资产。
  *
+ * ── v3（WP1）新增的节点侧资源 ──
+ * `Node` / `EgressPool` / `EgressTarget` / `NodePortLease` **不带 workspace_id
+ * 列**，归属沿 `Node → node_group → workspace_id` 单向上查。这类资源的 scope
+ * 必须经 {@link nodeScope} 派生（唯一入口，见其注释），DB 侧只有一份归属真相。
+ * 端口租约的 Redis NX 抢占锁见 {@link portLeaseLockKey}（协调用途，长期真相
+ * 仍是 DB 的 `UNIQUE(node_id, port)`）。
+ *
  * ── 隔离不变量 ──
  *   1. 任何**描述租户资产**的 key 都不能只带资源 id 而不带 scope；
  *   2. 键的解析（{@link parseScopedKey}）与生成必须同源，否则 worker 扫描时会
@@ -342,6 +349,81 @@ export function groupScope(
   group: Pick<GroupScopeRow, "workspace_id" | "is_shared">,
 ): number {
   return group.is_shared === true ? GLOBAL_SCOPE : scopeId(group.workspace_id);
+}
+
+/* ================================================================== */
+/* v3 节点侧资源作用域（WP1）                                          */
+/* ================================================================== */
+
+/**
+ * v3 节点侧资源（{@link Node} / `EgressPool` / `EgressTarget` / `NodePortLease`）
+ * 应使用的 scope。
+ *
+ * 这四张表**都没有 workspace_id 列**：归属沿
+ * `Node → node_group → workspace_id` 单向上查，DB 里只存一份归属真相，
+ * 避免「冗余列与真相列漂移」这类经典不一致。因此所有派生位置的 scope 必须
+ * 经由本函数统一解析，不允许各处自己读 `node.node_group.workspace_id`。
+ *
+ * 输入只要求带 node_group 的最小投影，便于调用方在 `select` 里只取需要的列。
+ */
+export function nodeScope(
+  node: {
+    node_group?: Pick<GroupScopeRow, "workspace_id" | "is_shared"> | null;
+  },
+): number {
+  return groupScope(node.node_group ?? { workspace_id: null });
+}
+
+/**
+ * 端口租约快速抢占锁（§5.1）：`ws:<scope>:node_port_lease:lock:<nodeId>:<port>`。
+ *
+ * DEVELOPMENT.md §5.1：物理唯一性的最终真相是 DB 的 `UNIQUE(node_id, port)`，
+ * Redis NX 只做**快速并发抢占/短事务协调**，不作为长期唯一真相源。因此：
+ *   · 抢到锁 ≠ 拿到端口（DB insert 仍可能因唯一键失败，那是正常路径）；
+ *   · 锁必须有 TTL（进程崩溃不能永久阻塞分配）；
+ *   · 锁丢失后由 DB unique 兜底，不允许「锁没了就把已有 lease 判为孤儿」。
+ *
+ * scope 让两个租户的同 ID 节点不会在同一个物理端口上互抢。
+ */
+export function portLeaseLockKey(
+  scope: number | null | undefined,
+  nodeId: string,
+  port: number,
+): string {
+  return scopedKey(scope, "node_port_lease", "lock", nodeId, port);
+}
+
+/** 租约锁扫描 pattern（跨租户；WP3 reconciler 对账用）。 */
+export function portLeaseLockPattern(scope?: number | null): string {
+  return scopedPattern(scope ?? "*", "node_port_lease", "lock", "*", "*");
+}
+
+/** 解析 {@link portLeaseLockKey}；非本模块形态返回 `null`。 */
+export function parsePortLeaseLockKey(
+  key: string,
+): { scope: number; nodeId: string; port: number } | null {
+  const parsed = parseScopedKey(key);
+  if (!parsed) return null;
+  // 段位固定为 lock:<nodeId...>:<port>：末段必须是端口，其余拼回 nodeId
+  const [kind, lock, ...rest] = parsed.segments;
+  if (kind !== "node_port_lease" || lock !== "lock" || rest.length < 2) return null;
+  const port = rest[rest.length - 1];
+  if (!/^\d+$/.test(port)) return null;
+  const nodeId = rest.slice(0, -1).join(":");
+  if (nodeId.length === 0) return null;
+  return { scope: parsed.scope, nodeId, port: Number(port) };
+}
+
+/**
+ * v3 节点注册防爆破键（按 node credential，WP7）。
+ *
+ * 与 {@link registerBlockKey}（节点组 token，全局唯一、已隐含归属）的区别：
+ * 节点凭据的爆破防护发生在**身份解析之前**，此时还不知道节点属于哪个
+ * workspace，只能按凭据指纹自作用域——值只描述「这次失败尝试」，不描述
+ * 任何租户资产，故放 global 段。
+ */
+export function nodeRegisterBlockKey(credentialFingerprint: string): string {
+  return scopedKey(GLOBAL_SCOPE, "node_register_block", credentialFingerprint);
 }
 
 /* ================================================================== */
