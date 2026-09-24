@@ -103,7 +103,13 @@ DAILY_DIR="$BACKUP_DIR/${STAMP%%T*}"     # 按 UTC 日期分目录
 mkdir -p "$DAILY_DIR"
 chmod 700 "$DAILY_DIR"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tunex-backup.XXXXXX")"
-trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc stamp=$STAMP"; fi; rm -rf "$WORK"' EXIT
+# shellcheck disable=SC2317
+cleanup() {
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc stamp=$STAMP"; fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 log "暂存目录: $WORK"
 
 # --- 2. MySQL 全库备份 -------------------------------------------------------
@@ -141,8 +147,11 @@ log "[2/5] Redis BGSAVE 快照"
 # 通过容器内 redis-cli 操作（不依赖主机端口映射）
 LASTSAVE_BEFORE="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli LASTSAVE | tr -d '\r')"
 "${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli BGSAVE >/dev/null
-# 等待 BGSAVE 完成（rdb_bgsave_in_progress:0 且 last_save_time 前进）
-for i in $(seq 1 60); do
+# 等待 BGSAVE 完成（rdb_bgsave_in_progress:0 且 last_save_time 前进）。
+# shellcheck disable=SC2034  # BGSAVE_WAIT 为轮询计数，仅用于可读性/排障
+BGSAVE_WAIT=0
+# shellcheck disable=SC2034
+for BGSAVE_WAIT in $(seq 1 60); do
   STATUS="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli INFO persistence | tr -d '\r')"
   INPROG="$(awk -F: '/^rdb_bgsave_in_progress:/{print $2}' <<<"$STATUS")"
   LASTSAVE="$(awk -F: '/^rdb_last_save_time:/{print $2}' <<<"$STATUS")"
@@ -150,9 +159,7 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 [[ "${INPROG:-1}" == "0" ]] || warn "BGSAVE 仍在进行，继续等待结果"
-REDIS_RDB_HOST_PATH="/data/dump.rdb"
-# 容器 cp：compose v2.28 支持 `docker compose cp <svc>:<path> -` 写到 stdout 不可靠，
-# 这里用 bind-mount 之外的稳妥路径：容器内直接 cat 到宿主机文件（rdb < 内存，可接受）。
+# 容器内直接 cat 到宿主机文件（rdb < 内存，可接受）。
 "${COMPOSE[@]}" exec -T "$REDIS_SERVICE" sh -c "cat /data/dump.rdb" > "$REDIS_RDB" \
   || die "复制 RDB 失败"
 [[ -s "$REDIS_RDB" ]] || die "RDB 文件为空"
@@ -190,10 +197,19 @@ gzip -9 "$REDIS_RDB"
 tar -C "$WORK" -czf "$WORK/config.tar.gz" config
 gzip -9 "$WORK/config.tar.gz" 2>/dev/null || true
 
+# 备份加密算法。
+# 注意：不要用 -aes-256-gcm。openssl enc 的 CLI 自 1.1.1 起就不支持 AEAD 套件，
+# Ubuntu 24.04（OpenSSL 3.0.13）会直接报 "AEAD ciphers not supported" 并失败。
+# 因此统一用 AES-256-CBC + PBKDF2（200k 迭代）+ 随机 salt；配合备份产物自带的
+# SHA256 校验和，可以同时发现「口令错误」与「文件损坏/篡改」。
+# 若日后要升级到 GCM，需改用 `openssl enc -aead`（新版）或改用 age/gpg。
+CIPHER="aes-256-cbc"
+KDF_ITER=200000
+
 encrypt_file() {
   local src="$1" dst="$2"
   if [[ "$ENCRYPT" == "1" ]]; then
-    openssl enc -aes-256-gcm -pbkdf2 -iter 200000 -salt \
+    openssl enc -"$CIPHER" -pbkdf2 -iter "$KDF_ITER" -salt \
       -in "$src" -out "$dst" -pass "pass:$PASSPHRASE" \
       || die "加密失败: $src"
   else
@@ -224,7 +240,7 @@ cat > "$OUT_BASE.manifest.json" <<EOF
   "created_utc": "$STAMP",
   "project_root": "$PROJECT_ROOT",
   "encrypted": $([ "$ENCRYPT" = "1" ] && echo true || echo false),
-  "kdf": "openssl aes-256-gcm pbkdf2 iter=200000",
+  "kdf": "openssl $CIPHER pbkdf2 iter=$KDF_ITER",
   "mysql": { "database": "$MYSQL_DATABASE", "rows": $MYSQL_ROWS, "engine": "mysqldump --single-transaction" },
   "redis": { "keys": $REDIS_KEYS, "mechanism": "BGSAVE rdb snapshot" },
   "files": [

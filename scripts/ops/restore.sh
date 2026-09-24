@@ -17,7 +17,7 @@
 # 恢复流程（每一步都有校验，失败即停）：
 #   1. 解析 backup id → 定位三个加密文件 + manifest
 #   2. SHA256 校验（防传输/磁盘损坏）
-#   3. 解密（openssl aes-256-gcm，同 backup 口令）
+#   3. 解密（openssl aes-256-cbc + PBKDF2，同 backup 口令；算法见 backup.sh，勿用 GCM）
 #   4. MySQL：先 DROP+DATABASE 重建，再灌入 dump（含 _prisma_migrations，
 #      恢复后 prisma migrate deploy 应为 "No pending migrations"）
 #   5. Redis：FLUSHALL + 停 AOF 上下文恢复 RDB（SHUTDOWN NOSAVE 后替换卷文件再启动），
@@ -137,9 +137,15 @@ verify_and_decrypt() {
   sum="$(cat "$enc.sha256")"
   echo "$sum  $enc" | sha256sum -c - >/dev/null 2>&1 || die "SHA256 校验失败: $enc（文件损坏或被篡改）"
   log "  SHA256 OK : $(basename "$enc")"
-  openssl enc -d -aes-256-gcm -pbkdf2 -iter 200000 \
+  # 算法必须与 backup.sh 的 CIPHER/KDF_ITER 一致（aes-256-cbc + PBKDF2 200k）。
+  # CBC 无认证标签，因此「口令错误」只能靠下面这段 gzip 头校验兜底。
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
     -in "$enc" -out "$out" -pass "pass:$PASSPHRASE" 2>"$WORK/openssl.err" \
     || { cat "$WORK/openssl.err" >&2; die "解密失败（口令错误？）: $enc"; }
+  # gzip 魔术头（1f 8b）校验：口令正确时解密产物一定是 gzip。
+  # CBC 解密明文不定，口令错误时 openssl 可能不报错，只能靠这一层拦截。
+  head -c 2 "$out" | od -An -tx1 | tr -d ' \n' | grep -qi '^1f8b$' \
+    || die "解密产物不是 gzip —— 口令错误或备份文件被截断: $enc"
 }
 
 if [[ -n "${BACKUP_PASSPHRASE:-}" ]]; then
@@ -224,8 +230,11 @@ if [[ $DO_REDIS -eq 1 ]]; then
     die "无法解析 redis 数据卷名"
   fi
   "${COMPOSE[@]}" start "$REDIS_SERVICE" >/dev/null
-  # 等待 keys 加载
-  for i in $(seq 1 40); do
+  # 等待 keys 加载。
+  # shellcheck disable=SC2034  # REDIS_WAIT 为轮询计数，仅用于可读性/排障
+  REDIS_WAIT=0
+  # shellcheck disable=SC2034
+  for REDIS_WAIT in $(seq 1 40); do
     k="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli DBSIZE 2>/dev/null | tr -d '\r' || echo 0)"
     [[ "${k:-0}" -ge 1 ]] && break
     sleep 0.5

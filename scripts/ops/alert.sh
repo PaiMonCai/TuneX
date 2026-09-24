@@ -86,7 +86,8 @@ send_alert() {  # $1=severity $2=check $3=message
     fi
     jq --arg k "$key" --argjson t "$NOW_S" '.[$k]=$t' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
   fi
-  local line="[$(date -Iseconds)] [$sev] [$check] $msg"
+  local line
+  line="[$(date -Iseconds)] [$sev] [$check] $msg"
   echo "$line" >> "$LOG_FILE"
   [[ $STATUS_ONLY -eq 1 ]] && { log "$line"; return 0; }
   if [[ -n "$ALERT_WEBHOOK" ]]; then
