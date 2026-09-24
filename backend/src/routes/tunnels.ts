@@ -30,6 +30,12 @@ import type { AppVariables } from "../middlewares/auth.ts";
 import { pushNodeConfig } from "../socket/config-pusher.ts";
 import { canUseNodeGroup } from "../services/node-group-access.ts";
 import { canWorkspaceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
+import {
+  countWorkspaceTunnels,
+  sumWorkspaceTraffic,
+  withWorkspaceQuotaLock,
+} from "../services/policy-service.ts";
+import { checkTunnelCreation } from "../services/capability-policy.ts";
 
 export const tunnelsRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -192,6 +198,7 @@ tunnelsRoutes.post("/", async (c) => {
     return c.json({ error: "无权使用入口节点组" }, 403);
 
   let outGroupId: number | null = null;
+  let outGroupOwnedByWorkspace = true;
   if (body.out_node_group_id !== undefined && body.out_node_group_id !== null && body.out_node_group_id !== "") {
     const parsed = Number(body.out_node_group_id);
     if (!Number.isInteger(parsed)) return c.json({ error: "出口节点组非法" }, 400);
@@ -200,6 +207,7 @@ tunnelsRoutes.post("/", async (c) => {
     if (outGroup.node_type !== "out" || !(await canUseNodeGroup(user.id, outGroup, "out", workspace.id, workspace.personalWorkspaceId)))
       return c.json({ error: "无权使用出口节点组" }, 403);
     outGroupId = outGroup.id;
+    outGroupOwnedByWorkspace = outGroup.workspace_id === workspace.id;
   }
 
   const forward = parseForward(body.forward_addresses);
@@ -223,37 +231,66 @@ tunnelsRoutes.post("/", async (c) => {
   const tunnelType = String(body.tunnel_type ?? "tcp");
   const category = body.category === "remote_port_forward" ? "remote_port_forward" : "port_forward";
 
-  const maxOrder = await db.tunnel.aggregate({ _max: { order_by: true } });
-  const nextOrder = (maxOrder._max.order_by ?? 0) + 10;
+  // order_by 在锁内重算（与额度判定同事务，保证顺序稳定）
+  const inGroupOwned = inGroup.workspace_id === workspace.id;
+  const outGroupOwned = outGroupId === null || outGroupId === inGroupId ? true : outGroupOwnedByWorkspace;
 
-  const created = await db.tunnel.create({
-    data: {
-      name,
-      tunnel_type: tunnelType as never,
-      category: category as never,
-      listen_ip: body.listen_ip ? String(body.listen_ip) : "0.0.0.0",
-      listen_port: listenPort,
-      listen_protocol: [tunnelType],
-      status: "active",
-      forward_addresses: forward,
-      forward_addresses_protocol: forward.map(() => tunnelType),
-      load_balance_type: String(body.load_balance_type ?? "round") as never,
-      ip_type: String(body.ip_type ?? "ipv4") as never,
-      order_by: nextOrder,
-      ip_limit: body.ip_limit === undefined || body.ip_limit === null || body.ip_limit === "" ? null : Number(body.ip_limit),
-      client_limit: body.client_limit === undefined || body.client_limit === null || body.client_limit === "" ? null : Number(body.client_limit),
-      bandwidth_limit: body.bandwidth_limit === undefined || body.bandwidth_limit === null || body.bandwidth_limit === "" ? null : Number(body.bandwidth_limit),
-      proxy_protocol: Boolean(body.proxy_protocol),
-      in_node_group_id: inGroup.id,
-      out_node_group_id: outGroupId,
-      user_id: user.id,
-      workspace_id: workspace.id,
-    },
-    include: {
-      in_node_group: { select: { id: true, name: true, node_type: true } },
-      out_node_group: { select: { id: true, name: true, node_type: true } },
-    },
+  // SOFT-01：额度判定与落库在同一 workspace 行锁事务内完成（FOR UPDATE 串行化
+  // 同 workspace 的并发创建），杜绝「先查计数再插入」的 TOCTOU 超发。
+  const result = await withWorkspaceQuotaLock(workspace.id, async (tx, policy) => {
+    const [tunnelCount, trafficUsed, maxOrder] = await Promise.all([
+      countWorkspaceTunnels(workspace.id, tx),
+      sumWorkspaceTraffic(workspace.id, policy.limits.traffic_period, new Date(), tx),
+      tx.tunnel.aggregate({ _max: { order_by: true } }),
+    ]);
+    const nextOrder = (maxOrder._max.order_by ?? 0) + 10;
+    const decision = checkTunnelCreation(policy, {
+      tunnelCount,
+      trafficUsed,
+      protocol: tunnelType,
+      inGroupOwned,
+      inGroupId: inGroup.id,
+      outGroupId: outGroupId,
+      outGroupOwned,
+    });
+    if (!decision.allowed) return { denied: decision } as const;
+
+    const created = await tx.tunnel.create({
+      data: {
+        name,
+        tunnel_type: tunnelType as never,
+        category: category as never,
+        listen_ip: body.listen_ip ? String(body.listen_ip) : "0.0.0.0",
+        listen_port: listenPort,
+        listen_protocol: [tunnelType],
+        status: "active",
+        forward_addresses: forward,
+        forward_addresses_protocol: forward.map(() => tunnelType),
+        load_balance_type: String(body.load_balance_type ?? "round") as never,
+        ip_type: String(body.ip_type ?? "ipv4") as never,
+        order_by: nextOrder,
+        ip_limit: body.ip_limit === undefined || body.ip_limit === null || body.ip_limit === "" ? null : Number(body.ip_limit),
+        client_limit: body.client_limit === undefined || body.client_limit === null || body.client_limit === "" ? null : Number(body.client_limit),
+        bandwidth_limit: body.bandwidth_limit === undefined || body.bandwidth_limit === null || body.bandwidth_limit === "" ? null : Number(body.bandwidth_limit),
+        proxy_protocol: Boolean(body.proxy_protocol),
+        in_node_group_id: inGroup.id,
+        out_node_group_id: outGroupId,
+        user_id: user.id,
+        workspace_id: workspace.id,
+      },
+      include: {
+        in_node_group: { select: { id: true, name: true, node_type: true } },
+        out_node_group: { select: { id: true, name: true, node_type: true } },
+      },
+    });
+    return { tunnel: created } as const;
   });
+
+  const created = "tunnel" in result ? result.tunnel : null;
+  if (!created) {
+    const decision = "denied" in result ? result.denied : null;
+    return c.json({ error: decision?.message ?? "策略拒绝", code: decision?.reason }, 403);
+  }
 
   // 推送配置到入口/出口节点组（节点在线时立即生效）
   pushTunnelConfig(created);

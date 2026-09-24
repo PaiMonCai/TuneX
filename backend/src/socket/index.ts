@@ -1,11 +1,22 @@
 import { Server as HTTPServer, createServer } from "node:http";
 import { Server as IOServer, type Socket } from "socket.io";
 import { db } from "../db.ts";
-import { redis } from "../redis.ts";
+import { redis, RedisKeys } from "../redis.ts";
 import { env } from "../env.ts";
 import { systemConfig } from "../services/config.ts";
 import { signLicenseForAgent } from "../services/license-sign.ts";
-import { OUT_LISTEN_KEY } from "./config-generator.ts";
+import { withWorkspaceQuotaLock } from "../services/policy-service.ts";
+import { checkNodeCreation } from "../services/capability-policy.ts";
+import {
+  GLOBAL_SCOPE,
+  aliveGroupsKey,
+  disconnectMarkerKey,
+  heartbeatKey,
+  outListenKey,
+  registerBlockKey,
+  scopeId,
+  socketRoom,
+} from "../tenant-scope.ts";
 import { pushNodeConfig } from "./config-pusher.ts";
 import {
   ERR_PORT_IN_USE,
@@ -15,7 +26,6 @@ import {
 } from "./listen-events.ts";
 import {
   DISCONNECT_MARKER_TTL_S,
-  disconnectMarkerKey,
 } from "./offline-detector.ts";
 
 const SOCKET_PORT = Number(process.env.SOCKET_PORT ?? 3001);
@@ -54,15 +64,27 @@ function isUniqueViolation(e: unknown): boolean {
   return (e as { code?: string } | null)?.code === "P2002";
 }
 
+/** 从 socket.data 取 scope（连接中间件已写入；缺省折叠为平台作用域）。 */
+function socketScope(socket: Socket): number {
+  return scopeId(socket.data.scope as number | null | undefined);
+}
+
 /**
  * `listen` 回填：仅当隧道 `listen_port` 仍为空时写入实际端口。
  * 唯一约束（`@@unique([listen_port, in_node_group_id])`）冲突 → 记录
  * `port_conflict_at` 并重推该隧道所在组（复刻上游 `repushTunnelGroup` 语义）。
+ *
+ * TEN-02：`groupId` 为报备该端口的 socket 所属节点组——只回填本组隧道，
+ * 否则一个持证 agent 就能改别组（可能别租户）隧道的端口。
  */
-async function backfillTunnelListenPort(tunnelId: number, port: number): Promise<void> {
+async function backfillTunnelListenPort(
+  tunnelId: number,
+  port: number,
+  groupId: number,
+): Promise<void> {
   try {
     await db.tunnel.updateMany({
-      where: { id: tunnelId, listen_port: null },
+      where: { id: tunnelId, listen_port: null, in_node_group_id: groupId },
       data: { listen_port: port },
     });
   } catch (e) {
@@ -90,7 +112,7 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
     cors: { origin: true, credentials: true },
   });
 
-  // 连接中间件：CONNECT 载荷里的 token → nodeGroup
+  // 连接中间件：CONNECT 载荷里的 token → nodeGroup（并解析 scope）
   io.use(async (socket, next) => {
     try {
       const token = (socket.handshake.auth?.token as string | undefined) ?? "";
@@ -99,15 +121,18 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
       if (!group) return next(new Error("unauthorized"));
       socket.data.group = group;
       socket.data.groupId = group.id;
+      // TEN-02：scope 由节点组归属决定，连接方无法自选。
+      socket.data.scope = scopeId(group.workspace_id);
       next();
-    } catch (e) {
+    } catch {
       next(new Error("unauthorized"));
     }
   });
 
   io.on("connection", (socket: Socket) => {
     const groupId = socket.data.groupId as number;
-    const room = `node_group/${groupId}`;
+    const scope = socketScope(socket);
+    const room = socketRoom(scope, groupId);
     socket.join(room);
 
     // ---- register（带 ack）----
@@ -117,7 +142,8 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
         const now = Math.floor(Date.now() / 1000);
 
         // 1. 防暴力重试（registerBlock）
-        const blockKey = `register_block:${group.token}`;
+        // TEN-02：node_group.token 全局唯一（uuid），键走 ws:global 段（token 自作用域）。
+        const blockKey = registerBlockKey(group.token);
         const blocked = await redis.get(blockKey);
         if (blocked) {
           ack?.({ error: blocked });
@@ -132,19 +158,32 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
         });
 
         // 3. upsert node（connect_ip 变化时更新）
+        // SOFT-01：节点上线即占用 max_nodes 额度。判定与插入在同一 workspace 行锁
+        // 事务内完成——否则同一 workspace 的多个 agent 同时首注册会双双通过计数。
         const connectIp = (data.connect_ip ?? []).join(",");
         const existing = await db.node.findUnique({ where: { node_id: data.node_id } });
         if (!existing) {
-          const order = await db.node.count({ where: { node_group_id: group.id } });
-          await db.node.create({
-            data: {
-              node_id: data.node_id,
-              connect_ip: connectIp,
-              node_group_id: group.id,
-              version: data.version ?? "",
-              order_by: order * 1000,
-            },
-          });
+          const guard = await withWorkspaceQuotaLock(group.workspace_id, async (tx, policy) => {
+            const nodeCount = await tx.node.count({ where: { node_group: { workspace_id: group.workspace_id } } });
+            const decision = checkNodeCreation(policy, nodeCount);
+            if (!decision.allowed) return { denied: decision.message } as const;
+            const created = await tx.node.create({
+              data: {
+                node_id: data.node_id,
+                connect_ip: connectIp,
+                node_group_id: group.id,
+                version: data.version ?? "",
+                order_by: nodeCount * 1000,
+              },
+            });
+            return { node: created } as const;
+          }).catch(() => null);
+          // 行锁不可用（如并发死锁/锁超时）时不阻断 agent 上线：节点已真实连着，
+          // 额度只是锦上添花的约束。真正的硬约束仍在 HTTP 建隧道路径上。
+          if (guard && "denied" in guard) {
+            ack?.({ error: guard.denied });
+            return;
+          }
         } else if (existing.connect_ip !== connectIp || existing.version !== data.version) {
           await db.node.update({
             where: { node_id: data.node_id },
@@ -157,10 +196,10 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
 
         // 节点（重）上线：取消待处理离线标记，并把可能被 worker 置为 inactive 的
         // 节点拉回 active（节点活着就等于在线，避免刚上线仍显示离线）。
-        await redis.del(disconnectMarkerKey(group.id, data.node_id));
+        await redis.del(disconnectMarkerKey(scope, group.id, data.node_id));
         await db.node
           .updateMany({
-            where: { node_id: data.node_id, status: "inactive" },
+            where: { node_id: data.node_id, node_group_id: group.id, status: "inactive" },
             data: { status: "active" },
           })
           .catch(() => {});
@@ -174,7 +213,7 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
         });
 
         // 5. 立即推一次配置（节点上线，强制下发，跳过去重）
-        void pushNodeConfig(groupId, { force: true }).catch(() => {});
+        void pushNodeConfig(groupId, { force: true, scope }).catch(() => {});
       } catch (e) {
         ack?.({ error: "internal error" });
       }
@@ -183,12 +222,15 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
     // ---- sysinfo（无 ack，10s 心跳）----
     socket.on("sysinfo", async (data: { node_id: string; sysinfo?: Record<string, unknown> }) => {
       try {
-        const key = `sysinfo:${groupId}:${data.node_id}`;
+        // TEN-02：心跳键带 scope（ws:<scope>:node:<gid>:<nodeId>:heartbeat），
+        // 两个租户的同 ID 节点组不再共享「在线」状态。
+        const key = heartbeatKey(scope, groupId, data.node_id);
         await redis.set(key, JSON.stringify({ ...data, last_active: new Date().toISOString() }), "EX", SYSINFO_TTL_S);
-        // room 动态管理：有心跳的节点组保持活跃集合（pushNodeConfig 用于过滤）
-        await redis.sadd(`alive_groups`, String(groupId));
+        // room 动态管理：有心跳的节点组保持活跃集合（pushNodeConfig 用于过滤）。
+        // 集合键同样带 scope：组 id 只在所属租户的集合里有意义。
+        await redis.sadd(aliveGroupsKey(scope), String(groupId));
         // 心跳即「节点仍在线」：取消可能存在的待处理离线标记（重连防抖）。
-        await redis.del(disconnectMarkerKey(groupId, data.node_id));
+        await redis.del(disconnectMarkerKey(scope, groupId, data.node_id));
       } catch {
         /* 心跳失败不影响连接 */
       }
@@ -206,15 +248,16 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
         const { tunnelId } = parseListenName(data.name);
         if (tunnelId !== null) {
           // 隧道监听端口回写（仅 listen_port 为空时；冲突则记 port_conflict_at + 重推）
-          await backfillTunnelListenPort(tunnelId, data.port);
+          await backfillTunnelListenPort(tunnelId, data.port, groupId);
         } else {
           // 出口监听：node_id 字符串 → 数字主键（供 out_hops 拼 addr）
+          // TEN-02：只接受本组节点上报 + 按 scope 写键，避免跨租户写出口端口缓存。
           const node = await db.node.findUnique({
             where: { node_id: data.node_id },
-            select: { id: true },
+            select: { id: true, node_group_id: true },
           });
-          if (node) {
-            await redis.hset(OUT_LISTEN_KEY, `${node.id}:${data.type}`, String(data.port));
+          if (node && node.node_group_id === groupId) {
+            await redis.hset(outListenKey(scope), `${node.id}:${data.type}`, String(data.port));
           }
         }
         ack?.({ ok: true });
@@ -235,13 +278,15 @@ export function attachSocketIO(httpServer: HTTPServer): IOServer {
     // socket.id 每次重连都变，用它做 key 等于无法反查。
     // 标记由 offline-detector.ts 的 worker 消费：防抖到点且无心跳 → 置 inactive；
     // 期间节点重连（register/sysinfo）会删除该标记，取消待处理离线。
-    socket.on("disconnect", async (reason) => {
+    // TEN-02：key 带 scope（ws:<scope>:node:<gid>:<nodeId>:offline），
+    // 同 ID 组/节点在不同租户下不再串台。
+    socket.on("disconnect", async () => {
       const nodeId = socket.data.nodeId as string | undefined;
       if (!nodeId) return; // 未 register 过的连接，无节点可标记
       // TTL = 防抖窗口 + 宽限期（见 offline-detector.ts）：保证防抖到点后 worker
       // 至少能扫到一次，避免「标记在两次扫描之间过期」导致漏判。
       await redis.set(
-        disconnectMarkerKey(groupId, nodeId),
+        disconnectMarkerKey(scope, groupId, nodeId),
         String(Date.now()),
         "EX",
         DISCONNECT_MARKER_TTL_S,

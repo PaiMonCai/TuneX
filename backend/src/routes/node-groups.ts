@@ -21,6 +21,7 @@ import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
+import { withWorkspaceQuotaLock } from "../services/policy-service.ts";
 
 export const nodeGroupsRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -102,12 +103,23 @@ nodeGroupsRoutes.post("/", async (c) => {
     const [start, end] = port_range.split("-").map(Number);
     if (start < 1 || end > 65535 || start > end) return c.json({ error: "端口范围不合法" }, 400);
   }
-  const group = await db.nodeGroup.create({
-    data: { name, node_type, port_range, workspace_id: workspace.id, user_id: user.id },
-    select: { id: true, name: true, node_type: true, token: true, workspace_id: true },
+  // SOFT-01：自建入口/出口组是一种能力（entitlement），按 workspace 行锁串行判定，
+  // 策略未授予 allow_custom_*_group 时拒绝（不是超限提示，是能力未开通）。
+  const group = await withWorkspaceQuotaLock(workspace.id, async (tx, policy) => {
+    const customAllowed = node_type === "in" ? policy.entitlements.allow_custom_in_group : policy.entitlements.allow_custom_out_group;
+    if (!customAllowed) {
+      return { denied: true } as const;
+    }
+    const created = await tx.nodeGroup.create({
+      data: { name, node_type, port_range, workspace_id: workspace.id, user_id: user.id },
+      select: { id: true, name: true, node_type: true, token: true, workspace_id: true },
+    });
+    await tx.auditEvent.create({
+      data: { workspace_id: workspace.id, actor_user_id: user.id, action: "node_group.created", resource_type: "node_group", resource_id: String(created.id) },
+    });
+    return { group: created } as const;
   });
-  await db.auditEvent.create({
-    data: { workspace_id: workspace.id, actor_user_id: user.id, action: "node_group.created", resource_type: "node_group", resource_id: String(group.id) },
-  });
-  return c.json({ data: group }, 201);
+
+  if ("group" in group) return c.json({ data: group.group }, 201);
+  return c.json({ error: `当前策略不允许自建${node_type === "in" ? "入口" : "出口"}节点组`, code: "custom_group_not_allowed" }, 403);
 });

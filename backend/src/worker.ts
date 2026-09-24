@@ -15,8 +15,11 @@
  *   cron_push_node_config        推送节点配置
  *   cron_check_node_offline      离线检测：消费 `dc:*` 标记，防抖到点置 inactive
  *
- * 原版 10 个 cron 任务均已注册调度；各 handler 当前为占位实现（仅打日志/计数），
- * 真正的业务逻辑（流量入库、DNS 同步、自动续费等）待后续迭代补齐。
+ * 原版的 cron 任务均已注册调度；已实现有业务逻辑的是
+ * `cron_save_traffic`（Redis → MySQL 流量归档，OPS-01/OPS-03，幂等）与
+ * `cron_check_node_offline`（离线检测闭环，已实现）；其余 handler 仍为
+ * 占位实现（仅打日志/计数）—— DNS 同步、自动续费等待后续迭代补齐，
+ * 注意 PLAN §2 的要求：占位任务不应被当成已实现能力对外宣称。
  * `cron_check_node_offline` 为 TuneX 新增（第 11 个），补上离线检测闭环（已实现）。
  */
 import { Queue, Worker, type Job } from "bullmq";
@@ -25,6 +28,7 @@ import { env } from "./env.ts";
 import { db } from "./db.ts";
 import { redis } from "./redis.ts";
 import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
+import { defaultTrafficArchiveDeps, flushTrafficBuffer } from "./services/traffic-archive.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步" },
@@ -49,9 +53,22 @@ const worker = new Worker(
     const started = Date.now();
     switch (job.name) {
       case "cron_save_traffic": {
-        // 待实现：Redis HINCRBYFLOAT 缓冲 → tunnel_traffic createMany
-        const pending = await redis.keys("tunnel:traffic:*");
-        return { pending: pending.length, note: "buffer→DB" };
+        // OPS-01/OPS-03：Redis 流量缓冲 → MySQL 归档（幂等，见 services/traffic-archive.ts）。
+        // 幂等三层防线：SETNX 占位锁 + (tunnel_id, date) 唯一索引 + 读走即删。
+        const r = await flushTrafficBuffer(defaultTrafficArchiveDeps());
+        const summary = {
+          scanned: r.scanned,
+          keys: r.keys,
+          records: r.records,
+          inserted: r.inserted,
+          duplicates: r.duplicates,
+          skipped: r.skipped,
+          errors: r.errors,
+        };
+        if (r.inserted > 0 || r.duplicates > 0 || r.errors > 0) {
+          console.log("[worker] cron_save_traffic:", JSON.stringify(summary));
+        }
+        return summary;
       }
       case "cron_delete_tunnel_traffic": {
         // 待实现：按 TUNNEL_TRAFFIC_RETENTION_DAYS 清理

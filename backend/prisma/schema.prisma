@@ -36,6 +36,22 @@ enum WorkspaceRole {
   viewer
 }
 
+/// 策略来源：系统默认（免费基础能力）/ 管理员授予 / 试用 / 付费发放。
+/// 支付只影响“哪一条策略被发放”，不参与权限与额度判定本身。
+enum PolicySource {
+  system_default
+  admin_grant
+  trial
+  purchase
+}
+
+/// 流量额度计量周期。
+enum TrafficPeriod {
+  total
+  month
+  day
+}
+
 model Workspace {
   id               Int               @id @default(autoincrement())
   slug             String            @unique @db.VarChar(191)
@@ -52,6 +68,7 @@ model Workspace {
   audit_events     AuditEvent[]
   node_groups      NodeGroup[]
   tunnels          Tunnel[]
+  policy_assignments WorkspacePolicyAssignment[]
 
   @@map("workspace")
 }
@@ -120,6 +137,88 @@ model AuditEvent {
 
   @@index([workspace_id, created_at])
   @@map("audit_event")
+}
+
+/// 能力策略模板：与价格/订单彻底解耦的「功能准入 + 资源额度」事实源。
+///
+/// 字段语义（PLAN §4.2）：
+///   · `0` = 禁止；`null` = 无额外额度限制（仅平台硬上限仍生效）
+///   · 空白名单（`[]`）= 无访问；`allow_all` 必须显式为真
+///   · 绝不因「没有套餐 / 名单为空」默认放行
+model CapabilityPolicy {
+  id          Int          @id @default(autoincrement())
+  key         String       @unique @db.VarChar(120)
+  name        String       @db.VarChar(120)
+  description String?      @db.Text
+  source      PolicySource @default(system_default)
+  /// 新建 workspace 时自动发放的免费模板（个人 / 团队各一条）
+  is_default  Boolean      @default(false)
+  /// 仅对某类 workspace 生效；null = 个人与团队通用
+  applies_to  WorkspaceKind?
+  /// 平台硬上限模板：额度作为所有 workspace 的绝对上界，不直接发放
+  is_ceiling  Boolean      @default(false)
+  status      Status       @default(active)
+  /// 策略内容版本；任一字段变化时自增，用于 `policy_revision` 与缓存失效
+  revision    Int          @default(1)
+
+  // —— 功能准入（Entitlement）——
+  /// 允许的隧道协议；[] = 不允许任何协议
+  tunnel_types           Json    @default("[]")
+  allow_custom_in_group  Boolean @default(false)
+  allow_custom_out_group Boolean @default(false)
+  /// 显式允许使用的共享入口/出口节点组 id；null = 仅自有节点组
+  allowed_in_group_ids   Json?
+  allowed_out_group_ids  Json?
+  allow_shared_entry     Boolean @default(false)
+
+  // —— 资源额度（Quota）——
+  max_tunnels     Int?
+  max_nodes       Int?
+  max_members     Int?
+  /// 流量额度（字节）；配合 `traffic_period`
+  traffic_limit   Float?
+  traffic_period  TrafficPeriod @default(total)
+  /// 带宽上限（Mbps）
+  bandwidth_limit Int?
+  /// 单隧道并发客户端上限
+  client_limit    Int?
+  /// 单隧道 IP 上限
+  ip_limit        Int?
+  /// 入口 admission 白名单（IP/CIDR）；null = 不启用
+  whitelist_ips   Json?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  assignments WorkspacePolicyAssignment[]
+
+  @@index([source, status])
+  @@map("capability_policy")
+}
+
+/// 把策略模板发放给某个 workspace，并记录来源 / 生效 / 截止 / 撤销。
+/// 支付若启用，只负责产生一条 `purchase` 来源的发放记录；
+/// 停用支付不影响 `system_default` / `admin_grant` 的既有发放。
+model WorkspacePolicyAssignment {
+  id           Int              @id @default(autoincrement())
+  workspace_id Int
+  workspace    Workspace        @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  policy_id    Int
+  policy       CapabilityPolicy @relation(fields: [policy_id], references: [id], onDelete: Cascade)
+  source       PolicySource     @default(system_default)
+  effective_at DateTime         @default(now())
+  /// null = 不设截止（仅管理员显式赋予）
+  expires_at   DateTime?
+  /// 显式撤销：立即生效，无宽限期
+  revoked_at   DateTime?
+  granted_by_id Int?
+  note         String?          @db.VarChar(255)
+  created_at   DateTime         @default(now())
+  updated_at   DateTime         @updatedAt
+
+  @@unique([workspace_id, policy_id])
+  @@index([workspace_id, revoked_at])
+  @@map("workspace_policy_assignment")
 }
 
 model NodeGroup {
@@ -298,8 +397,22 @@ model User {
   referral_commission_rate Float?
   referral_first_only      Boolean?
   auto_renew               Boolean            @default(false)
-  api_key                  String             @unique @default(uuid())
-  subscription_key         String             @unique @default(uuid())
+  /// SEC-02（legacy 明文列，保留仅为惰性迁移）。
+  ///
+  /// 新签发的凭据只写 `api_key_hash`（sha256）。明文列在两处被清空：
+  ///  1. 惰性迁移：认证命中存量明文行时同事务写哈希并置本列为 null；
+  ///  2. 轮换：rotateKey 覆盖哈希列并置本列为 null。
+  /// 因此本列必须可空 + 去掉 `@default(uuid())`（默认值会让 Prisma 的
+  /// `db.user.create()` 永不显式写 null，惰性迁移与 seed 都退化成明文落库）。
+  /// 唯一索引保留：NULL 可重复，不影响「迁移后所有明文行均为 null」的终态。
+  api_key                  String?            @unique
+  /// SEC-02：subscription_key 明文列，迁移策略同 api_key（可空、无默认值）。
+  subscription_key         String?            @unique
+  /// SEC-02：api_key 的 sha256 hex（64 字符）。新签发凭据只落哈希；明文列
+  /// （api_key）保留仅用于惰性迁移——认证命中明文行时同事务写入哈希并清空明文。
+  api_key_hash             String?            @unique @db.Char(64)
+  /// SEC-02：subscription_key 的 sha256 hex；迁移策略同 api_key_hash。
+  subscription_key_hash    String?            @unique @db.Char(64)
   notify_subscriptions     Json?
   admin_notify_subscriptions Json?
   node_groups              NodeGroup[]
@@ -309,6 +422,9 @@ model User {
   status                   Status             @default(active)
   created_at               DateTime           @default(now())
   updated_at               DateTime           @updatedAt
+  /// TEN-03：邮箱验证时间。NULL = 未验证（老用户与 0.1 阶段软约束兼容）。
+  email_verified_at        DateTime?
+  email_verifications      EmailVerification[]
   orders                   PlanOrder[]
   topups                   TopupOrder[]
   user_plan                UserPlan?
@@ -475,6 +591,7 @@ model TunnelTraffic {
   date         DateTime
 
   @@index([date])
+  @@unique([tunnel_id, date])
   @@map("tunnel_traffic")
 }
 
@@ -757,4 +874,29 @@ model UserCredential {
   updated_at DateTime @updatedAt
 
   @@map("user_credential")
+}
+
+/// TEN-03：邮箱验证 / 密码重置共用的一次性令牌表。
+///
+/// 设计（对齐 workspace_invite 的既有安全取向）：
+///  · **只存哈希**：`token_hash` 为 sha256(token) 的 hex；明文 token 只在邮件链接里出现一次。
+///  · **单次使用**：`used_at` 置位即失效；重复使用返回同一「无效或已使用」响应，不区分状态。
+///  · **过期**：`expires_at` 到期即失效；验证邮件 24h，密码重置 1h。
+///  · **同邮箱发新 token 时旧的立即作废**（仍是「一次一封有效信」的语义）。
+///  · purpose 区分用途，杜绝「用验证链接改密码」之类的跨用途重放。
+model EmailVerification {
+  id         Int       @id @default(autoincrement())
+  user_id    Int
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  email      String    @db.VarChar(191)
+  purpose    String    @db.VarChar(32) // email_verify | password_reset
+  token_hash String    @unique @db.Char(64)
+  expires_at DateTime
+  used_at    DateTime?
+  created_at DateTime  @default(now())
+
+  @@index([user_id, purpose])
+  @@index([email, purpose])
+  @@index([expires_at])
+  @@map("email_verification")
 }

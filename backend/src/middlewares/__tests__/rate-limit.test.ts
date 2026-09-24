@@ -37,6 +37,19 @@ describe("selectRule", () => {
     );
   });
 
+  // OPS-03：agent 流量上报专用规则必须排在 api-global 之前命中。
+  // 顺序反了就会被通用规则按 user 维度计数——而 agent 免认证、没有 userId，
+  // 会静默退化成 anon 身份，把全部节点打进同一个桶里互相限流。
+  test("agent traffic POST hits agent-traffic (ip scope) before api-global", () => {
+    const r = selectRule(GLOBAL_RATE_LIMIT_RULES, "/api/tunnel/traffic", "POST");
+    expect(r?.name).toBe("agent-traffic");
+    expect(r?.scope).toBe("ip");
+    // 非 POST 方法不受该规则约束（agent 只 POST）
+    expect(selectRule(GLOBAL_RATE_LIMIT_RULES, "/api/tunnel/traffic", "GET")?.name).toBe(
+      "api-global",
+    );
+  });
+
   test("generic api path falls through to api-global", () => {
     expect(selectRule(GLOBAL_RATE_LIMIT_RULES, "/api/tunnels", "GET")?.name).toBe("api-global");
   });
@@ -137,7 +150,17 @@ describe("checkRateLimit (memory store)", () => {
 });
 
 describe("rateLimitKey", () => {
-  test("namespaced key", () => {
-    expect(rateLimitKey("auth-login", "ip:1.2.3.4")).toBe("ratelimit:auth-login:ip:1.2.3.4");
+  test("namespaced key (TEN-02：带 ws:global: 前缀)", () => {
+    expect(rateLimitKey("auth-login", "1.2.3.4")).toBe(
+      "ws:global:ratelimit:auth-login:1.2.3.4",
+    );
+  });
+
+  test("identity 含冒号时被转义（不能伪造出新的段）", () => {
+    // escapeSegment 把 `:` 转成 `\:`：否则 `ip:1.2.3.4` 里的冒号会被
+    // 解析成额外段，同 key 前缀下不同 rule/identity 可能串味。
+    expect(rateLimitKey("auth-login", "ip:1.2.3.4")).toBe(
+      "ws:global:ratelimit:auth-login:ip\\:1.2.3.4",
+    );
   });
 });

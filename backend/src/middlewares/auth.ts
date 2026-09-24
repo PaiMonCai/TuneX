@@ -9,7 +9,8 @@ import { getCookie } from "hono/cookie";
 import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
 import { env } from "../env.ts";
-import { verifyAccessToken, isUUID, safeEqual } from "../auth.ts";
+import { verifyAccessToken, isUUID } from "../auth.ts";
+import { resolveUserByKey } from "../services/user-keys.ts";
 import {
   getEffectiveAccess,
   resolveAdminRoute,
@@ -46,11 +47,17 @@ export function extractIp(headers: Headers): string {
  * 免认证路径白名单（原版 noAuthPathsRegex，本次任务指定集合）
  * /api/auth/*、/api/pay/*\/callback、/api/tunnel/observer、/healthz
  * 另保留原版的 /api/system/config/site、/api/tunnel/subscription、/api/license
+ *
+ * OPS-03：`/api/tunnel/traffic`（agent 流量上报）同属免认证白名单 —— 它与
+ * observer 一样是机器端点，归属由 node_id → 组 → workspace 反查决定（见
+ * routes/public.ts）。**它必须在任何依赖用户身份的路由之前被白名单短路**，
+ * 否则 agent 的全部上报都会 401。
  */
 const NO_AUTH_PATTERNS: RegExp[] = [
   /^\/api\/auth\/.*/,
   /^\/api\/pay\/[^/]+\/callback$/,
   /^\/api\/tunnel\/observer$/,
+  /^\/api\/tunnel\/traffic$/,
   /^\/api\/tunnel\/subscription$/,
   /^\/api\/system\/config\/site$/,
   /^\/api\/license(\/.*)?$/,
@@ -68,6 +75,9 @@ export function isNoAuthPath(path: string): boolean {
 /** 冒充机制（x-impersonation + Redis，TTL 2h），仅超管可用 */
 export const IMPERSONATION_HEADER = "x-impersonation";
 export const IMPERSONATION_TTL_SECONDS = 2 * 60 * 60;
+
+// TEN-02：冒充票据是 token 自作用域（token 全局唯一、值只描述「哪个用户」），
+// 键走 `ws:global:impersonation:<token>`。
 
 async function resolveImpersonation(
   headers: Headers,
@@ -93,7 +103,8 @@ async function resolveImpersonation(
 /**
  * authRequired —— 双通道认证
  * 通道 A: Cookie `access`（JWT，HS256）
- * 通道 B: Authorization: Bearer <uuid v4>（user.api_key）
+ * 通道 B: Authorization: Bearer <uuid v4>（查 user.api_key_hash，见 services/user-keys.ts：
+ *   新凭据只落 sha256 哈希，旧明文行在首次认证时惰性迁移）
  */
 export const authRequired = createMiddleware<{ Variables: AppVariables }>(async (c, next) => {
   const path = c.req.path;
@@ -109,6 +120,8 @@ export const authRequired = createMiddleware<{ Variables: AppVariables }>(async 
     if (!Number.isInteger(userId)) throw new HTTPException(401, { message: "Unauthorized" });
 
     // ① Redis 映射缓存（sub → user.id）
+    // TEN-02：JWT sub 映射是**账户**数据（一个用户可属于多个 workspace），
+    // 不属于任何单个租户 → `ws:global:user:<sub>:id`。
     let user: NonNullable<AuthedUser> | null = null;
     try {
       const cachedId = await redis.get(RedisKeys.userSub(payload.sub));
@@ -141,14 +154,10 @@ export const authRequired = createMiddleware<{ Variables: AppVariables }>(async 
 
   if (!isUUID(bearer)) throw new HTTPException(401, { message: "Unauthorized" });
 
-  const user = await db.user.findUnique({
-    where: { api_key: bearer },
-    include: { admin_roles: true },
-  });
+  // SEC-02：凭据哈希化。先查哈希列，未命中再查明文列（惰性迁移命中时同事务写哈希清
+  // 明文）；恒定时间复核已由 hash 唯一索引等值匹配 + 迁移路径内的 safeEqual 覆盖。
+  const user = await resolveUserByKey("api_key", bearer);
   if (!user) throw new HTTPException(401, { message: "Unauthorized" });
-
-  // 恒定时间比较复核（防时序侧信道）
-  if (!safeEqual(user.api_key, bearer)) throw new HTTPException(401, { message: "Unauthorized" });
 
   if (user.status === "inactive") throw new HTTPException(403, { message: "用户账户已被封禁" });
 

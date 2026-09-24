@@ -27,9 +27,13 @@ import type {
   Tunnel,
   User,
   UserPlan,
+  Workspace,
+  WorkspaceInvite,
+  WorkspaceMember,
+  WorkspaceRole,
 } from "@/lib/types";
 import * as seed from "./data";
-import { getStore, resetStore } from "./state";
+import { getStore, resetStore, type MockWorkspaceInvite } from "./state";
 
 export interface MockRequest {
   body?: unknown;
@@ -582,8 +586,9 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       if (!found || (password !== expected && !isDemo)) return fail(401, "邮箱或密码错误");
       if (found.status !== "active") return fail(403, "账号已被禁用");
       return ok({
-        user: found,
+        user: { ...found, email_verified_at: found.email_verified_at ?? null },
         token: `mock-jwt-${found.id}`,
+        email_verified: Boolean(found.email_verified_at),
         expires_at: new Date(Date.now() + 6048e5).toISOString(),
         // mock 模式下没有真实响应头，浏览器端无法拿到 Set-Cookie，
         // 故把会话 cookie 值随 body 下发，由 api 层在客户端写入 document.cookie。
@@ -615,19 +620,315 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         api_key: `rk_live_${Math.random().toString(16).slice(2, 18)}`,
         subscription_key: `sk_sub_${Math.random().toString(16).slice(2, 18)}`,
         status: "active",
+        email_verified_at: null,
         created_at: nowIso(),
         updated_at: nowIso(),
       };
       db.users.push(created);
       db.passwords[id] = password;
-      return ok({ user: created, token: `mock-jwt-${id}`, session_cookie: sessionCookieValue(id) });
+      // TEN-03：注册即发一封 24h 验证邮件（mock 侧落内存 token，语义对齐后端）
+      const now = Date.now();
+      db.emailTokens.push({
+        token: `mock-verify-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        email,
+        purpose: "email_verify",
+        expires_at: now + 24 * 60 * 60 * 1000,
+        used_at: null,
+        created_at: now,
+      });
+      return ok({
+        user: created,
+        token: `mock-jwt-${id}`,
+        email_verified: false,
+        session_cookie: sessionCookieValue(id),
+      });
     }
     if (seg[1] === "logout" && method === "POST") return ok({ ok: true });
+
+    /* -------------------- TEN-03 邮箱验证 / 密码重置 -------------------- */
+    // 这三个端点与后端 /api/auth/* 同在免认证白名单内（前端可能未登录就点邮件链接），
+    // 但各自的业务约束与后端严格一致：
+    //   · verify-email：token 单次使用、过期即失效；用途不符拒绝
+    //   · forgot-password：**存在与不存在的邮箱返回同一响应**（防枚举）
+    //   · resend-verification：需要登录态（后端同理），已验证 → 409，60s 内 → 429
+    //   · reset-password：token 单次使用；成功后所有未用 token 一并作废
+    if (seg[1] === "verify-email" && method === "GET") {
+      const token = reqStr(q?.token);
+      if (!token) return fail(400, "验证链接无效");
+      const row = db.emailTokens.find((x) => x.token === token && x.purpose === "email_verify");
+      if (!row || row.used_at !== null || row.expires_at <= Date.now()) {
+        return fail(400, "验证链接无效或已使用");
+      }
+      row.used_at = Date.now();
+      const target = db.users.find((u) => u.email.toLowerCase() === row.email);
+      if (target) target.email_verified_at = nowIso();
+      return ok({ status: "verified", message: "邮箱验证成功" });
+    }
+
+    if (seg[1] === "forgot-password" && method === "POST") {
+      const body = asRecord(req.body);
+      const email = reqStr(body.email).toLowerCase();
+      if (!email) return badRequest("邮箱不能为空");
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return badRequest("邮箱格式不正确");
+      // 防枚举：无论邮箱是否存在都返回同一响应，且已发出未过期重置信时不重复发
+      const unused = db.emailTokens.find(
+        (x) => x.email === email && x.purpose === "password_reset" && x.used_at === null,
+      );
+      if (!unused || unused.expires_at <= Date.now()) {
+        const now = Date.now();
+        for (const t of db.emailTokens) {
+          if (t.email === email && t.purpose === "password_reset" && t.used_at === null) t.used_at = now;
+        }
+        db.emailTokens.push({
+          token: `mock-reset-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+          email,
+          purpose: "password_reset",
+          expires_at: now + 60 * 60 * 1000, // 1h，与后端一致
+          used_at: null,
+          created_at: now,
+        });
+      }
+      return ok({ ok: true, expires_in: 3600 });
+    }
+
+    if (seg[1] === "resend-verification" && method === "POST") {
+      if (!logged) return fail(401, "Unauthorized");
+      // 注意：`user` 常量在下方登录闸之后才声明，这里显式取一次会话用户
+      const me = userFromCookie(db, req.cookie);
+      if (me.email_verified_at) return fail(409, "邮箱已完成验证");
+      const now = Date.now();
+      const last = db.emailTokens
+        .filter((x) => x.email === me.email.toLowerCase() && x.purpose === "email_verify" && x.used_at === null)
+        .sort((a, b) => b.created_at - a.created_at)[0];
+      if (last && now - last.created_at < 60_000) return fail(429, "请求过于频繁，请稍后再试");
+      for (const t of db.emailTokens) {
+        if (t.email === me.email.toLowerCase() && t.purpose === "email_verify" && t.used_at === null) t.used_at = now;
+      }
+      db.emailTokens.push({
+        token: `mock-verify-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        email: me.email.toLowerCase(),
+        purpose: "email_verify",
+        expires_at: now + 24 * 60 * 60 * 1000, // 24h，与后端一致
+        used_at: null,
+        created_at: now,
+      });
+      return ok({ ok: true, expires_in: 24 * 60 * 60 });
+    }
+
+    if (seg[1] === "reset-password" && method === "POST") {
+      const body = asRecord(req.body);
+      const token = reqStr(body.token);
+      const password = reqStr(body.password);
+      if (!token) return fail(400, "重置链接无效或已过期");
+      if (password.length < 8) return fail(400, "密码至少 8 位");
+      const row = db.emailTokens.find((x) => x.token === token && x.purpose === "password_reset");
+      if (!row || row.used_at !== null || row.expires_at <= Date.now()) {
+        return fail(400, "重置链接无效或已过期");
+      }
+      const target = db.users.find((u) => u.email.toLowerCase() === row.email);
+      if (!target) return fail(400, "重置链接无效或已过期");
+      row.used_at = Date.now();
+      db.passwords[target.id] = password;
+      // 所有未用 token（含邮箱验证信）一并作废
+      const now = Date.now();
+      for (const t of db.emailTokens) {
+        if (target && t.email === target.email.toLowerCase() && t.used_at === null) t.used_at = now;
+      }
+      return ok({ ok: true });
+    }
   }
 
   // 以下全部需要登录
   if (!logged) return fail(401, "Unauthorized");
   const user = userFromCookie(db, req.cookie);
+
+  // ---------- TEN-01 workspaces ----------
+  // 镜像 backend/src/routes/workspaces.ts 的契约：列表按会话过滤、邀请只返回一次 token、
+  // 邀请接受要求邮箱匹配且单次使用、owner 不可移除、成员可自行退出。
+  if (seg[0] === "workspaces") {
+    // POST /workspaces/invites/accept（注意：必须早于 /:id 分支，避免 "invites" 被当成 ID）
+    if (seg[1] === "invites" && seg[2] === "accept" && method === "POST") {
+      const body = asRecord(req.body);
+      const token = reqStr(body.token);
+      const invite = db.workspaceInvites.find(
+        (x) => x.token === token && x.accepted_at === null && x.revoked_at === null && x.expires_at > Date.now(),
+      );
+      if (!invite || invite.email !== user.email.toLowerCase()) {
+        return fail(404, "邀请不存在或已失效", "INVITE_INVALID");
+      }
+      const prior = db.workspaceMembers.find(
+        (m) => m.workspace_id === invite.workspace_id && m.user_id === user.id,
+      );
+      if (prior?.active) return fail(409, "邀请已使用", "INVITE_ALREADY_MEMBER");
+      invite.accepted_at = Date.now();
+      db.workspaceMembers.push({
+        id: nextId(db.workspaceMembers),
+        workspace_id: invite.workspace_id,
+        user_id: user.id,
+        role: invite.role,
+        active: true,
+        created_at: nowIso(),
+      });
+      return ok({ workspace_id: invite.workspace_id });
+    }
+
+    // GET /workspaces：当前用户的所有 active 成员关系（含个人空间），带 role
+    if (method === "GET" && seg[1] === undefined) {
+      const mine = db.workspaceMembers.filter((m) => m.user_id === user.id && m.active);
+      const rows: Workspace[] = [];
+      for (const m of mine) {
+        const ws = db.workspaces.find((w) => w.id === m.workspace_id);
+        if (!ws) continue;
+        rows.push({
+          id: ws.id,
+          name: ws.name,
+          slug: ws.slug,
+          kind: ws.kind,
+          role: m.role,
+          created_at: ws.created_at,
+        });
+      }
+      rows.sort((a, b) => a.id - b.id);
+      return ok(rows);
+    }
+
+    // POST /workspaces：创建团队空间，创建者为 owner（mock 同步发默认策略由后端负责）
+    if (method === "POST" && seg[1] === undefined) {
+      const body = asRecord(req.body);
+      const name = reqStr(body.name);
+      if (!name || name.length > 120) return badRequest("工作空间名称必须为 1–120 个字符");
+      const id = nextId(db.workspaces);
+      const ws: Workspace = {
+        id,
+        name,
+        slug: `team-${Date.now().toString(36)}`,
+        kind: "team",
+        created_at: nowIso(),
+        role: "owner",
+      };
+      db.workspaces.push({
+        id,
+        slug: ws.slug,
+        name,
+        kind: "team",
+        personal_user_id: null,
+        created_by_id: user.id,
+        created_at: nowIso(),
+      });
+      db.workspaceMembers.push({
+        id: nextId(db.workspaceMembers),
+        workspace_id: id,
+        user_id: user.id,
+        role: "owner",
+        active: true,
+        created_at: nowIso(),
+      });
+      return ok(ws);
+    }
+
+    // /workspaces/:id[/...]
+    const id = parseId(seg[1]);
+    if (id !== null) {
+      const membership = db.workspaceMembers.find(
+        (m) => m.workspace_id === id && m.user_id === user.id && m.active,
+      );
+      const ws = db.workspaces.find((w) => w.id === id);
+      if (!membership || !ws) return notFound("工作空间不存在");
+
+      // GET /:id/members：任一 active 成员可读
+      if (method === "GET" && seg[2] === "members") {
+        const rows: WorkspaceMember[] = db.workspaceMembers
+          .filter((m) => m.workspace_id === id && m.active)
+          .map((m) => {
+            const u = db.users.find((x) => x.id === m.user_id);
+            return { user_id: m.user_id, email: u?.email ?? "", role: m.role, created_at: m.created_at };
+          })
+          .sort((a, b) => a.user_id - b.user_id);
+        return ok(rows);
+      }
+
+      // POST /:id/invites：仅 team + owner/admin；重复邮箱 409；成员+待接受邀请上限 5
+      if (method === "POST" && seg[2] === "invites") {
+        if (ws.kind !== "team" || (membership.role !== "owner" && membership.role !== "admin")) {
+          return fail(403, "没有邀请权限", "FORBIDDEN");
+        }
+        const body = asRecord(req.body);
+        const email = reqStr(body.email).toLowerCase();
+        const role = (reqStr(body.role) || "member") as WorkspaceRole;
+        if (!email || !/^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$/.test(email)) return badRequest("邮箱或角色不合法");
+        if (role !== "admin" && role !== "member" && role !== "viewer") return badRequest("邮箱或角色不合法");
+        if (db.workspaceMembers.some((m) => {
+          const u = db.users.find((x) => x.id === m.user_id);
+          return m.workspace_id === id && m.active && u?.email.toLowerCase() === email;
+        })) {
+          return fail(409, "该用户已经是工作空间成员", "ALREADY_MEMBER");
+        }
+        const activeCount = db.workspaceMembers.filter((m) => m.workspace_id === id && m.active).length;
+        const pendingCount = db.workspaceInvites.filter(
+          (x) => x.workspace_id === id && x.accepted_at === null && x.revoked_at === null && x.expires_at > Date.now(),
+        ).length;
+        const limit = 5;
+        if (activeCount + pendingCount >= limit) {
+          return fail(403, `工作空间成员数已达上限（${limit}）`, "MAX_MEMBERS");
+        }
+        // 重新邀请会把该邮箱旧的未用邀请作废（与后端 updateMany 语义一致）
+        for (const old of db.workspaceInvites) {
+          if (old.workspace_id === id && old.email === email && old.accepted_at === null && old.revoked_at === null) {
+            old.revoked_at = Date.now();
+          }
+        }
+        const token = `inv_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+        const invite: MockWorkspaceInvite = {
+          id: nextId(db.workspaceInvites),
+          workspace_id: id,
+          email,
+          role,
+          token,
+          invited_by_id: user.id,
+          expires_at: Date.now() + 7 * 86400000,
+          accepted_at: null,
+          revoked_at: null,
+          created_at: Date.now(),
+        };
+        db.workspaceInvites.push(invite);
+        const created: WorkspaceInvite = {
+          id: invite.id,
+          email,
+          role,
+          expires_at: new Date(invite.expires_at).toISOString(),
+          token,
+        };
+        return ok(created);
+      }
+
+      // DELETE /:id/members/:userId：manage 角色，或 actor===target（退出）；owner 不可移除
+      if (method === "DELETE" && seg[2] === "members" && parseId(seg[3]) !== null) {
+        const targetId = parseId(seg[3])!;
+        const target = db.workspaceMembers.find(
+          (m) => m.workspace_id === id && m.user_id === targetId && m.active,
+        );
+        if (!target) return notFound("成员不存在");
+        if (target.role === "owner") return fail(403, "不能移除 owner", "FORBIDDEN");
+        if (user.id !== targetId && membership.role !== "owner" && membership.role !== "admin") {
+          return fail(403, "没有移除权限", "FORBIDDEN");
+        }
+        target.active = false;
+        return ok({ ok: true });
+      }
+
+      // GET /:id：当前空间详情（前端暂未使用，保留以对齐后端契约）
+      if (method === "GET" && seg[2] === undefined) {
+        return ok({
+          id: ws.id,
+          name: ws.name,
+          slug: ws.slug,
+          kind: ws.kind,
+          created_at: ws.created_at,
+          role: membership.role,
+        });
+      }
+    }
+  }
 
   // ---------- dashboard ----------
   if (seg[0] === "dashboard") {
@@ -1089,17 +1390,20 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       db.passwords[user.id] = next;
       return ok({ ok: true });
     }
+    // SEC-02 对齐：mock 轮换后明文列同样「只出现一次」——
+    // 响应里回明文，但 user 对象上的 api_key 归 null（后端只存 sha256 哈希列）。
+    // 前端一次性展示区读的是响应顶层字段，不是 user.*，故此形状即真实契约。
     if (seg[1] === "api-key" && method === "POST") {
       const rand = () => Math.random().toString(16).slice(2, 10);
       const key = `rk_live_${rand()}${rand()}`;
-      user.api_key = key;
+      user.api_key = null;
       user.updated_at = nowIso();
       return ok({ ok: true, api_key: key, user });
     }
     if (seg[1] === "subscription-key" && method === "POST") {
       const rand = () => Math.random().toString(16).slice(2, 10);
       const key = `sk_sub_${rand()}${rand()}`;
-      user.subscription_key = key;
+      user.subscription_key = null;
       user.updated_at = nowIso();
       return ok({ ok: true, subscription_key: key, user });
     }
@@ -1248,6 +1552,7 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           api_key: `rk_live_${Math.random().toString(16).slice(2, 18)}`,
           subscription_key: `sk_sub_${Math.random().toString(16).slice(2, 18)}`,
           status: reqStr(body.status) === "inactive" ? "inactive" : "active",
+          email_verified_at: null,
           created_at: nowIso(),
           updated_at: nowIso(),
         };

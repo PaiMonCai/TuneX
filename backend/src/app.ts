@@ -7,6 +7,7 @@
  *   ② CORS（仅非生产）
  *   ③ 免认证白名单命中 → 直接放行（/api/auth/*, /api/pay/*\/callback,
  *      /api/tunnel/observer, /healthz, /api/system/config/site, /api/license ...）
+ *   ③.5 CSRF 防护（createCsrfMiddleware：Origin/Referer + 自定义头存在性）
  *   ④ authRequired（双通道：Cookie access JWT | Bearer api_key）
  *   ⑤ [/api/admin/*] adminRequired → adminPermissionGuard
  */
@@ -25,6 +26,7 @@ import {
   type AppVariables,
 } from "./middlewares/auth.ts";
 import { createAuditMiddleware } from "./middlewares/audit.ts";
+import { createCsrfMiddleware } from "./middlewares/csrf.ts";
 import { createRateLimitMiddleware } from "./middlewares/rate-limit.ts";
 import { authRoutes } from "./routes/auth.ts";
 import { adminRoutes } from "./routes/admin.ts";
@@ -96,6 +98,12 @@ export function createApp() {
     }
     await next();
   });
+
+  // ③.5 CSRF 防护（billing gate 之后、authRequired 之前）
+  //   必须早于认证：它只看 cookie 头存在性（不需要知道用户是谁），
+  //   提前挡住跨站写，避免未认证的 CSRF 探测产生任何副作用；
+  //   /api/auth/* 登录/注册 POST 同受其保护（防登录 CSRF），这是有意的。
+  app.use("*", createCsrfMiddleware());
 
   // ④ 全局认证（白名单在 authRequired 内部短路）
   app.use("*", authRequired);

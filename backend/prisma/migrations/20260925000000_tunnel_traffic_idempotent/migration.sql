@@ -1,0 +1,24 @@
+-- OPS-03：tunnel_traffic 增加 (tunnel_id, date) 唯一约束，作为流量归档幂等的**最终防线**。
+--
+-- 背景：services/traffic-archive.ts 的归档流程是「读 Redis 缓冲 → 写 tunnel_traffic
+-- → 删缓冲」。进程在「写库成功、删缓冲之前」崩溃时，同一份 (tunnel_id, date) 缓冲
+-- 会在下一轮被再次归档 —— 没有库级约束，这条记录就会重复入库，流量被双计，
+-- 直接违反 OPS-03 验收「采集入库不重复」与 OPS-01「任务幂等」。
+--
+-- 为什么用唯一索引而不是应用层去重：Redis 层的 SETNX 占位锁只是把重试频率
+-- 降到「锁 TTL 内一次」的**优化**，锁过期或 Redis 丢数据后仍会重复；而
+-- createMany({ skipDuplicates: true }) 撞唯一索引时由 MySQL 静默跳过重复行，
+-- 即使应用层判断全部失效，重复数据也**不可能**进入隧道聚合。
+--
+-- 兼容性（本迁移对存量数据零影响的前提）：迁移前已存在的 (tunnel_id, date)
+-- 组合必须本来就只有一行。CI 的空库与升级 fixture 都不含重复行；本地开发库
+-- 已实测 16 行 16 个不同 tunnel 且同一 date 下无重复。若线上库存在重复行，
+-- 本迁移会失败并报 1062 —— 那正是要的信号：先清理重复行再迁移，绝不静默合并
+-- 两份流量（合并会改变历史计量口径）。
+--
+-- 回滚：ALTER TABLE `tunnel_traffic` DROP INDEX `tunnel_traffic_tunnel_id_date_key`;
+-- （注意：已入库的数据不会因回滚而重复；回滚只是丢掉了「重复不可能」的保证，
+--  应立即重新上线本迁移。）
+
+-- CreateIndex
+CREATE UNIQUE INDEX `tunnel_traffic_tunnel_id_date_key` ON `tunnel_traffic`(`tunnel_id`, `date`);

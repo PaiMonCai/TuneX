@@ -13,6 +13,9 @@ export interface LicenseInfo {
  * License 服务
  * 原版从远程 LICENSE_URL 拉取并缓存 Redis；本实现用 env + Redis 覆盖模拟，
  * 保留 getLicense / isBusinessLicense / businessLicenseRequired 的语义。
+ *
+ * TEN-02：license 是**实例级**配置（不随租户变化），键走平台段
+ * `ws:global:license`——经 {@link scopedKey} 显式生成，而不是裸名 `license`。
  */
 class LicenseService {
   async getLicense(): Promise<LicenseInfo | null> {

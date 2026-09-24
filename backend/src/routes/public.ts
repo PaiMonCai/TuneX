@@ -1,37 +1,152 @@
 /**
  * 免认证端点：支付回调 / 隧道观测 / 站点配置 / license
  * 对应 noAuthPaths 白名单中的业务路径（部分端点仍为占位实现）。
+ *
+ * TEN-02：`/api/tunnel/observer` 在免认证白名单里，因此**不能**信任任何
+ * 自我声明的归属。observer 回传按「node_id → node → group → workspace」
+ * 解析后分键写入 Redis；解析不出 workspace 的一律丢弃，而不是落到一个全局
+ * 队列里——裸名 `tunnel:observer:raw` 会让所有租户的回传混在一起，且载荷
+ * 不含归属信息，任何消费者都无法按租户拆分。
  */
 import { Hono } from "hono";
-import { redis, RedisKeys } from "../redis.ts";
+import { db } from "../db.ts";
+import { redis, RedisKeys, observerBufferKey, OBSERVER_BUFFER_MAX, trafficBufferKey } from "../redis.ts";
 import { systemConfig } from "../services/config.ts";
+import { resolveUserByKey } from "../services/user-keys.ts";
+import { decideTrafficReport, accumulateTraffic } from "../services/traffic-archive.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const publicRoutes = new Hono<{ Variables: AppVariables }>();
 
 /** POST /api/tunnel/observer —— agent 观测数据回传（免认证） */
 publicRoutes.post("/tunnel/observer", async (c) => {
+  const nodeId = c.req.query("node_id") ?? "";
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json({ error: "invalid json" }, 400);
+  if (!nodeId) return c.json({ error: "missing node_id" }, 400);
+
+  // node_id → 组 → workspace。解析失败就丢弃：无归属的回传写进任何桶都是错的。
+  let workspaceId: number | null = null;
+  try {
+    const node = await db.node.findUnique({
+      where: { node_id: nodeId },
+      select: { node_group: { select: { workspace_id: true } } },
+    });
+    workspaceId = node?.node_group?.workspace_id ?? null;
+  } catch {
+    /* DB 不可用时按下方丢弃处理 */
+  }
+  if (workspaceId === null) {
+    // 返回 200 而非 4xx：agent 对 4xx 可能重试，而无归属的数据重试也不会变对。
+    return c.json({ data: { ok: true, dropped: "unknown node" } });
+  }
 
   // Writes to Redis buffer; DB persistence via HINCRBYFLOAT + cron archiving.
   try {
+    // TEN-02：按 workspace 分键写入（ws:<workspaceId>:tunnel:observer:raw）。
+    const key = observerBufferKey(workspaceId);
     await redis.rpush(
-      `${RedisKeys.observerBuffer}:raw`,
-      JSON.stringify({ at: Date.now(), body }),
+      key,
+      JSON.stringify({ at: Date.now(), node_id: nodeId, workspace_id: workspaceId, body }),
     );
+    // 有上限：这个队列没有消费者，不设上限就是 Redis 内存泄漏。
+    await redis.ltrim(key, -OBSERVER_BUFFER_MAX, -1);
   } catch {
     /* Redis 故障返回 200 避免 agent 重试风暴 */
   }
   return c.json({ data: { ok: true } });
 });
 
+/**
+ * POST /api/tunnel/traffic —— agent 隧道流量上报（免认证，凭 node_id 归属）
+ *
+ * OPS-03 采集入口。载荷：`{ items: [{ tunnel_id, bytes }, ...] }`，`bytes` 是
+ * **本轮新增字节数**（不是累计值）—— agent 侧按上报周期取差。
+ *
+ * 归属判定与 observer 同源：node_id → node → node_group → workspace，
+ * 解析不出归属一律丢弃（返回 200 而非 4xx，见 observer 的批注）。隧道必须
+ * 属于该 workspace（`tunnel.workspace_id === group.workspace_id`），否则
+ * 拒绝该条：节点不能靠改 tunnel_id 往别人的桶里写流量。
+ *
+ * 写入 Redis hash（`ws:<scope>:tunnel:traffic:<tunnelId>`，field = 本地日界
+ * `YYYY-MM-DD`，HINCRBYFLOAT 累加），不直接落库 —— 落库由 worker 的
+ * `cron_save_traffic` 批量归档（OPS-01，幂等）。上报端失败不影响 agent，
+ * Redis 故障同样返回 200（重试只会让己方日志变多，不会让数据变对）。
+ */
+publicRoutes.post("/tunnel/traffic", async (c) => {
+  const nodeId = c.req.query("node_id") ?? "";
+  const body = await c.req.json().catch(() => null);
+  if (!nodeId || !body) return c.json({ error: "missing node_id or body" }, 400);
+
+  // node_id → 组 → workspace（与 observer 同一套反查；失败即丢弃）。
+  let workspaceId: number | null = null;
+  try {
+    const node = await db.node.findUnique({
+      where: { node_id: nodeId },
+      select: { node_group: { select: { workspace_id: true } } },
+    });
+    workspaceId = node?.node_group?.workspace_id ?? null;
+  } catch {
+    /* DB 不可用按下方丢弃处理 */
+  }
+  if (workspaceId === null) {
+    return c.json({ data: { ok: true, dropped: "unknown node" } });
+  }
+
+  const rawItems = (body as { items?: unknown }).items;
+  let decided: ReturnType<typeof decideTrafficReport>;
+  try {
+    // 归属白名单：该 workspace 下的隧道 id 集合。查不到任何隧道 → 空集合，
+    // 所有上报条都会被判 tunnel_not_in_scope（fail-closed）。
+    const tunnels = await db.tunnel.findMany({
+      where: { workspace_id: workspaceId },
+      select: { id: true },
+    });
+    decided = decideTrafficReport(rawItems, new Set(tunnels.map((t) => t.id)));
+  } catch {
+    return c.json({ data: { ok: true, dropped: "unavailable" } });
+  }
+
+  if (decided.accepted.length === 0) {
+    // 没有可写入的增量：不写缓冲。响应里带上拒绝原因，便于 agent 侧排错。
+    return c.json({
+      data: {
+        ok: true,
+        accepted: 0,
+        rejected: decided.rejected,
+      },
+    });
+  }
+
+  try {
+    const n = await accumulateTraffic(
+      workspaceId,
+      decided.accepted.map((a) => a.tunnel_id),
+      decided.accepted.map((a) => a.bytes),
+      {
+        hincrBy: (key, field, by) => redis.hincrbyfloat(key, field, by),
+      },
+    );
+    return c.json({
+      data: {
+        ok: true,
+        accepted: n,
+        rejected: decided.rejected,
+      },
+    });
+  } catch {
+    // Redis 故障：返回 200 避免 agent 重试风暴（同 observer 的取向）。
+    return c.json({ data: { ok: true, dropped: "buffer unavailable" } });
+  }
+});
+
 /** GET /api/tunnel/subscription —— 订阅式配置分发（免认证，凭 subscription_key） */
 publicRoutes.get("/tunnel/subscription", async (c) => {
   const key = c.req.query("token") ?? c.req.query("key") ?? "";
   if (!key) return c.json({ error: "missing token" }, 400);
-  const { db } = await import("../db.ts");
-  const user = await db.user.findUnique({ where: { subscription_key: key } });
+  // SEC-02：凭据哈希化查询 —— 先 subscription_key_hash，未命中再查 legacy 明文列
+  //（存量 60+ 用户的旧行，命中时同事务写哈希并清空明文，完成惰性迁移）。
+  const user = await resolveUserByKey("subscription_key", key);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   // The legacy subscription key belongs to the account, not to a team. It must never
   // grant access to team assets even when the account created those assets.
@@ -72,12 +187,16 @@ publicRoutes.get("/license", async (c) => {
   return c.json({ data: (await licenseService.getLicense()) ?? { type: "none" } });
 });
 
-/** POST /api/pay/:id/callback —— 支付网关回调（免认证） */
+/** POST /api/pay/:id/callback —— 支付网关回调（免认证，原文缓冲） */
 publicRoutes.post("/pay/:id/callback", async (c) => {
   const id = c.req.param("id");
   const raw = await c.req.text();
   try {
-    await redis.rpush(`pay:callback:${id}`, JSON.stringify({ at: Date.now(), raw }));
+    // TEN-02：回调缓冲是全局审计留痕（按网关 id），走平台段 `ws:global:pay:callback:<id>`。
+    await redis.rpush(
+      RedisKeys.payCallback(id),
+      JSON.stringify({ at: Date.now(), raw }),
+    );
   } catch {
     /* ignore */
   }

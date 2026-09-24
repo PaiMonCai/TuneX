@@ -3,7 +3,7 @@ import {
   parseDisconnectMarkerKey,
   parseMarker,
   disconnectMarkerKey,
-  sysinfoKey,
+  heartbeatKey,
   decideOffline,
   runOfflineCheck,
   DISCONNECT_DEBOUNCE_MS,
@@ -13,22 +13,48 @@ import {
   type OfflineContext,
 } from "../offline-detector.ts";
 
-describe("key helpers", () => {
-  test("disconnectMarkerKey / sysinfoKey shape", () => {
-    expect(disconnectMarkerKey(3, "Node-A")).toBe("dc:3:Node-A");
-    expect(sysinfoKey(3, "Node-A")).toBe("sysinfo:3:Node-A");
+describe("key helpers (TEN-02 scoped)", () => {
+  test("disconnectMarkerKey / heartbeatKey carry scope", () => {
+    expect(disconnectMarkerKey(1, 3, "Node-A")).toBe("ws:1:node:3:Node-A:offline");
+    expect(heartbeatKey(1, 3, "Node-A")).toBe("ws:1:node:3:Node-A:heartbeat");
+    // 平台组 scope=0 → tag=global
+    expect(disconnectMarkerKey(0, 3, "Node-A")).toBe("ws:global:node:3:Node-A:offline");
+    // 非法 scope 折叠为 global（不落到别的租户）
+    expect(disconnectMarkerKey(-5, 3, "Node-A")).toBe("ws:global:node:3:Node-A:offline");
   });
 
-  test("parseDisconnectMarkerKey round-trips", () => {
-    expect(parseDisconnectMarkerKey("dc:3:Node-A")).toEqual({ groupId: 3, nodeId: "Node-A" });
-    // node_id 含冒号/空格也能解析（只取第一个冒号后半段整体）
-    expect(parseDisconnectMarkerKey("dc:7:a:b c")).toEqual({ groupId: 7, nodeId: "a:b c" });
+  test("同一 groupId 在不同 scope 下生成互不相同的 key（同 ID 资源隔离）", () => {
+    expect(disconnectMarkerKey(1, 7, "n")).not.toBe(disconnectMarkerKey(2, 7, "n"));
+    expect(heartbeatKey(1, 7, "n")).not.toBe(heartbeatKey(2, 7, "n"));
   });
 
-  test("parseDisconnectMarkerKey rejects malformed keys", () => {
-    expect(parseDisconnectMarkerKey("sysinfo:1:x")).toBeNull();
-    expect(parseDisconnectMarkerKey("dc:abc:X")).toBeNull();
-    expect(parseDisconnectMarkerKey("dc:1")).toBeNull();
+  test("parseDisconnectMarkerKey round-trips with scope", () => {
+    expect(parseDisconnectMarkerKey("ws:1:node:3:Node-A:offline")).toEqual({
+      scope: 1,
+      groupId: 3,
+      nodeId: "Node-A",
+    });
+    // node_id 含冒号/空格也能解析（转义还原为一个整体）
+    expect(parseDisconnectMarkerKey("ws:7:node:9:a:b c:offline")).toEqual({
+      scope: 7,
+      groupId: 9,
+      nodeId: "a:b c",
+    });
+    // 平台 scope 解析为 0
+    expect(parseDisconnectMarkerKey("ws:global:node:9:n1:offline")).toEqual({
+      scope: 0,
+      groupId: 9,
+      nodeId: "n1",
+    });
+  });
+
+  test("parseDisconnectMarkerKey rejects malformed / legacy (unscoped) keys", () => {
+    expect(parseDisconnectMarkerKey("ws:1:node:3:n1:heartbeat")).toBeNull();
+    // 旧的无 scope 形态（dc:<groupId>:<nodeId>）必须被拒绝，避免误判租户
+    expect(parseDisconnectMarkerKey("dc:3:Node-A")).toBeNull();
+    expect(parseDisconnectMarkerKey("sysinfo:1:3:x")).toBeNull();
+    expect(parseDisconnectMarkerKey("ws:abc:node:1:X:offline")).toBeNull();
+    expect(parseDisconnectMarkerKey("ws:1:node:1:offline")).toBeNull();
     expect(parseDisconnectMarkerKey("")).toBeNull();
   });
 
@@ -39,21 +65,23 @@ describe("key helpers", () => {
 });
 
 describe("parseMarker", () => {
-  test("parses value as ms timestamp", () => {
-    const m = parseMarker("dc:2:n1", "1700000000000");
+  test("parses scope + value as ms timestamp", () => {
+    const m = parseMarker("ws:1:node:2:n1:offline", "1700000000000");
     expect(m).not.toBeNull();
+    expect(m!.scope).toBe(1);
     expect(m!.groupId).toBe(2);
     expect(m!.nodeId).toBe("n1");
     expect(m!.markedAt).toBe(1700000000000);
   });
 
   test("malformed value → markedAt 0 (treated as long overdue)", () => {
-    expect(parseMarker("dc:2:n1", "not-a-number")!.markedAt).toBe(0);
-    expect(parseMarker("dc:2:n1", "")!.markedAt).toBe(0);
+    expect(parseMarker("ws:1:node:2:n1:offline", "not-a-number")!.markedAt).toBe(0);
+    expect(parseMarker("ws:1:node:2:n1:offline", "")!.markedAt).toBe(0);
   });
 
-  test("malformed key → null", () => {
+  test("malformed key → null (incl. legacy unscoped form)", () => {
     expect(parseMarker("bad", "1")).toBeNull();
+    expect(parseMarker("dc:1:n1", "1")).toBeNull();
   });
 });
 
@@ -65,7 +93,8 @@ describe("decideOffline", () => {
     nodeStatus: "active",
   };
   const marker = (markedAt: number): DisconnectMarker => ({
-    key: "dc:1:n1",
+    key: "ws:1:node:1:n1:offline",
+    scope: 1,
     groupId: 1,
     nodeId: "n1",
     markedAt,
@@ -129,7 +158,7 @@ function fakeDeps(opts: {
 
   const deps: OfflineCheckDeps = {
     listMarkers: async () => opts.markers,
-    hasHeartbeat: async (g, n) => heartbeats.has(sysinfoKey(g, n)),
+    hasHeartbeat: async (s, g, n) => heartbeats.has(heartbeatKey(s, g, n)),
     getNodeStatus: async (n) => nodes.get(n) ?? "missing",
     markInactive: async (n) => {
       if (nodes.get(n) === "active") {
@@ -144,8 +173,8 @@ function fakeDeps(opts: {
     },
     groupHasActiveNode: async (g) =>
       [...nodes.entries()].some(([k, v]) => k.startsWith(`n${g}`) && v === "active"),
-    removeAliveGroup: async (g) => {
-      srem.push(String(g));
+    removeAliveGroup: async (s, g) => {
+      srem.push(`${s}:${g}`);
     },
     now: () => opts.now ?? 1_000_000,
     debounceMs: opts.debounceMs,
@@ -157,7 +186,7 @@ function fakeDeps(opts: {
 describe("runOfflineCheck", () => {
   test("offline node is flipped + marker cleared", async () => {
     const { deps, deleted, flipped } = fakeDeps({
-      markers: [{ key: "dc:1:n1", value: String(1_000_000 - 120_000) }],
+      markers: [{ key: "ws:1:node:1:n1:offline", value: String(1_000_000 - 120_000) }],
       nodes: new Map([["n1", "active"]]),
       now: 1_000_000,
     });
@@ -165,12 +194,12 @@ describe("runOfflineCheck", () => {
     expect(r.scanned).toBe(1);
     expect(r.flipped).toBe(1);
     expect(flipped).toEqual(["n1"]);
-    expect(deleted).toEqual(["dc:1:n1"]);
+    expect(deleted).toEqual(["ws:1:node:1:n1:offline"]);
   });
 
   test("within debounce is kept (marker NOT cleared), node untouched", async () => {
     const { deps, deleted, nodes } = fakeDeps({
-      markers: [{ key: "dc:1:n1", value: String(1_000_000 - 10_000) }],
+      markers: [{ key: "ws:1:node:1:n1:offline", value: String(1_000_000 - 10_000) }],
       nodes: new Map([["n1", "active"]]),
       now: 1_000_000,
     });
@@ -183,22 +212,37 @@ describe("runOfflineCheck", () => {
 
   test("heartbeat alive → marker cleared, node stays active", async () => {
     const { deps, deleted, nodes } = fakeDeps({
-      markers: [{ key: "dc:1:n1", value: String(1_000_000 - 120_000) }],
-      heartbeats: new Set([sysinfoKey(1, "n1")]),
+      markers: [{ key: "ws:1:node:1:n1:offline", value: String(1_000_000 - 120_000) }],
+      heartbeats: new Set([heartbeatKey(1, 1, "n1")]),
       nodes: new Map([["n1", "active"]]),
       now: 1_000_000,
     });
     const r = await runOfflineCheck(deps);
     expect(r.skippedHeartbeatAlive).toBe(1);
     expect(nodes.get("n1")).toBe("active");
-    expect(deleted).toEqual(["dc:1:n1"]);
+    expect(deleted).toEqual(["ws:1:node:1:n1:offline"]);
+  });
+
+  test("心跳只认本 scope：别租户的心跳不能让本租户的节点逃过离线判定", async () => {
+    // marker 属 scope=1；heartbeat set 里放的是 scope=2 的键（同 groupId/nodeId）。
+    // hasHeartbeat 用 marker.scope 生成的键查表 → 不应命中 → 判 offline。
+    const { deps, deleted, nodes } = fakeDeps({
+      markers: [{ key: "ws:1:node:1:n1:offline", value: String(1_000_000 - 120_000) }],
+      heartbeats: new Set([heartbeatKey(2, 1, "n1")]),
+      nodes: new Map([["n1", "active"]]),
+      now: 1_000_000,
+    });
+    const r = await runOfflineCheck(deps);
+    expect(r.flipped).toBe(1);
+    expect(nodes.get("n1")).toBe("inactive");
+    expect(r.skippedHeartbeatAlive).toBe(0);
   });
 
   test("already inactive / missing node → cleared without flip", async () => {
     const { deps, flipped } = fakeDeps({
       markers: [
-        { key: "dc:1:gone", value: "1" },
-        { key: "dc:1:off", value: "1" },
+        { key: "ws:1:node:1:gone:offline", value: "1" },
+        { key: "ws:1:node:1:off:offline", value: "1" },
       ],
       nodes: new Map([["off", "inactive"]]),
       now: 1_000_000,
@@ -211,7 +255,7 @@ describe("runOfflineCheck", () => {
 
   test("malformed marker key is ignored (not scanned)", async () => {
     const { deps } = fakeDeps({
-      markers: [{ key: "sysinfo:1:n1", value: "1" }],
+      markers: [{ key: "ws:1:node:1:n1:heartbeat", value: "1" }],
       now: 1_000_000,
     });
     const r = await runOfflineCheck(deps);
@@ -220,21 +264,21 @@ describe("runOfflineCheck", () => {
 
   test("alive group is reaped only when no active node remains", async () => {
     const { deps, srem } = fakeDeps({
-      markers: [{ key: "dc:4:n4a", value: "1" }],
+      markers: [{ key: "ws:1:node:4:n4a:offline", value: "1" }],
       nodes: new Map([["n4a", "active"]]),
       now: 1_000_000,
     });
     const r = await runOfflineCheck(deps);
     expect(r.flipped).toBe(1);
-    // n4a 现为 inactive，组内已无 active → 移除
-    expect(r.clearedGroups).toEqual([4]);
-    expect(srem).toEqual(["4"]);
+    // n4a 现为 inactive，组内已无 active → 从**该 scope 的**集合移除
+    expect(r.clearedGroups).toEqual(["1:4"]);
+    expect(srem).toEqual(["1:4"]);
   });
 
   test("alive group NOT reaped when another node in the group is still active", async () => {
     // 两个节点同组：一个离线翻转，另一个仍 active
     const { deps, srem } = fakeDeps({
-      markers: [{ key: "dc:4:n4a", value: "1" }],
+      markers: [{ key: "ws:1:node:4:n4a:offline", value: "1" }],
       nodes: new Map([
         ["n4a", "active"],
         ["n4b", "active"],
@@ -250,8 +294,8 @@ describe("runOfflineCheck", () => {
   test("per-marker failure is swallowed and counted", async () => {
     const { deps } = fakeDeps({
       markers: [
-        { key: "dc:1:n1", value: "1" },
-        { key: "dc:1:n2", value: "1" },
+        { key: "ws:1:node:1:n1:offline", value: "1" },
+        { key: "ws:1:node:1:n2:offline", value: "1" },
       ],
       nodes: new Map([
         ["n1", "active"],
@@ -276,7 +320,7 @@ describe("runOfflineCheck", () => {
   test("idempotent: re-running after flip reports already_inactive, no double count", async () => {
     const nodes = new Map<string, "active" | "inactive">([["n1", "active"]]);
     const first = fakeDeps({
-      markers: [{ key: "dc:1:n1", value: "1" }],
+      markers: [{ key: "ws:1:node:1:n1:offline", value: "1" }],
       nodes,
       now: 1_000_000,
     });
@@ -284,7 +328,7 @@ describe("runOfflineCheck", () => {
     expect(r1.flipped).toBe(1);
     // 第二轮同一标记（尚未清理的极端情况）——节点已 inactive
     const second = fakeDeps({
-      markers: [{ key: "dc:1:n1", value: "1" }],
+      markers: [{ key: "ws:1:node:1:n1:offline", value: "1" }],
       nodes,
       now: 1_000_000,
     });

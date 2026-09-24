@@ -6,6 +6,9 @@ import { z } from "zod";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { canWorkspaceAction } from "../services/workspace.ts";
+import { assignDefaultPolicy, withWorkspaceQuotaLock } from "../services/policy-service.ts";
+import { checkMemberAddition } from "../services/capability-policy.ts";
+import { getWorkspaceTrafficSummary } from "../services/traffic.ts";
 
 export const workspaceRoutes = new Hono<{ Variables: AppVariables }>();
 // Legacy account-wide API keys are not scoped to a workspace. Team management
@@ -67,6 +70,7 @@ workspaceRoutes.post("/", async (c) => {
       },
       select: { id: true, name: true, slug: true, kind: true, created_at: true },
     });
+    await assignDefaultPolicy(tx, { id: workspace.id, kind: "team" });
     await tx.auditEvent.create({ data: { workspace_id: workspace.id, actor_user_id: userId, action: "workspace.created", resource_type: "workspace", resource_id: String(workspace.id) } });
     return workspace;
   });
@@ -90,6 +94,33 @@ workspaceRoutes.get("/:id/members", async (c) => {
   return c.json({ data: rows.map(({ user, ...row }) => ({ ...row, email: user.email })) });
 });
 
+/**
+ * GET /:id/traffic —— workspace 流量聚合（OPS-03）。
+ *
+ * 归属与权限沿用 `membership()`：必须是该 workspace 的 active 成员（viewer
+ * 也可读）。查询本身再经 `tunnel: { workspace_id }` relation filter 兜底，
+ * 双重作用域下跨租户的流量行不会进入结果。
+ *
+ * 口径与策略流量一致：period 缺省取生效策略的 traffic_period，窗口起点复用
+ * capability-policy 的 trafficWindowStart —— 与 config-generator 判定
+ * 「流量耗尽」用的是同一套日/月界。
+ */
+workspaceRoutes.get("/:id/traffic", async (c) => {
+  const id = workspaceId(c.req.param("id"));
+  const member = await membership(id, actorId(c));
+  if (!canWorkspaceAction(member.role, "read")) throw new HTTPException(403);
+
+  const q = c.req.query();
+  const days = q.days === undefined ? undefined : Number(q.days);
+  const period = q.period === "day" || q.period === "month" || q.period === "total" ? q.period : undefined;
+  if (q.days !== undefined && !Number.isFinite(days)) {
+    return c.json({ error: "days 必须为 1–90 的整数" }, 400);
+  }
+
+  const summary = await getWorkspaceTrafficSummary(id, { period, days });
+  return c.json({ data: summary });
+});
+
 workspaceRoutes.post("/:id/invites", async (c) => {
   const userId = actorId(c);
   const member = await membership(workspaceId(c.req.param("id")), userId);
@@ -99,16 +130,34 @@ workspaceRoutes.post("/:id/invites", async (c) => {
   const { email, role } = parsed.data;
   const existing = await db.workspaceMember.findFirst({ where: { workspace_id: member.workspace_id, user: { email }, active: true } });
   if (existing) return c.json({ error: "该用户已经是工作空间成员" }, 409);
-  const token = randomBytes(32).toString("base64url");
-  const expiresAt = new Date(Date.now() + 7 * 86400_000);
-  const invite = await db.$transaction(async (tx) => {
+
+  // 成员额度：active 成员 + 未过期未使用的邀请，合计不得越过策略上限。
+  // SOFT-01：判定与插入在同一 workspace 行锁事务内完成，两个 owner 并发邀请
+  // 不会双双通过（此前是先查 policy 再查计数，然后另起事务插入）。
+  const invite = await withWorkspaceQuotaLock(member.workspace_id, async (tx, policy) => {
+    const [memberCount, pendingInvites] = await Promise.all([
+      tx.workspaceMember.count({ where: { workspace_id: member.workspace_id, active: true } }),
+      tx.workspaceInvite.count({ where: { workspace_id: member.workspace_id, accepted_at: null, revoked_at: null, expires_at: { gt: new Date() } } }),
+    ]);
+    const decision = checkMemberAddition(policy, memberCount + pendingInvites);
+    if (!decision.allowed) return { denied: decision, limit: policy.limits.max_members } as const;
+
+    const token = randomBytes(32).toString("base64url");
+    const expiresAt = new Date(Date.now() + 7 * 86400_000);
     await tx.workspaceInvite.updateMany({ where: { workspace_id: member.workspace_id, email, accepted_at: null, revoked_at: null }, data: { revoked_at: new Date() } });
     const created = await tx.workspaceInvite.create({ data: { workspace_id: member.workspace_id, email, role, token_hash: hash(token), invited_by_id: userId, expires_at: expiresAt } });
     await tx.auditEvent.create({ data: { workspace_id: member.workspace_id, actor_user_id: userId, action: "member.invited", resource_type: "workspace_invite", resource_id: String(created.id) } });
-    return created;
+    return { token, expiresAt, invite: created } as const;
   });
-  // Display exactly once over authenticated TLS; only its hash is stored.
-  return c.json({ data: { id: invite.id, token, email, role, expires_at: expiresAt } }, 201);
+
+  if ("invite" in invite && invite.invite) {
+    // Display exactly once over authenticated TLS; only its hash is stored.
+    return c.json({ data: { id: invite.invite.id, token: invite.token, email, role, expires_at: invite.expiresAt } }, 201);
+  }
+  if ("denied" in invite) {
+    return c.json({ error: invite.denied.message, code: invite.denied.reason, limit: invite.limit }, 403);
+  }
+  return c.json({ error: "策略拒绝" }, 403);
 });
 
 workspaceRoutes.post("/invites/accept", async (c) => {

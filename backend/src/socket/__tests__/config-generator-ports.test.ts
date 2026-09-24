@@ -47,31 +47,17 @@ function tunnel(id: number, tunnelType: string, listenPort: number | null) {
     proxy_protocol: false,
     status: "active",
     in_node_group_id: 4,
-    // main 版 canUseTunnelGroup 要求组对象存在且 id 匹配；
-    // workspace_id 缺失时走 legacy 放行：group.user_id === tunnel.user_id。
-    in_node_group: { id: 4, user_id: 1 },
+    // main 版 canUseTunnelGroup 要求组对象存在且 id 匹配；组的 workspace_id
+    // 与隧道一致即视为自有组放行（isNodeGroupGranted）。
+    in_node_group: { id: 4, user_id: 1, workspace_id: 1 },
     out_node_group_id: null,
     out_node_group: null,
     tunnel_chains: [],
     user_id: 1,
+    workspace_id: 1,
     user: {
       id: 1,
-      user_plan: {
-        traffic: 1000,
-        traffic_used: 0,
-        max_tunnels: 100,
-        whitelist_ips: null,
-        plan: {
-          traffic: 1000,
-          max_tunnels: 100,
-          ip_limit: null,
-          client_limit: null,
-          bandwidth_limit: null,
-          all_in_node_groups: true,
-          all_out_node_groups: true,
-          node_groups: [],
-        },
-      },
+      // AUTHZ-02：额度/白名单不再来自 user_plan，改由 policyContext（CapabilityPolicy）注入。
     },
   } as never;
 }

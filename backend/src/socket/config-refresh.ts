@@ -12,11 +12,12 @@
  *
  * ── 为什么「用户/套餐」变更会影响节点组配置 ──
  * `config-generator.ts#loadAvailableTunnels` 只下发「有效」隧道：
- *   tunnel.status=active ∧ user.status=active ∧ 套餐未过期；
- * `filterAvailableTunnels` 再用 `plan.all_in_node_groups` / `plan.node_groups`
- * 决定某条隧道能否进入某个**入口/出口**节点组的配置。因此一旦：
+ *   tunnel.status=active ∧ user.status=active ∧ 用户有节点组准入
+ * （NodeGroupGrant 或自有组）；`filterAvailableTunnels` 再按
+ * CapabilityPolicy 的额度（max_tunnels / 流量）决定某条隧道能否进入某个
+ * **入口/出口**节点组的配置。因此一旦：
  *   · 用户被停用 → 其全部隧道从所有相关组配置中消失；
- *   · 套餐绑定的节点组集合变化 → 相关隧道在某些组的「进/出」资格变化；
+ *   · 策略发放/撤销变化 → 相关隧道在某些组的资格与额度变化；
  * 这些组的配置字节就会变化，必须重推，否则 agent 上仍残留旧的监听/链路。
  *
  * ── 受影响节点组的判定（保守超集，宁多推不漏推）──
