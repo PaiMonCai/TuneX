@@ -45,6 +45,7 @@ export const mockUser: User = {
   status: "active",
   created_at: iso(daysAgo(180)),
   updated_at: iso(daysAgo(1)),
+  email_verified_at: iso(daysAgo(179)),
 };
 
 export const mockAdminRole: AdminRole = {

@@ -204,6 +204,23 @@ export const api = {
       clearMockSessionCookie();
       return res;
     },
+    /** TEN-03：点击邮件链接验证邮箱（GET + query，后端返回 { status }） */
+    verifyEmail: (token: string) =>
+      request<{ status: "verified" | "invalid"; message: string }>(
+        `/auth/verify-email?token=${encodeURIComponent(token)}`,
+        { method: "GET", noRedirect: true },
+      ),
+    /** TEN-03：重新发送验证邮件（需登录） */
+    resendVerification: async () => post<{ ok: boolean; expires_in: number }>("/auth/resend-verification"),
+    /**
+     * TEN-03：忘记密码。**响应与邮箱是否存在无关**（后端防枚举），
+     * 故前端不做「该邮箱未注册」的错误分支。
+     */
+    forgotPassword: async (email: string) =>
+      post<{ ok: boolean; expires_in: number }>("/auth/forgot-password", { email }),
+    /** TEN-03：用邮件里的 token 设置新密码 */
+    resetPassword: async (token: string, password: string) =>
+      post<{ ok: boolean }>("/auth/reset-password", { token, password }),
   },
   // 个人设置
   settings: {

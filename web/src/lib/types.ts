@@ -37,6 +37,8 @@ export interface User {
   status: Status;
   created_at: string;
   updated_at: string;
+  /** TEN-03：邮箱验证时间；null = 未验证（0.1 阶段软约束，不阻断登录） */
+  email_verified_at: string | null;
   // 关联（可选，由后端 include 决定）
   user_plan?: UserPlan | null;
   roles?: AdminRole[];
@@ -143,6 +145,8 @@ export interface AuthSession {
   user: User;
   token?: string;
   expires_at?: string;
+  /** TEN-03：后端在登录/注册响应里附带，供前端弹出「去验证邮箱」提示 */
+  email_verified?: boolean;
   /**
    * 仅 mock 模式：后端没有真实响应头，浏览器拿不到 Set-Cookie，
    * 故由 mock 下发会话 cookie 字符串，api 层在客户端写入 document.cookie。

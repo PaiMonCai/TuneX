@@ -50,8 +50,24 @@ export interface MockStore {
   license: LicenseInfo;
   /** 审计日志（只读） */
   auditLogs: AuditLog[];
+  /** TEN-03：邮箱验证 / 密码重置一次性令牌（仅 mock 内存态，语义对齐后端 email_verification） */
+  emailTokens: MockEmailToken[];
   /** 单例创建时间，便于调试 */
   boot_at: string;
+}
+
+/**
+ * TEN-03 mock 令牌：与后端 `email_verification` 行同构。
+ * 单次使用（used_at）/ 过期（expires_at）/ 用途隔离（purpose）三条不变量在 mock 里同样成立，
+ * 这样前端页面在 mock 模式下跑的是真实契约，而不是「任何 token 都成功」的假实现。
+ */
+export interface MockEmailToken {
+  token: string;
+  email: string;
+  purpose: "email_verify" | "password_reset";
+  expires_at: number;
+  used_at: number | null;
+  created_at: number;
 }
 
 const STORE_KEY = "__tunex_mock_store_v1__";
@@ -101,6 +117,7 @@ function build(): MockStore {
     systemConfig: clone(seed.mockSystemConfig),
     license: clone(seed.mockLicense),
     auditLogs: clone(seed.mockAuditLogs),
+    emailTokens: [],
     boot_at: new Date().toISOString(),
   };
 }

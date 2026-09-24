@@ -582,8 +582,9 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       if (!found || (password !== expected && !isDemo)) return fail(401, "邮箱或密码错误");
       if (found.status !== "active") return fail(403, "账号已被禁用");
       return ok({
-        user: found,
+        user: { ...found, email_verified_at: found.email_verified_at ?? null },
         token: `mock-jwt-${found.id}`,
+        email_verified: Boolean(found.email_verified_at),
         expires_at: new Date(Date.now() + 6048e5).toISOString(),
         // mock 模式下没有真实响应头，浏览器端无法拿到 Set-Cookie，
         // 故把会话 cookie 值随 body 下发，由 api 层在客户端写入 document.cookie。
@@ -615,14 +616,122 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         api_key: `rk_live_${Math.random().toString(16).slice(2, 18)}`,
         subscription_key: `sk_sub_${Math.random().toString(16).slice(2, 18)}`,
         status: "active",
+        email_verified_at: null,
         created_at: nowIso(),
         updated_at: nowIso(),
       };
       db.users.push(created);
       db.passwords[id] = password;
-      return ok({ user: created, token: `mock-jwt-${id}`, session_cookie: sessionCookieValue(id) });
+      // TEN-03：注册即发一封 24h 验证邮件（mock 侧落内存 token，语义对齐后端）
+      const now = Date.now();
+      db.emailTokens.push({
+        token: `mock-verify-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        email,
+        purpose: "email_verify",
+        expires_at: now + 24 * 60 * 60 * 1000,
+        used_at: null,
+        created_at: now,
+      });
+      return ok({
+        user: created,
+        token: `mock-jwt-${id}`,
+        email_verified: false,
+        session_cookie: sessionCookieValue(id),
+      });
     }
     if (seg[1] === "logout" && method === "POST") return ok({ ok: true });
+
+    /* -------------------- TEN-03 邮箱验证 / 密码重置 -------------------- */
+    // 这三个端点与后端 /api/auth/* 同在免认证白名单内（前端可能未登录就点邮件链接），
+    // 但各自的业务约束与后端严格一致：
+    //   · verify-email：token 单次使用、过期即失效；用途不符拒绝
+    //   · forgot-password：**存在与不存在的邮箱返回同一响应**（防枚举）
+    //   · resend-verification：需要登录态（后端同理），已验证 → 409，60s 内 → 429
+    //   · reset-password：token 单次使用；成功后所有未用 token 一并作废
+    if (seg[1] === "verify-email" && method === "GET") {
+      const token = reqStr(q?.token);
+      if (!token) return fail(400, "验证链接无效");
+      const row = db.emailTokens.find((x) => x.token === token && x.purpose === "email_verify");
+      if (!row || row.used_at !== null || row.expires_at <= Date.now()) {
+        return fail(400, "验证链接无效或已使用");
+      }
+      row.used_at = Date.now();
+      const target = db.users.find((u) => u.email.toLowerCase() === row.email);
+      if (target) target.email_verified_at = nowIso();
+      return ok({ status: "verified", message: "邮箱验证成功" });
+    }
+
+    if (seg[1] === "forgot-password" && method === "POST") {
+      const body = asRecord(req.body);
+      const email = reqStr(body.email).toLowerCase();
+      if (!email) return badRequest("邮箱不能为空");
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return badRequest("邮箱格式不正确");
+      // 防枚举：无论邮箱是否存在都返回同一响应，且已发出未过期重置信时不重复发
+      const unused = db.emailTokens.find(
+        (x) => x.email === email && x.purpose === "password_reset" && x.used_at === null,
+      );
+      if (!unused || unused.expires_at <= Date.now()) {
+        const now = Date.now();
+        for (const t of db.emailTokens) {
+          if (t.email === email && t.purpose === "password_reset" && t.used_at === null) t.used_at = now;
+        }
+        db.emailTokens.push({
+          token: `mock-reset-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+          email,
+          purpose: "password_reset",
+          expires_at: now + 60 * 60 * 1000, // 1h，与后端一致
+          used_at: null,
+          created_at: now,
+        });
+      }
+      return ok({ ok: true, expires_in: 3600 });
+    }
+
+    if (seg[1] === "resend-verification" && method === "POST") {
+      if (!logged) return fail(401, "Unauthorized");
+      // 注意：`user` 常量在下方登录闸之后才声明，这里显式取一次会话用户
+      const me = userFromCookie(db, req.cookie);
+      if (me.email_verified_at) return fail(409, "邮箱已完成验证");
+      const now = Date.now();
+      const last = db.emailTokens
+        .filter((x) => x.email === me.email.toLowerCase() && x.purpose === "email_verify" && x.used_at === null)
+        .sort((a, b) => b.created_at - a.created_at)[0];
+      if (last && now - last.created_at < 60_000) return fail(429, "请求过于频繁，请稍后再试");
+      for (const t of db.emailTokens) {
+        if (t.email === me.email.toLowerCase() && t.purpose === "email_verify" && t.used_at === null) t.used_at = now;
+      }
+      db.emailTokens.push({
+        token: `mock-verify-${now.toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        email: me.email.toLowerCase(),
+        purpose: "email_verify",
+        expires_at: now + 24 * 60 * 60 * 1000, // 24h，与后端一致
+        used_at: null,
+        created_at: now,
+      });
+      return ok({ ok: true, expires_in: 24 * 60 * 60 });
+    }
+
+    if (seg[1] === "reset-password" && method === "POST") {
+      const body = asRecord(req.body);
+      const token = reqStr(body.token);
+      const password = reqStr(body.password);
+      if (!token) return fail(400, "重置链接无效或已过期");
+      if (password.length < 8) return fail(400, "密码至少 8 位");
+      const row = db.emailTokens.find((x) => x.token === token && x.purpose === "password_reset");
+      if (!row || row.used_at !== null || row.expires_at <= Date.now()) {
+        return fail(400, "重置链接无效或已过期");
+      }
+      const target = db.users.find((u) => u.email.toLowerCase() === row.email);
+      if (!target) return fail(400, "重置链接无效或已过期");
+      row.used_at = Date.now();
+      db.passwords[target.id] = password;
+      // 所有未用 token（含邮箱验证信）一并作废
+      const now = Date.now();
+      for (const t of db.emailTokens) {
+        if (target && t.email === target.email.toLowerCase() && t.used_at === null) t.used_at = now;
+      }
+      return ok({ ok: true });
+    }
   }
 
   // 以下全部需要登录
@@ -1248,6 +1357,7 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           api_key: `rk_live_${Math.random().toString(16).slice(2, 18)}`,
           subscription_key: `sk_sub_${Math.random().toString(16).slice(2, 18)}`,
           status: reqStr(body.status) === "inactive" ? "inactive" : "active",
+          email_verified_at: null,
           created_at: nowIso(),
           updated_at: nowIso(),
         };

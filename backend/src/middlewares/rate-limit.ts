@@ -111,7 +111,12 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     max: 5,
     methods: ["POST"],
     match: (p, m) =>
-      isPost(m) && (p === "/api/auth/forgot" || p === "/api/auth/reset" || p === "/api/auth/reset-password"),
+      isPost(m) &&
+      (p === "/api/auth/forgot" ||
+        p === "/api/auth/forgot-password" ||
+        p === "/api/auth/reset" ||
+        p === "/api/auth/reset-password" ||
+        p === "/api/auth/resend-verification"),
     scope: "ip",
   },
   {

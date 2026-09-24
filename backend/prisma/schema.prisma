@@ -309,6 +309,9 @@ model User {
   status                   Status             @default(active)
   created_at               DateTime           @default(now())
   updated_at               DateTime           @updatedAt
+  /// TEN-03：邮箱验证时间。NULL = 未验证（老用户与 0.1 阶段软约束兼容）。
+  email_verified_at        DateTime?
+  email_verifications      EmailVerification[]
   orders                   PlanOrder[]
   topups                   TopupOrder[]
   user_plan                UserPlan?
@@ -757,4 +760,29 @@ model UserCredential {
   updated_at DateTime @updatedAt
 
   @@map("user_credential")
+}
+
+/// TEN-03：邮箱验证 / 密码重置共用的一次性令牌表。
+///
+/// 设计（对齐 workspace_invite 的既有安全取向）：
+///  · **只存哈希**：`token_hash` 为 sha256(token) 的 hex；明文 token 只在邮件链接里出现一次。
+///  · **单次使用**：`used_at` 置位即失效；重复使用返回同一「无效或已使用」响应，不区分状态。
+///  · **过期**：`expires_at` 到期即失效；验证邮件 24h，密码重置 1h。
+///  · **同邮箱发新 token 时旧的立即作废**（仍是「一次一封有效信」的语义）。
+///  · purpose 区分用途，杜绝「用验证链接改密码」之类的跨用途重放。
+model EmailVerification {
+  id         Int       @id @default(autoincrement())
+  user_id    Int
+  user       User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  email      String    @db.VarChar(191)
+  purpose    String    @db.VarChar(32) // email_verify | password_reset
+  token_hash String    @unique @db.Char(64)
+  expires_at DateTime
+  used_at    DateTime?
+  created_at DateTime  @default(now())
+
+  @@index([user_id, purpose])
+  @@index([email, purpose])
+  @@index([expires_at])
+  @@map("email_verification")
 }

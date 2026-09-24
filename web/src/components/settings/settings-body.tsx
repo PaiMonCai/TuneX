@@ -150,6 +150,29 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
     }
   }
 
+  /* ---- TEN-03 邮箱验证条 ---- */
+  const [sendingVerify, setSendingVerify] = useState(false);
+  const [verifySent, setVerifySent] = useState(false);
+
+  async function resendVerification() {
+    setSendingVerify(true);
+    try {
+      await api.auth.resendVerification();
+      setVerifySent(true);
+      toast.success(t("auth.resendVerificationSent"));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : t("auth.resendVerificationFailed");
+      // 429（已发过 / 间隔不足）提示是预期的节流反馈，不算「失败」
+      if (msg.includes("频繁") || msg.includes("Too many")) {
+        toast.warning(t("auth.resendVerificationTooSoon"));
+      } else {
+        toast.error(msg);
+      }
+    } finally {
+      setSendingVerify(false);
+    }
+  }
+
   // 订阅地址需要浏览器 origin，放在 effect 里计算，避免 SSR/client 首帧不一致
   const [origin, setOrigin] = useState("");
   useEffect(() => {
@@ -160,6 +183,29 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
 
   return (
     <div className="flex flex-col gap-5" data-testid="settings-body">
+      {/* TEN-03：邮箱未验证时的提示条。软约束——不阻断使用，但给「去验证」一个明确入口。 */}
+      {user.email_verified_at === null && (
+        <div
+          className="flex items-center justify-between gap-4 rounded-md border border-[var(--warning,#eab308)]/50 bg-[var(--warning,#eab308)]/10 px-4 py-3"
+          data-testid="email-verify-banner"
+        >
+          <div className="flex flex-col gap-0.5">
+            <p className="text-sm font-medium">{t("auth.emailUnverified")}</p>
+            <p className="text-xs text-[var(--muted-foreground)]">{t("auth.emailUnverifiedHint")}</p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={resendVerification}
+            disabled={sendingVerify || verifySent}
+            data-testid="resend-verification-btn"
+          >
+            {sendingVerify && <Loader2 className="size-4 animate-spin" />}
+            {verifySent ? t("auth.resendVerificationSent") : t("auth.resendVerification")}
+          </Button>
+        </div>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>{t("settings.profile")}</CardTitle>

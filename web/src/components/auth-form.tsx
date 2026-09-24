@@ -121,6 +121,13 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
             </Link>
           </p>
           {isLogin && (
+            <p className="text-center text-xs">
+              <Link href="/forgot-password" className="text-[var(--primary)] hover:underline" data-testid="forgot-link">
+                {t("auth.loginForgot")}
+              </Link>
+            </p>
+          )}
+          {isLogin && (
             <p className="rounded-md bg-[var(--muted)] px-3 py-2 text-center text-xs text-[var(--muted-foreground)]">
               {t("auth.demoHint")}
             </p>
