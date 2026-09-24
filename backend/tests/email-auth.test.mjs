@@ -54,11 +54,12 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   const newPassword = "ci-only-password-99";
   let userId = 0;
 
+  let requestSeq = 0;
   async function request(path, method, cookie, body, query) {
     const q = query ? `?${new URLSearchParams(query)}` : "";
     return app.request(`http://localhost${path}${q}`, {
       method,
-      headers: { ...(cookie ? { cookie } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+      headers: { "x-forwarded-for": `198.51.100.${++requestSeq}`, ...(cookie ? { cookie, "x-csrf-token": "test" } : {}), ...(body ? { "content-type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
   }
