@@ -316,217 +316,781 @@ NodePortLease
 
 ---
 
-## 7. 唯一实施路线
+## 7. 固定开发执行流水线
 
-后续 Issue、分支和 PR 必须标注所属切片。除 blocker 外，不跨阶段提前开发后续能力。
+> **本节不是建议顺序，而是强制执行顺序。**
+>
+> 后续所有开发都必须从当前步骤向下推进。除安全漏洞、主支阻断性 bug 外，**Step N 未合并到 main 且 main CI 未全绿，不得开始 Step N+1**。
+>
+> 每一步都从最新 `main` 新建分支；通过评审和完整 CI 后 squash merge；合并后再创建下一步分支。禁止长期堆积多个相互依赖的未合并功能分支。
 
-### S0 — 架构冻结与文档收口
+### 7.1 总顺序
 
-状态：**✅ 完成**
+| Step | 对应阶段 | 目标 | 主要产物 |
+|---|---|---|---|
+| 0 | S0 | 架构与文档冻结 | 本文件 + v3map 约束 |
+| 1 | S1-A | 定义 v3 数据模型 | Prisma schema + additive migration |
+| 2 | S1-B | 存量数据回填与升级验证 | legacy fixture + backfill tests |
+| 3 | S2 | 统一物理端口所有权 | NodePortLease + allocator service |
+| 4 | S3-A | Agent 运行时骨架 | Forwarder / TunnelManager / EgressManager |
+| 5 | S3-B | TCP RELAY 数据面 | RelayForwarder / EgressForwarder + 本地网络测试 |
+| 6 | S4-A | v3 命令协议 | command envelope + revision + ACK |
+| 7 | S4-B | 节点身份与重连 | per-node credential + state report + replay |
+| 8 | S5-A | 调度与 RELAY 编排 | scheduler + orchestrator |
+| 9 | S5-B | Reconciler 与恢复 | retry / reconcile / restart recovery |
+| 10 | S6-A | 管理端 Node/Egress API | role / pool / target CRUD |
+| 11 | S6-B | 用户 Tunnel API | direct/relay create/update/retry/suspend |
+| 12 | S7-A | 管理端 Web | Node role + Egress target UI |
+| 13 | S7-B | 用户 Tunnel Web | DIRECT/RELAY UI + runtime state |
+| 14 | S8 | 三机真实 E2E 与灰度 | real network acceptance + relay flag |
+| 15 | S9 | DIRECT v3 化 | DIRECT 迁入统一 runtime |
+| 16+ | S10 | 协议与高级能力 | UDP → WS/TLS → QUIC → advanced LB → DNS → HA → multi-hop |
 
-交付：
+下面每一步都定义“允许做什么”和“禁止顺手做什么”。
 
-- 本文件成为唯一开发方案。
-- v3map 明确为架构约束。
-- 删除旧 `PLAN.md` 和旧 v3 migration plan。
-- 固化 ingress binding、状态机、revision/ACK、统一端口所有权、出站控制通道。
+---
 
-DoD：仓库不存在第二份可执行开发路线。
+### Step 0 — 文档与架构冻结
 
-### S1 — v3 Schema（全 additive）
+**状态：✅ 已完成。**
 
-状态：**下一阶段**
+已经完成：
 
-新增/调整：
+- `DEVELOPMENT.md` 成为唯一开发方案。
+- `docs/tunex-devmap-v3.md` 只作为目标约束。
+- 删除旧 `PLAN.md` 和旧 migration plan。
+- 固化 v3 的关键原则：
+  - Node role 是节点能力真相源；
+  - Tunnel 持久绑定 ingress / egress Node；
+  - 端口物理唯一；
+  - desired state + revision + ACK；
+  - Agent 主动出站连接控制面；
+  - RELAY 先出口后入口；
+  - 数据库 expand-and-contract。
 
-- `Node.role = ingress | egress | both`
-- Node 独立 credential / credential version
-- `Tunnel.tunnel_mode`
-- `Tunnel.ingress_node_id`
-- `Tunnel.egress_node_id`
-- `Tunnel.egress_pool_id`
-- `Tunnel.ingress_port / egress_port`
-- desired/apply 状态、revision、error 字段
+**进入 Step 1 的条件：** main CI 全绿。
+
+---
+
+### Step 1 — V3-S1A：只建立 v3 Schema
+
+**建议分支：** `feature/v3-s1a-schema`
+
+**目标：** 先把以后所有模块依赖的数据契约定死，不写业务编排。
+
+#### 只允许修改
+
+- `backend/prisma/schema.prisma`
+- 新 Prisma migration
+- 必要的 migration fixture 定义
+- 与 schema 编译直接相关的类型测试
+
+#### 必须新增
+
+**Node：**
+
+- `role: ingress | egress | both`
+- credential hash / credential version / revoked_at（具体字段名可按现有 user-key 设计统一）
+- `last_seen_at` 若当前模型没有可靠运行态时间
+
+**Tunnel：**
+
+- `tunnel_mode: direct | relay`
+- `ingress_node_id`
+- `egress_node_id`
+- `egress_pool_id`
+- `ingress_port`
+- `egress_port`
+- `desired_status`
+- `apply_status`
+- `config_revision`
+- `applied_revision`（若决定放运行态表，需在本步一次定型）
+- `apply_error_code`
+- `apply_error`
+- `last_applied_at`
+
+**新增模型：**
+
 - `EgressPool`
 - `EgressTarget`
 - `NodePortLease`
 
-同时定义 legacy 映射：
+#### Schema 硬约束
 
-- 存量 Tunnel 一律 `direct`。
-- 存量 DIRECT 不改变运行通道。
-- Node role 从现有组信息安全回填；无法可靠判定的节点保持待管理员确认，不猜。
-- migration 必须可重复在空库与升级库执行。
+- `NodePortLease @@unique([node_id, port])`
+- 一个 `EgressPool` 只能属于一个 Node。
+- Tunnel 的 ingress/egress 外键必须能明确恢复实际运行实例。
+- DIRECT 允许 `egress_node_id / egress_pool_id / egress_port = null`。
+- RELAY 所需字段是否暂时 nullable 由迁移兼容决定，但服务层最终必须校验完整。
+- 所有新增列/表都是 additive，不删除旧列，不改旧 DIRECT 的实际行为。
 
-DoD：
+#### 本步禁止
 
-- Prisma generate/typecheck 通过。
-- 空库 migrate 通过。
-- 至少一份真实结构的 legacy fixture 升级通过。
-- 回填后存量 DIRECT 数据数量、端口、目标不变。
-- 不 DROP 旧字段。
+- 不写 Agent。
+- 不写 port allocator。
+- 不改 Tunnel API 行为。
+- 不改 Web。
+- 不启用 RELAY。
+- 不改现有 DIRECT config-generator。
 
-### S2 — 统一端口所有权
+#### DoD
 
-实现 NodePortLease + 分配服务。
+- 空库 `prisma migrate deploy` 通过。
+- `prisma generate` / `tsc --noEmit` 通过。
+- migration 不 DROP 任何 legacy 列。
+- schema review 明确所有唯一约束与 onDelete 行为。
+- main CI 全绿后才能进入 Step 2。
 
-DoD：
+---
 
-- 同 Node 同 port 无论 ingress/egress 都不能重复。
-- 两个控制面实例并发申请不重复。
-- 用户指定端口与自动端口走同一冲突规则。
-- 黑名单双层校验。
-- 存量 DIRECT 不被重新分配。
-- 对账测试覆盖 DB / Redis / Agent 三方差异。
+### Step 2 — V3-S1B：存量数据回填与升级兼容
 
-### S3 — Agent TCP RELAY 数据面
+**建议分支：** `feature/v3-s1b-backfill`
+
+**目标：** 证明真实旧库能安全升级，而不是只证明空库能创建。
+
+#### 主要工作
+
+- 扩展现有 `tests/fixtures/create-upgrade-db.sql` 或增加专用 v3 legacy fixture。
+- 回填存量 Tunnel：
+  - `tunnel_mode = direct`
+  - 保留原 listen/forward 语义
+  - 不凭空指定错误的 ingress Node
+- 回填 Node.role：
+  - 能根据旧 `NodeGroup.node_type` 唯一确定的才自动映射；
+  - 无法确定的保持需要管理员确认的安全状态；
+  - 不允许“猜” BOTH。
+- 为已有入口监听建立兼容端口占用基线；如果此时不正式写 NodePortLease，则必须留下明确迁移标记供 Step 3 接管。
+- 写升级巡检 SQL / 自动测试。
+
+#### 必须验证
+
+升级前后：
+
+- Tunnel 总数相同。
+- ACTIVE DIRECT 数量相同。
+- 原 listen_port 不变化。
+- `forward_addresses` 不变化。
+- Workspace / user / policy 外键关系不变化。
+- 旧 Agent 继续能读到旧配置。
+
+#### 本步禁止
+
+- 不让新字段参与运行时选择。
+- 不切控制通道。
+- 不开始 RELAY。
+
+#### DoD
+
+至少同时通过：
+
+1. 空库 migrate；
+2. 当前 CI legacy fixture migrate；
+3. v3 特殊 legacy fixture migrate；
+4. upgrade verification script；
+5. 完整 backend tests。
+
+通过后，**v3 schema 才算真正成立**。
+
+---
+
+### Step 3 — V3-S2：统一物理端口所有权
+
+**建议分支：** `feature/v3-s2-port-lease`
+
+**目标：** 在任何 RELAY 代码出现之前，先解决“哪个 Node 的哪个端口属于谁”。
+
+#### 实现
+
+新增类似：
+
+`backend/src/services/node-port-lease.ts`
+
+核心 API 应保持小而稳定：
+
+- `acquire(nodeId, tunnelId, kind, range, preferred?)`
+- `release(...)`
+- `renew/reserve(...)`
+- `holder(nodeId, port)`
+- `reconcile(...)`
+
+#### 一致性规则
+
+- DB `UNIQUE(node_id, port)` 是最终真相。
+- Redis NX 用于并发优化，不替代 DB 唯一约束。
+- ingress 与 egress **不能分物理 namespace**。
+- BOTH Node 的同一 port 永远只能有一个 listener owner。
+- 用户指定端口和自动分配端口必须走同一服务。
+- PORT_BLACKLIST 统一定义，API 与 service 双重检查。
+
+#### 存量处理
+
+- 已运行的 legacy DIRECT 端口不能被新分配器抢占。
+- 可以通过初始化 lease、legacy reservation 或查询兼容层实现，但最终不能存在两个 allocator 都认为自己有分配权。
+
+#### 测试
+
+- 100+ 并发申请同一小区间不重复。
+- Redis 丢锁时 DB unique 仍能兜底。
+- ingress/egress 同 Node 同 port 冲突。
+- 不同 Node 同 port 合法。
+- release 只能释放自己的 lease。
+- crash 后 reconcile 能识别孤儿 lease。
+
+#### 本步禁止
+
+- 不写 RELAY forwarder。
+- 不改 Web。
+- 不切 DIRECT。
+
+---
+
+### Step 4 — V3-S3A：Agent v3 Runtime 骨架
+
+**建议分支：** `feature/v3-s3a-agent-runtime`
+
+**目标：** 建立新 Agent runtime 的内部边界，但先不做完整 RELAY 网络链路。
+
+#### 新模块
+
+建议：
+
+```text
+agent/internal/v3/
+├─ forwarder/
+│  └─ interface.go
+├─ manager/
+│  ├─ tunnel.go
+│  ├─ egress.go
+│  └─ ports.go
+└─ state/
+   └─ revision.go
+```
+
+允许根据当前仓库组织调整目录，但职责不能混回 legacy engine。
+
+#### 本步实现
+
+- Forwarder interface：Start / Stop / Stats / Mode。
+- TunnelManager：按 tunnel_id 管理运行实例。
+- EgressManager：管理目标池 snapshot。
+- 本地 used-port 二次保护。
+- revision state 存储接口。
+- graceful stop 与进程退出清理。
+
+#### 本步禁止
+
+- 不接 Panel command。
+- 不改 Socket.IO 协议。
+- 不改 legacy engine。
+- 不写 Web/API。
+
+#### DoD
+
+Go 单测覆盖：
+
+- Add / duplicate Add；
+- Stop 幂等；
+- 同 port 冲突；
+- manager 并发安全；
+- stale revision 状态接口。
+
+---
+
+### Step 5 — V3-S3B：TCP RELAY 数据面
+
+**建议分支：** `feature/v3-s3b-relay-dataplane`
+
+**目标：** 不依赖控制面，先证明 Agent 数据面本身正确。
+
+#### 实现
+
+- RelayForwarder：
+  `listen ingressPort → dial egress nextHop`
+- EgressForwarder：
+  `listen egressPort → choose target → dial target`
+- 双向 copy + cancellation。
+- round / rand / weighted_round。
+- 目标池原子热更新。
+
+#### 本地验收拓扑
+
+```text
+test client
+   ↓
+Ingress Agent process
+   ↓
+Egress Agent process
+   ↓
+Target A / Target B
+```
+
+必须是实际 TCP socket，不允许只有 mock Conn。
+
+#### DoD
+
+- 大小数据双向收发正确。
+- 客户端主动断开无 goroutine 泄漏。
+- Target A 下线时错误可观测。
+- 热更新 target 不关闭 listener。
+- weighted_round 有统计测试。
+- BOTH 节点端口冲突被拒绝。
+- `go test -race` 若 CI 环境允许，应纳入该模块测试。
+
+---
+
+### Step 6 — V3-S4A：结构化控制协议 + Revision + ACK
+
+**建议分支：** `feature/v3-s4a-control-protocol`
+
+**目标：** 在现有 Agent 主动出站连接上增加 v3 命令协议，不建立 Panel→Agent 公网 HTTP 依赖。
+
+#### 命令
+
+至少：
+
+- `apply_tunnel`
+- `remove_tunnel`
+- `update_targets`
+- `suspend_tunnel`
+- `state_request`
+
+统一 envelope 必须包含：
+
+- command_id
+- resource / resource_id
+- revision
+- action
+- expires_at
+- payload
+
+#### Agent ACK
+
+至少：
+
+- command_id
+- resource_id
+- received_revision
+- applied_revision
+- status
+- error_code
+- error
+
+#### 硬规则
+
+- stale revision 拒绝。
+- equal revision 幂等 ACK。
+- newer revision 原子 apply。
+- 命令过期拒绝。
+- malformed payload fail closed。
+- apply 完成以后再更新 applied_revision。
+
+#### 本步禁止
+
+- 还不由用户 API 直接创建 RELAY。
+- 不做最终 orchestrator。
+- 不做 Web。
+
+---
+
+### Step 7 — V3-S4B：节点身份、认证、重连与 State Report
+
+**建议分支：** `feature/v3-s4b-node-session`
+
+**目标：** 让“谁在连控制面”与“这台 Agent 当前真正运行什么”都可信。
+
+#### 实现
+
+- 每 Node 独立 credential。
+- credential hash at rest。
+- rotate / revoke。
+- Agent handshake 由 credential 映射到 server-side Node identity。
+- 不信任 payload 自报 node_id。
+- Agent 周期 state report：
+  - version
+  - role
+  - active tunnel ids
+  - active ports
+  - applied revisions
+- reconnect 后控制面获得完整 runtime snapshot。
+
+#### DoD
+
+- A Node token 不能冒充 B Node。
+- revoked credential 重连失败。
+- rotate 后旧 credential 失效。
+- token 不出现在日志。
+- NAT/私网 Agent 只靠出站连接即可工作。
+
+---
+
+### Step 8 — V3-S5A：Node Scheduler + RELAY Orchestrator
+
+**建议分支：** `feature/v3-s5a-orchestrator`
+
+**目标：** 第一次把 DB desired state、port lease、Agent command 串起来。
+
+#### Scheduler
+
+负责：
+
+- 从 NodeGroup 候选中挑选实际 ingress Node。
+- 检查 Node.role。
+- 检查 active/last_seen。
+- explicit node 优先。
+- 自动选择规则必须 deterministic，可解释。
+- 选中后立即写入 `Tunnel.ingress_node_id`。
+- RELAY 同理绑定 `egress_node_id`。
+
+#### Orchestrator 创建顺序
+
+```text
+1 DB quota/auth validation
+2 create desired Tunnel = pending
+3 bind ingress / egress Node
+4 acquire ingress / egress port leases
+5 increment config_revision
+6 send Egress apply
+7 wait Egress ACK
+8 send Ingress apply
+9 wait Ingress ACK
+10 mark active
+```
+
+任何失败：
+
+- 保留 Tunnel；
+- `apply_status=error`；
+- 写结构化 error；
+- 补偿已应用的一端；
+- 释放不再使用的 lease；
+- 不物理删除 Tunnel。
+
+#### DoD
+
+用 fake transport + real DB 测试顺序：
+
+- Egress ACK 前绝不 apply Ingress。
+- Egress fail → Ingress 不启动。
+- Ingress fail → Egress 被补偿。
+- retry 不产生第二个 lease。
+- 同一 request 重试不重复创建 runtime。
+
+---
+
+### Step 9 — V3-S5B：Reconciler、Retry 与重启恢复
+
+**建议分支：** `feature/v3-s5b-reconciler`
+
+**目标：** 让系统不依赖“一次请求必须成功”。
+
+#### Reconciler 对比
+
+- DB desired state。
+- Tunnel revision。
+- Agent state report。
+- NodePortLease。
+- Node online state。
+
+#### 只允许的自动动作
+
+- 重发相同 desired revision。
+- 补齐 Agent 缺失 runtime。
+- 清理确认无主的 lease。
+- 将异常记录为 error / warning。
+
+#### 默认不允许
+
+- 自动换 Node。
+- 自动换端口。
+- 自动迁移用户隧道。
+- 因心跳短暂丢失删除 Tunnel。
+
+#### Restart 恢复
+
+Agent 重启后只能恢复：
+
+`Tunnel.ingress_node_id == self.id`
+
+或者：
+
+`Tunnel.egress_node_id == self.id`
+
+禁止再按整个 NodeGroup 把隧道恢复到每台机器。
+
+#### DoD
+
+- Agent kill → restart 后恢复。
+- 控制连接断开 → reconnect 后 converge。
+- control plane restart 后 converge。
+- 多次 reconcile 幂等。
+- NodeGroup 多 Node 不重复监听。
+
+---
+
+### Step 10 — V3-S6A：管理端 Node / Egress API
+
+**建议分支：** `feature/v3-s6a-admin-api`
+
+**目标：** 先让管理员能够正确配置 v3 基础资源。
+
+#### API
+
+- Node role read/update。
+- credential rotate/revoke。
+- EgressPool CRUD。
+- EgressTarget CRUD。
+- target status / weight / order。
+- Node runtime/state report 查询。
+
+#### 权限
+
+仍走现有平台 admin / workspace 权限体系，不创建 v3 私有权限旁路。
+
+#### DoD
+
+- workspace / admin 权限负面测试。
+- 非 egress/both Node 不能启用 EgressPool。
+- 最后一个 active target 不能被无保护地停用。
+- target 热更新能产生正确 revision/command。
+
+---
+
+### Step 11 — V3-S6B：Tunnel RELAY API
+
+**建议分支：** `feature/v3-s6b-tunnel-api`
+
+**目标：** 到这一步，用户 API 才第一次正式允许创建 RELAY。
+
+#### POST /api/tunnels
 
 新增：
 
-- Forwarder interface。
-- RelayForwarder。
-- EgressForwarder。
-- TunnelManager。
-- EgressManager。
-- round / rand / weighted_round。
-- 原子 apply / stop。
-- active ports + applied revision 状态上报。
+- tunnel_mode
+- explicit ingress_node_id（可选）
+- egress_node_id / egress_pool_id（RELAY）
+- 继续兼容 legacy DIRECT 请求体
 
-暂不迁移现有 DIRECT engine。
+#### 操作
+
+- create
+- update target/pool/node
+- retry
+- suspend
+- resume
+- delete
+
+所有动作都调用 orchestrator，不允许 route 自己写一套下发逻辑。
+
+#### 安全
+
+必须继续经过：
+
+```text
+workspace membership
+→ role permission
+→ capability policy
+→ node-group grant
+→ node role
+→ port ownership
+→ orchestrator
+```
+
+#### DoD
+
+- 跨 workspace 读写拒绝。
+- viewer 写操作拒绝。
+- policy 不允许 relay 时拒绝。
+- 无可用 Egress/Target 时明确 4xx。
+- create 成功返回的是 desired/runtime 状态，而不是假定“写 DB = 在线”。
+
+---
+
+### Step 12 — V3-S7A：管理端 Web
+
+**建议分支：** `feature/v3-s7a-admin-web`
+
+只实现管理员需要的 v3 配置：
+
+- Node role Badge / 编辑。
+- credential rotation 状态。
+- Egress Pool / Target 编辑器。
+- Node 在线、revision、active tunnel/port 诊断。
+
+**禁止同时改用户 Tunnel 创建页。**
 
 DoD：
 
-- Go unit tests 覆盖 start/stop/idempotency/stale revision。
-- RELAY 本地双进程 TCP 双向流完整。
-- target 热更新不断 listener。
-- 空 target snapshot 被拒绝。
-- BOTH 节点端口冲突被本地 manager 二次阻止。
+- typecheck。
+- unit tests。
+- production build。
+- 空态、错误态、离线态完整。
 
-### S4 — v3 控制协议与 ACK
+---
 
-在 Agent 主动出站连接上实现：
+### Step 13 — V3-S7B：用户 Tunnel Web
 
-- apply_tunnel
-- remove_tunnel
-- update_targets
-- suspend_tunnel
-- state_report
-- command_ack
-
-DoD：
-
-- 不开放公网 Agent 管理端口也能完成全部控制。
-- 重复 command 幂等。
-- 乱序 revision 不回退。
-- 断连重连后能补齐 desired state。
-- 节点凭据撤销后立即无法重新认证。
-
-### S5 — Orchestrator + Reconciler
+**建议分支：** `feature/v3-s7b-tunnel-web`
 
 实现：
 
-- ingress/egress Node 调度与持久绑定。
-- RELAY 两阶段 apply。
-- 错误状态与 retry。
-- 修改出口的无损切换。
-- 周期 reconcile。
-- node offline 只标状态，不自动迁移。
+- DIRECT / RELAY 模式切换。
+- Ingress / Egress 选择。
+- Target Pool 选择。
+- pending / applying / active / error / suspended。
+- retry。
+- 实际 ingress/egress Node 与端口展示。
+- apply_error 可读提示。
 
-DoD：
+UI 不自行判断授权，以 capabilities + 服务端响应为准。
 
-- Egress 未 ACK 时 Ingress 绝不开始监听。
-- 任一步失败均有可解释状态，不物理删除 Tunnel。
-- Agent 重启只恢复绑定给自己的 Tunnel。
-- 同 NodeGroup 多 Node 不会重复恢复同一 Tunnel。
-- retry 不产生重复 listener / port lease。
+---
 
-### S6 — Backend API
+### Step 14 — V3-S8：真实三机 E2E + 灰度发布
 
-新增/改造：
-
-- Node role 管理。
-- EgressPool / EgressTarget CRUD。
-- Tunnel DIRECT / RELAY 模式参数。
-- ingress / egress explicit selection 与自动调度。
-- retry / suspend / resume。
-- 运行状态与错误查询。
-
-权限必须继续复用 Workspace RBAC + CapabilityPolicy + NodeGroupGrant。
-
-DoD：
-
-- 跨 workspace 访问全拒绝。
-- RELAY 无可用 egress/target 时给明确 4xx。
-- 角色/策略/额度/端口判定在服务端生效。
-- API 不依赖前端隐藏保证安全。
-
-### S7 — Web UI
-
-实现：
-
-- Node role Badge 与能力编辑。
-- Egress 默认目标池编辑器。
-- 创建 Tunnel 的 DIRECT / RELAY 切换。
-- RELAY 入口/出口选择。
-- apply_status / apply_error / retry。
-- 详情页显示实际运行 Node 与端口。
-
-DoD：
-
-- typecheck、unit test、production build 全过。
-- error / pending / active / suspended 状态均有明确 UI。
-- 移动端不阻塞核心创建与诊断路径。
-
-### S8 — 真实 E2E 与灰度
+**建议分支：** `feature/v3-s8-e2e`
 
 最低环境：
 
-- 1 控制面。
-- 1 Ingress。
-- 1 Egress。
-- 2 个可区分 Target。
-- 至少一个 Agent 处于 NAT/私网，仅可主动出站。
+```text
+Control Plane
+Ingress Node
+Egress Node
+Target A
+Target B
+```
 
-必须验证：
+至少一个 Agent 必须放在 NAT/私网，只能主动出站。
 
-- DIRECT 存量链路不回归。
-- RELAY 完整路径。
-- 先出口后入口时序。
-- Egress target 热更新。
-- Agent 重启恢复。
-- 控制连接断线重连。
-- 错误 credential。
-- 端口冲突/池耗尽。
-- 两 workspace 同 ID/同端口场景不串租户。
-- 备份/回滚后存量 DIRECT 可继续服务。
+#### 必跑场景
 
-通过后才允许默认开启 `relay_enabled`。
+1. legacy DIRECT 创建/访问不回归。
+2. TCP RELAY 连通。
+3. Egress-before-Ingress 时序。
+4. weighted target 流量分布。
+5. target 热更新。
+6. Agent 重启恢复。
+7. Agent 网络断开/恢复。
+8. Panel 重启恢复。
+9. stale revision。
+10. credential revoke。
+11. port conflict。
+12. port exhaustion。
+13. 两 workspace 隔离。
+14. BOTH Node。
+15. suspend/resume。
+16. 修改 Egress Node。
+17. 备份 → 恢复 → DIRECT/RELAY 状态检查。
+18. 旧版本 Agent 与新 Panel 的兼容行为。
 
-### S9 — DIRECT v3 化
+#### 灰度规则
 
-只有 S8 稳定后才开始。
+- 默认 `relay_enabled=false`。
+- 第一轮只对白名单 workspace/node 开放。
+- 观察错误率、端口冲突、ACK 延迟、流量一致性。
+- 验收通过后才允许默认开启。
 
-把新建 DIRECT 从 legacy engine 迁到 v3 TunnelManager；经过至少一个灰度周期后，再迁存量 DIRECT。
+这一步不过，**不允许开始 DIRECT v3 化**。
 
-DoD：
+---
 
-- 同一状态机/revision/port lease 控制 DIRECT 与 RELAY。
-- 与旧 DIRECT 功能逐项对照，无协议/限速/目标语义倒退。
-- legacy engine 只有在所有存量实例迁完后才进入删除候选。
+### Step 15 — V3-S9：DIRECT 迁入 v3 Runtime
 
-### S10 — 协议与高级能力
+**建议分支：** `feature/v3-s9-direct-runtime`
 
-按独立工作包顺序推进：
+顺序：
 
-1. UDP
-2. WS/TLS
-3. QUIC
-4. 高级 LB（least_conn / least_traffic / ip_hash）
-5. DNS
-6. 多入口 HA / 故障迁移
-7. 多跳（只有真实需求后）
+1. 新建 DIRECT 可选择 v3 runtime，但 feature flag 默认关闭。
+2. 对照 legacy DIRECT 的 TCP 功能。
+3. 灰度新建 DIRECT。
+4. 停止让 legacy allocator 为新 Tunnel 分配端口。
+5. 存量 DIRECT 分批迁移。
+6. 至少一个稳定发布周期后，才允许删除 legacy read/write path。
 
-每项都必须独立威胁建模、E2E、性能基线和回滚方案。
+在确认所有存量实例迁完之前：
+
+- 不删 `forward_addresses`。
+- 不删旧 engine。
+- 不删旧 config generator。
+- 不做 destructive migration。
+
+---
+
+### Step 16+ — V3-S10：协议与高级能力逐项开发
+
+S10 不允许一次性“全做完”，每一项重新走：
+
+```text
+设计约束
+→ schema/API（如需要）
+→ Agent
+→ tests
+→ real E2E
+→ feature flag
+→ 灰度
+→ 稳定
+```
+
+固定顺序：
+
+1. **UDP**
+2. **WS/TLS**
+3. **QUIC**
+4. **高级 LB**：least_conn → least_traffic → ip_hash
+5. **DNS**
+6. **多入口 HA / 手动故障迁移**
+7. **自动故障迁移**（只有监控与状态机足够稳定后）
+8. **多跳 / Tunnel Chain**（只有明确产品需求后）
+
+任何后项不得因为“顺手”提前塞进前项 PR。
+
+---
+
+### 7.2 每一步统一工作流程
+
+每个 Step 都严格执行：
+
+```text
+A. 从最新 main 创建对应 feature/v3-* 分支
+B. 只实现该 Step 的范围
+C. 本地/分支测试
+D. 创建 PR
+E. 对照本文件逐条 review
+F. CI 全绿
+G. squash merge main
+H. main push CI 再次全绿
+I. 更新本文件中的“当前执行步骤”
+J. 删除/停止使用已合并源分支
+K. 才能创建下一 Step 分支
+```
+
+如果 PR 出现以下任意情况，**不合并**：
+
+- 属于后续 Step 的功能提前进入。
+- 新增第二套开发计划/roadmap。
+- 用新字段重新推断实际 Node，而不是使用明确 binding。
+- 绕过统一 port lease。
+- 绕过 Workspace RBAC / CapabilityPolicy / NodeGroupGrant。
+- 要求公网开放 Agent 管理端口才能工作。
+- 没有 revision/ACK 就声称控制面可靠。
+- 测试或 CI 失败。
+- 破坏 legacy DIRECT 且没有对应迁移步骤。
+- 数据库回滚依赖 DROP 列才能恢复代码。
+
+### 7.3 当前执行游标
+
+开发文档里必须始终只保留一个“当前执行游标”。
+
+**当前：Step 1 — V3-S1A Schema。**
+
+因此当前允许创建的下一条开发分支只有：
+
+```text
+feature/v3-s1a-schema
+```
+
+在它合入并且 main CI 全绿前，Step 2 及以后全部视为“未授权提前开发”。
+
 
 ---
 
