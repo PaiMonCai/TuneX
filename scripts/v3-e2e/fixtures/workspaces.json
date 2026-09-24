@@ -1,0 +1,31 @@
+{
+  "users": [
+    {
+      "key": "wp14",
+      "email_local": "wp14-e2e",
+      "password_source": "generated",
+      "notes": "口令由 setup.sh 随机生成并写入 scripts/v3-e2e/.passwords.env（600，不入 git）。"
+    }
+  ],
+  "workspaces": [
+    {
+      "key": "primary",
+      "name": "WP14 E2E Primary",
+      "kind": "team",
+      "owner_user": "wp14",
+      "notes": "DIRECT / RELAY 主租户。"
+    },
+    {
+      "key": "isolation",
+      "name": "WP14 E2E Isolation",
+      "kind": "team",
+      "owner_user": "wp14",
+      "notes": "跨租户隔离负面用例：同宿主主的第二个 workspace，用于验证 agent 只能拿到自己 workspace 的隧道配置。"
+    }
+  ],
+  "isolation_requirements": [
+    "两个 workspace 的 id 必须不同",
+    "两组节点组的 token 必须不同",
+    "A 的 agent 不得收到 B workspace 的隧道配置（配置下发按节点组 room 单播）"
+  ]
+}

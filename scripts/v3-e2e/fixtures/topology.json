@@ -1,0 +1,78 @@
+{
+  "name": "wp14-v3-e2e",
+  "description": "WP14 真实 E2E / 灰度发布测试拓扑（DEVELOPMENT.md §7.15 最低拓扑：Control Plane / Ingress Agent / Egress Agent / Target A / Target B）。",
+  "compose_file": "scripts/v3-e2e/docker-compose.e2e.yaml",
+  "container_prefix": "wp14",
+  "networks": {
+    "wp14-ctrl": {
+      "driver": "bridge",
+      "internal": false,
+      "purpose": "控制面网络：panel + 两个 agent。agent 侧的连接方向只允许 agent -> panel（agent 主动出站），panel 不得反向拨号 agent。",
+      "members": ["panel", "ingress-agent", "egress-agent"]
+    },
+    "wp14-ingress-data": {
+      "driver": "bridge",
+      "internal": true,
+      "purpose": "入口侧数据面：ingress-agent 直连 Target A/B（DIRECT 单跳路径）。internal=true 使该网段无外网出口。",
+      "members": ["ingress-agent", "target-a", "target-b"]
+    },
+    "wp14-egress-data": {
+      "driver": "bridge",
+      "internal": true,
+      "purpose": "出口侧数据面：ingress-agent -> egress-agent(egressPort) -> Target A/B（RELAY 双跳路径）。ingress-agent 同时接入本网段才能拨号出口节点。",
+      "members": ["ingress-agent", "egress-agent", "target-a", "target-b"]
+    }
+  },
+  "machines": {
+    "panel": {
+      "role": "control-plane",
+      "kind": "panel",
+      "image_var": "TUNEX_BACKEND_IMAGE",
+      "host_ports": { "http": 18180, "socketio": 18181 },
+      "published_to_host": true,
+      "nat_or_private_only": false,
+      "notes": "控制面：HTTP API + Socket.IO agent 接入。未接入任何数据面网段，因此从网络层就无法拨号 agent 的数据端口。"
+    },
+    "ingress-agent": {
+      "role": "ingress",
+      "kind": "agent",
+      "node_id": "WP14-IN-A-NODE",
+      "host_ports": { "tcp": [18201, 18202] },
+      "published_to_host": true,
+      "nat_or_private_only": false,
+      "notes": "入口 agent：持有隧道 listen 端口。host 仅映射 fixture 固定端口 18201/18202 供 harness 以真实客户端身份拨入。"
+    },
+    "egress-agent": {
+      "role": "egress",
+      "kind": "agent",
+      "node_id": "WP14-OUT-A-NODE",
+      "host_ports": {},
+      "published_to_host": false,
+      "nat_or_private_only": true,
+      "notes": "出口 agent：无任何 host 端口映射，且不在 panel 所在网段——等价于 NAT/私网内、仅可主动出站（agent -> panel 控制通道 + 被 ingress 拨号的数据端口）。"
+    },
+    "target-a": {
+      "role": "target",
+      "kind": "target",
+      "marker": "WP14-TARGET-A",
+      "container_port": 3030,
+      "host_ports": {},
+      "published_to_host": false,
+      "notes": "测试目标服务 A：TCP echo + marker。"
+    },
+    "target-b": {
+      "role": "target",
+      "kind": "target",
+      "marker": "WP14-TARGET-B",
+      "container_port": 3030,
+      "host_ports": {},
+      "published_to_host": false,
+      "notes": "测试目标服务 B：TCP echo + marker。"
+    }
+  },
+  "data_ports": {
+    "ingress_listen": [21001, 21002],
+    "egress_listen": [22001],
+    "target": 3030
+  }
+}

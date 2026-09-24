@@ -32,3 +32,17 @@ scripts/net01-e2e/state.json
 scripts/net01-e2e/_bootstrap.py
 scripts/net01-e2e/evidence/
 scripts/net01-e2e/verify.sh.new
+
+# WP14 v3 E2E Harness 运行期产物（密钥/口令/状态/证据，切勿提交）
+# 注意：_bootstrap.py 是**交付物**（fixture→控制面 HTTP API 的桥，setup.sh 调用），
+# 有意不在此列；勿与 net01-e2e 的忽略项混抄。
+scripts/v3-e2e/.env.wp14
+scripts/v3-e2e/.passwords.env
+scripts/v3-e2e/state.json
+scripts/v3-e2e/agent.Dockerfile.e2e
+scripts/v3-e2e/evidence/
+scripts/v3-e2e/__pycache__/
+
+# backend v3 E2E harness 运行期产物
+backend/tests/v3-e2e/.artifacts/
+backend/tests/v3-e2e/__pycache__/

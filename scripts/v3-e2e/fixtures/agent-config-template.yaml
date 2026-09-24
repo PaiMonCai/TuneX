@@ -1,0 +1,37 @@
+# Target A/B 测试服务 —— 配置由 setup.sh 生成（含随机或显式指定的 token）。
+# 目标服务本身不参与鉴权：任何连上 3030 的连接都会收到 marker 回串。
+<?xml version="1.0"?>
+<container-wait-plain false />
+<container-wait-address 0.0.0.0:3030 />
+<container-internal-static>
+  <config>
+    <log level="info" />
+    <chains>
+      <name>target-echo-alpha</name>
+      <hops>
+        <name>hop-alpha</name>
+        <nodes>
+          <name>WP14-TARGET-ALPHA</name>
+          <addr>WP14-TARGET-A</addr>
+          <connector>
+            <type>relay</type>
+          </connector>
+          <dialer>
+            <type>tcp</type>
+          </dialer>
+        </nodes>
+      </hops>
+    </chains>
+    <services>
+      <name>target-alpha</name>
+      <listener>
+        <type>tcp</type>
+      </listener>
+      <handler>
+        <type>rtcp</type>
+        <chain>target-echo-alpha</chain>
+        <metadata></metadata>
+      </handler>
+    </services>
+  </config>
+</container-internal-static>
