@@ -397,8 +397,22 @@ model User {
   referral_commission_rate Float?
   referral_first_only      Boolean?
   auto_renew               Boolean            @default(false)
-  api_key                  String             @unique @default(uuid())
-  subscription_key         String             @unique @default(uuid())
+  /// SEC-02（legacy 明文列，保留仅为惰性迁移）。
+  ///
+  /// 新签发的凭据只写 `api_key_hash`（sha256）。明文列在两处被清空：
+  ///  1. 惰性迁移：认证命中存量明文行时同事务写哈希并置本列为 null；
+  ///  2. 轮换：rotateKey 覆盖哈希列并置本列为 null。
+  /// 因此本列必须可空 + 去掉 `@default(uuid())`（默认值会让 Prisma 的
+  /// `db.user.create()` 永不显式写 null，惰性迁移与 seed 都退化成明文落库）。
+  /// 唯一索引保留：NULL 可重复，不影响「迁移后所有明文行均为 null」的终态。
+  api_key                  String?            @unique
+  /// SEC-02：subscription_key 明文列，迁移策略同 api_key（可空、无默认值）。
+  subscription_key         String?            @unique
+  /// SEC-02：api_key 的 sha256 hex（64 字符）。新签发凭据只落哈希；明文列
+  /// （api_key）保留仅用于惰性迁移——认证命中明文行时同事务写入哈希并清空明文。
+  api_key_hash             String?            @unique @db.Char(64)
+  /// SEC-02：subscription_key 的 sha256 hex；迁移策略同 api_key_hash。
+  subscription_key_hash    String?            @unique @db.Char(64)
   notify_subscriptions     Json?
   admin_notify_subscriptions Json?
   node_groups              NodeGroup[]

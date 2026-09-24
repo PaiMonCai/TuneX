@@ -20,6 +20,7 @@ import {
   isUUID,
   newApiKey,
 } from "../auth.ts";
+import { hashKey, resolveUserByKey } from "../services/user-keys.ts";
 import { systemConfig } from "../services/config.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import { licenseService } from "../services/license.ts";
@@ -36,11 +37,16 @@ import { sendMail } from "../services/mail.ts";
 
 export const authRoutes = new Hono<{ Variables: AppVariables }>();
 
+/**
+ * 对外用户视图。
+ * SEC-02：`api_key` 一律回 null —— 新签发凭据只落 sha256 哈希（api_key_hash），
+ * 明文仅在 settings 轮换端点的响应体里出现一次；注册响应 / /me / 登录响应
+ * 都不再回显明文（明文一旦随 GET 响应流出即可被日志/缓存/浏览器历史截获）。
+ */
 function publicUser(u: {
   id: number;
   email: string;
   super_admin: boolean;
-  api_key: string;
   balance: number;
   status: string;
   created_at: Date;
@@ -51,7 +57,7 @@ function publicUser(u: {
     id: u.id,
     email: u.email,
     super_admin: u.super_admin,
-    api_key: u.api_key,
+    api_key: null,
     balance: u.balance,
     status: u.status,
     created_at: u.created_at,
@@ -97,7 +103,9 @@ authRoutes.post("/register", async (c) => {
 
   const user = await db.$transaction(async (tx) => {
     const created = await tx.user.create({
-      data: { email, super_admin: superAdmin, parent_id: parentId, api_key: newApiKey() },
+      // SEC-02：注册即只落 api_key 的 sha256 哈希，明文字段留空（一次性明文仅由
+      // settings 轮换端点返回）。hashKey(newApiKey()) 保持 UUID v4 明文通道语义。
+      data: { email, super_admin: superAdmin, parent_id: parentId, api_key_hash: hashKey(newApiKey()) },
     });
     await tx.userCredential.create({
       data: { user_id: created.id, password: passwordHash },
@@ -168,7 +176,8 @@ authRoutes.post("/login", async (c) => {
 
   return c.json({
     data: {
-      user: { id: user.id, email: user.email, super_admin: user.super_admin, api_key: user.api_key },
+      // SEC-02：登录响应同样不回明文 api_key（只在 settings 轮换端点返回一次）。
+      user: { id: user.id, email: user.email, super_admin: user.super_admin, api_key: null },
       expires_in: env.jwtTtlSeconds,
       /** TEN-03：未验证不阻断登录（软约束），字段供前端提示去验证。 */
       email_verified: user.email_verified_at !== null,
@@ -206,7 +215,8 @@ export async function authenticateRequest(c: Context) {
   if (bearer && isUUID(bearer)) {
     const license = await licenseService.getLicense();
     if (license && license.type !== "business") return null;
-    const u = await db.user.findUnique({ where: { api_key: bearer }, include: { admin_roles: true } });
+    // SEC-02：凭据哈希化查询（旧明文行惰性迁移），语义与直查 api_key 等价。
+    const u = await resolveUserByKey("api_key", bearer);
     if (u && u.status !== "inactive") return u;
   }
   return null;

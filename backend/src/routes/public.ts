@@ -3,8 +3,10 @@
  * 对应 noAuthPaths 白名单中的业务路径（部分端点仍为占位实现）。
  */
 import { Hono } from "hono";
+import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
 import { systemConfig } from "../services/config.ts";
+import { resolveUserByKey } from "../services/user-keys.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const publicRoutes = new Hono<{ Variables: AppVariables }>();
@@ -30,8 +32,9 @@ publicRoutes.post("/tunnel/observer", async (c) => {
 publicRoutes.get("/tunnel/subscription", async (c) => {
   const key = c.req.query("token") ?? c.req.query("key") ?? "";
   if (!key) return c.json({ error: "missing token" }, 400);
-  const { db } = await import("../db.ts");
-  const user = await db.user.findUnique({ where: { subscription_key: key } });
+  // SEC-02：凭据哈希化查询 —— 先 subscription_key_hash，未命中再查 legacy 明文列
+  //（存量 60+ 用户的旧行，命中时同事务写哈希并清空明文，完成惰性迁移）。
+  const user = await resolveUserByKey("subscription_key", key);
   if (!user) return c.json({ error: "Unauthorized" }, 401);
   // The legacy subscription key belongs to the account, not to a team. It must never
   // grant access to team assets even when the account created those assets.

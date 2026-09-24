@@ -42,6 +42,7 @@ import { HTTPException } from "hono/http-exception";
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { hashPassword, newApiKey } from "../auth.ts";
+import { hashKey } from "../services/user-keys.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import {
@@ -201,8 +202,12 @@ adminExtendedRoutes.get("/users", async (c) => {
     db.user.count({ where }),
   ]);
 
-  // api_key 脱敏：列表不下发凭据（原版语义）
-  const data = rows.map(({ api_key, ...rest }) => rest);
+  // SEC-02 脱敏：凭据哈希化后明文列对老行仍可能有值，两个明文字段 **连同两个
+  // 哈希字段** 一并剔除——管理端列表绝不下发任何可用凭据或其摘要
+  //（哈希列虽不能反推明文，但可被离线爆破，且对管理端毫无用途）。
+  const data = rows.map(
+    ({ api_key, subscription_key, api_key_hash, subscription_key_hash, ...rest }) => rest,
+  );
   return listJson(c, data, total, page, limit);
 });
 
@@ -248,7 +253,9 @@ adminExtendedRoutes.post("/users", async (c) => {
           auto_renew: Boolean(body.auto_renew),
           status: status ?? "active",
           parent_id: parentId ?? undefined,
-          api_key: newApiKey(),
+          // SEC-02：新建用户同样只落 api_key 的 sha256 哈希，明文列留空（一次性明文
+          // 仅由用户侧的 settings 轮换端点返回，管理端创建不返回凭据）。
+          api_key_hash: hashKey(newApiKey()),
         } as Prisma.UserUncheckedCreateInput,
       });
       await createPersonalWorkspace(tx, user);
