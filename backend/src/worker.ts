@@ -37,7 +37,7 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
   { name: "cron_reset_expired_tunnel", everyMs: 60_000, desc: "重置过期隧道" },
   { name: "cron_reset_table_order", everyMs: 86_400_000, desc: "重置表排序" },
   { name: "cron_push_node_config", everyMs: 5_000, desc: "推送节点配置" },
-  { name: "cron_check_node_offline", everyMs: 30_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
+  { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });

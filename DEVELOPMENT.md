@@ -296,7 +296,7 @@ Redis 里这三个 key 曾在多节点验证中因写/读口径不一致而断�
 
 **出口 listen 分支要点**：`node_id` 是字符串标识，必须先 `db.node.findUnique({where:{node_id}})` 换成数字主键 `node.id`，因为 hops 拼 addr 用的是 `node.id`。
 
-**`dc:*` 消费闭环**（`socket/offline-detector.ts`，见 §4.7）：标记值存断开时刻，TTL = 防抖 60s + 宽限 120s（保证 worker 在防抖到点后至少扫到一次）。节点重连时 `register` / `sysinfo` 会 `DEL` 该标记取消待处理离线；worker 每 30s（`cron_check_node_offline`）扫描，仅当「防抖到点 ∧ 无 `sysinfo:*` 心跳 ∧ DB 仍 active」才置 `inactive`，并按需清理 `alive_groups`。
+**`dc:*` 消费闭环**（`socket/offline-detector.ts`，见 §4.7）：标记值存断开时刻，TTL = 防抖 60s + 宽限 120s（保证 worker 在防抖到点后至少扫到一次）。节点重连时 `register` / `sysinfo` 会 `DEL` 该标记取消待处理离线；worker 每 10s（`cron_check_node_offline`）扫描，仅当「防抖到点 ∧ 无 `sysinfo:*` 心跳 ∧ DB 仍 active」才置 `inactive`，并按需清理 `alive_groups`。
 
 ### 4.7 离线检测闭环（`dc:*` → `inactive`）
 
@@ -307,8 +307,8 @@ Redis 里这三个 key 曾在多节点验证中因写/读口径不一致而断�
 - **心跳双重确认**：即使防抖到点，只要 `sysinfo:<gid>:<node_id>` 还在，就判定节点存活、清掉残留标记。
 - **幂等**：`updateMany({where:{status:"active"}})` 只翻转一次，重复消费/多 worker 并存不重复写；`SCAN` 游标扫描不阻塞 Redis。
 - **`alive_groups` 清理**：节点翻转后若组内再无 active 节点，`SREM alive_groups <gid>`。
-- **触发**：worker `cron_check_node_offline`（每 30s）。单条失败被吞并计入 `errors`，不阻断整轮。
-- **延迟预算**：`断开被 socket 层发现` + `防抖 60s` + `≤扫描间隔 30s`。即最坏情况下从节点消失到置 `inactive` ≈ 90s。若验收要求「≤60s 显示离线」（`PLAN.md` §5），把扫描间隔下调（如 `10_000`）即可逼近防抖下限，成本仅是更频繁地扫描（空闲时 `dc:*` 通常为空）。
+- **触发**：worker `cron_check_node_offline`（每 10s）。单条失败被吞并计入 `errors`，不阻断整轮。
+- **延迟预算**：`断开被 socket 层发现` + `防抖 60s` + `≤扫描间隔 10s`。即最坏情况下从节点消失到置 `inactive` ≈ 70s。若验收要求「≤60s 显示离线」（`PLAN.md` §5），需与产品确认是否接受该下限（防抖窗口本身是需求核心），或进一步压缩防抖窗口。
 
 单测：`backend/src/socket/__tests__/offline-detector.test.ts`（`bun test`，纯逻辑 + fake deps，不依赖 Redis/DB）。
 
@@ -432,7 +432,7 @@ mock 端点（`web/src/mocks/handler.ts`）已为上述页面补齐：
 | plan_node_group 变更 → 刷新 | 后端 | ✅ 已随套餐 hook 一并覆盖 |
 | ~~exit_listen 读写键名不一致~~ | 后端 | ✅ 已修（`OUT_LISTEN_KEY` + `<node.id>:<type>`），契约已验证 |
 | ~~disconnect 标记按 socket.id~~ | 后端 | ✅ 已改为 `dc:<groupId>:<nodeId>`，实测可反查 |
-| ~~离线检测 worker~~ | 后端 | ✅ 已实现（`socket/offline-detector.ts`）：worker `cron_check_node_offline` 每 30s 消费 `dc:*`，防抖 60s 到点且无心跳 → 节点置 `inactive` + 清 `alive_groups`；重连自动取消标记并拉回 active |
+| ~~离线检测 worker~~ | 后端 | ✅ 已实现（`socket/offline-detector.ts`）：worker `cron_check_node_offline` 每 10s 消费 `dc:*`，防抖 60s 到点且无心跳 → 节点置 `inactive` + 清 `alive_groups`；重连自动取消标记并拉回 active |
 | ~~多节点端口竞争（动态端口）~~ | 后端 | ✅ 已修：控制面在生成入口配置时为动态端口确定性分配唯一固定端口（`socket/port-allocator.ts`），同组 agent 拿到同一映射、同隧道 tcp/udp 不同号；agent 侧 `usedPorts` 改为协议感知 + 确定性启动顺序 + 区间耗尽回 `ERR_NO_FREE_PORT` |
 | admin 前端页面补齐 | 前端 | ✅ 已完成：新增 roles/settings/license 三段，tunnels/orders/tickets 改只读管理组件，users 增加详情与角色分配；`tsc` 与 `next build` 通过 |
 
@@ -441,7 +441,7 @@ mock 端点（`web/src/mocks/handler.ts`）已为上述页面补齐：
 | 任务 | 归属 | 说明 |
 |---|---|---|
 | sing-box 二进制集成 | Agent | 当前用自研 Go 转发（功能等价） |
-| Worker BullMQ delay job | 后端 | ✅ 已落地（`cron_check_node_offline`，每 30s）：`dc:*` 标记由 worker 消费，实现 60s 防抖后置离线 |
+| Worker BullMQ delay job | 后端 | ✅ 已落地（`cron_check_node_offline`，每 10s）：`dc:*` 标记由 worker 消费，实现 60s 防抖后置离线 |
 | ~~`listen_error` 服务端 handler~~ | 后端 | ✅ 已补（`socket/listen-events.ts`）：`ERR_PORT_IN_USE` → 隧道置 `inactive` + 写 `port_conflict_at`（复刻上游语义）；`listen` 回填遇 `P2002` 也记 `port_conflict_at` 并重推该组 |
 | ~~`pushNodeConfig` 增量去重~~ | 后端 | ✅ 已落地：`config-pusher.ts` 默认路径用 `fingerprint` 与 Redis `node_group:config_hash` 比对，未变则跳过 `emit`（不加密/不下发）；`force:true`（隧道/register）仍强制下发并落缓存。Redis 故障 fail-open（照样推）。单测 `config-pusher-dedup.test.ts`（10 例） |
 | ~~全局限流~~ | 后端 | ✅ 已落地：`middlewares/rate-limit.ts` 固定窗口 + Redis Lua 原子计数（`ratelimit:<rule>:<identity>`），规则表覆盖登录/注册/找回/支付回调/全站 `api-global`；超限 429 + `Retry-After`，Redis 故障 fail-open。单测 `rate-limit.test.ts`（18 例） |
