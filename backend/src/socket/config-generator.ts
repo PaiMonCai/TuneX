@@ -32,6 +32,8 @@
 
 import { createHash } from "node:crypto";
 import { isNodeGroupGranted } from "../services/node-group-policy.ts";
+import type { EffectivePolicy, TrafficPeriodName } from "../services/capability-policy.ts";
+import { getEffectivePolicies } from "../services/policy-service.ts";
 import { isIPv4, isIPv6 } from "node:net";
 import { NodeType, TunnelCategory, TunnelType, IpType } from "@prisma/client";
 import type { LoadBalanceType } from "@prisma/client";
@@ -96,28 +98,35 @@ export interface AvailableTunnelChain {
   node_group: AvailableNodeGroup;
 }
 
-export interface AvailableUserPlan {
-  traffic: number | null;
-  traffic_used: number;
-  max_tunnels: number | null;
-  whitelist_ips: string[] | null;
-  plan: {
-    traffic: number | null;
-    max_tunnels: number | null;
-    ip_limit: number | null;
-    client_limit: number | null;
-    bandwidth_limit: number | null;
-    all_in_node_groups: boolean;
-    all_out_node_groups: boolean;
-    node_groups: { node_group_id: number }[];
-  } | null;
-}
-
 export interface AvailableUser {
   id: number;
   personal_workspace?: { id: number } | null;
   node_group_grants?: { node_group_id: number; direction: NodeType; active: boolean }[];
-  user_plan: AvailableUserPlan | null;
+}
+
+/**
+ * 配置生成用的**策略上下文**（只读快照）。
+ *
+ * `filterAvailableTunnels` / `computeAllLimits` / `buildInNodeConfig`
+ * 的额度与白名单判定全部取自这里，**不再读 `user.user_plan`**（AUTHZ-02）：
+ *   · `policies`   ：`workspace_id → EffectivePolicy`（`getEffectivePolicies` 批量合成）
+ *   · `trafficUsed`：`workspace_id → 当前计量周期已用流量（字节）`
+ *
+ * 语义（默认拒绝）：
+ *   · 上下文里**没有**该 workspace 的条目，或 `deny_scope === true`
+ *     （无生效策略 / 已到期且超出宽限期）→ 该 workspace 的隧道**一律不下发**。
+ *   · 完全不传上下文（仅测试 / 内部纯函数）→ 不施加额度，保持旧行为。
+ */
+export interface PolicyContext {
+  policies: Map<number, EffectivePolicy>;
+  trafficUsed?: Map<number, number>;
+}
+
+/** 解析出的单条隧道额度视图（来源只会是 CapabilityPolicy，不是 UserPlan）。 */
+export interface TunnelQuota {
+  maxTunnels: number | null;
+  trafficLimit: number | null;
+  trafficUsed: number;
 }
 
 /**
@@ -179,6 +188,11 @@ export interface GenerateNodeConfigOptions {
   limitScope?: string;
   /** 预取的合并限速表（不传则内部用 {@link computeAllLimits} 计算）。 */
   tunnelLimits?: Map<number, TunnelLimit>;
+  /**
+   * AUTHZ-02：预取的 CapabilityPolicy 上下文（额度 + admission 白名单 + 默认拒绝）。
+   * 不传则内部调 {@link loadPolicyContext} 按 `allTunnels` 合成。
+   */
+  policyContext?: PolicyContext;
 }
 
 /** {@link generateNodeConfig} 的返回：明文配置 + 线上 JSON + 指纹。 */
@@ -409,13 +423,19 @@ export function uuidv5(name: string, namespace: string = UUID_NAMESPACE_URL): st
 /* ================================================================== */
 
 /**
- * 节点组归属或显式准入与购买无关；历史 UserPlan 存在时暂保留额度限制。
- * 无套餐的新用户可使用自有节点组（后续迁移到 CapabilityPolicy）。
+ * 节点组归属或显式准入与购买无关；额度只来自 CapabilityPolicy
+ * （AUTHZ-02：不再读 `user.user_plan`）。
+ *
+ * 语义：
+ *   · 无策略（上下文缺该 workspace，或 `deny_scope`）→ **不下发**（默认拒绝）。
+ *   · `max_tunnels === null` 表示策略未限制隧道数（仍受平台硬上限约束）。
+ *   · `traffic_limit === null` 表示不限制流量；否则用量达到上限即停止下发。
  */
 export function filterAvailableTunnels(
   tunnels: AvailableTunnel[],
   inNodeGroupId?: number,
   outNodeGroupId?: number,
+  policyContext?: PolicyContext,
 ): AvailableTunnel[] {
   const available: AvailableTunnel[] = [];
   const userTunnelCount: Record<number, number> = {};
@@ -429,17 +449,37 @@ export function filterAvailableTunnels(
 
   for (const tunnel of filtered) {
     const userId = tunnel.user_id;
-    const userPlan = tunnel.user?.user_plan;
-    const trafficUsed = userPlan?.traffic_used ?? 0;
-    const maxTunnels = userPlan?.max_tunnels ?? userPlan?.plan?.max_tunnels ?? null;
-    const traffic = userPlan?.traffic ?? userPlan?.plan?.traffic ?? null;
+    // 默认拒绝：无生效策略（超出宽限期/未发放/上下文缺失）的隧道不下发。
+    if (policyContext !== undefined && !hasEffectivePolicy(tunnel.workspace_id, policyContext)) continue;
+    const quota = resolveTunnelQuota(tunnel, policyContext);
     const used = userTunnelCount[userId] ?? 0;
-    if (maxTunnels != null && used >= maxTunnels) continue;
-    if (traffic != null && trafficUsed >= traffic) continue;
+    if (quota.maxTunnels != null && used >= quota.maxTunnels) continue;
+    if (quota.trafficLimit != null && quota.trafficUsed >= quota.trafficLimit) continue;
     userTunnelCount[userId] = used + 1;
     available.push(tunnel);
   }
   return available;
+}
+
+/** 该 workspace 是否有生效策略（含宽限期）；缺上下文条目时按「无策略」处理。 */
+export function hasEffectivePolicy(workspaceId: number, context?: PolicyContext): boolean {
+  if (context === undefined) return true; // 无上下文 = 不施加额度（内部/测试路径）
+  const policy = context.policies.get(workspaceId);
+  return policy !== undefined && !policy.deny_scope;
+}
+
+/**
+ * 从 CapabilityPolicy 解析单条隧道的额度视图。
+ * 这是全模块**唯一**的额度来源（UserPlan 已不参与）。
+ */
+export function resolveTunnelQuota(tunnel: AvailableTunnel, context?: PolicyContext): TunnelQuota {
+  const policy = context?.policies.get(tunnel.workspace_id);
+  const trafficUsed = context?.trafficUsed?.get(tunnel.workspace_id) ?? 0;
+  return {
+    maxTunnels: policy?.limits.max_tunnels ?? null,
+    trafficLimit: policy?.limits.traffic_limit ?? null,
+    trafficUsed,
+  };
 }
 
 /** Missing group/owner data fails closed. Purchases never grant shared group access. */
@@ -468,21 +508,32 @@ function minLimit(a: number | null | undefined, b: number | null | undefined): n
 }
 
 /**
- * 复刻原版 `computeAllLimits(allTunnels, limitScope)`。
+ * 复刻原版 `computeAllLimits(allTunnels, limitScope)`，但限速来源从
+ * `user_plan.plan` 换成 CapabilityPolicy：
+ *
+ *   · `tunnel` 域：limiter 粒度是**单条隧道**，取隧道自身配置与策略的较小值；
+ *   · 用户域：limiter 粒度是**该用户名下全部隧道**，与套餐（按用户）语义
+ *     对应到策略（按 workspace），因此只取策略值（不做 min，否则会把
+ *     单隧道限速误当成用户总限速放大）。
+ *
+ * 策略的 `ip_limit` / `client_limit` / `bandwidth_limit` 是 workspace 级口径，
+ * 由本模块换算成 agent 可执行的 limiter；缺策略时不限速。
+ *
  * `limitScope === "tunnel"` → 每隧道限速器（`climiter-<id>` / `limiter-<id>`）；
  * 否则按用户限速器（`climiter-u<userId>` / `limiter-u<userId>`）。
  */
 export function computeAllLimits(
   allTunnels: AvailableTunnel[],
   limitScope?: string,
+  policyContext?: PolicyContext,
 ): Map<number, TunnelLimit> {
   const result = new Map<number, TunnelLimit>();
   for (const t of allTunnels) {
-    const plan = t.user?.user_plan?.plan;
+    const policy = policyContext?.policies.get(t.workspace_id);
     if (limitScope === "tunnel") {
-      const ipLimit = minLimit(t.ip_limit, plan?.ip_limit);
-      const clientLimit = minLimit(t.client_limit, plan?.client_limit);
-      const bandwidthLimit = minLimit(t.bandwidth_limit, plan?.bandwidth_limit);
+      const ipLimit = minLimit(t.ip_limit, policy?.limits.ip_limit);
+      const clientLimit = minLimit(t.client_limit, policy?.limits.client_limit);
+      const bandwidthLimit = minLimit(t.bandwidth_limit, policy?.limits.bandwidth_limit);
       result.set(t.id, {
         ip_limit: ipLimit,
         client_limit: clientLimit,
@@ -492,9 +543,10 @@ export function computeAllLimits(
       });
       continue;
     }
-    const ipLimit = plan?.ip_limit ?? undefined;
-    const clientLimit = plan?.client_limit ?? undefined;
-    const bandwidthLimit = plan?.bandwidth_limit ?? undefined;
+    // 用户域策略（workspace 口径）≈ 原版的 plan（单用户口径）。
+    const ipLimit = policy?.limits.ip_limit ?? undefined;
+    const clientLimit = policy?.limits.client_limit ?? undefined;
+    const bandwidthLimit = policy?.limits.bandwidth_limit ?? undefined;
     result.set(t.id, {
       ip_limit: ipLimit,
       client_limit: clientLimit,
@@ -607,6 +659,11 @@ export interface InConfigInput {
   observerPeriod: string;
   /** 入口组 bypass 配置（原版二次查库；此处按需透传，缺省则跳过 bypass 段）。 */
   bypass?: { type: string; list: string[]; admission: boolean };
+  /**
+   * CapabilityPolicy 上下文（额度 + admission 白名单 + 默认拒绝）。
+   * 不传 → 不施加策略额度（纯函数/测试路径）。
+   */
+  policyContext?: PolicyContext;
 }
 
 /**
@@ -614,7 +671,7 @@ export interface InConfigInput {
  * `observers` 恒非空（见文件头 ②）。
  */
 export function buildInNodeConfig(input: InConfigInput): NodeConfig {
-  const { inNodeGroupId, portRange, allowListenProtocol, allTunnels, outListens, tunnelLimits } = input;
+  const { inNodeGroupId, portRange, allowListenProtocol, allTunnels, outListens, tunnelLimits, policyContext } = input;
   const observerPeriod = input.observerPeriod;
 
   const services: ServiceConfig[] = [];
@@ -629,7 +686,7 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
   const isAdmissionEnabled = input.bypass?.admission ?? false;
 
   const filtered = allTunnels.filter((t) => t.in_node_group_id === inNodeGroupId);
-  const tunnels = filterAvailableTunnels(filtered, inNodeGroupId);
+  const tunnels = filterAvailableTunnels(filtered, inNodeGroupId, undefined, policyContext);
   const portForwardTunnels = tunnels.filter((t) => t.category === TunnelCategory.port_forward);
 
   for (const tunnel of portForwardTunnels) {
@@ -764,11 +821,15 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
 
     const blockProtocols = tunnel.in_node_group_block_protocols;
     const sniffing = blockProtocols ? true : undefined;
-    const whitelistIps = tunnel.user?.user_plan?.whitelist_ips;
-    const hasAdmission = isAdmissionEnabled && !!whitelistIps && whitelistIps.length > 0;
+    // AUTHZ-02：入口 admission 白名单来自 CapabilityPolicy 的 entitlement
+    // （`whitelist_ips`）；NodeGroupGrant 只决定节点组准入，不含 IP 名单。
+    // `null` = 策略未启用白名单 → 不下发 admission（与原版一致，绝不默认放行）。
+    const whitelistIps = input.policyContext?.policies.get(tunnel.workspace_id)?.entitlements.whitelist_ips ?? null;
+    const whitelistMatchers = whitelistIps !== null && whitelistIps.length > 0 ? whitelistIps : null;
+    const hasAdmission = isAdmissionEnabled && whitelistMatchers !== null;
     const admissionName = hasAdmission ? `admission-${name}` : undefined;
-    if (hasAdmission) {
-      admissions.push({ name: `admission-${name}`, whitelist: true, matchers: whitelistIps! });
+    if (hasAdmission && whitelistMatchers) {
+      admissions.push({ name: `admission-${name}`, whitelist: true, matchers: [...whitelistMatchers] });
     }
 
     const bypass = hasBypass ? bypassName : undefined;
@@ -944,7 +1005,7 @@ export function buildInNodeConfig(input: InConfigInput): NodeConfig {
     }
   }
 
-  const existsInChains = filterAvailableTunnels(allTunnels).some((t) =>
+  const existsInChains = filterAvailableTunnels(allTunnels, undefined, undefined, policyContext).some((t) =>
     (t.tunnel_chains ?? []).some(
       (c) => c.node_group_id === inNodeGroupId && c.node_group?.node_type === NodeType.in,
     ),
@@ -1014,6 +1075,11 @@ export interface OutConfigInput {
   siteUrl: string;
   /** 出口组「协议封堵」列表（原版二次查库）。 */
   blockProtocols?: unknown;
+  /**
+   * CapabilityPolicy 上下文（额度 + 默认拒绝）。
+   * 不传 → 不施加策略额度（纯函数/测试路径）。
+   */
+  policyContext?: PolicyContext;
 }
 
 /**
@@ -1021,7 +1087,7 @@ export interface OutConfigInput {
  * ⚠️ 原版出口配置**不含 `observers` / `bypasses` / `admissions` 字段**（见文件头）。
  */
 export function buildOutNodeConfig(input: OutConfigInput): NodeConfig {
-  const { outNodeGroupId, portRange, allTunnels, outListens, tunnelLimits } = input;
+  const { outNodeGroupId, portRange, allTunnels, outListens, tunnelLimits, policyContext } = input;
   const services: ServiceConfig[] = [];
   const chains: { name: string; hops: Hop[] }[] = [];
   const climiters = new Map<string, { name: string; limits: string[] }>();
@@ -1029,11 +1095,11 @@ export function buildOutNodeConfig(input: OutConfigInput): NodeConfig {
 
   const blockProtocols = input.blockProtocols;
   const filtered = allTunnels.filter((t) => t.out_node_group_id === outNodeGroupId);
-  const tunnels = filterAvailableTunnels(filtered, undefined, outNodeGroupId);
+  const tunnels = filterAvailableTunnels(filtered, undefined, outNodeGroupId, policyContext);
   const portForwardTunnels = tunnels.filter((t) => t.category === TunnelCategory.port_forward);
   const tunnelTypes = new Set<TunnelType>(portForwardTunnels.map((t) => t.tunnel_type));
 
-  const existsInChains = filterAvailableTunnels(allTunnels).some((t) =>
+  const existsInChains = filterAvailableTunnels(allTunnels, undefined, undefined, policyContext).some((t) =>
     (t.tunnel_chains ?? []).some(
       (c) => c.node_group_id === outNodeGroupId && c.node_group?.node_type === NodeType.out,
     ),
@@ -1211,10 +1277,14 @@ async function loadGroupBlockProtocols(groupId: number): Promise<unknown> {
 }
 
 /**
- * 复刻原版 `getAllAvailableTunnels`：拉取「有效」隧道（active 状态 + 用户 active +
- * 套餐未过期）并展开生成配置所需的关系。
+ * 复刻原版 `getAllAvailableTunnels`：拉取「有效」隧道（active 状态 + 用户 active）
+ * 并展开生成配置所需的关系。
  *
- * 不依赖 License 或购买；按节点组所有权/显式准入过滤。
+ * AUTHZ-02：不再 join `user_plan`（套餐`plan`的容量/白名单已迁到
+ * CapabilityPolicy）。额度与准入由 {@link loadPolicyContext} 单独批量合成，
+ * 因此这里的 where 只保留**身份/拓扑**条件，不含套餐有效期。
+ *
+ * 不依赖 License 或购买；按节点组所有权/显式准入（NodeGroupGrant）过滤。
  */
 export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
   const rows = await db.tunnel.findMany({
@@ -1223,11 +1293,6 @@ export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
         include: {
           node_group_grants: { where: { active: true } },
           personal_workspace: { select: { id: true } },
-          user_plan: {
-            include: {
-              plan: { include: { node_groups: true } },
-            },
-          },
         },
       },
       out_node_group: {
@@ -1263,6 +1328,64 @@ export async function loadAvailableTunnels(): Promise<AvailableTunnel[]> {
     ...t,
     in_node_group_block_protocols: blockProtocolsByGroup.get(t.in_node_group_id),
   }));
+}
+
+/**
+ * AUTHZ-02：为给定隧道集合合成 {@link PolicyContext}。
+ *
+ *   · `policies`   ：`getEffectivePolicies` 一次拉全量发放 + 平台硬上限后按
+ *     workspace 合成（无生效策略 → `deny_scope` → 该组隧道不下发）。
+ *   · `trafficUsed`：按各策略的 `traffic_period` 汇总 `tunnel_traffic`
+ *     （`total` 全量、`month`/`day` 按月/日窗口）。查询失败不阻断配置生成，
+ *     退化为 0 —— 因为「用量未知」只会让**流量耗尽**这一项放宽，额度上限
+ *     （`max_tunnels`）与准入仍然生效，不会形成越权下发。
+ *
+ * 返回的 map 对**每个**出现的 workspace 都有条目（含 deny），调用方据此做
+ * 「默认拒绝」判定。
+ */
+export async function loadPolicyContext(tunnels: AvailableTunnel[]): Promise<PolicyContext> {
+  const workspaceIds = [...new Set(tunnels.map((t) => t.workspace_id).filter((id) => Number.isInteger(id) && id > 0))];
+  const policies = await getEffectivePolicies(workspaceIds);
+
+  const trafficUsed = new Map<number, number>();
+  try {
+    const periodOf = (workspaceId: number) => policies.get(workspaceId)?.limits.traffic_period ?? "total";
+    const periods = [...new Set(workspaceIds.map(periodOf))];
+    const now = new Date();
+    const sums = await Promise.all(
+      periods.map(async (period) => {
+        const since = period === "total" ? undefined : periodStart(period, now);
+        const rows = await db.tunnelTraffic.groupBy({
+          by: ["tunnel_id"],
+          where: { tunnel: { workspace_id: { in: workspaceIds } }, ...(since ? { date: { gte: since } } : {}) },
+          _sum: { traffic: true },
+        });
+        const byTunnel = new Map<number, number>();
+        for (const r of rows) byTunnel.set(r.tunnel_id, r._sum.traffic ?? 0);
+        return { period, byTunnel };
+      }),
+    );
+    const tunnelPeriod = new Map<number, TrafficPeriodName>();
+    for (const t of tunnels) tunnelPeriod.set(t.id, periodOf(t.workspace_id));
+    for (const t of tunnels) {
+      const period = tunnelPeriod.get(t.id) ?? "total";
+      const sum = sums.find((s) => s.period === period)?.byTunnel.get(t.id) ?? 0;
+      trafficUsed.set(t.workspace_id, (trafficUsed.get(t.workspace_id) ?? 0) + sum);
+    }
+  } catch {
+    /* 用量查询失败：退化为 0（见上文） */
+  }
+  return { policies, trafficUsed };
+}
+
+/** 计量周期起点（本地日界，与 `policy-service.ts#trafficStart` 一致）。 */
+function periodStart(period: "total" | "month" | "day", now: Date): Date | null {
+  if (period === "total") return null;
+  const d = new Date(now.getTime());
+  d.setHours(0, 0, 0, 0);
+  if (period === "day") return d;
+  d.setDate(1);
+  return d;
 }
 
 /* ================================================================== */
@@ -1303,7 +1426,9 @@ export async function generateNodeConfig(
     options.outListens ?? loadOutListens(),
   ]);
 
-  const tunnelLimits = options.tunnelLimits ?? computeAllLimits(allTunnels, limitScope ?? undefined);
+  // AUTHZ-02：额度/白名单/默认拒绝全部来自 CapabilityPolicy，不再读 user_plan。
+  const policyContext = options.policyContext ?? (await loadPolicyContext(allTunnels));
+  const tunnelLimits = options.tunnelLimits ?? computeAllLimits(allTunnels, limitScope ?? undefined, policyContext);
 
   let config: NodeConfig;
   if (group.node_type === NodeType.in) {
@@ -1317,6 +1442,7 @@ export async function generateNodeConfig(
       siteUrl,
       observerPeriod,
       bypass: await loadGroupBypass(group.id),
+      policyContext,
     });
   } else {
     config = buildOutNodeConfig({
@@ -1327,6 +1453,7 @@ export async function generateNodeConfig(
       tunnelLimits,
       siteUrl,
       blockProtocols: await loadGroupBlockProtocols(group.id),
+      policyContext,
     });
   }
 
@@ -1348,7 +1475,8 @@ export async function generateAllNodeConfigs(): Promise<GeneratedNodeConfig[]> {
   const shared = await loadAvailableTunnels().catch(() => [] as AvailableTunnel[]);
   const outListens = await loadOutListens();
   const limitScope = (await systemConfig.getConfig("LIMIT_SCOPE")) ?? undefined;
-  const tunnelLimits = computeAllLimits(shared, limitScope);
+  const policyContext = await loadPolicyContext(shared);
+  const tunnelLimits = computeAllLimits(shared, limitScope, policyContext);
   const observerPeriod = await loadObserverPeriod();
 
   const results: GeneratedNodeConfig[] = [];
@@ -1360,6 +1488,7 @@ export async function generateAllNodeConfigs(): Promise<GeneratedNodeConfig[]> {
           outListens,
           limitScope,
           tunnelLimits,
+          policyContext,
           observerPeriod,
         }),
       );
