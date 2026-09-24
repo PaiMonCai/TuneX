@@ -19,10 +19,11 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   const password = "ci-only-password-12";
   const ids = [];
 
+  let requestSeq = 0;
   async function request(path, method, cookie, body, workspaceId) {
     return app.request(`http://localhost${path}`, {
       method,
-      headers: { ...(cookie ? { cookie } : {}), ...(workspaceId ? { "x-workspace-id": String(workspaceId) } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+      headers: { "x-forwarded-for": `203.0.113.${++requestSeq}`, ...(cookie ? { cookie, "x-csrf-token": "test" } : {}), ...(workspaceId ? { "x-workspace-id": String(workspaceId) } : {}), ...(body ? { "content-type": "application/json" } : {}) },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
   }
