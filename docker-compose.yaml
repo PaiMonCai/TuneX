@@ -42,7 +42,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: tunex-backend:latest
+    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
     container_name: tunex-db-migrate
     env_file: [.env]
     environment:
@@ -62,7 +62,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: tunex-backend:latest
+    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
     container_name: tunex-backend
     restart: always
     env_file: [.env]
@@ -88,7 +88,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: tunex-backend:latest
+    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
     container_name: tunex-worker
     restart: always
     env_file: [.env]
@@ -108,7 +108,7 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-    image: tunex-web:latest
+    image: ${TUNEX_WEB_IMAGE:-ghcr.io/paimoncai/tunex-web:latest}
     container_name: tunex-web
     restart: always
     environment:

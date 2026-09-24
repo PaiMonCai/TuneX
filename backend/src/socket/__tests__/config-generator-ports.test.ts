@@ -47,7 +47,12 @@ function tunnel(id: number, tunnelType: string, listenPort: number | null) {
     proxy_protocol: false,
     status: "active",
     in_node_group_id: 4,
+    // main 版 canUseTunnelGroup 要求组对象存在且 id 匹配；
+    // workspace_id 缺失时走 legacy 放行：group.user_id === tunnel.user_id。
+    in_node_group: { id: 4, user_id: 1 },
     out_node_group_id: null,
+    out_node_group: null,
+    tunnel_chains: [],
     user_id: 1,
     user: {
       id: 1,
