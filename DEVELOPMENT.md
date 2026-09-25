@@ -890,6 +890,34 @@ auth/quota
 - 迁移用户 Tunnel；
 - 心跳超时即删除资源。
 
+**实现（服务层 + 离线单测，已随本分支交付）：**
+
+- `backend/src/services/reconciler.ts`：五份事实的对比与动作闸门。
+  - 纯判定（`computeDrift` / `planTunnelActions` / `decideAutoAction`）与副作用
+    （`executeReconcile`）分离；副作用全部走注入依赖，下发通道（`ReconcileSink`）
+    由 WP8 编排器接线，**未注入时只记录不假装成功**。
+  - `AUTO_ACTIONS` / `FORBIDDEN_AUTO_ACTIONS` 两个常量把 §7.12 的两条清单钉成
+    穷尽数组；`decideAutoAction` 是唯一闸门，未知动作 fail-closed。
+  - 重发的 revision 恒等于 `tunnel.config_revision`（测试 D 组锚定任何路径下
+    都不抬高）；`error` 态受 `DEFAULT_RETRY_BACKOFF_MS` 退避保护，避免 Agent
+    持续失败时控制面自我 DDoS。
+  - 节点不可达（`status=inactive` / 上报过期 / 归属节点缺失）⇒ 全线不自动修，
+    只产 `node_unreachable` finding；端口租约回收**复用 WP3 `reconcileLeases`**
+    的孤儿判定，不复制第二套规则。
+  - `config_revision = null` 的 legacy DIRECT 完全不在视野内（§5.2：legacy
+    路径的真相在 config-generator / legacy allocator）。
+- `backend/src/services/__tests__/reconciler.test.ts`：36 个离线用例（无
+  MySQL / Redis / 网络），覆盖对比逻辑、白名单四项、禁令四项、revision 不抬高、
+  节点不可达降级、legacy 不受影响、多隧道统计。
+- CI（`.github/workflows/ci.yml`）散装单测步骤已加入 `reconciler.test.ts`。
+
+**与 WP8 的边界（未在 WP9 内完成，等编排器接线）：**
+
+- `ReconcileSink.resendSameRevision` 的生产实现（WP6 `createCommand` 信封 +
+  transport）、worker 的周期调用（cron job）、以及把 finding 接到告警通道。
+- reconciler 只声明「用哪个 revision 重发」，**不自己拼命令信封**：§7.13 禁止
+  第二套下发逻辑，重发必须和控制面走同一条编排出口。
+
 ---
 
 ### 7.13 WP10 / WP11 — API Track
@@ -1295,6 +1323,7 @@ Track A: feature/v3-wp1-schema
 Track B: feature/v3-wp4-agent-runtime
 Track C: feature/v3-wp6-control-contract
 Track B/C: feature/v3-wp7-node-credential （WP7，依赖 WP6 已合并）
+Track C: feature/v3-wp9-reconciler （WP9，服务层/纯逻辑可先行，合并依赖 WP8 接线）
 Track D: test/v3-wp14-e2e-harness
 ```
 
@@ -1303,6 +1332,7 @@ Track D: test/v3-wp14-e2e-harness
 - **WP1 是当前最高优先级合并 Gate**。
 - WP4/WP6 可以立即开发和评审，但如果最终依赖 WP1 的 contract，必须等待 WP1 合并、更新到最新 main 后才能合并。
 - WP7 依赖 WP6 已合并的 Control Contract；它自己的合并同时解锁 WP8 / WP10。
+- WP9 已在服务层交付对比逻辑 + 离线单测（§7.12），但 `ReconcileSink` 生产实现、worker 周期调用与告警接线依赖 WP8，合并前需确认 WP8 已就位。
 - WP14 当前只允许建设测试 harness，不得提前宣称 RELAY 验收完成。
 - Gate F1 通过后，立即解锁 WP2、WP3、WP10 foundation，并继续保持 Track B/C 并行。
 
