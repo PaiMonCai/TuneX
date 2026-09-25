@@ -59,22 +59,19 @@ export function ForwardWorkspace() {
   async function load() {
     setLoading(true);
     try {
-      const nodeRows = await api.nodes.list();
+      const [nodeRows, forwardRows] = await Promise.all([
+        api.nodes.list(),
+        api.forwards.list(),
+      ]);
       const ingressRows = nodeRows.filter(isIngress);
       const rows = await Promise.all(
         ingressRows.map(async (node) => ({
           id: Number(node.id),
-          forwards: await api.nodes.forwards(node.id),
           bindings: await api.nodes.bindings(node.id),
         })),
       );
       const bindingMap: Record<number, NodeBinding[]> = {};
-      const forwardRows: PortForward[] = [];
-      for (const row of rows) {
-        bindingMap[row.id] = row.bindings;
-        forwardRows.push(...row.forwards);
-      }
-      forwardRows.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+      for (const row of rows) bindingMap[row.id] = row.bindings;
       setNodes(nodeRows);
       setBindings(bindingMap);
       setForwards(forwardRows);
@@ -142,7 +139,9 @@ export function ForwardWorkspace() {
 
     setBusy(true);
     try {
-      await api.nodes.createForward(ingress, {
+      await api.forwards.create({
+        mode: createMode,
+        ingress_node_id: ingress,
         name: name.trim(),
         listen_port: listenPortNum,
         target_host: targetHost.trim(),
@@ -162,7 +161,7 @@ export function ForwardWorkspace() {
   async function runAction(forward: PortForward, action: "retry" | "suspend" | "resume") {
     setActionBusy(Number(forward.id));
     try {
-      await api.nodes.forwardAction(forward.ingress_node_id, forward.id, action);
+      await api.forwards.action(forward.id, action);
       await load();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
@@ -175,7 +174,7 @@ export function ForwardWorkspace() {
     if (!confirm(t("forward.deleteConfirm").replace("{name}", forward.name))) return;
     setActionBusy(Number(forward.id));
     try {
-      await api.nodes.removeForward(forward.ingress_node_id, forward.id);
+      await api.forwards.remove(forward.id);
       toast.success(t("forward.deleteSuccess"));
       await load();
     } catch (err) {

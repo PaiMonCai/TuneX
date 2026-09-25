@@ -872,6 +872,16 @@ export interface PortForwardCreateInput {
   egress_node_id?: ID | null;
 }
 
+/** V4 product API payload. Forward owns the explicit mode + ingress choice. */
+export interface ForwardCreateInput extends PortForwardCreateInput {
+  mode: "direct" | "relay";
+  ingress_node_id: ID;
+}
+
+export interface ForwardPatchInput {
+  name?: string;
+}
+
 export interface ProvisionNodeResult {
   node: UserNode;
   enrollment: NodeEnrollmentIssued;
