@@ -8,7 +8,7 @@
 TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户先在控制台创建 Node，复制一键安装命令到 Linux 节点执行，然后直接在入口节点上创建 PortForward；不选出口就是 DIRECT，选择已绑定出口就是 RELAY。内部 `Tunnel` 只作为 revision/ACK/NodePortLease/Reconciler 的运行时对象，不再要求用户手工创建。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
 
 > [!IMPORTANT]
-> TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 升级验证、Workspace/RBAC、节点级凭据、TCP DIRECT/RELAY v3 数据面与真实 Docker 集成 Gate。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署请使用 `docker-compose.prod.yaml`、Caddy TLS 与生产环境密钥。**
+> TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 升级验证、Workspace/RBAC、节点级凭据、TCP DIRECT/RELAY v3 数据面与真实 Docker 集成 Gate。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署默认使用 `docker-compose.prod.yaml`，由宿主机 Nginx/宝塔/1Panel 终止 TLS，再反代到 TuneX 的单一 loopback 入口。没有宿主机反代时可叠加 `docker-compose.standalone.yaml` 让 Caddy 直接接管 80/443。**
 
 ## 当前能力
 
@@ -52,9 +52,14 @@ Egress Node
                        ┌──────────────────────────┐
                        │        Browser           │
                        └────────────┬─────────────┘
-                                    │ HTTP/HTTPS
+                                    │ HTTPS
+                       ┌────────────▼─────────────┐
+                       │ Host Nginx/宝塔/1Panel   │
+                       │ TLS + public 80/443      │
+                       └────────────┬─────────────┘
+                                    │ 127.0.0.1:13000
                              ┌──────▼──────┐
-                             │    Caddy    │
+                             │ Docker Caddy│
                              └───┬─────┬───┘
                       /api/*     │     │ other routes
                                  │     │
@@ -84,7 +89,7 @@ Egress Node
 - **Web**：Next.js 16、React 19、TypeScript、Tailwind CSS
 - **Backend**：Bun、Hono、Prisma 6、MySQL 8.4、Redis 7.4
 - **Agent**：Go 1.22，仅使用 Go 标准库
-- **入口**：Caddy
+- **入口**：Docker 内 Caddy 统一应用路由；生产默认由宿主机 Nginx/宝塔/1Panel 终止 TLS
 - **CI/CD**：GitHub Actions + GHCR
 
 ## 快速开始
@@ -435,6 +440,32 @@ docker compose -f docker-compose.prod.yaml --env-file .env run --rm db-migrate
 docker compose -f docker-compose.prod.yaml --env-file .env up -d backend worker web caddy
 ```
 
+默认生产入口只有一个宿主机本地端口：
+
+```text
+Host Nginx/宝塔/1Panel :80/:443
+              │
+              └── http://127.0.0.1:13000
+                         │
+                    Docker Caddy
+                    ├── /api/*       → backend:3000
+                    ├── /socket.io/* → backend:3001
+                    └── /*           → web:3000
+```
+
+因此宿主机反代只需要指向 `127.0.0.1:13000`，不需要分别管理 Backend/Web 端口。这个端口可用 `TUNEX_HTTP_PORT` 修改，并始终只绑定 loopback。
+
+若服务器没有现成反代，可使用 standalone overlay：
+
+```bash
+docker compose \
+  -f docker-compose.prod.yaml \
+  -f docker-compose.standalone.yaml \
+  --env-file .env up -d
+```
+
+standalone 模式下 Caddy 使用 `Caddyfile.prod`、读取 `SITE_URL/ACME_EMAIL`，并直接绑定 80/443 自动处理 HTTPS。
+
 回滚同样只需把 `TUNEX_IMAGE` 改回上一条已知良好的 SHA，再重新创建应用容器。
 MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用镜像版本一起切换。
 
@@ -448,10 +479,11 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 │   └── release.yml                 # main 集成通过后发布 GHCR
 ├── .env.example                    # 开发/本地环境变量模板
 ├── .env.production.example         # 生产环境变量模板（复制为 .env）
-├── Caddyfile                      # 开发用反代（HTTP）
-├── Caddyfile.prod                 # 生产入口（域名 + ACME + TLS）
+├── Caddyfile                      # Docker 内统一 HTTP 路由（生产默认也使用）
+├── Caddyfile.prod                 # standalone 公网入口（域名 + ACME + TLS）
 ├── docker-compose.yaml            # 开发/自托管基础栈
-├── docker-compose.prod.yaml       # 生产栈（端口不外泄/TLS/限额）
+├── docker-compose.prod.yaml       # 生产栈（默认仅 127.0.0.1:13000 单入口）
+├── docker-compose.standalone.yaml # 可选 overlay：Caddy 直接接管 80/443
 ├── docs/                          # 部署与运维手册
 │   └── production-deploy.md       # 生产部署/备份/恢复/回滚手册
 ├── DEVELOPMENT.md                 # 唯一开发方案、Gate、迁移与 DoD
@@ -492,9 +524,7 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 6. 保持 `PAYMENTS_ENABLED=false`，除非计费链路已完成独立审查和验收；
 7. 以 [DEVELOPMENT.md](DEVELOPMENT.md) 的 Integration Gate 为发布门槛；不得跳过真实 v3 网络验证。
 
-生产部署使用 `docker-compose.prod.yaml` + `Caddyfile.prod` + `.env.production.example`，
-完整步骤、巡检阈值、备份/恢复/回滚操作与演练清单见
-[docs/production-deploy.md](docs/production-deploy.md)。
+生产部署默认使用 `docker-compose.prod.yaml` + `Caddyfile` + `.env.production.example`：宿主机 Nginx/宝塔/1Panel 负责公网 TLS，只反代到 `127.0.0.1:13000`。无宿主机反代时再叠加 `docker-compose.standalone.yaml`，切换到 `Caddyfile.prod` 自动 ACME/TLS。完整步骤、Nginx 配置、巡检阈值、备份/恢复/回滚操作与演练清单见 [docs/production-deploy.md](docs/production-deploy.md)。
 
 仓库已提供 `scripts/ops/` 下的备份、恢复、回滚和告警脚本基础，但生产策略仍应根据实际部署环境审查和演练。
 
