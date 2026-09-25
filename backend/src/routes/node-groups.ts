@@ -181,54 +181,89 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
 
   try {
     const reserved = await withWorkspaceQuotaLock(workspace.id, async (tx, policy) => {
+      const existing = await tx.node.findUnique({
+        where: { node_id: parsed.data.node_id },
+        select: { id: true, node_group_id: true, role: true },
+      });
+      if (existing && existing.node_group_id !== group.id) {
+        return { groupConflict: true } as const;
+      }
+      if (existing?.role && existing.role !== role) {
+        return { roleConflict: existing.role } as const;
+      }
+
       const nodeCount = await tx.node.count({
         where: { node_group: { workspace_id: workspace.id } },
       });
-      const decision = checkNodeCreation(policy, nodeCount);
-      if (!decision.allowed) return { denied: decision } as const;
+      if (!existing) {
+        const decision = checkNodeCreation(policy, nodeCount);
+        if (!decision.allowed) return { denied: decision } as const;
+      }
 
-      const node = await tx.node.create({
-        data: {
-          node_id: parsed.data.node_id,
-          connect_ip: parsed.data.connect_ip,
-          node_group_id: group.id,
-          role,
-          port_range_min: portMin,
-          port_range_max: portMax,
-          lb_strategy: "round",
-          node_credential_hash: credentialHash,
-          credential_rotated_at: new Date(),
-          credential_revoked: false,
-          order_by: nodeCount * 1000,
-        },
-        select: {
-          id: true,
-          node_id: true,
-          connect_ip: true,
-          node_group_id: true,
-          role: true,
-          port_range_min: true,
-          port_range_max: true,
-        },
-      });
+      const select = {
+        id: true,
+        node_id: true,
+        connect_ip: true,
+        node_group_id: true,
+        role: true,
+        port_range_min: true,
+        port_range_max: true,
+      } as const;
+      const node = existing
+        ? await tx.node.update({
+            where: { id: existing.id },
+            data: {
+              connect_ip: parsed.data.connect_ip,
+              role,
+              port_range_min: portMin,
+              port_range_max: portMax,
+              lb_strategy: "round",
+              node_credential_hash: credentialHash,
+              credential_rotated_at: new Date(),
+              credential_revoked: false,
+            },
+            select,
+          })
+        : await tx.node.create({
+            data: {
+              node_id: parsed.data.node_id,
+              connect_ip: parsed.data.connect_ip,
+              node_group_id: group.id,
+              role,
+              port_range_min: portMin,
+              port_range_max: portMax,
+              lb_strategy: "round",
+              node_credential_hash: credentialHash,
+              credential_rotated_at: new Date(),
+              credential_revoked: false,
+              order_by: nodeCount * 1000,
+            },
+            select,
+          });
 
       if (role === "egress" || role === "both") {
         const targets = parsed.data.targets ?? [];
-        await tx.egressPool.create({
-          data: {
+        const pool = await tx.egressPool.upsert({
+          where: { node_id_name: { node_id: node.id, name: "default" } },
+          update: { lb_strategy: "round", status: "active" },
+          create: {
             node_id: node.id,
             name: "default",
             lb_strategy: "round",
-            targets: {
-              create: targets.map((target, index) => ({
-                host: target.host,
-                port: target.port,
-                weight: target.weight ?? 1,
-                order_by: (index + 1) * 1000,
-                status: "active",
-              })),
-            },
+            status: "active",
           },
+          select: { id: true },
+        });
+        await tx.egressTarget.deleteMany({ where: { pool_id: pool.id } });
+        await tx.egressTarget.createMany({
+          data: targets.map((target, index) => ({
+            pool_id: pool.id,
+            host: target.host,
+            port: target.port,
+            weight: target.weight ?? 1,
+            order_by: (index + 1) * 1000,
+            status: "active",
+          })),
         });
       }
 
@@ -236,7 +271,7 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
         data: {
           workspace_id: workspace.id,
           actor_user_id: user.id,
-          action: "node.provisioned",
+          action: existing ? "node.reprovisioned" : "node.provisioned",
           resource_type: "node",
           resource_id: String(node.id),
         },
@@ -244,6 +279,12 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       return { node } as const;
     });
 
+    if ("groupConflict" in reserved && reserved.groupConflict) {
+      return c.json({ error: "node_id 已被其它节点组占用" }, 409);
+    }
+    if ("roleConflict" in reserved && reserved.roleConflict) {
+      return c.json({ error: `已存在节点角色为 ${reserved.roleConflict}，请先显式修改角色` }, 409);
+    }
     const denied = "denied" in reserved ? reserved.denied : null;
     if (denied) {
       return c.json({
