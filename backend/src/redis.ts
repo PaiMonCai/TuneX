@@ -3,14 +3,11 @@ import { env } from "./env.ts";
 import {
   GLOBAL_SCOPE,
   aliveGroupsKey,
-  configHashKey,
   nodeRegisterBlockKey,
   observerBufferKey,
-  outListenKey,
   parsePortLeaseLockKey,
   portLeaseLockKey,
   portLeaseLockPattern,
-  registerBlockKey,
   scopedKey,
   trafficBufferPrefix,
   trafficBufferKey,
@@ -60,19 +57,15 @@ export {
   scopeTag,
   GLOBAL_SCOPE,
   GLOBAL_SCOPE_TAG,
-  configHashKey,
-  outListenKey,
   trafficBufferPrefix,
   trafficBufferKey,
   observerBufferKey,
   aliveGroupsKey,
-  registerBlockKey,
   nodeRegisterBlockKey,
   nodeScope,
   portLeaseLockKey,
   portLeaseLockPattern,
   parsePortLeaseLockKey,
-  socketRoom,
 } from "./tenant-scope.ts";
 
 /**
@@ -84,12 +77,6 @@ export const RedisKeys = {
   /** License 快照（实例级配置，不随租户变化）。 */
   license: scopedKey(GLOBAL_SCOPE, "license"),
 
-  /**
-   * 节点注册防爆破键。`node_group.token` 本身全局唯一（uuid），
-   * 已隐含租户归属，故无需再加 workspace 段（加 scope 反而需要先解析 token→组）。
-   */
-  registerBlock: (groupToken: string) => registerBlockKey(groupToken),
-
   /** 观测回传缓冲键（按 workspace 分段，见 {@link observerBufferKey}）。 */
   observerBuffer: (scope?: number | null) => observerBufferKey(scope),
 
@@ -100,10 +87,7 @@ export const RedisKeys = {
   rateLimit: (ruleName: string, identity: string) =>
     scopedKey(GLOBAL_SCOPE, "ratelimit", ruleName, identity),
 
-  /** 节点组配置指纹缓存（hash，field=groupId，value=明文配置 JSON 的 sha256）。 */
-  nodeGroupConfigHash: (scope?: number | null) => configHashKey(scope),
-
-  /** 近期有心跳的节点组 id 集合（set；成员只有整数 id）。 */
+  /** 近期有心跳的节点组 id 集合（set；成员只有整数 id；offline-detector 用）。 */
   aliveNodeGroups: (scope?: number | null) => aliveGroupsKey(scope),
 
   /**
@@ -122,8 +106,8 @@ export const RedisKeys = {
   /**
    * v3 节点凭据注册防爆破键（`ws:global:node_register_block:<fingerprint>`）。
    *
-   * global 段的理由同 {@link RedisKeys.registerBlock}：防爆破发生在身份解析
-   * 之前，还不知道节点属于哪个租户；键值只描述「这次失败尝试」。
+   * global 段的理由：防爆破发生在身份解析之前，还不知道节点属于哪个租户；
+   * 键值只描述「这次失败尝试」。
    */
   nodeRegisterBlock: (credentialFingerprint: string) =>
     nodeRegisterBlockKey(credentialFingerprint),

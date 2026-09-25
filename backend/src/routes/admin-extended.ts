@@ -45,14 +45,6 @@ import { hashPassword, newApiKey } from "../auth.ts";
 import { hashKey } from "../services/user-keys.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
-import {
-  collectAffectedNodeGroupsForUserDeletion,
-  collectAffectedNodeGroupsForUsers,
-  enqueueRefresh,
-  refreshNodeGroups,
-  refreshNodeGroupsForPlans,
-  refreshNodeGroupsForUsers,
-} from "../socket/config-refresh.ts";
 
 export const adminExtendedRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -363,11 +355,7 @@ async function updateUser(c: Ctx) {
     return user;
   });
 
-  // 停用/启用切换会改变 loadAvailableTunnels 的「有效隧道」集合
-  // （user.status=active 是准入条件），必须刷新该用户名下隧道所在的全部节点组。
-  if (data.status !== undefined && data.status !== target.status) {
-    enqueueRefresh(refreshNodeGroupsForUsers([id]));
-  }
+  // WP15：用户状态切换不再触发 legacy 推送；v3 由 reconciler 拉齐 apply 命令。
 
   return one(c, updated);
 }
@@ -397,9 +385,8 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     return bad(c, `该用户仍有 ${tunnelCount} 条隧道，请先删除隧道`, 409);
   }
 
-  // 级联删除会移除该用户的隧道/链路/节点组，故必须在事务前先算出受影响的节点组，
-  // 事务后再刷新（否则查询隧道时数据已不存在）。
-  const affectedGroups = await collectAffectedNodeGroupsForUserDeletion([id]);
+  // WP15：旧 collectAffectedNodeGroups*（为 legacy 配置推送计算受影响节点组）
+  // 随 config-refresh 一起删除；v3 传播不依赖它。
 
   await db.$transaction(async (tx) => {
     // 解除角色绑定（隐式多对多）
@@ -442,9 +429,7 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     await tx.user.delete({ where: { id } });
   });
 
-  // 用户已删除：刷新其隧道/节点组曾影响到的全部节点组（含引用其节点组的其他用户隧道组）。
-  enqueueRefresh(refreshNodeGroups(affectedGroups));
-
+  // WP15：用户删除后由 reconciler 拉齐 apply 命令，无需 legacy 推送。
   return one(c, { ok: true });
 });
 
@@ -816,12 +801,6 @@ adminExtendedRoutes.delete("/node-groups/:id", async (c) => {
   if (nodeCount > 0) return bad(c, "请先移除该节点组下的节点", 409);
   if (tunnelCount > 0) return bad(c, "该节点组仍被隧道引用，无法删除", 409);
 
-  // 删除会移除本组的套餐绑定（plan_node_group）——属于「套餐-节点组绑定变更」，
-  // 故先记录受影响的套餐，事务后刷新这些套餐的其余绑定组。
-  const affectedPlanIds = (
-    await db.planNodeGroup.findMany({ where: { node_group_id: id }, select: { plan_id: true } })
-  ).map((r) => r.plan_id);
-
   await db.$transaction(async (tx) => {
     await tx.planNodeGroup.deleteMany({ where: { node_group_id: id } });
     await tx.tunnelChain.deleteMany({ where: { node_group_id: id } });
@@ -829,10 +808,7 @@ adminExtendedRoutes.delete("/node-groups/:id", async (c) => {
     await tx.nodeGroup.delete({ where: { id } });
   });
 
-  // 刷新受影响套餐的订户隧道所在组（本组已删除，无需推送）。
-  if (affectedPlanIds.length > 0) {
-    enqueueRefresh(refreshNodeGroupsForPlans(affectedPlanIds));
-  }
+  // WP15：节点组删除不再触发 legacy 推送；v3 由 reconciler 拉齐。
 
   return one(c, { ok: true });
 });
@@ -1029,18 +1005,8 @@ async function updatePlan(c: Ctx) {
   const nodeGroupIds =
     body.node_group_ids === undefined ? undefined : parseIntList(body.node_group_ids) ?? [];
 
-  // 事务前读取「旧」绑定与状态，用于变更后判定受影响的节点组。
-  const bindingChanged = nodeGroupIds !== undefined;
-  const configAffectingChange =
-    (data.status !== undefined && data.status !== plan.status) ||
-    bindingChanged ||
-    (body.all_in_node_groups !== undefined && Boolean(body.all_in_node_groups) !== plan.all_in_node_groups) ||
-    (body.all_out_node_groups !== undefined && Boolean(body.all_out_node_groups) !== plan.all_out_node_groups);
-  const oldBoundGroupIds = bindingChanged || configAffectingChange
-    ? (
-        await db.planNodeGroup.findMany({ where: { plan_id: id }, select: { node_group_id: true } })
-      ).map((r) => r.node_group_id)
-    : [];
+  // WP15：plan 变更的「受影响节点组」预读（configAffectingChange / oldBoundGroupIds）
+  // 与 config-refresh 一起删除——它只为 legacy 配置推送计算 scope。
 
   try {
     await db.$transaction(async (tx) => {
@@ -1055,13 +1021,7 @@ async function updatePlan(c: Ctx) {
     throw e;
   }
 
-  // 套餐停用/启用、全组放行开关、或套餐-节点组绑定变化，都会改变
-  // 订阅该套餐用户隧道的「进/出」资格 → 刷新订户隧道所在组 + 绑定前后涉及的组。
-  if (configAffectingChange) {
-    enqueueRefresh(
-      refreshNodeGroupsForPlans([id], [...oldBoundGroupIds, ...(nodeGroupIds ?? [])]),
-    );
-  }
+  // WP15：套餐/绑定变更不再触发 legacy 推送；v3 由 reconciler 拉齐。
 
   const full = await db.plan.findUniqueOrThrow({
     where: { id },
@@ -1097,8 +1057,7 @@ adminExtendedRoutes.delete("/plans/:id", async (c) => {
     await tx.plan.delete({ where: { id } });
   });
 
-  // 套餐删除：若存在漏网的订阅/引用，也要把相关节点组刷新一遍（防御性，通常为空）。
-  enqueueRefresh(refreshNodeGroupsForPlans([id], boundGroupIds));
+  // WP15：套餐删除不再触发 legacy 推送；v3 由 reconciler 拉齐。
 
   return one(c, { ok: true });
 });

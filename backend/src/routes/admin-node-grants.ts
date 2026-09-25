@@ -2,7 +2,6 @@
 import { Hono } from "hono";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
-import { enqueueRefresh, refreshNodeGroups } from "../socket/config-refresh.ts";
 
 export const nodeGrantRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -46,7 +45,7 @@ nodeGrantRoutes.post("/node/group/:id/grants", async (c) => {
     create: { user_id: userId, node_group_id: groupId, direction, active: true },
     update: { active: true },
   });
-  enqueueRefresh(refreshNodeGroups([groupId]));
+  // WP15：授权写入不再触发 legacy 配置推送；v3 由 reconciler 拉齐。
   return c.json({ data: grant });
 });
 
@@ -62,6 +61,6 @@ nodeGrantRoutes.delete("/node/group/:id/grants/:userId/:direction", async (c) =>
     data: { active: false },
   });
   if (!revoked.count) return c.json({ error: "有效授权不存在" }, 404);
-  enqueueRefresh(refreshNodeGroups([groupId]));
+  // WP15：授权撤销不再触发 legacy 配置推送；v3 由 reconciler 拉齐。
   return c.json({ data: { ok: true } });
 });

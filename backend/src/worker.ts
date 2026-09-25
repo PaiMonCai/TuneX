@@ -10,9 +10,14 @@
  *   cron_delete_tunnel_traffic  每日 0 点        过期流量清理（OPS-03，按
  *                                                TUNNEL_TRAFFIC_RETENTION_DAYS，幂等，
  *                                                见 services/traffic-retention.ts）
- *   cron_push_node_config       每 5s          推送节点配置（事件驱动路径由
- *                                                socket/config-refresh.ts 提供）
  *   cron_check_node_offline     每 10s         离线检测（消费 dc:* 标记，防抖到点置 inactive）
+ *
+ * WP15 已删除：
+ *   cron_push_node_config       每 5s          旧 Agent 的 gost 配置推送（Fernet 加密 + Socket.IO
+ *                                                emit）。DIRECT 改由 v3 runtime 承载后，节点通过
+ *                                                `/api/internal/node/state` 上报、由 orchestrator
+ *                                                下发 revisioned apply 命令（§7.16 执行要求 1/4：
+ *                                                不为旧 Agent 保留第二套配置生成路径）。
  *
  * 未实现（**已从 CRON_JOBS 移除，不再占位调度**）：
  *   cron_sync_dns               DNS 记录同步（CF+Huawei）——无任何实现，上游原版的
@@ -47,7 +52,6 @@ import { defaultTrafficRetentionDeps, deleteExpiredTraffic } from "./services/tr
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步（OPS-01/OPS-03，幂等）" },
   { name: "cron_delete_tunnel_traffic", pattern: "0 0 * * *", desc: "删除过期流量记录（OPS-03，按保留期，幂等）" },
-  { name: "cron_push_node_config", everyMs: 5_000, desc: "推送节点配置（事件驱动见 socket/config-refresh.ts）" },
   { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
 ];
 
@@ -87,13 +91,6 @@ const worker = new Worker(
           console.log("[worker] cron_delete_tunnel_traffic:", JSON.stringify(r));
         }
         return r;
-      }
-      case "cron_push_node_config": {
-        // 事件驱动路径（routes 写操作 → socket/config-refresh.ts → pushNodeConfig）
-        // 已覆盖绝大多数变更；本到点轮询是**兜底**：补「没有触发事件但配置已变化」
-        // 或「事件推送时节点离线」的场景。推送逻辑复用 config-refresh 的数据源
-        // 解析（按 workspace 作用域），逐个组走 pushNodeConfig 的指纹去重。
-        return { nodes: await db.node.count(), note: "sha256 incremental push" };
       }
       case "cron_check_node_offline": {
         // 消费 `dc:<gid>:<nodeId>` 标记：防抖（60s）到点且无心跳 → 节点置 inactive。

@@ -2,7 +2,6 @@ import { app } from "./app.ts";
 import { env } from "./env.ts";
 import { db } from "./db.ts";
 import { redisPing } from "./redis.ts";
-import { startSocketServer } from "./socket/index.ts";
 
 async function main() {
   let dbOk = false;
@@ -23,8 +22,10 @@ async function main() {
     idleTimeout: 60,
   });
 
-  // Socket.IO 在独立端口（解决 Bun.serve + Hono WebSocket 不兼容）
-  startSocketServer();
+  // WP15：Socket.IO agent 接入层（register / license 签名 / Fernet config 下发）
+  // 随 legacy 引擎一起删除。v3 节点通过 `POST /api/internal/node/state` 上报、
+  // 由 orchestrator 经 agent admin API（HTTP）下发 revisioned apply 命令，
+  // 不再需要独立的 socket 端口（§7.16 执行要求 1/4）。
 
   console.log(`[boot] TuneX backend listening on http://0.0.0.0:${server.port}`);
 }

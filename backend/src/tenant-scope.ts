@@ -150,16 +150,6 @@ export function scopedPattern(
 /* 节点组 / 节点资源 key                                               */
 /* ================================================================== */
 
-/** 节点组配置指纹（Redis hash；field = groupId，value = 明文 JSON 的 sha256）。 */
-export function configHashKey(scope: number | null | undefined): string {
-  return scopedKey(scope, "node_group", "config_hash");
-}
-
-/** 出口端口缓存（Redis hash；field = `${nodeId}:${type}`，value = 端口）。 */
-export function outListenKey(scope: number | null | undefined): string {
-  return scopedKey(scope, "tunnel", "out_listen");
-}
-
 /** 流量缓冲前缀（worker 归档时按此扫描，如 `${prefix}:<tunnelId>`）。 */
 export function trafficBufferPrefix(scope: number | null | undefined): string {
   return scopedKey(scope, "tunnel", "traffic");
@@ -201,16 +191,6 @@ export function observerBufferKey(scope: number | null | undefined): string {
 /** 活跃节点组集合（Redis set；成员 = groupId 字符串）。 */
 export function aliveGroupsKey(scope: number | null | undefined): string {
   return scopedKey(scope, "alive_groups");
-}
-
-/**
- * 节点注册防爆破键。
- *
- * `node_group.token` 本身全局唯一（uuid），密钥自作用域：值只描述「这个
- * token 自己」，不描述别的租户资产，因此放在 global 段。
- */
-export function registerBlockKey(nodeToken: string): string {
-  return scopedKey(GLOBAL_SCOPE, "register_block", nodeToken);
 }
 
 /**
@@ -274,22 +254,6 @@ export function parseDisconnectMarkerKey(
   const nodeId = rest.slice(0, -1).join(":");
   if (nodeId.length === 0) return null;
   return { scope: parsed.scope, groupId: Number(groupRaw), nodeId };
-}
-
-/** Socket.IO room 名：`ws:<scope>:node_group/<groupId>`。 */
-export function socketRoom(scope: number | null | undefined, groupId: number): string {
-  return `ws:${scopeTag(scope)}:node_group/${groupId}`;
-}
-
-/**
- * 解析 `ws:<scope>:node_group/<groupId>` room 名（测试/审计用）。
- * 非该形态返回 `null`。
- */
-export function parseSocketRoom(room: string): { scope: number; groupId: number } | null {
-  const m = /^ws:(\d+|global):node_group\/(\d+)$/.exec(room);
-  if (!m) return null;
-  const scope = m[1] === GLOBAL_SCOPE_TAG ? GLOBAL_SCOPE : Number(m[1]);
-  return { scope, groupId: Number(m[2]) };
 }
 
 /* ================================================================== */
@@ -417,7 +381,6 @@ export function parsePortLeaseLockKey(
 /**
  * v3 节点注册防爆破键（按 node credential，WP7）。
  *
- * 与 {@link registerBlockKey}（节点组 token，全局唯一、已隐含归属）的区别：
  * 节点凭据的爆破防护发生在**身份解析之前**，此时还不知道节点属于哪个
  * workspace，只能按凭据指纹自作用域——值只描述「这次失败尝试」，不描述
  * 任何租户资产，故放 global 段。

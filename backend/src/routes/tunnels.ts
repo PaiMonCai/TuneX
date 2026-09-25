@@ -27,7 +27,6 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
-import { pushNodeConfig } from "../socket/config-pusher.ts";
 import { canUseNodeGroup } from "../services/node-group-access.ts";
 import { canWorkspaceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
 import {
@@ -57,22 +56,6 @@ tunnelsRoutes.use("*", async (c, next) => {
   c.set("workspace", await resolveWorkspaceAccess(c, isCreate ? "create" : "read"));
   await next();
 });
-
-/**
- * 推送隧道所属节点组的配置（节点在线时立即生效）。
- * 只推「入/出组」——原版语义：入口组负责监听，出口组负责转发目标。
- *
- * force: true —— 隧道侧强制下发，不走指纹去重。原因：隧道是用户直接操作的对象，
- * 即便某些字段不影响生成配置的指纹（例如备注），用户也有权期待「改了就看到」；
- * 且去重命中时 register 首推已由 index.ts 单独 force，二者不冲突。
- */
-function pushTunnelConfig(t: {
-  in_node_group_id: number;
-  out_node_group_id: number | null;
-}): void {
-  void pushNodeConfig(t.in_node_group_id, { force: true }).catch(() => {});
-  if (t.out_node_group_id) void pushNodeConfig(t.out_node_group_id, { force: true }).catch(() => {});
-}
 
 /* ------------------------------------------------------------------ */
 /* 工具                                                               */
@@ -304,9 +287,9 @@ tunnelsRoutes.post("/", async (c) => {
     return c.json({ error: decision?.message ?? "策略拒绝", code: decision?.reason }, 403);
   }
 
-  // 推送配置到入口/出口节点组（节点在线时立即生效）
-  pushTunnelConfig(created);
-
+  // WP15：旧 Agent 的配置推送旁路已删（config-generator/config-pusher 随 legacy
+  // 引擎移除）。传播由 orchestrator + reconciler 负责：隧道落库后 reconciler
+  // 拉齐 apply 命令，节点心跳带 revision，无需「写操作 → 立即推配置」。
   return ok(c, tunnelView(created as unknown as Record<string, unknown>));
 });
 
@@ -499,15 +482,7 @@ tunnelsRoutes.patch("/:id", async (c) => {
     },
   });
 
-  // 换节点组时，旧组的配置也要刷新（移除该隧道的监听）
-  if (updated.in_node_group_id !== tunnel.in_node_group_id) {
-    void pushNodeConfig(tunnel.in_node_group_id).catch(() => {});
-  }
-  if (updated.out_node_group_id !== tunnel.out_node_group_id && tunnel.out_node_group_id) {
-    void pushNodeConfig(tunnel.out_node_group_id).catch(() => {});
-  }
-  pushTunnelConfig(updated);
-
+  // WP15：换节点组/改配置不再触发 legacy 推送；v3 由 reconciler 拉齐 apply 命令。
   return ok(c, tunnelView(updated as unknown as Record<string, unknown>));
 });
 
@@ -535,9 +510,7 @@ tunnelsRoutes.post("/:id/toggle", async (c) => {
     },
   });
 
-  // 状态变化影响 loadAvailableTunnels（只推 active），必须推送
-  pushTunnelConfig(updated);
-
+  // WP15：状态变化不再触发 legacy 推送；v3 由 reconciler 拉齐。
   return ok(c, tunnelView(updated as unknown as Record<string, unknown>));
 });
 
@@ -586,9 +559,7 @@ tunnelsRoutes.delete("/:id", async (c) => {
     db.tunnel.delete({ where: { id: tunnel.id } }),
   ]);
 
-  // 删除后刷新相关节点组（节点上的监听需要下线）
-  pushTunnelConfig(tunnel);
-
+  // WP15：删除后由 reconciler 拉齐 apply 命令，监听自然下线。
   return ok(c, { ok: true, id: tunnel.id });
 });
 
@@ -860,7 +831,6 @@ tunnelsRoutes.delete("/v3/:id", async (c) => {
   });
   if (!result.ok) return apiError(c, result);
 
-  // 删完刷新两端节点组，让节点上的监听下线（legacy 语义保持一致）。
-  pushTunnelConfig(existing);
+  // WP15：删完由 reconciler 拉齐，让节点上的监听下线。
   return ok(c, { ok: true, id, action: "delete" });
 });

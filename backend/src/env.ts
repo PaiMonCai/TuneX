@@ -2,10 +2,12 @@
  * 环境变量集中读取。
  *
  * Security: secrets have no built-in default. Deployments must supply
- * AUTH_SECRET, LICENSE_SECRET, TUNEX_CONFIG_KEY and TUNEX_LICENSE_KEY.
- * Missing secrets fail fast instead of silently using a shared value.
+ * AUTH_SECRET and LICENSE_SECRET. Missing secrets fail fast instead of
+ * silently using a shared value.
+ *
+ * WP15：TUNEX_CONFIG_KEY / TUNEX_LICENSE_KEY 不再读取也不再校验——它们只为
+ * legacy agent 的 Fernet config 下发与 license 签名存在，随 Socket.IO 层删除。
  */
-import { configKey, licenseKey } from "./crypto/keys.ts";
 
 function requireSecret(name: string): string {
   const value = process.env[name]?.trim();
@@ -55,11 +57,3 @@ export const env = {
   /** Optional billing integration; off by default, independent of RBAC. */
   paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
 } as const;
-
-// Fail fast at startup: validate the per-install Fernet keys as soon as this
-// module is loaded, instead of lazily on first use. A deployment missing either
-// key cannot boot, so a key leaked from one install can never be reused.
-if (process.env.NODE_ENV !== "test") {
-  configKey();
-  licenseKey();
-}
