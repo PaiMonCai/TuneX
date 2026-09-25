@@ -26,6 +26,7 @@ import {
 } from "./tunnel-api.ts";
 
 export type ForwardMode = "direct" | "relay";
+export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
 export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume">;
 
 export interface ForwardCreateInput {
@@ -40,8 +41,9 @@ export interface ForwardCreateInput {
 
 export interface ForwardListInput {
   ingress_node_id?: number;
+  egress_node_id?: number;
   mode?: ForwardMode;
-  apply_status?: string;
+  apply_status?: ForwardApplyStatus;
   keyword?: string;
 }
 
@@ -179,6 +181,9 @@ export async function listForwards(workspaceId: number, input: ForwardListInput 
     ...(input.ingress_node_id
       ? { ingress_node_id: input.ingress_node_id }
       : {}),
+    ...(input.egress_node_id
+      ? { egress_node_id: input.egress_node_id }
+      : {}),
     ...(input.mode ? { tunnel_mode: input.mode } : {}),
     ...(input.apply_status ? { apply_status: input.apply_status } : {}),
   };
@@ -199,6 +204,55 @@ export async function listForwards(workspaceId: number, input: ForwardListInput 
     include: forwardInclude,
   });
   return rows.map(forwardView);
+}
+
+export interface ForwardSummary {
+  total: number;
+  direct: number;
+  relay: number;
+  active: number;
+  error: number;
+  suspended: number;
+  pending: number;
+  traffic: number;
+  traffic_cost: number;
+}
+
+export async function getForwardSummary(
+  workspaceId: number,
+): Promise<ForwardSummary> {
+  const base: Prisma.TunnelWhereInput = {
+    workspace_id: workspaceId,
+    category: "port_forward",
+  };
+  const [total, direct, relay, active, errorCount, suspended, pending, usage] =
+    await Promise.all([
+      db.tunnel.count({ where: base }),
+      db.tunnel.count({ where: { ...base, tunnel_mode: "direct" } }),
+      db.tunnel.count({ where: { ...base, tunnel_mode: "relay" } }),
+      db.tunnel.count({ where: { ...base, apply_status: "active" } }),
+      db.tunnel.count({ where: { ...base, apply_status: "error" } }),
+      db.tunnel.count({ where: { ...base, apply_status: "suspended" } }),
+      db.tunnel.count({
+        where: { ...base, apply_status: { in: ["pending", "applying"] } },
+      }),
+      db.tunnel.aggregate({
+        where: base,
+        _sum: { traffic: true, traffic_cost: true },
+      }),
+    ]);
+
+  return {
+    total,
+    direct,
+    relay,
+    active,
+    error: errorCount,
+    suspended,
+    pending,
+    traffic: Number(usage._sum.traffic ?? 0),
+    traffic_cost: Number(usage._sum.traffic_cost ?? 0),
+  };
 }
 
 export async function getForward(

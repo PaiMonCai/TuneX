@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { handleMock } from "@/mocks/handler";
 import { resetStore } from "@/mocks/state";
 import type {
+  ForwardSummary,
   NodeBinding,
   PortForward,
   ProvisionNodeResult,
@@ -120,6 +121,43 @@ describe("V4 forward product contract", () => {
     expect(Number(created.body.egress_node_id)).toBe(7);
     expect(created.body.target_host).toBe("example.internal");
     expect(created.body.target_port).toBe(443);
+  });
+
+  test("summary and apply-status filtering stay on the Forward API", async () => {
+    const summary = await call<ForwardSummary>("GET", "/forwards/summary");
+    expect(summary.status).toBe(200);
+    expect(summary.body.total).toBeGreaterThan(0);
+    expect(summary.body.direct + summary.body.relay).toBe(summary.body.total);
+    expect(summary.body.error).toBeGreaterThanOrEqual(0);
+
+    const errors = await call<PortForward[]>(
+      "GET",
+      "/forwards?apply_status=error",
+    );
+    expect(errors.status).toBe(200);
+    for (const row of errors.body) expect(row.apply_status).toBe("error");
+  });
+
+  test("ingress and egress filters use actual Node ids", async () => {
+    const ingress = await call<PortForward[]>(
+      "GET",
+      "/forwards?ingress_node_id=1",
+    );
+    expect(ingress.status).toBe(200);
+    expect(ingress.body.length).toBeGreaterThan(0);
+    for (const row of ingress.body) {
+      expect(Number(row.ingress_node_id)).toBe(1);
+    }
+
+    const egress = await call<PortForward[]>(
+      "GET",
+      "/forwards?egress_node_id=4",
+    );
+    expect(egress.status).toBe(200);
+    for (const row of egress.body) {
+      expect(Number(row.egress_node_id)).toBe(4);
+      expect(row.mode).toBe("relay");
+    }
   });
 
   test("runtime actions and traffic stay on the Forward API", async () => {

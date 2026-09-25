@@ -42,6 +42,9 @@ nodesRoutes.use("*", async (c, next) => {
     resource = "node";
   } else if (path.includes("/forwards")) {
     resource = "tunnel";
+    c.header("Deprecation", "true");
+    c.header("Link", '</api/forwards>; rel="successor-version"');
+    c.header("X-TuneX-Deprecated", "/api/nodes/:ingressId/forwards");
     if (method === "DELETE") action = "delete";
     else if (method === "POST" && /\/forwards\/?$/.test(path)) action = "create";
     else if (method === "GET") action = "read";

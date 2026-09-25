@@ -887,6 +887,18 @@ export interface ForwardPatchInput {
   name?: string;
 }
 
+export interface ForwardSummary {
+  total: number;
+  direct: number;
+  relay: number;
+  active: number;
+  error: number;
+  suspended: number;
+  pending: number;
+  traffic: number;
+  traffic_cost: number;
+}
+
 export interface ProvisionNodeResult {
   node: UserNode;
   enrollment: NodeEnrollmentIssued;

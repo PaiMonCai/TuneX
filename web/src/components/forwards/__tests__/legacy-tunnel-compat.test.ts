@@ -1,5 +1,11 @@
 /**
- * WP13 Tunnel Web — v3 隧道编排契约单测（纯逻辑，不起服务器 / 浏览器）。
+ * Legacy Tunnel compatibility contract (pure mock/API logic, no UI).
+ *
+ * V4 Web no longer exposes Tunnel as a user product. These tests intentionally
+ * keep the deprecated backend/mock contract covered during the compatibility
+ * window so removing the old UI does not accidentally break existing clients.
+ *
+ * Historical WP13 invariants covered here:
  *
  * 覆盖交付要求：
  *   1. **「未声明」语义**：tunnel_mode / apply_status 为 NULL = 补列前的存量行，
@@ -14,7 +20,8 @@
  *      返回空集（防 UI 传错值静默全空）；
  *   6. **出口池候选**：/egress-pools 只回用户侧可用视图（node_label + targets）。
  *
- * 跑法（web 目录）：bun test src/components/tunnels/__tests__/wp13-tunnel-orchestration.test.ts
+ * This file should be removed together with the deprecated /api/tunnels
+ * compatibility surface after the announced compatibility window.
  */
 import { test, expect, describe, beforeEach } from "bun:test";
 import { handleMock } from "@/mocks/handler";

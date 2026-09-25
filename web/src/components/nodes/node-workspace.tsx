@@ -190,10 +190,18 @@ export function NodeWorkspace() {
         <p className="text-sm text-[var(--muted-foreground)]">
           {loading ? t("common.loading") : nodes.length + " 个节点 · " + ingressNodes.length + " 个入口"}
         </p>
-        <Button onClick={() => setCreateOpen(true)}>
-          <Plus className="size-4" />
-          {t("node.create")}
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" asChild>
+            <Link href="/forwards">
+              <ArrowLeftRight className="size-4" />
+              {t("common.forwards")}
+            </Link>
+          </Button>
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus className="size-4" />
+            {t("node.create")}
+          </Button>
+        </div>
       </div>
 
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -257,67 +265,57 @@ export function NodeWorkspace() {
       </div>
 
       {selectedIngress ? (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <CardTitle className="text-base">{selectedIngress.node_id} · {t("node.bindings")}</CardTitle>
-                  <CardDescription>{t("node.relayHint")}</CardDescription>
-                </div>
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <CardTitle className="text-base">{selectedIngress.node_id} · {t("node.bindings")}</CardTitle>
+                <CardDescription>{t("node.bindingInfraHint")}</CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" asChild>
+                  <Link href={`/forwards?ingress_node_id=${selectedIngress.id}`}>
+                    <ArrowLeftRight className="size-3.5" />
+                    {t("node.viewForwards")}
+                  </Link>
+                </Button>
                 <Button size="sm" variant="outline" onClick={() => setBindOpen(true)}>
                   <Link2 className="size-3.5" />
                   {t("node.bindEgress")}
                 </Button>
               </div>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-2">
-              {bindings.map((binding) => (
-                <div
-                  key={String(binding.id)}
-                  className="flex items-center justify-between gap-2 rounded-md border border-[var(--border)] p-3"
-                >
-                  <div>
-                    <div className="text-sm font-medium">{binding.egress_node.node_id}</div>
-                    <div className="text-xs text-[var(--muted-foreground)]">
-                      {binding.egress_node.connect_ip ?? t("node.waiting")}
-                    </div>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+            {bindings.map((binding) => (
+              <div
+                key={String(binding.id)}
+                className="flex items-center justify-between gap-2 rounded-md border border-[var(--border)] p-3"
+              >
+                <div>
+                  <div className="text-sm font-medium">{binding.egress_node.node_id}</div>
+                  <div className="text-xs text-[var(--muted-foreground)]">
+                    {binding.egress_node.connect_ip ?? t("node.waiting")}
                   </div>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    onClick={() => void unbindEgress(Number(binding.egress_node_id))}
-                    disabled={busy}
-                    aria-label={t("common.delete")}
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
                 </div>
-              ))}
-              {bindings.length === 0 ? (
-                <p className="py-6 text-center text-sm text-[var(--muted-foreground)]">{t("node.noBindings")}</p>
-              ) : null}
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">{t("common.forwards")}</CardTitle>
-              <CardDescription>{t("forward.subtitle")}</CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-3">
-              <p className="text-sm text-[var(--muted-foreground)]">
-                {t("forward.directDesc")} {t("forward.relayDesc")}
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => void unbindEgress(Number(binding.egress_node_id))}
+                  disabled={busy}
+                  aria-label={t("common.delete")}
+                >
+                  <Trash2 className="size-4" />
+                </Button>
+              </div>
+            ))}
+            {bindings.length === 0 ? (
+              <p className="py-6 text-center text-sm text-[var(--muted-foreground)] md:col-span-2 xl:col-span-3">
+                {t("node.noBindings")}
               </p>
-              <Button asChild>
-                <Link href="/forwards">
-                  <ArrowLeftRight className="size-4" />
-                  {t("common.forwards")}
-                </Link>
-              </Button>
-            </CardContent>
-          </Card>
-        </div>
+            ) : null}
+          </CardContent>
+        </Card>
       ) : null}
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>

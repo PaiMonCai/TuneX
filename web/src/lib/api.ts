@@ -40,9 +40,9 @@ import type {
   Paginated,
   PasswordChangeInput,
   PortForward,
-  PortForwardCreateInput,
   ForwardCreateInput,
   ForwardPatchInput,
+  ForwardSummary,
   ProvisionNodeResult,
   Payment,
   Plan,
@@ -54,9 +54,6 @@ import type {
   TopupOrder,
   TrafficPoint,
   Tunnel,
-  TunnelCreateInput,
-  TunnelEgressPoolOption,
-  TunnelRuntimeAction,
   TunnelUpdateInput,
   User,
   UserNode,
@@ -379,46 +376,12 @@ export const api = {
     stats: (cookie?: string) => get<DashboardStats>("/dashboard/stats", undefined, cookie),
     traffic: (days = 14, cookie?: string) => get<TrafficPoint[]>("/dashboard/traffic", { days }, cookie),
   },
-  tunnels: {
-    list: (query?: ListQuery, cookie?: string) => get<Paginated<Tunnel>>("/tunnels", query, cookie),
-    detail: (id: number, cookie?: string) => get<Tunnel>(`/tunnels/${id}`, undefined, cookie),
-    traffic: (id: number, days = 14, cookie?: string) => get<TrafficPoint[]>(`/tunnels/${id}/traffic`, { days }, cookie),
-    create: (input: TunnelCreateInput, cookie?: string) => post<Tunnel>("/tunnels", input, cookie),
-    update: (id: number, input: TunnelUpdateInput, cookie?: string) => patch<Tunnel>(`/tunnels/${id}`, input, cookie),
-    remove: (id: number, cookie?: string) => del<{ ok: boolean }>(`/tunnels/${id}`, cookie),
-    toggle: (id: number, cookie?: string) => post<Tunnel>(`/tunnels/${id}/toggle`, {}, cookie),
-    /**
-     * WP11 Tunnel RELAY API —— 隧道运行态操作（全部统一走 orchestrator，
-     * route 自己不写第二套下发逻辑，DEVELOPMENT.md §7.13 WP11 边界）。
-     *
-     * 状态机（§4.1）：
-     *   error     → retry      ：重放相同 desired revision（不抬高），编排重入
-     *   active    → suspend    ：通知两端节点下线，Tunnel 保留 → suspended
-     *   suspended → resume     ：重新走「先 egress 后 ingress」→ pending → active
-     *
-     * 后端 WP11 未合入 main 期间由 mock handler 提供同契约响应；契约冻结后
-     * 这里无需改动。**前端不得据此发明字段**：返回体就是 TunnelRuntimeAction。
-     */
-    /** retry：从 error 态重放编排（相同 revision；revision 仅在编排真正前进时 +1） */
-    retry: (id: number, cookie?: string) => post<TunnelRuntimeAction>(`/tunnels/${id}/retry`, {}, cookie),
-    /** suspend：暂停隧道（通知两端节点），不物理删除 */
-    suspend: (id: number, cookie?: string) => post<TunnelRuntimeAction>(`/tunnels/${id}/suspend`, {}, cookie),
-    /** resume：恢复被暂停的隧道（重新走 egress-before-ingress 编排） */
-    resume: (id: number, cookie?: string) => post<TunnelRuntimeAction>(`/tunnels/${id}/resume`, {}, cookie),
-  },
-  /**
-   * WP11 出口池候选（用户侧创建 RELAY 隧道时选池用）。
-   *
-   * admin 侧 WP10 已有 `/admin/node/pools`，但那是管理端全量视图（需要
-   * admin 权限）；用户侧只需要「我有权用的出口池」，契约用 `?available=1`
-   * 表达。后端未合入期间由 mock handler 提供。
-   */
-  egressPools: {
-    /** 当前 workspace 可用的出口池（含池内目标，用于创建 RELAY 时选池） */
-    available: (query?: ListQuery, cookie?: string) =>
-      get<TunnelEgressPoolOption[]>("/egress-pools", query, cookie),
-  },
+  // User-facing forwarding is V4-only from this point onward.
+  // Legacy /api/tunnels stays backend-compatible, but the Web client no longer
+  // exposes it as a product API. Admin tunnel inspection remains below.
   forwards: {
+    summary: (cookie?: string) =>
+      get<ForwardSummary>("/forwards/summary", undefined, cookie),
     list: (query?: ListQuery, cookie?: string) =>
       get<PortForward[]>("/forwards", query, cookie),
     detail: (id: ID, cookie?: string) =>
@@ -447,14 +410,6 @@ export const api = {
       post<NodeBinding>(`/nodes/${ingressId}/bindings`, { egress_node_id }, cookie),
     unbindEgress: (ingressId: ID, egressId: ID, cookie?: string) =>
       del<{ ok: boolean }>(`/nodes/${ingressId}/bindings/${egressId}`, cookie),
-    forwards: (ingressId: ID, cookie?: string) =>
-      get<PortForward[]>(`/nodes/${ingressId}/forwards`, undefined, cookie),
-    createForward: (ingressId: ID, input: PortForwardCreateInput, cookie?: string) =>
-      post<PortForward>(`/nodes/${ingressId}/forwards`, input, cookie),
-    forwardAction: (ingressId: ID, forwardId: ID, action: "retry" | "suspend" | "resume", cookie?: string) =>
-      post<PortForward>(`/nodes/${ingressId}/forwards/${forwardId}/${action}`, {}, cookie),
-    removeForward: (ingressId: ID, forwardId: ID, cookie?: string) =>
-      del<{ ok: boolean }>(`/nodes/${ingressId}/forwards/${forwardId}`, cookie),
   },
   nodeGroups: {
     list: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/node-groups", query, cookie),

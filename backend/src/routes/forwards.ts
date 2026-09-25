@@ -13,11 +13,13 @@ import {
   createForward,
   deleteForward,
   getForward,
+  getForwardSummary,
   getForwardTraffic,
   listForwards,
   patchForward,
   runForwardAction,
   type ForwardAction,
+  type ForwardApplyStatus,
   type ForwardMode,
   type ForwardServiceResult,
 } from "../services/forward-service.ts";
@@ -96,6 +98,13 @@ const ForwardPatchSchema = z
   .strict();
 
 const ACTIONS = new Set<ForwardAction>(["retry", "suspend", "resume"]);
+const APPLY_STATUSES = new Set<ForwardApplyStatus>([
+  "pending",
+  "applying",
+  "active",
+  "error",
+  "suspended",
+]);
 
 forwardsRoutes.get("/", async (c) => {
   const ws = workspace(c);
@@ -103,13 +112,30 @@ forwardsRoutes.get("/", async (c) => {
   const mode = q.mode === "direct" || q.mode === "relay"
     ? (q.mode as ForwardMode)
     : undefined;
+  const applyStatus = APPLY_STATUSES.has(q.apply_status as ForwardApplyStatus)
+    ? (q.apply_status as ForwardApplyStatus)
+    : undefined;
+  const ingressNodeId = Number(q.ingress_node_id);
+  const egressNodeId = Number(q.egress_node_id);
 
   const rows = await listForwards(ws.id, {
     mode,
-    apply_status: q.apply_status?.trim() || undefined,
+    apply_status: applyStatus,
+    ingress_node_id:
+      Number.isInteger(ingressNodeId) && ingressNodeId > 0
+        ? ingressNodeId
+        : undefined,
+    egress_node_id:
+      Number.isInteger(egressNodeId) && egressNodeId > 0
+        ? egressNodeId
+        : undefined,
     keyword: q.keyword?.trim() || undefined,
   });
   return c.json({ data: rows });
+});
+
+forwardsRoutes.get("/summary", async (c) => {
+  return c.json({ data: await getForwardSummary(workspace(c).id) });
 });
 
 forwardsRoutes.post("/", async (c) => {

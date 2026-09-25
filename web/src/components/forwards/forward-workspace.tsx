@@ -25,23 +25,31 @@ import {
 import { Input, Label } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatDateTime } from "@/lib/utils";
-import type { NodeBinding, PortForward, UserNode } from "@/lib/types";
+import { formatBytes, formatDateTime } from "@/lib/utils";
+import type { ForwardSummary, NodeBinding, PortForward, UserNode } from "@/lib/types";
 
 type ForwardModeFilter = "all" | "direct" | "relay";
+type ForwardStatusFilter = "all" | "active" | "error" | "suspended" | "pending";
 
 function isIngress(node: UserNode) {
   return node.role === "ingress" || node.role === "both";
+}
+
+function isEgress(node: UserNode) {
+  return node.role === "egress" || node.role === "both";
 }
 
 export function ForwardWorkspace() {
   const { t } = useI18n();
   const [nodes, setNodes] = useState<UserNode[]>([]);
   const [forwards, setForwards] = useState<PortForward[]>([]);
+  const [summary, setSummary] = useState<ForwardSummary | null>(null);
   const [bindings, setBindings] = useState<Record<number, NodeBinding[]>>({});
   const [loading, setLoading] = useState(true);
   const [keyword, setKeyword] = useState("");
   const [modeFilter, setModeFilter] = useState<ForwardModeFilter>("all");
+  const [statusFilter, setStatusFilter] = useState<ForwardStatusFilter>("all");
+  const [ingressFilter, setIngressFilter] = useState("all");
   const [createOpen, setCreateOpen] = useState(false);
   const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
   const [name, setName] = useState("");
@@ -50,18 +58,34 @@ export function ForwardWorkspace() {
   const [listenPort, setListenPort] = useState("");
   const [targetHost, setTargetHost] = useState("");
   const [targetPort, setTargetPort] = useState("");
+  const [bindEgressId, setBindEgressId] = useState("");
+  const [bindingBusy, setBindingBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<number | null>(null);
 
   const ingressNodes = useMemo(() => nodes.filter(isIngress), [nodes]);
   const selectedBindings = ingressId ? bindings[Number(ingressId)] ?? [] : [];
+  const availableEgressNodes = useMemo(() => {
+    if (!ingressId) return [];
+    const ingress = Number(ingressId);
+    const bound = new Set(
+      (bindings[ingress] ?? []).map((binding) => Number(binding.egress_node_id)),
+    );
+    return nodes.filter(
+      (node) =>
+        isEgress(node) &&
+        Number(node.id) !== ingress &&
+        !bound.has(Number(node.id)),
+    );
+  }, [nodes, bindings, ingressId]);
 
   async function load() {
     setLoading(true);
     try {
-      const [nodeRows, forwardRows] = await Promise.all([
+      const [nodeRows, forwardRows, forwardSummary] = await Promise.all([
         api.nodes.list(),
         api.forwards.list(),
+        api.forwards.summary(),
       ]);
       const ingressRows = nodeRows.filter(isIngress);
       const rows = await Promise.all(
@@ -75,6 +99,7 @@ export function ForwardWorkspace() {
       setNodes(nodeRows);
       setBindings(bindingMap);
       setForwards(forwardRows);
+      setSummary(forwardSummary);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
     } finally {
@@ -84,12 +109,27 @@ export function ForwardWorkspace() {
 
   useEffect(() => {
     void load();
+    const requestedIngress = new URLSearchParams(window.location.search).get("ingress_node_id");
+    if (requestedIngress && /^\d+$/.test(requestedIngress)) {
+      setIngressFilter(requestedIngress);
+    }
   }, []);
 
   const filtered = useMemo(() => {
     const q = keyword.trim().toLowerCase();
     return forwards.filter((forward) => {
       if (modeFilter !== "all" && forward.mode !== modeFilter) return false;
+      if (
+        ingressFilter !== "all" &&
+        Number(forward.ingress_node_id) !== Number(ingressFilter)
+      ) {
+        return false;
+      }
+      if (statusFilter === "pending") {
+        if (forward.apply_status !== "pending" && forward.apply_status !== "applying") return false;
+      } else if (statusFilter !== "all" && forward.apply_status !== statusFilter) {
+        return false;
+      }
       if (!q) return true;
       const fields = [
         forward.name,
@@ -101,10 +141,14 @@ export function ForwardWorkspace() {
       ];
       return fields.some((field) => field.toLowerCase().includes(q));
     });
-  }, [forwards, keyword, modeFilter]);
+  }, [forwards, keyword, modeFilter, statusFilter, ingressFilter]);
 
   function openCreate(mode: "direct" | "relay") {
-    const firstIngress = ingressNodes[0];
+    const filteredIngress =
+      ingressFilter !== "all"
+        ? ingressNodes.find((node) => String(node.id) === ingressFilter)
+        : undefined;
+    const firstIngress = filteredIngress ?? ingressNodes[0];
     setCreateMode(mode);
     setName("");
     setIngressId(firstIngress ? String(firstIngress.id) : "");
@@ -112,7 +156,35 @@ export function ForwardWorkspace() {
     setListenPort("");
     setTargetHost("");
     setTargetPort("");
+    setBindEgressId("");
     setCreateOpen(true);
+  }
+
+  async function bindSelectedEgress() {
+    const ingress = Number(ingressId);
+    const egress = Number(bindEgressId);
+    if (!Number.isInteger(ingress) || !Number.isInteger(egress)) return;
+
+    setBindingBusy(true);
+    try {
+      const binding = await api.nodes.bindEgress(ingress, egress);
+      setBindings((current) => {
+        const existing = current[ingress] ?? [];
+        const next = existing.some(
+          (row) => Number(row.egress_node_id) === Number(binding.egress_node_id),
+        )
+          ? existing
+          : [...existing, binding];
+        return { ...current, [ingress]: next };
+      });
+      setEgressId(String(binding.egress_node_id));
+      setBindEgressId("");
+      toast.success(t("node.bindSuccess"));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("forward.bindFailed"));
+    } finally {
+      setBindingBusy(false);
+    }
   }
 
   async function createForward() {
@@ -215,6 +287,34 @@ export function ForwardWorkspace() {
             onChange={(event) => setKeyword(event.target.value)}
             placeholder={t("forward.searchPlaceholder")}
           />
+          <Select
+            value={statusFilter}
+            onValueChange={(value) => setStatusFilter(value as ForwardStatusFilter)}
+          >
+            <SelectTrigger className="h-9 w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("forward.statusAll")}</SelectItem>
+              <SelectItem value="active">{t("forward.statusActive")}</SelectItem>
+              <SelectItem value="pending">{t("forward.statusPending")}</SelectItem>
+              <SelectItem value="suspended">{t("forward.statusSuspended")}</SelectItem>
+              <SelectItem value="error">{t("forward.statusError")}</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={ingressFilter} onValueChange={setIngressFilter}>
+            <SelectTrigger className="h-9 w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("forward.allIngress")}</SelectItem>
+              {ingressNodes.map((node) => (
+                <SelectItem key={String(node.id)} value={String(node.id)}>
+                  {node.node_id}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={() => openCreate("direct")}>
@@ -228,7 +328,42 @@ export function ForwardWorkspace() {
         </div>
       </div>
 
-      {!loading && forwards.length === 0 && !keyword && modeFilter === "all" ? (
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTotal")}</div>
+            <div className="mt-1 text-2xl font-semibold">{summary?.total ?? (loading ? "—" : 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
+              {t("forward.direct")} {summary?.direct ?? 0} · {t("forward.relay")} {summary?.relay ?? 0}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorActive")}</div>
+            <div className="mt-1 text-2xl font-semibold">{summary?.active ?? (loading ? "—" : 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
+              {t("forward.statusPending")} {summary?.pending ?? 0} · {t("forward.statusSuspended")} {summary?.suspended ?? 0}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttention")}</div>
+            <div className="mt-1 text-2xl font-semibold">{summary?.error ?? (loading ? "—" : 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttentionHint")}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTraffic")}</div>
+            <div className="mt-1 text-2xl font-semibold">{formatBytes(summary?.traffic ?? 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorTrafficHint")}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {!loading && forwards.length === 0 && !keyword && modeFilter === "all" && statusFilter === "all" && ingressFilter === "all" ? (
         <div className="grid gap-4 md:grid-cols-2">
           <Card>
             <CardHeader>
@@ -386,6 +521,7 @@ export function ForwardWorkspace() {
                   onValueChange={(value) => {
                     setIngressId(value);
                     setEgressId("");
+                    setBindEgressId("");
                   }}
                 >
                   <SelectTrigger><SelectValue placeholder={t("forward.chooseIngress")} /></SelectTrigger>
@@ -401,26 +537,64 @@ export function ForwardWorkspace() {
 
               {createMode === "relay" ? (
                 <Field label={t("forward.egressNode")}>
-                  {selectedBindings.length === 0 ? (
-                    <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
-                      <div>{t("forward.noBoundEgress")}</div>
-                      <div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div>
-                      <Button className="mt-3" size="sm" variant="outline" asChild>
-                        <Link href="/nodes">{t("common.nodes")}</Link>
-                      </Button>
-                    </div>
-                  ) : (
-                    <Select value={egressId} onValueChange={setEgressId}>
-                      <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
-                      <SelectContent>
-                        {selectedBindings.map((binding) => (
-                          <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
-                            {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
+                  <div className="flex flex-col gap-3">
+                    {selectedBindings.length > 0 ? (
+                      <Select value={egressId} onValueChange={setEgressId}>
+                        <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
+                        <SelectContent>
+                          {selectedBindings.map((binding) => (
+                            <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
+                              {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
+                        <div>{t("forward.noBoundEgress")}</div>
+                        <div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div>
+                      </div>
+                    )}
+
+                    {availableEgressNodes.length > 0 ? (
+                      <div className="rounded-md border border-[var(--border)] p-3">
+                        <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">
+                          {selectedBindings.length > 0
+                            ? t("forward.bindAnotherEgress")
+                            : t("forward.bindInline")}
+                        </div>
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <Select value={bindEgressId} onValueChange={setBindEgressId}>
+                            <SelectTrigger className="min-w-0 flex-1">
+                              <SelectValue placeholder={t("forward.chooseUnboundEgress")} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {availableEgressNodes.map((node) => (
+                                <SelectItem key={String(node.id)} value={String(node.id)}>
+                                  {node.node_id} · {node.connect_ip ?? t("node.waiting")}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => void bindSelectedEgress()}
+                            disabled={bindingBusy || !bindEgressId}
+                          >
+                            {t("forward.bindAndUse")}
+                          </Button>
+                        </div>
+                      </div>
+                    ) : selectedBindings.length === 0 ? (
+                      <div className="text-xs text-[var(--muted-foreground)]">
+                        {t("forward.noAvailableEgress")}{" "}
+                        <Link href="/nodes" className="underline underline-offset-2">
+                          {t("common.nodes")}
+                        </Link>
+                      </div>
+                    ) : null}
+                  </div>
                 </Field>
               ) : null}
 
@@ -453,7 +627,7 @@ export function ForwardWorkspace() {
               disabled={
                 busy ||
                 ingressNodes.length === 0 ||
-                (createMode === "relay" && selectedBindings.length === 0)
+                (createMode === "relay" && (!egressId || selectedBindings.length === 0))
               }
             >
               {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
