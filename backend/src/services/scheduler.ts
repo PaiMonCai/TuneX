@@ -973,6 +973,7 @@ export async function createRelayTunnel(
   await store.tunnel.update({
     where: { id: tunnelId },
     data: {
+      ingress_node_id: ingressPick.node.id,
       egress_node_id: egressPick.node.id,
       egress_pool_id: poolId,
       apply_status: APPLY_STATUS.applying,
@@ -1251,7 +1252,7 @@ export async function reapplyRelayTunnel(
     return fail(
       "bind_nodes",
       SCHEDULER_ERROR_CODES.mode_topology_mismatch,
-      `隧道 ${tunnelId} 不是 RELAY 模式（${String(row.tunnel_mode)}），重推请走 legacy 配置下发`,
+      `隧道 ${tunnelId} 不是 RELAY 模式（${String(row.tunnel_mode)}）`,
     );
   }
   const inNodeGroupId = Number(row.in_node_group_id);
@@ -1336,7 +1337,7 @@ export async function reapplyRelayTunnel(
   }
   await store.tunnel.update({
     where: { id: tunnelId },
-    data: { egress_node_id: egressPick.node.id, egress_pool_id: poolId },
+    data: { ingress_node_id: ingressPick.node.id, egress_node_id: egressPick.node.id, egress_pool_id: poolId },
   });
 
   /* ---------------- ④ ports（已有值复用，空才分配）---------------- */
@@ -1478,24 +1479,3 @@ export async function reapplyRelayTunnel(
 function asRow<T>(row: unknown): T | null {
   return row ? (row as T) : null;
 }
-
-/**
- * WP8 期间**不能写**的 Tunnel 列。
- *
- * DEVELOPMENT.md §7.4「已知留白」明确：`ingress_node_id` 没有新增列，
- * `tunnel.in_node_group_id` + `tunnel.listen_port` 是既有等价物，而
- * 「实际入口节点」这一列**属于 WP8 schema 设计时补齐，不能沿用
- * NodeGroup 顶替」。
- *
- * 本包（WP8 代码部分）**不自行 ALTER 表**：§8.2「先 schema / migration，
- * 再服务层」的顺序不能倒过来，而 schema 变更属于 WP1 的后续 additive
- * migration，需要独立 PR + 空库/升级库双测。因此编排器把实际入口节点
- * 落在本文件导出的记录里，等列落地后由一条 migration + 一次落库补上。
- *
- * 这不是遗漏而是**显式留白**：常量存在的意义是让「手滑写错列名」在 review
- * 时能被一眼看到，而不是让 `ingress_node_id` 悄悄出现在某个 update 的
- * data 里、上线才炸。
- */
-export const PENDING_SCHEMA_COLUMNS: readonly string[] = [
-  "ingress_node_id",
-];
