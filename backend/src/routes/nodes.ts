@@ -13,6 +13,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
@@ -134,7 +135,7 @@ function nodeView(node: {
   };
 }
 
-const forwardInclude = {
+const forwardInclude = Prisma.validator<Prisma.TunnelInclude>()({
   ingress_node: { select: { id: true, node_id: true, connect_ip: true, role: true } },
   egress_node: { select: { id: true, node_id: true, connect_ip: true, role: true } },
   egress_pool: {
@@ -145,7 +146,7 @@ const forwardInclude = {
       },
     },
   },
-} as const;
+});
 
 function portForwardView(t: any) {
   const target =
@@ -481,10 +482,11 @@ nodesRoutes.post("/:ingressId/forwards", async (c) => {
     return { tunnelId: tunnel.id, poolId } as const;
   });
 
-  if ("denied" in reserved) {
+  const denied = "denied" in reserved ? reserved.denied : null;
+  if (denied) {
     return c.json({
-      error: reserved.denied.message ?? "策略拒绝",
-      code: reserved.denied.reason,
+      error: denied.message ?? "策略拒绝",
+      code: denied.reason,
     }, 403);
   }
   if ("conflict" in reserved) return c.json({ error: "该入口端口已被占用" }, 409);
