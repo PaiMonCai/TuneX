@@ -157,7 +157,7 @@ export async function DashboardBody() {
             <TableHeader>
               <TableRow>
                 <TableHead>{t("fields.id")}</TableHead>
-                <TableHead>{t("fields.name")}</TableHead>
+                <TableHead>{t("common.name")}</TableHead>
                 <TableHead>{t("forward.mode")}</TableHead>
                 <TableHead>{t("forward.listenPort")}</TableHead>
                 <TableHead>{t("forward.totalTraffic")}</TableHead>
