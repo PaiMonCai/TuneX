@@ -1,0 +1,70 @@
+{
+  "node_groups": [
+    {
+      "key": "ingress",
+      "name": "WP14-IN-A",
+      "node_type": "in",
+      "port_range": "21000-21099",
+      "workspace": "primary",
+      "agent_container": "ingress-agent",
+      "node_id": "WP14-IN-A-NODE"
+    },
+    {
+      "key": "egress",
+      "name": "WP14-OUT-A",
+      "node_type": "out",
+      "port_range": "22000-22099",
+      "workspace": "primary",
+      "agent_container": "egress-agent",
+      "node_id": "WP14-OUT-A-NODE"
+    },
+    {
+      "key": "foreign-ingress",
+      "name": "WP14-IN-B",
+      "node_type": "in",
+      "port_range": "21100-21199",
+      "workspace": "isolation",
+      "agent_container": null,
+      "node_id": null,
+      "notes": "跨租户隔离负面用例用：本组不启动 agent，仅用于在另一 workspace 建同形隧道，验证配置不下发给 WP14-IN-A。"
+    }
+  ],
+  "tunnels": [
+    {
+      "key": "direct",
+      "name": "wp14-direct",
+      "in_node_group": "ingress",
+      "out_node_group": null,
+      "tunnel_type": "tcp",
+      "listen_port": 21001,
+      "forward_addresses": ["target-a:3030"],
+      "expected_marker": "WP14-TARGET-A",
+      "verified_by": "verify.sh DIRECT 场景 + backend/tests/v3-e2e/direct.e2e.test.mjs",
+      "expected_path": "client -> ingress-agent:21001 -> target-a:3030（单跳）"
+    },
+    {
+      "key": "relay",
+      "name": "wp14-relay",
+      "in_node_group": "ingress",
+      "out_node_group": "egress",
+      "tunnel_type": "tcp",
+      "listen_port": 21002,
+      "forward_addresses": ["target-b:3030"],
+      "expected_marker": "WP14-TARGET-B",
+      "verified_by": "verify.sh RELAY 场景 + backend/tests/v3-e2e/relay.e2e.test.mjs",
+      "expected_path": "client -> ingress-agent:21002 -> egress-agent:22001 -> target-b:3030（双跳）"
+    },
+    {
+      "key": "foreign",
+      "name": "wp14-foreign",
+      "in_node_group": "foreign-ingress",
+      "out_node_group": null,
+      "tunnel_type": "tcp",
+      "listen_port": 21101,
+      "forward_addresses": ["target-b:3030"],
+      "expected_marker": "WP14-TARGET-B",
+      "verified_by": "verify.sh isolation 负面用例",
+      "expected_path": "不得出现在 ingress-agent 的配置里"
+    }
+  ]
+}

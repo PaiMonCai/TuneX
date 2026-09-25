@@ -1,0 +1,58 @@
+{
+  "name": "WP14 E2E 测试夹具",
+  "description": "scripts/v3-e2e 使用的静态 fixture 数据。运行时对象（workspace / 节点组 / 隧道）由 setup.sh 经真实 HTTP API 创建，结果写入 scripts/v3-e2e/state.json（不入 git）。",
+  "fixtures": [
+    {
+      "file": "topology.json",
+      "purpose": "三机拓扑描述：网络分段、每台机器的角色 / 端口 / 是否仅出站。setup.sh 与 docker-compose.e2e.yaml 的端口与网段必须与本文件一致。"
+    },
+    {
+      "file": "workspaces.json",
+      "purpose": "租户 fixture：primary（DIRECT/RELAY）+ isolation（跨租户负面用例）。"
+    },
+    {
+      "file": "tunnels.json",
+      "purpose": "隧道 fixture：direct（单跳）、relay（双跳）、foreign（跨租户隔离）。listen_port 与 agent 容器端口映射保持一致。"
+    },
+    {
+      "file": "agent-config-template.yaml",
+      "purpose": "Agent 启动配置模板参考（钉死 agent 兼容位字段形状）。agent 进程的真实配置由控制面经 Socket.IO 下发，不用本文件直接启动。"
+    },
+    {
+      "file": "readme-placeholder.txt",
+      "purpose": "占位说明：运行时生成的 state.json / .passwords.env / evidence/ 均已在 .gitignore 中，不进入版本库。"
+    }
+  ],
+  "runtime_generated": [
+    "state.json",
+    ".env.wp14",
+    ".passwords.env",
+    "evidence/",
+    "agent.Dockerfile.e2e"
+  ],
+  "deliverables_note": "_bootstrap.py 与 fixtures/ 本身是交付物（随 git 走）；setup.sh 每次现生成 agent.Dockerfile.e2e，故它属于 runtime_generated。",
+  "port_plan": {
+    "host": {
+      "panel_http": 18180,
+      "panel_socketio": 18181,
+      "ingress_agent_direct": 18201,
+      "ingress_agent_relay": 18202
+    },
+    "container": {
+      "ingress_listen": [21001, 21002],
+      "egress_listen": [22001],
+      "target": 3030,
+      "panel_http": 3000,
+      "panel_socketio": 3001
+    },
+    "avoid_collisions_with": [
+      "net01 栈: mysql 13310 / redis 13311 / http 8787 / socket 8788",
+      "tunex 栈: mysql 3307 / redis 6380 / backend 8787 / caddy 9091"
+    ]
+  },
+  "markers": {
+    "target_a": "WP14-TARGET-A",
+    "target_b": "WP14-TARGET-B",
+    "purpose": "串台判定：经 DIRECT/RELAY 隧道收到的回串必须只含所连目标机的 marker。"
+  }
+}

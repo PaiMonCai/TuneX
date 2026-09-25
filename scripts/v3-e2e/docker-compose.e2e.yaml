@@ -1,0 +1,225 @@
+# WP14 v3 E2E Harness —— 五机真实拓扑（DEVELOPMENT.md §7.15 最低拓扑）
+#
+#   Control Plane: panel（HTTP API + Socket.IO agent 接入）
+#   Ingress Agent: ingress-agent（DIRECT 单跳：监听隧道端口直接转发 Target A/B）
+#   Egress Agent : egress-agent（RELAY 双跳第二跳：监听 egressPort 转发 Target A/B）
+#   Target A/B  : target-a / target-b（marker 回显服务）
+#
+# 至少一个 Agent 必须位于 NAT/私网、仅可主动出站 —— 本栈这样实现：
+#   egress-agent 不映射任何 host 端口，且**只接 wp14-egress-data 网段**
+#   （`internal: true`，容器间可互达、无外网出口）。agent -> panel 的控制通道是
+#   agent 主动出站的 Socket.IO 连接；被 ingress-agent 拨号的数据端口（egressPort）
+#   只存在于 compose 内部网络。这与家用 NAT 后面的出口节点语义一致：
+#   控制面无法反连它，只有链路对端能拨它。
+#
+# panel 只接 wp14-ctrl 网段，两个数据网段都不接 —— 也是同一约束的控制面侧镜像：
+# 面板从网络层就无法访问 agent 的数据端口。
+#
+# 端口唯一性（避开 net01 / tunex 两套栈）：
+#   host: panel http 18180 / socket.io 18181 / ingress 18201 18202
+#   container: panel 3000 3001 / ingress listen 21001 21002 / egress 22001 / targets 3030
+#
+# 用法（README.md 有完整说明）：
+#   bash scripts/v3-e2e/setup.sh     # 建环境（幂等）
+#   bash scripts/v3-e2e/verify.sh    # 跑 DIRECT / RELAY / 隔离断言
+#   bash scripts/v3-e2e/teardown.sh  # 整套销毁
+name: wp14-e2e
+
+# Targets A/B：busybox 自带 `nc -lk -p <port> -e`，无第三方依赖即可作为
+# marker 回显服务（每次连接回带本机 marker，用于串台判定与全部转发断言）。
+x-target-common: &target-common
+  image: busybox:1.36
+  restart: unless-stopped
+  networks:
+    - wp14-ingress-data
+    - wp14-egress-data
+
+services:
+  # ---------------------------------------------------------------- 控制面
+  panel:
+    image: ${TUNEX_BACKEND_IMAGE:?TUNEX_BACKEND_IMAGE is required (see setup.sh)}
+    container_name: wp14-panel
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      SOCKET_PORT: "3001"
+      TZ: Asia/Shanghai
+      SITE_URL: ${SITE_URL:-http://127.0.0.1:18181}
+      DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
+      REDIS_URL: redis://redis:6379
+      AUTH_SECRET: ${AUTH_SECRET:?required}
+      LICENSE_SECRET: ${LICENSE_SECRET:?required}
+      TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
+      TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
+      JWT_ISSUER: wp14
+      JWT_TTL_SECONDS: "43200"
+      COOKIE_SECURE: "false"
+      ALLOW_REGISTER_FALLBACK: "true"
+      DISABLE_WORKER: "false"
+      RATE_LIMIT_ENABLED: "true"
+      AUDIT_LOG_ENABLED: "true"
+      LOG_DIR: /logs
+    # 只挂控制面网段：面板不接入任何数据面网络，无法拨号 agent 的数据端口。
+    networks:
+      wp14-ctrl:
+        aliases: [panel]
+    ports:
+      - "${WP14_PANEL_HTTP_PORT:-18180}:3000"
+      - "${WP14_PANEL_SOCKET_PORT:-18181}:3001"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # 数据面依赖（独立栈，不影响 /opt/TuneX 与 net01 栈）
+  mysql:
+    image: mysql:8.4.11
+    container_name: wp14-mysql
+    restart: unless-stopped
+    command: --skip-log-bin --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?required}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-tunex}
+    volumes:
+      - wp14_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:?required}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [wp14-ctrl]
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: wp14-redis
+    restart: unless-stopped
+    # 关 AOF：与生产纪律一致（Redis 只放 TTL 会话/租约/缓存）。
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [wp14-ctrl]
+
+  # db-migrate：migrate deploy + seed（一次性，成功后退出）
+  db-migrate:
+    image: ${TUNEX_BACKEND_IMAGE:?required}
+    container_name: wp14-db-migrate
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
+      REDIS_URL: redis://redis:6379
+      SITE_URL: ${SITE_URL:-http://127.0.0.1:18181}
+      AUTH_SECRET: ${AUTH_SECRET:?required}
+      LICENSE_SECRET: ${LICENSE_SECRET:?required}
+      TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
+      TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
+      JWT_ISSUER: wp14
+    command: ["sh", "-c", "bunx prisma migrate deploy && bun prisma/seed.ts"]
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [wp14-ctrl]
+
+  # ------------------------------------------------------------ 入口 Agent
+  # 真实 Go agent（见 agent/）。只映射 fixture 固定的两个隧道端口到 host，
+  # 供 harness 以真实客户端身份拨入；不暴露任何控制端口（agent 代理理由
+  # Socket.IO 主动出站，见 scripts/v3-e2e/README.md「仅出站」论证）。
+  ingress-agent:
+    image: ${WP14_AGENT_IMAGE:?WP14_AGENT_IMAGE is required (see setup.sh)}
+    container_name: wp14-ingress-agent
+    restart: unless-stopped
+    command:
+      - -s
+      - ${SITE_URL:-http://127.0.0.1:18181}
+      - -t
+      - ${WP14_INGRESS_TOKEN:?WP14_INGRESS_TOKEN is required (setup.sh 写入)}
+      - -n
+      - WP14-IN-A-NODE
+      - -i
+      - 0.0.0.0
+      - -d
+    networks:
+      wp14-ctrl:
+        aliases: [ingress-agent]
+      wp14-ingress-data:
+        aliases: [ingress-agent]
+      wp14-egress-data:
+        aliases: [ingress-agent]
+    ports:
+      # 18201 = DIRECT 隧道 wp14-direct；18202 = RELAY 隧道 wp14-relay
+      - "${WP14_INGRESS_PORT_DIRECT:-18201}:21001"
+      - "${WP14_INGRESS_PORT_RELAY:-18202}:21002"
+
+  # ------------------------------------------------------- 出口 Agent（仅出站）
+  # **没有任何 host 端口映射**：外部（含控制面）无法主动拨号它；只有同一
+  # compose 网络里的 ingress-agent 能拨它的 egressPort。这等价于 NAT/私网
+  # 内、仅可主动出站的出口节点。
+  egress-agent:
+    image: ${WP14_AGENT_IMAGE:?required}
+    container_name: wp14-egress-agent
+    restart: unless-stopped
+    command:
+      - -s
+      - ${SITE_URL:-http://127.0.0.1:18181}
+      - -t
+      - ${WP14_EGRESS_TOKEN:?WP14_EGRESS_TOKEN is required (setup.sh 写入)}
+      - -n
+      - WP14-OUT-A-NODE
+      - -i
+      - 0.0.0.0
+      - -d
+    networks:
+      # 刻意**不接 wp14-ctrl**：控制通道由 agent 主动出站完成（docker 内网
+      # 三个网段的域名解析皆可用，实际连接方向恒为 egress-agent -> panel）。
+      wp14-egress-data:
+        aliases: [egress-agent]
+
+  # ---------------------------------------------------------- Target A / B
+  # busybox nc：`-lk` 持续 accept，`-e` 每个连接回带 marker 字符串。
+  # 回串标记与 fixtures/README.json 的 markers 段一致，用于串台判定。
+  target-a:
+    <<: *target-common
+    container_name: wp14-target-a
+    # busybox `nc -lk -p <port> -e <cmd>`：持续 accept，每个新连接由 -e 起的子进程
+    # 把 marker 写回客户端。整个测试栈的"回显标记"真相源唯一（fixtures/README.json）。
+    command: ["sh", "-c", "nc -lk -p 3030 -e echo WP14-TARGET-A"]
+    hostname: wp14-target-a
+
+  target-b:
+    <<: *target-common
+    container_name: wp14-target-b
+    command: ["sh", "-c", "nc -lk -p 3030 -e echo WP14-TARGET-B"]
+    hostname: wp14-target-b
+
+volumes:
+  wp14_mysql_data:
+    name: wp14_mysql_data
+
+networks:
+  # 控制面网段：panel + 两个 agent。注意 agent 侧的连接方向恒为 agent -> panel。
+  wp14-ctrl:
+    name: wp14_ctrl
+    driver: bridge
+  # 入口数据面：ingress-agent + Target A/B（内部网段，无外网出口）
+  wp14-ingress-data:
+    name: wp14_ingress_data
+    driver: bridge
+    internal: true
+  # 出口数据面：ingress-agent + egress-agent + Target A/B（内部网段）
+  wp14-egress-data:
+    name: wp14_egress_data
+    driver: bridge
+    internal: true
