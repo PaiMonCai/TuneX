@@ -1,10 +1,10 @@
 # TuneX
 
-> 面向个人与团队的多租户隧道控制面：管理账号、Workspace、节点、隧道、权限策略与 Agent 配置分发。
+> 面向个人与团队的多租户端口转发控制面：管理 Workspace、节点、入口/出口绑定、端口转发与 Agent。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
 
-TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户在控制台创建个人或团队 Workspace，部署 Agent，再通过控制面管理节点与隧道。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
+TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户先在控制台创建 Node，复制一键安装命令到 Linux 节点执行，然后直接在入口节点上创建 PortForward；不选出口就是 DIRECT，选择已绑定出口就是 RELAY。内部 `Tunnel` 只作为 revision/ACK/NodePortLease/Reconciler 的运行时对象，不再要求用户手工创建。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
 
 > [!IMPORTANT]
 > TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 升级验证、Workspace/RBAC、节点级凭据、TCP DIRECT/RELAY v3 数据面与真实 Docker 集成 Gate。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署请使用 `docker-compose.prod.yaml`、Caddy TLS 与生产环境密钥。**
@@ -17,12 +17,31 @@ TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用
 | Workspace | 个人空间、团队空间、成员邀请、owner/admin/member/viewer 固定角色 |
 | 权限 | Workspace RBAC、CapabilityPolicy、默认免费策略、节点组授权 |
 | 安全 | CSRF、请求限流、审计、API/订阅密钥哈希存储与一次性轮换 |
-| 隧道/节点 | INGRESS/EGRESS/BOTH 节点、TCP DIRECT/RELAY、NodePortLease、revision/ACK、重启恢复与 Reconciler |
+| 节点/转发 | Node 一键 enrollment、INGRESS/EGRESS/BOTH、Ingress↔Egress Binding、Node-first PortForward、TCP DIRECT/RELAY、NodePortLease、revision/ACK、重启恢复与 Reconciler |
 | Web | Next.js 管理控制台、Workspace 切换与成员管理、设置页 |
 | CI | Backend/Web/Agent、秘密扫描、空库/升级迁移、真实 DIRECT/RELAY E2E、统一 GHCR 镜像构建 |
 | 运维 | Compose、Caddy、备份/恢复/告警/容量脚本基础框架 |
 
 后续开发方向、依赖 Gate、迁移规则与 DoD 统一以 [DEVELOPMENT.md](DEVELOPMENT.md) 为准；[docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md) 只作为长期目标架构约束。
+
+### 用户侧模型
+
+```text
+Ingress Node
+├─ PortForward（不选择出口）──────────────→ Target       # DIRECT
+└─ PortForward（选择已绑定 Egress）──────→ Egress → Target # RELAY
+
+Egress Node
+└─ 先与 Ingress 建立 Binding，之后才会出现在该入口的出口选项中
+```
+
+典型使用流程：
+
+1. 在「节点与转发」创建 Node，选择 `INGRESS`、`EGRESS` 或 `BOTH`。
+2. Panel 返回一条可复制的一键安装命令；命令只携带 10 分钟、一次性的 enrollment token。
+3. 在节点机器执行命令后，Agent 自动下载、换取长期 per-node credential、注册 systemd 并主动连接 Panel。
+4. 选择一个入口 Node；需要 RELAY 时先绑定出口 Node。
+5. 在入口 Node 上直接「添加端口转发」：不选出口 = DIRECT，选择已绑定出口 = RELAY。
 
 ## 架构
 
@@ -190,18 +209,41 @@ cd agent
 go build -o tunex-agent .
 ```
 
-### 运行
+### 一键安装（推荐）
 
-在控制台/API 中创建具体 Node 后会签发一次性的 **per-node credential**。Agent 使用该凭据主动连接 Panel；生产控制链不要求 Panel 反向访问 Agent 的公网管理端口：
+在「节点与转发」创建 Node 后，Panel 会显示类似下面的一条命令：
+
+```bash
+curl -fsSL 'https://panel.example.com/api/internal/node/install.sh' | \
+  sudo sh -s -- \
+  --panel 'https://panel.example.com' \
+  --enroll-token '<10-minute-one-time-token>' \
+  --role 'INGRESS' \
+  --ingress-range '10000-30000'
+```
+
+安装脚本会从**当前 Panel 镜像**下载与 Panel 版本匹配的 `linux/amd64` 或
+`linux/arm64` Agent，原子消费 enrollment token 换取真正的 per-node
+credential，将凭据写入 root-only `/etc/tunex-agent/agent.env`，然后安装并启动
+`tunex-agent.service`。enrollment token 只能使用一次，重新生成安装命令会撤销
+该节点尚未使用的旧 token。
+
+生产控制链仍然只有 **Agent → Panel 出站 HTTPS**；不要求 Panel 反向访问
+Agent 的公网管理端口。
+
+### 手工运行（调试）
+
+如果已经有节点的 per-node credential，也可以直接运行：
 
 ```bash
 ./tunex-agent \
   --panel-http-url https://panel.example.com \
-  --node-credential <one-time-node-credential> \
+  --node-credential '<node-credential>' \
   --node-id edge-hkg-01 \
   --role BOTH \
   --ingress-range 10000-30000 \
-  --egress-range 30001-60000
+  --egress-range 30001-60000 \
+  --agent-admin-port 0
 ```
 
 常用参数：
@@ -309,8 +351,8 @@ GitHub Actions 会执行：
 - **backend**：依赖安装、Prisma migration、类型检查、HTTP/授权测试、旧数据库升级验证；
 - **web**：依赖安装、TypeScript 类型检查、Next.js build；
 - **agent**：`go vet`、`go test`、`go build`、Linux amd64/arm64 交叉编译；
-- **v3-integration**：启动真实 MySQL/Redis/Panel/双 Agent/Target Docker 拓扑，验证 DIRECT、RELAY、NodePortLease、重启恢复、凭据与 Reconciler；
-- **unified-image**：在 v3 Gate 通过后构建统一 TuneX 镜像，并验证 Bun、Node、Next standalone 与两份 Compose；
+- **v3-integration**：启动真实 MySQL/Redis/Panel/双 Agent/Target Docker 拓扑，通过一次性 enrollment 注册 Agent，再经 NodeBinding + PortForward API 验证 DIRECT、RELAY、NodePortLease、重启恢复、凭据与 Reconciler；
+- **unified-image**：在 v3 Gate 通过后构建统一 TuneX 镜像，并验证 Bun、Node、Next standalone、两份 Compose，以及内置的 amd64/arm64 Agent 安装制品；
 - **images**：仅在 push 事件下推送 `ghcr.io/paimoncai/tunex:{latest,<git-sha>}`。
 
 本地常用检查：
