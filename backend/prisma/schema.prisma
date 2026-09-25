@@ -596,6 +596,23 @@ model Tunnel {
 
   port_leases NodePortLease[]
 
+  // ── V4-WP1 增量字段（Forward Revision Foundation，迁移 20260927090000）──
+  //
+  // desired_revision_id 指向 forward_revision 表里**最新**的一条 snapshot，
+  // 是「用户当前想跑什么」的权威指针。不加外键的两个理由：
+  //   1. forward_revision.tunnel_id 已是 ON DELETE CASCADE 指向 tunnel，
+  //      再加一条反向 FK 会形成循环级联路径，MySQL 深删时会走进锁竞争；
+  //   2. 这是高频更新列（每次编辑都写），外键校验会给它加多余的 JOIN 成本。
+  // 读取方必须校验 `desired_revision_id` 指向的行 revision == tunnel.config_revision；
+  // 不匹配时按「从兼容投影列推算」降级并打日志，**绝不 fail-open 到旧配置**。
+  //
+  // 可空理由（expand-and-contract）：存量 Forward 从未有过 snapshot，
+  // NULL = 「V4-WP1 之前创建，尚未被编辑过一次」。V4 代码读到 NULL 时按
+  // 当前投影列合成基线（见 services/forward-revision.ts 的 baselineSnapshot）。
+  desired_revision_id Int?
+  /// V4-WP1：不可变 revision snapshot 历史（一对多，随 Tunnel 级联删除）。
+  forward_revisions ForwardRevision[]
+
   // Node-first 后物理唯一性由 NodePortLease(node_id, port) 保证。
   // 同一 NodeGroup 内不同入口节点允许复用相同 listen_port。
   @@index([in_node_group_id, listen_port])
@@ -606,6 +623,70 @@ model Tunnel {
   @@index([egress_pool_id])
   @@index([apply_status])
   @@map("tunnel")
+}
+
+/// V4-WP1 Forward Revision Snapshot（DEVELOPMENT.md §13.3.2）。
+///
+/// **Revision snapshot 不可原地修改**：`@@unique([tunnel_id, revision])` 保证
+/// 同一 (tunnel, version) 只有一条，且没有任何代码路径 update/delete 已写入的
+/// 行（删除只可能随 Tunnel 级联发生，见下方 tunnel 关系的 onDelete）。
+///
+/// 分层语义：本表**不是第二张用户业务真相表**。Forward 的产品身份仍在
+/// `tunnel` 行（name / id / 归属 / 兼容投影列）；本表只承载「某个 revision
+/// 时刻的完整 runtime 配置」，用于 §13.3.2 要求的可恢复性与 WP3 的
+/// compensation（回退到 applied_revision 对应的 snapshot）。
+///
+/// 至少可恢复 §13.3.2 列出的运行态相关配置：
+///   mode / ingress_node_id / egress_node_id /
+///   requested listen_port（含自动分配语义：NULL）/ target_host / target_port
+/// 另外保存 egress_pool_id + egress_port + targets 快照与 desired_status，
+/// 让 RELAY 的恢复不需要反查当前池状态（池的目标可能在 revision 之后被改）。
+///
+/// 为什么节点/池列**不加外键**：snapshot 的历史性正是它的价值——节点被删后，
+/// 「revision 12 当时跑在哪个节点上」这个事实不能被 `ON DELETE SET NULL`
+/// 抹掉。悬空引用的校验是读取方（WP3 rollout 前必须确认节点仍存在）的职责，
+/// 不是数据库该静默改写历史的地方。与 `node_port_lease.tunnel_id` 的无 FK
+/// 先例同一取向（见该 model 注释）。
+model ForwardRevision {
+  id       Int @id @default(autoincrement())
+  tunnel_id Int
+  /// 随 Forward 共存亡：删 Tunnel 会删掉它的 revision 历史。
+  /// 注意这与「删除 Forward 不得删除历史流量/审计」不冲突——那两类数据在
+  /// `tunnel_traffic` / `audit_log`，不是本表。
+  tunnel   Tunnel @relation(fields: [tunnel_id], references: [id], onDelete: Cascade)
+  /// 单调递增，与 tunnel.config_revision 同值（同一事务内写入）。
+  revision Int
+  /// 保存这一刻的名称。允许与 tunnel.name 不同（可能只改了名）：
+  /// snapshot 是 runtime 配置，改名不生成 snapshot（§13.3.2）。
+  name String @db.VarChar(255)
+  /// 保存这一刻的期望状态。`suspended` 编辑 = 存 desired 不启 runtime（§13.3.6）。
+  desired_status String @db.VarChar(20)
+
+  mode TunnelMode
+  ingress_node_id Int
+  egress_node_id  Int?
+  /// 用户请求的监听端口；NULL = 「自动分配」。与创建 contract 同义：
+  /// 编排器会在 apply 时落到 concrete port 并写回 tunnel.listen_port，
+  /// 但 snapshot 保留的是**请求值**，才能还原「用户当时要自动还是指名」。
+  listen_ip   String?
+  listen_port Int?
+  /// DIRECT 目标；RELAY 为 NULL（目标在 targets 快照里）。
+  target_host String? @db.VarChar(255)
+  target_port Int?
+  /// RELAY 出口池 + 节点间内部端口；DIRECT 为 NULL。
+  egress_pool_id Int?
+  egress_port    Int?
+  /// RELAY 保存时刻的 active EgressTarget 快照（[{host,port,weight,order_by}]）。
+  /// 为什么必须冗余：§2.2 的硬规则是「目标修改只更新目标快照，不重建隧道」，
+  /// 因此池内容可能在 revision 之后变化；只有 snapshot 能还原当时的完整配置。
+  targets Json?
+  /// 保存人（审计上下文）。无 FK：用户删除不得改写 runtime 历史。
+  created_by_id Int?
+  created_at    DateTime @default(now())
+
+  @@unique([tunnel_id, revision])
+  @@index([tunnel_id, created_at])
+  @@map("forward_revision")
 }
 
 model TunnelChain {
