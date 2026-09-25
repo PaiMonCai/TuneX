@@ -155,12 +155,6 @@ jobs:
           # Windows target intentionally omitted: the agent uses Linux-only syscalls
           # (netutil/statfs.go -> syscall.Statfs), so GOOS=windows fails to build.
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunex-agent
-          path: agent/dist/
-          retention-days: 14
-
   agent-image:
     needs: [agent]
     runs-on: ubuntu-latest
@@ -192,8 +186,8 @@ jobs:
           bash scripts/v3-e2e/setup.sh
           bash scripts/v3-e2e/verify.sh
       - name: Upload v3 integration evidence
-        if: always()
-        uses: actions/upload-artifact@v4
+        if: failure() || github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
         with:
           name: v3-integration-evidence
           path: scripts/v3-e2e/evidence/
