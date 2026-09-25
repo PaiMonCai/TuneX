@@ -138,6 +138,28 @@ describe("V4 forward product contract", () => {
     for (const row of errors.body) expect(row.apply_status).toBe("error");
   });
 
+  test("ingress and egress filters use actual Node ids", async () => {
+    const ingress = await call<PortForward[]>(
+      "GET",
+      "/forwards?ingress_node_id=1",
+    );
+    expect(ingress.status).toBe(200);
+    expect(ingress.body.length).toBeGreaterThan(0);
+    for (const row of ingress.body) {
+      expect(Number(row.ingress_node_id)).toBe(1);
+    }
+
+    const egress = await call<PortForward[]>(
+      "GET",
+      "/forwards?egress_node_id=4",
+    );
+    expect(egress.status).toBe(200);
+    for (const row of egress.body) {
+      expect(Number(row.egress_node_id)).toBe(4);
+      expect(row.mode).toBe("relay");
+    }
+  });
+
   test("runtime actions and traffic stay on the Forward API", async () => {
     const created = await call<PortForward>("POST", "/forwards", {
       name: "runtime-v4",
