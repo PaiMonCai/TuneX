@@ -42,6 +42,7 @@ import type {
   PortForward,
   ForwardCreateInput,
   ForwardPatchInput,
+  ForwardSummary,
   ProvisionNodeResult,
   Payment,
   Plan,
@@ -418,6 +419,8 @@ export const api = {
       get<TunnelEgressPoolOption[]>("/egress-pools", query, cookie),
   },
   forwards: {
+    summary: (cookie?: string) =>
+      get<ForwardSummary>("/forwards/summary", undefined, cookie),
     list: (query?: ListQuery, cookie?: string) =>
       get<PortForward[]>("/forwards", query, cookie),
     detail: (id: ID, cookie?: string) =>
