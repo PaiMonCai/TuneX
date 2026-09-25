@@ -149,7 +149,7 @@ async function registerSchedules() {
       await queue.upsertJobScheduler(j.name, { every: j.everyMs }, { name: j.name });
     }
   }
-  console.log(`[worker] registered ${CRON_JOBS.length} cron schedulers`);
+  console.log(`[worker] registered ${CRON_JOBS.length} cron schedulers: ${CRON_JOBS.map((j) => j.name).join(",")}`);
 }
 
 async function main() {
