@@ -36,6 +36,8 @@ function resetState(): void {
   users.length = 0;
   rows.length = 0;
   nextId = 1;
+  deadlockBudget = 0;
+  txOptionsSeen.length = 0;
 }
 
 /**
@@ -99,6 +101,11 @@ const tx: Tx = {
       // MySQL 侧 `used_at` 无默认值，但 Prisma 的可空 DateTime 允许 JSON null / undefined；
       // 这里统一补 null，模拟「新建即未使用」。
       const row: Row = { ...data, id: nextId++, used_at: data.used_at ?? null };
+      // 死锁注入：预算 >0 时抛 Prisma 形状的 P2034（活锁重试用例会覆写本方法）。
+      if (deadlockBudget > 0) {
+        deadlockBudget--;
+        throw deadlockError();
+      }
       rows.push(row);
       return row;
     },
@@ -138,8 +145,31 @@ const tx: Tx = {
   },
 };
 
+/**
+ * 死锁注入替身：让接下来的 create 抛 P2034（伪造 Prisma 的形状与错误码）。
+ * 每个用例按需开预算，验证 issueEmailToken 会重试而不是把错抛给调用方。
+ */
+let deadlockBudget = 0;
+function deadlockError(): Error {
+  const e = new Error(
+    "\nInvalid `tx.emailVerification.create()` invocation in\nTransaction failed due to a write conflict or a deadlock. Please retry your transaction",
+  );
+  Object.defineProperties(e, {
+    name: { value: "PrismaClientKnownRequestError", configurable: true },
+    code: { value: "P2034", configurable: true },
+    clientVersion: { value: "test", configurable: true },
+  });
+  return e;
+}
+
+/** 记录被测代码传给 $transaction 的选项（断言隔离级别）。 */
+const txOptionsSeen: unknown[] = [];
+
 const dbStub = {
-  $transaction: async (fn: (t: Tx) => unknown) => fn(tx),
+  $transaction: async (fn: (t: Tx) => unknown, options?: unknown) => {
+    if (options) txOptionsSeen.push(options);
+    return fn(tx);
+  },
   emailVerification: tx.emailVerification,
   user: tx.user,
 };
@@ -186,11 +216,102 @@ describe("issueEmailToken", () => {
   });
 
   test("验证邮件 24h / 重置 1h，各自按用途计时", async () => {
+    // 把 expiresAt 夹在「调用前后」两个时钟读数之间：无论进程被事件循环卡多久，
+    // t0 <= expiresAt - ttl <= t1 恒成立（此前固定容差 1-2ms，在慢机器/CI 上 flake）。
+    const t0 = Date.now();
     const v = await tokens.issueEmailToken(7, "alice@example.test", "email_verify");
     const r = await tokens.issueEmailToken(7, "alice@example.test", "password_reset");
-    // 容差 1ms：被测模块与服务分别在两个时刻读 Date.now()，跨毫秒属正常。
-    expect(Math.abs(v.expiresAt.getTime() - realNow() - 24 * 60 * 60 * 1000)).toBeLessThanOrEqual(1);
-    expect(Math.abs(r.expiresAt.getTime() - realNow() - 60 * 60 * 1000)).toBeLessThanOrEqual(1);
+    const t1 = Date.now();
+    const vBase = v.expiresAt.getTime() - 24 * 60 * 60 * 1000;
+    const rBase = r.expiresAt.getTime() - 60 * 60 * 1000;
+    expect(vBase).toBeGreaterThanOrEqual(t0);
+    expect(vBase).toBeLessThanOrEqual(t1);
+    expect(rBase).toBeGreaterThanOrEqual(t0);
+    expect(rBase).toBeLessThanOrEqual(t1);
+    // 两个 TTL 之间的差就是两个用途的定义差（跨毫秒边界也只差 1ms）
+    expect(
+      Math.abs(v.expiresAt.getTime() - r.expiresAt.getTime() - (24 * 60 * 60 - 60 * 60) * 1000),
+    ).toBeLessThanOrEqual(1000);
+  });
+
+  test("事务显式用 ReadCommitted：消除 REPEATABLE READ 下二级索引 gap 锁互撞", async () => {
+    await tokens.issueEmailToken(7, "alice@example.test", "email_verify");
+    const opts = txOptionsSeen.at(-1) as { isolationLevel?: string } | undefined;
+    // MySQL 8.4 / InnoDB：RR 的 updateMany 在 (user_id, purpose) 上加 next-key lock，
+    // 并发 INSERT 的 insert intention 拿不到同一 gap → 1213 deadlock。
+    // email_verification 没有「范围内并发读」语义，SoRC 足够且不改变任何业务行为。
+    expect(opts?.isolationLevel).toBe("ReadCommitted");
+  });
+
+  test("P2034 死锁自动重试：前两次抛错后第三次成功，调用方无感", async () => {
+    deadlockBudget = 2;
+    const issued = await tokens.issueEmailToken(7, "alice@example.test", "email_verify");
+    expect(issued.token).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].used_at).toBeNull();
+    // 三次尝试（2 次死锁 + 1 次成功）都带同样的隔离级别选项
+    expect(txOptionsSeen).toHaveLength(3);
+    for (const o of txOptionsSeen) expect((o as { isolationLevel?: string }).isolationLevel).toBe("ReadCommitted");
+    // 签出来的 token 是可用的
+    expect((await tokens.consumeEmailToken(issued.token, "email_verify")).ok).toBe(true);
+  });
+
+  test("P2034 超过重试上限才抛错（不能无限重试把请求挂死）", async () => {
+    deadlockBudget = 99;
+    let error: unknown;
+    try {
+      await tokens.issueEmailToken(7, "alice@example.test", "email_verify");
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeDefined();
+    expect((error as { code?: string })?.code).toBe("P2034");
+    expect(txOptionsSeen.length).toBe(3); // DEADLOCK_MAX_ATTEMPTS = 3
+  });
+
+  test("P2028（事务池瞬时竞争）同样重试，而非直接 500", async () => {
+    const apiError = new Error("Transaction API error: Unable to start a transaction in the given time.");
+    Object.defineProperties(apiError, {
+      name: { value: "PrismaClientKnownRequestError", configurable: true },
+      code: { value: "P2028", configurable: true },
+    });
+    const original = tx.emailVerification.create;
+    tx.emailVerification.create = async () => {
+      throw apiError;
+    };
+    try {
+      let error: unknown;
+      try {
+        await tokens.issueEmailToken(7, "alice@example.test", "email_verify");
+      } catch (e) {
+        error = e;
+      }
+      expect(txOptionsSeen).toHaveLength(3);
+      expect((error as { code?: string })?.code).toBe("P2028");
+    } finally {
+      tx.emailVerification.create = original;
+    }
+  });
+
+  test("非死锁错误不重试、立即抛出", async () => {
+    // create 抛一个普通错（非 P2034/P2028）：必须原样抛出一次，不能吞。
+    const boom = new Error("boom-not-a-lock-conflict");
+    const original = tx.emailVerification.create;
+    tx.emailVerification.create = async () => {
+      throw boom;
+    };
+    try {
+      let error: unknown;
+      try {
+        await tokens.issueEmailToken(7, "alice@example.test", "email_verify");
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBe(boom);
+      expect(txOptionsSeen).toHaveLength(1);
+    } finally {
+      tx.emailVerification.create = original;
+    }
   });
 
   test("同一用户同用途发新 token 时，旧的立即作废", async () => {
@@ -277,9 +398,14 @@ describe("issueForgotPasswordToken（邮箱枚举防护）", () => {
   });
 
   test("邮箱存在 → 正常签发 1h 重置 token", async () => {
+    // 同上方「TTL 计时」用例的思路：把 expiresAt 夹在调用前后的时钟读数之间。
+    const t0 = Date.now();
     const issued = await tokens.issueForgotPasswordToken("alice@example.test");
+    const t1 = Date.now();
     expect(issued).not.toBeNull();
-    expect(Math.abs(issued!.expiresAt.getTime() - realNow() - 60 * 60 * 1000)).toBeLessThanOrEqual(1);
+    const base = issued!.expiresAt.getTime() - 60 * 60 * 1000;
+    expect(base).toBeGreaterThanOrEqual(t0);
+    expect(base).toBeLessThanOrEqual(t1);
     expect(rows).toHaveLength(1);
     expect(rows[0].purpose).toBe("password_reset");
   });
