@@ -476,13 +476,30 @@ export async function acquirePort(
   }
 
   // DB 侧已占用的端口（一次批量查询，避免 N+1；只看 active，released 行不占位）。
+  // 同一 Tunnel 以同方向重入自己已经持有的 preferred port 是幂等续用，不是冲突。
+  // suspend 只停 runtime、不释放 durable lease，因此 resume 必须能原端口恢复。
   const activeRows = (await pdb.nodePortLease.findMany({
     where: { node_id: input.nodeId, status: LEASE_STATUS.active },
-    select: { port: true },
-  })) as { port: number }[];
-  for (const row of activeRows) reserved.add(row.port);
+    select: { id: true, port: true, tunnel_id: true, lease_type: true },
+  })) as Array<{ id: number; port: number; tunnel_id: number | null; lease_type: LeaseDirection }>;
 
   const isPreferred = input.preferredPort !== undefined && input.preferredPort !== null;
+  if (isPreferred && input.tunnelId !== null && input.tunnelId !== undefined) {
+    const held = activeRows.find((row) => row.port === input.preferredPort);
+    if (held && held.tunnel_id === input.tunnelId && held.lease_type === input.leaseType) {
+      return {
+        ok: true,
+        result: {
+          port: held.port,
+          leaseId: held.id,
+          leaseType: held.lease_type,
+          tunnelId: held.tunnel_id,
+          reused: true,
+        },
+      };
+    }
+  }
+  for (const row of activeRows) reserved.add(row.port);
 
   // 预分配默认 TTL：NULL expiry 的预分配是 reconcile 收不回的孤儿
   // （删隧道会把 tunnel_id 打成 NULL，无法与「活着的新建中」区分）。
@@ -570,8 +587,30 @@ export async function acquirePort(
         };
       } catch (e) {
         if (!isUniqueConflict(e)) throw e;
-        // 已被别人占用（DB 唯一键）→ 下一个候选端口。
-        // user-specified 场景候选集只有一个 → 循环结束，落到底部 port_taken。
+        // 并发的重复 apply 可能在 activeRows 快照之后抢先创建了同一租约。
+        // 重新读 holder：只有同 Tunnel + 同方向才按幂等成功收敛；其它情况仍是冲突。
+        if (input.tunnelId !== null && input.tunnelId !== undefined) {
+          const holder = (await pdb.nodePortLease.findUnique({
+            where: { node_id_port: { node_id: input.nodeId, port } },
+          })) as LeaseRow | null;
+          if (
+            holder?.status === LEASE_STATUS.active &&
+            holder.tunnel_id === input.tunnelId &&
+            holder.lease_type === input.leaseType
+          ) {
+            return {
+              ok: true,
+              result: {
+                port,
+                leaseId: holder.id,
+                leaseType: holder.lease_type,
+                tunnelId: holder.tunnel_id,
+                reused: true,
+              },
+            };
+          }
+        }
+        // 已被其它所有者占用 → 下一个候选端口；user-specified 最终返回 port_taken。
       }
     } finally {
       if (gotLock) await unlock(rdb, scope, input.nodeId, port);
