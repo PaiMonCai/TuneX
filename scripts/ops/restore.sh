@@ -257,14 +257,16 @@ if [[ $DRY_RUN -ne 1 && -f "$BK_DIR/$ENC_CFG" ]]; then
   verify_and_decrypt "$BK_DIR/$ENC_CFG" "$WORK/config.tar.gz"
   tar -xzf "$WORK/config.tar.gz" -C "$WORK"
   find "$WORK/config" -type f | sed 's/^/  /'
-  log "  注意：.env / Caddyfile 未自动覆盖。如需恢复："
+  log "  注意：.env / Caddyfile* / compose 未自动覆盖。如需恢复请先人工 diff："
   log "    diff -u $PROJECT_ROOT/.env $WORK/config/env"
   log "    diff -u $PROJECT_ROOT/Caddyfile $WORK/config/Caddyfile"
+  [[ -f "$WORK/config/Caddyfile.prod" ]] && log "    diff -u $PROJECT_ROOT/Caddyfile.prod $WORK/config/Caddyfile.prod"
+  [[ -f "$WORK/config/docker-compose.standalone.yaml" ]] && log "    diff -u $PROJECT_ROOT/docker-compose.standalone.yaml $WORK/config/docker-compose.standalone.yaml"
 fi
 
 log "✅ 恢复完成"
 log "  后续验证："
 log "    1. docker compose ps（全部 healthy）"
-log "    2. curl -fsS http://127.0.0.1:${CADDY_HTTP_PORT:-9091}/healthz"
+log "    2. curl -fsS ${RESTORE_HEALTH_URL:-http://127.0.0.1:${TUNEX_HTTP_PORT:-13000}/healthz}"
 log "    3. 后台登录 / 抽 1 个 workspace 核对 tunnel 数据"
 exit 0
