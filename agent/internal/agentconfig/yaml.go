@@ -98,6 +98,18 @@ func setScalar(cfg *Config, key, val string) {
 		if n, err := strconv.Atoi(val); err == nil {
 			cfg.PprofPort = n
 		}
+	case "role":
+		cfg.Role = val
+	case "panel-http-url", "panel_http_url":
+		cfg.PanelHTTPURL = val
+	case "agent-admin-token", "agent_admin_token":
+		cfg.AgentAdminToken = val
+	case "agent-admin-port", "agent_admin_port":
+		cfg.AgentAdminPort = atoi(val)
+	case "ingress-range", "ingress_range":
+		cfg.IngressRange = val
+	case "egress-range", "egress_range":
+		cfg.EgressRange = val
 	case "tcp-port":
 		cfg.TCPPort = atoi(val)
 	case "udp-port":

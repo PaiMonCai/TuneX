@@ -29,6 +29,20 @@ type Config struct {
 	VnstatInterface string
 	PprofPort       int
 
+	// v3 runtime (WP4). These are additive: the legacy DIRECT path never reads
+	// them, so a node running the old engine can leave them unset.
+	// Role is the node role: INGRESS / EGRESS / BOTH (empty = BOTH via legacy
+	// only). PanelHTTPURL is the place the heartbeat reporter posts to.
+	// AgentAdminPort is the admin HTTP plane's port (0 disables it).
+	Role            string
+	PanelHTTPURL    string
+	AgentAdminPort  int
+	AgentAdminToken string
+	// IngressRange / EgressRange optionally pin the ports the v3 managers may
+	// bind, in the same "80,443,30000-30010" syntax as PortRange.
+	IngressRange string
+	EgressRange  string
+
 	// Per-protocol fixed listen ports (0 = dynamic / WAIT_LISTEN).
 	TCPPort   int
 	UDPPort   int
@@ -42,6 +56,34 @@ type Config struct {
 
 	ShowVersion bool
 	ConfigFile  string
+}
+
+// Node roles (the panel's NodeRole enum).
+const (
+	// RoleIngress runs ingress tunnels only (DIRECT/RELAY listeners).
+	RoleIngress = "INGRESS"
+	// RoleEgress runs the egress target pools only.
+	RoleEgress = "EGRESS"
+	// RoleBoth runs both in one process; the shared port guard is what keeps
+	// the two ranges from clashing.
+	RoleBoth = "BOTH"
+
+	// DefaultAgentAdminPort is the v3 admin plane port (devmap §8: 9090).
+	DefaultAgentAdminPort = 9090
+)
+
+// NormalizeRole maps a raw role value to one of the three canonical roles.
+// Empty or unknown values become BOTH, which is the permissive default for a
+// freshly provisioned node (the legacy engine has no role concept).
+func NormalizeRole(role string) string {
+	switch strings.ToUpper(strings.TrimSpace(role)) {
+	case RoleIngress:
+		return RoleIngress
+	case RoleEgress:
+		return RoleEgress
+	default:
+		return RoleBoth
+	}
 }
 
 // DefaultConfigFile is the original default config path.
@@ -66,8 +108,9 @@ func Parse(args []string, version string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		ConfigFile: DefaultConfigFile(),
-		PprofPort:  6060,
+		ConfigFile:     DefaultConfigFile(),
+		PprofPort:      6060,
+		AgentAdminPort: DefaultAgentAdminPort,
 	}
 
 	// Defaults from a config file / environment are read first so that explicit
@@ -112,6 +155,15 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.IntVar(&cfg.TunexPort, "tunex-port", cfg.TunexPort, "TuneX port")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "version for TuneX agent")
 	fs.BoolVar(&cfg.ShowVersion, "v", false, "version for TuneX agent (shorthand)")
+
+	// v3 runtime (WP4). All optional: a legacy node never sets them.
+	fs.StringVar(&cfg.Role, "role", cfg.Role, "Node role: INGRESS, EGRESS or BOTH (v3 runtime)")
+	fs.StringVar(&cfg.Role, "R", cfg.Role, "Node role (shorthand)")
+	fs.StringVar(&cfg.PanelHTTPURL, "panel-http-url", cfg.PanelHTTPURL, "Panel HTTP base URL for heartbeat reporting, e.g. http://panel:3001 (v3 runtime)")
+	fs.StringVar(&cfg.AgentAdminToken, "agent-admin-token", cfg.AgentAdminToken, "Bearer token for the local admin API on AGENT_ADMIN_PORT (v3 runtime)")
+	fs.IntVar(&cfg.AgentAdminPort, "agent-admin-port", cfg.AgentAdminPort, "Local admin API port; 0 disables it (v3 runtime, default 9090)")
+	fs.StringVar(&cfg.IngressRange, "ingress-range", cfg.IngressRange, "Port range the v3 ingress tunnels may bind, e.g. 10000-30000")
+	fs.StringVar(&cfg.EgressRange, "egress-range", cfg.EgressRange, "Port range the v3 egress tunnels may bind, e.g. 30001-60000")
 
 	// connect-ip is a repeatable string flag (`-i a -i b`).
 	var connectIPs stringList
@@ -158,6 +210,15 @@ func Parse(args []string, version string) (*Config, error) {
 		} else {
 			cfg.NodeID = "tunex-agent"
 		}
+	}
+	cfg.Role = NormalizeRole(cfg.Role)
+	if cfg.PanelHTTPURL != "" {
+		cfg.PanelHTTPURL = strings.TrimRight(cfg.PanelHTTPURL, "/")
+	}
+	// A configured admin port without a token would leave the mutating routes
+	// unreachable forever, so fail fast here instead of at first request.
+	if cfg.AgentAdminPort != 0 && cfg.AgentAdminToken == "" {
+		return nil, fmt.Errorf("AGENT_ADMIN_TOKEN (or -agent-admin-token) is required when AGENT_ADMIN_PORT is set")
 	}
 	return cfg, nil
 }
@@ -224,7 +285,13 @@ func applyDefaults(cfg *Config, file string) {
 	envStr("NODE_ID", &cfg.NodeID)
 	envStr("LISTEN_IP", &cfg.ListenIP)
 	envStr("PORT_RANGE", &cfg.PortRange)
+	envStr("ROLE", &cfg.Role)
+	envStr("PANEL_HTTP_URL", &cfg.PanelHTTPURL)
+	envStr("AGENT_ADMIN_TOKEN", &cfg.AgentAdminToken)
+	envStr("INGRESS_RANGE", &cfg.IngressRange)
+	envStr("EGRESS_RANGE", &cfg.EgressRange)
 	envInt("PPROF_PORT", &cfg.PprofPort)
+	envInt("AGENT_ADMIN_PORT", &cfg.AgentAdminPort)
 }
 
 func printUsage(w io.Writer, version string) {
@@ -256,6 +323,15 @@ Flags:
   -v, --version                   version for TuneX agent
   -I, --vnstat-interface string   vnstat interface to use for traffic monitoring
       --wss-port int              WSS port
+
+v3 runtime (all optional; the legacy DIRECT engine ignores them):
+      --role string               Node role: INGRESS, EGRESS or BOTH (default BOTH)
+  -R, --role string               Node role (shorthand)
+      --panel-http-url string     Panel HTTP base URL for heartbeat reporting
+      --agent-admin-token string  Bearer token for the local admin API
+      --agent-admin-port int      Local admin API port; 0 disables (default 9090)
+      --ingress-range string      Port range v3 ingress tunnels may bind
+      --egress-range string       Port range v3 egress tunnels may bind
 
 Version: %s
 `, version)
