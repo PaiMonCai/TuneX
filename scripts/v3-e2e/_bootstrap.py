@@ -133,6 +133,47 @@ def ensure_group(cookie, workspace_id, spec):
     return unwrap(body)
 
 
+def enroll_node(enrollment):
+    token = enrollment["token"]
+    request = urllib.request.Request(
+        API + "/api/internal/node/enroll",
+        data=b"",
+        method="POST",
+        headers={
+            "authorization": f"Enrollment {token}",
+            "accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = response.status
+            raw = response.read().decode()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read().decode()
+    body = json.loads(raw) if raw else {}
+    assert status == 200, f"{ERR}enroll node -> {status} {body}"
+    enrolled = unwrap(body)
+
+    # Enrollment is strictly one-time. A replay must fail closed.
+    replay = urllib.request.Request(
+        API + "/api/internal/node/enroll",
+        data=b"",
+        method="POST",
+        headers={
+            "authorization": f"Enrollment {token}",
+            "accept": "application/json",
+        },
+    )
+    try:
+        urllib.request.urlopen(replay, timeout=30)
+        raise AssertionError(f"{ERR}enrollment replay unexpectedly succeeded")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, f"{ERR}enrollment replay -> {exc.code}"
+
+    return enrolled
+
+
 def provision_node(cookie, workspace_id, group, spec):
     if not spec.get("node_id"):
         return None
@@ -152,7 +193,10 @@ def provision_node(cookie, workspace_id, group, spec):
         {"x-workspace-id": str(workspace_id)},
     )
     assert status in (200, 201), f"{ERR}provision {spec['node_id']} -> {status} {body}"
-    return unwrap(body)
+    provisioned = unwrap(body)
+    enrolled = enroll_node(provisioned["enrollment"])
+    provisioned["credential"] = enrolled["credential"]
+    return provisioned
 
 
 def list_tunnels(cookie, workspace_id):
