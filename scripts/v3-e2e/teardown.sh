@@ -16,6 +16,17 @@ set -euo pipefail
 
 REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/v3-e2e"
+ENVF="$HERE/.env.wp14"
+
+# Compose validates required substitutions even for `down`. Load the generated
+# E2E env first and provide harmless placeholders for runtime-only values.
+if [[ -f "$ENVF" ]]; then
+  set -a; . "$ENVF"; set +a
+fi
+export TUNEX_BACKEND_IMAGE=${TUNEX_BACKEND_IMAGE:-wp14-backend:ci}
+export WP14_AGENT_IMAGE=${WP14_AGENT_IMAGE:-wp14-agent:ci}
+export WP14_INGRESS_CREDENTIAL=${WP14_INGRESS_CREDENTIAL:-UNPROVISIONED}
+export WP14_EGRESS_CREDENTIAL=${WP14_EGRESS_CREDENTIAL:-UNPROVISIONED}
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 
@@ -26,7 +37,7 @@ for prefix in net01- tunex- relayx-; do
 done
 
 say "拆除 wp14-e2e 栈（容器 + 网络 + 数据卷）"
-docker compose -f "$HERE/docker-compose.e2e.yaml" down -v --remove-orphans
+docker compose -f "$HERE/docker-compose.e2e.yaml" --env-file "$ENVF" down -v --remove-orphans
 
 # 兜底：个别 compose 版本在 --remove-orphans 下仍可能留下断网容器/网络
 leftover=$(docker ps -a --format '{{.Names}}' | grep '^wp14-' || true)
