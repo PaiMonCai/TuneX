@@ -133,6 +133,11 @@ const ProvisionNode = z.object({
   node_id: z.string().trim().min(1).max(255),
   connect_ip: z.string().trim().min(1).max(255),
   role: z.enum(["ingress", "egress", "both"]).optional(),
+  targets: z.array(z.object({
+    host: z.string().trim().min(1).max(255),
+    port: z.number().int().min(1).max(65535),
+    weight: z.number().int().min(1).max(100).optional(),
+  })).max(64).optional(),
 });
 
 /**
@@ -205,11 +210,24 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       });
 
       if (role === "egress" || role === "both") {
+        const targets = parsed.data.targets ?? [];
+        if (targets.length === 0) {
+          return { invalidTargets: true } as const;
+        }
         await tx.egressPool.create({
           data: {
             node_id: node.id,
             name: "default",
             lb_strategy: "round",
+            targets: {
+              create: targets.map((target, index) => ({
+                host: target.host,
+                port: target.port,
+                weight: target.weight ?? 1,
+                order_by: (index + 1) * 1000,
+                status: "active",
+              })),
+            },
           },
         });
       }
@@ -226,6 +244,9 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       return { node } as const;
     });
 
+    if ("invalidTargets" in reserved && reserved.invalidTargets) {
+      return c.json({ error: "egress / both 节点 provision 时至少需要一个出口目标" }, 400);
+    }
     const denied = "denied" in reserved ? reserved.denied : null;
     if (denied) {
       return c.json({
