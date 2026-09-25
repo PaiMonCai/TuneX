@@ -2,12 +2,12 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { ArrowLeft } from "lucide-react";
 import { AppShell } from "@/components/app-shell";
-import { TunnelDetail } from "@/components/tunnels/tunnel-detail";
+import { ForwardDetail } from "@/components/forwards/forward-detail";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
 import { serverT } from "@/lib/server-i18n";
-import type { TrafficPoint, Tunnel } from "@/lib/types";
+import type { PortForward, TrafficPoint } from "@/lib/types";
 
 export default async function ForwardDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -15,12 +15,12 @@ export default async function ForwardDetailPage({ params }: { params: Promise<{ 
   const cookie = (await cookies()).toString();
   const { t } = await serverT();
 
-  let forward: Tunnel | null = null;
+  let forward: PortForward | null = null;
   let traffic: TrafficPoint[] = [];
   if (Number.isFinite(numericId) && numericId > 0) {
-    forward = await api.tunnels.detail(numericId, cookie).catch(() => null);
+    forward = await api.forwards.detail(numericId, cookie).catch(() => null);
     if (forward) {
-      traffic = await api.tunnels.traffic(numericId, 14, cookie).catch(() => [] as TrafficPoint[]);
+      traffic = await api.forwards.traffic(numericId, 14, cookie).catch(() => [] as TrafficPoint[]);
     }
   }
 
@@ -46,7 +46,7 @@ export default async function ForwardDetailPage({ params }: { params: Promise<{ 
 
   return (
     <AppShell title={forward.name} subtitleKey="forward.detailSubtitle" activeHref="/forwards" showToaster={false}>
-      <TunnelDetail tunnel={forward} traffic={traffic} />
+      <ForwardDetail forward={forward} traffic={traffic} />
     </AppShell>
   );
 }
