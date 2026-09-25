@@ -132,15 +132,19 @@ type SwapPlan struct {
 
 判定表（§13.3.4 的属性 → plan）：
 
+**表中 `mode 相同/不同` 指 cfg.Mode 的切换（DIRECT↔RELAY↔EGRESS）；`端口同/不同` 指 ListenPort()。** §13.3.4 对 DIRECT↔RELAY 的裁决是「Ingress listener 保持」：这一行是上游语义变化（upstream 从 RemoteHost:RemotePort 变成 NextHop），不是 listener 迁移，因此与 listen port 无关地归 `target_hot_swap`、`drain_old=false`、`free_old_port=false`——实现以冻结的 §13.3.4 为准（`PlanForwardSwap` 的 `modeMoved` 分支），下表已据实更正。
+
 | old → new | strategy | drain_old | free_old_port |
 |---|---|---|---|
 | 完全相同 | `noop` | false | false |
-| 仅 metadata（protocol/speed_limit/listen_host 之外的无数据面字段） | `metadata_only` | false | false |
-| 同 mode、同 listen port、上游不同 | `target_hot_swap` | false | true（**语义上**由 EgressManager/Pool 承担，见 §3.2） |
+| 仅 metadata（无数据面字段：speed_limit / protocol 等） | `metadata_only` | false | false |
+| 同 mode、同 listen port、上游不同 | `target_hot_swap` | false | false（端口未被移动，仍在位） |
+| **模式不同（DIRECT↔RELAY）且端口同** | `target_hot_swap`（§13.3.4「Ingress listener 保持」；上游从 target 变 next_hop，forwarder 仍只拨一个地址） | false | false |
 | 同 mode、**端口不同** | `listener_replace` | true | true |
-| 模式不同（DIRECT↔RELAY）且端口同 | `listener_replace` | true | false |
-| 模式不同且端口不同 | `listener_replace` | true | true |
+| 模式不同且端口不同 | `listener_replace`（端口迁移优先分类，同时携带上游变化） | true | true |
 | 目标为 EGRESS（池由 EgressManager 管） | `recreate`（Agent 内不支持原地 hot swap，走 Apply 既有路径） | — | — |
+
+`drain_old=false` 只表示「这一跳不 drain」：纯上游热换的旧实例就是存活下来的那个 forwarder，没有旧实例可 drain；端口迁移则先 bind 新 listener、再 drain 旧实例（§13.3.5 CUTOVER→DRAIN）。
 
 ## 3. 与既有实现的衔接（关键设计裁决）
 
@@ -222,7 +226,7 @@ CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动
 | 判定纯函数 | `PlanForwardSwap` 判定表逐行（§2.4）+ metadata/noop/recreate | CI `go test ./internal/manager/` |
 | upstream 热换 | ① 换上游后**同一端口**仍 listen；② 换前建立的连接继续转发且字节计入；③ 换后新连接走新上游；④ 新上游不可达 → 新连接被丢弃、listener 不退出 | CI 真实 loopback |
 | listener replacement | ① 换端口：新端口先活、旧端口随后不可连、旧实例被 drain；② 同端口同 mode：走既有路径且**不**重复 drain；③ bind 冲突（外国进程占端口）→ 旧实例原样运行、端口表无残留 | CI |
-| drain | ① `Drain(0)`/`Drain(巨大值)` 都有界；② drain 期间新 Apply 视该端口为占用；③ drain 后端口立即可复用 | CI |
+| drain | ① `Drain(0)`/`Drain(巨大值)` 都有界且**空闲时立即返回**；② drain 期间新 Apply 视该端口为占用；③ drain 后端口立即可复用（Remove）；④ drain 后**新连接不再被 accept**、在途连接被等待；⑤ drain 后 `SetUpstream`/`Start` 被拒（不可逆） | CI |
 | revision 幂等 | ① equal revision 二次 Apply = 同一 forwarder 指针、不 rebind、不 drain；② older revision = `ErrStaleRevision` 且**运行时未被改动**（旧连接仍在） | CI |
 | EGRESS 契约断言 | 换 target 后旧连接不中断（§13.3.4 RELAY Egress 行） | CI |
 | 既有回归 | `go test ./...` 全量（含 dataplane_test / forwarder_test / lb_test / client_test） | CI |
@@ -267,6 +271,24 @@ CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动
 3. **首次 apply 被误判成 listener 替换**。对零配置做 diff 永远呈现「端口 0→N」，会走 `replaceListenerLocked` 从而**完全绕过 `usedPort` 端口 guard**——不是优雅降级，是把端口冲突检查跳过了。已显式分流到 `applyLocked`。
 4. `TestReplaceListenerBindFailureKeepsTheOldInstanceRunning` 长期 SKIP（占错端口）。已改成占用要移动到的目标端口，恢复成真正跑的 PREPARE 失败规则用例。
 5. 核对无越界：仅 `agent/**` + 本报告；`backend/`、`web/`、`.github/workflows/ci.yml`、迁移目录均未触碰。
+
+### 9.2b 第二轮独立审查发现与修正（plan/测试偏差）
+
+6. **`Drain` 未真正停止接受新连接**（§2.2 不变式 3 的 `Forwarder.Drain` 注释、§13.3.5 DRAIN 语义都没落地）。`pipeTracker.drainFor` 只轮询 `liveConns`，accept 循环从头到尾在跑：一次 Drain 之后 forwarder 还在收新连接，manager 侧的 DRAIN 阶段形同虚设。已改为 drain 前先置 `draining` 标志、accept 循环见标志即退出且**不关 listener**（端口留给 manager 释放），并把「conn 已 accept 但 drain 已开始」的竞态统一按 drain 赢处理。另补一条重要约束：**drain 不可逆**——无 un-drain；被 drain 的 forwarder 拒绝 `SetUpstream` 与再次 `start`，拆除走 `stop()`（drain 后任意时刻安全）。真实 loopback 测试覆盖：drain 后端口仍绑定但新连接不再被转发、在途连接被等待且返回仍有界、重复 drain / Stop 之后续生命周期、drain 与 Stop/拨号并发、egress forwarder 同契约。
+7. **`d <= 0` 被当成「等死」而不是「不等」**。原实现 `if d <= 0 || d > drainCeiling { d = drainCeiling }` 把 0 也改写成 15s 上限，与 §2.2 不变式 3「`Drain(d)` 用 `min(d, ceiling)`」相反。已改为 `d <= 0` 立即返回（不等待但仍完成停止 accept 的那一半），`d > ceiling` 仍收敛。
+8. **§2.4 判定表与代码不一致**（DIRECT↔RELAY 同行）。表中写「模式不同且端口同 → `listener_replace` + drain_old」，而冻结的 §13.3.4 要求「Ingress listener 保持」——这一行是上游语义变化，不是 listener 迁移，代码（`PlanForwardSwap` 的 `modeMoved` 分支）才是对的。已按冻结 §13.3.4 更正表格与说明，并补写 `mode`/`port` 的判定口径。
+9. **`TestReplaceListenerTargetSwapFallbackKeepsNodeServing` 没有走 fallback**。它构造「端口 + target 同时改」，`PlanForwardSwap` 判 `SwapListener`，路由进 `replaceListenerLocked`，`hotSwapUpstreamLocked` 的 fallback 分支从未被执行——测试名承诺的契约没被测。已改名/拆分为真正触发 `SetUpstream` 被拒的用例（见 §9.2c）。
+10. **旧端口 guard 提前释放**。`replaceListenerLocked` / `applyLocked` 在 `stopEntry`（异步关旧 listener）之前就 `releasePortLocked`，guard 报告的端口已经空闲、OS 层面的 bind 却还没发生。已改为旧实例真正停止后才释放，消除「guard 说空、OS 说占」的端口再利用窗口（见 §9.2c）。
+
+### 9.2c 本轮补片
+
+| 观察 | 修复前 | 修复后 |
+|---|---|---|
+| `Drain` 后新连接 | 仍被 accept 并转发 | 不再 accept，端口仍绑定/保留 |
+| `Drain(d<=0)` 空闲时 | 死等 15s 上限 | 立即返回 |
+| drain 后 `SetUpstream` | 成功安装一个没人能拨的地址 | `ErrForwarderNotRunning` |
+| 端口迁移时旧端口 guard | 在旧 listener 关闭前释放 | 旧实例停止后才释放 |
+| `TestReplaceListenerTargetSwapFallbackKeepsNodeServing` | 名不副实（走的是 listener 路径） | 改名 + 真正触发 `SetUpstream` 拒绝的用例 |
 
 ### 9.3 回滚
 
