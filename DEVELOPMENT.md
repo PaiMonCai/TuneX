@@ -364,7 +364,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并**；✅ 已实现（分支 `feature/v3-wp8-scheduler` 已 push，见 §7.11） |
 | WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
 | WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并（WP10 已实现，见 §7.13，待 CI） |
-| WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并** |
+| WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并**；✅ 已实现（分支 `feature/v3-wp11-tunnel-api` 已 push，见 §7.13：v3 CRUD + 状态查询 + retry/suspend/resume/delete，33 条离线单测全绿） |
 | WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | ✅ 已完成（分支 `feature/v3-wp12-admin-web` 已 push：节点列表/详情、角色与端口编辑、credential 签发/轮转/吊销、出口池 CRUD、运行态诊断；后端 WP10 未落地期间走 mock 契约，25 条 contract 单测全绿，CI 已接入） |
 | WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | WP11 已合并 |
 | WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | **WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 + WP13 已合并** |
@@ -1049,6 +1049,43 @@ DB 替身，不连 MySQL/Redis/net；含对上述不变式的反向断言）。
 - 所有运行操作统一走 orchestrator。
 
 禁止 route 自己写第二套下发逻辑。
+
+**状态：✅ 已完成（分支 `feature/v3-wp11-tunnel-api` 已 push，未开 PR）。**
+
+交付范围：
+
+- 服务层：`backend/src/services/tunnel-api.ts`（期望状态 CRUD + 状态查询 +
+  动作编排；`db` / `loadPolicy` / `applyCreate` / `applyReapply` / `orchestrator`
+  全部可注入，离线单测无需 `mock.module`）。
+  - `createTunnel`：DIRECT 落 `tunnel_mode=direct` 无编排；RELAY 先落
+    `apply_status=pending` 再交 WP8 `createRelayTunnel`（§7.11 十步 + 补偿）。
+    编排失败时**不删行**（§4.1），只把结果翻成 502 + `apply_error_code`。
+  - `runTunnelAction`：retry（仅 `error`）/ suspend（幂等拒绝重复）/
+    resume（`suspended`|`error`）/ delete（任意态）。前两者经 WP8
+    `reapplyRelayTunnel` 对**已存在**的 tunnelId 重新下发；delete 经
+    `orchestrator.removeTunnel` 撤两端（revision+1 绕开 Agent 的 stale 闸门）
+    后再删行，补偿失败不阻断显式用户动作。
+  - `updateTunnel`：RELAY 不得清空出口组（按**更新后**的 mode 判定，
+    同 PATCH 里既改 mode 又清组的组合也拦得住）；转发目标形态校验。
+- 编排入口复用：`backend/src/services/scheduler.ts` 新增
+  `reapplyRelayTunnel(tunnelId, orchestrator, deps)` —— 复用模块内既有
+  `pickNode` / `allocateTunnelPort` / `dispatchEgress` / `persistFailure`
+  阶段函数，§7.11 编排顺序仍是单一真相源（`createRelayTunnel` 强制建新行，
+  无法重入既有 tunnelId，故不能拿它做 retry）。
+- 进程级接线：`backend/src/services/relay-wiring.ts` 惰性单例
+  `getOrchestrator()`。取不到时停在 pending，**不假装成功**（§7.13），
+  由 WP9 reconciler 的 `fill_missing_runtime` 稍后补发。
+  已知过渡态（已在文件头如实记录）：WP7 per-node credential 是「验哈希」
+  而 `tokenForNode` 是「发明文」，方向相反，暂以环境变量兜底。
+- 端点：`backend/src/routes/tunnels.ts` 追加 v3 前缀一组
+  （`GET /v3/modes`、`GET /v3`、`POST /v3/relay`、`GET /v3/:id/state`、
+  `POST /v3/:id/{retry,suspend,resume}`、`DELETE /v3/:id`）。与 legacy
+  路径分开，同一 URL 下不会出现两种语义。handler 只做解析/鉴权/调服务层，
+  文件内无 `createCommand` / `dispatch*` / transport 调用（单测 E 组静态锚定）。
+- 测试：`backend/src/services/__tests__/tunnel-api.test.ts` 33 条
+  （CRUD、状态操作兼容矩阵、越权 404 不泄漏存在性、失败保留 Tunnel、
+  未接线不假成功、结构约束），`bun test` 全绿；存量 12 条环境相关失败
+  与 `main` 基线逐条一致（非本包引入）。
 
 ---
 
