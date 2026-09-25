@@ -862,6 +862,10 @@ export interface PortForward {
   apply_status: TunnelApplyStatus | null;
   config_revision: number | null;
   applied_revision: number | null;
+  /** V4-WP1：指向最新 desired snapshot 的指针（前端作审计展示，不自行解析） */
+  desired_revision_id: number | null;
+  /** V4-WP1：最新 revision 号（与 config_revision 同值）；保存时作 expected_revision 回传 */
+  latest_revision: number;
   apply_error_code: string | null;
   apply_error: string | null;
   last_applied_at: string | null;
@@ -883,8 +887,76 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
   ingress_node_id: ID;
 }
 
+/**
+ * V4-WP1 全字段编辑 patch（与后端 ForwardPatchSchema 同形）。
+ * `expected_revision` 是可选的乐观并发凭据；缺失 = 首次请求或有意跳过检查。
+ */
 export interface ForwardPatchInput {
   name?: string;
+  mode?: "direct" | "relay";
+  ingress_node_id?: ID;
+  egress_node_id?: ID | null;
+  /** null = 自动分配 */
+  listen_port?: number | null;
+  target_host?: string | null;
+  target_port?: number | null;
+  expected_revision?: number | null;
+}
+
+/** preview 的候选 config 投影（与后端 ForwardCandidateConfig 同形）。 */
+export interface ForwardPreviewConfig {
+  name: string;
+  mode: "direct" | "relay";
+  ingress_node_id: number;
+  egress_node_id: number | null;
+  listen_port: number | null;
+  target_host: string | null;
+  target_port: number | null;
+}
+
+/**
+ * preview / update 共用的影响面（§13.3.3 逐项）。
+ *
+ * 字段名与后端 ForwardImpact 逐条同名；UI 只消费形状，语义以后端为准。
+ */
+export interface ForwardImpact {
+  metadata_only: boolean;
+  runtime_change: boolean;
+  changes_external_address: boolean;
+  listen_port_change: boolean;
+  listener_replacement: boolean;
+  ingress_node_change: boolean;
+  egress_node_change: boolean;
+  mode_change: boolean;
+  target_change: boolean;
+  egress_target_change: boolean;
+  nodes_prepare_drain: string[];
+  binding_required: boolean;
+  port_status: "ok" | "auto" | "conflict" | "out_of_range";
+  desired_address: string | null;
+}
+
+export interface ForwardValidation {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  reasons: string[];
+}
+
+/** `POST /api/forwards/:id/preview` 响应体（不写库）。 */
+export interface ForwardPreviewResult {
+  current: {
+    revision: number;
+    config: ForwardPreviewConfig;
+    apply_status: TunnelApplyStatus | null;
+    desired_status: TunnelDesiredStatus | null;
+  };
+  candidate: {
+    revision: number;
+    config: ForwardPreviewConfig;
+  };
+  impact: ForwardImpact;
+  validation: ForwardValidation;
 }
 
 export interface ForwardSummary {

@@ -47,6 +47,15 @@ import type {
 } from "@/lib/types";
 import * as seed from "./data";
 import { getStore, resetStore, type MockNodeBinding, type MockWorkspaceInvite } from "./state";
+import {
+  applyMockForwardPatch,
+  injectMockForwardView,
+  previewMockForwardUpdate,
+} from "./forward-edit";
+import type { ForwardPatchInput } from "@/lib/types";
+
+// forward-edit.ts 需要 handler 的 forward 投影（避免反向依赖），在这里注入一次。
+injectMockForwardView((_db, tunnel) => mockForwardView(_db, tunnel));
 
 export interface MockRequest {
   body?: unknown;
@@ -134,8 +143,8 @@ const nowIso = () => new Date().toISOString();
 function ok(body: unknown): MockResponse {
   return { status: 200, body };
 }
-function fail(status: number, message: string, code?: string): MockResponse {
-  return { status, body: code ? { message, code } : { message } };
+function fail(status: number, message: string, code?: string, data?: unknown): MockResponse {
+  return { status, body: { message, ...(code ? { code } : {}), ...(data ? { data } : {}) } };
 }
 function badRequest(message: string, code = "VALIDATION_ERROR"): MockResponse {
   return fail(400, message, code);
@@ -951,6 +960,11 @@ function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
     apply_status: tunnel.apply_status ?? null,
     config_revision: tunnel.config_revision ?? null,
     applied_revision: tunnel.applied_revision ?? null,
+    // V4-WP1：desired 指针 + 最新 revision 号。mock 的 desired 指针由 tunnel 行
+    // 自身承担，因此这里投影出稳定的派生值；UI 只消费形状，不解析语义。
+    desired_revision_id:
+      tunnel.config_revision == null ? null : tunnel.id * 10000 + tunnel.config_revision,
+    latest_revision: tunnel.config_revision ?? 0,
     apply_error_code: tunnel.apply_error_code ?? null,
     apply_error: tunnel.apply_error ?? null,
     last_applied_at: tunnel.last_applied_at ?? null,
@@ -1683,14 +1697,28 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         return ok(mockForwardView(db, tunnel));
       }
       if (method === "PATCH" && seg[2] === undefined) {
+        // V4-WP4（镜像 V4-WP1 契约）：编辑 = 全字段 patch + expected_revision。
+        // 校验只有一个实现：applyMockForwardPatch 与 preview 共用
+        // resolveMockForwardCandidate，因此 preview 放行 ⇔ PATCH 接受。
         const body = asRecord(req.body);
-        if (body.name !== undefined) {
-          const name = reqStr(body.name);
-          if (!name || name.length > 60) return badRequest("转发名称不合法");
-          tunnel.name = name;
-          tunnel.updated_at = nowIso();
+        const patched = applyMockForwardPatch(db, tunnel, body as ForwardPatchInput);
+        if (!patched.ok) {
+          const e = patched.error;
+          // 与后端 send() 的错误体同形：{ message, code, data }，
+          // data.latest_revision 让 UI 能给出「最新 revision 是多少」。
+          return fail(e.status, e.message, e.code, e.data);
         }
-        return ok(mockForwardView(db, tunnel));
+        return ok(patched.view);
+      }
+      if (method === "POST" && seg[2] === "preview") {
+        // V4-WP1 §13.3.3 preview：保存前影响面，不写库。
+        const body = asRecord(req.body);
+        const previewed = previewMockForwardUpdate(db, tunnel, body as ForwardPatchInput);
+        if (!previewed.ok) {
+          const e = previewed.error;
+          return fail(e.status, e.message, e.code, e.data);
+        }
+        return ok(previewed.result);
       }
       if (
         method === "POST" &&
