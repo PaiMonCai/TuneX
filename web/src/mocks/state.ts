@@ -68,6 +68,8 @@ export interface MockStore {
   workspaces: MockWorkspace[];
   workspaceMembers: MockWorkspaceMember[];
   workspaceInvites: MockWorkspaceInvite[];
+  /** V4 Node-first：入口到出口的显式绑定。 */
+  nodeBindings: MockNodeBinding[];
   /** WP12 节点凭据签发明文记录：node_id → 多久轮转过（次数） */
   nodeCredentials: Map<ID, { rotation_count: number; issued_at: string; last_rejected_at: string | null }>;
   /** WP12 出口池（node_id → 池列表） */
@@ -97,6 +99,13 @@ export interface MockWorkspaceMember {
   user_id: number;
   role: WorkspaceRole;
   active: boolean;
+  created_at: string;
+}
+
+export interface MockNodeBinding {
+  id: number;
+  ingress_node_id: ID;
+  egress_node_id: ID;
   created_at: string;
 }
 
@@ -238,6 +247,11 @@ function build(): MockStore {
     workspaces,
     workspaceMembers,
     workspaceInvites: [],
+    nodeBindings: [
+      { id: 1, ingress_node_id: 1, egress_node_id: 4, created_at: wsAt },
+      { id: 2, ingress_node_id: 1, egress_node_id: 6, created_at: wsAt },
+      { id: 3, ingress_node_id: 6, egress_node_id: 4, created_at: wsAt },
+    ],
     nodeCredentials: new Map(),
     // v3 出口池：按 node_id 分组（与 WP10「池挂节点」层级一致）；
     // 种子来自 data.ts 的 mockEgressPools，运行期由 CRUD 端点增删改。
