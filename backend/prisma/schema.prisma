@@ -43,6 +43,7 @@ enum TunnelMode {
 enum LBStrategy {
   round
   rand
+  weighted_round
 }
 
 /// 端口租约方向（DEVELOPMENT.md §5.1）。
@@ -432,9 +433,10 @@ model Node {
   /// 最近一次 rejected 认证时刻：供 rotate 时识别「谁还在拿旧 token 敲门」
   credential_last_rejected_at DateTime?
 
-  egress_pools   EgressPool[]
-  port_leases    NodePortLease[]
-  egress_tunnels Tunnel[]      @relation("egress_node")
+  egress_pools    EgressPool[]
+  port_leases     NodePortLease[]
+  ingress_tunnels Tunnel[]      @relation("ingress_node")
+  egress_tunnels  Tunnel[]      @relation("egress_node")
   /// 节点凭据状态快照（版本 / 角色 / 端口占用 / 隧道列表），见 model NodeStateReport。
   /// 每节点一行：`@@unique([node_id])` 保证 Agent 断线重连后恢复的是自己那一份。
   state_report   NodeStateReport?
@@ -518,6 +520,10 @@ model Tunnel {
   // 类型层面可区分——读代码的人看到 `tunnel_mode === null` 就知道该行不是
   // 被 v3 显式声明过的，而不是要靠「值恰好等于默认值」去猜。
   tunnel_mode TunnelMode?
+  /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
+  /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
+  ingress_node_id Int?
+  ingress_node    Node?      @relation("ingress_node", fields: [ingress_node_id], references: [id], onDelete: SetNull)
   /// RELAY 实际出口节点；DIRECT 为 NULL（DEVELOPMENT.md §2.1）。
   /// 只保存 Node 而不只存 out_node_group：否则组内多 Agent 重启时无法判断
   /// 隧道真正属于谁。
@@ -553,6 +559,7 @@ model Tunnel {
   @@unique([listen_port, in_node_group_id])
   @@index([workspace_id])
   @@index([tunnel_mode])
+  @@index([ingress_node_id])
   @@index([egress_node_id])
   @@index([egress_pool_id])
   @@index([apply_status])
