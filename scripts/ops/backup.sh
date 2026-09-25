@@ -5,7 +5,7 @@
 # 备份内容（全部租户数据，零遗漏）：
 #   1. MySQL 全库逻辑备份（mysqldump，单事务 + 一致快照，含 _prisma_migrations）
 #   2. Redis 全量导出（RDB 快照：BGSAVE + 从容器卷复制 dump.rdb；AOF 关闭时唯一手段）
-#   3. 环境密钥与配置清单（.env / Caddyfile / compose 版本指纹 —— 不含明文密钥入库，
+#   3. 环境密钥与配置清单（.env / Caddyfile* / compose 版本指纹 —— 不含明文密钥入库，
 #      整文件加密后单独存放）
 #
 # 设计约束：
@@ -173,7 +173,10 @@ CFG_DIR="$WORK/config"
 mkdir -p "$CFG_DIR"
 log "[3/5] 收集配置清单（加密存放）"
 [[ -f "$PROJECT_ROOT/.env" ]]           && cp "$PROJECT_ROOT/.env" "$CFG_DIR/env"
-[[ -f "$PROJECT_ROOT/Caddyfile" ]]      && cp "$PROJECT_ROOT/Caddyfile" "$CFG_DIR/Caddyfile"
+[[ -f "$PROJECT_ROOT/Caddyfile" ]]          && cp "$PROJECT_ROOT/Caddyfile" "$CFG_DIR/Caddyfile"
+[[ -f "$PROJECT_ROOT/Caddyfile.internal" ]] && cp "$PROJECT_ROOT/Caddyfile.internal" "$CFG_DIR/Caddyfile.internal"
+[[ -f "$PROJECT_ROOT/Caddyfile.prod" ]]     && cp "$PROJECT_ROOT/Caddyfile.prod" "$CFG_DIR/Caddyfile.prod"
+[[ -f "$PROJECT_ROOT/docker-compose.standalone.yaml" ]] && cp "$PROJECT_ROOT/docker-compose.standalone.yaml" "$CFG_DIR/docker-compose.standalone.yaml"
 [[ -f "$COMPOSE_FILE" ]]                && cp "$COMPOSE_FILE" "$CFG_DIR/docker-compose.yaml"
 cp "$PROJECT_ROOT/scripts/ops/backup.sh" "$CFG_DIR/" 2>/dev/null || true
 
