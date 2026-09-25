@@ -85,6 +85,7 @@ function targetAddress(host: string, port: number): string {
 const nodeSelect = {
   id: true,
   node_id: true,
+  agent_id: true,
   connect_ip: true,
   role: true,
   status: true,
@@ -102,6 +103,7 @@ const nodeSelect = {
 function nodeView(node: {
   id: number;
   node_id: string;
+  agent_id: string;
   connect_ip: string | null;
   role: string | null;
   status: string;
@@ -136,8 +138,8 @@ function nodeView(node: {
 }
 
 const forwardInclude = Prisma.validator<Prisma.TunnelInclude>()({
-  ingress_node: { select: { id: true, node_id: true, connect_ip: true, role: true } },
-  egress_node: { select: { id: true, node_id: true, connect_ip: true, role: true } },
+  ingress_node: { select: { id: true, node_id: true, agent_id: true, connect_ip: true, role: true } },
+  egress_node: { select: { id: true, node_id: true, agent_id: true, connect_ip: true, role: true } },
   egress_pool: {
     include: {
       targets: {
