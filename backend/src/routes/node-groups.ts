@@ -23,7 +23,7 @@ import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { withWorkspaceQuotaLock } from "../services/policy-service.ts";
 import { checkNodeCreation } from "../services/capability-policy.ts";
-import { generateNodeCredential, hashNodeCredential } from "../services/node-credential.ts";
+import { createNodeEnrollment } from "../services/node-enrollment.ts";
 
 export const nodeGroupsRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -131,7 +131,7 @@ nodeGroupsRoutes.post("/", async (c) => {
 
 const ProvisionNode = z.object({
   node_id: z.string().trim().min(1).max(255),
-  connect_ip: z.string().trim().min(1).max(255),
+  connect_ip: z.string().trim().min(1).max(255).nullable().optional(),
   role: z.enum(["ingress", "egress", "both"]).optional(),
   targets: z.array(z.object({
     host: z.string().trim().min(1).max(255),
@@ -143,8 +143,8 @@ const ProvisionNode = z.object({
 /**
  * Provision one concrete Agent identity inside an owned workspace NodeGroup.
  *
- * Returns the node credential exactly once. The database stores only its hash;
- * subsequent control/state requests derive node identity from that credential.
+ * Returns a short-lived one-time enrollment + install command. The real
+ * per-node credential is minted only when the node consumes that enrollment.
  */
 nodeGroupsRoutes.post("/:id/nodes", async (c) => {
   const user = requireUser(c);
@@ -166,18 +166,12 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
   if (!group) return c.json({ error: "节点组不存在" }, 404);
 
   const role = parsed.data.role ?? (group.node_type === "in" ? "ingress" : "egress");
-  if ((role === "egress" || role === "both") && (parsed.data.targets?.length ?? 0) === 0) {
-    return c.json({ error: "egress / both 节点 provision 时至少需要一个出口目标" }, 400);
-  }
   const range = group.port_range?.split("-").map(Number) ?? [];
   const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
   const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
   if (portMin === null || portMax === null || portMin < 1 || portMax > 65535 || portMin > portMax) {
     return c.json({ error: "节点组未配置可用于 v3 的连续端口范围" }, 409);
   }
-
-  const plaintext = generateNodeCredential();
-  const credentialHash = hashNodeCredential(plaintext);
 
   try {
     const reserved = await withWorkspaceQuotaLock(workspace.id, async (tx, policy) => {
@@ -213,35 +207,29 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
         ? await tx.node.update({
             where: { id: existing.id },
             data: {
-              connect_ip: parsed.data.connect_ip,
+              ...(parsed.data.connect_ip !== undefined ? { connect_ip: parsed.data.connect_ip } : {}),
               role,
               port_range_min: portMin,
               port_range_max: portMax,
               lb_strategy: "round",
-              node_credential_hash: credentialHash,
-              credential_rotated_at: new Date(),
-              credential_revoked: false,
             },
             select,
           })
         : await tx.node.create({
             data: {
               node_id: parsed.data.node_id,
-              connect_ip: parsed.data.connect_ip,
+              connect_ip: parsed.data.connect_ip ?? null,
               node_group_id: group.id,
               role,
               port_range_min: portMin,
               port_range_max: portMax,
               lb_strategy: "round",
-              node_credential_hash: credentialHash,
-              credential_rotated_at: new Date(),
-              credential_revoked: false,
               order_by: nodeCount * 1000,
             },
             select,
           });
 
-      if (role === "egress" || role === "both") {
+      if ((role === "egress" || role === "both") && (parsed.data.targets?.length ?? 0) > 0) {
         const targets = parsed.data.targets ?? [];
         const pool = await tx.egressPool.upsert({
           where: { node_id_name: { node_id: node.id, name: "default" } },
@@ -293,11 +281,11 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       }, 403);
     }
 
+    const enrollment = await createNodeEnrollment(reserved.node.id);
     return c.json({
       data: {
         node: reserved.node,
-        credential: plaintext,
-        issued_at: new Date().toISOString(),
+        enrollment,
       },
     }, 201);
   } catch (e) {
