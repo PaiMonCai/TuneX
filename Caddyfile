@@ -1,19 +1,49 @@
-# TuneX — Caddy 入口
-# 当前：http 端口做反向代理（/api/* + /healthz → backend，其余 → Next.js web）
-# 后续：接入真实域名 + 自动 HTTPS
+# TuneX — Docker 内部统一 HTTP 入口
+#
+# 默认生产拓扑：
+#   Host Nginx / 宝塔 / 1Panel (:80/:443, TLS)
+#      -> 127.0.0.1:${TUNEX_HTTP_PORT:-13000}
+#      -> tunex-caddy:80
+#      -> backend/web
+#
+# Caddy 在该模式下只负责 TuneX 应用内部路由，不负责公网 TLS。
+# standalone（Caddy 直接占用宿主机 80/443）使用 Caddyfile.prod。
 
 :80 {
 	encode zstd gzip
 
+	# 由宿主机反代传入的原始协议信息继续传给 Backend。
+	# 默认端口只绑定 127.0.0.1，因此这里的上游只能来自本机可信代理。
+	@has_forwarded_proto header X-Forwarded-Proto *
+	reverse_proxy @has_forwarded_proto backend:3000 {
+		header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+	}
+
+	# Agent 控制面 Socket.IO / WebSocket。
+	handle /socket.io/* {
+		reverse_proxy backend:3001 {
+			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
 	handle /api/* {
-		reverse_proxy backend:3000
+		reverse_proxy backend:3000 {
+			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+		}
 	}
 
 	handle /healthz {
 		reverse_proxy backend:3000
 	}
 
-	# 其余请求 → Next.js 前端（next start 监听 3000）
+	handle /readyz {
+		reverse_proxy backend:3000
+	}
+
 	handle {
 		reverse_proxy web:3000
 	}
