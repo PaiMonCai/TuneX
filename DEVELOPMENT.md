@@ -1251,6 +1251,13 @@ WP13 的 Tunnel Web 已完成其 v3 技术验证使命；V4 不删除 Tunnel run
   （总数、DIRECT/RELAY、active/pending/suspended/error、累计流量）。
 - 移除 Web 端 node-scoped Forward client；等兼容窗口结束后再独立删除后端旧路由，
   不在同一 PR 里把兼容删除与产品 UI 重构绑在一起。
+- V4.3 收尾删除旧用户侧 `components/tunnels/*` UI 与 `api.tunnels` /
+  用户侧 `egressPools` client；`/tunnels` 页面只保留到 `/forwards` 的重定向。
+- legacy Tunnel mock/API 契约测试迁入
+  `components/forwards/__tests__/legacy-tunnel-compat.test.ts`，只用于兼容窗口守护，
+  不再代表用户产品界面。
+- Admin 的 `/admin/tunnels` 继续保留运行诊断/管理能力，它与用户侧 Forward 产品入口
+  是不同层级，不参与上述删除。
 
 V4 的单一边界仍是：
 
