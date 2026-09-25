@@ -25,8 +25,8 @@
 #   2. 备份现状（默认要求，除非 --no-backup-backup）
 #   3. 拉取目标镜像（本地不存在时）
 #   4. 更新 .env 的 TUNEX_IMAGE（同一 digest 同时驱动 backend/worker/web）
-#   5. compose up -d 切换（DB/Redis 不动，滚动替换 backend/worker/web）
-#   6. 健康等待：/healthz 200 + 三个服务 healthy，超时即失败
+#   5. compose up -d 切换（DB/Redis/Caddy 不动，滚动替换 backend/worker/web）
+#   6. 健康等待：统一入口 /healthz 200 + 三个服务 running，超时即失败
 #   7. 失败 → 自动回退到步骤 1 记录的状态（幂等）
 #   8. 成功 → 写 deploy-history，提示数据是否也要回滚
 #
@@ -90,7 +90,8 @@ svc_running() {
     | awk -v s="$svc" '$1==s && $2 ~ /^running/ {found=1} END{exit found?0:1}'
 }
 
-CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-9091}"
+TUNEX_HTTP_PORT="${TUNEX_HTTP_PORT:-13000}"
+ROLLBACK_HEALTH_URL="${ROLLBACK_HEALTH_URL:-http://127.0.0.1:${TUNEX_HTTP_PORT}/healthz}"
 
 # --- 当前状态指纹 ------------------------------------------------------------
 current_state() {
@@ -193,7 +194,7 @@ fi
 # --- 3. 确认 -----------------------------------------------------------------
 if [[ $ASSUME_YES -ne 1 ]]; then
   echo
-  log "即将执行回滚：backend/worker/web → $TUNEX_IMG；mysql/redis 不动。"
+  log "即将执行回滚：backend/worker/web → $TUNEX_IMG；mysql/redis/caddy 不动."
   [[ $DO_DATA -eq 1 ]] && log "⚠️  --data：随后还会从最新备份恢复数据（覆盖现有数据）"
   read -r -p "输入 ROLLBACK 确认执行: " ans
   [[ "$ans" == "ROLLBACK" ]] || die "已取消" 2
@@ -221,10 +222,10 @@ diff -u "$OPS_DIR/.env.before-rollback" "$ENV_FILE" | sed 's/^/    /' || true
 
 # --- 5. 执行切换 -------------------------------------------------------------
 log "[4/6] 切换服务（mysql/redis 不受影响）"
-if ! "${COMPOSE[@]}" up -d backend worker web caddy >> "$OPS_DIR/rollback-up.log" 2>&1; then
+if ! "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1; then
   warn "compose up 失败，自动回退 env 并重启"
   cp "$OPS_DIR/.env.before-rollback" "$ENV_FILE"
-  "${COMPOSE[@]}" up -d backend worker web caddy >> "$OPS_DIR/rollback-up.log" 2>&1 || true
+  "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
   die "回滚失败且已尝试自动回退 —— 详见 $OPS_DIR/rollback-up.log；必要时执行 restore.sh 恢复数据" 1
 fi
 log "  详见 $OPS_DIR/rollback-up.log"
@@ -236,7 +237,7 @@ ok=0
 while [[ $(date +%s) -lt $deadline ]]; do
   # /healthz 必须 200
   code="$(curl -fsS -o /dev/null -w '%{http_code}' -m 3 \
-    "http://127.0.0.1:${CADDY_HTTP_PORT}/healthz" 2>/dev/null || echo 000)"
+    "$ROLLBACK_HEALTH_URL" 2>/dev/null || echo 000)"
   # 三个服务 running
   running=1
   for s in backend worker web; do
@@ -249,7 +250,7 @@ done
 if [[ $ok -ne 1 ]]; then
   log "  ⚠️ 健康检查未通过（healthz=$code running=$running）—— 自动回退"
   cp "$OPS_DIR/.env.before-rollback" "$ENV_FILE"
-  "${COMPOSE[@]}" up -d backend worker web caddy >> "$OPS_DIR/rollback-up.log" 2>&1 || true
+  "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
   die "回滚未通过健康检查，已自动回退到上一版本。请人工介入：docker compose ps + logs" 1
 fi
 log "  healthz=200, backend/worker/web 全部 running ✅"
@@ -274,7 +275,7 @@ fi
 log "✅ 回滚完成：$TUNEX_IMG"
 log "  后续："
 log "    docker compose ps"
-log "    curl -fsS http://127.0.0.1:${CADDY_HTTP_PORT}/healthz"
+log "    curl -fsS $ROLLBACK_HEALTH_URL"
 log "    抽 1 个 workspace 核对业务数据"
 log "  历史：$HISTORY"
 exit 0
