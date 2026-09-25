@@ -25,6 +25,7 @@
  * console；响应体也永不含凭据。凭据明文只存在于 rotate 的响应（管理端点）。
  */
 import { Hono } from "hono";
+import { readFile } from "node:fs/promises";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { authenticateNode } from "../services/node-credential.ts";
 import {
@@ -33,6 +34,12 @@ import {
   submitStateReport,
 } from "../services/node-state.ts";
 import {
+  agentBinaryPath,
+  consumeNodeEnrollment,
+  extractEnrollmentToken,
+  renderNodeInstallScript,
+} from "../services/node-enrollment.ts";
+import {
   buildDesiredNodeSnapshot,
   dequeueAgentCommand,
   storeAgentCommandAck,
@@ -40,6 +47,69 @@ import {
 } from "../services/agent-command-bus.ts";
 
 export const internalNodeRoutes = new Hono<{ Variables: AppVariables }>();
+
+/**
+ * GET /api/internal/node/install.sh
+ *
+ * Public installer code contains no credential. The short-lived enrollment
+ * token is passed as a shell argument by the Panel-generated one-liner.
+ */
+internalNodeRoutes.get("/node/install.sh", (c) => {
+  return c.body(renderNodeInstallScript(), 200, {
+    "content-type": "text/x-shellscript; charset=utf-8",
+    "cache-control": "no-store",
+  });
+});
+
+/** Download a Panel-version-matched Agent binary bundled in the app image. */
+internalNodeRoutes.get("/node/binary/:artifact", async (c) => {
+  const path = agentBinaryPath(c.req.param("artifact"));
+  if (!path) return c.json({ ok: false, error: "unsupported_artifact" }, 404);
+  try {
+    const file = await readFile(path);
+    return new Response(file, {
+      status: 200,
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-disposition": `attachment; filename="${c.req.param("artifact")}"`,
+        "cache-control": "public, max-age=3600, immutable",
+      },
+    });
+  } catch {
+    return c.json({ ok: false, error: "agent_binary_unavailable" }, 404);
+  }
+});
+
+/**
+ * POST /api/internal/node/enroll
+ *
+ * Authorization: Enrollment <short-lived-token>
+ *
+ * This is the only bridge from installer token to long-lived node credential.
+ * The token is consumed atomically and cannot be replayed.
+ */
+internalNodeRoutes.post("/node/enroll", async (c) => {
+  const token = extractEnrollmentToken(c.req.header("authorization"));
+  if (!token) return c.json({ ok: false, error: "invalid_enrollment" }, 401);
+  try {
+    const enrolled = await consumeNodeEnrollment(token, c.get("ip") || null);
+    if ((c.req.header("accept") ?? "").includes("text/plain")) {
+      return c.body(enrolled.credential, 200, {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+      });
+    }
+    return c.json({
+      data: {
+        credential: enrolled.credential,
+        node_id: enrolled.node_id,
+        node_key: enrolled.node_key,
+      },
+    });
+  } catch {
+    return c.json({ ok: false, error: "invalid_enrollment" }, 401);
+  }
+});
 
 /** 认证包装：HTTP 层只需要「401/503 三态 + node_id」，避免每个处理器重复展开判别联合。 */
 async function authedNode(
