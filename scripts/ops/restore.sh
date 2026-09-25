@@ -260,6 +260,7 @@ if [[ $DRY_RUN -ne 1 && -f "$BK_DIR/$ENC_CFG" ]]; then
   log "  注意：.env / Caddyfile* / compose 未自动覆盖。如需恢复请先人工 diff："
   log "    diff -u $PROJECT_ROOT/.env $WORK/config/env"
   log "    diff -u $PROJECT_ROOT/Caddyfile $WORK/config/Caddyfile"
+  [[ -f "$WORK/config/Caddyfile.internal" ]] && log "    diff -u $PROJECT_ROOT/Caddyfile.internal $WORK/config/Caddyfile.internal"
   [[ -f "$WORK/config/Caddyfile.prod" ]] && log "    diff -u $PROJECT_ROOT/Caddyfile.prod $WORK/config/Caddyfile.prod"
   [[ -f "$WORK/config/docker-compose.standalone.yaml" ]] && log "    diff -u $PROJECT_ROOT/docker-compose.standalone.yaml $WORK/config/docker-compose.standalone.yaml"
 fi
