@@ -268,6 +268,6 @@ fi
 log "✅ 恢复完成"
 log "  后续验证："
 log "    1. docker compose ps（全部 healthy）"
-log "    2. curl -fsS ${RESTORE_HEALTH_URL:-http://127.0.0.1:${TUNEX_HTTP_PORT:-13000}/healthz}"
+log "    2. curl -fsS ${RESTORE_HEALTH_URL:-http://127.0.0.1:${TUNEX_API_PORT:-13001}/healthz}"
 log "    3. 后台登录 / 抽 1 个 workspace 核对 tunnel 数据"
 exit 0
