@@ -24,7 +24,7 @@
  * `409 revision_conflict` 并回带最新 revision（见 {@link handleRevisionConflict}），
  * 绝不静默覆写。
  */
-import type { Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 
 /* ================================================================== */
@@ -706,7 +706,7 @@ export async function createForwardRevision(
     const targets =
       input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
         ? (input.egressTargets as unknown as Prisma.InputJsonValue)
-        : null;
+        : Prisma.JsonNull;
 
     let snapshotId: number;
     try {
@@ -739,6 +739,11 @@ export async function createForwardRevision(
       input.candidate.mode === "direct" && input.candidate.target_host && input.candidate.target_port
         ? [targetAddress(input.candidate.target_host, input.candidate.target_port)]
         : null;
+    // legacy 投影列是 JSON 类型：读出来是 JsonValue（可能是 null），写回去必须转成
+    // Prisma 的输入类型。直接透传会触发 TS2322（`null` 不在 InputJsonValue 里）。
+    const existingAddresses = (row.forward_addresses ?? Prisma.JsonNull) as Prisma.InputJsonValue;
+    const existingProtocol =
+      (row.forward_addresses_protocol ?? Prisma.JsonNull) as Prisma.InputJsonValue;
 
     await tx.tunnel.update({
       where: { id: input.tunnelId },
@@ -754,9 +759,13 @@ export async function createForwardRevision(
         listen_ip: input.resolvedListenIp ?? row.listen_ip,
         remote_host: input.candidate.mode === "direct" ? input.candidate.target_host : null,
         remote_port: input.candidate.mode === "direct" ? input.candidate.target_port : null,
-        forward_addresses: directTarget ?? (input.candidate.mode === "direct" ? row.forward_addresses : []),
+        forward_addresses: directTarget
+          ? (directTarget as unknown as Prisma.InputJsonValue)
+          : existingAddresses,
         forward_addresses_protocol:
-          directTarget !== null ? ["tcp"] : row.forward_addresses_protocol,
+          directTarget !== null
+            ? (["tcp"] as unknown as Prisma.InputJsonValue)
+            : existingProtocol,
         out_node_group_id: input.candidate.mode === "direct" ? null : row.out_node_group_id,
         desired_status: input.desiredStatus,
         // ── revision 账本（与 snapshot 同值，同一事务）──

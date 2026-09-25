@@ -809,7 +809,13 @@ async function resolveForwardCandidate(
     }
   }
   for (const s of siblings) {
-    if (s.id !== id && s.listen_port === candidate.listen_port) takenByOther.add(s.listen_port);
+    if (
+      s.id !== id &&
+      candidate.listen_port !== null &&
+      s.listen_port === candidate.listen_port
+    ) {
+      takenByOther.add(candidate.listen_port);
+    }
   }
   const portHolderList = [...takenByOther].map((port) => ({ tunnel_id: -1, port }));
 
