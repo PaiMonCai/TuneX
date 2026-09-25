@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  ArrowLeftRight,
   BadgeCheck,
   BarChart3,
   Boxes,
@@ -30,6 +31,7 @@ import {
  */
 export const NAV_ICONS = {
   dashboard: LayoutDashboard,
+  forwards: ArrowLeftRight,
   tunnels: Waypoints,
   plans: Package,
   topup: CreditCard,

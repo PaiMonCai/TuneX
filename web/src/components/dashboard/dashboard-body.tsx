@@ -124,8 +124,8 @@ export async function DashboardBody() {
             </div>
             <div className="flex flex-col gap-2 pt-1">
               <Button size="sm" asChild>
-                <Link href="/tunnels">
-                  <Plus className="size-4" /> {t("tunnel.createButton")}
+                <Link href="/forwards">
+                  <Plus className="size-4" /> {t("forward.createDirect")}
                 </Link>
               </Button>
               <Button size="sm" variant="outline" asChild>
@@ -150,7 +150,7 @@ export async function DashboardBody() {
             </CardDescription>
           </div>
           <Button size="sm" variant="outline" asChild>
-            <Link href="/tunnels">{t("common.tunnels")}</Link>
+            <Link href="/forwards">{t("common.forwards")}</Link>
           </Button>
         </CardHeader>
         <CardContent className="p-0">
@@ -171,7 +171,7 @@ export async function DashboardBody() {
                 <TableRow key={tn.id}>
                   <TableCell className="text-[var(--muted-foreground)]">{tn.id}</TableCell>
                   <TableCell className="font-medium">
-                    <Link href={`/tunnels/${tn.id}`} className="hover:underline">
+                    <Link href={`/forwards/${tn.id}`} className="hover:underline">
                       {tn.name}
                     </Link>
                   </TableCell>
