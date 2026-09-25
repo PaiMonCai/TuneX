@@ -131,8 +131,17 @@ assert_eq "$R_PORT" "$RELAY_EGRESS_PORT" "T2 RELAY 持久化 egress_port"
 assert_eq "$R_STATUS" "active" "T2 RELAY apply_status=active"
 assert_eq "$R_CFG" "$R_APPLIED" "T2 RELAY config_revision 已被双端 ACK"
 
-LEASE_COUNT=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE tunnel_id IN ($DIRECT_ID,$RELAY_ID) AND status='active';")
-assert_eq "$LEASE_COUNT" "3" "T2 DIRECT 1 + RELAY 2 个 active NodePortLease"
+DIRECT_LEASE=$(mysqlc "SELECT CONCAT(node_id,'|',port,'|',lease_type,'|',status) FROM node_port_lease WHERE tunnel_id=$DIRECT_ID AND node_id=$INGRESS_NODE AND port=$DIRECT_PORT LIMIT 1;")
+assert_eq "$DIRECT_LEASE" "$INGRESS_NODE|$DIRECT_PORT|ingress|active" "T2 DIRECT ingress NodePortLease 完整"
+
+RELAY_IN_LEASE=$(mysqlc "SELECT CONCAT(node_id,'|',port,'|',lease_type,'|',status) FROM node_port_lease WHERE tunnel_id=$RELAY_ID AND node_id=$INGRESS_NODE AND port=$RELAY_PORT LIMIT 1;")
+assert_eq "$RELAY_IN_LEASE" "$INGRESS_NODE|$RELAY_PORT|ingress|active" "T2 RELAY ingress NodePortLease 完整"
+
+RELAY_OUT_LEASE=$(mysqlc "SELECT CONCAT(node_id,'|',port,'|',lease_type,'|',status) FROM node_port_lease WHERE tunnel_id=$RELAY_ID AND node_id=$EGRESS_NODE AND port=$RELAY_EGRESS_PORT LIMIT 1;")
+assert_eq "$RELAY_OUT_LEASE" "$EGRESS_NODE|$RELAY_EGRESS_PORT|egress|active" "T2 RELAY egress NodePortLease 完整"
+
+LEASE_ROWS=$(mysqlc "SELECT GROUP_CONCAT(CONCAT(node_id,':',port,':',lease_type,':',status) ORDER BY node_id,port SEPARATOR ',') FROM node_port_lease WHERE tunnel_id IN ($DIRECT_ID,$RELAY_ID);")
+assert_nonempty "$LEASE_ROWS" "T2 lease 账本可诊断 [$LEASE_ROWS]"
 DUP_COUNT=$(mysqlc "SELECT COUNT(*) FROM (SELECT node_id,port,COUNT(*) c FROM node_port_lease WHERE status='active' GROUP BY node_id,port HAVING c>1) x;")
 assert_eq "$DUP_COUNT" "0" "T2 同一物理 Node 端口无重复 active owner"
 
