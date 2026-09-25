@@ -189,9 +189,10 @@ main (9a489b5)
 | C1 | `reports/v4-wp2-plan.md`（本报告） | 仅文档 |
 | C2 | `forwarder`：`Forwarder` 接口增加 `Running()/SetUpstream()/Drain()`；`singhop.go` 实现 `SetUpstream`/`Drain`（原子上游槽位 + 有界 drain）；`base.go` 暴露 `drainFor(d)`；`egress.go` 实现 `SetUpstream` 返回 `ErrUpstreamNotSwappable`、`Drain` 复用 pipeTracker | 只改 `agent/internal/forwarder/**` |
 | C3 | `forwarder/interface_test` 扩展 + `singhop_hotswap_test.go`：真实 loopback 断言①`SetUpstream` 后 listener 未变（同一端口、旧连接不中断、字节继续计）；②上游不可达时新连接被丢弃但 listener 仍在；③`Drain` 有界且返回后 listener 已释放 | 只加测试文件 |
-| C4 | `manager/swap.go`（新）：`SwapStrategy`/`SwapPlan`/`PlanForwardSwap` 纯函数；`TunnelManager.HotSwapUpstream` / `ReplaceListener` / `DrainTunnel` | 新文件 + 不改 tunnel.go |
+| C4 | `manager/swap.go`（新）：`SwapStrategy`/`SwapPlan`/`PlanForwardSwap` 纯函数；`TunnelManager.HotSwapUpstream` / `ReplaceListener` / `DrainTunnel` / `DrainAllTunnels`；`tunnel.go` 的 `Apply` 重构成共享 `applyLocked`（两条入口共用同一 revision + 端口 guard 实现） | 新文件 + 只重构 tunnel.go（行为不变） |
 | C5 | `manager/swap_test.go`：判定表逐行 + `ReplaceListener` 的三类路径（幂等 / 同端口 / 换端口）+ bind 失败旧实例存活 + drain 后端口可立即复用 + `HotSwapUpstream` 未知/未运行/不可换的三种错误 | 只加测试文件 |
-| C6 | `manager/dataplane_test.go` 追加：EGRESS 换目标后**旧连接不中断**定向断言（锚定 §13.3.4 RELAY Egress 行，能力已存在，补契约断言） | 只追加测试 |
+| C6 | `control/client.go` `apply_tunnel` + `api/server.go` `POST /tunnel` 按 plan 路由（listener 移动走 `ReplaceListener`）+ `control/hotreload_test.go`：命令路径换端口不断连、幂等 replay no-op、stale 拒绝 | 只改 agent 命令面 |
+| C7 | （本 commit）报告同步实际切片与验收结果 | 仅文档 |
 
 CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动纳入。**不改 `.github/workflows/ci.yml`**（避免与并行 WP 的 CI 列表冲突——skill 记录的高频冲突点）。
 
@@ -228,6 +229,20 @@ CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动
 
 ## 9. 验证与回滚
 
-- 验证：`agent` CI job 三命令（vet / test / build）全绿；新测试文件必须真实执行（`go test ./...` 递归，无白名单问题）。
-- 回滚：纯代码回滚；无 schema、无 wire 契约变化，`backend`/`web` 零影响，回滚不需要数据修复。
+### 9.1 实际验证结果（实现后回填）
+
+| 检查 | 结果 |
+|---|---|
+| `go vet ./...` | 通过 |
+| `go test ./...`（全量，真实 loopback） | 通过（agentconfig / control / forwarder / manager 四包） |
+| `go test -race`（control / manager / forwarder） | 通过，无 DATA RACE |
+| CI `agent` job（vet + test + build + 交叉编译） | 每个功能 commit 一跑，逐次 success |
+| 对 WP1 分支 / 其他文件的副作用 | 无：`git diff 74f97cd --stat` 只含 `agent/**` + 本报告 |
+
+本地验证纪律：只跑单文件/单包 `go test`（Go 编译器 + 测试比 tsc/next build 轻得多，但 `-race` 全项目仍耗时，故按包执行）。**未**跑 `npm run build` / `tsc --noEmit`（本包不触碰 backend/web，且 CI 拥有重量验证）。
+
+### 9.2 回滚
+
+- 纯代码回滚；无 schema、无 wire 契约变化，`backend`/`web` 零影响，回滚不需要数据修复。
 - 不碰生产 DB/容器、不做部署。
+- 回滚到 WP1 契约 tip = `git reset --hard 74f97cd`（本分支所有 WP2 commit 在其之上，revert 任一 commit 不影响 WP1 血缘）。
