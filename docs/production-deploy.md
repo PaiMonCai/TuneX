@@ -64,7 +64,8 @@ openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 | `MYSQL_ROOT_PASSWORD` | 必须同时改 `DATABASE_URL` 里的口令（两边一致） |
 | `AUTH_SECRET` / `LICENSE_SECRET` | ≥32 随机字节，禁止跨环境复用 |
 | `TUNEX_CONFIG_KEY` / `TUNEX_LICENSE_KEY` | 32 字节 base64url Fernet 密钥，两把必须不同 |
-| `TUNEX_IMAGE` | 统一应用镜像，钉到具体 git sha（见下） |
+| `TUNEX_IMAGE` | 统一 Panel 应用镜像，钉到具体 git sha（见下） |
+| `TUNEX_AGENT_IMAGE` | 节点一键安装使用的多架构 Agent 镜像；生产建议与 Panel 使用同一 git sha |
 | `SMTP_*` | 公网服务必须配，否则验证/重置邮件只进日志 |
 | `BACKUP_PASSPHRASE` | cron 回滚前备份必需，否则备份脚本交互读取失败并终止回滚 |
 
@@ -73,21 +74,22 @@ PLAN.md 的既定默认，**不要**在生产环境打开以"图方便"。
 
 ### 2.3 选定镜像版本
 
-CI 发布一个完整应用镜像：
+CI 发布两类镜像：
 
 ```text
-ghcr.io/paimoncai/tunex:<git-sha>   ghcr.io/paimoncai/tunex:latest
+ghcr.io/paimoncai/tunex:<git-sha>         # Panel / Worker / Web / migrate
+ghcr.io/paimoncai/tunex-agent:<git-sha>   # Linux amd64/arm64 Agent
 ```
 
-该镜像同时承载 Backend、Worker、DB migrate 与 Next.js standalone Web，
-但 Compose 仍以独立容器运行各角色。生产钉 sha，不钉 `latest`：
+Panel 镜像仍由 Compose 以独立容器运行各角色。生产同时钉住同一个 git sha：
 
 ```bash
 SHA=$(git rev-parse HEAD)
 sed -i "s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA#" .env
+sed -i "s#^TUNEX_AGENT_IMAGE=.*#TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:$SHA#" .env
 ```
 
-GHCR 包若为 private 需先 `docker login ghcr.io`。
+Panel 主机若拉 private GHCR 包可先 `docker login ghcr.io`。但 **Agent 镜像必须允许节点匿名拉取**，否则控制台生成的一键安装命令无法做到无额外 registry 登录；使用 GHCR 时应将 `tunex-agent` package 设为 public，或把 `TUNEX_AGENT_IMAGE` 指向节点可访问的公开镜像仓库。
 
 ### 2.4 启动
 
