@@ -6,7 +6,7 @@ ALTER TABLE `node`
   MODIFY `connect_ip` VARCHAR(255) NULL;
 
 UPDATE `node`
-SET `agent_id` = CONCAT('agt_', REPLACE(UUID(), '-', ''))
+SET `agent_id` = UUID()
 WHERE `agent_id` IS NULL;
 
 ALTER TABLE `node`
