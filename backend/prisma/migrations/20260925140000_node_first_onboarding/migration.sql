@@ -2,7 +2,17 @@
 -- Expand-only: existing nodes/tunnels remain valid.
 
 ALTER TABLE `node`
+  ADD COLUMN `agent_id` VARCHAR(64) NULL,
   MODIFY `connect_ip` VARCHAR(255) NULL;
+
+UPDATE `node`
+SET `agent_id` = CONCAT('agt_', REPLACE(UUID(), '-', ''))
+WHERE `agent_id` IS NULL;
+
+ALTER TABLE `node`
+  MODIFY `agent_id` VARCHAR(64) NOT NULL;
+
+CREATE UNIQUE INDEX `node_agent_id_key` ON `node`(`agent_id`);
 
 -- Port ownership is now concrete-node scoped. The old group-level unique key
 -- prevented two different ingress nodes in one group from listening on the same port.
