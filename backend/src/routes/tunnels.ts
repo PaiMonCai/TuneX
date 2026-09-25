@@ -55,6 +55,11 @@ export const tunnelsRoutes = new Hono<{ Variables: AppVariables }>();
 tunnelsRoutes.use("*", async (c, next) => {
   const isCreate = c.req.method === "POST" && /^\/api\/tunnels\/?$/.test(c.req.path);
   c.set("workspace", await resolveWorkspaceAccess(c, isCreate ? "create" : "read"));
+  // V4 compatibility window: keep the legacy Tunnel API operational while
+  // advertising Forward as the successor product surface.
+  c.header("Deprecation", "true");
+  c.header("Link", '</api/forwards>; rel="successor-version"');
+  c.header("X-TuneX-Deprecated", "/api/tunnels");
   await next();
 });
 
