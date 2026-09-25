@@ -334,21 +334,26 @@ func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwa
 	}
 	m.markPortUsedLocked(cfg)
 
-	var toDrain *entry
 	if hadOld {
 		if old.cfg.ListenPort() != cfg.ListenPort() {
-			// The old port is genuinely free now; the new one owns its own.
-			m.releasePortLocked(old.cfg)
+			// The old port becomes free once the old forwarder has really
+			// stopped — releasing it before the listener is closed would
+			// advertise a port the kernel still has bound. The reservation
+			// is dropped in the teardown hook, never from this goroutine,
+			// and only if no other tunnel has taken the port by then.
+			m.stopEntryAsync(old, m.releasePortAfterStop(old.cfg))
+		} else {
+			// Same port: the new forwarder already owns the reservation,
+			// so there is nothing to free, and the old instance must not
+			// be allowed to drop it on its way out.
+			m.stopEntryAsync(old, nil)
 		}
-		toDrain = old
+		// The old instance is already tearing down; nothing to defer.
 	}
 	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
 	logx.Info("tunnel listener replaced", "id", cfg.ID, "mode", string(cfg.Mode),
 		"old_port", oldPortOf(old, hadOld), "port", cfg.ListenPort(), "revision", cfg.Revision)
 
-	if toDrain != nil {
-		defer m.stopEntry(toDrain)
-	}
 	return fwd, nil
 }
 
@@ -374,9 +379,16 @@ func (m *TunnelManager) applyLocked(cfg forwarder.TunnelConfig) (forwarder.Forwa
 	}
 	if old, ok := m.tunnels[cfg.ID]; ok {
 		if old.cfg.ListenPort() != cfg.ListenPort() {
-			m.releasePortLocked(old.cfg)
+			// The old port becomes free once the old forwarder has really
+			// stopped. On the same-port path startLocked already stopped it,
+			// so its listener is closed; either way the reservation is
+			// dropped only after Stop returns, never before.
+			defer m.stopEntryAsync(old, m.releasePortAfterStop(old.cfg))
+		} else {
+			// Same port, same owner: the new forwarder holds the key, so the
+			// old instance's teardown must not free it.
+			defer m.stopEntryAsync(old, nil)
 		}
-		defer m.stopEntry(old)
 	}
 	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
 	m.markPortUsedLocked(cfg)

@@ -280,6 +280,8 @@ CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动
 9. **`TestReplaceListenerTargetSwapFallbackKeepsNodeServing` 没有走 fallback**。它构造「端口 + target 同时改」，`PlanForwardSwap` 判 `SwapListener`，路由进 `replaceListenerLocked`，`hotSwapUpstreamLocked` 的 fallback 分支从未被执行——测试名承诺的契约没被测。已改名/拆分为真正触发 `SetUpstream` 被拒的用例（见 §9.2c）。
 10. **旧端口 guard 提前释放**。`replaceListenerLocked` / `applyLocked` 在 `stopEntry`（异步关旧 listener）之前就 `releasePortLocked`，guard 报告的端口已经空闲、OS 层面的 bind 却还没发生。已改为旧实例真正停止后才释放，消除「guard 说空、OS 说占」的端口再利用窗口（见 §9.2c）。
 
+  落地方式：`stopEntry` 增加 `stopEntryAsync(entry, onStopped)` 钩子，`releasePortAfterStop(cfg)` 在 `Stop()` 返回后**持 `m.mu`** 释放（guard 是 manager 状态，绝不交给 teardown goroutine 直接改）。该释放是 **owner-aware** 的：旧端口被新条目合法占用时（X→Y→X 的折返迁移）不删 key，避免晚到的释放把在跑隧道的端口送人。同端口同 id 场景显式传 nil 钩子——新 forwarder 已经持有该 key，旧实例拆的时候绝不能把它放掉。`TestReplaceListenerOldPortGuardFollowsTheOldListener` 同时钉住「仍在停止 → 保留」和「停止后 → 释放且端口立刻可再绑定」，mutation 验证：把 `stopEntryAsync(old, releasePortAfterStop(...))` 改回提前 `releasePortLocked` 立即 FAIL。
+
 ### 9.2c 本轮补片
 
 | 观察 | 修复前 | 修复后 |

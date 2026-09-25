@@ -72,6 +72,22 @@ func itoa(p int) string {
 	return string(buf[i:])
 }
 
+// portFreedWithin waits until port stops being reserved in the manager's guard.
+// It exists because the reservation release is now deliberately sequenced after
+// the old forwarder has stopped (see releasePortAfterStop), so the guard's read
+// is racy for a short, bounded window — but the release must still happen.
+func portFreedWithin(t *testing.T, ports func() map[int]bool, port int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !ports()[port] {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return !ports()[port]
+}
+
 // relayPayload is a RELAY tunnel config as the wire spells it.
 type relayPayload struct {
 	ID          string `json:"id"`
@@ -236,9 +252,12 @@ func TestAdminApplyTunnelPortMoveKeepsOldInstanceTemporarily(t *testing.T) {
 	// torn down before the new listener was live.
 	roundTrip(t, held, "after\n")
 
-	// The old port reservation was released (a later apply may reuse it).
-	if tunnels.UsedPorts()[oldPort] {
-		t.Fatal("old port is still reserved after a listener move")
+	// The old port reservation is released once the old instance has
+	// actually stopped: the guard must never advertise a port the kernel
+	// still has bound, so the release follows the teardown rather than
+	// preceding it. It must still be released promptly, not leaked.
+	if !portFreedWithin(t, tunnels.UsedPorts, oldPort, 5*time.Second) {
+		t.Fatal("the old port reservation was never released after a listener move")
 	}
 	if !tunnels.UsedPorts()[newPort] {
 		t.Fatal("new port is not reserved after a listener move")

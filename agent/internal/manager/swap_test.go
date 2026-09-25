@@ -46,6 +46,22 @@ func relayCfg(id string, port int, upstream string, revision int64) forwarder.Tu
 	}
 }
 
+// portFreedWithin waits until the manager's port guard no longer reserves port.
+// The reservation release is sequenced after the old forwarder has stopped, so a
+// read immediately after the move is racy by design; what must hold is that the
+// release still happens, promptly, and never leaks.
+func portFreedWithin(t *testing.T, ports func() map[int]bool, port int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !ports()[port] {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return !ports()[port]
+}
+
 // readOneLine reads a single line from conn, so a test can see which upstream
 // served it.
 func readOneLine(t *testing.T, conn net.Conn) string {
@@ -298,6 +314,84 @@ func TestHotSwapUpstreamEgressIsNotSwappable(t *testing.T) {
 // ReplaceListener — the §13.3.5 PREPARE/CUTOVER/DRAIN ordering
 // ---------------------------------------------------------------------------
 
+// TestReplaceListenerOldPortGuardFollowsTheOldListener is the guard window the
+// review flagged: the old port's reservation used to be dropped BEFORE the old
+// forwarder's listener was closed, so the guard advertised a port the kernel
+// still had bound. A concurrent Apply could then take that port and fail its
+// bind, on a port the manager had just called free.
+//
+// What must hold is a strict ordering: while the old listener is still bound,
+// the guard still reserves the port; only once the old instance has really
+// stopped does the reservation go, and then the port is immediately rebindable.
+func TestReplaceListenerOldPortGuardFollowsTheOldListener(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	aPort, aServed := labeledServer(t, "a")
+	defer aServed()
+	oldPort := freePort(t)
+	newPort := freePort(t)
+
+	base := relayCfg("guard", oldPort, addrFor(aPort), 5)
+	if _, err := tm.Apply(base); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer tm.StopAll()
+
+	// A connection held across the replacement: it keeps the old forwarder's
+	// Stop blocking for the whole drain window, which widens the window in
+	// which a wrong release would be observable.
+	held, err := dialRetry(t, addrFor(oldPort))
+	if err != nil {
+		t.Fatalf("dial held: %v", err)
+	}
+	defer held.Close()
+	if !waitFor(t, "relay picks up the connection", 2*time.Second, func() bool {
+		return tm.LiveConns("guard") > 0
+	}) {
+		t.Fatal("the relay never took the held connection")
+	}
+
+	next := base.Clone()
+	next.IngressPort = newPort
+	next.Revision = 6
+	if _, err := tm.ReplaceListener(next); err != nil {
+		t.Fatalf("ReplaceListener: %v", err)
+	}
+
+	// While the old instance is still stopping, the guard must keep the old
+	// port reserved. That is the observable that matters to a concurrent
+	// Apply: it reads the guard, not the kernel, and a reservation dropped
+	// early would let it take a port whose listener is still bound.
+	//
+	// (The OS side is not a usable oracle here: a probe bind can succeed on
+	// a port whose listener has just closed and fail on a port about to be
+	// released, so it would flake for reasons unrelated to the ordering.)
+	sawReserved := false
+	for i := 0; i < 40; i++ {
+		if tm.UsedPorts()[oldPort] {
+			sawReserved = true
+		} else if sawReserved {
+			// Previously reserved, now free: the teardown released it.
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawReserved {
+		t.Fatal("the old port reservation was released before the old instance stopped")
+	}
+
+	// And it IS released afterwards, with the port immediately reusable: no
+	// permanent leak.
+	if !portFreedWithin(t, tm.UsedPorts, oldPort, 5*time.Second) {
+		t.Fatal("the old port reservation was never released")
+	}
+	waitForPortClosed(t, oldPort)
+}
+
+// TestReplaceListenerMovesPortAndDrainsTheOldOne is the happy path: the new
+// port serves the same target on the new listener, the old port stops
+// accepting, the old port reservation is released (after the old instance
+// stops), and the new port stays reserved.
 func TestReplaceListenerMovesPortAndDrainsTheOldOne(t *testing.T) {
 	em := NewEgressManager()
 	tm := NewTunnelManager(em, "127.0.0.1")
@@ -335,10 +429,12 @@ func TestReplaceListenerMovesPortAndDrainsTheOldOne(t *testing.T) {
 	if got := servedLabel(t, addrFor(newPort)); got != "srv:a" {
 		t.Fatalf("new port served %q, want srv:a", got)
 	}
-	// The port guard released the old port the instant ReplaceListener
-	// returned: a later Apply may not collide with it.
-	if tm.UsedPorts()[oldPort] {
-		t.Fatal("old port is still marked used after a listener move")
+	// The port guard releases the old port once the old instance has
+	// actually stopped, which is what keeps the guard from advertising a
+	// port the kernel still has bound. It must still be released, not
+	// leaked, and the new port stays ours.
+	if !portFreedWithin(t, tm.UsedPorts, oldPort, 5*time.Second) {
+		t.Fatal("the old port reservation was never released after a listener move")
 	}
 	if !tm.UsedPorts()[newPort] {
 		t.Fatal("new port is not marked used after a listener move")

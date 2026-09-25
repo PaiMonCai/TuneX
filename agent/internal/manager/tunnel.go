@@ -236,14 +236,55 @@ func (m *TunnelManager) releasePortLocked(cfg forwarder.TunnelConfig) {
 // flags this exact pair). Callers release the port under the lock instead —
 // see releasePortLocked — which also makes "Remove frees the port" hold the
 // instant Remove returns rather than "eventually".
+//
+// onStopped runs after Stop returned, i.e. after the old listener is really
+// closed and its port is reclaimable at the OS level. Releasing a reservation
+// before that point would let the guard advertise a port the kernel still has
+// bound, and the next Apply would fail its bind on a port the map says is free.
+// It is nil on the teardown paths that release under the lock themselves.
 func (m *TunnelManager) stopEntry(e *entry) {
+	m.stopEntryAsync(e, nil)
+}
+
+// stopEntryAsync is stopEntry with a post-stop hook. Caller must not hold m.mu
+// (Stop blocks for drainTimeout); onStopped is invoked from the goroutine, after
+// Stop returned. A nil hook is the plain "Stop and log" case.
+func (m *TunnelManager) stopEntryAsync(e *entry, onStopped func()) {
 	go func() {
 		if err := e.fwd.Stop(); err != nil {
 			logx.Warn("tunnel stop failed", "id", e.cfg.ID, "err", err.Error())
-			return
+			// Fall through anyway: the forwarder is out of the registry, so
+			// the port is ours to keep or free whatever Stop managed to do.
+		}
+		if onStopped != nil {
+			onStopped()
 		}
 		logx.Info("tunnel removed", "id", e.cfg.ID, "mode", string(e.cfg.Mode), "port", e.cfg.ListenPort())
 	}()
+}
+
+// releasePortAfterStop releases the ports held by cfg once the forwarder that
+// still owns them has actually stopped. The reservation lives under m.mu, so
+// the release takes the write lock rather than being dispatched at teardown
+// time: the guard is manager state, never the teardown goroutine's.
+//
+// The release is owner-aware and therefore safe to run late. A listener move
+// back onto the port being drained is legal (X -> Y, then Y -> X), and by the
+// time the drained forwarder's Stop returns, the newer entry may already have
+// reserved that port. Blindly deleting the key would hand a live tunnel's port
+// to whoever asks next, so the key is dropped only while no registered tunnel
+// holds it.
+func (m *TunnelManager) releasePortAfterStop(cfg forwarder.TunnelConfig) func() {
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, e := range m.tunnels {
+			if e.cfg.ID != cfg.ID && e.cfg.ListenPort() == cfg.ListenPort() {
+				return
+			}
+		}
+		m.releasePortLocked(cfg)
+	}
 }
 
 // isStale reports whether next is older than current.
