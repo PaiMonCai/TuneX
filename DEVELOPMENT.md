@@ -356,7 +356,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP0 | 架构/文档冻结 | Shared | 已完成 | ✅ 已完成 |
 | WP1 | v3 Schema 契约 | A | WP0 | ✅ 已完成（分支 `feature/v3-wp1-schema` 已 push，CI 全绿） |
 | WP2 | Legacy Backfill / Upgrade | A | WP1 schema 设计冻结后 | **WP1 已合并** |
-| WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | **WP1 已合并** |
+| WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | ✅ 已完成（分支 `feature/v3-wp3-port-allocator` 已 push，CI 全绿） |
 | WP4 | Agent v3 Runtime 骨架 | B | WP0；不依赖 DB 实现 | WP1 已合并或确认无 schema 耦合 |
 | WP5 | TCP RELAY Data Plane | B | **WP4 接口冻结** | WP4 已合并 |
 | WP6 | v3 Command / Revision / ACK 协议 | B/C | WP0；协议字段冻结即可 | WP1 已合并；WP4 接口兼容 |
@@ -382,13 +382,15 @@ WP1 已完成（见 §7.4 交付记录）。当前同步窗口为：
 WP1 合并后立即扩展并行窗口到 **WP2 + WP3**，B/C Track 继续推进：
 
 #### Track A
-`feature/v3-wp2-legacy-backfill`（WP2）、`feature/v3-wp3-port-lease`（WP3）
+`feature/v3-wp2-legacy-backfill`（WP2）、`feature/v3-wp3-port-allocator`（WP3，已交付，见 §7.6）
 
 依赖已满足（WP1 已合并）。注意：
 
 - WP2 只能做**确定性**回填，不得猜测 Node.role（WP1 的 `role` 列可空正是为此留的）。
-- WP3 的端口所有权以 `NodePortLease.UNIQUE(node_id, port)` 为最终真相，
+- WP3 已交付：端口所有权以 `NodePortLease.UNIQUE(node_id, port)` 为最终真相，
   Redis NX 抢占锁统一取 `RedisKeys.portLeaseLock`（见 `src/tenant-scope.ts`）。
+  WP8 编排器调用 `acquirePort` 时必须把同节点存量 DIRECT 的 `listen_port` 经
+  `reservedPorts` 灌入（详见 §7.6「LEGACY 交接」）。
 
 #### Track B
 `feature/v3-wp4-agent-runtime`
@@ -564,7 +566,7 @@ DoD：
 - orphan lease 可 reconcile；
 - 完整 backend tests。
 
-**状态：🟡 已实现，分支 `feature/v3-wp3-port-allocator` 待 push / CI 验证。**
+**状态：✅ 已实现，分支 `feature/v3-wp3-port-allocator` 已 push，CI 全绿（5 jobs，含 `portPool.test.ts` 42/42 在 backend job 内实跑）。**
 
 交付物（`backend/src/services/portPool.ts`，708 → 现 825 行）：
 
