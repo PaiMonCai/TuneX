@@ -12,16 +12,10 @@
 :80 {
 	encode zstd gzip
 
-	# 由宿主机反代传入的原始协议信息继续传给 Backend。
-	# 默认端口只绑定 127.0.0.1，因此这里的上游只能来自本机可信代理。
-	@has_forwarded_proto header X-Forwarded-Proto *
-	reverse_proxy @has_forwarded_proto backend:3000 {
-		header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
-	}
-
 	# Agent 控制面 Socket.IO / WebSocket。
 	handle /socket.io/* {
 		reverse_proxy backend:3001 {
+			# 宿主机反代已完成 TLS 时，保留原始协议给 Backend。
 			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
 			transport http {
 				read_timeout 0
@@ -45,6 +39,8 @@
 	}
 
 	handle {
-		reverse_proxy web:3000
+		reverse_proxy web:3000 {
+			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+		}
 	}
 }
