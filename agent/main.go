@@ -16,12 +16,17 @@
 //     ⚠️ the ACK frame is "430[..]" (4=engine MESSAGE, 3=ACK, 0=ack-id). "44" is
 //     the Socket.IO ERROR packet, not an ack.
 //   - sysinfo (no ack):        42["sysinfo", {..}] every 10s
-//   - config (S->C):           42["config", "<fernet-token>"]  (bare string, NOT
+//   - config (S->C):           42["config", "<fernet-token>"] (bare string, NOT
 //     an array — the original panics on an array payload)
 //   - listen (C->S):           42["listen", {name,port,type}] (only when a service
 //     addr used the WAIT_LISTEN placeholder)
 //
 // Only the Go standard library is used, so the module builds fully offline.
+//
+// v3 runtime (WP4) sits alongside the legacy session: manager.TunnelManager /
+// manager.EgressManager own v3 tunnels, api serves the local admin plane and
+// reporter sends the heartbeat. The legacy engine in internal/engine is NOT
+// touched — a DIRECT node keeps behaving exactly as before.
 package main
 
 import (
@@ -48,6 +53,21 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// run starts the v3 runtime and the legacy control-plane session, then blocks
+// until the process is signalled. It returns a process exit code.
+//
+// Startup order is fixed:
+//
+//  1. v3 managers (TunnelManager + EgressManager; one shared port guard)
+//  2. restore: pull the node's ACTIVE tunnels so ports are re-bound after a
+//     restart (devmap §5.5). Before the WP1 contract lands this is a no-op
+//     source, so the order is exercisable today.
+//  3. admin API (:9090) — the mutation surface (WP4 scope; the final panel
+//     orchestration is WP6 and is deliberately not wired here)
+//  4. heartbeat reporter (every 30s, optional)
+//  5. the legacy Socket.IO agent loop (unchanged legacy DIRECT behaviour)
+//
+// Shutdown is the reverse: reporter, admin API, managers, legacy engine.
 func run(args []string) int {
 	cfg, err := agentconfig.Parse(args, version)
 	if err != nil {
@@ -75,6 +95,11 @@ func run(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	rt := startV3Runtime(ctx, cfg)
+	if rt != nil {
+		defer rt.Shutdown()
+	}
 
 	// The agent reconnects internally forever; Run only returns on ctx cancel.
 	if err := a.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
