@@ -9,6 +9,7 @@ import (
 //
 // Supported (enough for $HOME/.tunex-agent.yaml):
 //
+//	agent-id: agt_xxxxxxxx
 //	node-id: node-01
 //	role: BOTH
 //	debug: true
@@ -53,6 +54,8 @@ func applyYAML(cfg *Config, text string) {
 // own configuration only.
 func setScalar(cfg *Config, key, val string) {
 	switch key {
+	case "agent-id", "agent_id":
+		cfg.AgentID = val
 	case "node-id", "node_id":
 		cfg.NodeID = val
 	case "debug":
