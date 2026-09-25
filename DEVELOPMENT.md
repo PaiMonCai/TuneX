@@ -435,7 +435,7 @@ WP1 已合并，Prisma 类型已生成，可按最终字段开发；仍需满足
 开发者 D → WP14 E2E Harness / QA infrastructure
 ```
 
-WP1 已合并（见 §7.4），WP2 + WP3 已解锁；WP5 已实现待合入（§7.8），WP7/WP8 的合并门槛不变。
+WP1 已合并（见 §7.4），**WP2 已交付（§7.5，待 CI 验证）** + WP3 已解锁；WP5 已实现待合入（§7.8），WP7/WP8 的合并门槛不变。ut breaking DIRECT))
 
 > 注：本节措辞里的「已合并」指代码已交付并 CI 全绿。WP1 尚未由 maintainer
 > 合入 `main`——本仓库的 PAT 无建 PR 权限，需在 Web 端开
@@ -542,6 +542,63 @@ DoD：
 - 旧 Agent 仍能获取 legacy config。
 
 DoD：empty DB + legacy fixture + v3 upgrade fixture 全部通过。
+
+**实现：**
+
+- 迁移 `20260926120000_v3_legacy_backfill`：**零 DDL，只含 DML**（三条幂等
+  `UPDATE`）。它是 WP1 之后的第二道防线——WP1 迁移跑完的那一刻，新代码写入的
+  行不带任何 v3 列值（`routes/tunnels.ts` 的 tunnel.create 不写 tunnel_mode /
+  remote_host；`socket/index.ts` 与 `routes/admin-extended.ts` 的 node.create
+  不写 Node.role），这些行 WP1 的回填语句覆盖不到，本迁移在它们被创建**之后**
+  运行把它们补齐。因为只做 UPDATE，回滚镜像时不需要逆迁移（§6）。
+  - `tunnel_mode`：剩余 NULL 且**不带 egress 指针**（`egress_node_id` /
+    `egress_pool_id` 双 NULL）的行 → `direct`。判定比 WP1 严：带 RELAY 指针
+    却缺 mode 是「写了一半的 v3 行」，留给 WP8，不被草率标成 direct。
+  - `remote_host` / `remote_port`：`forward_addresses` 首目标回填，端口取最后
+    一个冒号后片段（IPv6 冒号不误判）、host 剥掉 `[]`。解析不出（无端口 /
+    非数字 / 空数组 / 越界）一律留 NULL，**绝不写 0 端口**。与 WP1 的回填
+    SQL、`socket/config-generator.ts#normalizeForwardAddresses`、
+    `routes/tunnels.ts` 的 FORWARD_RE 完全一致。
+  - `Node.role`：按**节点组被哪些隧道引用的观测事实**确定性回填——只被 in 组
+    引用 → `ingress`；只被 out 组引用 → `egress`；in/out 都引用、或没有任何
+    隧道引用 → **留 NULL**（组内多节点谁走哪个方向无法从组级观测推出）。
+    判定依据不是 `NodeGroup.node_type`（§2.1：该列只是 legacy 兼容字段），
+    也不看 `tunnel_chain`（chain 是同一条隧道的附加跳，参与节点不可推出）。
+    `'both'` 永远不写：那是「单机兼任」的显式管理动作，不是能从数据里推导的
+    事实；留 NULL 让管理员在面板显式设置，成本远低于把未声明节点误判成兼任。
+    幂等靠外层 `role IS NULL` 限定：管理员已显式设置（含 `both`）的行永不被回改。
+
+- 测试 `backend/tests/legacy-backfill.test.mjs`（`TUNEX_DB_TEST=1`）：
+  三条防线各用一个匿名库，互不污染。
+  - **① 空库**：legacy 基线 + 全量 v3 迁移全部 apply，`_prisma_migrations`
+    逐条 `finished_at` 非空。
+  - **② legacy fixture**：`fixtures/legacy-backfill-rows.sql` 灌**纯存量数据**
+    （只写 legacy 列）→ 升 v3 → `fixtures/legacy-backfill-post-v3.sql` 追加
+    v3 列已存在才能构造的引用。断言 §7.5 的全部「不变」：10 条隧道的
+    `listen_port` / `forward_addresses` / `user_id` / `workspace_id` / in-out
+    组指针逐字不变，user / workspace / member / node_group / node 的关系不变；
+    同时断言回填结果（3 ingress + 1 egress、2 行保持 NULL、整库无 `both`）。
+  - **③ v3 upgrade fixture**：同一条 `migration.sql` 重放三次，数值与计数不变；
+    管理员显式设置过的 `relay` / `both` 永不被回改。
+  - **旧 Agent 兼容**：直接驱动真实的 `buildInNodeConfig` /
+    `normalizeForwardAddresses`，证明下发的仍是 `listen_port` +
+    `forward_addresses`，且**不含**任何 v3 字段（tunnel_mode / remote_host /
+    apply_status）。配置生成路径本身未改一行。
+
+DoD 核对：
+
+| 验收项 | 结论 |
+|---|---|
+| 存量 Tunnel → direct | ✅ 9/10 → `direct`，唯一例外是带 egress 指针的半条 v3 行（留给 WP8） |
+| tunnel 数量不变 | ✅ 回填前后 COUNT(*) 与逐行 id 一致 |
+| listen port 不变 | ✅ 逐条断言 19001…19010 原样 |
+| forward_addresses 不变 | ✅ 字符串 / 对象 / IPv6 / 多目标四种形态逐字不变 |
+| workspace/user/policy 关系不变 | ✅ user / workspace / workspace_member / node_group / node 的关系与归属逐条断言 |
+| Node.role 确定性回填，不猜 BOTH | ✅ 只按组用途观测判定；混挂组与无隧道组留 NULL；整库 `role = 'both'` 计数恒为 0 |
+| 旧 Agent 仍能获取 legacy config | ✅ 真实 `buildInNodeConfig` 输出仍以 `forward_addresses` + `listen_port` 为准，无 v3 字段泄漏 |
+| empty DB + legacy fixture + v3 upgrade fixture 全部通过 | ✅ 12 tests / 0 fail（本地一次性 mysql:8.4 容器实测） |
+| full CI green | ⏳ 等 push 后的 CI 验证（CI 新增一步 `node --experimental-strip-types --test tests/legacy-backfill.test.mjs`） |
+
 
 ---
 

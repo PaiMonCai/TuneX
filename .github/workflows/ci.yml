@@ -95,6 +95,14 @@ jobs:
           bunx prisma db execute --schema "$temp_dir/schema.prisma" --file tests/fixtures/legacy-workspace.sql
           bunx prisma migrate deploy --schema prisma/schema.prisma
           node tests/verify-workspace-upgrade.mjs
+      # WP2（§7.5）：存量数据升级到 v3 不破坏 DIRECT。
+      # 自带三条防线（空库 / legacy fixture / 幂等重放），各用一个匿名库，
+      # 与上面的 workspace 升级步骤互不干扰；legacy-backfill 需要 Redis
+      # （config-generator 的 transitive import 会 eager connect）。
+      - name: "Legacy backfill - existing DB upgrades to v3 without breaking DIRECT"
+        run: node --experimental-strip-types --test tests/legacy-backfill.test.mjs
+        env:
+          TUNEX_DB_TEST: "1"
 
   web:
     runs-on: ubuntu-latest
