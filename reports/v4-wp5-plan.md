@@ -293,6 +293,20 @@ WP1（`feature/v4-wp1-forward-revisions`，worktree `/opt/TuneX-v4-wp1`）会改
 
 不新增 DB 集成测试（`tests/*.test.mjs` 需要 MySQL；§5 迁移由 CI 的 `prisma migrate deploy` 覆盖）。
 
+### 6.3 交付核对：实现与本报告的差异（收尾时记录）
+
+以下为**实现与 §4/§6 报告的偏离**，均为有意决策，已就地补决策记录注释；PR 与代码注释以本节为准。
+
+| 项 | 报告原计划 | 实际交付 | 理由 |
+|---|---|---|---|
+| 端点前缀 | 用户侧 `/api/nodes/:id/lifecycle` 等 5 个端点 | 管理端 `/api/admin/node/:id/lifecycle`、`/impact`、`DELETE /node/:id/lifecycle` | 与 WP10 `node-admin.ts` 同一挂载点，直接复用 `adminRequired → adminPermissionGuard`，不新增权限键。用户侧端点与 `routes/nodes.ts` 的 `accepts_new_business` 投影留给后续 |
+| 专用限流规则 | `node-lifecycle` 规则（60s/10 次，插在 `api-global` 前）+ 反锚定测试 | 未加；沿用 `api-global` | lifecycle 写不是凭据轮换那种高频攻击面，非法变更被 409 挡住，滥用者拿不到额外能力。**规避 R5 的方式改为写下顺序约束**：日后若加规则必须插在 `api-global` 之前 |
+| 角色/端口区间 impact 接入 | 改 `routes/node-admin.ts` 的 PATCH role 加守卫 | 未改 node-admin.ts；改为 `GET /api/admin/node/:id/impact?next_role=&port_min=&port_max=` 提供同等判定 | 不动 WP10 既有写路径，避免与并行开发的 WP10 冲突；判定逻辑仍走同一个 `checkRoleChange` 纯函数 |
+| `routes/nodes.ts` 投影 | `GET /api/nodes` 增加 lifecycle/connection/accepts_new_business | 未改 nodes.ts | 同上，不在本期触碰既有列表投影；投影函数（`lifecycleView`）已就位，接入是纯增量 |
+| route 测试文件名 | `node-lifecycle-routes.test.ts` | `node-lifecycle-route.test.ts` | 命名对齐实现文件名 |
+
+**test:unit 的一次真实修复**：WIP 曾把脚本改成 `bun test src/**/__tests__/`。未加引号时 `**` 在 sh / bash（globstar 未开，= CI 默认）下退化成单层 `*`，展开只会得到 `src/{middlewares,routes,services,socket}/__tests__/`，**静默漏掉 `src/__tests__/`**（4 个既有套件）。加引号则被 `bun test` 当成路径过滤器而报错。最终改为 `bun test src`——交给 Bun 自己去递归匹配，无 shell glob 依赖，且实测覆盖 23 个文件 / 743 条用例（1.4s）。
+
 ---
 
 ## 7. 风险与已采取的规避
@@ -303,7 +317,7 @@ WP1（`feature/v4-wp1-forward-revisions`，worktree `/opt/TuneX-v4-wp1`）会改
 | R2 | `nodeView` 的 online 推导（90s 窗口）与 offline-detector 的 `status` 翻转口径不同 | 不改推导。`connection` 只做命名化，两者差异由 WP6 health 合成统一 |
 | R3 | WP1 并行改 `schema.prisma` | §5.2 的合并策略先冻结；migration 时间戳不重名 |
 | R4 | memory 小（3.9G，4 核），本地跑不动 tsc/build | 本地只跑 `bun test <单文件>`；typecheck/build/test 全量交 CI |
-| R5 | rate-limit 规则顺序错误导致 lifecycle 写操作被 api-global 按 600/min 放行 | 新规则插在 `api-global` 之前；测试反锚定 |
+| R5 | rate-limit 规则顺序错误导致 lifecycle 写操作被 api-global 按 600/min 放行 | 本期**未**加专用规则（见 §6.3），沿用 api-global；顺序约束已写进 `routes/node-lifecycle.ts` 顶部注释：日后加规则必须插在 `api-global` 之前 |
 | R6 | `retiring` 无 cancel 出口，用户误点后无法回头 | 契约显式拒绝 `retiring → *`，并在 PR/UI 契约里写明「退役前需清空依赖」；WP7 不得提供取消按钮 |
 
 ---
