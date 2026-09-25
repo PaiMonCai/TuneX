@@ -27,6 +27,72 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
   }
+  function sha256(value) {
+    return createHash("sha256").update(value).digest("hex");
+  }
+
+  async function createIngressNode(groupId, label, portBase) {
+    const credential = `ci-node-${label}-${randomUUID()}`;
+    const node = await db.node.create({
+      data: {
+        node_group_id: groupId,
+        node_id: `ci-${label}-${nonce}`,
+        connect_ip: "127.0.0.1",
+        status: "active",
+        role: "ingress",
+        last_seen_at: new Date(),
+        port_range_min: portBase,
+        port_range_max: portBase + 99,
+        node_credential_hash: sha256(credential),
+        credential_revoked: false,
+      },
+    });
+    return { node, credential };
+  }
+
+  /**
+   * Minimal outbound-only fake Agent for workspace integration tests.
+   *
+   * This deliberately exercises the same authenticated Agent -> Panel command
+   * endpoints as production. It only ACKs commands; real listener/data-plane
+   * behaviour belongs to the dedicated v3 E2E gate.
+   */
+  function startFakeAgent(credential) {
+    let stopped = false;
+    const task = (async () => {
+      while (!stopped) {
+        const pull = await app.request("http://localhost/api/internal/node/commands", {
+          headers: { authorization: `Bearer ${credential}` },
+        });
+        assert.equal(pull.status, 200, `fake agent command pull failed: ${pull.status}`);
+        const body = await pull.json();
+        const command = body?.data?.command ?? null;
+        if (command?.envelope?.command_id) {
+          const ack = await app.request("http://localhost/api/internal/node/ack", {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${credential}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              command_id: command.envelope.command_id,
+              ok: true,
+              applied_revision: command.envelope.revision,
+            }),
+          });
+          assert.equal(ack.status, 200, `fake agent ack failed: ${ack.status}`);
+          continue;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    })();
+
+    return async () => {
+      stopped = true;
+      await task;
+    };
+  }
+
   async function register(email) {
     const response = await request("/api/auth/register", "POST", "", { email, password });
     const result = await response.json();
@@ -78,19 +144,38 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       const groupData = (await createdGroup.json()).data;
       assert.equal(groupData.workspace_id, teamId);
       assert.ok(groupData.token);
+
+      // v3 DIRECT is a real runtime operation now: concrete ingress placement,
+      // per-node credential, NodePortLease and Agent ACK are mandatory before
+      // apply_status can become active.
+      const teamIngress = await createIngressNode(groupData.id, "team-ingress", 20000);
+      const stopTeamAgent = startFakeAgent(teamIngress.credential);
       const ownTunnel = await request("/api/tunnels", "POST", a.cookie, { name: "Team TCP", tunnel_type: "tcp", in_node_group_id: groupData.id, forward_addresses: ["127.0.0.1:8080"] }, teamId);
       const tunnelPayload = await ownTunnel.json();
+      await stopTeamAgent();
       assert.equal(ownTunnel.status, 200, JSON.stringify(tunnelPayload));
       const tunnelId = tunnelPayload.data.id;
+      assert.equal((await db.tunnel.findUniqueOrThrow({ where: { id: tunnelId } })).ingress_node_id, teamIngress.node.id);
+
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       await db.tunnelTraffic.create({ data: { tunnel_id: tunnelId, traffic: 8192, traffic_cost: 0, date: today } });
-      await db.node.create({ data: { node_group_id: groupData.id, node_id: `ci-${nonce}`, connect_ip: "127.0.0.1", status: "active" } });
+
       const personalGroup = await request("/api/node-groups", "POST", a.cookie, { name: "Personal ingress", node_type: "in" });
       assert.equal(personalGroup.status, 201);
-      const personalTunnel = await request("/api/tunnels", "POST", a.cookie, { name: "Personal TCP", tunnel_type: "tcp", in_node_group_id: (await personalGroup.json()).data.id, forward_addresses: ["127.0.0.1:8081"] });
-      assert.equal(personalTunnel.status, 200, JSON.stringify(await personalTunnel.clone().json()));
+      const personalGroupId = (await personalGroup.json()).data.id;
+      const personalIngress = await createIngressNode(personalGroupId, "personal-ingress", 22000);
+      const stopPersonalAgent = startFakeAgent(personalIngress.credential);
+      const personalTunnel = await request("/api/tunnels", "POST", a.cookie, { name: "Personal TCP", tunnel_type: "tcp", in_node_group_id: personalGroupId, forward_addresses: ["127.0.0.1:8081"] });
+      const personalPayload = await personalTunnel.clone().json();
+      await stopPersonalAgent();
+      assert.equal(personalTunnel.status, 200, JSON.stringify(personalPayload));
       const personalTunnelId = (await personalTunnel.json()).data.id;
+
+      // The rest of this test intentionally asserts the user's personal
+      // workspace has zero nodes. Remove only the temporary fake Agent after
+      // DIRECT has been ACKed; Tunnel survives because ingress FK is SetNull.
+      await db.node.delete({ where: { id: personalIngress.node.id } });
       const legacySubscription = await request(`/api/tunnel/subscription?token=${a.subscriptionKey}`, "GET", "", undefined, teamId);
       assert.equal(legacySubscription.status, 200);
       assert.deepEqual((await legacySubscription.json()).data.tunnels.map((t) => t.id), [personalTunnelId], "account subscription must never include team tunnels");
