@@ -3,8 +3,9 @@
 #
 # 与开发栈的差异（PLAN.md 4.5 "必须有独立的生产配置"）：
 #   · 不映射 MySQL / Redis 主机端口（仅 compose 内网可达，杜绝公网暴露 3306/6379）
-#   · 不映射 backend/web 主机端口，对外只暴露 Caddy 80/443（TLS 自动签发）
-#   · 入口统一走 TLS；/socket.io/* 单独路由到 backend:3001（Agent 控制面 WebSocket）
+#   · backend/web 不映射主机端口；Docker 对外只有 Caddy 一个统一 HTTP 入口
+#   · 默认仅绑定 127.0.0.1:13000，交给宿主机 Nginx/宝塔/1Panel 做公网 TLS
+#   · /socket.io/* 单独路由到 backend:3001（Agent 控制面 WebSocket）
 #   · TuneX 应用角色共用一个 CI 预构建 GHCR 镜像；镜像 tag 由 .env 的 TUNEX_IMAGE 钉住
 #   · 资源限额 / 日志轮转 / no-new-privileges，避免单容器吃光主机
 #   · 独立数据卷名（*-prod），与开发栈同机运行也不互相覆盖
@@ -110,7 +111,7 @@ services:
     container_name: tunex-backend
     restart: always
     env_file: [.env]
-    # HTTP 3000 + Socket.IO 3001 均只对 compose 内网开放，由 Caddy 反代。
+    # HTTP 3000 + Socket.IO 3001 均只对 compose 内网开放，由 Docker 内 Caddy 反代。
     expose:
       - "3000"
       - "3001"
@@ -197,16 +198,12 @@ services:
     image: ${CADDY_IMAGE:-caddy:2.8}
     container_name: tunex-caddy
     restart: always
-    # 主机仅开放 80（ACME HTTP-01 挑战 + 跳转）与 443（业务，含 HTTP/3 UDP）。
-    # 非 80/443（如上游还有一层 LB）可用 CADDY_HTTP_PORT / CADDY_HTTPS_PORT 覆盖。
+    # 默认生产模式：只给宿主机反代暴露一个 loopback HTTP 端口。
+    # 公网 80/443、TLS、域名与证书统一由宿主机 Nginx/宝塔/1Panel 管理。
     ports:
-      - "${CADDY_HTTP_PORT:-80}:80"
-      - "${CADDY_HTTPS_PORT:-443}:443"
-      - "${CADDY_HTTPS_PORT:-443}:443/udp"
+      - "127.0.0.1:${TUNEX_HTTP_PORT:-13000}:80"
     volumes:
-      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
       backend:
         condition: service_started
@@ -226,11 +223,6 @@ volumes:
     name: tunex-mysql-data-prod
   redis_data:
     name: tunex-redis-data-prod
-  caddy_data:
-    # 卷名保留 tunex-caddy-data 前缀：alert.sh 按 `tunex-caddy-data*` 找证书目录。
-    name: tunex-caddy-data-prod
-  caddy_config:
-    name: tunex-caddy-config-prod
 
 networks:
   tunex:
