@@ -13,7 +13,7 @@
 #   REDIS_KEYS：key 数量突增（> 10万 提示检查 TTL/缓存击穿）
 #   REDIS_EVICT：有 key 被逐出（maxmemory-policy 触发）→ 严重
 #   CONTAINER：compose 服务全部 running 且（如定义了 healthcheck）healthy
-#   CERT   ：Caddy HTTPS 证书剩余有效期（< 14 天告警；未启用 TLS 时跳过）
+#   CERT   ：standalone Caddy HTTPS 证书剩余有效期（< 14 天告警；宿主机反代模式跳过）
 #   BACKUP ：最新备份距今小时数（> 25h 告警 —— 说明 cron 没跑）
 #
 # 通知渠道（按优先级）：
@@ -237,7 +237,7 @@ if [[ -f "$COMPOSE_FILE" ]]; then
   fi
 fi
 
-# 证书：若 Caddy 用 443 且有站点域名，尝试读 caddy 卷内证书到期（best-effort）
+# 证书：仅 standalone 模式存在 caddy_data 卷；默认宿主机反代模式自动跳过（best-effort）
 CADDY_DIR="$(find /var/lib/docker/volumes -maxdepth 1 -name 'tunex-caddy-data*' 2>/dev/null | head -1)"
 if [[ -n "${CADDY_DIR:-}" && -d "$CADDY_DIR/_data" ]]; then
   DAYS_MIN=9999
