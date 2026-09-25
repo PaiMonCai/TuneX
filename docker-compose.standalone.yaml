@@ -1,0 +1,28 @@
+# TuneX standalone public entry overlay
+#
+# Use this only when the host has no existing Nginx/Apache/Traefik/1Panel proxy.
+# Requires Docker Compose >= 2.24.4 for !override.
+#
+#   docker compose \
+#     -f docker-compose.prod.yaml \
+#     -f docker-compose.standalone.yaml \
+#     --env-file .env up -d
+#
+# In this mode Caddy owns host 80/443 and uses Caddyfile.prod for ACME/TLS.
+services:
+  caddy:
+    env_file: [.env]
+    ports: !override
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+      - "${CADDY_HTTPS_PORT:-443}:443/udp"
+    volumes: !override
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+    name: tunex-caddy-data-prod
+  caddy_config:
+    name: tunex-caddy-config-prod
