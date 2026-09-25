@@ -1371,36 +1371,63 @@ export async function reapplyRelayTunnel(
       .filter((t) => t.id !== tunnelId),
   );
 
-  let ingressPort = row.listen_port === null ? null : Number(row.listen_port);
-  let egressPort = row.egress_port === null ? null : Number(row.egress_port);
-  if (ingressPort === null) {
-    const alloc = await allocateTunnelPort(
-      { nodeId: ingressPick.node.id, direction: "ingress", preferred: null, tunnelId, reservedPorts: ingressReserved },
-      deps.portPoolDeps,
-    );
-    if (!alloc.ok) {
-      return fail("acquire_ports", alloc.code, alloc.detail, { meta: { direction: "ingress" } });
-    }
-    ingressPort = alloc.port;
+  // Even when the Tunnel row already contains a port, the durable
+  // NodePortLease may not exist yet (notably the create -> reapply path where
+  // the user-specified ingress port is persisted before orchestration). Always
+  // acquire with the existing port as `preferred`: acquirePort is idempotent
+  // for an already-held same tunnel/direction lease and creates the missing
+  // canonical ownership row otherwise.
+  const existingIngressPort = row.listen_port === null ? null : Number(row.listen_port);
+  const ingressAlloc = await allocateTunnelPort(
+    {
+      nodeId: ingressPick.node.id,
+      direction: "ingress",
+      preferred: existingIngressPort,
+      tunnelId,
+      reservedPorts: ingressReserved,
+    },
+    deps.portPoolDeps,
+  );
+  if (!ingressAlloc.ok) {
+    return fail("acquire_ports", ingressAlloc.code, ingressAlloc.detail, {
+      meta: { direction: "ingress", port: existingIngressPort },
+    });
   }
-  if (egressPort === null) {
-    const alloc = await allocateTunnelPort(
-      { nodeId: egressPick.node.id, direction: "egress", preferred: null, tunnelId, reservedPorts: egressReserved },
-      deps.portPoolDeps,
-    );
-    if (!alloc.ok) {
-      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-      return fail("acquire_ports", alloc.code, `出口端口分配失败：${alloc.detail}`, {
-        meta: { direction: "egress", ingress_port: ingressPort },
-      });
+
+  const existingEgressPort = row.egress_port === null ? null : Number(row.egress_port);
+  const egressAlloc = await allocateTunnelPort(
+    {
+      nodeId: egressPick.node.id,
+      direction: "egress",
+      preferred: existingEgressPort,
+      tunnelId,
+      reservedPorts: egressReserved,
+    },
+    deps.portPoolDeps,
+  );
+  if (!egressAlloc.ok) {
+    if (!ingressAlloc.reused) {
+      await releaseLease({ leaseId: ingressAlloc.leaseId }, deps.portPoolDeps).catch(() => {});
     }
-    egressPort = alloc.port;
+    return fail("acquire_ports", egressAlloc.code, `出口端口分配失败：${egressAlloc.detail}`, {
+      meta: { direction: "egress", ingress_port: ingressAlloc.port },
+    });
   }
+
+  const ingressPort = ingressAlloc.port;
+  const egressPort = egressAlloc.port;
   await store.tunnel.update({ where: { id: tunnelId }, data: { listen_port: ingressPort, egress_port: egressPort } });
   steps.push({
     step: "acquire_ports",
     ok: true,
-    meta: { ingress_port: ingressPort, egress_port: egressPort, reused: true },
+    meta: {
+      ingress_port: ingressPort,
+      ingress_lease_id: ingressAlloc.leaseId,
+      ingress_reused: ingressAlloc.reused,
+      egress_port: egressPort,
+      egress_lease_id: egressAlloc.leaseId,
+      egress_reused: egressAlloc.reused,
+    },
   });
 
   /* ---------------- ⑤ revision++ ---------------- */
