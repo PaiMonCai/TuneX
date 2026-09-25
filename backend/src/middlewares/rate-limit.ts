@@ -160,6 +160,28 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     scope: "ip",
   },
   {
+    // WP7：节点状态上报 / 重连快照，按 IP 限流。上报周期 30s（与心跳同频），
+    // 60/min 是两倍余量；爆破指纹的封禁在 Redis 层（node-credential.ts），
+    // 这里的上限是第二道闸。scope:"ip" 是关键：节点没有 userId，走 user
+    // 维度会退化成 anon 让全部节点共用一个桶互相误伤。
+    name: "agent-node-state",
+    windowSeconds: 60,
+    max: 60,
+    match: (p) => p === "/api/internal/node/state" || p === "/api/internal/node/snapshot",
+    scope: "ip",
+  },
+  {
+    // WP7：节点凭据签发/轮换/撤销。与 key-rotation 同级（60s/5 次，user 维度）
+    // —— 凭据写操作必须比普通写更克制，且走 user 而非 ip：这些端点本身
+    // 就要求 admin 身份，没有匿名场景。
+    name: "node-credential-rotation",
+    windowSeconds: 60,
+    max: 5,
+    methods: ["POST"],
+    match: (p, m) => isPost(m) && /^\/api\/admin\/node\/[^/]+\/credential(\/(rotate|revoke))?$/.test(p),
+    scope: "user",
+  },
+  {
     name: "api-global",
     windowSeconds: 60,
     max: 600,

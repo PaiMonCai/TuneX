@@ -34,6 +34,7 @@ import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
 import { workspaceRoutes } from "./routes/workspaces.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { publicRoutes } from "./routes/public.ts";
+import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
 import { dashboardRoutes } from "./routes/dashboard.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
@@ -120,6 +121,10 @@ export function createApp() {
 
   // 路由挂载
   app.route("/api/auth", authRoutes);
+  // WP7：节点机器端点（/api/internal/node/*）。在 publicRoutes 之前挂载是
+  // 有意的：两者都免用户认证，但本路由的路径更具体，先匹配可以先落到
+  // 节点凭据语义上（顺序不影响结果，白名单已整段豁免 /api/internal/*）。
+  app.route("/api", internalNodeRoutes);
   app.route("/api/pay", payRoutes);
   app.route("/api/dashboard", dashboardRoutes);
   app.route("/api/tunnels", tunnelsRoutes);

@@ -53,6 +53,9 @@ export const CSRF_EXEMPT_PATTERNS: RegExp[] = [
   /^\/api\/tunnel\/observer$/,
   /^\/api\/tunnel\/traffic$/,
   /^\/api\/tunnel\/subscription$/,
+  // WP7：节点状态上报/快照端点。与上四者同类：非浏览器客户端，不携带会话
+  // cookie，凭据走 Authorization: Bearer（不会被浏览器自动附加）。
+  /^\/api\/internal\/.*/,
 ];
 
 export function isCsrfExempt(path: string): boolean {

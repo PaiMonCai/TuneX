@@ -61,7 +61,7 @@ const MAX_PATH_LEN = 255;
  * 因为这些端点触及凭据 / 令牌语义。
  */
 const SENSITIVE_RE =
-  /(password|passwd|secret|token|reset|verify|otp|code|callback|impersonation|api[_-]?key|card|cvv|payment|login|register|forgot)/i;
+  /(password|passwd|secret|token|credential|reset|verify|otp|code|callback|impersonation|api[_-]?key|card|cvv|payment|login|register|forgot)/i;
 
 /** 不产生审计的公共健康检查。 */
 const SKIP_PREFIXES = ["/healthz", "/readyz", "/socket.io", "/_next", "/favicon", "/openapi.json", "/docs", "/queuedash"];

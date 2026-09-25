@@ -9,6 +9,12 @@ import { db } from "../db.ts";
 import { systemConfig } from "../services/config.ts";
 import { licenseService } from "../services/license.ts";
 import {
+  credentialErrorStatus,
+  issueNodeCredential,
+  revokeNodeCredential,
+  rotateNodeCredential,
+} from "../services/node-credential.ts";
+import {
   ADMIN_RESOURCES,
   sanitizePermissions,
   getEffectiveAccess,
@@ -95,6 +101,83 @@ adminRoutes.get("/node/group", async (c) => {
 adminRoutes.get("/node", async (c) => {
   const rows = await db.node.findMany({ orderBy: { id: "desc" } });
   return c.json({ data: rows, total: rows.length });
+});
+
+/* ------------------------------------------------------------------ *
+ * node credential — /api/admin/node/:id/credential*（WP7）
+ *
+ * 路径已落在 `nodes` 资源的 apiPrefixes（`/admin/node`）上，因此
+ * adminPermissionGuard 自动要求 nodes 资源的 write 权限；
+ * 轮换/撤销是**敏感的凭据写操作**，另在 middlewares/rate-limit.ts 配了
+ * `node-credential-rotation` 专属低额度规则（60s/5 次，user 维度）。
+ *
+ * 明文的唯一出口：issue/rotate 的 200 响应体。审计侧只留 method/path/status/ip，
+ * services/audit.ts 的 SENSITIVE_RE 命中 token/credential 亦会丢 metadata；本文件不写日志。
+ * ------------------------------------------------------------------ */
+
+/** 节点 id 解析：面板侧用数字主键（db.id）；字符串 node_id 走 :key 变体。 */
+async function resolveNodeIdParam(param: string): Promise<number | null> {
+  const num = Number(param);
+  if (Number.isInteger(num) && num > 0) {
+    const row = await db.node.findUnique({ where: { id: num }, select: { id: true } });
+    return row?.id ?? null;
+  }
+  const row = await db.node.findUnique({ where: { node_id: param }, select: { id: true } });
+  return row?.id ?? null;
+}
+
+/** 节点凭据错误 → HTTP 状态码（401 之外的错误走这里，统一 4xx）。 */
+function credentialHttpStatus(e: unknown): 404 | 409 {
+  return credentialErrorStatus(e) === 409 ? 409 : 404;
+}
+
+adminRoutes.post("/node/:id/credential", async (c) => {
+  const nodeDbId = await resolveNodeIdParam(c.req.param("id"));
+  if (nodeDbId === null) return c.json({ error: "节点不存在" }, 404);
+  try {
+    const { plaintext, node_id, node_key } = await issueNodeCredential(nodeDbId);
+    // 明文只在这里出现一次。响应之外不落任何存储/日志。
+    return c.json({
+      data: { credential: plaintext, node_id, node_key, issued_at: new Date().toISOString() },
+    });
+  } catch (e) {
+    if (credentialErrorStatus(e) === null) throw e;
+    return c.json(
+      {
+        error:
+          credentialErrorStatus(e) === 409
+            ? "该节点已有有效凭据，请改用轮换"
+            : "节点不存在",
+      },
+      credentialHttpStatus(e),
+    );
+  }
+});
+
+adminRoutes.post("/node/:id/credential/rotate", async (c) => {
+  const nodeDbId = await resolveNodeIdParam(c.req.param("id"));
+  if (nodeDbId === null) return c.json({ error: "节点不存在" }, 404);
+  try {
+    const { plaintext, node_id, node_key } = await rotateNodeCredential(nodeDbId);
+    return c.json({
+      data: { credential: plaintext, node_id, node_key, rotated_at: new Date().toISOString() },
+    });
+  } catch (e) {
+    if (credentialErrorStatus(e) === null) throw e;
+    return c.json({ error: "节点不存在或尚未签发凭据" }, credentialHttpStatus(e));
+  }
+});
+
+adminRoutes.post("/node/:id/credential/revoke", async (c) => {
+  const nodeDbId = await resolveNodeIdParam(c.req.param("id"));
+  if (nodeDbId === null) return c.json({ error: "节点不存在" }, 404);
+  try {
+    const { node_id, node_key } = await revokeNodeCredential(nodeDbId);
+    return c.json({ data: { revoked: true, node_id, node_key } });
+  } catch (e) {
+    if (credentialErrorStatus(e) === null) throw e;
+    return c.json({ error: "节点不存在" }, credentialHttpStatus(e));
+  }
 });
 
 /* ------------------------------------------------------------------ *
