@@ -204,6 +204,8 @@ jobs:
             test -f /app/backend/prisma/schema.prisma
             test -f /app/web/server.js
             test -d /app/web/.next/static
+            test -x /app/agent-dist/tunex-agent-linux-amd64
+            test -x /app/agent-dist/tunex-agent-linux-arm64
           '
       - name: Validate unified Compose wiring
         run: |
