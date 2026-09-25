@@ -197,20 +197,37 @@ func (m *TunnelManager) DrainTunnel(id string, timeout time.Duration) error {
 	return e.fwd.Drain(timeout)
 }
 
-// ReplaceListener applies cfg with the revision rules but guarantees the
-// listener-safe ordering §13.3.5 requires: when the listener itself must
-// change, the NEW listener binds first and the old instance is drained only
-// after the new one is live. A failed bind leaves the old instance running
-// untouched and reserves no port.
+// ReplaceListener applies cfg with the revision rules and honours the
+// §13.3.4 rollout class the change actually has:
+//
+//   - the listener moved (port / mode change): the NEW listener binds first
+//     and the old instance is drained only after the new one is live. A
+//     failed bind leaves the old instance running untouched and reserves
+//     no port (§13.3.5 PREPARE);
+//   - only the upstream moved, same listener: the running forwarder's
+//     upstream is swapped in place, so live connections keep relaying and
+//     the forwarded-byte counter is not reset. This is the §13.3.4 "Target
+//     Host / Port" row, and NOT going through Apply here is the whole point
+//     — Apply's same-port path stops the old forwarder first, which drains
+//     every live connection for drainTimeout;
+//   - everything else (identical config, metadata, EGRESS) rides on Apply's
+//     existing paths.
 //
 // Revision rules are Apply's, unchanged:
 //
-//	cfg.Revision >  current -> replace
+//	cfg.Revision >  current -> apply
 //	cfg.Revision == current -> idempotent no-op (running forwarder back)
 //	cfg.Revision <  current -> ErrStaleRevision
 //
 // A revision of 0 means "source does not track revisions" and always applies.
+//
+// It is the one entry point both apply surfaces use (control.execute's
+// apply_tunnel and the admin API's POST /tunnel), so the routing cannot
+// differ between them.
 func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
 		normalized.ListenHost = m.listenHost
@@ -218,9 +235,6 @@ func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.F
 	if err := normalized.Validate(); err != nil {
 		return nil, err
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if cur, ok := m.tunnels[normalized.ID]; ok {
 		if isStale(normalized.Revision, cur.cfg.Revision) {
@@ -235,23 +249,62 @@ func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.F
 		}
 	}
 
-	plan := PlanForwardSwap(currentOrZero(m, normalized.ID), normalized)
-	if plan.Strategy == SwapListener {
-		return m.replaceListenerLocked(normalized)
-	}
-	// Everything else rides on Apply's existing paths: same-port replace,
-	// target swap via the forwarder seam, metadata no-op. Sharing the code
-	// keeps one implementation of the revision + port-guard rules.
-	return m.applyLocked(normalized)
+	return m.applyRoutedLocked(normalized)
 }
 
-// currentOrZero returns the running config for id, or a zero config that
-// still carries the id so PlanForwardSwap can classify a first-ever apply.
-func currentOrZero(m *TunnelManager, id string) forwarder.TunnelConfig {
-	if e, ok := m.tunnels[id]; ok {
-		return e.cfg
+// applyRoutedLocked sends one (revision-gated) config through the primitive
+// its plan names. It is the single routing point in the manager, so the
+// control-plane command path and the admin API cannot disagree about what a
+// change means. Caller must hold m.mu.
+func (m *TunnelManager) applyRoutedLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+	// A first-ever apply has no running instance to classify against: a diff
+	// against a zero config always looks like a listener move. Take Apply's
+	// path, which also runs the port-guard check a fresh bind needs.
+	e, ok := m.tunnels[cfg.ID]
+	if !ok {
+		return m.applyLocked(cfg)
 	}
-	return forwarder.TunnelConfig{ID: id}
+	switch PlanForwardSwap(e.cfg, cfg).Strategy {
+	case SwapListener:
+		return m.replaceListenerLocked(cfg)
+	case SwapTargetSwap:
+		return m.hotSwapUpstreamLocked(cfg)
+	default:
+		// SwapNoop / SwapMetadata / SwapRecreate: Apply's existing paths,
+		// sharing one implementation of the build + port-guard rules.
+		return m.applyLocked(cfg)
+	}
+}
+
+// hotSwapUpstreamLocked performs the §13.3.4 "Target Host / Port" swap: the
+// running forwarder starts dialing cfg's upstream, its listener and its live
+// connections untouched, and the registered config is updated to what the
+// node now runs (revision and reported upstream must not keep describing the
+// revision that was just replaced).
+//
+// One defensive exit: the forwarder refuses the swap (no live listener, or an
+// upstream that is not one swappable address). It falls back to Apply's
+// rebuild rather than failing the command and stranding the node on a config
+// the panel does not believe in — the one path that costs live connections.
+func (m *TunnelManager) hotSwapUpstreamLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+	e, ok := m.tunnels[cfg.ID]
+	if !ok {
+		return m.applyLocked(cfg)
+	}
+	if err := e.fwd.SetUpstream(cfg.UpstreamAddr()); err != nil {
+		// Only a forwarder whose upstream is not one swappable address
+		// lands here. Failing the command would strand the node on a
+		// stale config, so rebuild and say so in the log: this is the one
+		// path that costs live connections.
+		logx.Warn("tunnel upstream swap refused, rebuilding",
+			"id", cfg.ID, "err", err.Error())
+		return m.applyLocked(cfg)
+	}
+	e.cfg = cfg
+	m.markPortUsedLocked(cfg)
+	logx.Info("tunnel upstream hot-swapped", "id", cfg.ID, "mode", string(cfg.Mode),
+		"port", cfg.ListenPort(), "upstream", cfg.UpstreamAddr(), "revision", cfg.Revision)
+	return e.fwd, nil
 }
 
 // replaceListenerLocked performs the listener-safe replacement. Caller must
