@@ -405,116 +405,83 @@ tunnelsRoutes.patch("/:id", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(selectedWorkspace(c).role, "update", tunnel.user_id === user.id))
+  if (!canWorkspaceAction(workspace.role, "update", tunnel.user_id === user.id)) {
     return c.json({ error: "无权操作该团队隧道" }, 403);
+  }
+  if ((tunnel.tunnel_mode ?? "direct") !== "direct") {
+    return c.json({ error: "RELAY 配置请使用 v3 隧道接口" }, 409);
+  }
 
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
   if (!body || typeof body !== "object") return c.json({ error: "参数错误" }, 400);
 
-  const data: Record<string, unknown> = {};
-
-  if (body.name !== undefined) {
-    const name = String(body.name).trim();
-    if (!name) return c.json({ error: "隧道名称不能为空" }, 400);
-    if (name.length > 60) return c.json({ error: "隧道名称长度不能超过 60 字符" }, 400);
-    data.name = name;
-  }
-
-  if (body.in_node_group_id !== undefined) {
-    const gid = Number(body.in_node_group_id);
-    const g = Number.isInteger(gid) ? await db.nodeGroup.findUnique({ where: { id: gid } }) : null;
-    if (!g) return c.json({ error: "入口节点组不存在" }, 404);
-    if (g.node_type !== "in" || !(await canUseNodeGroup(user.id, g, "in", workspace.id, workspace.personalWorkspaceId)))
-      return c.json({ error: "无权使用入口节点组" }, 403);
-    data.in_node_group_id = g.id;
-  }
-  if (body.out_node_group_id !== undefined) {
-    if (body.out_node_group_id === null || body.out_node_group_id === "") {
-      data.out_node_group_id = null;
-    } else {
-      const oid = Number(body.out_node_group_id);
-      const g = Number.isInteger(oid) ? await db.nodeGroup.findUnique({ where: { id: oid } }) : null;
-      if (!g) return c.json({ error: "出口节点组不存在" }, 404);
-      if (g.node_type !== "out" || !(await canUseNodeGroup(user.id, g, "out", workspace.id, workspace.personalWorkspaceId)))
-        return c.json({ error: "无权使用出口节点组" }, 403);
-      data.out_node_group_id = g.id;
+  for (const forbidden of ["in_node_group_id", "out_node_group_id", "mode", "tunnel_mode", "category", "tunnel_type"]) {
+    if (body[forbidden] !== undefined) {
+      return c.json({ error: `兼容 PATCH 不允许修改 ${forbidden}；拓扑变更请走 v3 流程` }, 409);
     }
   }
 
+  let forward: string[] | undefined;
+  let remoteHost: string | undefined;
+  let remotePort: number | undefined;
+  if (body.forward_addresses !== undefined) {
+    forward = parseForward(body.forward_addresses);
+    if (forward.length !== 1) {
+      return c.json({ error: "v3 DIRECT 当前要求且仅允许一个转发目标" }, 400);
+    }
+    const target = forward[0]!;
+    if (!FORWARD_RE.test(target)) return c.json({ error: "转发目标格式应为 host:port" }, 400);
+    const match = /^\[([^\]]+)\]:(\d+)$/.exec(target) ?? /^([^:]+):(\d+)$/.exec(target);
+    if (!match) return c.json({ error: "转发目标格式应为 host:port" }, 400);
+    remoteHost = match[1]!;
+    remotePort = Number(match[2]);
+  }
+
+  let listenPort: number | null | undefined;
   if (body.listen_port !== undefined) {
     if (body.listen_port === null || body.listen_port === "") {
-      data.listen_port = null;
+      listenPort = null;
     } else {
       const port = Number(body.listen_port);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         return c.json({ error: "监听端口必须在 1-65535 之间" }, 400);
       }
-      const inGroupId = (data.in_node_group_id as number | undefined) ?? tunnel.in_node_group_id;
-      const conflict = await db.tunnel.findFirst({
-        where: { in_node_group_id: inGroupId, listen_port: port, NOT: { id: tunnel.id } },
-      });
-      if (conflict) return c.json({ error: "监听端口已被占用" }, 400);
-      data.listen_port = port;
+      listenPort = port;
     }
   }
 
-  if (body.forward_addresses !== undefined) {
-    const forward = parseForward(body.forward_addresses);
-    if (forward.length === 0) return c.json({ error: "至少需要一个转发目标" }, 400);
-    const bad = forward.find((a) => !FORWARD_RE.test(a));
-    if (bad) return c.json({ error: `转发目标格式应为 host:port（${bad}）` }, 400);
-    data.forward_addresses = forward;
-    const ttype = (body.tunnel_type as string | undefined) ?? tunnel.tunnel_type;
-    data.forward_addresses_protocol = forward.map(() => ttype);
-  }
+  const updated = await updateTunnelApi(
+    id,
+    {
+      ...(body.name !== undefined ? { name: String(body.name) } : {}),
+      ...(listenPort !== undefined ? { listenPort } : {}),
+      ...(forward ? { forwardAddresses: forward, remoteHost, remotePort } : {}),
+    },
+    workspace.id,
+    { db: db as never, orchestrator: getOrchestrator() },
+  );
+  if (!updated.ok) return apiError(c, updated);
 
-  if (body.tunnel_type !== undefined) {
-    const ttype = String(body.tunnel_type);
-    data.tunnel_type = ttype;
-    data.listen_protocol = [ttype];
-    const addrs = (data.forward_addresses as string[] | undefined) ?? (tunnel.forward_addresses as string[]);
-    data.forward_addresses_protocol = addrs.map(() => ttype);
-  }
-
-  if (body.load_balance_type !== undefined) data.load_balance_type = String(body.load_balance_type);
-  if (body.ip_type !== undefined) data.ip_type = String(body.ip_type);
-  if (body.category !== undefined) {
-    data.category = body.category === "remote_port_forward" ? "remote_port_forward" : "port_forward";
-  }
-  if (body.status !== undefined) {
-    const s = String(body.status);
-    if (s !== "active" && s !== "inactive") return c.json({ error: "状态不合法" }, 400);
-    data.status = s;
-  }
-  if (body.order_by !== undefined) {
-    const ob = Number(body.order_by);
-    if (Number.isFinite(ob)) data.order_by = ob;
-  }
-  for (const key of ["ip_limit", "client_limit", "bandwidth_limit"] as const) {
-    if (body[key] !== undefined) {
-      if (body[key] === null || body[key] === "") data[key] = null;
-      else {
-        const n = Number(body[key]);
-        if (!Number.isFinite(n)) return c.json({ error: `${key} 必须是数字` }, 400);
-        data[key] = n;
+  // Inactive/suspended desired state stays stopped. Active DIRECT is re-applied
+  // immediately so DB and data plane cannot drift after a successful PATCH.
+  if ((tunnel.desired_status ?? "active") === "active") {
+    const orchestrator = getOrchestrator();
+    if (orchestrator) {
+      const applied = await reapplyDirectTunnel(id, orchestrator);
+      if (!applied.ok) {
+        return c.json({
+          error: applied.error,
+          code: "apply_failed",
+          apply_error_code: applied.error_code,
+        }, 502);
       }
     }
   }
-  if (body.proxy_protocol !== undefined) data.proxy_protocol = Boolean(body.proxy_protocol);
 
-  const updated = await db.tunnel.update({
-    where: { id: tunnel.id },
-    data,
-    include: {
-      in_node_group: { select: { id: true, name: true, node_type: true } },
-      out_node_group: { select: { id: true, name: true, node_type: true } },
-    },
-  });
-
-  // WP15：换节点组/改配置不再触发 legacy 推送；v3 由 reconciler 拉齐 apply 命令。
-  return ok(c, tunnelView(updated as unknown as Record<string, unknown>));
+  const state = await getTunnelStateApi(id, workspace.id, { db: db as never });
+  return ok(c, state.ok ? state.tunnel : updated.tunnel);
 });
 
 /* ------------------------------------------------------------------ */
@@ -523,26 +490,33 @@ tunnelsRoutes.patch("/:id", async (c) => {
 
 tunnelsRoutes.post("/:id/toggle", async (c) => {
   const user = requireUser(c);
+  const workspace = selectedWorkspace(c);
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(selectedWorkspace(c).role, "update", tunnel.user_id === user.id))
+  if (!canWorkspaceAction(workspace.role, "update", tunnel.user_id === user.id)) {
     return c.json({ error: "无权操作该团队隧道" }, 403);
+  }
 
-  const next = tunnel.status === "active" ? "inactive" : "active";
-  const updated = await db.tunnel.update({
-    where: { id: tunnel.id },
-    data: { status: next },
-    include: {
-      in_node_group: { select: { id: true, name: true, node_type: true } },
-      out_node_group: { select: { id: true, name: true, node_type: true } },
-    },
+  const action = tunnel.apply_status === "suspended" || tunnel.desired_status === "inactive"
+    ? "resume"
+    : "suspend";
+  const result = await runTunnelActionApi(id, action, workspace.id, {
+    db: db as never,
+    orchestrator: getOrchestrator(),
   });
+  if (!result.ok) return apiError(c, result);
 
-  // WP15：状态变化不再触发 legacy 推送；v3 由 reconciler 拉齐。
-  return ok(c, tunnelView(updated as unknown as Record<string, unknown>));
+  // Legacy status remains a display/filter compatibility column only.
+  await db.tunnel.update({
+    where: { id },
+    data: { status: action === "suspend" ? "inactive" : "active" },
+  }).catch(() => {});
+
+  const state = await getTunnelStateApi(id, workspace.id, { db: db as never });
+  return ok(c, state.ok ? state.tunnel : result.tunnel ?? { id, action });
 });
 
 /* ------------------------------------------------------------------ */
@@ -576,22 +550,22 @@ tunnelsRoutes.post("/:id/reset-traffic", async (c) => {
 
 tunnelsRoutes.delete("/:id", async (c) => {
   const user = requireUser(c);
+  const workspace = selectedWorkspace(c);
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
+  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(selectedWorkspace(c).role, "delete", tunnel.user_id === user.id))
+  if (!canWorkspaceAction(workspace.role, "delete", tunnel.user_id === user.id)) {
     return c.json({ error: "无权操作该团队隧道" }, 403);
+  }
 
-  await db.$transaction([
-    db.tunnelChain.deleteMany({ where: { tunnel_id: tunnel.id } }),
-    db.tunnelTraffic.deleteMany({ where: { tunnel_id: tunnel.id } }),
-    db.tunnel.delete({ where: { id: tunnel.id } }),
-  ]);
-
-  // WP15：删除后由 reconciler 拉齐 apply 命令，监听自然下线。
-  return ok(c, { ok: true, id: tunnel.id });
+  const result = await runTunnelActionApi(id, "delete", workspace.id, {
+    db: db as never,
+    orchestrator: getOrchestrator(),
+  });
+  if (!result.ok) return apiError(c, result);
+  return ok(c, { ok: true, id });
 });
 
 /* ================================================================== */
