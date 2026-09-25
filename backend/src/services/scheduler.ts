@@ -1475,6 +1475,196 @@ export async function reapplyRelayTunnel(
   };
 }
 
+export type ApplyDirectResult =
+  | {
+      ok: true;
+      tunnelId: number;
+      revision: number;
+      ingressNodeId: number;
+      ingressPort: number;
+    }
+  | {
+      ok: false;
+      tunnelId: number;
+      error_code: SchedulerErrorCode;
+      error: string;
+      retryable: boolean;
+    };
+
+/**
+ * Apply/re-apply one existing DIRECT tunnel through the v3 runtime.
+ *
+ * Placement rule: once ingress_node_id exists, retry sticks to that concrete
+ * Node. A retry must not silently migrate a user's tunnel.
+ */
+export async function reapplyDirectTunnel(
+  tunnelId: number,
+  orchestrator: Orchestrator,
+  over?: SchedulerDeps,
+): Promise<ApplyDirectResult> {
+  const deps = resolveDeps(over);
+  const store = deps.db;
+  const now = deps.now();
+
+  const row = asRow<Record<string, unknown>>(await store.tunnel.findUnique({ where: { id: tunnelId } }));
+  if (!row) {
+    return {
+      ok: false,
+      tunnelId,
+      error_code: SCHEDULER_ERROR_CODES.invariant_violated,
+      error: `隧道 ${tunnelId} 不存在`,
+      retryable: false,
+    };
+  }
+  if (row.tunnel_mode !== "direct") {
+    return {
+      ok: false,
+      tunnelId,
+      error_code: SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      error: `隧道 ${tunnelId} 不是 DIRECT 模式`,
+      retryable: false,
+    };
+  }
+
+  const inNodeGroupId = Number(row.in_node_group_id);
+  const candidates = await store.node.findMany({
+    where: { node_group_id: inNodeGroupId },
+    orderBy: { id: "asc" },
+  }) as unknown as SchedulableNode[];
+
+  let pick:
+    | { ok: true; node: SchedulableNode; online: boolean }
+    | { ok: false; reason: "no_role_match" | "no_credential" };
+
+  const boundId = row.ingress_node_id == null ? null : Number(row.ingress_node_id);
+  if (boundId !== null) {
+    const bound = candidates.find((n) => n.id === boundId);
+    pick = bound
+      ? pickNode([bound], "ingress", now)
+      : { ok: false, reason: "no_role_match" };
+  } else {
+    pick = pickNode(candidates, "ingress", now);
+  }
+
+  if (!pick.ok) {
+    const code = pick.reason === "no_credential"
+      ? SCHEDULER_ERROR_CODES.node_credential_missing
+      : SCHEDULER_ERROR_CODES.node_unavailable;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] DIRECT 入口节点不可用`,
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: "DIRECT 入口节点不可用", retryable: isRetryable(code) };
+  }
+
+  const remoteHost = typeof row.remote_host === "string" ? row.remote_host.trim() : "";
+  const remotePort = Number(row.remote_port ?? 0);
+  if (!remoteHost || !Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535) {
+    const code = SCHEDULER_ERROR_CODES.invalid_target;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] DIRECT 目标无效`,
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: "DIRECT 目标无效", retryable: false };
+  }
+
+  const reserved = collectReservedPorts(
+    (await store.tunnel.findMany({
+      where: { in_node_group_id: inNodeGroupId },
+      select: { id: true, listen_port: true },
+    }) as unknown as { id: number; listen_port: number | null }[])
+      .filter((t) => t.id !== tunnelId),
+  );
+
+  let ingressPort = row.listen_port == null ? null : Number(row.listen_port);
+  const alloc = await allocateTunnelPort({
+    nodeId: pick.node.id,
+    direction: "ingress",
+    preferred: ingressPort,
+    tunnelId,
+    reservedPorts: reserved,
+  }, deps.portPoolDeps);
+  if (!alloc.ok) {
+    const code = alloc.code;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] ${alloc.detail}`.slice(0, 500),
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: alloc.detail, retryable: isRetryable(code) };
+  }
+  ingressPort = alloc.port;
+
+  const currentRevision = Number(row.config_revision ?? 0) || 0;
+  const revision = currentRevision + 1;
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: {
+      ingress_node_id: pick.node.id,
+      listen_port: ingressPort,
+      desired_status: DESIRED_STATUS.inactive,
+      apply_status: APPLY_STATUS.applying,
+      config_revision: revision,
+      apply_error_code: null,
+      apply_error: null,
+    },
+  });
+
+  const dispatched = await orchestrator.dispatchDirect({
+    tunnelId,
+    revision,
+    ingressNode: pick.node,
+    ingressPort,
+    remoteHost,
+    remotePort,
+    listenHost: typeof row.listen_ip === "string" ? row.listen_ip : null,
+  });
+  if (!dispatched.ok) {
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const code = mapDispatchCode("ingress", dispatched);
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] ${dispatched.error}`.slice(0, 500),
+        config_revision: revision,
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: dispatched.error, retryable: isRetryable(code) };
+  }
+
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: {
+      apply_status: APPLY_STATUS.active,
+      desired_status: DESIRED_STATUS.active,
+      config_revision: revision,
+      applied_revision: revision,
+      last_applied_at: deps.now(),
+      apply_error_code: null,
+      apply_error: null,
+    },
+  });
+
+  return { ok: true, tunnelId, revision, ingressNodeId: pick.node.id, ingressPort };
+}
+
 /** 行投影收窄（`findUnique` 返回 unknown，本文件内部使用）。 */
 function asRow<T>(row: unknown): T | null {
   return row ? (row as T) : null;
