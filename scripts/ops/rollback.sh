@@ -26,7 +26,7 @@
 #   3. 拉取目标镜像（本地不存在时）
 #   4. 更新 .env 的 TUNEX_IMAGE（同一 digest 同时驱动 backend/worker/web）
 #   5. compose up -d 切换（DB/Redis/Caddy 不动，滚动替换 backend/worker/web）
-#   6. 健康等待：统一入口 /healthz 200 + 三个服务 running，超时即失败
+#   6. 健康等待：Backend loopback /healthz 200 + 三个服务 running，超时即失败
 #   7. 失败 → 自动回退到步骤 1 记录的状态（幂等）
 #   8. 成功 → 写 deploy-history，提示数据是否也要回滚
 #
@@ -90,8 +90,8 @@ svc_running() {
     | awk -v s="$svc" '$1==s && $2 ~ /^running/ {found=1} END{exit found?0:1}'
 }
 
-TUNEX_HTTP_PORT="${TUNEX_HTTP_PORT:-13000}"
-ROLLBACK_HEALTH_URL="${ROLLBACK_HEALTH_URL:-http://127.0.0.1:${TUNEX_HTTP_PORT}/healthz}"
+TUNEX_API_PORT="${TUNEX_API_PORT:-13001}"
+ROLLBACK_HEALTH_URL="${ROLLBACK_HEALTH_URL:-http://127.0.0.1:${TUNEX_API_PORT}/healthz}"
 
 # --- 当前状态指纹 ------------------------------------------------------------
 current_state() {
