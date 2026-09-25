@@ -195,6 +195,7 @@ def provision_node(cookie, workspace_id, group, spec):
     assert status in (200, 201), f"{ERR}provision {spec['node_id']} -> {status} {body}"
     provisioned = unwrap(body)
     enrolled = enroll_node(provisioned["enrollment"])
+    assert enrolled["agent_id"] == provisioned["node"]["agent_id"], f"{ERR}agent_id enrollment mismatch"
     provisioned["credential"] = enrolled["credential"]
     return provisioned
 
