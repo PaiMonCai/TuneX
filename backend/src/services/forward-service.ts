@@ -26,6 +26,7 @@ import {
 } from "./tunnel-api.ts";
 
 export type ForwardMode = "direct" | "relay";
+export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
 export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume">;
 
 export interface ForwardCreateInput {
@@ -40,8 +41,9 @@ export interface ForwardCreateInput {
 
 export interface ForwardListInput {
   ingress_node_id?: number;
+  egress_node_id?: number;
   mode?: ForwardMode;
-  apply_status?: string;
+  apply_status?: ForwardApplyStatus;
   keyword?: string;
 }
 
@@ -178,6 +180,9 @@ export async function listForwards(workspaceId: number, input: ForwardListInput 
     category: "port_forward",
     ...(input.ingress_node_id
       ? { ingress_node_id: input.ingress_node_id }
+      : {}),
+    ...(input.egress_node_id
+      ? { egress_node_id: input.egress_node_id }
       : {}),
     ...(input.mode ? { tunnel_mode: input.mode } : {}),
     ...(input.apply_status ? { apply_status: input.apply_status } : {}),
