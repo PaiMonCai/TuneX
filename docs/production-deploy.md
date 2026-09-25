@@ -212,12 +212,7 @@ docker compose \
 
 此模式会用 `Caddyfile.prod` 替换内部 HTTP 配置，直接绑定宿主机 80/443（含 443/udp），并从 `.env` 读取 `SITE_URL` / `ACME_EMAIL` 自动申请证书。**已有 Nginx 占用 80/443 时不要启用 standalone。**
 
-standalone 下 `rollback.sh` / `restore.sh` 的入口健康检查需要显式走公网 HTTPS，例如：
-
-```bash
-export ROLLBACK_HEALTH_URL=https://tunex.example.com/healthz
-export RESTORE_HEALTH_URL=https://tunex.example.com/healthz
-```
+standalone 模式下 Backend 的 loopback 健康端口仍保留，因此 `rollback.sh` / `restore.sh` 不依赖 Caddy 存活即可完成本机健康检查。
 
 首启管理员凭据落在**项目根** `.admin-credentials`（`db-migrate` 把
 `ADMIN_CREDENTIALS_PATH=/host/.admin-credentials` 挂到仓库根）：
