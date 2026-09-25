@@ -1138,7 +1138,7 @@ export async function createRelayTunnel(
   if (!ingressDispatch.ok) {
     /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
     await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, revision: revision + 1, reason: "ingress apply failed" })
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" })
       .catch(() => {});
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
     return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
