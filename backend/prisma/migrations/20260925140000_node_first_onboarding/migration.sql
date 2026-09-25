@@ -4,6 +4,12 @@
 ALTER TABLE `node`
   MODIFY `connect_ip` VARCHAR(255) NULL;
 
+-- Port ownership is now concrete-node scoped. The old group-level unique key
+-- prevented two different ingress nodes in one group from listening on the same port.
+ALTER TABLE `tunnel`
+  DROP INDEX `tunnel_listen_port_in_node_group_id_key`,
+  ADD INDEX `tunnel_in_node_group_id_listen_port_idx`(`in_node_group_id`, `listen_port`);
+
 CREATE TABLE `node_enrollment` (
   `id` INTEGER NOT NULL AUTO_INCREMENT,
   `node_id` INTEGER NOT NULL,
