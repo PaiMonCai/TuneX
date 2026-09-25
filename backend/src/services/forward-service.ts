@@ -139,6 +139,9 @@ export function forwardView(t: any) {
     target_host: target?.host ?? null,
     target_port: target?.port ?? null,
     target_weight: target?.weight ?? null,
+    traffic: Number(t.traffic ?? 0),
+    traffic_cost: Number(t.traffic_cost ?? 0),
+    online: t.apply_status === "active",
     desired_status: t.desired_status,
     apply_status: t.apply_status,
     config_revision: t.config_revision,
@@ -204,6 +207,61 @@ export async function getForward(
 ): Promise<ReturnType<typeof forwardView> | null> {
   const row = await loadForwardRow(id, workspaceId);
   return row ? forwardView(row) : null;
+}
+
+export async function getForwardTraffic(
+  id: number,
+  workspaceId: number,
+  days = 14,
+): Promise<
+  ForwardServiceResult<
+    { date: string; traffic: number; traffic_cost: number }[]
+  >
+> {
+  const current = await db.tunnel.findFirst({
+    where: {
+      id,
+      workspace_id: workspaceId,
+      category: "port_forward",
+    },
+    select: { id: true },
+  });
+  if (!current) return error(404, "not_found", "端口转发不存在");
+
+  const windowDays = Math.max(1, Math.min(90, Math.floor(days) || 14));
+  const since = new Date();
+  since.setHours(0, 0, 0, 0);
+  since.setDate(since.getDate() - (windowDays - 1));
+
+  const rows = await db.tunnelTraffic.findMany({
+    where: { tunnel_id: current.id, date: { gte: since } },
+    orderBy: { date: "asc" },
+  });
+
+  const byDate = new Map<string, { traffic: number; traffic_cost: number }>();
+  for (const row of rows) {
+    const key = row.date.toISOString().slice(0, 10);
+    const acc = byDate.get(key) ?? { traffic: 0, traffic_cost: 0 };
+    acc.traffic += row.traffic;
+    acc.traffic_cost += row.traffic_cost;
+    byDate.set(key, acc);
+  }
+
+  const points: { date: string; traffic: number; traffic_cost: number }[] = [];
+  for (let i = windowDays - 1; i >= 0; i--) {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - i);
+    const key = date.toISOString().slice(0, 10);
+    const hit = byDate.get(key);
+    points.push({
+      date: key,
+      traffic: hit ? Number(hit.traffic.toFixed(2)) : 0,
+      traffic_cost: hit ? Number(hit.traffic_cost.toFixed(4)) : 0,
+    });
+  }
+
+  return { ok: true, data: points };
 }
 
 export async function createForward(
