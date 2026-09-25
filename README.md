@@ -39,7 +39,7 @@ Egress Node
 
 1. 在「节点与转发」创建 Node，选择 `INGRESS`、`EGRESS` 或 `BOTH`。
 2. Panel 返回一条可复制的一键安装命令；命令只携带 10 分钟、一次性的 enrollment token。
-3. 在节点机器执行命令后，Agent 自动下载、换取长期 per-node credential、注册 systemd 并主动连接 Panel。
+3. 在节点机器执行命令后，脚本自动准备 Docker、拉取 Agent 镜像、换取长期 per-node credential，并以 host network 容器启动 Agent。
 4. 选择一个入口 Node；需要 RELAY 时先绑定出口 Node。
 5. 在入口 Node 上直接「添加端口转发」：不选出口 = DIRECT，选择已绑定出口 = RELAY。
 
@@ -222,11 +222,17 @@ curl -fsSL 'https://panel.example.com/api/internal/node/install.sh' | \
   --ingress-range '10000-30000'
 ```
 
-安装脚本会从**当前 Panel 镜像**下载与 Panel 版本匹配的 `linux/amd64` 或
-`linux/arm64` Agent，原子消费 enrollment token 换取真正的 per-node
-credential，将凭据写入 root-only `/etc/tunex-agent/agent.env`，然后安装并启动
-`tunex-agent.service`。enrollment token 只能使用一次，重新生成安装命令会撤销
-该节点尚未使用的旧 token。
+安装脚本采用 **Docker-first** 部署：
+
+1. 节点没有 Docker Engine 时自动安装并启动 Docker；
+2. 先拉取 Panel 配置的 `TUNEX_AGENT_IMAGE`，镜像拉取失败不会消费一次性 token；
+3. 原子消费 enrollment token，换取真正的 per-node credential；
+4. credential 只写入宿主机 root-only `/etc/tunex-agent/agent.env`；
+5. 启动 `tunex-agent` 容器，使用 `--network host` 让动态 DIRECT/RELAY 监听端口直接绑定宿主机网络；
+6. 容器只读挂载 credential 文件，不通过 `docker run -e` 注入长期凭据，避免 `docker inspect` 直接暴露 credential。
+
+容器默认 `--restart unless-stopped`，并仅保留 `NET_BIND_SERVICE` capability。
+enrollment token 只能使用一次，重新生成安装命令会撤销该节点尚未使用的旧 token。
 
 生产控制链仍然只有 **Agent → Panel 出站 HTTPS**；不要求 Panel 反向访问
 Agent 的公网管理端口。
@@ -351,9 +357,10 @@ GitHub Actions 会执行：
 - **backend**：依赖安装、Prisma migration、类型检查、HTTP/授权测试、旧数据库升级验证；
 - **web**：依赖安装、TypeScript 类型检查、Next.js build；
 - **agent**：`go vet`、`go test`、`go build`、Linux amd64/arm64 交叉编译；
+- **agent-image**：构建并 smoke test 专用 Docker Agent 镜像；
 - **v3-integration**：启动真实 MySQL/Redis/Panel/双 Agent/Target Docker 拓扑，通过一次性 enrollment 注册 Agent，再经 NodeBinding + PortForward API 验证 DIRECT、RELAY、NodePortLease、重启恢复、凭据与 Reconciler；
-- **unified-image**：在 v3 Gate 通过后构建统一 TuneX 镜像，并验证 Bun、Node、Next standalone、两份 Compose，以及内置的 amd64/arm64 Agent 安装制品；
-- **images**：仅在 push 事件下推送 `ghcr.io/paimoncai/tunex:{latest,<git-sha>}`。
+- **unified-image**：在 v3 Gate 通过后构建统一 TuneX Panel 镜像，并验证 Bun、Node、Next standalone 与两份 Compose；
+- **images**：仅在 push 事件下推送 Panel `ghcr.io/paimoncai/tunex:{latest,<git-sha>}` 和多架构 Agent `ghcr.io/paimoncai/tunex-agent:{latest,<git-sha>}`。
 
 本地常用检查：
 
@@ -399,10 +406,11 @@ ghcr.io/paimoncai/tunex:<git-sha>
 └── web          → node server.js
 ```
 
-生产只需要钉一个不可变版本：
+Panel 应用角色继续共用一个不可变版本；Agent 使用独立的 slim multi-arch 镜像，生产建议两者钉同一个 git sha：
 
 ```dotenv
 TUNEX_IMAGE=ghcr.io/paimoncai/tunex:<git-sha>
+TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:<git-sha>
 ```
 
 典型更新流程：
