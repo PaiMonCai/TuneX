@@ -164,10 +164,13 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     // 60/min 是两倍余量；爆破指纹的封禁在 Redis 层（node-credential.ts），
     // 这里的上限是第二道闸。scope:"ip" 是关键：节点没有 userId，走 user
     // 维度会退化成 anon 让全部节点共用一个桶互相误伤。
-    name: "agent-node-state",
+    name: "agent-node-control",
     windowSeconds: 60,
-    max: 60,
-    match: (p) => p === "/api/internal/node/state" || p === "/api/internal/node/snapshot",
+    // One healthy Agent polls commands once/second and also emits state + ACKs.
+    // NAT can place many Agents behind one source IP; failed credential attempts
+    // are independently throttled by node-credential's hashed fingerprint key.
+    max: 6000,
+    match: (p) => /^\/api\/internal\/node\/(state|snapshot|commands|ack|desired)$/.test(p),
     scope: "ip",
   },
   {

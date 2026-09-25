@@ -50,6 +50,7 @@ interface TunnelRow {
   user_id: number;
   workspace_id: number;
   tunnel_mode: string | null;
+  ingress_node_id: number | null;
   egress_node_id: number | null;
   egress_pool_id: number | null;
   egress_port: number | null;
@@ -167,6 +168,7 @@ function makeDb() {
           user_id: Number(data.user_id ?? 0),
           workspace_id: Number(data.workspace_id ?? 0),
           tunnel_mode: (data.tunnel_mode as string | null) ?? null,
+          ingress_node_id: (data.ingress_node_id as number | null) ?? null,
           egress_node_id: (data.egress_node_id as number | null) ?? null,
           egress_pool_id: (data.egress_pool_id as number | null) ?? null,
           egress_port: (data.egress_port as number | null) ?? null,
@@ -343,7 +345,7 @@ function makeRedis() {
 /* ------------------------------------------------------------------ */
 
 interface RecordedApply {
-  kind: "egress" | "relay" | "remove";
+  kind: "direct" | "egress" | "relay" | "remove";
   nodeId: number;
   config: Record<string, unknown> | null;
 }
@@ -352,17 +354,20 @@ class FakeAgentTransport {
   readonly applies: RecordedApply[] = [];
   /** 注入失败：下一次 apply 的 kind → 失败模式。 */
   failNext: {
-    kind: "egress" | "relay" | "remove";
+    kind: "direct" | "egress" | "relay" | "remove";
     mode: "reject" | "unreachable" | "bad_revision";
   } | null = null;
   /** 排队的历史失败（按顺序消费，便于测「先成功后失败」）。 */
-  scriptedFailures: ({ kind: "egress" | "relay" | "remove"; mode: "reject" | "unreachable" | "bad_revision" })[] = [];
+  scriptedFailures: ({ kind: "direct" | "egress" | "relay" | "remove"; mode: "reject" | "unreachable" | "bad_revision" })[] = [];
 
   async applyEgress(node: { id: number }, config: Record<string, unknown>) {
     return this.record("egress", node, config);
   }
   async applyRelay(node: { id: number }, config: Record<string, unknown>) {
     return this.record("relay", node, config);
+  }
+  async applyDirect(node: { id: number }, config: Record<string, unknown>) {
+    return this.record("direct", node, config);
   }
   async removeTunnel(node: { id: number }, tunnelId: string) {
     this.applies.push({ kind: "remove", nodeId: node.id, config: { tunnelId } });
@@ -375,7 +380,7 @@ class FakeAgentTransport {
   }
 
   private async record(
-    kind: "egress" | "relay" | "remove",
+    kind: "direct" | "egress" | "relay" | "remove",
     node: { id: number },
     config: Record<string, unknown>,
   ) {
@@ -482,6 +487,7 @@ function seedTunnel(over: Partial<TunnelRow> = {}): TunnelRow {
     user_id: 1,
     workspace_id: 7,
     tunnel_mode: "relay",
+    ingress_node_id: 1,
     egress_node_id: 2,
     egress_pool_id: 99,
     egress_port: null,
@@ -699,6 +705,7 @@ describe("A. 编排顺序（§7.11 十条步骤）", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const t = tunnels.find((x) => x.id === result.tunnelId)!;
+    expect(t.ingress_node_id).toBe(1);
     expect(t.egress_node_id).toBe(2);
     // 未显式指定池 → 取该出口节点的 default 池（§2.2）。
     expect(t.egress_pool_id).toBe(99);
@@ -992,6 +999,29 @@ describe("C. 端口分配集成", () => {
     expect(result.ingressPort).toBe(20005);
     const t = tunnels.find((x) => x.id === result.tunnelId)!;
     expect(t.listen_port).toBe(20005);
+  });
+
+  test("C3b. pending 行已写 listen_port 时，reapply 仍必须补齐 ingress NodePortLease", async () => {
+    const existing = seedTunnel({
+      listen_port: 20005,
+      egress_port: null,
+      desired_status: "inactive",
+      apply_status: "pending",
+      config_revision: 0,
+      applied_revision: null,
+    });
+    tunnels.push(existing);
+
+    const result = await scheduler.reapplyRelayTunnel(existing.id, orch, deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const owned = leases.filter((l) => l.tunnel_id === existing.id && l.status === "active");
+    expect(owned).toHaveLength(2);
+    expect(owned).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node_id: 1, port: 20005, lease_type: "ingress" }),
+      expect.objectContaining({ node_id: 2, lease_type: "egress" }),
+    ]));
   });
 
   test("C4. user-specified 指定黑名单端口 → port_invalid（不静默改分）", async () => {

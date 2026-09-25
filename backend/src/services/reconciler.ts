@@ -106,6 +106,7 @@ export interface DesiredTunnel {
   last_applied_at?: Date | null;
   listen_port?: number | null;
   egress_port?: number | null;
+  ingress_node_id?: number | null;
   egress_node_id?: number | null;
   in_node_group_id?: number | null;
 }
@@ -225,7 +226,7 @@ export function isPortMismatch(t: DesiredTunnel, agent: AgentTunnelState | null)
 /** mode 是否不一致（agent 未上报 mode 时不判）。 */
 export function isModeMismatch(t: DesiredTunnel, agent: AgentTunnelState | null): boolean {
   if (!agent || !agent.mode || !t.tunnel_mode) return false;
-  return t.tunnel_mode !== agent.mode;
+  return t.tunnel_mode.toLowerCase() !== agent.mode.toLowerCase();
 }
 
 /**
@@ -562,6 +563,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
           last_applied_at: true,
           listen_port: true,
           egress_port: true,
+          ingress_node_id: true,
           egress_node_id: true,
           in_node_group_id: true,
         },
@@ -659,8 +661,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     // RELAY 再看 egress 节点。两份快照都可能没有这条隧道 —— 都缺才算
     // missing_runtime（无法确认到底哪侧丢了，但 desired 也没声明哪侧，
     // 这正是「只重发同 revision、不换节点」能覆盖的范围）。
-    const report = pickReport(reports, t);
-    const agent = pickAgentTunnel(report, t);
+    const agent = pickAgentTunnel(reports, t);
     const node = pickNode(nodeById, t);
 
     // 找不到归属节点（DIRECT 隧道没有 egress_node_id、或节点行已被删）⇒
@@ -783,25 +784,120 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
 }
 
 /** 取该隧道的 agent applied 快照（RELAY 取 egress 侧，DIRECT 取 ingress 侧附近的节点）。 */
-function pickReport(
+function runtimeId(tunnelId: number, direction: "direct" | "ingress" | "egress"): string {
+  return direction === "direct"
+    ? `tunex-${tunnelId}-direct`
+    : direction === "ingress"
+      ? `tunex-${tunnelId}-relay`
+      : `tunex-${tunnelId}-egress`;
+}
+
+/**
+ * Collapse the concrete Agent-side runtime(s) into one reconciliation view.
+ * DIRECT requires its ingress runtime; RELAY desired-active requires both
+ * ingress + egress. A half-present RELAY is treated as missing_runtime so the
+ * sink replays the same revision to both bound nodes.
+ */
+function pickAgentTunnel(
   reports: Map<number, NodeReport>,
   t: DesiredTunnel,
-): NodeReport | undefined {
-  return reports.get(t.egress_node_id ?? -1) ?? undefined;
-}
-
-/** 在快照里按字符串 id 找这条隧道。 */
-function pickAgentTunnel(
-  report: { reported_at: Date | null; tunnels: AgentTunnelState[] } | undefined,
-  t: DesiredTunnel,
 ): AgentTunnelState | null {
-  if (!report) return null;
-  const id = String(t.id);
-  return report.tunnels.find((x) => x.id === id) ?? null;
+  const ingressReport =
+    t.ingress_node_id == null ? undefined : reports.get(t.ingress_node_id);
+  const ingressId = t.tunnel_mode === "relay"
+    ? runtimeId(t.id, "ingress")
+    : runtimeId(t.id, "direct");
+  const ingress = ingressReport?.tunnels.find((x) => x.id === ingressId) ?? null;
+
+  if (t.tunnel_mode !== "relay") {
+    if (!ingress) return null;
+    return {
+      ...ingress,
+      id: String(t.id),
+      mode: "direct",
+    };
+  }
+
+  const egressReport =
+    t.egress_node_id == null ? undefined : reports.get(t.egress_node_id);
+  const egress = egressReport?.tunnels.find((x) => x.id === runtimeId(t.id, "egress")) ?? null;
+
+  // When desired is inactive, one leftover side is enough to flag
+  // unexpected_runtime. When desired is active, both sides are required.
+  if (!wantsActive(t)) {
+    const any = ingress ?? egress;
+    if (!any) return null;
+    return {
+      id: String(t.id),
+      mode: "relay",
+      ingress_port: ingress?.ingress_port ?? null,
+      egress_port: egress?.egress_port ?? null,
+      revision: Math.min(
+        ingress?.revision ?? Number.MAX_SAFE_INTEGER,
+        egress?.revision ?? Number.MAX_SAFE_INTEGER,
+      ),
+    };
+  }
+  if (!ingress || !egress) return null;
+
+  const ingressMode = String(ingress.mode ?? "").toLowerCase();
+  const egressMode = String(egress.mode ?? "").toLowerCase();
+  // A RELAY resource is healthy only when its two concrete runtimes have the
+  // expected roles. Preserve an unexpected runtime mode in the collapsed view
+  // so computeDrift can emit mode_mismatch instead of normalising the error away.
+  const mode =
+    ingressMode !== "" && ingressMode !== "relay"
+      ? ingressMode
+      : egressMode !== "" && egressMode !== "egress"
+        ? egressMode
+        : "relay";
+
+  return {
+    id: String(t.id),
+    mode,
+    ingress_port: ingress.ingress_port ?? null,
+    egress_port: egress.egress_port ?? null,
+    revision: Math.min(
+      ingress.revision ?? 0,
+      egress.revision ?? 0,
+    ),
+  };
 }
 
-/** 该隧道归属节点的在线性事实。 */
-function pickNode(nodeById: Map<number, NodeOnlineInput>, t: DesiredTunnel): NodeOnlineInput | null {
-  if (t.egress_node_id === null || t.egress_node_id === undefined) return null;
-  return nodeById.get(t.egress_node_id) ?? null;
+/**
+ * A RELAY is auto-repairable only while both of its already-bound nodes are
+ * reachable. This deliberately does not select a replacement Node.
+ */
+function pickNode(
+  nodeById: Map<number, NodeOnlineInput>,
+  t: DesiredTunnel,
+): NodeOnlineInput | null {
+  if (t.ingress_node_id == null) return null;
+  const ingress = nodeById.get(t.ingress_node_id);
+  if (!ingress) return null;
+  if (t.tunnel_mode !== "relay") return ingress;
+
+  if (t.egress_node_id == null) return null;
+  const egress = nodeById.get(t.egress_node_id);
+  if (!egress) return null;
+
+  const status =
+    ingress.status === "inactive" || egress.status === "inactive"
+      ? "inactive"
+      : "active";
+
+  const seen = (n: NodeOnlineInput): number | null => {
+    const d = n.last_seen_at ?? n.reported_at ?? null;
+    return d ? new Date(d).getTime() : null;
+  };
+  const a = seen(ingress);
+  const b = seen(egress);
+  const oldest = a == null || b == null ? null : new Date(Math.min(a, b));
+
+  return {
+    node_id: ingress.node_id,
+    status,
+    last_seen_at: oldest,
+    reported_at: oldest,
+  };
 }

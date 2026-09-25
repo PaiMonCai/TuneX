@@ -42,6 +42,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
+import { nodeScope } from "../tenant-scope.ts";
 
 /* ================================================================== */
 /* 常量                                                                */
@@ -289,7 +290,7 @@ export async function authenticateNode(plaintext: string): Promise<NodeAuthResul
         node_id: true,
         node_credential_hash: true,
         credential_revoked: true,
-        node_group: { select: { workspace_id: true, is_shared: true } },
+        node_group: { select: { workspace_id: true } },
       },
     });
     const decision = decideNodeAuth(row, hashed);
@@ -297,8 +298,7 @@ export async function authenticateNode(plaintext: string): Promise<NodeAuthResul
       await noteRejection(hashed, blockKey);
       return decision;
     }
-    const wsId = row!.node_group.workspace_id;
-    const scope = row!.node_group.is_shared === true ? 0 : (wsId ?? 0);
+    const scope = nodeScope(row!);
     return { ok: true, node_id: row!.id, node_key: row!.node_id, scope };
   } catch (e) {
     if (e instanceof NodeCredentialError) throw e;

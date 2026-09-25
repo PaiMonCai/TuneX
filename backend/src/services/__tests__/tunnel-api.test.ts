@@ -51,7 +51,7 @@ import {
   type TunnelRow,
 } from "../tunnel-api.ts";
 import type { EffectivePolicy } from "../capability-policy.ts";
-import type { CreateRelayTunnelResult } from "../scheduler.ts";
+import type { ApplyDirectResult, CreateRelayTunnelResult } from "../scheduler.ts";
 
 /* ------------------------------------------------------------------ */
 /* 内存表                                                               */
@@ -67,10 +67,11 @@ const groups: NodeGroupRow[] = [];
 const pools: EgressPoolRow[] = [];
 /** 编排器收到的 apply 调用记录（验证「确实走 orchestrator」）。 */
 const orchestratorCalls: {
-  kind: "create" | "reapply" | "remove";
+  kind: "create" | "reapply" | "direct" | "remove";
   tunnelId: number;
   revision?: number;
   nodeId?: number;
+  direction?: "direct" | "ingress" | "egress";
 }[] = [];
 /** 假 Agent 是否接受下一次下发。 */
 let agentHealthy = true;
@@ -124,6 +125,7 @@ function seedTunnel(over: Partial<TunnelRow> = {}): TunnelRow {
     user_id: 1,
     workspace_id: 7,
     tunnel_mode: "relay",
+    ingress_node_id: 1,
     egress_node_id: 2,
     egress_pool_id: 99,
     egress_port: 30000 + id,
@@ -224,6 +226,7 @@ function makeDb(): TunnelApiDeps["db"] {
           user_id: Number(data.user_id ?? 0),
           workspace_id: Number(data.workspace_id ?? 0),
           tunnel_mode: (data.tunnel_mode as string | null) ?? null,
+          ingress_node_id: (data.ingress_node_id as number | null) ?? null,
           egress_node_id: (data.egress_node_id as number | null) ?? null,
           egress_pool_id: (data.egress_pool_id as number | null) ?? null,
           egress_port: (data.egress_port as number | null) ?? null,
@@ -335,8 +338,19 @@ function allowAllPolicy(): EffectivePolicy {
  * **不实现任何下发**——它只是编排器的替身，验证 WP11 把动作交给了编排层。
  */
 const fakeOrchestrator = {
-  removeTunnel: async (input: { tunnelId: number; revision: number }) => {
-    orchestratorCalls.push({ kind: "remove", tunnelId: input.tunnelId, revision: input.revision });
+  removeTunnel: async (input: {
+    tunnelId: number;
+    revision: number;
+    direction?: "direct" | "ingress" | "egress";
+    node?: { id?: number };
+  }) => {
+    orchestratorCalls.push({
+      kind: "remove",
+      tunnelId: input.tunnelId,
+      revision: input.revision,
+      direction: input.direction,
+      nodeId: input.node?.id,
+    });
     return { ok: true, result: { commandId: "cmd-rm", revision: input.revision, ack: {} } };
   },
 };
@@ -346,6 +360,7 @@ function deps(over: TunnelApiDeps = {}): TunnelApiDeps {
     db: makeDb(),
     loadPolicy: async () => allowAllPolicy(),
     orchestrator: fakeOrchestrator as never,
+    applyDirect: successDirect(),
     now: () => new Date("2026-09-25T12:00:00.000Z"),
     ...over,
   };
@@ -385,6 +400,39 @@ function successCreate(over: Partial<TunnelRow> = {}): NonNullable<TunnelApiDeps
       Object.assign(t, over);
     }
     return { ok: true, tunnelId: id, revision: 1, ingressNodeId: 1, egressNodeId: 2, ingressPort: 20001, egressPort: 30001, steps: [] } as CreateRelayTunnelResult;
+  };
+}
+
+/** DIRECT 走 v3 runtime：绑定实际 ingress、推进 revision，ACK 后才 active。 */
+function successDirect(): NonNullable<TunnelApiDeps["applyDirect"]> {
+  return async (tunnelId) => {
+    orchestratorCalls.push({ kind: "direct", tunnelId });
+    const t = tunnels.get(tunnelId);
+    if (!t) {
+      return {
+        ok: false,
+        tunnelId,
+        error_code: "invariant_violated",
+        error: "missing tunnel",
+        retryable: false,
+      } as ApplyDirectResult;
+    }
+    const rev = (t.config_revision ?? 0) + 1;
+    t.ingress_node_id = 1;
+    t.listen_port = t.listen_port ?? 20001;
+    t.desired_status = "active";
+    t.apply_status = "active";
+    t.config_revision = rev;
+    t.applied_revision = rev;
+    t.apply_error_code = null;
+    t.apply_error = null;
+    return {
+      ok: true,
+      tunnelId,
+      revision: rev,
+      ingressNodeId: 1,
+      ingressPort: t.listen_port,
+    } as ApplyDirectResult;
   };
 }
 
@@ -532,8 +580,8 @@ describe("A. 纯校验", () => {
 /* ================================================================== */
 
 describe("B. CRUD", () => {
-  test("B1. 创建 DIRECT：落 direct 模式，不走编排器", async () => {
-    const d = deps({ applyCreate: successCreate() });
+  test("B1. 创建 DIRECT：落 pending 后走 v3 DIRECT 编排，ACK 后才 active", async () => {
+    const d = deps({ applyCreate: successCreate(), applyDirect: successDirect() });
     const r = await createTunnel(
       {
         name: "direct-1",
@@ -551,10 +599,16 @@ describe("B. CRUD", () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.mode).toBe("direct");
-    // DIRECT 无 egress 端，绝不该触发 RELAY 编排。
+    // DIRECT 不走 RELAY create，但必须走自己的 v3 data-plane apply。
     expect(orchestratorCalls.filter((c) => c.kind === "create")).toHaveLength(0);
+    expect(orchestratorCalls.filter((c) => c.kind === "direct")).toHaveLength(1);
     const created = tunnels.get(r.tunnelId)!;
     expect(created.tunnel_mode).toBe("direct");
+    expect(created.ingress_node_id).toBe(1);
+    expect(created.apply_status).toBe("active");
+    expect(created.desired_status).toBe("active");
+    expect(created.config_revision).toBe(1);
+    expect(created.applied_revision).toBe(1);
     expect(created.forward_addresses).toEqual(["192.168.1.10:5000"]);
   });
 
@@ -775,14 +829,16 @@ describe("C. 运行操作统一走 orchestrator", () => {
     expect(orchestratorCalls.some((c) => c.kind === "reapply" && c.tunnelId === 202)).toBe(true);
   });
 
-  test("C4. suspend：desired→inactive、apply_status→suspended，不调编排器（只标记期望）", async () => {
+  test("C4. suspend：先撤实际 ingress/egress runtime，再保持 desired=inactive/suspended", async () => {
     const t = seedTunnel({ id: 203, apply_status: "active", desired_status: "active" });
     const r = await runTunnelAction(203, "suspend", 7, deps({ applyReapply: successReapply() }));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(t.desired_status).toBe("inactive");
     expect(t.apply_status).toBe("suspended");
-    expect(orchestratorCalls).toHaveLength(0);
+    const removes = orchestratorCalls.filter((c) => c.kind === "remove");
+    expect(removes).toHaveLength(2);
+    expect(removes.map((c) => c.direction).sort()).toEqual(["egress", "ingress"]);
   });
 
   test("C5. suspend 幂等：已 suspended → 409", async () => {

@@ -973,6 +973,7 @@ export async function createRelayTunnel(
   await store.tunnel.update({
     where: { id: tunnelId },
     data: {
+      ingress_node_id: ingressPick.node.id,
       egress_node_id: egressPick.node.id,
       egress_pool_id: poolId,
       apply_status: APPLY_STATUS.applying,
@@ -1137,7 +1138,7 @@ export async function createRelayTunnel(
   if (!ingressDispatch.ok) {
     /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
     await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, revision: revision + 1, reason: "ingress apply failed" })
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" })
       .catch(() => {});
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
     return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
@@ -1246,12 +1247,10 @@ export async function reapplyRelayTunnel(
     );
   }
   if (row.tunnel_mode !== "relay") {
-    // DIRECT 的重推是 legacy config-pusher 的领域（socket 推送），
-    // 不走 v3 编排器：它没有 egress 端、也不需要 revision 闸门。
     return fail(
       "bind_nodes",
       SCHEDULER_ERROR_CODES.mode_topology_mismatch,
-      `隧道 ${tunnelId} 不是 RELAY 模式（${String(row.tunnel_mode)}），重推请走 legacy 配置下发`,
+      `隧道 ${tunnelId} 不是 RELAY 模式（${String(row.tunnel_mode)}）`,
     );
   }
   const inNodeGroupId = Number(row.in_node_group_id);
@@ -1271,11 +1270,22 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true } });
 
   /* ---------------- ③ bind nodes ---------------- */
-  const [inCandidates, outCandidates] = await Promise.all([
+  const [inCandidatesRaw, outCandidatesRaw] = await Promise.all([
     store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
     store.node.findMany({ where: { node_group_id: outNodeGroupId }, orderBy: { id: "asc" } }),
   ]);
-  const ingressPick = pickNode(inCandidates as unknown as SchedulableNode[], "ingress", now);
+  // Initial apply may schedule from the group. Once concrete placement exists,
+  // retry/resume must stay on those exact Nodes: no silent migration on a
+  // transient failure. Explicit topology changes are a separate user action.
+  const boundIngressId = row.ingress_node_id == null ? null : Number(row.ingress_node_id);
+  const boundEgressId = row.egress_node_id == null ? null : Number(row.egress_node_id);
+  const inCandidates = (inCandidatesRaw as unknown as SchedulableNode[]).filter(
+    (node) => boundIngressId === null || node.id === boundIngressId,
+  );
+  const outCandidates = (outCandidatesRaw as unknown as SchedulableNode[]).filter(
+    (node) => boundEgressId === null || node.id === boundEgressId,
+  );
+  const ingressPick = pickNode(inCandidates, "ingress", now);
   if (!ingressPick.ok) {
     return fail(
       "bind_nodes",
@@ -1336,7 +1346,7 @@ export async function reapplyRelayTunnel(
   }
   await store.tunnel.update({
     where: { id: tunnelId },
-    data: { egress_node_id: egressPick.node.id, egress_pool_id: poolId },
+    data: { ingress_node_id: ingressPick.node.id, egress_node_id: egressPick.node.id, egress_pool_id: poolId },
   });
 
   /* ---------------- ④ ports（已有值复用，空才分配）---------------- */
@@ -1361,36 +1371,63 @@ export async function reapplyRelayTunnel(
       .filter((t) => t.id !== tunnelId),
   );
 
-  let ingressPort = row.listen_port === null ? null : Number(row.listen_port);
-  let egressPort = row.egress_port === null ? null : Number(row.egress_port);
-  if (ingressPort === null) {
-    const alloc = await allocateTunnelPort(
-      { nodeId: ingressPick.node.id, direction: "ingress", preferred: null, tunnelId, reservedPorts: ingressReserved },
-      deps.portPoolDeps,
-    );
-    if (!alloc.ok) {
-      return fail("acquire_ports", alloc.code, alloc.detail, { meta: { direction: "ingress" } });
-    }
-    ingressPort = alloc.port;
+  // Even when the Tunnel row already contains a port, the durable
+  // NodePortLease may not exist yet (notably the create -> reapply path where
+  // the user-specified ingress port is persisted before orchestration). Always
+  // acquire with the existing port as `preferred`: acquirePort is idempotent
+  // for an already-held same tunnel/direction lease and creates the missing
+  // canonical ownership row otherwise.
+  const existingIngressPort = row.listen_port === null ? null : Number(row.listen_port);
+  const ingressAlloc = await allocateTunnelPort(
+    {
+      nodeId: ingressPick.node.id,
+      direction: "ingress",
+      preferred: existingIngressPort,
+      tunnelId,
+      reservedPorts: ingressReserved,
+    },
+    deps.portPoolDeps,
+  );
+  if (!ingressAlloc.ok) {
+    return fail("acquire_ports", ingressAlloc.code, ingressAlloc.detail, {
+      meta: { direction: "ingress", port: existingIngressPort },
+    });
   }
-  if (egressPort === null) {
-    const alloc = await allocateTunnelPort(
-      { nodeId: egressPick.node.id, direction: "egress", preferred: null, tunnelId, reservedPorts: egressReserved },
-      deps.portPoolDeps,
-    );
-    if (!alloc.ok) {
-      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-      return fail("acquire_ports", alloc.code, `出口端口分配失败：${alloc.detail}`, {
-        meta: { direction: "egress", ingress_port: ingressPort },
-      });
+
+  const existingEgressPort = row.egress_port === null ? null : Number(row.egress_port);
+  const egressAlloc = await allocateTunnelPort(
+    {
+      nodeId: egressPick.node.id,
+      direction: "egress",
+      preferred: existingEgressPort,
+      tunnelId,
+      reservedPorts: egressReserved,
+    },
+    deps.portPoolDeps,
+  );
+  if (!egressAlloc.ok) {
+    if (!ingressAlloc.reused) {
+      await releaseLease({ leaseId: ingressAlloc.leaseId }, deps.portPoolDeps).catch(() => {});
     }
-    egressPort = alloc.port;
+    return fail("acquire_ports", egressAlloc.code, `出口端口分配失败：${egressAlloc.detail}`, {
+      meta: { direction: "egress", ingress_port: ingressAlloc.port },
+    });
   }
+
+  const ingressPort = ingressAlloc.port;
+  const egressPort = egressAlloc.port;
   await store.tunnel.update({ where: { id: tunnelId }, data: { listen_port: ingressPort, egress_port: egressPort } });
   steps.push({
     step: "acquire_ports",
     ok: true,
-    meta: { ingress_port: ingressPort, egress_port: egressPort, reused: true },
+    meta: {
+      ingress_port: ingressPort,
+      ingress_lease_id: ingressAlloc.leaseId,
+      ingress_reused: ingressAlloc.reused,
+      egress_port: egressPort,
+      egress_lease_id: egressAlloc.leaseId,
+      egress_reused: egressAlloc.reused,
+    },
   });
 
   /* ---------------- ⑤ revision++ ---------------- */
@@ -1474,28 +1511,197 @@ export async function reapplyRelayTunnel(
   };
 }
 
+export type ApplyDirectResult =
+  | {
+      ok: true;
+      tunnelId: number;
+      revision: number;
+      ingressNodeId: number;
+      ingressPort: number;
+    }
+  | {
+      ok: false;
+      tunnelId: number;
+      error_code: SchedulerErrorCode;
+      error: string;
+      retryable: boolean;
+    };
+
+/**
+ * Apply/re-apply one existing DIRECT tunnel through the v3 runtime.
+ *
+ * Placement rule: once ingress_node_id exists, retry sticks to that concrete
+ * Node. A retry must not silently migrate a user's tunnel.
+ */
+export async function reapplyDirectTunnel(
+  tunnelId: number,
+  orchestrator: Orchestrator,
+  over?: SchedulerDeps,
+): Promise<ApplyDirectResult> {
+  const deps = resolveDeps(over);
+  const store = deps.db;
+  const now = deps.now();
+
+  const row = asRow<Record<string, unknown>>(await store.tunnel.findUnique({ where: { id: tunnelId } }));
+  if (!row) {
+    return {
+      ok: false,
+      tunnelId,
+      error_code: SCHEDULER_ERROR_CODES.invariant_violated,
+      error: `隧道 ${tunnelId} 不存在`,
+      retryable: false,
+    };
+  }
+  if (row.tunnel_mode !== "direct") {
+    return {
+      ok: false,
+      tunnelId,
+      error_code: SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      error: `隧道 ${tunnelId} 不是 DIRECT 模式`,
+      retryable: false,
+    };
+  }
+
+  const inNodeGroupId = Number(row.in_node_group_id);
+  const candidates = await store.node.findMany({
+    where: { node_group_id: inNodeGroupId },
+    orderBy: { id: "asc" },
+  }) as unknown as SchedulableNode[];
+
+  let pick:
+    | { ok: true; node: SchedulableNode; online: boolean }
+    | { ok: false; reason: "no_role_match" | "no_credential" };
+
+  const boundId = row.ingress_node_id == null ? null : Number(row.ingress_node_id);
+  if (boundId !== null) {
+    const bound = candidates.find((n) => n.id === boundId);
+    pick = bound
+      ? pickNode([bound], "ingress", now)
+      : { ok: false, reason: "no_role_match" };
+  } else {
+    pick = pickNode(candidates, "ingress", now);
+  }
+
+  if (!pick.ok) {
+    const code = pick.reason === "no_credential"
+      ? SCHEDULER_ERROR_CODES.node_credential_missing
+      : SCHEDULER_ERROR_CODES.node_unavailable;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] DIRECT 入口节点不可用`,
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: "DIRECT 入口节点不可用", retryable: isRetryable(code) };
+  }
+
+  const remoteHost = typeof row.remote_host === "string" ? row.remote_host.trim() : "";
+  const remotePort = Number(row.remote_port ?? 0);
+  if (!remoteHost || !Number.isInteger(remotePort) || remotePort < 1 || remotePort > 65535) {
+    const code = SCHEDULER_ERROR_CODES.invalid_target;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] DIRECT 目标无效`,
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: "DIRECT 目标无效", retryable: false };
+  }
+
+  const reserved = collectReservedPorts(
+    (await store.tunnel.findMany({
+      where: { in_node_group_id: inNodeGroupId },
+      select: { id: true, listen_port: true },
+    }) as unknown as { id: number; listen_port: number | null }[])
+      .filter((t) => t.id !== tunnelId),
+  );
+
+  let ingressPort = row.listen_port == null ? null : Number(row.listen_port);
+  const alloc = await allocateTunnelPort({
+    nodeId: pick.node.id,
+    direction: "ingress",
+    preferred: ingressPort,
+    tunnelId,
+    reservedPorts: reserved,
+  }, deps.portPoolDeps);
+  if (!alloc.ok) {
+    const code = alloc.code;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] ${alloc.detail}`.slice(0, 500),
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: alloc.detail, retryable: isRetryable(code) };
+  }
+  ingressPort = alloc.port;
+
+  const currentRevision = Number(row.config_revision ?? 0) || 0;
+  const revision = currentRevision + 1;
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: {
+      ingress_node_id: pick.node.id,
+      listen_port: ingressPort,
+      desired_status: DESIRED_STATUS.inactive,
+      apply_status: APPLY_STATUS.applying,
+      config_revision: revision,
+      apply_error_code: null,
+      apply_error: null,
+    },
+  });
+
+  const dispatched = await orchestrator.dispatchDirect({
+    tunnelId,
+    revision,
+    ingressNode: pick.node,
+    ingressPort,
+    remoteHost,
+    remotePort,
+    listenHost: typeof row.listen_ip === "string" ? row.listen_ip : null,
+  });
+  if (!dispatched.ok) {
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const code = mapDispatchCode("ingress", dispatched);
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
+        apply_error_code: code,
+        apply_error: `[${code}] ${dispatched.error}`.slice(0, 500),
+        config_revision: revision,
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: dispatched.error, retryable: isRetryable(code) };
+  }
+
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: {
+      apply_status: APPLY_STATUS.active,
+      desired_status: DESIRED_STATUS.active,
+      config_revision: revision,
+      applied_revision: revision,
+      last_applied_at: deps.now(),
+      apply_error_code: null,
+      apply_error: null,
+    },
+  });
+
+  return { ok: true, tunnelId, revision, ingressNodeId: pick.node.id, ingressPort };
+}
+
 /** 行投影收窄（`findUnique` 返回 unknown，本文件内部使用）。 */
 function asRow<T>(row: unknown): T | null {
   return row ? (row as T) : null;
 }
-
-/**
- * WP8 期间**不能写**的 Tunnel 列。
- *
- * DEVELOPMENT.md §7.4「已知留白」明确：`ingress_node_id` 没有新增列，
- * `tunnel.in_node_group_id` + `tunnel.listen_port` 是既有等价物，而
- * 「实际入口节点」这一列**属于 WP8 schema 设计时补齐，不能沿用
- * NodeGroup 顶替」。
- *
- * 本包（WP8 代码部分）**不自行 ALTER 表**：§8.2「先 schema / migration，
- * 再服务层」的顺序不能倒过来，而 schema 变更属于 WP1 的后续 additive
- * migration，需要独立 PR + 空库/升级库双测。因此编排器把实际入口节点
- * 落在本文件导出的记录里，等列落地后由一条 migration + 一次落库补上。
- *
- * 这不是遗漏而是**显式留白**：常量存在的意义是让「手滑写错列名」在 review
- * 时能被一眼看到，而不是让 `ingress_node_id` 悄悄出现在某个 update 的
- * data 里、上线才炸。
- */
-export const PENDING_SCHEMA_COLUMNS: readonly string[] = [
-  "ingress_node_id",
-];

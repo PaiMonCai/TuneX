@@ -85,7 +85,7 @@ export interface AgentTunnelConfig {
   /** 稳定 id：`tunex-<tunnelId>-<direction>`。Agent 以它为幂等键。 */
   id: string;
   /** EGRESS = 出口侧；RELAY = 入口侧（WP4 `forwarder.Mode`）。 */
-  mode: "EGRESS" | "RELAY";
+  mode: "DIRECT" | "EGRESS" | "RELAY";
   ingress_port: number;
   egress_port: number;
   remote_host: string;
@@ -156,11 +156,13 @@ export type RelayDispatchErrorCode =
  */
 export interface AgentTransport {
   /** 在出口节点上应用/替换一条 EGRESS 隧道。 */
-  applyEgress(node: OrchestratorNode, config: AgentTunnelConfig): Promise<unknown>;
+  applyEgress(node: OrchestratorNode, config: AgentTunnelConfig, envelope?: CommandEnvelope): Promise<unknown>;
   /** 在入口节点上应用/替换一条 RELAY 隧道。 */
-  applyRelay(node: OrchestratorNode, config: AgentTunnelConfig): Promise<unknown>;
+  applyRelay(node: OrchestratorNode, config: AgentTunnelConfig, envelope?: CommandEnvelope): Promise<unknown>;
+  /** 在入口节点上应用/替换一条 DIRECT 隧道。 */
+  applyDirect(node: OrchestratorNode, config: AgentTunnelConfig, envelope?: CommandEnvelope): Promise<unknown>;
   /** 下线一条隧道（补偿路径；幂等，Agent 侧未知 id 返回 ok）。 */
-  removeTunnel(node: OrchestratorNode, tunnelId: string): Promise<unknown>;
+  removeTunnel(node: OrchestratorNode, tunnelId: string, envelope?: CommandEnvelope): Promise<unknown>;
   /** 节点管理面是否可达（用于快速失败；默认实现总是 true）。 */
   isReachable?(node: OrchestratorNode): Promise<boolean>;
 }
@@ -306,6 +308,10 @@ export class HttpAgentTransport implements AgentTransport {
     return this.post(node, "/tunnel", config);
   }
 
+  applyDirect(node: OrchestratorNode, config: AgentTunnelConfig): Promise<unknown> {
+    return this.post(node, "/tunnel", config);
+  }
+
   removeTunnel(node: OrchestratorNode, tunnelId: string): Promise<unknown> {
     return this.post(node, `/tunnel?id=${encodeURIComponent(tunnelId)}`, {});
   }
@@ -344,6 +350,16 @@ export interface DispatchIngressInput {
   nextHop: string;
 }
 
+export interface DispatchDirectInput {
+  tunnelId: number;
+  revision: number;
+  ingressNode: OrchestratorNode;
+  ingressPort: number;
+  remoteHost: string;
+  remotePort: number;
+  listenHost?: string | null;
+}
+
 /** dispatchEgress 成功时额外带回出口地址（入口下发要用它拼 next_hop）。 */
 export interface EgressDispatchSuccess {
   ok: true;
@@ -358,8 +374,10 @@ export type EgressDispatchOutcome = EgressDispatchSuccess | DispatchFailure;
 
 export interface RemoveTunnelInput {
   tunnelId: number;
-  /** 在哪台节点上撤。RELAY 的补偿必须知道撤的是哪一端。 */
+  /** 在哪台节点上撤。 */
   node: OrchestratorNode;
+  /** 明确 runtime 方向；不能再根据 Node.role 猜，BOTH 节点会猜错。 */
+  direction?: "direct" | "ingress" | "egress";
   /** 补偿用的 revision：比失败的那次高 1（让 Agent 侧的闸门放行）。 */
   revision: number;
   reason?: string;
@@ -445,9 +463,14 @@ export class Orchestrator {
     return `tunex-${tunnelId}-egress`;
   }
 
-  /** 入口侧隧道 id：`tunex-<tunnelId>-relay`。 */
+  /** 入口侧 RELAY 隧道 id：`tunex-<tunnelId>-relay`。 */
   static relayTunnelId(tunnelId: number): string {
     return `tunex-${tunnelId}-relay`;
+  }
+
+  /** DIRECT 隧道 id：`tunex-<tunnelId>-direct`。 */
+  static directTunnelId(tunnelId: number): string {
+    return `tunex-${tunnelId}-direct`;
   }
 
   /* ---------------------------------------------------------------- */
@@ -611,6 +634,61 @@ export class Orchestrator {
   }
 
   /* ---------------------------------------------------------------- */
+  /* DIRECT 下发                                                       */
+  /* ---------------------------------------------------------------- */
+
+  async dispatchDirect(input: DispatchDirectInput): Promise<RelayDispatchOutcome> {
+    const directId = Orchestrator.directTunnelId(input.tunnelId);
+    const unreachable = await this.reachable(input.ingressNode);
+    if (unreachable) return unreachable;
+
+    const config: AgentTunnelConfig = {
+      id: directId,
+      mode: "DIRECT",
+      ingress_port: input.ingressPort,
+      egress_port: 0,
+      remote_host: input.remoteHost,
+      remote_port: input.remotePort,
+      next_hop: "",
+      targets: [],
+      lb_strategy: "ROUND_ROBIN",
+      protocol: "tcp",
+      speed_limit: 0,
+      revision: input.revision,
+      ...(input.listenHost ? { listen_host: input.listenHost } : {}),
+    };
+
+    const envelope = createCommand({
+      resource: "tunnel",
+      resource_id: directId,
+      revision: input.revision,
+      action: "apply_tunnel",
+      payload: {
+        tunnel: {
+          name: directId,
+          tunnel_type: "tcp",
+          listen_port: input.ingressPort,
+          targets: [{ address: input.remoteHost, port: input.remotePort }],
+          ...(input.listenHost ? { listen_ip: input.listenHost } : {}),
+        },
+      },
+    });
+
+    return this.send(input.ingressNode, envelope, (ack) => {
+      if (ack.applied_revision !== input.revision) {
+        throw new AgentTransportError(
+          RELAY_DISPATCH_ERROR_CODES.revision_mismatch,
+          `DIRECT ACK revision=${ack.applied_revision} 与下发 revision=${input.revision} 不符`,
+        );
+      }
+      return {
+        ok: true as const,
+        result: { commandId: envelope.command_id, revision: ack.applied_revision ?? input.revision, ack },
+      };
+    }, config);
+  }
+
+  /* ---------------------------------------------------------------- */
   /* 补偿：撤隧道                                                      */
   /* ---------------------------------------------------------------- */
 
@@ -627,9 +705,11 @@ export class Orchestrator {
    */
   async removeTunnel(input: RemoveTunnelInput): Promise<RelayDispatchOutcome> {
     const id =
-      input.node.role === "egress"
+      input.direction === "egress"
         ? Orchestrator.egressTunnelId(input.tunnelId)
-        : Orchestrator.relayTunnelId(input.tunnelId);
+        : input.direction === "direct"
+          ? Orchestrator.directTunnelId(input.tunnelId)
+          : Orchestrator.relayTunnelId(input.tunnelId);
 
     const unreachable = await this.reachable(input.node);
     if (unreachable) return unreachable;
@@ -700,10 +780,12 @@ export class Orchestrator {
           };
         }
         raw = await (config.mode === "EGRESS"
-          ? this.transport.applyEgress(node, config)
-          : this.transport.applyRelay(node, config));
+          ? this.transport.applyEgress(node, config, envelope)
+          : config.mode === "DIRECT"
+            ? this.transport.applyDirect(node, config, envelope)
+            : this.transport.applyRelay(node, config, envelope));
       } else if (envelope.action === "remove_tunnel") {
-        raw = await this.transport.removeTunnel(node, envelope.resource_id);
+        raw = await this.transport.removeTunnel(node, envelope.resource_id, envelope);
       } else {
         return {
           ok: false,

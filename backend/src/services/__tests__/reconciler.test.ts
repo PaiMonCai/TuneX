@@ -66,6 +66,7 @@ function tunnel(over: Partial<DesiredTunnel> = {}): DesiredTunnel {
     last_applied_at: null,
     listen_port: 19001,
     egress_port: 19002,
+    ingress_node_id: 7,
     egress_node_id: 8,
     in_node_group_id: 3,
     ...over,
@@ -88,21 +89,68 @@ function depsFrom(
   extra: Partial<ReconcileDeps> = {},
 ): ReconcileDeps {
   const reports = new Map<number, { reported_at: Date | null; tunnels: AgentTunnelState[]; last_error: string | null }>();
+  const ensureReport = (nodeId: number) => {
+    if (!reports.has(nodeId)) reports.set(nodeId, { reported_at: NOW, tunnels: [], last_error: null });
+    return reports.get(nodeId)!;
+  };
+
+  // The production reconciler reads concrete directional runtimes:
+  //   tunex-<id>-relay  on ingress
+  //   tunex-<id>-egress on egress
+  // Tests keep the compact agent() helper as a collapsed logical view and
+  // expand it here into the two real Agent reports.
   for (const t of tunnels) {
-    if (t.egress_node_id === null || t.egress_node_id === undefined) continue;
-    if (!reports.has(t.egress_node_id)) reports.set(t.egress_node_id, { reported_at: NOW, tunnels: [], last_error: null });
+    if (t.ingress_node_id != null) ensureReport(t.ingress_node_id);
+    if (t.egress_node_id != null) ensureReport(t.egress_node_id);
   }
   for (const a of agents) {
-    // 归属 = 对应隧道的 egress_node_id（测试里 agent.tunnels 与 tunnel 同 id）。
     const owner = tunnels.find((t) => String(t.id) === a.id);
-    const key = owner?.egress_node_id ?? 8;
-    if (!reports.has(key)) reports.set(key, { reported_at: NOW, tunnels: [], last_error: null });
-    reports.get(key)!.tunnels.push(a);
+    if (!owner) continue;
+
+    if (owner.tunnel_mode === "relay") {
+      if (owner.ingress_node_id != null) {
+        ensureReport(owner.ingress_node_id).tunnels.push({
+          id: `tunex-${owner.id}-relay`,
+          mode: a.mode ?? "relay",
+          ingress_port: a.ingress_port,
+          revision: a.revision,
+        });
+      }
+      if (owner.egress_node_id != null) {
+        ensureReport(owner.egress_node_id).tunnels.push({
+          id: `tunex-${owner.id}-egress`,
+          mode: "egress",
+          egress_port: a.egress_port,
+          revision: a.revision,
+        });
+      }
+    } else if (owner.ingress_node_id != null) {
+      ensureReport(owner.ingress_node_id).tunnels.push({
+        ...a,
+        id: `tunex-${owner.id}-direct`,
+        mode: a.mode ?? "direct",
+      });
+    }
   }
+
+  // Most unit cases express one node state template ("fresh", "stale",
+  // "inactive"). Mirror that template onto any other concrete bound node so
+  // the test remains about reconciliation behaviour rather than fixture noise.
+  const expandedNodes = [...nodes];
+  if (nodes.length > 0) {
+    const template = nodes[0]!;
+    for (const t of tunnels) {
+      for (const id of [t.ingress_node_id, t.egress_node_id]) {
+        if (id == null || expandedNodes.some((n) => n.node_id === id)) continue;
+        expandedNodes.push({ ...template, node_id: id });
+      }
+    }
+  }
+
   return {
     tunnels: async () => tunnels,
     reports: async () => reports,
-    nodes: async () => nodes,
+    nodes: async () => expandedNodes,
     now: () => NOW,
     ...extra,
   };

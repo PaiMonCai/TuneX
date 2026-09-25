@@ -1,212 +1,234 @@
 #!/usr/bin/env bash
-# WP14 v3 E2E Harness —— 流量转发验证（DEVELOPMENT.md §7.15 Gate 必测项子集）
-#
-# 只验证**测试基础设施自身可证明的**断言，不伪造任何功能结论：
-#   T0 拓扑就绪（panel / 两 agent / 两 target 均存活）
-#   T1 仅出站约束（egress-agent 无 host 端口映射；panel 不接数据面网段）
-#   T2 DIRECT 单跳：host:18201 -> ingress-agent:21001 -> target-a:3030 回 'WP14-TARGET-A'
-#   T3 RELAY  双跳：host:18202 -> ingress-agent:21002 -> egress-agent -> target-b:3030 回 'WP14-TARGET-B'
-#   T4 数据面不串台：DIRECT 不回 TARGET-B 标记，RELAY 不回 TARGET-A 标记
-#   T5 跨租户隔离：primary 会话不得读到 isolation workspace 的隧道 wp14-foreign
-#   T6 配置隔离：foreign 隧道不得出现在 ingress-agent 拿到的配置（agent 日志 / MySQL 侧不变量）
-#
-# ⚠️ WP14 边界：本脚本是 **harness 自检**。它证明"拓扑 + 转发链路 + 隔离约束成立"，
-# 但不替代正式的 WP14 Gate（legacy DIRECT no regression / Egress-before-Ingress /
-# weighted target / hot update / ... 那一整张清单，见 DEVELOPMENT.md §7.15）。
-# 功能 WP（WP5/WP8/...）未合入前，T2/T3 会如实 FAIL 而不是被跳过当作通过。
-#
-# 输出：PASS/FAIL 逐项 + 退出码（0 = 全过）；证据落 scripts/v3-e2e/evidence/。
+# TuneX v3 real integration gate.
 set -euo pipefail
 
 REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/v3-e2e"
-COMPOSE="$HERE/docker-compose.e2e.yaml"
 ENVF="$HERE/.env.wp14"
 STATE="$HERE/state.json"
 API=${API:-http://127.0.0.1:18180}
 OUT="$HERE/evidence"
 mkdir -p "$OUT"
 
-PASS=0; FAIL=0; RESULTS=()
+PASS=0
+FAIL=0
+RESULTS=()
 ok()  { PASS=$((PASS+1)); RESULTS+=("PASS | $1"); printf '\033[1;32mPASS\033[0m | %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); RESULTS+=("FAIL | $1"); printf '\033[1;31mFAIL\033[0m | %s\n' "$1"; }
-
-assert_eq()  { if [[ "$1" == "$2" ]]; then ok "$3"; else bad "$3 [实得 '$1' 期望 '$2']"; fi; }
-assert_ne()  { if [[ -n "$1" && "$1" != "$2" ]]; then ok "$3"; else bad "$3 [实得 '$1']"; fi; }
-assert_ge()  { if [[ "${1:-0}" =~ ^[0-9]+$ && "${1:-0}" -ge "$2" ]]; then ok "$3"; else bad "$3 [实得 '$1' 需 >= $2]"; fi; }
-assert_present()     { if [[ "$1" == *"$2"* ]]; then ok "$3"; else bad "$3 [未含 '$2']"; fi; }
-assert_not_contains(){ if [[ "$1" != *"$2"* ]]; then ok "$3"; else bad "$3 [不应含 '$2']"; fi; }
-assert_nonempty()    { if [[ -n "$1" ]]; then ok "$2"; else bad "$2 [为空]"; fi; }
+assert_eq() { [[ "$1" == "$2" ]] && ok "$3" || bad "$3 [实得 '$1' 期望 '$2']"; }
+assert_ne() { [[ -n "$1" && "$1" != "$2" ]] && ok "$3" || bad "$3 [实得 '$1']"; }
+assert_ge() { [[ "${1:-0}" =~ ^[0-9]+$ && "${1:-0}" -ge "$2" ]] && ok "$3" || bad "$3 [实得 '$1' 需 >= $2]"; }
+assert_empty() { [[ -z "$1" ]] && ok "$2" || bad "$2 [实得 '$1']"; }
+assert_nonempty() { [[ -n "$1" ]] && ok "$2" || bad "$2 [为空]"; }
+assert_not_contains() { [[ "$1" != *"$2"* ]] && ok "$3" || bad "$3 [不应含 '$2']"; }
 assert_status_in() {
-  local actual="$1"; shift; local label="${!#}"; local allowed=("${@:1:$#-1}") a
+  local actual="$1"; shift
+  local label="${!#}"
+  local allowed=("${@:1:$#-1}") a
   for a in "${allowed[@]}"; do
-    [[ "$actual" == "$a" ]] && { ok "$label [实得 $actual]"; return; }
+    if [[ "$actual" == "$a" ]]; then ok "$label [实得 $actual]"; return; fi
   done
   bad "$label [实得 $actual 期望 ${allowed[*]}]"
 }
 
-[[ -f "$STATE" ]] || { echo "missing state.json；先跑 setup.sh" >&2; exit 2; }
+[[ -f "$STATE" ]] || { echo "missing $STATE; run setup.sh first" >&2; exit 2; }
 
-# state <selector...> —— 例：state tunnels direct listen_port
 state() {
   python3 - "$STATE" "$@" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 for k in sys.argv[2:-1]:
     d = d[k]
-print(d[sys.argv[-1]])
+v = d[sys.argv[-1]]
+if v is None:
+    print("")
+elif isinstance(v, (dict, list)):
+    print(json.dumps(v, separators=(",", ":")))
+else:
+    print(v)
 PY
 }
 
 mysqlc() {
   set -a; . "$ENVF"; set +a
-  docker exec wp14-mysql sh -c \
-    'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "$0"' "$1" 2>/dev/null | tail -1
+  docker exec wp14-mysql sh -c     'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "$0"' "$1" 2>/dev/null | tail -1
 }
 
-# tcp_probe <host> <port> -> 收到字节（空 = 拨不通）
-tcp_probe() {
-  timeout 8 python3 - "$1" "$2" <<'PY'
-import socket, sys
-try:
-    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=4)
-    s.settimeout(4)
-    data = s.recv(256)
-    s.close()
-    sys.stdout.write(data.decode(errors="replace").strip())
-except Exception:
-    sys.stdout.write("")
-PY
+probe() {
+  local port="$1"
+  docker exec wp14-client sh -c "nc -w 4 172.31.10.20 '$port' </dev/null" 2>/dev/null     | tr -d '\r\n' || true
 }
 
+wait_probe() {
+  local port="$1" want="$2" got=""
+  for _ in $(seq 1 30); do
+    got=$(probe "$port")
+    [[ "$got" == "$want" ]] && { printf '%s' "$got"; return 0; }
+    sleep 1
+  done
+  printf '%s' "$got"
+  return 1
+}
+
+http_mutate() {
+  local method="$1" path="$2" cookie="$3" ws="$4"
+  curl -sS -m 30 -X "$method"     -H "cookie: $cookie"     -H "x-workspace-id: $ws"     -H "x-requested-with: XMLHttpRequest"     -H "content-type: application/json"     "$API$path"
+}
+
+DIRECT_ID=$(state tunnels direct id)
 DIRECT_PORT=$(state tunnels direct listen_port)
+RELAY_ID=$(state tunnels relay id)
 RELAY_PORT=$(state tunnels relay listen_port)
+RELAY_EGRESS_PORT=$(state tunnels relay egress_port)
+INGRESS_NODE=$(state nodes ingress id)
+EGRESS_NODE=$(state nodes egress id)
+INGRESS_CRED=$(state nodes ingress credential)
 MARK_A=$(state markers target_a)
 MARK_B=$(state markers target_b)
-direct_host_port=${WP14_INGRESS_PORT_DIRECT:-$(python3 -c "import json;print(json.load(open('$STATE'))['hostPorts']['direct'])")}
-relay_host_port=${WP14_INGRESS_PORT_RELAY:-$(python3 -c "import json;print(json.load(open('$STATE'))['hostPorts']['relay'])")}
-
-# SQL 注入面：本文件所有 WHERE 值都来自本仓库 fixture 生成的 state.json，但 host 侧
-# 环境变量（WP14_INGRESS_PORT_*）是操作者可控的，用整数校验兜底。
-[[ "$direct_host_port" =~ ^[0-9]+$ ]] || direct_host_port=18201
-[[ "$relay_host_port" =~ ^[0-9]+$ ]] || relay_host_port=18202
+PRI_WS=$(state workspaces primary id)
+FOREIGN_WS=$(state workspaces isolation id)
+FOREIGN_GROUP=$(state nodeGroups foreign-ingress id)
 
 echo "=================================================================="
-echo " WP14 v3 E2E Harness —— 流量转发验证"
-echo " panel=$API  direct: 127.0.0.1:$direct_host_port -> :$DIRECT_PORT -> target-a"
-echo "              relay : 127.0.0.1:$relay_host_port -> :$RELAY_PORT -> egress -> target-b"
+echo " TuneX v3 Integration Gate"
+echo " DIRECT tunnel=$DIRECT_ID : 172.31.10.20:$DIRECT_PORT -> target-a"
+echo " RELAY  tunnel=$RELAY_ID  : 172.31.10.20:$RELAY_PORT -> 172.31.20.20:$RELAY_EGRESS_PORT -> target-b"
 echo "=================================================================="
 
-# ---------------------------------------------------------------- T0 拓扑就绪
-for c in wp14-panel wp14-ingress-agent wp14-egress-agent wp14-target-a wp14-target-b; do
+# ---------------------------------------------------------------- T0 topology
+for c in wp14-panel wp14-worker wp14-ingress-agent wp14-egress-agent wp14-target-a wp14-target-b wp14-client; do
   running=$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo false)
   assert_eq "$running" "true" "T0 $c 运行中"
 done
-panel_health=$(docker inspect -f '{{.State.Health.Status}}' wp14-panel 2>/dev/null || echo none)
-assert_eq "$panel_health" "healthy" "T0b panel 健康检查 healthy"
+assert_eq "$(docker inspect -f '{{.State.Health.Status}}' wp14-panel 2>/dev/null || echo none)" "healthy" "T0 panel healthy"
 
-# ---------------------------------------------------------------- T1 仅出站约束
-# 1a. egress-agent 不得有 host 端口映射（NAT/私网语义）
-EGRESS_PORTS=$(docker inspect wp14-egress-agent --format '{{json .HostConfig.PortBindings}}' 2>/dev/null || echo '{}')
-[[ "$EGRESS_PORTS" == "{}" || "$EGRESS_PORTS" == "null" ]] \
-  && ok "T1a egress-agent 无 host 端口映射（仅可主动出站）" \
-  || bad "T1a egress-agent 出现 host 端口映射，破坏仅出站约束: $EGRESS_PORTS"
-# 1b. panel 不得接入数据面网段（控制面无法数据面可达）
-PANEL_NETS=$(docker inspect wp14-panel --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || echo "")
-assert_not_contains "$PANEL_NETS" "wp14_ingress_data" "T1b panel 未接入口数据面网段"
-assert_not_contains "$PANEL_NETS" "wp14_egress_data"  "T1b2 panel 未接出口数据面网段"
-# 1c. 数据面网段必须是 internal（容器间可达、无外网出口）
-for net in wp14_ingress_data wp14_egress_data; do
-  internal=$(docker network inspect "$net" --format '{{.Internal}}' 2>/dev/null || echo "")
-  assert_eq "$internal" "true" "T1c $net 为 internal 网段（无外网出口）"
+# ---------------------------------------------------------------- T1 outbound-only control
+for c in wp14-ingress-agent wp14-egress-agent; do
+  ports=$(docker inspect "$c" --format '{{json .HostConfig.PortBindings}}' 2>/dev/null || echo '{}')
+  [[ "$ports" == "{}" || "$ports" == "null" ]] && ok "T1 $c 无 host 端口映射" || bad "T1 $c 暴露 host 端口: $ports"
+  logs=$(docker logs "$c" 2>&1 || true)
+  assert_not_contains "$logs" "v3 admin api listening" "T1 $c 未启动入站 admin API"
 done
+PANEL_NETS=$(docker inspect wp14-panel --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || true)
+assert_not_contains "$PANEL_NETS" "wp14_ingress_data" "T1 Panel 不接入口数据网"
+assert_not_contains "$PANEL_NETS" "wp14_egress_data" "T1 Panel 不接出口数据网"
+assert_eq "$(docker network inspect wp14_ingress_data --format '{{.Internal}}')" "true" "T1 ingress data network internal"
+assert_eq "$(docker network inspect wp14_egress_data --format '{{.Internal}}')" "true" "T1 egress data network internal"
 
-# ---------------------------------------------------------------- T2 DIRECT 单跳
-GOT_A=$(tcp_probe 127.0.0.1 "$direct_host_port" | tr -d '\r\n')
-echo "--- DIRECT 探针 127.0.0.1:$direct_host_port -> '$GOT_A'"
-assert_nonempty "$GOT_A" "T2a host:$direct_host_port 拨入 ingress-agent（DIRECT 隧道已监听）"
-assert_eq "$GOT_A" "$MARK_A" "T2b DIRECT 单跳命中 target-a 标记"
+# ---------------------------------------------------------------- T2 concrete DB state
+DIRECT_ROW=$(mysqlc "SELECT CONCAT(IFNULL(ingress_node_id,0),'|',IFNULL(egress_node_id,0),'|',apply_status,'|',IFNULL(config_revision,0),'|',IFNULL(applied_revision,0)) FROM tunnel WHERE id=$DIRECT_ID;")
+IFS='|' read -r D_IN D_OUT D_STATUS D_CFG D_APPLIED <<<"$DIRECT_ROW"
+assert_eq "$D_IN" "$INGRESS_NODE" "T2 DIRECT 持久化 concrete ingress_node_id"
+assert_eq "$D_OUT" "0" "T2 DIRECT 无 egress_node_id"
+assert_eq "$D_STATUS" "active" "T2 DIRECT apply_status=active"
+assert_eq "$D_CFG" "$D_APPLIED" "T2 DIRECT config_revision 已被 ACK"
 
-# ---------------------------------------------------------------- T3 RELAY 双跳
-GOT_B=$(tcp_probe 127.0.0.1 "$relay_host_port" | tr -d '\r\n')
-echo "--- RELAY 探针 127.0.0.1:$relay_host_port -> '$GOT_B'"
-assert_nonempty "$GOT_B" "T3a host:$relay_host_port 拨入 ingress-agent（RELAY 隧道已监听）"
-assert_eq "$GOT_B" "$MARK_B" "T3b RELAY 双跳命中 target-b 标记"
+RELAY_ROW=$(mysqlc "SELECT CONCAT(IFNULL(ingress_node_id,0),'|',IFNULL(egress_node_id,0),'|',IFNULL(egress_port,0),'|',apply_status,'|',IFNULL(config_revision,0),'|',IFNULL(applied_revision,0)) FROM tunnel WHERE id=$RELAY_ID;")
+IFS='|' read -r R_IN R_OUT R_PORT R_STATUS R_CFG R_APPLIED <<<"$RELAY_ROW"
+assert_eq "$R_IN" "$INGRESS_NODE" "T2 RELAY 持久化 concrete ingress_node_id"
+assert_eq "$R_OUT" "$EGRESS_NODE" "T2 RELAY 持久化 concrete egress_node_id"
+assert_eq "$R_PORT" "$RELAY_EGRESS_PORT" "T2 RELAY 持久化 egress_port"
+assert_eq "$R_STATUS" "active" "T2 RELAY apply_status=active"
+assert_eq "$R_CFG" "$R_APPLIED" "T2 RELAY config_revision 已被双端 ACK"
 
-# 双跳的第二跳证据：出口 agent 必须真实持有 egressPort 监听。egress-agent 容器内
-# 无 ss/netstat（busybox 基础镜像），故用「入口 agent 日志出现 nodelay 拨号 +
-# egress 节点在线」两条可观测证据替代容器内端口表。
-IN_LOG=$(docker logs wp14-ingress-agent 2>&1 || true)
-EG_ONLINE=$(mysqlc "SELECT COUNT(*) FROM node WHERE node_id='WP14-OUT-A-NODE' AND status='active';")
-assert_ge "$EG_ONLINE" 1 "T3c 出口节点在控制面标记为 active（count=${EG_ONLINE}）"
+DIRECT_LEASE=$(mysqlc "SELECT CONCAT(node_id,'|',port,'|',lease_type,'|',status) FROM node_port_lease WHERE tunnel_id=$DIRECT_ID AND node_id=$INGRESS_NODE AND port=$DIRECT_PORT LIMIT 1;")
+assert_eq "$DIRECT_LEASE" "$INGRESS_NODE|$DIRECT_PORT|ingress|active" "T2 DIRECT ingress NodePortLease 完整"
 
-# ---------------------------------------------------------------- T4 数据面不串台
-assert_ne "$GOT_A" "$MARK_B" "T4a DIRECT 端口不回 TARGET-B 标记"
-assert_ne "$GOT_B" "$MARK_A" "T4b RELAY 端口不回 TARGET-A 标记"
+RELAY_IN_LEASE=$(mysqlc "SELECT CONCAT(node_id,'|',port,'|',lease_type,'|',status) FROM node_port_lease WHERE tunnel_id=$RELAY_ID AND node_id=$INGRESS_NODE AND port=$RELAY_PORT LIMIT 1;")
+assert_eq "$RELAY_IN_LEASE" "$INGRESS_NODE|$RELAY_PORT|ingress|active" "T2 RELAY ingress NodePortLease 完整"
 
-# ---------------------------------------------------------------- T5 跨租户隔离
-FOREIGN_TUN_ID=$(state tunnels foreign id)
-FOREIGN_WS=$(state workspaces isolation id)
-PRI_WS=$(state workspaces primary id)
-assert_ne "$FOREIGN_WS" "$PRI_WS" "T5a primary / isolation 是不同 workspace"
+RELAY_OUT_LEASE=$(mysqlc "SELECT CONCAT(node_id,'|',port,'|',lease_type,'|',status) FROM node_port_lease WHERE tunnel_id=$RELAY_ID AND node_id=$EGRESS_NODE AND port=$RELAY_EGRESS_PORT LIMIT 1;")
+assert_eq "$RELAY_OUT_LEASE" "$EGRESS_NODE|$RELAY_EGRESS_PORT|egress|active" "T2 RELAY egress NodePortLease 完整"
 
-# 测试用户登录拿 cookie（set-cookie 头 split 第一段）
-LOGIN_PAYLOAD=$(python3 -c "import json;print(json.dumps(json.load(open('$STATE'))['user']))")
-curl -s -m 10 -D "$OUT/t5-login-headers.txt" -o "$OUT/t5-login-body.json" \
-  -X POST "$API/api/auth/login" -H 'content-type: application/json' -d "$LOGIN_PAYLOAD" >/dev/null
-COOKIE=$(grep -i '^set-cookie:' "$OUT/t5-login-headers.txt" | head -1 | sed 's/^[Ss]et-[Cc]ookie: *//' | cut -d';' -f1)
-assert_nonempty "$COOKIE" "T5a2 测试用户登录成功并拿到会话 cookie"
+LEASE_ROWS=$(mysqlc "SELECT GROUP_CONCAT(CONCAT(node_id,':',port,':',lease_type,':',status) ORDER BY node_id,port SEPARATOR ',') FROM node_port_lease WHERE tunnel_id IN ($DIRECT_ID,$RELAY_ID);")
+assert_nonempty "$LEASE_ROWS" "T2 lease 账本可诊断 [$LEASE_ROWS]"
+DUP_COUNT=$(mysqlc "SELECT COUNT(*) FROM (SELECT node_id,port,COUNT(*) c FROM node_port_lease WHERE status='active' GROUP BY node_id,port HAVING c>1) x;")
+assert_eq "$DUP_COUNT" "0" "T2 同一物理 Node 端口无重复 active owner"
 
-# primary 会话读 isolation 的隧道 → 必须被拒（403/404）
-cross_status=$(curl -s -o "$OUT/t5-foreign-get.json" -w '%{http_code}' -m 10 \
-  -H "cookie: $COOKIE" -H "x-workspace-id: $FOREIGN_WS" "$API/api/tunnels/$FOREIGN_TUN_ID" 2>/dev/null || echo 000)
-assert_status_in "$cross_status" 403 404 "T5b primary 会话读 isolation 隧道 $FOREIGN_TUN_ID 被拒"
+# ---------------------------------------------------------------- T3 real data plane
+GOT_A=$(wait_probe "$DIRECT_PORT" "$MARK_A" || true)
+assert_eq "$GOT_A" "$MARK_A" "T3 DIRECT client -> ingress -> target-a"
+GOT_B=$(wait_probe "$RELAY_PORT" "$MARK_B" || true)
+assert_eq "$GOT_B" "$MARK_B" "T3 RELAY client -> ingress -> egress -> target-b"
+assert_ne "$GOT_A" "$MARK_B" "T3 DIRECT 不串到 target-b"
+assert_ne "$GOT_B" "$MARK_A" "T3 RELAY 不串到 target-a"
 
-# 反向对照：primary 会话读自己的隧道必须 200（否则上面的拒绝只是"全拒"）
-DIRECT_TUN_ID=$(state tunnels direct id)
-own_status=$(curl -s -o "$OUT/t5-own-get.json" -w '%{http_code}' -m 10 \
-  -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" "$API/api/tunnels/$DIRECT_TUN_ID" 2>/dev/null || echo 000)
-assert_eq "$own_status" "200" "T5c primary 会话读自己的隧道 $DIRECT_TUN_ID 通过（对照）"
+# ---------------------------------------------------------------- login for user actions
+LOGIN_PAYLOAD=$(python3 - "$STATE" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(json.dumps(d["user"]))
+PY
+)
+curl -sS -m 15 -D "$OUT/login.headers" -o "$OUT/login.json"   -X POST "$API/api/auth/login"   -H 'content-type: application/json'   -H 'x-requested-with: XMLHttpRequest'   -d "$LOGIN_PAYLOAD" >/dev/null
+COOKIE=$(grep -i '^set-cookie:' "$OUT/login.headers" | head -1 | sed 's/^[Ss]et-[Cc]ookie: *//' | cut -d';' -f1)
+assert_nonempty "$COOKIE" "T4 用户会话登录成功"
 
-# 跨 workspace 建隧道同样必须被拒（isolation 组的入组 id 不属于 primary 会话）
-FOREIGN_GROUP_ID=$(state nodeGroups foreign-ingress id)
-cross_create=$(curl -s -o "$OUT/t5-cross-create.json" -w '%{http_code}' -m 10 -X POST \
-  -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'content-type: application/json' \
-  -d "{\"name\":\"cross-illegal\",\"in_node_group_id\":$FOREIGN_GROUP_ID,\"tunnel_type\":\"tcp\",
-       \"listen_port\":21199,\"forward_addresses\":[\"target-b:3030\"]}" \
-  "$API/api/tunnels" 2>/dev/null || echo 000)
-assert_status_in "$cross_create" 400 403 404 "T5d primary 会话用 isolation 组建隧道被拒"
+# ---------------------------------------------------------------- T4 suspend / resume = real runtime stop/start
+SUSPEND_STATUS=$(curl -sS -m 30 -o "$OUT/direct-suspend.json" -w '%{http_code}'   -X POST "$API/api/tunnels/v3/$DIRECT_ID/suspend"   -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS"   -H 'x-requested-with: XMLHttpRequest' -H 'content-type: application/json')
+assert_eq "$SUSPEND_STATUS" "200" "T4 DIRECT suspend API 成功"
+sleep 1
+assert_empty "$(probe "$DIRECT_PORT")" "T4 suspend 后 DIRECT listener 已停止"
+LEASE_AFTER_SUSPEND=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE tunnel_id=$DIRECT_ID AND status='active';")
+assert_eq "$LEASE_AFTER_SUSPEND" "1" "T4 suspend 保留 durable port lease"
 
-# ---------------------------------------------------------------- T6 配置隔离
-# 「跨租户数据不串台」的可证明形式：foreign 隧道在控制面真实存在，但不得出现在
-# ingress 节点组可见的隧道集合里。控制面 render 出的 agent 配置是 Fernet 密文
-# （无法直接 grep 明文），故在 DB 侧验证可达性不变量 + 在 agent 日志侧验证已应用。
-INGRESS_GID=$(state nodeGroups ingress id)
-FOREIGN_INGRESS_GID=$(state nodeGroups foreign-ingress id)
-assert_ne "$INGRESS_GID" "$FOREIGN_INGRESS_GID" "T6a ingress / foreign 是不同节点组"
-INGRESS_VISIBLE=$(mysqlc "SELECT GROUP_CONCAT(id ORDER BY id) FROM tunnel WHERE in_node_group_id=$INGRESS_GID;")
-echo "--- ingress 组 $INGRESS_GID 可见隧道: ${INGRESS_VISIBLE:-<空>}"
-assert_not_contains "${INGRESS_VISIBLE:-}," "$FOREIGN_TUN_ID," "T6b ingress 组配置不含 foreign 隧道"
-# foreign 隧道必须真实存在于它自己的 isolation 组（否则 T5b 的拒绝只是"对象不存在"）
-FOREIGN_COUNT=$(mysqlc "SELECT COUNT(*) FROM tunnel WHERE id=$FOREIGN_TUN_ID AND in_node_group_id=$FOREIGN_INGRESS_GID;")
-assert_eq "$FOREIGN_COUNT" "1" "T6c foreign 隧道真实存在于 isolation 组（T5b 拒绝来自授权而非不存在）"
+RESUME_STATUS=$(curl -sS -m 45 -o "$OUT/direct-resume.json" -w '%{http_code}'   -X POST "$API/api/tunnels/v3/$DIRECT_ID/resume"   -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS"   -H 'x-requested-with: XMLHttpRequest' -H 'content-type: application/json')
+assert_eq "$RESUME_STATUS" "200" "T4 DIRECT resume API 成功"
+GOT_AFTER_RESUME=$(wait_probe "$DIRECT_PORT" "$MARK_A" || true)
+assert_eq "$GOT_AFTER_RESUME" "$MARK_A" "T4 resume 原端口恢复 DIRECT"
+LEASE_PORT=$(mysqlc "SELECT port FROM node_port_lease WHERE tunnel_id=$DIRECT_ID AND status='active' LIMIT 1;")
+assert_eq "$LEASE_PORT" "$DIRECT_PORT" "T4 resume 沿用原 NodePortLease"
 
-# agent 在线证据：ingress agent 已拿到配置（日志出现 config applied）
-assert_present "$IN_LOG" "config applied" "T6d ingress-agent 已应用控制面配置（日志证据）"
+# ---------------------------------------------------------------- T5 Agent restart restore
+say_restart() { printf '%s\n' "--- restarting $* to prove /desired restore"; }
+say_restart wp14-ingress-agent wp14-egress-agent
+docker restart wp14-ingress-agent wp14-egress-agent >/dev/null
+GOT_RESTART_DIRECT=$(wait_probe "$DIRECT_PORT" "$MARK_A" || true)
+GOT_RESTART_RELAY=$(wait_probe "$RELAY_PORT" "$MARK_B" || true)
+assert_eq "$GOT_RESTART_DIRECT" "$MARK_A" "T5 ingress Agent 重启后 DIRECT 从 desired snapshot 恢复"
+assert_eq "$GOT_RESTART_RELAY" "$MARK_B" "T5 Agent 重启后 RELAY 双端恢复"
 
-# ---------------------------------------------------------------- 证据沉淀
+# ---------------------------------------------------------------- T6 per-node credential and server-side identity
+BAD_STATUS=$(curl -s -m 10 -o "$OUT/bad-credential.json" -w '%{http_code}'   -H 'authorization: Bearer definitely-invalid-node-credential'   "$API/api/internal/node/commands" || echo 000)
+assert_eq "$BAD_STATUS" "401" "T6 无效 node credential 被拒"
+
+GOOD_STATUS=$(curl -s -m 10 -o "$OUT/good-credential.json" -w '%{http_code}'   -H "authorization: Bearer $INGRESS_CRED"   "$API/api/internal/node/commands" || echo 000)
+assert_eq "$GOOD_STATUS" "200" "T6 ingress per-node credential 可认证"
+
+DESIRED=$(curl -sS -m 10 -H "authorization: Bearer $INGRESS_CRED" "$API/api/internal/node/desired")
+assert_not_contains "$DESIRED" "tunex-$RELAY_ID-egress" "T6 ingress credential 看不到 egress runtime"
+[[ "$DESIRED" == *"tunex-$DIRECT_ID-direct"* && "$DESIRED" == *"tunex-$RELAY_ID-relay"* ]]   && ok "T6 desired snapshot 只包含绑定到 ingress Node 的 runtime"   || bad "T6 desired snapshot 缺少 ingress runtime: $DESIRED"
+
+# ---------------------------------------------------------------- T7 tenant isolation
+assert_ne "$PRI_WS" "$FOREIGN_WS" "T7 primary/isolation workspace 不同"
+CROSS_STATUS=$(curl -sS -m 20 -o "$OUT/cross-create.json" -w '%{http_code}'   -X POST "$API/api/tunnels"   -H "cookie: $COOKIE"   -H "x-workspace-id: $PRI_WS"   -H 'x-requested-with: XMLHttpRequest'   -H 'content-type: application/json'   -d "{\"name\":\"cross-illegal\",\"in_node_group_id\":$FOREIGN_GROUP,\"tunnel_type\":\"tcp\",\"listen_port\":21199,\"forward_addresses\":[\"target-b:3030\"]}" || echo 000)
+assert_status_in "$CROSS_STATUS" 403 404 "T7 primary workspace 不能使用 isolation NodeGroup"
+
+# ---------------------------------------------------------------- T8 worker/reconciler is actually running
+WORKER_RUNNING=$(docker inspect -f '{{.State.Running}}' wp14-worker 2>/dev/null || echo false)
+assert_eq "$WORKER_RUNNING" "true" "T8 Reconciler worker 进程运行中"
+# The recurring job is registered in BullMQ; observing the job name proves this
+# deployment is not merely importing reconciler.ts without scheduling it.
+for _ in $(seq 1 40); do
+  WLOG=$(docker logs wp14-worker 2>&1 || true)
+  [[ "$WLOG" == *"cron_reconcile_v3"* ]] && break
+  sleep 1
+done
+[[ "${WLOG:-}" == *"cron_reconcile_v3"* ]]   && ok "T8 cron_reconcile_v3 已进入生产 worker 调度"   || bad "T8 worker 日志未观察到 cron_reconcile_v3"
+
+# ---------------------------------------------------------------- evidence
 {
-  echo "# WP14 v3 E2E Harness 验证证据"
-  echo "时间: $(date -Is)"
-  echo "拓扑: panel + ingress-agent + egress-agent + target-a + target-b"
-  echo "DIRECT: host:$direct_host_port -> agent:$DIRECT_PORT -> target-a:3030 -> '$GOT_A'"
-  echo "RELAY : host:$relay_host_port -> agent:$RELAY_PORT -> egress-agent -> target-b:3030 -> '$GOT_B'"
+  echo "# TuneX v3 Integration Gate Evidence"
+  echo "time: $(date -Is)"
+  echo "DIRECT: tunnel=$DIRECT_ID port=$DIRECT_PORT result=$GOT_RESTART_DIRECT"
+  echo "RELAY: tunnel=$RELAY_ID ingress=$RELAY_PORT egress=$RELAY_EGRESS_PORT result=$GOT_RESTART_RELAY"
+  echo "bindings: ingress_node=$INGRESS_NODE egress_node=$EGRESS_NODE"
   echo
   printf '%s\n' "${RESULTS[@]}"
   echo
-  echo "总计: PASS=$PASS FAIL=$FAIL"
-} > "$OUT/verify-result.txt"
+  echo "TOTAL PASS=$PASS FAIL=$FAIL"
+} >"$OUT/verify-result.txt"
 
 echo "------------------------------------------------------------------"
-printf '总计: \033[1;32mPASS=%d\033[0m \033[1;31mFAIL=%d\033[0m  证据: %s\n' "$PASS" "$FAIL" "$OUT/verify-result.txt"
-[[ $FAIL -eq 0 ]]
+printf 'TOTAL: \033[1;32mPASS=%d\033[0m \033[1;31mFAIL=%d\033[0m evidence=%s\n' "$PASS" "$FAIL" "$OUT/verify-result.txt"
+[[ "$FAIL" -eq 0 ]]

@@ -42,7 +42,7 @@ export const EGRESS_STATUSES = ["active", "inactive"] as const;
 export type EgressStatusValue = (typeof EGRESS_STATUSES)[number];
 
 /** 负载均衡策略（schema `enum LBStrategy`）。 */
-export const LB_STRATEGIES = ["round", "rand"] as const;
+export const LB_STRATEGIES = ["round", "rand", "weighted_round"] as const;
 export type LbStrategyValue = (typeof LB_STRATEGIES)[number];
 
 /** 每个出口节点自动维护的默认池名（schema `EgressPool` 注释）。 */
