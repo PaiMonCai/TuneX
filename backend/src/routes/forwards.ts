@@ -13,6 +13,7 @@ import {
   createForward,
   deleteForward,
   getForward,
+  getForwardTraffic,
   listForwards,
   patchForward,
   runForwardAction,
@@ -125,6 +126,18 @@ forwardsRoutes.post("/", async (c) => {
     await createForward(user(c).id, ws.id, parsed.data),
     201,
   );
+});
+
+forwardsRoutes.get("/:id/traffic", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) {
+    return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  }
+  const days = Math.max(
+    1,
+    Math.min(90, Number(c.req.query("days") ?? 14) || 14),
+  );
+  return send(c, await getForwardTraffic(id, workspace(c).id, days));
 });
 
 forwardsRoutes.get("/:id", async (c) => {
