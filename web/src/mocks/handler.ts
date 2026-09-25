@@ -1953,10 +1953,82 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     return notFound(`Mock route not found: ${method} /${clean}`);
   }
 
-  // ---------- node groups（用户侧：仅返回可用） ----------
-  if (seg[0] === "node-groups" && method === "GET") {
-    const items = filterByStatus(db.nodeGroups, q).map((g) => withGroupStats(db, g));
-    return ok(paginate(items, q));
+  // ---------- node groups（用户侧：列表 + V4 节点部署） ----------
+  if (seg[0] === "node-groups") {
+    if (method === "GET" && seg[1] === undefined) {
+      const items = filterByStatus(db.nodeGroups, q).map((g) => withGroupStats(db, g));
+      return ok(paginate(items, q));
+    }
+
+    const groupId = parseId(seg[1]);
+    if (method === "POST" && groupId !== null && seg[2] === "nodes") {
+      const group = db.nodeGroups.find((row) => row.id === groupId);
+      if (!group) return notFound("节点组不存在");
+      const body = asRecord(req.body);
+      const nodeKey = reqStr(body.node_id);
+      if (!nodeKey) return badRequest("node_id / connect_ip / role 不合法");
+      if (db.nodes.some((node) => node.node_id === nodeKey)) {
+        return fail(409, "节点 ID 已存在", "NODE_EXISTS");
+      }
+
+      const roleRaw = reqStr(body.role);
+      const role =
+        roleRaw === "ingress" || roleRaw === "egress" || roleRaw === "both"
+          ? roleRaw
+          : group.node_type === "out"
+            ? "egress"
+            : "ingress";
+      const range = group.port_range?.split("-").map(Number) ?? [];
+      const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
+      const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
+      if (
+        portMin === null ||
+        portMax === null ||
+        portMin < 1 ||
+        portMax > 65535 ||
+        portMin > portMax
+      ) {
+        return fail(409, "节点组未配置可用于 v3 的连续端口范围", "PORT_RANGE_REQUIRED");
+      }
+
+      const id = nextId(db.nodes);
+      const created: Node = {
+        id,
+        node_id: nodeKey,
+        agent_id: `mock-agent-${id}-${Math.random().toString(36).slice(2, 8)}`,
+        weight: 10,
+        status: "active",
+        connect_ip: reqStr(body.connect_ip) || null,
+        version: "pending",
+        backup: false,
+        order_by: db.nodes.reduce((max, node) => Math.max(max, node.order_by), 0) + 10,
+        custom_line: null,
+        dns_status: false,
+        node_group_id: group.id,
+        node_group: { id: group.id, name: group.name, node_type: group.node_type },
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        online: false,
+        traffic: 0,
+        role,
+        last_seen_at: null,
+        port_range_min: portMin,
+        port_range_max: portMax,
+        lb_strategy: "round",
+        has_credential: false,
+        credential_revoked: false,
+        credential_rotated_at: null,
+        credential_last_rejected_at: null,
+      };
+      db.nodes.push(created);
+      const projected = mockUserNode(db, created);
+      return ok({
+        node: projected,
+        enrollment: mockEnrollment(projected),
+      });
+    }
+
+    return notFound(`Mock route not found: ${method} /${clean}`);
   }
 
   // ---------- WP11 / WP13：用户侧可用出口池（创建 RELAY 隧道时选池） ----------
