@@ -251,8 +251,8 @@ export interface Node {
   id: ID;
   /** 用户可读节点名/标签。 */
   node_id: string;
-  /** Panel 生成的不可变物理 Agent 唯一 ID。 */
-  agent_id: string;
+  /** Panel 生成的不可变物理 Agent 唯一 ID；旧管理接口/fixture 迁移期可缺省。 */
+  agent_id?: string;
   weight: number;
   status: Status;
   connect_ip: string | null;
@@ -825,6 +825,7 @@ export interface NodeEnrollmentIssued {
 
 /** 用户侧 Node-first 列表的安全节点投影。 */
 export interface UserNode extends Node {
+  agent_id: string;
   registered?: boolean;
   has_credential?: boolean;
 }
