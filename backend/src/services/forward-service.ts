@@ -374,7 +374,7 @@ export async function createForward(
   if (denied) {
     return error(
       403,
-      denied.reason,
+      denied.reason ?? "policy_denied",
       denied.message ?? "策略拒绝",
     );
   }
