@@ -25,10 +25,11 @@ import {
 import { Input, Label } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatDateTime } from "@/lib/utils";
-import type { NodeBinding, PortForward, UserNode } from "@/lib/types";
+import { formatBytes, formatDateTime } from "@/lib/utils";
+import type { ForwardSummary, NodeBinding, PortForward, UserNode } from "@/lib/types";
 
 type ForwardModeFilter = "all" | "direct" | "relay";
+type ForwardStatusFilter = "all" | "active" | "error" | "suspended" | "pending";
 
 function isIngress(node: UserNode) {
   return node.role === "ingress" || node.role === "both";
@@ -42,10 +43,12 @@ export function ForwardWorkspace() {
   const { t } = useI18n();
   const [nodes, setNodes] = useState<UserNode[]>([]);
   const [forwards, setForwards] = useState<PortForward[]>([]);
+  const [summary, setSummary] = useState<ForwardSummary | null>(null);
   const [bindings, setBindings] = useState<Record<number, NodeBinding[]>>({});
   const [loading, setLoading] = useState(true);
   const [keyword, setKeyword] = useState("");
   const [modeFilter, setModeFilter] = useState<ForwardModeFilter>("all");
+  const [statusFilter, setStatusFilter] = useState<ForwardStatusFilter>("all");
   const [createOpen, setCreateOpen] = useState(false);
   const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
   const [name, setName] = useState("");
@@ -78,9 +81,10 @@ export function ForwardWorkspace() {
   async function load() {
     setLoading(true);
     try {
-      const [nodeRows, forwardRows] = await Promise.all([
+      const [nodeRows, forwardRows, forwardSummary] = await Promise.all([
         api.nodes.list(),
         api.forwards.list(),
+        api.forwards.summary(),
       ]);
       const ingressRows = nodeRows.filter(isIngress);
       const rows = await Promise.all(
@@ -94,6 +98,7 @@ export function ForwardWorkspace() {
       setNodes(nodeRows);
       setBindings(bindingMap);
       setForwards(forwardRows);
+      setSummary(forwardSummary);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
     } finally {
@@ -109,6 +114,11 @@ export function ForwardWorkspace() {
     const q = keyword.trim().toLowerCase();
     return forwards.filter((forward) => {
       if (modeFilter !== "all" && forward.mode !== modeFilter) return false;
+      if (statusFilter === "pending") {
+        if (forward.apply_status !== "pending" && forward.apply_status !== "applying") return false;
+      } else if (statusFilter !== "all" && forward.apply_status !== statusFilter) {
+        return false;
+      }
       if (!q) return true;
       const fields = [
         forward.name,
@@ -120,7 +130,7 @@ export function ForwardWorkspace() {
       ];
       return fields.some((field) => field.toLowerCase().includes(q));
     });
-  }, [forwards, keyword, modeFilter]);
+  }, [forwards, keyword, modeFilter, statusFilter]);
 
   function openCreate(mode: "direct" | "relay") {
     const firstIngress = ingressNodes[0];
@@ -262,6 +272,21 @@ export function ForwardWorkspace() {
             onChange={(event) => setKeyword(event.target.value)}
             placeholder={t("forward.searchPlaceholder")}
           />
+          <Select
+            value={statusFilter}
+            onValueChange={(value) => setStatusFilter(value as ForwardStatusFilter)}
+          >
+            <SelectTrigger className="h-9 w-40">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("forward.statusAll")}</SelectItem>
+              <SelectItem value="active">{t("forward.statusActive")}</SelectItem>
+              <SelectItem value="pending">{t("forward.statusPending")}</SelectItem>
+              <SelectItem value="suspended">{t("forward.statusSuspended")}</SelectItem>
+              <SelectItem value="error">{t("forward.statusError")}</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={() => openCreate("direct")}>
@@ -275,7 +300,42 @@ export function ForwardWorkspace() {
         </div>
       </div>
 
-      {!loading && forwards.length === 0 && !keyword && modeFilter === "all" ? (
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTotal")}</div>
+            <div className="mt-1 text-2xl font-semibold">{summary?.total ?? (loading ? "—" : 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
+              {t("forward.direct")} {summary?.direct ?? 0} · {t("forward.relay")} {summary?.relay ?? 0}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorActive")}</div>
+            <div className="mt-1 text-2xl font-semibold">{summary?.active ?? (loading ? "—" : 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
+              {t("forward.statusPending")} {summary?.pending ?? 0} · {t("forward.statusSuspended")} {summary?.suspended ?? 0}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttention")}</div>
+            <div className="mt-1 text-2xl font-semibold">{summary?.error ?? (loading ? "—" : 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttentionHint")}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTraffic")}</div>
+            <div className="mt-1 text-2xl font-semibold">{formatBytes(summary?.traffic ?? 0)}</div>
+            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorTrafficHint")}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {!loading && forwards.length === 0 && !keyword && modeFilter === "all" && statusFilter === "all" ? (
         <div className="grid gap-4 md:grid-cols-2">
           <Card>
             <CardHeader>
