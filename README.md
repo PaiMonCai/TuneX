@@ -1,10 +1,11 @@
 # TuneX
 
-> 面向个人与团队的多租户隧道控制面：管理账号、Workspace、节点、隧道、权限策略与 Agent 配置分发。
+> 面向个人与团队的多租户端口转发控制面：管理 Workspace、节点、入口/出口绑定、端口转发与 Agent。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
+[![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
-TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户在控制台创建个人或团队 Workspace，部署 Agent，再通过控制面管理节点与隧道。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
+TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户先在控制台创建 Node，复制一键安装命令到 Linux 节点执行，然后直接在入口节点上创建 PortForward；不选出口就是 DIRECT，选择已绑定出口就是 RELAY。内部 `Tunnel` 只作为 revision/ACK/NodePortLease/Reconciler 的运行时对象，不再要求用户手工创建。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
 
 > [!IMPORTANT]
 > TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 升级验证、Workspace/RBAC、节点级凭据、TCP DIRECT/RELAY v3 数据面与真实 Docker 集成 Gate。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署请使用 `docker-compose.prod.yaml`、Caddy TLS 与生产环境密钥。**
@@ -17,12 +18,33 @@ TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用
 | Workspace | 个人空间、团队空间、成员邀请、owner/admin/member/viewer 固定角色 |
 | 权限 | Workspace RBAC、CapabilityPolicy、默认免费策略、节点组授权 |
 | 安全 | CSRF、请求限流、审计、API/订阅密钥哈希存储与一次性轮换 |
-| 隧道/节点 | INGRESS/EGRESS/BOTH 节点、TCP DIRECT/RELAY、NodePortLease、revision/ACK、重启恢复与 Reconciler |
+| 节点/转发 | Node 一键 enrollment、INGRESS/EGRESS/BOTH、Ingress↔Egress Binding、Node-first PortForward、TCP DIRECT/RELAY、NodePortLease、revision/ACK、重启恢复与 Reconciler |
 | Web | Next.js 管理控制台、Workspace 切换与成员管理、设置页 |
 | CI | Backend/Web/Agent、秘密扫描、空库/升级迁移、真实 DIRECT/RELAY E2E、统一 GHCR 镜像构建 |
 | 运维 | Compose、Caddy、备份/恢复/告警/容量脚本基础框架 |
 
 后续开发方向、依赖 Gate、迁移规则与 DoD 统一以 [DEVELOPMENT.md](DEVELOPMENT.md) 为准；[docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md) 只作为长期目标架构约束。
+
+### 用户侧模型
+
+`agent_id` 是物理 Agent 的稳定身份，和角色分离。同一台 Agent 选择 `BOTH` 后就是同一条 Node 同时具备入口/出口能力，不会注册成两个节点。
+
+```text
+Ingress Node
+├─ PortForward（不选择出口）──────────────→ Target       # DIRECT
+└─ PortForward（选择已绑定 Egress）──────→ Egress → Target # RELAY
+
+Egress Node
+└─ 先与 Ingress 建立 Binding，之后才会出现在该入口的出口选项中
+```
+
+典型使用流程：
+
+1. 在「节点与转发」创建 Node，Panel 同时生成不可变的唯一 `agent_id`；再选择 `INGRESS`、`EGRESS` 或 `BOTH` 能力。
+2. Panel 返回一条可复制的一键安装命令；命令携带 10 分钟一次性 enrollment token、agent_id 和当前节点显示名，不包含长期 credential。
+3. 在节点机器执行命令后，脚本自动准备 Docker、拉取 Agent 镜像、换取长期 per-node credential，并以 host network 容器启动 Agent。
+4. 选择一个入口 Node；需要 RELAY 时先绑定出口 Node。
+5. 在入口 Node 上直接「添加端口转发」：不选出口 = DIRECT，选择已绑定出口 = RELAY。
 
 ## 架构
 
@@ -190,18 +212,47 @@ cd agent
 go build -o tunex-agent .
 ```
 
-### 运行
+### 一键安装（推荐）
 
-在控制台/API 中创建具体 Node 后会签发一次性的 **per-node credential**。Agent 使用该凭据主动连接 Panel；生产控制链不要求 Panel 反向访问 Agent 的公网管理端口：
+在「节点与转发」创建 Node 后，Panel 会显示类似下面的一条命令：
+
+```bash
+curl -fsSL 'https://panel.example.com/api/internal/node/install.sh' | \
+  sudo sh -s -- \
+  --panel 'https://panel.example.com' \
+  --enroll-token '<10-minute-one-time-token>' \
+  --role 'INGRESS' \
+  --ingress-range '10000-30000'
+```
+
+安装脚本采用 **Docker-first** 部署：
+
+1. 节点没有 Docker Engine 时自动安装并启动 Docker；
+2. 先拉取 Panel 配置的 `TUNEX_AGENT_IMAGE`，镜像拉取失败不会消费一次性 token；
+3. 原子消费 enrollment token，换取真正的 per-node credential；
+4. credential 只写入宿主机 root-only `/etc/tunex-agent/agent.env`；
+5. 启动 `tunex-agent` 容器，使用 `--network host` 让动态 DIRECT/RELAY 监听端口直接绑定宿主机网络；
+6. 容器只读挂载 credential 文件，不通过 `docker run -e` 注入长期凭据，避免 `docker inspect` 直接暴露 credential。
+
+容器默认 `--restart unless-stopped`，并仅保留 `NET_BIND_SERVICE` capability。
+enrollment token 只能使用一次，重新生成安装命令会撤销该节点尚未使用的旧 token。
+
+生产控制链仍然只有 **Agent → Panel 出站 HTTPS**；不要求 Panel 反向访问
+Agent 的公网管理端口。
+
+### 手工运行（调试）
+
+如果已经有节点的 per-node credential，也可以直接运行：
 
 ```bash
 ./tunex-agent \
   --panel-http-url https://panel.example.com \
-  --node-credential <one-time-node-credential> \
+  --node-credential '<node-credential>' \
   --node-id edge-hkg-01 \
   --role BOTH \
   --ingress-range 10000-30000 \
-  --egress-range 30001-60000
+  --egress-range 30001-60000 \
+  --agent-admin-port 0
 ```
 
 常用参数：
@@ -303,15 +354,27 @@ go build ./...
 
 ## 测试与 CI
 
-GitHub Actions 会执行：
+GitHub Actions 分成三层，测试内容不减少：
 
-- **secret-scan**：扫描已跟踪文件中的疑似秘密；
-- **backend**：依赖安装、Prisma migration、类型检查、HTTP/授权测试、旧数据库升级验证；
-- **web**：依赖安装、TypeScript 类型检查、Next.js build；
-- **agent**：`go vet`、`go test`、`go build`、Linux amd64/arm64 交叉编译；
-- **v3-integration**：启动真实 MySQL/Redis/Panel/双 Agent/Target Docker 拓扑，验证 DIRECT、RELAY、NodePortLease、重启恢复、凭据与 Reconciler；
-- **unified-image**：在 v3 Gate 通过后构建统一 TuneX 镜像，并验证 Bun、Node、Next standalone 与两份 Compose；
-- **images**：仅在 push 事件下推送 `ghcr.io/paimoncai/tunex:{latest,<git-sha>}`。
+```text
+feature/** push
+      └── CI
+
+Pull Request
+      ├── CI
+      └── Integration
+
+main push
+      └── CI
+           └── Integration
+                └── Release
+```
+
+- **CI（`.github/workflows/ci.yml`）**：快速源码 Gate。包含 secret-scan、Backend（migration/typecheck/unit/HTTP/旧库升级）、Web（typecheck/unit/build）和 Agent（vet/test/build + amd64/arm64 交叉编译）。同一分支只保留最新一轮。
+- **Integration（`.github/workflows/integration.yml`）**：PR 直接运行；main 上必须等 CI 成功后才运行。依次执行 `agent-image → v3-integration → unified-image`，真实启动 MySQL/Redis/Panel/双 Agent/Target，验证 enrollment、Agent ID、NodeBinding/PortForward、DIRECT/RELAY、NodePortLease、重启恢复、凭据隔离和 Reconciler。
+- **Release（`.github/workflows/release.yml`）**：只会被 **main 的成功 Integration** 触发，发布 Panel `ghcr.io/paimoncai/tunex:{latest,<git-sha>}` 与多架构 Agent `ghcr.io/paimoncai/tunex-agent:{latest,<git-sha>}`。feature/PR 永远不会移动正式镜像标签。
+
+因此正式发布链是严格的 `CI → Integration → Release`；开发分支的小提交不会反复启动重型 v3 Docker E2E。
 
 本地常用检查：
 
@@ -339,7 +402,7 @@ go build ./...
 
 ## Docker 镜像
 
-CI 在发布 push 后构建一个统一应用镜像：
+Release workflow 在 main 的 CI + Integration 全绿后发布统一应用镜像：
 
 ```text
 ghcr.io/paimoncai/tunex:latest
@@ -357,10 +420,11 @@ ghcr.io/paimoncai/tunex:<git-sha>
 └── web          → node server.js
 ```
 
-生产只需要钉一个不可变版本：
+Panel 应用角色继续共用一个不可变版本；Agent 使用独立的 slim multi-arch 镜像，生产建议两者钉同一个 git sha：
 
 ```dotenv
 TUNEX_IMAGE=ghcr.io/paimoncai/tunex:<git-sha>
+TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:<git-sha>
 ```
 
 典型更新流程：
@@ -378,7 +442,10 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 
 ```text
 .
-├── .github/workflows/ci.yml        # CI / image publishing
+├── .github/workflows/
+│   ├── ci.yml                      # 快速源码 Gate
+│   ├── integration.yml             # Docker / DIRECT / RELAY 真实集成 Gate
+│   └── release.yml                 # main 集成通过后发布 GHCR
 ├── .env.example                    # 开发/本地环境变量模板
 ├── .env.production.example         # 生产环境变量模板（复制为 .env）
 ├── Caddyfile                      # 开发用反代（HTTP）
@@ -387,15 +454,15 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 ├── docker-compose.prod.yaml       # 生产栈（端口不外泄/TLS/限额）
 ├── docs/                          # 部署与运维手册
 │   └── production-deploy.md       # 生产部署/备份/恢复/回滚手册
-├── PLAN.md                        # 产品定位、里程碑、发布门槛
-├── DEVELOPMENT.md                 # 深入开发规范与协议说明
+├── DEVELOPMENT.md                 # 唯一开发方案、Gate、迁移与 DoD
+├── docs/tunex-devmap-v3.md         # 长期目标架构约束
 ├── backend/
 │   ├── prisma/                    # schema / migrations / seed
 │   ├── src/
 │   │   ├── middlewares/           # auth / CSRF / audit / rate limit
 │   │   ├── routes/                # HTTP API
 │   │   ├── services/              # workspace / policy / mail / keys
-│   │   └── socket/                # Agent 控制面
+│   │   └── services/              # outbound Agent control / scheduler / reconciler
 │   └── tests/                     # HTTP/DB integration tests
 ├── web/
 │   └── src/
@@ -451,7 +518,7 @@ TuneX 的部分产品场景和历史兼容行为参考了 RelayX 的公开产品
 
 ```text
 feature/*  ─┐
-fix/*      ├─> Pull Request -> CI -> main
+fix/*      ├─> Pull Request -> CI + Integration -> main -> CI -> Integration -> Release
 docs/*     ┘
 ```
 

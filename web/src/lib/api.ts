@@ -29,6 +29,8 @@ import type {
   Node,
   NodeCredentialIssued,
   NodeCredentialRevoked,
+  NodeEnrollmentIssued,
+  NodeBinding,
   NodeDetail,
   NodeGroup,
   NodeGroupInput,
@@ -37,6 +39,9 @@ import type {
   NodeStateReport,
   Paginated,
   PasswordChangeInput,
+  PortForward,
+  PortForwardCreateInput,
+  ProvisionNodeResult,
   Payment,
   Plan,
   PlanInput,
@@ -52,6 +57,7 @@ import type {
   TunnelRuntimeAction,
   TunnelUpdateInput,
   User,
+  UserNode,
   Workspace,
   WorkspaceAcceptInviteResult,
   WorkspaceCreateInput,
@@ -410,8 +416,37 @@ export const api = {
     available: (query?: ListQuery, cookie?: string) =>
       get<TunnelEgressPoolOption[]>("/egress-pools", query, cookie),
   },
+  nodes: {
+    list: (cookie?: string) => get<UserNode[]>("/nodes", undefined, cookie),
+    enrollment: (id: ID, cookie?: string) =>
+      post<NodeEnrollmentIssued>(`/nodes/${id}/enrollment`, {}, cookie),
+    bindings: (ingressId: ID, cookie?: string) =>
+      get<NodeBinding[]>(`/nodes/${ingressId}/bindings`, undefined, cookie),
+    bindEgress: (ingressId: ID, egress_node_id: ID, cookie?: string) =>
+      post<NodeBinding>(`/nodes/${ingressId}/bindings`, { egress_node_id }, cookie),
+    unbindEgress: (ingressId: ID, egressId: ID, cookie?: string) =>
+      del<{ ok: boolean }>(`/nodes/${ingressId}/bindings/${egressId}`, cookie),
+    forwards: (ingressId: ID, cookie?: string) =>
+      get<PortForward[]>(`/nodes/${ingressId}/forwards`, undefined, cookie),
+    createForward: (ingressId: ID, input: PortForwardCreateInput, cookie?: string) =>
+      post<PortForward>(`/nodes/${ingressId}/forwards`, input, cookie),
+    forwardAction: (ingressId: ID, forwardId: ID, action: "retry" | "suspend" | "resume", cookie?: string) =>
+      post<PortForward>(`/nodes/${ingressId}/forwards/${forwardId}/${action}`, {}, cookie),
+    removeForward: (ingressId: ID, forwardId: ID, cookie?: string) =>
+      del<{ ok: boolean }>(`/nodes/${ingressId}/forwards/${forwardId}`, cookie),
+  },
   nodeGroups: {
     list: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/node-groups", query, cookie),
+    provisionNode: (
+      groupId: ID,
+      input: {
+        node_id: string;
+        connect_ip?: string | null;
+        role?: NodeRole;
+        targets?: { host: string; port: number; weight?: number }[];
+      },
+      cookie?: string,
+    ) => post<ProvisionNodeResult>(`/node-groups/${groupId}/nodes`, input, cookie),
   },
   plans: {
     list: (query?: ListQuery, cookie?: string) => get<Paginated<Plan>>("/plans", query, cookie),
@@ -455,6 +490,9 @@ export const api = {
      * 轮换/撤销是敏感写操作，后端挂了 60s/5 次的 user 维度限流
      * （`node-credential-rotation`），连续点击会被 429 挡回。
      */
+    /** 生成/重新生成短时一键安装命令（会撤销尚未使用的旧 enrollment）。 */
+    createNodeEnrollment: (id: ID, cookie?: string) =>
+      post<NodeEnrollmentIssued>(`/admin/node/${id}/enrollment`, {}, cookie),
     /** 签发凭据（明文只此一次可见）。已有有效凭据 → 409 */
     issueNodeCredential: (id: ID, cookie?: string) =>
       post<NodeCredentialIssued>(`/admin/node/${id}/credential`, {}, cookie),

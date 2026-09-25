@@ -58,6 +58,7 @@ var ErrAlreadyRunning = errors.New("reporter: already running")
 // Payload is the heartbeat body. Field names match the panel's Node model so
 // the backend can deserialise it directly.
 type Payload struct {
+	AgentID     string                   `json:"agent_id,omitempty"`
 	NodeID      string                   `json:"node_id"`
 	Version     string                   `json:"version"`
 	Role        string                   `json:"role"`
@@ -73,6 +74,7 @@ type Payload struct {
 // makes a reconnect snapshot possible (devmap §5.5 "节点重启 → 拉取 ACTIVE 隧道"
 // mirrored on the panel side). Shape is owned by services/node-state.ts.
 type StatePayload struct {
+	AgentID     string                   `json:"agent_id,omitempty"`
 	Version     string                   `json:"version,omitempty"`
 	Role        string                   `json:"role,omitempty"`
 	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
@@ -112,6 +114,7 @@ type Reporter struct {
 // Config configures the reporter.
 type Config struct {
 	PanelURL string // e.g. "http://panel:3001"; empty disables reporting
+	AgentID  string
 	NodeID   string
 	Version  string
 	Role     string
@@ -201,6 +204,7 @@ func (r *Reporter) Endpoint() string {
 // Payload builds the current heartbeat body.
 func (r *Reporter) Payload() Payload {
 	p := Payload{
+		AgentID:   r.cfg.AgentID,
 		NodeID:    r.cfg.NodeID,
 		Version:   r.cfg.Version,
 		Role:      r.cfg.Role,
@@ -222,6 +226,7 @@ func (r *Reporter) Payload() Payload {
 // gets to say "I am node X").
 func (r *Reporter) StatePayload() StatePayload {
 	p := StatePayload{
+		AgentID: r.cfg.AgentID,
 		Version: r.cfg.Version,
 		Role:    r.cfg.Role,
 	}

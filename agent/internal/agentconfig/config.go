@@ -21,6 +21,9 @@ import (
 
 // Config is the resolved agent configuration.
 type Config struct {
+	// AgentID is the immutable Panel-issued physical Agent identity.
+	// It does not change when the display node name or INGRESS/EGRESS/BOTH role changes.
+	AgentID         string
 	NodeID          string
 	Debug           bool
 	ListenIP        string
@@ -111,7 +114,8 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.StringVar(&cfg.ConfigFile, "c", cfg.ConfigFile, "Config file (shorthand)")
 	fs.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Enable debug mode")
 	fs.BoolVar(&cfg.Debug, "d", cfg.Debug, "Enable debug mode (shorthand)")
-	fs.StringVar(&cfg.NodeID, "node-id", cfg.NodeID, "Node ID (defaults to hostname)")
+	fs.StringVar(&cfg.AgentID, "agent-id", cfg.AgentID, "Immutable Panel-issued Agent ID")
+	fs.StringVar(&cfg.NodeID, "node-id", cfg.NodeID, "Human-readable node name (defaults to hostname)")
 	fs.StringVar(&cfg.NodeID, "n", cfg.NodeID, "Node ID (shorthand)")
 	fs.StringVar(&cfg.ListenIP, "listen-ip", cfg.ListenIP, "Interface tunnels bind when the config does not pin one")
 	fs.StringVar(&cfg.ListenIP, "l", cfg.ListenIP, "Interface tunnels bind (shorthand)")
@@ -207,6 +211,7 @@ func applyDefaults(cfg *Config, file string) {
 			}
 		}
 	}
+	envStr("AGENT_ID", &cfg.AgentID)
 	envStr("NODE_ID", &cfg.NodeID)
 	envStr("LISTEN_IP", &cfg.ListenIP)
 	envStr("ROLE", &cfg.Role)
@@ -229,7 +234,8 @@ Flags:
   -d, --debug                     Enable debug mode
   -h, --help                      help for TuneX agent
   -l, --listen-ip string          Interface tunnels bind when the config does not pin one
-  -n, --node-id string            Node ID (defaults to hostname)
+      --agent-id string           Immutable Panel-issued Agent ID
+  -n, --node-id string            Human-readable node name (defaults to hostname)
   -v, --version                   version for TuneX agent
 
 Runtime:

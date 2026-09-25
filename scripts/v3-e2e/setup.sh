@@ -85,6 +85,8 @@ echo "images: backend=$TUNEX_BACKEND_IMAGE agent=$WP14_AGENT_IMAGE"
 # the whole file before Agents are started.
 export WP14_INGRESS_CREDENTIAL=${WP14_INGRESS_CREDENTIAL:-UNPROVISIONED}
 export WP14_EGRESS_CREDENTIAL=${WP14_EGRESS_CREDENTIAL:-UNPROVISIONED}
+export WP14_INGRESS_AGENT_ID=${WP14_INGRESS_AGENT_ID:-UNPROVISIONED}
+export WP14_EGRESS_AGENT_ID=${WP14_EGRESS_AGENT_ID:-UNPROVISIONED}
 
 # Recreate networks so old WP14 topology cannot leak into this gate. Keep DB
 # volume for idempotent migration/provision coverage.
@@ -121,8 +123,12 @@ WP14_BOOTSTRAP_PHASE=provision python3 "$HERE/_bootstrap.py"
 
 export WP14_INGRESS_CREDENTIAL
 export WP14_EGRESS_CREDENTIAL
+export WP14_INGRESS_AGENT_ID
+export WP14_EGRESS_AGENT_ID
 WP14_INGRESS_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress']['credential'])")
 WP14_EGRESS_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress']['credential'])")
+WP14_INGRESS_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress']['agent_id'])")
+WP14_EGRESS_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress']['agent_id'])")
 
 say "启动 Agents（仅主动出站；admin port=0）"
 docker compose -f "$COMPOSE" --env-file "$ENVF" up -d --force-recreate ingress-agent egress-agent

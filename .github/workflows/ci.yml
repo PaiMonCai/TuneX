@@ -5,12 +5,15 @@ on:
     branches: [main, "feature/**"]
   pull_request:
 
+# A branch can receive many small commits while an integration repair is in
+# progress. Keep only the newest CI for that branch; a PR run and a push run for
+# the same head branch also collapse into the same concurrency group.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
-  packages: write
-
-env:
-  IMAGE_NAMESPACE: ghcr.io/paimoncai/tunex
 
 jobs:
   secret-scan:
@@ -147,96 +150,3 @@ jobs:
           # Windows target intentionally omitted: the agent uses Linux-only syscalls
           # (netutil/statfs.go -> syscall.Statfs), so GOOS=windows fails to build.
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tunex-agent
-          path: agent/dist/
-          retention-days: 14
-
-  v3-integration:
-    needs: [secret-scan, backend, agent]
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v7
-      - name: Run outbound-only DIRECT / RELAY integration gate
-        run: |
-          bash scripts/v3-e2e/setup.sh
-          bash scripts/v3-e2e/verify.sh
-      - name: Upload v3 integration evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: v3-integration-evidence
-          path: scripts/v3-e2e/evidence/
-          if-no-files-found: warn
-          retention-days: 14
-      - name: Teardown v3 integration topology
-        if: always()
-        run: DELETE_IMAGES=1 bash scripts/v3-e2e/teardown.sh
-
-  unified-image:
-    needs: [backend, web, v3-integration]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
-      - name: Build unified TuneX image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          load: true
-          tags: tunex-unified:ci
-          build-args: |
-            NEXT_PUBLIC_API_BASE=
-            NEXT_PUBLIC_API_MOCK=0
-            NEXT_PUBLIC_PAYMENTS_ENABLED=false
-          cache-from: type=gha,scope=tunex-unified
-          cache-to: type=gha,mode=max,scope=tunex-unified
-      - name: Smoke test unified runtimes
-        run: |
-          docker run --rm --entrypoint sh tunex-unified:ci -c '
-            set -eu
-            bun --version
-            node --version
-            test -f /app/backend/src/index.ts
-            test -f /app/backend/prisma/schema.prisma
-            test -f /app/web/server.js
-            test -d /app/web/.next/static
-          '
-      - name: Validate unified Compose wiring
-        run: |
-          cp .env.production.example .env
-          TUNEX_IMAGE=tunex-unified:ci docker compose -f docker-compose.prod.yaml config -q
-          TUNEX_IMAGE=tunex-unified:ci docker compose -f docker-compose.yaml config -q
-          rm -f .env
-
-  images:
-    needs: [secret-scan, backend, web, agent, v3-integration, unified-image]
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build & push unified TuneX image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: |
-            ${{ env.IMAGE_NAMESPACE }}:latest
-            ${{ env.IMAGE_NAMESPACE }}:${{ github.sha }}
-          build-args: |
-            NEXT_PUBLIC_API_BASE=
-            NEXT_PUBLIC_API_MOCK=0
-            NEXT_PUBLIC_PAYMENTS_ENABLED=false
-          cache-from: type=gha,scope=tunex-unified
-          cache-to: type=gha,mode=max,scope=tunex-unified

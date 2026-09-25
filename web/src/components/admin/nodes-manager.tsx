@@ -3,11 +3,13 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { Copy } from "lucide-react";
 import { toast } from "sonner";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field, ToggleRow } from "@/components/ui/form";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { OptionSelect } from "@/components/ui/option-select";
@@ -16,7 +18,7 @@ import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
 import { NODE_ROLES, STATUS_OPTIONS } from "@/lib/constants";
 import { formatBytes, formatDateTime, strOf, toNumOrNull } from "@/lib/utils";
-import type { Node, NodeGroup, NodeInput, NodeRole, Paginated } from "@/lib/types";
+import type { Node, NodeEnrollmentIssued, NodeGroup, NodeInput, NodeRole, Paginated } from "@/lib/types";
 
 interface NodeForm {
   node_id: string;
@@ -49,7 +51,7 @@ const EMPTY: NodeForm = {
 function toForm(n: Node): NodeForm {
   return {
     node_id: n.node_id,
-    connect_ip: n.connect_ip,
+    connect_ip: n.connect_ip ?? "",
     node_group_id: String(n.node_group_id),
     role: n.role ?? null,
     weight: strOf(n.weight),
@@ -65,7 +67,7 @@ function toForm(n: Node): NodeForm {
 function toPayload(f: NodeForm): NodeInput {
   return {
     node_id: f.node_id.trim(),
-    connect_ip: f.connect_ip.trim(),
+    connect_ip: f.connect_ip.trim() || null,
     node_group_id: Number(f.node_group_id),
     role: f.role ?? null,
     weight: toNumOrNull(f.weight) ?? 1,
@@ -102,6 +104,7 @@ export function AdminNodesManager({
   const [pending, setPending] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Node | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [install, setInstall] = useState<NodeEnrollmentIssued | null>(null);
   const { form, set, setForm } = useForm<NodeForm>(EMPTY);
   const router = useRouter();
 
@@ -130,7 +133,7 @@ export function AdminNodesManager({
 
   async function submit() {
     const payload = toPayload(form);
-    if (!payload.node_id || !payload.connect_ip || !payload.node_group_id) {
+    if (!payload.node_id || !payload.node_group_id) {
       toast.error(t("admin.saveFailed"));
       return;
     }
@@ -140,7 +143,9 @@ export function AdminNodesManager({
         await api.admin.updateNode(editing.id, payload);
         toast.success(t("admin.updateSuccess", { name: payload.node_id }));
       } else {
-        await api.admin.createNode(payload);
+        const created = await api.admin.createNode(payload);
+        const enrollment = await api.admin.createNodeEnrollment(created.id);
+        setInstall(enrollment);
         toast.success(t("admin.createSuccess", { name: payload.node_id }));
       }
       setOpen(false);
@@ -237,7 +242,7 @@ export function AdminNodesManager({
                       {n.node_id}
                     </Link>
                   </TableCell>
-                  <TableCell className="font-mono text-xs">{n.connect_ip}</TableCell>
+                  <TableCell className="font-mono text-xs">{n.connect_ip ?? t("node.waiting")}</TableCell>
                   <TableCell className="text-xs">{n.node_group?.name ?? n.node_group_id}</TableCell>
                   <TableCell>
                     <RoleBadge role={n.role ?? null} t={t} />
@@ -291,8 +296,7 @@ export function AdminNodesManager({
             <Input
               value={form.connect_ip}
               onChange={(e) => set("connect_ip", e.target.value)}
-              required
-              placeholder="1.2.3.4"
+              placeholder={t("node.waiting")}
               data-testid="node-ip"
             />
           </Field>
@@ -359,6 +363,33 @@ export function AdminNodesManager({
           </p>
         )}
       </FormDialog>
+
+      <Dialog open={Boolean(install)} onOpenChange={(open) => !open && setInstall(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("node.installTitle")}</DialogTitle>
+            <DialogDescription>{t("node.installHint")}</DialogDescription>
+          </DialogHeader>
+          {install ? (
+            <div className="rounded-md border border-[var(--border)] bg-[var(--muted)] p-3 font-mono text-xs break-all">
+              {install.install_command}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setInstall(null)}>{t("common.done")}</Button>
+            <Button
+              onClick={async () => {
+                if (!install) return;
+                await navigator.clipboard.writeText(install.install_command);
+                toast.success(t("node.copySuccess"));
+              }}
+            >
+              <Copy className="size-4" />
+              {t("common.copy")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <ConfirmDeleteDialog
         open={!!deleteTarget}

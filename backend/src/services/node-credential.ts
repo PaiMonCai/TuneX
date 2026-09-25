@@ -252,6 +252,7 @@ export async function revokeNodeCredential(nodeDbId: number): Promise<{ node_id:
 export interface NodeIdentity {
   node_id: number;
   node_key: string;
+  agent_id: string;
   scope: number;
 }
 
@@ -288,6 +289,7 @@ export async function authenticateNode(plaintext: string): Promise<NodeAuthResul
       select: {
         id: true,
         node_id: true,
+        agent_id: true,
         node_credential_hash: true,
         credential_revoked: true,
         node_group: { select: { workspace_id: true } },
@@ -299,7 +301,7 @@ export async function authenticateNode(plaintext: string): Promise<NodeAuthResul
       return decision;
     }
     const scope = nodeScope(row!);
-    return { ok: true, node_id: row!.id, node_key: row!.node_id, scope };
+    return { ok: true, node_id: row!.id, node_key: row!.node_id, agent_id: row!.agent_id, scope };
   } catch (e) {
     if (e instanceof NodeCredentialError) throw e;
     return { ok: false, reason: "db_unavailable" };

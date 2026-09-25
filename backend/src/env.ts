@@ -19,6 +19,8 @@ export const env = {
   isProduction: (process.env.NODE_ENV ?? "development") === "production",
   port: Number(process.env.PORT ?? 3000),
   siteUrl: process.env.SITE_URL ?? "http://localhost:8088",
+  /** Docker-first node installer pulls this dedicated slim Agent image. */
+  agentImage: process.env.TUNEX_AGENT_IMAGE?.trim() || "ghcr.io/paimoncai/tunex-agent:latest",
 
   databaseUrl: requireSecret("DATABASE_URL"),
   redisUrl: process.env.REDIS_URL ?? "redis://redis:6379",

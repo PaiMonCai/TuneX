@@ -1,0 +1,103 @@
+name: Integration
+
+on:
+  pull_request:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# PRs run Integration directly. On main, Integration starts only after CI
+# completed successfully for that exact main commit.
+concurrency:
+  group: integration-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.workflow_run.head_branch || github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  agent-image:
+    if: github.event_name == 'pull_request' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Docker Agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./agent/Dockerfile
+          load: true
+          tags: tunex-agent:ci
+          platforms: linux/amd64
+          cache-from: type=gha,scope=tunex-agent
+          cache-to: type=gha,mode=max,scope=tunex-agent
+      - name: Smoke test Docker Agent image
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/tunex-agent tunex-agent:ci --help >/dev/null
+
+  v3-integration:
+    needs: [agent-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Run outbound-only DIRECT / RELAY integration gate
+        run: |
+          bash scripts/v3-e2e/setup.sh
+          bash scripts/v3-e2e/verify.sh
+      - name: Upload v3 integration evidence
+        if: failure() || github.event_name == 'workflow_run'
+        uses: actions/upload-artifact@v7
+        with:
+          name: v3-integration-evidence
+          path: scripts/v3-e2e/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Teardown v3 integration topology
+        if: always()
+        run: DELETE_IMAGES=1 bash scripts/v3-e2e/teardown.sh
+
+  unified-image:
+    needs: [v3-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build unified TuneX image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: tunex-unified:ci
+          build-args: |
+            NEXT_PUBLIC_API_BASE=
+            NEXT_PUBLIC_API_MOCK=0
+            NEXT_PUBLIC_PAYMENTS_ENABLED=false
+          cache-from: type=gha,scope=tunex-unified
+          cache-to: type=gha,mode=max,scope=tunex-unified
+      - name: Smoke test unified runtimes
+        run: |
+          docker run --rm --entrypoint sh tunex-unified:ci -c '
+            set -eu
+            bun --version
+            node --version
+            test -f /app/backend/src/index.ts
+            test -f /app/backend/prisma/schema.prisma
+            test -f /app/web/server.js
+            test -d /app/web/.next/static
+          '
+      - name: Validate unified Compose wiring
+        run: |
+          cp .env.production.example .env
+          TUNEX_IMAGE=tunex-unified:ci docker compose -f docker-compose.prod.yaml config -q
+          TUNEX_IMAGE=tunex-unified:ci docker compose -f docker-compose.yaml config -q
+          rm -f .env

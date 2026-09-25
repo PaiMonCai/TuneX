@@ -45,6 +45,7 @@ import { paymentsRoutes } from "./routes/topups.ts";
 import { ticketsRoutes } from "./routes/tickets.ts";
 import { settingsRoutes } from "./routes/settings.ts";
 import { nodeGroupsRoutes } from "./routes/node-groups.ts";
+import { nodesRoutes } from "./routes/nodes.ts";
 
 export function createApp() {
   const app = new Hono<{ Variables: AppVariables }>();
@@ -136,6 +137,7 @@ export function createApp() {
   app.route("/api/tickets", ticketsRoutes);
   app.route("/api/settings", settingsRoutes);
   app.route("/api/node-groups", nodeGroupsRoutes);
+  app.route("/api/nodes", nodesRoutes);
   app.route("/api", publicRoutes);
   app.route("/api/admin", adminRoutes);
   app.route("/api/admin", nodeGrantRoutes);

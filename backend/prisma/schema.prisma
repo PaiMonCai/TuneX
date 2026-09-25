@@ -378,8 +378,13 @@ model Node {
   id          Int      @id @default(autoincrement())
   weight      Int      @default(1)
   status      Status   @default(active)
+  /// 用户可读节点名/标签，可改名；不再承担物理 Agent 身份。
   node_id     String   @unique @db.VarChar(255)
-  connect_ip  String   @db.VarChar(255)
+  /// Panel 生成且不可变的物理 Agent 唯一 ID。角色可在 ingress/egress/both 间调整，
+  /// agent_id 不随角色、hostname、显示名变化。
+  agent_id    String   @unique @default(uuid()) @db.VarChar(64)
+  /// Panel 可先创建未注册节点；首次 enrollment 后写入面板观察到的连接 IP。
+  connect_ip  String?  @db.VarChar(255)
   version     String   @default("unknown") @db.VarChar(255)
   backup      Boolean  @default(false)
   order_by    Float    @default(1000)
@@ -437,12 +442,47 @@ model Node {
   port_leases     NodePortLease[]
   ingress_tunnels Tunnel[]      @relation("ingress_node")
   egress_tunnels  Tunnel[]      @relation("egress_node")
+  enrollments     NodeEnrollment[]
+  bound_egresses  NodeBinding[] @relation("binding_ingress")
+  bound_ingresses NodeBinding[] @relation("binding_egress")
   /// 节点凭据状态快照（版本 / 角色 / 端口占用 / 隧道列表），见 model NodeStateReport。
   /// 每节点一行：`@@unique([node_id])` 保证 Agent 断线重连后恢复的是自己那一份。
   state_report   NodeStateReport?
 
   @@index([role])
   @@map("node")
+}
+
+/// Panel 创建 Node 后签发的短时一次性 enrollment。
+/// 明文 token 只返回一次；数据库只存 sha256(token)。
+model NodeEnrollment {
+  id         Int      @id @default(autoincrement())
+  node_id    Int
+  node       Node     @relation(fields: [node_id], references: [id], onDelete: Cascade)
+  token_hash String   @unique @db.Char(64)
+  expires_at DateTime
+  used_at    DateTime?
+  revoked_at DateTime?
+  created_at DateTime @default(now())
+
+  @@index([node_id, expires_at])
+  @@index([expires_at, used_at, revoked_at])
+  @@map("node_enrollment")
+}
+
+/// 用户产品层的 Ingress → Egress 绑定。
+/// PortForward 选择出口前必须先存在这条绑定；Tunnel 仍是内部 runtime 对象。
+model NodeBinding {
+  id              Int      @id @default(autoincrement())
+  ingress_node_id Int
+  egress_node_id  Int
+  ingress_node    Node     @relation("binding_ingress", fields: [ingress_node_id], references: [id], onDelete: Cascade)
+  egress_node     Node     @relation("binding_egress", fields: [egress_node_id], references: [id], onDelete: Cascade)
+  created_at      DateTime @default(now())
+
+  @@unique([ingress_node_id, egress_node_id])
+  @@index([egress_node_id])
+  @@map("node_binding")
 }
 
 enum LoadBalanceType {
@@ -556,7 +596,9 @@ model Tunnel {
 
   port_leases NodePortLease[]
 
-  @@unique([listen_port, in_node_group_id])
+  // Node-first 后物理唯一性由 NodePortLease(node_id, port) 保证。
+  // 同一 NodeGroup 内不同入口节点允许复用相同 listen_port。
+  @@index([in_node_group_id, listen_port])
   @@index([workspace_id])
   @@index([tunnel_mode])
   @@index([ingress_node_id])

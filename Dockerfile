@@ -5,8 +5,8 @@
 #   - Backend / Worker / DB migration: Bun + Prisma
 #   - Web: Next.js standalone on Node 24
 #
-# Compose still runs one process per container. MySQL, Redis, Caddy and Agent
-# remain separate artifacts with independent lifecycles.
+# Compose still runs one process per container. MySQL, Redis, Caddy and the
+# dedicated multi-arch Agent image remain separate artifacts with independent lifecycles.
 
 FROM node:24-bookworm-slim AS web-deps
 WORKDIR /build/web

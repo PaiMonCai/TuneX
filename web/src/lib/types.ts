@@ -249,10 +249,13 @@ export interface NodeGroup {
 
 export interface Node {
   id: ID;
+  /** 用户可读节点名/标签。 */
   node_id: string;
+  /** Panel 生成的不可变物理 Agent 唯一 ID；旧管理接口/fixture 迁移期可缺省。 */
+  agent_id?: string;
   weight: number;
   status: Status;
-  connect_ip: string;
+  connect_ip: string | null;
   version: string;
   backup: boolean;
   order_by: number;
@@ -765,7 +768,7 @@ export interface NodeGroupInput {
 /** 管理端：节点新建/编辑 */
 export interface NodeInput {
   node_id: string;
-  connect_ip: string;
+  connect_ip: string | null;
   weight: number;
   version: string;
   status: Status;
@@ -808,6 +811,70 @@ export interface NodeCredentialRevoked {
   revoked: true;
   node_id: ID;
   node_key: string;
+}
+
+/** 创建/重新安装节点时只显示一次的短时 enrollment。 */
+export interface NodeEnrollmentIssued {
+  token: string;
+  node_id: ID;
+  node_key: string;
+  agent_id: string;
+  expires_at: string;
+  install_command: string;
+}
+
+/** 用户侧 Node-first 列表的安全节点投影。 */
+export interface UserNode extends Node {
+  agent_id: string;
+  registered?: boolean;
+  has_credential?: boolean;
+}
+
+/** Ingress 可选择的已绑定出口。 */
+export interface NodeBinding {
+  id: ID;
+  ingress_node_id: ID;
+  egress_node_id: ID;
+  egress_node: UserNode;
+  created_at: string;
+}
+
+export interface PortForward {
+  id: ID;
+  name: string;
+  protocol: "tcp";
+  mode: "direct" | "relay";
+  ingress_node_id: ID;
+  ingress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;
+  egress_node_id: ID | null;
+  egress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;
+  listen_ip: string | null;
+  listen_port: number | null;
+  target_host: string | null;
+  target_port: number | null;
+  target_weight: number | null;
+  desired_status: TunnelDesiredStatus | null;
+  apply_status: TunnelApplyStatus | null;
+  config_revision: number | null;
+  applied_revision: number | null;
+  apply_error_code: string | null;
+  apply_error: string | null;
+  last_applied_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortForwardCreateInput {
+  name: string;
+  listen_port?: number | null;
+  target_host: string;
+  target_port: number;
+  egress_node_id?: ID | null;
+}
+
+export interface ProvisionNodeResult {
+  node: UserNode;
+  enrollment: NodeEnrollmentIssued;
 }
 
 /** 出口池（EgressPool）：挂 Node（role=egress|both），内含多个 EgressTarget */

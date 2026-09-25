@@ -17,7 +17,6 @@ backend/dist/
 agent/dist/
 
 # Unified app image only needs backend + web source trees
-agent/
 docs/
 scripts/
 mysql-init/

@@ -34,6 +34,59 @@ v3 的目标不是重写整个项目，而是保留已经稳定的 Workspace、�
 - UDP、WS/TLS、QUIC、高级负载均衡、多跳、DNS 等均在 TCP RELAY 稳定后独立验收，不得因枚举存在就宣称支持。
 - 工单、返佣、支付扩展、隧道链等不进入当前 v3 主路径。
 
+### 1.1.1 用户产品模型：Node + PortForward
+
+从本阶段开始，用户侧不再把 `Tunnel` 当作需要手工创建的第一层资源。产品语义固定为：
+
+```text
+Ingress Node
+├─ PortForward（不选择出口） → DIRECT
+└─ PortForward（选择已绑定出口） → RELAY
+
+Egress Node
+└─ 必须先与某个 Ingress Node 建立 Binding，才能被该入口的 PortForward 选择
+```
+
+硬规则：
+
+- **一个实际 Agent = 一个不可变 `agent_id` = 一条 Node 记录**。角色不是身份；同一 Agent 可以是 `ingress`、`egress` 或 `both`。
+- `node_id` 只作为用户可读名称/标签，可修改；`agent_id` 由 Panel 创建 Node 时生成，安装、角色切换、hostname 变化都不得改变。
+- `both` 节点不拆成两个 Agent。它可以自己承担 DIRECT/RELAY ingress，也可以作为其它入口节点绑定的 egress。
+- 同一条 PortForward 不允许把相同 Agent 同时选成 ingress + egress；这种“自中继”没有额外网络语义，应直接使用 DIRECT。
+- Ingress / BOTH 节点可以独立创建端口转发。
+- 创建 PortForward 时 `egress_node_id = null` 即 DIRECT。
+- 指定 `egress_node_id` 即 RELAY，但该出口必须与入口存在有效 `NodeBinding`。
+- Egress 节点不能独立创建用户监听端口；它只作为入口节点的可选出口能力。
+- 用户界面统一使用「节点 / 端口转发 / 绑定出口」术语，不再要求用户先创建 Tunnel。
+- `Tunnel` 继续保留为**内部 runtime / desired-state 对象**，承载 revision、ACK、NodePortLease、Reconciler 与历史流量；不得为 PortForward 再造第二套数据面状态机。
+- 第一版 `PortForward.id` 可以直接映射内部 `Tunnel.id`；对外 API 做 projection，数据库无需立刻复制一张业务真相表。
+- 每条 RELAY PortForward 的目标属于该转发自己的 EgressPool；出口节点本身不再要求预先配置业务目标。
+
+### 1.1.2 节点创建与一键安装
+
+Node 生命周期改为「Panel 先创建 → 机器后注册」：
+
+1. Panel 创建 pending Node，只确定 NodeGroup、角色与端口范围；`connect_ip` 可为空。
+2. Panel 生成一个 **10 分钟、一次性** enrollment token，只存哈希。
+3. UI 立即展示可复制的一键安装命令；命令携带短时 enrollment token、不可变 agent_id 和当前可读 node_id，长期 node credential 不出现在该命令中。
+4. 安装脚本先确保 Docker Engine 可用，并拉取 Panel 配置的专用多架构 `tunex-agent` 镜像；镜像拉取失败时不得消费 enrollment token。
+5. 节点以 enrollment token 调用机器端 enroll API；服务端原子消费 token，并签发真正的 per-node credential。
+6. 安装脚本把 credential 写入宿主机 root-only `/etc/tunex-agent/agent.env`，容器只读挂载该文件，不通过 Docker 环境变量明文注入长期凭据。
+7. Agent 容器使用 `--network host`，让 DIRECT/RELAY 动态监听端口直接绑定宿主机网络；默认 `--restart unless-stopped`。
+8. Agent 后续只使用 per-node credential 做 outbound command/state/desired；enrollment token 永不复用。
+9. 重新安装必须由 Panel 显式生成新的 enrollment token；新 token 会撤销该节点尚未使用的旧 token。
+
+安全约束：
+
+- enrollment token / node credential 明文都不得落数据库、日志、审计 metadata 或 URL query。
+- credential 是认证真相；agent_id 是运行实例一致性校验。Agent 上报 agent_id 时必须与该 credential 绑定的 Node.agent_id 相同，否则拒绝。
+- 安装命令可以包含短时 enrollment token，但不得包含长期 credential。
+- enroll 端点必须并发安全：同一 token 最多一个请求成功。
+- Panel 不主动连接 Agent；一键安装不得重新引入公网 9090 依赖。
+- Agent 使用独立 `ghcr.io/paimoncai/tunex-agent:<sha>` slim multi-arch 镜像；生产应通过 `TUNEX_AGENT_IMAGE` 与 Panel 镜像钉同一 git sha。
+- 安装器不得把长期 node credential 放进 `docker run -e` 或容器元数据；凭据只允许存在于 root-only 宿主机文件与进程内存。
+- Agent Docker 容器必须使用 host network；不得通过预声明固定 `ports:` 映射模拟动态转发端口。
+
 ### 1.2 当前阶段边界
 
 当前 `main` 已经具备并继续保留：
@@ -186,6 +239,8 @@ Agent ACK：
 - 不明文写日志。
 - 不从用户请求传入的 node_id 推断身份。
 - 后续可平滑升级为 mTLS。
+
+节点 enrollment 与运行凭据必须严格分层：enrollment 只负责**首次/重新安装时换取 credential**，不能直接调用 state/commands/ACK/desired API；credential 也不能反过来生成 enrollment。
 
 ---
 

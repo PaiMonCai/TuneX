@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Integration"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAMESPACE: ghcr.io/paimoncai/tunex
+  AGENT_IMAGE_NAMESPACE: ghcr.io/paimoncai/tunex-agent
+
+jobs:
+  images:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push unified TuneX image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAMESPACE }}:latest
+            ${{ env.IMAGE_NAMESPACE }}:${{ github.event.workflow_run.head_sha }}
+          build-args: |
+            NEXT_PUBLIC_API_BASE=
+            NEXT_PUBLIC_API_MOCK=0
+            NEXT_PUBLIC_PAYMENTS_ENABLED=false
+          cache-from: type=gha,scope=tunex-unified
+          cache-to: type=gha,mode=max,scope=tunex-unified
+      - name: Build & push multi-arch Agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./agent/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.AGENT_IMAGE_NAMESPACE }}:latest
+            ${{ env.AGENT_IMAGE_NAMESPACE }}:${{ github.event.workflow_run.head_sha }}
+          cache-from: type=gha,scope=tunex-agent
+          cache-to: type=gha,mode=max,scope=tunex-agent
