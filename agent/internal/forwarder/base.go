@@ -27,12 +27,57 @@ const dialTimeout = 10 * time.Second
 // process shutdown indefinitely.
 const drainTimeout = 3 * time.Second
 
+// drainCeiling is the hard upper bound every Drain honours, whatever timeout
+// the caller asks for. A drain is a teardown step, not a wait-forever: the
+// manager holds no lock while draining, but the next phase of a rollout still
+// has to be reachable.
+const drainCeiling = 15 * time.Second
+
+// upstream is the swappable dial address a forwarder hands to its pick
+// function. It exists so the §13.3.4 "Target Host / Port" hot swap can
+// replace where new connections go WITHOUT touching the listener: a
+// pipeTracker keeps dialing through whatever value is current, and the
+// swap only changes what "current" means from then on.
+//
+// A closed forwarder refuses swaps (its listener is gone; a new dial address
+// would be a lie about what the client sees).
+type upstream struct {
+	mu    sync.RWMutex
+	addr  string
+	stale bool
+	// armed is the "listener exists" flag: it flips on start() and clears
+	// on stop(). A swap before the first Start is refused — installing an
+	// address on a forwarder with no listener would tell the caller a hot
+	// swap happened while the OS would refuse every new connection.
+	armed bool
+}
+
+func (u *upstream) get() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.addr
+}
+
+// swap installs addr and returns false when the forwarder has no live listener
+// (never started, or already stopped).
+func (u *upstream) swap(addr string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.stale || !u.armed {
+		return false
+	}
+	u.addr = addr
+	return true
+}
+
 // pipeTracker is the shared lifecycle of every TCP forwarder: it binds the
 // listener once, hands every accepted connection to pick(), and owns the
 // started/stopped state, the byte counter and the connection wait group that
 // lets Stop drain what is in flight.
 type pipeTracker struct {
 	cfg TunnelConfig
+
+	up upstream
 
 	mu       sync.Mutex
 	ln       net.Listener
@@ -68,6 +113,7 @@ func (t *pipeTracker) start(p pick) error {
 	}
 	t.ln = ln
 	t.started = true
+	t.up.arm()
 	t.mu.Unlock()
 
 	go t.acceptLoop(ln, p)
@@ -114,6 +160,7 @@ func (t *pipeTracker) stop() error {
 		return nil
 	}
 	t.stopped = true
+	t.up.markStale()
 	ln := t.ln
 	t.mu.Unlock()
 
@@ -124,14 +171,58 @@ func (t *pipeTracker) stop() error {
 	return nil
 }
 
+// markStale records that the forwarder is finished, so a late SetUpstream is
+// refused instead of silently installing an address nobody can dial.
+func (u *upstream) markStale() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.stale = true
+	u.armed = false
+}
+
+// arm records that the forwarder has a live listener, which is what makes a
+// hot swap legitimate. It runs after the bind succeeded.
+func (u *upstream) arm() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.armed = true
+}
+
+// drainFor waits for in-flight connections, bounded by the smaller of d and
+// the package's hard ceiling. It does NOT close the listener: the caller
+// (manager) owns the port lifecycle across a drain.
+//
+// The counter is re-read under the wait rather than snapshotted once: a
+// connection accepted while the drain is running still counts, so "drain"
+// means "nothing is in flight any more" and not "nothing was in flight when
+// I looked".
+func (t *pipeTracker) drainFor(d time.Duration) {
+	if d <= 0 || d > drainCeiling {
+		d = drainCeiling
+	}
+	deadline := time.Now().Add(d)
+	for {
+		live := t.liveConns()
+		if live == 0 {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		// Re-check on a short tick instead of blocking on the WaitGroup:
+		// a fresh connection that lands between two polls keeps the drain
+		// waiting, and the deadline still wins eventually.
+		if remaining > 50*time.Millisecond {
+			remaining = 50 * time.Millisecond
+		}
+		time.Sleep(remaining)
+	}
+}
+
 // drain waits for in-flight connections, bounded by drainTimeout.
 func (t *pipeTracker) drain() {
-	done := make(chan struct{})
-	go func() { t.inFlight.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(drainTimeout):
-	}
+	t.drainFor(drainTimeout)
 }
 
 func (t *pipeTracker) stats() int64   { return t.bytes.load() }

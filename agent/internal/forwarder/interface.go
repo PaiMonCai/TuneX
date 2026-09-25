@@ -22,6 +22,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/tunex/agent/internal/logx"
 )
 
 // TunnelMode is the role a tunnel plays on this node (the tunnelMode column).
@@ -231,7 +234,35 @@ type Forwarder interface {
 	Stop() error
 	// Stats returns the bytes forwarded in both directions, read atomically.
 	Stats() int64
+	// Running reports whether the listener is currently bound. A forwarder
+	// that was never started, or was stopped, reports false.
+	Running() bool
+	// SetUpstream hot-swaps the upstream of a RUNNING forwarder: live
+	// connections keep the upstream they were dialed with, every following
+	// connection dials addr. It never touches the listener, so it cannot
+	// fail a bind and cannot drop a live connection — this is what makes
+	// the §13.3.4 "Target Host / Port" row a no-impact change.
+	//
+	// A forwarder whose upstream is not a single swappable address (EGRESS
+	// load-balances over a pool owned by manager.EgressManager) returns
+	// ErrUpstreamNotSwappable: retargeting it is PATCH /node/targets'
+	// pool swap, not this call.
+	SetUpstream(addr string) error
+	// Drain stops accepting new connections and waits — bounded by timeout,
+	// and never longer than the package's hard drain ceiling — for the
+	// in-flight connections to finish. Unlike Stop it is a two-step API on
+	// the manager side: the caller decides when the port is released
+	// (Remove) so a drained-but-still-registered tunnel keeps its port
+	// reserved while its connections fade out.
+	//
+	// An idle Drain returns immediately. It is safe to call before Start
+	// and more than once.
+	Drain(timeout time.Duration) error
 }
+
+// ErrUpstreamNotSwappable is returned by SetUpstream on a forwarder whose
+// upstream is not one swappable address (an EGRESS pool).
+var ErrUpstreamNotSwappable = errors.New("forwarder: upstream is not swappable")
 
 // TargetSelector picks the upstream for the next egress connection. The egress
 // forwarder depends only on this narrow interface so the hot-updatable
@@ -243,6 +274,18 @@ type TargetSelector interface {
 
 // ErrAlreadyStarted is returned when Start is called on a listening forwarder.
 var ErrAlreadyStarted = errors.New("forwarder: listener already started")
+
+// ErrForwarderNotRunning is returned by SetUpstream when the forwarder has no
+// bound listener (never started, or already stopped). Swapping the upstream of
+// a dead forwarder would be a silent no-op that the caller reads as success.
+var ErrForwarderNotRunning = errors.New("forwarder: forwarder is not running")
+
+// logUpstreamSwap records a hot swap on the agent log. It is a function
+// variable so tests can observe swaps without wiring the logger: the manager
+// and the forwarder tests both assert on it (nil-safe).
+var logUpstreamSwap = func(tunnelID, addr string) {
+	logx.Info("tunnel upstream hot-swapped", "id", tunnelID, "upstream", addr)
+}
 
 // validPort reports whether p is a bindable TCP port.
 func validPort(p int) bool { return p > 0 && p <= 65535 }
