@@ -1521,12 +1521,20 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     if (method === "GET" && seg[1] === undefined) {
       const mode = reqStr(q?.mode);
       const applyStatus = reqStr(q?.apply_status);
+      const ingressNodeId = Number(q?.ingress_node_id);
+      const egressNodeId = Number(q?.egress_node_id);
       const keyword = reqStr(q?.keyword).toLowerCase();
       let rows = db.tunnels
         .filter((tunnel) => tunnel.user_id === user.id && tunnel.category === "port_forward")
         .map((tunnel) => mockForwardView(db, tunnel));
       if (mode === "direct" || mode === "relay") {
         rows = rows.filter((row) => row.mode === mode);
+      }
+      if (Number.isInteger(ingressNodeId) && ingressNodeId > 0) {
+        rows = rows.filter((row) => Number(row.ingress_node_id) === ingressNodeId);
+      }
+      if (Number.isInteger(egressNodeId) && egressNodeId > 0) {
+        rows = rows.filter((row) => Number(row.egress_node_id) === egressNodeId);
       }
       if (APPLY_STATUSES.includes(applyStatus as (typeof APPLY_STATUSES)[number])) {
         rows = rows.filter((row) => row.apply_status === applyStatus);
