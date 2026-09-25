@@ -10,6 +10,7 @@ export interface NodeEnrollmentIssued {
   token: string;
   node_id: number;
   node_key: string;
+  agent_id: string;
   expires_at: string;
   install_command: string;
 }
@@ -18,6 +19,7 @@ export interface EnrolledNode {
   credential: string;
   node_id: number;
   node_key: string;
+  agent_id: string;
 }
 
 export class NodeEnrollmentError extends Error {
@@ -58,6 +60,7 @@ function rangeValue(min: number | null, max: number | null): string | null {
 }
 
 function buildInstallCommand(node: {
+  agent_id: string;
   role: "ingress" | "egress" | "both" | null;
   port_range_min: number | null;
   port_range_max: number | null;
@@ -68,6 +71,7 @@ function buildInstallCommand(node: {
     "--panel", shellQuote(panel),
     "--enroll-token", shellQuote(token),
     "--agent-image", shellQuote(env.agentImage),
+    "--agent-id", shellQuote(node.agent_id),
     "--role", shellQuote(roleFlag(node.role)),
   ];
   if (range && (node.role === "ingress" || node.role === "both" || node.role === null)) {
@@ -93,6 +97,7 @@ export async function createNodeEnrollment(
     select: {
       id: true,
       node_id: true,
+      agent_id: true,
       role: true,
       port_range_min: true,
       port_range_max: true,
@@ -123,6 +128,7 @@ export async function createNodeEnrollment(
     token: plaintext,
     node_id: node.id,
     node_key: node.node_id,
+    agent_id: node.agent_id,
     expires_at: expiresAt.toISOString(),
     install_command: buildInstallCommand(node, plaintext),
   };
@@ -151,7 +157,7 @@ export async function consumeNodeEnrollment(
         expires_at: true,
         used_at: true,
         revoked_at: true,
-        node: { select: { node_id: true, connect_ip: true } },
+        node: { select: { node_id: true, agent_id: true, connect_ip: true } },
       },
     });
     if (
@@ -197,11 +203,11 @@ export async function consumeNodeEnrollment(
       data: { revoked_at: now },
     });
 
-    return { id: enrollment.node_id, key: enrollment.node.node_id };
+    return { id: enrollment.node_id, key: enrollment.node.node_id, agentID: enrollment.node.agent_id };
   });
 
   if (!result) throw new NodeEnrollmentError("invalid_enrollment", 401);
-  return { credential, node_id: result.id, node_key: result.key };
+  return { credential, node_id: result.id, node_key: result.key, agent_id: result.agentID };
 }
 
 export function extractEnrollmentToken(authorization: string | null | undefined): string | null {
@@ -225,6 +231,7 @@ set -eu
 PANEL=""
 TOKEN=""
 AGENT_IMAGE=""
+AGENT_ID=""
 ROLE="BOTH"
 INGRESS_RANGE=""
 EGRESS_RANGE=""
@@ -234,6 +241,7 @@ while [ "$#" -gt 0 ]; do
     --panel) PANEL="$2"; shift 2 ;;
     --enroll-token) TOKEN="$2"; shift 2 ;;
     --agent-image) AGENT_IMAGE="$2"; shift 2 ;;
+    --agent-id) AGENT_ID="$2"; shift 2 ;;
     --role) ROLE="$2"; shift 2 ;;
     --ingress-range) INGRESS_RANGE="$2"; shift 2 ;;
     --egress-range) EGRESS_RANGE="$2"; shift 2 ;;
@@ -244,6 +252,7 @@ done
 [ -n "$PANEL" ] || { echo "tunex install: --panel is required" >&2; exit 2; }
 [ -n "$TOKEN" ] || { echo "tunex install: --enroll-token is required" >&2; exit 2; }
 [ -n "$AGENT_IMAGE" ] || { echo "tunex install: --agent-image is required" >&2; exit 2; }
+[ -n "$AGENT_ID" ] || { echo "tunex install: --agent-id is required" >&2; exit 2; }
 
 case "$(uname -s)" in
   Linux) ;;
@@ -282,6 +291,7 @@ CREDENTIAL="$(curl -fsS -X POST \
 install -d -m 0700 /etc/tunex-agent
 {
   printf '%s\n' "TUNEX_PANEL_HTTP_URL=$PANEL"
+  printf '%s\n' "TUNEX_AGENT_ID=$AGENT_ID"
   printf '%s\n' "TUNEX_NODE_CREDENTIAL=$CREDENTIAL"
   printf '%s\n' "TUNEX_ROLE=$ROLE"
   printf '%s\n' "TUNEX_AGENT_ADMIN_PORT=0"
