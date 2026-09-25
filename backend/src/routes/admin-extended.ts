@@ -470,8 +470,7 @@ adminExtendedRoutes.post("/nodes", async (c) => {
   if (nodeId.length > 64) return bad(c, "节点 ID 长度不能超过 64 字符");
 
   const connectIp = strOrNull(body.connect_ip);
-  if (!connectIp) return bad(c, "连接 IP 不能为空");
-  if (connectIp.length > 64) return bad(c, "连接 IP 长度不能超过 64 字符");
+  if (connectIp && connectIp.length > 255) return bad(c, "连接 IP 长度不能超过 255 字符");
 
   const dup = await db.node.findUnique({ where: { node_id: nodeId } });
   if (dup) return bad(c, "节点 ID 已存在", 409);
@@ -479,16 +478,25 @@ adminExtendedRoutes.post("/nodes", async (c) => {
   const status = pickEnum(body.status, STATUS_VALUES);
   if (status === null) return bad(c, "状态不合法");
 
-  // node_group_id 在 schema 中非空：未提供时落到首个节点组
+  // node_group_id 在 schema 中非空：未提供时落到首个节点组。
+  // 新节点角色优先使用显式 body.role，否则按组方向给出初始角色；运行时最终真相仍是 Node.role。
   let groupId = numOrNull(body.node_group_id);
+  let groupType: "in" | "out" | null = null;
   if (groupId === null) {
-    const first = await db.nodeGroup.findFirst({ orderBy: { id: "asc" }, select: { id: true } });
+    const first = await db.nodeGroup.findFirst({ orderBy: { id: "asc" }, select: { id: true, node_type: true } });
     if (!first) return bad(c, "请先创建节点组");
     groupId = first.id;
+    groupType = first.node_type;
   } else {
-    const group = await db.nodeGroup.findUnique({ where: { id: groupId } });
+    const group = await db.nodeGroup.findUnique({ where: { id: groupId }, select: { id: true, node_type: true } });
     if (!group) return bad(c, "节点组不存在", 404);
+    groupType = group.node_type;
   }
+  const requestedRole = body.role === undefined || body.role === null ? null : String(body.role);
+  if (requestedRole !== null && !["ingress", "egress", "both"].includes(requestedRole)) {
+    return bad(c, "节点角色必须是 ingress / egress / both");
+  }
+  const role = (requestedRole ?? (groupType === "out" ? "egress" : "ingress")) as "ingress" | "egress" | "both";
 
   const weight = numOrNull(body.weight);
   if (weight !== null && weight < 0) return bad(c, "权重不合法");
@@ -499,6 +507,7 @@ adminExtendedRoutes.post("/nodes", async (c) => {
         node_id: nodeId,
         connect_ip: connectIp,
         node_group_id: groupId,
+        role,
         weight: weight ?? undefined,
         version: strOrNull(body.version) ?? undefined,
         backup: body.backup === undefined ? undefined : Boolean(body.backup),
@@ -541,7 +550,7 @@ async function updateNode(c: Ctx) {
   }
   if (body.connect_ip !== undefined) {
     const connectIp = strOrNull(body.connect_ip);
-    if (!connectIp) return bad(c, "连接 IP 不能为空");
+    if (connectIp && connectIp.length > 255) return bad(c, "连接 IP 长度不能超过 255 字符");
     data.connect_ip = connectIp;
   }
   if (body.node_group_id !== undefined) {
