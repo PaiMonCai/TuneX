@@ -423,6 +423,8 @@ export const api = {
       get<PortForward[]>("/forwards", query, cookie),
     detail: (id: ID, cookie?: string) =>
       get<PortForward>(`/forwards/${id}`, undefined, cookie),
+    traffic: (id: ID, days = 14, cookie?: string) =>
+      get<TrafficPoint[]>(`/forwards/${id}/traffic`, { days }, cookie),
     create: (input: ForwardCreateInput, cookie?: string) =>
       post<PortForward>("/forwards", input, cookie),
     update: (id: ID, input: ForwardPatchInput, cookie?: string) =>
