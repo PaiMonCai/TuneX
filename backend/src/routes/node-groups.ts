@@ -226,10 +226,11 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       return { node } as const;
     });
 
-    if ("denied" in reserved) {
+    const denied = "denied" in reserved ? reserved.denied : null;
+    if (denied) {
       return c.json({
-        error: reserved.denied.message ?? "节点额度不足",
-        code: reserved.denied.reason,
+        error: denied.message ?? "节点额度不足",
+        code: denied.reason,
       }, 403);
     }
 
