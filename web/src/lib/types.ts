@@ -293,6 +293,29 @@ export interface Node {
   credential_last_rejected_at?: string | null;
 }
 
+/**
+ * v3 隧道模式（schema enum TunnelMode，DEVELOPMENT.md §2.1）。
+ * NULL = 存量行 / 未参与 v3 编排的 legacy DIRECT 隧道，**不得**默认成 direct
+ * 之外的任何值——存量隧道在补列当口就是「未声明」，与 NodeRole 同理。
+ */
+export type TunnelMode = "direct" | "relay";
+
+/**
+ * v3 隧道 apply 状态机（schema 注释 / DEVELOPMENT.md §4.1）。
+ *
+ *   pending   —— 已生成期望状态（desired_status + config_revision），尚未下发
+ *   applying  —— 已下发，等待 Agent ACK
+ *   active    —— RELAY 两端（先 egress 后 ingress）均 ACK 同一 revision
+ *   error     —— 任一步失败：保留记录，原因见 apply_error_code / apply_error
+ *   suspended —— 节点失效 / 管理员暂停后的可解释状态（不物理删除隧道数据）
+ *
+ * NULL = legacy DIRECT 隧道（无 revision / 无编排），走旧 config-generator。
+ */
+export type TunnelApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
+
+/** 期望状态（控制面想让隧道处于什么状态；与运行态 apply_status 是两列）。 */
+export type TunnelDesiredStatus = "active" | "inactive";
+
 export interface Tunnel {
   id: ID;
   name: string;
@@ -302,6 +325,7 @@ export interface Tunnel {
   listen_port: number | null;
   listen_protocol: string[] | null;
   status: Status;
+  /** legacy DIRECT 开关列（active/inactive）；与 desired_status 并行存在。 */
   forward_addresses: string[];
   forward_addresses_protocol: string[] | null;
   load_balance_type: LoadBalanceType;
@@ -325,6 +349,43 @@ export interface Tunnel {
   // 运行态（由 agent 上报，非 schema 列）
   online?: boolean;
   client_count?: number;
+  // ---------------------------------------------------------------
+  // v3 RELAY 增量字段（WP1 schema：全部可空，存量行 = 未参与 v3 编排）
+  // ---------------------------------------------------------------
+  /**
+   * v3 隧道模式。NULL = 存量 legacy DIRECT（§7.1「不改 / 不猜」）。
+   * 面板必须显式渲染「未声明」，不得默认成 direct。
+   */
+  tunnel_mode?: TunnelMode | null;
+  /** RELAY 实际出口节点（schema §2.1：禁止只存 NodeGroup）；DIRECT = NULL */
+  egress_node_id?: ID | null;
+  /** 出口节点展示引用（由后端 include 提供，缺失时回落 id） */
+  egress_node?: Pick<Node, "id" | "node_id" | "connect_ip"> | null;
+  /** RELAY 出口侧内部通信端口（节点间端口，**不是**用户可见端口） */
+  egress_port?: number | null;
+  /** RELAY 指向的出口目标池（Tunnel.egress_pool_id） */
+  egress_pool_id?: ID | null;
+  egress_pool?: Pick<EgressPool, "id" | "name" | "lb_strategy" | "status"> | null;
+  /** DIRECT 模式目标（由存量 forward_addresses[0] 回填）；RELAY 不使用 */
+  remote_host?: string | null;
+  remote_port?: number | null;
+  /** 期望状态：控制面想让隧道处于什么状态（active/inactive） */
+  desired_status?: TunnelDesiredStatus | null;
+  /** 实际 apply 状态机；NULL = legacy DIRECT（无编排） */
+  apply_status?: TunnelApplyStatus | null;
+  /** 控制面期望版本；每次 desired/配置变更自增 */
+  config_revision?: number | null;
+  /** 最近被 Agent ACK 确认的版本；< config_revision = 待下发 */
+  applied_revision?: number | null;
+  /** 结构化错误码 + 原文；失败时保留 Tunnel（§4.1 禁止物理删除） */
+  apply_error_code?: string | null;
+  apply_error?: string | null;
+  last_applied_at?: string | null;
+  /**
+   * RELAY 编排步骤摘要（WP8 十步有序的只读回放，用于解释「卡在哪一步」）。
+   * 后端返回 steps 列表；前端只展示，不据此发明状态。
+   */
+  apply_steps?: TunnelApplyStep[] | null;
 }
 
 export interface TunnelCreateInput {
@@ -340,6 +401,19 @@ export interface TunnelCreateInput {
   bandwidth_limit?: number | null;
   client_limit?: number | null;
   ip_limit?: number | null;
+  // ── v3（WP11 Tunnel RELAY API 契约；后端未落地字段一律不下发）──
+  /**
+   * v3 模式：direct = 单跳到 remote_host/remote_port；relay = 双跳经出口节点。
+   * 缺省 = 交给后端按 forward_addresses 推导（存量路径不变）。
+   */
+  tunnel_mode?: TunnelMode;
+  /** RELAY 出口目标池；缺省 = 出口节点的 default 池（§2.2） */
+  egress_pool_id?: ID | null;
+  /** RELAY 出口节点 id（backends 显式绑定；不传则由编排器从出口组挑选） */
+  egress_node_id?: ID | null;
+  /** DIRECT 模式目标（单跳）；RELAY 不使用（目标在 EgressTarget 上） */
+  remote_host?: string;
+  remote_port?: number;
 }
 
 export interface Plan {
@@ -566,6 +640,69 @@ export interface TunnelUpdateInput {
   client_limit?: number | null;
   ip_limit?: number | null;
   order_by?: number;
+  // ── v3（WP11 契约；只改 desired state，revision 自增由控制面负责）──
+  /** v3 模式切换（direct ↔ relay）；relay 必须给出口组/池 */
+  tunnel_mode?: TunnelMode;
+  out_node_group_id?: ID | null;
+  egress_pool_id?: ID | null;
+  egress_node_id?: ID | null;
+  remote_host?: string | null;
+  remote_port?: number | null;
+  /** 期望状态（active/inactive）；resume 走这里，不是 apply_status 直写 */
+  desired_status?: TunnelDesiredStatus;
+}
+
+/* ================================================================== */
+/* WP13 Tunnel Web —— v3 隧道编排运行态契约（mock 标注见 api.tunnels）   */
+/* ================================================================== */
+
+/**
+ * WP8 十步编排的一步（只读回放）。前端只用于解释「卡在哪一步」，
+ * 不据此推导状态机（状态真相是 apply_status）。
+ */
+export interface TunnelApplyStep {
+  step: string;
+  ok: boolean;
+  meta?: Record<string, unknown> | null;
+  error?: string | null;
+}
+
+/** retry / suspend / resume 三个运行操作的统一响应（WP11 unified orchestrator）。 */
+export interface TunnelRuntimeAction {
+  tunnel: Tunnel;
+  /** 操作后隧道进入的状态（前端据此刷新徽章，不自行推断） */
+  apply_status: TunnelApplyStatus;
+  /** 操作后的 revision（retry 会 +1；suspend/resume 不变） */
+  config_revision: number | null;
+  /** 编排是否已重入（幂等键命中时 true，不算失败） */
+  reentered?: boolean;
+}
+
+/** 隧道列表查询（WP11：按 apply_status 过滤替代 legacy status） */
+export interface TunnelListQuery {
+  page?: number;
+  page_size?: number;
+  keyword?: string;
+  /** legacy 开关列过滤 */
+  status?: Status;
+  /** v3 apply 状态机过滤（pending/applying/active/error/suspended） */
+  apply_status?: TunnelApplyStatus;
+  /** v3 模式过滤 */
+  tunnel_mode?: TunnelMode;
+  /** 只看「待下发」：applied_revision < config_revision */
+  pending_only?: boolean;
+  [key: string]: string | number | boolean | undefined;
+}
+
+/** 创建 RELAY 隧道时可选的出口池候选项（用户侧只展示可用池，不暴露 Node 主键细节）。 */
+export interface TunnelEgressPoolOption {
+  id: ID;
+  name: string;
+  node_id: ID;
+  node_label: string;
+  lb_strategy: LBStrategy | null;
+  status: Status;
+  targets: { host: string; port: number; weight: number; status: Status }[];
 }
 
 /** 个人设置：基础资料（PATCH /settings/profile） */

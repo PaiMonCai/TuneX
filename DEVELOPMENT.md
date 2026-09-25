@@ -366,8 +366,8 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并（WP10 已实现，见 §7.13，待 CI） |
 | WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并**；✅ 已实现（分支 `feature/v3-wp11-tunnel-api` 已 push，见 §7.13：v3 CRUD + 状态查询 + retry/suspend/resume/delete，33 条离线单测全绿） |
 | WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | ✅ 已完成（分支 `feature/v3-wp12-admin-web` 已 push：节点列表/详情、角色与端口编辑、credential 签发/轮转/吊销、出口池 CRUD、运行态诊断；后端 WP10 未落地期间走 mock 契约，25 条 contract 单测全绿，CI 已接入） |
-| WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | WP11 已合并 |
-| WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | **WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 + WP13 已合并** |
+| WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | ✅ 已实现（分支 `feature/v3-wp13-tunnel-web` 已 push：列表/详情/创建三页 + DIRECT/RELAY 选择与出口池 + 五种 apply 态展示 + retry/suspend/resume 运行按钮按状态机启用；WP11 未合入期间走 mock 契约，44 断言全绿，见 §7.14） |
+| WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 已合并；WP13 待 CI |
 | WP15 | DIRECT v3 Migration | B/C | WP14 验收方案冻结 | WP14 验收通过 |
 | WP16+ | UDP / WS/TLS / QUIC / Advanced | 多 Track | WP14 后按独立 RFC/contract | 各自前置 Gate 通过 |
 
@@ -1136,6 +1136,34 @@ Frontend **允许在后端实现未完成时提前并行开发**，条件是使�
 可在 WP11 contract freeze 后开始，合并依赖 WP11。
 
 **前端不得自己发明字段或临时 API。** Contract 改动必须回到对应 Backend WP。
+
+**状态：✅ 已实现（feature/v3-wp13-tunnel-web）。** WP11 尚未合入 main，全部契约按 §7.14
+规则走 mock 并显式标注（`api.tunnels.retry/suspend/resume`、`/egress-pools`、seed 数据）。
+
+交付内容（`web/src/`）：
+
+| 能力 | 落点 |
+| --- | --- |
+| 列表 + DIRECT/RELAY mode 列 + apply 徽章 + 三种过滤（apply_status / tunnel_mode / pending_only）+ 关键字 | `components/tunnels/tunnel-list.tsx` |
+| 详情（编排面板：状态/revision/两端节点/出口端口/出口池/错误原因/步骤回放/运行按钮） | `components/tunnels/tunnel-detail.tsx` + `components/tunnels/tunnel-orchestration-panel.tsx` |
+| 创建（DIRECT/RELAY 选择、出口组、出口池候选、RELAY 下转发目标非必填） | `components/tunnels/tunnel-create-dialog.tsx` |
+| v3 契约类型 + api 层（retry / suspend / resume / egress-pools） | `lib/types.ts`、`lib/api.ts` |
+| mock 端点 + v3 seed（5 条隧道覆盖 5 种 apply 态、2 个出口池） | `mocks/handler.ts`、`mocks/data.ts`、`mocks/state.ts` |
+| i18n（zh/en，`tunnel.v3*` 词条约 50 条） | `lib/i18n.ts` |
+| mock 契约验证（44 断言全过） | `scripts/verify-wp13-tunnel-mock.ts` |
+
+关键不变式（实现即约束）：
+
+1. `tunnel_mode` / `apply_status` 为 NULL 的行 = 补列前存量隧道，UI 必须渲染「未声明 /
+   无编排」，**不得**默认成 direct / active（§7.1 不改不猜）。
+2. 运行操作按 §4.1 状态机启用：error → retry、active → suspend、suspended → resume；
+   retry 重放相同 revision（不抬高），resume 与配置变更使 revision +1。
+3. 详情/列表的状态真相是 `apply_status`；legacy `status` 开关列并行展示，不被替代。
+4. error 态必须可解释（`apply_error_code` + `apply_error` + 步骤回放）且保留记录，不物理删除。
+
+**Backend 侧（WP11）合入 main 后需同步的点：** mock 只覆盖 §4.1 主路径与常见拒绝，
+未模拟编排超时重入、波长高并发下发、端口耗尽等真实竞争；届时替换为真实端点即可，
+前端契约层（types.ts / api.ts）无需改动。
 
 ---
 

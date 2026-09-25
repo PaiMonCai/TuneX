@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import { TrafficChart } from "@/components/traffic-chart";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
+import TunnelOrchestrationPanel, { TunnelModeBadge } from "@/components/tunnels/tunnel-orchestration-panel";
 import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
 import { formatBytes, formatDateTime } from "@/lib/utils";
@@ -156,6 +157,7 @@ export function TunnelDetail({
             </div>
             <div className="flex items-center gap-2">
               <Badge variant="outline">{tunnel.tunnel_type}</Badge>
+              <TunnelModeBadge mode={tunnel.tunnel_mode} />
               <Badge variant={isActive ? "success" : "muted"}>
                 {isActive ? t("common.active") : t("common.inactive")}
               </Badge>
@@ -209,6 +211,17 @@ export function TunnelDetail({
             <InfoRow label={t("tunnel.outNodeGroup")}>
               {tunnel.out_node_group?.name ?? t("common.none")}
             </InfoRow>
+            <InfoRow label={t("tunnel.v3Mode")}>
+              <TunnelModeBadge mode={tunnel.tunnel_mode} />
+              {tunnel.tunnel_mode == null && (
+                <span className="ml-1.5 text-xs font-normal text-[var(--muted-foreground)]">
+                  {t("tunnel.v3ModeLegacy")}
+                </span>
+              )}
+            </InfoRow>
+            <InfoRow label={t("tunnel.v3EgressPort")}>
+              {tunnel.tunnel_mode === "relay" ? tunnel.egress_port ?? t("common.none") : t("common.none")}
+            </InfoRow>
             <InfoRow label={t("tunnel.listenAddress")}>
               <button
                 className="inline-flex items-center gap-1 font-mono text-xs hover:text-[var(--primary)]"
@@ -233,6 +246,14 @@ export function TunnelDetail({
           </CardContent>
         </Card>
       </div>
+
+      <TunnelOrchestrationPanel
+        tunnel={tunnel}
+        onChanged={(next) => {
+          setTunnel(next);
+          router.refresh();
+        }}
+      />
 
       <div className="grid gap-5 lg:grid-cols-3">
         <Card className="lg:col-span-2">

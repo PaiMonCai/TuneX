@@ -136,6 +136,17 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+/** v3 出口池种子按 node_id 分组（store 用 Map<node_id, EgressPool[]>） */
+function seedPoolsByNode(): Map<ID, EgressPool[]> {
+  const map = new Map<ID, EgressPool[]>();
+  for (const entry of seed.mockEgressPools) {
+    const list = map.get(entry.node_id) ?? [];
+    list.push(clone(entry.pool));
+    map.set(entry.node_id, list);
+  }
+  return map;
+}
+
 function build(): MockStore {
   const users = clone(seed.mockUsers);
   const userPlans = clone([seed.mockUserPlan]);
@@ -228,8 +239,10 @@ function build(): MockStore {
     workspaceMembers,
     workspaceInvites: [],
     nodeCredentials: new Map(),
-    egressPools: new Map(),
-    egressTargets: new Map(),
+    // v3 出口池：按 node_id 分组（与 WP10「池挂节点」层级一致）；
+    // 种子来自 data.ts 的 mockEgressPools，运行期由 CRUD 端点增删改。
+    egressPools: seedPoolsByNode(),
+    egressTargets: new Map(seed.mockEgressPools.map((p) => [p.pool.id, clone(p.targets)])),
     nodeStates: new Map(),
     boot_at: new Date().toISOString(),
   };

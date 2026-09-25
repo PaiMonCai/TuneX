@@ -124,8 +124,9 @@ jobs:
       - run: npm run typecheck
       # OPS-03：仪表盘流量装配纯逻辑单测（bun test，无 DB / 浏览器依赖）
       # WP12：节点管理 mock 契约（角色三元/凭据生命周期/出口池 CRUD）单测
-      - name: Unit tests (dashboard traffic + WP12 node management)
-        run: bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/
+      # WP13：隧道编排 mock 契约（apply 状态机/revision/DIRECT+RELAY 创建/过滤）单测
+      - name: Unit tests (dashboard traffic + WP12 node management + WP13 tunnel orchestration)
+        run: bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/tunnels/__tests__/
       - name: Build with optional billing disabled
         run: npm run build
         env:
