@@ -592,7 +592,9 @@ model Tunnel {
 
   port_leases NodePortLease[]
 
-  @@unique([listen_port, in_node_group_id])
+  // Node-first 后物理唯一性由 NodePortLease(node_id, port) 保证。
+  // 同一 NodeGroup 内不同入口节点允许复用相同 listen_port。
+  @@index([in_node_group_id, listen_port])
   @@index([workspace_id])
   @@index([tunnel_mode])
   @@index([ingress_node_id])
