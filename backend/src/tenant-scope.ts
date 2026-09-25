@@ -381,7 +381,6 @@ export function parsePortLeaseLockKey(
 /**
  * v3 节点注册防爆破键（按 node credential，WP7）。
  *
- * 与 {@link registerBlockKey}（节点组 token，全局唯一、已隐含归属）的区别：
  * 节点凭据的爆破防护发生在**身份解析之前**，此时还不知道节点属于哪个
  * workspace，只能按凭据指纹自作用域——值只描述「这次失败尝试」，不描述
  * 任何租户资产，故放 global 段。

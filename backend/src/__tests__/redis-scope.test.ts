@@ -46,12 +46,9 @@ const {
   scopedPattern,
   scopeId,
   scopeTag,
-  configHashKey,
-  outListenKey,
   trafficBufferPrefix,
   observerBufferKey,
   aliveGroupsKey,
-  registerBlockKey,
   nodeRegisterBlockKey,
   nodeScope,
   portLeaseLockKey,
@@ -63,8 +60,6 @@ const {
   disconnectMarkerKey,
   offlinePattern,
   parseDisconnectMarkerKey,
-  socketRoom,
-  parseSocketRoom,
   classifyGroupForWorkspace,
   isGroupUsableByWorkspace,
   isGroupOwnedByWorkspace,
@@ -183,19 +178,15 @@ describe("TEN-02：同一资源 id 在不同租户下 key 互不相同", () => {
     expect(heartbeatKey(1, 7, "n1")).not.toBe(heartbeatKey(0, 7, "n1"));
   });
 
-  test("出口端口表 / 流量缓冲 / observer 队列 / 活跃组集合 / 指纹缓存", () => {
-    expect(outListenKey(1)).not.toBe(outListenKey(2));
+  test("出口端口表 / 流量缓冲 / observer 队列 / 活跃组集合", () => {
     expect(trafficBufferPrefix(1)).not.toBe(trafficBufferPrefix(2));
     expect(observerBufferKey(1)).not.toBe(observerBufferKey(2));
     expect(aliveGroupsKey(1)).not.toBe(aliveGroupsKey(2));
-    expect(configHashKey(1)).not.toBe(configHashKey(2));
   });
 
   test("key 形态：租户 id 出现在第二个段", () => {
     expect(heartbeatKey(42, 7, "n1")).toBe("ws:42:node:7:n1:heartbeat");
-    expect(outListenKey(42)).toBe("ws:42:tunnel:out_listen");
     expect(observerBufferKey(42)).toBe("ws:42:tunnel:observer:raw");
-    expect(configHashKey(42)).toBe("ws:42:node_group:config_hash");
   });
 });
 
@@ -255,28 +246,6 @@ describe("TEN-02：离线标记 / 心跳解析与生成同源", () => {
 });
 
 /* ================================================================== */
-/* Socket room 作用域（隔离的第二条链路）                              */
-/* ================================================================== */
-
-describe("TEN-02：Socket room 带 scope", () => {
-  test("room 名形如 ws:<scope>:node_group/<groupId>", () => {
-    expect(socketRoom(1, 5)).toBe("ws:1:node_group/5");
-    expect(socketRoom(null, 5)).toBe(`ws:${GLOBAL_SCOPE_TAG}:node_group/5`);
-  });
-
-  test("同 groupId 不同 scope → 不同 room", () => {
-    expect(socketRoom(1, 5)).not.toBe(socketRoom(2, 5));
-  });
-
-  test("parseSocketRoom round-trip / 拒异形", () => {
-    expect(parseSocketRoom("ws:3:node_group/8")).toEqual({ scope: 3, groupId: 8 });
-    expect(parseSocketRoom(`ws:${GLOBAL_SCOPE_TAG}:node_group/8`)).toEqual({ scope: 0, groupId: 8 });
-    expect(parseSocketRoom("node_group/8")).toBeNull();
-    expect(parseSocketRoom("ws:3:room/8")).toBeNull();
-  });
-});
-
-/* ================================================================== */
 /* redis.ts 导出的工厂（业务代码唯一的取键入口）                       */
 /* ================================================================== */
 
@@ -285,14 +254,13 @@ describe("RedisKeys 工厂（集中于 redis.ts）", () => {
     const { RedisKeys } = await import("../redis.ts");
     const produced = [
       RedisKeys.license,
-      RedisKeys.registerBlock("tok-a"),
       RedisKeys.observerBuffer(1),
       RedisKeys.payCallback("epay"),
       RedisKeys.rateLimit("auth-login", "ip:1.2.3.4"),
       RedisKeys.userSub("sub-1"),
       RedisKeys.impersonation("tok-b"),
       RedisKeys.topupOrderLock(9),
-      RedisKeys.nodeGroupConfigHash(1),
+      RedisKeys.nodeRegisterBlock("fp-1"),
       RedisKeys.aliveNodeGroups(1),
     ];
     for (const k of produced) {
@@ -306,9 +274,6 @@ describe("RedisKeys 工厂（集中于 redis.ts）", () => {
     const { RedisKeys } = await import("../redis.ts");
     // license 是实例级配置
     expect(RedisKeys.license).toBe("ws:global:license");
-    // 注册防爆破：token 自作用域
-    expect(RedisKeys.registerBlock("tok-a")).toBe("ws:global:register_block:tok-a");
-    expect(RedisKeys.registerBlock("tok-a")).not.toBe(RedisKeys.registerBlock("tok-b"));
     // 账户数据
     expect(RedisKeys.userSub("abc")).toBe("ws:global:user:abc:id");
     expect(RedisKeys.impersonation("abc")).toBe("ws:global:impersonation:abc");
@@ -320,7 +285,6 @@ describe("RedisKeys 工厂（集中于 redis.ts）", () => {
   test("租户段键带 workspace id", async () => {
     const { RedisKeys } = await import("../redis.ts");
     expect(RedisKeys.observerBuffer(3)).toBe("ws:3:tunnel:observer:raw");
-    expect(RedisKeys.nodeGroupConfigHash(3)).toBe("ws:3:node_group:config_hash");
     expect(RedisKeys.aliveNodeGroups(3)).toBe("ws:3:alive_groups");
     // 同 workspace → 同 key（否则缓存永远命中不了）
     expect(RedisKeys.observerBuffer(3)).toBe(RedisKeys.observerBuffer(3));
