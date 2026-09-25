@@ -3,9 +3,9 @@
 #
 # 与开发栈的差异（PLAN.md 4.5 "必须有独立的生产配置"）：
 #   · 不映射 MySQL / Redis 主机端口（仅 compose 内网可达，杜绝公网暴露 3306/6379）
-#   · backend/web 不映射主机端口；Docker 对外只有 Caddy 一个统一 HTTP 入口
-#   · 默认仅绑定 127.0.0.1:13000，交给宿主机 Nginx/宝塔/1Panel 做公网 TLS
-#   · /socket.io/* 单独路由到 backend:3001（Agent 控制面 WebSocket）
+#   · backend/web 仅映射到宿主机 loopback，永不直接暴露公网
+#   · 默认由宿主机 Nginx/宝塔/1Panel 直接反代；Caddy 是可选 profile
+#   · 可选 Caddy 把 Web/API/WebSocket 聚合为 127.0.0.1:13000 单入口
 #   · TuneX 应用角色共用一个 CI 预构建 GHCR 镜像；镜像 tag 由 .env 的 TUNEX_IMAGE 钉住
 #   · 资源限额 / 日志轮转 / no-new-privileges，避免单容器吃光主机
 #   · 独立数据卷名（*-prod），与开发栈同机运行也不互相覆盖
@@ -111,10 +111,10 @@ services:
     container_name: tunex-backend
     restart: always
     env_file: [.env]
-    # HTTP 3000 + Socket.IO 3001 均只对 compose 内网开放，由 Docker 内 Caddy 反代。
-    expose:
-      - "3000"
-      - "3001"
+    # 默认生产模式允许宿主机反代直连，但只绑定 loopback，不对公网开放。
+    ports:
+      - "127.0.0.1:${TUNEX_API_PORT:-13001}:3000"
+      - "127.0.0.1:${TUNEX_WS_PORT:-13002}:3001"
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -170,12 +170,12 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3000"
-      # 生产前端与后端同源：Caddy 把 /api/* → backend:3000、/socket.io/* → backend:3001，
+      # 生产外部始终同源：宿主机 Nginx 或可选 Caddy 负责路由，
       # 因此 API 基址留空走相对路径；显式关闭 mock。
       NEXT_PUBLIC_API_MOCK: "0"
       NEXT_PUBLIC_API_BASE: ""
-    expose:
-      - "3000"
+    ports:
+      - "127.0.0.1:${TUNEX_WEB_PORT:-13003}:3000"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -195,11 +195,12 @@ services:
           memory: ${WEB_MEM_LIMIT:-768M}
 
   caddy:
+    profiles: ["caddy"]
     image: ${CADDY_IMAGE:-caddy:2.8}
     container_name: tunex-caddy
     restart: always
-    # 默认生产模式：只给宿主机反代暴露一个 loopback HTTP 端口。
-    # 公网 80/443、TLS、域名与证书统一由宿主机 Nginx/宝塔/1Panel 管理。
+    # 可选聚合入口：启用 --profile caddy 后，宿主机只需反代这一个 loopback 端口。
+    # 不启用时，宿主机 Nginx 可直接代理 TUNEX_WEB/API/WS_PORT。
     ports:
       - "127.0.0.1:${TUNEX_HTTP_PORT:-13000}:80"
     volumes:
