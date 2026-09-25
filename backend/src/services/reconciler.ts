@@ -840,9 +840,21 @@ function pickAgentTunnel(
   }
   if (!ingress || !egress) return null;
 
+  const ingressMode = String(ingress.mode ?? "").toLowerCase();
+  const egressMode = String(egress.mode ?? "").toLowerCase();
+  // A RELAY resource is healthy only when its two concrete runtimes have the
+  // expected roles. Preserve an unexpected runtime mode in the collapsed view
+  // so computeDrift can emit mode_mismatch instead of normalising the error away.
+  const mode =
+    ingressMode !== "" && ingressMode !== "relay"
+      ? ingressMode
+      : egressMode !== "" && egressMode !== "egress"
+        ? egressMode
+        : "relay";
+
   return {
     id: String(t.id),
-    mode: "relay",
+    mode,
     ingress_port: ingress.ingress_port ?? null,
     egress_port: egress.egress_port ?? null,
     revision: Math.min(
