@@ -1,0 +1,33 @@
+# VCS / local state
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+!.env.production.example
+var/
+reports/
+backups/
+.admin-credentials
+
+# Dependencies / build outputs are rebuilt inside Docker
+**/node_modules/
+web/.next/
+backend/dist/
+agent/dist/
+
+# Unified app image only needs backend + web source trees
+agent/
+docs/
+scripts/
+mysql-init/
+Caddyfile
+Caddyfile.prod
+docker-compose*.yaml
+README.md
+DEVELOPMENT.md
+
+# Editor / OS noise
+**/.DS_Store
+**/.idea/
+**/.vscode/

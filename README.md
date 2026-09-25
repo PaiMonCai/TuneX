@@ -332,19 +332,21 @@ go build ./...
 
 ## Docker 镜像
 
-CI 在 `main` / `feature/**` push 后构建：
+CI 在发布 push 后构建一个统一应用镜像：
 
 ```text
-ghcr.io/paimoncai/tunex-backend:latest
-ghcr.io/paimoncai/tunex-web:latest
+ghcr.io/paimoncai/tunex:latest
+ghcr.io/paimoncai/tunex:<git-sha>
 ```
 
-同时会以 Git SHA 打 tag。Compose 也允许通过以下变量覆盖镜像：
+同一镜像由 Compose 以不同启动命令运行 Backend、Worker、DB migrate 和
+Next.js standalone Web；它们仍是独立容器，不是单容器多进程。生产可通过：
 
 ```dotenv
-TUNEX_BACKEND_IMAGE=ghcr.io/paimoncai/tunex-backend:latest
-TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
+TUNEX_IMAGE=ghcr.io/paimoncai/tunex:<git-sha>
 ```
+
+钉住完整应用版本。MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品。
 
 ## 项目结构
 

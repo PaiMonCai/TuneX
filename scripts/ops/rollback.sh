@@ -15,7 +15,7 @@
 #   scripts/ops/rollback.sh --verify <target>         # 只验证不执行
 #
 # target 三种形式：
-#   1. 镜像引用：ghcr.io/paimoncai/tunex-backend:<sha> @sha256:<digest>
+#   1. 镜像引用：ghcr.io/paimoncai/tunex:<sha> @sha256:<digest>
 #      （CI 每个 commit 都推 <sha> tag；回滚到指定版本最稳）
 #   2. 部署记录 id（.deploy-history.jsonl 中的一条，包含当时的镜像 digest）
 #   3. `previous`：自动取上一个成功部署
@@ -24,8 +24,7 @@
 #   1. 记录当前状态（git rev + 镜像 digest + compose config 指纹）→ 用于再次回滚
 #   2. 备份现状（默认要求，除非 --no-backup-backup）
 #   3. 拉取目标镜像（本地不存在时）
-#   4. 更新 .env 的 TUNEX_BACKEND_IMAGE / TUNEX_WEB_IMAGE（写入 .env.rollback 而非原地改，
-#      由 --apply 生效；默认 dry-run 出 diff）
+#   4. 更新 .env 的 TUNEX_IMAGE（同一 digest 同时驱动 backend/worker/web）
 #   5. compose up -d 切换（DB/Redis 不动，滚动替换 backend/worker/web）
 #   6. 健康等待：/healthz 200 + 三个服务 healthy，超时即失败
 #   7. 失败 → 自动回退到步骤 1 记录的状态（幂等）
@@ -44,9 +43,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_ROOT/docker-compose.yaml}"
 OPS_DIR="${OPS_DIR:-$PROJECT_ROOT/var/ops}"
-BACKEND_IMAGE_DEFAULT="ghcr.io/paimoncai/tunex-backend:latest"
-# shellcheck disable=SC2034  # 由 backend tag 推导，仅作文档化后备
-WEB_IMAGE_DEFAULT="ghcr.io/paimoncai/tunex-web:latest"  # @unused: 推导所用
+TUNEX_IMAGE_DEFAULT="ghcr.io/paimoncai/tunex:latest"
 # shellcheck disable=SC2034  # 兜底已知良好版本（见 docs/production-deploy.md）
 KNOWN_GOOD_IMAGE="${ROLLBACK_KNOWN_GOOD_IMAGE:-}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-120}"
@@ -97,12 +94,12 @@ CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-9091}"
 
 # --- 当前状态指纹 ------------------------------------------------------------
 current_state() {
-  local commit digest backend_web
+  local commit digest image
   commit="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
-  backend_web="${TUNEX_BACKEND_IMAGE:-$BACKEND_IMAGE_DEFAULT}"
-  digest="$(docker image inspect "$backend_web" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "local:${backend_web}")"
-  jq -nc --arg c "$commit" --arg i "$backend_web" --arg d "$digest" --arg t "$(date -Iseconds)" \
-    '{commit:$c, backend_image:$i, digest:$d, at:$t}'
+  image="${TUNEX_IMAGE:-$TUNEX_IMAGE_DEFAULT}"
+  digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "local:${image}")"
+  jq -nc --arg c "$commit" --arg i "$image" --arg d "$digest" --arg t "$(date -Iseconds)" \
+    '{commit:$c, image:$i, digest:$d, at:$t}'
 }
 
 # --- 部署历史 ----------------------------------------------------------------
@@ -116,19 +113,19 @@ if [[ $DO_LIST -eq 1 ]]; then
   echo
   echo "本地可用镜像："
   docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.CreatedSince}}\t{{.Size}}' \
-    | grep -E 'tunex-(backend|web)' | sed 's/^/  /' || echo "  （无）"
+    | grep -E '(^|/)tunex:' | sed 's/^/  /' || echo "  （无）"
   echo
   echo "GHCR 上的 sha tag（需 gh CLI 或 git ls-remote 辅助，见 docs/ops/rollback.md）"
   exit 0
 fi
 
 # --- 解析目标 ----------------------------------------------------------------
-resolve_image() {  # $1 = target → prints backend image ref
+resolve_image() {  # $1 = target → prints unified TuneX image ref
   local t="$1"
   [[ -n "$t" ]] || die "未指定 --to 目标" 2
   case "$t" in
     previous)
-      tail -2 "$HISTORY" | head -1 | jq -r '.backend_image // empty' \
+      tail -2 "$HISTORY" | head -1 | jq -r '.image // .backend_image // empty' \
         || die "历史记录不足以解析 previous" 2
       ;;
     ghcr.io/*|*@sha256:*|*/*:*)
@@ -136,37 +133,33 @@ resolve_image() {  # $1 = target → prints backend image ref
     *)
       # 部署记录 id / digest 短形式
       local found
-      found="$(grep -F "$t" "$HISTORY" 2>/dev/null | tail -1 | jq -r '.backend_image // empty')"
+      found="$(grep -F "$t" "$HISTORY" 2>/dev/null | tail -1 | jq -r '.image // .backend_image // empty')"
       [[ -n "$found" ]] && echo "$found" || die "无法解析目标: $t" 2
       ;;
   esac
 }
 
 if [[ $DO_VERIFY -eq 1 || -n "$TARGET" ]]; then
-  BACKEND_IMG="$(resolve_image "$TARGET")"
-  [[ -n "$BACKEND_IMG" ]] || die "目标镜像为空" 2
+  TUNEX_IMG="$(resolve_image "$TARGET")"
+  [[ -n "$TUNEX_IMG" ]] || die "目标镜像为空" 2
 else
   usage
   die "必须指定 --to <target> 或 --list" 2
 fi
-# web 镜像跟随 backend 的 tag/域（CI 同 commit 推送）
-WEB_IMG="$(echo "$BACKEND_IMG" | sed -e 's#tunex-backend#tunex-web#')"
-
 log "回滚目标："
-log "  backend : $BACKEND_IMG"
-log "  web     : $WEB_IMG"
+log "  TuneX image: $TUNEX_IMG"
 [[ "$TARGET" == "previous" ]] && log "  (解析自部署历史 previous)"
 
 # --- 1. 目标镜像可用性校验 ---------------------------------------------------
 log "[1/6] 校验目标镜像"
-if docker image inspect "$BACKEND_IMG" >/dev/null 2>&1; then
-  log "  本地已存在: $BACKEND_IMG"
+if docker image inspect "$TUNEX_IMG" >/dev/null 2>&1; then
+  log "  本地已存在: $TUNEX_IMG"
 else
   log "  本地不存在，尝试拉取…"
-  docker pull "$BACKEND_IMG" >/dev/null 2>&1 || die "拉取失败: $BACKEND_IMG（检查网络/GHCR 权限/tag 是否真实存在）" 2
-  log "  已拉取: $(docker image inspect "$BACKEND_IMG" --format '{{.Id}}')"
+  docker pull "$TUNEX_IMG" >/dev/null 2>&1 || die "拉取失败: $TUNEX_IMG（检查网络/GHCR 权限/tag 是否真实存在）" 2
+  log "  已拉取: $(docker image inspect "$TUNEX_IMG" --format '{{.Id}}')"
 fi
-log "  digest: $(docker image inspect "$BACKEND_IMG" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo '(local only)')"
+log "  digest: $(docker image inspect "$TUNEX_IMG" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo '(local only)')"
 
 if [[ "$DO_VERIFY" -eq 1 ]]; then
   log "✅ 目标可回滚（verify 模式，未做任何变更）"
@@ -200,7 +193,7 @@ fi
 # --- 3. 确认 -----------------------------------------------------------------
 if [[ $ASSUME_YES -ne 1 ]]; then
   echo
-  log "即将执行回滚：backend/worker/web → $BACKEND_IMG；mysql/redis 不动。"
+  log "即将执行回滚：backend/worker/web → $TUNEX_IMG；mysql/redis 不动。"
   [[ $DO_DATA -eq 1 ]] && log "⚠️  --data：随后还会从最新备份恢复数据（覆盖现有数据）"
   read -r -p "输入 ROLLBACK 确认执行: " ans
   [[ "$ans" == "ROLLBACK" ]] || die "已取消" 2
@@ -215,13 +208,14 @@ log "  当前状态已记录（用于失败回退）: $(jq -r '.digest' <<<"$CUR
 ENV_FILE="$PROJECT_ROOT/.env"
 [[ -f "$ENV_FILE" ]] || die ".env 不存在 —— 无法确定部署配置" 2
 cp "$ENV_FILE" "$OPS_DIR/.env.before-rollback"
-# 替换/追加两个镜像变量
-sed -i -E "s#^TUNEX_BACKEND_IMAGE=.*#TUNEX_BACKEND_IMAGE=$BACKEND_IMG#" "$ENV_FILE" 2>/dev/null \
-  || echo "TUNEX_BACKEND_IMAGE=$BACKEND_IMG" >> "$ENV_FILE"
-grep -q '^TUNEX_BACKEND_IMAGE=' "$ENV_FILE" || echo "TUNEX_BACKEND_IMAGE=$BACKEND_IMG" >> "$ENV_FILE"
-sed -i -E "s#^TUNEX_WEB_IMAGE=.*#TUNEX_WEB_IMAGE=$WEB_IMG#" "$ENV_FILE" 2>/dev/null \
-  || echo "TUNEX_WEB_IMAGE=$WEB_IMG" >> "$ENV_FILE"
-grep -q '^TUNEX_WEB_IMAGE=' "$ENV_FILE" || echo "TUNEX_WEB_IMAGE=$WEB_IMG" >> "$ENV_FILE"
+# 替换/追加统一镜像变量
+if grep -q '^TUNEX_IMAGE=' "$ENV_FILE"; then
+  sed -i -E "s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=$TUNEX_IMG#" "$ENV_FILE"
+else
+  echo "TUNEX_IMAGE=$TUNEX_IMG" >> "$ENV_FILE"
+fi
+# 清理旧双镜像变量，避免运维人员误以为它们仍生效。
+sed -i -E '/^TUNEX_(BACKEND|WEB)_IMAGE=/d' "$ENV_FILE"
 log "  .env diff:"
 diff -u "$OPS_DIR/.env.before-rollback" "$ENV_FILE" | sed 's/^/    /' || true
 
@@ -263,7 +257,7 @@ log "  healthz=200, backend/worker/web 全部 running ✅"
 # --- 7. 记录 + 数据层可选回滚 -------------------------------------------------
 log "[6/6] 写回滚记录"
 jq -nc --arg t "$(date -Iseconds)" --arg from "$(jq -r '.digest' <<<"$CUR_STATE")" \
-  --arg to "$BACKEND_IMG" --arg data "$DO_DATA" \
+  --arg to "$TUNEX_IMG" --arg data "$DO_DATA" \
   '{at:$t, action:"rollback", from:$from, to:$to, data_restore:($data=="1")}' >> "$HISTORY"
 
 if [[ $DO_DATA -eq 1 ]]; then
@@ -277,7 +271,7 @@ if [[ $DO_DATA -eq 1 ]]; then
     "$SCRIPT_DIR/restore.sh" "$LATEST" --yes || die "数据恢复失败" 1
 fi
 
-log "✅ 回滚完成：$BACKEND_IMG"
+log "✅ 回滚完成：$TUNEX_IMG"
 log "  后续："
 log "    docker compose ps"
 log "    curl -fsS http://127.0.0.1:${CADDY_HTTP_PORT}/healthz"
