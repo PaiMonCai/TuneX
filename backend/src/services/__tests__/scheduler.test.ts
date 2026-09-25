@@ -1001,6 +1001,29 @@ describe("C. 端口分配集成", () => {
     expect(t.listen_port).toBe(20005);
   });
 
+  test("C3b. pending 行已写 listen_port 时，reapply 仍必须补齐 ingress NodePortLease", async () => {
+    const existing = seedTunnel({
+      listen_port: 20005,
+      egress_port: null,
+      desired_status: "inactive",
+      apply_status: "pending",
+      config_revision: 0,
+      applied_revision: null,
+    });
+    tunnels.push(existing);
+
+    const result = await scheduler.reapplyRelayTunnel(existing.id, orch, deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const owned = leases.filter((l) => l.tunnel_id === existing.id && l.status === "active");
+    expect(owned).toHaveLength(2);
+    expect(owned).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node_id: 1, port: 20005, lease_type: "ingress" }),
+      expect.objectContaining({ node_id: 2, lease_type: "egress" }),
+    ]));
+  });
+
   test("C4. user-specified 指定黑名单端口 → port_invalid（不静默改分）", async () => {
     const result = await scheduler.createRelayTunnel(
       input({ listenPort: 80 }),
