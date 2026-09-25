@@ -197,6 +197,7 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       const select = {
         id: true,
         node_id: true,
+        agent_id: true,
         connect_ip: true,
         node_group_id: true,
         role: true,
