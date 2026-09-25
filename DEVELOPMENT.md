@@ -49,6 +49,10 @@ Egress Node
 
 硬规则：
 
+- **一个实际 Agent = 一个不可变 `agent_id` = 一条 Node 记录**。角色不是身份；同一 Agent 可以是 `ingress`、`egress` 或 `both`。
+- `node_id` 只作为用户可读名称/标签，可修改；`agent_id` 由 Panel 创建 Node 时生成，安装、角色切换、hostname 变化都不得改变。
+- `both` 节点不拆成两个 Agent。它可以自己承担 DIRECT/RELAY ingress，也可以作为其它入口节点绑定的 egress。
+- 同一条 PortForward 不允许把相同 Agent 同时选成 ingress + egress；这种“自中继”没有额外网络语义，应直接使用 DIRECT。
 - Ingress / BOTH 节点可以独立创建端口转发。
 - 创建 PortForward 时 `egress_node_id = null` 即 DIRECT。
 - 指定 `egress_node_id` 即 RELAY，但该出口必须与入口存在有效 `NodeBinding`。
@@ -64,7 +68,7 @@ Node 生命周期改为「Panel 先创建 → 机器后注册」：
 
 1. Panel 创建 pending Node，只确定 NodeGroup、角色与端口范围；`connect_ip` 可为空。
 2. Panel 生成一个 **10 分钟、一次性** enrollment token，只存哈希。
-3. UI 立即展示可复制的一键安装命令；长期 node credential 不出现在该命令中。
+3. UI 立即展示可复制的一键安装命令；命令携带短时 enrollment token、不可变 agent_id 和当前可读 node_id，长期 node credential 不出现在该命令中。
 4. 安装脚本先确保 Docker Engine 可用，并拉取 Panel 配置的专用多架构 `tunex-agent` 镜像；镜像拉取失败时不得消费 enrollment token。
 5. 节点以 enrollment token 调用机器端 enroll API；服务端原子消费 token，并签发真正的 per-node credential。
 6. 安装脚本把 credential 写入宿主机 root-only `/etc/tunex-agent/agent.env`，容器只读挂载该文件，不通过 Docker 环境变量明文注入长期凭据。
@@ -75,6 +79,7 @@ Node 生命周期改为「Panel 先创建 → 机器后注册」：
 安全约束：
 
 - enrollment token / node credential 明文都不得落数据库、日志、审计 metadata 或 URL query。
+- credential 是认证真相；agent_id 是运行实例一致性校验。Agent 上报 agent_id 时必须与该 credential 绑定的 Node.agent_id 相同，否则拒绝。
 - 安装命令可以包含短时 enrollment token，但不得包含长期 credential。
 - enroll 端点必须并发安全：同一 token 最多一个请求成功。
 - Panel 不主动连接 Agent；一键安装不得重新引入公网 9090 依赖。
