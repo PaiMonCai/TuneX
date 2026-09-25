@@ -1,6 +1,26 @@
 /**
  * 动态端口分配器（多节点端口竞争修复）
  *
+ * ⚠️ **LEGACY（WP3 起）—— 新代码请改用 `services/portPool.ts`。**
+ *
+ * 本文件是 v2「入口组内确定性端口分配」的既有实现，仍在 `config-generator.ts`
+ * 的下发链路里服役（DIRECT 路径），**不要在新功能里引入它**。它与
+ * `services/portPool.ts` 的关系与边界：
+ *
+ *   · **作用域不同**：本文件在**入口组**内分配（跨该组所有节点、所有 agent），
+ *     依据是 `@@unique([listen_port, in_node_group_id])`；portPool 在
+ *     **单个节点**上分配，依据是 `@@unique([node_id, port])`。两者不通用。
+ *   · **持久化不同**：本文件纯函数、不落库不碰 Redis（配置生成幂等重算）；
+ *     portPool 落 `node_port_lease` 行，DB 唯一约束是所有权终审。
+ *   · **端口不会互相免让**：本文件分配的 DIRECT `listen_port` **没有**
+ *     `node_port_lease` 行。因此任何调用 portPool 的地方，必须把同节点这些
+ *     DIRECT 端口通过 `AcquirePortInput.reservedPorts` 灌进去，否则新分配的
+ *     v3 端口会与 agent 正在 bind 的端口撞号——那种撞号**没有任何 DB 约束
+ *     兜底**，比 v3 内部撞号危险得多。
+ *
+ * 迁移（WP8 编排器）：把 DIRECT 隧道逐步切到 `acquirePort` + `releaseLease`，
+ * 由 portPool 统一所有权与对账；本文件随 DIRECT 存量清零后删除。
+ *
  * ── 问题（见 reports/multi-node-verification.md §7 缺陷#5）──
  * 当隧道 `listen_port=NULL` 时，配置里下发 `WAIT_LISTEN<range>` 占位符，由**各
  * agent 进程内**自选端口（`engine/runtime.go#allocatePort`）。进程内 `usedPorts`

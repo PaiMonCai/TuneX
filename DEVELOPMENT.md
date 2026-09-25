@@ -564,6 +564,43 @@ DoD：
 - orphan lease 可 reconcile；
 - 完整 backend tests。
 
+**状态：🟡 已实现，分支 `feature/v3-wp3-port-allocator` 待 push / CI 验证。**
+
+交付物（`backend/src/services/portPool.ts`，708 → 现 825 行）：
+
+| 符号 | 语义 |
+|---|---|
+| `acquirePort` | `revive-or-create`：先按 `status='released'` 守卫原子认领已释放的行，认领不到再 `create`；撞 P2002 = 真被占用 → 下一候选 |
+| `releaseLease` | 软删除（`status='released'` 保留行）；三粒度 `leaseId` / `tunnelId` / `nodeId` |
+| `leaseHolder` | 按 `(node_id, port)` 定位持有者；**签名里刻意没有 Redis**——「锁在不在」与「端口归谁」是两个问题 |
+| `reconcileLeases` | 回收两类孤儿：悬空 tunnel_id、过期预分配（含 NULL expiry） |
+| `reconcileLeaseLocks` | SCAN 清理残留锁 key；只清理不判定，`acquire` 的正确性从不依赖它 |
+
+DoD 逐条落地（`backend/src/services/__tests__/portPool.test.ts`，42 tests / 318 assertions 全绿）：
+
+- **并发分配无重复**：50 并发同节点 → 50 个互异端口；10 并发抢同一 user-specified 端口 → 恰 1 成功，其余 9 个 `port_taken`；
+- **Redis 丢锁后 DB unique 兜底**：两种形态都验证——① Redis `set` 永远返回 null（抢不到锁）；② Redis set/del/scan 全部抛异常（Redis 整体宕机）。两种下分配仍正确且互斥，证明锁只是优化；
+- **orphan lease 可 reconcile**：悬空 tunnel、过期预分配（含 NULL expiry）、预分配默认 TTL 兜底、`dryRun` 不写、revive 后端口可再分；
+- **黑名单生效**：9 个端口（22/80/443/3306/5432/6379/27017/9090/9191）全清单；区间打散剔除；user-specified 指定黑名单 → `port_blacklisted` 而非静默改分；
+- **ingress/egress 双池隔离**：`sameLeaseTarget` 不看 `lease_type`，同 `node_id` 必互斥（BOTH 双绑被禁），跨 `node_id` 同端口天然可各自持有；
+- **legacy DIRECT 不可被抢占**：`AcquirePortInput.reservedPorts` 灌入存量 DIRECT `listen_port` 后，自动分配与 user-specified 都不再碰；显式抢占 → `port_taken`，且不静默改分别的端口；
+- **user-specified 与 auto 同一规则**：`portCandidates` 共用；差别只在候选集长度（`[port]` vs 全区间），判定本身无白名单绕过项。
+
+关键设计决定（写进了 portPool.ts 头注，供 review 时对齐）：
+
+1. **锁 key 单一真相源**：`leaseLockKey` 直接调 `RedisKeys.portLeaseLock`（`tenant-scope.ts`），本文件不拼字符串；
+2. **scope 只经 `nodeScope()` 派生**：`NodePortLease` 无 workspace_id 列，归属沿 `Node → node_group → workspace_id` 单向上查；
+3. **预分配必须有 TTL**：`tunnel_id` 是 `ON DELETE SET NULL` 软外键，NULL expiry 的预分配会让 reconcile 永远收不回它，故缺省按 `PREALLOC_TTL_S`（15 min）兜底；
+4. **不接路由/HTTP、不接 agent bind 探测、不做 role 校验**：端口 OS 层可用性由 agent `EADDRINUSE` 反馈，控制面只保证自己不再重复分配。
+
+LEGACY 交接（见 `src/socket/port-allocator.ts` 头注与 `config-generator.ts` 导入处）：
+
+- 旧 `socket/port-allocator.ts` 是**入口组内**确定性分配（依据 `@@unique([listen_port, in_node_group_id])`），
+  与新 portPool 的**单节点**分配（依据 `@@unique([node_id, port])`）作用域不同、不通用；
+- 它分配的 DIRECT `listen_port` **没有 `node_port_lease` 行**，因此调用 portPool 的一方
+  必须把同节点这些端口经 `AcquirePortInput.reservedPorts` 灌入——那种撞号没有任何 DB 约束兜底，
+  比 v3 内部撞号危险得多。WP8 编排器切流时这条是硬要求。
+
 ---
 
 ### 7.7 WP4 — Agent v3 Runtime 骨架
