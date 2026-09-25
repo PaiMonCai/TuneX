@@ -32,13 +32,19 @@ import {
   extractBearerCredential,
   submitStateReport,
 } from "../services/node-state.ts";
+import {
+  buildDesiredNodeSnapshot,
+  dequeueAgentCommand,
+  storeAgentCommandAck,
+  type AgentCommandAck,
+} from "../services/agent-command-bus.ts";
 
 export const internalNodeRoutes = new Hono<{ Variables: AppVariables }>();
 
 /** 认证包装：HTTP 层只需要「401/503 三态 + node_id」，避免每个处理器重复展开判别联合。 */
 async function authedNode(
   authorization: string | undefined,
-): Promise<{ ok: true; node_id: number } | { ok: false; status: 401 | 503; reason: string }> {
+): Promise<{ ok: true; node_id: number; scope: number } | { ok: false; status: 401 | 503; reason: string }> {
   const credential = extractBearerCredential(authorization ?? null);
   if (!credential) return { ok: false, status: 401, reason: "missing_credential" };
   const auth = await authenticateNode(credential);
@@ -47,7 +53,7 @@ async function authedNode(
     // db_unavailable 回 503，Agent 该退避重试而不是换凭据。
     return { ok: false, status: auth.reason === "db_unavailable" ? 503 : 401, reason: auth.reason };
   }
-  return { ok: true, node_id: auth.node_id };
+  return { ok: true, node_id: auth.node_id, scope: auth.scope };
 }
 
 /**
@@ -86,5 +92,56 @@ internalNodeRoutes.get("/node/snapshot", async (c) => {
   const auth = await authedNode(c.req.header("authorization"));
   if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
   const snapshot = await buildReconnectSnapshot(auth.node_id);
+  return c.json({ data: { snapshot } });
+});
+
+
+/**
+ * GET /api/internal/node/commands
+ *
+ * One-at-a-time outbound command pull. Empty queue is a normal 200 response;
+ * Agent polls again. Command ownership is implicit in the credential-derived
+ * node id and workspace scope, so callers cannot request another node's queue.
+ */
+internalNodeRoutes.get("/node/commands", async (c) => {
+  const auth = await authedNode(c.req.header("authorization"));
+  if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
+  const command = await dequeueAgentCommand(auth.scope, auth.node_id);
+  return c.json({ data: { command } });
+});
+
+/** POST /api/internal/node/ack —— Agent executes a queued command then ACKs it. */
+internalNodeRoutes.post("/node/ack", async (c) => {
+  const auth = await authedNode(c.req.header("authorization"));
+  if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
+  const body = await c.req.json().catch(() => null) as AgentCommandAck | null;
+  if (!body || typeof body !== "object" || typeof body.command_id !== "string" || typeof body.ok !== "boolean") {
+    return c.json({ ok: false, error: "invalid_ack" }, 400);
+  }
+  try {
+    await storeAgentCommandAck(auth.scope, auth.node_id, {
+      command_id: body.command_id,
+      ok: body.ok,
+      applied_revision: typeof body.applied_revision === "number" ? body.applied_revision : null,
+      error_code: typeof body.error_code === "string" ? body.error_code : null,
+      error: typeof body.error === "string" ? body.error.slice(0, 500) : null,
+    });
+  } catch {
+    return c.json({ ok: false, error: "invalid_ack" }, 400);
+  }
+  return c.json({ data: { ok: true } });
+});
+
+/**
+ * GET /api/internal/node/desired
+ *
+ * Startup restore source: canonical desired state for this concrete Node.
+ * It never re-schedules from NodeGroup; only Tunnel.ingress_node_id /
+ * egress_node_id bindings are returned.
+ */
+internalNodeRoutes.get("/node/desired", async (c) => {
+  const auth = await authedNode(c.req.header("authorization"));
+  if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
+  const snapshot = await buildDesiredNodeSnapshot(auth.node_id);
   return c.json({ data: { snapshot } });
 });
