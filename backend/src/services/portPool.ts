@@ -375,7 +375,7 @@ interface NodeRow {
   id: number;
   port_range_min: number | null;
   port_range_max: number | null;
-  node_group?: { workspace_id: number | null; is_shared?: boolean | null } | null;
+  node_group?: { workspace_id: number | null } | null;
 }
 
 /** 解析出的分配上下文。 */
@@ -401,7 +401,7 @@ async function resolveContext(
       id: true,
       port_range_min: true,
       port_range_max: true,
-      node_group: { select: { workspace_id: true, is_shared: true } },
+      node_group: { select: { workspace_id: true } },
     },
   })) as NodeRow | null;
 
