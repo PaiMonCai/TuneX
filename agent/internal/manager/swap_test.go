@@ -516,11 +516,57 @@ func TestReplaceListenerSamePortTargetSwapKeepsLiveConnections(t *testing.T) {
 	}
 }
 
-// TestReplaceListenerTargetSwapFallbackKeepsNodeServing pins the defensive
-// exit: when the forwarder cannot swap its upstream in place, the manager
-// rebuilds through Apply rather than failing the command and leaving the node
-// running a config the panel no longer believes in.
-func TestReplaceListenerTargetSwapFallbackKeepsNodeServing(t *testing.T) {
+// TestReplaceListenerPortAndTargetChangeRoutesThroughTheListenerPath is the
+// port-move case carrying an upstream change with it: PlanForwardSwap answers
+// SwapListener (the port moved, so there is no one-listener swap to perform),
+// the new listener binds first, and the node ends up serving the requested
+// target on the requested port.
+//
+// This is NOT the in-place-swap fallback (see
+// TestReplaceListenerTargetSwapAfterDrainFallsBackToRebuild for that): the
+// routing decision here is the plan's listener class, not a refused swap.
+func TestReplaceListenerPortAndTargetChangeRoutesThroughTheListenerPath(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	aPort, aServed := labeledServer(t, "a")
+	defer aServed()
+	bPort, _ := labeledServer(t, "b")
+	port := freePort(t)
+
+	base := relayCfg("move-and-target", port, addrFor(aPort), 2)
+	if _, err := tm.Apply(base); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer tm.StopAll()
+
+	// The port moved AND the target moved.
+	next := base.Clone()
+	next.IngressPort = freePort(t)
+	next.NextHop = addrFor(bPort)
+	next.Revision = 3
+	if _, err := tm.ReplaceListener(next); err != nil {
+		t.Fatalf("ReplaceListener (port + target): %v", err)
+	}
+	if got := servedLabel(t, addrFor(next.IngressPort)); got != "srv:b" {
+		t.Fatalf("target after port+target change = %q, want srv:b", got)
+	}
+	if cfg, ok := tm.Get("move-and-target"); !ok || cfg.Revision != 3 || cfg.IngressPort != next.IngressPort {
+		t.Fatalf("registered config after port+target change = %+v ok=%v", cfg, ok)
+	}
+}
+
+// TestReplaceListenerTargetSwapAfterDrainFallsBackToRebuild is the REAL
+// defensive exit of hotSwapUpstreamLocked, which the old
+// "TestReplaceListenerTargetSwapFallback..." never reached: it built a port +
+// target change, which PlanForwardSwap classifies as SwapListener, so the
+// fallback branch (SetUpstream refused) was dead code under test.
+//
+// The reachable case is a DRAINED tunnel. A drain ends the accept loop, so
+// SetUpstream on that forwarder answers ErrForwarderNotRunning; a revision
+// that then moves only the upstream still classifies as target_hot_swap, and
+// the manager must rebuild through Apply rather than fail the command and
+// leave the node running a config the panel no longer believes in.
+func TestReplaceListenerTargetSwapAfterDrainFallsBackToRebuild(t *testing.T) {
 	em := NewEgressManager()
 	tm := NewTunnelManager(em, "127.0.0.1")
 	aPort, aServed := labeledServer(t, "a")
@@ -534,21 +580,42 @@ func TestReplaceListenerTargetSwapFallbackKeepsNodeServing(t *testing.T) {
 	}
 	defer tm.StopAll()
 
-	// A plan the manager cannot honour in place: the port moved AND the
-	// target moved, so there is no one-listener swap to perform. The node
-	// must still end up serving the requested target.
+	// Drain first: the forwarder keeps its port reservation but takes no
+	// new work, so it must refuse the in-place swap that follows.
+	if err := tm.DrainTunnel("fallback", time.Second); err != nil {
+		t.Fatalf("DrainTunnel: %v", err)
+	}
+	// Sanity: the direct swap really is refused on a drained forwarder,
+	// which is what forces the manager down its fallback.
+	if err := tm.HotSwapUpstream("fallback", addrFor(bPort)); err == nil {
+		t.Fatal("HotSwapUpstream on a drained tunnel succeeded: the fallback below would never be reached")
+	}
+
+	// Upstream-only change on the same listener: still a target swap by
+	// classification, but the forwarder cannot take it.
 	next := base.Clone()
-	next.IngressPort = freePort(t)
 	next.NextHop = addrFor(bPort)
 	next.Revision = 3
-	if _, err := tm.ReplaceListener(next); err != nil {
-		t.Fatalf("ReplaceListener (port + target): %v", err)
+	rebuilt, err := tm.ReplaceListener(next)
+	if err != nil {
+		t.Fatalf("ReplaceListener after a refused swap: %v", err)
 	}
-	if got := servedLabel(t, addrFor(next.IngressPort)); got != "srv:b" {
-		t.Fatalf("target after port+target change = %q, want srv:b", got)
+	if !rebuilt.Running() {
+		t.Fatal("the rebuilt forwarder is not serving")
 	}
-	if cfg, ok := tm.Get("fallback"); !ok || cfg.Revision != 3 || cfg.IngressPort != next.IngressPort {
-		t.Fatalf("registered config after port+target change = %+v ok=%v", cfg, ok)
+	// The node ended up on the requested target and revision, on the same
+	// port, through the Apply rebuild.
+	if got := servedLabel(t, addrFor(port)); got != "srv:b" {
+		t.Fatalf("target after the fallback = %q, want srv:b", got)
+	}
+	if cfg, ok := tm.Get("fallback"); !ok || cfg.Revision != 3 || cfg.IngressPort != port {
+		t.Fatalf("registered config after the fallback = %+v ok=%v, want revision 3 on port %d", cfg, ok, port)
+	}
+	if cfg, _ := tm.Get("fallback"); cfg.UpstreamAddr() != addrFor(bPort) {
+		t.Fatalf("registered upstream = %q, want %q", cfg.UpstreamAddr(), addrFor(bPort))
+	}
+	if !tm.UsedPorts()[port] {
+		t.Fatal("the rebuild lost the port reservation")
 	}
 }
 
