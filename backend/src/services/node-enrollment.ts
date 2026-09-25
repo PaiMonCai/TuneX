@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from "node:crypto";
-import { join } from "node:path";
 import { db } from "../db.ts";
 import { env } from "../env.ts";
 import { generateNodeCredential, hashNodeCredential } from "./node-credential.ts";
@@ -68,6 +67,7 @@ function buildInstallCommand(node: {
   const args = [
     "--panel", shellQuote(panel),
     "--enroll-token", shellQuote(token),
+    "--agent-image", shellQuote(env.agentImage),
     "--role", shellQuote(roleFlag(node.role)),
   ];
   if (range && (node.role === "ingress" || node.role === "both" || node.role === null)) {
@@ -210,21 +210,13 @@ export function extractEnrollmentToken(authorization: string | null | undefined)
   return match?.[1]?.trim() || null;
 }
 
-export const AGENT_BINARY_NAMES = new Set([
-  "tunex-agent-linux-amd64",
-  "tunex-agent-linux-arm64",
-]);
-
-export function agentBinaryPath(name: string): string | null {
-  if (!AGENT_BINARY_NAMES.has(name)) return null;
-  const root = process.env.TUNEX_AGENT_DIST_DIR?.trim() || "/app/agent-dist";
-  return join(root, name);
-}
-
 /**
- * POSIX installer served by the Panel. It downloads the Agent binary from the
- * same Panel image, exchanges the short-lived enrollment token only after the
- * binary is present, writes a root-only EnvironmentFile and starts systemd.
+ * Docker-first installer served by the Panel.
+ *
+ * The host script installs Docker Engine when missing, pulls the configured
+ * slim Agent image before consuming enrollment, then stores the long-lived
+ * credential in a root-only host file. The container only gets a read-only
+ * bind mount of that file, so docker inspect does not expose the credential.
  */
 export function renderNodeInstallScript(): string {
   return `#!/bin/sh
@@ -232,6 +224,7 @@ set -eu
 
 PANEL=""
 TOKEN=""
+AGENT_IMAGE=""
 ROLE="BOTH"
 INGRESS_RANGE=""
 EGRESS_RANGE=""
@@ -240,6 +233,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --panel) PANEL="$2"; shift 2 ;;
     --enroll-token) TOKEN="$2"; shift 2 ;;
+    --agent-image) AGENT_IMAGE="$2"; shift 2 ;;
     --role) ROLE="$2"; shift 2 ;;
     --ingress-range) INGRESS_RANGE="$2"; shift 2 ;;
     --egress-range) EGRESS_RANGE="$2"; shift 2 ;;
@@ -249,31 +243,43 @@ done
 
 [ -n "$PANEL" ] || { echo "tunex install: --panel is required" >&2; exit 2; }
 [ -n "$TOKEN" ] || { echo "tunex install: --enroll-token is required" >&2; exit 2; }
+[ -n "$AGENT_IMAGE" ] || { echo "tunex install: --agent-image is required" >&2; exit 2; }
 
 case "$(uname -s)" in
   Linux) ;;
   *) echo "tunex install: only Linux is supported" >&2; exit 3 ;;
 esac
 
-case "$(uname -m)" in
-  x86_64|amd64) ARTIFACT="tunex-agent-linux-amd64" ;;
-  aarch64|arm64) ARTIFACT="tunex-agent-linux-arm64" ;;
-  *) echo "tunex install: unsupported architecture $(uname -m)" >&2; exit 3 ;;
-esac
+if ! command -v docker >/dev/null 2>&1; then
+  echo "TuneX: Docker Engine not found; installing Docker..."
+  TMP_DOCKER="$(mktemp)"
+  trap 'rm -f "$TMP_DOCKER"' EXIT INT TERM
+  curl -fsSL https://get.docker.com -o "$TMP_DOCKER"
+  sh "$TMP_DOCKER"
+  rm -f "$TMP_DOCKER"
+  trap - EXIT INT TERM
+fi
 
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT INT TERM
-curl -fsSL "$PANEL/api/internal/node/binary/$ARTIFACT" -o "$TMP"
-chmod 0755 "$TMP"
-install -m 0755 "$TMP" /usr/local/bin/tunex-agent
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl enable --now docker >/dev/null 2>&1 || true
+fi
+
+docker info >/dev/null 2>&1 || {
+  echo "tunex install: Docker daemon is not available" >&2
+  exit 4
+}
+
+# Pull first so a registry/network error does not consume the one-time token.
+echo "TuneX: pulling Agent image $AGENT_IMAGE ..."
+docker pull "$AGENT_IMAGE"
 
 CREDENTIAL="$(curl -fsS -X POST \
   -H "Authorization: Enrollment $TOKEN" \
   -H "Accept: text/plain" \
   "$PANEL/api/internal/node/enroll")"
-[ -n "$CREDENTIAL" ] || { echo "tunex install: enrollment returned an empty credential" >&2; exit 4; }
+[ -n "$CREDENTIAL" ] || { echo "tunex install: enrollment returned an empty credential" >&2; exit 5; }
 
-install -d -m 0755 /etc/tunex-agent
+install -d -m 0700 /etc/tunex-agent
 {
   printf '%s\n' "TUNEX_PANEL_HTTP_URL=$PANEL"
   printf '%s\n' "TUNEX_NODE_CREDENTIAL=$CREDENTIAL"
@@ -284,26 +290,22 @@ install -d -m 0755 /etc/tunex-agent
 } > /etc/tunex-agent/agent.env
 chmod 0600 /etc/tunex-agent/agent.env
 
-cat > /etc/systemd/system/tunex-agent.service <<'UNIT'
-[Unit]
-Description=TuneX Agent
-After=network-online.target
-Wants=network-online.target
+docker rm -f tunex-agent >/dev/null 2>&1 || true
 
-[Service]
-Type=simple
-EnvironmentFile=/etc/tunex-agent/agent.env
-ExecStart=/usr/local/bin/tunex-agent
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
+docker run -d \
+  --name tunex-agent \
+  --restart unless-stopped \
+  --network host \
+  --security-opt no-new-privileges:true \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  --log-opt max-size=20m \
+  --log-opt max-file=3 \
+  -v /etc/tunex-agent/agent.env:/run/tunex-agent/agent.env:ro \
+  "$AGENT_IMAGE" >/dev/null
 
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-systemctl enable --now tunex-agent
-echo "TuneX Agent installed and started."
+echo "TuneX Agent deployed with Docker."
+echo "Check status: docker ps --filter name=tunex-agent"
+echo "View logs:   docker logs -f tunex-agent"
 `;
 }
