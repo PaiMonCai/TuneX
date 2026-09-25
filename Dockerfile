@@ -5,8 +5,8 @@
 #   - Backend / Worker / DB migration: Bun + Prisma
 #   - Web: Next.js standalone on Node 24
 #
-# Compose still runs one process per container. MySQL, Redis, Caddy and Agent
-# remain separate artifacts with independent lifecycles.
+# Compose still runs one process per container. MySQL, Redis, Caddy and the
+# dedicated multi-arch Agent image remain separate artifacts with independent lifecycles.
 
 FROM node:24-bookworm-slim AS web-deps
 WORKDIR /build/web
@@ -32,14 +32,6 @@ ENV NODE_ENV=production \
     NEXT_PUBLIC_PAYMENTS_ENABLED=${NEXT_PUBLIC_PAYMENTS_ENABLED}
 RUN npm run build
 
-FROM golang:1.22-bookworm AS agent-builder
-WORKDIR /build/agent
-COPY agent/go.mod ./
-COPY agent ./
-RUN mkdir -p /out \
-    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -o /out/tunex-agent-linux-amd64 . \
-    && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -o /out/tunex-agent-linux-arm64 .
-
 FROM oven/bun:1-debian AS backend-builder
 WORKDIR /build/backend
 COPY backend/package.json backend/bun.lock ./
@@ -64,11 +56,6 @@ COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 
 # Backend keeps Prisma CLI because db-migrate is a runtime role of this image.
 COPY --from=backend-builder /build/backend /app/backend
-
-# Panel-served installer assets. Agent still runs as a separate node process;
-# bundling both Linux architectures here only makes one-click installation
-# version-locked to the Panel image.
-COPY --from=agent-builder /out /app/agent-dist
 
 # Next standalone includes the minimal server/runtime dependency graph. Static
 # and public assets are copied separately per Next.js standalone requirements.
