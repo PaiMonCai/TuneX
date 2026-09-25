@@ -51,6 +51,9 @@ func ParseTunnelMode(s string) (TunnelMode, error) {
 }
 
 // LBStrategy selects how an EGRESS tunnel spreads connections over its pool.
+// The values are the devmap §3 enum names; ParseLBStrategy also accepts the
+// panel's short EgressPool spellings ("round" / "rand" / "weighted_round") so
+// a payload from either side of the wire is understood.
 type LBStrategy string
 
 const (
@@ -58,15 +61,22 @@ const (
 	LBRoundRobin LBStrategy = "ROUND_ROBIN"
 	// LBRandom picks a uniformly random target per connection.
 	LBRandom LBStrategy = "RANDOM"
+	// LBWeightedRoundRobin spreads connections proportionally to weight.
+	LBWeightedRoundRobin LBStrategy = "WEIGHTED_ROUND_ROBIN"
 )
 
-// ParseLBStrategy normalises a wire value.
+// ParseLBStrategy normalises a wire value. Both the long devmap names and the
+// short EgressPool names ("round" / "rand" / "weighted_round") resolve to the
+// same policy. Unknown strategies are an error: silently falling back would
+// route live traffic under a policy the operator did not choose.
 func ParseLBStrategy(s string) (LBStrategy, error) {
-	switch LBStrategy(strings.ToUpper(strings.TrimSpace(s))) {
-	case LBRoundRobin:
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case string(LBRoundRobin), "ROUND":
 		return LBRoundRobin, nil
-	case LBRandom:
+	case string(LBRandom), "RAND":
 		return LBRandom, nil
+	case string(LBWeightedRoundRobin), "WEIGHTED_ROUND", "WEIGHTED":
+		return LBWeightedRoundRobin, nil
 	default:
 		return "", fmt.Errorf("forwarder: unknown lb strategy %q", s)
 	}

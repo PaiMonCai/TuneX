@@ -37,14 +37,14 @@ type blockingConn struct {
 	r blockingReader
 }
 
-func (c blockingConn) Read(p []byte) (int, error)             { return c.r.Read(p) }
-func (c blockingConn) Write(p []byte) (int, error)            { return len(p), nil }
-func (c blockingConn) Close() error                           { return nil }
-func (c blockingConn) LocalAddr() net.Addr                    { return dummyAddr{} }
-func (c blockingConn) RemoteAddr() net.Addr                   { return dummyAddr{} }
-func (c blockingConn) SetDeadline(time.Time) error            { return nil }
-func (c blockingConn) SetReadDeadline(time.Time) error        { return nil }
-func (c blockingConn) SetWriteDeadline(time.Time) error       { return nil }
+func (c blockingConn) Read(p []byte) (int, error)       { return c.r.Read(p) }
+func (c blockingConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c blockingConn) Close() error                     { return nil }
+func (c blockingConn) LocalAddr() net.Addr              { return dummyAddr{} }
+func (c blockingConn) RemoteAddr() net.Addr             { return dummyAddr{} }
+func (c blockingConn) SetDeadline(time.Time) error      { return nil }
+func (c blockingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c blockingConn) SetWriteDeadline(time.Time) error { return nil }
 
 // fastConn ends its read direction as soon as closed is closed.
 type fastConn struct {
@@ -627,7 +627,6 @@ func TestPipeConnsHalfClosesAndDrains(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // DirectForwarder
 // ---------------------------------------------------------------------------
@@ -861,12 +860,16 @@ func TestRelayForwarderForwardsToNextHop(t *testing.T) {
 	}
 	conn.Close()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for f.Stats() == 0 && time.Now().Before(deadline) {
+	// Poll to the exact total instead of a bare "not zero yet" check: the
+	// relay pair drains asynchronously, so a Stats observed mid-flight is a
+	// timing artefact, not a bug. Both directions carry len(msg) bytes.
+	want := int64(2 * len(msg))
+	deadline := time.Now().Add(5 * time.Second)
+	for f.Stats() != want && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := f.Stats(); got != int64(2*len(msg)) {
-		t.Fatalf("Stats = %d, want %d", got, 2*len(msg))
+	if got := f.Stats(); got != want {
+		t.Fatalf("Stats = %d, want %d", got, want)
 	}
 }
 
