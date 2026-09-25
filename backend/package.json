@@ -9,13 +9,12 @@
     "worker": "bun src/worker.ts",
     "build": "bun build src/index.ts --target=bun --external external --outdir=dist && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
+    "test": "node --experimental-transform-types --test tests/*.test.mjs",
+    "test:unit": "bun test src/services/__tests__/ src/__tests__/",
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
     "generate": "prisma generate",
-    "seed": "bun prisma/seed.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --test tests/*.test.mjs"
+    "seed": "bun prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "6.13.0",
