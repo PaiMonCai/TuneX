@@ -166,6 +166,9 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
   if (!group) return c.json({ error: "节点组不存在" }, 404);
 
   const role = parsed.data.role ?? (group.node_type === "in" ? "ingress" : "egress");
+  if ((role === "egress" || role === "both") && (parsed.data.targets?.length ?? 0) === 0) {
+    return c.json({ error: "egress / both 节点 provision 时至少需要一个出口目标" }, 400);
+  }
   const range = group.port_range?.split("-").map(Number) ?? [];
   const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
   const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
@@ -211,9 +214,6 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
 
       if (role === "egress" || role === "both") {
         const targets = parsed.data.targets ?? [];
-        if (targets.length === 0) {
-          return { invalidTargets: true } as const;
-        }
         await tx.egressPool.create({
           data: {
             node_id: node.id,
@@ -244,9 +244,6 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       return { node } as const;
     });
 
-    if ("invalidTargets" in reserved && reserved.invalidTargets) {
-      return c.json({ error: "egress / both 节点 provision 时至少需要一个出口目标" }, 400);
-    }
     const denied = "denied" in reserved ? reserved.denied : null;
     if (denied) {
       return c.json({
