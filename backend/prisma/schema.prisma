@@ -378,7 +378,11 @@ model Node {
   id          Int      @id @default(autoincrement())
   weight      Int      @default(1)
   status      Status   @default(active)
+  /// 用户可读节点名/标签，可改名；不再承担物理 Agent 身份。
   node_id     String   @unique @db.VarChar(255)
+  /// Panel 生成且不可变的物理 Agent 唯一 ID。角色可在 ingress/egress/both 间调整，
+  /// agent_id 不随角色、hostname、显示名变化。
+  agent_id    String   @unique @default(uuid()) @db.VarChar(64)
   /// Panel 可先创建未注册节点；首次 enrollment 后写入面板观察到的连接 IP。
   connect_ip  String?  @db.VarChar(255)
   version     String   @default("unknown") @db.VarChar(255)
