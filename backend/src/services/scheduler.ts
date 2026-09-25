@@ -911,7 +911,7 @@ export async function createRelayTunnel(
       { tunnelId },
     );
   }
-  const egressPick = pickNode(outCandidates as unknown as SchedulableNode[], "egress", now);
+  const egressPick = pickNode(outCandidates, "egress", now);
   if (!egressPick.ok) {
     return fail(
       "bind_nodes",
@@ -1247,8 +1247,6 @@ export async function reapplyRelayTunnel(
     );
   }
   if (row.tunnel_mode !== "relay") {
-    // DIRECT 的重推是 legacy config-pusher 的领域（socket 推送），
-    // 不走 v3 编排器：它没有 egress 端、也不需要 revision 闸门。
     return fail(
       "bind_nodes",
       SCHEDULER_ERROR_CODES.mode_topology_mismatch,
@@ -1272,11 +1270,22 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true } });
 
   /* ---------------- ③ bind nodes ---------------- */
-  const [inCandidates, outCandidates] = await Promise.all([
+  const [inCandidatesRaw, outCandidatesRaw] = await Promise.all([
     store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
     store.node.findMany({ where: { node_group_id: outNodeGroupId }, orderBy: { id: "asc" } }),
   ]);
-  const ingressPick = pickNode(inCandidates as unknown as SchedulableNode[], "ingress", now);
+  // Initial apply may schedule from the group. Once concrete placement exists,
+  // retry/resume must stay on those exact Nodes: no silent migration on a
+  // transient failure. Explicit topology changes are a separate user action.
+  const boundIngressId = row.ingress_node_id == null ? null : Number(row.ingress_node_id);
+  const boundEgressId = row.egress_node_id == null ? null : Number(row.egress_node_id);
+  const inCandidates = (inCandidatesRaw as unknown as SchedulableNode[]).filter(
+    (node) => boundIngressId === null || node.id === boundIngressId,
+  );
+  const outCandidates = (outCandidatesRaw as unknown as SchedulableNode[]).filter(
+    (node) => boundEgressId === null || node.id === boundEgressId,
+  );
+  const ingressPick = pickNode(inCandidates, "ingress", now);
   if (!ingressPick.ok) {
     return fail(
       "bind_nodes",
