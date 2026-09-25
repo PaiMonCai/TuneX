@@ -34,6 +34,10 @@ function isIngress(node: UserNode) {
   return node.role === "ingress" || node.role === "both";
 }
 
+function isEgress(node: UserNode) {
+  return node.role === "egress" || node.role === "both";
+}
+
 export function ForwardWorkspace() {
   const { t } = useI18n();
   const [nodes, setNodes] = useState<UserNode[]>([]);
@@ -50,11 +54,26 @@ export function ForwardWorkspace() {
   const [listenPort, setListenPort] = useState("");
   const [targetHost, setTargetHost] = useState("");
   const [targetPort, setTargetPort] = useState("");
+  const [bindEgressId, setBindEgressId] = useState("");
+  const [bindingBusy, setBindingBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<number | null>(null);
 
   const ingressNodes = useMemo(() => nodes.filter(isIngress), [nodes]);
   const selectedBindings = ingressId ? bindings[Number(ingressId)] ?? [] : [];
+  const availableEgressNodes = useMemo(() => {
+    if (!ingressId) return [];
+    const ingress = Number(ingressId);
+    const bound = new Set(
+      (bindings[ingress] ?? []).map((binding) => Number(binding.egress_node_id)),
+    );
+    return nodes.filter(
+      (node) =>
+        isEgress(node) &&
+        Number(node.id) !== ingress &&
+        !bound.has(Number(node.id)),
+    );
+  }, [nodes, bindings, ingressId]);
 
   async function load() {
     setLoading(true);
@@ -112,7 +131,35 @@ export function ForwardWorkspace() {
     setListenPort("");
     setTargetHost("");
     setTargetPort("");
+    setBindEgressId("");
     setCreateOpen(true);
+  }
+
+  async function bindSelectedEgress() {
+    const ingress = Number(ingressId);
+    const egress = Number(bindEgressId);
+    if (!Number.isInteger(ingress) || !Number.isInteger(egress)) return;
+
+    setBindingBusy(true);
+    try {
+      const binding = await api.nodes.bindEgress(ingress, egress);
+      setBindings((current) => {
+        const existing = current[ingress] ?? [];
+        const next = existing.some(
+          (row) => Number(row.egress_node_id) === Number(binding.egress_node_id),
+        )
+          ? existing
+          : [...existing, binding];
+        return { ...current, [ingress]: next };
+      });
+      setEgressId(String(binding.egress_node_id));
+      setBindEgressId("");
+      toast.success(t("node.bindSuccess"));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("forward.bindFailed"));
+    } finally {
+      setBindingBusy(false);
+    }
   }
 
   async function createForward() {
@@ -386,6 +433,7 @@ export function ForwardWorkspace() {
                   onValueChange={(value) => {
                     setIngressId(value);
                     setEgressId("");
+                    setBindEgressId("");
                   }}
                 >
                   <SelectTrigger><SelectValue placeholder={t("forward.chooseIngress")} /></SelectTrigger>
@@ -401,26 +449,64 @@ export function ForwardWorkspace() {
 
               {createMode === "relay" ? (
                 <Field label={t("forward.egressNode")}>
-                  {selectedBindings.length === 0 ? (
-                    <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
-                      <div>{t("forward.noBoundEgress")}</div>
-                      <div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div>
-                      <Button className="mt-3" size="sm" variant="outline" asChild>
-                        <Link href="/nodes">{t("common.nodes")}</Link>
-                      </Button>
-                    </div>
-                  ) : (
-                    <Select value={egressId} onValueChange={setEgressId}>
-                      <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
-                      <SelectContent>
-                        {selectedBindings.map((binding) => (
-                          <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
-                            {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
+                  <div className="flex flex-col gap-3">
+                    {selectedBindings.length > 0 ? (
+                      <Select value={egressId} onValueChange={setEgressId}>
+                        <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
+                        <SelectContent>
+                          {selectedBindings.map((binding) => (
+                            <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
+                              {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
+                        <div>{t("forward.noBoundEgress")}</div>
+                        <div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div>
+                      </div>
+                    )}
+
+                    {availableEgressNodes.length > 0 ? (
+                      <div className="rounded-md border border-[var(--border)] p-3">
+                        <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">
+                          {selectedBindings.length > 0
+                            ? t("forward.bindAnotherEgress")
+                            : t("forward.bindInline")}
+                        </div>
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <Select value={bindEgressId} onValueChange={setBindEgressId}>
+                            <SelectTrigger className="min-w-0 flex-1">
+                              <SelectValue placeholder={t("forward.chooseUnboundEgress")} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {availableEgressNodes.map((node) => (
+                                <SelectItem key={String(node.id)} value={String(node.id)}>
+                                  {node.node_id} · {node.connect_ip ?? t("node.waiting")}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => void bindSelectedEgress()}
+                            disabled={bindingBusy || !bindEgressId}
+                          >
+                            {t("forward.bindAndUse")}
+                          </Button>
+                        </div>
+                      </div>
+                    ) : selectedBindings.length === 0 ? (
+                      <div className="text-xs text-[var(--muted-foreground)]">
+                        {t("forward.noAvailableEgress")}{" "}
+                        <Link href="/nodes" className="underline underline-offset-2">
+                          {t("common.nodes")}
+                        </Link>
+                      </div>
+                    ) : null}
+                  </div>
                 </Field>
               ) : null}
 
@@ -453,7 +539,7 @@ export function ForwardWorkspace() {
               disabled={
                 busy ||
                 ingressNodes.length === 0 ||
-                (createMode === "relay" && selectedBindings.length === 0)
+                (createMode === "relay" && (!egressId || selectedBindings.length === 0))
               }
             >
               {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
