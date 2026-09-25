@@ -60,6 +60,7 @@ function rangeValue(min: number | null, max: number | null): string | null {
 }
 
 function buildInstallCommand(node: {
+  node_id: string;
   agent_id: string;
   role: "ingress" | "egress" | "both" | null;
   port_range_min: number | null;
@@ -72,6 +73,7 @@ function buildInstallCommand(node: {
     "--enroll-token", shellQuote(token),
     "--agent-image", shellQuote(env.agentImage),
     "--agent-id", shellQuote(node.agent_id),
+    "--node-id", shellQuote(node.node_id),
     "--role", shellQuote(roleFlag(node.role)),
   ];
   if (range && (node.role === "ingress" || node.role === "both" || node.role === null)) {
@@ -232,6 +234,7 @@ PANEL=""
 TOKEN=""
 AGENT_IMAGE=""
 AGENT_ID=""
+NODE_ID=""
 ROLE="BOTH"
 INGRESS_RANGE=""
 EGRESS_RANGE=""
@@ -242,6 +245,7 @@ while [ "$#" -gt 0 ]; do
     --enroll-token) TOKEN="$2"; shift 2 ;;
     --agent-image) AGENT_IMAGE="$2"; shift 2 ;;
     --agent-id) AGENT_ID="$2"; shift 2 ;;
+    --node-id) NODE_ID="$2"; shift 2 ;;
     --role) ROLE="$2"; shift 2 ;;
     --ingress-range) INGRESS_RANGE="$2"; shift 2 ;;
     --egress-range) EGRESS_RANGE="$2"; shift 2 ;;
@@ -253,6 +257,7 @@ done
 [ -n "$TOKEN" ] || { echo "tunex install: --enroll-token is required" >&2; exit 2; }
 [ -n "$AGENT_IMAGE" ] || { echo "tunex install: --agent-image is required" >&2; exit 2; }
 [ -n "$AGENT_ID" ] || { echo "tunex install: --agent-id is required" >&2; exit 2; }
+[ -n "$NODE_ID" ] || { echo "tunex install: --node-id is required" >&2; exit 2; }
 
 case "$(uname -s)" in
   Linux) ;;
@@ -292,6 +297,7 @@ install -d -m 0700 /etc/tunex-agent
 {
   printf '%s\n' "TUNEX_PANEL_HTTP_URL=$PANEL"
   printf '%s\n' "TUNEX_AGENT_ID=$AGENT_ID"
+  printf '%s\n' "TUNEX_NODE_ID=$NODE_ID"
   printf '%s\n' "TUNEX_NODE_CREDENTIAL=$CREDENTIAL"
   printf '%s\n' "TUNEX_ROLE=$ROLE"
   printf '%s\n' "TUNEX_AGENT_ADMIN_PORT=0"
