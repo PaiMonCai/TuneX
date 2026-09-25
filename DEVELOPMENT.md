@@ -1,24 +1,36 @@
-# TuneX v3 唯一开发方案
+# TuneX V4 唯一开发方案
 
 > **文档地位：本文件是 TuneX 唯一可执行的开发方案（Single Source of Truth）。**
 >
 > 后续功能设计、Issue、分支、PR、验收与发布均以本文件为准。不得再创建第二份路线图、迁移方案或并行开发计划。
 >
-> `docs/tunex-devmap-v3.md` 是 **v3 目标架构约束**：规定产品最终形态和关键能力，但不是执行清单。若其中旧目录、旧传输方式或早期实现细节与当前代码事实冲突，以本文件的迁移安全规则为实施准则，同时不得改变 v3map 的核心产品语义。
+> `docs/tunex-devmap-v3.md` 是 **已完成的 v3 架构基线约束**：规定底层 Node / Tunnel / runtime 的关键语义，但不是 V4 执行清单。V4 以本文件为唯一开发计划；若旧文档中的目录、传输方式或产品入口与当前代码事实冲突，以本文件和 `main` 为准，同时不得破坏已经稳定的 v3 runtime 不变式。
 >
 > `docs/production-deploy.md` 是运维手册；`reports/` 是历史验证证据。它们都不是开发路线。
 
 ---
 
-## 1. 后续唯一方向
+## 1. 后续唯一方向：V4 产品完成度
 
-TuneX 的核心 v3 网络架构升级、WP14 Real E2E Gate、WP15 DIRECT v3 Migration，以及 V4 的 Node + Forward 产品层收敛均已进入 `main`。
+TuneX 的核心 v3 网络架构升级、WP14 Real E2E Gate、WP15 DIRECT v3 Migration，以及 V4.0 的 Node + Forward 产品入口收敛均已进入 `main`。
 
-当前主线从“迁移旧架构”切换为：
+V4 从现在开始正式定义为：
 
-**稳定单一 v3 runtime 与 V4 Node + Forward 产品面；新增协议和高级能力统一进入 WP16+ 独立工作包。**
+**细节优化 + 功能补全 + 生命周期闭环。**
 
-后续仍保留已经稳定的 Workspace、权限、策略额度、流量、认证、CI 和生产运维底座。网络层的事实源已经收敛为 Node 角色、Forward/Tunnel desired state、具体 ingress/egress binding、NodePortLease、revision/ACK 和 Reconciler；不得重新引入第二套 DIRECT engine、第二套端口所有权或第二套用户侧 Tunnel 产品模型。
+V4 不是第二次架构重写，也不以增加 UDP / QUIC / multi-hop 等新协议为主目标。它要把已经能跑的 TCP DIRECT / RELAY 做成完整、可编辑、可维护、可监控、权限边界清晰的产品。
+
+V4 的优先级固定为：
+
+1. **Forward 完整生命周期**：创建时可设置的业务字段，创建后原则上全部可编辑；业务资源 ID 不因修改而变化。
+2. **Agent 热重载**：Forward 修改通过 revision / desired state 下发，Agent 不因普通配置修改重启进程或容器。
+3. **Node 托管生命周期**：采用 V4 托管版模型，区分 Connection / Lifecycle / Health，并支持维护、停用、退役和安全删除。
+4. **Agent 主动状态上报**：继续沿用 outbound-only 控制链，扩展现有 `NodeStateReport`，为节点监控和健康判断提供事实。
+5. **监控与交互补全**：让错误可解释、可行动；让 Dashboard、Forward、Node 页面围绕用户任务而不是内部 runtime 字段组织。
+6. **权限模型收敛**：在产品资源和生命周期稳定后，最后统一澄清 Workspace RBAC、资源作用域、Capability/Quota、NodeGroupGrant 的边界，并决定 NodeGroup 的最终用户语义。
+7. **稳定发布与兼容收尾**：真实 E2E 覆盖编辑/热重载/维护/退役；deprecated API 是否移除由独立 breaking-change 决策，不夹带在普通功能 PR 中。
+
+后续仍保留已经稳定的 Workspace、认证、策略额度、流量、CI 和生产运维底座。网络层的事实源已经收敛为 Node 角色、Forward/Tunnel desired state、具体 ingress/egress binding、NodePortLease、revision/ACK 和 Reconciler；V4 **不得**重新引入第二套 DIRECT engine、第二套端口所有权、第二套用户侧 Tunnel 产品模型或另一套 Agent 控制链。
 
 ### 1.1 v3 不可改变的产品约束
 
@@ -1301,7 +1313,7 @@ DoD 已落地：
 
 ### 7.17 WP16+ — 后续协议与高级能力
 
-WP14 之后按独立工作包继续并行，但每个能力必须自己走：
+V4 产品完成度 Gate 全部通过后，协议与高级网络能力再按独立工作包继续推进；每个能力必须自己走：
 
 ```text
 contract
@@ -1454,7 +1466,7 @@ Gate F6  DIRECT v3 migrated             ✅（WP15）
 
 ## 9. CI 与发布门槛
 
-任何 v3 PR 至少满足受影响范围的全部检查；合入主线的阶段性 PR 必须整套 CI 全绿：
+任何 V4 PR 至少满足受影响范围的全部检查；合入主线的阶段性 PR 必须整套 CI 全绿：
 
 ### Backend
 
@@ -1554,7 +1566,7 @@ PR 描述必须包含：
 
 ## 12. 当前开发状态
 
-核心 v3 / V4 收敛阶段已经完成。当前 `main` 的发布链为：
+核心 v3 runtime 与 V4.0 Node + Forward 产品入口已经稳定进入 `main`。当前发布链保持：
 
 ```text
 PR CI + Integration
@@ -1564,7 +1576,7 @@ PR CI + Integration
 → Release
 ```
 
-### 当前 Integration Gate
+### 已完成的历史 Gate
 
 ```text
 Gate F0  文档/架构冻结                 ✅
@@ -1574,43 +1586,18 @@ Gate F3  RELAY Control Plane integrated ✅
 Gate F4  API/Web integrated             ✅
 Gate F5  Real E2E passed                ✅（WP14）
 Gate F6  DIRECT v3 migrated             ✅（WP15）
+V4.0     Node + Forward 产品入口收敛    ✅
 ```
 
-### 已完成的核心 Work Package
+### V4 当前执行状态
 
 ```text
-WP0  架构/文档冻结             ✅
-WP1  v3 Schema 契约            ✅
-WP2  Legacy Backfill           ✅
-WP3  NodePortLease / Allocator ✅
-WP4  Agent v3 Runtime          ✅
-WP5  TCP RELAY Data Plane      ✅
-WP6  Command / Revision / ACK  ✅
-WP7  Node Credential / State   ✅
-WP8  Scheduler + Orchestrator  ✅
-WP9  Reconciler / Retry        ✅
-WP10 Admin Node / Egress API   ✅
-WP11 Tunnel Runtime API        ✅
-WP12 Admin Web                 ✅
-WP13 Tunnel Web（历史产品层）   ✅
-WP14 Real E2E / Release Gate   ✅
-WP15 DIRECT v3 Migration       ✅
-V4   Node + Forward 产品层收敛 ✅
+V4-WP0  V4 产品/团队开发方案冻结       ✅（本计划）
+V4-WP1  Forward Revision Foundation     NEXT
+V4-WP5  Node Lifecycle Foundation       NEXT / 可与 WP1 做契约层并行
 ```
 
-### 当前 Active WP
-
-```text
-Active Core WP:
-- none
-```
-
-当前维护重点：
-
-1. 保持 Node = infrastructure、Forward = user business、Tunnel = internal runtime 的边界；
-2. 生产部署、升级、回滚、备份/恢复与告警演练；
-3. 管理 deprecated compatibility API 的生命周期；
-4. 新能力进入 WP16+，按独立 contract → implementation → tests → real E2E → release gate 推进。
+正式开发顺序、并行关系和 Gate 以第 13 节为准。V4 期间默认暂停新协议横向扩展；除阻断性安全/生产问题外，UDP、QUIC、multi-hop 等进入 V4 稳定版之后的 WP16+。
 
 ### Compatibility API（P1）
 
@@ -1630,3 +1617,539 @@ Active Core WP:
 - 新集成一律只使用 `/api/forwards`。
 
 后续开发、分支、PR 和合并判断继续以第 7 节的依赖规则与 Integration Gate 为准。
+
+---
+
+## 13. V4 产品完成度开发方案
+
+> **本节是当前团队的 Active Plan。**
+>
+> 第 7 节 WP0–WP15 保留为 v3 历史迁移记录；从本节开始，新开发统一使用 `V4-WPx` 编号。任何与本节冲突的旧“下一步”描述，以本节为准。
+
+### 13.1 V4 版本里程碑
+
+| 版本 | 目标 | 对应 WP | Release Gate |
+|---|---|---|---|
+| **V4.0** | Node + Forward 产品入口收敛 | 已完成 | ✅ |
+| **V4.1** | Forward 全字段编辑 + Agent 热重载 | V4-WP1～WP4 | Gate V4-F1 |
+| **V4.2** | 托管 Node 生命周期 + Agent 状态监控 | V4-WP5～WP7 | Gate V4-F2 |
+| **V4.3** | Dashboard / 诊断 / 列表规模化 / 交互补全 | V4-WP8～WP9 | Gate V4-F3 |
+| **V4.4** | 权限模型 + NodeGroup 最终语义 | V4-WP10 | Gate V4-F4 |
+| **V4.5** | 稳定版、真实 E2E、兼容 API 决策、文档收尾 | V4-WP11 | Gate V4-F5 |
+
+V4.1～V4.5 是产品完成度里程碑，不表示每个小版本都必须单独改变数据库主版本。所有数据库改动继续遵守 expand-and-contract。
+
+### 13.2 V4 团队 Track
+
+V4 延续四条长期 Track，但职责切换为产品完成度：
+
+| Track | V4 负责范围 | 主要目录 |
+|---|---|---|
+| **Track A — Data / Contract** | additive schema、Revision snapshot、Node lifecycle 字段、StateReport 扩展、迁移 | `backend/prisma`、shared types |
+| **Track B — Agent / Runtime** | Forward hot-reload、listener/upstream 切换、drain、Agent telemetry | `agent/` |
+| **Track C — Control Plane / API** | Forward update/preview、rollout orchestrator、Node lifecycle、health synthesis、权限 resolver | `backend/src/services`、`backend/src/routes` |
+| **Track D — Web / QA / Release** | Forward/Node 产品 UI、Dashboard、分页筛选、E2E、发布 Gate、文档 | `web/`、`scripts/`、CI |
+
+并行原则：
+
+- Contract 可以先冻结，Backend / Agent / Web 随后并行实现。
+- Web 可以基于冻结 contract + mock 提前开发，但不能在 Backend contract 未进入 main 时自行发明字段。
+- Agent 与 Control Plane 可以并行，但任何 command payload / ACK 变化必须先在 V4-WP1 或 V4-WP5 contract 中冻结。
+- 两个 PR 如果持续修改同一个核心文件，必须重新拆边界；不靠反复解决 merge conflict 维持“伪并行”。
+
+### 13.3 Forward 编辑模型（V4.1 硬约束）
+
+#### 13.3.1 产品语义
+
+**Forward 是长期业务资源，不是一次性配置。**
+
+创建时由用户设置的业务字段，创建后原则上全部允许编辑：
+
+- `name`
+- `mode: direct | relay`
+- `ingress_node_id`
+- `egress_node_id`
+- `listen_port`（含“自动分配”语义）
+- `target_host`
+- `target_port`
+
+以后创建表单新增新的普通业务字段时，默认也必须进入编辑模型；如果某字段创建后不可改，必须在 contract 中说明物理原因，不得因为实现方便而禁止编辑。
+
+Forward 编辑不得通过“删除旧 Forward + 创建新 Forward”实现：
+
+- `Forward.id / Tunnel.id` 保持不变；
+- 历史流量和审计上下文保留；
+- NodeBinding 是可复用基础设施关系，修改/删除 Forward 不自动删除 Binding；
+- RELAY 系统管理的 `forward-<tunnelId>` EgressPool 随当前 revision/topology 管理，不暴露给普通用户。
+
+#### 13.3.2 Revision Snapshot
+
+V4-WP1 必须为**运行态相关配置**引入不可变 Revision Snapshot。实现仍挂在内部 Tunnel runtime 上，不创建第二张用户业务真相表。
+
+概念模型：
+
+```text
+Forward / Tunnel #123
+├─ desired revision = 18
+├─ applied revision = 17
+├─ Revision 17 = 最后成功运行的完整 runtime config
+└─ Revision 18 = 用户最新保存的完整 desired config
+```
+
+Revision 至少能恢复：
+
+```text
+mode
+ingress_node_id
+egress_node_id
+requested listen_port / auto
+target_host
+target_port
+```
+
+要求：
+
+- Revision snapshot 不可原地修改；同一 `(tunnel_id, revision)` 唯一。
+- Tunnel 当前字段可以继续作为最新 desired projection / compatibility projection，但不能是唯一历史依据。
+- rename 等纯 metadata 修改不要求重启 runtime；是否记录 product history 可独立处理，但不得为了改名触发无意义的 Agent listener 重建。
+- Backend/Worker 重启后，只靠 DB revision + Agent state report + NodePortLease 就能继续/补偿 rollout。
+- Reconciler 永远朝**最新 desired revision**收敛，不依次 replay 用户维护期间产生的中间旧 revision。
+
+#### 13.3.3 Update API 与并发控制
+
+保留产品入口：
+
+```text
+PATCH /api/forwards/:id
+```
+
+V4 扩展为可修改全部 Forward 业务字段。请求可以是 partial patch，但 Backend 必须：
+
+```text
+读取当前 desired config
+→ 合并 patch 得到一份完整候选 config
+→ 对完整 config 一次性校验
+→ 生成一个新 revision
+→ 一次 rollout
+```
+
+禁止把一次用户编辑拆成多个独立 PATCH 形成临时非法状态。
+
+更新请求必须支持 optimistic concurrency（例如 `expected_revision`）。如果页面基于旧 revision 保存：
+
+```text
+409 revision_conflict
+→ 返回/提示最新 revision
+→ 用户刷新后重新确认
+```
+
+对于拓扑变化，Backend 应提供 preview/validation 能力，让 UI 在提交前知道：
+
+- 是否改变外部访问地址；
+- 是否需要新的 NodeBinding；
+- 新端口是否可用；
+- 哪些 Node 参与 PREPARE / DRAIN；
+- 是否会造成 listener replacement；
+- 明确的 warning / blocking reason。
+
+具体 endpoint 名在 V4-WP1 contract 冻结，但校验逻辑只能有一个 Service 实现，preview 与真实 update 不得各写一份规则。
+
+#### 13.3.4 Hot Reload 分类
+
+Agent **进程/容器不因 Forward 编辑重启**。不同修改按下列策略执行：
+
+| 修改 | Rollout | 用户可见影响 |
+|---|---|---|
+| 名称 | Control Plane only | 无数据面影响 |
+| Target Host / Port | 原 runtime 热换 upstream/target snapshot | 旧 TCP 连接继续；新连接走新目标 |
+| RELAY Egress | prepare 新 Egress → cutover Ingress → drain/cleanup 旧 Egress | Ingress listener 保持 |
+| DIRECT → RELAY | 先准备 Egress，ACK 后切 Ingress upstream | Ingress listener 保持 |
+| RELAY → DIRECT | Ingress 切直连 target，ACK 后撤旧 Egress | Ingress listener 保持 |
+| Listen Port | 先申请/监听新端口 → cutover → drain/释放旧 lease | 外部端口改变 |
+| Ingress Node | 新 Ingress 完整 prepare → ACK → effective ingress 切换 → 旧 Ingress drain | 外部 IP/地址可能改变，不能宣称客户端无感 |
+| 多字段同时改 | 一个完整 revision / 一个 rollout plan | 禁止暴露中间半配置状态 |
+
+“热重载”的保证是 Agent 进程不重启；涉及 listener/Node 迁移时允许创建新的 runtime 实例并 drain 旧实例。
+
+#### 13.3.5 统一 Rollout 五阶段
+
+所有 runtime 相关 Forward 编辑统一建模为：
+
+```text
+VALIDATE
+→ PREPARE
+→ CUTOVER
+→ DRAIN
+→ CLEANUP
+```
+
+失败规则：
+
+- VALIDATE / PREPARE 失败：旧 applied revision 完全不动。
+- PREPARE 成功、CUTOVER 前失败：回收新资源，旧 runtime 继续。
+- CUTOVER 后失败：优先 compensation 回最后 applied revision。
+- compensation 成功：业务继续跑旧 revision，产品状态展示“更新失败，上一版本仍运行”。
+- compensation 失败：进入 degraded/error，由 Reconciler 或人工 Retry 修复。
+- Cleanup 必须幂等；Backend 重启后可继续清理，不得因为进程中断永久泄漏 NodePortLease / Egress runtime。
+
+#### 13.3.6 Suspended / Maintenance 编辑
+
+Forward 处于 suspended 时允许编辑：
+
+```text
+保存最新 desired revision
+→ 不启动 runtime
+→ resume 时只应用最新 revision
+```
+
+Node 处于 maintenance 时，如果某次编辑需要该 Node：
+
+- 用户仍可保存 desired config；
+- 不要求把每个中间 revision 依次下发；
+- UI 标记“等待节点退出维护”；
+- Node 恢复 active 后由 Reconciler 应用最新 desired revision。
+
+### 13.4 Node 托管生命周期（V4.2 硬约束）
+
+V4 采用 **托管版 Node 生命周期**。Node 不再只用一个 `status` 表达全部含义。
+
+#### 13.4.1 三层状态
+
+```text
+Connection:
+  waiting | online | offline
+
+Lifecycle:
+  active | maintenance | disabled | retiring
+
+Health:
+  healthy | warning | error | unknown
+```
+
+语义：
+
+- **Connection**：由 Panel 收到 Agent 上报的时间、credential 状态等事实推导；不是用户可编辑状态。
+- **Lifecycle**：用户/管理员的期望管理状态；V4 新增独立字段，**不得复用现有 legacy `Node.status` 同时表示连接与生命周期**。
+- **Health**：Backend 根据事实计算；Agent 只上报原始状态，不允许一句 `health=healthy` 成为最终真相。
+
+#### 13.4.2 Lifecycle 行为
+
+**active**
+
+- 正常承载 Forward；
+- 接受新的 desired revision；
+- 可作为合法 Ingress/Egress 候选。
+
+**maintenance**
+
+- 用于服务器升级、重启、检查；
+- 已存在 runtime 尽量保持，不做隐式删除；
+- 不接受需要立即应用的新 runtime 变化，新的 desired revision 可以保存并等待；
+- 退出维护后 Reconciler 只应用最新 desired revision。
+
+**disabled**
+
+- 明确表示这台 Node 不再接受新的业务/拓扑选择；
+- 不能作为新 Forward、新 Binding 或迁移目标；
+- 不得静默级联删除现有 Forward；已有依赖如何处理必须在 UI 中显式展示并由用户处理。
+
+**retiring**
+
+- 删除前的退役阶段；
+- 不接受新业务；
+- 展示并锁定依赖清单；
+- 只有 Ingress Forward、Egress Forward、Binding、有效 runtime/lease 等依赖清空后才允许物理删除。
+
+#### 13.4.3 Node 可编辑字段
+
+V4 用户侧必须补齐 Node 生命周期操作：
+
+- 修改 `node_id` 显示名；
+- 修改 `role: ingress | egress | both`；
+- 修改端口范围；
+- 重新安装 Agent；
+- 进入/退出 maintenance；
+- disabled / re-enable；
+- 进入 retiring；
+- 删除；
+- credential rotate / revoke 的合适入口；
+- 查看 Agent version / 是否建议升级。
+
+`agent_id` 永久不可编辑。重新安装仍是同一个 Node/agent identity，不重建业务资源。
+
+角色或端口范围修改必须先做 impact check。例如 BOTH → EGRESS 时，如果它仍作为 Ingress 承载 Forward，Backend 必须阻止或要求先迁移，不得修改后再让业务随机报错。
+
+Node 删除永远不隐式级联删除 Forward。
+
+#### 13.4.4 Agent 自动状态上报
+
+V4 继续使用 outbound-only Agent → Panel 通道，扩展**现有** `NodeStateReport`，不得新造第二套 Node 监控真相。
+
+状态报告至少覆盖：
+
+- `agent_id` / Node identity 校验；
+- Agent version、启动时间/uptime；
+- hostname、OS、arch；
+- latest known/applied revision 摘要；
+- DIRECT / RELAY ingress / Egress runtime 数量；
+- active Forward / runtime 快照；
+- 实际占用端口；
+- 最近 runtime/apply error；
+- CPU / memory / disk / load 的轻量当前值。
+
+V4 第一阶段不把 Agent 做成完整 Prometheus exporter。系统资源指标用于诊断和 warning，核心监控事实仍是：
+
+```text
+Agent 是否在上报
+→ desired/applied 是否一致
+→ runtime 是否存在
+→ 端口是否真实占用
+→ 是否存在 apply/runtime error
+```
+
+Backend 根据这些事实计算 Health：
+
+- `healthy`：Connection online，关键 runtime/revision 一致，无持续错误；
+- `warning`：在线但 revision 落后、部分 Forward error、版本落后或资源接近阈值；
+- `error`：Agent/runtime 初始化失败或关键 runtime 持续不可用；
+- `unknown`：尚未安装/没有足够报告。
+
+Offline 是 Connection 状态，不等价于 Health=error。
+
+### 13.5 V4 权限模型目标（V4.4，最后实施）
+
+NodeGroup 暂时保持当前实现，**V4-WP10 之前不做大规模 NodeGroup 重构**。先把 Forward 与 Node 生命周期做稳定，再决定 NodeGroup 最终是“用户组织对象、调度对象、权限对象”中的哪几个角色。
+
+V4 的权限判断必须按五层拆开：
+
+```text
+1. Authentication   谁在调用？
+2. Workspace RBAC   这个身份能对该类资源做什么动作？
+3. Resource Scope   这个具体资源是否属于/授权给当前 Workspace？
+4. Capability/Quota 当前 Workspace 是否拥有该能力、是否超额度？
+5. Runtime Admission 当前 Node/Binding/Port/Lifecycle 是否满足运行条件？
+```
+
+硬规则：
+
+- **CapabilityPolicy/Quota 不是 RBAC。** “套餐允许 20 条 Forward”不能回答“这个 member 能不能删除别人的 Forward”。
+- **Node role/lifecycle/online 不是权限。** 它们属于 runtime admission。
+- **NodeGroupGrant 是资源作用域/共享机制，不应承担用户身份角色的职责。**
+- Agent credential 是机器身份认证，不参与普通用户 Workspace RBAC。
+- 用户侧资源名统一为 `forward`；兼容期内部仍可映射旧 `tunnel` permission，但 V4-WP10 必须给出最终迁移方案。
+- 权限拒绝、能力拒绝、额度拒绝、运行条件拒绝必须使用可区分的错误码，Web 才能给用户正确下一步。
+
+V4-WP10 必须先做“权限矩阵 + 资源作用域 + NodeGroup 语义”设计 PR，审查通过后才允许改 schema/API。禁止一边改 NodeGroup 一边临时发明权限规则。
+
+### 13.6 V4 Work Package 依赖矩阵
+
+| WP | 工作包 | Track | Depends-On | 主要 DoD |
+|---|---|---|---|---|
+| **V4-WP0** | Product / Team Contract Freeze | Shared | V4.0 | ✅ 本节冻结后作为唯一计划 |
+| **V4-WP1** | Forward Revision Foundation | A/C | WP0 | revision snapshot、full update contract、expected_revision、preview/validation、迁移测试 |
+| **V4-WP2** | Agent Hot Reload Primitives | B | WP1 contract | target/upstream 热换、listener replacement、drain、幂等 revision |
+| **V4-WP3** | Forward Rollout Orchestrator | C/B | WP1 + WP2 | VALIDATE→PREPARE→CUTOVER→DRAIN→CLEANUP、compensation、Reconciler 恢复 |
+| **V4-WP4** | Forward Edit Product UX | D | WP1 contract；merge 依赖 WP3 | 创建表单=编辑能力全集、impact warning、running-vs-desired、copy/result UX |
+| **V4-WP5** | Node Lifecycle Foundation | A/C | WP0 | lifecycle schema/API、impact check、maintenance/disabled/retiring/delete contract |
+| **V4-WP6** | Agent Telemetry & Node Health | B/C | WP5 state contract；Agent 部分建议在 WP2 后 | 扩展 NodeStateReport、health synthesis、版本/资源/runtime 状态 |
+| **V4-WP7** | Node Lifecycle Product UX | D | WP5 + WP6 | 安装等待闭环、维护/停用/退役、依赖预览、Node 详情监控 |
+| **V4-WP8** | Monitoring & Actionable Diagnostics | C/D | WP4 + WP7 | Dashboard 异常入口、用户状态语义、错误→下一步、隐藏默认内部 revision 细节 |
+| **V4-WP9** | Scale & Interaction Polish | C/D | WP4 | server pagination/filter/sort、Egress filter、auto-port 提示、复制 Forward、Binding usage、必要批量操作 |
+| **V4-WP10** | Authorization + NodeGroup Model | Shared | WP4 + WP7 + WP8 + WP9 | 权限矩阵、resource scope、Capability 分层、NodeGroup 最终语义与兼容迁移 |
+| **V4-WP11** | Stable Gate / Compatibility Decision | Shared/D | WP10 | Real E2E、升级/回滚演练、compat API 去留决策、README/运维文档、V4.5 release |
+
+### 13.7 团队开发步骤与并行波次
+
+V4 不按“所有人等一个 Step”开发，但合并有明确 Gate。
+
+#### Wave 0 — Contract Freeze
+
+```text
+V4-WP0
+→ 本开发方案进入 main
+→ V4 API / state / product invariants 冻结
+```
+
+#### Wave 1 — 两条 Foundation 并行
+
+```text
+Track A/C: V4-WP1 Forward Revision Foundation
+Track A/C: V4-WP5 Node Lifecycle Foundation
+```
+
+两者可以由不同开发者并行，但 schema migration 必须协调顺序，禁止双方各自重写同一 migration。
+
+WP1 contract 冻结后：
+
+```text
+Track B: V4-WP2 Agent Hot Reload
+Track D: V4-WP4 Forward UI 可用 mock 提前开发
+```
+
+WP5 state contract 冻结后：
+
+```text
+Track C: Node lifecycle service/API
+Track D: V4-WP7 Node UI 可用 mock 提前开发
+```
+
+#### Wave 2 — Runtime Integration
+
+```text
+WP1 + WP2
+→ V4-WP3 Forward Rollout Orchestrator
+→ Real E2E 扩展
+→ Gate V4-F1
+```
+
+Gate V4-F1 至少真实验证：
+
+- target host/port 热修改；
+- listen port 修改；
+- RELAY 换 Egress；
+- DIRECT ↔ RELAY；
+- Ingress migration；
+- multi-field single revision；
+- stale expected_revision 409；
+- update 失败时旧 applied revision 继续运行；
+- suspended edit + resume 最新 revision；
+- Backend/Agent 重启后 rollout/reconcile 可恢复。
+
+WP3 进入 main 且 Gate 绿后，WP4 才能最终 merge。
+
+#### Wave 3 — Managed Node
+
+Agent Track 在 WP2 稳定后进入 V4-WP6，避免两个大 Agent PR 同时长期修改 TunnelManager/上报主循环。
+
+```text
+WP5 + WP6
+→ V4-WP7
+→ Gate V4-F2
+```
+
+Gate V4-F2 至少验证：
+
+- waiting → online → offline；
+- active ↔ maintenance；
+- maintenance 期间保存 Forward，新 revision 等待；
+- 退出 maintenance 后只收敛到最新 revision；
+- disabled 不接受新业务；
+- retiring 显示依赖并阻止有依赖删除；
+- Agent 重装保持 agent_id / Node / Forward 关系；
+- role/port-range 修改 impact check；
+- state report / health / version / runtime/port facts 正确。
+
+#### Wave 4 — Product Polish
+
+```text
+V4-WP8 Monitoring
++
+V4-WP9 Scale/Interaction
+→ Gate V4-F3
+```
+
+重点不是增加新协议，而是让现有功能在真实规模下好用：
+
+- Dashboard 优先显示异常、离线、等待安装和快捷操作；
+- Forward/Node 普通页面使用产品状态，不默认暴露 raw revision/desired internals；
+- 错误必须给下一步动作；
+- Forward 列表改为服务端分页、筛选、排序；
+- 创建后清晰展示最终访问地址/auto port；
+- Binding 删除前显示使用量；
+- Tunnel 术语从普通用户文案中清理。
+
+#### Wave 5 — Permission / NodeGroup
+
+只有 Gate V4-F1～F3 全绿后启动 V4-WP10。
+
+顺序固定：
+
+```text
+现状审计
+→ 权限矩阵
+→ Resource Scope 模型
+→ Capability/Quota 分层
+→ NodeGroup 最终语义
+→ Compatibility Plan
+→ Schema/API migration
+→ Web
+→ Negative E2E
+```
+
+不得先改 NodeGroup 表结构再补权限设计。
+
+#### Wave 6 — V4 Stable
+
+V4-WP11：
+
+- 跑 V4 全量 Real E2E；
+- 生产部署 / Agent 重装 / Panel 升级 / 镜像回滚 / backup-restore 演练；
+- 检查 orphan EgressPool / NodePortLease / stale runtime；
+- 审核 deprecated `/api/tunnels` 与 node-scoped Forward API 的外部兼容窗口；
+- 如果决定删除旧 API，单独 breaking-change PR + release notes；
+- 更新 README / production deploy / migration notes；
+- Gate V4-F5 通过后标记 V4.5 stable。
+
+### 13.8 V4 Integration Gates
+
+```text
+Gate V4-F0  Product / Team Contract Frozen          ← V4-WP0
+Gate V4-F1  Forward Fully Editable + Hot Reload     ← WP1–WP4
+Gate V4-F2  Managed Node Lifecycle + Telemetry      ← WP5–WP7
+Gate V4-F3  Monitoring / Scale / UX Complete        ← WP8–WP9
+Gate V4-F4  Authorization / NodeGroup Model Stable  ← WP10
+Gate V4-F5  Real E2E / Ops / Compatibility Stable   ← WP11
+```
+
+只有对应 Gate 通过，才宣称该 V4 里程碑完成。单个 PR CI 绿不等于 V4 Gate 通过。
+
+### 13.9 V4 分支与 PR 约定
+
+新分支统一：
+
+```text
+feature/v4-wp1-forward-revisions
+feature/v4-wp2-agent-hot-reload
+feature/v4-wp3-forward-rollout
+feature/v4-wp4-forward-edit-web
+feature/v4-wp5-node-lifecycle
+feature/v4-wp6-node-telemetry
+feature/v4-wp7-node-lifecycle-web
+feature/v4-wp8-monitoring
+feature/v4-wp9-product-polish
+feature/v4-wp10-permissions-nodegroup
+test/v4-wp11-stable-gate
+```
+
+PR 描述在原有模板基础上增加：
+
+```text
+V4 Work Package:
+V4 Milestone:
+Product Behavior Changes:
+Desired/Applied Revision Impact:
+Node Lifecycle Impact:
+Hot Reload / Drain Impact:
+Permission Impact:
+Migration Impact:
+Rollback:
+Tests / Real E2E:
+```
+
+禁止用一个“v4-all”分支同时开发 WP1～WP10。
+
+### 13.10 V4 明确暂缓
+
+以下内容不因为 V4 开发而顺手加入：
+
+- UDP；
+- WS/TLS 新数据面；
+- QUIC；
+- advanced multi-target LB 产品化；
+- DNS；
+- multi-ingress HA；
+- automatic failover；
+- multi-hop。
+
+它们仍保留为 V4 稳定后的 WP16+。除非某能力是 V4 Forward 编辑/Node 生命周期的阻断项，否则不得抢占 V4-F1～F5 的主线资源。
+
