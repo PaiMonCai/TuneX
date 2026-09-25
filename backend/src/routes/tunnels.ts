@@ -300,14 +300,18 @@ tunnelsRoutes.post("/", async (c) => {
   if ("conflict" in reserved && reserved.conflict) {
     return c.json({ error: "监听端口已被占用" }, 409);
   }
+  if (!("tunnelId" in reserved) || typeof pendingTunnelId !== "number") {
+    return c.json({ error: "创建隧道失败：未生成 pending 记录" }, 500);
+  }
+  const pendingTunnelId = pendingTunnelId;
 
   const orchestrator = getOrchestrator();
   if (!orchestrator) {
-    const state = await getTunnelStateApi(reserved.tunnelId, workspace.id, { db: db as never });
-    return ok(c, state.ok ? state.tunnel : { id: reserved.tunnelId, apply_status: "pending" });
+    const state = await getTunnelStateApi(pendingTunnelId, workspace.id, { db: db as never });
+    return ok(c, state.ok ? state.tunnel : { id: pendingTunnelId, apply_status: "pending" });
   }
 
-  const applied = await reapplyDirectTunnel(reserved.tunnelId, orchestrator);
+  const applied = await reapplyDirectTunnel(pendingTunnelId, orchestrator);
   if (!applied.ok) {
     return c.json({
       error: applied.error,
@@ -316,9 +320,9 @@ tunnelsRoutes.post("/", async (c) => {
     }, 502);
   }
 
-  const state = await getTunnelStateApi(reserved.tunnelId, workspace.id, { db: db as never });
+  const state = await getTunnelStateApi(pendingTunnelId, workspace.id, { db: db as never });
   return ok(c, state.ok ? state.tunnel : {
-    id: reserved.tunnelId,
+    id: pendingTunnelId,
     tunnel_mode: "direct",
     apply_status: "active",
     config_revision: applied.revision,
