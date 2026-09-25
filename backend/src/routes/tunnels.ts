@@ -293,10 +293,11 @@ tunnelsRoutes.post("/", async (c) => {
     return { tunnelId: created.id } as const;
   });
 
-  if ("denied" in reserved) {
-    return c.json({ error: reserved.denied.message ?? "策略拒绝", code: reserved.denied.reason }, 403);
+  const denied = "denied" in reserved ? reserved.denied : null;
+  if (denied) {
+    return c.json({ error: denied.message ?? "策略拒绝", code: denied.reason }, 403);
   }
-  if ("conflict" in reserved) {
+  if ("conflict" in reserved && reserved.conflict) {
     return c.json({ error: "监听端口已被占用" }, 409);
   }
 
