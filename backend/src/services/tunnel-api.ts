@@ -190,6 +190,12 @@ export interface TunnelApiDb {
   node: {
     findUnique(args: unknown): Promise<unknown>;
   };
+  tunnelChain?: {
+    deleteMany(args: unknown): Promise<unknown>;
+  };
+  tunnelTraffic?: {
+    deleteMany(args: unknown): Promise<unknown>;
+  };
   nodeGroup: {
     findUnique(args: unknown): Promise<unknown>;
   };
@@ -790,6 +796,10 @@ export async function runTunnelAction(
     }
 
     await releaseLease({ tunnelId }).catch(() => {});
+    // Child rows are legacy relational data with restrictive FKs. Runtime must
+    // be withdrawn first, then children can be removed before the Tunnel row.
+    await pdb.tunnelChain?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
+    await pdb.tunnelTraffic?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
     await pdb.tunnel.delete({ where: { id: tunnel.id } }).catch((e: unknown) => {
       throw toTunnelApiError(e, "删除失败");
     });
