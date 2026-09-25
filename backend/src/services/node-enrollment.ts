@@ -151,7 +151,7 @@ export async function consumeNodeEnrollment(
         expires_at: true,
         used_at: true,
         revoked_at: true,
-        node: { select: { node_id: true } },
+        node: { select: { node_id: true, connect_ip: true } },
       },
     });
     if (
@@ -177,7 +177,7 @@ export async function consumeNodeEnrollment(
     await tx.node.update({
       where: { id: enrollment.node_id },
       data: {
-        ...(observedIp ? { connect_ip: observedIp } : {}),
+        ...(!enrollment.node.connect_ip && observedIp ? { connect_ip: observedIp } : {}),
         node_credential_hash: credentialHash,
         credential_revoked: false,
         credential_rotated_at: now,
