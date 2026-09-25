@@ -73,9 +73,10 @@ func (f *SingleHopForwarder) Running() bool { return f.pipeTracker.running() }
 // SetUpstream hot-swaps where new connections dial. The listener is not
 // touched, so this call cannot fail a bind and cannot drop a live connection.
 //
-// It refuses to act on a forwarder that was never started or was already
-// stopped: installing an address on a dead listener would tell the caller a
-// hot swap happened while the OS refuses every new connection.
+// It refuses to act on a forwarder that was never started, was already
+// stopped, or has been drained: installing an address on a listener that
+// cannot take a new connection would tell the caller a hot swap happened
+// while the OS would refuse every new connection.
 // ErrForwarderNotRunning is the honest answer there.
 func (f *SingleHopForwarder) SetUpstream(addr string) error {
 	if strings.TrimSpace(addr) == "" {
@@ -91,10 +92,15 @@ func (f *SingleHopForwarder) SetUpstream(addr string) error {
 	return nil
 }
 
-// Drain waits — bounded — for the in-flight connections to finish while the
-// listener stays bound. The port is released by the manager (Remove / the
-// replacement path), not here, so a drained tunnel keeps its reservation
-// until the rollout says otherwise.
+// Drain stops accepting new connections and waits — bounded — for the
+// in-flight connections to finish while the listener stays bound. The port is
+// released by the manager (Remove / the replacement path), not here, so a
+// drained tunnel keeps its reservation until the rollout says otherwise.
+//
+// Drain is irreversible: the accept loop has ended, so after it returns this
+// forwarder takes no new work and refuses swaps (a dial address nobody can
+// reach would be a lie about what the client sees). Teardown is Stop's job,
+// and it is safe to call at any point after a Drain.
 func (f *SingleHopForwarder) Drain(d time.Duration) error {
 	f.pipeTracker.drainFor(d)
 	return nil

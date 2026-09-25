@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -310,10 +311,18 @@ func TestSingleHopSetUpstreamConcurrentWithConnections(t *testing.T) {
 	t.Logf("dialed=%d swaps=200", atomic.LoadInt64(&dialed))
 }
 
-// TestSingleHopDrainKeepsListenerAndBoundsTheWait pins the Drain contract:
-// bounded wait (never longer than the package ceiling), listener still bound
-// afterwards, and an idle drain returns immediately.
-func TestSingleHopDrainKeepsListenerAndBoundsTheWait(t *testing.T) {
+// TestSingleHopDrainStopsAcceptingKeepsThePortAndBoundsTheWait pins the Whole
+// Drain contract in one run, against real sockets:
+//
+//   - "stop accepting": after a drain the port is still bound, but a new
+//     connection is NOT answered any more (the relay loop is gone) — the
+//     half of "drain" the old implementation missed;
+//   - "keeps the port": the port is still reserved for the owner that comes
+//     next, and Running() still reports true;
+//   - "bounded": neither d <= 0 nor an absurd timeout waits, while a real
+//     in-flight connection makes the drain wait the full requested window;
+//   - "irreversible": a drained forwarder refuses a swap and a restart.
+func TestSingleHopDrainStopsAcceptingKeepsThePortAndBoundsTheWait(t *testing.T) {
 	port := freePort(t)
 	live, stopLive := labeledTarget(t, "live")
 	defer stopLive()
@@ -327,7 +336,15 @@ func TestSingleHopDrainKeepsListenerAndBoundsTheWait(t *testing.T) {
 	}
 	defer func() { _ = fwd.Stop() }()
 
-	// Idle drain: returns immediately.
+	// Sanity check first: before the drain, a connection IS relayed.
+	if got := readLabel(t, addrFor(port)); got != "live" {
+		t.Fatalf("pre-drain label = %q, want live", got)
+	}
+
+	// An idle drain (d == 0) returns immediately, per the API "do not
+	// wait" contract — NOT after the 15s ceiling, which is what a naive
+	// min(d, ceiling) with d==0 would fall into if it treated 0 as
+	// "no preference".
 	start := time.Now()
 	if err := fwd.Drain(0); err != nil {
 		t.Fatalf("idle Drain: %v", err)
@@ -335,7 +352,11 @@ func TestSingleHopDrainKeepsListenerAndBoundsTheWait(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("idle Drain took %v, want near-instant", elapsed)
 	}
-	// Absurd timeout is clamped to the hard ceiling, not honoured.
+	if err := fwd.Drain(-time.Second); err != nil {
+		t.Fatalf("negative Drain: %v", err)
+	}
+
+	// An absurd timeout is clamped to the hard ceiling, not honoured.
 	start = time.Now()
 	if err := fwd.Drain(time.Hour); err != nil {
 		t.Fatalf("Drain(time.Hour): %v", err)
@@ -344,35 +365,205 @@ func TestSingleHopDrainKeepsListenerAndBoundsTheWait(t *testing.T) {
 		t.Fatalf("Drain(time.Hour) took %v, want clamped (no live conns)", elapsed)
 	}
 
-	// A connection that never finishes must not wedge the drain: the target
-	// answers and then sleeps, so the in-flight count is non-zero for a
-	// while. Drain returns after the requested wait while the listener
-	// survives.
+	// The drain is irreversible: the forwarder still reports its port as
+	// bound (the reservation), but it takes no new work.
+	if !fwd.Running() {
+		t.Fatal("Running() went false after Drain: Drain must not release the port")
+	}
+	if err := fwd.SetUpstream(live); !errors.Is(err, ErrForwarderNotRunning) {
+		t.Fatalf("SetUpstream after Drain = %v, want ErrForwarderNotRunning (no new conn can reach it)", err)
+	}
+	if err := fwd.Start(); !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("Start after Drain = %v, want ErrAlreadyStarted (a drained forwarder is consumed)", err)
+	}
+
+	// The kernel backlog keeps accepting the connection (the port is
+	// bound), but the relay no longer answers it: this is the "stop
+	// accepting new connections" half the implementation was missing.
+	c, err := dialRetry(t, addrFor(port))
+	if err != nil {
+		t.Fatalf("dial after Drain: %v", err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if n, err := c.Read(make([]byte, 8)); n != 0 || err == nil {
+		t.Fatalf("a drained forwarder still relayed %d bytes: drain did not stop accepting", n)
+	}
+	if fwd.LiveConns() != 0 {
+		t.Fatalf("LiveConns = %d after Drain on an idle forwarder, want 0", fwd.LiveConns())
+	}
+}
+
+// TestSingleHopDrainWaitsForTheInFlightConnections is the other half: a
+// connection that is ALREADY in flight when the drain starts is waited for,
+// and the drain returns after the requested window while the listener stays
+// bound. A drain that returned instantly here would drop a live connection.
+func TestSingleHopDrainWaitsForTheInFlightConnections(t *testing.T) {
+	port := freePort(t)
+	// sleepTarget answers and then holds the connection for a while, so the
+	// in-flight count is non-zero well past the drain window.
+	holding, stopHolding := holdingTarget(t, 2*time.Second)
+	defer stopHolding()
+
+	fwd, err := NewSingleHop(singleHopCfg(t, port, holding))
+	if err != nil {
+		t.Fatalf("NewSingleHop: %v", err)
+	}
+	if err := fwd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = fwd.Stop() }()
+
 	held, err := dialRetry(t, addrFor(port))
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf("dial held: %v", err)
 	}
 	defer held.Close()
-	// Wait until the relay has actually taken the connection, so the drain
-	// below has something in flight to wait for.
 	if !waitForConn(t, fwd) {
 		t.Fatalf("the relay never picked up the connection; LiveConns=%d", fwd.LiveConns())
 	}
-	start = time.Now()
+
+	start := time.Now()
 	if err := fwd.Drain(80 * time.Millisecond); err != nil {
-		t.Fatalf("Drain: %v", err)
+		t.Fatalf("Drain with an in-flight connection: %v", err)
 	}
+	// Bounded: the drain must not wait for the connection to finish, so it
+	// returns far inside the target's 2s hold, but it must not return
+	// instantly either — that would mean "no wait at all".
 	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
-		t.Fatalf("Drain returned in %v, want at least the requested wait", elapsed)
+		t.Fatalf("Drain returned in %v with an in-flight connection, want ~80ms", elapsed)
 	}
 	if !fwd.Running() {
 		t.Fatal("listener is gone after Drain: Drain must not release the port")
 	}
-	// The port is still bound, so a new connection is accepted (and then
-	// dropped, because this test's target sleeps before answering).
-	if _, err := dialRetry(t, addrFor(port)); err != nil {
-		t.Fatalf("listener stopped accepting after Drain: %v", err)
+}
+
+// TestSingleHopDrainIsSafeToCallRepeatedlyAndAroundStop covers the lifecycle
+// the irreversible drain needs: double drains are no-ops, Stop after a Drain
+// is the normal teardown, and neither path hangs the caller.
+func TestSingleHopDrainIsSafeToCallRepeatedlyAndAroundStop(t *testing.T) {
+	port := freePort(t)
+	live, stopLive := labeledTarget(t, "live")
+	defer stopLive()
+
+	fwd, err := NewSingleHop(singleHopCfg(t, port, live))
+	if err != nil {
+		t.Fatalf("NewSingleHop: %v", err)
 	}
+	if err := fwd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := fwd.Drain(10 * time.Millisecond); err != nil {
+			t.Fatalf("Drain #%d: %v", i, err)
+		}
+	}
+	// Stop after Drain is the teardown path: it releases the port that the
+	// drain deliberately kept.
+	done := make(chan error, 1)
+	go func() { done <- fwd.Stop() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Stop after Drain: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop after Drain hung")
+	}
+	if fwd.Running() {
+		t.Fatal("Running() is true after Stop: the port must be released")
+	}
+	// Drain before Start is a no-op on a forwarder with nothing to do.
+	fresh, err := NewSingleHop(singleHopCfg(t, freePort(t), live))
+	if err != nil {
+		t.Fatalf("NewSingleHop: %v", err)
+	}
+	if err := fresh.Drain(0); err != nil {
+		t.Fatalf("Drain before Start: %v", err)
+	}
+	if fresh.Running() {
+		t.Fatal("Drain before Start started the forwarder")
+	}
+}
+
+// TestSingleHopDrainRacesStopAndConnections runs drains, stops and dials
+// against each other so `go test -race` covers the new draining flag and its
+// three readers (the accept loop twice, and the swap guard).
+func TestSingleHopDrainRacesStopAndConnections(t *testing.T) {
+	port := freePort(t)
+	live, stopLive := labeledTarget(t, "live")
+	defer stopLive()
+
+	fwd, err := NewSingleHop(singleHopCfg(t, port, live))
+	if err != nil {
+		t.Fatalf("NewSingleHop: %v", err)
+	}
+	if err := fwd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	dialStop := make(chan struct{})
+	var dialWg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		dialWg.Add(1)
+		go func() {
+			defer dialWg.Done()
+			for {
+				select {
+				case <-dialStop:
+					return
+				default:
+				}
+				c, err := net.DialTimeout("tcp", addrFor(port), 200*time.Millisecond)
+				if err == nil {
+					_ = c.Close()
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+
+	var drainWg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		drainWg.Add(1)
+		go func() {
+			defer drainWg.Done()
+			for j := 0; j < 20; j++ {
+				_ = fwd.Drain(time.Millisecond)
+				_ = fwd.Start() // must never resurrect, must not crash
+				_ = fwd.Drain(0)
+				_ = fwd.Stop()
+			}
+		}()
+	}
+	drainWg.Wait()
+	close(dialStop)
+	dialWg.Wait()
+}
+
+// holdingTarget answers immediately and then holds the connection open for d,
+// so a test has a guaranteed in-flight connection to wait for.
+func holdingTarget(t *testing.T, d time.Duration) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("held\n"))
+				time.Sleep(d)
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
 }
 
 // waitForConn waits until the forwarder is relaying at least one connection.
@@ -405,6 +596,44 @@ func TestEgressSetUpstreamNotSwappable(t *testing.T) {
 	// Drain is still available (pool hot updates keep working through it).
 	if err := fwd.Drain(0); err != nil {
 		t.Fatalf("Drain: %v", err)
+	}
+}
+
+// TestEgressDrainStopsAcceptingButKeepsThePort is the same Drain contract on
+// the egress forwarder, which shares pipeTracker: the pool keeps its hot
+// updates, the port stays reserved, and no new connection is answered.
+func TestEgressDrainStopsAcceptingButKeepsThePort(t *testing.T) {
+	sel := &recordingSelector{target: Target{Host: "127.0.0.1", Port: 1}}
+	port := freePort(t)
+	fwd, err := NewEgress(TunnelConfig{
+		ID: "wp2-egress-drain", Mode: ModeEgress, EgressPort: port, Protocol: "tcp",
+	}, sel)
+	if err != nil {
+		t.Fatalf("NewEgress: %v", err)
+	}
+	if err := fwd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = fwd.Stop() }()
+
+	if err := fwd.Drain(0); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if !fwd.Running() {
+		t.Fatal("egress Drain released the port: the reservation must survive")
+	}
+	if err := fwd.SetUpstream("127.0.0.1:1"); !errors.Is(err, ErrUpstreamNotSwappable) {
+		t.Fatalf("SetUpstream on a DRAINED egress forwarder = %v, want ErrUpstreamNotSwappable", err)
+	}
+	// A drained egress forwarder does not relay.
+	c, err := dialRetry(t, addrFor(port))
+	if err != nil {
+		t.Fatalf("dial after Drain: %v", err)
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if n, err := c.Read(make([]byte, 8)); n != 0 || err == nil {
+		t.Fatalf("a drained egress forwarder still relayed %d bytes", n)
 	}
 }
 

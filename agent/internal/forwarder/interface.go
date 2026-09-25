@@ -255,8 +255,14 @@ type Forwarder interface {
 	// (Remove) so a drained-but-still-registered tunnel keeps its port
 	// reserved while its connections fade out.
 	//
-	// An idle Drain returns immediately. It is safe to call before Start
-	// and more than once.
+	// Drain is irreversible and one-way. The accept loop ends and the
+	// listener stays bound: the port is NOT freed, Running() keeps
+	// reporting true, and the drained forwarder refuses swaps (an address
+	// no new connection can reach would be a lie). Resuming means a new
+	// forwarder; finishing means Stop, which is safe at any point after.
+	//
+	// An idle Drain returns immediately — d <= 0 means "do not wait", never
+	// the ceiling. It is safe to call before Start and more than once.
 	Drain(timeout time.Duration) error
 }
 

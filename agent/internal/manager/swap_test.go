@@ -613,19 +613,48 @@ func TestDrainTunnelKeepsPortReservedAndIsBounded(t *testing.T) {
 	if err := tm.DrainTunnel("ghost", time.Millisecond); !errors.Is(err, ErrTunnelNotFound) {
 		t.Fatalf("DrainTunnel(unknown) = %v, want ErrTunnelNotFound", err)
 	}
-	if err := tm.DrainTunnel("drain", 0); err != nil {
-		t.Fatalf("idle DrainTunnel: %v", err)
-	}
-	// An absurd timeout is clamped by the forwarder, not honoured.
-	start := time.Now()
-	if err := tm.DrainTunnel("drain", time.Hour); err != nil {
-		t.Fatalf("DrainTunnel(hour): %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("idle drain took %v, want instant", elapsed)
+
+	// The idle forwarder first: neither d <= 0 nor an absurd timeout waits
+	// at all. d == 0 means "do not wait" (never "no preference"), and a
+	// huge timeout is clamped by the forwarder's ceiling rather than
+	// honoured. This runs before the live connection because a drain is
+	// irreversible by design.
+	var start time.Time
+	for _, d := range []time.Duration{0, -time.Second, time.Hour} {
+		start = time.Now()
+		if err := tm.DrainTunnel("drain", d); err != nil {
+			t.Fatalf("idle DrainTunnel(%v): %v", d, err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("idle DrainTunnel(%v) took %v, want instant", d, elapsed)
+		}
 	}
 
-	// With a live connection the drain waits, then returns bounded.
+	// The tunnel is still registered and still owns its port: drain is not
+	// teardown, and an idle drain must not release the reservation either.
+	if _, ok := tm.Get("drain"); !ok {
+		t.Fatal("the tunnel was removed by a drain")
+	}
+	if !tm.UsedPorts()[port] {
+		t.Fatal("the port reservation was released by an idle drain")
+	}
+}
+
+// TestDrainTunnelWaitsForTheInFlightConnections is the live-connection half.
+// The connection is opened BEFORE the drain, because a drain ends the accept
+// loop: work started after it would never be relayed, which is the point of
+// the §13.3.5 DRAIN phase rather than a side effect.
+func TestDrainTunnelWaitsForTheInFlightConnections(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	aPort, _ := labeledServer(t, "a")
+	port := freePort(t)
+
+	if _, err := tm.Apply(relayCfg("drain", port, addrFor(aPort), 1)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer tm.StopAll()
+
 	c, err := dialRetry(t, addrFor(port))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -636,20 +665,14 @@ func TestDrainTunnelKeepsPortReservedAndIsBounded(t *testing.T) {
 	}) {
 		t.Fatal("the relay never took the connection")
 	}
-	start = time.Now()
+	// Bounded by the caller's timeout, not by the connection finishing: the
+	// label server holds the connection open until the client goes away.
+	start := time.Now()
 	if err := tm.DrainTunnel("drain", 100*time.Millisecond); err != nil {
 		t.Fatalf("DrainTunnel: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
 		t.Fatalf("drain returned in %v with a live connection, want ~100ms", elapsed)
-	}
-	// The tunnel is still registered and still owns its port: drain is not
-	// teardown.
-	if _, ok := tm.Get("drain"); !ok {
-		t.Fatal("the tunnel was removed by a drain")
-	}
-	if !tm.UsedPorts()[port] {
-		t.Fatal("the port reservation was released by a drain")
 	}
 }
 
@@ -668,10 +691,74 @@ func TestDrainAllTunnelsSkipsForwardersWithoutListener(t *testing.T) {
 	if len(skipped) != 0 {
 		t.Fatalf("DrainAllTunnels skipped %v, want none (the tunnel is running)", skipped)
 	}
-	// Everything is still registered and serving.
-	if got := servedLabel(t, addrFor(port)); got != "srv:a" {
-		t.Fatalf("target after DrainAll = %q, want srv:a", got)
+	// Everything is still registered.
+	if _, ok := tm.Get("one"); !ok {
+		t.Fatal("DrainAllTunnels removed a tunnel")
 	}
+	if !tm.UsedPorts()[port] {
+		t.Fatal("DrainAllTunnels released a port reservation")
+	}
+}
+
+// TestDrainTunnelStopsAcceptingButKeepsThePort is the §13.3.5 DRAIN phase as
+// the manager exposes it: after a drain the port is still RESERVED (so a
+// concurrent Apply cannot steal it while the last connections fade) but the
+// tunnel no longer answers a new connection. A listener-move replacement that
+// lands on the drained tunnel's port must then find the old listener already
+// out of the way.
+func TestDrainTunnelStopsAcceptingButKeepsThePort(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	aPort, _ := labeledServer(t, "a")
+	port := freePort(t)
+
+	if _, err := tm.Apply(relayCfg("drainy", port, addrFor(aPort), 1)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer tm.StopAll()
+
+	// A connection that IS in flight when the drain starts keeps relaying.
+	held, err := dialRetry(t, addrFor(port))
+	if err != nil {
+		t.Fatalf("dial held: %v", err)
+	}
+	defer held.Close()
+	if !waitFor(t, "relay picks up the connection", 2*time.Second, func() bool {
+		return tm.LiveConns("drainy") > 0
+	}) {
+		t.Fatal("the relay never took the connection")
+	}
+	if err := tm.DrainTunnel("drainy", time.Second); err != nil {
+		t.Fatalf("DrainTunnel: %v", err)
+	}
+
+	// Still registered, port still reserved: a drain is not a removal.
+	if _, ok := tm.Get("drainy"); !ok {
+		t.Fatal("the tunnel was removed by a drain")
+	}
+	if !tm.UsedPorts()[port] {
+		t.Fatal("the port reservation was released by a drain")
+	}
+	// And no new connection is answered.
+	fresh, err := dialRetry(t, addrFor(port))
+	if err != nil {
+		t.Fatalf("dial after drain: %v", err)
+	}
+	defer fresh.Close()
+	_ = fresh.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if n, err := fresh.Read(make([]byte, 16)); n != 0 || err == nil {
+		t.Fatalf("a drained tunnel still relayed %d bytes: the manager drain did not stop accepting", n)
+	}
+
+	// Remove is what releases it: the port must become reusable right away,
+	// because the old forwarder is stopped with it.
+	if err := tm.Remove("drainy"); err != nil {
+		t.Fatalf("Remove after drain: %v", err)
+	}
+	if tm.UsedPorts()[port] {
+		t.Fatal("Remove after a drain left the port reserved")
+	}
+	waitForPortClosed(t, port)
 }
 
 // ---------------------------------------------------------------------------

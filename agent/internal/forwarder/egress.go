@@ -275,6 +275,9 @@ func (f *EgressForwarder) SetUpstream(addr string) error {
 // Drain waits — bounded — for the in-flight connections to finish while the
 // listener stays bound. Retargeting the pool mid-drain is still allowed: the
 // pool is independent of the listener, exactly like a live hot update.
+//
+// Like the single-hop Drain it is irreversible: the accept loop ends, the port
+// stays reserved, and teardown stays Stop's job.
 func (f *EgressForwarder) Drain(d time.Duration) error {
 	f.pipeTracker.drainFor(d)
 	return nil
