@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tunex/agent/internal/agentconfig"
@@ -14,7 +15,8 @@ import (
 )
 
 // v3Runtime bundles the WP4 components so main can start and stop them as one
-// unit and the legacy loop stays independent.
+// unit. Since WP15 it is the agent's only runtime: there is no legacy session
+// beside it.
 type v3Runtime struct {
 	cfg     *agentconfig.Config
 	tunnels *manager.TunnelManager
@@ -25,8 +27,7 @@ type v3Runtime struct {
 }
 
 // startV3Runtime builds the v3 components and brings them up in the documented
-// order. It returns nil when the node is not running the v3 runtime at all (no
-// role, no admin port, no panel URL) so a legacy-only node pays nothing.
+// order.
 //
 // The role decides which components start:
 //
@@ -47,10 +48,10 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 
 	rt := &v3Runtime{cfg: cfg, tunnels: tunnels, egress: egress}
 	if cfg.AgentAdminPort == 0 && cfg.PanelHTTPURL == "" {
-		// Legacy-only node: nothing to bring up. Returned nil keeps the
-		// caller's shutdown hook a no-op.
-		logx.Debug("v3 runtime idle: no AGENT_ADMIN_PORT and no PANEL_HTTP_URL")
-		return nil
+		// Nothing to bring up: no admin plane and nothing to report to. The
+		// node still accepts no apply commands, so say so loudly instead of
+		// silently running an empty process.
+		logx.Warn("v3 runtime idle: no AGENT_ADMIN_PORT and no PANEL_HTTP_URL; this node cannot receive tunnels")
 	}
 
 	// 1. Restore before the admin plane opens, so a port the panel expects to
@@ -66,21 +67,29 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 
 	// 2. Admin API.
 	if cfg.AgentAdminPort != 0 {
-		srv, err := api.New(api.Options{
-			ListenHost: "127.0.0.1",
-			Port:       cfg.AgentAdminPort,
-			Token:      cfg.AgentAdminToken,
-			NodeID:     cfg.NodeID,
-			Version:    version,
-			Role:       role,
-		}, tunnels, egress, nil)
-		if err != nil {
-			logx.Error("v3 admin api disabled", "err", err.Error())
-		} else if err := srv.Start(); err != nil {
-			logx.Error("v3 admin api start failed", "addr", srv.ListenAddr(), "err", err.Error())
+		// api.New requires a token (an unauthenticated management plane is
+		// never acceptable). Fail fast at parse time instead of losing the
+		// error inside a goroutine.
+		if strings.TrimSpace(cfg.AgentAdminToken) == "" {
+			logx.Error("AGENT_ADMIN_TOKEN is required when AGENT_ADMIN_PORT is set; admin API disabled",
+				"node_id", cfg.NodeID)
 		} else {
-			rt.api = srv
-			logx.Info("v3 admin api listening", "addr", srv.ListenAddr(), "role", role)
+			srv, err := api.New(api.Options{
+				ListenHost: "127.0.0.1",
+				Port:       cfg.AgentAdminPort,
+				Token:      cfg.AgentAdminToken,
+				NodeID:     cfg.NodeID,
+				Version:    version,
+				Role:       role,
+			}, tunnels, egress, nil)
+			if err != nil {
+				logx.Error("v3 admin api disabled", "err", err.Error())
+			} else if err := srv.Start(); err != nil {
+				logx.Error("v3 admin api start failed", "addr", srv.ListenAddr(), "err", err.Error())
+			} else {
+				rt.api = srv
+				logx.Info("v3 admin api listening", "addr", srv.ListenAddr(), "role", role)
+			}
 		}
 	}
 

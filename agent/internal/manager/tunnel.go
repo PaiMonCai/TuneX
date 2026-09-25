@@ -10,8 +10,9 @@
 // Ports: the v3 design notes that a BOTH node runs ingress and egress tunnels in
 // one process and the two pools can overlap numerically, so a single shared
 // usedPorts guard owns every port this manager binds (skill note: agent-side
-// TunnelManager and EgressManager must share one usedPorts map). The legacy
-// engine keeps its own map; this package never queries it.
+// TunnelManager and EgressManager must share one usedPorts map). This guard is
+// the only port ownership in the process since WP15 removed the old engine's
+// private usedPorts map.
 package manager
 
 import (
@@ -57,7 +58,7 @@ type TunnelManager struct {
 
 	egress *EgressManager
 	// listenHost is the interface ingress/egress tunnels bind when the config
-	// does not pin one. Empty means all interfaces (the legacy behaviour).
+	// does not pin one. Empty means all interfaces.
 	listenHost string
 }
 
@@ -170,10 +171,10 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, 
 // buildLocked builds the Forwarder. Caller must hold m.mu.
 func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
 	switch cfg.Mode {
-	case forwarder.ModeDirect:
-		return forwarder.NewDirect(cfg)
-	case forwarder.ModeRelay:
-		return forwarder.NewRelay(cfg)
+	case forwarder.ModeDirect, forwarder.ModeRelay:
+		// DIRECT and RELAY are both one-hop tunnels: the only difference is
+		// where UpstreamAddr() points. One implementation carries both.
+		return forwarder.NewSingleHop(cfg)
 	case forwarder.ModeEgress:
 		sel, err := m.egress.SelectorFor(cfg.ID)
 		if err != nil {

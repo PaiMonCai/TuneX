@@ -9,29 +9,26 @@ import (
 //
 // Supported (enough for $HOME/.tunex-agent.yaml):
 //
-//	server: https://tunex.example.com:3000
-//	token: xxxxxxxx
 //	node-id: node-01
+//	role: BOTH
 //	debug: true
-//	pprof-port: 6060
-//	connect-ip: ["1.2.3.4", "5.6.7.8"]   # or a bare scalar
-//	connect-ip:
-//	  - 1.2.3.4
-//	  - 5.6.7.8
+//	panel-http-url: http://panel:3001
+//	agent-admin-port: 9090
+//	agent-admin-token: xxxxxxxx
+//	ingress-range: 10000-30000
+//	egress-range: 30001-60000
+//	node-credential: xxxxxxxx
 //
 // It intentionally does not support nested maps, anchors or multi-document
-// files — the agent config is flat. Unknown keys are ignored.
+// files — the agent config is flat. Unknown keys are ignored, so a config file
+// written before WP15 still loads; its legacy keys (server, token, port-range,
+// the per-protocol fixed ports, connect-ip) simply have no effect any more
+// because the legacy data plane they configured no longer exists.
 func applyYAML(cfg *Config, text string) {
 	lines := strings.Split(text, "\n")
 	for i := 0; i < len(lines); i++ {
-		raw := lines[i]
-		line := stripComment(raw)
+		line := stripComment(lines[i])
 		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		// A leading "- item" continues the previous list key.
-		if strings.HasPrefix(strings.TrimSpace(line), "- ") {
-			// handled inline below when the key line set pendingList
 			continue
 		}
 		key, val, ok := splitKey(line)
@@ -40,64 +37,28 @@ func applyYAML(cfg *Config, text string) {
 		}
 		key = normalizeKey(key)
 		val = strings.TrimSpace(val)
-
-		// Block list form: key with empty value followed by "- item" lines.
 		if val == "" {
-			var items []string
-			for j := i + 1; j < len(lines); j++ {
-				nxt := strings.TrimSpace(stripComment(lines[j]))
-				if strings.HasPrefix(nxt, "- ") {
-					items = append(items, unquote(strings.TrimSpace(strings.TrimPrefix(nxt, "- "))))
-					i = j
-					continue
-				}
-				break
-			}
-			if len(items) > 0 {
-				setList(cfg, key, items)
-			}
 			continue
 		}
-
-		// Inline list [a, b] or scalar.
-		if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
-			inner := strings.TrimSuffix(strings.TrimPrefix(val, "["), "]")
-			var items []string
-			for _, p := range strings.Split(inner, ",") {
-				p = unquote(strings.TrimSpace(p))
-				if p != "" {
-					items = append(items, p)
-				}
-			}
-			setList(cfg, key, items)
+		// A trailing "- item" list block belongs to a previous key; the v3
+		// config is flat with no list values, so these lines carry nothing.
+		if strings.HasPrefix(strings.TrimSpace(line), "- ") {
 			continue
 		}
 		setScalar(cfg, key, unquote(val))
 	}
 }
 
+// setScalar applies the survivors of the legacy/​v3 key merge: the v3 runtime's
+// own configuration only.
 func setScalar(cfg *Config, key, val string) {
 	switch key {
-	case "server":
-		cfg.Server = val
-	case "token":
-		cfg.Token = val
 	case "node-id", "node_id":
 		cfg.NodeID = val
 	case "debug":
 		cfg.Debug = parseBool(val)
 	case "listen-ip", "listen_ip":
 		cfg.ListenIP = val
-	case "port-range", "port_range":
-		cfg.PortRange = val
-	case "out-interface", "out_interface":
-		cfg.OutInterface = val
-	case "vnstat-interface", "vnstat_interface":
-		cfg.VnstatInterface = val
-	case "pprof-port", "pprof_port":
-		if n, err := strconv.Atoi(val); err == nil {
-			cfg.PprofPort = n
-		}
 	case "role":
 		cfg.Role = val
 	case "panel-http-url", "panel_http_url":
@@ -110,33 +71,8 @@ func setScalar(cfg *Config, key, val string) {
 		cfg.IngressRange = val
 	case "egress-range", "egress_range":
 		cfg.EgressRange = val
-	case "tcp-port":
-		cfg.TCPPort = atoi(val)
-	case "udp-port":
-		cfg.UDPPort = atoi(val)
-	case "tls-port":
-		cfg.TLSPort = atoi(val)
-	case "wss-port":
-		cfg.WSSPort = atoi(val)
-	case "mtcp-port":
-		cfg.MTCPPort = atoi(val)
-	case "mtls-port":
-		cfg.MTLSPort = atoi(val)
-	case "mwss-port":
-		cfg.MWSSPort = atoi(val)
-	case "quic-port":
-		cfg.QUICPort = atoi(val)
-	case "tunex-port":
-		cfg.TunexPort = atoi(val)
-	case "connect-ip", "connect_ip":
-		cfg.ConnectIP = []string{val}
-	}
-}
-
-func setList(cfg *Config, key string, items []string) {
-	switch key {
-	case "connect-ip", "connect_ip":
-		cfg.ConnectIP = items
+	case "node-credential", "node_credential":
+		cfg.NodeCredential = val
 	}
 }
 

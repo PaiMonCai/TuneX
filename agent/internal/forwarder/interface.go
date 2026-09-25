@@ -10,8 +10,10 @@
 //
 // Nothing here talks to the control plane. A Forwarder is built from a
 // TunnelConfig and is owned by manager.TunnelManager, the only place that knows
-// about revisions, node roles and the shared port guard. The legacy DIRECT
-// engine (internal/engine) is untouched and keeps running its own listeners.
+// about revisions, node roles and the shared port guard. DIRECT and RELAY share
+// one implementation (singhop.go); EGRESS has its own because it load-balances
+// over a pool. Since WP15 there is exactly one data plane per tunnel mode and no
+// second "legacy" implementation to fall back to.
 package forwarder
 
 import (

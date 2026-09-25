@@ -35,20 +35,4 @@ test("HTTP health and non-payment endpoints are not blocked by billing policy", 
   assert.equal(tunnels.status, 401);
 });
 
-test("config admission: no plan is needed for owned groups; any unauthorized hop denies the tunnel", async () => {
-  const { filterAvailableTunnels } = await import("../src/socket/config-generator.ts");
-  const own = { id: 4, user_id: 12, node_type: "in" };
-  const shared = { id: 9, user_id: 88, node_type: "out" };
-  const tunnel = {
-    id: 1, user_id: 12, in_node_group_id: 4, in_node_group: own,
-    out_node_group_id: null, user: { id: 12, user_plan: null, node_group_grants: [] },
-    tunnel_chains: [],
-  };
-  assert.equal(filterAvailableTunnels([tunnel], 4).length, 1);
-  assert.equal(filterAvailableTunnels([{ ...tunnel, in_node_group: { id: 4 } }], 4).length, 0);
-  const withHop = { ...tunnel, tunnel_chains: [{ id: 5, node_group_id: 9, node_type: "out", node_group: shared }] };
-  assert.equal(filterAvailableTunnels([withHop], 4).length, 0);
-  const granted = { ...withHop, user: { ...tunnel.user, node_group_grants: [{ node_group_id: 9, direction: "out", active: true }] } };
-  assert.equal(filterAvailableTunnels([granted], 4).length, 1);
-  assert.equal(filterAvailableTunnels([{ ...granted, user: { ...granted.user, node_group_grants: [{ node_group_id: 9, direction: "out", active: false }] } }], 4).length, 0);
-});
+

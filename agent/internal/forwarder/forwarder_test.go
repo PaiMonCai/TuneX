@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -628,7 +629,7 @@ func TestPipeConnsHalfClosesAndDrains(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DirectForwarder
+// SingleHopForwarder — DIRECT mode (upstream is the remote_host:remote_port)
 // ---------------------------------------------------------------------------
 
 func directConfig(id string, ingress int, host string, remote int) TunnelConfig {
@@ -643,7 +644,7 @@ func directConfig(id string, ingress int, host string, remote int) TunnelConfig 
 	}
 }
 
-func TestDirectForwarderStartForwardsAndCounts(t *testing.T) {
+func TestSingleHopDirectStartForwardsAndCounts(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 	upHost, upPortS, _ := net.SplitHostPort(up)
@@ -651,9 +652,9 @@ func TestDirectForwarderStartForwardsAndCounts(t *testing.T) {
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
 	port := freePort(t)
-	f, err := NewDirect(directConfig("d1", port, upHost, upPort))
+	f, err := NewSingleHop(directConfig("d1", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -696,7 +697,7 @@ func TestDirectForwarderStartForwardsAndCounts(t *testing.T) {
 	}
 }
 
-func TestDirectForwarderStartIsIdempotent(t *testing.T) {
+func TestSingleHopDirectStartIsIdempotent(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 	upHost, upPortS, _ := net.SplitHostPort(up)
@@ -704,9 +705,9 @@ func TestDirectForwarderStartIsIdempotent(t *testing.T) {
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
 	port := freePort(t)
-	f, err := NewDirect(directConfig("d2", port, upHost, upPort))
+	f, err := NewSingleHop(directConfig("d2", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -719,7 +720,7 @@ func TestDirectForwarderStartIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestDirectForwarderStopFreesPort(t *testing.T) {
+func TestSingleHopDirectStopFreesPort(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 	upHost, upPortS, _ := net.SplitHostPort(up)
@@ -727,9 +728,9 @@ func TestDirectForwarderStopFreesPort(t *testing.T) {
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
 	port := freePort(t)
-	f, err := NewDirect(directConfig("d3", port, upHost, upPort))
+	f, err := NewSingleHop(directConfig("d3", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -745,9 +746,9 @@ func TestDirectForwarderStopFreesPort(t *testing.T) {
 		t.Fatalf("second Stop: %v", err)
 	}
 	// Stop before Start is also a no-op (the manager reuses instances).
-	g, err := NewDirect(directConfig("d4", freePort(t), upHost, upPort))
+	g, err := NewSingleHop(directConfig("d4", freePort(t), upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := g.Stop(); err != nil {
 		t.Fatalf("Stop before Start: %v", err)
@@ -761,9 +762,9 @@ func TestDirectForwarderStopFreesPort(t *testing.T) {
 	}
 }
 
-// TestDirectForwarderPortConflictRejected: two tunnels asking for the same port
+// TestSingleHopDirectPortConflictRejected: two tunnels asking for the same port
 // cannot both bind; the OS enforces it even if the manager's guard misses.
-func TestDirectForwarderPortConflictRejected(t *testing.T) {
+func TestSingleHopDirectPortConflictRejected(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 	upHost, upPortS, _ := net.SplitHostPort(up)
@@ -771,18 +772,18 @@ func TestDirectForwarderPortConflictRejected(t *testing.T) {
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
 	port := freePort(t)
-	a, err := NewDirect(directConfig("a", port, upHost, upPort))
+	a, err := NewSingleHop(directConfig("a", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := a.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer a.Stop()
 
-	b, err := NewDirect(directConfig("b", port, upHost, upPort))
+	b, err := NewSingleHop(directConfig("b", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	err = b.Start()
 	if err == nil {
@@ -791,7 +792,7 @@ func TestDirectForwarderPortConflictRejected(t *testing.T) {
 	}
 }
 
-func TestDirectForwarderDropsUnreachableUpstream(t *testing.T) {
+func TestSingleHopDirectDropsUnreachableUpstream(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 	_, upPortS, _ := net.SplitHostPort(up)
@@ -801,9 +802,9 @@ func TestDirectForwarderDropsUnreachableUpstream(t *testing.T) {
 	_ = upPortS
 
 	port := freePort(t)
-	f, err := NewDirect(directConfig("d5", port, "127.0.0.1", dead))
+	f, err := NewSingleHop(directConfig("d5", port, "127.0.0.1", dead))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -823,20 +824,20 @@ func TestDirectForwarderDropsUnreachableUpstream(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// RelayForwarder
+// SingleHopForwarder in RELAY mode
 // ---------------------------------------------------------------------------
 
-func TestRelayForwarderForwardsToNextHop(t *testing.T) {
+func TestSingleHopRelayForwardsToNextHop(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 
 	port := freePort(t)
-	f, err := NewRelay(TunnelConfig{
+	f, err := NewSingleHop(TunnelConfig{
 		ID: "r1", Mode: ModeRelay, IngressPort: port, NextHop: up,
 		Protocol: "tcp", ListenHost: "127.0.0.1",
 	})
 	if err != nil {
-		t.Fatalf("NewRelay: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -873,10 +874,62 @@ func TestRelayForwarderForwardsToNextHop(t *testing.T) {
 	}
 }
 
-func TestRelayForwarderRejectsWrongMode(t *testing.T) {
-	_, err := NewRelay(directConfig("x", 10000, "127.0.0.1", 80))
+// TestSingleHopForwarderRejectsEgressConfig pins the one boundary WP15 left:
+// the one-hop implementation covers DIRECT and RELAY, and must refuse an
+// EGRESS config (that mode has its own forwarder and its own semantics).
+func TestSingleHopForwarderRejectsEgressConfig(t *testing.T) {
+	_, err := NewSingleHop(TunnelConfig{
+		ID:          "x",
+		Mode:        ModeEgress,
+		EgressPort:  40000,
+		IngressPort: 40000,
+		Targets:     []Target{{Host: "127.0.0.1", Port: 80, Weight: 1}},
+		Protocol:    "tcp",
+		ListenHost:  "127.0.0.1",
+	})
 	if err == nil {
-		t.Fatal("NewRelay must reject a DIRECT config")
+		t.Fatal("NewSingleHop must reject an EGRESS config")
+	}
+}
+
+// TestDirectAndRelayShareOneImplementation is the WP15 DoD "同一套 v3 runtime
+// 同时承载 DIRECT 与 RELAY" at the forwarder level: both modes build the same
+// type, so there is no second implementation to keep in sync (or to fall back
+// to). The distinction is only where UpstreamAddr() points.
+func TestDirectAndRelayShareOneImplementation(t *testing.T) {
+	up, stopUp := echoTarget(t)
+	defer stopUp()
+	upHost, upPortS, _ := net.SplitHostPort(up)
+	var upPort int
+	fmt.Sscanf(upPortS, "%d", &upPort)
+
+	for _, tc := range []struct {
+		name string
+		cfg  func(port int) TunnelConfig
+	}{
+		{"direct", func(port int) TunnelConfig {
+			return directConfig("d-share", port, upHost, upPort)
+		}},
+		{"relay", func(port int) TunnelConfig {
+			c := directConfig("r-share", port, upHost, upPort)
+			c.Mode = ModeRelay
+			c.NextHop = net.JoinHostPort(upHost, strconv.Itoa(upPort))
+			return c
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := NewSingleHop(tc.cfg(freePort(t)))
+			if err != nil {
+				t.Fatalf("NewSingleHop: %v", err)
+			}
+			defer f.Stop()
+			if err := f.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if _, ok := any(f).(*SingleHopForwarder); !ok {
+				t.Fatalf("expected *SingleHopForwarder, got %T", f)
+			}
+		})
 	}
 }
 
@@ -993,10 +1046,10 @@ func TestEgressForwarderRequiresSelector(t *testing.T) {
 // concurrency
 // ---------------------------------------------------------------------------
 
-// TestDirectForwarderConcurrentConnections stresses the accept loop and the
+// TestSingleHopDirectConcurrentConnections stresses the accept loop and the
 // atomic counter with many simultaneous clients. Run with -race it is the
 // guard against a data race in the shared byteCounter / conns bookkeeping.
-func TestDirectForwarderConcurrentConnections(t *testing.T) {
+func TestSingleHopDirectConcurrentConnections(t *testing.T) {
 	up, stopUp := echoTarget(t)
 	defer stopUp()
 	upHost, upPortS, _ := net.SplitHostPort(up)
@@ -1004,9 +1057,9 @@ func TestDirectForwarderConcurrentConnections(t *testing.T) {
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
 	port := freePort(t)
-	f, err := NewDirect(directConfig("cc", port, upHost, upPort))
+	f, err := NewSingleHop(directConfig("cc", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1072,9 +1125,9 @@ func TestPipeTrackerDrainsOnStop(t *testing.T) {
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
 	port := freePort(t)
-	f, err := NewDirect(directConfig("drain", port, upHost, upPort))
+	f, err := NewSingleHop(directConfig("drain", port, upHost, upPort))
 	if err != nil {
-		t.Fatalf("NewDirect: %v", err)
+		t.Fatalf("NewSingleHop: %v", err)
 	}
 	if err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)

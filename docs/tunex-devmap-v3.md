@@ -463,7 +463,7 @@ Next.js · Hono · Prisma · MySQL · Redis · Go 1.22
 |                                                                       |
 | // nextHop = 出口节点IP:egressPort                                    |
 |                                                                       |
-| f := forwarder.NewRelay(cfg.IngressPort, cfg.NextHop)                 |
+| f := forwarder.NewSingleHop(cfg)                                  |
 |                                                                       |
 | return f.Start()                                                      |
 |                                                                       |

@@ -1,20 +1,13 @@
 /**
- * TuneX Fernet keys.
+ * TuneX data-plane auth constants (protocol labels, not secrets).
  *
- * Each installation generates its own config key and license key. There is no
- * built-in default: if the environment variables are missing the backend
- * refuses to start, so a key leaked from one deployment can never be used to
- * forge configs or licenses against another.
+ * The per-install Fernet keys (`configKey` / `licenseKey`) were removed in
+ * WP15 together with the legacy agent's config push and license signing:
+ * they existed only to authenticate the Socket.IO/Fernet channel that carried
+ * the old gost config. The v3 control plane authenticates per-node
+ * credentials instead, so refusing to boot on a missing `TUNEX_CONFIG_KEY`
+ * would break deployments that have no legacy agent to serve.
  */
-
-/** Validate a 32-byte base64url Fernet key supplied by the deployment. */
-function requiredKey(name: "TUNEX_CONFIG_KEY" | "TUNEX_LICENSE_KEY"): string {
-  const key = process.env[name]?.trim();
-  if (!key || !/^[A-Za-z0-9_-]{43}=?$/.test(key) || Buffer.from(key, "base64url").length !== 32) {
-    throw new Error(`${name} must be a unique, 32-byte base64url Fernet key`);
-  }
-  return key;
-}
 
 /**
  * Data-plane auth HKDF info constant.
@@ -38,13 +31,3 @@ export const TUNEX_AUTH_TOKEN_OFFSETS = {
   mac: 24,
   total: 56,
 } as const;
-
-/** Key shared only between this installation's backend and its own agents. */
-export function configKey(): string {
-  return requiredKey("TUNEX_CONFIG_KEY");
-}
-
-/** A second, independent key for the node registration response. */
-export function licenseKey(): string {
-  return requiredKey("TUNEX_LICENSE_KEY");
-}
