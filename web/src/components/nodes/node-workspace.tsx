@@ -306,6 +306,9 @@ export function NodeWorkspace() {
                     <p className="mt-1 text-xs text-[var(--muted-foreground)]">
                       {node.connect_ip ?? t("node.waiting")}
                     </p>
+                    <p className="mt-1 font-mono text-[10px] text-[var(--muted-foreground)]">
+                      Agent: {node.agent_id}
+                    </p>
                   </div>
                   <Badge variant={node.online ? "success" : "secondary"}>
                     {node.online ? t("common.online") : node.registered ? t("common.offline") : t("node.waiting")}
@@ -508,6 +511,9 @@ export function NodeWorkspace() {
           </DialogHeader>
           {install ? (
             <div className="flex flex-col gap-3">
+              <div className="text-xs text-[var(--muted-foreground)]">
+                Agent ID: <span className="font-mono">{install.agent_id}</span>
+              </div>
               <div className="rounded-md border border-[var(--border)] bg-[var(--muted)] p-3 font-mono text-xs break-all">
                 {install.install_command}
               </div>
