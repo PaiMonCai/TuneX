@@ -10,7 +10,7 @@ import { api, workspaceIdFromCookie } from "@/lib/api";
 import { serverT } from "@/lib/server-i18n";
 import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
 import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
-import type { DashboardStats, Tunnel } from "@/lib/types";
+import type { DashboardStats, PortForward } from "@/lib/types";
 
 /** 仪表盘数据体（服务端组件，AppShell 内由 Suspense 包裹） */
 export async function DashboardBody() {
@@ -22,16 +22,15 @@ export async function DashboardBody() {
   // 缺失时不猜个人空间、直接进入空态——让页面显示「未选择空间」而非别的空间的流量。
   const workspaceId = workspaceIdFromCookie(cookie);
 
-  const [stats, traffic, tunnels] = await Promise.all([
+  const [stats, traffic, forwardRows] = await Promise.all([
     api.dashboard.stats(cookie).catch(() => null as DashboardStats | null),
     loadDashboardTraffic({
       workspaceId,
       fetchTraffic: (id, days) => api.workspaces.traffic(id, { days }),
     }).catch(() => null),
-    api.tunnels
-      .list({ page: 1, page_size: 5 }, cookie)
-      .catch(() => ({ data: [] as Tunnel[], total: 0, page: 1, page_size: 5 })),
+    api.forwards.list(undefined, cookie).catch(() => [] as PortForward[]),
   ]);
+  const forwards = forwardRows.slice(0, 5);
   const paymentsEnabled = process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true";
   const usedPct = stats?.traffic_limit ? (stats.traffic_used / stats.traffic_limit) * 100 : 0;
 
@@ -158,31 +157,33 @@ export async function DashboardBody() {
             <TableHeader>
               <TableRow>
                 <TableHead>{t("fields.id")}</TableHead>
-                <TableHead>{t("tunnel.name")}</TableHead>
-                <TableHead>{t("tunnel.tunnelType")}</TableHead>
-                <TableHead>{t("fields.listenPort")}</TableHead>
-                <TableHead>{t("tunnel.traffic")}</TableHead>
+                <TableHead>{t("fields.name")}</TableHead>
+                <TableHead>{t("forward.mode")}</TableHead>
+                <TableHead>{t("forward.listenPort")}</TableHead>
+                <TableHead>{t("forward.totalTraffic")}</TableHead>
                 <TableHead>{t("common.status")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {tunnels.data.length === 0 && <TableEmpty colSpan={6} text={dict.tunnel.empty} />}
-              {tunnels.data.map((tn) => (
-                <TableRow key={tn.id}>
-                  <TableCell className="text-[var(--muted-foreground)]">{tn.id}</TableCell>
+              {forwards.length === 0 && <TableEmpty colSpan={6} text={t("forward.emptyTitle")} />}
+              {forwards.map((forward) => (
+                <TableRow key={forward.id}>
+                  <TableCell className="text-[var(--muted-foreground)]">{forward.id}</TableCell>
                   <TableCell className="font-medium">
-                    <Link href={`/forwards/${tn.id}`} className="hover:underline">
-                      {tn.name}
+                    <Link href={`/forwards/${forward.id}`} className="hover:underline">
+                      {forward.name}
                     </Link>
                   </TableCell>
                   <TableCell>
-                    <Badge variant="outline">{tn.tunnel_type}</Badge>
+                    <Badge variant="outline">
+                      {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
+                    </Badge>
                   </TableCell>
-                  <TableCell className="font-mono text-xs">{tn.listen_port ?? "-"}</TableCell>
-                  <TableCell>{formatBytes(tn.traffic)}</TableCell>
+                  <TableCell className="font-mono text-xs">{forward.listen_port ?? "-"}</TableCell>
+                  <TableCell>{formatBytes(forward.traffic)}</TableCell>
                   <TableCell>
-                    <Badge variant={tn.status === "active" ? "success" : "muted"}>
-                      {tn.status === "active" ? t("common.active") : t("common.inactive")}
+                    <Badge variant={forward.apply_status === "active" ? "success" : forward.apply_status === "error" ? "destructive" : "muted"}>
+                      {forward.apply_status ?? t("forward.statusPending")}
                     </Badge>
                   </TableCell>
                 </TableRow>
