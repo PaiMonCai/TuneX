@@ -201,6 +201,55 @@ export async function listForwards(workspaceId: number, input: ForwardListInput 
   return rows.map(forwardView);
 }
 
+export interface ForwardSummary {
+  total: number;
+  direct: number;
+  relay: number;
+  active: number;
+  error: number;
+  suspended: number;
+  pending: number;
+  traffic: number;
+  traffic_cost: number;
+}
+
+export async function getForwardSummary(
+  workspaceId: number,
+): Promise<ForwardSummary> {
+  const base: Prisma.TunnelWhereInput = {
+    workspace_id: workspaceId,
+    category: "port_forward",
+  };
+  const [total, direct, relay, active, errorCount, suspended, pending, usage] =
+    await Promise.all([
+      db.tunnel.count({ where: base }),
+      db.tunnel.count({ where: { ...base, tunnel_mode: "direct" } }),
+      db.tunnel.count({ where: { ...base, tunnel_mode: "relay" } }),
+      db.tunnel.count({ where: { ...base, apply_status: "active" } }),
+      db.tunnel.count({ where: { ...base, apply_status: "error" } }),
+      db.tunnel.count({ where: { ...base, apply_status: "suspended" } }),
+      db.tunnel.count({
+        where: { ...base, apply_status: { in: ["pending", "applying"] } },
+      }),
+      db.tunnel.aggregate({
+        where: base,
+        _sum: { traffic: true, traffic_cost: true },
+      }),
+    ]);
+
+  return {
+    total,
+    direct,
+    relay,
+    active,
+    error: errorCount,
+    suspended,
+    pending,
+    traffic: Number(usage._sum.traffic ?? 0),
+    traffic_cost: Number(usage._sum.traffic_cost ?? 0),
+  };
+}
+
 export async function getForward(
   id: number,
   workspaceId: number,
