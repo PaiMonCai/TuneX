@@ -911,7 +911,7 @@ export async function createRelayTunnel(
       { tunnelId },
     );
   }
-  const egressPick = pickNode(outCandidates, "egress", now);
+  const egressPick = pickNode(outCandidates as unknown as SchedulableNode[], "egress", now);
   if (!egressPick.ok) {
     return fail(
       "bind_nodes",
