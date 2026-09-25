@@ -75,6 +75,7 @@ export interface ReportedEgressPool {
 
 /** 上报载荷。未定义未知字段不做猜测式解析——原样存 JSON，坏形状由校验函数拦。 */
 export interface StateReportInput {
+  agent_id?: string;
   version?: string;
   role?: string;
   tunnels?: ReportedTunnel[];
@@ -104,6 +105,7 @@ export interface StateSnapshot {
 export type StateReportRejection =
   | "missing_credential"
   | "invalid_json"
+  | "bad_agent_id"
   | "bad_version"
   | "bad_role"
   | "bad_tunnels"
@@ -125,6 +127,9 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "invalid_json" };
   const b = body as Record<string, unknown>;
 
+  if (b.agent_id !== undefined && (typeof b.agent_id !== "string" || b.agent_id.length === 0 || b.agent_id.length > 64)) {
+    return { ok: false, reason: "bad_agent_id" };
+  }
   if (b.version !== undefined && typeof b.version !== "string") return { ok: false, reason: "bad_version" };
   if (b.role !== undefined && typeof b.role !== "string") return { ok: false, reason: "bad_role" };
   if (b.reported_revision !== undefined && typeof b.reported_revision !== "number") {
@@ -181,6 +186,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
   return {
     ok: true,
     report: {
+      agent_id: b.agent_id as string | undefined,
       version: b.version as string | undefined,
       role: b.role as string | undefined,
       tunnels: b.tunnels as ReportedTunnel[] | undefined,
@@ -234,6 +240,12 @@ export async function submitStateReport(
   if (!validated.ok) return { ok: false, status: 400, reason: validated.reason };
 
   const report = validated.report;
+  // Credential remains the authentication truth. agent_id is an immutable
+  // runtime-instance guard: new Agents report it and must match the Node row.
+  // Older Agents that do not report agent_id remain temporarily compatible.
+  if (report.agent_id !== undefined && report.agent_id !== auth.agent_id) {
+    return { ok: false, status: 401, reason: "agent_id_mismatch" };
+  }
   const reportedAt = new Date();
   await db.nodeStateReport.upsert({
     where: { node_id: auth.node_id },
