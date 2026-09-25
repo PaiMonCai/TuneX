@@ -357,6 +357,13 @@ func TestReplaceListenerMovesPortAndDrainsTheOldOne(t *testing.T) {
 	}
 }
 
+// TestReplaceListenerBindFailureKeepsTheOldInstanceRunning is the §13.3.5
+// PREPARE-failure rule on the listener path: the new port cannot be bound, so
+// the old applied revision keeps running and its port reservation stays.
+//
+// The failure must come from a listener move. The previous construction
+// occupied the tunnel's CURRENT port, which only pinned the universal
+// gateway, so it collapsed into a no-op that exercised nothing.
 func TestReplaceListenerBindFailureKeepsTheOldInstanceRunning(t *testing.T) {
 	em := NewEgressManager()
 	tm := NewTunnelManager(em, "127.0.0.1")
@@ -369,14 +376,16 @@ func TestReplaceListenerBindFailureKeepsTheOldInstanceRunning(t *testing.T) {
 	}
 	defer tm.StopAll()
 
-	// Occupy the target port with a foreign process so the bind MUST fail.
-	blocker, err := net.Listen("tcp", addrFor(port))
+	// Hold the port the replacement wants to MOVE TO, with a foreign
+	// process, so the new bind must fail.
+	newPort := freePort(t)
+	blocker, err := net.Listen("tcp", addrFor(newPort))
 	if err != nil {
-		t.Skipf("cannot occupy the port: %v", err)
+		t.Skipf("cannot occupy the target port: %v", err)
 	}
 	defer blocker.Close()
 
-	next := relayCfg("safe", port, addrFor(aPort), 9)
+	next := relayCfg("safe", newPort, addrFor(aPort), 9)
 	if _, err := tm.ReplaceListener(next); err == nil {
 		t.Fatal("ReplaceListener succeeded on a port held by a foreign process")
 	}
@@ -389,14 +398,21 @@ func TestReplaceListenerBindFailureKeepsTheOldInstanceRunning(t *testing.T) {
 	if cfg.Revision != 1 {
 		t.Fatalf("running revision = %d, want the old 1", cfg.Revision)
 	}
-	if got := servedLabel(t, addrFor(port)); got != "srv:a" {
-		// The blocker accepts a connection and never answers, so this dial
-		// would time out rather than return a label. Probe the manager
-		// state instead of the wire.
-		t.Logf("port is held by the blocker (expected); tunnel state: %+v", cfg)
+	if cfg.IngressPort != port {
+		t.Fatalf("running listen port = %d, want the old %d", cfg.IngressPort, port)
 	}
+	// The old instance still serves traffic on the old port: it is the
+	// tunnel, not the blocker (which never answers).
+	if got := servedLabel(t, addrFor(port)); got != "srv:a" {
+		t.Fatalf("the old instance stopped serving after a failed replacement: %q", got)
+	}
+	// Neither port reservation was lost or leaked: the old one stays taken,
+	// and the blocked one was never ours.
 	if !tm.UsedPorts()[port] {
 		t.Fatal("the failed replacement released the old tunnel's port reservation")
+	}
+	if tm.UsedPorts()[newPort] {
+		t.Fatal("the failed replacement reserved a port it does not own")
 	}
 }
 
@@ -425,6 +441,114 @@ func TestReplaceListenerSamePortKeepsServing(t *testing.T) {
 	}
 	if !tm.UsedPorts()[port] {
 		t.Fatal("the port reservation was lost by a same-port replacement")
+	}
+}
+
+// TestReplaceListenerSamePortTargetSwapKeepsLiveConnections is the manager's
+// side of the §13.3.4 "Target Host / Port" row: an upstream-only change must
+// retarget the RUNNING forwarder in place. Going through applyLocked instead
+// (Apply's same-port path stops the old forwarder first) would drain the held
+// connection and reset the byte counter, which is the silent outage the row
+// exists to prevent — so this test fails on observables a rebuild cannot fake:
+// the very same forwarder pointer, a byte counter that survives, and a held
+// connection that keeps relaying.
+func TestReplaceListenerSamePortTargetSwapKeepsLiveConnections(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	aPort, aServed := labeledServer(t, "a")
+	defer aServed()
+	bPort, bServed := labeledServer(t, "b")
+	defer bServed()
+	port := freePort(t)
+
+	base := relayCfg("swap", port, addrFor(aPort), 3)
+	before, err := tm.Apply(base)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer tm.StopAll()
+
+	// A held connection through the running forwarder, plus bytes on the
+	// counter, so a rebuild is detectable.
+	held, err := dialRetry(t, addrFor(port))
+	if err != nil {
+		t.Fatalf("dial held: %v", err)
+	}
+	defer held.Close()
+	if got := readOneLine(t, held); got != "srv:a" {
+		t.Fatalf("pre-swap label = %q, want srv:a", got)
+	}
+	if _, err := held.Write([]byte("live\n")); err != nil {
+		t.Fatalf("write on held conn: %v", err)
+	}
+	if bytes := tm.Stats("swap"); bytes == 0 {
+		t.Fatal("forwarded bytes stayed 0 after a completed round trip")
+	}
+	bytesBefore := tm.Stats("swap")
+
+	next := base.Clone()
+	next.NextHop = addrFor(bPort)
+	next.Revision = 4
+	got, err := tm.ReplaceListener(next)
+	if err != nil {
+		t.Fatalf("ReplaceListener (same port, new upstream): %v", err)
+	}
+	if got != before {
+		t.Fatal("an upstream-only change must retarget the running forwarder, not build a new one")
+	}
+	if tm.Stats("swap") < bytesBefore {
+		t.Fatalf("forwarded bytes went %d -> %d, want the surviving forwarder's counter", bytesBefore, tm.Stats("swap"))
+	}
+	if tm.LiveConns("swap") < 1 {
+		t.Fatal("LiveConns dropped the held connection during a target swap")
+	}
+
+	// The new target serves new connections, on the same listener.
+	if got := servedLabel(t, addrFor(port)); got != "srv:b" {
+		t.Fatalf("target after target swap = %q, want srv:b", got)
+	}
+	// The registered config describes the revision the node now runs.
+	if cfg, ok := tm.Get("swap"); !ok || cfg.Revision != 4 {
+		t.Fatalf("registered revision after target swap = %+v ok=%v, want 4", cfg, ok)
+	}
+	if !tm.UsedPorts()[port] {
+		t.Fatal("the port reservation was lost by a target swap")
+	}
+}
+
+// TestReplaceListenerTargetSwapFallbackKeepsNodeServing pins the defensive
+// exit: when the forwarder cannot swap its upstream in place, the manager
+// rebuilds through Apply rather than failing the command and leaving the node
+// running a config the panel no longer believes in.
+func TestReplaceListenerTargetSwapFallbackKeepsNodeServing(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	aPort, aServed := labeledServer(t, "a")
+	defer aServed()
+	bPort, _ := labeledServer(t, "b")
+	port := freePort(t)
+
+	base := relayCfg("fallback", port, addrFor(aPort), 2)
+	if _, err := tm.Apply(base); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	defer tm.StopAll()
+
+	// A plan the manager cannot honour in place: the port moved AND the
+	// target moved, so there is no one-listener swap to perform. The node
+	// must still end up serving the requested target.
+	next := base.Clone()
+	next.IngressPort = freePort(t)
+	next.NextHop = addrFor(bPort)
+	next.Revision = 3
+	if _, err := tm.ReplaceListener(next); err != nil {
+		t.Fatalf("ReplaceListener (port + target): %v", err)
+	}
+	if got := servedLabel(t, addrFor(next.IngressPort)); got != "srv:b" {
+		t.Fatalf("target after port+target change = %q, want srv:b", got)
+	}
+	if cfg, ok := tm.Get("fallback"); !ok || cfg.Revision != 3 || cfg.IngressPort != next.IngressPort {
+		t.Fatalf("registered config after port+target change = %+v ok=%v", cfg, ok)
 	}
 }
 

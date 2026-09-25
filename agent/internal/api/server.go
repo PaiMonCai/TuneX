@@ -260,18 +260,15 @@ func (s *Server) handleApplyTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Route by the hot-reload plan (WP2, DEVELOPMENT.md §13.3.4): a command
-	// that moves the listener must not drop live connections, so it goes
-	// through the replace path that binds the new listener first.
-	if cur, ok := s.tunnels.Get(cfg.ID); ok && cfg.ID != "" {
-		if manager.PlanForwardSwap(cur, cfg).Strategy == manager.SwapListener {
-			_, err = s.tunnels.ReplaceListener(cfg)
-		} else {
-			_, err = s.tunnels.Apply(cfg)
-		}
-	} else {
-		_, err = s.tunnels.Apply(cfg)
-	}
-	if err != nil {
+	// that moves the listener must not drop live connections, and a command
+	// that only moves the upstream must not rebuild the forwarder at all.
+	// ReplaceListener makes both decisions inside the manager, against the
+	// config the node is actually running, under the manager's lock — the
+	// same routing the panel's apply_tunnel command gets. Applying the plan
+	// here as well would freeze a classification the running config may
+	// already have contradicted, and it would give the two apply surfaces
+	// two places to keep in sync.
+	if _, err := s.tunnels.ReplaceListener(cfg); err != nil {
 		if errors.Is(err, manager.ErrStaleRevision) {
 			// The panel must reject this command rather than retry it.
 			writeError(w, http.StatusConflict, err.Error())

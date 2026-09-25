@@ -179,21 +179,23 @@ func (c *Client) execute(cmd *QueuedCommand) ackPayload {
 // (DEVELOPMENT.md §13.3.4) are honoured by the command path and not only by
 // the local admin API:
 //
-//   - a listener move (port / mode) goes through ReplaceListener, which
-//     binds the new listener BEFORE draining the old one;
-//   - an upstream-only change rides on Apply's existing same-port path;
+//   - a listener move (port / mode) binds the new listener BEFORE draining
+//     the old one;
+//   - an upstream-only change on a running listener is swapped in place, so
+//     the live connections keep relaying and the byte counter survives;
 //   - EGRESS and everything else keep the previous behaviour verbatim.
+//
+// ReplaceListener is that router: the plan is evaluated inside the manager,
+// against the running config, under the manager's lock — the same evaluation
+// the admin API gets. Recomputing it here instead would freeze a classification
+// that the manager has already contradicted by the time the locked section
+// runs.
 //
 // The plan is advisory about HOW to apply, never about WHETHER: the revision
 // gate and every port conflict stay inside the manager, so a bad plan cannot
 // make a command succeed or fail differently than the manager decides.
 func (c *Client) applyByPlan(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
-	if cur, ok := c.tunnels.Get(cfg.ID); ok {
-		if manager.PlanForwardSwap(cur, cfg).Strategy == manager.SwapListener {
-			return c.tunnels.ReplaceListener(cfg)
-		}
-	}
-	return c.tunnels.Apply(cfg)
+	return c.tunnels.ReplaceListener(cfg)
 }
 
 // prepareEgressPool stages the desired target pool before an EGRESS listener

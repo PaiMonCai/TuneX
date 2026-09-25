@@ -194,6 +194,25 @@ main (9a489b5)
 | C6 | `control/client.go` `apply_tunnel` + `api/server.go` `POST /tunnel` 按 plan 路由（listener 移动走 `ReplaceListener`）+ `control/hotreload_test.go`：命令路径换端口不断连、幂等 replay no-op、stale 拒绝 | 只改 agent 命令面 |
 | C7 | （本 commit）报告同步实际切片与验收结果 | 仅文档 |
 
+### 5.1 补片 C8（收尾审查发现，见 §9.3）
+
+C6 的布线**只覆盖了 listener 移动**：命令面按 `Strategy == SwapListener` 选 `ReplaceListener`，其余一律回落到 `Apply`。于是 §13.3.4 的「Target Host / Port」行在生产路径上走的是 `Apply` 的 same-port 路径——而那条路径是「停旧 → 起新」，drain 掉全部活动连接并清零字节计数器。探针实测：同端口换 upstream 耗时 3.0036s（= `drainTimeout` 硬上限），`Stats` 由 14 归零，`LiveConns` 1→0。原语存在，但没有任何一个生产入口调它。
+
+C8 把路由收敛进 manager 单点，并补三类定向测试：
+
+- `applyRoutedLocked` 成为唯一路由点，两个 apply 面（`apply_tunnel`、`POST /tunnel`）都直接调 `ReplaceListener`，不再各自算 plan——两层各算一次必然漂移，且在外层的分类在拿锁前就过期了；
+- `hotSwapUpstreamLocked`：同 listener 换 upstream 只改运行中 forwarder 的 dial 地址，listener、活动连接、字节计数全部保留；`SetUpstream` 被拒（不可换的 forwarder 种类）时 log 一行并回落到 `Apply` 重建，**不**让命令失败把节点留在面板已不信的配置上；
+- 首次 apply 显式走 `Apply`：对零配置做 diff 永远长得像 listener 移动，若不排除会绕过 `usedPort` 端口 guard（这正是探针日志里 `tunnel listener replaced old_port=0` 暴露的问题）。
+
+| 观察 | 修复前 | 修复后 |
+|---|---|---|
+| 同端口换 target 耗时 | 3.0036s（drainTimeout 上限） | 228µs |
+| `Stats`（字节计数） | 14 → 0（重建清零） | 保留（单调不减） |
+| `LiveConns` | 1 → 0（连接被 drain） | 1 → 1 |
+| 首次 apply 日志 | `tunnel listener replaced old_port=0`（误判 + 绕过端口 guard） | `tunnel applied`，端口 guard 生效 |
+
+顺带修掉两个既有测试缺陷：`TestReplaceListenerBindFailureKeepsTheOldInstanceRunning` 原本占用的是隧道**当前**端口（第二次 `127.0.0.1` bind 必失败）→ 每次都 SKIP、等于没测；改成占用要移动到的**新**端口，真正验证 §13.3.5 PREPARE 失败规则，并新增「旧实例仍可服务 / 端口表无残留」断言。
+
 CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动纳入。**不改 `.github/workflows/ci.yml`**（避免与并行 WP 的 CI 列表冲突——skill 记录的高频冲突点）。
 
 ## 6. 测试计划
@@ -234,14 +253,22 @@ CI 覆盖：`agent` job 的 `go vet ./...` + `go test ./...` + `go build` 自动
 | 检查 | 结果 |
 |---|---|
 | `go vet ./...` | 通过 |
-| `go test ./...`（全量，真实 loopback） | 通过（agentconfig / control / forwarder / manager 四包） |
-| `go test -race`（control / manager / forwarder） | 通过，无 DATA RACE |
+| `go test ./...`（全量，真实 loopback） | 通过（agentconfig / api / control / forwarder / manager 五包） |
+| `go test -race`（api / control / manager / forwarder） | 通过，无 DATA RACE |
 | CI `agent` job（vet + test + build + 交叉编译） | 每个功能 commit 一跑，逐次 success |
 | 对 WP1 分支 / 其他文件的副作用 | 无：`git diff 74f97cd --stat` 只含 `agent/**` + 本报告 |
 
 本地验证纪律：只跑单文件/单包 `go test`（Go 编译器 + 测试比 tsc/next build 轻得多，但 `-race` 全项目仍耗时，故按包执行）。**未**跑 `npm run build` / `tsc --noEmit`（本包不触碰 backend/web，且 CI 拥有重量验证）。
 
-### 9.2 回滚
+### 9.2 审查发现与修正（C8 引出的契约缺口）
+
+1. **同端口 target 热换未走热换路径**（§1.3 表「Target Host / Port」行的 owner 原语未接线）。C6 只把 listener 移动接到 `ReplaceListener`，target-only 改动全部回落到 `Apply` 的 same-port 路径（停旧→起新），**协议上违反** §13.3.4「旧 TCP 连接继续；新连接走新目标」。已由 §5.1 的 `hotSwapUpstreamLocked` + 三类定向测试修复（api / control / manager 三层各一条）。
+2. **plan 在两处各算一次**。命令面自己 `PlanForwardSwap` 挑路径，manager 锁内又算一次；外层那次在拿锁前就可能已过期（配置已被并发 Apply 改掉）。已收敛到 manager 锁内的 `applyRoutedLocked` 单点路由。
+3. **首次 apply 被误判成 listener 替换**。对零配置做 diff 永远呈现「端口 0→N」，会走 `replaceListenerLocked` 从而**完全绕过 `usedPort` 端口 guard**——不是优雅降级，是把端口冲突检查跳过了。已显式分流到 `applyLocked`。
+4. `TestReplaceListenerBindFailureKeepsTheOldInstanceRunning` 长期 SKIP（占错端口）。已改成占用要移动到的目标端口，恢复成真正跑的 PREPARE 失败规则用例。
+5. 核对无越界：仅 `agent/**` + 本报告；`backend/`、`web/`、`.github/workflows/ci.yml`、迁移目录均未触碰。
+
+### 9.3 回滚
 
 - 纯代码回滚；无 schema、无 wire 契约变化，`backend`/`web` 零影响，回滚不需要数据修复。
 - 不碰生产 DB/容器、不做部署。
