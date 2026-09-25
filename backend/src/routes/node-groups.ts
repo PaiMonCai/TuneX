@@ -281,6 +281,9 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       }, 403);
     }
 
+    if (!("node" in reserved) || !reserved.node) {
+      return c.json({ error: "创建节点失败" }, 500);
+    }
     const enrollment = await createNodeEnrollment(reserved.node.id);
     return c.json({
       data: {
