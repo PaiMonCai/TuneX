@@ -28,7 +28,9 @@ import { db } from "../db.ts";
 import {
   SCHEDULER_ERROR_CODES,
   createRelayTunnel,
+  reapplyDirectTunnel,
   reapplyRelayTunnel,
+  type ApplyDirectResult,
   type CreateRelayTunnelResult,
 } from "./scheduler.ts";
 import type { Orchestrator } from "./orchestrator.ts";
@@ -132,6 +134,7 @@ export interface TunnelRow {
   user_id: number;
   workspace_id: number;
   tunnel_mode: string | null;
+  ingress_node_id: number | null;
   egress_node_id: number | null;
   egress_pool_id: number | null;
   egress_port: number | null;
@@ -211,6 +214,12 @@ export interface TunnelApiDeps {
     orchestrator: Orchestrator,
     deps?: unknown,
   ) => Promise<CreateRelayTunnelResult>;
+  /** DIRECT 对既有 pending 行的 v3 编排。 */
+  applyDirect?: (
+    tunnelId: number,
+    orchestrator: Orchestrator,
+    deps?: unknown,
+  ) => Promise<ApplyDirectResult>;
   /**
    * 进程级 orchestrator（WP8 的 Orchestrator 实例，revision 闸门跨请求共享）。
    * 未注入时隧道操作仍可读写 desired state，但 apply 停在 pending——
@@ -228,6 +237,7 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
   loadPolicy: (workspaceId: number) => Promise<EffectivePolicy>;
   applyCreate: (input: unknown, orchestrator: Orchestrator) => Promise<CreateRelayTunnelResult>;
   applyReapply: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<CreateRelayTunnelResult>;
+  applyDirect: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<ApplyDirectResult>;
   now: () => Date;
 } {
   return {
@@ -237,6 +247,8 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
       over?.applyCreate ?? (createRelayTunnel as unknown as (i: unknown, o: Orchestrator) => Promise<CreateRelayTunnelResult>),
     applyReapply:
       over?.applyReapply ?? (reapplyRelayTunnel as unknown as (t: number, o: Orchestrator, d?: unknown) => Promise<CreateRelayTunnelResult>),
+    applyDirect:
+      over?.applyDirect ?? (reapplyDirectTunnel as unknown as (t: number, o: Orchestrator, d?: unknown) => Promise<ApplyDirectResult>),
     now: over?.now ?? (() => new Date()),
   };
 }
@@ -510,10 +522,19 @@ export async function createTunnel(
   if (mode === null) return err("invalid_input", "隧道模式非法（direct/relay）");
 
   if (mode === "direct") {
-    /* ---- DIRECT：desired = direct，无编排（行为与原版一致）---- */
     const forward = (input.forwardAddresses ?? []).map((x) => String(x).trim()).filter(Boolean);
     if (forward.length === 0) return err("invalid_input", "至少需要一个转发目标");
-    const created = asRow<TunnelRow>(
+    const parsed = parseForwardAddress(forward[0]);
+    if (!parsed) return err("invalid_input", "DIRECT 转发目标格式应为 host:port");
+    const split = /^\[([^\]]+)\]:(\d+)$/.exec(parsed) ?? /^([^:]+):(\d+)$/.exec(parsed);
+    if (!split) return err("invalid_input", "DIRECT 转发目标格式应为 host:port");
+    const remoteHost = input.remoteHost ?? split[1]!;
+    const remotePort = input.remotePort ?? Number(split[2]);
+
+    const inGroup = asRow<NodeGroupRow>(await pdb.nodeGroup.findUnique({ where: { id: input.inNodeGroupId } }));
+    if (!inGroup) return err("not_found", "入口节点组不存在");
+
+    const pending = asRow<TunnelRow>(
       await pdb.tunnel.create({
         data: {
           name,
@@ -530,15 +551,52 @@ export async function createTunnel(
           user_id: input.userId,
           workspace_id: input.workspaceId,
           tunnel_mode: "direct",
-          desired_status: "active",
-          apply_status: "active",
-          remote_host: input.remoteHost ?? null,
-          remote_port: input.remotePort ?? null,
+          desired_status: "inactive",
+          apply_status: "pending",
+          config_revision: 0,
+          applied_revision: null,
+          remote_host: remoteHost,
+          remote_port: remotePort,
         },
       }),
     );
-    if (!created) return err("db_unavailable", "创建失败");
-    return { ok: true, tunnelId: created.id, mode: "direct" };
+    if (!pending) return err("db_unavailable", "创建失败");
+
+    const policy = await deps.loadPolicy(input.workspaceId);
+    const decision = checkTunnelCreation(policy, {
+      tunnelCount: 0,
+      trafficUsed: 0,
+      protocol: input.tunnelType ?? "tcp",
+      inGroupOwned: inGroup.workspace_id === input.workspaceId,
+      inGroupId: inGroup.id,
+      outGroupId: null,
+      outGroupOwned: true,
+    });
+    if (!decision.allowed) {
+      await pdb.tunnel.update({
+        where: { id: pending.id },
+        data: {
+          apply_status: "error",
+          desired_status: "inactive",
+          apply_error_code: SCHEDULER_ERROR_CODES.policy_denied,
+          apply_error: `[${SCHEDULER_ERROR_CODES.policy_denied}] ${decision.message ?? "策略拒绝"}`,
+        },
+      }).catch(() => {});
+      return err("policy_denied", decision.message ?? "策略拒绝");
+    }
+
+    const orchestrator = over?.orchestrator ?? null;
+    if (!orchestrator) return { ok: true, tunnelId: pending.id, mode: "direct", revision: 0 };
+
+    const applied = await deps.applyDirect(pending.id, orchestrator, {
+      db: deps.db as never,
+      loadPolicy: deps.loadPolicy,
+      now: deps.now,
+    });
+    if (!applied.ok) {
+      return err("apply_failed", applied.error, { apply_error_code: applied.error_code });
+    }
+    return { ok: true, tunnelId: pending.id, mode: "direct", revision: applied.revision };
   }
 
   /* ---- RELAY：落 pending desired，交给编排器 ---- */
@@ -616,21 +674,28 @@ export async function createTunnel(
     return err("policy_denied", decision.message ?? "策略拒绝");
   }
 
-  const result = await deps.applyCreate(
-    {
-      name,
-      userId: input.userId,
-      workspaceId: input.workspaceId,
-      personalWorkspaceId: input.personalWorkspaceId,
-      tunnelType: input.tunnelType ?? "tcp",
-      inNodeGroupId: input.inNodeGroupId,
-      outNodeGroupId: input.outNodeGroupId,
-      egressPoolId: input.egressPoolId ?? null,
-      listenPort: input.listenPort ?? null,
-      listenIp: "0.0.0.0",
-    },
-    orchestrator,
-  );
+  const result = over?.applyCreate
+    ? await deps.applyCreate(
+        {
+          tunnelId: pending.id,
+          name,
+          userId: input.userId,
+          workspaceId: input.workspaceId,
+          personalWorkspaceId: input.personalWorkspaceId,
+          tunnelType: input.tunnelType ?? "tcp",
+          inNodeGroupId: input.inNodeGroupId,
+          outNodeGroupId: input.outNodeGroupId,
+          egressPoolId: input.egressPoolId ?? null,
+          listenPort: input.listenPort ?? null,
+          listenIp: "0.0.0.0",
+        },
+        orchestrator,
+      )
+    : await deps.applyReapply(pending.id, orchestrator, {
+        db: deps.db as never,
+        loadPolicy: deps.loadPolicy,
+        now: deps.now,
+      });
 
   if (!result.ok) {
     // 失败已由编排器落库（apply_status=error + 结构化错误 + 补偿）。
