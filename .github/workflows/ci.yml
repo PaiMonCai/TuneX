@@ -153,8 +153,30 @@ jobs:
           path: agent/dist/
           retention-days: 14
 
+  v3-integration:
+    needs: [secret-scan, backend, agent]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run outbound-only DIRECT / RELAY integration gate
+        run: |
+          bash scripts/v3-e2e/setup.sh
+          bash scripts/v3-e2e/verify.sh
+      - name: Upload v3 integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v3-integration-evidence
+          path: scripts/v3-e2e/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Teardown v3 integration topology
+        if: always()
+        run: DELETE_IMAGES=1 bash scripts/v3-e2e/teardown.sh
+
   images:
-    needs: [secret-scan, backend, web, agent]
+    needs: [secret-scan, backend, web, agent, v3-integration]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
