@@ -1406,13 +1406,13 @@ Gate F5  Real E2E passed                ✅（WP14）
 Gate F6  DIRECT v3 migrated             ✅（WP15）
 ```
 
-当前 Active Core WP：
+v3 迁移阶段当前没有 Active Core WP：
 
 ```text
 - none
 ```
 
-后续出现 WP16+ 时，为该能力单独建立 contract 和 Integration Gate；兼容 API 删除也必须作为独立 breaking-change PR 处理。
+V4 的 Active Plan、并行 Track 与 Gate 已迁移到第 13 节；V4 完成后出现 WP16+ 时，为新协议能力单独建立 contract 和 Integration Gate。兼容 API 删除仍必须作为独立 breaking-change PR 处理。
 
 ---
 
@@ -1501,7 +1501,7 @@ Gate F6  DIRECT v3 migrated             ✅（WP15）
 
 ## 10. 分支、PR 与提交约定
 
-分支名必须与 Work Package 对应，使用第 7 节统一命名，例如：
+第 7 节以下命名保留为 v3 历史示例。**当前 V4 新分支必须使用 §13.9 的 `feature/v4-wp*` / `test/v4-wp*` 命名。** v3 历史命名例如：
 
 ```text
 feature/v3-wp1-schema
@@ -1520,7 +1520,7 @@ feature/v3-wp13-tunnel-web
 test/v3-wp14-e2e-harness
 ```
 
-禁止创建“v3-next”“v3-all”“next-stage”这类把多个 WP 混在一起的总分支。
+禁止创建“v3-next”“v3-all”“v4-all”“next-stage”这类把多个 WP 混在一起的总分支。
 
 PR 标题：
 
@@ -1616,7 +1616,7 @@ V4-WP5  Node Lifecycle Foundation       NEXT / 可与 WP1 做契约层并行
 - 同时删除兼容 mock/test；
 - 新集成一律只使用 `/api/forwards`。
 
-后续开发、分支、PR 和合并判断继续以第 7 节的依赖规则与 Integration Gate 为准。
+V4 后续开发、分支、PR 和合并判断以第 13 节的 Work Package、并行波次与 Integration Gate 为准；第 7 节只保留 v3 历史迁移记录。
 
 ---
 
