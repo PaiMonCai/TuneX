@@ -223,55 +223,70 @@ def delete_named(cookie, workspace_id, name):
             assert status == 200, f"{ERR}delete {name} -> {status} {body}"
 
 
-def create_direct(cookie, workspace_id, in_group, spec):
+def _target(spec):
+    value = spec["forward_addresses"][0]
+    host, port = value.rsplit(":", 1)
+    return host.strip("[]"), int(port)
+
+
+def create_direct(cookie, workspace_id, ingress_node, spec):
     delete_named(cookie, workspace_id, spec["name"])
+    host, port = _target(spec)
     status, body, _ = req(
         "POST",
-        "/api/tunnels",
+        f"/api/nodes/{ingress_node['id']}/forwards",
         {
             "name": spec["name"],
-            "in_node_group_id": in_group["id"],
-            "tunnel_type": "tcp",
             "listen_port": spec["listen_port"],
-            "forward_addresses": spec["forward_addresses"],
+            "target_host": host,
+            "target_port": port,
         },
         cookie,
         {"x-workspace-id": str(workspace_id)},
         timeout=45,
     )
-    assert status in (200, 201), f"{ERR}DIRECT create -> {status} {body}"
-    tunnel = unwrap(body)
-    assert tunnel.get("apply_status") == "active", f"{ERR}DIRECT not active: {tunnel}"
-    assert tunnel.get("ingress_node_id"), f"{ERR}DIRECT missing concrete ingress binding"
-    return tunnel
+    assert status in (200, 201), f"{ERR}DIRECT PortForward create -> {status} {body}"
+    forward = unwrap(body)
+    assert forward.get("mode") == "direct", f"{ERR}DIRECT mode mismatch: {forward}"
+    assert forward.get("apply_status") == "active", f"{ERR}DIRECT not active: {forward}"
+    assert forward.get("ingress_node_id") == ingress_node["id"], f"{ERR}DIRECT concrete ingress mismatch"
+    return forward
 
 
-def create_relay(cookie, workspace_id, in_group, out_group, spec):
+def create_relay(cookie, workspace_id, ingress_node, egress_node, spec):
     delete_named(cookie, workspace_id, spec["name"])
+
+    bind_status, bind_body, _ = req(
+        "POST",
+        f"/api/nodes/{ingress_node['id']}/bindings",
+        {"egress_node_id": egress_node["id"]},
+        cookie,
+        {"x-workspace-id": str(workspace_id)},
+    )
+    assert bind_status in (200, 201), f"{ERR}bind egress -> {bind_status} {bind_body}"
+
+    host, port = _target(spec)
     status, body, _ = req(
         "POST",
-        "/api/tunnels/v3/relay",
+        f"/api/nodes/{ingress_node['id']}/forwards",
         {
             "name": spec["name"],
-            "in_node_group_id": in_group["id"],
-            "out_node_group_id": out_group["id"],
-            "tunnel_type": "tcp",
             "listen_port": spec["listen_port"],
+            "target_host": host,
+            "target_port": port,
+            "egress_node_id": egress_node["id"],
         },
         cookie,
         {"x-workspace-id": str(workspace_id)},
         timeout=60,
     )
-    assert status in (200, 201), f"{ERR}RELAY create -> {status} {body}"
-    tunnel = unwrap(body)
-    if isinstance(tunnel, dict) and "tunnel" in tunnel:
-        tunnel = tunnel["tunnel"]
-    assert tunnel.get("apply_status") == "active", f"{ERR}RELAY not active: {tunnel}"
-    assert tunnel.get("ingress_node_id"), f"{ERR}RELAY missing ingress binding"
-    assert tunnel.get("egress_node_id"), f"{ERR}RELAY missing egress binding"
-    assert tunnel.get("egress_port"), f"{ERR}RELAY missing egress port"
-    return tunnel
-
+    assert status in (200, 201), f"{ERR}RELAY PortForward create -> {status} {body}"
+    forward = unwrap(body)
+    assert forward.get("mode") == "relay", f"{ERR}RELAY mode mismatch: {forward}"
+    assert forward.get("apply_status") == "active", f"{ERR}RELAY not active: {forward}"
+    assert forward.get("ingress_node_id") == ingress_node["id"], f"{ERR}RELAY ingress mismatch"
+    assert forward.get("egress_node_id") == egress_node["id"], f"{ERR}RELAY egress mismatch"
+    return forward
 
 def write_state(state):
     with open(STATE, "w", encoding="utf-8") as fh:
@@ -334,14 +349,14 @@ elif PHASE == "tunnels":
     direct = create_direct(
         cookie,
         primary,
-        state["nodeGroups"]["ingress"],
+        state["nodes"]["ingress"],
         TUNNEL_SPECS["direct"],
     )
     relay = create_relay(
         cookie,
         primary,
-        state["nodeGroups"]["ingress"],
-        state["nodeGroups"]["egress"],
+        state["nodes"]["ingress"],
+        state["nodes"]["egress"],
         TUNNEL_SPECS["relay"],
     )
     state["tunnels"] = {
