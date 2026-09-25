@@ -31,6 +31,7 @@ func TestParseRejectsRemovedLegacyFlags(t *testing.T) {
 
 func TestParseSurvivingFlags(t *testing.T) {
 	cfg, err := Parse([]string{
+		"--agent-id", "agt_01",
 		"--node-id", "node-01",
 		"--role", "ingress",
 		"--panel-http-url", "http://panel:3001/",
@@ -41,6 +42,9 @@ func TestParseSurvivingFlags(t *testing.T) {
 	}, "test")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.AgentID != "agt_01" {
+		t.Errorf("AgentID = %q", cfg.AgentID)
 	}
 	if cfg.NodeID != "node-01" {
 		t.Errorf("NodeID = %q", cfg.NodeID)
@@ -114,6 +118,7 @@ func TestNormalizeRole(t *testing.T) {
 func TestApplyYAMLV3Keys(t *testing.T) {
 	cfg := &Config{}
 	applyYAML(cfg, `
+agent-id: agt_42
 node-id: node-42
 role: egress
 debug: true
@@ -126,7 +131,7 @@ egress-range: 30001-60000
 node-credential: cred
 # a comment line
 `)
-	if cfg.NodeID != "node-42" || cfg.Role != "egress" || !cfg.Debug || cfg.ListenIP != "10.0.0.5" {
+	if cfg.AgentID != "agt_42" || cfg.NodeID != "node-42" || cfg.Role != "egress" || !cfg.Debug || cfg.ListenIP != "10.0.0.5" {
 		t.Errorf("scalars: %+v", cfg)
 	}
 	if cfg.PanelHTTPURL != "http://panel:3001" || cfg.AgentAdminPort != 9090 || cfg.AgentAdminToken != "tok" {
@@ -189,7 +194,7 @@ func TestUsageHasNoLegacyFlags(t *testing.T) {
 			t.Errorf("usage still documents removed flag %q:\n%s", bad, out)
 		}
 	}
-	for _, good := range []string{"--role", "--panel-http-url", "--agent-admin-port", "--ingress-range", "--egress-range", "--node-credential"} {
+	for _, good := range []string{"--agent-id", "--role", "--panel-http-url", "--agent-admin-port", "--ingress-range", "--egress-range", "--node-credential"} {
 		if !strings.Contains(out, good) {
 			t.Errorf("usage missing %q:\n%s", good, out)
 		}
