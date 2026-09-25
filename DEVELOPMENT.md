@@ -662,6 +662,8 @@ DoD：
 
 **Track：B/C；依赖 WP6。**
 
+状态：**已实现，待 CI 验证**（分支 `feature/v3-wp7-node-credential`）。
+
 实现：
 
 - per-node credential；
@@ -671,13 +673,38 @@ DoD：
 - state report；
 - reconnect snapshot。
 
-DoD：
+落地位置（单一事实源，改动前先读这几处）：
 
-- A token 不能冒充 B；
-- revoked token 不能重连；
-- rotate 后旧 token 失效；
-- token 不写日志；
-- NAT Agent 只靠出站连接工作。
+- `backend/src/services/node-credential.ts` —— 签发 / 校验 / 轮换 / 撤销，
+  以及 `authenticateNode`（server-side node identity）。**hash at rest**：
+  DB 只存 `sha256(明文)` hex（`CHAR(64)` 唯一列），明文只在 issue/rotate
+  的响应体出现一次。不回落 `node_group.token`（组 token 冒充组内任意节点
+  的口子就是这么来的）。
+- `backend/src/services/node-state.ts` —— 上报校验 + upsert（每节点一行，
+  `NodeStateReport @@unique([node_id])`）+ `buildReconnectSnapshot`。
+- `backend/src/routes/internal-node.ts` —— `POST /api/internal/node/state`、
+  `GET /api/internal/node/snapshot`，Bearer 节点凭据，校验规则与 CSRF /
+  认证 / 限流豁免**四处同步**（auth.ts、csrf.ts、rate-limit.ts、本文件）。
+- `backend/src/routes/admin.ts` —— `/api/admin/node/:id/credential[/rotate|/revoke]`，
+  明文唯一出口。
+- `backend/prisma/migrations/20260925120000_node_credential` —— 纯
+  expand-and-contract：`node` 加四个可空/默认列 + 新表 `node_state_report`。
+- `agent/internal/reporter/heartbeat.go` + `agent/v3runtime.go` —— Agent 侧
+  上报（`--node-credential` / `NODE_CREDENTIAL`）；没有凭据的节点保持旧
+  heartbeat 形态不变。
+
+DoD（每条都有对应单测，见 `backend/src/services/__tests__/node-credential.test.ts`）：
+
+- A token 不能冒充 B —— 认证按哈希唯一列等值查找，命中行即身份；
+- revoked token 不能重连 —— `credential_revoked` 优先级高于哈希比对；
+  撤销保留哈希，面板才能把「撤销」和「瞎猜」区分开（清哈希会把所有
+  失败压成 `invalid_credential`，管理员无从判断要不要人工介入）。想彻底
+  抹掉一把钥匙 → rotate；
+- rotate 后旧 token 失效 —— rotate 覆盖哈希列，旧 sha256 立即查不到；
+- token 不写日志 —— 服务层零 console；Redis 防爆破键也是哈希；
+  `services/audit.ts` 的 `SENSITIVE_RE` 命中 *credential* 会丢 metadata；
+- NAT Agent 只靠出站连接工作 —— 上报由 Agent POST 上来，下发走 Socket.IO，
+  服务层不 import 任何传输层（单测静态断言）。
 
 ---
 
@@ -1142,6 +1169,7 @@ Gate F6  DIRECT v3 migrated             ⏳
 Track A: feature/v3-wp1-schema
 Track B: feature/v3-wp4-agent-runtime
 Track C: feature/v3-wp6-control-contract
+Track B/C: feature/v3-wp7-node-credential （WP7，依赖 WP6 已合并）
 Track D: test/v3-wp14-e2e-harness
 ```
 
@@ -1149,6 +1177,7 @@ Track D: test/v3-wp14-e2e-harness
 
 - **WP1 是当前最高优先级合并 Gate**。
 - WP4/WP6 可以立即开发和评审，但如果最终依赖 WP1 的 contract，必须等待 WP1 合并、更新到最新 main 后才能合并。
+- WP7 依赖 WP6 已合并的 Control Contract；它自己的合并同时解锁 WP8 / WP10。
 - WP14 当前只允许建设测试 harness，不得提前宣称 RELAY 验收完成。
 - Gate F1 通过后，立即解锁 WP2、WP3、WP10 foundation，并继续保持 Track B/C 并行。
 
