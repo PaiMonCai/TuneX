@@ -65,11 +65,12 @@ Node 生命周期改为「Panel 先创建 → 机器后注册」：
 1. Panel 创建 pending Node，只确定 NodeGroup、角色与端口范围；`connect_ip` 可为空。
 2. Panel 生成一个 **10 分钟、一次性** enrollment token，只存哈希。
 3. UI 立即展示可复制的一键安装命令；长期 node credential 不出现在该命令中。
-4. 安装脚本从当前 Panel 下载与其版本匹配的 Agent 二进制。
+4. 安装脚本先确保 Docker Engine 可用，并拉取 Panel 配置的专用多架构 `tunex-agent` 镜像；镜像拉取失败时不得消费 enrollment token。
 5. 节点以 enrollment token 调用机器端 enroll API；服务端原子消费 token，并签发真正的 per-node credential。
-6. 安装脚本把 credential 写入 root-only 环境文件，注册 systemd 并启动 Agent。
-7. Agent 后续只使用 per-node credential 做 outbound command/state/desired；enrollment token 永不复用。
-8. 重新安装必须由 Panel 显式生成新的 enrollment token；新 token 会撤销该节点尚未使用的旧 token。
+6. 安装脚本把 credential 写入宿主机 root-only `/etc/tunex-agent/agent.env`，容器只读挂载该文件，不通过 Docker 环境变量明文注入长期凭据。
+7. Agent 容器使用 `--network host`，让 DIRECT/RELAY 动态监听端口直接绑定宿主机网络；默认 `--restart unless-stopped`。
+8. Agent 后续只使用 per-node credential 做 outbound command/state/desired；enrollment token 永不复用。
+9. 重新安装必须由 Panel 显式生成新的 enrollment token；新 token 会撤销该节点尚未使用的旧 token。
 
 安全约束：
 
@@ -77,7 +78,9 @@ Node 生命周期改为「Panel 先创建 → 机器后注册」：
 - 安装命令可以包含短时 enrollment token，但不得包含长期 credential。
 - enroll 端点必须并发安全：同一 token 最多一个请求成功。
 - Panel 不主动连接 Agent；一键安装不得重新引入公网 9090 依赖。
-- Agent 安装二进制由当前 TuneX 应用镜像提供，保证 Panel 与 Agent 版本可对齐。
+- Agent 使用独立 `ghcr.io/paimoncai/tunex-agent:<sha>` slim multi-arch 镜像；生产应通过 `TUNEX_AGENT_IMAGE` 与 Panel 镜像钉同一 git sha。
+- 安装器不得把长期 node credential 放进 `docker run -e` 或容器元数据；凭据只允许存在于 root-only 宿主机文件与进程内存。
+- Agent Docker 容器必须使用 host network；不得通过预声明固定 `ports:` 映射模拟动态转发端口。
 
 ### 1.2 当前阶段边界
 
