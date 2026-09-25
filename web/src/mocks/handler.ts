@@ -1499,14 +1499,37 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   if (seg[0] === "forwards") {
     const id = parseId(seg[1]);
 
+    if (method === "GET" && seg[1] === "summary") {
+      const rows = db.tunnels
+        .filter((tunnel) => tunnel.user_id === user.id && tunnel.category === "port_forward")
+        .map((tunnel) => mockForwardView(db, tunnel));
+      return ok({
+        total: rows.length,
+        direct: rows.filter((row) => row.mode === "direct").length,
+        relay: rows.filter((row) => row.mode === "relay").length,
+        active: rows.filter((row) => row.apply_status === "active").length,
+        error: rows.filter((row) => row.apply_status === "error").length,
+        suspended: rows.filter((row) => row.apply_status === "suspended").length,
+        pending: rows.filter(
+          (row) => row.apply_status === "pending" || row.apply_status === "applying",
+        ).length,
+        traffic: rows.reduce((sum, row) => sum + row.traffic, 0),
+        traffic_cost: rows.reduce((sum, row) => sum + row.traffic_cost, 0),
+      });
+    }
+
     if (method === "GET" && seg[1] === undefined) {
       const mode = reqStr(q?.mode);
+      const applyStatus = reqStr(q?.apply_status);
       const keyword = reqStr(q?.keyword).toLowerCase();
       let rows = db.tunnels
         .filter((tunnel) => tunnel.user_id === user.id && tunnel.category === "port_forward")
         .map((tunnel) => mockForwardView(db, tunnel));
       if (mode === "direct" || mode === "relay") {
         rows = rows.filter((row) => row.mode === mode);
+      }
+      if (APPLY_STATUSES.includes(applyStatus as (typeof APPLY_STATUSES)[number])) {
+        rows = rows.filter((row) => row.apply_status === applyStatus);
       }
       if (keyword) {
         rows = rows.filter((row) =>
