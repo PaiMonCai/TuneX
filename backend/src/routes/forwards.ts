@@ -13,6 +13,7 @@ import {
   createForward,
   deleteForward,
   getForward,
+  getForwardSummary,
   getForwardTraffic,
   listForwards,
   patchForward,
@@ -110,6 +111,10 @@ forwardsRoutes.get("/", async (c) => {
     keyword: q.keyword?.trim() || undefined,
   });
   return c.json({ data: rows });
+});
+
+forwardsRoutes.get("/summary", async (c) => {
+  return c.json({ data: await getForwardSummary(workspace(c).id) });
 });
 
 forwardsRoutes.post("/", async (c) => {
