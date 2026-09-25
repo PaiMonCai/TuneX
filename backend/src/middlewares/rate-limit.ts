@@ -160,6 +160,16 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     scope: "ip",
   },
   {
+    // 一键安装 enrollment 是匿名机器端点，但 token 有 256-bit 熵且只能使用一次。
+    // 仍给它独立 IP 桶，避免攻击者用大量无效 token 占用 DB/事务资源。
+    name: "node-enrollment",
+    windowSeconds: 60,
+    max: 20,
+    methods: ["POST"],
+    match: (p, m) => isPost(m) && p === "/api/internal/node/enroll",
+    scope: "ip",
+  },
+  {
     // WP7：节点状态上报 / 重连快照，按 IP 限流。上报周期 30s（与心跳同频），
     // 60/min 是两倍余量；爆破指纹的封禁在 Redis 层（node-credential.ts），
     // 这里的上限是第二道闸。scope:"ip" 是关键：节点没有 userId，走 user
