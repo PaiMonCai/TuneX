@@ -300,10 +300,10 @@ tunnelsRoutes.post("/", async (c) => {
   if ("conflict" in reserved && reserved.conflict) {
     return c.json({ error: "监听端口已被占用" }, 409);
   }
-  if (!("tunnelId" in reserved) || typeof pendingTunnelId !== "number") {
+  if (!("tunnelId" in reserved) || typeof reserved.tunnelId !== "number") {
     return c.json({ error: "创建隧道失败：未生成 pending 记录" }, 500);
   }
-  const pendingTunnelId = pendingTunnelId;
+  const pendingTunnelId: number = reserved.tunnelId;
 
   const orchestrator = getOrchestrator();
   if (!orchestrator) {
