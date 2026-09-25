@@ -487,6 +487,7 @@ function seedTunnel(over: Partial<TunnelRow> = {}): TunnelRow {
     user_id: 1,
     workspace_id: 7,
     tunnel_mode: "relay",
+    ingress_node_id: 1,
     egress_node_id: 2,
     egress_pool_id: 99,
     egress_port: null,
