@@ -136,23 +136,33 @@ Tunnel
 
 ### 2.2 出口目标模型
 
-保留 v3map“目标池属于出口节点”的语义，但增加轻量 `EgressPool` 层，避免一台出口节点永远只能服务一个业务目标集合：
+`EgressPool` 继续作为内部 runtime 目标容器，但用户侧 V4 产品模型不要求先创建或选择 Pool。
+普通 RELAY PortForward 的目标属于**该 Forward 自己**，控制面负责创建一个系统管理的
+单成员 EgressPool：
 
 ```text
-Node (egress/both)
-└─ EgressPool
-   └─ EgressTarget[]
+Forward (RELAY / Tunnel runtime)
+├─ egress_node_id
+└─ implicit EgressPool  (system managed, e.g. forward-<tunnelId>)
+   └─ EgressTarget(host, port, weight=1)
 ```
 
 规则：
 
-- 每个出口 Node 自动拥有一个 `default` pool，初期 UI 可以完全隐藏 Pool 概念。
-- Tunnel RELAY 指向 `egress_pool_id`。
-- `EgressTarget` 包含 host、port、weight、order、status。
-- 目标修改只更新 EgressManager 的目标快照，不重建监听。
-- 第一版负载均衡支持 `round / rand / weighted_round`；其余高级策略后置。
-- 任何时刻至少保留一个 active 且 weight > 0 的目标，否则拒绝应用新目标快照。
-
+- 普通 Forward 创建只让用户选择实际 Ingress / Egress Node 与目标 host/port；
+  **不得要求用户填写 NodeGroup ID 或 EgressPool ID**。
+- 每条普通 RELAY Forward 使用独立的系统管理 Pool，挂在所选 Egress Node 上；
+  不得让多条目标不同的 Forward 共用一个全局 `default` Pool，否则修改其中一条目标
+  会污染其它转发。
+- Tunnel runtime 继续通过 `egress_pool_id` 指向该 Pool，Agent / Orchestrator
+  无需增加第二套目标模型。
+- 删除使用 `forward-<tunnelId>` 规则创建的系统 Pool 时，应随 Forward 一起回收；
+  显式创建的高级共享 Pool 不按该规则自动删除。
+- Admin 高级界面仍可维护显式多目标 EgressPool / EgressTarget；这是高级能力，
+  不进入普通 Forward 创建流程。
+- `EgressTarget` 继续包含 host、port、weight、order、status。简单 Forward 首版
+  只有一个 active target；高级多目标负载均衡独立演进。
+- Pool 的默认策略可继承 Node.lb_strategy，目标快照热更新仍不得要求重建 ingress listener。
 ### 2.3 数据平面
 
 第一阶段 v3 只新增 **TCP RELAY**，不改当时正在运行的 DIRECT。
@@ -1222,6 +1232,38 @@ Frontend **允许在后端实现未完成时提前并行开发**，条件是使�
 **Backend 侧（WP11）已在 main，前端 mock 与真实端点的差异：** mock 只覆盖 §4.1 主路径与常见拒绝，
 未模拟编排超时重入、波长高并发下发、端口耗尽等真实竞争；这些竞争由 WP11 的服务层单测与
 WP14 Real E2E 覆盖，前端契约层（types.ts / api.ts）无需改动。
+
+#### V4 产品层收敛（Node-first + Forward）
+
+WP13 的 Tunnel Web 已完成其 v3 技术验证使命；V4 不删除 Tunnel runtime，而是把用户产品层
+收敛成 Node + Forward：
+
+- `/nodes` 只负责 Agent 生命周期、角色、安装与 Ingress→Egress Binding；
+  不在节点页维护 Forward CRUD。
+- `/forwards` 是唯一用户业务入口，同时承载 DIRECT 与 RELAY；创建时直接选择实际 Node。
+- `/api/forwards` + `ForwardService` 是新的用户业务 API / Service 单一入口；
+  旧 `/api/nodes/:ingressId/forwards` 只在兼容窗口保留并委托同一个 Service。
+- `/tunnels` Web 路由只做重定向；旧 `/api/tunnels` 继续作为兼容 API，但响应显式
+  `Deprecation` / successor headers，不再承载新 UI。
+- Forward 详情、流量、运行操作全部通过 `/api/forwards/:id*`，UI 不再引用 TunnelDetail。
+- RELAY 创建允许在同一流程内完成出口绑定；没有可用出口节点时才回到 Node 管理。
+- Forward 列表提供 mode / apply-status / keyword 过滤与工作空间级监控摘要
+  （总数、DIRECT/RELAY、active/pending/suspended/error、累计流量）。
+- 移除 Web 端 node-scoped Forward client；等兼容窗口结束后再独立删除后端旧路由，
+  不在同一 PR 里把兼容删除与产品 UI 重构绑在一起。
+
+V4 的单一边界仍是：
+
+```text
+UI Product Layer
+→ /api/forwards
+→ ForwardService
+→ Tunnel desired/runtime
+→ Scheduler / Orchestrator
+→ Agent TunnelManager
+```
+
+因此 V4 是**产品与控制面解耦**，不是重写 Agent 或复制一套 Forward runtime 表。
 
 ---
 
