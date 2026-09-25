@@ -5,10 +5,10 @@
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
 [![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
-TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户先在控制台创建 Node，复制一键安装命令到 Linux 节点执行，然后直接在入口节点上创建 PortForward；不选出口就是 DIRECT，选择已绑定出口就是 RELAY。内部 `Tunnel` 只作为 revision/ACK/NodePortLease/Reconciler 的运行时对象，不再要求用户手工创建。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
+TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户先在「节点」创建并安装 Agent，再到「转发」创建业务 Forward：不选择出口就是 DIRECT，选择已绑定出口就是 RELAY；RELAY 也可以在创建流程里直接完成出口绑定。内部 `Tunnel` 只作为 revision/ACK/NodePortLease/Reconciler 的 desired/runtime 对象，不再作为普通用户需要管理的第一层资源。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
 
 > [!IMPORTANT]
-> TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 升级验证、Workspace/RBAC、节点级凭据、TCP DIRECT/RELAY v3 数据面与真实 Docker 集成 Gate。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署默认使用 `docker-compose.prod.yaml`，由宿主机 Nginx/宝塔/1Panel 终止 TLS，并直连只绑定在 loopback 的 Web/API/WebSocket 端口。Caddy 是可选项：需要单端口入口时启用 `--profile caddy`，没有宿主机反代时可叠加 `docker-compose.standalone.yaml` 让 Caddy 直接接管 80/443。**
+> TuneX 仍处于积极开发阶段，但核心 v3 迁移已经完成：WP14 真实 DIRECT/RELAY Integration Gate 与 WP15 DIRECT v3 Migration 均已进入 `main`，DIRECT/RELAY 现在共用一套 TunnelManager runtime。当前主分支按 **CI → Integration → Release** 发布。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署默认使用 `docker-compose.prod.yaml`，由宿主机 Nginx/宝塔/1Panel 终止 TLS，并直连只绑定在 loopback 的 Web/API/WebSocket 端口。Caddy 是可选项：需要单端口入口时启用 `--profile caddy`，没有宿主机反代时可叠加 `docker-compose.standalone.yaml` 让 Caddy 直接接管 80/443。**
 
 ## 当前能力
 
@@ -18,9 +18,9 @@ TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用
 | Workspace | 个人空间、团队空间、成员邀请、owner/admin/member/viewer 固定角色 |
 | 权限 | Workspace RBAC、CapabilityPolicy、默认免费策略、节点组授权 |
 | 安全 | CSRF、请求限流、审计、API/订阅密钥哈希存储与一次性轮换 |
-| 节点/转发 | Node 一键 enrollment、INGRESS/EGRESS/BOTH、Ingress↔Egress Binding、Node-first PortForward、TCP DIRECT/RELAY、NodePortLease、revision/ACK、重启恢复与 Reconciler |
-| Web | Next.js 管理控制台、Workspace 切换与成员管理、设置页 |
-| CI | Backend/Web/Agent、秘密扫描、空库/升级迁移、真实 DIRECT/RELAY E2E、统一 GHCR 镜像构建 |
+| 节点/转发 | Node 一键 enrollment、INGRESS/EGRESS/BOTH、Ingress↔Egress Binding、Forward 产品 API、TCP DIRECT/RELAY、NodePortLease、revision/ACK、desired restore 与 Reconciler |
+| Web | 「节点」基础设施管理 + 「转发」业务管理、Forward 监控/筛选/详情、Workspace 切换与成员管理、设置页 |
+| CI/CD | Backend/Web/Agent、秘密扫描、空库/升级迁移、真实 outbound-only DIRECT/RELAY Integration、统一镜像验证、main 自动 Release |
 | 运维 | Compose、Caddy、备份/恢复/告警/容量脚本基础框架 |
 
 后续开发方向、依赖 Gate、迁移规则与 DoD 统一以 [DEVELOPMENT.md](DEVELOPMENT.md) 为准；[docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md) 只作为长期目标架构约束。
@@ -38,13 +38,18 @@ Egress Node
 └─ 先与 Ingress 建立 Binding，之后才会出现在该入口的出口选项中
 ```
 
+普通用户和新集成统一使用 `/api/forwards`。旧 `/api/tunnels` 与
+`/api/nodes/:ingressId/forwards` 目前仅为兼容旧客户端保留，并带有
+deprecation/successor headers；仓库内 V4 Web 不再依赖这些旧接口。
+
 典型使用流程：
 
-1. 在「节点与转发」创建 Node，Panel 同时生成不可变的唯一 `agent_id`；再选择 `INGRESS`、`EGRESS` 或 `BOTH` 能力。
+1. 在「节点」页面创建 Node，Panel 同时生成不可变的唯一 `agent_id`；选择 `INGRESS`、`EGRESS` 或 `BOTH` 能力。
 2. Panel 返回一条可复制的一键安装命令；命令携带 10 分钟一次性 enrollment token、agent_id 和当前节点显示名，不包含长期 credential。
 3. 在节点机器执行命令后，脚本自动准备 Docker、拉取 Agent 镜像、换取长期 per-node credential，并以 host network 容器启动 Agent。
-4. 选择一个入口 Node；需要 RELAY 时先绑定出口 Node。
-5. 在入口 Node 上直接「添加端口转发」：不选出口 = DIRECT，选择已绑定出口 = RELAY。
+4. 需要 RELAY 时，在「节点」维护 Ingress→Egress Binding；也可以直接在创建 RELAY Forward 时完成绑定。
+5. 进入「转发」页面创建业务：DIRECT 只选入口节点和目标；RELAY 再选已绑定出口节点。列表、状态筛选、流量和运行操作都在 Forward 页面完成。
+6. 节点页不再承载 Forward CRUD；`/tunnels` 仅作为历史 URL 重定向到 `/forwards`。
 
 ## 架构
 
@@ -170,7 +175,7 @@ docker compose logs -f web
 | `http://localhost:9091` | Caddy / Web 主入口 |
 | `https://localhost:9445` | Caddy HTTPS 端口映射；本地证书/域名需自行配置 |
 | `http://localhost:8787` | Backend HTTP API |
-| `http://localhost:8788` | Backend Socket.IO / Agent 接入 |
+| `http://localhost:8788` | Backend Socket.IO / 实时兼容通道；生产 Agent 控制默认走 8787 HTTP outbound poll/ACK |
 | `localhost:3307` | MySQL 调试端口 |
 | `localhost:6380` | Redis 调试端口 |
 
@@ -215,7 +220,7 @@ go build -o tunex-agent .
 
 ### 一键安装（推荐）
 
-在「节点与转发」创建 Node 后，Panel 会显示类似下面的一条命令：
+在「节点」页面创建 Node 后，Panel 会显示类似下面的一条命令：
 
 ```bash
 curl -fsSL 'https://panel.example.com/api/internal/node/install.sh' | \
