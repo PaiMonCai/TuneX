@@ -40,7 +40,6 @@ import type {
   Paginated,
   PasswordChangeInput,
   PortForward,
-  PortForwardCreateInput,
   ForwardCreateInput,
   ForwardPatchInput,
   ProvisionNodeResult,
@@ -447,14 +446,6 @@ export const api = {
       post<NodeBinding>(`/nodes/${ingressId}/bindings`, { egress_node_id }, cookie),
     unbindEgress: (ingressId: ID, egressId: ID, cookie?: string) =>
       del<{ ok: boolean }>(`/nodes/${ingressId}/bindings/${egressId}`, cookie),
-    forwards: (ingressId: ID, cookie?: string) =>
-      get<PortForward[]>(`/nodes/${ingressId}/forwards`, undefined, cookie),
-    createForward: (ingressId: ID, input: PortForwardCreateInput, cookie?: string) =>
-      post<PortForward>(`/nodes/${ingressId}/forwards`, input, cookie),
-    forwardAction: (ingressId: ID, forwardId: ID, action: "retry" | "suspend" | "resume", cookie?: string) =>
-      post<PortForward>(`/nodes/${ingressId}/forwards/${forwardId}/${action}`, {}, cookie),
-    removeForward: (ingressId: ID, forwardId: ID, cookie?: string) =>
-      del<{ ok: boolean }>(`/nodes/${ingressId}/forwards/${forwardId}`, cookie),
   },
   nodeGroups: {
     list: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/node-groups", query, cookie),
