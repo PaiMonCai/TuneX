@@ -283,6 +283,22 @@ func (m *TunnelManager) Stats(id string) int64 {
 	return e.fwd.Stats()
 }
 
+// MaxRevision returns the newest config revision among the running tunnels
+// (0 when none or when the source does not track revisions). It is what the
+// WP7 state report sends as reported_revision so the panel can tell
+// "this node is behind" (revision < tunnel.config_revision) from "no data".
+func (m *TunnelManager) MaxRevision() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var max int64
+	for _, e := range m.tunnels {
+		if e.cfg.Revision > max {
+			max = e.cfg.Revision
+		}
+	}
+	return max
+}
+
 // StopAll tears down every tunnel, draining connections. Used on shutdown.
 func (m *TunnelManager) StopAll() {
 	m.mu.Lock()

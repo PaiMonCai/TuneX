@@ -20,11 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/tunex/agent/internal/forwarder"
+	"github.com/tunex/agent/internal/logx"
 )
 
 // Interval is the heartbeat cadence (devmap v0.3: 每 30s 上报一次).
@@ -36,6 +38,14 @@ const ClientTimeout = 10 * time.Second
 
 // HeartbeatPath is the panel endpoint the agent posts to.
 const HeartbeatPath = "/api/internal/heartbeat"
+
+// StatePath is the WP7 state-report endpoint (services/node-state.ts).
+const StatePath = "/api/internal/node/state"
+
+// CredentialHeader carries the per-node credential (services/node-credential.ts).
+// Bearer, because the same agent also speaks to endpoints that document Bearer;
+// the header value never appears in any log line (logx calls never touch it).
+const CredentialHeader = "Authorization"
 
 // ErrNoPanelURL is returned by Run when no panel URL is configured. A node may
 // legitimately run without reporting, so this is a startup decision, not a
@@ -54,6 +64,23 @@ type Payload struct {
 	Timestamp   int64                    `json:"timestamp"`
 	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
 	EgressPools map[string]EgressPool    `json:"egress_pools,omitempty"`
+}
+
+// StatePayload is the WP7 state-report body (POST /api/internal/node/state).
+//
+// It is the heartbeat's stats superset: everything the panel needs to re-derive
+// "what is this node doing right now" without touching the agent, which is what
+// makes a reconnect snapshot possible (devmap §5.5 "节点重启 → 拉取 ACTIVE 隧道"
+// mirrored on the panel side). Shape is owned by services/node-state.ts.
+type StatePayload struct {
+	Version     string                   `json:"version,omitempty"`
+	Role        string                   `json:"role,omitempty"`
+	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
+	EgressPools map[string]EgressPool    `json:"egress_pools,omitempty"`
+	UsedPorts   []int                    `json:"used_ports,omitempty"`
+	// Revision is the newest config revision the agent has applied (0 = none).
+	Revision int64  `json:"reported_revision,omitempty"`
+	LastErr  string `json:"last_error,omitempty"`
 }
 
 // EgressPool is the reported target pool of one egress tunnel.
@@ -89,14 +116,37 @@ type Config struct {
 	Version  string
 	Role     string
 
-	tunnels TunnelLister
-	egress  EgressLister
+	// Credential is the WP7 per-node credential (services/node-credential.ts).
+	// Empty keeps the legacy heartbeat shape and skips the state report — a
+	// node that predates credentials must keep working unchanged.
+	Credential string
+
+	tunnels  TunnelLister
+	egress   EgressLister
+	ports    PortLister
+	revision RevisionLister
+	lastErr  ErrorLister
 
 	// post overrides the HTTP call (tests). Defaults to httpPost.
-	post func(ctx context.Context, url string, body []byte) error
+	post func(ctx context.Context, url string, body []byte, headers map[string]string) error
 	// now overrides time.Now (tests).
 	now func() time.Time
 }
+
+// The sources the state report reads from beyond tunnels/egress:
+// manager.TunnelManager satisfies UsedPorts directly; the applied revision
+// comes from the manager too (its newest applied revision).
+type (
+	PortLister interface {
+		UsedPorts() map[int]bool
+	}
+	RevisionLister interface {
+		MaxRevision() int64
+	}
+	ErrorLister interface {
+		LastError() string
+	}
+)
 
 // Option customises the reporter.
 type Option func(*Config)
@@ -107,10 +157,20 @@ func WithTunnels(t TunnelLister) Option { return func(c *Config) { c.tunnels = t
 // WithEgress sets the egress-pool source.
 func WithEgress(e EgressLister) Option { return func(c *Config) { c.egress = e } }
 
-// WithPost replaces the HTTP transport (tests).
-func WithPost(fn func(ctx context.Context, url string, body []byte) error) Option {
+// WithPost replaces the HTTP transport (tests). The headers map carries the
+// credential for the state report; the legacy heartbeat sends nil headers.
+func WithPost(fn func(ctx context.Context, url string, body []byte, headers map[string]string) error) Option {
 	return func(c *Config) { c.post = fn }
 }
+
+// WithPorts sets the used-port source for the WP7 state report.
+func WithPorts(p PortLister) Option { return func(c *Config) { c.ports = p } }
+
+// WithRevision sets the applied-revision source for the WP7 state report.
+func WithRevision(rev RevisionLister) Option { return func(c *Config) { c.revision = rev } }
+
+// WithLastError sets the error source for the WP7 state report.
+func WithLastError(e ErrorLister) Option { return func(c *Config) { c.lastErr = e } }
 
 // WithClock replaces the clock (tests).
 func WithNow(now func() time.Time) Option { return func(c *Config) { c.now = now } }
@@ -155,6 +215,59 @@ func (r *Reporter) Payload() Payload {
 	return p
 }
 
+// StatePayload builds the WP7 state-report body. It is the heartbeat superset:
+// same tunnel/pool data plus the ports actually bound, the newest applied
+// revision and the last error string. Version/Role come from config, not from
+// the payload — the panel pins them to the credential's node (the agent never
+// gets to say "I am node X").
+func (r *Reporter) StatePayload() StatePayload {
+	p := StatePayload{
+		Version: r.cfg.Version,
+		Role:    r.cfg.Role,
+	}
+	if r.cfg.tunnels != nil {
+		p.Tunnels = r.cfg.tunnels.List()
+	}
+	if r.cfg.egress != nil {
+		p.EgressPools = r.cfg.egress.Snapshot()
+	}
+	if r.cfg.ports != nil {
+		p.UsedPorts = sortedPorts(r.cfg.ports.UsedPorts())
+	}
+	if r.cfg.revision != nil {
+		p.Revision = r.cfg.revision.MaxRevision()
+	}
+	if r.cfg.lastErr != nil {
+		p.LastErr = r.cfg.lastErr.LastError()
+	}
+	return p
+}
+
+// StateEndpoint returns the full state-report URL, or "" when credential-less.
+// A node without a credential keeps the legacy heartbeat only: the panel has no
+// way to attribute a state report for it anyway.
+func (r *Reporter) StateEndpoint() string {
+	base := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
+	if base == "" || strings.TrimSpace(r.cfg.Credential) == "" {
+		return ""
+	}
+	return base + StatePath
+}
+
+// sortedPorts turns the manager's port set into a deterministic slice so the
+// panel's fingerprint comparison does not churn on map iteration order.
+func sortedPorts(in map[int]bool) []int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(in))
+	for p := range in {
+		out = append(out, p)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // Run blocks, sending a heartbeat every Interval until ctx is cancelled or Stop
 // is called. The first beat goes out immediately so the panel sees the node
 // right after a restart (devmap §5.5: 节点重启 → 启动时拉取 ACTIVE 隧道).
@@ -185,6 +298,7 @@ func (r *Reporter) Run(ctx context.Context) error {
 	defer t.Stop()
 
 	r.send(ctx)
+	r.sendState(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -193,6 +307,7 @@ func (r *Reporter) Run(ctx context.Context) error {
 			return nil
 		case <-t.C:
 			r.send(ctx)
+			r.sendState(ctx)
 		}
 	}
 }
@@ -207,8 +322,39 @@ func (r *Reporter) send(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	_ = r.cfg.post(ctx, r.Endpoint(), body)
+	_ = r.cfg.post(ctx, r.Endpoint(), body, nil)
 }
+
+// sendState posts one WP7 state report (best effort, same reasoning as send).
+//
+// Rejected credentials (401) are the one failure worth mentioning to the
+// operator: the node is alive and healthy but can no longer identify itself,
+// which is a provisioning problem they must fix. Transport failures stay
+// swallowed — a flaky panel must never cascade into the data plane.
+func (r *Reporter) sendState(ctx context.Context) {
+	if r.StateEndpoint() == "" {
+		return
+	}
+	body, err := json.Marshal(r.StatePayload())
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
+	defer cancel()
+	err = r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
+	})
+	if isCredentialRejected(err) {
+		logx.Warn("state report rejected: node credential is invalid or revoked",
+			"node_id", r.cfg.NodeID)
+	}
+}
+
+// errRejected is returned by the post hook when the panel answers 401/403.
+// It keeps sendState from parsing error strings to detect a revoked node.
+var errRejected = errors.New("reporter: credential rejected")
+
+func isCredentialRejected(err error) bool { return errors.Is(err, errRejected) }
 
 // Stop makes a running Run return. Safe before/after Run and more than once.
 func (r *Reporter) Stop() {
@@ -221,19 +367,30 @@ func (r *Reporter) Stop() {
 }
 
 // httpPost is the default transport: POST the payload as JSON and treat any
-// 3xx/4xx/5xx as an error so the caller can decide to log it.
-func httpPost(ctx context.Context, url string, body []byte) error {
+// 3xx/4xx/5xx as an error so the caller can decide to log it. 401/403 maps to
+// errRejected so sendState can tell "my credential is no good" (operator must
+// act) from "the panel is flaky" (nothing to do).
+//
+// headers is nil for the legacy heartbeat and carries Authorization for the
+// state report; the credential value is never included in the error text.
+func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("heartbeat post %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
+		}
 		return fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
 	}
 	return nil

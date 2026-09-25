@@ -43,6 +43,12 @@ type Config struct {
 	IngressRange string
 	EgressRange  string
 
+	// NodeCredential is the WP7 per-node credential (services/node-credential.ts).
+	// It authenticates the state report POST /api/internal/node/state; empty
+	// means "no credential provisioned", in which case the heartbeat keeps its
+	// legacy shape and the state report is skipped (the node still works).
+	NodeCredential string
+
 	// Per-protocol fixed listen ports (0 = dynamic / WAIT_LISTEN).
 	TCPPort   int
 	UDPPort   int
@@ -164,6 +170,8 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.IntVar(&cfg.AgentAdminPort, "agent-admin-port", cfg.AgentAdminPort, "Local admin API port; 0 disables it (v3 runtime, default 9090)")
 	fs.StringVar(&cfg.IngressRange, "ingress-range", cfg.IngressRange, "Port range the v3 ingress tunnels may bind, e.g. 10000-30000")
 	fs.StringVar(&cfg.EgressRange, "egress-range", cfg.EgressRange, "Port range the v3 egress tunnels may bind, e.g. 30001-60000")
+	// WP7：per-node credential。绝不明文进日志（usage 文本里也不回显值）。
+	fs.StringVar(&cfg.NodeCredential, "node-credential", cfg.NodeCredential, "Per-node credential for the v3 state report (WP7)")
 
 	// connect-ip is a repeatable string flag (`-i a -i b`).
 	var connectIPs stringList
@@ -288,6 +296,7 @@ func applyDefaults(cfg *Config, file string) {
 	envStr("ROLE", &cfg.Role)
 	envStr("PANEL_HTTP_URL", &cfg.PanelHTTPURL)
 	envStr("AGENT_ADMIN_TOKEN", &cfg.AgentAdminToken)
+	envStr("NODE_CREDENTIAL", &cfg.NodeCredential)
 	envStr("INGRESS_RANGE", &cfg.IngressRange)
 	envStr("EGRESS_RANGE", &cfg.EgressRange)
 	envInt("PPROF_PORT", &cfg.PprofPort)
@@ -330,6 +339,7 @@ v3 runtime (all optional; the legacy DIRECT engine ignores them):
       --panel-http-url string     Panel HTTP base URL for heartbeat reporting
       --agent-admin-token string  Bearer token for the local admin API
       --agent-admin-port int      Local admin API port; 0 disables (default 9090)
+      --node-credential string    Per-node credential for the v3 state report (WP7)
       --ingress-range string      Port range v3 ingress tunnels may bind
       --egress-range string       Port range v3 egress tunnels may bind
 

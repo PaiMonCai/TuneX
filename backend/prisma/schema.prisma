@@ -409,9 +409,35 @@ model Node {
   /// 缺省值（round）。池内策略优先于本字段。
   lb_strategy   LBStrategy?
 
+  // ── v3 增量字段（WP7：per-node credential，见迁移 20260925120000）──
+  //
+  // 节点凭据为「一节点一凭证」，与 node_group.token（一组一凭证）分工：
+  //   · node_group.token 声明「这个 Agent 属于哪个组」，决定配置下发范围；
+  //   · node_credential_hash 声明「这个 Agent 就是节点 N 本人」，决定控制面
+  //     的 node/agent 资源谁能指挥（A token 不能冒充 B 的实现点）。
+  // 只存 sha256(token) hex（64 字符，`CHAR(64)` 唯一索引）：拖库拿不到可用
+  // 凭据，与 user.api_key_hash / email_verification.token_hash 同一取向。
+  // 明文只在 rotate 响应里出现一次，之后任何路径（日志、审计、错误回显）
+  // 都不再携带它。
+  //
+  // 可空理由（expand-and-contract）：存量节点从未签发节点凭据，`NULL` =
+  // 「尚未签发」。认证遇到 NULL 必须**拒绝**（fail-closed），不能回落到
+  // node_group.token —— 否则一个泄露的组 token 就能冒充组内任意节点。
+  /// `sha256(credential)` hex；NULL = 尚未签发节点凭据
+  node_credential_hash String?        @unique @db.Char(64)
+  /// 最近一次凭据轮换时刻；rotate 时刷新，供面板展示与审计对齐
+  credential_rotated_at DateTime?
+  /// true = 已撤销：任何重连一律拒绝（GodD「revoked token 不能重连」）
+  credential_revoked    Boolean       @default(false)
+  /// 最近一次 rejected 认证时刻：供 rotate 时识别「谁还在拿旧 token 敲门」
+  credential_last_rejected_at DateTime?
+
   egress_pools   EgressPool[]
   port_leases    NodePortLease[]
   egress_tunnels Tunnel[]      @relation("egress_node")
+  /// 节点凭据状态快照（版本 / 角色 / 端口占用 / 隧道列表），见 model NodeStateReport。
+  /// 每节点一行：`@@unique([node_id])` 保证 Agent 断线重连后恢复的是自己那一份。
+  state_report   NodeStateReport?
 
   @@index([role])
   @@map("node")
@@ -1159,4 +1185,52 @@ model EmailVerification {
   @@index([email, purpose])
   @@index([expires_at])
   @@map("email_verification")
+}
+
+/// WP7 — Node state report（DEVELOPMENT.md §7.10「state report + reconnect snapshot」）。
+///
+/// Agent 通过 `POST /api/internal/node/state`（Bearer 节点凭据）上报：
+/// 版本 / 角色 / 端口占用 / 隧道列表 / 出口池快照。**每节点一行**
+/// （`@@unique([node_id])`），语义是「这个节点当前的状态快照」，不是时序表 ——
+/// 时序是流量/指标的事（traffic-archive），状态的对账由 WP9 reconciler 做。
+///
+/// 为什么快照进 DB 而不是只进 Redis：
+///   · 重连恢复（reconnect snapshot）要求面板在 Agent 断线重连后立刻知道
+///     「它上次报的是什么」——Redis 键有 TTL，重启即丢，DB 才是还活着的真相；
+///   · WP9 reconciler 对比 desired state / applied state 需要一份可查询的
+///     agent 侧事实（`reported_revision` vs `tunnel.config_revision`）；
+///   · 面板「runtime/state query」（WP10）需要节点维度查询，不是扫 Redis pattern。
+///
+/// 只写快照不写凭据：本表**没有**任何凭据字段，token 不落库的更广义版本是
+/// 「凭据相关产物一律不进新表」。哈希在 `node.node_credential_hash`。
+///
+/// `tunnels` / `egress_pools` / `used_ports` 是 JSON 而非关联表：这是**对端
+/// 报来的原文快照**，不是面板自己的模型；做成外键表会让「Agent 报了一个面板
+/// 没下发的隧道」这种冲突无处安放，而 JSON 快照天然容纳这种偏差并由 reconciler
+/// 判定。形状见 services/node-state.ts 的 StateReport 类型。
+model NodeStateReport {
+  id      Int  @id @default(autoincrement())
+  node_id Int  @unique
+  node    Node @relation(fields: [node_id], references: [id], onDelete: Cascade)
+
+  /// Agent 版本号（面板据此提示节点升级）
+  version String? @db.VarChar(255)
+  /// 自报角色，与 node.role 对齐校验（不一致按 node.role 为准并在返回里标注）
+  role    String? @db.VarChar(32)
+  /// Agent 已知的最新 revision（与 Tunnel.config_revision 对比判断是否落后）
+  reported_revision Int?
+  /// 隧道快照 JSON：`{ "tunnels": [ { "id", "mode", "ingress_port", "egress_port", "revision", "targets"? } ] }`
+  tunnels         Json?
+  /// 出口池快照 JSON：`{ "<tunnelId>": { "strategy", "targets": [ "host:port" ] } }`
+  egress_pools    Json?
+  /// 已占用端口列表（agent 侧 usedPorts）
+  used_ports      Json?
+  /// Agent 自述的最近错误（无则 null；不写凭据）
+  last_error      String?  @db.VarChar(500)
+  /// 面板收到本次上报的时刻（非 Agent 时钟，供离线判定用 DB 侧单一真相）
+  reported_at     DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@index([reported_at])
+  @@map("node_state_report")
 }

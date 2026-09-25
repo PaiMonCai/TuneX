@@ -58,6 +58,13 @@ const NO_AUTH_PATTERNS: RegExp[] = [
   /^\/api\/pay\/[^/]+\/callback$/,
   /^\/api\/tunnel\/observer$/,
   /^\/api\/tunnel\/traffic$/,
+  // WP7：节点凭据机器端点（`/api/internal/node/*`）。它们**免用户认证**
+  // 但不免身份——身份是 Bearer 节点凭据（services/node-credential.ts），
+  // 由路由内部解析。放在这里而不是在每个 handler 里查 user，是因为
+  // 中间件链在 authRequired 就必须短路：否则 Agent 的上报会全部 401。
+  // 宽匹配 `.*` 是有意的：将来 `/api/internal/node/:id/...` 之类的派生
+  // 端点同样按节点凭据认证，不需要回来改白名单；真实身份判定在 handler。
+  /^\/api\/internal\/.*/,
   /^\/api\/tunnel\/subscription$/,
   /^\/api\/system\/config\/site$/,
   /^\/api\/license(\/.*)?$/,
