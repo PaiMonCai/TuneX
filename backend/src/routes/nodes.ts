@@ -490,25 +490,28 @@ nodesRoutes.post("/:ingressId/forwards", async (c) => {
     }, 403);
   }
   if ("conflict" in reserved) return c.json({ error: "该入口端口已被占用" }, 409);
-  if (!("tunnelId" in reserved)) return c.json({ error: "创建端口转发失败" }, 500);
+  const tunnelId = "tunnelId" in reserved && typeof reserved.tunnelId === "number"
+    ? reserved.tunnelId
+    : null;
+  if (tunnelId === null) return c.json({ error: "创建端口转发失败" }, 500);
 
   const orchestrator = getOrchestrator();
   if (orchestrator) {
     const applied = mode === "direct"
-      ? await reapplyDirectTunnel(reserved.tunnelId, orchestrator)
-      : await reapplyRelayTunnel(reserved.tunnelId, orchestrator);
+      ? await reapplyDirectTunnel(tunnelId, orchestrator)
+      : await reapplyRelayTunnel(tunnelId, orchestrator);
     if (!applied.ok) {
-      const failed = await loadForward(reserved.tunnelId, ingress.id, ws.id);
+      const failed = await loadForward(tunnelId, ingress.id, ws.id);
       return c.json({
         error: applied.error,
         code: "apply_failed",
         apply_error_code: applied.error_code,
-        data: failed ? portForwardView(failed) : { id: reserved.tunnelId },
+        data: failed ? portForwardView(failed) : { id: tunnelId },
       }, 502);
     }
   }
 
-  const created = await loadForward(reserved.tunnelId, ingress.id, ws.id);
+  const created = await loadForward(tunnelId, ingress.id, ws.id);
   if (!created) return c.json({ error: "端口转发创建后无法读取" }, 500);
   return c.json({ data: portForwardView(created) }, 201);
 });
