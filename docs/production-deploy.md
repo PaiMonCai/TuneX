@@ -11,8 +11,9 @@
 | 维度 | 开发 `docker-compose.yaml` | 生产 `docker-compose.prod.yaml` |
 |---|---|---|
 | MySQL/Redis 端口 | 映射主机（3307/6380） | **不映射**，仅 compose 内网 |
-| backend/web | 映射主机（8787/8788/9091/9445） | **不映射**，只走 Docker 内 Caddy |
-| 对外入口 | Caddy `:80` 纯 HTTP | 默认仅 `127.0.0.1:13000`；宿主机反代负责公网 80/443 + TLS |
+| backend/web | 映射主机（8787/8788/9091/9445） | 仅映射到 `127.0.0.1`：API 13001 / WS 13002 / Web 13003 |
+| 对外入口 | Caddy `:80` 纯 HTTP | 默认宿主机 Nginx/宝塔/1Panel 直接代理 loopback；Caddy 可选 |
+| 可选 Caddy | 默认启用 | `--profile caddy` 后聚合为 `127.0.0.1:13000` 单入口 |
 | standalone | 不适用 | 可叠加 `docker-compose.standalone.yaml`，由 Caddy 直接占 80/443 + ACME |
 | 镜像来源 | 本地 `build:` | CI 预构建 GHCR，sha 钉版本 |
 | 数据卷 | `tunex-mysql-data` 等 | `tunex-mysql-data-prod` 等 |
@@ -61,7 +62,8 @@ openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 | 变量 | 说明 |
 |---|---|
 | `SITE_URL` | 对外唯一地址，如 `https://tunex.example.com`；应用生成回调/Agent 安装地址使用 |
-| `TUNEX_HTTP_PORT` | 默认 `13000`；Docker 只绑定 `127.0.0.1:<port>`，给宿主机反代使用 |
+| `TUNEX_API_PORT` / `TUNEX_WS_PORT` / `TUNEX_WEB_PORT` | 默认 13001 / 13002 / 13003；都只绑定 `127.0.0.1` |
+| `TUNEX_HTTP_PORT` | 默认 13000；仅启用可选 Caddy profile 时使用 |
 | `ACME_EMAIL` | 仅 standalone 模式必需；Caddy ACME 账号邮箱 |
 | `MYSQL_ROOT_PASSWORD` | 必须同时改 `DATABASE_URL` 里的口令（两边一致） |
 | `AUTH_SECRET` / `LICENSE_SECRET` | ≥32 随机字节，禁止跨环境复用 |
@@ -93,7 +95,7 @@ sed -i "s#^TUNEX_AGENT_IMAGE=.*#TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:
 
 Panel 主机若拉 private GHCR 包可先 `docker login ghcr.io`。但 **Agent 镜像必须允许节点匿名拉取**，否则控制台生成的一键安装命令无法做到无额外 registry 登录；使用 GHCR 时应将 `tunex-agent` package 设为 public，或把 `TUNEX_AGENT_IMAGE` 指向节点可访问的公开镜像仓库。
 
-### 2.4 启动（推荐：宿主机反代 + Docker 单入口）
+### 2.4 启动（默认：宿主机反代直连）
 
 ```bash
 export COMPOSE_FILE=$PWD/docker-compose.prod.yaml
@@ -102,17 +104,18 @@ docker compose -f "$COMPOSE_FILE" up -d
 ```
 
 启动顺序由 compose 保证：`mysql` healthy → `db-migrate` 执行
-`prisma migrate deploy && seed`（**退出码 0 才算成功**）→ `backend/worker/web` →
-`caddy`。生产 compose 只在宿主机暴露一个地址：
+`prisma migrate deploy && seed`（**退出码 0 才算成功**）→ `backend/worker/web`。
+默认**不会启动 Caddy**。
+
+生产栈提供三个只绑定 loopback 的宿主机端口：
 
 ```text
-127.0.0.1:13000 -> tunex-caddy:80
-                      ├── /api/*       -> backend:3000
-                      ├── /socket.io/* -> backend:3001
-                      └── /*           -> web:3000
+127.0.0.1:13001 -> backend:3000   # API / healthz / readyz
+127.0.0.1:13002 -> backend:3001   # Socket.IO / Agent WebSocket
+127.0.0.1:13003 -> web:3000       # Next.js Web
 ```
 
-Backend/Web/MySQL/Redis 都没有公网主机端口。
+MySQL/Redis 仍不映射任何主机端口。上述三个端口也只监听 `127.0.0.1`，不会直接暴露公网。
 
 宿主机 Nginx 示例：
 
@@ -130,29 +133,68 @@ server {
     ssl_certificate     /path/to/fullchain.pem;
     ssl_certificate_key /path/to/privkey.pem;
 
-    location / {
-        proxy_pass http://127.0.0.1:13000;
+    location /socket.io/ {
+        proxy_pass http://127.0.0.1:13002;
         proxy_http_version 1.1;
-
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; # Caddy 2.8 strict 模式从右向左解析
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host $host;
-
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-
-        # Agent Socket.IO/WebSocket 是长连接；普通 HTTP 不受影响。
         proxy_read_timeout 86400;
         proxy_send_timeout 86400;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:13001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /healthz {
+        proxy_pass http://127.0.0.1:13001;
+    }
+
+    location = /readyz {
+        proxy_pass http://127.0.0.1:13001;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:13003;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
 
-宝塔/1Panel 只需要把反向代理目标填成 `http://127.0.0.1:13000`，并确保启用 WebSocket/Upgrade 透传即可。不要把 `13000` 放进公网安全组；compose 已固定绑定 loopback。
+宝塔/1Panel 同理按路径配置三个 loopback 目标，并给 `/socket.io/` 开启 WebSocket/Upgrade 透传。
 
-#### 2.4.1 无宿主机反代：standalone Caddy
+#### 2.4.1 可选：Docker 内 Caddy 单入口
+
+如果希望宿主机只维护一个反代目标：
+
+```bash
+docker compose -f docker-compose.prod.yaml --profile caddy --env-file .env up -d
+```
+
+此时额外启动 `tunex-caddy`，聚合为：
+
+```text
+127.0.0.1:13000 -> tunex-caddy:80
+                      ├── /api/*       -> backend:3000
+                      ├── /socket.io/* -> backend:3001
+                      └── /*           -> web:3000
+```
+
+宿主机 Nginx 便可以只反代到 `http://127.0.0.1:13000`。Caddy 仍是独立官方镜像和独立容器，不进入 TuneX 主应用镜像。
+
+#### 2.4.2 无宿主机反代：standalone Caddy
 
 如果这台机器没有 Nginx/Apache/Traefik，可让 Caddy 直接接管公网入口：
 
@@ -190,11 +232,15 @@ sudo cat /opt/TuneX/.admin-credentials     # 改完密码后请删除此文件
 # 1) 容器与健康
 docker compose -f "$COMPOSE_FILE" ps        # 全部 running；backend healthcheck 通过
 
-# 2) Docker 单入口（宿主机本地）
-curl -fsS http://127.0.0.1:13000/healthz    # 期望 {"status":"ok",...}
-docker port tunex-caddy                     # 期望 80/tcp -> 127.0.0.1:13000
-docker port tunex-backend                   # 期望无输出
-docker port tunex-web                       # 期望无输出
+# 2) 默认 loopback 服务入口
+curl -fsS http://127.0.0.1:13001/healthz
+curl -fsSI http://127.0.0.1:13003/
+docker port tunex-backend                   # 期望仅 127.0.0.1:13001/13002
+docker port tunex-web                       # 期望仅 127.0.0.1:13003
+
+# 可选 Caddy profile 启用时再检查：
+# curl -fsS http://127.0.0.1:13000/healthz
+# docker port tunex-caddy
 
 # 3) 公网入口由宿主机反代提供
 curl -fsS https://$DOMAIN/healthz
@@ -203,7 +249,10 @@ curl -fsSI https://$DOMAIN/
 # 4) 数据面确实内网隔离
 nc -vz <公网IP> 3306                        # 期望 connection refused / 超时
 nc -vz <公网IP> 6379                        # 同上
-nc -vz <公网IP> 13000                       # 期望不可达（只绑定 127.0.0.1）
+nc -vz <公网IP> 13001                       # 期望不可达（只绑定 127.0.0.1）
+nc -vz <公网IP> 13002                       # 同上
+nc -vz <公网IP> 13003                       # 同上
+nc -vz <公网IP> 13000                       # 启用 Caddy profile 时也应不可达
 
 # 5) 一键巡检
 scripts/ops/alert.sh                        # 期望退出码 0、全部 ok
@@ -226,7 +275,7 @@ SHA=$(git rev-parse HEAD)
 sed -i "s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA#" .env
 
 docker compose -f "$COMPOSE_FILE" pull
-docker compose -f "$COMPOSE_FILE" up -d backend worker web caddy
+docker compose -f "$COMPOSE_FILE" up -d backend worker web
 # mysql/redis 不会被 up -d 重建（image/配置未变），数据安全
 scripts/ops/alert.sh
 ```
@@ -386,9 +435,9 @@ scripts/ops/capacity.sh --baseline # 与历史对比
 
 | 现象 | 先看 |
 |---|---|
-| 默认模式 `caddy` 起不来 / 站点 404 | `docker logs tunex-caddy`；`127.0.0.1:13000` 是否被占用；`docker port tunex-caddy` 是否正确 |
-| 宿主机 Nginx 502 | 先 `curl http://127.0.0.1:13000/healthz`；再检查 Nginx `proxy_pass` 与防火墙/SELinux |
-| Agent 反复重连 | 宿主机代理是否透传 Upgrade/Connection；Docker Caddy 的 `/socket.io/*` 是否路由到 `backend:3001` |
+| 宿主机 Nginx 502 | 先分别检查 `curl http://127.0.0.1:13001/healthz` 与 `curl -I http://127.0.0.1:13003/`；再检查路径路由 |
+| Agent 反复重连 | `/socket.io/*` 是否代理到 `127.0.0.1:13002`；是否透传 Upgrade/Connection |
+| 可选 Caddy 起不来 | 是否带了 `--profile caddy`；`127.0.0.1:13000` 是否被占用；查看 `docker logs tunex-caddy` |
 | standalone 证书没签下来 | 是否叠加 `docker-compose.standalone.yaml`；80/443 是否放行；SITE_URL/ACME_EMAIL 是否正确；域名是否已解析 |
 | backend 起不来 | `docker logs tunex-backend`；缺失某密钥时 `env.ts` fail-fast 会直报 `X is required and has no default` |
 | 登录后秒退 | `COOKIE_SECURE` 与访问协议是否一致：HTTPS 站点必须是 `true` |
@@ -421,8 +470,9 @@ scripts/ops/capacity.sh --baseline # 与历史对比
 
 | 项 | 状态 |
 |---|---|
-| 生产 compose（无数据端口外泄、仅 loopback 单入口、`/socket.io` 路由、资源限额） | ✅ 本仓库交付 |
-| 宿主机反代模式（Nginx/宝塔/1Panel → `127.0.0.1:13000`） | ✅ 默认生产路径 |
+| 生产 compose（MySQL/Redis 不外泄；Web/API/WS 仅 loopback；资源限额） | ✅ 本仓库交付 |
+| 宿主机反代模式（Nginx/宝塔/1Panel → 13001/13002/13003） | ✅ 默认生产路径 |
+| 可选 Caddy profile（统一为 `127.0.0.1:13000`） | ✅ 可选路径 |
 | standalone overlay（Caddy 80/443 + ACME） | ✅ 可选兼容路径 |
 | `.env.production.example`（含全部密钥占位与开关说明） | ✅ 本仓库交付 |
 | `Caddyfile.internal` / `Caddyfile.prod`（内部 HTTP / standalone TLS） | ✅ 本仓库交付 |
