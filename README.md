@@ -479,7 +479,8 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 │   └── release.yml                 # main 集成通过后发布 GHCR
 ├── .env.example                    # 开发/本地环境变量模板
 ├── .env.production.example         # 生产环境变量模板（复制为 .env）
-├── Caddyfile                      # Docker 内统一 HTTP 路由（生产默认也使用）
+├── Caddyfile                      # 开发栈 HTTP 反代
+├── Caddyfile.internal             # 生产默认：Docker 内统一 HTTP 路由
 ├── Caddyfile.prod                 # standalone 公网入口（域名 + ACME + TLS）
 ├── docker-compose.yaml            # 开发/自托管基础栈
 ├── docker-compose.prod.yaml       # 生产栈（默认仅 127.0.0.1:13000 单入口）
@@ -524,7 +525,7 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 6. 保持 `PAYMENTS_ENABLED=false`，除非计费链路已完成独立审查和验收；
 7. 以 [DEVELOPMENT.md](DEVELOPMENT.md) 的 Integration Gate 为发布门槛；不得跳过真实 v3 网络验证。
 
-生产部署默认使用 `docker-compose.prod.yaml` + `Caddyfile` + `.env.production.example`：宿主机 Nginx/宝塔/1Panel 负责公网 TLS，只反代到 `127.0.0.1:13000`。无宿主机反代时再叠加 `docker-compose.standalone.yaml`，切换到 `Caddyfile.prod` 自动 ACME/TLS。完整步骤、Nginx 配置、巡检阈值、备份/恢复/回滚操作与演练清单见 [docs/production-deploy.md](docs/production-deploy.md)。
+生产部署默认使用 `docker-compose.prod.yaml` + `Caddyfile.internal` + `.env.production.example`：宿主机 Nginx/宝塔/1Panel 负责公网 TLS，只反代到 `127.0.0.1:13000`。无宿主机反代时再叠加 `docker-compose.standalone.yaml`，切换到 `Caddyfile.prod` 自动 ACME/TLS。完整步骤、Nginx 配置、巡检阈值、备份/恢复/回滚操作与演练清单见 [docs/production-deploy.md](docs/production-deploy.md)。
 
 仓库已提供 `scripts/ops/` 下的备份、恢复、回滚和告警脚本基础，但生产策略仍应根据实际部署环境审查和演练。
 
