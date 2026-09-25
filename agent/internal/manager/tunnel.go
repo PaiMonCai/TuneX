@@ -117,6 +117,10 @@ func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.F
 //
 // Equal revision returns (nil, nil) after a read-only check; the caller can
 // ACK it as an idempotent no-op.
+//
+// The revision gate and the port guard live here (and in ReplaceListener,
+// which shares applyLocked); the ordering inside is applyLocked's job, and it
+// is the same sequence for both entry points so the two cannot drift.
 func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
@@ -139,33 +143,7 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, 
 			return cur.fwd, nil
 		}
 	}
-	fwd, err := m.buildLocked(normalized)
-	if err != nil {
-		return nil, err
-	}
-	m.attachLedger(normalized, fwd)
-	if err := m.startLocked(normalized, fwd); err != nil {
-		return nil, err
-	}
-	if old, ok := m.tunnels[normalized.ID]; ok {
-		if old.cfg.ListenPort() != normalized.ListenPort() {
-			// A different port: the old one is genuinely freed. On the
-			// same port startLocked already stopped the old forwarder and
-			// dropped the guard key, so both paths end with the old port
-			// unreserved and the new tunnel owning it.
-			m.releasePortLocked(old.cfg)
-		}
-		// The new listener is bound (or the old one already stopped for the
-		// same-port replace), so tearing the old one down is safe. The port
-		// bookkeeping above happened under this lock, so the async Stop
-		// never touches the guard map.
-		defer m.stopEntry(old)
-	}
-	m.tunnels[normalized.ID] = &entry{cfg: normalized, fwd: fwd}
-	m.markPortUsedLocked(normalized)
-	logx.Info("tunnel applied", "id", normalized.ID, "mode", string(normalized.Mode),
-		"port", normalized.ListenPort(), "revision", normalized.Revision)
-	return fwd, nil
+	return m.applyLocked(normalized)
 }
 
 // buildLocked builds the Forwarder. Caller must hold m.mu.
