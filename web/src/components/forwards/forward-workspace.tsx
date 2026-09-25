@@ -49,6 +49,7 @@ export function ForwardWorkspace() {
   const [keyword, setKeyword] = useState("");
   const [modeFilter, setModeFilter] = useState<ForwardModeFilter>("all");
   const [statusFilter, setStatusFilter] = useState<ForwardStatusFilter>("all");
+  const [ingressFilter, setIngressFilter] = useState("all");
   const [createOpen, setCreateOpen] = useState(false);
   const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
   const [name, setName] = useState("");
@@ -108,12 +109,22 @@ export function ForwardWorkspace() {
 
   useEffect(() => {
     void load();
+    const requestedIngress = new URLSearchParams(window.location.search).get("ingress_node_id");
+    if (requestedIngress && /^\d+$/.test(requestedIngress)) {
+      setIngressFilter(requestedIngress);
+    }
   }, []);
 
   const filtered = useMemo(() => {
     const q = keyword.trim().toLowerCase();
     return forwards.filter((forward) => {
       if (modeFilter !== "all" && forward.mode !== modeFilter) return false;
+      if (
+        ingressFilter !== "all" &&
+        Number(forward.ingress_node_id) !== Number(ingressFilter)
+      ) {
+        return false;
+      }
       if (statusFilter === "pending") {
         if (forward.apply_status !== "pending" && forward.apply_status !== "applying") return false;
       } else if (statusFilter !== "all" && forward.apply_status !== statusFilter) {
@@ -130,10 +141,14 @@ export function ForwardWorkspace() {
       ];
       return fields.some((field) => field.toLowerCase().includes(q));
     });
-  }, [forwards, keyword, modeFilter, statusFilter]);
+  }, [forwards, keyword, modeFilter, statusFilter, ingressFilter]);
 
   function openCreate(mode: "direct" | "relay") {
-    const firstIngress = ingressNodes[0];
+    const filteredIngress =
+      ingressFilter !== "all"
+        ? ingressNodes.find((node) => String(node.id) === ingressFilter)
+        : undefined;
+    const firstIngress = filteredIngress ?? ingressNodes[0];
     setCreateMode(mode);
     setName("");
     setIngressId(firstIngress ? String(firstIngress.id) : "");
@@ -287,6 +302,19 @@ export function ForwardWorkspace() {
               <SelectItem value="error">{t("forward.statusError")}</SelectItem>
             </SelectContent>
           </Select>
+          <Select value={ingressFilter} onValueChange={setIngressFilter}>
+            <SelectTrigger className="h-9 w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("forward.allIngress")}</SelectItem>
+              {ingressNodes.map((node) => (
+                <SelectItem key={String(node.id)} value={String(node.id)}>
+                  {node.node_id}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" onClick={() => openCreate("direct")}>
@@ -335,7 +363,7 @@ export function ForwardWorkspace() {
         </Card>
       </div>
 
-      {!loading && forwards.length === 0 && !keyword && modeFilter === "all" && statusFilter === "all" ? (
+      {!loading && forwards.length === 0 && !keyword && modeFilter === "all" && statusFilter === "all" && ingressFilter === "all" ? (
         <div className="grid gap-4 md:grid-cols-2">
           <Card>
             <CardHeader>
