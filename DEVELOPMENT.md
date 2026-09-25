@@ -361,7 +361,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP5 | TCP RELAY Data Plane | B | **WP4 接口冻结** | **WP4 已合并** |
 | WP6 | v3 Command / Revision / ACK 协议 | B/C | WP0；协议字段冻结即可 | WP1 已合并；WP4 接口兼容 |
 | WP7 | Node Credential / Session / State Report | B/C | WP6 协议冻结 | WP6 已合并 |
-| WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并** |
+| WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并**；✅ 已实现（分支 `feature/v3-wp8-scheduler` 已 push，见 §7.11） |
 | WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
 | WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并 |
 | WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并** |
@@ -837,6 +837,8 @@ DoD（每条都有对应单测，见 `backend/src/services/__tests__/node-creden
 
 **Track：C；集成型工作包。**
 
+**状态：✅ 已实现，分支 `feature/v3-wp8-scheduler` 已 push（依赖 WP3/WP5/WP6/WP7 接口；WP9 Reconciler 依赖本包的接口冻结）。**
+
 开发可以在 WP3/WP5/WP7 接口冻结后提前开始，但**不得在这些依赖合并前进入 main**。
 
 创建顺序固定：
@@ -857,10 +859,60 @@ auth/quota
 任何失败：
 
 - 保留 Tunnel；
-- apply_status=error；
+- `apply_status=error`；
 - 写结构化错误；
 - 执行补偿；
 - 不物理删除。
+
+**落地位置（单一事实源，改动前先读这三处）：**
+
+- `backend/src/services/scheduler.ts` —— §7.11 十条步骤的编排主体。auth/quota
+  走既有 `capability-policy` + `policy-service` + `node-group-access`；bind 阶段
+  用 `pickNode`（role 覆盖 + **WP7 身份闸门** + 在线优先 + id 最小）；
+  端口经 `portPool.acquirePort`（legacy DIRECT `listen_port` 按 §7.6 灌
+  `reservedPorts`）；下发走 {@link Orchestrator}。失败统一收进
+  {@link CreateRelayFailure}，`persistFailure` 只 update 不 delete。
+- `backend/src/services/orchestrator.ts` —— RELAY 双下发（先 Egress 后 Ingress，
+  两端共用 revision N，Agent 侧 id 带 `-egress` / `-relay` 方向后缀）。
+  命令经 WP6 `createCommand` + `ControlValidator`，ACK 也要过闸门；
+  `removeTunnel` 用 revision+1 保证补偿撤得动。
+- `backend/src/services/__tests__/scheduler.test.ts` —— 离线单测（内存 DB /
+  Redis / 假 Agent 三个替身，零外部依赖）。
+
+**关键设计决定（review 对齐用）：**
+
+1. **orchestrator 不 import portPool**：端口所有权是 WP3 的领域，编排器只消费
+   已拿到的端口号。否则「入口下发失败要不要释放出口端口」这类编排补偿会被
+   端口分配的并发/对账逻辑污染。
+2. **身份闸门落在 bind 阶段且复用 WP7 `decideNodeAuth`**：§3.3 的三条判定
+   （未签发 / revoked / 哈希不等）只有一份实现。没有有效凭据的节点**不降级
+   放行**（心跳抖动还可以等 ACK，身份缺口没法等），错误码
+   `node_credential_missing` 且**不可重试**——用户重试不会让节点多出一把
+   凭据，必须管理员到 WP10 端点补签。
+3. **补偿顺序与下发相反**（Egress 后进先出）：已 ACK 的 Egress 必须先撤，
+   否则它继续占着出口端口收流量；端口租约随后释放，不等 WP9 的
+   15 分钟预分配 TTL。
+4. **`PENDING_SCHEMA_COLUMNS` 显式留白**：`Tunnel.ingress_node_id` 列（§2.1
+   「禁止只保存 NodeGroup」）尚未落库，本包**不自行 ALTER**（§8.2 顺序：
+   schema 先行，需独立 additive migration PR）。常量存在的意义是让手滑写错
+   列名在 review 时一眼可见。实际入口节点暂存于返回值
+   `ingressNodeId`，列落地后由 migration + 一次落库补上。
+
+DoD 核对（`scheduler.test.ts` 59 tests / 243 assertions 全绿，`tsc --noEmit` 0 error）：
+
+| 验收项 | 结论 |
+|---|---|
+| 十条步骤严格有序，任一时刻「下一步」未允许被执行 | ✅ A1–A7 逐步断言执行顺序与落库状态 |
+| 铁律一：Egress 先于 Ingress（含 next_hop 因果） | ✅ A2/A3；`dispatchIngress` 无 next_hop 直接拒（E2） |
+| 铁律二：两次独立下发、同 revision N、各自 command_id | ✅ A4；id 带方向后缀（D8） |
+| stale revision 被 WP6 闸门拒绝 | ✅ A5 |
+| 失败保留 Tunnel + `apply_status=error` + 结构化错误 + 补偿，零 delete | ✅ B1/B2/B13/B14 + `dbCalls` 全程无 delete |
+| 补偿先撤已 ACK 的 Egress（revision+1） | ✅ B3/B6 |
+| 补偿释放全部端口租约（不等 reconcile TTL） | ✅ B4/B5/B10 |
+| 端口分配集成（WP3）：两端各取、UNIQUE(node_id,port)、user-specified 同规则、legacy 保留、黑名单、区间耗尽 | ✅ C1–C10 |
+| WP7 身份闸门：未签发 / revoked → `node_credential_missing` 且不可重试 | ✅ B13/B14/D1/D1b |
+| 跨租户 fail-closed / RELAY 必须给出口组 / 出口池归属 | ✅ F2/F3/F4/F5 |
+| full CI green | ⏳ 等 push 后的 CI 验证（ci.yml 已显式加入 `bun test scheduler.test.ts`） |
 
 ---
 
@@ -1115,6 +1167,7 @@ Active WP:
 - WP1 Schema
 - WP4 Agent Runtime（可并行，受 WP1 merge gate 约束）
 - WP6 Control Contract（可并行，受 WP1/WP4 compatibility gate 约束）
+- WP8 Scheduler + RELAY Orchestrator（已实现，见 §7.11，待 CI 验证）
 - WP14 E2E Harness（仅测试基础设施）
 
 Next unlock after Gate F1:
