@@ -83,6 +83,7 @@ internalNodeRoutes.post("/node/enroll", async (c) => {
         credential: enrolled.credential,
         node_id: enrolled.node_id,
         node_key: enrolled.node_key,
+        agent_id: enrolled.agent_id,
       },
     });
   } catch {
