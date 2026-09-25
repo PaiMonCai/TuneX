@@ -13,9 +13,14 @@ import type {
   AdminRole,
   BillingCycle,
   BalanceLog,
+  EgressPool,
+  EgressTarget,
   ID,
+  LBStrategy,
   ListQuery,
   Node,
+  NodeCredentialIssued,
+  NodeCredentialRevoked,
   NodeGroup,
   NodeType,
   Plan,
@@ -546,10 +551,196 @@ function readNodePayload(
   if (body.version !== undefined) patch.version = reqStr(body.version) || "1.0.0";
   if (body.custom_line !== undefined) patch.custom_line = reqStr(body.custom_line) || null;
   if (body.order_by !== undefined) patch.order_by = numOrNull(body.order_by) ?? 0;
+  // v3 角色三元：ingress / egress / both；「未声明」是 null 而非默认值——
+  // mock 必须与 schema 一致：显式 null 就是 null，不能偷偷填 ingress。
+  if (body.role !== undefined) {
+    if (body.role === null) {
+      patch.role = null;
+    } else {
+      const r = reqStr(body.role);
+      if (r !== "ingress" && r !== "egress" && r !== "both") return badRequest("节点角色不合法");
+      patch.role = r;
+    }
+  }
+  if (body.port_range_min !== undefined) patch.port_range_min = numOrNull(body.port_range_min);
+  if (body.port_range_max !== undefined) patch.port_range_max = numOrNull(body.port_range_max);
+  if (body.lb_strategy !== undefined) {
+    if (body.lb_strategy === null) {
+      patch.lb_strategy = null;
+    } else {
+      const s = reqStr(body.lb_strategy);
+      if (s !== "round" && s !== "rand") return badRequest("出口策略不合法");
+      patch.lb_strategy = s;
+    }
+  }
   for (const key of ["backup", "dns_status"] as const) {
     if (body[key] !== undefined) patch[key] = Boolean(body[key]);
   }
   return { patch };
+}
+
+// ------------------------------------------------- WP12 出口池 / 目标（mock）
+
+/** 出口池 CRUD + 嵌套目标 CRUD：/admin/nodes/:id/pools[...]（node 解析后喂进来） */
+function handleEgressPools(
+  db: Store,
+  node: Node,
+  method: string,
+  rest: string[],
+  req: MockRequest,
+): MockResponse {
+  const pools = db.egressPools.get(node.id) ?? [];
+
+  // /pools 列表路由
+  if (rest.length === 0) {
+    if (method === "GET") {
+      return ok(pools.map((p) => ({ ...p, targets: db.egressTargets.get(p.id) ?? [] })));
+    }
+    if (method === "POST") {
+      const body = asRecord(req.body);
+      const name = reqStr(body.name);
+      if (!name) return badRequest("池名称不能为空");
+      const strategy = body.lb_strategy === undefined || body.lb_strategy === null ? null : reqStr(body.lb_strategy);
+      if (strategy !== null && strategy !== "round" && strategy !== "rand") return badRequest("出口策略不合法");
+      const pool: EgressPool = {
+        id: nextPoolId(pools),
+        node_id: node.id,
+        name,
+        // NULL = 回落 node.lb_strategy → round（契约语义）
+        lb_strategy: strategy as LBStrategy | null,
+        status: "active",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        targets: [],
+      };
+      pools.push(pool);
+      db.egressPools.set(node.id, pools);
+      db.egressTargets.set(pool.id, []);
+      return ok(pool);
+    }
+    return badRequest("方法不允许");
+  }
+
+  const poolId = parseId(rest[0]);
+  const pool = poolId === null ? undefined : pools.find((p) => p.id === poolId);
+  if (!pool) return notFound("出口池不存在");
+
+  // /pools/:poolId
+  if (rest.length === 1) {
+    if (method === "GET") return ok({ ...pool, targets: db.egressTargets.get(pool.id) ?? [] });
+    if ((method === "PUT" || method === "PATCH")) {
+      const body = asRecord(req.body);
+      if (body.name !== undefined) {
+        const name = reqStr(body.name);
+        if (!name) return badRequest("池名称不能为空");
+        pool.name = name;
+      }
+      if (body.lb_strategy !== undefined) {
+        if (body.lb_strategy === null) {
+          pool.lb_strategy = null;
+        } else {
+          const s = reqStr(body.lb_strategy);
+          if (s !== "round" && s !== "rand") return badRequest("出口策略不合法");
+          pool.lb_strategy = s;
+        }
+      }
+      if (body.status !== undefined) {
+        const s = reqStr(body.status);
+        if (s !== "active" && s !== "inactive") return badRequest("状态不合法");
+        pool.status = s;
+      }
+      pool.updated_at = nowIso();
+      return ok(pool);
+    }
+    if (method === "DELETE") {
+      pools.splice(pools.indexOf(pool), 1);
+      db.egressTargets.delete(pool.id);
+      return ok({ ok: true, id: pool.id });
+    }
+    return badRequest("方法不允许");
+  }
+
+  // /pools/:poolId/targets[...]
+  if (rest[1] === "targets") {
+    const targets = db.egressTargets.get(pool.id) ?? [];
+    if (rest.length === 2) {
+      if (method === "GET") return ok(targets);
+      if (method === "POST") {
+        const body = asRecord(req.body);
+        const host = reqStr(body.host);
+        if (!host) return badRequest("目标地址不能为空");
+        const port = numOrNull(body.port);
+        if (port === null || port <= 0 || port > 65535) return badRequest("端口不合法");
+        const weight = numOrNull(body.weight);
+        if (weight !== null && weight < 0) return badRequest("权重不合法");
+        if (targets.some((t) => t.host === host && t.port === port)) return badRequest("同一地址端口已存在");
+        const target: EgressTarget = {
+          id: nextTargetId(targets),
+          pool_id: pool.id,
+          host,
+          port,
+          weight: weight ?? 1,
+          order_by: numOrNull(body.order_by) ?? targets.length * 10,
+          remark: reqStr(body.remark) || null,
+          status: body.status === undefined ? "active" : reqStr(body.status) === "inactive" ? "inactive" : "active",
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        };
+        targets.push(target);
+        db.egressTargets.set(pool.id, targets);
+        return ok(target);
+      }
+      return badRequest("方法不允许");
+    }
+    const tid = parseId(rest[2]);
+    const target = tid === null ? undefined : targets.find((x) => x.id === tid);
+    if (!target) return notFound("出口目标不存在");
+    if (rest.length === 3) {
+      if (method === "GET") return ok(target);
+      if (method === "PUT" || method === "PATCH") {
+        const body = asRecord(req.body);
+        if (body.host !== undefined) {
+          const h = reqStr(body.host);
+          if (!h) return badRequest("目标地址不能为空");
+          target.host = h;
+        }
+        if (body.port !== undefined) {
+          const p = numOrNull(body.port);
+          if (p === null || p <= 0 || p > 65535) return badRequest("端口不合法");
+          target.port = p;
+        }
+        if (body.weight !== undefined) {
+          const w = numOrNull(body.weight);
+          if (w === null || w < 0) return badRequest("权重不合法");
+          target.weight = w;
+        }
+        if (body.order_by !== undefined) target.order_by = numOrNull(body.order_by) ?? target.order_by;
+        if (body.remark !== undefined) target.remark = reqStr(body.remark) || null;
+        if (body.status !== undefined) {
+          const s = reqStr(body.status);
+          if (s !== "active" && s !== "inactive") return badRequest("状态不合法");
+          target.status = s;
+        }
+        target.updated_at = nowIso();
+        return ok(target);
+      }
+      if (method === "DELETE") {
+        targets.splice(targets.indexOf(target), 1);
+        return ok({ ok: true, id: target.id });
+      }
+      return badRequest("方法不允许");
+    }
+  }
+
+  return notFound("接口不存在");
+}
+
+function nextPoolId(pools: EgressPool[]): ID {
+  return pools.reduce((m, p) => Math.max(m, p.id), 0) + 1;
+}
+
+function nextTargetId(targets: EgressTarget[]): ID {
+  return targets.reduce((m, x) => Math.max(m, x.id), 0) + 1;
 }
 
 // ---------------------------------------------------------------- 路由
@@ -1690,6 +1881,17 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           updated_at: nowIso(),
           online: (parsed.patch.status ?? "active") === "active",
           traffic: 0,
+          // v3 新列：未声明就是 null（存量节点迁移进来的行就是空值，mock 必须复刻这一点）
+          role: parsed.patch.role ?? null,
+          port_range_min: parsed.patch.port_range_min ?? null,
+          port_range_max: parsed.patch.port_range_max ?? null,
+          lb_strategy: parsed.patch.lb_strategy ?? null,
+          last_seen_at: null,
+          // v3 凭据派生字段：新节点 = 从未签发（hash 为 null → has_credential=false）
+          has_credential: false,
+          credential_revoked: false,
+          credential_rotated_at: null,
+          credential_last_rejected_at: null,
         };
         db.nodes.push(node);
         return ok(node);
@@ -1698,7 +1900,19 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       if (id !== null) {
         const node = db.nodes.find((n) => n.id === id);
         if (!node) return notFound("节点不存在");
-        if (method === "GET" && seg[3] === undefined) return ok(node);
+        if (method === "GET" && seg[3] === undefined) {
+          // GET /admin/nodes/:id —— WP12 详情页聚合契约（NodeDetail）：
+          // 基础字段（含凭据派生字段） + 出口池 + 最近一条状态上报。
+          // 后端 WP10 未合并前 mock 直接按这个形状返回，前端零改动切换真实 API。
+          return ok({
+            ...node,
+            pools: (db.egressPools.get(node.id) ?? []).map((p) => ({
+              ...p,
+              targets: db.egressTargets.get(p.id) ?? [],
+            })),
+            state: db.nodeStates.get(node.id) ?? null,
+          });
+        }
         if ((method === "PUT" || method === "PATCH") && seg[3] === undefined) {
           const parsed = readNodePayload(db, asRecord(req.body), true, id);
           if (isResponse(parsed)) return parsed;
@@ -1709,8 +1923,67 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         }
         if (method === "DELETE" && seg[3] === undefined) {
           db.nodes.splice(db.nodes.indexOf(node), 1);
+          db.nodeCredentials.delete(node.id);
+          db.egressPools.delete(node.id);
           return ok({ ok: true, id: node.id });
         }
+        // ----- WP12 出口池：/admin/nodes/:id/pools[/:poolId[/targets[/:targetId]]] -----
+        if (seg[3] === "pools") return handleEgressPools(db, node, method, seg.slice(4), req);
+        // ----- WP12 运行态：/admin/nodes/:id/state -----
+        if (seg[3] === "state" && method === "GET") {
+          return ok(db.nodeStates.get(node.id) ?? null);
+        }
+      }
+    }
+
+    // ----- WP12 凭据：/admin/node/:id/credential[/rotate|/revoke] -----
+    // 路径是单数 node（不是 nodes），与后端已合并的 WP7 路由一致。
+    // 注意 path 已被 split("/")，所以 action 是 seg[3]，rotate/revoke 在 seg[4]。
+    if (seg[1] === "node" && method === "POST" && seg[3] === "credential") {
+      const id = parseId(seg[2]);
+      if (id !== null) {
+        const node = db.nodes.find((n) => n.id === id);
+        if (!node) return notFound("节点不存在");
+        const action = seg[4]; // undefined | "rotate" | "revoke"
+        if (action === "revoke") {
+          // 吊销：哈希保留 + revoked 位置位。响应只回 { revoked: true }，
+          // 绝不把明文再吐出来一次（契约：NodeCredentialRevoked）
+          if (!node.has_credential) return badRequest("该节点尚未签发凭据，无法吊销");
+          if (node.credential_revoked) return badRequest("凭据已处于吊销状态");
+          node.credential_revoked = true;
+          node.credential_last_rejected_at = nowIso();
+          node.updated_at = nowIso();
+          const revokedBody: NodeCredentialRevoked = { revoked: true, node_id: node.id, node_key: node.node_id };
+          return ok(revokedBody);
+        }
+        // 签发（/credential）或轮转（/credential/rotate）：明文只在本次响应可见
+        const isRotate = action === "rotate";
+        if (action !== undefined && !isRotate) return notFound("接口不存在");
+        const issued = db.nodeCredentials.get(node.id);
+        if (isRotate && !node.has_credential) {
+          return badRequest("当前没有生效凭据，无法轮转（请先签发）");
+        }
+        const rotation = (issued?.rotation_count ?? (node.has_credential ? 1 : 0)) + 1;
+        const issuedAt = nowIso();
+        db.nodeCredentials.set(node.id, {
+          rotation_count: rotation,
+          issued_at: issuedAt,
+          last_rejected_at: issued?.last_rejected_at ?? null,
+        });
+        node.has_credential = true;
+        node.credential_revoked = false;
+        node.credential_rotated_at = issuedAt;
+        node.credential_last_rejected_at = null;
+        node.updated_at = issuedAt;
+        // mock 假 token：真实后端也只在该响应里给一次明文（NodeCredentialIssued）
+        const credential = `tunx_mock_${node.node_id}_${rotation}_${Math.random().toString(36).slice(2, 10)}`;
+        const issuedBody: NodeCredentialIssued = {
+          credential,
+          node_id: node.id,
+          node_key: node.node_id,
+          ...(isRotate ? { rotated_at: issuedAt } : { issued_at: issuedAt }),
+        };
+        return ok(issuedBody);
       }
     }
 

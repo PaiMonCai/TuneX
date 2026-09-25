@@ -19,6 +19,10 @@ export type PaymentMethod = "epay" | "bepusdt" | "heleket";
 export type BalanceLogType = "topup" | "plan" | "commission_transfer" | "admin_adjust";
 export type PermissionLevel = "read" | "write";
 export type LicenseType = "none" | "personal" | "business";
+/** v3 节点角色（WP1 schema enum NodeRole）。NULL = 尚未声明，不可默认成 ingress */
+export type NodeRole = "ingress" | "egress" | "both";
+/** v3 出口池默认策略（schema enum LBStrategy）；池内策略优先于节点默认值 */
+export type LBStrategy = "round" | "rand";
 
 export interface User {
   id: ID;
@@ -260,6 +264,33 @@ export interface Node {
   updated_at: string;
   online?: boolean;
   traffic?: number;
+  // ── v3 增量字段（WP1 schema：全部可空，存量行 = 尚未声明 / 从未配置）──
+  /**
+   * v3 节点角色。NULL = 尚未声明（WP2 回填策略「不改 / 不猜」的产物）。
+   * 面板必须显式展示「未声明」并允许设置，不得默认成 ingress —— 那会让
+   * 未声明节点被误当入口参与调度（DEVELOPMENT.md §7.1）。
+   */
+  role?: NodeRole | null;
+  /** 最近一次心跳；NULL = 从未心跳（不替代 offline-detector 的 Redis 防抖） */
+  last_seen_at?: string | null;
+  /** 可分配端口区间（WP3 NodePortLease 的分配域）；NULL = 未配置 */
+  port_range_min?: number | null;
+  port_range_max?: number | null;
+  /** egress/both 节点的默认池策略；NULL = 回落 round */
+  lb_strategy?: LBStrategy | null;
+  // ── v3 增量字段（WP7 per-node credential）──
+  /**
+   * 服务端**绝不下发** `node_credential_hash`（列表/详情接口不含该列），
+   * 前端只凭这三个派生状态渲染凭据区块：
+   *   - hasCredential = hash != null → 已签发（是否有效另看 revoked）
+   *   - credential_revoked = true → 已撤销（哈希保留，面板能区分「撤销」与「瞎猜」）
+   * 因此 `has_credential` 这类布尔是展示便利字段，真值永远在后端。
+   */
+  has_credential?: boolean;
+  credential_revoked?: boolean;
+  credential_rotated_at?: string | null;
+  /** 最近一次 rejected 认证时刻：rotate 时识别「谁还在拿旧 token 敲门」 */
+  credential_last_rejected_at?: string | null;
 }
 
 export interface Tunnel {
@@ -606,6 +637,124 @@ export interface NodeInput {
   dns_status: boolean;
   order_by: number;
   node_group_id: ID;
+  // ── v3 增量字段（可选：旧面板只发上面的字段时后端按「不动该列」处理）──
+  role?: NodeRole | null;
+  port_range_min?: number | null;
+  port_range_max?: number | null;
+  lb_strategy?: LBStrategy | null;
+}
+
+/* ================================================================== */
+/* v3 节点凭据 / 出口池 / 运行态（WP10 Admin API 契约）                  */
+/* ================================================================== */
+
+/**
+ * 凭据签发的**一次性明文**（POST /admin/node/:id/credential[/rotate] 响应）。
+ *
+ * 明文只在这一次响应体里出现：后端不落任何存储/日志，前端也不得持久化——
+ * 所以类型上只作为「立刻展示 + 复制」的瞬态值存在，关掉弹窗即消失。
+ */
+export interface NodeCredentialIssued {
+  /** 一次性明文凭据。只在本次响应可见，勿写入 localStorage/URL */
+  credential: string;
+  /** 节点主键（数字） */
+  node_id: ID;
+  /** 节点对外标识（字符串 node_id，Agent 启动参数用） */
+  node_key: string;
+  /** issue 时为 issued_at，rotate 时为 rotated_at（后端二者不同名） */
+  issued_at?: string;
+  rotated_at?: string;
+}
+
+/** 撤销结果（POST /admin/node/:id/credential/revoke 响应）。哈希保留，仅置 revoked 位 */
+export interface NodeCredentialRevoked {
+  revoked: true;
+  node_id: ID;
+  node_key: string;
+}
+
+/** 出口池（EgressPool）：挂 Node（role=egress|both），内含多个 EgressTarget */
+export interface EgressPool {
+  id: ID;
+  node_id: ID;
+  name: string;
+  /** 池内目标选择策略；NULL = 回落 node.lb_strategy → round */
+  lb_strategy: LBStrategy | null;
+  status: Status;
+  targets?: EgressTarget[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** 出口目标（EgressPool 成员）：host 与 port 分列，不存 host:port 组合串 */
+export interface EgressTarget {
+  id: ID;
+  pool_id: ID;
+  host: string;
+  port: number;
+  /** 加权策略下生效；创建后必须存在至少一个 weight>0 的目标 */
+  weight: number;
+  order_by: number;
+  remark: string | null;
+  status: Status;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EgressPoolInput {
+  name: string;
+  lb_strategy?: LBStrategy | null;
+  status?: Status;
+}
+
+export interface EgressTargetInput {
+  host: string;
+  port: number;
+  weight?: number;
+  order_by?: number;
+  remark?: string | null;
+  status?: Status;
+}
+
+/**
+ * 节点运行态诊断（WP7 Agent 状态上报 → NodeStateReport）。
+ *
+ * 口径：`reported_at` 是面板收到上报的时刻（DB 侧时钟，非 Agent 时钟），
+ * 离线判定用它而不是 Agent 自述时间，避免被节点时钟漂移骗到。
+ */
+export interface NodeStateReport {
+  node_id: ID;
+  /** Agent 版本号（面板据此提示节点升级） */
+  version: string | null;
+  /** Agent 自报角色，与 node.role 不一致时以 node.role 为准 */
+  role: string | null;
+  /** Agent 已知的最新 revision；与 Tunnel.config_revision 对比判断是否落后 */
+  reported_revision: number | null;
+  /** 隧道快照：`{ "tunnels": [{ id, mode, ingress_port, egress_port, revision, targets? }] }` */
+  tunnels: NodeRuntimeTunnel[] | null;
+  /** 出口池快照：`{ "<tunnelId>": { strategy, targets: ["host:port"] } }` */
+  egress_pools: Record<string, { strategy: string; targets: string[] }> | null;
+  /** 已占用端口列表（agent 侧 usedPorts） */
+  used_ports: number[] | null;
+  /** Agent 自述的最近错误（不写凭据） */
+  last_error: string | null;
+  reported_at: string;
+  updated_at: string;
+}
+
+export interface NodeRuntimeTunnel {
+  id: number;
+  mode: string;
+  ingress_port?: number | null;
+  egress_port?: number | null;
+  revision?: number | null;
+  targets?: string[];
+}
+
+/** 节点详情（列表行 + 凭据状态派生 + 出口池 + 运行态） */
+export interface NodeDetail extends Node {
+  pools: EgressPool[];
+  state: NodeStateReport | null;
 }
 
 /** 管理端：用户新建/编辑 */

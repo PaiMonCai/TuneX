@@ -1,24 +1,28 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { Field, ToggleRow } from "@/components/ui/form";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { OptionSelect } from "@/components/ui/option-select";
 import { AdminToolbar, ConfirmDeleteDialog, FormDialog, RowActions, useForm } from "@/components/admin/admin-ui";
 import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
-import { STATUS_OPTIONS } from "@/lib/constants";
+import { NODE_ROLES, STATUS_OPTIONS } from "@/lib/constants";
 import { formatBytes, formatDateTime, strOf, toNumOrNull } from "@/lib/utils";
-import type { Node, NodeGroup, NodeInput, Paginated } from "@/lib/types";
+import type { Node, NodeGroup, NodeInput, NodeRole, Paginated } from "@/lib/types";
 
 interface NodeForm {
   node_id: string;
   connect_ip: string;
   node_group_id: string;
+  role: Node["role"];
   weight: string;
   version: string;
   status: Node["status"];
@@ -32,6 +36,7 @@ const EMPTY: NodeForm = {
   node_id: "",
   connect_ip: "",
   node_group_id: "",
+  role: null,
   weight: "1",
   version: "unknown",
   status: "active",
@@ -46,6 +51,7 @@ function toForm(n: Node): NodeForm {
     node_id: n.node_id,
     connect_ip: n.connect_ip,
     node_group_id: String(n.node_group_id),
+    role: n.role ?? null,
     weight: strOf(n.weight),
     version: n.version,
     status: n.status,
@@ -61,6 +67,7 @@ function toPayload(f: NodeForm): NodeInput {
     node_id: f.node_id.trim(),
     connect_ip: f.connect_ip.trim(),
     node_group_id: Number(f.node_group_id),
+    role: f.role ?? null,
     weight: toNumOrNull(f.weight) ?? 1,
     version: f.version.trim() || "unknown",
     status: f.status,
@@ -69,6 +76,13 @@ function toPayload(f: NodeForm): NodeInput {
     custom_line: f.custom_line.trim() || null,
     order_by: toNumOrNull(f.order_by) ?? 1000,
   };
+}
+
+/** v3 角色列：null = 尚未声明（存量行），显式渲染而不是隐藏 */
+function RoleBadge({ role, t }: { role: Node["role"]; t: (k: string) => string }) {
+  if (!role) return <Badge variant="muted">{t("admin.nodeRoleUndeclared")}</Badge>;
+  const variant = role === "ingress" ? "success" : role === "egress" ? "default" : "outline";
+  return <Badge variant={variant}>{role}</Badge>;
 }
 
 export function AdminNodesManager({
@@ -89,6 +103,7 @@ export function AdminNodesManager({
   const [deleteTarget, setDeleteTarget] = useState<Node | null>(null);
   const [deleting, setDeleting] = useState(false);
   const { form, set, setForm } = useForm<NodeForm>(EMPTY);
+  const router = useRouter();
 
   async function load(kw = keyword) {
     setLoading(true);
@@ -192,6 +207,7 @@ export function AdminNodesManager({
               <TableHead>{t("fields.nodeId")}</TableHead>
               <TableHead>{t("fields.connectIp")}</TableHead>
               <TableHead>{t("fields.nodeGroup")}</TableHead>
+              <TableHead>{t("admin.nodeRole")}</TableHead>
               <TableHead>{t("fields.weight")}</TableHead>
               <TableHead>{t("fields.version")}</TableHead>
               <TableHead>{t("tunnel.traffic")}</TableHead>
@@ -202,19 +218,30 @@ export function AdminNodesManager({
           <TableBody>
             {loading && data.data.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={9} className="h-24 text-center text-[var(--muted-foreground)]">
+                <TableCell colSpan={10} className="h-24 text-center text-[var(--muted-foreground)]">
                   {t("common.loading")}
                 </TableCell>
               </TableRow>
             ) : rows.length === 0 ? (
-              <TableEmpty colSpan={9} text={t("common.noData")} />
+              <TableEmpty colSpan={10} text={t("common.noData")} />
             ) : (
               rows.map((n) => (
                 <TableRow key={n.id}>
-                  <TableCell className="font-mono text-xs">{n.id}</TableCell>
-                  <TableCell className="font-medium">{n.node_id}</TableCell>
+                  <TableCell className="font-mono text-xs">
+                    <Link href={`/admin/nodes/${n.id}`} className="underline hover:text-[var(--primary)]" data-testid="node-row-link">
+                      {n.id}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="font-medium">
+                    <Link href={`/admin/nodes/${n.id}`} className="hover:text-[var(--primary)]">
+                      {n.node_id}
+                    </Link>
+                  </TableCell>
                   <TableCell className="font-mono text-xs">{n.connect_ip}</TableCell>
                   <TableCell className="text-xs">{n.node_group?.name ?? n.node_group_id}</TableCell>
+                  <TableCell>
+                    <RoleBadge role={n.role ?? null} t={t} />
+                  </TableCell>
                   <TableCell className="text-xs">{n.weight}</TableCell>
                   <TableCell className="text-xs">{n.version}</TableCell>
                   <TableCell className="text-xs">{formatBytes(n.traffic ?? 0)}</TableCell>
@@ -227,7 +254,15 @@ export function AdminNodesManager({
                     </div>
                   </TableCell>
                   <TableCell>
-                    <RowActions onEdit={() => openEdit(n)} onDelete={() => setDeleteTarget(n)} />
+                    <RowActions
+                      onEdit={() => openEdit(n)}
+                      onDelete={() => setDeleteTarget(n)}
+                      extra={
+                        <Button size="sm" variant="ghost" asChild={false} onClick={() => router.push(`/admin/nodes/${n.id}`)}>
+                          {t("admin.nodeDetailTitle")}
+                        </Button>
+                      }
+                    />
                   </TableCell>
                 </TableRow>
               ))
@@ -270,6 +305,24 @@ export function AdminNodesManager({
                 {nodeGroups.map((g) => (
                   <SelectItem key={g.id} value={String(g.id)}>
                     {g.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label={t("fields.nodeRole")} hint={t("admin.nodeRoleHint")}>
+            <Select
+              value={form.role === null ? "__unset__" : form.role}
+              onValueChange={(v) => set("role", (v === "__unset__" ? null : v) as NodeRole | null)}
+            >
+              <SelectTrigger data-testid="node-role-select">
+                <SelectValue placeholder={t("admin.nodeRoleUndeclared")} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__unset__">{t("admin.nodeRoleUndeclared")}</SelectItem>
+                {NODE_ROLES.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {o.zh}
                   </SelectItem>
                 ))}
               </SelectContent>

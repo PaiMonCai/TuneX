@@ -119,9 +119,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run typecheck
-      # OPS-03：仪表盘流量装配纯逻辑单测（bun test，无 DB/浏览器依赖）
-      - name: Unit tests (dashboard traffic + api mocks)
-        run: bun test src/components/dashboard/__tests__/
+      # OPS-03：仪表盘流量装配纯逻辑单测（bun test，无 DB / 浏览器依赖）
+      # WP12：节点管理 mock 契约（角色三元/凭据生命周期/出口池 CRUD）单测
+      - name: Unit tests (dashboard traffic + WP12 node management)
+        run: bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/
       - name: Build with optional billing disabled
         run: npm run build
         env:
