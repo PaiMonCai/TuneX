@@ -310,7 +310,7 @@ export function NodeWorkspace() {
         </Card>
       ) : null}
 
-      <Dialog open={createOpen}      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t("node.create")}</DialogTitle>
