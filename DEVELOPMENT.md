@@ -431,25 +431,25 @@ TuneX v3 团队按以下 Track 并行推进：
 
 ### 7.2 Work Package 依赖矩阵
 
-| WP | 工作包 | Track | 可以开始开发 | 可以合并 main |
+| WP | 工作包 | Track | 当前状态 | 备注 |
 |---|---|---|---|---|
-| WP0 | 架构/文档冻结 | Shared | 已完成 | ✅ 已完成 |
-| WP1 | v3 Schema 契约 | A | WP0 | ✅ 已完成（分支 `feature/v3-wp1-schema` 已 push，CI 全绿） |
-| WP2 | Legacy Backfill / Upgrade | A | WP1 schema 设计冻结后 | **WP1 已合并** |
-| WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | ✅ 已完成（分支 `feature/v3-wp3-port-allocator` 已 push，CI 全绿） |
-| WP4 | Agent v3 Runtime 骨架 | B | WP0；不依赖 DB 实现 | WP1 已合并或确认无 schema 耦合 |
-| WP5 | TCP RELAY Data Plane | B | **WP4 接口冻结** | **WP4 已合并** |
-| WP6 | v3 Command / Revision / ACK 协议 | B/C | WP0；协议字段冻结即可 | WP1 已合并；WP4 接口兼容 |
-| WP7 | Node Credential / Session / State Report | B/C | WP6 协议冻结 | WP6 已合并 |
-| WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并**；✅ 已实现（分支 `feature/v3-wp8-scheduler` 已 push，见 §7.11） |
-| WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
-| WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并（WP10 已实现，见 §7.13，待 CI） |
-|| WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并**；✅ 已合并 main（merge commit `39a9c32`，分支 `feature/v3-wp11-tunnel-api` 已合入：v3 CRUD + 状态查询 + retry/suspend/resume/delete，33 条离线单测全绿，见 §7.13） |
-| WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | ✅ 已完成（分支 `feature/v3-wp12-admin-web` 已 push：节点列表/详情、角色与端口编辑、credential 签发/轮转/吊销、出口池 CRUD、运行态诊断；后端 WP10 未落地期间走 mock 契约，25 条 contract 单测全绿，CI 已接入） |
-|| WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | ✅ 已合并 main（merge commit `8997fb0`，分支 `feature/v3-wp13-tunnel-web` 已合入：列表/详情/创建三页 + DIRECT/RELAY 选择与出口池 + 五种 apply 态展示 + retry/suspend/resume 运行按钮按状态机启用；mock 契约 44 断言全绿，CI web job 已接入，见 §7.14） |
-|| WP14 | Real E2E / Release Gate | D/Shared | 测试环境可提前搭建 | ✅ 已完成；outbound-only DIRECT/RELAY 真实 Integration Gate 已进入 CI |
-|| WP15 | DIRECT v3 Migration | B/C | WP14 Gate | ✅ 已完成；legacy DIRECT engine 已删除，统一 v3 runtime（`cdfc3f9` + `95d4c6c`） |
-| WP16+ | UDP / WS/TLS / QUIC / Advanced | 多 Track | WP14 后按独立 RFC/contract | 各自前置 Gate 通过 |
+| WP0 | 架构/文档冻结 | Shared | ✅ 完成 | 开发约束与单一计划已冻结 |
+| WP1 | v3 Schema 契约 | A | ✅ 完成 | Schema foundation |
+| WP2 | Legacy Backfill / Upgrade | A | ✅ 完成 | 存量 DB additive 升级 |
+| WP3 | NodePortLease / Port Allocator | A/C | ✅ 完成 | 物理端口单一所有权 |
+| WP4 | Agent v3 Runtime | B | ✅ 完成 | TunnelManager runtime |
+| WP5 | TCP RELAY Data Plane | B | ✅ 完成 | RELAY data plane |
+| WP6 | Command / Revision / ACK | B/C | ✅ 完成 | revisioned control contract |
+| WP7 | Node Credential / State | B/C | ✅ 完成 | per-node credential + state/desired |
+| WP8 | Scheduler + Orchestrator | C | ✅ 完成 | concrete ingress/egress binding |
+| WP9 | Reconciler / Retry / Recovery | C | ✅ 完成 | same-revision controlled repair |
+| WP10 | Admin Node / Egress API | C | ✅ 完成 | admin/runtime management |
+| WP11 | Tunnel Runtime API | C | ✅ 完成 | 历史 runtime API；V4 用户产品使用 Forward API |
+| WP12 | Admin Web | D | ✅ 完成 | 管理端节点/runtime diagnostics |
+| WP13 | Tunnel Web | D | ✅ 完成 | 历史产品层；V4 已收敛到 Forward |
+| WP14 | Real E2E / Release Gate | D/Shared | ✅ 完成 | outbound-only DIRECT/RELAY Integration |
+| WP15 | DIRECT v3 Migration | B/C | ✅ 完成 | legacy DIRECT engine 已删除（`cdfc3f9` + `95d4c6c`） |
+| WP16+ | UDP / WS/TLS / QUIC / Advanced | 多 Track | 按需启动 | 每项单独 contract + tests + real E2E + release gate |
 
 **重要：** “可以开始开发”是允许团队成员创建分支、写代码、开 Draft PR；“可以合并 main”才是硬门槛。
 
@@ -820,7 +820,7 @@ DoD：
 
 **Track：B/C；依赖 WP6。**
 
-状态：**已实现，待 CI 验证**（分支 `feature/v3-wp7-node-credential`）。
+状态：**✅ 已合并 main 并经 CI 验证**（WP7 Node Credential / Session / State Report）。
 
 实现：
 
@@ -1020,7 +1020,7 @@ DoD 核对（`scheduler.test.ts` 59 tests / 243 assertions 全绿，`tsc --noEmi
 
 credential 相关 endpoint 的合并依赖 WP7。
 
-状态：**已实现，待 CI 验证**（分支 `feature/v3-wp10-admin-api`）。
+状态：**✅ 已合并 main 并经 CI 验证**（merge `2e7e9b4`）。
 
 实现（service：`backend/src/services/node-admin.ts`，路由：
 `backend/src/routes/node-admin.ts`，挂载于 `app.route("/api/admin", nodeAdminRoutes)`）：
