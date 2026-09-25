@@ -236,6 +236,8 @@ const zh = {
     registered: "已注册",
     bindEgress: "绑定出口",
     bindings: "已绑定出口",
+    bindingInfraHint: "这里只维护入口与出口节点的基础设施关系；转发业务请在转发管理中创建。",
+    viewForwards: "查看该节点转发",
     noBindings: "尚未绑定出口节点",
     forwards: "端口转发",
     addForward: "添加端口转发",
