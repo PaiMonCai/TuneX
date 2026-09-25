@@ -26,6 +26,8 @@ TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用
 
 ### 用户侧模型
 
+`agent_id` 是物理 Agent 的稳定身份，和角色分离。同一台 Agent 选择 `BOTH` 后就是同一条 Node 同时具备入口/出口能力，不会注册成两个节点。
+
 ```text
 Ingress Node
 ├─ PortForward（不选择出口）──────────────→ Target       # DIRECT
@@ -37,8 +39,8 @@ Egress Node
 
 典型使用流程：
 
-1. 在「节点与转发」创建 Node，选择 `INGRESS`、`EGRESS` 或 `BOTH`。
-2. Panel 返回一条可复制的一键安装命令；命令只携带 10 分钟、一次性的 enrollment token。
+1. 在「节点与转发」创建 Node，Panel 同时生成不可变的唯一 `agent_id`；再选择 `INGRESS`、`EGRESS` 或 `BOTH` 能力。
+2. Panel 返回一条可复制的一键安装命令；命令携带 10 分钟一次性 enrollment token、agent_id 和当前节点显示名，不包含长期 credential。
 3. 在节点机器执行命令后，脚本自动准备 Docker、拉取 Agent 镜像、换取长期 per-node credential，并以 host network 容器启动 Agent。
 4. 选择一个入口 Node；需要 RELAY 时先绑定出口 Node。
 5. 在入口 Node 上直接「添加端口转发」：不选出口 = DIRECT，选择已绑定出口 = RELAY。
