@@ -36,6 +36,7 @@ import {
 import type { Orchestrator } from "./orchestrator.ts";
 import { getEffectivePolicy } from "./policy-service.ts";
 import { checkTunnelCreation, type EffectivePolicy } from "./capability-policy.ts";
+import { releaseLease } from "./portPool.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -751,38 +752,44 @@ export async function runTunnelAction(
   if (!compat.ok) return err("invalid_state", compat.message);
 
   if (action === "delete") {
-    /* ---- delete：撤两端（编排器补偿路径）→ 删行 ---- */
     const orchestrator = over?.orchestrator ?? null;
-    if (orchestrator && tunnel.tunnel_mode === "relay") {
-      // revision+1：与 orchestrator.removeTunnel 的 stale 闸门契约一致
-      //（用失败那次同值会被 Agent 判 stale 而撤不掉）。
-      const revision = (tunnel.config_revision ?? 0) + 1;
-      const egressNode = asRow<TunnelApiNodeRow>(
-        await pdb.node.findUnique({
-          where: { id: tunnel.egress_node_id ?? 0 },
+    const revision = (tunnel.config_revision ?? 0) + 1;
+
+    const ingressNode = tunnel.ingress_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.ingress_node_id },
           select: { id: true, node_id: true, connect_ip: true, role: true },
-        }),
-      );
-      if (egressNode) {
-        await orchestrator
-          .removeTunnel({ tunnelId, node: egressNode as never, revision, reason: "tunnel deleted" })
-          .catch(() => {});
+        }))
+      : null;
+    const egressNode = tunnel.egress_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.egress_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
+
+    if (orchestrator) {
+      if (tunnel.tunnel_mode === "relay" && egressNode) {
+        await orchestrator.removeTunnel({
+          tunnelId,
+          node: egressNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel deleted",
+        }).catch(() => {});
       }
-      // 入口侧同样要撤。补偿失败不阻断删除：行没了之后残留的 listener
-      // 由 reconciler 的租约回收 + 同 revision 重发兜底，而「删不掉」
-      // 对用户是死局（§4.1 的删除是显式用户动作）。
-      const ingressNode = asRow<TunnelApiNodeRow>(
-        await pdb.node.findUnique({
-          where: { node_group_id: tunnel.in_node_group_id, role: "ingress" },
-          select: { id: true, node_id: true, connect_ip: true, role: true },
-        }),
-      );
-      if (ingressNode && ingressNode.id !== egressNode?.id) {
-        await orchestrator
-          .removeTunnel({ tunnelId, node: ingressNode as never, revision, reason: "tunnel deleted" })
-          .catch(() => {});
+      if (ingressNode) {
+        await orchestrator.removeTunnel({
+          tunnelId,
+          node: ingressNode as never,
+          direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
+          revision,
+          reason: "tunnel deleted",
+        }).catch(() => {});
       }
     }
+
+    await releaseLease({ tunnelId }).catch(() => {});
     await pdb.tunnel.delete({ where: { id: tunnel.id } }).catch((e: unknown) => {
       throw toTunnelApiError(e, "删除失败");
     });
@@ -802,28 +809,80 @@ export async function runTunnelAction(
   );
   if (!updated) return err("not_found", "隧道不存在");
 
-  if (action === "suspend") {
-    return { ok: true, tunnelId: tunnel.id, action, revision: updated.config_revision ?? 0, tunnel: tunnelView(updated) };
-  }
-
-  /* ---- retry / resume：走 orchestrator 重新下发两端 ---- */
   const orchestrator = over?.orchestrator ?? null;
-  if (!orchestrator || updated.tunnel_mode !== "relay") {
-    // 未接线或 DIRECT：只完成 desired 切换。reconciler 的
-    // fill_missing_runtime 会用同 revision 补发（RELAY），
-    // legacy 配置推送照旧覆盖 DIRECT。
+
+  if (action === "suspend") {
+    const revision = (tunnel.config_revision ?? 0) + 1;
+    await pdb.tunnel.update({
+      where: { id: tunnel.id },
+      data: { config_revision: revision, desired_status: "inactive", apply_status: "suspended" },
+    });
+
+    if (orchestrator) {
+      const ingressNode = tunnel.ingress_node_id
+        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+            where: { id: tunnel.ingress_node_id },
+            select: { id: true, node_id: true, connect_ip: true, role: true },
+          }))
+        : null;
+      const egressNode = tunnel.egress_node_id
+        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+            where: { id: tunnel.egress_node_id },
+            select: { id: true, node_id: true, connect_ip: true, role: true },
+          }))
+        : null;
+
+      if (tunnel.tunnel_mode === "relay" && egressNode) {
+        const stopped = await orchestrator.removeTunnel({
+          tunnelId,
+          node: egressNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel suspended",
+        });
+        if (!stopped.ok) return err("apply_failed", stopped.error, { apply_error_code: stopped.error_code });
+      }
+      if (ingressNode) {
+        const stopped = await orchestrator.removeTunnel({
+          tunnelId,
+          node: ingressNode as never,
+          direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
+          revision,
+          reason: "tunnel suspended",
+        });
+        if (!stopped.ok) return err("apply_failed", stopped.error, { apply_error_code: stopped.error_code });
+      }
+    }
+
+    const afterSuspend = asRow<TunnelRow>(
+      await pdb.tunnel.findFirst({ where: { id: tunnel.id, workspace_id: workspaceId } }),
+    );
+    return {
+      ok: true,
+      tunnelId: tunnel.id,
+      action,
+      revision,
+      ...(afterSuspend ? { tunnel: tunnelView(afterSuspend) } : {}),
+    };
+  }
+
+  if (!orchestrator) {
     return { ok: true, tunnelId: tunnel.id, action, revision: updated.config_revision ?? 0, tunnel: tunnelView(updated) };
   }
 
-  const result = await deps.applyReapply(tunnel.id, orchestrator, {
-    db: deps.db as never,
-    loadPolicy: deps.loadPolicy,
-    now: deps.now,
-  });
+  const result = updated.tunnel_mode === "direct"
+    ? await deps.applyDirect(tunnel.id, orchestrator, {
+        db: deps.db as never,
+        loadPolicy: deps.loadPolicy,
+        now: deps.now,
+      })
+    : await deps.applyReapply(tunnel.id, orchestrator, {
+        db: deps.db as never,
+        loadPolicy: deps.loadPolicy,
+        now: deps.now,
+      });
 
   if (!result.ok) {
-    // 编排失败：编排器已把行落成 error（保留记录）。这里**不能** 204 掉，
-    // 调用方必须看到失败才能展示原因并允许再次 Retry（§4.1）。
     return err("apply_failed", result.error, { apply_error_code: result.error_code });
   }
   const after = asRow<TunnelRow>(
