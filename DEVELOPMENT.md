@@ -358,7 +358,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP2 | Legacy Backfill / Upgrade | A | WP1 schema 设计冻结后 | **WP1 已合并** |
 | WP3 | NodePortLease / Port Allocator | A/C | WP1 schema 设计冻结后 | **WP1 已合并** |
 | WP4 | Agent v3 Runtime 骨架 | B | WP0；不依赖 DB 实现 | WP1 已合并或确认无 schema 耦合 |
-| WP5 | TCP RELAY Data Plane | B | **WP4 接口冻结** | WP4 已合并 |
+| WP5 | TCP RELAY Data Plane | B | **WP4 接口冻结** | **WP4 已合并** |
 | WP6 | v3 Command / Revision / ACK 协议 | B/C | WP0；协议字段冻结即可 | WP1 已合并；WP4 接口兼容 |
 | WP7 | Node Credential / Session / State Report | B/C | WP6 协议冻结 | WP6 已合并 |
 | WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并** |
@@ -433,7 +433,7 @@ WP1 已合并，Prisma 类型已生成，可按最终字段开发；仍需满足
 开发者 D → WP14 E2E Harness / QA infrastructure
 ```
 
-WP1 已合并（见 §7.4），WP2 + WP3 已解锁；WP5/WP7/WP8 的合并门槛不变。
+WP1 已合并（见 §7.4），WP2 + WP3 已解锁；WP5 已实现待合入（§7.8），WP7/WP8 的合并门槛不变。
 
 > 注：本节措辞里的「已合并」指代码已交付并 CI 全绿。WP1 尚未由 maintainer
 > 合入 `main`——本仓库的 PAT 无建 PR 权限，需在 Web 端开
@@ -619,6 +619,35 @@ DoD：
 - hot update；
 - BOTH port conflict；
 - 无 goroutine 泄漏。
+
+**状态：✅ 已实现（待合入 main，见分支 `feature/v3-wp5-tcp-relay`）。**
+
+落地要点（`agent/internal/`）：
+
+- `forwarder/relay.go` — `RelayForwarder` 监听 `ingressPort` 并转发到 `nextHop`；
+  每连接独立 byte 计数，连接结束即结算（disconnect cleanup 的计量口径）。
+- `forwarder/egress.go` — `EgressForwarder` 监听 `egressPort`，从 selector 选 target
+  后 dial；dial 成功/失败、延迟、异常文案都记入 target 账本（target fail 可观测），
+  每连接字节数也归属到具体 target。wrapper conn 转发 `CloseWrite/SetDeadline`
+  等可选接口，保证 TCP 半关闭语义不被计量层破坏。
+- `forwarder/pipe.go` — 双向 copy，up-front 选定向账本计数器，连接对共享一个计数器。
+- `forwarder/interface.go` — `LBStrategy` 解析同时接受长枚举名与面板小写拼写
+  （`round` / `rand` / `weighted_round` 等）。
+- `manager/lb.go` — `round` / `rand` / `weighted_round` 三种策略；
+  加权用「权重 slots 预展开」，上限 1024，避免超大权重占用内存；
+  `UpdateTargets` / `SetPool` 只换 balancer，不重启 listener。
+- `manager/egress.go` / `manager/tunnel.go` — Egress/Tunnel 管理，`TargetStats`
+  桥接到 forwarder 账本；WP4 同端口替换 bug 已修（bind 自身为权威校验）。
+- `api/server.go` — `PATCH /node/targets` 热更新入口已接入。
+
+测试（`go test` 全绿，`-race` 通过）：
+
+- `internal/forwarder/forwarder_test.go` — 单 forwarder 行为（含 Stats 轮询到精确总量，
+  修掉历史 flaky 断言）。
+- `internal/manager/lb_test.go` — 三种策略、别名解析、权重上限、并发安全性单测。
+- `internal/manager/dataplane_test.go` — 真实 TCP 双进程端到端：双向大/小流量、
+  disconnect cleanup、target fail 可观测 + 恢复、hot update 不重启 listener、
+  BOTH 端口冲突双向拒绝。
 
 ---
 

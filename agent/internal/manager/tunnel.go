@@ -85,19 +85,29 @@ func (m *TunnelManager) New(cfg forwarder.TunnelConfig) (forwarder.Forwarder, er
 	if err := normalized.Validate(); err != nil {
 		return nil, err
 	}
-	switch normalized.Mode {
-	case forwarder.ModeDirect:
-		return forwarder.NewDirect(normalized)
-	case forwarder.ModeRelay:
-		return forwarder.NewRelay(normalized)
-	case forwarder.ModeEgress:
-		sel, err := m.egress.SelectorFor(cfg.ID)
-		if err != nil {
-			return nil, err
-		}
-		return forwarder.NewEgress(normalized, sel)
-	default:
-		return nil, fmt.Errorf("manager: unsupported tunnel mode %q", normalized.Mode)
+	fwd, err := m.buildLocked(normalized)
+	if err != nil {
+		return nil, err
+	}
+	m.attachLedger(normalized, fwd)
+	return fwd, nil
+}
+
+// attachLedger links an egress forwarder's per-target health view to its pool,
+// so EgressManager.TargetStats can report what the running forwarder observed.
+// A non-egress tunnel (or a pool-less one) is a no-op.
+func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.Forwarder) {
+	if cfg.Mode != forwarder.ModeEgress || m.egress == nil {
+		return
+	}
+	reader, ok := fwd.(interface {
+		TargetStats() []forwarder.TargetStats
+	})
+	if !ok {
+		return
+	}
+	if pool, err := m.egress.poolFor(cfg.ID); err == nil {
+		pool.SetLedger(reader.TargetStats)
 	}
 }
 
@@ -132,16 +142,22 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, 
 	if err != nil {
 		return nil, err
 	}
+	m.attachLedger(normalized, fwd)
 	if err := m.startLocked(normalized, fwd); err != nil {
 		return nil, err
 	}
 	if old, ok := m.tunnels[normalized.ID]; ok {
 		if old.cfg.ListenPort() != normalized.ListenPort() {
-			// The old port is genuinely freed and can be reused by a later
-			// tunnel, unlike a replace-in-place swap.
+			// A different port: the old one is genuinely freed. On the
+			// same port startLocked already stopped the old forwarder and
+			// dropped the guard key, so both paths end with the old port
+			// unreserved and the new tunnel owning it.
 			m.releasePortLocked(old.cfg)
 		}
-		// The new listener is bound, so it is safe to tear the old one down.
+		// The new listener is bound (or the old one already stopped for the
+		// same-port replace), so tearing the old one down is safe. The port
+		// bookkeeping above happened under this lock, so the async Stop
+		// never touches the guard map.
 		defer m.stopEntry(old)
 	}
 	m.tunnels[normalized.ID] = &entry{cfg: normalized, fwd: fwd}
@@ -163,9 +179,27 @@ func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Forwa
 		if err != nil {
 			return nil, err
 		}
-		return forwarder.NewEgress(cfg, sel)
+		// egressObserver is nil-safe, so a mode-only build loses nothing but
+		// the log line; tests can leave the observer unset.
+		return forwarder.NewEgressWithHealth(cfg, sel, egressObserver(cfg.ID))
 	default:
 		return nil, fmt.Errorf("manager: unsupported tunnel mode %q", cfg.Mode)
+	}
+}
+
+// egressObserver builds the target-failure observer for one egress tunnel.
+// It logs every failed dial (the WP5 "target fail 可观测" requirement) so a
+// broken target is visible in the agent log the moment it breaks, while the
+// per-target ledger stays the machine-readable source of truth.
+func egressObserver(tunnelID string) forwarder.TargetObserver {
+	return func(stats forwarder.TargetStats) {
+		logx.Warn("egress target dial failed",
+			"tunnel", tunnelID,
+			"target", stats.Addr(),
+			"dial_ok", stats.DialOK,
+			"dial_failed", stats.DialFailed,
+			"err", stats.LastErr,
+		)
 	}
 }
 
@@ -173,11 +207,30 @@ func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Forwa
 // The port guard is checked here AND the bind itself is the authoritative check
 // (a foreign process holding the port makes net.Listen fail), so a race with
 // the OS cannot be hidden by the map.
+//
+// When this Apply replaces the tunnel that currently owns the port, the old
+// forwarder must already have released it: Apply then does the replace in two
+// steps (release the old port, bind the new one) rather than failing on a port
+// the node itself holds. Same-port replacement is exactly the hot-update case
+// the panel hits when it re-sends a tunnel with a new revision.
 func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Forwarder) error {
-	if port := cfg.ListenPort(); port > 0 && m.usedPort[portGuardKey(port)] {
-		return fmt.Errorf("manager: port %d is already used by another tunnel", port)
+	port := cfg.ListenPort()
+	if port <= 0 {
+		return fwd.Start()
 	}
-	return fwd.Start()
+	key := portGuardKey(port)
+	if !m.usedPort[key] {
+		return fwd.Start()
+	}
+	// The port is taken. If the taker is the entry this Apply replaces, the
+	// port is genuinely available to us: the old forwarder is stopped first
+	// and its listener closed, and only then does the new one bind it.
+	if old, ok := m.tunnels[cfg.ID]; ok && old.cfg.ListenPort() == port {
+		_ = old.fwd.Stop()
+		delete(m.usedPort, key)
+		return fwd.Start()
+	}
+	return fmt.Errorf("manager: port %d is already used by another tunnel", port)
 }
 
 // markPortUsedLocked records the port of a now-running tunnel. Caller must hold
@@ -195,11 +248,17 @@ func (m *TunnelManager) releasePortLocked(cfg forwarder.TunnelConfig) {
 	}
 }
 
-// stopEntry stops a forwarder outside the manager lock: Stop drains live
-// connections and may block for drainTimeout. Caller must hold m.mu.
+// stopEntry stops a forwarder in the background. Stop drains live connections
+// and may block for drainTimeout, so it must never run while m.mu is held or
+// the whole manager stalls behind one tunnel's teardown.
+//
+// The port guard is deliberately NOT touched here: a goroutine reaching into
+// m.usedPort would race every Apply/StopAll that reads it (the -race detector
+// flags this exact pair). Callers release the port under the lock instead —
+// see releasePortLocked — which also makes "Remove frees the port" hold the
+// instant Remove returns rather than "eventually".
 func (m *TunnelManager) stopEntry(e *entry) {
 	go func() {
-		m.releasePortLocked(e.cfg)
 		if err := e.fwd.Stop(); err != nil {
 			logx.Warn("tunnel stop failed", "id", e.cfg.ID, "err", err.Error())
 			return
@@ -224,6 +283,7 @@ func (m *TunnelManager) Remove(id string) error {
 		return nil
 	}
 	delete(m.tunnels, id)
+	m.releasePortLocked(e.cfg)
 	m.mu.Unlock()
 
 	m.stopEntry(e)
@@ -297,6 +357,23 @@ func (m *TunnelManager) MaxRevision() int64 {
 		}
 	}
 	return max
+}
+
+// LiveConns returns how many client connections the tunnel is relaying right
+// now (0 when unknown). It is the observable the disconnect-cleanup guard
+// needs: after every client hangs up the count must fall back to zero.
+func (m *TunnelManager) LiveConns(id string) int {
+	m.mu.RLock()
+	e, ok := m.tunnels[id]
+	m.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	type counter interface{ LiveConns() int }
+	if c, ok := e.fwd.(counter); ok {
+		return c.LiveConns()
+	}
+	return 0
 }
 
 // StopAll tears down every tunnel, draining connections. Used on shutdown.
