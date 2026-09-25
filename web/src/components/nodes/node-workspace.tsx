@@ -272,10 +272,18 @@ export function NodeWorkspace() {
                 <CardTitle className="text-base">{selectedIngress.node_id} · {t("node.bindings")}</CardTitle>
                 <CardDescription>{t("node.bindingInfraHint")}</CardDescription>
               </div>
-              <Button size="sm" variant="outline" onClick={() => setBindOpen(true)}>
-                <Link2 className="size-3.5" />
-                {t("node.bindEgress")}
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" asChild>
+                  <Link href={`/forwards?ingress_node_id=${selectedIngress.id}`}>
+                    <ArrowLeftRight className="size-3.5" />
+                    {t("node.viewForwards")}
+                  </Link>
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => setBindOpen(true)}>
+                  <Link2 className="size-3.5" />
+                  {t("node.bindEgress")}
+                </Button>
+              </div>
             </div>
           </CardHeader>
           <CardContent className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
