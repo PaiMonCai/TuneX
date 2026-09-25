@@ -116,6 +116,7 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 	if cfg.PanelHTTPURL != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
+			AgentID:    cfg.AgentID,
 			NodeID:     cfg.NodeID,
 			Version:    version,
 			Role:       role,
