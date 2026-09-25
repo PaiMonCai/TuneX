@@ -48,11 +48,14 @@ import { db } from "./db.ts";
 import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
 import { defaultTrafficArchiveDeps, flushTrafficBuffer } from "./services/traffic-archive.ts";
 import { defaultTrafficRetentionDeps, deleteExpiredTraffic } from "./services/traffic-retention.ts";
+import { defaultReconcileDeps, executeReconcile } from "./services/reconciler.ts";
+import { createRuntimeReconcileSink } from "./services/runtime-reconcile-sink.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步（OPS-01/OPS-03，幂等）" },
   { name: "cron_delete_tunnel_traffic", pattern: "0 0 * * *", desc: "删除过期流量记录（OPS-03，按保留期，幂等）" },
   { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
+  { name: "cron_reconcile_v3", everyMs: 30_000, desc: "v3 desired/runtime/lease 同 revision 对账修复" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
@@ -105,6 +108,26 @@ const worker = new Worker(
         };
         if (r.flipped > 0 || r.errors > 0) {
           console.log("[worker] cron_check_node_offline:", JSON.stringify(summary));
+        }
+        return summary;
+      }
+      case "cron_reconcile_v3": {
+        // Same-revision only: sink reads the already persisted ingress/egress
+        // bindings and never chooses a new node/port. Offline nodes therefore
+        // produce findings instead of automatic migration.
+        const deps = defaultReconcileDeps();
+        deps.sink = createRuntimeReconcileSink();
+        const r = await executeReconcile(deps);
+        const summary = {
+          scanned: r.scanned,
+          findings: r.findings.length,
+          resent: r.resent,
+          failed: r.failed,
+          no_transport: r.noTransport,
+          leases: r.leases,
+        };
+        if (r.findings.length > 0 || r.failed > 0) {
+          console.log("[worker] cron_reconcile_v3:", JSON.stringify(summary));
         }
         return summary;
       }
