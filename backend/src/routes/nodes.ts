@@ -13,19 +13,10 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
-import {
-  countWorkspaceTunnels,
-  sumWorkspaceTraffic,
-  withWorkspaceQuotaLock,
-} from "../services/policy-service.ts";
-import { checkTunnelCreation } from "../services/capability-policy.ts";
 import { createNodeEnrollment } from "../services/node-enrollment.ts";
-import { getOrchestrator } from "../services/relay-wiring.ts";
-import { reapplyDirectTunnel, reapplyRelayTunnel } from "../services/scheduler.ts";
 import {
   createForward as createForwardService,
   deleteForward as deleteForwardService,
@@ -81,9 +72,6 @@ function idParam(c: Ctx, name: string): number | null {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
-function targetAddress(host: string, port: number): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]:${port}` : `${host}:${port}`;
-}
 
 const nodeSelect = {
   id: true,
@@ -140,63 +128,10 @@ function nodeView(node: {
   };
 }
 
-const forwardInclude = Prisma.validator<Prisma.TunnelInclude>()({
-  ingress_node: { select: { id: true, node_id: true, agent_id: true, connect_ip: true, role: true } },
-  egress_node: { select: { id: true, node_id: true, agent_id: true, connect_ip: true, role: true } },
-  egress_pool: {
-    include: {
-      targets: {
-        where: { status: "active" as const },
-        orderBy: [{ order_by: "asc" as const }, { id: "asc" as const }],
-      },
-    },
-  },
-});
-
-function portForwardView(t: any) {
-  const target =
-    t.tunnel_mode === "relay"
-      ? t.egress_pool?.targets?.[0] ?? null
-      : t.remote_host && t.remote_port
-        ? { host: t.remote_host, port: t.remote_port, weight: 1 }
-        : null;
-  return {
-    id: t.id,
-    name: t.name,
-    protocol: "tcp",
-    mode: t.tunnel_mode ?? "direct",
-    ingress_node_id: t.ingress_node_id,
-    ingress_node: t.ingress_node ?? null,
-    egress_node_id: t.egress_node_id,
-    egress_node: t.egress_node ?? null,
-    listen_ip: t.listen_ip,
-    listen_port: t.listen_port,
-    target_host: target?.host ?? null,
-    target_port: target?.port ?? null,
-    target_weight: target?.weight ?? null,
-    desired_status: t.desired_status,
-    apply_status: t.apply_status,
-    config_revision: t.config_revision,
-    applied_revision: t.applied_revision,
-    apply_error_code: t.apply_error_code,
-    apply_error: t.apply_error,
-    last_applied_at: t.last_applied_at,
-    created_at: t.created_at,
-    updated_at: t.updated_at,
-  };
-}
-
 async function loadWorkspaceNode(nodeId: number, workspaceId: number) {
   return db.node.findFirst({
     where: { id: nodeId, node_group: { workspace_id: workspaceId } },
     select: nodeSelect,
-  });
-}
-
-async function loadForward(id: number, ingressNodeId: number, workspaceId: number) {
-  return db.tunnel.findFirst({
-    where: { id, workspace_id: workspaceId, ingress_node_id: ingressNodeId },
-    include: forwardInclude,
   });
 }
 
