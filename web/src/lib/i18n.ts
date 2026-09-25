@@ -944,6 +944,7 @@ const en: Dict = {
     registered: "Registered",
     bindEgress: "Bind egress",
     bindings: "Bound egress nodes",
+    bindingInfraHint: "Manage only ingress-to-egress infrastructure relationships here; create business forwards in Forward Management.",
     noBindings: "No egress nodes bound yet",
     forwards: "Port forwards",
     addForward: "Add port forward",
