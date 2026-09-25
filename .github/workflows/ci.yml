@@ -68,15 +68,19 @@ jobs:
         run: |
           bunx prisma generate
           bunx tsc --noEmit
-      # WP6 / WP3：散布式纯逻辑单测（bun test，无 DB / 网络 / 浏览器依赖）。
-      # package.json 的 "test" 脚本有重复键，JSON 后写的 node --test 那组覆盖先写的
-      # `bun test`，所以 src/**/__tests__ 下的散装单测必须在这里显式跑，
-      # 否则 CI 绿了但它们一次都没被执行（typecheck 不覆盖运行时行为）。
-      # WP3 的 portPool.test.ts 自带内存 DB/Redis 替身（依赖注入），不连真实服务。
-      - name: Scattered backend unit tests (control-protocol, portPool)
+      # WP6 / WP3 / WP10：散布式纯逻辑单测（bun test，无 DB / 网络 / 浏览器依赖）。
+      # package.json 的 "test" 脚本有重复键，JSON 后写的 node --test
+      # tests/*.test.mjs 那组覆盖先写的 `bun test`，所以 src/**/__tests__
+      # 下的散装单测必须在这里显式跑，否则 CI 绿了但它们一次都没被执行
+      # （typecheck 不覆盖运行时行为）。
+      # WP3 的 portPool.test.ts 自带内存 DB/Redis 替身（依赖注入），不连真实服务；
+      # WP10 的 node-admin.test.ts 同理（内存 DB + 注入 now），它守住
+      # 「只写 desired state，不下发」与「credential 绝不下发明文或哈希」。
+      - name: Scattered backend unit tests (control-protocol, portPool, WP10 node-admin)
         run: |
           bun test src/services/__tests__/control-protocol.test.ts
           bun test src/services/__tests__/portPool.test.ts
+          bun test src/services/__tests__/node-admin.test.ts
       - name: Authorization and payment HTTP tests
         run: bun run test
         env:

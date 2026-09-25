@@ -363,7 +363,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP7 | Node Credential / Session / State Report | B/C | WP6 协议冻结 | WP6 已合并 |
 | WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并** |
 | WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
-| WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并 |
+| WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并（WP10 已实现，见 §7.13，待 CI） |
 | WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并** |
 | WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | WP10 已合并 |
 | WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | WP11 已合并 |
@@ -906,6 +906,57 @@ auth/quota
 - runtime/state query。
 
 credential 相关 endpoint 的合并依赖 WP7。
+
+状态：**已实现，待 CI 验证**（分支 `feature/v3-wp10-admin-api`）。
+
+实现（service：`backend/src/services/node-admin.ts`，路由：
+`backend/src/routes/node-admin.ts`，挂载于 `app.route("/api/admin", nodeAdminRoutes)`）：
+
+- Node role：`PATCH /api/admin/node/:id/role`（role 必填，`port_range_min/max`
+  与 `lb_strategy` 可选；节点获得出口能力时自动补建 `default` 池，取消出口
+  角色时须先清池）；
+- credential 状态读端点（**只查状态，绝不下发明文或哈希**，issue/rotate/revoke
+  仍归 WP7）：
+  - `GET /api/admin/node/:id/credential` —— 单节点状态；
+  - `GET /api/admin/node/credentials` —— 全量状态 + 运行态摘要
+    （`?role=` / `?online=` / `?stale=`）；
+- EgressPool CRUD：
+  - `POST /api/admin/node/:id/pools`、`GET /api/admin/node/:id/pools`、
+    `PATCH /api/admin/node/pools/:poolId`、`DELETE /api/admin/node/pools/:poolId`、
+    `GET /api/admin/node/pools`；
+- EgressTarget CRUD：
+  - `POST /api/admin/node/pools/:poolId/targets`、
+    `GET /api/admin/node/pools/:poolId/targets`、
+    `PATCH /api/admin/node/targets/:targetId`、
+    `DELETE /api/admin/node/targets/:targetId`、
+    `PUT /api/admin/node/pools/:poolId/targets`（整批替换，面板「保存池」）；
+- runtime/state query（读 `node_state_report`）：
+  - `GET /api/admin/node/:id/state`、`GET /api/admin/node/:id/detail`、
+  - `GET /api/admin/node/states`（`?role=` / `?online=` / `?stale=`）。
+
+`:id` 既接受数字主键也接受字符串 `node_id`（`resolveNodeId`）。
+
+所有路径都落在 `nodes` 资源的 `/admin/node` 前缀下——`adminPermissionGuard`
+按资源前缀 fail-closed 授权，前缀不对会 403。
+
+防御性不变式（`poolHasViableTarget` / §2.2 硬规则）：
+
+- 每个池至少保留一个 `active` 且 `weight > 0` 的目标：改 `weight=0`、把最后
+  一个可用目标改成 `inactive`、删除最后一个可用目标、整批替换成空集，一律
+  409 而不是让下发拿到空快照；
+- `ingress` 角色不配池（无出口能力）；池被隧道引用时拒绝删除（409）；
+- 自报角色（`state_report.role`）不覆盖面板 `node.role`，只报
+  `role_mismatch`；
+- 未配置 per-node `port_range` 时不回落节点组端口区间。
+
+WP10 边界（不与 WP8/WP9 抢）：
+
+- 本包只写 **desired state**；不做下发、不提 socket、不 import control-protocol
+  或 portPool（由单测逐条守住）；
+- 隧道运行状态 / retry-suspend-resume 归 WP11（unified orchestrator）。
+
+测试：`backend/src/services/__tests__/node-admin.test.ts`（74 例全绿，纯内存
+DB 替身，不连 MySQL/Redis/net；含对上述不变式的反向断言）。
 
 #### WP11 Tunnel RELAY API
 

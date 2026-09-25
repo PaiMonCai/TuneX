@@ -33,6 +33,7 @@ import { adminRoutes } from "./routes/admin.ts";
 import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
 import { workspaceRoutes } from "./routes/workspaces.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
+import { nodeAdminRoutes } from "./routes/node-admin.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
@@ -139,6 +140,9 @@ export function createApp() {
   app.route("/api/admin", adminRoutes);
   app.route("/api/admin", nodeGrantRoutes);
   app.route("/api/admin", adminExtendedRoutes);
+  // WP10：管理端节点角色 / 凭据状态 / 出口池 / 运行态查询。与上面三个同批
+  // 挂载，中间件（adminRequired → adminPermissionGuard）已在 §⑥ 统一施加。
+  app.route("/api/admin", nodeAdminRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 
