@@ -12,9 +12,13 @@ import type {
   AdminRole,
   AuditLog,
   BalanceLog,
+  EgressPool,
+  EgressTarget,
+  ID,
   LicenseInfo,
   Node,
   NodeGroup,
+  NodeStateReport,
   Payment,
   Plan,
   PlanOrder,
@@ -64,6 +68,14 @@ export interface MockStore {
   workspaces: MockWorkspace[];
   workspaceMembers: MockWorkspaceMember[];
   workspaceInvites: MockWorkspaceInvite[];
+  /** WP12 节点凭据签发明文记录：node_id → 多久轮转过（次数） */
+  nodeCredentials: Map<ID, { rotation_count: number; issued_at: string; last_rejected_at: string | null }>;
+  /** WP12 出口池（node_id → 池列表） */
+  egressPools: Map<ID, EgressPool[]>;
+  /** WP12 出口目标（pool_id → 目标列表） */
+  egressTargets: Map<ID, EgressTarget[]>;
+  /** WP12 节点最近一条运行态上报（node_id → report） */
+  nodeStates: Map<ID, NodeStateReport>;
   /** 单例创建时间，便于调试 */
   boot_at: string;
 }
@@ -215,6 +227,10 @@ function build(): MockStore {
     workspaces,
     workspaceMembers,
     workspaceInvites: [],
+    nodeCredentials: new Map(),
+    egressPools: new Map(),
+    egressTargets: new Map(),
+    nodeStates: new Map(),
     boot_at: new Date().toISOString(),
   };
 }

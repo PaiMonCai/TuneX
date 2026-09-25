@@ -365,7 +365,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
 | WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并（WP10 已实现，见 §7.13，待 CI） |
 | WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并** |
-| WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | WP10 已合并 |
+| WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | ✅ 已完成（分支 `feature/v3-wp12-admin-web` 已 push：节点列表/详情、角色与端口编辑、credential 签发/轮转/吊销、出口池 CRUD、运行态诊断；后端 WP10 未落地期间走 mock 契约，25 条 contract 单测全绿，CI 已接入） |
 | WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | WP11 已合并 |
 | WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | **WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 + WP13 已合并** |
 | WP15 | DIRECT v3 Migration | B/C | WP14 验收方案冻结 | WP14 验收通过 |
@@ -1066,6 +1066,26 @@ Frontend **允许在后端实现未完成时提前并行开发**，条件是使�
 - runtime diagnostics。
 
 可在 WP10 contract freeze 后开始，合并依赖 WP10。
+
+**状态：✅ 已完成（分支 `feature/v3-wp12-admin-web` 已 push，未开 PR）。**
+
+交付范围：
+
+- 路由：`/admin/nodes`（列表，新增角色徽章列 + 行内详情入口）与 `/admin/nodes/[id]`
+  （详情；与既有 `/admin/[segment]` 动态段共存，实测 Next 16 无冲突）。
+- 角色 / 端口区间：`role` 三元（ingress / egress / both）+ 「未声明」独立选项，
+  显式 `null` 原样提交，**不得默认成 ingress**（§7.1：存量行「不改 / 不猜」）；
+  端口区间 `port_range_min/max` 与默认池策略 `lb_strategy`（仅 egress/both 显示）。
+- Credential：状态徽章（未签发 / 有效 / 已吊销）+ 签发、轮转、吊销三个动作，
+  各自带确认弹窗（说明后果）；明文只在签发/轮转响应里出现一次，
+  UI 复制后关窗即失，不写入 localStorage / URL / toast 正文。
+- Egress Pool / Target：池 + 嵌套目标的增删改，`host:port` 分列、去重、范围校验。
+- Runtime diagnostics：`/admin/nodes/:id/state` 最近一条上报（版本、revision、
+  隧道快照、出口池快照、占用端口、最近错误）。
+- 后端 WP10 未落地期间：mock 契约先行（`src/mocks/*`），详情页显著标注 MOCK；
+  后端合并后删除 mock 分支即可，页面零改动。
+- 测试：`web/src/components/admin/__tests__/wp12-node-management.test.ts`
+  25 条 contract 单测（bun test，无 DB/浏览器依赖），已接入 CI web job。
 
 #### WP13 Tunnel Web
 

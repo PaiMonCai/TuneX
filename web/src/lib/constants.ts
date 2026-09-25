@@ -46,6 +46,23 @@ export const BYPASS_TYPE_OPTIONS: OptionMeta[] = [
   { value: "whitelist", zh: "白名单", en: "Whitelist" },
 ];
 
+/**
+ * v3 节点角色（schema enum NodeRole）。**不含「未声明」项**：`null` 在界面上
+ * 单独渲染成「未声明」占位，不预设默认值 —— 默成 ingress 会让存量节点被误当
+ * 入口参与调度（DEVELOPMENT.md §7.1 / WP2 回填策略）。
+ */
+export const NODE_ROLES: OptionMeta[] = [
+  { value: "ingress", zh: "入口", en: "Ingress" },
+  { value: "egress", zh: "出口", en: "Egress" },
+  { value: "both", zh: "兼任", en: "Both" },
+];
+
+/** v3 出口池默认策略（schema enum LBStrategy） */
+export const LB_STRATEGIES: OptionMeta[] = [
+  { value: "round", zh: "轮询", en: "Round" },
+  { value: "rand", zh: "随机", en: "Random" },
+];
+
 export const CATEGORY_OPTIONS: OptionMeta[] = [
   { value: "port_forward", labelKey: "tunnel.portForward", zh: "端口转发", en: "Port forward" },
   { value: "remote_port_forward", labelKey: "tunnel.remotePortForward", zh: "远程端口转发", en: "Remote port forward" },

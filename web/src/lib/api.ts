@@ -18,12 +18,23 @@ import type {
   AuthSession,
   BalanceLog,
   DashboardStats,
+  EgressPool,
+  EgressPoolInput,
+  EgressTarget,
+  EgressTargetInput,
+  ID,
   LicenseInfo,
   ListQuery,
+  LBStrategy,
   Node,
+  NodeCredentialIssued,
+  NodeCredentialRevoked,
+  NodeDetail,
   NodeGroup,
   NodeGroupInput,
   NodeInput,
+  NodeRole,
+  NodeStateReport,
   Paginated,
   PasswordChangeInput,
   Payment,
@@ -399,6 +410,60 @@ export const api = {
     updateNode: (id: number, input: Partial<NodeInput>, cookie?: string) =>
       patch<Node>(`/admin/nodes/${id}`, input, cookie),
     removeNode: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/nodes/${id}`, cookie),
+    /**
+     * 节点凭据（WP7，已随 main 合并；对应 backend/src/routes/admin.ts 的
+     * `/node/:id/credential[/rotate|/revoke]`）。
+     *
+     * 三条端点都只接受节点主键（数字）或字符串 node_id 作 :id。
+     * 其中 issue 已在上面那段注释之外额外多一条约束：**已持有有效凭据的节点
+     * 只能 rotate**（issue 对有效凭据返回 409），否则误点两次「签发」会让
+     * 线上 Agent 静默失联；revoke 保留哈希仅置 revoked 位；想彻底换钥匙只有
+     * rotate 一条路（它覆盖哈希列）。
+     *
+     * 轮换/撤销是敏感写操作，后端挂了 60s/5 次的 user 维度限流
+     * （`node-credential-rotation`），连续点击会被 429 挡回。
+     */
+    /** 签发凭据（明文只此一次可见）。已有有效凭据 → 409 */
+    issueNodeCredential: (id: ID, cookie?: string) =>
+      post<NodeCredentialIssued>(`/admin/node/${id}/credential`, {}, cookie),
+    /** 轮换凭据：覆盖哈希列，旧明文立即失效；从未签发 → 404 */
+    rotateNodeCredential: (id: ID, cookie?: string) =>
+      post<NodeCredentialIssued>(`/admin/node/${id}/credential/rotate`, {}, cookie),
+    /** 撤销凭据：保留哈希 + 置 revoked 位，重连一律拒绝 */
+    revokeNodeCredential: (id: ID, cookie?: string) =>
+      post<NodeCredentialRevoked>(`/admin/node/${id}/credential/revoke`, {}, cookie),
+    /**
+     * 节点详情（WP10）：列表字段 + 出口池 + 运行态快照。
+     *
+     * 注：WP10 的 Admin API 尚未合入 main（§7.14 允许前端在 contract 冻结后
+     * 先 mock 开发）。详情端点与出口池 CRUD 由 mock handler 提供，契约冻结后
+     * 这里只需把路径指向真实实现，页面代码不用改。
+     */
+    nodeDetail: (id: ID, cookie?: string) => get<NodeDetail>(`/admin/nodes/${id}`, undefined, cookie),
+    /**
+     * 出口池 / 出口目标 CRUD（WP10 Admin API，mock 中；契约见 devmap v3
+     * `/api/admin/nodes/:id/targets*` 与 schema 的 EgressPool/EgressTarget）。
+     *
+     * 不变式由后端保证、前端必须如实展示的两条：
+     *   1. 池内至少一个 active 且 weight>0 的目标（删到空 = 拒绝，属于服务层
+     *      而非 DB 约束）；
+     *   2. 目标修改只更新快照，不重建 ingress listener（热更新）。
+     */
+    pools: (nodeId: ID, cookie?: string) => get<EgressPool[]>(`/admin/nodes/${nodeId}/pools`, undefined, cookie),
+    createPool: (nodeId: ID, input: EgressPoolInput, cookie?: string) =>
+      post<EgressPool>(`/admin/nodes/${nodeId}/pools`, input, cookie),
+    updatePool: (nodeId: ID, poolId: ID, input: Partial<EgressPoolInput>, cookie?: string) =>
+      patch<EgressPool>(`/admin/nodes/${nodeId}/pools/${poolId}`, input, cookie),
+    removePool: (nodeId: ID, poolId: ID, cookie?: string) =>
+      del<{ ok: boolean }>(`/admin/nodes/${nodeId}/pools/${poolId}`, cookie),
+    createTarget: (nodeId: ID, poolId: ID, input: EgressTargetInput, cookie?: string) =>
+      post<EgressTarget>(`/admin/nodes/${nodeId}/pools/${poolId}/targets`, input, cookie),
+    updateTarget: (nodeId: ID, poolId: ID, targetId: ID, input: Partial<EgressTargetInput>, cookie?: string) =>
+      patch<EgressTarget>(`/admin/nodes/${nodeId}/pools/${poolId}/targets/${targetId}`, input, cookie),
+    removeTarget: (nodeId: ID, poolId: ID, targetId: ID, cookie?: string) =>
+      del<{ ok: boolean }>(`/admin/nodes/${nodeId}/pools/${poolId}/targets/${targetId}`, cookie),
+    /** 运行态诊断（WP7 上报 → NodeStateReport；无上报时 404/空） */
+    nodeState: (id: ID, cookie?: string) => get<NodeStateReport>(`/admin/nodes/${id}/state`, undefined, cookie),
     nodeGroups: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/admin/node-groups", query, cookie),
     createNodeGroup: (input: NodeGroupInput, cookie?: string) =>
       post<NodeGroup>("/admin/node-groups", input, cookie),

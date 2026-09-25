@@ -107,11 +107,12 @@ export function ConfirmDeleteDialog({
   );
 }
 
-/** 行内操作按钮组：编辑 + 删除 */
-export function RowActions({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => void }) {
+/** 行内操作按钮组：编辑 + 删除（extra 供调用方追加入口，如「详情」跳转） */
+export function RowActions({ onEdit, onDelete, extra }: { onEdit: () => void; onDelete: () => void; extra?: React.ReactNode }) {
   const { t } = useI18n();
   return (
     <div className="flex items-center justify-end gap-1">
+      {extra}
       <Button size="sm" variant="ghost" onClick={onEdit} data-testid="row-edit">
         {t("common.edit")}
       </Button>
