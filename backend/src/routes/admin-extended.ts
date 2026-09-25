@@ -500,7 +500,7 @@ adminExtendedRoutes.post("/nodes", async (c) => {
     groupType = first.node_type;
     groupPortRange = first.port_range;
   } else {
-    const group = await db.nodeGroup.findUnique({ where: { id: groupId }, select: { id: true, node_type: true } });
+    const group = await db.nodeGroup.findUnique({ where: { id: groupId }, select: { id: true, node_type: true, port_range: true } });
     if (!group) return bad(c, "节点组不存在", 404);
     groupType = group.node_type;
     groupPortRange = group.port_range;
