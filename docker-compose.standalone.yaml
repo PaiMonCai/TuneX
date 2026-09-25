@@ -11,6 +11,8 @@
 # In this mode Caddy owns host 80/443 and uses Caddyfile.prod for ACME/TLS.
 services:
   caddy:
+    # standalone overlay 自身就是显式启用 Caddy，因此移除基础 compose 的可选 profile。
+    profiles: !override []
     env_file: [.env]
     ports: !override
       - "${CADDY_HTTP_PORT:-80}:80"
