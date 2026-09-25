@@ -22,6 +22,8 @@ import { db } from "../db.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { withWorkspaceQuotaLock } from "../services/policy-service.ts";
+import { checkNodeCreation } from "../services/capability-policy.ts";
+import { generateNodeCredential, hashNodeCredential } from "../services/node-credential.ts";
 
 export const nodeGroupsRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -124,4 +126,124 @@ nodeGroupsRoutes.post("/", async (c) => {
 
   if ("group" in group) return c.json({ data: group.group }, 201);
   return c.json({ error: `当前策略不允许自建${node_type === "in" ? "入口" : "出口"}节点组`, code: "custom_group_not_allowed" }, 403);
+});
+
+
+const ProvisionNode = z.object({
+  node_id: z.string().trim().min(1).max(255),
+  connect_ip: z.string().trim().min(1).max(255),
+  role: z.enum(["ingress", "egress", "both"]).optional(),
+});
+
+/**
+ * Provision one concrete Agent identity inside an owned workspace NodeGroup.
+ *
+ * Returns the node credential exactly once. The database stores only its hash;
+ * subsequent control/state requests derive node identity from that credential.
+ */
+nodeGroupsRoutes.post("/:id/nodes", async (c) => {
+  const user = requireUser(c);
+  const workspace = c.get("workspace")!;
+  const groupId = Number(c.req.param("id"));
+  if (!Number.isInteger(groupId) || groupId <= 0) {
+    return c.json({ error: "节点组 ID 不合法" }, 400);
+  }
+
+  const parsed = ProvisionNode.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: "node_id / connect_ip / role 不合法" }, 400);
+  }
+
+  const group = await db.nodeGroup.findFirst({
+    where: { id: groupId, workspace_id: workspace.id },
+    select: { id: true, node_type: true, port_range: true },
+  });
+  if (!group) return c.json({ error: "节点组不存在" }, 404);
+
+  const role = parsed.data.role ?? (group.node_type === "in" ? "ingress" : "egress");
+  const range = group.port_range?.split("-").map(Number) ?? [];
+  const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
+  const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
+  if (portMin === null || portMax === null || portMin < 1 || portMax > 65535 || portMin > portMax) {
+    return c.json({ error: "节点组未配置可用于 v3 的连续端口范围" }, 409);
+  }
+
+  const plaintext = generateNodeCredential();
+  const credentialHash = hashNodeCredential(plaintext);
+
+  try {
+    const reserved = await withWorkspaceQuotaLock(workspace.id, async (tx, policy) => {
+      const nodeCount = await tx.node.count({
+        where: { node_group: { workspace_id: workspace.id } },
+      });
+      const decision = checkNodeCreation(policy, nodeCount);
+      if (!decision.allowed) return { denied: decision } as const;
+
+      const node = await tx.node.create({
+        data: {
+          node_id: parsed.data.node_id,
+          connect_ip: parsed.data.connect_ip,
+          node_group_id: group.id,
+          role,
+          port_range_min: portMin,
+          port_range_max: portMax,
+          lb_strategy: "round",
+          node_credential_hash: credentialHash,
+          credential_rotated_at: new Date(),
+          credential_revoked: false,
+          order_by: nodeCount * 1000,
+        },
+        select: {
+          id: true,
+          node_id: true,
+          connect_ip: true,
+          node_group_id: true,
+          role: true,
+          port_range_min: true,
+          port_range_max: true,
+        },
+      });
+
+      if (role === "egress" || role === "both") {
+        await tx.egressPool.create({
+          data: {
+            node_id: node.id,
+            name: "default",
+            lb_strategy: "round",
+          },
+        });
+      }
+
+      await tx.auditEvent.create({
+        data: {
+          workspace_id: workspace.id,
+          actor_user_id: user.id,
+          action: "node.provisioned",
+          resource_type: "node",
+          resource_id: String(node.id),
+        },
+      });
+      return { node } as const;
+    });
+
+    if ("denied" in reserved) {
+      return c.json({
+        error: reserved.denied.message ?? "节点额度不足",
+        code: reserved.denied.reason,
+      }, 403);
+    }
+
+    return c.json({
+      data: {
+        node: reserved.node,
+        credential: plaintext,
+        issued_at: new Date().toISOString(),
+      },
+    }, 201);
+  } catch (e) {
+    if ((e as { code?: string })?.code === "P2002") {
+      return c.json({ error: "node_id 已存在" }, 409);
+    }
+    throw e;
+  }
 });
