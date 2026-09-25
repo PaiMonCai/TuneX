@@ -296,12 +296,12 @@ describe("1. 并发分配无重复（§7.6 DoD）", () => {
     seedNode(1, [19000, 19200]);
 
     const results = await Promise.all(
-      Array.from({ length: 10 }, () =>
+      Array.from({ length: 10 }, (_, i) =>
         pool.acquirePort({
           nodeId: 1,
           leaseType: "ingress",
           preferredPort: 19050,
-          tunnelId: 1,
+          tunnelId: i + 1,
           deps: h.deps,
         }),
       ),
@@ -314,6 +314,58 @@ describe("1. 并发分配无重复（§7.6 DoD）", () => {
     for (const r of results) {
       if (!r.ok) expect(r.code).toBe("port_taken");
     }
+  });
+
+  test("同一 tunnel/node/direction 重入 preferred port 幂等成功，供 suspend→resume 使用", async () => {
+    const h = harness();
+    seedNode(1, [19000, 19010]);
+
+    const first = await pool.acquirePort({
+      nodeId: 1,
+      leaseType: "ingress",
+      preferredPort: 19005,
+      tunnelId: 42,
+      deps: h.deps,
+    });
+    const again = await pool.acquirePort({
+      nodeId: 1,
+      leaseType: "ingress",
+      preferredPort: 19005,
+      tunnelId: 42,
+      deps: h.deps,
+    });
+
+    expect(first.ok).toBe(true);
+    expect(again.ok).toBe(true);
+    if (!first.ok || !again.ok) return;
+    expect(again.result.port).toBe(first.result.port);
+    expect(again.result.leaseId).toBe(first.result.leaseId);
+    expect(again.result.reused).toBe(true);
+    expect(leases.filter((l) => l.status === "active")).toHaveLength(1);
+  });
+
+  test("同一 tunnel 但不同方向不能把同一物理端口当作幂等重入", async () => {
+    const h = harness();
+    seedNode(1, [19000, 19010]);
+
+    const ingress = await pool.acquirePort({
+      nodeId: 1,
+      leaseType: "ingress",
+      preferredPort: 19006,
+      tunnelId: 42,
+      deps: h.deps,
+    });
+    const egress = await pool.acquirePort({
+      nodeId: 1,
+      leaseType: "egress",
+      preferredPort: 19006,
+      tunnelId: 42,
+      deps: h.deps,
+    });
+
+    expect(ingress.ok).toBe(true);
+    expect(egress.ok).toBe(false);
+    if (!egress.ok) expect(egress.code).toBe("port_taken");
   });
 
   test("同一隧道的 ingress/egress 两个槽拿到不同端口", async () => {
