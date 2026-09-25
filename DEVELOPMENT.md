@@ -102,11 +102,11 @@ Node (egress/both)
 
 ### 2.3 数据平面
 
-第一阶段 v3 只新增 **TCP RELAY**，不同时重写已经可用的 DIRECT。
+第一阶段 v3 只新增 **TCP RELAY**，不改当时正在运行的 DIRECT。
 
 ```text
-现有 DIRECT:
-Client → current engine → target
+当时（仍在运行，属 WP15 删除对象）:
+Client → legacy engine → target
 
 v3 RELAY:
 Client → Ingress RelayForwarder
@@ -116,7 +116,9 @@ Client → Ingress RelayForwarder
 
 原因：先验证新增架构，不把 RELAY 上线和 DIRECT 重写绑定为同一次高风险迁移。
 
-RELAY 稳定后再单独执行 DIRECT v3 化，最终统一到同一 TunnelManager / Forwarder 模型。
+RELAY 稳定后按 §7.16 单独执行 DIRECT v3 化：**直接删除 legacy engine**，所有 DIRECT
+由同一 `RelayForwarder` / TunnelManager / Forwarder 模型承载（当前 legacy engine
+仍在运行，删除动作属 WP15，尚未开始）。
 
 ---
 
@@ -299,18 +301,20 @@ NodePortLease
 1. 只新增兼容字段/表。
 2. 回填。
 3. 新代码双读/必要时双写。
-4. 灰度切换。
-5. 稳定一个发布周期后再停止旧写路径。
+4. 切换读/写真相源。
+5. 按发布窗口停止旧写路径（不设额外灰度阶段，见 §7.16 WP15 与 §8.5）。
 6. 最后才讨论清理 legacy 字段。
 
 生产回滚默认：
 
 ```text
-关闭 v3 feature flag
-→ 回滚 Backend/Web/Agent 镜像
+直接回滚 Backend/Web/Agent 镜像到上一版本
 → 保留新增 schema
-→ 存量 DIRECT 继续运行
+→ 上一版本镜像自带其需要的读/写路径，存量隧道继续运行
 ```
+
+> §7.16 决定删除 legacy engine 后，代码里不再保留「v3 / legacy」运行期开关，
+> 因此回滚不依赖关闭某个 flag，而是整组镜像回退。
 
 **禁止把“DROP 新列/逆迁移数据库”作为普通代码回滚的前置条件。**
 
@@ -364,11 +368,11 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP8 | Scheduler + RELAY Orchestrator | C | WP3/WP5/WP6 接口冻结后 | **WP2 + WP3 + WP5 + WP7 已合并**；✅ 已实现（分支 `feature/v3-wp8-scheduler` 已 push，见 §7.11） |
 | WP9 | Reconciler / Retry / Recovery | C | WP8 接口冻结 | WP8 已合并 |
 | WP10 | Admin Node / Egress API | C | WP1；credential 部分等 WP7 | WP7 已合并（WP10 已实现，见 §7.13，待 CI） |
-| WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并**；✅ 已实现（分支 `feature/v3-wp11-tunnel-api` 已 push，见 §7.13：v3 CRUD + 状态查询 + retry/suspend/resume/delete，33 条离线单测全绿） |
+|| WP11 | Tunnel RELAY API | C | WP8 API/service contract 冻结 | **WP8 + WP9 已合并**；✅ 已合并 main（merge commit `39a9c32`，分支 `feature/v3-wp11-tunnel-api` 已合入：v3 CRUD + 状态查询 + retry/suspend/resume/delete，33 条离线单测全绿，见 §7.13） |
 | WP12 | Admin Web | D | WP10 API contract 冻结后，可先 mock | ✅ 已完成（分支 `feature/v3-wp12-admin-web` 已 push：节点列表/详情、角色与端口编辑、credential 签发/轮转/吊销、出口池 CRUD、运行态诊断；后端 WP10 未落地期间走 mock 契约，25 条 contract 单测全绿，CI 已接入） |
-| WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | ✅ 已实现（分支 `feature/v3-wp13-tunnel-web` 已 push：列表/详情/创建三页 + DIRECT/RELAY 选择与出口池 + 五种 apply 态展示 + retry/suspend/resume 运行按钮按状态机启用；WP11 未合入期间走 mock 契约，44 断言全绿，见 §7.14） |
-| WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 已合并；WP13 待 CI |
-| WP15 | DIRECT v3 Migration | B/C | WP14 验收方案冻结 | WP14 验收通过 |
+|| WP13 | Tunnel Web | D | WP11 API contract 冻结后，可先 mock | ✅ 已合并 main（merge commit `8997fb0`，分支 `feature/v3-wp13-tunnel-web` 已合入：列表/详情/创建三页 + DIRECT/RELAY 选择与出口池 + 五种 apply 态展示 + retry/suspend/resume 运行按钮按状态机启用；mock 契约 44 断言全绿，CI web job 已接入，见 §7.14） |
+|| WP14 | Real E2E / Grey Release | D/Shared | 测试环境可提前搭建 | WP5 + WP7 + WP8 + WP9 + WP10 + WP11 + WP12 + WP13 已合并；WP14 为下一个待启动 Gate |
+|| WP15 | DIRECT v3 Migration | B/C | WP14 验收方案冻结 | WP14 验收通过 |
 | WP16+ | UDP / WS/TLS / QUIC / Advanced | 多 Track | WP14 后按独立 RFC/contract | 各自前置 Gate 通过 |
 
 **重要：** “可以开始开发”是允许团队成员创建分支、写代码、开 Draft PR；“可以合并 main”才是硬门槛。
@@ -1050,7 +1054,7 @@ DB 替身，不连 MySQL/Redis/net；含对上述不变式的反向断言）。
 
 禁止 route 自己写第二套下发逻辑。
 
-**状态：✅ 已完成（分支 `feature/v3-wp11-tunnel-api` 已 push，未开 PR）。**
+**状态：✅ 已合并 main（merge commit `39a9c32`）。**
 
 交付范围：
 
@@ -1137,8 +1141,7 @@ Frontend **允许在后端实现未完成时提前并行开发**，条件是使�
 
 **前端不得自己发明字段或临时 API。** Contract 改动必须回到对应 Backend WP。
 
-**状态：✅ 已实现（feature/v3-wp13-tunnel-web）。** WP11 尚未合入 main，全部契约按 §7.14
-规则走 mock 并显式标注（`api.tunnels.retry/suspend/resume`、`/egress-pools`、seed 数据）。
+**状态：✅ 已合并 main（merge commit `8997fb0`）。** WP11 已在 main（§7.13），契约已验证对齐。
 
 交付内容（`web/src/`）：
 
@@ -1161,9 +1164,9 @@ Frontend **允许在后端实现未完成时提前并行开发**，条件是使�
 3. 详情/列表的状态真相是 `apply_status`；legacy `status` 开关列并行展示，不被替代。
 4. error 态必须可解释（`apply_error_code` + `apply_error` + 步骤回放）且保留记录，不物理删除。
 
-**Backend 侧（WP11）合入 main 后需同步的点：** mock 只覆盖 §4.1 主路径与常见拒绝，
-未模拟编排超时重入、波长高并发下发、端口耗尽等真实竞争；届时替换为真实端点即可，
-前端契约层（types.ts / api.ts）无需改动。
+**Backend 侧（WP11）已在 main，前端 mock 与真实端点的差异：** mock 只覆盖 §4.1 主路径与常见拒绝，
+未模拟编排超时重入、波长高并发下发、端口耗尽等真实竞争；这些竞争由 WP11 的服务层单测与
+WP14 Real E2E 覆盖，前端契约层（types.ts / api.ts）无需改动。
 
 ---
 
@@ -1203,27 +1206,59 @@ Target B
 - suspend/resume；
 - change Egress；
 - backup/restore；
-- old Agent compatibility。
+- old Agent compatibility（改为版本边界验证：见 §7.16 执行要求 4）。
 
-只有 WP14 通过后，relay 才允许从白名单灰度扩大。
+WP14 通过是 RELAY 成为默认公开能力、以及 WP15 删除 legacy engine 的共同前置 Gate。
 
 ---
 
-### 7.16 WP15 — DIRECT v3 Migration
+### 7.16 WP15 — DIRECT v3 Migration（重新定义：直接删除 legacy engine）
 
 **Track：B/C；依赖 WP14。**
 
-迁移顺序：
+> **方向变更（用户明确决定，2026-09-25）：WP15 不做兼容、不做灰度、不做 feature flag。**
+> 原「flag 默认关闭 → 对照 → 灰度 → 分批迁移存量 → 稳定一个发布周期 → 最后删 legacy」
+> 七步路线**全部作废**。新定义只有一句话：**直接删除 legacy engine，所有 DIRECT 走 v3 runtime。**
 
-1. 新建 DIRECT 可选择 v3 runtime，flag 默认关闭。
-2. 对照 legacy DIRECT。
-3. 灰度新 DIRECT。
-4. legacy allocator 不再负责新 Tunnel。
-5. 分批迁移存量 DIRECT。
-6. 稳定一个发布周期。
-7. 最后才删除 legacy path。
+新定义（唯一执行路径）：
 
-禁止为了回滚方便做 destructive DB downgrade。
+```text
+所有 DIRECT 改由 v3 runtime（RelayForwarder，§7.8 已交付）承载
+→ 删除 legacy engine 及其独占代码路径
+→ DIRECT 不再有任何旧实现分支
+```
+
+执行要求：
+
+1. **删除，不并存**。`direct` 模式只有一种实现：WP4/WP5 的 `RelayForwarder` +
+   TunnelManager + `NodePortLease` + WP6 revision/ACK。不允许出现
+   「走 v3 / 走 legacy」的运行期判定分支；删除代码而不是加 flag 绕开它。
+2. **存量隧道零数据迁移，只换运行态**。`tunnel_mode=direct` 的存量行由
+   WP2 回填保证已是 `direct`（§7.5），WP15 不搬数据、不改端口归属语义；
+   唯一变化是「谁来 listen / forward」——从 legacy engine 换成 v3 runtime。
+3. **端口对照必须留在 NodePortLease**。§7.6「LEGACY 交接」已要求 legacy DIRECT
+   `listen_port` 经 `reservedPorts` 灌入；WP15 删除 legacy allocator 前，必须先确认
+   acquirePort 侧仍覆盖这些端口，否则删 legacy 会和 v3 自己抢端口。
+4. **旧 Agent 兼容以版本边界处理，不以双实现处理**。WP14 Gate 里的
+   「old Agent compatibility」一条改为：新 Agent 版本是唯一交付物，旧 Agent
+   升级窗口属于发布步骤（docs/production-deploy.md），不在代码里为旧 Agent
+   保留第二套配置生成路径。
+5. **一次性切换 + 可回滚 = 回滚镜像**，不是回滚代码分支。DB 仍只做 additive
+   （§6）：保留新增 schema，回滚方式是回滚 Backend/Web/Agent 镜像到上一版本。
+   §7.5 已证明存量列语义不变，所以「回滚镜像」即可回到 legacy 承载。
+
+DoD：
+
+- legacy engine 相关代码（旧 forward 路径、旧 config-generator 直连、
+  legacy allocator 的**独立所有权**逻辑）从 main 删除，`git grep` 无残留引用；
+- 同一套 v3 runtime 同时承载 DIRECT 与 RELAY，`tunnel_mode` 只影响 next_hop
+  与出口侧是否存在，不再是「两套数据面」的开关；
+- `NodePortLease` 覆盖全部 DIRECT 端口（含移植过来的存量端口），无端口双绑；
+- WP14 Gate 的 legacy DIRECT no regression 一条改由 v3 runtime 直连验证：
+  目标地址可达、端口不变、流量计数正确；
+- 删除过程中零 DROP 列 / 零逆迁移（§6）。
+
+仍禁止：为了回滚方便做 destructive DB downgrade。
 
 ---
 
@@ -1311,33 +1346,26 @@ Tests:
 ### 7.19 Integration Gate，而不是“单一游标”
 
 项目不再维护“全团队唯一当前 Step”，改为维护 **Integration Gate + Active WP Set**。
+Gate 的最新事实见 §12；此处只保留模型说明。
 
 Gate 定义：
 
 ```text
 Gate F0  文档/架构冻结                 ✅
-Gate F1  Schema Contract merged         ⏳
-Gate F2  Runtime Foundations merged     ⏳
-Gate F3  RELAY Control Plane integrated ⏳
-Gate F4  API/Web integrated             ⏳
-Gate F5  Real E2E passed                ⏳
-Gate F6  DIRECT v3 migrated             ⏳
+Gate F1  Schema Contract merged         ✅
+Gate F2  Runtime Foundations merged     ✅
+Gate F3  RELAY Control Plane integrated ✅
+Gate F4  API/Web integrated             ✅
+Gate F5  Real E2E passed                ⏳ 当前关键 Gate（WP14）
+Gate F6  DIRECT v3 migrated             ⏳（WP15，直接删 legacy，见 §7.16）
 ```
 
-当前：
+当前 Active WP：
 
 ```text
-Active WP:
-- WP1 Schema
-- WP4 Agent Runtime（可并行，受 WP1 merge gate 约束）
-- WP6 Control Contract（可并行，受 WP1/WP4 compatibility gate 约束）
-- WP8 Scheduler + RELAY Orchestrator（已实现，见 §7.11，待 CI 验证）
-- WP14 E2E Harness（仅测试基础设施）
+- WP14 Real E2E / Grey Release
 
-Next unlock after Gate F1:
-- WP2 Backfill
-- WP3 Port Lease
-- WP10 Admin API foundation
+WP15、WP16+ 尚未启动，分别等 WP14 Gate 与各自 contract。
 ```
 
 这就是后续团队开发的统一并行模型。
@@ -1381,12 +1409,15 @@ Next unlock after Gate F1:
 - 跨租户负面测试与正常功能测试同等重要。
 - 支付保持可选、默认关闭，不进入核心授权判断。
 
-### 8.5 兼容优先
+### 8.5 回滚路径：镜像，不是双实现
 
-- v3 第一阶段不重写现有 DIRECT。
-- 新协议不能静默改变旧 Agent 行为。
-- 不依赖数据库逆迁移完成代码回滚。
-- 任何 legacy 字段删除都发生在“停止读 → 停止写 → 观察 → 删除”的最后一步。
+- 代码回滚 = 回滚 Backend/Web/Agent 镜像到上一版本，**不**在代码里长期保留
+  「走新实现 / 走旧实现」的运行期双分支。双实现等于两套真相，比回滚成本更高
+  （本条由用户决定，见 §7.16 WP15 的新定义）。
+- DB 仍坚持 additive（§6）：保留新增 schema，禁止把 DROP 列 / 逆迁移当作
+  普通代码回滚的前置条件。
+- legacy 代码的删除按「停止读 → 停止写 → 删除」三步走（§7.16），但观察期
+  以发布窗口计，不再设「稳定一个发布周期」之外的额外灰度阶段。
 
 ---
 
@@ -1497,32 +1528,49 @@ PR 描述必须包含：
 
 ```text
 Gate F0  文档/架构冻结                 ✅
-Gate F1  Schema Contract merged         ⏳ 当前关键 Gate
-Gate F2  Runtime Foundations merged     ⏳
-Gate F3  RELAY Control Plane integrated ⏳
-Gate F4  API/Web integrated             ⏳
-Gate F5  Real E2E passed                ⏳
-Gate F6  DIRECT v3 migrated             ⏳
+Gate F1  Schema Contract merged         ✅（WP1 已合入 main）
+Gate F2  Runtime Foundations merged     ✅（WP2/WP3/WP4/WP5/WP6/WP7 已合入）
+Gate F3  RELAY Control Plane integrated ✅（WP8/WP9 已合入）
+Gate F4  API/Web integrated             ✅（WP10/WP11/WP12/WP13 已合入）
+Gate F5  Real E2E passed                ⏳ 当前关键 Gate（WP14）
+Gate F6  DIRECT v3 migrated             ⏳（WP15，定义见 §7.16：直接删 legacy）
 ```
 
-### 当前允许并行启动
+### 已合并 main 的 Work Package
 
 ```text
-Track A: feature/v3-wp1-schema
-Track B: feature/v3-wp4-agent-runtime
-Track C: feature/v3-wp6-control-contract
-Track B/C: feature/v3-wp7-node-credential （WP7，依赖 WP6 已合并）
-Track C: feature/v3-wp9-reconciler （WP9，服务层/纯逻辑可先行，合并依赖 WP8 接线）
-Track D: test/v3-wp14-e2e-harness
+WP0  架构/文档冻结            ✅   （merge 于早期文档冻结提交）
+WP1  v3 Schema 契约           ✅
+WP2  Legacy Backfill          ✅
+WP3  NodePortLease / Allocator✅
+WP4  Agent v3 Runtime 骨架    ✅
+WP5  TCP RELAY Data Plane     ✅
+WP6  Command / Revision / ACK ✅
+WP7  Node Credential / State  ✅
+WP8  Scheduler + RELAY Orch.  ✅   （merge `f6752a4`）
+WP9  Reconciler / Retry       ✅   （merge `6df99c5`）
+WP10 Admin Node / Egress API  ✅   （merge `2e7e9b4`）
+WP12 Admin Web               ✅   （merge `7f704e0`）
+WP11 Tunnel RELAY API        ✅   （merge `39a9c32`）
+WP13 Tunnel Web              ✅   （merge `8997fb0`）
 ```
 
-其中：
+> 注：WP11/WP13 的依赖（WP8/WP9/WP10）在 WP12 合并时已全部就位，两个包
+> 依赖满足后即合入，合并顺序与 WP 编号无关。合并均为 `--no-ff`，可直接 revert。
 
-- **WP1 是当前最高优先级合并 Gate**。
-- WP4/WP6 可以立即开发和评审，但如果最终依赖 WP1 的 contract，必须等待 WP1 合并、更新到最新 main 后才能合并。
-- WP7 依赖 WP6 已合并的 Control Contract；它自己的合并同时解锁 WP8 / WP10。
-- WP9 已在服务层交付对比逻辑 + 离线单测（§7.12），但 `ReconcileSink` 生产实现、worker 周期调用与告警接线依赖 WP8，合并前需确认 WP8 已就位。
-- WP14 当前只允许建设测试 harness，不得提前宣称 RELAY 验收完成。
-- Gate F1 通过后，立即解锁 WP2、WP3、WP10 foundation，并继续保持 Track B/C 并行。
+### 当前 Active WP
+
+```text
+Active WP:
+- WP14 Real E2E / Grey Release（唯一 Active；其余核心 WP 已合入）
+
+WP15（直接删除 legacy engine，§7.16）依赖 WP14 验收后才能启动；
+WP15 不做灰度、不做兼容双实现。
+```
+
+### Next unlock
+
+- WP14 验收 Gate 通过 → 解锁 WP15（§7.16：直接删除 legacy engine）。
+- WP16+（UDP / WS-TLS / QUIC / 高级 LB）各自独立 contract + Gate，不依赖 WP15。
 
 后续开发、分支、PR 和合并判断全部以第 7 节的 **依赖矩阵 + Integration Gate** 为准。
