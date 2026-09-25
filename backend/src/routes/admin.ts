@@ -8,6 +8,7 @@ import { Hono } from "hono";
 import { db } from "../db.ts";
 import { systemConfig } from "../services/config.ts";
 import { licenseService } from "../services/license.ts";
+import { createNodeEnrollment } from "../services/node-enrollment.ts";
 import {
   credentialErrorStatus,
   issueNodeCredential,
@@ -130,6 +131,17 @@ async function resolveNodeIdParam(param: string): Promise<number | null> {
 function credentialHttpStatus(e: unknown): 404 | 409 {
   return credentialErrorStatus(e) === 409 ? 409 : 404;
 }
+
+adminRoutes.post("/node/:id/enrollment", async (c) => {
+  const nodeDbId = await resolveNodeIdParam(c.req.param("id"));
+  if (nodeDbId === null) return c.json({ error: "节点不存在" }, 404);
+  try {
+    const enrollment = await createNodeEnrollment(nodeDbId);
+    return c.json({ data: enrollment }, 201);
+  } catch {
+    return c.json({ error: "节点不存在" }, 404);
+  }
+});
 
 adminRoutes.post("/node/:id/credential", async (c) => {
   const nodeDbId = await resolveNodeIdParam(c.req.param("id"));
