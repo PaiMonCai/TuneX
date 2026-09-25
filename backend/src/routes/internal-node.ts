@@ -25,7 +25,6 @@
  * console；响应体也永不含凭据。凭据明文只存在于 rotate 的响应（管理端点）。
  */
 import { Hono } from "hono";
-import { readFile } from "node:fs/promises";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { authenticateNode } from "../services/node-credential.ts";
 import {
@@ -34,7 +33,6 @@ import {
   submitStateReport,
 } from "../services/node-state.ts";
 import {
-  agentBinaryPath,
   consumeNodeEnrollment,
   extractEnrollmentToken,
   renderNodeInstallScript,
@@ -59,25 +57,6 @@ internalNodeRoutes.get("/node/install.sh", (c) => {
     "content-type": "text/x-shellscript; charset=utf-8",
     "cache-control": "no-store",
   });
-});
-
-/** Download a Panel-version-matched Agent binary bundled in the app image. */
-internalNodeRoutes.get("/node/binary/:artifact", async (c) => {
-  const path = agentBinaryPath(c.req.param("artifact"));
-  if (!path) return c.json({ ok: false, error: "unsupported_artifact" }, 404);
-  try {
-    const file = await readFile(path);
-    return new Response(file, {
-      status: 200,
-      headers: {
-        "content-type": "application/octet-stream",
-        "content-disposition": `attachment; filename="${c.req.param("artifact")}"`,
-        "cache-control": "public, max-age=3600, immutable",
-      },
-    });
-  } catch {
-    return c.json({ ok: false, error: "agent_binary_unavailable" }, 404);
-  }
 });
 
 /**
