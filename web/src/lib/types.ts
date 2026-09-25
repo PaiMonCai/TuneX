@@ -249,7 +249,10 @@ export interface NodeGroup {
 
 export interface Node {
   id: ID;
+  /** 用户可读节点名/标签。 */
   node_id: string;
+  /** Panel 生成的不可变物理 Agent 唯一 ID。 */
+  agent_id: string;
   weight: number;
   status: Status;
   connect_ip: string | null;
@@ -815,6 +818,7 @@ export interface NodeEnrollmentIssued {
   token: string;
   node_id: ID;
   node_key: string;
+  agent_id: string;
   expires_at: string;
   install_command: string;
 }
@@ -840,9 +844,9 @@ export interface PortForward {
   protocol: "tcp";
   mode: "direct" | "relay";
   ingress_node_id: ID;
-  ingress_node: Pick<Node, "id" | "node_id" | "connect_ip" | "role"> | null;
+  ingress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;
   egress_node_id: ID | null;
-  egress_node: Pick<Node, "id" | "node_id" | "connect_ip" | "role"> | null;
+  egress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;
   listen_ip: string | null;
   listen_port: number | null;
   target_host: string | null;
