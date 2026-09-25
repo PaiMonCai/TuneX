@@ -1173,6 +1173,312 @@ export async function createRelayTunnel(
   };
 }
 
+/* ================================================================== */
+/* 重入：对已存在的 RELAY 隧道重新编排（WP11 retry / resume 用）        */
+/* ================================================================== */
+
+/**
+ * 对一条**已存在**的 RELAY 隧道重新走一遍 §7.11 的 ③–⑩ 步。
+ *
+ * 为什么不是 `createRelayTunnel`：那条入口的 ② 是 `tunnel.create`——
+ * 对已有行调用会产生第二条记录，而 retry 的语义（§4.1「失败时保留
+ * Tunnel 并允许 Retry」）明确要求**同一条行**重新编排。因此这里从
+ * 「行已在」开始：bind → ports → revision++ → 下发 → active。
+ *
+ * 为什么不在 WP11 自己写下发：§7.13「所有运行操作统一走 orchestrator，
+ * 禁止 route 自己写第二套下发逻辑」。retry 与创建走的是同两个
+ * `dispatchEgress` / `dispatchIngress` 调用（本函数内的代码与
+ * `createRelayTunnel` 的 ⑥–⑨ 逐行同源），铁律一（先出口后入口）
+ * 依然只有一处实现。
+ *
+ * revision 语义：从库里当前 `config_revision` +1。**不能复用旧值**——
+ * Agent 的闸门是「applied_revision ≥ incoming 即拒 stale」，上一次失败
+ * 已经推进过 applied_revision 的话，同 revision 重发会被直接拒掉，
+ * retry 就静默失效了（这与 {@link Orchestrator.removeTunnel} 用
+ * revision+1 是同一条理由）。
+ *
+ * 端口语义：`listen_port` / `egress_port` 已有值则**原样复用**（重试不
+ * 换端口：§7.12 把 `change_port` 列为默认禁止的自动动作，用户手动
+ * retry 更不该偷偷换端口）；为空才分配。
+ *
+ * @param tunnelId 已存在的 RELAY 隧道 id。
+ * @param orchestrator 下发通道（与创建共用同一个实例：revision 闸门
+ *        是进程级的，重建实例会让两端看到不同的账本）。
+ * @param over 见 {@link SchedulerDeps}。
+ */
+export async function reapplyRelayTunnel(
+  tunnelId: number,
+  orchestrator: Orchestrator,
+  over?: SchedulerDeps,
+): Promise<CreateRelayTunnelResult> {
+  const deps = resolveDeps(over);
+  const store = deps.db;
+  const now = deps.now();
+  const steps: StepRecord[] = [];
+
+  const fail = (
+    step: SchedulerStep,
+    code: SchedulerErrorCode,
+    detail: string,
+    ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
+  ): CreateRelayFailure => {
+    steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
+    void persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+    return {
+      ok: false,
+      tunnelId,
+      steps,
+      failedStep: step,
+      error_code: code,
+      error: errorText(code, detail),
+      retryable: isRetryable(code),
+    };
+  };
+
+  const row = asRow<Record<string, unknown>>(
+    await store.tunnel.findUnique({ where: { id: tunnelId } }),
+  );
+  if (!row) {
+    return fail(
+      "create_pending",
+      SCHEDULER_ERROR_CODES.invariant_violated,
+      `隧道 ${tunnelId} 不存在（重推前必须已落库）`,
+    );
+  }
+  if (row.tunnel_mode !== "relay") {
+    // DIRECT 的重推是 legacy config-pusher 的领域（socket 推送），
+    // 不走 v3 编排器：它没有 egress 端、也不需要 revision 闸门。
+    return fail(
+      "bind_nodes",
+      SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      `隧道 ${tunnelId} 不是 RELAY 模式（${String(row.tunnel_mode)}），重推请走 legacy 配置下发`,
+    );
+  }
+  const inNodeGroupId = Number(row.in_node_group_id);
+  const outNodeGroupId = row.out_node_group_id === null ? null : Number(row.out_node_group_id);
+  if (outNodeGroupId === null) {
+    return fail(
+      "bind_nodes",
+      SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      `RELAY 隧道 ${tunnelId} 没有出口节点组，无法重推`,
+    );
+  }
+
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: { apply_status: APPLY_STATUS.applying, desired_status: DESIRED_STATUS.inactive },
+  });
+  steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true } });
+
+  /* ---------------- ③ bind nodes ---------------- */
+  const [inCandidates, outCandidates] = await Promise.all([
+    store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
+    store.node.findMany({ where: { node_group_id: outNodeGroupId }, orderBy: { id: "asc" } }),
+  ]);
+  const ingressPick = pickNode(inCandidates as unknown as SchedulableNode[], "ingress", now);
+  if (!ingressPick.ok) {
+    return fail(
+      "bind_nodes",
+      ingressPick.reason === "no_credential"
+        ? SCHEDULER_ERROR_CODES.node_credential_missing
+        : SCHEDULER_ERROR_CODES.node_unavailable,
+      ingressPick.reason === "no_credential"
+        ? `入口节点组 ${inNodeGroupId} 内没有持有有效 per-node credential 的 ingress 节点`
+        : `入口节点组 ${inNodeGroupId} 内没有 role 覆盖 ingress 的节点`,
+    );
+  }
+  const egressPick = pickNode(outCandidates as unknown as SchedulableNode[], "egress", now);
+  if (!egressPick.ok) {
+    return fail(
+      "bind_nodes",
+      egressPick.reason === "no_credential"
+        ? SCHEDULER_ERROR_CODES.node_credential_missing
+        : SCHEDULER_ERROR_CODES.node_unavailable,
+      egressPick.reason === "no_credential"
+        ? `出口节点组 ${outNodeGroupId} 内没有持有有效 per-node credential 的 egress 节点`
+        : `出口节点组 ${outNodeGroupId} 内没有 role 覆盖 egress 的节点`,
+    );
+  }
+  if (ingressPick.node.id === egressPick.node.id) {
+    return fail(
+      "bind_nodes",
+      SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      `入口与出口绑定到同一节点 ${ingressPick.node.id}（RELAY 必须跨节点）`,
+    );
+  }
+
+  // 出口池：沿用行上的值；为空则取该出口节点的 default 池（§2.2）。
+  let poolId = row.egress_pool_id === null ? null : Number(row.egress_pool_id);
+  if (poolId !== null) {
+    const pool = await store.egressPool.findUnique({ where: { id: poolId } });
+    if (!pool || Number((pool as { node_id: number }).node_id) !== egressPick.node.id) {
+      return fail(
+        "bind_nodes",
+        SCHEDULER_ERROR_CODES.node_unavailable,
+        `出口池 ${poolId} 不存在或不属于出口节点 ${egressPick.node.id}`,
+      );
+    }
+  } else {
+    const pool = await store.egressPool.findFirst({
+      where: { node_id: egressPick.node.id, name: "default" },
+    });
+    if (pool) poolId = Number((pool as { id: number }).id);
+  }
+  if (!ingressPick.online || !egressPick.online) {
+    steps.push({
+      step: "bind_nodes",
+      ok: true,
+      detail: "入口或出口节点心跳超时，仍按候选绑定",
+      meta: { ingress_online: ingressPick.online, egress_online: egressPick.online },
+    });
+  } else {
+    steps.push({ step: "bind_nodes", ok: true });
+  }
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: { egress_node_id: egressPick.node.id, egress_pool_id: poolId },
+  });
+
+  /* ---------------- ④ ports（已有值复用，空才分配）---------------- */
+  const ingressReserved = collectReservedPorts(
+    (
+      await store.tunnel.findMany({
+        where: { in_node_group_id: inNodeGroupId },
+        select: { id: true, listen_port: true },
+      })
+    )
+      .map((t) => t as { id: number; listen_port: number | null })
+      .filter((t) => t.id !== tunnelId),
+  );
+  const egressReserved = collectReservedPorts(
+    (
+      await store.tunnel.findMany({
+        where: { out_node_group_id: outNodeGroupId },
+        select: { id: true, listen_port: true },
+      })
+    )
+      .map((t) => t as { id: number; listen_port: number | null })
+      .filter((t) => t.id !== tunnelId),
+  );
+
+  let ingressPort = row.listen_port === null ? null : Number(row.listen_port);
+  let egressPort = row.egress_port === null ? null : Number(row.egress_port);
+  if (ingressPort === null) {
+    const alloc = await allocateTunnelPort(
+      { nodeId: ingressPick.node.id, direction: "ingress", preferred: null, tunnelId, reservedPorts: ingressReserved },
+      deps.portPoolDeps,
+    );
+    if (!alloc.ok) {
+      return fail("acquire_ports", alloc.code, alloc.detail, { meta: { direction: "ingress" } });
+    }
+    ingressPort = alloc.port;
+  }
+  if (egressPort === null) {
+    const alloc = await allocateTunnelPort(
+      { nodeId: egressPick.node.id, direction: "egress", preferred: null, tunnelId, reservedPorts: egressReserved },
+      deps.portPoolDeps,
+    );
+    if (!alloc.ok) {
+      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      return fail("acquire_ports", alloc.code, `出口端口分配失败：${alloc.detail}`, {
+        meta: { direction: "egress", ingress_port: ingressPort },
+      });
+    }
+    egressPort = alloc.port;
+  }
+  await store.tunnel.update({ where: { id: tunnelId }, data: { listen_port: ingressPort, egress_port: egressPort } });
+  steps.push({
+    step: "acquire_ports",
+    ok: true,
+    meta: { ingress_port: ingressPort, egress_port: egressPort, reused: true },
+  });
+
+  /* ---------------- ⑤ revision++ ---------------- */
+  // 从库里读当前 revision 再 +1：上一次失败可能已推进 applied_revision，
+  // 复用同值会被 Agent 的 stale 闸门拒掉，retry 就静默失效。
+  const current = await store.tunnel.findUnique({ where: { id: tunnelId }, select: { config_revision: true } });
+  const revision = (Number(current?.config_revision ?? 0) || 0) + 1;
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: { config_revision: revision, apply_status: APPLY_STATUS.applying },
+  });
+  steps.push({ step: "bump_revision", ok: true, meta: { revision } });
+
+  /* ---------------- ⑥⑦ apply Egress → ACK ---------------- */
+  const egressTargets =
+    poolId !== null
+      ? await store.egressTarget.findMany({ where: { pool_id: poolId, status: "active" }, orderBy: { order_by: "asc" } })
+      : [];
+  if (poolId !== null && egressTargets.length === 0) {
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    return fail(
+      "apply_egress",
+      SCHEDULER_ERROR_CODES.egress_apply_rejected,
+      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`,
+      { revision },
+    );
+  }
+
+  const egressDispatch = await orchestrator.dispatchEgress({
+    tunnelId,
+    revision,
+    egressNode: egressPick.node,
+    egressPort,
+    poolId,
+    targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+  });
+  if (!egressDispatch.ok) {
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    return fail("apply_egress", mapDispatchCode("egress", egressDispatch), egressDispatch.error, {
+      revision,
+      meta: { command_id: egressDispatch.commandId ?? null },
+    });
+  }
+  steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
+  steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
+
+  /* ---------------- ⑧⑨ apply Ingress → ACK ---------------- */
+  const ingressDispatch = await orchestrator.dispatchIngress({
+    tunnelId,
+    revision,
+    ingressNode: ingressPick.node,
+    ingressPort,
+    nextHop: `${egressDispatch.egress_host}:${egressPort}`,
+  });
+  if (!ingressDispatch.ok) {
+    await orchestrator
+      .removeTunnel({ tunnelId, node: egressPick.node, revision: revision + 1, reason: "ingress apply failed" })
+      .catch(() => {});
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
+      revision,
+      meta: { command_id: ingressDispatch.commandId ?? null },
+    });
+  }
+  steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
+  steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
+
+  /* ---------------- ⑩ active ---------------- */
+  await persistSuccess(store, tunnelId, { revision, at: deps.now() });
+  steps.push({ step: "activate", ok: true, meta: { revision } });
+
+  return {
+    ok: true,
+    tunnelId,
+    revision,
+    ingressNodeId: ingressPick.node.id,
+    egressNodeId: egressPick.node.id,
+    ingressPort,
+    egressPort,
+    steps,
+  };
+}
+
+/** 行投影收窄（`findUnique` 返回 unknown，本文件内部使用）。 */
+function asRow<T>(row: unknown): T | null {
+  return row ? (row as T) : null;
+}
+
 /**
  * WP8 期间**不能写**的 Tunnel 列。
  *
