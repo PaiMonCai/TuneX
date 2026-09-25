@@ -15,8 +15,11 @@
 	# Agent 控制面 Socket.IO / WebSocket。
 	handle /socket.io/* {
 		reverse_proxy backend:3001 {
-			# 宿主机反代已完成 TLS 时，保留原始协议给 Backend。
+			# 入口只绑定 127.0.0.1，可安全信任宿主机反代传来的原始请求信息。
+			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Real-IP {http.request.header.X-Real-IP}
 			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+			header_up X-Forwarded-Host {http.request.header.X-Forwarded-Host}
 			transport http {
 				read_timeout 0
 				write_timeout 0
@@ -26,7 +29,10 @@
 
 	handle /api/* {
 		reverse_proxy backend:3000 {
+			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Real-IP {http.request.header.X-Real-IP}
 			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+			header_up X-Forwarded-Host {http.request.header.X-Forwarded-Host}
 		}
 	}
 
@@ -40,7 +46,10 @@
 
 	handle {
 		reverse_proxy web:3000 {
+			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Real-IP {http.request.header.X-Real-IP}
 			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+			header_up X-Forwarded-Host {http.request.header.X-Forwarded-Host}
 		}
 	}
 }
