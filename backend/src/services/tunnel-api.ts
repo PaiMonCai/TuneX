@@ -135,7 +135,7 @@ export interface TunnelRow {
   user_id: number;
   workspace_id: number;
   tunnel_mode: string | null;
-  ingress_node_id: number | null;
+  ingress_node_id?: number | null;
   egress_node_id: number | null;
   egress_pool_id: number | null;
   egress_port: number | null;
