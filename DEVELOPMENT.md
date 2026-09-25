@@ -34,6 +34,51 @@ v3 的目标不是重写整个项目，而是保留已经稳定的 Workspace、�
 - UDP、WS/TLS、QUIC、高级负载均衡、多跳、DNS 等均在 TCP RELAY 稳定后独立验收，不得因枚举存在就宣称支持。
 - 工单、返佣、支付扩展、隧道链等不进入当前 v3 主路径。
 
+### 1.1.1 用户产品模型：Node + PortForward
+
+从本阶段开始，用户侧不再把 `Tunnel` 当作需要手工创建的第一层资源。产品语义固定为：
+
+```text
+Ingress Node
+├─ PortForward（不选择出口） → DIRECT
+└─ PortForward（选择已绑定出口） → RELAY
+
+Egress Node
+└─ 必须先与某个 Ingress Node 建立 Binding，才能被该入口的 PortForward 选择
+```
+
+硬规则：
+
+- Ingress / BOTH 节点可以独立创建端口转发。
+- 创建 PortForward 时 `egress_node_id = null` 即 DIRECT。
+- 指定 `egress_node_id` 即 RELAY，但该出口必须与入口存在有效 `NodeBinding`。
+- Egress 节点不能独立创建用户监听端口；它只作为入口节点的可选出口能力。
+- 用户界面统一使用「节点 / 端口转发 / 绑定出口」术语，不再要求用户先创建 Tunnel。
+- `Tunnel` 继续保留为**内部 runtime / desired-state 对象**，承载 revision、ACK、NodePortLease、Reconciler 与历史流量；不得为 PortForward 再造第二套数据面状态机。
+- 第一版 `PortForward.id` 可以直接映射内部 `Tunnel.id`；对外 API 做 projection，数据库无需立刻复制一张业务真相表。
+- 每条 RELAY PortForward 的目标属于该转发自己的 EgressPool；出口节点本身不再要求预先配置业务目标。
+
+### 1.1.2 节点创建与一键安装
+
+Node 生命周期改为「Panel 先创建 → 机器后注册」：
+
+1. Panel 创建 pending Node，只确定 NodeGroup、角色与端口范围；`connect_ip` 可为空。
+2. Panel 生成一个 **10 分钟、一次性** enrollment token，只存哈希。
+3. UI 立即展示可复制的一键安装命令；长期 node credential 不出现在该命令中。
+4. 安装脚本从当前 Panel 下载与其版本匹配的 Agent 二进制。
+5. 节点以 enrollment token 调用机器端 enroll API；服务端原子消费 token，并签发真正的 per-node credential。
+6. 安装脚本把 credential 写入 root-only 环境文件，注册 systemd 并启动 Agent。
+7. Agent 后续只使用 per-node credential 做 outbound command/state/desired；enrollment token 永不复用。
+8. 重新安装必须由 Panel 显式生成新的 enrollment token；新 token 会撤销该节点尚未使用的旧 token。
+
+安全约束：
+
+- enrollment token / node credential 明文都不得落数据库、日志、审计 metadata 或 URL query。
+- 安装命令可以包含短时 enrollment token，但不得包含长期 credential。
+- enroll 端点必须并发安全：同一 token 最多一个请求成功。
+- Panel 不主动连接 Agent；一键安装不得重新引入公网 9090 依赖。
+- Agent 安装二进制由当前 TuneX 应用镜像提供，保证 Panel 与 Agent 版本可对齐。
+
 ### 1.2 当前阶段边界
 
 当前 `main` 已经具备并继续保留：
@@ -186,6 +231,8 @@ Agent ACK：
 - 不明文写日志。
 - 不从用户请求传入的 node_id 推断身份。
 - 后续可平滑升级为 mTLS。
+
+节点 enrollment 与运行凭据必须严格分层：enrollment 只负责**首次/重新安装时换取 credential**，不能直接调用 state/commands/ACK/desired API；credential 也不能反过来生成 enrollment。
 
 ---
 
