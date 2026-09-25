@@ -8,6 +8,7 @@ import (
 
 	"github.com/tunex/agent/internal/agentconfig"
 	"github.com/tunex/agent/internal/api"
+	"github.com/tunex/agent/internal/control"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/reporter"
@@ -22,6 +23,7 @@ type v3Runtime struct {
 	tunnels *manager.TunnelManager
 	egress  *manager.EgressManager
 	api     *api.Server
+	control *control.Client
 	heart   *reporter.Reporter
 	started bool
 }
@@ -56,7 +58,7 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 
 	// 1. Restore before the admin plane opens, so a port the panel expects to
 	// be live is never briefly free-and-then-taken while the API is reachable.
-	if err := restoreTunnels(ctx, tunnels, egress, role); err != nil {
+	if err := restoreTunnels(ctx, tunnels, egress, role, cfg); err != nil {
 		// A failed restore must not stop the node: it still serves /health and
 		// can accept apply commands. Logged loudly because it usually means a
 		// panel outage right after a restart.
@@ -93,8 +95,24 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		}
 	}
 
-	// 3. Heartbeat reporter. Disabled (nil) when no panel URL is configured;
-	// Run's ErrNoPanilURL path is handled by the goroutine below.
+	// 3. Outbound control loop. The Agent polls the Panel with its per-node
+	// credential; the Panel never dials this process. This is the production
+	// control path for DIRECT/RELAY/EGRESS. The local admin API above is debug-only.
+	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
+		rt.control = control.New(control.Config{
+			PanelURL: cfg.PanelHTTPURL,
+			Credential: cfg.NodeCredential,
+		}, tunnels, egress)
+		go func() {
+			if err := rt.control.Run(ctx); err != nil {
+				logx.Debug("v3 control loop stopped", "err", err.Error())
+			}
+		}()
+		logx.Info("v3 outbound control scheduled", "url", cfg.PanelHTTPURL)
+	}
+
+	// 4. Heartbeat reporter. Disabled (nil) when no panel URL is configured;
+	// Run's ErrNoPanelURL path is handled by the goroutine below.
 	if cfg.PanelHTTPURL != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
@@ -146,7 +164,7 @@ func (rt *v3Runtime) Shutdown() {
 // EGRESS tunnels additionally need their target pool (devmap §5.5: "RELAY 模式
 // 的出口节点需同时拉取 EgressTarget"), which restore.Apply registers before the
 // forwarder is built.
-func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.EgressManager, role string) error {
+func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.EgressManager, role string, cfg *agentconfig.Config) error {
 	if role == agentconfig.RoleIngress {
 		// An ingress node has no egress pools of its own; a nil EgressManager
 		// would make restore.Apply skip EGRESS tunnels instead of half-starting
@@ -156,7 +174,7 @@ func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress 
 	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	failed, err := restore.Restore(rctx, tunnels, egress, source())
+	failed, err := restore.Restore(rctx, tunnels, egress, source(cfg))
 	if err != nil {
 		return err
 	}
@@ -166,9 +184,15 @@ func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress 
 	return nil
 }
 
-// source returns the restore.Source to use. WP4 ships restore.NopSource; the
-// WP6 control transport replaces this body.
-func source() restore.Source { return restore.NopSource{} }
+// source returns the canonical desired-state restore source. It uses the same
+// outbound per-node credential as the command loop and never needs an inbound
+// Agent management port.
+func source(cfg *agentconfig.Config) restore.Source {
+	if cfg == nil || cfg.PanelHTTPURL == "" || cfg.NodeCredential == "" {
+		return restore.NopSource{}
+	}
+	return restore.HTTPSource{PanelURL: cfg.PanelHTTPURL, Credential: cfg.NodeCredential}
+}
 
 // egressAdapter maps manager.EgressManager.Snapshot's PoolSnapshot onto the
 // reporter's EgressPool view so the heartbeat JSON shape stays decoupled from
