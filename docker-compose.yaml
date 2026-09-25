@@ -1,3 +1,13 @@
+x-tunex-app: &tunex-app
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      NEXT_PUBLIC_API_BASE: ""
+      NEXT_PUBLIC_API_MOCK: "0"
+      NEXT_PUBLIC_PAYMENTS_ENABLED: "false"
+  image: ${TUNEX_IMAGE:-ghcr.io/paimoncai/tunex:latest}
+
 services:
   mysql:
     image: mysql:8.4.11
@@ -39,10 +49,7 @@ services:
     networks: [tunex]
 
   db-migrate:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
+    <<: *tunex-app
     container_name: tunex-db-migrate
     env_file: [.env]
     environment:
@@ -59,10 +66,7 @@ services:
     networks: [tunex]
 
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
+    <<: *tunex-app
     container_name: tunex-backend
     restart: always
     env_file: [.env]
@@ -85,10 +89,7 @@ services:
     networks: [tunex]
 
   worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    image: ${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}
+    <<: *tunex-app
     container_name: tunex-worker
     restart: always
     env_file: [.env]
@@ -103,14 +104,12 @@ services:
     networks: [tunex]
 
   web:
-    # Next.js 16 前端：多阶段构建（见 web/Dockerfile），运行 `next start -p 3000`。
-    # 注意：不是静态站点，不能用 nginx 直接托管 web/ 目录。
-    build:
-      context: ./web
-      dockerfile: Dockerfile
-    image: ${TUNEX_WEB_IMAGE:-ghcr.io/paimoncai/tunex-web:latest}
+    # Next.js standalone 与 Backend/Worker/DB migrate 共用统一镜像。
+    <<: *tunex-app
     container_name: tunex-web
     restart: always
+    working_dir: /app/web
+    command: ["node", "server.js"]
     environment:
       NODE_ENV: production
       PORT: "3000"
@@ -123,7 +122,7 @@ services:
     expose:
       - "3000"
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 12

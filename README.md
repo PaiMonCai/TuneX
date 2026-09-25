@@ -7,7 +7,7 @@
 TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户在控制台创建个人或团队 Workspace，部署 Agent，再通过控制面管理节点与隧道。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
 
 > [!IMPORTANT]
-> TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 迁移验证、Workspace/RBAC、账号安全和基础隧道链路，但部分租户作用域、流量计量与生产运维能力仍在收尾。**根目录的 Docker Compose 更适合作为开发/自托管基线，不应未经加固直接暴露到公网生产环境。**
+> TuneX 仍处于积极开发阶段。当前仓库已经具备可重复 CI、真实 MySQL 升级验证、Workspace/RBAC、节点级凭据、TCP DIRECT/RELAY v3 数据面与真实 Docker 集成 Gate。**根目录的 Docker Compose 更适合作为开发/自托管基线；公网生产部署请使用 `docker-compose.prod.yaml`、Caddy TLS 与生产环境密钥。**
 
 ## 当前能力
 
@@ -17,12 +17,12 @@ TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用
 | Workspace | 个人空间、团队空间、成员邀请、owner/admin/member/viewer 固定角色 |
 | 权限 | Workspace RBAC、CapabilityPolicy、默认免费策略、节点组授权 |
 | 安全 | CSRF、请求限流、审计、API/订阅密钥哈希存储与一次性轮换 |
-| 隧道/节点 | 节点组、节点、隧道管理，Agent 配置下发，基础 TCP 数据链路 |
+| 隧道/节点 | INGRESS/EGRESS/BOTH 节点、TCP DIRECT/RELAY、NodePortLease、revision/ACK、重启恢复与 Reconciler |
 | Web | Next.js 管理控制台、Workspace 切换与成员管理、设置页 |
-| CI | Backend/Web/Agent 检查、秘密扫描、空库及升级迁移验证、GHCR 镜像构建 |
+| CI | Backend/Web/Agent、秘密扫描、空库/升级迁移、真实 DIRECT/RELAY E2E、统一 GHCR 镜像构建 |
 | 运维 | Compose、Caddy、备份/恢复/告警/容量脚本基础框架 |
 
-仍在推进的主要工作包括：Redis/Queue/Socket/Agent 全链路租户作用域、策略在配置生成器中的全面接线、流量采集与聚合、生产部署加固。详细进度以 [PLAN.md](PLAN.md) 为准。
+后续开发方向、依赖 Gate、迁移规则与 DoD 统一以 [DEVELOPMENT.md](DEVELOPMENT.md) 为准；[docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md) 只作为长期目标架构约束。
 
 ## 架构
 
@@ -51,15 +51,16 @@ TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用
                                    │ Worker  │
                                    └─────────┘
 
-        Agent ── Socket.IO / outbound connection ──► Backend
+        Agent ── outbound HTTP poll / ACK ─────────► Backend
+          │        per-node credential
           │
-          └── applies encrypted config and serves tunnel data path
+          └── applies revisioned DIRECT/RELAY runtime and serves data path
 ```
 
 ### 技术栈
 
 - **Web**：Next.js 16、React 19、TypeScript、Tailwind CSS
-- **Backend**：Bun、Hono、Prisma 6、MySQL 8.4、Redis 7.4、Socket.IO
+- **Backend**：Bun、Hono、Prisma 6、MySQL 8.4、Redis 7.4
 - **Agent**：Go 1.22，仅使用 Go 标准库
 - **入口**：Caddy
 - **CI/CD**：GitHub Actions + GHCR
@@ -191,27 +192,31 @@ go build -o tunex-agent .
 
 ### 运行
 
-从控制台/节点组 API 获取节点组 token，然后连接 Backend 的 Agent 端口：
+在控制台/API 中创建具体 Node 后会签发一次性的 **per-node credential**。Agent 使用该凭据主动连接 Panel；生产控制链不要求 Panel 反向访问 Agent 的公网管理端口：
 
 ```bash
 ./tunex-agent \
-  -s http://127.0.0.1:8788 \
-  -t <node-group-token> \
-  -d
+  --panel-http-url https://panel.example.com \
+  --node-credential <one-time-node-credential> \
+  --node-id edge-hkg-01 \
+  --role BOTH \
+  --ingress-range 10000-30000 \
+  --egress-range 30001-60000
 ```
 
 常用参数：
 
-- `-s, --server`：控制面 Socket.IO 地址
-- `-t, --token`：节点组 token
-- `-n, --node-id`：节点 ID；默认主机名
-- `-i, --connect-ip`：上报连接 IP，可重复
-- `-l, --listen-ip`：强制监听 IP
-- `-r, --port-range`：允许的端口范围
+- `--panel-http-url`：Panel HTTP 基地址；用于命令轮询、ACK、状态上报与 desired-state 恢复
+- `--node-credential`：节点独立凭据；服务端由凭据确定 Node 身份，不接受客户端伪造 node_id
+- `-n, --node-id`：节点标识；默认主机名
+- `--role`：`INGRESS` / `EGRESS` / `BOTH`
+- `-l, --listen-ip`：隧道未显式指定地址时的绑定接口
+- `--ingress-range` / `--egress-range`：节点允许使用的端口范围
+- `--agent-admin-port`：本机调试管理 API；生产控制面不依赖该端口入站
 - `-d, --debug`：调试日志
 - `-c, --config`：配置文件；默认 `~/.tunex-agent.yaml`
 
-也可以使用 `TUNEX_SERVER`、`TUNEX_TOKEN` 等环境变量。
+对应环境变量使用 `TUNEX_PANEL_HTTP_URL`、`TUNEX_NODE_CREDENTIAL`、`TUNEX_ROLE`、`TUNEX_INGRESS_RANGE`、`TUNEX_EGRESS_RANGE` 等。
 
 > Agent 目前面向 Linux。CI 会构建 `linux/amd64` 与 `linux/arm64`；代码包含 Linux-only syscall，因此当前不提供 Windows 构建。
 
@@ -304,7 +309,9 @@ GitHub Actions 会执行：
 - **backend**：依赖安装、Prisma migration、类型检查、HTTP/授权测试、旧数据库升级验证；
 - **web**：依赖安装、TypeScript 类型检查、Next.js build；
 - **agent**：`go vet`、`go test`、`go build`、Linux amd64/arm64 交叉编译；
-- **images**：前述任务成功后构建并推送 Backend/Web GHCR 镜像。
+- **v3-integration**：启动真实 MySQL/Redis/Panel/双 Agent/Target Docker 拓扑，验证 DIRECT、RELAY、NodePortLease、重启恢复、凭据与 Reconciler；
+- **unified-image**：在 v3 Gate 通过后构建统一 TuneX 镜像，并验证 Bun、Node、Next standalone 与两份 Compose；
+- **images**：仅在 push 事件下推送 `ghcr.io/paimoncai/tunex:{latest,<git-sha>}`。
 
 本地常用检查：
 
@@ -332,19 +339,40 @@ go build ./...
 
 ## Docker 镜像
 
-CI 在 `main` / `feature/**` push 后构建：
+CI 在发布 push 后构建一个统一应用镜像：
 
 ```text
-ghcr.io/paimoncai/tunex-backend:latest
-ghcr.io/paimoncai/tunex-web:latest
+ghcr.io/paimoncai/tunex:latest
+ghcr.io/paimoncai/tunex:<git-sha>
 ```
 
-同时会以 Git SHA 打 tag。Compose 也允许通过以下变量覆盖镜像：
+同一镜像由 Compose 以不同启动命令运行 Backend、Worker、DB migrate 和
+Next.js standalone Web；它们仍是独立容器，不是单容器多进程：
+
+```text
+ghcr.io/paimoncai/tunex:<git-sha>
+├── backend      → bun src/index.ts
+├── worker       → bun src/worker.ts
+├── db-migrate   → Prisma migrate / seed
+└── web          → node server.js
+```
+
+生产只需要钉一个不可变版本：
 
 ```dotenv
-TUNEX_BACKEND_IMAGE=ghcr.io/paimoncai/tunex-backend:latest
-TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
+TUNEX_IMAGE=ghcr.io/paimoncai/tunex:<git-sha>
 ```
+
+典型更新流程：
+
+```bash
+docker compose -f docker-compose.prod.yaml --env-file .env pull
+docker compose -f docker-compose.prod.yaml --env-file .env run --rm db-migrate
+docker compose -f docker-compose.prod.yaml --env-file .env up -d backend worker web caddy
+```
+
+回滚同样只需把 `TUNEX_IMAGE` 改回上一条已知良好的 SHA，再重新创建应用容器。
+MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用镜像版本一起切换。
 
 ## 项目结构
 
@@ -395,7 +423,7 @@ TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:latest
 4. 使用独立数据库账号与最小权限，而不是长期使用 root；
 5. 配置 SMTP、备份、恢复、日志、告警和资源限制；
 6. 保持 `PAYMENTS_ENABLED=false`，除非计费链路已完成独立审查和验收；
-7. 按 [PLAN.md](PLAN.md) 的 P0 发布门槛完成租户隔离与真实网络验证。
+7. 以 [DEVELOPMENT.md](DEVELOPMENT.md) 的 Integration Gate 为发布门槛；不得跳过真实 v3 网络验证。
 
 生产部署使用 `docker-compose.prod.yaml` + `Caddyfile.prod` + `.env.production.example`，
 完整步骤、巡检阈值、备份/恢复/回滚操作与演练清单见

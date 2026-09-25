@@ -64,7 +64,7 @@ openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 | `MYSQL_ROOT_PASSWORD` | 必须同时改 `DATABASE_URL` 里的口令（两边一致） |
 | `AUTH_SECRET` / `LICENSE_SECRET` | ≥32 随机字节，禁止跨环境复用 |
 | `TUNEX_CONFIG_KEY` / `TUNEX_LICENSE_KEY` | 32 字节 base64url Fernet 密钥，两把必须不同 |
-| `TUNEX_BACKEND_IMAGE` / `TUNEX_WEB_IMAGE` | 钉到具体 git sha（见下） |
+| `TUNEX_IMAGE` | 统一应用镜像，钉到具体 git sha（见下） |
 | `SMTP_*` | 公网服务必须配，否则验证/重置邮件只进日志 |
 | `BACKUP_PASSPHRASE` | cron 回滚前备份必需，否则备份脚本交互读取失败并终止回滚 |
 
@@ -73,19 +73,18 @@ PLAN.md 的既定默认，**不要**在生产环境打开以"图方便"。
 
 ### 2.3 选定镜像版本
 
-CI 每个 push 到 `main` / `feature/**` 都会推送：
+CI 发布一个完整应用镜像：
 
 ```text
-ghcr.io/paimoncai/tunex-backend:<git-sha>   ghcr.io/paimoncai/tunex-backend:latest
-ghcr.io/paimoncai/tunex-web:<git-sha>       ghcr.io/paimoncai/tunex-web:latest
+ghcr.io/paimoncai/tunex:<git-sha>   ghcr.io/paimoncai/tunex:latest
 ```
 
-生产钉 sha，不钉 `latest`——回滚的前提是能明确指回某个版本：
+该镜像同时承载 Backend、Worker、DB migrate 与 Next.js standalone Web，
+但 Compose 仍以独立容器运行各角色。生产钉 sha，不钉 `latest`：
 
 ```bash
 SHA=$(git rev-parse HEAD)
-sed -i "s#^TUNEX_BACKEND_IMAGE=.*#TUNEX_BACKEND_IMAGE=ghcr.io/paimoncai/tunex-backend:$SHA#" .env
-sed -i "s#^TUNEX_WEB_IMAGE=.*#TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:$SHA#" .env
+sed -i "s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA#" .env
 ```
 
 GHCR 包若为 private 需先 `docker login ghcr.io`。
@@ -142,8 +141,7 @@ git fetch origin && git checkout <target-commit>
 
 export COMPOSE_FILE=$PWD/docker-compose.prod.yaml
 SHA=$(git rev-parse HEAD)
-sed -i "s#^TUNEX_BACKEND_IMAGE=.*#TUNEX_BACKEND_IMAGE=ghcr.io/paimoncai/tunex-backend:$SHA#" .env
-sed -i "s#^TUNEX_WEB_IMAGE=.*#TUNEX_WEB_IMAGE=ghcr.io/paimoncai/tunex-web:$SHA#" .env
+sed -i "s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA#" .env
 
 docker compose -f "$COMPOSE_FILE" pull
 docker compose -f "$COMPOSE_FILE" up -d backend worker web caddy
@@ -263,11 +261,11 @@ scripts/ops/rollback.sh --list
 
 # 预演：只校验目标镜像可拉取/存在，不做任何变更
 COMPOSE_FILE=$PWD/docker-compose.prod.yaml BACKUP_PASSPHRASE='<口令>' \
-  scripts/ops/rollback.sh --verify ghcr.io/paimoncai/tunex-backend:<sha> 
+  scripts/ops/rollback.sh --verify ghcr.io/paimoncai/tunex:<sha> 
 
 # 执行：先备份现状 → 切镜像 → 健康检查 → 失败自动回退
 COMPOSE_FILE=$PWD/docker-compose.prod.yaml BACKUP_PASSPHRASE='<口令>' \
-  scripts/ops/rollback.sh --to ghcr.io/paimoncai/tunex-backend:<sha> --yes
+  scripts/ops/rollback.sh --to ghcr.io/paimoncai/tunex:<sha> --yes
 ```
 
 语义要点：
