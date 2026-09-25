@@ -3,6 +3,7 @@
 > 面向个人与团队的多租户端口转发控制面：管理 Workspace、节点、入口/出口绑定、端口转发与 Agent。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
+[![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
 TuneX 由 **Web 控制台、Backend 控制面、Worker、Go Agent** 组成。用户先在控制台创建 Node，复制一键安装命令到 Linux 节点执行，然后直接在入口节点上创建 PortForward；不选出口就是 DIRECT，选择已绑定出口就是 RELAY。内部 `Tunnel` 只作为 revision/ACK/NodePortLease/Reconciler 的运行时对象，不再要求用户手工创建。支付/套餐能力保留为可选扩展，默认关闭，不参与核心权限判定。
 
@@ -353,16 +354,27 @@ go build ./...
 
 ## 测试与 CI
 
-GitHub Actions 会执行：
+GitHub Actions 分成三层，测试内容不减少：
 
-- **secret-scan**：扫描已跟踪文件中的疑似秘密；
-- **backend**：依赖安装、Prisma migration、类型检查、HTTP/授权测试、旧数据库升级验证；
-- **web**：依赖安装、TypeScript 类型检查、Next.js build；
-- **agent**：`go vet`、`go test`、`go build`、Linux amd64/arm64 交叉编译；
-- **agent-image**：构建并 smoke test 专用 Docker Agent 镜像；
-- **v3-integration**：启动真实 MySQL/Redis/Panel/双 Agent/Target Docker 拓扑，通过一次性 enrollment 注册 Agent，再经 NodeBinding + PortForward API 验证 DIRECT、RELAY、NodePortLease、重启恢复、凭据与 Reconciler；
-- **unified-image**：在 v3 Gate 通过后构建统一 TuneX Panel 镜像，并验证 Bun、Node、Next standalone 与两份 Compose；
-- **images**：仅在 push 事件下推送 Panel `ghcr.io/paimoncai/tunex:{latest,<git-sha>}` 和多架构 Agent `ghcr.io/paimoncai/tunex-agent:{latest,<git-sha>}`。
+```text
+feature/** push
+      └── CI
+
+Pull Request
+      ├── CI
+      └── Integration
+
+main push
+      └── CI
+           └── Integration
+                └── Release
+```
+
+- **CI（`.github/workflows/ci.yml`）**：快速源码 Gate。包含 secret-scan、Backend（migration/typecheck/unit/HTTP/旧库升级）、Web（typecheck/unit/build）和 Agent（vet/test/build + amd64/arm64 交叉编译）。同一分支只保留最新一轮。
+- **Integration（`.github/workflows/integration.yml`）**：PR 直接运行；main 上必须等 CI 成功后才运行。依次执行 `agent-image → v3-integration → unified-image`，真实启动 MySQL/Redis/Panel/双 Agent/Target，验证 enrollment、Agent ID、NodeBinding/PortForward、DIRECT/RELAY、NodePortLease、重启恢复、凭据隔离和 Reconciler。
+- **Release（`.github/workflows/release.yml`）**：只会被 **main 的成功 Integration** 触发，发布 Panel `ghcr.io/paimoncai/tunex:{latest,<git-sha>}` 与多架构 Agent `ghcr.io/paimoncai/tunex-agent:{latest,<git-sha>}`。feature/PR 永远不会移动正式镜像标签。
+
+因此正式发布链是严格的 `CI → Integration → Release`；开发分支的小提交不会反复启动重型 v3 Docker E2E。
 
 本地常用检查：
 
@@ -390,7 +402,7 @@ go build ./...
 
 ## Docker 镜像
 
-CI 在发布 push 后构建一个统一应用镜像：
+Release workflow 在 main 的 CI + Integration 全绿后发布统一应用镜像：
 
 ```text
 ghcr.io/paimoncai/tunex:latest
@@ -430,7 +442,10 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 
 ```text
 .
-├── .github/workflows/ci.yml        # CI / image publishing
+├── .github/workflows/
+│   ├── ci.yml                      # 快速源码 Gate
+│   ├── integration.yml             # Docker / DIRECT / RELAY 真实集成 Gate
+│   └── release.yml                 # main 集成通过后发布 GHCR
 ├── .env.example                    # 开发/本地环境变量模板
 ├── .env.production.example         # 生产环境变量模板（复制为 .env）
 ├── Caddyfile                      # 开发用反代（HTTP）
@@ -439,15 +454,15 @@ MySQL、Redis、Caddy 与远端 Agent 保持独立镜像/制品，不随应用�
 ├── docker-compose.prod.yaml       # 生产栈（端口不外泄/TLS/限额）
 ├── docs/                          # 部署与运维手册
 │   └── production-deploy.md       # 生产部署/备份/恢复/回滚手册
-├── PLAN.md                        # 产品定位、里程碑、发布门槛
-├── DEVELOPMENT.md                 # 深入开发规范与协议说明
+├── DEVELOPMENT.md                 # 唯一开发方案、Gate、迁移与 DoD
+├── docs/tunex-devmap-v3.md         # 长期目标架构约束
 ├── backend/
 │   ├── prisma/                    # schema / migrations / seed
 │   ├── src/
 │   │   ├── middlewares/           # auth / CSRF / audit / rate limit
 │   │   ├── routes/                # HTTP API
 │   │   ├── services/              # workspace / policy / mail / keys
-│   │   └── socket/                # Agent 控制面
+│   │   └── services/              # outbound Agent control / scheduler / reconciler
 │   └── tests/                     # HTTP/DB integration tests
 ├── web/
 │   └── src/
@@ -503,7 +518,7 @@ TuneX 的部分产品场景和历史兼容行为参考了 RelayX 的公开产品
 
 ```text
 feature/*  ─┐
-fix/*      ├─> Pull Request -> CI -> main
+fix/*      ├─> Pull Request -> CI + Integration -> main -> CI -> Integration -> Release
 docs/*     ┘
 ```
 
