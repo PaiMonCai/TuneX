@@ -2,7 +2,7 @@
 
 > 对象：单机 Docker Compose 生产栈（`docker-compose.prod.yaml`）。
 > 覆盖：首次部署、升级、监控告警、备份、恢复、回滚、容量基线与演练清单。
-> 相关文件：`docker-compose.prod.yaml`、`docker-compose.standalone.yaml`、`Caddyfile`、`Caddyfile.prod`、`.env.production.example`、`scripts/ops/{alert,backup,restore,rollback,capacity}.sh`。
+> 相关文件：`docker-compose.prod.yaml`、`docker-compose.standalone.yaml`、`Caddyfile.internal`、`Caddyfile.prod`、`.env.production.example`、`scripts/ops/{alert,backup,restore,rollback,capacity}.sh`。
 
 ---
 
@@ -330,7 +330,7 @@ COMPOSE_FILE=$PWD/docker-compose.prod.yaml BACKUP_PASSPHRASE='<口令>' \
 scripts/ops/alert.sh                                        # 全 ok
 curl -fsS https://$DOMAIN/healthz
 # 登录后台抽 1 个 workspace 核对 tunnel 数据与主备份一致
-# config 目录只解包到临时目录，.env/Caddyfile 需人工 diff 后才覆盖（见脚本日志）
+# config 目录只解包到临时目录，.env/Caddyfile* 需人工 diff 后才覆盖（见脚本日志）
 ```
 
 ---
@@ -406,7 +406,7 @@ scripts/ops/capacity.sh --baseline # 与历史对比
 
 - [ ] 在**隔离环境**完整执行一次：deploy → backup → restore → rollback 全链路
 - [ ] 恢复演练后核对 `_prisma_migrations` 行数与关键表行数和 manifest 一致
-- [ ] 用 `restore.sh` 的 config 目录做过 `diff -u`，确认 .env/Caddyfile 覆盖策略
+- [ ] 用 `restore.sh` 的 config 目录做过 `diff -u`，确认 .env/Caddyfile* 覆盖策略
 - [ ] 通知渠道实测：ALERT_WEBHOOK 送达，宝塔通道（如使用）收到测试消息
 - [ ] `alert.sh` 各项阈值与主机实际容量匹配（如内存 16G 机应放宽 MEM 阈值）
 - [ ] 本地 + 异地各有一份可用的近期备份，且能在另一台机解密校验
@@ -425,6 +425,6 @@ scripts/ops/capacity.sh --baseline # 与历史对比
 | 宿主机反代模式（Nginx/宝塔/1Panel → `127.0.0.1:13000`） | ✅ 默认生产路径 |
 | standalone overlay（Caddy 80/443 + ACME） | ✅ 可选兼容路径 |
 | `.env.production.example`（含全部密钥占位与开关说明） | ✅ 本仓库交付 |
-| `Caddyfile` / `Caddyfile.prod`（内部 HTTP / standalone TLS） | ✅ 本仓库交付 |
+| `Caddyfile.internal` / `Caddyfile.prod`（内部 HTTP / standalone TLS） | ✅ 本仓库交付 |
 | ops 脚本集（alert/backup/restore/rollback/capacity） | ✅ 已就位 |
 | 真实生产机部署与恢复/回滚演练 | ⏳ 待部署环境执行（见第 10 节） |
