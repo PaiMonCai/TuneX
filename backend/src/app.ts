@@ -39,6 +39,7 @@ import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
 import { dashboardRoutes } from "./routes/dashboard.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
+import { forwardsRoutes } from "./routes/forwards.ts";
 import { plansRoutes } from "./routes/plans.ts";
 import { topupsRoutes } from "./routes/topups.ts";
 import { paymentsRoutes } from "./routes/topups.ts";
@@ -130,6 +131,7 @@ export function createApp() {
   app.route("/api/pay", payRoutes);
   app.route("/api/dashboard", dashboardRoutes);
   app.route("/api/tunnels", tunnelsRoutes);
+  app.route("/api/forwards", forwardsRoutes);
   app.route("/api/workspaces", workspaceRoutes);
   app.route("/api/plans", plansRoutes);
   app.route("/api/topups", topupsRoutes);

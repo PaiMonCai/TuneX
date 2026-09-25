@@ -18,6 +18,7 @@ export interface NavItem {
 
 export const userNav: NavItem[] = [
   { href: "/dashboard", labelKey: "common.dashboard", iconKey: "dashboard" },
+  { href: "/forwards", labelKey: "common.forwards", iconKey: "forwards" },
   { href: "/nodes", labelKey: "common.nodes", iconKey: "nodes" },
   ...(process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true"
     ? ([

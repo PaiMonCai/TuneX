@@ -360,6 +360,8 @@ export interface Tunnel {
    * 面板必须显式渲染「未声明」，不得默认成 direct。
    */
   tunnel_mode?: TunnelMode | null;
+  /** v4 入口节点主键；旧 Tunnel payload 迁移期可缺省。 */
+  ingress_node_id?: ID | null;
   /** RELAY 实际出口节点（schema §2.1：禁止只存 NodeGroup）；DIRECT = NULL */
   egress_node_id?: ID | null;
   /** 出口节点展示引用（由后端 include 提供，缺失时回落 id） */
@@ -853,6 +855,9 @@ export interface PortForward {
   target_host: string | null;
   target_port: number | null;
   target_weight: number | null;
+  traffic: number;
+  traffic_cost: number;
+  online: boolean;
   desired_status: TunnelDesiredStatus | null;
   apply_status: TunnelApplyStatus | null;
   config_revision: number | null;
@@ -870,6 +875,16 @@ export interface PortForwardCreateInput {
   target_host: string;
   target_port: number;
   egress_node_id?: ID | null;
+}
+
+/** V4 product API payload. Forward owns the explicit mode + ingress choice. */
+export interface ForwardCreateInput extends PortForwardCreateInput {
+  mode: "direct" | "relay";
+  ingress_node_id: ID;
+}
+
+export interface ForwardPatchInput {
+  name?: string;
 }
 
 export interface ProvisionNodeResult {

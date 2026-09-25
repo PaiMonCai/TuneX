@@ -21,10 +21,13 @@ import type {
   Node,
   NodeCredentialIssued,
   NodeCredentialRevoked,
+  NodeEnrollmentIssued,
+  NodeBinding,
   NodeGroup,
   NodeType,
   Plan,
   PlanOrder,
+  PortForward,
   Ticket,
   TicketReply,
   TopupOrder,
@@ -34,6 +37,7 @@ import type {
   TunnelMode,
   TunnelRuntimeAction,
   User,
+  UserNode,
   UserPlan,
   Workspace,
   WorkspaceInvite,
@@ -42,7 +46,7 @@ import type {
   WorkspaceTrafficSummary,
 } from "@/lib/types";
 import * as seed from "./data";
-import { getStore, resetStore, type MockWorkspaceInvite } from "./state";
+import { getStore, resetStore, type MockNodeBinding, type MockWorkspaceInvite } from "./state";
 
 export interface MockRequest {
   body?: unknown;
@@ -849,6 +853,126 @@ function tunnelRuntimeAction(
   return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision } satisfies TunnelRuntimeAction);
 }
 
+function mockUserNode(db: Store, node: Node): UserNode {
+  const group = db.nodeGroups.find((g) => g.id === node.node_group_id);
+  // Compatibility shim for legacy mock fixtures whose v3 role is still NULL:
+  // the user-facing V4 surface projects the old group direction so the demo
+  // remains operable without mutating the admin/source fixture.
+  const role =
+    node.role ??
+    (group?.node_type === "in"
+      ? "ingress"
+      : group?.node_type === "out"
+        ? "egress"
+        : null);
+  return {
+    ...node,
+    agent_id: node.agent_id ?? `mock-agent-${node.id}`,
+    role,
+    registered: Boolean(node.has_credential) && !node.credential_revoked,
+    online: Boolean(node.online) && node.status === "active",
+  };
+}
+
+function mockBindingView(db: Store, binding: MockNodeBinding): NodeBinding | null {
+  const egress = db.nodes.find((node) => node.id === binding.egress_node_id);
+  if (!egress) return null;
+  return {
+    ...binding,
+    egress_node: mockUserNode(db, egress),
+  };
+}
+
+function mockIngressNode(db: Store, tunnel: Tunnel): UserNode | null {
+  const explicit = tunnel.ingress_node_id
+    ? db.nodes.find((node) => node.id === tunnel.ingress_node_id)
+    : null;
+  const fallback =
+    explicit ??
+    db.nodes.find(
+      (node) =>
+        node.node_group_id === tunnel.in_node_group_id &&
+        (mockUserNode(db, node).role === "ingress" ||
+          mockUserNode(db, node).role === "both"),
+    ) ??
+    db.nodes.find((node) => node.node_group_id === tunnel.in_node_group_id);
+  return fallback ? mockUserNode(db, fallback) : null;
+}
+
+function parseMockTarget(address: string | undefined): { host: string; port: number } | null {
+  if (!address) return null;
+  const match =
+    /^\[([^\]]+)\]:(\d+)$/.exec(address) ??
+    /^([^:]+):(\d+)$/.exec(address);
+  if (!match) return null;
+  const port = Number(match[2]);
+  return Number.isInteger(port) ? { host: match[1]!, port } : null;
+}
+
+function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
+  const ingress = mockIngressNode(db, tunnel);
+  const egressRaw = tunnel.egress_node_id
+    ? db.nodes.find((node) => node.id === tunnel.egress_node_id)
+    : null;
+  const egress = egressRaw ? mockUserNode(db, egressRaw) : null;
+  const pooled =
+    tunnel.egress_pool_id != null
+      ? (db.egressTargets.get(tunnel.egress_pool_id) ?? []).find(
+          (target) => target.status === "active",
+        ) ?? null
+      : null;
+  const fallback = parseMockTarget(tunnel.forward_addresses[0]);
+  const target =
+    pooled ??
+    (tunnel.remote_host && tunnel.remote_port
+      ? { host: tunnel.remote_host, port: tunnel.remote_port, weight: 1 }
+      : fallback
+        ? { ...fallback, weight: 1 }
+        : null);
+
+  return {
+    id: tunnel.id,
+    name: tunnel.name,
+    protocol: "tcp",
+    mode: tunnel.tunnel_mode === "relay" ? "relay" : "direct",
+    ingress_node_id: ingress?.id ?? tunnel.in_node_group_id,
+    ingress_node: ingress,
+    egress_node_id: egress?.id ?? null,
+    egress_node: egress,
+    listen_ip: tunnel.listen_ip,
+    listen_port: tunnel.listen_port,
+    target_host: target?.host ?? null,
+    target_port: target?.port ?? null,
+    target_weight: target && "weight" in target ? target.weight : 1,
+    traffic: tunnel.traffic,
+    traffic_cost: tunnel.traffic_cost,
+    online: tunnel.apply_status === "active",
+    desired_status: tunnel.desired_status ?? null,
+    apply_status: tunnel.apply_status ?? null,
+    config_revision: tunnel.config_revision ?? null,
+    applied_revision: tunnel.applied_revision ?? null,
+    apply_error_code: tunnel.apply_error_code ?? null,
+    apply_error: tunnel.apply_error ?? null,
+    last_applied_at: tunnel.last_applied_at ?? null,
+    created_at: tunnel.created_at,
+    updated_at: tunnel.updated_at,
+  };
+}
+
+function mockEnrollment(node: UserNode): NodeEnrollmentIssued {
+  const token = `mock_enroll_${node.agent_id}_${Math.random().toString(36).slice(2, 10)}`;
+  return {
+    token,
+    node_id: node.id,
+    node_key: node.node_id,
+    agent_id: node.agent_id,
+    expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+    install_command:
+      `docker run -d --name tunex-agent --restart unless-stopped ` +
+      `-e TUNEX_ENROLLMENT_TOKEN=${token} ghcr.io/paimoncai/tunex-agent:latest`,
+  };
+}
+
 // ---------------------------------------------------------------- 路由
 
 export async function handleMock(method: string, path: string, req: MockRequest): Promise<MockResponse> {
@@ -1280,6 +1404,282 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     }
   }
 
+  // ---------- nodes（V4 user-facing） ----------
+  if (seg[0] === "nodes") {
+    if (method === "GET" && seg[1] === undefined) {
+      return ok(db.nodes.map((node) => mockUserNode(db, node)));
+    }
+
+    const nodeId = parseId(seg[1]);
+    if (nodeId !== null) {
+      const node = db.nodes.find((row) => row.id === nodeId);
+      if (!node) return notFound("节点不存在");
+      const projected = mockUserNode(db, node);
+
+      if (method === "POST" && seg[2] === "enrollment") {
+        return ok(mockEnrollment(projected));
+      }
+
+      if (seg[2] === "bindings") {
+        if (projected.role !== "ingress" && projected.role !== "both") {
+          return badRequest("该节点不具备入口能力");
+        }
+
+        if (method === "GET" && seg[3] === undefined) {
+          return ok(
+            db.nodeBindings
+              .filter((binding) => binding.ingress_node_id === nodeId)
+              .map((binding) => mockBindingView(db, binding))
+              .filter((binding): binding is NodeBinding => binding !== null),
+          );
+        }
+
+        if (method === "POST" && seg[3] === undefined) {
+          const body = asRecord(req.body);
+          const egressId = reqNum(body.egress_node_id);
+          if (egressId === undefined) return badRequest("出口节点 ID 不合法");
+          const egressRaw = db.nodes.find((row) => row.id === egressId);
+          if (!egressRaw) return notFound("出口节点不存在");
+          const egress = mockUserNode(db, egressRaw);
+          if (egress.id === projected.id) return badRequest("入口和出口不能是同一节点");
+          if (egress.role !== "egress" && egress.role !== "both") {
+            return badRequest("出口节点角色必须是 egress 或 both");
+          }
+
+          let binding = db.nodeBindings.find(
+            (row) =>
+              row.ingress_node_id === nodeId &&
+              row.egress_node_id === egressId,
+          );
+          if (!binding) {
+            binding = {
+              id: nextId(db.nodeBindings),
+              ingress_node_id: nodeId,
+              egress_node_id: egressId,
+              created_at: nowIso(),
+            };
+            db.nodeBindings.push(binding);
+          }
+          return ok(mockBindingView(db, binding));
+        }
+
+        const egressId = parseId(seg[3]);
+        if (method === "DELETE" && egressId !== null) {
+          const used = db.tunnels.filter((tunnel) => {
+            const ingress = mockIngressNode(db, tunnel);
+            return (
+              tunnel.tunnel_mode === "relay" &&
+              ingress?.id === nodeId &&
+              tunnel.egress_node_id === egressId
+            );
+          }).length;
+          if (used > 0) {
+            return fail(
+              409,
+              `该出口仍被 ${used} 条端口转发使用，请先删除或改为其它出口`,
+              "BINDING_IN_USE",
+            );
+          }
+          db.nodeBindings = db.nodeBindings.filter(
+            (row) =>
+              !(
+                row.ingress_node_id === nodeId &&
+                row.egress_node_id === egressId
+              ),
+          );
+          return ok({ ok: true });
+        }
+      }
+    }
+
+    return notFound(`Mock route not found: ${method} /${clean}`);
+  }
+
+  // ---------- forwards（V4 product API） ----------
+  if (seg[0] === "forwards") {
+    const id = parseId(seg[1]);
+
+    if (method === "GET" && seg[1] === undefined) {
+      const mode = reqStr(q?.mode);
+      const keyword = reqStr(q?.keyword).toLowerCase();
+      let rows = db.tunnels
+        .filter((tunnel) => tunnel.user_id === user.id && tunnel.category === "port_forward")
+        .map((tunnel) => mockForwardView(db, tunnel));
+      if (mode === "direct" || mode === "relay") {
+        rows = rows.filter((row) => row.mode === mode);
+      }
+      if (keyword) {
+        rows = rows.filter((row) =>
+          [
+            row.name,
+            row.ingress_node?.node_id ?? "",
+            row.egress_node?.node_id ?? "",
+            row.target_host ?? "",
+            String(row.target_port ?? ""),
+          ].some((value) => value.toLowerCase().includes(keyword)),
+        );
+      }
+      return ok(rows.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)));
+    }
+
+    if (method === "POST" && seg[1] === undefined) {
+      const body = asRecord(req.body);
+      const name = reqStr(body.name);
+      const mode = reqStr(body.mode);
+      const ingressId = reqNum(body.ingress_node_id);
+      const egressId = numOrNull(body.egress_node_id);
+      const targetHost = reqStr(body.target_host);
+      const targetPort = reqNum(body.target_port);
+      const listenPort = numOrNull(body.listen_port);
+
+      if (
+        !name ||
+        (mode !== "direct" && mode !== "relay") ||
+        ingressId === undefined ||
+        !targetHost ||
+        targetPort === undefined ||
+        targetPort < 1 ||
+        targetPort > 65535 ||
+        (listenPort !== null && (listenPort < 1 || listenPort > 65535))
+      ) {
+        return badRequest("端口转发参数不合法");
+      }
+
+      const ingressRaw = db.nodes.find((node) => node.id === ingressId);
+      if (!ingressRaw) return notFound("入口节点不存在");
+      const ingress = mockUserNode(db, ingressRaw);
+      if (ingress.role !== "ingress" && ingress.role !== "both") {
+        return badRequest("该节点不具备入口能力");
+      }
+
+      let egress: UserNode | null = null;
+      if (mode === "relay") {
+        if (egressId === null) return badRequest("RELAY 转发必须指定出口节点");
+        const egressRaw = db.nodes.find((node) => node.id === egressId);
+        if (!egressRaw) return notFound("出口节点不存在");
+        egress = mockUserNode(db, egressRaw);
+        if (egress.role !== "egress" && egress.role !== "both") {
+          return badRequest("选择的节点不具备出口能力");
+        }
+        const bound = db.nodeBindings.some(
+          (binding) =>
+            binding.ingress_node_id === ingress.id &&
+            binding.egress_node_id === egress!.id,
+        );
+        if (!bound) return fail(409, "该出口尚未绑定到当前入口节点", "BINDING_REQUIRED");
+      } else if (egressId !== null) {
+        return badRequest("DIRECT 转发不能指定出口节点");
+      }
+
+      const effectiveListenPort = listenPort ?? 20000 + nextId(db.tunnels);
+      const conflict = db.tunnels.some((tunnel) => {
+        const rowIngress = mockIngressNode(db, tunnel);
+        return rowIngress?.id === ingress.id && tunnel.listen_port === effectiveListenPort;
+      });
+      if (conflict) return fail(409, "该入口端口已被占用", "PORT_CONFLICT");
+
+      const newId = nextId(db.tunnels);
+      const target =
+        targetHost.includes(":") && !targetHost.startsWith("[")
+          ? `[${targetHost}]:${targetPort}`
+          : `${targetHost}:${targetPort}`;
+      const created: Tunnel = {
+        id: newId,
+        name,
+        tunnel_type: "tcp",
+        category: "port_forward",
+        listen_ip: "0.0.0.0",
+        listen_port: effectiveListenPort,
+        listen_protocol: ["tcp"],
+        status: "active",
+        forward_addresses: [target],
+        forward_addresses_protocol: ["tcp"],
+        load_balance_type: "round",
+        ip_type: "ipv4",
+        order_by: db.tunnels.reduce((max, row) => Math.max(max, row.order_by), 0) + 10,
+        ip_limit: null,
+        client_limit: null,
+        bandwidth_limit: null,
+        traffic: 0,
+        traffic_cost: 0,
+        proxy_protocol: false,
+        in_node_group_id: ingress.node_group_id,
+        in_node_group: groupRef(db, ingress.node_group_id) ?? undefined,
+        out_node_group_id: egress?.node_group_id ?? null,
+        out_node_group: egress ? groupRef(db, egress.node_group_id) ?? null : null,
+        user_id: user.id,
+        port_conflict_at: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        online: false,
+        client_count: 0,
+        tunnel_mode: mode,
+        ingress_node_id: ingress.id,
+        egress_node_id: egress?.id ?? null,
+        egress_port: mode === "relay" ? 30000 + newId : null,
+        egress_pool_id: null,
+        egress_pool: null,
+        remote_host: mode === "direct" ? targetHost : null,
+        remote_port: mode === "direct" ? targetPort : null,
+        desired_status: "active",
+        apply_status: "pending",
+        config_revision: 1,
+        applied_revision: 0,
+        apply_error_code: null,
+        apply_error: null,
+        last_applied_at: null,
+      };
+      db.tunnels.unshift(created);
+      completeOrchestration(created);
+      created.online = true;
+      return ok(mockForwardView(db, created));
+    }
+
+    if (id !== null) {
+      const tunnel = db.tunnels.find(
+        (row) =>
+          row.id === id &&
+          row.user_id === user.id &&
+          row.category === "port_forward",
+      );
+      if (!tunnel) return notFound("端口转发不存在");
+
+      if (method === "GET" && seg[2] === "traffic") {
+        const days = Math.max(1, Math.min(90, Number(q?.days ?? 14) || 14));
+        return ok(tunnelTrafficSeries(tunnel.id, tunnel.traffic, days));
+      }
+      if (method === "GET" && seg[2] === undefined) {
+        return ok(mockForwardView(db, tunnel));
+      }
+      if (method === "PATCH" && seg[2] === undefined) {
+        const body = asRecord(req.body);
+        if (body.name !== undefined) {
+          const name = reqStr(body.name);
+          if (!name || name.length > 60) return badRequest("转发名称不合法");
+          tunnel.name = name;
+          tunnel.updated_at = nowIso();
+        }
+        return ok(mockForwardView(db, tunnel));
+      }
+      if (
+        method === "POST" &&
+        (seg[2] === "retry" ||
+          seg[2] === "suspend" ||
+          seg[2] === "resume")
+      ) {
+        const result = tunnelRuntimeAction(db, tunnel, seg[2]);
+        if (result.status >= 400) return result;
+        return ok(mockForwardView(db, tunnel));
+      }
+      if (method === "DELETE" && seg[2] === undefined) {
+        db.tunnels.splice(db.tunnels.indexOf(tunnel), 1);
+        return ok({ ok: true });
+      }
+    }
+
+    return notFound(`Mock route not found: ${method} /${clean}`);
+  }
+
   // ---------- tunnels ----------
   if (seg[0] === "tunnels") {
     const id = parseId(seg[1]);
@@ -1553,10 +1953,82 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     return notFound(`Mock route not found: ${method} /${clean}`);
   }
 
-  // ---------- node groups（用户侧：仅返回可用） ----------
-  if (seg[0] === "node-groups" && method === "GET") {
-    const items = filterByStatus(db.nodeGroups, q).map((g) => withGroupStats(db, g));
-    return ok(paginate(items, q));
+  // ---------- node groups（用户侧：列表 + V4 节点部署） ----------
+  if (seg[0] === "node-groups") {
+    if (method === "GET" && seg[1] === undefined) {
+      const items = filterByStatus(db.nodeGroups, q).map((g) => withGroupStats(db, g));
+      return ok(paginate(items, q));
+    }
+
+    const groupId = parseId(seg[1]);
+    if (method === "POST" && groupId !== null && seg[2] === "nodes") {
+      const group = db.nodeGroups.find((row) => row.id === groupId);
+      if (!group) return notFound("节点组不存在");
+      const body = asRecord(req.body);
+      const nodeKey = reqStr(body.node_id);
+      if (!nodeKey) return badRequest("node_id / connect_ip / role 不合法");
+      if (db.nodes.some((node) => node.node_id === nodeKey)) {
+        return fail(409, "节点 ID 已存在", "NODE_EXISTS");
+      }
+
+      const roleRaw = reqStr(body.role);
+      const role =
+        roleRaw === "ingress" || roleRaw === "egress" || roleRaw === "both"
+          ? roleRaw
+          : group.node_type === "out"
+            ? "egress"
+            : "ingress";
+      const range = group.port_range?.split("-").map(Number) ?? [];
+      const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
+      const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
+      if (
+        portMin === null ||
+        portMax === null ||
+        portMin < 1 ||
+        portMax > 65535 ||
+        portMin > portMax
+      ) {
+        return fail(409, "节点组未配置可用于 v3 的连续端口范围", "PORT_RANGE_REQUIRED");
+      }
+
+      const id = nextId(db.nodes);
+      const created: Node = {
+        id,
+        node_id: nodeKey,
+        agent_id: `mock-agent-${id}-${Math.random().toString(36).slice(2, 8)}`,
+        weight: 10,
+        status: "active",
+        connect_ip: reqStr(body.connect_ip) || null,
+        version: "pending",
+        backup: false,
+        order_by: db.nodes.reduce((max, node) => Math.max(max, node.order_by), 0) + 10,
+        custom_line: null,
+        dns_status: false,
+        node_group_id: group.id,
+        node_group: { id: group.id, name: group.name, node_type: group.node_type },
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        online: false,
+        traffic: 0,
+        role,
+        last_seen_at: null,
+        port_range_min: portMin,
+        port_range_max: portMax,
+        lb_strategy: "round",
+        has_credential: false,
+        credential_revoked: false,
+        credential_rotated_at: null,
+        credential_last_rejected_at: null,
+      };
+      db.nodes.push(created);
+      const projected = mockUserNode(db, created);
+      return ok({
+        node: projected,
+        enrollment: mockEnrollment(projected),
+      });
+    }
+
+    return notFound(`Mock route not found: ${method} /${clean}`);
   }
 
   // ---------- WP11 / WP13：用户侧可用出口池（创建 RELAY 隧道时选池） ----------

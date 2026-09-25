@@ -41,6 +41,8 @@ import type {
   PasswordChangeInput,
   PortForward,
   PortForwardCreateInput,
+  ForwardCreateInput,
+  ForwardPatchInput,
   ProvisionNodeResult,
   Payment,
   Plan,
@@ -415,6 +417,25 @@ export const api = {
     /** 当前 workspace 可用的出口池（含池内目标，用于创建 RELAY 时选池） */
     available: (query?: ListQuery, cookie?: string) =>
       get<TunnelEgressPoolOption[]>("/egress-pools", query, cookie),
+  },
+  forwards: {
+    list: (query?: ListQuery, cookie?: string) =>
+      get<PortForward[]>("/forwards", query, cookie),
+    detail: (id: ID, cookie?: string) =>
+      get<PortForward>(`/forwards/${id}`, undefined, cookie),
+    traffic: (id: ID, days = 14, cookie?: string) =>
+      get<TrafficPoint[]>(`/forwards/${id}/traffic`, { days }, cookie),
+    create: (input: ForwardCreateInput, cookie?: string) =>
+      post<PortForward>("/forwards", input, cookie),
+    update: (id: ID, input: ForwardPatchInput, cookie?: string) =>
+      patch<PortForward>(`/forwards/${id}`, input, cookie),
+    action: (
+      id: ID,
+      action: "retry" | "suspend" | "resume",
+      cookie?: string,
+    ) => post<PortForward>(`/forwards/${id}/${action}`, {}, cookie),
+    remove: (id: ID, cookie?: string) =>
+      del<{ ok: true }>(`/forwards/${id}`, cookie),
   },
   nodes: {
     list: (cookie?: string) => get<UserNode[]>("/nodes", undefined, cookie),
