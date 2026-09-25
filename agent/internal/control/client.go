@@ -126,7 +126,18 @@ func (c *Client) execute(cmd *QueuedCommand) ackPayload {
 		}
 		cfg := cmd.Config.Clone()
 		if cfg.Revision == 0 { cfg.Revision = cmd.Envelope.Revision }
+
+		// EGRESS forwarders depend on a target selector at construction time.
+		// Online commands must therefore install/update the target pool before
+		// TunnelManager.Apply, exactly like startup restore does. Otherwise the
+		// manager cannot build the EGRESS forwarder and returns ErrPoolNotFound.
+		rollbackPool, err := c.prepareEgressPool(cfg)
+		if err != nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", err.Error()
+			return ack
+		}
 		if _, err := c.tunnels.Apply(cfg); err != nil {
+			rollbackPool()
 			if errors.Is(err, manager.ErrStaleRevision) { ack.ErrorCode = "stale_revision" } else { ack.ErrorCode = "apply_failed" }
 			ack.Error = err.Error()
 			return ack
@@ -139,6 +150,12 @@ func (c *Client) execute(cmd *QueuedCommand) ackPayload {
 			ack.ErrorCode, ack.Error = "remove_failed", err.Error()
 			return ack
 		}
+		// Harmless for DIRECT/RELAY ids, required for EGRESS ids. Keeping the
+		// pool after the listener is gone would make state reports claim a
+		// runtime resource that no longer exists.
+		if c.egress != nil {
+			c.egress.DropPool(cmd.Envelope.ResourceID)
+		}
 		ack.OK = true
 		rev := cmd.Envelope.Revision
 		ack.AppliedRevision = &rev
@@ -147,6 +164,46 @@ func (c *Client) execute(cmd *QueuedCommand) ackPayload {
 		ack.Error = "unsupported action: " + cmd.Envelope.Action
 	}
 	return ack
+}
+
+// prepareEgressPool stages the desired target pool before an EGRESS listener
+// is built. It returns a rollback closure so a failed listener apply does not
+// leave the pool half-applied.
+//
+// Existing pools are updated in place: live EGRESS forwarders hold a pointer to
+// the Pool, so replacing the map entry would break hot-update semantics.
+func (c *Client) prepareEgressPool(cfg forwarder.TunnelConfig) (func(), error) {
+	if cfg.Mode != forwarder.ModeEgress {
+		return func() {}, nil
+	}
+	if c.egress == nil {
+		return func() {}, errors.New("control: egress manager is required for EGRESS tunnel")
+	}
+	strategy, ok := manager.ParseStrategy(string(cfg.LBStrategy))
+	if !ok {
+		return func() {}, fmt.Errorf("control: invalid egress lb strategy %q", cfg.LBStrategy)
+	}
+
+	oldTargets, existed := c.egress.Targets(cfg.ID)
+	oldStrategy := manager.RoundRobin
+	if existed {
+		if snap, ok := c.egress.Snapshot()[cfg.ID]; ok {
+			if parsed, ok := manager.ParseStrategy(snap.Strategy); ok {
+				oldStrategy = parsed
+			}
+		}
+		if err := c.egress.UpdateTargets(cfg.ID, strategy, cfg.Targets); err != nil {
+			return func() {}, err
+		}
+		return func() {
+			if len(oldTargets) > 0 {
+				_ = c.egress.UpdateTargets(cfg.ID, oldStrategy, oldTargets)
+			}
+		}, nil
+	}
+
+	c.egress.SetPool(cfg.ID, strategy, cfg.Targets)
+	return func() { c.egress.DropPool(cfg.ID) }, nil
 }
 
 func (c *Client) ack(ctx context.Context, ack ackPayload) error {
