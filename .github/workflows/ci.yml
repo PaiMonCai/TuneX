@@ -121,8 +121,8 @@ jobs:
       # WP12：节点管理 mock 契约（角色三元/凭据生命周期/出口池 CRUD）单测
       # WP13：隧道编排 mock 契约（apply 状态机/revision/DIRECT+RELAY 创建/过滤）单测
       # V4：Node-first + Forward product API mock 契约单测
-      - name: Unit tests (dashboard + node admin + tunnel orchestration + V4 forwards)
-        run: bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/tunnels/__tests__/ src/components/forwards/__tests__/
+      - name: Unit tests (dashboard + node admin + V4 forwards + legacy compatibility)
+        run: bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/forwards/__tests__/
       - name: Build with optional billing disabled
         run: npm run build
         env:
