@@ -37,7 +37,14 @@ TUNNEL_SPECS = {t["key"]: t for t in TUNNEL_FIX["tunnels"]}
 
 def req(method, path, body=None, cookie=None, headers=None, timeout=30):
     data = json.dumps(body).encode() if body is not None else None
-    h = {"content-type": "application/json"}
+    # Browser-equivalent CSRF headers. The harness uses the public HTTP API,
+    # so mutating bootstrap requests must satisfy the same Origin/custom-header
+    # checks as the real Web client instead of bypassing CSRF middleware.
+    h = {
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "origin": API,
+    }
     if cookie:
         h["cookie"] = cookie
     if headers:
