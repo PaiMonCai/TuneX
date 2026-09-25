@@ -30,6 +30,9 @@ import type {
   TopupOrder,
   TrafficPoint,
   Tunnel,
+  TunnelEgressPoolOption,
+  TunnelMode,
+  TunnelRuntimeAction,
   User,
   UserPlan,
   Workspace,
@@ -743,6 +746,109 @@ function nextTargetId(targets: EgressTarget[]): ID {
   return targets.reduce((m, x) => Math.max(m, x.id), 0) + 1;
 }
 
+/* ------------------------------------------------------------------ *
+ * WP11 / WP13 隧道 v3 编排运行态（mock）
+ *
+ * 镜像**冻结的 WP11 契约**（后端 feature/v3-wp11-tunnel-api 未合入 main）：
+ *   - `apply_status` 状态机 pending/applying/active/error/suspended
+ *     （DEVELOPMENT.md §4.1，schema 注释同口径）；
+ *   - retry / suspend / resume 三个运行操作统一走「编排器」语义：
+ *       retry     —— error/suspended → pending（revision 保持，不抬高）
+ *       suspend   —— active → suspended（通知两端，Tunnel 保留）
+ *       resume    —— suspended → pending →（编排完成）active
+ *   - **绝不发明字段**：返回体就是 TunnelRuntimeAction + Tunnel 增量列。
+ *
+ * mock 的「Agent」是同步假ACK：resume/retry 半秒内把状态推到 active，
+ * 这样 UI 的重试→轮询闭环可跑通。真实后端走 async orchestrator，
+ * 前端轮询 `GET /tunnels/:id` 直到终态，UI 逻辑两侧一致。
+ * ------------------------------------------------------------------ */
+
+const APPLY_STATUSES = ["pending", "applying", "active", "error", "suspended"] as const;
+const TUNNEL_MODES = ["direct", "relay"] as const;
+
+function applyStatusOf(t: Tunnel): Tunnel["apply_status"] {
+  return t.apply_status ?? null;
+}
+
+/** v3 增量列是否存在（存量 mock 行没有这些键 = legacy DIRECT） */
+function hasV3Columns(t: Tunnel): boolean {
+  return t.tunnel_mode !== undefined && t.apply_status !== undefined;
+}
+
+/** 把一条 relay 隧道推进到「编排完成」（mock 的假 Agent ACK） */
+function completeOrchestration(t: Tunnel): void {
+  t.apply_status = "active";
+  t.desired_status = "active";
+  t.applied_revision = t.config_revision ?? null;
+  t.apply_error = null;
+  t.apply_error_code = null;
+  t.last_applied_at = nowIso();
+  t.updated_at = nowIso();
+}
+
+/** 池 id → 挂它的 node id（RELAY 编排器按池反查出口节点） */
+function poolOfNode(db: Store, poolId: ID): ID | null {
+  for (const [, pools] of db.egressPools) {
+    const hit = pools.find((p) => p.id === poolId);
+    if (hit) return hit.node_id;
+  }
+  return null;
+}
+
+/** 池 id → 展示用引用（Tunnel.egress_pool） */
+function poolRef(db: Store, poolId: ID | null): Tunnel["egress_pool"] {
+  if (poolId === null) return null;
+  for (const [, pools] of db.egressPools) {
+    const hit = pools.find((p) => p.id === poolId);
+    if (hit) return { id: hit.id, name: hit.name, lb_strategy: hit.lb_strategy ?? null, status: hit.status };
+  }
+  return null;
+}
+
+/** 运行操作网关：校验来源状态 → 推进 → 返回 TunnelRuntimeAction */
+function tunnelRuntimeAction(
+  db: Store,
+  t: Tunnel,
+  action: "retry" | "suspend" | "resume",
+): MockResponse {
+  const current = applyStatusOf(t);
+  if (action === "retry") {
+    if (current !== "error" && current !== "suspended") {
+      return badRequest(`当前状态 ${current ?? "legacy"} 不允许重试（仅 error / suspended 可重试）`, "INVALID_STATE");
+    }
+    if (!hasV3Columns(t)) return badRequest("该隧道未参与 v3 编排（legacy DIRECT），无编排可重放", "NOT_V3");
+    t.apply_status = "pending";
+    // retry 重放相同 desired revision：mock 里同步完成后 revision 不变，
+    // 与 WP8 的 dispatchIngress 相同 revision 语义一致（不抬高）。
+    completeOrchestration(t);
+    return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision ?? null, reentered: true } satisfies TunnelRuntimeAction);
+  }
+  if (action === "suspend") {
+    if (current !== "active") {
+      return badRequest(`当前状态 ${current ?? "legacy"} 不允许暂停（仅 active 可暂停）`, "INVALID_STATE");
+    }
+    t.desired_status = "inactive";
+    t.apply_status = "suspended";
+    t.status = "inactive";
+    t.online = false;
+    t.client_count = 0;
+    t.updated_at = nowIso();
+    return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision ?? null } satisfies TunnelRuntimeAction);
+  }
+  // resume
+  if (current !== "suspended") {
+    return badRequest(`当前状态 ${current ?? "legacy"} 不允许恢复（仅 suspended 可恢复）`, "INVALID_STATE");
+  }
+  t.desired_status = "active";
+  t.apply_status = "pending";
+  t.status = "active";
+  // resume 重新走编排：revision +1（与 WP8「revision 必须继续前进」一致）
+  t.config_revision = (t.config_revision ?? 0) + 1;
+  completeOrchestration(t);
+  t.online = true;
+  return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision } satisfies TunnelRuntimeAction);
+}
+
 // ---------------------------------------------------------------- 路由
 
 export async function handleMock(method: string, path: string, req: MockRequest): Promise<MockResponse> {
@@ -1180,7 +1286,25 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     const sub = seg[2];
 
     if (method === "GET" && seg[1] === undefined) {
-      const mine = db.tunnels.filter((t) => t.user_id === user.id);
+      // WP13：v3 过滤维度（apply_status / tunnel_mode / pending_only）叠加在
+      // legacy 过滤之上；未知值一律忽略而不是返回空集（防 UI 传错值静默全空）。
+      const applyFilter = reqStr(q?.apply_status);
+      const modeFilter = reqStr(q?.tunnel_mode);
+      const pendingOnly = q?.pending_only === true || q?.pending_only === "true" || q?.pending_only === "1";
+      let mine = db.tunnels.filter((t) => t.user_id === user.id);
+      if (APPLY_STATUSES.includes(applyFilter as (typeof APPLY_STATUSES)[number])) {
+        mine = mine.filter((t) => applyStatusOf(t) === applyFilter);
+      }
+      if (TUNNEL_MODES.includes(modeFilter as (typeof TUNNEL_MODES)[number])) {
+        mine = mine.filter((t) => t.tunnel_mode === modeFilter);
+      }
+      if (pendingOnly) {
+        mine = mine.filter((t) => {
+          const desired = t.config_revision ?? null;
+          const applied = t.applied_revision ?? null;
+          return desired !== null && applied !== null && applied < desired;
+        });
+      }
       return ok(paginate(filterByStatus(filterByKeyword(mine, q, ["name"]), q), q));
     }
 
@@ -1202,15 +1326,38 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         return badRequest("监听端口已被占用", "PORT_CONFLICT");
       }
 
-      const forward = Array.isArray(body.forward_addresses)
-        ? body.forward_addresses.map((s) => reqStr(s)).filter(Boolean)
-        : parseList(body.forward_addresses) ?? [];
-      if (forward.length === 0) return badRequest("至少需要一个转发目标");
-      const badAddr = forward.find((a) => !/^(\[[0-9a-fA-F:]+\]|[^:\s]+):\d{1,5}$/.test(a));
-      if (badAddr) return badRequest(`转发目标格式应为 host:port（${badAddr}）`);
+      // WP13：DIRECT / RELAY mode + 出口池选择。缺省 tunnel_mode 时：
+      //   · 有 out_node_group_id 或 egress_pool_id → relay
+      //   · 否则 legacy direct（存量路径不变）
+      const rawMode = reqStr(body.tunnel_mode);
+      const poolId = numOrNull(body.egress_pool_id);
+      const outIdParsed = numOrNull(body.out_node_group_id);
+      const mode: Tunnel["tunnel_mode"] =
+        rawMode === "relay" || rawMode === "direct"
+          ? (rawMode as TunnelMode)
+          : poolId !== null || outIdParsed !== null
+            ? "relay"
+            : "direct";
+      const relay = mode === "relay";
 
       const tunnelType = (reqStr(body.tunnel_type) || "tcp") as Tunnel["tunnel_type"];
       const newId = nextId(db.tunnels);
+
+      // forward 目标只在 DIRECT 下必填；RELAY 的目标在 EgressTarget 上（池内），
+      // 因此 RELAY 允许 forward_addresses 为空数组（与 backend WP11 契约一致）。
+      const forward = Array.isArray(body.forward_addresses)
+        ? body.forward_addresses.map((s) => reqStr(s)).filter(Boolean)
+        : parseList(body.forward_addresses) ?? [];
+      if (!relay && forward.length === 0) return badRequest("至少需要一个转发目标");
+      const badAddr = forward.find((a) => !/^(\[[0-9a-fA-F:]+\]|[^:\s]+):\d{1,5}$/.test(a));
+      if (badAddr) return badRequest(`转发目标格式应为 host:port（${badAddr}）`);
+      const remoteHost = reqStr(body.remote_host) || null;
+      const remotePort = numOrNull(body.remote_port);
+      // 直连目标可写在 forward_addresses（存量契约）或 remote_host/remote_port
+      // （v3 列）；后者缺失时从 forward[0] 拆一份，保证 DIRECT 详情可展示。
+      const derivedFromForward = forward[0]?.match(/^(?:\[([^\]]+)\]|([^:\s]+)):(\d{1,5})$/) ?? null;
+      const finalRemoteHost = remoteHost ?? (derivedFromForward ? (derivedFromForward[1] ?? derivedFromForward[2]) : null);
+      const finalRemotePort = remotePort ?? (derivedFromForward ? Number(derivedFromForward[3]) : null);
       const created: Tunnel = {
         id: newId,
         name: nameR.value,
@@ -1241,6 +1388,24 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         updated_at: nowIso(),
         online: true,
         client_count: 0,
+        // ── v3 增量列（WP13）：新行总是显式声明模式，不留给「未声明」──
+        tunnel_mode: mode,
+        remote_host: relay ? null : finalRemoteHost,
+        remote_port: relay ? null : finalRemotePort,
+        desired_status: "active",
+        // 真实链路（§4.1）：persist_desired → pending → applying → active。
+        // mock 创建后停在 pending（不做假 ACK），与后端的「期望状态已落库、
+        // 尚未下发」一致；编排推进由后续运行操作/重算驱动。
+        apply_status: "pending",
+        config_revision: 1,
+        applied_revision: 0,
+        apply_error_code: null,
+        apply_error: null,
+        last_applied_at: null,
+        egress_node_id: relay ? (poolId !== null ? poolOfNode(db, poolId) : null) : null,
+        egress_port: relay ? 30000 + newId : null,
+        egress_pool_id: relay ? poolId : null,
+        egress_pool: relay ? poolRef(db, poolId) : null,
       };
       db.tunnels.push(created);
       return ok(created);
@@ -1322,6 +1487,44 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           if (body[key] !== undefined) t[key] = numOrNull(body[key]);
         }
         if (body.proxy_protocol !== undefined) t.proxy_protocol = Boolean(body.proxy_protocol);
+        // WP13 v3 列：只写 desired state；revision 自增/编排重入归 WP11 orchestrator
+        if (body.tunnel_mode !== undefined) {
+          const m = reqStr(body.tunnel_mode);
+          if (m !== "direct" && m !== "relay") return badRequest("tunnel_mode 只能是 direct / relay");
+          t.tunnel_mode = m;
+        }
+        if (body.out_node_group_id !== undefined) {
+          const oid = numOrNull(body.out_node_group_id);
+          if (oid !== null && !db.nodeGroups.some((g) => g.id === oid)) return notFound("出口节点组不存在");
+          t.out_node_group_id = oid;
+          t.out_node_group = oid ? groupRef(db, oid) ?? null : null;
+        }
+        if (body.egress_pool_id !== undefined) {
+          const pid = numOrNull(body.egress_pool_id);
+          t.egress_pool_id = pid;
+          t.egress_pool = poolRef(db, pid);
+          if (pid !== null) t.egress_node_id = poolOfNode(db, pid);
+        }
+        if (body.egress_node_id !== undefined) {
+          t.egress_node_id = numOrNull(body.egress_node_id);
+        }
+        if (body.remote_host !== undefined) t.remote_host = reqStr(body.remote_host) || null;
+        if (body.remote_port !== undefined) t.remote_port = numOrNull(body.remote_port);
+        if (body.desired_status !== undefined) {
+          const ds = reqStr(body.desired_status);
+          if (ds !== "active" && ds !== "inactive") return badRequest("desired_status 只能是 active / inactive");
+          t.desired_status = ds;
+          // resume 语义：期望重新启用 → 重新入编排（revision 前进）
+          if (ds === "active" && applyStatusOf(t) === "suspended") {
+            t.config_revision = (t.config_revision ?? 0) + 1;
+            t.apply_status = "pending";
+            completeOrchestration(t);
+          }
+        }
+        // 任何 desired/配置变更都让隧道「待下发」：applied < config
+        if (t.config_revision !== undefined && t.config_revision !== null) {
+          t.config_revision = t.config_revision + 1;
+        }
         t.updated_at = nowIso();
         return ok(t);
       }
@@ -1335,6 +1538,10 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         if (!t.online) t.client_count = 0;
         t.updated_at = nowIso();
         return ok(t);
+      }
+      // WP11 运行操作：retry / suspend / resume（统一走编排器语义）
+      if (method === "POST" && (sub === "retry" || sub === "suspend" || sub === "resume")) {
+        return tunnelRuntimeAction(db, t, sub);
       }
       if (method === "POST" && sub === "reset-traffic") {
         t.traffic = 0;
@@ -1350,6 +1557,40 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   if (seg[0] === "node-groups" && method === "GET") {
     const items = filterByStatus(db.nodeGroups, q).map((g) => withGroupStats(db, g));
     return ok(paginate(items, q));
+  }
+
+  // ---------- WP11 / WP13：用户侧可用出口池（创建 RELAY 隧道时选池） ----------
+  // admin 侧 WP10 的 /admin/node/pools 是管理端全量视图（需要 admin 权限）；
+  // 用户侧只暴露「有出口能力节点上的 active 池」，且只读池内目标摘要，
+  // 不下发 node 主键之外的管理字段（不发明字段：字段名与 EgressPool/EgressTarget 对齐）。
+  if (seg[0] === "egress-pools" && method === "GET") {
+    const options: TunnelEgressPoolOption[] = [];
+    for (const [nodeId, pools] of db.egressPools) {
+      const node = db.nodes.find((n) => n.id === nodeId);
+      if (!node) continue;
+      // 出口能力：role=egress|both（ingress 节点不配池，§2.2 硬规则）
+      if (node.role !== "egress" && node.role !== "both") continue;
+      for (const p of pools) {
+        if (p.status !== "active") continue;
+        options.push({
+          id: p.id,
+          name: p.name,
+          node_id: nodeId,
+          node_label: `${node.node_id} (${node.connect_ip})`,
+          lb_strategy: p.lb_strategy ?? null,
+          status: p.status,
+          targets: (db.egressTargets.get(p.id) ?? [])
+            .filter((t) => t.status === "active")
+            .map((t) => ({ host: t.host, port: t.port, weight: t.weight, status: t.status })),
+        });
+      }
+    }
+    const sorted = options.sort((a, b) => a.node_id - b.node_id || a.id - b.id);
+    if (q?.pool_id !== undefined) {
+      const want = Number(q.pool_id);
+      return ok(sorted.filter((p) => p.id === want));
+    }
+    return ok(sorted);
   }
 
   // ---------- plans ----------

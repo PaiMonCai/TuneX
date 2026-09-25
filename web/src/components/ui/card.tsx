@@ -37,13 +37,17 @@ export function Badge({
   className,
   variant = "default",
   ...props
-}: React.HTMLAttributes<HTMLSpanElement> & { variant?: "default" | "success" | "destructive" | "outline" | "muted" }) {
+}: React.HTMLAttributes<HTMLSpanElement> & {
+  variant?: "default" | "success" | "destructive" | "outline" | "muted" | "secondary";
+}) {
   const variants: Record<string, string> = {
     default: "bg-[var(--primary)] text-[var(--primary-foreground)]",
     success: "bg-[var(--success)] text-white",
     destructive: "bg-[var(--destructive)] text-[var(--destructive-foreground)]",
     outline: "border border-[var(--border)] text-[var(--foreground)]",
     muted: "bg-[var(--muted)] text-[var(--muted-foreground)]",
+    // WP13：进行中的编排（applying 等）——中性强调，区别于 success/destructive
+    secondary: "border border-[var(--primary)] text-[var(--primary)]",
   };
   return (
     <span
