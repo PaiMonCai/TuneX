@@ -88,13 +88,16 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 	// Run's ErrNoPanilURL path is handled by the goroutine below.
 	if cfg.PanelHTTPURL != "" {
 		rt.heart = reporter.New(reporter.Config{
-			PanelURL: cfg.PanelHTTPURL,
-			NodeID:   cfg.NodeID,
-			Version:  version,
-			Role:     role,
+			PanelURL:   cfg.PanelHTTPURL,
+			NodeID:     cfg.NodeID,
+			Version:    version,
+			Role:       role,
+			Credential: cfg.NodeCredential,
 		},
 			reporter.WithTunnels(tunnels),
 			reporter.WithEgress(egressAdapter{egress}),
+			reporter.WithPorts(tunnels),
+			reporter.WithRevision(tunnels),
 		)
 		go func() {
 			if err := rt.heart.Run(ctx); err != nil {
