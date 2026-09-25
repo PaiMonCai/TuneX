@@ -14,6 +14,61 @@ enum NodeType {
   out
 }
 
+/// v3 节点角色（WP1，DEVELOPMENT.md §2.1）：节点能力的最终真相源。
+///
+/// legacy `NodeGroup.node_type` 只作兼容显示，v3 新逻辑不得把它当作方向判定的
+/// 最终依据；同一节点组内完全可以混挂 ingress / egress / both 三种 Node。
+enum NodeRole {
+  /// 入口：可单独以 DIRECT 模式服务，也可作为 RELAY 的入口侧
+  ingress
+  /// 出口：不能单独服务，必须由入口节点把流量转入；目标由 EgressPool 维护
+  egress
+  /// 兼任入口与出口（单机测试 / 开发环境）
+  both
+}
+
+/// v3 隧道模式（DEVELOPMENT.md §2.1）。
+enum TunnelMode {
+  /// 单跳：客户端 → 入口节点 → 目标（目标落在 tunnel.remote_host/remote_port）
+  direct
+  /// 双跳：客户端 → 入口节点 → 出口节点 → EgressPool 目标池
+  relay
+}
+
+/// v3 第一版出口目标负载均衡策略（DEVELOPMENT.md §2.2）。
+///
+/// 与 legacy `LoadBalanceType`（round/rand/fifo/hash/ll/lc）是**两套列**：
+/// 旧列继续服务现有 DIRECT 配置下发，本枚举只描述 v3 EgressPool，
+/// 因此不存在枚举膨胀或旧值被 reinterpret 的风险。
+enum LBStrategy {
+  round
+  rand
+}
+
+/// 端口租约方向（DEVELOPMENT.md §5.1）。
+///
+/// 方向只是租约元数据：物理唯一性由 `UNIQUE(node_id, port)` 保证，
+/// 与方向无关——否则 BOTH 节点会用同一端口双绑 ingress/egress。
+enum LeaseType {
+  ingress
+  egress
+}
+
+/// v3 隧道 apply 状态机（DEVELOPMENT.md §4.1）—— **有意不加 Prisma 枚举**。
+///
+/// 状态值由 `Tunnel.apply_status`（VARCHAR(20)）承载，原因见该列注释：
+/// DB 列先落地，枚举随 WP8 编排器一起收敛，避免现在加枚举、
+/// WP8 又要 `ALTER` 改它。此处只把状态语义钉在文档里，作为 WP8 的契约：
+///
+///   pending    —— 已生成期望状态（desired_status + config_revision），尚未下发
+///   applying   —— 已下发，等待 Agent ACK
+///   active     —— RELAY 两端（先 egress 后 ingress）均 ACK 同一 revision
+///   error      —— 任一步失败：保留记录，原因见 apply_error_code / apply_error
+///   suspended  —— 节点失效 / 管理员暂停后的可解释状态（不物理删除隧道数据）
+///
+/// Tunnel 是**期望状态**，不是一次 HTTP 操作：失败必须保留记录 +
+/// 结构化错误，前端展示原因并允许 Retry，禁止物理删除。
+
 enum Status {
   active
   inactive
@@ -335,6 +390,30 @@ model Node {
   node_group_id Int
   node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
 
+  // ── v3 增量字段（WP1，全部可空 → expand-and-contract，见迁移 20260926040000）──
+  //
+  // role 可空的理由：存量行的真实角色无从推断（一个节点组里既跑入口又跑出口的
+  // 混挂很常见），WP2 的确定性回填策略是「不改 / 不猜」，由管理员在面板显式
+  // 设置。因此 v3 代码必须把 `role === null` 当作「尚未声明角色」处理，而不是
+  // 默认成 ingress——默认值会让未声明的节点被误当入口参与调度。
+  role          NodeRole?
+  /// 最近一次心跳时间。NULL = 从未心跳。用于面板展示与离线判定，不替代
+  /// offline-detector 的 Redis 防抖（那层才负责翻转 node.status）。
+  last_seen_at  DateTime?
+  /// 可分配端口区间（v3 NodePortLease 的分配域）。NULL = 未配置，
+  /// 分配服务必须拒绝在未配置区间上分配，而不是回落到节点组 port_range
+  /// ——后者是给 legacy DIRECT 整组下发用的，不是 per-node 所有权。
+  port_range_min Int?
+  port_range_max Int?
+  /// egress/both 节点上 EgressPool 的默认负载均衡策略；NULL = 使用分配策略时的
+  /// 缺省值（round）。池内策略优先于本字段。
+  lb_strategy   LBStrategy?
+
+  egress_pools   EgressPool[]
+  port_leases    NodePortLease[]
+  egress_tunnels Tunnel[]      @relation("egress_node")
+
+  @@index([role])
   @@map("node")
 }
 
@@ -398,15 +477,59 @@ model Tunnel {
   out_node_group_id          Int?
   out_node_group             NodeGroup?      @relation("out_node_group", fields: [out_node_group_id], references: [id])
   user_id                    Int
-  user                       User            @relation(fields: [user_id], references: [id])
+  user                       User           @relation(fields: [user_id], references: [id])
   workspace_id               Int
-  workspace                  Workspace       @relation(fields: [workspace_id], references: [id])
+  workspace                  Workspace      @relation(fields: [workspace_id], references: [id])
 
   tunnel_traffic TunnelTraffic[]
   tunnel_chains  TunnelChain[]
 
+  // ── v3 增量字段（WP1，expand-and-contract：全部可空，见迁移 20260926040000）──
+  //
+  // tunnel_mode 可空，但**迁移会把所有存量行回填成 `direct`**（不存在存量
+  // RELAY，见迁移注释），因此「NULL」在存量库里只是瞬态，新行由控制面显式写入。
+  // 可空而非 NOT NULL DEFAULT 'direct' 的理由：让「未迁移到 v3 语义」这件事在
+  // 类型层面可区分——读代码的人看到 `tunnel_mode === null` 就知道该行不是
+  // 被 v3 显式声明过的，而不是要靠「值恰好等于默认值」去猜。
+  tunnel_mode TunnelMode?
+  /// RELAY 实际出口节点；DIRECT 为 NULL（DEVELOPMENT.md §2.1）。
+  /// 只保存 Node 而不只存 out_node_group：否则组内多 Agent 重启时无法判断
+  /// 隧道真正属于谁。
+  egress_node_id Int?
+  egress_node    Node?      @relation("egress_node", fields: [egress_node_id], references: [id], onDelete: SetNull)
+  /// RELAY 出口侧内部通信端口（节点间端口，**不是**用户可见端口）。
+  /// 用户可见端口仍是 legacy `listen_port`。
+  egress_port    Int?
+  /// RELAY 指向的出口目标池
+  egress_pool_id Int?
+  egress_pool   EgressPool? @relation("egress_pool", fields: [egress_pool_id], references: [id], onDelete: SetNull)
+  /// DIRECT 模式目标（由存量 forward_addresses[0] 幂等回填，见迁移）。
+  /// RELAY 不使用本列（目标在 EgressTarget 上）。
+  remote_host    String?    @db.VarChar(255)
+  remote_port    Int?
+  /// 期望状态：控制面想让隧道处于什么状态
+  desired_status String?    @db.VarChar(20)
+  /// 实际 apply 状态机（pending/applying/active/error/suspended）。
+  /// 字符串而非枚举：DB 列先落地，枚举随 WP8 编排器一起收敛，避免现在加枚举
+  /// 后 WP8 又要 ALTER 改它。
+  apply_status   String?    @db.VarChar(20)
+  /// 控制面期望版本；每次 desired/配置变更自增
+  config_revision Int?
+  /// 最近被 Agent ACK 确认的版本；`applied_revision < config_revision` = 待下发
+  applied_revision Int?
+  /// 结构化错误码 + 原文；失败时保留 Tunnel，前端展示原因并允许 Retry
+  apply_error_code String?  @db.VarChar(64)
+  apply_error      String?   @db.VarChar(500)
+  last_applied_at  DateTime?
+
+  port_leases NodePortLease[]
+
   @@unique([listen_port, in_node_group_id])
   @@index([workspace_id])
+  @@index([tunnel_mode])
+  @@index([egress_node_id])
+  @@index([egress_pool_id])
+  @@index([apply_status])
   @@map("tunnel")
 }
 
@@ -419,6 +542,102 @@ model TunnelChain {
   node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
 
   @@map("tunnel_chain")
+}
+
+/// v3 出口目标池（WP1，DEVELOPMENT.md §2.2）。
+///
+/// 层级：`Node (role=egress|both) → EgressPool → EgressTarget[]`。
+/// 每个出口节点自动拥有一个 `default` 池（初期 UI 可完全隐藏 Pool 概念），
+/// RELAY 隧道通过 `tunnel.egress_pool_id` 指向池。
+///
+/// 关键语义：**目标修改只更新目标快照，不重建监听、也不重建隧道**。因此本表
+/// 不带任何 revision 字段——版本由 `Tunnel.config_revision` 驱动，池的变更
+/// 触发指向它的隧道升 revision，而不是自己计数。
+///
+/// workspace 归属：池归节点所属 workspace（Node → node_group → workspace），
+/// 不冗余 workspace_id 列。跨租户校验沿 `pool.node.node_group.workspace_id`
+/// 单向上查，避免两份可能漂移的归属真相。
+model EgressPool {
+  id      Int     @id @default(autoincrement())
+  node_id Int
+  node    Node    @relation(fields: [node_id], references: [id], onDelete: Cascade)
+  /// 每节点内唯一（含自动创建的 `default`）
+  name    String  @db.VarChar(120)
+  /// 池内目标选择策略；NULL = 回落到 node.lb_strategy
+  lb_strategy LBStrategy?
+  /// inactive = 停用整池：指向它的 RELAY 隧道应进入可解释的 error/suspended，
+  /// 而不是继续下发空目标快照
+  status Status @default(active)
+  /// 池内至少保留一个 active 且 weight>0 的目标，否则拒绝应用新目标快照
+  /// （DEVELOPMENT.md §2.2 硬规则）。该不变式由分配/应用服务保证，不在 DB 层。
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  targets EgressTarget[]
+  tunnels Tunnel[]     @relation("egress_pool")
+
+  @@unique([node_id, name])
+  @@index([node_id, status])
+  @@map("egress_pool")
+}
+
+/// v3 出口目标（EgressPool 成员）。
+///
+/// 与原版 `tunnel.forward_addresses`（JSON，落在隧道上）的关系：DIRECT 继续用
+/// 旧列，RELAY 用本表。两条路径并存是 expand-and-contract 的必然，不是重复设计。
+model EgressTarget {
+  id      Int        @id @default(autoincrement())
+  pool_id Int
+  pool    EgressPool @relation(fields: [pool_id], references: [id], onDelete: Cascade)
+  /// 目标地址（IP 或域名）。不存 host:port 组合串：端口另有独立列，
+  /// 组合串会让「按端口查询/校验退化为字符串解析」。
+  host   String @db.VarChar(255)
+  port   Int
+  /// 权重；加权策略下生效。创建后必须存在至少一个 weight>0 的目标。
+  weight Int    @default(1)
+  /// 排序/轮询次序（同原版 order_by 语义）
+  order_by Float @default(1000)
+  remark String? @db.VarChar(255)
+  status Status @default(active)
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([pool_id, status])
+  @@map("egress_target")
+}
+
+/// v3 端口租约（WP1，DEVELOPMENT.md §5.1）。
+///
+/// **`UNIQUE(node_id, port)` 是端口所有权的最终一致性真相源**；Redis NX 只做
+/// 快速并发抢占/短事务协调，不做长期真相。方向（lease_type）只是元数据，
+/// 以免 BOTH 节点用同一端口同时双绑 ingress/egress。
+///
+/// 不设外键到 tunnel：租约必须先于隧道可撤销存在（预分配、补偿释放），
+/// 且隧道被删时租约应先释放而非级联——级联会让「释放」这件事静默发生，
+/// 无法在审计里区分「主动释放」与「随隧道消失」。
+model NodePortLease {
+  id      Int  @id @default(autoincrement())
+  node_id Int
+  node    Node @relation(fields: [node_id], references: [id], onDelete: Cascade)
+  /// 占用方隧道；NULL = 预分配/孤儿租约（可通过 reconcile 回收）。
+  /// 无外键约束（见 model 注释）：隧道删除时租约应由编排器显式释放。
+  tunnel_id  Int?
+  tunnel    Tunnel? @relation(fields: [tunnel_id], references: [id], onDelete: SetNull)
+  /// 端口号；与 node_id 共同构成物理唯一性
+  port       Int
+  lease_type LeaseType
+  /// active = 占用中；released = 已释放（保留行供对账，不物理删除）
+  status     String  @db.VarChar(20)
+  /// 租约过期时间；NULL = 不自动过期。过期后由 reconciler 回收而非即时释放，
+  /// 避免控制面与 Agent 之间的瞬时不一致误杀活跃连接。
+  expires_at DateTime?
+  created_at DateTime  @default(now())
+
+  @@unique([node_id, port])
+  @@index([tunnel_id])
+  @@index([node_id, status])
+  @@map("node_port_lease")
 }
 
 model User {

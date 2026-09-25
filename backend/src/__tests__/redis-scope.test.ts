@@ -52,6 +52,11 @@ const {
   observerBufferKey,
   aliveGroupsKey,
   registerBlockKey,
+  nodeRegisterBlockKey,
+  nodeScope,
+  portLeaseLockKey,
+  portLeaseLockPattern,
+  parsePortLeaseLockKey,
   heartbeatKey,
   heartbeatPattern,
   parseHeartbeatKey,
@@ -369,5 +374,92 @@ describe("隧道归属判定", () => {
     expect(tunnelBelongsToWorkspace({ workspace_id: 10 }, 10)).toBe(true);
     expect(tunnelBelongsToWorkspace({ workspace_id: 20 }, 10)).toBe(false);
     expect(tunnelBelongsToWorkspace({ workspace_id: null }, 10)).toBe(false);
+  });
+});
+
+/* ================================================================== */
+/* v3（WP1）节点侧资源作用域                                           */
+/* ================================================================== */
+
+describe("WP1：nodeScope —— 节点侧资源归属派生", () => {
+  test("归属沿 Node → node_group 单向上查", () => {
+    expect(nodeScope({ node_group: { workspace_id: 10 } })).toBe(10);
+    expect(nodeScope({ node_group: { workspace_id: 10, is_shared: true } })).toBe(GLOBAL_SCOPE);
+  });
+
+  test("无 node_group（未 include）/ 孤儿组 → GLOBAL_SCOPE（fail-closed）", () => {
+    expect(nodeScope({})).toBe(GLOBAL_SCOPE);
+    expect(nodeScope({ node_group: null })).toBe(GLOBAL_SCOPE);
+    expect(nodeScope({ node_group: { workspace_id: null } })).toBe(GLOBAL_SCOPE);
+  });
+
+  test("同 ID 节点在不同租户下派生出的租约锁不同", () => {
+    // 否则两个租户的同 ID 节点会在同一个物理端口上互抢
+    expect(portLeaseLockKey(1, "n1", 20000)).not.toBe(portLeaseLockKey(2, "n1", 20000));
+    expect(portLeaseLockKey(0, "n1", 20000)).not.toBe(portLeaseLockKey(1, "n1", 20000));
+  });
+
+  test("key / pattern / parse 三段同源", () => {
+    expect(portLeaseLockKey(42, "Node-A", 20000)).toBe("ws:42:node_port_lease:lock:Node-A:20000");
+    expect(portLeaseLockKey(0, "Node-A", 20000)).toBe(
+      `ws:${GLOBAL_SCOPE_TAG}:node_port_lease:lock:Node-A:20000`,
+    );
+    expect(portLeaseLockPattern()).toBe("ws:*:node_port_lease:lock:*:*");
+    expect(portLeaseLockPattern(42)).toBe("ws:42:node_port_lease:lock:*:*");
+    expect(parsePortLeaseLockKey("ws:42:node_port_lease:lock:Node-A:20000")).toEqual({
+      scope: 42,
+      nodeId: "Node-A",
+      port: 20000,
+    });
+  });
+
+  test("node_id 含冒号仍能正确还原（末段才是端口）", () => {
+    const key = portLeaseLockKey(7, "a:b", 30000);
+    expect(parsePortLeaseLockKey(key)).toEqual({ scope: 7, nodeId: "a:b", port: 30000 });
+  });
+
+  test("拒绝异形 key", () => {
+    expect(parsePortLeaseLockKey("ws:1:tunnel:traffic:9")).toBeNull();
+    expect(parsePortLeaseLockKey("ws:1:node_port_lease:Node-A:20000")).toBeNull();
+    expect(parsePortLeaseLockKey("ws:1:node_port_lease:lock:Node-A:abc")).toBeNull();
+    expect(parsePortLeaseLockKey("ws:global:node_port_lease:lock:Node-A")).toBeNull();
+  });
+
+  test("scan pattern 能命中生成端产物（reconciler 不漏扫）", () => {
+    const globToRe = (p: string) =>
+      new RegExp(`^${p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
+    const re = globToRe(portLeaseLockPattern());
+    expect(re.test(portLeaseLockKey(1, "n1", 20000))).toBe(true);
+    expect(re.test(portLeaseLockKey(0, "n1", 20000))).toBe(true);
+    expect(re.test(portLeaseLockKey(42, "a:b", 30000))).toBe(true);
+    // 旧裸名形态不应被命中
+    expect(re.test("port_lock:1:20000")).toBe(false);
+  });
+
+  test("节点凭据防爆破键走 global 段（身份解析前不知道租户）", () => {
+    expect(nodeRegisterBlockKey("fp-1")).toBe("ws:global:node_register_block:fp-1");
+    expect(nodeRegisterBlockKey("fp-1")).not.toBe(nodeRegisterBlockKey("fp-2"));
+  });
+});
+
+describe("WP1：RedisKeys 工厂覆盖新键", () => {
+  test("端口租约锁 / 节点防爆破键都带 ws: 前缀", async () => {
+    const { RedisKeys } = await import("../redis.ts");
+    const produced = [
+      RedisKeys.portLeaseLock(1, "n1", 20000),
+      RedisKeys.nodeRegisterBlock("fp-1"),
+    ];
+    for (const k of produced) {
+      expect(k.startsWith("ws:")).toBe(true);
+      expect(/^ws:(global|\d+):.+$/.test(k)).toBe(true);
+      expect(k).not.toContain("::");
+      expect(k).not.toMatch(/:$/);
+    }
+  });
+
+  test("portLeaseLockScan 是 pattern，不是 key", async () => {
+    const { RedisKeys } = await import("../redis.ts");
+    expect(RedisKeys.portLeaseLockScan()).toContain("*");
+    expect(RedisKeys.portLeaseLockScan(9)).toBe("ws:9:node_port_lease:lock:*:*");
   });
 });
