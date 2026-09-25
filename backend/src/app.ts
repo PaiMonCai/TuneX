@@ -34,6 +34,7 @@ import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
 import { workspaceRoutes } from "./routes/workspaces.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { nodeAdminRoutes } from "./routes/node-admin.ts";
+import { nodeLifecycleRoutes } from "./routes/node-lifecycle.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
@@ -147,6 +148,12 @@ export function createApp() {
   // WP10：管理端节点角色 / 凭据状态 / 出口池 / 运行态查询。与上面三个同批
   // 挂载，中间件（adminRequired → adminPermissionGuard）已在 §⑥ 统一施加。
   app.route("/api/admin", nodeAdminRoutes);
+  // WP5：管理端 Node 生命周期（GET/PATCH lifecycle、impact check、retiring 后删除）。
+  // 与节点管理接口共用 adminPermissionGuard（§⑥ 已统一施加，本文件不再套中间件）。
+  // 敏感写（PATCH/DELETE）目前走 api-global 限流：lifecycle 变更不是凭据轮换那种
+  // 高频攻击面，且 409 拒绝本身可挡住误操作重复提交；若后续证明需要更严的用户
+  // 维度限额，见 routes/node-lifecycle.ts 顶部「限流」小节的决策记录。
+  app.route("/api/admin", nodeLifecycleRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 
