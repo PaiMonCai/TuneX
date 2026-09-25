@@ -51,6 +51,10 @@ import {
   type ServiceConfig,
 } from "../crypto/node-config.ts";
 import { resolveDynamicServicePorts, type TunnelPortInfo } from "./port-allocator.ts";
+// ↑ LEGACY（WP3 标记）：入口组内确定性端口分配，仅 DIRECT 下发链路在用。
+//   节点级端口所有权 / 并发互斥 / 对账已由 services/portPool.ts 承担——本文件
+//   分配的 DIRECT listen_port 没有 node_port_lease 行，调用 portPool 时必须
+//   把它们经 AcquirePortInput.reservedPorts 灌进去（见该文件的 LEGACY 注）。
 
 /* ================================================================== */
 /* 常量                                                               */

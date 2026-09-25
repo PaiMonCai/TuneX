@@ -68,12 +68,15 @@ jobs:
         run: |
           bunx prisma generate
           bunx tsc --noEmit
-      # WP6：散布式纯逻辑单测（bun test，无 DB / 网络 / 浏览器依赖）。
+      # WP6 / WP3：散布式纯逻辑单测（bun test，无 DB / 网络 / 浏览器依赖）。
       # package.json 的 "test" 脚本有重复键，JSON 后写的 node --test 那组覆盖先写的
       # `bun test`，所以 src/**/__tests__ 下的散装单测必须在这里显式跑，
       # 否则 CI 绿了但它们一次都没被执行（typecheck 不覆盖运行时行为）。
-      - name: Scattered backend unit tests (control-protocol)
-        run: bun test src/services/__tests__/control-protocol.test.ts
+      # WP3 的 portPool.test.ts 自带内存 DB/Redis 替身（依赖注入），不连真实服务。
+      - name: Scattered backend unit tests (control-protocol, portPool)
+        run: |
+          bun test src/services/__tests__/control-protocol.test.ts
+          bun test src/services/__tests__/portPool.test.ts
       - name: Authorization and payment HTTP tests
         run: bun run test
         env:
