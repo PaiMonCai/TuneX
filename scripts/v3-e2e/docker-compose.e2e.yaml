@@ -142,6 +142,8 @@ services:
       - INGRESS
       - --agent-admin-port
       - "0"
+      - --agent-id
+      - ${WP14_INGRESS_AGENT_ID:?provision phase must export WP14_INGRESS_AGENT_ID}
       - --node-credential
       - ${WP14_INGRESS_CREDENTIAL:?provision phase must export WP14_INGRESS_CREDENTIAL}
       - --ingress-range
@@ -174,6 +176,8 @@ services:
       - EGRESS
       - --agent-admin-port
       - "0"
+      - --agent-id
+      - ${WP14_EGRESS_AGENT_ID:?provision phase must export WP14_EGRESS_AGENT_ID}
       - --node-credential
       - ${WP14_EGRESS_CREDENTIAL:?provision phase must export WP14_EGRESS_CREDENTIAL}
       - --egress-range
