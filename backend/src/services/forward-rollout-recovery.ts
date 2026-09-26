@@ -20,8 +20,10 @@
  * `executeReconcile` **之前**先调本模块（详见 `worker.ts` 的注释）。
  *
  * ── 三条硬约束（写死在实现里）──
- *  1. **只扫未完成行**：`phase in ACTIVE_ROLLOUT_PHASES`。`done/failed/
- *     degraded` 是终态，再扫进来只会每轮空转。
+ *  1. **只扫静默了一小段时间的未完成行**：`phase in ACTIVE_ROLLOUT_PHASES`
+ *     且 `updated_at <= now - quietPeriod`。`patchForward` 会创建 rollout 后
+ *     立即在请求线程同步执行；worker 不能在这段窗口抢同一行，否则两个执行器会
+ *     互相 CAS 出 `concurrent_transition`，留下已切数据面但未完成 cleanup 的半态。
  *  2. **顺序 = id 升序**：同一 tunnel 同期至多一条未完成 rollout（register 的
  *     抢占闸门保证），因此升序即「先发生的先收敛」，与补偿回退的时序直觉一致。
  *  3. **一条失败不影响其余**：worker 是共享进程里的一轮 cron，一次 Agent
@@ -65,6 +67,15 @@ export interface ResumeRolloutsResult {
 const RESUME_BATCH_LIMIT = 25;
 
 /**
+ * 请求同步执行与后台恢复之间的所有权缓冲。
+ *
+ * outbound command 的同步 ACK 等待上限是 15s；20s quiet period 保证请求线程
+ * 在“正常 ACK”或“ACK timeout → waiting”两条路径上都先完成本次状态提交。
+ * worker 每 30s 扫一次，因此最坏只是把恢复推迟到下一轮，不会造成长期卡死。
+ */
+export const ROLLOUT_RESUME_QUIET_MS = 20_000;
+
+/**
  * 扫库并续跑全部未完成 rollout。
  *
  * @param deps 与 {@link executeRollout} 同一套注入（db + orchestrator）。
@@ -92,8 +103,15 @@ export async function resumeRollouts(deps: ResumeRolloutsDeps): Promise<ResumeRo
     ...(deps.now ? { now: deps.now } : {}),
   };
 
+  const now = deps.now?.() ?? new Date();
+  const quietCutoff = new Date(now.getTime() - ROLLOUT_RESUME_QUIET_MS).toISOString();
+
   const rows = (await deps.db.forwardRollout.findMany({
-    where: { phase: { in: [...ACTIVE_ROLLOUT_PHASES] } },
+    where: {
+      phase: { in: [...ACTIVE_ROLLOUT_PHASES] },
+      // 关键：只接管已经“静默”的 rollout。新建/刚推进的 row 仍属于请求同步路径。
+      updated_at: { lte: quietCutoff },
+    },
     orderBy: { id: "asc" },
     take: RESUME_BATCH_LIMIT + 1,
     select: { id: true },
