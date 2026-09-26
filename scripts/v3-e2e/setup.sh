@@ -119,9 +119,9 @@ say "E2E-only capability fixture：team node quota = 4"
 docker exec wp14-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "
   UPDATE capability_policy
   SET max_nodes=4, revision=revision+1
-  WHERE `key`='"'"'free_team'"'"' AND source='"'"'system_default'"'"' AND is_default=1;"'
+  WHERE key='"'"'free_team'"'"' AND source='"'"'system_default'"'"' AND is_default=1;"'
 quota=$(docker exec wp14-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "
-  SELECT IFNULL(max_nodes,0) FROM capability_policy WHERE `key`='"'"'free_team'"'"' LIMIT 1;"' | tail -1 | tr -d '\r')
+  SELECT IFNULL(max_nodes,0) FROM capability_policy WHERE key='"'"'free_team'"'"' LIMIT 1;"' | tail -1 | tr -d '\r')
 [[ "$quota" == "4" ]] || die "E2E team node quota fixture 未生效（got=$quota）"
 
 say "启动 Panel / Worker / Targets / Client"
