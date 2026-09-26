@@ -1,5 +1,31 @@
 # V4-F1 Gate — rest 切片实施报告（S3–S6）
 
+> **2026-09-26 结案更新（head `ed25e328`）**
+>
+> 本报告下方 §1–§8 保留的是 Gate 首轮运行时的历史取证；其中 **D1 已关闭**，
+> 不再代表当前分支状态。修复后的事实以本节为准：
+>
+> - 创建成功后为真实 ACKed `applied_revision` 建立**同 revision baseline snapshot**，
+>   且首次编辑前会自愈缺失 baseline；因此第一次 listener replacement 也能拿到旧
+>   runtime，正常规划 DRAIN/CLEANUP 与 `release_old_lease`。
+> - `release_old_lease` 只按精确 `leaseId` 释放旧租约；CLEANUP replay 若发现旧
+>   lease 已不存在，直接按幂等成功处理，**不会**退回按 tunnel 全量释放当前新 lease。
+> - slice-1 的 S2.11 已同步为「409 前后 rollout 行数增量 = 0」，不再用会被 S1
+>   历史行污染的绝对计数。
+> - `integration.yml` 已正式执行 `v4-gate-rest.sh`，rest slice 不再只靠人工实跑。
+>
+> **自动验证：**
+>
+> - CI #359（run `36227330866`）：backend / web / agent / secret-scan 全部 success；
+>   backend 的 Prisma generate + TypeScript typecheck、全量 unit tests、HTTP tests、
+>   existing-DB migration 与 legacy backfill 均通过。
+> - Integration #70（run `36227330831`）：agent image success；原 outbound-only
+>   DIRECT/RELAY gate success；`v4-gate.sh` success；**`v4-gate-rest.sh` success**；
+>   unified TuneX image build/smoke/Compose wiring success。
+>
+> 因此下文中“D1 未修复 / PASS=55 FAIL=5 DEFECT=3”只描述修复前现场，不是当前结论。
+
+
 分支：`feature/v4-gate-forward-rollout-rest`（worktree `/opt/TuneX-v4-gate-rest`，脚本提交基线
 `7bc70d5`）。本报告只覆盖**文档侧**：脚本 `scripts/v3-e2e/v4-gate-rest.sh` 与 fixture 归脚本
 代理；文中提到的工作区未提交改动不是本报告产物，本报告也不修改它们。
