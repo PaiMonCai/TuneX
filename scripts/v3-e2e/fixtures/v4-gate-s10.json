@@ -1,0 +1,43 @@
+{
+  "v4_gate_s10": {
+    "notes": "V4-F1 Gate S10 切片：rollout 阶段推进可见性 + applied==config + 新旧端口真实 TCP marker 迁移 + agent 重启后数据面存活 + 唯一 active lease。端口区间全部落在 ingress 21000-21099，并避开 v3 DIRECT(21001)/v3 RELAY(21002)/V4 forward 初始(21003)/S3(21004)/S4(21005)/S6(21006) 与 fixtures/v4-gate-rest.json 的 s5 probe_port(21007)。",
+    "port_block": {
+      "ingress_range": "21000-21099",
+      "reserved": [21001, 21002, 21003, 21004, 21005, 21006, 21007],
+      "s10_baseline_port": 21010,
+      "s10_listen_port_after": 21011,
+      "s10_degraded_port": 21012
+    },
+    "targets": {
+      "target_a": { "host": "target-a", "port": 3030, "marker": "WP14-TARGET-A" },
+      "target_b": { "host": "target-b", "port": 3030, "marker": "WP14-TARGET-B" }
+    },
+    "forward": {
+      "name": "v4-gate-s10",
+      "listen_port": 21010,
+      "target_host": "target-a",
+      "target_port": 3030,
+      "notes": "S10 自己创建、自己编辑、自己删除的 Forward。不复用 setup.sh 的 v4_direct，避免与 slice-1/rest 切片的历史状态共生（历史状态会污染 applied/snapshot/lease 基线计数）。创建后必须有真实 Agent ACK 的 runtime。"
+    },
+    "edit_target_hot_swap": {
+      "target_host": "target-b",
+      "target_port": 3030,
+      "notes": "第一次真实编辑：target 热换（不换 listen_port），用于观察 rollout 从 validate 推进到 done 的中间相，并断言 applied==config、snapshot/rollout 各 +1、活跃 lease 唯一。"
+    },
+    "edit_listener_replace": {
+      "listen_port": 21011,
+      "target_host": "target-b",
+      "target_port": 3030,
+      "notes": "第二次真实编辑：listener 替换（agent 重启场景的数据面对象），旧端口 21010 必须死、新端口 21011 必须读到 target-b marker。"
+    },
+    "agent_restart": {
+      "container": "wp14-ingress-agent",
+      "notes": "重启 ingress agent 容器（restart 策略已有 unless-stopped，属于真实运维动作而非手写 DB）。重启后：同一 listen_port 上 marker 必须不变、applied_revision 必须不变、活跃 lease 仍唯一；证明 §13.7 'Backend/Agent 重启后 rollout/reconcile 可恢复'。",
+      "restart_settle_seconds": 25
+    },
+    "interruption": {
+      "notes": "受控中断实验（pause ingress agent → PATCH → ACK timeout/waiting → unpause）。恢复后必须由 resumeRollouts 以同 revision 自行收敛到 done 且 applied_revision == config_revision；这是 S10.47 的正式回归门。",
+      "probe_port": 21012
+    }
+  }
+}

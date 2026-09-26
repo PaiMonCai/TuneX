@@ -30,9 +30,12 @@
  * 3. **失败分流严格按 §13.3.5 第三张表**：
  *      VALIDATE 失败 → `failed`，**完全不写** rollout 行（planRollout 是纯函数，
  *                 它返回 blocking 时调用方还没落库）；
- *      PREPARE 失败 → 释放本轮 prepared 的 lease + 撤已 ACK 的 egress → `failed`，
+ *      PREPARE 明确失败 → 释放本轮 prepared 的 lease + 撤已 ACK 的 egress → `failed`，
  *                 `applied_revision` 不动、旧 runtime 继续；
- *      CUTOVER 失败 → `compensating`，接着跑 `compensate()`；
+ *      CUTOVER 明确失败 → `compensating`，接着跑 `compensate()`；
+ *      PREPARE/CUTOVER 的 `agent_unreachable` → `waiting`，因为 outbound command
+ *                 已入队但 ACK 超时并不能证明「未生效」；恢复时按同 revision
+ *                 幂等重放，只有明确 reject/failed 才允许补偿；
  *      DRAIN 失败 → 只记 warning，**不阻塞** CLEANUP（在途连接由 kernel 超时兜底）；
  *      CLEANUP 失败 → 记 `degraded`，不影响已生效的新 revision。
  *
@@ -1075,6 +1078,22 @@ export async function executeRollout(
     return { ok: row.phase === "done", rolloutId, phase: row.phase, completed: row.cleaned?.length ?? 0 };
   }
 
+  // 崩溃若发生在「已切到 compensating、但补偿还没跑完」的窗口，恢复入口
+  // 必须继续补偿，而不是把 compensating 伪装成 prepare。补偿动作本身按
+  // revision/command_id 幂等，可以安全重放。
+  if (row.phase === "compensating") {
+    const comp = await compensateRollout(rolloutId, deps);
+    return {
+      ok: false,
+      rolloutId,
+      phase: comp.ok ? "failed" : "degraded",
+      error_code: comp.ok ? (row.last_error_code ?? "cutover_failed_compensated") : "compensation_failed",
+      error: comp.error ?? row.last_error ?? undefined,
+      completed: readKeySet(row.cleaned).length,
+      compensated: true,
+    };
+  }
+
   const plan = readPlan(row.steps);
   const completed = new Set(readKeySet(row.cleaned));
   if (!plan || !Array.isArray(plan.steps)) {
@@ -1102,7 +1121,10 @@ export async function executeRollout(
   };
 
   const phases = ROLLOUT_STAGE_SEQUENCE;
-  let status: RolloutStatus = row.phase === "compensating" || row.phase === "waiting" ? "prepare" : row.phase;
+  // waiting 是「上一次 remote step 的结果未知」，不是一个具体执行阶段。
+  // 保留它作为当前 DB phase；循环遇到第一个未完成 step 时再原子地
+  // waiting → step.phase。这样 PREPARE/CUTOVER 任一位置都能从断点恢复。
+  let status: RolloutStatus = row.phase;
 
   for (const phase of phases) {
     const steps = plan.steps.filter((s) => s.phase === phase && !completed.has(s.idempotency_key));
@@ -1149,6 +1171,50 @@ export async function executeRollout(
       }
 
       /* ---------------- 失败分流（§13.3.5 第三张表）---------------- */
+
+      // outbound-only transport 的 ACK timeout 是「结果未知」，不是「命令未执行」：
+      // command 已经先写入 Redis 队列，信封 TTL 远长于同步 ACK 等待窗口；Agent
+      // 恢复后仍可能执行这条命令。此时若立刻 compensation，会与迟到的原命令
+      // 竞态，形成 runtime 已到新 revision、ledger 却 degraded 的 S10.47。
+      //
+      // 因此 PREPARE/CUTOVER 的 agent_unreachable 统一停在 waiting，不释放
+      // prepared 资源、不发 revision+1 的补偿。下一轮 resume 以同 revision
+      // 重放未完成 step：若原命令已生效，Agent 返回 duplicate/同 revision ACK；
+      // 若没生效，则这次正常应用。两种情况最终都走同一条成功记账路径。
+      if ((phase === "prepare" || phase === "cutover") && outcome.error_code === "agent_unreachable") {
+        ctx.notes.push(`${step.phase}:${step.kind} WAIT ${outcome.error_code} ${outcome.error}`);
+        const moved = await transitionRollout(
+          rolloutId,
+          phase,
+          "waiting",
+          {
+            last_error_code: outcome.error_code,
+            last_error: `${outcome.error}`.slice(0, 2000),
+            notes: ctx.notes,
+            updated_at: (deps.now?.() ?? new Date()).toISOString(),
+          },
+          { db },
+        );
+        if (!moved) {
+          const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
+          return {
+            ok: false,
+            rolloutId,
+            phase: fresh?.phase ?? "failed",
+            error_code: "concurrent_transition",
+            error: "rollout 状态被并发修改，重试",
+            completed: readKeySet(fresh?.cleaned).length,
+          };
+        }
+        return {
+          ok: false,
+          rolloutId,
+          phase: "waiting",
+          error_code: outcome.error_code,
+          error: outcome.error,
+          completed: completed.size,
+        };
+      }
 
       if (phase === "prepare") {
         // 释放本轮自己创建的资源 + 撤已 ACK 的 egress；applied_revision 不动、
@@ -1387,7 +1453,7 @@ export interface RegisterRolloutResult {
   ok: boolean;
   rolloutId: number | null;
   /** `blocked` = VALIDATE 失败（§13.3.5 失败规则一）：什么都不写。 */
-  status: "done" | "blocked" | "created" | "conflict";
+  status: "done" | "waiting" | "blocked" | "created" | "conflict";
   error_code?: string;
   error?: string;
   blocking?: Array<{ code: string; message: string }>;
@@ -1482,9 +1548,11 @@ export async function registerRollout(
 
   const result = await executeRollout(created.id, deps);
   return {
+    // waiting = desired 已接收但 runtime 结果暂未知；保留 ok=false 让调用者能
+    // 区分「已应用」和「已接受待收敛」，同时用 status 精确表达可恢复状态。
     ok: result.ok,
     rolloutId: created.id,
-    status: result.ok ? "done" : "created",
+    status: result.ok ? "done" : result.phase === "waiting" ? "waiting" : "created",
     error_code: result.error_code,
     error: result.error,
     warnings: plan.warnings,
