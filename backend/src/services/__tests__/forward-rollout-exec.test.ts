@@ -842,25 +842,32 @@ describe("续跑：只重放未完成步骤", () => {
   });
 
   it("compensating 中途崩溃 ⇒ resume 继续补偿，而不是错误跳回 prepare", async () => {
-    const { f } = modeSwitchEnv();
-    const orch = fakeOrchestrator();
-    const row = await f.db.forwardRollout.create({
-      data: {
-        tunnel_id: 1, revision: 7, base_revision: 6, phase: "compensating", strategy: "mode_switch",
-        steps: { steps: [], desired: {}, applied: {} }, cleaned: [], prepared: [],
-        last_error_code: "agent_rejected", last_error: "cutover rejected before crash", compensated: false,
-        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-      },
-    }) as { id: number };
-    const resumed = await executeRollout(row.id, { db: f.db, orchestrator: orch });
+    const { f, deps, orch } = modeSwitchEnv();
+    const initial = await registerRollout(
+      { tunnelId: 1, impact: impact({ mode_change: true, egress_node_change: true }), revision: 7, baseRevision: 6 },
+      deps,
+    );
+    expect(initial.ok).toBe(true);
+    const row = f.rollouts[0]!;
+
+    // 用真实 register 生成 plan + node index，再模拟「CUTOVER 已把 phase 切到
+    // compensating，进程在 compensateRollout 之前崩溃」。
+    row.phase = "compensating";
+    row.compensated = false;
+    row.last_error_code = "agent_rejected";
+    row.last_error = "cutover rejected before crash";
+    const beforeRemove = orch.calls.removeTunnel.length;
+    const beforeDirect = orch.calls.dispatchDirect.length;
+
+    const resumed = await executeRollout(row.id, deps);
     expect(resumed.ok).toBe(false);
     expect(resumed.phase).toBe("failed");
     expect(resumed.compensated).toBe(true);
-    expect(f.rollouts.find((r) => r.id === row.id)!.phase).toBe("failed");
-    expect(f.rollouts.find((r) => r.id === row.id)!.compensated).toBe(true);
-    expect(orch.calls.removeTunnel.length).toBeGreaterThanOrEqual(1);
-    expect(orch.calls.dispatchDirect).toHaveLength(1);
-    expect(Number((orch.calls.dispatchDirect[0] as { revision: number }).revision)).toBe(6);
+    expect(row.phase).toBe("failed");
+    expect(row.compensated).toBe(true);
+    expect(orch.calls.removeTunnel.length).toBeGreaterThan(beforeRemove);
+    expect(orch.calls.dispatchDirect).toHaveLength(beforeDirect + 1);
+    expect(Number((orch.calls.dispatchDirect.at(-1) as { revision: number }).revision)).toBe(6);
   });
 
   it("cutover 中途崩溃 ⇒ resume 从断点补做 cutover 并跑完", async () => {
