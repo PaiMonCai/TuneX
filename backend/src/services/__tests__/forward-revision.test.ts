@@ -25,6 +25,7 @@ import {
   ForwardRevisionError,
   computeForwardImpact,
   currentDesiredConfig,
+  ensureForwardBaselineRevision,
   handleRevisionConflict,
   isMetadataOnlyPatch,
   mergeForwardCandidate,
@@ -416,5 +417,99 @@ describe("F. snapshot 契约形状", () => {
     expect(targetAddress("10.0.0.1", 8080)).toBe("10.0.0.1:8080");
     expect(targetAddress("::1", 8080)).toBe("[::1]:8080");
     expect(targetAddress("[::1]", 8080)).toBe("[::1]:8080");
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* G. create/retry 后 baseline snapshot                                */
+/* ------------------------------------------------------------------ */
+
+describe("G. applied baseline snapshot", () => {
+  function baselineClient(over: Record<string, unknown> = {}) {
+    const tunnel: Record<string, unknown> = {
+      id: 501,
+      category: "port_forward",
+      name: "web-prod",
+      tunnel_mode: "direct",
+      ingress_node_id: 11,
+      egress_node_id: null,
+      listen_ip: "0.0.0.0",
+      listen_port: 19001,
+      remote_host: "10.0.0.10",
+      remote_port: 8080,
+      egress_pool_id: null,
+      egress_port: null,
+      config_revision: 3,
+      applied_revision: 3,
+      desired_revision_id: null,
+      desired_status: "active",
+      ...over,
+    };
+    const snapshots: Array<{ id: number; data: Record<string, unknown> }> = [];
+    const client = {
+      tunnel: {
+        findUnique: async () => ({ ...tunnel }),
+        updateMany: async (args: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          const matches = Object.entries(args.where).every(
+            ([key, value]) => value === undefined || tunnel[key] === value,
+          );
+          if (!matches) return { count: 0 };
+          Object.assign(tunnel, args.data);
+          return { count: 1 };
+        },
+      },
+      forwardRevision: {
+        findFirst: async (args: { where: { tunnel_id: number; revision: number } }) => {
+          const hit = snapshots.find(
+            (s) =>
+              Number(s.data.tunnel_id) === args.where.tunnel_id &&
+              Number(s.data.revision) === args.where.revision,
+          );
+          return hit ? { id: hit.id } : null;
+        },
+        create: async (args: { data: Record<string, unknown> }) => {
+          const id = snapshots.length + 1;
+          snapshots.push({ id, data: { ...args.data } });
+          return { id };
+        },
+      },
+      egressTarget: { findMany: async () => [] },
+    };
+    return { tunnel, snapshots, client };
+  }
+
+  test("G1. 首次成功 apply 后补同 revision baseline，不 bump revision", async () => {
+    const f = baselineClient();
+    const first = await ensureForwardBaselineRevision(501, 42, f.client as never);
+    expect(first).toEqual({ revision: 3, snapshotId: 1, created: true });
+    expect(f.snapshots).toHaveLength(1);
+    expect(f.snapshots[0]!.data).toMatchObject({
+      tunnel_id: 501,
+      revision: 3,
+      name: "web-prod",
+      mode: "direct",
+      ingress_node_id: 11,
+      listen_port: 19001,
+      target_host: "10.0.0.10",
+      target_port: 8080,
+      created_by_id: 42,
+    });
+    expect(f.tunnel.config_revision).toBe(3);
+    expect(f.tunnel.applied_revision).toBe(3);
+    expect(f.tunnel.desired_revision_id).toBe(1);
+
+    const again = await ensureForwardBaselineRevision(501, 42, f.client as never);
+    expect(again?.created).toBe(false);
+    expect(f.snapshots).toHaveLength(1);
+    expect(f.tunnel.config_revision).toBe(3);
+  });
+
+  test("G2. desired/applied 尚未收敛时不伪造 baseline", async () => {
+    const f = baselineClient({ config_revision: 4, applied_revision: 3 });
+    const res = await ensureForwardBaselineRevision(501, null, f.client as never);
+    expect(res).toBeNull();
+    expect(f.snapshots).toHaveLength(0);
+    expect(f.tunnel.desired_revision_id).toBeNull();
   });
 });

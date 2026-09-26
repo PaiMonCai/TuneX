@@ -26,6 +26,7 @@ import {
   computeForwardImpact,
   createForwardRevision,
   currentDesiredConfig,
+  ensureForwardBaselineRevision,
   isMetadataOnlyPatch,
   mergeForwardCandidate,
   validateForwardCandidate,
@@ -551,6 +552,7 @@ export async function createForward(
         data: failed ? forwardView(failed) : { id: tunnelId },
       });
     }
+    await ensureForwardBaselineRevision(tunnelId, userId).catch(() => null);
   }
 
   const created = await loadForwardRow(tunnelId, workspaceId);
@@ -595,6 +597,16 @@ export async function patchForward(
       return error(409, "revision_conflict", "该转发已被他人修改，请刷新后重新确认", {
         data: { latest_revision: latest },
       });
+    }
+  }
+
+  // 存量/创建路径自愈：已经有真实 applied runtime 但还没有 snapshot 指针时，
+  // 先冻结当前 applied revision，保证首次 listener replacement 有旧 runtime。
+  if (current.applied_revision != null && current.desired_revision_id == null) {
+    try {
+      await ensureForwardBaselineRevision(current.id, ctx.userId);
+    } catch {
+      return error(503, "db_unavailable", "保存前无法建立已应用版本基线，请稍后重试");
     }
   }
 

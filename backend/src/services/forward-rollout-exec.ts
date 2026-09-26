@@ -722,11 +722,49 @@ async function runStep(
         return { ok: false, error_code: "invariant_violated", error: "release_old_lease 缺少 node_id" };
       }
       // 幂等：releaseLease 对已 released 的租约是 no-op（portPool.ts 注释）。
-      const released = await releaseLease(
-        { tunnelId: ctx.tunnelId, nodeId },
-        { db: deps.db as never },
-      );
-      return { ok: true, note: released ? `lease ${nodeId}:${step.port ?? "?"} released` : `lease ${nodeId} 已释放（幂等）` };
+      //
+      // 必须按**本步骤要释放的那一条**旧 lease 定位，不能传 `{ tunnelId, nodeId }`：
+      // portPool.releaseLease 只实现 {leaseId} / {tunnelId} / {nodeId} 三种键，
+      // 没有组合语义——同时带 tunnelId 与 nodeId 时命中的是 tunnelId 分支，
+      // 它把 nodeId 静默丢掉，`updateMany({ tunnel_id, status: 'active' })` 会
+      // 释放该 tunnel 下**所有** active lease，包括本轮 PREPARE 刚 acquirePort
+      // 拿到的新端口 lease。后果是 cutover 已生效、applied_revision 已前进，
+      // 而新端口的 durable lease 却已回收 ⇒ 账本与 runtime 不一致，且下一次
+      // 分配命中该端口时不会发现占用 ⇒ 双绑风险。
+      // 与下面 releasePrepared 的补偿口径一致：补偿也用 { leaseId }。
+      //
+      // `step.port` 是计划期从 applied.listen_port 写死的旧端口（planRollout
+      // 的 `push(..., { port: applied?.listen_port ?? null })`）。极端情况下
+      // 没有 port ⇒ 定位不到具体旧 lease ⇒ 不再假装精确释放，直接退回
+      // 修正前的口径，让 caller 的记账保持可解释（而不是静默全部释放）。
+      const oldLeaseRows = (await deps.db.nodePortLease.findMany({
+        where: {
+          node_id: nodeId,
+          ...(step.port != null ? { port: step.port } : {}),
+          tunnel_id: ctx.tunnelId,
+          status: "active",
+        },
+        select: { id: true },
+      })) as Array<{ id: number }>;
+      // 取第一条：同 (node, port) 的 lease 在该节点端口区间内唯一。
+      const oldLeaseId: number | null =
+        step.port != null && oldLeaseRows.length > 0 ? oldLeaseRows[0]!.id : null;
+
+      // 旧 rollout 行重放时那一条可能已被释放：这时回退到按 tunnelId 释放，
+      // 不因差一行而让整个 rollout 判失败（§13.3.5 CLEANUP 是尽力而为）。
+      // 找不到 active 的旧 lease = 它已经被之前一轮 CLEANUP/reconciler 回收。
+      // 这是幂等成功，不得退回按 tunnelId 全量释放：那会把 PREPARE 刚拿到、
+      // 当前 runtime 正在使用的新端口 lease 一并释放，制造账本/runtime 分叉。
+      if (oldLeaseId === null) {
+        return { ok: true, note: `lease ${nodeId}:${step.port ?? "?"} 已释放（幂等）` };
+      }
+      const released = await releaseLease({ leaseId: oldLeaseId }, { db: deps.db as never });
+      return {
+        ok: true,
+        note: released
+          ? `lease ${nodeId}:${step.port ?? "?"} released`
+          : `lease ${nodeId}:${step.port ?? "?"} 已释放（幂等）`,
+      };
     }
 
     case "drop_old_egress": {
