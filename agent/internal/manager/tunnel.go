@@ -117,6 +117,10 @@ func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.F
 //
 // Equal revision returns (nil, nil) after a read-only check; the caller can
 // ACK it as an idempotent no-op.
+//
+// The revision gate and the port guard live here (and in ReplaceListener,
+// which shares applyLocked); the ordering inside is applyLocked's job, and it
+// is the same sequence for both entry points so the two cannot drift.
 func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
@@ -139,33 +143,7 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, 
 			return cur.fwd, nil
 		}
 	}
-	fwd, err := m.buildLocked(normalized)
-	if err != nil {
-		return nil, err
-	}
-	m.attachLedger(normalized, fwd)
-	if err := m.startLocked(normalized, fwd); err != nil {
-		return nil, err
-	}
-	if old, ok := m.tunnels[normalized.ID]; ok {
-		if old.cfg.ListenPort() != normalized.ListenPort() {
-			// A different port: the old one is genuinely freed. On the
-			// same port startLocked already stopped the old forwarder and
-			// dropped the guard key, so both paths end with the old port
-			// unreserved and the new tunnel owning it.
-			m.releasePortLocked(old.cfg)
-		}
-		// The new listener is bound (or the old one already stopped for the
-		// same-port replace), so tearing the old one down is safe. The port
-		// bookkeeping above happened under this lock, so the async Stop
-		// never touches the guard map.
-		defer m.stopEntry(old)
-	}
-	m.tunnels[normalized.ID] = &entry{cfg: normalized, fwd: fwd}
-	m.markPortUsedLocked(normalized)
-	logx.Info("tunnel applied", "id", normalized.ID, "mode", string(normalized.Mode),
-		"port", normalized.ListenPort(), "revision", normalized.Revision)
-	return fwd, nil
+	return m.applyLocked(normalized)
 }
 
 // buildLocked builds the Forwarder. Caller must hold m.mu.
@@ -258,14 +236,55 @@ func (m *TunnelManager) releasePortLocked(cfg forwarder.TunnelConfig) {
 // flags this exact pair). Callers release the port under the lock instead —
 // see releasePortLocked — which also makes "Remove frees the port" hold the
 // instant Remove returns rather than "eventually".
+//
+// onStopped runs after Stop returned, i.e. after the old listener is really
+// closed and its port is reclaimable at the OS level. Releasing a reservation
+// before that point would let the guard advertise a port the kernel still has
+// bound, and the next Apply would fail its bind on a port the map says is free.
+// It is nil on the teardown paths that release under the lock themselves.
 func (m *TunnelManager) stopEntry(e *entry) {
+	m.stopEntryAsync(e, nil)
+}
+
+// stopEntryAsync is stopEntry with a post-stop hook. Caller must not hold m.mu
+// (Stop blocks for drainTimeout); onStopped is invoked from the goroutine, after
+// Stop returned. A nil hook is the plain "Stop and log" case.
+func (m *TunnelManager) stopEntryAsync(e *entry, onStopped func()) {
 	go func() {
 		if err := e.fwd.Stop(); err != nil {
 			logx.Warn("tunnel stop failed", "id", e.cfg.ID, "err", err.Error())
-			return
+			// Fall through anyway: the forwarder is out of the registry, so
+			// the port is ours to keep or free whatever Stop managed to do.
+		}
+		if onStopped != nil {
+			onStopped()
 		}
 		logx.Info("tunnel removed", "id", e.cfg.ID, "mode", string(e.cfg.Mode), "port", e.cfg.ListenPort())
 	}()
+}
+
+// releasePortAfterStop releases the ports held by cfg once the forwarder that
+// still owns them has actually stopped. The reservation lives under m.mu, so
+// the release takes the write lock rather than being dispatched at teardown
+// time: the guard is manager state, never the teardown goroutine's.
+//
+// The release is owner-aware and therefore safe to run late. A listener move
+// back onto the port being drained is legal (X -> Y, then Y -> X), and by the
+// time the drained forwarder's Stop returns, the newer entry may already have
+// reserved that port. Blindly deleting the key would hand a live tunnel's port
+// to whoever asks next, so the key is dropped only while no registered tunnel
+// holds it.
+func (m *TunnelManager) releasePortAfterStop(cfg forwarder.TunnelConfig) func() {
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, e := range m.tunnels {
+			if e.cfg.ID != cfg.ID && e.cfg.ListenPort() == cfg.ListenPort() {
+				return
+			}
+		}
+		m.releasePortLocked(cfg)
+	}
 }
 
 // isStale reports whether next is older than current.

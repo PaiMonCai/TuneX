@@ -12,9 +12,20 @@
 // An EGRESS tunnel is NOT a one-hop tunnel and keeps its own implementation
 // (egress.go): it load-balances over a target pool instead of dialing a single
 // upstream address.
+//
+// WP2 adds the hot-reload seam here: SetUpstream swaps where NEW connections
+// dial without touching the listener, which is exactly the §13.3.4 "Target
+// Host / Port" row (old TCP connections continue, new ones take the new
+// target). The DIRECT/RELAY distinction survives the swap because both simply
+// dial one address; the mode only decided which address the config named.
 package forwarder
 
-import "net"
+import (
+	"errors"
+	"net"
+	"strings"
+	"time"
+)
 
 // SingleHopForwarder listens on the tunnel's ingress port and forwards every
 // accepted connection to cfg.UpstreamAddr().
@@ -32,15 +43,18 @@ func NewSingleHop(cfg TunnelConfig) (*SingleHopForwarder, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &SingleHopForwarder{pipeTracker{cfg: cfg}}, nil
+	return &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}, nil
 }
 
 // Start binds the listen port and begins forwarding. Returns ErrAlreadyStarted
 // when the forwarder is already running.
+//
+// The upstream is read per accepted connection rather than captured once:
+// a hot swap landing mid-flight therefore affects only the connections that
+// arrive after it, and every connection always dials a complete address.
 func (f *SingleHopForwarder) Start() error {
-	addr := f.cfg.UpstreamAddr()
 	return f.pipeTracker.start(func(net.Conn) (net.Conn, error) {
-		return net.DialTimeout("tcp", addr, dialTimeout)
+		return net.DialTimeout("tcp", f.up.get(), dialTimeout)
 	})
 }
 
@@ -55,3 +69,39 @@ func (f *SingleHopForwarder) LiveConns() int { return f.pipeTracker.liveConns() 
 
 // Running reports whether the listener is bound.
 func (f *SingleHopForwarder) Running() bool { return f.pipeTracker.running() }
+
+// SetUpstream hot-swaps where new connections dial. The listener is not
+// touched, so this call cannot fail a bind and cannot drop a live connection.
+//
+// It refuses to act on a forwarder that was never started, was already
+// stopped, or has been drained: installing an address on a listener that
+// cannot take a new connection would tell the caller a hot swap happened
+// while the OS would refuse every new connection.
+// ErrForwarderNotRunning is the honest answer there.
+func (f *SingleHopForwarder) SetUpstream(addr string) error {
+	if strings.TrimSpace(addr) == "" {
+		return errors.New("forwarder: empty upstream address")
+	}
+	if _, _, err := splitHostPort(addr); err != nil {
+		return err
+	}
+	if !f.pipeTracker.up.swap(addr) {
+		return ErrForwarderNotRunning
+	}
+	logUpstreamSwap(f.cfg.ID, addr)
+	return nil
+}
+
+// Drain stops accepting new connections and waits — bounded — for the
+// in-flight connections to finish while the listener stays bound. The port is
+// released by the manager (Remove / the replacement path), not here, so a
+// drained tunnel keeps its reservation until the rollout says otherwise.
+//
+// Drain is irreversible: the accept loop has ended, so after it returns this
+// forwarder takes no new work and refuses swaps (a dial address nobody can
+// reach would be a lie about what the client sees). Teardown is Stop's job,
+// and it is safe to call at any point after a Drain.
+func (f *SingleHopForwarder) Drain(d time.Duration) error {
+	f.pipeTracker.drainFor(d)
+	return nil
+}

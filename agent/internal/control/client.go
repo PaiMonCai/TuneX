@@ -136,7 +136,15 @@ func (c *Client) execute(cmd *QueuedCommand) ackPayload {
 			ack.ErrorCode, ack.Error = "invalid_payload", err.Error()
 			return ack
 		}
-		if _, err := c.tunnels.Apply(cfg); err != nil {
+		// A command that moves the listener (new port / mode change) must not
+		// tear the old one down before the new listener is bound: that is the
+		// §13.3.5 PREPARE→CUTOVER ordering, and dropping live connections
+		// during a port move would be exactly the "silent outage" the hot
+		// reload contract exists to prevent. An upstream-only change rides on
+		// Apply's same-port path (stop old, then start new is acceptable
+		// there because the listener did not move).
+		_, err = c.applyByPlan(cfg)
+		if err != nil {
 			rollbackPool()
 			if errors.Is(err, manager.ErrStaleRevision) { ack.ErrorCode = "stale_revision" } else { ack.ErrorCode = "apply_failed" }
 			ack.Error = err.Error()
@@ -164,6 +172,30 @@ func (c *Client) execute(cmd *QueuedCommand) ackPayload {
 		ack.Error = "unsupported action: " + cmd.Envelope.Action
 	}
 	return ack
+}
+
+// applyByPlan routes one apply_tunnel command through the hot-reload
+// primitive that matches its plan, so the panel's edit semantics
+// (DEVELOPMENT.md §13.3.4) are honoured by the command path and not only by
+// the local admin API:
+//
+//   - a listener move (port / mode) binds the new listener BEFORE draining
+//     the old one;
+//   - an upstream-only change on a running listener is swapped in place, so
+//     the live connections keep relaying and the byte counter survives;
+//   - EGRESS and everything else keep the previous behaviour verbatim.
+//
+// ReplaceListener is that router: the plan is evaluated inside the manager,
+// against the running config, under the manager's lock — the same evaluation
+// the admin API gets. Recomputing it here instead would freeze a classification
+// that the manager has already contradicted by the time the locked section
+// runs.
+//
+// The plan is advisory about HOW to apply, never about WHETHER: the revision
+// gate and every port conflict stay inside the manager, so a bad plan cannot
+// make a command succeed or fail differently than the manager decides.
+func (c *Client) applyByPlan(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+	return c.tunnels.ReplaceListener(cfg)
 }
 
 // prepareEgressPool stages the desired target pool before an EGRESS listener

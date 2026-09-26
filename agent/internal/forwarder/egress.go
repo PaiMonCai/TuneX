@@ -263,6 +263,26 @@ func (f *EgressForwarder) LiveConns() int { return f.pipeTracker.liveConns() }
 // Running reports whether the egress listener is bound.
 func (f *EgressForwarder) Running() bool { return f.pipeTracker.running() }
 
+// SetUpstream always returns ErrUpstreamNotSwappable: an EGRESS tunnel's
+// upstream is a whole pool owned by manager.EgressManager, and the hot path
+// that retargets it is Pool.SwapTargets (devmap §5.3 "Target snapshot hot
+// update"). Accepting an address here would silently drop the balancer and
+// turn every new connection onto one target the pool never chose.
+func (f *EgressForwarder) SetUpstream(addr string) error {
+	return ErrUpstreamNotSwappable
+}
+
+// Drain waits — bounded — for the in-flight connections to finish while the
+// listener stays bound. Retargeting the pool mid-drain is still allowed: the
+// pool is independent of the listener, exactly like a live hot update.
+//
+// Like the single-hop Drain it is irreversible: the accept loop ends, the port
+// stays reserved, and teardown stays Stop's job.
+func (f *EgressForwarder) Drain(d time.Duration) error {
+	f.pipeTracker.drainFor(d)
+	return nil
+}
+
 // TargetStats returns the per-target failure/throughput ledger, ordered by
 // address. It is the machine-readable form of "target fail 可观测" and is what
 // /health and a state_request reply expose.
