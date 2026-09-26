@@ -278,7 +278,9 @@ function fakeOrchestrator(opts: { failOn?: Record<string, boolean> } = {}) {
     dispatchDirect: [] as Array<Record<string, unknown>>,
     removeTunnel: [] as Array<Record<string, unknown>>,
   };
-  const fail = { error_code: "agent_unreachable", error: "fake transport failure" };
+  // 这组 ledger 用例验证的是「明确失败后的补偿/记账」，不是 ACK 超时。
+  // S10.47 后 agent_unreachable 专指结果未知，必须由专门 waiting 用例覆盖。
+  const fail = { error_code: "agent_rejected", error: "fake transport failure" };
   const orch = {
     calls,
     dispatchEgress: async (input: Record<string, unknown>) => {
