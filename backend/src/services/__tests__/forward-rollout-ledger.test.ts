@@ -805,3 +805,314 @@ describe("resumeRollouts 的顺序", () => {
     expect(seenOrderBy).toEqual({ id: "asc" });
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* 7. S10.47：degraded 是终态，不参与 resume / reconcile 自动修复      */
+/* ------------------------------------------------------------------ */
+
+describe("S10.47 degraded 终态：不自动重放、不掩盖真相", () => {
+  /**
+   * S10.47 现象（wp14 实测）：tunnel tunex-15 的 rollout id=20 停在
+   * `degraded`，`compensation_error` 记录「撤新 runtime 超时 + 基线重放被
+   * validator 的 revision 闸门以 stale_revision 拒绝」，而 Agent 侧其实已经
+   * hot-swap 到 revision=4。worker 每轮 cron 都在扫它、都不收敛。
+   *
+   * 这不是代码 Bug（degraded 语义上就是「回不去也进不去，等人来看」），
+   * 但两个观测面必须诚实：
+   *   a. `resumeRollouts` **不得**把 degraded 扫进来重放 —— 已由 ACTIVE_ROLLOUT_PHASES
+   *      不含 degraded 保证（上面第 1 组已覆盖）。这里补的是**反向**断言：
+   *      即使有人把 degraded 塞进扫进来的行，executeRollout 也不得推进它。
+   *   b. degraded 行的 `applied_revision < config_revision` 必须让 reconciler
+   *      只产 finding、不自动 resend —— 否则每轮都在给一个不可达/半损的节点
+   *      下发注定被拒的命令，属于把「不可达降级」的需求反向实现成自动修。
+   */
+
+  /** 环境：tunnel 1 的 desired revision 7、applied revision 6（落后一版）。 */
+  function behindEnv() {
+    const { f, orch } = directEnv();
+    // directEnv 已 addSnapshot(rev6 / rev7)；补一条 tunnel 行让 reconciler 能读到。
+    f.db.tunnel.findUnique = (async () => {
+      const row = {
+        id: 1,
+        name: "fwd",
+        tunnel_mode: "direct",
+        ingress_node_id: 11,
+        egress_node_id: null,
+        listen_port: 20002,
+        remote_host: "10.9.9.9",
+        remote_port: 8080,
+        egress_pool_id: null,
+        egress_port: null,
+        config_revision: 7,
+        applied_revision: 6,
+        desired_status: "active",
+        apply_status: "active",
+        desired_revision_id: null,
+        last_applied_at: null,
+        apply_error_code: null,
+        apply_error: null,
+      };
+      return {
+        ...row,
+        ingress_node: { id: 11, node_id: "node-11", connect_ip: "10.0.1.11", role: null, lb_strategy: null },
+        egress_node: null,
+      };
+    }) as unknown as RolloutDb["tunnel"]["findUnique"];
+    return { f, orch };
+  }
+
+  it("executeRollout 对 degraded 行返回 ok:false 且不写任何下发", async () => {
+    const { f, orch } = behindEnv();
+    f.addRollout({
+      id: 40,
+      phase: "degraded",
+      revision: 7,
+      base_revision: 6,
+      compensated: false,
+      compensation_error: "compensation failed",
+      steps: {
+        revision: 7,
+        base_revision: 6,
+        strategy: "target_hot_swap",
+        blocking: [],
+        warnings: [],
+        desired: {
+          name: "fwd",
+          mode: "direct",
+          ingress_node_id: 11,
+          egress_node_id: null,
+          listen_ip: null,
+          listen_port: 20002,
+          target_host: "10.9.9.9",
+          target_port: 8080,
+          egress_pool_id: null,
+          egress_port: null,
+          egress_targets: null,
+          desired_status: "active",
+        },
+        applied: null,
+        steps: [],
+      },
+    });
+    const before = orch.calls.dispatchDirect.length;
+    const res = await executeRollout(40, { db: f.db, orchestrator: orch } as RolloutDeps);
+    // degraded 是终态：不得假装推进成功，也不得再下发任何 Agent 命令。
+    expect(res.ok).toBe(false);
+    expect(res.phase).toBe("degraded");
+    expect(orch.calls.dispatchDirect.length).toBe(before);
+    expect(f.rollouts[0]!.phase).toBe("degraded");
+  });
+
+  it("reconciler：rollout 停在 degraded 时，落后的 revision 只产 finding 不重发", async () => {
+    const { f, orch } = behindEnv();
+    const { executeReconcile } = await import("../reconciler.ts");
+    const outcome = await executeReconcile({
+      tunnels: async () => [
+        {
+          id: 1,
+          name: "fwd",
+          mode: "direct",
+          desired_status: "active",
+          config_revision: 7,
+          applied_revision: 6,
+          apply_status: "active",
+          apply_error_code: null,
+          apply_error: null,
+          ingress_node_id: 11,
+          egress_node_id: null,
+        },
+      ],
+      nodes: async () => [
+        { node_id: 11, last_seen_at: new Date().toISOString(), reported_at: new Date().toISOString(), stale: false },
+      ],
+      reports: async () =>
+        new Map([
+          [
+            11,
+            {
+              reported_at: new Date(),
+              // agent 快照里必须有这条 runtime，否则只有 missing_runtime。
+              tunnels: [{ id: "tunex-1-direct", mode: "direct", revision: 6 }],
+              last_error: null,
+            },
+          ],
+        ]),
+      sink: null,
+    } as never);
+    const resendFindings = outcome.findings.filter((x) => x.code === "resend_skipped");
+    // sink 未注入 ⇒ 只记 finding，不得有任何下发尝试。
+    expect(outcome.resent).toBe(0);
+    expect(outcome.noTransport).toBe(1);
+    expect(resendFindings.length).toBe(1);
+    // 落后事实本身要被如实报出来（不是静默放过）。
+    expect(outcome.findings.some((x) => x.code === "revision_behind")).toBe(true);
+    // 落盘的那条 resend_skipped 必须挂到这条隧道 + 这个 revision 上。
+    expect(resendFindings[0]!.tunnel_id).toBe(1);
+    expect(resendFindings[0]!.revision).toBe(7);
+    void f;
+    void orch;
+  });
+
+
+  it("resendSameRevision：该 tunnel 有 degraded rollout 行 ⇒ 拒绝重发且一次都不下发", async () => {
+    // S10.47 实测形态：tunnel 15 的 rollout 20 停在 degraded、compensation 已
+    // 失败，而 applied_revision=3 < config_revision=4。reconciler 每轮都会判
+    // 定 revision_behind 并尝试 resend —— 修好后 sink 必须在任何 dispatch
+    // 之前拒绝，并让拒绝措辞带出 rollout id/phase，使观测面如实呈现
+    // 「degraded 需要人工介入」而不是一条没有上下文的 resend 失败。
+    const { createRuntimeReconcileSink } = await import("../runtime-reconcile-sink.ts");
+    const dispatched: Array<{ method: string; revision: number }> = [];
+    const orch = {
+      dispatchDirect: async (input: Record<string, unknown>) => {
+        dispatched.push({ method: "dispatchDirect", revision: Number(input.revision) });
+        return { ok: true as const, result: { commandId: "x", revision: Number(input.revision), ack: {} } };
+      },
+    };
+    const sink = createRuntimeReconcileSink({
+      db: {
+        tunnel: {
+          findUnique: async (args: unknown) => {
+            const a = args as { include?: { forwardRollouts?: unknown } };
+            expect(a.include?.forwardRollouts).toBeDefined();
+            return {
+              id: 15,
+              desired_status: "active",
+              config_revision: 4,
+              applied_revision: 3,
+              tunnel_mode: "direct",
+              listen_port: 21011,
+              remote_host: "target-a",
+              remote_port: 3030,
+              listen_ip: null,
+              ingress_node: { id: 3, node_id: "node-3", connect_ip: "10.0.1.3", role: null, lb_strategy: null },
+              egress_node: null,
+              egress_pool: null,
+              forwardRollouts: [{ id: 20, phase: "degraded" }],
+            };
+          },
+        },
+      },
+      orchestrator: (() => orch) as never,
+    });
+
+    let thrown: Error | null = null;
+    try {
+      await sink.resendSameRevision({ tunnel_id: 15, revision: 4, envelope: null } as never);
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown).not.toBeNull();
+    expect(thrown!.message).toMatch(/degraded/);
+    expect(thrown!.message).toMatch(/15/);
+    // 关键：拒绝发生在下发之前，Agent 一次都不被打扰。
+    expect(dispatched).toEqual([]);
+  });
+
+  it("resendSameRevision：compensating 行同样阻止重发（补偿未收敛）", async () => {
+    const { createRuntimeReconcileSink } = await import("../runtime-reconcile-sink.ts");
+    const dispatched: Array<{ method: string }> = [];
+    const sink = createRuntimeReconcileSink({
+      db: {
+        tunnel: {
+          findUnique: async () => ({
+            id: 7,
+            desired_status: "active",
+            config_revision: 4,
+            applied_revision: 3,
+            tunnel_mode: "direct",
+            listen_port: 21011,
+            remote_host: "target-a",
+            remote_port: 3030,
+            listen_ip: null,
+            ingress_node: { id: 3, node_id: "node-3", connect_ip: "10.0.1.3", role: null, lb_strategy: null },
+            egress_node: null,
+            egress_pool: null,
+            forwardRollouts: [{ id: 31, phase: "compensating" }],
+          }),
+        },
+      },
+      orchestrator: (() => ({
+        dispatchDirect: async () => {
+          dispatched.push({ method: "dispatchDirect" });
+          return { ok: true as const, result: { commandId: "x", revision: 4, ack: {} } };
+        },
+      })) as never,
+    });
+    await expect(
+      sink.resendSameRevision({ tunnel_id: 7, revision: 4 } as never),
+    ).rejects.toThrow(/compensating#31/);
+    expect(dispatched).toEqual([]);
+  });
+
+  it("resendSameRevision：没有 degraded/compensating 行时行为不变（无回归）", async () => {
+    const { createRuntimeReconcileSink } = await import("../runtime-reconcile-sink.ts");
+    const dispatched: number[] = [];
+    const sink = createRuntimeReconcileSink({
+      db: {
+        tunnel: {
+          findUnique: async () => ({
+            id: 6,
+            desired_status: "active",
+            config_revision: 4,
+            applied_revision: 3,
+            tunnel_mode: "direct",
+            listen_port: 21011,
+            remote_host: "target-a",
+            remote_port: 3030,
+            listen_ip: null,
+            ingress_node: { id: 3, node_id: "node-3", connect_ip: "10.0.1.3", role: null, lb_strategy: null },
+            egress_node: null,
+            egress_pool: null,
+            forwardRollouts: [],
+          }),
+        },
+      },
+      orchestrator: (() => ({
+        dispatchDirect: async (input: Record<string, unknown>) => {
+          dispatched.push(Number(input.revision));
+          return { ok: true as const, result: { commandId: "x", revision: Number(input.revision), ack: {} } };
+        },
+      })) as never,
+    });
+    await sink.resendSameRevision({ tunnel_id: 6, revision: 4 } as never);
+    expect(dispatched).toEqual([4]);
+  });
+
+  it("resendSameRevision：完成后只剩 done 行 ⇒ 不阻挡重发", async () => {
+    // done/failed 不列在 select 里；用「include 真的生效」来证明 where 生效。
+    const { createRuntimeReconcileSink } = await import("../runtime-reconcile-sink.ts");
+    const sink = createRuntimeReconcileSink({
+      db: {
+        tunnel: {
+          findUnique: async (args: unknown) => {
+            const a = args as { include?: { forwardRollouts?: { where?: { phase?: { in: string[] } } } } };
+            const phases = a.include?.forwardRollouts?.where?.phase?.in ?? [];
+            expect(phases).toContain("degraded");
+            expect(phases).toContain("compensating");
+            expect(phases).not.toContain("done");
+            expect(phases).not.toContain("failed");
+            return {
+              id: 6,
+              desired_status: "active",
+              config_revision: 4,
+              applied_revision: 3,
+              tunnel_mode: "direct",
+              listen_port: 21011,
+              remote_host: "target-a",
+              remote_port: 3030,
+              listen_ip: null,
+              ingress_node: { id: 3, node_id: "node-3", connect_ip: "10.0.1.3", role: null, lb_strategy: null },
+              egress_node: null,
+              egress_pool: null,
+              forwardRollouts: [],
+            };
+          },
+        },
+      },
+      orchestrator: (() => ({
+        dispatchDirect: async () => ({ ok: true as const, result: { commandId: "x", revision: 4, ack: {} } }),
+      })) as never,
+    });
+    await sink.resendSameRevision({ tunnel_id: 6, revision: 4 } as never);
+  });
+});
