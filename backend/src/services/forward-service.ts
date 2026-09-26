@@ -708,7 +708,7 @@ export async function patchForward(
       data: { latest_revision: revision },
     });
   }
-  if (runtime && !runtime.ok && runtime.status !== "waiting") {
+  if (runtime && !runtime.ok && runtime.status !== "waiting" && runtime.status !== "in_progress") {
     // 只有确定失败才回 502。waiting 表示 desired/revision 已经可靠落库，
     // 但 outbound command 的 ACK 结果未知；worker 会按同 revision 继续收敛。
     const failed = await loadForwardRow(id, workspaceId);
