@@ -991,6 +991,9 @@ describe("准入、并发与 noop", () => {
 
   it("同步 PATCH 输掉 phase CAS ⇒ accepted in_progress，由另一个 executor 继续", async () => {
     const { f, deps } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.config_revision = 7;
+    f.tunnels[0]!.apply_status = "pending";
     const originalUpdateMany = deps.db.forwardRollout.updateMany;
     let stolen = false;
     deps.db.forwardRollout.updateMany = async (args: unknown) => {
