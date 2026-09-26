@@ -17,6 +17,7 @@ import {
   getForwardTraffic,
   listForwards,
   patchForward,
+  previewForwardUpdate,
   runForwardAction,
   type ForwardAction,
   type ForwardApplyStatus,
@@ -91,11 +92,32 @@ const ForwardCreateSchema = z
   })
   .strict();
 
+/**
+ * V4-WP1 §13.3.1 / §13.3.3：可编辑全集（与 create 的字段一致）+ `expected_revision`。
+ *
+ * `expected_revision` 是可选的乐观并发凭据，不是筛选条件——缺失说明客户端是
+ * 首次请求或有意跳过并发检查；存在但不匹配 → 409（见 patchForward 内闸门）。
+ */
 const ForwardPatchSchema = z
   .object({
     name: z.string().trim().min(1).max(60).optional(),
+    mode: z.enum(["direct", "relay"]).optional(),
+    ingress_node_id: z.number().int().positive().optional(),
+    egress_node_id: z.number().int().positive().nullable().optional(),
+    listen_port: z.number().int().min(1).max(65535).nullable().optional(),
+    target_host: z.string().trim().min(1).max(255).nullable().optional(),
+    target_port: z.number().int().min(1).max(65535).nullable().optional(),
+    expected_revision: z.number().int().nonnegative().nullable().optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (v) =>
+      Object.keys(v).some(
+        (k) => k !== "expected_revision" && k !== "name",
+      ) ||
+      v.name !== undefined,
+    { message: "至少提供一个有效输入字段" },
+  );
 
 const ACTIONS = new Set<ForwardAction>(["retry", "suspend", "resume"]);
 const APPLY_STATUSES = new Set<ForwardApplyStatus>([
@@ -179,6 +201,9 @@ forwardsRoutes.get("/:id", async (c) => {
 });
 
 forwardsRoutes.patch("/:id", async (c) => {
+  // V4-WP1：PATCH 是「编辑」语义而非「改名字」——不再只接受 name 补丁。
+  // 单用户/单窗口编辑最快，但两个浏览器标签先后保存必须被 expected_revision
+  // 拦下（409），否则后保存者会静默覆盖前者的端口/节点选择。
   const id = idParam(c, "id");
   if (id === null) {
     return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
@@ -187,9 +212,41 @@ forwardsRoutes.patch("/:id", async (c) => {
     await c.req.json().catch(() => null),
   );
   if (!parsed.success) {
-    return c.json({ error: "端口转发参数不合法", code: "invalid_input" }, 400);
+    const message = parsed.error.issues[0]?.message ?? "端口转发参数不合法";
+    return c.json({ error: message, code: "invalid_input" }, 400);
   }
   return send(c, await patchForward(id, workspace(c).id, parsed.data));
+});
+
+/**
+ * V4-WP1 §13.3.3 preview：保存前影响面（不写库、不触发 apply）。
+ *
+ * 路由与 mutation 同源：同一个 zod schema、同一个 candidate resolver。
+ * 因此「preview 显示可保存」与「PATCH 实际接受」不可能出现两种结论。
+ * 注意：注册在 `/:id/:action` 之前，否则 action 参数会吃掉 "preview"。
+ */
+forwardsRoutes.post("/:id/preview", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) {
+    return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  }
+  const parsed = ForwardPatchSchema.safeParse(
+    await c.req.json().catch(() => null),
+  );
+  if (!parsed.success) {
+    const message = parsed.error.issues[0]?.message ?? "端口转发参数不合法";
+    return c.json({ error: message, code: "invalid_input" }, 400);
+  }
+  const u = c.get("user");
+  return send(
+    c,
+    await previewForwardUpdate(
+      id,
+      workspace(c).id,
+      parsed.data,
+      u?.id ?? undefined,
+    ),
+  );
 });
 
 forwardsRoutes.post("/:id/:action", async (c) => {

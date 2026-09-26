@@ -20,6 +20,25 @@ import { checkTunnelCreation } from "./capability-policy.ts";
 import { getOrchestrator } from "./relay-wiring.ts";
 import { reapplyDirectTunnel, reapplyRelayTunnel } from "./scheduler.ts";
 import {
+  FORWARD_REVISION_ERROR_CODES,
+  ForwardRevisionError,
+  computeForwardImpact,
+  createForwardRevision,
+  currentDesiredConfig,
+  isMetadataOnlyPatch,
+  mergeForwardCandidate,
+  validateForwardCandidate,
+  validateForwardCandidateFull,
+  type ForwardCandidateConfig,
+  type ForwardCandidateContext,
+  type ForwardCandidatePatch,
+  type ForwardDesiredStatus,
+  type ForwardPreviewResult,
+  type ForwardRevisionErrorCode,
+  type ForwardRevisionRow,
+  type ForwardValidation,
+} from "./forward-revision.ts";
+import {
   runTunnelAction as runTunnelActionApi,
   TUNNEL_API_ERROR_STATUS,
   type TunnelAction,
@@ -28,7 +47,6 @@ import {
 export type ForwardMode = "direct" | "relay";
 export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
 export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume">;
-
 export interface ForwardCreateInput {
   name: string;
   mode: ForwardMode;
@@ -49,6 +67,15 @@ export interface ForwardListInput {
 
 export interface ForwardPatchInput {
   name?: string;
+  /** V4-WP1 §13.3.1：创建后可编辑的全部业务字段。 */
+  mode?: ForwardMode;
+  ingress_node_id?: number;
+  egress_node_id?: number | null;
+  listen_port?: number | null;
+  target_host?: string | null;
+  target_port?: number | null;
+  /** V4-WP1 §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
+  expected_revision?: number | null;
 }
 
 export type ForwardServiceError = {
@@ -72,6 +99,9 @@ const nodeSelect = {
   role: true,
   node_group_id: true,
   lb_strategy: true,
+  // V4-WP1：自动分配端口前必须确认节点配置了区间（§7.6「未配置区间拒绝分配」）。
+  port_range_min: true,
+  port_range_max: true,
   node_group: { select: { workspace_id: true } },
 } as const;
 
@@ -148,6 +178,10 @@ export function forwardView(t: any) {
     apply_status: t.apply_status,
     config_revision: t.config_revision,
     applied_revision: t.applied_revision,
+    // V4-WP1：desired revision 指针 + 最新 revision 号。前端保存时把它们作为
+    // expected_revision 回传（§13.3.3 乐观并发）。
+    desired_revision_id: t.desired_revision_id ?? null,
+    latest_revision: t.config_revision ?? 0,
     apply_error_code: t.apply_error_code,
     apply_error: t.apply_error,
     last_applied_at: t.last_applied_at,
@@ -533,20 +567,324 @@ export async function patchForward(
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
 
-  if (patch.name !== undefined) {
-    const name = patch.name.trim();
-    if (!name || name.length > 60) {
-      return error(400, "invalid_input", "转发名称不合法");
-    }
+  // ── V4-WP1 §13.3.3：校验逻辑只有一个实现 ──
+  // patchForward 与 previewForwardUpdate 都走 resolveForwardCandidate() → 同一个
+  // 合并 + 同一个校验 + 同一个影响面计算；两者只差「是否落库」。
+  const resolved = await resolveForwardCandidate(id, workspaceId, patch);
+  if (!resolved.ok) return resolved.error;
+
+  const { base, candidate, ctx, metadataOnly, desiredStatus } = resolved.data;
+
+  if (metadataOnly) {
+    // §13.3.2：纯 metadata（name）修改不生成 revision、不 bump config_revision、
+    // 不触发任何 runtime 收敛。
     await db.tunnel.update({
       where: { id: current.id },
-      data: { name },
+      data: { name: candidate.name.trim() },
     });
+    const renamed = await loadForwardRow(id, workspaceId);
+    if (!renamed) return error(404, "not_found", "端口转发不存在");
+    return { ok: true, data: forwardView(renamed) };
+  }
+
+  // expected_revision 闸门：在落库前比对，过期直接 409（§13.3.3）。
+  if (patch.expected_revision !== undefined && patch.expected_revision !== null) {
+    const latest = Number(current.config_revision ?? 0);
+    if (Number(patch.expected_revision) !== latest) {
+      return error(409, "revision_conflict", "该转发已被他人修改，请刷新后重新确认", {
+        data: { latest_revision: latest },
+      });
+    }
+  }
+
+  // 写不可变 snapshot + 推进 revision + 同步兼容投影列（单事务）。
+  let revision: number;
+  try {
+    const written = await createForwardRevision({
+      tunnelId: current.id,
+      candidate,
+      desiredStatus,
+      createdById: ctx.userId,
+      egressTargets: ctx.egressTargets,
+      resolvedListenIp: ctx.ingress?.connect_ip
+        ? String(ctx.ingress.connect_ip).split(",").map((x) => x.trim()).find(Boolean) ?? null
+        : null,
+      egressPort: candidate.mode === "relay" ? current.egress_port ?? null : null,
+      egressPoolId: candidate.mode === "relay" ? current.egress_pool?.id ?? null : null,
+    });
+    revision = written.revision;
+  } catch (e) {
+    if (e instanceof ForwardRevisionError) {
+      return error(
+        e.status as ForwardServiceError["status"],
+        e.code,
+        e.message,
+        { data: e.data },
+      );
+    }
+    return error(503, "db_unavailable", "保存失败，请稍后重试");
+  }
+
+  // RELAY 需要新 NodeBinding 时先补建（§13.3.1：Binding 是可复用基础设施关系，
+  // 修改 Forward 不自动删除，但新建必须显式）。
+  if (candidate.mode === "relay" && ctx.egress && ctx.bindingExists === false) {
+    await db.nodeBinding
+      .create({
+        data: {
+          ingress_node_id: ctx.ingress!.id,
+          egress_node_id: ctx.egress.id,
+        },
+      })
+      .catch(() => {});
+  }
+
+  // ── WP1 边界：只落 desired，把 apply 交给既有 reconciler ──
+  // apply_status 置 pending 让 reconciler 的 revision_behind / fill_missing_runtime
+  // 按新 revision 收敛；WP3 的 Orchestrator 落地时替换这个收敛出口。
+  await db.tunnel
+    .update({
+      where: { id: current.id },
+      data: { apply_status: "pending", apply_error_code: null, apply_error: null },
+    })
+    .catch(() => {});
+
+  const orchestrator = getOrchestrator();
+  if (orchestrator) {
+    const applied =
+      candidate.mode === "direct"
+        ? await reapplyDirectTunnel(current.id, orchestrator).catch(() => null)
+        : await reapplyRelayTunnel(current.id, orchestrator).catch(() => null);
+    if (applied && !applied.ok) {
+      // 失败保留 Tunnel 与 revision 历史（§4.1 铁律）：只回带错误，不删行。
+      const failed = await loadForwardRow(id, workspaceId);
+      return error(502, "apply_failed", applied.error, {
+        apply_error_code: applied.error_code,
+        data: failed ? forwardView(failed) : { id: current.id, revision },
+      });
+    }
   }
 
   const updated = await loadForwardRow(id, workspaceId);
   if (!updated) return error(404, "not_found", "端口转发不存在");
   return { ok: true, data: forwardView(updated) };
+}
+
+/**
+ * V4-WP1 preview：**不写库**，只回答「这次编辑会发生什么」。
+ *
+ * 与 {@link patchForward} 共用 {@link resolveForwardCandidate} 与
+ * {@link computeForwardImpact}，因此 preview 放行 ⇔ update 接受（§13.3.3）。
+ */
+export async function previewForwardUpdate(
+  id: number,
+  workspaceId: number,
+  patch: ForwardPatchInput,
+  userId?: number,
+): Promise<ForwardServiceResult<ForwardPreviewResult>> {
+  const current = await loadForwardRow(id, workspaceId);
+  if (!current) return error(404, "not_found", "端口转发不存在");
+
+  const resolved = await resolveForwardCandidate(id, workspaceId, patch, userId);
+  if (!resolved.ok) return resolved.error;
+
+  const { base, candidate, ctx, validation } = resolved.data;
+
+  const resolvedListenPort = candidate.listen_port ?? current.listen_port ?? null;
+  const impact = computeForwardImpact({
+    current: base,
+    candidate,
+    ingressNodeId: ctx.ingress?.node_id ?? null,
+    egressNodeId: ctx.egress?.node_id ?? null,
+    currentIngressNodeId: current.ingress_node?.node_id ?? null,
+    currentEgressNodeId: current.egress_node?.node_id ?? null,
+    ingressConnectIp: ctx.ingress?.connect_ip ?? null,
+    resolvedListenPort,
+    currentResolvedListenPort: current.listen_port ?? null,
+    bindingRequired: candidate.mode === "relay" && ctx.bindingExists === false,
+  });
+
+  return {
+    ok: true,
+    data: {
+      current: {
+        revision: Number(current.config_revision ?? 0),
+        config: base,
+        apply_status: current.apply_status,
+        desired_status: current.desired_status,
+      },
+      candidate: {
+        revision: Number(current.config_revision ?? 0) + 1,
+        config: candidate,
+      },
+      impact,
+      validation,
+    },
+  };
+}
+
+/** resolveForwardCandidate 的成功载荷。 */
+interface ResolvedCandidate {
+  base: ForwardCandidateConfig;
+  candidate: ForwardCandidateConfig;
+  ctx: ForwardCandidateContext & { userId: number | null; egressTargets: Array<{ host: string; port: number; weight: number; order_by: number }> | null };
+  metadataOnly: boolean;
+  desiredStatus: ForwardDesiredStatus;
+  validation: ForwardValidation;
+}
+
+/**
+ * 编辑请求的公共前置：读当前 desired → 合并 patch → 读库校验 → 算影响面输入。
+ *
+ * 这是 §13.3.3「preview 与真实 update 不得各写一份规则」的结构性保证：
+ * 两个入口函数体都只有「落库 / 不落库」的差别，前置完全同一份代码。
+ */
+async function resolveForwardCandidate(
+  id: number,
+  workspaceId: number,
+  patch: ForwardPatchInput,
+  userIdOverride?: number,
+): Promise<{ ok: true; data: ResolvedCandidate } | { ok: false; error: ForwardServiceError }> {
+  const current = await loadForwardRow(id, workspaceId);
+  if (!current) return { ok: false, error: error(404, "not_found", "端口转发不存在") };
+
+  const row = current as unknown as ForwardRevisionRow;
+  const base = currentDesiredConfig(row);
+  const candidate = mergeForwardCandidate(base, patch);
+
+  // 纯形态校验失败 → 不读库（preview / update 同一短路顺序）。
+  const pure = validateForwardCandidate(candidate);
+  if (!pure.ok) {
+    return {
+      ok: false,
+      error: error(400, "invalid_input", pure.errors[0] ?? "端口转发参数不合法", {
+        data: { errors: pure.errors, reasons: pure.reasons },
+      }),
+    };
+  }
+
+  // 需要读库的上下文：节点归属/能力、端口占用、NodeBinding、端口区间。
+  const [ingress, egress, binding, portHolders, siblings] = await Promise.all([
+    loadWorkspaceNode(candidate.ingress_node_id, workspaceId),
+    candidate.egress_node_id === null
+      ? Promise.resolve(null)
+      : loadWorkspaceNode(candidate.egress_node_id, workspaceId),
+    candidate.mode === "relay" && candidate.egress_node_id !== null
+      ? db.nodeBinding.findUnique({
+          where: {
+            ingress_node_id_egress_node_id: {
+              ingress_node_id: candidate.ingress_node_id,
+              egress_node_id: candidate.egress_node_id,
+            },
+          },
+          select: { id: true },
+        })
+      : Promise.resolve(null),
+    candidate.listen_port === null
+      ? Promise.resolve([])
+      : db.nodePortLease.findMany({
+          where: { port: candidate.listen_port, status: "active" },
+          select: { tunnel_id: true, port: true },
+        }),
+    db.tunnel.findMany({
+      where: {
+        ingress_node_id: candidate.ingress_node_id,
+        listen_port: candidate.listen_port ?? undefined,
+      },
+      select: { id: true, listen_port: true },
+    }),
+  ]);
+
+  if (!ingress) {
+    return { ok: false, error: error(404, "not_found", "入口节点不存在") };
+  }
+  if (candidate.mode === "relay" && !egress) {
+    return { ok: false, error: error(404, "not_found", "出口节点不存在") };
+  }
+
+  // 端口占用：DB 租约 + 同节点其它 Forward（含 legacy DIRECT）。
+  const takenByOther = new Set<number>();
+  for (const h of portHolders) {
+    if (h.tunnel_id !== null && h.tunnel_id !== id && h.port === candidate.listen_port) {
+      takenByOther.add(h.port);
+    }
+  }
+  for (const s of siblings) {
+    if (
+      s.id !== id &&
+      candidate.listen_port !== null &&
+      s.listen_port === candidate.listen_port
+    ) {
+      takenByOther.add(candidate.listen_port);
+    }
+  }
+  const portHolderList = [...takenByOther].map((port) => ({ tunnel_id: -1, port }));
+
+  const ctx: ForwardCandidateContext & {
+    userId: number | null;
+    egressTargets: Array<{ host: string; port: number; weight: number; order_by: number }> | null;
+  } = {
+    ingress: {
+      id: ingress.id,
+      node_id: ingress.node_id,
+      role: ingress.role,
+      connect_ip: ingress.connect_ip,
+    },
+    egress: egress
+      ? { id: egress.id, node_id: egress.node_id, role: egress.role }
+      : null,
+    portHolders: portHolderList,
+    bindingExists: binding ? true : candidate.mode === "relay" ? false : null,
+    ingressRangeConfigured: ingress.port_range_min !== null && ingress.port_range_max !== null,
+    userId: userIdOverride ?? null,
+    egressTargets: current.egress_pool?.targets
+      ? (current.egress_pool.targets as unknown as Array<{
+          host: string;
+          port: number;
+          weight: number;
+          order_by: number;
+        }>)
+      : null,
+  };
+
+  const validation = validateForwardCandidateFull(candidate, ctx);
+  if (!validation.ok) {
+    const code =
+      validation.reasons.includes("binding_required")
+        ? "binding_required"
+        : validation.reasons.includes("port_conflict")
+          ? "port_conflict"
+          : validation.reasons.includes("node_unavailable")
+            ? "conflict"
+            : validation.reasons.includes("not_found")
+              ? "not_found"
+              : "invalid_input";
+    return {
+      ok: false,
+      error: error(
+        code === "not_found" ? 404 : code === "binding_required" || code === "port_conflict" || code === "conflict" ? 409 : 400,
+        code,
+        validation.errors[0] ?? "端口转发参数不合法",
+        { data: { errors: validation.errors, reasons: validation.reasons } },
+      ),
+    };
+  }
+
+  // suspended 编辑：§13.3.6「保存最新 desired revision → 不启动 runtime」。
+  // 目标 desired_status 取当前值，suspend 的 desired 是 inactive 已由运行动作维护。
+  const desiredStatus: ForwardDesiredStatus =
+    current.apply_status === "suspended" ? "inactive" : "active";
+
+  return {
+    ok: true,
+    data: {
+      base,
+      candidate,
+      ctx,
+      metadataOnly: isMetadataOnlyPatch(base, candidate),
+      desiredStatus,
+      validation,
+    },
+  };
 }
 
 export async function runForwardAction(
