@@ -405,7 +405,7 @@ function directEnv(overrides: { failOn?: Record<string, boolean> } = {}) {
     node_id: 11,
   });
   const orch = fakeOrchestrator(overrides);
-  return { f, deps: { db: f.db, orchestrator: orch } as RolloutDeps, orch };
+  return { f, deps: { db: f.db, orchestrator: orch, sleep: async () => {} } as RolloutDeps, orch };
 }
 
 /** 「DIRECT(rev6) → RELAY(rev7)」环境。 */
@@ -582,21 +582,34 @@ describe("notes 列：追加式流水账", () => {
     const notes = f.rollouts[0]!.notes as string[] | null;
     expect(notes).not.toBeNull();
     const list = notes ?? [];
-    // 五阶段全部有落账：done 前的最后一次 transition 也会带 notes。
-    for (const phase of ["validate", "prepare", "cutover", "drain", "cleanup"]) {
+    // same-node listener replacement 不再有远程 drain；Agent 自行 retire 旧 listener。
+    for (const phase of ["validate", "prepare", "cutover", "cleanup"]) {
       expect(list.some((n) => n.startsWith(`${phase}:`))).toBe(true);
     }
-    // 完成后步骤数 ≥ 5（有的阶段会有多条 note）。
-    expect(list.length).toBeGreaterThanOrEqual(5);
+    expect(list.some((n) => n.startsWith("drain:"))).toBe(false);
+    expect(list.length).toBeGreaterThanOrEqual(4);
   });
 
-  it("DRAIN 软失败也记一条 note（§13.3.5：只记 warning 不阻塞 CLEANUP）", async () => {
-    const { f, deps } = directEnv();
-    const soft = { db: f.db, orchestrator: fakeOrchestrator({ failOn: { removeTunnel: true } }) } as RolloutDeps;
+  it("Ingress 节点迁移的 DRAIN 软失败也记 note（只 warning，不阻塞 CLEANUP）", async () => {
+    const { f } = directEnv();
+    const desired = f.snapshots.find((s) => Number(s.revision) === 7)!;
+    desired.ingress_node_id = 12;
+    f.tunnels[0]!.ingress_node_id = 12;
+    f.tunnels[0]!.node_id = 12;
+
+    const soft: RolloutDeps = {
+      db: f.db,
+      orchestrator: fakeOrchestrator({ failOn: { removeTunnel: true } }),
+      sleep: async () => {},
+    };
     const res = await registerRollout(
       {
         tunnelId: 1,
-        impact: impact({ listen_port_change: true, listener_replacement: true }),
+        impact: impact({
+          ingress_node_change: true,
+          listen_port_change: true,
+          listener_replacement: true,
+        }),
         revision: 7,
         baseRevision: 6,
       },
@@ -604,7 +617,7 @@ describe("notes 列：追加式流水账", () => {
     );
     expect(res.ok).toBe(true);
     const list = (f.rollouts[0]!.notes ?? []) as string[];
-    expect(list.some((n) => n.includes("SOFT"))).toBe(true);
+    expect(list.some((n) => n.startsWith("drain:") && n.includes("SOFT"))).toBe(true);
   });
 });
 

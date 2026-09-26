@@ -621,7 +621,7 @@ describe("C. 硬规则", () => {
       expect(second.seen.length).toBe(0);
     });
 
-    test("同一意图用不同 command_id 重发（不同 ID、同 resource+revision）→ 也是 duplicate", async () => {
+    test("同一意图用不同 command_id 重发（不同 ID、同 resource+revision）→ duplicate 且新 ID 可被 ACK", async () => {
       const v = new ControlValidator();
       await v.handle(applyCmd("c-1", 1), noopApplier, NOW);
       const rec = recordingApplier();
@@ -629,6 +629,21 @@ describe("C. 硬规则", () => {
       expect(ack.status).toBe("duplicate");
       expect(ack.applied_revision).toBe(1);
       expect(rec.seen.length).toBe(0);
+
+      // Outbound transport 会把真实 Agent ACK 绑定到“这一次重放”的 command_id。
+      // 所以 duplicate 也必须给新 ID 建账，否则这里会变 unknown_command。
+      expect(v.outcome("c-1-again")).toBeDefined();
+      const transportAck = await v.handle(
+        ackEnvelope("ack-c-1-again", "c-1-again", {
+          applied_revision: 1,
+          status: "applied",
+        }),
+        noopApplier,
+        NOW,
+      );
+      expect(transportAck.status).toBe("applied");
+      expect(transportAck.error_code).toBeUndefined();
+      expect(v.outcome("c-1-again")?.acked).toBe(true);
     });
 
     test("state_request 不在闸门管辖内：重复查询永远拿新鲜快照", async () => {

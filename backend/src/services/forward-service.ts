@@ -210,6 +210,104 @@ async function loadForwardRow(id: number, workspaceId: number) {
   });
 }
 
+interface RelayRevisionResources {
+  poolId: number | null;
+  egressPort: number | null;
+  targets: Array<{ host: string; port: number; weight: number; order_by: number }> | null;
+}
+
+/**
+ * Prepare the desired RELAY pool without touching the currently applied Agent
+ * runtime. The old runtime owns an immutable in-memory/snapshot config until
+ * CUTOVER, so moving this Forward's dedicated pool is safe and compensatable.
+ */
+async function prepareRelayRevisionResources(
+  tx: Prisma.TransactionClient,
+  tunnelId: number,
+  current: any,
+  candidate: ForwardCandidateConfig,
+  ctx: ResolvedCandidate["ctx"],
+): Promise<RelayRevisionResources> {
+  if (candidate.mode !== "relay") {
+    return { poolId: null, egressPort: null, targets: null };
+  }
+  if (!ctx.egress || candidate.egress_node_id == null) {
+    throw new ForwardRevisionError("node_unavailable", "RELAY 转发缺少出口节点");
+  }
+
+  const targetHost = candidate.target_host ?? ctx.egressTargets?.[0]?.host ?? null;
+  const targetPort = candidate.target_port ?? ctx.egressTargets?.[0]?.port ?? null;
+  if (!targetHost || targetPort == null) {
+    throw new ForwardRevisionError("invalid_input", "RELAY 转发必须至少有一个有效目标");
+  }
+
+  const poolName = `forward-${tunnelId}`;
+  const onDesiredNode = await tx.egressPool.findUnique({
+    where: {
+      node_id_name: {
+        node_id: candidate.egress_node_id,
+        name: poolName,
+      },
+    },
+    select: { id: true },
+  });
+
+  let poolId: number;
+  if (onDesiredNode) {
+    poolId = onDesiredNode.id;
+    await tx.egressPool.update({
+      where: { id: poolId },
+      data: {
+        status: "active",
+        lb_strategy: (ctx.egress.lb_strategy as any) ?? "round",
+      },
+    });
+  } else if (current.egress_pool?.name === poolName) {
+    const moved = await tx.egressPool.update({
+      where: { id: current.egress_pool.id },
+      data: {
+        node_id: candidate.egress_node_id,
+        status: "active",
+        lb_strategy: (ctx.egress.lb_strategy as any) ?? "round",
+      },
+      select: { id: true },
+    });
+    poolId = moved.id;
+  } else {
+    const created = await tx.egressPool.create({
+      data: {
+        node_id: candidate.egress_node_id,
+        name: poolName,
+        lb_strategy: (ctx.egress.lb_strategy as any) ?? "round",
+        status: "active",
+      },
+      select: { id: true },
+    });
+    poolId = created.id;
+  }
+
+  await tx.egressTarget.deleteMany({ where: { pool_id: poolId } });
+  await tx.egressTarget.create({
+    data: {
+      pool_id: poolId,
+      host: targetHost,
+      port: targetPort,
+      weight: 1,
+      order_by: 1000,
+      status: "active",
+    },
+  });
+
+  const placementChanged =
+    current.tunnel_mode !== "relay" ||
+    Number(current.egress_node_id ?? 0) !== candidate.egress_node_id;
+  return {
+    poolId,
+    egressPort: placementChanged ? null : current.egress_port ?? null,
+    targets: [{ host: targetHost, port: targetPort, weight: 1, order_by: 1000 }],
+  };
+}
+
 export async function listForwards(workspaceId: number, input: ForwardListInput = {}) {
   const where: Prisma.TunnelWhereInput = {
     workspace_id: workspaceId,
@@ -610,22 +708,50 @@ export async function patchForward(
     }
   }
 
-  // 写不可变 snapshot + 推进 revision + 同步兼容投影列（单事务）。
+  // Pool/snapshot/topology projection are one desired-config transaction.
+  // New egress placement stores egress_port=NULL; PREPARE allocates the
+  // concrete per-node port and markTunnelApplied persists it after ACK.
   let revision: number;
   try {
-    const written = await createForwardRevision({
-      tunnelId: current.id,
-      candidate,
-      desiredStatus,
-      createdById: ctx.userId,
-      egressTargets: ctx.egressTargets,
-      resolvedListenIp: ctx.ingress?.connect_ip
-        ? String(ctx.ingress.connect_ip).split(",").map((x) => x.trim()).find(Boolean) ?? null
-        : null,
-      egressPort: candidate.mode === "relay" ? current.egress_port ?? null : null,
-      egressPoolId: candidate.mode === "relay" ? current.egress_pool?.id ?? null : null,
+    const result = await db.$transaction(async (tx) => {
+      const resources = await prepareRelayRevisionResources(
+        tx,
+        current.id,
+        current,
+        candidate,
+        ctx,
+      );
+      const written = await createForwardRevision(
+        {
+          tunnelId: current.id,
+          candidate,
+          desiredStatus,
+          createdById: ctx.userId,
+          egressTargets: resources.targets,
+          resolvedListenIp: ctx.ingress?.connect_ip
+            ? String(ctx.ingress.connect_ip).split(",").map((x) => x.trim()).find(Boolean) ?? null
+            : null,
+          egressPort: resources.egressPort,
+          egressPoolId: resources.poolId,
+        },
+        tx,
+      );
+      await tx.tunnel.update({
+        where: { id: current.id },
+        data: {
+          in_node_group_id: ctx.ingress?.node_group_id ?? current.in_node_group_id,
+          out_node_group_id:
+            candidate.mode === "relay"
+              ? (ctx.egress?.node_group_id ?? current.out_node_group_id)
+              : null,
+          egress_pool_id: resources.poolId,
+          egress_port: resources.egressPort,
+        },
+      });
+      return { written, resources };
     });
-    revision = written.revision;
+    revision = result.written.revision;
+    ctx.egressTargets = result.resources.targets;
   } catch (e) {
     if (e instanceof ForwardRevisionError) {
       return error(
@@ -638,18 +764,8 @@ export async function patchForward(
     return error(503, "db_unavailable", "保存失败，请稍后重试");
   }
 
-  // RELAY 需要新 NodeBinding 时先补建（§13.3.1：Binding 是可复用基础设施关系，
-  // 修改 Forward 不自动删除，但新建必须显式）。
-  if (candidate.mode === "relay" && ctx.egress && ctx.bindingExists === false) {
-    await db.nodeBinding
-      .create({
-        data: {
-          ingress_node_id: ctx.ingress!.id,
-          egress_node_id: ctx.egress.id,
-        },
-      })
-      .catch(() => {});
-  }
+  // Missing Binding is deliberately left to rollout PREPARE/ensure_binding.
+  // Pre-creating it here would erase the preview/plan impact and split semantics.
 
   // ── WP3 §13.3.2/§13.3.4：影响面 = rollout 计划的唯一输入 ──
   // 与 previewForwardUpdate（下面同一 resolveForwardCandidate 的形状）逐字同一
@@ -803,6 +919,10 @@ async function resolveForwardCandidate(
 
   const row = current as unknown as ForwardRevisionRow;
   const base = currentDesiredConfig(row);
+  if (base.mode === "relay" && current.egress_pool?.targets?.[0]) {
+    base.target_host = current.egress_pool.targets[0].host;
+    base.target_port = current.egress_pool.targets[0].port;
+  }
   const candidate = mergeForwardCandidate(base, patch);
 
   // 纯形态校验失败 → 不读库（preview / update 同一短路顺序）。
@@ -882,22 +1002,37 @@ async function resolveForwardCandidate(
       node_id: ingress.node_id,
       role: ingress.role,
       connect_ip: ingress.connect_ip,
+      node_group_id: ingress.node_group_id,
     },
     egress: egress
-      ? { id: egress.id, node_id: egress.node_id, role: egress.role }
+      ? {
+          id: egress.id,
+          node_id: egress.node_id,
+          role: egress.role,
+          node_group_id: egress.node_group_id,
+          lb_strategy: egress.lb_strategy,
+        }
       : null,
     portHolders: portHolderList,
     bindingExists: binding ? true : candidate.mode === "relay" ? false : null,
     ingressRangeConfigured: ingress.port_range_min !== null && ingress.port_range_max !== null,
     userId: userIdOverride ?? null,
-    egressTargets: current.egress_pool?.targets
-      ? (current.egress_pool.targets as unknown as Array<{
-          host: string;
-          port: number;
-          weight: number;
-          order_by: number;
-        }>)
-      : null,
+    egressTargets:
+      candidate.target_host && candidate.target_port
+        ? [{
+            host: candidate.target_host,
+            port: candidate.target_port,
+            weight: 1,
+            order_by: 1000,
+          }]
+        : current.egress_pool?.targets
+          ? (current.egress_pool.targets as unknown as Array<{
+              host: string;
+              port: number;
+              weight: number;
+              order_by: number;
+            }>)
+          : null,
   };
 
   const validation = validateForwardCandidateFull(candidate, ctx);

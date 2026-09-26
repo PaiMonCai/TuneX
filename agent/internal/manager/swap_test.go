@@ -45,6 +45,13 @@ func relayCfg(id string, port int, upstream string, revision int64) forwarder.Tu
 		RemotePort:  p,
 	}
 }
+func directCfg(id string, port int, upstream string, revision int64) forwarder.TunnelConfig {
+	cfg := relayCfg(id, port, upstream, revision)
+	cfg.Mode = forwarder.ModeDirect
+	cfg.NextHop = ""
+	return cfg
+}
+
 
 // portFreedWithin waits until the manager's port guard no longer reserves port.
 // The reservation release is sequenced after the old forwarder has stopped, so a
@@ -313,6 +320,64 @@ func TestHotSwapUpstreamEgressIsNotSwappable(t *testing.T) {
 // ---------------------------------------------------------------------------
 // ReplaceListener — the §13.3.5 PREPARE/CUTOVER/DRAIN ordering
 // ---------------------------------------------------------------------------
+
+func TestReplaceListenerAdoptsDirectRelaySiblingOnSamePort(t *testing.T) {
+	tm := NewTunnelManager(NewEgressManager(), "127.0.0.1")
+	aPort, aServed := labeledServer(t, "a")
+	defer aServed()
+	bPort, bServed := labeledServer(t, "b")
+	defer bServed()
+	port := freePort(t)
+
+	directID := "tunex-42-direct"
+	relayID := "tunex-42-relay"
+	first, err := tm.Apply(directCfg(directID, port, addrFor(aPort), 1))
+	if err != nil {
+		t.Fatalf("Apply direct: %v", err)
+	}
+	defer tm.StopAll()
+	if got := servedLabel(t, addrFor(port)); got != "srv:a" {
+		t.Fatalf("direct baseline = %q, want srv:a", got)
+	}
+
+	relay, err := tm.ReplaceListener(relayCfg(relayID, port, addrFor(bPort), 2))
+	if err != nil {
+		t.Fatalf("DIRECT -> RELAY: %v", err)
+	}
+	if relay != first {
+		t.Fatal("same-port mode switch rebuilt the listener instead of adopting it")
+	}
+	if _, ok := tm.Get(directID); ok {
+		t.Fatal("old direct resource id remained registered after mode switch")
+	}
+	if cfg, ok := tm.Get(relayID); !ok || cfg.Mode != forwarder.ModeRelay || cfg.Revision != 2 {
+		t.Fatalf("relay registry = %+v ok=%v", cfg, ok)
+	}
+	if got := servedLabel(t, addrFor(port)); got != "srv:b" {
+		t.Fatalf("relay target = %q, want srv:b", got)
+	}
+	if !tm.UsedPorts()[port] {
+		t.Fatal("mode switch lost the ingress port reservation")
+	}
+
+	back, err := tm.ReplaceListener(directCfg(directID, port, addrFor(aPort), 3))
+	if err != nil {
+		t.Fatalf("RELAY -> DIRECT: %v", err)
+	}
+	if back != first {
+		t.Fatal("reverse same-port mode switch rebuilt the listener")
+	}
+	if _, ok := tm.Get(relayID); ok {
+		t.Fatal("old relay resource id remained registered after reverse mode switch")
+	}
+	if cfg, ok := tm.Get(directID); !ok || cfg.Mode != forwarder.ModeDirect || cfg.Revision != 3 {
+		t.Fatalf("direct registry after reverse = %+v ok=%v", cfg, ok)
+	}
+	if got := servedLabel(t, addrFor(port)); got != "srv:a" {
+		t.Fatalf("direct target after reverse = %q, want srv:a", got)
+	}
+}
+
 
 // TestReplaceListenerOldPortGuardFollowsTheOldListener is the guard window the
 // review flagged: the old port's reservation used to be dropped BEFORE the old

@@ -1,29 +1,23 @@
 # V4-WP4 — Forward Edit Product UX 开发报告
 
-> **2026-09-26 收口更新（refresh branch / PR #21）**
+> **2026-09-26 最终收口更新 — WP4 / V4.1 已完成**
 >
-> 本报告下方原文保留的是 WP4 最初的 mock-stage 设计与开发记录；当前状态已经从
-> “mock 可用、等待 WP3”推进到**基于真实 rollout runtime 的最终合并候选**：
+> WP4 的 UI 代码已随 PR #21 合入 main；PR #22 随后完成 Gate V4-F1 的最终真实拓扑
+> 收口。最终代码证据为 `7836d20`，通过 **CI #439** 与 **Integration #112**。
 >
-> - WP4 的 11 个文件已在 PR #20 的 S10.47 修复 runtime head 上重新构建；
-> - 从原 WP4 基线到当前 runtime head，这 11 个文件没有 mainline 重叠改动，
->   因此 refresh 是字节级重放而不是冲突手工拼接；
-> - 真实后端契约已包含 full-field PATCH、preview impact、`expected_revision` 409、
->   `waiting` pending convergence，以及修正后的 revision-conflict 409 返回顺序；
-> - Web CI #375 已通过 typecheck、Forward 单测和 production build；
-> - Integration #81 的真实 wp14 拓扑已通过 outbound-only、V4 rollout、rest、S10
->   interruption/recovery Gate 与统一镜像 smoke/Compose；
-> - retarget 到 main 的最终 Gate 又真实捕获到一个 WP3 并发边界：同步 PATCH 与
->   1s recovery worker 可同时续跑同一 rollout，输掉 phase CAS 的请求曾误报
->   `concurrent_transition` / HTTP 502，而另一个 executor 已实际推进 runtime；
-> - PR #21 因此包含一个**最小 runtime 收尾修复**：executor takeover 视为
->   `in_progress`、HTTP 接受 pending convergence、最终 done CAS 不再错误推进
->   `applied_revision`；并把 queued-command ACK 超时真正端到端统一为
->   `ack_timeout`。没有新增 schema / migration / Agent wire action。
+> 最终产品能力与 Gate 事实：
 >
-> 因此下面“mock 阶段 / 不做真后端联调”的描述仅代表最初开发阶段，不再代表
-> 当前 merge readiness。当前 PR 的目标是把已实现的 Forward 全字段编辑产品 UX
-> 合入主线，并结束 WP4 代码层交付。
+> - 编辑表单覆盖创建时的完整业务字段，并使用单次 PATCH + `expected_revision`；
+> - preview impact、running-vs-desired、409 刷新重确认和 pending convergence 已接真实后端；
+> - Agent 热重载与 rollout 支持 target/listener、DIRECT↔RELAY、Egress migration、
+>   Ingress migration，而不是通过删除重建 Forward；
+> - S10 中断恢复：**PASS=57 / FAIL=0 / LIMITED=1 / DEFECT=0**；
+> - 四 Agent topology closure：**PASS=31 / FAIL=0**；
+> - 因此 `DEVELOPMENT.md` §13.7 的 Gate V4-F1 必验项已全部有真实 E2E 证据，
+>   **V4.1 / WP1～WP4 正式完成**，后续进入 V4.2 / WP5。
+>
+> 下方 mock-stage 设计记录保留作为历史开发过程，不再代表当前 merge readiness 或
+> 产品能力边界。
 
 - Work package: **V4-WP4 Forward Edit Product UX**（Track D，Wave 2，mock 阶段）
 - Baseline: `feature/v4-wp1-forward-revisions` @ `74f97cd`（WP1 contract 冻结点；CI 绿：run 36184882122）

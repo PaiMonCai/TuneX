@@ -249,7 +249,92 @@ func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.F
 		}
 	}
 
+	// DIRECT and RELAY use different control-plane resource IDs
+	// (tunex-<n>-direct / tunex-<n>-relay), but on the ingress Agent they are
+	// the same physical SingleHop listener. A mode switch must therefore
+	// adopt the sibling runtime rather than creating a second tunnel that
+	// collides with the port already owned by this Forward.
+	if siblingID, sibling, ok := m.ingressModeSiblingLocked(normalized.ID); ok {
+		if isStale(normalized.Revision, sibling.cfg.Revision) {
+			return nil, ErrStaleRevision
+		}
+		if normalized.Revision == sibling.cfg.Revision && normalized.Revision != revisionUnknown {
+			return nil, fmt.Errorf("manager: mode transition %s -> %s requires a newer revision", siblingID, normalized.ID)
+		}
+		return m.adoptIngressModeSiblingLocked(siblingID, sibling, normalized)
+	}
+
 	return m.applyRoutedLocked(normalized)
+}
+
+// ingressModeSiblingID maps the two control-plane resource IDs of one Forward.
+// It intentionally recognizes only the suffixes emitted by Orchestrator.
+func ingressModeSiblingID(id string) (string, bool) {
+	switch {
+	case strings.HasSuffix(id, "-direct"):
+		return strings.TrimSuffix(id, "-direct") + "-relay", true
+	case strings.HasSuffix(id, "-relay"):
+		return strings.TrimSuffix(id, "-relay") + "-direct", true
+	default:
+		return "", false
+	}
+}
+
+func (m *TunnelManager) ingressModeSiblingLocked(id string) (string, *entry, bool) {
+	siblingID, ok := ingressModeSiblingID(id)
+	if !ok {
+		return "", nil, false
+	}
+	e, ok := m.tunnels[siblingID]
+	if !ok || (e.cfg.Mode != forwarder.ModeDirect && e.cfg.Mode != forwarder.ModeRelay) {
+		return "", nil, false
+	}
+	return siblingID, e, true
+}
+
+// adoptIngressModeSiblingLocked performs DIRECT <-> RELAY for one business
+// Forward even though the wire resource id changes. Same-port mode switches
+// keep the exact same SingleHop forwarder/listener and only swap upstream +
+// registry key; moved-port switches bind the new listener first, then drain
+// the old sibling with the same ordering as replaceListenerLocked.
+func (m *TunnelManager) adoptIngressModeSiblingLocked(
+	oldID string,
+	old *entry,
+	cfg forwarder.TunnelConfig,
+) (forwarder.Forwarder, error) {
+	if old.cfg.ListenPort() == cfg.ListenPort() {
+		if err := old.fwd.SetUpstream(cfg.UpstreamAddr()); err != nil {
+			return nil, fmt.Errorf("manager: mode switch upstream swap refused: %w", err)
+		}
+		delete(m.tunnels, oldID)
+		old.cfg = cfg
+		m.tunnels[cfg.ID] = old
+		m.markPortUsedLocked(cfg)
+		logx.Info("tunnel ingress mode hot-swapped",
+			"old_id", oldID, "id", cfg.ID, "mode", string(cfg.Mode),
+			"port", cfg.ListenPort(), "upstream", cfg.UpstreamAddr(),
+			"revision", cfg.Revision)
+		return old.fwd, nil
+	}
+
+	fwd, err := m.buildLocked(cfg)
+	if err != nil {
+		return nil, err
+	}
+	m.attachLedger(cfg, fwd)
+	if err := m.startLocked(cfg, fwd); err != nil {
+		return nil, err
+	}
+	m.markPortUsedLocked(cfg)
+
+	delete(m.tunnels, oldID)
+	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
+	m.stopEntryAsync(old, m.releasePortAfterStop(old.cfg))
+	logx.Info("tunnel ingress mode listener replaced",
+		"old_id", oldID, "id", cfg.ID, "mode", string(cfg.Mode),
+		"old_port", old.cfg.ListenPort(), "port", cfg.ListenPort(),
+		"revision", cfg.Revision)
+	return fwd, nil
 }
 
 // applyRoutedLocked sends one (revision-gated) config through the primitive

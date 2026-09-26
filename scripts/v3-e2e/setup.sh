@@ -87,6 +87,10 @@ export WP14_INGRESS_CREDENTIAL=${WP14_INGRESS_CREDENTIAL:-UNPROVISIONED}
 export WP14_EGRESS_CREDENTIAL=${WP14_EGRESS_CREDENTIAL:-UNPROVISIONED}
 export WP14_INGRESS_AGENT_ID=${WP14_INGRESS_AGENT_ID:-UNPROVISIONED}
 export WP14_EGRESS_AGENT_ID=${WP14_EGRESS_AGENT_ID:-UNPROVISIONED}
+export WP14_INGRESS_B_CREDENTIAL=${WP14_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
+export WP14_EGRESS_B_CREDENTIAL=${WP14_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
+export WP14_INGRESS_B_AGENT_ID=${WP14_INGRESS_B_AGENT_ID:-UNPROVISIONED}
+export WP14_EGRESS_B_AGENT_ID=${WP14_EGRESS_B_AGENT_ID:-UNPROVISIONED}
 
 # Recreate networks so old WP14 topology cannot leak into this gate. Keep DB
 # volume for idempotent migration/provision coverage.
@@ -107,6 +111,21 @@ done
 say "执行 Prisma migrate + seed"
 docker compose -f "$COMPOSE" --env-file "$ENVF" run --rm db-migrate
 
+# V4-F1 topology closure needs four concrete Nodes in the same team workspace.
+# Production's free_team default remains max_nodes=2; only this disposable E2E DB
+# raises the test entitlement so every Node can still be created through the real
+# provisioning/enrollment API instead of bypassing quota/business logic.
+say "E2E-only capability fixture：team node quota = 4"
+docker exec wp14-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "
+  UPDATE capability_policy
+  SET max_nodes=4, revision=revision+1
+  WHERE applies_to='"'"'team'"'"' AND source='"'"'system_default'"'"' AND is_default=1;"'
+quota=$(docker exec wp14-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "
+  SELECT IFNULL(max_nodes,0) FROM capability_policy
+  WHERE applies_to='"'"'team'"'"' AND source='"'"'system_default'"'"' AND is_default=1
+  ORDER BY id ASC LIMIT 1;"' | tail -1 | tr -d '\r')
+[[ "$quota" == "4" ]] || die "E2E team node quota fixture 未生效（got=$quota）"
+
 say "启动 Panel / Worker / Targets / Client"
 docker compose -f "$COMPOSE" --env-file "$ENVF" up -d panel worker target-a target-b client
 for _ in $(seq 1 60); do
@@ -125,30 +144,39 @@ export WP14_INGRESS_CREDENTIAL
 export WP14_EGRESS_CREDENTIAL
 export WP14_INGRESS_AGENT_ID
 export WP14_EGRESS_AGENT_ID
+export WP14_INGRESS_B_CREDENTIAL
+export WP14_EGRESS_B_CREDENTIAL
+export WP14_INGRESS_B_AGENT_ID
+export WP14_EGRESS_B_AGENT_ID
 WP14_INGRESS_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress']['credential'])")
 WP14_EGRESS_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress']['credential'])")
 WP14_INGRESS_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress']['agent_id'])")
 WP14_EGRESS_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress']['agent_id'])")
+WP14_INGRESS_B_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress_secondary']['credential'])")
+WP14_EGRESS_B_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress_secondary']['credential'])")
+WP14_INGRESS_B_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress_secondary']['agent_id'])")
+WP14_EGRESS_B_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress_secondary']['agent_id'])")
 
-say "启动 Agents（仅主动出站；admin port=0）"
-docker compose -f "$COMPOSE" --env-file "$ENVF" up -d --force-recreate ingress-agent egress-agent
+say "启动四个 Agents（仅主动出站；admin port=0）"
+docker compose -f "$COMPOSE" --env-file "$ENVF" up -d --force-recreate ingress-agent egress-agent ingress-agent-b egress-agent-b
 
-# Wait until both Agents authenticated with their per-node credentials and
-# produced a DB state report. This proves Agent -> Panel before tunnel creation.
-say "等待两个 Agent state report"
-for _ in $(seq 1 45); do
+# Wait until all four Agents authenticated with their per-node credentials.
+say "等待四个 Agent state report"
+for _ in $(seq 1 60); do
   count=$(docker exec wp14-mysql sh -c     'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "
       SELECT COUNT(*) FROM node_state_report s
       JOIN node n ON n.id=s.node_id
-      WHERE n.node_id IN ('"'"'WP14-IN-A-NODE'"'"','"'"'WP14-OUT-A-NODE'"'"')
+      WHERE n.node_id IN ('"'"'WP14-IN-A-NODE'"'"','"'"'WP14-OUT-A-NODE'"'"','"'"'WP14-IN-C-NODE'"'"','"'"'WP14-OUT-B-NODE'"'"')
         AND s.reported_at > NOW() - INTERVAL 2 MINUTE;"' 2>/dev/null | tail -1 || echo 0)
-  [[ "${count:-0}" -ge 2 ]] && break
+  [[ "${count:-0}" -ge 4 ]] && break
   sleep 2
 done
-[[ "${count:-0}" -ge 2 ]] || {
+[[ "${count:-0}" -ge 4 ]] || {
   docker logs --tail 80 wp14-ingress-agent || true
   docker logs --tail 80 wp14-egress-agent || true
-  die "Agent 未完成 credential-authenticated state report"
+  docker logs --tail 80 wp14-ingress-agent-b || true
+  docker logs --tail 80 wp14-egress-agent-b || true
+  die "四个 Agent 未完成 credential-authenticated state report"
 }
 
 # ---------------------------------------------------------------- live creation

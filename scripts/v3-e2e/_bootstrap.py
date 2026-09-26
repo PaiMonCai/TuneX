@@ -182,7 +182,7 @@ def provision_node(cookie, workspace_id, group, spec):
     is_ingress = spec["node_type"] == "in"
     payload = {
         "node_id": spec["node_id"],
-        "connect_ip": "172.31.10.20" if is_ingress else "172.31.20.20",
+        "connect_ip": spec.get("connect_ip") or ("172.31.10.20" if is_ingress else "172.31.20.20"),
         "role": "ingress" if is_ingress else "egress",
     }
     if not is_ingress:
@@ -347,7 +347,13 @@ if PHASE == "provision":
 
     ingress = provision_node(cookie, workspaces["primary"]["id"], groups["ingress"], GROUP_SPECS["ingress"])
     egress = provision_node(cookie, workspaces["primary"]["id"], groups["egress"], GROUP_SPECS["egress"])
-    assert ingress and egress
+    ingress_secondary = provision_node(
+        cookie, workspaces["primary"]["id"], groups["ingress-secondary"], GROUP_SPECS["ingress-secondary"]
+    )
+    egress_secondary = provision_node(
+        cookie, workspaces["primary"]["id"], groups["egress-secondary"], GROUP_SPECS["egress-secondary"]
+    )
+    assert ingress and egress and ingress_secondary and egress_secondary
 
     state = {
         "api": API,
@@ -376,12 +382,23 @@ if PHASE == "provision":
                 **egress["node"],
                 "credential": egress["credential"],
             },
+            "ingress_secondary": {
+                **ingress_secondary["node"],
+                "credential": ingress_secondary["credential"],
+            },
+            "egress_secondary": {
+                **egress_secondary["node"],
+                "credential": egress_secondary["credential"],
+            },
         },
         "tunnels": {},
         "markers": {"target_a": "WP14-TARGET-A", "target_b": "WP14-TARGET-B"},
     }
     write_state(state)
-    print(f"{ERR}provisioned ingress={ingress['node']['id']} egress={egress['node']['id']}")
+    print(
+        f"{ERR}provisioned ingress={ingress['node']['id']} egress={egress['node']['id']} "
+        f"ingress_secondary={ingress_secondary['node']['id']} egress_secondary={egress_secondary['node']['id']}"
+    )
     print(f"{ERR}wrote {STATE}")
 
 elif PHASE == "tunnels":

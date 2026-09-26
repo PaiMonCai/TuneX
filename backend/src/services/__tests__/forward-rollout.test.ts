@@ -13,7 +13,7 @@
  *   6. 跨 phase 严格有序、同 phase 保持生成序；
  *   7. lifecycle 非 active ⇒ fail-closed（R7 与 WP5 口径一致）；
  *   8. DIRECT 热换不重建 listener（旧连接保持）；
- *   9. CLEANUP 的 release_old_lease 一定晚于同节点的 drain（避免双绑窗口）。
+ *   9. 同节点 listener move 由 Agent 自行 retire；只有节点迁移才远程 drain。
  */
 
 import { describe, expect, it } from "bun:test";
@@ -289,7 +289,7 @@ describe("VALIDATE 失败 ⇒ 零步骤（§13.3.5 失败规则一）", () => {
 /* ------------------------------------------------------------------ */
 
 describe("策略分类与步骤集合（§13.3.4 判定表）", () => {
-  it("换监听端口 ⇒ listener_replace + acquire_port + drain/cleanup 旧 lease", () => {
+  it("换监听端口 ⇒ listener_replace + acquire_port + cleanup；不 remove 新 listener", () => {
     const input = planInput({
       desired: snapshot({ listen_port: 20002 }),
       applied: snapshot(),
@@ -300,7 +300,6 @@ describe("策略分类与步骤集合（§13.3.4 判定表）", () => {
       "validate:validate",
       "prepare:acquire_port",
       "cutover:cutover_ingress",
-      "drain:drain_ingress",
       "cleanup:release_old_lease",
     ]);
   });
@@ -596,7 +595,7 @@ describe("旧路径退场顺序（避免双绑/暴露窗口）", () => {
     expect(steps).toEqual(["validate:validate", "prepare:acquire_port", "cutover:cutover_ingress"]);
   });
 
-  it("端口变化但节点不变 ⇒ 同样 drain/cleanup 旧端口", () => {
+  it("端口变化但节点不变 ⇒ 不远程 drain，只 cleanup 旧 lease", () => {
     const input = planInput({
       desired: snapshot({ listen_port: 20003 }),
       applied: snapshot(),
@@ -609,7 +608,7 @@ describe("旧路径退场顺序（避免双绑/暴露窗口）", () => {
       },
     });
     const plan = planRollout(input, 42).steps;
-    expect(plan.find((s) => s.kind === "drain_ingress")!.port).toBe(10001);
+    expect(plan.find((s) => s.kind === "drain_ingress")).toBeUndefined();
     expect(plan.find((s) => s.kind === "release_old_lease")!.port).toBe(10001);
   });
 

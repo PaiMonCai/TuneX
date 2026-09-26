@@ -19,6 +19,26 @@
       "node_id": "WP14-OUT-A-NODE"
     },
     {
+      "key": "ingress-secondary",
+      "name": "WP14-IN-C",
+      "node_type": "in",
+      "port_range": "21000-21099",
+      "workspace": "primary",
+      "agent_container": "ingress-agent-b",
+      "node_id": "WP14-IN-C-NODE",
+      "connect_ip": "172.31.10.21"
+    },
+    {
+      "key": "egress-secondary",
+      "name": "WP14-OUT-B",
+      "node_type": "out",
+      "port_range": "22000-22099",
+      "workspace": "primary",
+      "agent_container": "egress-agent-b",
+      "node_id": "WP14-OUT-B-NODE",
+      "connect_ip": "172.31.20.21"
+    },
+    {
       "key": "foreign-ingress",
       "name": "WP14-IN-B",
       "node_type": "in",
@@ -37,7 +57,9 @@
       "out_node_group": null,
       "tunnel_type": "tcp",
       "listen_port": 21001,
-      "forward_addresses": ["target-a:3030"],
+      "forward_addresses": [
+        "target-a:3030"
+      ],
       "expected_marker": "WP14-TARGET-A",
       "verified_by": "verify.sh DIRECT 场景 + backend/tests/v3-e2e/direct.e2e.test.mjs",
       "expected_path": "client -> ingress-agent:21001 -> target-a:3030（单跳）"
@@ -49,7 +71,9 @@
       "out_node_group": "egress",
       "tunnel_type": "tcp",
       "listen_port": 21002,
-      "forward_addresses": ["target-b:3030"],
+      "forward_addresses": [
+        "target-b:3030"
+      ],
       "expected_marker": "WP14-TARGET-B",
       "verified_by": "verify.sh RELAY 场景 + backend/tests/v3-e2e/relay.e2e.test.mjs",
       "expected_path": "client -> ingress-agent:21002 -> egress-agent:22001 -> target-b:3030（双跳）"
@@ -61,7 +85,9 @@
       "out_node_group": null,
       "tunnel_type": "tcp",
       "listen_port": 21101,
-      "forward_addresses": ["target-b:3030"],
+      "forward_addresses": [
+        "target-b:3030"
+      ],
       "expected_marker": "WP14-TARGET-B",
       "verified_by": "verify.sh isolation 负面用例",
       "expected_path": "不得出现在 ingress-agent 的配置里"

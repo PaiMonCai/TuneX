@@ -59,6 +59,8 @@
  * 一次创建不会让 Agent 重建 listener（§3.2 hard rule 2）。
  */
 
+import { createHash } from "node:crypto";
+
 import {
   ControlValidator,
   createCommand,
@@ -716,18 +718,22 @@ export class Orchestrator {
     const unreachable = await this.reachable(input.node);
     if (unreachable) return unreachable;
 
-    // 补偿撤下必须**幂等**：同一条 remove 重发要拿到同一个 command_id，
-    // 否则 validator 的去重闸门会把它当成另一条新命令，且 Agent 侧看到的是
-    // 两个不同幂等键 —— 第一次已删、第二次「又删一遍」在多数实现里是 no-op，
-    // 但账本里会留下两条不可对齐的记录。
-    const commandId = `tunex-${id}-remove-r${input.revision}`;
+    // remove 既要“同一次意图重试稳定”，又不能只按 resource+revision 生成 ID：
+    // compensation / drain / suspend 可能合法地在同一 revision 对同一 runtime 发
+    // 不同 remove；若共用 command_id，validator 会因 payload.reason 不同报
+    // duplicate_command_id。把规范化 reason 的短 hash 纳入 ID：同意图重试仍命中
+    // 同一幂等键，不同意图则不会互相占用。总长严格限制在协议的 64 字符上界内。
+    const reason = (input.reason ?? "compensation").slice(0, 255);
+    const intent = createHash("sha256").update(reason).digest("hex").slice(0, 10);
+    const suffix = `-rm-r${input.revision}-${intent}`;
+    const commandId = `${id.slice(0, Math.max(1, 64 - suffix.length))}${suffix}`;
     const envelope = createCommand({
       resource: "tunnel",
       resource_id: id,
       revision: input.revision,
       action: "remove_tunnel",
       command_id: commandId,
-      payload: { reason: (input.reason ?? "compensation").slice(0, 255) },
+      payload: { reason },
     });
 
     return this.send(input.node, envelope, (ack) => ({

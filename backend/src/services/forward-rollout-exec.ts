@@ -603,15 +603,19 @@ async function runStep(
     case "prepare_egress": {
       // §13.3.5 铁律：EGRESS 先 apply、ACK 后**不切入口**（入口由 CUTOVER 的
       // cutover_ingress 负责）。因此这里只做 egress 侧下发。
-      if (nodeId == null || step.port == null) {
-        return { ok: false, error_code: "invariant_violated", error: "prepare_egress 缺少 node/port" };
+      if (nodeId == null) {
+        return { ok: false, error_code: "invariant_violated", error: "prepare_egress 缺少 node" };
+      }
+      const egressPort = resolveEgressPort(step, ctx);
+      if (egressPort <= 0) {
+        return { ok: false, error_code: "invariant_violated", error: "prepare_egress 无法解析出口端口" };
       }
       const targets = ctx.desired.egress_targets ?? [];
       const outcome = await orchestrator.dispatchEgress({
         tunnelId: ctx.tunnelId,
         revision: ctx.revision,
         egressNode: nodeFor(orchestrator, nodeId),
-        egressPort: step.port,
+        egressPort,
         poolId: ctx.desired.egress_pool_id,
         targets: targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order_by })),
       });
@@ -624,8 +628,8 @@ async function runStep(
       recordNextHop(ctx.rolloutId, nodeId, outcome.egress_host);
       return {
         ok: true,
-        note: `egress ${nodeId}:${step.port} applied（未切入口）`,
-        sideEffect: { kind: "egress_apply", node_id: nodeId, port: step.port, handle: null },
+        note: `egress ${nodeId}:${egressPort} applied（未切入口）`,
+        sideEffect: { kind: "egress_apply", node_id: nodeId, port: egressPort, handle: null },
       };
     }
 
@@ -636,22 +640,26 @@ async function runStep(
       // PREPARE apply，这里做的是把入口的 next_hop 指向它之前的那一步：
       // 若 PREPARE 已 apply 同 revision，此处是幂等重发（Agent 按 revision
       // 三态收敛，同 revision ⇒ no-op）。
-      if (nodeId == null || step.port == null) {
-        return { ok: false, error_code: "invariant_violated", error: "cutover_egress 缺少 node/port" };
+      if (nodeId == null) {
+        return { ok: false, error_code: "invariant_violated", error: "cutover_egress 缺少 node" };
+      }
+      const egressPort = resolveEgressPort(step, ctx);
+      if (egressPort <= 0) {
+        return { ok: false, error_code: "invariant_violated", error: "cutover_egress 无法解析出口端口" };
       }
       const targets = ctx.desired.egress_targets ?? [];
       const outcome = await orchestrator.dispatchEgress({
         tunnelId: ctx.tunnelId,
         revision: ctx.revision,
         egressNode: nodeFor(orchestrator, nodeId),
-        egressPort: step.port,
+        egressPort,
         poolId: ctx.desired.egress_pool_id,
         targets: targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order_by })),
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
       }
-      return { ok: true, note: `egress ${nodeId}:${step.port} 生效于 revision ${ctx.revision}` };
+      return { ok: true, note: `egress ${nodeId}:${egressPort} 生效于 revision ${ctx.revision}` };
     }
 
     case "cutover_ingress": {
@@ -720,7 +728,12 @@ async function runStep(
       const outcome = await orchestrator.removeTunnel({
         tunnelId: ctx.tunnelId,
         node: nodeFor(orchestrator, nodeId),
-        direction: step.direction === "egress" ? "egress" : "ingress",
+        direction:
+          step.kind === "drain_egress"
+            ? "egress"
+            : ctx.applied?.mode === "direct"
+              ? "direct"
+              : "ingress",
         // 撤旧用 revision+1：让 Agent 的 stale 闸门放行（orchestrator.ts 注释）。
         revision: ctx.revision + 1,
         reason: `rollout ${ctx.rolloutId} drain ${step.kind}`,
@@ -737,6 +750,24 @@ async function runStep(
     case "release_old_lease": {
       if (nodeId == null) {
         return { ok: false, error_code: "invariant_violated", error: "release_old_lease 缺少 node_id" };
+      }
+
+      // 同节点 listener move 的旧 runtime 由 Agent ReplaceListener 自己 retire。
+      // cutover ACK 只保证“新 listener 已上线”，旧 forwarder 的 Stop/drain 仍在
+      // Agent 后台进行，最长 3s。不能对同 logical resource 再发 remove_tunnel，
+      // 也不能立刻释放 backend durable lease；否则下一次分配可能撞 Agent 仍持有
+      // 的旧端口 guard。
+      const sameNodeListenerMove =
+        step.direction === "ingress" &&
+        ctx.applied != null &&
+        ctx.applied.ingress_node_id === ctx.desired.ingress_node_id &&
+        ctx.applied.listen_port != null &&
+        ctx.desired.listen_port != null &&
+        ctx.applied.listen_port !== ctx.desired.listen_port &&
+        step.port === ctx.applied.listen_port;
+      if (sameNodeListenerMove) {
+        const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+        await sleep(SAME_NODE_LISTENER_RETIRE_WAIT_MS);
       }
       // 幂等：releaseLease 对已 released 的租约是 no-op（portPool.ts 注释）。
       //
@@ -869,14 +900,33 @@ function resolveIngressPort(step: RolloutStep, ctx: RolloutExecContext): number 
   return ctx.desired.listen_port ?? 0;
 }
 
+/** egress 端口与 ingress 同义：snapshot 可为 auto(null)，以本轮 lease 为准。 */
+function resolveEgressPort(step: RolloutStep, ctx: RolloutExecContext): number {
+  if (step.port != null) return step.port;
+  const nodeId = step.node_id ?? ctx.desired.egress_node_id;
+  const fromApply = ctx.prepared.find(
+    (p) => p.kind === "egress_apply" && p.node_id === nodeId && p.port != null,
+  );
+  if (fromApply?.port != null) return fromApply.port;
+  const fromLease = ctx.prepared.find(
+    (p) => p.kind === "lease" && p.node_id === nodeId && p.port != null,
+  );
+  if (fromLease?.port != null) return fromLease.port;
+  return ctx.desired.egress_port ?? 0;
+}
+
 /** `<egress ip>:<egress port>`；解析不到 ⇒ null ⇒ cutover_ingress 拒绝执行。 */
 function resolveNextHop(ctx: RolloutExecContext): string | null {
   const egressNodeId = ctx.desired.egress_node_id;
-  if (egressNodeId == null || ctx.desired.egress_port == null) return null;
+  if (egressNodeId == null) return null;
   const prepared = ctx.prepared.find(
     (p) => p.kind === "egress_apply" && p.node_id === egressNodeId && p.port != null,
   );
-  const port = prepared?.port ?? ctx.desired.egress_port;
+  const lease = ctx.prepared.find(
+    (p) => p.kind === "lease" && p.node_id === egressNodeId && p.port != null,
+  );
+  const port = prepared?.port ?? lease?.port ?? ctx.desired.egress_port ?? 0;
+  if (port <= 0) return null;
   // 旧实现（orchestrator.dispatchEgress 内）会拿 egress 节点的可寻址 host
   // 拼 next_hop；这里同样只允许从**已登记**的节点事实里取，不猜 IP。
   const host = nextHopHosts.get(ctx.rolloutId)?.get(egressNodeId);
@@ -937,9 +987,12 @@ export async function compensateRollout(
   // 尝试切过去的那个**拓扑，而 tunnel 行可能已被后续编辑改写。
   const removeRevision = row.revision + 1;
   const planned = planSnapshot(row.steps, "desired");
-  const removals: Array<{ direction: "egress" | "ingress"; nodeId: number }> = [
+  const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number }> = [
     { direction: "egress", nodeId: planned.egress_node_id ?? 0 },
-    { direction: "ingress", nodeId: planned.ingress_node_id },
+    {
+      direction: planned.mode === "direct" ? "direct" : "ingress",
+      nodeId: planned.ingress_node_id,
+    },
   ];
   for (const { direction, nodeId } of removals) {
     if (!nodeId) continue;
@@ -1115,6 +1168,13 @@ export const ROLLOUT_EXECUTOR_LEASE_MS = 90_000;
 /** Agent state report 周期 30s；多给 5s 抖动，先等事实再决定是否重发。 */
 export const ROLLOUT_RUNTIME_CONFIRM_WAIT_MS = 35_000;
 const ROLLOUT_RUNTIME_CONFIRM_POLL_MS = 1_000;
+/**
+ * Agent pipeTracker.Stop() 的 drainTimeout 是 3s。Same-node listener replacement
+ * 在 ACK 前已经把新 listener 放进 registry，但旧 listener 的 Stop 在后台 goroutine
+ * 中完成；backend 释放旧 durable lease 前多留 500ms 调度余量，避免旧 Agent
+ * port guard 尚未释放时控制面把该端口重新分配出去。
+ */
+export const SAME_NODE_LISTENER_RETIRE_WAIT_MS = 3_500;
 
 function asDate(value: Date | string | null | undefined): Date | null {
   if (value == null) return null;
@@ -1536,7 +1596,7 @@ async function executeRolloutOwned(
     const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
     return concurrentTakeoverResult(rolloutId, fresh, completed.size);
   }
-  await markTunnelApplied(row.tunnel_id, row.revision, db, deps.now);
+  await markTunnelApplied(row.tunnel_id, row.revision, ctx, db, deps.now);
   return { ok: true, rolloutId, phase: "done", completed: completed.size };
 }
 
@@ -1633,9 +1693,25 @@ async function markTunnelFailed(
 async function markTunnelApplied(
   tunnelId: number,
   revision: number,
+  ctx: RolloutExecContext,
   db: RolloutDb,
   now?: () => Date,
 ): Promise<void> {
+  const ingressLease = ctx.prepared.find(
+    (p) => p.kind === "lease" && p.node_id === ctx.desired.ingress_node_id && p.port != null,
+  );
+  const egressApplied = ctx.prepared.find(
+    (p) => p.kind === "egress_apply" && p.node_id === ctx.desired.egress_node_id && p.port != null,
+  );
+  const egressLease = ctx.prepared.find(
+    (p) => p.kind === "lease" && p.node_id === ctx.desired.egress_node_id && p.port != null,
+  );
+  const concreteListenPort = ingressLease?.port ?? ctx.desired.listen_port ?? null;
+  const concreteEgressPort =
+    ctx.desired.mode === "relay"
+      ? (egressApplied?.port ?? egressLease?.port ?? ctx.desired.egress_port ?? null)
+      : null;
+
   await db.tunnel
     .updateMany({
       where: { id: tunnelId },
@@ -1646,6 +1722,9 @@ async function markTunnelApplied(
         apply_error: null,
         config_revision: revision,
         applied_revision: revision,
+        listen_port: concreteListenPort,
+        egress_port: concreteEgressPort,
+        egress_pool_id: ctx.desired.mode === "relay" ? ctx.desired.egress_pool_id : null,
         last_applied_at: (now?.() ?? new Date()).toISOString(),
       },
     })
@@ -1715,6 +1794,10 @@ export async function registerRollout(
   }
 
   const { desired, applied, nodes, bindingExists } = await loadRolloutNodes(input.tunnelId, { db });
+  indexRolloutNodes(
+    deps.orchestrator,
+    [nodes.ingress, nodes.egress].filter((n) => n != null) as any,
+  );
 
   const planInput: PlanRolloutInput = {
     revision: input.revision,

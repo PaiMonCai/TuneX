@@ -816,11 +816,35 @@ export class ControlValidator {
     }
     if (decision.kind === "idempotent") {
       const previous = this.lastAppliedOutcome(cmd.resource, cmd.resource_id, cmd.revision);
-      if (previous) {
-        return ackFrom(cmd, "duplicate", undefined, undefined, previous.outcome.applied_revision, previous.outcome.state ?? null);
-      }
-      // 状态是注入的（seed）而非本实例执行过：没有可回放的账本，仍按「已生效」回答。
-      return ackFrom(cmd, "duplicate", undefined, `revision=${cmd.revision} 已应用（无本地账本可回放）`, record!.applied_revision);
+      const appliedRevision = previous?.outcome.applied_revision ?? record!.applied_revision;
+      const state = previous?.outcome.state ?? null;
+
+      // 同一 resource/revision 可以用新的 command_id 重试。虽然不再执行 applier，
+      // **这个新 command_id 仍必须进入幂等账本**：Outbound transport 随后收到的
+      // command_ack 会以本次 envelope.command_id 作为 acked_command_id。若这里只
+      // 返回 duplicate 而不 remember，真实 Agent 的 ACK 会被 recordAck 判成
+      // unknown_command，控制面反而把一次成功的幂等重放翻成 502。
+      const aliasOutcome: CommandOutcomeInternal = {
+        command_id: cmd.command_id,
+        action: cmd.action,
+        resource: cmd.resource,
+        resource_id: cmd.resource_id,
+        revision: cmd.revision,
+        applied_revision: appliedRevision,
+        status: "duplicate",
+        state,
+        acked: false,
+      };
+      this.remember(cmd.command_id, fingerprint, aliasOutcome);
+
+      return ackFrom(
+        cmd,
+        "duplicate",
+        undefined,
+        previous ? undefined : `revision=${cmd.revision} 已应用（记录本次幂等别名）`,
+        appliedRevision,
+        state,
+      );
     }
 
     // ③ 执行（applying 期间对 state_request 可见）+ 原子推进。
