@@ -678,7 +678,7 @@ describe("正常路径：五阶段推进到 done", () => {
   it("resume 到 done 时同样补写 applied_revision", async () => {
     const at = new Date("2026-09-26T04:05:00.000Z");
     const { f, orch } = directEnv();
-    const deps: RolloutDeps = { db: f.db, orchestrator: orch, now: () => at };
+    const deps: RolloutDeps = { db: f.db, orchestrator: orch, now: () => at, sleep: async () => {} };
     const reg = await registerRollout(
       {
         tunnelId: 1,
@@ -830,13 +830,19 @@ describe("续跑：只重放未完成步骤", () => {
     expect(f.rollouts[0]!.compensated).toBe(false);
 
     const recovered = fakeOrchestrator();
-    const resumed = await executeRollout(f.rollouts[0]!.id, { db: f.db, orchestrator: recovered });
+    const resumed = await executeRollout(f.rollouts[0]!.id, {
+      db: f.db,
+      orchestrator: recovered,
+      sleep: async () => {},
+    });
     expect(resumed.ok).toBe(true);
     expect(f.rollouts[0]!.phase).toBe("done");
     expect(f.tunnels[0]!.applied_revision).toBe(7);
     expect(f.tunnels[0]!.config_revision).toBe(7);
     expect(recovered.calls.dispatchDirect).toHaveLength(1);
-    expect(recovered.calls.removeTunnel).toHaveLength(1);
+    // same-node listener replacement由 Agent 自行 retire 旧 listener；backend 不应
+    // remove 同一个 logical resource，否则会把刚恢复的新 listener 一并删掉。
+    expect(recovered.calls.removeTunnel).toHaveLength(0);
     expect(f.rollouts[0]!.compensated).toBe(false);
   });
 
@@ -935,7 +941,7 @@ describe("续跑：只重放未完成步骤", () => {
     expect(result.error_code).toBe("concurrent_transition");
     expect(contender.calls.dispatchDirect).toHaveLength(0);
   });
-  it("cutover 后崩溃（drain 前）⇒ resume 只补做 drain/cleanup，不重发入口配置", async () => {
+  it("cutover 后崩溃 ⇒ resume 只补做 cleanup，不重发入口配置/不误删新 listener", async () => {
     const { f, deps, orch } = directEnv();
     const reg = await registerRollout(
       {
@@ -949,8 +955,8 @@ describe("续跑：只重放未完成步骤", () => {
     expect(reg.ok).toBe(true);
     const row = f.rollouts[0]!;
 
-    // 抹掉 drain / cleanup 的进度，phase 退回 drain：模拟 cutover_ingress 已 ACK、
-    // 进程在进入 DRAIN 前被 kill 的现场。真实库里这就是恢复入口读到的形状。
+    // 抹掉 cleanup 进度，phase 退回 drain：模拟 cutover_ingress 已 ACK 后进程
+    // 被 kill。same-node port move 没有远程 drain step，恢复只能做安全 cleanup。
     //
     // 这个用例要钉死的是「已完成步骤绝不重放」：入口配置此刻已按 revision 7
     // 生效，再 dispatch 一次 = 无谓的 listener churn（WP2 的 revision 闸门会判
@@ -972,10 +978,10 @@ describe("续跑：只重放未完成步骤", () => {
     expect(f.rollouts[0]!.phase).toBe("done");
     // 入口配置没有重发。
     expect(orch.calls.dispatchDirect).toHaveLength(beforeDirect);
-    // DRAIN 补做了一次（旧端口退场）。
-    expect(orch.calls.removeTunnel).toHaveLength(beforeRemove + 1);
-    // 五个步骤最终全部落账。
-    expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(5);
+    // 不能发 remove_tunnel；Agent ReplaceListener 已经负责旧 listener 退场。
+    expect(orch.calls.removeTunnel).toHaveLength(beforeRemove);
+    // validate + acquire + cutover + cleanup 共四个步骤。
+    expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(4);
   });
 
   it("compensating 中途崩溃 ⇒ resume 继续补偿，而不是错误跳回 prepare", async () => {
@@ -1038,7 +1044,7 @@ describe("续跑：只重放未完成步骤", () => {
     expect(orch.calls.dispatchDirect).toHaveLength(beforeDirect + 1);
     // 新端口确实是 desired 的 20002（不是 applied 的 10001）。
     expect(Number((orch.calls.dispatchDirect.at(-1) as { ingressPort: number }).ingressPort)).toBe(20002);
-    expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(5);
+    expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(4);
   });
 
   it("已完成步骤再次执行不产生新副作用（幂等）", async () => {
