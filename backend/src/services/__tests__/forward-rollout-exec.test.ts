@@ -782,6 +782,7 @@ describe("续跑：只重放未完成步骤", () => {
       { db: f.db, orchestrator: orch },
     );
     expect(first.ok).toBe(false);
+    expect(first.status).toBe("waiting");
     expect(f.rollouts[0]!.phase).toBe("waiting");
     expect(f.tunnels[0]!.applied_revision).toBe(6);
     expect(orch.calls.removeTunnel).toHaveLength(0);
