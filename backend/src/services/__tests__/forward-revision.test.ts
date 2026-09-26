@@ -231,13 +231,13 @@ describe("B. 校验规则", () => {
     expect(noRange.reasons).toContain("node_unavailable");
   });
 
-  test("B10. RELAY 未绑定 ingress→egress 被阻断（binding_required）", () => {
+  test("B10. RELAY 未绑定 ingress→egress 允许保存，由 rollout PREPARE ensure_binding", () => {
     const v = validateForwardCandidateFull(
       { ...BASE_CONFIG, mode: "relay", egress_node_id: 22, target_host: null, target_port: null },
       ctx({ bindingExists: false }),
     );
-    expect(v.ok).toBe(false);
-    expect(v.reasons).toContain("binding_required");
+    expect(v.ok).toBe(true);
+    expect(v.reasons).not.toContain("binding_required");
     expect(FORWARD_REVISION_ERROR_STATUS.binding_required).toBe(409);
   });
 

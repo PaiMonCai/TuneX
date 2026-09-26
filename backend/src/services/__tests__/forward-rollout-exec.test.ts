@@ -576,6 +576,29 @@ describe("正常路径：五阶段推进到 done", () => {
     expect(f.rollouts[0]!.phase).toBe("done");
   });
 
+  it("DIRECT→RELAY egress_port=auto ⇒ 租端口、next_hop 同端口并持久化", async () => {
+    const { f, deps, orch } = modeSwitchEnv();
+    const desired = f.snapshots.find((s) => Number(s.revision) === 7)!;
+    desired.egress_port = null;
+    f.tunnels[0]!.egress_port = null;
+
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ mode_change: true, egress_node_change: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+    expect(res.ok).toBe(true);
+    const dispatched = Number(orch.calls.dispatchEgress[0]?.egressPort);
+    expect(dispatched).toBeGreaterThan(0);
+    expect(String(orch.calls.dispatchIngress[0]?.nextHop)).toBe(`10.0.1.21:${dispatched}`);
+    expect(f.tunnels[0]!.egress_port).toBe(dispatched);
+    expect(f.leases.some((l) => l.node_id === 21 && l.port === dispatched && l.status === "active")).toBe(true);
+  });
+
   // ── 成功记账的完整列集合（applied_revision 缺口回归）──
   //
   // `markTunnelApplied` 只写 config_revision 而不写 applied_revision 是一个

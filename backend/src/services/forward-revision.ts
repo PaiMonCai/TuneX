@@ -372,8 +372,20 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
 /** 需要读库的校验输入（归属 / 能力 / 端口占用 / NodeBinding）。 */
 export interface ForwardCandidateContext {
   /** 入口节点（已校验属于当前 workspace）。NULL = 不存在/越权。 */
-  ingress: { id: number; node_id: string; role: string | null; connect_ip: string | null } | null;
-  egress: { id: number; node_id: string; role: string | null } | null;
+  ingress: {
+    id: number;
+    node_id: string;
+    role: string | null;
+    connect_ip: string | null;
+    node_group_id?: number | null;
+  } | null;
+  egress: {
+    id: number;
+    node_id: string;
+    role: string | null;
+    node_group_id?: number | null;
+    lb_strategy?: string | null;
+  } | null;
   /** 同节点上已占用 listen_port 的其它 Forward id（含 legacy DIRECT 与 v3）。 */
   portHolders: Array<{ tunnel_id: number; port: number }>;
   /** ingress → egress 的 NodeBinding 是否存在。 */
@@ -413,10 +425,8 @@ export function validateForwardCandidateWithDb(
       errors.push(`出口节点 ${ctx.egress.node_id} 不具备出口能力`);
       reasons.push("node_unavailable");
     }
-    if (ctx.ingress && ctx.egress && ctx.bindingExists === false) {
-      errors.push("该出口尚未绑定到当前入口节点");
-      reasons.push("binding_required");
-    }
+    // Missing edit-time Binding is prepared by rollout.ensure_binding.
+    // It is an impact/warning, not a reason to reject the desired topology.
   }
 
   const port = normalizeForwardPort(candidate.listen_port ?? undefined);
@@ -874,11 +884,15 @@ export async function createForwardRevision(
         remote_port: input.candidate.mode === "direct" ? input.candidate.target_port : null,
         forward_addresses: directTarget
           ? (directTarget as unknown as Prisma.InputJsonValue)
-          : existingAddresses,
+          : input.candidate.mode === "relay"
+            ? ([] as unknown as Prisma.InputJsonValue)
+            : existingAddresses,
         forward_addresses_protocol:
           directTarget !== null
             ? (["tcp"] as unknown as Prisma.InputJsonValue)
-            : existingProtocol,
+            : input.candidate.mode === "relay"
+              ? ([] as unknown as Prisma.InputJsonValue)
+              : existingProtocol,
         out_node_group_id: input.candidate.mode === "direct" ? null : row.out_node_group_id,
         desired_status: input.desiredStatus,
         // ── revision 账本（与 snapshot 同值，同一事务）──
