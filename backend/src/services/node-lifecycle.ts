@@ -21,8 +21,14 @@
  * 与 node-admin.ts / portPool.ts 同一取向：默认走进程级 `db` 单例，每个公开
  * 函数都接受 {@link LifecycleDb} 覆盖，测试直接传内存替身，**不需要**
  * `mock.module`（那会随 worktree/CI 路径静默打歪）。
+ *
+ * ⚠️ `db.ts` 用**惰性** `await import()` 而不是顶层 import：`db.ts` 在模块
+ * 加载期就 new PrismaClient()（读 DATABASE_URL、连池）。顶层 import 会让每
+ * 一个只想要本模块纯函数的调用方（forward-rollout / forward-service /
+ * reconciler）都在加载期把真实 db 拽进模块图，从而抢先于测试替身注册
+ * db.ts —— 替身失效、用例以 `pd.node.findUnique is not a function` 500 收尾。
+ * 这与 reconciler.ts / traffic-retention.ts 的既有取向一致。
  */
-import { db } from "../db.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -419,11 +425,33 @@ export interface LifecycleDeps {
   now?: () => Date;
 }
 
-function deps(over: LifecycleDeps | undefined): { db: LifecycleDb; now: () => Date } {
-  return { db: over?.db ?? defaultDb, now: over?.now ?? (() => new Date()) };
+/**
+ * 惰性解析的进程级 `db` 单例。
+ *
+ * 不用顶层 import：`db.ts` 在模块加载期就 new PrismaClient()（读
+ * DATABASE_URL）。顶层 import 会让只想要本模块**纯函数**的调用方
+ * （forward-rollout / forward-service / reconciler）也在加载期把真实 db
+ * 拽进模块图，从而抢先于测试替身注册 db.ts —— 替身失效，用例以
+ * `pd.node.findUnique is not a function` 500 收尾。首调用时才 import，
+ * 纯函数调用方因此完全碰不到 db（与 reconciler.ts / traffic-retention.ts
+ * 的既有取向一致）。
+ */
+let defaultDbPromise: Promise<LifecycleDb> | undefined;
+
+function loadDefaultDb(): Promise<LifecycleDb> {
+  defaultDbPromise ??= import("../db.ts").then((m) => m.db as unknown as LifecycleDb);
+  return defaultDbPromise;
 }
 
-const defaultDb = db as unknown as LifecycleDb;
+/**
+ * 解析依赖：调用方注入的替身优先，否则**惰性**取进程级 db。
+ * 返回 Promise 是因为默认 db 现在是按需 import 的。
+ */
+function deps(over: LifecycleDeps | undefined): Promise<{ db: LifecycleDb; now: () => Date }> {
+  const now = over?.now ?? (() => new Date());
+  if (over?.db) return Promise.resolve({ db: over.db, now });
+  return loadDefaultDb().then((db) => ({ db, now }));
+}
 
 function asRow<T>(row: unknown): T | null {
   return row ? (row as T) : null;
@@ -490,7 +518,7 @@ export async function getNodeImpact(
   nodeId: number,
   inject?: LifecycleDeps,
 ): Promise<{ ok: true; impact: NodeImpact } | LifecycleError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const node = await loadNode(pd, nodeId);
   if (!node) return err("not_found", "节点不存在");
@@ -592,7 +620,7 @@ export async function changeLifecycle(
   input: ChangeLifecycleInput,
   inject?: LifecycleDeps,
 ): Promise<{ ok: true; node: LifecycleNodeRow; view: NodeLifecycleView } | LifecycleError> {
-  const { db: pd, now } = deps(inject);
+  const { db: pd, now } = await deps(inject);
 
   const lifecycleParsed = parseLifecycle(input.lifecycle);
   if (!lifecycleParsed.ok) return err("invalid_input", lifecycleParsed.message);
@@ -652,7 +680,7 @@ export async function deleteNode(
   nodeId: number,
   inject?: LifecycleDeps,
 ): Promise<{ ok: true; id: number } | LifecycleError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const node = await loadNode(pd, nodeId);
   if (!node) return err("not_found", "节点不存在");
@@ -757,7 +785,7 @@ export async function getNodeLifecycle(
   nodeId: number,
   inject?: LifecycleDeps,
 ): Promise<{ ok: true; node: LifecycleNodeRow; view: NodeLifecycleView } | LifecycleError> {
-  const { db: pd, now } = deps(inject);
+  const { db: pd, now } = await deps(inject);
   const node = await loadNode(pd, nodeId);
   if (!node) return err("not_found", "节点不存在");
   return { ok: true, node, view: lifecycleView(node, now()) };
@@ -768,7 +796,7 @@ export async function listActiveLeasePorts(
   nodeId: number,
   inject?: LifecycleDeps,
 ): Promise<number[]> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
   const rows = asRows<{ port: number }>(
     await pd.nodePortLease.findMany({ where: { node_id: nodeId, status: "active" }, select: { port: true } }),
   );
