@@ -459,7 +459,9 @@ async function loadRolloutNodes(
       node_id: String(rec.node_id ?? ""),
       role: (rec.role as string | null) ?? null,
       connect_ip: (rec.connect_ip as string | null) ?? null,
-      // 本分支没有 WP5 lifecycle 列 ⇒ undefined ⇒ 不阻断（R7 本地口径）。
+      // WP5 lifecycle 列已随 WP5 schema 落地：节点行（include: true）会带上它，
+      // 因此 validateRolloutAdmission 能真的拦住维护中/退役中节点。undefined
+      // 只出现在构造入参（注入的替身）没这个字段时，行为退化为 fail-closed。
       lifecycle: (rec.lifecycle as string | null | undefined) ?? undefined,
       port_range_configured:
         rec.port_range_min == null || rec.port_range_max == null ? false : true,
