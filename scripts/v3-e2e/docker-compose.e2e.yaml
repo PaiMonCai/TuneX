@@ -193,6 +193,70 @@ services:
       panel:
         condition: service_healthy
 
+  ingress-agent-b:
+    image: ${WP14_AGENT_IMAGE:?required}
+    container_name: wp14-ingress-agent-b
+    restart: unless-stopped
+    command:
+      - --panel-http-url
+      - http://panel:3000
+      - --node-id
+      - WP14-IN-C-NODE
+      - --listen-ip
+      - 172.31.10.21
+      - --role
+      - INGRESS
+      - --agent-admin-port
+      - "0"
+      - --agent-id
+      - ${WP14_INGRESS_B_AGENT_ID:-UNPROVISIONED}
+      - --node-credential
+      - ${WP14_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
+      - --ingress-range
+      - 21000-21099
+      - --debug
+    networks:
+      wp14-ctrl:
+        ipv4_address: 172.31.0.21
+      wp14-ingress-data:
+        ipv4_address: 172.31.10.21
+      wp14-egress-data:
+        ipv4_address: 172.31.20.11
+    depends_on:
+      panel:
+        condition: service_healthy
+
+  egress-agent-b:
+    image: ${WP14_AGENT_IMAGE:?required}
+    container_name: wp14-egress-agent-b
+    restart: unless-stopped
+    command:
+      - --panel-http-url
+      - http://panel:3000
+      - --node-id
+      - WP14-OUT-B-NODE
+      - --listen-ip
+      - 172.31.20.21
+      - --role
+      - EGRESS
+      - --agent-admin-port
+      - "0"
+      - --agent-id
+      - ${WP14_EGRESS_B_AGENT_ID:-UNPROVISIONED}
+      - --node-credential
+      - ${WP14_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
+      - --egress-range
+      - 22000-22099
+      - --debug
+    networks:
+      wp14-ctrl:
+        ipv4_address: 172.31.0.31
+      wp14-egress-data:
+        ipv4_address: 172.31.20.21
+    depends_on:
+      panel:
+        condition: service_healthy
+
   target-a:
     <<: *target-common
     container_name: wp14-target-a
