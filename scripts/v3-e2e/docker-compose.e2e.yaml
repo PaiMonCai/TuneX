@@ -209,9 +209,9 @@ services:
       - --agent-admin-port
       - "0"
       - --agent-id
-      - ${WP14_INGRESS_B_AGENT_ID:?provision phase must export WP14_INGRESS_B_AGENT_ID}
+      - ${WP14_INGRESS_B_AGENT_ID:-UNPROVISIONED}
       - --node-credential
-      - ${WP14_INGRESS_B_CREDENTIAL:?provision phase must export WP14_INGRESS_B_CREDENTIAL}
+      - ${WP14_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
       - --ingress-range
       - 21000-21099
       - --debug
@@ -242,9 +242,9 @@ services:
       - --agent-admin-port
       - "0"
       - --agent-id
-      - ${WP14_EGRESS_B_AGENT_ID:?provision phase must export WP14_EGRESS_B_AGENT_ID}
+      - ${WP14_EGRESS_B_AGENT_ID:-UNPROVISIONED}
       - --node-credential
-      - ${WP14_EGRESS_B_CREDENTIAL:?provision phase must export WP14_EGRESS_B_CREDENTIAL}
+      - ${WP14_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
       - --egress-range
       - 22000-22099
       - --debug
