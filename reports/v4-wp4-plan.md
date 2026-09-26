@@ -12,8 +12,14 @@
 >   `waiting` pending convergence，以及修正后的 revision-conflict 409 返回顺序；
 > - Web CI #375 已通过 typecheck、Forward 单测和 production build；
 > - Integration #81 的真实 wp14 拓扑已通过 outbound-only、V4 rollout、rest、S10
->   interruption/recovery Gate；统一镜像 smoke/Compose 为最终收尾项；
-> - WP4 本身没有新增 backend/schema/agent 改动，仍保持 Track D 边界。
+>   interruption/recovery Gate 与统一镜像 smoke/Compose；
+> - retarget 到 main 的最终 Gate 又真实捕获到一个 WP3 并发边界：同步 PATCH 与
+>   1s recovery worker 可同时续跑同一 rollout，输掉 phase CAS 的请求曾误报
+>   `concurrent_transition` / HTTP 502，而另一个 executor 已实际推进 runtime；
+> - PR #21 因此包含一个**最小 runtime 收尾修复**：executor takeover 视为
+>   `in_progress`、HTTP 接受 pending convergence、最终 done CAS 不再错误推进
+>   `applied_revision`；并把 queued-command ACK 超时真正端到端统一为
+>   `ack_timeout`。没有新增 schema / migration / Agent wire action。
 >
 > 因此下面“mock 阶段 / 不做真后端联调”的描述仅代表最初开发阶段，不再代表
 > 当前 merge readiness。当前 PR 的目标是把已实现的 Forward 全字段编辑产品 UX
