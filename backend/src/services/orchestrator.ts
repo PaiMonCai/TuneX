@@ -126,8 +126,10 @@ export type RelayDispatchOutcome =
  * 映射，这里只报协议层能区分的东西）。
  */
 export const RELAY_DISPATCH_ERROR_CODES = {
-  /** 命令没到 Agent：DNS / 连接拒绝 / 超时。 */
+  /** 命令明确未建立可用管理面连接：DNS / 连接拒绝等。 */
   agent_unreachable: "agent_unreachable",
+  /** outbound command 已入队，但同步等待窗口内没有收到 ACK；执行结果未知。 */
+  ack_timeout: "ack_timeout",
   /** Agent 回了非 2xx（含 409 stale revision、400 payload）。 */
   agent_rejected: "agent_rejected",
   /** ACK 结构不合法（protocol validator 拒绝）。 */
