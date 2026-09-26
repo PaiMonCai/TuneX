@@ -555,22 +555,25 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   }
 
   /* ---------------- DRAIN ---------------- */
-  // 旧入口：换端口或换节点时旧 listener 必须退场。wire 上没有 drain 原语
-  // （报告 R3），因此 DRAIN 用 `remove_tunnel` 表达「停止接受新连接后等待在途
-  // 退出」——与 `tunnel-api.ts#suspend` 同一条既有表达。
+  // 旧入口退场分两种完全不同的所有权：
   //
-  // `applied === null` ⇒ 该 tunnel **从未成功 apply 过**，没有旧 runtime 可退场；
-  // 此时旧节点 id / 旧端口都是 null，生成的 drain 会是「对不存在的 listener
-  // 发 remove」。首次部署（`createForward` 之后第一次编辑）正落在这支。
+  //   · **Ingress 节点迁移**：新旧 runtime 在不同 Agent 上，backend 必须显式
+  //     remove 旧节点上的 resource，因此生成 drain_ingress。
+  //   · **同节点 listen_port 变化**：Agent 的 ReplaceListener 已经先启动新 listener，
+  //     再异步 Stop/drain 旧 listener。此时如果 backend 再对同 logical resource 发
+  //     remove_tunnel，会把刚切好的新 listener 一起删掉。这里绝不能生成远程 drain；
+  //     CLEANUP 仅在旧 listener 的 Stop 上限过去后释放旧 durable lease。
+  //
+  // `applied === null` ⇒ 从未成功 apply，没有旧 runtime 可退场。
   const hasPreviousRuntime = applied !== null;
-  if (hasPreviousRuntime && (impact.ingress_node_change || impact.listen_port_change)) {
+  if (hasPreviousRuntime && impact.ingress_node_change) {
     const oldNode = nodes.ingress_previous;
     const oldPort = applied?.listen_port ?? null;
     push("drain", "drain_ingress", {
       node_id: oldNode?.id ?? (applied?.ingress_node_id ?? null),
       direction: "ingress",
       port: oldPort,
-      meta: { reason: impact.ingress_node_change ? "ingress_node_changed" : "listen_port_changed" },
+      meta: { reason: "ingress_node_changed" },
     });
   }
 

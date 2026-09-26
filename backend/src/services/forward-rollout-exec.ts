@@ -751,6 +751,24 @@ async function runStep(
       if (nodeId == null) {
         return { ok: false, error_code: "invariant_violated", error: "release_old_lease 缺少 node_id" };
       }
+
+      // 同节点 listener move 的旧 runtime 由 Agent ReplaceListener 自己 retire。
+      // cutover ACK 只保证“新 listener 已上线”，旧 forwarder 的 Stop/drain 仍在
+      // Agent 后台进行，最长 3s。不能对同 logical resource 再发 remove_tunnel，
+      // 也不能立刻释放 backend durable lease；否则下一次分配可能撞 Agent 仍持有
+      // 的旧端口 guard。
+      const sameNodeListenerMove =
+        step.direction === "ingress" &&
+        ctx.applied != null &&
+        ctx.applied.ingress_node_id === ctx.desired.ingress_node_id &&
+        ctx.applied.listen_port != null &&
+        ctx.desired.listen_port != null &&
+        ctx.applied.listen_port !== ctx.desired.listen_port &&
+        step.port === ctx.applied.listen_port;
+      if (sameNodeListenerMove) {
+        const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+        await sleep(SAME_NODE_LISTENER_RETIRE_WAIT_MS);
+      }
       // 幂等：releaseLease 对已 released 的租约是 no-op（portPool.ts 注释）。
       //
       // 必须按**本步骤要释放的那一条**旧 lease 定位，不能传 `{ tunnelId, nodeId }`：
@@ -1150,6 +1168,13 @@ export const ROLLOUT_EXECUTOR_LEASE_MS = 90_000;
 /** Agent state report 周期 30s；多给 5s 抖动，先等事实再决定是否重发。 */
 export const ROLLOUT_RUNTIME_CONFIRM_WAIT_MS = 35_000;
 const ROLLOUT_RUNTIME_CONFIRM_POLL_MS = 1_000;
+/**
+ * Agent pipeTracker.Stop() 的 drainTimeout 是 3s。Same-node listener replacement
+ * 在 ACK 前已经把新 listener 放进 registry，但旧 listener 的 Stop 在后台 goroutine
+ * 中完成；backend 释放旧 durable lease 前多留 500ms 调度余量，避免旧 Agent
+ * port guard 尚未释放时控制面把该端口重新分配出去。
+ */
+export const SAME_NODE_LISTENER_RETIRE_WAIT_MS = 3_500;
 
 function asDate(value: Date | string | null | undefined): Date | null {
   if (value == null) return null;

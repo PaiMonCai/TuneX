@@ -450,7 +450,7 @@ function directEnv(overrides: { failOn?: FakeOrchestratorOpts["failOn"] } = {}) 
     node_id: 11,
   });
   const orch = fakeOrchestrator(overrides);
-  const deps: RolloutDeps = { db: f.db, orchestrator: orch };
+  const deps: RolloutDeps = { db: f.db, orchestrator: orch, sleep: async () => {} };
   return { f, deps, orch };
 }
 
@@ -516,7 +516,7 @@ function modeSwitchEnv() {
 /* ------------------------------------------------------------------ */
 
 describe("正常路径：五阶段推进到 done", () => {
-  it("DIRECT 换端口 ⇒ done，动作顺序为 acquire → direct → drain → remove", async () => {
+  it("DIRECT 同节点换端口 ⇒ Agent 自行 retire 旧 listener，backend 不 remove 新 runtime", async () => {
     const { f, deps, orch } = directEnv();
     const res = await registerRollout(
       {
@@ -534,8 +534,9 @@ describe("正常路径：五阶段推进到 done", () => {
     // tunnel 行回到 active，config_revision 与目标 revision 一致。
     expect(f.tunnels[0]!.apply_status).toBe("active");
     expect(f.tunnels[0]!.config_revision).toBe(7);
-    // 五个步骤全部标记完成。
-    expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(5);
+    // validate + acquire + cutover + cleanup；同节点端口移动不再生成远程 drain。
+    expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(4);
+    expect(orch.calls.removeTunnel).toHaveLength(0);
     // CLEANUP 只释放旧端口；新端口的 durable ownership 必须仍 active。
     expect(f.leases.find((l) => l.port === 10001)?.status).toBe("released");
     expect(f.leases.find((l) => l.port === 20002)?.status).toBe("active");
