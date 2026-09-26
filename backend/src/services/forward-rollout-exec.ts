@@ -1214,7 +1214,7 @@ export async function executeRollout(
       return { ok: fresh.phase === "done", rolloutId, phase: fresh.phase, completed: completed.size };
     }
   }
-  await markTunnelApplied(row.tunnel_id, row.revision, db);
+  await markTunnelApplied(row.tunnel_id, row.revision, db, deps.now);
   return { ok: true, rolloutId, phase: "done", completed: completed.size };
 }
 
@@ -1293,8 +1293,27 @@ async function markTunnelFailed(
     .catch(() => {});
 }
 
-/** 全部阶段完成：tunnel 行回到 active（desired 与 applied 一致）。 */
-async function markTunnelApplied(tunnelId: number, revision: number, db: RolloutDb): Promise<void> {
+/**
+ * 全部阶段完成：tunnel 行回到 active（desired 与 applied 一致）。
+ *
+ * **必须写 `applied_revision`（与 `config_revision` 同值）**：这正是 §13.3.5
+ * 「成功推进 applied」的那一步，也是 Agent ACK 顺序之后唯一能让
+ * `reconciler.isRevisionBehind()`（`applied < config`）安静下来的地方。只写
+ * `config_revision` 会留下一个静默故障：rollout 记 done、Agent 已在跑新配置，
+ * 而 tunnel 行永远显示「落后」——reconciler 每轮 `resend_same_revision` 重发
+ * 同一 revision，被 Agent 的 stale 闸门拒绝后又进入重试退避，循环空转。
+ * `markTunnelApplied` 是 WP3 对 tunnel 行成功记账的唯一出口，与
+ * `scheduler.persistSuccess`（创建路径）保持同一组列，避免两条写入路径语义分叉。
+ *
+ * `last_applied_at` 同样要写：reconciler 的 `DEFAULT_RETRY_BACKOFF_MS` 退避
+ * 读它，缺列/不写会让退避窗口永远算不出（`null` ⇒ 不 defer）。
+ */
+async function markTunnelApplied(
+  tunnelId: number,
+  revision: number,
+  db: RolloutDb,
+  now?: () => Date,
+): Promise<void> {
   await db.tunnel
     .updateMany({
       where: { id: tunnelId },
@@ -1304,6 +1323,8 @@ async function markTunnelApplied(tunnelId: number, revision: number, db: Rollout
         apply_error_code: null,
         apply_error: null,
         config_revision: revision,
+        applied_revision: revision,
+        last_applied_at: (now?.() ?? new Date()).toISOString(),
       },
     })
     .catch(() => {});

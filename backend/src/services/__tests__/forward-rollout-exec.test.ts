@@ -22,6 +22,9 @@ import { describe, expect, it } from "bun:test";
 
 import type { ForwardImpact } from "../forward-revision.ts";
 import type { RolloutPlan, RolloutSnapshot } from "../forward-rollout.ts";
+// `isRevisionBehind` 是 reconciler 的落后判定（applied < config）：rollout 落账
+// 是否让「编辑后」安静下来，必须用真实判定函数而不是在测试里重抄一遍条件。
+import { isRevisionBehind } from "../reconciler.ts";
 import {
   executeRollout,
   readKeySet,
@@ -512,6 +515,116 @@ describe("正常路径：五阶段推进到 done", () => {
     );
     expect(res.ok).toBe(true);
     expect(f.rollouts[0]!.phase).toBe("done");
+  });
+
+  // ── 成功记账的完整列集合（applied_revision 缺口回归）──
+  //
+  // `markTunnelApplied` 只写 config_revision 而不写 applied_revision 是一个
+  // 没有任何测试会红的缺陷：rollout 行 done、Agent 已跑新配置，而
+  // `reconciler.isRevisionBehind()`（applied < config）永远为 true ⇒ 每轮
+  // `resend_same_revision` 重发同一 revision，被 Agent 的 stale 闸门拒绝后
+  // 进入重试退避，循环空转。接口层（200 OK / config_revision）完全看不出问题，
+  // 只有直接断言 tunnel 行的**全部**记账列才能发现。
+  //
+  // 口径与 `scheduler.persistSuccess`（创建路径）逐列对齐：两条成功写入路径
+  // 语义必须一致，否则「创建后 applied 会收敛、编辑后不会」会成为第二套真相。
+  it("done ⇒ tunnel 行写全成功记账列（applied_revision 收敛，不只 config_revision）", async () => {
+    const at = new Date("2026-09-26T04:00:00.000Z");
+    const { f, deps } = directEnv();
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ listen_port_change: true, listener_replacement: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      { ...deps, now: () => at },
+    );
+    expect(res.ok).toBe(true);
+
+    const tunnel = f.tunnels[0]!;
+    // desired 侧
+    expect(tunnel.apply_status).toBe("active");
+    expect(tunnel.desired_status).toBe("active");
+    expect(tunnel.config_revision).toBe(7);
+    // applied 侧：**这是本用例的核心**。只断言 config_revision 会让旧实现
+    // （缺 applied_revision）保持全绿。
+    expect(tunnel.applied_revision).toBe(7);
+    expect(tunnel.applied_revision).toBe(tunnel.config_revision);
+    // 错误侧被清空，退避窗口读 last_applied_at
+    expect(tunnel.apply_error_code).toBeNull();
+    expect(tunnel.apply_error).toBeNull();
+    expect(tunnel.last_applied_at).toBe("2026-09-26T04:00:00.000Z");
+  });
+
+  // reconciler 的落后判定是纯函数：applied < config ⇒ 永远落后。这里把上面
+  // 落库得到的行喂给真实判定函数，证明「编辑后不再触发同 revision 重发」。
+  //
+  // 基线必须显式播种 `applied_revision: 6`（desired=7）：直接省略会让
+  // `Number(undefined)` 变 NaN，而 `NaN < 7` 是 false ⇒ 旧实现也会 pass，
+  // 断言变成恒真。真实库里这一列在首次 apply 前是 NULL、之后一直是某个整数，
+  // 因此用例按「已发布过 rev6」这条最常见的线上形态来构造。
+  it("done 落库后 reconciler 不再判定 revision 落后", async () => {
+    const { f, deps } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ listen_port_change: true, listener_replacement: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+    expect(res.ok).toBe(true);
+
+    const tunnel = f.tunnels[0]!;
+    const row = {
+      desired_status: String(tunnel.desired_status),
+      config_revision: Number(tunnel.config_revision),
+      applied_revision: Number(tunnel.applied_revision),
+    };
+    // 回归前 enabled：旧实现（不写 applied_revision）下 applied 停在 6，
+    // 这一行会是 true —— 那正是 reconciler 每轮重发同一 revision 的根因。
+    expect(isRevisionBehind(row as never)).toBe(false);
+  });
+
+  // resume 路径（worker 崩溃后补跑）也走同一个 markTunnelApplied：崩溃前的
+  // rollout 行没有 applied_revision 可继承，续跑完成后必须补齐，否则
+  // 「重启一次就永久落后」。
+  it("resume 到 done 时同样补写 applied_revision", async () => {
+    const at = new Date("2026-09-26T04:05:00.000Z");
+    const { f, orch } = directEnv();
+    const deps: RolloutDeps = { db: f.db, orchestrator: orch, now: () => at };
+    const reg = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ listen_port_change: true, listener_replacement: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+    expect(reg.ok).toBe(true);
+    const row = f.rollouts[0]!;
+
+    // 模拟「cutover 后崩溃、drain 前重启」：抹掉 drain/cleanup 进度，phase 退回
+    // drain。applied 侧故意留在旧的 6 —— 只有续跑落账能推进它。
+    row.cleaned = readKeySet(row.cleaned).filter(
+      (k) =>
+        k.endsWith(":validate:-:-") ||
+        k.endsWith(":prepare:acquire_port:11:20002") ||
+        k.endsWith(":cutover:cutover_ingress:11:20002"),
+    );
+    row.phase = "drain";
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.apply_status = "pending";
+
+    const resumed = await executeRollout(row.id, deps);
+    expect(resumed.ok).toBe(true);
+    expect(f.rollouts[0]!.phase).toBe("done");
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
+    expect(f.tunnels[0]!.last_applied_at).toBe("2026-09-26T04:05:00.000Z");
   });
 });
 

@@ -161,6 +161,12 @@ WP14_BOOTSTRAP_PHASE=tunnels python3 "$HERE/_bootstrap.py"
 # edit, so it must exist with a real, ACKed runtime before any V4 scenario
 # runs. It is the same tunnel row seen as a PortForward — no extra runtime,
 # no extra Agent.
+#
+# Exactly ONE create call: `create_v4_forward` passes a fixed listen_port from
+# the fixture, and a second call would hit 409 `port_conflict` (the first call
+# already bound that port) and abort setup.sh before the topology checks run.
+# Port occupancy inside the workspace is asserted by the API itself, not by
+# repeating the request.
 # ----------------------------------------------------------------
 say "阶段 3：创建 V4 Forward（DIRECT，V4 场景的被编辑对象）"
 WP14_BOOTSTRAP_PHASE=forward python3 "$HERE/_bootstrap.py"
@@ -178,14 +184,6 @@ done
 # Panel must not join data networks.
 panel_nets=$(docker inspect wp14-panel --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')
 [[ "$panel_nets" != *"wp14_ingress_data"* && "$panel_nets" != *"wp14_egress_data"* ]] || die "Panel 意外接入数据网段"
-
-# ---------------------------------------------------------------- V4 forward object
-# The v3 gate keeps using the legacy /api/tunnels surface. The V4 Forward object
-# is the product entity going forward, so create it too (real HTTP + real ACK):
-# it is what the V4 scenarios edit. It reuses the same tunnel row seen as a
-# PortForward, so no extra runtime or Agent is introduced.
-say "阶段 3：创建 V4 Forward（DIRECT，作为 V4 场景的被编辑对象）"
-WP14_BOOTSTRAP_PHASE=forward python3 "$HERE/_bootstrap.py"
 
 say "环境就绪"
 cat <<EOF
