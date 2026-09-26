@@ -180,9 +180,11 @@ suspend 自身也只 bump `config_revision`（revision 号因此跳空：4→5�
    无 `release_old_lease`（实测 rev 2 步骤仅
    `validate / prepare:acquire_port(21004) / cutover:cutover_ingress`）。
 4. §13.3.5 要求「Cleanup 必须幂等……不得永久泄漏 NodePortLease」。此时新端口已落地、
-   旧端口 21003 的 lease 仍 active ⇒ 同 tunnel 双 active lease，与 v3 gate T2
-   「NodePortLease 完整且无双 owner」不兼容（两个 active lease 同 node 不同 port，
-   `acquirePort` 的 `reserved` 会同时拒掉这两个端口以外的正常回收逻辑之外的竞争）。
+   旧端口 21003 的 lease 仍 active ⇒ 同一 tunnel 在同一 ingress 节点上同时持有两条
+   active lease。这与 §13.3.2「只靠 DB revision + Agent state report + NodePortLease
+   就能继续/补偿 rollout」的账本前提冲突：对账方看到双 active 时无法判断哪一个端口
+   是真正在跑的 runtime；同时 `acquirePort` 把这两条都占用位（`portPool.ts:478-502`），
+   同一区间内可用端口被无谓压缩。
 
 **观测到的自愈路径（不足以结案）**：后续一次换端口的 rollout 的 `release_old_lease`
 经 `releaseLease({ tunnelId, nodeId })` 释放该 tunnel 在该节点上**全部** active 租约
