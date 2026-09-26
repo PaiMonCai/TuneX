@@ -701,18 +701,20 @@ export async function patchForward(
   // 保存本身已成功（snapshot + revision 已落库，§4.1 铁律不破），worker 下一轮
   // `resumeRollouts()` 会补上——与 WP1「orchestrator 缺失就跳过 reapply」同口径。
   // 注意：此分支**不会**创建 rollout 行，因此不需要回 502/409。
-  if (runtime && !runtime.ok) {
-    // 失败保留 Tunnel 与 revision 历史（§4.1 铁律）：只回带错误，不删行。
+  if (runtime && runtime.status === "conflict") {
+    // 同期已有未完成 rollout（§13.3.5 抢占闸门）⇒ 409，前端刷新后重试。
+    // 必须先于通用 !ok 判断，否则 conflict 会被错误折叠成 502 apply_failed。
+    return error(409, "revision_conflict", "该转发已有正在进行的更新", {
+      data: { latest_revision: revision },
+    });
+  }
+  if (runtime && !runtime.ok && runtime.status !== "waiting") {
+    // 只有确定失败才回 502。waiting 表示 desired/revision 已经可靠落库，
+    // 但 outbound command 的 ACK 结果未知；worker 会按同 revision 继续收敛。
     const failed = await loadForwardRow(id, workspaceId);
     return error(502, "apply_failed", runtime.error ?? "rollout 执行失败", {
       apply_error_code: runtime.error_code,
       data: failed ? forwardView(failed) : { id: current.id, revision },
-    });
-  }
-  if (runtime && runtime.status === "conflict") {
-    // 同期已有未完成 rollout（§13.3.5 抢占闸门）⇒ 409，前端刷新后重试。
-    return error(409, "revision_conflict", "该转发已有正在进行的更新", {
-      data: { latest_revision: revision },
     });
   }
 
