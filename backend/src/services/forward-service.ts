@@ -45,6 +45,7 @@ import {
   TUNNEL_API_ERROR_STATUS,
   type TunnelAction,
 } from "./tunnel-api.ts";
+import { nodeAdmission } from "./node-lifecycle.ts";
 
 export type ForwardMode = "direct" | "relay";
 export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
@@ -89,6 +90,48 @@ export type ForwardServiceError = {
   data?: unknown;
 };
 
+/**
+ * 读回 tunnel 行；读不到时（极端情况：并发删除）退回最小投影，让调用方至少
+ * 能拿到 revision。blocked 分支用——那时「已保存」本身就是成功语义，
+ * 不能因为读行失败把一次成功的保存报错。
+ */
+async function reloadOrMinimal(
+  id: number,
+  workspaceId: number,
+  revision: number,
+): Promise<Parameters<typeof forwardView>[0]> {
+  const row = await loadForwardRow(id, workspaceId);
+  return row ?? ({ id, config_revision: revision, apply_status: "pending" } as never);
+}
+
+/**
+ * V4-WP5 §13.4.2：节点准入判定的**唯一**转发出口。
+ *
+ * 创建 Forward / 迁移到新节点前必须过这里。判定逻辑一行都不在本文件——
+ * lifecycle 与 connection 的口径全在 `services/node-lifecycle.ts` 的
+ * `nodeAdmission`（WP1/WP3/WP8 共用），两边各自判一遍必然漂移。
+ *
+ * 返回 null = 放行；否则是 { code, message } 形状的阻断（`data` 里可选附带
+ * 具体 condition，供 §13.5 的可区分错误码）。
+ */
+function nodeAdmissionError(node: {
+  lifecycle?: string | null;
+  status?: string | null;
+  last_seen_at?: Date | null;
+  node_credential_hash?: string | null;
+  credential_revoked?: boolean;
+}): { code: "conflict"; message: string; data: { condition: string } } | null {
+  const admission = nodeAdmission({
+    lifecycle: node.lifecycle ?? null,
+    status: node.status ?? null,
+    last_seen_at: node.last_seen_at ?? null,
+    has_credential: Boolean(node.node_credential_hash),
+    credential_revoked: Boolean(node.credential_revoked),
+  });
+  if (admission.ok) return null;
+  return { code: "conflict", message: admission.message, data: { condition: admission.condition } };
+}
+
 export type ForwardServiceResult<T> =
   | { ok: true; data: T }
   | ForwardServiceError;
@@ -104,6 +147,14 @@ const nodeSelect = {
   // V4-WP1：自动分配端口前必须确认节点配置了区间（§7.6「未配置区间拒绝分配」）。
   port_range_min: true,
   port_range_max: true,
+  // V4-WP5：§13.4.2 准入判定需要 lifecycle（desired 管理态）。它和下面 role
+  // 的能力判定是两个正交维度：role=ingress 的节点也可能正处于 maintenance。
+  lifecycle: true,
+  // §13.4.1 Connection 层事实：准入谓词要求「已安装且未撤销」。
+  status: true,
+  last_seen_at: true,
+  node_credential_hash: true,
+  credential_revoked: true,
   node_group: { select: { workspace_id: true } },
 } as const;
 
@@ -486,6 +537,14 @@ export async function createForward(
   if (ingress.role !== "ingress" && ingress.role !== "both") {
     return error(409, "conflict", "该节点不具备入口能力");
   }
+  // §13.4.2：active 才接受新业务。role 判定回答「有没有能力」，这里回答
+  // 「现在允不允许接」——二者正交，一个 ingress 节点可以正处于 maintenance。
+  const ingressAdmission = nodeAdmissionError(ingress);
+  if (ingressAdmission) {
+    return error(409, ingressAdmission.code, ingressAdmission.message, {
+      data: ingressAdmission.data,
+    });
+  }
 
   const egress =
     egressId === null ? null : await loadWorkspaceNode(egressId, workspaceId);
@@ -497,6 +556,16 @@ export async function createForward(
   }
   if (egress && egress.role !== "egress" && egress.role !== "both") {
     return error(409, "conflict", "选择的节点不具备出口能力");
+  }
+  if (egress) {
+    // §13.4.2：出口节点同样必须过准入（maintenance/disabled/retiring/waiting
+    // 都不接受新业务）。不能只判入口——RELAY 的两端都是新 runtime 的落点。
+    const egressAdmission = nodeAdmissionError(egress);
+    if (egressAdmission) {
+      return error(409, egressAdmission.code, egressAdmission.message, {
+        data: egressAdmission.data,
+      });
+    }
   }
 
   if (egress) {
@@ -824,6 +893,17 @@ export async function patchForward(
       data: { latest_revision: revision },
     });
   }
+  if (runtime && runtime.status === "blocked") {
+    // ── V4-WP5 §13.4.2 + §13.3.5 失败规则一 ──
+    // rollout 的 VALIDATE 拒绝（节点此刻 maintenance / retiring / disabled /
+    // 未安装）。**desired 与 revision 已可靠落库**，只是不启 runtime——这正是
+    // §13.3.6「用户仍可保存 desired config，节点退出维护后再由 Reconciler 应用」。
+    //
+    // 因此这里不能回 502：502 的语义是「保存失败、请重试」，而实际状态是
+    // 「已保存、待节点恢复后自动应用」。回 502 会让前端提示失败并诱使用户
+    // 反复重试同一编辑。用 200 + 明确的 runtime 状态把真相交回前端。
+    return { ok: true, data: forwardView(await reloadOrMinimal(id, workspaceId, revision)) };
+  }
   if (runtime && !runtime.ok && runtime.status !== "waiting" && runtime.status !== "in_progress") {
     // 只有确定失败才回 502。waiting 表示 desired/revision 已经可靠落库，
     // 但 outbound command 的 ACK 结果未知；worker 会按同 revision 继续收敛。
@@ -973,6 +1053,40 @@ async function resolveForwardCandidate(
   }
   if (candidate.mode === "relay" && !egress) {
     return { ok: false, error: error(404, "not_found", "出口节点不存在") };
+  }
+
+  // ── V4-WP5 §13.4.2：把 Forward（迁移）到新节点前先过准入 ──
+  //
+  // 只判「新选的节点」，不判「当前已在跑的节点」：maintenance 的语义是
+  // 「不接受新业务 + 存量 runtime 尽量保持」，用户**可以**在维护期间保存
+  // 与当前节点无关的编辑（比如改名、改目标），那种编辑不应被这里挡下。
+  // 一旦这次编辑真的要把 runtime 挪到某个节点上，那个节点必须 active。
+  //
+  // 注意与 rollout VALIDATE 的分工：这里回答「这次编辑选的节点能不能选」；
+  // rollout 那边回答「这一刻允不允许下发」（preview 合法 ≠ 立刻应用，
+  // §13.3.6 允许保存 desired 后等节点退出维护）。两者都必须存在。
+  const ingressChanged =
+    Number(ctx.ingress?.id ?? 0) !== Number(current.ingress_node_id ?? 0);
+  const egressChanged =
+    (candidate.mode === "relay" ? Number(candidate.egress_node_id ?? 0) : 0) !==
+    Number(current.egress_node_id ?? 0);
+  if (ingressChanged) {
+    const rejected = nodeAdmissionError(ingress);
+    if (rejected) {
+      return {
+        ok: false,
+        error: error(409, rejected.code, rejected.message, { data: rejected.data }),
+      };
+    }
+  }
+  if (egressChanged && egress) {
+    const rejected = nodeAdmissionError(egress);
+    if (rejected) {
+      return {
+        ok: false,
+        error: error(409, rejected.code, rejected.message, { data: rejected.data }),
+      };
+    }
   }
 
   // 端口占用：DB 租约 + 同节点其它 Forward（含 legacy DIRECT）。
