@@ -156,17 +156,55 @@ ACK 并生效的 revision 判为 `degraded`，导致 `applied_revision` 永久�
 
 ---
 
-## 4. 已知限制与诚实标注
+## 4. 如何复跑（无本地 build）
+
+```bash
+# 1) 建隔离 worktree（若不存在）
+git -C /opt/TuneX worktree add /opt/TuneX-v4-gate-s10 -b feature/v4-gate-forward-rollout-s10 main
+cd /opt/TuneX-v4-gate-s10
+
+# 2) 复制 harness 的运行时状态（这些文件被 .gitignore，不含凭据入库）
+cp /opt/TuneX-v4-gate-rest/scripts/v3-e2e/{.env.wp14,.passwords.env,state.json} scripts/v3-e2e/
+
+# 3) 确认 exact-SHA 预构建镜像在本地
+docker pull ghcr.io/paimoncai/tunex:ed23e550e3584eccca58068f22643ae8acb90997
+docker pull ghcr.io/paimoncai/tunex-agent:ed23e550e3584eccca58068f22643ae8acb90997
+
+# 4) 用 exact-SHA 镜像重建 wp14 栈（只动 wp14-*；会 run db-migrate 与 provisioning）
+bash scripts/v3-e2e/s10-stack-up.sh
+
+# 5) 跑 gate
+bash scripts/v3-e2e/v4-gate-s10.sh
+echo "exit=$?"   # 非 0 即存在 FAIL 或 DEFECT；LIMITED 不单独决定退出码
+```
+
+`s10-stack-up.sh` 是 setup.sh 的「零 build」等价物：不执行任何 `docker build` /
+`bun run build` / `tsc`；`prisma migrate deploy` 与 seed 在镜像内由 compose
+`db-migrate` 角色执行，与 CI/生产同一路径。
+
+### 退出码语义
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 无 FAIL 且无 DEFECT（LIMITED 允许存在，但会打印在总账里） |
+| 3 | 环境阻塞（基线查询为空 / 缺少镜像 / 栈未就绪），无任何 PASS 结论被伪造 |
+| 9 | 白名单之外的容器被请求操作（安全闸门，脚本拒绝执行） |
+| 其它非 0 | 存在 FAIL 或 DEFECT，见 `evidence/v4-gate-s10-result.txt` 逐条明细 |
+
+---
+
+## 5. 已知限制与诚实标注（超出本轮实测的部分）
 
 1. **first-edit baseline**：GHCR exact-SHA 镜像含 D1 自愈修复，因此本切片
    预期不复现 rest 报告 §4 的 D1（旧 lease 未释放）。脚本对
-   `release_old_lease` 与 active-lease 唯一性仍**如实断言**，不复用 rest
-   的特殊分支——这能验证修复在真实 exact-SHA 构建上成立。
-2. **S10-B 中间相捕获**：wp14 的 rollout 通常在亚秒级完成，轮询可能错过
-   中间相。脚本以「至少一次非终态」为目标，但**绝不因没捕获到就把场景判过**：
-   未捕获时该断言记为 `LIMITED` 并附轮询窗口证据， PASS 只在真实捕获时才成立。
+   `release_old_lease` 与 active-lease 唯一性仍**如实断言**，本轮实测确认
+   在同一条 Forward 的第二次编辑上 `release_old_lease` 正常出现（S10.26/
+   S10.27/S10.28/S10.29/S10.30 全 PASS）。
+2. **first-edit 的 D1 分支未复测**：本切片创建 Forward 时 `applied_revision`
+   即非 null（S10.4 PASS），所以「首次编辑无 applied 快照」这条历史缺陷路径
+   本切片没有单独造出来复测；该路径仍以 rest 报告的历史结论为准。
 3. **不读取 secrets**：脚本只读 `state.json` 的非凭据字段与 `.env.wp14` 的
    `MYSQL_ROOT_PASSWORD`/`MYSQL_DATABASE`（仅用于 `mysql -N -e` 登录，对应
    rest 脚本既有做法），**不打印**这些值；报告与证据文件同样不含凭据。
 4. **生产栈零接触**：所有 `docker` 写操作限定 `wp14-*` 容器名白名单，
-   误匹配时脚本拒绝执行而非继续。
+   误匹配时脚本拒绝执行（退出码 9）而非继续。
