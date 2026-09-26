@@ -1595,28 +1595,35 @@ V4.0     Node + Forward 产品入口收敛    ✅
 V4-WP0  V4 产品/团队开发方案冻结       ✅
 V4-WP1  Forward Revision Foundation     ✅ main
 V4-WP2  Agent Hot Reload Primitives     ✅ main
-V4-WP3  Forward Rollout Orchestrator    ✅ main + S10.47 恢复缺陷已在 PR #20 关闭
-V4-WP4  Forward Edit Product UX         ✅ 完成（PR #21，真实 runtime 联调 + 全字段编辑）
-V4-WP5  Node Lifecycle Foundation       NEXT / 已有实现分支，下一阶段先重审偏离再刷新
+V4-WP3  Forward Rollout Orchestrator    ✅ main
+V4-WP4  Forward Edit Product UX         ✅ main（PR #21）
+Gate F1 Forward Fully Editable/Hot Reload ✅ 完成（PR #22 closure）
+V4-WP5  Node Lifecycle Foundation       NEXT / 已有历史分支，下一阶段基于最新 main 重审刷新
 ```
 
-**2026-09-26 runtime closure：** PR #20 的当前代码通过 CI #371 与 Integration #79；
-新增的正式 S10 中断恢复 Gate 为 **PASS=57 / FAIL=0 / LIMITED=0 / DEFECT=0**。
-其中 S10.47 真实执行 `pause ingress Agent → PATCH → ACK timeout → waiting → unpause → resume`，
-最终从 revision 3 自动收敛到 revision 4，`forward_rollout.phase=done` 且数据面继续可用。
+**2026-09-26 V4.1 / Gate V4-F1 最终收口：✅**
 
-这表示 **WP3 runtime / recovery 子门已经全绿，WP4 代码层交付也已完成**。PR #21
-收尾时，正式 S10 又暴露并修复了“同步 PATCH 与 recovery worker 同时续跑同一 rollout”
-的 executor takeover 竞态：输掉 phase CAS 现在按 accepted/in-progress 处理，而不是误报
-502；同时 `ack_timeout` 已从 command bus → orchestrator → rollout executor 端到端收口。
+PR #22 的最后一个代码承载 head `7836d20` 已通过 **CI #439** 与
+**Integration #112**。Gate 证据不再只覆盖 target/listener 等基础编辑，而是同时包含：
 
-但按 §13.7 / §13.8，**仍不提前宣称 Gate V4-F1 / V4.1 完成**：当前自动 Gate 已覆盖
-target/listener/multi-field/stale-409/failure/suspend-resume/restart/interruption recovery，
-仍需为 RELAY 换 Egress、DIRECT ↔ RELAY、Ingress migration 补齐明确的真实 E2E 证据。
+- 既有 `v4-gate.sh` / `v4-gate-rest.sh`：target host/port、listen port、
+  multi-field single revision、stale expected_revision 409、失败保留旧 applied、
+  suspend/resume；
+- `v4-gate-s10.sh`：**PASS=57 / FAIL=0 / LIMITED=1 / DEFECT=0**。S10.47 的
+  `pause ingress Agent → PATCH → ack_timeout/waiting → unpause → runtime truth reconcile`
+  已稳定收敛为 rollout `done`、`applied_revision == config_revision`，数据面可用；
+- 新增 `v4-gate-topology.sh` 四 Agent 拓扑：**PASS=31 / FAIL=0**，真实完成
+  **DIRECT→RELAY、RELAY 更换 Egress、RELAY→DIRECT、Ingress migration**，并同时断言
+  runtime 退场、Binding、NodePortLease 唯一性和最终 ledger 收敛。
 
-正式开发顺序、并行关系和 Gate 以第 13 节为准。V4 期间默认暂停新协议横向扩展；除阻断性安全/生产问题外，UDP、QUIC、multi-hop 等进入 V4 稳定版之后的 WP16+。
+S10 的 `LIMITED=1` 仅记录“未叠加 worker/panel 重启 + Agent pause 的组合实验”，
+不对应 V4-F1 最低验收项，也没有 DEFECT。至此 §13.7 列出的 Gate V4-F1 必验场景
+均有真实 E2E 证据，**V4.1 正式完成**。下一阶段切到 V4.2 / V4-WP5～WP7。
 
-### Compatibility API（P1）
+正式开发顺序、并行关系和 Gate 以第 13 节为准。V4 期间默认暂停新协议横向扩展；
+除阻断性安全/生产问题外，UDP、QUIC、multi-hop 等进入 V4 稳定版之后的 WP16+。
+
+### Compatibility API（P1）### Compatibility API（P1）
 
 仓库内新的 Web 产品代码已经不依赖旧接口。当前仍暂留：
 
@@ -1648,7 +1655,7 @@ V4 后续开发、分支、PR 和合并判断以第 13 节的 Work Package、并
 | 版本 | 目标 | 对应 WP | Release Gate |
 |---|---|---|---|
 | **V4.0** | Node + Forward 产品入口收敛 | 已完成 | ✅ |
-| **V4.1** | Forward 全字段编辑 + Agent 热重载 | V4-WP1～WP4 | Gate V4-F1 |
+| **V4.1** | Forward 全字段编辑 + Agent 热重载 | V4-WP1～WP4 | ✅ Gate V4-F1 |
 | **V4.2** | 托管 Node 生命周期 + Agent 状态监控 | V4-WP5～WP7 | Gate V4-F2 |
 | **V4.3** | Dashboard / 诊断 / 列表规模化 / 交互补全 | V4-WP8～WP9 | Gate V4-F3 |
 | **V4.4** | 权限模型 + NodeGroup 最终语义 | V4-WP10 | Gate V4-F4 |
@@ -2034,13 +2041,15 @@ Gate V4-F1 至少真实验证：
 
 WP3 进入 main 且 Gate 绿后，WP4 才能最终 merge。
 
-**Runtime Gate closure（2026-09-26）：✅** `v4-gate.sh`、`v4-gate-rest.sh` 与
-正式接入 Integration 的 `v4-gate-s10.sh` 已在 PR #20 / Integration #79 同一
-checkout 上全部通过。S10.47 的 Agent 中断恢复从 `applied=3 / config=4`
-自动收敛到 `applied=config=4`、rollout `done`，不再出现 runtime 已生效但
-ledger `degraded` 的分叉。故 WP4 的“merge 依赖 WP3 runtime gate”条件现已满足。
+**Gate V4-F1 final closure（2026-09-26）：✅** PR #22 的代码承载 head
+`7836d20` 已通过 CI #439 与 Integration #112。既有 rollout/rest/S10 Gate 全绿，
+其中 S10 总账为 **PASS=57 / FAIL=0 / LIMITED=1 / DEFECT=0**；新增四 Agent
+`v4-gate-topology.sh` 为 **PASS=31 / FAIL=0**，真实验证 RELAY 换 Egress、
+DIRECT ↔ RELAY 与 Ingress migration，同时检查数据面、runtime 退场、Binding、
+NodePortLease 和 ledger 收敛。因此本节列出的 V4-F1 最低验收项均已闭环，
+**V4.1 可标记完成，开发游标进入 V4.2 / WP5。**
 
-#### Wave 3 — Managed Node
+#### Wave 3 — Managed Node#### Wave 3 — Managed Node
 
 Agent Track 在 WP2 稳定后进入 V4-WP6，避免两个大 Agent PR 同时长期修改 TunnelManager/上报主循环。
 
@@ -2117,7 +2126,7 @@ V4-WP11：
 
 ```text
 Gate V4-F0  Product / Team Contract Frozen          ← V4-WP0
-Gate V4-F1  Forward Fully Editable + Hot Reload     ← WP1–WP4
+Gate V4-F1  Forward Fully Editable + Hot Reload     ← WP1–WP4  ✅
 Gate V4-F2  Managed Node Lifecycle + Telemetry      ← WP5–WP7
 Gate V4-F3  Monitoring / Scale / UX Complete        ← WP8–WP9
 Gate V4-F4  Authorization / NodeGroup Model Stable  ← WP10

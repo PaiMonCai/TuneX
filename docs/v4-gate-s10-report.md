@@ -1,34 +1,26 @@
 # V4-F1 Gate — S10 真实 E2E 切片实施报告
 
-> **2026-09-26 结案更新 — S10.47 已关闭（PR #20 / head `0008dca`）**
+> **2026-09-26 最终结案更新 — V4-F1 已关闭（PR #22 / code head `7836d20`）**
 >
-> 下方原报告保留首次实跑时的历史缺陷现场；其中“PASS=55 / LIMITED=1 /
-> DEFECT=1”与 S10.47 degraded 结论已经**过期**。修复后的当前事实：
+> 本文下方保留 S10 首次发现缺陷时的历史现场；顶部结论以最终自动化证据为准。
 >
-> - outbound command 的“已入队但同步窗口未收到 ACK”使用独立
->   `ack_timeout`，不再与真正的 `agent_unreachable` 混用；
-> - PREPARE/CUTOVER 的 `ack_timeout` 进入可恢复 `waiting`，不会立即发
->   compensation 与迟到的原命令竞态；
-> - `resumeRollouts` 从第一个未完成步骤按**同 revision**幂等续跑；
-> - 崩溃停在 `compensating` 时会继续补偿，不再错误跳回 PREPARE；
-> - Forward PATCH 对 `waiting` 按“desired 已保存、后台继续收敛”处理，
->   同时修正了原先会把 revision conflict 的 409 折叠成 502 的分支顺序；
-> - S10 已正式接入 `.github/workflows/integration.yml`，并直接测试当前
->   checkout 由 `setup.sh` 构建的 `wp14-backend:ci / wp14-agent:ci`。
+> - **CI #439：success**（backend / web / agent / secret-scan 全绿）；
+> - **Integration #112：success**，同一 checkout 跑完 outbound-only、V4 rollout、
+>   REST、S10、F1 topology closure 与统一镜像验证；
+> - S10 总账：**PASS=57 / FAIL=0 / LIMITED=1 / DEFECT=0**；
+> - S10.47：Agent pause 期间 revision 只进入 waiting，不假 done；unpause 后依据
+>   Agent 上报的**具体 resource revision**确认迟到成功，rollout 自动补账并收敛到
+>   `done`、`applied_revision == config_revision`；
+> - rollout 使用 durable single-executor lease，避免同步 PATCH / recovery worker
+>   同时执行远程副作用；
+> - `LIMITED=1` 只代表没有把 worker/panel 重启与 Agent pause 叠加成一个组合实验，
+>   **不是 DEFECT，也不属于 Gate V4-F1 最低必验项**；
+> - PR #22 另增四 Agent `v4-gate-topology.sh`：**PASS=31 / FAIL=0**，补齐
+>   DIRECT→RELAY、RELAY 换 Egress、RELAY→DIRECT、Ingress migration 的真实数据面、
+>   runtime 退场、Binding、lease 与 ledger 证据。
 >
-> **自动验证：**
->
-> - CI #371：backend / web / agent / secret-scan 全部 success；
-> - Integration #79：outbound-only gate、`v4-gate.sh`、`v4-gate-rest.sh`、
->   **`v4-gate-s10.sh`**、统一镜像 build/smoke/Compose 全部 success；
-> - S10 总账：**PASS=57 / FAIL=0 / LIMITED=0 / DEFECT=0**；
-> - S10.47：Agent pause 期间 `applied=3 / config=4` 且无假 `done`；
->   unpause 后约 15 秒自行收敛到 revision 4，终态 `done`；
-> - S10.48：收敛后 rollout phase = `done`；
-> - S10.49：最终端口 21011 真实 TCP 数据面仍读到 `WP14-TARGET-A`。
->
-> 因此 S10.47 已成为正式、可重复的 PR/main 回归门。以下内容仅作为首次发现
-> 缺陷时的历史取证保留。
+> 因此 S10.47 和 V4-F1 的恢复子门均已正式关闭。以下“LIMITED + DEFECT”描述仅是
+> 首次发现问题时的历史取证，不再代表当前代码状态。
 
 分支：`feature/v4-gate-forward-rollout-s10`（worktree `/opt/TuneX-v4-gate-s10`，基线
 `main` @ `ed23e550e3584eccca58068f22643ae8acb90997`）。交付物：独立脚本
