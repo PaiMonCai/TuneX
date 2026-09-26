@@ -1,5 +1,24 @@
 # V4-WP4 — Forward Edit Product UX 开发报告
 
+> **2026-09-26 收口更新（refresh branch / PR #21）**
+>
+> 本报告下方原文保留的是 WP4 最初的 mock-stage 设计与开发记录；当前状态已经从
+> “mock 可用、等待 WP3”推进到**基于真实 rollout runtime 的最终合并候选**：
+>
+> - WP4 的 11 个文件已在 PR #20 的 S10.47 修复 runtime head 上重新构建；
+> - 从原 WP4 基线到当前 runtime head，这 11 个文件没有 mainline 重叠改动，
+>   因此 refresh 是字节级重放而不是冲突手工拼接；
+> - 真实后端契约已包含 full-field PATCH、preview impact、`expected_revision` 409、
+>   `waiting` pending convergence，以及修正后的 revision-conflict 409 返回顺序；
+> - Web CI #375 已通过 typecheck、Forward 单测和 production build；
+> - Integration #81 的真实 wp14 拓扑已通过 outbound-only、V4 rollout、rest、S10
+>   interruption/recovery Gate；统一镜像 smoke/Compose 为最终收尾项；
+> - WP4 本身没有新增 backend/schema/agent 改动，仍保持 Track D 边界。
+>
+> 因此下面“mock 阶段 / 不做真后端联调”的描述仅代表最初开发阶段，不再代表
+> 当前 merge readiness。当前 PR 的目标是把已实现的 Forward 全字段编辑产品 UX
+> 合入主线，并结束 WP4 代码层交付。
+
 - Work package: **V4-WP4 Forward Edit Product UX**（Track D，Wave 2，mock 阶段）
 - Baseline: `feature/v4-wp1-forward-revisions` @ `74f97cd`（WP1 contract 冻结点；CI 绿：run 36184882122）
 - Worktree: `/opt/TuneX-v4-wp4`，分支 `feature/v4-wp4-forward-edit-web`（基于 74f97cd，不带 WP3/WP5 内容）
