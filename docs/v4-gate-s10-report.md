@@ -86,12 +86,73 @@ run（`36228566537`）conclusion=success，因此 exact-SHA 镜像存在且与 `
 
 ---
 
-## 3. 实测状态（由脚本在本会话内回填）
+## 3. 实测状态（脚本在本会话内回填）
 
-> 本节由 `v4-gate-s10.sh` 运行后写入。若脚本因环境阻塞未跑完，这里只会有
-> 阻塞原因与已完成的阶段号，不会有任何 `PASS` 字样。
+运行：2026-09-26 10:20–10:31（`bash scripts/v3-e2e/v4-gate-s10.sh`，完整跑完）。
+栈：`scripts/v3-e2e/s10-stack-up.sh` 用 exact-SHA GHCR 镜像从零重建的 wp14 拓扑
+（含 migrate/seed/provision/创建 v3 DIRECT、RELAY 与 V4 Forward，全部走真实 HTTP API）。
+镜像（本会话从 GHCR manifest 取回 digest 并与本地 pull 结果比对一致）：
 
-（待回填）
+| 镜像 | digest |
+| --- | --- |
+| `ghcr.io/paimoncai/tunex@ed23e55…` | `sha256:524c500eb77bd8326d142f5f72c07ce102c9fc14adca75de53d71ffe26e1b9c8` |
+| `ghcr.io/paimoncai/tunex-agent@ed23e55…` | `sha256:949da5cf10f8cd00e7c75685937404aa450b275acfb19dc49db5d760375e0c04` |
+
+**总账：PASS=55，LIMITED=1，DEFECT=1（FAIL 计数含该 DEFECT），脚本自身失败 0。**
+证据文件：`scripts/v3-e2e/evidence/v4-gate-s10-result.txt`（含逐条结果与
+rollout phase 时间线，未含任何凭据）。
+
+逐组结果：
+
+| 组 | 场景 | 结果 | 关键实测证据 |
+| --- | --- | --- | --- |
+| A0 | 栈与镜像前置 | **PASS** | 九个 wp14 容器运行中；两个 exact-SHA 镜像 digest 与 GHCR 取回值相等 |
+| S10-A | in-flight 非终态 phase | **PASS** | phase 时间线 4 个采样点：`cutover ×3 -> done`，sampler 在 PATCH 之前启动 |
+| S10-B | applied == config | **PASS** | `target_hot_swap` 与 `listener_replace` 后 applied_revision 均等于 config_revision（API 响应与 DB 双查） |
+| S10-C | 单 revision 记账 | **PASS** | 两次编辑各只新增 1 行 `forward_revision` + 1 行 `forward_rollout` |
+| S10-D | 新旧端口真实 marker | **PASS** | 新端口 21011 读到 `WP14-TARGET-B`；旧端口 21010 `wait_dead` 20 次 + 复查均无响应 |
+| S10-C/F | 唯一 active lease | **PASS** | 21011 active；21010 released；`acquire_port` + `release_old_lease` 均在 plan 中 |
+| S10-E | agent 重启数据面 | **PASS** | `State.StartedAt` 前进；重启后 10s 内新鲜 state report；同端口/同 revision/同 marker；仍 1 条 active lease；未产生额外 snapshot |
+| S10-G.1 | 暂停期间无假 done | **PASS** | 暂停期间 PATCH 后 70 个采样点只见 `cutover/compensating`，无任何行到 `done`；applied 不超前 config |
+| S10-G.2 | trap unpause | **PASS** | `docker unpause` 后 `State.Paused=false`；trap 保证中断也恢复 |
+| S10.47 | 中断后自行收敛 | **LIMITED + DEFECT** | 见下 |
+| S10.49 | 数据面最终可读 | **PASS** | 端口 21011 最终读到最后一次真实编辑的目标 `WP14-TARGET-A` |
+
+### S10.47 真实缺陷（DEFECT，如实上报不判过）
+
+暂停 ingress agent 期间发起一次真实 PATCH（target-a）。unpause 后实测：
+
+- Agent 日志：`10:09:16 tunnel upstream hot-swapped id=tunex-12-direct … upstream=target-a:3030 revision=4`
+  ⇒ **运行时确实按 revision 4 生效**。
+- 但 DB ledger：`forward_rollout.revision=4` 停在 `degraded`，`applied_revision=3`
+  落后 `config_revision=4`，且 180s 轮询窗口内未自行收敛到 `applied == config`。
+
+即 **ledger 与 runtime 不一致**：`resumeRollouts` 的补偿路径把一个 Agent 已经
+ACK 并生效的 revision 判为 `degraded`，导致 `applied_revision` 永久落后。脚本把两侧
+证据都写进证据文件，按 DEFECT 计入非零退出，没有把它改判为 LIMITED。
+
+后续如果该缺陷修复，重跑本脚本应看到 `S10.47` 由 LIMITED+DEFECT 变为
+`PASS`（终态 `done`、`applied == config`）。
+
+### 脚本自身在本轮修掉的测量性问题（均为测试问题，非产品问题）
+
+| 问题 | 症状 | 修正 |
+| --- | --- | --- |
+| `mysqlc` 的 docker exec 引号嵌套错误 | 所有 ledger 查询返回空串，断言空 vs 空被记成 PASS | 改用 `v4-gate-rest.sh` 已证明可用的 argv 传参形式 |
+| `assert_eq` / `assert_ne` 空 vs 空判 PASS | 环境失败被静默放过 | 显式判 `FAIL [实得与期望均为空——查询失败，不是相等]` |
+| `createForward` 期望 200 | 实际返回 201 | 改为 201；端点改为 node-scoped `POST /api/nodes/{id}/forwards` |
+| 用容器 Id 证明重启 | `docker restart` 不换 Id（设计如此），断言恒 FAIL | 改用 `State.StartedAt` + 新鲜 state report |
+| 基线读取失败仍继续 | 产生一整屏由空值算术造成的假 FAIL | 基线为空即 fail-fast 退出并说明是环境阻塞 |
+| 上一轮遗留 Forward | 端口冲突/幂等噪声 | 通过真实 API `DELETE` 清理，不手写 DB |
+
+### 环境限制（如实记录）
+
+1. **中断实验覆盖有限**：只做了「pause ingress agent → PATCH → unpause」一条
+   恢复路径；未覆盖 worker/panel 重启叠加 agent 暂停的组合。未跑到的分支没有任何
+   PASS 字样。
+2. **phase 采样竞态**：rollout 常在一个轮询间隔内完成。脚本已把 sampler 提前到
+   PATCH 之前启动，本轮 4 次与 70 次采样都捕获到了非终态，但这依赖时序；若某轮
+   只采到终态，脚本会记 `LIMITED` 而不是 PASS。
 
 ---
 
