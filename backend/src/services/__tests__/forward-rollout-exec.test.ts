@@ -301,6 +301,8 @@ interface FakeOrchestratorOpts {
     dispatchDirect?: boolean;
     removeTunnel?: boolean;
   };
+  /** 明确 reject 与 ACK timeout 必须分开建模；默认是确定失败。 */
+  failCode?: "agent_rejected" | "agent_unreachable";
   /** egress 节点可寻址 host。 */
   egressHost?: string;
 }
@@ -312,7 +314,7 @@ function fakeOrchestrator(opts: FakeOrchestratorOpts = {}) {
     dispatchDirect: [] as Array<Record<string, unknown>>,
     removeTunnel: [] as Array<Record<string, unknown>>,
   };
-  const fail = { error_code: "agent_unreachable", error: "fake transport failure" };
+  const fail = { error_code: opts.failCode ?? "agent_rejected", error: "fake transport failure" };
   const orch = {
     calls,
     dispatchEgress: async (input: Record<string, unknown>) => {
@@ -769,6 +771,33 @@ describe("失败分流（§13.3.5 第三张表）", () => {
 /* ------------------------------------------------------------------ */
 
 describe("续跑：只重放未完成步骤", () => {
+  it("CUTOVER ACK 超时 ⇒ waiting；恢复后同 revision 重放并收敛，不做补偿", async () => {
+    const { f } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.apply_status = "pending";
+
+    const orch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_unreachable" });
+    const first = await registerRollout(
+      { tunnelId: 1, impact: impact({ listen_port_change: true, listener_replacement: true }), revision: 7, baseRevision: 6 },
+      { db: f.db, orchestrator: orch },
+    );
+    expect(first.ok).toBe(false);
+    expect(f.rollouts[0]!.phase).toBe("waiting");
+    expect(f.tunnels[0]!.applied_revision).toBe(6);
+    expect(orch.calls.removeTunnel).toHaveLength(0);
+    expect(f.rollouts[0]!.compensated).toBe(false);
+
+    const recovered = fakeOrchestrator();
+    const resumed = await executeRollout(f.rollouts[0]!.id, { db: f.db, orchestrator: recovered });
+    expect(resumed.ok).toBe(true);
+    expect(f.rollouts[0]!.phase).toBe("done");
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
+    expect(f.tunnels[0]!.config_revision).toBe(7);
+    expect(recovered.calls.dispatchDirect).toHaveLength(1);
+    expect(recovered.calls.removeTunnel).toHaveLength(1);
+    expect(f.rollouts[0]!.compensated).toBe(false);
+  });
+
   it("cutover 后崩溃（drain 前）⇒ resume 只补做 drain/cleanup，不重发入口配置", async () => {
     const { f, deps, orch } = directEnv();
     const reg = await registerRollout(
@@ -810,6 +839,28 @@ describe("续跑：只重放未完成步骤", () => {
     expect(orch.calls.removeTunnel).toHaveLength(beforeRemove + 1);
     // 五个步骤最终全部落账。
     expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(5);
+  });
+
+  it("compensating 中途崩溃 ⇒ resume 继续补偿，而不是错误跳回 prepare", async () => {
+    const { f } = modeSwitchEnv();
+    const orch = fakeOrchestrator();
+    const row = await f.db.forwardRollout.create({
+      data: {
+        tunnel_id: 1, revision: 7, base_revision: 6, phase: "compensating", strategy: "mode_switch",
+        steps: { steps: [], desired: {}, applied: {} }, cleaned: [], prepared: [],
+        last_error_code: "agent_rejected", last_error: "cutover rejected before crash", compensated: false,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      },
+    }) as { id: number };
+    const resumed = await executeRollout(row.id, { db: f.db, orchestrator: orch });
+    expect(resumed.ok).toBe(false);
+    expect(resumed.phase).toBe("failed");
+    expect(resumed.compensated).toBe(true);
+    expect(f.rollouts.find((r) => r.id === row.id)!.phase).toBe("failed");
+    expect(f.rollouts.find((r) => r.id === row.id)!.compensated).toBe(true);
+    expect(orch.calls.removeTunnel.length).toBeGreaterThanOrEqual(1);
+    expect(orch.calls.dispatchDirect).toHaveLength(1);
+    expect(Number((orch.calls.dispatchDirect[0] as { revision: number }).revision)).toBe(6);
   });
 
   it("cutover 中途崩溃 ⇒ resume 从断点补做 cutover 并跑完", async () => {
