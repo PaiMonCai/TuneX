@@ -1453,7 +1453,7 @@ export interface RegisterRolloutResult {
   ok: boolean;
   rolloutId: number | null;
   /** `blocked` = VALIDATE 失败（§13.3.5 失败规则一）：什么都不写。 */
-  status: "done" | "blocked" | "created" | "conflict";
+  status: "done" | "waiting" | "blocked" | "created" | "conflict";
   error_code?: string;
   error?: string;
   blocking?: Array<{ code: string; message: string }>;
@@ -1548,9 +1548,11 @@ export async function registerRollout(
 
   const result = await executeRollout(created.id, deps);
   return {
+    // waiting = desired 已接收但 runtime 结果暂未知；保留 ok=false 让调用者能
+    // 区分「已应用」和「已接受待收敛」，同时用 status 精确表达可恢复状态。
     ok: result.ok,
     rolloutId: created.id,
-    status: result.ok ? "done" : "created",
+    status: result.ok ? "done" : result.phase === "waiting" ? "waiting" : "created",
     error_code: result.error_code,
     error: result.error,
     warnings: plan.warnings,
