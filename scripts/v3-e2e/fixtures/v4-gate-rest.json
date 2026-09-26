@@ -1,0 +1,42 @@
+{
+  "v4_gate_rest": {
+    "notes": "V4-F1 Gate rest 切片（S3 listen_port / S4 multi-field / S5 failure-old-runtime / S6 suspended-edit-resume）。所有端口都在 ingress 组区间 21000-21099 内，且避开 v3 DIRECT(21001)/RELAY(21002)/V4 forward(21003)。client 在 wp14-ingress-data(172.31.10.40)，两个 target 都在该数据网上，因此端口切换可以从 client 侧真实观测。",
+    "port_block": {
+      "ingress_range": "21000-21099",
+      "reserved": [21001, 21002, 21003],
+      "s3_listen_port_after": 21004,
+      "s4_listen_port_final": 21005,
+      "s4_listen_port_transient_high": 21006
+    },
+    "targets": {
+      "target_a": { "host": "target-a", "port": 3030, "marker": "WP14-TARGET-A" },
+      "target_b": { "host": "target-b", "port": 3030, "marker": "WP14-TARGET-B" }
+    },
+    "s3_listen_port": {
+      "new_port": 21004,
+      "expected_marker_after": "WP14-TARGET-A",
+      "notes": "只改 listen_port，target 保持 target-a。新端口必须真实读到 WP14-TARGET-A，旧端口必须不可再建连。"
+    },
+    "s4_multi_field": {
+      "listen_port": 21005,
+      "target_host": "target-b",
+      "target_port": 3030,
+      "name_suffix": "-mf",
+      "expected_marker_after": "WP14-TARGET-B",
+      "notes": "一次 PATCH 同时改 target_host/target_port/listen_port/name。必须只产生 1 行 forward_revision 与 1 行 forward_rollout，且 snapshot 四字段全部为新值（禁止中间半配置状态）。"
+    },
+    "s5_failure_old_runtime": {
+      "conflict_port": 21003,
+      "requested_port": 21003,
+      "notes": "S5 的真实失败注入：把 PATCH 的 listen_port 指向另一条真实 Forward 已 ACK 的端口（v3 DIRECT = 21001 / RELAY = 21002 / V4 forward 最初 21003 已被占用过；这里用一个由真实 createForward 产生的占用端口）。portPool.acquirePort 的 reserved.has(port) => port_taken，或 forward-service port_conflict 短路。随后 appiled_revision 必须不变、数据面仍走旧 target。",
+      "probe_port": 21007,
+      "notes2": "若需要在 PREPARE 阶段失败而不是 VALIDATE 前短路，可把目标端口指向一个已由真实 Forward 占用的端口（租约行 active 但 tunnel 行允许同端口不同节点——当前 harness 只有一台 ingress，因此主要命中 VALIDATE 前 port_conflict 短路，这同样是§13.3.5 第一条失败规则的证据）。"
+    },
+    "s6_suspended_resume": {
+      "first_edit": { "target_host": "target-a", "target_port": 3030, "listen_port": 21006 },
+      "second_edit": { "target_host": "target-b", "target_port": 3030, "listen_port": 21006 },
+      "expected_marker_after_resume": "WP14-TARGET-B",
+      "notes": "suspend -> 连续两次编辑（第二次覆盖第一次）-> resume。resume 后数据面必须只反映第二次编辑（§13.3.2 Reconciler 朝最新 desired revision 收敛，不依次 replay 中间 revision）。"
+    }
+  }
+}
