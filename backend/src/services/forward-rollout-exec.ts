@@ -33,7 +33,7 @@
  *      PREPARE 明确失败 → 释放本轮 prepared 的 lease + 撤已 ACK 的 egress → `failed`，
  *                 `applied_revision` 不动、旧 runtime 继续；
  *      CUTOVER 明确失败 → `compensating`，接着跑 `compensate()`；
- *      PREPARE/CUTOVER 的 `agent_unreachable` → `waiting`，因为 outbound command
+ *      PREPARE/CUTOVER 的 `ack_timeout` → `waiting`，因为 outbound command
  *                 已入队但 ACK 超时并不能证明「未生效」；恢复时按同 revision
  *                 幂等重放，只有明确 reject/failed 才允许补偿；
  *      DRAIN 失败 → 只记 warning，**不阻塞** CLEANUP（在途连接由 kernel 超时兜底）；
@@ -1053,6 +1053,42 @@ export async function compensateRollout(
   return { ok: false, error: errors.join("; ") };
 }
 
+/**
+ * phase CAS 失败并不等于 rollout 失败：同步 PATCH 与 resume worker 可能同时
+ * 续跑同一行。CAS 只负责选出当前执行器；输掉竞争的一方观察新状态后退出，
+ * 不得把“已被别人接管”翻成 502 apply_failed。
+ */
+function concurrentTakeoverResult(
+  rolloutId: number,
+  fresh: RolloutRowView | null,
+  fallbackCompleted: number,
+): RolloutExecResult {
+  if (!fresh) {
+    return {
+      ok: false, rolloutId, phase: "failed",
+      error_code: "concurrent_transition",
+      error: "rollout 状态已变化且无法重新读取",
+      completed: fallbackCompleted,
+    };
+  }
+  const completed = readKeySet(fresh.cleaned).length;
+  if (fresh.phase === "done") return { ok: true, rolloutId, phase: "done", completed };
+  if (fresh.phase === "failed" || fresh.phase === "degraded") {
+    return {
+      ok: false, rolloutId, phase: fresh.phase,
+      error_code: fresh.last_error_code ?? "rollout_failed",
+      error: fresh.last_error ?? "rollout 已由另一执行器推进到失败终态",
+      completed, compensated: fresh.compensated,
+    };
+  }
+  return {
+    ok: false, rolloutId, phase: fresh.phase,
+    error_code: "concurrent_transition",
+    error: "rollout 已由另一执行器接管，等待收敛",
+    completed,
+  };
+}
+
 /* ================================================================== */
 /* 主执行循环                                                          */
 /* ================================================================== */
@@ -1135,14 +1171,7 @@ export async function executeRollout(
       // status 已被并发改动 ⇒ 重新读行（别用旧 completed 覆盖别人的进度）。
       if (!moved) {
         const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-        return {
-          ok: false,
-          rolloutId,
-          phase: fresh?.phase ?? "failed",
-          error_code: "concurrent_transition",
-          error: "rollout 状态被并发修改，重试",
-          completed: readKeySet(fresh?.cleaned).length,
-        };
+        return concurrentTakeoverResult(rolloutId, fresh, completed.size);
       }
       status = phase;
     }
@@ -1177,11 +1206,11 @@ export async function executeRollout(
       // 恢复后仍可能执行这条命令。此时若立刻 compensation，会与迟到的原命令
       // 竞态，形成 runtime 已到新 revision、ledger 却 degraded 的 S10.47。
       //
-      // 因此 PREPARE/CUTOVER 的 agent_unreachable 统一停在 waiting，不释放
+      // 因此 PREPARE/CUTOVER 的 ack_timeout 统一停在 waiting，不释放
       // prepared 资源、不发 revision+1 的补偿。下一轮 resume 以同 revision
       // 重放未完成 step：若原命令已生效，Agent 返回 duplicate/同 revision ACK；
       // 若没生效，则这次正常应用。两种情况最终都走同一条成功记账路径。
-      if ((phase === "prepare" || phase === "cutover") && outcome.error_code === "agent_unreachable") {
+      if ((phase === "prepare" || phase === "cutover") && outcome.error_code === "ack_timeout") {
         ctx.notes.push(`${step.phase}:${step.kind} WAIT ${outcome.error_code} ${outcome.error}`);
         const moved = await transitionRollout(
           rolloutId,
@@ -1197,14 +1226,7 @@ export async function executeRollout(
         );
         if (!moved) {
           const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-          return {
-            ok: false,
-            rolloutId,
-            phase: fresh?.phase ?? "failed",
-            error_code: "concurrent_transition",
-            error: "rollout 状态被并发修改，重试",
-            completed: readKeySet(fresh?.cleaned).length,
-          };
+          return concurrentTakeoverResult(rolloutId, fresh, completed.size);
         }
         return {
           ok: false,
@@ -1255,14 +1277,7 @@ export async function executeRollout(
         );
         if (!moved) {
           const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-          return {
-            ok: false,
-            rolloutId,
-            phase: fresh?.phase ?? "failed",
-            error_code: "concurrent_transition",
-            error: "rollout 状态被并发修改，重试",
-            completed: readKeySet(fresh?.cleaned).length,
-          };
+          return concurrentTakeoverResult(rolloutId, fresh, completed.size);
         }
         const comp = await compensateRollout(rolloutId, deps);
         return {
@@ -1314,9 +1329,7 @@ export async function executeRollout(
   );
   if (!finished) {
     const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-    if (fresh && (fresh.phase === "done" || fresh.phase === "failed")) {
-      return { ok: fresh.phase === "done", rolloutId, phase: fresh.phase, completed: completed.size };
-    }
+    return concurrentTakeoverResult(rolloutId, fresh, completed.size);
   }
   await markTunnelApplied(row.tunnel_id, row.revision, db, deps.now);
   return { ok: true, rolloutId, phase: "done", completed: completed.size };
@@ -1453,7 +1466,7 @@ export interface RegisterRolloutResult {
   ok: boolean;
   rolloutId: number | null;
   /** `blocked` = VALIDATE 失败（§13.3.5 失败规则一）：什么都不写。 */
-  status: "done" | "waiting" | "blocked" | "created" | "conflict";
+  status: "done" | "waiting" | "in_progress" | "blocked" | "created" | "conflict";
   error_code?: string;
   error?: string;
   blocking?: Array<{ code: string; message: string }>;
@@ -1552,7 +1565,7 @@ export async function registerRollout(
     // 区分「已应用」和「已接受待收敛」，同时用 status 精确表达可恢复状态。
     ok: result.ok,
     rolloutId: created.id,
-    status: result.ok ? "done" : result.phase === "waiting" ? "waiting" : "created",
+    status: result.ok ? "done" : result.phase === "waiting" ? "waiting" : result.error_code === "concurrent_transition" ? "in_progress" : "created",
     error_code: result.error_code,
     error: result.error,
     warnings: plan.warnings,
