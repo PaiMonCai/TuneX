@@ -1,0 +1,31 @@
+# S10 override for the wp14 E2E topology.
+#
+# Purpose: run the wp14 stack on PREBUILT exact-SHA GHCR images instead of a
+# locally built backend, and make the Alpine-based prebuilt agent image accept
+# the same command line setup.sh passes to its busybox-based self-built image.
+# Nothing here is a product change; it is a harness-only override applied with
+# `docker compose -f docker-compose.e2e.yaml -f <this file>`.
+services:
+  panel:
+    image: ${TUNEX_BACKEND_IMAGE:?required}
+    working_dir: /app/backend
+
+  worker:
+    image: ${TUNEX_BACKEND_IMAGE:?required}
+    working_dir: /app/backend
+
+  db-migrate:
+    image: ${TUNEX_BACKEND_IMAGE:?required}
+    working_dir: /app/backend
+
+  ingress-agent:
+    image: ${WP14_AGENT_IMAGE:?required}
+    # The prebuilt agent image's entrypoint expects a credential env file; the
+    # E2E harness passes credentials on the command line instead. Skipping the
+    # entrypoint produces the exact same behaviour as the self-built image
+    # (docker-entrypoint.sh only sources the env file then execs the binary).
+    entrypoint: /usr/local/bin/tunex-agent
+
+  egress-agent:
+    image: ${WP14_AGENT_IMAGE:?required}
+    entrypoint: /usr/local/bin/tunex-agent

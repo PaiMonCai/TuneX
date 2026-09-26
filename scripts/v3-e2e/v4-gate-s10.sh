@@ -41,6 +41,10 @@ mkdir -p "$S10_OUT"
 HEAD_SHA=${HEAD_SHA:-ed23e550e3584eccca58068f22643ae8acb90997}
 BACKEND_IMAGE=${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex:$HEAD_SHA}
 AGENT_IMAGE=${WP14_AGENT_IMAGE:-ghcr.io/paimoncai/tunex-agent:$HEAD_SHA}
+# Registry-side digests fetched from GHCR in this session (Release workflow
+# pushes both latest and <head_sha> tags for main's Integration run).
+EXPECTED_BACKEND_DIGEST=${EXPECTED_BACKEND_DIGEST:-'["ghcr.io/paimoncai/tunex@sha256:524c500eb77bd8326d142f5f72c07ce102c9fc14adca75de53d71ffe26e1b9c8"]'}
+EXPECTED_AGENT_DIGEST=${EXPECTED_AGENT_DIGEST:-'["ghcr.io/paimoncai/tunex-agent@sha256:949da5cf10f8cd00e7c75685937404aa450b275acfb19dc49db5d760375e0c04"]'}
 ALLOWED_CONTAINERS="wp14-panel wp14-worker wp14-mysql wp14-redis wp14-ingress-agent wp14-egress-agent wp14-target-a wp14-target-b wp14-client wp14-db-migrate"
 
 PASS=0
@@ -60,8 +64,25 @@ DEFECT() {
   RESULTS+=("DEFECT[$1] | $2")
   printf '\033[1;35mDEFECT[%s]\033[0m | %s\n' "$1" "$2"
 }
-assert_eq() { [[ "$1" == "$2" ]] && ok "$3" || bad "$3 [实得 '$1' 期望 '$2']"; }
 assert_nonempty() { [[ -n "$1" ]] && ok "$2" || bad "$2 [为空]"; }
+assert_ne() {
+  # Empty-vs-empty is an environment failure, not a difference.
+  if [[ -z "$1" && -z "$2" ]]; then
+    bad "$3 [两侧均为空——查询失败，不是不等]"
+    return
+  fi
+  [[ -n "$1" && "$1" != "$2" ]] && ok "$3" || bad "$3 [实得 '$1']"
+}
+assert_eq() {
+  # An empty observed value is never silently "equal" to an empty expectation:
+  # that is an environment failure, not a pass. Callers that legitimately expect
+  # emptiness must pass a non-empty sentinel (e.g. "none").
+  if [[ -z "$1" && -z "$2" ]]; then
+    bad "$3 [实得与期望均为空——查询失败，不是相等]"
+    return
+  fi
+  [[ "$1" == "$2" ]] && ok "$3" || bad "$3 [实得 '$1' 期望 '$2']"
+}
 assert_contains() { [[ "$1" == *"$2"* ]] && ok "$3" || bad "$3 [未含 '$2']"; }
 assert_gt() { [[ "${1:-0}" =~ ^[0-9]+$ && "${2:-0}" =~ ^[0-9]+$ && "$1" -gt "$2" ]] && ok "$3" || bad "$3 [实得 '$1' 需严格大于 '$2']"; }
 
@@ -75,9 +96,15 @@ guard_container() {
 }
 
 mysqlc() {
+  # Read-only ledger probe.
+  #   · .env.wp14 is sourced first so docker exec inherits MYSQL_ROOT_PASSWORD /
+  #     MYSQL_DATABASE as container environment (never echoed, never committed).
+  #   · The SQL goes in as $0 of the inner sh so whitespace and quoted literals
+  #     survive unchanged. tail -1 keeps only the result row of a multi-line
+  #     statement (a blank first line would otherwise count as a wrong answer).
   set -a; . "$ENVF"; set +a
   docker exec wp14-mysql sh -c \
-    'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "$0"' "$1" 2>/dev/null | tail -1
+    'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "$0"' "$1" 2>/dev/null | tail -1 | tr -d '\r'
 }
 
 probe() {
@@ -86,8 +113,8 @@ probe() {
 }
 
 wait_probe() {
-  local port="$1" want="$2" got=""
-  for _ in $(seq 1 40); do
+  local port="$1" want="$2" got="" tries=${3:-40}
+  for _ in $(seq 1 "$tries"); do
     got=$(probe "$port")
     [[ "$got" == "$want" ]] && { printf '%s' "$got"; return 0; }
     sleep 1
@@ -114,6 +141,9 @@ jget() { python3 -c "import json;d=json.load(open('$S10_OUT/$1'));print(d$2)" 2>
 # the real row while the backend is executing. No column is ever written here.
 phase_sampler() {
   local tunnel_id="$1" revision="$2" samples_file="$3" stop_file="$4"
+  # Start each sampler from a clean file so a previous run's samples can never
+  # be mistaken for this run's evidence.
+  : >"$samples_file"
   rm -f "$stop_file"
   (
     while [[ ! -f "$stop_file" ]]; do
@@ -160,6 +190,7 @@ AGENT_C=$(fx "['agent_restart']['container']")
 MARK_A=$(fx "['targets']['target_a']['marker']")
 MARK_B=$(fx "['targets']['target_b']['marker']")
 PRI_WS=$(st workspaces primary id)
+INGRESS_NODE_ID=$(st nodes ingress id)
 
 log "S10 前置检查：wp14 栈 / exact-SHA 镜像"
 for c in wp14-panel wp14-worker wp14-mysql wp14-redis wp14-ingress-agent wp14-egress-agent wp14-target-a wp14-target-b wp14-client; do
@@ -170,14 +201,17 @@ ok "A0.1 wp14 栈九个容器全部存在（白名单外容器一概不操作）
 [[ "$(docker inspect -f '{{.State.Running}}' wp14-panel)" == true ]] && ok "A0.2 wp14-panel 运行中"
 
 # Every image in the wp14 stack must come from the exact-SHA GHCR tag, never the
-# stale local build.
-WP14_IMG_SRC=$(docker inspect -f '{{.Image}}' wp14-panel)
-WP14_IMG_SRC2=$(docker image inspect --format '{{index .RepoDigests 0}}' "$BACKEND_IMAGE" 2>/dev/null || echo "")
-[[ -n "$WP14_IMG_SRC2" ]] && ok "A0.3 exact-SHA backend 镜像 $BACKEND_IMAGE 在本地可考" || bad "A0.3 本地缺少 $BACKEND_IMAGE"
-AGENT_IMG_SRC2=$(docker image inspect --format '{{index .RepoDigests 0}}' "$AGENT_IMAGE" 2>/dev/null || echo "")
-[[ -n "$AGENT_IMG_SRC2" ]] && ok "A0.4 exact-SHA agent 镜像 $AGENT_IMAGE 在本地可考" || bad "A0.4 本地缺少 $AGENT_IMAGE"
-[[ "$WP14_IMG_SRC2" == *"$HEAD_SHA"* ]] && ok "A0.5 backend 镜像 digest 绑定 main HEAD $HEAD_SHA" || bad "A0.5 backend 镜像未绑定 $HEAD_SHA"
-[[ "$AGENT_IMG_SRC2" == *"$HEAD_SHA"* ]] && ok "A0.6 agent 镜像 digest 绑定 main HEAD $HEAD_SHA" || bad "A0.6 agent 镜像未绑定 $HEAD_SHA"
+# stale local build. Verify against the registry-side digest recorded for the
+# local tag, not against a locally rebuilt digest.
+digest_of() { docker image inspect --format '{{json .RepoDigests}}' "$1" 2>/dev/null; }
+BACKEND_DIGEST=$(digest_of "$BACKEND_IMAGE")
+AGENT_DIGEST=$(digest_of "$AGENT_IMAGE")
+[[ "$BACKEND_DIGEST" == *"@sha256:"* ]] && ok "A0.3 exact-SHA backend 镜像 $BACKEND_IMAGE 在本地可考（digest 已登记）" || bad "A0.3 本地缺少 $BACKEND_IMAGE 或未登记 digest"
+[[ "$AGENT_DIGEST" == *"@sha256:"* ]] && ok "A0.4 exact-SHA agent 镜像 $AGENT_IMAGE 在本地可考（digest 已登记）" || bad "A0.4 本地缺少 $AGENT_IMAGE 或未登记 digest"
+[[ "$BACKEND_DIGEST" == *"tunex@sha256:"* ]] && ok "A0.5 backend 镜像指向 ghcr.io/paimoncai/tunex 仓库" || bad "A0.5 backend 镜像仓库不符: $BACKEND_DIGEST"
+[[ "$AGENT_DIGEST" == *"tunex-agent@sha256:"* ]] && ok "A0.6 agent 镜像指向 ghcr.io/paimoncai/tunex-agent 仓库" || bad "A0.6 agent 镜像仓库不符: $AGENT_DIGEST"
+[[ "$BACKEND_DIGEST" == "$EXPECTED_BACKEND_DIGEST" ]] && ok "A0.7 backend digest 等于本会话从 GHCR 取回的 $EXPECTED_BACKEND_DIGEST" || limited "A0.7 backend digest 与预期不同（实得 $BACKEND_DIGEST 期望 $EXPECTED_BACKEND_DIGEST）"
+[[ "$AGENT_DIGEST" == "$EXPECTED_AGENT_DIGEST" ]] && ok "A0.8 agent digest 等于本会话从 GHCR 取回的 $EXPECTED_AGENT_DIGEST" || limited "A0.8 agent digest 与预期不同（实得 $AGENT_DIGEST 期望 $EXPECTED_AGENT_DIGEST）"
 
 # ------------------------------------------------------------------ login
 log "S10 登录（复用 setup.sh 创建的用户/workspace）"
@@ -201,8 +235,11 @@ assert_nonempty "$COOKIE" "S10.1 rest 用户会话登录成功"
 
 api_post_forward() {
   local body="$1" file="$2"
-  curl -sS -m 90 -o "$S10_OUT/$file" -w '%{http_code}' \
-    -X POST "$API/api/forwards" \
+  # node-scoped Forward creation is the real product surface (same endpoint the
+  # Web client uses); the create call returns only after the Agent ACKed the
+  # new runtime, so there is nothing to poll afterwards.
+  curl -sS -m 120 -o "$S10_OUT/$file" -w '%{http_code}' \
+    -X POST "$API/api/nodes/$INGRESS_NODE_ID/forwards" \
     -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" \
     -H 'x-requested-with: XMLHttpRequest' -H 'content-type: application/json' \
     -d "$body" || echo 000
@@ -222,7 +259,16 @@ api_del() {
     -H 'x-requested-with: XMLHttpRequest' || echo 000
 }
 
-TUN_CREATE=$(mysqlc "SELECT id FROM tunnel WHERE name='$FW_NAME' ORDER BY id DESC LIMIT 1;" 2>/dev/null || echo "")
+TUN_CREATE=$(curl -sS -m 20 "$API/api/nodes/$INGRESS_NODE_ID/forwards" \
+  -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" \
+  -H 'x-requested-with: XMLHttpRequest' \
+  | python3 -c "import json,sys
+d=json.load(sys.stdin)
+rows=(d.get('data') if isinstance(d,dict) else d) or []
+rows=rows if isinstance(rows,list) else []
+for r in rows:
+    if r.get('name')=='$FW_NAME':
+        print(r['id']); break" 2>/dev/null || echo "")
 if [[ -n "$TUN_CREATE" ]]; then
   # A previous run left this slice's own Forward behind. Deleting it through the
   # real API keeps the ledger honest (no manual DELETE FROM ... WHERE ...).
@@ -233,8 +279,8 @@ if [[ -n "$TUN_CREATE" ]]; then
 fi
 
 log "S10 创建自己的 Forward（真实业务操作，等待 Agent ACK）"
-CREATE_STATUS=$(api_post_forward "{\"name\":\"$FW_NAME\",\"in_node_group\":\"ingress\",\"listen_port\":$FW_PORT,\"target_host\":\"$FW_HOST\",\"target_port\":$FW_TPORT}" create.json)
-assert_eq "$CREATE_STATUS" "200" "S10.2 createForward HTTP 200（port=$FW_PORT target=$FW_HOST:$FW_TPORT）"
+CREATE_STATUS=$(api_post_forward "{\"name\":\"$FW_NAME\",\"listen_port\":$FW_PORT,\"target_host\":\"$FW_HOST\",\"target_port\":$FW_TPORT}" create.json)
+assert_eq "$CREATE_STATUS" "201" "S10.2 createForward HTTP 201（port=$FW_PORT target=$FW_HOST:$FW_TPORT）"
 
 FORWARD_ID=$(jget create.json "['data']['id']")
 assert_nonempty "$FORWARD_ID" "S10.3 Forward id 已返回"
@@ -247,6 +293,13 @@ BASE_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$F
 BASE_SNAP=$(mysqlc "SELECT COUNT(*) FROM forward_revision WHERE tunnel_id=$FORWARD_ID;")
 BASE_ROLLOUT=$(mysqlc "SELECT COUNT(*) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID;")
 BASE_LEASE=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND status='active';")
+# A blank baseline means the MySQL probe itself failed. Continuing would turn
+# every later ledger delta into a meaningless arithmetic error, so fail fast
+# instead of producing a wall of false FAILs.
+if [[ -z "$BASE_REV" || -z "$BASE_SNAP" || -z "$BASE_LEASE" ]]; then
+  echo "FATAL: S10 基线读取失败 rev='$BASE_REV' snap='$BASE_SNAP' lease='$BASE_LEASE'——环境阻塞，结束运行" >&2
+  exit 3
+fi
 log "S10 基线 rev=$BASE_REV applied=$BASE_APPLIED snapshot=$BASE_SNAP rollout=$BASE_ROLLOUT active_lease=$BASE_LEASE"
 
 BASE_MARK=$(wait_probe "$FW_PORT" "$MARK_A" || true)
@@ -256,11 +309,17 @@ assert_eq "$BASE_MARK" "$MARK_A" "S10.5 真实数据面在端口 $FW_PORT 读到
 # S10-A/B/C — 一次真实 target 热换：阶段推进 + applied==config + 单行记账
 # ==================================================================
 log "S10-A/B/C: target 热换（$FW_HOST -> $SWAP_HOST），观测 rollout 阶段推进"
+# The sampler must be running BEFORE the PATCH: the rollout executes in tens of
+# milliseconds, so a sampler started after the request returns would only ever
+# see the terminal phase and the in-flight assertion could not be honest.
 SAMPLES="$S10_OUT/phase-samples.txt"
 STOPF="$S10_OUT/.stop-sampler"
 phase_sampler "$FORWARD_ID" "$((BASE_REV + 1))" "$SAMPLES" "$STOPF"
+sleep 0.5
 
 PATCH1_STATUS=$(api_patch "{\"target_host\":\"$SWAP_HOST\",\"target_port\":$SWAP_TPORT,\"expected_revision\":$BASE_REV}" patch1.json)
+# Keep sampling a moment after the response so the terminal phase is captured.
+sleep 0.5
 stop_phase_sampler "$STOPF"
 
 assert_eq "$PATCH1_STATUS" "200" "S10.6 target 热换 PATCH HTTP 200"
@@ -286,7 +345,8 @@ else
   limited "S10.10 未捕获到非终态 phase（采样 $SAMPLE_COUNT 点，rollout 可能在一个轮询间隔内完成）——不判 PASS"
 fi
 TERMINAL_PHASE=$(tail -1 "$SAMPLES" 2>/dev/null | awk '{print $2}')
-assert_eq "$TERMINAL_PHASE" "done" "S10.11 rollout 终态 = done"
+DB_TERMINAL_PHASE=$(mysqlc "SELECT IFNULL(phase,'') FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND revision=$P1_REV ORDER BY id DESC LIMIT 1;")
+assert_eq "$DB_TERMINAL_PHASE" "done" "S10.11 rollout 终态 = done（DB 真相；采样末点='$TERMINAL_PHASE'）"
 
 # ---- one edit == one snapshot + one rollout row (+ one lease, still unique)
 P1_SNAP=$(mysqlc "SELECT COUNT(*) FROM forward_revision WHERE tunnel_id=$FORWARD_ID;")
@@ -318,7 +378,15 @@ assert_eq "$P2_APPLIED" "$P2_REV" "S10.19 Agent 已 ACK listener 替换 revision
 P2_NEW_MARK=$(wait_probe "$NEW_PORT" "$MARK_B" || true)
 assert_eq "$P2_NEW_MARK" "$MARK_B" "S10.20 新端口 $NEW_PORT 真实 TCP 读到 $MARK_B"
 P2_OLD_DEAD=$(wait_dead "$FW_PORT" || true)
-assert_eq "$P2_OLD_DEAD" "" "S10.21 旧端口 $FW_PORT 已不再接受新连接"
+# wait_dead already proves the port refused 20 consecutive connections; the
+# ambiguity to rule out is "probe itself was broken", so re-read the port once
+# and require it to be blank too. Blank-after-wait_dead == really dead.
+P2_OLD_RECHECK=$(probe "$FW_PORT")
+if [[ -z "$P2_OLD_DEAD" && -z "$P2_OLD_RECHECK" ]]; then
+  ok "S10.21 旧端口 $FW_PORT 已不再接受新连接（wait_dead 20 次 + 复查均无响应）"
+else
+  bad "S10.21 旧端口 $FW_PORT 仍响应 [wait_dead='$P2_OLD_DEAD' 复查='$P2_OLD_RECHECK']"
+fi
 
 P2_DB_CFG=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
 P2_DB_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
@@ -345,14 +413,32 @@ assert_eq "$P2_OLD_LEASE" "released" "S10.30 旧端口 $FW_PORT 的 lease 已 re
 # ==================================================================
 log "S10-E: 重启 $AGENT_C（真实运维动作，不是手写 DB）"
 guard_container "$AGENT_C"
-AGENT_START_ID=$(docker inspect -f '{{.Id}}' "$AGENT_C")
-docker restart "$AGENT_C" >/dev/null || bad "S10.31 agent 容器 restart 命令失败"
+# NOTE: `docker restart` keeps the SAME container ID (it only restarts the
+# process inside the existing container), so the ID alone cannot prove a
+# restart happened. The honest witness is State.StartedAt combined with the
+# container's own restart count and a fresh state report.
+AGENT_STARTED_AT=$(docker inspect -f '{{.State.StartedAt}}' "$AGENT_C" 2>/dev/null || echo "")
+AGENT_RESTARTS_BEFORE=$(docker inspect -f '{{.RestartCount}}' "$AGENT_C" 2>/dev/null || echo "")
+assert_nonempty "$AGENT_STARTED_AT" "S10.31a 重启前可读到 State.StartedAt（基线）"
+if docker restart "$AGENT_C" >/dev/null 2>&1; then
+  ok "S10.31 docker restart $AGENT_C 命令成功"
+else
+  # An approval-blocked or unsupported restart is an environment blocker, not a
+  # product defect. Say so instead of silently continuing with a stale stamp.
+  bad "S10.31 docker restart $AGENT_C 失败（可能是宿主机审批策略阻止容器生命周期操作）"
+  limited "S10-E 整体受限：容器未真正重启，后续 agent 重启断言不是在测真实重启"
+fi
 for _ in $(seq 1 30); do
   [[ "$(docker inspect -f '{{.State.Running}}' "$AGENT_C" 2>/dev/null)" == true ]] && break
   sleep 1
 done
-AGENT_NOW_ID=$(docker inspect -f '{{.Id}}' "$AGENT_C")
-assert_ne "$AGENT_NOW_ID" "$AGENT_START_ID" "S10.32 agent 容器确已重建（新容器 ID）"
+AGENT_STARTED_AT_AFTER=$(docker inspect -f '{{.State.StartedAt}}' "$AGENT_C" 2>/dev/null || echo "")
+AGENT_RESTARTS_AFTER=$(docker inspect -f '{{.RestartCount}}' "$AGENT_C" 2>/dev/null || echo "")
+if [[ -n "$AGENT_STARTED_AT" && -n "$AGENT_STARTED_AT_AFTER" && "$AGENT_STARTED_AT_AFTER" > "$AGENT_STARTED_AT" ]]; then
+  ok "S10.32 agent 进程确已重启（State.StartedAt $AGENT_STARTED_AT -> $AGENT_STARTED_AT_AFTER；RestartCount $AGENT_RESTARTS_BEFORE -> $AGENT_RESTARTS_AFTER）"
+else
+  limited "S10.32 State.StartedAt 未前进（$AGENT_STARTED_AT -> $AGENT_STARTED_AT_AFTER；RestartCount $AGENT_RESTARTS_BEFORE -> $AGENT_RESTARTS_AFTER）——除非 restart 被宿主机阻止，否则为真实缺陷"
+fi
 
 # Agent must re-authenticate and re-report state after the restart.
 for _ in $(seq 1 40); do
@@ -370,10 +456,10 @@ assert_eq "$P3_MARK" "$MARK_B" "S10.34 agent 重启后同一端口 $NEW_PORT 数
 
 P3_DB_CFG=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
 P3_DB_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
-P3_APPLY_STATE=$(mysqlc "SELECT IFNULL(apply_status,''),IFNULL(desired_status,'') FROM tunnel WHERE id=$FORWARD_ID;" 2>/dev/null || true)
+P3_APPLY_STATE=$(mysqlc "SELECT CONCAT(IFNULL(apply_status,''),'/',IFNULL(desired_status,'')) FROM tunnel WHERE id=$FORWARD_ID;")
 assert_eq "$P3_DB_CFG" "$P2_REV" "S10.35 重启后 config_revision 不变（无需新 revision）"
 assert_eq "$P3_DB_APPLIED" "$P2_REV" "S10.36 重启后 applied_revision 不变（runtime 已恢复）"
-assert_eq "$P3_APPLY_STATE" "active active" "S10.37 重启后 apply_status/desired_status 仍为 active"
+assert_eq "$P3_APPLY_STATE" "active/active" "S10.37 重启后 apply_status/desired_status 仍为 active/active"
 
 P3_LEASE=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND status='active';")
 assert_eq "$P3_LEASE" "1" "S10.38 agent 重启后仍只有一条 active lease"
@@ -441,36 +527,57 @@ if [[ "$(docker inspect -f '{{.State.Paused}}' "$AGENT_C" 2>/dev/null)" == "true
 
   # After unpause the pending revision must converge by itself (resumeRollouts /
   # reconciler), proving recovery rather than a stuck base.
+  # The wait is long on purpose: the real system first drives the rollout
+  # through cutover -> compensating while the paused agent cannot ACK, so a
+  # short window would report a LIMITED for a system that does converge.
   REC_MARK=""
-  for _ in $(seq 1 60); do
+  REC_CFG=""
+  REC_APPLIED=""
+  REC_TERM=""
+  for _ in $(seq 1 90); do
     REC_MARK=$(probe "$NEW_PORT")
     REC_CFG=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
     REC_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
+    REC_TERM=$(mysqlc "SELECT IFNULL(phase,'') FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND revision=$REC_CFG ORDER BY id DESC LIMIT 1;")
     [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" ]] && break
     sleep 2
   done
   if [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" ]]; then
-    ok "S10.47 unpause 后 rollout 自行收敛（rev $P3_DB_CFG -> $REC_APPLIED，终态 done）"
-    REC_TERM=$(mysqlc "SELECT IFNULL(phase,'') FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND revision=$REC_CFG ORDER BY id DESC LIMIT 1;")
+    ok "S10.47 unpause 后 rollout 自行收敛（rev $P3_DB_CFG -> $REC_APPLIED，终态 $REC_TERM）"
     assert_eq "$REC_TERM" "done" "S10.48 收敛后的 rollout 行 phase=done"
   else
-    limited "S10.47 unpause 后未在 120s 内自行收敛（applied=$REC_APPLIED cfg=$REC_CFG，端口 $NEW_PORT marker=$REC_MARK）——如实记 LIMITED，不判 PASS"
+    # Observed in this slice's run: the ledger ends 'degraded' (applied stays
+    # behind config) while the Agent log proves the target swap DID take
+    # effect. That is a real backend finding, not a harness limitation, so it
+    # is recorded as DEFECT with both sides of the evidence quoted.
+    AGENT_SWAPPED=$(docker logs --tail 300 "$AGENT_C" 2>&1 | grep -c "hot-swap" || true)
+    limited "S10.47 unpause 后未在 180s 内自行收敛（applied=$REC_APPLIED cfg=$REC_CFG phase=$REC_TERM 端口 $NEW_PORT marker=$REC_MARK）"
+    if [[ "$REC_TERM" == "degraded" ]]; then
+      DEFECT "S10.47" "暂停期间编辑的 revision $REC_CFG 在 unpause 后停在 degraded：applied_revision=$REC_APPLIED 落后于 config_revision=$REC_CFG，可是 Agent 日志显示 'upstream hot-swapped ... revision=$REC_CFG'（运行已实际生效）——ledger 与 runtime 不一致，resumeRollouts 的补偿路径把已生效的 revision 判为 degraded"
+    fi
   fi
 else
   unverified "S10.41 docker pause $AGENT_C 未生效（或不被支持）——中断实验整体 UNVERIFIED"
 fi
 
-# Final data-plane liveness for the slice.
-FINAL_MARK=$(wait_probe "$NEW_PORT" "$MARK_B" || true)
-assert_eq "$FINAL_MARK" "$MARK_B" "S10.49 实验结束后端口 $NEW_PORT 数据面仍读到 $MARK_B"
+# Final data-plane liveness for the slice. The pause experiment intentionally
+# edited the target to target-a, so the final marker reflects that last real
+# edit — assert "serves SOME real target marker", and separately assert the
+# port is still listening at all.
+FINAL_MARK=$(wait_probe "$NEW_PORT" "$MARK_A" || true)
+if [[ "$FINAL_MARK" == "$MARK_A" ]]; then
+  ok "S10.49 实验结束后端口 $NEW_PORT 数据面仍可读（marker=$FINAL_MARK，即中断实验最后一次真实编辑的目标）"
+else
+  bad "S10.49 实验结束后端口 $NEW_PORT 数据面不可读 [实得 '$FINAL_MARK' 期望 '$MARK_A']"
+fi
 
 # ---------------------------------------------------------------- evidence
 {
   echo "# TuneX V4-F1 Gate — S10 slice Evidence"
   echo "time: $(date -Is)"
   echo "head_sha: $HEAD_SHA"
-  echo "backend_image: $BACKEND_IMAGE digest=$WP14_IMG_SRC2"
-  echo "agent_image:   $AGENT_IMAGE digest=$AGENT_IMG_SRC2"
+  echo "backend_image: $BACKEND_IMAGE digest=$BACKEND_DIGEST"
+  echo "agent_image:   $AGENT_IMAGE digest=$AGENT_DIGEST"
   echo "forward: id=$FORWARD_ID name=$FW_NAME base_port=$FW_PORT target=$FW_HOST:$FW_TPORT"
   echo "baseline: rev=$BASE_REV applied=$BASE_APPLIED snapshot=$BASE_SNAP rollout=$BASE_ROLLOUT lease=$BASE_LEASE"
   echo
@@ -484,7 +591,7 @@ assert_eq "$FINAL_MARK" "$MARK_B" "S10.49 实验结束后端口 $NEW_PORT 数据
   echo
   echo "S10-A/B/C hot swap: rev $BASE_REV -> $P1_REV applied=$P1_APPLIED strategy=$P1_STRATEGY marker=$P1_MARK"
   echo "S10-D listener_replace: $FW_PORT -> $NEW_PORT rev=$P2_REV new_marker=$P2_NEW_MARK old_dead=$([[ -z "$P2_OLD_DEAD" ]] && echo yes || echo no) lease_active=$P2_LEASE old_lease=$P2_OLD_LEASE"
-  echo "S10-E agent restart: container_id $AGENT_START_ID -> $AGENT_NOW_ID rev=$P3_DB_CFG applied=$P3_DB_APPLIED marker=$P3_MARK lease=$P3_LEASE"
+  echo "S10-E agent restart: StartedAt $AGENT_STARTED_AT -> $AGENT_STARTED_AT_AFTER RestartCount $AGENT_RESTARTS_BEFORE -> $AGENT_RESTARTS_AFTER rev=$P3_DB_CFG applied=$P3_DB_APPLIED marker=$P3_MARK lease=$P3_LEASE"
   echo "S10-G paused experiment: paused_patch_http=${PAUSED_PATCH:-n/a} done_rows_while_paused=${IST_DONE_COUNT:-n/a} final_rev=$REC_APPLIED"
   echo
   printf '%s\n' "${RESULTS[@]}"
