@@ -612,6 +612,9 @@ model Tunnel {
   desired_revision_id Int?
   /// V4-WP1：不可变 revision snapshot 历史（一对多，随 Tunnel 级联删除）。
   forward_revisions ForwardRevision[]
+  /// V4-WP3：五阶段 rollout 记账历史（一对多，随 Tunnel 级联删除）。
+  /// 只记「流程进度」，不复制 runtime 事实（见 model 注释）。
+  forward_rollouts ForwardRollout[]
 
   // Node-first 后物理唯一性由 NodePortLease(node_id, port) 保证。
   // 同一 NodeGroup 内不同入口节点允许复用相同 listen_port。
@@ -687,6 +690,67 @@ model ForwardRevision {
   @@unique([tunnel_id, revision])
   @@index([tunnel_id, created_at])
   @@map("forward_revision")
+}
+
+/// V4-WP3 Forward Rollout 记账（DEVELOPMENT.md §13.3.5 五阶段 / §13.3.2 可恢复性）。
+///
+/// **本表不是第二套真相**。它只回答「这一次 rollout 走到哪了」：
+///   · `revision` / `base_revision` 是两个整数（与 tunnel 行既有的
+///     `config_revision` / `applied_revision` 同值）；
+///   · snapshot 内容一律读 `forward_revision`（WP1）；
+///   · runtime 事实（端口、节点、目标）一律读 tunnel 行 + Agent 上报。
+/// 把 runtime 事实复制进来只会得到三份会互相漂移的真相。
+///
+/// 为什么 `apply_status`（单值状态机）不够：它无法表达「这一跳到了哪个阶段、
+/// 哪些资源已分配、补偿到哪一步」。§13.3.2 要求「只靠 DB revision + Agent
+/// state report + NodePortLease 就能继续/补偿 rollout」，前提就是阶段进度
+/// 本身已落库——这就是本表的存在理由。
+///
+/// **一条 tunnel 同一时刻至多一条未完成 rollout**：由服务层
+/// `updateMany where phase in (active set)` 抢占；DB 层面刻意不加唯一键——
+/// 允许历史多行并存，便于排障（哪一次 rollout 卡在哪一步要能查出来）。
+model ForwardRollout {
+  id Int @id @default(autoincrement())
+  tunnel_id Int
+  /// 随 Forward 共存亡：删 Tunnel 会删掉它的 rollout 记账历史。
+  tunnel Tunnel @relation(fields: [tunnel_id], references: [id], onDelete: Cascade)
+  /// 本次 rollout 的目标 revision（创建时刻 = tunnel.config_revision 的瞬时值）。
+  revision Int
+  /// 回退基线：启动本次 rollout 前的 applied_revision（compensation 目标）。
+  /// NULL = 该 Forward 从未被成功 apply 过（首次编辑）。
+  base_revision Int?
+  /// validate|prepare|cutover|drain|cleanup|done|failed|compensating|degraded|waiting
+  phase String @db.VarChar(20)
+  /// §13.3.4 的分类（metadata_only|target_hot_swap|listener_replace|
+  /// node_migration|mode_switch|noop）。WP1 `computeForwardImpact` 的投影，
+  /// 随 rollout 行落库以便续跑与排障。
+  /// 由迁移 20261009123000 追加（C4 实现晚于建表迁移，保持后者逐字不动）。
+  strategy String? @db.VarChar(30)
+  /// 阶段步骤记录（JSON：StepRecord[]，与 scheduler.SCHEDULER_STEPS 同构）。
+  steps Json?
+  /// 已分配/待回收资源句柄（leaseId / bindingId / egress 命令 id …）。
+  prepared Json?
+  /// 每个 CLEANUP 项的幂等键执行结果（重复执行走「已清」分支）。
+  cleaned Json?
+  /// 逐步的人类可读流水账（追加式 notes.push）。§13.3.5「哪一次 rollout 卡在哪一步
+  /// 要能查出来」的载体；与 last_error 的区别：last_error 只记最终失败，notes 记全程。
+  notes Json?
+  /// CUTOVER 失败后是否已回退到 base_revision（§13.3.5 第三张表的判据）。
+  /// 缺省 false 让存量行（迁移前的历史 rollout）语义安全：「未确认补偿」。
+  compensated Boolean @default(false)
+  /// compensation 失败的原因；非 NULL ⇒ phase 落到 degraded，交 Reconciler／
+  /// 人工 Retry 修复（§13.3.5）。成功补偿时为 NULL。
+  compensation_error String? @db.VarChar(500)
+  /// 续跑/补偿的重试计数（观测用：attempt 暴涨 = 环境有问题，不是用户问题）。
+  attempt Int @default(0)
+  last_error_code String? @db.VarChar(64)
+  last_error String? @db.VarChar(500)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([tunnel_id, revision])
+  @@index([phase])
+  @@map("forward_rollout")
 }
 
 model TunnelChain {
