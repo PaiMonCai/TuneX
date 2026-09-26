@@ -818,7 +818,8 @@ describe("resumeRollouts 的顺序", () => {
       now: () => now,
     } as RolloutDeps);
     expect(seenOrderBy).toEqual({ id: "asc" });
-    expect(seenQuietCutoff).toBe(
+    // TypeScript 不会把异步 callback 内的赋值用于外层控制流收窄，显式归一化后断言。
+    expect(typeof seenQuietCutoff === "string" ? seenQuietCutoff : "").toBe(
       new Date(now.getTime() - ROLLOUT_RESUME_QUIET_MS).toISOString(),
     );
   });
