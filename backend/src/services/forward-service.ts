@@ -1065,8 +1065,13 @@ async function resolveForwardCandidate(
   // 注意与 rollout VALIDATE 的分工：这里回答「这次编辑选的节点能不能选」；
   // rollout 那边回答「这一刻允不允许下发」（preview 合法 ≠ 立刻应用，
   // §13.3.6 允许保存 desired 后等节点退出维护）。两者都必须存在。
+  //
+  // 「新选的节点」直接用刚加载的 `ingress` / `egress` 行来比，**不要**写成
+  // `ctx.ingress?.id`：`ctx` 在下面才构造（它的构造依赖本次读库的结果），
+  // 在它声明之前引用就是 TDZ —— CI typecheck 会以 TS2448/TS2454 直接红掉。
+  // 语义完全等价：ctx.ingress 就是稍后那个对象字面量对同一行的投影。
   const ingressChanged =
-    Number(ctx.ingress?.id ?? 0) !== Number(current.ingress_node_id ?? 0);
+    ingress.id !== Number(current.ingress_node_id ?? 0);
   const egressChanged =
     (candidate.mode === "relay" ? Number(candidate.egress_node_id ?? 0) : 0) !==
     Number(current.egress_node_id ?? 0);
