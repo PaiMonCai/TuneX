@@ -33,7 +33,7 @@
  *      PREPARE 明确失败 → 释放本轮 prepared 的 lease + 撤已 ACK 的 egress → `failed`，
  *                 `applied_revision` 不动、旧 runtime 继续；
  *      CUTOVER 明确失败 → `compensating`，接着跑 `compensate()`；
- *      PREPARE/CUTOVER 的 `agent_unreachable` → `waiting`，因为 outbound command
+ *      PREPARE/CUTOVER 的 `ack_timeout` → `waiting`，因为 outbound command
  *                 已入队但 ACK 超时并不能证明「未生效」；恢复时按同 revision
  *                 幂等重放，只有明确 reject/failed 才允许补偿；
  *      DRAIN 失败 → 只记 warning，**不阻塞** CLEANUP（在途连接由 kernel 超时兜底）；
@@ -46,9 +46,11 @@
  * · 不复制 runtime 事实：端口来自 `acquirePort` 的返回值，节点来自 DB 行。
  */
 
+import { randomUUID } from "node:crypto";
+
 import { acquirePort, releaseLease } from "./portPool.ts";
 import type { AcquirePortOutcome } from "./portPool.ts";
-import type { Orchestrator } from "./orchestrator.ts";
+import { Orchestrator } from "./orchestrator.ts";
 import { ACTIVE_ROLLOUT_PHASES, planRollout, ROLLOUT_STAGE_SEQUENCE, rolloutStepKey } from "./forward-rollout.ts";
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
 
@@ -138,6 +140,8 @@ export interface RolloutDeps {
    */
   orchestrator: Orchestrator;
   now?: () => Date;
+  /** 测试可注入无等待 sleeper；生产默认 setTimeout。 */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -189,6 +193,13 @@ export interface RolloutDb {
     update(args: unknown): Promise<unknown>;
     updateMany(args: unknown): Promise<unknown>;
   };
+  /**
+   * Agent 最近一次自报的 runtime 快照。旧测试替身可以不实现；缺失时恢复
+   * 仍走同 revision 重放，只是少一条“事实确认后跳过重发”的优化/安全路径。
+   */
+  nodeStateReport?: {
+    findUnique(args: unknown): Promise<unknown>;
+  };
 }
 
 /* ================================================================== */
@@ -218,8 +229,11 @@ export interface RolloutRowView {
   last_error_code: string | null;
   last_error: string | null;
   compensated: boolean;
-  created_at: Date | null;
-  updated_at: Date | null;
+  /** 单执行器 DB lease；老替身/迁移前对象允许 undefined，按 NULL 处理。 */
+  executor_owner?: string | null;
+  executor_lease_until?: Date | string | null;
+  created_at: Date | string | null;
+  updated_at: Date | string | null;
 }
 
 /* ================================================================== */
@@ -1053,6 +1067,171 @@ export async function compensateRollout(
   return { ok: false, error: errors.join("; ") };
 }
 
+/**
+ * phase CAS 失败并不等于 rollout 失败：同步 PATCH 与 resume worker 可能同时
+ * 续跑同一行。CAS 只负责选出当前执行器；输掉竞争的一方观察新状态后退出，
+ * 不得把“已被别人接管”翻成 502 apply_failed。
+ */
+function concurrentTakeoverResult(
+  rolloutId: number,
+  fresh: RolloutRowView | null,
+  fallbackCompleted: number,
+): RolloutExecResult {
+  if (!fresh) {
+    return {
+      ok: false, rolloutId, phase: "failed",
+      error_code: "concurrent_transition",
+      error: "rollout 状态已变化且无法重新读取",
+      completed: fallbackCompleted,
+    };
+  }
+  const completed = readKeySet(fresh.cleaned).length;
+  if (fresh.phase === "done") return { ok: true, rolloutId, phase: "done", completed };
+  if (fresh.phase === "failed" || fresh.phase === "degraded") {
+    return {
+      ok: false, rolloutId, phase: fresh.phase,
+      error_code: fresh.last_error_code ?? "rollout_failed",
+      error: fresh.last_error ?? "rollout 已由另一执行器推进到失败终态",
+      completed, compensated: fresh.compensated,
+    };
+  }
+  return {
+    ok: false, rolloutId, phase: fresh.phase,
+    error_code: "concurrent_transition",
+    error: "rollout 已由另一执行器接管，等待收敛",
+    completed,
+  };
+}
+
+/* ================================================================== */
+/* 单执行器 lease + runtime 事实确认                                    */
+/* ================================================================== */
+
+/**
+ * 一条远程 ACK 最长等 15s；RELAY 补偿可能连续做多次远程操作。90s 足够当前
+ * owner 完成一个阶段，又能让崩溃后的 worker 在 S10 的 180s 窗口内接管。
+ */
+export const ROLLOUT_EXECUTOR_LEASE_MS = 90_000;
+/** Agent state report 周期 30s；多给 5s 抖动，先等事实再决定是否重发。 */
+export const ROLLOUT_RUNTIME_CONFIRM_WAIT_MS = 35_000;
+const ROLLOUT_RUNTIME_CONFIRM_POLL_MS = 1_000;
+
+function asDate(value: Date | string | null | undefined): Date | null {
+  if (value == null) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+async function claimRolloutExecutor(
+  rolloutId: number,
+  deps: RolloutDeps,
+): Promise<{ token: string | null; row: RolloutRowView | null }> {
+  const row = (await deps.db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
+  if (!row) return { token: null, row: null };
+  if (row.phase === "done" || row.phase === "failed" || row.phase === "degraded") {
+    return { token: null, row };
+  }
+
+  const now = deps.now?.() ?? new Date();
+  const observedOwner = row.executor_owner ?? null;
+  const observedLease = row.executor_lease_until ?? null;
+  const leaseDate = asDate(observedLease);
+  if (observedOwner && leaseDate && leaseDate.getTime() > now.getTime()) {
+    return { token: null, row };
+  }
+
+  const token = randomUUID();
+  const leaseUntil = new Date(now.getTime() + ROLLOUT_EXECUTOR_LEASE_MS);
+  // 对“刚才读到的 owner + lease + phase”做精确 CAS。两个 executor 即使同时
+  // 读到 NULL，也只有一个能把 NULL→token；过期接管同理。
+  const claimed = (await deps.db.forwardRollout.updateMany({
+    where: {
+      id: rolloutId,
+      phase: row.phase,
+      executor_owner: observedOwner,
+      executor_lease_until: observedLease,
+    },
+    data: {
+      executor_owner: token,
+      executor_lease_until: leaseUntil,
+    },
+  })) as { count: number };
+
+  return claimed.count > 0 ? { token, row } : { token: null, row };
+}
+
+async function renewRolloutExecutor(rolloutId: number, token: string, deps: RolloutDeps): Promise<boolean> {
+  const now = deps.now?.() ?? new Date();
+  const renewed = (await deps.db.forwardRollout.updateMany({
+    where: { id: rolloutId, executor_owner: token },
+    data: { executor_lease_until: new Date(now.getTime() + ROLLOUT_EXECUTOR_LEASE_MS) },
+  })) as { count: number };
+  return renewed.count > 0;
+}
+
+async function releaseRolloutExecutor(rolloutId: number, token: string, deps: RolloutDeps): Promise<void> {
+  await deps.db.forwardRollout
+    .updateMany({
+      where: { id: rolloutId, executor_owner: token },
+      data: { executor_owner: null, executor_lease_until: null },
+    })
+    .catch(() => {});
+}
+
+function runtimeResourceId(step: RolloutStep, ctx: RolloutExecContext): string | null {
+  if (step.kind === "prepare_egress" || step.kind === "cutover_egress") {
+    return Orchestrator.egressTunnelId(ctx.tunnelId);
+  }
+  if (step.kind === "cutover_ingress") {
+    return ctx.desired.mode === "relay"
+      ? Orchestrator.relayTunnelId(ctx.tunnelId)
+      : Orchestrator.directTunnelId(ctx.tunnelId);
+  }
+  return null;
+}
+
+/**
+ * ACK timeout 后优先问 Agent 最近一次**具体 resource** 自报，而不是再猜一次。
+ * 只有同 node + 同 resource 的 revision >= desired 才算确认；绝不使用节点级
+ * reported_revision（它是 max，可能来自别的 tunnel，会制造假阳性）。
+ */
+async function runtimeConfirmsStepApplied(
+  step: RolloutStep,
+  ctx: RolloutExecContext,
+  deps: RolloutDeps,
+): Promise<boolean> {
+  const reader = deps.db.nodeStateReport?.findUnique;
+  const nodeId = step.node_id;
+  const resourceId = runtimeResourceId(step, ctx);
+  if (!reader || nodeId == null || !resourceId) return false;
+
+  const deadline = (deps.now?.() ?? new Date()).getTime() + ROLLOUT_RUNTIME_CONFIRM_WAIT_MS;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  while (true) {
+    const snap = (await reader({
+      where: { node_id: nodeId },
+      select: { tunnels: true, reported_at: true },
+    }).catch(() => null)) as { tunnels?: unknown; reported_at?: Date | string | null } | null;
+
+    if (snap && Array.isArray(snap.tunnels)) {
+      for (const raw of snap.tunnels) {
+        if (!raw || typeof raw !== "object") continue;
+        const tunnel = raw as Record<string, unknown>;
+        if (String(tunnel.id ?? "") !== resourceId) continue;
+        const revision = Number(tunnel.revision);
+        // resource revision 单调递增；只要 >= desired，就已经是比任何 wall-clock
+        // 更强的事实。不要再拿 rollout.updated_at/lease heartbeat 当 freshness 闸门。
+        if (Number.isFinite(revision) && revision >= ctx.revision) return true;
+      }
+    }
+
+    const nowMs = (deps.now?.() ?? new Date()).getTime();
+    if (nowMs >= deadline) return false;
+    await sleep(Math.min(ROLLOUT_RUNTIME_CONFIRM_POLL_MS, Math.max(0, deadline - nowMs)));
+  }
+}
+
 /* ================================================================== */
 /* 主执行循环                                                          */
 /* ================================================================== */
@@ -1066,6 +1245,40 @@ export async function compensateRollout(
 export async function executeRollout(
   rolloutId: number,
   deps: RolloutDeps,
+): Promise<RolloutExecResult> {
+  const claimed = await claimRolloutExecutor(rolloutId, deps);
+  if (!claimed.row) {
+    return { ok: false, rolloutId, phase: "failed", error_code: "not_found", error: `rollout ${rolloutId} 不存在`, completed: 0 };
+  }
+  if (!claimed.token) {
+    const row = claimed.row;
+    if (row.phase === "done" || row.phase === "failed" || row.phase === "degraded") {
+      return {
+        ok: row.phase === "done",
+        rolloutId,
+        phase: row.phase,
+        completed: readKeySet(row.cleaned).length,
+        ...(row.phase === "done" ? {} : {
+          error_code: row.last_error_code ?? "rollout_failed",
+          error: row.last_error ?? undefined,
+          compensated: row.compensated,
+        }),
+      };
+    }
+    return concurrentTakeoverResult(rolloutId, row, readKeySet(row.cleaned).length);
+  }
+
+  try {
+    return await executeRolloutOwned(rolloutId, deps, claimed.token);
+  } finally {
+    await releaseRolloutExecutor(rolloutId, claimed.token, deps);
+  }
+}
+
+async function executeRolloutOwned(
+  rolloutId: number,
+  deps: RolloutDeps,
+  executorToken: string,
 ): Promise<RolloutExecResult> {
   const db = deps.db;
   const row = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as
@@ -1125,6 +1338,7 @@ export async function executeRollout(
   // 保留它作为当前 DB phase；循环遇到第一个未完成 step 时再原子地
   // waiting → step.phase。这样 PREPARE/CUTOVER 任一位置都能从断点恢复。
   let status: RolloutStatus = row.phase;
+  const recoveringAmbiguous = row.phase === "waiting" && row.last_error_code === "ack_timeout";
 
   for (const phase of phases) {
     const steps = plan.steps.filter((s) => s.phase === phase && !completed.has(s.idempotency_key));
@@ -1135,19 +1349,29 @@ export async function executeRollout(
       // status 已被并发改动 ⇒ 重新读行（别用旧 completed 覆盖别人的进度）。
       if (!moved) {
         const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-        return {
-          ok: false,
-          rolloutId,
-          phase: fresh?.phase ?? "failed",
-          error_code: "concurrent_transition",
-          error: "rollout 状态被并发修改，重试",
-          completed: readKeySet(fresh?.cleaned).length,
-        };
+        return concurrentTakeoverResult(rolloutId, fresh, completed.size);
       }
       status = phase;
     }
 
     for (const step of steps) {
+      // owner 在每个可能产生副作用的 step 前续租；租约丢失 = 本执行器立即停手。
+      if (!(await renewRolloutExecutor(rolloutId, executorToken, deps))) {
+        const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
+        return concurrentTakeoverResult(rolloutId, fresh, completed.size);
+      }
+
+      // S10.47：第一次 command 的 ACK 可能丢了，但 Agent 已真实应用。恢复时先用
+      // state report 确认具体 resource 的 revision；确认后只补 ledger，不重发命令。
+      if (recoveringAmbiguous && await runtimeConfirmsStepApplied(step, ctx, deps)) {
+        const note = `${step.phase}:${step.kind} CONFIRMED runtime revision=${ctx.revision}`;
+        await markStepCompleted(rolloutId, step.idempotency_key, { db });
+        completed.add(step.idempotency_key);
+        ctx.completed = completed;
+        ctx.notes.push(note);
+        continue;
+      }
+
       const outcome = await runStep(step, ctx, { ...deps, db });
       if (outcome.ok) {
         await markStepCompleted(rolloutId, step.idempotency_key, { db });
@@ -1177,11 +1401,17 @@ export async function executeRollout(
       // 恢复后仍可能执行这条命令。此时若立刻 compensation，会与迟到的原命令
       // 竞态，形成 runtime 已到新 revision、ledger 却 degraded 的 S10.47。
       //
-      // 因此 PREPARE/CUTOVER 的 agent_unreachable 统一停在 waiting，不释放
+      // 因此 PREPARE/CUTOVER 的 ack_timeout 统一停在 waiting，不释放
       // prepared 资源、不发 revision+1 的补偿。下一轮 resume 以同 revision
       // 重放未完成 step：若原命令已生效，Agent 返回 duplicate/同 revision ACK；
       // 若没生效，则这次正常应用。两种情况最终都走同一条成功记账路径。
-      if ((phase === "prepare" || phase === "cutover") && outcome.error_code === "agent_unreachable") {
+      if (
+        (phase === "prepare" || phase === "cutover") &&
+        (
+          outcome.error_code === "ack_timeout" ||
+          (recoveringAmbiguous && outcome.error_code === "stale_revision")
+        )
+      ) {
         ctx.notes.push(`${step.phase}:${step.kind} WAIT ${outcome.error_code} ${outcome.error}`);
         const moved = await transitionRollout(
           rolloutId,
@@ -1197,14 +1427,7 @@ export async function executeRollout(
         );
         if (!moved) {
           const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-          return {
-            ok: false,
-            rolloutId,
-            phase: fresh?.phase ?? "failed",
-            error_code: "concurrent_transition",
-            error: "rollout 状态被并发修改，重试",
-            completed: readKeySet(fresh?.cleaned).length,
-          };
+          return concurrentTakeoverResult(rolloutId, fresh, completed.size);
         }
         return {
           ok: false,
@@ -1255,14 +1478,11 @@ export async function executeRollout(
         );
         if (!moved) {
           const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-          return {
-            ok: false,
-            rolloutId,
-            phase: fresh?.phase ?? "failed",
-            error_code: "concurrent_transition",
-            error: "rollout 状态被并发修改，重试",
-            completed: readKeySet(fresh?.cleaned).length,
-          };
+          return concurrentTakeoverResult(rolloutId, fresh, completed.size);
+        }
+        if (!(await renewRolloutExecutor(rolloutId, executorToken, deps))) {
+          const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
+          return concurrentTakeoverResult(rolloutId, fresh, completed.size);
         }
         const comp = await compensateRollout(rolloutId, deps);
         return {
@@ -1314,9 +1534,7 @@ export async function executeRollout(
   );
   if (!finished) {
     const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
-    if (fresh && (fresh.phase === "done" || fresh.phase === "failed")) {
-      return { ok: fresh.phase === "done", rolloutId, phase: fresh.phase, completed: completed.size };
-    }
+    return concurrentTakeoverResult(rolloutId, fresh, completed.size);
   }
   await markTunnelApplied(row.tunnel_id, row.revision, db, deps.now);
   return { ok: true, rolloutId, phase: "done", completed: completed.size };
@@ -1453,7 +1671,7 @@ export interface RegisterRolloutResult {
   ok: boolean;
   rolloutId: number | null;
   /** `blocked` = VALIDATE 失败（§13.3.5 失败规则一）：什么都不写。 */
-  status: "done" | "waiting" | "blocked" | "created" | "conflict";
+  status: "done" | "waiting" | "in_progress" | "blocked" | "created" | "conflict";
   error_code?: string;
   error?: string;
   blocking?: Array<{ code: string; message: string }>;
@@ -1552,7 +1770,7 @@ export async function registerRollout(
     // 区分「已应用」和「已接受待收敛」，同时用 status 精确表达可恢复状态。
     ok: result.ok,
     rolloutId: created.id,
-    status: result.ok ? "done" : result.phase === "waiting" ? "waiting" : "created",
+    status: result.ok ? "done" : result.phase === "waiting" ? "waiting" : result.error_code === "concurrent_transition" ? "in_progress" : "created",
     error_code: result.error_code,
     error: result.error,
     warnings: plan.warnings,

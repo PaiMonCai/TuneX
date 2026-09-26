@@ -123,7 +123,7 @@ export async function waitAgentCommandAck(
     await new Promise((resolve) => setTimeout(resolve, ACK_POLL_MS));
   }
   throw new AgentTransportError(
-    RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+    RELAY_DISPATCH_ERROR_CODES.ack_timeout,
     `等待 Agent ACK 超时（node=${nodeId}, command=${commandId}）`,
   );
 }

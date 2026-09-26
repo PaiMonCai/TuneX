@@ -51,6 +51,8 @@ interface Row {
   last_error_code: string | null;
   last_error: string | null;
   compensated: boolean;
+  executor_owner?: string | null;
+  executor_lease_until?: Date | string | null;
   created_at: string;
   updated_at: string;
   notes?: string[];
@@ -209,6 +211,8 @@ const fakeDb = () => {
           last_error_code: (a.data.last_error_code as string | null) ?? null,
           last_error: (a.data.last_error as string | null) ?? null,
           compensated: Boolean(a.data.compensated),
+          executor_owner: (a.data.executor_owner as string | null) ?? null,
+          executor_lease_until: (a.data.executor_lease_until as Date | string | null) ?? null,
           created_at: String(a.data.created_at),
           updated_at: String(a.data.updated_at),
           notes: (a.data.notes as string[]) ?? [],
@@ -229,7 +233,12 @@ const fakeDb = () => {
       update: async () => ({ count: 1 }),
       updateMany: async (args: unknown) => {
         const a = args as {
-          where: { id: number; phase?: string | { in: string[] } };
+          where: {
+            id: number;
+            phase?: string | { in: string[] };
+            executor_owner?: string | null;
+            executor_lease_until?: Date | string | null;
+          };
           data: Record<string, unknown>;
         };
         const row = rollouts.find((r) => r.id === a.where.id);
@@ -242,6 +251,14 @@ const fakeDb = () => {
           } else if (!expected.in.includes(row.phase)) {
             return { count: 0 };
           }
+        }
+        if (a.where.executor_owner !== undefined && (row.executor_owner ?? null) !== a.where.executor_owner) {
+          return { count: 0 };
+        }
+        if (a.where.executor_lease_until !== undefined) {
+          const left = row.executor_lease_until == null ? null : new Date(row.executor_lease_until).getTime();
+          const right = a.where.executor_lease_until == null ? null : new Date(a.where.executor_lease_until).getTime();
+          if (left !== right) return { count: 0 };
         }
         for (const [k, v] of Object.entries(a.data)) {
           if (v && typeof v === "object" && "push" in (v as Record<string, unknown>)) {
@@ -302,7 +319,7 @@ interface FakeOrchestratorOpts {
     removeTunnel?: boolean;
   };
   /** 明确 reject 与 ACK timeout 必须分开建模；默认是确定失败。 */
-  failCode?: "agent_rejected" | "agent_unreachable";
+  failCode?: "agent_rejected" | "agent_unreachable" | "ack_timeout";
   /** egress 节点可寻址 host。 */
   egressHost?: string;
 }
@@ -776,7 +793,7 @@ describe("续跑：只重放未完成步骤", () => {
     f.tunnels[0]!.applied_revision = 6;
     f.tunnels[0]!.apply_status = "pending";
 
-    const orch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_unreachable" });
+    const orch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
     const first = await registerRollout(
       { tunnelId: 1, impact: impact({ listen_port_change: true, listener_replacement: true }), revision: 7, baseRevision: 6 },
       { db: f.db, orchestrator: orch },
@@ -799,6 +816,101 @@ describe("续跑：只重放未完成步骤", () => {
     expect(f.rollouts[0]!.compensated).toBe(false);
   });
 
+
+  it("waiting 恢复优先相信新鲜 NodeStateReport：runtime 已到目标 revision 时不重发", async () => {
+    const { f } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.apply_status = "pending";
+
+    const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
+    const first = await registerRollout(
+      { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
+      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:00:00.000Z") },
+    );
+    expect(first.status).toBe("waiting");
+
+    // Agent 的迟到 command 已经实际应用 rev7，并在 waiting 之后上报了具体 resource。
+    (f.db as RolloutDb & { nodeStateReport?: { findUnique(args: unknown): Promise<unknown> } }).nodeStateReport = {
+      findUnique: async () => ({
+        tunnels: [{ id: "tunex-1-direct", revision: 7 }],
+        reported_at: new Date("2026-09-26T13:00:30.000Z"),
+      }),
+    };
+
+    const recovered = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_rejected" });
+    const resumed = await executeRollout(f.rollouts[0]!.id, {
+      db: f.db,
+      orchestrator: recovered,
+      now: () => new Date("2026-09-26T13:00:31.000Z"),
+      sleep: async () => {},
+    });
+    expect(resumed.ok).toBe(true);
+    expect(resumed.phase).toBe("done");
+    expect(recovered.calls.dispatchDirect).toHaveLength(0);
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
+  });
+
+
+  it("waiting 恢复会等一个 state-report 周期，迟到的 runtime revision 出现后不重发", async () => {
+    const { f } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.apply_status = "pending";
+
+    const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
+    const first = await registerRollout(
+      { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
+      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:02:00.000Z") },
+    );
+    expect(first.status).toBe("waiting");
+
+    let reads = 0;
+    (f.db as RolloutDb & { nodeStateReport?: { findUnique(args: unknown): Promise<unknown> } }).nodeStateReport = {
+      findUnique: async () => {
+        reads += 1;
+        return {
+          tunnels: reads < 3
+            ? [{ id: "tunex-1-direct", revision: 6 }]
+            : [{ id: "tunex-1-direct", revision: 7 }],
+          reported_at: new Date("2026-09-26T13:02:10.000Z"),
+        };
+      },
+    };
+
+    let tick = 0;
+    const resumedOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_rejected" });
+    const resumed = await executeRollout(f.rollouts[0]!.id, {
+      db: f.db,
+      orchestrator: resumedOrch,
+      now: () => new Date(Date.parse("2026-09-26T13:02:31.000Z") + tick * 1000),
+      sleep: async () => { tick += 1; },
+    });
+    expect(resumed.ok).toBe(true);
+    expect(reads).toBeGreaterThanOrEqual(3);
+    expect(resumedOrch.calls.dispatchDirect).toHaveLength(0);
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
+  });
+
+  it("executor lease 阻止第二个执行器对同一 active rollout 产生远程副作用", async () => {
+    const { f } = directEnv();
+    const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
+    const first = await registerRollout(
+      { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
+      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:01:00.000Z") },
+    );
+    expect(first.status).toBe("waiting");
+
+    f.rollouts[0]!.executor_owner = "other-executor";
+    f.rollouts[0]!.executor_lease_until = new Date("2026-09-26T13:03:00.000Z");
+    const contender = fakeOrchestrator();
+    const result = await executeRollout(f.rollouts[0]!.id, {
+      db: f.db,
+      orchestrator: contender,
+      now: () => new Date("2026-09-26T13:01:30.000Z"),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error_code).toBe("concurrent_transition");
+    expect(contender.calls.dispatchDirect).toHaveLength(0);
+  });
   it("cutover 后崩溃（drain 前）⇒ resume 只补做 drain/cleanup，不重发入口配置", async () => {
     const { f, deps, orch } = directEnv();
     const reg = await registerRollout(
@@ -987,6 +1099,44 @@ describe("准入、并发与 noop", () => {
     // noop 也写一行 rollout（旁路记账），但 phase=done 且零步骤执行。
     expect(f.rollouts).toHaveLength(1);
     expect(f.rollouts[0]!.phase).toBe("done");
+  });
+
+  it("同步 PATCH 输掉 phase CAS ⇒ accepted in_progress，由另一个 executor 继续", async () => {
+    const { f, deps } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.config_revision = 7;
+    f.tunnels[0]!.apply_status = "pending";
+    const originalUpdateMany = deps.db.forwardRollout.updateMany;
+    let stolen = false;
+    deps.db.forwardRollout.updateMany = async (args: unknown) => {
+      const a = args as { where?: { phase?: unknown }; data?: { phase?: string } };
+      if (!stolen && a.where?.phase === "validate" && a.data?.phase === "prepare") {
+        stolen = true;
+        // 模拟 resume worker 抢先把 validate → prepare。同步请求的 CAS 应输掉，
+        // 但这不是失败：worker 已经接管同一 rollout。
+        f.rollouts[0]!.phase = "prepare";
+        return { count: 0 };
+      }
+      return originalUpdateMany(args);
+    };
+
+    const res = await registerRollout(
+      { tunnelId: 1, impact: impact({ listen_port_change: true, listener_replacement: true }), revision: 7, baseRevision: 6 },
+      deps,
+    );
+    expect(stolen).toBe(true);
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe("in_progress");
+    expect(res.error_code).toBe("concurrent_transition");
+    expect(f.rollouts[0]!.phase).toBe("prepare");
+    expect(f.tunnels[0]!.applied_revision).toBe(6);
+
+    // worker 后续继续即可正常收敛；输掉 CAS 的 HTTP 线程不能把它写成 failed。
+    deps.db.forwardRollout.updateMany = originalUpdateMany;
+    const resumed = await executeRollout(f.rollouts[0]!.id, deps);
+    expect(resumed.ok).toBe(true);
+    expect(f.rollouts[0]!.phase).toBe("done");
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
   });
 
   it("已有 active rollout ⇒ conflict（R6）", async () => {

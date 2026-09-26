@@ -743,6 +743,10 @@ model ForwardRollout {
   compensation_error String? @db.VarChar(500)
   /// 续跑/补偿的重试计数（观测用：attempt 暴涨 = 环境有问题，不是用户问题）。
   attempt Int @default(0)
+  /// 当前唯一执行器。NULL = 无人持有；token 只用于 rollout 内部并发仲裁。
+  executor_owner String? @db.VarChar(64)
+  /// 执行租约到期时间。进程崩溃后其它 worker 只有在到期后才能接管。
+  executor_lease_until DateTime?
   last_error_code String? @db.VarChar(64)
   last_error String? @db.VarChar(500)
   created_at DateTime @default(now())
@@ -750,6 +754,7 @@ model ForwardRollout {
 
   @@index([tunnel_id, revision])
   @@index([phase])
+  @@index([executor_lease_until])
   @@map("forward_rollout")
 }
 

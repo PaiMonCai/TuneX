@@ -2,9 +2,10 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { ArrowLeftRight, MoreHorizontal, Plus, Route, Trash2 } from "lucide-react";
+import { ArrowLeftRight, MoreHorizontal, Pencil, Plus, Route, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
+import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -39,6 +40,22 @@ function isEgress(node: UserNode) {
   return node.role === "egress" || node.role === "both";
 }
 
+/**
+ * 编辑器未选中行时的占位（避免 null 传播进受控表单）。
+ * 仅用于渲染，open=false 时不会真正读到。
+ */
+const EMPTY_FORWARD: PortForward = {
+  id: 0,
+  name: "",
+  mode: "direct",
+  ingress_node_id: 0,
+  egress_node_id: null,
+  listen_port: null,
+  target_host: null,
+  target_port: null,
+  created_at: "",
+} as PortForward;
+
 export function ForwardWorkspace() {
   const { t } = useI18n();
   const [nodes, setNodes] = useState<UserNode[]>([]);
@@ -62,8 +79,16 @@ export function ForwardWorkspace() {
   const [bindingBusy, setBindingBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<number | null>(null);
+  // V4-WP4：列表行也能全字段编辑（§13.3.1），不需要先进详情。
+  const [editTarget, setEditTarget] = useState<PortForward | null>(null);
 
   const ingressNodes = useMemo(() => nodes.filter(isIngress), [nodes]);
+  // 编辑器的出口下拉用字符串 key（Record<string, NodeBinding[]>）。
+  const bindingMapForDialog = useMemo(() => {
+    const out: Record<string, NodeBinding[]> = {};
+    for (const [key, value] of Object.entries(bindings)) out[String(key)] = value;
+    return out;
+  }, [bindings]);
   const selectedBindings = ingressId ? bindings[Number(ingressId)] ?? [] : [];
   const availableEgressNodes = useMemo(() => {
     if (!ingressId) return [];
@@ -480,6 +505,10 @@ export function ForwardWorkspace() {
                               {t("forward.resume")}
                             </DropdownMenuItem>
                           ) : null}
+                          <DropdownMenuItem onClick={() => setEditTarget(forward)}>
+                            <Pencil className="size-4" />
+                            {t("forward.editForward")}
+                          </DropdownMenuItem>
                           <DropdownMenuItem className="text-[var(--destructive)]" onClick={() => void removeForward(forward)}>
                             <Trash2 className="size-4" />
                             {t("common.delete")}
@@ -635,6 +664,24 @@ export function ForwardWorkspace() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* V4-WP4：列表行进入全字段编辑；保存后按 updated 回填行，保持列表可用 */}
+      <ForwardEditDialog
+        open={editTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setEditTarget(null);
+        }}
+        forward={editTarget ?? EMPTY_FORWARD}
+        nodes={nodes}
+        bindings={bindingMapForDialog}
+        onSaved={(updated) => {
+          setForwards((rows) =>
+            rows.map((row) => (Number(row.id) === Number(updated.id) ? updated : row)),
+          );
+          setEditTarget(null);
+        }}
+        onReload={() => void load()}
+      />
     </div>
   );
 }

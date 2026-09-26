@@ -658,6 +658,7 @@ export function mapDispatchCode(
 ): SchedulerErrorCode {
   switch (failure.error_code) {
     case "agent_unreachable":
+    case "ack_timeout":
     case "node_unaddressable":
       return side === "egress"
         ? SCHEDULER_ERROR_CODES.egress_apply_rejected

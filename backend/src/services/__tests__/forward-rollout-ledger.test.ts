@@ -28,7 +28,7 @@ import {
   type RolloutDb,
   type RolloutDeps,
 } from "../forward-rollout-exec.ts";
-import { resumeRollouts } from "../forward-rollout-recovery.ts";
+import { ROLLOUT_RESUME_QUIET_MS, resumeRollouts } from "../forward-rollout-recovery.ts";
 
 /* ------------------------------------------------------------------ */
 /* 内存替身（含四个新列）                                               */
@@ -48,6 +48,8 @@ interface Row {
   notes: string[] | null;
   compensated: boolean;
   compensation_error: string | null;
+  executor_owner?: string | null;
+  executor_lease_until?: Date | string | null;
   last_error_code: string | null;
   last_error: string | null;
   created_at: string;
@@ -178,6 +180,8 @@ const fakeDb = () => {
           notes: (a.data.notes as string[] | null) ?? null,
           compensated: Boolean(a.data.compensated),
           compensation_error: (a.data.compensation_error as string | null) ?? null,
+          executor_owner: (a.data.executor_owner as string | null) ?? null,
+          executor_lease_until: (a.data.executor_lease_until as Date | string | null) ?? null,
           last_error_code: (a.data.last_error_code as string | null) ?? null,
           last_error: (a.data.last_error as string | null) ?? null,
           created_at: String(a.data.created_at),
@@ -199,7 +203,12 @@ const fakeDb = () => {
       update: async () => ({ count: 1 }),
       updateMany: async (args: unknown) => {
         const a = args as {
-          where: { id: number; phase?: string | { in: string[] } };
+          where: {
+            id: number;
+            phase?: string | { in: string[] };
+            executor_owner?: string | null;
+            executor_lease_until?: Date | string | null;
+          };
           data: Record<string, unknown>;
         };
         const row = rollouts.find((r) => r.id === a.where.id);
@@ -211,6 +220,14 @@ const fakeDb = () => {
           } else if (!expected.in.includes(row.phase)) {
             return { count: 0 };
           }
+        }
+        if (a.where.executor_owner !== undefined && (row.executor_owner ?? null) !== a.where.executor_owner) {
+          return { count: 0 };
+        }
+        if (a.where.executor_lease_until !== undefined) {
+          const left = row.executor_lease_until == null ? null : new Date(row.executor_lease_until).getTime();
+          const right = a.where.executor_lease_until == null ? null : new Date(a.where.executor_lease_until).getTime();
+          if (left !== right) return { count: 0 };
         }
         for (const [k, v] of Object.entries(a.data)) {
           // 先判数组：`"push" in []` 因为 Array.prototype.push 继承而为 true，
@@ -262,6 +279,8 @@ const fakeDb = () => {
         notes: null,
         compensated: false,
         compensation_error: null,
+        executor_owner: null,
+        executor_lease_until: null,
         last_error_code: null,
         last_error: null,
         created_at: new Date().toISOString(),
@@ -786,24 +805,43 @@ describe("resumeRollouts：只扫未完成、按 id 升序、一条失败不阻�
 /* ------------------------------------------------------------------ */
 
 describe("resumeRollouts 的顺序", () => {
-  it("where 用 id 升序（先发生的 rollout 先收敛）", async () => {
+  it("where 同时带 active phase + quiet cutoff，并按 id 升序", async () => {
     const f = fakeDb();
     let seenOrderBy: unknown = null;
+    let seenQuietCutoff: string | null = null;
+    const now = new Date("2026-09-26T12:58:00.000Z");
     const db = {
       ...f.db,
       forwardRollout: {
         ...f.db.forwardRollout,
         findMany: async (args: unknown) => {
-          const a = args as { orderBy?: unknown; where?: { phase?: { in: string[] } } };
+          const a = args as {
+            orderBy?: unknown;
+            where?: {
+              phase?: { in: string[] };
+              updated_at?: { lte?: string };
+            };
+          };
           seenOrderBy = a.orderBy;
-          // 断言扫的是 active 集合（不是全表）。
+          seenQuietCutoff = a.where?.updated_at?.lte ?? null;
+          // 断言扫的是 active 集合（不是全表），并且不会抢刚被请求线程推进的 row。
           expect(a.where?.phase?.in).toContain("compensating");
           expect(a.where?.phase?.in).not.toContain("done");
           return [];
         },
       },
     } as unknown as RolloutDb;
-    await resumeRollouts({ db, orchestrator: fakeOrchestrator() as never } as RolloutDeps);
+    await resumeRollouts({
+      db,
+      orchestrator: fakeOrchestrator() as never,
+      now: () => now,
+    } as RolloutDeps);
     expect(seenOrderBy).toEqual({ id: "asc" });
+    // TypeScript 不会把异步 callback 内的赋值用于外层控制流收窄，显式归一化后断言。
+    // Bun 的 expect 对 callback 外仍被推断为 null 的 union 会选错 overload；
+    // String() 在断言边界显式归一化为 string，语义不变。
+    expect(String(seenQuietCutoff ?? "")).toBe(
+      new Date(now.getTime() - ROLLOUT_RESUME_QUIET_MS).toISOString(),
+    );
   });
 });

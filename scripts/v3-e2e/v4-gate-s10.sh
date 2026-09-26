@@ -366,10 +366,25 @@ log "S10-D: listener 替换（port $FW_PORT -> $NEW_PORT）"
 PATCH2_STATUS=$(api_patch "{\"listen_port\":$NEW_PORT,\"target_host\":\"$SWAP_HOST\",\"target_port\":$SWAP_TPORT,\"expected_revision\":$P1_REV}" patch2.json)
 assert_eq "$PATCH2_STATUS" "200" "S10.17 listen_port PATCH HTTP 200"
 P2_REV=$(jget patch2.json "['data']['config_revision']")
-P2_APPLIED=$(jget patch2.json "['data']['applied_revision']")
 P2_VIEW_PORT=$(jget patch2.json "['data']['listen_port']")
 assert_eq "$P2_VIEW_PORT" "$NEW_PORT" "S10.18 Forward 视图 listen_port 已切到 $NEW_PORT"
-assert_eq "$P2_APPLIED" "$P2_REV" "S10.19 Agent 已 ACK listener 替换 revision"
+
+# PATCH 可能与 1s recovery worker 同时续跑同一 rollout。HTTP 线程输掉 phase
+# CAS 时现在返回 200 + pending，而不是伪 502；因此 Gate 必须等待 ledger 真相
+# 收敛后再断言 applied/lease，而不能把“HTTP 返回瞬间”当作 done 屏障。
+P2_APPLIED=""
+P2_TERM=""
+P2_LEASE=""
+P2_OLD_LEASE=""
+for _ in $(seq 1 40); do
+  P2_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
+  P2_TERM=$(mysqlc "SELECT IFNULL(phase,'') FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND revision=$P2_REV ORDER BY id DESC LIMIT 1;")
+  P2_LEASE=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND status='active';")
+  P2_OLD_LEASE=$(mysqlc "SELECT IFNULL(status,'') FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND port=$FW_PORT ORDER BY id DESC LIMIT 1;")
+  [[ "$P2_APPLIED" == "$P2_REV" && "$P2_TERM" == "done" && "$P2_LEASE" == "1" && "$P2_OLD_LEASE" == "released" ]] && break
+  sleep 1
+done
+assert_eq "$P2_APPLIED" "$P2_REV" "S10.19 Agent/ledger 已收敛 listener 替换 revision"
 
 P2_NEW_MARK=$(wait_probe "$NEW_PORT" "$MARK_B" || true)
 assert_eq "$P2_NEW_MARK" "$MARK_B" "S10.20 新端口 $NEW_PORT 真实 TCP 读到 $MARK_B"
@@ -397,11 +412,10 @@ P2_STEPS=$(mysqlc "SELECT IFNULL(steps,'') FROM forward_rollout WHERE tunnel_id=
 assert_contains "$P2_STEPS" "acquire_port" "S10.26 rollout 计划含 acquire_port"
 assert_contains "$P2_STEPS" "release_old_lease" "S10.27 rollout 计划含 release_old_lease（§13.3.5 CLEANUP）"
 
-P2_LEASE=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND status='active';")
+# P2_LEASE / P2_OLD_LEASE 已在上面的收敛循环中读取最终值。
 assert_eq "$P2_LEASE" "1" "S10.28 同一 tunnel 只有一条 active lease（无泄漏）"
 P2_LEASE_PORT=$(mysqlc "SELECT IFNULL(port,0) FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND status='active' ORDER BY id DESC LIMIT 1;")
 assert_eq "$P2_LEASE_PORT" "$NEW_PORT" "S10.29 active lease 端口即新端口 $NEW_PORT"
-P2_OLD_LEASE=$(mysqlc "SELECT IFNULL(status,'') FROM node_port_lease WHERE tunnel_id=$FORWARD_ID AND port=$FW_PORT ORDER BY id DESC LIMIT 1;")
 assert_eq "$P2_OLD_LEASE" "released" "S10.30 旧端口 $FW_PORT 的 lease 已 released"
 
 # ==================================================================
@@ -495,13 +509,14 @@ if [[ "$(docker inspect -f '{{.State.Paused}}' "$AGENT_C" 2>/dev/null)" == "true
   phase_sampler "$FORWARD_ID" "$((P3_DB_CFG + 1))" "$IST_SAMPLES" "$S10_OUT/.stop-ist"
   PAUSED_PATCH=$(api_patch "{\"target_host\":\"$FW_HOST\",\"target_port\":$FW_TPORT,\"expected_revision\":$P3_DB_CFG}" paused-patch.json)
   stop_phase_sampler "$S10_OUT/.stop-ist"
+  assert_eq "$PAUSED_PATCH" "200" "S10.41b pause 期间 PATCH 已保存为 pending（等待恢复收敛）"
   IST_NON_TERMINAL=$(awk '$2!="" && $2!="done" && $2!="failed" && $2!="degraded" && $2!="compensating" {print $2}' "$IST_SAMPLES" 2>/dev/null | sort -u | tr '\n' ',' || true)
   IST_NON_TERMINAL="${IST_NON_TERMINAL%,}"
   IST_SAMPLES_N=$(wc -l <"$IST_SAMPLES" 2>/dev/null | tr -d ' ' || echo 0)
   echo "paused-phase samples ($IST_SAMPLES_N): $(tr '\n' ' ' <"$IST_SAMPLES" 2>/dev/null | sed 's/  */ /g')"
 
-  # The API is expected to answer (possibly 5xx/409) — what matters is the
-  # ledger never claims a done rollout for a revision the agent could not ACK.
+  # PATCH 必须被接受为 desired/pending；真正的生效由 unpause 后 recovery 证明。
+  # 暂停期间 ledger 绝不能提前声称 done。
   IST_DB_CFG=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
   IST_DB_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
   IST_DONE_COUNT=$(mysqlc "SELECT COUNT(*) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND phase='done' AND revision > $P3_DB_CFG;")

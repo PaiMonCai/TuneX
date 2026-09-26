@@ -382,7 +382,11 @@ func TestReplaceListenerOldPortGuardFollowsTheOldListener(t *testing.T) {
 
 	// And it IS released afterwards, with the port immediately reusable: no
 	// permanent leak.
-	if !portFreedWithin(t, tm.UsedPorts, oldPort, 5*time.Second) {
+	// Stop drains for up to the package hard ceiling. On a loaded CI runner the
+	// held connection can consume essentially the full 5s before teardown's
+	// post-stop hook runs, so give the guard a small scheduler margin instead
+	// of racing the exact drain timeout.
+	if !portFreedWithin(t, tm.UsedPorts, oldPort, 7*time.Second) {
 		t.Fatal("the old port reservation was never released")
 	}
 	waitForPortClosed(t, oldPort)

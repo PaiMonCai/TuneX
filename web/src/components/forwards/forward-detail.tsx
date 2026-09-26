@@ -2,26 +2,18 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Copy, Loader2, Pencil, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
+import { ForwardEditDialog, RunningVsDesiredBadge } from "@/components/forwards/forward-edit-dialog";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { InfoRow } from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
-import type { PortForward, TrafficPoint } from "@/lib/types";
+import type { NodeBinding, PortForward, TrafficPoint, UserNode } from "@/lib/types";
 import { formatBytes, formatDateTime } from "@/lib/utils";
 
 function statusVariant(status: PortForward["apply_status"]) {
@@ -44,9 +36,37 @@ export function ForwardDetail({
   const [actionBusy, setActionBusy] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // V4-WP4：编辑 = 全字段编辑器（不再只有改名）。
   const [editOpen, setEditOpen] = useState(false);
-  const [nameDraft, setNameDraft] = useState(initialForward.name);
-  const [saving, setSaving] = useState(false);
+  const [nodes, setNodes] = useState<UserNode[]>([]);
+  const [bindings, setBindings] = useState<Record<string, NodeBinding[]>>({});
+
+  useEffect(() => {
+    if (!editOpen) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const rows = await api.nodes.list();
+        if (cancelled) return;
+        setNodes(rows);
+        const ingressRows = rows.filter(
+          (node) => node.role === "ingress" || node.role === "both",
+        );
+        const map: Record<string, NodeBinding[]> = {};
+        for (const node of ingressRows) {
+          const list = await api.nodes.bindings(node.id);
+          map[String(node.id)] = list;
+        }
+        if (!cancelled) setBindings(map);
+      } catch {
+        // 节点列表只服务于编辑器的下拉；取不到时编辑器仍可打开，
+        // 由表单自身的必填校验提示用户。
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [editOpen]);
 
   async function refreshTraffic() {
     try {
@@ -67,26 +87,6 @@ export function ForwardDetail({
       toast.error(error instanceof Error ? error.message : t("forward.loadFailed"));
     } finally {
       setActionBusy(false);
-    }
-  }
-
-  async function saveName() {
-    const name = nameDraft.trim();
-    if (!name) {
-      toast.error(t("forward.saveFailed"));
-      return;
-    }
-    setSaving(true);
-    try {
-      const updated = await api.forwards.update(forward.id, { name });
-      setForward(updated);
-      setEditOpen(false);
-      toast.success(t("forward.saveSuccess"));
-      router.refresh();
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : t("forward.saveFailed"));
-    } finally {
-      setSaving(false);
     }
   }
 
@@ -150,13 +150,10 @@ export function ForwardDetail({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => {
-              setNameDraft(forward.name);
-              setEditOpen(true);
-            }}
+            onClick={() => setEditOpen(true)}
           >
             <Pencil className="size-4" />
-            {t("forward.editName")}
+            {t("forward.editForward")}
           </Button>
           <Button size="sm" variant="destructive" onClick={() => setConfirmDelete(true)}>
             <Trash2 className="size-4" />
@@ -251,6 +248,10 @@ export function ForwardDetail({
         </CardHeader>
         <CardContent className="grid gap-x-8 md:grid-cols-2">
           <div className="flex flex-col divide-y divide-[var(--border)]">
+            {/* V4-WP4：running-vs-desired 用产品状态表达，先给语义再给数字。 */}
+            <InfoRow label={t("forward.runningDesired")}>
+              <RunningVsDesiredBadge forward={forward} />
+            </InfoRow>
             <InfoRow label={t("forward.desiredStatus")}>
               {forward.desired_status ?? t("common.none")}
             </InfoRow>
@@ -260,7 +261,7 @@ export function ForwardDetail({
               </Badge>
             </InfoRow>
             <InfoRow label={t("forward.revision")}>
-              {forward.config_revision ?? "—"}
+              {forward.config_revision ?? forward.latest_revision ?? "—"}
             </InfoRow>
           </div>
           <div className="flex flex-col divide-y divide-[var(--border)]">
@@ -286,24 +287,18 @@ export function ForwardDetail({
         </CardContent>
       </Card>
 
-      <Dialog open={editOpen} onOpenChange={setEditOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t("forward.editName")}</DialogTitle>
-            <DialogDescription>{t("forward.detailSubtitle")}</DialogDescription>
-          </DialogHeader>
-          <Input value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} maxLength={60} />
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setEditOpen(false)} disabled={saving}>
-              {t("common.cancel")}
-            </Button>
-            <Button onClick={() => void saveName()} disabled={saving}>
-              {saving && <Loader2 className="size-4 animate-spin" />}
-              {t("common.save")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ForwardEditDialog
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        forward={forward}
+        nodes={nodes}
+        bindings={bindings}
+        onSaved={(updated) => {
+          setForward(updated);
+          router.refresh();
+        }}
+        onReload={() => router.refresh()}
+      />
 
       <ConfirmDeleteDialog
         open={confirmDelete}
