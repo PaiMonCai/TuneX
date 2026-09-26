@@ -1592,10 +1592,21 @@ V4.0     Node + Forward 产品入口收敛    ✅
 ### V4 当前执行状态
 
 ```text
-V4-WP0  V4 产品/团队开发方案冻结       ✅（本计划）
-V4-WP1  Forward Revision Foundation     NEXT
-V4-WP5  Node Lifecycle Foundation       NEXT / 可与 WP1 做契约层并行
+V4-WP0  V4 产品/团队开发方案冻结       ✅
+V4-WP1  Forward Revision Foundation     ✅ main
+V4-WP2  Agent Hot Reload Primitives     ✅ main
+V4-WP3  Forward Rollout Orchestrator    ✅ main + S10.47 恢复缺陷已在 PR #20 关闭
+V4-WP4  Forward Edit Product UX         NEXT / 旧实现分支需基于最新 main 重放并真后端联调
+V4-WP5  Node Lifecycle Foundation       ⏸ 已有实现分支，V4.1 收口后继续
 ```
+
+**2026-09-26 runtime closure：** PR #20 的当前代码通过 CI #371 与 Integration #79；
+新增的正式 S10 中断恢复 Gate 为 **PASS=57 / FAIL=0 / LIMITED=0 / DEFECT=0**。
+其中 S10.47 真实执行 `pause ingress Agent → PATCH → ACK timeout → waiting → unpause → resume`，
+最终从 revision 3 自动收敛到 revision 4，`forward_rollout.phase=done` 且数据面继续可用。
+
+这表示 **WP3 runtime / recovery 子门已经全绿，WP4 最终合入已解除阻塞**；但按 §13.8，
+Gate V4-F1 定义覆盖 WP1～WP4，因此在 WP4 真前端联调与 E2E 合入前，仍不宣称 V4.1 完成。
 
 正式开发顺序、并行关系和 Gate 以第 13 节为准。V4 期间默认暂停新协议横向扩展；除阻断性安全/生产问题外，UDP、QUIC、multi-hop 等进入 V4 稳定版之后的 WP16+。
 
@@ -2016,6 +2027,12 @@ Gate V4-F1 至少真实验证：
 - Backend/Agent 重启后 rollout/reconcile 可恢复。
 
 WP3 进入 main 且 Gate 绿后，WP4 才能最终 merge。
+
+**Runtime Gate closure（2026-09-26）：✅** `v4-gate.sh`、`v4-gate-rest.sh` 与
+正式接入 Integration 的 `v4-gate-s10.sh` 已在 PR #20 / Integration #79 同一
+checkout 上全部通过。S10.47 的 Agent 中断恢复从 `applied=3 / config=4`
+自动收敛到 `applied=config=4`、rollout `done`，不再出现 runtime 已生效但
+ledger `degraded` 的分叉。故 WP4 的“merge 依赖 WP3 runtime gate”条件现已满足。
 
 #### Wave 3 — Managed Node
 
