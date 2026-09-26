@@ -10,7 +10,7 @@
     "build": "bun build src/index.ts --target=bun --external external --outdir=dist && tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-transform-types --test tests/*.test.mjs",
-    "test:unit": "bun test src/services/__tests__/ src/__tests__/",
+    "test:unit": "bun test src",
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
     "generate": "prisma generate",
