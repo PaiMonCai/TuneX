@@ -103,7 +103,21 @@ const fakeDb = () => {
         const a = args as { where: { id: number } };
         return leases.find((l) => l.id === a.where.id) ?? null;
       },
-      findMany: async () => leases.filter((l) => l.status === "active"),
+      findMany: async (args?: unknown) => {
+        const a = (args ?? {}) as { where?: Record<string, unknown>; select?: Record<string, boolean> };
+        const where = a.where ?? {};
+        const rows = leases.filter((lease) =>
+          Object.entries(where).every(([key, value]) => value === undefined || lease[key] === value),
+        );
+        if (!a.select) return rows;
+        return rows.map((lease) => {
+          const out: Record<string, unknown> = {};
+          for (const [key, enabled] of Object.entries(a.select ?? {})) {
+            if (enabled) out[key] = lease[key];
+          }
+          return out;
+        });
+      },
       update: async (args: unknown) => {
         const a = args as { where: { id: number }; data: Record<string, unknown> };
         const row = leases.find((l) => l.id === a.where.id);
@@ -113,10 +127,16 @@ const fakeDb = () => {
       },
       updateMany: async (args: unknown) => {
         const a = args as { where: Record<string, unknown>; data: Record<string, unknown> };
-        for (const l of leases) {
-          if (a.where.status === undefined || l.status === a.where.status) Object.assign(l, a.data);
+        let count = 0;
+        for (const lease of leases) {
+          const matches = Object.entries(a.where).every(
+            ([key, value]) => value === undefined || lease[key] === value,
+          );
+          if (!matches) continue;
+          Object.assign(lease, a.data);
+          count += 1;
         }
-        return { count: 1 };
+        return { count };
       },
     },
     tunnel: {
@@ -257,9 +277,15 @@ const fakeDb = () => {
     tunnels,
     bindings,
     snapshots,
+    leases,
     removed,
     released,
     addSnapshot: (s: Record<string, unknown>) => snapshots.push({ id: seq++, ...s }),
+    addLease: (l: Record<string, unknown>) => {
+      const id = leases.length + 1;
+      leases.push({ id, status: "active", ...l });
+      return id;
+    },
     addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, ...t }),
   };
 };
@@ -344,6 +370,16 @@ function impact(overrides: Partial<ForwardImpact> = {}): ForwardImpact {
 /** 建一个「desired=rev7 / applied=rev6 / DIRECT」的环境。 */
 function directEnv(overrides: { failOn?: FakeOrchestratorOpts["failOn"] } = {}) {
   const f = fakeDb();
+  // rev6 已真实运行在旧端口：DB 必须已有 durable lease，后续 listener_replace
+  // 才能验证 CLEANUP 精确释放旧租约而保留新租约。
+  f.addLease({
+    node_id: 11,
+    port: 10001,
+    lease_type: "ingress",
+    tunnel_id: 1,
+    status: "active",
+    expires_at: null,
+  });
   f.addSnapshot({
     tunnel_id: 1,
     revision: 6,
@@ -481,6 +517,10 @@ describe("正常路径：五阶段推进到 done", () => {
     expect(f.tunnels[0]!.config_revision).toBe(7);
     // 五个步骤全部标记完成。
     expect(readKeySet(f.rollouts[0]!.cleaned)).toHaveLength(5);
+    // CLEANUP 只释放旧端口；新端口的 durable ownership 必须仍 active。
+    expect(f.leases.find((l) => l.port === 10001)?.status).toBe("released");
+    expect(f.leases.find((l) => l.port === 20002)?.status).toBe("active");
+    expect(f.leases.filter((l) => l.tunnel_id === 1 && l.status === "active")).toHaveLength(1);
   });
 
   it("RELAY 模式切换 ⇒ prepare_egress 的调用早于 cutover_ingress", async () => {
@@ -827,6 +867,36 @@ describe("续跑：只重放未完成步骤", () => {
     expect(again.phase).toBe("done");
     expect(orch.calls.dispatchDirect).toHaveLength(before.direct);
     expect(orch.calls.removeTunnel).toHaveLength(before.remove);
+  });
+
+  it("CLEANUP replay：旧 lease 已释放时不得误释放当前新 lease", async () => {
+    const { f, deps } = directEnv();
+    await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ listen_port_change: true, listener_replacement: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+    const row = f.rollouts[0]!;
+    expect(f.leases.find((l) => l.port === 10001)?.status).toBe("released");
+    expect(f.leases.find((l) => l.port === 20002)?.status).toBe("active");
+
+    // 模拟 CLEANUP 已释放旧 lease 后、cleaned 记账前进程崩溃：恢复时同一步会重放。
+    row.cleaned = readKeySet(row.cleaned).filter(
+      (key) => !key.includes(":cleanup:release_old_lease:"),
+    );
+    row.phase = "cleanup";
+
+    const resumed = await executeRollout(row.id, deps);
+    expect(resumed.ok).toBe(true);
+    expect(f.rollouts[0]!.phase).toBe("done");
+    // 回归前 fallback 到 releaseLease({tunnelId,...}) 会把 20002 也释放掉。
+    expect(f.leases.find((l) => l.port === 10001)?.status).toBe("released");
+    expect(f.leases.find((l) => l.port === 20002)?.status).toBe("active");
+    expect(f.leases.filter((l) => l.tunnel_id === 1 && l.status === "active")).toHaveLength(1);
   });
 });
 

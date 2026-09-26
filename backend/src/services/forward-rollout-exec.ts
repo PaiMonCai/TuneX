@@ -752,14 +752,18 @@ async function runStep(
 
       // 旧 rollout 行重放时那一条可能已被释放：这时回退到按 tunnelId 释放，
       // 不因差一行而让整个 rollout 判失败（§13.3.5 CLEANUP 是尽力而为）。
-      const released = oldLeaseId !== null
-        ? await releaseLease({ leaseId: oldLeaseId }, { db: deps.db as never })
-        : await releaseLease({ tunnelId: ctx.tunnelId, nodeId }, { db: deps.db as never });
+      // 找不到 active 的旧 lease = 它已经被之前一轮 CLEANUP/reconciler 回收。
+      // 这是幂等成功，不得退回按 tunnelId 全量释放：那会把 PREPARE 刚拿到、
+      // 当前 runtime 正在使用的新端口 lease 一并释放，制造账本/runtime 分叉。
+      if (oldLeaseId === null) {
+        return { ok: true, note: `lease ${nodeId}:${step.port ?? "?"} 已释放（幂等）` };
+      }
+      const released = await releaseLease({ leaseId: oldLeaseId }, { db: deps.db as never });
       return {
         ok: true,
         note: released
           ? `lease ${nodeId}:${step.port ?? "?"} released`
-          : `lease ${nodeId} 已释放（幂等）`,
+          : `lease ${nodeId}:${step.port ?? "?"} 已释放（幂等）`,
       };
     }
 

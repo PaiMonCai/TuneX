@@ -656,6 +656,119 @@ export interface CreateForwardRevisionResult {
   wroteSnapshot: boolean;
 }
 
+
+/**
+ * 为已经成功运行、但还没有 revision snapshot 的 Forward 补一条**同 revision**
+ * baseline。它不 bump config_revision：只把当前 applied runtime 冻结为不可变
+ * snapshot，并在该 revision 仍是 desired/applied 同步态时补 desired_revision_id。
+ *
+ * 这是 create/retry → 首次编辑之间的桥：没有 baseline 时，下一次 listener
+ * replacement 只能看到新 desired，看不到旧 runtime，DRAIN/CLEANUP 就无法规划。
+ */
+export async function ensureForwardBaselineRevision(
+  tunnelId: number,
+  createdById: number | null,
+  client?: Prisma.TransactionClient,
+): Promise<{ revision: number; snapshotId: number; created: boolean } | null> {
+  const run = async (
+    tx: Prisma.TransactionClient,
+  ): Promise<{ revision: number; snapshotId: number; created: boolean } | null> => {
+    const row = await tx.tunnel.findUnique({
+      where: { id: tunnelId },
+      select: {
+        id: true,
+        category: true,
+        name: true,
+        tunnel_mode: true,
+        ingress_node_id: true,
+        egress_node_id: true,
+        listen_ip: true,
+        listen_port: true,
+        remote_host: true,
+        remote_port: true,
+        egress_pool_id: true,
+        egress_port: true,
+        config_revision: true,
+        applied_revision: true,
+        desired_revision_id: true,
+        desired_status: true,
+      },
+    });
+    if (!row || row.category !== "port_forward") return null;
+
+    const revision = Number(row.applied_revision ?? 0);
+    const configRevision = Number(row.config_revision ?? 0);
+    if (revision < 1 || revision !== configRevision) return null;
+
+    let existing = await tx.forwardRevision.findFirst({
+      where: { tunnel_id: tunnelId, revision },
+      select: { id: true },
+    });
+    let created = false;
+
+    if (!existing) {
+      const egressTargets =
+        row.tunnel_mode === "relay" && row.egress_pool_id != null
+          ? await tx.egressTarget.findMany({
+              where: { pool_id: row.egress_pool_id, status: "active" },
+              orderBy: [{ order_by: "asc" }, { id: "asc" }],
+              select: { host: true, port: true, weight: true, order_by: true },
+            })
+          : [];
+      const targets =
+        egressTargets.length > 0
+          ? (egressTargets as unknown as Prisma.InputJsonValue)
+          : Prisma.JsonNull;
+
+      try {
+        existing = await tx.forwardRevision.create({
+          data: {
+            tunnel_id: tunnelId,
+            revision,
+            name: row.name,
+            desired_status: row.desired_status ?? "active",
+            mode: row.tunnel_mode === "relay" ? "relay" : "direct",
+            ingress_node_id: row.ingress_node_id ?? 0,
+            egress_node_id: row.egress_node_id,
+            listen_ip: row.listen_ip,
+            listen_port: row.listen_port,
+            target_host: row.tunnel_mode === "direct" ? row.remote_host : null,
+            target_port: row.tunnel_mode === "direct" ? row.remote_port : null,
+            egress_pool_id: row.tunnel_mode === "relay" ? row.egress_pool_id : null,
+            egress_port: row.tunnel_mode === "relay" ? row.egress_port : null,
+            targets,
+            created_by_id: createdById,
+          },
+          select: { id: true },
+        });
+        created = true;
+      } catch (e) {
+        if ((e as { code?: string } | null)?.code !== "P2002") throw e;
+        existing = await tx.forwardRevision.findFirst({
+          where: { tunnel_id: tunnelId, revision },
+          select: { id: true },
+        });
+        if (!existing) throw e;
+      }
+    }
+
+    await tx.tunnel.updateMany({
+      where: {
+        id: tunnelId,
+        config_revision: revision,
+        applied_revision: revision,
+        desired_revision_id: null,
+      },
+      data: { desired_revision_id: existing.id },
+    });
+
+    return { revision, snapshotId: existing.id, created };
+  };
+
+  if (client) return run(client);
+  return db.$transaction(run);
+}
+
 /**
  * 不可变 snapshot 的**唯一**写入入口。
  *
