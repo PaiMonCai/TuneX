@@ -28,7 +28,7 @@ import {
   type RolloutDb,
   type RolloutDeps,
 } from "../forward-rollout-exec.ts";
-import { resumeRollouts } from "../forward-rollout-recovery.ts";
+import { ROLLOUT_RESUME_QUIET_MS, resumeRollouts } from "../forward-rollout-recovery.ts";
 
 /* ------------------------------------------------------------------ */
 /* 内存替身（含四个新列）                                               */
@@ -786,24 +786,40 @@ describe("resumeRollouts：只扫未完成、按 id 升序、一条失败不阻�
 /* ------------------------------------------------------------------ */
 
 describe("resumeRollouts 的顺序", () => {
-  it("where 用 id 升序（先发生的 rollout 先收敛）", async () => {
+  it("where 同时带 active phase + quiet cutoff，并按 id 升序", async () => {
     const f = fakeDb();
     let seenOrderBy: unknown = null;
+    let seenQuietCutoff: string | null = null;
+    const now = new Date("2026-09-26T12:58:00.000Z");
     const db = {
       ...f.db,
       forwardRollout: {
         ...f.db.forwardRollout,
         findMany: async (args: unknown) => {
-          const a = args as { orderBy?: unknown; where?: { phase?: { in: string[] } } };
+          const a = args as {
+            orderBy?: unknown;
+            where?: {
+              phase?: { in: string[] };
+              updated_at?: { lte?: string };
+            };
+          };
           seenOrderBy = a.orderBy;
-          // 断言扫的是 active 集合（不是全表）。
+          seenQuietCutoff = a.where?.updated_at?.lte ?? null;
+          // 断言扫的是 active 集合（不是全表），并且不会抢刚被请求线程推进的 row。
           expect(a.where?.phase?.in).toContain("compensating");
           expect(a.where?.phase?.in).not.toContain("done");
           return [];
         },
       },
     } as unknown as RolloutDb;
-    await resumeRollouts({ db, orchestrator: fakeOrchestrator() as never } as RolloutDeps);
+    await resumeRollouts({
+      db,
+      orchestrator: fakeOrchestrator() as never,
+      now: () => now,
+    } as RolloutDeps);
     expect(seenOrderBy).toEqual({ id: "asc" });
+    expect(seenQuietCutoff).toBe(
+      new Date(now.getTime() - ROLLOUT_RESUME_QUIET_MS).toISOString(),
+    );
   });
 });
