@@ -49,8 +49,25 @@ import type { ForwardImpact } from "./forward-revision.ts";
 /** 五阶段（§13.3.5）。终态不在这里：它们是 rollout 行的 phase，不是计划阶段。 */
 export type RolloutPhase = "validate" | "prepare" | "cutover" | "drain" | "cleanup";
 
-/** rollout 行 `phase` 列的全部取值（含终态与等待态）。 */
-export const ROLLOUT_PHASES = [
+/**
+ * **执行阶段**的有序序列（§13.3.5 的推进顺序）。
+ *
+ * 与 {@link ROLLOUT_PHASE_STATES} 分开是硬约束：后者是 rollout 行 `phase`
+ * 列的全部取值（含终态），混在一起会让「按顺序推进」的循环走进
+ * `done` / `failed` 这些**不是阶段**的值——那时 `plan.steps.filter(phase ===
+ * "done")` 永远为空、循环白转几圈，而 `transitionRollout(from, to)` 会拿
+ * 一个终态当目标，把已完成的 rollout 改写回中间态。
+ */
+export const ROLLOUT_STAGE_SEQUENCE: readonly RolloutPhase[] = [
+  "validate",
+  "prepare",
+  "cutover",
+  "drain",
+  "cleanup",
+];
+
+/** rollout 行 `phase` 列的全部取值（五阶段 + 四个终态/等待态）。 */
+export const ROLLOUT_PHASE_STATES = [
   "validate",
   "prepare",
   "cutover",
@@ -62,7 +79,7 @@ export const ROLLOUT_PHASES = [
   "degraded",
   "waiting",
 ] as const;
-export type RolloutPhaseState = (typeof ROLLOUT_PHASES)[number];
+export type RolloutPhaseState = (typeof ROLLOUT_PHASE_STATES)[number];
 
 /**
  * 仍在上手（未终结）的 phase 集合。
@@ -70,12 +87,18 @@ export type RolloutPhaseState = (typeof ROLLOUT_PHASES)[number];
  * 服务层用 `updateMany where phase in (ACTIVE_ROLLOUT_PHASES)` 抢占
  * 「一条 tunnel 同时至多一条未完成 rollout」；DB 层面刻意不加唯一键——
  * 历史多行要能并存排障。
+ *
+ * **五个执行阶段必须全在这里**（含 `cleanup`）：它同时被用来兜底过渡到
+ * 终态（`executeRollout` 的「全部阶段走完」）。漏掉任一阶段 ⇒ 那个阶段的
+ * rollout 行永远过渡不到 `done`，下一轮 `resumeRollouts` 又把它捞起来
+ * 重放已完成的步骤——不报错，只是每轮空转一次。
  */
 export const ACTIVE_ROLLOUT_PHASES: readonly RolloutPhaseState[] = [
   "validate",
   "prepare",
   "cutover",
   "drain",
+  "cleanup",
   "compensating",
   "waiting",
 ];
