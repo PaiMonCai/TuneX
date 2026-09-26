@@ -140,6 +140,8 @@ export interface RolloutDeps {
    */
   orchestrator: Orchestrator;
   now?: () => Date;
+  /** 测试可注入无等待 sleeper；生产默认 setTimeout。 */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -1110,6 +1112,9 @@ function concurrentTakeoverResult(
  * owner 完成一个阶段，又能让崩溃后的 worker 在 S10 的 180s 窗口内接管。
  */
 export const ROLLOUT_EXECUTOR_LEASE_MS = 90_000;
+/** Agent state report 周期 30s；多给 5s 抖动，先等事实再决定是否重发。 */
+export const ROLLOUT_RUNTIME_CONFIRM_WAIT_MS = 35_000;
+const ROLLOUT_RUNTIME_CONFIRM_POLL_MS = 1_000;
 
 function asDate(value: Date | string | null | undefined): Date | null {
   if (value == null) return null;
@@ -1194,31 +1199,37 @@ async function runtimeConfirmsStepApplied(
   step: RolloutStep,
   ctx: RolloutExecContext,
   deps: RolloutDeps,
-  since: Date | string | null | undefined,
 ): Promise<boolean> {
   const reader = deps.db.nodeStateReport?.findUnique;
   const nodeId = step.node_id;
   const resourceId = runtimeResourceId(step, ctx);
   if (!reader || nodeId == null || !resourceId) return false;
 
-  const snap = (await reader({
-    where: { node_id: nodeId },
-    select: { tunnels: true, reported_at: true },
-  }).catch(() => null)) as { tunnels?: unknown; reported_at?: Date | string | null } | null;
-  if (!snap || !Array.isArray(snap.tunnels)) return false;
+  const deadline = (deps.now?.() ?? new Date()).getTime() + ROLLOUT_RUNTIME_CONFIRM_WAIT_MS;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-  const sinceDate = asDate(since);
-  const reportedAt = asDate(snap.reported_at);
-  if (sinceDate && (!reportedAt || reportedAt.getTime() < sinceDate.getTime())) return false;
+  while (true) {
+    const snap = (await reader({
+      where: { node_id: nodeId },
+      select: { tunnels: true, reported_at: true },
+    }).catch(() => null)) as { tunnels?: unknown; reported_at?: Date | string | null } | null;
 
-  for (const raw of snap.tunnels) {
-    if (!raw || typeof raw !== "object") continue;
-    const tunnel = raw as Record<string, unknown>;
-    if (String(tunnel.id ?? "") !== resourceId) continue;
-    const revision = Number(tunnel.revision);
-    return Number.isFinite(revision) && revision >= ctx.revision;
+    if (snap && Array.isArray(snap.tunnels)) {
+      for (const raw of snap.tunnels) {
+        if (!raw || typeof raw !== "object") continue;
+        const tunnel = raw as Record<string, unknown>;
+        if (String(tunnel.id ?? "") !== resourceId) continue;
+        const revision = Number(tunnel.revision);
+        // resource revision 单调递增；只要 >= desired，就已经是比任何 wall-clock
+        // 更强的事实。不要再拿 rollout.updated_at/lease heartbeat 当 freshness 闸门。
+        if (Number.isFinite(revision) && revision >= ctx.revision) return true;
+      }
+    }
+
+    const nowMs = (deps.now?.() ?? new Date()).getTime();
+    if (nowMs >= deadline) return false;
+    await sleep(Math.min(ROLLOUT_RUNTIME_CONFIRM_POLL_MS, Math.max(0, deadline - nowMs)));
   }
-  return false;
 }
 
 /* ================================================================== */
@@ -1352,7 +1363,7 @@ async function executeRolloutOwned(
 
       // S10.47：第一次 command 的 ACK 可能丢了，但 Agent 已真实应用。恢复时先用
       // state report 确认具体 resource 的 revision；确认后只补 ledger，不重发命令。
-      if (recoveringAmbiguous && await runtimeConfirmsStepApplied(step, ctx, deps, row.updated_at)) {
+      if (recoveringAmbiguous && await runtimeConfirmsStepApplied(step, ctx, deps)) {
         const note = `${step.phase}:${step.kind} CONFIRMED runtime revision=${ctx.revision}`;
         await markStepCompleted(rolloutId, step.idempotency_key, { db });
         completed.add(step.idempotency_key);

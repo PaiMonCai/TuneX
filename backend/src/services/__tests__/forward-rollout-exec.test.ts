@@ -842,10 +842,51 @@ describe("续跑：只重放未完成步骤", () => {
       db: f.db,
       orchestrator: recovered,
       now: () => new Date("2026-09-26T13:00:31.000Z"),
+      sleep: async () => {},
     });
     expect(resumed.ok).toBe(true);
     expect(resumed.phase).toBe("done");
     expect(recovered.calls.dispatchDirect).toHaveLength(0);
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
+  });
+
+
+  it("waiting 恢复会等一个 state-report 周期，迟到的 runtime revision 出现后不重发", async () => {
+    const { f } = directEnv();
+    f.tunnels[0]!.applied_revision = 6;
+    f.tunnels[0]!.apply_status = "pending";
+
+    const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
+    const first = await registerRollout(
+      { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
+      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:02:00.000Z") },
+    );
+    expect(first.status).toBe("waiting");
+
+    let reads = 0;
+    (f.db as RolloutDb & { nodeStateReport?: { findUnique(args: unknown): Promise<unknown> } }).nodeStateReport = {
+      findUnique: async () => {
+        reads += 1;
+        return {
+          tunnels: reads < 3
+            ? [{ id: "tunex-1-direct", revision: 6 }]
+            : [{ id: "tunex-1-direct", revision: 7 }],
+          reported_at: new Date("2026-09-26T13:02:10.000Z"),
+        };
+      },
+    };
+
+    let tick = 0;
+    const resumedOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_rejected" });
+    const resumed = await executeRollout(f.rollouts[0]!.id, {
+      db: f.db,
+      orchestrator: resumedOrch,
+      now: () => new Date(Date.parse("2026-09-26T13:02:31.000Z") + tick * 1000),
+      sleep: async () => { tick += 1; },
+    });
+    expect(resumed.ok).toBe(true);
+    expect(reads).toBeGreaterThanOrEqual(3);
+    expect(resumedOrch.calls.dispatchDirect).toHaveLength(0);
     expect(f.tunnels[0]!.applied_revision).toBe(7);
   });
 
