@@ -122,17 +122,90 @@ rollout phase 时间线，未含任何凭据）。
 
 暂停 ingress agent 期间发起一次真实 PATCH（target-a）。unpause 后实测：
 
-- Agent 日志：`10:09:16 tunnel upstream hot-swapped id=tunex-12-direct … upstream=target-a:3030 revision=4`
-  ⇒ **运行时确实按 revision 4 生效**。
-- 但 DB ledger：`forward_rollout.revision=4` 停在 `degraded`，`applied_revision=3`
-  落后 `config_revision=4`，且 180s 轮询窗口内未自行收敛到 `applied == config`。
+- Agent 日志：`10:26:22 tunnel upstream hot-swapped id=tunex-15-direct mode=DIRECT port=21011 upstream=target-a:3030 revision=4`
+  ⇒ **运行时确实按 revision 4 生效**（hot-swap 已 ACK）。
+- 但 DB ledger：`forward_rollout` id=20（tunnel `tunex-15`，revision=4，
+  base_revision=3）停在 `degraded`，`compensated=0`，
+  `last_error_code=compensation_failed`，而 `tunnel.applied_revision=3` 落后
+  `config_revision=4`，180s 轮询窗口内未自行收敛。
 
 即 **ledger 与 runtime 不一致**：`resumeRollouts` 的补偿路径把一个 Agent 已经
 ACK 并生效的 revision 判为 `degraded`，导致 `applied_revision` 永久落后。脚本把两侧
 证据都写进证据文件，按 DEFECT 计入非零退出，没有把它改判为 LIMITED。
 
+#### 根因（`feature/v4-gate-s10-fix` 分支实测定位，非推测）
+
+`compensation_error` 全文给出了两条因果链（DB 原文，本报告只引用不手改）：
+
+```
+remove ingress: 下发 remove_tunnel 到 3 失败：等待 Agent ACK 超时
+                （node=3, command=tunex-tunex-15-relay-remove-r5）
+replay direct: 本地校验拒绝本命令：stale_revision 命令 revision=3
+               低于已应用的 revision=4
+```
+
+链 1（`executeRollout` 的 cutover 步骤在 Agent 暂停期间 ACK 超时）：
+`dispatchDirect` 走 `agent-command-bus` 把命令排进 Redis 等 Agent 轮询拉取；
+Agent 被 `docker pause` 时没有心跳也没有命令拉取，于是 ACK TTL 到期，
+`cutover_ingress` 记 `agent_unreachable`/ACK 超时。
+
+链 2（compensation 在 Agent 恢复后被自己的新 revision 打脸）：
+`compensateRollout` 用 `revision + 1` 撤新 runtime —— 动作本身对（闸门会放行），
+但 `uptime` 期间 Agent 侧已经把 revision 4 完整 apply 并 ACK（见上）。
+随后 unpause，compensation 的**第 ② 步**按 §3.4 重放基线：
+
+```
+const ingress = await orchestrator.dispatchDirect({ revision: row.base_revision /* = 3 */, … });
+```
+
+这条命令 `revision=3` 比 Agent 已 ACK 的 `applied_revision=4` **旧**，
+在到达 Agent 之前就被本进程的 `checkRevisionGate`（`validator.ts:124`，`revision < applied ⇒ stale_reject`）
+判为 `stale_reject` 拒绝 ⇒ `replay direct` 失败 ⇒ `compensateRollout` 收尾时
+`errors` 非空 ⇒ `phase=degraded` + `compensation_error`，**永不重试**。
+
+链 3（180s 不收敛：不是「还没轮到」，而是每轮都在做注定失败的重发）：
+`degraded` 不在 `ACTIVE_ROLLOUT_PHASES`（`forward-rollout.ts:96`），
+所以 `resumeRollouts` 正确地不碰它 —— worker 日志
+`{"scanned":1,"resumed":0,"failed":0,"skipped":1}` 的 `skipped` 正是这条。
+但旁路 `reconciler`（`cron_reconcile_v3` 的另一半）看的是 `tunnel` 行：
+`applied_revision=3 < config_revision=4` ⇒ 每轮都判 `revision_behind` 并调
+`runtime-reconcile-sink.resendSameRevision()`，而那个 sink **完全不看 rollout 表**，
+照着 `tunnel` 行就把同 revision 的 `dispatchDirect` 又打给已经跑着 revision 4 的
+Agent。实测 worker 每轮都在
+`{"findings":2,"resent":0,"failed":1}` —— 那 1 条 `failed` 就是这次注定被拒的重发。
+
+**结论**：缺陷是**后端**的，具体是 `runtime-reconcile-sink.ts` 缺少一条
+「该 tunnel 有未收敛 rollout（`degraded`/`compensating`）时不得以
+`resendSameRevision` 自动重放」的闸门。Agent 侧的 `ErrStaleRevision`
+（`agent/internal/manager/swap.go:240`）与 `checkRevisionGate` 行为**正确**、
+且已有 `dataplane_test.go:815` / `swap_test.go:746` 钉死，不是缺陷点。
+
+#### 修复（`feature/v4-gate-s10-fix`，小步 commit）
+
+`backend/src/services/runtime-reconcile-sink.ts`：`resendSameRevision` 读 tunnel 行时
+一并 `include.forwardRollouts where phase in (degraded, compensating)`，
+命中即 throw（措辞带出 rollout id + phase），**在任何 dispatch 之前**返回。
+并把实现体抽成可注入依赖的 `createSink`，单测因此不必 monkey-patch ES 模块只读导出。
+
+这不是「自动修好 degraded」——`DEVELOPMENT.md:1001/1008` 明确要求节点不可达/
+降级场景不得全线自动修。它只是让 reconciler 停止对一个**已知不可安全下发**的
+tunnel 反复下发注定被拒的命令，把 `degraded` 如实留在需要人工介入的状态。
+
+回归断言（`forward-rollout-ledger.test.ts` 新增 6 个 `it`，全部真实断言）：
+1. `executeRollout` 对 `degraded` 行 ⇒ `ok:false` + `phase=degraded` + **零下发**；
+2. reconciler 在落后 + 无 sink 时 ⇒ `resent=0`、`noTransport=1`、如实报
+   `revision_behind` finding（不静默放过）；
+3. `resendSameRevision` 该 tunnel 有 `degraded` 行 ⇒ throw `/degraded/` + `/15/`，
+   且 `dispatched` 为空（拒绝发生在下发之前）；
+4. `compensating` 行同样阻止重发（错误信息含 `compensating#31`）；
+5. 没有这两类行 ⇒ 行为不变（`dispatched=[4]`，无回归）；
+6. select 的 `phase in` **不含** `done`/`failed`（只拦未收敛的，不拦已完成）。
+
 后续如果该缺陷修复，重跑本脚本应看到 `S10.47` 由 LIMITED+DEFECT 变为
 `PASS`（终态 `done`、`applied == config`）。
+**本分支尚未取得该 PASS**：修复只保证「不再往坏状态下乱发命令」，
+`tunnel 15` 的存量 `degraded` 行仍需要按 REPLAY 语义人工重放基线（或重跑一次
+真实编辑让 register 建新 rollout），这不是脚本能自动完成的。
 
 ### 脚本自身在本轮修掉的测量性问题（均为测试问题，非产品问题）
 
