@@ -48,6 +48,8 @@ interface Row {
   notes: string[] | null;
   compensated: boolean;
   compensation_error: string | null;
+  executor_owner?: string | null;
+  executor_lease_until?: Date | string | null;
   last_error_code: string | null;
   last_error: string | null;
   created_at: string;
@@ -178,6 +180,8 @@ const fakeDb = () => {
           notes: (a.data.notes as string[] | null) ?? null,
           compensated: Boolean(a.data.compensated),
           compensation_error: (a.data.compensation_error as string | null) ?? null,
+          executor_owner: (a.data.executor_owner as string | null) ?? null,
+          executor_lease_until: (a.data.executor_lease_until as Date | string | null) ?? null,
           last_error_code: (a.data.last_error_code as string | null) ?? null,
           last_error: (a.data.last_error as string | null) ?? null,
           created_at: String(a.data.created_at),
@@ -199,7 +203,12 @@ const fakeDb = () => {
       update: async () => ({ count: 1 }),
       updateMany: async (args: unknown) => {
         const a = args as {
-          where: { id: number; phase?: string | { in: string[] } };
+          where: {
+            id: number;
+            phase?: string | { in: string[] };
+            executor_owner?: string | null;
+            executor_lease_until?: Date | string | null;
+          };
           data: Record<string, unknown>;
         };
         const row = rollouts.find((r) => r.id === a.where.id);
@@ -211,6 +220,14 @@ const fakeDb = () => {
           } else if (!expected.in.includes(row.phase)) {
             return { count: 0 };
           }
+        }
+        if (a.where.executor_owner !== undefined && (row.executor_owner ?? null) !== a.where.executor_owner) {
+          return { count: 0 };
+        }
+        if (a.where.executor_lease_until !== undefined) {
+          const left = row.executor_lease_until == null ? null : new Date(row.executor_lease_until).getTime();
+          const right = a.where.executor_lease_until == null ? null : new Date(a.where.executor_lease_until).getTime();
+          if (left !== right) return { count: 0 };
         }
         for (const [k, v] of Object.entries(a.data)) {
           // 先判数组：`"push" in []` 因为 Array.prototype.push 继承而为 true，
@@ -262,6 +279,8 @@ const fakeDb = () => {
         notes: null,
         compensated: false,
         compensation_error: null,
+        executor_owner: null,
+        executor_lease_until: null,
         last_error_code: null,
         last_error: null,
         created_at: new Date().toISOString(),
