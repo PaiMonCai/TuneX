@@ -42,6 +42,7 @@ import type {
   PortForward,
   ForwardCreateInput,
   ForwardPatchInput,
+  ForwardPreviewResult,
   ForwardSummary,
   ProvisionNodeResult,
   Payment,
@@ -392,6 +393,14 @@ export const api = {
       post<PortForward>("/forwards", input, cookie),
     update: (id: ID, input: ForwardPatchInput, cookie?: string) =>
       patch<PortForward>(`/forwards/${id}`, input, cookie),
+    /**
+     * V4-WP4 §13.3.3 preview：保存前影响面（不写库）。
+     *
+     * 与 update 共用后端同一个 candidate resolver，因此本方法放行 ⇔ update 接受。
+     * UI 在每次字段变更后调用它渲染 impact warning。
+     */
+    preview: (id: ID, input: ForwardPatchInput, cookie?: string) =>
+      post<ForwardPreviewResult>(`/forwards/${id}/preview`, input, cookie),
     action: (
       id: ID,
       action: "retry" | "suspend" | "resume",
