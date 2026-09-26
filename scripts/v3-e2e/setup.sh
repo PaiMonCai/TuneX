@@ -111,6 +111,19 @@ done
 say "执行 Prisma migrate + seed"
 docker compose -f "$COMPOSE" --env-file "$ENVF" run --rm db-migrate
 
+# V4-F1 topology closure needs four concrete Nodes in the same team workspace.
+# Production's free_team default remains max_nodes=2; only this disposable E2E DB
+# raises the test entitlement so every Node can still be created through the real
+# provisioning/enrollment API instead of bypassing quota/business logic.
+say "E2E-only capability fixture：team node quota = 4"
+docker exec wp14-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "
+  UPDATE capability_policy
+  SET max_nodes=4, revision=revision+1
+  WHERE `key`='"'"'free_team'"'"' AND source='"'"'system_default'"'"' AND is_default=1;"'
+quota=$(docker exec wp14-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "
+  SELECT IFNULL(max_nodes,0) FROM capability_policy WHERE `key`='"'"'free_team'"'"' LIMIT 1;"' | tail -1 | tr -d '\r')
+[[ "$quota" == "4" ]] || die "E2E team node quota fixture 未生效（got=$quota）"
+
 say "启动 Panel / Worker / Targets / Client"
 docker compose -f "$COMPOSE" --env-file "$ENVF" up -d panel worker target-a target-b client
 for _ in $(seq 1 60); do
