@@ -302,7 +302,7 @@ interface FakeOrchestratorOpts {
     removeTunnel?: boolean;
   };
   /** 明确 reject 与 ACK timeout 必须分开建模；默认是确定失败。 */
-  failCode?: "agent_rejected" | "agent_unreachable";
+  failCode?: "agent_rejected" | "agent_unreachable" | "ack_timeout";
   /** egress 节点可寻址 host。 */
   egressHost?: string;
 }
@@ -776,7 +776,7 @@ describe("续跑：只重放未完成步骤", () => {
     f.tunnels[0]!.applied_revision = 6;
     f.tunnels[0]!.apply_status = "pending";
 
-    const orch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_unreachable" });
+    const orch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
     const first = await registerRollout(
       { tunnelId: 1, impact: impact({ listen_port_change: true, listener_replacement: true }), revision: 7, baseRevision: 6 },
       { db: f.db, orchestrator: orch },
@@ -987,6 +987,41 @@ describe("准入、并发与 noop", () => {
     // noop 也写一行 rollout（旁路记账），但 phase=done 且零步骤执行。
     expect(f.rollouts).toHaveLength(1);
     expect(f.rollouts[0]!.phase).toBe("done");
+  });
+
+  it("同步 PATCH 输掉 phase CAS ⇒ accepted in_progress，由另一个 executor 继续", async () => {
+    const { f, deps } = directEnv();
+    const originalUpdateMany = deps.db.forwardRollout.updateMany;
+    let stolen = false;
+    deps.db.forwardRollout.updateMany = async (args: unknown) => {
+      const a = args as { where?: { phase?: unknown }; data?: { phase?: string } };
+      if (!stolen && a.where?.phase === "validate" && a.data?.phase === "prepare") {
+        stolen = true;
+        // 模拟 resume worker 抢先把 validate → prepare。同步请求的 CAS 应输掉，
+        // 但这不是失败：worker 已经接管同一 rollout。
+        f.rollouts[0]!.phase = "prepare";
+        return { count: 0 };
+      }
+      return originalUpdateMany(args);
+    };
+
+    const res = await registerRollout(
+      { tunnelId: 1, impact: impact({ listen_port_change: true, listener_replacement: true }), revision: 7, baseRevision: 6 },
+      deps,
+    );
+    expect(stolen).toBe(true);
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe("in_progress");
+    expect(res.error_code).toBe("concurrent_transition");
+    expect(f.rollouts[0]!.phase).toBe("prepare");
+    expect(f.tunnels[0]!.applied_revision).toBe(6);
+
+    // worker 后续继续即可正常收敛；输掉 CAS 的 HTTP 线程不能把它写成 failed。
+    deps.db.forwardRollout.updateMany = originalUpdateMany;
+    const resumed = await executeRollout(f.rollouts[0]!.id, deps);
+    expect(resumed.ok).toBe(true);
+    expect(f.rollouts[0]!.phase).toBe("done");
+    expect(f.tunnels[0]!.applied_revision).toBe(7);
   });
 
   it("已有 active rollout ⇒ conflict（R6）", async () => {
