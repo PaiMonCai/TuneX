@@ -51,7 +51,9 @@ jobs:
         run: |
           bash scripts/v3-e2e/setup.sh
           bash scripts/v3-e2e/verify.sh
-      - name: Upload v3 integration evidence
+      - name: Run V4 Forward rollout integration gate
+        run: bash scripts/v3-e2e/v4-gate.sh
+      - name: Upload v3/v4 integration evidence
         if: failure() || github.event_name == 'workflow_run'
         uses: actions/upload-artifact@v7
         with:

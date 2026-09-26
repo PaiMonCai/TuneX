@@ -12,6 +12,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from typing import Any
 
 ERR = "[v3-e2e] "
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +31,7 @@ def _load(name):
 
 WORKSPACE_FIX = _load("workspaces.json")
 TUNNEL_FIX = _load("tunnels.json")
+FORWARD_FIX = _load("forward-edit.json")
 WORKSPACES = {w["key"]: w for w in WORKSPACE_FIX["workspaces"]}
 GROUP_SPECS = {g["key"]: g for g in TUNNEL_FIX["node_groups"]}
 TUNNEL_SPECS = {t["key"]: t for t in TUNNEL_FIX["tunnels"]}
@@ -230,6 +232,46 @@ def _target(spec):
     return host.strip("[]"), int(port)
 
 
+def _v4_target(spec):
+    """V4 Forward fixture 的初始目标（显式 host/port 字段，不用 forward_addresses）。"""
+    return str(spec["target_host"]).strip("[]"), int(spec["target_port"])
+
+
+V4_SPEC = FORWARD_FIX["v4_forward"]
+
+
+def create_v4_forward(cookie, workspace_id, ingress_node):
+    """Phase 3: the V4 Forward product object (same runtime row as the tunnel).
+
+    It is the entity the V4 scenarios edit through PATCH /api/forwards/:id,
+    so it must exist with a real ACKed runtime before any scenario runs.
+    """
+    host, port = _v4_target(V4_SPEC)
+    status, body, _ = req(
+        "POST",
+        "/api/nodes/%d/forwards" % ingress_node["id"],
+        {
+            "name": V4_SPEC["name"],
+            "listen_port": V4_SPEC["listen_port"],
+            "target_host": host,
+            "target_port": port,
+        },
+        cookie,
+        {"x-workspace-id": str(workspace_id)},
+        timeout=60,
+    )
+    assert status in (200, 201), f"{ERR}V4 Forward create -> {status} {body}"
+    forward = unwrap(body)
+    assert isinstance(forward, dict), f"{ERR}V4 forward 不是对象: {forward!r}"
+    assert forward.get("mode") == "direct", f"{ERR}V4 mode mismatch: {forward}"
+    assert forward.get("apply_status") == "active", f"{ERR}V4 not active: {forward}"
+    assert forward.get("ingress_node_id") == ingress_node["id"], f"{ERR}V4 ingress mismatch"
+    assert forward.get("listen_port") == V4_SPEC["listen_port"], f"{ERR}V4 listen_port mismatch: {forward}"
+    assert forward.get("target_host") == host, f"{ERR}V4 target_host mismatch: {forward}"
+    assert forward.get("target_port") == port, f"{ERR}V4 target_port mismatch: {forward}"
+    return forward
+
+
 def create_direct(cookie, workspace_id, ingress_node, spec):
     delete_named(cookie, workspace_id, spec["name"])
     host, port = _target(spec)
@@ -366,6 +408,20 @@ elif PHASE == "tunnels":
     }
     write_state(state)
     print(f"{ERR}tunnels direct={direct['id']} relay={relay['id']}")
+    print(f"{ERR}wrote {STATE}")
+elif PHASE == "forward":
+    with open(STATE, encoding="utf-8") as fh:
+        state = json.load(fh)
+    cookie = login()
+    primary = state["workspaces"]["primary"]["id"]
+    forward = create_v4_forward(
+        cookie,
+        primary,
+        state["nodes"]["ingress"],
+    )
+    state["forward"] = forward
+    write_state(state)
+    print(f"{ERR}v4 forward id={forward['id']} revision={forward.get('config_revision')}")
     print(f"{ERR}wrote {STATE}")
 else:
     raise SystemExit(f"{ERR}unknown WP14_BOOTSTRAP_PHASE={PHASE!r}")

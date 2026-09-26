@@ -1,0 +1,15 @@
+{
+  "v4_forward": {
+    "key": "v4_direct",
+    "name": "v4-gate-direct",
+    "in_node_group": "ingress",
+    "listen_port": 21003,
+    "target_host": "target-a",
+    "target_port": 3030,
+    "hot_swap_target_host": "target-b",
+    "hot_swap_target_port": 3030,
+    "marker_before": "WP14-TARGET-A",
+    "marker_after": "WP14-TARGET-B",
+    "notes": "V4 Gate 的被编辑 Forward。listen_port 21003 避开 v3 DIRECT(21001)/RELAY(21002)；两个 target 都在 wp14-ingress-data 上，因此热改可以从 client 侧真实观测到 marker 切换。"
+  }
+}
