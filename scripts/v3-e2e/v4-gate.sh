@@ -173,6 +173,10 @@ assert_eq "$GOT_S2" "$MARK_A" "S2.3 真实数据面切回 target-a"
 
 # Now the stale one: the browser tab that never reloaded still thinks the
 # revision is BASELINE_REV.
+# Snapshot both ledger counts immediately BEFORE this request: everything it
+# observes below must be excluded from the delta, so a non-zero delta can only
+# come from this 409 request itself.
+ROLLOUTS_BEFORE_S2=$(mysqlc "SELECT COUNT(*) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID;")
 S2_STALE_STATUS=$(api_patch "{\"target_host\":\"target-b\",\"target_port\":3030,\"expected_revision\":$BASELINE_REV}" s2-stale.json)
 assert_eq "$S2_STALE_STATUS" "409" "S2.4 过期 expected_revision 被拒 HTTP 409"
 S2_STALE_CODE=$(python3 -c "import json;d=json.load(open('$OUT/s2-stale.json'));print(d.get('code'))")
@@ -184,12 +188,17 @@ S2_DB_CFG=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWA
 S2_DB_HOST=$(mysqlc "SELECT IFNULL(remote_host,'') FROM tunnel WHERE id=$FORWARD_ID;")
 S2_DB_PORT=$(mysqlc "SELECT IFNULL(remote_port,0) FROM tunnel WHERE id=$FORWARD_ID;")
 S2_DB_SNAPSHOTS=$(mysqlc "SELECT COUNT(*) FROM forward_revision WHERE tunnel_id=$FORWARD_ID;")
-S2_DB_ROLLOUTS=$(mysqlc "SELECT COUNT(*) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND revision=$BASELINE_REV;")
+S2_DB_ROLLOUTS=$(mysqlc "SELECT COUNT(*) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID;")
 assert_eq "$S2_DB_CFG" "$S2_OK_REV" "S2.7 409 不推进 config_revision"
 assert_eq "$S2_DB_HOST" "target-a" "S2.8 409 不改变 remote_host"
 assert_eq "$S2_DB_PORT" "3030" "S2.9 409 不改变 remote_port"
 assert_eq "$((S2_DB_SNAPSHOTS - SNAPSHOTS_BEFORE_S2))" "1" "S2.10 409 不写 revision snapshot"
-assert_eq "$S2_DB_ROLLOUTS" "0" "S2.11 过期 revision 未创建 rollout 记账"
+# 用**增量**而不是「$BASELINE_REV 的 rollout 行数 == 0」：S1 自己已经为
+# $BASELINE_REV（=S1_REV）建过一行 done ledger，绝对计数恒为 1，与 409 无关。
+# 真正要证明的是「这次 409 没有新增任何一条记账」⇒ 与 409 前的总数比差。
+# 409 是在 createForwardRevision / registerRollout **之前**返回的，所以差值
+# 必须为 0；若哪天门挪到落库之后，这里会变成 1 而不是被静默放行。
+assert_eq "$((S2_DB_ROLLOUTS - ROLLOUTS_BEFORE_S2))" "0" "S2.11 过期 revision 未创建 rollout 记账"
 
 GOT_S2_AFTER=$(wait_probe "$FORWARD_PORT" "$MARK_A" || true)
 assert_eq "$GOT_S2_AFTER" "$MARK_A" "S2.12 409 之后真实数据面仍走有效目标"
@@ -201,6 +210,7 @@ assert_eq "$GOT_S2_AFTER" "$MARK_A" "S2.12 409 之后真实数据面仍走有效
   echo "forward: tunnel=$FORWARD_ID listen_port=$FORWARD_PORT"
   echo "S1: $BASELINE_CFG -> $S1_REV target -> $SWAP_HOST:$SWAP_PORT data_plane=$GOT_AFTER rollout=$S1_ROLLOUT"
   echo "S2: ok_rev=$S2_OK_REV stale_expected=$BASELINE_REV status=409 code=$S2_STALE_CODE latest=$S2_STALE_LATEST data_plane=$GOT_S2_AFTER"
+  echo "S2 ledger deltas: forward_revision +$((S2_DB_SNAPSHOTS - SNAPSHOTS_BEFORE_S2)) forward_rollout +$((S2_DB_ROLLOUTS - ROLLOUTS_BEFORE_S2)) (expected +1 / +0: only the accepted PATCH may write)"
   echo
   printf '%s\n' "${RESULTS[@]}"
   echo
