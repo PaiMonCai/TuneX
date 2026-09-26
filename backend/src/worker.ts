@@ -40,12 +40,20 @@
  *   ① 在 services/ 写实现（含纯函数 + deps 注入 + 单测）；
  *   ② 回到本文件的 CRON_JOBS 与 switch 各加一行；
  *   ③ 更新本注释块与 PLAN.md 的 OPS-01 行。
+ *
+ * ── V4-WP3 的改动 ──
+ * `cron_reconcile_v3` 的**第一步**改为 `resumeRollouts`：把 Normal/Pre-Comp 表
+ * 里仍处于活跃相位的 rollout 捞起来按断点续跑（§3.5「恢复面」）。它放在对账
+ * 之前而非之后，是因为对账只做同 revision 重发/缺失补发，而跨阶段推进与回退
+ * 归 rollout——若顺序反了，「已被 rollout 推进到 CUTOVER」的对账项会被按旧
+ * revision 重发，把已切走的节点拉回旧配置。
  */
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import { env } from "./env.ts";
 import { db } from "./db.ts";
 import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.ts";
+import { defaultRolloutResumeDeps, resumeRollouts } from "./services/forward-rollout-recovery.ts";
 import { defaultTrafficArchiveDeps, flushTrafficBuffer } from "./services/traffic-archive.ts";
 import { defaultTrafficRetentionDeps, deleteExpiredTraffic } from "./services/traffic-retention.ts";
 import { defaultReconcileDeps, executeReconcile } from "./services/reconciler.ts";
@@ -112,6 +120,34 @@ const worker = new Worker(
         return summary;
       }
       case "cron_reconcile_v3": {
+        // WP3 §3.5：rollout 续跑是本轮 reconcile 的**第一步**，失败不影响后续
+        // 对账。理由：reconciler 只处理「同 revision 重发 / 缺失 runtime 补发」，
+        // 跨阶段推进与补偿归 rollout；若把 rollout 排在 reconcile 之后，一次
+        // 五阶段滚动中 reconcile 会先看到 `applied_revision < config_revision`
+        // 并按旧 revision 重发一遍——多余但不致命，却让「谁在下发」变混。
+        //
+        // 只在 transport 可用时才跑：`resumeRollouts` 每一步都要 Agent 往返，
+        // 没有 orchestrator 时逐条失败只是把日志刷满（这一轮已经由
+        // `no_transport` 记账了）。
+        try {
+          const { resumeRollouts } = await import("./services/forward-rollout-recovery.ts");
+          const { getOrchestrator } = await import("./services/relay-wiring.ts");
+          const orchestrator = getOrchestrator();
+          if (orchestrator) {
+            const rollouts = await resumeRollouts({
+              db: db as never,
+              orchestrator: orchestrator as never,
+            });
+            if (rollouts.scanned > 0) {
+              console.log("[worker] cron_reconcile_v3 rollout resume:", JSON.stringify(rollouts));
+            }
+          }
+        } catch (e) {
+          // 续跑失败绝不阻断本轮 reconcile：§13.3.5 的失败分流已经在 rollout 行里，
+          // 下一轮会自然重试。
+          console.error("[worker] rollout resume failed:", e instanceof Error ? e.message : e);
+        }
+
         // Same-revision only: sink reads the already persisted ingress/egress
         // bindings and never chooses a new node/port. Offline nodes therefore
         // produce findings instead of automatic migration.

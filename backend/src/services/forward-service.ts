@@ -19,6 +19,7 @@ import {
 import { checkTunnelCreation } from "./capability-policy.ts";
 import { getOrchestrator } from "./relay-wiring.ts";
 import { reapplyDirectTunnel, reapplyRelayTunnel } from "./scheduler.ts";
+import { registerRollout } from "./forward-rollout-exec.ts";
 import {
   FORWARD_REVISION_ERROR_CODES,
   ForwardRevisionError,
@@ -638,30 +639,69 @@ export async function patchForward(
       .catch(() => {});
   }
 
-  // ── WP1 边界：只落 desired，把 apply 交给既有 reconciler ──
-  // apply_status 置 pending 让 reconciler 的 revision_behind / fill_missing_runtime
-  // 按新 revision 收敛；WP3 的 Orchestrator 落地时替换这个收敛出口。
-  await db.tunnel
-    .update({
-      where: { id: current.id },
-      data: { apply_status: "pending", apply_error_code: null, apply_error: null },
-    })
-    .catch(() => {});
+  // ── WP3 §13.3.2/§13.3.4：影响面 = rollout 计划的唯一输入 ──
+  // 与 previewForwardUpdate（下面同一 resolveForwardCandidate 的形状）逐字同一
+  // 组入参，§13.3.3「preview 与 update 同源」：planRollout 不重算差异。
+  const resolvedListenPort = candidate.listen_port ?? current.listen_port ?? null;
+  const impact = computeForwardImpact({
+    current: base,
+    candidate,
+    ingressNodeId: ctx.ingress?.node_id ?? null,
+    egressNodeId: ctx.egress?.node_id ?? null,
+    currentIngressNodeId: current.ingress_node?.node_id ?? null,
+    currentEgressNodeId: current.egress_node?.node_id ?? null,
+    ingressConnectIp: ctx.ingress?.connect_ip ?? null,
+    resolvedListenPort,
+    currentResolvedListenPort: current.listen_port ?? null,
+    bindingRequired: candidate.mode === "relay" && ctx.bindingExists === false,
+  });
 
+  // ── WP3 接入点：落库后走五阶段 rollout，替换 WP1 的"同步 reapply"出口 ──
+  //
+  // 为什么替换而不是并存（报告 §5 C6 + §1.1「WP1 的收敛出口必须替换」）：
+  // 旧的 `reapplyDirectTunnel/reapplyRelayTunnel` 是**创建路径**的编排器——
+  // 它自己 bind_nodes、自己 allocateTunnelPort、自己 config_revision = 读回 + 1、
+  // 失败时 desired_status=inactive，语义上是"重推一遍创建"，不是"按预先生成的
+  // revision 滚动"。两条路径并存会让"改端口"有时走五阶段有时走创建路径，
+  // 而后者会重新选节点/端口——正是 §13.3.5 要消灭的那类分叉。
+  //
+  // 契约不变的部分（WP1 冻结，WP4 依赖）：
+  //   · 成功仍返回 200 + forwardView；
+  //   · 失败仍返回 502 `apply_failed` + `apply_error_code` + 当前行快照；
+  //   · `applied_revision` 不动、revision 历史不删（§4.1 铁律）。
+  const suspended = current.apply_status === "suspended";
   const orchestrator = getOrchestrator();
-  if (orchestrator) {
-    const applied =
-      candidate.mode === "direct"
-        ? await reapplyDirectTunnel(current.id, orchestrator).catch(() => null)
-        : await reapplyRelayTunnel(current.id, orchestrator).catch(() => null);
-    if (applied && !applied.ok) {
-      // 失败保留 Tunnel 与 revision 历史（§4.1 铁律）：只回带错误，不删行。
-      const failed = await loadForwardRow(id, workspaceId);
-      return error(502, "apply_failed", applied.error, {
-        apply_error_code: applied.error_code,
-        data: failed ? forwardView(failed) : { id: current.id, revision },
-      });
-    }
+  const runtime = orchestrator
+    ? await registerRollout(
+        {
+          tunnelId: current.id,
+          impact,
+          revision,
+          baseRevision: current.applied_revision ?? null,
+          // §13.3.6：suspended 编辑 = 存 desired 不启 runtime（noop rollout）。
+          suspended,
+        },
+        { db: db as never, orchestrator: orchestrator as never },
+      ).catch(() => null)
+    : null;
+
+  // orchestrator 未接线（relay-wiring 失败）⇒ 跳过本轮执行，不回错误。
+  // 保存本身已成功（snapshot + revision 已落库，§4.1 铁律不破），worker 下一轮
+  // `resumeRollouts()` 会补上——与 WP1「orchestrator 缺失就跳过 reapply」同口径。
+  // 注意：此分支**不会**创建 rollout 行，因此不需要回 502/409。
+  if (runtime && !runtime.ok) {
+    // 失败保留 Tunnel 与 revision 历史（§4.1 铁律）：只回带错误，不删行。
+    const failed = await loadForwardRow(id, workspaceId);
+    return error(502, "apply_failed", runtime.error ?? "rollout 执行失败", {
+      apply_error_code: runtime.error_code,
+      data: failed ? forwardView(failed) : { id: current.id, revision },
+    });
+  }
+  if (runtime && runtime.status === "conflict") {
+    // 同期已有未完成 rollout（§13.3.5 抢占闸门）⇒ 409，前端刷新后重试。
+    return error(409, "revision_conflict", "该转发已有正在进行的更新", {
+      data: { latest_revision: revision },
+    });
   }
 
   const updated = await loadForwardRow(id, workspaceId);

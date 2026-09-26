@@ -721,12 +721,26 @@ model ForwardRollout {
   base_revision Int?
   /// validate|prepare|cutover|drain|cleanup|done|failed|compensating|degraded|waiting
   phase String @db.VarChar(20)
+  /// §13.3.4 的分类（metadata_only|target_hot_swap|listener_replace|
+  /// node_migration|mode_switch|noop）。WP1 `computeForwardImpact` 的投影，
+  /// 随 rollout 行落库以便续跑与排障。
+  /// 由迁移 20261009123000 追加（C4 实现晚于建表迁移，保持后者逐字不动）。
+  strategy String? @db.VarChar(30)
   /// 阶段步骤记录（JSON：StepRecord[]，与 scheduler.SCHEDULER_STEPS 同构）。
   steps Json?
   /// 已分配/待回收资源句柄（leaseId / bindingId / egress 命令 id …）。
   prepared Json?
   /// 每个 CLEANUP 项的幂等键执行结果（重复执行走「已清」分支）。
   cleaned Json?
+  /// 逐步的人类可读流水账（追加式 notes.push）。§13.3.5「哪一次 rollout 卡在哪一步
+  /// 要能查出来」的载体；与 last_error 的区别：last_error 只记最终失败，notes 记全程。
+  notes Json?
+  /// CUTOVER 失败后是否已回退到 base_revision（§13.3.5 第三张表的判据）。
+  /// 缺省 false 让存量行（迁移前的历史 rollout）语义安全：「未确认补偿」。
+  compensated Boolean @default(false)
+  /// compensation 失败的原因；非 NULL ⇒ phase 落到 degraded，交 Reconciler／
+  /// 人工 Retry 修复（§13.3.5）。成功补偿时为 NULL。
+  compensation_error String? @db.VarChar(500)
   /// 续跑/补偿的重试计数（观测用：attempt 暴涨 = 环境有问题，不是用户问题）。
   attempt Int @default(0)
   last_error_code String? @db.VarChar(64)

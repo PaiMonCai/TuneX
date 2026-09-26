@@ -128,6 +128,11 @@ export interface RolloutDeps {
    * 这类跨请求状态最容易出静默数据错乱的地方。
    */
   db: RolloutDb;
+  /**
+   * 控制面 transport。调用方（route/worker）显式注入；无法取得时应以
+   * `agent_unreachable` 的失败形态交给调用方，而不是代填 null
+   * （本模块的 step runner 在无 transport 时无法安全执行任何下发）。
+   */
   orchestrator: Orchestrator;
   now?: () => Date;
 }
@@ -193,15 +198,20 @@ export interface RolloutRowView {
   tunnel_id: number;
   revision: number;
   base_revision: number | null;
-  /**  rollout 行自己的 phase 列（`phase` 与 RolloutStatus 同名不同物：列是 DB 真相）。 */
+  /** rollout 行自己的 phase 列（`phase` 与 RolloutStatus 同名不同物：列是 DB 真相）。 */
   phase: RolloutStatus;
-  strategy: string;
+  /** `strategy` 列；迁移前的存量行为 NULL（DB 允许、不回落不影响语义）。 */
+  strategy: string | null;
   /** `steps` 列：register 时写入的「计划 + desired/applied 快照」。 */
   steps: unknown;
   /** `cleaned` 列：已完成的 step 幂等键集合（追加式）。 */
   cleaned: string[];
   /** `prepared` 列：本轮创建、失败时要回收的资源句柄（追加式）。 */
   prepared: PreparedResource[];
+  /** `notes` 列：逐步流水账（追加式）；迁移前的存量行为 NULL。 */
+  notes: string[] | null;
+  /** `compensation_error`：补偿失败原因；成功补偿与未补偿时为 NULL。 */
+  compensation_error: string | null;
   last_error_code: string | null;
   last_error: string | null;
   compensated: boolean;
@@ -1046,7 +1056,11 @@ export async function executeRollout(
     plan,
     completed,
     prepared,
-    notes: [],
+    // `notes` 是**追加式流水账**：`transitionRollout` 写 `notes: ctx.notes` 时
+    // 走的是 Prisma 的 `{ push }`，若此处重新置 []，第一次 patch 就会把上一轮
+    // （崩溃前的阶段）落账抹掉，`§13.3.2` 要求「可追溯到本轮结束」就断了。
+    // 因此必须从当前行读起；列为 NULL（迁移前存量行）时按空数组开始。
+    notes: [...readLedger<string[]>(row.notes, [])],
   };
 
   const phases = ROLLOUT_STAGE_SEQUENCE;
