@@ -14,12 +14,18 @@
  *    不是 `applied_revision`——否则永远打不中并发闸门。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Copy, Info, Loader2, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Copy, Info, Link2, Loader2, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/card";
+import {
+  listenPortHintKey,
+  listenPortPlaceholderKey,
+  type ForwardDraft,
+} from "@/components/forwards/forward-copy";
+import { bindingUsageView } from "@/components/forwards/forward-binding-usage";
 import {
   Dialog,
   DialogContent,
@@ -49,15 +55,12 @@ export const FORWARD_EDIT_FIELDS = [
 
 export type ForwardEditField = (typeof FORWARD_EDIT_FIELDS)[number];
 
-type Draft = {
-  name: string;
-  mode: "direct" | "relay";
-  ingressId: string;
-  egressId: string;
-  listenPort: string;
-  targetHost: string;
-  targetPort: string;
-};
+/**
+ * 编辑器草稿形状。V4-WP9 起复用 `forward-copy.ts` 的 {@link ForwardDraft}：
+ * 复制出的草稿必须能直接落进同一个编辑器（字段集完全相同），因此这里不再另立一份
+ * 结构上等价、却可能悄悄漂移的本地类型。
+ */
+type Draft = ForwardDraft;
 
 const EMPTY_DRAFT: Draft = {
   name: "",
@@ -155,7 +158,7 @@ export function ForwardEditDialog({
   forward: PortForward;
   /** 当前 workspace 的节点（用于 ingress/egress 选择）。 */
   nodes: UserNode[];
-  /** ingress_id → 已绑定的出口列表。 */
+  /** ingress_id → 已绑定的出口列表（每行带后端下发的 `used_by_forward_count`）。 */
   bindings: Record<string, NodeBinding[]>;
   onSaved: (updated: PortForward) => void;
   onReload: () => void;
@@ -241,6 +244,21 @@ export function ForwardEditDialog({
     }));
   }, [bindings, draft.ingressId]);
 
+  /**
+   * V4-WP9 Binding usage：当前入口节点每条绑定的使用量与解绑闸门状态。
+   *
+   * 使用量直接取后端下发的 `used_by_forward_count` / `unbind_blocked`
+   * （`GET /api/nodes/:id/bindings` 的响应投影），前端**不重新统计** ——
+   * 否则「列表说可解绑、删除又被 409 拒绝」这类自相矛盾的体验会重现。
+   */
+  const bindingUsageRows = useMemo(() => {
+    if (!draft.ingressId) return [];
+    return (bindings[draft.ingressId] ?? []).map((binding) => ({
+      label: binding.egress_node?.node_id ?? String(binding.egress_node_id),
+      usage: bindingUsageView(binding),
+    }));
+  }, [bindings, draft.ingressId]);
+
   const saveBlocked =
     saving || empty || hasFormError || preview.kind !== "ready" || conflict !== null;
 
@@ -294,6 +312,8 @@ export function ForwardEditDialog({
     if (impact.listen_port_change && !impact.changes_external_address) {
       lines.push(t("forward.impactPort"));
     }
+    // auto-port：端口留空 = 由系统分配，必须显式说出来，而不是给一个假端口号。
+    if (impact.port_status === "auto") lines.push(t("forward.impactPortAuto"));
     if (impact.binding_required) lines.push(t("forward.impactBinding"));
     if (impact.nodes_prepare_drain.length > 0) {
       lines.push(
@@ -406,13 +426,13 @@ export function ForwardEditDialog({
 
             <Field
               label={t("forward.listenPort")}
-              hint={t("forward.autoPortHint")}
+              hint={t(listenPortHintKey(draft.listenPort))}
               error={formErrors.listen_port}
             >
               <Input
                 inputMode="numeric"
                 value={draft.listenPort}
-                placeholder={t("forward.portPlaceholder")}
+                placeholder={t(listenPortPlaceholderKey(draft.listenPort))}
                 onChange={(event) => setDraft((d) => ({ ...d, listenPort: event.target.value }))}
               />
             </Field>
@@ -433,6 +453,51 @@ export function ForwardEditDialog({
                 onChange={(event) => setDraft((d) => ({ ...d, targetPort: event.target.value }))}
               />
             </Field>
+
+            {/*
+              V4-WP9 Binding usage：当前入口节点每条绑定被多少条 Forward 占用，
+              并区分「正在使用（解绑会被后端 409 拒绝）」与「未被使用（可解绑）」。
+              只在 relay 下展示 —— direct 根本不使用出口绑定，列出来只会是噪音。
+              数字与 `unbind_blocked` 都来自 bindings 响应投影，本处只负责展示。
+            */}
+            {draft.mode === "relay" && bindingUsageRows.length > 0 ? (
+              <div className="rounded-md border border-[var(--border)] p-3 sm:col-span-2">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Link2 className="size-4" />
+                  {t("forward.bindingUsageTitle")}
+                </div>
+                <p className="mt-1 text-xs text-[var(--muted-foreground)]">
+                  {t("forward.bindingUsageHint")}
+                </p>
+                <ul className="mt-2 space-y-1.5">
+                  {bindingUsageRows.map((row) => {
+                    const deletable = row.usage.state === "deletable";
+                    return (
+                      <li
+                        key={row.label}
+                        className="flex flex-wrap items-center justify-between gap-2 text-xs"
+                      >
+                        <span className="font-mono">{row.label}</span>
+                        <span className="flex items-center gap-2">
+                          <span className="text-[var(--muted-foreground)]">
+                            {deletable
+                              ? t("forward.bindingUsageUnused")
+                              : t("forward.bindingUsageUsed", {
+                                  count: String(row.usage.used_by_forward_count),
+                                })}
+                          </span>
+                          <Badge variant={deletable ? "outline" : "secondary"}>
+                            {deletable
+                              ? t("forward.bindingUsageDeletable")
+                              : t("forward.bindingUsageInUse")}
+                          </Badge>
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ) : null}
           </div>
         )}
 

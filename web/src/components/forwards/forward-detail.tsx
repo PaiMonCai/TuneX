@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { InfoRow } from "@/components/ui/form";
 import { api } from "@/lib/api";
+import { forwardAccessAddress } from "@/components/forwards/forward-copy";
 import type { NodeBinding, PortForward, TrafficPoint, UserNode } from "@/lib/types";
 import { formatBytes, formatDateTime } from "@/lib/utils";
 
@@ -113,7 +114,7 @@ export function ForwardDetail({
     }
   }
 
-  const listenAddress = `${forward.listen_ip ?? "*"}:${forward.listen_port ?? "auto"}`;
+  const listenAddress = forwardAccessAddress(forward) ?? t("forward.addressPending");
   const targetAddress =
     forward.target_host && forward.target_port
       ? `${forward.target_host}:${forward.target_port}`

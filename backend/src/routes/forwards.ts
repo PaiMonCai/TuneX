@@ -16,14 +16,21 @@ import {
   getForwardSummary,
   getForwardTraffic,
   listForwards,
+  listForwardsPage,
   patchForward,
   previewForwardUpdate,
   runForwardAction,
+  runForwardBatch,
   type ForwardAction,
-  type ForwardApplyStatus,
-  type ForwardMode,
   type ForwardServiceResult,
 } from "../services/forward-service.ts";
+import { parseForwardBatchRequest } from "../services/forward-batch.ts";
+import {
+  forwardListShape,
+  forwardOrderBy,
+  forwardPage,
+  parseForwardListQuery,
+} from "../services/forward-list-query.ts";
 
 export const forwardsRoutes = new Hono<{ Variables: AppVariables }>();
 type Ctx = Context<{ Variables: AppVariables }>;
@@ -120,40 +127,43 @@ const ForwardPatchSchema = z
   );
 
 const ACTIONS = new Set<ForwardAction>(["retry", "suspend", "resume"]);
-const APPLY_STATUSES = new Set<ForwardApplyStatus>([
-  "pending",
-  "applying",
-  "active",
-  "error",
-  "suspended",
-]);
+
+/**
+ * V4-WP9 §13.6：列表改为**服务端**分页 / 排序。
+ *
+ * 响应形状 `{ data: { data, total, page, page_size } }`（前端 request() 剥一层
+ * 后即 `Paginated<PortForward>`），与 `GET /api/node-groups`、
+ * `GET /api/tunnels` 的分页信封完全一致——同一产品里不能有两种分页形状。
+ *
+ * 兼容口径（重要）：
+ *   · 客户端**显式带 page / page_size**才走分页信封；
+ *   · 不带分页参数时返回裸数组（保持 WP4 及之前 `api.forwards.list()` 的契约，
+ *     以及 E2E 脚本 / 仪表盘的 `slice(0,5)` 取用方式）。
+ *   这条不是"过渡期双轨"：分页信封与裸数组都是冻结契约，前者是新 UI 的形态，
+ *   后者是「取全部」的显式语义（服务端仍施加上限，防止无界查询）。
+ *
+ * 上限常量 `FORWARD_LIST_MAX_UNPAGED` 定义在 `forward-list-query.ts`——兼容端点
+ * `/api/nodes/:ingressId/forwards` 用同一个常量，两处不能各写一个数字。
+ */
 
 forwardsRoutes.get("/", async (c) => {
   const ws = workspace(c);
   const q = c.req.query();
-  const mode = q.mode === "direct" || q.mode === "relay"
-    ? (q.mode as ForwardMode)
-    : undefined;
-  const applyStatus = APPLY_STATUSES.has(q.apply_status as ForwardApplyStatus)
-    ? (q.apply_status as ForwardApplyStatus)
-    : undefined;
-  const ingressNodeId = Number(q.ingress_node_id);
-  const egressNodeId = Number(q.egress_node_id);
+  const parsed = parseForwardListQuery(q);
 
-  const rows = await listForwards(ws.id, {
-    mode,
-    apply_status: applyStatus,
-    ingress_node_id:
-      Number.isInteger(ingressNodeId) && ingressNodeId > 0
-        ? ingressNodeId
-        : undefined,
-    egress_node_id:
-      Number.isInteger(egressNodeId) && egressNodeId > 0
-        ? egressNodeId
-        : undefined,
-    keyword: q.keyword?.trim() || undefined,
+  if (forwardListShape(q) === "all") {
+    // 「取全部」的上限在 `listForwards` 服务层（单一落点），这里不再二次截断。
+    return c.json({ data: await listForwards(ws.id, parsed.filters) });
+  }
+
+  const page = await listForwardsPage(ws.id, parsed.filters, {
+    skip: parsed.skip,
+    take: parsed.take,
+    orderBy: forwardOrderBy(parsed.sort, parsed.order),
   });
-  return c.json({ data: rows });
+  return c.json({
+    data: forwardPage(page.data, page.total, parsed.page, parsed.page_size),
+  });
 });
 
 forwardsRoutes.get("/summary", async (c) => {
@@ -247,6 +257,31 @@ forwardsRoutes.post("/:id/preview", async (c) => {
       u?.id ?? undefined,
     ),
   );
+});
+
+/**
+ * V4-WP9 §13.6：批量 retry / suspend / resume。
+ *
+ * 为什么是独立路径 `/batch` 而不是给 `POST /api/forwards/:id/:action` 加数组形态：
+ * 单条与批量的**错误语义不同**——单条失败整请求失败（4xx/5xx），批量失败是
+ * 逐条结果 + 200。把两种语义塞进一个端点会让客户端无法判断该看 `error` 还是
+ * `results`。路由注册在 `/:id/:action` **之前**，否则 `:id` 会吃掉 "batch"。
+ *
+ * 限流：见 rate-limit.ts 的 `forward-batch` 规则（必须在 `api-global` 之前命中）。
+ */
+forwardsRoutes.post("/batch", async (c) => {
+  const parsed = parseForwardBatchRequest(
+    await c.req.json().catch(() => null),
+  );
+  if ("message" in parsed) {
+    return c.json({ error: parsed.message, code: "invalid_input" }, 400);
+  }
+  const payload = await runForwardBatch(
+    parsed.ids,
+    parsed.action,
+    workspace(c).id,
+  );
+  return c.json({ data: payload });
 });
 
 forwardsRoutes.post("/:id/:action", async (c) => {

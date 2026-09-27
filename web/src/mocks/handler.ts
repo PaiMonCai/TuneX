@@ -181,6 +181,50 @@ function paginate<T>(items: T[], query?: ListQuery) {
   return { data: items.slice(start, start + page_size), total: items.length, page, page_size };
 }
 
+/**
+ * V4-WP9 §13.6：Forward 列表的服务端排序口径（mock 版）。
+ *
+ * 与后端 `services/forward-list-query.ts` 的 `FORWARD_SORT_COLUMNS` 一一对应：
+ *   · 白名单外的 sort 键回落 `order_by`（不报错，也不产出未定义列名）；
+ *   · 永远追加 `id desc` 兜底，让分页稳定（同名行不会在两页间跳动）；
+ *   · `order` 只认 asc/desc。
+ * 保持两份实现是 mock 的固有代价，因此这里的取值刻意写成与后端同名的映射表，
+ * 差异一眼可见；契约测试（forward-scale.test.ts）钉住两者的可见行为。
+ */
+const MOCK_FORWARD_SORT_FIELDS: Record<string, keyof PortForward> = {
+  order_by: "listen_port",
+  name: "name",
+  status: "apply_status",
+  mode: "mode",
+  listen_port: "listen_port",
+  traffic: "traffic",
+  created_at: "created_at",
+  updated_at: "updated_at",
+};
+
+function sortMockForwards(
+  rows: PortForward[],
+  sort: string | undefined,
+  order: string | undefined,
+): PortForward[] {
+  const key = sort?.trim().toLowerCase() ?? "";
+  const field = MOCK_FORWARD_SORT_FIELDS[key] ?? "listen_port";
+  const direction = order?.trim().toLowerCase() === "desc" ? -1 : 1;
+  return [...rows].sort((a, b) => {
+    const av = a[field];
+    const bv = b[field];
+    let cmp: number;
+    if (typeof av === "number" && typeof bv === "number") {
+      cmp = av - bv;
+    } else {
+      cmp = String(av ?? "").localeCompare(String(bv ?? ""));
+    }
+    if (cmp !== 0) return cmp * direction;
+    // id desc 兜底：分页稳定性依赖它（与后端 orderBy 的第二项一致）。
+    return Number(b.id) - Number(a.id);
+  });
+}
+
 /** 关键字过滤：接受任意实体数组（Prisma 模型无索引签名，内部按 record 取值） */
 function filterByKeyword<T extends object>(items: T[], query: ListQuery | undefined, keys: string[]): T[] {
   const kw = String(query?.keyword ?? "").trim().toLowerCase();
@@ -786,6 +830,27 @@ function nextTargetId(targets: EgressTarget[]): ID {
 const APPLY_STATUSES = ["pending", "applying", "active", "error", "suspended"] as const;
 const TUNNEL_MODES = ["direct", "relay"] as const;
 
+/**
+ * V4-WP9 §13.6：批量动作白名单（mock 侧镜像）。
+ *
+ * 与后端 `services/forward-batch.ts` 的 `FORWARD_BATCH_ACTIONS` **必须一致**：
+ * 不含 delete（不可逆动作不提供批量入口）。上限同理——mock 必须拒绝同样的
+ * 请求，否则本地开发会通过、线上 400。
+ */
+const FORWARD_BATCH_ACTIONS = ["retry", "suspend", "resume"] as const;
+const FORWARD_BATCH_MAX_IDS = 50;
+
+type MockForwardBatchAction = (typeof FORWARD_BATCH_ACTIONS)[number];
+
+/** 逐条结果形状：与后端 `ForwardBatchItemResult` 对齐（字段名即契约）。 */
+interface MockForwardBatchItemResult {
+  id: number;
+  ok: boolean;
+  apply_status: string | null;
+  code?: string;
+  message?: string;
+}
+
 function applyStatusOf(t: Tunnel): Tunnel["apply_status"] {
   return t.apply_status ?? null;
 }
@@ -890,12 +955,32 @@ function mockUserNode(db: Store, node: Node): UserNode {
   };
 }
 
+/**
+ * V4-WP9 §13.6「Binding usage」：绑定使用量是**响应投影**，不是存储字段。
+ *
+ * 与后端 `services/binding-usage.ts` 同一口径：统计以该 pair 为 (ingress, egress)
+ * 的 relay 转发条数；> 0 即解绑阻塞。mock 里逐绑定计算即可（数据量小），
+ * 真实后端用一次 groupBy 避免 N+1。
+ */
+function mockBindingUsage(db: Store, ingressNodeId: number, egressNodeId: number) {
+  const used = db.tunnels.filter((tunnel) => {
+    const ingress = mockIngressNode(db, tunnel);
+    return (
+      tunnel.tunnel_mode === "relay" &&
+      ingress?.id === ingressNodeId &&
+      tunnel.egress_node_id === egressNodeId
+    );
+  }).length;
+  return { used_by_forward_count: used, unbind_blocked: used > 0 };
+}
+
 function mockBindingView(db: Store, binding: MockNodeBinding): NodeBinding | null {
   const egress = db.nodes.find((node) => node.id === binding.egress_node_id);
   if (!egress) return null;
   return {
     ...binding,
     egress_node: mockUserNode(db, egress),
+    ...mockBindingUsage(db, binding.ingress_node_id, binding.egress_node_id),
   };
 }
 
@@ -1507,19 +1592,15 @@ export async function handleMock(method: string, path: string, req: MockRequest)
 
         const egressId = parseId(seg[3]);
         if (method === "DELETE" && egressId !== null) {
-          const used = db.tunnels.filter((tunnel) => {
-            const ingress = mockIngressNode(db, tunnel);
-            return (
-              tunnel.tunnel_mode === "relay" &&
-              ingress?.id === nodeId &&
-              tunnel.egress_node_id === egressId
-            );
-          }).length;
-          if (used > 0) {
+          // V4-WP9 §13.6：与后端同一判定 + 同一文案（binding-usage.ts），
+          // 并在错误响应里回传使用量，前端错误分支也能刷新按钮状态。
+          const usage = mockBindingUsage(db, nodeId, egressId);
+          if (usage.unbind_blocked) {
             return fail(
               409,
-              `该出口仍被 ${used} 条端口转发使用，请先删除或改为其它出口`,
+              `该出口仍被 ${usage.used_by_forward_count} 条端口转发使用，请先删除或改为其它出口`,
               "BINDING_IN_USE",
+              usage,
             );
           }
           db.nodeBindings = db.nodeBindings.filter(
@@ -1592,7 +1673,89 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           ].some((value) => value.toLowerCase().includes(keyword)),
         );
       }
-      return ok(rows.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)));
+      // V4-WP9 §13.6：与后端 `routes/forwards.ts` 同一形态决策——带 page /
+      // page_size / sort / order 任一参数 → 分页信封；否则 → 裸数组。
+      // 口径一旦分叉，mock 下的分页行为就会与线上静默不一致。
+      const wantsPage =
+        q?.page !== undefined ||
+        q?.page_size !== undefined ||
+        q?.sort !== undefined ||
+        q?.order !== undefined;
+      if (!wantsPage) {
+        return ok(rows.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)));
+      }
+      return ok(
+        paginate(sortMockForwards(rows, reqStr(q?.sort), reqStr(q?.order)), q),
+      );
+    }
+
+    /**
+     * V4-WP9 §13.6：批量 retry / suspend / resume。
+     *
+     * 与后端同一契约：动作白名单（不含 delete）、ids 去重、单次上限 50、
+     * 逐条结果 + 200（部分失败不改整体状态码）。**必须**在单条 POST 分支之前
+     * 判定，否则 "batch" 会被当成 id 走进单条分支。
+     */
+    if (method === "POST" && seg[1] === "batch") {
+      const body = asRecord(req.body);
+      const rawAction = reqStr(body.action);
+      if (
+        !(FORWARD_BATCH_ACTIONS as readonly string[]).includes(rawAction)
+      ) {
+        return badRequest("不支持的批量动作");
+      }
+      const batchAction = rawAction as MockForwardBatchAction;
+      if (!Array.isArray(body.ids)) return badRequest("ids 必须是数组");
+      for (const raw of body.ids) {
+        if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+          return badRequest("ids 只能包含正整数");
+        }
+      }
+      const batchIds = [...new Set(body.ids as number[])];
+      if (batchIds.length === 0) return badRequest("ids 不能为空");
+      if (batchIds.length > FORWARD_BATCH_MAX_IDS) {
+        return badRequest(`一次最多处理 ${FORWARD_BATCH_MAX_IDS} 条`);
+      }
+
+      const results: MockForwardBatchItemResult[] = [];
+      for (const batchId of batchIds) {
+        const row = db.tunnels.find((tunnel) => tunnel.id === batchId);
+        if (!row) {
+          results.push({
+            id: batchId,
+            ok: false,
+            apply_status: null,
+            code: "not_found",
+            message: "端口转发不存在",
+          });
+          continue;
+        }
+        const outcome = tunnelRuntimeAction(db, row, batchAction);
+        if (outcome.status >= 400) {
+          const bodyOf = outcome.body as { message?: string; code?: string };
+          results.push({
+            id: batchId,
+            ok: false,
+            apply_status: mockForwardView(db, row).apply_status,
+            code: bodyOf.code ?? "invalid_state",
+            message: bodyOf.message ?? "动作被拒绝",
+          });
+          continue;
+        }
+        results.push({
+          id: batchId,
+          ok: true,
+          apply_status: mockForwardView(db, row).apply_status,
+        });
+      }
+      const succeeded = results.filter((row) => row.ok).length;
+      return ok({
+        action: batchAction,
+        requested: results.length,
+        succeeded,
+        failed: results.length - succeeded,
+        results,
+      });
     }
 
     if (method === "POST" && seg[1] === undefined) {

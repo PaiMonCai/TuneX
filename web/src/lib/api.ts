@@ -48,6 +48,9 @@ import type {
   ForwardCreateInput,
   ForwardPatchInput,
   ForwardPreviewResult,
+  ForwardListQuery,
+  ForwardBatchInput,
+  ForwardBatchResult,
   ForwardSummary,
   ProvisionNodeResult,
   Payment,
@@ -405,8 +408,28 @@ export const api = {
   forwards: {
     summary: (cookie?: string) =>
       get<ForwardSummary>("/forwards/summary", undefined, cookie),
-    list: (query?: ListQuery, cookie?: string) =>
+    /**
+     * V4-WP9 §13.6：列表支持服务端分页 / 排序 / 过滤。
+     *
+     * 带 `page` / `page_size` / `sort` / `order` 任一参数时后端返回
+     * `Paginated<PortForward>`；不带则返回裸数组（冻结的旧契约）。
+     * 用两个方法把这两种形态分开，调用点就无法"忘了带 page 却按分页读"。
+     */
+    list: (query?: ForwardListQuery, cookie?: string) =>
       get<PortForward[]>("/forwards", query, cookie),
+    /** 分页形态：必须有分页/排序参数，响应为 `Paginated<PortForward>`。 */
+    page: (query: ForwardListQuery, cookie?: string) =>
+      get<Paginated<PortForward>>("/forwards", query, cookie),
+    /**
+     * V4-WP9 §13.6：批量 retry / suspend / resume。
+     *
+     * 逐条结果 + 200（部分失败不改整体状态码），因此调用方必须读
+     * `succeeded` / `failed` 而不是只看 promise 是否 reject。
+     */
+    batch: (
+      input: ForwardBatchInput,
+      cookie?: string,
+    ) => post<ForwardBatchResult>("/forwards/batch", input, cookie),
     detail: (id: ID, cookie?: string) =>
       get<PortForward>(`/forwards/${id}`, undefined, cookie),
     traffic: (id: ID, days = 14, cookie?: string) =>
