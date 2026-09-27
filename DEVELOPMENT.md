@@ -1612,7 +1612,7 @@ V4-WP9  Scale & Interaction Polish            ✅ main
 Gate F2 Managed Node Lifecycle + Telemetry     ✅ 完成
 Gate F3 Monitoring / Scale / UX Complete      ✅ 完成
 
-V4-WP10 Authorization + NodeGroup Model       🟢 NEXT
+V4-WP10 Authorization + NodeGroup Model       ⏸️ PAUSED — resume here
 V4-WP11 Stable / Ops Hardening                ⏸️ blocked by F4
 ```
 
