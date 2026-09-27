@@ -75,7 +75,35 @@ const nodes = new Map<number, NodeRow>();
 const pools: PoolRow[] = [];
 const targets: TargetRow[] = [];
 const reports = new Map<number, StateReportRow>();
-const tunnels = new Map<number, { id: number; egress_pool_id: number | null; egress_node_id: number | null }>();
+/** tunnel 行投影：impact 的角色收缩判定要看 ingress_node_id，出口池删除要看 egress_*。 */
+const tunnels = new Map<
+  number,
+  {
+    id: number;
+    egress_pool_id: number | null;
+    ingress_node_id: number | null;
+    egress_node_id: number | null;
+  }
+>();
+/** active 租约行投影（`node_port_lease`）：端口区间收缩的悬空判定输入。 */
+const leases: Array<{ node_id: number; port: number; status: string }> = [];
+const bindings: Array<{ ingress_node_id: number; egress_node_id: number }> = [];
+/**
+ * 事务内调用轨迹：断言「行锁 → 依赖统计 → 写入」的顺序，以及守卫的统计确实
+ * 发生在事务里（而不是锁外读一份快照）。
+ */
+const trace: string[] = [];
+let txDepth = 0;
+/** 测试钩子：模拟「另一事务在本次拿到行锁的瞬间提交了一条依赖行」。 */
+let afterLockHook: (() => void) | null = null;
+
+function traceInTx(step: string): void {
+  if (txDepth > 0) trace.push(step);
+}
+
+function setAfterLockHook(hook: (() => void) | null): void {
+  afterLockHook = hook;
+}
 let nextNodeId = 1;
 let nextPoolId = 1;
 let nextTargetId = 1;
@@ -87,6 +115,11 @@ function resetState(): void {
   targets.length = 0;
   reports.clear();
   tunnels.clear();
+  leases.length = 0;
+  bindings.length = 0;
+  trace.length = 0;
+  txDepth = 0;
+  afterLockHook = null;
   nextNodeId = 1;
   nextPoolId = 1;
   nextTargetId = 1;
@@ -156,7 +189,7 @@ function seedStateReport(nodeId: number, over: Partial<StateReportRow> = {}): St
  *   · node.update 对不存在的 id 抛 P2025。
  */
 function makeDb(): NodeAdminDb {
-  return {
+  const dbStub: NodeAdminDb = {
     node: {
       async findUnique(args: unknown) {
         const { where, select, include } = args as {
@@ -403,16 +436,116 @@ function makeDb(): NodeAdminDb {
       async count({ where }: { where: Record<string, unknown> }) {
         let rows = [...tunnels.values()];
         if (where?.egress_pool_id !== undefined) rows = rows.filter((t) => t.egress_pool_id === where.egress_pool_id);
+        if (where?.ingress_node_id !== undefined) {
+          rows = rows.filter((t) => t.ingress_node_id === where.ingress_node_id);
+        }
         if (where?.egress_node_id !== undefined) rows = rows.filter((t) => t.egress_node_id === where.egress_node_id);
         return rows.length;
       },
       async findMany({ where }: { where: Record<string, unknown> }) {
         let rows = [...tunnels.values()];
+        if (where?.ingress_node_id !== undefined) {
+          rows = rows.filter((t) => t.ingress_node_id === where.ingress_node_id);
+        }
         if (where?.egress_node_id !== undefined) rows = rows.filter((t) => t.egress_node_id === where.egress_node_id);
         return rows;
       },
     },
+
+    /** impact 的 binding_count（`getNodeImpact` 的 OR 形状，需显式支持）。 */
+    nodeBinding: {
+      async count({ where }: { where: Record<string, unknown> }) {
+        const or = (where as { OR?: Array<Record<string, number>> }).OR;
+        if (!Array.isArray(or)) return bindings.length;
+        return bindings.filter((b) =>
+          or.some(
+            (clause) =>
+              (clause.ingress_node_id === undefined || clause.ingress_node_id === b.ingress_node_id) &&
+              (clause.egress_node_id === undefined || clause.egress_node_id === b.egress_node_id),
+          ),
+        ).length;
+      },
+    },
+
+    /** impact 的租约计数 + `listActiveLeasePorts` 的端口清单。 */
+    nodePortLease: {
+      async count({ where }: { where: Record<string, unknown> }) {
+        return leases.filter(
+          (l) =>
+            (where?.node_id === undefined || l.node_id === where.node_id) &&
+            (where?.status === undefined || l.status === where.status),
+        ).length;
+      },
+      async findMany({ where, select }: { where?: Record<string, unknown>; select?: Record<string, unknown> }) {
+        const rows = leases.filter(
+          (l) =>
+            (where?.node_id === undefined || l.node_id === where.node_id) &&
+            (where?.status === undefined || l.status === where.status),
+        );
+        if (select) return rows.map((l) => ({ port: l.port }));
+        return rows;
+      },
+    },
   };
+
+  /**
+   * 追踪隧道：守卫的依赖统计必须落在事务里（否则「判完再被并发插一条」= TOCTOU）。
+   * 只记读取依赖的 count/findMany 与 node.update，避免噪音。
+   *
+   * 注意：先取出原始实现（`rawX.…`），否则包装体调用 `dbStub.node.update` 会自递归。
+   */
+  const tracked = (name: string, fn: () => Promise<unknown>): Promise<unknown> => {
+    traceInTx(name);
+    return fn();
+  };
+  type Loose = Record<string, (...args: unknown[]) => Promise<unknown>>;
+  const rawNode = dbStub.node as unknown as Loose;
+  const rawLease = dbStub.nodePortLease as unknown as Loose;
+  const rawPool = dbStub.egressPool as unknown as Loose;
+  const rawTunnel = dbStub.tunnel as unknown as Loose;
+
+  dbStub.node = {
+    ...dbStub.node,
+    count: (args: unknown) => tracked("node.count", () => rawNode.count(args)),
+    update: (args: unknown) => tracked("node.update", () => rawNode.update(args)),
+  };
+  dbStub.nodePortLease = {
+    count: (args: unknown) => tracked("lease.count", () => rawLease.count(args)),
+    findMany: (args: unknown) => tracked("lease.findMany", () => rawLease.findMany(args)),
+  };
+  dbStub.egressPool = {
+    ...dbStub.egressPool,
+    count: (args: unknown) => tracked("pool.count", () => rawPool.count(args)),
+  };
+  dbStub.tunnel = {
+    ...dbStub.tunnel,
+    count: (args: unknown) => tracked("tunnel.count", () => rawTunnel.count(args)),
+  };
+
+  /**
+   * 事务接缝（内存实现）：进入即「持锁」，退出即「提交」。
+   * `$queryRaw` 里的 FOR UPDATE 触发 {@link setAfterLockHook} —— 用来模拟
+   * 「锁到手的那一刻另一事务提交了依赖行」，验证守卫确实在锁内重新统计。
+   */
+  dbStub.$transaction = async <T>(fn: (tx: NodeAdminDb) => Promise<T>): Promise<T> => {
+    txDepth += 1;
+    try {
+      return await fn(dbStub);
+    } finally {
+      txDepth -= 1;
+    }
+  };
+  dbStub.$queryRaw = async () => {
+    traceInTx("node.lock");
+    const hook = afterLockHook;
+    if (hook) {
+      afterLockHook = null;
+      hook();
+    }
+    return [];
+  };
+
+  return dbStub;
 }
 
 /** 固定"现在"，让 stale/age 断言不依赖真实时钟。 */
@@ -455,6 +588,27 @@ function seedDefaultPool(node: NodeRow): PoolRow {
 beforeEach(() => {
   resetState();
 });
+
+/* ---- 依赖行种子（角色/区间收缩的 impact 判定输入） ---- */
+
+/** 造一条以该节点为入口的 Forward（impact：`ingress_forward_count`）。 */
+function seedIngressForward(nodeId: number): number {
+  const id = nextTunnelId++;
+  tunnels.set(id, { id, egress_pool_id: null, ingress_node_id: nodeId, egress_node_id: null });
+  return id;
+}
+
+/** 造一条以该节点为出口的 Forward（impact：`egress_forward_count`）。 */
+function seedEgressForward(nodeId: number): number {
+  const id = nextTunnelId++;
+  tunnels.set(id, { id, egress_pool_id: null, ingress_node_id: null, egress_node_id: nodeId });
+  return id;
+}
+
+/** 造一条 active 端口租约（区间收缩的悬空判定只看 active）。 */
+function seedLease(nodeId: number, port: number, status = "active"): void {
+  leases.push({ node_id: nodeId, port, status });
+}
 
 /* ------------------------------------------------------------------ */
 /* 纯校验                                                               */
@@ -747,6 +901,179 @@ describe("updateNodeRole", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* §13.4.3 写路径 fail-closed（V4-F2 缺陷回归）                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * V4-F2 的真实缺陷：`GET /admin/node/:id/impact` 预检用 `checkRoleChange` 判
+ * 「不许收缩」，而 `PATCH /admin/node/:id/role` 的写路径只查了出口池计数就落库
+ * → 预检拒绝、PATCH 却 200 且 DB 已改。
+ *
+ * 这组用例把 Gate 里那两条负面断言（F2.9.11 / F2.9.12）钉在服务层：拒绝必须
+ * 是 **409 + condition + 零写入**，而不是 200。
+ */
+describe("updateNodeRole：§13.4.3 依赖收缩必须 fail-closed", () => {
+  test("BOTH 节点仍承载入口 Forward 时，收缩为 EGRESS → 409 node_still_used_as_ingress 且不落库", async () => {
+    const node = seedNode({ role: "both", port_range_min: 22000, port_range_max: 22099 });
+    seedIngressForward(node.id);
+
+    const r = await updateNodeRole(node.id, { role: "egress" }, deps());
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("invalid_state");
+    expect(r.condition).toBe("node_still_used_as_ingress");
+    // 关键：DB 一个字段都没动（缺陷时这里是 "egress"）。
+    expect(nodes.get(node.id)?.role).toBe("both");
+    expect(r.dependencies?.ingress_forward_count).toBe(1);
+  });
+
+  test("端口区间收缩使 active 租约悬空 → 409 port_range_would_orphan_leases 且区间不变", async () => {
+    const node = seedNode({ role: "both", port_range_min: 22000, port_range_max: 22099 });
+    seedLease(node.id, 22050);
+
+    const r = await updateNodeRole(
+      node.id,
+      { role: "both", portRangeMin: 22060, portRangeMax: 22099 },
+      deps(),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("invalid_state");
+    expect(r.condition).toBe("port_range_would_orphan_leases");
+    // 文案要能指出是哪个端口会悬空（前端直接展示）。
+    expect(r.message).toContain("22050");
+    const after = nodes.get(node.id);
+    expect(after?.port_range_min).toBe(22000);
+    expect(after?.port_range_max).toBe(22099);
+  });
+
+  test("只给 lb_strategy 的请求不触发依赖判定（不会把合法改动误判为收缩）", async () => {
+    const node = seedNode({ role: "both" });
+    seedIngressForward(node.id);
+    const r = await updateNodeRole(node.id, { lbStrategy: "rand" }, deps());
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.node.lb_strategy).toBe("rand");
+  });
+
+  test("角色未变（both → both）时，即使仍有入口 Forward 也放行", async () => {
+    const node = seedNode({ role: "both" });
+    seedIngressForward(node.id);
+    const r = await updateNodeRole(node.id, { role: "both" }, deps());
+    expect(r.ok).toBe(true);
+  });
+
+  test("依赖计数跨「入口+出口」都拦：双向都有的节点收缩任一侧都被拒", async () => {
+    const node = seedNode({ role: "both" });
+    seedIngressForward(node.id);
+    const r = await updateNodeRole(node.id, { role: "egress" }, deps());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.condition).toBe("node_still_used_as_ingress");
+
+    const node2 = seedNode({ role: "both" });
+    seedEgressForward(node2.id);
+    const r2 = await updateNodeRole(node2.id, { role: "ingress" }, deps());
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.condition).toBe("node_still_used_as_egress");
+  });
+
+  test("未声明角色（null）改为 egress 且仍有入口 Forward → 拒绝", async () => {
+    // null = 尚未声明，按 ingress 语义参与判定（见 checkRoleChange 注释）。
+    const node = seedNode({ role: null });
+    seedIngressForward(node.id);
+    const r = await updateNodeRole(node.id, { role: "egress" }, deps());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.condition).toBe("node_still_used_as_ingress");
+  });
+
+  test("释放的（released）租约不占位：区间收缩只被 active 租约阻止", async () => {
+    const node = seedNode({ role: "both", port_range_min: 22000, port_range_max: 22099 });
+    seedLease(node.id, 22050, "released");
+    const r = await updateNodeRole(
+      node.id,
+      { portRangeMin: 22060, portRangeMax: 22099 },
+      deps(),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.node.port_range_min).toBe(22060);
+  });
+
+  test("区间置空（不配置）= 不判悬空：与 portRangeWouldOrphan 的既定语义一致", async () => {
+    // `null` 区间 = 「没有 v3 端口域」，无法定义「落在区间外」，因此不构成悬空
+    // （见 portRangeWouldOrphan 注释与 parsePortRange）。这是既有契约，本回归
+    // 只钉住它、不改它：真要清区间得先释放租约是 portPool 分配侧的纪律。
+    const node = seedNode({ role: "both", port_range_min: 22000, port_range_max: 22099 });
+    seedLease(node.id, 22050);
+    const r = await updateNodeRole(node.id, { portRangeMin: null, portRangeMax: null }, deps());
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.node.port_range_min).toBeNull();
+  });
+
+  test("依赖清零后同样的收缩被放行（证明不是一律拒绝）", async () => {
+    const node = seedNode({ role: "both", port_range_min: 22000, port_range_max: 22099 });
+    const fwd = seedIngressForward(node.id);
+    seedLease(node.id, 22050);
+
+    expect((await updateNodeRole(node.id, { role: "egress" }, deps())).ok).toBe(false);
+
+    // 删掉 Forward 与租约（模拟用户先迁移/清理）。
+    tunnels.delete(fwd);
+    leases.length = 0;
+
+    const ok = await updateNodeRole(node.id, { role: "egress" }, deps());
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.node.role).toBe("egress");
+  });
+
+  test("依赖统计失败 → fail-closed（503，绝不放过收缩）", async () => {
+    const node = seedNode({ role: "both" });
+    const d = deps();
+    // 依赖统计不可用：必须拒绝收缩，而不是「统计不到就当没有依赖」。
+    // 注意要改替身本体——事务闭包拿到的是 dbStub，不是 spread 出来的副本。
+    (d.db as NodeAdminDb).tunnel = {
+      async count() {
+        throw new Error("db down");
+      },
+      async findMany() {
+        throw new Error("db down");
+      },
+    };
+    const r = await updateNodeRole(node.id, { role: "egress" }, d);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("db_unavailable");
+    expect(nodes.get(node.id)?.role).toBe("both");
+  });
+
+  test("守卫读取发生在事务（行锁）内，且先锁后统计再写入", async () => {
+    // 无依赖的双向节点改成 egress：守卫放行，因此能看到「统计 → 写入」都发生在锁后。
+    const node = seedNode({ role: "both" });
+    const r = await updateNodeRole(node.id, { role: "egress" }, deps());
+    expect(r.ok).toBe(true);
+
+    // 没有锁 = 判定与写入之间存在可被并发 Forward 插入的空档（TOCTOU）。
+    expect(trace[0]).toBe("node.lock");
+    const statIdx = trace.findIndex(
+      (t) => t === "lease.count" || t === "tunnel.count" || t === "pool.count",
+    );
+    expect(statIdx).toBeGreaterThan(0);
+    expect(trace.indexOf("node.update")).toBeGreaterThan(statIdx);
+  });
+
+  test("锁内重新统计：锁到手后并发提交的入口 Forward 仍会阻止收缩（防 TOCTOU）", async () => {
+    const node = seedNode({ role: "both" });
+    // 挂锁后立刻「另一个事务」提交一条入口 Forward —— 只有真正在锁内统计才看得见。
+    setAfterLockHook(() => seedIngressForward(node.id));
+
+    const r = await updateNodeRole(node.id, { role: "egress" }, deps());
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.condition).toBe("node_still_used_as_ingress");
+    expect(nodes.get(node.id)?.role).toBe("both");
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* EgressPool CRUD                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -832,7 +1159,7 @@ describe("EgressPool CRUD", () => {
   test("被 RELAY 隧道引用的池删除 → 409（先换池，不是级联删隧道）", async () => {
     const node = seedEgressNode();
     seedDefaultPool(node);
-    tunnels.set(nextTunnelId++, { id: nextTunnelId - 1, egress_pool_id: pools[0].id, egress_node_id: node.id });
+    tunnels.set(nextTunnelId++, { id: nextTunnelId - 1, egress_pool_id: pools[0].id, ingress_node_id: null, egress_node_id: node.id });
     const r = await deleteEgressPool(pools[0].id, deps());
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -1266,7 +1593,7 @@ describe("getNodeDetail", () => {
 
   test("引用该节点为出口的隧道被计数", async () => {
     const node = seedEgressNode();
-    tunnels.set(nextTunnelId++, { id: nextTunnelId - 1, egress_pool_id: null, egress_node_id: node.id });
+    tunnels.set(nextTunnelId++, { id: nextTunnelId - 1, egress_pool_id: null, ingress_node_id: null, egress_node_id: node.id });
     const r = await getNodeDetail(node.id, deps());
     if (!r.ok) throw new Error("expected ok");
     expect(r.detail.tunnel_count).toBe(1);
