@@ -20,9 +20,11 @@ import {
   patchForward,
   previewForwardUpdate,
   runForwardAction,
+  runForwardBatch,
   type ForwardAction,
   type ForwardServiceResult,
 } from "../services/forward-service.ts";
+import { parseForwardBatchRequest } from "../services/forward-batch.ts";
 import {
   forwardListShape,
   forwardOrderBy,
@@ -255,6 +257,31 @@ forwardsRoutes.post("/:id/preview", async (c) => {
       u?.id ?? undefined,
     ),
   );
+});
+
+/**
+ * V4-WP9 §13.6：批量 retry / suspend / resume。
+ *
+ * 为什么是独立路径 `/batch` 而不是给 `POST /api/forwards/:id/:action` 加数组形态：
+ * 单条与批量的**错误语义不同**——单条失败整请求失败（4xx/5xx），批量失败是
+ * 逐条结果 + 200。把两种语义塞进一个端点会让客户端无法判断该看 `error` 还是
+ * `results`。路由注册在 `/:id/:action` **之前**，否则 `:id` 会吃掉 "batch"。
+ *
+ * 限流：见 rate-limit.ts 的 `forward-batch` 规则（必须在 `api-global` 之前命中）。
+ */
+forwardsRoutes.post("/batch", async (c) => {
+  const parsed = parseForwardBatchRequest(
+    await c.req.json().catch(() => null),
+  );
+  if ("message" in parsed) {
+    return c.json({ error: parsed.message, code: "invalid_input" }, 400);
+  }
+  const payload = await runForwardBatch(
+    parsed.ids,
+    parsed.action,
+    workspace(c).id,
+  );
+  return c.json({ data: payload });
 });
 
 forwardsRoutes.post("/:id/:action", async (c) => {

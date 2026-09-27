@@ -195,6 +195,25 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     scope: "user",
   },
   {
+    /**
+     * 批量 Forward 动作（V4-WP9 §13.6）。单次最多 50 条，每条都可能触发一次
+     * rollout（两端下发 + 租约），请求成本远高于普通写操作；3 次/分钟 =
+     * 最多 150 条/分钟，对「节点恢复后批量重试」是充足余量，对脚本化刷接口是硬顶。
+     *
+     * scope 是 `user`：批量动作必须已认证，没有匿名场景，按 IP 会退化成 anon 桶，
+     * 让同一出口 NAT 后的不同用户互相误伤。
+     *
+     * 位置必须在 `api-global` **之前**——规则选取是「第一条命中」，否则这个上限
+     * 会被 600/min 的通用桶掩盖，等于没加。
+     */
+    name: "forward-batch",
+    windowSeconds: 60,
+    max: 3,
+    methods: ["POST"],
+    match: (p, m) => isPost(m) && p === "/api/forwards/batch",
+    scope: "user",
+  },
+  {
     name: "api-global",
     windowSeconds: 60,
     max: 600,

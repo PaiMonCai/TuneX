@@ -48,6 +48,12 @@ import {
 import { nodeAdmission } from "./node-lifecycle.ts";
 import { FORWARD_LIST_MAX_UNPAGED } from "./forward-list-query.ts";
 import type { ForwardPage } from "./forward-list-query.ts";
+import {
+  forwardBatchSummary,
+  type ForwardBatchAction,
+  type ForwardBatchItemResult,
+  type ForwardBatchSummary,
+} from "./forward-batch.ts";
 
 export type ForwardMode = "direct" | "relay";
 export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
@@ -1278,6 +1284,51 @@ export async function runForwardAction(
   if (!after) return error(404, "not_found", "端口转发不存在");
   return { ok: true, data: forwardView(after) };
 }
+
+/**
+ * V4-WP9 §13.6：批量 retry / suspend / resume。
+ *
+ * 形态约束（与 `forward-batch.ts` 的决策文档一致）：
+ *   · **顺序执行**，不并发：每个 action 都可能触发 rollout（下发 + 租约），
+ *     并发对同一入口节点发起 N 个动作会让 apply 状态机互相踩踏；
+ *   · **逐条结果**：一条失败不影响其它条，返回 `{ id, ok, code, message }`，
+ *     部分失败对用户可见——这是「批量删除不做」的同一条理由的反面（删除的
+ *     部分成功无法解释，retry/suspend 的部分成功可以）；
+ *   · 工作空间作用域由 `runForwardAction` 内部检查（越权 id 得到 404，
+ *     不泄漏其它工作空间的行是否存在）。
+ */
+export async function runForwardBatch(
+  ids: number[],
+  action: ForwardBatchAction,
+  workspaceId: number,
+): Promise<ForwardBatchPayload> {
+  const results: ForwardBatchItemResult[] = [];
+  for (const id of ids) {
+    const outcome = await runForwardAction(id, action, workspaceId);
+    if (outcome.ok) {
+      results.push({
+        id,
+        ok: true,
+        apply_status: outcome.data.apply_status ?? null,
+      });
+    } else {
+      results.push({
+        id,
+        ok: false,
+        apply_status: null,
+        code: outcome.code,
+        message: outcome.message,
+      });
+    }
+  }
+  return { action, ...forwardBatchSummary(results), results };
+}
+
+export type ForwardBatchPayload = {
+  action: ForwardBatchAction;
+} & ForwardBatchSummary & {
+  results: ForwardBatchItemResult[];
+};
 
 export async function deleteForward(
   id: number,
