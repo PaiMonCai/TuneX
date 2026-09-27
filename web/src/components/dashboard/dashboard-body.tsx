@@ -10,6 +10,8 @@ import { api, workspaceIdFromCookie } from "@/lib/api";
 import { serverT } from "@/lib/server-i18n";
 import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
 import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
+import { AttentionPanel } from "@/components/dashboard/attention-panel";
+import { forwardProductBadgeVariant, forwardProductStatus } from "@/lib/forward-status";
 import type { DashboardStats, PortForward } from "@/lib/types";
 
 /** 仪表盘数据体（服务端组件，AppShell 内由 Suspense 包裹） */
@@ -66,6 +68,13 @@ export async function DashboardBody() {
           testId="stat-nodes"
         />
       </div>
+
+      {/*
+        V4-WP8 §13.7 Wave 4：异常 / 离线 / 等待安装的入口要**优先**出现，
+        而不是排在计数卡片与流量图之后。放在这里（统计卡片之下、流量图之上）
+        是「先看有没有事，再看曲线」的阅读顺序。
+      */}
+      <AttentionPanel />
 
       <div className="grid gap-5 lg:grid-cols-3">
         <Card className={paymentsEnabled ? "lg:col-span-2" : "lg:col-span-3"}>
@@ -182,9 +191,15 @@ export async function DashboardBody() {
                   <TableCell className="font-mono text-xs">{forward.listen_port ?? "-"}</TableCell>
                   <TableCell>{formatBytes(forward.traffic)}</TableCell>
                   <TableCell>
-                    <Badge variant={forward.apply_status === "active" ? "success" : forward.apply_status === "error" ? "destructive" : "muted"}>
-                      {forward.apply_status ?? t("forward.statusPending")}
-                    </Badge>
+                    {(() => {
+                      // V4-WP8 §13.7：普通页面用**产品状态**，不画 apply_status 原始枚举。
+                      const { state } = forwardProductStatus(forward);
+                      return (
+                        <Badge variant={forwardProductBadgeVariant(state)}>
+                          {t(`forward.product.${state}`)}
+                        </Badge>
+                      );
+                    })()}
                   </TableCell>
                 </TableRow>
               ))}

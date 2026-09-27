@@ -52,6 +52,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { interpolate } from "@/lib/i18n";
 import type { Locale } from "@/lib/i18n";
+import {
+  applyErrorAction,
+  forwardErrorActions,
+  forwardErrorInfo,
+  forwardProductBadgeVariant,
+  forwardProductStatus,
+} from "@/lib/forward-status";
 import { formatBytes, formatDateTime } from "@/lib/utils";
 import type {
   ForwardBatchAction,
@@ -455,6 +462,24 @@ export function ForwardWorkspace() {
    * 汇总卡片与节点/绑定是不随筛选变化的「参考数据」，与列表分开取：
    * 翻页只该触发一次列表请求，不该顺带把全部节点的绑定再拉一遍。
    */
+  /**
+   * V4-WP8 §13.5 —— 写操作失败 → 「下一步做什么」。
+   *
+   * 抽成一处是因为列表页有 create / retry / suspend / resume / batch 多条写路径，
+   * 每处各写一遍「取 condition → 查表」必然漂移；而 409 `condition`
+   * （`node_in_maintenance` / `node_waiting_install` …）**必须**被消费，
+   * 否则用户看到的是「保存失败」而不是「入口节点正在维护，请改选节点」。
+   *
+   * 输出顺序有意固定：先可执行的动作，再后端原文（原文是排障材料，可能要念给
+   * 管理员）。没有任何已知动作时只给原文 —— 不编造通用建议。
+   */
+  function writeFailureText(err: unknown, fallback: string): string {
+    const info = forwardErrorInfo(err);
+    const actions = forwardErrorActions(locale, info);
+    const parts = [...actions, info.message || fallback].filter((s) => s !== "");
+    return parts.join(" ");
+  }
+
   async function loadReference() {
     try {
       const [nodeRows, forwardSummary] = await Promise.all([
@@ -674,7 +699,7 @@ export function ForwardWorkspace() {
       setPage(1);
       reloadList();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("forward.createFailed"));
+      toast.error(writeFailureText(err, t("forward.createFailed")));
     } finally {
       setBusy(false);
     }
@@ -686,7 +711,7 @@ export function ForwardWorkspace() {
       await api.forwards.action(forward.id, action);
       reloadList();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
+      toast.error(writeFailureText(err, t("forward.loadFailed")));
     } finally {
       setActionBusy(null);
     }
@@ -771,7 +796,9 @@ export function ForwardWorkspace() {
       }
       reloadList();
     } catch (err) {
-      const message = err instanceof Error ? err.message : L("forward.batchFailed");
+      // 批量失败同样是写失败：按 condition/apply_error_code 给下一步，
+      // 并在页内保留一条常驻提示（toast 会消失，而用户要照着做）。
+      const message = writeFailureText(err, L("forward.batchFailed"));
       setBatchError(message);
       toast.error(message);
     } finally {
@@ -1203,20 +1230,30 @@ export function ForwardWorkspace() {
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-col gap-1">
-                          <Badge
-                            variant={
-                              forward.apply_status === "active"
-                                ? "success"
-                                : forward.apply_status === "error"
-                                  ? "destructive"
-                                  : "secondary"
-                            }
-                          >
-                            {forward.apply_status ?? "pending"}
-                          </Badge>
+                          {(() => {
+                            // V4-WP8 §13.7：产品状态取代 raw apply_status 枚举
+                            //（唯一实现见 lib/forward-status.ts）。
+                            const product = forwardProductStatus(forward);
+                            return (
+                              <Badge
+                                variant={forwardProductBadgeVariant(product.state)}
+                                data-testid={`forward-status-${forward.id}`}
+                              >
+                                {t(`forward.product.${product.state}`)}
+                              </Badge>
+                            );
+                          })()}
                           {forward.apply_error ? (
-                            <span className="max-w-52 truncate text-xs text-[var(--destructive)]">
-                              {forward.apply_error}
+                            /* V4-WP8 §13.5：先给「下一步」，原文仍保留（排障用）。 */
+                            <span className="max-w-52 text-xs text-[var(--destructive)]">
+                              {applyErrorAction(locale, forward.apply_error_code) ? (
+                                <span className="block">
+                                  {applyErrorAction(locale, forward.apply_error_code)}
+                                </span>
+                              ) : null}
+                              <span className="block truncate font-mono opacity-70">
+                                {forward.apply_error}
+                              </span>
                             </span>
                           ) : null}
                         </div>

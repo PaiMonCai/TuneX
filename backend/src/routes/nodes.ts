@@ -31,6 +31,7 @@ import {
   lookupBindingUsage,
   unbindBlockedMessage,
 } from "../services/binding-usage.ts";
+import { projectUserNode } from "../services/node-view.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -97,10 +98,18 @@ const nodeSelect = {
   node_group_id: true,
   node_credential_hash: true,
   credential_revoked: true,
+  // V4-WP8 §13.4.1：用户侧也要能回答「这台机器现在能不能接新业务」。
+  // lifecycle 是 Lifecycle 层的唯一真相列（WP5）；本文件**不重复**判定它，
+  // 只把它交给 services/node-lifecycle.ts 的 nodeAdmission。
+  lifecycle: true,
+  // 展示用（WP7 的备注；不参与任何判定）。
+  lifecycle_note: true,
+  lifecycle_updated_at: true,
   node_group: { select: { id: true, name: true, node_type: true, workspace_id: true } },
 } as const;
 
-function nodeView(node: {
+/** 用户侧节点行的 select 形状（Prisma `select: nodeSelect` 的投影）。 */
+interface UserNodeRow {
   id: number;
   node_id: string;
   agent_id: string;
@@ -115,25 +124,38 @@ function nodeView(node: {
   node_group_id: number;
   node_credential_hash?: string | null;
   credential_revoked?: boolean;
+  /** V4-WP5 生命周期列（schema `@default(active)`）；缺省 = 未 select 到。 */
+  lifecycle?: string | null;
+  lifecycle_note?: string | null;
+  lifecycle_updated_at?: Date | null;
   node_group?: unknown;
-}) {
-  const lastSeen = node.last_seen_at?.getTime() ?? 0;
-  const online =
-    node.status === "active" &&
-    lastSeen > 0 &&
-    Date.now() - lastSeen <= 90_000 &&
-    Boolean(node.node_credential_hash) &&
-    !node.credential_revoked;
+}
 
+/**
+ * V4-WP8 §13.4.1 —— 用户侧节点投影。
+ *
+ * 三层状态的**判定不在本文件**，全部来自 `services/node-view.ts`
+ * （它只调 WP5 的 `deriveConnection` / `nodeAdmission`）。这里负责：
+ *   · 去掉 credential hash（既不明文也不哈希地外泄）；
+ *   · 把判定结果摊平进响应体。
+ *
+ * 改造前本函数自己写过一份在线判据（与 `deriveConnection` 重复），
+ * 详见 `services/node-view.ts` 顶部「两份实现」的说明。
+ */
+function nodeView(node: UserNodeRow) {
   const {
-    node_credential_hash: _credentialHash,
+    node_credential_hash: credentialHash,
     ...safe
   } = node;
   return {
     ...safe,
-    online,
-    has_credential: Boolean(_credentialHash),
-    registered: Boolean(_credentialHash) && !node.credential_revoked,
+    ...projectUserNode({
+      status: node.status,
+      last_seen_at: node.last_seen_at,
+      has_credential: Boolean(credentialHash),
+      credential_revoked: node.credential_revoked,
+      lifecycle: node.lifecycle,
+    }),
   };
 }
 

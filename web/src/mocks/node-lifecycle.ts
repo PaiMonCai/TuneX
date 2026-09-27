@@ -297,6 +297,37 @@ export function mockLifecycleChange(
   return { node: { ...node }, view: mockLifecycleView(node, lifecycle, now) };
 }
 
+/**
+ * V4-WP8 §13.4.1 —— mock 的用户侧节点投影（三层状态）。
+ *
+ * 与真实后端 `routes/nodes.ts` 的 `nodeView()` **同形**：mock 是前端演示与
+ * 契约测试的运行环境，形状不一致会让「mock 下正常、真实后端下缺字段」成为
+ * 一类只在生产才出现的故障。
+ *
+ * 判定复用本文件已有的 `mockConnection` / `mockLifecycleOf` /
+ * `mockAcceptsBusiness` / `mockBusinessRejectionCode`（它们各自镜像后端
+ * `deriveConnection` / `nodeAdmission`），**不**在这里重写心率窗口或
+ * lifecycle 白名单 —— mock 内的判定也只有一个来源。
+ *
+ * `online` 保留为 `connection === "online"` 的兼容投影，与后端一致。
+ */
+export function mockUserNodeStatus(db: { nodeLifecycle: Map<ID, { lifecycle: NodeLifecycleValue }> }, node: Node, now = new Date()) {
+  const lifecycle = mockLifecycleOf(node, db.nodeLifecycle.get(node.id));
+  const connection = mockConnection(node, now);
+  const accepts = mockAcceptsBusiness(lifecycle) && connection !== "waiting";
+  return {
+    lifecycle,
+    connection,
+    accepts_new_business: accepts,
+    admission_rejection: accepts
+      ? null
+      : connection === "waiting"
+        ? ("node_waiting_install" as const)
+        : mockBusinessRejectionCode(lifecycle),
+    online: connection === "online",
+  };
+}
+
 /** 便捷：从 store 的 Node 行取 UserNode 投影（rejection 判定只用基础字段）。 */
 export function mockLifecycleUserNode(node: Node): UserNode {
   return { ...(node as UserNode) };

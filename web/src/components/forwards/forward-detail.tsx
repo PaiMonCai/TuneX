@@ -14,14 +14,15 @@ import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from
 import { InfoRow } from "@/components/ui/form";
 import { api } from "@/lib/api";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
+import {
+  applyErrorAction,
+  forwardErrorActions,
+  forwardErrorInfo,
+  forwardProductBadgeVariant,
+  forwardProductStatus,
+} from "@/lib/forward-status";
 import type { NodeBinding, PortForward, TrafficPoint, UserNode } from "@/lib/types";
 import { formatBytes, formatDateTime } from "@/lib/utils";
-
-function statusVariant(status: PortForward["apply_status"]) {
-  if (status === "active") return "success" as const;
-  if (status === "error") return "destructive" as const;
-  return "secondary" as const;
-}
 
 export function ForwardDetail({
   forward: initialForward,
@@ -30,11 +31,19 @@ export function ForwardDetail({
   forward: PortForward;
   traffic: TrafficPoint[];
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const router = useRouter();
   const [forward, setForward] = useState(initialForward);
   const [traffic, setTraffic] = useState(initialTraffic);
   const [actionBusy, setActionBusy] = useState(false);
+  /**
+   * 「下一步做什么」提示：重试/暂停/恢复失败时**不替换页面内容**，只在按钮
+   * 下方给一句可执行的话（V4-WP8 §13.5：错误必须给下一步）。
+   *
+   * 为什么不用 toast：toast 几秒后消失，而用户真正需要的是「照这句话去做」，
+   * 页面上的常驻提示才办得到；何况失败原因往往需要照着念给管理员。
+   */
+  const [actionHint, setActionHint] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   // V4-WP4：编辑 = 全字段编辑器（不再只有改名）。
@@ -79,16 +88,33 @@ export function ForwardDetail({
 
   async function runAction(action: "retry" | "suspend" | "resume") {
     setActionBusy(true);
+    setActionHint(null);
     try {
       const updated = await api.forwards.action(forward.id, action);
       setForward(updated);
       await refreshTraffic();
       router.refresh();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t("forward.loadFailed"));
+      // V4-WP8 §13.5：失败必须给「下一步」，而且**先给动作再给原文**。
+      //
+      // 顺序是有意的：动作是用户现在能做的事；原文是排障材料（可能要念给管理员）。
+      // 只回显原文等于把诊断责任推给用户。而「动作」全部来自码表（WP7 的
+      // `conditionAction` / 本 WP 的 `applyErrorAction`）—— 409 的
+      // `data.condition`（例如 `node_in_maintenance`）在此被消费，不再是笼统的
+      // 「操作失败」。
+      const message = writeFailureText(error, t("forward.loadFailed"));
+      toast.error(message);
+      setActionHint(message);
     } finally {
       setActionBusy(false);
     }
+  }
+
+  /** 与列表页同一口径：按 condition / apply_error_code 给下一步，再落后端原文。 */
+  function writeFailureText(err: unknown, fallback: string): string {
+    const info = forwardErrorInfo(err);
+    const actions = forwardErrorActions(locale, info);
+    return [...actions, info.message || fallback].filter((part) => part !== "").join(" ");
   }
 
   async function removeForward() {
@@ -100,7 +126,7 @@ export function ForwardDetail({
       router.push("/forwards");
       router.refresh();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : t("forward.deleteFailed"));
+      toast.error(writeFailureText(error, t("forward.deleteFailed")));
       setDeleting(false);
     }
   }
@@ -119,6 +145,13 @@ export function ForwardDetail({
     forward.target_host && forward.target_port
       ? `${forward.target_host}:${forward.target_port}`
       : t("forward.noTarget");
+  // V4-WP8 §13.4：产品状态是**唯一**的投影实现（lib/forward-status.ts），
+  // 本组件不再自己比较 revision。
+  const product = forwardProductStatus(forward);
+  // 失败时给可执行的一步（后端原文优先；没有已知动作时不编造）。
+  const applyNextStep = forward.apply_error
+    ? applyErrorAction(locale, forward.apply_error_code)
+    : null;
 
   return (
     <div className="flex flex-col gap-5" data-testid="forward-detail">
@@ -174,8 +207,9 @@ export function ForwardDetail({
               <Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>
                 {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
               </Badge>
-              <Badge variant={statusVariant(forward.apply_status)}>
-                {forward.apply_status ?? "pending"}
+              {/* V4-WP8 §13.7：产品状态，不画 apply_status 原始枚举。 */}
+              <Badge variant={forwardProductBadgeVariant(product.state)} data-testid="forward-product-status">
+                {t(`forward.product.${product.state}`)}
               </Badge>
             </div>
           </CardHeader>
@@ -249,36 +283,62 @@ export function ForwardDetail({
         </CardHeader>
         <CardContent className="grid gap-x-8 md:grid-cols-2">
           <div className="flex flex-col divide-y divide-[var(--border)]">
-            {/* V4-WP4：running-vs-desired 用产品状态表达，先给语义再给数字。 */}
+            {/* V4-WP4/V4-WP8：running-vs-desired 用产品状态表达，先给语义。 */}
             <InfoRow label={t("forward.runningDesired")}>
               <RunningVsDesiredBadge forward={forward} />
-            </InfoRow>
-            <InfoRow label={t("forward.desiredStatus")}>
-              {forward.desired_status ?? t("common.none")}
-            </InfoRow>
-            <InfoRow label={t("forward.applyStatus")}>
-              <Badge variant={statusVariant(forward.apply_status)}>
-                {forward.apply_status ?? "pending"}
-              </Badge>
-            </InfoRow>
-            <InfoRow label={t("forward.revision")}>
-              {forward.config_revision ?? forward.latest_revision ?? "—"}
-            </InfoRow>
-          </div>
-          <div className="flex flex-col divide-y divide-[var(--border)]">
-            <InfoRow label={t("forward.appliedRevision")}>
-              {forward.applied_revision ?? "—"}
-            </InfoRow>
-            <InfoRow label={t("forward.lastApplied")}>
-              {forward.last_applied_at ? formatDateTime(forward.last_applied_at) : "—"}
             </InfoRow>
             <InfoRow label={t("forward.online")}>
               {forward.online ? t("common.online") : t("common.offline")}
             </InfoRow>
           </div>
+          <div className="flex flex-col divide-y divide-[var(--border)]">
+            {/*
+              V4-WP8 §13.7：raw revision / desired internals **默认折叠**。
+              信息不删除（排障仍要看），只是不再默认糊在脸上 ——
+              「config_revision 5 / applied_revision 3」对普通用户不构成决策依据，
+              产品状态才构成。用原生 <details> 而不是状态驱动的折叠组件：
+              默认收起是**结构性**保证（没有 JS 也能保证收起），不会被某次
+              重构顺手改成默认展开。
+            */}
+            <details className="py-2" data-testid="forward-technical-details">
+              <summary className="cursor-pointer text-xs text-[var(--muted-foreground)]">
+                {t("forward.technicalDetails")}
+              </summary>
+              <div className="mt-2 flex flex-col divide-y divide-[var(--border)]">
+                <InfoRow label={t("forward.desiredStatus")}>
+                  {forward.desired_status ?? t("common.none")}
+                </InfoRow>
+                <InfoRow label={t("forward.applyStatus")}>
+                  <span className="font-mono text-xs">{forward.apply_status ?? "—"}</span>
+                </InfoRow>
+                <InfoRow label={t("forward.revision")}>
+                  {forward.config_revision ?? forward.latest_revision ?? "—"}
+                </InfoRow>
+                <InfoRow label={t("forward.appliedRevision")}>
+                  {forward.applied_revision ?? "—"}
+                </InfoRow>
+                <InfoRow label={t("forward.lastApplied")}>
+                  {forward.last_applied_at ? formatDateTime(forward.last_applied_at) : "—"}
+                </InfoRow>
+              </div>
+            </details>
+            {actionHint ? (
+              <p className="py-2 text-xs text-[var(--destructive)]" data-testid="forward-action-hint">
+                {actionHint}
+              </p>
+            ) : null}
+          </div>
           {forward.apply_error ? (
             <div className="md:col-span-2 mt-4 rounded-md border border-[var(--destructive)]/30 bg-[var(--destructive)]/5 p-3">
               <div className="text-sm font-medium text-[var(--destructive)]">{t("forward.applyError")}</div>
+              {/* V4-WP8 §13.5：先给「下一步」，再给原文。
+                  原文是排障材料（可能要念给管理员），动作是用户现在能做的事；
+                  只给原文等于把诊断责任推给用户。 */}
+              {applyNextStep ? (
+                <p className="mt-1 text-xs" data-testid="forward-apply-next-step">
+                  {applyNextStep}
+                </p>
+              ) : null}
               <div className="mt-1 font-mono text-xs text-[var(--destructive)]">
                 {forward.apply_error_code ? `${forward.apply_error_code}: ` : ""}
                 {forward.apply_error}
