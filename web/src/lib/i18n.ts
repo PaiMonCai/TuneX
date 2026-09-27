@@ -372,6 +372,21 @@ const zh = {
     portAuto: "自动分配",
     portPlaceholder: "20001",
     autoPortHint: "留空由系统自动分配",
+    // ── V4-WP9：复制 Forward / auto-port 显式语义 ──
+    autoPortNotice: "未填写监听端口 = 由系统自动分配；实际端口在保存后确定。",
+    listenPortFixed: "指定端口必须落在该入口节点的可用端口区间内，保存后立即生效。",
+    autoPortPlaceholder: "自动分配",
+    copyForward: "复制转发",
+    copySuffix: "（副本）",
+    // ── V4-WP9：Binding usage（绑定使用量）──
+    bindingUsageTitle: "出口绑定使用量",
+    bindingUsageHint:
+      "统计口径与后端解绑闸门一致：只统计中继转发，正在使用中的绑定无法解绑。",
+    bindingUsageUsed: "被 {count} 条转发使用",
+    bindingUsageUnused: "未被任何转发使用",
+    bindingUsageInUse: "使用中",
+    bindingUsageDeletable: "可解绑",
+    impactPortAuto: "监听端口留空：由系统自动分配，保存后才会确定具体端口。",
   },
   tunnel: {
     title: "隧道管理",
@@ -1123,6 +1138,23 @@ const en: Dict = {
     portAuto: "Automatic allocation",
     portPlaceholder: "20001",
     autoPortHint: "Leave empty for automatic allocation",
+    // ── V4-WP9：duplicate forward / explicit auto-port semantics ──
+    autoPortNotice:
+      "No listen port = the system assigns one automatically; the real port is fixed only after saving.",
+    listenPortFixed:
+      "A fixed port must fall inside this ingress node's available port range and applies immediately.",
+    autoPortPlaceholder: "Automatic",
+    copyForward: "Duplicate forward",
+    copySuffix: " (copy)",
+    // ── V4-WP9：binding usage ──
+    bindingUsageTitle: "Egress binding usage",
+    bindingUsageHint:
+      "Counted exactly like the backend unbind gate: relay forwards only, and a binding that is in use cannot be unbound.",
+    bindingUsageUsed: "Used by {count} forward(s)",
+    bindingUsageUnused: "Not used by any forward",
+    bindingUsageInUse: "In use",
+    bindingUsageDeletable: "Can unbind",
+    impactPortAuto: "Listen port left empty: the system assigns one; the real port is known after saving.",
   },
   tunnel: {
     title: "Tunnels",

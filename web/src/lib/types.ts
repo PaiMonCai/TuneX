@@ -832,13 +832,22 @@ export interface UserNode extends Node {
   has_credential?: boolean;
 }
 
-/** Ingress 可选择的已绑定出口。 */
+/**
+ * Ingress 可选择的已绑定出口。
+ *
+ * V4-WP9 §13.6「Binding usage」：`used_by_forward_count` / `unbind_blocked` 是
+ * 服务端的**响应投影**（不新增 DB 列）。列表接口一次 groupBy 得到全部出口的
+ * 使用量，因此前端在解绑前就能显示影响面、并提前禁用按钮——而不是等 409。
+ */
 export interface NodeBinding {
   id: ID;
   ingress_node_id: ID;
   egress_node_id: ID;
   egress_node: UserNode;
   created_at: string;
+  used_by_forward_count: number;
+  /** > 0 即解绑会被 409 拒绝（与后端同一判定）。 */
+  unbind_blocked: boolean;
 }
 
 export interface PortForward {
@@ -969,6 +978,48 @@ export interface ForwardSummary {
   pending: number;
   traffic: number;
   traffic_cost: number;
+}
+
+/**
+ * V4-WP9 §13.6：服务端列表的查询参数（与后端 `forward-list-query.ts` 的词表一致）。
+ *
+ * `sort` 的取值是**后端白名单**（order_by / name / status / mode / listen_port /
+ * traffic / created_at / updated_at）；这里不写联合类型是有意的——后端对未知键
+ * 回落默认而不是报错，前端若把它写窄反而会逼出 `as` 断言。合法性由列表头的
+ * 常量数组（`FORWARD_SORT_OPTIONS`）在渲染侧保证。
+ */
+export interface ForwardListQuery extends ListQuery {
+  mode?: "direct" | "relay";
+  apply_status?: string;
+  ingress_node_id?: number;
+  egress_node_id?: number;
+  sort?: string;
+  order?: "asc" | "desc";
+}
+
+/** 批量动作白名单：与后端 `FORWARD_BATCH_ACTIONS` 一致，不含 delete。 */
+export type ForwardBatchAction = "retry" | "suspend" | "resume";
+
+export interface ForwardBatchInput {
+  action: ForwardBatchAction;
+  ids: number[];
+}
+
+export interface ForwardBatchItemResult {
+  id: ID;
+  ok: boolean;
+  apply_status: string | null;
+  code?: string;
+  message?: string;
+}
+
+/** 逐条结果 + 汇总计数。部分失败仍是 200，所以必须读 `failed`。 */
+export interface ForwardBatchResult {
+  action: ForwardBatchAction;
+  requested: number;
+  succeeded: number;
+  failed: number;
+  results: ForwardBatchItemResult[];
 }
 
 export interface ProvisionNodeResult {
