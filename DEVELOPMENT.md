@@ -461,7 +461,7 @@ TuneX v3 团队按以下 Track 并行推进：
 | WP13 | Tunnel Web | D | ✅ 完成 | 历史产品层；V4 已收敛到 Forward |
 | WP14 | Real E2E / Release Gate | D/Shared | ✅ 完成 | outbound-only DIRECT/RELAY Integration |
 | WP15 | DIRECT v3 Migration | B/C | ✅ 完成 | legacy DIRECT engine 已删除（`cdfc3f9` + `95d4c6c`） |
-| WP16+ | UDP / WS/TLS / QUIC / Advanced | 多 Track | 按需启动 | 每项单独 contract + tests + real E2E + release gate |
+| V5 | Advanced Networking / Resilience / Federation | 多 Track | V4.5 stable 后启动 | 每项单独 contract + tests + real E2E + release gate |
 
 **重要：** “可以开始开发”是允许团队成员创建分支、写代码、开 Draft PR；“可以合并 main”才是硬门槛。
 
@@ -481,9 +481,9 @@ WP0–WP15 的核心迁移链已经结束，当前没有“等待前置 Gate 才
 - 这些兼容路由在仓库内没有新的产品调用方；删除它们是**外部 API breaking change**，应单独 PR、单独发布说明，不与功能开发混合。
 - `web/src/components/forwards/__tests__/legacy-tunnel-compat.test.ts` 只用于兼容窗口守护；兼容路由删除时一并删除。
 
-#### WP16+ 新能力
+#### V5 新能力
 
-UDP、WS/TLS、QUIC、advanced LB、DNS、multi-ingress HA、automatic failover、multi-hop 按 §7.17 独立 contract / tests / real E2E / release gate 推进。
+UDP、WS/TLS、QUIC、advanced LB、DNS、multi-ingress HA、automatic failover、multi-hop、Panel federation 等统一按 §7.17 的 V5 路线独立 contract / tests / real E2E / release gate 推进。
 
 **当前默认没有 Active Core WP。** 如果没有明确的新能力 contract，优先做生产稳定化、可观测性、部署演练和兼容 API 生命周期管理。
 
@@ -1277,7 +1277,7 @@ WP14 最终收敛为一条可重复、自动化、不能伪造通过的真实网
 
 主分支 `3f4b905` 对应 CI、Integration、Release 均已通过。
 
-早期 §7.15 的 18 项清单把“核心发布 Gate”“高级 LB/拓扑能力”“运维灾备演练”混在了一起。当前以以上自动化 Gate 作为 **WP14 完成标准**；weighted target / hot update / change Egress 等高级能力继续由对应 service/unit/E2E 与 WP16+ contract 承担，backup/restore 属于 `scripts/ops/` 与生产演练，不再阻塞 WP14 状态。
+早期 §7.15 的 18 项清单把“核心发布 Gate”“高级 LB/拓扑能力”“运维灾备演练”混在了一起。当前以以上自动化 Gate 作为 **WP14 完成标准**；weighted target / hot update / change Egress 等高级能力继续由对应 service/unit/E2E 与 V5 contract 承担，backup/restore 属于 `scripts/ops/` 与生产演练，不再阻塞 WP14 状态。
 
 ---
 
@@ -1311,9 +1311,9 @@ DoD 已落地：
 
 ---
 
-### 7.17 WP16+ — 后续协议与高级能力
+### 7.17 V5 — 高级网络能力、韧性与联邦
 
-V4 产品完成度 Gate 全部通过后，协议与高级网络能力再按独立工作包继续推进；每个能力必须自己走：
+V4.5 stable 后，协议、高级网络能力与跨控制面能力统一进入 V5；每个能力必须自己走：
 
 ```text
 contract
@@ -1340,7 +1340,7 @@ V4.5 之前不以“参考项目已有”作为提前引入高级协议的理由
 
 其中 target health/latency **先做观测，再做自动决策**：先让用户看见目标可达性、延迟、失败次数和恢复事实；circuit breaker / automatic failover 必须在观测数据稳定、误判边界和恢复策略有 Real E2E 后才允许自动切流。
 
-Panel federation 不属于 V4-WP10 NodeGroup 重构。WP10 只冻结单控制面内的 RBAC / Resource Scope / Grant；跨 Panel 信任、远端 lease、远端配额与分布式 reconcile 必须留在 WP16+ 单独设计。
+Panel federation 不属于 V4-WP10 NodeGroup 重构。WP10 只冻结单控制面内的 RBAC / Resource Scope / Grant；跨 Panel 信任、远端 lease、远端配额与分布式 reconcile 必须留在 V5 单独设计。
 
 同一底层模块冲突严重的能力不得强行并行。
 
@@ -1416,7 +1416,7 @@ v3 迁移阶段当前没有 Active Core WP：
 - none
 ```
 
-V4 的 Active Plan、并行 Track 与 Gate 已迁移到第 13 节；V4 完成后出现 WP16+ 时，为新协议能力单独建立 contract 和 Integration Gate。兼容 API 删除仍必须作为独立 breaking-change PR 处理。
+V4 的 Active Plan、并行 Track 与 Gate 已迁移到第 13 节；V4.5 stable 后统一进入 V5，为新协议/高可用/联邦能力单独建立 contract 和 Integration Gate。兼容 API 删除仍必须作为独立 breaking-change PR 处理。
 
 ---
 
@@ -1498,7 +1498,7 @@ V4 的 Active Plan、并行 Track 与 Gate 已迁移到第 13 节；V4 完成后
 
 - 数据平面能力必须增加真实网络测试，不能只依赖 mock。
 - WP14 已完成；当前 main 的 CI → Integration → Release 链必须持续保持全绿。
-- 任何 WP16+ 跨 Track 能力都必须新增或扩展对应真实 Integration Gate，不能只靠单元测试宣称可发布。
+- 任何 V5 跨 Track 能力都必须新增或扩展对应真实 Integration Gate，不能只靠单元测试宣称可发布。
 - 并行 PR 各自 CI 通过不等于集成完成；跨 Track 能力必须在对应 Integration Gate 再验一次。
 
 ---
@@ -2320,7 +2320,7 @@ Tests / Real E2E:
 - Plugin Store / 移动端等非核心产品面。
 
 V4-WP11 可以增加 **target health / latency 的诊断观测**，但不能借诊断之名提前实现
-automatic failover。高级网络能力仍保留为 V4 稳定后的 WP16+。除非某能力是
+automatic failover。高级网络能力统一进入 V5。除非某能力是
 Forward 编辑、Node 生命周期或稳定性 Gate 的阻断项，否则不得抢占 V4-F2～F5 的主线资源。
 
 ### 13.11 外部参考项目吸收规则
@@ -2349,3 +2349,41 @@ V4.5 的 durability / diagnostics 方向参考当前 fork 的三个项目，但
    未经明确 license review 不直接复制实现代码。
 5. TuneX 在 V4.5 stable 前必须明确仓库自身 LICENSE / NOTICE / third-party
    attribution 策略；许可状态未明确时不得以“公开仓库可见”为理由复制代码。
+
+
+---
+
+## 14. V5 Roadmap — Advanced Networking / Resilience / Federation
+
+V5 的启动条件是 **Gate V4-F5 通过并标记 V4.5 stable**。V5 不反向扩大 V4 范围；V4 未完成的 durability / diagnostics / authorization 项不得通过改名“V5”逃逸。
+
+### 14.1 V5 范围
+
+建议按依赖顺序推进：
+
+| V5 阶段 | 主题 | 主要能力 |
+|---|---|---|
+| **V5.0** | Contract Freeze | 协议/能力 negotiation、数据面扩展边界、兼容策略、性能基线 |
+| **V5.1** | Protocol Expansion | UDP、WS/TLS、QUIC |
+| **V5.2** | Target Intelligence | 持续 target health / latency observation、circuit breaker、advanced LB |
+| **V5.3** | Resilience / HA | DNS 动态目标、multi-ingress HA、automatic failover |
+| **V5.4** | Multi-hop | 多跳拓扑、共享 transport/link、拓扑迁移与故障恢复 |
+| **V5.5** | Federation | Panel federation、跨 workspace / 跨控制面 external sharing、远端 lease/quota/usage/revocation |
+| **V5.x** | Optional Data Plane / Ecosystem | WireGuard / mimic 类数据面、Plugin Store、移动端等，逐项架构评审后决定 |
+
+### 14.2 V5 从参考项目继续吸收的方向
+
+- **RelayPanel**：multi-target health、circuit breaker、failover 行为与恢复测试；
+- **FLVX**：tunnel quality observation、federation grant / port / quota / expiry / usage 语义；
+- **ForwardX**：multi-hop、HA、复杂 runtime recovery、WireGuard/扩展体系的边界与负面测试。
+
+这些项目仍只作为设计/行为/测试参考。许可证与单一真相源规则继续沿用 §13.11。
+
+### 14.3 V5 硬规则
+
+1. **先观测、后自动决策。** target health/latency 稳定之前不得上线 automatic failover。
+2. **每种协议独立 Gate。** UDP/WS/TLS/QUIC 不共享“一个协议通过就代表全部通过”的 Gate。
+3. **高可用必须验证故障恢复。** multi-ingress / failover 必须包含断链、恢复、抖动、双活冲突和回切测试。
+4. **multi-hop 不复活第二套产品模型。** 用户仍以 Forward 为业务对象；内部 Link/Transport 是否独立建模需 V5 contract 冻结后决定。
+5. **Federation 单独安全评审。** 跨 Panel credential、resource grant、lease、quota、revocation、审计、partial failure 与 reconcile 都必须有明确 ownership。
+6. **V5 不降低 V4 的稳定性门槛。** V4.5 的 LKG、drain、diagnose、Support Bundle、version/capability negotiation 继续作为所有 V5 能力的基础设施。
