@@ -20,6 +20,7 @@ import {
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import {
+  forwardAccessAddress,
   forwardCopyDraft,
   listenPortHintKey,
   listenPortPlaceholderKey,
@@ -368,6 +369,7 @@ export function ForwardWorkspace() {
   /** 写操作后强制重取当前页（页码/筛选都没变，靠它触发）。 */
   const [reloadToken, setReloadToken] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
   const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
   const [name, setName] = useState("");
   const [ingressId, setIngressId] = useState("");
@@ -657,7 +659,7 @@ export function ForwardWorkspace() {
 
     setBusy(true);
     try {
-      await api.forwards.create({
+      const created = await api.forwards.create({
         mode: createMode,
         ingress_node_id: ingress,
         name: name.trim(),
@@ -666,7 +668,7 @@ export function ForwardWorkspace() {
         target_port: targetPortNum,
         egress_node_id: createMode === "relay" ? Number(egressId) : null,
       });
-      toast.success(t("forward.createSuccess"));
+      setCreatedForward(created);
       setCreateOpen(false);
       // 新行按默认排序（order_by asc）不一定落在当前页，回到第 1 页更容易被看到。
       setPage(1);
@@ -1135,6 +1137,7 @@ export function ForwardWorkspace() {
                     order={order}
                     onSort={toggleSort}
                   />
+                  <TableHead>{t("forward.accessAddress")}</TableHead>
                   <TableHead>{t("forward.target")}</TableHead>
                   <SortableHead
                     label={t("common.status")}
@@ -1156,12 +1159,12 @@ export function ForwardWorkspace() {
               <TableBody>
                 {loading ? (
                   <TableRow>
-                    <TableCell colSpan={9} className="h-24 text-center text-[var(--muted-foreground)]">
+                    <TableCell colSpan={11} className="h-24 text-center text-[var(--muted-foreground)]">
                       {t("common.loading")}
                     </TableCell>
                   </TableRow>
                 ) : forwards.length === 0 ? (
-                  <TableEmpty colSpan={9} text={t("common.noData")} />
+                  <TableEmpty colSpan={11} text={t("common.noData")} />
                 ) : (
                   forwards.map((forward) => (
                     <TableRow key={String(forward.id)}>
@@ -1189,7 +1192,12 @@ export function ForwardWorkspace() {
                       </TableCell>
                       <TableCell>{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
                       <TableCell>{forward.egress_node?.node_id ?? "—"}</TableCell>
-                      <TableCell className="font-mono text-xs">:{forward.listen_port ?? "auto"}</TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`}
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {forwardAccessAddress(forward) ?? t("forward.addressPending")}
+                      </TableCell>
                       <TableCell className="font-mono text-xs">
                         {forward.target_host ?? "—"}{forward.target_port ? ":" + forward.target_port : ""}
                       </TableCell>
@@ -1419,6 +1427,25 @@ export function ForwardWorkspace() {
             >
               {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={createdForward !== null} onOpenChange={(open) => !open && setCreatedForward(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("forward.createReceiptTitle")}</DialogTitle>
+            <DialogDescription>
+              {forwardAccessAddress(createdForward ?? EMPTY_FORWARD)
+                ? t("forward.createReceiptAddress")
+                : t("forward.createReceiptPending")}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-[var(--border)] px-4 py-3 font-mono text-sm">
+            {forwardAccessAddress(createdForward ?? EMPTY_FORWARD) ?? t("forward.addressPending")}
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setCreatedForward(null)}>{t("common.confirm")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

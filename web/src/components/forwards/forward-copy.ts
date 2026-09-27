@@ -149,3 +149,15 @@ export function listenPortPlaceholderKey(
 ): "forward.autoPortPlaceholder" | "forward.portPlaceholder" {
   return isAutoPort(value) ? "forward.autoPortPlaceholder" : "forward.portPlaceholder";
 }
+
+/**
+ * Forward 的用户访问地址。自动端口尚未由后端/runtime 确定时返回 null，
+ * 调用方必须展示「待确定」而不是拼出 `:auto` 这样的伪地址。
+ */
+export function forwardAccessAddress(forward: Pick<PortForward, "listen_ip" | "listen_port" | "ingress_node">): string | null {
+  if (forward.listen_port == null) return null;
+  const host = (forward.ingress_node?.connect_ip ?? forward.listen_ip ?? "").split(",").map((ip) => ip.trim()).find(Boolean);
+  if (!host || host === "0.0.0.0" || host === "::" || host === "*") return null;
+  const normalizedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `${normalizedHost}:${forward.listen_port}`;
+}
