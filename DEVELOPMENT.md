@@ -1703,7 +1703,7 @@ V4 延续四条长期 Track，但职责切换为产品完成度：
 
 - Contract 可以先冻结，Backend / Agent / Web 随后并行实现。
 - Web 可以基于冻结 contract + mock 提前开发，但不能在 Backend contract 未进入 main 时自行发明字段。
-- Agent 与 Control Plane 可以并行，但任何 command payload / ACK 变化必须先在 V4-WP1 或 V4-WP5 contract 中冻结。
+- Agent 与 Control Plane 可以并行，但任何 command payload / ACK 变化必须先在对应 contract PR 中冻结：Forward/Node 基础协议归 V4-WP1 / V4-WP5；V4-WP11 新增 Diagnose / Upgrade / Support 动作时必须先做 WP11 contract 变更，禁止实现先行。
 - 两个 PR 如果持续修改同一个核心文件，必须重新拆边界；不靠反复解决 merge conflict 维持“伪并行”。
 
 ### 13.3 Forward 编辑模型（V4.1 硬约束）
@@ -2072,7 +2072,7 @@ WP3 进入 main 且 Gate 绿后，WP4 才能最终 merge。
 `v4-gate-topology.sh` 为 **PASS=31 / FAIL=0**，真实验证 RELAY 换 Egress、
 DIRECT ↔ RELAY 与 Ingress migration，同时检查数据面、runtime 退场、Binding、
 NodePortLease 和 ledger 收敛。因此本节列出的 V4-F1 最低验收项均已闭环，
-**V4.1 可标记完成，开发游标进入 V4.2 / WP5。**
+**V4.1 可标记完成。该句只记录历史 closure；当前实际游标以 §12 为准：关闭 V4-F2 / V4-F3。**
 
 #### Wave 3 — Managed Node
 
@@ -2301,7 +2301,7 @@ Rollback:
 Tests / Real E2E:
 ```
 
-禁止用一个“v4-all”分支同时开发 WP1～WP10。
+禁止用一个“v4-all”分支同时开发 WP1～WP11。
 
 ### 13.10 V4 明确暂缓
 
