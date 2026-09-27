@@ -25,6 +25,12 @@ import {
   runForwardAction as runForwardActionService,
   type ForwardAction,
 } from "../services/forward-service.ts";
+import {
+  bindingUsage,
+  bindingUsageMap,
+  lookupBindingUsage,
+  unbindBlockedMessage,
+} from "../services/binding-usage.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -187,6 +193,29 @@ nodesRoutes.get("/:ingressId/bindings", async (c) => {
       egress_node: { select: nodeSelect },
     },
   });
+
+  // V4-WP9 §13.6「Binding usage」：一次 groupBy 拿到全部出口的使用量，
+  // 而不是每个绑定查一次（N+1 在绑定量上来后是列表页的主要延迟来源）。
+  const usage = bindingUsageMap(
+    await db.tunnel.groupBy({
+      by: ["ingress_node_id", "egress_node_id"],
+      where: {
+        workspace_id: ws.id,
+        category: "port_forward",
+        tunnel_mode: "relay",
+        ingress_node_id: ingressId,
+        egress_node_id: { not: null },
+      },
+      _count: { _all: true },
+    }).then((groups) =>
+      groups.map((group) => ({
+        ingress_node_id: group.ingress_node_id,
+        egress_node_id: group.egress_node_id,
+        count: group._count._all,
+      })),
+    ),
+  );
+
   return c.json({
     data: rows.map((row) => ({
       id: row.id,
@@ -194,6 +223,8 @@ nodesRoutes.get("/:ingressId/bindings", async (c) => {
       egress_node_id: row.egress_node_id,
       egress_node: nodeView(row.egress_node),
       created_at: row.created_at,
+      // 使用量是响应投影（不新增列）：用户在解绑前就能看到影响面。
+      ...lookupBindingUsage(usage, row.ingress_node_id, row.egress_node_id),
     })),
   });
 });
@@ -223,7 +254,7 @@ nodesRoutes.post("/:ingressId/bindings", async (c) => {
     return c.json({ error: "出口节点角色必须是 egress 或 both" }, 409);
   }
 
-  const binding = await db.nodeBinding.upsert({
+  const created = await db.nodeBinding.upsert({
     where: {
       ingress_node_id_egress_node_id: {
         ingress_node_id: ingress.id,
@@ -235,8 +266,11 @@ nodesRoutes.post("/:ingressId/bindings", async (c) => {
   });
   return c.json({
     data: {
-      ...binding,
+      ...created,
       egress_node: nodeView(egress),
+      // V4-WP9 §13.6：新建绑定必然 0 使用量；仍显式返回，让前端的绑定行
+      // 处理逻辑不需要区分「刚创建」与「列表返回」两种形状。
+      ...bindingUsage(0),
     },
   }, 201);
 });
@@ -262,7 +296,17 @@ nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
     },
   });
   if (used > 0) {
-    return c.json({ error: `该出口仍被 ${used} 条端口转发使用，请先删除或改为其它出口` }, 409);
+    // V4-WP9 §13.6：409 文案由 `binding-usage.ts` 单点提供，与列表响应里的
+    // `used_by_forward_count` / `unbind_blocked` 用同一份判定；并回传使用量，
+    // 让前端在错误分支也能刷新按钮状态（而不是只弹一句话）。
+    return c.json(
+      {
+        error: unbindBlockedMessage(used),
+        code: "binding_in_use",
+        ...bindingUsage(used),
+      },
+      409,
+    );
   }
 
   await db.nodeBinding.deleteMany({
