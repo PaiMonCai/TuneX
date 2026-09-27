@@ -96,7 +96,8 @@ Health 四态（§13.4.4 语义逐条）：
 
 范围：**只碰 `web/`**。把 §1–§4 定下的后端结论渲染进**既有**节点 UI，新增消费
 `GET /api/admin/node/:id/health`（单节点）与 `GET /api/admin/node/health`（全量巡检）。
-后端/Agent 契约不动；本切片不 commit（另一个子代理持有 git 操作）。
+后端/Agent 契约不动。本切片与 §1–§4 的后端审查修复一并由收尾代理提交为 WP6 收尾
+commit（分支 `feature/v4-wp6-agent-telemetry`）。
 
 ### 6.1 新增
 
@@ -131,15 +132,19 @@ Health 四态（§13.4.4 语义逐条）：
 
 ### 6.4 验证
 
-- `bun test src/components/admin/__tests__/wp6-node-health.test.ts` → **38 pass / 0 fail**（219 断言）。
-- `bun test`（全量 web）→ **105 pass / 1 fail / 1 error**；唯一失败为**既有**问题：无 `node_modules` 时 `next`/`react` 缺失使 `forward-edit-dialog.test.ts` 无法导入组件（改动前基线同样是 1 fail / 1 error）。
-- 无本地构建 / 全量 `tsc`（按任务约束）。已用 `Bun.Transpiler` 对 14 个改动文件做语法校验：全部通过。
+- `bun test src/components/admin/__tests__/wp6-node-health.test.ts` → **38 pass / 0 fail**（223 断言）。
+- `bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/forwards/__tests__/`（CI web 步的原命令，`web/node_modules` 指向 `/opt/TuneX/web/node_modules`）→ **131 pass / 0 fail**。
+- `bun test`（全量 web）→ **131 pass / 0 fail**。改动前无 `node_modules` 时的 1 fail / 1 error（`forward-edit-dialog.test.ts` 找不到 `react/jsx-runtime`）是**环境**问题：接上依赖后转绿，与本次改动无关。
+- `tsc --noEmit`（web，接上依赖后）→ **exit 0**。首轮报出一处真实类型错误并已修：`web/src/mocks/node-health.ts` 把 `NodeRuntimeTunnel` 直接 `as Record<string, unknown>` 触发 TS2352（该接口无字符串索引签名），改为 `as unknown as Record<string, unknown>`——上报是外部输入，坏形状仍须能安全读。
+- `tsc --noEmit`（backend）→ **exit 0**；`bun test src`（全量 backend unit）→ **947 pass / 0 fail**。
+- `bun scripts/ci/secret-scan.mjs` → OK（387 个跟踪文件，仅既有弱口令告警，不阻断）。
+- 无本地 `next build`（按任务约束，交 CI web 步验证）。
 - 与 WP9 合并安全：对 `api.ts` / `types.ts` / `i18n.ts` / `handler.ts` 做三方合并（base=`origin/main`）**无冲突**，合并结果可解析且两侧功能共存（已固化为测试用例）。
 
 ### 6.5 Web 切片剩余 Gate
 
 1. **后端联调**：确认真实 `/admin/node/health` 信封与单节点 `{data: view}` 形状与本文假设一致（含 `port_not_bound` / `flags.ports_bound` 契约修订）。
-2. **`tsc --noEmit` + `next build`**：本机无 `node_modules`，类型与构建未验证。
+2. **`next build`**：`tsc --noEmit` 已在本地转绿，构建仍只由 CI 的 `npm run build` 验证（本地不 build）。
 3. **组件级渲染测试**：现有 web 测试无 jsdom 环境，面板 DOM 未在浏览器中断言（mock 覆盖了取数与投影）。
 4. **`i18n.ts` 收敛**：WP6 词条暂存独立文件，建议两个分支合并后统一并入。
 5. **列表健康列刷新**：当前只在首屏与列表 CRUD 后刷新；定时轮询属 WP8 范围。

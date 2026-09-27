@@ -100,7 +100,8 @@ function reportedRuntimes(snapshot: NodeStateReport | undefined): { id: string; 
   const out: { id: string; revision: number | null }[] = [];
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
-    const row = item as Record<string, unknown>;
+    // `tunnels` is typed as NodeRuntimeTunnel[], but external payloads still need runtime shape checks.
+    const row = item as unknown as Record<string, unknown>;
     if (typeof row.id !== "string" || row.id.length === 0) continue;
     out.push({ id: row.id, revision: num(row.revision) });
   }
