@@ -212,6 +212,9 @@ export function NodeLifecycleManager({
         }}
         open={installOpen}
         onOpenChange={setInstallOpen}
+        // 详情页同样补上闭环：等待中的节点在别处装好后，这里应当自己变绿，
+        // 而不是要求用户手动刷新才发现（§13.4.3 的缺口正是在详情页最刺眼）。
+        autoStart
       />
     </NodeLifecyclePanel>
   );

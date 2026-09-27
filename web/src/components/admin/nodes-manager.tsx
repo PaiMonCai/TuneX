@@ -581,23 +581,32 @@ export function AdminNodesManager({
           并区分「已安装掉线」（连接问题）与「还在装」（继续等）。
           判定只在后端（`deriveConnection`），这里不重算在线。 */}
       {installNode && (
-        <NodeInstallWaiting
-          nodeId={installNode.id}
-          view={installView}
-          onViewChange={setInstallView}
-          initialEnrollment={install}
-          open={Boolean(install)}
-          onOpenChange={(open) => {
-            if (!open) {
-              setInstall(null);
-              setInstallNode(null);
-              setInstallView(null);
-              // 安装可能改变连接/准入，关闭时刷新两处概览
-              void loadHealth();
-            }
-          }}
-          autoStart
-        />
+        <div
+          className="flex flex-col gap-2 rounded-[var(--radius)] border border-[var(--border)] p-3"
+          data-testid="node-install-banner-card"
+        >
+          {/* 列表页里横幅脱离上下文就会看不懂，故带上节点名与区块标题 */}
+          <span className="text-xs font-medium">
+            {lifetxt.sectionInstall} · <span className="font-mono">{installNode.node_id}</span>
+          </span>
+          <NodeInstallWaiting
+            nodeId={installNode.id}
+            view={installView}
+            onViewChange={setInstallView}
+            initialEnrollment={install}
+            open={Boolean(install)}
+            onOpenChange={(open) => {
+              if (!open) {
+                setInstall(null);
+                setInstallNode(null);
+                setInstallView(null);
+                // 安装可能改变连接/准入，关闭时刷新两处概览
+                void loadHealth();
+              }
+            }}
+            autoStart
+          />
+        </div>
       )}
 
       <ConfirmDeleteDialog

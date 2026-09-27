@@ -85,17 +85,24 @@ export function NodeInstallWaiting({
   const phase = installPhase(view);
   const closed = installClosureReached(phase);
 
-  // 父组件传入的命令（新建节点流程）接管状态；不自动重签。
+  // 传入的命令（新建节点流程）接管状态；不自动重签。
   useEffect(() => {
     if (initialEnrollment) setEnrollment(initialEnrollment);
   }, [initialEnrollment]);
 
-  // 新创建节点的流程：带着命令打开时直接开始等待闭环。
+  /**
+   * 自动开始等待：只要节点确实还在等待安装就轮询。
+   *
+   * 刻意**不**依赖 `enrollment`：轮询读的是节点的 connection，与「本地有没有
+   * 存着命令」无关。把两者绑在一起会让「在别的终端里已经装好了」这种情况永远
+   * 等不到更新——那正是本期要消灭的体验缺口。
+   */
   useEffect(() => {
-    if (!open || !autoStart || !enrollment || closed) return;
+    if (!autoStart || closed) return;
+    if (phase !== "awaiting_install") return;
     startedAt.current = Date.now();
     setWaiting(true);
-  }, [open, autoStart, enrollment, closed]);
+  }, [autoStart, closed, phase]);
 
   /** 生成新命令并把轮询打开。 */
   const generate = useCallback(async () => {
@@ -116,12 +123,16 @@ export function NodeInstallWaiting({
   /**
    * 轮询到闭环。
    *
-   * 终止条件三条：已在线 / 已超时 / 组件收起。**不**在 offline 时停：
+   * 终止条件三条：已在线 / 已超时 / 用户显式停止。**不**在 offline 时停：
    * 「已安装但掉线」说明安装已完成，但连接可能立刻恢复，继续等才有意义；
    * 界面文案已经区分这两种情况。
+   *
+   * 也**不**在关闭对话框时停：命令对话框只是查看命令的入口，等待本身是页面级
+   * 的状态（横幅上一直显示阶段）。关掉对话框就停止等待，等于又回到「复制完就
+   * 没有下文」——正是本期要修的缺口。
    */
   useEffect(() => {
-    if (!waiting || closed || !open) return;
+    if (!waiting || closed) return;
     const timer = setInterval(() => {
       if (Date.now() - startedAt.current > INSTALL_POLL_MAX_MS) {
         setWaiting(false);
@@ -139,7 +150,7 @@ export function NodeInstallWaiting({
         .catch(() => undefined);
     }, INSTALL_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [waiting, closed, open, nodeId, onViewChange]);
+  }, [waiting, closed, nodeId, onViewChange]);
 
   async function copyCommand() {
     if (!enrollment) return;

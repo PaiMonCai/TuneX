@@ -513,6 +513,21 @@ describe("WP7 接线", () => {
     expect(src).not.toMatch(/Date\.now\(\)\s*-\s*\w*report/i);
   });
 
+  test("等待闭环不依赖「本地是否存着命令」：关掉对话框也继续等", () => {
+    const src = flat(install);
+    // 自动开始只看 autoStart + 阶段（phase），不看 enrollment / 对话框开合
+    expect(src).toContain('if (!autoStart || closed) return;');
+    expect(src).toContain('if (phase !== "awaiting_install") return;');
+    // 轮询的守卫里不得再出现 open（关掉对话框就停 = 又回到「复制完没有下文」）
+    expect(src).toContain("if (!waiting || closed) return;");
+    expect(src).not.toContain("if (!waiting || closed || !open) return;");
+  });
+
+  test("详情页与列表页都开启等待闭环（autoStart）", () => {
+    expect(flat(manager)).toContain("autoStart");
+    expect(flat(nodes)).toContain("autoStart");
+  });
+
   test("已保存备注来自节点行（视图没有 note 字段），并接到面板", () => {
     // 契约：/admin/node/:id/lifecycle 的视图是固定十键、**不含** note；
     // 备注在节点行 lifecycle_note 上，详情页读它并传给卡片。
