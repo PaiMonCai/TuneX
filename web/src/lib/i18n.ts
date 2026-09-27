@@ -368,6 +368,14 @@ const zh = {
     runningPending: "等待应用（运行 {applied}，已保存 {desired}）",
     runningSuspended: "已暂停 — 恢复时应用已保存的版本",
     runningError: "应用失败 — 上一版本仍在运行",
+    // ── V4-WP8：技术细节默认折叠（raw revision / desired internals）──
+    technicalDetails: "技术细节（revision / 期望状态）",
+    product: {
+      synced: "运行中",
+      pending: "下发中",
+      error: "运行异常",
+      suspended: "已暂停",
+    },
     savedRevision: "已保存版本",
     copyAddress: "复制地址",
     copyFailed: "复制失败，请手动选择文本",
@@ -1139,6 +1147,14 @@ const en: Dict = {
     runningPending: "Saving in progress (revision {applied} running, {desired} saved)",
     runningSuspended: "Suspended — the saved version applies on resume",
     runningError: "Apply failed — the previous version keeps running",
+    // ── V4-WP8：技术细节默认折叠（raw revision / desired internals）──
+    technicalDetails: "Technical details (revision / desired state)",
+    product: {
+      synced: "Running",
+      pending: "Rolling out",
+      error: "Not running correctly",
+      suspended: "Suspended",
+    },
     savedRevision: "Saved revision",
     copyAddress: "Copy address",
     copyFailed: "Could not copy — select the text manually",

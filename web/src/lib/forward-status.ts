@@ -26,6 +26,8 @@
  * 解释成「回滚」——那需要后端语义，不是前端能猜的）。本模块只做归类与文案键。
  */
 import type { PortForward } from "./types";
+import { conditionAction } from "./node-lifecycle-i18n";
+import type { Locale } from "./i18n";
 
 /** 产品状态四态（与 WP4 的 running-vs-desired 语义一致）。 */
 export type ForwardProductState = "synced" | "pending" | "error" | "suspended";
@@ -240,3 +242,92 @@ export const APPLY_ERROR_CODES: string[] = Object.keys(APPLY_ERROR_ACTION);
 export const RETRYABLE_APPLY_ERROR_CODES: string[] = APPLY_ERROR_CODES.filter(
   (code) => APPLY_ERROR_ACTION[code].retryable,
 );
+
+/* ================================================================== */
+/* 写操作失败 → 下一步（消费 409 condition，D4）                        */
+/* ================================================================== */
+
+/** 从接口错误里抽出的 Forward 写失败信息。 */
+export interface ForwardErrorInfo {
+  status: number | null;
+  /** 服务层码：`conflict` / `invalid_input` / `not_found` / `policy_denied` … */
+  code: string | null;
+  /**
+   * 运行条件拒绝码（`node_in_maintenance` / `node_waiting_install` / …）。
+   *
+   * 后端把它放在 `data.condition`（`routes/forwards.ts` 的 `send()` →
+   * `forward-service.ts` 的 `nodeAdmissionError`）。改造前前端**完全没读**
+   * 这个字段，于是一个「入口节点正在维护」的 409 在界面上只剩「保存失败」。
+   */
+  condition: string | null;
+  /** 编排错误码（`apply_error_code`；创建/更新路径上的失败原因）。 */
+  applyErrorCode: string | null;
+  /** 人读原因（`message` → `error` → 状态码兜底，见 lib/api.ts 的 finalize）。 */
+  message: string;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * 解析 Forward 写操作（create / patch / action）抛出的 `ApiError`。
+ *
+ * 后端 `forwards` 族的错误体是 `{ error, code, apply_error_code, data }`：
+ *   · `code`：服务层分类（`conflict` / `invalid_input` / …）；
+ *   · `data.condition`：**节点准入/生命周期拒绝码**（§13.5 要求的可区分码）；
+ *   · `apply_error_code`：编排阶段失败码（下发后才会有）。
+ * 三者平级，所以这里一次全取，调用方按优先级给下一步。
+ *
+ * 同时容忍 `data.data` 一层嵌套（mock 的通用 `fail()` 用那种形状，而 mock 是
+ * 前端演示与契约测试的运行环境）。**契约仍以后端顶层为准**。
+ */
+export function forwardErrorInfo(error: unknown): ForwardErrorInfo {
+  const status =
+    isRecord(error) && typeof error.status === "number" && Number.isFinite(error.status)
+      ? error.status
+      : null;
+  const message =
+    isRecord(error) && typeof error.message === "string"
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  const payload = isRecord(error) && isRecord(error.data) ? error.data : null;
+  const nested = payload && isRecord(payload.data) ? payload.data : null;
+  const read = (key: string): unknown => payload?.[key] ?? nested?.[key];
+  const str = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
+  return {
+    status,
+    code: str(read("code")),
+    condition: str(read("condition")),
+    applyErrorCode: str(read("apply_error_code")),
+    message,
+  };
+}
+
+/**
+ * 写失败 → 「下一步做什么」（可能返回多条，按优先级）。
+ *
+ * 顺序有意如此：**准入拒绝**（`condition`）优先于编排错误（`apply_error_code`）
+ * —— 准入被拒说明请求根本没进编排，此时给一个编排层面的建议是误导。
+ *
+ * 返回空数组 = 没有已知动作；调用方回落后端原文（`message`），不编造建议。
+ */
+export function forwardErrorActions(locale: string, info: ForwardErrorInfo): string[] {
+  const out: string[] = [];
+  if (info.condition) {
+    const text = conditionAction(locale as Locale, info.condition);
+    if (text) out.push(text);
+  }
+  if (info.applyErrorCode) {
+    const text = applyErrorAction(locale, info.applyErrorCode);
+    if (text) out.push(text);
+  }
+  return out;
+}
+
+/** 是否值得给「重试」（仅编排层的可自愈错误）。 */
+export function forwardErrorIsRetryable(info: ForwardErrorInfo): boolean {
+  return applyErrorIsRetryable(info.applyErrorCode);
+}
