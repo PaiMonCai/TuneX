@@ -1325,20 +1325,24 @@ contract
 → stable
 ```
 
-优先顺序仍为：
+V4.5 之前不以“参考项目已有”作为提前引入高级协议的理由。优先顺序调整为：
 
 1. UDP
 2. WS/TLS
 3. QUIC
-4. advanced LB
-5. DNS
-6. multi-ingress HA
-7. automatic failover
-8. multi-hop
+4. target health / latency observation
+5. circuit breaker / advanced LB
+6. DNS
+7. multi-ingress HA
+8. automatic failover
+9. multi-hop
+10. Panel federation / cross-workspace external sharing（单独架构评审）
+
+其中 target health/latency **先做观测，再做自动决策**：先让用户看见目标可达性、延迟、失败次数和恢复事实；circuit breaker / automatic failover 必须在观测数据稳定、误判边界和恢复策略有 Real E2E 后才允许自动切流。
+
+Panel federation 不属于 V4-WP10 NodeGroup 重构。WP10 只冻结单控制面内的 RBAC / Resource Scope / Grant；跨 Panel 信任、远端 lease、远端配额与分布式 reconcile 必须留在 WP16+ 单独设计。
 
 同一底层模块冲突严重的能力不得强行并行。
-
----
 
 ### 7.18 PR / Branch 并行规则
 
@@ -1592,14 +1596,40 @@ V4.0     Node + Forward 产品入口收敛    ✅
 ### V4 当前执行状态
 
 ```text
-V4-WP0  V4 产品/团队开发方案冻结       ✅
-V4-WP1  Forward Revision Foundation     ✅ main
-V4-WP2  Agent Hot Reload Primitives     ✅ main
-V4-WP3  Forward Rollout Orchestrator    ✅ main
-V4-WP4  Forward Edit Product UX         ✅ main（PR #21）
-Gate F1 Forward Fully Editable/Hot Reload ✅ 完成（PR #22 closure）
-V4-WP5  Node Lifecycle Foundation       NEXT / 已有历史分支，下一阶段基于最新 main 重审刷新
+V4-WP0  V4 产品/团队开发方案冻结             ✅
+V4-WP1  Forward Revision Foundation           ✅ main
+V4-WP2  Agent Hot Reload Primitives           ✅ main
+V4-WP3  Forward Rollout Orchestrator          ✅ main
+V4-WP4  Forward Edit Product UX               ✅ main
+Gate F1 Forward Fully Editable/Hot Reload     ✅ 完成
+
+V4-WP5  Node Lifecycle Foundation             ✅ main
+V4-WP6  Agent Telemetry & Node Health         ✅ main
+V4-WP7  Node Lifecycle Product UX             ✅ main
+V4-WP8  Monitoring & Actionable Diagnostics   ✅ main
+V4-WP9  Scale & Interaction Polish            ✅ main
+
+Gate F2 Managed Node Lifecycle + Telemetry     🟡 正式收口中
+Gate F3 Monitoring / Scale / UX Complete      🟡 功能已进 main，正式 Gate 待关闭
+
+V4-WP10 Authorization + NodeGroup Model       ⏸️ blocked by F2/F3
+V4-WP11 Stable / Ops Hardening                ⏸️ 未开始
 ```
+
+**2026-09-28 主线状态：**
+
+- PR #23 的 reconcile / `applied_revision` 收敛修复已合入 `main`，当前主线
+  HEAD `c64fc13`；
+- 该提交对应的 **CI → Integration → Release 全部成功**；
+- V4 interruption/recovery S10 已验证 Agent pause → desired revision 前进 →
+  unpause → runtime ledger 与 rollout ledger 都自行收敛，最新证据为
+  **PASS=58 / FAIL=0 / LIMITED=0 / DEFECT=0**；
+- WP5～WP9 的主体代码已经进入 main，不能再把“当前开发游标”写成 WP5 NEXT；
+- Gate V4-F2 仍有一项明确收尾：`feature/v4-f2-role-impact-fail-closed`
+  需要更新到最新 main、重新跑完整 CI/Integration，并纳入 F2 lifecycle 场景；
+- Gate V4-F3 需要把已经进入 main 的 Monitoring / Scale / UX 功能用正式 Gate
+  证据闭环，而不是用“代码已合并”替代 Gate；
+- **V4-WP10 在 F1～F3 全绿之前不得启动。**
 
 **2026-09-26 V4.1 / Gate V4-F1 最终收口：✅**
 
@@ -1609,21 +1639,16 @@ PR #22 的最后一个代码承载 head `7836d20` 已通过 **CI #439** 与
 - 既有 `v4-gate.sh` / `v4-gate-rest.sh`：target host/port、listen port、
   multi-field single revision、stale expected_revision 409、失败保留旧 applied、
   suspend/resume；
-- `v4-gate-s10.sh`：**PASS=57 / FAIL=0 / LIMITED=1 / DEFECT=0**。S10.47 的
-  `pause ingress Agent → PATCH → ack_timeout/waiting → unpause → runtime truth reconcile`
-  已稳定收敛为 rollout `done`、`applied_revision == config_revision`，数据面可用；
-- 新增 `v4-gate-topology.sh` 四 Agent 拓扑：**PASS=31 / FAIL=0**，真实完成
+- `v4-gate-s10.sh`：此前 F1 closure 的证据为 **PASS=57 / FAIL=0 / LIMITED=1 / DEFECT=0**；
+  后续 PR #23 又把同一路径强化为 runtime ledger + rollout ledger 双收敛见证，
+  最新为 **PASS=58 / FAIL=0 / LIMITED=0 / DEFECT=0**；
+- `v4-gate-topology.sh` 四 Agent 拓扑：**PASS=31 / FAIL=0**，真实完成
   **DIRECT→RELAY、RELAY 更换 Egress、RELAY→DIRECT、Ingress migration**，并同时断言
   runtime 退场、Binding、NodePortLease 唯一性和最终 ledger 收敛。
 
-S10 的 `LIMITED=1` 仅记录“未叠加 worker/panel 重启 + Agent pause 的组合实验”，
-不对应 V4-F1 最低验收项，也没有 DEFECT。至此 §13.7 列出的 Gate V4-F1 必验场景
-均有真实 E2E 证据，**V4.1 正式完成**。下一阶段切到 V4.2 / V4-WP5～WP7。
+至此 V4.1 正式完成；当前主线任务是 **关闭 V4-F2 / V4-F3，再进入 WP10**。
 
-正式开发顺序、并行关系和 Gate 以第 13 节为准。V4 期间默认暂停新协议横向扩展；
-除阻断性安全/生产问题外，UDP、QUIC、multi-hop 等进入 V4 稳定版之后的 WP16+。
-
-### Compatibility API（P1）### Compatibility API（P1）
+### Compatibility API（P1）
 
 仓库内新的 Web 产品代码已经不依赖旧接口。当前仍暂留：
 
@@ -1659,7 +1684,7 @@ V4 后续开发、分支、PR 和合并判断以第 13 节的 Work Package、并
 | **V4.2** | 托管 Node 生命周期 + Agent 状态监控 | V4-WP5～WP7 | Gate V4-F2 |
 | **V4.3** | Dashboard / 诊断 / 列表规模化 / 交互补全 | V4-WP8～WP9 | Gate V4-F3 |
 | **V4.4** | 权限模型 + NodeGroup 最终语义 | V4-WP10 | Gate V4-F4 |
-| **V4.5** | 稳定版、真实 E2E、兼容 API 决策、文档收尾 | V4-WP11 | Gate V4-F5 |
+| **V4.5** | Agent 耐久性 / 运维升级 / 诊断闭环 + 稳定版、兼容与发布收尾 | V4-WP11 | Gate V4-F5 |
 
 V4.1～V4.5 是产品完成度里程碑，不表示每个小版本都必须单独改变数据库主版本。所有数据库改动继续遵守 expand-and-contract。
 
@@ -1670,9 +1695,9 @@ V4 延续四条长期 Track，但职责切换为产品完成度：
 | Track | V4 负责范围 | 主要目录 |
 |---|---|---|
 | **Track A — Data / Contract** | additive schema、Revision snapshot、Node lifecycle 字段、StateReport 扩展、迁移 | `backend/prisma`、shared types |
-| **Track B — Agent / Runtime** | Forward hot-reload、listener/upstream 切换、drain、Agent telemetry | `agent/` |
-| **Track C — Control Plane / API** | Forward update/preview、rollout orchestrator、Node lifecycle、health synthesis、权限 resolver | `backend/src/services`、`backend/src/routes` |
-| **Track D — Web / QA / Release** | Forward/Node 产品 UI、Dashboard、分页筛选、E2E、发布 Gate、文档 | `web/`、`scripts/`、CI |
+| **Track B — Agent / Runtime** | Forward hot-reload、listener/upstream 切换、graceful drain、LKG runtime persistence、Agent telemetry / upgrade primitives | `agent/` |
+| **Track C — Control Plane / API** | Forward update/preview、rollout orchestrator、Node lifecycle、health synthesis、diagnostics/support task、权限 resolver | `backend/src/services`、`backend/src/routes` |
+| **Track D — Web / QA / Release** | Forward/Node 产品 UI、Dashboard、诊断入口、Support Bundle、分页筛选、E2E、发布 Gate、文档 | `web/`、`scripts/`、CI |
 
 并行原则：
 
@@ -1980,7 +2005,7 @@ V4-WP10 必须先做“权限矩阵 + 资源作用域 + NodeGroup 语义”设�
 | **V4-WP8** | Monitoring & Actionable Diagnostics | C/D | WP4 + WP7 | Dashboard 异常入口、用户状态语义、错误→下一步、隐藏默认内部 revision 细节 |
 | **V4-WP9** | Scale & Interaction Polish | C/D | WP4 | server pagination/filter/sort、Egress filter、auto-port 提示、复制 Forward、Binding usage、必要批量操作 |
 | **V4-WP10** | Authorization + NodeGroup Model | Shared | WP4 + WP7 + WP8 + WP9 | 权限矩阵、resource scope、Capability 分层、NodeGroup 最终语义与兼容迁移 |
-| **V4-WP11** | Stable Gate / Compatibility Decision | Shared/D | WP10 | Real E2E、升级/回滚演练、compat API 去留决策、README/运维文档、V4.5 release |
+| **V4-WP11** | Agent Durability / Ops / Diagnostics / Stable Gate | Shared/B/C/D | WP10 | LKG runtime cache、graceful drain、protocol capability、Agent 重装/升级、Forward/Node diagnose、Support Bundle、全量 Real E2E、兼容/回滚/文档、V4.5 release |
 
 ### 13.7 团队开发步骤与并行波次
 
@@ -2049,7 +2074,7 @@ DIRECT ↔ RELAY 与 Ingress migration，同时检查数据面、runtime 退场�
 NodePortLease 和 ledger 收敛。因此本节列出的 V4-F1 最低验收项均已闭环，
 **V4.1 可标记完成，开发游标进入 V4.2 / WP5。**
 
-#### Wave 3 — Managed Node#### Wave 3 — Managed Node
+#### Wave 3 — Managed Node
 
 Agent Track 在 WP2 稳定后进入 V4-WP6，避免两个大 Agent PR 同时长期修改 TunnelManager/上报主循环。
 
@@ -2071,6 +2096,21 @@ Gate V4-F2 至少验证：
 - role/port-range 修改 impact check；
 - state report / health / version / runtime/port facts 正确。
 
+**当前状态（2026-09-28）：WP5～WP7 已进 main，但 F2 尚未正式关闭。**
+
+F2 收口顺序固定：
+
+```text
+同步 feature/v4-f2-role-impact-fail-closed 到最新 main
+→ role/port-range impact fail-closed CI + Integration
+→ lifecycle exact-scenario Gate
+→ Agent reinstall identity scenario
+→ state report / health facts assertions
+→ Gate V4-F2 = green
+```
+
+不得因为 WP5～WP7 已 merge 就跳过 exact-scenario Gate。
+
 #### Wave 4 — Product Polish
 
 ```text
@@ -2089,6 +2129,17 @@ V4-WP9 Scale/Interaction
 - 创建后清晰展示最终访问地址/auto port；
 - Binding 删除前显示使用量；
 - Tunnel 术语从普通用户文案中清理。
+
+**当前状态（2026-09-28）：WP8 / WP9 已进 main，F3 需要单独 Gate closure。**
+
+F3 不重复证明 F1/F2 的 runtime 正确性，重点验证产品闭环：
+
+- 大列表分页/过滤/排序稳定且结果无重复/漏项；
+- Dashboard needs-attention 与 Node/Forward 真实状态一致；
+- 错误项能跳到可执行的下一步；
+- copy Forward / batch retry-suspend-resume / Binding usage 的权限与失败结果可解释；
+- 普通产品页面不依赖 raw revision 才能理解当前状态；
+- 真实 Integration 拿到的最终访问地址与数据面一致。
 
 #### Wave 5 — Permission / NodeGroup
 
@@ -2112,15 +2163,94 @@ V4-WP9 Scale/Interaction
 
 #### Wave 6 — V4 Stable
 
-V4-WP11：
+V4-WP11 不再只是“最后再跑一次 E2E”，而是把现有控制器架构补成可长期运维的系统。WP11 拆成四个可独立 PR/分支推进、最终共同关闭 F5 的子阶段：
 
-- 跑 V4 全量 Real E2E；
-- 生产部署 / Agent 重装 / Panel 升级 / 镜像回滚 / backup-restore 演练；
-- 检查 orphan EgressPool / NodePortLease / stale runtime；
-- 审核 deprecated `/api/tunnels` 与 node-scoped Forward API 的外部兼容窗口；
+##### WP11A — Agent Durability
+
+- Agent 保存**最后成功 applied** 的 runtime snapshot（LKG，last-known-good）；
+- LKG 必须版本化、原子写入、权限收紧，禁止持久化 credential/token；
+- Agent/主机重启且 Panel 暂时不可达时，可从 LKG 恢复已成功运行过的 runtime；
+- Panel 恢复后仍以 Panel desired revision 为最终权威，正常 reconcile 到最新 desired；
+- remove/suspend/retarget 等成功 applied 后必须同步更新/删除对应 LKG，禁止“配置已删但缓存复活”；
+- SIGTERM / maintenance / upgrade 共用一个 graceful drain primitive：
+  close listeners → 不接新连接 → 等待既有 TCP 连接归零或超时 → final report/flush → stop；
+- 明确“不承诺跨进程 socket handoff”，drain 是有界窗口，不是假装零中断。
+
+##### WP11B — Agent Operations
+
+- 在现有 `NodeStateReport` 增加可选的 `control_protocol_version` 与
+  `capabilities`，继续坚持“只扩展一个状态真相源”；
+- Panel 下发新动作前先做 capability check，不支持时返回结构化
+  `incompatible_agent` / upgrade-required 类错误，禁止靠未知命令失败来猜；
+- Docker-first 安装不采用“进程自覆盖二进制”作为主升级方式；
+- 标准升级闭环：
+  `maintenance → drain → recreate/update Agent → same agent_id → reconnect → desired/applied converge → active`；
+- Agent reinstall / upgrade 必须保持 Node、agent_id、Forward/Binding 关系；
+- 升级失败必须回到可解释状态并保留旧运行版本/恢复路径；
+- 多 Node 升级后续支持 rolling waves，先小批、确认健康再继续，禁止一次性全量打掉数据面。
+
+##### WP11C — Diagnostics
+
+新增产品级 **Forward / Node Diagnose**，继续走现有 outbound-only command/ACK 通道，不新建第二套 Agent 管理协议。
+
+Forward Diagnose 最低事实：
+
+```text
+DIRECT:
+runtime exists
+→ listener bound
+→ desired/applied revision match
+→ target resolve/connect
+→ latency/error
+
+RELAY:
+Ingress runtime/listener
+→ Ingress ↔ Egress path
+→ Egress runtime
+→ Egress → target reachability
+→ 每一段 latency/error
+```
+
+诊断 probe 必须是 side-channel：
+
+- 不计业务流量；
+- 不占用户连接额度；
+- 不经过业务 bandwidth limiter；
+- 有单 probe timeout、target 数量和并发硬上限；
+- result 必须绑定原 command/resource/revision，过期或不匹配结果拒绝；
+- UDP 等无法可靠验证的协议不得伪装成“已确认可达”。
+
+新增 **Support Bundle**：
+
+- Panel 侧汇总 NodeStateReport、desired/applied、ForwardRollout、最近 audit / panel log；
+- Agent 侧按白名单采集版本、process/boot 信息、listeners、routes、service status、
+  必要日志和有限网络事实；
+- 所有字段和文本二次 redact `token/password/secret/private key/authorization/cookie/credential`；
+- 每命令输出、单 Agent 输出、总 Bundle 都有大小上限；
+- 每命令和整个 task 都有 timeout；
+- offline Node 明确返回 offline，不无限 pending；
+- Bundle 只用于诊断，不成为新的运行态真相源。
+
+##### WP11D — Stable Gate
+
+最终 F5 必须覆盖：
+
+- 全量 V4 Real E2E；
+- Panel online / temporarily unavailable 下 Agent restart；
+- LKG 恢复后 Panel 回归、revision 再收敛；
+- SIGTERM graceful drain：新连接拒绝、已有 TCP 在窗口内可结束；
+- Agent reinstall / image upgrade 保持 agent_id / Node / Forward 关系；
+- old Agent + new Panel / new Agent + old Panel 的 capability/version skew；
+- diagnose 的真实 reachable / timeout / refused 路径；
+- Support Bundle 不泄露 credential/token；
+- 生产部署 / Panel 升级 / 镜像回滚 / backup-restore 演练；
+- orphan EgressPool / NodePortLease / stale runtime 检查；
+- deprecated `/api/tunnels` 与 node-scoped Forward API 的外部兼容窗口决策；
 - 如果决定删除旧 API，单独 breaking-change PR + release notes；
-- 更新 README / production deploy / migration notes；
-- Gate V4-F5 通过后标记 V4.5 stable。
+- README / production deploy / migration notes；
+- 仓库 LICENSE / NOTICE / third-party attribution 策略明确后再标记 V4.5 stable。
+
+Gate V4-F5 通过后才标记 V4.5 stable。
 
 ### 13.8 V4 Integration Gates
 
@@ -2130,7 +2260,7 @@ Gate V4-F1  Forward Fully Editable + Hot Reload     ← WP1–WP4  ✅
 Gate V4-F2  Managed Node Lifecycle + Telemetry      ← WP5–WP7
 Gate V4-F3  Monitoring / Scale / UX Complete        ← WP8–WP9
 Gate V4-F4  Authorization / NodeGroup Model Stable  ← WP10
-Gate V4-F5  Real E2E / Ops / Compatibility Stable   ← WP11
+Gate V4-F5  Durability / Diagnostics / Ops / Compatibility Stable ← WP11
 ```
 
 只有对应 Gate 通过，才宣称该 V4 里程碑完成。单个 PR CI 绿不等于 V4 Gate 通过。
@@ -2150,6 +2280,9 @@ feature/v4-wp7-node-lifecycle-web
 feature/v4-wp8-monitoring
 feature/v4-wp9-product-polish
 feature/v4-wp10-permissions-nodegroup
+feature/v4-wp11-agent-durability
+feature/v4-wp11-agent-operations
+feature/v4-wp11-diagnostics
 test/v4-wp11-stable-gate
 ```
 
@@ -2172,16 +2305,47 @@ Tests / Real E2E:
 
 ### 13.10 V4 明确暂缓
 
-以下内容不因为 V4 开发而顺手加入：
+以下内容不因为 V4 开发或参考项目已有而顺手加入：
 
 - UDP；
 - WS/TLS 新数据面；
 - QUIC；
-- advanced multi-target LB 产品化；
+- advanced multi-target LB 自动决策；
 - DNS；
 - multi-ingress HA；
 - automatic failover；
-- multi-hop。
+- multi-hop；
+- Panel federation / 跨控制面共享；
+- WireGuard / mimic 类额外数据面；
+- Plugin Store / 移动端等非核心产品面。
 
-它们仍保留为 V4 稳定后的 WP16+。除非某能力是 V4 Forward 编辑/Node 生命周期的阻断项，否则不得抢占 V4-F1～F5 的主线资源。
+V4-WP11 可以增加 **target health / latency 的诊断观测**，但不能借诊断之名提前实现
+automatic failover。高级网络能力仍保留为 V4 稳定后的 WP16+。除非某能力是
+Forward 编辑、Node 生命周期或稳定性 Gate 的阻断项，否则不得抢占 V4-F2～F5 的主线资源。
 
+### 13.11 外部参考项目吸收规则
+
+V4.5 的 durability / diagnostics 方向参考当前 fork 的三个项目，但
+`DEVELOPMENT.md` 与 TuneX 自身 contract 永远是唯一开发真相源：
+
+- **RelayPanel**：重点参考 config cache、protocol-version guard、rule diagnose、
+  graceful shutdown/drain、Agent upgrade 生命周期与 CI/E2E 组织方式；
+- **FLVX**：重点参考流式 diagnosis、tunnel quality observation、批量产品交互和
+  federation 的“资源 grant/port/quota/expiry/usage”语义；
+- **ForwardX**：重点参考 LKG runtime persistence、self-test、Support Bundle、
+  upgrade waves、runtime recovery 与大量负面/恢复测试。
+
+实现原则：
+
+1. **吸收行为/状态机/测试场景，不复制产品复杂度。** TuneX 不因参考项目存在
+   multi-hop、WireGuard、插件、支付等能力而改变 V4 范围。
+2. **不引入第二套真相源。** LKG 是 last-applied availability cache，不取代
+   Panel desired；Support Bundle 是诊断产物，不取代 NodeStateReport；
+   diagnose result 是一次测试事实，不取代 Health synthesis。
+3. **不引入第二套控制协议。** Diagnose / upgrade / support request 优先扩展现有
+   outbound-only command + ACK/result contract。
+4. **许可证 fail-closed。** RelayPanel 当前为 Apache-2.0；FLVX 当前修改部分为
+   GPLv3；ForwardX 当前为 AGPL-3.0-only。GPL/AGPL 项目默认只参考设计和测试思路，
+   未经明确 license review 不直接复制实现代码。
+5. TuneX 在 V4.5 stable 前必须明确仓库自身 LICENSE / NOTICE / third-party
+   attribution 策略；许可状态未明确时不得以“公开仓库可见”为理由复制代码。
