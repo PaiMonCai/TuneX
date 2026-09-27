@@ -1634,7 +1634,7 @@ V4-WP11 Stable / Ops Hardening                ⏸️ blocked by F4
   - **V4-F3 product closure：PASS=21 / FAIL=0**；
   - unified image build / smoke / Compose validation：success。
 - 因此 **Gate V4-F2 与 Gate V4-F3 正式关闭**，V4.2 / V4.3 完成；
-- F1～F3 已全绿，**V4-WP10 Authorization + NodeGroup Model 解除阻塞，成为当前 NEXT**；
+- F1～F3 已全绿，V4-WP10 Authorization + NodeGroup Model 已解除阻塞；\n- **2026-09-28 起项目开发暂时暂停**，当前没有 Active WP；恢复开发时从 **V4-WP10** 继续，不跳过 Gate F4；
 - 高级协议、target intelligence、HA/failover、multi-hop、federation 等不进入 V4，
   已统一迁入第 14 节 **V5 Roadmap**。
 
@@ -1653,7 +1653,28 @@ PR #22 的最后一个代码承载 head `7836d20` 已通过 **CI #439** 与
   **DIRECT→RELAY、RELAY 更换 Egress、RELAY→DIRECT、Ingress migration**，并同时断言
   runtime 退场、Binding、NodePortLease 唯一性和最终 ledger 收敛。
 
-至此 V4.1 正式完成；截至 2026-09-28，V4-F2 / V4-F3 也已关闭，当前主线任务进入 **V4-WP10**。
+至此 V4.1 正式完成；截至 2026-09-28，V4-F2 / V4-F3 已关闭；随后项目进入暂停状态，恢复开发时从 **V4-WP10** 继续。
+
+### V4 开发暂停快照
+
+**暂停日期：2026-09-28。**
+
+暂停不是取消路线图。当前冻结点：
+
+```text
+F1 ✅
+F2 ✅
+F3 ✅
+→ PAUSED
+→ resume at V4-WP10
+→ Gate F4
+→ V4-WP11
+→ Gate F5 / V4.5 Stable
+→ V5
+```
+
+暂停期间不启动新的 V4/V5 Work Package；已有代码、migration、Integration Gate 和
+部署脚本保持可运行状态。恢复时先基于最新 main 重跑 CI / Integration，再继续 WP10。
 
 ### Compatibility API（P1）
 
