@@ -4,10 +4,97 @@
  * This module deliberately never calls scheduler reapply helpers: those bump
  * config_revision and may choose nodes. Reconciliation is allowed to replay
  * only the already persisted topology at the same revision.
+ *
+ * ── 为什么「同 revision 重发成功」必须落库（V4-F2 Gate 缺陷 1）──
+ * 维护（§13.4.2 maintenance）期间保存的 desired 不会走 rollout：`patchForward`
+ * 的 VALIDATE 被 `lifecycleAcceptsBusiness()` 拒绝，返回 `blocked`，**一条
+ * `forward_rollout` 行都不会建**。退出维护后能把 runtime 推到最新 desired 的
+ * 通道只有 reconcile 的同-revision 重发。若这里只 dispatch 不记账，就会出现
+ * 「真实面已生效（Agent `reported_revision` 追平 `config_revision`、TCP 已切
+ * 到新 target），面板 `tunnel.applied_revision` 永远停在旧值」：reconciler 每
+ * 30 s 再判一次 `revision_behind` 并重复下发同一 revision，永不静默，
+ * `/api/tunnels/:id` 的 `sync_pending` 投影也随之长期失真。
+ *
+ * 因此 ACK 成功后必须把「已确认应用的 revision」写回 tunnel 行。写入走
+ * {@link ReconcileSinkLedger.markApplied} 的 **CAS**（`config_revision` 仍等于
+ * 本次重发的 revision、且 `applied_revision` 落后于它时才推进）。三条不变量：
+ *   1. **不写 `config_revision`**：期望版本只属于编排器（§7.12 禁 reconciler
+ *      抬高 revision）。CAS 的 where 已经要求它等于本次重发值，写入列里没有它。
+ *   2. **不写 port / node / binding**：本 sink 只记账，§7.12 的
+ *      `change_port` / `switch_node` 禁令在此体现为「这些列根本不在 data 里」。
+ *   3. **并发编辑不会被打脏**：CAS 未命中（`count=0`）说明 desired 已被别人推进
+ *      （或已有别的写入者记过账），本轮 dispatch 结果按过期丢弃，下一轮按新
+ *      revision 重新收敛。
+ *
+ * ── 依赖姿态 ──
+ * `ledger` / `orchestrator` / `now` 全部可注入，默认实现懒加载 Prisma 与
+ * relay-wiring：只 import 本模块的单测不会连库（与 `reconciler.ts` 的
+ * `defaultReconcileDeps`、`forward-rollout-recovery.ts` 的
+ * `defaultRolloutResumeDeps` 同口径）。
  */
-import { db } from "../db.ts";
-import { getOrchestrator } from "./relay-wiring.ts";
+import type { Orchestrator, OrchestratorNode } from "./orchestrator.ts";
 import type { ReconcileSink } from "./reconciler.ts";
+
+/* ================================================================== */
+/* DB 投影                                                             */
+/* ================================================================== */
+
+/** 目标池 target（`EgressTarget` 的投影，字段名与 orchestrator 入参一致）。 */
+export interface SinkEgressTarget {
+  host: string;
+  port: number;
+  weight?: number;
+  order_by?: number;
+}
+
+/**
+ * sink 读取的 tunnel 行投影。
+ *
+ * 只声明实际消费的列，因此替身不必实现整张表；生产实现把 Prisma 行
+ * `as unknown as SinkTunnel` 收窄（与 `reconciler.ts` 的 `DesiredTunnel` 同一
+ * 手法：投影形状由消费方定义，DB 侧多出来的列不参与语义）。
+ */
+export interface SinkTunnel {
+  id: number;
+  desired_status: string | null;
+  config_revision: number | null;
+  applied_revision: number | null;
+  apply_status: string | null;
+  apply_error_code: string | null;
+  apply_error: string | null;
+  last_applied_at: Date | null;
+  tunnel_mode: "direct" | "relay" | null;
+  listen_port: number | null;
+  listen_ip: string | null;
+  remote_host: string | null;
+  remote_port: number | null;
+  egress_port: number | null;
+  egress_pool_id: number | null;
+  ingress_node: OrchestratorNode | null;
+  egress_node: (OrchestratorNode & { lb_strategy?: string | null }) | null;
+  egress_pool: { lb_strategy?: string | null; targets: SinkEgressTarget[] } | null;
+}
+
+/** sink 需要的最小 DB 面（Prisma 子集；替身只实现这两个方法）。 */
+export interface ReconcileSinkDb {
+  tunnel: {
+    findUnique(args: unknown): Promise<unknown>;
+    updateMany(args: unknown): Promise<unknown>;
+  };
+}
+
+/**
+ * sink 的 IO 接缝：读 desired 行 + **CAS 推进 applied 记账**。
+ *
+ * `markApplied` 返回 `false` 表示 CAS 未命中（desired 已改变或已被别的写入者
+ * 记账）。这不是错误——本轮下发结果自然过期，下一轮按新的 `config_revision`
+ * 收敛即可，所以 sink 不因此抛错（抛错会被 reconciler 记成 `failed`，把一次
+ * 正常的并发编辑伪装成下发故障）。
+ */
+export interface ReconcileSinkLedger {
+  loadTunnel(tunnelId: number): Promise<SinkTunnel | null>;
+  markApplied(input: { tunnelId: number; revision: number; at: Date }): Promise<boolean>;
+}
 
 function firstHost(raw: string | null): string {
   return String(raw ?? "").split(",").map((x) => x.trim()).find(Boolean) ?? "";
@@ -18,14 +105,32 @@ function nextHop(host: string, port: number): string {
   return `${h}:${port}`;
 }
 
-export function createRuntimeReconcileSink(): ReconcileSink {
-  return {
-    async resendSameRevision({ tunnel_id, revision }) {
-      const orchestrator = getOrchestrator();
-      if (!orchestrator) throw new Error("v3 orchestrator is unavailable");
+/* ================================================================== */
+/* 生产 ledger（懒加载 Prisma）                                          */
+/* ================================================================== */
 
+/** 懒加载 Prisma，避免「只 import 本模块」的单测连库。 */
+async function prismaDb(): Promise<ReconcileSinkDb> {
+  const { db } = await import("../db.ts");
+  return db as unknown as ReconcileSinkDb;
+}
+
+/**
+ * 建一个 ledger。测试可传入替身 db（`tunnel.findUnique` / `tunnel.updateMany`）。
+ *
+ * `markApplied` 的 where 是本修复的**并发正确性核心**：
+ * `config_revision = 本次重发的 revision` 保证「重发期间用户又编辑过」时不会
+ * 把旧版本的 ACK 记到新 desired 头上；`OR [applied_revision = null,
+ * applied_revision < revision]` 是幂等闸门——`NULL` 必须显式列出（SQL 的
+ * `<` 对 NULL 求值为 NULL，只写 `lt` 会漏掉「从未 ACK」的行，
+ * `reconciler.isRevisionBehind()` 恰好把 `null` 判为落后）。
+ */
+export function createTunnelLedger(loadDb: () => Promise<ReconcileSinkDb> = prismaDb): ReconcileSinkLedger {
+  return {
+    async loadTunnel(tunnelId: number): Promise<SinkTunnel | null> {
+      const db = await loadDb();
       const tunnel = await db.tunnel.findUnique({
-        where: { id: tunnel_id },
+        where: { id: tunnelId },
         include: {
           ingress_node: true,
           egress_node: true,
@@ -39,6 +144,65 @@ export function createRuntimeReconcileSink(): ReconcileSink {
           },
         },
       });
+      return (tunnel as SinkTunnel | null) ?? null;
+    },
+
+    async markApplied({ tunnelId, revision, at }): Promise<boolean> {
+      const db = await loadDb();
+      const res = await db.tunnel.updateMany({
+        where: {
+          id: tunnelId,
+          config_revision: revision,
+          OR: [{ applied_revision: null }, { applied_revision: { lt: revision } }],
+        },
+        data: {
+          applied_revision: revision,
+          apply_status: "active",
+          apply_error_code: null,
+          apply_error: null,
+          last_applied_at: at,
+        },
+      });
+      return Number((res as { count?: number } | null)?.count ?? 0) === 1;
+    },
+  };
+}
+
+/* ================================================================== */
+/* Sink                                                                */
+/* ================================================================== */
+
+/** 下发通道（只要 orchestrator 的三个 dispatch 方法，便于替身收窄）。 */
+export type SinkOrchestrator = Pick<
+  Orchestrator,
+  "dispatchDirect" | "dispatchEgress" | "dispatchIngress"
+>;
+
+export interface RuntimeReconcileSinkDeps {
+  ledger?: ReconcileSinkLedger;
+  /** 控制面接线；返回 null = 未接线（抛错让 reconciler 记 `failed`）。 */
+  orchestrator?: () => SinkOrchestrator | null;
+  now?: () => Date;
+}
+
+/** 懒加载 relay-wiring：顶层 import 会连带 eager 建 Redis/Prisma 连接。 */
+async function lazyOrchestrator(): Promise<SinkOrchestrator | null> {
+  const { getOrchestrator } = await import("./relay-wiring.ts");
+  return getOrchestrator();
+}
+
+export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}): ReconcileSink {
+  const ledger = deps.ledger ?? createTunnelLedger();
+  const injectedOrchestrator = deps.orchestrator;
+  const now = deps.now ?? (() => new Date());
+
+  return {
+    async resendSameRevision({ tunnel_id, revision }) {
+      // 注入优先（测试/替身）；未注入才走进程级 relay-wiring 单例。
+      const orchestrator = injectedOrchestrator ? injectedOrchestrator() : await lazyOrchestrator();
+      if (!orchestrator) throw new Error("v3 orchestrator is unavailable");
+
+      const tunnel = await ledger.loadTunnel(tunnel_id);
       if (!tunnel) throw new Error(`tunnel ${tunnel_id} not found`);
       if (tunnel.desired_status !== "active") return;
       if ((tunnel.config_revision ?? 0) !== revision) {
@@ -64,6 +228,8 @@ export function createRuntimeReconcileSink(): ReconcileSink {
           listenHost: tunnel.listen_ip,
         });
         if (!r.ok) throw new Error(r.error);
+        // ACK 已确认这个 revision 在 Agent 上生效 ⇒ 记账（见文件头「缺陷 1」）。
+        await ledger.markApplied({ tunnelId: tunnel.id, revision, at: now() });
         return;
       }
 
@@ -100,6 +266,11 @@ export function createRuntimeReconcileSink(): ReconcileSink {
         nextHop: nextHop(host, tunnel.egress_port),
       });
       if (!ingress.ok) throw new Error(ingress.error);
+
+      // RELAY 要**两侧都 ACK** 才算这个 revision 应用成功（与 §13.3.5 的
+      // CUTOVER 判定同源：入口切断就绪前不能宣称 applied；半途失败不记账，
+      // 下一轮重发同一 revision，Agent 对等版本回 duplicate，天然幂等）。
+      await ledger.markApplied({ tunnelId: tunnel.id, revision, at: now() });
     },
   };
 }

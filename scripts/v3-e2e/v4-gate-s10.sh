@@ -538,10 +538,18 @@ if [[ "$(docker inspect -f '{{.State.Paused}}' "$AGENT_C" 2>/dev/null)" == "true
 
   # After unpause the pending revision must converge by itself (resumeRollouts /
   # reconciler), proving recovery rather than a stuck base.
-  # The wait is long on purpose: the control plane first waits for the outbound
-  # ACK timeout, parks the rollout in waiting, then resumeRollouts replays the
-  # same revision after the Agent comes back. A short window would misclassify a
-  # healthy recovery as LIMITED.
+  #
+  # Convergence has TWO durable witnesses and both must settle before this gate
+  # declares success:
+  #   1. tunnel.applied_revision == tunnel.config_revision (runtime truth), and
+  #   2. the matching forward_rollout row reaches phase=done (workflow ledger).
+  #
+  # Reconciler may confirm the Agent ACK and advance applied_revision a few
+  # seconds before resumeRollouts closes a previously waiting rollout. Breaking
+  # as soon as (1) becomes true races the 20s rollout quiet-period / 30s worker
+  # cadence and produces a false S10.48 failure ("applied is current, phase is
+  # still waiting"). Keep polling until BOTH witnesses converge, or the full
+  # 180s window expires.
   REC_MARK=""
   REC_CFG=""
   REC_APPLIED=""
@@ -551,17 +559,18 @@ if [[ "$(docker inspect -f '{{.State.Paused}}' "$AGENT_C" 2>/dev/null)" == "true
     REC_CFG=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
     REC_APPLIED=$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
     REC_TERM=$(mysqlc "SELECT IFNULL(phase,'') FROM forward_rollout WHERE tunnel_id=$FORWARD_ID AND revision=$REC_CFG ORDER BY id DESC LIMIT 1;")
-    [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" ]] && break
+    [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" && "$REC_TERM" == "done" ]] && break
     sleep 2
   done
-  if [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" ]]; then
-    ok "S10.47 unpause 后 rollout 自行收敛（rev $P3_DB_CFG -> $REC_APPLIED，终态 $REC_TERM）"
+  if [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" && "$REC_TERM" == "done" ]]; then
+    ok "S10.47 unpause 后 runtime 与 rollout ledger 均自行收敛（rev $P3_DB_CFG -> $REC_APPLIED）"
     assert_eq "$REC_TERM" "done" "S10.48 收敛后的 rollout 行 phase=done"
+  elif [[ "$REC_APPLIED" == "$REC_CFG" && "$REC_APPLIED" -gt "$P3_DB_CFG" ]]; then
+    # Runtime 已确认最新 revision，但 180s 后 rollout 仍未闭环，这才是 S10.48
+    # 真正要抓的产品缺陷；不能在 applied_revision 刚前进的瞬间就提前失败。
+    DEFECT "S10.48" "runtime 已收敛到 revision $REC_CFG，但 matching rollout 在 180s 后仍为 phase=$REC_TERM；workflow ledger 没有闭环"
   else
-    # Observed in this slice's run: the ledger ends 'degraded' (applied stays
-    # behind config) while the Agent log proves the target swap DID take
-    # effect. That is a real backend finding, not a harness limitation, so it
-    # is recorded as DEFECT with both sides of the evidence quoted.
+    # Ledger/runtime 都没在窗口内收敛：保留原有证据分类。
     AGENT_SWAPPED=$(docker logs --tail 300 "$AGENT_C" 2>&1 | grep -c "hot-swap" || true)
     limited "S10.47 unpause 后未在 180s 内自行收敛（applied=$REC_APPLIED cfg=$REC_CFG phase=$REC_TERM 端口 $NEW_PORT marker=$REC_MARK）"
     if [[ "$REC_TERM" == "degraded" ]]; then
