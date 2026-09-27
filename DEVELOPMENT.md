@@ -1609,27 +1609,34 @@ V4-WP7  Node Lifecycle Product UX             ✅ main
 V4-WP8  Monitoring & Actionable Diagnostics   ✅ main
 V4-WP9  Scale & Interaction Polish            ✅ main
 
-Gate F2 Managed Node Lifecycle + Telemetry     🟡 正式收口中
-Gate F3 Monitoring / Scale / UX Complete      🟡 功能已进 main，正式 Gate 待关闭
+Gate F2 Managed Node Lifecycle + Telemetry     ✅ 完成
+Gate F3 Monitoring / Scale / UX Complete      ✅ 完成
 
-V4-WP10 Authorization + NodeGroup Model       ⏸️ blocked by F2/F3
-V4-WP11 Stable / Ops Hardening                ⏸️ 未开始
+V4-WP10 Authorization + NodeGroup Model       🟢 NEXT
+V4-WP11 Stable / Ops Hardening                ⏸️ blocked by F4
 ```
 
 **2026-09-28 主线状态：**
 
-- PR #23 的 reconcile / `applied_revision` 收敛修复已合入 `main`，当前主线
-  HEAD `c64fc13`；
-- 该提交对应的 **CI → Integration → Release 全部成功**；
-- V4 interruption/recovery S10 已验证 Agent pause → desired revision 前进 →
-  unpause → runtime ledger 与 rollout ledger 都自行收敛，最新证据为
+- PR #23 的 reconcile / `applied_revision` 收敛修复已进入 main，S10 双账本收敛证据为
   **PASS=58 / FAIL=0 / LIMITED=0 / DEFECT=0**；
-- WP5～WP9 的主体代码已经进入 main，不能再把“当前开发游标”写成 WP5 NEXT；
-- Gate V4-F2 仍有一项明确收尾：`feature/v4-f2-role-impact-fail-closed`
-  需要更新到最新 main、重新跑完整 CI/Integration，并纳入 F2 lifecycle 场景；
-- Gate V4-F3 需要把已经进入 main 的 Monitoring / Scale / UX 功能用正式 Gate
-  证据闭环，而不是用“代码已合并”替代 Gate；
-- **V4-WP10 在 F1～F3 全绿之前不得启动。**
+- PR #25 的 role / port-range impact fail-closed 修复已进入 main；
+- PR #26（head `62cadf4`，merge `e99ddb6`）把 F2/F3 正式 Gate 接入 Integration；
+- PR #26 **CI #36340990649：success**；
+- PR #26 **Integration #36340990654：success**；
+- 同一 Integration 的完整证据：
+  - v3 verify：**PASS=51 / FAIL=0**；
+  - V4 rollout：**PASS=30 / FAIL=0**；
+  - V4 REST：**PASS=64 / FAIL=0 / DEFECT=0**；
+  - V4 S10 interruption/recovery：**PASS=58 / FAIL=0 / LIMITED=0 / DEFECT=0**；
+  - V4-F1 topology：**PASS=31 / FAIL=0**；
+  - **V4-F2 managed-node closure：PASS=37 / FAIL=0**；
+  - **V4-F3 product closure：PASS=21 / FAIL=0**；
+  - unified image build / smoke / Compose validation：success。
+- 因此 **Gate V4-F2 与 Gate V4-F3 正式关闭**，V4.2 / V4.3 完成；
+- F1～F3 已全绿，**V4-WP10 Authorization + NodeGroup Model 解除阻塞，成为当前 NEXT**；
+- 高级协议、target intelligence、HA/failover、multi-hop、federation 等不进入 V4，
+  已统一迁入第 14 节 **V5 Roadmap**。
 
 **2026-09-26 V4.1 / Gate V4-F1 最终收口：✅**
 
@@ -1646,7 +1653,7 @@ PR #22 的最后一个代码承载 head `7836d20` 已通过 **CI #439** 与
   **DIRECT→RELAY、RELAY 更换 Egress、RELAY→DIRECT、Ingress migration**，并同时断言
   runtime 退场、Binding、NodePortLease 唯一性和最终 ledger 收敛。
 
-至此 V4.1 正式完成；当前主线任务是 **关闭 V4-F2 / V4-F3，再进入 WP10**。
+至此 V4.1 正式完成；截至 2026-09-28，V4-F2 / V4-F3 也已关闭，当前主线任务进入 **V4-WP10**。
 
 ### Compatibility API（P1）
 
@@ -1681,8 +1688,8 @@ V4 后续开发、分支、PR 和合并判断以第 13 节的 Work Package、并
 |---|---|---|---|
 | **V4.0** | Node + Forward 产品入口收敛 | 已完成 | ✅ |
 | **V4.1** | Forward 全字段编辑 + Agent 热重载 | V4-WP1～WP4 | ✅ Gate V4-F1 |
-| **V4.2** | 托管 Node 生命周期 + Agent 状态监控 | V4-WP5～WP7 | Gate V4-F2 |
-| **V4.3** | Dashboard / 诊断 / 列表规模化 / 交互补全 | V4-WP8～WP9 | Gate V4-F3 |
+| **V4.2** | 托管 Node 生命周期 + Agent 状态监控 | V4-WP5～WP7 | ✅ Gate V4-F2 |
+| **V4.3** | Dashboard / 诊断 / 列表规模化 / 交互补全 | V4-WP8～WP9 | ✅ Gate V4-F3 |
 | **V4.4** | 权限模型 + NodeGroup 最终语义 | V4-WP10 | Gate V4-F4 |
 | **V4.5** | Agent 耐久性 / 运维升级 / 诊断闭环 + 稳定版、兼容与发布收尾 | V4-WP11 | Gate V4-F5 |
 
@@ -2096,20 +2103,22 @@ Gate V4-F2 至少验证：
 - role/port-range 修改 impact check；
 - state report / health / version / runtime/port facts 正确。
 
-**当前状态（2026-09-28）：WP5～WP7 已进 main，但 F2 尚未正式关闭。**
+**当前状态（2026-09-28）：WP5～WP7 已进 main，Gate V4-F2 已正式关闭（PASS=37 / FAIL=0）。**
 
-F2 收口顺序固定：
+F2 closure 已按既定顺序完成：
 
 ```text
-同步 feature/v4-f2-role-impact-fail-closed 到最新 main
-→ role/port-range impact fail-closed CI + Integration
-→ lifecycle exact-scenario Gate
-→ Agent reinstall identity scenario
-→ state report / health facts assertions
+role/port-range impact fail-closed
+→ waiting / online / offline
+→ maintenance latest-revision convergence
+→ disabled admission rejection
+→ retiring dependency/delete gate
+→ reinstall preserves agent_id / Node / Forward
+→ state report / health / version / runtime / port facts
 → Gate V4-F2 = green
 ```
 
-不得因为 WP5～WP7 已 merge 就跳过 exact-scenario Gate。
+最终真实 Integration：**PASS=37 / FAIL=0**。
 
 #### Wave 4 — Product Polish
 
@@ -2130,7 +2139,7 @@ V4-WP9 Scale/Interaction
 - Binding 删除前显示使用量；
 - Tunnel 术语从普通用户文案中清理。
 
-**当前状态（2026-09-28）：WP8 / WP9 已进 main，F3 需要单独 Gate closure。**
+**当前状态（2026-09-28）：WP8 / WP9 已进 main，Gate V4-F3 已正式关闭（PASS=21 / FAIL=0）。**
 
 F3 不重复证明 F1/F2 的 runtime 正确性，重点验证产品闭环：
 
@@ -2141,9 +2150,13 @@ F3 不重复证明 F1/F2 的 runtime 正确性，重点验证产品闭环：
 - 普通产品页面不依赖 raw revision 才能理解当前状态；
 - 真实 Integration 拿到的最终访问地址与数据面一致。
 
+F3 closure 使用真实产品 API 验证了分页/跨页稳定排序、mode/egress 筛选、Binding usage + 409、
+auto-port 最终地址真实数据面、batch suspend/resume、Dashboard attention 与 summary，
+最终 **PASS=21 / FAIL=0**。
+
 #### Wave 5 — Permission / NodeGroup
 
-只有 Gate V4-F1～F3 全绿后启动 V4-WP10。
+Gate V4-F1～F3 已全绿；**V4-WP10 现已解除阻塞并成为当前开发入口。**
 
 顺序固定：
 
@@ -2257,8 +2270,8 @@ Gate V4-F5 通过后才标记 V4.5 stable。
 ```text
 Gate V4-F0  Product / Team Contract Frozen          ← V4-WP0
 Gate V4-F1  Forward Fully Editable + Hot Reload     ← WP1–WP4  ✅
-Gate V4-F2  Managed Node Lifecycle + Telemetry      ← WP5–WP7
-Gate V4-F3  Monitoring / Scale / UX Complete        ← WP8–WP9
+Gate V4-F2  Managed Node Lifecycle + Telemetry      ← WP5–WP7  ✅
+Gate V4-F3  Monitoring / Scale / UX Complete        ← WP8–WP9  ✅
 Gate V4-F4  Authorization / NodeGroup Model Stable  ← WP10
 Gate V4-F5  Durability / Diagnostics / Ops / Compatibility Stable ← WP11
 ```
@@ -2319,8 +2332,8 @@ Tests / Real E2E:
 - WireGuard / mimic 类额外数据面；
 - Plugin Store / 移动端等非核心产品面。
 
-V4-WP11 可以增加 **target health / latency 的诊断观测**，但不能借诊断之名提前实现
-automatic failover。高级网络能力统一进入 V5。除非某能力是
+V4-WP11 只允许一次性 Diagnose probe 返回目标可达性/延迟事实；**持续 target health /
+latency observation、circuit breaker 与 automatic failover 全部属于 V5**。高级网络能力统一进入 V5。除非某能力是
 Forward 编辑、Node 生命周期或稳定性 Gate 的阻断项，否则不得抢占 V4-F2～F5 的主线资源。
 
 ### 13.11 外部参考项目吸收规则
