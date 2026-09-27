@@ -27,7 +27,14 @@
  * {@link NodeAdminDeps} 覆盖，测试直接把内存替身传进去，**不需要
  * mock.module**（那个会随 worktree / CI 路径静默打歪）。
  */
-import { db } from "../db.ts";
+import {
+  checkRoleChange,
+  getNodeImpact,
+  listActiveLeasePorts,
+  type LifecycleConditionCode,
+  type LifecycleDb,
+  type NodeImpact,
+} from "./node-lifecycle.ts";
 
 /* ================================================================== */
 /* 常量                                                                */
@@ -94,6 +101,16 @@ export interface NodeAdminError {
   ok: false;
   code: NodeAdminErrorCode;
   message: string;
+  /**
+   * 运行条件拒绝码（§13.5「必须使用可区分的错误码，Web 才能给用户正确下一步」）。
+   *
+   * 只有「依赖未清 / 收缩被阻止」这类条件拒绝才带：取值与
+   * `GET /api/admin/node/:id/impact` 预检的 `role_check.condition` **同源**
+   * （同一个 {@link checkRoleChange} 返回的 condition 原样透传）。
+   */
+  condition?: LifecycleConditionCode;
+  /** 被拒时的依赖清单（与 impact 预检同一形状），Web 可直接渲染「要清什么」。 */
+  dependencies?: NodeImpact;
 }
 
 function err(code: NodeAdminErrorCode, message: string): NodeAdminError {
@@ -206,6 +223,23 @@ export interface NodeAdminDb {
     count(args: unknown): Promise<unknown>;
     findMany(args: unknown): Promise<unknown>;
   };
+  /** impact 统计需要（与 node-lifecycle 的 `getNodeImpact` 同一组计数）。 */
+  nodeBinding: {
+    count(args: unknown): Promise<unknown>;
+  };
+  nodePortLease: {
+    count(args: unknown): Promise<unknown>;
+    findMany(args: unknown): Promise<unknown>;
+  };
+  /**
+   * 事务接缝（prisma 的 `$transaction` 满足之）。
+   *
+   * 省略 = 内存替身：守卫与写入仍按同一顺序执行，只是拿不到行锁
+   * （离线单测用；见 `inNodeRoleTx`）。
+   */
+  $transaction?<T>(fn: (tx: NodeAdminDb) => Promise<T>): Promise<T>;
+  /** 行锁接缝（prisma 的 `$queryRaw` 满足之）：`SELECT ... FOR UPDATE`。 */
+  $queryRaw?(strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown>;
 }
 
 export interface NodeAdminDeps {
@@ -214,12 +248,31 @@ export interface NodeAdminDeps {
   now?: () => Date;
 }
 
-function deps(over: NodeAdminDeps | undefined): { db: NodeAdminDb; now: () => Date } {
-  return { db: over?.db ?? defaultDb, now: over?.now ?? (() => new Date()) };
+/**
+ * 解析本模块的依赖（惰性 `db`）。
+ *
+ * 不能用模块级 `const defaultDb = db`：`db.ts` 在加载期就 new PrismaClient()
+ * （读 DATABASE_URL），顶层绑定会把**真实** client 冻在模块作用域里——测试
+ * 若在其后注册 `mock.module("../db.ts")` 替身就永远打不进去（路由路径没有
+ * inject 参数，只能走 default），用例会以 `db_unavailable` 收尾。
+ * `services/node-lifecycle.ts` 的 `loadDefaultDb()` 记录了同一个坑。
+ */
+async function deps(over: NodeAdminDeps | undefined): Promise<{ db: NodeAdminDb; now: () => Date }> {
+  const now = over?.now ?? (() => new Date());
+  if (over?.db) return { db: over.db, now };
+  return { db: (await loadDefaultDb()), now };
 }
 
-/** 进程级默认依赖（路由直接用）。 */
-const defaultDb = db as unknown as NodeAdminDb;
+/**
+ * 惰性解析的进程级 `db` 单例：首次调用时才 import，替身因此能先注册。
+ * 缓存的是 Promise（并发首调用只 import 一次）。
+ */
+let defaultDbPromise: Promise<NodeAdminDb> | undefined;
+
+function loadDefaultDb(): Promise<NodeAdminDb> {
+  defaultDbPromise ??= import("../db.ts").then((m) => m.db as unknown as NodeAdminDb);
+  return defaultDbPromise;
+}
 
 /** 把一行 unknown 收窄成行类型（DB 返回值只有调用方知道形状）。 */
 function asRow<T>(row: unknown): T | null {
@@ -516,6 +569,86 @@ export async function resolveNodeId(
 /* Node role 管理                                                      */
 /* ================================================================== */
 
+/**
+ * 角色 / 端口区间写入的**唯一**依赖判定入口（§13.4.3）。
+ *
+ * 判定与统计一行都不在本文件重写：直接复用 `services/node-lifecycle.ts` 的
+ * `getNodeImpact` / `listActiveLeasePorts` / `checkRoleChange` —— 与
+ * `GET /api/admin/node/:id/impact` 预检是**同一套口径**。
+ *
+ * V4-F2 的缺陷正是两者的漂移：预检用 `checkRoleChange` 判「不许收缩」，而写路径
+ * 只查了出口池计数就落库 → 预检拒绝、PATCH 却 200 且 DB 已改。所以这里不新增
+ * 第二套规则，只把同一个判定接到写路径上。
+ *
+ * 返回 null = 放行；否则 409 + `condition` + 依赖清单（§13.5 可区分错误码）。
+ */
+async function guardNodeRoleChange(
+  pd: NodeAdminDb,
+  node: NodeRow,
+  input: {
+    roleGiven: boolean;
+    nextRole: NodeRoleValue | null;
+    rangeGiven: boolean;
+    nextRange: { min: number; max: number } | null;
+  },
+): Promise<NodeAdminError | null> {
+  const lifecycleDb = pd as unknown as LifecycleDb;
+  const impactResult = await getNodeImpact(node.id, { db: lifecycleDb });
+  // 统计失败一律 fail-closed：看不见依赖时不许收缩（宁可 503 也不落库）。
+  if (!impactResult.ok) return err("db_unavailable", "节点依赖统计失败，已拒绝本次修改");
+
+  const verdict = checkRoleChange({
+    node: { id: node.id, role: node.role },
+    impact: impactResult.impact,
+    check: {
+      // 角色键缺失 = 本次不改角色 → 沿用当前角色参与判定；
+      // 显式清空（null / ""）传空串，与预检 `?next_role=`（空值）同义：
+      // 入口与出口能力都丢，仍需依赖为空才允许。
+      nextRole: input.roleGiven ? (input.nextRole ?? "") : undefined,
+      // 端口区间键缺失 = 区间不变 → 不可能新增悬空（portRangeWouldOrphan 对
+      // null/undefined 返回 []）。给了才查租约，省一次查询。
+      nextPortRange: input.rangeGiven ? input.nextRange : undefined,
+      activeLeasePorts: input.rangeGiven
+        ? await listActiveLeasePorts(node.id, { db: lifecycleDb })
+        : [],
+    },
+  });
+  if (verdict.ok) return null;
+  return {
+    ok: false,
+    code: "invalid_state",
+    message: verdict.message,
+    condition: verdict.condition,
+    dependencies: impactResult.impact,
+  };
+}
+
+/**
+ * 把「依赖判定 + 写入」收进**同一个事务**，并先锁住 node 行
+ * （`SELECT id FROM node WHERE id = ? FOR UPDATE`）。
+ *
+ * 为什么锁 node 行就够（无需改 forward-service / portPool）：
+ * `tunnel.ingress_node_id` / `tunnel.egress_node_id` / `node_port_lease.node_id`
+ * 都是指向 `node` 的外键，InnoDB 在插入子行时会对该父行加共享锁；本事务持排他锁
+ * 期间，并发的 Forward / 租约插入会阻塞到提交，因此锁内统计出的依赖清单在写入前
+ * 不会再被改变（防 TOCTOU）。同一把锁也串行化同一节点的并发角色/区间修改。
+ *
+ * 省略事务接缝（内存替身）= 顺序执行同一套判定与写入，只是没有行锁。
+ */
+async function inNodeRoleTx<T>(
+  pd: NodeAdminDb,
+  nodeId: number,
+  run: (tx: NodeAdminDb) => Promise<T>,
+): Promise<T> {
+  const begin = pd.$transaction?.bind(pd);
+  if (!begin) return run(pd);
+  return begin(async (tx: NodeAdminDb) => {
+    const raw = tx.$queryRaw?.bind(tx);
+    if (raw) await raw`SELECT id FROM node WHERE id = ${nodeId} FOR UPDATE`;
+    return run(tx);
+  });
+}
+
 export interface UpdateNodeRoleInput {
   /** `null` / "" = 显式清空角色（回到「尚未声明」）。 */
   role?: unknown;
@@ -527,7 +660,10 @@ export interface UpdateNodeRoleInput {
 /**
  * 更新节点角色（+ 可选的端口区间 / 默认出口策略）。
  *
- * 三条守卫，按顺序：
+ * 守卫，按顺序：
+ *   0. **依赖收缩必须先过 impact check**（§13.4.3，见 {@link guardNodeRoleChange}）：
+ *      丢掉入口/出口能力却仍有 Forward 用它，或端口区间收缩会让 active 租约悬空
+ *      → 409 + condition，**不落库**。判定与 `GET /node/:id/impact` 预检同源。
  *   1. **丢掉出口能力前必须先把池清干净**：ingress 节点上的出口池不会跟着
  *      角色消失，留着 = 「以为在跑出口其实没有出口能力」；要删池请显式走
  *      {@link deleteEgressPool}（它自己会检查是否被隧道引用）。
@@ -536,6 +672,9 @@ export interface UpdateNodeRoleInput {
  *      幂等（唯一冲突 = 别人已建好，视为成功）。
  *   3. 端口区间同 portPool 语义：未配置 = 没有 v3 端口域，不回落节点组
  *      `port_range`。
+ *
+ * 上面所有读取与写入都在**同一个事务 + node 行锁**里完成（{@link inNodeRoleTx}），
+ * 否则「判定通过」与「落库」之间会被并发创建的 Forward 插空档。
  */
 export async function updateNodeRole(
   nodeId: number,
@@ -545,8 +684,38 @@ export async function updateNodeRole(
   | { ok: true; node: NodeRow; default_pool_created: boolean }
   | NodeAdminError
 > {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
+  // 入参校验是纯函数，先做完再进事务（不必占着行锁做 400）。
+  const roleParsed = parseNodeRole(input.role);
+  if (!roleParsed.ok) return err("invalid_input", roleParsed.message);
+  const rangeParsed = parsePortRange(input.portRangeMin, input.portRangeMax);
+  if (!rangeParsed.ok) return err("invalid_input", rangeParsed.message);
+  const lbParsed = parseLbStrategy(input.lbStrategy);
+  if (!lbParsed.ok) return err("invalid_input", lbParsed.message);
+
+  try {
+    return await inNodeRoleTx(pd, nodeId, (tx) => applyNodeRoleChange(tx, nodeId, input));
+  } catch (e) {
+    return toAdminError(e, "节点更新失败");
+  }
+}
+
+/**
+ * {@link updateNodeRole} 的守卫 + 落库主体。
+ *
+ * `pd` 由调用方传入（生产 = 事务客户端 `tx`，测试 = 内存替身），因此这里的每一次
+ * count / findFirst / update 都落在**同一个事务**里：守卫读到的依赖与最终写入之间
+ * 不存在可被并发插入的空档。
+ */
+async function applyNodeRoleChange(
+  pd: NodeAdminDb,
+  nodeId: number,
+  input: UpdateNodeRoleInput,
+): Promise<
+  | { ok: true; node: NodeRow; default_pool_created: boolean }
+  | NodeAdminError
+> {
   const roleParsed = parseNodeRole(input.role);
   if (!roleParsed.ok) return err("invalid_input", roleParsed.message);
   const rangeParsed = parsePortRange(input.portRangeMin, input.portRangeMax);
@@ -557,7 +726,13 @@ export async function updateNodeRole(
   const node = asRow<NodeRow>(await pd.node.findUnique({ where: { id: nodeId } }));
   if (!node) return err("not_found", "节点不存在");
 
-  const nextRole = roleParsed.value;
+  // 角色键缺失 = 本次不改角色（只改区间/策略）→ 沿用当前 role 参与守卫判定；
+  // 显式 `null`/"" = 清空角色。二者必须可区分：把「没给 role」当成「清空 role」
+  // 会让只改 lb_strategy 的请求被误判成丢掉入口能力（既有缺口），
+  // 也会误建 default 池。持久化仍只认 `input.role !== undefined`（见下）。
+  // `node.role` 来自 DB 的 `NodeRole?` 枚举，这里按枚举收窄（null = 尚未声明）。
+  const currentRole = (node.role ?? null) as NodeRoleValue | null;
+  const nextRole: NodeRoleValue | null = input.role !== undefined ? roleParsed.value : currentRole;
   const gainingEgress = hasEgressCapability(nextRole) && !hasEgressCapability(node.role);
   const losingEgress = !hasEgressCapability(nextRole) && hasEgressCapability(node.role);
 
@@ -570,6 +745,24 @@ export async function updateNodeRole(
         `该节点还有 ${poolCount} 个出口池，请先删除出口池再取消出口角色`,
       );
     }
+  }
+
+  // 守卫 2（§13.4.3）：角色 / 端口区间的**依赖收缩**必须先过 impact check，
+  // 与 `GET /admin/node/:id/impact` 预检同源（同一个 checkRoleChange）。拒绝即
+  // 返回，绝不落库——这正是 V4-F2 里「预检拒绝、PATCH 却 200」的缺口。
+  //
+  // 两个键都没给（例如只改 lb_strategy）时不可能收缩依赖，连统计都不做：
+  // 否则一次无关改动会因为「统计暂时查不动」被 503 掉。
+  const roleGiven = input.role !== undefined;
+  const rangeGiven = input.portRangeMin !== undefined || input.portRangeMax !== undefined;
+  if (roleGiven || rangeGiven) {
+    const blocked = await guardNodeRoleChange(pd, node, {
+      roleGiven,
+      nextRole,
+      rangeGiven,
+      nextRange: rangeParsed.value,
+    });
+    if (blocked) return blocked;
   }
 
   const data: Record<string, unknown> = {};
@@ -592,7 +785,7 @@ export async function updateNodeRole(
     return toAdminError(e, "节点更新失败");
   }
 
-  // 守卫 2：刚获得出口能力 → 补 default 池（幂等）。
+  // 守卫 3：刚获得出口能力 → 补 default 池（幂等）。
   let defaultPoolCreated = false;
   if (gainingEgress) {
     const existing = asRow<{ id: number }>(
@@ -645,7 +838,7 @@ export async function getNodeDetail(
   nodeId: number,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; detail: NodeDetailResult } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
   const node = asRow<NodeRow>(
     await pd.node.findUnique({
       where: { id: nodeId },
@@ -700,7 +893,7 @@ export async function createEgressPool(
   input: CreatePoolInput,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; pool: EgressPoolRow } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const nameParsed = parsePoolName(input.name);
   if (!nameParsed.ok) return err("invalid_input", nameParsed.message);
@@ -755,7 +948,7 @@ export async function updateEgressPool(
   input: UpdatePoolInput,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; pool: EgressPoolRow } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const pool = asRow<EgressPoolRow>(await pd.egressPool.findUnique({ where: { id: poolId } }));
   if (!pool) return err("not_found", "出口池不存在");
@@ -820,7 +1013,7 @@ export async function deleteEgressPool(
   poolId: number,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; deleted: boolean } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const pool = asRow<EgressPoolRow>(await pd.egressPool.findUnique({ where: { id: poolId } }));
   if (!pool) return err("not_found", "出口池不存在");
@@ -847,7 +1040,7 @@ export async function listEgressPools(
   options: { nodeId?: number | null; includeTargets?: boolean } = {},
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; pools: EgressPoolRow[]; total: number } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
   const where = options.nodeId ? { node_id: options.nodeId } : {};
   const pools = asRows<EgressPoolRow>(
     await pd.egressPool.findMany({
@@ -931,7 +1124,7 @@ export async function createTarget(
   input: TargetInput,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; target: EgressTargetRow } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const parsed = parseTargetInput(input);
   if (!parsed.ok) return err("invalid_input", parsed.message);
@@ -976,7 +1169,7 @@ export async function updateTarget(
   input: TargetInput,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; target: EgressTargetRow } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const parsed = parseTargetInput(input, { partial: true });
   if (!parsed.ok) return err("invalid_input", parsed.message);
@@ -1056,7 +1249,7 @@ export async function deleteTarget(
   targetId: number,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; deleted: boolean } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const existing = asRow<EgressTargetRow>(
     await pd.egressTarget.findUnique({ where: { id: targetId } }),
@@ -1090,7 +1283,7 @@ export async function listTargets(
   options: { poolId?: number | null } = {},
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; targets: EgressTargetRow[]; total: number } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
   const where = options.poolId ? { pool_id: options.poolId } : {};
   const targets = asRows<EgressTargetRow>(
     await pd.egressTarget.findMany({
@@ -1115,7 +1308,7 @@ export async function replaceTargets(
   inputs: unknown[],
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; targets: EgressTargetRow[] } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
 
   const pool = asRow<EgressPoolRow>(await pd.egressPool.findUnique({ where: { id: poolId } }));
   if (!pool) return err("not_found", "出口池不存在");
@@ -1285,7 +1478,7 @@ export async function getNodeState(
   nodeId: number,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; state: NodeStateView } | NodeAdminError> {
-  const { db: pd, now } = deps(inject);
+  const { db: pd, now } = await deps(inject);
 
   const node = asRow<NodeRow>(
     await pd.node.findUnique({
@@ -1380,7 +1573,7 @@ export async function listNodeStates(
   options: FleetStateOptions = {},
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; states: NodeStateView[]; total: number } | NodeAdminError> {
-  const { db: pd, now } = deps(inject);
+  const { db: pd, now } = await deps(inject);
 
   const roleParsed = parseNodeRole(normalizeRoleQuery(options.role));
   if (!roleParsed.ok) return err("invalid_input", roleParsed.message);
@@ -1465,7 +1658,7 @@ export async function listNodeStatesWithCredentials(
   | { ok: true; items: Array<NodeStateView & { credential: NodeCredentialState }>; total: number }
   | NodeAdminError
 > {
-  const { db: pd, now } = deps(inject);
+  const { db: pd, now } = await deps(inject);
 
   const roleParsed = parseNodeRole(normalizeRoleQuery(options.role));
   if (!roleParsed.ok) return err("invalid_input", roleParsed.message);
@@ -1557,7 +1750,7 @@ export async function getNodeCredential(
   nodeId: number,
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; credential: NodeCredentialState } | NodeAdminError> {
-  const { db: pd } = deps(inject);
+  const { db: pd } = await deps(inject);
   const node = asRow<{
     id: number;
     node_id: string;
