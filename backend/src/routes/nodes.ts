@@ -288,6 +288,8 @@ nodesRoutes.get("/:ingressId/forwards", async (c) => {
   if (!ingress) return c.json({ error: "入口节点不存在" }, 404);
 
   const rows = await listForwardsService(ws.id, { ingress_node_id: ingressId });
+  // V4-WP9：兼容端点保持**裸数组**契约（E2E 脚本与旧客户端按数组解析）；
+  // 「取全部」的上限由 `listForwards` 服务层统一施加，这里不重复截断。
   return c.json({ data: rows });
 });
 

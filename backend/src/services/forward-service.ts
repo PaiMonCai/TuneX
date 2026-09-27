@@ -46,6 +46,8 @@ import {
   type TunnelAction,
 } from "./tunnel-api.ts";
 import { nodeAdmission } from "./node-lifecycle.ts";
+import { FORWARD_LIST_MAX_UNPAGED } from "./forward-list-query.ts";
+import type { ForwardPage } from "./forward-list-query.ts";
 
 export type ForwardMode = "direct" | "relay";
 export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
@@ -359,7 +361,16 @@ async function prepareRelayRevisionResources(
   };
 }
 
-export async function listForwards(workspaceId: number, input: ForwardListInput = {}) {
+/**
+ * V4-WP9 §13.6：列表 where 的唯一构造点。
+ *
+ * `listForwards`（兼容裸数组）与 `listForwardsPage`（产品分页端点）共用它，
+ * 否则「筛选口径」会出现两份实现——那是 §13.3.3 明确要消灭的漂移形态。
+ */
+function forwardListWhere(
+  workspaceId: number,
+  input: ForwardListInput,
+): Prisma.TunnelWhereInput {
   const where: Prisma.TunnelWhereInput = {
     workspace_id: workspaceId,
     category: "port_forward",
@@ -375,20 +386,68 @@ export async function listForwards(workspaceId: number, input: ForwardListInput 
 
   const keyword = input.keyword?.trim();
   if (keyword) {
-    where.OR = [
+    const matches: Prisma.TunnelWhereInput[] = [
       { name: { contains: keyword } },
       { remote_host: { contains: keyword } },
       { ingress_node: { node_id: { contains: keyword } } },
       { egress_node: { node_id: { contains: keyword } } },
     ];
+    // 端口也可以直接搜：用户在列表里看到 `:20001` 就会试着粘进来。
+    // 纯数字关键字才加数值条件——否则 `contains` 语义的字符串条件与分析
+    // 目标端口（remote_port）的关系会让「搜 abc」意外匹配端口为 0 的行。
+    const port = Number(keyword);
+    if (Number.isInteger(port) && port > 0) {
+      matches.push({ listen_port: port });
+      matches.push({ remote_port: port });
+    }
+    where.OR = matches;
   }
+  return where;
+}
 
+/**
+ * 「取全部」语义：**上限在服务层**，不在路由层。
+ *
+ * 放在服务层是因为有三个调用方（V4 产品端点的不分页分支、兼容端点
+ * `/api/nodes/:ingressId/forwards`、其它内部消费方），上限写在路由里就会漏。
+ * 一旦需要超过 500 条的完整遍历，应使用 `listForwardsPage` 逐页取，而不是
+ * 把这里的数字调大——无界 `findMany` 是规模化的对立场。
+ */
+export async function listForwards(workspaceId: number, input: ForwardListInput = {}) {
   const rows = await db.tunnel.findMany({
-    where,
+    where: forwardListWhere(workspaceId, input),
     orderBy: [{ order_by: "asc" }, { id: "desc" }],
+    take: FORWARD_LIST_MAX_UNPAGED,
     include: forwardInclude,
   });
   return rows.map(forwardView);
+}
+
+/**
+ * V4-WP9 §13.6：服务端分页 / 排序的 Forward 列表。
+ *
+ * `orderBy` 由 `forward-list-query.ts` 的白名单派生（含 `id desc` 稳定兜底），
+ * 因此路由层不拼列名、前端 mock 与真实后端共用同一套键表。
+ */
+export async function listForwardsPage(
+  workspaceId: number,
+  input: ForwardListInput = {},
+  page: { skip: number; take: number; orderBy: Array<Record<string, "asc" | "desc">> },
+): Promise<ForwardPage<ReturnType<typeof forwardView>>> {
+  const where = forwardListWhere(workspaceId, input);
+  const [rows, total] = await Promise.all([
+    db.tunnel.findMany({
+      where,
+      orderBy: page.orderBy as Prisma.TunnelOrderByWithRelationInput[],
+      skip: page.skip,
+      take: page.take,
+      include: forwardInclude,
+    }),
+    db.tunnel.count({ where }),
+  ]);
+  return { data: rows.map(forwardView), total } as ForwardPage<
+    ReturnType<typeof forwardView>
+  >;
 }
 
 export interface ForwardSummary {
