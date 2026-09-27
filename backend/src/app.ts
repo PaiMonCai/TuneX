@@ -35,6 +35,7 @@ import { workspaceRoutes } from "./routes/workspaces.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { nodeAdminRoutes } from "./routes/node-admin.ts";
 import { nodeLifecycleRoutes } from "./routes/node-lifecycle.ts";
+import { nodeHealthRoutes } from "./routes/node-health.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
@@ -154,6 +155,11 @@ export function createApp() {
   // 高频攻击面，且 409 拒绝本身可挡住误操作重复提交；若后续证明需要更严的用户
   // 维度限额，见 routes/node-lifecycle.ts 顶部「限流」小节的决策记录。
   app.route("/api/admin", nodeLifecycleRoutes);
+  // V4-WP6：管理端 Node health（单节点判定 + 全量巡检）。路径在同前缀下，
+  // 与 WP5 的 lifecycle、WP10 的 state 互不重叠；中间件同样由 §⑥ 统一施加。
+  // health 是**读**接口（判定由 services/node-health.ts 的纯函数给出），
+  // 因此不新增限流规则，走 api-global。
+  app.route("/api/admin", nodeHealthRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 

@@ -34,7 +34,12 @@ import type {
   NodeDetail,
   NodeGroup,
   NodeGroupInput,
+  NodeHealthList,
+  NodeHealthSummary,
+  NodeHealthValue,
+  NodeHealthView,
   NodeInput,
+  NodeLifecycleValue,
   NodeRole,
   NodeStateReport,
   Paginated,
@@ -69,6 +74,7 @@ import type {
   WorkspaceMember,
   WorkspaceTrafficSummary,
 } from "./types";
+import { normalizeHealthSummary } from "./node-health";
 
 export const API_MOCK = process.env.NEXT_PUBLIC_API_MOCK === "1";
 
@@ -142,6 +148,14 @@ export interface RequestOptions {
   cache?: RequestCache;
   /** TEN-01：显式指定作用域工作空间（服务端组件用；缺失时后端回落个人空间 */
   workspaceId?: number;
+  /**
+   * 是否剥掉响应的一层 `{ data }`（默认 true）。
+   *
+   * 只有「信封带旁路字段」的端点才需要 false：通用解包认识 `data`，但会把
+   * `total` / `summary` 一起丢掉（WP6 的 `/admin/node/health` 就是这种形状）。
+   * 拿原始信封的调用方**必须自己**判空，不能假定字段一定存在。
+   */
+  unwrap?: boolean;
 }
 
 /* ================================================================== */
@@ -195,7 +209,7 @@ export function clearMockSessionCookie(): void {
 }
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, query, cookie, noRedirect, cache, workspaceId } = options;
+  const { method = "GET", body, query, cookie, noRedirect, cache, workspaceId, unwrap = true } = options;
   const url = `/api${path.startsWith("/") ? path : `/${path}`}${buildQuery(query)}`;
 
   if (API_MOCK) {
@@ -207,7 +221,9 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     if (res.status >= 400) {
       throw new ApiError(res.status, (res.body as { message?: string })?.message ?? "Request failed", res.body);
     }
-    // mock 响应没有 { data } 包装，直接用 body（与既有接口约定一致）
+    // mock 响应没有 { data } 包装，直接用 body（与既有接口约定一致）。
+    // 注意：mock 里也没有「解包」这一步，因此 `unwrap: false` 的端点在两种
+    // 模式下拿到的是同一形状——mock 必须自己造出 `{ data, total, summary }`。
     return res.body as T;
   }
 
@@ -234,11 +250,17 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     cache: cache ?? "no-store",
   });
 
-  return await finalize<T>(res, noRedirect);
+  return await finalize<T>(res, noRedirect, unwrap);
 }
 
-/** 统一解析响应：错误时抛 ApiError，成功时剥掉一层 { data }。 */
-async function finalize<T>(res: Response, noRedirect?: boolean): Promise<T> {
+/**
+ * 统一解析响应：错误时抛 ApiError，成功时剥掉一层 { data }。
+ *
+ * `unwrap === false` 用于**带旁路字段的信封**（如 WP6 的
+ * `{ data, total, summary }`）：通用解包只认识 `data`，会把 summary/total
+ * 一起丢掉，所以这类端点必须自己拿原始信封。
+ */
+async function finalize<T>(res: Response, noRedirect?: boolean, unwrap = true): Promise<T> {
   if (res.status === 401 || res.status === 403) {
     if (!noRedirect) redirectToLogin();
   }
@@ -258,7 +280,7 @@ async function finalize<T>(res: Response, noRedirect?: boolean): Promise<T> {
         : null) ?? `Request failed with status ${res.status}`;
     throw new ApiError(res.status, msg, data);
   }
-  return unwrapData<T>(data);
+  return (unwrap ? unwrapData<T>(data) : (data as T));
 }
 
 /** 剥掉后端的一层 { data }（mock 模式没有这层，按有无 data 字段兼容）。 */
@@ -542,6 +564,41 @@ export const api = {
       del<{ ok: boolean }>(`/admin/nodes/${nodeId}/pools/${poolId}/targets/${targetId}`, cookie),
     /** 运行态诊断（WP7 上报 → NodeStateReport；无上报时 404/空） */
     nodeState: (id: ID, cookie?: string) => get<NodeStateReport>(`/admin/nodes/${id}/state`, undefined, cookie),
+    /**
+     * V4-WP6 §13.4.4：节点健康视图（后端 `routes/node-health.ts`）。
+     *
+     * 端点用**单数** `/admin/node/:id/health`（与 WP7 凭据端点同一前缀），
+     * 返回 `{ data: NodeHealthView }`（单层信封 → 走通用解包）。
+     * health / connection / reasons / telemetry 全部由后端合成，前端不重算：
+     * §13.4.1 明文「Agent 只上报原始状态，不允许一句 health=healthy 成为
+     * 最终真相」。
+     *
+     * 未上报的节点返回 200 + `telemetry = null`（不是 404）：新节点还没事实
+     * 是正常状态，页面据此显示「等待首次上报」。
+     */
+    nodeHealth: (id: ID, cookie?: string) =>
+      get<NodeHealthView>(`/admin/node/${id}/health`, undefined, cookie),
+    /**
+     * V4-WP6 §13.4.4：全量巡检（`?health=` / `?lifecycle=`）。
+     *
+     * 响应是单层信封 `{ data, total, summary }`，`summary` 是**过滤前**的
+     * 四态计数——「有多少节点是 error」不需要先拉全部节点。通用解包会丢掉
+     * summary，因此这里用 `unwrap: false` 并自己解出三个字段。
+     */
+    nodeHealthList: async (
+      query?: { health?: NodeHealthValue | "all"; lifecycle?: NodeLifecycleValue | "all" },
+      cookie?: string,
+    ): Promise<NodeHealthList> => {
+      const envelope = await request<NodeHealthList & { data?: NodeHealthView[] }>(
+        "/admin/node/health",
+        { method: "GET", query: query as ListQuery, cookie, unwrap: false },
+      );
+      return {
+        data: Array.isArray(envelope?.data) ? envelope.data : [],
+        total: typeof envelope?.total === "number" ? envelope.total : 0,
+        summary: normalizeHealthSummary(envelope?.summary),
+      };
+    },
     nodeGroups: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/admin/node-groups", query, cookie),
     createNodeGroup: (input: NodeGroupInput, cookie?: string) =>
       post<NodeGroup>("/admin/node-groups", input, cookie),

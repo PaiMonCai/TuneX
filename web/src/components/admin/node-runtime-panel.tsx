@@ -31,6 +31,12 @@ function formatEgressPools(report: NodeStateReport): string {
  *      离线/陈旧判定只用前者，避免被节点时钟漂移骗到；
  *   2. **Agent 自报角色仅供参考**：schema 注释明确「与 node.role 不一致时按
  *      node.role 为准」，所以这里只展示并在不一致时给出角标，不改任何东西。
+ *
+ * ── 与 WP6 健康面板的边界（V4-WP6 起）──
+ * 本面板展示 `node_state_report` 的**原始快照**（隧道/出口池列表、上报时刻）。
+ * 健康判定、版本/资源/runtime 计数摘要、可操作理由都由 WP6 的
+ * `/admin/node/:id/health` 给出，由 `NodeHealthManager` 渲染。两者不重复判定：
+ * 面板上「version」这一行的权威口径在健康卡里（Agent 版本 + 期望版本 + 升级建议）。
  */
 export function NodeRuntimePanel({ nodeId, report }: { nodeId: number; report: NodeStateReport | null }) {
   const { t } = useI18n();

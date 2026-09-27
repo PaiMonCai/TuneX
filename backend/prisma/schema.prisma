@@ -1467,6 +1467,42 @@ model NodeStateReport {
   reported_at     DateTime @default(now())
   updated_at      DateTime @updatedAt
 
+  // ── V4-WP6 Agent Telemetry（§13.4.4，迁移 20260928000000）──
+  //
+  // 全部可空，且**没有默认值**：存量行从未有过这些事实，`NULL` 就是
+  // 「Agent 还没报过」，health synthesis 靠它判 `unknown`。给默认值会把
+  // 未知抹成 0（0 字节内存 / 0 个 runtime），那是把未知渲染成故障。
+  //
+  // 每列与 §13.4.4 要求项的对应：
+  //   known_revision  ← latest known revision（与 reported_revision 比较即
+  //                     区分「面板在推但节点应用不了」与「节点已最新」）
+  //   agent_started_at← Agent 启动时间 / uptime
+  //   hostname/os/arch← hostname、OS、arch
+  //   runtime_counts  ← DIRECT / RELAY ingress / Egress runtime 数量
+  //   host_metrics    ← CPU / memory / disk / load 轻量当前值
+  //   error_count / last_error_at ← 「最近 runtime/apply error」的持续性与时刻
+
+  /// Agent 在信封里**见过**的最新 revision（不是已应用的那条）
+  known_revision   Int?
+  /// Agent 进程启动时刻（面板据此算 uptime，不用 Agent 时钟做算术）
+  agent_started_at DateTime?
+  /// 主机名（重装才会变）
+  hostname         String?  @db.VarChar(255)
+  /// runtime.GOOS
+  os               String?  @db.VarChar(32)
+  /// runtime.GOARCH
+  arch             String?  @db.VarChar(32)
+  /// `{ direct, relay_ingress, relay_egress, total }`（Agent 自报的分类计数）
+  runtime_counts   Json?
+  /// 轻量资源采样：`{ cpu_count, load1..15, memory_*, disk_*, host_uptime_seconds,
+  /// process_rss_bytes }`；缺失分组不写键（面板按「未知」处理）
+  host_metrics     Json?
+  /// 累计 apply/runtime 错误条数（NULL = 旧 Agent 没这个账本）
+  error_count      Int?
+  /// 最近一次错误时刻（NULL = 从未出错或旧 Agent）
+  last_error_at    DateTime?
+
   @@index([reported_at])
+  @@index([last_error_at])
   @@map("node_state_report")
 }

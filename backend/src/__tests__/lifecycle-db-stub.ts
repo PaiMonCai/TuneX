@@ -48,10 +48,54 @@ interface StubNodeRow {
   credential_revoked: boolean;
   lifecycle_note: string | null;
   lifecycle_updated_at: Date | null;
+  /** V4-WP6：面板侧记录/回填的 Agent 版本（health 的版本基线之一）。 */
+  version?: string | null;
+}
+
+/**
+ * V4-WP6 —— `node_state_report` 行（遥测快照）。
+ *
+ * 字段刻意与 Prisma `NodeStateReport` 同名（含 WP6 新增的遥测列），这样
+ * services 层的 select 投影在替身上「原样可用」，不必为每个字段写映射。
+ */
+export interface StubStateReportRow {
+  node_id: number;
+  version: string | null;
+  role: string | null;
+  reported_revision: number | null;
+  tunnels: unknown;
+  egress_pools: unknown;
+  used_ports: unknown;
+  last_error: string | null;
+  reported_at: Date | null;
+  // ── V4-WP6 遥测列 ──
+  known_revision?: number | null;
+  agent_started_at?: Date | null;
+  hostname?: string | null;
+  os?: string | null;
+  arch?: string | null;
+  runtime_counts?: unknown;
+  host_metrics?: unknown;
+  error_count?: number | null;
+  last_error_at?: Date | null;
 }
 
 const nodes = new Map<number, StubNodeRow>();
-const tunnelRows: Array<{ id: number; ingress_node_id: number | null; egress_node_id: number | null }> = [];
+/** 每节点一行快照（与真实 upsert 语义一致：不是时序追加）。 */
+const stateReports = new Map<number, StubStateReportRow>();
+const tunnelRows: Array<{
+  id: number;
+  ingress_node_id: number | null;
+  egress_node_id: number | null;
+  name?: string | null;
+  tunnel_mode?: string | null;
+  desired_status?: string | null;
+  config_revision?: number | null;
+  apply_status?: string | null;
+  apply_error?: string | null;
+  listen_port?: number | null;
+  egress_port?: number | null;
+}> = [];
 const bindingRows: Array<{ id: number; ingress_node_id: number; egress_node_id: number }> = [];
 const leaseRows: Array<{ id: number; node_id: number; port: number; status: string }> = [];
 const poolRows: Array<{ id: number; node_id: number }> = [];
@@ -113,8 +157,51 @@ function stubNode(id: number): StubNodeRow | undefined {
   return nodes.get(id);
 }
 
-function pushStubTunnel(row: { ingress_node_id: number | null; egress_node_id: number | null }): void {
+function pushStubTunnel(row: {
+  ingress_node_id: number | null;
+  egress_node_id: number | null;
+  name?: string | null;
+  tunnel_mode?: string | null;
+  desired_status?: string | null;
+  config_revision?: number | null;
+  apply_status?: string | null;
+  apply_error?: string | null;
+  listen_port?: number | null;
+  egress_port?: number | null;
+}): void {
   tunnelRows.push({ id: tunnelRows.length + 1, ...row });
+}
+
+/**
+ * 播种一条快照（V4-WP6）。
+ *
+ * 缺省值刻意取「上线且一切正常」那一侧（新鲜心跳、revision 0、零错误），
+ * 用例要构造异常时显式覆盖某个字段即可——这样「忘了设字段」不会静默变成
+ * 一个看起来正常的 health，而是需要被显式写的那个事实。
+ */
+function seedStubStateReport(over: Partial<StubStateReportRow> & { node_id: number }): StubStateReportRow {
+  const row: StubStateReportRow = {
+    version: "1.4.0",
+    role: "BOTH",
+    reported_revision: 0,
+    tunnels: [],
+    egress_pools: {},
+    used_ports: [],
+    last_error: null,
+    reported_at: freshHeartbeat(),
+    known_revision: 0,
+    agent_started_at: new Date(Date.now() - 3_600_000),
+    hostname: `node-${over.node_id}`,
+    os: "linux",
+    arch: "amd64",
+    runtime_counts: { direct: 0, relay_ingress: 0, relay_egress: 0, total: 0 },
+    host_metrics: null,
+    error_count: 0,
+    last_error_at: null,
+    ...over,
+  };
+  stateReports.set(row.node_id, row);
+  return row;
 }
 
 function pushStubBinding(row: { ingress_node_id: number; egress_node_id: number }): void {
@@ -171,6 +258,39 @@ export const dbStub = {
       }
       return tunnelRows.length;
     },
+    /** V4-WP6：health 需要 Forward 的 desired 面（含 OR ingress/egress）。 */
+    async findMany({ where }: { where?: Record<string, unknown> } = {}) {
+      let rows = [...tunnelRows];
+      const or = (where?.OR ?? []) as Array<{ ingress_node_id?: number; egress_node_id?: number }>;
+      if (or.length > 0) {
+        rows = rows.filter((t) =>
+          or.some((c) => t.ingress_node_id === c.ingress_node_id || t.egress_node_id === c.egress_node_id),
+        );
+      }
+      return rows.map((r) => ({ ...r }));
+    },
+  },
+
+  /**
+   * V4-WP6：快照读面。`upsert` 与真实语义一致（每节点一行）。
+   * `select` 被忽略：替身回整行，services 层的投影只读自己点名的字段。
+   */
+  nodeStateReport: {
+    async findUnique({ where }: { where: { node_id: number } }) {
+      const row = stateReports.get(where.node_id);
+      return row ? { ...row } : null;
+    },
+    async findMany() {
+      return [...stateReports.values()].map((r) => ({ ...r }));
+    },
+    async upsert({ where, create, update }: { where: { node_id: number }; create: Record<string, unknown>; update: Record<string, unknown> }) {
+      const existing = stateReports.get(where.node_id);
+      const next = existing
+        ? { ...existing, ...update }
+        : ({ node_id: where.node_id, ...create } as unknown as StubStateReportRow);
+      stateReports.set(where.node_id, next as StubStateReportRow);
+      return { ...next };
+    },
   },
 
   nodeBinding: {
@@ -216,6 +336,7 @@ export function mockDb(): void {
 /** 清空替身持有的全部状态（beforeEach 调用）。 */
 export function resetLifecycleStub(): void {
   nodes.clear();
+  stateReports.clear();
   tunnelRows.length = 0;
   bindingRows.length = 0;
   leaseRows.length = 0;
@@ -226,6 +347,10 @@ export const stubState = {
   seedNode: seedStubNode,
   hasNode: hasStubNode,
   node: stubNode,
+  /** V4-WP6：播种/读取快照行。 */
+  seedStateReport: seedStubStateReport,
+  stateReport: (nodeId: number) => stateReports.get(nodeId),
+  stateReportCount: () => stateReports.size,
   pushTunnel: pushStubTunnel,
   pushBinding: pushStubBinding,
   pushLease: pushStubLease,

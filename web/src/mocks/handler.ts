@@ -47,6 +47,13 @@ import type {
 } from "@/lib/types";
 import * as seed from "./data";
 import { getStore, resetStore, type MockNodeBinding, type MockWorkspaceInvite } from "./state";
+// V4-WP6 §13.4.4：health 投影（mock 无法 import 后端，形状与规则镜像在这里）
+import {
+  mockFleetHealth,
+  mockNodeHealth,
+  mockResolveNode,
+  type MockHealthWorld,
+} from "./node-health";
 import {
   applyMockForwardPatch,
   injectMockForwardView,
@@ -974,6 +981,27 @@ function mockBindingView(db: Store, binding: MockNodeBinding): NodeBinding | nul
     ...binding,
     egress_node: mockUserNode(db, egress),
     ...mockBindingUsage(db, binding.ingress_node_id, binding.egress_node_id),
+  };
+}
+
+/**
+ * V4-WP6：把 store 投影成 health 模块需要的「世界」。
+ *
+ * 入口解析复用 `mockIngressNode`——转发视图与健康视图必须对「这条隧道落在哪个
+ * 节点上」给出**同一个答案**，否则面板会出现「转发在 node 3，但 health 说
+ * node 1 的 runtime 缺失」这种自相矛盾。
+ */
+function healthWorld(db: Store): MockHealthWorld {
+  return {
+    nodes: db.nodes,
+    tunnels: db.tunnels,
+    nodeStates: db.nodeStates,
+    ingressNodeIdFor: (tunnel) => mockIngressNode(db, tunnel)?.id ?? null,
+    // 时钟基准用 **seed.now**（与整套演示数据同一个基准）：否则固定时间戳的
+    // fixture 会随真实时间流逝整体变旧，演示页在一次会话里前后自相矛盾
+    // （列表说在线、健康卡说上报过期）。真实后端用服务器时钟，这一处只是
+    // mock 的自洽选择。
+    now: seed.now,
   };
 }
 
@@ -2869,6 +2897,25 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           return ok(db.nodeStates.get(node.id) ?? null);
         }
       }
+    }
+
+    // ----- V4-WP6 §13.4.4 健康：单数 /admin/node/health 与前缀 /admin/node/:id/health -----
+    // 形状对齐 backend/src/routes/node-health.ts：
+    //   · fleet 返回 `{ data, total, summary }`（summary 是**过滤前**全量）；
+    //   · 单节点返回裸 view（api.ts 的 get() 在真实模式下会剥掉 `{ data }`）。
+    // 注册顺序同理：字面量 `health` 必须在前，否则会被当成节点标识。
+    if (seg[1] === "node" && method === "GET" && seg[2] === "health" && seg[3] === undefined) {
+      const result = mockFleetHealth(healthWorld(db), {
+        health: typeof q?.health === "string" ? q.health : null,
+        lifecycle: typeof q?.lifecycle === "string" ? q.lifecycle : null,
+      });
+      if ("invalid" in result) return fail(400, result.invalid, "invalid_input");
+      return ok({ data: result.items, total: result.total, summary: result.summary });
+    }
+    if (seg[1] === "node" && method === "GET" && seg[3] === "health") {
+      const node = mockResolveNode(db.nodes, seg[2]);
+      if (!node) return notFound("节点不存在");
+      return ok(mockNodeHealth(healthWorld(db), node));
     }
 
     // ----- WP12 凭据：/admin/node/:id/credential[/rotate|/revoke] -----
