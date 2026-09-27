@@ -365,8 +365,30 @@ describe("C. 记账是 CAS：并发推进不脏写、不把并发编辑伪装成
  * `createRuntimeReconcileSink` —— 本文件要证明的正是「reconcile 收敛路径自己会
  * 记账」。Agent 快照两侧都自报 revision 3，与 Gate 实测一致：数据面已经切到最新，
  * 落后的是面板账本。
+ *
+ * `tunnels()` 每轮从 `row` 现读（不是一次性快照）：第一轮记账后 `applied_revision`
+ * 变了，第二轮的 drift 判定必须看到新值，否则「第二轮零 findings」是假的。
  */
 function reconcileDeps(row: TunnelRow, lifecycles: { ingress: string; egress: string }): ReconcileDeps {
+  // reconciler 读的是 `*_node_id` 标量指针，sink 读的是 include 出来的节点对象；
+  // 两者必须显式换算（把 sink 形状的行直接当 DesiredTunnel 用会让 pickNode 返回
+  // null ⇒ 隧道被误判为 node_unreachable）。
+  const toDesired = (r: TunnelRow): DesiredTunnel => ({
+    id: r.id,
+    tunnel_mode: r.tunnel_mode,
+    desired_status: r.desired_status,
+    config_revision: r.config_revision,
+    applied_revision: r.applied_revision,
+    apply_status: r.apply_status,
+    apply_error_code: r.apply_error_code,
+    apply_error: r.apply_error,
+    last_applied_at: r.last_applied_at,
+    listen_port: r.listen_port,
+    egress_port: r.egress_port,
+    ingress_node_id: r.ingress_node?.id ?? null,
+    egress_node_id: r.egress_node?.id ?? null,
+  });
+
   const node = (node_id: number, lifecycle: string): NodeOnlineInput => ({
     node_id,
     status: "active",
@@ -387,7 +409,7 @@ function reconcileDeps(row: TunnelRow, lifecycles: { ingress: string; egress: st
     }],
   ]);
   return {
-    tunnels: async () => [row as unknown as DesiredTunnel],
+    tunnels: async () => [toDesired(row)],
     nodes: async () => [node(11, lifecycles.ingress), node(12, lifecycles.egress)],
     reports: async () => reports,
     sink: createRuntimeReconcileSink({
