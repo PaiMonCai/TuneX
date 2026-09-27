@@ -257,7 +257,7 @@ function build(): MockStore {
     // 种子来自 data.ts 的 mockEgressPools，运行期由 CRUD 端点增删改。
     egressPools: seedPoolsByNode(),
     egressTargets: new Map(seed.mockEgressPools.map((p) => [p.pool.id, clone(p.targets)])),
-    nodeStates: new Map(),
+    nodeStates: new Map(seed.mockNodeStateReports.map((r) => [r.node_id, clone(r)])),
     boot_at: new Date().toISOString(),
   };
 }

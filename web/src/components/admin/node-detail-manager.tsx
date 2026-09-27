@@ -13,6 +13,7 @@ import { OptionSelect } from "@/components/ui/option-select";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { NodeCredentialPanel } from "@/components/admin/node-credential-panel";
 import { NodeEgressPoolsPanel } from "@/components/admin/node-egress-pools-panel";
+import { NodeHealthManager } from "@/components/admin/node-health-manager";
 import { NodeRuntimePanel } from "@/components/admin/node-runtime-panel";
 import { api, API_MOCK } from "@/lib/api";
 import { useI18n } from "@/components/providers";
@@ -265,7 +266,10 @@ export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
         <NodeEgressPoolsPanel nodeId={nodeId} nodeRole={role} pools={detail.pools} onChanged={reload} />
       )}
 
-      {/* 运行态诊断 */}
+      {/* 运行态诊断（WP12）：原始 Agent 上报快照（隧道列表 / 出口池 / 上报时刻）。
+          WP6 的健康判定与遥测摘要不在这里：它走 /admin/node/:id/health，由后端合成。 */}
+      <NodeHealthManager nodeId={nodeId} />
+
       <NodeRuntimePanel nodeId={nodeId} report={detail.state} />
     </div>
   );
