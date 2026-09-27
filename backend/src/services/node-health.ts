@@ -90,6 +90,7 @@ export type HealthReasonCode =
   | "agent_errors_historical"
   | "runtime_missing"
   | "runtime_revision_behind"
+  | "port_not_bound"
   | "forward_apply_error"
   | "agent_version_behind"
   | "agent_version_unknown"
@@ -157,6 +158,15 @@ export interface DesiredRuntime {
   apply_error?: string | null;
   /** 期望它处于运行态（desired_status=active）。 */
   wants_active: boolean;
+  /**
+   * 该 runtime 应该占用的监听端口（DIRECT/RELAY 入口侧为 `tunnel.listen_port`；
+   * EGRESS 侧为 null——出口 runtime 不监听面板分配的入口端口）。
+   *
+   * §13.4.4 的核心事实链里「端口是否真实占用」的最后一段：runtime 进程在跑
+   * 不等于**面板给的那个端口**真的被监听（换端口失败、被别的进程抢占都会
+   * 出现「runtime 在、端口不在」）。null = 不判（出口侧 / 未分配）。
+   */
+  listen_port?: number | null;
 }
 
 /** state_report 快照（面板侧读出来的那一行，字段可缺）。 */
@@ -212,6 +222,8 @@ export interface HealthResult {
     revision_in_sync: boolean;
     agent_errors_ongoing: boolean;
     resources_ok: boolean;
+    /** §13.4.4「端口是否真实占用」：所有该占用的监听端口都在上报的清单里。 */
+    ports_bound: boolean;
   };
 }
 
@@ -291,6 +303,21 @@ export function parseReportedRuntimes(input: unknown): ReportedRuntime[] {
 }
 
 /**
+ * 取证：Agent 上报的「实际占用端口」集合。
+ *
+ * 只收正整数（端口 0 与负数在协议里没有意义）。NaN/字符串一律丢弃——
+ * 端口判定必须基于确切数字，否则会把「类型错的 0」读成「端口没被占用」。
+ */
+export function parseUsedPorts(input: unknown): Set<number> {
+  const out = new Set<number>();
+  if (!Array.isArray(input)) return out;
+  for (const p of input) {
+    if (typeof p === "number" && Number.isInteger(p) && p > 0 && p <= 65535) out.add(p);
+  }
+  return out;
+}
+
+/**
  * 版本比较：`a` 是否严格旧于 `b`。
  *
  * 只做数字段比较（`0.13.22` = [0,13,22]），非数字段（`-rc1`、`dev`）在
@@ -350,7 +377,7 @@ export function resourceReasons(
       out.push({
         code: "resource_memory_high",
         severity: "warning",
-        message: `内存使用率 ${(ratio * 100).toFixed(1)}%（${pct(ratio)} 阈值）`,
+        message: `内存使用率 ${(ratio * 100).toFixed(1)}%（阈值 ${pct(thresholds.memoryUsedRatio)}）`,
         detail: null,
       });
     }
@@ -365,7 +392,7 @@ export function resourceReasons(
       out.push({
         code: "resource_disk_high",
         severity: "warning",
-        message: `数据盘使用率 ${(ratio * 100).toFixed(1)}%（${pct(ratio)} 阈值）`,
+        message: `数据盘使用率 ${(ratio * 100).toFixed(1)}%（阈值 ${pct(thresholds.diskUsedRatio)}）`,
         detail: metrics.disk_path ?? null,
       });
     }
@@ -387,9 +414,13 @@ export function resourceReasons(
   return out;
 }
 
+/**
+ * 阈值文案。`85.0%` 的阈值若也渲染成 `85%`，理由字符串会变成
+ * 「内存使用率 85.0%（85% 阈值）」——两个数字看起来是同一个，用户读不出
+ * 「刚好越线」还是「远超阈值」。统一保留一位小数（与上面的实测值同精度）。
+ */
 function pct(ratio: number): string {
-  const t = ratio * 100;
-  return `${Number.isInteger(t) ? t : t.toFixed(0)}%`;
+  return `${(ratio * 100).toFixed(1)}%`;
 }
 
 /* ================================================================== */
@@ -479,6 +510,11 @@ export function synthesiseHealth(input: HealthInput): HealthResult {
   // runtime 判定（调用方给了 desired 才做）
   const reported = parseReportedRuntimes(snapshot.tunnels);
   const byId = new Map(reported.map((r) => [r.id, r]));
+  // 「实际占用端口」这一事实：只在 Agent 报过 used_ports 时才有意义。
+  // `tunnels` 里带 ports 但 used_ports 缺失的旧 Agent → 不判端口（unknown 不
+  // 等于「没占用」），否则升级瞬间所有节点都会红一片。
+  const usedPorts = parseUsedPorts(snapshot.used_ports);
+  const hasPortFacts = Array.isArray(snapshot.used_ports);
   let revisionBehindCount = 0;
   if (Array.isArray(input.desired)) {
     for (const d of input.desired) {
@@ -514,6 +550,18 @@ export function synthesiseHealth(input: HealthInput): HealthResult {
           severity: "warning",
           message: `转发「${d.label}」的配置尚未在此节点生效`,
           detail: got ? `${have ?? "无"} < ${want}` : "无运行实例",
+        });
+      }
+      // §13.4.4 事实链的最后一环：runtime 在运行 ≠ 面板给的那个端口真的被监听。
+      // 只在该 runtime **确实在运行**（got 存在）且面板给了端口时才判——runtime
+      // 根本没起来已经由 runtime_missing 表达，再报一次端口是重复噪声。
+      const listenPort = num(d.listen_port);
+      if (hasPortFacts && got && d.wants_active && listenPort !== null && !usedPorts.has(listenPort)) {
+        reasons.push({
+          code: "port_not_bound",
+          severity: "error",
+          message: `转发「${d.label}」的监听端口未被占用`,
+          detail: String(listenPort),
         });
       }
     }
@@ -595,6 +643,7 @@ function finish(health: NodeHealthValue, connection: NodeConnectionValue, reason
       revision_in_sync: !sorted.some((r) => r.code === "runtime_revision_behind" && r.severity === "warning"),
       agent_errors_ongoing: sorted.some((r) => r.code === "agent_errors_ongoing"),
       resources_ok: !sorted.some((r) => r.code.startsWith("resource_")),
+      ports_bound: !sorted.some((r) => r.code === "port_not_bound"),
     },
   };
 }

@@ -27,6 +27,7 @@ import {
   parseHostMetrics,
   parseRuntimeCounts,
   parseReportedRuntimes,
+  parseUsedPorts,
   type DesiredRuntime,
   type HealthInput,
   type HealthResult,
@@ -34,6 +35,8 @@ import {
   type TelemetrySnapshot,
 } from "./node-health.ts";
 import { runtimeId } from "./reconciler.ts";
+import { env } from "../env.ts";
+import { NODE_LIFECYCLES } from "./node-lifecycle.ts";
 
 /* ================================================================== */
 /* DB 投影（可注入替身）                                                */
@@ -81,7 +84,20 @@ async function deps(over: NodeHealthDeps | undefined): Promise<{
   expectedAgentVersion: string | null;
 }> {
   const now = over?.now ?? (() => new Date());
-  const expectedAgentVersion = over?.expectedAgentVersion ?? null;
+  // 显式传入优先（测试与调用方覆盖）；否则取部署配置的基线；未配置 = null =
+  // 不判版本落后（`agent_version_behind` / `agent_version_unknown` 都不出现）。
+  //
+  // 读法必须容忍 `env` 里**没有**这个键：仓库里三个测试文件
+  //（redis-scope / traffic-pipeline / policy-concurrency）为了绕开 env.ts 顶部的
+  // fail-fast 而 `mock.module("env.ts", () => ({ env: {...} }))`，那些替身是**部分**
+  // 拷贝；bun 的 mock.module 是进程级注册表，先加载者生效，于是同一个
+  // `bun test src` 进程里后面加载的模块拿到的是缺键的 env。直接
+  // `env.agentLatestVersion.length` 会在这种进程里抛
+  // `TypeError: undefined is not an object`，把 health 路由测试全部打挂
+  //（实测 18 失败）。缺键 = 部署方未配置 = 不判版本，与空串同义。
+  const configuredVersion = typeof env.agentLatestVersion === "string" ? env.agentLatestVersion.trim() : "";
+  const expectedAgentVersion =
+    over?.expectedAgentVersion ?? (configuredVersion.length > 0 ? configuredVersion : null);
   if (over?.db) return { db: over.db, now, expectedAgentVersion };
   return loadDefaultDb().then((db) => ({ db, now, expectedAgentVersion }));
 }
@@ -182,10 +198,16 @@ export function desiredRuntimesForNode(nodeId: number, tunnels: HealthTunnelRow[
       wants_active: wantsActive,
     };
     if (t.ingress_node_id === nodeId) {
-      out.push({ ...base, runtime_id: runtimeId(t.id, mode === "relay" ? "ingress" : "direct") });
+      // 入口侧 runtime 才监听面板分配的 `listen_port`（DIRECT 与 RELAY 的
+      // 入口都一样）；出口侧不监听入口端口，所以传 null = 不判端口。
+      out.push({
+        ...base,
+        runtime_id: runtimeId(t.id, mode === "relay" ? "ingress" : "direct"),
+        listen_port: t.listen_port,
+      });
     }
     if (t.egress_node_id === nodeId) {
-      out.push({ ...base, runtime_id: runtimeId(t.id, "egress") });
+      out.push({ ...base, runtime_id: runtimeId(t.id, "egress"), listen_port: null });
     }
   }
   return out;
@@ -260,7 +282,9 @@ function telemetryView(
     agent_started_at: startedAt ? startedAt.toISOString() : null,
     uptime_seconds: startedAt ? Math.max(0, Math.round((now.getTime() - startedAt.getTime()) / 1000)) : null,
     runtime: { counts: parseRuntimeCounts(snapshot.runtime_counts), running: running.map((r) => r.id) },
-    used_ports: Array.isArray(snapshot.used_ports) ? (snapshot.used_ports as unknown[]).filter((p): p is number => typeof p === "number") : [],
+    // 与判定同源（同一次解析）：视图里显示的端口清单和「是否真实占用」的
+    // 结论必须来自同一份事实，否则会出现「列表里有 8443 但判端口未占用」。
+    used_ports: [...parseUsedPorts(snapshot.used_ports)].sort((a, b) => a - b),
     host: parseHostMetrics(snapshot.host_metrics),
     errors: {
       count: snapshot.error_count ?? null,
@@ -356,11 +380,19 @@ export async function listNodeHealth(
   const { db: pd, now, expectedAgentVersion } = await deps(inject);
   const nowDate = now();
 
-  const healthFilter = normalizeEnumQuery(options.health);
-  if (healthFilter !== null && !(healthFilter in EMPTY_SUMMARY)) {
+  const healthFilter = normalizeQueryToken(options.health);
+  if (healthFilter !== null && !Object.hasOwn(EMPTY_SUMMARY, healthFilter)) {
     return { ok: false, code: "invalid_input", message: "health 只能是 healthy / warning / error / unknown" };
   }
-  const lifecycleFilter = normalizeEnumQuery(options.lifecycle);
+  const lifecycleFilter = normalizeQueryToken(options.lifecycle);
+  // lifecycle 是 Prisma **枚举**列，面板对它的唯一真相是 NODE_LIFECYCLES
+  // （不在这里重抄一份字面量）。不校验就塞进 `where` 的话，`?lifecycle=banana`
+  // 会把非法枚举值交给 Prisma，在查询期抛错 → 未捕获的 500；那不是「客户端
+  // 输入错」，而是面板把一个探测请求变成了自己的故障。与上面的 health 同一
+  // 口径：非法值显式 400，不静默返回空列表。
+  if (lifecycleFilter !== null && !(NODE_LIFECYCLES as readonly string[]).includes(lifecycleFilter)) {
+    return { ok: false, code: "invalid_input", message: "lifecycle 只能是 active / maintenance / disabled / retiring" };
+  }
 
   const where: Record<string, unknown> = {};
   if (lifecycleFilter !== null) where.lifecycle = lifecycleFilter;
@@ -407,7 +439,7 @@ export async function listNodeHealth(
 const EMPTY_SUMMARY: Record<NodeHealthValue, number> = { healthy: 0, warning: 0, error: 0, unknown: 0 };
 
 /** 下拉框口径：缺省/空串/`all` 都是「不过滤」，不是非法值。 */
-function normalizeEnumQuery(input: string | null | undefined): string | null {
+function normalizeQueryToken(input: string | null | undefined): string | null {
   if (input === undefined || input === null) return null;
   const v = input.trim().toLowerCase();
   if (v === "" || v === "all") return null;

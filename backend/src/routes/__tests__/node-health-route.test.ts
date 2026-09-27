@@ -338,6 +338,31 @@ describe("GET /api/admin/node/health", () => {
     expect(body.code).toBe("invalid_input");
   });
 
+  test("非法 lifecycle 值 → 400 invalid_input（不能把非法枚举丢给 Prisma：那是 500）", async () => {
+    seedFleet();
+    const res = await app.request("/api/admin/node/health?lifecycle=banana");
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { code: string };
+    expect(body.code).toBe("invalid_input");
+  });
+
+  test("health 过滤只认四态白名单（原型链上的键也不是合法过滤值）", async () => {
+    seedFleet();
+    for (const bad of ["constructor", "toString", "__proto__", "valueOf"]) {
+      const res = await app.request(`/api/admin/node/health?health=${bad}`);
+      expect(res.status).toBe(400);
+    }
+  });
+
+  test("lifecycle=ALL / 空串等于不过滤（与 health 同一口径）", async () => {
+    seedFleet();
+    for (const q of ["", "?lifecycle=", "?lifecycle=ALL", "?lifecycle=all"]) {
+      const res = await app.request(`/api/admin/node/health${q}`);
+      const body = (await res.json()) as { total: number };
+      expect(body.total).toBe(3);
+    }
+  });
+
   test("没有任何节点 → 空列表 + 全零 summary（不是 404）", async () => {
     const res = await app.request("/api/admin/node/health");
     expect(res.status).toBe(200);

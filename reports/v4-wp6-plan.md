@@ -85,7 +85,61 @@ Health 四态（§13.4.4 语义逐条）：
 
 ## 5. 剩余 Gate / 未完成
 
-- **V4-WP7**（Node Lifecycle Product UX）消费本 WP 的 `GET /api/admin/node/:id/health` 与 `?health=` 巡检；WP6 **不做** web UI。
+- **V4-WP7**（Node Lifecycle Product UX）消费本 WP 的 `GET /api/admin/node/:id/health` 与 `?health=` 巡检；WP6 的**后端/Agent 切片不做** web UI（Web 呈现切片见 §6）。
 - **V4-WP8** 的「人工确认诊断」需要真实多节点故障数据样本；WP6 只保证理由码与严重度稳定。
 - **Gate V4-F2** 的真实验证（waiting→online→offline、maintenance 期间保存 Forward、退出维护只收敛最新 revision…）由 WP7/WP8 阶段的 E2E 承担；WP6 提供的事实面是它的输入。
 - 本地不跑全项目 tsc/镜像构建（限内存）；以 `bun test src` + `tsc --noEmit` 的分包自证 + GitHub Actions 为准。
+
+---
+
+## 6. Web 呈现切片（§13.4.4 的读面）
+
+范围：**只碰 `web/`**。把 §1–§4 定下的后端结论渲染进**既有**节点 UI，新增消费
+`GET /api/admin/node/:id/health`（单节点）与 `GET /api/admin/node/health`（全量巡检）。
+后端/Agent 契约不动；本切片不 commit（另一个子代理持有 git 操作）。
+
+### 6.1 新增
+
+| 文件 | 作用 |
+|---|---|
+| `web/src/lib/node-health.ts` | 纯展示逻辑：徽章映射、比例/字节/时长/端口区间格式化、runtime 计数条目、资源行、`hasReasonCode`。无 React / 无网络，可离线单测 |
+| `web/src/lib/node-health-i18n.ts` | 四态/连接/生命周期/严重度/flags/字段名 + 16 个 reason code 的中英词条 |
+| `web/src/components/admin/node-health-panel.tsx` | 展示组件：徽章、flags、reasons（可操作）、版本/身份/revision/runtime/资源/错误六区块 |
+| `web/src/components/admin/node-health-manager.tsx` | 取数组件：客户端拉 health，失败保留上一份视图 |
+| `web/src/mocks/node-health.ts` | mock 侧 health 投影（镜像后端形状与规则），供 mock 模式与契约测试 |
+| `web/src/components/admin/__tests__/wp6-node-health.test.ts` | 38 条契约 / 纯逻辑 / 接线断言 |
+
+### 6.2 修改
+
+| 文件 | 作用 |
+|---|---|
+| `web/src/lib/api.ts` | `api.admin.nodeHealth` / `nodeHealthList`；`RequestOptions.unwrap`（fleet 是 `{data,total,summary}` 信封，通用解包会把 summary 丢掉） |
+| `web/src/lib/types.ts` | WP6 health 类型（view / telemetry / reason / flags / summary）；`NodeStateReport` 补扩展列；`Node.lifecycle`；`NodeRuntimeTunnel.id` 由 `number` 校正为 **runtime id 字符串**（与 `parseReportedRuntimes` 判据一致） |
+| `web/src/components/admin/node-detail-manager.tsx` | 详情页挂 `<NodeHealthManager />` |
+| `web/src/components/admin/nodes-manager.tsx` | 列表新增「健康」列 + 全量四态概览条；列表刷新后同步健康；取数失败静默回落为「-」 |
+| `web/src/components/admin/node-runtime-panel.tsx` | 仅加注释划清边界（原始上报快照 vs 派生判定），行为未变 |
+| `web/src/mocks/handler.ts` | mock 路由 `GET /admin/node/health`、`GET /admin/node/:id/health` + `healthWorld` 投影助手 |
+| `web/src/mocks/data.ts`、`web/src/mocks/state.ts` | 演示上报种子（只给 sg-out-01；不动 WP12 用 id=4 的空态断言） |
+
+### 6.3 判断
+
+- **不重算判定**：面板不比较版本、不比阈值，否则就是 §13.4.4 禁止的第二套真相。`hasReasonCode(view, "agent_version_behind")` 只决定是否显示「建议升级」徽章。
+- **未知 ≠ 0**：扩展列缺字段时不出行 / 显示 `-`，绝不渲染成 0（旧 Agent 不报内存时显示「内存 0%」会误导）。
+- **offline 不画成故障**：连接态用中性徽章；`connection !== online` 且无 error 级理由 → 整体 `unknown`（§13.4.4 末句）。
+- **词条不落 `i18n.ts`**：WP9 正在改 `i18n.ts` 的 forward 词条，WP6 词条单列 `node-health-i18n.ts`，两分支不在同一处收口。
+- **mock 时钟用 `seed.now`**：与整套演示数据同一基准，否则固定时间戳会随真实时间变旧、同一会话内自相矛盾。
+
+### 6.4 验证
+
+- `bun test src/components/admin/__tests__/wp6-node-health.test.ts` → **38 pass / 0 fail**（219 断言）。
+- `bun test`（全量 web）→ **105 pass / 1 fail / 1 error**；唯一失败为**既有**问题：无 `node_modules` 时 `next`/`react` 缺失使 `forward-edit-dialog.test.ts` 无法导入组件（改动前基线同样是 1 fail / 1 error）。
+- 无本地构建 / 全量 `tsc`（按任务约束）。已用 `Bun.Transpiler` 对 14 个改动文件做语法校验：全部通过。
+- 与 WP9 合并安全：对 `api.ts` / `types.ts` / `i18n.ts` / `handler.ts` 做三方合并（base=`origin/main`）**无冲突**，合并结果可解析且两侧功能共存（已固化为测试用例）。
+
+### 6.5 Web 切片剩余 Gate
+
+1. **后端联调**：确认真实 `/admin/node/health` 信封与单节点 `{data: view}` 形状与本文假设一致（含 `port_not_bound` / `flags.ports_bound` 契约修订）。
+2. **`tsc --noEmit` + `next build`**：本机无 `node_modules`，类型与构建未验证。
+3. **组件级渲染测试**：现有 web 测试无 jsdom 环境，面板 DOM 未在浏览器中断言（mock 覆盖了取数与投影）。
+4. **`i18n.ts` 收敛**：WP6 词条暂存独立文件，建议两个分支合并后统一并入。
+5. **列表健康列刷新**：当前只在首屏与列表 CRUD 后刷新；定时轮询属 WP8 范围。

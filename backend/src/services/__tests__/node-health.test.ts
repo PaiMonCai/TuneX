@@ -403,6 +403,14 @@ describe("资源阈值 — 未知字段绝不参与判定", () => {
     expect(resourceReasons(metrics, HEALTH_THRESHOLDS)).toEqual([]);
   });
 
+  test("告警文案同时给实测值与**阈值**（两个数不能是同一个）", () => {
+    // 曾经的写法把实测值当阈值印出来：「内存使用率 90.0%（90.0% 阈值）」——
+    // 用户读不出「刚好越线」还是「远超阈值」，阈值改配置后文案还不变。
+    const reasons = resourceReasons({ memory_total_bytes: 100, memory_used_bytes: 90 }, HEALTH_THRESHOLDS);
+    expect(reasons[0].message).toContain("90.0%"); // 实测
+    expect(reasons[0].message).toContain("85.0%"); // 阈值（HEALTH_THRESHOLDS.memoryUsedRatio）
+  });
+
   test("只有 total 没有 used（旧 Agent 只报一半）→ 不判定", () => {
     expect(resourceReasons({ memory_total_bytes: 100 }, HEALTH_THRESHOLDS)).toEqual([]);
     expect(resourceReasons({ disk_total_bytes: 100 }, HEALTH_THRESHOLDS)).toEqual([]);

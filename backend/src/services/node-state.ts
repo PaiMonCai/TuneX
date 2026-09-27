@@ -193,8 +193,24 @@ export type StateReportRejection =
  * `hostname` 对应 schema 的 VarChar(255)。这里显式拦长串：Prisma 会把超长
  * 值交给 MySQL，MySQL 严格模式报错 → 整个上报 500，连带丢掉隧道与端口这些
  * 更有用的字段。上报层只做「能不能安全落库」的形状判断，不做语义判断。
+ *
+ * **按列宽逐字段给上限**（不是三列共用 255）：`os` / `arch` 是 VarChar(32)
+ * （见迁移 20261010000000 与线上 `SHOW CREATE TABLE`）。共用 255 的话，一个
+ * 40 字符的 `os` 会通过校验、再被 MySQL 严格模式（8.4 默认
+ * `STRICT_TRANS_TABLES`）以 `ERROR 1406 (22001) Data too long for column 'os'`
+ * 拒掉 → 整份上报 500，正好绕过本护栏。
  */
 export const TELEMETRY_TEXT_MAX = 255;
+
+/**
+ * 逐字段上限表。**刻意不 export**：services 层不导出数据对象
+ * （`node-credential.test.ts` 的「只 export 纯函数/服务函数」纪律）。
+ */
+const TELEMETRY_LEN_LIMITS: Record<"hostname" | "os" | "arch", number> = {
+  hostname: TELEMETRY_TEXT_MAX,
+  os: 32,
+  arch: 32,
+};
 
 /** 非负整数（计数 / revision；0 合法，负数与小数与 NaN 都是坏形状）。 */
 function isNonNegativeInt(v: unknown): boolean {
@@ -332,9 +348,9 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
   if (b.started_at !== undefined && !isUnixSeconds(b.started_at)) {
     return { ok: false, reason: "bad_telemetry" };
   }
-  for (const key of ["hostname", "os", "arch"]) {
+  for (const key of ["hostname", "os", "arch"] as const) {
     const v = b[key];
-    if (v !== undefined && (typeof v !== "string" || v.length > TELEMETRY_TEXT_MAX)) {
+    if (v !== undefined && (typeof v !== "string" || v.length > TELEMETRY_LEN_LIMITS[key])) {
       return { ok: false, reason: "bad_telemetry" };
     }
   }

@@ -113,6 +113,16 @@ describe("validateStateReport — 遥测段形状校验", () => {
     expect(tooLong.ok).toBe(false);
   });
 
+  test("os / arch 的上限按列宽（VarChar(32)）而不是共用一个 255", () => {
+    // 列的宽度由迁移 20261010000000 决定：os/arch 是 VarChar(32)。
+    // 共用 255 的话，40 字符的 os 会通过校验、再被 MySQL 严格模式
+    // `ERROR 1406 (22001) Data too long` 拒掉 → 整份上报 500。
+    expect(validateStateReport({ ...BASE, os: "x".repeat(32), arch: "x".repeat(32) }).ok).toBe(true);
+    expect(validateStateReport({ ...BASE, os: "x".repeat(33) }).ok).toBe(false);
+    expect(validateStateReport({ ...BASE, arch: "x".repeat(33) }).ok).toBe(false);
+    expect(validateStateReport({ ...BASE, os: "x".repeat(255) }).ok).toBe(false);
+  });
+
   test("未知顶层字段继续容忍（与 WP7 同一口径）", () => {
     expect(validateStateReport({ ...BASE, future_telemetry: { a: 1 } }).ok).toBe(true);
   });
