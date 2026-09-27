@@ -38,8 +38,11 @@ import type {
   NodeHealthSummary,
   NodeHealthValue,
   NodeHealthView,
+  NodeImpactResult,
   NodeInput,
+  NodeLifecycleChangeResult,
   NodeLifecycleValue,
+  NodeLifecycleView,
   NodeRole,
   NodeStateReport,
   Paginated,
@@ -576,6 +579,60 @@ export const api = {
         summary: normalizeHealthSummary(envelope?.summary),
       };
     },
+    /**
+     * V4-WP5 §13.4.2：节点生命周期视图（后端 `routes/node-lifecycle.ts`）。
+     *
+     * 返回 `{ data: NodeLifecycleView }`，含三层状态里的 **Lifecycle** 层与
+     * **Connection** 层：`lifecycle`（管理期望态）、`connection`（事实推导）、
+     * `accepts_new_business`（准入谓词）、`admission_rejection`（拒绝原因码）、
+     * `allowed_transitions`（当前状态下合法的迁移目标）。
+     *
+     * Health 层不在这里——它由 WP6 的 `/admin/node/:id/health` 给出。
+     * UI 一律直接消费这三个字段，**不自行推导**：`allowed_transitions` 是
+     * 「哪些按钮能点」的唯一依据，前端复刻一遍 `canTransition` 就会在
+     * 服务层加状态时出现「按钮能点但 PATCH 409」。
+     */
+    nodeLifecycle: (id: ID, cookie?: string) =>
+      get<NodeLifecycleView>(`/admin/node/${id}/lifecycle`, undefined, cookie),
+    /**
+     * V4-WP5 §13.4.2：变更生命周期（进入/退出 maintenance、disabled、
+     * 进入 retiring）。
+     *
+     * body `{ lifecycle, note? }`：`note` 键缺失 = 不动备注，`null`/空串 =
+     * 显式清空。响应 `{ data: { node, view } }`——`node` 是写后整行，
+     * `view` 是同一行的新生命周期视图，两者同源不会不一致。
+     *
+     * 非法迁移由服务端以 409 `code=invalid_state` + `condition=
+     * invalid_transition` 拒绝（附合法目标清单）；UI 必须按 `condition`
+     * 给出下一步，不能只说「操作失败」。
+     */
+    setNodeLifecycle: (
+      id: ID,
+      input: { lifecycle: NodeLifecycleValue; note?: string | null },
+      cookie?: string,
+    ) => patch<NodeLifecycleChangeResult>(`/admin/node/${id}/lifecycle`, input, cookie),
+    /**
+     * V4-WP5 §13.4.3：依赖影响检查（删除/收缩前的预览）。
+     *
+     * 返回五类依赖计数 + `role_check`。可选传 `next_role` / `port_min` +
+     * `port_max`（+ `current_role`）让后端把「收缩是否可行」一并判了——
+     * 判定与真正写入同源，前端**不复制** `checkRoleChange` 的规则。
+     */
+    nodeImpact: (
+      id: ID,
+      query?: { next_role?: string; port_min?: number; port_max?: number; current_role?: string },
+      cookie?: string,
+    ) => get<NodeImpactResult>(`/admin/node/${id}/impact`, query as ListQuery, cookie),
+    /**
+     * V4-WP5 §13.4.3：物理删除节点。
+     *
+     * 前置条件：`lifecycle === "retiring"` 且无任何依赖（§13.4.3「Node 删除
+     * 永远不隐式级联删除 Forward」）。未退役 → 409 `invalid_state`；有依赖 →
+     * 409 `dependency_blocked` + `dependencies` 清单。UI 用 impact 做**预览**，
+     * 但最终裁决权在服务端。
+     */
+    deleteNodeLifecycle: (id: ID, cookie?: string) =>
+      del<{ id: ID; deleted: true }>(`/admin/node/${id}/lifecycle`, cookie),
     nodeGroups: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/admin/node-groups", query, cookie),
     createNodeGroup: (input: NodeGroupInput, cookie?: string) =>
       post<NodeGroup>("/admin/node-groups", input, cookie),
