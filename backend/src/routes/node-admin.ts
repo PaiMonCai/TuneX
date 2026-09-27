@@ -79,7 +79,13 @@ type Ctx = Context<{ Variables: AppVariables }>;
 /** 统一错误响应：`{ error, message, code }`（message 兼容前端 ApiError 取文案）。 */
 function adminError(c: Ctx, e: NodeAdminError) {
   const status = ADMIN_ERROR_STATUS[e.code] ?? 500;
-  return c.json({ error: e.message, message: e.message, code: e.code }, status);
+  const body: Record<string, unknown> = { error: e.message, message: e.message, code: e.code };
+  // §13.5「权限拒绝、能力拒绝、额度拒绝、运行条件拒绝必须使用可区分的错误码，
+  // Web 才能给用户正确下一步」：条件拒绝（角色/端口区间收缩被依赖阻止）带上
+  // condition + 依赖清单，形状与 GET /node/:id/impact 的 role_check 一致。
+  if (e.condition !== undefined) body.condition = e.condition;
+  if (e.dependencies !== undefined) body.dependencies = e.dependencies;
+  return c.json(body, status);
 }
 
 /** 节点 id 解析失败（数字主键或 node_id 字符串都找不到）→ 404。 */
