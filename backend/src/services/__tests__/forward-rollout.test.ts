@@ -557,9 +557,14 @@ describe("节点 lifecycle fail-closed（R7 / WP5 口径）", () => {
     expect(lifecycleBlocksForward("active")).toBeNull();
   });
 
-  it("null / undefined ⇒ 不阻断（存量库没有该列）", () => {
-    expect(lifecycleBlocksForward(null)).toBeNull();
-    expect(lifecycleBlocksForward(undefined)).toBeNull();
+  it("null / undefined ⇒ node_disabled（迁移后不存在 NULL，fail-closed）", () => {
+    // WP3 该断言写的是「存量库没有该列 ⇒ 不阻断」。迁移
+    // 20260927000000 把 node.lifecycle 建成 NOT NULL DEFAULT 'active' 并回填，
+    // 跑完迁移后行里不可能有 NULL。因此还能读到 null/undefined 只说明这个
+    // 库没跑迁移——不能据此证明节点可承接业务，按 fail-closed 拒绝。
+    // （依据 4dc51da 的契约变更；与下方「未知值 ⇒ node_disabled」口径一致。）
+    expect(lifecycleBlocksForward(null)).toBe("node_disabled");
+    expect(lifecycleBlocksForward(undefined)).toBe("node_disabled");
   });
 
   it("已知非 active ⇒ 对应阻断码", () => {

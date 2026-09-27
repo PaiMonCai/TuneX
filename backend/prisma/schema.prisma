@@ -46,6 +46,24 @@ enum LBStrategy {
   weighted_round
 }
 
+/// V4 托管 Node 生命周期（DEVELOPMENT.md §13.4.1）。
+///
+/// 与 legacy `Status`（active/inactive，连接态）**刻意分开**：§13.4.1 硬约束
+/// 「不得复用现有 legacy Node.status 同时表示连接与生命周期」。
+///   · Status 由 offline-detector 翻 active/inactive，是**事实**；
+///   · NodeLifecycle 由用户/管理员设置，是**期望**。
+/// 「维护中的节点掉线」必须两件事同时成立，挤一列必然互相覆盖。
+enum NodeLifecycle {
+  /// 正常承载 Forward；接受新业务；可作为 Ingress/Egress 候选
+  active
+  /// 服务器升级/重启/检查：不接受新业务，存量 runtime 尽量保持不删
+  maintenance
+  /// 明确不再接受新业务；不作为新 Forward/新 Binding/迁移目标
+  disabled
+  /// 删除前的退役阶段：依赖锁定展示，仅依赖清空后才允许物理删除
+  retiring
+}
+
 /// 端口租约方向（DEVELOPMENT.md §5.1）。
 ///
 /// 方向只是租约元数据：物理唯一性由 `UNIQUE(node_id, port)` 保证，
@@ -437,6 +455,25 @@ model Node {
   credential_revoked    Boolean       @default(false)
   /// 最近一次 rejected 认证时刻：供 rotate 时识别「谁还在拿旧 token 敲门」
   credential_last_rejected_at DateTime?
+
+  // ── V4 增量字段（WP5 Node lifecycle，见迁移 20260927000000_v4_node_lifecycle）──
+  //
+  // §13.4.1 三层状态里的 **Lifecycle**：用户/管理员声明的期望管理状态。它与
+  // 上面的 legacy `status`（连接态：offline-detector 翻转它）是**两个正交维度**，
+  // 硬约束禁止复用同一列——「维护中的节点掉线」必须能同时表达两件事，挤在
+  // 一列里就会互相覆盖。
+  //
+  // 为什么默认 `active` 而不是像 role 那样留空：存量节点今天确实在正常承载
+  // Forward，`active` 是把这个**已知现状**写成默认值，不是推理未知值
+  // （对比 role：存量行的真实角色无从推断，那个才必须留 NULL）。
+  //
+  // retirement 是单向门（见 services/node-lifecycle.ts 的 LIFECYCLE_TRANSITIONS）：
+  // retiring → 任意非删除状态一律拒绝，退出路径只有「清空依赖后物理删除」。
+  lifecycle           NodeLifecycle @default(active)
+  /// 最近一次 lifecycle 变更时刻；供面板展示「维护了多久」与审计对齐
+  lifecycle_updated_at DateTime?
+  /// 进入 maintenance / retiring 的原因（用户填写，纯备注，不参与判定）
+  lifecycle_note       String?      @db.VarChar(255)
 
   egress_pools    EgressPool[]
   port_leases     NodePortLease[]

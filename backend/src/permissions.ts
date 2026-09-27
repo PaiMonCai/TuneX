@@ -26,6 +26,10 @@ export const ADMIN_RESOURCES: AdminResource[] = [
     apiPrefixes: ["/admin/stats", "/admin/plan/stats", "/admin/topup/stats"],
   },
   { key: "node_groups", label: "节点组配置", group: "基础", url: "/admin/node-groups", business: false, apiPrefixes: ["/admin/node/group", "/admin/node-groups"] },
+  // `/admin/node` 前缀同时覆盖 WP10 的 role/credential/pools 与 WP5 的
+  // lifecycle/impact 端点（二者都注册在 node-admin.ts / node-lifecycle.ts，
+  // 路径互不重叠）。因此这里**不新增** `node_lifecycle` 资源键：多一个键就
+  // 多一处「谁该看到什么」的分叉，而生命周期与角色管理同属节点管理面。
   { key: "nodes", label: "节点配置", group: "基础", url: "/admin/nodes", business: false, apiPrefixes: ["/admin/node", "/admin/nodes"] },
   { key: "plans", label: "套餐配置", group: "基础", url: "/admin/plans", business: false, apiPrefixes: ["/admin/plan", "/admin/plans"] },
   { key: "plan_coupons", label: "优惠券配置", group: "财务", url: "/admin/plan_coupons", business: true, apiPrefixes: ["/admin/plan/coupon", "/admin/plan_coupons"] },

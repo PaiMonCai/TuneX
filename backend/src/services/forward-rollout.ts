@@ -40,6 +40,7 @@
  *    本模块只产出「该动哪个资源的哪一面」。
  */
 
+import { businessRejectionCode, lifecycleAcceptsBusiness } from "./node-lifecycle.ts";
 import type { ForwardImpact } from "./forward-revision.ts";
 
 /* ================================================================== */
@@ -202,11 +203,9 @@ export interface RolloutNodeFact {
   role: string | null;
   connect_ip: string | null;
   /**
-   * WP5 `Node.lifecycle`。**本地等价常量口径**（报告 R7）：WP5 尚未并入本分支
-   * 前 import 会编译失败，因此这里直接判 `active` 放行、其余阻断，阻断码与 WP5
-   * `node-lifecycle.ts#businessRejectionCode` 逐字一致。WP5 并入后改为 import
-   * `NODE_LIFECYCLES` / `nodeAdmission`——**语义零漂移是评审要对着两处代码
-   * 确认的**，不是靠一句描述。
+   * WP5 `Node.lifecycle`（§13.4.1 三层状态的 Lifecycle 层）。
+   * 判定统一走 node-lifecycle.ts 的 `lifecycleAcceptsBusiness()` / 
+   * `businessRejectionCode()`，本文件不再持有任何等价常量副本。
    */
   lifecycle?: string | null;
   /** 是否配置了端口区间（自动分配端口的前置）。 */
@@ -239,36 +238,29 @@ export interface PlanRolloutInput {
 }
 
 /* ================================================================== */
-/* 常量：节点准入（R7 的本地等价口径）                                   */
+/* 节点准入（V4-WP5 §13.4.2 —— 单一真相在 node-lifecycle.ts）            */
 /* ================================================================== */
-
-/** 放行的 lifecycle 集合。WP5 并入后改为 `import { NODE_LIFECYCLES }`。 */
-export const ROLLOUT_ADMITTED_LIFECYCLES: readonly string[] = ["active"];
-
-/**
- * lifecycle → 阻断码。与 WP5 `node-lifecycle.ts#businessRejectionCode` 逐字一致
- * （`disabled` 即 WP5 的 fail-closed 兜底）。
- */
-export const ROLLOUT_LIFECYCLE_BLOCKING_CODES = {
-  maintenance: "node_in_maintenance",
-  retiring: "node_retiring",
-  disabled: "node_disabled",
-} as const;
-
-/**
- * 该 lifecycle 是否阻断承载 Forward。
+/*
+ * 这里曾经有一份「逐字一致」的本地副本（ROLLOUT_ADMITTED_LIFECYCLES +
+ * ROLLOUT_LIFECYCLE_BLOCKING_CODES）。那正是 §13.4.2 / 审计 R7 明令禁止的
+ * 双实现漂移点：两份拷贝可以各自演进，于是「准入」会静默地取决于调的是哪份。
+ * WP5 已把 lifecycle 服务层收拢到 node-lifecycle.ts，此处删副本、改为 import。
  *
- * `null` / `undefined` / 未知值 ⇒ **不阻断**：本分支没有 WP5 的 lifecycle 列，
- * 存量库里读到的就是 null。把「未知」当阻断会让全部存量 Forward 一次都改不动，
- * 那是比放宽更糟的故障。已知的非 active 值一律 fail-closed。
+ * 迁移未跑的老库里 `node.lifecycle` 读到 null：WP5 的 businessRejectionCode
+ * 对 null/undefined 一律 fail-closed 兜底 node_disabled，即存量 Forward 会
+ * 被拒绝而非写坏。这是 §13.4.2 的有意选择（宁可拒绝，不可误放行）。
+ */
+/**
+ * 该 lifecycle 是否阻断承载 Forward（§13.4.2：只有 active 接新业务）。
+ *
+ * 只放行 active；maintenance/disabled/retiring 一律拒绝。
+ * 判定与拒绝码都来自 WP5 单一真相，避免两套口径漂移。
  */
 export function lifecycleBlocksForward(lifecycle: string | null | undefined): string | null {
-  if (lifecycle === null || lifecycle === undefined) return null;
-  if (ROLLOUT_ADMITTED_LIFECYCLES.includes(lifecycle)) return null;
-  return (
-    ROLLOUT_LIFECYCLE_BLOCKING_CODES[lifecycle as keyof typeof ROLLOUT_LIFECYCLE_BLOCKING_CODES] ??
-    ROLLOUT_LIFECYCLE_BLOCKING_CODES.disabled
-  );
+  if (lifecycle !== null && lifecycle !== undefined && lifecycleAcceptsBusiness(lifecycle)) {
+    return null;
+  }
+  return businessRejectionCode(lifecycle);
 }
 
 /** 端口黑名单：与 `portPool.PORT_BLACKLIST` / WP1 `RESERVED_PORTS` 同口径。 */

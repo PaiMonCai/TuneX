@@ -128,6 +128,13 @@ export interface NodeOnlineInput {
   last_seen_at?: Date | null;
   /** state_report.reported_at：面板侧收到上报的时刻（DB 侧真相）。 */
   reported_at?: Date | null;
+  /**
+   * WP5 `node.lifecycle`（desired 管理态，§13.4.1）。**与 status 正交**：
+   * status 是「连没连上」（事实），lifecycle 是「允不允许接新业务」（期望）。
+   * 缺省 undefined = 读到的行没有这一列（WP5 之前的替身/旧查询），此时
+   * 不据此等待。
+   */
+  lifecycle?: string | null;
 }
 
 export type Severity = "info" | "warning" | "error";
@@ -146,6 +153,8 @@ export type DriftKind =
   | "mode_mismatch"
   /** 节点当前离线 / 上报过期。 */
   | "node_unreachable"
+  /** 节点处于 maintenance：本轮不下发，只等待（§13.4.2）。 */
+  | "node_in_maintenance"
   /** 上次 apply 以 error 收尾。 */
   | "error_state";
 
@@ -256,6 +265,27 @@ export function isErrorState(t: DesiredTunnel): boolean {
 }
 
 /**
+ * 节点是否处于「等待应用」状态（V4-WP5 §13.4.2 maintenance）。
+ *
+ * maintenance 的三条语义在本函数落地：
+ *   1. **不接受需要立即应用的新 runtime 变化** ⇒ reconciler 本轮不下发；
+ *   2. **已存在 runtime 尽量保持，不做隐式删除** ⇒ 只产 finding，不动任何资源；
+ *   3. **退出维护后 Reconciler 只应用最新 desired revision** ⇒ 这里只「等」，
+ *      不改 revision、不换节点——下一轮节点回到 active 时 `wantsActive` +
+ *      `isRevisionBehind` 自然 converging，无需额外队列。
+ *
+ * 只认 `maintenance`：`disabled` / `retiring` 的 runtime 处理语义不同
+ * （§13.4.2 disabled：不得静默级联删除，依赖由用户显式处理），那是编排层
+ * 与人工 Retry 的职责，不该由巡检悄悄决定「等」还是「撤」。
+ *
+ * `undefined`（列不存在 / 未投影）⇒ false：存量库里没有这个字段时不能把
+ * 每条隧道都变成等待态。
+ */
+export function isNodeInMaintenance(node: NodeOnlineInput | null | undefined): boolean {
+  return node?.lifecycle === "maintenance";
+}
+
+/**
  * 单条隧道的偏差清单（纯函数）。
  *
  * 不在此处产出动作：`computeDrift` 回答「差在哪」，`planTunnelActions` 回答
@@ -332,6 +362,17 @@ export function computeDrift(
       suppressed: ["delete_on_stale", "switch_node"],
     });
   }
+  if (node && isNodeInMaintenance(node)) {
+    // §13.4.2 maintenance：**存量 runtime 保留，新 runtime 变化等待**。
+    // 与 node_unreachable 的关键差别：节点是**可达**的，所以这不是故障，
+    // 而是一个有明确退出条件的管理状态。把它渲染成「离线」会让人去查网络。
+    out.push({
+      kind: "node_in_maintenance",
+      detail: "节点维护中：本轮不下发新 runtime，退出维护后由 Reconciler 应用最新 desired revision",
+      // 维护期间换节点 = 把用户没要求过的迁移做了；改端口同理。
+      suppressed: ["switch_node", "migrate_tunnel", "change_port"],
+    });
+  }
   return out;
 }
 
@@ -375,15 +416,24 @@ export function decideAutoAction(
  *      error 且距上次 apply 太近 → 延迟到下一轮，不每轮都打 agent。
  *      `missing_runtime` 不受退避限制：agent 根本就没有这条隧道，等下去只会
  *      无限期缺失。
+ *   4. **maintenance 节点等待**（WP5 §13.4.2）。只有 `active` 才承载新
+ *      runtime；维护中的节点本轮不下发，退出后自然收敛（见
+ *      {@link isNodeInMaintenance}）。`disabled` / `retiring` 不在此列——
+ *      那两种状态的 runtime 归属是编排决策，不是巡检该悄悄做的。
  */
 export function planTunnelActions(
   tunnel: DesiredTunnel,
   drifts: Drift[],
   now: Date,
-  opts: { staleAfterMs?: number; retryBackoffMs?: number; nodeReachable?: boolean } = {},
+  opts: { staleAfterMs?: number; retryBackoffMs?: number; nodeReachable?: boolean; nodeInMaintenance?: boolean } = {},
 ): PlannedAction[] {
   if (!hasDeclaredDesired(tunnel)) return [];
+  // 节点不在场 ⇒ 什么都不自动做（离线补不上缺失的 runtime，只能等回来）。
   if (opts.nodeReachable === false) return [];
+  // V4-WP5 §13.4.2：maintenance 节点**等待**。存量 runtime 一行不动、新
+  // desired revision 一条不发——退出维护后 wantsActive + isRevisionBehind
+  // 会自然把最新 revision 应用掉，所以这里不需要「记住待办」的队列。
+  if (opts.nodeInMaintenance === true) return [];
 
   const kinds = new Set(drifts.map((d) => d.kind));
   const actions: PlannedAction[] = [];
@@ -573,13 +623,16 @@ export function defaultReconcileDeps(): ReconcileDeps {
     async nodes() {
       const { db } = await import("../db.ts");
       const rows = await db.node.findMany({
-        select: { id: true, status: true, last_seen_at: true, state_report: { select: { reported_at: true } } },
+        // WP5：lifecycle 是 §13.4.1 的另一半状态。缺了它，maintenance 节点会被
+        // 当成「可达且 active」而照样下发新 revision——那正是 §13.4.2 禁的行为。
+        select: { id: true, status: true, last_seen_at: true, lifecycle: true, state_report: { select: { reported_at: true } } },
       });
       return rows.map((r) => ({
         node_id: r.id,
         status: r.status,
         last_seen_at: r.last_seen_at ?? null,
         reported_at: r.state_report?.reported_at ?? null,
+        lifecycle: r.lifecycle ?? null,
       })) as NodeOnlineInput[];
     },
     async reports() {
@@ -675,6 +728,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
       staleAfterMs: deps.staleAfterMs,
       retryBackoffMs: deps.retryBackoffMs,
       nodeReachable: reachable,
+      nodeInMaintenance: node !== null && isNodeInMaintenance(node),
     });
 
     findings.push(...planFindings(t, drifts, planned));
