@@ -71,7 +71,7 @@ describe("V4-WP9 分页参数解析", () => {
 
 describe("V4-WP9 排序白名单", () => {
   test("白名单键与映射表一致（列名映射冻结）", () => {
-    expect([...FORWARD_SORT_KEYS].sort()).toEqual(
+    expect([...FORWARD_SORT_KEYS].sort() as string[]).toEqual(
       [
         "created_at",
         "listen_port",
