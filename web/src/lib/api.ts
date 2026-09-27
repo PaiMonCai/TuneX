@@ -13,6 +13,7 @@ import type {
   AdminRole,
   AdminRoleInput,
   AdminUserInput,
+  AttentionPayload,
   AuditLog,
   AuditLogQuery,
   AuthSession,
@@ -277,10 +278,20 @@ async function finalize<T>(res: Response, noRedirect?: boolean, unwrap = true): 
   }
 
   if (!res.ok) {
-    const msg =
-      (data && typeof data === "object" && "message" in (data as Record<string, unknown>)
-        ? String((data as Record<string, unknown>).message)
-        : null) ?? `Request failed with status ${res.status}`;
+    // V4-WP8 N2 —— 人读原因的取值顺序（后端两族错误体形状不同）：
+    //   · node-lifecycle 族：`{ error, message, code, condition }` → `message`
+    //   · forwards 族：      `{ error, code, apply_error_code, data }` → **没有**
+    //     `message`，原因在 `error` 里
+    // 改造前只读 `message`，于是 Forward 的写操作失败在真实后端下只剩
+    // 「Request failed with status 409」—— 用户拿不到原因，WP8 的「错误 →
+    // 下一步」也就无从谈起。mock 的 `fail()` 恰好带 `message`，所以这个缺口
+    // 在 mock 演示里看不出来。
+    const body = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+    const pick = (key: string): string | null => {
+      const value = body?.[key];
+      return typeof value === "string" && value.trim() !== "" ? value : null;
+    };
+    const msg = pick("message") ?? pick("error") ?? `Request failed with status ${res.status}`;
     throw new ApiError(res.status, msg, data);
   }
   return (unwrap ? unwrapData<T>(data) : (data as T));
@@ -404,6 +415,16 @@ export const api = {
   dashboard: {
     stats: (cookie?: string) => get<DashboardStats>("/dashboard/stats", undefined, cookie),
     traffic: (days = 14, cookie?: string) => get<TrafficPoint[]>("/dashboard/traffic", { days }, cookie),
+    /**
+     * V4-WP8 §13.7 Wave 4：需要处理的节点/转发（离线、等待安装、管理态、
+     * 下发失败、未收敛）。
+     *
+     * 后端在聚合失败时会返回**空清单 + `degraded: true`**（不是 5xx：Dashboard
+     * 是首页，一个聚合查询失败不该让整页打不开）。因此调用方必须看
+     * `degraded`，不能把空清单当成「一切正常」—— 面板文案据此分流。
+     */
+    attention: (cookie?: string) =>
+      get<AttentionPayload>("/dashboard/attention", undefined, cookie),
   },
   // User-facing forwarding is V4-only from this point onward.
   // Legacy /api/tunnels stays backend-compatible, but the Web client no longer

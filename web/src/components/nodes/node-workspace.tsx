@@ -19,6 +19,7 @@ import {
 import { Input, Label } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import type { NodeBinding, NodeEnrollmentIssued, NodeGroup, NodeRole, UserNode } from "@/lib/types";
+import { userNodeStatus } from "@/lib/node-status";
 
 function roleLabel(role: NodeRole | null | undefined, t: (key: string) => string) {
   if (role === "ingress") return t("node.ingress");
@@ -36,7 +37,7 @@ function isEgress(node: UserNode) {
 }
 
 export function NodeWorkspace() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [nodes, setNodes] = useState<UserNode[]>([]);
   const [groups, setGroups] = useState<NodeGroup[]>([]);
   const [selectedIngressId, setSelectedIngressId] = useState<number | null>(null);
@@ -50,6 +51,14 @@ export function NodeWorkspace() {
   const [bindOpen, setBindOpen] = useState(false);
   const [bindEgressId, setBindEgressId] = useState("");
   const [busy, setBusy] = useState(false);
+  /**
+   * V4-WP8：Dashboard 待办里「查看节点」的目标 —— `?focus=<id>`。
+   *
+   * 待办条目必须能落到**具体那一行**上：只说「去看节点」而把用户丢到一屏节点
+   * 最上面，等于让用户自己找那个已经出问题的节点。这里只做定位/高亮，
+   * 不参与任何状态判定（三层状态依旧全部来自后端投影）。
+   */
+  const [focusId, setFocusId] = useState<number | null>(null);
 
   const selectedIngress = nodes.find((node) => Number(node.id) === selectedIngressId) ?? null;
   const ingressNodes = nodes.filter(isIngress);
@@ -95,7 +104,17 @@ export function NodeWorkspace() {
 
   useEffect(() => {
     void loadNodes();
+    // V4-WP8：`/nodes?focus=<id>` 来自 Dashboard 待办。只认数字，不猜其它形态；
+    // 读到后滚动到那张卡片并高亮（找不到就什么也不做，不报错）。
+    const requested = new URLSearchParams(window.location.search).get("focus");
+    if (requested && /^\d+$/.test(requested)) setFocusId(Number(requested));
   }, []);
+
+  useEffect(() => {
+    if (focusId === null || loading) return;
+    const target = document.getElementById(`node-${focusId}`);
+    target?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [focusId, loading]);
 
   useEffect(() => {
     void loadBindings(selectedIngressId);
@@ -207,8 +226,26 @@ export function NodeWorkspace() {
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {nodes.map((node) => {
           const selected = Number(node.id) === selectedIngressId;
+          // V4-WP8：来自 Dashboard 待办的定位目标（只影响高亮/滚动，不参与判定）。
+          const focused = Number(node.id) === focusId;
+          // V4-WP8 §13.4.1：三层状态（Connection / Lifecycle / Admission）
+          // 全部来自后端投影，本组件只翻译成徽章 —— 不读 last_seen_at、
+          // 不比 90s 窗口、不推准入（那是 routes/nodes.ts 的 projectUserNode
+          // 与 services/node-lifecycle.ts 的唯一职责）。
+          const status = userNodeStatus(locale, node);
           return (
-            <Card key={String(node.id)} className={selected ? "ring-2 ring-[var(--ring)]" : ""}>
+            <Card
+              key={String(node.id)}
+              id={`node-${node.id}`}
+              data-focused={focused ? "true" : undefined}
+              className={
+                focused
+                  ? "ring-2 ring-[var(--destructive)]"
+                  : selected
+                    ? "ring-2 ring-[var(--ring)]"
+                    : ""
+              }
+            >
               <CardHeader className="pb-2">
                 <div className="flex items-start justify-between gap-2">
                   <div>
@@ -223,12 +260,28 @@ export function NodeWorkspace() {
                       Agent: {node.agent_id}
                     </p>
                   </div>
-                  <Badge variant={node.online ? "success" : "secondary"}>
-                    {node.online ? t("common.online") : node.registered ? t("common.offline") : t("node.waiting")}
-                  </Badge>
+                  <div className="flex flex-col items-end gap-1">
+                    <Badge variant={status.connection.variant} data-testid={`node-connection-${node.id}`}>
+                      {status.connection.label}
+                    </Badge>
+                    {status.lifecycle ? (
+                      <Badge variant={status.lifecycle.variant} data-testid={`node-lifecycle-${node.id}`}>
+                        {status.lifecycle.label}
+                      </Badge>
+                    ) : null}
+                  </div>
                 </div>
               </CardHeader>
               <CardContent className="flex flex-col gap-3">
+                {status.admission ? (
+                  <p
+                    className="text-xs text-[var(--muted-foreground)]"
+                    data-testid={`node-admission-${node.id}`}
+                  >
+                    {status.admission.label}
+                    {status.admission.reason ? ` — ${status.admission.reason}` : ""}
+                  </p>
+                ) : null}
                 <div className="flex flex-wrap gap-2 text-xs">
                   <Badge variant="outline">{roleLabel(node.role, t)}</Badge>
                   {node.port_range_min && node.port_range_max ? (
