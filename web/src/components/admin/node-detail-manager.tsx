@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { ArrowLeft, Loader2, Pencil, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -14,6 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { NodeCredentialPanel } from "@/components/admin/node-credential-panel";
 import { NodeEgressPoolsPanel } from "@/components/admin/node-egress-pools-panel";
 import { NodeHealthManager } from "@/components/admin/node-health-manager";
+import { NodeLifecycleManager } from "@/components/admin/node-lifecycle-manager";
 import { NodeRuntimePanel } from "@/components/admin/node-runtime-panel";
 import { api, API_MOCK } from "@/lib/api";
 import { useI18n } from "@/components/providers";
@@ -116,6 +118,19 @@ export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
 
   const node = detail;
   const role = node.role ?? null;
+  const router = useRouter();
+
+  /**
+   * V4-WP7：把角色/端口区间的**待提交**值交给 lifecycle 管理组件做影响检查。
+   *
+   * 判定在服务端（`checkRoleChange`）；这里只负责在用户改动表单时把候选值
+   * 传给后端，并把结论渲染出来。空值 = 不参与检查（与后端「缺省 = 不改」同义）。
+   */
+  const roleCheckInput = {
+    nextRole: form.role === "" ? null : (form.role as string),
+    portMin: toNumOrNull(form.port_range_min),
+    portMax: toNumOrNull(form.port_range_max),
+  };
 
   return (
     <div className="flex flex-col gap-5" data-testid="admin-node-detail">
@@ -269,6 +284,17 @@ export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
       {/* 运行态诊断（WP12）：原始 Agent 上报快照（隧道列表 / 出口池 / 上报时刻）。
           WP6 的健康判定与遥测摘要不在这里：它走 /admin/node/:id/health，由后端合成。 */}
       <NodeHealthManager nodeId={nodeId} />
+
+      {/* V4-WP7 §13.4.2/§13.4.3：托管生命周期（维护/停用/退役、依赖预览、
+          删除闸门、安装等待闭环）。三层状态里的 Lifecycle 层只在这里改；
+          判定全部来自后端 WP5 端点，前端不重算。 */}
+      <NodeLifecycleManager
+        nodeId={nodeId}
+        currentNote={detail.lifecycle_note ?? null}
+        roleCheckInput={roleCheckInput}
+        onChanged={reload}
+        onDeleted={() => router.push("/admin/nodes")}
+      />
 
       <NodeRuntimePanel nodeId={nodeId} report={detail.state} />
     </div>

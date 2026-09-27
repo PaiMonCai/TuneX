@@ -2859,7 +2859,11 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         db.nodeLifecycle.set(node.id, { lifecycle: next, note, updated_at: nowIso() });
         // PATCH 也把生命周期写回节点行：`/admin/nodes` 列表与 `/impact` 之外的
         // 读面（NodeDetail）读的是节点行，不同步会出现「详情说维护中、列表说使用中」。
+        // 备注同理只存在于节点行（`lifecycleView` 的键是固定的十个，不含备注），
+        // 不写回这里，详情页就永远看不到自己刚填的原因。
         node.lifecycle = next;
+        node.lifecycle_note = note;
+        node.lifecycle_updated_at = nowIso();
         node.updated_at = nowIso();
         return ok(mockLifecycleChange(node, next, seed.now));
       }

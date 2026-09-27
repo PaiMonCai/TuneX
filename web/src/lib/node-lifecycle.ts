@@ -185,8 +185,7 @@ export function installClosureReached(phase: InstallPhase): boolean {
   return phase === "online";
 }
 
-/**
- * 准入拒绝码 → 是否属于「去安装」这一类。
+/** 准入拒绝码 → 是否属于「去安装」这一类。
  *
  * `waiting` 的节点拒绝新业务是对的，但它的下一步是安装而不是改生命周期；
  * 把两者混在一句「该节点不可用」里，用户会去改一个没错的地方。
@@ -194,3 +193,89 @@ export function installClosureReached(phase: InstallPhase): boolean {
 export function isInstallAdmissionRejection(rejection: NodeAdmissionRejection | null | undefined): boolean {
   return rejection === "node_waiting_install";
 }
+
+/* ================================================================== */
+/* 错误解析（把服务端拒绝码喂给文案表）                                  */
+/* ================================================================== */
+
+/** 从接口错误里抽出的生命周期拒绝信息。 */
+export interface LifecycleErrorInfo {
+  status: number | null;
+  /** 管理端错误码（`invalid_input` / `invalid_state` / `dependency_blocked` / …）。 */
+  code: string | null;
+  /** 运行条件的具体拒绝码（`invalid_transition` / `node_still_used_as_ingress` / …）。 */
+  condition: NodeLifecycleConditionCode | null;
+  /** 面向用户的句子（后端 message；缺失时给兜底）。 */
+  message: string;
+  /** 未清空的依赖清单（`dependency_blocked` 时才有）。 */
+  dependencies: NodeImpact | null;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function readImpact(v: unknown): NodeImpact | null {
+  if (!isRecord(v)) return null;
+  const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : 0);
+  return {
+    ingress_forward_count: num(v.ingress_forward_count),
+    egress_forward_count: num(v.egress_forward_count),
+    binding_count: num(v.binding_count),
+    active_port_lease_count: num(v.active_port_lease_count),
+    egress_pool_count: num(v.egress_pool_count),
+    blockers: Array.isArray(v.blockers) ? v.blockers.filter((b): b is string => typeof b === "string") : [],
+  };
+}
+
+/**
+ * 把 `ApiError`（或任意抛出的值）解析成生命周期 UI 能用的拒绝信息。
+ *
+ * 后端契约（`routes/node-lifecycle.ts` 的 `lifecycleError`）把 `condition` /
+ * `dependencies` 与 `code` **平级**放在响应顶层，前端从 `error.data.*` 读。
+ * 这里额外容忍一层 `data.data` 嵌套：mock 的通用 `fail()` 用的是那种形状，
+ * 而 mock 模式是前端演示与契约测试的运行环境——与其让界面在 mock 下退化成
+ * 「操作失败」，不如让解析器容忍两种已知形状。**契约仍以后端顶层为准**。
+ *
+ * `condition` 缺失（例如旧后端 / 500）时返回 null，调用方回落 message。
+ */
+export function lifecycleErrorInfo(error: unknown): LifecycleErrorInfo {
+  const status =
+    isRecord(error) && typeof error.status === "number" && Number.isFinite(error.status) ? error.status : null;
+  const message =
+    isRecord(error) && typeof error.message === "string"
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  const payload = isRecord(error) && isRecord(error.data) ? error.data : null;
+  // 顶层优先；再容忍一层 `data.data`（见函数注释）。
+  const nested = payload && isRecord(payload.data) ? payload.data : null;
+  const read = (key: string): unknown => payload?.[key] ?? nested?.[key];
+  const rawCondition = read("condition");
+  const condition =
+    typeof rawCondition === "string" && (NODE_LIFECYCLE_CONDITION_CODES as string[]).includes(rawCondition)
+      ? (rawCondition as NodeLifecycleConditionCode)
+      : null;
+  return {
+    status,
+    code: typeof read("code") === "string" ? (read("code") as string) : null,
+    condition,
+    message,
+    dependencies: readImpact(read("dependencies")),
+  };
+}
+
+/** 已知条件码全集（与后端 `LifecycleConditionCode` + `node_waiting_install` 对齐）。 */
+export const NODE_LIFECYCLE_CONDITION_CODES: string[] = [
+  "invalid_transition",
+  "node_in_maintenance",
+  "node_disabled",
+  "node_retiring",
+  "node_not_retiring",
+  "node_still_used_as_ingress",
+  "node_still_used_as_egress",
+  "dependency_blocked",
+  "port_range_would_orphan_leases",
+  "node_waiting_install",
+];

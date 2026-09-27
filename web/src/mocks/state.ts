@@ -187,6 +187,16 @@ function build(): MockStore {
   for (const n of nodes) {
     const g = nodeGroups.find((x) => x.id === n.node_group_id);
     n.node_group = g ? { id: g.id, name: g.name, node_type: g.node_type } : undefined;
+    // V4-WP7：把生命周期种子灌进节点行。
+    // 后端只有一列真值（Node.lifecycle / lifecycle_note）；mock 若把它只放在
+    // 单独的 Map 里，详情页与列表（读节点行）就永远看不到维护态——而 PATCH 之后
+    // 又变成了节点行有、Map 也有，两边不同步。这里以节点行为准即可。
+    const seeded = MOCK_LIFECYCLE_SEED[n.id];
+    if (seeded) {
+      n.lifecycle = seeded.lifecycle;
+      n.lifecycle_note = seeded.note;
+      n.lifecycle_updated_at = iso(daysAgo(1));
+    }
   }
   const tunnels = clone(seed.mockTunnels);
   for (const t of tunnels) {

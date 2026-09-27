@@ -40,6 +40,10 @@ export interface NodeLifecycleText {
   notePlaceholder: string;
   noteHint: string;
   noteClearHint: string;
+  /** 「当前生效的备注」（节点行 lifecycle_note），与输入框的「改成什么」区分。 */
+  noteCurrent: string;
+  /** 节点行上还没有备注时的占位。 */
+  noteNone: string;
   applying: string;
   irreversibleHint: string;
 
@@ -117,6 +121,8 @@ const zh: NodeLifecycleText = {
   notePlaceholder: "例如：内核升级，预计 30 分钟",
   noteHint: "备注只用于展示与审计，不参与任何判定。",
   noteClearHint: "清空备注：提交时留空即清除，不改生命周期时不会动备注。",
+  noteCurrent: "当前原因",
+  noteNone: "未填写",
   applying: "提交中…",
   irreversibleHint: "退役是单向操作：进入后不能再回到其它生命周期，唯一的出口是清空依赖后删除节点。",
 
@@ -204,6 +210,8 @@ const en: NodeLifecycleText = {
   notePlaceholder: "e.g. kernel upgrade, about 30 minutes",
   noteHint: "The note is display/audit only and never participates in any decision.",
   noteClearHint: "Clearing the note: submitting it empty removes it; not changing the lifecycle leaves the note untouched.",
+  noteCurrent: "Current reason",
+  noteNone: "not set",
   applying: "Submitting…",
   irreversibleHint: "Retiring is one-way: no other lifecycle can be reached from it. The only exit is deleting the node after clearing its dependencies.",
 
@@ -362,3 +370,6 @@ export const NODE_LIFECYCLE_DICTS = { zh, en } as const;
 
 /** 已知条件码全集（与后端 LifecycleConditionCode + node_waiting_install 对齐）。 */
 export const NODE_LIFECYCLE_CONDITION_CODES = Object.keys(CONDITION_TITLE.zh) as NodeLifecycleConditionCode[];
+
+/** 已有中英词条的条件码（测试据此断言「契约里的码都有翻译」）。 */
+export const NODE_LIFECYCLE_TRANSLATED_CODES = Object.keys(CONDITION_TITLE.zh);

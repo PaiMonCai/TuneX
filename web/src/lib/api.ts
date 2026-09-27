@@ -608,7 +608,7 @@ export const api = {
      */
     setNodeLifecycle: (
       id: ID,
-      input: { lifecycle: NodeLifecycleValue; note?: string | null },
+      input: { lifecycle?: NodeLifecycleValue; note?: string | null },
       cookie?: string,
     ) => patch<NodeLifecycleChangeResult>(`/admin/node/${id}/lifecycle`, input, cookie),
     /**

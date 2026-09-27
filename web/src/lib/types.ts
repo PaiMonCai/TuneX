@@ -289,6 +289,16 @@ export interface Node {
    * 徽章，而不是红色 error——WP6 的 health 视图据此展示，不做第二套判定。
    */
   lifecycle?: NodeLifecycleValue | null;
+  /**
+   * 进入 maintenance / disabled / retiring 的原因（用户填写，纯备注、不参与判定）。
+   *
+   * 注意它**不在** lifecycle 视图里（后端 `lifecycleView` 的键是固定的十个，
+   * 有意不含备注），而是节点行的一列。管理端 `/admin/nodes[/:id]` 用的是全字段
+   * select，所以这里能拿到；用视图判断「有没有备注」会永远读到 undefined。
+   */
+  lifecycle_note?: string | null;
+  /** 最近一次 lifecycle 变更时刻（展示「维护了多久」）。 */
+  lifecycle_updated_at?: string | null;
   // ── v3 增量字段（WP7 per-node credential）──
   /**
    * 服务端**绝不下发** `node_credential_hash`（列表/详情接口不含该列），
