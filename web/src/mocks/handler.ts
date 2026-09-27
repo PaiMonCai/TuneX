@@ -11,6 +11,9 @@
  */
 import type {
   AdminRole,
+  AttentionItem,
+  AttentionReasonCode,
+  AttentionSummary,
   BillingCycle,
   BalanceLog,
   EgressPool,
@@ -65,6 +68,7 @@ import {
   mockLifecycleOf,
   mockLifecycleView,
   mockRoleCheck,
+  mockUserNodeStatus,
   type MockImpactWorld,
 } from "./node-lifecycle";
 import {
@@ -72,6 +76,11 @@ import {
   injectMockForwardView,
   previewMockForwardUpdate,
 } from "./forward-edit";
+// V4-WP8：可重试结论**复用** `lib/forward-status.ts` 的 `applyErrorIsRetryable`。
+// 那是本项目里对后端 `scheduler.ts` 的 `RETRYABLE` 集合的**唯一**镜像，且由
+// `components/forwards/__tests__/wp8-forward-status.test.ts` 直接读后端源码做集合断言。
+// mock 里再抄一份「哪些码可重试」就是第三份判据 —— 报告 N1 记的正是这种形态。
+import { applyErrorIsRetryable } from "@/lib/forward-status";
 import type { ForwardPatchInput } from "@/lib/types";
 
 // forward-edit.ts 需要 handler 的 forward 投影（避免反向依赖），在这里注入一次。
@@ -967,6 +976,111 @@ function tunnelRuntimeAction(
   return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision } satisfies TunnelRuntimeAction);
 }
 
+/** 与后端 `services/attention.ts` 的 `ATTENTION_MAX_ITEMS` 同值（契约测试钉住）。 */
+export const MOCK_ATTENTION_MAX_ITEMS = 25;
+
+/**
+ * V4-WP8 §13.7 Wave 4 —— Dashboard 待办的 mock 投影。
+ *
+ * **判定逻辑与后端 `services/attention.ts` 一一对应**，因为 mock 在这个项目里
+ * 就是"离线可跑的后端"（WP6/WP7 同一先例）：形状或优先级漂移会让前端契约测试
+ * 通过、真实后端却不一致。四处复用既有判定，不新造：
+ *   · 节点三层 → `mockUserNodeStatus`（镜像 deriveConnection / nodeAdmission）
+ *   · Forward 视图 → `mockForwardView`（与列表页同一投影）
+ *   · 可重试结论 → `applyErrorIsRetryable`（lib/forward-status.ts，已有后端集合断言）
+ *   · 上限 → `MOCK_ATTENTION_MAX_ITEMS`（与后端常量同值，测试钉住）
+ *
+ * 排序同样照抄后端：severity(error→warning→info) → kind(node 先) → id。
+ */
+function mockAttention(db: Store) {
+  const items: AttentionItem[] = [];
+  const summary: AttentionSummary = {
+    nodes_offline: 0,
+    nodes_waiting_install: 0,
+    nodes_restricted: 0,
+    forwards_error: 0,
+    forwards_pending: 0,
+  };
+
+  for (const node of db.nodes) {
+    const status = mockUserNodeStatus(db, node);
+    const base = { kind: "node" as const, id: node.id, name: node.node_id };
+    if (status.connection === "waiting") {
+      summary.nodes_waiting_install++;
+      items.push({ ...base, severity: "warning", reason_code: "node_waiting_install", retryable: null });
+      continue;
+    }
+    if (status.accepts_new_business === false && status.admission_rejection) {
+      summary.nodes_restricted++;
+      items.push({
+        ...base,
+        severity: "info",
+        reason_code: status.admission_rejection as AttentionReasonCode,
+        retryable: null,
+      });
+      continue;
+    }
+    if (status.connection === "offline") {
+      summary.nodes_offline++;
+      items.push({ ...base, severity: "warning", reason_code: "connection_offline", retryable: null });
+    }
+  }
+
+  for (const tunnel of db.tunnels) {
+    // 与后端 `collectAttention` 的 where 同一口径：只聚合 `port_forward`。
+    // legacy 的 `remote_port_forward` 不在 V4 产品面上，混进来会让「待办数量」
+    // 永远不等于用户在转发页看到的行数。
+    if (tunnel.category !== "port_forward") continue;
+    const forward = mockForwardView(db, tunnel);
+    const base = { kind: "forward" as const, id: forward.id, name: forward.name };
+    const status = forward.apply_status ?? null;
+    if (status === "error") {
+      summary.forwards_error++;
+      const code = forward.apply_error_code ?? null;
+      items.push({
+        ...base,
+        severity: "error",
+        reason_code: "forward_apply_error",
+        apply_error_code: code,
+        retryable: code === null ? null : applyErrorIsRetryable(code),
+      });
+      continue;
+    }
+    const desired = forward.config_revision ?? null;
+    const applied = forward.applied_revision ?? null;
+    if (status === "active" && desired !== null && applied !== null && applied < desired) {
+      summary.forwards_pending++;
+      items.push({ ...base, severity: "warning", reason_code: "runtime_revision_behind", retryable: null });
+      continue;
+    }
+    if (status === "pending" || status === "applying") {
+      summary.forwards_pending++;
+      items.push({ ...base, severity: "info", reason_code: "forward_pending_apply", retryable: null });
+    }
+  }
+
+  const weight = { error: 0, warning: 1, info: 2 } as const;
+  items.sort((a, b) => {
+    const bySeverity = weight[a.severity] - weight[b.severity];
+    if (bySeverity !== 0) return bySeverity;
+    if (a.kind !== b.kind) return a.kind === "node" ? -1 : 1;
+    return Number(a.id) - Number(b.id);
+  });
+
+  return {
+    items: items.slice(0, MOCK_ATTENTION_MAX_ITEMS),
+    summary,
+    total: items.length,
+    generated_at: nowIso(),
+  };
+}
+
+/**
+ * 用户侧节点投影（V4-WP8 三层状态）：与真实后端 `nodeView()` 同形。
+ *
+ * 判定集中在 `mocks/node-lifecycle.ts`（镜像后端 deriveConnection /
+ * nodeAdmission），本函数只做「去掉 credential hash + 摊平三层」。
+ */
 function mockUserNode(db: Store, node: Node): UserNode {
   const group = db.nodeGroups.find((g) => g.id === node.node_group_id);
   // Compatibility shim for legacy mock fixtures whose v3 role is still NULL:
@@ -984,7 +1098,8 @@ function mockUserNode(db: Store, node: Node): UserNode {
     agent_id: node.agent_id ?? `mock-agent-${node.id}`,
     role,
     registered: Boolean(node.has_credential) && !node.credential_revoked,
-    online: Boolean(node.online) && node.status === "active",
+    // V4-WP8 §13.4.1：三层状态与真实后端同形（判定集中在 mocks/node-lifecycle.ts）。
+    ...mockUserNodeStatus(db, node),
   };
 }
 
@@ -1580,6 +1695,18 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     if (seg[1] === "traffic") {
       const days = Math.max(1, Number(q?.days ?? 14) || 14);
       return ok(seed.mockTrafficPoints.slice(-days));
+    }
+    /**
+     * V4-WP8 §13.7 Wave 4 —— 需要处理的节点/转发。
+     *
+     * **形状与排序必须等于**后端 `services/attention.ts`：kind / severity /
+     * reason_code / apply_error_code / retryable、severity→kind→id 的顺序、
+     * summary 与 items 同源、以及 `degraded` 只在取不到时出现。
+     * mock 是前端演示与契约测试的运行环境，形状漂移会掩盖真实缺口。
+     * 判定一律复用 mocks/node-lifecycle.ts 与 mocks 的 forward 视图。
+     */
+    if (seg[1] === "attention") {
+      return ok(mockAttention(db));
     }
   }
 
