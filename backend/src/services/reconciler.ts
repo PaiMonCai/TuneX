@@ -837,8 +837,12 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
   };
 }
 
-/** 取该隧道的 agent applied 快照（RELAY 取 egress 侧，DIRECT 取 ingress 侧附近的节点）。 */
-function runtimeId(tunnelId: number, direction: "direct" | "ingress" | "egress"): string {
+/**
+ * Agent 侧 runtime id 的**唯一**拼接口径（V4-WP6 的 health synthesis 也用它，
+ * 所以是 export：两处各拼一次的话，Agent 侧改了规则就会出现「reconciler 说
+ * 落后、health 说没运行」的分叉）。
+ */
+export function runtimeId(tunnelId: number, direction: "direct" | "ingress" | "egress"): string {
   return direction === "direct"
     ? `tunex-${tunnelId}-direct`
     : direction === "ingress"

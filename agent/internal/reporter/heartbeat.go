@@ -1,9 +1,17 @@
 // Package reporter is the agent's outbound telemetry.
 //
-// WP4 implements the heartbeat only: every 30s the agent POSTs its version,
-// role, node id, running tunnels and their ports to the panel, so the panel can
-// place the node in the v3 orchestration without polling it. Traffic and metrics
-// reporters are later work packages.
+// Every 30s the agent POSTs its version, role, node id, running tunnels and
+// their ports to the panel, so the panel can place the node in the v3
+// orchestration without polling it.
+//
+// V4-WP6 (§13.4.4) extends the same report instead of adding a second one:
+// host identity, one lightweight resource sample, runtime counts and the
+// apply/runtime error ledger travel inside the WP7 state report. The agent only
+// reports raw facts — the panel computes Health from them.
+//
+// Traffic and per-metric history reporters are still later work packages: WP6
+// deliberately keeps this an O(1)-per-heartbeat sampler, not a Prometheus
+// exporter.
 //
 // Transport contract (devmap §6.1 "内部上报"): the heartbeat is a machine
 // endpoint POST <panel>/api/internal/heartbeat, sent by the agent as an
@@ -39,7 +47,9 @@ const ClientTimeout = 10 * time.Second
 // HeartbeatPath is the panel endpoint the agent posts to.
 const HeartbeatPath = "/api/internal/heartbeat"
 
-// StatePath is the WP7 state-report endpoint (services/node-state.ts).
+// StatePath is the WP7 state-report endpoint (services/node-state.ts). V4-WP6
+// carries the telemetry extension in the *same* body: §13.4.4 forbids a second
+// node-monitoring truth, so there is no /telemetry endpoint.
 const StatePath = "/api/internal/node/state"
 
 // CredentialHeader carries the per-node credential (services/node-credential.ts).
@@ -83,6 +93,90 @@ type StatePayload struct {
 	// Revision is the newest config revision the agent has applied (0 = none).
 	Revision int64  `json:"reported_revision,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
+
+	// ── V4-WP6 telemetry (DEVELOPMENT.md §13.4.4) ──────────────────────
+	//
+	// All of it is optional and additive: an older panel ignores the unknown
+	// keys (validateStateReport tolerates unknown fields), and an older agent
+	// simply omits them — which is why the panel's health synthesis must
+	// treat "field absent" as "unknown", never as a zero/threshold breach.
+
+	/// Newest config revision this agent has *seen* in an envelope. Compared
+	/// with Revision (applied) it separates "panel is pushing but this node
+	/// cannot apply" from "node is up to date".
+	KnownRevision int64 `json:"known_revision,omitempty"`
+	/// Agent process start time, unix seconds (0 = unknown).
+	StartedAt int64 `json:"started_at,omitempty"`
+	/// Agent uptime in seconds, derived from StartedAt by the payload
+	/// builder (the panel must not trust an agent clock for arithmetic).
+	Uptime int64 `json:"uptime_seconds,omitempty"`
+	/// Host facts that only change on reinstall.
+	Hostname string `json:"hostname,omitempty"`
+	OS       string `json:"os,omitempty"`
+	Arch     string `json:"arch,omitempty"`
+	/// DIRECT / RELAY-ingress / RELAY-egress runtime counts.
+	Runtimes *RuntimeCounts `json:"runtime_counts,omitempty"`
+	/// One lightweight resource sample. Absent when the host exposes none
+	/// (non-linux build, or every sampler failed).
+	Host *HostSample `json:"host,omitempty"`
+	/// Apply/runtime error ledger summary. Always present once the agent has
+	/// a ledger so the panel can distinguish "0 errors" from "no ledger".
+	ErrorCount int64 `json:"error_count,omitempty"`
+	/// Newest failure time, unix seconds (0 = never).
+	LastErrorAt int64 `json:"last_error_at,omitempty"`
+}
+
+// HostSample is the on-the-wire resource sample. Field names are explicit about
+// bytes/seconds; the panel never has to guess a unit.
+//
+// Only *valid* groups are emitted: a linux box where statfs failed sends no
+// disk_* keys at all, so the panel cannot mistake "unknown" for "0 bytes".
+type HostSample struct {
+	CPUCount int     `json:"cpu_count,omitempty"`
+	Load1    float64 `json:"load1,omitempty"`
+	Load5    float64 `json:"load5,omitempty"`
+	Load15   float64 `json:"load15,omitempty"`
+
+	MemoryTotal uint64 `json:"memory_total_bytes,omitempty"`
+	MemoryUsed  uint64 `json:"memory_used_bytes,omitempty"`
+
+	DiskPath  string `json:"disk_path,omitempty"`
+	DiskTotal uint64 `json:"disk_total_bytes,omitempty"`
+	DiskFree  uint64 `json:"disk_free_bytes,omitempty"`
+
+	HostUptime uint64 `json:"host_uptime_seconds,omitempty"`
+	ProcessRSS uint64 `json:"process_rss_bytes,omitempty"`
+}
+
+// hostSampleFrom projects a HostStats onto the wire shape, dropping every group
+// whose sampler reported nothing (see the *Valid flags in telemetry.go).
+func hostSampleFrom(h HostStats) *HostSample {
+	out := &HostSample{CPUCount: h.CPUCount}
+	any := h.CPUCount > 0
+	if h.LoadValid {
+		out.Load1, out.Load5, out.Load15 = h.Load1, h.Load5, h.Load15
+		any = true
+	}
+	if h.MemoryValid {
+		out.MemoryTotal, out.MemoryUsed = h.MemoryTotal, h.MemoryUsed
+		any = true
+	}
+	if h.DiskValid {
+		out.DiskPath, out.DiskTotal, out.DiskFree = h.DiskPath, h.DiskTotal, h.DiskFree
+		any = true
+	}
+	if h.HostUpValid {
+		out.HostUptime = h.HostUptime
+		any = true
+	}
+	if h.ProcessValid {
+		out.ProcessRSS = h.ProcessRSS
+		any = true
+	}
+	if !any {
+		return nil
+	}
+	return out
 }
 
 // EgressPool is the reported target pool of one egress tunnel.
@@ -129,6 +223,20 @@ type Config struct {
 	ports    PortLister
 	revision RevisionLister
 	lastErr  ErrorLister
+
+	// ── V4-WP6 telemetry sources (all optional) ──
+	//
+	// host     : hostname/os/arch + one resource sample per beat;
+	// ledger   : apply/runtime error counters (shared with the control loop);
+	// revisions: newest *seen* revision (shared with the control loop);
+	// startedAt: agent process start, used for uptime_seconds.
+	//
+	// nil for any of them = report no field from that group. That is the
+	// deliberate "unknown, not zero" contract the panel thresholds on.
+	host      HostSampler
+	ledger    *Ledger
+	revisions *RevisionState
+	startedAt time.Time
 
 	// post overrides the HTTP call (tests). Defaults to httpPost.
 	post func(ctx context.Context, url string, body []byte, headers map[string]string) error
@@ -177,6 +285,26 @@ func WithLastError(e ErrorLister) Option { return func(c *Config) { c.lastErr = 
 
 // WithClock replaces the clock (tests).
 func WithNow(now func() time.Time) Option { return func(c *Config) { c.now = now } }
+
+// WithHost sets the host identity/resource sampler (V4-WP6).
+func WithHost(h HostSampler) Option { return func(c *Config) { c.host = h } }
+
+// WithLedger shares the apply/runtime error ledger with the reporter, so the
+// control loop's failures show up in the state report (V4-WP6 §13.4.4
+// "最近 runtime/apply error").
+func WithLedger(l *Ledger) Option { return func(c *Config) { c.ledger = l } }
+
+// WithRevisionState shares the newest-seen revision tracker with the reporter,
+// so `known_revision` (from envelopes) and `reported_revision` (applied) can be
+// compared on the panel.
+func WithRevisionState(r *RevisionState) Option { return func(c *Config) { c.revisions = r } }
+
+// WithStartedAt sets the agent process start time (uptime source). main passes
+// its own start instant; a zero value simply omits uptime_seconds.
+func WithStartedAt(t time.Time) Option { return func(c *Config) { c.startedAt = t } }
+
+// StartedAt reports the configured process start time (zero when unset).
+func (r *Reporter) StartedAt() time.Time { return r.cfg.startedAt }
 
 // New builds a reporter with options applied after cfg.
 func New(cfg Config, opts ...Option) *Reporter {
@@ -232,6 +360,8 @@ func (r *Reporter) StatePayload() StatePayload {
 	}
 	if r.cfg.tunnels != nil {
 		p.Tunnels = r.cfg.tunnels.List()
+		counts := CountRuntimes(p.Tunnels)
+		p.Runtimes = &counts
 	}
 	if r.cfg.egress != nil {
 		p.EgressPools = r.cfg.egress.Snapshot()
@@ -245,7 +375,50 @@ func (r *Reporter) StatePayload() StatePayload {
 	if r.cfg.lastErr != nil {
 		p.LastErr = r.cfg.lastErr.LastError()
 	}
+	r.fillTelemetry(&p)
 	return p
+}
+
+// fillTelemetry adds the V4-WP6 facts (§13.4.4). Everything here is derived
+// from injected sources and cannot fail the report: a missing sampler means the
+// field group is absent, which the panel reads as "unknown".
+//
+// Note the ordering discipline for errors: the *ledger* wins over the legacy
+// single-string source when both are wired, because the ledger also carries the
+// count and the failure time. `lastErr` (WP7 shape) stays as the fallback so an
+// agent that only has that source keeps reporting a message.
+func (r *Reporter) fillTelemetry(p *StatePayload) {
+	if r.cfg.host != nil {
+		id := r.cfg.host.Identity()
+		p.Hostname = id.Hostname
+		p.OS = id.OS
+		p.Arch = id.Arch
+		p.Host = hostSampleFrom(r.cfg.host.Sample())
+	}
+	if r.cfg.revisions != nil {
+		p.KnownRevision = r.cfg.revisions.Known()
+	}
+	if !r.cfg.startedAt.IsZero() {
+		p.StartedAt = r.cfg.startedAt.Unix()
+		if up := r.cfg.now().Sub(r.cfg.startedAt); up > 0 {
+			p.Uptime = int64(up / time.Second)
+		}
+	}
+	if r.cfg.ledger != nil {
+		st := r.cfg.ledger.Snapshot()
+		p.ErrorCount = st.Count
+		if !st.LastAt.IsZero() {
+			p.LastErrorAt = st.LastAt.Unix()
+		}
+		// The ledger is authoritative when it has something to say: it carries
+		// the newest message *and* the counters, while the legacy lastErr source
+		// is a single string with no notion of when it happened. An empty ledger
+		// leaves the legacy message in place (a node whose only error source is
+		// WP7's LastErrorLister still reports it).
+		if st.LastMessage != "" {
+			p.LastErr = st.LastMessage
+		}
+	}
 }
 
 // StateEndpoint returns the full state-report URL, or "" when credential-less.

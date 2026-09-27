@@ -21,6 +21,16 @@ export const env = {
   siteUrl: process.env.SITE_URL ?? "http://localhost:8088",
   /** Docker-first node installer pulls this dedicated slim Agent image. */
   agentImage: process.env.TUNEX_AGENT_IMAGE?.trim() || "ghcr.io/paimoncai/tunex-agent:latest",
+  /**
+   * V4-WP6：面板建议节点升级到的 Agent 版本（§13.4.3「查看 Agent version /
+   * 是否建议升级」的**基线**）。空串 = 未配置 = **不判版本落后**
+   * （`agent_version_unknown` 也不会出现）。
+   *
+   * 为什么不从代码里推断：仓库里没有任何权威的「当前 Agent 版本」常量
+   * （`agentImage` 只有镜像标签 `:latest`），凭猜测编一个基线会让面板对所有
+   * 节点谎报「版本落后」。部署方知道自己发的镜像版本，就由部署方给这一项。
+   */
+  agentLatestVersion: process.env.TUNEX_AGENT_LATEST_VERSION?.trim() || "",
 
   databaseUrl: requireSecret("DATABASE_URL"),
   redisUrl: process.env.REDIS_URL ?? "redis://redis:6379",

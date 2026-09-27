@@ -13,6 +13,7 @@ import type {
   LicenseInfo,
   Node,
   NodeGroup,
+  NodeStateReport,
   Payment,
   Plan,
   PlanOrder,
@@ -1251,3 +1252,66 @@ export const mockAdminStats: AdminDashboardStats = {
 
 /** 演示登录凭据（与真实后端契约一致：POST /auth/login {email,password}） */
 export const DEMO_CREDENTIALS = { email: "demo@tunex.example", password: "demo1234" };
+
+/**
+ * V4-WP6 §13.4.4：演示用的状态上报（Agent → node_state_report）。
+ *
+ * 只给 **sg-out-01（id 6）** 一条：它是种子数据里唯一「有凭据 + 在线 +
+ * 在 relay 链路上」的节点，因此能同时展示 telemetry 的每一块（版本 / 资源 /
+ * runtime 计数与端口 / 错误账本）与**由转发事实推出的理由**——隧道 5 的
+ * `apply_status = "error"` 会让 node 6 拿到一条 error 级 `forward_apply_error`，
+ * 这正是「可操作理由」要演示的路径。
+ *
+ * 其他节点故意**没有上报**：hk-in-01/02/03（无凭据 → waiting/unknown）、
+ * jp-out-01（有凭据无上报 → never_reported）、sg-out-02（无凭据）。
+ * 三种「没有事实」的形态各不相同，面板的空态因此都有真实覆盖。
+ *
+ * 注意：不要把 jp-out-01（id 4）也塞进来——WP12 的既有测试用 id 4 断言
+ * 「无上报时 /state 返回 null」（前端面板的空态契约），加一条就会把它打红。
+ */
+export const mockNodeStateReports: NodeStateReport[] = [
+  {
+    node_id: 6,
+    version: "1.8.4",
+    // Agent 自报小写，面板存的是 "both" → 不产生 role_mismatch（同一角色）
+    role: "both",
+    known_revision: 5,
+    reported_revision: 5,
+    tunnels: [
+      // 与 health 的 desired runtime 对齐：relay 出口侧 = tunex-<id>-egress。
+      // revision 与 tunnel.config_revision 相等 → 不产生 revision_behind。
+      { id: "tunex-3-egress", mode: "relay", egress_port: 31011, revision: 3, targets: ["10.0.0.21:25565"] },
+      { id: "tunex-5-egress", mode: "relay", egress_port: 31012, revision: 5, targets: ["10.0.0.31:3389"] },
+    ],
+    egress_pools: {
+      "2": { strategy: "round", targets: ["10.0.0.31:3389"] },
+    },
+    used_ports: [20010, 20030, 31011, 31012],
+    last_error: "apply tunex-5-egress: egress pool has no healthy target",
+    error_count: 2,
+    // 5 分钟前：超出 90s 的「持续报错」窗口 → historical warning 而不是 error。
+    // node 6 的 error 级理由来自隧道 5 的 apply_status，不来自这里。
+    last_error_at: iso(new Date(now.getTime() - 5 * 60 * 1000)),
+    // 面板观察列：Agent 进程 3 天前启动（uptime 由面板时钟算）
+    agent_started_at: iso(daysAgo(3, 2)),
+    hostname: "sg-out-01",
+    os: "linux",
+    arch: "amd64",
+    runtime_counts: { direct: 0, relay_ingress: 0, relay_egress: 2, total: 2 },
+    host_metrics: {
+      cpu_count: 4,
+      load1: 0.42,
+      load5: 0.55,
+      load15: 0.61,
+      memory_total_bytes: 2 * 1024 * 1024 * 1024,
+      memory_used_bytes: Math.round(1.31 * 1024 * 1024 * 1024),
+      disk_path: "/",
+      disk_total_bytes: 80 * 1024 * 1024 * 1024,
+      disk_free_bytes: Math.round(27.4 * 1024 * 1024 * 1024),
+      host_uptime_seconds: 32 * 86400,
+      process_rss_bytes: 48 * 1024 * 1024,
+    },
+    reported_at: iso(now),
+    updated_at: iso(now),
+  },
+];

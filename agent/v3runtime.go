@@ -25,6 +25,10 @@ type v3Runtime struct {
 	api     *api.Server
 	control *control.Client
 	heart   *reporter.Reporter
+	// ledger is the V4-WP6 apply/runtime error ledger, kept on the runtime so a
+	// later admin surface can record operator-triggered failures into the same
+	// place the panel reads.
+	ledger  *reporter.Ledger
 	started bool
 }
 
@@ -40,6 +44,9 @@ type v3Runtime struct {
 // "BOTH" is the default because a freshly provisioned node has no role yet and
 // the v3 tunnel managers must be ready for the first apply.
 func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
+	// startedAt is sampled once here: uptime must measure the agent process, not
+	// the moment the reporter happened to build a payload.
+	startedAt := time.Now()
 	role := cfg.Role
 	if role == "" {
 		role = agentconfig.RoleBoth
@@ -95,6 +102,14 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		}
 	}
 
+	// V4-WP6 telemetry: one error ledger and one revision tracker shared by the
+	// control loop (writer) and the reporter (reader). Sharing is the point —
+	// a second copy on either side would make the panel's `known vs applied`
+	// comparison and `error_count` describe different processes.
+	ledger := reporter.NewLedger()
+	revisions := reporter.NewRevisionState()
+	rt.ledger = ledger
+
 	// 3. Outbound control loop. The Agent polls the Panel with its per-node
 	// credential; the Panel never dials this process. This is the production
 	// control path for DIRECT/RELAY/EGRESS. The local admin API above is debug-only.
@@ -102,6 +117,8 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		rt.control = control.New(control.Config{
 			PanelURL: cfg.PanelHTTPURL,
 			Credential: cfg.NodeCredential,
+			Errors: ledger,
+			Revisions: revisions,
 		}, tunnels, egress)
 		go func() {
 			if err := rt.control.Run(ctx); err != nil {
@@ -126,6 +143,13 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			reporter.WithEgress(egressAdapter{egress}),
 			reporter.WithPorts(tunnels),
 			reporter.WithRevision(tunnels),
+			// V4-WP6 (§13.4.4): host facts, resource sample, error ledger and
+			// the newest-seen revision ride the existing state report.
+			reporter.WithHost(reporter.NewSystemSampler("")),
+			reporter.WithLedger(ledger),
+			reporter.WithLastError(ledger),
+			reporter.WithRevisionState(revisions),
+			reporter.WithStartedAt(startedAt),
 		)
 		go func() {
 			if err := rt.heart.Run(ctx); err != nil {

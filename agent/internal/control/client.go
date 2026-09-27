@@ -1,4 +1,10 @@
 // Package control implements the v3 outbound-only control transport.
+//
+// V4-WP6 (§13.4.4) adds two optional observers so the state report can describe
+// *why* a node is behind: the newest revision seen in an envelope and the
+// apply/runtime failures. Both are plain interfaces (not a dependency on
+// reporter) so the transport stays testable on its own and the reporter owns the
+// ledger implementation.
 package control
 
 import (
@@ -23,9 +29,27 @@ const (
 	httpTimeout = 12 * time.Second
 )
 
+// ErrorRecorder files one apply/runtime failure message (V4-WP6 §13.4.4
+// "最近 runtime/apply error"). reporter.Ledger satisfies it; a nil recorder
+// keeps the transport silent, which is what every existing test expects.
+type ErrorRecorder interface {
+	Record(message string)
+}
+
+// RevisionObserver records a revision the agent has *seen* (not applied), so
+// the panel can separate "pushing but this node cannot apply" from "up to
+// date". reporter.RevisionState satisfies it.
+type RevisionObserver interface {
+	Observe(revision int64)
+}
+
 type Config struct {
 	PanelURL string
 	Credential string
+
+	// Optional V4-WP6 telemetry sinks (both default to nil = no recording).
+	Errors    ErrorRecorder
+	Revisions RevisionObserver
 }
 
 type Envelope struct {
@@ -80,7 +104,18 @@ func (c *Client) Run(ctx context.Context) error {
 		if err != nil {
 			logx.Debug("control pull failed", "err", err.Error())
 		} else if cmd != nil {
+			// Observe before execute: the revision is "known" the moment the
+			// envelope arrives, even if the apply is about to fail.
+			if c.cfg.Revisions != nil {
+				c.cfg.Revisions.Observe(cmd.Envelope.Revision)
+			}
 			ack := c.execute(cmd)
+			if !ack.OK && ack.Error != "" {
+				// The panel learns this from the ACK too, but the report needs
+				// it as a *fact* so health synthesis can see a node that is
+				// still erroring after the command was already consumed.
+				c.recordError(ack.ErrorCode, cmd.Envelope.ResourceID, ack.Error)
+			}
 			if err := c.ack(ctx, ack); err != nil {
 				logx.Warn("control ack failed", "command_id", ack.CommandID, "err", err.Error())
 			}
@@ -92,6 +127,34 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 	}
 }
+
+// recordError files one failure in the shared ledger. The message is prefixed
+// with the structured error code and resource id so an operator reading the
+// node's `last_error` on the panel can tell a stale-revision rejection from a
+// dial failure without opening agent logs. It is truncated to the panel's
+// VarChar(500) so a long dial error cannot make the report be rejected.
+func (c *Client) recordError(code, resourceID, message string) {
+	if c.cfg.Errors == nil {
+		return
+	}
+	prefix := "apply"
+	if strings.TrimSpace(code) != "" {
+		prefix += ":" + strings.TrimSpace(code)
+	}
+	if strings.TrimSpace(resourceID) != "" {
+		prefix += " " + strings.TrimSpace(resourceID)
+	}
+	text := prefix + ": " + message
+	if len(text) > maxReportedErrorBytes {
+		text = text[:maxReportedErrorBytes]
+	}
+	c.cfg.Errors.Record(text)
+}
+
+// maxReportedErrorBytes mirrors node_state_report.last_error VarChar(500). The
+// panel would truncate anyway; doing it here keeps the *reported* fact equal to
+// the stored one.
+const maxReportedErrorBytes = 500
 
 func (c *Client) pull(ctx context.Context) (*QueuedCommand, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.cfg.PanelURL, "/")+commandsPath, nil)
