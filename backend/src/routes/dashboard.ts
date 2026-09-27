@@ -2,8 +2,11 @@
  * 仪表盘路由（用户侧）—— 前端 api.dashboard.*
  *
  * 端点（挂载于 /api/dashboard）：
- *   GET /stats     个人概览：余额 / 佣金 / 隧道数 / 套餐流量 / 节点数 / 今日流量
- *   GET /traffic   近 N 天流量趋势（TrafficPoint[]）
+ *   GET /stats      个人概览：余额 / 佣金 / 隧道数 / 套餐流量 / 节点数 / 今日流量
+ *   GET /traffic    近 N 天流量趋势（TrafficPoint[]）
+ *   GET /attention  V4-WP8 §13.7 Wave 4：需要处理的异常/离线/等待安装条目
+ *                   （离线或未安装的节点、管理态挡掉新业务的节点、失败或
+ *                   仍在下发中的 Forward），每条带既有理由码供前端给下一步
  *
  * 挂载方式（由 app.ts 的收尾子代理执行，本模块不修改 app.ts）：
  *   import { dashboardRoutes } from "./routes/dashboard.ts";
@@ -22,6 +25,8 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
+import { collectAttention } from "../services/attention.ts";
+import { projectUserNode } from "../services/node-view.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const dashboardRoutes = new Hono<{ Variables: AppVariables }>();
@@ -105,7 +110,21 @@ dashboardRoutes.get("/stats", async (c) => {
   const [userPlan, tunnelCount, nodes, todayAgg, monthAgg] = await Promise.all([
     workspace.kind === "personal" ? db.userPlan.findUnique({ where: { user_id: user.id }, include: { plan: true } }) : null,
     db.tunnel.count({ where: { workspace_id: workspace.id } }),
-    db.node.findMany({ where: { node_group: { workspace_id: workspace.id } }, select: { status: true } }),
+    db.node.findMany({
+      where: { node_group: { workspace_id: workspace.id } },
+      // V4-WP8：节点计数也要用 Connection 层的事实。改造前这里只数
+      // `status === "active"`（legacy 列），所以「从未安装过 Agent 的节点」
+      // 与「已装但掉线的节点」都会被算成在线 —— Dashboard 的节点卡片因此
+      // 与节点页显示的在线数不一致。这里改读同一批事实列，判定交给
+      // services/node-view.ts（唯一实现）。
+      select: {
+        status: true,
+        last_seen_at: true,
+        node_credential_hash: true,
+        credential_revoked: true,
+        lifecycle: true,
+      },
+    }),
     db.tunnelTraffic.aggregate({
       where: { date: { gte: startOfToday() }, tunnel: { workspace_id: workspace.id } },
       _sum: { traffic: true },
@@ -116,7 +135,15 @@ dashboardRoutes.get("/stats", async (c) => {
     }),
   ]);
 
-  const activeNodes = nodes.filter((n) => n.status === "active").length;
+  const activeNodes = nodes.filter((n) =>
+    projectUserNode({
+      status: n.status,
+      last_seen_at: n.last_seen_at,
+      has_credential: Boolean(n.node_credential_hash),
+      credential_revoked: n.credential_revoked,
+      lifecycle: n.lifecycle,
+    }).online,
+  ).length;
   const totalNodes = nodes.length;
 
   const stats = {
@@ -135,4 +162,47 @@ dashboardRoutes.get("/stats", async (c) => {
   };
 
   return c.json({ data: stats });
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /attention —— 需要处理的异常 / 离线 / 等待安装                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * V4-WP8 §13.7 Wave 4：Dashboard 优先显示异常、离线、等待安装与快捷操作。
+ *
+ * 判定全部在 `services/attention.ts` 里（复用 WP5 的 `deriveConnection` /
+ * `nodeAdmission` 与 WP3 的 `isRetryable`）；本路由只做三件事：
+ *   · 用 `resolveWorkspaceAccess` 落到当前 workspace（不跨空间泄漏节点/转发）；
+ *   · 把结果装进标准 `{ data }` 信封；
+ *   · 让 DB 不可用时**不 500** —— Dashboard 是首页，一个聚合查询失败不该让
+ *     整个页面打不开；返回空清单并标注 `degraded`，由前端提示「暂时取不到
+ *     待办」而不是伪装成「一切正常」。
+ *
+ * 注册为 GET：轮询 Dashboard 时会重复命中，走 `api-global` 限流即可
+ * （与 `/stats` / `/traffic` 同一取向；读端点不新建专属规则）。
+ */
+dashboardRoutes.get("/attention", async (c) => {
+  const workspace = await resolveWorkspaceAccess(c, "read");
+  try {
+    const payload = await collectAttention(workspace.id);
+    return c.json({ data: payload });
+  } catch {
+    return c.json({
+      data: {
+        items: [],
+        summary: {
+          nodes_offline: 0,
+          nodes_waiting_install: 0,
+          nodes_restricted: 0,
+          forwards_error: 0,
+          forwards_pending: 0,
+        },
+        total: 0,
+        generated_at: new Date().toISOString(),
+        // 显式标记降级：空清单 ≠ 没有待办。前端据此显示「暂时取不到」。
+        degraded: true,
+      },
+    });
+  }
 });
