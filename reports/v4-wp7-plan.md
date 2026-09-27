@@ -86,14 +86,50 @@
 - 本地不跑 `next build`、不跑全量 `tsc`（按项目约束与用户要求）；CI 负责
   typecheck/build。
 
-## 6. 剩余 Gate / 未完成
+## 6. 交付结果（实现后回填）
 
-1. **后端联调**：确认真实 `GET /api/admin/node/:id/lifecycle` 的
-   `NodeLifecycleView` 与 `PATCH` 的 `{ node, view }` 信封与本文假设一致。
-2. **Gate V4-F2 的真实 E2E**（waiting→online→offline、maintenance 期间保存
+已按 §3 的切片交付，另有两片修正（见下）。契约核对结论：
+
+- `GET /api/admin/node/:id/lifecycle` 返回 `{ data }` 信封，视图键集合固定为
+  十个，**不含**备注与凭据哈希（`services/__tests__/node-lifecycle.test.ts`
+  有断言）。`allowed_transitions` 原样下发白名单，**含当前值**（同值幂等写），
+  「不含自身」是前端渲染时的过滤 —— 原先按「后端已剔除」写会误判。
+- `PATCH` 返回 `{ data: { node, view } }`，其中 `node` 是写后整行；
+  `lifecycle` 键**可缺省**（= 只改备注），故 api 客户端的入参改为可选。
+- **备注（`lifecycle_note` / `lifecycle_updated_at`）不在视图里**，是节点行的列；
+  详情页从 `/admin/nodes/:id` 读。mock 的 PATCH 同步写回节点行，否则详情页
+  永远看不到刚填的原因。
+- `DELETE` 的 409 把 `condition` / `dependencies` 与 `code` **平级**放在顶层；
+  错误解析器按此读取，并容错 mock 的 `data.data` 嵌套。
+- `disabled → maintenance` 被拒；`retiring` 的唯一合法目标是自身（前端渲染为
+  「没有可用操作」）。
+
+### 6.1 实现中修正的两个真实缺陷
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| F1 | 安装等待闭环把「本地是否存着命令」和「对话框是否打开」当成轮询前提，导致「在别的终端装好了」永远等不到更新；关掉对话框即停止等待 —— 等于把本要消灭的缺口原样保留 | 自动开始只看「节点是否仍在等待安装」；轮询不随对话框关闭而停；详情页同步开启（此前只有列表页创建流程接上） |
+| F2 | `roleCheckInput` 是每次渲染新建的对象，却进了下游 effect 依赖 → 只读收缩检查被无限重发；且把未改动值也提交，面板长期显示「检查通过」的噪声 | 上游 `useMemo` 固定身份并只传真正改过的字段；下游依赖拆成基本类型 |
+
+### 6.2 验证
+
+- `bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/forwards/__tests__/`
+  （CI 的 web 单测命令）→ **175 pass / 0 fail**。
+- `web` 目录 `tsc --noEmit` → 无错误（本地仅作定向校验，CI 仍负责 typecheck/build）。
+- `bun scripts/ci/secret-scan.mjs` → OK。
+- 端到端手工核对（mock store，非浏览器）：`waiting → 签发凭据+上报 → online`
+  闭环成立；陈旧上报 → `installed_offline`（不是「等待安装」）；吊销凭据 →
+  `installed_offline`；区间缩到租约之外 → `port_range_would_orphan_leases`。
+
+## 7. 剩余 Gate / 未完成
+
+1. **Gate V4-F2 的真实 E2E**（waiting→online→offline、maintenance 期间保存
    Forward、退出维护只收敛最新 revision、retiring 依赖阻止删除）由
-   WP7/WP8 阶段的 E2E 承担；WP7 只提供 UI 输入面。
-3. **`next build`** 只由 CI 验证（本地不 build）。
-4. **组件级渲染测试**：现有 web 无 jsdom 环境，DOM 交互未在浏览器中断言
-   （mock 覆盖取数与投影）。
-5. 定时轮询（列表页健康/生命周期自动刷新）属 WP8 范围。
+   WP8 阶段的 E2E 承担；WP7 只提供 UI 输入面。
+2. **`next build`** 只由 CI 验证（本地不 build，按用户与项目约束）。
+3. **组件级渲染测试**：现有 web 无 jsdom 环境，DOM 交互未在浏览器中断言
+   （测试覆盖取数、投影与源码级接线）。
+4. 定时轮询（列表页健康/生命周期自动刷新）属 WP8 范围；本地只在新创建节点
+   与详情页等待安装时轮询。
+5. WP9 的分页/筛选不在此分支；`i18n.ts` 未改动，落地后可把
+   `node-lifecycle-i18n.ts` 的键机械并入。
