@@ -56,8 +56,24 @@ const bindingRows: Array<{ id: number; ingress_node_id: number; egress_node_id: 
 const leaseRows: Array<{ id: number; node_id: number; port: number; status: string }> = [];
 const poolRows: Array<{ id: number; node_id: number }> = [];
 
-/** 基准时间：固定，让 90s 在线窗口的判定可预测。 */
-export const STUB_NOW = new Date("2026-09-27T00:00:00.000Z");
+/**
+ * 心跳偏移（毫秒）：替身节点默认 `last_seen_at` 取「**播种这一刻**」往前
+ * 这么久——相对时间，不是固定时刻。
+ *
+ * 为什么不能钉一个固定 `STUB_NOW`（WP5 踩过的坑）：路由层被测
+ * `getNodeLifecycle` 不注入 `now`，读的是真实时钟。固定时刻一旦落在真实
+ * 90s 在线窗口之外（写完它的当天晚些时候再跑就会），active 节点被判
+ * offline，「active + online」断言随即失败——同一份代码换个时间跑就红。
+ * 用相对播种时刻的偏移则永远新鲜；要构造「超窗离线」时，调用方显式传一个
+ * 大于 `CONNECTION_ONLINE_WINDOW_MS` 的历史偏移即可（见
+ * `routes/__tests__/node-lifecycle-route.test.ts`）。
+ */
+export const HEARTBEAT_AGE_MS = 5_000;
+
+/** 新鲜心跳时刻：相对当前时间，让 90s 在线窗口判定稳定成立。 */
+export function freshHeartbeat(ageMs: number = HEARTBEAT_AGE_MS): Date {
+  return new Date(Date.now() - ageMs);
+}
 
 /** 测试里用来断言「哈希绝不外泄」的哨兵值（非真实凭据形态）。 */
 export const STUB_CRED_HASH = "e".repeat(64);
@@ -76,7 +92,7 @@ function seedStubNode(over: Partial<StubNodeRow> = {}): StubNodeRow {
     role: "both",
     status: "active",
     lifecycle: "active",
-    last_seen_at: STUB_NOW,
+    last_seen_at: freshHeartbeat(),
     port_range_min: null,
     port_range_max: null,
     node_credential_hash: STUB_CRED_HASH,

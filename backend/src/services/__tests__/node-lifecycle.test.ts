@@ -120,8 +120,17 @@ function seedNode(over: Partial<LifecycleNodeRow> = {}): LifecycleNodeRow {
   return row;
 }
 
-/** 固定「现在」，让 90s 在线窗口可预测。 */
-const NOW = new Date("2026-09-27T00:00:00.000Z");
+/**
+ * 固定的「现在」基准（本套件注入 `now`，所以被测代码不会读真实时钟）。
+ *
+ * 选 2026-01-01T00:00:00.000Z 而不是「写测试的当天」：`changeLifecycle`
+ * 断言 `lifecycle_updated_at` 与 `now()` 相等，前者是固定值、后者来自注入，
+ * 所以基准必须恒定；而取**远离测试执行日**的历法值，未来有人把这里的
+ * `last_seen_at` / 派生逻辑换成读真实时钟时，不会因为我们选的日子正好
+ * 落在 90s 窗口内而假绿。要构造「超窗离线」一律用
+ * `new Date(NOW.getTime() - 91_000)` 相对偏移，别钉第二个固定时刻。
+ */
+const NOW = new Date("2026-01-01T00:00:00.000Z");
 
 function deps() {
   return { db: makeDb(), now: () => NOW };

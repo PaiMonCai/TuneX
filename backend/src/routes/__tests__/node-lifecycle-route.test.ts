@@ -30,6 +30,8 @@ import {
   mockDb,
   resetLifecycleStub,
   stubState,
+  freshHeartbeat,
+  HEARTBEAT_AGE_MS,
   STUB_CRED_HASH as CRED_HASH,
 } from "../../__tests__/lifecycle-db-stub.ts";
 
@@ -89,6 +91,52 @@ describe("GET /api/admin/node/:id/lifecycle", () => {
     // 凭据纪律：只有布尔，不明文不哈希
     expect(body.data.has_credential).toBe(true);
     expect(JSON.stringify(body)).not.toContain(CRED_HASH);
+  });
+
+  // ── 连接态窗口：以「相对播种时刻」断言，不依赖任何固定时刻 ──
+  // （本文件不再钉 STUB_NOW：路由层读真实时钟，固定时刻会过期成 offline。）
+  test("心跳新鲜（5s 前）→ online", async () => {
+    const node = seedNode({ last_seen_at: freshHeartbeat(5_000) });
+    const res = await app.request(`/api/admin/node/${node.id}/lifecycle`);
+    const body = (await res.json()) as { data: { connection: string } };
+    expect(body.data.connection).toBe("online");
+  });
+
+  test("心跳超窗（91s 前）→ offline，但 active 仍接受新业务", async () => {
+    const node = seedNode({ last_seen_at: freshHeartbeat(91_000) });
+    const res = await app.request(`/api/admin/node/${node.id}/lifecycle`);
+    const body = (await res.json()) as {
+      data: { connection: string; accepts_new_business: boolean };
+    };
+    expect(body.data.connection).toBe("offline");
+    // 连接是事实、生命周期是期望：掉线不剥夺 active 的准入（服务层契约）
+    expect(body.data.accepts_new_business).toBe(true);
+  });
+
+  test("从未上报（last_seen_at=null）→ offline", async () => {
+    const node = seedNode({ last_seen_at: null });
+    const res = await app.request(`/api/admin/node/${node.id}/lifecycle`);
+    const body = (await res.json()) as { data: { connection: string; accepts_new_business: boolean } };
+    expect(body.data.connection).toBe("offline");
+    expect(body.data.accepts_new_business).toBe(true);
+  });
+
+  test("无凭据 → waiting + 拒绝码 node_waiting_install", async () => {
+    const node = seedNode({ node_credential_hash: null });
+    const res = await app.request(`/api/admin/node/${node.id}/lifecycle`);
+    const body = (await res.json()) as {
+      data: { connection: string; has_credential: boolean; admission_rejection: string };
+    };
+    expect(body.data.connection).toBe("waiting");
+    expect(body.data.has_credential).toBe(false);
+    expect(body.data.admission_rejection).toBe("node_waiting_install");
+  });
+
+  test("凭据已撤销 → offline（撤销不是 waiting）", async () => {
+    const node = seedNode({ last_seen_at: freshHeartbeat(HEARTBEAT_AGE_MS), credential_revoked: true });
+    const res = await app.request(`/api/admin/node/${node.id}/lifecycle`);
+    const body = (await res.json()) as { data: { connection: string } };
+    expect(body.data.connection).toBe("offline");
   });
 
   test("node_id 字符串也能定位（resolveNodeId 的两种入参）", async () => {
