@@ -55,6 +55,19 @@ import {
   type MockHealthWorld,
 } from "./node-health";
 import {
+  MOCK_LIFECYCLES,
+  MOCK_LIFECYCLE_NOTE_MAX,
+  mockAllowedTransitions,
+  mockCanTransition,
+  mockDeleteGates,
+  mockImpact,
+  mockLifecycleChange,
+  mockLifecycleOf,
+  mockLifecycleView,
+  mockRoleCheck,
+  type MockImpactWorld,
+} from "./node-lifecycle";
+import {
   applyMockForwardPatch,
   injectMockForwardView,
   previewMockForwardUpdate,
@@ -158,6 +171,26 @@ function badRequest(message: string, code = "VALIDATION_ERROR"): MockResponse {
 }
 function notFound(message: string): MockResponse {
   return fail(404, message, "NOT_FOUND");
+}
+
+/**
+ * V4-WP7：错误体把 extras 放在**顶层**。
+ *
+ * 后端 `routes/node-lifecycle.ts` 的拒绝响应形状是
+ * `{ error, message, code, condition?, dependencies? }`（condition 与
+ * dependencies 与 code 平级）。通用 `fail()` 会把 extras 塞进 `data`，
+ * 于是 UI 读 `ApiError.data.condition` 在 mock 模式下拿不到值——错误码
+ * 退化成一视同仁的「操作失败」，正好破坏 §13.5「可区分错误码」的要求。
+ * 新增端点用本函数保持与真实后端同形；不改 `fail()`（大量既有调用方依赖
+ * 它的 `data` 嵌套）。
+ */
+function failFlat(
+  status: number,
+  message: string,
+  code: string,
+  extras: Record<string, unknown> = {},
+): MockResponse {
+  return { status, body: { error: message, message, code, ...extras } };
 }
 
 function isLoggedIn(cookie?: string): boolean {
@@ -917,6 +950,25 @@ function healthWorld(db: Store): MockHealthWorld {
     // （列表说在线、健康卡说上报过期）。真实后端用服务器时钟，这一处只是
     // mock 的自洽选择。
     now: seed.now,
+  };
+}
+
+/**
+ * V4-WP7：把 store 投影成 impact 统计需要的「世界」。
+ *
+ * 入口解析复用 `mockIngressNode`——转发视图、健康视图与依赖统计必须对
+ * 「这条隧道落在哪个节点上」给出**同一个答案**，否则依赖预览会说
+ * 「没有入口转发」而转发列表里明明列着一条。
+ */
+function impactWorld(db: Store): MockImpactWorld {
+  return {
+    nodes: db.nodes,
+    tunnels: db.tunnels,
+    poolsForNode: (nodeId) => (db.egressPools.get(nodeId) ?? []).length,
+    bindingsForNode: (nodeId) =>
+      db.nodeBindings.filter((b) => b.ingress_node_id === nodeId || b.egress_node_id === nodeId).length,
+    leasesForNode: (nodeId) => db.nodeLeases.get(nodeId) ?? [],
+    ingressNodeIdFor: (tunnel) => mockIngressNode(db, tunnel)?.id ?? null,
   };
 }
 
@@ -2753,6 +2805,110 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       const node = mockResolveNode(db.nodes, seg[2]);
       if (!node) return notFound("节点不存在");
       return ok(mockNodeHealth(healthWorld(db), node));
+    }
+
+    // ----- V4-WP7 §13.4.2/§13.4.3 生命周期：单数 /admin/node/:id/lifecycle|impact -----
+    // 形状对齐 backend/src/routes/node-lifecycle.ts：
+    //   · GET  lifecycle  → `{ data: NodeLifecycleView }`
+    //   · PATCH lifecycle → `{ data: { node, view } }`
+    //   · GET  impact     → `{ data: { impact, role_check } }`
+    //   · DELETE lifecycle→ `{ data: { id, deleted } }`
+    // 错误体带 `code` / `condition` / `dependencies`（§13.5 要求可区分错误码，
+    // UI 据此给出不同的下一步；丢掉 condition 就等于把所有拒绝渲染成
+    // 同一句「操作失败」）。
+    if (seg[1] === "node" && seg[3] === "lifecycle") {
+      const node = mockResolveNode(db.nodes, seg[2]);
+      if (!node) return notFound("节点不存在");
+      const stored = db.nodeLifecycle.get(node.id);
+      const current = mockLifecycleOf(node, stored);
+
+      if (method === "GET") {
+        return ok(mockLifecycleView(node, current, seed.now));
+      }
+
+      if (method === "PATCH" || method === "PUT") {
+        const body = asRecord(req.body);
+        const raw = body.lifecycle;
+        // `undefined` / `null` / 空串 = 本次不改生命周期（与后端 parseLifecycle 同义）
+        const requested =
+          raw === undefined || raw === null || raw === "" ? null : String(raw).trim().toLowerCase();
+        if (requested !== null && !(MOCK_LIFECYCLES as string[]).includes(requested)) {
+          return failFlat(400, "生命周期状态必须是 active / maintenance / disabled / retiring", "invalid_input");
+        }
+        if (body.note !== undefined && body.note !== null && typeof body.note !== "string") {
+          return failFlat(400, "备注必须是字符串", "invalid_input");
+        }
+        if (typeof body.note === "string" && body.note.trim().length > MOCK_LIFECYCLE_NOTE_MAX) {
+          return failFlat(400, `备注长度不能超过 ${MOCK_LIFECYCLE_NOTE_MAX}`, "invalid_input");
+        }
+        // 未指定 lifecycle 且没有 note 键 = 什么都不做（返回当前视图）
+        if (requested === null && body.note === undefined) {
+          return ok({ node, view: mockLifecycleView(node, current, seed.now) });
+        }
+        if (requested !== null && !mockCanTransition(current, requested)) {
+          return failFlat(
+            409,
+            `不能从 ${current} 迁移到 ${requested}；可用目标：${mockAllowedTransitions(current).join(" / ") || "无"}`,
+            "invalid_state",
+            { condition: "invalid_transition" },
+          );
+        }
+        const next = (requested ?? current) as import("@/lib/types").NodeLifecycleValue;
+        const note =
+          body.note === undefined ? (stored?.note ?? null) : reqStr(body.note) || null;
+        db.nodeLifecycle.set(node.id, { lifecycle: next, note, updated_at: nowIso() });
+        // PATCH 也把生命周期写回节点行：`/admin/nodes` 列表与 `/impact` 之外的
+        // 读面（NodeDetail）读的是节点行，不同步会出现「详情说维护中、列表说使用中」。
+        node.lifecycle = next;
+        node.updated_at = nowIso();
+        return ok(mockLifecycleChange(node, next, seed.now));
+      }
+
+      if (method === "DELETE") {
+        const gate = mockDeleteGates({ lifecycle: current, impact: mockImpact(impactWorld(db), node.id) });
+        if (!gate.ok) {
+          const impact = mockImpact(impactWorld(db), node.id);
+          const code = gate.condition === "node_not_retiring" ? "invalid_state" : "dependency_blocked";
+          return failFlat(409, gate.message, code, { condition: gate.condition, dependencies: impact });
+        }
+        db.nodes.splice(db.nodes.indexOf(node), 1);
+        db.nodeCredentials.delete(node.id);
+        db.egressPools.delete(node.id);
+        db.egressTargets.delete(node.id);
+        db.nodeLifecycle.delete(node.id);
+        db.nodeLeases.delete(node.id);
+        db.nodeStates.delete(node.id);
+        return ok({ id: node.id, deleted: true });
+      }
+    }
+
+    if (seg[1] === "node" && method === "GET" && seg[3] === "impact") {
+      const node = mockResolveNode(db.nodes, seg[2]);
+      if (!node) return notFound("节点不存在");
+      const nextRole = typeof q?.next_role === "string" ? q.next_role : undefined;
+      const portMin = q?.port_min !== undefined ? Number(q.port_min) : undefined;
+      const portMax = q?.port_max !== undefined ? Number(q.port_max) : undefined;
+      const nextPortRange =
+        portMin !== undefined && portMax !== undefined && Number.isFinite(portMin) && Number.isFinite(portMax)
+          ? { min: portMin, max: portMax }
+          : undefined;
+      // `current_role` 缺省 = 沿用节点自身角色（与后端路由的 currentRole ?? null 同义）
+      const currentRole =
+        typeof q?.current_role === "string" ? q.current_role : (node.role ?? null);
+      const impact = mockImpact(impactWorld(db), node.id);
+      const check = {
+        ...(nextPortRange ? { nextPortRange } : {}),
+        ...(nextRole !== undefined || nextPortRange ? { nextRole: nextRole ?? currentRole } : {}),
+      };
+      return ok({
+        impact,
+        role_check: mockRoleCheck({
+          currentRole,
+          impact,
+          ...check,
+          activeLeasePorts: db.nodeLeases.get(node.id) ?? [],
+        }),
+      });
     }
 
     // ----- WP12 凭据：/admin/node/:id/credential[/rotate|/revoke] -----
