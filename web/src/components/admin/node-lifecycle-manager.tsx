@@ -46,13 +46,16 @@ export interface NodeLifecycleManagerProps {
   currentNote?: string | null;
   onChanged?: LifecycleChangeHandler;
   /**
-   * 角色 / 端口区间的**待提交**输入。
+   * 角色 / 端口区间的**待提交**输入（只含真正改过的字段）。
    *
-   * 父组件的角色表单每次变更就把它传进来，本组件去问后端 `checkRoleChange`
-   * 的结论——判定规则只在服务端有一份，前端不做「BOTH→EGRESS 是否可行」的
+   * 由父组件在用户改动角色表单时传入，本组件去问后端 `checkRoleChange` 的
+   * 结论——判定规则只在服务端有一份，前端不做「BOTH→EGRESS 是否可行」的
    * 推断（§13.4.3 硬要求）。
+   *
+   * 语义与后端的 query 一致：**缺省 = 不改**。`null`/`undefined` = 没有任何
+   * 待提交改动（此时不发请求，也不显示检查结论）。
    */
-  roleCheckInput?: { nextRole: string | null; portMin: number | null; portMax: number | null } | null;
+  roleCheckInput?: { nextRole?: string; portMin?: number; portMax?: number } | null;
   /** 父组件希望在成功删除后离开详情页。 */
   onDeleted?: (id: ID) => void;
 }
@@ -109,18 +112,29 @@ export function NodeLifecycleManager({
     void load();
   }, [load]);
 
-  /** 角色/端口区间检查：输入变化时问后端（不去抖，检查是只读且缓存友好）。 */
+  /**
+   * 角色/端口收缩检查：把候选值问一遍后端（只读、缓存友好，故不去抖）。
+   *
+   * 依赖刻意拆成**基本类型**而不是 `roleCheckInput` 对象：上游每次渲染都可能
+   * 造一个新对象，用对象做依赖会让这个 effect 每帧都重跑，把只读检查变成请求
+   * 风暴。上游也只传真正改过的字段（见 node-detail-manager 的 memo）。
+   */
+  const nextRole = roleCheckInput?.nextRole ?? null;
+  const portMin = roleCheckInput?.portMin ?? null;
+  const portMax = roleCheckInput?.portMax ?? null;
   useEffect(() => {
-    if (!roleCheckInput) {
+    if (nextRole === null && (portMin === null || portMax === null)) {
       setRoleCheck(null);
       return;
     }
     let cancelled = false;
     setRoleCheckPending(true);
     const query: { next_role?: string; port_min?: number; port_max?: number } = {};
-    if (roleCheckInput.nextRole) query.next_role = roleCheckInput.nextRole;
-    if (roleCheckInput.portMin !== null) query.port_min = roleCheckInput.portMin;
-    if (roleCheckInput.portMax !== null) query.port_max = roleCheckInput.portMax;
+    if (nextRole !== null) query.next_role = nextRole;
+    if (portMin !== null && portMax !== null) {
+      query.port_min = portMin;
+      query.port_max = portMax;
+    }
     void api.admin
       .nodeImpact(nodeId, query)
       .then((res) => {
@@ -137,7 +151,7 @@ export function NodeLifecycleManager({
     return () => {
       cancelled = true;
     };
-  }, [nodeId, roleCheckInput?.nextRole, roleCheckInput?.portMin, roleCheckInput?.portMax, roleCheckInput]);
+  }, [nodeId, nextRole, portMin, portMax]);
 
   const apply = useCallback(
     async (lifecycle: NodeLifecycleValue, nextNote: string | null) => {

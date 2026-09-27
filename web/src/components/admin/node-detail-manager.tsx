@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -123,14 +123,31 @@ export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
   /**
    * V4-WP7：把角色/端口区间的**待提交**值交给 lifecycle 管理组件做影响检查。
    *
-   * 判定在服务端（`checkRoleChange`）；这里只负责在用户改动表单时把候选值
-   * 传给后端，并把结论渲染出来。空值 = 不参与检查（与后端「缺省 = 不改」同义）。
+   * 判定在服务端（`checkRoleChange`）；这里只负责把候选值传出去，并把结论渲染
+   * 出来。两条纪律：
+   *   1. **只传真正改过的字段**——把「没变的值」也塞进去会让面板一直显示
+   *      「收缩检查通过」，看起来像在提示什么，其实是噪声；后端语义也是
+   *      「缺省 = 不改」。
+   *   2. 对象必须 memo——它进了下游 effect 的依赖，每次渲染都造一个新对象
+   *      会让检查请求无限重发。
    */
-  const roleCheckInput = {
-    nextRole: form.role === "" ? null : (form.role as string),
-    portMin: toNumOrNull(form.port_range_min),
-    portMax: toNumOrNull(form.port_range_max),
-  };
+  const roleCheckInput = useMemo(() => {
+    const savedRole = node.role ?? "";
+    const savedMin = strOf(node.port_range_min);
+    const savedMax = strOf(node.port_range_max);
+    const next: { nextRole?: string; portMin?: number; portMax?: number } = {};
+    if (form.role !== savedRole && form.role !== "") next.nextRole = form.role;
+    // 端口区间按「两个都给且至少一个变了」提交，避免半截区间被当成收缩
+    const minChanged = form.port_range_min !== savedMin;
+    const maxChanged = form.port_range_max !== savedMax;
+    const min = toNumOrNull(form.port_range_min);
+    const max = toNumOrNull(form.port_range_max);
+    if ((minChanged || maxChanged) && min !== null && max !== null) {
+      next.portMin = min;
+      next.portMax = max;
+    }
+    return Object.keys(next).length === 0 ? null : next;
+  }, [form.role, form.port_range_min, form.port_range_max, node.role, node.port_range_min, node.port_range_max]);
 
   return (
     <div className="flex flex-col gap-5" data-testid="admin-node-detail">

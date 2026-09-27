@@ -234,6 +234,30 @@ describe("WP7 lifecycle 端点契约", () => {
     }
   });
 
+  test("GET impact 带收缩候选：区间会悬空租约时给出专用条件码", async () => {
+    // node 6 在种子里占用 24001/24002；把区间缩到 1000-1010 会让它们悬空。
+    const shrink = await call<NodeImpactResult>("GET", `/admin/node/${DEMO}/impact`, {
+      next_role: "both",
+      port_min: "1000",
+      port_max: "1010",
+    });
+    expect(shrink.status).toBe(200);
+    expect(shrink.body.role_check.ok).toBe(false);
+    expect(shrink.body.role_check.condition).toBe("port_range_would_orphan_leases");
+
+    // 区间仍覆盖现有租约 → 通过（判定在服务端，前端只渲染结论）
+    const covering = await call<NodeImpactResult>("GET", `/admin/node/${DEMO}/impact`, {
+      next_role: "both",
+      port_min: "24000",
+      port_max: "24100",
+    });
+    expect(covering.body.role_check.ok).toBe(true);
+
+    // 不带候选参数 = 不改 → 永远通过，且不产生误报
+    const none = await call<NodeImpactResult>("GET", `/admin/node/${DEMO}/impact`);
+    expect(none.body.role_check.ok).toBe(true);
+  });
+
   test("未知节点：404（不是 500、不是空视图）", async () => {
     const res = await call<Record<string, unknown>>("GET", "/admin/node/99999/lifecycle");
     expect(res.status).toBe(404);
