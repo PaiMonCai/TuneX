@@ -41,9 +41,13 @@ export type NodeLifecycleValue = (typeof NODE_LIFECYCLES)[number];
 /**
  * 连接态枚举（§13.4.1 Connection 层）。
  *
- * WP5 **不新推导**：连接态由 routes/nodes.ts 的 `nodeView()` 用
- * `status + last_seen_at + credential` 推导。这里只把既有事实收拢成命名，
- * 让「这个节点现在能不能接新业务」成为单一谓词，而不是每个调用方各判一遍。
+ * 这里是 Connection 判定的**唯一落点**：`deriveConnection()` 用
+ * `status + last_seen_at + credential` 推导，所有调用方（用户侧
+ * `services/node-view.ts`、管理端 `node-lifecycle.ts` 的
+ * `lifecycleView`、health 合成）都消费它，不再各自判一遍。
+ *
+ * V4-WP8 说明：改造前 `routes/nodes.ts` 的 `nodeView()` 曾自带一份同样的
+ * 推导（两份实现靠人工对齐）；现已改为调用本模块，路由层只做形状翻译。
  */
 export const NODE_CONNECTIONS = ["waiting", "online", "offline"] as const;
 export type NodeConnectionValue = (typeof NODE_CONNECTIONS)[number];
@@ -51,7 +55,13 @@ export type NodeConnectionValue = (typeof NODE_CONNECTIONS)[number];
 /** 进入 maintenance / retiring 时用户可填的原因长度上限（与 schema VarChar 对齐）。 */
 export const LIFECYCLE_NOTE_MAX = 255;
 
-/** 上报陈旧阈值（毫秒）：与 routes/nodes.ts 的 `nodeView` 保持一致（90s）。 */
+/**
+ * 上报陈旧阈值（毫秒）。
+ *
+ * 判定的**唯一**使用点是下面的 `deriveConnection`；任何其它模块（含路由层）
+ * 出现同样数值即为复制判据 —— `services/__tests__/node-view.test.ts` 有静态
+ * 守卫钉住这一点。
+ */
 export const CONNECTION_ONLINE_WINDOW_MS = 90_000;
 
 /* ================================================================== */
@@ -216,11 +226,15 @@ export function businessRejectionCode(lifecycle: string | null | undefined): Lif
 }
 
 /**
- * 连接态推导（**复用** routes/nodes.ts `nodeView` 的口径，不重发明）。
+ * 连接态推导（Connection 层事实的**唯一**实现）。
  *
  *   waiting —— 已创建但从未绑定凭据（尚未完成 enrollment）
  *   online  —— 有有效凭据、未撤销、status=active 且 last_seen 在窗口内
  *   offline —— 其余（含：有凭据但掉线、有凭据但已撤销）
+ *
+ * 调用方：用户侧 `services/node-view.ts`（`/api/nodes` 三层投影）、本模块的
+ * `lifecycleView`、`services/node-health.ts` 的 health 合成。V4-WP8 之前
+ * `routes/nodes.ts` 还有一份等价实现，已删除 —— 路由层只做形状翻译。
  *
  * 为什么 revoked 归 offline 而不是 waiting：revoke 是**主动**断开机器身份，
  * 节点确实已不在服务；waiting 的语义是「还没装好」，给 revoked 用会让运维
