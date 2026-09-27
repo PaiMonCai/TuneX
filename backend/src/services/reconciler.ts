@@ -951,11 +951,21 @@ function pickNode(
   const a = seen(ingress);
   const b = seen(egress);
   const oldest = a == null || b == null ? null : new Date(Math.min(a, b));
+  // V4-WP5 §13.4.2：lifecycle 必须随折叠视图带出去。漏了它，
+  // `executeReconcile` 的 `nodeInMaintenance` 对 RELAY 恒为 false（DIRECT 走
+  // 上面的 early return 所以不受影响），维护中的入口/出口节点会被照样下发新
+  // desired revision——正是 §13.4.2「不接受需要立即应用的新 runtime 变化」
+  // 禁止的行为。**任一侧 maintenance 就按维护处理**：RELAY 的新 runtime 要同时
+  // 落在两侧，只放行一侧等于把半态写进数据面。其余 lifecycle 取值原样投影
+  // （planTunnelActions 只认 maintenance，disabled / retiring 的处理另属编排层）。
+  const anyMaintenance =
+    ingress.lifecycle === "maintenance" || egress.lifecycle === "maintenance";
 
   return {
     node_id: ingress.node_id,
     status,
     last_seen_at: oldest,
     reported_at: oldest,
+    lifecycle: anyMaintenance ? "maintenance" : (ingress.lifecycle ?? egress.lifecycle ?? null),
   };
 }
