@@ -36,6 +36,18 @@ const calls = {
 };
 
 /** 服务层替身：记录调用参数，返回可控行集。 */
+/**
+ * 服务层替身。**导出面必须与 `services/forward-service.ts` 的运行时导出等价**
+ * （至少覆盖 routes/forwards.ts 与 routes/nodes.ts 的具名导入全集）。
+ *
+ * `mock.module` 是**进程级**注册表：同一进程内所有解析该模块的调用方拿到最后
+ * 注册的那个工厂结果。本文件与 `forward-batch-route.test.ts` 都会替换
+ * forward-service，若任一方的替身只列「自己用到的键」，另一方（或同进程内
+ * 之后加载的文件）就会在具名导入处炸 `SyntaxError: Export named 'runForwardBatch'
+ * not found`——且与用例内容无关，只随文件加载顺序时红时绿（CI 上实际发生）。
+ * 本仓库对同类问题已有先例与结论，见 `src/__tests__/lifecycle-db-stub.ts` 顶部：
+ * 替身必须**语义完整**。新增服务层导出时，两份替身都要补。
+ */
 mock.module(`${ROOT}services/forward-service.ts`, () => ({
   listForwards: async (_workspaceId: number, input: Record<string, unknown>) => {
     calls.list.push({ scope: "all", input });
@@ -63,6 +75,17 @@ mock.module(`${ROOT}services/forward-service.ts`, () => ({
   patchForward: async () => ({ ok: true, data: {} }),
   previewForwardUpdate: async () => ({ ok: true, data: {} }),
   runForwardAction: async () => ({ ok: true, data: {} }),
+  /**
+   * V4-WP9：批量替身。本文件不测批量语义（那是 forward-batch-route.test.ts），
+   * 但**必须**在这里存在——见上方注释（进程级注册表 / 具名导入）。
+   */
+  runForwardBatch: async () => ({
+    action: "retry",
+    requested: 0,
+    succeeded: 0,
+    failed: 0,
+    results: [],
+  }),
 }));
 
 /** workspace 替身：路由的 `workspace(c)` 依赖它写入的变量。 */
