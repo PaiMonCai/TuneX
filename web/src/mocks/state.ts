@@ -18,6 +18,7 @@ import type {
   LicenseInfo,
   Node,
   NodeGroup,
+  NodeLifecycleValue,
   NodeStateReport,
   Payment,
   Plan,
@@ -31,6 +32,7 @@ import type {
   WorkspaceRole,
 } from "@/lib/types";
 import * as seed from "./data";
+import { MOCK_LIFECYCLE_SEED, MOCK_PORT_LEASE_SEED } from "./node-lifecycle";
 
 /** build() 内复用种子数据集的时间基准（seed.now），保证演示数据时间一致 */
 const iso = (d: Date) => d.toISOString();
@@ -78,8 +80,25 @@ export interface MockStore {
   egressTargets: Map<ID, EgressTarget[]>;
   /** WP12 节点最近一条运行态上报（node_id → report） */
   nodeStates: Map<ID, NodeStateReport>;
+  /**
+   * V4-WP7 节点生命周期（node_id → { lifecycle, note, updated_at }）。
+   *
+   * 单独一张 Map 而不是写进 `Node.lifecycle`：mock 的 `Node` 是种子行的克隆，
+   * 生命周期有独立的变更时刻（`lifecycle_updated_at`），混进节点行会让
+   * 「PATCH 生命周期」看起来像改了节点基础信息。缺省（不在 Map 里）= active。
+   */
+  nodeLifecycle: Map<ID, MockNodeLifecycle>;
+  /** V4-WP7 演示端口租约（node_id → active 端口列表）；mock 无 NodePortLease 表。 */
+  nodeLeases: Map<ID, number[]>;
   /** 单例创建时间，便于调试 */
   boot_at: string;
+}
+
+/** V4-WP7 mock 生命周期行（对齐 schema 的 lifecycle/lifecycle_note/lifecycle_updated_at）。 */
+export interface MockNodeLifecycle {
+  lifecycle: NodeLifecycleValue;
+  note: string | null;
+  updated_at: string;
 }
 
 /** TEN-01 mock 工作空间（对齐 backend/prisma/schema.prisma 的 Workspace 子集） */
@@ -168,6 +187,16 @@ function build(): MockStore {
   for (const n of nodes) {
     const g = nodeGroups.find((x) => x.id === n.node_group_id);
     n.node_group = g ? { id: g.id, name: g.name, node_type: g.node_type } : undefined;
+    // V4-WP7：把生命周期种子灌进节点行。
+    // 后端只有一列真值（Node.lifecycle / lifecycle_note）；mock 若把它只放在
+    // 单独的 Map 里，详情页与列表（读节点行）就永远看不到维护态——而 PATCH 之后
+    // 又变成了节点行有、Map 也有，两边不同步。这里以节点行为准即可。
+    const seeded = MOCK_LIFECYCLE_SEED[n.id];
+    if (seeded) {
+      n.lifecycle = seeded.lifecycle;
+      n.lifecycle_note = seeded.note;
+      n.lifecycle_updated_at = iso(daysAgo(1));
+    }
   }
   const tunnels = clone(seed.mockTunnels);
   for (const t of tunnels) {
@@ -258,6 +287,14 @@ function build(): MockStore {
     egressPools: seedPoolsByNode(),
     egressTargets: new Map(seed.mockEgressPools.map((p) => [p.pool.id, clone(p.targets)])),
     nodeStates: new Map(seed.mockNodeStateReports.map((r) => [r.node_id, clone(r)])),
+    // V4-WP7：生命周期与演示租约（缺省 = active 且无备注/无租约，与 schema 默认值一致）
+    nodeLifecycle: new Map(
+      Object.entries(MOCK_LIFECYCLE_SEED).map(([id, row]) => [
+        Number(id),
+        { lifecycle: row.lifecycle, note: row.note, updated_at: iso(daysAgo(1)) },
+      ]),
+    ),
+    nodeLeases: new Map(Object.entries(MOCK_PORT_LEASE_SEED).map(([id, ports]) => [Number(id), [...ports]])),
     boot_at: new Date().toISOString(),
   };
 }
