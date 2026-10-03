@@ -1886,10 +1886,22 @@ WP11C Diagnose / Support    ✅ Forward 诊断（分段，业务端口不探测�
                               Gate F5.10 / F5.12 覆盖
 ```
 
-**关于 "V4.5 Stable"**：F4/F5 已在真实四节点拓扑全绿（F4 58/0、F5 133/0），因此代码与
-Gate 层面已就绪。标记 V4.5 Stable 还需要一个**发布窗口动作**（确定版本号与镜像标签、
-按 docs/release-notes-v4.md 走一次升级演练并留存记录），这属于发布流程，不属于本目标的
-"完成 F4/F5 + 补测试与文档"。在此之前 README 保持"不标记为 V4.5 Stable"的说法。
+**关于 "V4.5 Stable"——发布窗口已执行完毕（2026-10-03）**：
+
+```text
+发布提交    14305c8
+镜像        ghcr.io/paimoncai/tunex:14305c8        （image id c0d99e9379ad）
+            ghcr.io/paimoncai/tunex-agent:14305c8  （image id cd4d3da7c2eb）
+演练        面板升级（readyz 200 + 22 migrations/schema up to date）
+            回滚双向（:14305c8 ↔ 上一镜像，健康闸门与迁移兼容性检查均通过）
+            Agent 升级（发布镜像 + 安装布局：换镜像不换 agent_id、能力清单齐全）
+查出的缺陷  整数型 env 变量被静默忽略（真实缺陷）、rollback.sh 三处部署属性写死、
+            e2e 与生产的镜像变量不一致 —— 均已修复并补测
+记录        docs/release-record-v4.5.md
+未做        docker push 这两个 tag（需要 registry 凭证）
+```
+
+因此 README 现在标记 **V4.5 Stable 已放行**。
 
 ### 2026-09-28 暂停前状态（历史）
 
