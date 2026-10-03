@@ -3,10 +3,13 @@
  * - 自动携带 Cookie（credentials: "include"，兼容 SSR 转发 cookie）
  * - SEC-02 CSRF：所有写操作统一带 `X-CSRF-Token: 1` 自定义头
  *   （后端 middlewares/csrf.ts 凭此 + Origin/Referer 挡跨站写）
- * - 401/403 时跳转登录页（携带 next 参数）
+ * - 仅 401 时跳转登录页（403 保留权限错误）（携带 next 参数）
  * - NEXT_PUBLIC_API_MOCK=1 时改为调用 src/mocks/handler.ts 的手写响应
  */
 import type {
+  DiagnoseReport,
+  NodeDiagnosticsReport,
+  NodeUpgradeCommand,
   AdminDashboardStats,
   AdminListInput,
   AdminResourceMeta,
@@ -79,6 +82,8 @@ import type {
   WorkspaceTrafficSummary,
 } from "./types";
 import { normalizeHealthSummary } from "./node-health";
+import { shouldRedirectToLogin } from "./workspace-permissions";
+import type { EffectiveWorkspacePermissions, WorkspaceCustomRole, WorkspaceCustomRoleInput, WorkspaceMemberRoleInput } from "./workspace-permissions";
 
 export const API_MOCK = process.env.NEXT_PUBLIC_API_MOCK === "1";
 
@@ -220,7 +225,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     const { handleMock } = await import("@/mocks/handler");
     // 浏览器端的 mock「请求」也要带上真实 cookie，否则 SSR 里能看到的会话在客户端丢失
     const reqCookie = cookie ?? (typeof document !== "undefined" ? document.cookie : undefined);
-    const res = await handleMock(method, path, { body, query, cookie: reqCookie });
+    const res = await handleMock(method, path, { body, query, cookie: reqCookie, workspaceId: workspaceId ?? (typeof window !== "undefined" ? activeWorkspaceId ?? undefined : reqCookie ? workspaceIdFromCookie(reqCookie) ?? undefined : undefined) });
     if (res.status === 401 && !noRedirect) redirectToLogin();
     if (res.status >= 400) {
       throw new ApiError(res.status, (res.body as { message?: string })?.message ?? "Request failed", res.body);
@@ -265,7 +270,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
  * 一起丢掉，所以这类端点必须自己拿原始信封。
  */
 async function finalize<T>(res: Response, noRedirect?: boolean, unwrap = true): Promise<T> {
-  if (res.status === 401 || res.status === 403) {
+  if (shouldRedirectToLogin(res.status)) {
     if (!noRedirect) redirectToLogin();
   }
 
@@ -307,7 +312,7 @@ function unwrapData<T>(data: unknown): T {
 }
 
 const get = <T>(path: string, query?: ListQuery, cookie?: string) =>
-  request<T>(path, { method: "GET", query, cookie });
+  request<T>(path, { method: "GET", query, cookie, workspaceId: cookie ? workspaceIdFromCookie(cookie) ?? undefined : undefined });
 const post = <T>(path: string, body?: unknown, cookie?: string) =>
   request<T>(path, { method: "POST", body, cookie });
 const put = <T>(path: string, body?: unknown, cookie?: string) => request<T>(path, { method: "PUT", body, cookie });
@@ -320,6 +325,12 @@ export const api = {
   // 这几个端点全部按「会话 cookie」鉴权（Bearer token 会被后端 403 拒绝），
   // 因此浏览器侧请求不要带 Authorization 头。
   workspaces: {
+    permissions: (id: number) => request<EffectiveWorkspacePermissions>(`/workspaces/${id}/permissions`, { noRedirect: true, workspaceId: id }),
+    roles: (id: number) => get<WorkspaceCustomRole[]>(`/workspaces/${id}/roles`),
+    createRole: (id: number, input: WorkspaceCustomRoleInput) => post<WorkspaceCustomRole>(`/workspaces/${id}/roles`, input),
+    updateRole: (id: number, roleId: number, input: WorkspaceCustomRoleInput) => patch<WorkspaceCustomRole>(`/workspaces/${id}/roles/${roleId}`, input),
+    deleteRole: (id: number, roleId: number) => del<{ ok: boolean }>(`/workspaces/${id}/roles/${roleId}`),
+    assignRole: (id: number, userId: number, input: WorkspaceMemberRoleInput) => patch<WorkspaceMember>(`/workspaces/${id}/members/${userId}/role`, input),
     /** 当前用户可见的全部工作空间（含个人空间），带上各自角色 */
     list: (cookie?: string) => get<Workspace[]>("/workspaces", undefined, cookie),
     /** 创建团队空间（后端事务内发放默认策略），创建者成为 owner */
@@ -477,6 +488,14 @@ export const api = {
     ) => post<PortForward>(`/forwards/${id}/${action}`, {}, cookie),
     remove: (id: ID, cookie?: string) =>
       del<{ ok: true }>(`/forwards/${id}`, cookie),
+    /**
+     * V4-WP11C：Forward 诊断（只读）。
+     *
+     * 探针目标由**后端**从该转发的已授权期望状态推导，请求体不带 host/port ——
+     * 因此这里刻意不接受任何参数：一个"带目标参数的诊断"就是把客户端变成内网扫描器。
+     */
+    diagnose: (id: ID, cookie?: string) =>
+      post<DiagnoseReport>(`/forwards/${id}/diagnose`, {}, cookie),
   },
   nodes: {
     list: (cookie?: string) => get<UserNode[]>("/nodes", undefined, cookie),
@@ -488,6 +507,24 @@ export const api = {
       post<NodeBinding>(`/nodes/${ingressId}/bindings`, { egress_node_id }, cookie),
     unbindEgress: (ingressId: ID, egressId: ID, cookie?: string) =>
       del<{ ok: boolean }>(`/nodes/${ingressId}/bindings/${egressId}`, cookie),
+    /**
+     * V4-WP11C：Node 级诊断。后端会**先判活**：上报过期即返回 offline，不下发命令。
+     */
+    diagnostics: (id: ID, cookie?: string) =>
+      get<NodeDiagnosticsReport>(`/nodes/${id}/diagnostics`, undefined, cookie),
+    /**
+     * V4-WP11C：Support Bundle（白名单采集 + 脱敏）。返回整份产物用于另存为 JSON。
+     */
+    supportBundle: (id: ID, cookie?: string) =>
+      get<Record<string, unknown>>(`/nodes/${id}/support-bundle`, undefined, cookie),
+    /**
+     * V4-WP11B：渲染升级脚本。
+     *
+     * 返回的是**操作者需要在节点上执行**的脚本；控制面不会远程替换 Agent。
+     * `allow_active` 为 false 时后端会拒绝非 maintenance 节点（409）。
+     */
+    upgradeCommand: (id: ID, input: { agent_image: string; allow_active?: boolean }, cookie?: string) =>
+      post<NodeUpgradeCommand>(`/nodes/${id}/upgrade-command`, input, cookie),
   },
   nodeGroups: {
     list: (query?: ListQuery, cookie?: string) => get<Paginated<NodeGroup>>("/node-groups", query, cookie),

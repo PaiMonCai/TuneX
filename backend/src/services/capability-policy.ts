@@ -413,6 +413,19 @@ export function checkTunnelCreation(policy: EffectivePolicy, ctx: TunnelCreateCo
   return { allowed: true };
 }
 
+/** Existing resources consume no new count slot. Capability and traffic gates
+ * still apply to retarget/retry/resume; metadata/delete/suspend bypass this gate.
+ * Keep the same protocol/group semantics as creation without duplicating them. */
+export function checkTunnelUse(
+  policy: EffectivePolicy,
+  ctx: Omit<TunnelCreateContext, "tunnelCount">,
+): CapabilityDecision {
+  return checkTunnelCreation(
+    { ...policy, limits: { ...policy.limits, max_tunnels: null } },
+    { ...ctx, tunnelCount: 0 },
+  );
+}
+
 function sharedGroupAllowed(allowList: number[] | null, groupId: number): boolean {
   if (allowList === null) return false; // 仅自有
   return allowList.includes(groupId);

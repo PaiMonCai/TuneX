@@ -1,10 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeftRight, Copy, Link2, Plus, RefreshCw, Server, Trash2 } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, getActiveWorkspace } from "@/lib/api";
+import { NodeDiagnostics } from "@/components/nodes/node-diagnostics";
+import { useWorkspace } from "@/components/workspace/workspace-context";
+import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -38,6 +41,11 @@ function isEgress(node: UserNode) {
 
 export function NodeWorkspace() {
   const { t, locale } = useI18n();
+  const { currentId, permissions, permissionsLoading, can } = useWorkspace();
+  const canRead = can("node:read");
+  const canManage = can("node:manage");
+  const nodeSeq = useRef(0);
+  const bindingSeq = useRef(0);
   const [nodes, setNodes] = useState<UserNode[]>([]);
   const [groups, setGroups] = useState<NodeGroup[]>([]);
   const [selectedIngressId, setSelectedIngressId] = useState<number | null>(null);
@@ -70,12 +78,17 @@ export function NodeWorkspace() {
   }, [nodes, bindings, selectedIngressId]);
 
   async function loadNodes() {
+    const ticket = ++nodeSeq.current;
+    const scope = currentId;
+    setNodes([]); setGroups([]);
+    if (!canRead) { setLoading(false); return; }
     setLoading(true);
     try {
       const [nodeRows, groupRows] = await Promise.all([
         api.nodes.list(),
-        api.nodeGroups.list({ page: 1, page_size: 100 }),
+        canManage ? api.nodeGroups.list({ page: 1, page_size: 100 }).catch(() => ({ data: [] })) : Promise.resolve({ data: [] }),
       ]);
+      if (ticket !== nodeSeq.current || scope !== getActiveWorkspace()) return;
       setNodes(nodeRows);
       setGroups(groupRows.data);
       const ingressRows = nodeRows.filter(isIngress);
@@ -86,17 +99,21 @@ export function NodeWorkspace() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("common.noData"));
     } finally {
-      setLoading(false);
+      if (ticket === nodeSeq.current) setLoading(false);
     }
   }
 
   async function loadBindings(id: number | null) {
-    if (!id) {
+    const ticket = ++bindingSeq.current;
+    const scope = currentId;
+    setBindings([]);
+    if (!id || !canRead) {
       setBindings([]);
       return;
     }
     try {
-      setBindings(await api.nodes.bindings(id));
+      const rows = await api.nodes.bindings(id);
+      if (ticket === bindingSeq.current && scope === getActiveWorkspace()) setBindings(rows);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("common.noData"));
     }
@@ -108,7 +125,8 @@ export function NodeWorkspace() {
     // 读到后滚动到那张卡片并高亮（找不到就什么也不做，不报错）。
     const requested = new URLSearchParams(window.location.search).get("focus");
     if (requested && /^\d+$/.test(requested)) setFocusId(Number(requested));
-  }, []);
+    return () => { nodeSeq.current++; bindingSeq.current++; };
+  }, [currentId, permissions]);
 
   useEffect(() => {
     if (focusId === null || loading) return;
@@ -118,7 +136,10 @@ export function NodeWorkspace() {
 
   useEffect(() => {
     void loadBindings(selectedIngressId);
-  }, [selectedIngressId]);
+    return () => { bindingSeq.current++; };
+  }, [selectedIngressId, currentId, permissions]);
+
+  useEffect(() => { setInstall(null); setCreateOpen(false); setBindOpen(false); setSelectedIngressId(null); }, [currentId, permissions]);
 
   useEffect(() => {
     if (!createOpen || groupId || groups.length === 0) return;
@@ -128,6 +149,7 @@ export function NodeWorkspace() {
   }, [createOpen, groupId, groups]);
 
   async function createNode() {
+    if (!canManage) { toast.error(PERMISSION_DENIED); return; }
     const gid = Number(groupId);
     if (!nodeId.trim() || !Number.isInteger(gid)) {
       toast.error("请填写节点 ID 并选择节点组");
@@ -153,6 +175,7 @@ export function NodeWorkspace() {
   }
 
   async function regenerateInstaller(node: UserNode) {
+    if (!canManage) { toast.error(PERMISSION_DENIED); return; }
     setBusy(true);
     try {
       setInstall(await api.nodes.enrollment(node.id));
@@ -164,6 +187,7 @@ export function NodeWorkspace() {
   }
 
   async function copyInstaller() {
+    if (!canManage) { toast.error(PERMISSION_DENIED); return; }
     if (!install) return;
     try {
       await navigator.clipboard.writeText(install.install_command);
@@ -174,6 +198,7 @@ export function NodeWorkspace() {
   }
 
   async function bindEgress() {
+    if (!canManage) { toast.error(PERMISSION_DENIED); return; }
     if (!selectedIngressId || !bindEgressId) return;
     setBusy(true);
     try {
@@ -190,6 +215,7 @@ export function NodeWorkspace() {
   }
 
   async function unbindEgress(egressId: number) {
+    if (!canManage) { toast.error(PERMISSION_DENIED); return; }
     if (!selectedIngressId) return;
     setBusy(true);
     try {
@@ -203,6 +229,8 @@ export function NodeWorkspace() {
     }
   }
 
+  if (permissionsLoading) return <p>{t("common.loading")}</p>;
+  if (!canRead) return <p role="alert">{PERMISSION_DENIED}</p>;
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -216,7 +244,7 @@ export function NodeWorkspace() {
               {t("common.forwards")}
             </Link>
           </Button>
-          <Button onClick={() => setCreateOpen(true)}>
+          <Button disabled={!canManage} onClick={() => setCreateOpen(true)}>
             <Plus className="size-4" />
             {t("node.create")}
           </Button>
@@ -299,7 +327,7 @@ export function NodeWorkspace() {
                       {t("node.bindings")}
                     </Button>
                   ) : null}
-                  <Button size="sm" variant="outline" onClick={() => void regenerateInstaller(node)} disabled={busy}>
+                  <Button size="sm" variant="outline" onClick={() => void regenerateInstaller(node)} disabled={busy || !canManage}>
                     <RefreshCw className="size-3.5" />
                     {node.registered ? t("node.reinstall") : t("node.install")}
                   </Button>
@@ -332,7 +360,7 @@ export function NodeWorkspace() {
                     {t("node.viewForwards")}
                   </Link>
                 </Button>
-                <Button size="sm" variant="outline" onClick={() => setBindOpen(true)}>
+                <Button disabled={!canManage} size="sm" variant="outline" onClick={() => setBindOpen(true)}>
                   <Link2 className="size-3.5" />
                   {t("node.bindEgress")}
                 </Button>
@@ -371,7 +399,7 @@ export function NodeWorkspace() {
         </Card>
       ) : null}
 
-      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+      <Dialog open={createOpen && canManage} onOpenChange={setCreateOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t("node.create")}</DialogTitle>
@@ -441,7 +469,12 @@ export function NodeWorkspace() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={bindOpen} onOpenChange={setBindOpen}>
+      {/* V4-WP11C/WP11B：诊断 / 支持包 / 升级命令。只读 + 生成脚本，不改运行态。 */}
+      {selectedIngress ? (
+        <NodeDiagnostics nodeId={selectedIngress.id} nodeKey={selectedIngress.node_id} />
+      ) : null}
+
+      <Dialog open={bindOpen && canManage} onOpenChange={setBindOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t("node.bindEgress")}</DialogTitle>

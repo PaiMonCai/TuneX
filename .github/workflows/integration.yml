@@ -65,6 +65,13 @@ jobs:
         run: python3 scripts/v3-e2e/v4-gate-f2.py
       - name: Run V4-F3 monitoring scale and UX closure gate
         run: python3 scripts/v3-e2e/v4-gate-f3.py
+      - name: Run V4-F4 authorization and NodeGroup closure gate
+        run: python3 scripts/v3-e2e/v4-gate-f4.py
+      # V4-WP11 / F5: durability (last-known-good cache, fail-closed fallback,
+      # authoritative prune), graceful shutdown with a live connection, and the
+      # ops-script rewrite guards. It stops and recreates real Agents on purpose.
+      - name: Run V4-F5 durability shutdown and ops closure gate
+        run: python3 scripts/v3-e2e/v4-gate-f5.py
       - name: Upload v3/v4 integration evidence
         if: failure() || github.event_name == 'workflow_run'
         uses: actions/upload-artifact@v7

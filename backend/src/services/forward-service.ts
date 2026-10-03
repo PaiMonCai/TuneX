@@ -47,6 +47,8 @@ import {
 } from "./tunnel-api.ts";
 import { nodeAdmission } from "./node-lifecycle.ts";
 import { FORWARD_LIST_MAX_UNPAGED } from "./forward-list-query.ts";
+import { checkForwardRuntimeUse } from "./forward-capability.ts";
+import { authorizationErrorLayer, type AuthorizationErrorLayer } from "./authorization-errors.ts";
 import type { ForwardPage } from "./forward-list-query.ts";
 import {
   forwardBatchSummary,
@@ -95,6 +97,7 @@ export type ForwardServiceError = {
   code: string;
   message: string;
   apply_error_code?: string;
+  error_layer?: AuthorizationErrorLayer;
   data?: unknown;
 };
 
@@ -199,9 +202,9 @@ function error(
   status: ForwardServiceError["status"],
   code: string,
   message: string,
-  extra?: Pick<ForwardServiceError, "apply_error_code" | "data">,
+  extra?: Pick<ForwardServiceError, "apply_error_code" | "data" | "error_layer">,
 ): ForwardServiceError {
-  return { ok: false, status, code, message, ...extra };
+  return { ok: false, status, code, message, error_layer: authorizationErrorLayer(code, extra?.data), ...extra };
 }
 
 function targetAddress(host: string, port: number): string {
@@ -220,6 +223,7 @@ export function forwardView(t: any) {
 
   return {
     id: t.id,
+    creator_user_id: t.user_id ?? null,
     name: t.name,
     protocol: "tcp" as const,
     mode: (t.tunnel_mode ?? "direct") as ForwardMode,
@@ -798,6 +802,7 @@ export async function patchForward(
   id: number,
   workspaceId: number,
   patch: ForwardPatchInput,
+  actorId?: number,
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
@@ -805,7 +810,7 @@ export async function patchForward(
   // ── V4-WP1 §13.3.3：校验逻辑只有一个实现 ──
   // patchForward 与 previewForwardUpdate 都走 resolveForwardCandidate() → 同一个
   // 合并 + 同一个校验 + 同一个影响面计算；两者只差「是否落库」。
-  const resolved = await resolveForwardCandidate(id, workspaceId, patch);
+  const resolved = await resolveForwardCandidate(id, workspaceId, patch, actorId);
   if (!resolved.ok) return resolved.error;
 
   const { base, candidate, ctx, metadataOnly, desiredStatus } = resolved.data;
@@ -1101,7 +1106,7 @@ async function resolveForwardCandidate(
     candidate.listen_port === null
       ? Promise.resolve([])
       : db.nodePortLease.findMany({
-          where: { port: candidate.listen_port, status: "active" },
+          where: { node_id: candidate.ingress_node_id, port: candidate.listen_port, status: "active" },
           select: { tunnel_id: true, port: true },
         }),
     db.tunnel.findMany({
@@ -1242,6 +1247,20 @@ async function resolveForwardCandidate(
     };
   }
 
+  if (!isMetadataOnlyPatch(base, candidate)) {
+    const rejected = await checkForwardRuntimeUse(workspaceId, {
+      user_id: current.user_id,
+      in_node_group_id: ingress.node_group_id,
+      out_node_group_id: candidate.mode === "relay" ? egress?.node_group_id ?? null : null,
+      tunnel_type: "tcp",
+    });
+    if (rejected) {
+      return { ok: false, error: error(403, rejected.reason, rejected.message, {
+        data: { error_layer: rejected.error_layer },
+      }) };
+    }
+  }
+
   // suspended 编辑：§13.3.6「保存最新 desired revision → 不启动 runtime」。
   // 目标 desired_status 取当前值，suspend 的 desired 是 inactive 已由运行动作维护。
   const desiredStatus: ForwardDesiredStatus =
@@ -1276,7 +1295,7 @@ export async function runForwardAction(
       TUNNEL_API_ERROR_STATUS[result.code],
       result.code,
       result.message,
-      { apply_error_code: result.apply_error_code },
+      { apply_error_code: result.apply_error_code, error_layer: result.error_layer, data: result.reason ? { reason: result.reason } : undefined },
     );
   }
 
@@ -1301,9 +1320,23 @@ export async function runForwardBatch(
   ids: number[],
   action: ForwardBatchAction,
   workspaceId: number,
+  authorize?: (row: { user_id: number }) => boolean,
 ): Promise<ForwardBatchPayload> {
   const results: ForwardBatchItemResult[] = [];
   for (const id of ids) {
+    // Scope before RBAC: a foreign ID remains 404, never an existence oracle.
+    if (authorize) {
+      const row = await loadForwardRow(id, workspaceId);
+      if (!row) {
+        results.push({ id, ok: false, apply_status: null, code: "not_found", message: "端口转发不存在" });
+        continue;
+      }
+      if (!authorize(row)) {
+        // Same code as the single-resource endpoint: a per-item RBAC refusal.
+        results.push({ id, ok: false, apply_status: null, code: "forbidden", error_layer: "rbac", message: "无权操作该端口转发" });
+        continue;
+      }
+    }
     const outcome = await runForwardAction(id, action, workspaceId);
     if (outcome.ok) {
       results.push({
@@ -1351,7 +1384,7 @@ export async function deleteForward(
       TUNNEL_API_ERROR_STATUS[result.code],
       result.code,
       result.message,
-      { apply_error_code: result.apply_error_code },
+      { apply_error_code: result.apply_error_code, error_layer: result.error_layer, data: result.reason ? { reason: result.reason } : undefined },
     );
   }
 

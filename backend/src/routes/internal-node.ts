@@ -175,6 +175,10 @@ internalNodeRoutes.post("/node/ack", async (c) => {
       applied_revision: typeof body.applied_revision === "number" ? body.applied_revision : null,
       error_code: typeof body.error_code === "string" ? body.error_code : null,
       error: typeof body.error === "string" ? body.error.slice(0, 500) : null,
+      // V4-WP11C: a read-only action may return structured findings. They are
+      // validated and bounded in the bus, not trusted as-is.
+      ...(body.results !== undefined ? { results: body.results as never } : {}),
+      ...(body.facts !== undefined ? { facts: body.facts as never } : {}),
     });
   } catch {
     return c.json({ ok: false, error: "invalid_ack" }, 400);

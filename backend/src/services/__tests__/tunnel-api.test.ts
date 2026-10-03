@@ -359,6 +359,7 @@ function deps(over: TunnelApiDeps = {}): TunnelApiDeps {
   return {
     db: makeDb(),
     loadPolicy: async () => allowAllPolicy(),
+    runtimeUse: async () => null,
     orchestrator: fakeOrchestrator as never,
     applyDirect: successDirect(),
     now: () => new Date("2026-09-25T12:00:00.000Z"),
@@ -782,6 +783,27 @@ describe("B. CRUD", () => {
 /* ================================================================== */
 /* C. 运行操作统一走 orchestrator（§7.13 铁律）                          */
 /* ================================================================== */
+
+describe("WP10 runtime-use admission", () => {
+  for (const action of ["retry", "resume"] as const) {
+    test(`${action}: revoked capability rejects before desired mutation or dispatch`, async () => {
+      const t = seedTunnel({ id: 990, apply_status: action === "retry" ? "error" : "suspended", desired_status: "inactive" });
+      const before = JSON.stringify(t);
+      const result = await runTunnelAction(t.id, action, 7, deps({ runtimeUse: async () => ({ code: "policy_denied", reason: "no_active_policy", error_layer: "capability", message: "revoked" }) }));
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error_layer).toBe("capability");
+      expect(JSON.stringify(t)).toBe(before);
+      expect(orchestratorCalls).toHaveLength(0);
+    });
+  }
+  test("suspend remains available after revoke", async () => {
+    const t = seedTunnel({ id: 991, apply_status: "active" });
+    let checked = false;
+    const result = await runTunnelAction(t.id, "suspend", 7, deps({ runtimeUse: async () => { checked = true; throw new Error("must not check"); } }));
+    expect(result.ok).toBe(true);
+    expect(checked).toBe(false);
+  });
+});
 
 describe("C. 运行操作统一走 orchestrator", () => {
   test("C1. retry：仅 error 可重试，且走 reapply（同一 tunnelId，不新建行）", async () => {

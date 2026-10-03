@@ -73,6 +73,10 @@ const fakeDb = () => {
           id,
           node_id: `node-${id}`,
           workspace_id: 1,
+          node_group_id: id,
+          role: id >= 20 ? "egress" : "ingress",
+          connect_ip: `10.0.0.${id}`,
+          lifecycle: "active",
           scope: 1,
           port_range_min: min,
           port_range_max: min + 19999,
@@ -264,7 +268,7 @@ const fakeDb = () => {
     tunnels,
     snapshots,
     addSnapshot: (s: Record<string, unknown>) => snapshots.push({ id: seq++, ...s }),
-    addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, ...t }),
+    addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, user_id: 1, workspace_id: 1, tunnel_type: "tcp", ...t }),
     addRollout: (r: Partial<Row>) =>
       rollouts.push({
         id: rollouts.length + 1,
@@ -405,7 +409,7 @@ function directEnv(overrides: { failOn?: Record<string, boolean> } = {}) {
     node_id: 11,
   });
   const orch = fakeOrchestrator(overrides);
-  return { f, deps: { db: f.db, orchestrator: orch, sleep: async () => {} } as RolloutDeps, orch };
+  return { f, deps: { db: f.db, runtimeUse: async () => null, orchestrator: orch, sleep: async () => {} } as RolloutDeps, orch };
 }
 
 /** 「DIRECT(rev6) → RELAY(rev7)」环境。 */
@@ -461,7 +465,7 @@ function modeSwitchEnv() {
     apply_status: "pending",
     node_id: 11,
   });
-  return { f, deps: { db: f.db, orchestrator: fakeOrchestrator() } as RolloutDeps };
+  return { f, deps: { db: f.db, runtimeUse: async () => null, orchestrator: fakeOrchestrator() } as RolloutDeps };
 }
 
 /* ------------------------------------------------------------------ */
@@ -599,6 +603,7 @@ describe("notes 列：追加式流水账", () => {
 
     const soft: RolloutDeps = {
       db: f.db,
+      runtimeUse: async () => null,
       orchestrator: fakeOrchestrator({ failOn: { removeTunnel: true } }),
       sleep: async () => {},
     };
@@ -628,7 +633,7 @@ describe("notes 列：追加式流水账", () => {
 describe("compensated + compensation_error：§13.3.5 第三张表的两个终态", () => {
   it("CUTOVER 失败且补偿成功 ⇒ compensated=true、compensation_error=null、phase=failed", async () => {
     const { f } = modeSwitchEnv();
-    const d2 = { db: f.db, orchestrator: fakeOrchestrator({ failOn: { dispatchIngress: true } }) } as RolloutDeps;
+    const d2 = { db: f.db, runtimeUse: async () => null, orchestrator: fakeOrchestrator({ failOn: { dispatchIngress: true } }) } as RolloutDeps;
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -649,6 +654,7 @@ describe("compensated + compensation_error：§13.3.5 第三张表的两个终�
     const { f } = modeSwitchEnv();
     const d2 = {
       db: f.db,
+      runtimeUse: async () => null,
       orchestrator: fakeOrchestrator({ failOn: { dispatchIngress: true, removeTunnel: true } }),
     } as RolloutDeps;
     const res = await registerRollout(
@@ -673,7 +679,7 @@ describe("compensated + compensation_error：§13.3.5 第三张表的两个终�
 
   it("PREPARE 失败 ⇒ 不进补偿：compensated 保持 false、compensation_error 为空", async () => {
     const { f } = modeSwitchEnv();
-    const d2 = { db: f.db, orchestrator: fakeOrchestrator({ failOn: { dispatchEgress: true } }) } as RolloutDeps;
+    const d2 = { db: f.db, runtimeUse: async () => null, orchestrator: fakeOrchestrator({ failOn: { dispatchEgress: true } }) } as RolloutDeps;
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -807,7 +813,7 @@ describe("resumeRollouts：只扫未完成、按 id 升序、一条失败不阻�
     f.addRollout({ id: 3, phase: "degraded" });
     f.addRollout({ id: 4, phase: "cutover" });
     // findMany 只返回 `phase in ACTIVE_ROLLOUT_PHASES` 的行 ⇒ 第 4 行。
-    const res = await resumeRollouts({ db: f.db, orchestrator: fakeOrchestrator() as never } as RolloutDeps);
+    const res = await resumeRollouts({ db: f.db, runtimeUse: async () => null, orchestrator: fakeOrchestrator() as never } as RolloutDeps);
     expect(res.scanned).toBe(1);
     expect(readKeySet(f.rollouts[3]!.cleaned).length).toBeGreaterThanOrEqual(0);
   });

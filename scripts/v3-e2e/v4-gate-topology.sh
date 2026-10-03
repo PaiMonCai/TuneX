@@ -45,8 +45,33 @@ PY
 curl -sS -m 15 -D "$TOP/login.headers" -o "$TOP/login.json" -X POST "$API/api/auth/login" -H 'content-type: application/json' -H 'x-requested-with: XMLHttpRequest' -d "$LOGIN" >/dev/null
 COOKIE=$(grep -i '^set-cookie:' "$TOP/login.headers" | head -1 | sed 's/^[Ss]et-[Cc]ookie: *//' | cut -d';' -f1); nonempty "$COOKIE" "F1.1 登录成功"
 api_patch(){ curl -sS -m 120 -o "$TOP/$2" -w '%{http_code}' -X PATCH "$API/api/forwards/$FORWARD_ID" -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'x-requested-with: XMLHttpRequest' -H 'content-type: application/json' -d "$1" || echo 000; }
-OLD=$(curl -sS "$API/api/nodes/$ING_A/forwards" -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'x-requested-with: XMLHttpRequest' | python3 -c "import json,sys;d=json.load(sys.stdin);r=d.get('data',d) or [];print(next((x['id'] for x in r if x.get('name')=='$NAME'),''))" 2>/dev/null || true)
-[[ -n "$OLD" ]] && curl -sS -m 60 -X DELETE "$API/api/forwards/$OLD" -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'x-requested-with: XMLHttpRequest' >/dev/null && sleep 2
+# Remove EVERY previous run's fixture from BOTH nodes this gate uses, and prove
+# the ingress port is free before creating anything.
+#
+# An aborted run (ctrl-C, timeout, killed job) leaves its forward holding the
+# port — possibly on the *other* ingress node, where the next run's migration to
+# that node would then be refused with a real, correct port_conflict. Cleaning
+# only node A turned that fixture residue into a "product failure" report once.
+for node_id in "$ING_A" "$ING_B"; do
+  mapfile -t OLDS < <(curl -sS "$API/api/nodes/$node_id/forwards" -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'x-requested-with: XMLHttpRequest' | python3 -c "import json,sys;d=json.load(sys.stdin);r=d.get('data',d) or [];print('\n'.join(str(x['id']) for x in r if x.get('name')=='$NAME'))" 2>/dev/null || true)
+  for old_id in "${OLDS[@]:-}"; do
+    [[ -z "$old_id" ]] && continue
+    curl -sS -m 60 -X DELETE "$API/api/forwards/$old_id" -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'x-requested-with: XMLHttpRequest' >/dev/null
+    echo "  (removed leftover fixture forward $old_id from node $node_id)"
+  done
+done
+for _ in $(seq 1 30); do
+  leftover=$(mysqlc "SELECT COUNT(*) FROM tunnel WHERE name='$NAME' AND desired_status<>'removed';")
+  [[ "${leftover:-0}" == "0" ]] && break
+  sleep 2
+done
+for _ in $(seq 1 45); do
+  leased=$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE port=$PORT AND status='active';")
+  [[ "${leased:-0}" == "0" ]] && break
+  sleep 2
+done
+# Say it out loud instead of discovering it two thirds of the way through.
+eq "$(mysqlc "SELECT COUNT(*) FROM node_port_lease WHERE port=$PORT AND status='active';")" 0 "F1.0 入口端口在开始前是空闲的"
 log "DIRECT baseline"
 CS=$(curl -sS -m 90 -o "$TOP/create.json" -w '%{http_code}' -X POST "$API/api/nodes/$ING_A/forwards" -H "cookie: $COOKIE" -H "x-workspace-id: $PRI_WS" -H 'x-requested-with: XMLHttpRequest' -H 'content-type: application/json' -d "{\"name\":\"$NAME\",\"listen_port\":$PORT,\"target_host\":\"target-a\",\"target_port\":3030}" || echo 000)
 eq "$CS" 201 "F1.2 DIRECT 基线创建"; FORWARD_ID=$(j create.json data.id); REV=$(j create.json data.config_revision); nonempty "$FORWARD_ID" "F1.3 Forward id 返回"; eq "$(wait_probe "$HOST_A" "$PORT" "$MARK" || true)" "$MARK" "F1.4 DIRECT 数据面"

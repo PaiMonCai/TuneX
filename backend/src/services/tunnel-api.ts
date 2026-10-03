@@ -37,6 +37,7 @@ import type { Orchestrator } from "./orchestrator.ts";
 import { getEffectivePolicy } from "./policy-service.ts";
 import { checkTunnelCreation, type EffectivePolicy } from "./capability-policy.ts";
 import { releaseLease } from "./portPool.ts";
+import { checkForwardRuntimeUse, type RuntimeUseDenied, type RuntimeUseResource } from "./forward-capability.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -104,6 +105,8 @@ export interface TunnelApiError {
   message: string;
   /** `apply_failed` 时带上编排器的结构化错误码（供前端展示与排障）。 */
   apply_error_code?: string;
+  reason?: string;
+  error_layer?: "capability" | "quota" | "resource_scope";
 }
 
 function err(code: TunnelApiErrorCode, message: string, extra?: { apply_error_code?: string }): TunnelApiError {
@@ -235,6 +238,8 @@ export interface TunnelApiDeps {
   orchestrator?: Orchestrator | null;
   /** 策略读取（默认 {@link getEffectivePolicy}，noCache）。 */
   loadPolicy?: (workspaceId: number) => Promise<EffectivePolicy>;
+  /** Existing runtime use, not new-resource quota. Tests may inject this gate. */
+  runtimeUse?: (workspaceId: number, resource: RuntimeUseResource) => Promise<RuntimeUseDenied | null>;
   /** 覆盖「现在」（测试注入固定时间）。 */
   now?: () => Date;
 }
@@ -245,11 +250,13 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
   applyCreate: (input: unknown, orchestrator: Orchestrator) => Promise<CreateRelayTunnelResult>;
   applyReapply: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<CreateRelayTunnelResult>;
   applyDirect: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<ApplyDirectResult>;
+  runtimeUse: NonNullable<TunnelApiDeps["runtimeUse"]>;
   now: () => Date;
 } {
   return {
     db: over?.db ?? (db as unknown as TunnelApiDb),
     loadPolicy: over?.loadPolicy ?? ((workspaceId: number) => getEffectivePolicy(workspaceId, { noCache: true })),
+    runtimeUse: over?.runtimeUse ?? ((workspaceId, resource) => checkForwardRuntimeUse(workspaceId, resource)),
     applyCreate:
       over?.applyCreate ?? (createRelayTunnel as unknown as (i: unknown, o: Orchestrator) => Promise<CreateRelayTunnelResult>),
     applyReapply:
@@ -598,6 +605,7 @@ export async function createTunnel(
     const applied = await deps.applyDirect(pending.id, orchestrator, {
       db: deps.db as never,
       loadPolicy: deps.loadPolicy,
+      runtimeUse: deps.runtimeUse,
       now: deps.now,
     });
     if (!applied.ok) {
@@ -701,6 +709,7 @@ export async function createTunnel(
     : await deps.applyReapply(pending.id, orchestrator, {
         db: deps.db as never,
         loadPolicy: deps.loadPolicy,
+        runtimeUse: deps.runtimeUse,
         now: deps.now,
       });
 
@@ -756,6 +765,11 @@ export async function runTunnelAction(
 
   const compat = canRunAction(action, tunnel);
   if (!compat.ok) return err("invalid_state", compat.message);
+
+  if (action === "retry" || action === "resume") {
+    const denied = await (over?.runtimeUse ?? checkForwardRuntimeUse)(workspaceId, tunnel);
+    if (denied) return { ...err(denied.code, denied.message), reason: denied.reason, error_layer: denied.error_layer };
+  }
 
   if (action === "delete") {
     const orchestrator = over?.orchestrator ?? null;
@@ -889,6 +903,7 @@ export async function runTunnelAction(
     : await deps.applyReapply(tunnel.id, orchestrator, {
         db: deps.db as never,
         loadPolicy: deps.loadPolicy,
+        runtimeUse: deps.runtimeUse,
         now: deps.now,
       });
 

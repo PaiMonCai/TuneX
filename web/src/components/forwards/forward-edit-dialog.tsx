@@ -16,7 +16,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Copy, Info, Link2, Loader2, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, getActiveWorkspace } from "@/lib/api";
+import { useWorkspace } from "@/components/workspace/workspace-context";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/card";
@@ -164,6 +165,8 @@ export function ForwardEditDialog({
   onReload: () => void;
 }) {
   const { t } = useI18n();
+  const { currentId, permissions, canForward } = useWorkspace();
+  const allowed = canForward(forward, "update");
   const [draft, setDraft] = useState<Draft>(() => draftFrom(forward));
   const [saving, setSaving] = useState(false);
   const [preview, setPreview] = useState<PreviewState>({ kind: "idle" });
@@ -187,7 +190,7 @@ export function ForwardEditDialog({
   const empty = patchKeys.length === 0;
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !allowed) return;
     if (empty) {
       setPreview({ kind: "idle" });
       return;
@@ -230,7 +233,7 @@ export function ForwardEditDialog({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [open, empty, hasFormError, forward.id, patch, t]);
+  }, [open, empty, hasFormError, forward.id, patch, t, allowed, currentId, permissions]);
 
   const ingressNodes = useMemo(
     () => nodes.filter((node) => node.role === "ingress" || node.role === "both"),
@@ -260,7 +263,7 @@ export function ForwardEditDialog({
   }, [bindings, draft.ingressId]);
 
   const saveBlocked =
-    saving || empty || hasFormError || preview.kind !== "ready" || conflict !== null;
+    !allowed || saving || empty || hasFormError || preview.kind !== "ready" || conflict !== null;
 
   async function save() {
     if (saveBlocked) return;
@@ -271,6 +274,7 @@ export function ForwardEditDialog({
         ...patch,
         expected_revision: expectedRevision,
       });
+      if (getActiveWorkspace() !== currentId) return;
       const revision = updated.config_revision ?? updated.latest_revision;
       onSaved(updated);
       onOpenChange(false);

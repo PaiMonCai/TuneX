@@ -53,6 +53,14 @@ import type { AcquirePortOutcome } from "./portPool.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { ACTIVE_ROLLOUT_PHASES, planRollout, ROLLOUT_STAGE_SEQUENCE, rolloutStepKey } from "./forward-rollout.ts";
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
+import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
+
+/** Existing runtime use, not a new creation/count slot. Production never defaults to allow. */
+export type RuntimeUseChecker = (workspaceId: number, resource: RuntimeUseResource) => Promise<RuntimeUseDenied | null>;
+export const defaultRuntimeUse: RuntimeUseChecker = async (workspaceId, resource) => {
+  const { checkForwardRuntimeUse } = await import("./forward-capability.ts");
+  return checkForwardRuntimeUse(workspaceId, resource);
+};
 
 /* ================================================================== */
 /* 契约类型                                                            */
@@ -139,6 +147,8 @@ export interface RolloutDeps {
    * （本模块的 step runner 在无 transport 时无法安全执行任何下发）。
    */
   orchestrator: Orchestrator;
+  /** Re-read grants/policy/traffic before every PREPARE/CUTOVER side effect. */
+  runtimeUse?: RuntimeUseChecker;
   now?: () => Date;
   /** 测试可注入无等待 sleeper；生产默认 setTimeout。 */
   sleep?: (ms: number) => Promise<void>;
@@ -468,9 +478,20 @@ async function loadRolloutNodes(
     };
   };
 
+  // A desired revision may choose different Nodes while the tunnel projection
+  // still describes the old applied topology. Admission must inspect the target.
+  const [desiredIngress, desiredEgress] = await Promise.all([
+    (row.ingress_node as { id?: number } | null)?.id === desired.ingress_node_id
+      ? row.ingress_node
+      : deps.db.node.findUnique({ where: { id: desired.ingress_node_id } }),
+    desired.egress_node_id == null ? null
+      : (row.egress_node as { id?: number } | null)?.id === desired.egress_node_id
+        ? row.egress_node
+        : deps.db.node.findUnique({ where: { id: desired.egress_node_id } }),
+  ]);
   const nodes: PlanRolloutInput["nodes"] = {
-    ingress: nodeFact(row.ingress_node),
-    egress: nodeFact(row.egress_node),
+    ingress: nodeFact(desiredIngress),
+    egress: nodeFact(desiredEgress),
     // 旧拓扑的节点对象：applied snapshot 里有 id 即可，运行时 DRAIN/CLEANUP
     // 只需要 node id 与端口，不需要再读一次 Node 行（避免旧节点已删时读库失败）。
     ingress_previous:
@@ -499,12 +520,12 @@ async function loadRolloutNodes(
 
   // Binding 存在性：只有 RELAY 且出口节点解析出来才有意义。
   let bindingExists: boolean | null = null;
-  if (desired.mode === "relay" && row.ingress_node_id != null && row.egress_node_id != null) {
+  if (desired.mode === "relay" && desired.ingress_node_id != null && desired.egress_node_id != null) {
     const found = (await deps.db.nodeBinding.findUnique({
       where: {
         ingress_node_id_egress_node_id: {
-          ingress_node_id: row.ingress_node_id,
-          egress_node_id: row.egress_node_id,
+          ingress_node_id: desired.ingress_node_id,
+          egress_node_id: desired.egress_node_id,
         },
       },
     })) as { id: number } | null;
@@ -512,6 +533,37 @@ async function loadRolloutNodes(
   }
 
   return { desired, applied, nodes, bindingExists };
+}
+
+/** Resolve the candidate Nodes' CURRENT groups, never the old applied groups.
+ * Missing identity/topology fails closed even when a test checker is injected. */
+async function rolloutRuntimeDenial(
+  tunnelId: number,
+  desired: RolloutSnapshot,
+  deps: RolloutDeps,
+): Promise<RuntimeUseDenied | null> {
+  const [rawTunnel, rawIngress, rawEgress] = await Promise.all([
+    deps.db.tunnel.findUnique({ where: { id: tunnelId } }),
+    deps.db.node.findUnique({ where: { id: desired.ingress_node_id }, select: { node_group_id: true } }),
+    desired.mode === "relay" && desired.egress_node_id != null
+      ? deps.db.node.findUnique({ where: { id: desired.egress_node_id }, select: { node_group_id: true } })
+      : null,
+  ]);
+  const tunnel = rawTunnel as { workspace_id?: number; user_id?: number; tunnel_type?: string } | null;
+  const ingress = rawIngress as { node_group_id?: number } | null;
+  const egress = rawEgress as { node_group_id?: number } | null;
+  const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
+  if (!validId(tunnel?.workspace_id) || !validId(tunnel?.user_id) ||
+      !validId(ingress?.node_group_id) ||
+      (desired.mode === "relay" && !validId(egress?.node_group_id))) {
+    return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或候选节点组已失效，无法应用目标配置" };
+  }
+  return (deps.runtimeUse ?? defaultRuntimeUse)(tunnel.workspace_id, {
+    user_id: tunnel.user_id,
+    in_node_group_id: ingress.node_group_id,
+    out_node_group_id: desired.mode === "relay" ? egress!.node_group_id! : null,
+    tunnel_type: tunnel.tunnel_type ?? "tcp",
+  });
 }
 
 /* ================================================================== */
@@ -1400,7 +1452,9 @@ async function executeRolloutOwned(
   // 保留它作为当前 DB phase；循环遇到第一个未完成 step 时再原子地
   // waiting → step.phase。这样 PREPARE/CUTOVER 任一位置都能从断点恢复。
   let status: RolloutStatus = row.phase;
-  const recoveringAmbiguous = row.phase === "waiting" && row.last_error_code === "ack_timeout";
+  const recoveringAmbiguous = row.phase === "waiting" && (
+    row.last_error_code === "ack_timeout" || ctx.notes.some((note) => note.includes(" WAIT ack_timeout "))
+  );
 
   for (const phase of phases) {
     const steps = plan.steps.filter((s) => s.phase === phase && !completed.has(s.idempotency_key));
@@ -1421,6 +1475,32 @@ async function executeRolloutOwned(
       if (!(await renewRolloutExecutor(rolloutId, executorToken, deps))) {
         const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
         return concurrentTakeoverResult(rolloutId, fresh, completed.size);
+      }
+
+      // WP10: registration is not an authorization lease. Re-read CURRENT target
+      // scope/capability before *each* lease/binding/command write, including a
+      // recovered pending rollout. Blocking keeps the ledger recoverable and the
+      // old applied runtime intact; do not turn denial into destructive rollback.
+      // DRAIN/CLEANUP and compensation deliberately bypass this business-use gate.
+      if (phase === "prepare" || phase === "cutover") {
+        const denied = await rolloutRuntimeDenial(ctx.tunnelId, ctx.desired, deps);
+        if (denied) {
+          const code = denied.reason;
+          const error = `[${denied.error_layer}] ${denied.message}`;
+          ctx.notes.push(`${phase}:${step.kind} BLOCKED ${code} ${error}`);
+          const moved = await transitionRollout(rolloutId, status, "waiting", {
+            last_error_code: code,
+            last_error: error.slice(0, 2000),
+            notes: ctx.notes,
+            updated_at: (deps.now?.() ?? new Date()).toISOString(),
+          }, { db });
+          if (!moved) {
+            const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
+            return concurrentTakeoverResult(rolloutId, fresh, completed.size);
+          }
+          await markTunnelFailed(ctx.tunnelId, code, error, db);
+          return { ok: false, rolloutId, phase: "waiting", error_code: code, error, completed: completed.size };
+        }
       }
 
       // S10.47：第一次 command 的 ACK 可能丢了，但 Agent 已真实应用。恢复时先用
@@ -1796,6 +1876,16 @@ export async function registerRollout(
   }
 
   const { desired, applied, nodes, bindingExists } = await loadRolloutNodes(input.tunnelId, { db });
+  if (!input.suspended && input.impact.runtime_change) {
+    const denied = await rolloutRuntimeDenial(input.tunnelId, desired, deps);
+    if (denied) {
+      return {
+        ok: false, rolloutId: null, status: "blocked",
+        error_code: denied.reason, error: denied.message,
+        blocking: [{ code: denied.reason, message: `[${denied.error_layer}] ${denied.message}` }],
+      };
+    }
+  }
   indexRolloutNodes(
     deps.orchestrator,
     [nodes.ingress, nodes.egress].filter((n) => n != null) as any,

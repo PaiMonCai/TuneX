@@ -11,7 +11,7 @@ x-target-common: &target-common
 
 services:
   panel:
-    image: ${TUNEX_BACKEND_IMAGE:?required}
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
     container_name: wp14-panel
     restart: unless-stopped
     environment:
@@ -50,7 +50,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${TUNEX_BACKEND_IMAGE:?required}
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
     container_name: wp14-worker
     restart: unless-stopped
     environment:
@@ -106,7 +106,7 @@ services:
         ipv4_address: 172.31.0.12
 
   db-migrate:
-    image: ${TUNEX_BACKEND_IMAGE:?required}
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
     container_name: wp14-db-migrate
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
@@ -148,7 +148,11 @@ services:
       - ${WP14_INGRESS_CREDENTIAL:?provision phase must export WP14_INGRESS_CREDENTIAL}
       - --ingress-range
       - 21000-21099
+      - --state-dir
+      - /var/lib/tunex-agent
       - --debug
+    volumes:
+      - ingress_agent_state:/var/lib/tunex-agent
     networks:
       wp14-ctrl:
         ipv4_address: 172.31.0.20
@@ -182,7 +186,11 @@ services:
       - ${WP14_EGRESS_CREDENTIAL:?provision phase must export WP14_EGRESS_CREDENTIAL}
       - --egress-range
       - 22000-22099
+      - --state-dir
+      - /var/lib/tunex-agent
       - --debug
+    volumes:
+      - egress_agent_state:/var/lib/tunex-agent
     networks:
       wp14-ctrl:
         ipv4_address: 172.31.0.30
@@ -214,7 +222,11 @@ services:
       - ${WP14_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
       - --ingress-range
       - 21000-21099
+      - --state-dir
+      - /var/lib/tunex-agent
       - --debug
+    volumes:
+      - ingress_agent_b_state:/var/lib/tunex-agent
     networks:
       wp14-ctrl:
         ipv4_address: 172.31.0.21
@@ -247,7 +259,11 @@ services:
       - ${WP14_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
       - --egress-range
       - 22000-22099
+      - --state-dir
+      - /var/lib/tunex-agent
       - --debug
+    volumes:
+      - egress_agent_b_state:/var/lib/tunex-agent
     networks:
       wp14-ctrl:
         ipv4_address: 172.31.0.31
@@ -287,6 +303,17 @@ services:
         ipv4_address: 172.31.10.40
 
 volumes:
+  # One state volume per Agent: the last-known-good cache is keyed to the
+  # immutable agent_id, so a shared directory would have four nodes overwriting
+  # (and rejecting) each other's cache.
+  ingress_agent_state:
+    name: wp14-ingress-agent-state
+  egress_agent_state:
+    name: wp14-egress-agent-state
+  ingress_agent_b_state:
+    name: wp14-ingress-agent-b-state
+  egress_agent_b_state:
+    name: wp14-egress-agent-b-state
   wp14_mysql_data:
     name: wp14_mysql_data
 

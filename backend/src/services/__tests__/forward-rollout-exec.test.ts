@@ -82,6 +82,10 @@ const fakeDb = () => {
           id,
           node_id: `node-${id}`,
           workspace_id: 1,
+          node_group_id: id,
+          role: id >= 20 ? "egress" : "ingress",
+          connect_ip: `10.0.0.${id}`,
+          lifecycle: "active",
           scope: 1,
           port_range_min: min,
           port_range_max: max,
@@ -303,7 +307,7 @@ const fakeDb = () => {
       leases.push({ id, status: "active", ...l });
       return id;
     },
-    addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, ...t }),
+    addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, user_id: 1, workspace_id: 1, tunnel_type: "tcp", ...t }),
   };
 };
 
@@ -450,7 +454,7 @@ function directEnv(overrides: { failOn?: FakeOrchestratorOpts["failOn"] } = {}) 
     node_id: 11,
   });
   const orch = fakeOrchestrator(overrides);
-  const deps: RolloutDeps = { db: f.db, orchestrator: orch, sleep: async () => {} };
+  const deps: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: orch, sleep: async () => {} };
   return { f, deps, orch };
 }
 
@@ -508,7 +512,7 @@ function modeSwitchEnv() {
     node_id: 11,
   });
   const orch = fakeOrchestrator();
-  return { f, deps: { db: f.db, orchestrator: orch } as RolloutDeps, orch };
+  return { f, deps: { db: f.db, runtimeUse: async () => null, orchestrator: orch } as RolloutDeps, orch };
 }
 
 /* ------------------------------------------------------------------ */
@@ -678,7 +682,7 @@ describe("正常路径：五阶段推进到 done", () => {
   it("resume 到 done 时同样补写 applied_revision", async () => {
     const at = new Date("2026-09-26T04:05:00.000Z");
     const { f, orch } = directEnv();
-    const deps: RolloutDeps = { db: f.db, orchestrator: orch, now: () => at, sleep: async () => {} };
+    const deps: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: orch, now: () => at, sleep: async () => {} };
     const reg = await registerRollout(
       {
         tunnelId: 1,
@@ -723,7 +727,7 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     const relay = modeSwitchEnv();
     // 让 RELAY 的 prepare_egress 失败 ⇒ 走 PREPARE 失败分支。
     const failOrch = fakeOrchestrator({ failOn: { dispatchEgress: true } });
-    const failDeps: RolloutDeps = { db: relay.f.db, orchestrator: failOrch };
+    const failDeps: RolloutDeps = { db: relay.f.db, runtimeUse: async () => null, orchestrator: failOrch };
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -746,7 +750,7 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     const { f } = modeSwitchEnv();
     // ingress 失败 ⇒ cutover 阶段失败 ⇒ 必须补偿。
     const failOrch = fakeOrchestrator({ failOn: { dispatchIngress: true } });
-    const d2: RolloutDeps = { db: f.db, orchestrator: failOrch };
+    const d2: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: failOrch };
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -772,7 +776,7 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     const { f, deps } = modeSwitchEnv();
     // ingress 失败 + removeTunnel 也失败 ⇒ 补偿无法完成。
     const failOrch = fakeOrchestrator({ failOn: { dispatchIngress: true, removeTunnel: true } });
-    const d2: RolloutDeps = { db: f.db, orchestrator: failOrch };
+    const d2: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: failOrch };
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -792,7 +796,7 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     // removeTunnel 失败：DIRECT 换端口的 drain/cleanup 都靠 removeTunnel，
     // 失败是 soft ⇒ 最终仍 done。
     const softOrch = fakeOrchestrator({ failOn: { removeTunnel: true } });
-    const d2: RolloutDeps = { db: f.db, orchestrator: softOrch };
+    const d2: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: softOrch };
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -820,7 +824,7 @@ describe("续跑：只重放未完成步骤", () => {
     const orch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
     const first = await registerRollout(
       { tunnelId: 1, impact: impact({ listen_port_change: true, listener_replacement: true }), revision: 7, baseRevision: 6 },
-      { db: f.db, orchestrator: orch },
+      { db: f.db, runtimeUse: async () => null, orchestrator: orch },
     );
     expect(first.ok).toBe(false);
     expect(first.status).toBe("waiting");
@@ -832,6 +836,7 @@ describe("续跑：只重放未完成步骤", () => {
     const recovered = fakeOrchestrator();
     const resumed = await executeRollout(f.rollouts[0]!.id, {
       db: f.db,
+      runtimeUse: async () => null,
       orchestrator: recovered,
       sleep: async () => {},
     });
@@ -855,7 +860,7 @@ describe("续跑：只重放未完成步骤", () => {
     const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
     const first = await registerRollout(
       { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
-      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:00:00.000Z") },
+      { db: f.db, runtimeUse: async () => null, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:00:00.000Z") },
     );
     expect(first.status).toBe("waiting");
 
@@ -870,6 +875,7 @@ describe("续跑：只重放未完成步骤", () => {
     const recovered = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_rejected" });
     const resumed = await executeRollout(f.rollouts[0]!.id, {
       db: f.db,
+      runtimeUse: async () => null,
       orchestrator: recovered,
       now: () => new Date("2026-09-26T13:00:31.000Z"),
       sleep: async () => {},
@@ -889,7 +895,7 @@ describe("续跑：只重放未完成步骤", () => {
     const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
     const first = await registerRollout(
       { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
-      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:02:00.000Z") },
+      { db: f.db, runtimeUse: async () => null, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:02:00.000Z") },
     );
     expect(first.status).toBe("waiting");
 
@@ -910,6 +916,7 @@ describe("续跑：只重放未完成步骤", () => {
     const resumedOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "agent_rejected" });
     const resumed = await executeRollout(f.rollouts[0]!.id, {
       db: f.db,
+      runtimeUse: async () => null,
       orchestrator: resumedOrch,
       now: () => new Date(Date.parse("2026-09-26T13:02:31.000Z") + tick * 1000),
       sleep: async () => { tick += 1; },
@@ -925,7 +932,7 @@ describe("续跑：只重放未完成步骤", () => {
     const firstOrch = fakeOrchestrator({ failOn: { dispatchDirect: true }, failCode: "ack_timeout" });
     const first = await registerRollout(
       { tunnelId: 1, impact: impact({ target_change: true }), revision: 7, baseRevision: 6 },
-      { db: f.db, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:01:00.000Z") },
+      { db: f.db, runtimeUse: async () => null, orchestrator: firstOrch, now: () => new Date("2026-09-26T13:01:00.000Z") },
     );
     expect(first.status).toBe("waiting");
 
@@ -934,6 +941,7 @@ describe("续跑：只重放未完成步骤", () => {
     const contender = fakeOrchestrator();
     const result = await executeRollout(f.rollouts[0]!.id, {
       db: f.db,
+      runtimeUse: async () => null,
       orchestrator: contender,
       now: () => new Date("2026-09-26T13:01:30.000Z"),
     });

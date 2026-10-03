@@ -90,6 +90,7 @@ mock.module(`${ROOT}services/forward-service.ts`, () => ({
 
 /** workspace 替身：路由的 `workspace(c)` 依赖它写入的变量。 */
 mock.module(`${ROOT}services/workspace.ts`, () => ({
+  canWorkspaceResourceAction: (access: { role: string }) => access.role === "owner",
   resolveWorkspaceAccess: async () => ({
     id: 11,
     personalWorkspaceId: 11,

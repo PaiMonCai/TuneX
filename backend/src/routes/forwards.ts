@@ -8,7 +8,9 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import type { AppVariables } from "../middlewares/auth.ts";
-import { resolveWorkspaceAccess } from "../services/workspace.ts";
+import { db } from "../db.ts";
+import { canWorkspaceResourceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
+import { defaultDiagnoseDeps, diagnoseForward } from "../services/agent-diagnose.ts";
 import {
   createForward,
   deleteForward,
@@ -43,11 +45,16 @@ forwardsRoutes.use("*", async (c, next) => {
   if (method === "DELETE") action = "delete";
   else if (method === "POST" && /\/api\/forwards\/?$/.test(path)) {
     action = "create";
+  } else if (method === "POST" && /\/diagnose\/?$/.test(path)) {
+    // V4-WP11C: the probe is read-only (no desired-state change, no revision
+    // bump). Requiring forward:update would tell a read-only role "you may not
+    // diagnose the forward you can see", which is not the product rule.
+    action = "read";
   } else if (method === "PATCH" || method === "PUT" || method === "POST") {
     action = "update";
   }
 
-  c.set("workspace", await resolveWorkspaceAccess(c, action, "tunnel"));
+  c.set("workspace", await resolveWorkspaceAccess(c, action, "forward"));
   await next();
 });
 
@@ -61,6 +68,22 @@ function user(c: Ctx): NonNullable<AppVariables["user"]> {
   const value = c.get("user");
   if (!value) throw new HTTPException(401, { message: "Unauthorized" });
   return value;
+}
+
+/** Preliminary workspace checks cannot establish creator ownership. Query only the
+ * scoped runtime identity; full-access identities keep service-level scope checks. */
+async function authorizeForward(c: Ctx, id: number, action: "read" | "update" | "delete") {
+  const access = workspace(c);
+  if (canWorkspaceResourceAction(access, action, "forward")) return null;
+  const row = await db.tunnel.findFirst({
+    where: { id, workspace_id: access.id, category: "port_forward" },
+    select: { user_id: true },
+  });
+  if (!row) return c.json({ error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+  if (!canWorkspaceResourceAction(access, action, "forward", row.user_id === user(c).id)) {
+    return c.json({ error: "无权操作该端口转发", code: "forbidden", error_layer: "rbac" }, 403);
+  }
+  return null;
 }
 
 function idParam(c: Ctx, name: string): number | null {
@@ -79,6 +102,7 @@ function send<T>(
         error: result.message,
         code: result.code,
         apply_error_code: result.apply_error_code,
+        error_layer: result.error_layer,
         data: result.data,
       },
       result.status,
@@ -225,7 +249,31 @@ forwardsRoutes.patch("/:id", async (c) => {
     const message = parsed.error.issues[0]?.message ?? "端口转发参数不合法";
     return c.json({ error: message, code: "invalid_input" }, 400);
   }
-  return send(c, await patchForward(id, workspace(c).id, parsed.data));
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
+  return send(c, await patchForward(id, workspace(c).id, parsed.data, user(c).id));
+});
+
+/**
+ * V4-WP11C —— `POST /api/forwards/:id/diagnose`
+ *
+ * 只读诊断：探针目标由服务端从该转发的**已授权期望状态**推导（见
+ * services/forward-probe-plan.ts），请求体不携带任何 host/port —— 否则这个
+ * 端点会变成"用客户机房里的机器扫内网"的 SSRF 工具。
+ *
+ * 权限：read 级（forward:read），资源作用域照旧由 resolveWorkspaceAccess +
+ * creator guard 保证；它不改 desired、不加 revision、不发业务流量。
+ */
+forwardsRoutes.post("/:id/diagnose", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "read");
+  if (denied) return denied;
+  const result = await diagnoseForward(id, workspace(c).id, defaultDiagnoseDeps());
+  if (!result.ok) {
+    return c.json({ error: result.message, code: result.code, error_layer: result.error_layer }, result.status);
+  }
+  return c.json({ data: result.report });
 });
 
 /**
@@ -247,6 +295,8 @@ forwardsRoutes.post("/:id/preview", async (c) => {
     const message = parsed.error.issues[0]?.message ?? "端口转发参数不合法";
     return c.json({ error: message, code: "invalid_input" }, 400);
   }
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
   const u = c.get("user");
   return send(
     c,
@@ -280,6 +330,9 @@ forwardsRoutes.post("/batch", async (c) => {
     parsed.ids,
     parsed.action,
     workspace(c).id,
+    (row: { user_id: number }) => canWorkspaceResourceAction(
+      workspace(c), "update", "forward", row.user_id === user(c).id,
+    ),
   );
   return c.json({ data: payload });
 });
@@ -293,6 +346,8 @@ forwardsRoutes.post("/:id/:action", async (c) => {
   if (!ACTIONS.has(action)) {
     return c.json({ error: "不支持的端口转发动作", code: "invalid_input" }, 400);
   }
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
   return send(c, await runForwardAction(id, action, workspace(c).id));
 });
 
@@ -301,5 +356,7 @@ forwardsRoutes.delete("/:id", async (c) => {
   if (id === null) {
     return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
   }
+  const denied = await authorizeForward(c, id, "delete");
+  if (denied) return denied;
   return send(c, await deleteForward(id, workspace(c).id));
 });

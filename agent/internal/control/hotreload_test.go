@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"io"
 	"net"
 	"testing"
@@ -107,7 +108,7 @@ func TestExecuteApplyTunnelPortMoveKeepsConnectionAlive(t *testing.T) {
 	oldPort := freeTCPPort(t)
 	newPort := freeTCPPort(t)
 
-	ack := client.execute(relayCommand(t, "cmd-move", oldPort, up, 1))
+	ack := client.execute(context.Background(), relayCommand(t, "cmd-move", oldPort, up, 1))
 	if !ack.OK {
 		t.Fatalf("initial apply failed: code=%s err=%s", ack.ErrorCode, ack.Error)
 	}
@@ -124,7 +125,7 @@ func TestExecuteApplyTunnelPortMoveKeepsConnectionAlive(t *testing.T) {
 	}
 
 	// The panel moves the listen port: one command, new revision.
-	ack = client.execute(relayCommand(t, "cmd-move", newPort, up, 2))
+	ack = client.execute(context.Background(), relayCommand(t, "cmd-move", newPort, up, 2))
 	if !ack.OK {
 		t.Fatalf("port-move apply failed: code=%s err=%s", ack.ErrorCode, ack.Error)
 	}
@@ -164,7 +165,7 @@ func TestExecuteApplyTunnelTargetOnlySwapKeepsEverything(t *testing.T) {
 	defer tunnels.StopAll()
 
 	port := freeTCPPort(t)
-	if ack := client.execute(relayCommand(t, "cmd-target", port, upA, 1)); !ack.OK {
+	if ack := client.execute(context.Background(), relayCommand(t, "cmd-target", port, upA, 1)); !ack.OK {
 		t.Fatalf("initial apply failed: code=%s err=%s", ack.ErrorCode, ack.Error)
 	}
 
@@ -186,7 +187,7 @@ func TestExecuteApplyTunnelTargetOnlySwapKeepsEverything(t *testing.T) {
 
 	// Only the target moves; port, mode and revision shape are unchanged.
 	start := time.Now()
-	ack := client.execute(relayCommand(t, "cmd-target", port, upB, 2))
+	ack := client.execute(context.Background(), relayCommand(t, "cmd-target", port, upB, 2))
 	elapsed := time.Since(start)
 	if !ack.OK {
 		t.Fatalf("target-only apply failed: code=%s err=%s", ack.ErrorCode, ack.Error)
@@ -247,13 +248,13 @@ func TestExecuteApplyTunnelIdempotentRevisionIsNoop(t *testing.T) {
 
 	port := freeTCPPort(t)
 	cmd := relayCommand(t, "cmd-idem", port, up, 4)
-	if ack := client.execute(cmd); !ack.OK {
+	if ack := client.execute(context.Background(), cmd); !ack.OK {
 		t.Fatalf("first apply: code=%s err=%s", ack.ErrorCode, ack.Error)
 	}
 
 	// The same revision again (the reconciler's resend-same-revision path):
 	// idempotent, no listener churn.
-	if ack := client.execute(cmd); !ack.OK {
+	if ack := client.execute(context.Background(), cmd); !ack.OK {
 		t.Fatalf("replay apply: code=%s err=%s", ack.ErrorCode, ack.Error)
 	}
 	cfg, ok := tunnels.Get("cmd-idem")
@@ -269,7 +270,7 @@ func TestExecuteApplyTunnelIdempotentRevisionIsNoop(t *testing.T) {
 
 	// An older revision is rejected, and the running instance survives it.
 	older := relayCommand(t, "cmd-idem", port, up, 3)
-	ack := client.execute(older)
+	ack := client.execute(context.Background(), older)
 	if ack.OK || ack.ErrorCode != "stale_revision" {
 		t.Fatalf("stale revision ack = %+v, want a stale_revision rejection", ack)
 	}

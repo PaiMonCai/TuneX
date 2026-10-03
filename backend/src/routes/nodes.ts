@@ -15,7 +15,7 @@ import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
-import { resolveWorkspaceAccess } from "../services/workspace.ts";
+import { canWorkspaceResourceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
 import { createNodeEnrollment } from "../services/node-enrollment.ts";
 import {
   createForward as createForwardService,
@@ -32,6 +32,9 @@ import {
   unbindBlockedMessage,
 } from "../services/binding-usage.ts";
 import { projectUserNode } from "../services/node-view.ts";
+import { collectSupportBundle, defaultSupportBundleDeps } from "../services/support-bundle.ts";
+import { checkUpgradePrecondition, renderNodeUpgradeScript, validateAgentImageRef } from "../services/node-upgrade.ts";
+import { collectNodeDiagnostics, defaultNodeDiagnosticsDeps } from "../services/node-diagnostics.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -42,13 +45,13 @@ nodesRoutes.use("*", async (c, next) => {
   const method = c.req.method.toUpperCase();
 
   let action: "read" | "create" | "update" | "delete" | "manage" = "read";
-  let resource: "node" | "tunnel" = "node";
+  let resource: "node" | "forward" = "node";
 
   if (path.includes("/bindings")) {
     action = method === "GET" ? "read" : "manage";
     resource = "node";
   } else if (path.includes("/forwards")) {
-    resource = "tunnel";
+    resource = "forward";
     c.header("Deprecation", "true");
     c.header("Link", '</api/forwards>; rel="successor-version"');
     c.header("X-TuneX-Deprecated", "/api/nodes/:ingressId/forwards");
@@ -191,6 +194,108 @@ nodesRoutes.post("/:ingressId/enrollment", async (c) => {
   return c.json({ data: enrollment }, 201);
 });
 
+/**
+ * V4-WP11C —— `GET /api/nodes/:id/diagnostics`
+ *
+ * Node 级诊断：回答"这个节点现在到底在跑什么"。事实来自两处——面板持有的状态上报，
+ * 以及节点进程的**自述**（collect_diagnostics）。离线节点**先判活再决定是否下发**，
+ * 因此不会出现"对一台掉线的机器等 20 秒超时"。
+ *
+ * 权限：`node:read`（GET 默认映射），只读，不产生 desired 变更。
+ */
+nodesRoutes.get("/:ingressId/diagnostics", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "ingressId");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+  const result = await collectNodeDiagnostics(nodeId, ws.id, defaultNodeDiagnosticsDeps());
+  if (!result.ok) {
+    return c.json({ error: result.message, code: result.code, error_layer: result.error_layer }, result.status);
+  }
+  return c.json({ data: result.report });
+});
+
+/**
+ * V4-WP11B —— `POST /api/nodes/:id/upgrade-command`
+ *
+ * 返回一段**由 Panel 渲染、由操作者在节点上执行**的升级脚本。控制面不远程替换
+ * 节点上的 Agent：Agent 没有 Docker 权限，Panel 也不主动连节点（§13.6）。
+ *
+ * 权限：`node:manage` + workspace 作用域（沿用本文件的 middleware 映射）。
+ * 副作用：**没有**——脚本不改任何运行态；维护态需要操作者按返回的提示自行切换，
+ * 因为 lifecycle 有自己的、更严格的授权面。
+ */
+nodesRoutes.post("/:ingressId/upgrade-command", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "ingressId");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+
+  const body = (await c.req.json().catch(() => null)) as
+    | { agent_image?: unknown; allow_active?: unknown; container_name?: unknown }
+    | null;
+  const image = validateAgentImageRef(body?.agent_image);
+  if (!image.ok) {
+    return c.json({ error: image.reason, code: "invalid_image", error_layer: "capability" }, 400);
+  }
+
+  const node = await loadWorkspaceNode(nodeId, ws.id);
+  if (!node) return c.json({ error: "节点不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+
+  const facts = {
+    node_key: node.node_id,
+    agent_id: node.agent_id ?? "",
+    role: node.role ?? null,
+    lifecycle: node.lifecycle ?? null,
+  };
+  const allowActive = body?.allow_active === true;
+  const precondition = checkUpgradePrecondition(facts, { allowActive });
+  if (!precondition.ok) {
+    return c.json(
+      { error: precondition.message, code: precondition.code, error_layer: "runtime_admission" },
+      409,
+    );
+  }
+
+  const rendered = renderNodeUpgradeScript(facts, image.image, {
+    containerName: typeof body?.container_name === "string" ? body.container_name : undefined,
+    // The panel address the node already uses; it is a public fact of the
+    // deployment, not a secret, and the script only ever prints an HTTP code.
+    panelURL: process.env.TUNEX_PUBLIC_PANEL_URL?.trim() || null,
+  });
+  return c.json({
+    data: {
+      node: { id: node.id, node_id: node.node_id, agent_id: node.agent_id, lifecycle: node.lifecycle },
+      target_image: image.image,
+      allow_active: allowActive,
+      ...rendered,
+    },
+  });
+});
+
+/**
+ * V4-WP11C —— `GET /api/nodes/:id/support-bundle`
+ *
+ * 一次排障快照。两条纪律：
+ *   1. **白名单采集 + 确定性脱敏**（services/support-bundle.ts），凭据哈希永不入内；
+ *   2. **按调用者权限裁剪段落**——只有 node:read 的身份不会拿到转发明细或审计记录，
+ *      并且产物里会写明"为什么没有"。node 读出权限本身不隐含 forward/audit 读权限。
+ *
+ * 只读：不产生 Agent 命令、不移动 revision。
+ */
+nodesRoutes.get("/:ingressId/support-bundle", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "ingressId");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+  const sections = {
+    forwards: canWorkspaceResourceAction(ws, "read", "forward"),
+    audit: canWorkspaceResourceAction(ws, "read", "audit"),
+  };
+  const result = await collectSupportBundle(nodeId, ws.id, defaultSupportBundleDeps(), sections);
+  if (!result.ok) {
+    return c.json({ error: result.message, code: result.code, error_layer: result.error_layer }, result.status);
+  }
+  return c.json({ data: result.bundle });
+});
+
 /* ------------------------------------------------------------------ */
 /* Ingress <-> Egress bindings                                        */
 /* ------------------------------------------------------------------ */
@@ -218,8 +323,9 @@ nodesRoutes.get("/:ingressId/bindings", async (c) => {
 
   // V4-WP9 §13.6「Binding usage」：一次 groupBy 拿到全部出口的使用量，
   // 而不是每个绑定查一次（N+1 在绑定量上来后是列表页的主要延迟来源）。
+  const usageVisible = canWorkspaceResourceAction(ws, "read", "forward");
   const usage = bindingUsageMap(
-    await db.tunnel.groupBy({
+    usageVisible ? await db.tunnel.groupBy({
       by: ["ingress_node_id", "egress_node_id"],
       where: {
         workspace_id: ws.id,
@@ -235,7 +341,7 @@ nodesRoutes.get("/:ingressId/bindings", async (c) => {
         egress_node_id: group.egress_node_id,
         count: group._count._all,
       })),
-    ),
+    ) : [],
   );
 
   return c.json({
@@ -246,7 +352,8 @@ nodesRoutes.get("/:ingressId/bindings", async (c) => {
       egress_node: nodeView(row.egress_node),
       created_at: row.created_at,
       // 使用量是响应投影（不新增列）：用户在解绑前就能看到影响面。
-      ...lookupBindingUsage(usage, row.ingress_node_id, row.egress_node_id),
+      usage_visible: usageVisible,
+      ...(usageVisible ? lookupBindingUsage(usage, row.ingress_node_id, row.egress_node_id) : { used_by_forward_count: null, unbind_blocked: null, usage: null }),
     })),
   });
 });
@@ -323,9 +430,10 @@ nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
     // 让前端在错误分支也能刷新按钮状态（而不是只弹一句话）。
     return c.json(
       {
-        error: unbindBlockedMessage(used),
+        error: canWorkspaceResourceAction(ws, "read", "forward") ? unbindBlockedMessage(used) : "该绑定仍存在业务依赖，请由有转发权限的成员处理后再解绑",
         code: "binding_in_use",
-        ...bindingUsage(used),
+        error_layer: "runtime_admission",
+        ...(canWorkspaceResourceAction(ws, "read", "forward") ? bindingUsage(used) : {}),
       },
       409,
     );
@@ -387,6 +495,7 @@ nodesRoutes.post("/:ingressId/forwards", async (c) => {
         error: result.message,
         code: result.code,
         apply_error_code: result.apply_error_code,
+        error_layer: result.error_layer,
         data: result.data,
       },
       result.status,
@@ -414,6 +523,17 @@ nodesRoutes.post("/:ingressId/forwards/:forwardId/:action", async (c) => {
     return c.json({ error: "端口转发不存在" }, 404);
   }
 
+  if (!canWorkspaceResourceAction(ws, "update", "forward")) {
+    const identity = await db.tunnel.findFirst({
+      where: { id: forwardId, workspace_id: ws.id, ingress_node_id: ingressId, category: "port_forward" },
+      select: { user_id: true },
+    });
+    if (!identity) return c.json({ error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+    if (!canWorkspaceResourceAction(ws, "update", "forward", identity.user_id === requireUser(c).id)) {
+      return c.json({ error: "无权操作该端口转发", code: "forbidden", error_layer: "rbac" }, 403);
+    }
+  }
+
   const result = await runForwardActionService(forwardId, action, ws.id);
   if (!result.ok) {
     return c.json(
@@ -421,6 +541,7 @@ nodesRoutes.post("/:ingressId/forwards/:forwardId/:action", async (c) => {
         error: result.message,
         code: result.code,
         apply_error_code: result.apply_error_code,
+        error_layer: result.error_layer,
       },
       result.status,
     );
@@ -441,6 +562,17 @@ nodesRoutes.delete("/:ingressId/forwards/:forwardId", async (c) => {
     return c.json({ error: "端口转发不存在" }, 404);
   }
 
+  if (!canWorkspaceResourceAction(ws, "delete", "forward")) {
+    const identity = await db.tunnel.findFirst({
+      where: { id: forwardId, workspace_id: ws.id, ingress_node_id: ingressId, category: "port_forward" },
+      select: { user_id: true },
+    });
+    if (!identity) return c.json({ error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+    if (!canWorkspaceResourceAction(ws, "delete", "forward", identity.user_id === requireUser(c).id)) {
+      return c.json({ error: "无权操作该端口转发", code: "forbidden", error_layer: "rbac" }, 403);
+    }
+  }
+
   const result = await deleteForwardService(forwardId, ws.id);
   if (!result.ok) {
     return c.json(
@@ -448,6 +580,7 @@ nodesRoutes.delete("/:ingressId/forwards/:forwardId", async (c) => {
         error: result.message,
         code: result.code,
         apply_error_code: result.apply_error_code,
+        error_layer: result.error_layer,
       },
       result.status,
     );

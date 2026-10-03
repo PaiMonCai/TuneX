@@ -130,6 +130,11 @@ export const APPLY_ERROR_ACTION: Record<string, { zh: string; en: string; retrya
     en: "The selected node group is not authorised. Pick an authorised ingress/egress node and retry.",
     retryable: false,
   },
+  scope_revoked: {
+    zh: "这条转发使用的节点组授权已被撤销。改选仍获授权的节点并保存；已运行的转发不会被自动迁移或删除。",
+    en: "The node group authorising this forward was revoked. Save with a still-authorised node; running forwards are never migrated or deleted automatically.",
+    retryable: false,
+  },
   mode_topology_mismatch: {
     zh: "模式与拓扑矛盾：中继必须选出口节点，直连不得选。改好模式或出口节点后再保存。",
     en: "Mode and topology conflict: relay requires an egress node, direct must not have one. Fix the mode or egress node and save again.",

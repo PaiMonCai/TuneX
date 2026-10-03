@@ -42,6 +42,7 @@
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
+import { normalizeCapabilities } from "./agent-capability.ts";
 
 /* ================================================================== */
 /* 形状（与 agent/internal/api 的 NodeState 字段对齐）                  */
@@ -108,6 +109,12 @@ export interface StateReportInput {
   error_count?: number;
   /** 最近一次错误时刻，unix 秒。 */
   last_error_at?: number;
+
+  // ── V4-WP11B：控制协议能力协商 ──
+  /** Agent 实现的控制协议版本（缺失 = 旧 Agent 未上报）。 */
+  control_protocol_version?: number;
+  /** Agent 实际实现的控制动作清单（缺失 = 未上报，与空数组语义不同）。 */
+  capabilities?: string[];
 }
 
 /** Agent 自报的 runtime 计数（形状由 agent/internal/reporter 定义）。 */
@@ -178,7 +185,9 @@ export type StateReportRejection =
   | "bad_revision"
   | "bad_last_error"
   /** V4-WP6：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
-  | "bad_telemetry";
+  | "bad_telemetry"
+  /** V4-WP11B：能力协商字段形状坏（版本非非负整数 / 能力不是字符串数组）。 */
+  | "bad_capabilities";
 
 /**
  * 载荷校验（fail-closed）：任何坏形状返回原因码，调用方回 400。
@@ -313,7 +322,12 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       // targets：Agent 报的可能是旧形状（address）或新形状（host）。只要求
       // 「数组里的每项是对象、port 是数字」，其余字段缺失不拦——面板侧
       // reconciler（WP9）自己决定能不能用这个 target，上报层不做语义判断。
-      if (tt.targets !== undefined) {
+      // `null` is what a Go nil slice marshals to, and every RELAY ingress
+      // tunnel has no targets of its own — treating null as a type error made
+      // those nodes' reports permanently 400 (no telemetry, no health), for a
+      // field the contract itself calls optional. Absent and null are the same
+      // fact here; only a *wrong non-null* shape is rejected.
+      if (tt.targets !== undefined && tt.targets !== null) {
         if (!Array.isArray(tt.targets)) return { ok: false, reason: "bad_tunnels" };
         for (const tgt of tt.targets) {
           if (!tgt || typeof tgt !== "object") return { ok: false, reason: "bad_tunnels" };
@@ -361,6 +375,23 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
     return { ok: false, reason: "bad_telemetry" };
   }
 
+  // ── V4-WP11B：能力协商 ──
+  //
+  // 与遥测同一纪律：**缺失容忍、类型错拒绝**。这里额外多一条要求：坏形状
+  // 绝不能退化成"未上报"——那会把 fail-closed（Agent 报了坏清单）静默降级成
+  // baseline 放行，方向恰好错反。所以先校验形状，再走 normalize。
+  if (b.control_protocol_version !== undefined && !isNonNegativeInt(b.control_protocol_version)) {
+    return { ok: false, reason: "bad_capabilities" };
+  }
+  if (b.capabilities !== undefined) {
+    if (!Array.isArray(b.capabilities)) return { ok: false, reason: "bad_capabilities" };
+    try {
+      normalizeCapabilities(b.capabilities);
+    } catch {
+      return { ok: false, reason: "bad_capabilities" };
+    }
+  }
+
   if (b.egress_pools !== undefined) {
     if (!b.egress_pools || typeof b.egress_pools !== "object" || Array.isArray(b.egress_pools)) {
       return { ok: false, reason: "bad_egress_pools" };
@@ -393,6 +424,11 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       host: b.host as HostMetricsInput | undefined,
       error_count: b.error_count as number | undefined,
       last_error_at: b.last_error_at as number | undefined,
+      // V4-WP11B：这条投影是**白名单**——校验通过但没列在这里的字段会被静默
+      // 丢掉。新增协商字段时必须同步这里，否则症状是"校验通过、库里永远是
+      // NULL"，即面板一直以为该 Agent 未上报能力（fail-closed 但不报错）。
+      control_protocol_version: b.control_protocol_version as number | undefined,
+      capabilities: b.capabilities as string[] | undefined,
     },
   };
 }
@@ -418,6 +454,8 @@ export function telemetryColumns(report: StateReportInput): {
   host_metrics: Prisma.InputJsonValue | typeof Prisma.JsonNull;
   error_count: number | null;
   last_error_at: Date | null;
+  control_protocol_version: number | null;
+  capabilities: Prisma.InputJsonValue | typeof Prisma.JsonNull;
 } {
   return {
     known_revision: report.known_revision ?? null,
@@ -434,6 +472,13 @@ export function telemetryColumns(report: StateReportInput): {
     host_metrics: report.host ? (report.host as unknown as Prisma.InputJsonValue) : Prisma.JsonNull,
     error_count: report.error_count ?? null,
     last_error_at: unixOrNull(report.last_error_at),
+    // NULL 与"空数组"在这里必须保持不同：NULL = 该 Agent 未上报能力，
+    // 空数组 = 明确上报了"什么都不支持"。两者对下发的含义完全不同
+    // （见 services/agent-capability.ts 的 decideCapability）。
+    control_protocol_version: report.control_protocol_version ?? null,
+    capabilities: report.capabilities
+      ? (normalizeCapabilities(report.capabilities) as unknown as Prisma.InputJsonValue)
+      : Prisma.JsonNull,
   };
 }
 

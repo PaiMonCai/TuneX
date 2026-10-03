@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"net"
 	"testing"
 
@@ -30,13 +31,13 @@ func egressCommand(port int) *QueuedCommand {
 			Action:     "apply_tunnel",
 		},
 		Config: &forwarder.TunnelConfig{
-			ID:          "tunex-1-egress",
-			Mode:        forwarder.ModeEgress,
-			EgressPort:  port,
-			Targets:     []forwarder.Target{{Host: "127.0.0.1", Port: 9, Weight: 1}},
-			LBStrategy:  forwarder.LBRoundRobin,
-			Protocol:    "tcp",
-			Revision:    1,
+			ID:         "tunex-1-egress",
+			Mode:       forwarder.ModeEgress,
+			EgressPort: port,
+			Targets:    []forwarder.Target{{Host: "127.0.0.1", Port: 9, Weight: 1}},
+			LBStrategy: forwarder.LBRoundRobin,
+			Protocol:   "tcp",
+			Revision:   1,
 		},
 	}
 }
@@ -47,7 +48,7 @@ func TestExecuteEgressStagesPoolBeforeApply(t *testing.T) {
 	client := New(Config{}, tunnels, egress)
 
 	cmd := egressCommand(freeTCPPort(t))
-	ack := client.execute(cmd)
+	ack := client.execute(context.Background(), cmd)
 	if !ack.OK {
 		t.Fatalf("expected successful EGRESS apply, got code=%s err=%s", ack.ErrorCode, ack.Error)
 	}
@@ -80,7 +81,7 @@ func TestExecuteEgressRollsBackNewPoolWhenListenerApplyFails(t *testing.T) {
 	client := New(Config{}, tunnels, egress)
 
 	cmd := egressCommand(port)
-	ack := client.execute(cmd)
+	ack := client.execute(context.Background(), cmd)
 	if ack.OK {
 		t.Fatal("expected EGRESS apply to fail while port is occupied")
 	}

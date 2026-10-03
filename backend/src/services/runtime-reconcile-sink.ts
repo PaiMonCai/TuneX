@@ -34,6 +34,8 @@
  */
 import type { Orchestrator, OrchestratorNode } from "./orchestrator.ts";
 import type { ReconcileSink } from "./reconciler.ts";
+import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
+import type { RuntimeUseDenied } from "./forward-capability.ts";
 
 /* ================================================================== */
 /* DB 投影                                                             */
@@ -56,6 +58,9 @@ export interface SinkEgressTarget {
  */
 export interface SinkTunnel {
   id: number;
+  workspace_id: number;
+  user_id: number;
+  tunnel_type?: string;
   desired_status: string | null;
   config_revision: number | null;
   applied_revision: number | null;
@@ -70,8 +75,8 @@ export interface SinkTunnel {
   remote_port: number | null;
   egress_port: number | null;
   egress_pool_id: number | null;
-  ingress_node: OrchestratorNode | null;
-  egress_node: (OrchestratorNode & { lb_strategy?: string | null }) | null;
+  ingress_node: (OrchestratorNode & { node_group_id: number }) | null;
+  egress_node: (OrchestratorNode & { node_group_id: number; lb_strategy?: string | null }) | null;
   egress_pool: { lb_strategy?: string | null; targets: SinkEgressTarget[] } | null;
 }
 
@@ -94,6 +99,8 @@ export interface ReconcileSinkDb {
 export interface ReconcileSinkLedger {
   loadTunnel(tunnelId: number): Promise<SinkTunnel | null>;
   markApplied(input: { tunnelId: number; revision: number; at: Date }): Promise<boolean>;
+  /** Denial only records an explanation; never deletes applied runtime/leases. */
+  markBlocked?(input: { tunnelId: number; revision: number; denied: RuntimeUseDenied }): Promise<void>;
 }
 
 function firstHost(raw: string | null): string {
@@ -147,6 +154,18 @@ export function createTunnelLedger(loadDb: () => Promise<ReconcileSinkDb> = pris
       return (tunnel as SinkTunnel | null) ?? null;
     },
 
+    async markBlocked({ tunnelId, revision, denied }): Promise<void> {
+      const db = await loadDb();
+      await db.tunnel.updateMany({
+        where: { id: tunnelId, config_revision: revision },
+        data: {
+          apply_status: "error",
+          apply_error_code: denied.reason,
+          apply_error: `[${denied.error_layer}] ${denied.message}`.slice(0, 2000),
+        },
+      });
+    },
+
     async markApplied({ tunnelId, revision, at }): Promise<boolean> {
       const db = await loadDb();
       const res = await db.tunnel.updateMany({
@@ -183,6 +202,8 @@ export interface RuntimeReconcileSinkDeps {
   /** 控制面接线；返回 null = 未接线（抛错让 reconciler 记 `failed`）。 */
   orchestrator?: () => SinkOrchestrator | null;
   now?: () => Date;
+  /** Production defaults to the real latest grant/policy/traffic check. */
+  runtimeUse?: RuntimeUseChecker;
 }
 
 /** 懒加载 relay-wiring：顶层 import 会连带 eager 建 Redis/Prisma 连接。 */
@@ -195,6 +216,28 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
   const ledger = deps.ledger ?? createTunnelLedger();
   const injectedOrchestrator = deps.orchestrator;
   const now = deps.now ?? (() => new Date());
+  const runtimeUse: RuntimeUseChecker = deps.runtimeUse ?? (async (workspaceId, resource) => {
+    const { checkForwardRuntimeUse } = await import("./forward-capability.ts");
+    return checkForwardRuntimeUse(workspaceId, resource);
+  });
+  const assertRuntimeUse = async (tunnel: SinkTunnel, revision: number) => {
+    const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
+    const invalidScope = !validId(tunnel.workspace_id) || !validId(tunnel.user_id) ||
+      !validId(tunnel.ingress_node?.node_group_id) ||
+      (tunnel.tunnel_mode === "relay" && !validId(tunnel.egress_node?.node_group_id));
+    const denied: RuntimeUseDenied | null = invalidScope
+      ? { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或实际节点组已失效" }
+      : await runtimeUse(tunnel.workspace_id, {
+          user_id: tunnel.user_id,
+          in_node_group_id: tunnel.ingress_node!.node_group_id,
+          out_node_group_id: tunnel.tunnel_mode === "relay" ? tunnel.egress_node!.node_group_id : null,
+          tunnel_type: tunnel.tunnel_type ?? "tcp",
+        });
+    if (denied) {
+      await ledger.markBlocked?.({ tunnelId: tunnel.id, revision, denied });
+      throw new Error(`[${denied.reason}:${denied.error_layer}] ${denied.message}`);
+    }
+  };
 
   return {
     async resendSameRevision({ tunnel_id, revision }) {
@@ -218,6 +261,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         if (!tunnel.listen_port || !tunnel.remote_host || !tunnel.remote_port) {
           throw new Error(`DIRECT tunnel ${tunnel_id} has incomplete desired config`);
         }
+        await assertRuntimeUse(tunnel, revision);
         const r = await orchestrator.dispatchDirect({
           tunnelId: tunnel.id,
           revision,
@@ -244,6 +288,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         throw new Error(`RELAY tunnel ${tunnel_id} has no active egress targets`);
       }
 
+      await assertRuntimeUse(tunnel, revision);
       const egress = await orchestrator.dispatchEgress({
         tunnelId: tunnel.id,
         revision,
@@ -258,6 +303,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
       const host = firstHost(tunnel.egress_node.connect_ip);
       if (!host) throw new Error(`egress node ${tunnel.egress_node.id} has no connect_ip`);
 
+      await assertRuntimeUse(tunnel, revision);
       const ingress = await orchestrator.dispatchIngress({
         tunnelId: tunnel.id,
         revision,

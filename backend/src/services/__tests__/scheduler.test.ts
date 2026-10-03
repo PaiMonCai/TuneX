@@ -591,6 +591,9 @@ beforeEach(async () => {
     db: makeDb() as unknown as NonNullable<typeof deps>["db"],
     loadPolicy: async () => allowAllPolicy() as never,
     authorizeGroup: async () => true,
+    // Runtime-use admission is production-real by default; this suite's doubles
+    // stand in for it so no case reaches the process-wide Prisma client.
+    runtimeUse: async () => null,
     now: () => NOW,
     validator: (orch as unknown as { validator: never }).validator,
     portPoolDeps: { db: makeDb(), redis: makeRedis() } as unknown as NonNullable<typeof deps>["portPoolDeps"],

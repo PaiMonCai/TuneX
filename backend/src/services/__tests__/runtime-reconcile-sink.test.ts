@@ -57,6 +57,8 @@ interface TunnelRow extends SinkTunnel {
 function makeTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
   return {
     id: 1,
+    user_id: 1,
+    workspace_id: 1,
     desired_status: "active",
     config_revision: 3,
     applied_revision: 1,
@@ -71,7 +73,7 @@ function makeTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
     remote_port: 80,
     egress_port: null,
     egress_pool_id: null,
-    ingress_node: { id: 11, node_id: "F2-A", connect_ip: "127.0.0.1", role: "both" },
+    ingress_node: { id: 11, node_id: "F2-A", connect_ip: "127.0.0.1", role: "both", node_group_id: 10 },
     egress_node: null,
     egress_pool: null,
     writes: [],
@@ -89,7 +91,7 @@ function makeRelayTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
     remote_port: null,
     egress_port: 31000,
     egress_pool_id: 7,
-    egress_node: { id: 12, node_id: "F2-B", connect_ip: "10.0.0.9", role: "egress", lb_strategy: "round" },
+    egress_node: { id: 12, node_id: "F2-B", connect_ip: "10.0.0.9", role: "egress", node_group_id: 20, lb_strategy: "round" },
     egress_pool: { lb_strategy: "round", targets: [egressTarget()] },
     ...over,
   });
@@ -178,6 +180,7 @@ function sinkFor(rows: TunnelRow[], opts: Parameters<typeof makeOrchestrator>[0]
   const db = makeDb(rows);
   const { calls, orchestrator } = makeOrchestrator(opts);
   const sink = createRuntimeReconcileSink({
+    runtimeUse: async () => null,
     ledger: createTunnelLedger(async () => db),
     orchestrator: () => orchestrator,
     now: () => NOW,
@@ -320,6 +323,7 @@ describe("C. 记账是 CAS：并发推进不脏写、不把并发编辑伪装成
       },
     };
     const sink = createRuntimeReconcileSink({
+    runtimeUse: async () => null,
       ledger: createTunnelLedger(async () => makeDb([row])),
       orchestrator: () => racing,
       now: () => NOW,
@@ -413,6 +417,7 @@ function reconcileDeps(row: TunnelRow, lifecycles: { ingress: string; egress: st
     nodes: async () => [node(11, lifecycles.ingress), node(12, lifecycles.egress)],
     reports: async () => reports,
     sink: createRuntimeReconcileSink({
+    runtimeUse: async () => null,
       ledger: createTunnelLedger(async () => makeDb([row])),
       orchestrator: () => makeOrchestrator().orchestrator,
       now: () => NOW,

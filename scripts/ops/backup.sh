@@ -77,7 +77,13 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
   set -a; . "$PROJECT_ROOT/.env"; set +a
 fi
 MYSQL_DATABASE="${MYSQL_DATABASE:-tunex}"
-COMPOSE=(docker compose -p tunex -f "$COMPOSE_FILE")
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-tunex}"
+# COMPOSE_ENV_FILE lets the same scripts run against a stack whose compose file
+# needs extra variables (e.g. the e2e topology), so a real drill is possible.
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-}"
+COMPOSE_BASE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE")
+[[ -n "$COMPOSE_ENV_FILE" ]] && COMPOSE_BASE+=(--env-file "$COMPOSE_ENV_FILE")
+COMPOSE=("${COMPOSE_BASE[@]}")
 
 # svc_running <service> —— 便携式"服务是否 running"检查。
 # 不同 compose 版本对 `ps --status` 支持不一（v2.28 无该 flag），
@@ -137,7 +143,8 @@ MYSQL_ROWS="$(grep -c 'INSERT INTO ' "$MYSQL_DUMP" || true)"
 log "      dump OK：$MYSQL_ROWS 条 INSERT 语句，$(du -h "$MYSQL_DUMP" | cut -f1)"
 
 # --- 3. Redis 备份 -----------------------------------------------------------
-# AOF 关闭（compose command 仅 --appendonly yes ？实测 appendonly=no）。
+# AOF 关闭（开发与生产 compose 都只起 `redis-server`，见 docker-compose.yaml 注释）；
+# 若某天开启 appendonly，restore.sh 在替换 dump.rdb 前会直接拒绝，避免"假恢复"。
 # 物理卷复制可能撞上正在写入的 RDB，因此走"在线触发 BGSAVE → LASTSAVE 确认 → 复制"：
 # 快照含 BGSAVE 时刻前的全部写入，最多丢失最近 <1s 的写（Redis 持久化语义上限）。
 # Redis 中的密钥均为 TTL 会话/限流/缓存（实测 107 keys 全部 expires），
@@ -158,7 +165,7 @@ for BGSAVE_WAIT in $(seq 1 60); do
   [[ "$INPROG" == "0" && "$LASTSAVE" -gt "$LASTSAVE_BEFORE" ]] && break
   sleep 0.5
 done
-[[ "${INPROG:-1}" == "0" ]] || warn "BGSAVE 仍在进行，继续等待结果"
+[[ "${INPROG:-1}" == "0" ]] || die "BGSAVE 超时未完成（rdb_bgsave_in_progress=${INPROG:-?}）—— 复制一份状态未知的 RDB 不构成备份，已中止"
 # 容器内直接 cat 到宿主机文件（rdb < 内存，可接受）。
 "${COMPOSE[@]}" exec -T "$REDIS_SERVICE" sh -c "cat /data/dump.rdb" > "$REDIS_RDB" \
   || die "复制 RDB 失败"
@@ -185,7 +192,9 @@ cp "$PROJECT_ROOT/scripts/ops/backup.sh" "$CFG_DIR/" 2>/dev/null || true
   echo "backup_stamp=$STAMP"
   echo "git_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "git_branch=$(git -C "$PROJECT_ROOT" branch --show-current 2>/dev/null || echo unknown)"
-  echo "backend_image=$(docker image inspect "${TUNEX_BACKEND_IMAGE:-ghcr.io/paimoncai/tunex-backend:latest}" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo unknown)"
+  # WP11D: the unified image drives backend/worker/web; the retired per-service
+  # variables are no longer recorded as if they described this deployment.
+  echo "tunex_image=$(docker image inspect "${TUNEX_IMAGE:-ghcr.io/paimoncai/tunex:latest}" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo unknown)"
   echo "web_image=$(docker image inspect "${TUNEX_WEB_IMAGE:-ghcr.io/paimoncai/tunex-web:latest}" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo unknown)"
   echo "mysql_rows=$MYSQL_ROWS"
   echo "redis_keys=$REDIS_KEYS"
@@ -197,8 +206,10 @@ OUT_BASE="$DAILY_DIR/tunex-$STAMP"
 
 gzip -9 "$MYSQL_DUMP"
 gzip -9 "$REDIS_RDB"
+# tar -z already produces gzip; a second `gzip` pass would only leave an
+# orphaned config.tar.gz.gz behind and encrypt a different file than the one the
+# manifest names.
 tar -C "$WORK" -czf "$WORK/config.tar.gz" config
-gzip -9 "$WORK/config.tar.gz" 2>/dev/null || true
 
 # 备份加密算法。
 # 注意：不要用 -aes-256-gcm。openssl enc 的 CLI 自 1.1.1 起就不支持 AEAD 套件，
@@ -212,8 +223,10 @@ KDF_ITER=200000
 encrypt_file() {
   local src="$1" dst="$2"
   if [[ "$ENCRYPT" == "1" ]]; then
-    openssl enc -"$CIPHER" -pbkdf2 -iter "$KDF_ITER" -salt \
-      -in "$src" -out "$dst" -pass "pass:$PASSPHRASE" \
+    # The passphrase is passed through the environment, not argv: `-pass
+    # pass:...` would publish it to every process on the host via `ps`.
+    TUNEX_BACKUP_PASSPHRASE="$PASSPHRASE" openssl enc -"$CIPHER" -pbkdf2 -iter "$KDF_ITER" -salt \
+      -in "$src" -out "$dst" -pass env:TUNEX_BACKUP_PASSPHRASE \
       || die "加密失败: $src"
   else
     cp "$src" "$dst"

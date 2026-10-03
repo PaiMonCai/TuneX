@@ -4,37 +4,130 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
 
+// HTTPSource fetches the node's canonical desired state over the same outbound
+// per-node credential the command loop uses.
+//
+// It is strict on purpose (WP11A/A2):
+//
+//   - a transport failure or 5xx is an OUTAGE (the only fallback-eligible case);
+//   - 401/403/404 is an AUTHORIZATION failure: the credential or the node
+//     identity is no good, and cached state must not be served;
+//   - a 2xx body that does not carry `data.snapshot` as an object is a BAD
+//     PAYLOAD. An explicitly empty tunnel list is authoritative "nothing runs
+//     here"; a *missing* snapshot key is a contract violation, and the two must
+//     never be conflated — conflating them is how a node silently drops every
+//     listener while the panel is merely misbehaving.
 type HTTPSource struct {
-	PanelURL string
+	PanelURL   string
 	Credential string
-	Client *http.Client
+	Client     *http.Client
+	// MaxBytes overrides MaxSnapshotBytes (tests use a small value).
+	MaxBytes int64
 }
 
+// desiredEnvelope decodes the panel's response with the tunnels slice behind a
+// pointer: nil means "the key was absent" (bad payload), while a pointer to an
+// empty slice means "this node has no desired tunnels" (valid).
+type desiredEnvelope struct {
+	Data *struct {
+		Snapshot *struct {
+			Version string           `json:"version"`
+			Tunnels *[]tunnelPayload `json:"tunnels"`
+		} `json:"snapshot"`
+	} `json:"data"`
+}
+
+// tunnelPayload mirrors forwarder.TunnelConfig's wire shape, but keeping it
+// local lets the decoder demand the fields the contract requires.
+type tunnelPayload struct {
+	ID          string `json:"id"`
+	Mode        string `json:"mode"`
+	IngressPort int    `json:"ingress_port"`
+	EgressPort  int    `json:"egress_port"`
+	RemoteHost  string `json:"remote_host"`
+	RemotePort  int    `json:"remote_port"`
+	NextHop     string `json:"next_hop"`
+	Targets     []struct {
+		Host   string `json:"host"`
+		Port   int    `json:"port"`
+		Weight int    `json:"weight"`
+		Order  int    `json:"order"`
+		Remark string `json:"remark"`
+	} `json:"targets"`
+	LBStrategy string `json:"lb_strategy"`
+	Protocol   string `json:"protocol"`
+	SpeedLimit int64  `json:"speed_limit"`
+	Revision   int64  `json:"revision"`
+	ListenHost string `json:"listen_host"`
+}
+
+// FetchSnapshot implements Source with the strict classification above.
 func (s HTTPSource) FetchSnapshot(ctx context.Context) (*Snapshot, error) {
 	base := strings.TrimRight(strings.TrimSpace(s.PanelURL), "/")
 	cred := strings.TrimSpace(s.Credential)
-	if base == "" || cred == "" { return nil, ErrNoPanel }
+	if base == "" || cred == "" {
+		return nil, ErrNoPanel
+	}
 	client := s.Client
-	if client == nil { client = &http.Client{Timeout: FetchTimeout} }
+	if client == nil {
+		client = &http.Client{Timeout: FetchTimeout}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/internal/node/desired", nil)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, &FetchError{Kind: FetchBadPayload, Err: err}
+	}
 	req.Header.Set("Authorization", "Bearer "+cred)
 	resp, err := client.Do(req)
-	if err != nil { return nil, err }
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 { return nil, fmt.Errorf("restore: desired snapshot status %d", resp.StatusCode) }
-	var body struct {
-		Data struct {
-			Snapshot *Snapshot `json:"snapshot"`
-		} `json:"data"`
+	if err != nil {
+		return nil, &FetchError{Kind: FetchUnreachable, Err: err}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil { return nil, err }
-	if body.Data.Snapshot == nil { return &Snapshot{}, nil }
-	return body.Data.Snapshot, nil
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode >= 500:
+		return nil, &FetchError{Kind: FetchUnreachable, Status: resp.StatusCode}
+	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusNotFound:
+		return nil, &FetchError{Kind: FetchUnauthorized, Status: resp.StatusCode}
+	case resp.StatusCode >= 300:
+		return nil, &FetchError{Kind: FetchBadPayload, Status: resp.StatusCode}
+	}
+
+	limit := s.MaxBytes
+	if limit <= 0 {
+		limit = MaxSnapshotBytes
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		// A truncated read mid-body is a network problem, not a bad contract.
+		return nil, &FetchError{Kind: FetchUnreachable, Err: err}
+	}
+	if int64(len(body)) > limit {
+		return nil, &FetchError{Kind: FetchBadPayload, Err: fmt.Errorf("snapshot exceeds %d bytes", limit)}
+	}
+
+	var env desiredEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, &FetchError{Kind: FetchBadPayload, Err: err}
+	}
+	if env.Data == nil || env.Data.Snapshot == nil || env.Data.Snapshot.Tunnels == nil {
+		return nil, &FetchError{Kind: FetchBadPayload, Err: ErrMalformedSnapshot}
+	}
+	if len(*env.Data.Snapshot.Tunnels) > MaxSnapshotTunnels {
+		return nil, &FetchError{Kind: FetchBadPayload, Err: fmt.Errorf("snapshot has more than %d tunnels", MaxSnapshotTunnels)}
+	}
+	snap, err := decodeSnapshot(env.Data.Snapshot.Version, *env.Data.Snapshot.Tunnels)
+	if err != nil {
+		// A payload that parses as JSON but violates the tunnel contract is a
+		// bad payload, and must not be reported as an outage: it is a decision
+		// to fail closed on, not a reason to serve cached state.
+		return nil, &FetchError{Kind: FetchBadPayload, Err: err}
+	}
+	return snap, nil
 }
 
 var _ Source = HTTPSource{}

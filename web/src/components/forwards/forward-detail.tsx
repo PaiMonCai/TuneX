@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Copy, Loader2, Pencil, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
+import { ForwardDiagnose } from "@/components/forwards/forward-diagnose";
 import { ForwardEditDialog, RunningVsDesiredBadge } from "@/components/forwards/forward-edit-dialog";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
@@ -13,6 +14,8 @@ import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { InfoRow } from "@/components/ui/form";
 import { api } from "@/lib/api";
+import { useWorkspace } from "@/components/workspace/workspace-context";
+import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
 import {
   applyErrorAction,
@@ -33,8 +36,13 @@ export function ForwardDetail({
 }) {
   const { t, locale } = useI18n();
   const router = useRouter();
+  const { currentId, permissions, permissionsLoading, can, canForward } = useWorkspace();
   const [forward, setForward] = useState(initialForward);
   const [traffic, setTraffic] = useState(initialTraffic);
+  const [resourceScope, setResourceScope] = useState<number | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const canUpdate = resourceScope === currentId && canForward(forward, "update");
+  const canDelete = resourceScope === currentId && canForward(forward, "delete");
   const [actionBusy, setActionBusy] = useState(false);
   /**
    * 「下一步做什么」提示：重试/暂停/恢复失败时**不替换页面内容**，只在按钮
@@ -52,7 +60,7 @@ export function ForwardDetail({
   const [bindings, setBindings] = useState<Record<string, NodeBinding[]>>({});
 
   useEffect(() => {
-    if (!editOpen) return;
+    if (!editOpen || !can("node:read")) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -76,7 +84,7 @@ export function ForwardDetail({
     return () => {
       cancelled = true;
     };
-  }, [editOpen]);
+  }, [editOpen, currentId, permissions]);
 
   async function refreshTraffic() {
     try {
@@ -87,6 +95,7 @@ export function ForwardDetail({
   }
 
   async function runAction(action: "retry" | "suspend" | "resume") {
+    if (!canUpdate) { toast.error(PERMISSION_DENIED); return; }
     setActionBusy(true);
     setActionHint(null);
     try {
@@ -118,6 +127,7 @@ export function ForwardDetail({
   }
 
   async function removeForward() {
+    if (!canDelete) { toast.error(PERMISSION_DENIED); return; }
     setDeleting(true);
     try {
       await api.forwards.remove(forward.id);
@@ -140,6 +150,19 @@ export function ForwardDetail({
     }
   }
 
+  useEffect(() => {
+    let cancelled = false;
+    setResourceScope(null); setLoadError(null);
+    setEditOpen(false); setConfirmDelete(false); setNodes([]); setBindings({});
+    if (!can("forward:read") || currentId === null) return;
+    void api.forwards.detail(initialForward.id).then(async (value) => {
+      const points = await api.forwards.traffic(value.id, 14).catch(() => [] as TrafficPoint[]);
+      if (cancelled) return;
+      setForward(value); setTraffic(points); setResourceScope(currentId);
+    }).catch((err) => { if (!cancelled) setLoadError(err instanceof Error ? err.message : PERMISSION_DENIED); });
+    return () => { cancelled = true; };
+  }, [currentId, permissions, initialForward]);
+
   const listenAddress = forwardAccessAddress(forward) ?? t("forward.addressPending");
   const targetAddress =
     forward.target_host && forward.target_port
@@ -153,6 +176,10 @@ export function ForwardDetail({
     ? applyErrorAction(locale, forward.apply_error_code)
     : null;
 
+  if (permissionsLoading) return <p>{t("common.loading")}</p>;
+  if (!can("forward:read")) return <p role="alert">{PERMISSION_DENIED}</p>;
+  if (loadError) return <p role="alert">{loadError}</p>;
+  if (resourceScope !== currentId) return <p>{t("common.loading")}</p>;
   return (
     <div className="flex flex-col gap-5" data-testid="forward-detail">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -163,19 +190,19 @@ export function ForwardDetail({
           </Link>
         </Button>
         <div className="flex flex-wrap items-center gap-2">
-          {forward.apply_status === "error" ? (
+          {canUpdate && forward.apply_status === "error" ? (
             <Button size="sm" variant="outline" onClick={() => void runAction("retry")} disabled={actionBusy}>
               {actionBusy && <Loader2 className="size-4 animate-spin" />}
               {t("forward.retry")}
             </Button>
           ) : null}
-          {forward.apply_status === "active" ? (
+          {canUpdate && forward.apply_status === "active" ? (
             <Button size="sm" variant="outline" onClick={() => void runAction("suspend")} disabled={actionBusy}>
               {actionBusy && <Loader2 className="size-4 animate-spin" />}
               {t("forward.suspend")}
             </Button>
           ) : null}
-          {forward.apply_status === "suspended" ? (
+          {canUpdate && forward.apply_status === "suspended" ? (
             <Button size="sm" variant="outline" onClick={() => void runAction("resume")} disabled={actionBusy}>
               {actionBusy && <Loader2 className="size-4 animate-spin" />}
               {t("forward.resume")}
@@ -184,12 +211,13 @@ export function ForwardDetail({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => setEditOpen(true)}
+            disabled={!canUpdate}
+             onClick={() => setEditOpen(true)}
           >
             <Pencil className="size-4" />
             {t("forward.editForward")}
           </Button>
-          <Button size="sm" variant="destructive" onClick={() => setConfirmDelete(true)}>
+          <Button disabled={!canDelete} size="sm" variant="destructive" onClick={() => setConfirmDelete(true)}>
             <Trash2 className="size-4" />
             {t("common.delete")}
           </Button>
@@ -348,8 +376,11 @@ export function ForwardDetail({
         </CardContent>
       </Card>
 
+      {/* V4-WP11C：诊断入口。只读，不需要变更权限——能看这条转发的人就能诊断它。 */}
+      <ForwardDiagnose forwardId={forward.id} />
+
       <ForwardEditDialog
-        open={editOpen}
+        open={editOpen && canUpdate}
         onOpenChange={setEditOpen}
         forward={forward}
         nodes={nodes}
@@ -362,7 +393,7 @@ export function ForwardDetail({
       />
 
       <ConfirmDeleteDialog
-        open={confirmDelete}
+        open={confirmDelete && canDelete}
         onOpenChange={setConfirmDelete}
         title={t("common.delete")}
         description={t("forward.deleteConfirm").replace("{name}", forward.name)}

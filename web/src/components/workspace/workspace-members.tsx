@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LogOut, LogIn, RefreshCw, Trash2, UserPlus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -8,7 +8,10 @@ import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Input, Label } from "@/components/ui/input";
-import { api } from "@/lib/api";
+import { api, getActiveWorkspace } from "@/lib/api";
+import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
+import type { WorkspaceCustomRole, WorkspaceMemberRoleInput } from "@/lib/workspace-permissions";
+import { WorkspaceRoles } from "./workspace-roles";
 import { useI18n } from "@/components/providers";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { InviteMemberDialog } from "@/components/workspace/invite-member-dialog";
@@ -99,36 +102,61 @@ function JoinWorkspace() {
 
 export function WorkspaceMembers() {
   const { t } = useI18n();
-  const { current, currentId, canManage, me, refresh } = useWorkspace();
+  const { current, currentId, canManage, permissions, permissionsLoading, can, me, refresh } = useWorkspace();
   const [members, setMembers] = useState<WorkspaceMember[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<WorkspaceMember | null>(null);
 
+  const [roles, setRoles] = useState<WorkspaceCustomRole[]>([]);
+  const [assignmentBusy, setAssignmentBusy] = useState(false);
+  const [permissionError, setPermissionError] = useState<string | null>(null);
+  const seq = useRef(0);
   const isPersonal = current?.kind === "personal";
 
   async function load() {
-    if (currentId === null) return;
+    const ticket = ++seq.current;
+    setMembers(null); setRoles([]); setPermissionError(null);
+    if (currentId === null || !can("member:read")) { setLoading(false); return; }
     setLoading(true);
     try {
-      setMembers(await api.workspaces.members(currentId));
+      const [rows, roleRows] = await Promise.all([
+        api.workspaces.members(currentId),
+        canManage && !isPersonal ? api.workspaces.roles(currentId).catch(() => []) : Promise.resolve([]),
+      ]);
+      if (ticket !== seq.current || getActiveWorkspace() !== currentId) return;
+      setMembers(rows); setRoles(roleRows);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("workspace.loadMembersFailed"));
-      setMembers([]);
-    } finally {
-      setLoading(false);
-    }
+      if (ticket !== seq.current) return;
+      setPermissionError(err instanceof Error ? err.message : PERMISSION_DENIED); setMembers([]);
+    } finally { if (ticket === seq.current) setLoading(false); }
   }
-
   useEffect(() => {
-    void load();
-    // currentId 变化即切换了空间，成员列表要整体重取
-  }, [currentId]);
+    setInviteOpen(false); setRemoveTarget(null); void load();
+    return () => { seq.current++; };
+  }, [currentId, permissions]);
+
+  async function assign(member: WorkspaceMember, value: string) {
+    if (!canManage || isPersonal || currentId === null || member.role === "owner" || assignmentBusy) return;
+    const scope = currentId;
+    const input: WorkspaceMemberRoleInput = value.startsWith("custom:")
+      ? { role_id: Number(value.slice(7)) }
+      : value === "base" ? { role_id: null } : { role: value as "admin" | "member" | "viewer" };
+    setAssignmentBusy(true); setPermissionError(null);
+    try {
+      await api.workspaces.assignRole(scope, member.user_id, input);
+      if (getActiveWorkspace() !== scope) return;
+      toast.success("成员角色已更新"); await refresh();
+    } catch (err) {
+      if (getActiveWorkspace() === scope) setPermissionError(err instanceof Error ? err.message : PERMISSION_DENIED);
+    } finally { setAssignmentBusy(false); }
+  }
 
   const canInvite = canManage && !isPersonal;
 
   async function onRemove() {
     if (!removeTarget || currentId === null) return;
+    if (!canManage && removeTarget.user_id !== me?.id) { setPermissionError(PERMISSION_DENIED); return; }
     const self = removeTarget.user_id === me?.id;
     try {
       await api.workspaces.removeMember(currentId, removeTarget.user_id);
@@ -149,6 +177,10 @@ export function WorkspaceMembers() {
         因此放在同一页内，先邀请后加入的 workflow 不用跳出本页。
       */}
       <JoinWorkspace />
+      {permissionsLoading && <p>{t("common.loading")}</p>}
+      {!permissionsLoading && !can("member:read") && <p role="alert">{PERMISSION_DENIED}</p>}
+      {permissionError && <p role="alert" className="text-sm text-[var(--destructive)]">操作被拒绝：{permissionError}</p>}
+      <WorkspaceRoles onChanged={() => void load()} />
 
       <Card>
         <CardHeader className="flex-row items-start justify-between gap-3">
@@ -173,9 +205,9 @@ export function WorkspaceMembers() {
               <span data-testid="workspace-member-count">
                 {t("workspace.memberCount")} {members?.length ?? 0}
               </span>
-              {current && (
+              {permissions && (
                 <Badge variant="muted" data-testid="workspace-role">
-                  {t(`workspace.role.${current.role}`)}
+                  {t(`workspace.role.${permissions.role}`)}
                 </Badge>
               )}
             </p>
@@ -234,8 +266,19 @@ export function WorkspaceMembers() {
                               m.role === "owner" ? "default" : m.role === "admin" ? "success" : "muted"
                             }
                           >
-                            {t(`workspace.role.${m.role}`)}
+                            {m.custom_role_name ?? roles.find((r) => r.id === (m.custom_role_id ?? m.role_id))?.name ?? t(`workspace.role.${m.role}`)}
                           </Badge>
+                          {canManage && !isPersonal && !isOwner && <select
+                            aria-label={`分配角色 ${m.email}`} data-testid={`member-role-${m.user_id}`}
+                            className="ml-2 rounded-md border border-[var(--border)] bg-[var(--background)] p-1 text-xs"
+                            disabled={assignmentBusy}
+                            value={(m.custom_role_id ?? m.role_id) ? `custom:${m.custom_role_id ?? m.role_id}` : m.role}
+                            onChange={(e) => void assign(m, e.target.value)}
+                          >
+                            <option value="admin">admin</option><option value="member">member</option><option value="viewer">viewer</option>
+                            {(m.custom_role_id ?? m.role_id) && <option value="base">恢复基础角色（{m.role}）</option>}
+                            {roles.map((r) => <option key={r.id} value={`custom:${r.id}`}>{r.name}</option>)}
+                          </select>}
                         </TableCell>
                         <TableCell className="text-xs text-[var(--muted-foreground)]">
                           {formatDateTime(m.created_at)}
@@ -266,7 +309,7 @@ export function WorkspaceMembers() {
         </CardContent>
       </Card>
 
-      {currentId !== null && (
+      {currentId !== null && canInvite && (
         <InviteMemberDialog
           open={inviteOpen}
           onOpenChange={setInviteOpen}

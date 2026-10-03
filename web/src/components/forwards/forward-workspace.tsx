@@ -18,7 +18,9 @@ import {
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, getActiveWorkspace } from "@/lib/api";
+import { useWorkspace } from "@/components/workspace/workspace-context";
+import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import {
   forwardAccessAddress,
   forwardCopyDraft,
@@ -355,6 +357,11 @@ function SortableHead({
 
 export function ForwardWorkspace() {
   const { t, locale } = useI18n();
+  const { currentId, permissions, permissionsLoading, can, canForward } = useWorkspace();
+  const canRead = can("forward:read");
+  const canReadNodes = can("node:read");
+  const canCreate = can("forward:create") && canReadNodes;
+  const canManageNodes = can("node:manage");
   const [nodes, setNodes] = useState<UserNode[]>([]);
   const [bindings, setBindings] = useState<Record<number, NodeBinding[]>>({});
   const [summary, setSummary] = useState<ForwardSummary | null>(null);
@@ -480,34 +487,37 @@ export function ForwardWorkspace() {
     return parts.join(" ");
   }
 
+  const referenceSeq = useRef(0);
   async function loadReference() {
-    try {
-      const [nodeRows, forwardSummary] = await Promise.all([
-        api.nodes.list(),
-        api.forwards.summary(),
-      ]);
-      const ingressRows = nodeRows.filter(isIngress);
-      const rows = await Promise.all(
-        ingressRows.map(async (node) => ({
-          id: Number(node.id),
-          bindings: await api.nodes.bindings(node.id),
-        })),
-      );
-      const bindingMap: Record<number, NodeBinding[]> = {};
-      for (const row of rows) bindingMap[row.id] = row.bindings;
+    const seq = ++referenceSeq.current;
+    const scope = currentId;
+    const current = () => seq === referenceSeq.current && getActiveWorkspace() === scope;
+    setNodes([]); setBindings({}); setSummary(null);
+    // Independent permissions and partial loads: denied nodes must not erase Forward summary.
+    const summaryTask = canRead ? api.forwards.summary().then((value) => {
+      if (current()) setSummary(value);
+    }).catch(() => {}) : Promise.resolve();
+    const nodesTask = canReadNodes ? api.nodes.list().then(async (nodeRows) => {
+      if (!current()) return;
       setNodes(nodeRows);
-      setBindings(bindingMap);
-      setSummary(forwardSummary);
-    } catch (err) {
-      // 汇总/节点失败不该让整个页面失去列表；列表自己的错误态会说明问题。
-      toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
-    }
+      const rows = await Promise.all(nodeRows.filter(isIngress).map(async (node) => ({
+        id: Number(node.id), bindings: await api.nodes.bindings(node.id).catch(() => []),
+      })));
+      if (!current()) return;
+      const map: Record<number, NodeBinding[]> = {};
+      for (const row of rows) map[row.id] = row.bindings;
+      setBindings(map);
+    }).catch((err) => { if (current()) toast.error(err instanceof Error ? err.message : t("forward.loadFailed")); }) : Promise.resolve();
+    await Promise.all([summaryTask, nodesTask]);
   }
 
   /** 写操作后刷新汇总：列表与卡片是两套口径（卡片是 workspace 全量）。 */
   async function reloadSummary() {
+    if (!canRead) return;
+    const scope = currentId;
     try {
-      setSummary(await api.forwards.summary());
+      const value = await api.forwards.summary();
+      if (getActiveWorkspace() === scope) setSummary(value);
     } catch {
       // 汇总失败不影响列表可用性；下一次写操作/刷新会再试。
     }
@@ -525,7 +535,12 @@ export function ForwardWorkspace() {
     if (requestedIngress && /^\d+$/.test(requestedIngress)) {
       setIngressFilter(requestedIngress);
     }
-  }, []);
+    return () => { referenceSeq.current++; };
+  }, [currentId, permissions]);
+
+  useEffect(() => {
+    setSelectedIds(new Set()); setEditTarget(null); setCreateOpen(false); setCreatedForward(null);
+  }, [currentId, permissions]);
 
   /**
    * 关键字防抖：服务端过滤意味着「每敲一个字 = 一次查询」。
@@ -548,6 +563,9 @@ export function ForwardWorkspace() {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setForwards([]);
+    setTotal(0);
+    if (!canRead || currentId === null) { setLoading(false); return; }
     api.forwards
       .page(listQuery)
       .then((result) => {
@@ -575,7 +593,7 @@ export function ForwardWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [listQuery, reloadToken, t]);
+  }, [listQuery, reloadToken, t, currentId, permissions, canRead]);
 
   /**
    * 筛选变化一律回第 1 页。
@@ -596,6 +614,7 @@ export function ForwardWorkspace() {
   }
 
   function openCreate(mode: "direct" | "relay") {
+    if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
     const filteredIngress =
       ingressFilter !== "all"
         ? ingressNodes.find((node) => String(node.id) === ingressFilter)
@@ -621,6 +640,7 @@ export function ForwardWorkspace() {
    * 真正的 POST 仍走 `createForward()`，因此「复制」没有第二条写路径。
    */
   function copyForward(forward: PortForward) {
+    if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
     const draft = forwardCopyDraft(forward, L("forward.copySuffix"));
     setCreateMode(draft.mode);
     setName(draft.name);
@@ -634,6 +654,7 @@ export function ForwardWorkspace() {
   }
 
   async function bindSelectedEgress() {
+    if (!canManageNodes) { toast.error(PERMISSION_DENIED); return; }
     const ingress = Number(ingressId);
     const egress = Number(bindEgressId);
     if (!Number.isInteger(ingress) || !Number.isInteger(egress)) return;
@@ -661,6 +682,7 @@ export function ForwardWorkspace() {
   }
 
   async function createForward() {
+    if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
     const ingress = Number(ingressId);
     const targetPortNum = Number(targetPort);
     const listenPortNum = listenPort ? Number(listenPort) : null;
@@ -706,6 +728,7 @@ export function ForwardWorkspace() {
   }
 
   async function runAction(forward: PortForward, action: "retry" | "suspend" | "resume") {
+    if (!canForward(forward, "update")) { toast.error(PERMISSION_DENIED); return; }
     setActionBusy(Number(forward.id));
     try {
       await api.forwards.action(forward.id, action);
@@ -723,6 +746,8 @@ export function ForwardWorkspace() {
 
   /** 选中集的唯一修改点（不可变更新，避免 Set 被就地改写导致漏渲染）。 */
   function toggleSelected(id: number, checked: boolean) {
+    const row = forwards.find((f) => Number(f.id) === id);
+    if (checked && (!row || !canForward(row, "update"))) return;
     setSelectedIds((current) => {
       const next = new Set(current);
       if (checked) next.add(id);
@@ -736,7 +761,7 @@ export function ForwardWorkspace() {
     setBatchError(null);
   }
 
-  const pageIds = useMemo(() => forwards.map((row) => Number(row.id)), [forwards]);
+  const pageIds = useMemo(() => forwards.filter((row) => canForward(row, "update")).map((row) => Number(row.id)), [forwards, permissions]);
   const selectedOnPage = pageIds.filter((id) => selectedIds.has(id));
   const allPageSelected = pageIds.length > 0 && selectedOnPage.length === pageIds.length;
 
@@ -766,6 +791,14 @@ export function ForwardWorkspace() {
    */
   async function runBatch(action: ForwardBatchAction) {
     const ids = [...selectedIds];
+    // Revalidate all selected resources before batching (including cross-page selections).
+    if (!can("forward:update")) { setBatchError(PERMISSION_DENIED); return; }
+    if (permissions?.forward_mutations === "own") {
+      const rows = await Promise.all(ids.map((id) => api.forwards.detail(id).catch(() => null)));
+      if (getActiveWorkspace() !== currentId || rows.some((row) => !row || !canForward(row, "update"))) {
+        setBatchError(PERMISSION_DENIED); return;
+      }
+    }
     if (ids.length === 0) return;
     if (ids.length > FORWARD_BATCH_MAX_IDS) {
       setBatchError(L("forward.batchLimit", { max: FORWARD_BATCH_MAX_IDS }));
@@ -807,6 +840,7 @@ export function ForwardWorkspace() {
   }
 
   async function removeForward(forward: PortForward) {
+    if (!canForward(forward, "delete")) { toast.error(PERMISSION_DENIED); return; }
     if (!confirm(t("forward.deleteConfirm").replace("{name}", forward.name))) return;
     setActionBusy(Number(forward.id));
     try {
@@ -820,8 +854,11 @@ export function ForwardWorkspace() {
     }
   }
 
+  if (permissionsLoading) return <p>{t("common.loading")}</p>;
+  if (!canRead) return <p role="alert">{PERMISSION_DENIED}</p>;
   return (
     <div className="flex flex-col gap-5">
+      {!can("forward:update") && <p className="text-sm text-[var(--muted-foreground)]">只读：当前有效权限不允许修改转发。</p>}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <Button
@@ -893,11 +930,11 @@ export function ForwardWorkspace() {
           </Select>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => openCreate("direct")}>
+          <Button disabled={!canCreate} variant="outline" onClick={() => openCreate("direct")}>
             <Plus className="size-4" />
             {t("forward.createDirect")}
           </Button>
-          <Button onClick={() => openCreate("relay")}>
+          <Button disabled={!canCreate} onClick={() => openCreate("relay")}>
             <Route className="size-4" />
             {t("forward.createRelay")}
           </Button>
@@ -1022,7 +1059,7 @@ export function ForwardWorkspace() {
               <CardDescription>{t("forward.directDesc")}</CardDescription>
             </CardHeader>
             <CardContent>
-              <Button onClick={() => openCreate("direct")}>{t("forward.createDirect")}</Button>
+              <Button disabled={!canCreate} onClick={() => openCreate("direct")}>{t("forward.createDirect")}</Button>
             </CardContent>
           </Card>
           <Card>
@@ -1034,7 +1071,7 @@ export function ForwardWorkspace() {
               <CardDescription>{t("forward.relayDesc")}</CardDescription>
             </CardHeader>
             <CardContent>
-              <Button onClick={() => openCreate("relay")}>{t("forward.createRelay")}</Button>
+              <Button disabled={!canCreate} onClick={() => openCreate("relay")}>{t("forward.createRelay")}</Button>
             </CardContent>
           </Card>
         </div>
@@ -1137,6 +1174,7 @@ export function ForwardWorkspace() {
                       className="size-4 cursor-pointer"
                       data-testid="forward-select-all"
                       aria-label={L("forward.selectAll")}
+                      disabled={!can("forward:update") || pageIds.length === 0}
                       checked={allPageSelected}
                       onChange={(event) => toggleSelectAllOnPage(event.target.checked)}
                     />
@@ -1201,6 +1239,7 @@ export function ForwardWorkspace() {
                           className="size-4 cursor-pointer"
                           data-testid={`forward-select-${forward.id}`}
                           aria-label={L("forward.selectRow")}
+                          disabled={!canForward(forward, "update")}
                           checked={selectedIds.has(Number(forward.id))}
                           onChange={(event) =>
                             toggleSelected(Number(forward.id), event.target.checked)
@@ -1269,34 +1308,35 @@ export function ForwardWorkspace() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            {forward.apply_status === "error" ? (
+                            {canForward(forward, "update") && forward.apply_status === "error" ? (
                               <DropdownMenuItem onClick={() => void runAction(forward, "retry")}>
                                 {t("forward.retry")}
                               </DropdownMenuItem>
                             ) : null}
-                            {forward.apply_status === "active" ? (
+                            {canForward(forward, "update") && forward.apply_status === "active" ? (
                               <DropdownMenuItem onClick={() => void runAction(forward, "suspend")}>
                                 {t("forward.suspend")}
                               </DropdownMenuItem>
                             ) : null}
-                            {forward.apply_status === "suspended" ? (
+                            {canForward(forward, "update") && forward.apply_status === "suspended" ? (
                               <DropdownMenuItem onClick={() => void runAction(forward, "resume")}>
                                 {t("forward.resume")}
                               </DropdownMenuItem>
                             ) : null}
-                            <DropdownMenuItem onClick={() => setEditTarget(forward)}>
+                            <DropdownMenuItem disabled={!canForward(forward, "update")} onClick={() => setEditTarget(forward)}>
                               <Pencil className="size-4" />
                               {t("forward.editForward")}
                             </DropdownMenuItem>
                             {/* V4-WP9 §13.6：复制 = 同一份 create 契约再建一条（端口自动分配）。 */}
                             <DropdownMenuItem
-                              data-testid={`forward-copy-${forward.id}`}
+                              disabled={!canCreate}
+                               data-testid={`forward-copy-${forward.id}`}
                               onClick={() => copyForward(forward)}
                             >
                               <Copy className="size-4" />
                               {L("forward.copyForward")}
                             </DropdownMenuItem>
-                            <DropdownMenuItem className="text-[var(--destructive)]" onClick={() => void removeForward(forward)}>
+                            <DropdownMenuItem disabled={!canForward(forward, "delete")} className="text-[var(--destructive)]" onClick={() => void removeForward(forward)}>
                               <Trash2 className="size-4" />
                               {t("common.delete")}
                             </DropdownMenuItem>
@@ -1312,7 +1352,7 @@ export function ForwardWorkspace() {
         </div>
       )}
 
-      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+      <Dialog open={createOpen && canCreate} onOpenChange={setCreateOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
@@ -1383,7 +1423,7 @@ export function ForwardWorkspace() {
                       </div>
                     )}
 
-                    {availableEgressNodes.length > 0 ? (
+                    {canManageNodes && availableEgressNodes.length > 0 ? (
                       <div className="rounded-md border border-[var(--border)] p-3">
                         <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">
                           {selectedBindings.length > 0
@@ -1489,7 +1529,7 @@ export function ForwardWorkspace() {
 
       {/* V4-WP4：列表行进入全字段编辑；保存后按 updated 回填行，保持列表可用 */}
       <ForwardEditDialog
-        open={editTarget !== null}
+        open={editTarget !== null && canForward(editTarget, "update")}
         onOpenChange={(open) => {
           if (!open) setEditTarget(null);
         }}

@@ -162,6 +162,10 @@ export interface StateReportRow {
   used_ports: unknown;
   last_error: string | null;
   reported_at: Date;
+  /** V4-WP11B：Agent 上报的控制协议版本（null = 未上报）。 */
+  control_protocol_version?: number | null;
+  /** V4-WP11B：Agent 上报的能力清单（null = 未上报；数组 = 已上报）。 */
+  capabilities?: unknown;
 }
 
 export interface EgressPoolRow {
@@ -1462,6 +1466,13 @@ export interface NodeStateView {
   used_ports: unknown;
   egress_pools: unknown;
   last_error: string | null;
+  /**
+   * V4-WP11B 控制协议协商事实。
+   * `null` = 该 Agent 未上报（按基线动作处理），数组 = 其自述实现的动作清单。
+   * 两者在下发判定里含义不同，因此这里也不做「null → []」的归一。
+   */
+  control_protocol_version: number | null;
+  capabilities: string[] | null;
 }
 
 /**
@@ -1507,6 +1518,10 @@ export async function getNodeState(
         used_ports: true,
         last_error: true,
         reported_at: true,
+        // V4-WP11B: the operator needs to see "this node cannot receive action X
+        // yet" before it happens, not as a dispatch failure afterwards.
+        control_protocol_version: true,
+        capabilities: true,
       },
     }),
   );
@@ -1536,6 +1551,11 @@ export async function getNodeState(
       used_ports: jsonOr(snapshot?.used_ports, []),
       egress_pools: jsonOr(snapshot?.egress_pools, {}),
       last_error: snapshot?.last_error ?? null,
+      // Negotiation facts, surfaced verbatim. `capabilities: null` means "this
+      // Agent never told us" and must NOT be rendered as an empty list: the two
+      // have different meanings for what the panel is allowed to send.
+      control_protocol_version: snapshot?.control_protocol_version ?? null,
+      capabilities: Array.isArray(snapshot?.capabilities) ? snapshot?.capabilities : null,
     },
   };
 }
@@ -1615,6 +1635,8 @@ export async function listNodeStates(
           used_ports: true,
           last_error: true,
           reported_at: true,
+          control_protocol_version: true,
+          capabilities: true,
         },
       }),
     );
@@ -1640,7 +1662,11 @@ export async function listNodeStates(
       used_ports: jsonOr(snapshot?.used_ports, []),
       egress_pools: jsonOr(snapshot?.egress_pools, {}),
       last_error: snapshot?.last_error ?? null,
-    });
+          // Same rule as the single-node view: null means "not reported", and the
+      // two cases must not be collapsed into an empty list.
+      control_protocol_version: snapshot?.control_protocol_version ?? null,
+      capabilities: Array.isArray(snapshot?.capabilities) ? snapshot?.capabilities : null,
+});
   }
   return { ok: true, states, total: states.length };
 }
@@ -1701,6 +1727,8 @@ export async function listNodeStatesWithCredentials(
         used_ports: true,
         last_error: true,
         reported_at: true,
+        control_protocol_version: true,
+        capabilities: true,
       },
     }),
   );
@@ -1734,6 +1762,9 @@ export async function listNodeStatesWithCredentials(
       last_error: snapshot?.last_error ?? null,
       // 状态投影：只有布尔/时间戳，没有哈希也没有明文。
       credential: credentialStateOf(node),
+      // Negotiation facts; `null` (never reported) is preserved as null.
+      control_protocol_version: snapshot?.control_protocol_version ?? null,
+      capabilities: Array.isArray(snapshot?.capabilities) ? snapshot?.capabilities : null,
     });
   }
   return { ok: true, items, total: items.length };

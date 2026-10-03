@@ -52,6 +52,8 @@ import {
   type ResourceRecord,
   type ResourceSnapshot,
   type ResourceStatus,
+  type CollectDiagnosticsEnvelope,
+  type DiagnoseTunnelEnvelope,
   type StateRequestEnvelope,
 } from "./types.ts";
 
@@ -161,6 +163,11 @@ export const ACTION_PAYLOAD_KEYS = {
   suspend_tunnel: new Set(["reason"]),
   state_request: new Set<string>(),
   command_ack: new Set(["acked_command_id", "applied_revision", "status", "error_code", "error", "state"]),
+  // V4-WP11C: read-only probe. `targets` is derived from the tunnel's own
+  // authorized desired state by the panel; the validator only bounds its shape.
+  diagnose_tunnel: new Set(["targets", "timeout_ms"]),
+  // No payload: the only accepted shape is an empty object.
+  collect_diagnostics: new Set<string>(),
 } as const;
 
 const TUNNEL_KEYS = new Set([
@@ -259,6 +266,10 @@ function validateReasonField(payload: Record<string, unknown>): string | null {
   return null;
 }
 
+/** V4-WP11C caps, shared with the agent's own limits. */
+export const DIAGNOSE_MAX_TARGETS = 8;
+export const DIAGNOSE_MAX_TIMEOUT_MS = 5000;
+
 /** payload schema 校验（白名单字段 + 值域）。 */
 export function validatePayload(action: CommandAction, payload: unknown): string | null {
   if (!isPlainObject(payload)) return "payload 必须是对象";
@@ -312,6 +323,38 @@ export function validatePayload(action: CommandAction, payload: unknown): string
       }
       if ((status === "rejected" || status === "failed") && payload.error_code === undefined) {
         return `status=${status} 时必须提供 payload.error_code`;
+      }
+      return null;
+    }
+    case "collect_diagnostics": {
+      const extra = unknownKeys(payload, [...ACTION_PAYLOAD_KEYS.collect_diagnostics]);
+      if (extra.length > 0) return `payload 含未定义字段: ${extra.join(", ")}`;
+      return null;
+    }
+    case "diagnose_tunnel": {
+      const extra = unknownKeys(payload, [...ACTION_PAYLOAD_KEYS.diagnose_tunnel]);
+      if (extra.length > 0) return `payload 含未定义字段: ${extra.join(", ")}`;
+      if (!Array.isArray(payload.targets) || payload.targets.length === 0) {
+        return "payload.targets 必须是非空数组";
+      }
+      if (payload.targets.length > DIAGNOSE_MAX_TARGETS) {
+        return `payload.targets 超过上限 ${DIAGNOSE_MAX_TARGETS}`;
+      }
+      for (let i = 0; i < payload.targets.length; i += 1) {
+        const entry = payload.targets[i];
+        if (!isPlainObject(entry)) return `payload.targets[${i}] 必须是对象`;
+        const entryExtra = unknownKeys(entry, ["host", "port"]);
+        if (entryExtra.length > 0) return `payload.targets[${i}] 含未定义字段: ${entryExtra.join(", ")}`;
+        if (typeof entry.host !== "string" || entry.host.trim() === "") {
+          return `payload.targets[${i}].host 不能为空`;
+        }
+        if (entry.host.length > MAX_ADDRESS_LEN) return `payload.targets[${i}].host 过长`;
+        const portErr = validateIntField(entry.port, `payload.targets[${i}].port`, 1, 65535);
+        if (portErr) return portErr;
+      }
+      if (payload.timeout_ms !== undefined) {
+        const err = validateIntField(payload.timeout_ms, "payload.timeout_ms", 1, DIAGNOSE_MAX_TIMEOUT_MS);
+        if (err) return err;
       }
       return null;
     }
@@ -668,9 +711,67 @@ export class ControlValidator {
         return this.answerStateRequest(cmd, nowMs);
       case "command_ack":
         return this.recordAck(cmd, nowMs);
+      case "collect_diagnostics": {
+        // Read-only, same as diagnose: it must not touch the mutation path.
+        const state = this.snapshot(cmd.resource, cmd.resource_id);
+        return {
+          command_id: cmd.command_id,
+          action: cmd.action,
+          resource: cmd.resource,
+          resource_id: cmd.resource_id,
+          revision: cmd.revision,
+          applied_revision: state.applied_revision,
+          status: "applied",
+          state,
+          acked_at: new Date(nowMs).toISOString(),
+        };
+      }
+      case "diagnose_tunnel":
+        // V4-WP11C: a diagnose is READ-ONLY. It must not enter the mutation path,
+        // which would apply the revision gate and advance the resource status —
+        // a diagnostic that mutates is not a diagnostic.
+        return this.recordReadOnlyProbe(cmd, nowMs);
       default:
         return this.executeMutation(cmd, applier, nowMs);
     }
+  }
+
+  /**
+   * diagnose_tunnel：只读动作。
+   *
+   * 与 state_request 一样不经过变更闸门；与它不同的是诊断**确实要下发到 Agent**，
+   * 所以由 orchestrator 走命令总线，而不是在这里就地回答。校验器这一层只负责
+   * "信封与 payload 合法、且不需要任何状态推进"，并回一个 accepted 形状的回执，
+   * 让调用方无法把它误当成一次已应用的变更。
+   */
+  private recordReadOnlyProbe(cmd: DiagnoseTunnelEnvelope, nowMs: number): CommandAck {
+    const state = this.snapshot(cmd.resource, cmd.resource_id);
+    const ack: CommandAck = {
+      command_id: cmd.command_id,
+      action: cmd.action,
+      resource: cmd.resource,
+      resource_id: cmd.resource_id,
+      revision: cmd.revision,
+      // Read-only: the applied revision is whatever the resource already had.
+      applied_revision: state.applied_revision,
+      status: "applied",
+      state,
+      acked_at: new Date(nowMs).toISOString(),
+    };
+    this.ledger.set(cmd.command_id, {
+      fingerprint: commandFingerprint(cmd),
+      outcome: {
+        command_id: cmd.command_id,
+        action: cmd.action,
+        resource: cmd.resource,
+        resource_id: cmd.resource_id,
+        revision: cmd.revision,
+        applied_revision: state.applied_revision,
+        status: "applied",
+        acked: false,
+      },
+    });
+    return ack;
   }
 
   /** state_request：不读闸门、不写账本、不调 applier —— 永远回新鲜快照。 */

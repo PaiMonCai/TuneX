@@ -67,7 +67,13 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
   set -a; . "$PROJECT_ROOT/.env"; set +a
 fi
 MYSQL_DATABASE="${MYSQL_DATABASE:-tunex}"
-COMPOSE=(docker compose -p tunex -f "$COMPOSE_FILE")
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-tunex}"
+# COMPOSE_ENV_FILE lets the same scripts run against a stack whose compose file
+# needs extra variables (e.g. the e2e topology), so a real drill is possible.
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-}"
+COMPOSE_BASE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE")
+[[ -n "$COMPOSE_ENV_FILE" ]] && COMPOSE_BASE+=(--env-file "$COMPOSE_ENV_FILE")
+COMPOSE=("${COMPOSE_BASE[@]}")
 
 # svc_running <service> —— 便携式"服务是否 running"检查。
 # 不同 compose 版本对 `ps --status` 支持不一（v2.28 无该 flag），
@@ -110,6 +116,14 @@ log "备份 id   : $BK_ID"
 log "manifest  : $MANIFEST"
 command -v jq >/dev/null 2>&1 || warn "无 jq，部分自检降级"
 
+# Whether a passphrase is needed at all is a property of the ARTEFACT, so it is
+# read from the manifest before anything asks the operator for one. A
+# `--no-encrypt` backup must restore without any passphrase.
+MANIFEST_ENCRYPTED="yes"
+if grep -q '"encrypted"[[:space:]]*:[[:space:]]*false' "$MANIFEST" 2>/dev/null; then
+  MANIFEST_ENCRYPTED="no"
+fi
+
 # --- 2. 人工确认 -------------------------------------------------------------
 if [[ $ASSUME_YES -ne 1 && $DRY_RUN -ne 1 ]]; then
   cat <<EOF
@@ -136,10 +150,18 @@ verify_and_decrypt() {
   sum="$(cat "$enc.sha256")"
   echo "$sum  $enc" | sha256sum -c - >/dev/null 2>&1 || die "SHA256 校验失败: $enc（文件损坏或被篡改）"
   log "  SHA256 OK : $(basename "$enc")"
+
+  if [[ "$MANIFEST_ENCRYPTED" == "no" ]]; then
+    # Plain artefact: the SHA256 above is the integrity check; decrypting it would
+    # be wrong regardless of what passphrase the operator has.
+    cp -- "$enc" "$out"
+    log "  未加密备份（manifest encrypted=false）：跳过解密"
+    return 0
+  fi
   # 算法必须与 backup.sh 的 CIPHER/KDF_ITER 一致（aes-256-cbc + PBKDF2 200k）。
   # CBC 无认证标签，因此「口令错误」只能靠下面这段 gzip 头校验兜底。
   openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-    -in "$enc" -out "$out" -pass "pass:$PASSPHRASE" 2>"$WORK/openssl.err" \
+    -in "$enc" -out "$out" -pass env:TUNEX_BACKUP_PASSPHRASE 2>"$WORK/openssl.err" \
     || { cat "$WORK/openssl.err" >&2; die "解密失败（口令错误？）: $enc"; }
   # gzip 魔术头（1f 8b）校验：口令正确时解密产物一定是 gzip。
   # CBC 解密明文不定，口令错误时 openssl 可能不报错，只能靠这一层拦截。
@@ -147,15 +169,30 @@ verify_and_decrypt() {
     || die "解密产物不是 gzip —— 口令错误或备份文件被截断: $enc"
 }
 
-if [[ -n "${BACKUP_PASSPHRASE:-}" ]]; then
+# One passphrase, two accepted variable names. `TUNEX_BACKUP_PASSPHRASE` is what
+# the openssl calls reference internally; `BACKUP_PASSPHRASE` is what the docs and
+# cron entries use. Accepting only one of them is how a real recovery ends up
+# failing at 3am with a correct passphrase.
+if [[ "$MANIFEST_ENCRYPTED" == "no" ]]; then
+  # Plain artefact: asking for a passphrase here would be noise, and requiring one
+  # would make a backup this tool produced impossible to restore.
+  PASSPHRASE=""
+elif [[ -n "${BACKUP_PASSPHRASE:-}" ]]; then
   PASSPHRASE="$BACKUP_PASSPHRASE"
+elif [[ -n "${TUNEX_BACKUP_PASSPHRASE:-}" ]]; then
+  PASSPHRASE="$TUNEX_BACKUP_PASSPHRASE"
+elif [[ $DRY_RUN -eq 1 ]]; then
+  PASSPHRASE="dry-run-no-decrypt"
+elif [[ -t 0 ]]; then
+  read -r -s -p "备份解密口令: " PASSPHRASE; echo
+  [[ -n "$PASSPHRASE" ]] || die "口令为空" 2
 else
-  [[ $DRY_RUN -eq 1 ]] && PASSPHRASE="dry-run-no-decrypt" || {
-    read -r -s -p "备份解密口令: " PASSPHRASE; echo
-  }
+  # Non-interactive (cron/CI/drill) with an encrypted artefact and no passphrase:
+  # say exactly what is missing instead of dying inside the prompt.
+  die "该备份已加密，但未提供口令。请设置 BACKUP_PASSPHRASE（或 TUNEX_BACKUP_PASSPHRASE），或在终端交互执行" 2
 fi
 
-log "[1/4] 校验 + 解密"
+log "[1/4] 校验 + 解密（encrypted=$MANIFEST_ENCRYPTED）"
 ENC_MYSQL="$(jq -r '.files[] | select(test("mysql"))' "$MANIFEST" 2>/dev/null || echo "${BK_ID}-mysql.sql.gz")"
 ENC_REDIS="$(jq -r '.files[] | select(test("redis"))' "$MANIFEST" 2>/dev/null || echo "${BK_ID}-redis.rdb.gz")"
 ENC_CFG="$(jq -r '.files[] | select(test("config"))' "$MANIFEST" 2>/dev/null || echo "${BK_ID}-config.tar.gz")"
@@ -173,30 +210,95 @@ MYSQL_SQL="$WORK/mysql.sql"
 grep -q "Dump completed on" "$MYSQL_SQL" || die "解密产物不是有效 dump"
 
 # --- 4. MySQL 恢复 -----------------------------------------------------------
+# WP11D: restoring into a database that the application is still writing to
+# produces a silently inconsistent result. Writers are stopped for the duration
+# of the restore and restarted by an EXIT trap, so a failure mid-restore cannot
+# leave the stack down.
+# Which services write to the database. Configurable because the stack layout is a
+# deployment property: hardcoding "backend worker web" makes the script silently
+# refuse to restart anything on a differently-named stack (e.g. the e2e topology,
+# where the API service is called "panel").
+WRITER_SERVICES="${WRITER_SERVICES:-backend worker web}"
+WRITERS_STOPPED=0
+stop_writers() {
+  local ws=()
+  for w in $WRITER_SERVICES; do
+    if svc_running "$w"; then ws+=("$w"); fi
+  done
+  [[ ${#ws[@]} -gt 0 ]] || return 0
+  log "  停止写入方: ${ws[*]}"
+  "${COMPOSE[@]}" stop "${ws[@]}" >/dev/null
+  WRITERS_STOPPED=1
+}
+resume_writers() {
+  [[ $WRITERS_STOPPED -eq 1 ]] || return 0
+  log "  恢复写入方: $WRITER_SERVICES"
+  # shellcheck disable=SC2086  # 有意分词：这是一个服务名列表
+  "${COMPOSE[@]}" start $WRITER_SERVICES >/dev/null 2>&1 || warn "写入方重启失败，请手动 docker compose up -d"
+  WRITERS_STOPPED=0
+}
+
+# Redis is stopped while its volume is replaced; this guarantees it comes back.
+REDIS_STOPPED=0
+resume_services() {
+  if [[ $REDIS_STOPPED -eq 1 ]]; then
+    "${COMPOSE[@]}" start "$REDIS_SERVICE" >/dev/null 2>&1 || warn "redis 未能自动启动，请手动 docker compose up -d $REDIS_SERVICE"
+    REDIS_STOPPED=0
+  fi
+  resume_writers
+}
+trap 'resume_services' EXIT
+
 if [[ $DO_MYSQL -eq 1 ]]; then
   log "[2/4] MySQL 恢复 → $MYSQL_DATABASE"
   svc_running "$MYSQL_SERVICE" \
     || die "mysql 服务未运行，先 docker compose up -d mysql" 2
+  stop_writers
 
   # 记录恢复前行数（供对比报告）
   before="$("${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" sh -c \
-    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT COUNT(*) FROM workspace;\" 2>/dev/null" || echo "?")"
+    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" \"$MYSQL_DATABASE\" -N -e \"SELECT COUNT(*) FROM workspace;\" 2>/dev/null" || echo "?")"
   log "  恢复前 workspace 行数: $before"
 
-  # dump 内含 CREATE DATABASE + USE，直接灌入。--force 让 DROP IF EXISTS 冲突可继续。
+  # dump 内含 CREATE DATABASE + USE，直接灌入。刻意**不用** --force：它会把
+  # 真实的 SQL 错误（缺表/外键/编码）一并吞掉，让一次半残的恢复报成成功。
+  # 唯一的预期噪声是 DROP ... IF EXISTS 对不存在的对象告警，下面按行分类。
+  MYSQL_RC=0
   "${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" sh -c \
-    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --force < /dev/stdin" < "$MYSQL_SQL" 2>"$WORK/mysql.err" \
-    || { warn "mysql stderr: $(head -5 "$WORK/mysql.err")"; die "MySQL 灌入失败"; }
+    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" < /dev/stdin" < "$MYSQL_SQL" 2>"$WORK/mysql.err" || MYSQL_RC=$?
+  SQL_ERRORS="$(grep -c '^ERROR' "$WORK/mysql.err" 2>/dev/null || true)"
+  SQL_ERRORS="${SQL_ERRORS:-0}"
+  [[ "$SQL_ERRORS" =~ ^[0-9]+$ ]] || SQL_ERRORS=0
+  if [[ "$MYSQL_RC" -ne 0 || "$SQL_ERRORS" -gt 0 ]]; then
+    warn "mysql stderr: $(head -10 "$WORK/mysql.err")"
+    die "MySQL 灌入未干净完成（exit=$MYSQL_RC, ERROR 行数=$SQL_ERRORS）—— 拒绝把半残恢复当成功"
+  fi
+  if [[ -s "$WORK/mysql.err" ]]; then
+    log "  mysql 告警（非 ERROR）: $(wc -l < "$WORK/mysql.err") 行，已留存 $WORK/mysql.err"
+  fi
 
   after="$("${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" sh -c \
-    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT COUNT(*) FROM workspace;\" 2>/dev/null" || echo "?")"
+    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" \"$MYSQL_DATABASE\" -N -e \"SELECT COUNT(*) FROM workspace;\" 2>/dev/null" || echo "?")"
   log "  恢复后 workspace 行数: $after"
 
   # 结构自检：迁移表存在且与 dump 中迁移版本一致
   mig="$("${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" sh -c \
-    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -N -e \"SELECT COUNT(*) FROM _prisma_migrations;\" 2>/dev/null" || echo 0)"
+    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" \"$MYSQL_DATABASE\" -N -e \"SELECT COUNT(*) FROM _prisma_migrations;\" 2>/dev/null" || echo 0)"
   log "  _prisma_migrations 行数: $mig"
-  [[ "$mig" -gt 0 ]] || warn "_prisma_migrations 为空 —— dump 可能来自未迁移库"
+  is_count() { [[ "$1" =~ ^[0-9]+$ ]]; }
+  if ! is_count "$mig"; then
+    warn "无法读取 _prisma_migrations 行数（mysql 自检未返回数字）—— 请人工确认 schema 版本"
+  elif [[ "$mig" -eq 0 ]]; then
+    warn "_prisma_migrations 为空 —— dump 可能来自未迁移库"
+  fi
+  if is_count "$before" && is_count "$after"; then
+    if [[ "$after" -lt "$before" ]]; then
+      warn "恢复后 workspace 行数($after) 少于恢复前($before) —— 这是预期行为（恢复会回到备份时刻），确认备份时刻的数据量是否符合预期"
+    fi
+    log "  行数对比: workspace $before → $after"
+  else
+    warn "行数自检未取到有效数字（before=$before, after=$after），跳过对比"
+  fi
   log "  建议执行 prisma migrate deploy 确认 schema 一致（在 backend 容器内）"
 fi
 
@@ -210,45 +312,73 @@ if [[ $DO_REDIS -eq 1 ]]; then
   before_keys="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli DBSIZE | tr -d '\r')"
   log "  恢复前 keys: $before_keys"
 
-  # 方式：停 redis → 替换卷内 dump.rdb → 启动（由 restart:always 自动拉起）。
-  # 找到 redis 数据卷
-  VOL="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" sh -c 'ls -d /data' >/dev/null 2>&1 \
-        && "${COMPOSE[@]}" inspect "$REDIS_SERVICE" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null || true)"
-  [[ -n "$VOL" ]] || VOL="$("${COMPOSE[@]}" inspect "$REDIS_SERVICE" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}')"
+  # 方式：停 redis → 替换卷内 dump.rdb → 启动。
+  # WP11D: `docker compose inspect` 不是 Compose v2 的子命令（旧写法必失败，
+  # 于是这里总会 die）。正确路径是先取容器 id，再用 docker inspect 查挂载。
+  CID="$("${COMPOSE[@]}" ps -q "$REDIS_SERVICE" | head -1)"
+  [[ -n "$CID" ]] || die "无法定位 $REDIS_SERVICE 容器（compose ps -q 为空）"
+  # NOTE: this template must have one {{end}} per {{range}}/{{if}}/{{with}}.
+  # The previous version had an extra close, so `docker inspect` always failed
+  # with "template: unexpected EOF" and no Redis restore could ever complete.
+  VOL="$(docker inspect "$CID" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{if .Name}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' 2>/dev/null || true)"
+  [[ -n "$VOL" ]] || die "无法解析 redis /data 挂载（容器 $CID）"
 
   "${COMPOSE[@]}" stop "$REDIS_SERVICE" >/dev/null
+  REDIS_STOPPED=1
   if [[ -n "$VOL" ]]; then
+    # AOF 守卫在两个位置都要做：卷内 appendonlydir 存在时，替换 dump.rdb 会被
+    # 静默忽略（恢复"成功"但 key 没变，即假恢复）。
     if [[ -d "/var/lib/docker/volumes/$VOL/_data" ]]; then
-      # AOF 守卫：Redis 7 若启用 appendonly，数据从 appendonlydir/*.aof 加载，
-      # 替换 dump.rdb 会被静默忽略（恢复"成功"但 key 没变，即假恢复）。
-      # 先确认卷内不存在 appendonlydir；存在即停下让运维显式决策。
-      if [[ -d "/var/lib/docker/volumes/$VOL/_data/appendonlydir" ]]; then
-        die "检测到 /var/lib/docker/volumes/$VOL/_data/appendonlydir —— 本栈 Redis 启用了 AOF，AOF 优先于 dump.rdb，替换 RDB 不会生效（假恢复）。请改用 FLUSHALL + AOF 重建，或临时以 --appendonly no 启动 redis 后再恢复。" 1
-      fi
-      cp "$WORK/redis.rdb" "/var/lib/docker/volumes/$VOL/_data/dump.rdb"
+      [[ -d "/var/lib/docker/volumes/$VOL/_data/appendonlydir" ]] && die "检测到 $VOL 卷内 appendonlydir —— 本栈 Redis 启用了 AOF，替换 dump.rdb 不会生效（假恢复）。请改用 FLUSHALL + AOF 重建，或临时以 --appendonly no 启动 redis 后再恢复。Redis 已由 EXIT trap 重新启动。" 1
+      cp "$WORK/redis.rdb" "/var/lib/docker/volumes/$VOL/_data/dump.rdb" \
+        || die "写入 redis 数据卷失败: $VOL"
     elif [[ -d "$VOL" ]]; then
-      if [[ -d "$VOL/appendonlydir" ]]; then
-        die "检测到 $VOL/appendonlydir —— 本栈 Redis 启用了 AOF，替换 dump.rdb 不会生效（假恢复）。请改用 FLUSHALL + AOF 重建，或临时以 --appendonly no 启动 redis 后再恢复。" 1
-      fi
-      cp "$WORK/redis.rdb" "$VOL/dump.rdb"
+      [[ -d "$VOL/appendonlydir" ]] && die "检测到 $VOL 卷内 appendonlydir —— 本栈 Redis 启用了 AOF，替换 dump.rdb 不会生效（假恢复）。请改用 FLUSHALL + AOF 重建，或临时以 --appendonly no 启动 redis 后再恢复。Redis 已由 EXIT trap 重新启动。" 1
+      cp "$WORK/redis.rdb" "$VOL/dump.rdb" || die "写入 redis 数据卷失败: $VOL"
     else
-      die "无法定位 redis 数据卷: $VOL"
+      # Named volume on a host whose docker root is not visible from here (the
+      # script running inside a container with only the docker socket, which is how
+      # a drill or a containerised ops runner works). A throwaway container mounts
+      # the volume and does the copy.
+      log "  宿主 docker root 不可见，改用辅助容器写入卷 $VOL"
+      # The file is STREAMED in, not bind-mounted: `docker run -v <path>` resolves
+      # the path against the docker HOST, so a path that only exists inside this
+      # container (which is where $WORK lives when the script runs containerised)
+      # would silently produce an empty volume.
+      HELPER_IMAGE="${HELPER_IMAGE:-busybox:1.36}"
+      if ! docker run --rm -i -v "$VOL:/target" "$HELPER_IMAGE" \
+           sh -c 'cat > /target/dump.rdb && test -s /target/dump.rdb'; then
+        die "辅助容器写入 redis 卷失败: $VOL（镜像 $HELPER_IMAGE）" 1
+      fi < "$WORK/redis.rdb"
     fi
   else
     die "无法解析 redis 数据卷名"
   fi
   "${COMPOSE[@]}" start "$REDIS_SERVICE" >/dev/null
-  # 等待 keys 加载。
-  # shellcheck disable=SC2034  # REDIS_WAIT 为轮询计数，仅用于可读性/排障
-  REDIS_WAIT=0
-  # shellcheck disable=SC2034
-  for REDIS_WAIT in $(seq 1 40); do
-    k="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli DBSIZE 2>/dev/null | tr -d '\r' || echo 0)"
-    [[ "${k:-0}" -ge 1 ]] && break
+  REDIS_STOPPED=0
+  # Wait for the dataset to load. While Redis is loading the RDB, `DBSIZE`
+  # answers "LOADING Redis is loading the dataset in memory" — a STRING. Comparing
+  # that in an arithmetic test is evaluated as a variable name, so under `set -u`
+  # the script died with "LOADING: unbound variable" *right after a successful
+  # restore*, and the operator saw a failed restore with the data already back.
+  redis_keys() {
+    "${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli DBSIZE 2>/dev/null | tr -d '\r' || true
+  }
+  after_keys=""
+  for _ in $(seq 1 60); do
+    k="$(redis_keys)"
+    if [[ "$k" =~ ^[0-9]+$ ]]; then
+      after_keys="$k"
+      [[ "$k" -ge 1 ]] && break
+    fi
+    # "LOADING ..." (or an empty answer while the process is starting) means
+    # "not ready yet", not "zero keys": keep waiting instead of reading it as data.
     sleep 0.5
   done
-  after_keys="$("${COMPOSE[@]}" exec -T "$REDIS_SERVICE" redis-cli DBSIZE | tr -d '\r')"
-  log "  恢复后 keys: $after_keys"
+  if [[ -z "$after_keys" ]]; then
+    die "redis 重启后未在 30 秒内可读（仍在加载或未启动）—— 请检查 docker compose logs $REDIS_SERVICE" 1
+  fi
+  log "  恢复后 keys: $after_keys（恢复前 $before_keys）"
 fi
 
 # --- 6. 配置恢复（谨慎：默认只解包展示，不覆盖） ------------------------------

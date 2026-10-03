@@ -5,10 +5,11 @@ import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
-import { canWorkspaceAction } from "../services/workspace.ts";
+import { canWorkspaceResourceAction, type WorkspaceAccess } from "../services/workspace.ts";
 import { assignDefaultPolicy, withWorkspaceQuotaLock } from "../services/policy-service.ts";
 import { checkMemberAddition } from "../services/capability-policy.ts";
 import { getWorkspaceTrafficSummary } from "../services/traffic.ts";
+import { effectiveWorkspaceAccess, canGrantWorkspaceBaseRole } from "../services/workspace-effective-access.ts";
 
 export const workspaceRoutes = new Hono<{ Variables: AppVariables }>();
 // Legacy account-wide API keys are not scoped to a workspace. Team management
@@ -36,13 +37,36 @@ function workspaceId(raw: string): number {
   if (!Number.isInteger(id) || id < 1) throw new HTTPException(400, { message: "非法工作空间 ID" });
   return id;
 }
-async function membership(id: number, userId: number) {
-  const member = await db.workspaceMember.findUnique({
+async function membership(id: number, userId: number, client: Pick<typeof db, "workspaceMember"> = db) {
+  const member = await client.workspaceMember.findUnique({
     where: { workspace_id_user_id: { workspace_id: id, user_id: userId } },
-    include: { workspace: true },
+    include: { workspace: true, custom_role: { select: { id: true, workspace_id: true, permissions: true } } },
   });
   if (!member?.active) throw new HTTPException(404, { message: "工作空间不存在" });
   return member;
+}
+
+/** Custom role references replace base permissions, including invalid references.
+ * Never let a dangling or foreign role silently restore admin privileges. */
+function memberAccess(member: Awaited<ReturnType<typeof membership>>): WorkspaceAccess {
+  const customRoleId = member.role_id ?? null;
+  const customRole = member.custom_role;
+  return {
+    id: member.workspace_id,
+    role: member.role,
+    kind: member.workspace.kind,
+    personalWorkspaceId: member.workspace_id,
+    actorId: member.user_id,
+    customRoleId,
+    customPermissions: customRoleId !== null && customRole?.id === customRoleId && customRole.workspace_id === member.workspace_id
+      ? customRole.permissions : null,
+  };
+}
+
+function requireMemberAction(member: Awaited<ReturnType<typeof membership>>, action: "read" | "manage", resource: "member" | "forward") {
+  if (!canWorkspaceResourceAction(memberAccess(member), action, resource)) {
+    throw new HTTPException(403, { res: Response.json({ error: "工作空间角色无权操作", code: "forbidden", error_layer: "rbac" }, { status: 403 }) });
+  }
 }
 
 workspaceRoutes.get("/", async (c) => {
@@ -83,15 +107,21 @@ workspaceRoutes.get("/:id", async (c) => {
   return c.json({ data: { id, name, slug, kind, created_at, role: member.role } });
 });
 
+/** Membership-only discovery: no resource read grant is implied by this view. */
+workspaceRoutes.get("/:id/permissions", async (c) => {
+  const member = await membership(workspaceId(c.req.param("id")), actorId(c));
+  return c.json({ data: effectiveWorkspaceAccess(memberAccess(member)) });
+});
+
 workspaceRoutes.get("/:id/members", async (c) => {
   const member = await membership(workspaceId(c.req.param("id")), actorId(c));
-  if (!canWorkspaceAction(member.role, "read")) throw new HTTPException(403);
+  requireMemberAction(member, "read", "member");
   const rows = await db.workspaceMember.findMany({
     where: { workspace_id: member.workspace_id, active: true },
-    select: { user_id: true, role: true, created_at: true, user: { select: { email: true } } },
+    select: { user_id: true, role: true, role_id: true, custom_role: { select: { name: true } }, created_at: true, user: { select: { email: true } } },
     orderBy: { id: "asc" },
   });
-  return c.json({ data: rows.map(({ user, ...row }) => ({ ...row, email: user.email })) });
+  return c.json({ data: rows.map(({ user, custom_role, ...row }) => ({ ...row, email: user.email, custom_role_id: row.role_id ?? null, custom_role_name: custom_role?.name ?? null })) });
 });
 
 /**
@@ -108,7 +138,7 @@ workspaceRoutes.get("/:id/members", async (c) => {
 workspaceRoutes.get("/:id/traffic", async (c) => {
   const id = workspaceId(c.req.param("id"));
   const member = await membership(id, actorId(c));
-  if (!canWorkspaceAction(member.role, "read")) throw new HTTPException(403);
+  requireMemberAction(member, "read", "forward");
 
   const q = c.req.query();
   const days = q.days === undefined ? undefined : Number(q.days);
@@ -124,7 +154,8 @@ workspaceRoutes.get("/:id/traffic", async (c) => {
 workspaceRoutes.post("/:id/invites", async (c) => {
   const userId = actorId(c);
   const member = await membership(workspaceId(c.req.param("id")), userId);
-  if (member.workspace.kind !== "team" || !canWorkspaceAction(member.role, "manage")) throw new HTTPException(403);
+  if (member.workspace.kind !== "team") throw new HTTPException(403);
+  requireMemberAction(member, "manage", "member");
   const parsed = inviteSchema.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: "邮箱或角色不合法" }, 400);
   const { email, role } = parsed.data;
@@ -135,6 +166,11 @@ workspaceRoutes.post("/:id/invites", async (c) => {
   // SOFT-01：判定与插入在同一 workspace 行锁事务内完成，两个 owner 并发邀请
   // 不会双双通过（此前是先查 policy 再查计数，然后另起事务插入）。
   const invite = await withWorkspaceQuotaLock(member.workspace_id, async (tx, policy) => {
+    const freshActor = await membership(member.workspace_id, userId, tx);
+    requireMemberAction(freshActor, "manage", "member");
+    if (!canGrantWorkspaceBaseRole(memberAccess(freshActor), role)) {
+      throw new HTTPException(403, { res: Response.json({ error: "不能邀请具有超出自身权限的角色", code: "permission_denied", error_layer: "rbac" }, { status: 403 }) });
+    }
     const [memberCount, pendingInvites] = await Promise.all([
       tx.workspaceMember.count({ where: { workspace_id: member.workspace_id, active: true } }),
       tx.workspaceInvite.count({ where: { workspace_id: member.workspace_id, accepted_at: null, revoked_at: null, expires_at: { gt: new Date() } } }),
@@ -171,6 +207,14 @@ workspaceRoutes.post("/invites/accept", async (c) => {
     return c.json({ error: "邀请不存在或已失效" }, 404);
   }
   const accepted = await db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM workspace WHERE id = ${invite.workspace_id} FOR UPDATE`;
+    const inviter = await membership(invite.workspace_id, invite.invited_by_id, tx);
+    requireMemberAction(inviter, "manage", "member");
+    // Invites can never mint the break-glass owner role, and the role recorded
+    // on the invite must still be grantable by the inviter right now.
+    if (invite.role === "owner" || !canGrantWorkspaceBaseRole(memberAccess(inviter), invite.role)) {
+      throw new HTTPException(403, { res: Response.json({ error: "邀请者已不具备授予该角色的权限，请重新申请邀请", code: "permission_denied", error_layer: "rbac" }, { status: 403 }) });
+    }
     // Never let a stale invite rewrite an existing member's role.
     const prior = await tx.workspaceMember.findUnique({ where: { workspace_id_user_id: { workspace_id: invite.workspace_id, user_id: userId } } });
     if (prior?.active) return false;
@@ -182,7 +226,7 @@ workspaceRoutes.post("/invites/accept", async (c) => {
     await tx.workspaceMember.upsert({
       where: { workspace_id_user_id: { workspace_id: invite.workspace_id, user_id: userId } },
       create: { workspace_id: invite.workspace_id, user_id: userId, role: invite.role },
-      update: { role: invite.role, active: true },
+      update: { role: invite.role, role_id: null, active: true },
     });
     await tx.auditEvent.create({ data: { workspace_id: invite.workspace_id, actor_user_id: userId, action: "member.joined", resource_type: "workspace_member", resource_id: String(userId) } });
     return true;
@@ -198,9 +242,15 @@ workspaceRoutes.delete("/:id/members/:userId", async (c) => {
   const target = await db.workspaceMember.findUnique({ where: { workspace_id_user_id: { workspace_id: groupId, user_id: targetId } } });
   if (!target?.active) return c.json({ error: "成员不存在" }, 404);
   if (target.role === "owner") throw new HTTPException(403, { message: "不能移除 owner" });
-  if (actor !== targetId && !canWorkspaceAction(member.role, "manage")) throw new HTTPException(403);
+  if (actor !== targetId) requireMemberAction(member, "manage", "member");
   await db.$transaction(async (tx) => {
-    await tx.workspaceMember.update({ where: { id: target.id }, data: { active: false } });
+    await tx.$queryRaw`SELECT id FROM workspace WHERE id = ${groupId} FOR UPDATE`;
+    const freshActor = await membership(groupId, actor, tx);
+    const freshTarget = await tx.workspaceMember.findUnique({ where: { workspace_id_user_id: { workspace_id: groupId, user_id: targetId } } });
+    if (!freshTarget?.active) throw new HTTPException(404, { message: "成员不存在" });
+    if (freshTarget.role === "owner") throw new HTTPException(403, { message: "不能移除 owner" });
+    if (actor !== targetId) requireMemberAction(freshActor, "manage", "member");
+    await tx.workspaceMember.update({ where: { id: freshTarget.id }, data: { active: false } });
     await tx.auditEvent.create({ data: { workspace_id: groupId, actor_user_id: actor, action: "member.removed", resource_type: "workspace_member", resource_id: String(targetId) } });
   });
   return c.json({ data: { ok: true } });

@@ -339,6 +339,7 @@ function emptySummary(): AttentionSummary {
 export async function collectAttention(
   workspaceId: number,
   inject?: AttentionDeps,
+  visibility: { nodes: boolean; forwards: boolean } = { nodes: true, forwards: true },
 ): Promise<AttentionPayload> {
   const db = inject?.db ?? (await loadDefaultDb());
   const now = inject?.now ?? (() => new Date());
@@ -348,16 +349,16 @@ export async function collectAttention(
   const isRetryable = await resolveIsRetryable(inject?.isRetryable);
 
   const [nodeRows, forwardRows] = await Promise.all([
-    db.node.findMany({
+    visibility.nodes ? db.node.findMany({
       where: { node_group: { workspace_id: workspaceId } },
       orderBy: [{ order_by: "asc" }, { id: "asc" }],
       select: NODE_SELECT,
-    }),
-    db.tunnel.findMany({
+    }) : [],
+    visibility.forwards ? db.tunnel.findMany({
       where: { workspace_id: workspaceId, category: "port_forward" },
       orderBy: [{ order_by: "asc" }, { id: "asc" }],
       select: FORWARD_SELECT,
-    }),
+    }) : [],
   ]);
 
   const nodes = asRows<Record<string, unknown>>(nodeRows).map((row) => ({

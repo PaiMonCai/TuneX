@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/tunex/agent/internal/forwarder"
@@ -60,6 +61,59 @@ type TunnelManager struct {
 	// listenHost is the interface ingress/egress tunnels bind when the config
 	// does not pin one. Empty means all interfaces.
 	listenHost string
+
+	// closing is the WP11A shutdown latch: once set, Apply refuses new work so a
+	// config arriving mid-teardown cannot rebind a port that was just closed.
+	closing bool
+	// shutdownMu guards the running shutdown tallies (written from one
+	// goroutine per tunnel).
+	shutdownMu      sync.Mutex
+	lastShutdown    ShutdownReport
+	lastShutdownIDs []string
+
+	// mutationHook is notified — outside every lock — after a mutation actually
+	// changed the running registry. It exists so the durable last-known-good
+	// cache (WP11A/A3) is refreshed by an event rather than only by a periodic
+	// sample: "ACK durable success but cache the previous state" is exactly the
+	// window this closes. One hook here covers the control loop, the local admin
+	// API and startup restore, which is why it lives in the manager rather than
+	// in each caller.
+	mutationHook func()
+}
+
+// SetMutationHook installs the post-mutation observer. It is safe to call at any
+// time; passing nil removes it.
+func (m *TunnelManager) SetMutationHook(fn func()) {
+	m.mu.Lock()
+	m.mutationHook = fn
+	m.mu.Unlock()
+}
+
+// fingerprint summarises the running registry (id, revision, bound port). It is
+// compared before/after a mutation so an idempotent apply — same revision, no
+// listener churn — does not wake the hook.
+func (m *TunnelManager) fingerprint() string {
+	m.mu.RLock()
+	parts := make([]string, 0, len(m.tunnels))
+	for id, e := range m.tunnels {
+		parts = append(parts, fmt.Sprintf("%s:%d:%d", id, e.cfg.Revision, e.cfg.ListenPort()))
+	}
+	m.mu.RUnlock()
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// notifyIfChanged fires the hook when the registry really changed.
+func (m *TunnelManager) notifyIfChanged(before string) {
+	if before == m.fingerprint() {
+		return
+	}
+	m.mu.RLock()
+	hook := m.mutationHook
+	m.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
 }
 
 // NewTunnelManager builds a manager. egress may be nil on a pure ingress node;
@@ -122,6 +176,18 @@ func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.F
 // which shares applyLocked); the ordering inside is applyLocked's job, and it
 // is the same sequence for both entry points so the two cannot drift.
 func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+	before := m.fingerprint()
+	fwd, err := m.applyInner(cfg)
+	if err == nil {
+		m.notifyIfChanged(before)
+	}
+	return fwd, err
+}
+
+// applyInner is Apply's locked body. Splitting it out keeps the fingerprint
+// comparison on the outside of the lock: the hook must never run while m.mu is
+// held, because it re-reads the registry.
+func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
 		normalized.ListenHost = m.listenHost
@@ -132,6 +198,12 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, 
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// WP11A: refuse work once shutdown has begun. Checked before the revision
+	// gate so a config cannot "win" by carrying a newer revision.
+	if m.closing {
+		return nil, ErrNodeShuttingDown
+	}
 
 	if cur, ok := m.tunnels[normalized.ID]; ok {
 		if isStale(normalized.Revision, cur.cfg.Revision) {
@@ -296,6 +368,15 @@ func isStale(next, current int64) bool {
 // nil when the id is unknown, so a duplicate remove_tunnel command from the
 // panel cannot erase a tunnel that was legitimately recreated.
 func (m *TunnelManager) Remove(id string) error {
+	before := m.fingerprint()
+	err := m.removeInner(id)
+	if err == nil {
+		m.notifyIfChanged(before)
+	}
+	return err
+}
+
+func (m *TunnelManager) removeInner(id string) error {
 	m.mu.Lock()
 	e, ok := m.tunnels[id]
 	if !ok {

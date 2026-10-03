@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1151,5 +1152,29 @@ func TestPipeTrackerDrainsOnStop(t *testing.T) {
 	conn.Close()
 	if !waitForPortClosed(t, port, 3*time.Second) {
 		t.Fatal("port was not released after Stop")
+	}
+}
+
+// V4-WP11B regression: a tunnel with no targets of its own (every RELAY ingress
+// tunnel) must not serialize `targets` as JSON null. The panel tolerates the
+// absent key, but it rejected the null — which silently killed the state report
+// (and with it telemetry/health) for exactly those nodes.
+func TestTunnelConfigOmitsEmptyTargets(t *testing.T) {
+	cfg := TunnelConfig{ID: "tunex-2-relay", Mode: ModeRelay, IngressPort: 21002, NextHop: "10.0.0.1:22001", Protocol: "tcp"}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"targets":null`) {
+		t.Fatalf("empty targets must be omitted, got %s", raw)
+	}
+	if !strings.Contains(string(raw), `"id":"tunex-2-relay"`) {
+		t.Fatalf("the rest of the config must still be serialized: %s", raw)
+	}
+	// A non-empty pool is still carried verbatim.
+	cfg.Targets = []Target{{Host: "10.9.9.9", Port: 8080, Weight: 1}}
+	raw, _ = json.Marshal(cfg)
+	if !strings.Contains(string(raw), `"targets":[{"host":"10.9.9.9","port":8080,"weight":1}]`) {
+		t.Fatalf("real targets must be serialized: %s", raw)
 	}
 }

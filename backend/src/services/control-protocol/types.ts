@@ -47,6 +47,14 @@ export const COMMAND_ACTIONS = [
   "suspend_tunnel",
   "state_request",
   "command_ack",
+  // V4-WP11C: read-only, bounded reachability probe. It never mutates the
+  // runtime, so it is declared non-mutating and needs no revision floor — but it
+  // is also NOT a baseline action: an agent only accepts it after advertising
+  // the capability (see services/agent-capability.ts).
+  "diagnose_tunnel",
+  // V4-WP11C: Node-level self report. Read-only, no payload, capability-gated
+  // exactly like diagnose_tunnel (an old agent must not receive it).
+  "collect_diagnostics",
 ] as const;
 export type CommandAction = (typeof COMMAND_ACTIONS)[number];
 
@@ -83,6 +91,31 @@ export type CommandResource = (typeof COMMAND_RESOURCES)[number];
  *  - `minRevision` revision 字段的下界；`state_request` 允许 0（"我不关心版本"），
  *    其余必须 ≥1（0 视为未初始化，禁止当版本号用）。
  */
+/**
+ * V4-WP11C diagnose payload.
+ *
+ * The panel builds this list from the tunnel's own authorized desired state —
+ * never from a request body — so a caller cannot use the diagnose endpoint to
+ * scan arbitrary hosts from a node.
+ */
+export interface DiagnoseTunnelPayload {
+  /** Host/port pairs to probe, capped by the agent. */
+  targets: { host: string; port: number }[];
+  /** Per-attempt deadline; the agent clamps it to its own maximum. */
+  timeout_ms?: number;
+}
+
+/**
+ * V4-WP11C Node diagnostic payload: deliberately empty.
+ *
+ * A node self-report takes no input. Accepting one would invite "collect this
+ * path" / "collect this process", which is how a diagnostic becomes a remote
+ * administration surface.
+ */
+export interface CollectDiagnosticsPayload {
+  readonly _empty?: never;
+}
+
 export interface ActionSpec {
   readonly mutating: boolean;
   readonly resources: readonly CommandResource[];
@@ -96,6 +129,8 @@ export const ACTION_SPECS: Readonly<Record<CommandAction, ActionSpec>> = {
   suspend_tunnel: { mutating: true, resources: ["tunnel"], minRevision: 1 },
   state_request: { mutating: false, resources: ["tunnel", "node", "node_group", "agent"], minRevision: 0 },
   command_ack: { mutating: false, resources: ["tunnel", "node", "node_group", "agent"], minRevision: 1 },
+  diagnose_tunnel: { mutating: false, resources: ["tunnel", "node"], minRevision: 0 },
+  collect_diagnostics: { mutating: false, resources: ["node"], minRevision: 0 },
 };
 
 /** 变更动作默认会把资源推到哪个状态（apply handler 可覆盖）。 */
@@ -254,6 +289,8 @@ export interface CommandAckPayload {
 }
 
 export type CommandPayload =
+  | CollectDiagnosticsPayload
+  | DiagnoseTunnelPayload
   | ApplyTunnelPayload
   | RemoveTunnelPayload
   | UpdateTargetsPayload
@@ -285,9 +322,13 @@ export type UpdateTargetsEnvelope = CommandEnvelopeBase & { action: "update_targ
 export type SuspendTunnelEnvelope = CommandEnvelopeBase & { action: "suspend_tunnel"; payload: SuspendTunnelPayload };
 export type StateRequestEnvelope = CommandEnvelopeBase & { action: "state_request"; payload: StateRequestPayload };
 export type CommandAckEnvelope = CommandEnvelopeBase & { action: "command_ack"; payload: CommandAckPayload };
+export type DiagnoseTunnelEnvelope = CommandEnvelopeBase & { action: "diagnose_tunnel"; payload: DiagnoseTunnelPayload };
+export type CollectDiagnosticsEnvelope = CommandEnvelopeBase & { action: "collect_diagnostics"; payload: CollectDiagnosticsPayload };
 
 /** 判别联合：`switch (env.action)` 即可把 payload 收敛到具体类型。 */
 export type CommandEnvelope =
+  | CollectDiagnosticsEnvelope
+  | DiagnoseTunnelEnvelope
   | ApplyTunnelEnvelope
   | RemoveTunnelEnvelope
   | UpdateTargetsEnvelope

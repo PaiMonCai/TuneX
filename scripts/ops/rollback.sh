@@ -24,7 +24,8 @@
 #   1. 记录当前状态（git rev + 镜像 digest + compose config 指纹）→ 用于再次回滚
 #   2. 备份现状（默认要求，除非 --no-backup-backup）
 #   3. 拉取目标镜像（本地不存在时）
-#   4. 更新 .env 的 TUNEX_IMAGE（同一 digest 同时驱动 backend/worker/web）
+#   4. 更新环境文件的 TUNEX_IMAGE（同一 digest 驱动全部应用服务；文件位置可用
+#      TUNEX_ENV_FILE 覆盖，默认 $PROJECT_ROOT/.env）
 #   5. compose up -d 切换（DB/Redis/Caddy 不动，滚动替换 backend/worker/web）
 #   6. 健康等待：Backend loopback /healthz 200 + 三个服务 running，超时即失败
 #   7. 失败 → 自动回退到步骤 1 记录的状态（幂等）
@@ -79,7 +80,25 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 不可用" 2
 
 cd "$PROJECT_ROOT"
 if [[ -f "$PROJECT_ROOT/.env" ]]; then set -a; . "$PROJECT_ROOT/.env"; set +a; fi
-COMPOSE=(docker compose -p tunex -f "$COMPOSE_FILE")
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-tunex}"
+# COMPOSE_ENV_FILE lets the same scripts run against a stack whose compose file
+# needs extra variables (e.g. the e2e topology), so a real drill is possible.
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-}"
+COMPOSE_BASE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE")
+[[ -n "$COMPOSE_ENV_FILE" ]] && COMPOSE_BASE+=(--env-file "$COMPOSE_ENV_FILE")
+COMPOSE=("${COMPOSE_BASE[@]}")
+
+# The application service names in the compose project. Configurable for the same
+# reason restore.sh's writer list is: a stack that names them differently (e.g. the
+# e2e topology's "panel") would otherwise be silently left untouched.
+APP_SERVICES="${TUNEX_APP_SERVICES:-backend worker web}"
+
+# Prerequisites. rollback parses targets and writes JSON history with jq, so it is
+# a hard requirement — say so instead of dying with "command not found" later.
+for tool in jq docker openssl; do
+  command -v "$tool" >/dev/null 2>&1 || die "缺少必需工具: $tool（回滚需要它解析目标与写历史）" 2
+done
+docker compose version >/dev/null 2>&1 || die "docker compose v2 不可用" 2
 
 # svc_running <service> —— 便携式"服务是否 running"检查。
 # 不同 compose 版本对 `ps --status` 支持不一（v2.28 无该 flag），
@@ -90,8 +109,15 @@ svc_running() {
     | awk -v s="$svc" '$1==s && $2 ~ /^running/ {found=1} END{exit found?0:1}'
 }
 
-TUNEX_API_PORT="${TUNEX_API_PORT:-13001}"
+# WP11D: the prod compose publishes the backend on TUNEX_API_PORT (13001), while
+# the dev compose publishes it on BACKEND_HOST_PORT (8787). Reading the port from
+# the environment in use — instead of hard-coding the prod default — keeps the
+# rollback gate honest on both stacks.
+TUNEX_API_PORT="${TUNEX_API_PORT:-${BACKEND_HOST_PORT:-13001}}"
 ROLLBACK_HEALTH_URL="${ROLLBACK_HEALTH_URL:-http://127.0.0.1:${TUNEX_API_PORT}/healthz}"
+# Readiness (checks MySQL + Redis) is what a rollback must actually prove;
+# /healthz alone answers "the HTTP process is up", which is not the question.
+ROLLBACK_READY_URL="${ROLLBACK_READY_URL:-http://127.0.0.1:${TUNEX_API_PORT}/readyz}"
 
 # --- 当前状态指纹 ------------------------------------------------------------
 current_state() {
@@ -132,10 +158,17 @@ resolve_image() {  # $1 = target → prints unified TuneX image ref
     ghcr.io/*|*@sha256:*|*/*:*)
       echo "$t" ;;
     *)
+      # A locally built image (`name:tag`, no registry prefix) is a legitimate
+      # rollback target when it actually exists here — a rehearsal or an air-gapped
+      # deployment needs that path, and the registry-shaped patterns above reject it.
+      if [[ "$t" == *:* && "$t" != */* ]] && docker image inspect "$t" >/dev/null 2>&1; then
+        echo "$t"
+        return 0
+      fi
       # 部署记录 id / digest 短形式
       local found
       found="$(grep -F "$t" "$HISTORY" 2>/dev/null | tail -1 | jq -r '.image // .backend_image // empty')"
-      [[ -n "$found" ]] && echo "$found" || die "无法解析目标: $t" 2
+      [[ -n "$found" ]] && echo "$found" || die "无法解析目标: $t（既不是可用的镜像引用，也不在部署历史里）" 2
       ;;
   esac
 }
@@ -174,14 +207,17 @@ if [[ $DO_BACKUP -eq 1 ]]; then
   # 是无效的：`VAR=val cmd` 形式只在 cmd 的环境里生效，而这里 `${BACKUP_PASSPHRASE:+}`
   # 展开为空串却让 shellcheck 误判为「参数」；更关键的是若父环境没有该变量，
   # backup.sh 会走到交互式 read，而在非 tty 的日志重定向下直接挂住/失败。
-  if [[ -z "${BACKUP_PASSPHRASE:-}" ]]; then
+  # The passphrase is only needed when the backup is actually encrypted: with
+  # ENCRYPT=0 (a documented test/air-gapped mode) demanding one makes a rollback
+  # impossible for a reason that does not exist.
+  if [[ "${ENCRYPT:-1}" == "1" && -z "${BACKUP_PASSPHRASE:-}" ]]; then
     if [[ -t 0 ]]; then
       read -r -s -p "备份加密口令（回滚前备份需要，输入不可见）: " BACKUP_PASSPHRASE; echo
     else
       die "回滚前备份需要 BACKUP_PASSPHRASE（cron/管道环境无法交互输入）。设置后重试，或确认已有备份后加 --no-backup。" 2
     fi
   fi
-  export BACKUP_PASSPHRASE
+  export BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
   if ! "$SCRIPT_DIR/backup.sh" > "$OPS_DIR/pre-rollback-backup.log" 2>&1; then
     tail -5 "$OPS_DIR/pre-rollback-backup.log" >&2
     die "回滚前备份失败 —— 已终止（不留无保护的回滚窗口）" 1
@@ -194,7 +230,7 @@ fi
 # --- 3. 确认 -----------------------------------------------------------------
 if [[ $ASSUME_YES -ne 1 ]]; then
   echo
-  log "即将执行回滚：backend/worker/web → $TUNEX_IMG；mysql/redis/caddy 不动."
+  log "即将执行回滚：$APP_SERVICES → $TUNEX_IMG；mysql/redis/caddy 不动."
   [[ $DO_DATA -eq 1 ]] && log "⚠️  --data：随后还会从最新备份恢复数据（覆盖现有数据）"
   read -r -p "输入 ROLLBACK 确认执行: " ans
   [[ "$ans" == "ROLLBACK" ]] || die "已取消" 2
@@ -206,8 +242,8 @@ CUR_STATE="$(current_state)"
 echo "$CUR_STATE" >> "$HISTORY"
 log "  当前状态已记录（用于失败回退）: $(jq -r '.digest' <<<"$CUR_STATE")"
 
-ENV_FILE="$PROJECT_ROOT/.env"
-[[ -f "$ENV_FILE" ]] || die ".env 不存在 —— 无法确定部署配置" 2
+ENV_FILE="${TUNEX_ENV_FILE:-$PROJECT_ROOT/.env}"
+[[ -f "$ENV_FILE" ]] || die "环境文件不存在（$ENV_FILE）—— 无法确定部署配置；可用 TUNEX_ENV_FILE 指定" 2
 cp "$ENV_FILE" "$OPS_DIR/.env.before-rollback"
 # 替换/追加统一镜像变量
 if grep -q '^TUNEX_IMAGE=' "$ENV_FILE"; then
@@ -222,7 +258,8 @@ diff -u "$OPS_DIR/.env.before-rollback" "$ENV_FILE" | sed 's/^/    /' || true
 
 # --- 5. 执行切换 -------------------------------------------------------------
 log "[4/6] 切换服务（mysql/redis 不受影响）"
-if ! "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1; then
+# shellcheck disable=SC2086  # 有意分词：这是一个服务名列表
+if ! "${COMPOSE[@]}" up -d $APP_SERVICES >> "$OPS_DIR/rollback-up.log" 2>&1; then
   warn "compose up 失败，自动回退 env 并重启"
   cp "$OPS_DIR/.env.before-rollback" "$ENV_FILE"
   "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
@@ -234,32 +271,59 @@ log "  详见 $OPS_DIR/rollback-up.log"
 log "[5/6] 健康验证（超时 ${HEALTH_TIMEOUT}s）"
 deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
 ok=0
+code=000; ready=000
 while [[ $(date +%s) -lt $deadline ]]; do
-  # /healthz 必须 200
+  # /healthz 必须 200（进程活着）
   code="$(curl -fsS -o /dev/null -w '%{http_code}' -m 3 \
     "$ROLLBACK_HEALTH_URL" 2>/dev/null || echo 000)"
+  # /readyz 必须 200（MySQL + Redis 都可用）：进程活着但依赖不可用不是回滚成功
+  ready="$(curl -fsS -o /dev/null -w '%{http_code}' -m 3 \
+    "$ROLLBACK_READY_URL" 2>/dev/null || echo 000)"
   # 三个服务 running
   running=1
-  for s in backend worker web; do
+  for s in $APP_SERVICES; do
     svc_running "$s" || running=0
   done
-  if [[ "$code" == "200" && "$running" -eq 1 ]]; then ok=1; break; fi
+  if [[ "$code" == "200" && "$ready" == "200" && "$running" -eq 1 ]]; then ok=1; break; fi
   sleep 3
 done
 
 if [[ $ok -ne 1 ]]; then
-  log "  ⚠️ 健康检查未通过（healthz=$code running=$running）—— 自动回退"
+  log "  ⚠️ 健康检查未通过（healthz=$code readyz=$ready running=$running）—— 自动回退"
   cp "$OPS_DIR/.env.before-rollback" "$ENV_FILE"
   "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
   die "回滚未通过健康检查，已自动回退到上一版本。请人工介入：docker compose ps + logs" 1
 fi
-log "  healthz=200, backend/worker/web 全部 running ✅"
+log "  healthz=200, readyz=200, $APP_SERVICES 全部 running ✅"
+
+# --- 6.5 迁移兼容性自检 ------------------------------------------------------
+# Rolling the Panel image back to an older build while the database already
+# carries newer migrations is the failure mode this check exists for: the older
+# code would run against a schema it does not understand. `prisma migrate status`
+# reports unapplied migrations, so a mismatch is surfaced instead of assumed away.
+log "[5.5/6] 迁移兼容性（旧镜像 vs 当前 schema）"
+MIG_OUT="$OPS_DIR/rollback-migrate-status.log"
+# The service that can run prisma is a deployment property (production calls it
+# "backend"; the e2e stack calls it "panel"). Hardcoding it made this SAFETY check
+# silently degrade to a warning on any stack that names it differently.
+MIGRATE_SERVICE="${TUNEX_MIGRATE_SERVICE:-backend}"
+if "${COMPOSE[@]}" exec -T "$MIGRATE_SERVICE" bunx prisma migrate status >"$MIG_OUT" 2>&1; then
+  log "  prisma migrate status OK"
+elif grep -qi "pending" "$MIG_OUT"; then
+  warn "  ⚠️ 存在尚未应用的迁移 —— 该镜像可能带新 schema；详见 $MIG_OUT"
+  warn "  回滚仅覆盖面板镜像；如需 schema 回退请用 restore.sh 恢复数据层"
+else
+  warn "  迁移状态无法确认（bunx prisma 不可用？）—— 详见 $MIG_OUT"
+fi
 
 # --- 7. 记录 + 数据层可选回滚 -------------------------------------------------
 log "[6/6] 写回滚记录"
 jq -nc --arg t "$(date -Iseconds)" --arg from "$(jq -r '.digest' <<<"$CUR_STATE")" \
   --arg to "$TUNEX_IMG" --arg data "$DO_DATA" \
   '{at:$t, action:"rollback", from:$from, to:$to, data_restore:($data=="1")}' >> "$HISTORY"
+
+log "  注意：本脚本只回退面板镜像。Agent 镜像由节点侧安装命令固定（TUNEX_AGENT_IMAGE），"
+log "       需要回退时应在节点上重新执行一次带目标镜像的安装命令（Node → 一键安装）。"
 
 if [[ $DO_DATA -eq 1 ]]; then
   log "数据层回滚 → 调用 restore.sh（最新备份）"

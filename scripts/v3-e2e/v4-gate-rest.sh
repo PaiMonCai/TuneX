@@ -465,6 +465,32 @@ S6_RESUME_STATUS_VAL=$(mysqlc "SELECT IFNULL(apply_status,'') FROM tunnel WHERE 
 assert_eq "$S6_RESUME_STATUS_VAL" "active" "S6.18 resume 后 apply_status=active"
 
 # ---------------------------------------------------------------- evidence
+# ================================================================
+# S7 — 还原夹具端口（让整套 Gate 可重复运行）
+# ================================================================
+#
+# S3 故意把 listen_port 迁到新端口，而 state.json 记录的是原始端口。如果不还原，
+# 下一次 v4-gate.sh 会拿原始端口去探针，得到"基线数据面读不到 marker"——把夹具
+# 漂移报成产品失败。还原是这一步的全部意义：单个 Gate 的结果不能依赖运行顺序。
+echo
+echo "---------- S7: restore fixture listen_port ----------"
+S7_REV=$(mysqlc "SELECT IFNULL(config_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")
+if [[ "$(mysqlc "SELECT IFNULL(listen_port,0) FROM tunnel WHERE id=$FORWARD_ID;")" == "$FORWARD_PORT" ]]; then
+  ok "S7.1 夹具端口已经是原始端口（无需还原）"
+else
+  S7_STATUS=$(api_patch "{\"listen_port\":$FORWARD_PORT,\"expected_revision\":$S7_REV}" s7-restore.json)
+  assert_eq "$S7_STATUS" "200" "S7.2 还原夹具端口 PATCH HTTP 200"
+  S7_REV2=$(jget s7-restore.json "['data']['config_revision']")
+  S7_PROBE=""
+  for _ in $(seq 1 45); do
+    S7_PROBE=$(probe "$FORWARD_PORT")
+    [[ "$S7_PROBE" == "$MARK_A" ]] && break
+    sleep 1
+  done
+  assert_eq "$S7_PROBE" "$MARK_A" "S7.3 原始端口 $FORWARD_PORT 恢复后真实读到 marker"
+  assert_eq "$(mysqlc "SELECT IFNULL(applied_revision,0) FROM tunnel WHERE id=$FORWARD_ID;")" "$S7_REV2" "S7.4 还原已收敛（applied == config）"
+fi
+
 {
   echo "# TuneX V4-F1 Gate — rest slice Evidence (S3/S4/S5/S6)"
   echo "time: $(date -Is)"

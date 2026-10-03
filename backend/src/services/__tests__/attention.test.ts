@@ -84,6 +84,25 @@ function collect(nodes: FakeNode[], forwards: FakeForward[] = []) {
   });
 }
 
+describe("WP10 resource-family visibility", () => {
+  for (const visibility of [{ nodes: false, forwards: true }, { nodes: true, forwards: false }, { nodes: false, forwards: false }]) {
+    test(JSON.stringify(visibility), async () => {
+      let nodeReads = 0; let forwardReads = 0;
+      const result = await collectAttention(7, {
+        db: {
+          node: { findMany: async () => { nodeReads++; return [okNode({ node_credential_hash: null })]; } },
+          tunnel: { findMany: async () => { forwardReads++; return [{ id: 42, name: "private", apply_status: "error" }]; } },
+        } as never,
+        now: () => NOW, isRetryable: retryableFake,
+      }, visibility);
+      expect(nodeReads).toBe(visibility.nodes ? 1 : 0);
+      expect(forwardReads).toBe(visibility.forwards ? 1 : 0);
+      expect(result.items.some((item) => item.kind === "node")).toBe(visibility.nodes);
+      expect(result.items.some((item) => item.kind === "forward")).toBe(visibility.forwards);
+    });
+  }
+});
+
 describe("A. 节点待办：三类且互斥", () => {
   test("无凭据 → node_waiting_install（warning，下一步是去安装）", async () => {
     const { items, summary } = await collect([okNode({ node_credential_hash: null })]);

@@ -28,7 +28,7 @@ import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { canUseNodeGroup } from "../services/node-group-access.ts";
-import { canWorkspaceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
+import { canWorkspaceResourceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
 import {
   countWorkspaceTunnels,
   sumWorkspaceTraffic,
@@ -53,8 +53,11 @@ export const tunnelsRoutes = new Hono<{ Variables: AppVariables }>();
 
 // Every user route selects a verified workspace; missing header means personal space.
 tunnelsRoutes.use("*", async (c, next) => {
-  const isCreate = c.req.method === "POST" && /^\/api\/tunnels\/?$/.test(c.req.path);
-  c.set("workspace", await resolveWorkspaceAccess(c, isCreate ? "create" : "read"));
+  const method = c.req.method.toUpperCase();
+  const isCreate = method === "POST" && /^\/api\/tunnels(?:\/v3\/relay)?\/?$/.test(c.req.path);
+  const action = isCreate ? "create" : method === "DELETE" ? "delete"
+    : ["PATCH", "PUT", "POST"].includes(method) ? "update" : "read";
+  c.set("workspace", await resolveWorkspaceAccess(c, action, "forward"));
   // V4 compatibility window: keep the legacy Tunnel API operational while
   // advertising Forward as the successor product surface.
   c.header("Deprecation", "true");
@@ -182,8 +185,8 @@ tunnelsRoutes.get("/", async (c) => {
 tunnelsRoutes.post("/", async (c) => {
   const user = requireUser(c);
   const workspace = selectedWorkspace(c);
-  if (!canWorkspaceAction(workspace.role, "create")) {
-    return c.json({ error: "无权创建团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "create", "forward")) {
+    return c.json({ error: "无权创建团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
   }
 
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
@@ -417,8 +420,8 @@ tunnelsRoutes.patch("/:id", async (c) => {
 
   const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "update", tunnel.user_id === user.id)) {
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "update", "forward", tunnel.user_id === user.id)) {
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
   }
   if ((tunnel.tunnel_mode ?? "direct") !== "direct") {
     return c.json({ error: "RELAY 配置请使用 v3 隧道接口" }, 409);
@@ -506,8 +509,8 @@ tunnelsRoutes.post("/:id/toggle", async (c) => {
 
   const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "update", tunnel.user_id === user.id)) {
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "update", "forward", tunnel.user_id === user.id)) {
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
   }
 
   const action = tunnel.apply_status === "suspended" || tunnel.desired_status === "inactive"
@@ -540,8 +543,8 @@ tunnelsRoutes.post("/:id/reset-traffic", async (c) => {
 
   const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(selectedWorkspace(c).role, "update", tunnel.user_id === user.id))
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(selectedWorkspace(c), "update", "forward", tunnel.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
 
   const updated = await db.tunnel.update({
     where: { id: tunnel.id },
@@ -566,8 +569,8 @@ tunnelsRoutes.delete("/:id", async (c) => {
 
   const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "delete", tunnel.user_id === user.id)) {
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "delete", "forward", tunnel.user_id === user.id)) {
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
   }
 
   const result = await runTunnelActionApi(id, "delete", workspace.id, {
@@ -602,10 +605,10 @@ tunnelsRoutes.delete("/:id", async (c) => {
 /** v3 端点统一把服务层错误翻成 HTTP 响应（状态码查表，不现场判）。 */
 function apiError(
   c: Ctx,
-  e: { ok: false; code: keyof typeof TUNNEL_API_ERROR_STATUS; message: string; apply_error_code?: string },
+  e: { ok: false; code: keyof typeof TUNNEL_API_ERROR_STATUS; message: string; apply_error_code?: string; error_layer?: string; reason?: string },
 ): Response {
   return c.json(
-    { error: e.message, code: e.code, ...(e.apply_error_code ? { apply_error_code: e.apply_error_code } : {}) },
+    { error: e.message, code: e.code, error_layer: e.error_layer, reason: e.reason, ...(e.apply_error_code ? { apply_error_code: e.apply_error_code } : {}) },
     TUNNEL_API_ERROR_STATUS[e.code] as 400 | 403 | 404 | 409 | 502 | 503,
   );
 }
@@ -660,7 +663,7 @@ tunnelsRoutes.get("/v3", async (c) => {
 tunnelsRoutes.post("/v3/relay", async (c) => {
   const user = requireUser(c);
   const workspace = selectedWorkspace(c);
-  if (!canWorkspaceAction(workspace.role, "create")) return c.json({ error: "无权创建团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "create", "forward")) return c.json({ error: "无权创建团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
 
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
   if (!body || typeof body !== "object") return c.json({ error: "参数错误" }, 400);
@@ -768,8 +771,8 @@ tunnelsRoutes.post("/v3/:id/retry", async (c) => {
 
   const existing = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!existing) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "update", existing.user_id === user.id))
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "update", "forward", existing.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
 
   const result = await runTunnelActionApi(id, "retry", workspace.id, {
     db: db as never,
@@ -791,8 +794,8 @@ tunnelsRoutes.post("/v3/:id/suspend", async (c) => {
 
   const existing = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!existing) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "update", existing.user_id === user.id))
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "update", "forward", existing.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
 
   const result = await runTunnelActionApi(id, "suspend", workspace.id, {
     db: db as never,
@@ -814,8 +817,8 @@ tunnelsRoutes.post("/v3/:id/resume", async (c) => {
 
   const existing = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!existing) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "update", existing.user_id === user.id))
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "update", "forward", existing.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
 
   const result = await runTunnelActionApi(id, "resume", workspace.id, {
     db: db as never,
@@ -837,8 +840,8 @@ tunnelsRoutes.delete("/v3/:id", async (c) => {
 
   const existing = await db.tunnel.findFirst({ where: { id, workspace_id: workspace.id } });
   if (!existing) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceAction(workspace.role, "delete", existing.user_id === user.id))
-    return c.json({ error: "无权操作该团队隧道" }, 403);
+  if (!canWorkspaceResourceAction(workspace, "delete", "forward", existing.user_id === user.id))
+    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
 
   const result = await runTunnelActionApi(id, "delete", workspace.id, {
     db: db as never,
