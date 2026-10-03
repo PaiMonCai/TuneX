@@ -1684,7 +1684,24 @@ automatic failover
 > ~~~
 >
 > - **迟滞（hysteresis）**：进入 `unhealthy` 要连续失败 N 次；离开 `unhealthy` 要连续成功 M 次
->   且成功率回升。**单次失败或单次成功都不改变状态**——这是本节"禁止 single timeout"的落地。
+>   且成功率回升。**单次失败或单次成功都不可能造成"判死"或"宣告恢复"**——这是本节
+>   "禁止 single timeout"的落地。
+>
+>   **两处口径必须写清楚，否则实现者只能猜（WP6 实现时两条都真的被问到）**：
+>   1. 「单次失败不改变状态」与 `degraded` 行（`0 < cf < N`）字面冲突。取**状态表为准**：
+>      单次失败**可以**到 `degraded` —— `degraded` 是**可见但不判死**的状态，
+>      而 `unhealthy` 才是"判死"，单次失败永远到不了它。同理单次成功最多回到
+>      `recovering`，**永远直接回不到 `healthy`**。
+>   2. `recovering` 是 `unhealthy` 的**唯一出口**。状态表字面上允许 `unhealthy → healthy`
+>      直通，但 Gate V5-G2 的链路是 `unhealthy → recovering → healthy`；采用后者，
+>      **每次合成只走一条跃迁**。代价是恢复后多经历一个上报周期的 `recovering`，
+>      收益是"恢复"这件事在观测上永远可见，不会被一次采样抹掉。
+> - **相位（全序）**：`unknown < healthy < recovering < degraded < unhealthy`。
+>   契约只说"取最坏"，没给全序；这个顺序是 fail-closed 的选择：不美化任何视角，
+>   且 `unknown` 比 `healthy` 差（"没有证据"不能等同于"健康"）。
+> - **压制方向**：flap 只把 `healthy`/`recovering` 向上压到 `degraded`；
+>   **`unhealthy` 绝不会被压下来**（把真实故障放宽成"只是抖动"是最危险的错误方向），
+>   `unknown` 也不参与压制。
 > - **warm-up**：新 target 从 `unknown` 起步；一次成功只到 `recovering`，
 >   连续 `WARMUP_SUCCESSES`（默认 2）次成功才到 `healthy`。
 > - **flap**：在 `FLAP_WINDOW` 内状态翻转超过 `FLAP_FLIPS` 次 → 合成结果标记 `flapping: true`
@@ -1695,10 +1712,28 @@ automatic failover
 >   每项注明它保护什么。禁止散落 magic number（§7.2 明确要求）。
 > - **synthesis 永不改 desired**（§7.2 与本节禁止项）。
 >
-> ### 开放产品决策（不猜）
+> ### 实现选定的默认值（可注入；不是冻结的产品决策）
 >
-> 观测周期与并发上限的具体取值（实现取有界默认并注明）；是否保留观测历史（当前只存最新一条投影）；
-> 多观测者时是否允许"多数表决"替代当前的最坏值；`success_rate` 的窗口长度是否随池规模调整；
+> 开放项的取值先由实现选定并集中在 `backend/src/services/target-health-thresholds.ts`
+> 与 `agent/internal/targetobs/observer.go`，每一项都注明它保护什么、改一个数即可调整：
+>
+> | 项 | 值 | 保护什么 |
+> |---|---|---|
+> | `FAILURE_THRESHOLD` | 3 | 进 `unhealthy` 的唯一入口；一次超时永远到不了 |
+> | `RECOVERY_SUCCESSES` | 2 | 防"一次好探测就回到服务" |
+> | `WARMUP_SUCCESSES` | 2 | 防"从未被验证就当健康" |
+> | `SUCCESS_RATE_WINDOW` | 20 | 观测窗口；散点失败接成功率、成串失败接连败计数 |
+> | `HEALTHY_RATE` | 0.9 | `healthy` 的成功率下限 |
+> | `LATENCY_DEGRADED_MS` | 3000 | 与观测器 `DefaultTimeout=3s` 同源：连得上但不能用 |
+> | `STALE_AFTER_MS` | 90000（=3×上报周期） | 超过即"没有证据"，也是"面板重启后旧观测不得当新鲜"的根据 |
+> | `REPORT_INTERVAL_MS` | 30000 | 与 Agent 心跳/观测同频，不引入第二条时间真相 |
+> | `FLAP_WINDOW_MS` / `FLAP_FLIPS` | 600000 / 4 | 明显长于一次真实恢复周期；只压 healthy/recovering |
+> | 观测间隔/超时/并发/抖动 | 30s / 3s / 8 / ±5s | 有界，避免全网同步与探测风暴 |
+>
+> ### 其余开放产品决策（不猜）
+>
+> 是否保留观测历史（当前只存每个 (节点,目标) 的最新一条投影）；
+> 多观测者时是否允许"多数表决"替代当前的最坏值；
 > 是否需要把退化状态通知到用户（当前只落事实，不产生告警语义）。
 
 ## 7.1 V5-WP5 — Target Observation
