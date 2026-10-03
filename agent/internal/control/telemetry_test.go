@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -83,7 +84,7 @@ func TestFailurePathRecordsThroughExecuteResult(t *testing.T) {
 			Protocol: "tcp", Revision: 5,
 		},
 	}
-	if ack := c.execute(first); !ack.OK {
+	if ack := c.execute(context.Background(), first); !ack.OK {
 		t.Fatalf("first apply should succeed: %+v", ack)
 	}
 	if len(rec.messages) != 0 {
@@ -96,7 +97,7 @@ func TestFailurePathRecordsThroughExecuteResult(t *testing.T) {
 	staleCfg := first.Config.Clone()
 	staleCfg.Revision = 4
 	stale.Config = &staleCfg
-	ack := c.execute(&stale)
+	ack := c.execute(context.Background(), &stale)
 	if ack.OK {
 		t.Fatal("replaying an older revision must fail")
 	}

@@ -166,9 +166,15 @@ func (m *TunnelManager) HotSwapUpstream(id, addr string) error {
 	}
 	m.mu.RLock()
 	e, ok := m.tunnels[id]
+	closing := m.closing
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrTunnelNotFound, id)
+	}
+	if closing {
+		// A target swap during teardown would keep a connection path alive on a
+		// node that is supposed to be going away.
+		return ErrNodeShuttingDown
 	}
 	if err := e.fwd.SetUpstream(clean); err != nil {
 		return errHotSwapRejected(id, err)
@@ -176,6 +182,9 @@ func (m *TunnelManager) HotSwapUpstream(id, addr string) error {
 	return nil
 }
 
+// DrainTunnel is deliberately NOT refused during shutdown: draining is what a
+// shutdown does. It stops accepting new work and waits, bounded.
+//
 // DrainTunnel stops accepting new work on a tunnel's behalf and waits —
 // bounded — for the in-flight connections to finish, while the listener stays
 // bound and the port stays reserved.
@@ -225,8 +234,24 @@ func (m *TunnelManager) DrainTunnel(id string, timeout time.Duration) error {
 // apply_tunnel and the admin API's POST /tunnel), so the routing cannot
 // differ between them.
 func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+	before := m.fingerprint()
+	fwd, err := m.replaceListenerInner(cfg)
+	if err == nil {
+		m.notifyIfChanged(before)
+	}
+	return fwd, err
+}
+
+func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Same latch as Apply. This is the entry the control plane actually uses for
+	// a listener change, so without the check here "refuse work during shutdown"
+	// held only for the path production does not take.
+	if m.closing {
+		return nil, ErrNodeShuttingDown
+	}
 
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {

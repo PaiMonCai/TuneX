@@ -87,10 +87,10 @@ type pipeTracker struct {
 
 	up upstream
 
-	mu       sync.Mutex
-	ln       net.Listener
-	started  bool
-	stopped  bool
+	mu      sync.Mutex
+	ln      net.Listener
+	started bool
+	stopped bool
 	// draining is the Drain state: the listener is still bound (the port
 	// stays reserved for whoever owns it next), but the accept loop has
 	// finished, so no NEW connection is taken from the kernel backlog.
@@ -98,6 +98,10 @@ type pipeTracker struct {
 	bytes    byteCounter
 	conns    int32
 	inFlight sync.WaitGroup
+	// live holds the connections currently being proxied. Stop and Drain only
+	// wait for them; a shutdown that runs out of deadline must be able to close
+	// them, which is impossible from a counter alone.
+	live map[net.Conn]struct{}
 }
 
 // errNotRunning is returned by internal helpers that require a bound listener.
@@ -171,9 +175,11 @@ func (t *pipeTracker) acceptLoop(ln net.Listener, p pick) {
 		}
 		atomic.AddInt32(&t.conns, 1)
 		t.inFlight.Add(1)
+		t.trackConn(conn)
 		go func() {
 			defer t.inFlight.Done()
 			defer atomic.AddInt32(&t.conns, -1)
+			defer t.untrackConn(conn)
 			defer conn.Close()
 			t.handleConn(conn, p)
 		}()
@@ -196,7 +202,14 @@ func (t *pipeTracker) handleConn(conn net.Conn, p pick) {
 		// leaving it hanging with no upstream.
 		return
 	}
-	defer upstream.Close()
+	// Register the upstream as well: a shutdown deadline must be able to end
+	// this pair, and closing only the client can leave the upstream copy blocked
+	// forever when the peer never sends again.
+	t.trackConn(upstream)
+	defer func() {
+		t.untrackConn(upstream)
+		_ = upstream.Close()
+	}()
 	PipeConns(conn, upstream, &t.bytes)
 }
 

@@ -124,6 +124,16 @@ type StatePayload struct {
 	ErrorCount int64 `json:"error_count,omitempty"`
 	/// Newest failure time, unix seconds (0 = never).
 	LastErrorAt int64 `json:"last_error_at,omitempty"`
+
+	// ── V4-WP11B control-protocol negotiation ──────────────────────────
+	//
+	// Both are omitted when unset: the panel must be able to tell "this agent
+	// implements X" from "this agent never told me", and a zero-value int would
+	// erase that distinction (see backend services/agent-capability.ts).
+	/// Control-contract version this agent implements (0 = not configured).
+	ControlProtocolVersion int `json:"control_protocol_version,omitempty"`
+	/// Actions this agent actually implements (empty = not configured).
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // HostSample is the on-the-wire resource sample. Field names are explicit about
@@ -197,6 +207,16 @@ type (
 	}
 )
 
+// WithProtocol advertises the control-contract version and the actions this
+// agent implements (WP11B). It is an option like the telemetry sources: the
+// reporter stays decoupled from the control package.
+func WithProtocol(version int, capabilities []string) Option {
+	return func(c *Config) {
+		c.controlPortocolVersion = version
+		c.capabilities = append([]string(nil), capabilities...)
+	}
+}
+
 // Reporter periodically reports the node's heartbeat.
 type Reporter struct {
 	cfg Config
@@ -223,6 +243,11 @@ type Config struct {
 	ports    PortLister
 	revision RevisionLister
 	lastErr  ErrorLister
+
+	// WP11B: control-protocol negotiation facts, injected by the runtime so the
+	// reporter does not have to import the control package.
+	controlPortocolVersion int
+	capabilities           []string
 
 	// ── V4-WP6 telemetry sources (all optional) ──
 	//
@@ -357,6 +382,14 @@ func (r *Reporter) StatePayload() StatePayload {
 		AgentID: r.cfg.AgentID,
 		Version: r.cfg.Version,
 		Role:    r.cfg.Role,
+	}
+	// WP11B: only advertise when configured. Leaving both fields out keeps
+	// "never told the panel" distinguishable from "supports nothing".
+	if r.cfg.controlPortocolVersion > 0 {
+		p.ControlProtocolVersion = r.cfg.controlPortocolVersion
+	}
+	if len(r.cfg.capabilities) > 0 {
+		p.Capabilities = append([]string(nil), r.cfg.capabilities...)
 	}
 	if r.cfg.tunnels != nil {
 		p.Tunnels = r.cfg.tunnels.List()
@@ -533,6 +566,28 @@ func (r *Reporter) sendState(ctx context.Context) {
 var errRejected = errors.New("reporter: credential rejected")
 
 func isCredentialRejected(err error) bool { return errors.Is(err, errRejected) }
+
+// ReportOnce sends one state report synchronously and reports whether it was
+// accepted. It exists for shutdown (WP11A): the last thing a node says should be
+// what it actually did while closing listeners, and Run's ticker cannot be
+// relied on once the process is on its way out.
+//
+// ctx bounds the attempt; the caller passes a context with its own deadline
+// because the process-wide context is already cancelled during shutdown.
+func (r *Reporter) ReportOnce(ctx context.Context) error {
+	if r == nil || r.StateEndpoint() == "" {
+		return nil
+	}
+	body, err := json.Marshal(r.StatePayload())
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
+	defer cancel()
+	return r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
+	})
+}
 
 // Stop makes a running Run return. Safe before/after Run and more than once.
 func (r *Reporter) Stop() {

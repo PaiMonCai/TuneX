@@ -42,6 +42,23 @@ type Config struct {
 
 	ShowVersion bool
 	ConfigFile  string
+
+	// StateDir holds agent-local durable state. Today it is the last-known-good
+	// desired-state cache (WP11A) that lets a restart during a panel outage come
+	// back with its listeners instead of empty. Empty disables the cache.
+	StateDir string
+}
+
+// DefaultStateDir is where the container mounts the agent's writable state.
+const DefaultStateDir = "/var/lib/tunex-agent"
+
+// LKGPath is the last-known-good cache file inside StateDir.
+func (c *Config) LKGPath() string {
+	dir := strings.TrimSpace(c.StateDir)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "desired-lkg.json")
 }
 
 // Node roles (the panel's NodeRole enum).
@@ -96,6 +113,10 @@ func Parse(args []string, version string) (*Config, error) {
 	cfg := &Config{
 		ConfigFile:     DefaultConfigFile(),
 		AgentAdminPort: DefaultAgentAdminPort,
+		// The durable state directory is on by default: a node that restarts
+		// during a panel outage should come back with its listeners (WP11A).
+		// An explicitly empty TUNEX_STATE_DIR disables the cache.
+		StateDir: DefaultStateDir,
 	}
 
 	// Defaults from a config file / environment are read first so that explicit
@@ -128,6 +149,8 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.StringVar(&cfg.EgressRange, "egress-range", cfg.EgressRange, "Port range the egress tunnels may bind, e.g. 30001-60000")
 	// WP7：per-node credential。绝不明文进日志（usage 文本里也不回显值）。
 	fs.StringVar(&cfg.NodeCredential, "node-credential", cfg.NodeCredential, "Per-node credential for the state report (WP7)")
+	// WP11A：durable state directory (last-known-good desired-state cache).
+	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "Directory for durable agent state (last-known-good desired cache); empty disables it")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "version for TuneX agent")
 	fs.BoolVar(&cfg.ShowVersion, "v", false, "version for TuneX agent (shorthand)")
 
@@ -220,6 +243,11 @@ func applyDefaults(cfg *Config, file string) {
 	envStr("NODE_CREDENTIAL", &cfg.NodeCredential)
 	envStr("INGRESS_RANGE", &cfg.IngressRange)
 	envStr("EGRESS_RANGE", &cfg.EgressRange)
+	// LookupEnv (not envStr): an explicitly empty TUNEX_STATE_DIR must be able
+	// to turn the durable cache OFF, which "unset" cannot express.
+	if v, ok := os.LookupEnv("TUNEX_STATE_DIR"); ok {
+		cfg.StateDir = strings.TrimSpace(v)
+	}
 	envInt("AGENT_ADMIN_PORT", &cfg.AgentAdminPort)
 }
 
@@ -246,6 +274,7 @@ Runtime:
       --ingress-range string      Port range ingress tunnels may bind, e.g. 10000-30000
       --egress-range string       Port range egress tunnels may bind, e.g. 30001-60000
       --node-credential string    Per-node credential for the state report
+      --state-dir string          Durable state dir (last-known-good cache); empty disables
 
 Version: %s
 `, version)

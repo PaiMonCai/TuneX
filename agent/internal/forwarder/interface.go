@@ -125,12 +125,15 @@ type TunnelConfig struct {
 	RemoteHost  string     `json:"remote_host"`
 	RemotePort  int        `json:"remote_port"`
 	NextHop     string     `json:"next_hop"`
-	Targets     []Target   `json:"targets"`
-	LBStrategy  LBStrategy `json:"lb_strategy"`
-	Protocol    string     `json:"protocol"`
-	SpeedLimit  int64      `json:"speed_limit"`
-	Revision    int64      `json:"revision"`
-	ListenHost  string     `json:"listen_host,omitempty"`
+	// omitempty keeps an empty pool from being emitted as `null`: the panel
+	// treats absent as "no targets of its own", which is what a RELAY ingress
+	// tunnel actually has.
+	Targets    []Target   `json:"targets,omitempty"`
+	LBStrategy LBStrategy `json:"lb_strategy"`
+	Protocol   string     `json:"protocol"`
+	SpeedLimit int64      `json:"speed_limit"`
+	Revision   int64      `json:"revision"`
+	ListenHost string     `json:"listen_host,omitempty"`
 }
 
 // Clone returns a copy that shares no mutable state with c.
