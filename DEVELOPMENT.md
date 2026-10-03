@@ -1217,8 +1217,8 @@ client → ingress listener(tcp | tls | ws) → 解密/解帧
 | WP5-A0 语义契约 | **DONE** | 本节上文，2026-10-03 冻结 |
 | WP5-A1 TLS stream runtime | **DONE** | 见下（真实拓扑已验证） |
 | WP5-A2 WS stream runtime | **DONE** | 见下（真实拓扑已验证） |
-| WP5-A3 protocol diagnostics | TODO | |
-| Gate V5-G1A | TODO | 脚本待写（`scripts/v3-e2e/v5-g1a.py`） |
+| WP5-A3 protocol diagnostics | **DONE** | 见下 |
+| Gate V5-G1A | **GREEN PASS=73 / FAIL=0** | `scripts/v3-e2e/v5-g1a.py`，证据 `docs/evidence/v5-g1a-result-20261004.txt`（154s，真实四 Agent 拓扑） |
 
 **WP5-A1 落地位置**
 
@@ -1293,6 +1293,45 @@ masked binary frame  -> 目标回包 b'WP14-TARGET-A\n'（opcode=0x2）
 3. **wire 校验白名单也要加 `ws`。** 面板下发时被冻结的 payload 校验器拒了
    （`payload.tunnel.tunnel_type 必须是 tcp/mtcp/.../quic`）。wire 词汇表可以领先
    于 DB 枚举——这一点已写进 `types.ts` 的注释，避免下一个人再踩。
+
+**V5.1a 收口（Gate V5-G1A 全绿）**
+
+~~~text
+G1A.1  tcp 回归                      旧协议未被新协议破坏
+G1A.2  tls 正向                     真实证书 → 握手 → 字节回环
+G1A.3  tls 负例                     证书不匹配 / 文件缺失 → fail closed，不建监听
+G1A.4  ws 正向                      101 + 掩码帧 → 字节回环
+G1A.5  ws 负例                      明文 HTTP / 垃圾字节不被升级，监听存活
+G1A.6  证书轮换                     换文件 → 新连接用新证书；live 连接不断
+G1A.7  热重载                       tls/ws 改目标：监听端口不动、流量继续
+G1A.8  Agent 重启                   tls 监听自动恢复（路径随 desired state 回来）
+G1A.9  Panel 重启                   数据面不受影响
+G1A.10 旧 Agent 准入                未广告 tls/ws 的节点在入队前被拒
+G1A.11 无密钥泄漏                   Agent 日志与支持包都不含私钥
+G1A.12 优雅排空                     suspend 后不再接受新客户端
+~~~
+
+**Gate 一共抓出 7 个真实缺陷（未 skip、未降级）**
+
+| # | 缺陷 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | tls/ws 转发热重载必然失败 | rollout 路径传了协议、没传证书路径 | 共享 `dispatchFactsFromRow`（协议 + 该协议必需配置一次解析），四条下发路径统一 |
+| 2 | Agent 重启后 tls 监听不回来 | restore 快照解码器不认识新字段 | `tunnelPayload` 补两列 + 解码器带过 |
+| 3 | ws 转发无法改目标 | 遗留列默认 `wss` 被当协议事实读，策略层拒绝 | 四处策略读取改用 canonical protocol（`persistedForwardProtocol`） |
+| 4 | 证书轮换后仍用旧证书 | 证书只在建 listener 时读一次，而热交换不重建 listener | `certReloader`：按文件戳在**每次握手**时重读；换坏文件保留上一份好的 |
+| 5 | ws 创建 500 | 遗留 enum 无 `ws` | DB 列省略（走列默认）+ wire 字段回落协议名 + wire 词汇表加 `ws` |
+| 6 | ws 转发改目标不生效 | 同上第 3 条（同一根因的另一条路径） | 同上 |
+| 7 | 账单视图把 ws 显示成 wss | `traffic.ts` 直读遗留列 | 同第 3 条（改成 canonical，缺失时不臆造默认值） |
+
+**这一阶段的教训（写给下一个人）**：三次"新增必需字段"的漏网都发生在**同一类位置** ——
+下发/恢复/投影路径里"读到了协议、却没收下这个协议需要的配置"。所以现在的纪律是：
+协议与它的必需配置**由一个函数一起解析**（`dispatchFactsFromRow`），任何路径都不许
+自己拆开读第二次；新增必需字段时，改这一个函数 + 让它编译失败，就是全部工作。
+
+Gate 自身也修了三个"看起来像产品缺陷"的问题：PEM/DER 比对、把 `raw` socket 在
+`wrap_socket` 之后再设超时（EBADF）、以及两个 gate 进程并发跑（一个在种假 Agent
+清单、另一个在创建 ws 转发）。第三个尤其值得记：**gate 会改动共享拓扑，必须自己
+上锁**，否则它会把自身的并发问题报成产品故障。
 
 #### V5.1a 实施范围（A1/A2/A3）
 

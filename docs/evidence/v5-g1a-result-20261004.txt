@@ -1,0 +1,79 @@
+# V5-G1A WS/TLS protocol expansion gate
+time: 2026-10-03T18:55:49+0000
+topology: scripts/v3-e2e/docker-compose.e2e.yaml (existing Agents, real TCP/TLS/WS)
+fixture: V5-G1A-1791053595; setup=executed
+elapsed_seconds: 154
+PASS | G1A.setup the e2e user can authenticate
+PASS | G1A.setup every policy row entitles ws (the ceiling is intersected with all of them)
+PASS | G1A.setup target-a serves a second port for the hot-reload cases
+PASS | G1A.setup target-a serves a byte-echo port (the e2e target only greets)
+PASS | G1A.setup the panel is reachable after the Agent restarts
+PASS | G1A.setup both data-plane Agents are running again
+PASS | G1A.setup all four Agents re-report after the restart
+PASS | G1A.setup all four Agents advertise ws before any case runs
+PASS | G1A.1 a tcp Forward is still created
+PASS | G1A.1 it converges
+PASS | G1A.1 the tcp listener still forwards end to end
+PASS | G1A.2 a tls Forward converges on a node with a real certificate
+PASS | G1A.2 TLS handshake succeeds against the ingress listener
+PASS | G1A.2 the node serves exactly the installed certificate
+PASS | G1A.3 a mismatched cert/key pair is refused
+PASS | G1A.3 the refusal explains it is about the certificate
+PASS | G1A.3 it never converges to active
+PASS | G1A.3 the row is left in error rather than reported as running
+PASS | G1A.3 no listener was created for the bad configuration
+PASS | G1A.3 a missing certificate file is refused
+PASS | G1A.3 and it never converges either
+PASS | G1A.4 a ws Forward converges
+PASS | G1A.4 WebSocket upgrade + masked frame round-trips
+PASS | G1A.5 the ws fixture converges
+PASS | G1A.5 a plain HTTP request is not upgraded
+PASS | G1A.5 garbage bytes are not upgraded
+PASS | G1A.5 the listener still serves a real ws client afterwards
+PASS | G1A.7 the tls fixture converges
+PASS | G1A.7 tls: first round trip works
+PASS | G1A.7 tls: the target change converges
+PASS | G1A.7 tls: the listener port did not move
+PASS | G1A.7 tls: the tunnel still serves after the hot reload
+PASS | G1A.7 the ws fixture converges
+PASS | G1A.7 ws: first round trip works
+PASS | G1A.7 ws: the target change converges
+PASS | G1A.7 ws: the listener port did not move
+PASS | G1A.7 ws: the tunnel still serves after the hot reload
+PASS | G1A.6 the tls fixture converges
+PASS | G1A.6 it starts by serving the first certificate
+PASS | G1A.6 a live connection carries a round trip before the reload
+PASS | G1A.6 the reload is driven through the real command bus
+PASS | G1A.6 the reloaded configuration converges
+PASS | G1A.6 new connections are served the NEW certificate
+PASS | G1A.6 the live connection kept working across the reload
+PASS | G1A.8 the tls fixture converges
+PASS | G1A.8 it serves before the restart
+PASS | G1A.8 the tls listener comes back after an Agent restart
+PASS | G1A.8 and it still serves the installed certificate (the paths survived the restore)
+PASS | G1A.9 the tls fixture converges
+PASS | G1A.9 the panel is back
+PASS | G1A.9 the tls listener kept serving across the panel restart
+PASS | G1A.10 the node's manifest was readable
+PASS | G1A.10 the old-Agent shape is planted before the tls attempt
+PASS | G1A.10 an old Agent does not get a tls dispatch
+PASS | G1A.10 the tls refusal is a runtime admission denial
+PASS | G1A.10 and the tls Forward never converges
+PASS | G1A.10 the old-Agent shape is planted before the ws attempt
+PASS | G1A.10 an old Agent does not get a ws dispatch
+PASS | G1A.10 the ws refusal is a runtime admission denial
+PASS | G1A.10 and the ws Forward never converges
+PASS | G1A.10 the Agent's real manifest came back after the planted outage
+PASS | G1A.10 ... and it is the REAL manifest (tls and ws are back), not just any report
+PASS | G1A.12 the ws fixture converges
+PASS | G1A.12 it serves before the drain
+PASS | G1A.12 suspend is accepted
+PASS | G1A.12 the drained tunnel stops accepting new WebSocket clients
+PASS | G1A.12 and its runtime is gone from the node's own report
+PASS | G1A.11 the tls fixture converges
+PASS | G1A.11 the private key never appears in the Agent log
+PASS | G1A.11 nor any PEM private-key header in the Agent log
+PASS | G1A.11 the private key is absent from the support bundle
+PASS | G1A.11 and no PEM private-key header either
+PASS | G1A.cleanup every fixture this gate created was removed
+V5-G1A TOTAL PASS=73 FAIL=0
