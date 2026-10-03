@@ -32,6 +32,7 @@ import type {
   WorkspaceRole,
 } from "@/lib/types";
 import * as seed from "./data";
+import type { WorkspaceCustomRole } from "@/lib/workspace-permissions";
 import { MOCK_LIFECYCLE_SEED, MOCK_PORT_LEASE_SEED } from "./node-lifecycle";
 
 /** build() 内复用种子数据集的时间基准（seed.now），保证演示数据时间一致 */
@@ -70,6 +71,7 @@ export interface MockStore {
   workspaces: MockWorkspace[];
   workspaceMembers: MockWorkspaceMember[];
   workspaceInvites: MockWorkspaceInvite[];
+  workspaceRoles: WorkspaceCustomRole[];
   /** V4 Node-first：入口到出口的显式绑定。 */
   nodeBindings: MockNodeBinding[];
   /** WP12 节点凭据签发明文记录：node_id → 多久轮转过（次数） */
@@ -113,6 +115,7 @@ export interface MockWorkspace {
 }
 
 export interface MockWorkspaceMember {
+  role_id?: number | null;
   id: number;
   workspace_id: number;
   user_id: number;
@@ -276,6 +279,7 @@ function build(): MockStore {
     workspaces,
     workspaceMembers,
     workspaceInvites: [],
+    workspaceRoles: [],
     nodeBindings: [
       { id: 1, ingress_node_id: 1, egress_node_id: 4, created_at: wsAt },
       { id: 2, ingress_node_id: 1, egress_node_id: 6, created_at: wsAt },

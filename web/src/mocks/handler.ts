@@ -82,6 +82,7 @@ import {
 // mock 里再抄一份「哪些码可重试」就是第三份判据 —— 报告 N1 记的正是这种形态。
 import { applyErrorIsRetryable } from "@/lib/forward-status";
 import type { ForwardPatchInput } from "@/lib/types";
+import { mockEffectivePermissions, mockBasePermissions, mockGrantSubset, validMockRolePermissions } from "./workspace-permissions";
 
 // forward-edit.ts 需要 handler 的 forward 投影（避免反向依赖），在这里注入一次。
 injectMockForwardView((_db, tunnel) => mockForwardView(_db, tunnel));
@@ -90,6 +91,7 @@ export interface MockRequest {
   body?: unknown;
   query?: ListQuery;
   cookie?: string;
+  workspaceId?: number;
 }
 
 export interface MockResponse {
@@ -1221,6 +1223,7 @@ function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
 
   return {
     id: tunnel.id,
+    creator_user_id: tunnel.user_id ?? null,
     name: tunnel.name,
     protocol: "tcp",
     mode: tunnel.tunnel_mode === "relay" ? "relay" : "direct",
@@ -1458,6 +1461,23 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   if (!logged) return fail(401, "Unauthorized");
   const user = userFromCookie(db, req.cookie);
 
+  // Mock resource storage remains user-based demonstration data, not evidence
+  // of real DB tenant isolation. Selected scope still exercises RBAC contracts.
+  const scopeId = req.workspaceId ?? db.workspaces.find((w) => w.personal_user_id === user.id)?.id;
+  const scopeMembership = db.workspaceMembers.find((m) => m.workspace_id === scopeId && m.user_id === user.id && m.active);
+  if (seg[0] === "nodes" || seg[0] === "node-groups" || seg[0] === "forwards") {
+    if (!scopeMembership) return notFound("工作空间不存在");
+    const grants = mockEffectivePermissions(db, scopeMembership);
+    const resource = seg[0] === "forwards" ? "forward" : "node";
+    const action = method === "GET" ? "read" : resource === "node" ? "manage" :
+      method === "DELETE" ? "delete" : method === "POST" && seg[1] === undefined ? "create" : "update";
+    if (!grants.permissions[`${resource}:${action}` as keyof typeof grants.permissions]) return fail(403, "工作空间角色无权操作", "permission_denied");
+    if (resource === "forward" && method !== "GET" && parseId(seg[1]) !== null && grants.forward_mutations === "own") {
+      const tunnel = db.tunnels.find((row) => row.id === parseId(seg[1]));
+      if (!tunnel || tunnel.user_id !== user.id) return fail(403, "只能修改本人创建的转发");
+    }
+  }
+
   // ---------- TEN-01 workspaces ----------
   // 镜像 backend/src/routes/workspaces.ts 的契约：列表按会话过滤、邀请只返回一次 token、
   // 邀请接受要求邮箱匹配且单次使用、owner 不可移除、成员可自行退出。
@@ -1549,15 +1569,68 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         (m) => m.workspace_id === id && m.user_id === user.id && m.active,
       );
       const ws = db.workspaces.find((w) => w.id === id);
-      if (!membership || !ws) return notFound("工作空间不存在");
+      if (!membership || !ws || (req.workspaceId !== undefined && req.workspaceId !== id)) return notFound("工作空间不存在");
+
+      const effective = mockEffectivePermissions(db, membership);
+      if (method === "GET" && seg[2] === "permissions") return ok(effective);
+      if (seg[2] === "roles") {
+        if (!effective.permissions[method === "GET" ? "member:read" : "member:manage"]) return fail(403, "无权管理工作空间角色");
+        const roleId = parseId(seg[3]);
+        const role = db.workspaceRoles.find((r) => r.id === roleId && r.workspace_id === id);
+        if (method === "GET" && seg[3] === undefined) return ok(db.workspaceRoles.filter((r) => r.workspace_id === id));
+        if (method === "DELETE") {
+          if (!role) return notFound("角色不存在");
+          if (!mockGrantSubset(effective, role.permissions)) return fail(403, "不能管理超出本人权限的角色");
+          if (db.workspaceMembers.some((m) => m.role_id === role.id)) return fail(409, "角色仍被成员绑定，请先显式调整成员角色");
+          db.workspaceRoles = db.workspaceRoles.filter((r) => r !== role);
+          return ok({ ok: true });
+        }
+        if (method === "POST" || method === "PATCH") {
+          if (method === "PATCH" && !role) return notFound("角色不存在");
+          if (role && !mockGrantSubset(effective, role.permissions)) return fail(403, "不能管理超出本人权限的角色");
+          const body = asRecord(req.body);
+          const name = body.name === undefined ? role?.name : reqStr(body.name);
+          const description = body.description === undefined ? role?.description ?? null : body.description;
+          const perms = body.permissions === undefined ? role?.permissions : body.permissions;
+          if (!name || name.length > 120 || (description !== null && (typeof description !== "string" || description.length > 255)) || !validMockRolePermissions(perms)) return badRequest("角色名称、说明或权限不合法");
+          if (!mockGrantSubset(effective, perms)) return fail(403, "不能授予超出本人权限的权限");
+          if (db.workspaceRoles.some((r) => r.workspace_id === id && r.id !== roleId && r.name === name)) return fail(409, "角色名称已存在");
+          if (role && db.workspaceMembers.some((m) => m.role_id === role.id && m.role === "owner")) return fail(403, "不能影响 owner 角色");
+          const value = { id: role?.id ?? nextId(db.workspaceRoles), workspace_id: id, name, description, permissions: { ...perms } };
+          if (role) Object.assign(role, value); else db.workspaceRoles.push(value);
+          return { status: role ? 200 : 201, body: value };
+        }
+      }
+      if (method === "PATCH" && seg[2] === "members" && seg[4] === "role") {
+        if (!effective.permissions["member:manage"]) return fail(403, "无权管理成员角色");
+        const target = db.workspaceMembers.find((m) => m.workspace_id === id && m.user_id === parseId(seg[3]));
+        if (!target) return notFound("成员不存在");
+        if (target.role === "owner") return fail(403, "不能更改 owner 角色");
+        const body = asRecord(req.body);
+        if (Object.keys(body).length !== 1 || (!Object.hasOwn(body, "role_id") && !Object.hasOwn(body, "role"))) return badRequest("必须选择一种角色载荷");
+        if (Object.hasOwn(body, "role_id")) {
+          if (body.role_id !== null && (!Number.isSafeInteger(body.role_id) || Number(body.role_id) < 1)) return badRequest("非法角色 ID");
+          const assigned = db.workspaceRoles.find((r) => r.workspace_id === id && r.id === body.role_id);
+          if (body.role_id !== null && !assigned) return notFound("角色不存在");
+          const candidate = assigned?.permissions ?? mockBasePermissions(target.role);
+          if (!mockGrantSubset(effective, candidate)) return fail(403, "不能授予超出本人权限的角色");
+          target.role_id = body.role_id as number | null;
+        } else {
+          if (body.role !== "admin" && body.role !== "member" && body.role !== "viewer") return badRequest("基础角色不合法");
+          if (!mockGrantSubset(effective, mockBasePermissions(body.role))) return fail(403, "不能授予超出本人权限的角色");
+          target.role = body.role; target.role_id = null;
+        }
+        return ok({ user_id: target.user_id, workspace_id: id, role: target.role, role_id: target.role_id, active: target.active });
+      }
 
       // GET /:id/members：任一 active 成员可读
       if (method === "GET" && seg[2] === "members") {
+        if (!effective.permissions["member:read"]) return fail(403, "没有查看成员权限");
         const rows: WorkspaceMember[] = db.workspaceMembers
           .filter((m) => m.workspace_id === id && m.active)
           .map((m) => {
             const u = db.users.find((x) => x.id === m.user_id);
-            return { user_id: m.user_id, email: u?.email ?? "", role: m.role, created_at: m.created_at };
+            return { user_id: m.user_id, email: u?.email ?? "", role: m.role, role_id: m.role_id ?? null, custom_role_id: m.role_id ?? null, custom_role_name: db.workspaceRoles.find((r) => r.id === m.role_id && r.workspace_id === id)?.name ?? null, created_at: m.created_at };
           })
           .sort((a, b) => a.user_id - b.user_id);
         return ok(rows);
@@ -1608,7 +1681,7 @@ export async function handleMock(method: string, path: string, req: MockRequest)
 
       // POST /:id/invites：仅 team + owner/admin；重复邮箱 409；成员+待接受邀请上限 5
       if (method === "POST" && seg[2] === "invites") {
-        if (ws.kind !== "team" || (membership.role !== "owner" && membership.role !== "admin")) {
+        if (ws.kind !== "team" || !effective.permissions["member:manage"]) {
           return fail(403, "没有邀请权限", "FORBIDDEN");
         }
         const body = asRecord(req.body);
@@ -1668,7 +1741,7 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         );
         if (!target) return notFound("成员不存在");
         if (target.role === "owner") return fail(403, "不能移除 owner", "FORBIDDEN");
-        if (user.id !== targetId && membership.role !== "owner" && membership.role !== "admin") {
+        if (user.id !== targetId && !effective.permissions["member:manage"]) {
           return fail(403, "没有移除权限", "FORBIDDEN");
         }
         target.active = false;
@@ -1725,6 +1798,143 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       if (method === "POST" && seg[2] === "enrollment") {
         return ok(mockEnrollment(projected));
       }
+        /**
+       * V4-WP11C：用户侧 Node 诊断 / 支持包 / 升级命令（mock）。
+       *
+       * 与真实后端同一套语义，特别是"离线是结论不是错误"：状态上报过期的节点
+       * 返回 reachability=offline 且 agent_facts 为空，这样界面在开发期也能看到
+       * 真实的分支，而不是永远只有 happy path。
+       */
+      if (method === "GET" && seg[2] === "diagnostics") {
+        const state = db.nodeStates.get(node.id) ?? null;
+        const ageSeconds = state?.reported_at
+          ? Math.max(0, Math.round((Date.now() - Date.parse(state.reported_at)) / 1000))
+          : null;
+        const reachability =
+          ageSeconds === null ? "unknown" : ageSeconds > 75 ? "offline" : "online";
+        const forwards = db.tunnels.filter(
+          (t) => t.category === "port_forward" && (t.ingress_node_id === node.id || t.egress_node_id === node.id),
+        );
+        return ok({
+          node_id: node.id,
+          node_key: node.node_id,
+          generated_at: nowIso(),
+          reachability,
+          agent_facts:
+            reachability === "online"
+              ? {
+                  version: (state as { version?: string } | null)?.version ?? "0.0.0-mock",
+                  role: String(node.role ?? "INGRESS").toUpperCase(),
+                  agent_id: String(node.agent_id ?? "mock-agent"),
+                  node_id: node.node_id,
+                  runtime: {
+                    tunnel_count: forwards.filter((t) => t.apply_status === "active").length,
+                    truncated: false,
+                    ports_total: forwards.length,
+                    listen_ports: forwards
+                      .map((t) => t.listen_port)
+                      .filter((p): p is number => typeof p === "number"),
+                    tunnels: forwards.map((t) => ({
+                      id: `tunex-${t.id}-${t.tunnel_mode ?? "direct"}`,
+                      mode: String(t.tunnel_mode ?? "direct").toUpperCase(),
+                      ingress_port: t.listen_port ?? 0,
+                      revision: t.config_revision ?? 1,
+                      crosses_node: t.tunnel_mode === "relay",
+                    })),
+                  },
+                  state_dir: {
+                    path: "/var/lib/tunex-agent/desired-lkg.json",
+                    configured: true,
+                    dir_exists: true,
+                    cache_present: true,
+                    cache_valid: true,
+                  },
+                  process: {
+                    uptime_seconds: 3600,
+                    started_at: nowIso(),
+                    go_version: "go1.27.1",
+                    os: "linux",
+                    arch: "amd64",
+                    cpu_count: 4,
+                    gomaxprocs: 4,
+                    goroutines: 20,
+                    heap_bytes: 1024,
+                  },
+                  shutting_down: false,
+                }
+              : null,
+          agent_facts_error:
+            reachability === "online"
+              ? null
+              : { error_code: reachability === "offline" ? "offline" : "never_reported", message: "节点未上报或上报已过期" },
+          panel: {
+            id: node.id,
+            node_id: node.node_id,
+            agent_id: node.agent_id ?? null,
+            role: node.role ?? null,
+            lifecycle: node.lifecycle ?? "active",
+            status: node.status ?? null,
+            last_seen_at: node.updated_at ?? null,
+            reported: state
+              ? {
+                  version: (state as { version?: string }).version ?? null,
+                  role: (state as { role?: string }).role ?? null,
+                  control_protocol_version: 1,
+                  capabilities: ["apply_tunnel", "remove_tunnel", "suspend_tunnel", "diagnose_tunnel", "collect_diagnostics"],
+                  reported_revision: 1,
+                  known_revision: 1,
+                  reported_at: (state as { reported_at?: string }).reported_at ?? null,
+                  age_seconds: ageSeconds,
+                  last_error: null,
+                  error_count: 0,
+                }
+              : null,
+            forwards: {
+              total: forwards.length,
+              active: forwards.filter((t) => t.apply_status === "active").length,
+              pending: forwards.filter((t) => t.apply_status === "pending").length,
+              failed: forwards.filter((t) => t.apply_status === "error").length,
+              unconverged: 0,
+            },
+          },
+          next_step: reachability === "offline" ? "节点已超过 75 秒没有上报：请检查节点主机与 Agent 进程。" : null,
+        });
+      }
+
+      if (method === "GET" && seg[2] === "support-bundle") {
+        const state = db.nodeStates.get(node.id) ?? null;
+        return ok({
+          schema_version: 1,
+          generated_at: nowIso(),
+          panel_version: "mock",
+          node: { id: node.id, node_id: node.node_id, agent_id: node.agent_id ?? null, role: node.role ?? null, lifecycle: node.lifecycle ?? "active" },
+          state_report: state ?? null,
+          forwards: [],
+          rollouts: [],
+          audit: [],
+          truncated: null,
+          notes: ["mock 产物：真实后端会按白名单采集并脱敏"],
+        });
+      }
+
+      if (method === "POST" && seg[2] === "upgrade-command") {
+        const body = asRecord(req.body);
+        const image = reqStr(body.agent_image);
+        if (!image) return badRequest("agent_image 不能为空");
+        if ((node.lifecycle ?? "active") !== "maintenance" && body.allow_active !== true) {
+          return fail(409, "升级前请先把节点置为 maintenance", "node_not_in_maintenance");
+        }
+        return ok({
+          node: { id: node.id, node_id: node.node_id, agent_id: node.agent_id ?? null, lifecycle: node.lifecycle ?? "active" },
+          target_image: image,
+          allow_active: body.allow_active === true,
+          script: `#!/bin/sh\n# TuneX Agent 升级脚本（mock）\nset -eu\nCONTAINER="tunex-agent"\nTARGET_IMAGE="${image}"\n# mock：真实后端会渲染完整的拉取/排空/重建/校验/回退步骤\n`,
+          preserves: { node_identity: true, credential: true, lkg_state: true, forwards: true },
+          rollback_hint: "用旧镜像重新运行安装脚本",
+          downtime: "升级窗口内该节点不接受新业务；在途连接最多等待 15 秒完成排空",
+        });
+      }
+
 
       if (seg[2] === "bindings") {
         if (projected.role !== "ingress" && projected.role !== "both") {
@@ -1800,6 +2010,73 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   // ---------- forwards（V4 product API） ----------
   if (seg[0] === "forwards") {
     const id = parseId(seg[1]);
+
+    /**
+     * V4-WP11C：POST /api/forwards/:id/diagnose（mock）。
+     *
+     * 形状必须与真实契约一致，尤其是 RELAY 的那一段：`method: "node_facts"` +
+     * `verified: false`。mock 若把这一段渲染成"已验证可达"，界面就会在开发期
+     * 掩盖掉真实环境里最重要的一条不确定性。
+     */
+    if (method === "POST" && id !== null && seg[2] === "diagnose") {
+      const tunnel = db.tunnels.find((row) => row.id === id);
+      if (!tunnel) return notFound("转发不存在");
+      const view = mockForwardView(db, tunnel);
+      const ingress = db.nodes.find((n) => n.id === view.ingress_node_id);
+      const egress = db.nodes.find((n) => n.id === view.egress_node_id);
+      const segments =
+        view.mode === "relay"
+          ? [
+              {
+                segment: "ingress_to_egress",
+                method: "node_facts",
+                verified: false,
+                node_id: view.ingress_node_id ?? 0,
+                node_key: ingress?.node_id ?? String(view.ingress_node_id ?? ""),
+                targets: [],
+                results: [],
+                facts: {
+                  hop: null,
+                  expected_revision: view.config_revision ?? null,
+                  ingress: { node_id: view.ingress_node_id ?? 0, reported: true, runtime_present: true, runtime_revision: view.config_revision ?? null, listener_port: view.listen_port ?? null },
+                  egress: { node_id: view.egress_node_id ?? 0, reported: true, runtime_present: true, runtime_revision: view.config_revision ?? null, listener_port: null },
+                },
+                outcome: "ok",
+                message: "两端运行时事实一致；该段未做连通性验证（不探测业务监听端口）",
+              },
+              {
+                segment: "egress_to_target",
+                method: "tcp_probe",
+                verified: true,
+                node_id: view.egress_node_id ?? 0,
+                node_key: egress?.node_id ?? String(view.egress_node_id ?? ""),
+                targets: [{ host: view.target_host ?? "", port: view.target_port ?? 0 }],
+                results: [{ host: view.target_host ?? "", port: view.target_port ?? 0, status: "reachable", elapsed_ms: 3 }],
+                outcome: "ok",
+              },
+            ]
+          : [
+              {
+                segment: "ingress_to_target",
+                method: "tcp_probe",
+                verified: true,
+                node_id: view.ingress_node_id ?? 0,
+                node_key: ingress?.node_id ?? String(view.ingress_node_id ?? ""),
+                targets: [{ host: view.target_host ?? "", port: view.target_port ?? 0 }],
+                results: [{ host: view.target_host ?? "", port: view.target_port ?? 0, status: "reachable", elapsed_ms: 3 }],
+                outcome: "ok",
+              },
+            ];
+      return ok({
+        forward_id: id,
+        mode: view.mode,
+        generated_at: nowIso(),
+        segments,
+        next_step: view.mode === "relay"
+          ? "出口节点到目标的 TCP 可达；节点间那一段未做连通性验证，若业务仍不通请从两端节点日志继续排查。"
+          : "入口节点到目标的 TCP 可达；若业务仍不通，请检查目标服务本身。",
+      });
+    }
 
     if (method === "GET" && seg[1] === "summary") {
       const rows = db.tunnels

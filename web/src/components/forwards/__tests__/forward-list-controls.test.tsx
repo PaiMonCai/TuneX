@@ -25,13 +25,24 @@ import {
   listenPortPlaceholderKey,
 } from "@/components/forwards/forward-copy";
 import { getDictionary, makeT } from "@/lib/i18n";
+import { WorkspaceContext, type WorkspaceContextValue } from "@/components/workspace/workspace-context";
+import { mockBasePermissions } from "@/mocks/workspace-permissions";
+import { hasWorkspacePermission, canMutateForward } from "@/lib/workspace-permissions";
+const permissions = { workspace_id: 1, actor_id: 1, role: "owner" as const, custom_role_id: null,
+  permissions: mockBasePermissions("owner"), forward_mutations: "workspace" as const };
+const workspace: WorkspaceContextValue = {
+  workspaces: [], current: null, currentId: 1, role: "owner", kind: "personal", me: { id: 1, email: "fixture" },
+  permissions, permissionsLoading: false, canManage: true, loading: false, error: null,
+  can: (key) => hasWorkspacePermission(permissions, key), canForward: (row, action) => canMutateForward(permissions, row, action),
+  select: () => {}, createTeam: async () => null, refresh: async () => {},
+};
 
 const COMPONENT = readFileSync(new URL("../forward-workspace.tsx", import.meta.url), "utf8");
 
 const render = (locale: "zh" | "en") =>
   renderToStaticMarkup(
     <I18nProvider locale={locale} dict={getDictionary(locale)}>
-      <ForwardWorkspace />
+      <WorkspaceContext.Provider value={workspace}><ForwardWorkspace /></WorkspaceContext.Provider>
     </I18nProvider>,
   );
 
