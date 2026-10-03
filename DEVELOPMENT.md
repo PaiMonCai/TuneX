@@ -1115,6 +1115,138 @@ How are secrets rotated?
 
 如果仓库现有产品要求无法唯一回答，不要靠猜测直接实现。
 
+### WP5-A0 语义契约（已冻结，2026-10-03）
+
+§6.1 要求编码前先唯一回答七个问题。下面是**答案 + 依据**：每条依据要么指向仓库
+事实（文件:行），要么指向已经冻结的 V5 不变量。凡仓库事实无法唯一回答的，写成
+「需要产品决策」并**不实现**，而不是靠枚举名字猜。
+
+#### 1. 什么是用户可见协议？
+
+`FORWARD_PROTOCOLS` 里的值（今天只有 `tcp`；V5.1a 增加 `tls`、`ws`）。
+用户创建 Forward 时通过 `protocol` 字段选择，`routes/forwards.ts` 用
+`z.enum(FORWARD_PROTOCOLS)` 校验 —— 所以「新增协议 = 改契约 + 改这一处白名单 +
+它的 Gate」，没有第二条入口。
+
+**不是**用户可见协议：`TunnelType` 里的 `mtcp / tunex / mtls / mwss`。这些是历史
+wrapper/实现名（`prisma/schema.prisma` 的 `enum TunnelType`），WP0 已定：枚举里有
+这个名字，不等于产品支持它。
+
+#### 2. 什么是内部 transport？
+
+`stream`（`FORWARD_TRANSPORTS`，`lifecycle: "connection"`）。tcp / tls / ws 都是
+连接型，所以三者共用同一个 stream 运行时（§6.1「WS/TLS 属于 stream lifecycle；
+复用 Stream Runtime」）。
+
+**Agent 之间的那一跳仍然是裸 TCP**：`agent/internal/forwarder/singhop.go` 的
+`Start()` 用 `net.DialTimeout("tcp", nextHop)` 连接下一跳。V5.1a **不改这一跳**：
+前端 TLS 终止、WS 解帧之后，转发出去的仍然是一条普通字节流。理由：这一跳在运维
+自己的信任域内，为一个新前端协议引入第二套跨节点传输 = 第二份 transport 真相 +
+一个新的失败面，而它没有自己的 Gate。
+
+#### 3. TLS 在哪里终止？
+
+在**入口 Agent 的 listener**（面向客户端那一侧）。`protocol=tls` 的入口监听是一个
+TLS server（Go `crypto/tls`，标准库，不新增依赖），握完手之后的明文流与今天的 TCP
+隧道走完全相同的转发路径。
+
+不终止 TLS 的地方：出口节点不终止、跨节点跳不做二次加密、面板不参与数据面。
+
+#### 4. 证书归谁所有？
+
+归**部署/运维**，以**节点上的文件**形式存在（Agent 的 state dir，与既有
+`StateDir`/`LKGPath` 同一个布局）。Forward 只携带**路径**
+（`tls: { cert_path, key_path }`），**绝不携带密钥material**。
+
+依据：
+- 面板没有 per-resource secret store；为证书新建一套，就会与
+  `node_credential` + 部署层 env Fernet 形成第三套密钥系统（§1.1 禁止第二份真相）；
+- §6.1 强制原则「certificate/key 必须进入现有 secret redaction」——
+  `services/redaction.ts:55` 已经按形状删除 PEM 私钥块。让密钥只以路径形式流经
+  控制面，redaction 是**兜底**而不是唯一防线。
+
+#### 5. WS 包的是客户端流量还是跨节点跳？
+
+**客户端流量**。WS 客户端连入口 listener，Agent 把 WS 帧解出来的**字节流**转给
+target；跨节点跳不变。
+
+因此 V5.1a 里 `ws` 是**分帧协议**，`tls` 是**传输安全**，两者正交：
+
+~~~text
+protocol（分帧/语义维度）:  tcp | ws
+transport security（加不加 TLS）:  目前没有独立字段
+~~~
+
+`wss` **不**作为新的 protocol 值加入。理由：把「wss」当成一个协议名，正是 WP0 花
+力气拆掉的混淆（topology / protocol / transport 三个维度混成一个枚举）。
+`wss = ws + TLS 终止` 在语义上是成立的，但产品目前**没有**表达「这条转发要不要
+TLS」的用户字段 —— 那是产品决策，**留作待定项**（见文末），本轮不猜、不实现。
+
+#### 6. DIRECT 怎么表现？
+
+~~~text
+client → ingress listener(tcp | tls | ws) → 解密/解帧 → 裸 TCP → target
+~~~
+
+没有出口节点，没有跨节点跳。listener 的协议只是入口那一层的形态。
+
+#### 7. RELAY 怎么表现？
+
+~~~text
+client → ingress listener(tcp | tls | ws) → 解密/解帧
+       → 裸 TCP 一跳 → egress（EGRESS 池）→ target
+~~~
+
+出口节点只看见一条普通 TCP 流，**不需要知道**前端协议是什么；它的 EGRESS 行为、
+目标池、负载均衡、健康视图全部不变。§1.3 铁律（先出口、出口 ACK、再入口、失败
+补偿）对三种协议完全一致 —— 协议不改变编排顺序。
+
+#### 8. 密钥/证书怎么轮换？
+
+- **证书/私钥**：运维在节点上替换文件。Agent 在**构建/替换 listener 时**读取；
+  轮换 = 一次配置重载（新 revision）。**重载失败必须保留上一份 applied 配置**
+  —— 复用既有 replace-listener 路径（它已经在失败时保留旧配置），不新建 reload
+  机制、不新建轮换表。
+- **node_credential**：语义不变（轮换后旧的 capability advertisement 依旧失效）。
+- 不引入第三套轮换系统。
+
+#### V5.1a 实施范围（A1/A2/A3）
+
+~~~text
+WP5-A1  TLS stream runtime   protocol=tls：入口 TLS listener + 证书路径校验
+WP5-A2  WS stream runtime    protocol=ws：入口 WS listener + 帧解包
+WP5-A3  protocol diagnostics tls/ws 的协议专属诊断事实（握手失败原因等）
+Gate V5-G1A                  见下
+~~~
+
+三项都必须：复用 stream 契约 / revision-ACK / 端口租约 / drain；不复制 manager；
+Agent 只在**真正编译进二进制**时才广告 `protocols` 里的 `tls`/`ws`
+（`forwarder.ImplementedProtocols()` 与 manifest 同源，WP1/WP2 已建立这条链）。
+
+#### Gate V5-G1A（映射到可执行检查）
+
+~~~text
+TCP regression                  V5-G0 的 G0.1/G0.2 在 V5.1a 分支上重跑
+TLS positive / negative         证书正确 ⇒ 握手成功且流量穿透；证书错误 ⇒ 明确拒绝
+WS positive / negative          正常 upgrade + 帧往返；非 WS 请求 ⇒ 明确拒绝
+malformed handshake             截断/垃圾字节 ⇒ listener 不崩、不泄漏、留诊断事实
+certificate reload              换证书文件 + 新 revision ⇒ 新连接用新证书、live 连接不被强杀
+bad certificate config          路径不存在/私钥与证书不匹配 ⇒ fail closed 且保留上一 applied
+hot reload                      target 热替换（§13.3.4）在 tls/ws 下同样不重建 listener
+drain                           有在途连接时 SIGTERM ⇒ 有界排空
+reconnect / Agent restart       / Panel restart     V4 既有耐久性路径在 tls/ws 下不变
+unsupported old Agent admission 旧 Agent 未广告 tls/ws ⇒ 面板在入队前拒绝
+no secret in logs/support bundle 私钥内容不出现在日志、诊断、Support Bundle
+~~~
+
+#### 待定项（需要产品决策，本轮**不实现、不猜测**）
+
+1. **是否需要「这条转发加不加 TLS」的用户可见维度**（即 `wss` / 任意协议 + TLS）。
+   本契约已把两个维度拆开，缺的只是一个用户字段与它的默认值。
+2. **证书供给方式**：目前定为「运维放文件 + Forward 携带路径」。若产品要求面板
+   托管证书（上传/签发/自动续期），那是一个**新 WP**，并且必须自带密钥存储与
+   轮换设计 —— 不允许顺手塞进 V5.1a。
+
 ### 强制原则
 
 - WS/TLS 属于 stream lifecycle；
