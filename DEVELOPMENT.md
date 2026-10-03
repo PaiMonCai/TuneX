@@ -356,8 +356,8 @@ V5.5 Federation
 | V5-WP1 | DONE（待 Integration Gate 覆盖） | 能力协商 v2：manifest 契约 + 三维 runtime admission |
 | V5-WP2 | DONE（待 Integration Gate 覆盖） | RuntimePlan 补全 + Agent Runtime Factory（StreamRuntime 显式化） |
 | V5-WP3 | DONE | TCP 性能基线（DIRECT / RELAY）+ 锚点产物 + 采集器自检 |
-| V5-WP4 / G0 | **RED：PASS=134 / FAIL=2** | Gate 已实现并在真实拓扑上跑通，见 §5.5 状态 |
-| V5.1+ | **BLOCKED** | §5.5：G0 有 FAIL 就不得进入 V5.1 |
+| V5-WP4 / G0 | **GREEN：PASS=137 / FAIL=0** | 真实四 Agent 拓扑，452s |
+| V5.1+ | **UNBLOCKED** | G0 全绿，按 §6 顺序开始 V5.1a WS/TLS |
 
 ---
 
@@ -973,10 +973,8 @@ large regression alert
 
 ### 状态
 
-**RED**：`PASS=134 / FAIL=2`。Gate 已实现并在真实四 Agent 拓扑上完整跑完
-（evidence: docs/evidence/v5-g0-result-20261003.txt，耗时 462s）。
-
-按 §5.5 的规定：**FAIL > 0 不开始 V5.1，不用 skip 掩盖，不把失败改成 warning。**
+**GREEN：`V5-G0 TOTAL PASS=137 / FAIL=0`**（真实四 Agent 拓扑，耗时 452s，
+evidence: docs/evidence/v5-g0-result-20261003.txt）。V5.1 解锁。
 
 落地位置：
 
@@ -986,47 +984,41 @@ scripts/v3-e2e/v5-g0.py                20 项检查（G0.1–G0.20），复用�
 docs/evidence/v5-g0-result-*.txt       每次运行的原始结果
 ~~~
 
-本次运行**发现并已修复**的三个真实缺陷（这些都是"契约没守住"，不是测试问题）：
+#### Gate 抓到的四个真实缺陷（已全部修复并加守卫）
 
-1. **reconcile / rollout 下发路径完全不传协议**（`runtime-reconcile-sink.ts`、
-   `forward-rollout-exec.ts` 共 7 处 `dispatch*`）。Orchestrator 对缺省协议回落到
-   `tcp`，于是历史 `wss`/`udp` Forward 会被当 TCP 真跑起来。现已全部携带协议，
-   并由 `dispatch-protocol-v5.test.ts` 做源码级守卫（新下发路径漏传即 CI 红）。
-2. **`admitPersistedProtocol` 把"投影忘了选协议列"当成 V4 的"省略协议 ⇒ tcp"**。
-   `reconciler` 的 desired 投影当时确实没选这两列（已补），但真正的修复是让
-   「行里完全没有协议事实」**fail-closed**：省略协议只有在下发**入口**才等于 TCP。
-3. **reapply 不回填 canonical protocol**：一条 V4 行重新编排成功后
-   `forward_protocol` 仍是 NULL，每个读它的人永远回落 legacy 列。
+这四个都是「契约没守住，但没人会立刻发现」的类型——它们是 Gate 存在的唯一理由。
 
-仍然红的 2 项（**同一根因，未解决**）：
+1. **7 处下发调用完全不传协议**（`runtime-reconcile-sink.ts`、`forward-rollout-exec.ts`
+   的 cutover 与回滚重放）。Orchestrator 对缺省协议回落到 `tcp`，于是历史
+   `wss`/`udp` Forward 会被当 TCP 真跑起来。现全部携带协议，并由
+   `dispatch-protocol-v5.test.ts` 做源码级守卫。
+2. **Agent 启动恢复快照把每条期望行写成 `protocol: "tcp"`**
+   （`buildDesiredNodeSnapshot`）。这是唯一一条刻意绕过 orchestrator 的下发面，
+   于是每次 Agent 重启都会把一条 `wss` 历史行**当 TCP 复活**——G0 的 LKG 用例
+   每重启一次 Agent 就复现一次。现在该 builder 逐行解析协议，未开放的协议行被
+   **省略**并记入 `skipped`（不静默）；纯函数 `desiredTunnelConfigFor` 由
+   `desired-snapshot-protocol-v5.test.ts` 逐条钉住。
+3. **`admitPersistedProtocol` 把「投影忘了选协议列」当成 V4 的「省略协议 ⇒ tcp」**。
+   现在「行里完全没有协议事实」**fail-closed**；「省略＝tcp」只保留在下发**入口**
+   （`reconciler` 的 desired 投影确实漏了这两列，已补）。
+4. **reapply 不回填 canonical protocol**：V4 行重新编排成功后 `forward_protocol`
+   仍是 NULL，所有读者永远回落 legacy 列。
 
-~~~text
-FAIL | G0.20 no inactive Forward holds a port lease anywhere [orphans=1]
-FAIL | G0.20 the refused legacy Forward 156 has no runtime on the node
-~~~
+另外把「协议值写成字面量」本身变成了 CI 守卫（`no source file writes a protocol
+value as a literal`）：协议值只能来自契约常量或行本身。
 
-复现：G0.19 造一条 `tunnel_type='wss'`、`forward_protocol=NULL` 的历史行（先用真实
-API 建好并 suspend，使其运行时确实停止），再对它 retry（被正确拒绝）。之后 Agent
-日志每 ~35s 出现一次：
+#### 教训（写给下一个接手的人）
 
-~~~text
-15:34:06 tunnel applied id=tunex-156-direct mode=DIRECT port=21010 revision=2
-15:34:41 tunnel applied id=tunex-156-direct mode=DIRECT port=21010 revision=2
-15:35:16 tunnel applied id=tunex-156-direct mode=DIRECT port=21010 revision=2
-~~~
+**「下发路径」不止 `dispatch*`。** G0 的三次红→绿迭代中，前两次修复都只覆盖了
+`Orchestrator` 的调用点，而真正在线上复活的路径是 **Agent 拉取期望快照**这一条。
+判断某处是不是下发面，问的是「Agent 会不会因为这里而开始听一个端口」，不是
+「这里有没有 `dispatch` 这个词」。
 
-即 worker 的 `cron_reconcile_v3`（30s 周期）里有一条路径仍在按 revision 2 重放这条
-`wss` 行。`cron_reconcile_v3` 的 summary 没有打印（`resent=0 / failed=0`），所以它
-**不是** reconcile sink，而是同一 cron 里先跑的 `resumeRollouts`：
-该行在被 suspend 时留下了一个活跃相位的 rollout，续跑循环反复执行它的 CUTOVER
-步骤。**在此之前不要假设协议门守住了所有下发路径**——这正是 Gate 存在的理由。
+#### 一处刻意**不**修的观察
 
-下一步（V5.1 之前必须完成）：
-
-1. 定位 `resumeRollouts` 对这条行的步骤序列，确认它走的是哪一处 dispatch；
-2. 让 rollout 续跑同样 fail-closed 拒绝未开放协议（并考虑 suspend 是否应终止活跃
-   rollout，而不是把它留给 30s 循环反复重放）；
-3. 修完**重跑完整 G0**（不是只跑失败的那两项）。
+`suspend` 停掉运行时但**保留端口租约**（端口留给 `resume`，§7.12「重试不换端口」）。
+G0 的第一版「所有 inactive Forward 都不得持有租约」断言因此误报——已改成只检查
+真正永远是缺陷的两种形态：悬空租约、以及「inactive 且 error」（被拒绝的配置）。
 
 ### 目标
 

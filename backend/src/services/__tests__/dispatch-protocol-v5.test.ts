@@ -101,6 +101,34 @@ describe("V5-G0 every dispatch path carries the protocol fact", () => {
     expect(missing.map((s) => `${s.file}: ${s.method}`)).toEqual([]);
   });
 
+  /**
+   * Gate V5-G0 抓到的第二处：`buildDesiredNodeSnapshot`（Agent 启动恢复的期望快照）
+   * 把每一条期望行都写成 `protocol: "tcp"`。它不是 `dispatch*` 调用，所以上面那条
+   * 守卫看不见它——而它是**每次 Agent 重启都会走**的下发面。
+   *
+   * 规则：协议值永远来自契约常量或行本身，**不能是字面量**。写成字面量的那一刻，
+   * 协议就变成了"代码里写死的那一个"，而不是"这条转发实际用的那一个"。
+   */
+  test("no source file writes a protocol value as a literal", () => {
+    const offenders: string[] = [];
+    for (const file of sourceFiles(SRC)) {
+      const text = stripComments(readFileSync(file, "utf8"));
+      for (const match of text.matchAll(/protocol\s*:\s*"tcp"/g)) {
+        offenders.push(`${file.replace(`${SRC}/`, "")}:${text.slice(0, match.index).split("\n").length}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  test("the desired-state snapshot resolves the protocol per row", () => {
+    // The specific builder that used to hardcode it must call the shared resolver.
+    const src = readFileSync(join(SRC, "services/agent-command-bus.ts"), "utf8");
+    expect(src.includes("admitPersistedProtocol")).toBe(true);
+    expect(src.includes("desiredTunnelConfigFor")).toBe(true);
+    // `skipped` is what keeps an omitted row observable instead of silent.
+    expect(src.includes("skipped")).toBe(true);
+  });
+
   test("the orchestrator's tcp default stays, as the V4 compatibility path", async () => {
     // The default must NOT be removed to "make this guard pass": an omitted
     // protocol from a V4 client legitimately means TCP. What must never happen is

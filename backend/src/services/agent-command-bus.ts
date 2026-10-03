@@ -10,6 +10,7 @@
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
+import { admitPersistedProtocol } from "./forward-contract.ts";
 import {
   admissionLayerLabel,
   admitAction,
@@ -858,8 +859,144 @@ function firstConnectIp(raw: string | null): string | null {
  * Canonical desired snapshot used by Agent startup restore.
  * Only concrete node bindings are considered; NodeGroup is never re-interpreted
  * as placement.
+ *
+ * V5-WP4/G0: this is the one dispatch-ish path that deliberately bypasses the
+ * orchestrator — the Agent *pulls* its desired state — so the protocol gate has
+ * to run here too. Before, every entry was emitted with `protocol: "tcp"`, and a
+ * historical non-TCP Forward whose row is still `desired_status='active'` was
+ * therefore handed to the Agent as TCP on **every node restart**: the gate found
+ * a `wss` row being re-applied every time an Agent came back, during the LKG
+ * cases, because of exactly this.
+ *
+ * The rule: a row whose protocol fact is not admitted is **omitted** from the
+ * snapshot (a single unrunnable Forward must not stop a node from restoring the
+ * rest of its work) and reported in `skipped` so the omission is observable
+ * instead of silent.
  */
-export async function buildDesiredNodeSnapshot(nodeId: number): Promise<{ version: string; tunnels: AgentTunnelConfig[] }> {
+/** 一行 desired 状态（`buildDesiredNodeSnapshot` 的输入投影）。 */
+export interface DesiredRowProjection {
+  id: number;
+  tunnel_mode: string | null;
+  desired_status: string | null;
+  config_revision: number | null;
+  forward_protocol?: unknown;
+  tunnel_type?: unknown;
+  ingress_node_id: number | null;
+  egress_node_id: number | null;
+  listen_port: number | null;
+  listen_ip: string | null;
+  remote_host: string | null;
+  remote_port: number | null;
+  egress_port: number | null;
+  egress_node?: { connect_ip: string | null } | null;
+  egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
+}
+
+export type DesiredRowOutcome =
+  | { kind: "config"; config: AgentTunnelConfig }
+  | { kind: "skip"; reason: string }
+  | { kind: "not_for_node" };
+
+/**
+ * One desired row → the Agent config for `nodeId` (pure).
+ *
+ * Extracted so the protocol decision is testable without a database: this is the
+ * exact spot where a historical non-TCP Forward used to be silently relabelled
+ * `tcp` on every node restart.
+ */
+export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number): DesiredRowOutcome {
+  const revision = row.config_revision ?? 0;
+  if (revision <= 0) return { kind: "not_for_node" };
+
+  // One row, one protocol: resolved once and used by every leg below, so the
+  // three branches cannot disagree about which protocol this Forward is.
+  const protocol = admitPersistedProtocol({
+    forward_protocol: row.forward_protocol,
+    tunnel_type: row.tunnel_type,
+  });
+  if (protocol === null) return { kind: "skip", reason: "protocol_not_supported" };
+
+  if (row.ingress_node_id === nodeId && row.tunnel_mode === "direct") {
+    if (!row.listen_port || !row.remote_host || !row.remote_port) return { kind: "not_for_node" };
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-direct`,
+        mode: "DIRECT",
+        ingress_port: row.listen_port,
+        egress_port: 0,
+        remote_host: row.remote_host,
+        remote_port: row.remote_port,
+        next_hop: "",
+        targets: [],
+        lb_strategy: "ROUND_ROBIN",
+        protocol,
+        speed_limit: 0,
+        revision,
+        listen_host: row.listen_ip ?? undefined,
+      },
+    };
+  }
+
+  if (row.tunnel_mode === "relay" && row.egress_node_id === nodeId) {
+    if (!row.egress_port) return { kind: "not_for_node" };
+    const strategy =
+      row.egress_pool?.lb_strategy === "rand" ? "RANDOM" :
+      row.egress_pool?.lb_strategy === "weighted_round" ? "WEIGHTED_ROUND_ROBIN" :
+      "ROUND_ROBIN";
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-egress`,
+        mode: "EGRESS",
+        ingress_port: 0,
+        egress_port: row.egress_port,
+        remote_host: "",
+        remote_port: 0,
+        next_hop: "",
+        targets: (row.egress_pool?.targets ?? []).map((x) => ({
+          host: x.host,
+          port: x.port,
+          weight: x.weight,
+          order: Math.trunc(x.order_by),
+        })),
+        lb_strategy: strategy,
+        protocol,
+        speed_limit: 0,
+        revision,
+      },
+    };
+  }
+
+  if (row.tunnel_mode === "relay" && row.ingress_node_id === nodeId) {
+    const host = firstConnectIp(row.egress_node?.connect_ip ?? null);
+    if (!row.listen_port || !row.egress_port || !host) return { kind: "not_for_node" };
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-relay`,
+        mode: "RELAY",
+        ingress_port: row.listen_port,
+        egress_port: 0,
+        remote_host: host,
+        remote_port: row.egress_port,
+        next_hop: hostPort(host, row.egress_port),
+        targets: [],
+        lb_strategy: "ROUND_ROBIN",
+        protocol,
+        speed_limit: 0,
+        revision,
+        listen_host: row.listen_ip ?? undefined,
+      },
+    };
+  }
+
+  return { kind: "not_for_node" };
+}
+
+export async function buildDesiredNodeSnapshot(
+  nodeId: number,
+): Promise<{ version: string; tunnels: AgentTunnelConfig[]; skipped: Array<{ id: number; reason: string }> }> {
   const rows = await db.tunnel.findMany({
     where: {
       desired_status: "active",
@@ -880,75 +1017,14 @@ export async function buildDesiredNodeSnapshot(nodeId: number): Promise<{ versio
   });
 
   const tunnels: AgentTunnelConfig[] = [];
-  for (const t of rows) {
-    const revision = t.config_revision ?? 0;
-    if (revision <= 0) continue;
-
-    if (t.ingress_node_id === nodeId && t.tunnel_mode === "direct") {
-      if (!t.listen_port || !t.remote_host || !t.remote_port) continue;
-      tunnels.push({
-        id: `tunex-${t.id}-direct`,
-        mode: "DIRECT",
-        ingress_port: t.listen_port,
-        egress_port: 0,
-        remote_host: t.remote_host,
-        remote_port: t.remote_port,
-        next_hop: "",
-        targets: [],
-        lb_strategy: "ROUND_ROBIN",
-        protocol: "tcp",
-        speed_limit: 0,
-        revision,
-        listen_host: t.listen_ip ?? undefined,
-      });
-    }
-
-    if (t.tunnel_mode === "relay" && t.egress_node_id === nodeId) {
-      if (!t.egress_port) continue;
-      const strategy =
-        t.egress_pool?.lb_strategy === "rand" ? "RANDOM" :
-        t.egress_pool?.lb_strategy === "weighted_round" ? "WEIGHTED_ROUND_ROBIN" :
-        "ROUND_ROBIN";
-      tunnels.push({
-        id: `tunex-${t.id}-egress`,
-        mode: "EGRESS",
-        ingress_port: 0,
-        egress_port: t.egress_port,
-        remote_host: "",
-        remote_port: 0,
-        next_hop: "",
-        targets: (t.egress_pool?.targets ?? []).map((x) => ({
-          host: x.host,
-          port: x.port,
-          weight: x.weight,
-          order: Math.trunc(x.order_by),
-        })),
-        lb_strategy: strategy,
-        protocol: "tcp",
-        speed_limit: 0,
-        revision,
-      });
-    }
-
-    if (t.tunnel_mode === "relay" && t.ingress_node_id === nodeId) {
-      const host = firstConnectIp(t.egress_node?.connect_ip ?? null);
-      if (!t.listen_port || !t.egress_port || !host) continue;
-      tunnels.push({
-        id: `tunex-${t.id}-relay`,
-        mode: "RELAY",
-        ingress_port: t.listen_port,
-        egress_port: 0,
-        remote_host: host,
-        remote_port: t.egress_port,
-        next_hop: hostPort(host, t.egress_port),
-        targets: [],
-        lb_strategy: "ROUND_ROBIN",
-        protocol: "tcp",
-        speed_limit: 0,
-        revision,
-        listen_host: t.listen_ip ?? undefined,
-      });
+  const skipped: Array<{ id: number; reason: string }> = [];
+  for (const t of rows as unknown as DesiredRowProjection[]) {
+    const outcome = desiredTunnelConfigFor(t, nodeId);
+    if (outcome.kind === "skip") {
+      skipped.push({ id: t.id, reason: outcome.reason });
+    } else if (outcome.kind === "config") {
+      tunnels.push(outcome.config);
     }
   }
-  return { version: "tunex-v3", tunnels };
+  return { version: "tunex-v3", tunnels, skipped };
 }

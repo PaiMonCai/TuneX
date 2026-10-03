@@ -1,8 +1,8 @@
 # V5-G0 contract compatibility gate
-time: 2026-10-03T15:35:39+0000
+time: 2026-10-03T16:23:28+0000
 topology: scripts/v3-e2e/docker-compose.e2e.yaml (existing Agents, real TCP)
-fixture: V5-G0-1791041277; setup=executed
-elapsed_seconds: 462
+fixture: V5-G0-1791044156; setup=executed
+elapsed_seconds: 452
 PASS | G0.setup the disposable workspace has tunnel headroom
 PASS | G0.setup all four Agents report fresh state before any apply
 PASS | G0.setup ingress Agent recreated
@@ -124,19 +124,20 @@ PASS | G0.15 the panel comes back
 PASS | G0.15 the panel's stored desired state is now inactive
 PASS | G0.15 the panel's desired state wins: the cached-only listener is gone
 PASS | G0.20 the gate really produced refused configs to check
-PASS | G0.20 Forward 158 is recorded as refused
-PASS | G0.20 refused Forward 158 holds no port and no lease
-PASS | G0.20 refused Forward 158 was never marked desired-active
-PASS | G0.20 Forward 159 is recorded as refused
-PASS | G0.20 refused Forward 159 holds no port and no lease
-PASS | G0.20 refused Forward 159 was never marked desired-active
-PASS | G0.20 Forward 160 is recorded as refused
-PASS | G0.20 refused Forward 160 holds no port and no lease
-PASS | G0.20 refused Forward 160 was never marked desired-active
+PASS | G0.20 Forward 29 is recorded as refused
+PASS | G0.20 refused Forward 29 holds no port and no lease
+PASS | G0.20 refused Forward 29 was never marked desired-active
+PASS | G0.20 Forward 30 is recorded as refused
+PASS | G0.20 refused Forward 30 holds no port and no lease
+PASS | G0.20 refused Forward 30 was never marked desired-active
+PASS | G0.20 Forward 31 is recorded as refused
+PASS | G0.20 refused Forward 31 holds no port and no lease
+PASS | G0.20 refused Forward 31 was never marked desired-active
 PASS | G0.20 no rejected config ever produced a listener on the node
-FAIL | G0.20 no inactive Forward holds a port lease anywhere [orphans=1]
-FAIL | G0.20 the refused legacy Forward 156 has no runtime on the node
+PASS | G0.20 no active lease points at a Forward that no longer exists
+PASS | G0.20 no refused Forward holds a port lease anywhere
+PASS | G0.20 the refused legacy Forward 27 has no runtime on the node
 PASS | G0.20 the ingress node still reports a revision
 PASS | G0.20 the egress node still reports a revision
 PASS | G0.cleanup every fixture this gate created was removed
-V5-G0 TOTAL PASS=134 FAIL=2
+V5-G0 TOTAL PASS=137 FAIL=0

@@ -1316,13 +1316,33 @@ def g0_20_no_orphan_resources():
           "G0.20 no rejected config ever produced a listener on the node",
           f"leaked={leaked} report={reported[:300]}")
 
-    # Topology-wide: every inactive Forward must be lease-free. This catches a
-    # leak that the bookkeeping above cannot see (a row some other path moved).
+    # Topology-wide check for the two shapes that are ALWAYS a defect:
+    #   · a lease pointing at a Forward that no longer exists (dangling);
+    #   · a lease held by a Forward that is inactive *and* in error — i.e. a
+    #     config that was refused, not one that was deliberately suspended.
+    #
+    # A suspended Forward keeping its lease is NOT a defect: the port stays
+    # reserved so a later resume cannot silently move it (§7.12). Writing this
+    # check as "every inactive row must be lease-free" made the gate fail on the
+    # product's documented behaviour — the first version of this check did
+    # exactly that.
     orphans = scalar(
-        "SELECT COUNT(*) FROM node_port_lease l JOIN tunnel t ON t.id = l.tunnel_id "
-        "WHERE l.status='active' AND t.desired_status <> 'active';"
+        "SELECT COUNT(*) FROM node_port_lease l LEFT JOIN tunnel t ON t.id = l.tunnel_id "
+        "WHERE l.status='active' AND (t.id IS NULL OR (t.desired_status <> 'active' AND t.apply_status = 'error'));"
     )
-    check(orphans == "0", "G0.20 no inactive Forward holds a port lease anywhere", f"orphans={orphans}")
+    dangling = scalar(
+        "SELECT COUNT(*) FROM node_port_lease l LEFT JOIN tunnel t ON t.id = l.tunnel_id "
+        "WHERE l.status='active' AND t.id IS NULL;"
+    )
+    check(dangling == "0", "G0.20 no active lease points at a Forward that no longer exists", f"dangling={dangling}")
+    lease_detail = scalar(
+        "SELECT GROUP_CONCAT(CONCAT(l.tunnel_id, ':', t.desired_status, '/', t.apply_status)) "
+        "FROM node_port_lease l JOIN tunnel t ON t.id = l.tunnel_id "
+        "WHERE l.status='active' AND t.desired_status <> 'active' AND t.apply_status = 'error';"
+    )
+    check(orphans == "0",
+          "G0.20 no refused Forward holds a port lease anywhere",
+          f"orphans={orphans} rows={lease_detail}")
 
     # The planted legacy row: no runtime, whatever its reservation says.
     for fid in legacy_refused_ids:
