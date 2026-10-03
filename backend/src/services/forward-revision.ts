@@ -43,8 +43,8 @@ export type ForwardDesiredStatus = "active" | "inactive";
 export interface ForwardCandidateConfig {
   name: string;
   mode: ForwardMode;
-  /** V5-WP0 canonical protocol; omitted fixtures normalize to the V4 TCP baseline. */
-  protocol?: ForwardProtocol;
+  /** Persisted protocol fact; validation separately decides whether it is admitted. */
+  protocol?: string;
   ingress_node_id: number;
   /** direct 必须 null；relay 必填。 */
   egress_node_id: number | null;
@@ -257,7 +257,7 @@ export function mergeForwardCandidate(
 export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: ForwardCandidateConfig): boolean {
   return (
     base.mode === candidate.mode &&
-    normalizeForwardProtocol(base.protocol) === normalizeForwardProtocol(candidate.protocol) &&
+    persistedForwardProtocol(base.protocol) === persistedForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
     base.egress_node_id === candidate.egress_node_id &&
     base.listen_port === candidate.listen_port &&

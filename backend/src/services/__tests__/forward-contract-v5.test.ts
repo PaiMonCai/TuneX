@@ -13,6 +13,7 @@ import {
   legacyTunnelTypeForForwardProtocol,
   normalizeForwardProtocol,
   persistedForwardProtocol,
+  protocolFactName,
 } from "../forward-contract.ts";
 
 describe("V5-WP0 Forward protocol contract", () => {
@@ -42,16 +43,17 @@ describe("V5-WP0 Forward protocol contract", () => {
     }
   });
 
-  test("legacy non-TCP rows are never reinterpreted as TCP", () => {
-    expect(() => persistedForwardProtocol(null, "wss")).toThrow(
-      "unsupported legacy Forward protocol",
-    );
-    expect(persistedForwardProtocol(null, "tcp")).toBe("tcp");
+  test("historical protocol facts are preserved without being admitted", () => {
+    expect(persistedForwardProtocol(null, "WSS")).toBe("wss");
+    expect(persistedForwardProtocol(" TLS ", "tcp")).toBe("tls");
+    expect(protocolFactName(" QUIC ")).toBe("quic");
+    expect(normalizeForwardProtocol("wss")).toBeNull();
+    expect(normalizeForwardProtocol("quic")).toBeNull();
   });
 
-  test("explicit unknown persisted values fail closed", () => {
-    expect(() => persistedForwardProtocol("carrier-pigeon")).toThrow(
-      "unsupported persisted Forward protocol",
+  test("malformed persisted values still fail closed", () => {
+    expect(() => persistedForwardProtocol({ bad: true })).toThrow(
+      "invalid persisted Forward protocol",
     );
   });
 

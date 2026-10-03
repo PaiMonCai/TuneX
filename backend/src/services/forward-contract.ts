@@ -38,52 +38,58 @@ export function isForwardMode(value: unknown): value is ForwardMode {
 }
 
 /**
- * Missing protocol means the V4-compatible TCP default. Any explicit unknown
- * value is rejected instead of falling through to a legacy TunnelType.
+ * Canonicalise a persisted protocol fact without deciding whether the current
+ * runtime admits it. This preserves historical legacy facts (wss/tls/udp/...)
+ * instead of silently relabelling them as TCP.
+ */
+export function protocolFactName(value: unknown): string {
+  if (value === undefined || value === null || value === "") {
+    return DEFAULT_FORWARD_PROTOCOL;
+  }
+  if (typeof value !== "string") {
+    throw new Error("invalid persisted Forward protocol: " + String(value));
+  }
+  const name = value.trim().toLowerCase();
+  if (name === "") return DEFAULT_FORWARD_PROTOCOL;
+  if (name.length > 16) {
+    throw new Error("invalid persisted Forward protocol: " + name);
+  }
+  return name;
+}
+
+/**
+ * Admission parser. Missing stays V4-compatible TCP; an explicit historical or
+ * future protocol is rejected until it is added to FORWARD_PROTOCOLS and has
+ * its independent Gate.
  */
 export function normalizeForwardProtocol(
   value: unknown,
 ): ForwardProtocol | null {
-  if (value === undefined || value === null || value === "") {
-    return DEFAULT_FORWARD_PROTOCOL;
+  let name: string;
+  try {
+    name = protocolFactName(value);
+  } catch {
+    return null;
   }
-  if (
-    typeof value === "string" &&
-    (FORWARD_PROTOCOLS as readonly string[]).includes(value)
-  ) {
-    return value as ForwardProtocol;
+  if ((FORWARD_PROTOCOLS as readonly string[]).includes(name)) {
+    return name as ForwardProtocol;
   }
   return null;
 }
 
 /**
- * Read a persisted canonical value. NULL is tolerated only as the
- * expand-and-contract compatibility state and means the V4 TCP baseline.
- * A non-null unknown value is corruption and fails closed.
+ * Read the persisted protocol fact. forward_protocol wins; old rows fall back
+ * to legacy tunnel_type so migrations never erase what protocol they actually
+ * represented. Whether that fact is executable is checked separately.
  */
 export function persistedForwardProtocol(
   value: unknown,
   legacyTunnelType?: unknown,
-): ForwardProtocol {
-  if (value === undefined || value === null || value === "") {
-    if (
-      legacyTunnelType !== undefined &&
-      legacyTunnelType !== null &&
-      legacyTunnelType !== "" &&
-      String(legacyTunnelType).toLowerCase() !== DEFAULT_FORWARD_PROTOCOL
-    ) {
-      throw new Error(
-        "unsupported legacy Forward protocol without canonical value: " +
-          String(legacyTunnelType),
-      );
-    }
-    return DEFAULT_FORWARD_PROTOCOL;
+): string {
+  if (value !== undefined && value !== null && value !== "") {
+    return protocolFactName(value);
   }
-  const parsed = normalizeForwardProtocol(value);
-  if (parsed === null) {
-    throw new Error("unsupported persisted Forward protocol: " + String(value));
-  }
-  return parsed;
+  return protocolFactName(legacyTunnelType);
 }
 
 export function legacyTunnelTypeForForwardProtocol(

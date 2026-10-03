@@ -231,11 +231,13 @@ export function forwardView(t: any) {
         ? { host: t.remote_host, port: t.remote_port, weight: 1 }
         : null;
 
+  const protocol = persistedForwardProtocol(t.forward_protocol, t.tunnel_type);
   return {
     id: t.id,
     creator_user_id: t.user_id ?? null,
     name: t.name,
-    protocol: persistedForwardProtocol(t.forward_protocol, t.tunnel_type),
+    protocol,
+    protocol_supported: normalizeForwardProtocol(protocol) !== null,
     mode: (t.tunnel_mode ?? "direct") as ForwardMode,
     ingress_node_id: t.ingress_node_id,
     ingress_node: t.ingress_node ?? null,
