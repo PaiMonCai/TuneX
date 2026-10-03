@@ -24,7 +24,8 @@
 #   1. 记录当前状态（git rev + 镜像 digest + compose config 指纹）→ 用于再次回滚
 #   2. 备份现状（默认要求，除非 --no-backup-backup）
 #   3. 拉取目标镜像（本地不存在时）
-#   4. 更新 .env 的 TUNEX_IMAGE（同一 digest 同时驱动 backend/worker/web）
+#   4. 更新环境文件的 TUNEX_IMAGE（同一 digest 驱动全部应用服务；文件位置可用
+#      TUNEX_ENV_FILE 覆盖，默认 $PROJECT_ROOT/.env）
 #   5. compose up -d 切换（DB/Redis/Caddy 不动，滚动替换 backend/worker/web）
 #   6. 健康等待：Backend loopback /healthz 200 + 三个服务 running，超时即失败
 #   7. 失败 → 自动回退到步骤 1 记录的状态（幂等）
@@ -87,6 +88,18 @@ COMPOSE_BASE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE")
 [[ -n "$COMPOSE_ENV_FILE" ]] && COMPOSE_BASE+=(--env-file "$COMPOSE_ENV_FILE")
 COMPOSE=("${COMPOSE_BASE[@]}")
 
+# The application service names in the compose project. Configurable for the same
+# reason restore.sh's writer list is: a stack that names them differently (e.g. the
+# e2e topology's "panel") would otherwise be silently left untouched.
+APP_SERVICES="${TUNEX_APP_SERVICES:-backend worker web}"
+
+# Prerequisites. rollback parses targets and writes JSON history with jq, so it is
+# a hard requirement — say so instead of dying with "command not found" later.
+for tool in jq docker openssl; do
+  command -v "$tool" >/dev/null 2>&1 || die "缺少必需工具: $tool（回滚需要它解析目标与写历史）" 2
+done
+docker compose version >/dev/null 2>&1 || die "docker compose v2 不可用" 2
+
 # svc_running <service> —— 便携式"服务是否 running"检查。
 # 不同 compose 版本对 `ps --status` 支持不一（v2.28 无该 flag），
 # 因此统一解析 `ps --format '{{.Service}} {{.State}}'` 的第二列。
@@ -145,10 +158,17 @@ resolve_image() {  # $1 = target → prints unified TuneX image ref
     ghcr.io/*|*@sha256:*|*/*:*)
       echo "$t" ;;
     *)
+      # A locally built image (`name:tag`, no registry prefix) is a legitimate
+      # rollback target when it actually exists here — a rehearsal or an air-gapped
+      # deployment needs that path, and the registry-shaped patterns above reject it.
+      if [[ "$t" == *:* && "$t" != */* ]] && docker image inspect "$t" >/dev/null 2>&1; then
+        echo "$t"
+        return 0
+      fi
       # 部署记录 id / digest 短形式
       local found
       found="$(grep -F "$t" "$HISTORY" 2>/dev/null | tail -1 | jq -r '.image // .backend_image // empty')"
-      [[ -n "$found" ]] && echo "$found" || die "无法解析目标: $t" 2
+      [[ -n "$found" ]] && echo "$found" || die "无法解析目标: $t（既不是可用的镜像引用，也不在部署历史里）" 2
       ;;
   esac
 }
@@ -187,14 +207,17 @@ if [[ $DO_BACKUP -eq 1 ]]; then
   # 是无效的：`VAR=val cmd` 形式只在 cmd 的环境里生效，而这里 `${BACKUP_PASSPHRASE:+}`
   # 展开为空串却让 shellcheck 误判为「参数」；更关键的是若父环境没有该变量，
   # backup.sh 会走到交互式 read，而在非 tty 的日志重定向下直接挂住/失败。
-  if [[ -z "${BACKUP_PASSPHRASE:-}" ]]; then
+  # The passphrase is only needed when the backup is actually encrypted: with
+  # ENCRYPT=0 (a documented test/air-gapped mode) demanding one makes a rollback
+  # impossible for a reason that does not exist.
+  if [[ "${ENCRYPT:-1}" == "1" && -z "${BACKUP_PASSPHRASE:-}" ]]; then
     if [[ -t 0 ]]; then
       read -r -s -p "备份加密口令（回滚前备份需要，输入不可见）: " BACKUP_PASSPHRASE; echo
     else
       die "回滚前备份需要 BACKUP_PASSPHRASE（cron/管道环境无法交互输入）。设置后重试，或确认已有备份后加 --no-backup。" 2
     fi
   fi
-  export BACKUP_PASSPHRASE
+  export BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
   if ! "$SCRIPT_DIR/backup.sh" > "$OPS_DIR/pre-rollback-backup.log" 2>&1; then
     tail -5 "$OPS_DIR/pre-rollback-backup.log" >&2
     die "回滚前备份失败 —— 已终止（不留无保护的回滚窗口）" 1
@@ -207,7 +230,7 @@ fi
 # --- 3. 确认 -----------------------------------------------------------------
 if [[ $ASSUME_YES -ne 1 ]]; then
   echo
-  log "即将执行回滚：backend/worker/web → $TUNEX_IMG；mysql/redis/caddy 不动."
+  log "即将执行回滚：$APP_SERVICES → $TUNEX_IMG；mysql/redis/caddy 不动."
   [[ $DO_DATA -eq 1 ]] && log "⚠️  --data：随后还会从最新备份恢复数据（覆盖现有数据）"
   read -r -p "输入 ROLLBACK 确认执行: " ans
   [[ "$ans" == "ROLLBACK" ]] || die "已取消" 2
@@ -219,8 +242,8 @@ CUR_STATE="$(current_state)"
 echo "$CUR_STATE" >> "$HISTORY"
 log "  当前状态已记录（用于失败回退）: $(jq -r '.digest' <<<"$CUR_STATE")"
 
-ENV_FILE="$PROJECT_ROOT/.env"
-[[ -f "$ENV_FILE" ]] || die ".env 不存在 —— 无法确定部署配置" 2
+ENV_FILE="${TUNEX_ENV_FILE:-$PROJECT_ROOT/.env}"
+[[ -f "$ENV_FILE" ]] || die "环境文件不存在（$ENV_FILE）—— 无法确定部署配置；可用 TUNEX_ENV_FILE 指定" 2
 cp "$ENV_FILE" "$OPS_DIR/.env.before-rollback"
 # 替换/追加统一镜像变量
 if grep -q '^TUNEX_IMAGE=' "$ENV_FILE"; then
@@ -235,7 +258,8 @@ diff -u "$OPS_DIR/.env.before-rollback" "$ENV_FILE" | sed 's/^/    /' || true
 
 # --- 5. 执行切换 -------------------------------------------------------------
 log "[4/6] 切换服务（mysql/redis 不受影响）"
-if ! "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1; then
+# shellcheck disable=SC2086  # 有意分词：这是一个服务名列表
+if ! "${COMPOSE[@]}" up -d $APP_SERVICES >> "$OPS_DIR/rollback-up.log" 2>&1; then
   warn "compose up 失败，自动回退 env 并重启"
   cp "$OPS_DIR/.env.before-rollback" "$ENV_FILE"
   "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
@@ -257,7 +281,7 @@ while [[ $(date +%s) -lt $deadline ]]; do
     "$ROLLBACK_READY_URL" 2>/dev/null || echo 000)"
   # 三个服务 running
   running=1
-  for s in backend worker web; do
+  for s in $APP_SERVICES; do
     svc_running "$s" || running=0
   done
   if [[ "$code" == "200" && "$ready" == "200" && "$running" -eq 1 ]]; then ok=1; break; fi
@@ -270,7 +294,7 @@ if [[ $ok -ne 1 ]]; then
   "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
   die "回滚未通过健康检查，已自动回退到上一版本。请人工介入：docker compose ps + logs" 1
 fi
-log "  healthz=200, readyz=200, backend/worker/web 全部 running ✅"
+log "  healthz=200, readyz=200, $APP_SERVICES 全部 running ✅"
 
 # --- 6.5 迁移兼容性自检 ------------------------------------------------------
 # Rolling the Panel image back to an older build while the database already
@@ -279,7 +303,11 @@ log "  healthz=200, readyz=200, backend/worker/web 全部 running ✅"
 # reports unapplied migrations, so a mismatch is surfaced instead of assumed away.
 log "[5.5/6] 迁移兼容性（旧镜像 vs 当前 schema）"
 MIG_OUT="$OPS_DIR/rollback-migrate-status.log"
-if "${COMPOSE[@]}" exec -T backend bunx prisma migrate status >"$MIG_OUT" 2>&1; then
+# The service that can run prisma is a deployment property (production calls it
+# "backend"; the e2e stack calls it "panel"). Hardcoding it made this SAFETY check
+# silently degrade to a warning on any stack that names it differently.
+MIGRATE_SERVICE="${TUNEX_MIGRATE_SERVICE:-backend}"
+if "${COMPOSE[@]}" exec -T "$MIGRATE_SERVICE" bunx prisma migrate status >"$MIG_OUT" 2>&1; then
   log "  prisma migrate status OK"
 elif grep -qi "pending" "$MIG_OUT"; then
   warn "  ⚠️ 存在尚未应用的迁移 —— 该镜像可能带新 schema；详见 $MIG_OUT"

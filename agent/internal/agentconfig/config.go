@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -129,7 +130,9 @@ func Parse(args []string, version string) (*Config, error) {
 	if file == "" {
 		file = cfg.ConfigFile
 	}
-	applyDefaults(cfg, file)
+	if err := applyDefaults(cfg, file); err != nil {
+		return nil, err
+	}
 
 	fs.StringVar(&cfg.ConfigFile, "config", cfg.ConfigFile, "Config file")
 	fs.StringVar(&cfg.ConfigFile, "c", cfg.ConfigFile, "Config file (shorthand)")
@@ -212,7 +215,7 @@ func preScan(args []string) map[string]string {
 }
 
 // applyDefaults loads the config file (if present) and environment into cfg.
-func applyDefaults(cfg *Config, file string) {
+func applyDefaults(cfg *Config, file string) error {
 	if file != "" {
 		if f, err := os.Open(file); err == nil {
 			data, _ := io.ReadAll(f)
@@ -226,13 +229,22 @@ func applyDefaults(cfg *Config, file string) {
 			*dst = v
 		}
 	}
-	envInt := func(key string, dst *int) {
-		if v := os.Getenv("TUNEX_" + key); v != "" {
-			var n int
-			if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
-				*dst = n
-			}
+	// envInt assigns on a SUCCESSFUL parse. The previous condition was inverted
+	// (`if err != nil`), so a valid value was ignored — the installer writes
+	// TUNEX_AGENT_ADMIN_PORT=0 and the agent silently kept the default 9090 — while
+	// a malformed value silently became 0. Both directions are wrong for a knob an
+	// operator sets through the env file, which is the documented install path.
+	envInt := func(key string, dst *int) error {
+		v, ok := os.LookupEnv("TUNEX_" + key)
+		if !ok || strings.TrimSpace(v) == "" {
+			return nil
 		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return fmt.Errorf("TUNEX_%s=%q 不是整数", key, v)
+		}
+		*dst = n
+		return nil
 	}
 	envStr("AGENT_ID", &cfg.AgentID)
 	envStr("NODE_ID", &cfg.NodeID)
@@ -248,7 +260,13 @@ func applyDefaults(cfg *Config, file string) {
 	if v, ok := os.LookupEnv("TUNEX_STATE_DIR"); ok {
 		cfg.StateDir = strings.TrimSpace(v)
 	}
-	envInt("AGENT_ADMIN_PORT", &cfg.AgentAdminPort)
+	// Propagated, not swallowed: ignoring it would leave the agent running with the
+	// DEFAULT port while the operator believes their value applied — the exact
+	// silent-ignore this fix is about.
+	if err := envInt("AGENT_ADMIN_PORT", &cfg.AgentAdminPort); err != nil {
+		return err
+	}
+	return nil
 }
 
 func printUsage(w io.Writer, version string) {

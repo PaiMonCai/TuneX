@@ -200,3 +200,58 @@ func TestUsageHasNoLegacyFlags(t *testing.T) {
 		}
 	}
 }
+
+// The env-file path is the documented install path, so its integer knobs must
+// actually take effect. The previous parser assigned only on a parse ERROR, which
+// silently ignored every valid value (and turned a typo into 0).
+func TestEnvIntKnobsAreApplied(t *testing.T) {
+	t.Run("a valid value is applied", func(t *testing.T) {
+		t.Setenv("TUNEX_AGENT_ADMIN_PORT", "0")
+		cfg, err := Parse([]string{}, "test")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.AgentAdminPort != 0 {
+			t.Fatalf("TUNEX_AGENT_ADMIN_PORT=0 must disable the admin plane, got %d", cfg.AgentAdminPort)
+		}
+	})
+
+	t.Run("a non-zero value is applied", func(t *testing.T) {
+		t.Setenv("TUNEX_AGENT_ADMIN_PORT", "9191")
+		cfg, err := Parse([]string{}, "test")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.AgentAdminPort != 9191 {
+			t.Fatalf("expected 9191, got %d", cfg.AgentAdminPort)
+		}
+	})
+
+	t.Run("an invalid value is loud, not silently 0", func(t *testing.T) {
+		t.Setenv("TUNEX_AGENT_ADMIN_PORT", "not-a-port")
+		if _, err := Parse([]string{}, "test"); err == nil {
+			t.Fatal("a malformed integer knob must fail the parse instead of defaulting silently")
+		}
+	})
+
+	t.Run("an unset value keeps the default", func(t *testing.T) {
+		cfg, err := Parse([]string{}, "test")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.AgentAdminPort != DefaultAgentAdminPort {
+			t.Fatalf("expected the default %d, got %d", DefaultAgentAdminPort, cfg.AgentAdminPort)
+		}
+	})
+
+	t.Run("a flag still wins over the env file", func(t *testing.T) {
+		t.Setenv("TUNEX_AGENT_ADMIN_PORT", "9191")
+		cfg, err := Parse([]string{"--agent-admin-port", "9292"}, "test")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.AgentAdminPort != 9292 {
+			t.Fatalf("expected the flag value 9292, got %d", cfg.AgentAdminPort)
+		}
+	})
+}

@@ -11,7 +11,7 @@ x-target-common: &target-common
 
 services:
   panel:
-    image: ${TUNEX_BACKEND_IMAGE:?required}
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
     container_name: wp14-panel
     restart: unless-stopped
     environment:
@@ -50,7 +50,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${TUNEX_BACKEND_IMAGE:?required}
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
     container_name: wp14-worker
     restart: unless-stopped
     environment:
@@ -106,7 +106,7 @@ services:
         ipv4_address: 172.31.0.12
 
   db-migrate:
-    image: ${TUNEX_BACKEND_IMAGE:?required}
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
     container_name: wp14-db-migrate
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
