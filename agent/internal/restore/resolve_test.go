@@ -425,6 +425,26 @@ func TestConcurrentCacheWritesStayValid(t *testing.T) {
 			}
 		}(i)
 	}
+	// Wait for the first successful write before reading.
+	//
+	// The reader loop below is fast enough to finish before any writer completes
+	// its FIRST Save (the writers only notice `stop` between iterations). When
+	// that happened, the final Load legitimately answered "cache is empty" and the
+	// test failed — a flake with nothing to do with concurrent renames, in the one
+	// suite whose evidence the durability gates lean on.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := cache.Load("agent-1"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(stop)
+			wg.Wait()
+			t.Fatal("no writer produced a cache file within 5s")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
 	// Readers run at the same time: a torn file would be visible to the node's
 	// own restart path, not just to this test.
 	for i := 0; i < 200; i++ {
