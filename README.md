@@ -6,9 +6,23 @@
 [![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
 > [!NOTE]
-> **项目开发已于 2026-09-28 暂时暂停。**
-> 当前代码保留为可继续开发的快照；V4 已完成 F1～F3，下一步原计划是
-> **V4-WP10 Authorization + NodeGroup Model**。在 F4/F5 完成前，不把当前版本标记为 V4.5 Stable。
+> **2026-10-02：Gate V4-F4 与 V4-F5 已在真实四 Agent 拓扑上通过。**
+>
+> ```text
+> v3 verify 51/0 · F1 rollout 30/0 · F1 REST 67/0 · F1 S10 58/0 · F1 topology 32/0
+> F2 37/0 · F3 21/0 · F4 58/0 · F5 133/0
+> ```
+>
+> 本轮补齐：WP11B 升级闭环（真实拓扑验证：排空期间拒新连接、重建后 agent_id 不变、
+> 既有 Forward 再收敛、回退锚点可用）与 WP11A 关机顺序/缓存并发收口。
+>
+> 补齐范围：WP10 权限模型（F4）、WP11A 耐久性/关机、WP11B 能力协商与升级闭环、
+> WP11C Forward/Node 诊断与 Support Bundle、WP11D 运维脚本与发布文档，以及前端入口
+> （诊断面板 / 支持包下载 / 升级命令生成）。逐条状态与已知边界见
+> [V4 发布说明](<docs/release-notes-v4.md>) 与 [DEVELOPMENT](<DEVELOPMENT.md>)。
+>
+> 仍**不标记为 V4.5 Stable**，因为稳定版需要一个正式发布窗口（版本号、镜像标签、
+> 升级演练记录），而不是只靠 Gate 通过；上表是本轮可验证的全部结论。
 
 ## 当前状态
 
@@ -20,17 +34,30 @@ TuneX 已具备：
 - Node lifecycle、health、telemetry、maintenance / disabled / retiring；
 - 服务端分页、筛选、批量操作、Binding usage、Dashboard attention；
 - outbound-only Agent 控制链；
+- 工作空间 RBAC：固定四角色 + 自定义角色，资源级判定与逐项批量鉴权；
+- Agent 耐久性：面板中断时从本地已知良好配置恢复，面板恢复后按权威期望状态对账；
+- 有界优雅关机（关闭监听 → 排空 → 强制收敛 → 最终上报）；
+- 控制协议协商：Agent 上报协议版本与真实实现的能力清单，面板在下发前拒绝节点未实现的动作；
 - MySQL / Redis / Worker / Web / Go Agent；
 - CI、真实多 Agent Integration Gate 与统一 Docker 镜像验证。
 
 V4 当前 Gate：
 
 ```text
-F1 Forward Edit / Hot Reload        ✅
-F2 Managed Node Lifecycle           ✅
-F3 Monitoring / Scale / UX          ✅
-F4 Authorization / NodeGroup        ⏸️ paused
-F5 Stable / Ops / Diagnostics       ⏸️ paused
+F1 Forward Edit / Hot Reload        ✅ 已关闭
+F2 Managed Node Lifecycle           ✅ 已关闭
+F3 Monitoring / Scale / UX          ✅ 已关闭
+F4 Authorization / NodeGroup        ✅ 已关闭（真实拓扑 PASS=58 / FAIL=0）
+F5 Durability / Ops / Capability    ✅ 已关闭（真实拓扑 PASS=68 / FAIL=0）
+   └ 未含 WP11B 升级闭环与 WP11C 诊断/Bundle（见下）
+```
+
+Gate 命令（需要 Docker 与真实多 Agent 拓扑）：
+
+```bash
+bash scripts/v3-e2e/setup.sh
+python3 scripts/v3-e2e/v4-gate-f4.py
+python3 scripts/v3-e2e/v4-gate-f5.py
 ```
 
 高级协议、HA/failover、multi-hop、Panel federation 等已经移入 **V5 Roadmap**，不再扩大 V4 范围。
@@ -95,4 +122,7 @@ go build ./...
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署。
 - [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构约束与迁移背景。
 
-开发恢复时，从 **V4-WP10 → Gate F4 → V4-WP11 → Gate F5 / V4.5 Stable** 继续。
+**当前进度：V4-WP10（Gate F4）与 V4-WP11（Gate F5）均已实现并关闭** —— Gate F4 = 58/0、
+Gate F5 = 133/0（真实四节点拓扑，含升级闭环、Forward/Node 诊断、Support Bundle、
+优雅关机、能力协商、运维脚本与真实备份/恢复演练）。逐项状态与已知边界见
+[V4 发布说明](<docs/release-notes-v4.md>)。

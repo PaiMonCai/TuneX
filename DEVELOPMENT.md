@@ -1612,9 +1612,286 @@ V4-WP9  Scale & Interaction Polish            ✅ main
 Gate F2 Managed Node Lifecycle + Telemetry     ✅ 完成
 Gate F3 Monitoring / Scale / UX Complete      ✅ 完成
 
-V4-WP10 Authorization + NodeGroup Model       ⏸️ PAUSED — resume here
-V4-WP11 Stable / Ops Hardening                ⏸️ blocked by F4
+V4-WP10 Authorization + NodeGroup Model       🟡 代码完成，Gate F4 待真实运行
+V4-WP11 Stable / Ops Hardening                🟡 WP11A/WP11D 代码完成；WP11B/C 未完成
 ```
+
+### 2026-10-01 恢复开发：WP10 / WP11 进度快照
+
+**这一节的结论只区分两种证据：**
+（a）本机可运行的自动验证（typecheck + 单元/路由测试）；
+（b）必须在真实多 Agent 拓扑里跑的 Gate。
+**本机没有 Docker daemon，因此（b）全部标注为"未运行"，不得当作通过。**
+
+已完成并经本机自动验证：
+
+```text
+V4-WP10 权限内核              backend typecheck + 新增 90+ 测试通过
+   · 非 owner 绑定自定义角色 = 替换基础权限（悬空/跨空间/损坏引用 fail-closed）
+   · forward:* 为规范键，legacy tunnel:* 兼容读取；显式 false 优先
+   · 新旧 Forward/Tunnel/Node 入口共用同一资源级判定，成员仅能改自己创建的转发
+   · 批量动作逐项鉴权（拒绝项不写库、不发命令）
+   · 自定义角色 CRUD + 成员角色分配（含权限子集约束、owner 保护、绑定中不可删）
+   · 重装（reinstall/enroll）不再重写既有 role/端口区间/地址/出口目标
+   · 转发编辑与 retry/resume 走真实能力+额度+资源授权准入（不占用创建数量额度）
+   · Web 从服务端投影有效权限；403 不再跳登录页；Forward 按 creator 控制操作
+
+V4-WP11A Agent 耐久性          go vet + go test ./... 全绿（新增 20+ 用例）
+   · 本地已知良好配置（LKG）缓存：0600/0700、原子写、schema+agent_id 校验、拒绝符号链接
+   · 仅"面板不可达"才回退缓存；401/403/404、载荷损坏、身份不符一律 fail-closed
+   · 只有真正 applied 的转发进入缓存；全部失败不清空既有缓存
+   · 面板恢复后进行权威对账，清理面板已不再列出的 runtime（缓存来源绝不作为裁剪依据）
+   · 统一关机原语：先拒绝新配置 → 关闭监听（新连接立即被拒）→ 单一截止时间排空
+     → 超时强制关闭 → 有界最终状态上报
+
+V4-WP11B 控制协议协商          backend 1210 测试通过 + agent 全绿（新增 20+ 用例）
+   · Agent 上报 control_protocol_version 与 capabilities，能力清单**由 execute 的
+     真实分支派生**；测试逐一驱动清单里的动作，证明"上报的"与"实现的"不会漂移
+   · 未实现的契约动作（update_targets / state_request）明确不上报
+   · 面板校验器白名单投影这两个字段；坏形状 → bad_capabilities（拒绝，不退化成"未上报"）
+   · 落库 control_protocol_version / capabilities（迁移 20261012000000，SQL 由
+     prisma migrate diff 生成）；admin 单节点与全量视图原样投影，null ≠ []
+   · 下发前闸门：未上报 → 只放行协议冻结的基线动作；上报了但不含该动作 → 拒绝；
+     空清单 → 连基线也拒绝；库里的坏形状 → 拒绝（不是放行）
+   · 重装会让旧上报失效：凭据签发晚于最后一次上报 ⇒ 视为未上报（避免"用上一个
+     进程的能力描述去放行新动作"）
+   · 闸门在入队之前失败，不产生任何队列写入
+
+V4-WP11B 命令通道加固          backend 1210 测试通过（含 12 个 ACK 绑定用例）
+   · 只有"本面板确实下发且未过期"的 command_id 才接受 ACK（伪造 command_id → 400）
+   · 首答优先（重复 ACK 不能改写已存结果）；applied_revision 超前于下发版本被拒
+   · 超时/消费后清理 pending，迟到 ACK 不可被当作后续命令的答案
+   · Agent 侧校验 envelope 的 resource_id / revision 与 config 一致，过期时间非法即拒
+
+V4-WP11D 运维脚本修复           bash -n 全过；回归守卫写在 F5 Gate 内
+   · restore.sh：改用 docker inspect 定位 Redis 卷（compose inspect 不是 v2 子命令）
+   · restore.sh：恢复期间停止 backend/worker/web，EXIT trap 保证一定重启
+   · restore.sh：不再用 mysql --force 掩盖 SQL 错误
+   · backup.sh：去掉 config.tar.gz 二次压缩；BGSAVE 超时改为 fail-closed
+   · backup.sh / restore.sh：口令改用 env: 传递，不再出现在 argv
+   · rollback.sh：健康门改为 /readyz（MySQL+Redis）；端口按实际栈解析；新增迁移兼容自检
+   · 开发栈 Redis 改回 RDB（与生产一致），否则替换 dump.rdb 的恢复是"假恢复"
+```
+
+**真实拓扑 Gate 结果（2026-10-02，四 Agent 拓扑 `scripts/v3-e2e`）：**
+
+```text
+v3 baseline verify        PASS=51 / FAIL=0
+V4-F1 rollout             PASS=30 / FAIL=0
+V4-F1 rollout REST        PASS=67 / FAIL=0 / DEFECT=0
+V4-F1 S10 中断/恢复        PASS=58 / FAIL=0 / LIMITED=0 / DEFECT=0
+V4-F1 topology            PASS=32 / FAIL=0
+V4-F2 managed node        PASS=37 / FAIL=0
+V4-F3 product closure     PASS=21 / FAIL=0
+V4-F4 authorization       PASS=58 / FAIL=0
+V4-F5 durability/ops      PASS=133 / FAIL=0  ← 含升级闭环、Forward/Node 诊断、
+                                               关机排空、能力协商、运维脚本与
+                                               真实备份/恢复演练（F5.13）
+```
+
+两个新 Gate 已接入 `.github/workflows/integration.yml`（F3 之后依次执行）。
+证据文件：`scripts/v3-e2e/evidence/v4-gate-f4-result.txt`、`v4-gate-f5-result.txt`。
+
+**首次真实运行在 F4/F5 里查出的真实产品缺陷（均已修复并补测）：**
+
+```text
+1. 状态上报 targets:null 被拒 → 该节点上报永久 400（F5 首次运行暴露）
+   Go 的 nil slice 序列化为 null，而校验器把 null 当成类型错误。受影响的是
+   **每一条 RELAY 入口隧道**，即面板会永久失去这些节点的遥测/健康判定。
+   修复：校验器把 null 与「缺该键」视为同一事实；Agent 侧对空目标改用
+   omitempty，不再产出 null。两侧各加回归测试。
+
+2. 停机期间重启的 Agent 永不与面板对账（F5.5 首次运行暴露）
+   恢复来源是本地缓存时，进程从未观察到"拉取失败"，因此首次成功拉取不会触发
+   对账 —— 面板已删除的转发会一直跑下去。修复：控制循环记录"启动即来自缓存"
+   并在面板可用后立即对账（event-only 刷新也补齐：管理器加变更钩子，缓存随
+   真实变更更新，而不是只靠 5s 周期采样）。
+
+3. 批量动作的拒绝项用了另一套错误码（F4.9 首次运行暴露）
+   单资源端点用 `forbidden`，批量项却回 `permission_denied`，前端需要两套映射。
+   修复：统一为 `forbidden`，并补 `error_layer`。
+```
+
+**第二轮子代理审计发现并已修复的真实缺陷（安全相关优先）：**
+
+```text
+1. RELAY 诊断会直连业务出口端口（P0）
+   "入口↔出口"那一段的目标是出口节点的业务 EGRESS listener：拨它会触发真实
+   业务连接（accept → 选目标 → 建上游 → 计入业务连接与 Stats），所以"诊断不占
+   业务连接/不计流量"的说法当时并不成立。修复：该段改为**只核对两端上报的运行态
+   事实**（运行时是否存在、revision 是否收敛）并标注 method=node_facts、
+   verified=false，报告与"下一步"都不再声称该段可达；出口→目标一段仍直探目标。
+
+2. 诊断结果没有与请求绑定（P1）
+   pending 记录原来只有 command_id/action/revision，ACK 也不回显绑定；且诊断的
+   revision 为 0 时整段校验被跳过。修复：pending 先于入队写入、携带 expires_at 与
+   期望目标集；Agent 回显 action/resource_id；结果必须**完整且一一对应**请求目标
+   （缺项/多项/重复/未请求目标一律拒绝），否则"没探到 B"会被读成"链路正常"。
+
+3. 诊断契约只加了枚举，validator 没有对应 case（P1）
+   `CommandPayload`/`ACTION_PAYLOAD_KEYS`/`validatePayload` 都没有诊断分支，
+   `ControlValidator.execute` 还会把只读动作送进变更路径（应用 revision 闸门、推进
+   状态）。修复：补齐 payload 白名单与值域校验、补只读 dispatch，并由
+   issueAgentDiagnose 走同一份契约校验，不再靠 `as unknown` 旁路。
+
+4. LKG 缓存会复活已删除的转发（P1）
+   Save 拒绝空快照 + SnapshotOf/RefreshCache 在"最后一个转发被删/暂停"后返回 nil，
+   于是磁盘上永远留着旧配置；面板停机重启时它就被恢复回来。修复：区分两种答案——
+   **权威的空**（写入墓碑）与**未知（nil）**（拒绝覆盖）；缓存改为记录
+   manager 真实 running 集合（幂等 retarget 不会再写入从未生效的新 payload）。
+
+5. 快照校验过松 + nil 崩溃
+   Snapshot.Validate 只校验 version/ID/mode；IDSet 在 nil 接收者上先 len() 会 panic。
+   修复：严格校验版本标识、revision>0、重复 ID、target 上限与 cfg.Validate；
+   IDSet 先判 nil。
+
+6. 脱敏层的性能与顺序问题
+   base64 规则的 lookahead 会在长值上近似二次扫描（200×4KB 需要数秒），且已知密值
+   是在截断之后才清除的（可能只清掉一部分）。修复：改为匹配后再判字符类、正则输入
+   先封顶、已知密值在任何截断之前清除、保留 Date 时间戳、修正递归深度被重置的问题。
+```
+
+**F4/F5 Gate 脚本自身也修了若干缺陷**（首次运行时才暴露）：历史断言查询用了不存在的
+`forward_id` 列；`data` 为数组时 `layer()` 崩溃；`expect()` 在拼错误信息时对非 dict
+响应体调 `.get`；compose 调用误用容器名导致 stop/start 静默失败；`up` 连带启动依赖
+服务把"面板停机"场景变成"面板健康"；断言的端口/目标选错导致连接探针无输出。
+
+**F5 DoD 逐项状态（不得笼统宣称"F5 完成"）**：
+
+```text
+LKG runtime cache                ✅ 实现 + Gate F5.2/F5.3/F5.4 真实覆盖
+graceful drain / shutdown        ✅ 实现 + Gate F5.6 真实覆盖（关闭监听/排空/强制收敛/最终上报）
+protocol capability 协商          ✅ 实现 + Gate F5.9 真实覆盖（含迁移与投影）
+agent reinstall 关系保持          ✅ 既有 F2 + Gate F4.42 覆盖
+agent upgrade 闭环               ✅ 已实现并由 Gate F5.11 真实覆盖：
+                                   `POST /api/nodes/:id/upgrade-command` 渲染升级脚本
+                                   （先拉取后停机 → SIGTERM 优雅排空 → 复用宿主 agent.env
+                                   与 LKG 目录重建 → 身份校验 → 失败自动回退）。脚本不含
+                                   凭据、镜像引用经过校验、变量做 shell 净化。真实拓扑上
+                                   验证了：排空期间新连接被拒、重建后 agent_id/node 行不变、
+                                   既有 Forward 再收敛、以及**用回退锚点真的换回旧镜像**后
+                                   数据面恢复。
+Forward/Node diagnose            ✅ Forward 与 Node 两级都已实现并由 Gate F5 真实覆盖：
+                                   · F5.10 Forward 诊断（DIRECT 直探 / RELAY 分段）；
+                                   · F5.12 Node 诊断：新增只读动作 `collect_diagnostics`，
+                                     Agent 侧 internal/selfinfo 按**白名单**自述版本/进程/
+                                     运行中 runtime/LKG 状态，面板侧先用上报新鲜度**判活**
+                                     （离线直接结构化返回，不下发命令、不等超时）。真实
+                                     Gate 验证了自述事实、报告不含配置目标与凭据、停机节点
+                                     有界返回且带解释。
+                                   历史说明（Forward 诊断的分段语义）：
+                                   DIRECT 直探目标；RELAY 分段——"入口↔出口"一段只核对
+                                   两端上报的运行态事实并标注 verified=false（**不拨业务
+                                   监听端口**，否则会产生真实业务连接），出口→目标一段仍
+                                   直探。
+Support Bundle                   ✅ Panel 侧：白名单逐字段投影 + 确定性脱敏两道防线、
+                                   按调用者权限裁剪 forward/audit 段落、条数与字节上限并显式
+                                   标记 truncated。**Agent 侧**：collect_diagnostics 的自述
+                                   事实作为独立段落并入产物（版本/进程/listeners/LKG 状态），
+                                   离线时产物照常生成并写明"为什么没有这一段"。
+                                   未含：容器内 service 状态/系统路由表（需要额外探针，
+                                   当前不在白名单内）。
+full real E2E                    ✅ F1–F5 全部真实通过（见上表）
+backup/restore 演练               ✅ Gate F5.13 在真实栈上跑完整链路（备份 → 打 canary →
+                                   恢复 → canary 消失、行数/迁移表与备份一致、面板与
+                                   Agent 恢复可用）。演练查出并修掉 6 个真实缺陷，
+                                   详见 docs/release-notes-v4.md
+兼容 / 回滚 / 文档                ✅ 兼容端点保留（旧权限键/旧路由/字段别名都不删）、
+                                   rollback/backup/restore 脚本已修并有守卫测试；
+                                   发布说明见 docs/release-notes-v4.md（列明已验证能力与
+                                   明确的已知边界，不写未验证的事）
+前端入口（Track D）               ✅ Forward 详情内嵌诊断面板；Node 页面内嵌诊断 /
+                                   支持包下载 / 升级命令生成；渲染不变量与 mock 契约均有
+                                   单测，且已进 CI 的测试目录清单
+```
+
+**Gate 套件可重复性（本轮修，两处同类缺陷）**：
+
+```text
+· 拓扑 Gate：只清入口 A 上第一个同名残留 → 被中断的运行把残留留在入口 B，迁移到
+  B 时收到 409 port_conflict。现在两端都清，并显式断言"入口端口开始前是空闲的"。
+· 升级 Gate 的回退锚点不能取自"节点当前跑的标签"：那会让用例自我指涉——上一次运行
+  留下的标签被当成新基线，节点被永久钉在测试标签上（随后 S10 的镜像断言就失败了）。
+  锚点改为**环境基线镜像**，并显式断言节点起点就是基线。
+· rest Gate：S3 故意迁移 listen_port 却不还原 → 下一次 v4-gate.sh 拿 state.json 的
+  原始端口探针，得到"基线读不到 marker"，把夹具漂移报成产品失败。现在收尾有 S7
+  还原步骤并断言原始端口真实可读、revision 已收敛。
+
+实测：先跑 rest（67/0）再跑 v4-gate.sh（30/0）与反向顺序都通过，Gate 结果不再依赖
+运行顺序。这两处都属于"报告看起来像产品缺陷、实际是夹具/环境"，必须修掉，否则
+Gate 的结论无法被信任。
+```
+
+**Gate 脚本对"上一次被中断"的健壮性（本轮修）**：拓扑 Gate 原来只删除
+**入口 A** 上第一个同名残留转发，而上一次被中断的运行把残留留在了**入口 B**，于是
+迁移到 B 时收到 409 `port_conflict` —— 产品行为是对的，报告却像产品缺陷。现在两端
+都清、并显式断言"入口端口在开始前是空闲的"（F1.0），把夹具问题与产品问题分开。
+
+**本轮（WP11A 收口 + WP11B 升级闭环）修掉的真实缺陷**：
+
+```text
+1. 生产下发入口没有关机闸门
+   Apply 有 closing 检查，但控制面实际走的是 ReplaceListener / HotSwapUpstream ——
+   两个入口都没有。shutdown 之后仍可能重新 bind listener。修复：三个入口同一个锁内
+   先拒后动，并补"closing 之后 ReplaceListener 必须被拒"的反例测试。
+
+2. 关机顺序错：先 fsync/上报，最后才关监听
+   原顺序是 RefreshCache（磁盘 fsync）→ BeginShutdown → 等最多 3s 上报 → 才关
+   listeners。也就是说 SIGTERM 之后新 TCP 还能进来，且"最终上报"描述的不是关完后的
+   事实。修复：拆成两阶段——BeginShutdown + CloseListeners 同步先做（新连接立刻被
+   拒），再做有界的缓存快照与上报，最后用**同一个绝对 deadline**排空并强制关闭；
+   总时长仍受 ShutdownTimeout 约束。
+
+3. 强制关闭只关客户端连接，对端不作声就永远卡住
+   PipeConns 双向拷贝，只 Close 客户端时若对端忽略 FIN，上游读会一直阻塞，handler
+   与 shutdown 都会越过 deadline。修复：连接对的两端都登记并在 deadline 时一起关闭；
+   新增"永不作声的对端"测试。
+
+4. 缓存写并发无护栏
+   Shutdown 把 rt.cacheTick 置 nil 而 writer goroutine 仍在读该字段（竞态 + 可能 nil
+   deref），且多个写入者可能让旧快照 rename 覆盖新快照（把"最后已知良好"往回滚）。
+   修复：writer 捕获局部 ticker、Shutdown 用 WaitGroup join、所有写入共用一个 mutex，
+   恢复路径也走同一把锁；补并发写入完整性测试。
+```
+
+**WP11C 本轮补完（Node 诊断 + Agent 侧 Bundle 段落）**：
+
+```text
+· 新增只读动作 collect_diagnostics（冻结契约的一部分：ACTION_SPECS、payload 白名单、
+  只读 dispatch、能力协商、ACK 结果校验全部到齐）。它的 payload 是**空的**——
+  一个"带参数的自检"就是远程管理面。
+· Agent 侧 internal/selfinfo 是白名单采集器：版本/角色/agent_id/进程事实/运行中的
+  runtime（id、mode、端口、revision）/LKG 状态目录事实。**刻意无法返回**配置值、
+  目标地址、凭据、环境变量、文件内容或命令输出；列表与字符串都有上限，截断显式可见。
+· 状态目录探针用节点**自己的** agent_id 校验缓存——用空 id 校验会永远报"无效"，
+  把一个健康节点变成假故障（实现时先写成空 id，被测试抓出来后修正）。
+· 面板侧先判活：上报超过 75 秒即 `offline`，直接返回事实与下一步，**不下发命令、
+  不等 20 秒超时**（这正是审计指出的"对离线节点无限 pending"）。
+· Support Bundle 并入该段落；离线时产物照常生成，并用 `agent_facts_error` 说明缺因。
+```
+
+**WP11 逐项状态已全部收敛到 ✅（含明确记录的边界），因此 F4 / F5 可以按证据关闭。**
+
+**上述三项现已全部实现并由真实 Gate 覆盖**（本节保留原缺口清单是为了让"为什么需要
+它们"有据可查）：
+
+```text
+WP11B 控制协议能力协商      ✅ NodeStateReport.control_protocol_version / capabilities
+                              全链路（迁移、列、投影、面板协商闸门），Gate F5.9 覆盖
+WP11B Agent 升级闭环        ✅ 面板渲染升级脚本（先拉取后停机 → 优雅排空 → 复用宿主身份
+                              重建 → 身份校验 → 失败回退），Gate F5.11 覆盖
+WP11C Diagnose / Support    ✅ Forward 诊断（分段，业务端口不探测）、Node 诊断
+                              （collect_diagnostics 白名单自述 + 面板先判活）、
+                              Support Bundle（白名单 + 双重脱敏 + 权限裁剪），
+                              Gate F5.10 / F5.12 覆盖
+```
+
+**关于 "V4.5 Stable"**：F4/F5 已在真实四节点拓扑全绿（F4 58/0、F5 133/0），因此代码与
+Gate 层面已就绪。标记 V4.5 Stable 还需要一个**发布窗口动作**（确定版本号与镜像标签、
+按 docs/release-notes-v4.md 走一次升级演练并留存记录），这属于发布流程，不属于本目标的
+"完成 F4/F5 + 补测试与文档"。在此之前 README 保持"不标记为 V4.5 Stable"的说法。
+
+### 2026-09-28 暂停前状态（历史）
 
 **2026-09-28 主线状态：**
 
@@ -2194,6 +2471,26 @@ Gate V4-F1～F3 已全绿；**V4-WP10 现已解除阻塞并成为当前开发入
 ```
 
 不得先改 NodeGroup 表结构再补权限设计。
+
+##### WP10 实施契约（恢复开发，待代码与负向 Gate 验证）
+
+以下设计沿用现有表与 workspace 所有权，不创建第二份路线图。实施顺序仍为设计审查、代码、Web、负向验收。
+
+| 身份 | Forward read/create | Forward update/delete/action | Node/Binding read | Node/Binding/enrollment manage | Workspace 管理 |
+|---|---|---|---|---|---|
+| owner | 允许 | workspace 内全部 | 允许 | 自有资源允许 | 全部，owner 保护规则保留 |
+| admin（无自定义角色） | 允许 | workspace 内全部 | 允许 | 自有资源允许 | 保留现有 admin 权限，不能提升/移除 owner |
+| member（无自定义角色） | 允许 | 仅自己创建的 Forward | 允许 | 拒绝 | 只读 |
+| viewer（无自定义角色） | 仅 read | 拒绝 | 允许 | 拒绝 | 只读 |
+| 非 owner 且绑定 custom role | 只认显式布尔 true 的权限 | 显式动作授权适用于当前 workspace 内资源 | 只认 node:read | 只认 node:manage，仍须 owned scope | member/settings/audit 各自独立键 |
+
+- owner 是固定 break-glass 身份；非 owner 绑定自定义角色后**替换**基础角色权限，不做未授权回退。悬空、跨 workspace 或损坏角色引用拒绝，不因数据异常恢复 admin/member 权限。
+- `forward:read/create/update/delete` 是规范产品权限键；旧 `tunnel:*` 按相同动作兼容读取。两键同时存在时规范键优先，包括显式 false；写入规范化为 forward 键。兼容 API 使用同一判定与 creator/scope 规则，不删除旧端点。JSON 权限无需破坏性 schema 迁移，旧 Panel 回滚前应恢复角色权限备份，避免旧 Panel 不认识 forward 键。
+- middleware 只做 workspace/action 初筛；需要 creator 的 update/delete 在加载 workspace-scoped 资源后再判定。batch 逐项判定，拒绝项不得触发修改或 Agent 命令。自定义角色不能绕过作用域、额度、生命周期或平台管理员权限。
+- NodeGroup 最终语义为 **workspace-owned 节点组织/授权容器 + scheduler 候选池**，不是 Agent 身份或角色。Node.role 为能力真相。保留 node_type 作为 legacy 默认值，不从它推导已创建节点角色。
+- NodeGroupGrant 保留为 personal workspace 的显式方向 use grant；不扩散到 team，不授予 enrollment、credential、Binding 或节点管理权。Node/Binding 管理要求 owned group。当前 Forward 只使用 owned Node/Binding；共享组继续通过兼容 runtime API 使用，不伪装成已支持跨 workspace Binding。
+- 拒绝响应保留既有 `code` 并增加可区分 `error_layer`：authentication、rbac、resource_scope、capability、quota、runtime_admission。越界 ID 返回 404；权限拒绝 403。运行状态和 capability 不得代替 RBAC。
+- 负向验收必须覆盖：固定四角色、custom replacement/invalid role、canonical/legacy key 冲突、creator 与非 creator、新旧 API、批量部分拒绝、跨 workspace ID、revoked grant、Bearer personal-only、能力/额度/运行态独立拒绝。
 
 #### Wave 6 — V4 Stable
 
