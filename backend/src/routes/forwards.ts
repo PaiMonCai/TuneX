@@ -27,6 +27,7 @@ import {
   type ForwardServiceResult,
 } from "../services/forward-service.ts";
 import { parseForwardBatchRequest } from "../services/forward-batch.ts";
+import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
 import {
   forwardListShape,
   forwardOrderBy,
@@ -115,6 +116,7 @@ const ForwardCreateSchema = z
   .object({
     name: z.string().trim().min(1).max(60),
     mode: z.enum(["direct", "relay"]),
+    protocol: z.enum(FORWARD_PROTOCOLS).optional(),
     ingress_node_id: z.number().int().positive(),
     egress_node_id: z.number().int().positive().nullable().optional(),
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),

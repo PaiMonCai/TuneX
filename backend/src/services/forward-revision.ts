@@ -26,18 +26,26 @@
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  normalizeForwardProtocol,
+  persistedForwardProtocol,
+  type ForwardMode,
+  type ForwardProtocol,
+} from "./forward-contract.ts";
 
 /* ================================================================== */
 /* 契约类型                                                            */
 /* ================================================================== */
 
-export type ForwardMode = "direct" | "relay";
 export type ForwardDesiredStatus = "active" | "inactive";
 
 /** 业务字段全集（§13.3.1）：创建后可编辑的全部字段。 */
 export interface ForwardCandidateConfig {
   name: string;
   mode: ForwardMode;
+  /** V5-WP0 canonical protocol; omitted fixtures normalize to the V4 TCP baseline. */
+  protocol?: ForwardProtocol;
   ingress_node_id: number;
   /** direct 必须 null；relay 必填。 */
   egress_node_id: number | null;
@@ -62,6 +70,7 @@ export interface ForwardRevisionRow {
   workspace_id: number;
   name: string;
   tunnel_mode: string | null;
+  forward_protocol?: string | null;
   ingress_node_id: number | null;
   egress_node_id: number | null;
   ingress_node: { id: number; node_id: string; role: string | null } | null;
@@ -209,6 +218,7 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
   return {
     name: row.name,
     mode: row.tunnel_mode === "relay" ? "relay" : "direct",
+    protocol: persistedForwardProtocol(row.forward_protocol),
     ingress_node_id: row.ingress_node_id ?? 0,
     egress_node_id: row.egress_node_id ?? null,
     // 注意：这里取**请求值**语义的表格。存量行没有 snapshot，listen_port 列
@@ -233,6 +243,7 @@ export function mergeForwardCandidate(
   return {
     name: patch.name !== undefined ? patch.name : base.name,
     mode: patch.mode !== undefined ? patch.mode : base.mode,
+    protocol: patch.protocol !== undefined ? patch.protocol : base.protocol,
     ingress_node_id:
       patch.ingress_node_id !== undefined ? patch.ingress_node_id : base.ingress_node_id,
     egress_node_id: patch.egress_node_id !== undefined ? patch.egress_node_id : base.egress_node_id,
@@ -246,6 +257,7 @@ export function mergeForwardCandidate(
 export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: ForwardCandidateConfig): boolean {
   return (
     base.mode === candidate.mode &&
+    normalizeForwardProtocol(base.protocol) === normalizeForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
     base.egress_node_id === candidate.egress_node_id &&
     base.listen_port === candidate.listen_port &&
@@ -309,6 +321,12 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
   if (candidate.mode !== "direct" && candidate.mode !== "relay") {
     errors.push("转发模式只能是 direct 或 relay");
     reasons.push("invalid_mode");
+    return { ok: false, errors, warnings, reasons };
+  }
+
+  if (normalizeForwardProtocol(candidate.protocol) === null) {
+    errors.push("当前版本不支持该转发协议");
+    reasons.push("invalid_protocol");
     return { ok: false, errors, warnings, reasons };
   }
 
@@ -690,6 +708,7 @@ export async function ensureForwardBaselineRevision(
         category: true,
         name: true,
         tunnel_mode: true,
+        forward_protocol: true,
         ingress_node_id: true,
         egress_node_id: true,
         listen_ip: true,
@@ -738,6 +757,7 @@ export async function ensureForwardBaselineRevision(
             name: row.name,
             desired_status: row.desired_status ?? "active",
             mode: row.tunnel_mode === "relay" ? "relay" : "direct",
+            protocol: persistedForwardProtocol(row.forward_protocol),
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
             listen_ip: row.listen_ip,
@@ -803,6 +823,7 @@ export async function createForwardRevision(
         config_revision: true,
         name: true,
         tunnel_mode: true,
+        forward_protocol: true,
         ingress_node_id: true,
         egress_node_id: true,
         listen_ip: true,
@@ -826,6 +847,9 @@ export async function createForwardRevision(
       maxSnapshotRevision: maxSnapshot?.revision ?? null,
     });
 
+    const protocol =
+      normalizeForwardProtocol(input.candidate.protocol) ?? DEFAULT_FORWARD_PROTOCOL;
+
     const targets =
       input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
         ? (input.egressTargets as unknown as Prisma.InputJsonValue)
@@ -840,6 +864,7 @@ export async function createForwardRevision(
           name: input.candidate.name.trim(),
           desired_status: input.desiredStatus,
           mode: input.candidate.mode,
+          protocol,
           ingress_node_id: input.candidate.ingress_node_id,
           egress_node_id: input.candidate.egress_node_id,
           listen_ip: input.resolvedListenIp ?? row.listen_ip,
@@ -874,6 +899,7 @@ export async function createForwardRevision(
         // ── 兼容投影列：socket/config-generator 与旧 Agent 的唯一读取源 ──
         name: input.candidate.name.trim(),
         tunnel_mode: input.candidate.mode,
+        forward_protocol: protocol,
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,
         // 自动分配时保留当前 concrete port（编排器 apply 后再写回确切值）：
@@ -889,7 +915,7 @@ export async function createForwardRevision(
             : existingAddresses,
         forward_addresses_protocol:
           directTarget !== null
-            ? (["tcp"] as unknown as Prisma.InputJsonValue)
+            ? ([protocol] as unknown as Prisma.InputJsonValue)
             : input.candidate.mode === "relay"
               ? ([] as unknown as Prisma.InputJsonValue)
               : existingProtocol,
