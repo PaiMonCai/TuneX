@@ -29,6 +29,10 @@ func decodeSnapshot(version string, tunnels []tunnelPayload) (*Snapshot, error) 
 		if err != nil {
 			return nil, fmt.Errorf("%w: tunnel %s: %v", ErrMalformedSnapshot, id, err)
 		}
+		protocol, err := forwarder.ParseForwardProtocol(t.Protocol)
+		if err != nil {
+			return nil, fmt.Errorf("%w: tunnel %s: %v", ErrMalformedSnapshot, id, err)
+		}
 		cfg := forwarder.TunnelConfig{
 			ID:          id,
 			Mode:        mode,
@@ -38,7 +42,7 @@ func decodeSnapshot(version string, tunnels []tunnelPayload) (*Snapshot, error) 
 			RemotePort:  t.RemotePort,
 			NextHop:     t.NextHop,
 			LBStrategy:  forwarder.LBStrategy(t.LBStrategy),
-			Protocol:    t.Protocol,
+			Protocol:    protocol,
 			SpeedLimit:  t.SpeedLimit,
 			Revision:    t.Revision,
 			ListenHost:  t.ListenHost,
