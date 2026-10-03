@@ -1294,6 +1294,13 @@ masked binary frame  -> 目标回包 b'WP14-TARGET-A\n'（opcode=0x2）
    （`payload.tunnel.tunnel_type 必须是 tcp/mtcp/.../quic`）。wire 词汇表可以领先
    于 DB 枚举——这一点已写进 `types.ts` 的注释，避免下一个人再踩。
 
+**V5.1a 之后的 V5-G0 回归重跑：GREEN PASS=137 / FAIL=0**
+
+（证据 `docs/evidence/v5-g0-rerun-after-v51a-20261004.txt`。协议扩张最容易伤到的就是
+V4 的兼容契约，所以 §5.5 要求每个协议阶段之后都要重跑这个 Gate。重跑时两处断言按契约
+预期翻转：G0.5 现在要求 Agent 广告「本分支真正实现的协议集合」，G0.7 的"未开放协议"例子
+从 udp 换成 quic —— 例子不跟着走，这条检查就会静默地不再检查任何东西。）
+
 **V5.1a 收口（Gate V5-G1A 全绿）**
 
 ~~~text

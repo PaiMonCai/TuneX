@@ -821,11 +821,30 @@ def g0_5_new_agent_baseline_and_manifest():
     if isinstance(manifest, dict):
         check(manifest.get("schema_version") == 2,
               "G0.5 the manifest declares schema_version 2", f"got={manifest.get('schema_version')!r}")
-        check(manifest.get("protocols") == ["tcp"],
-              "G0.5 it advertises exactly the protocol the runtime implements", f"protocols={manifest.get('protocols')!r}")
-        check(manifest.get("transports") == ["stream"],
-              "G0.5 and exactly the transport that carries it", f"transports={manifest.get('transports')!r}")
-        for absent in ("udp", "quic", "tls", "ws"):
+        # V5.1a opened protocols, so this list moves with each Gate: today the
+        # build implements tcp, tls, ws on the stream transport. It gains udp +
+        # datagram in the V5.1b commit that lands the datagram runtime — the
+        # expectation tracks what the BRANCH actually builds, so this gate stays
+        # green at every commit instead of going red in anticipation of work that
+        # is not merged yet. What the check
+        # is FOR has not changed — an agent must not invent capability it does not
+        # have — and it is now enforced in two halves:
+        #   · here, the advertised set must equal what this branch builds, and
+        #     protocols whose Gate has not run must be absent;
+        #   · in the agent's own suite, `ImplementedProtocols()` must equal the
+        #     registry of real builders, which is the half that can actually see
+        #     the wiring (`agent/internal/forwarder/factory_test.go`).
+        # The first half alone could be satisfied by a lie; the second alone cannot
+        # see what the node told the panel. Both are needed.
+        expected_protocols = ["tcp", "tls", "ws"]
+        expected_transports = ["stream"]
+        check(sorted(manifest.get("protocols") or []) == sorted(expected_protocols),
+              "G0.5 it advertises exactly the protocols this build implements",
+              f"protocols={manifest.get('protocols')!r} expected={expected_protocols}")
+        check(sorted(manifest.get("transports") or []) == sorted(expected_transports),
+              "G0.5 and exactly the transports that carry them",
+              f"transports={manifest.get('transports')!r} expected={expected_transports}")
+        for absent in ("quic", "mtcp", "tunex", "wss"):
             check(absent not in (manifest.get("protocols") or []),
                   f"G0.5 it does not advertise the unimplemented protocol {absent}")
         # The diagnostics dimension must agree with the action list, otherwise the
@@ -996,18 +1015,25 @@ def g0_6_omitted_protocol_is_tcp():
 
 
 def g0_7_unknown_protocol_rejected_before_dispatch():
-    """An explicit, unopened protocol must be refused before anything is queued."""
+    """An explicit, unopened protocol must be refused before anything is queued.
+
+    The example protocol has to be one whose Gate has NOT run: `udp` held this
+    place until V5.1b opened it (DEVELOPMENT.md §6.2 predicted this check would
+    have to flip). `quic` is in the legacy enum and in the wire vocabulary, so it
+    exercises the same path — a protocol the transport layer can NAME but the
+    product has not opened.
+    """
     group_id = int(scalar(f"SELECT in_node_group_id FROM tunnel WHERE id={created_ids[0]};"))
     before_rows = scalar("SELECT COUNT(*) FROM tunnel;")
     before_leases = scalar("SELECT COUNT(*) FROM node_port_lease WHERE status='active';")
     s, b, _ = req("POST", "/api/tunnels/v3/relay", {
         "name": f"{FIXTURE_PREFIX}-UDP",
-        "tunnel_type": "udp",
+        "tunnel_type": "quic",
         "in_node_group_id": group_id,
         "out_node_group_id": int(scalar(f"SELECT out_node_group_id FROM tunnel WHERE id={created_ids[1]};")),
         "targets": [{"host": "target-b", "port": 3030}],
     }, cookie, ws)
-    check(s >= 400, "G0.7 an explicit udp create is refused", f"status={s} body={b}")
+    check(s >= 400, "G0.7 an explicit quic create is refused", f"status={s} body={b}")
     # ensure_ascii=False: json.dumps escapes non-ASCII by default, so a plain
     # `"协议" in json.dumps(b)` could never match and the check would always fail.
     blob = json.dumps(b, ensure_ascii=False)
