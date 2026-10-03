@@ -105,6 +105,16 @@ export interface ForwardPatchInput {
   listen_port?: number | null;
   target_host?: string | null;
   target_port?: number | null;
+  /**
+   * V5-WP5-A1：tls 前端的证书/私钥路径可改，规则与创建时完全相同（只有 tls 能带，
+   * 且必须成对）—— 由 `tlsPathsForProtocol` 统一判定，不在这里复制一份规则。
+   *
+   * 协议本身仍然不可改：`protocol` 不在 patch 白名单里。把一个 tcp 转发改成 tls
+   * 是"换一个东西"，不是"编辑"（端口租约、目标语义、RELAY 形态都要重新决定），
+   * §6.1 没有冻结这个语义，因此不猜。
+   */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   /** V4-WP1 §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
   expected_revision?: number | null;
 }
@@ -246,6 +256,13 @@ export function forwardView(t: any) {
     name: t.name,
     protocol,
     protocol_supported: normalizeForwardProtocol(protocol) !== null,
+    // V5-WP5-A1: the paths are part of a tls Forward's configuration, so the view
+    // carries them. Without them the detail page can say "TLS" but never which
+    // certificate, and an operator cannot verify a path without reading the DB —
+    // the projection is the API, and an unexposed fact is an unavailable one.
+    // Paths only: key material never leaves the node.
+    tls_cert_path: protocol === "tls" ? (t.tls_cert_path ?? null) : null,
+    tls_key_path: protocol === "tls" ? (t.tls_key_path ?? null) : null,
     mode: (t.tunnel_mode ?? "direct") as ForwardMode,
     ingress_node_id: t.ingress_node_id,
     ingress_node: t.ingress_node ?? null,
@@ -926,6 +943,14 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
+          // V5-WP5-A1: the tls paths are part of the desired configuration, so a
+          // patch that changes them must persist them — and a patch that leaves
+          // them out must not silently drop them (the candidate carries the
+          // current values forward). This is the same rule the protocol follows,
+          // and the reason an operator can now rotate to a new certificate FILE
+          // NAME without deleting the Forward (which would also reassign an
+          // auto-allocated listen port).
+          ...tlsPathsForCandidate(candidate),
         },
       });
       return { written, resources };
@@ -1099,6 +1124,31 @@ interface ResolvedCandidate {
  * 这是 §13.3.3「preview 与真实 update 不得各写一份规则」的结构性保证：
  * 两个入口函数体都只有「落库 / 不落库」的差别，前置完全同一份代码。
  */
+/**
+ * The tls path columns for a resolved candidate.
+ *
+ * Uses the ONE rule (`tlsPathsForProtocol`) rather than re-checking here: only a
+ * tls candidate may carry paths, and it must carry both. A candidate that violates
+ * that never reaches this line — `resolveForwardCandidate` rejects it — so this
+ * helper only decides what to WRITE, and writing `null` for a non-tls candidate is
+ * what keeps a converted row from keeping stale paths.
+ */
+function tlsPathsForCandidate(candidate: {
+  protocol?: string;
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
+}): { tls_cert_path: string | null; tls_key_path: string | null } {
+  // A candidate always has a protocol by this point (`currentDesiredConfig` fills
+  // it from the persisted fact), but the type is optional; an absent protocol is
+  // not "tls", so the paths are cleared — the same fail-closed direction the rest
+  // of the contract takes.
+  const admitted = normalizeForwardProtocol(candidate.protocol);
+  if (admitted === null) return { tls_cert_path: null, tls_key_path: null };
+  const paths = tlsPathsForProtocol(admitted, candidate.tls_cert_path, candidate.tls_key_path);
+  if (!paths.ok) return { tls_cert_path: null, tls_key_path: null };
+  return { tls_cert_path: paths.columns.tls_cert_path, tls_key_path: paths.columns.tls_key_path };
+}
+
 async function resolveForwardCandidate(
   id: number,
   workspaceId: number,

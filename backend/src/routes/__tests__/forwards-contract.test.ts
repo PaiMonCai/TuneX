@@ -51,6 +51,12 @@ describe("V4-WP1 /api/forwards PATCH 契约", () => {
         "name",
         "target_host",
         "target_port",
+        // V5-WP5-A1: the tls front's paths are editable, so the patch contract
+        // stays equal to the create contract — which is what this assertion is
+        // FOR. `protocol` is deliberately absent (a protocol change is a
+        // different operation, not an edit) and that is asserted separately.
+        "tls_cert_path",
+        "tls_key_path",
       ].sort(),
     );
   });

@@ -145,6 +145,13 @@ const ForwardPatchSchema = z
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),
     target_host: z.string().trim().min(1).max(255).nullable().optional(),
     target_port: z.number().int().min(1).max(65535).nullable().optional(),
+    // V5-WP5-A1: the tls front's paths are editable, with the SAME shape rule as
+    // create. The protocol itself is deliberately NOT here: turning a tcp Forward
+    // into a tls one is a different operation (port lease, target semantics and
+    // the RELAY shape all change), and §6.1 did not freeze that semantics — so it
+    // is refused by omission rather than guessed at.
+    tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
+    tls_key_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     expected_revision: z.number().int().nonnegative().nullable().optional(),
   })
   .strict()

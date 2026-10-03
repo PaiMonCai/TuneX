@@ -55,6 +55,10 @@ const BASE_CONFIG: ForwardCandidateConfig = {
   listen_port: 19001,
   target_host: "10.0.0.10",
   target_port: 8080,
+  // V5-WP5-A1: the tls paths are part of the candidate like the protocol, so the
+  // canonical direct/tcp fixture carries them as null.
+  tls_cert_path: null,
+  tls_key_path: null,
 };
 
 /** 一条「当前 desired」的 tunnel 行投影（存量行形态：无 snapshot）。 */
@@ -138,6 +142,34 @@ describe("A. 合并得到完整候选 config（§13.3.3）", () => {
 
   test("A4. 从存量行抽取 current desired config（无 snapshot 的兼容路径）", () => {
     expect(currentDesiredConfig(row())).toEqual(BASE_CONFIG);
+  });
+
+  /**
+   * V5-WP5-A1：路径与协议同属"期望配置"，因此可合并；未提交时必须**沿用**
+   * 当前值（合并语义），否则一次改名就会把证书路径清空。
+   */
+  test("A4b. tls 路径可合并，未提交时沿用当前值", () => {
+    const tlsBase: ForwardCandidateConfig = {
+      ...BASE_CONFIG,
+      protocol: "tls",
+      tls_cert_path: "/etc/tunex/tls/site.crt",
+      tls_key_path: "/etc/tunex/tls/site.key",
+    };
+    expect(mergeForwardCandidate(tlsBase, { target_port: 8081 })).toMatchObject({
+      tls_cert_path: "/etc/tunex/tls/site.crt",
+      tls_key_path: "/etc/tunex/tls/site.key",
+    });
+    expect(
+      mergeForwardCandidate(tlsBase, { tls_cert_path: "/etc/tunex/tls/new.crt" }),
+    ).toMatchObject({
+      tls_cert_path: "/etc/tunex/tls/new.crt",
+      tls_key_path: "/etc/tunex/tls/site.key",
+    });
+  });
+
+  test("A4c. 改协议不是 metadata-only，必须触发 runtime 收敛", () => {
+    const tlsBase: ForwardCandidateConfig = { ...BASE_CONFIG, protocol: "tls" };
+    expect(isMetadataOnlyPatch(BASE_CONFIG, tlsBase)).toBe(false);
   });
 
   test("A5. 改名是唯一的纯 metadata 修改", () => {
@@ -421,6 +453,11 @@ describe("F. snapshot 契约形状", () => {
       "protocol",
       "target_host",
       "target_port",
+      // V5-WP5-A1：tls 前端的路径与 protocol 同属运行态配置，因此必须进入
+      // 不可变 runtime snapshot —— 少了它们，revision 里就没有证书这一维，
+      // 重放出来的配置会与被批准的那一份不同。
+      "tls_cert_path",
+      "tls_key_path",
     ]);
   });
 

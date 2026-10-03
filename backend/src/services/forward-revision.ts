@@ -52,6 +52,13 @@ export interface ForwardCandidateConfig {
   /** direct 目标；relay 可为 null（目标在 egress targets 里）。 */
   target_host: string | null;
   target_port: number | null;
+  /**
+   * V5-WP5-A1：tls 前端的节点本地证书路径。它与 `protocol` 属于同一份 desired
+   * 配置，所以同样可合并 —— 否则运维换一个证书文件名就必须删了重建（而重建还会
+   * 重新分配监听端口）。
+   */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 /** patch 入参：全部可选；缺省 = 沿用当前 desired config 的值。 */
@@ -70,6 +77,9 @@ export interface ForwardRevisionRow {
   tunnel_mode: string | null;
   tunnel_type?: string | null;
   forward_protocol?: string | null;
+  /** V5-WP5-A1：tls 前端的节点本地路径（只有路径，永远没有密钥内容）。 */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   ingress_node_id: number | null;
   egress_node_id: number | null;
   ingress_node: { id: number; node_id: string; role: string | null } | null;
@@ -226,6 +236,8 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     listen_port: row.listen_port ?? null,
     target_host: row.remote_host ?? null,
     target_port: row.remote_port ?? null,
+    tls_cert_path: row.tls_cert_path ?? null,
+    tls_key_path: row.tls_key_path ?? null,
   };
 }
 
@@ -249,6 +261,8 @@ export function mergeForwardCandidate(
     listen_port: patch.listen_port !== undefined ? patch.listen_port : base.listen_port,
     target_host: patch.target_host !== undefined ? patch.target_host : base.target_host,
     target_port: patch.target_port !== undefined ? patch.target_port : base.target_port,
+    tls_cert_path: patch.tls_cert_path !== undefined ? patch.tls_cert_path : base.tls_cert_path,
+    tls_key_path: patch.tls_key_path !== undefined ? patch.tls_key_path : base.tls_key_path,
   };
 }
 
