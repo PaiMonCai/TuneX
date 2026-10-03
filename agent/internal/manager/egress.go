@@ -183,6 +183,30 @@ func (e *EgressManager) Targets(tunnelID string) ([]forwarder.Target, bool) {
 	return p.Targets(), true
 }
 
+// DesiredTargets returns every target of every egress pool this node serves,
+// ordered by tunnel id and then by the pool's own order, so two cycles over an
+// unchanged desired state enumerate identically.
+//
+// It exists as the ONE accessor the V5.2-WP5 target observer enumerates from
+// (internal/targetobs): "observe only the targets of this node's desired state"
+// (§7 row 2) is enforced by making this the only window the observer has. It
+// reports desired state only — never observation results, never a peer's
+// targets — and nothing can write through it.
+func (e *EgressManager) DesiredTargets() []forwarder.Target {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	ids := make([]string, 0, len(e.pools))
+	for id := range e.pools {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]forwarder.Target, 0)
+	for _, id := range ids {
+		out = append(out, e.pools[id].Targets()...)
+	}
+	return out
+}
+
 // TargetStats returns the per-target failure/throughput ledger of one tunnel
 // (the WP5 "target fail 可观测" surface). It reports what the node's own
 // forwarder observed — dial successes/failures and relayed bytes — so a silent

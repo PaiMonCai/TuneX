@@ -35,6 +35,7 @@ import (
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/targetobs"
 )
 
 // Interval is the heartbeat cadence (devmap v0.3: 每 30s 上报一次).
@@ -138,6 +139,19 @@ type StatePayload struct {
 	/// panel needs it to distinguish "this node can carry this protocol" from
 	/// "this node never told me", without changing the array above.
 	CapabilityManifest *CapabilityManifest `json:"capability_manifest,omitempty"`
+
+	// ── V5.2-WP5 target observation (DEVELOPMENT.md §7) ─────────────────
+	//
+	// The observation facts of the targets THIS node serves, one entry per
+	// (node, target). They ride the existing state report as a new top-level
+	// key: additive only, so an older panel ignores it and keeps working, and
+	// an older agent simply omits it — which the panel must read as "unknown",
+	// never as "everything is healthy" (§7 rows 4/8).
+	//
+	// `observation_age` is deliberately NOT here: age is `now -
+	// last_observed_at` and is derived by the panel when it reads (row 7). A
+	// stored age is already wrong by the time it is written.
+	TargetObservations []targetobs.Observation `json:"target_observations,omitempty"`
 }
 
 // CapabilityManifest is the v2 capability fact set on the wire (V5-WP1).
@@ -175,6 +189,18 @@ type ReportedTunnel struct {
 // reporter reads: the reporter must not import the manager.
 type DiagnosticsLister interface {
 	DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagnostics
+}
+
+// TargetObservationLister reports the V5.2-WP5 observation facts of the targets
+// this node serves.
+//
+// It is an interface for the same decoupling reason as DiagnosticsLister: the
+// reporter reads facts, it does not know who produced them (today
+// internal/targetobs, which owns the probing and the success-rate window). A nil
+// source means this agent reports no observations at all, and the wire key is
+// simply absent.
+type TargetObservationLister interface {
+	TargetObservations() []targetobs.Observation
 }
 
 // HostSample is the on-the-wire resource sample. Field names are explicit about
@@ -265,6 +291,17 @@ func WithDiagnostics(lister DiagnosticsLister) Option {
 	return func(c *Config) { c.diagnostics = lister }
 }
 
+// WithTargetObservations attaches the V5.2-WP5 target observer. Omitted = the
+// report carries no `target_observations` key, which the panel reads as
+// "unknown", exactly like an older agent.
+//
+// The observer result is copied into the payload rather than referenced, so a
+// serialising report can never reach back into the observer's state (same rule
+// as Capabilities/Manifest above).
+func WithTargetObservations(lister TargetObservationLister) Option {
+	return func(c *Config) { c.targetObs = lister }
+}
+
 // reportedTunnels merges the running configs with their protocol diagnostics.
 func (r *Reporter) reportedTunnels() []ReportedTunnel {
 	configs := r.cfg.tunnels.List()
@@ -353,6 +390,12 @@ type Config struct {
 
 	// V5-WP5-A3: per-tunnel protocol diagnostics. nil = this agent reports none.
 	diagnostics DiagnosticsLister
+
+	// V5.2-WP5: the target observer's facts. nil = this agent does not observe
+	// targets (or has nothing to observe), and `target_observations` stays off
+	// the wire rather than being sent as an empty array that would read as
+	// "no problems found".
+	targetObs TargetObservationLister
 
 	// ── V4-WP6 telemetry sources (all optional) ──
 	//
@@ -523,8 +566,26 @@ func (r *Reporter) StatePayload() StatePayload {
 	if r.cfg.lastErr != nil {
 		p.LastErr = r.cfg.lastErr.LastError()
 	}
+	// V5.2-WP5: the observer's facts are pulled, never pushed. Reading them
+	// cannot fail and cannot block on a probe (the observer's state is an
+	// in-memory snapshot), so a broken target, a slow target or a broken
+	// observer can never keep the report — or the node — from being sent.
+	if r.cfg.targetObs != nil {
+		p.TargetObservations = copyObservations(r.cfg.targetObs.TargetObservations())
+	}
 	r.fillTelemetry(&p)
 	return p
+}
+
+// copyObservations hands the payload its own slice. Observations are values, so
+// a shallow copy is a full copy; what this prevents is the payload keeping a
+// reference to the observer's internal slice, which the next cycle would then
+// mutate while the report is being serialised.
+func copyObservations(in []targetobs.Observation) []targetobs.Observation {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]targetobs.Observation(nil), in...)
 }
 
 // fillTelemetry adds the V4-WP6 facts (§13.4.4). Everything here is derived

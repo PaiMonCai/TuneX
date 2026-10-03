@@ -16,6 +16,7 @@ import (
 	"github.com/tunex/agent/internal/reporter"
 	"github.com/tunex/agent/internal/restore"
 	"github.com/tunex/agent/internal/selfinfo"
+	"github.com/tunex/agent/internal/targetobs"
 )
 
 // v3Runtime bundles the WP4 components so main can start and stop them as one
@@ -135,6 +136,11 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 	revisions := reporter.NewRevisionState()
 	rt.ledger = ledger
 
+	// observations is the V5-WP5 observation source for the state report. It
+	// stays a nil interface when the observer is not running, so the report
+	// omits `target_observations` rather than claiming "no targets failed".
+	var observations reporter.TargetObservationLister
+
 	// 3. Outbound control loop. The Agent polls the Panel with its per-node
 	// credential; the Panel never dials this process. This is the production
 	// control path for DIRECT/RELAY/EGRESS. The local admin API above is debug-only.
@@ -179,6 +185,28 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 
 	// 4. Heartbeat reporter. Disabled (nil) when no panel URL is configured;
 	// Run's ErrNoPanelURL path is handled by the goroutine below.
+	//
+	// V5.2-WP5 target observation starts just before it, so the very first state
+	// report can already carry facts instead of an empty key.
+	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
+		// The observer probes ONLY the targets of the egress pools this node
+		// serves — DesiredTargets is its one window into the world, which is how
+		// "never scan an unauthorized target" (§7 row 2) is enforced.
+		//
+		// It is started only when the state report can actually carry the facts:
+		// without a node credential StateEndpoint is empty, so probing would be
+		// network noise against targets the panel never hears about. The
+		// lifecycle is the process context — the same one every other component
+		// uses — so there is no second teardown path to keep in sync.
+		observer := targetobs.New(targetobs.Config{
+			NodeID:  cfg.NodeID,
+			Targets: egress.DesiredTargets,
+		})
+		observations = observer
+		go observer.Run(ctx)
+		logx.Info("target observation scheduled",
+			"node_id", cfg.NodeID, "interval", observer.Interval().String())
+	}
 	if cfg.PanelHTTPURL != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
@@ -194,6 +222,9 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			// counters live in the runtime that observed the events; the panel only
 			// ever displays them.
 			reporter.WithDiagnostics(tunnels),
+			// V5.2-WP5: the target observer's facts (empty when it was not
+			// started above, which keeps the wire key absent).
+			reporter.WithTargetObservations(observations),
 			reporter.WithEgress(egressAdapter{egress}),
 			reporter.WithPorts(tunnels),
 			reporter.WithRevision(tunnels),
