@@ -1245,6 +1245,7 @@ function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
       : fallback
         ? { ...fallback, weight: 1 }
         : null);
+  const protocol = forwardProtocolFact(tunnel.forward_protocol, tunnel.tunnel_type);
 
   return {
     id: tunnel.id,
@@ -1259,11 +1260,19 @@ function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
      * 正是同一种「投影忘了选协议列」）。`protocol_supported` 由同一个契约模块判定，
      * mock 不另立一份白名单。
      */
-    protocol: forwardProtocolFact(tunnel.forward_protocol, tunnel.tunnel_type),
+    protocol,
     protocol_supported: forwardProtocolSupported(
       tunnel.forward_protocol,
       tunnel.tunnel_type,
     ),
+    /*
+     * V5-WP5-A1 后续修订：后端 `forwardView` 现在**投影** tls 的两列路径（只有路径，
+     * 永远没有密钥内容），否则详情页只能说「TLS」而说不出用哪张证书。mock 必须同形，
+     * 否则「详情页显示证书路径」在开发环境里永远是空的 —— 这正是 mock 存在的意义：
+     * 形状与真实投影一致，前端才不会只在线上才发现字段缺失。
+     */
+    tls_cert_path: protocol === "tls" ? (tunnel.tls_cert_path ?? null) : null,
+    tls_key_path: protocol === "tls" ? (tunnel.tls_key_path ?? null) : null,
     mode: tunnel.tunnel_mode === "relay" ? "relay" : "direct",
     ingress_node_id: ingress?.id ?? tunnel.in_node_group_id,
     ingress_node: ingress,

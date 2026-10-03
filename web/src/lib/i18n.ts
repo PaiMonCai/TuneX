@@ -312,6 +312,22 @@ const zh = {
     tlsPathAbsolute: "请填写以 / 开头的节点本地绝对路径。",
     tlsPathTooLong: "路径长度不能超过 512 个字符。",
     tlsPathNotAllowed: "只有 tls 转发可以携带证书/私钥路径。",
+    /*
+     * V5.1b §6.2：datagram（udp）面词条。
+     * 凡涉及生命周期的地方都必须说「映射」而不是「连接」；udp **没有**连接可保持、
+     * 也没有显式关闭（UDP 里没有 FIN/RST），所以这些文案里出现「连接」时都是否定式。
+     */
+    sessionModel: "会话模型",
+    sessionModelMapping:
+      "报文映射：按客户端地址建立，空闲超时后回收；不存在连接，也不存在显式关闭。",
+    impactListenerDatagram:
+      "监听会重建：udp 没有连接可 drain，既有报文映射随旧监听一起消失，客户端下一个包会新建一条映射。",
+    impactTargetDatagram:
+      "目标在运行态热替换：新映射走新目标，既有映射保持到空闲过期（udp 没有连接可保持）。",
+    udpRelayUnsupported:
+      "本版本 udp 只开放直连（DIRECT）：中继或出口上的 udp 会被运行时拒绝（跨节点跳的形态尚未定义）。请改用直连入口，或选择 tcp / tls / ws。",
+    impactMetadataOnlyTlsPaths:
+      "证书/私钥路径已修改，但服务端把本次修改判定为「纯元数据变更」：该判定下路径不会写入，也不会重新下发。请连同任一其它改动一起保存。",
     listenPort: "监听端口",
     autoPort: "留空由系统自动分配",
     targetHost: "目标主机",
@@ -1102,6 +1118,18 @@ const en: Dict = {
     tlsPathAbsolute: "Use an absolute node-local path starting with /.",
     tlsPathTooLong: "A path can be at most 512 characters.",
     tlsPathNotAllowed: "Only a tls forward may carry certificate/key paths.",
+    /* V5.1b §6.2 — datagram (udp). Lifecycle wording says mapping, never "connection". */
+    sessionModel: "Session model",
+    sessionModelMapping:
+      "Packet mappings: keyed per client address and reclaimed on idle timeout; there is no connection and no explicit close.",
+    impactListenerDatagram:
+      "The listener is rebuilt; a UDP runtime has no connections to drain, so existing packet mappings disappear with the old listener and the client's next packet starts a new one.",
+    impactTargetDatagram:
+      "The target is swapped in the running runtime: new mappings use the new target while existing ones keep the old one until they expire idle (UDP has no connection to hold).",
+    udpRelayUnsupported:
+      "UDP is DIRECT-only in this build: a relay or egress UDP forward is refused by the runtime (the inter-node hop for UDP is not defined yet). Use a direct ingress, or pick tcp / tls / ws.",
+    impactMetadataOnlyTlsPaths:
+      "The certificate/key paths changed, but the server classified this edit as metadata-only: under that classification the paths are neither written nor rolled out. Save it together with another change.",
     listenPort: "Listen port",
     autoPort: "Leave empty for automatic allocation",
     targetHost: "Target host",

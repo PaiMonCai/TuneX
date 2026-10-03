@@ -18,6 +18,12 @@ import type {
 } from "@/lib/types";
 import type { MockNodeBinding, MockStore } from "./state";
 import type { Tunnel, UserNode } from "@/lib/types";
+// V5-WP5-A1：tls 路径规则只保留一份实现（与创建表单、mock 的创建路径同一份）。
+import {
+  TLS_FORWARD_PROTOCOL,
+  forwardProtocolFact,
+  tlsPathFieldErrors,
+} from "@/lib/forward-protocol";
 
 /** WP1 错误码（与 backend FORWARD_REVISION_ERROR_CODES 同名同义）。 */
 export const FORWARD_MOCK_ERRORS = {
@@ -51,6 +57,17 @@ export interface MockForwardCandidate {
   listen_port: number | null;
   target_host: string | null;
   target_port: number | null;
+  /**
+   * V5-WP5-A1：持久化协议事实 + tls 的节点本地路径。
+   *
+   * 与后端 `ForwardCandidateConfig` 同形 —— 这两列属于 desired 配置（后端 A1：
+   * 「the paths are part of a Forward's desired configuration ... mergeable,
+   * persisted, and carried into the runtime revision snapshots」），所以 mock 的
+   * patch 也必须能合并与落库，否则「编辑器改证书路径」在 mock 下永远无效。
+   */
+  protocol?: string;
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 export interface MockForwardBase extends MockForwardCandidate {
@@ -83,6 +100,9 @@ export function rowOf(db: MockStore, tunnel: Tunnel): MockForwardBase {
   return {
     id: tunnel.id,
     name: tunnel.name,
+    protocol: tunnel.forward_protocol ?? tunnel.tunnel_type ?? null,
+    tls_cert_path: tunnel.tls_cert_path ?? null,
+    tls_key_path: tunnel.tls_key_path ?? null,
     mode: (tunnel.tunnel_mode ?? "direct") as "direct" | "relay",
     ingress_node_id:
       tunnel.ingress_node_id ??
@@ -140,6 +160,16 @@ function normalizeHost(value: unknown): string | null {
   return host.length >= 1 && host.length <= 255 ? host : null;
 }
 
+/**
+ * tls 路径归一化：非字符串（畸形请求体）一律当成 null，而不是抛。
+ *
+ * 真实后端在这一层之前就由 zod 挡掉了（`z.string().trim().min(1)...`），mock 不做
+ * 类型校验，所以这里只保证「不炸」并且方向安全：null = 没有路径，绝不留半份。
+ */
+function normalizeTlsPath(value: unknown): string | null {
+  return typeof value === "string" ? value.trim() : null;
+}
+
 function normalizeNodeId(value: unknown): number | null | undefined {
   if (value === undefined) return undefined;
   if (value === null || value === "") return null;
@@ -158,6 +188,9 @@ export function mockCurrentDesiredConfig(row: MockForwardBase): MockForwardCandi
     listen_port: row.listen_port,
     target_host: row.target_host,
     target_port: row.target_port,
+    protocol: row.protocol,
+    tls_cert_path: row.tls_cert_path ?? null,
+    tls_key_path: row.tls_key_path ?? null,
   };
 }
 
@@ -192,6 +225,18 @@ export function mergeMockForwardCandidate(
       listen === undefined ? base.listen_port : listen.ok ? listen.port : base.listen_port,
     target_host: targetHost === undefined ? base.target_host : targetHost,
     target_port: targetPort === undefined ? base.target_port : targetPort,
+    // protocol 不在 ForwardPatchInput 里（后端 ForwardPatchSchema 不接受它），
+    // 所以这里只有 tls 路径可合并 —— 与后端 `mergeForwardCandidate` 的
+    // 「undefined = 沿用当前值」同义。
+    protocol: base.protocol,
+    tls_cert_path:
+      patch.tls_cert_path === undefined
+        ? (base.tls_cert_path ?? null)
+        : normalizeTlsPath(patch.tls_cert_path),
+    tls_key_path:
+      patch.tls_key_path === undefined
+        ? (base.tls_key_path ?? null)
+        : normalizeTlsPath(patch.tls_key_path),
   };
 }
 
@@ -206,7 +251,21 @@ export function isMockMetadataOnlyPatch(
     (base.egress_node_id ?? null) === (candidate.egress_node_id ?? null) &&
     (base.listen_port ?? null) === (candidate.listen_port ?? null) &&
     (base.target_host ?? "") === (candidate.target_host ?? "") &&
-    (base.target_port ?? null) === (candidate.target_port ?? null)
+    (base.target_port ?? null) === (candidate.target_port ?? null) &&
+    /*
+     * V5-WP5-A1：**换证书不是 metadata 变更** —— 运行中的 listener 必须重新加载
+     * 新证书，否则它会一直用旧文件。后端 A1 的意图正是「paths 属于 desired 配置、
+     * 会被合并/落库/进 revision 快照」，所以这里必须比较这两列。
+     *
+     * ⚠️ 已知差异（已在任务回报中记录）：后端 `isMetadataOnlyPatch`
+     * （`backend/src/services/forward-revision.ts`）**尚未**比较这两列，于是今天
+     * 「只改 tls 路径」的 PATCH 会走 metadata-only 分支（只写 name，路径不落库、
+     * 不下发）。mock 按**契约意图**实现（否则开发期看不到「路径改成功了」这一面），
+     * 后端补上这两列后两边即一致；`forward-protocol.test.tsx` 里对后端的断言
+     * （patch schema 接受路径）与这里配合，把这个缺口显式留在测试与报告里。
+     */
+    (base.tls_cert_path ?? null) === (candidate.tls_cert_path ?? null) &&
+    (base.tls_key_path ?? null) === (candidate.tls_key_path ?? null)
   );
 }
 
@@ -528,6 +587,32 @@ export function resolveMockForwardCandidate(
   return { ok: true, candidate, env, validation };
 }
 
+/**
+ * 候选 config → 要落库的两列 tls 路径（对应后端 `tlsPathsForCandidate`）。
+ *
+ * 规则只有一条（`tlsPathFieldErrors` 的同一份实现）：只有 tls 可以携带，且必须
+ * 成对给出以 `/` 开头的路径；否则两列都是 null。非 tls 携带路径在后端**创建**路径上
+ * 是 400（patch 路径上目前是静默清空），mock 这里按「清空」实现，与 patch 行为一致。
+ */
+function candidateProtocolPaths(candidate: MockForwardCandidate): {
+  tls_cert_path: string | null;
+  tls_key_path: string | null;
+} {
+  if (forwardProtocolFact(candidate.protocol) !== TLS_FORWARD_PROTOCOL) {
+    return { tls_cert_path: null, tls_key_path: null };
+  }
+  const errors = tlsPathFieldErrors(
+    TLS_FORWARD_PROTOCOL,
+    candidate.tls_cert_path ?? "",
+    candidate.tls_key_path ?? "",
+  );
+  if (Object.keys(errors).length > 0) return { tls_cert_path: null, tls_key_path: null };
+  return {
+    tls_cert_path: (candidate.tls_cert_path ?? "").trim(),
+    tls_key_path: (candidate.tls_key_path ?? "").trim(),
+  };
+}
+
 /** 形态/读库校验失败原因码 → 稳定错误码（只映射 UI 分支会用的几个）。 */
 function invalid_topology_reason(reasons: string[]): ForwardMockErrorCode {
   if (reasons.includes("mode_topology_mismatch")) return "mode_topology_mismatch";
@@ -575,6 +660,16 @@ export function applyMockForwardPatch(
   }
 
   tunnel.name = candidate.name;
+  /*
+   * tls 路径落库：与后端 `tlsPathsForCandidate` 同一口径 —— 只有 tls 候选可以携带，
+   * 且必须成对且是绝对路径；不满足就写 null（不留半份路径）。非 tls 行永远写 null，
+   * 所以「把一条 tls 转发改成别的协议」不会留下陈旧路径（虽然协议本身不可改）。
+   */
+  {
+    const paths = candidateProtocolPaths(candidate);
+    tunnel.tls_cert_path = paths.tls_cert_path;
+    tunnel.tls_key_path = paths.tls_key_path;
+  }
   tunnel.tunnel_mode = candidate.mode;
   tunnel.ingress_node_id = candidate.ingress_node_id;
   tunnel.egress_node_id = candidate.mode === "relay" ? candidate.egress_node_id : null;

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowLeftRight,
   ArrowUp,
@@ -35,6 +36,7 @@ import {
   DEFAULT_FORWARD_PROTOCOL,
   FORWARD_PROTOCOLS,
   FORWARD_TLS_PATH_MAX,
+  datagramRelayBoundaryKey,
   forwardProtocolFields,
   forwardProtocolLabel,
   forwardProtocolNote,
@@ -662,8 +664,9 @@ export function ForwardWorkspace() {
    * 运行态/流量/revision 结构上进不来。这里只负责把草稿装进创建表单让用户确认，
    * 真正的 POST 仍走 `createForward()`，因此「复制」没有第二条写路径。
    *
-   * V5-WP5-A1：协议随草稿带过（tls 转发复制出来必须还是 tls），但证书/私钥路径
-   * 永远为空 —— 后端不投影这两列，只能由运维在表单里重新填写（见 `forwardCopyDraft`）。
+   * V5-WP5-A1：协议与 tls 的证书/私钥路径都随草稿带过（复制一条 tls 转发必须还是
+   * tls；路径现在由 `forwardView` 投影，所以不必再让运维重敲一遍），源行缺路径时
+   * 草稿留空并由表单预检拦下（见 `forwardCopyDraft`）。
    */
   function copyForward(forward: PortForward) {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
@@ -723,6 +726,8 @@ export function ForwardWorkspace() {
     [protocol, tlsCertPath, tlsKeyPath],
   );
   const protocolReady = Object.keys(protocolErrors).length === 0;
+  /** udp + relay 在本版本必然跑不起来（§6.2 B1 边界）：只告警，不代替后端拒绝。 */
+  const datagramRelayWarningKey = datagramRelayBoundaryKey(protocol, createMode);
 
   async function createForward() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
@@ -1622,6 +1627,24 @@ export function ForwardWorkspace() {
                   placeholder="443"
                 />
               </Field>
+
+              {/*
+                V5.1b B1：udp 在本版本只开放直连，中继/出口上的 udp 会被运行时拒绝
+                （DEVELOPMENT.md §6.2 实施边界；Agent 侧 `Validate()` 已按此拒绝）。
+                这里只**告警**：拒绝的执行点在后端与运行时，面板自己禁用提交会让
+                「接口能建、界面不能建」成为第二份真相（见 lib 的 datagramRelayBoundaryKey）。
+              */}
+              {datagramRelayWarningKey ? (
+                <div
+                  data-testid="forward-datagram-relay-warning"
+                  className="rounded-md border border-[var(--warning,var(--border))]/40 bg-[var(--muted)]/40 p-3 text-xs"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                    <span>{t(datagramRelayWarningKey)}</span>
+                  </div>
+                </div>
+              ) : null}
             </div>
           )}
 

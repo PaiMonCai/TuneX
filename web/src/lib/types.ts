@@ -1013,8 +1013,8 @@ export interface PortForward {
    * V5-WP5-A1：这一行的**协议事实**（后端投影：`forward_protocol` 优先，回落
    * legacy `tunnel_type`，所以协议列出现之前的行也会报告它当时是什么）。
    *
-   * 联合类型给出本契约开放的取值（`tcp` / `tls` / `ws`，见
-   * `lib/forward-protocol.ts`）；开口的那一支让历史事实（`wss` / `udp` …）保持
+   * 联合类型给出本契约开放的取值（`tcp` / `tls` / `ws` / `udp`，见
+   * `lib/forward-protocol.ts`）；开口的那一支让历史事实（`wss` / `quic` …）保持
    * 诚实 —— 界面只渲染行上写着的东西，绝不改写它。是否被当前运行时开放看
    * {@link protocol_supported}。
    */
@@ -1024,6 +1024,13 @@ export interface PortForward {
    * `false` = 历史/未开放的协议事实：按原样展示，**不得**替换成缺省值。
    */
   protocol_supported: boolean;
+  /**
+   * V5-WP5-A1：tls 入口的节点本地证书/私钥路径（**只有路径**，永远没有密钥内容）。
+   * 后端 `forwardView` 对非 tls 行投影 `null`，所以这里恒有两个字段。
+   * 详情页展示它们，编辑器用它们做 tls 路径编辑的「当前值」。
+   */
+  tls_cert_path: string | null;
+  tls_key_path: string | null;
   mode: "direct" | "relay";
   ingress_node_id: ID;
   ingress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;
@@ -1082,10 +1089,13 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
  * V4-WP1 全字段编辑 patch（与后端 ForwardPatchSchema 同形）。
  * `expected_revision` 是可选的乐观并发凭据；缺失 = 首次请求或有意跳过检查。
  *
- * V5-WP5-A1 未改动此处：后端 `ForwardPatchSchema` 目前**不接受** `protocol` /
- * `tls_cert_path` / `tls_key_path`（它是 `.strict()`，多发一个键就是 400），
- * 所以「协议」创建后不可改 —— 编辑器只读展示当前协议，不提供改协议入口。
- * 这条差异已在任务回报中作为契约缺口记录，前端不自行猜测后端行为。
+ * V5-WP5-A1（后续修订）：`tls_cert_path` / `tls_key_path` **已被 patch schema 接受**
+ * —— 证书路径属于一条转发的 desired 配置，运维换文件名不该被迫删了重建（重建还会
+ * 重新分配监听端口）。规则与创建完全相同（只有 tls 能带、且必须成对）。
+ *
+ * `protocol` 仍然**不可编辑**：把 tcp 改成 tls 不是一次编辑（端口租约、目标语义、
+ * RELAY 形态全都变），§6.1 没有冻结这套语义，所以后端 schema 用「不接受该键」
+ * 而不是猜一个行为。编辑器因此只读展示协议。
  */
 export interface ForwardPatchInput {
   name?: string;
@@ -1096,6 +1106,13 @@ export interface ForwardPatchInput {
   listen_port?: number | null;
   target_host?: string | null;
   target_port?: number | null;
+  /**
+   * 只有 tls 行可以携带；必须成对、以 `/` 开头、≤512。非 tls 携带它们
+   * 在创建路径上是 400，因此界面**结构上**不发（只能经
+   * `forwardProtocolPatchFields()` 生成）。
+   */
+  tls_cert_path?: string;
+  tls_key_path?: string;
   expected_revision?: number | null;
 }
 
@@ -1103,11 +1120,16 @@ export interface ForwardPatchInput {
 export interface ForwardPreviewConfig {
   name: string;
   mode: "direct" | "relay";
+  /** 持久化协议事实（后端 ForwardCandidateConfig.protocol）。 */
+  protocol?: string;
   ingress_node_id: number;
   egress_node_id: number | null;
   listen_port: number | null;
   target_host: string | null;
   target_port: number | null;
+  /** tls 的节点本地路径（非 tls 为 null），与 `forwardView` 同一投影口径。 */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 /**
