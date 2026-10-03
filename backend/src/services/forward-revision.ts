@@ -27,7 +27,6 @@
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import {
-  DEFAULT_FORWARD_PROTOCOL,
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardMode,
@@ -847,8 +846,10 @@ export async function createForwardRevision(
       maxSnapshotRevision: maxSnapshot?.revision ?? null,
     });
 
-    const protocol =
-      normalizeForwardProtocol(input.candidate.protocol) ?? DEFAULT_FORWARD_PROTOCOL;
+    const protocol = normalizeForwardProtocol(input.candidate.protocol);
+    if (protocol === null) {
+      throw new ForwardRevisionError("invalid_input", "当前版本不支持该转发协议");
+    }
 
     const targets =
       input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
