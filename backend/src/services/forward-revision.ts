@@ -30,7 +30,6 @@ import {
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardMode,
-  type ForwardProtocol,
 } from "./forward-contract.ts";
 
 /* ================================================================== */

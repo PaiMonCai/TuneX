@@ -8,7 +8,7 @@
 --   * non-Forward rows remain NULL;
 --   * existing Forward rows copy their legacy tunnel_type fact verbatim (lower-case);
 --   * historical wss/tls/udp/... facts are preserved without admitting those protocols;
---   * revision history is TCP by construction and receives a non-null snapshot field.
+--   * existing revision history inherits the owning Tunnel's protocol fact.
 -- VARCHAR is deliberate: adding a future protocol is an application-contract/Gate
 -- change, not a table-enum rewrite. Unknown persisted values still fail closed.
 -- No runtime behavior changes in this migration.
@@ -26,3 +26,10 @@ CREATE INDEX `tunnel_forward_protocol_idx`
 
 ALTER TABLE `forward_revision`
   ADD COLUMN `protocol` VARCHAR(16) NOT NULL DEFAULT 'tcp' AFTER `mode`;
+
+-- Existing revisions predate the protocol snapshot field. Recover the best
+-- available historical fact from their owning Tunnel instead of declaring all
+-- old snapshots TCP by construction.
+UPDATE `forward_revision` AS fr
+JOIN `tunnel` AS t ON t.`id` = fr.`tunnel_id`
+SET fr.`protocol` = COALESCE(t.`forward_protocol`, LOWER(t.`tunnel_type`));
