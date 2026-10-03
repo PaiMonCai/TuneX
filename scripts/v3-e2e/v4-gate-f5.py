@@ -42,6 +42,7 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
 STATE = HERE / "state.json"
 ENVF = HERE / ".env.wp14"
 PASSF = HERE / ".passwords.env"
@@ -1076,9 +1077,9 @@ def f5_13_backup_restore_drill():
     drill_dir = "/tmp/f5-drill-backups"
     env = {
         **os.environ,
-        "COMPOSE_FILE": "/repo/scripts/v3-e2e/docker-compose.e2e.yaml",
+        "COMPOSE_FILE": str(REPO_ROOT / "scripts" / "v3-e2e" / "docker-compose.e2e.yaml"),
         "COMPOSE_PROJECT_NAME": "wp14-e2e",
-        "COMPOSE_ENV_FILE": "/repo/scripts/v3-e2e/.env.wp14",
+        "COMPOSE_ENV_FILE": str(REPO_ROOT / "scripts" / "v3-e2e" / ".env.wp14"),
         "BACKUP_DIR": drill_dir,
         "ENCRYPT": "0",
         "MYSQL_DATABASE": drill_db,
@@ -1105,7 +1106,7 @@ def f5_13_backup_restore_drill():
           "F5.13 baseline row counts are readable", f"workspaces={rows_before}")
 
     backup = subprocess.run(
-        ["bash", "scripts/ops/backup.sh"], cwd="/repo", text=True, capture_output=True, timeout=900, env=env,
+        ["bash", "scripts/ops/backup.sh"], cwd=REPO_ROOT, text=True, capture_output=True, timeout=900, env=env,
     )
     check(backup.returncode == 0, "F5.13 backup.sh completes on the live stack",
           f"rc={backup.returncode} tail={backup.stdout[-300:]}{backup.stderr[-200:]}")
@@ -1132,7 +1133,7 @@ def f5_13_backup_restore_drill():
 
     restore = subprocess.run(
         ["bash", "scripts/ops/restore.sh", str(manifest), "--yes"],
-        cwd="/repo", text=True, capture_output=True, timeout=1200, env=env,
+        cwd=REPO_ROOT, text=True, capture_output=True, timeout=1200, env=env,
     )
     check(restore.returncode == 0, "F5.13 restore.sh completes on the live stack",
           f"rc={restore.returncode} tail={restore.stdout[-400:]}{restore.stderr[-200:]}")
