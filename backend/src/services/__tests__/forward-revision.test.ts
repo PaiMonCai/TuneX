@@ -410,7 +410,7 @@ describe("E. revision 号与 409", () => {
 
 describe("F. snapshot 契约形状", () => {
   test("F1. 候选 config 承载 §13.3.2 全部运行态字段", () => {
-    // mode / ingress / egress / listen_port(含 auto) / target_host / target_port
+    // V5-WP0 后 protocol 与 topology mode 正交，也必须进入不可变 runtime snapshot。
     const keys = Object.keys(BASE_CONFIG).sort();
     expect(keys).toEqual([
       "egress_node_id",
@@ -418,6 +418,7 @@ describe("F. snapshot 契约形状", () => {
       "listen_port",
       "mode",
       "name",
+      "protocol",
       "target_host",
       "target_port",
     ]);
