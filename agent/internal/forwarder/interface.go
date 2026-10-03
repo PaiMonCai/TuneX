@@ -318,8 +318,23 @@ func (c TunnelConfig) UpstreamAddr() string {
 	return net.JoinHostPort(strings.TrimSpace(c.RemoteHost), strconv.Itoa(c.RemotePort))
 }
 
-// Forwarder is the WP4-frozen data-plane contract.
-type Forwarder interface {
+// StreamRuntime is the data-plane contract for **connection-oriented**
+// (stream) transports: one accepted connection maps to one upstream
+// connection, and the runtime can drain work that is already in flight.
+//
+// V5-WP2 made the name explicit. It was called `Forwarder` and documented as
+// "the contract every tunnel mode implements", which quietly claimed that a
+// future datagram runtime would have to implement `Drain(time.Duration)` and
+// `SetUpstream(string)` too. Both are stream-only notions: there are no
+// "in-flight connections" to drain in a datagram runtime, and "the upstream
+// address" is a per-connection fact for TCP but not for UDP. Keeping one name
+// for both would have forced the UDP work (V5.1b) into either empty methods or
+// a second, silently-divergent interface.
+//
+// So: every method below is a property of the stream lifecycle, not of
+// "a tunnel". A datagram runtime (V5.1b) will get its own contract; the
+// manager keeps owning desired state, revision and ports for both.
+type StreamRuntime interface {
 	// Start binds the tunnel's listen port and starts forwarding. Starting an
 	// already running forwarder returns ErrAlreadyStarted.
 	Start() error
@@ -359,6 +374,15 @@ type Forwarder interface {
 	// the ceiling. It is safe to call before Start and more than once.
 	Drain(timeout time.Duration) error
 }
+
+// Forwarder is the V4-WP4 name for StreamRuntime, kept as an alias so the
+// frozen data plane and its tests do not churn.
+//
+// Read it as "the stream runtime this node runs today", never as "the contract
+// every future protocol must satisfy": V5-WP2 split the concept precisely
+// because that reading would have made UDP/QUIC awkward or dishonest. New code
+// should prefer StreamRuntime.
+type Forwarder = StreamRuntime
 
 // ErrUpstreamNotSwappable is returned by SetUpstream on a forwarder whose
 // upstream is not one swappable address (an EGRESS pool).

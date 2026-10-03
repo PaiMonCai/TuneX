@@ -62,8 +62,11 @@ import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
+  buildForwardRuntimePlan,
+  forwardRuntimePlanViolations,
   normalizeForwardProtocol,
   persistedForwardProtocol,
+  type ForwardRuntimePlan,
   type ForwardProtocol,
 } from "./forward-contract.ts";
 import {
@@ -319,6 +322,14 @@ export interface CreateRelaySuccess {
   ingressPort: number;
   /** 节点间内部通信端口（非用户可见）。 */
   egressPort: number | null;
+  /**
+   * V5-WP2：本次下发所依据的 **RuntimePlan**（纯计划）。
+   *
+   * 返回它是为了让"计划"可被外部断言，而不是只有编排器自己知道：Gate V5-G0
+   * 与后续协议都要检查「计划里的协议/传输/目标 == 实际下发到 Agent 的那一份」。
+   * 计划本身不含 socket，只有事实。
+   */
+  runtimePlan?: ForwardRuntimePlan;
   steps: StepRecord[];
 }
 
@@ -1222,6 +1233,7 @@ export async function createRelayTunnel(
     egressPort: egressAlloc.port,
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    protocol,
   });
   if (!egressDispatch.ok) {
     // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。
@@ -1245,13 +1257,53 @@ export async function createRelayTunnel(
     meta: { applied_revision: egressDispatch.result.revision },
   });
 
+  /* ---------------- V5-WP2 RuntimePlan（事实齐了之后的自检） ---------------- */
+  //
+  // 位置就是重点：RELAY 的 next_hop 只有出口 ACK 之后才存在（§1.3 铁律一），
+  // 所以计划只能在这里成型。在此之前用 `protocol` 原值下发，从这里开始一律走
+  // 计划——协议、传输、placement、listener、upstream 全部来自同一份纯计划，
+  // 不再由各调用点各自拼一遍。
+  //
+  // 自检失败 = 我们即将下发一份自相矛盾的配置（例如 RELAY 却没有 next_hop）。
+  // 那时出口已经 ACK，所以必须先补偿再失败，绝不让入口带着坏 hop 启动。
+  const plan = buildForwardRuntimePlan("relay", protocol, {
+    revision,
+    placement: {
+      ingress_node_id: ingressPick.node.id,
+      egress_node_id: egressPick.node.id,
+      egress_pool_id: poolId,
+    },
+    listener: { host: input.listenIp ?? null, port: ingressAlloc.port },
+    upstream: {
+      targets: (egressTargets as { host: string; port: number }[]).map((t) => ({
+        host: t.host,
+        port: t.port,
+      })),
+      next_hop: `${egressDispatch.egress_host}:${egressAlloc.port}`,
+    },
+  });
+  const planViolations = forwardRuntimePlanViolations(plan);
+  if (planViolations.length > 0) {
+    await orchestrator
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
+      .catch(() => {});
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    return fail(
+      "apply_ingress",
+      SCHEDULER_ERROR_CODES.invariant_violated,
+      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      { tunnelId, revision, meta: { runtime_plan_violations: planViolations } },
+    );
+  }
+
   /* ---------------- ⑧⑨ apply Ingress → ACK ---------------- */
   const ingressDispatch = await orchestrator.dispatchIngress({
     tunnelId,
     revision,
     ingressNode: ingressPick.node,
     ingressPort: ingressAlloc.port,
-    nextHop: `${egressDispatch.egress_host}:${egressAlloc.port}`,
+    nextHop: plan.upstream.next_hop as string,
+    protocol: plan.protocol.name,
   });
   if (!ingressDispatch.ok) {
     /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
@@ -1288,6 +1340,7 @@ export async function createRelayTunnel(
     egressNodeId: egressPick.node.id,
     ingressPort: ingressAlloc.port,
     egressPort: egressAlloc.port,
+    runtimePlan: plan,
     steps,
   };
 }
@@ -1676,6 +1729,7 @@ export async function reapplyRelayTunnel(
     );
   }
 
+  const reapplyProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
   const egressDispatch = await orchestrator.dispatchEgress({
     tunnelId,
     revision,
@@ -1683,6 +1737,7 @@ export async function reapplyRelayTunnel(
     egressPort,
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    protocol: reapplyProtocol,
   });
   if (!egressDispatch.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
@@ -1694,13 +1749,45 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
   steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
 
+  /* ---------------- V5-WP2 RuntimePlan 自检（与创建路径同源） ---------------- */
+  const plan = buildForwardRuntimePlan("relay", reapplyProtocol, {
+    revision,
+    placement: {
+      ingress_node_id: ingressPick.node.id,
+      egress_node_id: egressPick.node.id,
+      egress_pool_id: poolId,
+    },
+    listener: { host: typeof row.listen_ip === "string" ? row.listen_ip : null, port: ingressPort },
+    upstream: {
+      targets: (egressTargets as { host: string; port: number }[]).map((t) => ({
+        host: t.host,
+        port: t.port,
+      })),
+      next_hop: `${egressDispatch.egress_host}:${egressPort}`,
+    },
+  });
+  const planViolations = forwardRuntimePlanViolations(plan);
+  if (planViolations.length > 0) {
+    await orchestrator
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
+      .catch(() => {});
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    return fail(
+      "apply_ingress",
+      SCHEDULER_ERROR_CODES.invariant_violated,
+      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      { revision, meta: { runtime_plan_violations: planViolations } },
+    );
+  }
+
   /* ---------------- ⑧⑨ apply Ingress → ACK ---------------- */
   const ingressDispatch = await orchestrator.dispatchIngress({
     tunnelId,
     revision,
     ingressNode: ingressPick.node,
     ingressPort,
-    nextHop: `${egressDispatch.egress_host}:${egressPort}`,
+    nextHop: plan.upstream.next_hop as string,
+    protocol: plan.protocol.name,
   });
   if (!ingressDispatch.ok) {
     await orchestrator
@@ -1931,6 +2018,30 @@ export async function reapplyDirectTunnel(
     },
   });
 
+  /* V5-WP2 RuntimePlan 自检（DIRECT：端口分配后所有事实齐了）。 */
+  const directProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
+  const directPlan = buildForwardRuntimePlan("direct", directProtocol, {
+    revision,
+    placement: { ingress_node_id: pick.node.id },
+    listener: { host: typeof row.listen_ip === "string" ? row.listen_ip : null, port: ingressPort },
+    upstream: { targets: [{ host: remoteHost, port: remotePort }] },
+  });
+  const directPlanViolations = forwardRuntimePlanViolations(directPlan);
+  if (directPlanViolations.length > 0) {
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const code = SCHEDULER_ERROR_CODES.invariant_violated;
+    const detail = `RuntimePlan 自检未通过：${directPlanViolations.join("; ")}`;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        apply_error_code: code,
+        apply_error: detail.slice(0, 500),
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+  }
+
   const dispatched = await orchestrator.dispatchDirect({
     tunnelId,
     revision,
@@ -1939,6 +2050,7 @@ export async function reapplyDirectTunnel(
     remoteHost,
     remotePort,
     listenHost: typeof row.listen_ip === "string" ? row.listen_ip : null,
+    protocol: directPlan.protocol.name,
   });
   if (!dispatched.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});

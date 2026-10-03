@@ -218,24 +218,29 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Forwar
 	return m.applyLocked(normalized)
 }
 
-// buildLocked builds the Forwarder. Caller must hold m.mu.
+// buildLocked builds the data-plane runtime. Caller must hold m.mu.
+//
+// V5-WP2: construction goes through the forwarder's runtime factory, which
+// resolves protocol + transport FIRST and fails closed for anything this binary
+// has not opened. The manager keeps owning desired state, revisions, the port
+// guard and the single registry; only the "which runtime class" question moved
+// into the factory, and it is asked before anything can bind.
+//
+// The egress selector is passed as a lazy closure rather than resolved here, so
+// the factory decides whether this build needs a pool at all (DIRECT/RELAY must
+// not be made to fail because EgressManager is absent in a mode-only build).
 func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
-	switch cfg.Mode {
-	case forwarder.ModeDirect, forwarder.ModeRelay:
-		// DIRECT and RELAY are both one-hop tunnels: the only difference is
-		// where UpstreamAddr() points. One implementation carries both.
-		return forwarder.NewSingleHop(cfg)
-	case forwarder.ModeEgress:
-		sel, err := m.egress.SelectorFor(cfg.ID)
-		if err != nil {
-			return nil, err
-		}
+	return forwarder.BuildStream(cfg, forwarder.StreamBuildDeps{
+		SelectorFor: func(tunnelID string) (forwarder.TargetSelector, error) {
+			if m.egress == nil {
+				return nil, fmt.Errorf("manager: EGRESS tunnel %s has no egress manager wired", tunnelID)
+			}
+			return m.egress.SelectorFor(tunnelID)
+		},
 		// egressObserver is nil-safe, so a mode-only build loses nothing but
 		// the log line; tests can leave the observer unset.
-		return forwarder.NewEgressWithHealth(cfg, sel, egressObserver(cfg.ID))
-	default:
-		return nil, fmt.Errorf("manager: unsupported tunnel mode %q", cfg.Mode)
-	}
+		Observer: egressObserver(cfg.ID),
+	})
 }
 
 // egressObserver builds the target-failure observer for one egress tunnel.

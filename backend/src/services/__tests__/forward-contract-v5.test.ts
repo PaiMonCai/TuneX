@@ -23,16 +23,25 @@ describe("V5-WP0 Forward protocol contract", () => {
     expect(FORWARD_MODES).toEqual(["direct", "relay"]);
     expect(FORWARD_PROTOCOLS).toEqual(["tcp"]);
     expect(FORWARD_TRANSPORTS).toEqual(["stream"]);
-    expect(buildForwardRuntimePlan("direct", "tcp")).toEqual({
+    // V5-WP2 补全了计划的其余事实（revision / placement / listener / upstream），
+    // 所以这里不再断言"只有三个字段" —— 那正是 WP2 要改的东西。协议的判定
+    // 仍然只看这三个维度。
+    const direct = buildForwardRuntimePlan("direct", "tcp");
+    expect({
+      topology: direct.topology,
+      protocol: direct.protocol,
+      transport: direct.transport,
+    }).toEqual({
       topology: { mode: "direct" },
       protocol: { name: "tcp" },
       transport: { name: "stream", lifecycle: "connection" },
     });
-    expect(buildForwardRuntimePlan("relay", "tcp")).toEqual({
-      topology: { mode: "relay" },
-      protocol: { name: "tcp" },
-      transport: { name: "stream", lifecycle: "connection" },
-    });
+    expect(buildForwardRuntimePlan("relay", "tcp").topology).toEqual({ mode: "relay" });
+    // 未提供事实时其余字段是显式的"尚未确定"，不能是未定义。
+    expect(direct.revision).toBe(0);
+    expect(direct.placement).toEqual({ ingress_node_id: null, egress_node_id: null, egress_pool_id: null });
+    expect(direct.listener).toEqual({ host: null, port: null });
+    expect(direct.upstream).toEqual({ targets: [], next_hop: null });
   });
 
   test("transport is derived and unknown transport fails closed", () => {

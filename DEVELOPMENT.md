@@ -354,8 +354,8 @@ V5.5 Federation
 |---|---|---|
 | V5-WP0 | MERGED | PR #29 → main `61a8615`；契约冻结 |
 | V5-WP1 | DONE（待 Integration Gate 覆盖） | 能力协商 v2：manifest 契约 + 三维 runtime admission |
-| V5-WP2 | READY | WP1 契约已冻结，可开工 |
-| V5-WP3 | READY | 可在 WP2 后进行（不依赖 WP2 的代码形态） |
+| V5-WP2 | DONE（待 Integration Gate 覆盖） | RuntimePlan 补全 + Agent Runtime Factory（StreamRuntime 显式化） |
+| V5-WP3 | READY | 不依赖 WP2 代码形态，可开工 |
 | V5-WP4 / G0 | BLOCKED | 等 WP0–WP3 |
 | V5.1+ | BLOCKED | G0 全绿前禁止进入 |
 
@@ -666,6 +666,56 @@ TCP only                still the only product protocol
 ---
 
 ## 5.3 V5-WP2 — Runtime Abstraction
+
+### 状态
+
+**DONE**（本文件记录实现落点，后续 Agent 不要重做）。
+
+落地位置：
+
+~~~text
+agent/internal/forwarder/interface.go   StreamRuntime（显式 stream 生命周期契约）
+                                        Forwarder = StreamRuntime（类型别名，V4 零改动）
+                                        protocolRuntimes：protocol → transport 注册表
+agent/internal/forwarder/factory.go     ResolveRuntimeTarget / ParseForwardTransport
+                                        BuildStream：protocol+transport 解析先于构造
+                                        streamBuilders：protocol → 构造器注册表
+                                        RegisteredBuilders()（与 advertised 集合同源）
+agent/internal/manager/tunnel.go        buildLocked 改为经 factory 构造，不再自己 switch
+                                        （mode 分派下沉到 buildTCPStream）
+backend/src/services/forward-contract.ts  RuntimePlan 补全为纯计划
+                                        buildForwardRuntimePlan(mode, protocol, facts?)
+                                        forwardRuntimePlanViolations(plan)
+backend/src/services/orchestrator.ts    下发用计划里的 protocol（不再硬编码 "tcp"）
+backend/src/services/scheduler.ts       计划在下发路径成型、自检，并随成功结果返回
+~~~
+
+RuntimePlan 现在表达的六件事（全部纯数据，无 socket）：
+
+~~~text
+topology   direct | relay
+protocol   tcp（当前唯一）
+transport  由 protocol 派生（当前唯一：stream / connection）
+revision   这份计划对应的 config revision
+placement  ingress_node_id / egress_node_id / egress_pool_id
+listener   host / port（null = 尚未确定）
+upstream   targets[] / next_hop（RELAY 独有）
+~~~
+
+计划的成型点就是重点：RELAY 的 `next_hop` 只有出口 ACK 之后才存在（§1.3 铁律一），
+所以计划在「出口已 ACK、入口尚未启动」那一刻成型并自检；自检不通过就撤出口 + 释放
+租约后失败（`invariant_violated`），绝不让入口带着坏 hop 启动。
+
+已明确的边界：
+
+- `Forwarder` 保留为 `StreamRuntime` 的**类型别名**，V4 数据面与全部既有测试零改动；
+  新代码应写 `StreamRuntime`；
+- 只有 manager 一处做 transport 分派（`BuildStream` 内），不是"到处 type switch"；
+- 没有新增 UDP/TLS/WS/QUIC Manager，也没有第二个 revision / port owner；
+  `single_manager_guard_test.go` 以源码级守卫钉住这一点；
+- WP2 **不实现**任何新协议：`FORWARD_PROTOCOLS` 仍只有 tcp，`streamBuilders` 仍只有 TCP；
+- 计划自检是防御性 guard（当前事实组合下不可达），但 V5.1 起会真的被触发，
+  逻辑本身由 `forward-runtime-plan-v5.test.ts` 逐条覆盖。
 
 ### 目标
 

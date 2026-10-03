@@ -68,6 +68,11 @@ import {
   type CommandEnvelope,
 } from "./control-protocol/index.ts";
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  legacyTunnelTypeForForwardProtocol,
+  type ForwardProtocol,
+} from "./forward-contract.ts";
 
 /* ================================================================== */
 /* Agent 管理面契约（WP4 api.Server 的镜像）                            */
@@ -96,7 +101,14 @@ export interface AgentTunnelConfig {
   next_hop: string;
   targets: { host: string; port: number; weight: number; order: number }[];
   lb_strategy: "ROUND_ROBIN" | "RANDOM" | "WEIGHTED_ROUND_ROBIN";
-  protocol: "tcp";
+  /**
+   * V5-WP2: the product protocol this config carries, taken from the forward's
+   * RuntimePlan. It is no longer typed as the literal "tcp": the plan is the
+   * single source of this fact, and the agent's outbound gate reads the very
+   * same field (services/agent-command-bus.ts), so the admitted protocol and
+   * the dispatched protocol cannot disagree.
+   */
+  protocol: ForwardProtocol;
   speed_limit: number;
   revision: number;
   listen_host?: string;
@@ -343,6 +355,8 @@ export interface DispatchEgressInput {
   }[];
   /** 池/节点上的 LB 策略；NULL = ROUND_ROBIN。 */
   lbStrategy?: string | null;
+  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  protocol?: ForwardProtocol;
 }
 
 export interface DispatchIngressInput {
@@ -352,6 +366,8 @@ export interface DispatchIngressInput {
   ingressPort: number;
   /** `<egress ip>:<egress port>`，来自 {@link dispatchEgress} 的返回值。 */
   nextHop: string;
+  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  protocol?: ForwardProtocol;
 }
 
 export interface DispatchDirectInput {
@@ -362,6 +378,8 @@ export interface DispatchDirectInput {
   remoteHost: string;
   remotePort: number;
   listenHost?: string | null;
+  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  protocol?: ForwardProtocol;
 }
 
 /** dispatchEgress 成功时额外带回出口地址（入口下发要用它拼 next_hop）。 */
@@ -508,6 +526,7 @@ export class Orchestrator {
   async dispatchEgress(input: DispatchEgressInput): Promise<EgressDispatchOutcome> {
     const egressId = Orchestrator.egressTunnelId(input.tunnelId);
     const resourceId = egressId;
+    const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
     const unreachable = await this.reachable(input.egressNode);
     if (unreachable) return unreachable;
@@ -531,7 +550,7 @@ export class Orchestrator {
       next_hop: "",
       targets,
       lb_strategy: normalizeLbStrategy(input.lbStrategy),
-      protocol: "tcp",
+      protocol,
       speed_limit: 0,
       revision: input.revision,
     };
@@ -545,7 +564,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: egressId,
-          tunnel_type: "tcp",
+          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
           listen_port: input.egressPort,
           targets: targets.map((t) => ({ address: t.host, port: t.port, weight: t.weight })),
         },
@@ -575,6 +594,7 @@ export class Orchestrator {
 
   async dispatchIngress(input: DispatchIngressInput): Promise<RelayDispatchOutcome> {
     const relayId = Orchestrator.relayTunnelId(input.tunnelId);
+    const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
     const unreachable = await this.reachable(input.ingressNode);
     if (unreachable) return unreachable;
@@ -600,7 +620,7 @@ export class Orchestrator {
       next_hop: input.nextHop,
       targets: [], // RELAY 侧不持有目标知识（目标在出口节点上）
       lb_strategy: "ROUND_ROBIN",
-      protocol: "tcp",
+      protocol,
       speed_limit: 0,
       revision: input.revision,
     };
@@ -613,7 +633,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: relayId,
-          tunnel_type: "tcp",
+          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
           listen_port: input.ingressPort,
           // 入口侧的唯一「目标」是出口节点；WP6 的 targets 只是为了让信封
           // 结构合法（apply_tunnel 要求非空），Agent 的 RELAY forwarder 不读它。
@@ -643,6 +663,7 @@ export class Orchestrator {
 
   async dispatchDirect(input: DispatchDirectInput): Promise<RelayDispatchOutcome> {
     const directId = Orchestrator.directTunnelId(input.tunnelId);
+    const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
     const unreachable = await this.reachable(input.ingressNode);
     if (unreachable) return unreachable;
 
@@ -656,7 +677,7 @@ export class Orchestrator {
       next_hop: "",
       targets: [],
       lb_strategy: "ROUND_ROBIN",
-      protocol: "tcp",
+      protocol,
       speed_limit: 0,
       revision: input.revision,
       ...(input.listenHost ? { listen_host: input.listenHost } : {}),
@@ -670,7 +691,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: directId,
-          tunnel_type: "tcp",
+          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
           listen_port: input.ingressPort,
           targets: [{ address: input.remoteHost, port: input.remotePort }],
           ...(input.listenHost ? { listen_ip: input.listenHost } : {}),

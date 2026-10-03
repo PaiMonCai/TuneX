@@ -1,6 +1,7 @@
 import { test, expect, describe, beforeEach } from "bun:test";
 import type { EffectivePolicy } from "../capability-policy.ts";
 import type { AgentV2CapabilityFacts as AgentV2Facts } from "../capability-manifest.ts";
+import { forwardRuntimePlanViolations } from "../forward-contract.ts";
 
 /**
  * WP8 — Scheduler + RELAY Orchestrator 离线测试（不连 MySQL / Redis / 网络）。
@@ -1802,5 +1803,60 @@ describe("G. V5-WP1 runtime admission", () => {
     };
     const result = await scheduler.createRelayTunnel(input(), orch, deps);
     expect(result.ok).toBe(true);
+  });
+});
+
+/* ================================================================== */
+/* H. V5-WP2 RuntimePlan 与下发一致                                      */
+/* ================================================================== */
+
+/**
+ * §5.3「B. RuntimePlan」验收口径：计划是**下发所依据的那份事实**，而不是事后
+ * 补写的注释。这组用例断言「计划里的协议/传输/位置/监听/远端」与真正发给 Agent
+ * 的两条命令一致——协议是硬编码 `"tcp"` 时看不出来，一旦开了第二个协议，
+ * 不一致就意味着"准入说 udp、下发说 tcp"。
+ */
+describe("H. V5-WP2 runtime plan", () => {
+  test("H1. 成功路径带回 RuntimePlan，且是纯数据", async () => {
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const plan = result.runtimePlan;
+    expect(plan).toBeDefined();
+    if (!plan) return;
+    expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
+    expect(forwardRuntimePlanViolations(plan)).toEqual([]);
+  });
+
+  test("H2. 计划与真实下发的两条命令一致（协议/传输/位置/监听/远端）", async () => {
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const plan = result.runtimePlan!;
+
+    const egress = fakeAgent.applies.find((a) => a.kind === "egress")!;
+    const ingress = fakeAgent.applies.find((a) => a.kind === "relay")!;
+
+    // 位置：计划和实际落点的节点 id 一致。
+    expect(plan.placement.egress_node_id).toBe(egress.nodeId);
+    expect(plan.placement.ingress_node_id).toBe(ingress.nodeId);
+    // 监听：入口端口就是计划里的端口，也是下发下去的那个端口。
+    expect(plan.listener.port).toBe(ingress.config?.ingress_port);
+    expect(plan.listener.port).toBe(result.ingressPort);
+    // 远端：RELAY 的 next_hop 来自出口 ACK 的地址，计划与下发必须同源。
+    expect(plan.upstream.next_hop).toBe(ingress.config?.next_hop);
+    // 协议：两端下发的 config.protocol 都等于计划里的协议（不是硬编码）。
+    expect(egress.config?.protocol).toBe(plan.protocol.name);
+    expect(ingress.config?.protocol).toBe(plan.protocol.name);
+    // 传输由协议派生，不单独下发。
+    expect(plan.transport.name).toBe("stream");
+  });
+
+  test("H3. 失败路径不带回计划（没有计划就没有可断言的下发依据）", async () => {
+    fakeAgent.failNext = { kind: "egress", mode: "reject" };
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result).not.toHaveProperty("runtimePlan");
   });
 });
