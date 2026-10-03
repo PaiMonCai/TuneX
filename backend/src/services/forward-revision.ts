@@ -30,6 +30,7 @@ import {
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardMode,
+  tlsPathsForProtocol,
 } from "./forward-contract.ts";
 
 /* ================================================================== */
@@ -275,7 +276,17 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     base.egress_node_id === candidate.egress_node_id &&
     base.listen_port === candidate.listen_port &&
     (base.target_host ?? "") === (candidate.target_host ?? "") &&
-    (base.target_port ?? null) === (candidate.target_port ?? null)
+    (base.target_port ?? null) === (candidate.target_port ?? null) &&
+    // V5-WP5-A1: the tls paths are runtime configuration, exactly like the target
+    // is — so changing ONLY them must produce a revision and a rollout.
+    //
+    // Leaving them out of this comparison made a paths-only PATCH "metadata only":
+    // the metadata branch writes `{ name }` and nothing else, so the API answered
+    // 200 while the new certificate path was neither stored nor applied. The
+    // operator's symptom would be a "saved" rotation that keeps serving the old
+    // certificate — the exact failure G1A.6 exists to prevent.
+    (base.tls_cert_path ?? null) === (candidate.tls_cert_path ?? null) &&
+    (base.tls_key_path ?? null) === (candidate.tls_key_path ?? null)
   );
 }
 
@@ -340,6 +351,39 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
   if (normalizeForwardProtocol(candidate.protocol) === null) {
     errors.push("当前版本不支持该转发协议");
     reasons.push("invalid_protocol");
+    return { ok: false, errors, warnings, reasons };
+  }
+
+  // V5-WP5-A1: the tls path rule lives in ONE place (`tlsPathsForProtocol`) and is
+  // now applied on the pure validation path, so create, preview and patch answer
+  // with the same reason. Before this, create returned 400 for a non-tls with paths
+  // while PATCH silently discarded them — the same rule with two behaviours, which
+  // is worse than either behaviour on its own.
+  const admittedProtocol = normalizeForwardProtocol(candidate.protocol);
+  if (admittedProtocol !== null) {
+    const paths = tlsPathsForProtocol(
+      admittedProtocol,
+      candidate.tls_cert_path,
+      candidate.tls_key_path,
+    );
+    if (!paths.ok) {
+      // `reason` here is the human sentence (the same one create returns), so the
+      // machine-readable code is added alongside it rather than smuggled into it.
+      errors.push(paths.reason);
+      reasons.push("tls_paths_invalid");
+      return { ok: false, errors, warnings, reasons };
+    }
+  }
+
+  // V5.1b B1 boundary (DEVELOPMENT.md §6.2): udp is DIRECT-only in this build. The
+  // inter-node hop shape for a datagram RELAY is an OPEN product decision, so the
+  // panel refuses it here rather than letting the Agent be the only place that says
+  // no — a boundary enforced in one layer is a boundary that can be bypassed by the
+  // next caller, and the UI must be able to rely on validation, not on a warning of
+  // its own.
+  if (admittedProtocol === "udp" && candidate.mode !== "direct") {
+    errors.push("UDP 转发当前只支持 DIRECT：跨节点跳的形态尚未冻结");
+    reasons.push("datagram_relay_unsupported");
     return { ok: false, errors, warnings, reasons };
   }
 

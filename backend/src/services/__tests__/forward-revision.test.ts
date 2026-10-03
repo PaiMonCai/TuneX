@@ -564,3 +564,71 @@ describe("G. applied baseline snapshot", () => {
     expect(f.tunnel.desired_revision_id).toBeNull();
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* V5.1b B1：datagram 边界与 tls 路径的"改动分类"                        */
+/* ------------------------------------------------------------------ */
+
+describe("V5.1b：udp 是 DIRECT-only，且 tls 路径属于运行态配置", () => {
+  const udpDirect: ForwardCandidateConfig = {
+    ...BASE_CONFIG,
+    protocol: "udp",
+  };
+
+  test("udp + DIRECT 通过纯校验", () => {
+    expect(validateForwardCandidate(udpDirect)).toMatchObject({ ok: true });
+  });
+
+  test("udp + RELAY 被拒，并且是一个可解释的原因码", () => {
+    const v = validateForwardCandidate({
+      ...udpDirect,
+      mode: "relay",
+      egress_node_id: 22,
+      target_host: null,
+      target_port: null,
+    });
+    expect(v.ok).toBe(false);
+    // 跨节点跳的形态是**未冻结的产品决策**（DEVELOPMENT.md §6.2 §9.1），所以面板在
+    // 纯校验层就拒绝，而不是让 Agent 成为唯一说"不行"的地方 —— 只在一层设防的边界
+    // 会被下一个调用方绕过，而界面必须能依赖校验结果，而不是靠自己的警告。
+    expect(v.reasons).toContain("datagram_relay_unsupported");
+  });
+
+  test("非 tls 携带证书路径：create / preview / patch 得到同一个原因", () => {
+    const v = validateForwardCandidate({
+      ...BASE_CONFIG,
+      tls_cert_path: "/etc/tunex/tls/a.crt",
+      tls_key_path: "/etc/tunex/tls/a.key",
+    });
+    expect(v.ok).toBe(false);
+    expect(v.reasons).toContain("tls_paths_invalid");
+    expect(v.errors.join(" ")).toContain("只有 tls");
+  });
+
+  test("tls 缺一个路径同样被拒（成对要求只有一处实现）", () => {
+    const v = validateForwardCandidate({
+      ...BASE_CONFIG,
+      protocol: "tls",
+      tls_cert_path: "/etc/tunex/tls/a.crt",
+      tls_key_path: null,
+    });
+    expect(v.ok).toBe(false);
+    expect(v.reasons).toContain("tls_paths_invalid");
+  });
+
+  test("只改证书路径不是 metadata-only：必须落库并触发收敛", () => {
+    const tlsBase: ForwardCandidateConfig = {
+      ...BASE_CONFIG,
+      protocol: "tls",
+      tls_cert_path: "/etc/tunex/tls/old.crt",
+      tls_key_path: "/etc/tunex/tls/old.key",
+    };
+    const rotated = mergeForwardCandidate(tlsBase, { tls_cert_path: "/etc/tunex/tls/new.crt" });
+    // 这一条是 Gate 之外抓到的真实缺陷：漏掉这两列时，只改路径的 PATCH 会被判成
+    // metadata-only，而那个分支只写 name —— 接口回 200，新路径既没落库也没下发，
+    // 运维看到的是一次"已保存"却继续用旧证书的轮换。
+    expect(isMetadataOnlyPatch(tlsBase, rotated)).toBe(false);
+    // 只改名字仍然是 metadata-only（V4 的老规则没被动过）。
+    expect(isMetadataOnlyPatch(tlsBase, mergeForwardCandidate(tlsBase, { name: "renamed" }))).toBe(true);
+  });
+});
