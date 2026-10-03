@@ -6,10 +6,13 @@
 //	DELETE /tunnel?id=<id>     remove a tunnel
 //	PATCH  /node/targets       hot-update one tunnel's egress target pool
 //	GET    /health             version / role / ports / egress pools
+//	GET    /debug/runtime      process runtime gauges (goroutines / RSS / CPU)
 //
 // Mutating routes require a bearer token; by default the server binds to
 // loopback (127.0.0.1:9090 — the v3 deployment layout's admin port, separate
-// from the data-plane range).
+// from the data-plane range). /debug/runtime is authenticated too: it exposes
+// process internals, and "it is only a gauge" is not a reason to make the
+// management plane's auth story inconsistent.
 //
 // WP4 scope ends here: the routes call TunnelManager/EgressManager and report
 // state. The final panel orchestration (WP6 command/revision/ACK contract and
@@ -27,6 +30,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -128,7 +132,53 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/tunnel", s.withAuth(s.handleTunnel))
 	mux.HandleFunc("/tunnel/", s.withAuth(s.handleTunnel))
 	mux.HandleFunc("/node/targets", s.withAuth(s.handleTargets))
+	mux.HandleFunc("/debug/runtime", s.withAuth(s.handleRuntimeStats))
 	return mux
+}
+
+// RuntimeStats is the /debug/runtime payload (V5-WP3).
+//
+// Why the agent exposes these rather than letting a benchmark shell out to
+// /proc: **goroutine count is not in /proc**. It is an in-process number, and
+// the whole point of the V5 performance baseline is to notice "functionality
+// passes but the runtime leaks goroutines". Reading Threads from
+// /proc/<pid>/status would silently measure OS threads instead and look like a
+// pass forever.
+//
+// The shape is deliberately flat and unit-suffixed: a perf artifact that needs a
+// decoder to interpret is an artifact nobody compares later.
+type RuntimeStats struct {
+	Goroutines int    `json:"goroutines"`
+	GoMaxProcs int    `json:"gomaxprocs"`
+	GoVersion  string `json:"go_version"`
+	// HeapAllocBytes is live heap; SysBytes is what the process holds from the
+	// OS. Reporting only one of them hides the difference between "the
+	// allocator is keeping memory" and "objects are still reachable".
+	HeapAllocBytes uint64 `json:"heap_alloc_bytes"`
+	HeapSysBytes   uint64 `json:"heap_sys_bytes"`
+	NumGC          uint32 `json:"num_gc"`
+}
+
+// handleRuntimeStats reports this process's own runtime gauges.
+//
+// It is read-only and cheap (runtime.ReadMemStats stops the world for a
+// microsecond or so): it is meant to be polled by the perf harness, not by the
+// data plane, and it never mutates tunnel state.
+func (s *Server) handleRuntimeStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	writeOK(w, RuntimeStats{
+		Goroutines:     runtime.NumGoroutine(),
+		GoMaxProcs:     runtime.GOMAXPROCS(0),
+		GoVersion:      runtime.Version(),
+		HeapAllocBytes: mem.HeapAlloc,
+		HeapSysBytes:   mem.HeapSys,
+		NumGC:          mem.NumGC,
+	})
 }
 
 // Start binds the admin port and serves until Stop. Idempotent-safe: a second

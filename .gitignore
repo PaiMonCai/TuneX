@@ -46,3 +46,10 @@ scripts/v3-e2e/__pycache__/
 # backend v3 E2E harness 运行期产物
 backend/tests/v3-e2e/.artifacts/
 backend/tests/v3-e2e/__pycache__/
+
+# V5-WP3 性能基线运行期产物
+# .bin/ 是本地构建的 Agent；results/ 是每次跑出来的产物。
+# baseline/ **不**在此列：它是提交进仓库的"锚点"，用于相对趋势对比。
+scripts/perf/.bin/
+scripts/perf/results/
+scripts/perf/__pycache__/

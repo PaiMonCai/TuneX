@@ -355,7 +355,7 @@ V5.5 Federation
 | V5-WP0 | MERGED | PR #29 → main `61a8615`；契约冻结 |
 | V5-WP1 | DONE（待 Integration Gate 覆盖） | 能力协商 v2：manifest 契约 + 三维 runtime admission |
 | V5-WP2 | DONE（待 Integration Gate 覆盖） | RuntimePlan 补全 + Agent Runtime Factory（StreamRuntime 显式化） |
-| V5-WP3 | READY | 不依赖 WP2 代码形态，可开工 |
+| V5-WP3 | DONE | TCP 性能基线（DIRECT / RELAY）+ 锚点产物 + 采集器自检 |
 | V5-WP4 / G0 | BLOCKED | 等 WP0–WP3 |
 | V5.1+ | BLOCKED | G0 全绿前禁止进入 |
 
@@ -852,6 +852,55 @@ WP2 完成时用户仍只获得 TCP。
 ---
 
 ## 5.4 V5-WP3 — Performance Baseline
+
+### 状态
+
+**DONE**（本文件记录实现落点，后续 Agent 不要重做）。
+
+落地位置：
+
+~~~text
+scripts/perf/v5-tcp-baseline.py       采集器（纯标准库）：DIRECT / RELAY 双拓扑
+scripts/perf/v5-tcp-baseline.sh       入口：构建 Agent → 调用采集器
+scripts/perf/test_v5_tcp_baseline.py  自检：统计口径 / 产物形状（CI 里跑这一条）
+scripts/perf/README.md                怎么跑、怎么解读、已知边界
+scripts/perf/baseline/v5-g0-tcp-anchor.json  锚点产物（相对比较用，不是合格线）
+agent/internal/api/server.go          GET /debug/runtime（goroutine 等仪表）
+~~~
+
+为什么需要 `/debug/runtime`：**goroutine 数不在 /proc 里**。它是进程内的事实，
+而"功能通过、runtime 泄漏 goroutine"正是基线要发现的退化之一；读
+`/proc/<pid>/status` 的 Threads 会默默量成 OS 线程数，于是永远看起来没问题。
+
+输出契约：JSON 是权威格式，CSV 是同内容的摊平视图；每个数值都带
+`median / p95 / min / max / mean / count`，并附完整 `environment`
+（CPU 型号 / 核数 / 内核 / `cgroup_cpu_max` / loadavg / go 版本 / git rev）。
+
+已明确的边界：
+
+- **不是 CI 门槛**：CI 只跑采集器的纯函数自检（`perf-harness` 作业），不跑端到端
+  测量 —— 共享 Runner 上的毫秒级硬门槛只会制造随机红灯（见本节下文「规则」）；
+- 假面板不实现命令队列（404），因此测的是 desired/restore/LKG 这条路径，
+  不是命令下发路径；命令队列由 Integration Gate 覆盖；
+- CPU 分辨率是一个调度 tick（通常 10 ms）：quick 档读数可能为 0，产物会用
+  `cpu_resolution_note` 说明"低于分辨率"而不是"没测到"；
+- 只覆盖 TCP/stream；V5.1a/b/c 各协议需要各自场景。
+
+实测（本机 quick 档一次运行，锚点产物原值）：
+
+~~~text
+DIRECT throughput   median 71.01 MiB/s   p95 101.24   （并发 16：4.95 / 6.34）
+RELAY  throughput   median 58.13 MiB/s   p95  94.24   （并发 16：4.15 / 5.82）
+connect             median 0.04 ms（DIRECT） / 0.03 ms（RELAY）   p95 0.60 / 0.14
+restart (panel)     median 20.99 ms   sources=[panel]
+restart (lkg)       median 21.00 ms   sources=[lkg]
+hot reload          apply 0.78 ms / effective 1.32 ms
+graceful drain      idle 64.08 ms / held 10063.77 ms（有界排空上限）
+ingress gauges      goroutines 14–16 / RSS ~15 MB / 本轮 CPU 0.31–0.34 s
+~~~
+
+回环 + Python 采集器的数字波动很大（同一份代码在不同时刻能差数倍），所以这些数
+只在**同一台机器上做相对比较**才有意义；跨机器比较必须同时读 `environment`。
 
 ### 目标
 

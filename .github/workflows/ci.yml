@@ -152,3 +152,20 @@ jobs:
           # Windows target intentionally omitted: the agent uses Linux-only syscalls
           # (netutil/statfs.go -> syscall.Statfs), so GOOS=windows fails to build.
 
+  # V5-WP3：性能基线采集器的**纯函数自检**（统计口径 / 产物形状）。
+  #
+  # 只跑自检，**不跑真实基线**：端到端测量依赖机器负载与回环时序，放进 CI 就是
+  # 一条随机变红的测试。真实基线由人在一台确定环境的机器上跑（scripts/perf/README.md）。
+  # 这一步存在是因为"写好的采集器没人跑"是它唯一的失效方式：自检至少保证它还能
+  # 解析、统计、产出可机读的产物。
+  perf-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Performance baseline harness self-test
+        run: python3 scripts/perf/test_v5_tcp_baseline.py
+
+
