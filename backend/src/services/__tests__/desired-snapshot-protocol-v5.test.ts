@@ -61,7 +61,7 @@ describe("desired snapshot: the protocol fact is never invented", () => {
   });
 
   test("every unopened protocol is refused, not just wss", () => {
-    for (const legacy of ["wss", "udp", "quic", "mtcp", "carrier-pigeon"]) {
+    for (const legacy of ["wss", "quic", "mtcp", "carrier-pigeon"]) {
       expect(desiredTunnelConfigFor(directRow({ tunnel_type: legacy }), NODE)).toEqual({
         kind: "skip",
         reason: "protocol_not_supported",

@@ -17,27 +17,40 @@ export type ForwardMode = (typeof FORWARD_MODES)[number];
  * A value lands here only together with its own Gate (V5-G0 established the
  * "enum presence is not product support" rule; V5-WP0 enforced it). V5.1a adds
  * `tls` — the same stream lifecycle with a TLS-terminated client-facing listener
- * (DEVELOPMENT.md §6.1). `ws` follows in V5-WP5-A2, `udp`/`quic` after.
+ * (DEVELOPMENT.md §6.1). `ws` follows in V5-WP5-A2. `udp` follows in V5.1b
+ * (DEVELOPMENT.md §6.2, `docs/v5-1b-datagram-contract-draft.md`), and it is the
+ * first protocol whose TRANSPORT is not `stream`; `quic` comes last.
  */
-export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws"] as const;
+export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws", "udp"] as const;
 export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
 
 /**
  * Enabled transport contracts. Transport is derived from protocol and is NOT a
- * second user/DB field. Datagram is intentionally absent until its own runtime
- * abstraction + Gate are opened.
+ * second user/DB field.
+ *
+ * V5.1b adds `datagram` (DEVELOPMENT.md §6.2). It is a TRANSPORT and not a
+ * protocol because the transport dimension is already defined over how the bytes
+ * or packets actually move, and because the same protocol can be imagined over a
+ * different transport — while the user-facing dimension stays `protocol`.
+ *
+ * The lifecycle differs, and that difference is the whole reason this is a second
+ * transport rather than a flag on the first: a stream tunnel's unit of work is a
+ * CONNECTION that exists until someone closes it, while a datagram tunnel's unit
+ * is a MAPPING that expires by idle timeout and whose target side has no holdable
+ * object at all (there is no FIN to observe in UDP).
  */
-export const FORWARD_TRANSPORTS = ["stream"] as const;
+export const FORWARD_TRANSPORTS = ["stream", "datagram"] as const;
 export type ForwardTransport = (typeof FORWARD_TRANSPORTS)[number];
 
 export interface ForwardTransportSpec {
-  readonly lifecycle: "connection";
+  readonly lifecycle: "connection" | "mapping";
 }
 
 export const FORWARD_TRANSPORT_SPECS: Readonly<
   Record<ForwardTransport, ForwardTransportSpec>
 > = {
   stream: { lifecycle: "connection" },
+  datagram: { lifecycle: "mapping" },
 };
 
 export interface ForwardProtocolSpec {
@@ -72,6 +85,11 @@ export const FORWARD_PROTOCOL_SPECS: Readonly<
   // A WebSocket front is a client-facing framing layer; the inter-node hop stays
   // plain TCP, exactly like tls.
   ws: { transport: "stream", legacy_tunnel_type: null },
+  // `udp` is the first protocol on the datagram transport. Its legacy projection
+  // is the enum's own name, so unlike `ws` there is no projection problem here —
+  // `udp` has been in the wire vocabulary and the DB enum since long before V5,
+  // which is why V5.1b needs no protocol migration (only an entitlement one).
+  udp: { transport: "datagram", legacy_tunnel_type: "udp" },
 };
 
 export function normalizeForwardTransport(

@@ -13,6 +13,7 @@ import { describe, expect, test } from "bun:test";
 import {
   FORWARD_PROTOCOLS,
   FORWARD_TRANSPORTS,
+  FORWARD_TRANSPORT_SPECS,
   buildForwardRuntimePlan,
   forwardRuntimePlanViolations,
   type ForwardRuntimePlan,
@@ -76,21 +77,36 @@ describe("plan facts", () => {
     ]);
   });
 
-  test("every open protocol is a stream plan (V5.1a adds tls, not a new transport)", () => {
-    // V5-WP5-A1: tls is a *protocol* (what the client speaks), not a transport.
-    // The plan shape is unchanged, which is the point of WP0's orthogonality.
-    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws"]);
-    expect([...FORWARD_TRANSPORTS]).toEqual(["stream"]);
-    expect(directPlan().transport).toEqual({ name: "stream", lifecycle: "connection" });
+  test("the transport follows the protocol, and nothing else chooses it", () => {
+    // V5-WP5-A1 added tls (a protocol on the SAME stream transport); V5.1b added
+    // udp, the first protocol on `datagram`. Both halves matter: a new protocol
+    // must not need a new transport, and a new transport must not appear without
+    // a protocol that derives it — transport is never a user field (WP0).
+    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp"]);
+    expect([...FORWARD_TRANSPORTS]).toEqual(["stream", "datagram"]);
+
+    const expected: Record<
+      (typeof FORWARD_PROTOCOLS)[number],
+      { name: "stream" | "datagram"; lifecycle: "connection" | "mapping" }
+    > = {
+      tcp: { name: "stream", lifecycle: "connection" },
+      tls: { name: "stream", lifecycle: "connection" },
+      ws: { name: "stream", lifecycle: "connection" },
+      udp: { name: "datagram", lifecycle: "mapping" },
+    };
     for (const protocol of FORWARD_PROTOCOLS) {
       const plan = buildForwardRuntimePlan("direct", protocol);
-      expect(plan.transport).toEqual({ name: "stream", lifecycle: "connection" });
+      expect(plan.transport).toEqual(expected[protocol]);
+      expect(plan.protocol).toEqual({ name: protocol });
     }
+    // A datagram tunnel has no connection to drain: the lifecycle is what says so,
+    // and it is derived, never passed in.
+    expect(FORWARD_TRANSPORT_SPECS.datagram.lifecycle).toBe("mapping");
   });
 
   test("an unknown protocol or mode is refused at build time, not silently planned", () => {
     expect(() => buildForwardRuntimePlan("tcp" as never)).toThrow();
-    for (const unopened of ["udp", "quic", "wss"]) {
+    for (const unopened of ["quic", "wss"]) {
       expect(() => buildForwardRuntimePlan("direct", unopened as never)).toThrow();
     }
   });

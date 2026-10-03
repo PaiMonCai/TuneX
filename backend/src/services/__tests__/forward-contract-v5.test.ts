@@ -24,8 +24,8 @@ describe("V5-WP0 Forward protocol contract", () => {
     // V5-WP5-A1/A2: tls and ws joined the product protocol list, each together
     // with its own Gate. This assertion is the deliberate, reviewable act of
     // opening a protocol — it must never change silently.
-    expect(FORWARD_PROTOCOLS).toEqual(["tcp", "tls", "ws"]);
-    expect(FORWARD_TRANSPORTS).toEqual(["stream"]);
+    expect(FORWARD_PROTOCOLS).toEqual(["tcp", "tls", "ws", "udp"]);
+    expect(FORWARD_TRANSPORTS).toEqual(["stream", "datagram"]);
     // V5-WP2 补全了计划的其余事实（revision / placement / listener / upstream），
     // 所以这里不再断言"只有三个字段" —— 那正是 WP2 要改的东西。协议的判定
     // 仍然只看这三个维度。
@@ -49,8 +49,11 @@ describe("V5-WP0 Forward protocol contract", () => {
 
   test("transport is derived and unknown transport fails closed", () => {
     expect(normalizeForwardTransport("stream")).toBe("stream");
-    expect(normalizeForwardTransport("datagram")).toBeNull();
+    // V5.1b opened the datagram transport; it is a TRANSPORT, so it normalises as
+    // one and is never a value a user picks — the protocol does that.
+    expect(normalizeForwardTransport("datagram")).toBe("datagram");
     expect(normalizeForwardTransport("carrier-pigeon")).toBeNull();
+    expect(normalizeForwardTransport("udp")).toBeNull();
   });
 
   test("V4 omission remains TCP-compatible", () => {
@@ -65,7 +68,10 @@ describe("V5-WP0 Forward protocol contract", () => {
     // Gate); `wss` stays out on purpose: the WS framing and the TLS transport
     // security are separate dimensions, and collapsing them into one enum name
     // is exactly what V5-WP0 undid.
-    for (const legacy of ["udp", "wss", "quic", "mtcp", "tunex"]) {
+    // `udp` left this list in V5.1b (WP5-B1): it is now an open protocol on its
+    // own transport. Its Gate is V5-G1B, so it must not be advertised as usable
+    // until that passes — but the CONTRACT knows it, which is what this list is.
+    for (const legacy of ["wss", "quic", "mtcp", "tunex"]) {
       expect(normalizeForwardProtocol(legacy)).toBeNull();
     }
     // And the open ones really are admitted — the two halves of the rule stay
@@ -73,6 +79,7 @@ describe("V5-WP0 Forward protocol contract", () => {
     // the only change.
     expect(normalizeForwardProtocol("tls")).toBe("tls");
     expect(normalizeForwardProtocol("ws")).toBe("ws");
+    expect(normalizeForwardProtocol("udp")).toBe("udp");
   });
 
   test("historical protocol facts are preserved without being admitted", () => {

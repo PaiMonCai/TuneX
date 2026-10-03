@@ -637,9 +637,13 @@ describe("A. 编排顺序（§7.11 十条步骤）", () => {
   });
 
   test("A1b. 未开放协议在 scheduler 边界 fail-closed，且绝不创建/下发", async () => {
+    // `quic` rather than `udp`: V5.1b opened udp (on the datagram transport), and
+    // what this case is about is a protocol whose Gate has NOT run — the example
+    // has to move as the contract opens protocols, or the test silently stops
+    // testing fail-closed behaviour.
     const before = tunnels.length;
     const result = await scheduler.createRelayTunnel(
-      input({ tunnelType: "udp" }),
+      input({ tunnelType: "quic" }),
       orch,
       deps,
     );

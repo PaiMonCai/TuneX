@@ -189,9 +189,12 @@ describe("B. 校验规则", () => {
   });
 
   test("B1b. legacy TunnelType 中存在的未开放协议仍 fail-closed", () => {
+    // `mtcp` is in the legacy enum and is NOT a product protocol; the example has
+    // to be a protocol whose Gate has not run (`udp` was this example until
+    // V5.1b opened it).
     const v = validateForwardCandidate({
       ...BASE_CONFIG,
-      protocol: "udp" as never,
+      protocol: "mtcp" as never,
     });
     expect(v.ok).toBe(false);
     expect(v.reasons).toContain("invalid_protocol");

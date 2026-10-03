@@ -1416,6 +1416,36 @@ Gate V5-G1A
 
 ## 6.2 V5.1b — UDP
 
+> **契约已冻结（WP5-B0，2026-10-04）**：完整语义见
+> [`docs/v5-1b-datagram-contract-draft.md`](docs/v5-1b-datagram-contract-draft.md)，
+> 该文档由 `DEVELOPMENT.md` §6.2 的要求驱动写成，回答八个问题并列出未猜测的开放
+> 产品决策；本文只保留结论与实施边界。拆分：
+>
+> ~~~text
+> WP5-B0  datagram 语义契约         DONE（上文链接）
+> WP5-B1  UDP DIRECT               进行中（agent 侧 datagram runtime + 面板侧开协议）
+> WP5-B2  UDP RELAY                阻塞：跨节点跳的形态是开放产品决策，不猜
+> Gate V5-G1B                      B1 完成后写脚本
+> ~~~
+>
+> **已冻结的结论（摘要）**
+>
+> | # | 结论 |
+> |---|---|
+> | 协议/传输 | 用户选 `protocol=udp`；`transport=datagram` 由协议派生，不是第二个字段。`datagram` 之所以是传输而不是协议：传输维度本就定义为「字节/报文怎么走」，而协议是「谁在说话」 |
+> | 生命周期 | stream 的单位是**连接**（有人关闭才结束）；datagram 的单位是**映射**（按空闲超时过期，目标侧没有可持有的对象——UDP 里没有 FIN 可观察）。因此 `ForwardTransportSpec.lifecycle` 增加了 `"mapping"` |
+> | 会话 | 入口映射的键 = 监听标识 + **归一化后的客户端地址**；目标**永不**进入键；映射**永不**持久化（LKG 只恢复配置，不恢复映射） |
+> | 三种结束方式 | 空闲过期、runtime 停止/进程退出，以及**明确指出：不存在显式关闭**。写下来是因为 TCP 的经验在这里会误导人 |
+> | StreamRuntime 映射 | `Start`/`Stop`/`Running` 适用；`Stats` 适用但单个 int64 不够（需要每方向报文/字节、映射数、丢弃数）；**`Drain` 与 `SetUpstream` 明确禁止强加给 datagram**，替代物是"停止新建映射"（socket 保持打开，因为回程共享它）与 `Retarget` |
+> | 端口所有权 | 仍走 NodePortLease + 端口守卫；但租约键是 `UNIQUE(node_id, port)` 而内核里 TCP/UDP 是两个命名空间 —— 因此冻结**保守规则：同一节点上 TCP 与 UDP 不共享端口号** |
+> | 观测 | 不得假装存在"连接数"；事实走 V5-WP5-A3 的每隧道 `diag` 通道（`runtime_counts` 是**封闭键集**，加未知键会让整份上报 400） |
+>
+> **开放产品决策（不猜，等产品回答）**：UDP RELAY 的跨节点跳形态（裸 TCP + 分帧 / UDP 出口 / 5.1b 不做 RELAY）、空闲超时取值与可配置性、映射上限与超限行为、TCP 与 UDP 是否允许共用端口号、UDP 是否计费及计在哪个链上、IPv4/IPv6 绑定与 v4-mapped 归一化、udp+DTLS 这一正交维度、以及协议级的套餐开关。
+>
+> **实施边界（B1）**：只做 UDP **DIRECT**。`udp` 在 EGRESS/RELAY 上必须被**拒绝**并给出明确错误，而不是半实现 —— 跨节点跳的形态未冻结。
+>
+> **无第二条实现**：datagram runtime 是新类型（不复用 `pipeTracker` 的连接模型），但生命周期、端口守卫、清单派生、诊断通道**复用既有机制**，不另建一套。
+
 UDP 是新的 Datagram lifecycle，不得套 TCP connection 模型。
 
 ### 目标生命周期

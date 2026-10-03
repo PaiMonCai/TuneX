@@ -80,7 +80,7 @@ describe("admitOnNode", () => {
     // `tls` (A1) and `ws` (A2) are NOT in this list any more: they are open, and
     // a node advertising them is admitted. The product gate still refuses
     // everything whose Gate has not run.
-    for (const protocol of ["udp", "quic"]) {
+    for (const protocol of ["quic"]) {
       expect(admitOnNode(ingress(futuristic), { action: "apply_tunnel", protocol })).toMatchObject({
         ok: false,
         layer: "protocol",

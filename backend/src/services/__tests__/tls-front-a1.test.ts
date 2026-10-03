@@ -30,7 +30,7 @@ const KEY = "/etc/tunex/tls/site.key";
 describe("tls is a protocol, not a transport", () => {
   test("tls is open and rides the stream transport", () => {
     // ws joined in V5-WP5-A2; both are stream protocols.
-    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws"]);
+    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp"]);
     expect(FORWARD_PROTOCOL_SPECS.tls.transport).toBe("stream");
     expect(FORWARD_PROTOCOL_SPECS.tls.legacy_tunnel_type).toBe("tls");
     // The plan shape is unchanged: a tls Forward is a stream plan like any other.
@@ -181,7 +181,22 @@ describe("dispatch facts: protocol and its required configuration", () => {
 
   test("a protocol the runtime has not opened is refused, whatever else the row says", () => {
     expect(dispatchFactsFromRow({ forward_protocol: "wss", tunnel_type: "wss" })).toBeNull();
-    expect(dispatchFactsFromRow({ tunnel_type: "udp" })).toBeNull();
+    expect(dispatchFactsFromRow({ tunnel_type: "mtcp" })).toBeNull();
+    expect(dispatchFactsFromRow({ forward_protocol: "quic", tunnel_type: "quic" })).toBeNull();
+  });
+
+  /**
+   * V5.1b：udp 走的是**另一条 transport**（datagram），因此它下发时既没有任何额外
+   * 配置字段（不像 tls 要证书），也绝不能被当成 stream 处理 —— 判定的依据是
+   * protocol → transport 的派生表，调用方不需要知道这件事。
+   */
+  test("a udp row dispatches on the datagram transport with no extra configuration", () => {
+    expect(dispatchFactsFromRow({ forward_protocol: "udp", tunnel_type: "udp" })).toEqual({
+      protocol: "udp",
+    });
+    expect(FORWARD_PROTOCOL_SPECS.udp.transport).toBe("datagram");
+    const plan = buildForwardRuntimePlan("direct", "udp");
+    expect(plan.transport).toEqual({ name: "datagram", lifecycle: "mapping" });
   });
 
   test("a row with no protocol fact at all stays fail-closed", () => {

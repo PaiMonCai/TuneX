@@ -120,26 +120,29 @@ describe("normalizeCapabilityManifest", () => {
   /**
    * 未知条目名是**事实**，不是许可。
    *
-   * 判定函数只回答「这台节点实现了没有」，因此一个广告了 udp 的节点在节点维度
-   * 上确实是「实现了 udp」。真正阻止它的是更早的产品白名单（WP0 的
-   * normalizeForwardProtocol / admitOnNode）——所以 udp 无论怎么上报都进不了
+   * 判定函数只回答「这台节点实现了没有」，因此一个广告了 quic 的节点在节点维度
+   * 上确实是「实现了 quic」。真正阻止它的是更早的产品白名单（WP0 的
+   * normalizeForwardProtocol / admitOnNode）——所以 quic 无论怎么上报都进不了
    * 下发路径。这两层必须分开断言，否则「未知能力被放行」这种回归看不出来。
    */
   test("unknown item names are kept as facts but can never admit anything", () => {
     const normalized = normalizeCapabilityManifest({
       schema_version: 2,
-      protocols: ["tcp", "udp"],
+      protocols: ["tcp", "quic"],
       transports: ["stream", "datagram"],
     });
-    expect(normalized?.protocols).toEqual(["tcp", "udp"]);
+    // The normaliser sorts, so the assertion reads as the stored fact rather than
+    // as the order the agent happened to send.
+    expect(normalized?.protocols).toEqual(["quic", "tcp"]);
     expect(normalized?.transports).toEqual(["datagram", "stream"]);
 
     const v2 = facts({ protocolVersion: 2, capabilities: ["apply_tunnel"], manifest: normalized });
-    // Node dimension: the agent really did advertise udp, so the fact is kept.
-    expect(decideProtocolCapability(v2, "udp")).toEqual({ supported: true, basis: "advertised" });
-    // Product dimension: udp is not a product protocol, so admission still refuses.
+    // Node dimension: the agent really did advertise quic, so the fact is kept.
+    expect(decideProtocolCapability(v2, "quic")).toEqual({ supported: true, basis: "advertised" });
+    // Product dimension: quic is NOT a product protocol (its Gate has not run),
+    // so admission still refuses even though the node advertised it.
     expect(
-      admitOnNode({ nodeId: 1, role: "ingress", facts: v2 }, { action: "apply_tunnel", protocol: "udp" }),
+      admitOnNode({ nodeId: 1, role: "ingress", facts: v2 }, { action: "apply_tunnel", protocol: "quic" }),
     ).toMatchObject({ ok: false, layer: "protocol", reason: "protocol_not_supported" });
     // And the transport is DERIVED from the protocol, never taken from the
     // agent's own advertising: a node claiming `datagram` still runs tcp as
