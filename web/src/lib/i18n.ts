@@ -297,6 +297,21 @@ const zh = {
     monitorAttentionHint: "应用失败的转发",
     monitorTraffic: "累计流量",
     monitorTrafficHint: "当前工作空间全部转发",
+    /*
+     * V5-WP5-A1 §6.1：协议面词条。
+     * 「协议」与「模式（直连/中继）」是两个维度，文案不得互相替代；
+     * 这里也刻意不出现 `wss` —— 它不是一个可创建的协议名。
+     */
+    protocol: "协议",
+    protocolUnsupported: "当前运行时未开放",
+    protocolFixedHint: "创建后不可更改。tls 的证书与私钥是入口节点上的文件，面板只保存路径。",
+    tlsCertPath: "证书路径（入口节点本地）",
+    tlsKeyPath: "私钥路径（入口节点本地）",
+    tlsPathsHint: "填写节点上的绝对路径；密钥内容不会上传到面板。",
+    tlsPathRequired: "tls 转发必须同时填写证书与私钥的绝对路径。",
+    tlsPathAbsolute: "请填写以 / 开头的节点本地绝对路径。",
+    tlsPathTooLong: "路径长度不能超过 512 个字符。",
+    tlsPathNotAllowed: "只有 tls 转发可以携带证书/私钥路径。",
     listenPort: "监听端口",
     autoPort: "留空由系统自动分配",
     targetHost: "目标主机",
@@ -1075,6 +1090,18 @@ const en: Dict = {
     monitorAttentionHint: "Forwards with apply errors",
     monitorTraffic: "Total traffic",
     monitorTrafficHint: "All forwards in this workspace",
+    /* V5-WP5-A1 §6.1 — protocol surface. "protocol" and "mode" stay separate. */
+    protocol: "Protocol",
+    protocolUnsupported: "Not enabled by this runtime",
+    protocolFixedHint:
+      "Fixed after creation. For tls, the certificate and key are files on the ingress node; the panel stores only their paths.",
+    tlsCertPath: "Certificate path (node-local)",
+    tlsKeyPath: "Private key path (node-local)",
+    tlsPathsHint: "Absolute paths on the node; key material is never uploaded to the panel.",
+    tlsPathRequired: "A tls forward requires absolute paths for both the certificate and the key.",
+    tlsPathAbsolute: "Use an absolute node-local path starting with /.",
+    tlsPathTooLong: "A path can be at most 512 characters.",
+    tlsPathNotAllowed: "Only a tls forward may carry certificate/key paths.",
     listenPort: "Listen port",
     autoPort: "Leave empty for automatic allocation",
     targetHost: "Target host",

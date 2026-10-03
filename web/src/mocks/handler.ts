@@ -81,8 +81,33 @@ import {
 // `components/forwards/__tests__/wp8-forward-status.test.ts` 直接读后端源码做集合断言。
 // mock 里再抄一份「哪些码可重试」就是第三份判据 —— 报告 N1 记的正是这种形态。
 import { applyErrorIsRetryable } from "@/lib/forward-status";
+// V5-WP5-A1：协议契约（白名单 + tls 路径规则）只保留**一份**实现。
+// mock 无法 import 后端，因此复用前端的契约镜像（与 `forward-status` 同一处理方式），
+// 而不是在 mock 里再抄一遍 `["tcp","tls","ws"]` —— 抄一份就是第三处白名单。
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  forwardProtocolFact,
+  forwardProtocolSupported,
+  isForwardProtocol,
+  tlsPathFieldErrors,
+  type ForwardProtocol,
+} from "@/lib/forward-protocol";
 import type { ForwardPatchInput } from "@/lib/types";
 import { mockEffectivePermissions, mockBasePermissions, mockGrantSubset, validMockRolePermissions } from "./workspace-permissions";
+
+/**
+ * V5-WP5-A1：`lib/forward-protocol.ts` 的预检 key → 人话错误体。
+ *
+ * 后端对应文案在 `forward-contract.ts` 的 `tlsPathsForProtocol`（reason 字段）。
+ * mock 需要一个可直接显示的 message（toast 会照原样画出来），所以这里做一次映射，
+ * 而不是把 i18n key 当错误信息发出去。
+ */
+const TLS_PATH_ERROR_MESSAGES: Record<string, string> = {
+  "forward.tlsPathRequired": "tls 转发必须提供证书与私钥路径",
+  "forward.tlsPathAbsolute": "证书/私钥路径必须是节点本地绝对路径",
+  "forward.tlsPathTooLong": "证书/私钥路径不能超过 512 个字符",
+  "forward.tlsPathNotAllowed": "只有 tls 转发可以携带证书/私钥路径",
+};
 
 // forward-edit.ts 需要 handler 的 forward 投影（避免反向依赖），在这里注入一次。
 injectMockForwardView((_db, tunnel) => mockForwardView(_db, tunnel));
@@ -1225,7 +1250,20 @@ function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
     id: tunnel.id,
     creator_user_id: tunnel.user_id ?? null,
     name: tunnel.name,
-    protocol: "tcp",
+    /*
+     * V5-WP5-A1：协议事实来自行（`forward_protocol` 优先，回落 legacy
+     * `tunnel_type`），与后端 `persistedForwardProtocol` 同一口径。
+     *
+     * 这里曾经硬编码 `"tcp"`：那条投影把 seed 里的 `tls` / `wss` 行全部谎报成
+     * TCP，于是前端在 mock 下**永远看不到**新协议面（V5-G0 在真实下发面上抓到的
+     * 正是同一种「投影忘了选协议列」）。`protocol_supported` 由同一个契约模块判定，
+     * mock 不另立一份白名单。
+     */
+    protocol: forwardProtocolFact(tunnel.forward_protocol, tunnel.tunnel_type),
+    protocol_supported: forwardProtocolSupported(
+      tunnel.forward_protocol,
+      tunnel.tunnel_type,
+    ),
     mode: tunnel.tunnel_mode === "relay" ? "relay" : "direct",
     ingress_node_id: ingress?.id ?? tunnel.in_node_group_id,
     ingress_node: ingress,
@@ -2237,6 +2275,35 @@ export async function handleMock(method: string, path: string, req: MockRequest)
         return badRequest("端口转发参数不合法");
       }
 
+      /*
+       * V5-WP5-A1：协议 + tls 路径，与后端 `ForwardCreateSchema` /
+       * `tlsPathsForProtocol` 同一口径：
+       *   · 省略协议 = V4 的 tcp（入口的「省略即默认」只在这里成立）；
+       *   · 显式未知协议 → 400（`z.enum(FORWARD_PROTOCOLS)`）；
+       *   · tls 必须给出两个以 `/` 开头的绝对路径；非 tls 携带路径 → 400。
+       * mock 若不拦，前端就会在开发期看到一次「成功」，线上（或 Gate）才 400 ——
+       * 这正是 mock 需要镜像契约的理由。
+       */
+      const rawProtocol = reqStr(body.protocol);
+      const protocol: ForwardProtocol =
+        rawProtocol === "" ? DEFAULT_FORWARD_PROTOCOL : (rawProtocol as ForwardProtocol);
+      if (!isForwardProtocol(protocol)) {
+        return badRequest("不支持的转发协议");
+      }
+      const tlsPathError = tlsPathFieldErrors(
+        protocol,
+        reqStr(body.tls_cert_path),
+        reqStr(body.tls_key_path),
+      );
+      // 预检返回的是 i18n key（给界面用）；mock 这里给出的是**人话错误体**，
+      // 与后端 `tlsPathsForProtocol` 的 reason 同义（不然 toast 里会画出 key）。
+      const tlsPathMessage = tlsPathError.tls_cert_path ?? tlsPathError.tls_key_path;
+      if (tlsPathMessage) {
+        return badRequest(TLS_PATH_ERROR_MESSAGES[tlsPathMessage] ?? "证书/私钥路径不合法");
+      }
+      const tlsCertPath = protocol === "tls" ? reqStr(body.tls_cert_path) : "";
+      const tlsKeyPath = protocol === "tls" ? reqStr(body.tls_key_path) : "";
+
       const ingressRaw = db.nodes.find((node) => node.id === ingressId);
       if (!ingressRaw) return notFound("入口节点不存在");
       const ingress = mockUserNode(db, ingressRaw);
@@ -2278,14 +2345,24 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       const created: Tunnel = {
         id: newId,
         name,
-        tunnel_type: "tcp",
+        /*
+         * legacy `tunnel_type` 只写契约给出的镜像值；`ws` 在 legacy 枚举里没有
+         * 对应值，**不写**这一列（后端的 `legacyTunnelTypeColumn("ws")` 返回空对象，
+         * 于是列保留 DB 默认值；`forward_protocol` 才是唯一的协议事实）。
+         * 这里之所以仍写一个具体值，是因为 mock 的 store 行必须有值才自洽 ——
+         * 用默认的 `wss` 模拟「列保留默认」的行为。
+         */
+        tunnel_type: protocol === "ws" ? "wss" : protocol,
+        forward_protocol: protocol,
+        tls_cert_path: tlsCertPath === "" ? null : tlsCertPath,
+        tls_key_path: tlsKeyPath === "" ? null : tlsKeyPath,
         category: "port_forward",
         listen_ip: "0.0.0.0",
         listen_port: effectiveListenPort,
-        listen_protocol: ["tcp"],
+        listen_protocol: [protocol],
         status: "active",
         forward_addresses: [target],
-        forward_addresses_protocol: ["tcp"],
+        forward_addresses_protocol: [protocol],
         load_balance_type: "round",
         ip_type: "ipv4",
         order_by: db.tunnels.reduce((max, row) => Math.max(max, row.order_by), 0) + 10,

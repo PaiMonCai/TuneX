@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
 import { ForwardDiagnose } from "@/components/forwards/forward-diagnose";
 import { ForwardEditDialog, RunningVsDesiredBadge } from "@/components/forwards/forward-edit-dialog";
+import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
@@ -268,6 +269,15 @@ export function ForwardDetail({
             </InfoRow>
             <InfoRow label={t("forward.mode")}>
               {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
+            </InfoRow>
+            {/*
+              V5-WP5-A1：协议事实（三种可创建值 + 历史行的未开放值）。
+              渲染走共用徽标，未知取值**不会**退化成 "unknown"。
+              证书/私钥路径不在这里展示：后端 `forwardView` 刻意**不投影**这两列
+              （证书是节点本地文件，面板只需要知道「是 tls」），详见任务回报的契约缺口。
+            */}
+            <InfoRow label={t("forward.protocol")}>
+              <ForwardProtocolBadge forward={forward} />
             </InfoRow>
             <InfoRow label={t("forward.ingressNode")}>
               {forward.ingress_node?.node_id ?? forward.ingress_node_id}

@@ -426,6 +426,8 @@ export const mockTunnels: Tunnel[] = [
     id: 1,
     name: "群晖 Web 面板",
     tunnel_type: "tcp",
+    /* V5-WP5-A1：`forward_protocol` 是权威协议事实（`tunnel_type` 只是 legacy 镜像）。 */
+    forward_protocol: "tcp",
     category: "port_forward",
     listen_ip: "0.0.0.0",
     listen_port: 20001,
@@ -472,6 +474,18 @@ export const mockTunnels: Tunnel[] = [
     id: 2,
     name: "开发机 SSH",
     tunnel_type: "tls",
+    /*
+     * V5-WP5-A1 的 tls 样例：入口监听是 TLS，证书/私钥是**入口节点上的文件**，
+     * 行里只有路径（面板永远不发密钥内容）。UI 的示范路径：列表/详情/首页都
+     * 应显示 TLS，创建表单在 protocol=tls 时出现这两个必填路径。
+     *
+     * legacy 的 `listen_protocol` / `forward_addresses_protocol` 两列有意不动：
+     * Forward 的协议事实只由 `forward_protocol` 投影，改这两列既不是本任务的范围，
+     * 也证明不了任何契约。
+     */
+    forward_protocol: "tls",
+    tls_cert_path: "/etc/tunex/tls/ssh-front.crt",
+    tls_key_path: "/etc/tunex/tls/ssh-front.key",
     category: "port_forward",
     listen_ip: "0.0.0.0",
     listen_port: 20002,
@@ -518,6 +532,12 @@ export const mockTunnels: Tunnel[] = [
     id: 3,
     name: "游戏联机 UDP",
     tunnel_type: "udp",
+    /*
+     * 历史事实样例：这一行的协议是 `udp`，当前运行时**尚未开放**它。
+     * 投影必须照实给出 `udp` + `protocol_supported: false`，界面按事实渲染
+     * （绝不回落成 tcp，也不显示 "unknown"）。
+     */
+    forward_protocol: "udp",
     category: "port_forward",
     listen_ip: "0.0.0.0",
     listen_port: 20010,
@@ -564,6 +584,12 @@ export const mockTunnels: Tunnel[] = [
     id: 4,
     name: "测试隧道（已停用）",
     tunnel_type: "wss",
+    /*
+     * 历史 `wss` 行：legacy 枚举里叫 `wss`，但 `wss` **不是**产品协议
+     * （§6.1：`wss = ws + TLS 终止`，产品没有表达「要不要 TLS」的字段）。
+     * 照实投影成 `wss` 且未开放 —— 界面显示 WSS，不会被当成 TCP 复活。
+     */
+    forward_protocol: "wss",
     category: "port_forward",
     listen_ip: "0.0.0.0",
     listen_port: 20020,

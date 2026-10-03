@@ -31,7 +31,18 @@ import {
   bindingUsageView,
   hasBindingUsage,
 } from "@/components/forwards/forward-binding-usage";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  FORWARD_PROTOCOLS,
+  FORWARD_TLS_PATH_MAX,
+  forwardProtocolFields,
+  forwardProtocolLabel,
+  forwardProtocolNote,
+  tlsPathFieldErrors,
+  type ForwardProtocol,
+} from "@/lib/forward-protocol";
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
+import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -386,6 +397,15 @@ export function ForwardWorkspace() {
   const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
   const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
   const [name, setName] = useState("");
+  /**
+   * V5-WP5-A1：创建表单的协议选择。取值只能是契约白名单里的值
+   * （`lib/forward-protocol.ts` 的 `FORWARD_PROTOCOLS`），下拉里没有第四个值、
+   * 也没有 `wss`（§6.1：`wss` 不是一个协议名）。
+   */
+  const [protocol, setProtocol] = useState<ForwardProtocol>(DEFAULT_FORWARD_PROTOCOL);
+  /** tls 入口的证书/私钥路径（节点本地绝对路径；面板只发路径，不发密钥内容）。 */
+  const [tlsCertPath, setTlsCertPath] = useState("");
+  const [tlsKeyPath, setTlsKeyPath] = useState("");
   const [ingressId, setIngressId] = useState("");
   const [egressId, setEgressId] = useState("");
   const [listenPort, setListenPort] = useState("");
@@ -622,6 +642,9 @@ export function ForwardWorkspace() {
     const firstIngress = filteredIngress ?? ingressNodes[0];
     setCreateMode(mode);
     setName("");
+    setProtocol(DEFAULT_FORWARD_PROTOCOL);
+    setTlsCertPath("");
+    setTlsKeyPath("");
     setIngressId(firstIngress ? String(firstIngress.id) : "");
     setEgressId("");
     setListenPort("");
@@ -638,12 +661,18 @@ export function ForwardWorkspace() {
    * 纯逻辑）构造 —— 监听端口一律留空（自动分配，避免与源转发抢同一个入口端口）、
    * 运行态/流量/revision 结构上进不来。这里只负责把草稿装进创建表单让用户确认，
    * 真正的 POST 仍走 `createForward()`，因此「复制」没有第二条写路径。
+   *
+   * V5-WP5-A1：协议随草稿带过（tls 转发复制出来必须还是 tls），但证书/私钥路径
+   * 永远为空 —— 后端不投影这两列，只能由运维在表单里重新填写（见 `forwardCopyDraft`）。
    */
   function copyForward(forward: PortForward) {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
     const draft = forwardCopyDraft(forward, L("forward.copySuffix"));
     setCreateMode(draft.mode);
     setName(draft.name);
+    setProtocol(draft.protocol);
+    setTlsCertPath(draft.tlsCertPath);
+    setTlsKeyPath(draft.tlsKeyPath);
     setIngressId(draft.ingressId);
     setEgressId(draft.egressId);
     setListenPort(draft.listenPort);
@@ -681,6 +710,20 @@ export function ForwardWorkspace() {
     }
   }
 
+  /**
+   * V5-WP5-A1：tls 路径的形态预检（与 create payload builder 成对，见
+   * `lib/forward-protocol.ts`）。
+   *
+   * 「tls 但没有证书」在契约里不是一种状态：这里拦住它，而不是把半条配置发给
+   * 后端换一个 400。非 tls 协议携带路径同样在此被拒（正常情况下到不了 —— 切换
+   * 协议会清空路径输入）。
+   */
+  const protocolErrors = useMemo(
+    () => tlsPathFieldErrors(protocol, tlsCertPath, tlsKeyPath),
+    [protocol, tlsCertPath, tlsKeyPath],
+  );
+  const protocolReady = Object.keys(protocolErrors).length === 0;
+
   async function createForward() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
     const ingress = Number(ingressId);
@@ -703,6 +746,13 @@ export function ForwardWorkspace() {
       toast.error(t("forward.chooseEgress"));
       return;
     }
+    // 提交按钮已按同一份预检禁用；这里再拦一次，防止键盘/程序路径绕过。
+    const firstProtocolError =
+      protocolErrors.tls_cert_path ?? protocolErrors.tls_key_path;
+    if (firstProtocolError) {
+      toast.error(t(firstProtocolError));
+      return;
+    }
 
     setBusy(true);
     try {
@@ -714,6 +764,9 @@ export function ForwardWorkspace() {
         target_host: targetHost.trim(),
         target_port: targetPortNum,
         egress_node_id: createMode === "relay" ? Number(egressId) : null,
+        // 协议与（仅 tls 的）路径由同一个纯函数生成：非 tls 的请求里两个路径键
+        // 结构上不存在，不存在「发出去再让 Agent 决定忽略」的字段。
+        ...forwardProtocolFields(protocol, tlsCertPath, tlsKeyPath),
       });
       setCreatedForward(created);
       setCreateOpen(false);
@@ -1193,6 +1246,8 @@ export function ForwardWorkspace() {
                     order={order}
                     onSort={toggleSort}
                   />
+                  {/* V5-WP5-A1：协议列。与「模式」是两个维度，不共用一格。 */}
+                  <TableHead>{t("forward.protocol")}</TableHead>
                   <TableHead>{t("forward.ingressNode")}</TableHead>
                   <TableHead>{t("forward.egressNode")}</TableHead>
                   <SortableHead
@@ -1224,12 +1279,12 @@ export function ForwardWorkspace() {
               <TableBody>
                 {loading ? (
                   <TableRow>
-                    <TableCell colSpan={11} className="h-24 text-center text-[var(--muted-foreground)]">
+                    <TableCell colSpan={12} className="h-24 text-center text-[var(--muted-foreground)]">
                       {t("common.loading")}
                     </TableCell>
                   </TableRow>
                 ) : forwards.length === 0 ? (
-                  <TableEmpty colSpan={11} text={t("common.noData")} />
+                  <TableEmpty colSpan={12} text={t("common.noData")} />
                 ) : (
                   forwards.map((forward) => (
                     <TableRow key={String(forward.id)}>
@@ -1255,6 +1310,10 @@ export function ForwardWorkspace() {
                         <Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>
                           {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
                         </Badge>
+                      </TableCell>
+                      <TableCell>
+                        {/* 共用徽标：`tls` / `ws` / 历史 `wss` 都照实渲染，无 unknown 兜底。 */}
+                        <ForwardProtocolBadge forward={forward} />
                       </TableCell>
                       <TableCell>{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
                       <TableCell>{forward.egress_node?.node_id ?? "—"}</TableCell>
@@ -1372,6 +1431,80 @@ export function ForwardWorkspace() {
               <Field label={t("common.name")}>
                 <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="web-hk" />
               </Field>
+
+              {/*
+                V5-WP5-A1：协议。选项**逐一**来自契约白名单（`FORWARD_PROTOCOLS`），
+                没有第四个值、也没有 `wss` —— §6.1 把「分帧（ws）」与「传输安全（tls）」
+                分成两个维度，`wss` 这种合并名正是 WP0 拆掉的东西。
+              */}
+              <Field label={t("forward.protocol")} hint={forwardProtocolNote(locale, protocol)}>
+                <Select
+                  value={protocol}
+                  onValueChange={(value) => {
+                    const next = value as ForwardProtocol;
+                    setProtocol(next);
+                    // 离开 tls 时清空路径：否则「协议=tcp + 残留的证书路径」会被
+                    // 后端 400（非 tls 不得携带路径）。与 mode→direct 清空出口同一
+                    // 处理方式：切换后不让上一个形态的输入留在表单里。
+                    if (next !== "tls") {
+                      setTlsCertPath("");
+                      setTlsKeyPath("");
+                    }
+                  }}
+                >
+                  <SelectTrigger data-testid="forward-protocol-select">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FORWARD_PROTOCOLS.map((value) => (
+                      <SelectItem key={value} value={value} data-testid={`forward-protocol-${value}`}>
+                        {forwardProtocolLabel(value)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+
+              {/*
+                tls 才出现的两个必填字段。节点本地绝对路径 —— 面板只把路径写进
+                期望配置，证书与私钥文件本身始终留在节点上（§6.1：证书归运维）。
+                两个都填齐之前提交按钮是禁用的（见 DialogFooter 的 disabled）。
+              */}
+              {protocol === "tls" ? (
+                <>
+                  <Field
+                    label={t("forward.tlsCertPath")}
+                    hint={t("forward.tlsPathsHint")}
+                    error={protocolErrors.tls_cert_path ? t(protocolErrors.tls_cert_path) : undefined}
+                  >
+                    <Input
+                      value={tlsCertPath}
+                      maxLength={FORWARD_TLS_PATH_MAX}
+                      placeholder="/etc/tunex/tls/front.crt"
+                      data-testid="forward-tls-cert-path"
+                      // 必填语义给到无障碍树（表单没有原生 submit，按钮闸门在 Footer）
+                      required
+                      aria-invalid={protocolErrors.tls_cert_path ? true : undefined}
+                      onChange={(event) => setTlsCertPath(event.target.value)}
+                    />
+                  </Field>
+                  <Field
+                    label={t("forward.tlsKeyPath")}
+                    error={protocolErrors.tls_key_path ? t(protocolErrors.tls_key_path) : undefined}
+                  >
+                    <Input
+                      value={tlsKeyPath}
+                      maxLength={FORWARD_TLS_PATH_MAX}
+                      placeholder="/etc/tunex/tls/front.key"
+                      data-testid="forward-tls-key-path"
+                      required
+                      aria-invalid={protocolErrors.tls_key_path ? true : undefined}
+                      onChange={(event) => setTlsKeyPath(event.target.value)}
+                    />
+                  </Field>
+                </>
+              ) : null}
+
               <Field label={t("forward.ingressNode")}>
                 <Select
                   value={ingressId}
@@ -1499,6 +1632,9 @@ export function ForwardWorkspace() {
               disabled={
                 busy ||
                 ingressNodes.length === 0 ||
+                // V5-WP5-A1：tls 的两个路径没填齐 → 提交按钮点不动
+                // （「tls 但没有证书」不是一种可提交的状态）。
+                !protocolReady ||
                 (createMode === "relay" && (!egressId || selectedBindings.length === 0))
               }
             >
@@ -1552,16 +1688,22 @@ export function ForwardWorkspace() {
 function Field({
   label,
   hint,
+  error,
   children,
 }: {
   label: string;
   hint?: string;
+  /** 形态预检错误（已本地化文本）。与 hint 并列显示：错误说「怎么改」。 */
+  error?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-1.5">
       <Label>{label}</Label>
       {children}
+      {error ? (
+        <p className="text-xs text-[var(--destructive)]">{error}</p>
+      ) : null}
       {hint ? <p className="text-xs text-[var(--muted-foreground)]">{hint}</p> : null}
     </div>
   );

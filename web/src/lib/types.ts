@@ -2,6 +2,7 @@
  * 与 backend/prisma/schema.prisma 对齐的前端类型定义。
  * 命名保持 Prisma 原样（snake_case），避免与后端 JSON 字段不一致。
  */
+import type { ForwardProtocolFact } from "./forward-protocol";
 
 export type ID = number;
 
@@ -352,6 +353,18 @@ export interface Tunnel {
   /** legacy DIRECT 开关列（active/inactive）；与 desired_status 并行存在。 */
   forward_addresses: string[];
   forward_addresses_protocol: string[] | null;
+  /**
+   * V5-WP0/A1 行级协议事实（`Tunnel.forward_protocol` 列）。
+   *
+   * 只给 **mock 的 store** 用：mock 的行是 DB 行（含 `remote_host` 等运行态列）的
+   * 镜像，而 `forward_protocol` 是 `PortForward.protocol` 投影的唯一来源，
+   * mock 若不存它就必然把每条 Forward 谎报成 `tcp`（V5-G0 抓到的正是这种形态）。
+   * 真实 `/api/tunnels` 的响应是否携带该列由后端决定，前端不依赖它。
+   */
+  forward_protocol?: string | null;
+  /** V5-WP5-A1：tls 入口的证书/私钥路径列（仅路径，无密钥内容）。 */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   load_balance_type: LoadBalanceType;
   ip_type: IpType;
   order_by: number;
@@ -997,11 +1010,20 @@ export interface PortForward {
   id: ID;
   name: string;
   /**
-   * V5-WP5-A1: the product protocol the runtime has opened. Mirrors the backend's
-   * FORWARD_PROTOCOLS — a forward created before the protocol field existed has
-   * no value, and the UI must not invent one (the panel resolves it from the row).
+   * V5-WP5-A1：这一行的**协议事实**（后端投影：`forward_protocol` 优先，回落
+   * legacy `tunnel_type`，所以协议列出现之前的行也会报告它当时是什么）。
+   *
+   * 联合类型给出本契约开放的取值（`tcp` / `tls` / `ws`，见
+   * `lib/forward-protocol.ts`）；开口的那一支让历史事实（`wss` / `udp` …）保持
+   * 诚实 —— 界面只渲染行上写着的东西，绝不改写它。是否被当前运行时开放看
+   * {@link protocol_supported}。
    */
-  protocol: "tcp" | "tls";
+  protocol: ForwardProtocolFact;
+  /**
+   * V5-WP5-A1：当前运行时是否开放这个协议（后端 `protocol_supported`）。
+   * `false` = 历史/未开放的协议事实：按原样展示，**不得**替换成缺省值。
+   */
+  protocol_supported: boolean;
   mode: "direct" | "relay";
   ingress_node_id: ID;
   ingress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;
@@ -1042,11 +1064,28 @@ export interface PortForwardCreateInput {
 export interface ForwardCreateInput extends PortForwardCreateInput {
   mode: "direct" | "relay";
   ingress_node_id: ID;
+  /**
+   * V5-WP5-A1：创建时选定的协议。省略时后端按 V4 语义回落 `tcp`；界面总是显式
+   * 携带（创建了什么就发什么）。取值只能是契约白名单里的值。
+   */
+  protocol?: ForwardProtocolFact;
+  /**
+   * V5-WP5-A1：`tls` 入口监听使用的证书/私钥路径 —— **只有路径**，绝不含密钥内容
+   * （§6.1：证书归运维，以节点本地文件存在）。非 tls 协议携带它们是 400，因此
+   * 只能经 `forwardProtocolFields()` 生成，保证非 tls 的请求里这两个键不存在。
+   */
+  tls_cert_path?: string;
+  tls_key_path?: string;
 }
 
 /**
  * V4-WP1 全字段编辑 patch（与后端 ForwardPatchSchema 同形）。
  * `expected_revision` 是可选的乐观并发凭据；缺失 = 首次请求或有意跳过检查。
+ *
+ * V5-WP5-A1 未改动此处：后端 `ForwardPatchSchema` 目前**不接受** `protocol` /
+ * `tls_cert_path` / `tls_key_path`（它是 `.strict()`，多发一个键就是 400），
+ * 所以「协议」创建后不可改 —— 编辑器只读展示当前协议，不提供改协议入口。
+ * 这条差异已在任务回报中作为契约缺口记录，前端不自行猜测后端行为。
  */
 export interface ForwardPatchInput {
   name?: string;

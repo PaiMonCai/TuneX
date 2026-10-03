@@ -12,6 +12,10 @@
  *    rollout 规则；这里只做「空值 / 端口范围」这类形态预检，少发无效请求。
  *  · `expected_revision` 取打开编辑器时的 `config_revision`（desired 指针），
  *    不是 `applied_revision`——否则永远打不中并发闸门。
+ *
+ * V5-WP5-A1：编辑器**不改协议**（后端 `ForwardPatchSchema` 不接受 `protocol` /
+ * `tls_*`），只读展示当前协议；协议徽标的唯一实现见
+ * `components/forwards/forward-protocol-badge.tsx`。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Copy, Info, Link2, Loader2, ShieldAlert } from "lucide-react";
@@ -27,6 +31,8 @@ import {
   type ForwardDraft,
 } from "@/components/forwards/forward-copy";
 import { bindingUsageView } from "@/components/forwards/forward-binding-usage";
+import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
+import { forwardProtocolNote, isForwardProtocol } from "@/lib/forward-protocol";
 import {
   Dialog,
   DialogContent,
@@ -164,7 +170,7 @@ export function ForwardEditDialog({
   onSaved: (updated: PortForward) => void;
   onReload: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { currentId, permissions, canForward } = useWorkspace();
   const allowed = canForward(forward, "update");
   const [draft, setDraft] = useState<Draft>(() => draftFrom(forward));
@@ -174,6 +180,18 @@ export function ForwardEditDialog({
   const seq = useRef(0);
 
   const expectedRevision = forward.config_revision ?? forward.latest_revision ?? 0;
+
+  /**
+   * V5-WP5-A1：协议只读提示。
+   *
+   * 后端 `ForwardPatchSchema` 不接受 `protocol` / `tls_cert_path` / `tls_key_path`
+   * （`.strict()`：多发一个键就是 400），所以协议创建后不可改。这里展示事实 +
+   * 一句「为什么改不了」，而不是摆一个点了注定失败的下拉框。
+   */
+  const protocolFact = isForwardProtocol(forward.protocol) ? forward.protocol : null;
+  const protocolHint = protocolFact
+    ? `${t("forward.protocolFixedHint")} ${forwardProtocolNote(locale, protocolFact)}`
+    : t("forward.protocolFixedHint");
 
   // 打开时重置草稿；forward 变化（刷新后）也重置，避免拿旧草稿覆盖别人保存。
   useEffect(() => {
@@ -364,6 +382,15 @@ export function ForwardEditDialog({
                 maxLength={60}
                 onChange={(event) => setDraft((d) => ({ ...d, name: event.target.value }))}
               />
+            </Field>
+
+            <Field label={t("forward.protocol")} hint={protocolHint}>
+              <div
+                className="flex h-9 items-center rounded-md border border-[var(--border)] bg-[var(--muted)]/40 px-3"
+                data-testid="forward-edit-protocol"
+              >
+                <ForwardProtocolBadge forward={forward} />
+              </div>
             </Field>
 
             <Field label={t("forward.mode")}>
