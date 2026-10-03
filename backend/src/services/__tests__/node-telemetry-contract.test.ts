@@ -22,7 +22,7 @@
  */
 import { test, expect, describe } from "bun:test";
 import { Prisma } from "@prisma/client";
-import { telemetryColumns, validateStateReport } from "../node-state.ts";
+import { telemetryColumns, validateStateReport, targetKeyOf } from "../node-state.ts";
 
 /** 一份最小的合法上报（含 WP7 既有字段）。 */
 const BASE = {
@@ -319,5 +319,124 @@ describe("protocol diagnostics ride through the state report (V5-WP5-A3)", () =>
       tunnels: [{ id: "tunex-4-direct", mode: "DIRECT", ingress_port: 21003, revision: 1, diag: "not-an-object" }],
     });
     expect(result.ok).toBe(true);
+  });
+});
+
+/* ================================================================== */
+/* V5.2 WP5：目标观测上报（Observation 是事实，不是 desired）             */
+/* ================================================================== */
+
+describe("target observations ride the state report (V5.2 WP5)", () => {
+  const base = {
+    agent_id: "agent-1",
+    node_id: "WP14-OUT-A-NODE",
+    ts: 1_800_000_000,
+    host: { cpu_cores: 2, mem_total: 512, agent_version: "1.0.0" },
+  };
+  const entry = (over: Record<string, unknown> = {}) => ({
+    host: "10.0.0.5",
+    port: 8080,
+    reachable: true,
+    latency_ms: 12,
+    consecutive_success: 7,
+    consecutive_failure: 0,
+    success_rate: 1,
+    last_observed_at: 1_800_000_000,
+    observation_source: "3/tcp_connect",
+    ...over,
+  });
+
+  test("the validated report KEEPS the observations (the whitelist trap)", () => {
+    // 这条断言防的是本文件上文注释里写的那个陷阱：字段校验通过、但没列进
+    // 返回白名单 → 静默丢失，症状是"上报 200、投影永远为空"。
+    const result = validateStateReport({ ...base, target_observations: [entry()] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations).toHaveLength(1);
+    expect(result.report.target_observations?.[0]).toMatchObject({
+      host: "10.0.0.5",
+      port: 8080,
+      reachable: true,
+      latency_ms: 12,
+      success_rate: 1,
+      observation_source: "3/tcp_connect",
+    });
+  });
+
+  test("a malformed ENTRY is dropped, not the whole report", () => {
+    // 观测是**附加证据**：一条坏记录只是那一条没用。若照 tunnels 的严格度让整份
+    // 上报 400，一个观测字段的类型错误就会把节点的遥测、健康、隧道列表一起黑掉。
+    const result = validateStateReport({
+      ...base,
+      tunnels: [{ id: "tunex-1-direct", mode: "DIRECT", ingress_port: 21000, revision: 1 }],
+      target_observations: [
+        entry(),
+        entry({ port: 0 }),
+        entry({ reachable: "yes" }),
+        entry({ last_observed_at: 0 }),
+        entry({ observation_source: "" }),
+        "not-an-object",
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations).toHaveLength(1);
+    // 隧道列表不受影响：这两件事的失败域必须分开。
+    expect(result.report.tunnels).toHaveLength(1);
+  });
+
+  test("a non-array payload is a rejection, because it is a different claim", () => {
+    // 「不是数组」与「数组里有坏记录」不是同一件事：前者说明上报方对契约的理解
+    // 就是错的，后者只是一条记录坏了。
+    const result = validateStateReport({ ...base, target_observations: { host: "x" } });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("bad_target_observations");
+  });
+
+  test("an unreachable target reports NO latency, never zero", () => {
+    // 0 是"瞬间可达"，不是"没有测量"。两者混用会让面板把"连不上"显示成"极快"。
+    const result = validateStateReport({
+      ...base,
+      target_observations: [entry({ reachable: false, latency_ms: 0 })],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations?.[0]?.latency_ms).toBeNull();
+  });
+
+  test("an agent that reports nothing leaves the projection alone (`undefined` ≠ empty)", () => {
+    // 这个区别是要害：字段存在且为空数组 = "我会观测，此刻没有观测"；
+    // 字段不存在 = "我没有观测能力"。把后者当空集会清空整张投影，
+    // 把"没有证据"伪造成"刚观测过且什么都没有"。
+    const result = validateStateReport({ ...base });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations).toBeUndefined();
+  });
+
+  test("host is normalised so one target has one identity", () => {
+    const result = validateStateReport({
+      ...base,
+      target_observations: [entry({ host: "  Example.COM.  " })],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations?.[0]?.host).toBe("example.com");
+    expect(targetKeyOf("Example.COM.", 443)).toBe("example.com:443");
+    expect(targetKeyOf("[::1]", 443)).toBe("::1:443");
+    expect(targetKeyOf("", 443)).toBeNull();
+    expect(targetKeyOf("host", 0)).toBeNull();
+  });
+
+  test("no `observation_age` on the wire — age is derived by the reader", () => {
+    const result = validateStateReport({
+      ...base,
+      target_observations: [entry({ observation_age: 5 } as never)],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const first = result.report.target_observations?.[0] as unknown as Record<string, unknown>;
+    expect(first.observation_age).toBeUndefined();
   });
 });

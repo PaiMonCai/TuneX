@@ -89,6 +89,14 @@ export interface StateReportInput {
   version?: string;
   role?: string;
   tunnels?: ReportedTunnel[];
+  /**
+   * V5.2 WP5 —— 该节点观测到的目标事实（DEVELOPMENT.md §7）。
+   *
+   * 每条是**这个观测视角**的事实，不是目标的"健康状态"：合成（WP6）是面板的事，
+   * Agent 只报它测到的 8 个事实。`observation_age` 刻意不在线上——它是
+   * `now - last_observed_at`，由读取方计算。
+   */
+  target_observations?: ReportedTargetObservation[];
   used_ports?: number[];
   egress_pools?: Record<string, ReportedEgressPool>;
   reported_revision?: number;
@@ -206,6 +214,8 @@ export type StateReportRejection =
   | "bad_last_error"
   /** V4-WP6：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
   | "bad_telemetry"
+  /** V5.2 WP5：观测载荷根本不是数组（逐条坏记录会被丢弃，不进这里）。 */
+  | "bad_target_observations"
   /** V4-WP11B：能力协商字段形状坏（版本非非负整数 / 能力不是字符串数组）。 */
   | "bad_capabilities"
   /** V5-WP1：capability_manifest 形状坏（非对象 / schema_version 非整数 / 维度不是字符串数组）。 */
@@ -312,6 +322,90 @@ function isHostMetrics(v: unknown): boolean {
   return true;
 }
 
+/** V5.2 WP5：单个目标的观测事实（线上形状）。 */
+export interface ReportedTargetObservation {
+  host: string;
+  port: number;
+  reachable: boolean;
+  /** 连接耗时；不可达为 null（不写 0：0 是"瞬间可达"）。 */
+  latency_ms: number | null;
+  consecutive_success: number;
+  consecutive_failure: number;
+  /** 最近 N 次探测的成功比例（观测方计算，面板不重算）。 */
+  success_rate: number;
+  /** 观测时刻（unix 秒）。 */
+  last_observed_at: number;
+  /** 谁说的：观测节点角色 + 探测种类。 */
+  observation_source: string;
+}
+
+/**
+ * 校验观测数组。
+ *
+ * 与 `tunnels` 的严格程度**刻意不同**：隧道列表是"这个节点现在跑着什么"，
+ * 形状坏掉意味着面板会基于错的运行态做决策；观测是**附加证据**，一条坏记录
+ * 只是那一条没用。所以这里逐条丢弃坏记录并返回丢弃数，而不是让整份上报 400 ——
+ * 那会因为一个观测字段的类型错误，把节点的遥测、健康、隧道列表一起黑掉。
+ * 丢弃不是静默的：调用方会把计数记进日志。
+ */
+export function validateTargetObservations(
+  value: unknown,
+): { ok: true; observations: ReportedTargetObservation[]; dropped: number } | { ok: false; reason: StateReportRejection } {
+  if (value === undefined || value === null) return { ok: true, observations: [], dropped: 0 };
+  if (!Array.isArray(value)) return { ok: false, reason: "bad_target_observations" };
+  const out: ReportedTargetObservation[] = [];
+  let dropped = 0;
+  for (const raw of value) {
+    const entry = normalizeTargetObservation(raw);
+    if (entry === null) {
+      dropped += 1;
+      continue;
+    }
+    out.push(entry);
+  }
+  return { ok: true, observations: out, dropped };
+}
+
+/** 一条观测的归一化；null = 坏记录（丢弃，不中断整份上报）。 */
+function normalizeTargetObservation(raw: unknown): ReportedTargetObservation | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  const host = typeof o.host === "string" ? o.host.trim().toLowerCase().replace(/\.$/, "") : "";
+  if (!host || host.length > 255) return null;
+  const port = o.port;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  if (typeof o.reachable !== "boolean") return null;
+  const latency = o.latency_ms;
+  if (latency !== null && latency !== undefined && (typeof latency !== "number" || !Number.isFinite(latency) || latency < 0)) {
+    return null;
+  }
+  // 不可达时 latency 必须是 null：写 0 会让"没测到"和"零延迟"变成同一个值。
+  const latencyMs = o.reachable === false ? null : latency === undefined ? null : (latency as number | null);
+  const counters = ["consecutive_success", "consecutive_failure"];
+  for (const key of counters) {
+    const v = (o as Record<string, unknown>)[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return null;
+  }
+  const rate = o.success_rate;
+  if (rate !== undefined && (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0 || rate > 1)) return null;
+  const observedAt = o.last_observed_at;
+  if (typeof observedAt !== "number" || !Number.isInteger(observedAt) || observedAt <= 0) return null;
+  const source = typeof o.observation_source === "string" ? o.observation_source.trim().slice(0, 64) : "";
+  if (!source) return null;
+  return {
+    host,
+    port,
+    reachable: o.reachable,
+    latency_ms: latencyMs,
+    consecutive_success: typeof o.consecutive_success === "number" ? o.consecutive_success : 0,
+    consecutive_failure: typeof o.consecutive_failure === "number" ? o.consecutive_failure : 0,
+    success_rate: typeof rate === "number" ? rate : 0,
+    last_observed_at: observedAt,
+    observation_source: source,
+  };
+}
+
 export function validateStateReport(body: unknown): { ok: true; report: StateReportInput } | { ok: false; reason: StateReportRejection } {
   // 数组也是 object，但状态载荷必须是「带名字段的对象」——`[1,2]` / `[]`
   // 一律坏形状（Agent 不会把状态报成一个列表）。
@@ -361,6 +455,9 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       }
     }
   }
+
+  const observations = validateTargetObservations(b.target_observations);
+  if (!observations.ok) return { ok: false, reason: observations.reason };
 
   if (b.used_ports !== undefined) {
     if (!Array.isArray(b.used_ports)) return { ok: false, reason: "bad_used_ports" };
@@ -478,6 +575,17 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       // V5-WP1：同一个白名单陷阱——校验通过但没列在这里的字段会被静默丢掉，
       // 症状是"上报 200、库里永远 NULL"，即面板一直以为该 Agent 没有 v2 能力。
       capability_manifest: b.capability_manifest as CapabilityManifestInput | undefined,
+      // V5.2 WP5：白名单陷阱同样适用。用**归一化后**的列表，坏记录已经在
+      // validateTargetObservations 里被逐条丢弃。
+      //
+      // `undefined` 与 `[]` 必须保持区别：前者是"这个 Agent 没有观测能力"
+      // （旧版本），后者是"我会观测，此刻没有观测"。写成 `observations.observations`
+      // 会让前者退化成 `[]`，而落库那条路径据此清空整张投影 —— 于是一次旧版本
+      // Agent 上报就把"没有证据"伪造成"刚刚观测过且什么都没有"。
+      target_observations:
+        b.target_observations === undefined || b.target_observations === null
+          ? undefined
+          : observations.observations,
     },
   };
 }
@@ -559,6 +667,63 @@ function normalizeManifestColumn(
 }
 
 /**
+/* ================================================================== */
+/* V5.2 WP5 —— 目标观测投影的同步                                       */
+/* ================================================================== */
+
+/** 目标身份：归一化 host + 端口。空 host 或非法端口返回 null（调用方跳过）。 */
+export function targetKeyOf(host: string, port: number): string | null {
+  const normalized = host
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, "")
+    .replace(/^\[|\]$/g, "");
+  if (!normalized || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return `${normalized}:${port}`;
+}
+
+/**
+ * 把一次上报里的观测同步进 `target_observation` 投影（V5.2 WP5，DEVELOPMENT.md §7）。
+ *
+ * 唯一键 (node_id, target_key)：同一 host:port 被两个节点观测是**两条独立事实**
+ * （观察视角不同），合并成一条会抹掉"一个节点通、另一个不通"这个信号。
+ *
+ * 与隧道列表不同，这里不"全删再插"：观测是周期性到达的，全删会在两次上报之间留下
+ * 空窗，让面板读到"刚刚没有任何观测"。做法是写入本次上报的，再删掉本节点**不再
+ * 观测**的行（目标已从 desired 移除，投影里不该留一个永远不会再更新的悬空行）。
+ */
+export async function syncTargetObservations(
+  nodeId: number,
+  observations: ReportedTargetObservation[],
+  reportedAt: Date,
+): Promise<void> {
+  const seen: string[] = [];
+  for (const o of observations) {
+    const key = targetKeyOf(o.host, o.port);
+    if (!key) continue;
+    seen.push(key);
+    const row = {
+      host: o.host,
+      port: o.port,
+      reachable: o.reachable,
+      latency_ms: o.latency_ms,
+      consecutive_success: o.consecutive_success,
+      consecutive_failure: o.consecutive_failure,
+      success_rate: o.success_rate,
+      observed_at: new Date(o.last_observed_at * 1000),
+      reported_at: reportedAt,
+      observation_source: o.observation_source,
+    };
+    await db.targetObservation.upsert({
+      where: { node_id_target_key: { node_id: nodeId, target_key: key } },
+      create: { node_id: nodeId, target_key: key, ...row },
+      update: row,
+    });
+  }
+  await db.targetObservation.deleteMany({ where: { node_id: nodeId, target_key: { notIn: seen } } });
+}
+
+/**
  * unix 秒 → Date，`undefined`/`0` → null。
  *
  * 0 的语义是「Agent 没有这个事实」（旧 Agent 不报 started_at、从未出错所以
@@ -636,6 +801,19 @@ export async function submitStateReport(
     create: { node_id: auth.node_id, ...core, ...telemetry },
     update: { ...core, ...telemetry },
   });
+
+  // ── V5.2 WP5：目标观测投影 ──
+  //
+  // 两种"缺失"含义完全不同，必须分开：
+  //   · 字段**存在**（哪怕是空数组）= 这个 Agent 会观测，且这就是它现在的全部
+  //     观测 → 按上报同步：写进投影，并删掉它不再观测的目标（目标已从 desired
+  //     移除，投影里不该留下一个永远不会再更新的悬空行）；
+  //   · 字段**不存在** = 这是个还没有观测能力的旧 Agent → 保持投影不动。
+  //     若按 `tunnels ?? []` 的写法把它当空集，一次旧版本 Agent 上报就会清空
+  //     整张观测表，把"没有证据"伪造成"刚刚观测过且什么都没有"。
+  if (report.target_observations !== undefined) {
+    await syncTargetObservations(auth.node_id, report.target_observations, reportedAt);
+  }
 
   // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（WP1 列，WP7 首次写入）。
   await db.node

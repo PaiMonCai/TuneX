@@ -1618,6 +1618,55 @@ automatic failover
 
 ---
 
+> **语义契约已冻结（WP5-C0，2026-10-04）**：与 §6.1/§6.2 同一纪律——每条结论要么指向仓库
+> 事实，要么指向已冻结的 V5 不变量；仓库无法唯一回答的写进「开放产品决策」，**不猜**。
+>
+> **固定链与禁止项**（本节开头）：Observation → Health Synthesis → Decision。
+> 禁止 single timeout → automatic failover：**一次超时永远不足以改变任何决策**。
+>
+> ### 冻结结论
+>
+> | # | 问题 | 结论与依据 |
+> |---|---|---|
+> | 1 | 谁观测 | **Agent**，不是 Panel。Panel 不能反连数据面（§13.5 分层 + Panel 不依赖数据面可达性），而 Agent 已经在节点上、已经在周期性上报。RELAY 的目标由**出口节点**观测——它是真正拨号的那一方 |
+> | 2 | 观测什么 | **只观测出现在该节点 desired 状态里的 target**（禁止扫描未授权目标）。观测对象是 `host:port`，不是"某个用户的目标" |
+> | 3 | 怎么观测 | 有界 TCP 连接（不是完整业务往返）：`timeout` 有界、并发有界、周期有界、带抖动避免全网同步。连接成功即 `reachable`，耗时即 `latency` |
+> | 4 | 观测存在哪 | **独立投影**（`target_observation` 表），**绝不写 EgressTarget 的 desired 字段**。desired 表达"用户要什么"，观测表达"我们看到了什么"，两者不可互相改写 |
+> | 5 | 观测的粒度 | **按 (观测节点, target) 二维**。同一 host:port 被两个节点观测是**两条不同的事实**（视角不同），不能合并成一条 |
+> | 6 | 8 个事实 | `reachable`（上次探测是否连上）、`latency_ms`（连接耗时，不可达为 null）、`consecutive_success`/`consecutive_failure`（自上次状态翻转起的连续计数）、`success_rate`（最近 N=20 次探测的成功比例，由**观测方**计算并上报，Panel 不重算）、`last_observed_at`、`observation_source`（谁说的：node_id + 探测种类）、`observation_age` |
+> | 7 | `observation_age` 是否存在库里 | **不存**。age 是 `now - last_observed_at`，在读取时计算——存下来的 age 在写入的那一刻就已经是错的 |
+> | 8 | stale 判定 | `age > STALE_AFTER`（= 3× 上报周期）。stale 的观测**必须可识别**，并且在合成里等同于"没有证据"（→ `unknown`），而不是"继续沿用最后一次结果" |
+> | 9 | Panel 重启 | 不能把旧观测当新鲜：重启后直到 Agent 重新上报之前，一切观测都按 stale 处理（age 会自然超过阈值）。**不引入"重启后信任缓存"的特例** |
+>
+> ### 统一状态与跃迁（WP6）
+>
+> ~~~text
+> unknown     没有非 stale 观测（从未观测 / 证据全过期）
+> healthy     reachable 且 success_rate >= HEALTHY_RATE 且 consecutive_failure == 0
+> degraded    reachable 但成功率或延迟不达标，或 0 < consecutive_failure < FAILURE_THRESHOLD
+> unhealthy   consecutive_failure >= FAILURE_THRESHOLD（默认 3）
+> recovering  刚从 unhealthy 出来：consecutive_success >= RECOVERY_SUCCESSES（默认 2）
+>             且 success_rate 尚未回到 HEALTHY_RATE
+> ~~~
+>
+> - **迟滞（hysteresis）**：进入 `unhealthy` 要连续失败 N 次；离开 `unhealthy` 要连续成功 M 次
+>   且成功率回升。**单次失败或单次成功都不改变状态**——这是本节"禁止 single timeout"的落地。
+> - **warm-up**：新 target 从 `unknown` 起步；一次成功只到 `recovering`，
+>   连续 `WARMUP_SUCCESSES`（默认 2）次成功才到 `healthy`。
+> - **flap**：在 `FLAP_WINDOW` 内状态翻转超过 `FLAP_FLIPS` 次 → 合成结果标记 `flapping: true`
+>   并压制为不超过 `degraded`。抖动是事实，不能被平均掉。
+> - **partial visibility**：多个观测者对同一 target 的结论**取最坏**（可用性上的 fail-closed），
+>   同时保留逐观测者明细——"一个节点说通、另一个说断"本身就是运维要看的信号。
+> - **阈值集中**：所有阈值放在**一处**导出常量里（`TARGET_HEALTH_THRESHOLDS`），
+>   每项注明它保护什么。禁止散落 magic number（§7.2 明确要求）。
+> - **synthesis 永不改 desired**（§7.2 与本节禁止项）。
+>
+> ### 开放产品决策（不猜）
+>
+> 观测周期与并发上限的具体取值（实现取有界默认并注明）；是否保留观测历史（当前只存最新一条投影）；
+> 多观测者时是否允许"多数表决"替代当前的最坏值；`success_rate` 的窗口长度是否随池规模调整；
+> 是否需要把退化状态通知到用户（当前只落事实，不产生告警语义）。
+
 ## 7.1 V5-WP5 — Target Observation
 
 ### 事实
