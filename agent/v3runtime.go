@@ -405,9 +405,15 @@ func (rt *v3Runtime) Shutdown() {
 		remaining = 0
 	}
 	report := rt.tunnels.ShutdownAll(remaining)
-	if report.RemainingConns > 0 || report.ForcedConns > 0 {
-		logx.Warn("shutdown closed connections past the deadline",
-			"forced", report.ForcedConns, "remaining", report.RemainingConns)
+	// Datagram mappings are reported separately because they are dropped, not
+	// waited out: a UDP mapping ends by idle expiry or by its socket closing
+	// (§2.3③ of the datagram contract), so a datagram tunnel that was relaying
+	// would otherwise contribute "0 forced, 0 remaining" to this line.
+	if report.RemainingConns > 0 || report.ForcedConns > 0 || report.ForcedMappings > 0 {
+		logx.Warn("shutdown closed work past the deadline",
+			"forced", report.ForcedConns,
+			"forced_mappings", report.ForcedMappings,
+			"remaining", report.RemainingConns)
 	}
 
 	if rt.heart != nil {

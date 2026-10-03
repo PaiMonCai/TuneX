@@ -76,6 +76,15 @@ const (
 	// (V5-WP5-A2). Framing and transport security are separate dimensions, which
 	// is why there is no `wss` protocol value.
 	ProtocolWS ForwardProtocol = "ws"
+	// ProtocolUDP is the client-facing datagram front (V5-WP5-B1). The client
+	// speaks connectionless UDP datagrams, so this protocol is carried by the
+	// datagram transport below, never by the stream one: there is no accepted
+	// connection to map to an upstream, no connection count and no drain of
+	// connections. Its semantics are frozen in
+	// docs/v5-1b-datagram-contract-draft.md; V5.1b opens UDP **DIRECT only**, so
+	// the RELAY/EGRESS shapes are refused in Validate instead of being
+	// half-implemented.
+	ProtocolUDP ForwardProtocol = "udp"
 )
 
 // ForwardTransport is the data-plane lifecycle contract that carries a protocol.
@@ -87,6 +96,18 @@ const (
 	// maps to one upstream connection, and the runtime can drain in-flight work
 	// (see Forwarder.Drain).
 	TransportStream ForwardTransport = "stream"
+	// TransportDatagram is a packet-oriented runtime: the ingress listener keeps
+	// ONE socket, and each client address gets an ingress **mapping** (§2.1 of
+	// the datagram contract) instead of a connection. The consequences are not
+	// stylistic — they are why the datagram runtime has its own contract below:
+	//
+	//   - work is counted in mappings, so "live connections" is not a question
+	//     this transport can answer (§4.4);
+	//   - the return path shares the ingress socket with the forward path, so
+	//     closing the socket ends every mapping's replies at once (§4.3);
+	//   - "the upstream address" is not a per-client fact, so retargeting moves
+	//     only the mappings created afterwards (§3.4).
+	TransportDatagram ForwardTransport = "datagram"
 )
 
 // protocolRuntime binds a protocol to the transport contract that actually
@@ -105,6 +126,7 @@ var protocolRuntimes = []protocolRuntime{
 	{Protocol: ProtocolTCP, Transport: TransportStream},
 	{Protocol: ProtocolTLS, Transport: TransportStream},
 	{Protocol: ProtocolWS, Transport: TransportStream},
+	{Protocol: ProtocolUDP, Transport: TransportDatagram},
 }
 
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
@@ -292,6 +314,23 @@ func (c *TunnelConfig) Validate() error {
 	if protocol == ProtocolWS && mode == ModeEgress {
 		return errors.New("forwarder: ws terminates at the client-facing listener; an EGRESS tunnel cannot be ws")
 	}
+	// UDP is a client-facing datagram front. V5.1b (WP5-B1) opens DIRECT only:
+	//
+	//   - EGRESS: this binary has no datagram egress runtime. The egress node
+	//     listens for the ingress node, and that hop is a single TCP listener by
+	//     contract, which cannot carry datagram boundaries;
+	//   - RELAY: the shape of the UDP inter-node hop is an OPEN product decision
+	//     (§9.1 of docs/v5-1b-datagram-contract-draft.md: bare TCP + length
+	//     prefixing, a UDP egress listener, or no UDP RELAY at all). Refusing it
+	//     here is the difference between "not implemented yet" and a config that
+	//     validates, reaches an egress node and fails where nobody is looking —
+	//     Validate used to only refuse tls/ws for EGRESS, so `udp` would have
+	//     passed straight through to a runtime that does not exist.
+	if protocol == ProtocolUDP && (mode == ModeEgress || mode == ModeRelay) {
+		return fmt.Errorf(
+			"forwarder: udp is a DIRECT-only datagram front in this build (mode %s): the UDP inter-node hop for RELAY/EGRESS is not implemented",
+			mode)
+	}
 
 	if strategy := strings.TrimSpace(string(c.LBStrategy)); strategy != "" {
 		parsed, err := ParseLBStrategy(strategy)
@@ -418,6 +457,128 @@ type StreamRuntime interface {
 // because that reading would have made UDP/QUIC awkward or dishonest. New code
 // should prefer StreamRuntime.
 type Forwarder = StreamRuntime
+
+// Runtime is the transport-agnostic handle manager.TunnelManager keeps for one
+// tunnel: whatever carries the payload, "a tunnel this node runs" means "a
+// listener that can be bound, released and asked whether it is bound".
+//
+// It exists so the manager can own ONE registry (revision, port guard, reconcile,
+// shutdown) without pretending a datagram runtime is a stream runtime. The
+// stream and datagram contracts both include these three methods, and everything
+// transport-specific stays behind an interface assertion at the call site: a
+// target swap asks for SetUpstream or Retarget, a shutdown asks for Shutdown,
+// in-flight work asks for LiveConns or LiveMappings.
+//
+// That assertion style is deliberate. The alternative — making the datagram
+// runtime implement StreamRuntime's Drain/SetUpstream as empty shells — is
+// forbidden by the datagram contract (§4.1): it would let a caller believe a
+// drain happened on a transport that cannot drain, and it would erase the
+// distinction between "this runtime has no such work" and "there is none now".
+type Runtime interface {
+	// Start binds the tunnel's listen port and starts forwarding.
+	Start() error
+	// Stop releases the port and tears down live work. Safe before Start and
+	// safe to call more than once.
+	Stop() error
+	// Running reports whether the listener is currently bound.
+	Running() bool
+}
+
+// DatagramStats is the structured count set a datagram runtime must report
+// (§6.1 of the datagram contract). It is deliberately NOT the stream contract's
+// single int64: "many tiny packets" (a scan, or an amplification attempt) and
+// "few large packets" are the same byte total and completely different
+// incidents, and there is no connection count to report at all.
+//
+// Field names match the per-tunnel `diag` wire keys (ProtocolDiagnostics) for
+// the facts the panel consumes; the classified drop reasons are the agent-side
+// detail behind the single wire total (Drops).
+type DatagramStats struct {
+	// Mappings is the datagram replacement for "live connections": it is the one
+	// number that answers "how much work is in flight here" (§4.4).
+	Mappings int64 `json:"mappings"`
+	// MappingsCreated / MappingsExpired / MappingsRejected are cumulative since
+	// this runtime was built and reset when it restarts — they are per-runtime
+	// observations, never lifetime totals. A mapping ends by idle expiry or by
+	// the socket closing, never by a client "hanging up": UDP has no such signal
+	// (§2.3②).
+	MappingsCreated  int64 `json:"mappings_created"`
+	MappingsExpired  int64 `json:"mappings_expired"`
+	MappingsRejected int64 `json:"mappings_rejected"`
+
+	// PacketsIn / BytesIn count datagrams CLIENT → TARGET, PacketsOut /
+	// BytesOut count TARGET → CLIENT. Both are counted on the write side, i.e.
+	// only what was really delivered to the peer: a datagram that could not be
+	// forwarded is a drop, never a byte (§6.1 inherits copyOne's rule). They are
+	// cumulative per runtime and reset on restart.
+	PacketsIn  int64 `json:"packets_in"`
+	BytesIn    int64 `json:"bytes_in"`
+	PacketsOut int64 `json:"packets_out"`
+	BytesOut   int64 `json:"bytes_out"`
+
+	// Drops is every datagram the runtime accepted from a client and then did
+	// NOT deliver (no mapping and none could be created, over the ceiling, or a
+	// failed send). The four reasons are separable for an operator reading the
+	// agent-side facts; the wire carries Drops.
+	Drops              int64 `json:"drops"`
+	DropsUnknownSource int64 `json:"drops_unknown_source"`
+	DropsCeiling       int64 `json:"drops_ceiling"`
+	DropsSendError     int64 `json:"drops_send_error"`
+	// DropsMalformed counts datagrams the runtime could not even read or key.
+	// Payload BYTES are opaque to this runtime (it never interprets them), so
+	// garbage content is forwarded, not dropped here.
+	DropsMalformed int64 `json:"drops_malformed"`
+
+	// LastActivityAt is the unix second of the last successfully forwarded
+	// datagram in either direction (0 = none yet).
+	LastActivityAt int64 `json:"last_activity_at"`
+}
+
+// DatagramRuntime is the data-plane contract for a datagram (packet) transport.
+//
+// The method set is the datagram translation of the stream contract, frozen in
+// docs/v5-1b-datagram-contract-draft.md §4. Two stream methods are deliberately
+// absent: `Drain` (a datagram has no in-flight connection to finish; its
+// replacement is DrainMappings, which keeps the socket OPEN because the return
+// path shares it — §4.3) and `SetUpstream` ("the upstream" is not a per-client
+// fact here; its replacement is Retarget, which leaves existing mappings on the
+// target they were created with — §3.4).
+//
+// A datagram runtime also answers the existing diagnostics and shutdown
+// primitives (Diagnostician, Shutdowner, ListenerCloser); CloseListener's
+// meaning changes with the transport, see its implementation.
+type DatagramRuntime interface {
+	Runtime
+
+	// Stats reports the datagram facts. A caller must not expect the stream
+	// contract's single byte total here.
+	Stats() DatagramStats
+
+	// Retarget replaces the target that NEW mappings use. It never touches the
+	// listener and never rewrites a live mapping: the mappings already created
+	// keep sending to (and receiving from) the target they were created with
+	// until they expire — the §13.3.4 semantics, translated (§3.4).
+	//
+	// It is refused on a runtime with no live listener, or one that has stopped
+	// admitting new work: A target no future mapping can reach is a lie.
+	Retarget(target string) error
+
+	// DrainMappings stops admitting NEW mappings and waits, bounded, for the
+	// live ones to end. The listener stays bound and its socket stays open so
+	// the existing mappings keep getting their replies (§4.3). Like the stream
+	// Drain it is irreversible; teardown is Stop's job.
+	DrainMappings(timeout time.Duration) error
+
+	// CloseListener is the two-phase shutdown's phase 1 for a datagram tunnel:
+	// it stops admitting new mappings and does NOT close the socket (§4.4.3).
+	// Closing it is Shutdown/Stop's job, because the return path of every live
+	// mapping goes through the same socket.
+	CloseListener() bool
+
+	// LiveMappings reports how much work is in flight, and is what a caller must
+	// ask instead of LiveConns.
+	LiveMappings() int
+}
 
 // ErrUpstreamNotSwappable is returned by SetUpstream on a forwarder whose
 // upstream is not one swappable address (an EGRESS pool).

@@ -6,14 +6,21 @@ import (
 )
 
 // ShutdownResult reports what one forwarder's shutdown had to do. ForcedConns
-// is non-zero only when the deadline expired with connections still open: they
-// were closed rather than left to outlive the process.
+// and ForcedMappings are non-zero only when work was still in flight when the
+// shutdown had to end it: it was closed rather than left to outlive the process.
 type ShutdownResult struct {
 	// ClosedListener is true when this call closed a bound listener (and with
 	// it made new TCP connections fail immediately instead of queueing).
 	ClosedListener bool
 	// ForcedConns counts connections closed after the shared deadline.
 	ForcedConns int
+	// ForcedMappings counts DATAGRAM mappings dropped by the socket close. It is
+	// a separate field, not a repurposing of ForcedConns, because a datagram
+	// mapping is not a connection that outlived a deadline: it ends by idle
+	// expiry or by its socket closing, so a shutdown drops it deliberately
+	// (§2.3③). Reporting it here is what keeps a datagram tunnel from reporting
+	// "0 remaining, 0 forced" while it was relaying (§4.4.2).
+	ForcedMappings int
 	// RemainingConns is what was still open when shutdown returned. A non-zero
 	// value is a truth worth reporting; it is not hidden by a nil error.
 	RemainingConns int

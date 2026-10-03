@@ -128,13 +128,126 @@ func BuildStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error) 
 // streamBuilders is the protocol → constructor registry.
 //
 // It is keyed by the same ForwardProtocol values ParseForwardProtocol accepts,
-// and TestEveryProtocolHasABuilder pins the two sets together: advertising (or
+// and TestEveryAdvertisedProtocolHasABuilder pins the two sets together: advertising (or
 // parsing) a protocol without a constructor behind it is a bug the tests catch,
 // not something production discovers as a nil map lookup.
 var streamBuilders = map[ForwardProtocol]StreamBuilder{
 	ProtocolTCP: buildTCPStream,
 	ProtocolTLS: buildTLSStream,
 	ProtocolWS:  buildWSStream,
+}
+
+// DatagramBuildDeps carries what a datagram builder may need from its owner.
+//
+// A struct for the same reason StreamBuildDeps is one: the fields a datagram
+// runtime needs are not the fields a stream runtime needs, and a shared
+// positional signature would force one to grow the other's parameters.
+type DatagramBuildDeps struct {
+	// IdleTimeout is the ingress mapping idle window (§2.3①). Zero uses the
+	// package default. The value is a product decision (§9.2) and no per-Forward
+	// column exists yet, so this is the seam where one would land.
+	IdleTimeout time.Duration
+	// MaxMappings is the mapping ceiling (§2.4). Zero uses the package default.
+	MaxMappings int
+}
+
+// DatagramBuilder constructs the datagram runtime for ONE protocol.
+//
+// Like a stream builder it must not bind anything: Start() does that, long after
+// the config was validated, which is what makes "an unusable config fails before
+// a listener exists" checkable on this path too.
+type DatagramBuilder func(cfg TunnelConfig, deps DatagramBuildDeps) (DatagramRuntime, error)
+
+// BuildDatagram builds the datagram runtime for a config.
+//
+// The ordering is BuildStream's, with the transport check inverted:
+//  1. resolve protocol + transport (fail closed on unknown);
+//  2. refuse a transport that is not the datagram one — a stream protocol must
+//     never be handed to a datagram builder either;
+//  3. look up the builder registered for that protocol;
+//  4. only then construct.
+//
+// Step 2 is what keeps §1.3's split from being cosmetic: a `udp` config sent to
+// BuildStream is refused there, and a `tcp` config sent here is refused here.
+// Neither "for now" fallback exists, because a stream listener carrying datagrams
+// (or the reverse) is not a partial implementation, it is a wrong one.
+func BuildDatagram(cfg TunnelConfig, deps DatagramBuildDeps) (DatagramRuntime, error) {
+	target, err := ResolveRuntimeTarget(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if target.Transport != TransportDatagram {
+		return nil, fmt.Errorf(
+			"forwarder: protocol %q is carried by the %q transport, not datagram",
+			target.Protocol, target.Transport)
+	}
+	builder, ok := datagramBuilders[target.Protocol]
+	if !ok {
+		return nil, fmt.Errorf(
+			"forwarder: protocol %q has no datagram builder registered", target.Protocol)
+	}
+	return builder(cfg, deps)
+}
+
+// datagramBuilders is the datagram half of the protocol → constructor registry.
+//
+// It is deliberately NOT streamBuilders: sharing one map would let a datagram
+// protocol sit behind a StreamRuntime constructor, which is the §4.1 mistake
+// expressed as a map. Keeping them apart means the transport a protocol resolves
+// to and the constructor it reaches are two views of the same registration.
+var datagramBuilders = map[ForwardProtocol]DatagramBuilder{
+	ProtocolUDP: buildUDPDatagram,
+}
+
+// buildUDPDatagram constructs the UDP DIRECT datagram runtime.
+//
+// UDP needs no configuration beyond the protocol name yet (the idle timeout and
+// the mapping ceiling are package defaults until §9.2/§9.3 decide whether they
+// become per-Forward columns). RELAY and EGRESS never reach this builder:
+// TunnelConfig.Validate refuses them, because the UDP inter-node hop is an open
+// product decision (§9.1) and a datagram egress runtime does not exist.
+func buildUDPDatagram(cfg TunnelConfig, deps DatagramBuildDeps) (DatagramRuntime, error) {
+	if cfg.Mode != ModeDirect {
+		// Unreachable through Validate; kept so a caller cannot get a datagram
+		// runtime for a role the datagram contract does not define.
+		return nil, errModeNot(ModeDirect, cfg.Mode)
+	}
+	return NewDatagram(cfg, DatagramOptions{
+		IdleTimeout: deps.IdleTimeout,
+		MaxMappings: deps.MaxMappings,
+	})
+}
+
+// BuildDeps is everything the manager's single build entry point may need, split
+// by transport so neither side grows with the other's parameters.
+type BuildDeps struct {
+	// Stream is handed to the stream builders unchanged.
+	StreamBuildDeps
+	// Datagram is handed to the datagram builder (udp only).
+	Datagram DatagramBuildDeps
+}
+
+// BuildRuntime builds the runtime for whichever transport carries cfg.
+//
+// This is the entry point manager.buildLocked uses, so the manager never needs to
+// know which protocol is which transport: it asks the factory, and the factory
+// answers from the same table the parser and the capability manifest read. A
+// config whose transport has no runtime fails here, before anything binds.
+func BuildRuntime(cfg TunnelConfig, deps BuildDeps) (Runtime, error) {
+	target, err := ResolveRuntimeTarget(cfg)
+	if err != nil {
+		return nil, err
+	}
+	switch target.Transport {
+	case TransportStream:
+		return BuildStream(cfg, deps.StreamBuildDeps)
+	case TransportDatagram:
+		return BuildDatagram(cfg, deps.Datagram)
+	default:
+		return nil, fmt.Errorf(
+			"forwarder: protocol %q resolves to transport %q, which has no runtime in this binary",
+			target.Protocol, target.Transport)
+	}
 }
 
 // buildWSStream constructs the WebSocket-fronted stream runtime.
@@ -246,12 +359,24 @@ func buildTCPStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, erro
 	}
 }
 
-// RegisteredBuilders reports the protocols this binary can build a stream
+// RegisteredBuilders reports the protocols this binary can build a STREAM
 // runtime for, sorted. It exists so a test can compare it with the advertised
-// protocol list instead of trusting a comment.
+// protocol list instead of trusting a comment; RegisteredDatagramBuilders is its
+// datagram counterpart, and together they must cover every advertised protocol.
 func RegisteredBuilders() []string {
 	out := make([]string, 0, len(streamBuilders))
 	for protocol := range streamBuilders {
+		out = append(out, string(protocol))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RegisteredDatagramBuilders reports the protocols this binary can build a
+// datagram runtime for, sorted.
+func RegisteredDatagramBuilders() []string {
+	out := make([]string, 0, len(datagramBuilders))
+	for protocol := range datagramBuilders {
 		out = append(out, string(protocol))
 	}
 	sort.Strings(out)

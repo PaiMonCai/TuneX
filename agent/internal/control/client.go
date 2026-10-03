@@ -434,7 +434,12 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 // The plan is advisory about HOW to apply, never about WHETHER: the revision
 // gate and every port conflict stay inside the manager, so a bad plan cannot
 // make a command succeed or fail differently than the manager decides.
-func (c *Client) applyByPlan(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+//
+// The returned handle is the transport-agnostic runtime (forwarder.Runtime): a
+// udp tunnel's runtime is not a StreamRuntime, and this router must not claim it
+// is. No caller reads the value today — the ACK is built from the error — so the
+// narrower type costs nothing and keeps the lie out of the signature.
+func (c *Client) applyByPlan(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	return c.tunnels.ReplaceListener(cfg)
 }
 

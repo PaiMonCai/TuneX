@@ -26,6 +26,13 @@ type ShutdownReport struct {
 	// ForcedConns is how many in-flight connections were force-closed after the
 	// shared deadline expired.
 	ForcedConns int
+	// ForcedMappings is how many datagram mappings were dropped by the socket
+	// close. It is separate from ForcedConns because a mapping is not a
+	// connection that outlived a deadline: it ends by idle expiry or by its
+	// socket closing, so a shutdown drops it deliberately (§2.3③ of the datagram
+	// contract). Counting it here is what stops a datagram tunnel from reporting
+	// "0 remaining, 0 forced" while it was relaying (§4.4.2).
+	ForcedMappings int
 	// RemainingConns is what was still live when shutdown returned.
 	RemainingConns int
 	// Skipped lists tunnel ids that had no bound listener (nothing to close).
@@ -169,21 +176,26 @@ func (m *TunnelManager) ShutdownAll(timeout time.Duration) ShutdownReport {
 	}
 	wg.Wait()
 
-	report.Listeners, report.ForcedConns, report.RemainingConns = m.drainShutdownTotals()
+	report.Listeners, report.ForcedConns, report.ForcedMappings, report.RemainingConns = m.drainShutdownTotals()
 	report.Listeners += len(closedInPhaseOne)
 	sort.Strings(report.Skipped)
 	report.FinishedAt = time.Now()
 	logx.Info("tunnels shut down",
 		"listeners", report.Listeners,
 		"forced_conns", report.ForcedConns,
+		"forced_mappings", report.ForcedMappings,
 		"remaining_conns", report.RemainingConns,
 		"skipped", len(report.Skipped))
 	return report
 }
 
-// shutdownOne closes one forwarder either through the WP11A primitive or, for a
-// forwarder that predates it, through Stop (which still ends the listener).
-func shutdownOne(fwd forwarder.Forwarder, timeout time.Duration) forwarder.ShutdownResult {
+// shutdownOne closes one runtime either through the WP11A primitive or, for a
+// runtime that predates it, through Stop (which still ends the listener).
+//
+// The in-flight fallback asks for the transport's own measure: a datagram runtime
+// answers LiveMappings, and asking it for LiveConns would silently report 0 for a
+// tunnel that is holding mappings (§4.4.2).
+func shutdownOne(fwd forwarder.Runtime, timeout time.Duration) forwarder.ShutdownResult {
 	if s, ok := fwd.(forwarder.Shutdowner); ok {
 		return s.Shutdown(timeout)
 	}
@@ -191,6 +203,10 @@ func shutdownOne(fwd forwarder.Forwarder, timeout time.Duration) forwarder.Shutd
 	result := forwarder.ShutdownResult{ClosedListener: err == nil}
 	if live, ok := fwd.(interface{ LiveConns() int }); ok {
 		result.RemainingConns = live.LiveConns()
+		return result
+	}
+	if mappings, ok := fwd.(forwarder.DatagramRuntime); ok {
+		result.RemainingConns = mappings.LiveMappings()
 	}
 	return result
 }
@@ -204,15 +220,19 @@ func (m *TunnelManager) recordShutdown(id string, result forwarder.ShutdownResul
 		m.lastShutdown.Listeners++
 	}
 	m.lastShutdown.ForcedConns += result.ForcedConns
+	m.lastShutdown.ForcedMappings += result.ForcedMappings
 	m.lastShutdown.RemainingConns += result.RemainingConns
 	m.lastShutdownIDs = append(m.lastShutdownIDs, id)
 }
 
-func (m *TunnelManager) drainShutdownTotals() (int, int, int) {
+func (m *TunnelManager) drainShutdownTotals() (listeners, forced, forcedMappings, remaining int) {
 	m.shutdownMu.Lock()
 	defer m.shutdownMu.Unlock()
-	listeners, forced, remaining := m.lastShutdown.Listeners, m.lastShutdown.ForcedConns, m.lastShutdown.RemainingConns
+	listeners = m.lastShutdown.Listeners
+	forced = m.lastShutdown.ForcedConns
+	forcedMappings = m.lastShutdown.ForcedMappings
+	remaining = m.lastShutdown.RemainingConns
 	m.lastShutdown = ShutdownReport{}
 	m.lastShutdownIDs = nil
-	return listeners, forced, remaining
+	return listeners, forced, forcedMappings, remaining
 }

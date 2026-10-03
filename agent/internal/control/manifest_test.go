@@ -135,8 +135,10 @@ func TestBuildManifestRejectsUnknownNames(t *testing.T) {
 	}{
 		{
 			name: "unknown protocol",
+			// V5.1b opened udp, so it is no longer a name that must be rejected;
+			// this case is about an UNKNOWN name, which stays an error.
 			facts: ImplementationFacts{
-				Protocols:  []string{"udp"},
+				Protocols:  []string{"quic"},
 				Transports: []string{"stream"},
 			},
 		},

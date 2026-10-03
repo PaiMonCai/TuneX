@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"sort"
 	"strings"
 	"testing"
 )
@@ -53,11 +54,13 @@ func TestResolveRuntimeTargetDefaultsToTCP(t *testing.T) {
 }
 
 func TestResolveRuntimeTargetFailsClosedForUnknownProtocol(t *testing.T) {
-	// "tls" (A1) and "ws" (A2) are deliberately NOT in this list any more: they
-	// are implemented, so they moved into the positive tests. A protocol leaves
-	// this list only together with its Gate, never to make a test pass — and
-	// "wss" stays here on purpose: framing and TLS are separate dimensions.
-	for _, name := range []string{"udp", "quic", "wss", "mtcp", "carrier-pigeon"} {
+	// "tls" (A1), "ws" (A2) and "udp" (B1) are deliberately NOT in this list any
+	// more: they are implemented, so they moved into the positive tests. A
+	// protocol leaves this list only together with its Gate, never to make a test
+	// pass — and "wss" stays here on purpose: framing and TLS are separate
+	// dimensions. udp's transport is datagram (see the assertion below), which is
+	// why it left the "no runtime at all" list without joining streamBuilders.
+	for _, name := range []string{"quic", "wss", "mtcp", "carrier-pigeon"} {
 		cfg := factoryDirectConfig()
 		cfg.Protocol = ForwardProtocol(name)
 		if _, err := ResolveRuntimeTarget(cfg); err == nil {
@@ -69,14 +72,21 @@ func TestResolveRuntimeTargetFailsClosedForUnknownProtocol(t *testing.T) {
 // The critical ordering property: a rejected config must not create a listener.
 // BuildStream is the first thing the manager calls, so if it fails, nothing has
 // bound yet — this test proves BuildStream itself never binds.
+//
+// Two refusals, two reasons, one rule: a protocol this binary does not implement
+// (quic), and a protocol it does implement but by ANOTHER transport (udp, B1).
+// The second one is the §4.1 rule — a datagram protocol behind a stream listener
+// is not a partial implementation, it is a wrong one.
 func TestBuildStreamRefusesUnknownProtocolWithoutBinding(t *testing.T) {
-	cfg := factoryDirectConfig()
-	// A port that would fail to bind if anything tried: BUILD must not touch it.
-	cfg.IngressPort = 1
-	cfg.Protocol = "udp"
+	for _, name := range []ForwardProtocol{"quic", ProtocolUDP} {
+		cfg := factoryDirectConfig()
+		// A port that would fail to bind if anything tried: BUILD must not touch it.
+		cfg.IngressPort = 1
+		cfg.Protocol = name
 
-	if _, err := BuildStream(cfg, StreamBuildDeps{}); err == nil {
-		t.Fatal("an unimplemented protocol must be refused before construction")
+		if _, err := BuildStream(cfg, StreamBuildDeps{}); err == nil {
+			t.Fatalf("protocol %q must be refused by BuildStream before construction", name)
+		}
 	}
 }
 
@@ -179,30 +189,56 @@ type staticSelector struct{ t Target }
 
 func (s staticSelector) Select() Target { return s.t }
 
-// The registry, the parser and the advertised manifest must describe the same
-// set of protocols. Three lists that can drift is exactly how an agent ends up
+// The registries, the parser and the advertised manifest must describe the same
+// set of protocols. Lists that can drift are exactly how an agent ends up
 // advertising something it cannot run.
+//
+// V5.1b made this a per-TRANSPORT question: udp is advertised, and it has a
+// datagram builder, not a stream one. The invariant is therefore "every
+// advertised protocol has a builder in the registry its transport names, and no
+// registry holds a protocol the parser rejects" — which is stronger than the old
+// single-list equality because it also pins the transport→registry split.
 func TestEveryAdvertisedProtocolHasABuilder(t *testing.T) {
 	advertised := ImplementedProtocols()
-	builders := RegisteredBuilders()
 	if len(advertised) == 0 {
 		t.Fatal("this binary must implement at least one protocol")
 	}
-	if strings.Join(advertised, ",") != strings.Join(builders, ",") {
-		t.Fatalf("advertised protocols %v and registered builders %v must match", advertised, builders)
+	streamBuilders := RegisteredBuilders()
+	datagramBuilders := RegisteredDatagramBuilders()
+	all := append(append([]string{}, streamBuilders...), datagramBuilders...)
+	sort.Strings(all)
+	if strings.Join(advertised, ",") != strings.Join(all, ",") {
+		t.Fatalf("advertised protocols %v and registered builders %v must match", advertised, all)
 	}
-	for _, name := range builders {
-		if _, err := ParseForwardProtocol(name); err != nil {
-			t.Fatalf("builder registered for %q but the parser rejects it: %v", name, err)
+	for _, name := range advertised {
+		protocol, err := ParseForwardProtocol(name)
+		if err != nil {
+			t.Fatalf("advertised protocol %q is rejected by the parser: %v", name, err)
+		}
+		transport, ok := TransportForProtocol(protocol)
+		if !ok {
+			t.Fatalf("advertised protocol %q has no transport", name)
+		}
+		registry := streamBuilders
+		if transport == TransportDatagram {
+			registry = datagramBuilders
+		}
+		if !containsString(registry, name) {
+			t.Fatalf("protocol %q resolves to the %q transport but has no builder in that registry (%v)",
+				name, transport, registry)
 		}
 	}
 }
 
 func TestParseForwardTransportFailsClosed(t *testing.T) {
-	if got, err := ParseForwardTransport("stream"); err != nil || got != TransportStream {
-		t.Fatalf("stream must parse, got %q / %v", got, err)
+	// V5.1b opened the datagram transport, so it moved out of the fail-closed list
+	// together with its protocol — the two leaves this list only as a pair.
+	for _, want := range []ForwardTransport{TransportStream, TransportDatagram} {
+		if got, err := ParseForwardTransport(string(want)); err != nil || got != want {
+			t.Fatalf("%s must parse, got %q / %v", want, got, err)
+		}
 	}
-	for _, name := range []string{"", "  ", "datagram", "packet", "carrier-pigeon"} {
+	for _, name := range []string{"", "  ", "packet", "carrier-pigeon"} {
 		if _, err := ParseForwardTransport(name); err == nil {
 			t.Fatalf("transport %q is not implemented and must be refused", name)
 		}

@@ -45,17 +45,24 @@ var ErrStaleRevision = fmt.Errorf("manager: stale revision")
 // ErrTunnelNotFound is returned by Remove/Get for an unknown tunnel id.
 var ErrTunnelNotFound = fmt.Errorf("manager: tunnel not found")
 
-// entry is one running tunnel: the config it was built from plus its Forwarder.
+// entry is one running tunnel: the config it was built from plus its runtime.
+//
+// The runtime is forwarder.Runtime (start/stop/running), NOT forwarder.Forwarder:
+// since V5.1b there is more than one transport contract behind a tunnel, and a
+// datagram runtime must not be forced to implement stream-only methods
+// (SetUpstream/Drain) to sit in this registry — forwarder.StreamRuntime's own
+// doc comment and the datagram contract §4.1 both forbid that. Everything
+// transport-specific is an interface assertion at the call site.
 type entry struct {
 	cfg forwarder.TunnelConfig
-	fwd forwarder.Forwarder
+	fwd forwarder.Runtime
 }
 
 // TunnelManager is the concurrency-safe registry of running tunnels.
 type TunnelManager struct {
 	mu       sync.RWMutex
 	tunnels  map[string]*entry
-	usedPort map[string]bool // "tcp:<port>" guard shared with EgressManager
+	usedPort map[string]bool // "<socket namespace>:<port>" guard shared with EgressManager
 
 	egress *EgressManager
 	// listenHost is the interface ingress/egress tunnels bind when the config
@@ -128,11 +135,48 @@ func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 }
 
 // portGuardKey is the usedPorts key for a bound port.
-func portGuardKey(port int) string { return "tcp:" + strconv.Itoa(port) }
+//
+// The key is namespaced by the OS socket family the listener actually binds
+// ("tcp:" / "udp:") because the key is also a REPORTED FACT: labelling a UDP
+// bind "tcp:" would say the node owns a TCP listener it does not (§5.3 of the
+// datagram contract). tls/ws are TCP sockets, so all three stream protocols
+// share one namespace; only a datagram runtime gets "udp:".
+func portGuardKey(cfg forwarder.TunnelConfig) string {
+	return portKey(socketNamespace(cfg.Protocol), cfg.ListenPort())
+}
 
-// New builds the Forwarder for cfg without starting it. It is exported so the
+// portKey renders one namespaced guard key.
+func portKey(namespace string, port int) string {
+	return namespace + strconv.Itoa(port)
+}
+
+// socketNamespace is the OS socket family a protocol's listener binds in.
+func socketNamespace(protocol forwarder.ForwardProtocol) string {
+	if transport, ok := forwarder.TransportForProtocol(protocol); ok && transport == forwarder.TransportDatagram {
+		return "udp:"
+	}
+	return "tcp:"
+}
+
+// portBoundLocked reports whether this node already owns the port number in ANY
+// namespace.
+//
+// The kernel would happily take TCP 19000 and UDP 19000 at the same time, but the
+// port lease above this manager does not: NodePortLease's unique key is
+// (node_id, port), protocol-free, and §5.2 of the datagram contract freezes that
+// stricter rule rather than expanding the lease. So a namespaced key must never
+// be the ONLY exclusion check, or the guard would allow a pair the panel's port
+// pool treats as one port — the exact "two owners for one number" failure the
+// guard exists to prevent.
+//
+// Caller must hold m.mu.
+func (m *TunnelManager) portBoundLocked(port int) bool {
+	return m.usedPort[portKey("tcp:", port)] || m.usedPort[portKey("udp:", port)]
+}
+
+// New builds the runtime for cfg without starting it. It is exported so the
 // API layer / tests can inspect what a config would produce.
-func (m *TunnelManager) New(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) New(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
 		normalized.ListenHost = m.listenHost
@@ -176,7 +220,7 @@ func (m *TunnelManager) DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagn
 // attachLedger links an egress forwarder's per-target health view to its pool,
 // so EgressManager.TargetStats can report what the running forwarder observed.
 // A non-egress tunnel (or a pool-less one) is a no-op.
-func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.Forwarder) {
+func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.Runtime) {
 	if cfg.Mode != forwarder.ModeEgress || m.egress == nil {
 		return
 	}
@@ -200,7 +244,7 @@ func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.F
 // The revision gate and the port guard live here (and in ReplaceListener,
 // which shares applyLocked); the ordering inside is applyLocked's job, and it
 // is the same sequence for both entry points so the two cannot drift.
-func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	before := m.fingerprint()
 	fwd, err := m.applyInner(cfg)
 	if err == nil {
@@ -212,7 +256,7 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Forwarder, 
 // applyInner is Apply's locked body. Splitting it out keeps the fingerprint
 // comparison on the outside of the lock: the hook must never run while m.mu is
 // held, because it re-reads the registry.
-func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
 		normalized.ListenHost = m.listenHost
@@ -251,26 +295,37 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Forwar
 // guard and the single registry; only the "which runtime class" question moved
 // into the factory, and it is asked before anything can bind.
 //
+// Since V5.1b the factory answers for BOTH transports (forwarder.BuildRuntime):
+// the manager does not branch on the protocol, so opening a datagram protocol
+// cannot silently land in the stream builder — or the other way round.
+//
 // The egress selector is passed as a lazy closure rather than resolved here, so
 // the factory decides whether this build needs a pool at all (DIRECT/RELAY must
 // not be made to fail because EgressManager is absent in a mode-only build).
-func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
-	return forwarder.BuildStream(cfg, forwarder.StreamBuildDeps{
-		SelectorFor: func(tunnelID string) (forwarder.TargetSelector, error) {
-			if m.egress == nil {
-				return nil, fmt.Errorf("manager: EGRESS tunnel %s has no egress manager wired", tunnelID)
-			}
-			return m.egress.SelectorFor(tunnelID)
+func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	return forwarder.BuildRuntime(cfg, forwarder.BuildDeps{
+		StreamBuildDeps: forwarder.StreamBuildDeps{
+			SelectorFor: func(tunnelID string) (forwarder.TargetSelector, error) {
+				if m.egress == nil {
+					return nil, fmt.Errorf("manager: EGRESS tunnel %s has no egress manager wired", tunnelID)
+				}
+				return m.egress.SelectorFor(tunnelID)
+			},
+			// egressObserver is nil-safe, so a mode-only build loses nothing but
+			// the log line; tests can leave the observer unset.
+			Observer: egressObserver(cfg.ID),
+			ReportCertError: func(err error) {
+				// A failed certificate rotation must be visible: the tunnel keeps
+				// serving the last good certificate, so the only symptom is this line
+				// plus a certificate that never changes.
+				logx.Error("tls certificate rotation failed", "tunnel", cfg.ID, "err", err.Error())
+			},
 		},
-		// egressObserver is nil-safe, so a mode-only build loses nothing but
-		// the log line; tests can leave the observer unset.
-		Observer: egressObserver(cfg.ID),
-		ReportCertError: func(err error) {
-			// A failed certificate rotation must be visible: the tunnel keeps
-			// serving the last good certificate, so the only symptom is this line
-			// plus a certificate that never changes.
-			logx.Error("tls certificate rotation failed", "tunnel", cfg.ID, "err", err.Error())
-		},
+		// Datagram options stay at the package defaults: the idle timeout and the
+		// mapping ceiling are product decisions (§9.2/§9.3) with no per-Forward
+		// column yet, so inventing values here would put a second, invisible copy
+		// of them in the control plane's way.
+		Datagram: forwarder.DatagramBuildDeps{},
 	})
 }
 
@@ -296,25 +351,27 @@ func egressObserver(tunnelID string) forwarder.TargetObserver {
 // the OS cannot be hidden by the map.
 //
 // When this Apply replaces the tunnel that currently owns the port, the old
-// forwarder must already have released it: Apply then does the replace in two
+// runtime must already have released it: Apply then does the replace in two
 // steps (release the old port, bind the new one) rather than failing on a port
 // the node itself holds. Same-port replacement is exactly the hot-update case
-// the panel hits when it re-sends a tunnel with a new revision.
-func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Forwarder) error {
+// the panel hits when it re-sends a tunnel with a new revision — including the
+// case where the new revision changes the listener's TRANSPORT (a udp binding
+// replaced by a tcp one on the same number), which is why the takeover below
+// frees the key under the OLD runtime's namespace, not the new one's.
+func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Runtime) error {
 	port := cfg.ListenPort()
 	if port <= 0 {
 		return fwd.Start()
 	}
-	key := portGuardKey(port)
-	if !m.usedPort[key] {
+	if !m.portBoundLocked(port) {
 		return fwd.Start()
 	}
 	// The port is taken. If the taker is the entry this Apply replaces, the
-	// port is genuinely available to us: the old forwarder is stopped first
+	// port is genuinely available to us: the old runtime is stopped first
 	// and its listener closed, and only then does the new one bind it.
 	if old, ok := m.tunnels[cfg.ID]; ok && old.cfg.ListenPort() == port {
 		_ = old.fwd.Stop()
-		delete(m.usedPort, key)
+		delete(m.usedPort, portGuardKey(old.cfg))
 		return fwd.Start()
 	}
 	return fmt.Errorf("manager: port %d is already used by another tunnel", port)
@@ -324,14 +381,14 @@ func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Fo
 // m.mu.
 func (m *TunnelManager) markPortUsedLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
-		m.usedPort[portGuardKey(p)] = true
+		m.usedPort[portGuardKey(cfg)] = true
 	}
 }
 
-// releasePortLocked frees the ports held by cfg. Caller must hold m.mu.
+// releasePortLocked frees the port held by cfg. Caller must hold m.mu.
 func (m *TunnelManager) releasePortLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
-		delete(m.usedPort, portGuardKey(p))
+		delete(m.usedPort, portGuardKey(cfg))
 	}
 }
 
@@ -470,6 +527,13 @@ func (m *TunnelManager) Len() int {
 }
 
 // Stats returns the forwarded bytes for one tunnel (0 when unknown).
+//
+// A stream runtime answers with its own bidirectional byte counter. A datagram
+// runtime is asked for the DELIVERED byte total of both directions instead
+// (bytes_in + bytes_out): the value means the same thing, and returning 0 just
+// because the transport's Stats() has a different shape would report an idle
+// tunnel for one that is relaying. Callers that need the datagram facts
+// separately (packets, mappings, drops) use DatagramStats.
 func (m *TunnelManager) Stats(id string) int64 {
 	m.mu.RLock()
 	e, ok := m.tunnels[id]
@@ -477,7 +541,33 @@ func (m *TunnelManager) Stats(id string) int64 {
 	if !ok {
 		return 0
 	}
-	return e.fwd.Stats()
+	type byteCounter interface{ Stats() int64 }
+	if c, ok := e.fwd.(byteCounter); ok {
+		return c.Stats()
+	}
+	if d, ok := e.fwd.(forwarder.DatagramRuntime); ok {
+		s := d.Stats()
+		return s.BytesIn + s.BytesOut
+	}
+	return 0
+}
+
+// DatagramStats returns the structured datagram facts of a tunnel, and whether
+// this tunnel is a datagram one at all. The second return value is the
+// absent-versus-empty flag: a stream tunnel is not a datagram tunnel that is
+// currently idle, and a caller must be able to tell those apart.
+func (m *TunnelManager) DatagramStats(id string) (forwarder.DatagramStats, bool) {
+	m.mu.RLock()
+	e, ok := m.tunnels[id]
+	m.mu.RUnlock()
+	if !ok {
+		return forwarder.DatagramStats{}, false
+	}
+	d, ok := e.fwd.(forwarder.DatagramRuntime)
+	if !ok {
+		return forwarder.DatagramStats{}, false
+	}
+	return d.Stats(), true
 }
 
 // MaxRevision returns the newest config revision among the running tunnels
@@ -496,10 +586,21 @@ func (m *TunnelManager) MaxRevision() int64 {
 	return max
 }
 
-// LiveConns returns how many client connections the tunnel is relaying right
-// now (0 when unknown). It is the observable the disconnect-cleanup guard
-// needs: after every client hangs up the count must fall back to zero.
+// LiveConns returns how much work the tunnel has in flight right now (0 when
+// unknown). For a stream tunnel that is its live connections — the observable
+// the disconnect-cleanup guard needs: after every client hangs up the count must
+// fall back to zero.
+//
+// A datagram tunnel has no connections and must NOT be answered with a silent 0
+// (§4.4.1): 0 would read as "nothing in flight" for a tunnel that is relaying,
+// which is the failure mode this project treats as the worst kind. Its in-flight
+// work is its mappings, so that is what is returned, and LiveMappings is the
+// explicit form callers should prefer when they know the transport.
 func (m *TunnelManager) LiveConns(id string) int {
+	live, ok := m.LiveMappings(id)
+	if ok {
+		return live
+	}
 	m.mu.RLock()
 	e, ok := m.tunnels[id]
 	m.mu.RUnlock()
@@ -513,7 +614,26 @@ func (m *TunnelManager) LiveConns(id string) int {
 	return 0
 }
 
-// StopAll tears down every tunnel, draining connections. Used on shutdown.
+// LiveMappings returns the number of ingress mappings a datagram tunnel is
+// holding, and whether this tunnel is a datagram one. Report the second value:
+// "0 mappings" and "this transport has no mappings" are different facts.
+func (m *TunnelManager) LiveMappings(id string) (int, bool) {
+	m.mu.RLock()
+	e, ok := m.tunnels[id]
+	m.mu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	d, ok := e.fwd.(forwarder.DatagramRuntime)
+	if !ok {
+		return 0, false
+	}
+	return d.LiveMappings(), true
+}
+
+// StopAll tears down every tunnel. A stream tunnel drains its connections; a
+// datagram tunnel drops its mappings (there is nothing to drain, §4.1). Used on
+// shutdown.
 func (m *TunnelManager) StopAll() {
 	m.mu.Lock()
 	entries := make([]*entry, 0, len(m.tunnels))
@@ -537,16 +657,62 @@ func (m *TunnelManager) StopAll() {
 }
 
 // UsedPorts returns a copy of the shared port guard (for /health and tests).
+//
+// The flat number set is still the correct answer to "is this port really bound
+// on this node" because §5.2 freezes the one-number-one-binding rule: TCP and UDP
+// may not share a number here, so a number present in either namespace means the
+// same thing. What the flat view cannot say is WHICH protocol owns it — a caller
+// that needs that (or the reporter projection that has to stop flattening two
+// namespaces) reads UsedPortsByProtocol instead; neither view lies about the
+// other.
 func (m *TunnelManager) UsedPorts() map[int]bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make(map[int]bool, len(m.usedPort))
 	for k := range m.usedPort {
-		if p, err := strconv.Atoi(k[len("tcp:"):]); err == nil {
-			out[p] = true
+		namespace, port := splitPortGuardKey(k)
+		if port > 0 {
+			_ = namespace
+			out[port] = true
 		}
 	}
 	return out
+}
+
+// UsedPortsByProtocol returns the guard grouped by OS socket family ("tcp" /
+// "udp"), the protocol-dimension view of the same facts (§5.3: the namespaces
+// must be preserved somewhere, not flattened away everywhere).
+func (m *TunnelManager) UsedPortsByProtocol() map[string]map[int]bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := map[string]map[int]bool{"tcp": {}, "udp": {}}
+	for k := range m.usedPort {
+		namespace, port := splitPortGuardKey(k)
+		if port <= 0 {
+			continue
+		}
+		name := strings.TrimSuffix(namespace, ":")
+		if out[name] == nil {
+			out[name] = map[int]bool{}
+		}
+		out[name][port] = true
+	}
+	return out
+}
+
+// splitPortGuardKey parses a "tcp:<port>" / "udp:<port>" guard key. An
+// unparseable key returns a zero port, which every caller treats as "not a
+// binding" rather than as port 0 being taken.
+func splitPortGuardKey(key string) (namespace string, port int) {
+	namespace, portStr, ok := strings.Cut(key, ":")
+	if !ok {
+		return "", 0
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0
+	}
+	return namespace + ":", p
 }
 
 // SetListenHost overrides the interface tunnels bind. Running tunnels keep
@@ -560,7 +726,7 @@ func (m *TunnelManager) SetListenHost(host string) {
 
 // compile-time check that the manager satisfies what the API layer needs.
 var _ interface {
-	Apply(forwarder.TunnelConfig) (forwarder.Forwarder, error)
+	Apply(forwarder.TunnelConfig) (forwarder.Runtime, error)
 	Remove(string) error
 	Get(string) (forwarder.TunnelConfig, bool)
 	List() []forwarder.TunnelConfig
