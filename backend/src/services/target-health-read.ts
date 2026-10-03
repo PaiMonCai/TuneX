@@ -143,3 +143,30 @@ export async function readTargetHealth(input: {
     now: input.now,
   };
 }
+
+/**
+ * 一个池的**期望目标**（来自 desired，不是来自观测）。
+ *
+ * `status` 非 active 的目标仍然算在期望清单里吗？算。原因是本模块不拥有"要不要看"
+ * 这个判断：把停用目标从观测面里剔除，会让"你把它关了所以它不健康"和"它真的挂了"
+ * 在面板上长得一样。停用目标是产品的决定，健康视图只报告事实。
+ */
+export async function readPoolTargetHealth(input: {
+  poolId: number;
+  now: Date;
+  previous?: TargetHealthMemory | null;
+  store?: TargetObservationStore;
+}): Promise<{ ok: true; health: TargetHealthReadResult } | { ok: false; reason: "not_found" }> {
+  const pool = await db.egressPool.findUnique({
+    where: { id: input.poolId },
+    select: { id: true, targets: { select: { host: true, port: true }, orderBy: { order_by: "asc" } } },
+  });
+  if (!pool) return { ok: false, reason: "not_found" };
+  const health = await readTargetHealth({
+    desired: pool.targets.map((t) => ({ host: t.host, port: t.port })),
+    now: input.now,
+    previous: input.previous ?? null,
+    store: input.store,
+  });
+  return { ok: true, health };
+}

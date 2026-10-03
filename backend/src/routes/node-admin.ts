@@ -70,6 +70,7 @@ import {
   updateTarget,
   type NodeAdminError,
 } from "../services/node-admin.ts";
+import { readPoolTargetHealth } from "../services/target-health-read.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const nodeAdminRoutes = new Hono<{ Variables: AppVariables }>();
@@ -269,6 +270,28 @@ nodeAdminRoutes.get("/node/pools/:poolId/targets", async (c) => {
   const result = await listTargets({ poolId });
   if (!result.ok) return adminError(c, result);
   return c.json({ data: { data: result.targets, total: result.total } });
+});
+
+/**
+ * GET /api/admin/node/pools/:poolId/health —— V5.2 WP5/WP6 的目标健康视图。
+ *
+ * 与 `.../targets` 分开而不是塞进同一个响应：那是**期望**（用户要什么），
+ * 这是**观测 + 合成**（我们看到了什么、据此判断什么）。混在一个响应里，
+ * 下一次改动就很难说清哪个字段属于哪一类事实，而这是 §7 反复强调的边界。
+ */
+nodeAdminRoutes.get("/node/pools/:poolId/health", async (c) => {
+  const poolId = numericParam(c, "poolId", "池");
+  if (poolId === null) return c.json({ error: "非法池 ID", message: "非法池 ID" }, 400);
+  // now 在路由边界取一次并透传：同一次响应里所有目标必须用同一个时刻判定 stale。
+  const result = await readPoolTargetHealth({ poolId, now: new Date() });
+  if (!result.ok) return c.json({ error: "池不存在", message: "池不存在" }, 404);
+  return c.json({
+    data: {
+      targets: result.health.targets,
+      observers: result.health.observers,
+      observed_at: result.health.now.toISOString(),
+    },
+  });
 });
 
 /** POST /api/admin/node/pools/:poolId/targets —— 加目标（单条）。 */
