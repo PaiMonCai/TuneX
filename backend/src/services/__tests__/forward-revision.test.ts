@@ -49,6 +49,7 @@ import {
 const BASE_CONFIG: ForwardCandidateConfig = {
   name: "web-prod",
   mode: "direct",
+  protocol: "tcp",
   ingress_node_id: 11,
   egress_node_id: null,
   listen_port: 19001,
@@ -153,6 +154,15 @@ describe("A. 合并得到完整候选 config（§13.3.3）", () => {
 describe("B. 校验规则", () => {
   test("B1. 合法 direct 候选通过", () => {
     expect(validateForwardCandidate(BASE_CONFIG).ok).toBe(true);
+  });
+
+  test("B1b. legacy TunnelType 中存在的未开放协议仍 fail-closed", () => {
+    const v = validateForwardCandidate({
+      ...BASE_CONFIG,
+      protocol: "udp" as never,
+    });
+    expect(v.ok).toBe(false);
+    expect(v.reasons).toContain("invalid_protocol");
   });
 
   test("B2. direct 指定 egress_node_id 被拒", () => {
@@ -400,7 +410,7 @@ describe("E. revision 号与 409", () => {
 
 describe("F. snapshot 契约形状", () => {
   test("F1. 候选 config 承载 §13.3.2 全部运行态字段", () => {
-    // mode / ingress / egress / listen_port(含 auto) / target_host / target_port
+    // V5-WP0 后 protocol 与 topology mode 正交，也必须进入不可变 runtime snapshot。
     const keys = Object.keys(BASE_CONFIG).sort();
     expect(keys).toEqual([
       "egress_node_id",
@@ -408,6 +418,7 @@ describe("F. snapshot 契约形状", () => {
       "listen_port",
       "mode",
       "name",
+      "protocol",
       "target_host",
       "target_port",
     ]);

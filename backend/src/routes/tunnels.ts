@@ -275,6 +275,7 @@ tunnelsRoutes.post("/", async (c) => {
       data: {
         name,
         tunnel_type: "tcp",
+        forward_protocol: "tcp",
         category: "port_forward",
         listen_ip: body.listen_ip ? String(body.listen_ip) : "0.0.0.0",
         listen_port: listenPort,
@@ -716,7 +717,10 @@ tunnelsRoutes.post("/v3/relay", async (c) => {
     listenPort = port;
   }
 
-  const tunnelType = String(body.tunnel_type ?? "tcp");
+  const tunnelType = String(body.tunnel_type ?? "tcp").toLowerCase();
+  if (tunnelType !== "tcp") {
+    return c.json({ error: "当前 v3/V5 runtime 仅支持已开放的 Forward 协议" }, 400);
+  }
 
   const result = await createTunnelApi(
     {

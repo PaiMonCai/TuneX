@@ -140,6 +140,11 @@ export const APPLY_ERROR_ACTION: Record<string, { zh: string; en: string; retrya
     en: "Mode and topology conflict: relay requires an egress node, direct must not have one. Fix the mode or egress node and save again.",
     retryable: false,
   },
+  unsupported_protocol: {
+    zh: "当前运行时尚未开放这类协议。请改用已支持的协议；历史配置请联系管理员处理。",
+    en: "This protocol is not enabled by the current runtime. Use a supported protocol; ask an administrator to handle legacy configurations.",
+    retryable: false,
+  },
   invalid_target: {
     zh: "目标地址格式不合法。检查主机名与端口后重新保存。",
     en: "The target address is invalid. Check the host and port, then save again.",

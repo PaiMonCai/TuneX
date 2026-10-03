@@ -55,6 +55,29 @@ func ParseTunnelMode(s string) (TunnelMode, error) {
 	}
 }
 
+// ForwardProtocol is the canonical product/data-plane protocol dimension.
+//
+// It is deliberately separate from TunnelMode: DIRECT/RELAY/EGRESS describes
+// topology/role, while protocol describes how bytes/packets are transported.
+// New protocol constants must not be added merely because a legacy Panel enum
+// contains the name; they are opened only with their V5 protocol Gate.
+type ForwardProtocol string
+
+const (
+	ProtocolTCP ForwardProtocol = "tcp"
+)
+
+// ParseForwardProtocol normalises a wire value and fails closed for protocols
+// whose V5 runtime Gate has not been opened yet.
+func ParseForwardProtocol(s string) (ForwardProtocol, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", string(ProtocolTCP):
+		return ProtocolTCP, nil
+	default:
+		return "", fmt.Errorf("forwarder: protocol %q is not supported by the current runtime contract", s)
+	}
+}
+
 // LBStrategy selects how an EGRESS tunnel spreads connections over its pool.
 // The values are the devmap §3 enum names; ParseLBStrategy also accepts the
 // panel's short EgressPool spellings ("round" / "rand" / "weighted_round") so
@@ -130,7 +153,7 @@ type TunnelConfig struct {
 	// tunnel actually has.
 	Targets    []Target   `json:"targets,omitempty"`
 	LBStrategy LBStrategy `json:"lb_strategy"`
-	Protocol   string     `json:"protocol"`
+	Protocol   ForwardProtocol `json:"protocol"`
 	SpeedLimit int64      `json:"speed_limit"`
 	Revision   int64      `json:"revision"`
 	ListenHost string     `json:"listen_host,omitempty"`
@@ -158,14 +181,11 @@ func (c *TunnelConfig) Validate() error {
 	}
 	c.Mode = mode
 
-	switch strings.ToUpper(strings.TrimSpace(c.Protocol)) {
-	case "", "TCP":
-		c.Protocol = "tcp"
-	default:
-		// UDP / WS / TLS / QUIC land in later work packages; rejecting them
-		// loudly beats silently running them over TCP.
-		return fmt.Errorf("forwarder: protocol %q is not implemented in WP4 (tcp only)", c.Protocol)
+	protocol, err := ParseForwardProtocol(string(c.Protocol))
+	if err != nil {
+		return err
 	}
+	c.Protocol = protocol
 
 	if strategy := strings.TrimSpace(string(c.LBStrategy)); strategy != "" {
 		parsed, err := ParseLBStrategy(strategy)

@@ -38,6 +38,7 @@ import { getEffectivePolicy } from "./policy-service.ts";
 import { checkTunnelCreation, type EffectivePolicy } from "./capability-policy.ts";
 import { releaseLease } from "./portPool.ts";
 import { checkForwardRuntimeUse, type RuntimeUseDenied, type RuntimeUseResource } from "./forward-capability.ts";
+import { normalizeForwardProtocol } from "./forward-contract.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -535,6 +536,11 @@ export async function createTunnel(
   const mode = parseTunnelMode(input.mode);
   if (mode === null) return err("invalid_input", "隧道模式非法（direct/relay）");
 
+  const protocol = normalizeForwardProtocol(input.tunnelType);
+  if (protocol === null) {
+    return err("invalid_input", "当前 v3/V5 runtime 仅支持已开放的 Forward 协议");
+  }
+
   if (mode === "direct") {
     const forward = (input.forwardAddresses ?? []).map((x) => String(x).trim()).filter(Boolean);
     if (forward.length === 0) return err("invalid_input", "至少需要一个转发目标");
@@ -552,10 +558,11 @@ export async function createTunnel(
       await pdb.tunnel.create({
         data: {
           name,
-          tunnel_type: input.tunnelType ?? "tcp",
+          tunnel_type: protocol,
+          forward_protocol: protocol,
           listen_ip: "0.0.0.0",
           listen_port: input.listenPort ?? null,
-          listen_protocol: [input.tunnelType ?? "tcp"],
+          listen_protocol: [protocol],
           status: "active",
           forward_addresses: forward,
           load_balance_type: "round",
@@ -580,7 +587,7 @@ export async function createTunnel(
     const decision = checkTunnelCreation(policy, {
       tunnelCount: 0,
       trafficUsed: 0,
-      protocol: input.tunnelType ?? "tcp",
+      protocol: protocol,
       inGroupOwned: inGroup.workspace_id === input.workspaceId,
       inGroupId: inGroup.id,
       outGroupId: null,
@@ -633,10 +640,11 @@ export async function createTunnel(
     await pdb.tunnel.create({
       data: {
         name,
-        tunnel_type: input.tunnelType ?? "tcp",
+        tunnel_type: protocol,
+        forward_protocol: protocol,
         listen_ip: "0.0.0.0",
         listen_port: input.listenPort ?? null,
-        listen_protocol: [input.tunnelType ?? "tcp"],
+        listen_protocol: [protocol],
         status: "active",
         forward_addresses: [],
         load_balance_type: "round",
@@ -668,7 +676,7 @@ export async function createTunnel(
   const decision = checkTunnelCreation(policy, {
     tunnelCount: 0,
     trafficUsed: 0,
-    protocol: input.tunnelType ?? "tcp",
+    protocol: protocol,
     inGroupOwned: inGroup.workspace_id === input.workspaceId,
     inGroupId: inGroup.id,
     outGroupId: outGroup.id,
@@ -697,7 +705,7 @@ export async function createTunnel(
           userId: input.userId,
           workspaceId: input.workspaceId,
           personalWorkspaceId: input.personalWorkspaceId,
-          tunnelType: input.tunnelType ?? "tcp",
+          tunnelType: protocol,
           inNodeGroupId: input.inNodeGroupId,
           outNodeGroupId: input.outNodeGroupId,
           egressPoolId: input.egressPoolId ?? null,

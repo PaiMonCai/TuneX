@@ -51,18 +51,27 @@ import { checkForwardRuntimeUse } from "./forward-capability.ts";
 import { authorizationErrorLayer, type AuthorizationErrorLayer } from "./authorization-errors.ts";
 import type { ForwardPage } from "./forward-list-query.ts";
 import {
+  legacyTunnelTypeForForwardProtocol,
+  normalizeForwardProtocol,
+  persistedForwardProtocol,
+  type ForwardMode,
+  type ForwardProtocol,
+} from "./forward-contract.ts";
+export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
+import {
   forwardBatchSummary,
   type ForwardBatchAction,
   type ForwardBatchItemResult,
   type ForwardBatchSummary,
 } from "./forward-batch.ts";
 
-export type ForwardMode = "direct" | "relay";
 export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
 export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume">;
 export interface ForwardCreateInput {
   name: string;
   mode: ForwardMode;
+  /** V5-WP0: omitted by V4 clients => tcp; explicit unknown values fail closed. */
+  protocol?: ForwardProtocol;
   ingress_node_id: number;
   egress_node_id?: number | null;
   listen_port?: number | null;
@@ -221,11 +230,13 @@ export function forwardView(t: any) {
         ? { host: t.remote_host, port: t.remote_port, weight: 1 }
         : null;
 
+  const protocol = persistedForwardProtocol(t.forward_protocol, t.tunnel_type);
   return {
     id: t.id,
     creator_user_id: t.user_id ?? null,
     name: t.name,
-    protocol: "tcp" as const,
+    protocol,
+    protocol_supported: normalizeForwardProtocol(protocol) !== null,
     mode: (t.tunnel_mode ?? "direct") as ForwardMode,
     ingress_node_id: t.ingress_node_id,
     ingress_node: t.ingress_node ?? null,
@@ -577,6 +588,10 @@ export async function createForward(
   workspaceId: number,
   input: ForwardCreateInput,
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
+  const protocol = normalizeForwardProtocol(input.protocol);
+  if (protocol === null) {
+    return error(400, "invalid_input", "当前版本不支持该转发协议");
+  }
   if (
     !input.name.trim() ||
     !input.target_host.trim() ||
@@ -671,7 +686,7 @@ export async function createForward(
       const decision = checkTunnelCreation(policy, {
         tunnelCount,
         trafficUsed,
-        protocol: "tcp",
+        protocol,
         inGroupOwned: true,
         inGroupId: ingress.node_group_id,
         outGroupId: egress?.node_group_id ?? null,
@@ -693,15 +708,16 @@ export async function createForward(
       const tunnel = await tx.tunnel.create({
         data: {
           name: input.name.trim(),
-          tunnel_type: "tcp",
+          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol) as "tcp",
+          forward_protocol: protocol,
           category: "port_forward",
           listen_ip: "0.0.0.0",
           listen_port: input.listen_port ?? null,
-          listen_protocol: ["tcp"],
+          listen_protocol: [protocol],
           status: "active",
           forward_addresses: input.mode === "direct" ? [target] : [],
           forward_addresses_protocol:
-            input.mode === "direct" ? ["tcp"] : [],
+            input.mode === "direct" ? [protocol] : [],
           load_balance_type: "round",
           ip_type: "ipv4",
           order_by: (maxOrder._max.order_by ?? 0) + 10,
@@ -1248,11 +1264,15 @@ async function resolveForwardCandidate(
   }
 
   if (!isMetadataOnlyPatch(base, candidate)) {
+    const admittedProtocol = normalizeForwardProtocol(candidate.protocol);
+    if (admittedProtocol === null) {
+      return { ok: false, error: error(400, "invalid_input", "当前版本不支持该转发协议") };
+    }
     const rejected = await checkForwardRuntimeUse(workspaceId, {
       user_id: current.user_id,
       in_node_group_id: ingress.node_group_id,
       out_node_group_id: candidate.mode === "relay" ? egress?.node_group_id ?? null : null,
-      tunnel_type: "tcp",
+      tunnel_type: admittedProtocol,
     });
     if (rejected) {
       return { ok: false, error: error(403, rejected.reason, rejected.message, {

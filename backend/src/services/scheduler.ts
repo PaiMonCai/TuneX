@@ -60,6 +60,11 @@ import { Orchestrator, type DispatchFailure, type EgressDispatchOutcome, type Re
 import type { ControlValidator } from "./control-protocol/index.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
+import {
+  normalizeForwardProtocol,
+  persistedForwardProtocol,
+  type ForwardProtocol,
+} from "./forward-contract.ts";
 
 /* ================================================================== */
 /* 常量与状态机                                                        */
@@ -121,6 +126,8 @@ export const SCHEDULER_ERROR_CODES = {
   mode_topology_mismatch: "mode_topology_mismatch",
   /** 目标 host:port 格式非法。 */
   invalid_target: "invalid_target",
+  /** V5-WP0：协议事实存在，但当前 runtime/Gate 未开放，禁止下发。 */
+  unsupported_protocol: "unsupported_protocol",
 
   /* ── ② bind / acquire（副作用开始产生，失败要补偿）── */
   /** 节点组下没有可用于该方向的 Node（role 不匹配或全部离线）。 */
@@ -786,6 +793,17 @@ export async function createRelayTunnel(
     };
   };
 
+  /* ---------------- V5-WP0 protocol admission ---------------- */
+  const protocol = normalizeForwardProtocol(input.tunnelType);
+  if (protocol === null) {
+    return fail(
+      "auth_quota",
+      SCHEDULER_ERROR_CODES.unsupported_protocol,
+      `协议 ${String(input.tunnelType)} 尚未通过当前 runtime Gate`,
+      {},
+    );
+  }
+
   /* ---------------- ① auth / quota ---------------- */
   const policy = await deps.loadPolicy(input.workspaceId);
   const decision = checkTunnelCreation(policy, {
@@ -798,7 +816,7 @@ export async function createRelayTunnel(
       now,
       store as never,
     ),
-    protocol: input.tunnelType,
+    protocol,
     inGroupOwned: true, // 由下方授权判定取代：组授权未过根本走不到这里
     inGroupId: input.inNodeGroupId,
     outGroupId: input.outNodeGroupId,
@@ -872,11 +890,14 @@ export async function createRelayTunnel(
   const created = await store.tunnel.create({
     data: {
       name: input.name,
-      tunnel_type: input.tunnelType,
+      tunnel_type: protocol,
+      // The compatibility create service admits product protocols before this
+      // point. Keep legacy-only values uncanonicalized rather than relabeling them.
+      forward_protocol: protocol,
       category: "port_forward",
       listen_ip: input.listenIp ?? null,
       listen_port: input.listenPort ?? null,
-      listen_protocol: [input.tunnelType],
+      listen_protocol: [protocol],
       status: "active",
       forward_addresses: [],
       load_balance_type: "round",
@@ -1218,6 +1239,15 @@ export async function createRelayTunnel(
  *        是进程级的，重建实例会让两端看到不同的账本）。
  * @param over 见 {@link SchedulerDeps}。
  */
+function admittedPersistedProtocol(row: Record<string, unknown>): ForwardProtocol | null {
+  try {
+    const fact = persistedForwardProtocol(row.forward_protocol, row.tunnel_type);
+    return normalizeForwardProtocol(fact);
+  } catch {
+    return null;
+  }
+}
+
 async function checkExistingRuntime(
   row: Record<string, unknown>,
   deps: ReturnType<typeof resolveDeps>,
@@ -1241,10 +1271,19 @@ async function checkExistingRuntime(
       (row.tunnel_mode === "relay" && !validId(outGroup))) {
     return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或实际节点组已失效" };
   }
+  const protocol = admittedPersistedProtocol(row);
+  if (protocol === null) {
+    return {
+      code: "policy_denied",
+      reason: "protocol_not_supported",
+      error_layer: "capability",
+      message: "该转发使用的历史协议尚未进入 V5 runtime 白名单",
+    };
+  }
   return deps.runtimeUse(row.workspace_id, {
     user_id: row.user_id, in_node_group_id: inGroup,
     out_node_group_id: outGroup as number | null,
-    tunnel_type: typeof row.tunnel_type === "string" ? row.tunnel_type : "tcp",
+    tunnel_type: protocol,
   });
 }
 
@@ -1304,6 +1343,13 @@ export async function reapplyRelayTunnel(
       "bind_nodes",
       SCHEDULER_ERROR_CODES.mode_topology_mismatch,
       `隧道 ${tunnelId} 不是 RELAY 模式（${String(row.tunnel_mode)}）`,
+    );
+  }
+  if (admittedPersistedProtocol(row) === null) {
+    return fail(
+      "auth_quota",
+      SCHEDULER_ERROR_CODES.unsupported_protocol,
+      `隧道 ${tunnelId} 的协议未通过当前 runtime Gate`,
     );
   }
   const inNodeGroupId = Number(row.in_node_group_id);
@@ -1620,6 +1666,24 @@ export async function reapplyDirectTunnel(
       tunnelId,
       error_code: SCHEDULER_ERROR_CODES.mode_topology_mismatch,
       error: `隧道 ${tunnelId} 不是 DIRECT 模式`,
+      retryable: false,
+    };
+  }
+  if (admittedPersistedProtocol(row) === null) {
+    const code = SCHEDULER_ERROR_CODES.unsupported_protocol;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        apply_error_code: code,
+        apply_error: `[${code}] 协议未通过当前 runtime Gate`,
+      },
+    }).catch(() => {});
+    return {
+      ok: false,
+      tunnelId,
+      error_code: code,
+      error: "协议未通过当前 runtime Gate",
       retryable: false,
     };
   }

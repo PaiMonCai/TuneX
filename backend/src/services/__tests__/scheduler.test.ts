@@ -625,6 +625,20 @@ describe("A. 编排顺序（§7.11 十条步骤）", () => {
     expect(result.steps.every((s) => s.ok)).toBe(true);
   });
 
+  test("A1b. 未开放协议在 scheduler 边界 fail-closed，且绝不创建/下发", async () => {
+    const before = tunnels.length;
+    const result = await scheduler.createRelayTunnel(
+      input({ tunnelType: "udp" }),
+      orch,
+      deps,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error_code).toBe(scheduler.SCHEDULER_ERROR_CODES.unsupported_protocol);
+    expect(tunnels.length).toBe(before);
+    expect(fakeAgent.applies.length).toBe(0);
+  });
+
   test("A2. 铁律一：出口下发先于入口下发（顺序不可交换）", async () => {
     const result = await scheduler.createRelayTunnel(input(), orch, deps);
     expect(result.ok).toBe(true);
