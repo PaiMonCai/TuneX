@@ -59,6 +59,12 @@ function makeTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
     id: 1,
     user_id: 1,
     workspace_id: 1,
+    // Every real row carries a protocol fact (the V4 shape: only the legacy
+    // column). Omitting BOTH is now a refusal, not a tcp default — see
+    // admitPersistedProtocol — so a fixture without them would not describe a row
+    // the database can actually hold.
+    tunnel_type: "tcp",
+    forward_protocol: null,
     desired_status: "active",
     config_revision: 3,
     applied_revision: 1,

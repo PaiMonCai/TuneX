@@ -1841,10 +1841,10 @@ describe("H. V5-WP2 runtime plan", () => {
     expect(plan.placement.egress_node_id).toBe(egress.nodeId);
     expect(plan.placement.ingress_node_id).toBe(ingress.nodeId);
     // 监听：入口端口就是计划里的端口，也是下发下去的那个端口。
-    expect(plan.listener.port).toBe(ingress.config?.ingress_port);
+    expect(plan.listener.port).toBe(ingress.config?.ingress_port as number | null);
     expect(plan.listener.port).toBe(result.ingressPort);
     // 远端：RELAY 的 next_hop 来自出口 ACK 的地址，计划与下发必须同源。
-    expect(plan.upstream.next_hop).toBe(ingress.config?.next_hop);
+    expect(plan.upstream.next_hop).toBe(ingress.config?.next_hop as string | null);
     // 协议：两端下发的 config.protocol 都等于计划里的协议（不是硬编码）。
     expect(egress.config?.protocol).toBe(plan.protocol.name);
     expect(ingress.config?.protocol).toBe(plan.protocol.name);

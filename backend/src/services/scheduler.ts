@@ -62,6 +62,7 @@ import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
+  admitPersistedProtocol,
   buildForwardRuntimePlan,
   forwardRuntimePlanViolations,
   normalizeForwardProtocol,
@@ -1378,14 +1379,10 @@ export async function createRelayTunnel(
  *        是进程级的，重建实例会让两端看到不同的账本）。
  * @param over 见 {@link SchedulerDeps}。
  */
-function admittedPersistedProtocol(row: Record<string, unknown>): ForwardProtocol | null {
-  try {
-    const fact = persistedForwardProtocol(row.forward_protocol, row.tunnel_type);
-    return normalizeForwardProtocol(fact);
-  } catch {
-    return null;
-  }
-}
+/* `admittedPersistedProtocol` moved to forward-contract.ts (WP4/G0): every
+   dispatch path needs the same answer, and two copies is how one path admits a
+   fact another refuses. */
+const admittedPersistedProtocol = admitPersistedProtocol;
 
 async function checkExistingRuntime(
   row: Record<string, unknown>,
@@ -1511,6 +1508,10 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "auth_quota", ok: true });
   steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true } });
 
+  // Resolved once, used for admission, dispatch and the canonical fact written
+  // back below: three places that must agree on which protocol this is.
+  const reapplyProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
+
   /* ---------------- ③ bind nodes ---------------- */
   const [inCandidatesRaw, outCandidatesRaw] = await Promise.all([
     store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
@@ -1619,6 +1620,12 @@ export async function reapplyRelayTunnel(
     data: {
       ingress_node_id: ingressPick.node.id, egress_node_id: egressPick.node.id, egress_pool_id: poolId,
       apply_status: APPLY_STATUS.applying, desired_status: DESIRED_STATUS.inactive,
+      // V5-WP1/G0: a Forward created before the protocol column existed carries
+      // its fact only in `tunnel_type`. Re-orchestrating it is the moment the
+      // canonical fact can be materialised, and leaving it NULL means every
+      // later reader keeps falling back to the legacy column forever. The value
+      // is the admitted protocol (admission already ran above), never a default.
+      forward_protocol: reapplyProtocol,
     },
   });
 
@@ -1729,7 +1736,6 @@ export async function reapplyRelayTunnel(
     );
   }
 
-  const reapplyProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
   const egressDispatch = await orchestrator.dispatchEgress({
     tunnelId,
     revision,
@@ -1949,6 +1955,10 @@ export async function reapplyDirectTunnel(
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: pick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
 
+  // Resolved once: admission, dispatch and the canonical fact written back below
+  // must agree on which protocol this is.
+  const directProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
+
   /* V5-WP1 runtime admission（DIRECT：只需入口节点满足动作 + 协议 + 传输）。
      与 unsupported_protocol 同一处理：只写 apply_status/apply_error_code，
      不动 desired_status —— admission 拒绝不是用户意图改变，「失败保留业务
@@ -2015,11 +2025,14 @@ export async function reapplyDirectTunnel(
       config_revision: revision,
       apply_error_code: null,
       apply_error: null,
+      // See reapplyRelayTunnel: a successful re-orchestration materialises the
+      // canonical protocol fact instead of leaving history's only evidence in
+      // the legacy column.
+      forward_protocol: directProtocol,
     },
   });
 
   /* V5-WP2 RuntimePlan 自检（DIRECT：端口分配后所有事实齐了）。 */
-  const directProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
   const directPlan = buildForwardRuntimePlan("direct", directProtocol, {
     revision,
     placement: { ingress_node_id: pick.node.id },

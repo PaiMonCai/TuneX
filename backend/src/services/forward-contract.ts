@@ -137,6 +137,39 @@ export function legacyTunnelTypeForForwardProtocol(
  * 一旦装进对象就必然有人开始从计划里读实时状态——那会让"计划"变成第二份
  * desired state 真相，正是 §1.4 禁止的。
  */
+/**
+ * The persisted protocol fact of a Forward row, **if the current runtime admits
+ * it**; `null` means "this fact is not runnable".
+ *
+ * This is the single implementation used by every dispatch path — the scheduler,
+ * the reconcile sink and the rollout executor. It lives here rather than in
+ * scheduler.ts because a second copy is how one path ends up admitting a fact the
+ * others refuse: the V5-G0 gate caught exactly that, with a historical `wss`
+ * Forward being dispatched as TCP by the reconcile sink because that path passed
+ * no protocol at all and the orchestrator's default is tcp.
+ */
+export function admitPersistedProtocol(row: {
+  forward_protocol?: unknown;
+  tunnel_type?: unknown;
+}): ForwardProtocol | null {
+  // A persisted row must CARRY a protocol fact. If neither column is present the
+  // projection is wrong (a forgotten `select`), and "absent means tcp" — which is
+  // correct at the V4 *ingest* boundary, where a client legitimately omits the
+  // field — becomes catastrophic here: the row's own fact is silently replaced by
+  // the default and a historical `wss` Forward is dispatched as TCP.
+  //
+  // Gate V5-G0 caught exactly that: the reconciler's desired-state projection did
+  // not select the protocol columns, so every resend through the reconcile sink
+  // admitted the default. Failing closed turns a missing column into a refusal
+  // (visible, diagnosable) instead of a wrong runtime (invisible, live).
+  if (row.forward_protocol == null && row.tunnel_type == null) return null;
+  try {
+    return normalizeForwardProtocol(persistedForwardProtocol(row.forward_protocol, row.tunnel_type));
+  } catch {
+    return null;
+  }
+}
+
 export interface ForwardRuntimePlacement {
   readonly ingress_node_id: number | null;
   readonly egress_node_id: number | null;

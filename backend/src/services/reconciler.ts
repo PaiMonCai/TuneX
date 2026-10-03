@@ -109,6 +109,13 @@ export interface DesiredTunnel {
   ingress_node_id?: number | null;
   egress_node_id?: number | null;
   in_node_group_id?: number | null;
+  /**
+   * 协议事实（V5-WP0/WP4）。**必须**随行一起投影：resend 路径要据此判定这份事实
+   * 是否可运行；缺列会被 fail-closed 拒绝（`admitPersistedProtocol` 不再把
+   * 「投影忘了选列」当成 V4 的「省略协议」）。
+   */
+  forward_protocol?: string | null;
+  tunnel_type?: string | null;
 }
 
 /** Agent 快照里的单条隧道（对齐 services/node-state.ts 的 ReportedTunnel）。 */
@@ -603,6 +610,12 @@ export function defaultReconcileDeps(): ReconcileDeps {
         select: {
           id: true,
           name: true,
+          // V5-WP4/G0: the protocol fact travels with the row, because the sink
+          // that resends it must decide whether this fact is runnable. Without
+          // these columns `admitPersistedProtocol` sees "no fact at all" and the
+          // old default would have replayed a historical non-TCP Forward as TCP.
+          forward_protocol: true,
+          tunnel_type: true,
           tunnel_mode: true,
           desired_status: true,
           config_revision: true,

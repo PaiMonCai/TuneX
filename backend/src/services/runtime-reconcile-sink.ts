@@ -33,6 +33,7 @@
  * `defaultRolloutResumeDeps` 同口径）。
  */
 import type { Orchestrator, OrchestratorNode } from "./orchestrator.ts";
+import { admitPersistedProtocol } from "./forward-contract.ts";
 import type { ReconcileSink } from "./reconciler.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
@@ -61,6 +62,13 @@ export interface SinkTunnel {
   workspace_id: number;
   user_id: number;
   tunnel_type?: string;
+  /**
+   * Canonical protocol fact (V5-WP0). It must be present on the projection: this
+   * sink issues real commands, and `admitPersistedProtocol` fails closed when the
+   * row carries no protocol fact at all (a forgotten `select` must not be read as
+   * a V4 "protocol omitted" payload).
+   */
+  forward_protocol?: string | null;
   desired_status: string | null;
   config_revision: number | null;
   applied_revision: number | null;
@@ -261,6 +269,20 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         if (!tunnel.listen_port || !tunnel.remote_host || !tunnel.remote_port) {
           throw new Error(`DIRECT tunnel ${tunnel_id} has incomplete desired config`);
         }
+        // V5-WP4/G0: this path dispatches real commands, so it must admit the
+        // persisted protocol like every other one. Without it a historical
+        // non-TCP Forward (wss/udp/...) would be replayed as TCP here — the
+        // orchestrator defaults an absent protocol to tcp — and the panel would
+        // report a successful reconcile of a Forward it must not run.
+        const protocol = admitPersistedProtocol({
+          forward_protocol: tunnel.forward_protocol,
+          tunnel_type: tunnel.tunnel_type,
+        });
+        if (protocol === null) {
+          throw new Error(
+            `tunnel ${tunnel_id} uses a protocol the current runtime has not opened; refusing to replay it`,
+          );
+        }
         await assertRuntimeUse(tunnel, revision);
         const r = await orchestrator.dispatchDirect({
           tunnelId: tunnel.id,
@@ -270,6 +292,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
           remoteHost: tunnel.remote_host,
           remotePort: tunnel.remote_port,
           listenHost: tunnel.listen_ip,
+          protocol,
         });
         if (!r.ok) throw new Error(r.error);
         // ACK 已确认这个 revision 在 Agent 上生效 ⇒ 记账（见文件头「缺陷 1」）。
@@ -288,6 +311,17 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         throw new Error(`RELAY tunnel ${tunnel_id} has no active egress targets`);
       }
 
+      // Same rule as the DIRECT branch above: the replay carries the persisted
+      // protocol, so a historical non-TCP Forward cannot be reconciled as TCP.
+      const relayProtocol = admitPersistedProtocol({
+        forward_protocol: tunnel.forward_protocol,
+        tunnel_type: tunnel.tunnel_type,
+      });
+      if (relayProtocol === null) {
+        throw new Error(
+          `tunnel ${tunnel_id} uses a protocol the current runtime has not opened; refusing to replay it`,
+        );
+      }
       await assertRuntimeUse(tunnel, revision);
       const egress = await orchestrator.dispatchEgress({
         tunnelId: tunnel.id,
@@ -297,6 +331,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         poolId: tunnel.egress_pool_id,
         targets,
         lbStrategy: tunnel.egress_pool?.lb_strategy ?? tunnel.egress_node.lb_strategy,
+        protocol: relayProtocol,
       });
       if (!egress.ok) throw new Error(egress.error);
 
@@ -310,6 +345,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         ingressNode: tunnel.ingress_node,
         ingressPort: tunnel.listen_port,
         nextHop: nextHop(host, tunnel.egress_port),
+        protocol: relayProtocol,
       });
       if (!ingress.ok) throw new Error(ingress.error);
 
