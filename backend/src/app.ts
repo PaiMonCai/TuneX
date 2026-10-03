@@ -32,6 +32,7 @@ import { authRoutes } from "./routes/auth.ts";
 import { adminRoutes } from "./routes/admin.ts";
 import { nodeGrantRoutes } from "./routes/admin-node-grants.ts";
 import { workspaceRoutes } from "./routes/workspaces.ts";
+import { workspaceRolesRoutes } from "./routes/workspace-roles.ts";
 import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { nodeAdminRoutes } from "./routes/node-admin.ts";
 import { nodeLifecycleRoutes } from "./routes/node-lifecycle.ts";
@@ -76,6 +77,9 @@ export function createApp() {
 
   app.onError((err, c) => {
     if (err instanceof HTTPException) {
+      // Structured authorization errors carry a response; do not erase its
+      // machine-readable code/layer at the global error boundary.
+      if (err.res) return err.getResponse();
       return c.json({ error: err.message || "Error" }, err.status);
     }
     console.error("[unhandled]", err);
@@ -135,6 +139,7 @@ export function createApp() {
   app.route("/api/tunnels", tunnelsRoutes);
   app.route("/api/forwards", forwardsRoutes);
   app.route("/api/workspaces", workspaceRoutes);
+  app.route("/api/workspaces", workspaceRolesRoutes);
   app.route("/api/plans", plansRoutes);
   app.route("/api/topups", topupsRoutes);
   app.route("/api/payments", paymentsRoutes);

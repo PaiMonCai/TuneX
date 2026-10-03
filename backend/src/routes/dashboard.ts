@@ -24,7 +24,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
-import { resolveWorkspaceAccess } from "../services/workspace.ts";
+import { resolveWorkspaceAccess, resolveWorkspaceMembership, canWorkspaceResourceAction } from "../services/workspace.ts";
 import { collectAttention } from "../services/attention.ts";
 import { projectUserNode } from "../services/node-view.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
@@ -103,14 +103,16 @@ dashboardRoutes.get("/traffic", async (c) => {
 dashboardRoutes.get("/stats", async (c) => {
   const user = requireUser(c);
 
-  const workspace = await resolveWorkspaceAccess(c, "read");
+  const workspace = await resolveWorkspaceMembership(c);
+  const forwardsVisible = canWorkspaceResourceAction(workspace, "read", "forward");
+  const nodesVisible = canWorkspaceResourceAction(workspace, "read", "node");
   const monthStart = startOfToday();
   monthStart.setDate(1);
 
   const [userPlan, tunnelCount, nodes, todayAgg, monthAgg] = await Promise.all([
     workspace.kind === "personal" ? db.userPlan.findUnique({ where: { user_id: user.id }, include: { plan: true } }) : null,
-    db.tunnel.count({ where: { workspace_id: workspace.id } }),
-    db.node.findMany({
+    forwardsVisible ? db.tunnel.count({ where: { workspace_id: workspace.id } }) : 0,
+    nodesVisible ? db.node.findMany({
       where: { node_group: { workspace_id: workspace.id } },
       // V4-WP8：节点计数也要用 Connection 层的事实。改造前这里只数
       // `status === "active"`（legacy 列），所以「从未安装过 Agent 的节点」
@@ -124,15 +126,15 @@ dashboardRoutes.get("/stats", async (c) => {
         credential_revoked: true,
         lifecycle: true,
       },
-    }),
-    db.tunnelTraffic.aggregate({
+    }) : [],
+    forwardsVisible ? db.tunnelTraffic.aggregate({
       where: { date: { gte: startOfToday() }, tunnel: { workspace_id: workspace.id } },
       _sum: { traffic: true },
-    }),
-    db.tunnelTraffic.aggregate({
+    }) : { _sum: { traffic: 0 } },
+    forwardsVisible ? db.tunnelTraffic.aggregate({
       where: { date: { gte: monthStart }, tunnel: { workspace_id: workspace.id } },
       _sum: { traffic: true },
-    }),
+    }) : { _sum: { traffic: 0 } },
   ]);
 
   const activeNodes = nodes.filter((n) =>
@@ -147,6 +149,7 @@ dashboardRoutes.get("/stats", async (c) => {
   const totalNodes = nodes.length;
 
   const stats = {
+    visibility: { forwards: forwardsVisible, nodes: nodesVisible },
     balance: workspace.kind === "personal" ? user.balance : 0,
     commission_balance: workspace.kind === "personal" ? user.commission_balance : 0,
     tunnel_count: tunnelCount,
@@ -183,9 +186,12 @@ dashboardRoutes.get("/stats", async (c) => {
  * （与 `/stats` / `/traffic` 同一取向；读端点不新建专属规则）。
  */
 dashboardRoutes.get("/attention", async (c) => {
-  const workspace = await resolveWorkspaceAccess(c, "read");
+  const workspace = await resolveWorkspaceMembership(c);
   try {
-    const payload = await collectAttention(workspace.id);
+    const payload = await collectAttention(workspace.id, undefined, {
+      nodes: canWorkspaceResourceAction(workspace, "read", "node"),
+      forwards: canWorkspaceResourceAction(workspace, "read", "forward"),
+    });
     return c.json({ data: payload });
   } catch {
     return c.json({

@@ -204,6 +204,45 @@ describe("telemetryColumns — 载荷 → 列", () => {
       host_metrics: { cpu_count: 8 },
       error_count: 2,
       last_error_at: null,
+      // V4-WP11B: an Agent that reports no negotiation facts keeps them NULL —
+      // "never told us" must stay distinguishable from "supports nothing".
+      // capabilities is a JSON column, so "absent" is Prisma.JsonNull.
+      control_protocol_version: null,
+      capabilities: Prisma.JsonNull,
     });
+  });
+});
+
+/**
+ * V4-WP11B regression: a Go nil slice marshals to `null`, and every RELAY
+ * ingress tunnel has no targets of its own. Treating that as a type error made
+ * those nodes' state reports permanently 400 — losing telemetry and health for
+ * exactly the nodes that relay traffic. Absent and null describe the same fact.
+ */
+describe("state report tolerates null where a field is optional", () => {
+  test("a RELAY tunnel with targets:null is accepted, not rejected", () => {
+    const r = validateStateReport({
+      ...BASE,
+      tunnels: [{ id: "tunex-2-relay", mode: "RELAY", targets: null, next_hop: "10.0.0.1:22001" }],
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test("targets:[] and an absent targets key stay accepted too", () => {
+    for (const targets of [[], undefined]) {
+      const r = validateStateReport({
+        ...BASE,
+        tunnels: [{ id: "tunex-2-relay", mode: "RELAY", ...(targets === undefined ? {} : { targets }) }],
+      });
+      expect(r.ok).toBe(true);
+    }
+  });
+
+  test("a wrong non-null shape is still rejected", () => {
+    for (const targets of ["none", 7, { host: "x" }, [1]]) {
+      const r = validateStateReport({ ...BASE, tunnels: [{ id: "t", mode: "DIRECT", targets }] });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("bad_tunnels");
+    }
   });
 });

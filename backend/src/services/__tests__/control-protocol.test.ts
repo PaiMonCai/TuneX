@@ -123,8 +123,11 @@ function ackEnvelope(
 /* A. 统一命令六型                                                      */
 /* ================================================================== */
 
-describe("A. 统一命令（§7.9 六个动作）", () => {
-  test("六个动作全部在冻结清单里，且 ACTION_SPECS 一一对应", () => {
+describe("A. 统一命令（§7.9 六个动作 + V4-WP11C 诊断）", () => {
+  test("清单与 ACTION_SPECS 一一对应（新增动作必须显式改这里）", () => {
+    // 这份清单是**冻结契约**：列表变化必须是刻意的决定，所以这里逐项写死。
+    // V4-WP11C 增加 `diagnose_tunnel` 时同步改了本断言——那是契约变更，不该
+    // 让"多一个动作"悄悄发生。
     expect([...COMMAND_ACTIONS]).toEqual([
       "apply_tunnel",
       "remove_tunnel",
@@ -132,11 +135,13 @@ describe("A. 统一命令（§7.9 六个动作）", () => {
       "suspend_tunnel",
       "state_request",
       "command_ack",
+      "diagnose_tunnel",
+      "collect_diagnostics",
     ]);
     for (const action of COMMAND_ACTIONS) {
       expect(ACTION_SPECS[action]).toBeDefined();
     }
-    // 只有四个变更动作用于 revision 闸门；state_request/command_ack 不走闸门。
+    // 只有四个变更动作用于 revision 闸门；state_request/command_ack/diagnose 不走闸门。
     expect(COMMAND_ACTIONS.filter((a) => ACTION_SPECS[a].mutating)).toEqual([
       "apply_tunnel",
       "remove_tunnel",
@@ -146,6 +151,22 @@ describe("A. 统一命令（§7.9 六个动作）", () => {
     // state_request 允许 revision 0（"我不关心版本"），其余必须 >= 1。
     expect(ACTION_SPECS.state_request.minRevision).toBe(0);
     expect(ACTION_SPECS.command_ack.minRevision).toBeGreaterThan(0);
+
+    // V4-WP11C：诊断是只读动作。它既不改 revision 也不改 desired，
+    // 因此 minRevision 为 0；**但它不是基线动作**——Agent 必须显式上报
+    // `diagnose_tunnel` 能力，面板才会下发（见 services/agent-capability.ts）。
+    expect(ACTION_SPECS.diagnose_tunnel.mutating).toBe(false);
+    expect(ACTION_SPECS.diagnose_tunnel.minRevision).toBe(0);
+    expect(ACTION_SPECS.diagnose_tunnel.resources).toContain("tunnel");
+
+    // collect_diagnostics is the Node-level sibling: also read-only, also
+    // capability-gated, and it takes NO payload — a node self report with inputs
+    // would be a remote-administration surface.
+    expect(ACTION_SPECS.collect_diagnostics.mutating).toBe(false);
+    expect(ACTION_SPECS.collect_diagnostics.minRevision).toBe(0);
+    expect(ACTION_SPECS.collect_diagnostics.resources).toEqual(["node"]);
+    expect(validatePayload("collect_diagnostics", {})).toBeNull();
+    expect(validatePayload("collect_diagnostics", { path: "/etc/shadow" })).toMatch(/未定义字段/);
   });
 
   test("apply_tunnel：合法命令 → applied，状态推进到 active", async () => {

@@ -169,10 +169,6 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
   const range = group.port_range?.split("-").map(Number) ?? [];
   const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
   const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
-  if (portMin === null || portMax === null || portMin < 1 || portMax > 65535 || portMin > portMax) {
-    return c.json({ error: "节点组未配置可用于 v3 的连续端口范围" }, 409);
-  }
-
   try {
     const reserved = await withWorkspaceQuotaLock(workspace.id, async (tx, policy) => {
       const existing = await tx.node.findUnique({
@@ -182,14 +178,20 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
       if (existing && existing.node_group_id !== group.id) {
         return { groupConflict: true } as const;
       }
-      if (existing?.role && existing.role !== role) {
+      if (existing?.role && parsed.data.role !== undefined && existing.role !== parsed.data.role) {
         return { roleConflict: existing.role } as const;
+      }
+      if (existing && (parsed.data.targets?.length ?? 0) > 0) {
+        return { runtimeEdit: true } as const;
       }
 
       const nodeCount = await tx.node.count({
         where: { node_group: { workspace_id: workspace.id } },
       });
       if (!existing) {
+        if (portMin === null || portMax === null || portMin < 1 || portMax > 65535 || portMin > portMax) {
+          return { rangeConflict: true } as const;
+        }
         const decision = checkNodeCreation(policy, nodeCount);
         if (!decision.allowed) return { denied: decision } as const;
       }
@@ -205,17 +207,10 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
         port_range_max: true,
       } as const;
       const node = existing
-        ? await tx.node.update({
-            where: { id: existing.id },
-            data: {
-              ...(parsed.data.connect_ip !== undefined ? { connect_ip: parsed.data.connect_ip } : {}),
-              role,
-              port_range_min: portMin,
-              port_range_max: portMax,
-              lb_strategy: "round",
-            },
-            select,
-          })
+        // Reinstall is identity/enrollment only, never an unguarded runtime
+        // edit. Preserve role/range/address/lb; the dedicated impact-checked
+        // APIs are the sole mutation surface for an existing node.
+        ? await tx.node.findUniqueOrThrow({ where: { id: existing.id }, select })
         : await tx.node.create({
             data: {
               node_id: parsed.data.node_id,
@@ -273,6 +268,9 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
     }
     if ("roleConflict" in reserved && reserved.roleConflict) {
       return c.json({ error: `已存在节点角色为 ${reserved.roleConflict}，请先显式修改角色` }, 409);
+    }
+    if ("runtimeEdit" in reserved) {
+      return c.json({ error: "重装不会修改现有运行配置，请使用出口池管理接口", code: "runtime_edit_requires_impact_check", error_layer: "runtime_admission" }, 409);
     }
     const denied = "denied" in reserved ? reserved.denied : null;
     if (denied) {

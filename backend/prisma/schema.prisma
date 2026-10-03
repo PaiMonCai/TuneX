@@ -1502,6 +1502,21 @@ model NodeStateReport {
   /// 最近一次错误时刻（NULL = 从未出错或旧 Agent）
   last_error_at    DateTime?
 
+  // ── V4-WP11B 控制协议协商（§13.5）──
+  //
+  // 两个字段都是**可空且无默认值**：NULL 明确表示「这个 Agent 没有协商能力」
+  // （旧版本 Agent），而不是「支持版本 0 / 能力为空」。这个区别决定了面板能
+  // 不能对旧 Agent 下发新动作——把 NULL 当 0 会把升级窗口变成一次全网中断。
+  //
+  //   control_protocol_version ← Agent 实现的控制协议版本（整数，单调增）
+  //   capabilities             ← Agent 实际实现的动作清单（字符串数组，
+  //                              由 Agent 侧 execute 分支的真实实现派生，
+  //                              不是"理论上支持"的清单）
+  /// Agent 实现的控制协议版本（NULL = 旧 Agent 未上报）
+  control_protocol_version Int?
+  /// Agent 实际实现的控制动作清单（NULL = 未上报；非数组 = 坏形状，fail-closed）
+  capabilities             Json?
+
   @@index([reported_at])
   @@index([last_error_at])
   @@map("node_state_report")

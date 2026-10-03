@@ -98,8 +98,15 @@ export interface ForwardBatchItemResult {
   id: number;
   ok: boolean;
   apply_status: string | null;
+  /**
+   * Machine-readable reason. RBAC refusals use the same `forbidden` code the
+   * single-resource endpoints use (`/api/forwards/:id`), so a client that maps
+   * one maps the other; `error_layer` below says which layer refused.
+   */
   code?: string;
   message?: string;
+  /** §13.5 error layering; present on refusals that never reached the runtime. */
+  error_layer?: "rbac" | "resource_scope" | "capability" | "quota" | "runtime_admission";
 }
 
 export interface ForwardBatchSummary {

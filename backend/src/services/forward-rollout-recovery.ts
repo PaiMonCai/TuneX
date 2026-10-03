@@ -33,6 +33,7 @@
 
 import {
   executeRollout,
+  defaultRuntimeUse,
   type RolloutDb,
   type RolloutDeps,
 } from "./forward-rollout-exec.ts";
@@ -100,7 +101,9 @@ export async function resumeRollouts(deps: ResumeRolloutsDeps): Promise<ResumeRo
   const engineDeps: RolloutDeps = {
     db: deps.db,
     orchestrator: deps.orchestrator,
+    runtimeUse: deps.runtimeUse ?? defaultRuntimeUse,
     ...(deps.now ? { now: deps.now } : {}),
+    ...(deps.sleep ? { sleep: deps.sleep } : {}),
   };
 
   const now = deps.now?.() ?? new Date();
@@ -164,22 +167,30 @@ export type ResumeRolloutsDeps = Omit<RolloutDeps, "orchestrator"> & {
  * 单测不会连库（与 `defaultReconcileDeps` 同口径：worker 在 import 期就加载
  * 全部 cron 实现，任何顶层 `db` 引用都会让单测强制连 MySQL）。
  */
+function lazyModel<K extends keyof RolloutDb>(
+  name: K, methods: Array<keyof NonNullable<RolloutDb[K]>>,
+): NonNullable<RolloutDb[K]> {
+  return Object.fromEntries(methods.map((method) => [method, async (args: unknown) => {
+    const { db } = await import("../db.ts");
+    const model = db[name] as unknown as Record<string, (args: unknown) => Promise<unknown>>;
+    return model[String(method)]!(args);
+  }])) as NonNullable<RolloutDb[K]>;
+}
+
 export function defaultRolloutResumeDeps(): ResumeRolloutsDeps {
   return {
+    // Recovery runs the entire executor, not merely the initial scan. Provide
+    // every ledger/topology/lease method lazily rather than casting a partial DB.
     db: {
-      forwardRollout: {
-        findMany: async (args) => {
-          const { db } = await import("../db.ts");
-          const rows = await db.forwardRollout.findMany(args as never);
-          return rows as unknown as Awaited<ReturnType<RolloutDb["forwardRollout"]["findMany"]>>;
-        },
-        findUnique: async (args) => {
-          const { db } = await import("../db.ts");
-          const row = await db.forwardRollout.findUnique(args as never);
-          return row as unknown as Awaited<ReturnType<RolloutDb["forwardRollout"]["findUnique"]>>;
-        },
-      },
-    } as RolloutDb,
+      tunnel: lazyModel("tunnel", ["findUnique", "update", "updateMany"]),
+      forwardRevision: lazyModel("forwardRevision", ["findFirst", "findMany"]),
+      forwardRollout: lazyModel("forwardRollout", ["create", "findUnique", "findMany", "update", "updateMany"]),
+      nodeBinding: lazyModel("nodeBinding", ["findUnique", "create"]),
+      node: lazyModel("node", ["findUnique", "findMany", "update", "updateMany"]),
+      nodePortLease: lazyModel("nodePortLease", ["create", "findUnique", "findMany", "update", "updateMany"]),
+      nodeStateReport: lazyModel("nodeStateReport", ["findUnique"]),
+    },
+    runtimeUse: defaultRuntimeUse,
     // orchestrator 在**构造时**取一次（worker 单例，与 relay-wiring 同一实例）。
     orchestrator: getOrchestrator(),
   };

@@ -9,7 +9,13 @@
  */
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
-import type { CommandEnvelope } from "./control-protocol/index.ts";
+import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
+import {
+  capabilityFactsFromStored,
+  decideCapability,
+  type AgentCapabilityFacts,
+} from "./agent-capability.ts";
+import { randomUUID } from "node:crypto";
 import {
   AgentTransportError,
   RELAY_DISPATCH_ERROR_CODES,
@@ -21,20 +27,92 @@ import {
 export interface QueuedAgentCommand {
   envelope: CommandEnvelope;
   config: AgentTunnelConfig | null;
+  /** V4-WP11C diagnose payload; delivered beside the envelope, like `config`. */
+  probe?: { targets: { host: string; port: number }[]; timeout_ms?: number } | null;
   queued_at: string;
 }
 
 export interface AgentCommandAck {
   command_id: string;
+  /** Echoed by the agent. Verified against the pending record when present. */
+  action?: string | null;
+  resource_id?: string | null;
   ok: boolean;
   applied_revision?: number | null;
   error_code?: string | null;
   error?: string | null;
+  /** V4-WP11C: a read-only action's findings (diagnose). Bounded below. */
+  results?: AgentDiagnoseResult[] | null;
+  /** V4-WP11C: the node's own bounded self report (collect_diagnostics). */
+  facts?: NodeSelfFacts | null;
+}
+
+/**
+ * The node self report, as validated on this side.
+ *
+ * Deliberately a closed shape: an agent (or anything holding its credential)
+ * cannot widen a diagnostic into an arbitrary payload, because every field here
+ * is checked and the object is rebuilt rather than trusted.
+ */
+export interface NodeSelfFacts {
+  version: string;
+  role: string;
+  agent_id: string;
+  node_id: string;
+  runtime: {
+    tunnel_count: number;
+    truncated: boolean;
+    ports_total: number;
+    listen_ports: number[];
+    tunnels: { id: string; mode: string; ingress_port: number; egress_port?: number; revision: number; crosses_node: boolean }[];
+  };
+  state_dir: {
+    path: string;
+    configured: boolean;
+    dir_exists: boolean;
+    cache_present: boolean;
+    cache_mod_time?: string;
+    cache_valid: boolean;
+  };
+  process: {
+    uptime_seconds: number;
+    started_at: string;
+    go_version: string;
+    os: string;
+    arch: string;
+    cpu_count: number;
+    gomaxprocs: number;
+    goroutines: number;
+    heap_bytes: number;
+  };
+  shutting_down: boolean;
+}
+
+/** One probe outcome, as reported by the agent. */
+export interface AgentDiagnoseResult {
+  host: string;
+  port: number;
+  status: string;
+  elapsed_ms: number;
+  resolved_ip?: string;
+  detail?: string;
 }
 
 const COMMAND_TTL_S = 120;
 const ACK_TIMEOUT_MS = 15_000;
 const ACK_POLL_MS = 100;
+/** Hard ceiling on a stored ACK body; anything larger is refused, not truncated
+ * into a shape the caller would read as a real result. */
+const ACK_MAX_BYTES = 8 * 1024;
+/** V4-WP11C caps: a probe request may carry at most this many results back. */
+export const DIAGNOSE_RESULT_MAX_ITEMS = 8;
+const DIAGNOSE_RESULT_HOST_MAX = 253;
+const DIAGNOSE_RESULT_DETAIL_MAX = 160;
+/** Error text is user-facing and stored in a VarChar(500) column upstream. */
+const ACK_ERROR_MAX_CHARS = 500;
+/** Mirrors the validator's own cap so a locally-built probe cannot exceed it. */
+const DIAGNOSE_MAX_TIMEOUT_MS = 5000;
+const ACK_ERROR_CODE_MAX_CHARS = 64;
 
 function queueKey(scope: number, nodeId: number): string {
   return scopedKey(scope, "agent", "command", String(nodeId), "queue");
@@ -42,6 +120,70 @@ function queueKey(scope: number, nodeId: number): string {
 function ackKey(scope: number, nodeId: number, commandId: string): string {
   return scopedKey(scope, "agent", "command", String(nodeId), "ack", commandId);
 }
+/**
+ * Pending-command ledger. An ACK is only accepted for a command this panel
+ * actually issued to this node, within its lifetime. Without it, anyone holding
+ * a node credential could inject an ACK for a command id of their choosing and
+ * the orchestrator would treat it as that node's answer.
+ */
+function pendingKey(scope: number, nodeId: number, commandId: string): string {
+  return scopedKey(scope, "agent", "command", String(nodeId), "pending", commandId);
+}
+
+/** The binding facts of an issued command, kept for ACK validation. */
+interface PendingCommand {
+  command_id: string;
+  action: string;
+  resource_id: string;
+  revision: number;
+  issued_at: string;
+  /** Absolute deadline (ISO) — the ACK is not evidence after this instant. */
+  expires_at: string;
+  /**
+   * The exact target set a diagnose command asked for. An answer that does not
+   * cover it is refused, because "we could not probe B" would otherwise be read
+   * as "A is reachable, so the path is fine".
+   */
+  expected_targets?: { host: string; port: number }[] | null;
+}
+
+/**
+ * The narrow Redis surface this module needs.
+ *
+ * It is an interface rather than direct `redis.*` calls so the ACK-binding rules
+ * below can be tested without a live Redis: those rules are security decisions,
+ * and "only covered by an integration run" is not good enough for them.
+ */
+export interface CommandBusStore {
+  get(key: string): Promise<string | null>;
+  del(key: string): Promise<unknown>;
+  /** Queue a payload with a TTL (atomically in production). */
+  push(key: string, value: string, ttlSeconds: number): Promise<void>;
+  /** Set a payload with a TTL, overwriting (used for the pending ledger). */
+  set(key: string, value: string, ttlSeconds: number): Promise<void>;
+  /** Set only when absent; returns null when the key already existed. */
+  setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<string | null>;
+  /** Pop the oldest queued payload. */
+  shift(key: string): Promise<string | null>;
+}
+
+const redisStore: CommandBusStore = {
+  get: (key) => redis.get(key),
+  del: (key) => redis.del(key),
+  async push(key, value, ttlSeconds) {
+    const tx = redis.multi();
+    tx.rpush(key, value);
+    tx.expire(key, ttlSeconds);
+    await tx.exec();
+  },
+  async set(key, value, ttlSeconds) {
+    await redis.set(key, value, "EX", ttlSeconds);
+  },
+  async setIfAbsent(key, value, ttlSeconds) {
+    return redis.set(key, value, "EX", ttlSeconds, "NX");
+  },
+  shift: (key) => redis.lpop(key),
+};
 
 async function nodeScope(nodeId: number): Promise<number> {
   const node = await db.node.findUnique({
@@ -55,30 +197,75 @@ async function nodeScope(nodeId: number): Promise<number> {
   return node.node_group.workspace_id;
 }
 
+export interface EnqueueDeps {
+  /**
+   * Resolves the workspace scope a node's keys live under. Injectable for the
+   * same reason the store is: the ordering and binding rules below are security
+   * decisions, and they must be testable without a database.
+   */
+  resolveScope?: (nodeId: number) => Promise<number>;
+}
+
 export async function enqueueAgentCommand(
   nodeId: number,
   envelope: CommandEnvelope,
   config: AgentTunnelConfig | null,
+  store: CommandBusStore = redisStore,
+  probe?: QueuedAgentCommand["probe"],
+  deps: EnqueueDeps = {},
 ): Promise<{ scope: number }> {
-  const scope = await nodeScope(nodeId);
+  const scope = await (deps.resolveScope ?? nodeScope)(nodeId);
   const item: QueuedAgentCommand = {
     envelope,
     config,
+    ...(probe ? { probe } : {}),
     queued_at: new Date().toISOString(),
   };
   const key = queueKey(scope, nodeId);
-  const tx = redis.multi();
-  tx.rpush(key, JSON.stringify(item));
-  tx.expire(key, COMMAND_TTL_S);
-  await tx.exec();
+  const pending: PendingCommand = {
+    command_id: envelope.command_id,
+    action: String(envelope.action ?? ""),
+    resource_id: String(envelope.resource_id ?? ""),
+    revision: Number(envelope.revision ?? 0),
+    issued_at: item.queued_at,
+    expires_at: String(envelope.expires_at ?? ""),
+    expected_targets: probe?.targets ? probe.targets.map((t) => ({ host: t.host, port: t.port })) : null,
+  };
+  // Register the binding BEFORE publishing the command. The reverse order has a
+  // real race: a fast agent can execute and ACK between the two writes, and the
+  // answer would then be rejected as "unknown command" while the caller waits for
+  // a timeout it can no longer receive.
+  await store.set(pendingKey(scope, nodeId, envelope.command_id), JSON.stringify(pending), COMMAND_TTL_S);
+  try {
+    await store.push(key, JSON.stringify(item), COMMAND_TTL_S);
+  } catch (error) {
+    // Never leave a binding for a command that was never queued.
+    await clearPendingCommand(scope, nodeId, envelope.command_id, store);
+    throw error;
+  }
   return { scope };
+}
+
+/**
+ * Clear the pending record once its command is finished with (ack consumed or
+ * timed out). Replay of the same command id afterwards is then impossible rather
+ * than merely unlikely.
+ */
+async function clearPendingCommand(
+  scope: number,
+  nodeId: number,
+  commandId: string,
+  store: CommandBusStore,
+): Promise<void> {
+  await store.del(pendingKey(scope, nodeId, commandId)).catch(() => {});
 }
 
 export async function dequeueAgentCommand(
   scope: number,
   nodeId: number,
+  store: CommandBusStore = redisStore,
 ): Promise<QueuedAgentCommand | null> {
-  const raw = await redis.lpop(queueKey(scope, nodeId));
+  const raw = await store.shift(queueKey(scope, nodeId));
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as QueuedAgentCommand;
@@ -89,20 +276,282 @@ export async function dequeueAgentCommand(
   }
 }
 
+/**
+ * Store one Agent ACK, but only for a command this panel issued to THIS node and
+ * that is still inside its lifetime.
+ *
+ * Rejections are the point of the function:
+ *   · unknown/expired command id → the ACK is not evidence of anything, and
+ *     accepting it would let a holder of the node credential fabricate a result
+ *     for a command that was never sent;
+ *   · an applied revision ahead of the issued revision → impossible, so forged
+ *     or misrouted;
+ *   · a duplicate ACK → the first answer wins (SET NX), so a late second answer
+ *     cannot rewrite a result the orchestrator may already have acted on.
+ *
+ * Error text is truncated rather than rejected: hiding a real node failure
+ * because its message was long would be worse than storing a clipped one.
+ */
 export async function storeAgentCommandAck(
   scope: number,
   nodeId: number,
   ack: AgentCommandAck,
+  store: CommandBusStore = redisStore,
 ): Promise<void> {
   if (!ack || typeof ack.command_id !== "string" || ack.command_id.trim() === "") {
     throw new TypeError("command_id is required");
   }
-  await redis.set(
-    ackKey(scope, nodeId, ack.command_id),
-    JSON.stringify(ack),
-    "EX",
-    COMMAND_TTL_S,
-  );
+  const commandId = ack.command_id.trim();
+
+  const rawPending = await store.get(pendingKey(scope, nodeId, commandId));
+  if (!rawPending) {
+    throw new TypeError(`unknown or expired command_id: ${commandId}`);
+  }
+  let pending: PendingCommand | null = null;
+  try {
+    pending = JSON.parse(rawPending) as PendingCommand;
+  } catch {
+    pending = null;
+  }
+  if (!pending || pending.command_id !== commandId) {
+    throw new TypeError(`unknown or expired command_id: ${commandId}`);
+  }
+  // The panel's deadline binds the answer too: a result that arrives after the
+  // command expired is not the answer to a question anyone is still asking.
+  if (pending.expires_at) {
+    const deadline = Date.parse(pending.expires_at);
+    if (Number.isFinite(deadline) && Date.now() > deadline) {
+      throw new TypeError(`ack after command expiry: ${commandId}`);
+    }
+  }
+  // An ACK that says which action/resource it is answering must agree with what
+  // was issued. Without this, a node (or anyone holding its credential) could
+  // answer a diagnose with the outcome of some other command.
+  if (typeof ack.action === "string" && ack.action !== "" && ack.action !== pending.action) {
+    throw new TypeError(`ack action ${ack.action} does not match issued action ${pending.action}`);
+  }
+  if (typeof ack.resource_id === "string" && ack.resource_id !== "" && ack.resource_id !== pending.resource_id) {
+    throw new TypeError(`ack resource_id ${ack.resource_id} does not match issued ${pending.resource_id}`);
+  }
+
+  const normalized: {
+    command_id: string;
+    ok: boolean;
+    applied_revision: number | null;
+    error_code: string | null;
+    error: string | null;
+    results?: AgentDiagnoseResult[];
+    facts?: NodeSelfFacts;
+  } = {
+    command_id: commandId,
+    ok: ack.ok === true,
+    applied_revision:
+      typeof ack.applied_revision === "number" && Number.isFinite(ack.applied_revision)
+        ? ack.applied_revision
+        : null,
+    error_code:
+      typeof ack.error_code === "string" && ack.error_code !== ""
+        ? ack.error_code.slice(0, ACK_ERROR_CODE_MAX_CHARS)
+        : null,
+    error:
+      typeof ack.error === "string" && ack.error !== ""
+        ? ack.error.slice(0, ACK_ERROR_MAX_CHARS)
+        : null,
+  };
+
+  // A node cannot have applied a revision newer than the one it was told to
+  // apply for this command.
+  if (
+    normalized.applied_revision !== null &&
+    pending.revision > 0 &&
+    normalized.applied_revision > pending.revision
+  ) {
+    throw new TypeError(
+      `applied_revision ${normalized.applied_revision} exceeds issued revision ${pending.revision}`,
+    );
+  }
+
+  const facts = normalizeNodeSelfFacts(ack.facts);
+  if (facts) {
+    if (pending.action !== "collect_diagnostics") {
+      throw new TypeError("a self report is only accepted for collect_diagnostics");
+    }
+    normalized.facts = facts;
+  } else if (pending.action === "collect_diagnostics" && ack.ok) {
+    throw new TypeError("collect_diagnostics acknowledged OK without facts");
+  }
+
+  const results = normalizeDiagnoseResults(ack.results);
+  if (results) {
+    // A diagnose answer must cover exactly the requested target set.
+    if (pending.action === "diagnose_tunnel") {
+      const expected = pending.expected_targets ?? [];
+      const problem = matchExpectedTargets(expected, results);
+      if (problem) throw new TypeError(problem);
+      if (!ack.ok) {
+        // A refused diagnose may legitimately carry no results.
+      } else if (results.length !== expected.length) {
+        throw new TypeError(`diagnose ack returned ${results.length} results for ${expected.length} targets`);
+      }
+    }
+    normalized.results = results;
+  } else if (pending.action === "diagnose_tunnel" && ack.ok) {
+    throw new TypeError("diagnose ack returned no results");
+  }
+
+  const payload = JSON.stringify(normalized);
+  if (Buffer.byteLength(payload, "utf8") > ACK_MAX_BYTES) {
+    throw new TypeError("ack payload too large");
+  }
+
+  const stored = await store.setIfAbsent(ackKey(scope, nodeId, commandId), payload, COMMAND_TTL_S);
+  if (stored === null) {
+    // A duplicate is not a new fact. Keep the first answer.
+    throw new TypeError(`duplicate ack for command ${commandId}`);
+  }
+}
+
+/**
+ * Bound and validate the structured results a read-only action returns.
+ *
+ * Undefined/absent stays absent (apply-style ACKs carry no results). A malformed
+ * list is refused rather than partially trusted: a diagnostic that reports half
+ * the probes as "reachable" while dropping the rest would read as "all good".
+ */
+export function normalizeDiagnoseResults(value: unknown): AgentDiagnoseResult[] | null {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) throw new TypeError("results must be an array");
+  if (value.length > DIAGNOSE_RESULT_MAX_ITEMS) {
+    throw new TypeError(`results has more than ${DIAGNOSE_RESULT_MAX_ITEMS} items`);
+  }
+  const out: AgentDiagnoseResult[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") throw new TypeError("result entries must be objects");
+    const row = entry as Record<string, unknown>;
+    if (typeof row.host !== "string" || row.host.length > DIAGNOSE_RESULT_HOST_MAX) {
+      throw new TypeError("result host is missing or too long");
+    }
+    if (!Number.isInteger(row.port) || (row.port as number) < 1 || (row.port as number) > 65535) {
+      throw new TypeError("result port is not a valid TCP port");
+    }
+    if (typeof row.status !== "string" || row.status.length > 32) {
+      throw new TypeError("result status is missing or too long");
+    }
+    out.push({
+      host: row.host,
+      port: row.port as number,
+      status: row.status,
+      elapsed_ms: Number.isFinite(row.elapsed_ms) ? Math.max(0, Math.trunc(row.elapsed_ms as number)) : 0,
+      ...(typeof row.resolved_ip === "string" && row.resolved_ip.length <= DIAGNOSE_RESULT_HOST_MAX
+        ? { resolved_ip: row.resolved_ip } : {}),
+      ...(typeof row.detail === "string" ? { detail: row.detail.slice(0, DIAGNOSE_RESULT_DETAIL_MAX) } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * The answer must describe the request. Missing, duplicated or unknown targets
+ * all mean the reply does not answer this question, so it is refused instead of
+ * being rendered as a partial success.
+ */
+export function matchExpectedTargets(
+  expected: { host: string; port: number }[],
+  results: AgentDiagnoseResult[],
+): string | null {
+  const key = (host: string, port: number) => `${host.toLowerCase()}:${port}`;
+  const want = new Set(expected.map((t) => key(t.host, t.port)));
+  const seen = new Set<string>();
+  for (const r of results) {
+    const k = key(r.host, r.port);
+    if (!want.has(k)) return `diagnose ack reported unrequested target ${k}`;
+    if (seen.has(k)) return `diagnose ack reported duplicate target ${k}`;
+    seen.add(k);
+  }
+  for (const t of expected) {
+    if (!seen.has(key(t.host, t.port))) return `diagnose ack is missing target ${key(t.host, t.port)}`;
+  }
+  return null;
+}
+
+/**
+ * Validate and rebuild a node self report.
+ *
+ * Every field is bounded and type-checked, and the object is constructed here
+ * rather than stored as-is: a diagnostic answer that the panel passes through
+ * would be a way for a node to place arbitrary data in a panel artefact.
+ */
+export function normalizeNodeSelfFacts(value: unknown): NodeSelfFacts | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError("facts must be an object");
+  const raw = value as Record<string, unknown>;
+  const str = (v: unknown, max: number): string => {
+    if (typeof v !== "string") throw new TypeError("fact string field missing");
+    return v.length > max ? v.slice(0, max) : v;
+  };
+  const int = (v: unknown, max: number): number => {
+    if (!Number.isFinite(v)) throw new TypeError("fact numeric field missing");
+    return Math.max(0, Math.min(max, Math.trunc(v as number)));
+  };
+  const bool = (v: unknown): boolean => v === true;
+
+  const runtime = raw.runtime as Record<string, unknown> | undefined;
+  const stateDir = raw.state_dir as Record<string, unknown> | undefined;
+  const process = raw.process as Record<string, unknown> | undefined;
+  if (!runtime || !stateDir || !process) throw new TypeError("facts missing a required section");
+
+  const rawTunnels = Array.isArray(runtime.tunnels) ? runtime.tunnels : [];
+  if (rawTunnels.length > DIAGNOSE_RESULT_MAX_ITEMS * 8) {
+    throw new TypeError("facts contain more tunnels than one answer may carry");
+  }
+  const tunnels = rawTunnels.map((entry) => {
+    const row = entry as Record<string, unknown>;
+    return {
+      id: str(row.id, 255),
+      mode: str(row.mode, 16),
+      ingress_port: int(row.ingress_port, 65535),
+      ...(row.egress_port === undefined ? {} : { egress_port: int(row.egress_port, 65535) }),
+      revision: int(row.revision, Number.MAX_SAFE_INTEGER),
+      crosses_node: bool(row.crosses_node),
+    };
+  });
+  const ports = (Array.isArray(runtime.listen_ports) ? runtime.listen_ports : [])
+    .slice(0, 256)
+    .map((p) => int(p, 65535));
+
+  return {
+    version: str(raw.version, 64),
+    role: str(raw.role, 32),
+    agent_id: str(raw.agent_id, 128),
+    node_id: str(raw.node_id, 128),
+    runtime: {
+      tunnel_count: int(runtime.tunnel_count, Number.MAX_SAFE_INTEGER),
+      truncated: bool(runtime.truncated),
+      ports_total: int(runtime.ports_total, 4096),
+      listen_ports: ports,
+      tunnels,
+    },
+    state_dir: {
+      path: str(stateDir.path, 255),
+      configured: bool(stateDir.configured),
+      dir_exists: bool(stateDir.dir_exists),
+      cache_present: bool(stateDir.cache_present),
+      ...(typeof stateDir.cache_mod_time === "string" ? { cache_mod_time: stateDir.cache_mod_time.slice(0, 40) } : {}),
+      cache_valid: bool(stateDir.cache_valid),
+    },
+    process: {
+      uptime_seconds: int(process.uptime_seconds, Number.MAX_SAFE_INTEGER),
+      started_at: str(process.started_at, 40),
+      go_version: str(process.go_version, 32),
+      os: str(process.os, 16),
+      arch: str(process.arch, 16),
+      cpu_count: int(process.cpu_count, 1024),
+      gomaxprocs: int(process.gomaxprocs, 1024),
+      goroutines: int(process.goroutines, 1_000_000),
+      heap_bytes: int(process.heap_bytes, Number.MAX_SAFE_INTEGER),
+    },
+    shutting_down: bool(raw.shutting_down),
+  };
 }
 
 export async function waitAgentCommandAck(
@@ -110,22 +559,67 @@ export async function waitAgentCommandAck(
   nodeId: number,
   commandId: string,
   timeoutMs = ACK_TIMEOUT_MS,
+  store: CommandBusStore = redisStore,
 ): Promise<AgentCommandAck> {
   const key = ackKey(scope, nodeId, commandId);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const raw = await redis.get(key);
+    const raw = await store.get(key);
     if (raw) {
-      await redis.del(key);
+      await store.del(key);
+      await clearPendingCommand(scope, nodeId, commandId, store);
       const ack = JSON.parse(raw) as AgentCommandAck;
       return ack;
     }
     await new Promise((resolve) => setTimeout(resolve, ACK_POLL_MS));
   }
+  // Timed out: the command is abandoned, so its pending record must go too. A
+  // late ACK for it would otherwise be accepted into a key nobody is watching
+  // and could be mistaken for the answer to a later command.
+  await clearPendingCommand(scope, nodeId, commandId, store);
   throw new AgentTransportError(
     RELAY_DISPATCH_ERROR_CODES.ack_timeout,
     `等待 Agent ACK 超时（node=${nodeId}, command=${commandId}）`,
   );
+}
+
+/**
+ * Read the node's latest advertised control capabilities (WP11B).
+ *
+ * Deliberately narrow and lazy: this module is imported by the worker, so a
+ * top-level Prisma import would connect during unit tests. A read failure is
+ * reported as "no facts" (which still allows baseline actions) instead of
+ * blocking every dispatch on a database hiccup.
+ */
+async function loadCapabilityFacts(nodeId: number): Promise<AgentCapabilityFacts | null> {
+  try {
+    const { db } = await import("../db.ts");
+    const row = await db.nodeStateReport.findUnique({
+      where: { node_id: nodeId },
+      select: {
+        control_protocol_version: true,
+        capabilities: true,
+        reported_at: true,
+        // Reinstall keeps node_id AND agent_id, so a stale row can describe an
+        // agent binary this node no longer runs (WP11B).
+        node: { select: { credential_rotated_at: true } },
+      },
+    });
+    // A malformed stored value must NOT silently become "never reported": that
+    // would downgrade fail-closed to baseline-allowed. The pure helper throws on
+    // bad shape and the caller turns that into a refusal.
+    return capabilityFactsFromStored(row
+      ? {
+          control_protocol_version: row.control_protocol_version,
+          capabilities: row.capabilities,
+          reported_at: row.reported_at,
+          credential_rotated_at: row.node?.credential_rotated_at ?? null,
+        }
+      : null);
+  } catch (error) {
+    if (error instanceof TypeError) throw error;
+    return null;
+  }
 }
 
 /**
@@ -134,6 +628,38 @@ export async function waitAgentCommandAck(
  * the credential on the Agent -> Panel polling endpoints.
  */
 export class OutboundAgentTransport implements AgentTransport {
+  /**
+   * capabilityFacts is injectable so the negotiation gate can be exercised
+   * without a database. Production default reads the node's last state report.
+   */
+  constructor(
+    private readonly capabilityFacts: (nodeId: number) => Promise<AgentCapabilityFacts | null> = loadCapabilityFacts,
+    private readonly store: CommandBusStore = redisStore,
+  ) {}
+
+  /** Refuse to queue a command the node has not advertised support for. */
+  private async assertCapability(node: OrchestratorNode, action: string): Promise<void> {
+    let facts: AgentCapabilityFacts | null = null;
+    try {
+      facts = await this.capabilityFacts(node.id);
+    } catch {
+      // A stored capability value that cannot be parsed means "this node's
+      // negotiation facts are unusable" — fail closed for everything except the
+      // protocol-frozen baseline, exactly like an explicit disagreement.
+      throw new AgentTransportError(
+        RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+        `节点 ${node.id} 的能力上报形状非法，拒绝下发 ${action}；请升级 Agent`,
+      );
+    }
+    const decision = decideCapability(facts, action);
+    if (!decision.supported) {
+      throw new AgentTransportError(
+        RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+        `${decision.detail}（node=${node.id}, action=${action}, reason=${decision.reason}）`,
+      );
+    }
+  }
+
   private async send(
     node: OrchestratorNode,
     envelope: CommandEnvelope | undefined,
@@ -145,8 +671,10 @@ export class OutboundAgentTransport implements AgentTransport {
         "outbound transport requires command envelope",
       );
     }
-    const { scope } = await enqueueAgentCommand(node.id, envelope, config);
-    const ack = await waitAgentCommandAck(scope, node.id, envelope.command_id);
+    // WP11B: never send an action this node has not told us it implements.
+    await this.assertCapability(node, String(envelope.action ?? ""));
+    const { scope } = await enqueueAgentCommand(node.id, envelope, config, this.store);
+    const ack = await waitAgentCommandAck(scope, node.id, envelope.command_id, undefined, this.store);
     if (!ack.ok) {
       return {
         ok: false,
@@ -154,7 +682,17 @@ export class OutboundAgentTransport implements AgentTransport {
         error: ack.error ?? "agent rejected command",
       };
     }
-    return { ok: true, applied_revision: ack.applied_revision ?? envelope.revision };
+    // An OK ack must carry the revision it applied. Substituting the issued
+    // revision would turn "the agent did not tell us" into "the agent confirmed
+    // this revision", which is exactly the fact the orchestrator then trusts.
+    if (ack.applied_revision === null || ack.applied_revision === undefined) {
+      return {
+        ok: false,
+        error_code: "ack_invalid",
+        error: `agent acknowledged ${envelope.command_id} without applied_revision`,
+      };
+    }
+    return { ok: true, applied_revision: ack.applied_revision };
   }
 
   applyEgress(node: OrchestratorNode, config: AgentTunnelConfig, envelope?: CommandEnvelope): Promise<unknown> {
@@ -173,6 +711,132 @@ export class OutboundAgentTransport implements AgentTransport {
     // Reachability is proven by ACK. Avoid Panel -> Agent probes entirely.
     return true;
   }
+}
+
+/**
+ * Issue a read-only diagnose command to one node and wait for its findings.
+ *
+ * It reuses the same rails as a mutating command on purpose: capability
+ * negotiation decides whether the node implements the action at all, and the
+ * pending/ACK ledger decides whether an answer is really this node's answer.
+ * A diagnostic that bypassed those would be a second, weaker command path.
+ */
+export async function issueAgentDiagnose(
+  input: {
+    /** Only the id is needed: a probe needs no connect_ip and never dials from here. */
+    nodeId: number;
+    resourceId: string;
+    targets: { host: string; port: number }[];
+    timeoutMs?: number;
+  },
+  deps: {
+    capabilityFacts?: (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    store?: CommandBusStore;
+  } = {},
+): Promise<{ ok: true; results: AgentDiagnoseResult[] } | { ok: false; error_code: string; error: string }> {
+  const factsReader = deps.capabilityFacts ?? loadCapabilityFacts;
+  const store = deps.store ?? redisStore;
+
+  const payload = {
+    targets: input.targets.map((t) => ({ host: t.host, port: t.port })),
+    ...(input.timeoutMs ? { timeout_ms: Math.min(input.timeoutMs, DIAGNOSE_MAX_TIMEOUT_MS) } : {}),
+  };
+  // Validate through the same frozen contract as every other action: a diagnose
+  // that bypassed the validator would be a second, weaker command path.
+  const payloadError = validatePayload("diagnose_tunnel", payload);
+  if (payloadError) {
+    return { ok: false, error_code: "invalid_payload", error: payloadError };
+  }
+  const envelope = {
+    command_id: randomUUID(),
+    resource: "tunnel",
+    resource_id: input.resourceId,
+    revision: 0, // read-only: it never advances a runtime revision
+    action: "diagnose_tunnel",
+    payload,
+    expires_at: new Date(Date.now() + (input.timeoutMs ?? 20_000)).toISOString(),
+  } as unknown as CommandEnvelope;
+
+  let facts: AgentCapabilityFacts | null = null;
+  try {
+    facts = await factsReader(input.nodeId);
+  } catch {
+    return { ok: false, error_code: "incompatible_agent", error: `节点 ${input.nodeId} 的能力上报形状非法，拒绝下发诊断` };
+  }
+  const decision = decideCapability(facts, "diagnose_tunnel");
+  if (!decision.supported) {
+    return { ok: false, error_code: decision.reason, error: decision.detail };
+  }
+
+  const { scope } = await enqueueAgentCommand(input.nodeId, envelope, null, store, {
+    targets: input.targets,
+    ...(input.timeoutMs ? { timeout_ms: input.timeoutMs } : {}),
+  });
+  let ack: AgentCommandAck;
+  try {
+    ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, input.timeoutMs ?? 20_000, store);
+  } catch (error) {
+    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+  }
+  if (!ack.ok) {
+    return { ok: false, error_code: ack.error_code ?? "diagnose_failed", error: ack.error ?? "节点拒绝执行诊断" };
+  }
+  return { ok: true, results: ack.results ?? [] };
+}
+
+/**
+ * Ask one node for its own bounded self report.
+ *
+ * Same rails as every other command: capability negotiation decides whether the
+ * node implements the action, and the pending/ACK ledger decides whether the
+ * answer really belongs to this command.
+ */
+export async function issueAgentDiagnostics(
+  input: { nodeId: number; timeoutMs?: number },
+  deps: {
+    capabilityFacts?: (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    store?: CommandBusStore;
+  } = {},
+): Promise<{ ok: true; facts: NodeSelfFacts } | { ok: false; error_code: string; error: string }> {
+  const factsReader = deps.capabilityFacts ?? loadCapabilityFacts;
+  const store = deps.store ?? redisStore;
+
+  let facts: AgentCapabilityFacts | null = null;
+  try {
+    facts = await factsReader(input.nodeId);
+  } catch {
+    return { ok: false, error_code: "incompatible_agent", error: `节点 ${input.nodeId} 的能力上报形状非法` };
+  }
+  const decision = decideCapability(facts, "collect_diagnostics");
+  if (!decision.supported) {
+    return { ok: false, error_code: decision.reason, error: decision.detail };
+  }
+
+  const timeoutMs = input.timeoutMs ?? 10_000;
+  const envelope = {
+    command_id: randomUUID(),
+    resource: "node",
+    resource_id: `node-${input.nodeId}`,
+    revision: 0,
+    action: "collect_diagnostics",
+    payload: {},
+    expires_at: new Date(Date.now() + timeoutMs).toISOString(),
+  } as unknown as CommandEnvelope;
+
+  const { scope } = await enqueueAgentCommand(input.nodeId, envelope, null, store, null);
+  let ack: AgentCommandAck;
+  try {
+    ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, timeoutMs, store);
+  } catch (error) {
+    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+  }
+  if (!ack.ok) {
+    return { ok: false, error_code: ack.error_code ?? "diagnostics_failed", error: ack.error ?? "节点拒绝自检" };
+  }
+  if (!ack.facts) {
+    return { ok: false, error_code: "incomplete_result", error: "节点没有返回自检事实" };
+  }
+  return { ok: true, facts: ack.facts };
 }
 
 function hostPort(host: string, port: number): string {

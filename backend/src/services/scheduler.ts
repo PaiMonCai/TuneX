@@ -58,6 +58,8 @@ import { checkTunnelCreation } from "./capability-policy.ts";
 import { canUseNodeGroup } from "./node-group-access.ts";
 import { Orchestrator, type DispatchFailure, type EgressDispatchOutcome, type RelayDispatchOutcome } from "./orchestrator.ts";
 import type { ControlValidator } from "./control-protocol/index.ts";
+import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
+import type { RuntimeUseDenied } from "./forward-capability.ts";
 
 /* ================================================================== */
 /* 常量与状态机                                                        */
@@ -113,6 +115,8 @@ export const SCHEDULER_ERROR_CODES = {
   traffic_exhausted: "traffic_exhausted",
   /** 入口或出口节点组未授权（自有判定 + NodeGroupGrant 都不过）。 */
   node_group_not_allowed: "node_group_not_allowed",
+  /** Existing runtime target scope was revoked; distinct from database errors. */
+  scope_revoked: "scope_revoked",
   /** RELAY 必须指定出口；DIRECT 不得指定（入参自相矛盾）。 */
   mode_topology_mismatch: "mode_topology_mismatch",
   /** 目标 host:port 格式非法。 */
@@ -342,6 +346,8 @@ export interface SchedulerDeps {
   ) => Promise<Awaited<ReturnType<typeof getEffectivePolicy>>>;
   /** 节点组授权判定（默认 {@link canUseNodeGroup}）。 */
   authorizeGroup?: typeof canUseNodeGroup;
+  /** Existing apply/retry/resume only; does not consume a creation count slot. */
+  runtimeUse?: RuntimeUseChecker;
   /** 编排时钟（测试注入固定时间，避免 TTL 边界漂移）。 */
   now?: () => Date;
 }
@@ -360,6 +366,10 @@ function resolveDeps(over?: SchedulerDeps) {
     db: over?.db ?? defaultDeps.db,
     loadPolicy: over?.loadPolicy ?? defaultDeps.loadPolicy,
     authorizeGroup: over?.authorizeGroup ?? defaultDeps.authorizeGroup,
+    runtimeUse: over?.runtimeUse ?? (async (workspaceId: number, resource: Parameters<RuntimeUseChecker>[1]) => {
+      const { checkForwardRuntimeUse } = await import("./forward-capability.ts");
+      return checkForwardRuntimeUse(workspaceId, resource);
+    }),
     now: over?.now ?? defaultDeps.now,
     validator: over?.validator,
     portPoolDeps: over?.portPoolDeps,
@@ -1208,6 +1218,48 @@ export async function createRelayTunnel(
  *        是进程级的，重建实例会让两端看到不同的账本）。
  * @param over 见 {@link SchedulerDeps}。
  */
+async function checkExistingRuntime(
+  row: Record<string, unknown>,
+  deps: ReturnType<typeof resolveDeps>,
+  selected?: { ingress: SchedulableNode; egress?: SchedulableNode },
+): Promise<RuntimeUseDenied | null> {
+  // Concrete placements outrank the historical candidate-group columns. If a
+  // Node has moved groups, retry must re-check its *new* scope before any write.
+  const [ingress, egress] = selected
+    ? [selected.ingress, selected.egress ?? null]
+    : await Promise.all([
+        row.ingress_node_id == null ? null : deps.db.node.findUnique({ where: { id: Number(row.ingress_node_id) } }),
+        row.tunnel_mode !== "relay" || row.egress_node_id == null
+          ? null : deps.db.node.findUnique({ where: { id: Number(row.egress_node_id) } }),
+      ]);
+  const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
+  const inGroup = ingress?.node_group_id ?? (row.ingress_node_id == null ? row.in_node_group_id : null);
+  const outGroup = row.tunnel_mode === "relay"
+    ? egress?.node_group_id ?? (row.egress_node_id == null ? row.out_node_group_id : null)
+    : null;
+  if (!validId(row.workspace_id) || !validId(row.user_id) || !validId(inGroup) ||
+      (row.tunnel_mode === "relay" && !validId(outGroup))) {
+    return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或实际节点组已失效" };
+  }
+  return deps.runtimeUse(row.workspace_id, {
+    user_id: row.user_id, in_node_group_id: inGroup,
+    out_node_group_id: outGroup as number | null,
+    tunnel_type: typeof row.tunnel_type === "string" ? row.tunnel_type : "tcp",
+  });
+}
+
+async function recordRuntimeBlock(store: SchedulerDb, tunnelId: number, denied: RuntimeUseDenied) {
+  const code = denied.code === "forbidden" ? SCHEDULER_ERROR_CODES.scope_revoked
+    : denied.reason === "traffic_exhausted" ? SCHEDULER_ERROR_CODES.traffic_exhausted
+      : SCHEDULER_ERROR_CODES.policy_denied;
+  const detail = `[${denied.reason}:${denied.error_layer}] ${denied.message}`;
+  // No desired/applied/revision mutation or release: blocking is not suspend.
+  await store.tunnel.update({ where: { id: tunnelId }, data: {
+    apply_status: APPLY_STATUS.error, apply_error_code: code, apply_error: detail.slice(0, 2000),
+  } });
+  return { code, detail };
+}
+
 export async function reapplyRelayTunnel(
   tunnelId: number,
   orchestrator: Orchestrator,
@@ -1264,10 +1316,14 @@ export async function reapplyRelayTunnel(
     );
   }
 
-  await store.tunnel.update({
-    where: { id: tunnelId },
-    data: { apply_status: APPLY_STATUS.applying, desired_status: DESIRED_STATUS.inactive },
-  });
+  const blockRuntimeUse = async (denied: RuntimeUseDenied): Promise<CreateRelayFailure> => {
+    const { code, detail } = await recordRuntimeBlock(store, tunnelId, denied);
+    steps.push({ step: "auth_quota", ok: false, error_code: code, detail });
+    return { ok: false, tunnelId, steps, failedStep: "auth_quota", error_code: code, error: detail, retryable: false };
+  };
+  const denied = await checkExistingRuntime(row, deps);
+  if (denied) return blockRuntimeUse(denied);
+  steps.push({ step: "auth_quota", ok: true });
   steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true } });
 
   /* ---------------- ③ bind nodes ---------------- */
@@ -1345,9 +1401,14 @@ export async function reapplyRelayTunnel(
   } else {
     steps.push({ step: "bind_nodes", ok: true });
   }
+  const targetDenied = await checkExistingRuntime(row, deps, { ingress: ingressPick.node, egress: egressPick.node });
+  if (targetDenied) return blockRuntimeUse(targetDenied);
   await store.tunnel.update({
     where: { id: tunnelId },
-    data: { ingress_node_id: ingressPick.node.id, egress_node_id: egressPick.node.id, egress_pool_id: poolId },
+    data: {
+      ingress_node_id: ingressPick.node.id, egress_node_id: egressPick.node.id, egress_pool_id: poolId,
+      apply_status: APPLY_STATUS.applying, desired_status: DESIRED_STATUS.inactive,
+    },
   });
 
   /* ---------------- ④ ports（已有值复用，空才分配）---------------- */
@@ -1563,6 +1624,13 @@ export async function reapplyDirectTunnel(
     };
   }
 
+  const blockRuntimeUse = async (denied: RuntimeUseDenied): Promise<ApplyDirectResult> => {
+    const { code, detail } = await recordRuntimeBlock(store, tunnelId, denied);
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+  };
+  const denied = await checkExistingRuntime(row, deps);
+  if (denied) return blockRuntimeUse(denied);
+
   const inNodeGroupId = Number(row.in_node_group_id);
   const candidates = await store.node.findMany({
     where: { node_group_id: inNodeGroupId },
@@ -1614,6 +1682,9 @@ export async function reapplyDirectTunnel(
     }).catch(() => {});
     return { ok: false, tunnelId, error_code: code, error: "DIRECT 目标无效", retryable: false };
   }
+
+  const targetDenied = await checkExistingRuntime(row, deps, { ingress: pick.node });
+  if (targetDenied) return blockRuntimeUse(targetDenied);
 
   const reserved = collectReservedPorts(
     (await store.tunnel.findMany({

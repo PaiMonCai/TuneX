@@ -294,6 +294,11 @@ CREDENTIAL="$(curl -fsS -X POST \
 [ -n "$CREDENTIAL" ] || { echo "tunex install: enrollment returned an empty credential" >&2; exit 5; }
 
 install -d -m 0700 /etc/tunex-agent
+# WP11A: the Agent keeps its last-known-good desired state here so a restart
+# during a panel outage comes back with its listeners. The directory lives on the
+# host (not in the container layer) because the container is recreated on every
+# reinstall — a cache inside it would be lost exactly when it is needed.
+install -d -m 0700 /var/lib/tunex-agent
 {
   printf '%s\n' "TUNEX_PANEL_HTTP_URL=$PANEL"
   printf '%s\n' "TUNEX_AGENT_ID=$AGENT_ID"
@@ -301,6 +306,7 @@ install -d -m 0700 /etc/tunex-agent
   printf '%s\n' "TUNEX_NODE_CREDENTIAL=$CREDENTIAL"
   printf '%s\n' "TUNEX_ROLE=$ROLE"
   printf '%s\n' "TUNEX_AGENT_ADMIN_PORT=0"
+  printf '%s\n' "TUNEX_STATE_DIR=/var/lib/tunex-agent"
   [ -z "$INGRESS_RANGE" ] || printf '%s\n' "TUNEX_INGRESS_RANGE=$INGRESS_RANGE"
   [ -z "$EGRESS_RANGE" ] || printf '%s\n' "TUNEX_EGRESS_RANGE=$EGRESS_RANGE"
 } > /etc/tunex-agent/agent.env
@@ -315,9 +321,11 @@ docker run -d \
   --security-opt no-new-privileges:true \
   --cap-drop ALL \
   --cap-add NET_BIND_SERVICE \
+  --stop-timeout 15 \
   --log-opt max-size=20m \
   --log-opt max-file=3 \
   -v /etc/tunex-agent/agent.env:/run/tunex-agent/agent.env:ro \
+  -v /var/lib/tunex-agent:/var/lib/tunex-agent \
   "$AGENT_IMAGE" >/dev/null
 
 echo "TuneX Agent deployed with Docker."

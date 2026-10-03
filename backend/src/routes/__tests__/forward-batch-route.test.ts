@@ -69,6 +69,7 @@ mock.module(`${ROOT}services/forward-service.ts`, () => ({
 }));
 
 mock.module(`${ROOT}services/workspace.ts`, () => ({
+  canWorkspaceResourceAction: (access: { role: string }) => access.role === "owner",
   resolveWorkspaceAccess: async () => ({
     id: 77,
     personalWorkspaceId: 77,

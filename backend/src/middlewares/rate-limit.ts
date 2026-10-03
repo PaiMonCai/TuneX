@@ -214,6 +214,20 @@ export const GLOBAL_RATE_LIMIT_RULES: RateLimitRule[] = [
     scope: "user",
   },
   {
+    /**
+     * V4-WP11C：诊断会在节点上产生真实探测（DNS 解析 + TCP 连接），因此单独限流，
+     * 而不是跟在 api-global 的 600/min 后面。上限比批量动作宽松——诊断是排障动作，
+     * 用户会连着点几次；但它必须是有限次，不能变成探测放大器。
+     * 同样必须在 `api-global` 之前。
+     */
+    name: "forward-diagnose",
+    windowSeconds: 60,
+    max: 10,
+    methods: ["POST"],
+    match: (p, m) => isPost(m) && /^\/api\/forwards\/\d+\/diagnose$/.test(p),
+    scope: "user",
+  },
+  {
     name: "api-global",
     windowSeconds: 60,
     max: 600,
