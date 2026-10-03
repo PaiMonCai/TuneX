@@ -8,11 +8,17 @@
 
 ```text
 发布名            TuneX V4.5（V4 稳定化：WP10 权限模型 + WP11 耐久性/运维/诊断）
-发布提交          14305c8  （分支 feat/v4-wp10-wp11-closure）
+发布窗口基线      14305c8  （分支 feat/v4-wp10-wp11-closure）
+最终收口提交      dd95713  （CI/Gate 可移植性修复后重新全链验证）
 上一提交          0f1acb7  （chore/project-pause-cleanup 的合并点）
-镜像（本地已构建）
+演练镜像（14305c8，本地构建）
   Panel/Worker    ghcr.io/paimoncai/tunex:14305c8          image id c0d99e9379ad
   Agent           ghcr.io/paimoncai/tunex-agent:14305c8    image id cd4d3da7c2eb
+最终自动发布镜像（dd95713，Release #30 已推送）
+  Panel/Worker    ghcr.io/paimoncai/tunex:dd957131204ee6a7c34c5b3aa101cc64cd28b23f
+                  digest sha256:384c90ce03d8a44e06f0204074737059e2f7f25be732b4fcd4c7767365e3bcb0
+  Agent           ghcr.io/paimoncai/tunex-agent:dd957131204ee6a7c34c5b3aa101cc64cd28b23f
+                  digest sha256:89d8ff23131a7448dcd1dd869d487dedeabb9a1b25118e67d8b7f08d2a28b3ea
 
   （演练与最终 tag 是同一批字节：在 14305c8 上重建后 image id 与演练时完全一致。）
 Schema            prisma migrate status → 22 migrations found / Database schema is up to date!
@@ -26,9 +32,10 @@ docker build -t ghcr.io/paimoncai/tunex:$SHA ./backend
 docker build -t ghcr.io/paimoncai/tunex-agent:$SHA -f agent/Dockerfile .
 ```
 
-> **未完成的一步（需要你的凭证）**：把这两个 tag `docker push` 到 GHCR。本环境没有
-> registry 凭证，因此镜像只是本地构建并按发布名打标；节点要能匿名拉取 Agent 镜像，
-> 还需要按 `docs/production-deploy.md` 把 `tunex-agent` package 设为 public。
+> **自动发布已完成**：最终 `dd95713` 在 CI #493 / Integration #139 全绿后触发 Release #30，
+> 使用仓库 `GITHUB_TOKEN` 成功把 Panel/Worker 与 multi-arch Agent 的 `latest` + 完整 SHA 标签
+> 推到 GHCR。若部署要求节点**匿名**拉取 Agent，package visibility 仍需按
+> `docs/production-deploy.md` 单独配置；这不是 CI 能证明的属性。
 
 ## 演练结果（真实四节点拓扑）
 
@@ -114,9 +121,17 @@ backend 1329/0 + tsc · agent go vet + go test -race 全部包 · web 350/0 + ts
 
 发布身份下的 F5 结果见 `scripts/v3-e2e/evidence/v4-gate-f5-result.txt`。
 
-**结论：V4.5 的代码、Gate、文档与发布演练均已就绪，已标记 V4.5 Stable。** 唯一未做的
-是 `docker push` 这两个 tag（需要你的 registry 凭证），以及按 `docs/production-deploy.md`
-确认 Agent 镜像可被节点匿名拉取。
+最终自动化复验（`dd95713`）：
+```text
+CI #493           success
+Integration #139  success
+Release #30       success
+F5.13             backup / manifest / canary / restore / row counts / migrations / panel / agents 全部 PASS
+```
+
+**结论：V4.5 的代码、Gate、文档、发布演练与镜像推送均已完成，V4 技术范围正式关闭。**
+若未来要做对外开源/再分发，仓库自身 `LICENSE` / `NOTICE` / third-party attribution
+仍需单独定稿；若节点需要匿名拉取 Agent，则还需确认 GHCR package visibility。
 
 ## 回滚指引（发布后如需回退）
 

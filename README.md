@@ -21,9 +21,10 @@
 > （诊断面板 / 支持包下载 / 升级命令生成）。逐条状态与已知边界见
 > [V4 发布说明](<docs/release-notes-v4.md>) 与 [DEVELOPMENT](<DEVELOPMENT.md>)。
 >
-> **V4.5 Stable 已放行**：发布窗口已完成（发布提交 `14305c8`、《[V4.5 发布记录](<docs/release-record-v4.5.md>)》），
-> 演练覆盖面板升级、回滚双向、以及发布镜像在安装布局下的 Agent 升级（换镜像不换身份）。
-> 唯一待办是 `docker push` 这两个 tag（需要 registry 凭证）。
+> **V4.5 Stable 已完成技术发布闭环**：发布窗口以 `14305c8` 完成升级/回滚/Agent 升级演练；
+> 最终收口提交 `dd95713` 又通过 **CI #493 → Integration #139 → Release #30**。Release 已把
+> Panel/Worker 与 Agent 的 `latest` 和 `dd957131204ee6a7c34c5b3aa101cc64cd28b23f` 标签推送到 GHCR。
+> 详细证据见《[V4.5 发布记录](<docs/release-record-v4.5.md>)》。V4 功能范围至此冻结，后续新能力进入 V5。
 
 ## 当前状态
 
@@ -49,8 +50,8 @@ F1 Forward Edit / Hot Reload        ✅ 已关闭
 F2 Managed Node Lifecycle           ✅ 已关闭
 F3 Monitoring / Scale / UX          ✅ 已关闭
 F4 Authorization / NodeGroup        ✅ 已关闭（真实拓扑 PASS=58 / FAIL=0）
-F5 Durability / Ops / Capability    ✅ 已关闭（真实拓扑 PASS=68 / FAIL=0）
-   └ 未含 WP11B 升级闭环与 WP11C 诊断/Bundle（见下）
+F5 Durability / Ops / Capability    ✅ 已关闭（真实拓扑 PASS=133 / FAIL=0）
+   └ 含升级闭环、Forward/Node 诊断、Support Bundle、能力协商与 F5.13 真实备份/恢复
 ```
 
 Gate 命令（需要 Docker 与真实多 Agent 拓扑）：
@@ -123,7 +124,7 @@ go build ./...
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署。
 - [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构约束与迁移背景。
 
-**当前进度：V4-WP10（Gate F4）与 V4-WP11（Gate F5）均已实现并关闭** —— Gate F4 = 58/0、
-Gate F5 = 133/0（真实四节点拓扑，含升级闭环、Forward/Node 诊断、Support Bundle、
-优雅关机、能力协商、运维脚本与真实备份/恢复演练）。逐项状态与已知边界见
-[V4 发布说明](<docs/release-notes-v4.md>)。
+**当前进度：V4 已正式完成技术收口。** Gate F4 = 58/0、Gate F5 = 133/0；最终
+`dd95713` 已在 GitHub Actions 上重新取得 CI / Integration / Release 全绿证据，并完成
+GHCR 镜像推送。V4 的兼容边界与已验证能力见 [V4 发布说明](<docs/release-notes-v4.md>)；
+下一阶段从 DEVELOPMENT.md §14 的 V5 Contract Freeze 开始。

@@ -1,20 +1,20 @@
-# TuneX V4 唯一开发方案
+# TuneX 开发方案（V4 已收口 / V5 下一阶段）
 
 > **文档地位：本文件是 TuneX 唯一可执行的开发方案（Single Source of Truth）。**
 >
 > 后续功能设计、Issue、分支、PR、验收与发布均以本文件为准。不得再创建第二份路线图、迁移方案或并行开发计划。
 >
-> `docs/tunex-devmap-v3.md` 是 **已完成的 v3 架构基线约束**：规定底层 Node / Tunnel / runtime 的关键语义，但不是 V4 执行清单。V4 以本文件为唯一开发计划；若旧文档中的目录、传输方式或产品入口与当前代码事实冲突，以本文件和 `main` 为准，同时不得破坏已经稳定的 v3 runtime 不变式。
+> `docs/tunex-devmap-v3.md` 是 **已完成的 v3 架构基线约束**：规定底层 Node / Tunnel / runtime 的关键语义。V4 已于 2026-10-03 完成技术收口；本文件继续作为唯一开发方案，保留 V4 的冻结基线，并由 §14 承接 V5。若旧文档中的目录、传输方式或产品入口与当前代码事实冲突，以本文件和 `main` 为准，同时不得破坏已经稳定的 v3/V4 runtime 不变式。
 >
 > `docs/production-deploy.md` 是运维手册；`reports/` 是历史验证证据。它们都不是开发路线。
 
 ---
 
-## 1. 后续唯一方向：V4 产品完成度
+## 1. V4 已完成：产品基线
 
-TuneX 的核心 v3 网络架构升级、WP14 Real E2E Gate、WP15 DIRECT v3 Migration，以及 V4.0 的 Node + Forward 产品入口收敛均已进入 `main`。
+TuneX 的核心 v3 网络架构升级、WP14 Real E2E Gate、WP15 DIRECT v3 Migration，以及 V4.0 的 Node + Forward 产品入口收敛均已进入 `main`。2026-10-03，最终收口提交 `dd95713` 通过 CI #493 → Integration #139 → Release #30，V4 技术范围正式冻结。
 
-V4 从现在开始正式定义为：
+V4 的完成定义为：
 
 **细节优化 + 功能补全 + 生命周期闭环。**
 
@@ -1612,8 +1612,11 @@ V4-WP9  Scale & Interaction Polish            ✅ main
 Gate F2 Managed Node Lifecycle + Telemetry     ✅ 完成
 Gate F3 Monitoring / Scale / UX Complete      ✅ 完成
 
-V4-WP10 Authorization + NodeGroup Model       🟡 代码完成，Gate F4 待真实运行
-V4-WP11 Stable / Ops Hardening                🟡 WP11A/WP11D 代码完成；WP11B/C 未完成
+V4-WP10 Authorization + NodeGroup Model       ✅ main
+Gate F4 Authorization / NodeGroup             ✅ 完成（PASS=58 / FAIL=0）
+V4-WP11 Stable / Ops Hardening                ✅ main
+Gate F5 Durability / Ops / Capability         ✅ 完成（PASS=133 / FAIL=0）
+V4.5 Stable 技术发布闭环                      ✅ CI #493 / Integration #139 / Release #30
 ```
 
 ### 2026-10-01 恢复开发：WP10 / WP11 进度快照
@@ -1886,22 +1889,26 @@ WP11C Diagnose / Support    ✅ Forward 诊断（分段，业务端口不探测�
                               Gate F5.10 / F5.12 覆盖
 ```
 
-**关于 "V4.5 Stable"——发布窗口已执行完毕（2026-10-03）**：
+**关于 "V4.5 Stable"——发布窗口与自动发布链均已闭环（2026-10-03）**：
 
 ```text
-发布提交    14305c8
-镜像        ghcr.io/paimoncai/tunex:14305c8        （image id c0d99e9379ad）
-            ghcr.io/paimoncai/tunex-agent:14305c8  （image id cd4d3da7c2eb）
-演练        面板升级（readyz 200 + 22 migrations/schema up to date）
-            回滚双向（:14305c8 ↔ 上一镜像，健康闸门与迁移兼容性检查均通过）
-            Agent 升级（发布镜像 + 安装布局：换镜像不换 agent_id、能力清单齐全）
-查出的缺陷  整数型 env 变量被静默忽略（真实缺陷）、rollback.sh 三处部署属性写死、
-            e2e 与生产的镜像变量不一致 —— 均已修复并补测
-记录        docs/release-record-v4.5.md
-未做        docker push 这两个 tag（需要 registry 凭证）
+发布窗口基线  14305c8
+最终收口提交  dd95713
+演练          面板升级（readyz 200 + 22 migrations/schema up to date）
+              回滚双向（:14305c8 ↔ 上一镜像，健康闸门与迁移兼容性检查均通过）
+              Agent 升级（发布镜像 + 安装布局：换镜像不换 agent_id、能力清单齐全）
+最终 Gate     F4 58/0 · F5 133/0；F5.13 backup → mutate → restore → verify 全通过
+自动发布      CI #493 success → Integration #139 success → Release #30 success
+GHCR Panel    ghcr.io/paimoncai/tunex:latest
+              ghcr.io/paimoncai/tunex:dd957131204ee6a7c34c5b3aa101cc64cd28b23f
+              digest sha256:384c90ce03d8a44e06f0204074737059e2f7f25be732b4fcd4c7767365e3bcb0
+GHCR Agent    ghcr.io/paimoncai/tunex-agent:latest
+              ghcr.io/paimoncai/tunex-agent:dd957131204ee6a7c34c5b3aa101cc64cd28b23f
+              digest sha256:89d8ff23131a7448dcd1dd869d487dedeabb9a1b25118e67d8b7f08d2a28b3ea
+记录          docs/release-record-v4.5.md
 ```
 
-因此 README 现在标记 **V4.5 Stable 已放行**。
+因此 **V4 技术范围正式关闭**；后续功能开发从 §14 V5 Roadmap 开始。
 
 ### 2026-09-28 暂停前状态（历史）
 
@@ -2690,15 +2697,16 @@ V4.5 的 durability / diagnostics 方向参考当前 fork 的三个项目，但
 4. **许可证 fail-closed。** RelayPanel 当前为 Apache-2.0；FLVX 当前修改部分为
    GPLv3；ForwardX 当前为 AGPL-3.0-only。GPL/AGPL 项目默认只参考设计和测试思路，
    未经明确 license review 不直接复制实现代码。
-5. TuneX 在 V4.5 stable 前必须明确仓库自身 LICENSE / NOTICE / third-party
-   attribution 策略；许可状态未明确时不得以“公开仓库可见”为理由复制代码。
+5. **授权治理仍 fail-closed。** V4 技术发布链已经闭环，但仓库根目录当前仍未放置
+   `LICENSE` / `NOTICE`。在仓库自身许可与 third-party attribution 策略明确前，
+   V4 的 “Stable” 只表示技术基线稳定，不表示授予对外开源/再分发许可；V5 开发也不得绕过这条约束。
 
 
 ---
 
 ## 14. V5 Roadmap — Advanced Networking / Resilience / Federation
 
-V5 的启动条件是 **Gate V4-F5 通过并标记 V4.5 stable**。V5 不反向扩大 V4 范围；V4 未完成的 durability / diagnostics / authorization 项不得通过改名“V5”逃逸。
+V5 的技术启动条件 **Gate V4-F5 通过并标记 V4.5 stable** 已于 2026-10-03 满足。V5 不反向扩大 V4 范围；V4 的 frozen baseline（durability / diagnostics / authorization / release gates）必须继续保持。仓库许可与 third-party attribution 仍按 §13.11 独立 fail-closed。
 
 ### 14.1 V5 范围
 

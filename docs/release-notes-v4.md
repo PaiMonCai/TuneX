@@ -1,7 +1,8 @@
 # TuneX V4.5 发布说明（WP10 / WP11 收口）
 
-> **状态：V4.5 Stable 已放行**（发布提交 `14305c8`）。发布窗口的实际动作与证据见
-> [V4.5 发布记录](release-record-v4.5.md)。
+> **状态：V4.5 Stable 已完成技术发布闭环。** 发布窗口基线为 `14305c8`；最终收口提交
+> `dd95713` 已通过 CI #493 → Integration #139 → Release #30，并完成 GHCR 镜像推送。
+> 发布窗口的实际动作与最终证据见 [V4.5 发布记录](release-record-v4.5.md)。
 
 适用范围：V4 稳定化（Node-first + Forward 产品对象、权限模型、Agent 耐久性/运维/诊断）。
 本文只记录**已由真实 Gate 验证**的能力与**明确的已知边界**；未验证的事不写在这里。
@@ -23,6 +24,24 @@ V4-F5 durability/ops      PASS=133 / FAIL=0
 证据文件：`scripts/v3-e2e/evidence/`（Gate 运行时写出，含逐条断言与失败详情）。
 F5 含一次**真实的备份→改数据→恢复→校验**演练（F5.13），不是只检查脚本内容。
 单元/类型检查：backend（bun test + tsc）、agent（go vet + go test -race）、web（bun test + tsc + build）。
+
+### 最终 GitHub Actions 发布闭环（2026-10-03）
+
+```text
+CI #493           success
+Integration #139  success
+Release #30       success
+
+F5.13              backup → canary mutate → restore → verify 全部 PASS
+Panel image        ghcr.io/paimoncai/tunex:dd957131204ee6a7c34c5b3aa101cc64cd28b23f
+Panel digest       sha256:384c90ce03d8a44e06f0204074737059e2f7f25be732b4fcd4c7767365e3bcb0
+Agent image        ghcr.io/paimoncai/tunex-agent:dd957131204ee6a7c34c5b3aa101cc64cd28b23f
+Agent digest       sha256:89d8ff23131a7448dcd1dd869d487dedeabb9a1b25118e67d8b7f08d2a28b3ea
+```
+
+Release 同时更新两个镜像的 `latest` 标签。V4 功能范围自此冻结；新的协议、HA、multi-hop
+与 federation 等能力进入 V5。仓库自身 LICENSE / NOTICE / third-party attribution 尚未
+定稿，因此这里的 “Stable” 是技术发布状态，不代表对外开源或再分发授权。
 
 ## 新增用户可见能力
 
