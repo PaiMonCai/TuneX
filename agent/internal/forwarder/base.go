@@ -102,6 +102,23 @@ type pipeTracker struct {
 	// wait for them; a shutdown that runs out of deadline must be able to close
 	// them, which is impossible from a counter alone.
 	live map[net.Conn]struct{}
+	// listen binds the tunnel's listener. nil means a plain TCP listener.
+	//
+	// V5-WP5-A1: this is the ONLY seam a TLS-fronted tunnel needs. Everything
+	// that makes a stream tunnel a stream tunnel — accept loop, per-connection
+	// pipe, drain, stats, the port guard, hot reload — is reused untouched, so
+	// "TLS is a stream runtime" is true by construction rather than by claim.
+	// It is deliberately not an abstraction layer: it is one function value.
+	listen func(addr string) (net.Listener, error)
+}
+
+// bindListener is the tunnel's listener factory: plain TCP unless the forwarder
+// was built with a TLS front.
+func (t *pipeTracker) bindListener(addr string) (net.Listener, error) {
+	if t.listen != nil {
+		return t.listen(addr)
+	}
+	return net.Listen("tcp", addr)
 }
 
 // errNotRunning is returned by internal helpers that require a bound listener.
@@ -127,7 +144,7 @@ func (t *pipeTracker) start(p pick) error {
 		t.mu.Unlock()
 		return ErrAlreadyStarted
 	}
-	ln, err := net.Listen("tcp", t.cfg.ListenAddr())
+	ln, err := t.bindListener(t.cfg.ListenAddr())
 	if err != nil {
 		t.mu.Unlock()
 		return err

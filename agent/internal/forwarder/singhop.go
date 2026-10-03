@@ -21,6 +21,7 @@
 package forwarder
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"strings"
@@ -44,6 +45,34 @@ func NewSingleHop(cfg TunnelConfig) (*SingleHopForwarder, error) {
 		return nil, err
 	}
 	return &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}, nil
+}
+
+// NewSingleHopTLS is NewSingleHop with a TLS-terminated listener (V5-WP5-A1).
+//
+// Only the listener differs: the accept loop, the per-connection pipe, drain,
+// stats, the port guard and hot reload are the same code path, because TLS is a
+// stream lifecycle like any other (§6.1 forced principles). The certificate is
+// loaded by the caller — before this constructor runs — so a bad certificate
+// config can never reach the point where a listener is bound.
+func NewSingleHopTLS(cfg TunnelConfig, tlsConfig *tls.Config) (*SingleHopForwarder, error) {
+	if tlsConfig == nil {
+		return nil, errors.New("forwarder: tls forwarder requires a tls config")
+	}
+	if cfg.Mode != ModeDirect && cfg.Mode != ModeRelay {
+		return nil, errModeNot(ModeDirect, cfg.Mode)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	f := &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}
+	f.listen = func(addr string) (net.Listener, error) {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return tls.NewListener(ln, tlsConfig), nil
+	}
+	return f, nil
 }
 
 // Start binds the listen port and begins forwarding. Returns ErrAlreadyStarted

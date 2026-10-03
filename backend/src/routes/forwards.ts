@@ -117,6 +117,11 @@ const ForwardCreateSchema = z
     name: z.string().trim().min(1).max(60),
     mode: z.enum(["direct", "relay"]),
     protocol: z.enum(FORWARD_PROTOCOLS).optional(),
+    // V5-WP5-A1: paths only. Shape is enforced here; existence is the Agent's
+    // check (the panel cannot see the node's filesystem), and a missing file is
+    // a build-time refusal on the node.
+    tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
+    tls_key_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     ingress_node_id: z.number().int().positive(),
     egress_node_id: z.number().int().positive().nullable().optional(),
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),

@@ -66,6 +66,11 @@ type ForwardProtocol string
 
 const (
 	ProtocolTCP ForwardProtocol = "tcp"
+	// ProtocolTLS is the same stream lifecycle with a TLS-terminated
+	// client-facing listener (V5-WP5-A1). See the semantics contract in
+	// DEVELOPMENT.md §6.1: TLS stops at the INGRESS listener; the inter-node hop
+	// stays plain TCP.
+	ProtocolTLS ForwardProtocol = "tls"
 )
 
 // ForwardTransport is the data-plane lifecycle contract that carries a protocol.
@@ -93,6 +98,7 @@ type protocolRuntime struct {
 
 var protocolRuntimes = []protocolRuntime{
 	{Protocol: ProtocolTCP, Transport: TransportStream},
+	{Protocol: ProtocolTLS, Transport: TransportStream},
 }
 
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
@@ -228,6 +234,12 @@ type TunnelConfig struct {
 	SpeedLimit int64           `json:"speed_limit"`
 	Revision   int64           `json:"revision"`
 	ListenHost string          `json:"listen_host,omitempty"`
+	// TLSCertPath / TLSKeyPath are the node-local file paths of the certificate
+	// and its private key, used when Protocol is tls on a client-facing listener
+	// (DIRECT / RELAY). The control plane carries PATHS, never key material
+	// (§6.1 "Where are certificates owned?").
+	TLSCertPath string `json:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `json:"tls_key_path,omitempty"`
 }
 
 // Clone returns a copy that shares no mutable state with c.
@@ -257,6 +269,18 @@ func (c *TunnelConfig) Validate() error {
 		return err
 	}
 	c.Protocol = protocol
+
+	// A TLS front is a client-facing listener. EGRESS listens for the ingress
+	// node, not for a client, and the hop is plain TCP by contract — so asking
+	// for TLS there is a configuration error, not something to quietly ignore.
+	if protocol == ProtocolTLS && mode == ModeEgress {
+		return errors.New("forwarder: tls terminates at the client-facing listener; an EGRESS tunnel cannot be tls")
+	}
+	if protocol == ProtocolTLS {
+		if strings.TrimSpace(c.TLSCertPath) == "" || strings.TrimSpace(c.TLSKeyPath) == "" {
+			return fmt.Errorf("forwarder: tls tunnel %s needs tls_cert_path and tls_key_path", c.ID)
+		}
+	}
 
 	if strategy := strings.TrimSpace(string(c.LBStrategy)); strategy != "" {
 		parsed, err := ParseLBStrategy(strategy)

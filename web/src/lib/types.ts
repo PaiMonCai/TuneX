@@ -996,7 +996,12 @@ export interface PortForward {
   creator_user_id?: number | null;
   id: ID;
   name: string;
-  protocol: "tcp";
+  /**
+   * V5-WP5-A1: the product protocol the runtime has opened. Mirrors the backend's
+   * FORWARD_PROTOCOLS — a forward created before the protocol field existed has
+   * no value, and the UI must not invent one (the panel resolves it from the row).
+   */
+  protocol: "tcp" | "tls";
   mode: "direct" | "relay";
   ingress_node_id: ID;
   ingress_node: Pick<Node, "id" | "node_id" | "agent_id" | "connect_ip" | "role"> | null;

@@ -61,7 +61,7 @@ describe("desired snapshot: the protocol fact is never invented", () => {
   });
 
   test("every unopened protocol is refused, not just wss", () => {
-    for (const legacy of ["wss", "tls", "udp", "quic", "mtcp", "carrier-pigeon"]) {
+    for (const legacy of ["wss", "udp", "quic", "mtcp", "carrier-pigeon"]) {
       expect(desiredTunnelConfigFor(directRow({ tunnel_type: legacy }), NODE)).toEqual({
         kind: "skip",
         reason: "protocol_not_supported",
@@ -73,6 +73,39 @@ describe("desired snapshot: the protocol fact is never invented", () => {
    * 行里**完全没有**协议事实 = 投影/迁移漏了列，不是 V4 的「省略协议 ⇒ tcp」。
    * 把它当 tcp 会把一个数据缺口变成一条真实运行的 TCP 转发。
    */
+  /** V5-WP5-A1：tls 行会被放行，**并且**带着它的证书路径一起进快照。 */
+  test("a tls row restores as tls, carrying its certificate paths", () => {
+    const outcome = desiredTunnelConfigFor(
+      directRow({
+        forward_protocol: "tls",
+        tunnel_type: "tls",
+        tls_cert_path: "/etc/tunex/tls/site.crt",
+        tls_key_path: "/etc/tunex/tls/site.key",
+      }),
+      NODE,
+    );
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.protocol).toBe("tls");
+    expect(outcome.config.tls_cert_path).toBe("/etc/tunex/tls/site.crt");
+    expect(outcome.config.tls_key_path).toBe("/etc/tunex/tls/site.key");
+  });
+
+  /** 没有证书的 tls 行是坏配置：不进快照，也绝不降级成普通 TCP。 */
+  test("a tls row without certificate paths is skipped, never downgraded to tcp", () => {
+    for (const paths of [
+      {},
+      { tls_cert_path: "/etc/tunex/tls/site.crt" },
+      { tls_key_path: "/etc/tunex/tls/site.key" },
+      { tls_cert_path: "  ", tls_key_path: "/etc/tunex/tls/site.key" },
+    ]) {
+      expect(desiredTunnelConfigFor(directRow({ forward_protocol: "tls", tunnel_type: "tls", ...paths }), NODE)).toEqual({
+        kind: "skip",
+        reason: "tls_paths_missing",
+      });
+    }
+  });
+
   test("a row with no protocol fact at all is refused (fail closed)", () => {
     expect(desiredTunnelConfigFor(directRow({ tunnel_type: null, forward_protocol: null }), NODE)).toEqual({
       kind: "skip",

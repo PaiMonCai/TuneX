@@ -601,6 +601,22 @@ model Tunnel {
   /// compatibility projection; new Forward admission/runtime decisions must use
   /// this field. NULL is reserved for non-Forward/old pre-backfill rows.
   forward_protocol String? @db.VarChar(16)
+
+  // ── V5-WP5-A1 TLS 前端（DEVELOPMENT.md §6.1 语义契约）──
+  //
+  // 证书归运维所有，以**节点上的文件**形式存在；这里只存路径。
+  //
+  // 为什么控制面不存密钥 material：
+  //   · 面板没有 per-resource secret store，新建一套会与 node_credential +
+  //     部署层 env Fernet 形成第三套密钥系统（§1.1 禁止第二份真相）；
+  //   · redaction 按形状删除 PEM 私钥块，是**兜底**而不是唯一防线：让密钥只以
+  //     路径形式流经控制面，它就没有机会进入日志/诊断/Support Bundle。
+  //
+  // 两列都可空且无默认值：只有 protocol=tls 的行才会填，其余行 NULL 是明确事实。
+  /// tls 监听使用的证书文件路径（节点本地；NULL = 非 tls）
+  tls_cert_path   String? @db.VarChar(512)
+  /// tls 监听使用的私钥文件路径（节点本地；NULL = 非 tls）
+  tls_key_path    String? @db.VarChar(512)
   /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?

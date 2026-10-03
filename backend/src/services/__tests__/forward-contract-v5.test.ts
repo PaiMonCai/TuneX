@@ -21,7 +21,10 @@ import {
 describe("V5-WP0 Forward protocol contract", () => {
   test("mode and protocol are orthogonal dimensions", () => {
     expect(FORWARD_MODES).toEqual(["direct", "relay"]);
-    expect(FORWARD_PROTOCOLS).toEqual(["tcp"]);
+    // V5-WP5-A1: tls joined the product protocol list together with its own
+    // Gate. This assertion is the deliberate, reviewable act of opening a
+    // protocol — it must never change silently.
+    expect(FORWARD_PROTOCOLS).toEqual(["tcp", "tls"]);
     expect(FORWARD_TRANSPORTS).toEqual(["stream"]);
     // V5-WP2 补全了计划的其余事实（revision / placement / listener / upstream），
     // 所以这里不再断言"只有三个字段" —— 那正是 WP2 要改的东西。协议的判定
@@ -58,9 +61,17 @@ describe("V5-WP0 Forward protocol contract", () => {
   });
 
   test("legacy enum presence does not advertise product support", () => {
-    for (const legacy of ["udp", "wss", "tls", "quic", "mtcp", "tunex"]) {
+    // `tls` left this list in V5-WP5-A1 (it is now an open protocol with its own
+    // Gate); `wss` stays out on purpose: the WS framing and the TLS transport
+    // security are separate dimensions, and collapsing them into one enum name
+    // is exactly what V5-WP0 undid.
+    for (const legacy of ["udp", "wss", "quic", "mtcp", "tunex"]) {
       expect(normalizeForwardProtocol(legacy)).toBeNull();
     }
+    // And the open one really is admitted — the two halves of the rule stay
+    // checked together, so "remove the name from the refused list" can never be
+    // the only change.
+    expect(normalizeForwardProtocol("tls")).toBe("tls");
   });
 
   test("historical protocol facts are preserved without being admitted", () => {

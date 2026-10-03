@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"crypto/tls"
 	"fmt"
 	"sort"
 	"strings"
@@ -35,6 +36,9 @@ type StreamBuildDeps struct {
 	SelectorFor func(tunnelID string) (TargetSelector, error)
 	// Observer receives per-target dial failures (EGRESS only). Nil is a no-op.
 	Observer TargetObserver
+	// ServerName overrides the TLS server name. Tests set it; production leaves
+	// it empty (the listener serves whatever SNI the client sends).
+	ServerName string
 }
 
 // StreamBuilder constructs the stream runtime for ONE protocol.
@@ -120,6 +124,38 @@ func BuildStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error) 
 // not something production discovers as a nil map lookup.
 var streamBuilders = map[ForwardProtocol]StreamBuilder{
 	ProtocolTCP: buildTCPStream,
+	ProtocolTLS: buildTLSStream,
+}
+
+// buildTLSStream constructs the TLS-fronted stream runtime.
+//
+// Ordering is the contract (§6.1 + WP2's "unknown protocol fails before a
+// listener exists"):
+//  1. the config has already been validated (paths present, mode applicable);
+//  2. the certificate and key are LOADED here — a missing file, a mismatched
+//     pair or an unreadable key fails now, before anything binds;
+//  3. only then is the listener wrapped in TLS.
+//
+// EGRESS stays a plain listener on purpose: the egress node listens for the
+// ingress node, and the inter-node hop is plain TCP by contract. Making the
+// egress side speak TLS would be inventing a second inter-node transport in a
+// protocol WP, which is exactly what the contract forbids.
+func buildTLSStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error) {
+	if cfg.Mode == ModeEgress {
+		return buildTCPStream(cfg, deps)
+	}
+	cert, err := tls.LoadX509KeyPair(strings.TrimSpace(cfg.TLSCertPath), strings.TrimSpace(cfg.TLSKeyPath))
+	if err != nil {
+		return nil, fmt.Errorf("forwarder: tls tunnel %s: %w", cfg.ID, err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if deps.ServerName != "" {
+		tlsConfig.ServerName = deps.ServerName
+	}
+	return NewSingleHopTLS(cfg, tlsConfig)
 }
 
 // buildTCPStream constructs the TCP stream runtime for one tunnel.

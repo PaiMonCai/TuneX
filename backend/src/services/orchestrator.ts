@@ -112,6 +112,14 @@ export interface AgentTunnelConfig {
   speed_limit: number;
   revision: number;
   listen_host?: string;
+  /**
+   * V5-WP5-A1: node-local certificate/key PATHS for a tls front. The control
+   * plane never carries key material (§6.1 "Where are certificates owned?").
+   * Omitted for every other protocol — the Agent refuses a tls tunnel without
+   * them, so an omission cannot silently degrade into "TLS but unauthenticated".
+   */
+  tls_cert_path?: string;
+  tls_key_path?: string;
 }
 
 /** 一次下发的结果（两条下发路径的公共形状）。 */
@@ -357,6 +365,9 @@ export interface DispatchEgressInput {
   lbStrategy?: string | null;
   /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
   protocol?: ForwardProtocol;
+  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  tlsCertPath?: string | null;
+  tlsKeyPath?: string | null;
 }
 
 export interface DispatchIngressInput {
@@ -368,6 +379,9 @@ export interface DispatchIngressInput {
   nextHop: string;
   /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
   protocol?: ForwardProtocol;
+  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  tlsCertPath?: string | null;
+  tlsKeyPath?: string | null;
 }
 
 export interface DispatchDirectInput {
@@ -380,6 +394,9 @@ export interface DispatchDirectInput {
   listenHost?: string | null;
   /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
   protocol?: ForwardProtocol;
+  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  tlsCertPath?: string | null;
+  tlsKeyPath?: string | null;
 }
 
 /** dispatchEgress 成功时额外带回出口地址（入口下发要用它拼 next_hop）。 */
@@ -474,6 +491,30 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
   /* 命令构造                                                        */
   /* ---------------------------------------------------------------- */
+
+  /**
+   * V5-WP5-A1: the tls front's paths, or nothing.
+   *
+   * Only emitted for `protocol=tls`, and only as a pair: a half-configured TLS
+   * front would otherwise reach an Agent that must then decide which half to
+   * believe. Absent for every other protocol, so the wire shape of a tcp tunnel
+   * is byte-for-byte what it was.
+   */
+  private static tlsFields(
+    protocol: ForwardProtocol,
+    input: { tlsCertPath?: string | null; tlsKeyPath?: string | null },
+  ): { tls_cert_path?: string; tls_key_path?: string } {
+    if (protocol !== "tls") return {};
+    const cert = typeof input.tlsCertPath === "string" ? input.tlsCertPath.trim() : "";
+    const key = typeof input.tlsKeyPath === "string" ? input.tlsKeyPath.trim() : "";
+    if (cert === "" || key === "") {
+      throw new AgentTransportError(
+        RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+        "tls 转发缺少证书/私钥路径，拒绝下发",
+      );
+    }
+    return { tls_cert_path: cert, tls_key_path: key };
+  }
 
   /**
    * 出口侧隧道 id：`tunex-<tunnelId>-egress`。
@@ -610,6 +651,8 @@ export class Orchestrator {
       };
     }
 
+    // The RELAY listener is client-facing, so this is where TLS terminates.
+    const tlsFields = Orchestrator.tlsFields(protocol, input);
     const config: AgentTunnelConfig = {
       id: relayId,
       mode: "RELAY",
@@ -623,6 +666,7 @@ export class Orchestrator {
       protocol,
       speed_limit: 0,
       revision: input.revision,
+      ...tlsFields,
     };
 
     const envelope = createCommand({
@@ -634,6 +678,7 @@ export class Orchestrator {
         tunnel: {
           name: relayId,
           tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
+          ...tlsFields,
           listen_port: input.ingressPort,
           // 入口侧的唯一「目标」是出口节点；WP6 的 targets 只是为了让信封
           // 结构合法（apply_tunnel 要求非空），Agent 的 RELAY forwarder 不读它。
@@ -667,6 +712,8 @@ export class Orchestrator {
     const unreachable = await this.reachable(input.ingressNode);
     if (unreachable) return unreachable;
 
+    // The DIRECT listener is client-facing, so this is where TLS terminates.
+    const tlsFields = Orchestrator.tlsFields(protocol, input);
     const config: AgentTunnelConfig = {
       id: directId,
       mode: "DIRECT",
@@ -680,6 +727,7 @@ export class Orchestrator {
       protocol,
       speed_limit: 0,
       revision: input.revision,
+      ...tlsFields,
       ...(input.listenHost ? { listen_host: input.listenHost } : {}),
     };
 
@@ -692,6 +740,7 @@ export class Orchestrator {
         tunnel: {
           name: directId,
           tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
+          ...tlsFields,
           listen_port: input.ingressPort,
           targets: [{ address: input.remoteHost, port: input.remotePort }],
           ...(input.listenHost ? { listen_ip: input.listenHost } : {}),

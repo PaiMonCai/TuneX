@@ -890,6 +890,9 @@ export interface DesiredRowProjection {
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
+  /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 export type DesiredRowOutcome =
@@ -916,6 +919,20 @@ export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number
   });
   if (protocol === null) return { kind: "skip", reason: "protocol_not_supported" };
 
+  // V5-WP5-A1: a tls front needs both paths. Without them the row is a broken
+  // configuration, and the honest outcome is to keep it out of the snapshot —
+  // the Agent must never be told "serve TLS" without a certificate.
+  const tlsPaths =
+    protocol === "tls"
+      ? {
+          tls_cert_path: (row.tls_cert_path ?? "").trim() || undefined,
+          tls_key_path: (row.tls_key_path ?? "").trim() || undefined,
+        }
+      : {};
+  if (protocol === "tls" && (tlsPaths.tls_cert_path === undefined || tlsPaths.tls_key_path === undefined)) {
+    return { kind: "skip", reason: "tls_paths_missing" };
+  }
+
   if (row.ingress_node_id === nodeId && row.tunnel_mode === "direct") {
     if (!row.listen_port || !row.remote_host || !row.remote_port) return { kind: "not_for_node" };
     return {
@@ -931,6 +948,7 @@ export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number
         targets: [],
         lb_strategy: "ROUND_ROBIN",
         protocol,
+        ...tlsPaths,
         speed_limit: 0,
         revision,
         listen_host: row.listen_ip ?? undefined,
@@ -984,6 +1002,7 @@ export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number
         targets: [],
         lb_strategy: "ROUND_ROBIN",
         protocol,
+        ...tlsPaths,
         speed_limit: 0,
         revision,
         listen_host: row.listen_ip ?? undefined,

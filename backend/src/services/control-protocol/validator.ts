@@ -69,6 +69,9 @@ export const MAX_COMMAND_ID_LEN = 64;
 export const MAX_RESOURCE_ID_LEN = 128;
 /** 单地址长度上界（含 IPv6 最坏情况 + 域名 FQDN）。 */
 export const MAX_ADDRESS_LEN = 253;
+/** V5-WP5-A1: 证书/私钥路径长度上界（与 Prisma `VarChar(512)` 对齐）。 */
+const MAX_PATH_LEN = 512;
+
 /** 名称长度上界（与 Prisma `VarChar(255)` 对齐）。 */
 export const MAX_NAME_LEN = 255;
 /** 目标池容量上界：防止一条命令把对端内存打爆。 */
@@ -179,6 +182,12 @@ const TUNNEL_KEYS = new Set([
   "load_balance",
   "ip_type",
   "targets",
+  // V5-WP5-A1: TLS front. Additive + optional per §3.5 — an Agent that predates
+  // them ignores them, and one that knows them still refuses a tls tunnel whose
+  // paths are absent (forwarder.TunnelConfig.Validate). The control plane
+  // carries paths, never key material (DEVELOPMENT.md §6.1).
+  "tls_cert_path",
+  "tls_key_path",
 ]);
 
 /** 单个 target 校验。返回错误文案或 null。 */
@@ -239,6 +248,24 @@ function validateApplyTunnel(payload: Record<string, unknown>): string | null {
   // load_balance / ip_type 走冻结白名单（与 Prisma 枚举的抄录一致）。
   if (tunnel.protocol !== undefined && typeof tunnel.protocol !== "string") {
     return "payload.tunnel.protocol 必须是字符串";
+  }
+  // V5-WP5-A1: TLS paths. Shape only — the panel cannot see the node's
+  // filesystem, so existence is the Agent's check (fail closed before binding).
+  // What the control plane CAN guarantee is that these are node-local absolute
+  // paths and not a smuggled blob: an unbounded string here would turn the
+  // command channel into a file-writing primitive.
+  for (const field of ["tls_cert_path", "tls_key_path"] as const) {
+    const value = tunnel[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || value.trim() === "") {
+      return `payload.tunnel.${field} 不能为空字符串（应省略该字段）`;
+    }
+    if (value !== value.trim()) return `payload.tunnel.${field} 不应含首尾空白`;
+    if (!value.startsWith("/")) return `payload.tunnel.${field} 必须是节点本地绝对路径`;
+    if (value.length > MAX_PATH_LEN) return `payload.tunnel.${field} 过长`;
+    if (value.includes("\n") || value.includes("\r") || value.includes("\x00")) {
+      return `payload.tunnel.${field} 含非法字符`;
+    }
   }
   const enumFields: [string, readonly string[]][] = [
     ["load_balance", LOAD_BALANCE_TYPES],

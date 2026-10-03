@@ -1210,6 +1210,54 @@ client → ingress listener(tcp | tls | ws) → 解密/解帧
 - **node_credential**：语义不变（轮换后旧的 capability advertisement 依旧失效）。
 - 不引入第三套轮换系统。
 
+#### 实施状态
+
+| 子项 | 状态 | 说明 |
+|---|---|---|
+| WP5-A0 语义契约 | **DONE** | 本节上文，2026-10-03 冻结 |
+| WP5-A1 TLS stream runtime | **DONE** | 见下（真实拓扑已验证） |
+| WP5-A2 WS stream runtime | TODO | 契约已冻结，可直接开工 |
+| WP5-A3 protocol diagnostics | TODO | |
+| Gate V5-G1A | TODO | 脚本待写（`scripts/v3-e2e/v5-g1a.py`） |
+
+**WP5-A1 落地位置**
+
+~~~text
+agent/internal/forwarder/base.go       pipeTracker.listen 接缝（一个函数值，不是抽象层）
+agent/internal/forwarder/singhop.go    NewSingleHopTLS：唯一区别是 listener
+agent/internal/forwarder/factory.go    buildTLSStream：先加载证书，再构造 listener
+agent/internal/forwarder/interface.go  ProtocolTLS + tls_cert_path/tls_key_path + Validate
+agent/internal/forwarder/tls_test.go   握手/负例/热替换/排空（自签证书测试期生成，不入库）
+backend/src/services/forward-contract.ts   tls 开白名单 + tlsPathsForProtocol
+backend/src/services/control-protocol/validator.ts  tls_* 路径的形状校验（additive）
+backend/src/services/orchestrator.ts   tls 字段只下发到面向客户端的那一跳
+backend/src/services/agent-command-bus.ts  期望快照按行解析协议并携带路径
+backend/src/services/scheduler.ts      重推/创建路径携带路径
+backend/prisma/migrations/20261015000000_v5_wp5a1_tls_front        两列可空路径
+backend/prisma/migrations/20261015000100_v5_wp5a1_tls_entitlement  上界与默认模板加入 tls
+~~~
+
+**真实拓扑验证**（evidence: docs/evidence/v5-wp5a1-tls-e2e-20261003.log）
+
+~~~text
+tls 无证书路径      -> 400 tls 转发必须提供证书与私钥路径
+tcp 带证书路径      -> 400 只有 tls 转发可以携带证书/私钥路径
+旧 Agent（未广告 tls）-> 502 runtime_capability_denied: protocol_not_supported   ← WP1 准入生效
+新 Agent + 有效证书 -> 201，4s 内 active
+TLS 握手 + 转发      -> 握手成功，目标回包 b'WP14-TARGET-A\n'
+~~~
+
+最后一条是 A1 的要害：TLS 在**入口 listener** 终止，解出来的明文流仍走同一条转发路径；
+而倒数第二条证明「协议开放 ≠ 旧节点自动可用」——面板在入队前就拒绝了。
+
+两个设计要点（容易被后续改动破坏）：
+
+1. `tlsFields` **只**出现在 DIRECT / RELAY（面向客户端的那一跳）。EGRESS 保持裸 TCP
+   listener：出口节点面对的是入口节点，跨节点跳按契约不变。把 tls 混进 EGRESS
+   会让"TLS 在入口终止"这句契约失效。
+2. 证书路径**只**随 `protocol=tls` 下发；tcp 携带路径会被拒绝而不是被忽略——
+   否则线上会出现"Agent 必须主动忽略"的字段。
+
 #### V5.1a 实施范围（A1/A2/A3）
 
 ~~~text

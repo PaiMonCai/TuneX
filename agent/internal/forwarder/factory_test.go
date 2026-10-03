@@ -53,7 +53,10 @@ func TestResolveRuntimeTargetDefaultsToTCP(t *testing.T) {
 }
 
 func TestResolveRuntimeTargetFailsClosedForUnknownProtocol(t *testing.T) {
-	for _, name := range []string{"udp", "quic", "tls", "ws", "wss", "mtcp", "carrier-pigeon"} {
+	// "tls" is deliberately NOT in this list any more: V5-WP5-A1 implements it,
+	// so it moved into the positive test below. A protocol leaves this list only
+	// together with its Gate, never to make a test pass.
+	for _, name := range []string{"udp", "quic", "ws", "wss", "mtcp", "carrier-pigeon"} {
 		cfg := factoryDirectConfig()
 		cfg.Protocol = ForwardProtocol(name)
 		if _, err := ResolveRuntimeTarget(cfg); err == nil {
@@ -73,6 +76,59 @@ func TestBuildStreamRefusesUnknownProtocolWithoutBinding(t *testing.T) {
 
 	if _, err := BuildStream(cfg, StreamBuildDeps{}); err == nil {
 		t.Fatal("an unimplemented protocol must be refused before construction")
+	}
+}
+
+// V5-WP5-A1: tls is a stream protocol, resolved like any other.
+func TestResolveRuntimeTargetForTLS(t *testing.T) {
+	cfg := factoryDirectConfig()
+	cfg.Protocol = ProtocolTLS
+	cfg.TLSCertPath = "/nonexistent/cert.pem"
+	cfg.TLSKeyPath = "/nonexistent/key.pem"
+	target, err := ResolveRuntimeTarget(cfg)
+	if err != nil {
+		t.Fatalf("ResolveRuntimeTarget: %v", err)
+	}
+	if target.Protocol != ProtocolTLS || target.Transport != TransportStream {
+		t.Fatalf("tls must resolve to the stream transport, got %+v", target)
+	}
+}
+
+// A TLS tunnel with no certificate paths is a configuration error, and it must be
+// refused by Validate — i.e. before any listener exists.
+func TestTLSWithoutCertificatePathsIsRefused(t *testing.T) {
+	cfg := factoryDirectConfig()
+	cfg.Protocol = ProtocolTLS
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a tls tunnel without cert/key paths must not validate")
+	}
+}
+
+// A certificate that cannot be loaded fails the BUILD, before binding: the
+// listener must never come up with a broken TLS front.
+func TestBuildStreamTLSFailsClosedOnBadCertificate(t *testing.T) {
+	cfg := factoryDirectConfig()
+	cfg.Protocol = ProtocolTLS
+	cfg.TLSCertPath = "/nonexistent/cert.pem"
+	cfg.TLSKeyPath = "/nonexistent/key.pem"
+	// Port 1 would fail to bind anyway; the point is that the failure is the
+	// certificate, and that nothing was bound.
+	if _, err := BuildStream(cfg, StreamBuildDeps{}); err == nil {
+		t.Fatal("an unloadable certificate must refuse the build")
+	}
+}
+
+// EGRESS keeps a plain listener: the egress node listens for the ingress node,
+// and the inter-node hop is plain TCP by contract.
+func TestTLSCannotBeUsedForEgress(t *testing.T) {
+	cfg := factoryDirectConfig()
+	cfg.Mode = ModeEgress
+	cfg.EgressPort = 30001
+	cfg.Protocol = ProtocolTLS
+	cfg.TLSCertPath = "/nonexistent/cert.pem"
+	cfg.TLSKeyPath = "/nonexistent/key.pem"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("tls on an EGRESS tunnel must not validate")
 	}
 }
 

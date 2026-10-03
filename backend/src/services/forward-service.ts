@@ -56,6 +56,7 @@ import {
   persistedForwardProtocol,
   type ForwardMode,
   type ForwardProtocol,
+  tlsPathsForProtocol,
 } from "./forward-contract.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import {
@@ -72,6 +73,13 @@ export interface ForwardCreateInput {
   mode: ForwardMode;
   /** V5-WP0: omitted by V4 clients => tcp; explicit unknown values fail closed. */
   protocol?: ForwardProtocol;
+  /**
+   * V5-WP5-A1: node-local certificate/key paths for a tls front. Paths, never
+   * key material (§6.1). Ignored for every other protocol — the panel does not
+   * silently turn a stray path into a TLS front.
+   */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   ingress_node_id: number;
   egress_node_id?: number | null;
   listen_port?: number | null;
@@ -592,6 +600,12 @@ export async function createForward(
   if (protocol === null) {
     return error(400, "invalid_input", "当前版本不支持该转发协议");
   }
+  // V5-WP5-A1: a tls front needs both paths, and only a tls front accepts them.
+  // The panel cannot check that the files exist (they live on the node); what it
+  // must not do is dispatch "serve TLS" without a certificate, or quietly attach
+  // paths to a protocol that has no TLS front.
+  const tlsPaths = tlsPathsForProtocol(protocol, input.tls_cert_path, input.tls_key_path);
+  if (!tlsPaths.ok) return error(400, "invalid_input", tlsPaths.reason);
   if (
     !input.name.trim() ||
     !input.target_host.trim() ||
@@ -710,6 +724,7 @@ export async function createForward(
           name: input.name.trim(),
           tunnel_type: legacyTunnelTypeForForwardProtocol(protocol) as "tcp",
           forward_protocol: protocol,
+          ...tlsPaths.columns,
           category: "port_forward",
           listen_ip: "0.0.0.0",
           listen_port: input.listen_port ?? null,

@@ -11,7 +11,15 @@
 export const FORWARD_MODES = ["direct", "relay"] as const;
 export type ForwardMode = (typeof FORWARD_MODES)[number];
 
-export const FORWARD_PROTOCOLS = ["tcp"] as const;
+/**
+ * Product protocols the runtime has opened.
+ *
+ * A value lands here only together with its own Gate (V5-G0 established the
+ * "enum presence is not product support" rule; V5-WP0 enforced it). V5.1a adds
+ * `tls` — the same stream lifecycle with a TLS-terminated client-facing listener
+ * (DEVELOPMENT.md §6.1). `ws` follows in V5-WP5-A2, `udp`/`quic` after.
+ */
+export const FORWARD_PROTOCOLS = ["tcp", "tls"] as const;
 export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
 
 /**
@@ -44,6 +52,10 @@ export const FORWARD_PROTOCOL_SPECS: Readonly<
   Record<ForwardProtocol, ForwardProtocolSpec>
 > = {
   tcp: { transport: "stream", legacy_tunnel_type: "tcp" },
+  // TLS terminates at the INGRESS listener; the inter-node hop stays plain TCP,
+  // which is why this is a protocol (what the client speaks) and not a
+  // transport (how bytes move between nodes).
+  tls: { transport: "stream", legacy_tunnel_type: "tls" },
 };
 
 export function normalizeForwardTransport(
@@ -168,6 +180,43 @@ export function admitPersistedProtocol(row: {
   } catch {
     return null;
   }
+}
+
+/**
+ * V5-WP5-A1: validate the tls front's paths for a given protocol.
+ *
+ * Two rules, both fail-closed:
+ *   · `protocol === "tls"` requires BOTH paths — dispatching "serve TLS" without
+ *     a certificate is never acceptable, and there is no safe default;
+ *   · every other protocol rejects them — attaching paths to tcp would put fields
+ *     on the wire that the Agent has to decide to ignore, and "the Agent ignores
+ *     it" is not a contract.
+ *
+ * Existence is deliberately NOT checked here: the files live on the node, and
+ * the panel cannot see them. The Agent fails the build before binding a listener.
+ */
+export function tlsPathsForProtocol(
+  protocol: ForwardProtocol,
+  certPath: unknown,
+  keyPath: unknown,
+):
+  | { ok: true; columns: { tls_cert_path: string | null; tls_key_path: string | null } }
+  | { ok: false; reason: string } {
+  const cert = typeof certPath === "string" ? certPath.trim() : "";
+  const key = typeof keyPath === "string" ? keyPath.trim() : "";
+  if (protocol !== "tls") {
+    if (cert !== "" || key !== "") {
+      return { ok: false, reason: "只有 tls 转发可以携带证书/私钥路径" };
+    }
+    return { ok: true, columns: { tls_cert_path: null, tls_key_path: null } };
+  }
+  if (cert === "" || key === "") {
+    return { ok: false, reason: "tls 转发必须提供证书与私钥路径" };
+  }
+  if (!cert.startsWith("/") || !key.startsWith("/")) {
+    return { ok: false, reason: "证书/私钥路径必须是节点本地绝对路径" };
+  }
+  return { ok: true, columns: { tls_cert_path: cert, tls_key_path: key } };
 }
 
 export interface ForwardRuntimePlacement {

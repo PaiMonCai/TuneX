@@ -449,6 +449,25 @@ async function admitBoundRuntime(
   return admitted.ok ? null : admitted;
 }
 
+/**
+ * V5-WP5-A1: the tls front's paths off a persisted row.
+ *
+ * Only returned for an admitted `tls` fact: handing paths to a tcp/ws tunnel
+ * would put fields on the wire that the Agent must then decide to ignore, and
+ * "the Agent ignores it" is not a contract.
+ */
+function tlsPathsFor(row: Record<string, unknown>, protocol: ForwardProtocol) {
+  if (protocol !== "tls") return {};
+  const cert = typeof row.tls_cert_path === "string" ? row.tls_cert_path.trim() : "";
+  const key = typeof row.tls_key_path === "string" ? row.tls_key_path.trim() : "";
+  if (cert === "" || key === "") {
+    // A tls row without paths is a broken configuration, not a tcp tunnel: the
+    // dispatch refuses (see Orchestrator.tlsFields) rather than downgrading.
+    return { tlsCertPath: null, tlsKeyPath: null };
+  }
+  return { tlsCertPath: cert, tlsKeyPath: key };
+}
+
 /** admission 失败 → `Tunnel.apply_error` 上的结构化记录（不删业务行，§7.11）。 */
 function admissionFailureText(denied: RuntimeAdmissionDenied): string {
   return admissionFailureDetail(denied);
@@ -1305,6 +1324,7 @@ export async function createRelayTunnel(
     ingressPort: ingressAlloc.port,
     nextHop: plan.upstream.next_hop as string,
     protocol: plan.protocol.name,
+    ...tlsPathsFor(asRow<Record<string, unknown>>(created) as Record<string, unknown>, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
     /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
@@ -1794,6 +1814,7 @@ export async function reapplyRelayTunnel(
     ingressPort,
     nextHop: plan.upstream.next_hop as string,
     protocol: plan.protocol.name,
+    ...tlsPathsFor(row, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
     await orchestrator
@@ -2064,6 +2085,7 @@ export async function reapplyDirectTunnel(
     remotePort,
     listenHost: typeof row.listen_ip === "string" ? row.listen_ip : null,
     protocol: directPlan.protocol.name,
+    ...tlsPathsFor(row, directPlan.protocol.name),
   });
   if (!dispatched.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
