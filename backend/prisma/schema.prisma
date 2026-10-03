@@ -1524,6 +1524,22 @@ model NodeStateReport {
   /// Agent 实际实现的控制动作清单（NULL = 未上报；非数组 = 坏形状，fail-closed）
   capabilities             Json?
 
+  // ── V5-WP1 能力协商 v2（DEVELOPMENT.md §5.2）──
+  //
+  // 第三个**可空且无默认值**的协商字段，additive 且不改动上面两列的语义。
+  //
+  //   capability_manifest ← { schema_version, protocols, transports,
+  //                           runtime, diagnostics }
+  //
+  // 为什么不把 capabilities 原地改成 object：它是 string[]，Support Bundle /
+  // 诊断快照 / 旧工具链已经按数组读它；原地改型会让每个读它的人静默拿到
+  // undefined，把「节点支持 apply_tunnel」变成「什么都不知道」。
+  //
+  // NULL 的含义与 capabilities 完全一致（旧 Agent 未上报 → baseline 放行），
+  // 形状校验由 node-state.ts 与 services/capability-manifest.ts 双重把关。
+  /// Agent 实际实现的协议 / 传输 / runtime 能力清单（NULL = 未上报）
+  capability_manifest      Json?
+
   @@index([reported_at])
   @@index([last_error_at])
   @@map("node_state_report")

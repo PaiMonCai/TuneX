@@ -11,10 +11,12 @@ import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
 import {
-  capabilityFactsFromStored,
-  decideCapability,
-  type AgentCapabilityFacts,
-} from "./agent-capability.ts";
+  admissionLayerLabel,
+  admitAction,
+  admitOnNode,
+  loadNodeCapabilityFacts,
+  type AgentV2CapabilityFacts,
+} from "./runtime-admission.ts";
 import { randomUUID } from "node:crypto";
 import {
   AgentTransportError,
@@ -584,40 +586,19 @@ export async function waitAgentCommandAck(
 }
 
 /**
- * Read the node's latest advertised control capabilities (WP11B).
+ * Read the node's latest advertised capability facts (V4-WP11B actions +
+ * V5-WP1 manifest).
  *
  * Deliberately narrow and lazy: this module is imported by the worker, so a
- * top-level Prisma import would connect during unit tests. A read failure is
- * reported as "no facts" (which still allows baseline actions) instead of
- * blocking every dispatch on a database hiccup.
+ * top-level Prisma import would connect during unit tests. The read itself
+ * lives in `runtime-admission.ts` so the panel's admission facts have exactly
+ * one loader; a failure there is reported as "no facts" (which still allows the
+ * protocol-frozen baseline) instead of blocking every dispatch on a hiccup.
  */
-async function loadCapabilityFacts(nodeId: number): Promise<AgentCapabilityFacts | null> {
+async function loadCapabilityFacts(nodeId: number): Promise<AgentV2CapabilityFacts | null> {
   try {
-    const { db } = await import("../db.ts");
-    const row = await db.nodeStateReport.findUnique({
-      where: { node_id: nodeId },
-      select: {
-        control_protocol_version: true,
-        capabilities: true,
-        reported_at: true,
-        // Reinstall keeps node_id AND agent_id, so a stale row can describe an
-        // agent binary this node no longer runs (WP11B).
-        node: { select: { credential_rotated_at: true } },
-      },
-    });
-    // A malformed stored value must NOT silently become "never reported": that
-    // would downgrade fail-closed to baseline-allowed. The pure helper throws on
-    // bad shape and the caller turns that into a refusal.
-    return capabilityFactsFromStored(row
-      ? {
-          control_protocol_version: row.control_protocol_version,
-          capabilities: row.capabilities,
-          reported_at: row.reported_at,
-          credential_rotated_at: row.node?.credential_rotated_at ?? null,
-        }
-      : null);
-  } catch (error) {
-    if (error instanceof TypeError) throw error;
+    return await loadNodeCapabilityFacts(nodeId);
+  } catch {
     return null;
   }
 }
@@ -633,29 +614,48 @@ export class OutboundAgentTransport implements AgentTransport {
    * without a database. Production default reads the node's last state report.
    */
   constructor(
-    private readonly capabilityFacts: (nodeId: number) => Promise<AgentCapabilityFacts | null> = loadCapabilityFacts,
+    private readonly capabilityFacts: (nodeId: number) => Promise<AgentV2CapabilityFacts | null> = loadCapabilityFacts,
     private readonly store: CommandBusStore = redisStore,
   ) {}
 
-  /** Refuse to queue a command the node has not advertised support for. */
-  private async assertCapability(node: OrchestratorNode, action: string): Promise<void> {
-    let facts: AgentCapabilityFacts | null = null;
+  /**
+   * Refuse to queue a command the node has not advertised support for.
+   *
+   * V5-WP1: the gate now covers all three orthogonal dimensions (action +
+   * protocol + transport) through the panel's single admission implementation.
+   * The protocol is taken from the outgoing config, which is the very fact the
+   * agent will act on — reading it from anywhere else would let the gate and the
+   * payload disagree.
+   *
+   * This stays even though the scheduler already admits before dispatch: it is
+   * the last line of defence, and it is the only one that also covers
+   * non-scheduler callers (rollout, diagnosis, future routes).
+   */
+  private async assertCapability(
+    node: OrchestratorNode,
+    action: string,
+    config?: AgentTunnelConfig | null,
+  ): Promise<void> {
+    let facts: AgentV2CapabilityFacts | null = null;
     try {
       facts = await this.capabilityFacts(node.id);
     } catch {
-      // A stored capability value that cannot be parsed means "this node's
-      // negotiation facts are unusable" — fail closed for everything except the
-      // protocol-frozen baseline, exactly like an explicit disagreement.
+      // A stored value that cannot be read means "this node's negotiation facts
+      // are unusable" — fail closed for everything except the protocol-frozen
+      // baseline, exactly like an explicit disagreement.
       throw new AgentTransportError(
         RELAY_DISPATCH_ERROR_CODES.agent_rejected,
-        `节点 ${node.id} 的能力上报形状非法，拒绝下发 ${action}；请升级 Agent`,
+        `节点 ${node.id} 的能力上报无法读取，拒绝下发 ${action}；请升级 Agent`,
       );
     }
-    const decision = decideCapability(facts, action);
-    if (!decision.supported) {
+    const decision = admitOnNode(
+      { nodeId: node.id, role: config?.mode === "EGRESS" ? "egress" : "ingress", facts },
+      { action, protocol: config?.protocol },
+    );
+    if (!decision.ok) {
       throw new AgentTransportError(
         RELAY_DISPATCH_ERROR_CODES.agent_rejected,
-        `${decision.detail}（node=${node.id}, action=${action}, reason=${decision.reason}）`,
+        `${decision.detail}（原因=${decision.reason}，维度=${admissionLayerLabel(decision.layer)}）`,
       );
     }
   }
@@ -671,8 +671,9 @@ export class OutboundAgentTransport implements AgentTransport {
         "outbound transport requires command envelope",
       );
     }
-    // WP11B: never send an action this node has not told us it implements.
-    await this.assertCapability(node, String(envelope.action ?? ""));
+    // WP11B + WP1: never send an action/protocol/transport this node has not
+    // told us it implements.
+    await this.assertCapability(node, String(envelope.action ?? ""), config);
     const { scope } = await enqueueAgentCommand(node.id, envelope, config, this.store);
     const ack = await waitAgentCommandAck(scope, node.id, envelope.command_id, undefined, this.store);
     if (!ack.ok) {
@@ -730,7 +731,7 @@ export async function issueAgentDiagnose(
     timeoutMs?: number;
   },
   deps: {
-    capabilityFacts?: (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    capabilityFacts?: (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
     store?: CommandBusStore;
   } = {},
 ): Promise<{ ok: true; results: AgentDiagnoseResult[] } | { ok: false; error_code: string; error: string }> {
@@ -757,14 +758,17 @@ export async function issueAgentDiagnose(
     expires_at: new Date(Date.now() + (input.timeoutMs ?? 20_000)).toISOString(),
   } as unknown as CommandEnvelope;
 
-  let facts: AgentCapabilityFacts | null = null;
+  let facts: AgentV2CapabilityFacts | null = null;
   try {
     facts = await factsReader(input.nodeId);
   } catch {
     return { ok: false, error_code: "incompatible_agent", error: `节点 ${input.nodeId} 的能力上报形状非法，拒绝下发诊断` };
   }
-  const decision = decideCapability(facts, "diagnose_tunnel");
-  if (!decision.supported) {
+  // Diagnose has no protocol dimension: it probes a target path, it is not a
+  // forward runtime. Requiring a protocol fact here would refuse a diagnostic on
+  // a node whose manifest is silent about protocols for unrelated reasons.
+  const decision = admitAction({ nodeId: input.nodeId, role: "ingress", facts }, "diagnose_tunnel");
+  if (!decision.ok) {
     return { ok: false, error_code: decision.reason, error: decision.detail };
   }
 
@@ -794,21 +798,23 @@ export async function issueAgentDiagnose(
 export async function issueAgentDiagnostics(
   input: { nodeId: number; timeoutMs?: number },
   deps: {
-    capabilityFacts?: (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    capabilityFacts?: (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
     store?: CommandBusStore;
   } = {},
 ): Promise<{ ok: true; facts: NodeSelfFacts } | { ok: false; error_code: string; error: string }> {
   const factsReader = deps.capabilityFacts ?? loadCapabilityFacts;
   const store = deps.store ?? redisStore;
 
-  let facts: AgentCapabilityFacts | null = null;
+  let facts: AgentV2CapabilityFacts | null = null;
   try {
     facts = await factsReader(input.nodeId);
   } catch {
     return { ok: false, error_code: "incompatible_agent", error: `节点 ${input.nodeId} 的能力上报形状非法` };
   }
-  const decision = decideCapability(facts, "collect_diagnostics");
-  if (!decision.supported) {
+  // Action-only, same reason as diagnose_tunnel: a node-level self report has no
+  // protocol dimension.
+  const decision = admitAction({ nodeId: input.nodeId, role: "ingress", facts }, "collect_diagnostics");
+  if (!decision.ok) {
     return { ok: false, error_code: decision.reason, error: decision.detail };
   }
 

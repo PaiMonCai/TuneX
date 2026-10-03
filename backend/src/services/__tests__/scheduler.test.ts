@@ -1,5 +1,6 @@
 import { test, expect, describe, beforeEach } from "bun:test";
 import type { EffectivePolicy } from "../capability-policy.ts";
+import type { AgentV2CapabilityFacts as AgentV2Facts } from "../capability-manifest.ts";
 
 /**
  * WP8 — Scheduler + RELAY Orchestrator 离线测试（不连 MySQL / Redis / 网络）。
@@ -576,10 +577,16 @@ function tunnelLimitPolicy(limit = 1) {
 let fakeAgent: FakeAgentTransport;
 let deps: NonNullable<Parameters<typeof scheduler.createRelayTunnel>[2]>;
 let orch: InstanceType<typeof orchestratorModule.Orchestrator>;
+/**
+ * V5-WP1：每个节点已上报的协商事实。空 Map = 所有节点都是「未上报」的旧 Agent
+ * ——那正是 baseline 放行的场景，所以既有用例的行为不受影响。
+ */
+let capabilityFacts: Map<number, AgentV2Facts>;
 
 beforeEach(async () => {
   seed();
   fakeAgent = new FakeAgentTransport();
+  capabilityFacts = new Map();
   // 动态 import：本文件不 mock.module（WP3 测试已证明依赖注入比 mock 稳），
   // 但 db 单例仍需替身 —— 用 scheduler 的 deps.db 注入即可，无需 mock。
   scheduler = scheduler ?? (await import("../scheduler.ts"));
@@ -594,6 +601,9 @@ beforeEach(async () => {
     // Runtime-use admission is production-real by default; this suite's doubles
     // stand in for it so no case reaches the process-wide Prisma client.
     runtimeUse: async () => null,
+    // V5-WP1 同理：默认 loader 会去读 node_state_report（真 Prisma 客户端），
+    // 这里用内存 Map 替身，保持本套件「零外部依赖」的性质。
+    loadCapabilityFacts: async (nodeId: number) => capabilityFacts.get(nodeId) ?? null,
     now: () => NOW,
     validator: (orch as unknown as { validator: never }).validator,
     portPoolDeps: { db: makeDb(), redis: makeRedis() } as unknown as NonNullable<typeof deps>["portPoolDeps"],
@@ -1648,5 +1658,149 @@ describe("F. 集成形状", () => {
     // 端口租约必须被补偿释放（不留孤儿租约）。
     const live = leases.filter((l) => l.status === "active");
     expect(live).toEqual([]);
+  });
+});
+
+/* ================================================================== */
+/* G. V5-WP1 Runtime Admission（下发前的三正交条件）                     */
+/* ================================================================== */
+
+/**
+ * §5.2 的准入要求在编排层落地：命令入队**之前**、端口租约产生**之前**，
+ * 每一台参与节点都必须满足「动作 + 协议 + 传输」。
+ *
+ * 这组用例守的是三件不同的事：
+ *   1. **两端都查**：RELAY 只查出口或只查入口，都会留下半开的运行时；
+ *   2. **零副作用拒绝**：拒绝时不能有 tick 落库、不能有租约、不能有命令；
+ *   3. **admission ≠ 授权**：能力协商只回答"实现了没有"，它既不能放宽 RBAC，
+ *      也不能让一个被策略/额度拒绝的请求通过。
+ */
+describe("G. V5-WP1 runtime admission", () => {
+  const V2_OK = {
+    protocolVersion: 2,
+    capabilities: ["apply_tunnel", "remove_tunnel", "suspend_tunnel"],
+    capabilitiesMalformed: false,
+    manifest: {
+      schema_version: 2,
+      protocols: ["tcp"],
+      transports: ["stream"],
+      runtime: ["graceful_drain", "hot_reload", "lkg_restore"],
+      diagnostics: ["node_snapshot", "tunnel_probe"],
+    },
+    manifestMalformed: false,
+  } as unknown as AgentV2Facts;
+
+  test("G1. 两端都上报 tcp/stream → 放行（advertised 依据）", async () => {
+    capabilityFacts.set(1, V2_OK);
+    capabilityFacts.set(2, V2_OK);
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
+  });
+
+  test("G2. 旧 Agent 未上报任何事实 → TCP baseline 继续（不制造升级中断）", async () => {
+    // capabilityFacts 为空 = 两个节点都没上报过。
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
+  });
+
+  test("G3. RELAY 一端支持、一端不支持 → 整条拒绝，且零副作用", async () => {
+    capabilityFacts.set(1, V2_OK);
+    // 出口节点明确上报了「协议里没有 tcp」。
+    capabilityFacts.set(2, {
+      ...V2_OK,
+      manifest: { ...V2_OK.manifest!, protocols: [] },
+    } as AgentV2Facts);
+
+    const tunnelsBefore = tunnels.length;
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error_code).toBe(scheduler.SCHEDULER_ERROR_CODES.runtime_capability_denied);
+    // 失败必须点名是**出口**不满足：只说"节点不支持"会让运维去查错的机器。
+    expect(result.error).toContain("出口节点 2");
+    expect(result.error).toContain("protocol_not_supported");
+    // 铁律：拒绝发生在任何下发之前。
+    expect(fakeAgent.applies).toEqual([]);
+    // 也不该产生端口租约（否则要等预分配 TTL 才收得回）。
+    expect(leases.filter((l) => l.status === "active")).toEqual([]);
+    // 业务行**保留**（§7.11「失败保留 Forward/Tunnel 数据，不物理删除」）：
+    // ② 已经落了一条 pending 行，admission 拒绝后它变成 error，而不是消失。
+    expect(tunnels.length).toBe(tunnelsBefore + 1);
+    const row = tunnels[tunnels.length - 1]!;
+    expect(row.apply_status).toBe("error");
+    expect(row.apply_error_code).toBe(scheduler.SCHEDULER_ERROR_CODES.runtime_capability_denied);
+    // 也没有绑定到具体节点：拒绝发生在 placements 落库之前。
+    expect(row.ingress_node_id).toBeNull();
+    expect(row.egress_node_id).toBeNull();
+  });
+
+  test("G4. 入口不支持 → 同样在下发前拒绝，出口侧不被先启动", async () => {
+    capabilityFacts.set(1, { ...V2_OK, manifest: { ...V2_OK.manifest!, transports: [] } } as AgentV2Facts);
+    capabilityFacts.set(2, V2_OK);
+
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("入口节点 1");
+    expect(result.error).toContain("transport_not_supported");
+    // 关键：铁律要求"先出口再入口"，但准入必须在两端都通过之后才开始，
+    // 否则要先启出口再撤它——一次本可避免的补偿。
+    expect(fakeAgent.applies).toEqual([]);
+  });
+
+  test("G5. 坏形状 manifest → fail-closed（连 baseline 也不放行）", async () => {
+    capabilityFacts.set(1, V2_OK);
+    capabilityFacts.set(2, { ...V2_OK, manifest: null, manifestMalformed: true } as AgentV2Facts);
+
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("malformed_capability_manifest");
+    expect(fakeAgent.applies).toEqual([]);
+  });
+
+  test("G6. 动作维度先于协议维度失败（拒绝文案落在最可行动的那条上）", async () => {
+    capabilityFacts.set(1, { ...V2_OK, capabilities: ["remove_tunnel"] } as AgentV2Facts);
+    capabilityFacts.set(2, V2_OK);
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // apply_tunnel 不在上报清单里 → 动作维度失败，而不是协议维度。
+    expect(result.error).toContain("[runtime_admission:incompatible_agent:action]");
+  });
+
+  test("G7. admission 不越过策略/额度：被 quota 拒绝的请求不会因为能力齐全而放行", async () => {
+    capabilityFacts.set(1, V2_OK);
+    capabilityFacts.set(2, V2_OK);
+    tunnels.push(seedTunnel()); // 已有一条，额度上限 1
+    deps.loadPolicy = async () => tunnelLimitPolicy(1) as never;
+
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error_code).toBe(scheduler.SCHEDULER_ERROR_CODES.tunnel_limit);
+    // 能力协商层不参与授权判定，因此这里连一步下发都不该发生。
+    expect(fakeAgent.applies).toEqual([]);
+  });
+
+  test("G9. admission 不越过 RBAC：能力齐全也不能让未授权的节点组通过", async () => {
+    capabilityFacts.set(1, V2_OK);
+    capabilityFacts.set(2, V2_OK);
+    deps.authorizeGroup = async () => false;
+
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error_code).toBe(scheduler.SCHEDULER_ERROR_CODES.node_group_not_allowed);
+    expect(fakeAgent.applies).toEqual([]);
+  });
+
+  test("G8. 读不到事实（DB 抖动）不构成拒绝理由：按未上报处理，baseline 继续", async () => {
+    deps.loadCapabilityFacts = async () => {
+      throw new Error("database is down");
+    };
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
   });
 });

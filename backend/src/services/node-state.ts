@@ -43,6 +43,7 @@ import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
 import { normalizeCapabilities } from "./agent-capability.ts";
+import { normalizeCapabilityManifest, type CapabilityManifest } from "./capability-manifest.ts";
 
 /* ================================================================== */
 /* 形状（与 agent/internal/api 的 NodeState 字段对齐）                  */
@@ -115,6 +116,25 @@ export interface StateReportInput {
   control_protocol_version?: number;
   /** Agent 实际实现的控制动作清单（缺失 = 未上报，与空数组语义不同）。 */
   capabilities?: string[];
+
+  // ── V5-WP1：能力协商 v2 ──
+  /** Agent 实际实现的协议 / 传输 / runtime 能力清单（缺失 = 旧 Agent 未上报）。 */
+  capability_manifest?: CapabilityManifestInput;
+}
+
+/**
+ * Agent 上报的 v2 能力清单（对齐 agent/internal/control.Manifest 的 JSON 形态）。
+ *
+ * 字段全部可选：Agent 侧尚未上报的维度会整键省略，面板按「这一维什么都没说」
+ * 处理（空集 → fail-closed），而不是补一个默认值。**不要**在这里加默认协议，
+ * 那会把「未上报」变成「上报了 tcp」，恰好抹掉协商的意义。
+ */
+export interface CapabilityManifestInput {
+  schema_version?: number;
+  protocols?: string[];
+  transports?: string[];
+  runtime?: string[];
+  diagnostics?: string[];
 }
 
 /** Agent 自报的 runtime 计数（形状由 agent/internal/reporter 定义）。 */
@@ -187,7 +207,9 @@ export type StateReportRejection =
   /** V4-WP6：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
   | "bad_telemetry"
   /** V4-WP11B：能力协商字段形状坏（版本非非负整数 / 能力不是字符串数组）。 */
-  | "bad_capabilities";
+  | "bad_capabilities"
+  /** V5-WP1：capability_manifest 形状坏（非对象 / schema_version 非整数 / 维度不是字符串数组）。 */
+  | "bad_capability_manifest";
 
 /**
  * 载荷校验（fail-closed）：任何坏形状返回原因码，调用方回 400。
@@ -392,6 +414,30 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
     }
   }
 
+  // ── V5-WP1：能力协商 v2 ──
+  //
+  // 三条纪律，与上面完全一致：
+  //   · 缺失容忍        —— 旧 Agent 不发这个字段，上报照收（面板按 baseline 判定）；
+  //   · 坏形状拒绝       —— 回 400 并给出原因码，而不是落一个坏 JSON；
+  //   · **不静默降级**   —— 坏形状绝不能被写成 NULL，那会把 fail-closed 变成
+  //                        baseline 放行，方向恰好错反（capability-manifest.ts
+  //                        的 normalize 抛错正是为了这一点）。
+  //
+  // 刻意**不**拒绝 schema_version ≠ 2：那是「本面板读不懂的更新版清单」，不是
+  // 坏载荷。normalize 对它返回 null → 落库为 NULL → 判定按 baseline 处理，
+  // 于是未来 Agent 灰度上线时 TCP 不会中断。若在这里回 400，新版 Agent 连状态
+  // 都上报不了，一次灰度就变成整批节点失去可观测性。
+  if (b.capability_manifest !== undefined) {
+    if (!b.capability_manifest || typeof b.capability_manifest !== "object" || Array.isArray(b.capability_manifest)) {
+      return { ok: false, reason: "bad_capability_manifest" };
+    }
+    try {
+      normalizeCapabilityManifest(b.capability_manifest);
+    } catch {
+      return { ok: false, reason: "bad_capability_manifest" };
+    }
+  }
+
   if (b.egress_pools !== undefined) {
     if (!b.egress_pools || typeof b.egress_pools !== "object" || Array.isArray(b.egress_pools)) {
       return { ok: false, reason: "bad_egress_pools" };
@@ -429,6 +475,9 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       // NULL"，即面板一直以为该 Agent 未上报能力（fail-closed 但不报错）。
       control_protocol_version: b.control_protocol_version as number | undefined,
       capabilities: b.capabilities as string[] | undefined,
+      // V5-WP1：同一个白名单陷阱——校验通过但没列在这里的字段会被静默丢掉，
+      // 症状是"上报 200、库里永远 NULL"，即面板一直以为该 Agent 没有 v2 能力。
+      capability_manifest: b.capability_manifest as CapabilityManifestInput | undefined,
     },
   };
 }
@@ -456,6 +505,7 @@ export function telemetryColumns(report: StateReportInput): {
   last_error_at: Date | null;
   control_protocol_version: number | null;
   capabilities: Prisma.InputJsonValue | typeof Prisma.JsonNull;
+  capability_manifest: Prisma.InputJsonValue | typeof Prisma.JsonNull;
 } {
   return {
     known_revision: report.known_revision ?? null,
@@ -479,7 +529,33 @@ export function telemetryColumns(report: StateReportInput): {
     capabilities: report.capabilities
       ? (normalizeCapabilities(report.capabilities) as unknown as Prisma.InputJsonValue)
       : Prisma.JsonNull,
+    // V5-WP1：落库的是**规范化后**的清单（去重 + 排序 + 维度补齐为空数组），
+    // 判定函数因此不必在每次下发时再规整一遍。读不懂的 schema 版本落 NULL，
+    // 与「未上报」同义：baseline 放行、其余拒绝（见 capability-manifest.ts）。
+    capability_manifest: normalizeManifestColumn(report.capability_manifest),
   };
+}
+
+/**
+ * `capability_manifest` 上报值 → 可落库的 JSON 列值。
+ *
+ * 读不懂的 schema 版本归一到 `JsonNull`（= 未上报的语义），**不是**落一个空对象：
+ * 空对象会被判定层读成「上报了，但四个维度都是空」→ fail-closed，那就把一次
+ * 无害的版本超前变成了全网拒绝下发。
+ */
+function normalizeManifestColumn(
+  value: CapabilityManifestInput | undefined,
+): Prisma.InputJsonValue | typeof Prisma.JsonNull {
+  if (!value) return Prisma.JsonNull;
+  let normalized: CapabilityManifest | null = null;
+  try {
+    normalized = normalizeCapabilityManifest(value);
+  } catch {
+    // 校验阶段已经拦过坏形状；这里再兜一次是为了让本函数**不会抛**——
+    // 它在下发路径的 upsert 里被调用，抛出去会变成一次 500。
+    return Prisma.JsonNull;
+  }
+  return normalized === null ? Prisma.JsonNull : (normalized as unknown as Prisma.InputJsonValue);
 }
 
 /**

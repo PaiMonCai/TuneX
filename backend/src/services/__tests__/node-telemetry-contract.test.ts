@@ -209,6 +209,10 @@ describe("telemetryColumns — 载荷 → 列", () => {
       // capabilities is a JSON column, so "absent" is Prisma.JsonNull.
       control_protocol_version: null,
       capabilities: Prisma.JsonNull,
+      // V5-WP1: the same rule for the v2 manifest — an old Agent that never
+      // reported one must stay NULL, never an empty object (an empty object
+      // would read as "I implement nothing" and fail every dispatch closed).
+      capability_manifest: Prisma.JsonNull,
     });
   });
 });

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,15 +68,85 @@ const (
 	ProtocolTCP ForwardProtocol = "tcp"
 )
 
+// ForwardTransport is the data-plane lifecycle contract that carries a protocol.
+// It is derived from the protocol, never a second user-visible field.
+type ForwardTransport string
+
+const (
+	// TransportStream is a connection-oriented runtime: one accepted connection
+	// maps to one upstream connection, and the runtime can drain in-flight work
+	// (see Forwarder.Drain).
+	TransportStream ForwardTransport = "stream"
+)
+
+// protocolRuntime binds a protocol to the transport contract that actually
+// carries it in this binary.
+//
+// This table — not a hand-maintained list elsewhere — is the single source of
+// truth behind BOTH ParseForwardProtocol and the manifest the agent advertises
+// (internal/control.Manifest). One table means there is no second list to drift
+// out of sync with what the parser accepts.
+type protocolRuntime struct {
+	Protocol  ForwardProtocol
+	Transport ForwardTransport
+}
+
+var protocolRuntimes = []protocolRuntime{
+	{Protocol: ProtocolTCP, Transport: TransportStream},
+}
+
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
 // whose V5 runtime Gate has not been opened yet.
 func ParseForwardProtocol(s string) (ForwardProtocol, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", string(ProtocolTCP):
+	name := strings.ToLower(strings.TrimSpace(s))
+	if name == "" {
+		// An omitted protocol is the V4 client shape and means TCP.
 		return ProtocolTCP, nil
-	default:
-		return "", fmt.Errorf("forwarder: protocol %q is not supported by the current runtime contract", s)
 	}
+	for _, rt := range protocolRuntimes {
+		if string(rt.Protocol) == name {
+			return rt.Protocol, nil
+		}
+	}
+	return "", fmt.Errorf("forwarder: protocol %q is not supported by the current runtime contract", s)
+}
+
+// TransportForProtocol returns the transport that carries p in this binary, and
+// whether p is implemented at all.
+func TransportForProtocol(p ForwardProtocol) (ForwardTransport, bool) {
+	for _, rt := range protocolRuntimes {
+		if rt.Protocol == p {
+			return rt.Transport, true
+		}
+	}
+	return "", false
+}
+
+// ImplementedProtocols lists the product protocols this binary can actually run,
+// sorted. It is derived from the same table ParseForwardProtocol consults, so
+// the agent cannot advertise a protocol its own parser would reject.
+func ImplementedProtocols() []string {
+	out := make([]string, 0, len(protocolRuntimes))
+	for _, rt := range protocolRuntimes {
+		out = append(out, string(rt.Protocol))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ImplementedTransports lists the distinct transport contracts reachable from
+// the implemented protocols, sorted.
+func ImplementedTransports() []string {
+	seen := make(map[string]bool, len(protocolRuntimes))
+	for _, rt := range protocolRuntimes {
+		seen[string(rt.Transport)] = true
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // LBStrategy selects how an EGRESS tunnel spreads connections over its pool.
@@ -151,12 +222,12 @@ type TunnelConfig struct {
 	// omitempty keeps an empty pool from being emitted as `null`: the panel
 	// treats absent as "no targets of its own", which is what a RELAY ingress
 	// tunnel actually has.
-	Targets    []Target   `json:"targets,omitempty"`
-	LBStrategy LBStrategy `json:"lb_strategy"`
+	Targets    []Target        `json:"targets,omitempty"`
+	LBStrategy LBStrategy      `json:"lb_strategy"`
 	Protocol   ForwardProtocol `json:"protocol"`
-	SpeedLimit int64      `json:"speed_limit"`
-	Revision   int64      `json:"revision"`
-	ListenHost string     `json:"listen_host,omitempty"`
+	SpeedLimit int64           `json:"speed_limit"`
+	Revision   int64           `json:"revision"`
+	ListenHost string          `json:"listen_host,omitempty"`
 }
 
 // Clone returns a copy that shares no mutable state with c.

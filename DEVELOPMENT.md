@@ -12,11 +12,11 @@
 
 ## 0. 当前接手点
 
-日期：2026-10-03。
+日期：2026-10-04。
 
 ### 0.1 main 状态
 
-V4.5 已完成技术闭环，V4 功能范围冻结。
+V4.5 已完成技术闭环，V4 功能范围冻结。V5.0 Contract Freeze 已开工。
 
 已验证发布链：
 
@@ -35,42 +35,38 @@ V4 发布证据与历史细节不再重复写入本文件，统一查阅：
 - docs/production-deploy.md —— 生产部署与运维；
 - scripts/v3-e2e/evidence/ —— Integration Gate 证据。
 
-### 0.2 V5-WP0 已有候选实现，禁止重做
+### 0.2 V5-WP0 已进入 main：禁止重做
 
-当前存在分支：
+`feature/v5-wp0-contract` 已通过 PR #29 合入 `main`（合并提交 `61a8615`）。
+旧的候选分支引用（`b34cd9b` / CI #512）已失效，**不要**再去拉那条分支。
 
-~~~text
-feature/v5-wp0-contract
-HEAD: b34cd9b267936a7bbd4e30e8d2c3d4b3aafc923d
-CI #512: success
-~~~
+WP0 落地内容（已冻结，改动它等于破坏 V5.0 契约）：
 
-该分支已经完成第一版 V5-WP0 Forward / Protocol / Transport Contract，实现内容包括：
-
-- Forward 产品层 canonical protocol；
+- Forward 产品层 canonical protocol（`backend/src/services/forward-contract.ts`）；
 - topology mode 与 protocol 正交；
 - transport 由 protocol 派生，不成为第二份用户/DB 真相；
 - Forward revision snapshot 保存 protocol fact；
 - deprecated /api/tunnels 创建路径与 /api/forwards 双写 canonical protocol；
 - 历史 tunnel_type 事实保留，不因旧枚举存在就自动开放；
 - scheduler 在下发前 fail-closed 拒绝未开放 protocol；
-- Agent ForwardProtocol typed contract；
+- Agent ForwardProtocol typed contract（`agent/internal/forwarder/interface.go`）；
 - LKG/snapshot 入口解析协议并 fail-closed；
 - unsupported_protocol 前端可行动错误文案；
 - 未实现 UDP / TLS / WS / QUIC。
 
-**接手 Agent 的第一件事不是重做 WP0。**
+**接手 Agent 的第一件事不是重做 WP0，而是确认它仍在 main 上生效。**
 
-第一步固定为：
+当前 WP：**V5-WP1 Capability Negotiation v2**（见 §5.2）。
 
-1. 对比 feature/v5-wp0-contract 与当前 main；
-2. 检查是否出现新的 main 冲突；
-3. 复核 migration、协议事实保留、V4 TCP 兼容路径；
-4. 确认 CI 仍绿；
-5. 通过正常 PR/合并流程让 WP0 进入 main；
-6. WP0 未进入 main 前，不从 main 新开 WP1。
+接手新工作前的固定动作（§3.2）：
 
-如果 main 已经前进，先 rebase / merge main 到 WP0 分支并重新跑 CI，不允许复制粘贴 WP0 代码到另一条新分支制造双实现。
+1. 拉取最新 main，确认 WP0 的契约文件仍在；
+2. 阅读本 WP 相关现有代码与测试；
+3. 搜索是否已经存在同名/同义实现（V5-WP1 已落地，不要重做协商层）；
+4. 写出当前事实与目标差异；
+5. 只在确认「没有第二套实现」后开始修改。
+
+不允许复制粘贴已有 WP 的代码到另一条新分支制造双实现。
 
 ---
 
@@ -356,10 +352,10 @@ V5.5 Federation
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
-| V5-WP0 | READY TO MERGE | feature/v5-wp0-contract，CI #512 green |
-| V5-WP1 | BLOCKED | 等 WP0 入 main |
-| V5-WP2 | BLOCKED | 等 WP1 contract |
-| V5-WP3 | BLOCKED | 可在 WP2 后并行准备 benchmark harness |
+| V5-WP0 | MERGED | PR #29 → main `61a8615`；契约冻结 |
+| V5-WP1 | DONE（待 Integration Gate 覆盖） | 能力协商 v2：manifest 契约 + 三维 runtime admission |
+| V5-WP2 | READY | WP1 契约已冻结，可开工 |
+| V5-WP3 | READY | 可在 WP2 后进行（不依赖 WP2 的代码形态） |
 | V5-WP4 / G0 | BLOCKED | 等 WP0–WP3 |
 | V5.1+ | BLOCKED | G0 全绿前禁止进入 |
 
@@ -433,6 +429,54 @@ transport 是 protocol 派生事实，不是第二个用户字段，也不是第
 ---
 
 ## 5.2 V5-WP1 — Capability Negotiation v2
+
+### 状态
+
+**DONE**（本文件记录实现落点，后续 Agent 不要重做）。
+
+落地位置：
+
+~~~text
+backend/src/services/capability-manifest.ts   契约 + 规范化 + 三维判定
+backend/src/services/runtime-admission.ts     三维准入的唯一实现（action+protocol+transport）
+backend/src/services/node-state.ts            上报校验 / 落库（capability_manifest）
+backend/prisma/migrations/20261014000000_v5_wp1_capability_manifest/
+agent/internal/control/manifest.go            Agent 侧 manifest（从真实实现派生）
+agent/internal/forwarder/interface.go         protocol → transport 注册表（parser 同源）
+agent/internal/reporter/heartbeat.go          上报字段 capability_manifest
+agent/v3runtime.go                            wiring 按「实际构造了什么」生成 manifest
+web/src/lib/forward-status.ts                 runtime_capability_denied 的可行动文案
+~~~
+
+生效点（**两处，同一实现**）：
+
+~~~text
+scheduler.createRelayTunnel / reapplyRelayTunnel / reapplyDirectTunnel
+    下发前、端口租约产生前：ingress（+ RELAY 的 egress）全量判定
+agent-command-bus.OutboundAgentTransport.assertCapability
+    入队前最后一道：按出站 config 里的 protocol 判定
+~~~
+
+错误码：
+
+~~~text
+Tunnel.apply_error_code = runtime_capability_denied
+apply_error              = [runtime_admission:<reason>:<layer>] ...
+reason ∈ upgrade_required | incompatible_agent | malformed_capability_manifest
+       | protocol_not_supported | transport_not_supported | runtime_feature_not_supported
+~~~
+
+刻意**没有**复用 `unsupported_protocol`：那一个是「产品还没开放这个协议」（等版本 /
+换协议），这一个是「这台节点还没实现」（升级 Agent / 换节点），下一步动作不同。
+
+已明确的边界：
+
+- `control_protocol_version` 由 1 升到 2；面板不按版本号做准入，只按 manifest 事实；
+- 面板看不懂的 `schema_version`（未来 Agent）→ 按「未上报」处理 → V4 baseline 继续，
+  新协议仍拒绝（不制造灰度升级期间的全网中断）；
+- manifest 的 `diagnostics` 维度是**观测用**，诊断下发仍由 V4 动作能力判定，
+  避免同一权限出现两套真相；
+- 未接入 Support Bundle / 节点详情展示（属后续 WP 的展示面，不影响准入）。
 
 ### 目标
 

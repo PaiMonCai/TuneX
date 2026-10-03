@@ -10,6 +10,7 @@ import (
 	"github.com/tunex/agent/internal/agentconfig"
 	"github.com/tunex/agent/internal/api"
 	"github.com/tunex/agent/internal/control"
+	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/reporter"
@@ -202,6 +203,12 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			// binary really implements, so the panel can refuse to send an action
 			// an older node would only answer with `unsupported_action`.
 			reporter.WithProtocol(control.ProtocolVersion, control.Capabilities()),
+			// V5-WP1: advertise the protocol/transport/runtime facts this process
+			// actually wired up. The facts are computed from what was constructed
+			// above — the LKG cache only claims lkg_restore when the store was
+			// really enabled, and the protocol list comes from the data plane's
+			// own parser table — never from config/env.
+			reporter.WithManifest(runtimeManifest(rt.cache.Enabled())),
 		)
 		go func() {
 			if err := rt.heart.Run(ctx); err != nil {
@@ -261,6 +268,46 @@ func (rt *v3Runtime) writeCache(version string) {
 	rt.cacheMu.Lock()
 	defer rt.cacheMu.Unlock()
 	restore.RefreshCache(rt.cache, rt.cfg.AgentID, rt.tunnels, version)
+}
+
+// runtimeManifest builds the V5-WP1 capability manifest from the subsystems this
+// process actually constructed.
+//
+// Why it takes a fact instead of being a package-level constant: the manifest is
+// a claim about what this binary does. hot_reload and graceful_drain come from
+// the data plane the runtime always builds (forwarder.Forwarder.SetUpstream /
+// Drain), but lkg_restore is only true when the local cache is enabled for this
+// deployment. Advertising it unconditionally would tell the panel a node can
+// survive a panel outage when it cannot.
+//
+// A build error here is a programming error (an unknown name was passed in), so
+// the manifest is omitted rather than guessed: no manifest means the panel falls
+// back to V4 baseline admission, which is safe, whereas a wrong manifest is not.
+func runtimeManifest(lkgEnabled bool) *reporter.CapabilityManifest {
+	runtimeFeatures := []control.RuntimeFeature{control.RuntimeHotReload, control.RuntimeGracefulDrain}
+	if lkgEnabled {
+		runtimeFeatures = append(runtimeFeatures, control.RuntimeLKGRestore)
+	}
+	facts := control.ImplementationFacts{
+		// Derived from the data plane's own parser table: the agent can never
+		// advertise a protocol its own ParseForwardProtocol would reject.
+		Protocols:   forwarder.ImplementedProtocols(),
+		Transports:  forwarder.ImplementedTransports(),
+		Runtime:     runtimeFeatures,
+		Diagnostics: control.DiagnosticsFromActions(control.Capabilities()),
+	}
+	manifest, err := control.BuildManifest(facts)
+	if err != nil {
+		logx.Error("capability manifest build failed", "err", err.Error())
+		return nil
+	}
+	return &reporter.CapabilityManifest{
+		SchemaVersion: manifest.SchemaVersion,
+		Protocols:     manifest.Protocols,
+		Transports:    manifest.Transports,
+		Runtime:       manifest.Runtime,
+		Diagnostics:   manifest.Diagnostics,
+	}
 }
 
 // lkgRefreshInterval is how often the running state is folded back into the

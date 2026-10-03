@@ -61,10 +61,18 @@ import type { ControlValidator } from "./control-protocol/index.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
 import {
+  DEFAULT_FORWARD_PROTOCOL,
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardProtocol,
 } from "./forward-contract.ts";
+import {
+  admitRuntimeFromStore,
+  admissionFailureDetail,
+  type AdmissionTarget,
+  type CapabilityFactsLoader,
+  type RuntimeAdmissionDenied,
+} from "./runtime-admission.ts";
 
 /* ================================================================== */
 /* 常量与状态机                                                        */
@@ -128,6 +136,19 @@ export const SCHEDULER_ERROR_CODES = {
   invalid_target: "invalid_target",
   /** V5-WP0：协议事实存在，但当前 runtime/Gate 未开放，禁止下发。 */
   unsupported_protocol: "unsupported_protocol",
+  /**
+   * V5-WP1：节点**尚未实现**这份配置所需的动作 / 协议 / 传输能力。
+   *
+   * 与 `unsupported_protocol` 刻意分开：那一个是「产品还没开放这个协议」（等版本
+   * 或换协议），这一个是「这台节点还没实现」（升级 Agent 或换一台节点）。两者的
+   * 下一步动作完全不同，压成一个码会把运维引向错误的修复方向。
+   *
+   * 精确原因（`upgrade_required` / `incompatible_agent` /
+   * `malformed_capability_manifest` / `protocol_not_supported` /
+   * `transport_not_supported` / `runtime_feature_not_supported`）随
+   * `apply_error` 的 `[runtime_admission:<reason>:<layer>]` 前缀一起落库。
+   */
+  runtime_capability_denied: "runtime_capability_denied",
 
   /* ── ② bind / acquire（副作用开始产生，失败要补偿）── */
   /** 节点组下没有可用于该方向的 Node（role 不匹配或全部离线）。 */
@@ -355,6 +376,11 @@ export interface SchedulerDeps {
   authorizeGroup?: typeof canUseNodeGroup;
   /** Existing apply/retry/resume only; does not consume a creation count slot. */
   runtimeUse?: RuntimeUseChecker;
+  /**
+   * V5-WP1：读取节点已上报的 v2 协商事实（默认读 `node_state_report`）。
+   * 注入点是**测试**用的，生产路径只有一处实现（services/runtime-admission.ts）。
+   */
+  loadCapabilityFacts?: CapabilityFactsLoader;
   /** 编排时钟（测试注入固定时间，避免 TTL 边界漂移）。 */
   now?: () => Date;
 }
@@ -380,7 +406,40 @@ function resolveDeps(over?: SchedulerDeps) {
     now: over?.now ?? defaultDeps.now,
     validator: over?.validator,
     portPoolDeps: over?.portPoolDeps,
+    loadCapabilityFacts: over?.loadCapabilityFacts,
   };
+}
+
+/**
+ * V5-WP1 runtime admission：**下发前**确认每一台参与节点都实现了
+ * 「这个动作 + 这个协议 + 这个传输」。
+ *
+ * 为什么放在编排层而不是只依赖 Agent 侧的拒绝：
+ *   · Agent 侧拒绝发生在命令**已经入队、端口租约已经产生**之后。RELAY 场景下
+ *     出口可能已经 ACK，于是要跑一遍补偿才回到干净状态——一次本来可以在
+ *     "零副作用"阶段拦下的失败，变成了三条写操作加一次撤隧道。
+ *   · 「节点离线」和「节点不支持」必须能被区分。前者可以重试，后者重试一万
+ *     次也没用，只能升级 Agent 或换节点。
+ *
+ * 判定规则本身**不在这里**（见 services/runtime-admission.ts）：本函数只负责
+ * 取事实、把结构化原因翻译成 scheduler 的错误码空间、并落一条可排障的 detail。
+ */
+async function admitBoundRuntime(
+  deps: ReturnType<typeof resolveDeps>,
+  targets: readonly AdmissionTarget[],
+  protocol: ForwardProtocol,
+): Promise<RuntimeAdmissionDenied | null> {
+  const admitted = await admitRuntimeFromStore(
+    targets,
+    { action: "apply_tunnel", protocol },
+    deps.loadCapabilityFacts,
+  );
+  return admitted.ok ? null : admitted;
+}
+
+/** admission 失败 → `Tunnel.apply_error` 上的结构化记录（不删业务行，§7.11）。 */
+function admissionFailureText(denied: RuntimeAdmissionDenied): string {
+  return admissionFailureDetail(denied);
 }
 
 /* ================================================================== */
@@ -1002,6 +1061,33 @@ export async function createRelayTunnel(
     steps.push({ step: "bind_nodes", ok: true });
   }
 
+  /* ---------------- V5-WP1 runtime admission（下发前，零副作用） ---------------- */
+  //
+  // 位置是有意的：在端口租约产生**之前**、在 placements 落库**之前**。到这里
+  // 两端节点已经确定，因此可以一次判完 ingress + egress；任何一端不满足就直接
+  // 失败，不产生租约、不产生 runtime、不需要补偿。
+  const admissionDenied = await admitBoundRuntime(
+    deps,
+    [
+      { nodeId: ingressPick.node.id, role: "ingress" },
+      { nodeId: egressPick.node.id, role: "egress" },
+    ],
+    protocol,
+  );
+  if (admissionDenied) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied, admissionFailureText(admissionDenied), {
+      tunnelId,
+      meta: {
+        runtime_admission: {
+          node_id: admissionDenied.node_id,
+          node_role: admissionDenied.node_role,
+          layer: admissionDenied.layer,
+          reason: admissionDenied.reason,
+        },
+      },
+    });
+  }
+
   await store.tunnel.update({
     where: { id: tunnelId },
     data: {
@@ -1447,6 +1533,32 @@ export async function reapplyRelayTunnel(
   } else {
     steps.push({ step: "bind_nodes", ok: true });
   }
+  /* V5-WP1：重推走的是同一条 admission——重推不换节点，所以节点换过镜像
+     （升级 / 回退）之后必须重新判一次，而不是沿用上一次的结论。 */
+  const reapplyAdmissionDenied = await admitBoundRuntime(
+    deps,
+    [
+      { nodeId: ingressPick.node.id, role: "ingress" },
+      { nodeId: egressPick.node.id, role: "egress" },
+    ],
+    admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL,
+  );
+  if (reapplyAdmissionDenied) {
+    return fail(
+      "bind_nodes",
+      SCHEDULER_ERROR_CODES.runtime_capability_denied,
+      admissionFailureText(reapplyAdmissionDenied),
+      {
+      meta: {
+        runtime_admission: {
+          node_id: reapplyAdmissionDenied.node_id,
+          node_role: reapplyAdmissionDenied.node_role,
+          layer: reapplyAdmissionDenied.layer,
+          reason: reapplyAdmissionDenied.reason,
+        },
+      },
+    });
+  }
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: ingressPick.node, egress: egressPick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
   await store.tunnel.update({
@@ -1749,6 +1861,29 @@ export async function reapplyDirectTunnel(
 
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: pick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
+
+  /* V5-WP1 runtime admission（DIRECT：只需入口节点满足动作 + 协议 + 传输）。
+     与 unsupported_protocol 同一处理：只写 apply_status/apply_error_code，
+     不动 desired_status —— admission 拒绝不是用户意图改变，「失败保留业务
+     资源」这条铁律在这里体现为不把 desired 改成 inactive。 */
+  const directAdmissionDenied = await admitBoundRuntime(
+    deps,
+    [{ nodeId: pick.node.id, role: "ingress" }],
+    admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL,
+  );
+  if (directAdmissionDenied) {
+    const detail = admissionFailureText(directAdmissionDenied);
+    const code = SCHEDULER_ERROR_CODES.runtime_capability_denied;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        apply_error_code: code,
+        apply_error: detail.slice(0, 500),
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+  }
 
   const reserved = collectReservedPorts(
     (await store.tunnel.findMany({

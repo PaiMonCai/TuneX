@@ -20,7 +20,12 @@ import "sort"
 
 // ProtocolVersion is the control-contract version this agent implements. It is
 // monotone: the panel may require a minimum version before using a new action.
-const ProtocolVersion = 1
+//
+// V5-WP1 moved it to 2: the state report now also carries `capability_manifest`
+// (control/manifest.go). Bumping the version is how an older panel can tell
+// "this agent speaks a contract I only partly understand" without having to
+// parse the manifest first.
+const ProtocolVersion = 2
 
 // Action names on the wire. They are constants so the dispatch switch and the
 // advertised capability list cannot disagree by typo.

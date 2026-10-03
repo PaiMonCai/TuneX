@@ -134,6 +134,24 @@ type StatePayload struct {
 	ControlProtocolVersion int `json:"control_protocol_version,omitempty"`
 	/// Actions this agent actually implements (empty = not configured).
 	Capabilities []string `json:"capabilities,omitempty"`
+	/// V5-WP1 protocol/transport/runtime facts, additive to Capabilities. The
+	/// panel needs it to distinguish "this node can carry this protocol" from
+	/// "this node never told me", without changing the array above.
+	CapabilityManifest *CapabilityManifest `json:"capability_manifest,omitempty"`
+}
+
+// CapabilityManifest is the v2 capability fact set on the wire (V5-WP1).
+//
+// It deliberately mirrors control.Manifest structurally instead of importing
+// it: the reporter must stay free of control-plane packages, and the wire shape
+// is a frozen contract that the panel validates field by field anyway. The
+// conversion lives in one place (control → reporter) at the wiring site.
+type CapabilityManifest struct {
+	SchemaVersion int      `json:"schema_version"`
+	Protocols     []string `json:"protocols"`
+	Transports    []string `json:"transports"`
+	Runtime       []string `json:"runtime"`
+	Diagnostics   []string `json:"diagnostics"`
 }
 
 // HostSample is the on-the-wire resource sample. Field names are explicit about
@@ -217,6 +235,28 @@ func WithProtocol(version int, capabilities []string) Option {
 	}
 }
 
+// WithManifest advertises the V5-WP1 capability manifest (protocols,
+// transports, runtime features, diagnostics).
+//
+// A nil manifest is stored as "not configured" and the field stays off the wire
+// — which the panel reads as the V4 baseline, not as "supports nothing". Passing
+// an empty manifest is different and meaningful: it says this agent implements
+// nothing beyond the protocol-frozen baseline, and the panel will fail closed.
+func WithManifest(manifest *CapabilityManifest) Option {
+	return func(c *Config) {
+		if manifest == nil {
+			c.capabilityManifest = nil
+			return
+		}
+		copied := *manifest
+		copied.Protocols = append([]string(nil), manifest.Protocols...)
+		copied.Transports = append([]string(nil), manifest.Transports...)
+		copied.Runtime = append([]string(nil), manifest.Runtime...)
+		copied.Diagnostics = append([]string(nil), manifest.Diagnostics...)
+		c.capabilityManifest = &copied
+	}
+}
+
 // Reporter periodically reports the node's heartbeat.
 type Reporter struct {
 	cfg Config
@@ -248,6 +288,9 @@ type Config struct {
 	// reporter does not have to import the control package.
 	controlPortocolVersion int
 	capabilities           []string
+	// V5-WP1: the additive v2 manifest. nil = this build does not advertise one,
+	// and the wire field is omitted rather than sent empty.
+	capabilityManifest *CapabilityManifest
 
 	// ── V4-WP6 telemetry sources (all optional) ──
 	//
@@ -390,6 +433,16 @@ func (r *Reporter) StatePayload() StatePayload {
 	}
 	if len(r.cfg.capabilities) > 0 {
 		p.Capabilities = append([]string(nil), r.cfg.capabilities...)
+	}
+	if r.cfg.capabilityManifest != nil {
+		// Copied per payload: a state report must not be able to mutate the
+		// reporter's own manifest (same rule as Capabilities above).
+		m := *r.cfg.capabilityManifest
+		m.Protocols = append([]string(nil), r.cfg.capabilityManifest.Protocols...)
+		m.Transports = append([]string(nil), r.cfg.capabilityManifest.Transports...)
+		m.Runtime = append([]string(nil), r.cfg.capabilityManifest.Runtime...)
+		m.Diagnostics = append([]string(nil), r.cfg.capabilityManifest.Diagnostics...)
+		p.CapabilityManifest = &m
 	}
 	if r.cfg.tunnels != nil {
 		p.Tunnels = r.cfg.tunnels.List()
