@@ -14,10 +14,26 @@ export type ForwardMode = (typeof FORWARD_MODES)[number];
 export const FORWARD_PROTOCOLS = ["tcp"] as const;
 export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
 
-export type ForwardTransportFamily = "stream" | "datagram";
+/**
+ * Enabled transport contracts. Transport is derived from protocol and is NOT a
+ * second user/DB field. Datagram is intentionally absent until its own runtime
+ * abstraction + Gate are opened.
+ */
+export const FORWARD_TRANSPORTS = ["stream"] as const;
+export type ForwardTransport = (typeof FORWARD_TRANSPORTS)[number];
+
+export interface ForwardTransportSpec {
+  readonly lifecycle: "connection";
+}
+
+export const FORWARD_TRANSPORT_SPECS: Readonly<
+  Record<ForwardTransport, ForwardTransportSpec>
+> = {
+  stream: { lifecycle: "connection" },
+};
 
 export interface ForwardProtocolSpec {
-  readonly family: ForwardTransportFamily;
+  readonly transport: ForwardTransport;
   /** Compatibility value written to legacy Tunnel.tunnel_type while it exists. */
   readonly legacy_tunnel_type: string;
 }
@@ -27,8 +43,20 @@ export const DEFAULT_FORWARD_PROTOCOL: ForwardProtocol = "tcp";
 export const FORWARD_PROTOCOL_SPECS: Readonly<
   Record<ForwardProtocol, ForwardProtocolSpec>
 > = {
-  tcp: { family: "stream", legacy_tunnel_type: "tcp" },
+  tcp: { transport: "stream", legacy_tunnel_type: "tcp" },
 };
+
+export function normalizeForwardTransport(
+  value: unknown,
+): ForwardTransport | null {
+  if (
+    typeof value === "string" &&
+    (FORWARD_TRANSPORTS as readonly string[]).includes(value)
+  ) {
+    return value as ForwardTransport;
+  }
+  return null;
+}
 
 export function isForwardMode(value: unknown): value is ForwardMode {
   return (
@@ -102,7 +130,10 @@ export interface ForwardRuntimePlan {
   readonly topology: { readonly mode: ForwardMode };
   readonly protocol: {
     readonly name: ForwardProtocol;
-    readonly family: ForwardTransportFamily;
+  };
+  readonly transport: {
+    readonly name: ForwardTransport;
+    readonly lifecycle: ForwardTransportSpec["lifecycle"];
   };
 }
 
@@ -122,8 +153,16 @@ export function buildForwardRuntimePlan(
   if (!spec) {
     throw new Error("unsupported Forward protocol: " + String(protocol));
   }
+  const transport = normalizeForwardTransport(spec.transport);
+  if (transport === null) {
+    throw new Error("unsupported Forward transport: " + String(spec.transport));
+  }
   return {
     topology: { mode },
-    protocol: { name: protocol, family: spec.family },
+    protocol: { name: protocol },
+    transport: {
+      name: transport,
+      lifecycle: FORWARD_TRANSPORT_SPECS[transport].lifecycle,
+    },
   };
 }

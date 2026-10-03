@@ -9,9 +9,11 @@ import {
   DEFAULT_FORWARD_PROTOCOL,
   FORWARD_MODES,
   FORWARD_PROTOCOLS,
+  FORWARD_TRANSPORTS,
   buildForwardRuntimePlan,
   legacyTunnelTypeForForwardProtocol,
   normalizeForwardProtocol,
+  normalizeForwardTransport,
   persistedForwardProtocol,
   protocolFactName,
 } from "../forward-contract.ts";
@@ -20,14 +22,23 @@ describe("V5-WP0 Forward protocol contract", () => {
   test("mode and protocol are orthogonal dimensions", () => {
     expect(FORWARD_MODES).toEqual(["direct", "relay"]);
     expect(FORWARD_PROTOCOLS).toEqual(["tcp"]);
+    expect(FORWARD_TRANSPORTS).toEqual(["stream"]);
     expect(buildForwardRuntimePlan("direct", "tcp")).toEqual({
       topology: { mode: "direct" },
-      protocol: { name: "tcp", family: "stream" },
+      protocol: { name: "tcp" },
+      transport: { name: "stream", lifecycle: "connection" },
     });
     expect(buildForwardRuntimePlan("relay", "tcp")).toEqual({
       topology: { mode: "relay" },
-      protocol: { name: "tcp", family: "stream" },
+      protocol: { name: "tcp" },
+      transport: { name: "stream", lifecycle: "connection" },
     });
+  });
+
+  test("transport is derived and unknown transport fails closed", () => {
+    expect(normalizeForwardTransport("stream")).toBe("stream");
+    expect(normalizeForwardTransport("datagram")).toBeNull();
+    expect(normalizeForwardTransport("carrier-pigeon")).toBeNull();
   });
 
   test("V4 omission remains TCP-compatible", () => {
