@@ -1561,7 +1561,41 @@ client → ingress → egress → target
 
 ## 6.3 V5.1c — QUIC
 
-QUIC 只有 UDP Gate 全绿后开始。
+> **状态：契约已冻结（WP5-C0，2026-10-04），实现被架构决策阻塞。**
+> 完整草案见 [`docs/v5-1c-quic-contract-draft.md`](docs/v5-1c-quic-contract-draft.md)。
+>
+> **§6.3 漏写的实现前置（最重要的事实）**：**Go 标准库没有 QUIC**。V5.1a/V5.1b 的七个
+> 问题全落在「标准库能做什么」之内，所以契约写完就能开工；QUIC 不是 —— 一个真实前端
+> 需要数据面的**第一份第三方依赖**，而「数据面零第三方依赖」（`agent/go.mod` 明文声明、
+> README 反复声明、CI 离线构建依赖它）是一条**架构属性**，不是随手可改的实现细节。
+>
+> 已实测的代价（不选，只定价）：
+>
+> | 选项 | 代价 |
+> |---|---|
+> | 引入 quic-go | **13 个模块**（8 直接 + 5 间接），要求 `go 1.26.0` → 必须同时改 `agent/go.mod`(1.22)、`agent/Dockerfile`、CI 的 go-version；**离线构建消失** |
+> | vendor 进仓库 | 保住离线构建，依赖图不变，仓库进数 MB 第三方源码，工具链三件套照样要动 |
+> | 契约层关闭（只交付契约） | 零依赖属性一件不改，**唯一不需要改既有 Gate 的选项**；代价是 V5.1c 零能力 |
+> | 推迟 | 与上一项的差别只是意图与重开条件；注意 `golang.org/x/net/quic` 自称 *not ready for production usage* 且不受 Go 安全策略覆盖，stdlib 方向**不是就绪的后路** |
+> | 用 `crypto/tls.QUICConn` 自研 | 零依赖、不动工具链；代价是手写 RFC 9000/9001/9002 胶水，互操作成为主要风险 |
+>
+> **决定权在产品/架构，不在实现者**。因此 **V5.1c 标记为「阻塞：待依赖决策」，
+> Gate V5-G1C 同样是阻塞项而不是待办 —— 没有端点就没有可断言的东西**。
+> 不假装完成，也不为了「有进度」而选一条悄悄改掉架构属性的路。
+>
+> **§6.3 七问之外还缺两问（已补进草案 §7，冻结前必须回答）**：
+> (a) QUIC 落在哪个 transport 槽 —— `stream` 与 `datagram` 都装不下它的工作单位
+> （一条连接承载 N 条 stream），要么新增第三个 transport，要么把 `stream` 的定义改含糊，
+> 而后者会让 `Drain`/在途口径/`SetUpstream` 同时变模糊；
+> (b) QUIC 的 **ALPN** 取值（本仓库首次出现 ALPN 概念，`buildTLSStream` 今天只设 `MinVersion`）。
+>
+> **协议投影零迁移**：`quic` 已在 DB enum、wire 词汇表与 web 类型里；只缺 entitlement
+> （`platform_ceiling` 不含 quic），否则协议开了也没人能创建 —— 与 V5.1b 同一教训。
+>
+> **翻转面比 UDP 大**：开 QUIC 要同批改 G0.5/G0.7 + 5 个 backend 测试 + 3 个 agent 测试
+> + web 的「未开放协议」渲染/复制断言。
+
+QUIC 只有 UDP Gate 全绿后开始（**该条件已满足：G1B = 76/0**；现在的阻塞是上面的依赖决策）。
 
 ### 强制先冻结
 
@@ -2268,19 +2302,22 @@ Known Boundaries:
 
 # 17. 当前下一步
 
-当前唯一正确顺序：
-
 ~~~text
-1. Review + merge feature/v5-wp0-contract
-2. Start V5-WP1 Capability Negotiation v2
-3. Complete WP1 tests
-4. Start V5-WP2 Runtime Abstraction
-5. Freeze V5-WP3 performance baseline
-6. Build and pass V5-G0
-7. Only then enter V5.1 protocol expansion
+已完成：V5.0（G0=137/0）→ V5.1a WS/TLS（G1A=73/0）→ V5.1b B1 UDP DIRECT（G1B=76/0）
+进行中：V5.2 Target Intelligence —— 契约已冻结（§7），WP5 观测 / WP6 合成在实现
+阻塞中：V5.1b B2 UDP RELAY（跨节点跳形态待产品决策，当前语义是"必须被拒绝"）
+        V5.1c QUIC（待依赖决策：引入库 / vendor / 契约层关闭 / 推迟，见 §6.3）
+待开始：V5.2 WP7 + Gate G2 → V5.3 WP8/WP9/WP10 + G3 → V5.4 WP11/WP12/WP13 + G4
+        → V5.5 WP14/WP15/WP16 + G5
+
+下一阶段的可执行顺序：
+1. 落地 V5.2 WP5（agent 观测 + 面板投影）与 WP6（纯合成 + 集中阈值）并各自提交
+2. 写 WP5/WP6 稳定 Gate；通过后进入 WP7（熔断 + 健康感知 LB）
+3. 跑 Gate V5-G2（含"desired 列表永不被遥测改写"）
+4. V5.3 先冻结 fencing 契约（split brain 是最高风险项），再动代码
 ~~~
 
-**禁止直接开始 UDP / QUIC。**
+**禁止跳过 Gate、禁止用 skip 掩盖、禁止为了赶进度删 V4 Integration Gate。**
 
 **禁止在 WP0 未进 main 时另写第二份 protocol contract。**
 
