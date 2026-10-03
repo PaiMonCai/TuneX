@@ -52,7 +52,6 @@ func directCfg(id string, port int, upstream string, revision int64) forwarder.T
 	return cfg
 }
 
-
 // portFreedWithin waits until the manager's port guard no longer reserves port.
 // The reservation release is sequenced after the old forwarder has stopped, so a
 // read immediately after the move is racy by design; what must hold is that the
@@ -377,7 +376,6 @@ func TestReplaceListenerAdoptsDirectRelaySiblingOnSamePort(t *testing.T) {
 		t.Fatalf("direct target after reverse = %q, want srv:a", got)
 	}
 }
-
 
 // TestReplaceListenerOldPortGuardFollowsTheOldListener is the guard window the
 // review flagged: the old port's reservation used to be dropped BEFORE the old

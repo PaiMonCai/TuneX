@@ -33,7 +33,7 @@
  * `defaultRolloutResumeDeps` 同口径）。
  */
 import type { Orchestrator, OrchestratorNode } from "./orchestrator.ts";
-import { admitPersistedProtocol } from "./forward-contract.ts";
+import { dispatchFactsFromRow, persistedForwardProtocol } from "./forward-contract.ts";
 import type { ReconcileSink } from "./reconciler.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
@@ -69,6 +69,9 @@ export interface SinkTunnel {
    * a V4 "protocol omitted" payload).
    */
   forward_protocol?: string | null;
+  /** V5-WP5-A1: the tls front's paths travel with the row, like the protocol. */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   desired_status: string | null;
   config_revision: number | null;
   applied_revision: number | null;
@@ -239,7 +242,10 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
           user_id: tunnel.user_id,
           in_node_group_id: tunnel.ingress_node!.node_group_id,
           out_node_group_id: tunnel.tunnel_mode === "relay" ? tunnel.egress_node!.node_group_id : null,
-          tunnel_type: tunnel.tunnel_type ?? "tcp",
+          // The canonical fact, not the legacy column: a ws row's legacy column
+          // defaults to 'wss', and the policy would refuse the Forward's own
+          // protocol (V5-G1A.7).
+          protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
         });
     if (denied) {
       await ledger.markBlocked?.({ tunnelId: tunnel.id, revision, denied });
@@ -274,13 +280,15 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         // non-TCP Forward (wss/udp/...) would be replayed as TCP here — the
         // orchestrator defaults an absent protocol to tcp — and the panel would
         // report a successful reconcile of a Forward it must not run.
-        const protocol = admitPersistedProtocol({
+        const facts = dispatchFactsFromRow({
           forward_protocol: tunnel.forward_protocol,
           tunnel_type: tunnel.tunnel_type,
+          tls_cert_path: tunnel.tls_cert_path,
+          tls_key_path: tunnel.tls_key_path,
         });
-        if (protocol === null) {
+        if (facts === null) {
           throw new Error(
-            `tunnel ${tunnel_id} uses a protocol the current runtime has not opened; refusing to replay it`,
+            `tunnel ${tunnel_id} uses a protocol the current runtime has not opened (or is missing its required configuration); refusing to replay it`,
           );
         }
         await assertRuntimeUse(tunnel, revision);
@@ -292,7 +300,9 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
           remoteHost: tunnel.remote_host,
           remotePort: tunnel.remote_port,
           listenHost: tunnel.listen_ip,
-          protocol,
+          protocol: facts.protocol,
+          tlsCertPath: facts.tlsCertPath,
+          tlsKeyPath: facts.tlsKeyPath,
         });
         if (!r.ok) throw new Error(r.error);
         // ACK 已确认这个 revision 在 Agent 上生效 ⇒ 记账（见文件头「缺陷 1」）。
@@ -313,13 +323,15 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
 
       // Same rule as the DIRECT branch above: the replay carries the persisted
       // protocol, so a historical non-TCP Forward cannot be reconciled as TCP.
-      const relayProtocol = admitPersistedProtocol({
+      const relayFacts = dispatchFactsFromRow({
         forward_protocol: tunnel.forward_protocol,
         tunnel_type: tunnel.tunnel_type,
+        tls_cert_path: tunnel.tls_cert_path,
+        tls_key_path: tunnel.tls_key_path,
       });
-      if (relayProtocol === null) {
+      if (relayFacts === null) {
         throw new Error(
-          `tunnel ${tunnel_id} uses a protocol the current runtime has not opened; refusing to replay it`,
+          `tunnel ${tunnel_id} uses a protocol the current runtime has not opened (or is missing its required configuration); refusing to replay it`,
         );
       }
       await assertRuntimeUse(tunnel, revision);
@@ -331,7 +343,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         poolId: tunnel.egress_pool_id,
         targets,
         lbStrategy: tunnel.egress_pool?.lb_strategy ?? tunnel.egress_node.lb_strategy,
-        protocol: relayProtocol,
+        protocol: relayFacts.protocol,
       });
       if (!egress.ok) throw new Error(egress.error);
 
@@ -345,7 +357,9 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         ingressNode: tunnel.ingress_node,
         ingressPort: tunnel.listen_port,
         nextHop: nextHop(host, tunnel.egress_port),
-        protocol: relayProtocol,
+        protocol: relayFacts.protocol,
+        tlsCertPath: relayFacts.tlsCertPath,
+        tlsKeyPath: relayFacts.tlsKeyPath,
       });
       if (!ingress.ok) throw new Error(ingress.error);
 

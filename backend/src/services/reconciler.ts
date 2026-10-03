@@ -116,6 +116,9 @@ export interface DesiredTunnel {
    */
   forward_protocol?: string | null;
   tunnel_type?: string | null;
+  /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 /** Agent 快照里的单条隧道（对齐 services/node-state.ts 的 ReportedTunnel）。 */
@@ -616,6 +619,11 @@ export function defaultReconcileDeps(): ReconcileDeps {
           // old default would have replayed a historical non-TCP Forward as TCP.
           forward_protocol: true,
           tunnel_type: true,
+          // V5-WP5-A1/A2: the tls front's paths travel with the row, so a resend
+          // can dispatch the same configuration the create did. Without them a
+          // tls Forward would be resendable but un-dispatchable.
+          tls_cert_path: true,
+          tls_key_path: true,
           tunnel_mode: true,
           desired_status: true,
           config_revision: true,

@@ -52,7 +52,11 @@ import { acquirePort, releaseLease } from "./portPool.ts";
 import type { AcquirePortOutcome } from "./portPool.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { ACTIVE_ROLLOUT_PHASES, planRollout, ROLLOUT_STAGE_SEQUENCE, rolloutStepKey } from "./forward-rollout.ts";
-import { admitPersistedProtocol, type ForwardProtocol } from "./forward-contract.ts";
+import {
+  dispatchFactsFromRow,
+  persistedForwardProtocol,
+  type DispatchFacts,
+} from "./forward-contract.ts";
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
 
@@ -550,7 +554,12 @@ async function rolloutRuntimeDenial(
       ? deps.db.node.findUnique({ where: { id: desired.egress_node_id }, select: { node_group_id: true } })
       : null,
   ]);
-  const tunnel = rawTunnel as { workspace_id?: number; user_id?: number; tunnel_type?: string } | null;
+  const tunnel = rawTunnel as {
+    workspace_id?: number;
+    user_id?: number;
+    forward_protocol?: unknown;
+    tunnel_type?: string;
+  } | null;
   const ingress = rawIngress as { node_group_id?: number } | null;
   const egress = rawEgress as { node_group_id?: number } | null;
   const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
@@ -563,7 +572,10 @@ async function rolloutRuntimeDenial(
     user_id: tunnel.user_id,
     in_node_group_id: ingress.node_group_id,
     out_node_group_id: desired.mode === "relay" ? egress!.node_group_id! : null,
-    tunnel_type: tunnel.tunnel_type ?? "tcp",
+    // The canonical FACT, legacy column only as a fallback. Feeding the legacy
+    // column straight in made the policy refuse a ws Forward (its column defaults
+    // to 'wss') — V5-G1A.7.
+    protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
   });
 }
 
@@ -666,12 +678,12 @@ async function runStep(
         return { ok: false, error_code: "invariant_violated", error: "prepare_egress 无法解析出口端口" };
       }
       const targets = ctx.desired.egress_targets ?? [];
-      const egressProtocol = await persistedProtocolFor(ctx.tunnelId, deps.db);
-      if (egressProtocol === null) {
+      const egressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (egressFacts === null) {
         return {
           ok: false,
           error_code: "unsupported_protocol",
-          error: "该转发使用的协议尚未进入当前 runtime 白名单，拒绝下发出口",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝下发出口",
         };
       }
       const outcome = await orchestrator.dispatchEgress({
@@ -681,7 +693,9 @@ async function runStep(
         egressPort,
         poolId: ctx.desired.egress_pool_id,
         targets: targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order_by })),
-        protocol: egressProtocol,
+        protocol: egressFacts.protocol,
+        tlsCertPath: egressFacts.tlsCertPath,
+        tlsKeyPath: egressFacts.tlsKeyPath,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -712,12 +726,12 @@ async function runStep(
         return { ok: false, error_code: "invariant_violated", error: "cutover_egress 无法解析出口端口" };
       }
       const targets = ctx.desired.egress_targets ?? [];
-      const egressProtocol = await persistedProtocolFor(ctx.tunnelId, deps.db);
-      if (egressProtocol === null) {
+      const egressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (egressFacts === null) {
         return {
           ok: false,
           error_code: "unsupported_protocol",
-          error: "该转发使用的协议尚未进入当前 runtime 白名单，拒绝下发出口",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝下发出口",
         };
       }
       const outcome = await orchestrator.dispatchEgress({
@@ -727,7 +741,9 @@ async function runStep(
         egressPort,
         poolId: ctx.desired.egress_pool_id,
         targets: targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order_by })),
-        protocol: egressProtocol,
+        protocol: egressFacts.protocol,
+        tlsCertPath: egressFacts.tlsCertPath,
+        tlsKeyPath: egressFacts.tlsKeyPath,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -760,12 +776,12 @@ async function runStep(
         // V5-WP4/G0: a cutover issues a real command, so it carries the
         // Forward's persisted protocol instead of letting the orchestrator
         // default an absent one to tcp.
-        const ingressProtocol = await persistedProtocolFor(ctx.tunnelId, deps.db);
-        if (ingressProtocol === null) {
+        const ingressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+        if (ingressFacts === null) {
           return {
             ok: false,
             error_code: "unsupported_protocol",
-            error: "该转发使用的协议尚未进入当前 runtime 白名单，拒绝切换",
+            error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝切换",
           };
         }
         const outcome = await orchestrator.dispatchIngress({
@@ -774,7 +790,9 @@ async function runStep(
           ingressNode: nodeFor(orchestrator, ingressNodeId),
           ingressPort: port,
           nextHop,
-          protocol: ingressProtocol,
+          protocol: ingressFacts.protocol,
+          tlsCertPath: ingressFacts.tlsCertPath,
+          tlsKeyPath: ingressFacts.tlsKeyPath,
         });
         if (!outcome.ok) {
           return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -786,12 +804,12 @@ async function runStep(
       if (!ctx.desired.target_host || !ctx.desired.target_port) {
         return { ok: false, error_code: "invalid_target", error: "DIRECT cutover 缺少目标" };
       }
-      const directProtocol = await persistedProtocolFor(ctx.tunnelId, deps.db);
-      if (directProtocol === null) {
+      const directFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (directFacts === null) {
         return {
           ok: false,
           error_code: "unsupported_protocol",
-          error: "该转发使用的协议尚未进入当前 runtime 白名单，拒绝切换",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝切换",
         };
       }
       const outcome = await orchestrator.dispatchDirect({
@@ -802,7 +820,9 @@ async function runStep(
         remoteHost: ctx.desired.target_host,
         remotePort: ctx.desired.target_port,
         listenHost: ctx.desired.listen_ip,
-        protocol: directProtocol,
+        protocol: directFacts.protocol,
+        tlsCertPath: directFacts.tlsCertPath,
+        tlsKeyPath: directFacts.tlsKeyPath,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -968,10 +988,20 @@ async function runStep(
  * a historical non-TCP Forward would otherwise be "cut over" as TCP. `null` means
  * the fact is not runnable, and the step refuses instead of dispatching.
  */
-async function persistedProtocolFor(
+/**
+ * The dispatch facts of an existing Forward: protocol + whatever that protocol
+ * needs (today: the tls certificate paths).
+ *
+ * Reading them together is the point. G1A found this the hard way: after `tls`
+ * arrived, this function returned only the protocol, so every hot reload of a
+ * tls Forward failed at `Orchestrator.tlsFields` ("missing certificate paths")
+ * while create and restore worked — a dispatch path that knew the protocol but
+ * not its required configuration.
+ */
+async function dispatchFactsFor(
   tunnelId: number,
   store: RolloutDeps["db"],
-): Promise<ForwardProtocol | null> {
+): Promise<DispatchFacts | null> {
   // Read through the INJECTED store, never the process-wide singleton: this
   // module is exercised offline with a stub, and reaching for `db` directly made
   // every rollout test fail with "db.tunnel.findUnique is not a function".
@@ -982,9 +1012,19 @@ async function persistedProtocolFor(
   if (!findUnique) return null;
   const row = (await findUnique({
     where: { id: tunnelId },
-    select: { forward_protocol: true, tunnel_type: true },
-  })) as { forward_protocol?: unknown; tunnel_type?: unknown } | null;
-  return row ? admitPersistedProtocol(row) : null;
+    select: {
+      forward_protocol: true,
+      tunnel_type: true,
+      tls_cert_path: true,
+      tls_key_path: true,
+    },
+  })) as {
+    forward_protocol?: unknown;
+    tunnel_type?: unknown;
+    tls_cert_path?: unknown;
+    tls_key_path?: unknown;
+  } | null;
+  return row ? dispatchFactsFromRow(row) : null;
 }
 
 function nodeFor(orchestrator: Orchestrator, nodeId: number): Parameters<Orchestrator["removeTunnel"]>[0]["node"] {
@@ -1149,8 +1189,8 @@ export async function compensateRollout(
           const targets = Array.isArray(baseline.targets)
             ? (baseline.targets as Array<{ host: string; port: number; weight?: number; order_by?: number }>)
             : [];
-          const replayEgressProtocol = await persistedProtocolFor(row.tunnel_id, deps.db);
-          if (replayEgressProtocol === null) {
+          const replayEgressFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+          if (replayEgressFacts === null) {
             errors.push(`replay egress: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
           } else {
           const egress = await orchestrator.dispatchEgress({
@@ -1165,7 +1205,9 @@ export async function compensateRollout(
               weight: t.weight ?? 1,
               order_by: t.order_by ?? (i + 1) * 10,
             })),
-            protocol: replayEgressProtocol,
+            protocol: replayEgressFacts.protocol,
+            tlsCertPath: replayEgressFacts.tlsCertPath,
+            tlsKeyPath: replayEgressFacts.tlsKeyPath,
           });
           if (!egress.ok) {
             errors.push(`replay egress: ${egress.error}`);
@@ -1177,8 +1219,10 @@ export async function compensateRollout(
               ingressNode: nodeFor(orchestrator, ingressNodeId),
               ingressPort: listenPort,
               nextHop: `${host}:${egressPort}`,
-              // The same fact the egress leg just used: one Forward, one protocol.
-              protocol: replayEgressProtocol,
+              // The same facts the egress leg just used: one Forward, one protocol.
+              protocol: replayEgressFacts.protocol,
+              tlsCertPath: replayEgressFacts.tlsCertPath,
+              tlsKeyPath: replayEgressFacts.tlsKeyPath,
             });
             if (!ingress.ok) errors.push(`replay ingress: ${ingress.error}`);
           }
@@ -1193,8 +1237,8 @@ export async function compensateRollout(
           // NOTE: `row` here is the ROLLOUT row; the protocol fact lives on the
           // TUNNEL row. Reading it off the rollout row would always look like "no
           // fact at all" and refuse every replay.
-          const replayProtocol = await persistedProtocolFor(row.tunnel_id, deps.db);
-          if (replayProtocol === null) {
+          const replayDirectFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+          if (replayDirectFacts === null) {
             errors.push(`replay direct: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
           } else {
             const ingress = await orchestrator.dispatchDirect({
@@ -1205,7 +1249,9 @@ export async function compensateRollout(
               remoteHost: targetHost,
               remotePort: targetPort,
               listenHost: (baseline.listen_ip as string | null) ?? null,
-              protocol: replayProtocol,
+              protocol: replayDirectFacts.protocol,
+              tlsCertPath: replayDirectFacts.tlsCertPath,
+              tlsKeyPath: replayDirectFacts.tlsKeyPath,
             });
             if (!ingress.ok) errors.push(`replay direct: ${ingress.error}`);
           }

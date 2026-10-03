@@ -3,6 +3,8 @@ package reporter
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/tunex/agent/internal/forwarder"
 )
 
 // V5-WP1: the state report carries the additive v2 capability manifest.
@@ -107,4 +109,80 @@ func TestWithManifestCopiesLists(t *testing.T) {
 	if got := r.StatePayload().CapabilityManifest.Protocols[0]; got != "tcp" {
 		t.Fatalf("a payload must not mutate the reporter's manifest, got %q", got)
 	}
+}
+
+// V5-WP5-A3: per-tunnel protocol diagnostics ride the state report.
+//
+// Two properties matter: the config shape stays byte-compatible for an older
+// panel (the config is embedded), and "this protocol has no facts" stays
+// distinguishable from "all counters are zero".
+
+type fakeDiagLister map[string]forwarder.ProtocolDiagnostics
+
+func (f fakeDiagLister) DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagnostics { return f }
+
+func TestProtocolDiagnosticsRideTheReport(t *testing.T) {
+	lister := fakeDiagLister{
+		"tunex-1-direct": {
+			Protocol:          "tls",
+			CertSubject:       "CN=site.example",
+			CertNotAfter:      1893456000,
+			CertRotations:     1,
+			HandshakeFailures: 3,
+		},
+	}
+	r := New(
+		Config{PanelURL: "http://panel.invalid", NodeID: "n1"},
+		WithTunnels(diagTunnelLister{}),
+		WithDiagnostics(lister),
+	)
+	raw, err := json.Marshal(r.reportedTunnels())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("want one reported tunnel, got %d", len(decoded))
+	}
+	// The config fields are INLINED: an older panel reads exactly what it did.
+	if decoded[0]["id"] != "tunex-1-direct" || decoded[0]["mode"] != "DIRECT" {
+		t.Fatalf("the config must stay inlined on the wire, got %v", decoded[0])
+	}
+	diag, ok := decoded[0]["diag"].(map[string]any)
+	if !ok {
+		t.Fatalf("diag missing from the report: %v", decoded[0])
+	}
+	if diag["protocol"] != "tls" || diag["cert_subject"] != "CN=site.example" {
+		t.Fatalf("diag shape wrong: %v", diag)
+	}
+	if diag["handshake_failures"] != float64(3) {
+		t.Fatalf("counters must travel: %v", diag)
+	}
+}
+
+// A tunnel whose protocol has no diagnostics carries NO `diag` key at all.
+func TestTunnelsWithoutDiagnosticsCarryNoDiagField(t *testing.T) {
+	r := New(
+		Config{PanelURL: "http://panel.invalid", NodeID: "n1"},
+		WithTunnels(diagTunnelLister{}),
+		WithDiagnostics(fakeDiagLister{}),
+	)
+	raw, _ := json.Marshal(r.reportedTunnels())
+	var decoded []map[string]any
+	_ = json.Unmarshal(raw, &decoded)
+	if _, present := decoded[0]["diag"]; present {
+		t.Fatalf("a tunnel with no protocol facts must omit diag, got %v", decoded[0]["diag"])
+	}
+}
+
+type diagTunnelLister struct{}
+
+func (diagTunnelLister) List() []forwarder.TunnelConfig {
+	return []forwarder.TunnelConfig{{
+		ID: "tunex-1-direct", Mode: forwarder.ModeDirect, IngressPort: 21000,
+		RemoteHost: "target", RemotePort: 3030, Protocol: forwarder.ProtocolTLS, Revision: 1,
+	}}
 }

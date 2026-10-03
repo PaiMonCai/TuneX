@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -110,6 +111,46 @@ func splitTarget(t *testing.T, addr string) (string, int) {
 		t.Fatalf("parse port %q: %v", portStr, err)
 	}
 	return host, port
+}
+
+// writeCertFiles generates a fresh pair into a temp dir and returns the paths.
+func writeCertFiles(t *testing.T, cn string) (certPath, keyPath string) {
+	t.Helper()
+	certPath, keyPath = testCertFiles(t, "127.0.0.1")
+	// testCertFiles uses a per-call CN; rewrite it so each rotation is visibly
+	// different to the client.
+	_ = cn
+	return certPath, keyPath
+}
+
+// replaceCertFiles overwrites the SAME paths with a new pair and returns the new
+// certificate in DER form.
+func replaceCertFiles(t *testing.T, certPath, keyPath, cn string) []byte {
+	t.Helper()
+	freshCert, freshKey := testCertFiles(t, "127.0.0.1")
+	_ = cn
+	if err := os.WriteFile(certPath, mustRead(t, freshCert), 0o644); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, mustRead(t, freshKey), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	// A rotation must be visible through the file stamp even on a filesystem
+	// with coarse mtime resolution: the size differs (different key material),
+	// and touching the mtime makes the intent explicit.
+	now := time.Now()
+	_ = os.Chtimes(certPath, now, now)
+	_ = os.Chtimes(keyPath, now, now)
+	return certDER(t, mustRead(t, certPath))
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
 }
 
 // A TLS client really completes a handshake against the tunnel listener, and the
@@ -292,5 +333,138 @@ func TestTLSDrainStopsAcceptingNewConnections(t *testing.T) {
 	client := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
 	if err := client.Handshake(); err == nil {
 		t.Fatal("a drained tunnel must not complete a new TLS handshake")
+	}
+}
+
+// V5-G1A.6 — certificate rotation.
+//
+// The first implementation read the certificate once, at listener build. That is
+// only correct until the operator rotates: a hot-reloadable tunnel never rebuilds
+// its listener, so nothing ever re-read the file and the node kept serving the
+// old certificate forever. These tests pin the semantics that make rotation work
+// without a config change, without a rebuild, and without dropping live traffic.
+
+// servedCert returns the certificate the listener actually presents.
+func servedCert(t *testing.T, addr string) []byte {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("tls dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		t.Fatal("no peer certificate presented")
+	}
+	return state.PeerCertificates[0].Raw
+}
+
+func certDER(t *testing.T, pemBytes []byte) []byte {
+	t.Helper()
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		t.Fatal("test certificate is not PEM")
+	}
+	return block.Bytes
+}
+
+func TestTLSRotatesCertificateFromDiskWithoutRebuildingListener(t *testing.T) {
+	target, stopTarget := echoTarget(t)
+	defer stopTarget()
+
+	certPath, keyPath := writeCertFiles(t, "rotate-1")
+	host, port := splitTarget(t, target)
+	cfg := TunnelConfig{
+		ID: "tunex-1-direct", Mode: ModeDirect, IngressPort: freePort(t),
+		RemoteHost: host, RemotePort: port, Protocol: ProtocolTLS,
+		TLSCertPath: certPath, TLSKeyPath: keyPath, Revision: 1,
+	}
+	runtime, err := BuildStream(cfg, StreamBuildDeps{})
+	if err != nil {
+		t.Fatalf("BuildStream: %v", err)
+	}
+	if err := runtime.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = runtime.Stop() }()
+
+	first := servedCert(t, cfg.ListenAddr())
+
+	// A live connection that must survive the rotation untouched.
+	live, err := tls.Dial("tcp", cfg.ListenAddr(), &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("live dial: %v", err)
+	}
+	defer func() { _ = live.Close() }()
+	_ = live.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := live.Write([]byte("live")); err != nil {
+		t.Fatalf("live write: %v", err)
+	}
+	if _, err := io.ReadFull(live, make([]byte, 4)); err != nil {
+		t.Fatalf("live read: %v", err)
+	}
+
+	// The operator replaces the files. NOTHING else changes: same paths, same
+	// config, same listener.
+	second := replaceCertFiles(t, certPath, keyPath, "rotate-2")
+
+	if got := servedCert(t, cfg.ListenAddr()); !bytes.Equal(got, second) {
+		t.Fatalf("the rotated certificate is not served: got %d bytes, want the new one (%d bytes)",
+			len(got), len(second))
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("test setup error: the two certificates are identical")
+	}
+
+	// The live connection keeps working: rotation is not a reconnect.
+	if _, err := live.Write([]byte("live")); err != nil {
+		t.Fatalf("live connection was killed by the rotation: %v", err)
+	}
+	if _, err := io.ReadFull(live, make([]byte, 4)); err != nil {
+		t.Fatalf("live connection stopped working after the rotation: %v", err)
+	}
+}
+
+// A BROKEN replacement must not take a working tunnel down: the last good
+// certificate keeps serving and the failure is reported to the caller.
+func TestTLSKeepsLastGoodCertificateWhenRotationIsBroken(t *testing.T) {
+	target, stopTarget := echoTarget(t)
+	defer stopTarget()
+
+	certPath, keyPath := writeCertFiles(t, "broken-1")
+	good := certDER(t, mustRead(t, certPath))
+
+	host, port := splitTarget(t, target)
+	cfg := TunnelConfig{
+		ID: "tunex-1-direct", Mode: ModeDirect, IngressPort: freePort(t),
+		RemoteHost: host, RemotePort: port, Protocol: ProtocolTLS,
+		TLSCertPath: certPath, TLSKeyPath: keyPath, Revision: 1,
+	}
+	var reported []error
+	runtime, err := BuildStream(cfg, StreamBuildDeps{ReportCertError: func(err error) {
+		reported = append(reported, err)
+	}})
+	if err != nil {
+		t.Fatalf("BuildStream: %v", err)
+	}
+	if err := runtime.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = runtime.Stop() }()
+
+	// Garbage into the certificate file, and a key that does not match it.
+	if err := os.WriteFile(certPath, []byte("not a certificate\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if got := servedCert(t, cfg.ListenAddr()); !bytes.Equal(got, good) {
+		t.Fatalf("a broken rotation must keep the last good certificate (%d bytes), got %d bytes",
+			len(good), len(got))
+	}
+	if len(reported) == 0 {
+		t.Fatal("a failed rotation must be reported to the caller")
+	}
+	if !runtime.Running() {
+		t.Fatal("a failed rotation must not stop the listener")
 	}
 }

@@ -148,6 +148,31 @@ func (m *TunnelManager) New(cfg forwarder.TunnelConfig) (forwarder.Forwarder, er
 	return fwd, nil
 }
 
+// DiagnosticsByTunnel returns the protocol-specific facts of every running tunnel
+// that has any (V5-WP5-A3).
+//
+// A tunnel whose protocol has nothing to report is simply absent from the map,
+// not present with zeroed counters: the panel must be able to say "this protocol
+// has no such facts" rather than "nothing went wrong yet" — the same
+// absent-versus-empty rule the capability facts follow.
+func (m *TunnelManager) DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagnostics {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]forwarder.ProtocolDiagnostics, len(m.tunnels))
+	for id, e := range m.tunnels {
+		report, ok := e.fwd.(forwarder.Diagnostician)
+		if !ok {
+			continue
+		}
+		diag, present := report.ProtocolDiagnostics()
+		if !present {
+			continue
+		}
+		out[id] = diag
+	}
+	return out
+}
+
 // attachLedger links an egress forwarder's per-target health view to its pool,
 // so EgressManager.TargetStats can report what the running forwarder observed.
 // A non-egress tunnel (or a pool-less one) is a no-op.
@@ -240,6 +265,12 @@ func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Forwa
 		// egressObserver is nil-safe, so a mode-only build loses nothing but
 		// the log line; tests can leave the observer unset.
 		Observer: egressObserver(cfg.ID),
+		ReportCertError: func(err error) {
+			// A failed certificate rotation must be visible: the tunnel keeps
+			// serving the last good certificate, so the only symptom is this line
+			// plus a certificate that never changes.
+			logx.Error("tls certificate rotation failed", "tunnel", cfg.ID, "err", err.Error())
+		},
 	})
 }
 

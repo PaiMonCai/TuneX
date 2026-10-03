@@ -68,13 +68,13 @@ var ErrAlreadyRunning = errors.New("reporter: already running")
 // Payload is the heartbeat body. Field names match the panel's Node model so
 // the backend can deserialise it directly.
 type Payload struct {
-	AgentID     string                   `json:"agent_id,omitempty"`
-	NodeID      string                   `json:"node_id"`
-	Version     string                   `json:"version"`
-	Role        string                   `json:"role"`
-	Timestamp   int64                    `json:"timestamp"`
-	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
-	EgressPools map[string]EgressPool    `json:"egress_pools,omitempty"`
+	AgentID     string                `json:"agent_id,omitempty"`
+	NodeID      string                `json:"node_id"`
+	Version     string                `json:"version"`
+	Role        string                `json:"role"`
+	Timestamp   int64                 `json:"timestamp"`
+	Tunnels     []ReportedTunnel      `json:"tunnels,omitempty"`
+	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
 }
 
 // StatePayload is the WP7 state-report body (POST /api/internal/node/state).
@@ -84,12 +84,12 @@ type Payload struct {
 // makes a reconnect snapshot possible (devmap §5.5 "节点重启 → 拉取 ACTIVE 隧道"
 // mirrored on the panel side). Shape is owned by services/node-state.ts.
 type StatePayload struct {
-	AgentID     string                   `json:"agent_id,omitempty"`
-	Version     string                   `json:"version,omitempty"`
-	Role        string                   `json:"role,omitempty"`
-	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
-	EgressPools map[string]EgressPool    `json:"egress_pools,omitempty"`
-	UsedPorts   []int                    `json:"used_ports,omitempty"`
+	AgentID     string                `json:"agent_id,omitempty"`
+	Version     string                `json:"version,omitempty"`
+	Role        string                `json:"role,omitempty"`
+	Tunnels     []ReportedTunnel      `json:"tunnels,omitempty"`
+	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
+	UsedPorts   []int                 `json:"used_ports,omitempty"`
 	// Revision is the newest config revision the agent has applied (0 = none).
 	Revision int64  `json:"reported_revision,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
@@ -152,6 +152,29 @@ type CapabilityManifest struct {
 	Transports    []string `json:"transports"`
 	Runtime       []string `json:"runtime"`
 	Diagnostics   []string `json:"diagnostics"`
+}
+
+// ReportedTunnel is one running tunnel as it travels on the state report: the
+// configuration it was applied with, plus the protocol-specific diagnostics of
+// the runtime that is actually serving it (V5-WP5-A3).
+//
+// The config is EMBEDDED, so the JSON is byte-for-byte what it was before this
+// field existed — an older panel reads exactly the shape it always did, and the
+// diagnostics are simply absent. That is the same additive rule every other
+// control-protocol change in V5 followed.
+type ReportedTunnel struct {
+	forwarder.TunnelConfig
+	// Diag is present only when the tunnel's protocol HAS protocol-specific
+	// facts. A tcp tunnel carries none, which is different from carrying zeroes.
+	Diag *forwarder.ProtocolDiagnostics `json:"diag,omitempty"`
+}
+
+// DiagnosticsLister reports per-tunnel protocol diagnostics by tunnel id.
+//
+// An interface rather than a concrete manager, like every other source the
+// reporter reads: the reporter must not import the manager.
+type DiagnosticsLister interface {
+	DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagnostics
 }
 
 // HostSample is the on-the-wire resource sample. Field names are explicit about
@@ -235,6 +258,42 @@ func WithProtocol(version int, capabilities []string) Option {
 	}
 }
 
+// WithDiagnostics attaches the source of per-tunnel protocol diagnostics
+// (V5-WP5-A3). Omitted = the report carries no diagnostics at all, which is what
+// an agent without any protocol front should send.
+func WithDiagnostics(lister DiagnosticsLister) Option {
+	return func(c *Config) { c.diagnostics = lister }
+}
+
+// reportedTunnels merges the running configs with their protocol diagnostics.
+func (r *Reporter) reportedTunnels() []ReportedTunnel {
+	configs := r.cfg.tunnels.List()
+	out := make([]ReportedTunnel, 0, len(configs))
+	var diags map[string]forwarder.ProtocolDiagnostics
+	if r.cfg.diagnostics != nil {
+		diags = r.cfg.diagnostics.DiagnosticsByTunnel()
+	}
+	for _, cfg := range configs {
+		entry := ReportedTunnel{TunnelConfig: cfg}
+		if diag, ok := diags[cfg.ID]; ok {
+			copied := diag
+			entry.Diag = &copied
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// configsOf projects the reported tunnels back to plain configs for the runtime
+// census, so CountRuntimes keeps describing the same fact it always did.
+func configsOf(tunnels []ReportedTunnel) []forwarder.TunnelConfig {
+	out := make([]forwarder.TunnelConfig, 0, len(tunnels))
+	for _, t := range tunnels {
+		out = append(out, t.TunnelConfig)
+	}
+	return out
+}
+
 // WithManifest advertises the V5-WP1 capability manifest (protocols,
 // transports, runtime features, diagnostics).
 //
@@ -291,6 +350,9 @@ type Config struct {
 	// V5-WP1: the additive v2 manifest. nil = this build does not advertise one,
 	// and the wire field is omitted rather than sent empty.
 	capabilityManifest *CapabilityManifest
+
+	// V5-WP5-A3: per-tunnel protocol diagnostics. nil = this agent reports none.
+	diagnostics DiagnosticsLister
 
 	// ── V4-WP6 telemetry sources (all optional) ──
 	//
@@ -407,7 +469,7 @@ func (r *Reporter) Payload() Payload {
 		Timestamp: r.cfg.now().Unix(),
 	}
 	if r.cfg.tunnels != nil {
-		p.Tunnels = r.cfg.tunnels.List()
+		p.Tunnels = r.reportedTunnels()
 	}
 	if r.cfg.egress != nil {
 		p.EgressPools = r.cfg.egress.Snapshot()
@@ -445,8 +507,8 @@ func (r *Reporter) StatePayload() StatePayload {
 		p.CapabilityManifest = &m
 	}
 	if r.cfg.tunnels != nil {
-		p.Tunnels = r.cfg.tunnels.List()
-		counts := CountRuntimes(p.Tunnels)
+		p.Tunnels = r.reportedTunnels()
+		counts := CountRuntimes(configsOf(p.Tunnels))
 		p.Runtimes = &counts
 	}
 	if r.cfg.egress != nil {

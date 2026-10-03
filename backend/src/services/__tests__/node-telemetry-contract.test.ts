@@ -250,3 +250,74 @@ describe("state report tolerates null where a field is optional", () => {
     }
   });
 });
+
+/* ================================================================== */
+/* V5-WP5-A3：协议专属诊断随上报一同穿过                              */
+/* ================================================================== */
+
+/**
+ * Agent 侧新增的 `diag` 是**每个隧道条目上的附加字段**，面板必须原样收下：
+ *
+ *   · 校验层不能因为「出现了没见过的字段」拒绝整份上报 —— 那会让整个节点的遥测
+ *     和健康一起消失（`bad_tunnels` 是整份 400），代价远大于收益；
+ *   · 也不能把它投影丢掉：证书到期时间与握手失败次数是运维在 TLS 前端出问题时
+ *     唯一能看的东西，而它们只存在于 Agent 观测到的那一刻。
+ *
+ * 这条契约靠「容忍未知字段」实现，因此必须被测试钉住：有人为了「严格」加一条
+ * 白名单，就会把这两个字段连同整份上报一起拒掉。
+ */
+describe("protocol diagnostics ride through the state report (V5-WP5-A3)", () => {
+  const base = {
+    agent_id: "agent-1",
+    node_id: "WP14-IN-A-NODE",
+    ts: 1_800_000_000,
+    host: { cpu_cores: 2, mem_total: 512, agent_version: "1.0.0" },
+  };
+
+  test("a tunnel carrying a tls diag block is accepted", () => {
+    const result = validateStateReport({
+      ...base,
+      tunnels: [
+        {
+          id: "tunex-1-direct",
+          mode: "DIRECT",
+          ingress_port: 21000,
+          revision: 3,
+          protocol: "tls",
+          diag: {
+            protocol: "tls",
+            cert_subject: "CN=site.example",
+            cert_not_after: 1_893_456_000,
+            cert_rotations: 2,
+            handshake_failures: 7,
+            last_handshake_error: "tls: first record does not look like a TLS handshake",
+            last_handshake_error_at: 1_800_000_100,
+          },
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("a ws diag block is accepted, and a diag-less tunnel stays valid", () => {
+    const result = validateStateReport({
+      ...base,
+      tunnels: [
+        { id: "tunex-2-direct", mode: "DIRECT", ingress_port: 21001, revision: 1, protocol: "ws", diag: { protocol: "ws", upgrade_refused: 4 } },
+        { id: "tunex-3-direct", mode: "DIRECT", ingress_port: 21002, revision: 1, protocol: "tcp" },
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("a malformed diag block does not invalidate the whole report", () => {
+    // 诊断是**信息**：形状不对也只是这条信息没用，不能因此让整个节点的上报
+    // 消失。这与 capability manifest 的 fail-closed 不同 —— 那份是准入依据，
+    // 这份是观测结果，误判的代价方向相反。
+    const result = validateStateReport({
+      ...base,
+      tunnels: [{ id: "tunex-4-direct", mode: "DIRECT", ingress_port: 21003, revision: 1, diag: "not-an-object" }],
+    });
+    expect(result.ok).toBe(true);
+  });
+});

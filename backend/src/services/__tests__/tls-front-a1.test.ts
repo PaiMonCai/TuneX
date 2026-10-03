@@ -17,6 +17,7 @@ import {
   FORWARD_PROTOCOLS,
   FORWARD_PROTOCOL_SPECS,
   buildForwardRuntimePlan,
+  dispatchFactsFromRow,
   legacyTunnelTypeColumn,
   legacyTunnelTypeForForwardProtocol,
   tlsPathsForProtocol,
@@ -135,5 +136,55 @@ describe("tls path rules fail closed", () => {
     const result = tlsPathsForProtocol("tls", `  ${CERT}  `, KEY);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.columns.tls_cert_path).toBe(CERT);
+  });
+});
+
+/**
+ * V5-WP5-A1/G1A：一次下发需要**协议 + 该协议必需的配置**，两者是一个事实。
+ *
+ * 这条 helper 的存在本身就是 Gate 的产物：G0 抓到"某条下发路径完全不传协议"，
+ * G1A 又抓到"某条路径传了协议、却没传证书路径"，症状是 tls 转发的**热重载**必然
+ * 失败而新建与恢复都正常。把两者收进同一个解析函数，下一类"新协议多了一个必需
+ * 字段"才不会在四条路径里漏掉一条。
+ */
+describe("dispatch facts: protocol and its required configuration", () => {
+  const row = (over: Record<string, unknown> = {}) => ({
+    forward_protocol: "tls",
+    tunnel_type: "tls",
+    tls_cert_path: CERT,
+    tls_key_path: KEY,
+    ...over,
+  });
+
+  test("a complete tls row yields the protocol and both paths", () => {
+    expect(dispatchFactsFromRow(row())).toEqual({
+      protocol: "tls",
+      tlsCertPath: CERT,
+      tlsKeyPath: KEY,
+    });
+  });
+
+  test("a tcp row yields no paths (nothing to configure)", () => {
+    expect(dispatchFactsFromRow({ forward_protocol: "tcp", tunnel_type: "tcp" })).toEqual({ protocol: "tcp" });
+  });
+
+  /** 半配置的 tls 行不可下发：要么完整，要么拒绝——不存在"用默认证书"这条路。 */
+  test("a tls row missing a path is not dispatchable at all", () => {
+    expect(dispatchFactsFromRow(row({ tls_key_path: null }))).toBeNull();
+    expect(dispatchFactsFromRow(row({ tls_cert_path: "  " }))).toBeNull();
+  });
+
+  test("a non-tls row carrying certificate paths is refused, not silently ignored", () => {
+    expect(dispatchFactsFromRow({ forward_protocol: "tcp", tunnel_type: "tcp", tls_cert_path: CERT, tls_key_path: KEY }))
+      .toBeNull();
+  });
+
+  test("a protocol the runtime has not opened is refused, whatever else the row says", () => {
+    expect(dispatchFactsFromRow({ forward_protocol: "wss", tunnel_type: "wss" })).toBeNull();
+    expect(dispatchFactsFromRow({ tunnel_type: "udp" })).toBeNull();
+  });
+
+  test("a row with no protocol fact at all stays fail-closed", () => {
+    expect(dispatchFactsFromRow({})).toBeNull();
   });
 });

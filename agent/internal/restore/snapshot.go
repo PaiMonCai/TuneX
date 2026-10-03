@@ -46,6 +46,8 @@ func decodeSnapshot(version string, tunnels []tunnelPayload) (*Snapshot, error) 
 			SpeedLimit:  t.SpeedLimit,
 			Revision:    t.Revision,
 			ListenHost:  t.ListenHost,
+			TLSCertPath: t.TLSCertPath,
+			TLSKeyPath:  t.TLSKeyPath,
 		}
 		for _, tg := range t.Targets {
 			cfg.Targets = append(cfg.Targets, forwarder.Target{

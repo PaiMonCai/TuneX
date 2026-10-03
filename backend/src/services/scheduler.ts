@@ -1439,7 +1439,7 @@ async function checkExistingRuntime(
   return deps.runtimeUse(row.workspace_id, {
     user_id: row.user_id, in_node_group_id: inGroup,
     out_node_group_id: outGroup as number | null,
-    tunnel_type: protocol,
+    protocol,
   });
 }
 

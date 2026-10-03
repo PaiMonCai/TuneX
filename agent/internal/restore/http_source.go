@@ -64,6 +64,13 @@ type tunnelPayload struct {
 	SpeedLimit int64  `json:"speed_limit"`
 	Revision   int64  `json:"revision"`
 	ListenHost string `json:"listen_host"`
+	// V5-WP5-A1: the tls front's paths. They MUST be decoded here: this payload
+	// is the desired-state snapshot an Agent pulls after every restart, and a
+	// decoder that drops them turns a working tls Forward into an unbuildable
+	// one — V5-G1A.8 caught exactly that (the listener never came back after a
+	// node restart while create and hot reload were fine).
+	TLSCertPath string `json:"tls_cert_path"`
+	TLSKeyPath  string `json:"tls_key_path"`
 }
 
 // FetchSnapshot implements Source with the strict classification above.

@@ -1297,7 +1297,7 @@ async function resolveForwardCandidate(
       user_id: current.user_id,
       in_node_group_id: ingress.node_group_id,
       out_node_group_id: candidate.mode === "relay" ? egress?.node_group_id ?? null : null,
-      tunnel_type: admittedProtocol,
+      protocol: admittedProtocol,
     });
     if (rejected) {
       return { ok: false, error: error(403, rejected.reason, rejected.message, {

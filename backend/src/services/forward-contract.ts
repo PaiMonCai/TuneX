@@ -267,6 +267,46 @@ export function legacyTunnelTypeColumn(
   return legacy === null ? {} : { tunnel_type: legacy };
 }
 
+/**
+ * Everything a dispatch needs to know about a persisted Forward, resolved in ONE
+ * place: the protocol and its protocol-specific configuration.
+ *
+ * This exists because "the protocol" and "the fields that protocol needs" are one
+ * fact, and splitting them across call sites is how a new required field is
+ * forgotten on one path. Gate G0 and G1A each found a version of that: first a
+ * dispatch path with no protocol at all, then (after `tls` arrived) a path that
+ * carried the protocol but not the certificate paths, so every hot reload of a
+ * tls Forward failed while create and restore worked.
+ *
+ * `null` means "this row must not be dispatched": either its protocol is not
+ * admitted, or it is a tls row without a complete certificate pair. Callers
+ * refuse; none of them re-derive the answer locally.
+ */
+export interface DispatchFacts {
+  readonly protocol: ForwardProtocol;
+  readonly tlsCertPath?: string;
+  readonly tlsKeyPath?: string;
+}
+
+export function dispatchFactsFromRow(row: {
+  forward_protocol?: unknown;
+  tunnel_type?: unknown;
+  tls_cert_path?: unknown;
+  tls_key_path?: unknown;
+}): DispatchFacts | null {
+  const protocol = admitPersistedProtocol(row);
+  if (protocol === null) return null;
+  const paths = tlsPathsForProtocol(protocol, row.tls_cert_path, row.tls_key_path);
+  if (!paths.ok) return null;
+  const cert = paths.columns.tls_cert_path;
+  const key = paths.columns.tls_key_path;
+  return {
+    protocol,
+    ...(cert ? { tlsCertPath: cert } : {}),
+    ...(key ? { tlsKeyPath: key } : {}),
+  };
+}
+
 export interface ForwardRuntimePlacement {
   readonly ingress_node_id: number | null;
   readonly egress_node_id: number | null;

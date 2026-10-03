@@ -44,6 +44,10 @@ type StreamBuildDeps struct {
 	// HandshakeTimeout bounds a client's WebSocket handshake. Zero uses the
 	// package default; tests shorten it.
 	HandshakeTimeout time.Duration
+	// ReportCertError is called when a rotated certificate cannot be loaded. The
+	// tunnel keeps serving the last good certificate; the caller decides how loud
+	// to be. Nil is silent.
+	ReportCertError func(error)
 }
 
 // StreamBuilder constructs the stream runtime for ONE protocol.
@@ -149,9 +153,20 @@ func buildWSStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	diag := &diagRecorder{protocol: ProtocolWS}
 	f := &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}
+	f.diag = diag
 	f.wrapConn = func(conn net.Conn) (net.Conn, error) {
-		return upgradeWebSocket(conn, deps.HandshakeTimeout)
+		wrapped, err := upgradeWebSocket(conn, deps.HandshakeTimeout)
+		if err != nil {
+			// A client that is not a WebSocket client is usually not a fault (every
+			// listener gets scanners), so it is counted separately from a failed
+			// handshake — and the connection is dropped without touching the
+			// listener.
+			diag.noteUpgradeRefused()
+			return nil, err
+		}
+		return wrapped, nil
 	}
 	return f, nil
 }
@@ -173,18 +188,36 @@ func buildTLSStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, erro
 	if cfg.Mode == ModeEgress {
 		return buildTCPStream(cfg, deps)
 	}
-	cert, err := tls.LoadX509KeyPair(strings.TrimSpace(cfg.TLSCertPath), strings.TrimSpace(cfg.TLSKeyPath))
+	// The certificate is loaded through a reloader rather than once: rotation is
+	// an operator replacing a file, and a hot-reloadable tunnel never rebuilds
+	// its listener, so a one-shot load would keep serving the old certificate
+	// forever (V5-G1A.6). The initial load still happens here, so a bad pair
+	// fails before anything binds.
+	diag := &diagRecorder{protocol: ProtocolTLS}
+	reloader, err := newCertReloader(
+		strings.TrimSpace(cfg.TLSCertPath), strings.TrimSpace(cfg.TLSKeyPath),
+		func(err error) {
+			// V5-WP5-A3: a failed rotation is both logged and REPORTED, because the
+			// tunnel keeps serving the last good certificate and would otherwise
+			// look perfectly healthy.
+			diag.noteCertReloadError(err)
+			if deps.ReportCertError != nil {
+				deps.ReportCertError(err)
+			}
+		},
+		diag.noteCertLoaded,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("forwarder: tls tunnel %s: %w", cfg.ID, err)
 	}
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		GetCertificate: reloader.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
 	}
 	if deps.ServerName != "" {
 		tlsConfig.ServerName = deps.ServerName
 	}
-	return NewSingleHopTLS(cfg, tlsConfig)
+	return NewSingleHopTLS(cfg, tlsConfig, diag)
 }
 
 // buildTCPStream constructs the TCP stream runtime for one tunnel.
