@@ -2706,35 +2706,684 @@ V4.5 的 durability / diagnostics 方向参考当前 fork 的三个项目，但
 
 ## 14. V5 Roadmap — Advanced Networking / Resilience / Federation
 
-V5 的技术启动条件 **Gate V4-F5 通过并标记 V4.5 stable** 已于 2026-10-03 满足。V5 不反向扩大 V4 范围；V4 的 frozen baseline（durability / diagnostics / authorization / release gates）必须继续保持。仓库许可与 third-party attribution 仍按 §13.11 独立 fail-closed。
+V5 的技术启动条件 **Gate V4-F5 通过并标记 V4.5 stable** 已于 2026-10-03 满足。V5 不反向扩大 V4 范围；V4 的 frozen baseline（Forward / Node 产品模型、desired/applied + revision/ACK、LKG、drain、diagnostics、authorization、CI → Integration → Release）必须继续保持。
 
-### 14.1 V5 范围
+V5 的定位不是第二次架构重写，而是：
 
-建议按依赖顺序推进：
+> **在 V4 单一控制链与单一 runtime 真相源上，逐层扩大协议、观测、容错、拓扑与跨控制面能力。**
 
-| V5 阶段 | 主题 | 主要能力 |
-|---|---|---|
-| **V5.0** | Contract Freeze | 协议/能力 negotiation、数据面扩展边界、兼容策略、性能基线 |
-| **V5.1** | Protocol Expansion | UDP、WS/TLS、QUIC |
-| **V5.2** | Target Intelligence | 持续 target health / latency observation、circuit breaker、advanced LB |
-| **V5.3** | Resilience / HA | DNS 动态目标、multi-ingress HA、automatic failover |
-| **V5.4** | Multi-hop | 多跳拓扑、共享 transport/link、拓扑迁移与故障恢复 |
-| **V5.5** | Federation | Panel federation、跨 workspace / 跨控制面 external sharing、远端 lease/quota/usage/revocation |
-| **V5.x** | Optional Data Plane / Ecosystem | WireGuard / mimic 类数据面、Plugin Store、移动端等，逐项架构评审后决定 |
+仓库许可与 third-party attribution 继续按 §13.11 独立 fail-closed。
 
-### 14.2 V5 从参考项目继续吸收的方向
+### 14.1 总体执行顺序
 
-- **RelayPanel**：multi-target health、circuit breaker、failover 行为与恢复测试；
-- **FLVX**：tunnel quality observation、federation grant / port / quota / expiry / usage 语义；
-- **ForwardX**：multi-hop、HA、复杂 runtime recovery、WireGuard/扩展体系的边界与负面测试。
+| 阶段 | 主题 | 核心交付 | 进入下一阶段的硬门槛 |
+|---|---|---|---|
+| **V5.0** | Contract Freeze | 协议/Transport 抽象、Capability v2、Stream/Datagram 边界、兼容矩阵、性能基线 | **Gate V5-G0 全绿** |
+| **V5.1a** | WS / TLS | 在 Stream Runtime 上扩展 TLS / WebSocket | 独立 WS/TLS Gate 全绿 |
+| **V5.1b** | UDP | Datagram Runtime、session mapping、idle timeout、packet accounting | 独立 UDP Gate 全绿 |
+| **V5.1c** | QUIC | 建立在 UDP + TLS 基础上的 QUIC runtime | 独立 QUIC Gate 全绿 |
+| **V5.2** | Target Intelligence | 持续 target health / latency observation、health synthesis、circuit breaker、advanced LB | **Gate V5-G2 全绿** |
+| **V5.3** | Resilience / HA | DNS 动态目标、multi-ingress HA、fencing、automatic failover/failback | **Gate V5-G3 全绿** |
+| **V5.4** | Multi-hop | 内部 RoutePlan / Link、2-hop → 3-hop、拓扑迁移与恢复 | **Gate V5-G4 全绿** |
+| **V5.5** | Federation | Panel federation、grant、remote lease/quota/usage/revocation、跨控制面 reconcile | **Gate V5-G5 全绿 + 独立安全评审** |
+| **V5.x** | Optional Data Plane / Ecosystem | WireGuard / mimic 类数据面、Plugin Store、移动端等 | 每项单独架构评审与 Gate |
 
-这些项目仍只作为设计/行为/测试参考。许可证与单一真相源规则继续沿用 §13.11。
+固定依赖顺序：
 
-### 14.3 V5 硬规则
+```text
+V4.5 frozen baseline
+        ↓
+V5.0 Contract Freeze
+        ↓
+      V5-G0
+        ↓
+WS/TLS → UDP → QUIC
+        ↓
+V5.2 Target Intelligence
+        ↓
+V5.3 HA / Failover
+        ↓
+V5.4 Multi-hop
+        ↓
+V5.5 Federation
+```
 
-1. **先观测、后自动决策。** target health/latency 稳定之前不得上线 automatic failover。
-2. **每种协议独立 Gate。** UDP/WS/TLS/QUIC 不共享“一个协议通过就代表全部通过”的 Gate。
-3. **高可用必须验证故障恢复。** multi-ingress / failover 必须包含断链、恢复、抖动、双活冲突和回切测试。
-4. **multi-hop 不复活第二套产品模型。** 用户仍以 Forward 为业务对象；内部 Link/Transport 是否独立建模需 V5 contract 冻结后决定。
-5. **Federation 单独安全评审。** 跨 Panel credential、resource grant、lease、quota、revocation、审计、partial failure 与 reconcile 都必须有明确 ownership。
-6. **V5 不降低 V4 的稳定性门槛。** V4.5 的 LKG、drain、diagnose、Support Bundle、version/capability negotiation 继续作为所有 V5 能力的基础设施。
+**禁止跳阶段。** 尤其在 V5-G0 关闭前，不进入 UDP / QUIC 实现；在 target observation 稳定前，不进入 automatic failover。
+
+---
+
+### 14.2 V5.0 — Contract Freeze
+
+V5.0 是当前唯一 Active Phase。它的目标不是交付新的用户协议，而是冻结后续所有 V5 能力共同依赖的扩展契约。
+
+#### V5-WP0 — Forward / Protocol / Transport Contract
+
+用户产品模型继续保持：
+
+```text
+Forward
+```
+
+禁止为 UDP / TLS / QUIC / multi-hop 再创建第二套用户侧 Tunnel/Forward 产品对象。
+
+内部模型按以下层次收敛：
+
+```text
+Forward
+  ↓
+ForwardDesiredState
+  ↓
+ProtocolSpec / TransportSpec
+  ↓
+RuntimePlan
+  ↓
+Agent Runtime
+```
+
+冻结原则：
+
+- `Forward` 仍是用户唯一业务对象；
+- `Tunnel` 继续承担内部 desired/runtime 兼容语义，不另造第二份业务真相；
+- protocol 与 transport 必须是显式契约，不允许在各 service/route 里散落 `if protocol === ...`；
+- future multi-hop 只允许扩展内部 `RuntimePlan` / `RoutePlan`，不得改变用户侧资源身份；
+- DIRECT / RELAY 仍是拓扑语义，不能与 TCP / UDP / QUIC 这类传输协议混成同一个枚举维度；
+- schema 变更优先 additive；旧 Agent / 旧 Forward 必须有明确兼容路径。
+
+DoD：
+
+- 数据模型 / API / Agent config 的字段归属冻结；
+- DIRECT/RELAY 与 protocol/transport 的正交关系有契约测试；
+- 未知 protocol / transport fail-closed；
+- V4 TCP Forward 无迁移即可继续运行。
+
+#### V5-WP1 — Capability Negotiation v2
+
+V4 已有 `control_protocol_version` + `capabilities`，V5 必须扩展而不是替换。
+
+目标形态允许表达：
+
+```text
+control protocol version
+transport capabilities
+runtime capabilities
+diagnostic capabilities
+optional feature/version ranges
+```
+
+示意：
+
+```json
+{
+  "control_protocol_version": 2,
+  "capabilities": {
+    "transport": ["tcp", "tls", "ws"],
+    "runtime": ["hot_reload", "graceful_drain"]
+  }
+}
+```
+
+硬规则：
+
+- Panel 在**入队前**完成 capability admission；
+- 旧 Agent 未上报 v2 时走明确兼容矩阵，不得猜能力；
+- “未上报”与“明确不支持”必须保持不同语义；
+- Agent 只能广告真实可执行能力，能力列表必须由实现分支或同一事实源派生；
+- unknown / malformed capability fail-closed；
+- 不允许通过“下发后失败”代替 capability negotiation。
+
+#### V5-WP2 — Runtime Abstraction
+
+数据面分成两类生命周期：
+
+```text
+Forward Runtime
+├─ Stream Runtime
+│  ├─ TCP
+│  ├─ TLS
+│  └─ WebSocket
+│
+└─ Datagram Runtime
+   ├─ UDP
+   └─ QUIC
+```
+
+共享：
+
+- desired state / revision / ACK；
+- NodePortLease / port guard；
+- authorization / quota admission；
+- reconcile；
+- health / telemetry；
+- LKG / graceful shutdown；
+- diagnostics / Support Bundle。
+
+不得共享错误的生命周期假设：
+
+```text
+Stream:
+listen → accept → dial → bidirectional copy → close
+
+Datagram:
+listen packet → session mapping → packet forwarding
+→ idle timeout → mapping cleanup
+```
+
+禁止为了 UDP 把 TCP 的 connection abstraction 强行泛化成一个无法表达真实生命周期的“大接口”；也禁止复制第二套 TunnelManager / desired/reconcile 控制链。
+
+#### V5-WP3 — Performance Baseline
+
+V5.0 必须先冻结 V4 TCP 基线，之后每种新能力才能判断“功能正确但性能退化”。
+
+至少记录：
+
+- throughput；
+- connection establishment latency；
+- concurrent connections；
+- CPU / RSS；
+- goroutine 数与泄漏；
+- hot reload latency；
+- interruption / reconnect convergence；
+- DIRECT vs RELAY 开销。
+
+原则：
+
+- correctness Gate 与 performance baseline 分开；
+- 第一阶段只做可重复测量与回归阈值，不追求极限 benchmark；
+- 环境波动大的指标先记录分布/趋势，不用脆弱的单点绝对值阻断 CI。
+
+#### V5-WP4 / Gate V5-G0 — Contract Compatibility Gate
+
+G0 是进入任何新协议实现前的硬门槛。
+
+必须真实验证：
+
+```text
+V4 TCP DIRECT                不退化
+V4 TCP RELAY                 不退化
+旧 Forward                   无需重建即可工作
+旧 Agent                     能继续连接新 Panel
+新 Agent                     能执行 V4 baseline
+unknown capability           fail-closed
+unknown protocol             不下发
+revision / ACK               语义不变
+LKG old schema               可安全读取/迁移或明确拒绝，不 crash
+LKG new schema               不覆盖 Panel desired truth
+diagnostics / support bundle 不因新契约泄漏额外敏感字段
+```
+
+**V5-G0 FAIL > 0 时禁止开始 V5.1。**
+
+建议分支：
+
+```text
+feature/v5-wp0-contract
+feature/v5-wp1-capability
+feature/v5-wp2-runtime-abstraction
+perf/v5-wp3-baseline
+test/v5-g0-contract
+```
+
+---
+
+### 14.3 V5.1 — Protocol Expansion
+
+协议扩展固定按：
+
+```text
+WS / TLS
+   ↓
+UDP
+   ↓
+QUIC
+```
+
+推进。原因是 WS/TLS 仍属于 Stream 生命周期，先用它验证 V5-WP2 的抽象是否正确；UDP 引入真正不同的 Datagram 生命周期；QUIC 同时依赖 UDP、TLS 与连接/stream 状态，因此最后实现。
+
+#### V5.1a — WS / TLS
+
+目标：
+
+- TLS termination / passthrough 的边界先冻结后实现；
+- WebSocket 明确是 transport/framing 能力，不复制 Forward 产品模型；
+- TCP/TLS/WS 共用 Stream Runtime 的 listener / revision / drain / telemetry 基础设施。
+
+退出条件：
+
+- TCP baseline 全绿；
+- TLS 独立正反向 Gate；
+- WS 独立正反向 Gate；
+- certificate/config reload 的失败必须保留旧 applied；
+- graceful drain 与 hot reload 不退化。
+
+若实现 WS/TLS 时需要复制整套 TunnelManager / Reconciler，应停止并回到 V5-WP2 修正抽象，而不是继续堆代码。
+
+#### V5.1b — UDP
+
+新增 Datagram Runtime：
+
+- source/session mapping；
+- idle timeout；
+- NAT-like mapping cleanup；
+- packet / byte accounting；
+- target selection；
+- target change 后的新 session 与既有 session 语义；
+- Agent restart / Panel outage / LKG restore。
+
+UDP Gate 必须覆盖：
+
+- 单向 / 双向 packet；
+- 多客户端同源/异源；
+- idle expiry；
+- mapping 上限；
+- target unavailable；
+- hot update；
+- restart / outage；
+- packet accounting；
+- BOTH 节点端口冲突。
+
+#### V5.1c — QUIC
+
+QUIC 只有在 UDP Gate 关闭后开始。
+
+至少冻结：
+
+- QUIC termination vs transport relay 边界；
+- connection / stream / datagram 的统计口径；
+- certificate / key material 的存储和下发边界；
+- graceful drain；
+- 0-RTT 是否支持（默认不因库支持就自动开放）。
+
+每种协议都有独立 Gate；不得用“UDP 已通过”代替 QUIC 验证。
+
+---
+
+### 14.4 V5.2 — Target Intelligence
+
+V5.2 固定遵循：
+
+```text
+Observation
+   ↓
+Health Synthesis
+   ↓
+Decision
+```
+
+先观测，后自动决策。
+
+#### V5-WP5 — Target Observation
+
+持续采集：
+
+- reachability；
+- latency；
+- consecutive failures / successes；
+- success rate；
+- active / recent connections；
+- last observation / observation source。
+
+观测事实不得直接改 desired state。
+
+#### V5-WP6 — Health Synthesis
+
+把多个 observation 合成为稳定状态，例如：
+
+```text
+unknown
+healthy
+degraded
+unhealthy
+recovering
+```
+
+必须处理：
+
+- flap / jitter；
+- stale observation；
+- startup warm-up；
+- partial visibility；
+- Panel restart。
+
+#### V5-WP7 — Circuit Breaker / Advanced LB
+
+只有 observation + synthesis Gate 稳定后才允许加入：
+
+- circuit breaker；
+- weighted health-aware routing；
+- least-latency / least-load 等高级策略；
+- recovery probing / half-open。
+
+禁止因为一次 timeout 立即永久摘除 target。
+
+#### Gate V5-G2
+
+真实 Gate 至少覆盖：
+
+- healthy → unhealthy → recovering → healthy；
+- 延迟升高但仍可达；
+- 单 target / 多 target；
+- target flap；
+- stale telemetry；
+- Panel/Agent restart；
+- hot target update；
+- circuit breaker open / half-open / close；
+- advanced LB 在 target 恢复后的重新纳入。
+
+---
+
+### 14.5 V5.3 — Resilience / HA
+
+V5.3 才允许真正改变“故障后由谁承载业务”的自动决策。
+
+#### V5-WP8 — DNS Dynamic Target
+
+DNS 解析属于 target observation/input，不允许绕过 desired/runtime 真相源。
+
+必须明确：
+
+- TTL；
+- NXDOMAIN；
+- 多 A/AAAA；
+- address churn；
+- stale DNS fallback；
+- IPv4 / IPv6；
+- DNS 变化与已有连接/session 的关系。
+
+#### V5-WP9 — Multi-Ingress HA
+
+Forward 仍是单一业务对象，内部允许：
+
+```text
+preferred ingress
+standby ingress(es)
+ownership / lease epoch
+```
+
+必须有 fencing/epoch/lease 机制避免：
+
+```text
+Panel 认为 A 已死
+→ B 接管
+→ A 实际仍在监听
+→ split brain
+```
+
+#### V5-WP10 — Automatic Failover / Failback
+
+自动迁移必须是显式 policy，默认不能把“heartbeat timeout”直接等价为“允许迁移”。
+
+决策输入至少包含：
+
+- node reachability；
+- observation freshness；
+- ownership epoch；
+- port availability；
+- target health；
+- policy / cooldown；
+- previous failover state。
+
+#### Gate V5-G3
+
+必须包含真实故障恢复：
+
+```text
+硬断链
+软超时
+短时抖动
+节点重启
+Panel 重启
+双活冲突
+重复 failover 请求
+failover 中再次失败
+旧节点恢复
+manual vs automatic failback
+lease/epoch fencing
+```
+
+G3 不只验证“能切过去”，还必须验证**不会同时承载、不会无限抖动、能解释为什么切换**。
+
+---
+
+### 14.6 V5.4 — Multi-hop
+
+multi-hop 不得复活第二套产品模型。
+
+用户仍然看到：
+
+```text
+Forward
+```
+
+内部才允许：
+
+```text
+Forward
+  ↓
+RoutePlan
+  ├─ Hop A
+  ├─ Hop B
+  └─ Hop C
+```
+
+#### V5-WP11 — RoutePlan / Link Contract
+
+先冻结：
+
+- hop identity；
+- hop order；
+- per-hop transport；
+- endpoint ownership；
+- port/link lease；
+- revision propagation；
+- error ownership；
+- telemetry aggregation。
+
+Link/Transport 是否独立持久化，只在明确能减少重复资源且 ownership 可证明时才引入。
+
+#### V5-WP12 — 2-hop
+
+第一版只做固定 2-hop，覆盖：
+
+- create；
+- hot edit；
+- middle-hop replacement；
+- rollback；
+- restart/reconcile；
+- per-hop diagnostics。
+
+#### V5-WP13 — 3-hop
+
+2-hop Gate 关闭后再扩 3-hop。
+
+V5.4 第一版**不做任意图 / 环 / 动态路径算法**；先证明线性 RoutePlan 的生命周期正确。
+
+#### Gate V5-G4
+
+必须验证：
+
+- 2-hop / 3-hop 建立与拆除；
+- 中间 hop 失败；
+- 中间 hop 恢复；
+- topology edit；
+- stale revision；
+- partial apply；
+- compensation；
+- lease cleanup；
+- Panel / 任一 Agent restart；
+- telemetry / diagnostics 能定位具体失败 hop；
+- 不产生 orphan listener / orphan link。
+
+---
+
+### 14.7 V5.5 — Federation
+
+Federation 是独立的分布式控制面阶段，必须最后做，并单独安全评审。
+
+概念上：
+
+```text
+Panel A
+   │ grant / credential / lease
+   ▼
+Panel B
+```
+
+必须先回答 ownership：
+
+- Forward 谁拥有；
+- Node / remote capacity 谁拥有；
+- port lease 谁分配；
+- quota 谁判定；
+- usage 谁计量；
+- billing/audit 事实源在哪；
+- revoke 由谁发起、多久生效；
+- 两个 Panel 断网后谁可以继续服务；
+- reconnect 后如何 reconcile 冲突。
+
+#### V5-WP14 — Federation Identity / Trust
+
+- Panel identity；
+- credential issuance / rotation / revoke；
+- trust scope；
+- replay protection；
+- audit。
+
+#### V5-WP15 — Resource Grant / Remote Lease
+
+- resource grant；
+- expiry；
+- remote port/capacity lease；
+- quota reservation；
+- revocation。
+
+#### V5-WP16 — Usage / Partial Failure / Reconcile
+
+- usage attribution；
+- duplicate delivery；
+- network partition；
+- stale grant；
+- partial commit；
+- retry / idempotency；
+- reconcile ownership。
+
+#### Gate V5-G5
+
+必须有：
+
+- normal grant/use/revoke；
+- credential rotate/revoke；
+- quota exhaustion；
+- lease expiry；
+- one Panel offline；
+- network partition；
+- duplicate/reordered messages；
+- partial failure；
+- reconnect reconcile；
+- cross-tenant isolation；
+- audit completeness。
+
+G5 关闭前不允许把 federation 当作生产可用能力。
+
+---
+
+### 14.8 V5.x — Optional Data Plane / Ecosystem
+
+WireGuard / mimic 类数据面、Plugin Store、移动端等不进入 V5 主线承诺。
+
+任何 V5.x 项目必须先回答：
+
+1. 是否复用 Forward + desired/revision/reconcile；
+2. 是否需要新的安全边界；
+3. 是否引入新的长期 credential；
+4. 是否影响现有 port/link ownership；
+5. 是否有独立真实 Gate；
+6. 第三方许可证是否允许实现方式。
+
+否则保持 proposal，不进入 Active WP。
+
+---
+
+### 14.9 V5 通用硬规则
+
+1. **V4 frozen baseline 永远是回归门槛。** 每个 V5 Gate 前先证明 V4 TCP DIRECT / RELAY、LKG、drain、diagnostics、authorization 仍然成立。
+2. **先契约、后实现。** 跨 Agent/Panel 的新字段与动作先冻结 contract，再并行开发。
+3. **先观测、后自动决策。** target health/latency 稳定之前不得上线 automatic failover。
+4. **每种协议独立 Gate。** TCP / TLS / WS / UDP / QUIC 不互相代替验证。
+5. **不引入第二套真相源。** 新 observation、RoutePlan、remote grant 都必须明确其与 Panel desired 的关系。
+6. **不引入第二套控制链。** 新能力继续复用 outbound-only command / desired / ACK / result / reconcile。
+7. **错误必须可解释。** capability、protocol、target、HA、hop、federation 的失败都要结构化到可行动错误层，而不是只留日志。
+8. **任何自动恢复都有 fencing。** HA/multi-hop/federation 不允许靠“最后写入者获胜”处理双活。
+9. **性能退化必须可见。** correctness pass 不等于性能可接受。
+10. **许可证继续 fail-closed。** 仓库自身 LICENSE / NOTICE / third-party attribution 未明确前，不把技术 Stable 描述成对外开源授权。
+
+---
+
+### 14.10 V5 分支、PR 与合并规则
+
+V5 分支使用：
+
+```text
+feature/v5-wp<N>-<topic>
+test/v5-g<N>-<topic>
+perf/v5-wp<N>-<topic>
+```
+
+例如：
+
+```text
+feature/v5-wp0-contract
+feature/v5-wp1-capability
+feature/v5-wp2-runtime-abstraction
+perf/v5-wp3-baseline
+test/v5-g0-contract
+```
+
+PR 必须继续包含：
+
+- Work Package / Track；
+- Depends-On / Blocks；
+- Contract Changes；
+- schema / compatibility impact；
+- rollback；
+- unit/integration evidence；
+- 对 V4 frozen baseline 的影响；
+- 对后续 Gate 的影响。
+
+合并原则：
+
+- 单个 WP 的 CI green ≠ 阶段完成；
+- 跨 Track 能力必须经过对应 V5-G*；
+- 任何阶段 Gate 未关闭，不得把下一阶段能力混入同一个 PR；
+- deprecated V4 API 的删除仍需独立 breaking-change 决策，不夹带在 V5 普通功能 PR。
+
+---
+
+### 14.11 当前执行状态
+
+截至 2026-10-03：
+
+```text
+V4.5 frozen baseline        ✅ CLOSED
+CI / Integration / Release  ✅ 全链闭环
+V5 技术启动条件             ✅ 满足
+
+ACTIVE:
+V5.0 Contract Freeze        🟡 开始
+
+NEXT:
+V5-WP0 Forward/Protocol Contract
+V5-WP1 Capability Negotiation v2
+V5-WP2 Runtime Abstraction
+V5-WP3 Performance Baseline
+V5-WP4 / Gate V5-G0
+
+BLOCKED UNTIL G0:
+V5.1 WS/TLS / UDP / QUIC
+V5.2 Target Intelligence
+V5.3 HA
+V5.4 Multi-hop
+V5.5 Federation
+```
+
+**下一步唯一允许的开发动作：完成 V5.0 的 contract freeze 与 Gate V5-G0；不要直接开始 UDP / QUIC。**
+
