@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""TuneX V5-WP3 —— TCP 性能基线（DIRECT / RELAY）。
+"""TuneX V5-WP3 —— 性能基线（TCP / TLS / WS）。
+
+本文件最初只测 TCP（DIRECT / RELAY，文件名与产物名沿用至今）。V5.1a 增加
+`tls` / `ws` 两个前端协议后，这里按同一条流水线补上两个场景：§5.4 要求
+「每个协议各有自己的场景」，而三种协议共用同一个 stream 运行时
+（DEVELOPMENT.md §6.1），所以场景之间只有「入口 listener 的形态」不同：
+
+  · `direct` / `relay`  TCP（**未改动**，仍是被冻结的参照）；
+  · `tls`             入口是 TLS listener（自签证书临时生成），握手后同一条路径；
+  · `ws`              入口是 WebSocket listener（RFC 6455 握手 + 分帧），
+                      解帧后的字节流走同一条路径。
 
 设计约束（DEVELOPMENT.md §5.4）：
 
@@ -25,6 +35,15 @@
   restart/reconnect convergence 重启 Agent 进程到端口重新可用
   graceful drain duration      SIGTERM 到进程退出（有界排空）
 
+TLS / WS 场景复用上面除「生命周期」以外的全部测量项（生命周期路径是三种协议
+共用的 stream 运行时，已在 `direct` 上测一次）：
+
+  TLS throughput              建连 + TLS 握手 + 一次完整回环传输
+  TLS connect latency         建连到 **TLS 握手完成**（这是 TLS 相对 TCP 多出来的
+                              那部分建立成本，所以口径必须包含握手）
+  WS throughput               建连 + RFC 6455 握手 + 一帧 masked 二进制消息 + 读回解帧字节
+  WS connect latency          建连到 **101 + Sec-WebSocket-Accept 校验通过**
+
 本模块只用 Python 标准库：基线脚本本身不该引入需要安装的依赖，否则"可重复"
 就变成了"在一台装过东西的机器上可重复"。
 """
@@ -32,7 +51,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import hashlib
 import json
 import os
 import platform
@@ -40,6 +61,7 @@ import random
 import shutil
 import signal
 import socket
+import ssl
 import http.server
 import socketserver
 import statistics
@@ -537,6 +559,474 @@ def concurrent_round(host: str, port: int, concurrency: int, payload: bytes,
     return len(latencies), wall, latencies
 
 
+def read_echo(sock: socket.socket, want: int) -> int:
+    """从 socket 读满 want 字节（对端提前关闭就返回实际读到的字节数）。"""
+    received = 0
+    while received < want:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        received += len(chunk)
+    return received
+
+
+# ======================================================================
+# TLS 前端（V5.1a）
+# ======================================================================
+#
+# §6.1：TLS 在**入口 listener** 终止（Go crypto/tls，标准库），握手之后的明文
+# 流与今天的 TCP 隧道走完全相同的转发路径；出口节点与跨节点跳不做二次加密。
+# 所以这里的客户端只要真的握手、真的传输，测到的就是"客户端多付的那一层成本"。
+
+def openssl_missing_message() -> str:
+    """缺 openssl 时的可行动报错（纯字符串：可离线断言）。"""
+    return (
+        "the tls scenario needs openssl to generate a throwaway self-signed certificate; "
+        "no certificate is committed on purpose (a committed one would expire and silently "
+        "rot the scenario). Install openssl, or run the scenarios that do not need it: "
+        "--scenarios direct relay ws (the default is 'direct relay')."
+    )
+
+
+def certificate_command(openssl: str, cert_path: Path, key_path: Path,
+                        cn: str = "tunex-perf-local") -> list[str]:
+    """自签证书的命令行。纯函数：形状可离线断言，不触碰机器状态。
+
+    用 EC P-256 而不是 RSA：握手成本低一个数量级，而基线要测的是**入口那一层
+    的固定开销**，不是故意把 CPU 烧在 RSA 上（`--profile full` 也不该为了握手等
+    几百毫秒）。SAN 写上 127.0.0.1，是为了让手工 `openssl s_client` 复核时不必
+    关校验。
+    """
+    return [
+        openssl, "req", "-x509", "-newkey", "ec",
+        "-pkeyopt", "ec_paramgen_curve:prime256v1",
+        "-nodes", "-keyout", str(key_path), "-out", str(cert_path),
+        "-days", "2", "-subj", f"/CN={cn}",
+        "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
+    ]
+
+
+def generate_self_signed(cert_path: Path, key_path: Path,
+                         cn: str = "tunex-perf-local") -> None:
+    """生成一对临时自签证书。失败就抛错 —— 绝不"跳过 tls 场景"。"""
+    exe = shutil.which("openssl")
+    if not exe:
+        raise RuntimeError(openssl_missing_message())
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(certificate_command(exe, cert_path, key_path, cn),
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "openssl failed to generate a self-signed certificate "
+            f"(exit {proc.returncode}): {(proc.stderr or proc.stdout).strip()}")
+    if not cert_path.exists() or not key_path.exists():
+        raise RuntimeError(
+            f"openssl reported success but {cert_path} / {key_path} are missing")
+
+
+def tls_client_context() -> ssl.SSLContext:
+    """回环自签证书 → 不校验链与主机名。**只用于本地基线**。
+
+    刻意不做校验：这里量的是数据面成本，不是证书信任链。把临时证书装进系统
+    信任库会让"同一命令跑两次可比较"依赖机器状态（§5.4 DoD「不需要生产凭据」）。
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2   # 与 Agent 的 MinVersion 对齐
+    return ctx
+
+
+def tls_transfer_once(host: str, port: int, payload: bytes, timeout: float = 30.0) -> tuple[int, float]:
+    """建连 + TLS 握手 → 写 payload → 读回同样字节。返回 (字节数, 秒)。
+
+    计时从 connect() 之前开始，与 TCP 的 `transfer_once` 同口径：TLS 多出来的
+    握手成本必须出现在吞吐里，否则"入口换成 TLS 之后吞吐掉了多少"看不见。
+    """
+    started = time.perf_counter()
+    ctx = tls_client_context()
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(payload)
+            received = read_echo(sock, len(payload))
+    return received, time.perf_counter() - started
+
+
+def tls_setup_latency_once(host: str, port: int, timeout: float = 10.0) -> float:
+    """建连 + **TLS 握手完成**的耗时。
+
+    TCP 场景的 connect 只量 TCP 建连，所以两者的差就是 TLS 引入的建立成本 ——
+    这正是"多一个协议"最该被量到的数字。
+    """
+    ctx = tls_client_context()
+    started = time.perf_counter()
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host):
+            pass
+    return time.perf_counter() - started
+
+
+def open_tls_session(host: str, port: int, timeout: float = 60.0) -> socket.socket:
+    """并发轮里用的 opener：返回一个握手完成的 TLS socket。"""
+    ctx = tls_client_context()
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        tls = ctx.wrap_socket(raw, server_hostname=host)
+    except Exception:
+        raw.close()
+        raise
+    tls.settimeout(timeout)
+    return tls
+
+
+# ======================================================================
+# WebSocket 前端（V5.1a，RFC 6455，只用标准库）
+# ======================================================================
+#
+# §6.1：ws 是**客户端流量**的分帧协议。客户端把 payload 装进 masked 帧，Agent
+# 解帧后把字节流转给 target；回程字节流由 Agent 重新分帧（服务端帧不掩码）。
+# 基线要测的正是"握手 + 分帧/解帧 + 转发"这条完整链路，所以客户端必须真的说
+# RFC 6455，而不是事后拿一个封装库把协议成本藏起来。
+#
+# 为什么手写不装依赖：与采集器本身的约束一致（"可重复" = 在干净机器上可重复），
+# 而且服务端那份实现本身就是手写的（agent/internal/forwarder/websocket.go）。
+# 审计轨迹：scripts/v3-e2e/v5-g1a.py 的 ws_probe()。
+
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_OP_CONTINUATION = 0x0
+WS_OP_TEXT = 0x1
+WS_OP_BINARY = 0x2
+WS_OP_CLOSE = 0x8
+WS_OP_PING = 0x9
+WS_OP_PONG = 0xA
+# 与服务端 wsMaxHandshakeBytes 同量级：握手响应不可能有这么大，超过就是伪装的客户端。
+WS_MAX_HANDSHAKE_BYTES = 16 << 10
+# 内容校验的探针大小：64 KiB，跨过 126/127 长度前缀分界（65536 用 8 字节长度）。
+WS_INTEGRITY_PROBE_BYTES = 1 << 16
+
+
+def ws_accept_value(key: str) -> str:
+    """RFC 6455 §4.2.2 的 Sec-WebSocket-Accept（纯函数，有公开测试向量）。"""
+    return base64.b64encode(hashlib.sha1((key + WS_MAGIC).encode()).digest()).decode()
+
+
+def ws_handshake_request(key: str, host: str = "127.0.0.1", path: str = "/") -> bytes:
+    """客户端握手请求（纯函数）。"""
+    return (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    ).encode()
+
+
+def ws_handshake_ok(head: bytes, key: str) -> tuple[bool, str]:
+    """校验握手响应（纯函数）：必须是 101，且 accept 值对得上。
+
+    只看「升级成功」不够：accept 算错的实现对端也会回 101，然后分帧语义对不上，
+    症状会变成"吞吐为 0"而不是"握手失败"——把协议错误伪装成性能问题。
+    """
+    lines = head.decode("latin-1", "replace").split("\r\n")
+    status = lines[0] if lines else ""
+    if not status.startswith("HTTP/") or " 101" not in status:
+        return False, f"no 101 upgrade: {status!r}"
+    accepts = [ln.split(":", 1)[1].strip() for ln in lines[1:]
+               if ln.lower().startswith("sec-websocket-accept:")]
+    if not accepts:
+        return False, "response has no Sec-WebSocket-Accept"
+    if accepts[0] != ws_accept_value(key):
+        return False, f"Sec-WebSocket-Accept mismatch: {accepts[0]!r}"
+    return True, "101 + accept ok"
+
+
+def xor_mask(data: bytes, mask: bytes) -> bytes:
+    """按 RFC 6455 §5.3 用 4 字节掩码循环异或（纯函数）。
+
+    用大整数异或而不是逐字节的 Python 循环：逐字节版本处理 64 KiB payload 要
+    十几毫秒，会盖过被测系统本身，把"基线"变成"Python 掩码有多慢"。按 4 字节
+    对齐后交给 C 层的大整数运算，采集器自身的成本就被压到噪声量级。
+    """
+    if not data:
+        return b""
+    if len(mask) != 4:
+        raise ValueError("websocket mask must be exactly 4 bytes")
+    n = len(data)
+    padded = n + (-n) % 4
+    chunk = int.from_bytes(data + b"\x00" * (padded - n), "big")
+    key = int.from_bytes(mask * (padded // 4), "big")
+    return (chunk ^ key).to_bytes(padded, "big")[:n]
+
+
+def encode_ws_frame(opcode: int, payload: bytes, mask: bytes | None = None,
+                    fin: bool = True) -> bytes:
+    """编码一帧。`mask=None` = 服务端方向（不掩码）；否则按 RFC 掩码。
+
+    掩码是客户端帧的**强制**要求（RFC 6455 §5.1），漏掉会被 Agent 直接拒连
+    （readFrame 里显式拒绝未掩码的客户端帧）——所以在客户端这一侧它不是可选项。
+    """
+    header = bytearray()
+    header.append((0x80 if fin else 0x00) | (opcode & 0x0F))
+    length = len(payload)
+    masked_bit = 0x80 if mask is not None else 0x00
+    if length < 126:
+        header.append(masked_bit | length)
+    elif length < (1 << 16):
+        header.append(masked_bit | 126)
+        header += length.to_bytes(2, "big")
+    else:
+        header.append(masked_bit | 127)
+        header += length.to_bytes(8, "big")
+    if mask is None:
+        return bytes(header) + payload
+    return bytes(header) + mask + xor_mask(payload, mask)
+
+
+def decode_ws_frames(buf: bytes) -> tuple[list[dict], bytes]:
+    """解析 buf 前部的完整帧，返回 (frames, 未消费的剩余字节)。
+
+    frames 每项 {fin, opcode, payload, masked}。不足一帧就把尾部原样留下：分帧
+    是流式的，一次 recv 很少刚好落在帧边界上，「半帧」是常态而不是错误 ——
+    把它当错误处理，会在真实链路（写侧按 32 KiB 切块）上随机失败。
+    """
+    frames: list[dict] = []
+    offset, total = 0, len(buf)
+    while total - offset >= 2:
+        b0, b1 = buf[offset], buf[offset + 1]
+        mask_flag = bool(b1 & 0x80)
+        length = b1 & 0x7F
+        cursor = offset + 2
+        if length == 126:
+            if total - cursor < 2:
+                break
+            length = int.from_bytes(buf[cursor:cursor + 2], "big")
+            cursor += 2
+        elif length == 127:
+            if total - cursor < 8:
+                break
+            length = int.from_bytes(buf[cursor:cursor + 8], "big")
+            cursor += 8
+        mask = None
+        if mask_flag:
+            if total - cursor < 4:
+                break
+            mask = buf[cursor:cursor + 4]
+            cursor += 4
+        if total - cursor < length:
+            break
+        payload = buf[cursor:cursor + length]
+        if mask is not None:
+            payload = xor_mask(payload, mask)
+        frames.append({"fin": bool(b0 & 0x80), "opcode": b0 & 0x0F,
+                       "payload": bytes(payload), "masked": mask_flag})
+        offset = cursor + length
+    return frames, buf[offset:]
+
+
+class WSClient:
+    """一个已握手的 WS 客户端，对调用方暴露**字节流**语义（sendall / recv）。
+
+    Agent 的那一侧也是这样做的（wsConn 实现 net.Conn，上层 pipe 看不见帧），
+    所以客户端也只把"解帧后的字节"露出去：这样并发的测量函数可以直接复用
+    TCP 的写法，不会为了 WS 再写一套形状略异的统计。
+
+    读侧必须能处理三件真事：握手响应与首个数据帧同段到达、服务端把一份 payload
+    切成多帧、以及 ping/close 控制帧（不处理会把"对端在探活"变成"读超时"）。
+    """
+
+    def __init__(self, host: str, port: int, timeout: float = 30.0,
+                 sock: socket.socket | None = None) -> None:
+        self._sock = sock or socket.create_connection((host, port), timeout=timeout)
+        self._sock.settimeout(timeout)
+        self._wire = b""    # 已收到、未解析的原始字节
+        self._plain = b""   # 已解帧、还没交给调用方的业务字节
+        self.handshake_ms = 0.0
+        self._handshake(host)
+
+    def _recv(self) -> bytes:
+        chunk = self._sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("websocket peer closed the connection")
+        return chunk
+
+    def _handshake(self, host: str) -> None:
+        started = time.perf_counter()
+        key = base64.b64encode(os.urandom(16)).decode()
+        self._sock.sendall(ws_handshake_request(key, host))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += self._recv()
+            if len(head) > WS_MAX_HANDSHAKE_BYTES:
+                raise RuntimeError(
+                    f"websocket handshake: response head exceeds {WS_MAX_HANDSHAKE_BYTES} bytes")
+        raw_head, rest = head.split(b"\r\n\r\n", 1)
+        self._wire = rest
+        ok, detail = ws_handshake_ok(raw_head + b"\r\n\r\n", key)
+        if not ok:
+            raise RuntimeError(f"websocket handshake failed: {detail}")
+        self.handshake_ms = (time.perf_counter() - started) * 1000
+
+    def _pump(self) -> None:
+        """解出至少一帧（必要时再 recv），数据帧进 _plain，控制帧就地处理。"""
+        while True:
+            frames, self._wire = decode_ws_frames(self._wire)
+            if frames:
+                for frame in frames:
+                    opcode = frame["opcode"]
+                    if opcode in (WS_OP_BINARY, WS_OP_TEXT, WS_OP_CONTINUATION):
+                        self._plain += frame["payload"]
+                    elif opcode == WS_OP_PING:
+                        self._sock.sendall(encode_ws_frame(
+                            WS_OP_PONG, frame["payload"], mask=os.urandom(4)))
+                    elif opcode == WS_OP_CLOSE:
+                        raise RuntimeError(
+                            "websocket peer sent close before the transfer completed")
+                    # pong：探活是对方的事，不回答（与 Agent 的 readFrame 一致）
+                return
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                return          # 对端关闭：让 recv() 返回 b""，与 TCP 语义一致
+            self._wire += chunk
+
+    def sendall(self, data: bytes) -> None:
+        """把整块数据作为**一帧**二进制消息发出（长度前缀由 encode_ws_frame 处理）。"""
+        self._sock.sendall(encode_ws_frame(WS_OP_BINARY, data, mask=os.urandom(4)))
+
+    def recv(self, size: int) -> bytes:
+        while not self._plain:
+            self._pump()
+            if not self._plain:
+                return b""
+        out, self._plain = self._plain[:size], self._plain[size:]
+        return out
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "WSClient":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+
+def ws_transfer_once(host: str, port: int, payload: bytes, timeout: float = 30.0) -> tuple[int, float]:
+    """建连 + WS 握手 → 一帧 masked 消息 → 读回同样多的解帧字节。返回 (字节数, 秒)。
+
+    与 TCP 的 `transfer_once` 同口径（计时含建连）：握手与分帧成本必须出现在
+    吞吐数字里，否则"入口换成 WS 之后吞吐掉了多少"看不见。
+    """
+    started = time.perf_counter()
+    with WSClient(host, port, timeout=timeout) as client:
+        client.sendall(payload)
+        received = read_echo(client, len(payload))  # type: ignore[arg-type]
+    return received, time.perf_counter() - started
+
+
+def ws_setup_latency_once(host: str, port: int, timeout: float = 10.0) -> float:
+    """建连 + WS 握手（101 + accept 校验通过）的耗时。"""
+    started = time.perf_counter()
+    with WSClient(host, port, timeout=timeout):
+        pass
+    return time.perf_counter() - started
+
+
+def ws_echo_matches(host: str, port: int, payload: bytes, timeout: float = 30.0) -> bool:
+    """把 payload 走一遍隧道，比较**内容**是否逐字节相同。
+
+    吞吐只数字节数：一个把 payload 解错了（例如忘了解掩码）的隧道同样会"回满
+    N 字节"，数字看起来完全健康。所以 WS 场景在采集吞吐之前先做一次内容校验，
+    不通过就直接失败——在错误的字节流上量出来的吞吐比没有数字更坏。
+    """
+    try:
+        with WSClient(host, port, timeout=timeout) as client:
+            client.sendall(payload)
+            got = b""
+            while len(got) < len(payload):
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                got += chunk
+    except Exception:  # noqa: BLE001 —— 校验失败就是 False，调用方负责报错
+        return False
+    return got == payload
+
+
+def measure_ws_integrity(topology: dict) -> dict:
+    """WS 场景的**前置**校验（每次真实采集都会跑）。
+
+    用 64 KiB 作为探针：它正好跨过 RFC 6455 的 126/127 长度前缀分界（65536 需要
+    8 字节长度），所以这一次往返同时证明了扩展长度字段的实现是对的。
+    """
+    if not ws_echo_matches("127.0.0.1", topology["listen_port"], os.urandom(WS_INTEGRITY_PROBE_BYTES)):
+        raise RuntimeError(
+            "ws scenario: the bytes echoed through the tunnel do not match what was sent; "
+            "refusing to measure throughput over a corrupted stream")
+    return {"ws_echo_integrity": True}
+
+
+def open_ws_session(host: str, port: int, timeout: float = 60.0) -> WSClient:
+    """并发轮里用的 opener：返回一个握手完成的 WSClient。"""
+    return WSClient(host, port, timeout=timeout)
+
+
+def concurrent_session_round(host: str, port: int, concurrency: int, payload: bytes,
+                             opener: Callable[[str, int, float], object],
+                             timeout: float = 60.0) -> tuple[int, float, list[float]]:
+    """`concurrent_round` 的会话版本：每条连接用自己的 opener 建立（TLS/WS 握手）。
+
+    与 TCP 版本保持同样的口径：墙钟取**整轮**（含握手），单连接往返从"发送前"
+    开始计。这样并发下的退化不会被平均掉。opener 返回已可读写 socket 或 WSClient
+    （两者都提供 sendall/recv 的字节流语义）。
+    """
+    errors: list[Exception] = []
+    latencies: list[float] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(concurrency)
+
+    def worker() -> None:
+        try:
+            session = opener(host, port, timeout)
+            try:
+                barrier.wait(timeout=timeout)
+                started = time.perf_counter()
+                session.sendall(payload)                     # type: ignore[attr-defined]
+                received = 0
+                while received < len(payload):
+                    chunk = session.recv(65536)              # type: ignore[attr-defined]
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                elapsed = time.perf_counter() - started
+                with lock:
+                    latencies.append(elapsed)
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+        except Exception as exc:  # noqa: BLE001 —— 失败要记成失败，不是崩掉整轮
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(concurrency)]
+    started = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout + 10)
+    wall = time.perf_counter() - started
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)}/{concurrency} concurrent sessions failed: {errors[0]!r}")
+    return len(latencies), wall, latencies
+
+
 # ======================================================================
 # 场景
 # ======================================================================
@@ -613,6 +1103,57 @@ def relay_topology(binary: Path, root: Path) -> dict:
             "listen_port": listen_port, "agents": [ingress, egress], "probe_port": listen_port}
 
 
+def stream_topology(binary: Path, root: Path, tunnel: dict) -> dict:
+    """DIRECT 形态的通用拓扑：入口 Agent + 回环 echo target，配置由面板下发。
+
+    与 `direct_topology` 的步骤逐条一致，只是隧道配置由调用方给出（TLS 需要证书
+    路径、WS 只是换一个协议名）。**没有**改写 `direct_topology`：那条路径是已冻结
+    的 TCP 参照，保持它逐字节不变比消除这点重复更重要。
+    """
+    target = EchoTarget()
+    panel = FakePanel()
+    panel.start()
+    ingress = AgentProcess(binary, root / "ingress", role="INGRESS", label="ingress", panel=panel)
+    listen_port = _free_port()
+    config = dict(tunnel, ingress_port=listen_port,
+                  remote_host=target.host, remote_port=target.port)
+    panel.set_desired(ingress.credential, [config])
+    try:
+        ingress.start()
+        wait_listener("127.0.0.1", listen_port)
+    except Exception:
+        _teardown({"agents": [ingress], "target": target, "panel": panel})
+        raise
+    return {"target": target, "panel": panel, "ingress": ingress,
+            "listen_port": listen_port, "agents": [ingress],
+            "probe_port": listen_port, "config": config}
+
+
+def tls_topology(binary: Path, root: Path) -> dict:
+    """TLS 场景拓扑：入口 listener 是一个 TLS server，证书是临时自签的。"""
+    cert_path = root / "certs" / "perf.crt"
+    key_path = root / "certs" / "perf.key"
+    generate_self_signed(cert_path, key_path)
+    return stream_topology(binary, root / "topology", {
+        "id": "perf-tls",
+        "mode": "DIRECT",
+        "protocol": "tls",
+        "tls_cert_path": str(cert_path),
+        "tls_key_path": str(key_path),
+        "revision": 1,
+    })
+
+
+def ws_topology(binary: Path, root: Path) -> dict:
+    """WS 场景拓扑：入口 listener 是一个 RFC 6455 server，握手后转发解帧字节。"""
+    return stream_topology(binary, root / "topology", {
+        "id": "perf-ws",
+        "mode": "DIRECT",
+        "protocol": "ws",
+        "revision": 1,
+    })
+
+
 def wait_listener(host: str, port: int, timeout: float = 30.0) -> float:
     """等到端口真的能建连为止，返回耗时（秒）。
 
@@ -631,31 +1172,42 @@ def wait_listener(host: str, port: int, timeout: float = 30.0) -> float:
     raise TimeoutError(f"listener {host}:{port} never accepted a connection: {last!r}")
 
 
-def measure_throughput(topology: dict, workers_profile: dict, prefix: str) -> dict:
+def measure_throughput(topology: dict, workers_profile: dict, prefix: str,
+                       transfer: Callable[[str, int, bytes], tuple[int, float]] = transfer_once) -> dict:
+    """`transfer` 默认是 TCP；tls / ws 场景传入各自的那一个（口径相同：计时含建连）。"""
     payload = os.urandom(workers_profile["payload_kib"] * 1024)
     samples = [
-        transfer_once("127.0.0.1", topology["listen_port"], payload)
+        transfer("127.0.0.1", topology["listen_port"], payload)
         for _ in range(workers_profile["transfers"])
     ]
     summary = summarize_throughput(samples)
     return {f"{prefix}_throughput": summary.to_json()}
 
 
-def measure_connection_setup(topology: dict, profile: dict, prefix: str) -> dict:
+def measure_connection_setup(topology: dict, profile: dict, prefix: str,
+                             setup: Callable[[str, int], float] = setup_latency_once) -> dict:
+    """`setup` 默认只量 TCP 建连；tls / ws 传入"建连 + 各自握手"的那一个。"""
     samples = [
-        setup_latency_once("127.0.0.1", topology["listen_port"])
+        setup("127.0.0.1", topology["listen_port"])
         for _ in range(profile["setups"])
     ]
     summary = Summary.of([s * 1000 for s in samples], "ms")
     return {f"{prefix}_connect_ms": summary.to_json()}
 
 
-def measure_concurrency(topology: dict, profile: dict, prefix: str) -> dict:
+def measure_concurrency(topology: dict, profile: dict, prefix: str,
+                        round_fn: Callable[..., tuple[int, float, list[float]]] = concurrent_round,
+                        opener: Callable[[str, int, float], object] | None = None) -> dict:
+    """`round_fn` 默认是 TCP 的 `concurrent_round`；tls / ws 用带 opener 的会话版本。"""
     payload = os.urandom(4096)
     rounds, latencies = [], []
     for _ in range(profile["conn_rounds"]):
-        count, wall, per_conn = concurrent_round(
-            "127.0.0.1", topology["listen_port"], profile["concurrency"], payload)
+        if opener is None:
+            count, wall, per_conn = round_fn(
+                "127.0.0.1", topology["listen_port"], profile["concurrency"], payload)
+        else:
+            count, wall, per_conn = round_fn(
+                "127.0.0.1", topology["listen_port"], profile["concurrency"], payload, opener)
         rounds.append((count * len(payload), wall))
         latencies.extend(per_conn)
     return {
@@ -701,6 +1253,72 @@ def measure_gauges(topology: dict, baseline_gauges: dict | None = None) -> dict:
 def collect_gauges(topology: dict) -> dict:
     """负载开始前的读数（供 measure_gauges 做差）。"""
     return {agent.label: agent.gauge() for agent in topology["agents"]}
+
+
+# ── 场景注册表 ──
+#
+# 场景名既是 JSON 的 key，也是所有指标的前缀，所以它必须能区分协议：
+# direct / relay 是 TCP，tls 与 ws 各自一个场景（§5.4「每个协议各有自己的场景」）。
+
+SCENARIO_PROTOCOL = {
+    "direct": "tcp",
+    "relay": "tcp",
+    "tls": "tls",
+    "ws": "ws",
+}
+
+PROTOCOL_TRANSFER: dict[str, Callable[[str, int, bytes], tuple[int, float]]] = {
+    "tcp": transfer_once,
+    "tls": tls_transfer_once,
+    "ws": ws_transfer_once,
+}
+
+PROTOCOL_SETUP: dict[str, Callable[[str, int], float]] = {
+    "tcp": setup_latency_once,
+    "tls": tls_setup_latency_once,
+    "ws": ws_setup_latency_once,
+}
+
+# 只有需要"会话建立"的协议才用并发 opener：TCP 的并发轮保持原样（已冻结的参照）。
+PROTOCOL_OPENER: dict[str, Callable[[str, int, float], object]] = {
+    "tls": open_tls_session,
+    "ws": open_ws_session,
+}
+
+
+def scenario_factory(scenario: str) -> Callable[[Path, Path], dict]:
+    """场景名 → 拓扑构造函数。新增场景必须在这里显式登记。"""
+    factories: dict[str, Callable[[Path, Path], dict]] = {
+        "direct": direct_topology,
+        "relay": relay_topology,
+        "tls": tls_topology,
+        "ws": ws_topology,
+    }
+    try:
+        return factories[scenario]
+    except KeyError:
+        raise ValueError(f"unknown scenario {scenario!r}") from None
+
+
+def measure_stream_scenario(scenario: str, topology: dict, profile: dict) -> dict:
+    """三种协议共用的一条流水线：吞吐 / 建连 / 并发。
+
+    差异全部收敛到"用哪个 transfer / setup / opener"，统计口径与产物形状完全一致
+    —— 这样 tls 与 direct 的数字才有可比性，而"可比"正是基线存在的意义。
+    """
+    protocol = SCENARIO_PROTOCOL[scenario]
+    out: dict = {}
+    if protocol == "ws":
+        # 先证明字节流是**对的**，再谈它有多快（见 measure_ws_integrity）。
+        out.update(measure_ws_integrity(topology))
+    out.update(measure_throughput(topology, profile, scenario, PROTOCOL_TRANSFER[protocol]))
+    out.update(measure_connection_setup(topology, profile, scenario, PROTOCOL_SETUP[protocol]))
+    if protocol == "tcp":
+        out.update(measure_concurrency(topology, profile, scenario))
+    else:
+        out.update(measure_concurrency(topology, profile, scenario,
+                                       concurrent_session_round, PROTOCOL_OPENER[protocol]))
+    return out
 
 
 def measure_hot_reload(topology: dict, profile: dict, prefix: str) -> dict:
@@ -904,6 +1522,8 @@ def environment(binary: Path | None) -> dict:
         env["go_version"] = _cmd(["go", "version"]) or None
     env["git_rev"] = _cmd(["git", "rev-parse", "HEAD"])
     env["git_dirty"] = bool(_cmd(["git", "status", "--porcelain"]))
+    # TLS 场景的证书是 openssl 现场生成的，所以它的版本是这条场景可复现性的一部分。
+    env["openssl_version"] = _cmd(["openssl", "version"]) or None
     return env
 
 
@@ -937,15 +1557,13 @@ def run(args: argparse.Namespace) -> dict:
     root = Path(tempfile.mkdtemp(prefix="tunex-perf-"))
     try:
         for scenario in args.scenarios:
-            factory = direct_topology if scenario == "direct" else relay_topology
-            topology = factory(binary, root / scenario)
+            topology = scenario_factory(scenario)(binary, root / scenario)
             try:
                 key = scenario
                 result["scenarios"][key] = {}
                 before = collect_gauges(topology)
-                result["scenarios"][key].update(measure_throughput(topology, profile, scenario))
-                result["scenarios"][key].update(measure_connection_setup(topology, profile, scenario))
-                result["scenarios"][key].update(measure_concurrency(topology, profile, scenario))
+                result["scenarios"][key].update(
+                    measure_stream_scenario(scenario, topology, profile))
                 if scenario == "direct":
                     # 热重载与重启收敛只跑 DIRECT：它们的对象是"单节点上的
                     # 生命周期"，在 RELAY 上重跑只是把同一个数字测两遍。
@@ -954,10 +1572,14 @@ def run(args: argparse.Namespace) -> dict:
             finally:
                 _teardown(topology)
 
-        result["scenarios"]["direct"].update(
-            measure_restart_convergence(binary, root, direct_topology, "direct"))
-        result["scenarios"]["direct"].update(
-            measure_graceful_drain(binary, root, "direct"))
+        # 热重载 / 重启收敛 / 排空是**三种协议共用**的 stream 运行时路径，只在
+        # tcp 的 direct 场景上测一次。守卫 is-not-None 是必要的：`--scenarios tls ws`
+        # 时 scenarios 里根本没有 direct 这个 key（旧代码在这种情况下会 KeyError）。
+        if "direct" in result["scenarios"]:
+            result["scenarios"]["direct"].update(
+                measure_restart_convergence(binary, root, direct_topology, "direct"))
+            result["scenarios"]["direct"].update(
+                measure_graceful_drain(binary, root, "direct"))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -992,21 +1614,30 @@ def flatten_metrics(result: dict) -> Iterable[tuple[str, str, object]]:
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TuneX V5 TCP performance baseline")
+    parser = argparse.ArgumentParser(description="TuneX V5 performance baseline (tcp/tls/ws)")
     parser.add_argument("--agent-binary", default="agent/tunex-agent",
                         help="path to the built tunex-agent binary")
     parser.add_argument("--out", default="scripts/perf/results",
                         help="output directory for the JSON/CSV artifacts")
     parser.add_argument("--profile", choices=sorted(PROFILES), default="quick")
-    parser.add_argument("--scenarios", nargs="+", choices=["direct", "relay"],
-                        default=["direct", "relay"])
+    parser.add_argument("--scenarios", nargs="+", choices=["direct", "relay", "tls", "ws"],
+                        default=["direct", "relay"],
+                        help="direct/relay are TCP; tls and ws are the V5.1a fronts "
+                             "(tls needs openssl)")
     parser.add_argument("--json", action="store_true", help="also print the JSON artifact to stdout")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    result = run(args)
+    try:
+        result = run(args)
+    except RuntimeError as exc:
+        # 已知的、可行动的环境/配置失败（例如缺 openssl）：给一条干净的错误，
+        # 而不是让读的人在一堆 traceback 的最后一行里找原因。退出码非 0，
+        # 所以脚本化调用不会把"没测成"当成"测过了"。
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     json_path, csv_path = write_outputs(result, Path(args.out))
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))

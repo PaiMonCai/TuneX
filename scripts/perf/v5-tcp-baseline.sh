@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# TuneX V5-WP3 —— TCP 性能基线入口（DIRECT / RELAY）。
+# TuneX V5-WP3 —— 性能基线入口（TCP: DIRECT / RELAY；V5.1a: TLS / WS）。
 #
-#   bash scripts/perf/v5-tcp-baseline.sh                  # quick，写 scripts/perf/results/
-#   bash scripts/perf/v5-tcp-baseline.sh --profile full    # 发布前人工对比用
+#   bash scripts/perf/v5-tcp-baseline.sh                       # 默认 direct+relay（TCP）
+#   bash scripts/perf/v5-tcp-baseline.sh --profile full         # 发布前人工对比用
 #   bash scripts/perf/v5-tcp-baseline.sh --scenarios direct
+#   bash scripts/perf/v5-tcp-baseline.sh --scenarios tls        # 需要 openssl（现场生成自签证书）
+#   bash scripts/perf/v5-tcp-baseline.sh --scenarios direct relay tls ws
 #
 # 这个脚本只做三件事：构建 Agent、检查依赖、调用 Python 采集器。**它不做判定**：
 # 性能基线不是 CI 门槛（§5.4「不要一开始用脆弱绝对阈值阻断 CI」），共享 Runner
