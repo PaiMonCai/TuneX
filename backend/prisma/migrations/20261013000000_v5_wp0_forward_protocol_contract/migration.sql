@@ -6,7 +6,9 @@
 --
 -- Expand-and-contract:
 --   * non-Forward rows remain NULL;
---   * existing Forward rows are deterministically backfilled to tcp;
+--   * only legacy tunnel_type='tcp' Forward rows are backfilled to canonical tcp;
+--   * non-TCP legacy rows stay NULL: their old enum value must never be reinterpreted
+--     as TCP merely because V4/V5 no longer implements that old data plane;
 --   * revision history is TCP by construction and receives a non-null snapshot field.
 -- No runtime behavior changes in this migration.
 
@@ -16,6 +18,7 @@ ALTER TABLE `tunnel`
 UPDATE `tunnel`
 SET `forward_protocol` = 'tcp'
 WHERE `category` = 'port_forward'
+  AND `tunnel_type` = 'tcp'
   AND `forward_protocol` IS NULL;
 
 CREATE INDEX `tunnel_forward_protocol_idx`
