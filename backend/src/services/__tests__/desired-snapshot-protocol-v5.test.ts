@@ -106,6 +106,20 @@ describe("desired snapshot: the protocol fact is never invented", () => {
     }
   });
 
+  /** V5-WP5-A2：ws 行会被放行，且**不需要**额外字段（握手是服务端行为）。 */
+  test("a ws row restores as ws with no extra configuration", () => {
+    const outcome = desiredTunnelConfigFor(
+      directRow({ forward_protocol: "ws", tunnel_type: "ws" }),
+      NODE,
+    );
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.protocol).toBe("ws");
+    // No certificate to carry: a ws front has nothing to configure.
+    expect(outcome.config.tls_cert_path).toBeUndefined();
+    expect(outcome.config.tls_key_path).toBeUndefined();
+  });
+
   test("a row with no protocol fact at all is refused (fail closed)", () => {
     expect(desiredTunnelConfigFor(directRow({ tunnel_type: null, forward_protocol: null }), NODE)).toEqual({
       kind: "skip",

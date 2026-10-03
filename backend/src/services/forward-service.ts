@@ -10,6 +10,7 @@
  * creation, validation and runtime actions have one implementation.
  */
 import { Prisma } from "@prisma/client";
+import type { TunnelType } from "@prisma/client";
 import { db } from "../db.ts";
 import {
   countWorkspaceTunnels,
@@ -51,12 +52,12 @@ import { checkForwardRuntimeUse } from "./forward-capability.ts";
 import { authorizationErrorLayer, type AuthorizationErrorLayer } from "./authorization-errors.ts";
 import type { ForwardPage } from "./forward-list-query.ts";
 import {
-  legacyTunnelTypeForForwardProtocol,
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardMode,
   type ForwardProtocol,
   tlsPathsForProtocol,
+  legacyTunnelTypeColumn,
 } from "./forward-contract.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import {
@@ -722,7 +723,16 @@ export async function createForward(
       const tunnel = await tx.tunnel.create({
         data: {
           name: input.name.trim(),
-          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol) as "tcp",
+          // The legacy column is a compatibility projection only, and for a
+          // protocol the legacy enum cannot express it stays absent (the column
+          // default applies) instead of being filled with a name that means
+          // something else — see legacyTunnelTypeForForwardProtocol.
+          // The contract is the source of the legacy names ('tcp' / 'tls'), and
+          // Prisma's generated enum type cannot see it — this cast is the
+          // boundary between the two. It is `TunnelType`, not `string`: a value
+          // the enum does not know must be a compile error, which is exactly the
+          // bug this line was written to fix (`ws` has no legacy enum value).
+          ...(legacyTunnelTypeColumn(protocol) as { tunnel_type?: TunnelType }),
           forward_protocol: protocol,
           ...tlsPaths.columns,
           category: "port_forward",

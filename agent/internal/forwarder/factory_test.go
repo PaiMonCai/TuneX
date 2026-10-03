@@ -53,10 +53,11 @@ func TestResolveRuntimeTargetDefaultsToTCP(t *testing.T) {
 }
 
 func TestResolveRuntimeTargetFailsClosedForUnknownProtocol(t *testing.T) {
-	// "tls" is deliberately NOT in this list any more: V5-WP5-A1 implements it,
-	// so it moved into the positive test below. A protocol leaves this list only
-	// together with its Gate, never to make a test pass.
-	for _, name := range []string{"udp", "quic", "ws", "wss", "mtcp", "carrier-pigeon"} {
+	// "tls" (A1) and "ws" (A2) are deliberately NOT in this list any more: they
+	// are implemented, so they moved into the positive tests. A protocol leaves
+	// this list only together with its Gate, never to make a test pass — and
+	// "wss" stays here on purpose: framing and TLS are separate dimensions.
+	for _, name := range []string{"udp", "quic", "wss", "mtcp", "carrier-pigeon"} {
 		cfg := factoryDirectConfig()
 		cfg.Protocol = ForwardProtocol(name)
 		if _, err := ResolveRuntimeTarget(cfg); err == nil {

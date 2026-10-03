@@ -71,6 +71,11 @@ const (
 	// DEVELOPMENT.md §6.1: TLS stops at the INGRESS listener; the inter-node hop
 	// stays plain TCP.
 	ProtocolTLS ForwardProtocol = "tls"
+	// ProtocolWS is the stream lifecycle with a WebSocket front: the client's
+	// frame payloads are unwrapped into the byte stream forwarded to the target
+	// (V5-WP5-A2). Framing and transport security are separate dimensions, which
+	// is why there is no `wss` protocol value.
+	ProtocolWS ForwardProtocol = "ws"
 )
 
 // ForwardTransport is the data-plane lifecycle contract that carries a protocol.
@@ -99,6 +104,7 @@ type protocolRuntime struct {
 var protocolRuntimes = []protocolRuntime{
 	{Protocol: ProtocolTCP, Transport: TransportStream},
 	{Protocol: ProtocolTLS, Transport: TransportStream},
+	{Protocol: ProtocolWS, Transport: TransportStream},
 }
 
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
@@ -280,6 +286,11 @@ func (c *TunnelConfig) Validate() error {
 		if strings.TrimSpace(c.TLSCertPath) == "" || strings.TrimSpace(c.TLSKeyPath) == "" {
 			return fmt.Errorf("forwarder: tls tunnel %s needs tls_cert_path and tls_key_path", c.ID)
 		}
+	}
+	// WS is a client-facing front like TLS: an EGRESS listener faces the ingress
+	// node, and that hop is plain TCP by contract.
+	if protocol == ProtocolWS && mode == ModeEgress {
+		return errors.New("forwarder: ws terminates at the client-facing listener; an EGRESS tunnel cannot be ws")
 	}
 
 	if strategy := strings.TrimSpace(string(c.LBStrategy)); strategy != "" {

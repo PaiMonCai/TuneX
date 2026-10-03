@@ -70,7 +70,7 @@ import {
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
-  legacyTunnelTypeForForwardProtocol,
+  wireTunnelTypeForForwardProtocol,
   type ForwardProtocol,
 } from "./forward-contract.ts";
 
@@ -605,7 +605,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: egressId,
-          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
+          tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
           listen_port: input.egressPort,
           targets: targets.map((t) => ({ address: t.host, port: t.port, weight: t.weight })),
         },
@@ -677,7 +677,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: relayId,
-          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
+          tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
           ...tlsFields,
           listen_port: input.ingressPort,
           // 入口侧的唯一「目标」是出口节点；WP6 的 targets 只是为了让信封
@@ -739,7 +739,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: directId,
-          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol),
+          tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
           ...tlsFields,
           listen_port: input.ingressPort,
           targets: [{ address: input.remoteHost, port: input.remotePort }],

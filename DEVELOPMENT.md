@@ -1216,7 +1216,7 @@ client → ingress listener(tcp | tls | ws) → 解密/解帧
 |---|---|---|
 | WP5-A0 语义契约 | **DONE** | 本节上文，2026-10-03 冻结 |
 | WP5-A1 TLS stream runtime | **DONE** | 见下（真实拓扑已验证） |
-| WP5-A2 WS stream runtime | TODO | 契约已冻结，可直接开工 |
+| WP5-A2 WS stream runtime | **DONE** | 见下（真实拓扑已验证） |
 | WP5-A3 protocol diagnostics | TODO | |
 | Gate V5-G1A | TODO | 脚本待写（`scripts/v3-e2e/v5-g1a.py`） |
 
@@ -1257,6 +1257,42 @@ TLS 握手 + 转发      -> 握手成功，目标回包 b'WP14-TARGET-A\n'
    会让"TLS 在入口终止"这句契约失效。
 2. 证书路径**只**随 `protocol=tls` 下发；tcp 携带路径会被拒绝而不是被忽略——
    否则线上会出现"Agent 必须主动忽略"的字段。
+
+**WP5-A2 落地位置**
+
+~~~text
+agent/internal/forwarder/base.go       wrapConn 接缝（替代 A1 的 listen 接缝：一个机制覆盖两种前端）
+agent/internal/forwarder/singhop.go    TLS 改用同一个接缝（tls.Server）
+agent/internal/forwarder/websocket.go  握手 + 帧编解码（纯标准库，agent 无第三方依赖）
+agent/internal/forwarder/factory.go    buildWSStream（ws 无额外配置，失败只按连接计）
+agent/internal/forwarder/websocket_test.go  9 个用例
+backend/src/services/forward-contract.ts    ws 开白名单 + legacy 投影可为 null
+backend/src/services/control-protocol/types.ts  wire 词汇表加入 ws
+backend/prisma/migrations/20261015000200_v5_wp5a2_ws_entitlement
+~~~
+
+**真实拓扑验证**（evidence: docs/evidence/v5-wp5a2-ws-e2e-20261003.log）
+
+~~~text
+ws create            -> 201，active
+WS 握手              -> HTTP/1.1 101 Switching Protocols，Sec-WebSocket-Accept 校验通过
+masked binary frame  -> 目标回包 b'WP14-TARGET-A\n'（opcode=0x2）
+~~~
+
+**A2 抓到的三个真实问题（都已修，且都不是"测试问题"）**
+
+1. **握手期的字节上限把整条连接限死了。** 第一版用 `io.LimitReader(conn, 16KiB)`
+   包住连接读握手——那 16 KiB 于是成了**整条隧道**的上限，任何客户端传过 16 KiB
+   就被重置。现在按行读头部并单独限长，且复用同一个 `bufio.Reader` 给后续帧用
+   （换成"另起一个 reader 读头部"会吞掉与头部同段到达的第一帧）。
+2. **`ws` 在遗留枚举里不存在。** 数据库 `TunnelType` 只有 `wss`，没有 `ws`；
+   第一次真实创建直接 500。写 `wss` 等于断言"WebSocket over TLS"，是假话；
+   往枚举里加值又是 §3.4 明确劝退的"用 DB enum 承载会频繁扩展的协议集合"。
+   于是把两个投影分开：**DB 列省略**（`legacyTunnelTypeColumn` 返回空对象，走列默认值），
+   **wire 字段回落到协议名本身**（`wireTunnelTypeForForwardProtocol`）。
+3. **wire 校验白名单也要加 `ws`。** 面板下发时被冻结的 payload 校验器拒了
+   （`payload.tunnel.tunnel_type 必须是 tcp/mtcp/.../quic`）。wire 词汇表可以领先
+   于 DB 枚举——这一点已写进 `types.ts` 的注释，避免下一个人再踩。
 
 #### V5.1a 实施范围（A1/A2/A3）
 

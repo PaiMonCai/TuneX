@@ -65,6 +65,15 @@ export type CommandAction = (typeof COMMAND_ACTIONS)[number];
  */
 export const TUNNEL_TYPES = [
   "tcp",
+  // V5-WP5-A2: `ws` is a PRODUCT protocol whose name the legacy Prisma enum does
+  // not carry (it has `wss`, the historical wrapper). This whitelist is the WIRE
+  // vocabulary, and it is allowed to lead the DB enum: the payload's
+  // `tunnel_type` is a descriptive echo (the canonical fact is `protocol`, and
+  // the Agent reads the tunnel config, not this field), while the DATABASE
+  // column keeps its historical value set — see `legacyTunnelTypeColumn` in
+  // services/forward-contract.ts, which omits the column for exactly this case
+  // rather than writing `wss` and asserting "WebSocket over TLS".
+  "ws",
   "mtcp",
   "udp",
   "tunex",

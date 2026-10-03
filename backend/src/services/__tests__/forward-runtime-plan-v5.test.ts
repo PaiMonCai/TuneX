@@ -79,7 +79,7 @@ describe("plan facts", () => {
   test("every open protocol is a stream plan (V5.1a adds tls, not a new transport)", () => {
     // V5-WP5-A1: tls is a *protocol* (what the client speaks), not a transport.
     // The plan shape is unchanged, which is the point of WP0's orthogonality.
-    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls"]);
+    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws"]);
     expect([...FORWARD_TRANSPORTS]).toEqual(["stream"]);
     expect(directPlan().transport).toEqual({ name: "stream", lifecycle: "connection" });
     for (const protocol of FORWARD_PROTOCOLS) {
@@ -90,7 +90,7 @@ describe("plan facts", () => {
 
   test("an unknown protocol or mode is refused at build time, not silently planned", () => {
     expect(() => buildForwardRuntimePlan("tcp" as never)).toThrow();
-    for (const unopened of ["udp", "quic", "ws", "wss"]) {
+    for (const unopened of ["udp", "quic", "wss"]) {
       expect(() => buildForwardRuntimePlan("direct", unopened as never)).toThrow();
     }
   });

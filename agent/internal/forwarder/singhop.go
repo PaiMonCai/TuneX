@@ -65,13 +65,11 @@ func NewSingleHopTLS(cfg TunnelConfig, tlsConfig *tls.Config) (*SingleHopForward
 		return nil, err
 	}
 	f := &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}
-	f.listen = func(addr string) (net.Listener, error) {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-		return tls.NewListener(ln, tlsConfig), nil
-	}
+	// The handshake happens on the first read/write (tls.Server defers it), so a
+	// client that connects and says nothing costs no handshake work — and a
+	// client that sends garbage fails here, inside the per-connection goroutine,
+	// without touching the listener.
+	f.wrapConn = func(conn net.Conn) (net.Conn, error) { return tls.Server(conn, tlsConfig), nil }
 	return f, nil
 }
 

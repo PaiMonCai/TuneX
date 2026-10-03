@@ -3,8 +3,10 @@ package forwarder
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
+	"time"
 )
 
 // V5-WP2 runtime factory.
@@ -39,6 +41,9 @@ type StreamBuildDeps struct {
 	// ServerName overrides the TLS server name. Tests set it; production leaves
 	// it empty (the listener serves whatever SNI the client sends).
 	ServerName string
+	// HandshakeTimeout bounds a client's WebSocket handshake. Zero uses the
+	// package default; tests shorten it.
+	HandshakeTimeout time.Duration
 }
 
 // StreamBuilder constructs the stream runtime for ONE protocol.
@@ -125,6 +130,30 @@ func BuildStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error) 
 var streamBuilders = map[ForwardProtocol]StreamBuilder{
 	ProtocolTCP: buildTCPStream,
 	ProtocolTLS: buildTLSStream,
+	ProtocolWS:  buildWSStream,
+}
+
+// buildWSStream constructs the WebSocket-fronted stream runtime.
+//
+// WS needs no configuration beyond the protocol name: the handshake is
+// server-side and the tunnel does not negotiate a subprotocol (it carries opaque
+// bytes). So unlike TLS there is nothing that can be misconfigured here — the
+// failure mode is per-connection (a client that is not a WS client), which must
+// never take the listener down.
+func buildWSStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error) {
+	if cfg.Mode == ModeEgress {
+		// Unreachable through Validate; kept so the factory cannot silently
+		// produce a WS front on the inter-node hop if called directly.
+		return buildTCPStream(cfg, deps)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	f := &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}
+	f.wrapConn = func(conn net.Conn) (net.Conn, error) {
+		return upgradeWebSocket(conn, deps.HandshakeTimeout)
+	}
+	return f, nil
 }
 
 // buildTLSStream constructs the TLS-fronted stream runtime.

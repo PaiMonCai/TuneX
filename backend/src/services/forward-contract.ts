@@ -19,7 +19,7 @@ export type ForwardMode = (typeof FORWARD_MODES)[number];
  * `tls` — the same stream lifecycle with a TLS-terminated client-facing listener
  * (DEVELOPMENT.md §6.1). `ws` follows in V5-WP5-A2, `udp`/`quic` after.
  */
-export const FORWARD_PROTOCOLS = ["tcp", "tls"] as const;
+export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws"] as const;
 export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
 
 /**
@@ -42,8 +42,21 @@ export const FORWARD_TRANSPORT_SPECS: Readonly<
 
 export interface ForwardProtocolSpec {
   readonly transport: ForwardTransport;
-  /** Compatibility value written to legacy Tunnel.tunnel_type while it exists. */
-  readonly legacy_tunnel_type: string;
+  /**
+   * Compatibility value for the legacy `Tunnel.tunnel_type` column, or `null`
+   * when the legacy Prisma enum has **no value that means this protocol**.
+   *
+   * `ws` is the first such case: the legacy enum carries `wss` (a historical
+   * wrapper name) but not `ws`. Writing `wss` would assert "WebSocket over TLS"
+   * about a plain-WS tunnel — a lie in a column that older readers still consult
+   * — and adding `ws` to the enum is exactly the protocol-set churn §3.4 warns
+   * about ("不要用 DB enum 承载会频繁扩展的协议集合").
+   *
+   * So the honest projection is "nothing useful to say here": the write omits
+   * the column and the canonical `forward_protocol` remains the only protocol
+   * fact (WP0 made it authoritative and it is never NULL for a new Forward).
+   */
+  readonly legacy_tunnel_type: string | null;
 }
 
 export const DEFAULT_FORWARD_PROTOCOL: ForwardProtocol = "tcp";
@@ -56,6 +69,9 @@ export const FORWARD_PROTOCOL_SPECS: Readonly<
   // which is why this is a protocol (what the client speaks) and not a
   // transport (how bytes move between nodes).
   tls: { transport: "stream", legacy_tunnel_type: "tls" },
+  // A WebSocket front is a client-facing framing layer; the inter-node hop stays
+  // plain TCP, exactly like tls.
+  ws: { transport: "stream", legacy_tunnel_type: null },
 };
 
 export function normalizeForwardTransport(
@@ -132,9 +148,13 @@ export function persistedForwardProtocol(
   return protocolFactName(legacyTunnelType);
 }
 
+/**
+ * The legacy column projection, or `null` when the legacy enum cannot express
+ * this protocol (see {@link ForwardProtocolSpec.legacy_tunnel_type}).
+ */
 export function legacyTunnelTypeForForwardProtocol(
   protocol: ForwardProtocol,
-): string {
+): string | null {
   return FORWARD_PROTOCOL_SPECS[protocol].legacy_tunnel_type;
 }
 
@@ -217,6 +237,34 @@ export function tlsPathsForProtocol(
     return { ok: false, reason: "证书/私钥路径必须是节点本地绝对路径" };
   }
   return { ok: true, columns: { tls_cert_path: cert, tls_key_path: key } };
+}
+
+/**
+ * Wire-side helper: what `payload.tunnel.tunnel_type` carries for a protocol.
+ *
+ * The wire vocabulary (`control-protocol/types.ts` TUNNEL_TYPES) can express
+ * every product protocol, including ones the DATABASE enum cannot store. So when
+ * there is no legacy name, the payload echoes the protocol name itself instead
+ * of `null`: a payload field that is always a string keeps the frozen validator
+ * simple, and the field is descriptive anyway — the Agent reads the tunnel
+ * config, and `protocol` is the canonical fact.
+ */
+export function wireTunnelTypeForForwardProtocol(protocol: ForwardProtocol): string {
+  return legacyTunnelTypeForForwardProtocol(protocol) ?? protocol;
+}
+
+/**
+ * Write-side helper: the `tunnel_type` column assignment for a protocol, or an
+ * empty object when the legacy enum has no value for it.
+ *
+ * Spread into a Prisma `data` object so the column keeps its historical default
+ * rather than being set to a name that means a different protocol.
+ */
+export function legacyTunnelTypeColumn(
+  protocol: ForwardProtocol,
+): { tunnel_type?: string } {
+  const legacy = legacyTunnelTypeForForwardProtocol(protocol);
+  return legacy === null ? {} : { tunnel_type: legacy };
 }
 
 export interface ForwardRuntimePlacement {

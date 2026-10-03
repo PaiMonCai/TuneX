@@ -102,23 +102,25 @@ type pipeTracker struct {
 	// wait for them; a shutdown that runs out of deadline must be able to close
 	// them, which is impossible from a counter alone.
 	live map[net.Conn]struct{}
-	// listen binds the tunnel's listener. nil means a plain TCP listener.
+	// wrapConn adapts a freshly accepted connection to the tunnel's front
+	// protocol. nil means "the raw connection" (plain TCP).
 	//
-	// V5-WP5-A1: this is the ONLY seam a TLS-fronted tunnel needs. Everything
-	// that makes a stream tunnel a stream tunnel — accept loop, per-connection
-	// pipe, drain, stats, the port guard, hot reload — is reused untouched, so
-	// "TLS is a stream runtime" is true by construction rather than by claim.
-	// It is deliberately not an abstraction layer: it is one function value.
-	listen func(addr string) (net.Listener, error)
-}
-
-// bindListener is the tunnel's listener factory: plain TCP unless the forwarder
-// was built with a TLS front.
-func (t *pipeTracker) bindListener(addr string) (net.Listener, error) {
-	if t.listen != nil {
-		return t.listen(addr)
-	}
-	return net.Listen("tcp", addr)
+	// V5-WP5-A1/A2: this is the ONLY seam a TLS- or WebSocket-fronted tunnel
+	// needs, and both use the same one. Everything that makes a stream tunnel a
+	// stream tunnel — accept loop, per-connection pipe, drain, stats, the port
+	// guard, hot reload — is reused untouched, so "TLS/WS is a stream runtime" is
+	// true by construction rather than by claim.
+	//
+	// One seam, not two: an earlier draft had a separate listener factory for
+	// TLS, which would have left WS needing its own second mechanism. The
+	// question a front protocol answers is "given this connection, give me the
+	// byte stream", and that is exactly this signature.
+	//
+	// A wrapper that returns an error means the front protocol refused this
+	// connection (a failed handshake, a non-WS request). The connection is
+	// dropped and the listener keeps serving: a bad client must never take the
+	// tunnel down.
+	wrapConn func(net.Conn) (net.Conn, error)
 }
 
 // errNotRunning is returned by internal helpers that require a bound listener.
@@ -144,7 +146,7 @@ func (t *pipeTracker) start(p pick) error {
 		t.mu.Unlock()
 		return ErrAlreadyStarted
 	}
-	ln, err := t.bindListener(t.cfg.ListenAddr())
+	ln, err := net.Listen("tcp", t.cfg.ListenAddr())
 	if err != nil {
 		t.mu.Unlock()
 		return err
@@ -189,6 +191,17 @@ func (t *pipeTracker) acceptLoop(ln net.Listener, p pick) {
 			// and "drain flag set" is resolved in the drain's favour.
 			_ = conn.Close()
 			return
+		}
+		if t.wrapConn != nil {
+			// Wrap BEFORE the connection is counted: a connection the front
+			// protocol refuses is not a live tunnelled connection, and counting
+			// it would make a drain wait for a client that never negotiates.
+			wrapped, err := t.wrapConn(conn)
+			if err != nil {
+				_ = conn.Close()
+				continue
+			}
+			conn = wrapped
 		}
 		atomic.AddInt32(&t.conns, 1)
 		t.inFlight.Add(1)

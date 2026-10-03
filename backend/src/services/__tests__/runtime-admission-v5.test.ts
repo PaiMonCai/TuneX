@@ -76,11 +76,11 @@ describe("admitOnNode", () => {
   });
 
   test("a protocol the panel has not opened is refused even when the node advertises it", () => {
-    const futuristic = v2({ manifest: fullManifest({ protocols: ["tcp", "tls", "udp", "quic", "ws"] }) });
-    // `tls` is NOT in this list any more: V5-WP5-A1 opened it (and the node
-    // advertising it is admitted). The product gate still refuses everything
-    // whose Gate has not run.
-    for (const protocol of ["udp", "quic", "ws"]) {
+    const futuristic = v2({ manifest: fullManifest({ protocols: ["tcp", "tls", "ws", "udp", "quic"] }) });
+    // `tls` (A1) and `ws` (A2) are NOT in this list any more: they are open, and
+    // a node advertising them is admitted. The product gate still refuses
+    // everything whose Gate has not run.
+    for (const protocol of ["udp", "quic"]) {
       expect(admitOnNode(ingress(futuristic), { action: "apply_tunnel", protocol })).toMatchObject({
         ok: false,
         layer: "protocol",
