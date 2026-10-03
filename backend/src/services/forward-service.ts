@@ -51,7 +51,6 @@ import { checkForwardRuntimeUse } from "./forward-capability.ts";
 import { authorizationErrorLayer, type AuthorizationErrorLayer } from "./authorization-errors.ts";
 import type { ForwardPage } from "./forward-list-query.ts";
 import {
-  DEFAULT_FORWARD_PROTOCOL,
   legacyTunnelTypeForForwardProtocol,
   normalizeForwardProtocol,
   persistedForwardProtocol,
@@ -1265,11 +1264,15 @@ async function resolveForwardCandidate(
   }
 
   if (!isMetadataOnlyPatch(base, candidate)) {
+    const admittedProtocol = normalizeForwardProtocol(candidate.protocol);
+    if (admittedProtocol === null) {
+      return { ok: false, error: error(400, "invalid_input", "当前版本不支持该转发协议") };
+    }
     const rejected = await checkForwardRuntimeUse(workspaceId, {
       user_id: current.user_id,
       in_node_group_id: ingress.node_group_id,
       out_node_group_id: candidate.mode === "relay" ? egress?.node_group_id ?? null : null,
-      tunnel_type: normalizeForwardProtocol(candidate.protocol) ?? DEFAULT_FORWARD_PROTOCOL,
+      tunnel_type: admittedProtocol,
     });
     if (rejected) {
       return { ok: false, error: error(403, rejected.reason, rejected.message, {

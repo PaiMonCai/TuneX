@@ -1271,10 +1271,19 @@ async function checkExistingRuntime(
       (row.tunnel_mode === "relay" && !validId(outGroup))) {
     return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或实际节点组已失效" };
   }
+  const protocol = admittedPersistedProtocol(row);
+  if (protocol === null) {
+    return {
+      code: "policy_denied",
+      reason: "protocol_not_supported",
+      error_layer: "capability",
+      message: "该转发使用的历史协议尚未进入 V5 runtime 白名单",
+    };
+  }
   return deps.runtimeUse(row.workspace_id, {
     user_id: row.user_id, in_node_group_id: inGroup,
     out_node_group_id: outGroup as number | null,
-    tunnel_type: typeof row.tunnel_type === "string" ? row.tunnel_type : "tcp",
+    tunnel_type: protocol,
   });
 }
 
