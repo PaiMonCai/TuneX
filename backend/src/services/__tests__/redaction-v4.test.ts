@@ -85,7 +85,7 @@ describe("key-based redaction", () => {
 
 describe("value-shape redaction", () => {
   const privateKey = [
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----", // secret-scan:allow — intentional fake redaction fixture
     "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW",
     "-----END OPENSSH PRIVATE KEY-----",
   ].join("\n");
@@ -190,7 +190,7 @@ describe("defence in depth", () => {
     // Even if a future collector loosens the key whitelist, a PEM in an
     // innocuous field must not escape.
     const out = redact({
-      note: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----",
+      note: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----", // secret-scan:allow — intentional fake redaction fixture
     }) as Record<string, string>;
     expect(out.note).toBe(REDACTED);
   });
