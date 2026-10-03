@@ -10,10 +10,12 @@
 --   * non-TCP legacy rows stay NULL: their old enum value must never be reinterpreted
 --     as TCP merely because V4/V5 no longer implements that old data plane;
 --   * revision history is TCP by construction and receives a non-null snapshot field.
+-- VARCHAR is deliberate: adding a future protocol is an application-contract/Gate
+-- change, not a table-enum rewrite. Unknown persisted values still fail closed.
 -- No runtime behavior changes in this migration.
 
 ALTER TABLE `tunnel`
-  ADD COLUMN `forward_protocol` ENUM('tcp') NULL;
+  ADD COLUMN `forward_protocol` VARCHAR(16) NULL;
 
 UPDATE `tunnel`
 SET `forward_protocol` = 'tcp'
@@ -25,4 +27,4 @@ CREATE INDEX `tunnel_forward_protocol_idx`
   ON `tunnel`(`forward_protocol`);
 
 ALTER TABLE `forward_revision`
-  ADD COLUMN `protocol` ENUM('tcp') NOT NULL DEFAULT 'tcp' AFTER `mode`;
+  ADD COLUMN `protocol` VARCHAR(16) NOT NULL DEFAULT 'tcp' AFTER `mode`;

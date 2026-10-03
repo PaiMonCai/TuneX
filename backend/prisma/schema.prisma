@@ -35,15 +35,6 @@ enum TunnelMode {
   relay
 }
 
-/// V5-WP0 产品层 Forward 协议。
-///
-/// 与 legacy TunnelType **不是同一个契约**：TunnelType 历史上同时混入 mtcp /
-/// tunex / mwss 等实现/包装名称，枚举值存在不代表 V5 产品已支持。V5 新代码只认
-/// 本枚举作为产品协议真相；每新增一个值都必须先经过对应独立 Gate。
-enum ForwardProtocol {
-  tcp
-}
-
 /// v3 第一版出口目标负载均衡策略（DEVELOPMENT.md §2.2）。
 ///
 /// 与 legacy `LoadBalanceType`（round/rand/fifo/hash/ll/lc）是**两套列**：
@@ -609,7 +600,7 @@ model Tunnel {
   /// V5-WP0 canonical product protocol. `tunnel_type` above remains a legacy
   /// compatibility projection; new Forward admission/runtime decisions must use
   /// this field. NULL is reserved for non-Forward/old pre-backfill rows.
-  forward_protocol ForwardProtocol?
+  forward_protocol String? @db.VarChar(16)
   /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?
@@ -718,7 +709,7 @@ model ForwardRevision {
 
   mode TunnelMode
   /// V5-WP0: protocol is part of the immutable runtime snapshot, orthogonal to mode.
-  protocol ForwardProtocol @default(tcp)
+  protocol String @default("tcp") @db.VarChar(16)
   ingress_node_id Int
   egress_node_id  Int?
   /// 用户请求的监听端口；NULL = 「自动分配」。与创建 contract 同义：
