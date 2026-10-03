@@ -873,6 +873,9 @@ export async function createRelayTunnel(
     data: {
       name: input.name,
       tunnel_type: input.tunnelType,
+      // The compatibility create service admits product protocols before this
+      // point. Keep legacy-only values uncanonicalized rather than relabeling them.
+      forward_protocol: input.tunnelType === "tcp" ? "tcp" : null,
       category: "port_forward",
       listen_ip: input.listenIp ?? null,
       listen_port: input.listenPort ?? null,
