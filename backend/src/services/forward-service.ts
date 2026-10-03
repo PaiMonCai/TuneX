@@ -235,7 +235,7 @@ export function forwardView(t: any) {
     id: t.id,
     creator_user_id: t.user_id ?? null,
     name: t.name,
-    protocol: persistedForwardProtocol(t.forward_protocol),
+    protocol: persistedForwardProtocol(t.forward_protocol, t.tunnel_type),
     mode: (t.tunnel_mode ?? "direct") as ForwardMode,
     ingress_node_id: t.ingress_node_id,
     ingress_node: t.ingress_node ?? null,

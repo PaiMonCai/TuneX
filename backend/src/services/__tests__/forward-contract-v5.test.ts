@@ -42,6 +42,13 @@ describe("V5-WP0 Forward protocol contract", () => {
     }
   });
 
+  test("legacy non-TCP rows are never reinterpreted as TCP", () => {
+    expect(() => persistedForwardProtocol(null, "wss")).toThrow(
+      "unsupported legacy Forward protocol",
+    );
+    expect(persistedForwardProtocol(null, "tcp")).toBe("tcp");
+  });
+
   test("explicit unknown persisted values fail closed", () => {
     expect(() => persistedForwardProtocol("carrier-pigeon")).toThrow(
       "unsupported persisted Forward protocol",

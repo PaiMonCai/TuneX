@@ -69,6 +69,7 @@ export interface ForwardRevisionRow {
   workspace_id: number;
   name: string;
   tunnel_mode: string | null;
+  tunnel_type?: string | null;
   forward_protocol?: string | null;
   ingress_node_id: number | null;
   egress_node_id: number | null;
@@ -217,7 +218,7 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
   return {
     name: row.name,
     mode: row.tunnel_mode === "relay" ? "relay" : "direct",
-    protocol: persistedForwardProtocol(row.forward_protocol),
+    protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
     ingress_node_id: row.ingress_node_id ?? 0,
     egress_node_id: row.egress_node_id ?? null,
     // 注意：这里取**请求值**语义的表格。存量行没有 snapshot，listen_port 列
@@ -707,6 +708,7 @@ export async function ensureForwardBaselineRevision(
         category: true,
         name: true,
         tunnel_mode: true,
+        tunnel_type: true,
         forward_protocol: true,
         ingress_node_id: true,
         egress_node_id: true,
@@ -756,7 +758,7 @@ export async function ensureForwardBaselineRevision(
             name: row.name,
             desired_status: row.desired_status ?? "active",
             mode: row.tunnel_mode === "relay" ? "relay" : "direct",
-            protocol: persistedForwardProtocol(row.forward_protocol),
+            protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
             listen_ip: row.listen_ip,
@@ -822,6 +824,7 @@ export async function createForwardRevision(
         config_revision: true,
         name: true,
         tunnel_mode: true,
+        tunnel_type: true,
         forward_protocol: true,
         ingress_node_id: true,
         egress_node_id: true,

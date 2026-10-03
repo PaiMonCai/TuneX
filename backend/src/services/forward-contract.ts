@@ -61,8 +61,22 @@ export function normalizeForwardProtocol(
  * expand-and-contract compatibility state and means the V4 TCP baseline.
  * A non-null unknown value is corruption and fails closed.
  */
-export function persistedForwardProtocol(value: unknown): ForwardProtocol {
+export function persistedForwardProtocol(
+  value: unknown,
+  legacyTunnelType?: unknown,
+): ForwardProtocol {
   if (value === undefined || value === null || value === "") {
+    if (
+      legacyTunnelType !== undefined &&
+      legacyTunnelType !== null &&
+      legacyTunnelType !== "" &&
+      String(legacyTunnelType).toLowerCase() !== DEFAULT_FORWARD_PROTOCOL
+    ) {
+      throw new Error(
+        "unsupported legacy Forward protocol without canonical value: " +
+          String(legacyTunnelType),
+      );
+    }
     return DEFAULT_FORWARD_PROTOCOL;
   }
   const parsed = normalizeForwardProtocol(value);
