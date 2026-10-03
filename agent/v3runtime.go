@@ -189,6 +189,11 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			Credential: cfg.NodeCredential,
 		},
 			reporter.WithTunnels(tunnels),
+			// V5-WP5-A3: the per-tunnel protocol diagnostics ride the state report.
+			// The manager is the source because it owns the running registry — the
+			// counters live in the runtime that observed the events; the panel only
+			// ever displays them.
+			reporter.WithDiagnostics(tunnels),
 			reporter.WithEgress(egressAdapter{egress}),
 			reporter.WithPorts(tunnels),
 			reporter.WithRevision(tunnels),

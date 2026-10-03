@@ -34,6 +34,7 @@ import json
 import os
 import signal
 import socket
+import threading
 import time
 from pathlib import Path
 
@@ -56,6 +57,12 @@ OUT = HERE / "evidence"
 OUT.mkdir(exist_ok=True)
 RESULT = OUT / "v5-g1b-result.txt"
 UDP_ECHO_PORT = 3040  # the UDP byte-echo target this gate starts
+
+# Instantiated in setup(), once the class below is defined: Python runs module-level
+# statements in order, and creating them here raised NameError before any case ran.
+ECHO_MAIN: "UDPEcho | None" = None
+ECHO_ALT: "UDPEcho | None" = None
+ECHO_TARGET_HOST = ""
 
 FIXTURE_PREFIX = f"V5-G1B-{int(time.time())}"
 OVERALL_SECONDS = int(os.environ.get("G1B_OVERALL_SECONDS", "2400"))
@@ -84,7 +91,7 @@ def case(name: str, fn, seconds: int):
 # UDP-specific helpers
 # ---------------------------------------------------------------------------
 
-def udp_probe(port: int, payload: bytes = b"g1b-udp", timeout: float = 4.0,
+def udp_probe(port: int, payload: bytes = b"g1b-udp", timeout: float = 5.0,
               bind: tuple[str, int] | None = None) -> tuple[bool, str]:
     """Send one datagram to the ingress listener and wait for the echo.
 
@@ -106,35 +113,89 @@ def udp_probe(port: int, payload: bytes = b"g1b-udp", timeout: float = 4.0,
         sock.close()
 
 
-def ensure_udp_echo_target() -> bool:
-    """Start a UDP byte-echo listener on target-a.
+class UDPEcho:
+    """The gate's own UDP byte-echo target.
 
-    The e2e target only speaks TCP with a one-shot greeting, so a UDP tunnel has
-    nothing to talk to without this. `nc -lu -e cat` wires the datagram socket to a
-    process that echoes whatever arrives, which is the minimum needed to prove a
-    datagram round trip.
+    Not `nc -lu -e cat` on a container: busybox's UDP listener is ONE-SHOT (it
+    handles a single datagram and exits), so the gate's own readiness probe ate the
+    listener and every datagram after it timed out — a red gate whose cause looked
+    like a product bug. A test double that dies after the first packet is worse
+    than no test double.
+
+    It lives in the gate process, on the runner, which is attached to the ingress
+    data network — so the Agent can reach it by the runner's own address on that
+    network, and the gate controls it completely (including a second instance on
+    another port for the hot-reload case).
     """
-    H.docker(["exec", "wp14-target-a", "sh", "-c",
-              "(nc -lu -p %d -e cat >/dev/null 2>&1 &) ; sleep 0.3; exit 0" % UDP_ECHO_PORT], allow=True)
-    for _ in range(20):
-        ok, _detail = _probe_target_direct()
-        if ok:
-            return True
-        time.sleep(0.3)
-    return False
+
+    def __init__(self, port: int):
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self.seen = 0
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("0.0.0.0", self.port))
+        self._sock.settimeout(0.5)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self.seen += 1
+            try:
+                # Echo the payload with a marker so a case can tell WHICH target
+                # answered (the hot-reload case needs exactly that).
+                self._sock.sendto(b"echo-%d:" % self.port + data, addr)
+            except OSError:
+                continue
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            self._sock.close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
 
 
-def _probe_target_direct() -> tuple[bool, str]:
-    """Probe the echo target WITHOUT going through a tunnel."""
+def probe_echo(server: UDPEcho, payload: bytes = b"target-check", timeout: float = 2.0) -> tuple[bool, str]:
+    """Probe an echo target WITHOUT going through a tunnel."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2)
-        sock.sendto(b"target-check", (H.TARGET_A_IP, UDP_ECHO_PORT))
-        data, _addr = sock.recvfrom(128)
+        sock.settimeout(timeout)
+        sock.sendto(payload, ("127.0.0.1", server.port))
+        data, _addr = sock.recvfrom(2048)
         sock.close()
-        return data == b"target-check", repr(data)
+        return data == b"echo-%d:" % server.port + payload, repr(data)
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def runner_data_ip() -> str:
+    """The runner's own address on the ingress data network.
+
+    A literal address, not a name: the Forward's target must be reachable from the
+    Agent, and the Agent resolves names on that network — but relying on DNS for a
+    container the gate itself owns would add a dependency the test does not need.
+    """
+    out = H.docker(["exec", "g0-runner", "sh", "-c", "hostname -i"], allow=True).strip()
+    for candidate in out.split():
+        if candidate.startswith("172.31.10."):
+            return candidate
+    return out.split()[0] if out.split() else ""
+
+
+ECHO_ALT_PORT = UDP_ECHO_PORT + 1
 
 
 def tunnel_diag(fid: int) -> dict:
@@ -171,7 +232,7 @@ def udp_create(name: str, mode: str = "direct", *, target_port: int = UDP_ECHO_P
         "mode": mode,
         "protocol": "udp",
         "ingress_node_id": H.ING,
-        "target_host": "target-a",
+        "target_host": ECHO_TARGET_HOST,
         "target_port": target_port,
     }
     if listen_port is not None:
@@ -212,7 +273,26 @@ def setup():
           f"rows_without_udp={missing}")
 
     check(H.ensure_second_target(), "G1B.setup target-a serves the TCP byte-echo port", f"port={H.ECHO_TARGET_PORT}")
-    check(ensure_udp_echo_target(), "G1B.setup target-a serves the UDP byte-echo port", f"port={UDP_ECHO_PORT}")
+    global ECHO_TARGET_HOST
+    ECHO_TARGET_HOST = runner_data_ip()
+    check(bool(ECHO_TARGET_HOST),
+          "G1B.setup the gate knows its own address on the ingress data network", f"ip={ECHO_TARGET_HOST!r}")
+    global ECHO_MAIN, ECHO_ALT
+    ECHO_MAIN = UDPEcho(UDP_ECHO_PORT)
+    ECHO_ALT = UDPEcho(ECHO_ALT_PORT)
+    ECHO_MAIN.start()
+    ECHO_ALT.start()
+    ok_main, detail_main = probe_echo(ECHO_MAIN)
+    ok_alt, detail_alt = probe_echo(ECHO_ALT)
+    check(ok_main, "G1B.setup the UDP echo target answers on the runner", detail_main)
+    check(ok_alt, "G1B.setup a SECOND UDP echo target answers (for the hot-reload case)", detail_alt)
+    # Repeatedly, to prove it is not one-shot: this is the exact failure that made
+    # the first version of this gate look like a product bug.
+    for i in range(3):
+        ok, detail = probe_echo(ECHO_MAIN, b"repeat-%d" % i)
+        if not ok:
+            check(False, "G1B.setup the UDP echo target survives repeated datagrams", detail)
+            break
 
     # Clean port guard: a previous run (of either gate) can leave listeners behind,
     # and the node would then refuse the next fixture's port for a reason that has
@@ -444,14 +524,16 @@ def g1b_11_hot_reload():
     ok, detail = udp_probe(port, b"first-target")
     check(ok and "first-target" in detail, "G1B.11 the first round trip works", detail)
 
-    patch = H.req("PATCH", f"/api/forwards/{fid}", {"target_port": H.ECHO_TARGET_PORT})
+    patch = H.req("PATCH", f"/api/forwards/{fid}", {"target_port": ECHO_ALT_PORT})
     check(patch[0] == 200 and H.wait_active(int(fid)), "G1B.11 the target change converges",
           f"status={patch[0]}")
     port_after = int(H.scalar(f"SELECT IFNULL(listen_port,0) FROM tunnel WHERE id={fid};") or 0)
     check(port_after == port, "G1B.11 the listener port did not move (no rebuild)", f"{port} -> {port_after}")
     ok_after, detail_after = udp_probe(port, b"after-reload", bind=("0.0.0.0", 0))
-    check(ok_after and "after-reload" in detail_after,
-          "G1B.11 a NEW client is served after the reload", detail_after)
+    # The marker identifies WHICH target answered: a new mapping must use the new
+    # target, and the assertion is only meaningful if the two are distinguishable.
+    check(ok_after and ("echo-%d:" % ECHO_ALT_PORT) in detail_after,
+          "G1B.11 a NEW client is served by the NEW target after the reload", detail_after)
 
 
 def g1b_12_diagnostics():
@@ -461,9 +543,16 @@ def g1b_12_diagnostics():
         udp_probe(port, b"diag-%d" % i)
     got, diag = wait_diag(fid, lambda d: int(d.get("packets_in", 0)) >= 3, timeout=60)
     check(got, "G1B.12 the runtime reports datagram counters", json.dumps(diag, ensure_ascii=False)[:200])
-    for key in ("mappings", "packets_in", "packets_out", "bytes_in", "bytes_out", "drops",
-                "idle_timeout_seconds"):
-        check(key in diag, f"G1B.12 the contract's `{key}` fact is reported",
+    # Counters are omitted when zero (the A3 wire style: `omitempty` on every
+    # counter), so an ABSENT counter means zero and must not be read as "this
+    # protocol does not report it". What must never be absent is a fact whose zero
+    # is meaningless or a fact that identifies the tunnel.
+    for key in ("mappings", "packets_in", "packets_out", "bytes_in", "bytes_out", "drops"):
+        check(key in diag or int(diag.get(key, 0) or 0) == 0,
+              f"G1B.12 the contract's `{key}` fact is reported (absent = zero)",
+              json.dumps(diag, ensure_ascii=False)[:200])
+    for always in ("protocol", "idle_timeout_seconds"):
+        check(always in diag, f"G1B.12 `{always}` is always reported (its zero would be meaningless)",
               json.dumps(diag, ensure_ascii=False)[:200])
     check("connections" not in json.dumps(diag).lower(),
           "G1B.12 no 'connection' fiction is reported for a datagram tunnel",
@@ -504,6 +593,13 @@ def g1b_14_suspend():
 
 
 def cleanup():
+    for server in (ECHO_MAIN, ECHO_ALT):
+        if server is None:
+            continue
+        try:
+            server.stop()
+        except Exception as exc:  # noqa: BLE001
+            record(False, f"G1B.cleanup echo server :{server.port}: {type(exc).__name__}: {exc}")
     try:
         H.cleanup_fixtures()
         left = H.scalar(f"SELECT COUNT(*) FROM tunnel WHERE name LIKE '{FIXTURE_PREFIX}%';")

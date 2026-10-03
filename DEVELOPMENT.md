@@ -1430,9 +1430,9 @@ Gate V5-G1A
 >
 > ~~~text
 > WP5-B0  datagram 语义契约         DONE（上文链接）
-> WP5-B1  UDP DIRECT               进行中（agent 侧 datagram runtime + 面板侧开协议）
+> WP5-B1  UDP DIRECT               **DONE**（Gate V5-G1B GREEN 76/0）
 > WP5-B2  UDP RELAY                阻塞：跨节点跳的形态是开放产品决策，不猜
-> Gate V5-G1B                      B1 完成后写脚本
+> Gate V5-G1B                      **GREEN PASS=76 / FAIL=0**（`scripts/v3-e2e/v5-g1b.py`，证据 `docs/evidence/v5-g1b-result-20261004.txt`）
 > ~~~
 >
 > **已冻结的结论（摘要）**
@@ -1515,6 +1515,28 @@ client → ingress → egress → target
 不要同时调试两种拓扑。
 
 ### Gate V5-G1B
+
+**执行结果：PASS=76 / FAIL=0**（真实四 Agent 拓扑；证据 `docs/evidence/v5-g1b-result-20261004.txt`）
+
+覆盖：流协议回归（tcp/tls/ws 未被新协议破坏）、udp DIRECT 数据报往返、映射语义（两个客户端两条映射、目标不进键）、
+空闲过期（按 runtime **自己上报**的超时等待，不猜常量）、udp+RELAY 被拒、畸形/超大报文、
+旧 Agent 准入、Agent 重启、Panel 重启、TCP/UDP 不共享端口号、热重载（新映射走新目标且端口不动）、
+诊断事实、无载荷泄漏、suspend。
+
+**这一阶段抓到的真实缺陷**
+
+| # | 缺陷 | 说明 |
+|---|---|---|
+| 1 | **A3 的诊断通道在生产里根本没接上** | `reporter.WithDiagnostics` 有实现、有单测，但 `v3runtime.go` 从未调用它 —— 单测直接构造 reporter，所以永远测不出"生产没接线"。症状是每条隧道的 `diag` 都不存在，只有端到端 Gate 能发现。 |
+| 2 | 只改证书路径的 PATCH 被判成 metadata-only | 接口回 200，新路径既不落库也不下发 —— "轮换成功"却继续用旧证书。（web 侧发现，已在 A1 的修复提交里修掉） |
+| 3 | udp+RELAY 面板不设防 | 边界只写在 Agent 一侧，面板可以建出一个永远不会生效的转发。已在纯校验层加 `datagram_relay_unsupported`。 |
+| 4 | gate 自己的 UDP echo target 是一次性的 | busybox `nc -lu` 收一个报文就退出，gate 的"就绪探测"把它吃掉了 —— 于是每条数据报都超时，看起来像产品故障。gate 现在自带 echo 服务（可重复、可区分目标）。 |
+| 5 | gate 会与自身并发 | 两个 gate 进程同时改共享拓扑（一个种假 Agent 清单、一个建 ws 转发）→ 幽灵故障。现在有单实例锁。 |
+
+**关于 UDP 的开放决策**：B2（UDP RELAY）**未做**，因为跨节点跳的形态是开放产品决策（见 §6.2 与契约 §9.1）。
+这不是"跳过"：契约冻结了 B1 只做 DIRECT，Gate 也把"RELAY 必须被拒绝"作为通过条件之一。
+实现层为其余开放项选了**有文档、可注入**的默认值（空闲 30s、映射上限 1024、超限丢新映射、拨号 3s 上限、
+读错误退避 20ms；最坏内存约 64 MiB/隧道）。
 
 至少：
 
