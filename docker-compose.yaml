@@ -34,7 +34,12 @@ services:
     image: redis:7.4-alpine
     container_name: tunex-redis
     restart: always
-    command: ["redis-server", "--appendonly", "yes"]
+    # AOF 关闭（与 docker-compose.prod.yaml 一致）：scripts/ops/backup.sh 走
+    # BGSAVE→拷贝 dump.rdb，scripts/ops/restore.sh 走"停 redis→替换 dump.rdb→拉起"。
+    # Redis 7 一旦开启 appendonly，数据改为从 appendonlydir/*.aof 加载，替换
+    # dump.rdb 会被完全忽略——备份看起来成功、恢复也"成功"，但数据没变。
+    # 开发栈此前开着 AOF，与生产的 RDB 语义不一致，恢复演练因此无法代表生产。
+    command: ["redis-server"]
     # 主机端口仅用于本机调试；容器间通过 compose 网络直连（redis:6379）。
     # 默认主机端口 6380；若本机已被占用可用 REDIS_HOST_PORT 覆盖。
     ports:

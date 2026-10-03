@@ -79,7 +79,13 @@ docker compose version >/dev/null 2>&1 || die "docker compose v2 不可用" 2
 
 cd "$PROJECT_ROOT"
 if [[ -f "$PROJECT_ROOT/.env" ]]; then set -a; . "$PROJECT_ROOT/.env"; set +a; fi
-COMPOSE=(docker compose -p tunex -f "$COMPOSE_FILE")
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-tunex}"
+# COMPOSE_ENV_FILE lets the same scripts run against a stack whose compose file
+# needs extra variables (e.g. the e2e topology), so a real drill is possible.
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-}"
+COMPOSE_BASE=(docker compose -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE")
+[[ -n "$COMPOSE_ENV_FILE" ]] && COMPOSE_BASE+=(--env-file "$COMPOSE_ENV_FILE")
+COMPOSE=("${COMPOSE_BASE[@]}")
 
 # svc_running <service> —— 便携式"服务是否 running"检查。
 # 不同 compose 版本对 `ps --status` 支持不一（v2.28 无该 flag），
@@ -90,8 +96,15 @@ svc_running() {
     | awk -v s="$svc" '$1==s && $2 ~ /^running/ {found=1} END{exit found?0:1}'
 }
 
-TUNEX_API_PORT="${TUNEX_API_PORT:-13001}"
+# WP11D: the prod compose publishes the backend on TUNEX_API_PORT (13001), while
+# the dev compose publishes it on BACKEND_HOST_PORT (8787). Reading the port from
+# the environment in use — instead of hard-coding the prod default — keeps the
+# rollback gate honest on both stacks.
+TUNEX_API_PORT="${TUNEX_API_PORT:-${BACKEND_HOST_PORT:-13001}}"
 ROLLBACK_HEALTH_URL="${ROLLBACK_HEALTH_URL:-http://127.0.0.1:${TUNEX_API_PORT}/healthz}"
+# Readiness (checks MySQL + Redis) is what a rollback must actually prove;
+# /healthz alone answers "the HTTP process is up", which is not the question.
+ROLLBACK_READY_URL="${ROLLBACK_READY_URL:-http://127.0.0.1:${TUNEX_API_PORT}/readyz}"
 
 # --- 当前状态指纹 ------------------------------------------------------------
 current_state() {
@@ -234,32 +247,55 @@ log "  详见 $OPS_DIR/rollback-up.log"
 log "[5/6] 健康验证（超时 ${HEALTH_TIMEOUT}s）"
 deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
 ok=0
+code=000; ready=000
 while [[ $(date +%s) -lt $deadline ]]; do
-  # /healthz 必须 200
+  # /healthz 必须 200（进程活着）
   code="$(curl -fsS -o /dev/null -w '%{http_code}' -m 3 \
     "$ROLLBACK_HEALTH_URL" 2>/dev/null || echo 000)"
+  # /readyz 必须 200（MySQL + Redis 都可用）：进程活着但依赖不可用不是回滚成功
+  ready="$(curl -fsS -o /dev/null -w '%{http_code}' -m 3 \
+    "$ROLLBACK_READY_URL" 2>/dev/null || echo 000)"
   # 三个服务 running
   running=1
   for s in backend worker web; do
     svc_running "$s" || running=0
   done
-  if [[ "$code" == "200" && "$running" -eq 1 ]]; then ok=1; break; fi
+  if [[ "$code" == "200" && "$ready" == "200" && "$running" -eq 1 ]]; then ok=1; break; fi
   sleep 3
 done
 
 if [[ $ok -ne 1 ]]; then
-  log "  ⚠️ 健康检查未通过（healthz=$code running=$running）—— 自动回退"
+  log "  ⚠️ 健康检查未通过（healthz=$code readyz=$ready running=$running）—— 自动回退"
   cp "$OPS_DIR/.env.before-rollback" "$ENV_FILE"
   "${COMPOSE[@]}" up -d backend worker web >> "$OPS_DIR/rollback-up.log" 2>&1 || true
   die "回滚未通过健康检查，已自动回退到上一版本。请人工介入：docker compose ps + logs" 1
 fi
-log "  healthz=200, backend/worker/web 全部 running ✅"
+log "  healthz=200, readyz=200, backend/worker/web 全部 running ✅"
+
+# --- 6.5 迁移兼容性自检 ------------------------------------------------------
+# Rolling the Panel image back to an older build while the database already
+# carries newer migrations is the failure mode this check exists for: the older
+# code would run against a schema it does not understand. `prisma migrate status`
+# reports unapplied migrations, so a mismatch is surfaced instead of assumed away.
+log "[5.5/6] 迁移兼容性（旧镜像 vs 当前 schema）"
+MIG_OUT="$OPS_DIR/rollback-migrate-status.log"
+if "${COMPOSE[@]}" exec -T backend bunx prisma migrate status >"$MIG_OUT" 2>&1; then
+  log "  prisma migrate status OK"
+elif grep -qi "pending" "$MIG_OUT"; then
+  warn "  ⚠️ 存在尚未应用的迁移 —— 该镜像可能带新 schema；详见 $MIG_OUT"
+  warn "  回滚仅覆盖面板镜像；如需 schema 回退请用 restore.sh 恢复数据层"
+else
+  warn "  迁移状态无法确认（bunx prisma 不可用？）—— 详见 $MIG_OUT"
+fi
 
 # --- 7. 记录 + 数据层可选回滚 -------------------------------------------------
 log "[6/6] 写回滚记录"
 jq -nc --arg t "$(date -Iseconds)" --arg from "$(jq -r '.digest' <<<"$CUR_STATE")" \
   --arg to "$TUNEX_IMG" --arg data "$DO_DATA" \
   '{at:$t, action:"rollback", from:$from, to:$to, data_restore:($data=="1")}' >> "$HISTORY"
+
+log "  注意：本脚本只回退面板镜像。Agent 镜像由节点侧安装命令固定（TUNEX_AGENT_IMAGE），"
+log "       需要回退时应在节点上重新执行一次带目标镜像的安装命令（Node → 一键安装）。"
 
 if [[ $DO_DATA -eq 1 ]]; then
   log "数据层回滚 → 调用 restore.sh（最新备份）"
