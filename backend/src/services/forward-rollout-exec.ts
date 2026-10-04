@@ -1343,6 +1343,7 @@ export async function compensateRollout(
   // 尝试切过去的那个**拓扑，而 tunnel 行可能已被后续编辑改写。
   const removeRevision = row.revision + 1;
   const planned = planSnapshot(row.steps, "desired");
+  const baselinePlanned = planSnapshot(row.steps, "applied");
   const plannedMiddle = (planned as { middle_node_id?: number | null }).middle_node_id ?? null;
   const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number; isIngress?: boolean }> = [
     { direction: "egress", nodeId: planned.egress_node_id ?? 0 },
@@ -1380,7 +1381,7 @@ export async function compensateRollout(
   if (
     plannedIngressRemoved &&
     planned.ingress_node_id &&
-    planned.ingress_node_id !== baseline.ingress_node_id
+    planned.ingress_node_id !== baselinePlanned.ingress_node_id
   ) {
     const released = await orchestrator.releaseOwnership({
       tunnelId: row.tunnel_id,
