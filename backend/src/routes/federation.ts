@@ -345,7 +345,17 @@ federationRoutes.post("/leases/:ref/apply", federationAuth(), async (c) => {
   const link = (body.link && typeof body.link === "object" ? body.link : {}) as Record<string, unknown>;
   const rawTargets = Array.isArray(link.targets) ? link.targets : Array.isArray(body.targets) ? body.targets : [];
   const targets = rawTargets as ApplyRemoteLeaseInput["targets"];
-  if (targets.length === 0) {
+  // next_hop 只对**入口腿**有意义（它要拨向下一跳）；出口腿靠 targets。
+  // 之前这里既没有转发 next_hop、又无条件要求 targets，于是"远端入口腿"经 HTTP 永远过不去 ——
+  // 服务层是支持的（有单测），红的却是那条真实通路。这正是"绿灯不等于那条路通"。
+  const nextHopRaw = link.next_hop ?? body.next_hop;
+  const nextHop = typeof nextHopRaw === "string" && nextHopRaw.trim() !== "" ? nextHopRaw.trim() : null;
+
+  if (lease.hop_role === "ingress") {
+    if (nextHop === null) {
+      return c.json(federationErrorBody("message_malformed", "入口腿的 apply 必须携带 link.next_hop"), 400 as never);
+    }
+  } else if (targets.length === 0) {
     // 出口腿没有目标等于一条永远不通的链路：拒绝，而不是发一条空配置上去。
     return c.json(federationErrorBody("message_malformed", "apply 必须携带至少一个 target（link.targets）"), 400 as never);
   }
@@ -354,6 +364,7 @@ federationRoutes.post("/leases/:ref/apply", federationAuth(), async (c) => {
     intent_id: body.intent_id,
     revision: Number(body.revision),
     targets,
+    next_hop: nextHop,
     lb_strategy:
       typeof link.lb_strategy === "string" ? link.lb_strategy : typeof body.lb_strategy === "string" ? body.lb_strategy : null,
     protocol: typeof link.protocol === "string" ? link.protocol : typeof body.protocol === "string" ? body.protocol : null,

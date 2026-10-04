@@ -465,3 +465,87 @@ maybe("WP14 federation: 撤销后可以按契约 §2.4 重新走带外 token 重
   assert.equal(current.status, "trusted");
   assert.equal(current.public_keys.length, 1, "重建信任后只应持有新密钥，旧密钥不得复活");
 });
+
+maybe("WP15 federation: 入口腿的 apply 经 HTTP 也能过（next_hop 必须被转发）", async () => {
+  await resetFederationTables();
+  await ensureIdentityForTest();
+  await setFederationEnabled(true);
+  const peer = await makePeer("Peer Ingress");
+
+  // 造一条 ingress 租约（不经过 reserve，只为验证路由形状）。租约对 grant 有外键，先建一条 grant。
+  const grant = await db.federationGrant.create({
+    data: {
+      peer_id: peer.peer.id,
+      grant_ref: `grant-${crypto.randomUUID().slice(0, 8)}`,
+      grant_epoch: 1,
+      status: "active",
+      scope: { hop_roles: ["ingress", "egress"], node_group_ids: [1] },
+      capacity: {},
+      expires_at: new Date(Date.now() + 3_600_000),
+    },
+  });
+  const leaseRef = `lease-ing-${crypto.randomUUID().slice(0, 8)}`;
+  await db.federationLease.create({
+    data: {
+      lease_ref: leaseRef,
+      grant_id: grant.id,
+      peer_panel_id: peer.panelId,
+      forward_ref: "fw-ingress-1",
+      intent_id: "intent-ingress-1",
+      state: "reserved",
+      lease_epoch: 1,
+      hop_role: "ingress",
+      node_id: null,
+      listen_port: 24001,
+      requested_revision: 1,
+      expires_at: new Date(Date.now() + 300_000),
+    },
+  });
+
+  // 契约 §3.2 的形状：link.next_hop + 空 targets（入口腿靠 next_hop，不靠 targets）
+  const ok = await signedPost(
+    `/api/federation/v1/leases/${leaseRef}/apply`,
+    { intent_id: "intent-ingress-1", revision: 1, link: { protocol: "tcp", next_hop: "203.0.113.9:443", targets: [] } },
+    peer.keys,
+    peer.panelId,
+  );
+  // 这里不断言 200（下发需要真实 orchestrator/agent）：断言的是**路由必须把 next_hop 转下去** ——
+  // 如果路由丢掉 next_hop 或无条件要 targets，就会是 400 message_malformed。
+  assert.notEqual(ok.res.status, 400, `next_hop 必须被转发；实际 ${ok.res.status} ${JSON.stringify(await ok.res.json())}`);
+
+  // 反例：入口腿缺 next_hop → 必须 fail-closed（不猜地址）
+  const missing = await signedPost(
+    `/api/federation/v1/leases/${leaseRef}/apply`,
+    { intent_id: "intent-ingress-1", revision: 1, link: { protocol: "tcp", targets: [{ host: "203.0.113.9", port: 443 }] } },
+    peer.keys,
+    peer.panelId,
+  );
+  assert.equal(missing.res.status, 400);
+  assert.equal((await missing.res.json()).code, "message_malformed");
+
+  // 出口腿仍然必须有 targets
+  const leaseRef2 = `lease-eg-${crypto.randomUUID().slice(0, 8)}`;
+  await db.federationLease.create({
+    data: {
+      lease_ref: leaseRef2,
+      grant_id: grant.id,
+      peer_panel_id: peer.panelId,
+      forward_ref: "fw-egress-1",
+      intent_id: "intent-egress-1",
+      state: "reserved",
+      lease_epoch: 1,
+      hop_role: "egress",
+      listen_port: 24002,
+      requested_revision: 1,
+      expires_at: new Date(Date.now() + 300_000),
+    },
+  });
+  const noTargets = await signedPost(
+    `/api/federation/v1/leases/${leaseRef2}/apply`,
+    { intent_id: "intent-egress-1", revision: 1, link: { protocol: "tcp", targets: [] } },
+    peer.keys,
+    peer.panelId,
+  );
+  assert.equal(noTargets.res.status, 400);
+  assert.equal((await noTargets.res.json()).code, "message_malformed");
+});
