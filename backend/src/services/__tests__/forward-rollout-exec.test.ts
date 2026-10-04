@@ -522,9 +522,105 @@ function modeSwitchEnv() {
   return { f, deps: { db: f.db, runtimeUse: async () => null, orchestrator: orch } as RolloutDeps, orch };
 }
 
+
+/** V5.4：建一个「三跳 rev6 → 单跳 rev7」环境，专门覆盖 G4.6 的回切。 */
+function removeMiddleHopEnv() {
+  const f = fakeDb();
+  f.addLease({ node_id: 11, port: 10001, lease_type: "ingress", tunnel_id: 1, status: "active", expires_at: null });
+  f.addLease({ node_id: 22, port: 22000, lease_type: "egress", tunnel_id: 1, status: "active", expires_at: null });
+  f.addLease({ node_id: 23, port: 23000, lease_type: "egress", tunnel_id: 1, status: "active", expires_at: null });
+
+  f.addSnapshot({
+    tunnel_id: 1,
+    revision: 6,
+    name: "three-hop",
+    desired_status: "active",
+    mode: "relay",
+    ingress_node_id: 11,
+    egress_node_id: 22,
+    middle_node_id: 23,
+    listen_port: 10001,
+    target_host: null,
+    target_port: null,
+    egress_pool_id: 1,
+    egress_port: 22000,
+    targets: [{ host: "10.9.9.9", port: 8080, weight: 1, order_by: 10 }],
+    listen_ip: null,
+  });
+  f.addSnapshot({
+    tunnel_id: 1,
+    revision: 7,
+    name: "single-hop",
+    desired_status: "active",
+    mode: "relay",
+    ingress_node_id: 11,
+    egress_node_id: 22,
+    middle_node_id: null,
+    listen_port: 10001,
+    target_host: null,
+    target_port: null,
+    egress_pool_id: 1,
+    egress_port: 22000,
+    targets: [{ host: "10.9.9.9", port: 8080, weight: 1, order_by: 10 }],
+    listen_ip: null,
+  });
+  f.addTunnel({
+    id: 1,
+    name: "single-hop",
+    tunnel_mode: "relay",
+    ingress_node_id: 11,
+    egress_node_id: 22,
+    middle_node_id: null,
+    listen_ip: null,
+    listen_port: 10001,
+    remote_host: null,
+    remote_port: null,
+    egress_pool_id: 1,
+    egress_port: 22000,
+    config_revision: 7,
+    desired_revision_id: null,
+    desired_status: "active",
+    apply_status: "pending",
+    node_id: 11,
+  });
+
+  const orch = fakeOrchestrator({ egressHost: "10.0.1.22" });
+  const deps: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: orch, sleep: async () => {} };
+  return { f, deps, orch };
+}
+
 /* ------------------------------------------------------------------ */
 /* 1. 正常路径                                                          */
 /* ------------------------------------------------------------------ */
+
+describe("V5.4 middle-hop topology cutover", () => {
+  it("removing middle hop re-cuts ingress to egress, retires transit, and releases only the transit lease", async () => {
+    const { f, deps, orch } = removeMiddleHopEnv();
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ middle_node_change: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+
+    expect(res.ok).toBe(true);
+    expect(orch.calls.dispatchEgress).toHaveLength(1);
+    expect(orch.calls.dispatchIngress).toHaveLength(1);
+    expect(String(orch.calls.dispatchIngress[0]?.nextHop)).toBe("10.0.1.22:22000");
+
+    const transitRemovals = orch.calls.removeTunnel.filter(
+      (x) => Number((x.node as { id?: number } | undefined)?.id) === 23 && x.direction === "egress",
+    );
+    expect(transitRemovals.length).toBeGreaterThan(0);
+
+    expect(f.leases.find((l) => l.node_id === 23 && l.port === 23000)?.status).toBe("released");
+    expect(f.leases.find((l) => l.node_id === 22 && l.port === 22000)?.status).toBe("active");
+    expect(f.leases.find((l) => l.node_id === 11 && l.port === 10001)?.status).toBe("active");
+  });
+});
 
 describe("正常路径：五阶段推进到 done", () => {
   it("DIRECT 同节点换端口 ⇒ Agent 自行 retire 旧 listener，backend 不 remove 新 runtime", async () => {
