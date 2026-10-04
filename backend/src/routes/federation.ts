@@ -162,7 +162,10 @@ federationRoutes.post("/trust/revoke", federationAuth(), async (c) => {
 async function selectGrantNode(input: {
   scope: { node_group_ids?: number[] };
   hopRole: string;
-}): Promise<{ ok: true; nodeId: number; nodeGroupId: number } | { ok: false; code: FederationErrorCode; message: string }> {
+}): Promise<
+  | { ok: true; nodeId: number; nodeGroupId: number; nodeAddress: string | null }
+  | { ok: false; code: FederationErrorCode; message: string }
+> {
   const groupIds = Array.isArray(input.scope.node_group_ids) ? input.scope.node_group_ids : [];
   if (groupIds.length === 0) {
     return { ok: false, code: "grant_scope_violation", message: "该 grant 未授权任何节点组" };
@@ -177,7 +180,7 @@ async function selectGrantNode(input: {
       role: { in: wantedRole },
       state_report: { reported_at: { gt: freshCutoff } },
     },
-    select: { id: true, node_group_id: true },
+    select: { id: true, node_group_id: true, connect_ip: true },
     orderBy: { id: "asc" },
   });
   if (candidates.length === 0) {
@@ -195,21 +198,70 @@ async function selectGrantNode(input: {
   for (const cand of candidates) {
     if ((busy.get(cand.id) ?? 0) < (busy.get(best.id) ?? 0)) best = cand;
   }
-  return { ok: true, nodeId: best.id, nodeGroupId: best.node_group_id };
+  // 回给 home 的**必须是 host 自己的事实**：远端腿的下一条跳地址。home 不可能知道
+  // host 的节点地址，而"猜 IP"在这个项目里已经证明过一次是每个新连接都连不上的静默故障。
+  const address = typeof best.connect_ip === "string" ? best.connect_ip.split(",")[0]!.trim() : "";
+  return { ok: true, nodeId: best.id, nodeGroupId: best.node_group_id, nodeAddress: address === "" ? null : address };
 }
 
 federationRoutes.post("/leases", federationAuth(), async (c) => {
   const peer = peerOf(c)!;
   const ctx = c.get("federation") as FederationContext;
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!body || typeof body.grant_ref !== "string" || !body.intent || typeof body.intent !== "object") {
-    return c.json(federationErrorBody("message_malformed", "缺少 grant_ref / intent"), 400 as never);
+  if (!body || !body.intent || typeof body.intent !== "object") {
+    return c.json(federationErrorBody("message_malformed", "缺少 intent"), 400 as never);
   }
   const intent = body.intent as LeaseIntent;
-  const grant = await db.federationGrant.findUnique({
-    where: { grant_ref: body.grant_ref },
-    include: { peer: { select: { peer_panel_id: true } } },
-  });
+
+  // grant 的解析顺序（home 侧在**重连重发**时不可能记得 grant_ref，所以不能强制要求它）：
+  //   1. 显式给了 grant_ref → 用它（并校验属于调用方 peer）；
+  //   2. 没给，但同 (peer, intent_id) 已有非终态 lease → 沿用那条 lease 的 grant；
+  //   3. 都没有 → 若该 peer 恰有一条覆盖本 hop_role 的 active grant 就用它，
+  //      多于一条则拒绝并点名"必须显式指定"（含糊地替调用方选一条 = 用错额度）。
+  let grant =
+    typeof body.grant_ref === "string"
+      ? await db.federationGrant.findUnique({
+          where: { grant_ref: body.grant_ref },
+          include: { peer: { select: { peer_panel_id: true } } },
+        })
+      : null;
+
+  if (!grant) {
+    const liveLease = await db.federationLease.findFirst({
+      where: { peer_panel_id: peer.peer_panel_id, intent_id: intent.intent_id, state: { in: ["reserved", "active", "releasing"] } },
+      orderBy: { id: "desc" },
+    });
+    if (liveLease) {
+      grant = await db.federationGrant.findUnique({
+        where: { id: liveLease.grant_id },
+        include: { peer: { select: { peer_panel_id: true } } },
+      });
+    }
+  }
+
+  if (!grant) {
+    const candidates = await db.federationGrant.findMany({
+      where: { peer_id: peer.id, status: "active", expires_at: { gt: new Date() } },
+      include: { peer: { select: { peer_panel_id: true } } },
+    });
+    const hopRoleWanted = typeof intent.hop_role === "string" ? intent.hop_role : "";
+    const usable = candidates.filter((g) => {
+      const scope = g.scope as { hop_roles?: unknown };
+      const roles = Array.isArray(scope?.hop_roles) ? (scope.hop_roles as string[]) : [];
+      return roles.length === 0 || roles.includes(hopRoleWanted);
+    });
+    if (usable.length === 0) {
+      return c.json(federationErrorBody("grant_not_found", "该 peer 没有覆盖本次 hop_role 的有效 grant"), 404 as never);
+    }
+    if (usable.length > 1) {
+      return c.json(
+        federationErrorBody("grant_scope_violation", "该 peer 有多条可用 grant，必须在请求里显式指定 grant_ref"),
+        403 as never,
+      );
+    }
+    grant = usable[0]!;
+  }
+
   if (!grant) return c.json(federationErrorBody("grant_not_found", "grant 不存在"), 404 as never);
   // 跨面板身份：grant 必须属于**调用方这个 peer**（grant.peer_id → peer.peer_panel_id）。
   // 别人拿到 grant_ref 也不能用：grant_ref 是引用，不是凭据。
@@ -265,6 +317,7 @@ federationRoutes.post("/leases", federationAuth(), async (c) => {
       lease_epoch: outcome.lease_epoch,
       state: outcome.lease.state,
       node_ref: outcome.lease.node_id === null ? null : String(outcome.lease.node_id),
+      node_address: selected.nodeAddress,
       port: outcome.port,
       expires_at: outcome.expires_at.toISOString(),
       applied_revision: outcome.lease.applied_revision,
