@@ -69,6 +69,7 @@ import {
 } from "./control-protocol/index.ts";
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
 import { targetHealthWireEntries } from "./target-health-read.ts";
+import { claimLease } from "./placement-lease.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   wireTunnelTypeForForwardProtocol,
@@ -601,6 +602,72 @@ export class Orchestrator {
   }
 
   /* ---------------------------------------------------------------- */
+  /* 归属事实（V5.3 WP9）                                              */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * 本节点被授权承载该 Forward 的归属事实，或 nothing。
+   *
+   * 命令下发路径**必须**和快照路径一样带上它：V5 里"新事实只补了一条投递路径"已经踩过
+   * 三次（协议、证书路径、健康），每次的症状都是"重启后静默失效"。归属这里更严重：
+   * Agent 的 stale-epoch 栅栏以"见过的最高 epoch"为准，重启后若拿不到 epoch，它的栅栏
+   * 就归零 —— 一个已被降级的节点会重新开始服务。
+   */
+  /**
+   * 认领归属并返回要下发的归属事实；归属被别人持有且租约未过期时**拒绝下发**。
+   *
+   * 认领放在这里（与归属事实的附着同一处）有三个理由：
+   *   1. 调用方不可能忘记认领 —— 忘了就没有 epoch，Agent 的栅栏就永远不生效（"实现存在
+   *      但没有接线"在本项目已经出现过两次）；
+   *   2. 两阶段交接在这一处统一执行：**旧租约未过期就不许换主人**，任何走这条路的调用方
+   *      都自动获得这个保护；
+   *   3. 同一节点的重新下发 = 续约（claim 对现任是幂等的），所以 reconcile/resend 不会
+   *      把自己挡在门外。
+   */
+  private async claimOwnership(
+    tunnelId: number,
+    nodeId: number,
+    revision: number,
+  ): Promise<
+    | { ok: true; fields: { ownership_epoch?: number; lease_expires_at?: string } }
+    | { ok: false; error: string }
+  > {
+    let claim: Awaited<ReturnType<typeof claimLease>> | null = null;
+    try {
+      claim = await claimLease({ tunnelId, nodeId, revision, now: new Date() });
+    } catch {
+      claim = null;
+    }
+    if (claim === null) {
+      // 租约存储不可用（或无租约表可用，例如离线测试的桩）：**不下发 epoch，但也不拒绝**。
+      //
+      // 为什么不拒绝：面板侧的存储抖动不该变成数据面全量停发。安全方向由 Agent 侧保证 ——
+      // 它的栅栏是"拒绝低于已见最高的 epoch"，而**缺席按 0 处理**，所以一个已经见过真实
+      // epoch 的节点不会接受这次无 epoch 的激活（0 < highest ⇒ 拒绝）。于是"存储不可用"最多
+      // 让**从未归属过**的隧道照常上线，而不会让被降级的节点复活。
+      //
+      // 注意这与"归属被别人持有且未过期"是两件事：那种情况 claim 会**成功返回** ok:false，
+      // 必须拒绝下发（那才是双主风险）。
+      return { ok: true, fields: {} };
+    }
+    if (!claim.ok) {
+      return {
+        ok: false,
+        error:
+          `归属仍由节点 ${claim.current?.owner_node_id ?? "?"} 持有（租约未过期）：` +
+          "两阶段交接要求旧租约先过期或被显式释放，否则会同时服务两份流量",
+      };
+    }
+    return {
+      ok: true,
+      fields: {
+        ownership_epoch: claim.epoch,
+        lease_expires_at: claim.lease.lease_expires_at.toISOString(),
+      },
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
   /* 可达性                                                           */
   /* ---------------------------------------------------------------- */
 
@@ -647,6 +714,11 @@ export class Orchestrator {
     // failure to read it must never block a rollout — health is an optimization for
     // selection order, not a gate on whether a Forward may run. So a failure becomes
     // "no signal" (absent array), which the agent treats exactly like an older panel.
+    const ownership = await this.claimOwnership(input.tunnelId, input.egressNode.id, input.revision);
+    if (!ownership.ok) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+    }
+
     let targetHealth: AgentTunnelConfig["target_health"];
     try {
       const health = await this.healthSource(input.targets.map((t) => ({ host: t.host, port: t.port })));
@@ -669,6 +741,7 @@ export class Orchestrator {
       // Absent when there is no signal at all, so the wire says "nothing to say"
       // rather than "every target is unknown".
       ...(targetHealth ? { target_health: targetHealth } : {}),
+      ...ownership.fields,
       lb_strategy: normalizeLbStrategy(input.lbStrategy),
       protocol,
       speed_limit: 0,
@@ -793,6 +866,11 @@ export class Orchestrator {
 
     // The DIRECT listener is client-facing, so this is where TLS terminates.
     const tlsFields = Orchestrator.tlsFields(protocol, input);
+    const ownership = await this.claimOwnership(input.tunnelId, input.ingressNode.id, input.revision);
+    if (!ownership.ok) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+    }
+
     const config: AgentTunnelConfig = {
       id: directId,
       mode: "DIRECT",
@@ -807,6 +885,7 @@ export class Orchestrator {
       speed_limit: 0,
       revision: input.revision,
       ...tlsFields,
+      ...ownership.fields,
       ...(input.listenHost ? { listen_host: input.listenHost } : {}),
     };
 
