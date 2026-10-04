@@ -12,11 +12,11 @@
 
 ## 0. 当前接手点
 
-日期：2026-10-04。
+日期：2026-10-05。
 
 ### 0.1 main 状态
 
-V4.5 已完成技术闭环，V4 功能范围冻结。V5.0 Contract Freeze 已开工。
+V4.5 已完成技术闭环，V4 功能范围冻结。V5.0–V5.4 已完成并通过硬门禁；当前进入 V5.5 前置的 Console / Route Profile 产品架构冻结。
 
 已验证发布链：
 
@@ -56,7 +56,9 @@ WP0 落地内容（已冻结，改动它等于破坏 V5.0 契约）：
 
 **接手 Agent 的第一件事不是重做 WP0，而是确认它仍在 main 上生效。**
 
-当前 WP：**V5-WP1 Capability Negotiation v2**（见 §5.2）。
+当前接手点：**V5-WP13.5 Console Split / Route Profile Contract Freeze**（见 §9.4）。
+
+V5.5 Federation 仍是下一项分布式能力，但 **WP14 不得早于 §9.4 的产品边界冻结进入实现**。
 
 接手新工作前的固定动作（§3.2）：
 
@@ -76,12 +78,35 @@ V5 是能力扩展，不是第二次重构。
 
 ### 1.1 用户产品模型
 
-用户只面对：
+V4/V5 的**运行时核心业务对象**仍只有：
 
 ~~~text
 Node
 Forward
 ~~~
+
+但从 V5.5 前置产品架构开始，前端必须区分“管理员配置资源”与“普通用户消费服务”：
+
+~~~text
+资源层（Admin）
+Node / NodeGroup
+        ↓
+产品线路层（Admin 定义，User 选择）
+Route Profile
+        ↓
+用户业务层
+Forward
+        ↓
+执行层
+ForwardRevision → RoutePlan → RuntimePlan / Lease / Agent
+~~~
+
+**Route Profile 不是第二套 desired/runtime 真相。** 它是可复用、可版本化的线路配置模板，只作为生成
+Forward revision / RoutePlan 的输入。真正运行、回滚、reconcile、lease、ACK 与 applied revision 仍全部归
+Forward 控制链。
+
+普通 User Console 默认不暴露 raw Node / Agent / lease / revision 等运维概念；这些属于 Admin Console。
+Node 仍是系统一等资源，但不要求普通用户直接管理 Node。
 
 Tunnel 保留为内部 desired/runtime 兼容资源，不重新成为第一层用户产品。
 
@@ -90,6 +115,7 @@ Tunnel 保留为内部 desired/runtime 兼容资源，不重新成为第一层�
 - 第二套用户侧 Tunnel 产品；
 - 第二套 DIRECT engine；
 - 第二套 RELAY engine；
+- 第二套 Route Profile runtime/state machine；
 - 第二套端口所有权；
 - 第二套 Agent 控制通道；
 - 第二套 desired state 真相源。
@@ -209,10 +235,23 @@ agent/
   internal/restore/
 
 web/
+  src/app/dashboard/
+  src/app/forwards/
+  src/app/nodes/
+  src/app/admin/
   src/components/forwards/
   src/components/nodes/
+  src/components/admin/
+  src/components/app-shell.tsx
+  src/components/sidebar.tsx
   src/lib/forward-status.ts
   src/lib/types.ts
+
+  V5-WP13.5 目标结构（迁移时保持 URL/权限兼容，不做无关重写）：
+  src/app/(user)/
+  src/app/(admin)/
+  src/app/(auth)/
+  UserShell / AdminShell 使用共享 design system，但导航、信息架构与权限入口分离
 
 scripts/v3-e2e/
   existing V3/V4 real topology
@@ -2419,9 +2458,222 @@ G4 关闭时额外确认的 durability 事实：
 
 ---
 
+## 9.4 V5-WP13.5 — Console Split / Route Profile Contract Freeze
+
+这是 **V5.5 Federation 的前置产品架构工作**。它不改 V5.4 的 G4 结论，也不允许为了 UI 重写
+Forward / revision / rollout / lease / reconcile。
+
+### 9.4.1 Console 边界
+
+Web 产品表面正式拆成两个控制台，共享组件库与视觉 token，但不再把全部功能长期堆进
+`AppShell(adminMode)`：
+
+~~~text
+User Console
+  Overview
+  Forwards
+  Routes / 可用线路
+  Billing
+  Support
+  Settings
+
+Admin Console
+  Overview
+  Infrastructure
+    Nodes
+    Node Groups
+    Capacity / Health
+  Network
+    Forwards
+    Route Profiles
+    Targets / Diagnostics
+  Users / Workspaces / Permissions
+  Commerce
+    Plans / Orders / Payments / Usage
+  Operations
+    Audit / Alerts / Support
+  Federation
+    Peers / Trust / Grants / Remote Leases / Usage
+  System
+    Settings / Security / Version
+~~~
+
+推荐 Next App Router 边界：
+
+~~~text
+src/app/(user)/
+src/app/(admin)/
+src/app/(auth)/
+~~~
+
+要求：
+
+- UserShell / AdminShell 的 sidebar、topbar、dashboard 信息密度分别设计；
+- shared UI / form / table / chart 可以复用，不复制 design system；
+- 前端 route guard 只负责 UX，**backend RBAC / workspace scope 仍是安全真相**；
+- Federation 只进入 Admin Console，不向普通用户暴露 trust / grant / remote lease；
+- 普通用户默认只看到“线路是否可用、延迟、流量、套餐与可行动错误”，不展示 lease epoch 等内部字段。
+
+### 9.4.2 Route Profile 定位
+
+Route Profile 是**可复用、可版本化的产品线路模板**：
+
+~~~text
+Node / NodeGroup
+        ↓
+Route Profile
+        ↓
+Forward
+        ↓
+ForwardRevision
+        ↓
+RoutePlan
+        ↓
+RuntimePlan
+~~~
+
+它解决“管理员编排线路，用户消费线路”，但**不拥有 runtime 生命周期**。
+
+Route Profile 第一版字段语义至少包括：
+
+~~~text
+id / name / description
+visibility
+enabled
+version
+
+ingress selector
+ordered transit[]
+egress selector
+
+ingress policy
+egress policy
+health / placement constraints
+required capabilities
+~~~
+
+Route Profile **不得拥有**：
+
+~~~text
+Agent runtime
+NodePortLease / placement lease
+Forward lifecycle
+applied revision
+traffic counter
+独立 reconcile
+独立 restart/stop state machine
+~~~
+
+### 9.4.3 Route Profile 与 RoutePlan 的区别
+
+~~~text
+Route Profile = 可复用的意图/模板
+RoutePlan     = 某个 Forward revision 已解析出的具体执行路径
+~~~
+
+例如：
+
+~~~text
+Route Profile:
+  香港入口组
+      ↓
+  SG-01
+      ↓
+  日本出口组 (least_conn)
+
+某次 RoutePlan:
+  HK-02
+      ↓
+  SG-01
+      ↓
+  JP-03
+~~~
+
+运行时必须使用**确定的具体节点事实**，不能让 Agent 自己从 NodeGroup 随机挑选。
+
+### 9.4.4 第一阶段支持边界
+
+按复杂度递增实现，不一次开放任意动态图：
+
+1. 已有基线：fixed ingress + ordered fixed transit[] + fixed egress；
+2. 下一步：Ingress NodeGroup + failover/fencing；
+3. 再下一步：Egress NodeGroup + `fallback / round_robin / random / least_conn / ip_hash`；
+4. dynamic middle pool / arbitrary graph / shortest-path routing 继续关闭。
+
+Transit 第一版保持 ordered fixed nodes；不要让每个 middle 同时成为动态 NodeGroup，避免候选路径组合爆炸。
+
+### 9.4.5 版本与变更传播
+
+共享 Route Profile 的编辑**不得静默重写正在运行的 Forward**。
+
+必须遵守：
+
+~~~text
+RouteProfile vN
+      ↓ 修改
+RouteProfile vN+1
+      ↓
+Impact Analysis
+      ↓
+显式 rollout / apply
+      ↓
+new ForwardRevision
+      ↓
+RoutePlan snapshot
+~~~
+
+因此实现 Route Profile persistence 时，Forward revision snapshot 必须能够解释“本次计划来自哪个
+Route Profile / version”，但 applied runtime 不能依赖随后可变的模板内容。
+
+### 9.4.6 Visibility / entitlement
+
+Route Profile 至少预留三类产品可见性：
+
+~~~text
+INTERNAL   仅管理员内部使用
+ASSIGNED   仅指定 Workspace / Plan 可选择
+PUBLIC     所有满足条件的用户可选择
+~~~
+
+套餐/Workspace 的用户侧授权优先指向 **Route Profile / capability entitlement**，不要重新发展成
+“普通用户直接拿 Node 权限”的主产品模型。
+
+### 9.4.7 Web 交互性能与状态表达
+
+Console 重构必须保留“先可操作、后补重数据”的交互原则：
+
+- 页面 shell / 基础列表先响应，流量、实时状态、趋势图延后并行加载；
+- 大列表使用服务端分页/筛选，不下载全量数据再浏览器分页；
+- 创建/编辑尽量就地完成，避免无必要的页面跳转；
+- Route Profile 编辑器使用入口/中转/出口明确角色、拖拽有序 transit、即时 capability/permission 校验；
+- 用户状态表达至少区分 desired / applying / running / available / degraded / failed，不把所有异常压成一个 ERROR；
+- Admin 可以展开 revision / lease / Agent ACK / diagnostics，User 只展示可行动的产品状态。
+
+### 9.4.8 实施顺序
+
+WP13.5 拆成两个独立改动面，禁止混成一次大重构：
+
+~~~text
+WP13.5A Console Boundary
+  route groups / UserShell / AdminShell / navigation / guard tests
+  不改变 backend business capability
+
+WP13.5B Route Profile Foundation
+  contract / schema / version / visibility / entitlement
+  compiler 输入接现有 RoutePlan
+  不建立第二套 runtime state machine
+~~~
+
+完成 WP13.5 后再进入 WP14 Federation；Federation 页面从第一天就只落在 Admin Console。
+
+---
+
 # 10. V5.5 — Federation
 
 Federation 是最后阶段，也是独立安全边界。
+
+**进入条件：§9.4 Console / Route Profile 产品边界已冻结。** Federation 的产品表面只属于 Admin Console；
+跨 Panel 资源不得因为 UI 方便而复制成本地 Node / Route Profile runtime。
 
 概念：
 
@@ -2729,18 +2981,24 @@ G4 已作为 PR Integration 的硬门禁执行，不再依赖手工证据。
 V5.1b B2 UDP RELAY —— 跨节点 datagram 形态仍待产品决策，当前必须拒绝；
 V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭。
 
+当前产品架构冻结：
+V5-WP13.5 Console Split / Route Profile。
+先把 User Console / Admin Console、Route Profile / RoutePlan 边界、版本传播与 entitlement 冻结；
+不得直接把 Federation、Route Profile 或更多管理功能继续堆进 AppShell(adminMode)。
+
 下一阶段：
-V5.5 Federation。先冻结 trust / grant / remote lease / quota / usage /
-revocation / partition / reconcile 的 ownership 与 authority 边界，再进入 WP14–WP16；
+WP13.5A Console Boundary → WP13.5B Route Profile Foundation → V5.5 Federation WP14–WP16；
 G5 关闭前不得标记 production-ready。
 ~~~
 
 下一阶段的可执行顺序：
 
-1. 先冻结 V5.5 Federation 的 authority/ownership 契约，不直接写跨 Panel 资源代码；
-2. 冻结 credential issuance / rotate / revoke、remote lease 与 quota reservation；
-3. 再实现 WP14 → WP15 → WP16，并为 partition / duplicate / reorder / reconnect 建 G5；
-4. 保持 UDP RELAY、QUIC 与其它 V5.x optional 能力关闭，直到各自产品契约和独立 Gate 成立。
+1. WP13.5A：拆 User/Admin/Auth route group 与 Shell；保持现有 URL/API/RBAC 兼容，不改 runtime；
+2. WP13.5B：冻结并实现 Route Profile contract / version / visibility / entitlement，编译到现有 RoutePlan；
+3. 冻结 V5.5 Federation 的 authority/ownership 契约，不直接写跨 Panel 资源代码；
+4. 冻结 credential issuance / rotate / revoke、remote lease 与 quota reservation；
+5. 再实现 WP14 → WP15 → WP16，并为 partition / duplicate / reorder / reconnect 建 G5；
+6. 保持 UDP RELAY、QUIC 与其它 V5.x optional 能力关闭，直到各自产品契约和独立 Gate 成立。
 
 **禁止跳过 Gate、禁止用 skip 掩盖、禁止为了赶进度删 V4 Integration Gate。**
 
@@ -2772,6 +3030,8 @@ G5 关闭前不得标记 production-ready。
 TuneX V5 的开发顺序只有一句话：
 
 > **先冻结契约，再证明兼容；先建立观测，再自动决策；先解决 ownership/fencing，再扩分布式拓扑。**
+>
+> 产品层同时遵守：**管理员编排资源与线路，用户消费 Route Profile 与 Forward；模板可以复用，运行时真相不可复制。**
 
 每一步都必须继续复用 V4 已经证明可靠的：
 
