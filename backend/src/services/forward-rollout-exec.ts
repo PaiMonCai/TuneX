@@ -174,6 +174,12 @@ export interface RolloutDb {
   forwardRevision: {
     findFirst(args: unknown): Promise<unknown>;
     findMany(args: unknown): Promise<unknown>;
+    /**
+     * V5.3：回滚需要为**新世代**写一份快照（内容 = 基线）。缺它就没法回滚 ——
+     * 这是刻意让端口显式化：如果某个替身没实现它，`create` 会立刻失败并被记进
+     * `compensation_error`，而不是让补偿悄悄退回"原地重放基线版本"那条已经证明行不通的路。
+     */
+    create(args: unknown): Promise<unknown>;
   };
   forwardRollout: {
     create(args: unknown): Promise<unknown>;
@@ -1167,6 +1173,9 @@ export async function compensateRollout(
     if (!outcome.ok) errors.push(`remove ${direction}: ${outcome.error}`);
   }
 
+  /** 回滚世代（内容 = 基线）。null = 没有基线可回（首次部署失败：撤干净即正确）。 */
+  let rollbackRevision: number | null = null;
+
   // ② 重放基线。base_revision 为 null ⇒ 没有旧 runtime 可回，只需要撤新的
   //    （首次部署失败的情形：撤干净即回到「没有 runtime」这个正确状态）。
   if (row.base_revision != null) {
@@ -1176,6 +1185,36 @@ export async function compensateRollout(
     if (!baseline) {
       errors.push(`baseline snapshot revision=${row.base_revision} 不存在`);
     } else {
+      // ── 回滚产生**新世代**（内容 = 基线），而不是原地重放基线版本 ──
+      //
+      // 第一版按 `base_revision` 重放，于是被 Agent 正确地拒绝为 `stale_revision`：版本在系统里
+      // 是**单调**的（Agent 拒收比它已见更低的 revision，这正是防乱序 apply 的机制），而回滚发生在
+      // 该行已经前进到更高 revision 之后 —— 重放一个更低的号，从 Agent 角度看就是一条迟到的旧命令，
+      // 拒绝是对的。实测后果：补偿永远失败，rollout 停在 degraded，两侧都不服务
+      // （`forward_rollout#35` 的 `compensation_error` 就是这句话）。
+      //
+      // 把重放号改成"目标 revision"也不行：那样 Agent 会接受，但**运行时挂在目标版本号上**，
+      // 而它跑的是基线内容 —— 下一次 rollout 的基线查找（按 applied_revision）就会拿到一个
+      // 名不副实的版本。两个方案都坏，说明模型错了：**回滚必须是一个新的世代**。
+      //
+      // 于是：内容 = 基线，版本 = 继续向前的新号。既保住 Agent 的单调性规则，也让台账与事实一致。
+      // 这与 §3.4「desired 不回退」并不冲突 —— desired 不是往回退，而是前进到一个"内容等于基线"
+      // 的新世代，UI 因此可以如实显示"已回滚到上一版本的内容"。
+      const rollbackGeneration = Math.max(
+        Number(row.base_revision),
+        Number(row.revision ?? row.base_revision),
+      ) + 1;
+      rollbackRevision = rollbackGeneration;
+      const { id: _snapshotId, revision: _snapshotRevision, ...baselineFields } = baseline as Record<string, unknown> & {
+        id?: unknown;
+        revision?: unknown;
+      };
+      // 新世代的快照必须存在，否则后续 rollout 按 revision 找基线会报"不存在"。
+      await deps.db.forwardRevision
+        .create({ data: { ...baselineFields, tunnel_id: row.tunnel_id, revision: rollbackGeneration } } as never)
+        .catch((e: unknown) => {
+          errors.push(`rollback snapshot revision=${rollbackGeneration} 写入失败：${(e as Error)?.message ?? String(e)}`);
+        });
       const ingressNodeId = Number(baseline.ingress_node_id);
       const listenPort = baseline.listen_port == null ? null : Number(baseline.listen_port);
       if (!ingressNodeId || listenPort == null) {
@@ -1195,7 +1234,7 @@ export async function compensateRollout(
           } else {
           const egress = await orchestrator.dispatchEgress({
             tunnelId: row.tunnel_id,
-            revision: row.base_revision,
+            revision: rollbackRevision,
             egressNode: nodeFor(orchestrator, egressNodeId),
             egressPort,
             poolId: baseline.egress_pool_id == null ? null : Number(baseline.egress_pool_id),
@@ -1215,7 +1254,7 @@ export async function compensateRollout(
             const host = egress.egress_host;
             const ingress = await orchestrator.dispatchIngress({
               tunnelId: row.tunnel_id,
-              revision: row.base_revision,
+              revision: rollbackRevision,
               ingressNode: nodeFor(orchestrator, ingressNodeId),
               ingressPort: listenPort,
               nextHop: `${host}:${egressPort}`,
@@ -1243,7 +1282,7 @@ export async function compensateRollout(
           } else {
             const ingress = await orchestrator.dispatchDirect({
               tunnelId: row.tunnel_id,
-              revision: row.base_revision,
+              revision: rollbackRevision,
               ingressNode: nodeFor(orchestrator, ingressNodeId),
               ingressPort: listenPort,
               remoteHost: targetHost,
@@ -1274,16 +1313,36 @@ export async function compensateRollout(
       },
       { db: deps.db },
     );
-    // §3.4：config_revision 保持目标 revision（desired 不回退），apply_status
-    // 归到 error 让 UI 显示「更新失败，上一版本仍运行」（§3.7 WP4 契约）。
+    // ── 补偿成功后的记账（V5.3：回滚是**新世代**）──
+    //
+    // 内容已经回到基线，而它挂在一个新的版本号上，所以台账必须**一起前进**：三列写成同一个
+    // rollbackRevision，`apply_status` 回到 `active`（回滚后的状态是"正在按要求运行"，
+    // 而不是"更新失败"）。§3.4 的"desired 不回退"没有被违反 —— desired 前进到了一个内容等于
+    // 基线的新世代；用户看到的是"已回滚到上一版本的内容"，而不是一个名不副实的版本号。
+    //
+    // 这也是下一轮 rollout 的基线从哪来的依据：新世代的快照在 ② 里已经写好，所以按
+    // applied_revision 找基线永远能找到一份与实际运行内容一致的行。
     await deps.db.tunnel
       .updateMany({
         where: { id: row.tunnel_id },
-        data: {
-          apply_status: "error",
-          apply_error_code: "cutover_failed_compensated",
-          apply_error: `rollout ${rolloutId} 回退到 revision ${row.base_revision ?? "none"}`,
-        },
+        data:
+          rollbackRevision === null
+            ? {
+                // 没有基线可回（首次部署失败）：撤干净即正确，desired 保持目标版本、
+                // 状态归 error，让 UI 如实显示"这次更新没成功，现在没有 runtime"。
+                apply_status: "error",
+                apply_error_code: "cutover_failed_compensated",
+                apply_error: `rollout ${rolloutId} 补偿完成：没有旧 runtime 可回（首次部署失败）`,
+              }
+            : {
+                config_revision: rollbackRevision,
+                applied_revision: rollbackRevision,
+                apply_status: "active",
+                apply_error_code: "rollback_compensated",
+                apply_error:
+                  `rollout ${rolloutId} 已回滚：内容 = revision ${row.base_revision ?? "none"}，` +
+                  `新世代 = ${rollbackRevision}（回滚产生新世代，而不是原地重放旧版本号）`,
+              },
       })
       .catch(() => {});
     return { ok: true };

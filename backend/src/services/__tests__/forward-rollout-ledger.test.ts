@@ -165,6 +165,14 @@ const fakeDb = () => {
           .filter((s) => s.tunnel_id === a.where.tunnel_id)
           .sort((x, y) => Number(y.revision) - Number(x.revision));
       },
+      // V5.3：回滚是**新世代** —— 补偿会为"内容 = 基线"的新 revision 写一份快照。
+      // 替身必须实现它：缺了它补偿会如实失败，而不是静默退回那条已经证明行不通的旧路径
+      // （原地重放基线版本号会被 Agent 拒绝为 stale_revision）。
+      create: async (args: unknown) => {
+        const a = args as { data: { tunnel_id: number; revision: number } };
+        snapshots.push({ ...a.data });
+        return a.data;
+      },
     },
     forwardRollout: {
       create: async (args: unknown) => {

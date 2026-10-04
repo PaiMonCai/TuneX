@@ -198,6 +198,12 @@ const fakeDb = () => {
           .filter((s) => s.tunnel_id === a.where.tunnel_id)
           .sort((x, y) => Number(y.revision) - Number(x.revision));
       },
+      // V5.3 新契约：回滚产生新世代 ⇒ 补偿为"内容 = 基线"的新 revision 写快照。
+      create: async (args: unknown) => {
+        const a = args as { data: { tunnel_id: number; revision: number } };
+        snapshots.push({ ...a.data });
+        return a.data;
+      },
     },
     forwardRollout: {
       create: async (args: unknown) => {
@@ -764,12 +770,20 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     expect(f.rollouts[0]!.phase).toBe("failed");
     // 补偿：撤新 runtime（removeTunnel 至少调了 ingress/egress 两端）
     expect(failOrch.calls.removeTunnel.length).toBeGreaterThanOrEqual(1);
-    // 重放基线（rev6 是 DIRECT）
+    // 重放基线（rev6 是 DIRECT）——但**挂在新世代上**（V5.3 契约变更）。
     expect(failOrch.calls.dispatchDirect.length).toBe(1);
-    expect((failOrch.calls.dispatchDirect[0] as { revision: number }).revision).toBe(6);
-    // 成功补偿 ⇒ failed（不是 degraded），tunnel.apply_status=error。
+    // max(base 6, target 7) + 1 = 8：内容 = 基线，版本继续向前。
+    // 旧契约（原地重放 revision 6）会被 Agent 正确地拒绝为 stale_revision —— 那正是补偿
+    // 永远失败、rollout 停在 degraded 的原因（forward_rollout#35 的 compensation_error）。
+    expect((failOrch.calls.dispatchDirect[0] as { revision: number }).revision).toBe(8);
+    // 新世代的快照必须存在，否则下一次 rollout 按 revision 找基线会"不存在"。
+    expect(f.snapshots.some((s) => Number(s.revision) === 8)).toBe(true);
+    // 成功补偿 ⇒ failed（不是 degraded）；台账**一起前进**：内容回到基线、版本是新世代。
     expect(f.rollouts[0]!.compensated).toBe(true);
-    expect(f.tunnels[0]!.apply_status).toBe("error");
+    expect(f.tunnels[0]!.apply_status).toBe("active");
+    expect(f.tunnels[0]!.config_revision).toBe(8);
+    expect(f.tunnels[0]!.applied_revision).toBe(8);
+    expect(String(f.tunnels[0]!.apply_error_code)).toBe("rollback_compensated");
   });
 
   it("补偿失败 ⇒ degraded", async () => {
@@ -1018,7 +1032,9 @@ describe("续跑：只重放未完成步骤", () => {
     expect(row.compensated).toBe(true);
     expect(orch.calls.removeTunnel.length).toBeGreaterThan(beforeRemove);
     expect(orch.calls.dispatchDirect).toHaveLength(beforeDirect + 1);
-    expect(Number((orch.calls.dispatchDirect.at(-1) as { revision: number }).revision)).toBe(6);
+    // 续跑补偿与首次补偿必须产出**同一个新世代**（8 = max(base 6, target 7) + 1）：
+    // 补偿是幂等的，不会每次崩溃都再抬一个版本号。
+    expect(Number((orch.calls.dispatchDirect.at(-1) as { revision: number }).revision)).toBe(8);
   });
 
   it("cutover 中途崩溃 ⇒ resume 从断点补做 cutover 并跑完", async () => {
