@@ -1377,7 +1377,11 @@ export async function compensateRollout(
 
   // 若目标入口曾经 claim 成功，但 apply/ACK 随后失败，ownership 仍会留在新节点。
   // 只有确认新入口 runtime 已撤下后才允许释放它；随后基线入口才能按新世代重新 claim。
-  if (plannedIngressRemoved && planned.ingress_node_id) {
+  if (
+    plannedIngressRemoved &&
+    planned.ingress_node_id &&
+    planned.ingress_node_id !== baseline.ingress_node_id
+  ) {
     const released = await orchestrator.releaseOwnership({
       tunnelId: row.tunnel_id,
       nodeId: planned.ingress_node_id,
