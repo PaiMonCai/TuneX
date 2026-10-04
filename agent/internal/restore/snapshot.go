@@ -12,6 +12,46 @@ import (
 // It is deliberately distinct from ErrNoPanel and from an empty tunnel list.
 var ErrMalformedSnapshot = errors.New("restore: malformed desired snapshot")
 
+// derefInt64 turns an absent number into 0, which the runtime reads as "no value".
+func derefInt64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+// decodeTargetHealth maps the wire health array onto the runtime shape.
+//
+// An unreadable state folds to `unknown` (the runtime's own parser decides), which is
+// the fail-closed direction: a state the agent cannot understand must never rank as
+// healthy.
+func decodeTargetHealth(entries []targetHealthPayload) []forwarder.TargetHealth {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]forwarder.TargetHealth, 0, len(entries))
+	for _, e := range entries {
+		// The runtime keeps the state as the RAW string and folds anything it does not
+		// understand to `unknown` at the point of use (ParseTargetHealthState), so this
+		// only drops entries that carry no address at all.
+		if e.Host == "" || e.Port <= 0 {
+			continue
+		}
+		out = append(out, forwarder.TargetHealth{
+			Host:      e.Host,
+			Port:      e.Port,
+			State:     e.State,
+			LatencyMs: derefInt64(e.LatencyMS),
+			AgeMs:     derefInt64(e.AgeMS),
+			Evidence:  e.Evidence,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // decodeSnapshot converts the panel's wire payload into the internal snapshot.
 //
 // A tunnel the agent cannot even parse (empty id, unknown mode) is a contract
@@ -46,6 +86,15 @@ func decodeSnapshot(version string, tunnels []tunnelPayload) (*Snapshot, error) 
 			SpeedLimit:  t.SpeedLimit,
 			Revision:    t.Revision,
 			ListenHost:  t.ListenHost,
+			TLSCertPath: t.TLSCertPath,
+			TLSKeyPath:  t.TLSKeyPath,
+			// V5.3 WP9: the ownership facts ride the snapshot so a restart keeps
+			// both the epoch fence's input and the lease clock's deadline.
+			OwnershipEpoch: t.OwnershipEpoch,
+			LeaseExpiresAt: t.LeaseExpiresAt,
+			// V5.2 WP7: health rides the snapshot with the targets, so a restart does
+			// not silently disable the circuit breaker.
+			TargetHealth: decodeTargetHealth(t.TargetHealth),
 		}
 		for _, tg := range t.Targets {
 			cfg.Targets = append(cfg.Targets, forwarder.Target{

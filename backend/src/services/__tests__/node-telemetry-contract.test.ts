@@ -22,7 +22,7 @@
  */
 import { test, expect, describe } from "bun:test";
 import { Prisma } from "@prisma/client";
-import { telemetryColumns, validateStateReport } from "../node-state.ts";
+import { telemetryColumns, validateStateReport, targetKeyOf } from "../node-state.ts";
 
 /** 一份最小的合法上报（含 WP7 既有字段）。 */
 const BASE = {
@@ -209,6 +209,10 @@ describe("telemetryColumns — 载荷 → 列", () => {
       // capabilities is a JSON column, so "absent" is Prisma.JsonNull.
       control_protocol_version: null,
       capabilities: Prisma.JsonNull,
+      // V5-WP1: the same rule for the v2 manifest — an old Agent that never
+      // reported one must stay NULL, never an empty object (an empty object
+      // would read as "I implement nothing" and fail every dispatch closed).
+      capability_manifest: Prisma.JsonNull,
     });
   });
 });
@@ -244,5 +248,195 @@ describe("state report tolerates null where a field is optional", () => {
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.reason).toBe("bad_tunnels");
     }
+  });
+});
+
+/* ================================================================== */
+/* V5-WP5-A3：协议专属诊断随上报一同穿过                              */
+/* ================================================================== */
+
+/**
+ * Agent 侧新增的 `diag` 是**每个隧道条目上的附加字段**，面板必须原样收下：
+ *
+ *   · 校验层不能因为「出现了没见过的字段」拒绝整份上报 —— 那会让整个节点的遥测
+ *     和健康一起消失（`bad_tunnels` 是整份 400），代价远大于收益；
+ *   · 也不能把它投影丢掉：证书到期时间与握手失败次数是运维在 TLS 前端出问题时
+ *     唯一能看的东西，而它们只存在于 Agent 观测到的那一刻。
+ *
+ * 这条契约靠「容忍未知字段」实现，因此必须被测试钉住：有人为了「严格」加一条
+ * 白名单，就会把这两个字段连同整份上报一起拒掉。
+ */
+describe("protocol diagnostics ride through the state report (V5-WP5-A3)", () => {
+  const base = {
+    agent_id: "agent-1",
+    node_id: "WP14-IN-A-NODE",
+    ts: 1_800_000_000,
+    host: { cpu_cores: 2, mem_total: 512, agent_version: "1.0.0" },
+  };
+
+  test("a tunnel carrying a tls diag block is accepted", () => {
+    const result = validateStateReport({
+      ...base,
+      tunnels: [
+        {
+          id: "tunex-1-direct",
+          mode: "DIRECT",
+          ingress_port: 21000,
+          revision: 3,
+          protocol: "tls",
+          diag: {
+            protocol: "tls",
+            cert_subject: "CN=site.example",
+            cert_not_after: 1_893_456_000,
+            cert_rotations: 2,
+            handshake_failures: 7,
+            last_handshake_error: "tls: first record does not look like a TLS handshake",
+            last_handshake_error_at: 1_800_000_100,
+          },
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("a ws diag block is accepted, and a diag-less tunnel stays valid", () => {
+    const result = validateStateReport({
+      ...base,
+      tunnels: [
+        { id: "tunex-2-direct", mode: "DIRECT", ingress_port: 21001, revision: 1, protocol: "ws", diag: { protocol: "ws", upgrade_refused: 4 } },
+        { id: "tunex-3-direct", mode: "DIRECT", ingress_port: 21002, revision: 1, protocol: "tcp" },
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("a malformed diag block does not invalidate the whole report", () => {
+    // 诊断是**信息**：形状不对也只是这条信息没用，不能因此让整个节点的上报
+    // 消失。这与 capability manifest 的 fail-closed 不同 —— 那份是准入依据，
+    // 这份是观测结果，误判的代价方向相反。
+    const result = validateStateReport({
+      ...base,
+      tunnels: [{ id: "tunex-4-direct", mode: "DIRECT", ingress_port: 21003, revision: 1, diag: "not-an-object" }],
+    });
+    expect(result.ok).toBe(true);
+  });
+});
+
+/* ================================================================== */
+/* V5.2 WP5：目标观测上报（Observation 是事实，不是 desired）             */
+/* ================================================================== */
+
+describe("target observations ride the state report (V5.2 WP5)", () => {
+  const base = {
+    agent_id: "agent-1",
+    node_id: "WP14-OUT-A-NODE",
+    ts: 1_800_000_000,
+    host: { cpu_cores: 2, mem_total: 512, agent_version: "1.0.0" },
+  };
+  const entry = (over: Record<string, unknown> = {}) => ({
+    host: "10.0.0.5",
+    port: 8080,
+    reachable: true,
+    latency_ms: 12,
+    consecutive_success: 7,
+    consecutive_failure: 0,
+    success_rate: 1,
+    last_observed_at: 1_800_000_000,
+    observation_source: "3/tcp_connect",
+    ...over,
+  });
+
+  test("the validated report KEEPS the observations (the whitelist trap)", () => {
+    // 这条断言防的是本文件上文注释里写的那个陷阱：字段校验通过、但没列进
+    // 返回白名单 → 静默丢失，症状是"上报 200、投影永远为空"。
+    const result = validateStateReport({ ...base, target_observations: [entry()] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations).toHaveLength(1);
+    expect(result.report.target_observations?.[0]).toMatchObject({
+      host: "10.0.0.5",
+      port: 8080,
+      reachable: true,
+      latency_ms: 12,
+      success_rate: 1,
+      observation_source: "3/tcp_connect",
+    });
+  });
+
+  test("a malformed ENTRY is dropped, not the whole report", () => {
+    // 观测是**附加证据**：一条坏记录只是那一条没用。若照 tunnels 的严格度让整份
+    // 上报 400，一个观测字段的类型错误就会把节点的遥测、健康、隧道列表一起黑掉。
+    const result = validateStateReport({
+      ...base,
+      tunnels: [{ id: "tunex-1-direct", mode: "DIRECT", ingress_port: 21000, revision: 1 }],
+      target_observations: [
+        entry(),
+        entry({ port: 0 }),
+        entry({ reachable: "yes" }),
+        entry({ last_observed_at: 0 }),
+        entry({ observation_source: "" }),
+        "not-an-object",
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations).toHaveLength(1);
+    // 隧道列表不受影响：这两件事的失败域必须分开。
+    expect(result.report.tunnels).toHaveLength(1);
+  });
+
+  test("a non-array payload is a rejection, because it is a different claim", () => {
+    // 「不是数组」与「数组里有坏记录」不是同一件事：前者说明上报方对契约的理解
+    // 就是错的，后者只是一条记录坏了。
+    const result = validateStateReport({ ...base, target_observations: { host: "x" } });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("bad_target_observations");
+  });
+
+  test("an unreachable target reports NO latency, never zero", () => {
+    // 0 是"瞬间可达"，不是"没有测量"。两者混用会让面板把"连不上"显示成"极快"。
+    const result = validateStateReport({
+      ...base,
+      target_observations: [entry({ reachable: false, latency_ms: 0 })],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations?.[0]?.latency_ms).toBeNull();
+  });
+
+  test("an agent that reports nothing leaves the projection alone (`undefined` ≠ empty)", () => {
+    // 这个区别是要害：字段存在且为空数组 = "我会观测，此刻没有观测"；
+    // 字段不存在 = "我没有观测能力"。把后者当空集会清空整张投影，
+    // 把"没有证据"伪造成"刚观测过且什么都没有"。
+    const result = validateStateReport({ ...base });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations).toBeUndefined();
+  });
+
+  test("host is normalised so one target has one identity", () => {
+    const result = validateStateReport({
+      ...base,
+      target_observations: [entry({ host: "  Example.COM.  " })],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.report.target_observations?.[0]?.host).toBe("example.com");
+    expect(targetKeyOf("Example.COM.", 443)).toBe("example.com:443");
+    expect(targetKeyOf("[::1]", 443)).toBe("::1:443");
+    expect(targetKeyOf("", 443)).toBeNull();
+    expect(targetKeyOf("host", 0)).toBeNull();
+  });
+
+  test("no `observation_age` on the wire — age is derived by the reader", () => {
+    const result = validateStateReport({
+      ...base,
+      target_observations: [entry({ observation_age: 5 } as never)],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const first = result.report.target_observations?.[0] as unknown as Record<string, unknown>;
+    expect(first.observation_age).toBeUndefined();
   });
 });

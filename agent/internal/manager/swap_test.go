@@ -52,7 +52,6 @@ func directCfg(id string, port int, upstream string, revision int64) forwarder.T
 	return cfg
 }
 
-
 // portFreedWithin waits until the manager's port guard no longer reserves port.
 // The reservation release is sequenced after the old forwarder has stopped, so a
 // read immediately after the move is racy by design; what must hold is that the
@@ -378,7 +377,6 @@ func TestReplaceListenerAdoptsDirectRelaySiblingOnSamePort(t *testing.T) {
 	}
 }
 
-
 // TestReplaceListenerOldPortGuardFollowsTheOldListener is the guard window the
 // review flagged: the old port's reservation used to be dropped BEFORE the old
 // forwarder's listener was closed, so the guard advertised a port the kernel
@@ -646,10 +644,24 @@ func TestReplaceListenerSamePortTargetSwapKeepsLiveConnections(t *testing.T) {
 	if _, err := held.Write([]byte("live\n")); err != nil {
 		t.Fatalf("write on held conn: %v", err)
 	}
-	if bytes := tm.Stats("swap"); bytes == 0 {
+	// The byte counter is written by the copy goroutine AFTER the bytes have crossed
+	// the wire, so reading it immediately after a non-blocking Write is a race the
+	// test can lose: two teammates independently saw this assertion fail (~1 in 25
+	// in isolation, and once in ~6 full-suite runs) while the tunnel itself was
+	// fine. Poll for it instead — the property being asserted is "the round trip is
+	// counted", not "it is counted before the writer returns".
+	var bytesBefore int64
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		bytesBefore = tm.Stats("swap")
+		if bytesBefore != 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if bytesBefore == 0 {
 		t.Fatal("forwarded bytes stayed 0 after a completed round trip")
 	}
-	bytesBefore := tm.Stats("swap")
 
 	next := base.Clone()
 	next.NextHop = addrFor(bPort)

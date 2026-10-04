@@ -145,6 +145,11 @@ export const APPLY_ERROR_ACTION: Record<string, { zh: string; en: string; retrya
     en: "This protocol is not enabled by the current runtime. Use a supported protocol; ask an administrator to handle legacy configurations.",
     retryable: false,
   },
+  runtime_capability_denied: {
+    zh: "所选节点尚未具备这条转发需要的协议/传输能力（通常是节点 Agent 版本偏旧）。请升级该节点 Agent，或改选其他节点后重试。",
+    en: "The selected node does not yet have the protocol/transport capability this forward needs (usually an older node Agent). Upgrade that node's Agent, or pick another node, then retry.",
+    retryable: false,
+  },
   invalid_target: {
     zh: "目标地址格式不合法。检查主机名与端口后重新保存。",
     en: "The target address is invalid. Check the host and port, then save again.",

@@ -21,6 +21,7 @@
 package forwarder
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"strings"
@@ -44,6 +45,41 @@ func NewSingleHop(cfg TunnelConfig) (*SingleHopForwarder, error) {
 		return nil, err
 	}
 	return &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}, nil
+}
+
+// NewSingleHopTLS is NewSingleHop with a TLS-terminated listener (V5-WP5-A1).
+//
+// Only the listener differs: the accept loop, the per-connection pipe, drain,
+// stats, the port guard and hot reload are the same code path, because TLS is a
+// stream lifecycle like any other (§6.1 forced principles). The certificate is
+// loaded by the caller — before this constructor runs — so a bad certificate
+// config can never reach the point where a listener is bound.
+func NewSingleHopTLS(cfg TunnelConfig, tlsConfig *tls.Config, diag *diagRecorder) (*SingleHopForwarder, error) {
+	if tlsConfig == nil {
+		return nil, errors.New("forwarder: tls forwarder requires a tls config")
+	}
+	if cfg.Mode != ModeDirect && cfg.Mode != ModeRelay {
+		return nil, errModeNot(ModeDirect, cfg.Mode)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	f := &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}, diag: diag}}
+	// The handshake happens on the first read/write (tls.Server defers it), so a
+	// client that connects and says nothing costs no handshake work — and a client
+	// that sends garbage fails here, inside the per-connection goroutine, without
+	// touching the listener.
+	f.wrapConn = func(conn net.Conn) (net.Conn, error) {
+		server := tls.Server(conn, tlsConfig)
+		if diag == nil {
+			return server, nil
+		}
+		// The first failing read is where a TLS handshake failure surfaces; the
+		// wrapper records it without making the handshake eager (an eager handshake
+		// in the accept loop would let one slow client stall the others).
+		return &observedConn{Conn: server, diag: diag}, nil
+	}
+	return f, nil
 }
 
 // Start binds the listen port and begins forwarding. Returns ErrAlreadyStarted

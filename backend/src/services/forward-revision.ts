@@ -30,6 +30,7 @@ import {
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardMode,
+  tlsPathsForProtocol,
 } from "./forward-contract.ts";
 
 /* ================================================================== */
@@ -47,11 +48,25 @@ export interface ForwardCandidateConfig {
   ingress_node_id: number;
   /** direct 必须 null；relay 必填。 */
   egress_node_id: number | null;
+  /**
+   * V5.4：三跳路由的中间跳。`null` = 单跳（V4 行为，绝大多数行）。
+   *
+   * 它与入出口是同一类事实（运行时放置），因此必须参与 current / merge / metadata-only
+   * 三处比较 —— 只改它也必须产生新 revision 与 rollout。
+   */
+  middle_node_id?: number | null;
   /** NULL = 「自动分配」（与创建 contract 同义）。 */
   listen_port: number | null;
   /** direct 目标；relay 可为 null（目标在 egress targets 里）。 */
   target_host: string | null;
   target_port: number | null;
+  /**
+   * V5-WP5-A1：tls 前端的节点本地证书路径。它与 `protocol` 属于同一份 desired
+   * 配置，所以同样可合并 —— 否则运维换一个证书文件名就必须删了重建（而重建还会
+   * 重新分配监听端口）。
+   */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 /** patch 入参：全部可选；缺省 = 沿用当前 desired config 的值。 */
@@ -70,8 +85,13 @@ export interface ForwardRevisionRow {
   tunnel_mode: string | null;
   tunnel_type?: string | null;
   forward_protocol?: string | null;
+  /** V5-WP5-A1：tls 前端的节点本地路径（只有路径，永远没有密钥内容）。 */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   ingress_node_id: number | null;
   egress_node_id: number | null;
+  /** V5.4：中间跳（NULL = 单跳）。 */
+  middle_node_id?: number | null;
   ingress_node: { id: number; node_id: string; role: string | null } | null;
   egress_node: { id: number; node_id: string; role: string | null } | null;
   egress_pool: { id: number; node_id: number } | null;
@@ -99,6 +119,8 @@ export interface ForwardImpact {
   listener_replacement: boolean;
   ingress_node_change: boolean;
   egress_node_change: boolean;
+  /** V5.4：中间跳增加 / 删除 / 换节点。它不换 listener，但一定会改变 RELAY next_hop。 */
+  middle_node_change?: boolean;
   mode_change: boolean;
   /** target host/port 热换（旧连接保持、新连接走新目标）。 */
   target_change: boolean;
@@ -220,12 +242,18 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
     ingress_node_id: row.ingress_node_id ?? 0,
     egress_node_id: row.egress_node_id ?? null,
+    // V5.4：中间跳是**运行时放置事实**，和入出口同类 —— 所以它必须出现在 current / merge /
+    // metadata-only 三处比较里。漏掉它与 V5-WP5-A1 漏掉 tls 路径是同一个 bug：
+    // PATCH 只改中间跳时会被判成"纯 metadata"，只写 name 就返回 200，而路由一个字节没变。
+    middle_node_id: row.middle_node_id ?? null,
     // 注意：这里取**请求值**语义的表格。存量行没有 snapshot，listen_port 列
     // 存的是编排后落地的 concrete port，无法与「用户请求自动」区分——按
     // 「当前占用」处理比按「自动」处理安全（不会把 fixed port 偷偷改成 auto）。
     listen_port: row.listen_port ?? null,
     target_host: row.remote_host ?? null,
     target_port: row.remote_port ?? null,
+    tls_cert_path: row.tls_cert_path ?? null,
+    tls_key_path: row.tls_key_path ?? null,
   };
 }
 
@@ -246,9 +274,12 @@ export function mergeForwardCandidate(
     ingress_node_id:
       patch.ingress_node_id !== undefined ? patch.ingress_node_id : base.ingress_node_id,
     egress_node_id: patch.egress_node_id !== undefined ? patch.egress_node_id : base.egress_node_id,
+    middle_node_id: patch.middle_node_id !== undefined ? patch.middle_node_id : base.middle_node_id,
     listen_port: patch.listen_port !== undefined ? patch.listen_port : base.listen_port,
     target_host: patch.target_host !== undefined ? patch.target_host : base.target_host,
     target_port: patch.target_port !== undefined ? patch.target_port : base.target_port,
+    tls_cert_path: patch.tls_cert_path !== undefined ? patch.tls_cert_path : base.tls_cert_path,
+    tls_key_path: patch.tls_key_path !== undefined ? patch.tls_key_path : base.tls_key_path,
   };
 }
 
@@ -259,9 +290,20 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     persistedForwardProtocol(base.protocol) === persistedForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
     base.egress_node_id === candidate.egress_node_id &&
+    (base.middle_node_id ?? null) === (candidate.middle_node_id ?? null) &&
     base.listen_port === candidate.listen_port &&
     (base.target_host ?? "") === (candidate.target_host ?? "") &&
-    (base.target_port ?? null) === (candidate.target_port ?? null)
+    (base.target_port ?? null) === (candidate.target_port ?? null) &&
+    // V5-WP5-A1: the tls paths are runtime configuration, exactly like the target
+    // is — so changing ONLY them must produce a revision and a rollout.
+    //
+    // Leaving them out of this comparison made a paths-only PATCH "metadata only":
+    // the metadata branch writes `{ name }` and nothing else, so the API answered
+    // 200 while the new certificate path was neither stored nor applied. The
+    // operator's symptom would be a "saved" rotation that keeps serving the old
+    // certificate — the exact failure G1A.6 exists to prevent.
+    (base.tls_cert_path ?? null) === (candidate.tls_cert_path ?? null) &&
+    (base.tls_key_path ?? null) === (candidate.tls_key_path ?? null)
   );
 }
 
@@ -326,6 +368,39 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
   if (normalizeForwardProtocol(candidate.protocol) === null) {
     errors.push("当前版本不支持该转发协议");
     reasons.push("invalid_protocol");
+    return { ok: false, errors, warnings, reasons };
+  }
+
+  // V5-WP5-A1: the tls path rule lives in ONE place (`tlsPathsForProtocol`) and is
+  // now applied on the pure validation path, so create, preview and patch answer
+  // with the same reason. Before this, create returned 400 for a non-tls with paths
+  // while PATCH silently discarded them — the same rule with two behaviours, which
+  // is worse than either behaviour on its own.
+  const admittedProtocol = normalizeForwardProtocol(candidate.protocol);
+  if (admittedProtocol !== null) {
+    const paths = tlsPathsForProtocol(
+      admittedProtocol,
+      candidate.tls_cert_path,
+      candidate.tls_key_path,
+    );
+    if (!paths.ok) {
+      // `reason` here is the human sentence (the same one create returns), so the
+      // machine-readable code is added alongside it rather than smuggled into it.
+      errors.push(paths.reason);
+      reasons.push("tls_paths_invalid");
+      return { ok: false, errors, warnings, reasons };
+    }
+  }
+
+  // V5.1b B1 boundary (DEVELOPMENT.md §6.2): udp is DIRECT-only in this build. The
+  // inter-node hop shape for a datagram RELAY is an OPEN product decision, so the
+  // panel refuses it here rather than letting the Agent be the only place that says
+  // no — a boundary enforced in one layer is a boundary that can be bypassed by the
+  // next caller, and the UI must be able to rely on validation, not on a warning of
+  // its own.
+  if (admittedProtocol === "udp" && candidate.mode !== "direct") {
+    errors.push("UDP 转发当前只支持 DIRECT：跨节点跳的形态尚未冻结");
+    reasons.push("datagram_relay_unsupported");
     return { ok: false, errors, warnings, reasons };
   }
 
@@ -528,6 +603,8 @@ export function computeForwardImpact(input: {
     input.current.ingress_node_id !== input.candidate.ingress_node_id;
   const egressNodeChange =
     input.current.egress_node_id !== input.candidate.egress_node_id;
+  const middleNodeChange =
+    (input.current.middle_node_id ?? null) !== (input.candidate.middle_node_id ?? null);
   const listenPortChange =
     (input.current.listen_port ?? null) !== (input.candidate.listen_port ?? null) ||
     (input.currentResolvedListenPort ?? null) !== (input.resolvedListenPort ?? null);
@@ -574,6 +651,7 @@ export function computeForwardImpact(input: {
     listener_replacement: listenerReplacement,
     ingress_node_change: ingressNodeChange,
     egress_node_change: egressNodeChange,
+    middle_node_change: middleNodeChange,
     mode_change: modeChange,
     target_change: targetChange,
     egress_target_change: egressTargetChange,
@@ -711,6 +789,7 @@ export async function ensureForwardBaselineRevision(
         forward_protocol: true,
         ingress_node_id: true,
         egress_node_id: true,
+        middle_node_id: true,
         listen_ip: true,
         listen_port: true,
         remote_host: true,
@@ -760,6 +839,7 @@ export async function ensureForwardBaselineRevision(
             protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
+            middle_node_id: row.middle_node_id,
             listen_ip: row.listen_ip,
             listen_port: row.listen_port,
             target_host: row.tunnel_mode === "direct" ? row.remote_host : null,
@@ -870,6 +950,7 @@ export async function createForwardRevision(
           protocol,
           ingress_node_id: input.candidate.ingress_node_id,
           egress_node_id: input.candidate.egress_node_id,
+          middle_node_id: input.candidate.middle_node_id ?? null,
           listen_ip: input.resolvedListenIp ?? row.listen_ip,
           listen_port: input.candidate.listen_port,
           target_host: input.candidate.mode === "direct" ? input.candidate.target_host : null,
@@ -905,6 +986,7 @@ export async function createForwardRevision(
         forward_protocol: protocol,
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,
+        middle_node_id: input.candidate.middle_node_id ?? null,
         // 自动分配时保留当前 concrete port（编排器 apply 后再写回确切值）：
         // 把它清成 null 会让 reconciler 在「尚未 apply」的窗口里读到残缺状态。
         listen_port: input.candidate.listen_port ?? row.listen_port,

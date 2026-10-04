@@ -795,8 +795,27 @@ export async function runTunnelAction(
           select: { id: true, node_id: true, connect_ip: true, role: true },
         }))
       : null;
+    // V5.4：三跳路由的中间跳。**拆除路径必须认识它**，否则留下一条孤儿中转 runtime，
+    // 永久占着它的端口（实测：`tunex-268-egress` 占着 22001，于是后续每一次分配到 22001
+    // 都被 Agent 正确地拒绝，看起来像"端口分配有 bug"）。
+    const middleNode = tunnel.middle_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.middle_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
 
     if (orchestrator) {
+      // 逆序拆除（先近后远）：中间跳 → 出口 → 入口。
+      if (tunnel.tunnel_mode === "relay" && middleNode) {
+        await orchestrator.removeTunnel({
+          tunnelId,
+          node: middleNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel deleted (transit)",
+        }).catch(() => {});
+      }
       if (tunnel.tunnel_mode === "relay" && egressNode) {
         await orchestrator.removeTunnel({
           tunnelId,
@@ -863,7 +882,28 @@ export async function runTunnelAction(
             select: { id: true, node_id: true, connect_ip: true, role: true },
           }))
         : null;
+      // V5.4：挂起同样要撤中间跳 —— 与删除同理，漏掉就是一条永久占端口的孤儿 runtime。
+      // "撤掉一条腿"的每条路径都必须同时知道所有腿：删除 ↔ 创建、挂起 ↔ 恢复、
+      // rollout 补偿 ↔ rollout 下发。
+      const middleNode = tunnel.middle_node_id
+        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+            where: { id: tunnel.middle_node_id },
+            select: { id: true, node_id: true, connect_ip: true, role: true },
+          }))
+        : null;
 
+      if (tunnel.tunnel_mode === "relay" && middleNode) {
+        const stoppedTransit = await orchestrator.removeTunnel({
+          tunnelId,
+          node: middleNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel suspended (transit)",
+        });
+        if (!stoppedTransit.ok) {
+          return err("apply_failed", stoppedTransit.error, { apply_error_code: stoppedTransit.error_code });
+        }
+      }
       if (tunnel.tunnel_mode === "relay" && egressNode) {
         const stopped = await orchestrator.removeTunnel({
           tunnelId,

@@ -1,0 +1,30 @@
+-- V5-WP1 — 能力协商 v2 落库字段（DEVELOPMENT.md §5.2 / Gate V5-G0）
+--
+-- 纯 expand：只给 node_state_report 增加一列**可空无默认值**的字段，不 DROP /
+-- 不 MODIFY 任何旧列，因此代码回滚时不需要逆迁移；V4 的 capabilities 与
+-- control_protocol_version 语义一字未改（additive，不是原地改型）。
+--
+-- 这一列承载的事实：
+--   capability_manifest ← Agent **实际编译进二进制**的协议 / 传输 / runtime /
+--                         诊断能力清单：{ schema_version, protocols, transports,
+--                         runtime, diagnostics }
+--
+-- 为什么必须可空（而不是 default '{}'）：
+--   存量行来自尚未上报该字段的 Agent。NULL 的含义是「这个 Agent 没有 v2 协商
+--   能力」，与「上报了一份空清单」是两件不同的事：
+--     · NULL       → 按 **baseline** 处理：V4 冻结时就存在的 tcp/stream 组合
+--                    继续可用，baseline 以外一律拒绝（升级提示）；
+--     · 空清单     → Agent 明确声明「我什么都没有」→ fail-closed。
+--   给默认值会把「未上报」抹成「什么都没实现」，让升级窗口内的整批旧 Agent
+--   立刻被拒发命令，把一次平滑升级变成一次全网中断。
+--
+-- 为什么不用 DB enum 承载协议集合：
+--   §3.4 —— 协议集合会随 V5 各协议的 Gate 逐个扩展，用 enum 意味着每开一个
+--   协议就要改表类型。列保持 JSON，扩展点是应用层契约（capability-manifest.ts
+--   的 CAPABILITY_MANIFEST_SCHEMA_VERSION）与对应 Gate。
+--
+-- 该 SQL 由 `prisma migrate diff --from-schema-datamodel <old> --to-schema-datamodel
+-- <new> --script` 生成，未手工改写，以避免与 schema 漂移。
+
+-- AlterTable
+ALTER TABLE `node_state_report` ADD COLUMN `capability_manifest` JSON NULL;

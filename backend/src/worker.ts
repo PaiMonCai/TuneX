@@ -153,6 +153,33 @@ const worker = new Worker(
         // produce findings instead of automatic migration.
         const deps = defaultReconcileDeps();
         deps.sink = createRuntimeReconcileSink();
+        // V5.3 WP10: evaluate automatic failover AFTER the rollout resume above and
+        // after this tick's repairs. Order matters: a node that is merely behind gets
+        // repaired by the resend path first, and only what remains broken is considered
+        // for a migration. The sweep is fail-closed internally — with no
+        // FAILOVER_POLICY configured it does nothing at all.
+        deps.failoverSweep = async () => {
+          const { runFailoverSweep } = await import("./services/failover-loop.ts");
+          const r = await runFailoverSweep({
+            // EVERY level is printed, not just warn/error.
+            //
+            // V5.3 round 11: filtering to warn/error hid exactly the information needed to
+            // diagnose an automatic failover that did not happen — the outcome
+            // (`moved` / `waiting_lease` / `aborted:<reason>`) is reported at INFO, because a
+            // correct decision that waits is not a warning. The result was a gate failure with
+            // no trace anywhere, and a debugging round spent on guessing.
+            log: (e) => {
+              const line = `[worker] failover: ${e.message} ${e.detail ? JSON.stringify(e.detail) : ""}`;
+              if (e.level === "error") console.error(line);
+              else if (e.level === "warn") console.warn(line);
+              else console.log(line);
+            },
+          });
+          if (r.evaluated > 0) {
+            console.log("[worker] failover sweep:", JSON.stringify({ evaluated: r.evaluated, moved: r.moved, held: r.held }));
+          }
+          return { evaluated: r.evaluated, moved: r.moved, held: r.held };
+        };
         const r = await executeReconcile(deps);
         const summary = {
           scanned: r.scanned,
@@ -164,6 +191,19 @@ const worker = new Worker(
         };
         if (r.findings.length > 0 || r.failed > 0) {
           console.log("[worker] cron_reconcile_v3:", JSON.stringify(summary));
+          // V5.3 round 14: finding DETAILS, not just the count.
+          //
+          // Second time this gap cost a round: `failed: 1` says a dispatch was attempted and
+          // threw, and the reason lived only inside a finding nobody printed. A count tells you
+          // something happened; only the detail tells you what.
+          for (const f of r.findings) {
+            if (f.severity === "error" || f.code === "resend_skipped") {
+              console.log(
+                "[worker] reconcile finding:",
+                JSON.stringify({ code: f.code, tunnel_id: f.tunnel_id, node_id: f.node_id, detail: f.detail }),
+              );
+            }
+          }
         }
         return summary;
       }

@@ -114,18 +114,34 @@ export type RolloutStepKind =
   | "ensure_binding"
   /** EGRESS 侧 apply（RELAY）；ACK 后不切入口。 */
   | "prepare_egress"
+  /**
+   * V5.4：中间跳的 apply（`hop_index = 1`）。
+   *
+   * 它与 `prepare_egress` 是**同一个原语**（一个监听 + 拨号到"目标"的转发），区别只在目标是谁：
+   * 出口跳指向真实目标池，中间跳指向**下一跳的节点间监听地址**。单独给一个 kind 而不是复用
+   * `prepare_egress`，是因为在执行器里两者**解析 next_hop 的来源不同**（中间跳要等下一跳登记地址），
+   * 而计划与执行器必须对同一件事用同一个名字。
+   */
+  | "prepare_transit"
   /** 入口 apply（= WP2 `ReplaceListener` 的目标形态）。 */
   | "cutover_ingress"
   /** EGRESS 侧切换（换节点/换池时）。 */
   | "cutover_egress"
-  /** 旧入口 drain（端口迁移/节点迁移）。 */
+  /**
+   * 入口节点迁移的 ownership handoff：
+   * 先撤旧入口 runtime，再显式释放旧 owner，随后才允许新入口认领。
+   */
+  | "handoff_ingress_owner"
+  /** 旧入口 drain（同节点 listener move 等兼容路径）。 */
   | "drain_ingress"
   /** 旧 EGRESS drain。 */
   | "drain_egress"
   /** 旧端口租约释放（等 drain 完成）。 */
   | "release_old_lease"
   /** 撤旧 EGRESS runtime（幂等 revision+1）。 */
-  | "drop_old_egress";
+  | "drop_old_egress"
+  /** V5.4：撤旧 middle/transit runtime（物理形态仍是 EGRESS runtime）。 */
+  | "drop_old_transit";
 
 /**
  * `release_binding` 明确**不在**本表里：§13.3.1 规定 Binding 是可复用基础设施
@@ -194,6 +210,13 @@ export interface RolloutSnapshot {
   egress_port: number | null;
   egress_targets: Array<{ host: string; port: number; weight: number; order_by: number }> | null;
   desired_status: string | null;
+  /**
+   * V5.4：中间跳。NULL / 缺省 = 单跳（V4 行为，绝大多数行都是这样）。
+   *
+   * 可选而不是必填：现有所有构造点与替换快照都不需要知道它，而"缺省 = 没有中间跳"正是 V4 的
+   * 真实语义 —— 让每个构造点都必须写 `null` 只会制造噪声，不会增加安全。
+   */
+  middle_node_id?: number | null;
 }
 
 /** 计划需要的节点事实（最小投影）。 */
@@ -228,10 +251,14 @@ export interface PlanRolloutInput {
     ingress: RolloutNodeFact | null;
     /** 新拓扑的出口节点（RELAY 必填）。 */
     egress: RolloutNodeFact | null;
+    /** V5.4：新拓扑的中间跳；单跳为 null。 */
+    middle?: RolloutNodeFact | null;
     /** 旧拓扑的入口节点（迁移时非空；用于 DRAIN/CLEANUP）。 */
     ingress_previous: RolloutNodeFact | null;
     /** 旧拓扑的出口节点（迁移时非空）。 */
     egress_previous: RolloutNodeFact | null;
+    /** V5.4：旧拓扑的中间跳；用于 DRAIN/CLEANUP。 */
+    middle_previous?: RolloutNodeFact | null;
   };
   /** RELAY 新 pair 的 NodeBinding 是否已存在；非 RELAY 传 null。 */
   binding_exists?: boolean | null;
@@ -316,7 +343,7 @@ export function classifyRolloutStrategy(input: {
   // 模式切换优先于一切：它同时改两端。
   if (impact.mode_change) return "mode_switch";
   // 入口或出口节点迁移（含「端口 + 入口节点同时改」合并为一档）。
-  if (impact.ingress_node_change || impact.egress_node_change) return "node_migration";
+  if (impact.ingress_node_change || impact.egress_node_change || impact.middle_node_change) return "node_migration";
   if (impact.listen_port_change) return "listener_replace";
   return "target_hot_swap";
 }
@@ -375,6 +402,26 @@ export function validateRolloutAdmission(input: PlanRolloutInput): Array<{
         blocking.push({ code: "node_unavailable", message: `出口节点 ${egress.node_id} 不具备出口能力` });
       }
     }
+    const middleNodeId = desired.middle_node_id ?? null;
+    if (middleNodeId != null) {
+      const middle = nodes.middle ?? null;
+      if (!middle) {
+        blocking.push({ code: "node_unavailable", message: `中间跳节点 ${middleNodeId} 不存在` });
+      } else {
+        const lifecycle = lifecycleBlocksForward(middle.lifecycle);
+        if (lifecycle) {
+          blocking.push({
+            code: lifecycle,
+            message: `中间跳节点 ${middle.node_id} 当前不可承载新 runtime（${middle.lifecycle}）`,
+          });
+        }
+        // transit 复用 EGRESS runtime 原语，因此必须具备出口能力。
+        if (middle.role !== "egress" && middle.role !== "both") {
+          blocking.push({ code: "node_unavailable", message: `中间跳节点 ${middle.node_id} 不具备出口能力` });
+        }
+      }
+    }
+
     // `binding_exists === false` **不阻断**：§3.2 判定表把 `ensure_binding`
     // 列为 PREPARE 的正式步骤，即「binding 缺失」正是要用 rollout 解决的问题，
     // 不是拒绝 rollout 的理由。真正该阻断的是「连能建 binding 的节点都没有」
@@ -485,6 +532,22 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   if (relay) {
     const egressNode = nodes.egress;
     const egressIsNew = impact.egress_node_change || impact.mode_change;
+    // ── 入口要重切时，出口**必须再准备一次**（V5.3 round 19）──
+    //
+    // `prepare_egress` 是**唯一**登记出口可寻址 host 的地方（`recordNextHop` 用
+    // `dispatchEgress` 返回的 `egress_host`）。而铁律是"没有 next_hop 就不允许启入口"，所以
+    // **入口要重新 cutover 时，出口在哪可达必须被重新确认一次** —— 哪怕出口自身一点没变。
+    //
+    // 漏掉它会发生什么（实测，failover 走的就是这条）：只换入口节点的迁移不在原条件里 ⇒ 没有
+    // `prepare_egress` ⇒ 没有登记 host ⇒ `resolveNextHop` 返回 null ⇒ `next_hop_unresolved` ⇒
+    // 入口 cutover 失败 ⇒ **新主人永远不服务**（`forward_rollout#36` 的 `last_error` 就是这句）。
+    //
+    // 该步骤同 revision 幂等，因此重复准备是 no-op，代价只是一次下发。
+    const ingressWillRecut =
+      impact.ingress_node_change ||
+      impact.listener_replacement ||
+      impact.mode_change ||
+      impact.middle_node_change;
     if (egressIsNew) {
       // 新 pair：Binding 必须先存在（§13.3.1：新建显式、删除不自动）。
       if (input.binding_exists === false) {
@@ -509,8 +572,42 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
       });
     } else if (impact.egress_target_change) {
       // 同出口节点、只换池内目标：PREPARE 无事可做，切换发生在 CUTOVER。
+    } else if (ingressWillRecut) {
+      // 出口一点没变，但**入口要重切** ⇒ 仍然要准备出口：只为拿到它的可寻址 host，
+      // 否则入口的 next_hop 无法解析（这就是只换入口节点的迁移长期失败的原因）。
+      push("prepare", "prepare_egress", {
+        node_id: egressNode?.id ?? desired.egress_node_id,
+        direction: "egress",
+        port: desired.egress_port ?? null,
+        meta: { reason: "ingress_recut" },
+      });
     }
   }
+
+  /* ---------------- 中间跳（V5.4：三跳路由）---------------- */
+  //
+  // 三跳 = 入口 → 中间跳 → 出口。中间跳与出口是**同一个原语**（监听 + 拨号到"目标"），因此它的
+  // PREPARE 只需要两件事：一个**端口**（它自己的监听端口）与一次 **apply**（目标 = 下一跳，即出口）。
+  //
+  // 顺序仍是铁律：先出口、再中间、最后入口（正向先远后近）。中间跳的 apply 必须在出口的
+  // `prepare_egress` 之后、入口的 `cutover_ingress` 之前 —— 否则入口拿不到它的地址。
+  const middleNodeId = (desired as { middle_node_id?: number | null }).middle_node_id ?? null;
+  if (relay && middleNodeId != null) {
+    push("prepare", "acquire_port", {
+      node_id: middleNodeId,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_hop" },
+    });
+    push("prepare", "prepare_transit", {
+      node_id: middleNodeId,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_hop" },
+    });
+  }
+
+  const hasPreviousRuntime = applied !== null;
 
   /* ---------------- CUTOVER ---------------- */
   // RELAY 出口侧先切（新节点 / 新池），入口随后指向新 next_hop。
@@ -534,9 +631,24 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   const ingressNeedsDispatch =
     impact.listener_replacement ||
     impact.mode_change ||
-    (relay && impact.egress_node_change) ||
+    (relay && (impact.egress_node_change || impact.middle_node_change)) ||
     (!relay && impact.target_change) ||
     applied === null;
+
+  // V5.3 ownership 是 client-facing ingress 的 fencing。跨节点迁移不能
+  // "先把新主人上线，再慢慢 drain 旧主人"：旧 lease 还活着时 claim 必须拒绝，
+  // 若强行绕过则会产生双主。正确顺序是：
+  //   acquire 新节点端口 → 撤旧 runtime → 显式释放旧 ownership → 新入口认领/上线。
+  // 这里把 handoff 放进 CUTOVER，并且排在 cutover_ingress 之前。
+  if (hasPreviousRuntime && impact.ingress_node_change) {
+    push("cutover", "handoff_ingress_owner", {
+      node_id: applied?.ingress_node_id ?? null,
+      direction: "ingress",
+      port: applied?.listen_port ?? null,
+      meta: { old_mode: applied?.mode ?? "direct" },
+    });
+  }
+
   if (ingressNeedsDispatch) {
     push("cutover", "cutover_ingress", {
       node_id: desired.ingress_node_id,
@@ -557,26 +669,32 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   //     CLEANUP 仅在旧 listener 的 Stop 上限过去后释放旧 durable lease。
   //
   // `applied === null` ⇒ 从未成功 apply，没有旧 runtime 可退场。
-  const hasPreviousRuntime = applied !== null;
-  if (hasPreviousRuntime && impact.ingress_node_change) {
-    const oldNode = nodes.ingress_previous;
-    const oldPort = applied?.listen_port ?? null;
-    push("drain", "drain_ingress", {
-      node_id: oldNode?.id ?? (applied?.ingress_node_id ?? null),
-      direction: "ingress",
-      port: oldPort,
-      meta: { reason: "ingress_node_changed" },
-    });
-  }
+  // 跨节点入口迁移已经在 CUTOVER 的 handoff_ingress_owner 中完成旧 runtime
+  // 下线；这里不能再把它当普通 drain，否则会多发一次更高 revision 的 remove，
+  // 让后续故障回滚的世代关系变复杂。旧端口 lease 仍在 CLEANUP 精确释放。
 
   // 旧出口：换出口节点、或 RELAY→DIRECT 时旧 EGRESS 必须退场。
   const egressMustDrain = relayBefore && (impact.egress_node_change || impact.mode_change);
+  const oldMiddleNodeId = applied?.middle_node_id ?? null;
+  const newMiddleNodeId = desired.middle_node_id ?? null;
+  const middleMustDrain =
+    relayBefore &&
+    oldMiddleNodeId != null &&
+    oldMiddleNodeId !== newMiddleNodeId;
   if (egressMustDrain) {
     const oldEgress = nodes.egress_previous;
     push("drain", "drain_egress", {
       node_id: oldEgress?.id ?? (applied?.egress_node_id ?? null),
       direction: "egress",
       port: applied?.egress_port ?? null,
+    });
+  }
+  if (middleMustDrain) {
+    push("drain", "drain_egress", {
+      node_id: nodes.middle_previous?.id ?? oldMiddleNodeId,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_changed" },
     });
   }
 
@@ -607,6 +725,23 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
         port: applied.egress_port,
       });
     }
+  }
+
+  // middle 的端口不复制进 revision snapshot：NodePortLease 仍是物理端口唯一真相。
+  // 因此 cleanup 用 (tunnel,node) 在执行期精确找旧 middle 的唯一 active lease。
+  if (middleMustDrain) {
+    const oldMiddle = nodes.middle_previous?.id ?? oldMiddleNodeId;
+    push("cleanup", "drop_old_transit", {
+      node_id: oldMiddle,
+      direction: "egress",
+      port: null,
+    });
+    push("cleanup", "release_old_lease", {
+      node_id: oldMiddle,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_changed" },
+    });
   }
 
   // 去重 + 按 phase 稳定排序（同 phase 内保持生成顺序：可重排；跨 phase 严格有序）。

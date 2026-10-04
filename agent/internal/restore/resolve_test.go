@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -425,6 +426,26 @@ func TestConcurrentCacheWritesStayValid(t *testing.T) {
 			}
 		}(i)
 	}
+	// Wait for the first successful write before reading.
+	//
+	// The reader loop below is fast enough to finish before any writer completes
+	// its FIRST Save (the writers only notice `stop` between iterations). When
+	// that happened, the final Load legitimately answered "cache is empty" and the
+	// test failed — a flake with nothing to do with concurrent renames, in the one
+	// suite whose evidence the durability gates lean on.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := cache.Load("agent-1"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(stop)
+			wg.Wait()
+			t.Fatal("no writer produced a cache file within 5s")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
 	// Readers run at the same time: a torn file would be visible to the node's
 	// own restart path, not just to this test.
 	for i := 0; i < 200; i++ {
@@ -443,5 +464,98 @@ func TestConcurrentCacheWritesStayValid(t *testing.T) {
 	}
 	if len(loaded.Tunnels) != 1 {
 		t.Fatalf("final cache must be one complete snapshot, got %+v", loaded.Tunnels)
+	}
+}
+
+// V5.2 WP7 —— 快照里的健康必须被安装，否则**每次 Agent 重启都会关掉熔断器**。
+//
+// V5-G2 抓到过这个：恢复路径只装了 targets，于是重启后的节点把连接继续五五开送到
+// 面板判定为 unhealthy 的目标上。这不是"少个字段"，是同一个事实有两条入口、只补了
+// 一条 —— V5.1 里协议、证书路径各踩过一次。
+func TestRestoreInstallsHealthFromTheSnapshot(t *testing.T) {
+	// 这条断言在 manager 侧已经由 SetPoolAndHealth 的用例覆盖；这里守的是**调用方
+	// 必须走那条路**：一旦 restore 退回 SetPool，重启就会静默丢掉健康信号。
+	src, err := os.ReadFile("restore.go")
+	if err != nil {
+		t.Fatalf("read restore.go: %v", err)
+	}
+	body := string(src)
+	if !strings.Contains(body, "SetPoolAndHealth") {
+		t.Fatal("restore must install health from the snapshot (SetPoolAndHealth), not targets alone")
+	}
+	if !strings.Contains(body, "len(cfg.TargetHealth) > 0") {
+		t.Fatal("restore must fall back to the health-less path when the snapshot carries no health")
+	}
+}
+
+// V5.2 WP7 —— 快照解码器必须认识 `target_health`。
+//
+// 这是 V5 里第三次"新事实有两条入口、只补了一条"（先是协议，然后证书路径，现在是健康）。
+// 解码器丢掉这个字段的症状特别隐蔽：Agent 每次重启都从快照重建 runtime，健康静默消失，
+// 熔断器失效，而客户端连接只是"有时候失败"——看起来像网络抖动，不像配置问题。
+func TestSnapshotDecoderKnowsTargetHealth(t *testing.T) {
+	entries := decodeTargetHealth([]targetHealthPayload{
+		{Host: "a.example.com", Port: 443, State: "unhealthy"},
+		{Host: "b.example.com", Port: 443, State: "healthy"},
+		{Host: "", Port: 443, State: "healthy"},   // 没有地址 → 丢掉（无法归属）
+		{Host: "c.example.com", Port: 0, State: "healthy"}, // 没有端口 → 丢掉
+	})
+	if len(entries) != 2 {
+		t.Fatalf("decoded %d health entries, want 2 (addressable ones only)", len(entries))
+	}
+	if entries[0].Host != "a.example.com" || entries[0].State != "unhealthy" {
+		t.Fatalf("first entry lost its fact: %+v", entries[0])
+	}
+	// 没有健康条目时返回 nil，而不是空切片：调用方据此走"没有信号"的分支。
+	if got := decodeTargetHealth(nil); got != nil {
+		t.Fatalf("no entries must decode to nil (no signal), got %v", got)
+	}
+}
+
+// V5.4 —— 裁剪必须同时覆盖**出口侧**的 runtime。
+//
+// 实测缺陷：`Reconcile` 只遍历 `TunnelManager.IDs()`，而在纯出口节点上那个集合是空的
+// （出口 runtime 活在 `EgressManager` 的池表里）⇒ 一条在节点离线期间被删除的 Forward，
+// 它的出口 runtime 永远裁不掉，一直占着监听端口。面板分配器查数据库租约，于是把那个端口
+// 又发出去，Agent 正确地拒绝每一次 apply —— 症状看起来像"端口分配有 bug"。
+func TestReconcilePrunesEgressPoolsOnAnEgressOnlyNode(t *testing.T) {
+	ctx := context.Background()
+	egress := manager.NewEgressManager()
+	tunnels := manager.NewTunnelManager(egress, "127.0.0.1")
+
+	// 一个"纯出口节点"：tunnel manager 里什么都没有，出口池里有一个权威集合之外的 id。
+	egress.SetPool("tunex-272-egress", manager.RoundRobin, []forwarder.Target{
+		{Host: "target-a", Port: 3030, Weight: 1, Order: 10},
+	})
+	// 权威期望里只有另一个 id。
+	snap := &Snapshot{Tunnels: []forwarder.TunnelConfig{{ID: "tunex-2-egress"}}}
+
+	removed := Reconcile(ctx, tunnels, egress, snap)
+
+	if len(removed) != 1 || removed[0] != "tunex-272-egress" {
+		t.Fatalf("expected the orphan egress pool to be pruned, got removed=%v", removed)
+	}
+	if ids := egress.IDs(); len(ids) != 0 {
+		t.Fatalf("expected no pools left, got %v", ids)
+	}
+}
+
+// 权威集合里的出口池**不得**被裁掉（否则每次重连都会把在跑的转发拆掉）。
+func TestReconcileKeepsEgressPoolsThatAreStillWanted(t *testing.T) {
+	ctx := context.Background()
+	egress := manager.NewEgressManager()
+	tunnels := manager.NewTunnelManager(egress, "127.0.0.1")
+	egress.SetPool("tunex-2-egress", manager.RoundRobin, []forwarder.Target{
+		{Host: "target-a", Port: 3030, Weight: 1, Order: 10},
+	})
+	snap := &Snapshot{Tunnels: []forwarder.TunnelConfig{{ID: "tunex-2-egress"}}}
+
+	removed := Reconcile(ctx, tunnels, egress, snap)
+
+	if len(removed) != 0 {
+		t.Fatalf("a wanted egress pool must survive reconcile, removed=%v", removed)
+	}
+	if ids := egress.IDs(); len(ids) != 1 || ids[0] != "tunex-2-egress" {
+		t.Fatalf("expected the pool to survive, got %v", ids)
 	}
 }

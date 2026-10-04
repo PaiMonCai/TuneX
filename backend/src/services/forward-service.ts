@@ -10,6 +10,7 @@
  * creation, validation and runtime actions have one implementation.
  */
 import { Prisma } from "@prisma/client";
+import type { TunnelType } from "@prisma/client";
 import { db } from "../db.ts";
 import {
   countWorkspaceTunnels,
@@ -51,11 +52,12 @@ import { checkForwardRuntimeUse } from "./forward-capability.ts";
 import { authorizationErrorLayer, type AuthorizationErrorLayer } from "./authorization-errors.ts";
 import type { ForwardPage } from "./forward-list-query.ts";
 import {
-  legacyTunnelTypeForForwardProtocol,
   normalizeForwardProtocol,
   persistedForwardProtocol,
   type ForwardMode,
   type ForwardProtocol,
+  tlsPathsForProtocol,
+  legacyTunnelTypeColumn,
 } from "./forward-contract.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import {
@@ -72,8 +74,20 @@ export interface ForwardCreateInput {
   mode: ForwardMode;
   /** V5-WP0: omitted by V4 clients => tcp; explicit unknown values fail closed. */
   protocol?: ForwardProtocol;
+  /**
+   * V5-WP5-A1: node-local certificate/key paths for a tls front. Paths, never
+   * key material (§6.1). Ignored for every other protocol — the panel does not
+   * silently turn a stray path into a TLS front.
+   */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   ingress_node_id: number;
   egress_node_id?: number | null;
+  /**
+   * V5.4：三跳路由的中间跳（省略 = 单跳）。给了它就意味着入口 → 中间 → 出口，
+   * 且相邻两段都必须已有 NodeBinding（校验在创建/更新路径上统一做）。
+   */
+  middle_node_id?: number | null;
   listen_port?: number | null;
   target_host: string;
   target_port: number;
@@ -93,9 +107,21 @@ export interface ForwardPatchInput {
   mode?: ForwardMode;
   ingress_node_id?: number;
   egress_node_id?: number | null;
+  /** V5.4：中间跳（`null` = 回到单跳）。与入出口同类：改它会触发新 revision 与 rollout。 */
+  middle_node_id?: number | null;
   listen_port?: number | null;
   target_host?: string | null;
   target_port?: number | null;
+  /**
+   * V5-WP5-A1：tls 前端的证书/私钥路径可改，规则与创建时完全相同（只有 tls 能带，
+   * 且必须成对）—— 由 `tlsPathsForProtocol` 统一判定，不在这里复制一份规则。
+   *
+   * 协议本身仍然不可改：`protocol` 不在 patch 白名单里。把一个 tcp 转发改成 tls
+   * 是"换一个东西"，不是"编辑"（端口租约、目标语义、RELAY 形态都要重新决定），
+   * §6.1 没有冻结这个语义，因此不猜。
+   */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   /** V4-WP1 §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
   expected_revision?: number | null;
 }
@@ -237,6 +263,13 @@ export function forwardView(t: any) {
     name: t.name,
     protocol,
     protocol_supported: normalizeForwardProtocol(protocol) !== null,
+    // V5-WP5-A1: the paths are part of a tls Forward's configuration, so the view
+    // carries them. Without them the detail page can say "TLS" but never which
+    // certificate, and an operator cannot verify a path without reading the DB —
+    // the projection is the API, and an unexposed fact is an unavailable one.
+    // Paths only: key material never leaves the node.
+    tls_cert_path: protocol === "tls" ? (t.tls_cert_path ?? null) : null,
+    tls_key_path: protocol === "tls" ? (t.tls_key_path ?? null) : null,
     mode: (t.tunnel_mode ?? "direct") as ForwardMode,
     ingress_node_id: t.ingress_node_id,
     ingress_node: t.ingress_node ?? null,
@@ -592,6 +625,12 @@ export async function createForward(
   if (protocol === null) {
     return error(400, "invalid_input", "当前版本不支持该转发协议");
   }
+  // V5-WP5-A1: a tls front needs both paths, and only a tls front accepts them.
+  // The panel cannot check that the files exist (they live on the node); what it
+  // must not do is dispatch "serve TLS" without a certificate, or quietly attach
+  // paths to a protocol that has no TLS front.
+  const tlsPaths = tlsPathsForProtocol(protocol, input.tls_cert_path, input.tls_key_path);
+  if (!tlsPaths.ok) return error(400, "invalid_input", tlsPaths.reason);
   if (
     !input.name.trim() ||
     !input.target_host.trim() ||
@@ -653,17 +692,37 @@ export async function createForward(
   }
 
   if (egress) {
-    const binding = await db.nodeBinding.findUnique({
-      where: {
-        ingress_node_id_egress_node_id: {
-          ingress_node_id: ingress.id,
-          egress_node_id: egress.id,
+    // V5.4：三跳路由的两段邻接是 (入口→中间) 与 (中间→出口)，而 (入口→出口) 那条
+    // **不被使用** —— 只查后者会让三跳路由在没有许可的情况下被创建出来，然后在下发时才炸。
+    const middleId = input.middle_node_id ?? null;
+    if (middleId != null) {
+      const pairs = await db.nodeBinding.findMany({
+        where: {
+          OR: [
+            { ingress_node_id: ingress.id, egress_node_id: middleId },
+            { ingress_node_id: middleId, egress_node_id: egress.id },
+          ],
         },
-      },
-      select: { id: true },
-    });
-    if (!binding) {
-      return error(409, "binding_required", "该出口尚未绑定到当前入口节点");
+        select: { ingress_node_id: true, egress_node_id: true },
+      });
+      const ok1 = pairs.some((b) => b.ingress_node_id === ingress.id && b.egress_node_id === middleId);
+      const ok2 = pairs.some((b) => b.ingress_node_id === middleId && b.egress_node_id === egress.id);
+      if (!ok1 || !ok2) {
+        return error(409, "binding_required", "三跳路由要求入口→中间、中间→出口两段都已绑定");
+      }
+    } else {
+      const binding = await db.nodeBinding.findUnique({
+        where: {
+          ingress_node_id_egress_node_id: {
+            ingress_node_id: ingress.id,
+            egress_node_id: egress.id,
+          },
+        },
+        select: { id: true },
+      });
+      if (!binding) {
+        return error(409, "binding_required", "该出口尚未绑定到当前入口节点");
+      }
     }
   }
 
@@ -708,8 +767,18 @@ export async function createForward(
       const tunnel = await tx.tunnel.create({
         data: {
           name: input.name.trim(),
-          tunnel_type: legacyTunnelTypeForForwardProtocol(protocol) as "tcp",
+          // The legacy column is a compatibility projection only, and for a
+          // protocol the legacy enum cannot express it stays absent (the column
+          // default applies) instead of being filled with a name that means
+          // something else — see legacyTunnelTypeForForwardProtocol.
+          // The contract is the source of the legacy names ('tcp' / 'tls'), and
+          // Prisma's generated enum type cannot see it — this cast is the
+          // boundary between the two. It is `TunnelType`, not `string`: a value
+          // the enum does not know must be a compile error, which is exactly the
+          // bug this line was written to fix (`ws` has no legacy enum value).
+          ...(legacyTunnelTypeColumn(protocol) as { tunnel_type?: TunnelType }),
           forward_protocol: protocol,
+          ...tlsPaths.columns,
           category: "port_forward",
           listen_ip: "0.0.0.0",
           listen_port: input.listen_port ?? null,
@@ -728,6 +797,8 @@ export async function createForward(
           tunnel_mode: input.mode,
           ingress_node_id: ingress.id,
           egress_node_id: egress?.id ?? null,
+          // V5.4：三跳路由的中间跳（省略 = 单跳）。创建路径直接用 `input`（候选尚未构建）。
+          middle_node_id: input.middle_node_id ?? null,
           desired_status: "inactive",
           apply_status: "pending",
           config_revision: 0,
@@ -798,6 +869,22 @@ export async function createForward(
         : await reapplyRelayTunnel(tunnelId, orchestrator);
 
     if (!applied.ok) {
+      // V5.4：把**失败在哪一步**打出来。
+      //
+      // 创建失败此前只回一个 502 body，`steps` / `failedStep` 被整条丢掉，于是"出口之后到底哪一步
+      // 失败"只能靠猜 —— 而这一步的失败会**留下已发出的出口 runtime**（实测 `tunex-277-egress`
+      // 占着 22001），每次尝试都在毒化下一次。没有这行日志，那类泄漏看起来像"端口分配有 bug"。
+      const failedStep = (applied as { failedStep?: string }).failedStep ?? "unknown";
+      const trail = (applied as { steps?: Array<{ step: string; ok: boolean; error_code?: string | null }> }).steps ?? [];
+      console.error(
+        "[forward] create failed:",
+        JSON.stringify({
+          tunnel_id: tunnelId,
+          failed_step: failedStep,
+          error_code: applied.error_code,
+          trail: trail.map((s2) => `${s2.step}${s2.ok ? "" : `(${s2.error_code ?? "fail"})`}`),
+        }),
+      );
       const failed = await loadForwardRow(tunnelId, workspaceId);
       return error(502, "apply_failed", applied.error, {
         apply_error_code: applied.error_code,
@@ -901,6 +988,17 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
+          // V5.4：中间跳与入出口同类 —— patch 里给了就落库，没给就沿用候选里的当前值
+          // （候选由 `mergeForwardCandidate` 合并，因此"没提交"永远是"不变"）。
+          middle_node_id: candidate.middle_node_id ?? null,
+          // V5-WP5-A1: the tls paths are part of the desired configuration, so a
+          // patch that changes them must persist them — and a patch that leaves
+          // them out must not silently drop them (the candidate carries the
+          // current values forward). This is the same rule the protocol follows,
+          // and the reason an operator can now rotate to a new certificate FILE
+          // NAME without deleting the Forward (which would also reassign an
+          // auto-allocated listen port).
+          ...tlsPathsForCandidate(candidate),
         },
       });
       return { written, resources };
@@ -1074,6 +1172,31 @@ interface ResolvedCandidate {
  * 这是 §13.3.3「preview 与真实 update 不得各写一份规则」的结构性保证：
  * 两个入口函数体都只有「落库 / 不落库」的差别，前置完全同一份代码。
  */
+/**
+ * The tls path columns for a resolved candidate.
+ *
+ * Uses the ONE rule (`tlsPathsForProtocol`) rather than re-checking here: only a
+ * tls candidate may carry paths, and it must carry both. A candidate that violates
+ * that never reaches this line — `resolveForwardCandidate` rejects it — so this
+ * helper only decides what to WRITE, and writing `null` for a non-tls candidate is
+ * what keeps a converted row from keeping stale paths.
+ */
+function tlsPathsForCandidate(candidate: {
+  protocol?: string;
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
+}): { tls_cert_path: string | null; tls_key_path: string | null } {
+  // A candidate always has a protocol by this point (`currentDesiredConfig` fills
+  // it from the persisted fact), but the type is optional; an absent protocol is
+  // not "tls", so the paths are cleared — the same fail-closed direction the rest
+  // of the contract takes.
+  const admitted = normalizeForwardProtocol(candidate.protocol);
+  if (admitted === null) return { tls_cert_path: null, tls_key_path: null };
+  const paths = tlsPathsForProtocol(admitted, candidate.tls_cert_path, candidate.tls_key_path);
+  if (!paths.ok) return { tls_cert_path: null, tls_key_path: null };
+  return { tls_cert_path: paths.columns.tls_cert_path, tls_key_path: paths.columns.tls_key_path };
+}
+
 async function resolveForwardCandidate(
   id: number,
   workspaceId: number,
@@ -1103,7 +1226,7 @@ async function resolveForwardCandidate(
   }
 
   // 需要读库的上下文：节点归属/能力、端口占用、NodeBinding、端口区间。
-  const [ingress, egress, binding, portHolders, siblings] = await Promise.all([
+  const [ingress, egress, binding, middleNode, middleBindings, portHolders, siblings] = await Promise.all([
     loadWorkspaceNode(candidate.ingress_node_id, workspaceId),
     candidate.egress_node_id === null
       ? Promise.resolve(null)
@@ -1119,6 +1242,23 @@ async function resolveForwardCandidate(
           select: { id: true },
         })
       : Promise.resolve(null),
+    // V5.4：中间跳的节点事实 + **两段**许可。三跳路由用到的两条邻接是
+    // (入口 → 中间) 与 (中间 → 出口)，而旧的 (入口 → 出口) 那条**不再被使用**
+    // （§9 冻结契约第 3 条：相邻两跳之间必须有绑定）。
+    candidate.mode === "relay" && candidate.middle_node_id != null
+      ? loadWorkspaceNode(candidate.middle_node_id, workspaceId)
+      : Promise.resolve(null),
+    candidate.mode === "relay" && candidate.middle_node_id != null && candidate.egress_node_id !== null
+      ? db.nodeBinding.findMany({
+          where: {
+            OR: [
+              { ingress_node_id: candidate.ingress_node_id, egress_node_id: candidate.middle_node_id },
+              { ingress_node_id: candidate.middle_node_id, egress_node_id: candidate.egress_node_id },
+            ],
+          },
+          select: { ingress_node_id: true, egress_node_id: true },
+        })
+      : Promise.resolve([]),
     candidate.listen_port === null
       ? Promise.resolve([])
       : db.nodePortLease.findMany({
@@ -1139,6 +1279,23 @@ async function resolveForwardCandidate(
   }
   if (candidate.mode === "relay" && !egress) {
     return { ok: false, error: error(404, "not_found", "出口节点不存在") };
+  }
+  // V5.4：三跳的中间跳必须存在，且**两段**邻接都必须有许可。缺任何一段都拒绝 ——
+  // 放行的后果是一条"中间那一段没有许可"的链路，它会在下发时才炸，且错误指向不了根因。
+  if (candidate.mode === "relay" && candidate.middle_node_id != null) {
+    if (!middleNode) return { ok: false, error: error(404, "not_found", "中间跳节点不存在") };
+    const hasIngressToMiddle = middleBindings.some(
+      (b) => b.ingress_node_id === candidate.ingress_node_id && b.egress_node_id === candidate.middle_node_id,
+    );
+    const hasMiddleToEgress = middleBindings.some(
+      (b) => b.ingress_node_id === candidate.middle_node_id && b.egress_node_id === candidate.egress_node_id,
+    );
+    if (!hasIngressToMiddle || !hasMiddleToEgress) {
+      return {
+        ok: false,
+        error: error(409, "binding_required", "三跳路由要求入口→中间、中间→出口两段都已绑定"),
+      };
+    }
   }
 
   // ── V4-WP5 §13.4.2：把 Forward（迁移）到新节点前先过准入 ──
@@ -1272,7 +1429,7 @@ async function resolveForwardCandidate(
       user_id: current.user_id,
       in_node_group_id: ingress.node_group_id,
       out_node_group_id: candidate.mode === "relay" ? egress?.node_group_id ?? null : null,
-      tunnel_type: admittedProtocol,
+      protocol: admittedProtocol,
     });
     if (rejected) {
       return { ok: false, error: error(403, rejected.reason, rejected.message, {

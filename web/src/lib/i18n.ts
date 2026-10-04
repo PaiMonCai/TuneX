@@ -297,6 +297,37 @@ const zh = {
     monitorAttentionHint: "应用失败的转发",
     monitorTraffic: "累计流量",
     monitorTrafficHint: "当前工作空间全部转发",
+    /*
+     * V5-WP5-A1 §6.1：协议面词条。
+     * 「协议」与「模式（直连/中继）」是两个维度，文案不得互相替代；
+     * 这里也刻意不出现 `wss` —— 它不是一个可创建的协议名。
+     */
+    protocol: "协议",
+    protocolUnsupported: "当前运行时未开放",
+    protocolFixedHint: "创建后不可更改。tls 的证书与私钥是入口节点上的文件，面板只保存路径。",
+    tlsCertPath: "证书路径（入口节点本地）",
+    tlsKeyPath: "私钥路径（入口节点本地）",
+    tlsPathsHint: "填写节点上的绝对路径；密钥内容不会上传到面板。",
+    tlsPathRequired: "tls 转发必须同时填写证书与私钥的绝对路径。",
+    tlsPathAbsolute: "请填写以 / 开头的节点本地绝对路径。",
+    tlsPathTooLong: "路径长度不能超过 512 个字符。",
+    tlsPathNotAllowed: "只有 tls 转发可以携带证书/私钥路径。",
+    /*
+     * V5.1b §6.2：datagram（udp）面词条。
+     * 凡涉及生命周期的地方都必须说「映射」而不是「连接」；udp **没有**连接可保持、
+     * 也没有显式关闭（UDP 里没有 FIN/RST），所以这些文案里出现「连接」时都是否定式。
+     */
+    sessionModel: "会话模型",
+    sessionModelMapping:
+      "报文映射：按客户端地址建立，空闲超时后回收；不存在连接，也不存在显式关闭。",
+    impactListenerDatagram:
+      "监听会重建：udp 没有连接可 drain，既有报文映射随旧监听一起消失，客户端下一个包会新建一条映射。",
+    impactTargetDatagram:
+      "目标在运行态热替换：新映射走新目标，既有映射保持到空闲过期（udp 没有连接可保持）。",
+    udpRelayUnsupported:
+      "本版本 udp 只开放直连（DIRECT）：中继或出口上的 udp 会被运行时拒绝（跨节点跳的形态尚未定义）。请改用直连入口，或选择 tcp / tls / ws。",
+    impactMetadataOnlyTlsPaths:
+      "证书/私钥路径已修改，但服务端把本次修改判定为「纯元数据变更」：该判定下路径不会写入，也不会重新下发。请连同任一其它改动一起保存。",
     listenPort: "监听端口",
     autoPort: "留空由系统自动分配",
     targetHost: "目标主机",
@@ -739,6 +770,49 @@ const zh = {
     runtimeEgressPools: "出口池快照",
     mockBadge: "MOCK",
     mockBadgeHint: "本页数据来自前端 mock（WP10 Admin API 尚未合入），字段与冻结契约一致。",
+    /*
+     * V5.2 §7：目标健康（观测 + 合成）。
+     * 词条只负责界面结构，**状态与理由码的文案在 `lib/target-health.ts`**（那里是
+     * `Record<State, …>` / `Record<Reason, …>`，漏一个码是编译错误；放这里就会退化成
+     * 「缺词条 → 界面画 key」）。凡涉及 `unknown` 的文案都必须表达「没有证据」。
+     */
+    targetHealth: {
+      title: "目标健康（观测）",
+      hint:
+        "上面那张表是「你要什么」，这里是「我们看到了什么」：状态由出口节点观测后合成。观测无权改动期望目标 —— 不删除、不启停，只报告事实。",
+      loading: "正在读取目标健康…",
+      failed: "目标健康读取失败",
+      retry: "重试",
+      refresh: "刷新观测",
+      empty: "该池还没有目标，因此没有可观测的对象。",
+      stateLabel: "健康状态",
+      snapshotAt: "观测快照",
+      snapshotAge: "快照时间 {age}",
+      age: "观测年龄",
+      lastObserved: "最近观测时刻",
+      stale: "证据已过期（等同于没有证据）",
+      fresh: "证据新鲜",
+      ageUnknown: "无年龄事实",
+      noFacts: "没有可用的观测事实（缺失不等于 0）。",
+      flapping: "抖动：窗口内反复翻转",
+      consecutiveFailure: "连续失败",
+      consecutiveSuccess: "连续成功",
+      successRate: "成功率",
+      latency: "连接耗时",
+      reachable: "可达",
+      unreachable: "不可达",
+      reachableUnknown: "可达性未知",
+      observers: "观测者",
+      observersNone: "没有任何节点观测过这个目标。",
+      disagreement: "观测者结论不一致：已取最坏，未做平均。",
+      reasons: "结论依据",
+      missingRow: "服务端未返回该目标的健康视图：按「没有证据」处理（不隐藏、不假定健康）。",
+      unexpectedRow: "该目标不在当前期望清单里（期望列表可能刚被改动）。",
+      desiredStatusTitle: "期望状态：由用户配置决定，观测无权修改",
+      desiredStatus: "期望状态",
+      observedBy: "观测方节点",
+      noObservingNodes: "没有任何节点参与观测：所有目标都只能是「无观测证据」。",
+    },
   },
   fields: {
     id: "ID",
@@ -1075,6 +1149,30 @@ const en: Dict = {
     monitorAttentionHint: "Forwards with apply errors",
     monitorTraffic: "Total traffic",
     monitorTrafficHint: "All forwards in this workspace",
+    /* V5-WP5-A1 §6.1 — protocol surface. "protocol" and "mode" stay separate. */
+    protocol: "Protocol",
+    protocolUnsupported: "Not enabled by this runtime",
+    protocolFixedHint:
+      "Fixed after creation. For tls, the certificate and key are files on the ingress node; the panel stores only their paths.",
+    tlsCertPath: "Certificate path (node-local)",
+    tlsKeyPath: "Private key path (node-local)",
+    tlsPathsHint: "Absolute paths on the node; key material is never uploaded to the panel.",
+    tlsPathRequired: "A tls forward requires absolute paths for both the certificate and the key.",
+    tlsPathAbsolute: "Use an absolute node-local path starting with /.",
+    tlsPathTooLong: "A path can be at most 512 characters.",
+    tlsPathNotAllowed: "Only a tls forward may carry certificate/key paths.",
+    /* V5.1b §6.2 — datagram (udp). Lifecycle wording says mapping, never "connection". */
+    sessionModel: "Session model",
+    sessionModelMapping:
+      "Packet mappings: keyed per client address and reclaimed on idle timeout; there is no connection and no explicit close.",
+    impactListenerDatagram:
+      "The listener is rebuilt; a UDP runtime has no connections to drain, so existing packet mappings disappear with the old listener and the client's next packet starts a new one.",
+    impactTargetDatagram:
+      "The target is swapped in the running runtime: new mappings use the new target while existing ones keep the old one until they expire idle (UDP has no connection to hold).",
+    udpRelayUnsupported:
+      "UDP is DIRECT-only in this build: a relay or egress UDP forward is refused by the runtime (the inter-node hop for UDP is not defined yet). Use a direct ingress, or pick tcp / tls / ws.",
+    impactMetadataOnlyTlsPaths:
+      "The certificate/key paths changed, but the server classified this edit as metadata-only: under that classification the paths are neither written nor rolled out. Save it together with another change.",
     listenPort: "Listen port",
     autoPort: "Leave empty for automatic allocation",
     targetHost: "Target host",
@@ -1523,6 +1621,44 @@ const en: Dict = {
     runtimeEgressPools: "Egress pool snapshot",
     mockBadge: "MOCK",
     mockBadgeHint: "This page is served from the frontend mock (WP10 Admin API is not merged yet); fields follow the frozen contract.",
+    /* V5.2 §7 — target health (observed). State/reason copy lives in lib/target-health.ts. */
+    targetHealth: {
+      title: "Target health (observed)",
+      hint:
+        "The table above is what you asked for; this is what we saw: states are synthesized from egress-node observations. Observation has no authority over desired targets — no delete, no enable/disable, facts only.",
+      loading: "Loading target health…",
+      failed: "Could not load target health",
+      retry: "Retry",
+      refresh: "Refresh observations",
+      empty: "This pool has no targets, so there is nothing to observe.",
+      stateLabel: "Health state",
+      snapshotAt: "Observation snapshot",
+      snapshotAge: "Snapshot {age}",
+      age: "Observation age",
+      lastObserved: "Last observed at",
+      stale: "Evidence is stale (equivalent to having no evidence)",
+      fresh: "Evidence is fresh",
+      ageUnknown: "No age fact",
+      noFacts: "No usable observation facts (missing is not zero).",
+      flapping: "Flapping: flipped repeatedly inside the window",
+      consecutiveFailure: "Consecutive failures",
+      consecutiveSuccess: "Consecutive successes",
+      successRate: "Success rate",
+      latency: "Connect latency",
+      reachable: "Reachable",
+      unreachable: "Unreachable",
+      reachableUnknown: "Reachability unknown",
+      observers: "Observers",
+      observersNone: "No node has observed this target.",
+      disagreement: "Observers disagree: the worst case is used, never an average.",
+      reasons: "Why this verdict",
+      missingRow: "The server returned no health row for this target: treated as having no evidence (never hidden, never assumed healthy).",
+      unexpectedRow: "This target is not in the current desired list (the list may have just changed).",
+      desiredStatusTitle: "Desired status: set by the operator; observation cannot change it",
+      desiredStatus: "Desired status",
+      observedBy: "Observing nodes",
+      noObservingNodes: "No node is observing: every target can only be \"no evidence\".",
+    },
   },
   fields: {
     id: "ID",

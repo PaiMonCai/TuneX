@@ -43,6 +43,8 @@ const NODE_INGRESS = {
 
 const NODE_INGRESS_B = { id: 12, node_id: "ing-b", role: "both", connect_ip: "10.0.0.12", lifecycle: "active" };
 const NODE_EGRESS = { id: 21, node_id: "egr-a", role: "egress", connect_ip: "10.0.1.21", lifecycle: "active" };
+/** V5.4：三跳路由的中间跳（只中转，不落目标）。 */
+const NODE_MIDDLE = { id: 22, node_id: "mid-a", role: "both", connect_ip: "10.0.1.22", lifecycle: "active" };
 const NODE_EGRESS_B = { id: 22, node_id: "egr-b", role: "egress", connect_ip: "10.0.1.22", lifecycle: "active" };
 
 const NONE_NODES = { ingress: null, egress: null, ingress_previous: null, egress_previous: null };
@@ -112,6 +114,94 @@ function shape(input: PlanRolloutInput): string[] {
 /* ------------------------------------------------------------------ */
 /* 1. RELAY CONP 铁律：prepare_egress 早于 cutover_ingress             */
 /* ------------------------------------------------------------------ */
+
+describe("V5.4：三跳路由的计划（中间跳）", () => {
+  const threeHopInput = () =>
+    planInput({
+      desired: snapshot({
+        mode: "relay",
+        target_host: null,
+        target_port: null,
+        egress_node_id: NODE_EGRESS.id,
+        middle_node_id: NODE_MIDDLE.id,
+      } as never),
+      impact: impact({ mode_change: true, egress_node_change: true, binding_required: false }),
+      nodes: {
+        ingress: NODE_INGRESS,
+        egress: NODE_EGRESS,
+        middle: NODE_MIDDLE,
+        ingress_previous: null,
+        egress_previous: null,
+      } as never,
+    });
+
+  it("中间跳有自己的端口与 apply 步骤，且顺序是出口 → 中间 → 入口", () => {
+    const steps = shape(threeHopInput());
+    expect(steps).toContain("prepare:prepare_transit");
+    // 先远后近：出口的 apply 必须早于中间跳，中间跳必须早于入口切换。
+    const egressPrepare = steps.indexOf("prepare:prepare_egress");
+    const transit = steps.indexOf("prepare:prepare_transit");
+    const ingressCut = steps.indexOf("cutover:cutover_ingress");
+    expect(egressPrepare).toBeGreaterThanOrEqual(0);
+    expect(egressPrepare).toBeLessThan(transit);
+    expect(transit).toBeLessThan(ingressCut);
+  });
+
+  it("中间跳有自己的端口租约（acquire_port 指向它）", () => {
+    const steps = planRollout(threeHopInput(), 42).steps;
+    const transitPort = steps.find((s) => s.kind === "prepare_transit");
+    const acquire = steps.find((s) => s.kind === "acquire_port" && s.node_id === NODE_MIDDLE.id);
+    expect(transitPort?.node_id).toBe(NODE_MIDDLE.id);
+    expect(acquire).toBeDefined();
+  });
+
+  it("单跳计划里**没有**任何中间跳步骤（多跳不能渗进 V4 的路径）", () => {
+    const single = planInput({
+      desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),
+      impact: impact({ mode_change: true, egress_node_change: true, binding_required: false }),
+      nodes: { ingress: NODE_INGRESS, egress: NODE_EGRESS, ingress_previous: null, egress_previous: null },
+    });
+    expect(shape(single).filter((x) => x.includes("transit"))).toHaveLength(0);
+  });
+});
+
+describe("RELAY 只换入口节点也必须准备出口（V5.3 round 19）", () => {
+  it("ingress_node_change 单独成立时，计划里必须有 prepare_egress", () => {
+    // 这是 failover 走的那条路：只换入口节点，出口一点没变。
+    // `prepare_egress` 是**唯一**登记出口可寻址 host 的地方，而铁律是"没有 next_hop 就不允许
+    // 启入口"。漏掉它 ⇒ resolveNextHop 返回 null ⇒ next_hop_unresolved ⇒ 入口 cutover 失败 ⇒
+    // 新主人永远不服务（forward_rollout#36 的 last_error 就是这句）。
+    const input = planInput({
+      desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),
+      impact: impact({ ingress_node_change: true, listener_replacement: true }),
+      nodes: {
+        ingress: NODE_INGRESS,
+        egress: NODE_EGRESS,
+        ingress_previous: null,
+        egress_previous: null,
+      },
+    });
+    const steps = shape(input);
+    expect(steps).toContain("prepare:prepare_egress");
+    // 而且顺序仍是铁律：出口准备必须早于入口切换。
+    expect(steps.indexOf("prepare:prepare_egress")).toBeLessThan(steps.indexOf("cutover:cutover_ingress"));
+  });
+
+  it("出口没变、入口也没重切时，不额外准备出口（避免每次 rollout 多一次下发）", () => {
+    const input = planInput({
+      desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),
+      impact: impact({ egress_target_change: true }),
+      nodes: {
+        ingress: NODE_INGRESS,
+        egress: NODE_EGRESS,
+        ingress_previous: null,
+        egress_previous: null,
+      },
+    });
+    // 只换池内目标：切换发生在 CUTOVER，PREPARE 无事可做（既有契约，不能被这次修复破坏）。
+    expect(shape(input).filter((x) => x.startsWith("prepare:prepare_egress"))).toHaveLength(0);
+  });
+});
 
 describe("RELAY ordering（§13.3.5 / orchestrator 铁律）", () => {
   it("prepare_egress 严格早于 cutover_ingress", () => {
@@ -304,7 +394,7 @@ describe("策略分类与步骤集合（§13.3.4 判定表）", () => {
     ]);
   });
 
-  it("换入口节点 ⇒ node_migration，drain/cleanup 指向旧节点", () => {
+  it("换入口节点 ⇒ node_migration，先 handoff 旧 owner 再 cutover 新入口", () => {
     const input = planInput({
       desired: snapshot({ ingress_node_id: NODE_INGRESS_B.id }),
       applied: snapshot(),
@@ -320,11 +410,11 @@ describe("策略分类与步骤集合（§13.3.4 判定表）", () => {
     expect(steps.map((s) => `${s.phase}:${s.kind}`)).toEqual([
       "validate:validate",
       "prepare:acquire_port",
+      "cutover:handoff_ingress_owner",
       "cutover:cutover_ingress",
-      "drain:drain_ingress",
       "cleanup:release_old_lease",
     ]);
-    expect(steps.find((s) => s.phase === "drain")!.node_id).toBe(NODE_INGRESS.id);
+    expect(steps.find((s) => s.kind === "handoff_ingress_owner")!.node_id).toBe(NODE_INGRESS.id);
     expect(steps.find((s) => s.phase === "cleanup")!.node_id).toBe(NODE_INGRESS.id);
     expect(steps.find((s) => s.phase === "prepare")!.node_id).toBe(NODE_INGRESS_B.id);
   });

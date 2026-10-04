@@ -82,6 +82,8 @@ import type {
   WorkspaceTrafficSummary,
 } from "./types";
 import { normalizeHealthSummary } from "./node-health";
+// V5.2 §7：目标健康视图的契约镜像（状态/理由码的 closed set 在那一处）。
+import type { TargetPoolHealth } from "./target-health";
 import { shouldRedirectToLogin } from "./workspace-permissions";
 import type { EffectiveWorkspacePermissions, WorkspaceCustomRole, WorkspaceCustomRoleInput, WorkspaceMemberRoleInput } from "./workspace-permissions";
 
@@ -639,6 +641,20 @@ export const api = {
      */
     nodeHealth: (id: ID, cookie?: string) =>
       get<NodeHealthView>(`/admin/node/${id}/health`, undefined, cookie),
+    /**
+     * V5.2 §7（WP5/WP6）：出口池的**目标健康**视图。
+     *
+     * 路径用后端的**真实**路径 `/admin/node/pools/:poolId/health`（单数 `node`，
+     * 与 `POST/PUT .../targets` 同一前缀；见 `backend/src/routes/node-admin.ts`）。
+     * 响应 `{ data: { targets, observers, observed_at } }` 是单层信封 → 走通用解包。
+     *
+     * 与 `.../targets` 分开取，是因为两者是两类事实：那是**期望**（用户要什么），
+     * 这是**观测 + 合成**（我们看到了什么、据此判断什么）。状态 / 理由 / 逐观测者
+     * 明细全部由后端给出；前端只展示，并把 age 按本地时钟现算，**不重算、不取平均、
+     * 不改 desired**。
+     */
+    poolTargetHealth: (poolId: ID, cookie?: string) =>
+      get<TargetPoolHealth>(`/admin/node/pools/${poolId}/health`, undefined, cookie),
     /**
      * V4-WP6 §13.4.4：全量巡检（`?health=` / `?lifecycle=`）。
      *

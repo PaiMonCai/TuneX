@@ -21,6 +21,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
+	"github.com/tunex/agent/internal/ownership"
 	"github.com/tunex/agent/internal/selfinfo"
 )
 
@@ -332,6 +333,16 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 			cfg.Revision = cmd.Envelope.Revision
 		}
 
+		// V5.3 WP9: the ownership gate runs BEFORE anything is staged. A refusal
+		// must not leave a trace — staging an EGRESS pool first would briefly
+		// apply a fenced activation's targets to a running pool before the
+		// refusal landed. The manager gates again when it applies; this call is
+		// what makes the refusal side-effect free.
+		if err := c.tunnels.AdmitActivation(cfg); err != nil {
+			ack.ErrorCode, ack.Error = ackCodeFor(err), err.Error()
+			return ack
+		}
+
 		// EGRESS forwarders depend on a target selector at construction time.
 		// Online commands must therefore install/update the target pool before
 		// TunnelManager.Apply, exactly like startup restore does. Otherwise the
@@ -351,11 +362,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		_, err = c.applyByPlan(cfg)
 		if err != nil {
 			rollbackPool()
-			if errors.Is(err, manager.ErrStaleRevision) {
-				ack.ErrorCode = "stale_revision"
-			} else {
-				ack.ErrorCode = "apply_failed"
-			}
+			ack.ErrorCode = ackCodeFor(err)
 			ack.Error = err.Error()
 			return ack
 		}
@@ -414,6 +421,26 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 	return ack
 }
 
+// ackCodeFor maps an apply failure onto the ACK's error_code.
+//
+// The code is the panel's vocabulary for WHAT happened, so a refusal keeps its
+// own name instead of collapsing into "apply_failed": an operator (and the
+// reconciler) must be able to tell "this node was demoted" from "the port was
+// taken", and a fence whose refusals look like generic failures is a fence
+// nobody can audit.
+func ackCodeFor(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, manager.ErrStaleRevision) {
+		return "stale_revision"
+	}
+	if code, ok := ownership.RefusalCode(err); ok {
+		return code
+	}
+	return "apply_failed"
+}
+
 // applyByPlan routes one apply_tunnel command through the hot-reload
 // primitive that matches its plan, so the panel's edit semantics
 // (DEVELOPMENT.md §13.3.4) are honoured by the command path and not only by
@@ -434,7 +461,12 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 // The plan is advisory about HOW to apply, never about WHETHER: the revision
 // gate and every port conflict stay inside the manager, so a bad plan cannot
 // make a command succeed or fail differently than the manager decides.
-func (c *Client) applyByPlan(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+//
+// The returned handle is the transport-agnostic runtime (forwarder.Runtime): a
+// udp tunnel's runtime is not a StreamRuntime, and this router must not claim it
+// is. No caller reads the value today — the ACK is built from the error — so the
+// narrower type costs nothing and keeps the lie out of the signature.
+func (c *Client) applyByPlan(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	return c.tunnels.ReplaceListener(cfg)
 }
 
@@ -464,17 +496,25 @@ func (c *Client) prepareEgressPool(cfg forwarder.TunnelConfig) (func(), error) {
 				oldStrategy = parsed
 			}
 		}
-		if err := c.egress.UpdateTargets(cfg.ID, strategy, cfg.Targets); err != nil {
+		// Both arrays travel in the same payload (§7.3): the desired targets
+		// and the panel's health facts, applied together so the health-aware
+		// mechanism never runs against a pool it was not computed for.
+		if err := c.egress.UpdateTargetsAndHealth(cfg.ID, strategy, cfg.Targets, cfg.TargetHealth); err != nil {
 			return func() {}, err
 		}
 		return func() {
 			if len(oldTargets) > 0 {
+				// The rollback restores what this agent can still know: the
+				// previous desired targets and strategy. The previous health
+				// facts are NOT retained (health is a live fact, never cached —
+				// §7.3), so the rollback clears them, which is the safe
+				// direction: a missing breaker behaves like the pre-WP7 agent.
 				_ = c.egress.UpdateTargets(cfg.ID, oldStrategy, oldTargets)
 			}
 		}, nil
 	}
 
-	c.egress.SetPool(cfg.ID, strategy, cfg.Targets)
+	c.egress.SetPoolAndHealth(cfg.ID, strategy, cfg.Targets, cfg.TargetHealth)
 	return func() { c.egress.DropPool(cfg.ID) }, nil
 }
 

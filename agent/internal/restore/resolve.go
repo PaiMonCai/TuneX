@@ -163,6 +163,27 @@ func Reconcile(ctx context.Context, tunnels *manager.TunnelManager, egress *mana
 		}
 		removed = append(removed, id)
 	}
+	// V5.4：**出口侧的 runtime 也必须按同一份权威集合裁剪。**
+	//
+	// 上面那个循环只看得见 `TunnelManager` 里的 runtime，而在**纯出口节点**上那个集合是**空的** ——
+	// 出口 runtime 活在 `EgressManager` 的池表里。实测后果：一条 Forward 在节点离线期间被删除，
+	// 它的出口 runtime 永远裁不掉，一直占着监听端口；面板的分配器查的是数据库租约，于是把那个
+	// 端口又发出去，Agent 正确地拒绝每一次 apply —— 症状看起来像"端口分配有 bug"，
+	// 实际是一条无法被裁剪的孤儿（`tunex-272-egress` 占着 22001，而它的 Forward 行早已不存在）。
+	//
+	// 判据与上面完全一致（不在权威期望集合里就撤），因此必须复用同一个 `wanted`。
+	if egress != nil {
+		for _, id := range egress.IDs() {
+			if err := ctx.Err(); err != nil {
+				break
+			}
+			if wanted[id] {
+				continue
+			}
+			egress.DropPool(id)
+			removed = append(removed, id)
+		}
+	}
 	if len(removed) > 0 {
 		sort.Strings(removed)
 		logx.Info("reconcile removed runtime absent from authoritative desired state",

@@ -8,7 +8,28 @@
  */
 import { describe, expect, test } from "bun:test";
 import { OutboundAgentTransport, type CommandBusStore } from "../agent-command-bus.ts";
-import type { AgentCapabilityFacts } from "../agent-capability.ts";
+import type { AgentV2CapabilityFacts } from "../runtime-admission.ts";
+
+/**
+ * V5-WP1: the outbound gate now consumes the v2 fact set (actions + manifest),
+ * so the V4-shaped literals below are widened with the manifest defaults an
+ * Agent that never reported one produces. The V4 assertions themselves are
+ * unchanged — that is the point of this file.
+ */
+function v2Facts(partial: {
+  capabilities: string[] | null;
+  protocolVersion: number | null;
+  capabilitiesMalformed?: boolean;
+  manifest?: AgentV2CapabilityFacts["manifest"];
+  manifestMalformed?: boolean;
+}): AgentV2CapabilityFacts {
+  return {
+    capabilitiesMalformed: false,
+    manifest: null,
+    manifestMalformed: false,
+    ...partial,
+  };
+}
 
 /** Records every write so the test can prove nothing was queued. */
 function memoryStore() {
@@ -61,17 +82,17 @@ const envelope = {
   revision: 3,
 } as never;
 
-function transportFor(facts: AgentCapabilityFacts | null | (() => never)) {
+function transportFor(facts: AgentV2CapabilityFacts | null | (() => never)) {
   const { store, writes } = memoryStore();
   const loader = typeof facts === "function"
-    ? (async () => facts()) as unknown as (nodeId: number) => Promise<AgentCapabilityFacts | null>
-    : (async () => facts) as unknown as (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    ? (async () => facts()) as unknown as (nodeId: number) => Promise<AgentV2CapabilityFacts | null>
+    : (async () => facts) as unknown as (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
   return { transport: new OutboundAgentTransport(loader, store), writes };
 }
 
 describe("WP11B outbound capability gate", () => {
   test("a non-baseline action is refused when the agent advertised nothing", async () => {
-    const { transport, writes } = transportFor({ capabilities: null, protocolVersion: null });
+    const { transport, writes } = transportFor(v2Facts({ capabilities: null, protocolVersion: null }));
     await expect(
       transport.applyDirect(node, config, { ...(envelope as object), action: "diagnose_forward" } as never),
     ).rejects.toThrow(/未上报控制协议能力/);
@@ -80,7 +101,7 @@ describe("WP11B outbound capability gate", () => {
   });
 
   test("a non-baseline action is refused when the agent reported a short list", async () => {
-    const { transport, writes } = transportFor({ capabilities: ["apply_tunnel"], protocolVersion: 1 });
+    const { transport, writes } = transportFor(v2Facts({ capabilities: ["apply_tunnel"], protocolVersion: 1 }));
     await expect(
       transport.applyDirect(node, config, { ...(envelope as object), action: "drain_node" } as never),
     ).rejects.toThrow(/未实现 drain_node/);
@@ -88,7 +109,7 @@ describe("WP11B outbound capability gate", () => {
   });
 
   test("an explicitly advertised action passes the gate (no refusal, queueing begins)", async () => {
-    const { transport } = transportFor({ capabilities: ["apply_tunnel"], protocolVersion: 1 });
+    const { transport } = transportFor(v2Facts({ capabilities: ["apply_tunnel"], protocolVersion: 1 }));
     // The gate lets it through; the next step needs a database for the node
     // scope, so any error from here on must NOT be a capability refusal.
     const failure = await transport
@@ -102,16 +123,28 @@ describe("WP11B outbound capability gate", () => {
 
   test("unparseable stored capabilities are refused instead of degrading to baseline", async () => {
     // A corrupt stored value must not become "never reported": that would turn a
-    // fail-closed case into a baseline pass.
+    // fail-closed case into a baseline pass. V5-WP1 represents the corruption as
+    // an explicit flag on the fact object (so freshness can still be evaluated),
+    // and the gate must honour it exactly like the V4 throw did.
+    const { transport, writes } = transportFor(
+      v2Facts({ capabilities: null, protocolVersion: 1, capabilitiesMalformed: true }),
+    );
+    await expect(transport.applyDirect(node, config, envelope)).rejects.toThrow(/未实现 apply_tunnel/);
+    expect(writes).toEqual([]);
+  });
+
+  test("a fact read that fails outright is refused, not silently treated as baseline", async () => {
+    // The loader throwing means "these facts are unusable"; degrading to baseline
+    // here would dispatch to a binary nobody has described.
     const { transport, writes } = transportFor(() => {
       throw new TypeError("capabilities must be an array of strings");
     });
-    await expect(transport.applyDirect(node, config, envelope)).rejects.toThrow(/能力上报形状非法/);
+    await expect(transport.applyDirect(node, config, envelope)).rejects.toThrow(/能力上报无法读取/);
     expect(writes).toEqual([]);
   });
 
   test("an empty advertisement refuses even the baseline actions", async () => {
-    const { transport, writes } = transportFor({ capabilities: [], protocolVersion: 1 });
+    const { transport, writes } = transportFor(v2Facts({ capabilities: [], protocolVersion: 1 }));
     await expect(transport.applyDirect(node, config, envelope)).rejects.toThrow(/未实现 apply_tunnel/);
     expect(writes).toEqual([]);
   });

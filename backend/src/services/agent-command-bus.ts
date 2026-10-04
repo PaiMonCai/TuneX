@@ -10,11 +10,18 @@
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
+import { admitPersistedProtocol } from "./forward-contract.ts";
 import {
-  capabilityFactsFromStored,
-  decideCapability,
-  type AgentCapabilityFacts,
-} from "./agent-capability.ts";
+  targetHealthWireEntries,
+  type TargetHealthWireEntry,
+} from "./target-health-read.ts";
+import {
+  admissionLayerLabel,
+  admitAction,
+  admitOnNode,
+  loadNodeCapabilityFacts,
+  type AgentV2CapabilityFacts,
+} from "./runtime-admission.ts";
 import { randomUUID } from "node:crypto";
 import {
   AgentTransportError,
@@ -584,40 +591,19 @@ export async function waitAgentCommandAck(
 }
 
 /**
- * Read the node's latest advertised control capabilities (WP11B).
+ * Read the node's latest advertised capability facts (V4-WP11B actions +
+ * V5-WP1 manifest).
  *
  * Deliberately narrow and lazy: this module is imported by the worker, so a
- * top-level Prisma import would connect during unit tests. A read failure is
- * reported as "no facts" (which still allows baseline actions) instead of
- * blocking every dispatch on a database hiccup.
+ * top-level Prisma import would connect during unit tests. The read itself
+ * lives in `runtime-admission.ts` so the panel's admission facts have exactly
+ * one loader; a failure there is reported as "no facts" (which still allows the
+ * protocol-frozen baseline) instead of blocking every dispatch on a hiccup.
  */
-async function loadCapabilityFacts(nodeId: number): Promise<AgentCapabilityFacts | null> {
+async function loadCapabilityFacts(nodeId: number): Promise<AgentV2CapabilityFacts | null> {
   try {
-    const { db } = await import("../db.ts");
-    const row = await db.nodeStateReport.findUnique({
-      where: { node_id: nodeId },
-      select: {
-        control_protocol_version: true,
-        capabilities: true,
-        reported_at: true,
-        // Reinstall keeps node_id AND agent_id, so a stale row can describe an
-        // agent binary this node no longer runs (WP11B).
-        node: { select: { credential_rotated_at: true } },
-      },
-    });
-    // A malformed stored value must NOT silently become "never reported": that
-    // would downgrade fail-closed to baseline-allowed. The pure helper throws on
-    // bad shape and the caller turns that into a refusal.
-    return capabilityFactsFromStored(row
-      ? {
-          control_protocol_version: row.control_protocol_version,
-          capabilities: row.capabilities,
-          reported_at: row.reported_at,
-          credential_rotated_at: row.node?.credential_rotated_at ?? null,
-        }
-      : null);
-  } catch (error) {
-    if (error instanceof TypeError) throw error;
+    return await loadNodeCapabilityFacts(nodeId);
+  } catch {
     return null;
   }
 }
@@ -633,29 +619,48 @@ export class OutboundAgentTransport implements AgentTransport {
    * without a database. Production default reads the node's last state report.
    */
   constructor(
-    private readonly capabilityFacts: (nodeId: number) => Promise<AgentCapabilityFacts | null> = loadCapabilityFacts,
+    private readonly capabilityFacts: (nodeId: number) => Promise<AgentV2CapabilityFacts | null> = loadCapabilityFacts,
     private readonly store: CommandBusStore = redisStore,
   ) {}
 
-  /** Refuse to queue a command the node has not advertised support for. */
-  private async assertCapability(node: OrchestratorNode, action: string): Promise<void> {
-    let facts: AgentCapabilityFacts | null = null;
+  /**
+   * Refuse to queue a command the node has not advertised support for.
+   *
+   * V5-WP1: the gate now covers all three orthogonal dimensions (action +
+   * protocol + transport) through the panel's single admission implementation.
+   * The protocol is taken from the outgoing config, which is the very fact the
+   * agent will act on — reading it from anywhere else would let the gate and the
+   * payload disagree.
+   *
+   * This stays even though the scheduler already admits before dispatch: it is
+   * the last line of defence, and it is the only one that also covers
+   * non-scheduler callers (rollout, diagnosis, future routes).
+   */
+  private async assertCapability(
+    node: OrchestratorNode,
+    action: string,
+    config?: AgentTunnelConfig | null,
+  ): Promise<void> {
+    let facts: AgentV2CapabilityFacts | null = null;
     try {
       facts = await this.capabilityFacts(node.id);
     } catch {
-      // A stored capability value that cannot be parsed means "this node's
-      // negotiation facts are unusable" — fail closed for everything except the
-      // protocol-frozen baseline, exactly like an explicit disagreement.
+      // A stored value that cannot be read means "this node's negotiation facts
+      // are unusable" — fail closed for everything except the protocol-frozen
+      // baseline, exactly like an explicit disagreement.
       throw new AgentTransportError(
         RELAY_DISPATCH_ERROR_CODES.agent_rejected,
-        `节点 ${node.id} 的能力上报形状非法，拒绝下发 ${action}；请升级 Agent`,
+        `节点 ${node.id} 的能力上报无法读取，拒绝下发 ${action}；请升级 Agent`,
       );
     }
-    const decision = decideCapability(facts, action);
-    if (!decision.supported) {
+    const decision = admitOnNode(
+      { nodeId: node.id, role: config?.mode === "EGRESS" ? "egress" : "ingress", facts },
+      { action, protocol: config?.protocol },
+    );
+    if (!decision.ok) {
       throw new AgentTransportError(
         RELAY_DISPATCH_ERROR_CODES.agent_rejected,
-        `${decision.detail}（node=${node.id}, action=${action}, reason=${decision.reason}）`,
+        `${decision.detail}（原因=${decision.reason}，维度=${admissionLayerLabel(decision.layer)}）`,
       );
     }
   }
@@ -671,8 +676,9 @@ export class OutboundAgentTransport implements AgentTransport {
         "outbound transport requires command envelope",
       );
     }
-    // WP11B: never send an action this node has not told us it implements.
-    await this.assertCapability(node, String(envelope.action ?? ""));
+    // WP11B + WP1: never send an action/protocol/transport this node has not
+    // told us it implements.
+    await this.assertCapability(node, String(envelope.action ?? ""), config);
     const { scope } = await enqueueAgentCommand(node.id, envelope, config, this.store);
     const ack = await waitAgentCommandAck(scope, node.id, envelope.command_id, undefined, this.store);
     if (!ack.ok) {
@@ -730,7 +736,7 @@ export async function issueAgentDiagnose(
     timeoutMs?: number;
   },
   deps: {
-    capabilityFacts?: (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    capabilityFacts?: (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
     store?: CommandBusStore;
   } = {},
 ): Promise<{ ok: true; results: AgentDiagnoseResult[] } | { ok: false; error_code: string; error: string }> {
@@ -757,14 +763,17 @@ export async function issueAgentDiagnose(
     expires_at: new Date(Date.now() + (input.timeoutMs ?? 20_000)).toISOString(),
   } as unknown as CommandEnvelope;
 
-  let facts: AgentCapabilityFacts | null = null;
+  let facts: AgentV2CapabilityFacts | null = null;
   try {
     facts = await factsReader(input.nodeId);
   } catch {
     return { ok: false, error_code: "incompatible_agent", error: `节点 ${input.nodeId} 的能力上报形状非法，拒绝下发诊断` };
   }
-  const decision = decideCapability(facts, "diagnose_tunnel");
-  if (!decision.supported) {
+  // Diagnose has no protocol dimension: it probes a target path, it is not a
+  // forward runtime. Requiring a protocol fact here would refuse a diagnostic on
+  // a node whose manifest is silent about protocols for unrelated reasons.
+  const decision = admitAction({ nodeId: input.nodeId, role: "ingress", facts }, "diagnose_tunnel");
+  if (!decision.ok) {
     return { ok: false, error_code: decision.reason, error: decision.detail };
   }
 
@@ -794,21 +803,23 @@ export async function issueAgentDiagnose(
 export async function issueAgentDiagnostics(
   input: { nodeId: number; timeoutMs?: number },
   deps: {
-    capabilityFacts?: (nodeId: number) => Promise<AgentCapabilityFacts | null>;
+    capabilityFacts?: (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
     store?: CommandBusStore;
   } = {},
 ): Promise<{ ok: true; facts: NodeSelfFacts } | { ok: false; error_code: string; error: string }> {
   const factsReader = deps.capabilityFacts ?? loadCapabilityFacts;
   const store = deps.store ?? redisStore;
 
-  let facts: AgentCapabilityFacts | null = null;
+  let facts: AgentV2CapabilityFacts | null = null;
   try {
     facts = await factsReader(input.nodeId);
   } catch {
     return { ok: false, error_code: "incompatible_agent", error: `节点 ${input.nodeId} 的能力上报形状非法` };
   }
-  const decision = decideCapability(facts, "collect_diagnostics");
-  if (!decision.supported) {
+  // Action-only, same reason as diagnose_tunnel: a node-level self report has no
+  // protocol dimension.
+  const decision = admitAction({ nodeId: input.nodeId, role: "ingress", facts }, "collect_diagnostics");
+  if (!decision.ok) {
     return { ok: false, error_code: decision.reason, error: decision.detail };
   }
 
@@ -852,15 +863,258 @@ function firstConnectIp(raw: string | null): string | null {
  * Canonical desired snapshot used by Agent startup restore.
  * Only concrete node bindings are considered; NodeGroup is never re-interpreted
  * as placement.
+ *
+ * V5-WP4/G0: this is the one dispatch-ish path that deliberately bypasses the
+ * orchestrator — the Agent *pulls* its desired state — so the protocol gate has
+ * to run here too. Before, every entry was emitted with `protocol: "tcp"`, and a
+ * historical non-TCP Forward whose row is still `desired_status='active'` was
+ * therefore handed to the Agent as TCP on **every node restart**: the gate found
+ * a `wss` row being re-applied every time an Agent came back, during the LKG
+ * cases, because of exactly this.
+ *
+ * The rule: a row whose protocol fact is not admitted is **omitted** from the
+ * snapshot (a single unrunnable Forward must not stop a node from restoring the
+ * rest of its work) and reported in `skipped` so the omission is observable
+ * instead of silent.
  */
-export async function buildDesiredNodeSnapshot(nodeId: number): Promise<{ version: string; tunnels: AgentTunnelConfig[] }> {
+/** 一行 desired 状态（`buildDesiredNodeSnapshot` 的输入投影）。 */
+export interface DesiredRowProjection {
+  id: number;
+  tunnel_mode: string | null;
+  desired_status: string | null;
+  config_revision: number | null;
+  forward_protocol?: unknown;
+  tunnel_type?: unknown;
+  ingress_node_id: number | null;
+  egress_node_id: number | null;
+  /** V5.4：三跳路由的中间节点；null = 单跳。 */
+  middle_node_id?: number | null;
+  listen_port: number | null;
+  listen_ip: string | null;
+  remote_host: string | null;
+  remote_port: number | null;
+  egress_port: number | null;
+  egress_node?: { connect_ip: string | null } | null;
+  middle_node?: { connect_ip: string | null } | null;
+  egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
+  /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
+  port_leases?: Array<{ node_id: number; port: number; status: string }>;
+  /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
+}
+
+export type DesiredRowOutcome =
+  | { kind: "config"; config: AgentTunnelConfig }
+  | { kind: "skip"; reason: string }
+  | { kind: "not_for_node" };
+
+/**
+ * One desired row → the Agent config for `nodeId` (pure).
+ *
+ * Extracted so the protocol decision is testable without a database: this is the
+ * exact spot where a historical non-TCP Forward used to be silently relabelled
+ * `tcp` on every node restart.
+ */
+export function desiredTunnelConfigFor(
+  row: DesiredRowProjection,
+  nodeId: number,
+  /**
+   * V5.2 WP7 —— 该转发出口池的健康事实，按隧道 id 索引。
+   *
+   * 作为**入参**而不是在这里读库：这个函数是纯的（可离线断言"哪些行该下发"），而健康
+   * 是 IO 结果。由调用方（快照构建）读一次、传进来，纯函数只负责把两类事实并排放好。
+   */
+  healthByTunnel: ReadonlyMap<number, readonly TargetHealthWireEntry[]> = new Map(),
+): DesiredRowOutcome {
+  const revision = row.config_revision ?? 0;
+  if (revision <= 0) return { kind: "not_for_node" };
+
+  // One row, one protocol: resolved once and used by every leg below, so the
+  // three branches cannot disagree about which protocol this Forward is.
+  const protocol = admitPersistedProtocol({
+    forward_protocol: row.forward_protocol,
+    tunnel_type: row.tunnel_type,
+  });
+  if (protocol === null) return { kind: "skip", reason: "protocol_not_supported" };
+
+  // V5-WP5-A1: a tls front needs both paths. Without them the row is a broken
+  // configuration, and the honest outcome is to keep it out of the snapshot —
+  // the Agent must never be told "serve TLS" without a certificate.
+  const tlsPaths =
+    protocol === "tls"
+      ? {
+          tls_cert_path: (row.tls_cert_path ?? "").trim() || undefined,
+          tls_key_path: (row.tls_key_path ?? "").trim() || undefined,
+        }
+      : {};
+  if (protocol === "tls" && (tlsPaths.tls_cert_path === undefined || tlsPaths.tls_key_path === undefined)) {
+    return { kind: "skip", reason: "tls_paths_missing" };
+  }
+
+  if (row.ingress_node_id === nodeId && row.tunnel_mode === "direct") {
+    if (!row.listen_port || !row.remote_host || !row.remote_port) return { kind: "not_for_node" };
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-direct`,
+        mode: "DIRECT",
+        ingress_port: row.listen_port,
+        egress_port: 0,
+        remote_host: row.remote_host,
+        remote_port: row.remote_port,
+        next_hop: "",
+        targets: [],
+        lb_strategy: "ROUND_ROBIN",
+        protocol,
+        ...tlsPaths,
+        speed_limit: 0,
+        revision,
+        listen_host: row.listen_ip ?? undefined,
+      },
+    };
+  }
+
+  // V5.4：中间跳在 Agent 上使用与 EGRESS 相同的 runtime 原语（tunex-<id>-egress），
+  // 但目标不是业务 target pool，而是最终出口节点的节点间 listener。
+  //
+  // 端口从 NodePortLease 读取，而不是复制到 Tunnel/Revision：物理端口所有权仍只有
+  // 一个真相源。没有 active lease / 出口地址时 fail closed，不猜端口、不直连 target。
+  if (row.tunnel_mode === "relay" && row.middle_node_id === nodeId) {
+    const middlePort = (row.port_leases ?? []).find(
+      (lease) => lease.node_id === nodeId && lease.status === "active",
+    )?.port;
+    const host = firstConnectIp(row.egress_node?.connect_ip ?? null);
+    if (!middlePort || !row.egress_port || !host) return { kind: "not_for_node" };
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-egress`,
+        mode: "EGRESS",
+        ingress_port: 0,
+        egress_port: middlePort,
+        remote_host: "",
+        remote_port: 0,
+        next_hop: "",
+        targets: [{ host, port: row.egress_port, weight: 1, order: 10 }],
+        lb_strategy: "ROUND_ROBIN",
+        protocol,
+        speed_limit: 0,
+        revision,
+      },
+    };
+  }
+
+  if (row.tunnel_mode === "relay" && row.egress_node_id === nodeId) {
+    if (!row.egress_port) return { kind: "not_for_node" };
+    const strategy =
+      row.egress_pool?.lb_strategy === "rand" ? "RANDOM" :
+      row.egress_pool?.lb_strategy === "weighted_round" ? "WEIGHTED_ROUND_ROBIN" :
+      "ROUND_ROBIN";
+    const poolTargets = (row.egress_pool?.targets ?? []).map((x) => ({
+      host: x.host,
+      port: x.port,
+      weight: x.weight,
+      order: Math.trunc(x.order_by),
+    }));
+    // V5.2 WP7: the snapshot carries health too, for the same reason the command path
+    // does — and for one more that is easy to miss: an agent that RESTARTS rebuilds its
+    // runtime from this snapshot, so a snapshot without health silently disables the
+    // circuit breaker until the next command arrives. V5-G2 found it exactly that way
+    // (connections still split 50/50 onto the refusing target after a restart).
+    const health = healthByTunnel.get(row.id) ?? [];
+    const healthForTargets = health.filter((h) =>
+      poolTargets.some((t) => t.host === h.host && t.port === h.port),
+    );
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-egress`,
+        mode: "EGRESS",
+        ingress_port: 0,
+        egress_port: row.egress_port,
+        remote_host: "",
+        remote_port: 0,
+        next_hop: "",
+        targets: poolTargets,
+        ...(healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
+        lb_strategy: strategy,
+        protocol,
+        speed_limit: 0,
+        revision,
+      },
+    };
+  }
+
+  if (row.tunnel_mode === "relay" && row.ingress_node_id === nodeId) {
+    const middleNodeId = row.middle_node_id ?? null;
+    const nextPort =
+      middleNodeId == null
+        ? row.egress_port
+        : (row.port_leases ?? []).find(
+            (lease) => lease.node_id === middleNodeId && lease.status === "active",
+          )?.port ?? null;
+    const host = firstConnectIp(
+      middleNodeId == null
+        ? row.egress_node?.connect_ip ?? null
+        : row.middle_node?.connect_ip ?? null,
+    );
+    if (!row.listen_port || !nextPort || !host) return { kind: "not_for_node" };
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-relay`,
+        mode: "RELAY",
+        ingress_port: row.listen_port,
+        egress_port: 0,
+        remote_host: host,
+        remote_port: nextPort,
+        next_hop: hostPort(host, nextPort),
+        targets: [],
+        lb_strategy: "ROUND_ROBIN",
+        protocol,
+        ...tlsPaths,
+        speed_limit: 0,
+        revision,
+        listen_host: row.listen_ip ?? undefined,
+      },
+    };
+  }
+
+  return { kind: "not_for_node" };
+}
+
+export async function buildDesiredNodeSnapshot(
+  nodeId: number,
+): Promise<{ version: string; tunnels: AgentTunnelConfig[]; skipped: Array<{ id: number; reason: string }> }> {
   const rows = await db.tunnel.findMany({
     where: {
       desired_status: "active",
-      OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }],
+      // ── V5.4：**从未成功应用过**的转发不得出现在期望状态里 ──
+      //
+      // `desired_status=active` 只说明用户**想要**它跑；`applied_revision IS NULL` 说明它
+      // **一次都没有成功跑起来**（首次创建就失败）。把这种行发布成期望状态会造成一个闭环：
+      // 创建失败 ⇒ 拆除路径撤掉已发出的 runtime（round 27/28 的修复）⇒ 但快照又把它发布回去 ⇒
+      // Agent 重新应用 ⇒ 它的端口被永久占住 ⇒ 而分配器查的是租约（已释放）⇒ 把同一端口发给下一条
+      // 转发 ⇒ Agent 正确地拒绝。实测症状就是"端口 22001 一直被占用"。
+      //
+      // 判据刻意保守：**只有"从未应用成功"才不发**。`applied_revision` 有值说明上一版仍在跑
+      // （§3.7 的"更新失败、上一版本仍运行"），那种情况必须继续发布，否则一次失败的更新会把
+      // 正在服务的转发整条撤掉。
+      applied_revision: { not: null },
+      OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }, { middle_node_id: nodeId }],
     },
     include: {
       egress_node: { select: { id: true, connect_ip: true } },
+      middle_node: { select: { id: true, connect_ip: true } },
+      // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
+      // its next_hop, while the middle node needs its own lease to restore its
+      // EGRESS-shaped transit runtime. Keep all active leases for this Forward;
+      // NodePortLease remains the only physical-port truth.
+      port_leases: {
+        where: { status: "active" },
+        select: { node_id: true, port: true, status: true },
+      },
       egress_pool: {
         include: {
           targets: {
@@ -873,76 +1127,52 @@ export async function buildDesiredNodeSnapshot(nodeId: number): Promise<{ versio
     orderBy: { id: "asc" },
   });
 
-  const tunnels: AgentTunnelConfig[] = [];
-  for (const t of rows) {
-    const revision = t.config_revision ?? 0;
-    if (revision <= 0) continue;
-
-    if (t.ingress_node_id === nodeId && t.tunnel_mode === "direct") {
-      if (!t.listen_port || !t.remote_host || !t.remote_port) continue;
-      tunnels.push({
-        id: `tunex-${t.id}-direct`,
-        mode: "DIRECT",
-        ingress_port: t.listen_port,
-        egress_port: 0,
-        remote_host: t.remote_host,
-        remote_port: t.remote_port,
-        next_hop: "",
-        targets: [],
-        lb_strategy: "ROUND_ROBIN",
-        protocol: "tcp",
-        speed_limit: 0,
-        revision,
-        listen_host: t.listen_ip ?? undefined,
-      });
-    }
-
+  // V5.2 WP7: read the health for the egress pools this snapshot will publish, ONCE,
+  // and hand it to the pure mapping. A restart of this node must not silently lose the
+  // circuit breaker, so the snapshot path publishes health exactly like the command
+  // path does — one wire shape, two deliveries.
+  const egressTargets: { host: string; port: number }[] = [];
+  for (const t of rows as unknown as DesiredRowProjection[]) {
     if (t.tunnel_mode === "relay" && t.egress_node_id === nodeId) {
-      if (!t.egress_port) continue;
-      const strategy =
-        t.egress_pool?.lb_strategy === "rand" ? "RANDOM" :
-        t.egress_pool?.lb_strategy === "weighted_round" ? "WEIGHTED_ROUND_ROBIN" :
-        "ROUND_ROBIN";
-      tunnels.push({
-        id: `tunex-${t.id}-egress`,
-        mode: "EGRESS",
-        ingress_port: 0,
-        egress_port: t.egress_port,
-        remote_host: "",
-        remote_port: 0,
-        next_hop: "",
-        targets: (t.egress_pool?.targets ?? []).map((x) => ({
-          host: x.host,
-          port: x.port,
-          weight: x.weight,
-          order: Math.trunc(x.order_by),
-        })),
-        lb_strategy: strategy,
-        protocol: "tcp",
-        speed_limit: 0,
-        revision,
-      });
-    }
-
-    if (t.tunnel_mode === "relay" && t.ingress_node_id === nodeId) {
-      const host = firstConnectIp(t.egress_node?.connect_ip ?? null);
-      if (!t.listen_port || !t.egress_port || !host) continue;
-      tunnels.push({
-        id: `tunex-${t.id}-relay`,
-        mode: "RELAY",
-        ingress_port: t.listen_port,
-        egress_port: 0,
-        remote_host: host,
-        remote_port: t.egress_port,
-        next_hop: hostPort(host, t.egress_port),
-        targets: [],
-        lb_strategy: "ROUND_ROBIN",
-        protocol: "tcp",
-        speed_limit: 0,
-        revision,
-        listen_host: t.listen_ip ?? undefined,
-      });
+      for (const x of t.egress_pool?.targets ?? []) egressTargets.push({ host: x.host, port: x.port });
     }
   }
-  return { version: "tunex-v3", tunnels };
+  const healthByTunnel = new Map<number, TargetHealthWireEntry[]>();
+  if (egressTargets.length > 0) {
+    const entries = await targetHealthWireEntries(egressTargets);
+    for (const t of rows as unknown as DesiredRowProjection[]) {
+      if (t.tunnel_mode !== "relay" || t.egress_node_id !== nodeId) continue;
+      healthByTunnel.set(t.id, entries as TargetHealthWireEntry[]);
+    }
+  }
+
+  // V5.3 WP9: ownership facts ride the snapshot as well, for the same reason health
+  // does — an agent that restarts must still know its epoch, or the stale-epoch guard
+  // resets to "never seen anything" and a demoted node could serve again.
+  const leases = await db.placementLease.findMany({
+    where: { tunnel_id: { in: (rows as unknown as DesiredRowProjection[]).map((r) => r.id) } },
+    select: { tunnel_id: true, owner_node_id: true, epoch: true, lease_expires_at: true },
+  });
+  const leaseByTunnel = new Map(leases.map((l) => [l.tunnel_id, l]));
+
+  const tunnels: AgentTunnelConfig[] = [];
+  const skipped: Array<{ id: number; reason: string }> = [];
+  for (const t of rows as unknown as DesiredRowProjection[]) {
+    const outcome = desiredTunnelConfigFor(t, nodeId, healthByTunnel);
+    if (outcome.kind === "skip") {
+      skipped.push({ id: t.id, reason: outcome.reason });
+    } else if (outcome.kind === "config") {
+      const lease = leaseByTunnel.get(t.id);
+      tunnels.push(
+        lease && lease.owner_node_id === nodeId
+          ? {
+              ...outcome.config,
+              ownership_epoch: lease.epoch,
+              lease_expires_at: lease.lease_expires_at.toISOString(),
+            }
+          : outcome.config,
+      );
+    }
+  }
+  return { version: "tunex-v3", tunnels, skipped };
 }

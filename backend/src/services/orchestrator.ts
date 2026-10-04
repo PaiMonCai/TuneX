@@ -68,6 +68,14 @@ import {
   type CommandEnvelope,
 } from "./control-protocol/index.ts";
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
+import { targetHealthWireEntries } from "./target-health-read.ts";
+import { claimLease, releaseLease as releasePlacementLease } from "./placement-lease.ts";
+import type { RoutePlan } from "./forward-route.ts";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  wireTunnelTypeForForwardProtocol,
+  type ForwardProtocol,
+} from "./forward-contract.ts";
 
 /* ================================================================== */
 /* Agent 管理面契约（WP4 api.Server 的镜像）                            */
@@ -95,11 +103,56 @@ export interface AgentTunnelConfig {
   /** RELAY 模式必填：`<egress node ip>:<egress port>`（validate 会强校验）。 */
   next_hop: string;
   targets: { host: string; port: number; weight: number; order: number }[];
+  /**
+   * V5.2 WP7 —— 合成后的目标健康，**与 `targets` 平行**而不是塞进每个 target 里。
+   *
+   * 两条理由，都不是风格问题：
+   *   1. desired 与 health 是两类事实。塞进同一个元素，下一次改动就说不清新增字段
+   *      属于哪一类；平行数组让"desired 一个字节没变"在结构上可见；
+   *   2. Agent 据此**只调整选择顺序**（熔断 + 加权），永远不改写 desired 列表。
+   *
+   * 缺失（旧面板 / 健康读取失败）= 没有健康信号 → Agent 行为与今天完全一致。
+   * 健康是**优化**，不是闸门：它读失败绝不能挡住一次下发。
+   */
+  target_health?: {
+    host: string;
+    port: number;
+    state: string;
+    latency_ms: number | null;
+    age_ms: number | null;
+    evidence: boolean;
+  }[];
   lb_strategy: "ROUND_ROBIN" | "RANDOM" | "WEIGHTED_ROUND_ROBIN";
-  protocol: "tcp";
+  /**
+   * V5-WP2: the product protocol this config carries, taken from the forward's
+   * RuntimePlan. It is no longer typed as the literal "tcp": the plan is the
+   * single source of this fact, and the agent's outbound gate reads the very
+   * same field (services/agent-command-bus.ts), so the admitted protocol and
+   * the dispatched protocol cannot disagree.
+   */
+  protocol: ForwardProtocol;
+  /**
+   * V5.3 WP9 —— 归属事实：本节点被授权承载该 Forward 的世代与租约到期时刻。
+   *
+   * Agent 侧据此拒绝 stale epoch（收到比已见最高更低的 epoch 时拒绝激活），
+   * 并在租约到期后停止服务。缺席 = 面板没有授权信息（旧面板）→ Agent 行为与今天一致。
+   *
+   * 这两个字段**必须同时出现在命令下发与重连快照两条路径上**，并且解码器必须认识它们 ——
+   * V5 里这个类别已经踩过三次（协议、证书路径、健康），症状分别是"重启后静默失效"。
+   */
+  ownership_epoch?: number;
+  lease_expires_at?: string;
   speed_limit: number;
   revision: number;
   listen_host?: string;
+  /**
+   * V5-WP5-A1: node-local certificate/key PATHS for a tls front. The control
+   * plane never carries key material (§6.1 "Where are certificates owned?").
+   * Omitted for every other protocol — the Agent refuses a tls tunnel without
+   * them, so an omission cannot silently degrade into "TLS but unauthenticated".
+   */
+  tls_cert_path?: string;
+  tls_key_path?: string;
 }
 
 /** 一次下发的结果（两条下发路径的公共形状）。 */
@@ -128,6 +181,15 @@ export type RelayDispatchOutcome =
  * 映射，这里只报协议层能区分的东西）。
  */
 export const RELAY_DISPATCH_ERROR_CODES = {
+  /**
+   * V5.4：路由本身不合法，或**尚未实现的形状**。
+   *
+   * 这是一个"宁可拒绝"的错误码，不是临时占位：`middle_node_id` 一旦非空，`RoutePlan`
+   * 就是三跳，而当前下发链路只会发出单跳形状的配置。若在这里放行，用户配了中间跳之后
+   * 转发会**静默地按单跳工作** —— 那正是本项目反复吃亏的一类失败（配置生效了，但不是
+   * 用户要的那条路）。实现 WP12 之前，多跳必须在这里被明确拒绝并点名原因。
+   */
+  route_not_dispatchable: "route_not_dispatchable",
   /** 命令明确未建立可用管理面连接：DNS / 连接拒绝等。 */
   agent_unreachable: "agent_unreachable",
   /** outbound command 已入队，但同步等待窗口内没有收到 ACK；执行结果未知。 */
@@ -325,6 +387,28 @@ export class HttpAgentTransport implements AgentTransport {
 /* Orchestrator                                                        */
 /* ================================================================== */
 
+/** V5.4：线性路由的下发输入（`dispatchRoute`）。 */
+export interface DispatchRouteInput {
+  readonly tunnelId: number;
+  readonly revision: number;
+  readonly plan: RoutePlan;
+  /** 每一跳的节点（`hop_index` → 节点事实）。 */
+  readonly hop_nodes: Readonly<Record<number, OrchestratorNode>>;
+  /** 每一跳的端口（来自计划阶段的 `acquire_port`；这里不选端口）。 */
+  readonly hop_ports: Readonly<Record<number, number>>;
+  /** 出口跳的真实目标池。 */
+  readonly targets: readonly { host: string; port: number; weight?: number; order_by?: number }[];
+  readonly poolId: number | null;
+  readonly lbStrategy?: string | null;
+  readonly protocol?: ForwardProtocol;
+  readonly tlsCertPath?: string | null;
+  readonly tlsKeyPath?: string | null;
+}
+
+export type RouteDispatchOutcome =
+  | { ok: true; plan: RoutePlan; hops_dispatched: readonly number[] }
+  | DispatchFailure;
+
 export interface DispatchEgressInput {
   tunnelId: number;
   revision: number;
@@ -343,6 +427,11 @@ export interface DispatchEgressInput {
   }[];
   /** 池/节点上的 LB 策略；NULL = ROUND_ROBIN。 */
   lbStrategy?: string | null;
+  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  protocol?: ForwardProtocol;
+  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  tlsCertPath?: string | null;
+  tlsKeyPath?: string | null;
 }
 
 export interface DispatchIngressInput {
@@ -352,6 +441,11 @@ export interface DispatchIngressInput {
   ingressPort: number;
   /** `<egress ip>:<egress port>`，来自 {@link dispatchEgress} 的返回值。 */
   nextHop: string;
+  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  protocol?: ForwardProtocol;
+  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  tlsCertPath?: string | null;
+  tlsKeyPath?: string | null;
 }
 
 export interface DispatchDirectInput {
@@ -362,6 +456,11 @@ export interface DispatchDirectInput {
   remoteHost: string;
   remotePort: number;
   listenHost?: string | null;
+  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  protocol?: ForwardProtocol;
+  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  tlsCertPath?: string | null;
+  tlsKeyPath?: string | null;
 }
 
 /** dispatchEgress 成功时额外带回出口地址（入口下发要用它拼 next_hop）。 */
@@ -387,7 +486,33 @@ export interface RemoveTunnelInput {
   reason?: string;
 }
 
+/**
+ * V5.2 WP7 默认健康来源：读观测投影 → WP6 合成。
+ *
+ * 合成的结论**由面板给出**，Agent 不自己定义健康；这里产出的就是那一个模型的下发形式。
+ * 失败一律回落到空数组（见 dispatchEgress 的说明）：健康是优化，不是闸门。
+ */
+const defaultTargetHealthSource: TargetHealthSource = async (targets) =>
+  // ONE implementation of the wire mapping, shared with the snapshot path
+  // (`buildDesiredNodeSnapshot`): two copies would drift, and the symptom of drift here
+  // is an agent that has health after a command but not after a restart.
+  targetHealthWireEntries(targets, new Date());
+
+/** V5.2 WP7：一次下发的健康来源。可注入，便于离线断言"没有健康信号"的分支。 */
+export type TargetHealthSource = (
+  targets: readonly { host: string; port: number }[],
+) => Promise<{
+  host: string;
+  port: number;
+  state: string;
+  latency_ms: number | null;
+  age_ms: number | null;
+  evidence: boolean;
+}[]>;
+
 export interface OrchestratorOptions {
+  /** V5.2 WP7：健康来源；省略则读观测投影并做 WP6 合成。 */
+  healthSource?: TargetHealthSource;
   transport: AgentTransport;
   /** WP6 校验器（进程级共享，revision 闸门跨请求生效）。 */
   validator?: ControlValidator;
@@ -446,16 +571,47 @@ export class Orchestrator {
   private readonly transport: AgentTransport;
   private readonly validator: ControlValidator;
   private readonly probe: boolean;
+  /**
+   * V5.2 WP7: where the per-target health comes from. Injected so the orchestrator
+   * keeps its "no IO beyond the transport" testability — a test can hand it a stub,
+   * including the empty case, without a database.
+   */
+  private readonly healthSource: TargetHealthSource;
 
   constructor(opts: OrchestratorOptions) {
     this.transport = opts.transport;
     this.validator = opts.validator ?? new ControlValidator();
     this.probe = opts.probeReachable ?? true;
+    this.healthSource = opts.healthSource ?? defaultTargetHealthSource;
   }
 
   /* ---------------------------------------------------------------- */
   /* 命令构造                                                        */
   /* ---------------------------------------------------------------- */
+
+  /**
+   * V5-WP5-A1: the tls front's paths, or nothing.
+   *
+   * Only emitted for `protocol=tls`, and only as a pair: a half-configured TLS
+   * front would otherwise reach an Agent that must then decide which half to
+   * believe. Absent for every other protocol, so the wire shape of a tcp tunnel
+   * is byte-for-byte what it was.
+   */
+  private static tlsFields(
+    protocol: ForwardProtocol,
+    input: { tlsCertPath?: string | null; tlsKeyPath?: string | null },
+  ): { tls_cert_path?: string; tls_key_path?: string } {
+    if (protocol !== "tls") return {};
+    const cert = typeof input.tlsCertPath === "string" ? input.tlsCertPath.trim() : "";
+    const key = typeof input.tlsKeyPath === "string" ? input.tlsKeyPath.trim() : "";
+    if (cert === "" || key === "") {
+      throw new AgentTransportError(
+        RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+        "tls 转发缺少证书/私钥路径，拒绝下发",
+      );
+    }
+    return { tls_cert_path: cert, tls_key_path: key };
+  }
 
   /**
    * 出口侧隧道 id：`tunex-<tunnelId>-egress`。
@@ -475,6 +631,227 @@ export class Orchestrator {
   /** DIRECT 隧道 id：`tunex-<tunnelId>-direct`。 */
   static directTunnelId(tunnelId: number): string {
     return `tunex-${tunnelId}-direct`;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* 线性路由的下发（V5.4 WP12）                                        */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * 中间跳的**唯一实现**：一个监听 + 拨号到下一跳的转发，与出口跳同一个原语。
+   *
+   * 为什么单独抽出来：创建路径与 rollout 路径都需要发这一腿，而"同一个事实有两个实现"是本项目
+   * 反复吃亏的形态（协议、证书路径、健康数组、池内容、schema）。**编排可以有两处，事实的实现只能有一处。**
+   *
+   * `nextHop` 必须是**下一跳自己 dispatch 返回值**里的地址，不能猜 —— 见 `dispatchRoute` 的说明。
+   */
+  async dispatchTransit(input: {
+    tunnelId: number;
+    revision: number;
+    node: OrchestratorNode;
+    port: number;
+    nextHop: string;
+    protocol?: ForwardProtocol;
+  }): Promise<{ ok: true; host: string } | DispatchFailure> {
+    const [host, portRaw] = input.nextHop.split(":");
+    const nextPort = Number(portRaw);
+    if (!host || !Number.isFinite(nextPort) || nextPort <= 0) {
+      return {
+        ok: false,
+        error_code: RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+        error: `中间跳的下一跳地址非法：${input.nextHop}`,
+      };
+    }
+    const outcome = await this.dispatchEgress({
+      tunnelId: input.tunnelId,
+      revision: input.revision,
+      egressNode: input.node,
+      egressPort: input.port,
+      // 中间跳没有自己的池：它唯一的"目标"就是下一跳。
+      poolId: null,
+      targets: [{ host, port: nextPort, weight: 1, order_by: 10 }],
+      protocol: input.protocol,
+    });
+    if (!outcome.ok) return outcome;
+    return { ok: true, host: outcome.egress_host };
+  }
+
+  /**
+   * 按 `RoutePlan` 下发一条线性路由。**这是既有原语的组合，不是第二条下发通道。**
+   *
+   * 三跳的形状，逐跳都是既有的两段式：
+   *   · hop N-1（出口）：`dispatchEgress` 指向**真实目标池**；
+   *   · 中间跳：同一个 `dispatchEgress` 形状，只是它的"目标"是**下一跳的节点间监听地址**
+   *     （一跳的出口就是下一跳的入口 —— 这正是 RELAY 两段式的本质）；
+   *   · hop 0（入口）：`dispatchIngress`，`next_hop` 指向它的下一跳。
+   *
+   * 顺序不可交换（§1 铁律在 N 跳上的推广）：**正向先远后近** —— 最远的一跳先起，客户端面前最后。
+   * 任何一跳失败时调用方按 `compensationSteps()` 逆序拆除。
+   *
+   * 每一跳的端口必须已经由计划阶段 `acquire_port` 拿到：这里**不选端口**，端口分配是调度决策。
+   * 每一跳的"可寻址地址"来自**该跳自己的 dispatch 返回值**，不猜 IP —— 猜错就是每个新连接都
+   * 连不上的静默故障（这也是既有两段式一直遵守的规则）。
+   */
+  async dispatchRoute(input: DispatchRouteInput): Promise<RouteDispatchOutcome> {
+    const hops = [...input.plan.hops];
+    const last = hops[hops.length - 1];
+    if (last === undefined) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: "路由为空" };
+    }
+
+    const listeningAt = new Map<number, { host: string; port: number }>();
+
+    for (let i = hops.length - 1; i >= 0; i -= 1) {
+      const hop = hops[i]!;
+      const port = input.hop_ports[hop.hop_index];
+      const node = input.hop_nodes[hop.hop_index];
+      if (node === undefined || port === undefined) {
+        return {
+          ok: false,
+          error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+          error: `hop ${hop.hop_index} 缺少节点或端口事实（计划阶段应先 acquire_port）`,
+        };
+      }
+
+      if (hop.role === "ingress") {
+        const next = listeningAt.get(hop.hop_index + 1);
+        if (next === undefined) {
+          return {
+            ok: false,
+            error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+            error: "入口的下一跳没有就绪（正向必须先远后近）",
+          };
+        }
+        const ingress = await this.dispatchIngress({
+          tunnelId: input.tunnelId,
+          revision: input.revision,
+          ingressNode: node,
+          ingressPort: port,
+          nextHop: `${next.host}:${next.port}`,
+          protocol: input.protocol,
+          tlsCertPath: input.tlsCertPath ?? null,
+          tlsKeyPath: input.tlsKeyPath ?? null,
+        });
+        if (!ingress.ok) return ingress;
+        listeningAt.set(hop.hop_index, { host: next.host, port });
+        continue;
+      }
+
+      const isEgress = hop.role === "egress";
+      let targets: readonly { host: string; port: number; weight?: number; order_by?: number }[] | null;
+      if (isEgress) {
+        targets = input.targets;
+      } else {
+        const next = listeningAt.get(hop.hop_index + 1);
+        targets = next === undefined ? null : [{ host: next.host, port: next.port, weight: 1, order_by: 10 }];
+      }
+      if (targets === null) {
+        return {
+          ok: false,
+          error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+          error: `hop ${hop.hop_index} 的下一跳没有就绪（正向必须先远后近）`,
+        };
+      }
+      const dispatched = await this.dispatchEgress({
+        tunnelId: input.tunnelId,
+        revision: input.revision,
+        egressNode: node,
+        egressPort: port,
+        poolId: isEgress ? input.poolId : null,
+        targets,
+        lbStrategy: isEgress ? input.lbStrategy : null,
+        protocol: input.protocol,
+      });
+      if (!dispatched.ok) return dispatched;
+      listeningAt.set(hop.hop_index, { host: dispatched.egress_host, port });
+    }
+
+    return { ok: true, plan: input.plan, hops_dispatched: hops.map((h) => h.hop_index) };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* 归属事实（V5.3 WP9）                                              */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * 本节点被授权承载该 Forward 的归属事实，或 nothing。
+   *
+   * 命令下发路径**必须**和快照路径一样带上它：V5 里"新事实只补了一条投递路径"已经踩过
+   * 三次（协议、证书路径、健康），每次的症状都是"重启后静默失效"。归属这里更严重：
+   * Agent 的 stale-epoch 栅栏以"见过的最高 epoch"为准，重启后若拿不到 epoch，它的栅栏
+   * 就归零 —— 一个已被降级的节点会重新开始服务。
+   */
+  /**
+   * 认领归属并返回要下发的归属事实；归属被别人持有且租约未过期时**拒绝下发**。
+   *
+   * 认领放在这里（与归属事实的附着同一处）有三个理由：
+   *   1. 调用方不可能忘记认领 —— 忘了就没有 epoch，Agent 的栅栏就永远不生效（"实现存在
+   *      但没有接线"在本项目已经出现过两次）；
+   *   2. 两阶段交接在这一处统一执行：**旧租约未过期就不许换主人**，任何走这条路的调用方
+   *      都自动获得这个保护；
+   *   3. 同一节点的重新下发 = 续约（claim 对现任是幂等的），所以 reconcile/resend 不会
+   *      把自己挡在门外。
+   */
+  /**
+   * 显式释放入口归属（两阶段 handoff 的第一阶段）。
+   *
+   * 这里只改 ownership ledger；调用方必须先确认旧入口 runtime 已经撤下，才能
+   * 调这个方法。把这条约束留在调用方，是因为只有 rollout 知道"旧 runtime 已
+   * remove ACK"这个事实，placement-lease 模块本身不碰 Agent IO。
+   */
+  async releaseOwnership(input: {
+    tunnelId: number;
+    nodeId: number;
+    now?: Date;
+  }): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" }> {
+    return releasePlacementLease({
+      tunnelId: input.tunnelId,
+      nodeId: input.nodeId,
+      now: input.now ?? new Date(),
+    });
+  }
+
+  private async claimOwnership(
+    tunnelId: number,
+    nodeId: number,
+    revision: number,
+  ): Promise<
+    | { ok: true; fields: { ownership_epoch?: number; lease_expires_at?: string } }
+    | { ok: false; error: string }
+  > {
+    let claim: Awaited<ReturnType<typeof claimLease>> | null = null;
+    try {
+      claim = await claimLease({ tunnelId, nodeId, revision, now: new Date() });
+    } catch {
+      claim = null;
+    }
+    if (claim === null) {
+      // 租约存储不可用（或无租约表可用，例如离线测试的桩）：**不下发 epoch，但也不拒绝**。
+      //
+      // 为什么不拒绝：面板侧的存储抖动不该变成数据面全量停发。安全方向由 Agent 侧保证 ——
+      // 它的栅栏是"拒绝低于已见最高的 epoch"，而**缺席按 0 处理**，所以一个已经见过真实
+      // epoch 的节点不会接受这次无 epoch 的激活（0 < highest ⇒ 拒绝）。于是"存储不可用"最多
+      // 让**从未归属过**的隧道照常上线，而不会让被降级的节点复活。
+      //
+      // 注意这与"归属被别人持有且未过期"是两件事：那种情况 claim 会**成功返回** ok:false，
+      // 必须拒绝下发（那才是双主风险）。
+      return { ok: true, fields: {} };
+    }
+    if (!claim.ok) {
+      return {
+        ok: false,
+        error:
+          `归属仍由节点 ${claim.current?.owner_node_id ?? "?"} 持有（租约未过期）：` +
+          "两阶段交接要求旧租约先过期或被显式释放，否则会同时服务两份流量",
+      };
+    }
+    return {
+      ok: true,
+      fields: {
+        ownership_epoch: claim.epoch,
+        lease_expires_at: claim.lease.lease_expires_at.toISOString(),
+      },
+    };
   }
 
   /* ---------------------------------------------------------------- */
@@ -508,6 +885,7 @@ export class Orchestrator {
   async dispatchEgress(input: DispatchEgressInput): Promise<EgressDispatchOutcome> {
     const egressId = Orchestrator.egressTunnelId(input.tunnelId);
     const resourceId = egressId;
+    const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
     const unreachable = await this.reachable(input.egressNode);
     if (unreachable) return unreachable;
@@ -518,6 +896,28 @@ export class Orchestrator {
       weight: t.weight ?? 1,
       order: t.order_by ?? (i + 1) * 10,
     }));
+
+    // V5.3 —— EGRESS **不认领归属**。
+    //
+    // 归属（placement ownership）属于**承载该 Forward 的那台入口节点**：RELAY 下客户端连的是入口
+    // listener，被降级时必须停止服务的也是它。出口节点是一份**资源**（它只服务入口节点的流量），
+    // 不是归属持有者。
+    //
+    // 第一版让出口腿也认领，于是出现一个自锁式的假故障：租约由入口节点（3）持有，出口侧向出口节点
+    // （4）认领被两阶段规则正确地拒绝，**整条重发路径因此永久失败**（实测 `failed: 1`、池永远不更新）。
+    // 规则没错，是问错了对象。
+
+    // V5.2 WP7: the synthesized health travels BESIDE the desired targets, and a
+    // failure to read it must never block a rollout — health is an optimization for
+    // selection order, not a gate on whether a Forward may run. So a failure becomes
+    // "no signal" (absent array), which the agent treats exactly like an older panel.
+    let targetHealth: AgentTunnelConfig["target_health"];
+    try {
+      const health = await this.healthSource(input.targets.map((t) => ({ host: t.host, port: t.port })));
+      targetHealth = health.length > 0 ? health : undefined;
+    } catch {
+      targetHealth = undefined;
+    }
 
     const config: AgentTunnelConfig = {
       id: egressId,
@@ -530,8 +930,11 @@ export class Orchestrator {
       remote_port: 0,
       next_hop: "",
       targets,
+      // Absent when there is no signal at all, so the wire says "nothing to say"
+      // rather than "every target is unknown".
+      ...(targetHealth ? { target_health: targetHealth } : {}),
       lb_strategy: normalizeLbStrategy(input.lbStrategy),
-      protocol: "tcp",
+      protocol,
       speed_limit: 0,
       revision: input.revision,
     };
@@ -545,7 +948,7 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: egressId,
-          tunnel_type: "tcp",
+          tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
           listen_port: input.egressPort,
           targets: targets.map((t) => ({ address: t.host, port: t.port, weight: t.weight })),
         },
@@ -574,7 +977,10 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
 
   async dispatchIngress(input: DispatchIngressInput): Promise<RelayDispatchOutcome> {
+    // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须
+    // 停止服务的也是它），所以认领发生在这里，而不是在出口腿。
     const relayId = Orchestrator.relayTunnelId(input.tunnelId);
+    const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
     const unreachable = await this.reachable(input.ingressNode);
     if (unreachable) return unreachable;
@@ -590,6 +996,15 @@ export class Orchestrator {
       };
     }
 
+    // The RELAY listener is client-facing, so this is where TLS terminates.
+    // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须停止
+    // 服务的也是它），所以认领发生在这里，而不是在出口腿 —— 出口节点是一份资源，不是归属持有者。
+    const ownership = await this.claimOwnership(input.tunnelId, input.ingressNode.id, input.revision);
+    if (!ownership.ok) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+    }
+
+    const tlsFields = Orchestrator.tlsFields(protocol, input);
     const config: AgentTunnelConfig = {
       id: relayId,
       mode: "RELAY",
@@ -600,9 +1015,11 @@ export class Orchestrator {
       next_hop: input.nextHop,
       targets: [], // RELAY 侧不持有目标知识（目标在出口节点上）
       lb_strategy: "ROUND_ROBIN",
-      protocol: "tcp",
+      protocol,
       speed_limit: 0,
       revision: input.revision,
+      ...tlsFields,
+      ...ownership.fields,
     };
 
     const envelope = createCommand({
@@ -613,7 +1030,8 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: relayId,
-          tunnel_type: "tcp",
+          tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
+          ...tlsFields,
           listen_port: input.ingressPort,
           // 入口侧的唯一「目标」是出口节点；WP6 的 targets 只是为了让信封
           // 结构合法（apply_tunnel 要求非空），Agent 的 RELAY forwarder 不读它。
@@ -643,8 +1061,16 @@ export class Orchestrator {
 
   async dispatchDirect(input: DispatchDirectInput): Promise<RelayDispatchOutcome> {
     const directId = Orchestrator.directTunnelId(input.tunnelId);
+    const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
     const unreachable = await this.reachable(input.ingressNode);
     if (unreachable) return unreachable;
+
+    // The DIRECT listener is client-facing, so this is where TLS terminates.
+    const tlsFields = Orchestrator.tlsFields(protocol, input);
+    const ownership = await this.claimOwnership(input.tunnelId, input.ingressNode.id, input.revision);
+    if (!ownership.ok) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+    }
 
     const config: AgentTunnelConfig = {
       id: directId,
@@ -656,9 +1082,11 @@ export class Orchestrator {
       next_hop: "",
       targets: [],
       lb_strategy: "ROUND_ROBIN",
-      protocol: "tcp",
+      protocol,
       speed_limit: 0,
       revision: input.revision,
+      ...tlsFields,
+      ...ownership.fields,
       ...(input.listenHost ? { listen_host: input.listenHost } : {}),
     };
 
@@ -670,7 +1098,8 @@ export class Orchestrator {
       payload: {
         tunnel: {
           name: directId,
-          tunnel_type: "tcp",
+          tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
+          ...tlsFields,
           listen_port: input.ingressPort,
           targets: [{ address: input.remoteHost, port: input.remotePort }],
           ...(input.listenHost ? { listen_ip: input.listenHost } : {}),

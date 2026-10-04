@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sort"
@@ -197,6 +198,20 @@ type EgressForwarder struct {
 	pipeTracker
 	sel    TargetSelector
 	health *targetHealth
+	// dial is the upstream dialer. The default is Go's own, with the stream
+	// dial timeout — i.e. exactly what this forwarder did before V5.3-WP8. The
+	// runtime injects a resolver-backed dialer so target names are resolved with
+	// a TTL cache and a stale fallback instead of once per connection.
+	dial DialFunc
+}
+
+// EgressOptions are the injections an egress forwarder accepts.
+type EgressOptions struct {
+	// Observer is notified when a target fails to dial (WP5). Nil is a no-op.
+	Observer TargetObserver
+	// Dial overrides the upstream dialer. Nil = a net.Dialer with the stream
+	// dial timeout, which is the pre-WP8 behaviour.
+	Dial DialFunc
 }
 
 // NewEgress builds an EGRESS forwarder (cfg.Mode must be ModeEgress). sel may
@@ -211,6 +226,11 @@ func NewEgress(cfg TunnelConfig, sel TargetSelector) (*EgressForwarder, error) {
 // The ledger is kept either way, so TargetStats() is usable on every egress
 // forwarder: a silent target is visible even when nobody wired a logger.
 func NewEgressWithHealth(cfg TunnelConfig, sel TargetSelector, obs TargetObserver) (*EgressForwarder, error) {
+	return NewEgressWithOptions(cfg, sel, EgressOptions{Observer: obs})
+}
+
+// NewEgressWithOptions is the constructor with the full injection set.
+func NewEgressWithOptions(cfg TunnelConfig, sel TargetSelector, opts EgressOptions) (*EgressForwarder, error) {
 	if cfg.Mode != ModeEgress {
 		return nil, errModeNot(ModeEgress, cfg.Mode)
 	}
@@ -220,17 +240,25 @@ func NewEgressWithHealth(cfg TunnelConfig, sel TargetSelector, obs TargetObserve
 	if sel == nil {
 		return nil, errors.New("forwarder: EGRESS tunnel requires a target selector")
 	}
+	dial := opts.Dial
+	if dial == nil {
+		// The timeout is the same one the pre-V5.3 code used through
+		// net.DialTimeout, so an uninjected runtime dials exactly as before.
+		dialer := &net.Dialer{Timeout: dialTimeout}
+		dial = dialer.DialContext
+	}
 	return &EgressForwarder{
 		pipeTracker: pipeTracker{cfg: cfg},
 		sel:         sel,
-		health:      newTargetHealth(obs),
+		health:      newTargetHealth(opts.Observer),
+		dial:        dial,
 	}, nil
 }
 
 // Start binds the egress port and begins load-balanced forwarding. Returns
 // ErrAlreadyStarted when the forwarder is already running.
 func (f *EgressForwarder) Start() error {
-	sel, health := f.sel, f.health
+	sel, health, dial := f.sel, f.health, f.dial
 	return f.pipeTracker.start(func(net.Conn) (net.Conn, error) {
 		t := sel.Select()
 		addr := t.Addr()
@@ -239,8 +267,23 @@ func (f *EgressForwarder) Start() error {
 			return nil, errNoTarget
 		}
 		start := time.Now()
-		raw, err := net.DialTimeout("tcp", addr, dialTimeout)
+		// The dial is bounded here AND by whatever the injected dialer imposes
+		// (the resolver bounds resolution and the candidate walk separately).
+		// Both are needed: a caller must be able to reason about "how long may a
+		// connection attempt take" without knowing which dialer is installed.
+		dialCtx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		raw, err := dial(dialCtx, "tcp", addr)
+		cancel()
 		health.recordDial(t, time.Since(start), err)
+		// V5.2-WP7: hand the outcome back to the selector when it asks for it.
+		// The selector may be running a circuit breaker, and a half-open probe
+		// can only be resolved by a real connection result — there is no other
+		// honest source. A selector without this capability is simply never
+		// told, which is why the assertion is optional and the call sits after
+		// the ledger (WP5's record is unconditional; WP7's feedback is not).
+		if reporter, ok := sel.(TargetReporter); ok {
+			reporter.ReportDial(t, err == nil)
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -12,6 +12,7 @@ import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
 import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
 import { AttentionPanel } from "@/components/dashboard/attention-panel";
 import { forwardProductBadgeVariant, forwardProductStatus } from "@/lib/forward-status";
+import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import type { DashboardStats, PortForward } from "@/lib/types";
 
 /** 仪表盘数据体（服务端组件，AppShell 内由 Suspense 包裹） */
@@ -168,13 +169,15 @@ export async function DashboardBody() {
                 <TableHead>{t("fields.id")}</TableHead>
                 <TableHead>{t("common.name")}</TableHead>
                 <TableHead>{t("forward.mode")}</TableHead>
+                {/* V5-WP5-A1：协议与模式是两个维度（direct/relay × tcp/tls/ws）。 */}
+                <TableHead>{t("forward.protocol")}</TableHead>
                 <TableHead>{t("forward.listenPort")}</TableHead>
                 <TableHead>{t("forward.totalTraffic")}</TableHead>
                 <TableHead>{t("common.status")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {forwards.length === 0 && <TableEmpty colSpan={6} text={t("forward.emptyTitle")} />}
+              {forwards.length === 0 && <TableEmpty colSpan={7} text={t("forward.emptyTitle")} />}
               {forwards.map((forward) => (
                 <TableRow key={forward.id}>
                   <TableCell className="text-[var(--muted-foreground)]">{forward.id}</TableCell>
@@ -187,6 +190,10 @@ export async function DashboardBody() {
                     <Badge variant="outline">
                       {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
                     </Badge>
+                  </TableCell>
+                  <TableCell>
+                    {/* 共用徽标：历史协议（wss/udp）照实渲染，不回落成 unknown。 */}
+                    <ForwardProtocolBadge forward={forward} />
                   </TableCell>
                   <TableCell className="font-mono text-xs">{forward.listen_port ?? "-"}</TableCell>
                   <TableCell>{formatBytes(forward.traffic)}</TableCell>

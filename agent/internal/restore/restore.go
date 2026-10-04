@@ -101,12 +101,28 @@ func Apply(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.
 			}
 			// An EGRESS tunnel's pool must exist before the forwarder is
 			// built (the balancer is a constructor argument).
+			//
+			// V5.2-WP7: the snapshot carries health alongside the targets, so a
+			// restored node keeps its circuit breaker instead of silently reverting
+			// to pre-WP7 behaviour until the next command arrives.
+			//
+			// What is NOT cached is health as PERSISTED state: the local last-known-good
+			// cache never stores it (it is a live observation, not configuration), and a
+			// restored pool with no health in the snapshot simply has no signal. The
+			// distinction matters — V5-G2 caught the first version of this, which
+			// installed targets only and therefore turned the breaker off on every
+			// restart, showing up as connections still splitting 50/50 onto a target the
+			// panel had called unhealthy.
 			if _, ok := egress.Targets(cfg.ID); !ok {
 				strategy, ok := manager.ParseStrategy(string(cfg.LBStrategy))
 				if !ok {
 					strategy = manager.RoundRobin
 				}
-				egress.SetPool(cfg.ID, strategy, cfg.Targets)
+				if len(cfg.TargetHealth) > 0 {
+					egress.SetPoolAndHealth(cfg.ID, strategy, cfg.Targets, cfg.TargetHealth)
+				} else {
+					egress.SetPool(cfg.ID, strategy, cfg.Targets)
+				}
 			}
 		}
 		if _, err := tunnels.Apply(cfg); err != nil {

@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
 import { ForwardDiagnose } from "@/components/forwards/forward-diagnose";
 import { ForwardEditDialog, RunningVsDesiredBadge } from "@/components/forwards/forward-edit-dialog";
+import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,11 @@ import { api } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
+import {
+  TLS_FORWARD_PROTOCOL,
+  forwardProtocolFact,
+  forwardProtocolHasConnections,
+} from "@/lib/forward-protocol";
 import {
   applyErrorAction,
   forwardErrorActions,
@@ -171,6 +177,15 @@ export function ForwardDetail({
   // V4-WP8 §13.4：产品状态是**唯一**的投影实现（lib/forward-status.ts），
   // 本组件不再自己比较 revision。
   const product = forwardProductStatus(forward);
+  /**
+   * V5.1b：传输维度决定两处渲染 —— datagram（udp）要显式说明它**没有连接**，
+   * tls 行要展示证书/私钥路径（后端已投影这两列）。
+   * 两个判断都走契约模块（`forwardProtocolHasConnections` / `forwardProtocolFact`），
+   * 组件不自己比较协议名 —— 否则「udp 没有连接」这个事实就有了第二份实现。
+   * `false` 才是「确认没有连接」；`null`（未开放的协议）不说任何话。
+   */
+  const datagram = forwardProtocolHasConnections(forward.protocol) === false;
+  const isTls = forwardProtocolFact(forward.protocol) === TLS_FORWARD_PROTOCOL;
   // 失败时给可执行的一步（后端原文优先；没有已知动作时不编造）。
   const applyNextStep = forward.apply_error
     ? applyErrorAction(locale, forward.apply_error_code)
@@ -269,6 +284,43 @@ export function ForwardDetail({
             <InfoRow label={t("forward.mode")}>
               {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
             </InfoRow>
+            {/*
+              V5-WP5-A1：协议事实（四个可创建值 + 历史行的未开放值）。
+              渲染走共用徽标，未知取值**不会**退化成 "unknown"。
+            */}
+            <InfoRow label={t("forward.protocol")}>
+              <ForwardProtocolBadge forward={forward} />
+            </InfoRow>
+            {/*
+              V5.1b §6.2：datagram（udp）的会话模型必须说出来。这是**唯一**会让人按
+              TCP 的连接模型理解 udp 的地方：详情页给出了它正在服务的协议，却对
+              「有没有连接」「怎么结束」保持沉默，用户就会把不存在的连接数当成 0。
+              只对 datagram 行显示 —— stream 行的「连接」不需要解释。
+            */}
+            {datagram ? (
+              <InfoRow label={t("forward.sessionModel")}>
+                <span className="text-xs">{t("forward.sessionModelMapping")}</span>
+              </InfoRow>
+            ) : null}
+            {/*
+              V5-WP5-A1：tls 行的证书/私钥路径。后端 `forwardView` 现在投影这两列
+              （只有路径，永远没有密钥内容），所以运维可以在页面上核对用的是哪张证书，
+              而不必去读数据库。
+            */}
+            {isTls ? (
+              <>
+                <InfoRow label={t("forward.tlsCertPath")}>
+                  <span className="font-mono text-xs break-all">
+                    {forward.tls_cert_path ?? t("common.none")}
+                  </span>
+                </InfoRow>
+                <InfoRow label={t("forward.tlsKeyPath")}>
+                  <span className="font-mono text-xs break-all">
+                    {forward.tls_key_path ?? t("common.none")}
+                  </span>
+                </InfoRow>
+              </>
+            ) : null}
             <InfoRow label={t("forward.ingressNode")}>
               {forward.ingress_node?.node_id ?? forward.ingress_node_id}
             </InfoRow>

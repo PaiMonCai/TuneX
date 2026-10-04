@@ -10,11 +10,15 @@ import (
 	"github.com/tunex/agent/internal/agentconfig"
 	"github.com/tunex/agent/internal/api"
 	"github.com/tunex/agent/internal/control"
+	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
+	"github.com/tunex/agent/internal/ownership"
 	"github.com/tunex/agent/internal/reporter"
 	"github.com/tunex/agent/internal/restore"
 	"github.com/tunex/agent/internal/selfinfo"
+	"github.com/tunex/agent/internal/targetdns"
+	"github.com/tunex/agent/internal/targetobs"
 )
 
 // v3Runtime bundles the WP4 components so main can start and stop them as one
@@ -30,8 +34,13 @@ type v3Runtime struct {
 	// ledger is the V4-WP6 apply/runtime error ledger, kept on the runtime so a
 	// later admin surface can record operator-triggered failures into the same
 	// place the panel reads.
-	ledger  *reporter.Ledger
-	started bool
+	ledger *reporter.Ledger
+	// ownership is the V5.3-WP9 activation gate and lease clock. Kept on the
+	// runtime because Shutdown reports its final facts.
+	ownership *ownership.Guard
+	// resolver is the V5.3-WP8 target resolver, kept for the same reason.
+	resolver *targetdns.Resolver
+	started  bool
 	// cache is the WP11A last-known-good desired state. It is written only from
 	// state the manager actually applied and read only when the panel is
 	// unreachable.
@@ -85,6 +94,99 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		logx.Warn("v3 runtime idle: no AGENT_ADMIN_PORT and no PANEL_HTTP_URL; this node cannot receive tunnels")
 	}
 
+	// V4-WP6 telemetry: one error ledger and one revision tracker shared by the
+	// control loop (writer) and the reporter (reader). Sharing is the point —
+	// a second copy on either side would make the panel's `known vs applied`
+	// comparison and `error_count` describe different processes.
+	//
+	// Built here rather than with the rest of the telemetry wiring because the
+	// V5.3-WP9 ownership gate below must be able to file its refusals into the
+	// ledger, and the FIRST thing that can apply a tunnel is the restore in the
+	// next block — a guard whose complaints only start being recorded after
+	// startup would go silent in exactly the window a fence matters.
+	ledger := reporter.NewLedger()
+	revisions := reporter.NewRevisionState()
+	rt.ledger = ledger
+
+	// V5.3 WP9: the epoch fence and the lease clock, installed BEFORE the first
+	// apply so the restore path is fenced like every other activation path
+	// (V5-G2's lesson: a fact that has two delivery paths and only one of them
+	// learns about it is a fact that is wrong half the time).
+	//
+	// The fence lives in the durable state directory next to the last-known-good
+	// cache: a node that forgets its highest epoch across a restart is the node
+	// that serves stale ownership during a partition, which is the one outcome
+	// this mechanism exists to make impossible.
+	ownerGuard := ownership.New(ownership.Config{
+		Fence:  ownership.OpenFence(cfg.OwnershipFencePath(), cfg.AgentID),
+		Now:    time.Now,
+		Report: ledger.Record,
+		// A stopped tunnel must not leave its egress pool behind: the pool would
+		// still be reported to the panel (and observed by the target observer)
+		// as if a listener existed for it.
+		OnLeaseStop: func(c forwarder.TunnelConfig) {
+			if c.Mode == forwarder.ModeEgress && egress != nil {
+				egress.DropPool(c.ID)
+			}
+		},
+	})
+	ownerGuard.SetRegistry(tunnels)
+	tunnels.SetOwnershipGuard(ownerGuard)
+	rt.ownership = ownerGuard
+	if f := ownerGuard.Fence(); f != nil && !f.Durable() {
+		logx.Warn("ownership: the epoch fence is not durable; a restart would forget which generations this node has seen",
+			"node_id", cfg.NodeID, "state_dir", cfg.StateDir)
+	}
+	if f := ownerGuard.Fence(); f != nil {
+		if err := f.LoadError(); err != nil {
+			logx.Error("ownership: the epoch fence could not be read; starting from an empty fence",
+				"node_id", cfg.NodeID, "path", f.Path, "err", err.Error())
+			ledger.Record("ownership: epoch fence unreadable, starting empty: " + err.Error())
+		}
+	}
+
+	// V5.3 WP8: the target resolver. Built BEFORE the restore for the same
+	// reason the ownership gate is: a restored EGRESS forwarder is constructed
+	// with the dialer that exists at that moment, and wiring it afterwards would
+	// leave the first listeners resolving once per connection — the "implemented
+	// but never wired" failure this project has already paid for twice.
+	//
+	// IP literals bypass it, a lookup failure falls back to the last good
+	// addresses, and the fact that it is doing so is logged and filed in the
+	// ledger the panel reads.
+	resolver := targetdns.New(targetdns.Config{
+		OnFact: func(f targetdns.Fact) {
+			attrs := []any{
+				"host", f.Host,
+				"addrs", strings.Join(f.Addrs, ","),
+				"stale", f.Stale,
+				"lookups", f.Lookups,
+			}
+			if f.StaleAgeSeconds > 0 {
+				attrs = append(attrs, "stale_age_seconds", f.StaleAgeSeconds)
+			}
+			if f.LastError != "" {
+				attrs = append(attrs, "err", f.LastError)
+			}
+			switch {
+			case f.Stale && len(f.Addrs) > 0:
+				// Not fatal: the node keeps dialing the last good addresses, and
+				// the age is the honest part of the fact (§8.1 stale fallback).
+				logx.Warn("target resolution failed; using the last good addresses", attrs...)
+				ledger.Record(fmt.Sprintf(
+					"dns: %s is stale (%ds old, %d addresses): %s",
+					f.Host, f.StaleAgeSeconds, len(f.Addrs), f.LastError))
+			case f.Stale:
+				logx.Warn("target resolution failed and there is no last good address set", attrs...)
+				ledger.Record(fmt.Sprintf("dns: %s does not resolve: %s", f.Host, f.LastError))
+			default:
+				logx.Info("target resolution recovered", attrs...)
+			}
+		},
+	})
+	tunnels.SetTargetDialer(resolver.DialContext)
+	rt.resolver = resolver
+
 	// 1. Restore before the admin plane opens, so a port the panel expects to
 	// be live is never briefly free-and-then-taken while the API is reachable.
 	cacheMu := &rt.cacheMu
@@ -114,6 +216,11 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 				NodeID:     cfg.NodeID,
 				Version:    version,
 				Role:       role,
+				// V5.3 WP9: the fencing counters/state are part of the node's
+				// health surface, so an operator can see refusals and lapsed
+				// leases without opening the agent log.
+				Ownership: ownerGuard,
+				TargetDNS: resolver,
 			}, tunnels, egress, nil)
 			if err != nil {
 				logx.Error("v3 admin api disabled", "err", err.Error())
@@ -126,13 +233,16 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		}
 	}
 
-	// V4-WP6 telemetry: one error ledger and one revision tracker shared by the
-	// control loop (writer) and the reporter (reader). Sharing is the point —
-	// a second copy on either side would make the panel's `known vs applied`
-	// comparison and `error_count` describe different processes.
-	ledger := reporter.NewLedger()
-	revisions := reporter.NewRevisionState()
-	rt.ledger = ledger
+	// observations is the V5-WP5 observation source for the state report. It
+	// stays a nil interface when the observer is not running, so the report
+	// omits `target_observations` rather than claiming "no targets failed".
+	var observations reporter.TargetObservationLister
+
+	// The lease clock runs for the whole process: it is the fail-safe half of
+	// WP9 ("lease expired means STOP"), and it reads the running registry each
+	// tick rather than trusting a timer armed by whichever path applied a
+	// tunnel. Cancelled with the process context like everything else.
+	go ownerGuard.Run(ctx)
 
 	// 3. Outbound control loop. The Agent polls the Panel with its per-node
 	// credential; the Panel never dials this process. This is the production
@@ -178,6 +288,33 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 
 	// 4. Heartbeat reporter. Disabled (nil) when no panel URL is configured;
 	// Run's ErrNoPanelURL path is handled by the goroutine below.
+	//
+	// V5.2-WP5 target observation starts just before it, so the very first state
+	// report can already carry facts instead of an empty key.
+	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
+		// The observer probes ONLY the targets of the egress pools this node
+		// serves — DesiredTargets is its one window into the world, which is how
+		// "never scan an unauthorized target" (§7 row 2) is enforced.
+		//
+		// It is started only when the state report can actually carry the facts:
+		// without a node credential StateEndpoint is empty, so probing would be
+		// network noise against targets the panel never hears about. The
+		// lifecycle is the process context — the same one every other component
+		// uses — so there is no second teardown path to keep in sync.
+		observer := targetobs.New(targetobs.Config{
+			NodeID:  cfg.NodeID,
+			Targets: egress.DesiredTargets,
+			// The observer and the data plane must dial through the SAME
+			// resolution: otherwise a probe could report a target unreachable
+			// while the data plane is still relaying it from the cached
+			// addresses (or the reverse), and both facts would be true.
+			Dial: resolver.DialContext,
+		})
+		observations = observer
+		go observer.Run(ctx)
+		logx.Info("target observation scheduled",
+			"node_id", cfg.NodeID, "interval", observer.Interval().String())
+	}
 	if cfg.PanelHTTPURL != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
@@ -188,6 +325,18 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			Credential: cfg.NodeCredential,
 		},
 			reporter.WithTunnels(tunnels),
+			// V5-WP5-A3: the per-tunnel protocol diagnostics ride the state report.
+			// The manager is the source because it owns the running registry — the
+			// counters live in the runtime that observed the events; the panel only
+			// ever displays them.
+			reporter.WithDiagnostics(tunnels),
+			// V5.2-WP5: the target observer's facts (empty when it was not
+			// started above, which keeps the wire key absent).
+			reporter.WithTargetObservations(observations),
+			// V5.3-WP9: the panel hands the renewed ownership deadlines back in
+			// the answer to this very report. Dropping that answer is what makes
+			// a healthy node stop every tunnel one TTL after its last config.
+			reporter.WithLeases(leaseSink{ownerGuard}),
 			reporter.WithEgress(egressAdapter{egress}),
 			reporter.WithPorts(tunnels),
 			reporter.WithRevision(tunnels),
@@ -202,6 +351,12 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			// binary really implements, so the panel can refuse to send an action
 			// an older node would only answer with `unsupported_action`.
 			reporter.WithProtocol(control.ProtocolVersion, control.Capabilities()),
+			// V5-WP1: advertise the protocol/transport/runtime facts this process
+			// actually wired up. The facts are computed from what was constructed
+			// above — the LKG cache only claims lkg_restore when the store was
+			// really enabled, and the protocol list comes from the data plane's
+			// own parser table — never from config/env.
+			reporter.WithManifest(runtimeManifest(rt.cache.Enabled())),
 		)
 		go func() {
 			if err := rt.heart.Run(ctx); err != nil {
@@ -261,6 +416,46 @@ func (rt *v3Runtime) writeCache(version string) {
 	rt.cacheMu.Lock()
 	defer rt.cacheMu.Unlock()
 	restore.RefreshCache(rt.cache, rt.cfg.AgentID, rt.tunnels, version)
+}
+
+// runtimeManifest builds the V5-WP1 capability manifest from the subsystems this
+// process actually constructed.
+//
+// Why it takes a fact instead of being a package-level constant: the manifest is
+// a claim about what this binary does. hot_reload and graceful_drain come from
+// the data plane the runtime always builds (forwarder.Forwarder.SetUpstream /
+// Drain), but lkg_restore is only true when the local cache is enabled for this
+// deployment. Advertising it unconditionally would tell the panel a node can
+// survive a panel outage when it cannot.
+//
+// A build error here is a programming error (an unknown name was passed in), so
+// the manifest is omitted rather than guessed: no manifest means the panel falls
+// back to V4 baseline admission, which is safe, whereas a wrong manifest is not.
+func runtimeManifest(lkgEnabled bool) *reporter.CapabilityManifest {
+	runtimeFeatures := []control.RuntimeFeature{control.RuntimeHotReload, control.RuntimeGracefulDrain}
+	if lkgEnabled {
+		runtimeFeatures = append(runtimeFeatures, control.RuntimeLKGRestore)
+	}
+	facts := control.ImplementationFacts{
+		// Derived from the data plane's own parser table: the agent can never
+		// advertise a protocol its own ParseForwardProtocol would reject.
+		Protocols:   forwarder.ImplementedProtocols(),
+		Transports:  forwarder.ImplementedTransports(),
+		Runtime:     runtimeFeatures,
+		Diagnostics: control.DiagnosticsFromActions(control.Capabilities()),
+	}
+	manifest, err := control.BuildManifest(facts)
+	if err != nil {
+		logx.Error("capability manifest build failed", "err", err.Error())
+		return nil
+	}
+	return &reporter.CapabilityManifest{
+		SchemaVersion: manifest.SchemaVersion,
+		Protocols:     manifest.Protocols,
+		Transports:    manifest.Transports,
+		Runtime:       manifest.Runtime,
+		Diagnostics:   manifest.Diagnostics,
+	}
 }
 
 // lkgRefreshInterval is how often the running state is folded back into the
@@ -358,9 +553,15 @@ func (rt *v3Runtime) Shutdown() {
 		remaining = 0
 	}
 	report := rt.tunnels.ShutdownAll(remaining)
-	if report.RemainingConns > 0 || report.ForcedConns > 0 {
-		logx.Warn("shutdown closed connections past the deadline",
-			"forced", report.ForcedConns, "remaining", report.RemainingConns)
+	// Datagram mappings are reported separately because they are dropped, not
+	// waited out: a UDP mapping ends by idle expiry or by its socket closing
+	// (§2.3③ of the datagram contract), so a datagram tunnel that was relaying
+	// would otherwise contribute "0 forced, 0 remaining" to this line.
+	if report.RemainingConns > 0 || report.ForcedConns > 0 || report.ForcedMappings > 0 {
+		logx.Warn("shutdown closed work past the deadline",
+			"forced", report.ForcedConns,
+			"forced_mappings", report.ForcedMappings,
+			"remaining", report.RemainingConns)
 	}
 
 	if rt.heart != nil {
@@ -438,6 +639,35 @@ func source(cfg *agentconfig.Config) restore.Source {
 		return restore.NopSource{}
 	}
 	return restore.HTTPSource{PanelURL: cfg.PanelHTTPURL, Credential: cfg.NodeCredential}
+}
+
+// leaseSink adapts the ownership guard to the reporter's lease interface.
+//
+// The conversion lives here, like egressAdapter, so the reporter stays free of
+// the enforcement package: it carries the wire facts, it does not decide what
+// they mean.
+type leaseSink struct{ guard *ownership.Guard }
+
+func (s leaseSink) ObserveLeases(leases []reporter.LeaseRenewal, at time.Time) {
+	if s.guard == nil || len(leases) == 0 {
+		return
+	}
+	converted := make([]ownership.Renewal, 0, len(leases))
+	for _, l := range leases {
+		converted = append(converted, ownership.Renewal{
+			TunnelRef: l.TunnelRef,
+			Epoch:     l.Epoch,
+			ExpiresAt: l.ExpiresAt,
+			Revision:  l.Revision,
+		})
+	}
+	if applied, missed := s.guard.ObserveRenewals(converted, at); missed > 0 {
+		// Not an error: a lease for a tunnel this node does not run is a
+		// legitimate panel answer. It is a fact worth a line, because a climbing
+		// count means the placement and this node's identity disagree.
+		logx.Debug("ownership: some renewals matched no running tunnel",
+			"applied", applied, "unmatched", missed)
+	}
 }
 
 // egressAdapter maps manager.EgressManager.Snapshot's PoolSnapshot onto the

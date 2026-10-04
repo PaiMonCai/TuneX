@@ -1,11 +1,22 @@
 /** WP10 runtime-use gate. No RBAC or creation-count semantics live here. */
 import { checkTunnelUse, type EffectivePolicy } from "./capability-policy.ts";
+import { DEFAULT_FORWARD_PROTOCOL } from "./forward-contract.ts";
 
 export interface RuntimeUseResource {
   user_id: number;
   in_node_group_id: number;
   out_node_group_id: number | null;
-  tunnel_type?: string;
+  /**
+   * The **canonical** protocol of the Forward (V5-WP0 `forward_protocol`, or the
+   * legacy column read as a fact through `persistedForwardProtocol`).
+   *
+   * It used to be called `tunnel_type` and callers fed it the legacy COLUMN
+   * value. That is not the same fact: a `ws` Forward has no value in the legacy
+   * Prisma enum, so the column takes its historical default (`wss`) and the
+   * policy layer then refused the Forward's own protocol — Gate V5-G1A.7 caught
+   * it as "a ws Forward cannot be retargeted: protocol_not_allowed (wss)".
+   */
+  protocol?: string;
 }
 export interface RuntimeUseDeps {
   policy(workspaceId: number): Promise<EffectivePolicy>;
@@ -56,7 +67,7 @@ export async function checkForwardRuntimeUse(
   const policy = await deps.policy(workspaceId);
   const decision = checkTunnelUse(policy, {
     trafficUsed: await deps.traffic(workspaceId, policy.limits.traffic_period),
-    protocol: resource.tunnel_type ?? "tcp",
+    protocol: resource.protocol ?? DEFAULT_FORWARD_PROTOCOL,
     inGroupId: resource.in_node_group_id,
     inGroupOwned: ingress!.workspace_id === workspaceId,
     outGroupId: resource.out_node_group_id,

@@ -33,7 +33,13 @@ export interface DiagnoseProbeTarget {
   port: number;
 }
 
-export type SegmentName = "ingress_to_target" | "ingress_to_egress" | "egress_to_target";
+export type SegmentName =
+  | "ingress_to_target"
+  | "ingress_to_egress"
+  // V5.4：三跳路由的两段（入口→中间、中间→出口）。
+  | "ingress_to_middle"
+  | "middle_to_egress"
+  | "egress_to_target";
 
 /** 真正发出去的 TCP 探测（只针对目标，不针对任何业务监听端口）。 */
 export interface TcpProbeSegment {
@@ -54,7 +60,7 @@ export interface TcpProbeSegment {
  */
 export interface NodeFactsSegment {
   kind: "node_facts";
-  segment: "ingress_to_egress";
+  segment: "ingress_to_egress" | "ingress_to_middle" | "middle_to_egress";
   ingress_node_id: number;
   ingress_node_key: string;
   egress_node_id: number;
@@ -144,21 +150,62 @@ export function probeTargetsForForward(forward: ForwardForDiagnose): ProbePlan {
     ? { host: forward.egress_connect_ip.trim(), port: forward.egress_port }
     : null;
 
+  // V5.4：三跳时"入口↔出口"被拆成**两段**，每段各自点名它两端的节点与期望 runtime。
+  // 这正是"遥测能定位失败跳"的实现方式：失败的那一段就是失败的那一跳。
+  const middleNodeId = forward.middle_node_id ?? null;
+  const middleKey = middleNodeId == null ? null : forward.middle_node_key || String(middleNodeId);
+  const middleHop =
+    middleNodeId != null && usableHost(forward.middle_connect_ip) && usablePort(forward.middle_port)
+      ? { host: (forward.middle_connect_ip as string).trim(), port: forward.middle_port as number }
+      : null;
+  const factsSegments: NodeFactsSegment[] =
+    middleNodeId != null && middleKey != null
+      ? [
+          {
+            kind: "node_facts",
+            segment: "ingress_to_middle",
+            ingress_node_id: forward.ingress_node_id,
+            ingress_node_key: ingressNodeKey,
+            egress_node_id: middleNodeId,
+            egress_node_key: middleKey,
+            ingress_runtime_id: runtimeIdFor(forward.id, "relay", "ingress"),
+            // 中间跳的 runtime 与出口同形（runtime id 按节点分命名空间）。
+            egress_runtime_id: runtimeIdFor(forward.id, "relay", "egress"),
+            hop: middleHop,
+            expected_revision: forward.config_revision ?? null,
+          },
+          {
+            kind: "node_facts",
+            segment: "middle_to_egress",
+            ingress_node_id: middleNodeId,
+            ingress_node_key: middleKey,
+            egress_node_id: forward.egress_node_id,
+            egress_node_key: forward.egress_node_key || String(forward.egress_node_id),
+            ingress_runtime_id: runtimeIdFor(forward.id, "relay", "egress"),
+            egress_runtime_id: runtimeIdFor(forward.id, "relay", "egress"),
+            hop,
+            expected_revision: forward.config_revision ?? null,
+          },
+        ]
+      : [
+          {
+            kind: "node_facts",
+            segment: "ingress_to_egress",
+            ingress_node_id: forward.ingress_node_id,
+            ingress_node_key: ingressNodeKey,
+            egress_node_id: forward.egress_node_id,
+            egress_node_key: forward.egress_node_key || String(forward.egress_node_id),
+            ingress_runtime_id: runtimeIdFor(forward.id, "relay", "ingress"),
+            egress_runtime_id: runtimeIdFor(forward.id, "relay", "egress"),
+            hop,
+            expected_revision: forward.config_revision ?? null,
+          },
+        ];
+
   return {
     ok: true,
     segments: [
-      {
-        kind: "node_facts",
-        segment: "ingress_to_egress",
-        ingress_node_id: forward.ingress_node_id,
-        ingress_node_key: ingressNodeKey,
-        egress_node_id: forward.egress_node_id,
-        egress_node_key: forward.egress_node_key || String(forward.egress_node_id),
-        ingress_runtime_id: runtimeIdFor(forward.id, "relay", "ingress"),
-        egress_runtime_id: runtimeIdFor(forward.id, "relay", "egress"),
-        hop,
-        expected_revision: forward.config_revision ?? null,
-      },
+      ...factsSegments,
       {
         kind: "tcp_probe",
         segment: "egress_to_target",

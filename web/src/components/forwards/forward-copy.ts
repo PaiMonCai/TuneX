@@ -14,6 +14,12 @@
  * 再建一条」，所以本模块不新增任何 API 调用。
  */
 import type { ForwardCreateInput, PortForward } from "@/lib/types";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  forwardProtocolFields,
+  forwardProtocolForCreate,
+  type ForwardProtocol,
+} from "@/lib/forward-protocol";
 
 /** 编辑器 / 创建表单共用的草稿形状（全字符串，便于受控输入与表单预检）。 */
 export type ForwardDraft = {
@@ -26,16 +32,44 @@ export type ForwardDraft = {
   targetPort: string;
 };
 
+/**
+ * V5-WP5-A1：创建/复制草稿 = 编辑草稿 + 协议字段。
+ *
+ * 分开定义（而不是把协议塞进 {@link ForwardDraft}）是因为**协议本身不可编辑**：
+ * 后端 `ForwardPatchSchema` 不接受 `protocol`（把 tcp 改成 tls 不是一次编辑），
+ * 编辑器草稿里放一个永远不会被保存的字段，是让人误以为能改的地方。
+ *
+ * （tls 的证书路径**可以**编辑，所以编辑器草稿里另有这两个字段 —— 见
+ * `forward-edit-dialog.tsx` 的编辑草稿类型。）
+ */
+export type ForwardCopyDraft = ForwardDraft & {
+  protocol: ForwardProtocol;
+  /**
+   * 节点本地证书/私钥路径。
+   *
+   * V5-WP5-A1 的后续修订：后端 `forwardView` **已经投影**这两列（否则详情页只能说
+   * 「TLS」而说不出用的是哪张证书），所以复制可以照抄源行的路径 —— 复制一条 tls
+   * 转发不再要求运维把同一份路径重敲一遍。源行若没有路径（历史行），草稿就是空的，
+   * 由表单预检拦下：复制**不猜**任何路径。
+   */
+  tlsCertPath: string;
+  tlsKeyPath: string;
+};
+
 /** 后端 `ForwardCreateSchema` 的字段集（`.strict()`：键集合必须完全一致）。 */
 export const FORWARD_CREATE_KEYS = [
   "name",
   "mode",
+  "protocol",
   "ingress_node_id",
   "egress_node_id",
   "listen_port",
   "target_host",
   "target_port",
 ] as const;
+
+/** `protocol=tls` 时才允许出现的键（非 tls 的请求里它们**不存在**）。 */
+export const FORWARD_TLS_CREATE_KEYS = ["tls_cert_path", "tls_key_path"] as const;
 
 /**
  * 复制时**禁止**继承的字段：主键、运行状态、流量统计、revision 轨迹。
@@ -49,6 +83,7 @@ export const FORWARD_COPY_FORBIDDEN_FIELDS = [
   "apply_status",
   "apply_error",
   "apply_error_code",
+  "protocol_supported",
   "traffic",
   "traffic_cost",
   "online",
@@ -84,9 +119,21 @@ export function forwardCopyName(forward: PortForward, suffix: string): string {
  *
  * mode / ingress / egress / target 原样带过（这些就是要复制的业务配置）；
  * `listen_port` 置空 = 自动分配。
+ *
+ * 协议与协议专属配置（V5-WP5-A1）：
+ *   · 源行的协议事实在契约白名单里 → 原样带过（复制一条 tls 转发必须还是 tls，
+ *     悄悄降级成 tcp 等于把入口的传输安全偷偷关掉）；
+ *   · 历史协议（`wss` / `quic` …）**不能**被再创建（`z.enum` 会 400），此时草稿回到
+ *     缺省协议，用户必须在表单里显式改选 —— 表单里协议下拉是可见的，所以这不是
+ *     静默改写；
+ *   · tls 的证书/私钥路径随源行带过（后端 `forwardView` 现在投影这两列），源行缺
+ *     路径时留空并由表单预检拦下；
+ *   · udp 没有任何协议专属配置 → 草稿里也不产生额外字段（`forwardProtocolFields`
+ *     对非 tls 只返回 protocol）。
  */
-export function forwardCopyDraft(forward: PortForward, suffix: string): ForwardDraft {
+export function forwardCopyDraft(forward: PortForward, suffix: string): ForwardCopyDraft {
   const mode: "direct" | "relay" = forward.mode === "relay" ? "relay" : "direct";
+  const protocol = forwardProtocolForCreate(forward.protocol) ?? DEFAULT_FORWARD_PROTOCOL;
   return {
     name: forwardCopyName(forward, suffix),
     mode,
@@ -98,16 +145,21 @@ export function forwardCopyDraft(forward: PortForward, suffix: string): ForwardD
     listenPort: "", // 自动分配：绝不复制源端口
     targetHost: forward.target_host ?? "",
     targetPort: forward.target_port != null ? String(forward.target_port) : "",
+    protocol,
+    // 非 tls 的源行在视图里就是 null，这里天然得到空串（不会被发出去）。
+    tlsCertPath: protocol === "tls" ? (forward.tls_cert_path ?? "") : "",
+    tlsKeyPath: protocol === "tls" ? (forward.tls_key_path ?? "") : "",
   };
 }
 
 /**
  * 复制草稿 → create payload。
  *
- * 键集合恒等于 {@link FORWARD_CREATE_KEYS}（逐个赋值，不 spread）——源转发上的
- * 任何运行态字段都不可能泄漏进创建请求。
+ * 键集合恒等于 {@link FORWARD_CREATE_KEYS}（`tls` 时再加上
+ * {@link FORWARD_TLS_CREATE_KEYS}）——逐个赋值，不 spread，源转发上的任何运行态
+ * 字段都不可能泄漏进创建请求；非 tls 协议**结构上**带不了证书路径。
  */
-export function forwardCopyCreateInput(draft: ForwardDraft): ForwardCreateInput {
+export function forwardCopyCreateInput(draft: ForwardCopyDraft): ForwardCreateInput {
   const listen = draft.listenPort.trim() ? Number(draft.listenPort.trim()) : null;
   const egress = draft.mode === "relay" && draft.egressId ? Number(draft.egressId) : null;
   return {
@@ -118,6 +170,7 @@ export function forwardCopyCreateInput(draft: ForwardDraft): ForwardCreateInput 
     listen_port: listen,
     target_host: draft.targetHost.trim(),
     target_port: Number(draft.targetPort.trim()),
+    ...forwardProtocolFields(draft.protocol, draft.tlsCertPath, draft.tlsKeyPath),
   };
 }
 

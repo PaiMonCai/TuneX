@@ -41,8 +41,10 @@
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
+import { LEASE_TTL_SECONDS } from "./placement-lease.ts";
 import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
 import { normalizeCapabilities } from "./agent-capability.ts";
+import { normalizeCapabilityManifest, type CapabilityManifest } from "./capability-manifest.ts";
 
 /* ================================================================== */
 /* 形状（与 agent/internal/api 的 NodeState 字段对齐）                  */
@@ -88,6 +90,14 @@ export interface StateReportInput {
   version?: string;
   role?: string;
   tunnels?: ReportedTunnel[];
+  /**
+   * V5.2 WP5 —— 该节点观测到的目标事实（DEVELOPMENT.md §7）。
+   *
+   * 每条是**这个观测视角**的事实，不是目标的"健康状态"：合成（WP6）是面板的事，
+   * Agent 只报它测到的 8 个事实。`observation_age` 刻意不在线上——它是
+   * `now - last_observed_at`，由读取方计算。
+   */
+  target_observations?: ReportedTargetObservation[];
   used_ports?: number[];
   egress_pools?: Record<string, ReportedEgressPool>;
   reported_revision?: number;
@@ -115,6 +125,25 @@ export interface StateReportInput {
   control_protocol_version?: number;
   /** Agent 实际实现的控制动作清单（缺失 = 未上报，与空数组语义不同）。 */
   capabilities?: string[];
+
+  // ── V5-WP1：能力协商 v2 ──
+  /** Agent 实际实现的协议 / 传输 / runtime 能力清单（缺失 = 旧 Agent 未上报）。 */
+  capability_manifest?: CapabilityManifestInput;
+}
+
+/**
+ * Agent 上报的 v2 能力清单（对齐 agent/internal/control.Manifest 的 JSON 形态）。
+ *
+ * 字段全部可选：Agent 侧尚未上报的维度会整键省略，面板按「这一维什么都没说」
+ * 处理（空集 → fail-closed），而不是补一个默认值。**不要**在这里加默认协议，
+ * 那会把「未上报」变成「上报了 tcp」，恰好抹掉协商的意义。
+ */
+export interface CapabilityManifestInput {
+  schema_version?: number;
+  protocols?: string[];
+  transports?: string[];
+  runtime?: string[];
+  diagnostics?: string[];
 }
 
 /** Agent 自报的 runtime 计数（形状由 agent/internal/reporter 定义）。 */
@@ -186,8 +215,12 @@ export type StateReportRejection =
   | "bad_last_error"
   /** V4-WP6：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
   | "bad_telemetry"
+  /** V5.2 WP5：观测载荷根本不是数组（逐条坏记录会被丢弃，不进这里）。 */
+  | "bad_target_observations"
   /** V4-WP11B：能力协商字段形状坏（版本非非负整数 / 能力不是字符串数组）。 */
-  | "bad_capabilities";
+  | "bad_capabilities"
+  /** V5-WP1：capability_manifest 形状坏（非对象 / schema_version 非整数 / 维度不是字符串数组）。 */
+  | "bad_capability_manifest";
 
 /**
  * 载荷校验（fail-closed）：任何坏形状返回原因码，调用方回 400。
@@ -290,6 +323,90 @@ function isHostMetrics(v: unknown): boolean {
   return true;
 }
 
+/** V5.2 WP5：单个目标的观测事实（线上形状）。 */
+export interface ReportedTargetObservation {
+  host: string;
+  port: number;
+  reachable: boolean;
+  /** 连接耗时；不可达为 null（不写 0：0 是"瞬间可达"）。 */
+  latency_ms: number | null;
+  consecutive_success: number;
+  consecutive_failure: number;
+  /** 最近 N 次探测的成功比例（观测方计算，面板不重算）。 */
+  success_rate: number;
+  /** 观测时刻（unix 秒）。 */
+  last_observed_at: number;
+  /** 谁说的：观测节点角色 + 探测种类。 */
+  observation_source: string;
+}
+
+/**
+ * 校验观测数组。
+ *
+ * 与 `tunnels` 的严格程度**刻意不同**：隧道列表是"这个节点现在跑着什么"，
+ * 形状坏掉意味着面板会基于错的运行态做决策；观测是**附加证据**，一条坏记录
+ * 只是那一条没用。所以这里逐条丢弃坏记录并返回丢弃数，而不是让整份上报 400 ——
+ * 那会因为一个观测字段的类型错误，把节点的遥测、健康、隧道列表一起黑掉。
+ * 丢弃不是静默的：调用方会把计数记进日志。
+ */
+export function validateTargetObservations(
+  value: unknown,
+): { ok: true; observations: ReportedTargetObservation[]; dropped: number } | { ok: false; reason: StateReportRejection } {
+  if (value === undefined || value === null) return { ok: true, observations: [], dropped: 0 };
+  if (!Array.isArray(value)) return { ok: false, reason: "bad_target_observations" };
+  const out: ReportedTargetObservation[] = [];
+  let dropped = 0;
+  for (const raw of value) {
+    const entry = normalizeTargetObservation(raw);
+    if (entry === null) {
+      dropped += 1;
+      continue;
+    }
+    out.push(entry);
+  }
+  return { ok: true, observations: out, dropped };
+}
+
+/** 一条观测的归一化；null = 坏记录（丢弃，不中断整份上报）。 */
+function normalizeTargetObservation(raw: unknown): ReportedTargetObservation | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  const host = typeof o.host === "string" ? o.host.trim().toLowerCase().replace(/\.$/, "") : "";
+  if (!host || host.length > 255) return null;
+  const port = o.port;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  if (typeof o.reachable !== "boolean") return null;
+  const latency = o.latency_ms;
+  if (latency !== null && latency !== undefined && (typeof latency !== "number" || !Number.isFinite(latency) || latency < 0)) {
+    return null;
+  }
+  // 不可达时 latency 必须是 null：写 0 会让"没测到"和"零延迟"变成同一个值。
+  const latencyMs = o.reachable === false ? null : latency === undefined ? null : (latency as number | null);
+  const counters = ["consecutive_success", "consecutive_failure"];
+  for (const key of counters) {
+    const v = (o as Record<string, unknown>)[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return null;
+  }
+  const rate = o.success_rate;
+  if (rate !== undefined && (typeof rate !== "number" || !Number.isFinite(rate) || rate < 0 || rate > 1)) return null;
+  const observedAt = o.last_observed_at;
+  if (typeof observedAt !== "number" || !Number.isInteger(observedAt) || observedAt <= 0) return null;
+  const source = typeof o.observation_source === "string" ? o.observation_source.trim().slice(0, 64) : "";
+  if (!source) return null;
+  return {
+    host,
+    port,
+    reachable: o.reachable,
+    latency_ms: latencyMs,
+    consecutive_success: typeof o.consecutive_success === "number" ? o.consecutive_success : 0,
+    consecutive_failure: typeof o.consecutive_failure === "number" ? o.consecutive_failure : 0,
+    success_rate: typeof rate === "number" ? rate : 0,
+    last_observed_at: observedAt,
+    observation_source: source,
+  };
+}
+
 export function validateStateReport(body: unknown): { ok: true; report: StateReportInput } | { ok: false; reason: StateReportRejection } {
   // 数组也是 object，但状态载荷必须是「带名字段的对象」——`[1,2]` / `[]`
   // 一律坏形状（Agent 不会把状态报成一个列表）。
@@ -339,6 +456,9 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       }
     }
   }
+
+  const observations = validateTargetObservations(b.target_observations);
+  if (!observations.ok) return { ok: false, reason: observations.reason };
 
   if (b.used_ports !== undefined) {
     if (!Array.isArray(b.used_ports)) return { ok: false, reason: "bad_used_ports" };
@@ -392,6 +512,30 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
     }
   }
 
+  // ── V5-WP1：能力协商 v2 ──
+  //
+  // 三条纪律，与上面完全一致：
+  //   · 缺失容忍        —— 旧 Agent 不发这个字段，上报照收（面板按 baseline 判定）；
+  //   · 坏形状拒绝       —— 回 400 并给出原因码，而不是落一个坏 JSON；
+  //   · **不静默降级**   —— 坏形状绝不能被写成 NULL，那会把 fail-closed 变成
+  //                        baseline 放行，方向恰好错反（capability-manifest.ts
+  //                        的 normalize 抛错正是为了这一点）。
+  //
+  // 刻意**不**拒绝 schema_version ≠ 2：那是「本面板读不懂的更新版清单」，不是
+  // 坏载荷。normalize 对它返回 null → 落库为 NULL → 判定按 baseline 处理，
+  // 于是未来 Agent 灰度上线时 TCP 不会中断。若在这里回 400，新版 Agent 连状态
+  // 都上报不了，一次灰度就变成整批节点失去可观测性。
+  if (b.capability_manifest !== undefined) {
+    if (!b.capability_manifest || typeof b.capability_manifest !== "object" || Array.isArray(b.capability_manifest)) {
+      return { ok: false, reason: "bad_capability_manifest" };
+    }
+    try {
+      normalizeCapabilityManifest(b.capability_manifest);
+    } catch {
+      return { ok: false, reason: "bad_capability_manifest" };
+    }
+  }
+
   if (b.egress_pools !== undefined) {
     if (!b.egress_pools || typeof b.egress_pools !== "object" || Array.isArray(b.egress_pools)) {
       return { ok: false, reason: "bad_egress_pools" };
@@ -429,6 +573,20 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       // NULL"，即面板一直以为该 Agent 未上报能力（fail-closed 但不报错）。
       control_protocol_version: b.control_protocol_version as number | undefined,
       capabilities: b.capabilities as string[] | undefined,
+      // V5-WP1：同一个白名单陷阱——校验通过但没列在这里的字段会被静默丢掉，
+      // 症状是"上报 200、库里永远 NULL"，即面板一直以为该 Agent 没有 v2 能力。
+      capability_manifest: b.capability_manifest as CapabilityManifestInput | undefined,
+      // V5.2 WP5：白名单陷阱同样适用。用**归一化后**的列表，坏记录已经在
+      // validateTargetObservations 里被逐条丢弃。
+      //
+      // `undefined` 与 `[]` 必须保持区别：前者是"这个 Agent 没有观测能力"
+      // （旧版本），后者是"我会观测，此刻没有观测"。写成 `observations.observations`
+      // 会让前者退化成 `[]`，而落库那条路径据此清空整张投影 —— 于是一次旧版本
+      // Agent 上报就把"没有证据"伪造成"刚刚观测过且什么都没有"。
+      target_observations:
+        b.target_observations === undefined || b.target_observations === null
+          ? undefined
+          : observations.observations,
     },
   };
 }
@@ -456,6 +614,7 @@ export function telemetryColumns(report: StateReportInput): {
   last_error_at: Date | null;
   control_protocol_version: number | null;
   capabilities: Prisma.InputJsonValue | typeof Prisma.JsonNull;
+  capability_manifest: Prisma.InputJsonValue | typeof Prisma.JsonNull;
 } {
   return {
     known_revision: report.known_revision ?? null,
@@ -479,7 +638,144 @@ export function telemetryColumns(report: StateReportInput): {
     capabilities: report.capabilities
       ? (normalizeCapabilities(report.capabilities) as unknown as Prisma.InputJsonValue)
       : Prisma.JsonNull,
+    // V5-WP1：落库的是**规范化后**的清单（去重 + 排序 + 维度补齐为空数组），
+    // 判定函数因此不必在每次下发时再规整一遍。读不懂的 schema 版本落 NULL，
+    // 与「未上报」同义：baseline 放行、其余拒绝（见 capability-manifest.ts）。
+    capability_manifest: normalizeManifestColumn(report.capability_manifest),
   };
+}
+
+/**
+ * `capability_manifest` 上报值 → 可落库的 JSON 列值。
+ *
+ * 读不懂的 schema 版本归一到 `JsonNull`（= 未上报的语义），**不是**落一个空对象：
+ * 空对象会被判定层读成「上报了，但四个维度都是空」→ fail-closed，那就把一次
+ * 无害的版本超前变成了全网拒绝下发。
+ */
+function normalizeManifestColumn(
+  value: CapabilityManifestInput | undefined,
+): Prisma.InputJsonValue | typeof Prisma.JsonNull {
+  if (!value) return Prisma.JsonNull;
+  let normalized: CapabilityManifest | null = null;
+  try {
+    normalized = normalizeCapabilityManifest(value);
+  } catch {
+    // 校验阶段已经拦过坏形状；这里再兜一次是为了让本函数**不会抛**——
+    // 它在下发路径的 upsert 里被调用，抛出去会变成一次 500。
+    return Prisma.JsonNull;
+  }
+  return normalized === null ? Prisma.JsonNull : (normalized as unknown as Prisma.InputJsonValue);
+}
+
+/**
+/* ================================================================== */
+/* V5.3 WP9 —— 上报即续约                                              */
+/* ================================================================== */
+
+/**
+ * 续约 this node 持有的租约。只续自己的；不创建、不抢占。
+ *
+ * 为什么不在这里 claim：认领意味着"我打算承载它"，那是编排决策（rollout PREPARE），
+ * 不是上报的副作用。上报只能说"我还在"，而"我还在"正是续约的语义。
+ */
+export async function renewOwnedLeases(nodeId: number, now: Date): Promise<LeaseFact[]> {
+  // **续约失败绝不影响上报本身**：上报是节点的主要职责（遥测/健康/隧道列表全靠它），
+  // 而续约是面板侧的记账。让一次租约存储抖动把上报打成 500，会用一个次要功能拖垮主要功能。
+  // 失败时返回空数组 = "这次没有新的归属信息"，Agent 保持它已有的截止时刻。
+  try {
+    return await renewOwnedLeasesUnsafe(nodeId, now);
+  } catch {
+    return [];
+  }
+}
+
+async function renewOwnedLeasesUnsafe(nodeId: number, now: Date): Promise<LeaseFact[]> {
+  const extended = new Date(now.getTime() + LEASE_TTL_SECONDS * 1000);
+  const result = await db.placementLease.updateMany({
+    where: { owner_node_id: nodeId },
+    data: { lease_expires_at: extended },
+  });
+  if (result.count === 0) return [];
+  // The refreshed facts are RETURNED, not just written to the row.
+  //
+  // V5.3 的关键一环：Agent 侧按契约"到期即停"，而续约只发生在库里 —— 如果不把这些事实
+  // 送回给 Agent，每个隧道都会在下发后一个 TTL（30s）到期时**自己把自己停掉**，在健康节点
+  // 上制造一次全量中断。这是本阶段实现者发现并上报的真实集成缺口。
+  return db.placementLease
+    .findMany({
+      where: { owner_node_id: nodeId },
+      select: { tunnel_id: true, epoch: true, lease_expires_at: true, revision: true },
+    })
+    .then((rows) => rows.map((r) => ({
+      tunnel_id: r.tunnel_id,
+      epoch: r.epoch,
+      lease_expires_at: r.lease_expires_at.toISOString(),
+      revision: r.revision,
+    })));
+}
+
+/** V5.3 WP9：一次续约后回给 Agent 的归属事实。 */
+export interface LeaseFact {
+  tunnel_id: number;
+  epoch: number;
+  lease_expires_at: string;
+  revision: number;
+}
+
+/* ================================================================== */
+/* V5.2 WP5 —— 目标观测投影的同步                                       */
+/* ================================================================== */
+
+/** 目标身份：归一化 host + 端口。空 host 或非法端口返回 null（调用方跳过）。 */
+export function targetKeyOf(host: string, port: number): string | null {
+  const normalized = host
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, "")
+    .replace(/^\[|\]$/g, "");
+  if (!normalized || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return `${normalized}:${port}`;
+}
+
+/**
+ * 把一次上报里的观测同步进 `target_observation` 投影（V5.2 WP5，DEVELOPMENT.md §7）。
+ *
+ * 唯一键 (node_id, target_key)：同一 host:port 被两个节点观测是**两条独立事实**
+ * （观察视角不同），合并成一条会抹掉"一个节点通、另一个不通"这个信号。
+ *
+ * 与隧道列表不同，这里不"全删再插"：观测是周期性到达的，全删会在两次上报之间留下
+ * 空窗，让面板读到"刚刚没有任何观测"。做法是写入本次上报的，再删掉本节点**不再
+ * 观测**的行（目标已从 desired 移除，投影里不该留一个永远不会再更新的悬空行）。
+ */
+export async function syncTargetObservations(
+  nodeId: number,
+  observations: ReportedTargetObservation[],
+  reportedAt: Date,
+): Promise<void> {
+  const seen: string[] = [];
+  for (const o of observations) {
+    const key = targetKeyOf(o.host, o.port);
+    if (!key) continue;
+    seen.push(key);
+    const row = {
+      host: o.host,
+      port: o.port,
+      reachable: o.reachable,
+      latency_ms: o.latency_ms,
+      consecutive_success: o.consecutive_success,
+      consecutive_failure: o.consecutive_failure,
+      success_rate: o.success_rate,
+      observed_at: new Date(o.last_observed_at * 1000),
+      reported_at: reportedAt,
+      observation_source: o.observation_source,
+    };
+    await db.targetObservation.upsert({
+      where: { node_id_target_key: { node_id: nodeId, target_key: key } },
+      create: { node_id: nodeId, target_key: key, ...row },
+      update: row,
+    });
+  }
+  await db.targetObservation.deleteMany({ where: { node_id: nodeId, target_key: { notIn: seen } } });
 }
 
 /**
@@ -507,7 +803,20 @@ export function extractBearerCredential(authorization: string | undefined | null
 /* ================================================================== */
 
 export type SubmitResult =
-  | { ok: true; node_id: number; scope: number; reported_at: Date }
+  | {
+      ok: true;
+      node_id: number;
+      scope: number;
+      reported_at: Date;
+      /**
+       * V5.3 WP9：本次上报续约成功的归属事实。
+       *
+       * 为什么必须回传：Agent 按契约"租约到期即停"，而续约是面板侧写的。不回传的话，
+       * 每个隧道在最后一次下发后一个 TTL 就会自停 —— 在健康节点上制造全量中断。
+       * 挂在既有响应上，不新增心跳、不新增往返。
+       */
+      leases: LeaseFact[];
+    }
   | { ok: false; status: 401 | 400 | 503; reason: string };
 
 /**
@@ -561,6 +870,34 @@ export async function submitStateReport(
     update: { ...core, ...telemetry },
   });
 
+  // ── V5.3 WP9：本人续约 ──
+  //
+  // 一个节点上报它正在服务的隧道，就是它仍在承载这些 Forward 的最好证据，所以续约挂在这条
+  // 既有节拍上，而不是新开一个心跳通道（第二条时间真相）。续不上（或别人是 owner）时**什么
+  // 都不做**：抢别人的归属必须走显式的两阶段交接，不能靠"报告里提到了它"。
+  // V5.3 WP9（round 6 修正）：续约**不依赖"被服务方上报了它"**。
+  //
+  // 第一版按"上报的隧道"续约，于是出现一个自锁：栅栏停掉隧道 → agent 不再上报它 →
+  // 续约永远续不到 → 租约一直过期 → 隧道一直停（实测落后 83s 且不恢复）。
+  // 正确的语义是：**一次上报证明的是"这个节点"还活着**，而面板知道它**持有**哪些租约；
+  // 只要它还活着，它手里的租约就该被续上（否则"租约到期即停"会退化成"一次抖动永久停服务"）。
+  //
+  // 注意这不会让"该停的隧道停不下来"：停一条隧道靠的是配置/remove 命令，不是靠让租约烂掉。
+  const renewedLeases = await renewOwnedLeases(auth.node_id, reportedAt);
+
+  // ── V5.2 WP5：目标观测投影 ──
+  //
+  // 两种"缺失"含义完全不同，必须分开：
+  //   · 字段**存在**（哪怕是空数组）= 这个 Agent 会观测，且这就是它现在的全部
+  //     观测 → 按上报同步：写进投影，并删掉它不再观测的目标（目标已从 desired
+  //     移除，投影里不该留下一个永远不会再更新的悬空行）；
+  //   · 字段**不存在** = 这是个还没有观测能力的旧 Agent → 保持投影不动。
+  //     若按 `tunnels ?? []` 的写法把它当空集，一次旧版本 Agent 上报就会清空
+  //     整张观测表，把"没有证据"伪造成"刚刚观测过且什么都没有"。
+  if (report.target_observations !== undefined) {
+    await syncTargetObservations(auth.node_id, report.target_observations, reportedAt);
+  }
+
   // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（WP1 列，WP7 首次写入）。
   await db.node
     .updateMany({ where: { id: auth.node_id }, data: { last_seen_at: reportedAt } })
@@ -568,7 +905,16 @@ export async function submitStateReport(
       /* 心跳刷新失败不影响上报结论 */
     });
 
-  return { ok: true, node_id: auth.node_id, scope: auth.scope, reported_at: reportedAt };
+  // V5.3 WP9: the renewed ownership facts travel back in the report's own response —
+  // zero extra round trips, zero new cadence, and the agent learns "you may keep serving
+  // until T" from the very answer it is already waiting for.
+  return {
+    ok: true,
+    node_id: auth.node_id,
+    scope: auth.scope,
+    reported_at: reportedAt,
+    leases: renewedLeases,
+  };
 }
 
 /* ================================================================== */

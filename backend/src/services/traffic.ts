@@ -45,6 +45,14 @@ export interface TrafficDayPoint {
 export interface TunnelTrafficGroup {
   tunnel_id: number;
   name: string;
+  /**
+   * The Forward's **canonical** protocol (V5-WP0). It is still called
+   * `tunnel_type` in this report because that is the column the report has always
+   * named; the VALUE is the canonical fact, not the legacy column — a `ws`
+   * Forward's legacy column defaults to `wss`, and a billing view that reports
+   * "WebSocket over TLS" about a plain-WS tunnel is wrong data in a customer-facing
+   * artefact.
+   */
   tunnel_type: string;
   in_node_group_id: number | null;
   in_node_group_name: string | null;
@@ -73,7 +81,13 @@ export interface TrafficAggRow {
   traffic: number;
   traffic_cost: number;
   date: Date;
-  tunnel?: { name: string; tunnel_type: string; in_node_group_id: number | null; in_node_group?: { name: string } | null } | null;
+  tunnel?: {
+    name: string;
+    forward_protocol?: string | null;
+    tunnel_type: string;
+    in_node_group_id: number | null;
+    in_node_group?: { name: string } | null;
+  } | null;
 }
 
 /* ================================================================== */
@@ -148,7 +162,15 @@ export function aggregateTrafficRows(
         group: {
           tunnel_id: r.tunnel_id,
           name: r.tunnel?.name ?? "",
-          tunnel_type: r.tunnel?.tunnel_type ?? "",
+          // Canonical fact first, legacy column as the fallback, and NOTHING when
+          // the metadata row is missing.
+          //
+          // `persistedForwardProtocol` is not used here on purpose: it answers the
+          // dispatch question ("what protocol should this run as") and therefore
+          // defaults, while a reporting projection must never invent a protocol for
+          // a row whose tunnel is gone — V4's report contract says a missing
+          // tunnel renders as empty, and that assertion is older than V5.
+          tunnel_type: r.tunnel?.forward_protocol ?? r.tunnel?.tunnel_type ?? "",
           in_node_group_id: r.tunnel?.in_node_group_id ?? null,
           in_node_group_name: r.tunnel?.in_node_group?.name ?? null,
           traffic: 0,
@@ -255,7 +277,15 @@ export async function getWorkspaceTrafficSummary(
       traffic: true,
       traffic_cost: true,
       date: true,
-      tunnel: { select: { name: true, tunnel_type: true, in_node_group_id: true, in_node_group: { select: { name: true } } } },
+      tunnel: {
+        select: {
+          name: true,
+          forward_protocol: true,
+          tunnel_type: true,
+          in_node_group_id: true,
+          in_node_group: { select: { name: true } },
+        },
+      },
     },
   });
 

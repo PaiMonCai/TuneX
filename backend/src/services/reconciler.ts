@@ -108,7 +108,27 @@ export interface DesiredTunnel {
   egress_port?: number | null;
   ingress_node_id?: number | null;
   egress_node_id?: number | null;
+  /** V5.4：三跳路由的中间节点；null = V4 单跳 RELAY。 */
+  middle_node_id?: number | null;
   in_node_group_id?: number | null;
+  /**
+   * V5.3（round 6/7）—— reconcile 必须能比较**内容**，不只是"存在性与 revision"：
+   *   · `desired_pool_targets` = 池里 active 目标的 `host:port`（升序）；
+   *   · `desired_target_health` = 面板此刻的合成结论（`host:port=state`，升序）。
+   * `undefined` = 本次没有加载这些事实，此时**不**判内容漂移（"没加载" ≠ "为空"）。
+   */
+  desired_pool_targets?: string[] | null;
+  desired_target_health?: string[] | null;
+  /**
+   * 协议事实（V5-WP0/WP4）。**必须**随行一起投影：resend 路径要据此判定这份事实
+   * 是否可运行；缺列会被 fail-closed 拒绝（`admitPersistedProtocol` 不再把
+   * 「投影忘了选列」当成 V4 的「省略协议」）。
+   */
+  forward_protocol?: string | null;
+  tunnel_type?: string | null;
+  /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
 }
 
 /** Agent 快照里的单条隧道（对齐 services/node-state.ts 的 ReportedTunnel）。 */
@@ -118,6 +138,10 @@ export interface AgentTunnelState {
   ingress_port?: number | null;
   egress_port?: number | null;
   revision?: number | null;
+  /** 该节点上报的**已应用**池目标（`host:port`，升序）。 */
+  applied_pool_targets?: string[] | null;
+  /** 该节点上报的**已应用**健康数组（`host:port=state`，升序）。 */
+  applied_target_health?: string[] | null;
 }
 
 /** 节点在线性事实。 */
@@ -156,7 +180,14 @@ export type DriftKind =
   /** 节点处于 maintenance：本轮不下发，只等待（§13.4.2）。 */
   | "node_in_maintenance"
   /** 上次 apply 以 error 收尾。 */
-  | "error_state";
+  | "error_state"
+  /**
+   * 已应用的**内容**与 desired 不一致（池目标集合、健康数组）。
+   *
+   * 存在性与 revision 都对、内容却过期 —— 症状是"池变空"、"熔断看着没生效"，
+   * 而 reconcile 认为一切正常（`resent: 0`）。
+   */
+  | "content_drift";
 
 /** 一条偏差（判定结果，无副作用）。 */
 export interface Drift {
@@ -291,6 +322,33 @@ export function isNodeInMaintenance(node: NodeOnlineInput | null | undefined): b
  * 不在此处产出动作：`computeDrift` 回答「差在哪」，`planTunnelActions` 回答
  * 「允许怎么修」。混在一起会让「同一偏差只能有一种修法」的约束散落各处。
  */
+/**
+ * agent 上报的池目标（`host:port`，升序）—— "已应用内容"的一半。
+ *
+ * V5.3 round 6 实测：agent 的池可以变空，而隧道仍在列表里，于是存在性判定认为一切正常、
+ * `resent: 0`，转发却什么都转发不出去（连得上、没数据）。
+ */
+function appliedPoolTargets(report: NodeReport | undefined, tunnelId: number): string[] | null {
+  if (!report) return null;
+  const pools = (report as unknown as { egress_pools?: Record<string, { targets?: unknown }> }).egress_pools;
+  if (!pools || typeof pools !== "object") return null;
+  const pool = pools[`tunex-${tunnelId}-egress`];
+  if (!pool || !Array.isArray(pool.targets)) return null;
+  return pool.targets.filter((x): x is string => typeof x === "string").slice().sort();
+}
+
+/** agent 应用的健康数组（`host:port=state`，升序）；没带就返回 null（= 不判漂移）。 */
+function appliedTargetHealth(egress: AgentTunnelState | null): string[] | null {
+  const raw = (egress as unknown as {
+    target_health?: Array<{ host?: unknown; port?: unknown; state?: unknown }>;
+  })?.target_health;
+  if (!Array.isArray(raw)) return null;
+  return raw
+    .filter((h) => typeof h?.host === "string" && typeof h?.port === "number" && typeof h?.state === "string")
+    .map((h) => `${h.host}:${h.port}=${h.state}`)
+    .sort();
+}
+
 export function computeDrift(
   tunnel: DesiredTunnel,
   agent: AgentTunnelState | null,
@@ -319,6 +377,38 @@ export function computeDrift(
       detail: `desired=${tunnel.desired_status ?? "未声明"} 但 agent 仍在运行隧道 ${tunnel.id}`,
     });
   }
+  // ── 内容漂移（V5.3 round 6/7）──
+  //
+  // 存在性与 revision 都对，但**内容**过期。只在两侧都有事实时判定：任一侧为 undefined
+  // 表示本次没有加载，"没加载"绝不能被读成"内容为空"，否则每一拍都会重发一次。
+  if (wantsActive(tunnel) && agent !== null && !unreachable) {
+    const desiredTargets = tunnel.desired_pool_targets;
+    const appliedTargets = agent.applied_pool_targets;
+    if (Array.isArray(desiredTargets) && Array.isArray(appliedTargets)) {
+      const want = [...desiredTargets].sort().join(",");
+      const have = [...appliedTargets].sort().join(",");
+      if (want !== have) {
+        out.push({
+          kind: "content_drift",
+          detail:
+            `池目标不一致：desired=[${want || "空"}] applied=[${have || "空"}]` +
+            (appliedTargets.length === 0 && desiredTargets.length > 0
+              ? "（agent 池为空：转发会连上但转发不出数据）"
+              : ""),
+        });
+      }
+    }
+    const desiredHealth = tunnel.desired_target_health;
+    const appliedHealth = agent.applied_target_health;
+    if (Array.isArray(desiredHealth) && Array.isArray(appliedHealth) &&
+        [...desiredHealth].sort().join(",") !== [...appliedHealth].sort().join(",")) {
+      out.push({
+        kind: "content_drift",
+        detail: `健康数组不一致：desired=[${[...desiredHealth].sort().join(",")}] applied=[${[...appliedHealth].sort().join(",")}]`,
+      });
+    }
+  }
+
   if (wantsActive(tunnel) && agent !== null && isRevisionBehind(tunnel)) {
     out.push({
       kind: "revision_behind",
@@ -447,6 +537,16 @@ export function planTunnelActions(
       tunnel_id: tunnel.id,
       node_id: tunnel.egress_node_id ?? null,
     });
+  } else if (kinds.has("content_drift") && wantsActive(tunnel)) {
+    // 同 revision 重发：池目标与健康数组不是 revision 的一部分，它们来自面板的实时读。
+    // 这正是"存在性对了、内容过期"应有的修法 —— 不需要新机制，也不需要 bump revision。
+    actions.push({
+      kind: "resend_same_revision",
+      detail: `内容漂移，同 revision ${revision} 重发以带上当前内容`,
+      revision,
+      tunnel_id: tunnel.id,
+      node_id: tunnel.egress_node_id ?? tunnel.ingress_node_id ?? null,
+    });
   } else if (kinds.has("revision_behind") && wantsActive(tunnel)) {
     const backoff = opts.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
     const last = tunnel.last_applied_at ?? null;
@@ -553,6 +653,14 @@ export type NodeReport = {
   /** Agent 自称正在运行的隧道。 */
   tunnels: AgentTunnelState[];
   last_error?: string | null;
+  /**
+   * Agent 自报的池视图（`{ "<tunnelId>": { targets: ["host:port", ...] } }`）。
+   *
+   * V5.3：**内容漂移判定需要它**。第一版没把它从上报里取出来，于是
+   * `applied_pool_targets` 恒为 null、"缺事实不判漂移"的保护让内容漂移永不触发 ——
+   * 表现就是 `resent: 0` 一直不变，而池可能已经空了。
+   */
+  egress_pools?: Record<string, { targets?: unknown }> | null;
 };
 
 export interface ReconcileDeps {
@@ -565,6 +673,17 @@ export interface ReconcileDeps {
   sink?: ReconcileSink | null;
   /** 端口租约回收（生产 = WP3 `reconcileLeases`）。 */
   reconcileLeases?: ReconcileLeasePort | null;
+  /**
+   * V5.3 WP10：自动故障转移评估（生产 = `runFailoverSweep`）。
+   *
+   * 注入而不是直接 import，有两个理由：本模块的用例不需要数据库；以及**顺序**
+   * 必须由调用方掌握 —— 先续跑未完成的 rollout，再评估新的迁移，否则一次未完成的迁移
+   * 会被当成"又一次掉线"再迁一遍。
+   *
+   * 缺省 = 不评估（旧行为）。这不是"忘了接线"的安全网，而是**有意的缺省**：没有策略
+   * 配置时自动迁移本来就不该发生（§8：必须是显式 policy）。
+   */
+  failoverSweep?: (() => Promise<{ evaluated: number; moved: number; held: number }>) | null;
   /** 端口租约回收的依赖注入（透传给 WP3）。 */
   leaseDeps?: unknown;
   log?: ReconcileLogger;
@@ -588,6 +707,13 @@ export interface ReconcileOutcome {
   noTransport: number;
   /** 端口租约回收统计（`null` = 本轮未配置回收依赖）。 */
   leases: { releasedDanglingTunnel: number; releasedExpired: number } | null;
+  /**
+   * V5.3 WP10：自动迁移评估结果（`null` = 本轮未配置该依赖）。
+   *
+   * 放在 outcome 里而不是只写日志：迁移是"改变了谁承载流量"的动作，它的次数必须和
+   * resend/failed 一样是**可观测的返回值**，否则"这轮到底有没有搬流量"只能靠翻日志。
+   */
+  failover: { evaluated: number; moved: number; held: number } | null;
   forbiddenSuppressed: ForbiddenActionKind[];
 }
 
@@ -603,6 +729,17 @@ export function defaultReconcileDeps(): ReconcileDeps {
         select: {
           id: true,
           name: true,
+          // V5-WP4/G0: the protocol fact travels with the row, because the sink
+          // that resends it must decide whether this fact is runnable. Without
+          // these columns `admitPersistedProtocol` sees "no fact at all" and the
+          // old default would have replayed a historical non-TCP Forward as TCP.
+          forward_protocol: true,
+          tunnel_type: true,
+          // V5-WP5-A1/A2: the tls front's paths travel with the row, so a resend
+          // can dispatch the same configuration the create did. Without them a
+          // tls Forward would be resendable but un-dispatchable.
+          tls_cert_path: true,
+          tls_key_path: true,
           tunnel_mode: true,
           desired_status: true,
           config_revision: true,
@@ -615,10 +752,24 @@ export function defaultReconcileDeps(): ReconcileDeps {
           egress_port: true,
           ingress_node_id: true,
           egress_node_id: true,
+          middle_node_id: true,
           in_node_group_id: true,
+          // V5.3（round 7）：内容漂移判定需要**期望内容**。只取 active 目标：
+          // 停用的目标不参与转发，不该因为它们触发重发。
+          egress_pool: { select: { targets: { select: { host: true, port: true, status: true } } } },
         },
       });
-      return rows as unknown as DesiredTunnel[];
+      const withContent = (rows as unknown as Array<{
+        egress_pool?: { targets?: Array<{ host: string; port: number; status: string }> } | null;
+        [key: string]: unknown;
+      }>).map((row) => {
+        const targets = (row.egress_pool?.targets ?? [])
+          .filter((t) => t.status === "active")
+          .map((t) => `${t.host}:${t.port}`);
+        const { egress_pool: _dropped, ...rest } = row;
+        return { ...rest, desired_pool_targets: targets } as unknown as DesiredTunnel;
+      });
+      return withContent;
     },
     async nodes() {
       const { db } = await import("../db.ts");
@@ -640,13 +791,27 @@ export function defaultReconcileDeps(): ReconcileDeps {
       // key 用 node.id 而非上报里的字符串 node_id：DB 外键全走主键。
       const { db } = await import("../db.ts");
       const rows = await db.nodeStateReport.findMany({
-        select: { node_id: true, reported_at: true, tunnels: true, last_error: true },
+        select: {
+          node_id: true,
+          reported_at: true,
+          tunnels: true,
+          last_error: true,
+          egress_pools: true,
+        },
       });
-      const map = new Map<number, { reported_at: Date | null; tunnels: AgentTunnelState[]; last_error: string | null }>();
+      const map = new Map<number, NodeReport>();
       for (const r of rows) {
         const raw = r.tunnels;
         const list = Array.isArray(raw) ? (raw as unknown as AgentTunnelState[]) : [];
-        map.set(r.node_id, { reported_at: r.reported_at ?? null, tunnels: list, last_error: r.last_error ?? null });
+        map.set(r.node_id, {
+          reported_at: r.reported_at ?? null,
+          tunnels: list,
+          last_error: r.last_error ?? null,
+          egress_pools:
+            r.egress_pools && typeof r.egress_pools === "object" && !Array.isArray(r.egress_pools)
+              ? (r.egress_pools as Record<string, { targets?: unknown }>)
+              : null,
+        });
       }
       return map;
     },
@@ -689,6 +854,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
   let failed = 0;
   let noTransport = 0;
 
+  let failoverSummary: { evaluated: number; moved: number; held: number } | null = null;
   const loadTunnels = deps.tunnels ?? (async () => [] as DesiredTunnel[]);
   const loadNodes = deps.nodes ?? (async () => [] as NodeOnlineInput[]);
   const loadReports = deps.reports ?? (async () => new Map<number, NodeReport>());
@@ -825,6 +991,23 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     });
   }
 
+  // ── V5.3 WP10：自动迁移评估（在逐条修复之后）──
+  //
+  // 顺序是刻意的：先把"该重发的重发、该补 runtime 的补上"，再考虑"要不要把归属搬走"。
+  // 反过来的话，一个只是暂时落后的节点会被判成故障并触发一次代价高昂的迁移。
+  if (deps.failoverSweep) {
+    try {
+      failoverSummary = await deps.failoverSweep();
+      if (failoverSummary.moved > 0) {
+        log("failover sweep", { moved: failoverSummary.moved, evaluated: failoverSummary.evaluated });
+      }
+    } catch (e) {
+      // 迁移评估失败绝不阻断本轮 reconcile：下一轮会自然重试，且失败本身已由
+      // 执行器的结构化结果记账（这里只保证不影响其它动作）。
+      log("failover sweep failed", { detail: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   return {
     scanned: tunnels.length,
     findings,
@@ -832,6 +1015,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     resent,
     failed,
     noTransport,
+    failover: failoverSummary,
     leases: leases ?? (leaseReconciler ? EMPTY_LEASES : null),
     forbiddenSuppressed: [...forbidden],
   };
@@ -879,46 +1063,62 @@ function pickAgentTunnel(
   const egressReport =
     t.egress_node_id == null ? undefined : reports.get(t.egress_node_id);
   const egress = egressReport?.tunnels.find((x) => x.id === runtimeId(t.id, "egress")) ?? null;
+  const middleReport =
+    t.middle_node_id == null ? undefined : reports.get(t.middle_node_id);
+  // Transit deliberately reuses the EGRESS runtime primitive and therefore the
+  // same resource id suffix. Node id disambiguates the concrete runtime.
+  const middle =
+    t.middle_node_id == null
+      ? null
+      : middleReport?.tunnels.find((x) => x.id === runtimeId(t.id, "egress")) ?? null;
 
-  // When desired is inactive, one leftover side is enough to flag
-  // unexpected_runtime. When desired is active, both sides are required.
+  // When desired is inactive, one leftover leg is enough to flag
+  // unexpected_runtime. When desired is active, EVERY concrete leg is required.
   if (!wantsActive(t)) {
-    const any = ingress ?? egress;
+    const any = ingress ?? middle ?? egress;
     if (!any) return null;
+    const revisions = [ingress?.revision, middle?.revision, egress?.revision]
+      .filter((v): v is number => typeof v === "number");
     return {
       id: String(t.id),
       mode: "relay",
       ingress_port: ingress?.ingress_port ?? null,
       egress_port: egress?.egress_port ?? null,
-      revision: Math.min(
-        ingress?.revision ?? Number.MAX_SAFE_INTEGER,
-        egress?.revision ?? Number.MAX_SAFE_INTEGER,
-      ),
+      revision: revisions.length > 0 ? Math.min(...revisions) : 0,
     };
   }
-  if (!ingress || !egress) return null;
+  if (!ingress || !egress || (t.middle_node_id != null && !middle)) return null;
 
   const ingressMode = String(ingress.mode ?? "").toLowerCase();
+  const middleMode = String(middle?.mode ?? "").toLowerCase();
   const egressMode = String(egress.mode ?? "").toLowerCase();
-  // A RELAY resource is healthy only when its two concrete runtimes have the
-  // expected roles. Preserve an unexpected runtime mode in the collapsed view
-  // so computeDrift can emit mode_mismatch instead of normalising the error away.
+  // A RELAY resource is healthy only when every concrete runtime has its
+  // expected role. In a three-hop route the middle runtime is EGRESS-shaped.
   const mode =
     ingressMode !== "" && ingressMode !== "relay"
       ? ingressMode
-      : egressMode !== "" && egressMode !== "egress"
-        ? egressMode
-        : "relay";
+      : middleMode !== "" && middleMode !== "egress"
+        ? middleMode
+        : egressMode !== "" && egressMode !== "egress"
+          ? egressMode
+          : "relay";
+
+  const revisions = [
+    ingress.revision ?? 0,
+    ...(middle ? [middle.revision ?? 0] : []),
+    egress.revision ?? 0,
+  ];
 
   return {
     id: String(t.id),
     mode,
+    // V5.3（round 7）：业务 target/health 仍属于最终出口，不把 transit 的
+    // 单一 next-hop 伪装成业务池内容。
+    applied_pool_targets: appliedPoolTargets(egressReport, t.id),
+    applied_target_health: appliedTargetHealth(egress),
     ingress_port: ingress.ingress_port ?? null,
     egress_port: egress.egress_port ?? null,
-    revision: Math.min(
-      ingress.revision ?? 0,
-      egress.revision ?? 0,
-    ),
+    revision: Math.min(...revisions),
   };
 }
 
@@ -938,19 +1138,24 @@ function pickNode(
   if (t.egress_node_id == null) return null;
   const egress = nodeById.get(t.egress_node_id);
   if (!egress) return null;
+  const middle =
+    t.middle_node_id == null ? null : nodeById.get(t.middle_node_id) ?? null;
+  if (t.middle_node_id != null && !middle) return null;
 
-  const status =
-    ingress.status === "inactive" || egress.status === "inactive"
-      ? "inactive"
-      : "active";
+  const boundNodes = [ingress, ...(middle ? [middle] : []), egress];
+  const status = boundNodes.some((n) => n.status === "inactive")
+    ? "inactive"
+    : "active";
 
   const seen = (n: NodeOnlineInput): number | null => {
     const d = n.last_seen_at ?? n.reported_at ?? null;
     return d ? new Date(d).getTime() : null;
   };
-  const a = seen(ingress);
-  const b = seen(egress);
-  const oldest = a == null || b == null ? null : new Date(Math.min(a, b));
+  const seenValues = boundNodes.map(seen);
+  const oldest =
+    seenValues.some((v) => v == null)
+      ? null
+      : new Date(Math.min(...(seenValues as number[])));
   // V4-WP5 §13.4.2：lifecycle 必须随折叠视图带出去。漏了它，
   // `executeReconcile` 的 `nodeInMaintenance` 对 RELAY 恒为 false（DIRECT 走
   // 上面的 early return 所以不受影响），维护中的入口/出口节点会被照样下发新
@@ -958,14 +1163,15 @@ function pickNode(
   // 禁止的行为。**任一侧 maintenance 就按维护处理**：RELAY 的新 runtime 要同时
   // 落在两侧，只放行一侧等于把半态写进数据面。其余 lifecycle 取值原样投影
   // （planTunnelActions 只认 maintenance，disabled / retiring 的处理另属编排层）。
-  const anyMaintenance =
-    ingress.lifecycle === "maintenance" || egress.lifecycle === "maintenance";
+  const anyMaintenance = boundNodes.some((n) => n.lifecycle === "maintenance");
 
   return {
     node_id: ingress.node_id,
     status,
     last_seen_at: oldest,
     reported_at: oldest,
-    lifecycle: anyMaintenance ? "maintenance" : (ingress.lifecycle ?? egress.lifecycle ?? null),
+    lifecycle: anyMaintenance
+      ? "maintenance"
+      : (ingress.lifecycle ?? middle?.lifecycle ?? egress.lifecycle ?? null),
   };
 }

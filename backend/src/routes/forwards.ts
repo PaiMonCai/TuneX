@@ -117,8 +117,18 @@ const ForwardCreateSchema = z
     name: z.string().trim().min(1).max(60),
     mode: z.enum(["direct", "relay"]),
     protocol: z.enum(FORWARD_PROTOCOLS).optional(),
+    // V5-WP5-A1: paths only. Shape is enforced here; existence is the Agent's
+    // check (the panel cannot see the node's filesystem), and a missing file is
+    // a build-time refusal on the node.
+    tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
+    tls_key_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     ingress_node_id: z.number().int().positive(),
     egress_node_id: z.number().int().positive().nullable().optional(),
+    // V5.4：三跳路由的中间跳（省略 = 单跳）。schema 是 `.strict()` 的 —— 也就是说
+    // 少了这一行，body 里的 `middle_node_id` 会被**拒绝**（400）而不是被静默丢掉。
+    // 这个 400 是对的（未知字段 fail-closed），它暴露的是"服务层加了、路由层没加"
+    // 这一半漏接线 —— 与协议/证书/健康/池内容那几次同类，只是这次发生在入参层。
+    middle_node_id: z.number().int().positive().nullable().optional(),
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),
     target_host: z.string().trim().min(1).max(255),
     target_port: z.number().int().min(1).max(65535),
@@ -137,9 +147,18 @@ const ForwardPatchSchema = z
     mode: z.enum(["direct", "relay"]).optional(),
     ingress_node_id: z.number().int().positive().optional(),
     egress_node_id: z.number().int().positive().nullable().optional(),
+    /** V5.4：中间跳（`null` = 回到单跳）。与入出口同样是运行态放置事实。 */
+    middle_node_id: z.number().int().positive().nullable().optional(),
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),
     target_host: z.string().trim().min(1).max(255).nullable().optional(),
     target_port: z.number().int().min(1).max(65535).nullable().optional(),
+    // V5-WP5-A1: the tls front's paths are editable, with the SAME shape rule as
+    // create. The protocol itself is deliberately NOT here: turning a tcp Forward
+    // into a tls one is a different operation (port lease, target semantics and
+    // the RELAY shape all change), and §6.1 did not freeze that semantics — so it
+    // is refused by omission rather than guessed at.
+    tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
+    tls_key_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     expected_revision: z.number().int().nonnegative().nullable().optional(),
   })
   .strict()

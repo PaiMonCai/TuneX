@@ -6,10 +6,13 @@
 //	DELETE /tunnel?id=<id>     remove a tunnel
 //	PATCH  /node/targets       hot-update one tunnel's egress target pool
 //	GET    /health             version / role / ports / egress pools
+//	GET    /debug/runtime      process runtime gauges (goroutines / RSS / CPU)
 //
 // Mutating routes require a bearer token; by default the server binds to
 // loopback (127.0.0.1:9090 — the v3 deployment layout's admin port, separate
-// from the data-plane range).
+// from the data-plane range). /debug/runtime is authenticated too: it exposes
+// process internals, and "it is only a gauge" is not a reason to make the
+// management plane's auth story inconsistent.
 //
 // WP4 scope ends here: the routes call TunnelManager/EgressManager and report
 // state. The final panel orchestration (WP6 command/revision/ACK contract and
@@ -27,6 +30,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +39,8 @@ import (
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/manager"
+	"github.com/tunex/agent/internal/ownership"
+	"github.com/tunex/agent/internal/targetdns"
 )
 
 // DefaultPort is the admin port from the v3 deployment layout (agent port 9090,
@@ -66,6 +72,31 @@ type Options struct {
 	NodeID     string // reported by /health
 	Version    string // reported by /health
 	Role       string // reported by /health
+
+	// Ownership is the V5.3-WP9 fencing view: the durable epoch fence plus the
+	// lease clock's counters. nil omits the section entirely (an older build, or
+	// a test), which is why the field is optional rather than a required source.
+	Ownership OwnershipFacts
+
+	// TargetDNS is the V5.3-WP8 resolution view: what each target name currently
+	// resolves to, how old that answer is, and why the last lookup failed. It is
+	// the "report the fact" half of NXDOMAIN handling — the node keeps serving
+	// from its last good addresses, and this is where an operator can see that it
+	// is doing so on stale evidence.
+	TargetDNS TargetDNSFacts
+}
+
+// TargetDNSFacts is the resolution view /health publishes. targetdns.Resolver
+// satisfies it.
+type TargetDNSFacts interface {
+	Facts() []targetdns.Fact
+}
+
+// OwnershipFacts is the report /health publishes about fencing. It is an
+// interface so this package never imports the enforcement side; ownership.Guard
+// satisfies it with Facts().
+type OwnershipFacts interface {
+	Facts() ownership.Facts
 }
 
 // NodeState is the /health payload. Field names match the panel's Node model
@@ -77,6 +108,14 @@ type NodeState struct {
 	Tunnels   []forwarder.TunnelConfig        `json:"tunnels"`
 	UsedPorts []int                           `json:"used_ports"`
 	Egress    map[string]manager.PoolSnapshot `json:"egress_pools,omitempty"`
+	// TargetDNS is the V5.3-WP8 resolution fact set, additive and optional.
+	TargetDNS []targetdns.Fact `json:"target_dns,omitempty"`
+	// Ownership is the V5.3-WP9 fencing fact set. It is ADDITIVE and optional:
+	// a node without a guard simply has no key, and every pre-V5.3 reader keeps
+	// working. It exists because a refused activation must be a fact somebody
+	// can read — the ACK tells the panel, the ledger carries it in the report,
+	// and this is the surface that says WHY without opening the agent log.
+	Ownership *ownership.Facts `json:"ownership,omitempty"`
 }
 
 // StateFunc builds the node snapshot. main wires it to the running managers;
@@ -128,7 +167,53 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/tunnel", s.withAuth(s.handleTunnel))
 	mux.HandleFunc("/tunnel/", s.withAuth(s.handleTunnel))
 	mux.HandleFunc("/node/targets", s.withAuth(s.handleTargets))
+	mux.HandleFunc("/debug/runtime", s.withAuth(s.handleRuntimeStats))
 	return mux
+}
+
+// RuntimeStats is the /debug/runtime payload (V5-WP3).
+//
+// Why the agent exposes these rather than letting a benchmark shell out to
+// /proc: **goroutine count is not in /proc**. It is an in-process number, and
+// the whole point of the V5 performance baseline is to notice "functionality
+// passes but the runtime leaks goroutines". Reading Threads from
+// /proc/<pid>/status would silently measure OS threads instead and look like a
+// pass forever.
+//
+// The shape is deliberately flat and unit-suffixed: a perf artifact that needs a
+// decoder to interpret is an artifact nobody compares later.
+type RuntimeStats struct {
+	Goroutines int    `json:"goroutines"`
+	GoMaxProcs int    `json:"gomaxprocs"`
+	GoVersion  string `json:"go_version"`
+	// HeapAllocBytes is live heap; SysBytes is what the process holds from the
+	// OS. Reporting only one of them hides the difference between "the
+	// allocator is keeping memory" and "objects are still reachable".
+	HeapAllocBytes uint64 `json:"heap_alloc_bytes"`
+	HeapSysBytes   uint64 `json:"heap_sys_bytes"`
+	NumGC          uint32 `json:"num_gc"`
+}
+
+// handleRuntimeStats reports this process's own runtime gauges.
+//
+// It is read-only and cheap (runtime.ReadMemStats stops the world for a
+// microsecond or so): it is meant to be polled by the perf harness, not by the
+// data plane, and it never mutates tunnel state.
+func (s *Server) handleRuntimeStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	writeOK(w, RuntimeStats{
+		Goroutines:     runtime.NumGoroutine(),
+		GoMaxProcs:     runtime.GOMAXPROCS(0),
+		GoVersion:      runtime.Version(),
+		HeapAllocBytes: mem.HeapAlloc,
+		HeapSysBytes:   mem.HeapSys,
+		NumGC:          mem.NumGC,
+	})
 }
 
 // Start binds the admin port and serves until Stop. Idempotent-safe: a second
@@ -301,10 +386,16 @@ func (s *Server) handleRemoveTunnel(w http.ResponseWriter, r *http.Request) {
 }
 
 // targetsRequest is the PATCH /node/targets body.
+//
+// TargetHealth is the V5.2-WP7 parallel array (§7.3): the same predicate the
+// control-plane dispatch carries, so the local hot-update surface cannot apply
+// the desired targets while silently discarding the health that came with them.
+// Absent means "no health signal" and restores the pre-WP7 behaviour.
 type targetsRequest struct {
-	TunnelID string             `json:"tunnel_id"`
-	Strategy manager.Strategy   `json:"strategy"`
-	Targets  []forwarder.Target `json:"targets"`
+	TunnelID     string                   `json:"tunnel_id"`
+	Strategy     manager.Strategy         `json:"strategy"`
+	Targets      []forwarder.Target       `json:"targets"`
+	TargetHealth []forwarder.TargetHealth `json:"target_health,omitempty"`
 }
 
 func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +421,7 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tunnel_id is required")
 		return
 	}
-	if err := s.egress.UpdateTargets(req.TunnelID, req.Strategy, req.Targets); err != nil {
+	if err := s.egress.UpdateTargetsAndHealth(req.TunnelID, req.Strategy, req.Targets, req.TargetHealth); err != nil {
 		if errors.Is(err, manager.ErrPoolNotFound) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -372,6 +463,13 @@ func (s *Server) snapshot() NodeState {
 	sort.Ints(st.UsedPorts)
 	if s.egress != nil {
 		st.Egress = s.egress.Snapshot()
+	}
+	if s.opts.Ownership != nil {
+		facts := s.opts.Ownership.Facts()
+		st.Ownership = &facts
+	}
+	if s.opts.TargetDNS != nil {
+		st.TargetDNS = s.opts.TargetDNS.Facts()
 	}
 	return st
 }

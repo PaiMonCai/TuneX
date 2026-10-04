@@ -72,7 +72,22 @@ jobs:
       # ops-script rewrite guards. It stops and recreates real Agents on purpose.
       - name: Run V4-F5 durability shutdown and ops closure gate
         run: python3 scripts/v3-e2e/v4-gate-f5.py
-      - name: Upload v3/v4 integration evidence
+      # V5-WP4 / Gate V5-G0: the V5 contract work (protocol facts, capability
+      # negotiation, runtime abstraction) must not have broken anything V4
+      # promised. It reuses the topology above and touches it (stops/restarts
+      # Agents, plants historical rows), so it runs last.
+      #
+      # §5.5: FAIL > 0 means V5.1 must not start. This step is therefore a hard
+      # blocker, not a report — a red G0 is the gate doing its job.
+      - name: Run V5-G0 contract compatibility gate
+        run: python3 scripts/v3-e2e/v5-g0.py
+      # V5.4 / G4 is the relevant merge gate for the middle-hop work on this
+      # branch. Keep it in the same real four-Agent topology so restart,
+      # compensation, orphan-port cleanup and three-hop data flow are verified
+      # before main ever sees the code.
+      - name: Run V5-G4 multi-hop closure gate
+        run: python3 scripts/v3-e2e/v5-g4.py
+      - name: Upload v3/v4/v5 integration evidence
         if: failure() || github.event_name == 'workflow_run'
         uses: actions/upload-artifact@v7
         with:

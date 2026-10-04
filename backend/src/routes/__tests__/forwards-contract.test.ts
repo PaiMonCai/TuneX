@@ -47,10 +47,19 @@ describe("V4-WP1 /api/forwards PATCH 契约", () => {
         "expected_revision",
         "ingress_node_id",
         "listen_port",
+        // V5.4：中间跳与入出口同为运行态放置事实，因此创建与 PATCH 两份契约都必须有它 ——
+        // 这条断言的目的就是"可编辑字段与创建契约一致"，少了它两边就会漂移。
+        "middle_node_id",
         "mode",
         "name",
         "target_host",
         "target_port",
+        // V5-WP5-A1: the tls front's paths are editable, so the patch contract
+        // stays equal to the create contract — which is what this assertion is
+        // FOR. `protocol` is deliberately absent (a protocol change is a
+        // different operation, not an edit) and that is asserted separately.
+        "tls_cert_path",
+        "tls_key_path",
       ].sort(),
     );
   });

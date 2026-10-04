@@ -12,6 +12,10 @@
  *    rollout 规则；这里只做「空值 / 端口范围」这类形态预检，少发无效请求。
  *  · `expected_revision` 取打开编辑器时的 `config_revision`（desired 指针），
  *    不是 `applied_revision`——否则永远打不中并发闸门。
+ *
+ * V5-WP5-A1：编辑器**不改协议**（后端 `ForwardPatchSchema` 不接受 `protocol` /
+ * `tls_*`），只读展示当前协议；协议徽标的唯一实现见
+ * `components/forwards/forward-protocol-badge.tsx`。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Copy, Info, Link2, Loader2, ShieldAlert } from "lucide-react";
@@ -27,6 +31,19 @@ import {
   type ForwardDraft,
 } from "@/components/forwards/forward-copy";
 import { bindingUsageView } from "@/components/forwards/forward-binding-usage";
+import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
+import {
+  FORWARD_TLS_PATH_MAX,
+  TLS_FORWARD_PROTOCOL,
+  datagramRelayBoundaryKey,
+  forwardProtocolFact,
+  forwardProtocolNote,
+  forwardProtocolPatchFields,
+  forwardTransportFor,
+  isForwardProtocol,
+  tlsPathFieldErrors,
+  type TlsPathFieldErrors,
+} from "@/lib/forward-protocol";
 import {
   Dialog,
   DialogContent,
@@ -60,8 +77,13 @@ export type ForwardEditField = (typeof FORWARD_EDIT_FIELDS)[number];
  * 编辑器草稿形状。V4-WP9 起复用 `forward-copy.ts` 的 {@link ForwardDraft}：
  * 复制出的草稿必须能直接落进同一个编辑器（字段集完全相同），因此这里不再另立一份
  * 结构上等价、却可能悄悄漂移的本地类型。
+ *
+ * V5-WP5-A1：草稿额外带 tls 的证书/私钥路径 —— 这两列现在**可编辑**
+ * （后端 patch schema 已接受，规则与创建相同：只有 tls 能带、必须成对）。
+ * 协议本身仍在 `forward` 上（只读），所以草稿里没有 `protocol`：草稿里放一个永远
+ * 不会被保存的字段，就是让人以为能改的地方。
  */
-type Draft = ForwardDraft;
+type Draft = ForwardDraft & { tlsCertPath: string; tlsKeyPath: string };
 
 const EMPTY_DRAFT: Draft = {
   name: "",
@@ -71,6 +93,8 @@ const EMPTY_DRAFT: Draft = {
   listenPort: "",
   targetHost: "",
   targetPort: "",
+  tlsCertPath: "",
+  tlsKeyPath: "",
 };
 
 function draftFrom(forward: PortForward): Draft {
@@ -82,12 +106,19 @@ function draftFrom(forward: PortForward): Draft {
     listenPort: forward.listen_port != null ? String(forward.listen_port) : "",
     targetHost: forward.target_host ?? "",
     targetPort: forward.target_port != null ? String(forward.target_port) : "",
+    // 只有 tls 行会渲染这两个输入；非 tls 行在视图里就是 null（= 空串，永不发出）。
+    tlsCertPath: forward.tls_cert_path ?? "",
+    tlsKeyPath: forward.tls_key_path ?? "",
   };
 }
 
 /**
  * Draft → patch：只包含用户实际改动的字段（未改的不发，让后端沿用当前 desired）。
  * `listen_port` 空串显式映射为 `null`（= 自动分配），与创建表单同义。
+ *
+ * V5-WP5-A1：tls 路径经 `forwardProtocolPatchFields()` 生成 —— 只有 tls 行会带上，
+ * 且只在真的改了、且非空时出现（空串会让后端 zod 的 `.min(1)` 直接 400；
+ * 「清空路径」是表单预检的失败，不是一次可提交的编辑）。
  */
 export function draftToPatch(forward: PortForward, draft: Draft): ForwardPatchInput {
   const patch: ForwardPatchInput = {};
@@ -112,6 +143,15 @@ export function draftToPatch(forward: PortForward, draft: Draft): ForwardPatchIn
   if (host !== (forward.target_host ?? null)) patch.target_host = host;
   const port = draft.targetPort.trim() ? Number(draft.targetPort.trim()) : null;
   if (port !== (forward.target_port ?? null)) patch.target_port = port;
+  // tls 路径：只有 tls 行、只有真的改了、且非空时才出现（见 forwardProtocolPatchFields）。
+  Object.assign(
+    patch,
+    forwardProtocolPatchFields(
+      forward.protocol,
+      { cert: forward.tls_cert_path, key: forward.tls_key_path },
+      { cert: draft.tlsCertPath ?? "", key: draft.tlsKeyPath ?? "" },
+    ),
+  );
   return patch;
 }
 
@@ -139,6 +179,26 @@ export function draftFormErrors(
   return errors;
 }
 
+/**
+ * V5-WP5-A1：tls 路径的形态预检（**只有 tls 行**会渲染这两个输入）。
+ *
+ * 复用 `lib/forward-protocol.ts` 的 `tlsPathFieldErrors` —— 与创建表单、后端
+ * `tlsPathsForProtocol` 是同一份规则，不在这里另写一遍：
+ *   · tls 必须同时给出两个以 `/` 开头的绝对路径（后端 candidate 校验同样要求成对）；
+ *   · 非 tls 行不会走到这里（调用方先看协议），但函数本身也对路径说「不允许」。
+ */
+export function draftTlsPathErrors(
+  forward: Pick<PortForward, "protocol">,
+  draft: { tlsCertPath: string; tlsKeyPath: string },
+): TlsPathFieldErrors {
+  if (forwardProtocolFact(forward.protocol) !== TLS_FORWARD_PROTOCOL) return {};
+  return tlsPathFieldErrors(
+    TLS_FORWARD_PROTOCOL,
+    draft.tlsCertPath ?? "",
+    draft.tlsKeyPath ?? "",
+  );
+}
+
 type PreviewState =
   | { kind: "idle" }
   | { kind: "checking" }
@@ -164,7 +224,7 @@ export function ForwardEditDialog({
   onSaved: (updated: PortForward) => void;
   onReload: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { currentId, permissions, canForward } = useWorkspace();
   const allowed = canForward(forward, "update");
   const [draft, setDraft] = useState<Draft>(() => draftFrom(forward));
@@ -174,6 +234,31 @@ export function ForwardEditDialog({
   const seq = useRef(0);
 
   const expectedRevision = forward.config_revision ?? forward.latest_revision ?? 0;
+
+  /**
+   * V5-WP5-A1：协议只读提示。
+   *
+   * 后端 `ForwardPatchSchema` 只接受 `tls_cert_path` / `tls_key_path`（tls 行的证书
+   * 路径可改），**不接受** `protocol`：把 tcp 改成 tls 不是一次编辑（端口租约、目标
+   * 语义、RELAY 形态都会变），§6.1 没有冻结那套语义，所以 schema 用「不接受这个键」
+   * 而不是猜一个行为。这里只读展示事实 + 一句「为什么改不了」，而不是摆一个点了
+   * 注定失败的下拉框。
+   */
+  const protocolFact = isForwardProtocol(forward.protocol) ? forward.protocol : null;
+  const protocolHint = protocolFact
+    ? `${t("forward.protocolFixedHint")} ${forwardProtocolNote(locale, protocolFact)}`
+    : t("forward.protocolFixedHint");
+
+  /** 该行是不是 tls：决定渲染哪些协议专属字段（路径只属于 tls）。 */
+  const isTlsForward = forwardProtocolFact(forward.protocol) === TLS_FORWARD_PROTOCOL;
+  /**
+   * datagram（udp）行在说「连接」的地方必须换措辞 —— 报文映射没有连接可保持、
+   * 没有连接可 drain（§6.2）。`transport === null`（历史/未开放协议）走 stream
+   * 措辞：那种行根本不会被下发（preview 会先拒绝），措辞不可能被用户看到。
+   */
+  const datagram = forwardTransportFor(forward.protocol) === "datagram";
+  /** udp 在本版本只开放直连：中继会被运行时拒绝，这里只**告警**（见 lib 注释）。 */
+  const datagramRelayWarningKey = datagramRelayBoundaryKey(forward.protocol, draft.mode);
 
   // 打开时重置草稿；forward 变化（刷新后）也重置，避免拿旧草稿覆盖别人保存。
   useEffect(() => {
@@ -187,6 +272,12 @@ export function ForwardEditDialog({
   const patchKeys = useMemo(() => Object.keys(patch), [patch]);
   const formErrors = useMemo(() => draftFormErrors(draft, t), [draft, t]);
   const hasFormError = Object.keys(formErrors).length > 0;
+  /**
+   * tls 路径的预检错误（非 tls 行恒为空对象）。它和形态预检**并列**参与闸门，
+   * 但不进 `draftFormErrors`（那个函数的字段集是「创建字段集」，由源码断言钉住）。
+   */
+  const tlsErrors = useMemo(() => draftTlsPathErrors(forward, draft), [forward, draft]);
+  const hasTlsError = Object.keys(tlsErrors).length > 0;
   const empty = patchKeys.length === 0;
 
   useEffect(() => {
@@ -195,7 +286,7 @@ export function ForwardEditDialog({
       setPreview({ kind: "idle" });
       return;
     }
-    if (hasFormError) {
+    if (hasFormError || hasTlsError) {
       setPreview({ kind: "idle" });
       return;
     }
@@ -233,7 +324,7 @@ export function ForwardEditDialog({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [open, empty, hasFormError, forward.id, patch, t, allowed, currentId, permissions]);
+  }, [open, empty, hasFormError, hasTlsError, forward.id, patch, t, allowed, currentId, permissions]);
 
   const ingressNodes = useMemo(
     () => nodes.filter((node) => node.role === "ingress" || node.role === "both"),
@@ -263,7 +354,15 @@ export function ForwardEditDialog({
   }, [bindings, draft.ingressId]);
 
   const saveBlocked =
-    !allowed || saving || empty || hasFormError || preview.kind !== "ready" || conflict !== null;
+    !allowed ||
+    saving ||
+    empty ||
+    hasFormError ||
+    // tls 行缺路径（或路径不合法）时不允许保存：后端候选校验要求成对，发过去只会
+    // 换一个 400（而且 patch 侧目前会静默丢弃，见任务回报的契约缺口）。
+    hasTlsError ||
+    preview.kind !== "ready" ||
+    conflict !== null;
 
   async function save() {
     if (saveBlocked) return;
@@ -302,14 +401,42 @@ export function ForwardEditDialog({
     }
   }
 
+  /**
+   * 影响面文案。
+   *
+   * V5.1b：两条线**只在 stream 上成立**，datagram（udp）必须换成映射语义 ——
+   * 「存量连接被 drain」「旧连接保持」在 udp 上都是错的事实（§6.2：映射按空闲过期，
+   * 没有连接可 drain，目标侧也没有可持有的对象）。措辞的选择由**传输**决定
+   * （`datagram`），不是由协议名字决定，所以将来再加报文协议不需要改这里两次。
+   */
   const impactLines = useMemo(() => {
     if (preview.kind !== "ready") return [];
     const impact = preview.result.impact;
-    if (impact.metadata_only) return [t("forward.impactMetadataOnly")];
+    if (impact.metadata_only) {
+      const lines = [t("forward.impactMetadataOnly")];
+      /**
+       * 后端把「只改了 tls 路径」也判成 metadata_only（`isMetadataOnlyPatch` 只比较
+       * mode/协议/节点/端口/目标，不含两列路径），而 metadata-only 分支只写 `name`：
+       * 该判定下路径既不会落库、也不会下发。这里把这个事实说出来，而不是让用户看着
+       * 「已保存」以为证书换了。条件挂在后端自己的 `metadata_only` 上，所以后端一旦
+       * 把路径纳入比较，这条提示会**自动消失**（不会变成一句常年错误的警告）。
+       */
+      if (
+        patch.tls_cert_path !== undefined ||
+        patch.tls_key_path !== undefined
+      ) {
+        lines.push(t("forward.impactMetadataOnlyTlsPaths"));
+      }
+      return lines;
+    }
     const lines: string[] = [];
     if (impact.changes_external_address) lines.push(t("forward.impactExternalAddress"));
-    if (impact.listener_replacement) lines.push(t("forward.impactListener"));
-    if (impact.target_change && !impact.mode_change) lines.push(t("forward.impactTarget"));
+    if (impact.listener_replacement) {
+      lines.push(datagram ? t("forward.impactListenerDatagram") : t("forward.impactListener"));
+    }
+    if (impact.target_change && !impact.mode_change) {
+      lines.push(datagram ? t("forward.impactTargetDatagram") : t("forward.impactTarget"));
+    }
     if (impact.ingress_node_change) lines.push(t("forward.impactIngress"));
     if (impact.egress_node_change) lines.push(t("forward.impactEgress"));
     if (impact.mode_change) lines.push(t("forward.impactMode"));
@@ -325,7 +452,7 @@ export function ForwardEditDialog({
       );
     }
     return lines;
-  }, [preview, t]);
+  }, [preview, t, datagram, patch]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -364,6 +491,15 @@ export function ForwardEditDialog({
                 maxLength={60}
                 onChange={(event) => setDraft((d) => ({ ...d, name: event.target.value }))}
               />
+            </Field>
+
+            <Field label={t("forward.protocol")} hint={protocolHint}>
+              <div
+                className="flex h-9 items-center rounded-md border border-[var(--border)] bg-[var(--muted)]/40 px-3"
+                data-testid="forward-edit-protocol"
+              >
+                <ForwardProtocolBadge forward={forward} />
+              </div>
             </Field>
 
             <Field label={t("forward.mode")}>
@@ -457,6 +593,66 @@ export function ForwardEditDialog({
                 onChange={(event) => setDraft((d) => ({ ...d, targetPort: event.target.value }))}
               />
             </Field>
+
+            {/*
+              V5-WP5-A1：tls 的证书/私钥路径 —— **可编辑**（后端 patch schema 已接受，
+              规则与创建完全相同：只有 tls 能带、必须成对）。
+              只在 tls 行出现：tcp/ws 携带路径是 400，udp 更没有 TLS 前端可言。
+            */}
+            {isTlsForward ? (
+              <>
+                <Field
+                  label={t("forward.tlsCertPath")}
+                  hint={t("forward.tlsPathsHint")}
+                  error={tlsErrors.tls_cert_path ? t(tlsErrors.tls_cert_path) : undefined}
+                >
+                  <Input
+                    value={draft.tlsCertPath}
+                    maxLength={FORWARD_TLS_PATH_MAX}
+                    placeholder="/etc/tunex/tls/front.crt"
+                    data-testid="forward-tls-cert-path"
+                    required
+                    aria-invalid={tlsErrors.tls_cert_path ? true : undefined}
+                    onChange={(event) =>
+                      setDraft((d) => ({ ...d, tlsCertPath: event.target.value }))
+                    }
+                  />
+                </Field>
+                <Field
+                  label={t("forward.tlsKeyPath")}
+                  error={tlsErrors.tls_key_path ? t(tlsErrors.tls_key_path) : undefined}
+                >
+                  <Input
+                    value={draft.tlsKeyPath}
+                    maxLength={FORWARD_TLS_PATH_MAX}
+                    placeholder="/etc/tunex/tls/front.key"
+                    data-testid="forward-tls-key-path"
+                    required
+                    aria-invalid={tlsErrors.tls_key_path ? true : undefined}
+                    onChange={(event) =>
+                      setDraft((d) => ({ ...d, tlsKeyPath: event.target.value }))
+                    }
+                  />
+                </Field>
+              </>
+            ) : null}
+
+            {/*
+              V5.1b B1：udp 在本版本只开放直连，中继/出口上的 udp 会被运行时拒绝
+              （§6.2 实施边界）。这里是**告警**而不是禁用提交：拒绝的执行点在后端与
+              运行时，面板自己拦下来会让「接口可用、界面不可用」，那是第二份真相。
+            */}
+            {datagramRelayWarningKey ? (
+              <div
+                data-testid="forward-datagram-relay-warning"
+                className="rounded-md border border-[var(--warning,var(--border))]/40 bg-[var(--muted)]/40 p-3 text-xs sm:col-span-2"
+              >
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                  <span>{t(datagramRelayWarningKey)}</span>
+                </div>
+              </div>
+            ) : null}
 
             {/*
               V4-WP9 Binding usage：当前入口节点每条绑定被多少条 Forward 占用，

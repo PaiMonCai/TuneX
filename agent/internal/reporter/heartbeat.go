@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/targetobs"
 )
 
 // Interval is the heartbeat cadence (devmap v0.3: 每 30s 上报一次).
@@ -68,13 +70,13 @@ var ErrAlreadyRunning = errors.New("reporter: already running")
 // Payload is the heartbeat body. Field names match the panel's Node model so
 // the backend can deserialise it directly.
 type Payload struct {
-	AgentID     string                   `json:"agent_id,omitempty"`
-	NodeID      string                   `json:"node_id"`
-	Version     string                   `json:"version"`
-	Role        string                   `json:"role"`
-	Timestamp   int64                    `json:"timestamp"`
-	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
-	EgressPools map[string]EgressPool    `json:"egress_pools,omitempty"`
+	AgentID     string                `json:"agent_id,omitempty"`
+	NodeID      string                `json:"node_id"`
+	Version     string                `json:"version"`
+	Role        string                `json:"role"`
+	Timestamp   int64                 `json:"timestamp"`
+	Tunnels     []ReportedTunnel      `json:"tunnels,omitempty"`
+	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
 }
 
 // StatePayload is the WP7 state-report body (POST /api/internal/node/state).
@@ -84,12 +86,12 @@ type Payload struct {
 // makes a reconnect snapshot possible (devmap §5.5 "节点重启 → 拉取 ACTIVE 隧道"
 // mirrored on the panel side). Shape is owned by services/node-state.ts.
 type StatePayload struct {
-	AgentID     string                   `json:"agent_id,omitempty"`
-	Version     string                   `json:"version,omitempty"`
-	Role        string                   `json:"role,omitempty"`
-	Tunnels     []forwarder.TunnelConfig `json:"tunnels,omitempty"`
-	EgressPools map[string]EgressPool    `json:"egress_pools,omitempty"`
-	UsedPorts   []int                    `json:"used_ports,omitempty"`
+	AgentID     string                `json:"agent_id,omitempty"`
+	Version     string                `json:"version,omitempty"`
+	Role        string                `json:"role,omitempty"`
+	Tunnels     []ReportedTunnel      `json:"tunnels,omitempty"`
+	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
+	UsedPorts   []int                 `json:"used_ports,omitempty"`
 	// Revision is the newest config revision the agent has applied (0 = none).
 	Revision int64  `json:"reported_revision,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
@@ -134,6 +136,72 @@ type StatePayload struct {
 	ControlProtocolVersion int `json:"control_protocol_version,omitempty"`
 	/// Actions this agent actually implements (empty = not configured).
 	Capabilities []string `json:"capabilities,omitempty"`
+	/// V5-WP1 protocol/transport/runtime facts, additive to Capabilities. The
+	/// panel needs it to distinguish "this node can carry this protocol" from
+	/// "this node never told me", without changing the array above.
+	CapabilityManifest *CapabilityManifest `json:"capability_manifest,omitempty"`
+
+	// ── V5.2-WP5 target observation (DEVELOPMENT.md §7) ─────────────────
+	//
+	// The observation facts of the targets THIS node serves, one entry per
+	// (node, target). They ride the existing state report as a new top-level
+	// key: additive only, so an older panel ignores it and keeps working, and
+	// an older agent simply omits it — which the panel must read as "unknown",
+	// never as "everything is healthy" (§7 rows 4/8).
+	//
+	// `observation_age` is deliberately NOT here: age is `now -
+	// last_observed_at` and is derived by the panel when it reads (row 7). A
+	// stored age is already wrong by the time it is written.
+	TargetObservations []targetobs.Observation `json:"target_observations,omitempty"`
+}
+
+// CapabilityManifest is the v2 capability fact set on the wire (V5-WP1).
+//
+// It deliberately mirrors control.Manifest structurally instead of importing
+// it: the reporter must stay free of control-plane packages, and the wire shape
+// is a frozen contract that the panel validates field by field anyway. The
+// conversion lives in one place (control → reporter) at the wiring site.
+type CapabilityManifest struct {
+	SchemaVersion int      `json:"schema_version"`
+	Protocols     []string `json:"protocols"`
+	Transports    []string `json:"transports"`
+	Runtime       []string `json:"runtime"`
+	Diagnostics   []string `json:"diagnostics"`
+}
+
+// ReportedTunnel is one running tunnel as it travels on the state report: the
+// configuration it was applied with, plus the protocol-specific diagnostics of
+// the runtime that is actually serving it (V5-WP5-A3).
+//
+// The config is EMBEDDED, so the JSON is byte-for-byte what it was before this
+// field existed — an older panel reads exactly the shape it always did, and the
+// diagnostics are simply absent. That is the same additive rule every other
+// control-protocol change in V5 followed.
+type ReportedTunnel struct {
+	forwarder.TunnelConfig
+	// Diag is present only when the tunnel's protocol HAS protocol-specific
+	// facts. A tcp tunnel carries none, which is different from carrying zeroes.
+	Diag *forwarder.ProtocolDiagnostics `json:"diag,omitempty"`
+}
+
+// DiagnosticsLister reports per-tunnel protocol diagnostics by tunnel id.
+//
+// An interface rather than a concrete manager, like every other source the
+// reporter reads: the reporter must not import the manager.
+type DiagnosticsLister interface {
+	DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagnostics
+}
+
+// TargetObservationLister reports the V5.2-WP5 observation facts of the targets
+// this node serves.
+//
+// It is an interface for the same decoupling reason as DiagnosticsLister: the
+// reporter reads facts, it does not know who produced them (today
+// internal/targetobs, which owns the probing and the success-rate window). A nil
+// source means this agent reports no observations at all, and the wire key is
+// simply absent.
+type TargetObservationLister interface {
+	TargetObservations() []targetobs.Observation
 }
 
 // HostSample is the on-the-wire resource sample. Field names are explicit about
@@ -217,6 +285,91 @@ func WithProtocol(version int, capabilities []string) Option {
 	}
 }
 
+// WithDiagnostics attaches the source of per-tunnel protocol diagnostics
+// (V5-WP5-A3). Omitted = the report carries no diagnostics at all, which is what
+// an agent without any protocol front should send.
+func WithDiagnostics(lister DiagnosticsLister) Option {
+	return func(c *Config) { c.diagnostics = lister }
+}
+
+// LeaseSink receives the ownership facts a state report's answer carries
+// (V5.3-WP9). Implemented by the ownership guard; declared here so the reporter
+// never imports the enforcement side.
+//
+// ObserveLeases is called on the reporting goroutine and must not block: the
+// reporter's tick is not allowed to depend on the lease clock's speed.
+type LeaseSink interface {
+	ObserveLeases(leases []LeaseRenewal, at time.Time)
+}
+
+// WithLeases attaches the lease sink that consumes the state report's answer.
+// Omitted = the answer's `leases` are ignored, which is the pre-V5.3 behaviour.
+func WithLeases(sink LeaseSink) Option {
+	return func(c *Config) { c.leases = sink }
+}
+
+// WithTargetObservations attaches the V5.2-WP5 target observer. Omitted = the
+// report carries no `target_observations` key, which the panel reads as
+// "unknown", exactly like an older agent.
+//
+// The observer result is copied into the payload rather than referenced, so a
+// serialising report can never reach back into the observer's state (same rule
+// as Capabilities/Manifest above).
+func WithTargetObservations(lister TargetObservationLister) Option {
+	return func(c *Config) { c.targetObs = lister }
+}
+
+// reportedTunnels merges the running configs with their protocol diagnostics.
+func (r *Reporter) reportedTunnels() []ReportedTunnel {
+	configs := r.cfg.tunnels.List()
+	out := make([]ReportedTunnel, 0, len(configs))
+	var diags map[string]forwarder.ProtocolDiagnostics
+	if r.cfg.diagnostics != nil {
+		diags = r.cfg.diagnostics.DiagnosticsByTunnel()
+	}
+	for _, cfg := range configs {
+		entry := ReportedTunnel{TunnelConfig: cfg}
+		if diag, ok := diags[cfg.ID]; ok {
+			copied := diag
+			entry.Diag = &copied
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// configsOf projects the reported tunnels back to plain configs for the runtime
+// census, so CountRuntimes keeps describing the same fact it always did.
+func configsOf(tunnels []ReportedTunnel) []forwarder.TunnelConfig {
+	out := make([]forwarder.TunnelConfig, 0, len(tunnels))
+	for _, t := range tunnels {
+		out = append(out, t.TunnelConfig)
+	}
+	return out
+}
+
+// WithManifest advertises the V5-WP1 capability manifest (protocols,
+// transports, runtime features, diagnostics).
+//
+// A nil manifest is stored as "not configured" and the field stays off the wire
+// — which the panel reads as the V4 baseline, not as "supports nothing". Passing
+// an empty manifest is different and meaningful: it says this agent implements
+// nothing beyond the protocol-frozen baseline, and the panel will fail closed.
+func WithManifest(manifest *CapabilityManifest) Option {
+	return func(c *Config) {
+		if manifest == nil {
+			c.capabilityManifest = nil
+			return
+		}
+		copied := *manifest
+		copied.Protocols = append([]string(nil), manifest.Protocols...)
+		copied.Transports = append([]string(nil), manifest.Transports...)
+		copied.Runtime = append([]string(nil), manifest.Runtime...)
+		copied.Diagnostics = append([]string(nil), manifest.Diagnostics...)
+		c.capabilityManifest = &copied
+	}
+}
+
 // Reporter periodically reports the node's heartbeat.
 type Reporter struct {
 	cfg Config
@@ -248,6 +401,23 @@ type Config struct {
 	// reporter does not have to import the control package.
 	controlPortocolVersion int
 	capabilities           []string
+	// V5-WP1: the additive v2 manifest. nil = this build does not advertise one,
+	// and the wire field is omitted rather than sent empty.
+	capabilityManifest *CapabilityManifest
+
+	// V5-WP5-A3: per-tunnel protocol diagnostics. nil = this agent reports none.
+	diagnostics DiagnosticsLister
+
+	// V5.2-WP5: the target observer's facts. nil = this agent does not observe
+	// targets (or has nothing to observe), and `target_observations` stays off
+	// the wire rather than being sent as an empty array that would read as
+	// "no problems found".
+	targetObs TargetObservationLister
+
+	// V5.3-WP9: the ownership facts the panel returns in the state report's
+	// answer. nil = this node tracks no leases (nothing to renew, nothing to
+	// expire) — which is also how it behaves with an older panel.
+	leases LeaseSink
 
 	// ── V4-WP6 telemetry sources (all optional) ──
 	//
@@ -263,8 +433,11 @@ type Config struct {
 	revisions *RevisionState
 	startedAt time.Time
 
-	// post overrides the HTTP call (tests). Defaults to httpPost.
-	post func(ctx context.Context, url string, body []byte, headers map[string]string) error
+	// post overrides the HTTP call (tests). Defaults to httpPost. It returns the
+	// panel's response body: the V5.3-WP9 lease renewal rides the state report's
+	// own answer, and a transport that threw it away would make every tunnel
+	// self-stop one TTL after its config (see sendState).
+	post func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error)
 	// now overrides time.Now (tests).
 	now func() time.Time
 }
@@ -295,7 +468,23 @@ func WithEgress(e EgressLister) Option { return func(c *Config) { c.egress = e }
 
 // WithPost replaces the HTTP transport (tests). The headers map carries the
 // credential for the state report; the legacy heartbeat sends nil headers.
+//
+// It is the error-only shape, so a test that does not care about the panel's
+// answer keeps working unchanged; the body it discards is what
+// WithPostResponse exists for.
 func WithPost(fn func(ctx context.Context, url string, body []byte, headers map[string]string) error) Option {
+	return func(c *Config) {
+		c.post = func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
+			return nil, fn(ctx, url, body, headers)
+		}
+	}
+}
+
+// WithPostResponse replaces the HTTP transport with the shape that can also read
+// what the panel answered. The state report's response carries the ownership
+// leases this node may keep serving under (V5.3 WP9), so discarding bodies is
+// no longer equivalent to ignoring them.
+func WithPostResponse(fn func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error)) Option {
 	return func(c *Config) { c.post = fn }
 }
 
@@ -364,7 +553,7 @@ func (r *Reporter) Payload() Payload {
 		Timestamp: r.cfg.now().Unix(),
 	}
 	if r.cfg.tunnels != nil {
-		p.Tunnels = r.cfg.tunnels.List()
+		p.Tunnels = r.reportedTunnels()
 	}
 	if r.cfg.egress != nil {
 		p.EgressPools = r.cfg.egress.Snapshot()
@@ -391,9 +580,19 @@ func (r *Reporter) StatePayload() StatePayload {
 	if len(r.cfg.capabilities) > 0 {
 		p.Capabilities = append([]string(nil), r.cfg.capabilities...)
 	}
+	if r.cfg.capabilityManifest != nil {
+		// Copied per payload: a state report must not be able to mutate the
+		// reporter's own manifest (same rule as Capabilities above).
+		m := *r.cfg.capabilityManifest
+		m.Protocols = append([]string(nil), r.cfg.capabilityManifest.Protocols...)
+		m.Transports = append([]string(nil), r.cfg.capabilityManifest.Transports...)
+		m.Runtime = append([]string(nil), r.cfg.capabilityManifest.Runtime...)
+		m.Diagnostics = append([]string(nil), r.cfg.capabilityManifest.Diagnostics...)
+		p.CapabilityManifest = &m
+	}
 	if r.cfg.tunnels != nil {
-		p.Tunnels = r.cfg.tunnels.List()
-		counts := CountRuntimes(p.Tunnels)
+		p.Tunnels = r.reportedTunnels()
+		counts := CountRuntimes(configsOf(p.Tunnels))
 		p.Runtimes = &counts
 	}
 	if r.cfg.egress != nil {
@@ -408,8 +607,26 @@ func (r *Reporter) StatePayload() StatePayload {
 	if r.cfg.lastErr != nil {
 		p.LastErr = r.cfg.lastErr.LastError()
 	}
+	// V5.2-WP5: the observer's facts are pulled, never pushed. Reading them
+	// cannot fail and cannot block on a probe (the observer's state is an
+	// in-memory snapshot), so a broken target, a slow target or a broken
+	// observer can never keep the report — or the node — from being sent.
+	if r.cfg.targetObs != nil {
+		p.TargetObservations = copyObservations(r.cfg.targetObs.TargetObservations())
+	}
 	r.fillTelemetry(&p)
 	return p
+}
+
+// copyObservations hands the payload its own slice. Observations are values, so
+// a shallow copy is a full copy; what this prevents is the payload keeping a
+// reference to the observer's internal slice, which the next cycle would then
+// mutate while the report is being serialised.
+func copyObservations(in []targetobs.Observation) []targetobs.Observation {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]targetobs.Observation(nil), in...)
 }
 
 // fillTelemetry adds the V4-WP6 facts (§13.4.4). Everything here is derived
@@ -533,7 +750,9 @@ func (r *Reporter) send(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	_ = r.cfg.post(ctx, r.Endpoint(), body, nil)
+	// The legacy heartbeat has no response contract: whatever comes back is
+	// ignored, exactly as before.
+	_, _ = r.cfg.post(ctx, r.Endpoint(), body, nil)
 }
 
 // sendState posts one WP7 state report (best effort, same reasoning as send).
@@ -552,13 +771,93 @@ func (r *Reporter) sendState(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	err = r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
 	if isCredentialRejected(err) {
 		logx.Warn("state report rejected: node credential is invalid or revoked",
 			"node_id", r.cfg.NodeID)
 	}
+	if err == nil {
+		r.deliverLeases(answer)
+	}
+}
+
+// deliverLeases hands the ownership facts a state report's answer carries to the
+// lease sink. It NEVER fails the report and never invents facts: an absent key,
+// an empty list and an unparseable body all mean "the panel told us nothing
+// about ownership", which is exactly how an older panel behaves.
+//
+// This is the renewal channel V5.3 WP9 depends on (see WithLeases): the panel
+// extends the lease row when a node reports it still serves a tunnel, and the
+// refreshed deadline must come BACK, or a healthy node stops every tunnel one
+// TTL after its last config.
+func (r *Reporter) deliverLeases(raw []byte) {
+	if r.cfg.leases == nil || len(raw) == 0 {
+		return
+	}
+	leases, present := decodeLeaseAnswer(raw)
+	if !present {
+		return
+	}
+	r.cfg.leases.ObserveLeases(leases, r.cfg.now())
+}
+
+// stateAnswer is the state report's response envelope. Only the ownership part
+// is decoded; every other field belongs to other packages.
+type stateAnswer struct {
+	Data *struct {
+		Leases *[]json.RawMessage `json:"leases"`
+	} `json:"data"`
+}
+
+// LeaseRenewal is one ownership fact the panel returned: "you may keep serving
+// this tunnel until LeaseExpiresAt, at generation Epoch".
+//
+// TunnelRef is the panel's lease key (the database tunnel id). The agent names
+// its tunnels with strings, so joining the two is the consumer's job — the
+// reporter only carries the fact faithfully.
+type LeaseRenewal struct {
+	TunnelRef int64  `json:"tunnel_id"`
+	Epoch     int64  `json:"epoch"`
+	ExpiresAt string `json:"lease_expires_at"`
+	Revision  int64  `json:"revision"`
+}
+
+// decodeLeaseAnswer extracts the lease list, tolerating the shapes a deployment
+// can actually produce:
+//
+//   - no `data.leases` key at all -> (nil, false): an older panel, nothing said;
+//   - `"leases": []`             -> (empty, true): "no ownership information",
+//     which the sink treats exactly like silence (it extends nothing);
+//   - individual bad entries     -> skipped, the rest are delivered. A lease row
+//     is evidence about one tunnel; one unreadable row must not blind the node
+//     to the other transitions in the same answer.
+func decodeLeaseAnswer(raw []byte) ([]LeaseRenewal, bool) {
+	var answer stateAnswer
+	if err := json.Unmarshal(raw, &answer); err != nil {
+		logx.Debug("state report answer was not JSON; ownership facts unavailable",
+			"err", err.Error())
+		return nil, false
+	}
+	if answer.Data == nil || answer.Data.Leases == nil {
+		return nil, false
+	}
+	entries := *answer.Data.Leases
+	out := make([]LeaseRenewal, 0, len(entries))
+	for _, entry := range entries {
+		var lease LeaseRenewal
+		if err := json.Unmarshal(entry, &lease); err != nil {
+			logx.Debug("skipping unreadable lease statement in the state report answer",
+				"err", err.Error())
+			continue
+		}
+		if lease.TunnelRef <= 0 || strings.TrimSpace(lease.ExpiresAt) == "" {
+			continue
+		}
+		out = append(out, lease)
+	}
+	return out, true
 }
 
 // errRejected is returned by the post hook when the panel answers 401/403.
@@ -584,9 +883,16 @@ func (r *Reporter) ReportOnce(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	return r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
+	if err == nil {
+		// The closing report renews the leases as much as any other one: a node
+		// that is draining still owns what it serves, and its last statement
+		// should not be the one that skips the answer.
+		r.deliverLeases(answer)
+	}
+	return err
 }
 
 // Stop makes a running Run return. Safe before/after Run and more than once.
@@ -606,10 +912,10 @@ func (r *Reporter) Stop() {
 //
 // headers is nil for the legacy heartbeat and carries Authorization for the
 // state report; the credential value is never included in the error text.
-func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) error {
+func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
@@ -617,14 +923,28 @@ func httpPost(ctx context.Context, url string, body []byte, headers map[string]s
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("heartbeat post %s: %w", url, err)
+		return nil, fmt.Errorf("heartbeat post %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			return fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
+			return nil, fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
 		}
-		return fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
 	}
-	return nil
+	// Bounded read: the answer carries lease facts, not a document. A panel that
+	// streams megabytes at the agent must not be able to grow its heap.
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, MaxAnswerBytes))
+	if err != nil {
+		// The report itself was accepted; only the answer was lost. That is not
+		// a failed report (the DB write already happened), so report success.
+		logx.Debug("state report answer could not be read", "err", err.Error())
+		return nil, nil
+	}
+	return answer, nil
 }
+
+// MaxAnswerBytes bounds the state report's response body. The lease list is a
+// few dozen bytes per tunnel the node serves; anything beyond this is a
+// misbehaving or hostile panel.
+const MaxAnswerBytes = 1 << 20

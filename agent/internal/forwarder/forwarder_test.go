@@ -259,9 +259,24 @@ func TestTunnelConfigValidateModes(t *testing.T) {
 		c.IngressPort = 30000
 		c.RemoteHost = "10.0.0.1"
 		c.RemotePort = 443
-		c.Protocol = "udp"
+		// V5.1b made "udp" a supported protocol, so it can no longer stand in for
+		// "a protocol this binary does not implement". The assertion is unchanged
+		// — an unimplemented protocol must not silently run over TCP.
+		c.Protocol = "quic"
 		if err := c.Validate(); err == nil {
-			t.Fatal("UDP must not silently run over TCP")
+			t.Fatal("an unimplemented protocol must not silently run over TCP")
+		}
+	})
+
+	t.Run("udp direct accepted by Validate", func(t *testing.T) {
+		c := base()
+		c.Mode = ModeDirect
+		c.IngressPort = 30000
+		c.RemoteHost = "10.0.0.1"
+		c.RemotePort = 3040
+		c.Protocol = "udp"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("udp DIRECT must validate since V5.1b: %v", err)
 		}
 	})
 

@@ -176,7 +176,7 @@ func (m *TunnelManager) HotSwapUpstream(id, addr string) error {
 		// node that is supposed to be going away.
 		return ErrNodeShuttingDown
 	}
-	if err := e.fwd.SetUpstream(clean); err != nil {
+	if err := retargetRuntime(e.cfg, e.fwd, clean); err != nil {
 		return errHotSwapRejected(id, err)
 	}
 	return nil
@@ -203,7 +203,7 @@ func (m *TunnelManager) DrainTunnel(id string, timeout time.Duration) error {
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrTunnelNotFound, id)
 	}
-	return e.fwd.Drain(timeout)
+	return drainRuntime(e.fwd, timeout)
 }
 
 // ReplaceListener applies cfg with the revision rules and honours the
@@ -233,7 +233,7 @@ func (m *TunnelManager) DrainTunnel(id string, timeout time.Duration) error {
 // It is the one entry point both apply surfaces use (control.execute's
 // apply_tunnel and the admin API's POST /tunnel), so the routing cannot
 // differ between them.
-func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	before := m.fingerprint()
 	fwd, err := m.replaceListenerInner(cfg)
 	if err == nil {
@@ -242,7 +242,13 @@ func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.F
 	return fwd, err
 }
 
-func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	// V5.3 WP9: same gate as applyInner, for the same reason. This is the entry
+	// the control plane actually uses for a listener change, so a fence that only
+	// covered Apply would be a fence production never passes through.
+	if err := m.admitOwnership(cfg); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -319,16 +325,29 @@ func (m *TunnelManager) ingressModeSiblingLocked(id string) (string, *entry, boo
 
 // adoptIngressModeSiblingLocked performs DIRECT <-> RELAY for one business
 // Forward even though the wire resource id changes. Same-port mode switches
-// keep the exact same SingleHop forwarder/listener and only swap upstream +
-// registry key; moved-port switches bind the new listener first, then drain
-// the old sibling with the same ordering as replaceListenerLocked.
+// keep the exact same forwarder/listener and only swap upstream + registry key;
+// moved-port switches bind the new listener first, then drain the old sibling
+// with the same ordering as replaceListenerLocked; and a switch that also
+// changes the listener's TRANSPORT (udp DIRECT <-> tcp RELAY) is replaced, since
+// a retarget cannot turn one kind of socket into the other.
 func (m *TunnelManager) adoptIngressModeSiblingLocked(
 	oldID string,
 	old *entry,
 	cfg forwarder.TunnelConfig,
-) (forwarder.Forwarder, error) {
+) (forwarder.Runtime, error) {
 	if old.cfg.ListenPort() == cfg.ListenPort() {
-		if err := old.fwd.SetUpstream(cfg.UpstreamAddr()); err != nil {
+		transportsDiffer, err := transportChange(old.cfg, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if transportsDiffer {
+			// The wire resource id changed AND the listener's transport changed
+			// (udp DIRECT <-> tcp RELAY are the two shapes one Forward takes).
+			// "Swap the upstream" cannot turn a UDP socket into a TCP one, so the
+			// one runtime is replaced rather than retargeted.
+			return m.replaceSiblingTransportLocked(oldID, old, cfg)
+		}
+		if err := retargetRuntime(old.cfg, old.fwd, cfg.UpstreamAddr()); err != nil {
 			return nil, fmt.Errorf("manager: mode switch upstream swap refused: %w", err)
 		}
 		delete(m.tunnels, oldID)
@@ -362,11 +381,113 @@ func (m *TunnelManager) adoptIngressModeSiblingLocked(
 	return fwd, nil
 }
 
+// replaceSiblingTransportLocked replaces one Forward's listener with one of a
+// different TRANSPORT on the SAME port number.
+//
+// Unlike a target swap or a mode switch inside one transport, this cannot be
+// absorbed by the running runtime: the socket kind itself changes, and §5.2
+// freezes one-number-one-binding on this node, so the old runtime must be gone
+// before the new one binds. That is a momentary outage for this Forward — the
+// honest price of changing what its listener IS.
+//
+// The new runtime is BUILT before the old one is touched, so an unusable config
+// (a bad certificate, an unimplemented protocol) fails without an outage. If the
+// new listener then fails to bind, no registry entry is left claiming a tunnel
+// that is not running: the caller gets the bind error, and the panel's next
+// reconcile rebuilds from its own desired state. Caller must hold m.mu.
+func (m *TunnelManager) replaceSiblingTransportLocked(
+	oldID string,
+	old *entry,
+	cfg forwarder.TunnelConfig,
+) (forwarder.Runtime, error) {
+	fwd, err := m.buildLocked(cfg)
+	if err != nil {
+		return nil, err
+	}
+	m.attachLedger(cfg, fwd)
+
+	_ = old.fwd.Stop()
+	m.releasePortLocked(old.cfg)
+	delete(m.tunnels, oldID)
+
+	if err := fwd.Start(); err != nil {
+		m.releasePortLocked(cfg)
+		return nil, err
+	}
+	m.markPortUsedLocked(cfg)
+	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
+	logx.Info("tunnel ingress transport replaced",
+		"old_id", oldID, "id", cfg.ID, "mode", string(cfg.Mode),
+		"port", cfg.ListenPort(), "revision", cfg.Revision)
+	return fwd, nil
+}
+
+// transportChange reports whether cfg is carried by a different transport than
+// running. A config whose protocol this binary cannot resolve is an error rather
+// than "no change": treating an unknown protocol as the same transport would
+// install a config whose runtime does not exist.
+func transportChange(running, cfg forwarder.TunnelConfig) (bool, error) {
+	from, err := forwarder.ResolveRuntimeTarget(running)
+	if err != nil {
+		return false, err
+	}
+	to, err := forwarder.ResolveRuntimeTarget(cfg)
+	if err != nil {
+		return false, err
+	}
+	return from.Transport != to.Transport, nil
+}
+
+// retargetRuntime moves where a RUNNING runtime sends its new work, without
+// touching its listener and without rewriting work already in flight.
+//
+// The dispatch is by the runtime's own kind, asked through the contract it
+// implements — never by a switch on the protocol name. A stream runtime answers
+// SetUpstream (live connections keep their upstream); a datagram runtime answers
+// Retarget (live mappings keep their target). Asking the wrong one is answered
+// with ErrUpstreamNotSwappable, which the callers treat as "this needs a rebuild"
+// rather than as a failure of the tunnel.
+func retargetRuntime(cfg forwarder.TunnelConfig, fwd forwarder.Runtime, addr string) error {
+	target, err := forwarder.ResolveRuntimeTarget(cfg)
+	if err != nil {
+		return err
+	}
+	if target.Transport == forwarder.TransportDatagram {
+		d, ok := fwd.(forwarder.DatagramRuntime)
+		if !ok {
+			return forwarder.ErrUpstreamNotSwappable
+		}
+		return d.Retarget(addr)
+	}
+	stream, ok := fwd.(forwarder.StreamRuntime)
+	if !ok {
+		return forwarder.ErrUpstreamNotSwappable
+	}
+	return stream.SetUpstream(addr)
+}
+
+// drainRuntime stops a runtime taking new work and waits, bounded, for what is
+// already in flight. It is the transport-agnostic form of the two drain
+// primitives: Drain for connections, DrainMappings for datagram mappings. Both
+// keep the listener bound — a rolled-out tunnel keeps its port reserved — and
+// both are irreversible.
+func drainRuntime(fwd forwarder.Runtime, timeout time.Duration) error {
+	if d, ok := fwd.(forwarder.DatagramRuntime); ok {
+		return d.DrainMappings(timeout)
+	}
+	if stream, ok := fwd.(forwarder.StreamRuntime); ok {
+		return stream.Drain(timeout)
+	}
+	// Unreachable for a runtime this manager built. Returning an error (rather
+	// than nil) keeps a caller from reading "drained" out of a no-op.
+	return fmt.Errorf("manager: runtime %T has no drain primitive", fwd)
+}
+
 // applyRoutedLocked sends one (revision-gated) config through the primitive
 // its plan names. It is the single routing point in the manager, so the
 // control-plane command path and the admin API cannot disagree about what a
 // change means. Caller must hold m.mu.
-func (m *TunnelManager) applyRoutedLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) applyRoutedLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	// A first-ever apply has no running instance to classify against: a diff
 	// against a zero config always looks like a listener move. Take Apply's
 	// path, which also runs the port-guard check a fresh bind needs.
@@ -396,16 +517,29 @@ func (m *TunnelManager) applyRoutedLocked(cfg forwarder.TunnelConfig) (forwarder
 // upstream that is not one swappable address). It falls back to Apply's
 // rebuild rather than failing the command and stranding the node on a config
 // the panel does not believe in — the one path that costs live connections.
-func (m *TunnelManager) hotSwapUpstreamLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) hotSwapUpstreamLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	e, ok := m.tunnels[cfg.ID]
 	if !ok {
 		return m.applyLocked(cfg)
 	}
-	if err := e.fwd.SetUpstream(cfg.UpstreamAddr()); err != nil {
-		// Only a forwarder whose upstream is not one swappable address
-		// lands here. Failing the command would strand the node on a
-		// stale config, so rebuild and say so in the log: this is the one
-		// path that costs live connections.
+	// A protocol change on the same port is not a target swap: the listener's
+	// transport changes with the protocol, and only a rebuild can produce the
+	// other kind of socket. Falling back to Apply's path is what keeps the
+	// registry from describing, say, a UDP socket as running a TCP config.
+	targetsDiffer, err := transportChange(e.cfg, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if targetsDiffer {
+		logx.Info("tunnel listener transport changed, rebuilding",
+			"id", cfg.ID, "port", cfg.ListenPort(), "revision", cfg.Revision)
+		return m.applyLocked(cfg)
+	}
+	if err := retargetRuntime(e.cfg, e.fwd, cfg.UpstreamAddr()); err != nil {
+		// Only a runtime whose upstream is not one swappable address lands
+		// here. Failing the command would strand the node on a stale config,
+		// so rebuild and say so in the log: this is the one path that costs
+		// live work.
 		logx.Warn("tunnel upstream swap refused, rebuilding",
 			"id", cfg.ID, "err", err.Error())
 		return m.applyLocked(cfg)
@@ -431,7 +565,7 @@ func (m *TunnelManager) hotSwapUpstreamLocked(cfg forwarder.TunnelConfig) (forwa
 // A bind failure returns with the old entry still registered and its port
 // still reserved, which is exactly "PREPARE failed, the old applied revision
 // keeps running".
-func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	old, hadOld := m.tunnels[cfg.ID]
 
 	fwd, err := m.buildLocked(cfg)
@@ -478,7 +612,7 @@ func oldPortOf(e *entry, ok bool) int {
 // ReplaceListener can share the exact same build/attach/start/port/stop
 // sequence without duplicating it. Caller must hold m.mu and have already
 // passed the revision gate.
-func (m *TunnelManager) applyLocked(cfg forwarder.TunnelConfig) (forwarder.Forwarder, error) {
+func (m *TunnelManager) applyLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	fwd, err := m.buildLocked(cfg)
 	if err != nil {
 		return nil, err
@@ -534,7 +668,7 @@ func (m *TunnelManager) DrainAllTunnels(timeout time.Duration) []string {
 		wg.Add(1)
 		go func(e *entry) {
 			defer wg.Done()
-			_ = e.fwd.Drain(timeout)
+			_ = drainRuntime(e.fwd, timeout)
 		}(e)
 	}
 	wg.Wait()
@@ -598,11 +732,11 @@ func normalizeUpstream(addr string) (string, error) {
 // compile-time proof that the manager still satisfies what the API layer and
 // the control loop need.
 var _ interface {
-	Apply(forwarder.TunnelConfig) (forwarder.Forwarder, error)
+	Apply(forwarder.TunnelConfig) (forwarder.Runtime, error)
 	Remove(string) error
 	Get(string) (forwarder.TunnelConfig, bool)
 	List() []forwarder.TunnelConfig
 	HotSwapUpstream(string, string) error
-	ReplaceListener(forwarder.TunnelConfig) (forwarder.Forwarder, error)
+	ReplaceListener(forwarder.TunnelConfig) (forwarder.Runtime, error)
 	DrainTunnel(string, time.Duration) error
 } = (*TunnelManager)(nil)

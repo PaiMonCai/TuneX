@@ -64,6 +64,45 @@ type tunnelPayload struct {
 	SpeedLimit int64  `json:"speed_limit"`
 	Revision   int64  `json:"revision"`
 	ListenHost string `json:"listen_host"`
+	// V5-WP5-A1: the tls front's paths. They MUST be decoded here: this payload
+	// is the desired-state snapshot an Agent pulls after every restart, and a
+	// decoder that drops them turns a working tls Forward into an unbuildable
+	// one — V5-G1A.8 caught exactly that (the listener never came back after a
+	// node restart while create and hot reload were fine).
+	TLSCertPath string `json:"tls_cert_path"`
+	TLSKeyPath  string `json:"tls_key_path"`
+	// V5.3 WP9: the ownership facts. They MUST be decoded here for the fourth
+	// time in V5's history (protocol, tls paths, health, now ownership): this
+	// payload is what an Agent rebuilds from after every restart, and a decoder
+	// that drops the epoch resets the "highest seen" to nothing — so a demoted
+	// node that restarts during a partition would happily serve again. The
+	// deadline matters just as much: without it a restored tunnel has no lease
+	// clock and would keep serving past the authorisation the panel granted.
+	//
+	// Absent means "the panel sent no ownership information" (an older panel),
+	// and the agent then behaves exactly as it did before V5.3.
+	OwnershipEpoch int64  `json:"ownership_epoch"`
+	LeaseExpiresAt string `json:"lease_expires_at"`
+
+	// V5.2 WP7: the health facts that travel with the desired targets.
+	//
+	// They MUST be decoded here, and this is the third time in V5 that a new fact
+	// needed adding on a second path (the protocol, then the tls paths, now health):
+	// this payload is what an Agent rebuilds from after every restart, so a decoder
+	// that drops the field turns a working circuit breaker into a silent 50/50 split
+	// onto a target the panel already called unhealthy — which is precisely what
+	// V5-G2 measured before this line existed.
+	TargetHealth []targetHealthPayload `json:"target_health"`
+}
+
+// targetHealthPayload is one entry of the parallel health array.
+type targetHealthPayload struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	State     string `json:"state"`
+	LatencyMS *int64 `json:"latency_ms"`
+	AgeMS     *int64 `json:"age_ms"`
+	Evidence  bool   `json:"evidence"`
 }
 
 // FetchSnapshot implements Source with the strict classification above.

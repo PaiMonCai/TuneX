@@ -52,9 +52,15 @@ const BASE_CONFIG: ForwardCandidateConfig = {
   protocol: "tcp",
   ingress_node_id: 11,
   egress_node_id: null,
+  // V5.4：中间跳也是候选的一部分（与 tls 路径同理）—— 单跳的规范 fixture 里它是 null。
+  middle_node_id: null,
   listen_port: 19001,
   target_host: "10.0.0.10",
   target_port: 8080,
+  // V5-WP5-A1: the tls paths are part of the candidate like the protocol, so the
+  // canonical direct/tcp fixture carries them as null.
+  tls_cert_path: null,
+  tls_key_path: null,
 };
 
 /** 一条「当前 desired」的 tunnel 行投影（存量行形态：无 snapshot）。 */
@@ -140,6 +146,34 @@ describe("A. 合并得到完整候选 config（§13.3.3）", () => {
     expect(currentDesiredConfig(row())).toEqual(BASE_CONFIG);
   });
 
+  /**
+   * V5-WP5-A1：路径与协议同属"期望配置"，因此可合并；未提交时必须**沿用**
+   * 当前值（合并语义），否则一次改名就会把证书路径清空。
+   */
+  test("A4b. tls 路径可合并，未提交时沿用当前值", () => {
+    const tlsBase: ForwardCandidateConfig = {
+      ...BASE_CONFIG,
+      protocol: "tls",
+      tls_cert_path: "/etc/tunex/tls/site.crt",
+      tls_key_path: "/etc/tunex/tls/site.key",
+    };
+    expect(mergeForwardCandidate(tlsBase, { target_port: 8081 })).toMatchObject({
+      tls_cert_path: "/etc/tunex/tls/site.crt",
+      tls_key_path: "/etc/tunex/tls/site.key",
+    });
+    expect(
+      mergeForwardCandidate(tlsBase, { tls_cert_path: "/etc/tunex/tls/new.crt" }),
+    ).toMatchObject({
+      tls_cert_path: "/etc/tunex/tls/new.crt",
+      tls_key_path: "/etc/tunex/tls/site.key",
+    });
+  });
+
+  test("A4c. 改协议不是 metadata-only，必须触发 runtime 收敛", () => {
+    const tlsBase: ForwardCandidateConfig = { ...BASE_CONFIG, protocol: "tls" };
+    expect(isMetadataOnlyPatch(BASE_CONFIG, tlsBase)).toBe(false);
+  });
+
   test("A5. 改名是唯一的纯 metadata 修改", () => {
     const merged = mergeForwardCandidate(BASE_CONFIG, { name: "renamed" });
     expect(merged.name).toBe("renamed");
@@ -157,9 +191,12 @@ describe("B. 校验规则", () => {
   });
 
   test("B1b. legacy TunnelType 中存在的未开放协议仍 fail-closed", () => {
+    // `mtcp` is in the legacy enum and is NOT a product protocol; the example has
+    // to be a protocol whose Gate has not run (`udp` was this example until
+    // V5.1b opened it).
     const v = validateForwardCandidate({
       ...BASE_CONFIG,
-      protocol: "udp" as never,
+      protocol: "mtcp" as never,
     });
     expect(v.ok).toBe(false);
     expect(v.reasons).toContain("invalid_protocol");
@@ -416,11 +453,19 @@ describe("F. snapshot 契约形状", () => {
       "egress_node_id",
       "ingress_node_id",
       "listen_port",
+      // V5.4：中间跳是运行时放置事实（谁承载这条路由），因此与入出口一样属于不可变
+      // runtime snapshot —— 少了它，重放出来的路由会与被批准的那一条不同。
+      "middle_node_id",
       "mode",
       "name",
       "protocol",
       "target_host",
       "target_port",
+      // V5-WP5-A1：tls 前端的路径与 protocol 同属运行态配置，因此必须进入
+      // 不可变 runtime snapshot —— 少了它们，revision 里就没有证书这一维，
+      // 重放出来的配置会与被批准的那一份不同。
+      "tls_cert_path",
+      "tls_key_path",
     ]);
   });
 
@@ -522,5 +567,113 @@ describe("G. applied baseline snapshot", () => {
     expect(res).toBeNull();
     expect(f.snapshots).toHaveLength(0);
     expect(f.tunnel.desired_revision_id).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* V5.1b B1：datagram 边界与 tls 路径的"改动分类"                        */
+/* ------------------------------------------------------------------ */
+
+describe("V5.1b：udp 是 DIRECT-only，且 tls 路径属于运行态配置", () => {
+  const udpDirect: ForwardCandidateConfig = {
+    ...BASE_CONFIG,
+    protocol: "udp",
+  };
+
+  test("udp + DIRECT 通过纯校验", () => {
+    expect(validateForwardCandidate(udpDirect)).toMatchObject({ ok: true });
+  });
+
+  test("udp + RELAY 被拒，并且是一个可解释的原因码", () => {
+    const v = validateForwardCandidate({
+      ...udpDirect,
+      mode: "relay",
+      egress_node_id: 22,
+      target_host: null,
+      target_port: null,
+    });
+    expect(v.ok).toBe(false);
+    // 跨节点跳的形态是**未冻结的产品决策**（DEVELOPMENT.md §6.2 §9.1），所以面板在
+    // 纯校验层就拒绝，而不是让 Agent 成为唯一说"不行"的地方 —— 只在一层设防的边界
+    // 会被下一个调用方绕过，而界面必须能依赖校验结果，而不是靠自己的警告。
+    expect(v.reasons).toContain("datagram_relay_unsupported");
+  });
+
+  test("非 tls 携带证书路径：create / preview / patch 得到同一个原因", () => {
+    const v = validateForwardCandidate({
+      ...BASE_CONFIG,
+      tls_cert_path: "/etc/tunex/tls/a.crt",
+      tls_key_path: "/etc/tunex/tls/a.key",
+    });
+    expect(v.ok).toBe(false);
+    expect(v.reasons).toContain("tls_paths_invalid");
+    expect(v.errors.join(" ")).toContain("只有 tls");
+  });
+
+  test("tls 缺一个路径同样被拒（成对要求只有一处实现）", () => {
+    const v = validateForwardCandidate({
+      ...BASE_CONFIG,
+      protocol: "tls",
+      tls_cert_path: "/etc/tunex/tls/a.crt",
+      tls_key_path: null,
+    });
+    expect(v.ok).toBe(false);
+    expect(v.reasons).toContain("tls_paths_invalid");
+  });
+
+  test("只改证书路径不是 metadata-only：必须落库并触发收敛", () => {
+    const tlsBase: ForwardCandidateConfig = {
+      ...BASE_CONFIG,
+      protocol: "tls",
+      tls_cert_path: "/etc/tunex/tls/old.crt",
+      tls_key_path: "/etc/tunex/tls/old.key",
+    };
+    const rotated = mergeForwardCandidate(tlsBase, { tls_cert_path: "/etc/tunex/tls/new.crt" });
+    // 这一条是 Gate 之外抓到的真实缺陷：漏掉这两列时，只改路径的 PATCH 会被判成
+    // metadata-only，而那个分支只写 name —— 接口回 200，新路径既没落库也没下发，
+    // 运维看到的是一次"已保存"却继续用旧证书的轮换。
+    expect(isMetadataOnlyPatch(tlsBase, rotated)).toBe(false);
+    // 只改名字仍然是 metadata-only（V4 的老规则没被动过）。
+    expect(isMetadataOnlyPatch(tlsBase, mergeForwardCandidate(tlsBase, { name: "renamed" }))).toBe(true);
+  });
+});
+
+/**
+ * V5.4：中间跳必须与入出口**同类对待** —— 它参与 current / merge / metadata-only 三处比较。
+ *
+ * 漏掉它与 V5-WP5-A1 漏掉 tls 路径是同一个 bug：PATCH 只改中间跳时会被判成"纯 metadata"，
+ * 只写 name 就返回 200，而**路由一个字节没变**（症状是"保存了但不生效"）。
+ */
+describe("V5.4：中间跳是运行时放置事实，不是 metadata", () => {
+  test("只改中间跳**不是** metadata-only：必须产生新 revision 与 rollout", () => {
+    expect(
+      isMetadataOnlyPatch(
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21 },
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21, middle_node_id: 31 },
+      ),
+    ).toBe(false);
+  });
+
+  test("去掉中间跳也不是 metadata-only（那是一次真实的路由变更）", () => {
+    expect(
+      isMetadataOnlyPatch(
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21, middle_node_id: 31 },
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21, middle_node_id: null },
+      ),
+    ).toBe(false);
+  });
+
+  test("存量行（没有中间跳）抽出来的 desired 是 null —— V4 行为不变", () => {
+    expect(currentDesiredConfig(row()).middle_node_id).toBeNull();
+  });
+
+  test("中间跳可以通过 patch 合并进去，未提交时沿用当前值", () => {
+    const withMiddle = mergeForwardCandidate(
+      { ...BASE_CONFIG, mode: "relay", egress_node_id: 21 },
+      { middle_node_id: 31 },
+    );
+    expect(withMiddle.middle_node_id).toBe(31);
+    const untouched = mergeForwardCandidate(withMiddle, { name: "renamed" });
+    expect(untouched.middle_node_id).toBe(31);
   });
 });

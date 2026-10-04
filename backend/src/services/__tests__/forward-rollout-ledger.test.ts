@@ -165,6 +165,14 @@ const fakeDb = () => {
           .filter((s) => s.tunnel_id === a.where.tunnel_id)
           .sort((x, y) => Number(y.revision) - Number(x.revision));
       },
+      // V5.3：回滚是**新世代** —— 补偿会为"内容 = 基线"的新 revision 写一份快照。
+      // 替身必须实现它：缺了它补偿会如实失败，而不是静默退回那条已经证明行不通的旧路径
+      // （原地重放基线版本号会被 Agent 拒绝为 stale_revision）。
+      create: async (args: unknown) => {
+        const a = args as { data: { tunnel_id: number; revision: number } };
+        snapshots.push({ ...a.data });
+        return a.data;
+      },
     },
     forwardRollout: {
       create: async (args: unknown) => {
@@ -300,6 +308,7 @@ function fakeOrchestrator(opts: { failOn?: Record<string, boolean> } = {}) {
     dispatchIngress: [] as Array<Record<string, unknown>>,
     dispatchDirect: [] as Array<Record<string, unknown>>,
     removeTunnel: [] as Array<Record<string, unknown>>,
+    releaseOwnership: [] as Array<Record<string, unknown>>,
   };
   // 这组 ledger 用例验证的是「明确失败后的补偿/记账」，不是 ACK 超时。
   // S10.47 后 agent_unreachable 专指结果未知，必须由专门 waiting 用例覆盖。
@@ -330,6 +339,10 @@ function fakeOrchestrator(opts: { failOn?: Record<string, boolean> } = {}) {
       calls.removeTunnel.push(input);
       if (opts.failOn?.removeTunnel) return { ok: false as const, ...fail };
       return { ok: true as const, result: { commandId: "cmd-r", revision: Number(input.revision), ack: {} } };
+    },
+    releaseOwnership: async (input: Record<string, unknown>) => {
+      calls.releaseOwnership.push(input);
+      return { ok: true as const };
     },
   };
   return orch as unknown as RolloutDeps["orchestrator"] & typeof orch;
@@ -594,17 +607,18 @@ describe("notes 列：追加式流水账", () => {
     expect(list.length).toBeGreaterThanOrEqual(4);
   });
 
-  it("Ingress 节点迁移的 DRAIN 软失败也记 note（只 warning，不阻塞 CLEANUP）", async () => {
+  it("Ingress 节点迁移记录 ownership handoff note，且不再走旧 drain 语义", async () => {
     const { f } = directEnv();
     const desired = f.snapshots.find((s) => Number(s.revision) === 7)!;
     desired.ingress_node_id = 12;
     f.tunnels[0]!.ingress_node_id = 12;
     f.tunnels[0]!.node_id = 12;
 
-    const soft: RolloutDeps = {
+    const orch = fakeOrchestrator();
+    const deps: RolloutDeps = {
       db: f.db,
       runtimeUse: async () => null,
-      orchestrator: fakeOrchestrator({ failOn: { removeTunnel: true } }),
+      orchestrator: orch,
       sleep: async () => {},
     };
     const res = await registerRollout(
@@ -618,11 +632,13 @@ describe("notes 列：追加式流水账", () => {
         revision: 7,
         baseRevision: 6,
       },
-      soft,
+      deps,
     );
     expect(res.ok).toBe(true);
     const list = (f.rollouts[0]!.notes ?? []) as string[];
-    expect(list.some((n) => n.startsWith("drain:") && n.includes("SOFT"))).toBe(true);
+    expect(list.some((n) => n.startsWith("cutover:handoff_ingress_owner"))).toBe(true);
+    expect(list.some((n) => n.startsWith("drain:"))).toBe(false);
+    expect(orch.calls.releaseOwnership).toHaveLength(1);
   });
 });
 

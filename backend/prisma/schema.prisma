@@ -485,6 +485,12 @@ model Node {
   /// 节点凭据状态快照（版本 / 角色 / 端口占用 / 隧道列表），见 model NodeStateReport。
   /// 每节点一行：`@@unique([node_id])` 保证 Agent 断线重连后恢复的是自己那一份。
   state_report   NodeStateReport?
+  /// V5.2 WP5：该节点上报的目标观测（每个 (节点, 目标) 一行）。
+  target_observations TargetObservation[]
+  /// V5.3 WP9：该节点当前持有的归属租约。
+  placement_leases PlacementLease[]
+  /// V5.4 WP12：作为中间跳承载的 Forward。
+  middle_hops Tunnel[] @relation("middle_node")
 
   @@index([role])
   @@map("node")
@@ -601,6 +607,22 @@ model Tunnel {
   /// compatibility projection; new Forward admission/runtime decisions must use
   /// this field. NULL is reserved for non-Forward/old pre-backfill rows.
   forward_protocol String? @db.VarChar(16)
+
+  // ── V5-WP5-A1 TLS 前端（DEVELOPMENT.md §6.1 语义契约）──
+  //
+  // 证书归运维所有，以**节点上的文件**形式存在；这里只存路径。
+  //
+  // 为什么控制面不存密钥 material：
+  //   · 面板没有 per-resource secret store，新建一套会与 node_credential +
+  //     部署层 env Fernet 形成第三套密钥系统（§1.1 禁止第二份真相）；
+  //   · redaction 按形状删除 PEM 私钥块，是**兜底**而不是唯一防线：让密钥只以
+  //     路径形式流经控制面，它就没有机会进入日志/诊断/Support Bundle。
+  //
+  // 两列都可空且无默认值：只有 protocol=tls 的行才会填，其余行 NULL 是明确事实。
+  /// tls 监听使用的证书文件路径（节点本地；NULL = 非 tls）
+  tls_cert_path   String? @db.VarChar(512)
+  /// tls 监听使用的私钥文件路径（节点本地；NULL = 非 tls）
+  tls_key_path    String? @db.VarChar(512)
   /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?
@@ -661,6 +683,20 @@ model Tunnel {
   // 同一 NodeGroup 内不同入口节点允许复用相同 listen_port。
   @@index([in_node_group_id, listen_port])
   @@index([workspace_id])
+  /// V5.3 WP9：该 Forward 的归属租约（最多一行，见 model PlacementLease）。
+  placement_lease PlacementLease?
+
+  /// V5.4 WP12：2 跳 / 3 跳路由的**中间跳**节点（NULL = 单跳，V4 行为）。
+  ///
+  /// 为什么是一列而不是一张链路表：§9.1 明确推荐"先让 Forward revision snapshot 承载有序
+  /// 路由事实，再根据真实重复需求决定是否独立持久化 Link"。一条线性路由最多 3 跳，其中
+  /// hop 0 = ingress_node_id、hop N-1 = egress_node_id，因此**只多出一个中间跳**；为它开一张
+  /// 表会在第一版就引入通用图结构，而那正是 §9.3 禁止的方向。
+  ///
+  /// 归属仍只有一个持有者（hop 0），中间跳是**资源**（见 §9 冻结契约第 7 条）。
+  middle_node_id Int?
+  middle_node    Node? @relation("middle_node", fields: [middle_node_id], references: [id], onDelete: SetNull)
+
   @@index([tunnel_mode])
   @@index([forward_protocol])
   @@index([ingress_node_id])
@@ -712,6 +748,9 @@ model ForwardRevision {
   protocol String @default("tcp") @db.VarChar(16)
   ingress_node_id Int
   egress_node_id  Int?
+  /// V5.4：该 revision 的中间跳放置事实。NULL = 单跳。
+  /// 不加 FK：revision snapshot 是历史事实；节点删除不能改写过去的路由。
+  middle_node_id  Int?
   /// 用户请求的监听端口；NULL = 「自动分配」。与创建 contract 同义：
   /// 编排器会在 apply 时落到 concrete port 并写回 tunnel.listen_port，
   /// 但 snapshot 保留的是**请求值**，才能还原「用户当时要自动还是指名」。
@@ -1126,6 +1165,9 @@ model TunnelTraffic {
 
 enum SystemConfigName {
   MIN_TOPUP_AMOUNT
+  /// V5.3 WP10：自动故障转移/回切的运维策略（JSON：`{auto_failover, auto_failback}`）。
+  /// 缺省不存在 ⇒ 两个都视为 false（fail-closed：策略没被配置过就不许自动搬流量）。
+  FAILOVER_POLICY
   NOTICE
   NOTICE_POPUP
   NOTICE_POPUP_INTERVAL_HOURS
@@ -1451,6 +1493,90 @@ model EmailVerification {
 /// 报来的原文快照**，不是面板自己的模型；做成外键表会让「Agent 报了一个面板
 /// 没下发的隧道」这种冲突无处安放，而 JSON 快照天然容纳这种偏差并由 reconciler
 /// 判定。形状见 services/node-state.ts 的 StateReport 类型。
+
+/// V5.2 WP5 —— 目标观测投影（Observation 是事实，不是 desired）
+///
+/// 契约见 DEVELOPMENT.md §7：观测按 **(观测节点, target) 二维** 存储，同一
+/// host:port 被两个节点观测是**两条不同的事实**（视角不同），所以唯一键是
+/// (node_id, target_key) 而不是 target_key。
+///
+/// 刻意**不**做的事：
+///   · 不写 EgressTarget 的 desired 字段 —— desired 表达"用户要什么"，
+///     观测表达"我们看到了什么"，互相改写会让"谁改了目标"无法回答；
+///   · 不存 observation_age —— age 是 `now - observed_at`，取的时候算；
+///     存下来的 age 在写入那一刻就已经是错的；
+///   · 不存历史。当前只保留每个 (node, target) 的最新一条投影；是否需要历史
+///     记录由数据保留需求决定（契约 §7 的开放决策）。
+///
+/// `success_rate` 由**观测方**计算并上报（契约第 6 条）：面板不重算，
+/// 否则同一个事实会有两个可能不一致的算法。
+
+/// V5.3 WP9 —— 归属租约（fencing）。这是防 split brain 的**唯一**机制。
+///
+/// 危险场景（§8.2）：面板以为 A 掉线 → 让 B 接管 → A 其实只是被分区，仍在监听。
+/// 于是同一个 Forward 有两个主人。防它的不是"更准的心跳"，而是**所有权世代（epoch）**：
+/// 只有持有当前 epoch 的节点才允许服务；被降级的节点在收到更高 epoch 时拒绝继续。
+///
+/// 关键字段与为什么存在：
+///   · `epoch` 单调递增，"最后写入者获胜"被明确禁止（§8）；任何归属变更都是 epoch+1；
+///   · `lease_expires_at` 到期即**停**（fail-safe）："可能还有另一个主人"比"短暂中断"更危险；
+///   · `revision` 把租约钉在某个配置版本上，避免"新主人用旧配置"或反之；
+///   · 每个 tunnel 只有一行（`@unique`），因此不存在"两条租约都自称有效"的表示法。
+model PlacementLease {
+  id         Int      @id @default(autoincrement())
+  tunnel_id  Int      @unique
+  tunnel     Tunnel   @relation(fields: [tunnel_id], references: [id], onDelete: Cascade)
+  /// 当前承载该 Forward 的节点。
+  owner_node_id Int
+  owner_node Node    @relation(fields: [owner_node_id], references: [id], onDelete: Cascade)
+  /// 所有权世代：单调递增，绝不回退（回退会被 Agent 侧拒绝）。
+  epoch      Int      @default(0)
+  /// 租约到期时刻（DB 时钟）。到期未续 = 不允许继续服务。
+  lease_expires_at DateTime
+  /// 该租约对应的配置 revision。
+  revision   Int
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([owner_node_id, lease_expires_at])
+  @@map("placement_lease")
+}
+
+model TargetObservation {
+  id         Int    @id @default(autoincrement())
+  node_id    Int
+  node       Node   @relation(fields: [node_id], references: [id], onDelete: Cascade)
+
+  /// 归一化后的目标身份（host 小写去尾点 + :port），同一目标只有一个身份。
+  target_key String @db.VarChar(288)
+  host       String @db.VarChar(255)
+  port       Int
+
+  /// 上次探测是否连上（观测事实，不是期望状态）。
+  reachable Boolean
+  /// 连接耗时（毫秒）；不可达为 NULL —— 不写 0，0 是"瞬间可达"，不是"不知道"。
+  latency_ms Int?
+  /// 自上次状态翻转起的连续成功/失败次数（迟滞判决的输入）。
+  consecutive_success Int @default(0)
+  consecutive_failure Int @default(0)
+  /// 最近 N 次探测的成功比例，0..1；由观测方计算。
+  success_rate Float @default(0)
+
+  /// 观测时刻（Agent 时钟）与面板收到该上报的时刻（DB 时钟）。
+  /// 两者都留着：age 用前者算，而"这份观测有多旧"在跨节点时钟偏斜时
+  /// 需要一个不依赖 Agent 时钟的参照。
+  observed_at DateTime
+  reported_at DateTime @default(now())
+  /// 谁说的：观测节点 + 探测种类（契约第 6 条的 observation_source）。
+  observation_source String @db.VarChar(64)
+
+  updated_at DateTime @updatedAt
+
+  @@unique([node_id, target_key])
+  @@index([target_key])
+  @@map("target_observation")
+}
+
 model NodeStateReport {
   id      Int  @id @default(autoincrement())
   node_id Int  @unique
@@ -1523,6 +1649,22 @@ model NodeStateReport {
   control_protocol_version Int?
   /// Agent 实际实现的控制动作清单（NULL = 未上报；非数组 = 坏形状，fail-closed）
   capabilities             Json?
+
+  // ── V5-WP1 能力协商 v2（DEVELOPMENT.md §5.2）──
+  //
+  // 第三个**可空且无默认值**的协商字段，additive 且不改动上面两列的语义。
+  //
+  //   capability_manifest ← { schema_version, protocols, transports,
+  //                           runtime, diagnostics }
+  //
+  // 为什么不把 capabilities 原地改成 object：它是 string[]，Support Bundle /
+  // 诊断快照 / 旧工具链已经按数组读它；原地改型会让每个读它的人静默拿到
+  // undefined，把「节点支持 apply_tunnel」变成「什么都不知道」。
+  //
+  // NULL 的含义与 capabilities 完全一致（旧 Agent 未上报 → baseline 放行），
+  // 形状校验由 node-state.ts 与 services/capability-manifest.ts 双重把关。
+  /// Agent 实际实现的协议 / 传输 / runtime 能力清单（NULL = 未上报）
+  capability_manifest      Json?
 
   @@index([reported_at])
   @@index([last_error_at])

@@ -52,7 +52,13 @@ import { acquirePort, releaseLease } from "./portPool.ts";
 import type { AcquirePortOutcome } from "./portPool.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { ACTIVE_ROLLOUT_PHASES, planRollout, ROLLOUT_STAGE_SEQUENCE, rolloutStepKey } from "./forward-rollout.ts";
+import {
+  dispatchFactsFromRow,
+  persistedForwardProtocol,
+  type DispatchFacts,
+} from "./forward-contract.ts";
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
+import { admitRoute } from "./forward-route.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
 
 /** Existing runtime use, not a new creation/count slot. Production never defaults to allow. */
@@ -169,6 +175,12 @@ export interface RolloutDb {
   forwardRevision: {
     findFirst(args: unknown): Promise<unknown>;
     findMany(args: unknown): Promise<unknown>;
+    /**
+     * V5.3：回滚需要为**新世代**写一份快照（内容 = 基线）。缺它就没法回滚 ——
+     * 这是刻意让端口显式化：如果某个替身没实现它，`create` 会立刻失败并被记进
+     * `compensation_error`，而不是让补偿悄悄退回"原地重放基线版本"那条已经证明行不通的路。
+     */
+    create(args: unknown): Promise<unknown>;
   };
   forwardRollout: {
     create(args: unknown): Promise<unknown>;
@@ -365,6 +377,7 @@ interface TunnelProjection {
   tunnel_mode: string;
   ingress_node_id: number | null;
   egress_node_id: number | null;
+  middle_node_id?: number | null;
   listen_ip: string | null;
   listen_port: number | null;
   remote_host: string | null;
@@ -386,6 +399,56 @@ interface TunnelProjection {
  * 找不到（suspend bump 出的 revision 没有 snapshot，报告 R5）时回退到投影列
  * 合成基线——与 WP1 `currentDesiredConfig` 同口径。
  */
+/**
+ * 相邻两跳的绑定集合（`"ingress->egress"`）。V5.4 路由准入需要它，而它是**外部事实**，
+ * 因此在这里一次性读出来交给纯判定。
+ *
+ * 读不到时返回空集合 = "没有绑定" ⇒ 三跳路由会被拒（fail-closed）。多跳在没有许可链路时本来
+ * 就不该下发，把"读不到"当成"有绑定"才是危险方向。
+ */
+async function loadBoundPairs(db: RolloutDb): Promise<ReadonlySet<string>> {
+  // 两级都要存在才调用：替身可以有 `nodeBinding` 却没有 `findMany`
+  // （实测：只给 `findUnique` 的替身会让 `?.findMany(...)` 抛 TypeError ——
+  // 可选链只护住了第一层，护不住第二层。这是"部分端口不该炸掉整条路径"的同一类问题）。
+  const port = (db as unknown as { nodeBinding?: { findMany?: (args: unknown) => Promise<unknown> } }).nodeBinding;
+  if (typeof port?.findMany !== "function") return new Set<string>();
+  const rows = (await port.findMany({ select: { ingress_node_id: true, egress_node_id: true } }).catch(() => [])) as
+    | Array<{ ingress_node_id: number; egress_node_id: number }>
+    | undefined;
+  return new Set((rows ?? []).map((b) => `${b.ingress_node_id}->${b.egress_node_id}`));
+}
+
+/**
+ * 释放**旧的归属租约**（V5.3 round 21）。
+ *
+ * 背景：一个节点不再承载某条 Forward 之后，它**可能还持有那条 Forward 的归属租约**。这不是无害的
+ * 残留 —— 它会让每一条修复路径都撞上两阶段规则：reconcile 的重发会为**放置节点**认领归属，而旧租约
+ * 未过期 ⇒ 认领被正确地拒绝 ⇒ **重发永远失败**。实测症状：`tunnel.ingress_node_id=3`、
+ * `placement_lease.owner_node_id=5`，DB 显示 `active/applied` 而两台节点都不服务，
+ * 且没有任何自动机制能打破它（"账本说好、事实说坏"，round 15 记下、round 21 才复现并定性）。
+ *
+ * 为什么可以在这里安全地释放：这一步（`release_old_lease`）**正是在旧 runtime 已经被撤掉之后**执行的
+ * —— 迁移计划里 `drain_ingress` 先把它摘掉，CLEANUP 才轮到释放。两阶段规则要防的"旧主人还在服务"
+ * 在这里已经不成立，而"旧主人仍占着归属"恰恰是必须清掉的东西。
+ *
+ * 只在该旧节点**不再是当前放置节点**时才释放：同节点换端口的场景由上面的 `sameNodeListenerMove`
+ * 处理，那里 Forward 并没有搬走。
+ */
+async function releaseStalePlacementLease(
+  deps: RolloutDeps,
+  ctx: RolloutExecContext,
+  oldNodeId: number,
+): Promise<void> {
+  if (ctx.desired.ingress_node_id === oldNodeId) return;
+  try {
+    const { releaseLease: releasePlacementLease } = await import("./placement-lease.ts");
+    await releasePlacementLease({ tunnelId: ctx.tunnelId, nodeId: oldNodeId, now: deps.now?.() ?? new Date() });
+  } catch {
+    // 尽力而为：CLEANUP 阶段不该因为归属释放失败而整条 rollout 判失败。留在那里的旧租约会自然过期
+    // （TTL），下一轮 reconcile 就能认领 —— 届时的行为与"等待过期"一致。
+  }
+}
+
 async function loadRolloutNodes(
   tunnelId: number,
   deps: { db: RolloutDb },
@@ -412,6 +475,7 @@ async function loadRolloutNodes(
     mode: String(s.mode ?? row.tunnel_mode) === "relay" ? "relay" : "direct",
     ingress_node_id: Number(s.ingress_node_id ?? row.ingress_node_id ?? 0),
     egress_node_id: s.egress_node_id == null ? null : Number(s.egress_node_id),
+    middle_node_id: s.middle_node_id == null ? null : Number(s.middle_node_id),
     listen_ip: (s.listen_ip as string | null) ?? row.listen_ip,
     listen_port: s.listen_port == null ? null : Number(s.listen_port),
     target_host: (s.target_host as string | null) ?? null,
@@ -436,6 +500,7 @@ async function loadRolloutNodes(
         mode: row.tunnel_mode === "relay" ? "relay" : "direct",
         ingress_node_id: row.ingress_node_id ?? 0,
         egress_node_id: row.egress_node_id ?? null,
+        middle_node_id: row.middle_node_id ?? null,
         listen_ip: row.listen_ip,
         listen_port: row.listen_port ?? null,
         target_host: row.remote_host,
@@ -480,7 +545,7 @@ async function loadRolloutNodes(
 
   // A desired revision may choose different Nodes while the tunnel projection
   // still describes the old applied topology. Admission must inspect the target.
-  const [desiredIngress, desiredEgress] = await Promise.all([
+  const [desiredIngress, desiredEgress, desiredMiddle] = await Promise.all([
     (row.ingress_node as { id?: number } | null)?.id === desired.ingress_node_id
       ? row.ingress_node
       : deps.db.node.findUnique({ where: { id: desired.ingress_node_id } }),
@@ -488,10 +553,14 @@ async function loadRolloutNodes(
       : (row.egress_node as { id?: number } | null)?.id === desired.egress_node_id
         ? row.egress_node
         : deps.db.node.findUnique({ where: { id: desired.egress_node_id } }),
+    desired.middle_node_id == null
+      ? null
+      : deps.db.node.findUnique({ where: { id: desired.middle_node_id } }),
   ]);
   const nodes: PlanRolloutInput["nodes"] = {
     ingress: nodeFact(desiredIngress),
     egress: nodeFact(desiredEgress),
+    middle: nodeFact(desiredMiddle),
     // 旧拓扑的节点对象：applied snapshot 里有 id 即可，运行时 DRAIN/CLEANUP
     // 只需要 node id 与端口，不需要再读一次 Node 行（避免旧节点已删时读库失败）。
     ingress_previous:
@@ -516,6 +585,10 @@ async function loadRolloutNodes(
         : applied && applied.egress_node_id != null
           ? { id: applied.egress_node_id, node_id: "", role: null, connect_ip: null }
           : null,
+    middle_previous:
+      applied?.middle_node_id != null
+        ? { id: applied.middle_node_id, node_id: "", role: null, connect_ip: null }
+        : null,
   };
 
   // Binding 存在性：只有 RELAY 且出口节点解析出来才有意义。
@@ -549,7 +622,12 @@ async function rolloutRuntimeDenial(
       ? deps.db.node.findUnique({ where: { id: desired.egress_node_id }, select: { node_group_id: true } })
       : null,
   ]);
-  const tunnel = rawTunnel as { workspace_id?: number; user_id?: number; tunnel_type?: string } | null;
+  const tunnel = rawTunnel as {
+    workspace_id?: number;
+    user_id?: number;
+    forward_protocol?: unknown;
+    tunnel_type?: string;
+  } | null;
   const ingress = rawIngress as { node_group_id?: number } | null;
   const egress = rawEgress as { node_group_id?: number } | null;
   const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
@@ -562,7 +640,10 @@ async function rolloutRuntimeDenial(
     user_id: tunnel.user_id,
     in_node_group_id: ingress.node_group_id,
     out_node_group_id: desired.mode === "relay" ? egress!.node_group_id! : null,
-    tunnel_type: tunnel.tunnel_type ?? "tcp",
+    // The canonical FACT, legacy column only as a fallback. Feeding the legacy
+    // column straight in made the policy refuse a ws Forward (its column defaults
+    // to 'wss') — V5-G1A.7.
+    protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
   });
 }
 
@@ -665,6 +746,14 @@ async function runStep(
         return { ok: false, error_code: "invariant_violated", error: "prepare_egress 无法解析出口端口" };
       }
       const targets = ctx.desired.egress_targets ?? [];
+      const egressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (egressFacts === null) {
+        return {
+          ok: false,
+          error_code: "unsupported_protocol",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝下发出口",
+        };
+      }
       const outcome = await orchestrator.dispatchEgress({
         tunnelId: ctx.tunnelId,
         revision: ctx.revision,
@@ -672,6 +761,9 @@ async function runStep(
         egressPort,
         poolId: ctx.desired.egress_pool_id,
         targets: targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order_by })),
+        protocol: egressFacts.protocol,
+        tlsCertPath: egressFacts.tlsCertPath,
+        tlsKeyPath: egressFacts.tlsKeyPath,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -702,6 +794,14 @@ async function runStep(
         return { ok: false, error_code: "invariant_violated", error: "cutover_egress 无法解析出口端口" };
       }
       const targets = ctx.desired.egress_targets ?? [];
+      const egressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (egressFacts === null) {
+        return {
+          ok: false,
+          error_code: "unsupported_protocol",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝下发出口",
+        };
+      }
       const outcome = await orchestrator.dispatchEgress({
         tunnelId: ctx.tunnelId,
         revision: ctx.revision,
@@ -709,11 +809,60 @@ async function runStep(
         egressPort,
         poolId: ctx.desired.egress_pool_id,
         targets: targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order_by })),
+        protocol: egressFacts.protocol,
+        tlsCertPath: egressFacts.tlsCertPath,
+        tlsKeyPath: egressFacts.tlsKeyPath,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
       }
       return { ok: true, note: `egress ${nodeId}:${egressPort} 生效于 revision ${ctx.revision}` };
+    }
+
+    case "handoff_ingress_owner": {
+      if (nodeId == null || ctx.applied == null) {
+        return {
+          ok: false,
+          error_code: "invariant_violated",
+          error: "handoff_ingress_owner 缺少旧入口节点或 applied snapshot",
+        };
+      }
+
+      // 两阶段交接：先确认旧 client-facing runtime 已经撤下，再把 ownership
+      // lease 显式置为到期。绝不能反过来，否则旧 Agent 仍可能按它手里的
+      // lease_expires_at 继续服务，而新 Agent 已经能 claim —— 这就是双主窗口。
+      const direction = ctx.applied.mode === "direct" ? "direct" : "ingress";
+      const removed = await orchestrator.removeTunnel({
+        tunnelId: ctx.tunnelId,
+        node: nodeFor(orchestrator, nodeId),
+        direction,
+        // 旧 runtime 当前最多是 base revision；用目标 revision 即可单调前进。
+        // 不用 revision+1：若后续新入口 cutover 失败，补偿会用 revision+1
+        // 恢复旧入口；这里若提前占掉 +1，回滚会被 Agent 判 equal/stale。
+        revision: ctx.revision,
+        reason: `rollout ${ctx.rolloutId} ingress ownership handoff`,
+      });
+      if (!removed.ok) {
+        return { ok: false, error_code: removed.error_code, error: removed.error };
+      }
+
+      const released = await orchestrator.releaseOwnership({
+        tunnelId: ctx.tunnelId,
+        nodeId,
+        now: deps.now?.() ?? new Date(),
+      });
+      if (!released.ok && released.reason !== "not_found") {
+        return {
+          ok: false,
+          error_code: "ownership_release_failed",
+          error: `旧入口 ${nodeId} ownership 释放失败：${released.reason}`,
+        };
+      }
+
+      return {
+        ok: true,
+        note: `old ingress ${nodeId} 已撤下，ownership 已释放，允许新入口认领`,
+      };
     }
 
     case "cutover_ingress": {
@@ -738,12 +887,26 @@ async function runStep(
             error: "RELAY 入口切换前无法解析 next_hop（出口未就绪）",
           };
         }
+        // V5-WP4/G0: a cutover issues a real command, so it carries the
+        // Forward's persisted protocol instead of letting the orchestrator
+        // default an absent one to tcp.
+        const ingressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+        if (ingressFacts === null) {
+          return {
+            ok: false,
+            error_code: "unsupported_protocol",
+            error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝切换",
+          };
+        }
         const outcome = await orchestrator.dispatchIngress({
           tunnelId: ctx.tunnelId,
           revision: ctx.revision,
           ingressNode: nodeFor(orchestrator, ingressNodeId),
           ingressPort: port,
           nextHop,
+          protocol: ingressFacts.protocol,
+          tlsCertPath: ingressFacts.tlsCertPath,
+          tlsKeyPath: ingressFacts.tlsKeyPath,
         });
         if (!outcome.ok) {
           return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -755,6 +918,14 @@ async function runStep(
       if (!ctx.desired.target_host || !ctx.desired.target_port) {
         return { ok: false, error_code: "invalid_target", error: "DIRECT cutover 缺少目标" };
       }
+      const directFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (directFacts === null) {
+        return {
+          ok: false,
+          error_code: "unsupported_protocol",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝切换",
+        };
+      }
       const outcome = await orchestrator.dispatchDirect({
         tunnelId: ctx.tunnelId,
         revision: ctx.revision,
@@ -763,6 +934,9 @@ async function runStep(
         remoteHost: ctx.desired.target_host,
         remotePort: ctx.desired.target_port,
         listenHost: ctx.desired.listen_ip,
+        protocol: directFacts.protocol,
+        tlsCertPath: directFacts.tlsCertPath,
+        tlsKeyPath: directFacts.tlsKeyPath,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -849,8 +1023,14 @@ async function runStep(
         select: { id: true },
       })) as Array<{ id: number }>;
       // 取第一条：同 (node, port) 的 lease 在该节点端口区间内唯一。
+      const releaseTransitLease =
+        step.port == null &&
+        step.meta?.reason === "transit_changed" &&
+        oldLeaseRows.length === 1;
       const oldLeaseId: number | null =
-        step.port != null && oldLeaseRows.length > 0 ? oldLeaseRows[0]!.id : null;
+        (step.port != null || releaseTransitLease) && oldLeaseRows.length > 0
+          ? oldLeaseRows[0]!.id
+          : null;
 
       // 旧 rollout 行重放时那一条可能已被释放：这时回退到按 tunnelId 释放，
       // 不因差一行而让整个 rollout 判失败（§13.3.5 CLEANUP 是尽力而为）。
@@ -858,9 +1038,11 @@ async function runStep(
       // 这是幂等成功，不得退回按 tunnelId 全量释放：那会把 PREPARE 刚拿到、
       // 当前 runtime 正在使用的新端口 lease 一并释放，制造账本/runtime 分叉。
       if (oldLeaseId === null) {
+        await releaseStalePlacementLease(deps, ctx, nodeId);
         return { ok: true, note: `lease ${nodeId}:${step.port ?? "?"} 已释放（幂等）` };
       }
       const released = await releaseLease({ leaseId: oldLeaseId }, { db: deps.db as never });
+      await releaseStalePlacementLease(deps, ctx, nodeId);
       return {
         ok: true,
         note: released
@@ -869,9 +1051,10 @@ async function runStep(
       };
     }
 
-    case "drop_old_egress": {
+    case "drop_old_egress":
+    case "drop_old_transit": {
       if (nodeId == null) {
-        return { ok: false, error_code: "invariant_violated", error: "drop_old_egress 缺少 node_id" };
+        return { ok: false, error_code: "invariant_violated", error: `${step.kind} 缺少 node_id` };
       }
       const outcome = await orchestrator.removeTunnel({
         tunnelId: ctx.tunnelId,
@@ -879,19 +1062,77 @@ async function runStep(
         direction: "egress",
         // revision+1：同 removeTunnel 的补偿口径，重复执行幂等。
         revision: ctx.revision + 1,
-        reason: `rollout ${ctx.rolloutId} drop old egress`,
+        reason: `rollout ${ctx.rolloutId} ${step.kind === "drop_old_transit" ? "drop old transit" : "drop old egress"}`,
       });
       if (!outcome.ok) {
         // §13.3.5：CLEANUP 失败只记 degraded，不影响已生效的新 revision。
         return { ok: false, soft: true, error_code: outcome.error_code, error: outcome.error };
       }
-      return { ok: true, note: `old egress ${nodeId} 已撤下` };
+      return {
+        ok: true,
+        note: step.kind === "drop_old_transit"
+          ? `old transit ${nodeId} 已撤下`
+          : `old egress ${nodeId} 已撤下`,
+      };
     }
 
     /* ---------------- VALIDATE（无副作用）---------------- */
 
     case "validate":
       return { ok: true, note: "validate（计划期已判定）" };
+
+    /* ---------------- 中间跳（V5.4 WP12）---------------- */
+
+    case "prepare_transit": {
+      // 中间跳与出口跳是**同一个原语**（一个监听 + 拨号到"目标"的转发），区别只在目标是谁：
+      // 出口指向真实目标池，中间跳指向**下一跳的节点间监听地址**。
+      //
+      // 正向先远后近 ⇒ 轮到这里时下一跳（出口）已经发过，它的可寻址 host 已登记；因此这里
+      // 用与入口同样的 `resolveNextHop`：不猜 IP，只用 dispatch 返回的地址。
+      const middleNodeId = nodeId;
+      if (middleNodeId == null) {
+        return { ok: false, error_code: "invariant_violated", error: "prepare_transit 缺少 node_id" };
+      }
+      if (ctx.desired.mode !== "relay") {
+        return { ok: false, error_code: "invariant_violated", error: "只有 RELAY 路由才有中间跳" };
+      }
+      const port = resolveIngressPort(step, ctx);
+      // 中间跳的下一跳**就是出口跳**（三跳的上限决定了中间跳最多一个）。这里不能用
+      // `resolveNextHop`：那是"入口的下一跳"，在有三跳时指向中间跳自己。
+      const egressNodeId = ctx.desired.egress_node_id;
+      const nextHop = egressNodeId == null ? null : resolveHopAddress(ctx, egressNodeId, ctx.desired.egress_port ?? null);
+      if (!nextHop) {
+        return {
+          ok: false,
+          error_code: "next_hop_unresolved",
+          error: `中间跳 ${middleNodeId} 无法解析下一跳（出口）地址：出口未就绪`,
+        };
+      }
+      // 协议事实与其它真实命令一样必须过 runtime 闸门（A1/A2 的 tls/ws 靠的就是这里）。
+      const transitFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (transitFacts === null) {
+        return {
+          ok: false,
+          error_code: "unsupported_protocol",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝中间跳",
+        };
+      }
+      // 中间跳只有**一份实现**（`Orchestrator.dispatchTransit`）：创建路径也用它。
+      const transit = await orchestrator.dispatchTransit({
+        tunnelId: ctx.tunnelId,
+        revision: ctx.revision,
+        node: nodeFor(orchestrator, middleNodeId),
+        port,
+        nextHop,
+        protocol: transitFacts.protocol,
+      });
+      if (!transit.ok) {
+        return { ok: false, error_code: transit.error_code, error: transit.error };
+      }
+      // 登记中间跳的可寻址 host：入口的 cutover 会用它拼 next_hop。
+      recordNextHop(ctx.rolloutId, middleNodeId, transit.host);
+      return { ok: true, note: `transit ${middleNodeId}:${port} → ${nextHop}` };
+    }
 
     default: {
       const exhaustive: never = step.kind;
@@ -920,6 +1161,53 @@ async function runStep(
  * 当 ingress 还是 egress 都是同一行。方向只影响 `removeTunnel` 拼哪个
  * tunnel id（`-relay` / `-egress` / `-direct`），那由 direction 参数自己决定。
  */
+/**
+ * The admitted protocol of an existing Forward (V5-WP4/G0).
+ *
+ * Rollout steps issue real commands to real Agents, so they must carry the
+ * Forward's protocol fact instead of letting the orchestrator default to tcp —
+ * a historical non-TCP Forward would otherwise be "cut over" as TCP. `null` means
+ * the fact is not runnable, and the step refuses instead of dispatching.
+ */
+/**
+ * The dispatch facts of an existing Forward: protocol + whatever that protocol
+ * needs (today: the tls certificate paths).
+ *
+ * Reading them together is the point. G1A found this the hard way: after `tls`
+ * arrived, this function returned only the protocol, so every hot reload of a
+ * tls Forward failed at `Orchestrator.tlsFields` ("missing certificate paths")
+ * while create and restore worked — a dispatch path that knew the protocol but
+ * not its required configuration.
+ */
+async function dispatchFactsFor(
+  tunnelId: number,
+  store: RolloutDeps["db"],
+): Promise<DispatchFacts | null> {
+  // Read through the INJECTED store, never the process-wide singleton: this
+  // module is exercised offline with a stub, and reaching for `db` directly made
+  // every rollout test fail with "db.tunnel.findUnique is not a function".
+  const handle = store as unknown as {
+    tunnel?: { findUnique?: (args: unknown) => Promise<unknown> };
+  };
+  const findUnique = handle?.tunnel?.findUnique;
+  if (!findUnique) return null;
+  const row = (await findUnique({
+    where: { id: tunnelId },
+    select: {
+      forward_protocol: true,
+      tunnel_type: true,
+      tls_cert_path: true,
+      tls_key_path: true,
+    },
+  })) as {
+    forward_protocol?: unknown;
+    tunnel_type?: unknown;
+    tls_cert_path?: unknown;
+    tls_key_path?: unknown;
+  } | null;
+  return row ? dispatchFactsFromRow(row) : null;
+}
+
 function nodeFor(orchestrator: Orchestrator, nodeId: number): Parameters<Orchestrator["removeTunnel"]>[0]["node"] {
   const rec = nodeIndex.get(orchestrator)?.get(nodeId);
   return rec ?? { id: nodeId, node_id: String(nodeId), connect_ip: null, role: null };
@@ -970,22 +1258,36 @@ function resolveEgressPort(step: RolloutStep, ctx: RolloutExecContext): number {
 }
 
 /** `<egress ip>:<egress port>`；解析不到 ⇒ null ⇒ cutover_ingress 拒绝执行。 */
-function resolveNextHop(ctx: RolloutExecContext): string | null {
-  const egressNodeId = ctx.desired.egress_node_id;
-  if (egressNodeId == null) return null;
-  const prepared = ctx.prepared.find(
-    (p) => p.kind === "egress_apply" && p.node_id === egressNodeId && p.port != null,
-  );
-  const lease = ctx.prepared.find(
-    (p) => p.kind === "lease" && p.node_id === egressNodeId && p.port != null,
-  );
-  const port = prepared?.port ?? lease?.port ?? ctx.desired.egress_port ?? 0;
+/**
+ * 解析**某一跳**的节点间可寻址地址（`host:port`）。
+ *
+ * 只允许从**已登记**的节点事实里取 host（`recordNextHop` 的产物，来自那台节点自己的
+ * dispatch 返回值）—— 不猜 IP：猜错就是"每个新连接都连不上"的静默故障。
+ *
+ * `fallbackPort` 只在那一跳没有自己的 lease/apply 登记时才用（单跳出口沿用了 historical
+ * `desired.egress_port`），中间跳没有这个回落：它的端口必须来自计划期的 acquire_port。
+ */
+function resolveHopAddress(ctx: RolloutExecContext, nodeId: number, fallbackPort: number | null): string | null {
+  const prepared = ctx.prepared.find((p) => p.kind === "egress_apply" && p.node_id === nodeId && p.port != null);
+  const lease = ctx.prepared.find((p) => p.kind === "lease" && p.node_id === nodeId && p.port != null);
+  const port = prepared?.port ?? lease?.port ?? fallbackPort ?? 0;
   if (port <= 0) return null;
-  // 旧实现（orchestrator.dispatchEgress 内）会拿 egress 节点的可寻址 host
-  // 拼 next_hop；这里同样只允许从**已登记**的节点事实里取，不猜 IP。
-  const host = nextHopHosts.get(ctx.rolloutId)?.get(egressNodeId);
+  const host = nextHopHosts.get(ctx.rolloutId)?.get(nodeId);
   if (!host) return null;
   return `${host}:${port}`;
+}
+
+/**
+ * 入口的 `next_hop` = **它的下一跳**。三跳时那不是出口，而是中间跳 —— 也就是"下一跳是谁"
+ * 取决于路由形状，不能写死成 egress。判定依据是同一份放置事实（`middle_node_id`），
+ * 与计划、准入、纯路由模型用的是同一个字段。
+ */
+function resolveNextHop(ctx: RolloutExecContext): string | null {
+  const middle = (ctx.desired as { middle_node_id?: number | null }).middle_node_id ?? null;
+  const nextHopNodeId = middle ?? ctx.desired.egress_node_id;
+  if (nextHopNodeId == null) return null;
+  // 中间跳的端口必须来自它自己的 lease/apply；出口跳保留 historical 回落。
+  return resolveHopAddress(ctx, nextHopNodeId, middle != null ? null : ctx.desired.egress_port ?? null);
 }
 
 /**
@@ -1041,14 +1343,24 @@ export async function compensateRollout(
   // 尝试切过去的那个**拓扑，而 tunnel 行可能已被后续编辑改写。
   const removeRevision = row.revision + 1;
   const planned = planSnapshot(row.steps, "desired");
-  const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number }> = [
+  const baselinePlanned = planSnapshot(row.steps, "applied");
+  const plannedMiddle = (planned as { middle_node_id?: number | null }).middle_node_id ?? null;
+  const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number; isIngress?: boolean }> = [
     { direction: "egress", nodeId: planned.egress_node_id ?? 0 },
     {
       direction: planned.mode === "direct" ? "direct" : "ingress",
       nodeId: planned.ingress_node_id,
+      isIngress: true,
     },
+    // V5.4：中间跳也是"新 runtime"，也必须撤。它的形态与出口跳相同（监听 + 拨号到下一跳），
+    // 因此方向同样是 `egress` —— runtime id 按节点分命名空间，中间跳与真出口不会互相覆盖。
+    //
+    // 漏掉它会留下一条**孤儿中转链路**：照旧监听端口、照旧接受连接，把流量转给一个已经被
+    // 拆掉的下一跳。这类残留不报错，只静默占着端口与许可 —— 也正是 G4 明确要验的一项。
+    { direction: "egress", nodeId: plannedMiddle ?? 0 },
   ];
-  for (const { direction, nodeId } of removals) {
+  let plannedIngressRemoved = false;
+  for (const { direction, nodeId, isIngress } of removals) {
     if (!nodeId) continue;
     const outcome = await orchestrator.removeTunnel({
       tunnelId: row.tunnel_id,
@@ -1057,8 +1369,34 @@ export async function compensateRollout(
       revision: removeRevision,
       reason: `rollout ${rolloutId} compensation`,
     });
-    if (!outcome.ok) errors.push(`remove ${direction}: ${outcome.error}`);
+    if (!outcome.ok) {
+      errors.push(`remove ${direction}: ${outcome.error}`);
+    } else if (isIngress) {
+      plannedIngressRemoved = true;
+    }
   }
+
+  // 若目标入口曾经 claim 成功，但 apply/ACK 随后失败，ownership 仍会留在新节点。
+  // 只有确认新入口 runtime 已撤下后才允许释放它；随后基线入口才能按新世代重新 claim。
+  if (
+    plannedIngressRemoved &&
+    planned.ingress_node_id &&
+    planned.ingress_node_id !== baselinePlanned.ingress_node_id
+  ) {
+    const released = await orchestrator.releaseOwnership({
+      tunnelId: row.tunnel_id,
+      nodeId: planned.ingress_node_id,
+      now: deps.now?.() ?? new Date(),
+    });
+    // not_owner/not_found 代表失败发生在 claim 之前（ownership 仍在旧主人或从未存在），
+    // 这两种都无需额外动作；真正异常会在后面的基线 replay 中继续暴露。
+    if (!released.ok && released.reason !== "not_owner" && released.reason !== "not_found") {
+      errors.push(`release planned ingress ownership: ${released.reason}`);
+    }
+  }
+
+  /** 回滚世代（内容 = 基线）。null = 没有基线可回（首次部署失败：撤干净即正确）。 */
+  let rollbackRevision: number | null = null;
 
   // ② 重放基线。base_revision 为 null ⇒ 没有旧 runtime 可回，只需要撤新的
   //    （首次部署失败的情形：撤干净即回到「没有 runtime」这个正确状态）。
@@ -1069,6 +1407,36 @@ export async function compensateRollout(
     if (!baseline) {
       errors.push(`baseline snapshot revision=${row.base_revision} 不存在`);
     } else {
+      // ── 回滚产生**新世代**（内容 = 基线），而不是原地重放基线版本 ──
+      //
+      // 第一版按 `base_revision` 重放，于是被 Agent 正确地拒绝为 `stale_revision`：版本在系统里
+      // 是**单调**的（Agent 拒收比它已见更低的 revision，这正是防乱序 apply 的机制），而回滚发生在
+      // 该行已经前进到更高 revision 之后 —— 重放一个更低的号，从 Agent 角度看就是一条迟到的旧命令，
+      // 拒绝是对的。实测后果：补偿永远失败，rollout 停在 degraded，两侧都不服务
+      // （`forward_rollout#35` 的 `compensation_error` 就是这句话）。
+      //
+      // 把重放号改成"目标 revision"也不行：那样 Agent 会接受，但**运行时挂在目标版本号上**，
+      // 而它跑的是基线内容 —— 下一次 rollout 的基线查找（按 applied_revision）就会拿到一个
+      // 名不副实的版本。两个方案都坏，说明模型错了：**回滚必须是一个新的世代**。
+      //
+      // 于是：内容 = 基线，版本 = 继续向前的新号。既保住 Agent 的单调性规则，也让台账与事实一致。
+      // 这与 §3.4「desired 不回退」并不冲突 —— desired 不是往回退，而是前进到一个"内容等于基线"
+      // 的新世代，UI 因此可以如实显示"已回滚到上一版本的内容"。
+      const rollbackGeneration = Math.max(
+        Number(row.base_revision),
+        Number(row.revision ?? row.base_revision),
+      ) + 1;
+      rollbackRevision = rollbackGeneration;
+      const { id: _snapshotId, revision: _snapshotRevision, ...baselineFields } = baseline as Record<string, unknown> & {
+        id?: unknown;
+        revision?: unknown;
+      };
+      // 新世代的快照必须存在，否则后续 rollout 按 revision 找基线会报"不存在"。
+      await deps.db.forwardRevision
+        .create({ data: { ...baselineFields, tunnel_id: row.tunnel_id, revision: rollbackGeneration } } as never)
+        .catch((e: unknown) => {
+          errors.push(`rollback snapshot revision=${rollbackGeneration} 写入失败：${(e as Error)?.message ?? String(e)}`);
+        });
       const ingressNodeId = Number(baseline.ingress_node_id);
       const listenPort = baseline.listen_port == null ? null : Number(baseline.listen_port);
       if (!ingressNodeId || listenPort == null) {
@@ -1082,9 +1450,13 @@ export async function compensateRollout(
           const targets = Array.isArray(baseline.targets)
             ? (baseline.targets as Array<{ host: string; port: number; weight?: number; order_by?: number }>)
             : [];
+          const replayEgressFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+          if (replayEgressFacts === null) {
+            errors.push(`replay egress: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
+          } else {
           const egress = await orchestrator.dispatchEgress({
             tunnelId: row.tunnel_id,
-            revision: row.base_revision,
+            revision: rollbackRevision,
             egressNode: nodeFor(orchestrator, egressNodeId),
             egressPort,
             poolId: baseline.egress_pool_id == null ? null : Number(baseline.egress_pool_id),
@@ -1094,19 +1466,64 @@ export async function compensateRollout(
               weight: t.weight ?? 1,
               order_by: t.order_by ?? (i + 1) * 10,
             })),
+            protocol: replayEgressFacts.protocol,
+            tlsCertPath: replayEgressFacts.tlsCertPath,
+            tlsKeyPath: replayEgressFacts.tlsKeyPath,
           });
           if (!egress.ok) {
             errors.push(`replay egress: ${egress.error}`);
           } else {
-            const host = egress.egress_host;
-            const ingress = await orchestrator.dispatchIngress({
-              tunnelId: row.tunnel_id,
-              revision: row.base_revision,
-              ingressNode: nodeFor(orchestrator, ingressNodeId),
-              ingressPort: listenPort,
-              nextHop: `${host}:${egressPort}`,
-            });
-            if (!ingress.ok) errors.push(`replay ingress: ${ingress.error}`);
+            let ingressNextHop = `${egress.egress_host}:${egressPort}`;
+            const baselineMiddleId =
+              baseline.middle_node_id == null ? null : Number(baseline.middle_node_id);
+
+            // V5.4：如果基线本身是三跳，回滚也必须先恢复 middle，再让 ingress 指向它。
+            // middle 的物理端口不复制进 snapshot；它仍由 NodePortLease 唯一持有。
+            if (baselineMiddleId != null) {
+              const leases = (await deps.db.nodePortLease.findMany({
+                where: {
+                  node_id: baselineMiddleId,
+                  tunnel_id: row.tunnel_id,
+                  status: "active",
+                },
+                select: { port: true },
+              })) as Array<{ port: number }>;
+              if (leases.length !== 1) {
+                errors.push(
+                  `replay transit: middle ${baselineMiddleId} active lease 数量=${leases.length}，无法唯一解析端口`,
+                );
+              } else {
+                const transit = await orchestrator.dispatchTransit({
+                  tunnelId: row.tunnel_id,
+                  revision: rollbackRevision,
+                  node: nodeFor(orchestrator, baselineMiddleId),
+                  port: leases[0]!.port,
+                  nextHop: `${egress.egress_host}:${egressPort}`,
+                  protocol: replayEgressFacts.protocol,
+                });
+                if (!transit.ok) {
+                  errors.push(`replay transit: ${transit.error}`);
+                } else {
+                  ingressNextHop = `${transit.host}:${leases[0]!.port}`;
+                }
+              }
+            }
+
+            if (!errors.some((message) => message.startsWith("replay transit:"))) {
+              const ingress = await orchestrator.dispatchIngress({
+                tunnelId: row.tunnel_id,
+                revision: rollbackRevision,
+                ingressNode: nodeFor(orchestrator, ingressNodeId),
+                ingressPort: listenPort,
+                nextHop: ingressNextHop,
+                // The same facts the egress leg just used: one Forward, one protocol.
+                protocol: replayEgressFacts.protocol,
+                tlsCertPath: replayEgressFacts.tlsCertPath,
+                tlsKeyPath: replayEgressFacts.tlsKeyPath,
+              });
+              if (!ingress.ok) errors.push(`replay ingress: ${ingress.error}`);
+            }
+          }
           }
         }
       } else {
@@ -1115,16 +1532,27 @@ export async function compensateRollout(
         if (!targetHost || targetPort == null) {
           errors.push("baseline DIRECT snapshot 缺 target");
         } else {
-          const ingress = await orchestrator.dispatchDirect({
-            tunnelId: row.tunnel_id,
-            revision: row.base_revision,
-            ingressNode: nodeFor(orchestrator, ingressNodeId),
-            ingressPort: listenPort,
-            remoteHost: targetHost,
-            remotePort: targetPort,
-            listenHost: (baseline.listen_ip as string | null) ?? null,
-          });
-          if (!ingress.ok) errors.push(`replay direct: ${ingress.error}`);
+          // NOTE: `row` here is the ROLLOUT row; the protocol fact lives on the
+          // TUNNEL row. Reading it off the rollout row would always look like "no
+          // fact at all" and refuse every replay.
+          const replayDirectFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+          if (replayDirectFacts === null) {
+            errors.push(`replay direct: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
+          } else {
+            const ingress = await orchestrator.dispatchDirect({
+              tunnelId: row.tunnel_id,
+              revision: rollbackRevision,
+              ingressNode: nodeFor(orchestrator, ingressNodeId),
+              ingressPort: listenPort,
+              remoteHost: targetHost,
+              remotePort: targetPort,
+              listenHost: (baseline.listen_ip as string | null) ?? null,
+              protocol: replayDirectFacts.protocol,
+              tlsCertPath: replayDirectFacts.tlsCertPath,
+              tlsKeyPath: replayDirectFacts.tlsKeyPath,
+            });
+            if (!ingress.ok) errors.push(`replay direct: ${ingress.error}`);
+          }
         }
       }
     }
@@ -1144,16 +1572,36 @@ export async function compensateRollout(
       },
       { db: deps.db },
     );
-    // §3.4：config_revision 保持目标 revision（desired 不回退），apply_status
-    // 归到 error 让 UI 显示「更新失败，上一版本仍运行」（§3.7 WP4 契约）。
+    // ── 补偿成功后的记账（V5.3：回滚是**新世代**）──
+    //
+    // 内容已经回到基线，而它挂在一个新的版本号上，所以台账必须**一起前进**：三列写成同一个
+    // rollbackRevision，`apply_status` 回到 `active`（回滚后的状态是"正在按要求运行"，
+    // 而不是"更新失败"）。§3.4 的"desired 不回退"没有被违反 —— desired 前进到了一个内容等于
+    // 基线的新世代；用户看到的是"已回滚到上一版本的内容"，而不是一个名不副实的版本号。
+    //
+    // 这也是下一轮 rollout 的基线从哪来的依据：新世代的快照在 ② 里已经写好，所以按
+    // applied_revision 找基线永远能找到一份与实际运行内容一致的行。
     await deps.db.tunnel
       .updateMany({
         where: { id: row.tunnel_id },
-        data: {
-          apply_status: "error",
-          apply_error_code: "cutover_failed_compensated",
-          apply_error: `rollout ${rolloutId} 回退到 revision ${row.base_revision ?? "none"}`,
-        },
+        data:
+          rollbackRevision === null
+            ? {
+                // 没有基线可回（首次部署失败）：撤干净即正确，desired 保持目标版本、
+                // 状态归 error，让 UI 如实显示"这次更新没成功，现在没有 runtime"。
+                apply_status: "error",
+                apply_error_code: "cutover_failed_compensated",
+                apply_error: `rollout ${rolloutId} 补偿完成：没有旧 runtime 可回（首次部署失败）`,
+              }
+            : {
+                config_revision: rollbackRevision,
+                applied_revision: rollbackRevision,
+                apply_status: "active",
+                apply_error_code: "rollback_compensated",
+                apply_error:
+                  `rollout ${rolloutId} 已回滚：内容 = revision ${row.base_revision ?? "none"}，` +
+                  `新世代 = ${rollbackRevision}（回滚产生新世代，而不是原地重放旧版本号）`,
+              },
       })
       .catch(() => {});
     return { ok: true };
@@ -1876,6 +2324,39 @@ export async function registerRollout(
   }
 
   const { desired, applied, nodes, bindingExists } = await loadRolloutNodes(input.tunnelId, { db });
+
+  // ── V5.4：路由准入（整条路由已知的那一层）──
+  //
+  // 放在这里而不是每条腿各自判定：`dispatchIngress` 看不到出口节点，按腿判定会把**每一个 RELAY
+  // 都拒掉**（试过，28 个测试失败）。路由是一个整体，准入也必须看在整条路由上。
+  //
+  // 配置了中间跳 = 三跳，而当前下发只会发单跳形状：放行的话转发**会正常工作，但走的是另一条路**，
+  // 没有任何错误。因此 fail-closed —— 在**任何副作用之前**拒绝，并点名是哪一跳。
+  const routeAdmission = admitRoute(
+    {
+      ingress_node_id: desired.ingress_node_id,
+      egress_node_id: desired.egress_node_id,
+      middle_node_id: (desired as { middle_node_id?: number | null }).middle_node_id ?? null,
+      tunnel_mode: desired.mode,
+      revision: input.revision,
+    },
+    await loadBoundPairs(db),
+    // V5.4：多跳的**计划 + 执行 + 补偿 + 准入**四件都齐了才打开这一位。
+    // 它存在的原因是：`admitRoute` 必须能区分"这个形状不合法"与"这个形状还没实现" ——
+    // 在实现齐备之前放行，等于让用户配了中间跳之后跑一条**别的路**且毫无提示。
+    { multiHopImplemented: true },
+  );
+  if (!routeAdmission.ok) {
+    return {
+      ok: false,
+      rolloutId: null,
+      status: "blocked",
+      error_code: routeAdmission.code,
+      error: routeAdmission.error,
+      blocking: [{ code: routeAdmission.code, message: routeAdmission.error }],
+    };
+  }
+
   if (!input.suspended && input.impact.runtime_change) {
     const denied = await rolloutRuntimeDenial(input.tunnelId, desired, deps);
     if (denied) {
@@ -1888,7 +2369,7 @@ export async function registerRollout(
   }
   indexRolloutNodes(
     deps.orchestrator,
-    [nodes.ingress, nodes.egress].filter((n) => n != null) as any,
+    [nodes.ingress, nodes.egress, nodes.middle].filter((n) => n != null) as any,
   );
 
   const planInput: PlanRolloutInput = {

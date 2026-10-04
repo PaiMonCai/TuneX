@@ -61,10 +61,22 @@ import type { ControlValidator } from "./control-protocol/index.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
 import {
+  DEFAULT_FORWARD_PROTOCOL,
+  admitPersistedProtocol,
+  buildForwardRuntimePlan,
+  forwardRuntimePlanViolations,
   normalizeForwardProtocol,
   persistedForwardProtocol,
+  type ForwardRuntimePlan,
   type ForwardProtocol,
 } from "./forward-contract.ts";
+import {
+  admitRuntimeFromStore,
+  admissionFailureDetail,
+  type AdmissionTarget,
+  type CapabilityFactsLoader,
+  type RuntimeAdmissionDenied,
+} from "./runtime-admission.ts";
 
 /* ================================================================== */
 /* 常量与状态机                                                        */
@@ -128,6 +140,19 @@ export const SCHEDULER_ERROR_CODES = {
   invalid_target: "invalid_target",
   /** V5-WP0：协议事实存在，但当前 runtime/Gate 未开放，禁止下发。 */
   unsupported_protocol: "unsupported_protocol",
+  /**
+   * V5-WP1：节点**尚未实现**这份配置所需的动作 / 协议 / 传输能力。
+   *
+   * 与 `unsupported_protocol` 刻意分开：那一个是「产品还没开放这个协议」（等版本
+   * 或换协议），这一个是「这台节点还没实现」（升级 Agent 或换一台节点）。两者的
+   * 下一步动作完全不同，压成一个码会把运维引向错误的修复方向。
+   *
+   * 精确原因（`upgrade_required` / `incompatible_agent` /
+   * `malformed_capability_manifest` / `protocol_not_supported` /
+   * `transport_not_supported` / `runtime_feature_not_supported`）随
+   * `apply_error` 的 `[runtime_admission:<reason>:<layer>]` 前缀一起落库。
+   */
+  runtime_capability_denied: "runtime_capability_denied",
 
   /* ── ② bind / acquire（副作用开始产生，失败要补偿）── */
   /** 节点组下没有可用于该方向的 Node（role 不匹配或全部离线）。 */
@@ -210,6 +235,8 @@ export const SCHEDULER_STEPS = [
   "bump_revision",
   "apply_egress",
   "egress_ack",
+  // V5.4：三跳路由的中间跳（在出口之后、入口之前 —— 正向先远后近）。
+  "apply_transit",
   "apply_ingress",
   "ingress_ack",
   "activate",
@@ -298,6 +325,14 @@ export interface CreateRelaySuccess {
   ingressPort: number;
   /** 节点间内部通信端口（非用户可见）。 */
   egressPort: number | null;
+  /**
+   * V5-WP2：本次下发所依据的 **RuntimePlan**（纯计划）。
+   *
+   * 返回它是为了让"计划"可被外部断言，而不是只有编排器自己知道：Gate V5-G0
+   * 与后续协议都要检查「计划里的协议/传输/目标 == 实际下发到 Agent 的那一份」。
+   * 计划本身不含 socket，只有事实。
+   */
+  runtimePlan?: ForwardRuntimePlan;
   steps: StepRecord[];
 }
 
@@ -355,6 +390,11 @@ export interface SchedulerDeps {
   authorizeGroup?: typeof canUseNodeGroup;
   /** Existing apply/retry/resume only; does not consume a creation count slot. */
   runtimeUse?: RuntimeUseChecker;
+  /**
+   * V5-WP1：读取节点已上报的 v2 协商事实（默认读 `node_state_report`）。
+   * 注入点是**测试**用的，生产路径只有一处实现（services/runtime-admission.ts）。
+   */
+  loadCapabilityFacts?: CapabilityFactsLoader;
   /** 编排时钟（测试注入固定时间，避免 TTL 边界漂移）。 */
   now?: () => Date;
 }
@@ -380,7 +420,59 @@ function resolveDeps(over?: SchedulerDeps) {
     now: over?.now ?? defaultDeps.now,
     validator: over?.validator,
     portPoolDeps: over?.portPoolDeps,
+    loadCapabilityFacts: over?.loadCapabilityFacts,
   };
+}
+
+/**
+ * V5-WP1 runtime admission：**下发前**确认每一台参与节点都实现了
+ * 「这个动作 + 这个协议 + 这个传输」。
+ *
+ * 为什么放在编排层而不是只依赖 Agent 侧的拒绝：
+ *   · Agent 侧拒绝发生在命令**已经入队、端口租约已经产生**之后。RELAY 场景下
+ *     出口可能已经 ACK，于是要跑一遍补偿才回到干净状态——一次本来可以在
+ *     "零副作用"阶段拦下的失败，变成了三条写操作加一次撤隧道。
+ *   · 「节点离线」和「节点不支持」必须能被区分。前者可以重试，后者重试一万
+ *     次也没用，只能升级 Agent 或换节点。
+ *
+ * 判定规则本身**不在这里**（见 services/runtime-admission.ts）：本函数只负责
+ * 取事实、把结构化原因翻译成 scheduler 的错误码空间、并落一条可排障的 detail。
+ */
+async function admitBoundRuntime(
+  deps: ReturnType<typeof resolveDeps>,
+  targets: readonly AdmissionTarget[],
+  protocol: ForwardProtocol,
+): Promise<RuntimeAdmissionDenied | null> {
+  const admitted = await admitRuntimeFromStore(
+    targets,
+    { action: "apply_tunnel", protocol },
+    deps.loadCapabilityFacts,
+  );
+  return admitted.ok ? null : admitted;
+}
+
+/**
+ * V5-WP5-A1: the tls front's paths off a persisted row.
+ *
+ * Only returned for an admitted `tls` fact: handing paths to a tcp/ws tunnel
+ * would put fields on the wire that the Agent must then decide to ignore, and
+ * "the Agent ignores it" is not a contract.
+ */
+function tlsPathsFor(row: Record<string, unknown>, protocol: ForwardProtocol) {
+  if (protocol !== "tls") return {};
+  const cert = typeof row.tls_cert_path === "string" ? row.tls_cert_path.trim() : "";
+  const key = typeof row.tls_key_path === "string" ? row.tls_key_path.trim() : "";
+  if (cert === "" || key === "") {
+    // A tls row without paths is a broken configuration, not a tcp tunnel: the
+    // dispatch refuses (see Orchestrator.tlsFields) rather than downgrading.
+    return { tlsCertPath: null, tlsKeyPath: null };
+  }
+  return { tlsCertPath: cert, tlsKeyPath: key };
+}
+
+/** admission 失败 → `Tunnel.apply_error` 上的结构化记录（不删业务行，§7.11）。 */
+function admissionFailureText(denied: RuntimeAdmissionDenied): string {
+  return admissionFailureDetail(denied);
 }
 
 /* ================================================================== */
@@ -1002,6 +1094,33 @@ export async function createRelayTunnel(
     steps.push({ step: "bind_nodes", ok: true });
   }
 
+  /* ---------------- V5-WP1 runtime admission（下发前，零副作用） ---------------- */
+  //
+  // 位置是有意的：在端口租约产生**之前**、在 placements 落库**之前**。到这里
+  // 两端节点已经确定，因此可以一次判完 ingress + egress；任何一端不满足就直接
+  // 失败，不产生租约、不产生 runtime、不需要补偿。
+  const admissionDenied = await admitBoundRuntime(
+    deps,
+    [
+      { nodeId: ingressPick.node.id, role: "ingress" },
+      { nodeId: egressPick.node.id, role: "egress" },
+    ],
+    protocol,
+  );
+  if (admissionDenied) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied, admissionFailureText(admissionDenied), {
+      tunnelId,
+      meta: {
+        runtime_admission: {
+          node_id: admissionDenied.node_id,
+          node_role: admissionDenied.node_role,
+          layer: admissionDenied.layer,
+          reason: admissionDenied.reason,
+        },
+      },
+    });
+  }
+
   await store.tunnel.update({
     where: { id: tunnelId },
     data: {
@@ -1136,6 +1255,7 @@ export async function createRelayTunnel(
     egressPort: egressAlloc.port,
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    protocol,
   });
   if (!egressDispatch.ok) {
     // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。
@@ -1159,13 +1279,58 @@ export async function createRelayTunnel(
     meta: { applied_revision: egressDispatch.result.revision },
   });
 
+  /* ---------------- V5-WP2 RuntimePlan（事实齐了之后的自检） ---------------- */
+  //
+  // 位置就是重点：RELAY 的 next_hop 只有出口 ACK 之后才存在（§1.3 铁律一），
+  // 所以计划只能在这里成型。在此之前用 `protocol` 原值下发，从这里开始一律走
+  // 计划——协议、传输、placement、listener、upstream 全部来自同一份纯计划，
+  // 不再由各调用点各自拼一遍。
+  //
+  // 自检失败 = 我们即将下发一份自相矛盾的配置（例如 RELAY 却没有 next_hop）。
+  // 那时出口已经 ACK，所以必须先补偿再失败，绝不让入口带着坏 hop 启动。
+  const plan = buildForwardRuntimePlan("relay", protocol, {
+    revision,
+    placement: {
+      ingress_node_id: ingressPick.node.id,
+      egress_node_id: egressPick.node.id,
+      egress_pool_id: poolId,
+    },
+    listener: { host: input.listenIp ?? null, port: ingressAlloc.port },
+    upstream: {
+      targets: (egressTargets as { host: string; port: number }[]).map((t) => ({
+        host: t.host,
+        port: t.port,
+      })),
+      next_hop: `${egressDispatch.egress_host}:${egressAlloc.port}`,
+    },
+  });
+  const planViolations = forwardRuntimePlanViolations(plan);
+  if (planViolations.length > 0) {
+    // 注意：这是 `createRelayTunnel`（另一条编排），**不认识中间跳** —— 见 §9 里
+    // "两条编排里只有一条认识中间跳"的记录。这里保留它原来的内联拆除，不做半套改动：
+    // 把中间跳支持搬过来需要与 `reapplyRelayTunnel` 同等的一套（端口分配 + 中转腿 + 逆序拆除），
+    // 而那属于"先确认它是否可达"之后的事。
+    await orchestrator
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
+      .catch(() => {});
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    return fail(
+      "apply_ingress",
+      SCHEDULER_ERROR_CODES.invariant_violated,
+      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      { tunnelId, revision, meta: { runtime_plan_violations: planViolations } },
+    );
+  }
+
   /* ---------------- ⑧⑨ apply Ingress → ACK ---------------- */
   const ingressDispatch = await orchestrator.dispatchIngress({
     tunnelId,
     revision,
     ingressNode: ingressPick.node,
     ingressPort: ingressAlloc.port,
-    nextHop: `${egressDispatch.egress_host}:${egressAlloc.port}`,
+    nextHop: plan.upstream.next_hop as string,
+    protocol: plan.protocol.name,
+    ...tlsPathsFor(asRow<Record<string, unknown>>(created) as Record<string, unknown>, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
     /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
@@ -1202,6 +1367,7 @@ export async function createRelayTunnel(
     egressNodeId: egressPick.node.id,
     ingressPort: ingressAlloc.port,
     egressPort: egressAlloc.port,
+    runtimePlan: plan,
     steps,
   };
 }
@@ -1239,14 +1405,10 @@ export async function createRelayTunnel(
  *        是进程级的，重建实例会让两端看到不同的账本）。
  * @param over 见 {@link SchedulerDeps}。
  */
-function admittedPersistedProtocol(row: Record<string, unknown>): ForwardProtocol | null {
-  try {
-    const fact = persistedForwardProtocol(row.forward_protocol, row.tunnel_type);
-    return normalizeForwardProtocol(fact);
-  } catch {
-    return null;
-  }
-}
+/* `admittedPersistedProtocol` moved to forward-contract.ts (WP4/G0): every
+   dispatch path needs the same answer, and two copies is how one path admits a
+   fact another refuses. */
+const admittedPersistedProtocol = admitPersistedProtocol;
 
 async function checkExistingRuntime(
   row: Record<string, unknown>,
@@ -1283,7 +1445,7 @@ async function checkExistingRuntime(
   return deps.runtimeUse(row.workspace_id, {
     user_id: row.user_id, in_node_group_id: inGroup,
     out_node_group_id: outGroup as number | null,
-    tunnel_type: protocol,
+    protocol,
   });
 }
 
@@ -1372,6 +1534,10 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "auth_quota", ok: true });
   steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true } });
 
+  // Resolved once, used for admission, dispatch and the canonical fact written
+  // back below: three places that must agree on which protocol this is.
+  const reapplyProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
+
   /* ---------------- ③ bind nodes ---------------- */
   const [inCandidatesRaw, outCandidatesRaw] = await Promise.all([
     store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
@@ -1447,6 +1613,32 @@ export async function reapplyRelayTunnel(
   } else {
     steps.push({ step: "bind_nodes", ok: true });
   }
+  /* V5-WP1：重推走的是同一条 admission——重推不换节点，所以节点换过镜像
+     （升级 / 回退）之后必须重新判一次，而不是沿用上一次的结论。 */
+  const reapplyAdmissionDenied = await admitBoundRuntime(
+    deps,
+    [
+      { nodeId: ingressPick.node.id, role: "ingress" },
+      { nodeId: egressPick.node.id, role: "egress" },
+    ],
+    admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL,
+  );
+  if (reapplyAdmissionDenied) {
+    return fail(
+      "bind_nodes",
+      SCHEDULER_ERROR_CODES.runtime_capability_denied,
+      admissionFailureText(reapplyAdmissionDenied),
+      {
+      meta: {
+        runtime_admission: {
+          node_id: reapplyAdmissionDenied.node_id,
+          node_role: reapplyAdmissionDenied.node_role,
+          layer: reapplyAdmissionDenied.layer,
+          reason: reapplyAdmissionDenied.reason,
+        },
+      },
+    });
+  }
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: ingressPick.node, egress: egressPick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
   await store.tunnel.update({
@@ -1454,6 +1646,12 @@ export async function reapplyRelayTunnel(
     data: {
       ingress_node_id: ingressPick.node.id, egress_node_id: egressPick.node.id, egress_pool_id: poolId,
       apply_status: APPLY_STATUS.applying, desired_status: DESIRED_STATUS.inactive,
+      // V5-WP1/G0: a Forward created before the protocol column existed carries
+      // its fact only in `tunnel_type`. Re-orchestrating it is the moment the
+      // canonical fact can be materialised, and leaving it NULL means every
+      // later reader keeps falling back to the legacy column forever. The value
+      // is the admitted protocol (admission already ran above), never a default.
+      forward_protocol: reapplyProtocol,
     },
   });
 
@@ -1524,6 +1722,30 @@ export async function reapplyRelayTunnel(
 
   const ingressPort = ingressAlloc.port;
   const egressPort = egressAlloc.port;
+
+  // ── V5.4：三跳路由的中间跳端口（唯一新增的分配）──
+  //
+  // 创建路径此前完全不认识 `middle_node_id`：它只发入口与出口两腿，中间跳没有任何 runtime，
+  // 于是流量**绕过中间跳**走单跳路径 —— 客户端照样通，所以只看"通不通"永远发现不了
+  // （实测：中间节点上报里 has_any=0 而客户端有数据）。创建路径是"知道中间跳"的第二条路。
+  const middleNodeId = (row as { middle_node_id?: number | null }).middle_node_id ?? null;
+  let middlePort: number | null = null;
+  /** 中间跳的节点事实（发出去之后供 teardownDispatched 逆序拆除）。 */
+  let transitNode: { id: number; node_id: string; connect_ip: string | null; role: "both" | "egress" | "ingress" | null } | null = null;
+  if (middleNodeId != null) {
+    const middleAlloc = await allocateTunnelPort(
+      { nodeId: middleNodeId, direction: "egress", preferred: null, tunnelId, reservedPorts: [] },
+      deps.portPoolDeps,
+    );
+    if (!middleAlloc.ok) {
+      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      return fail("acquire_ports", middleAlloc.code, `中间跳端口分配失败：${middleAlloc.detail}`, {
+        meta: { direction: "transit", middle_node_id: middleNodeId },
+      });
+    }
+    middlePort = middleAlloc.port;
+  }
+
   await store.tunnel.update({ where: { id: tunnelId }, data: { listen_port: ingressPort, egress_port: egressPort } });
   steps.push({
     step: "acquire_ports",
@@ -1571,6 +1793,7 @@ export async function reapplyRelayTunnel(
     egressPort,
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    protocol: reapplyProtocol,
   });
   if (!egressDispatch.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
@@ -1582,19 +1805,121 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
   steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
 
+  /**
+   * 撤掉本次**已经发出去**的腿，逆序（先中间、后出口），并释放端口租约。
+   *
+   * 为什么要收敛成一个函数：这条路径原先在每个失败分支里各写一次 `removeTunnel(egress)`，
+   * 而 V5.4 新增了"中间跳"这条腿之后，**没有任何一个分支记得撤它** —— 实测症状是
+   * Agent 侧留下端口守卫（`port 22001 is already used by another tunnel`），DB 租约却已释放，
+   * 于是下一次分配又选中同一个端口、被 Agent 正确地拒绝，看起来像"端口分配有 bug"。
+   *
+   * 一个失败分支漏撤一条腿 = 一次永久性资源泄漏，而泄漏只在**下一次**创建时才显形。
+   * 所以它必须是一处、且必须逆序（正向先远后近 ⇒ 拆除先近后远）。
+   */
+  const teardownDispatched = async (reason: string): Promise<void> => {
+    if (transitNode != null) {
+      await orchestrator
+        .removeTunnel({ tunnelId, node: transitNode, direction: "egress", revision: revision + 1, reason: `${reason} (transit)` })
+        .catch(() => {});
+    }
+    await orchestrator
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason })
+      .catch(() => {});
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+  };
+
+  // ── V5.4：中间跳（若有）──
+  //
+  // 与 rollout 路径**共用同一份实现**（`Orchestrator.dispatchTransit`）：编排可以有两处，
+  // 但"怎么发一条中间跳"只能有一处 —— 否则两条路径会在某次改动后悄悄分叉。
+  //
+  // 正向顺序仍是**先远后近**：出口已发 → 现在发中间跳（目标 = 出口）→ 最后才切入口（目标 = 中间跳）。
+  let transitHost: string | null = null;
+  if (middleNodeId != null && middlePort != null) {
+    // 中间跳**不是调度候选**：候选按节点组筛（`inNodeGroupId` / `outNodeGroupId`），而中间跳是
+    // 用户显式选定的放置事实，通常属于**第三个**节点组 —— 从候选列表里找它永远找不到。
+    // 实测后果：`apply_transit` 报 `invariant_violated`（"中间跳节点不存在"），而出口腿已经发出去了。
+    // 所以直接按 id 读它，和"绑定后的入出口必须落在指定节点"是同一口径：**已确定的放置事实不参与重新调度**。
+    const middleNode = (await store.node.findUnique({ where: { id: middleNodeId } })) as
+      | SchedulableNode
+      | null;
+    if (!middleNode) {
+      await teardownDispatched("middle node missing");
+      return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, `中间跳节点 ${middleNodeId} 不存在`, {
+        revision,
+      });
+    }
+    const transit = await orchestrator.dispatchTransit({
+      tunnelId,
+      revision,
+      node: {
+        id: middleNode.id,
+        node_id: String(middleNode.node_id ?? middleNode.id),
+        connect_ip: (middleNode.connect_ip as string | null) ?? null,
+        role: (middleNode.role as "both" | "egress" | "ingress" | null) ?? null,
+      },
+      port: middlePort,
+      nextHop: `${egressDispatch.egress_host}:${egressPort}`,
+      protocol: reapplyProtocol,
+    });
+    if (!transit.ok) {
+      await teardownDispatched("transit apply failed");
+      return fail("apply_transit", mapDispatchCode("egress", transit), transit.error, { revision });
+    }
+    transitHost = transit.host;
+    transitNode = {
+      id: middleNode.id,
+      node_id: String(middleNode.node_id ?? middleNode.id),
+      connect_ip: (middleNode.connect_ip as string | null) ?? null,
+      role: (middleNode.role as "both" | "egress" | "ingress" | null) ?? null,
+    };
+    steps.push({ step: "apply_transit", ok: true, meta: { middle_node_id: middleNodeId, port: middlePort } });
+  }
+
+  /* ---------------- V5-WP2 RuntimePlan 自检（与创建路径同源） ---------------- */
+  const plan = buildForwardRuntimePlan("relay", reapplyProtocol, {
+    revision,
+    placement: {
+      ingress_node_id: ingressPick.node.id,
+      egress_node_id: egressPick.node.id,
+      egress_pool_id: poolId,
+    },
+    listener: { host: typeof row.listen_ip === "string" ? row.listen_ip : null, port: ingressPort },
+    upstream: {
+      targets: (egressTargets as { host: string; port: number }[]).map((t) => ({
+        host: t.host,
+        port: t.port,
+      })),
+      // 三跳时入口的下一跳是**中间跳**，不是出口 —— 这正是 V5.4 之前这里会错的地方。
+      next_hop:
+        transitHost != null && middlePort != null
+          ? `${transitHost}:${middlePort}`
+          : `${egressDispatch.egress_host}:${egressPort}`,
+    },
+  });
+  const planViolations = forwardRuntimePlanViolations(plan);
+  if (planViolations.length > 0) {
+    await teardownDispatched("runtime plan invalid");
+    return fail(
+      "apply_ingress",
+      SCHEDULER_ERROR_CODES.invariant_violated,
+      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      { revision, meta: { runtime_plan_violations: planViolations } },
+    );
+  }
+
   /* ---------------- ⑧⑨ apply Ingress → ACK ---------------- */
   const ingressDispatch = await orchestrator.dispatchIngress({
     tunnelId,
     revision,
     ingressNode: ingressPick.node,
     ingressPort,
-    nextHop: `${egressDispatch.egress_host}:${egressPort}`,
+    nextHop: plan.upstream.next_hop as string,
+    protocol: plan.protocol.name,
+    ...tlsPathsFor(row, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, revision: revision + 1, reason: "ingress apply failed" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    await teardownDispatched("ingress apply failed");
     return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
       revision,
       meta: { command_id: ingressDispatch.commandId ?? null },
@@ -1750,6 +2075,33 @@ export async function reapplyDirectTunnel(
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: pick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
 
+  // Resolved once: admission, dispatch and the canonical fact written back below
+  // must agree on which protocol this is.
+  const directProtocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
+
+  /* V5-WP1 runtime admission（DIRECT：只需入口节点满足动作 + 协议 + 传输）。
+     与 unsupported_protocol 同一处理：只写 apply_status/apply_error_code，
+     不动 desired_status —— admission 拒绝不是用户意图改变，「失败保留业务
+     资源」这条铁律在这里体现为不把 desired 改成 inactive。 */
+  const directAdmissionDenied = await admitBoundRuntime(
+    deps,
+    [{ nodeId: pick.node.id, role: "ingress" }],
+    admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL,
+  );
+  if (directAdmissionDenied) {
+    const detail = admissionFailureText(directAdmissionDenied);
+    const code = SCHEDULER_ERROR_CODES.runtime_capability_denied;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        apply_error_code: code,
+        apply_error: detail.slice(0, 500),
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+  }
+
   const reserved = collectReservedPorts(
     (await store.tunnel.findMany({
       where: { in_node_group_id: inNodeGroupId },
@@ -1793,8 +2145,35 @@ export async function reapplyDirectTunnel(
       config_revision: revision,
       apply_error_code: null,
       apply_error: null,
+      // See reapplyRelayTunnel: a successful re-orchestration materialises the
+      // canonical protocol fact instead of leaving history's only evidence in
+      // the legacy column.
+      forward_protocol: directProtocol,
     },
   });
+
+  /* V5-WP2 RuntimePlan 自检（DIRECT：端口分配后所有事实齐了）。 */
+  const directPlan = buildForwardRuntimePlan("direct", directProtocol, {
+    revision,
+    placement: { ingress_node_id: pick.node.id },
+    listener: { host: typeof row.listen_ip === "string" ? row.listen_ip : null, port: ingressPort },
+    upstream: { targets: [{ host: remoteHost, port: remotePort }] },
+  });
+  const directPlanViolations = forwardRuntimePlanViolations(directPlan);
+  if (directPlanViolations.length > 0) {
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const code = SCHEDULER_ERROR_CODES.invariant_violated;
+    const detail = `RuntimePlan 自检未通过：${directPlanViolations.join("; ")}`;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: {
+        apply_status: APPLY_STATUS.error,
+        apply_error_code: code,
+        apply_error: detail.slice(0, 500),
+      },
+    }).catch(() => {});
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+  }
 
   const dispatched = await orchestrator.dispatchDirect({
     tunnelId,
@@ -1804,6 +2183,8 @@ export async function reapplyDirectTunnel(
     remoteHost,
     remotePort,
     listenHost: typeof row.listen_ip === "string" ? row.listen_ip : null,
+    protocol: directPlan.protocol.name,
+    ...tlsPathsFor(row, directPlan.protocol.name),
   });
   if (!dispatched.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});

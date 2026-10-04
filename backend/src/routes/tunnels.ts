@@ -35,6 +35,10 @@ import {
   withWorkspaceQuotaLock,
 } from "../services/policy-service.ts";
 import { checkTunnelCreation } from "../services/capability-policy.ts";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  legacyTunnelTypeForForwardProtocol,
+} from "../services/forward-contract.ts";
 import { getOrchestrator } from "../services/relay-wiring.ts";
 import { reapplyDirectTunnel } from "../services/scheduler.ts";
 import {
@@ -255,7 +259,11 @@ tunnelsRoutes.post("/", async (c) => {
     const decision = checkTunnelCreation(policy, {
       tunnelCount,
       trafficUsed,
-      protocol: "tcp",
+      // The route above already refused every non-tcp request, so this is the
+      // V4 default made explicit — via the contract constant, never a literal
+      // (a literal here is how "the protocol is tcp" spread to paths that must
+      // resolve it per row).
+      protocol: DEFAULT_FORWARD_PROTOCOL,
       inGroupOwned: inGroup.workspace_id === workspace.id,
       inGroupId: inGroup.id,
       outGroupId: null,
@@ -274,15 +282,17 @@ tunnelsRoutes.post("/", async (c) => {
     const created = await tx.tunnel.create({
       data: {
         name,
-        tunnel_type: "tcp",
-        forward_protocol: "tcp",
+        // `TunnelType` is a Prisma enum; the value still comes from the contract
+        // (the legacy mirror of the canonical protocol), never from a literal.
+        tunnel_type: legacyTunnelTypeForForwardProtocol(DEFAULT_FORWARD_PROTOCOL) as "tcp",
+        forward_protocol: DEFAULT_FORWARD_PROTOCOL,
         category: "port_forward",
         listen_ip: body.listen_ip ? String(body.listen_ip) : "0.0.0.0",
         listen_port: listenPort,
-        listen_protocol: ["tcp"],
+        listen_protocol: [DEFAULT_FORWARD_PROTOCOL],
         status: "active",
         forward_addresses: forward,
-        forward_addresses_protocol: forward.map(() => "tcp"),
+        forward_addresses_protocol: forward.map(() => DEFAULT_FORWARD_PROTOCOL),
         load_balance_type: "round",
         ip_type: "ipv4",
         order_by: (maxOrder._max.order_by ?? 0) + 10,
