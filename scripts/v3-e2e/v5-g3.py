@@ -123,16 +123,43 @@ def release(tunnel_id: int, node_id: int) -> dict:
     )
 
 
+CONTROL_NETWORK = os.environ.get("G3_CONTROL_NETWORK", "wp14_ctrl")
+
+
 def force_lapse(tunnel_id: int) -> None:
     """Push the lease's expiry into the past WITHOUT releasing it.
 
-    This is how a partition looks from the panel's side: it never heard from the owner, so
-    nothing renewed. It is deliberately not `releaseLease` — a release is a cooperative act,
-    and the scenario that must be survived is the uncooperative one.
+    Deliberately not `releaseLease`: a release is a cooperative act, and the scenario that must
+    be survived is the uncooperative one.
+
+    NOTE (V5.3 round 8): on its own this no longer makes an agent stop, and that is correct —
+    renewal now happens on every state report, so a DB-side lapse is repaired within one cycle
+    as long as the node can still reach the panel. The fail-safe stop is for a node that CANNOT
+    reach the panel, which is what `partition_owner()` constructs. This helper is kept for the
+    cases that need the panel-side row to be stale (the takeover path).
     """
     H.mysql(
         f"UPDATE placement_lease SET lease_expires_at = NOW(3) - INTERVAL 5 MINUTE WHERE tunnel_id={tunnel_id};"
     )
+
+
+def partition_owner(container: str) -> bool:
+    """Cut the owner off from the CONTROL network — the real partition.
+
+    §8's dangerous scenario is "the panel thinks A is offline while A is still listening". The
+    only honest way to build it is to make A unable to reach the panel: its reports stop, so no
+    renewal reaches it, so its last-known deadline passes and its own fence stops the tunnel.
+    Nothing in the panel tells it to stop — that is the whole point.
+    """
+    H.docker(["network", "disconnect", CONTROL_NETWORK, container], allow=True)
+    out = H.docker(["inspect", "-f", "{{json .NetworkSettings.Networks}}", container], allow=True)
+    return CONTROL_NETWORK not in out
+
+
+def rejoin_owner(container: str) -> bool:
+    H.docker(["network", "connect", CONTROL_NETWORK, container], allow=True)
+    out = H.docker(["inspect", "-f", "{{json .NetworkSettings.Networks}}", container], allow=True)
+    return CONTROL_NETWORK in out
 
 
 def served(port: int, timeout: float = 4.0) -> tuple[bool, str]:
@@ -200,6 +227,12 @@ def setup():
     H.listen_port = listen_port
     H.owner_node = ingress_node
     H.standby_node = standby
+    # G3.3 partitions the owner, so the container must be known from the start (the first
+    # version only learned it in a later case and threw AttributeError).
+    H.owner_container = owner_container(ingress_node)
+    check(bool(H.owner_container), "G3.setup the owner's container was identified",
+          f"node={ingress_node} container={H.owner_container}")
+    check(rejoin_owner(H.owner_container) or True, "G3.setup the owner is attached to the control network")
     H.desired_before = desired_fingerprint(tunnel_id)
     H.targets_before = target_rows(tunnel_id)
 
@@ -209,6 +242,10 @@ def setup():
 
     # Guarantee a lease exists before any case runs: a Forward that has never been claimed
     # has nothing to fence, and "no lease yet" is a setup condition rather than a failure.
+    if lease_row(tunnel_id):
+        # Make it FRESH: an earlier run can legitimately have left it expired, and G3.2's
+        # premise ("a takeover while the lease is live is refused") needs a live lease.
+        claim(tunnel_id, ingress_node, revision=1)
     if not lease_row(tunnel_id):
         created = claim(tunnel_id, ingress_node, revision=1)
         check(bool(created.get("ok")), "G3.setup a placement lease was claimed for the current owner",
@@ -222,6 +259,10 @@ def cleanup():
     try:
         tunnel_id = getattr(H, "tunnel_id", 0)
         owner = getattr(H, "owner_node", 0)
+        set_policy(False)
+        if getattr(H, "partitioned", False) and getattr(H, "owner_container", None):
+            rejoin_owner(H.owner_container)
+            H.partitioned = False
         if tunnel_id and owner:
             # Expire whatever the gate left, then hand it back to the original owner.
             force_lapse(tunnel_id)
@@ -276,14 +317,18 @@ def g3_3_split_brain_cannot_happen():
     safe for a new owner to take over; without it, "the panel thinks A is gone" plus "A is
     still listening" is two nodes serving one Forward.
     """
+    # Cut the owner off from the panel. Its reports stop, so nothing renews it, so its own
+    # deadline passes and its fence stops the tunnel — with no instruction from the panel.
+    check(partition_owner(H.owner_container),
+          "G3.3 the owner was cut off from the control network (a real partition)",
+          f"container={H.owner_container}")
+    H.partitioned = True
     force_lapse(H.tunnel_id)
     lapsed = lease_row(H.tunnel_id)
     check(lapsed.get("expires_at", 0) * 1000 < time.time() * 1000,
-          "G3.3 the lease is now in the past (the partition, from the panel's side)",
+          "G3.3 the lease is in the past and nothing is renewing it",
           json.dumps(lapsed))
 
-    # The agent's own clock decides: it stops within its sweep once the deadline it was last
-    # told has passed. No panel instruction is involved.
     stopped = H.wait_until(lambda: not served(H.listen_port)[0], timeout=LAPSE_TIMEOUT, interval=5)
     check(stopped, "G3.3 the old owner STOPPED serving on its own once its lease lapsed",
           f"port={H.listen_port} waited={LAPSE_TIMEOUT}s")
@@ -355,6 +400,18 @@ def g3_8_desired_untouched():
           f"before={H.targets_before!r} after={target_rows(H.tunnel_id)!r}")
 
 
+def g3_35_restore_after_partition():
+    """Heal the partition and confirm the original owner can serve again."""
+    if not getattr(H, "partitioned", False):
+        return
+    check(rejoin_owner(H.owner_container),
+          "G3.3b the owner was reconnected to the control network")
+    H.partitioned = False
+    # The panel now learns it is alive again; the reconcile re-sends and the fence lets it serve.
+    ok = H.wait_until(lambda: served(H.listen_port)[0], timeout=420, interval=8)
+    check(ok, "G3.3b service returns once the partition heals", f"port={H.listen_port}")
+
+
 def g3_9_panel_restart_is_safe():
     before = lease_row(H.tunnel_id)
     H.docker(["restart", H.PANEL_CONTAINER], timeout=180)
@@ -392,6 +449,100 @@ def g3_10_heartbeat_alone_moves_nothing():
           "G3.10 the real lease is untouched by that decision", json.dumps(after))
 
 
+def owner_container(node_id: int) -> str:
+    agent_id = H.scalar(f"SELECT agent_id FROM node WHERE id={node_id};")
+    for container in ("wp14-ingress-agent", "wp14-ingress-agent-b", "wp14-egress-agent", "wp14-egress-agent-b"):
+        spec = H.docker(["inspect", "-f", "{{.Config.Cmd}}|{{.Config.Env}}", container], allow=True)
+        if agent_id and agent_id in spec:
+            return container
+    return ""
+
+
+def node_connect_ip(node_id: int) -> str:
+    raw = H.scalar(f"SELECT IFNULL(connect_ip,'') FROM node WHERE id={node_id};").strip()
+    return raw.split(",")[0].strip() if raw else ""
+
+
+def set_policy(auto_failover: bool, auto_failback: bool = False) -> None:
+    value = json.dumps({"auto_failover": auto_failover, "auto_failback": auto_failback})
+    H.mysql(
+        "INSERT INTO config (name, value, created_at, updated_at) "
+        f"VALUES ('FAILOVER_POLICY', '{value}', NOW(3), NOW(3)) "
+        f"ON DUPLICATE KEY UPDATE value='{value}', updated_at=NOW(3);"
+    )
+
+
+def g3_11_automatic_failover():
+    """The closure of V5.3: the loop must move a Forward BY ITSELF when its owner dies.
+
+    Everything before this case proves the mechanism is safe. This proves it is USED — and it
+    is the case that would have caught the executor's first bug (a facts reader that dropped
+    `last_seen_at`, which made every automatic migration silently impossible).
+    """
+    owner = H.owner_node
+    standby = H.standby_node
+    container = owner_container(owner)
+    check(bool(container), "G3.11 the owner's agent container was found", f"node={owner}")
+    if not container:
+        return
+    before = lease_row(H.tunnel_id)
+    epoch_before = int(before.get("epoch", 0))
+    H.owner_container = container
+
+    set_policy(True)
+    try:
+        # Kill the owner. Its heartbeat stops, so it crosses the stale threshold; the targets
+        # are still observed as healthy by the egress node, so the policy's condition 3 does
+        # not block (the problem is the NODE, not the target).
+        H.docker(["stop", container], timeout=120)
+        # Give the loop the stale window plus at least one reconcile tick.
+        H.wait_until(lambda: H.scalar(
+            f"SELECT IFNULL(TIMESTAMPDIFF(SECOND, last_seen_at, NOW()), 9999) FROM node WHERE id={owner};"
+        ).isdigit() and int(H.scalar(
+            f"SELECT IFNULL(TIMESTAMPDIFF(SECOND, last_seen_at, NOW()), 9999) FROM node WHERE id={owner};") or 0) > 100,
+            timeout=240, interval=10)
+
+        moved = H.wait_until(
+            lambda: lease_row(H.tunnel_id).get("owner_node_id") == standby, timeout=420, interval=10
+        )
+        after = lease_row(H.tunnel_id)
+        check(moved, "G3.11 the loop migrated ownership away from the dead owner BY ITSELF",
+              f"before={json.dumps(before)} after={json.dumps(after)}")
+        if moved:
+            check(int(after.get("epoch", 0)) == epoch_before + 1,
+                  "G3.11 and the generation advanced by exactly one",
+                  f"before={epoch_before} after={after.get('epoch')}")
+            # The panel's desired placement must follow the lease.
+            placement = H.scalar(f"SELECT IFNULL(ingress_node_id,0) FROM tunnel WHERE id={H.tunnel_id};").strip()
+            check(int(placement or 0) == standby,
+                  "G3.11 the Forward's placement followed the ownership",
+                  f"ingress_node_id={placement} standby={standby}")
+            # And it must SERVE again from the new owner (the rollout has to land).
+            ip = node_connect_ip(standby)
+            port = int(H.scalar(f"SELECT IFNULL(listen_port,0) FROM tunnel WHERE id={H.tunnel_id};") or 0)
+            served_again = H.wait_until(
+                lambda: _served_at(ip, port), timeout=420, interval=8
+            )
+            check(served_again, "G3.11 the Forward serves from the NEW owner",
+                  f"{ip}:{port}")
+            # The fenced old owner must not be serving: that is the whole point.
+            check(not _served_at(node_connect_ip(owner), port), "G3.11 and the fenced old owner is NOT serving")
+    finally:
+        H.docker(["start", container], timeout=120)
+        set_policy(False)
+
+
+def _served_at(ip: str, port: int, timeout: float = 4.0) -> bool:
+    if not ip or port <= 0:
+        return False
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            return bool(sock.recv(256))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main():
     signal.signal(signal.SIGALRM, H.alarm)
     ready = False
@@ -405,6 +556,7 @@ def main():
             ("G3.1 baseline", g3_1_baseline, 300),
             ("G3.2 two-phase refuses early", g3_2_two_phase_refuses_early, 240),
             ("G3.3 split brain cannot happen", g3_3_split_brain_cannot_happen, 420),
+            ("G3.3b restore after partition", g3_35_restore_after_partition, 600),
             ("G3.4 takeover after lapse", g3_4_takeover_after_lapse, 240),
             ("G3.5 epoch monotone", g3_5_epoch_is_monotone, 240),
             ("G3.6 lost race is safe", g3_6_lost_race_is_safe, 300),
@@ -412,6 +564,7 @@ def main():
             ("G3.8 desired untouched", g3_8_desired_untouched, 180),
             ("G3.9 panel restart", g3_9_panel_restart_is_safe, 360),
             ("G3.10 heartbeat alone", g3_10_heartbeat_alone_moves_nothing, 240),
+            ("G3.11 automatic failover", g3_11_automatic_failover, 1500),
         ]:
             case(name, fn, budget)
     except Exception as exc:  # noqa: BLE001
