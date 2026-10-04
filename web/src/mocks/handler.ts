@@ -56,6 +56,8 @@ import type {
   TargetPoolHealth,
 } from "@/lib/target-health";
 import { getStore, resetStore, type MockNodeBinding, type MockWorkspaceInvite } from "./state";
+// V5.5：联邦 mock（自包含实现 + 错误码镜像）；路由分发在下面 admin 分支的 federation 段。
+import { handleFederationMock } from "./federation";
 // V4-WP6 §13.4.4：health 投影（mock 无法 import 后端，形状与规则镜像在这里）
 import {
   mockFleetHealth,
@@ -3238,6 +3240,15 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     if (!user.super_admin) return fail(403, "需要管理员权限");
 
     if (seg[1] === "stats" && method === "GET") return ok(adminStats(db));
+
+    // ----- federation（V5.5 WP14/WP15/WP16）-----
+    // 实现全在 ./federation.ts（自包含、可离线单测）；这里只做路径分发。
+    // 唯一真相是 backend/src/routes/admin-federation.ts，错误体形状见该模块头注释。
+    if (seg[1] === "federation") {
+      const fedRes = handleFederationMock({ method, seg: seg.slice(2), body: req.body, state: db.federation });
+      if (fedRes) return fedRes;
+      return notFound(`Mock route not found: ${method} /${clean}`);
+    }
 
     // ----- meta/resources（权限元数据，渲染角色编辑器） -----
     if (seg[1] === "meta" && seg[2] === "resources" && method === "GET") {

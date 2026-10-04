@@ -296,46 +296,53 @@ export const adminConsoleNav: NavGroup[] = [
     labelKey: "console.group.federation",
     labelZh: "联邦",
     labelEn: "Federation",
+    /**
+     * V5.5 落地后整组都是**真页面**（`(admin)/admin/federation/*`，消费真实后端 API）。
+     * 这组从第一天起就只属于 Admin Console：User Console 的结构里没有它的位置，
+     * 用户侧文案也不允许出现 trust / grant / lease / epoch（有回归测试守着）。
+     */
     items: [
+      {
+        href: "/admin/federation",
+        labelKey: "admin.federation.overview",
+        labelZh: "联邦总览",
+        labelEn: "Overview",
+        iconKey: "nodeGroups",
+      },
       {
         href: "/admin/federation/peers",
         labelKey: "admin.federation.peers",
         labelZh: "对等面板",
         labelEn: "Peers",
-        iconKey: "nodeGroups",
-        status: "planned",
+        iconKey: "adminTunnels",
       },
       {
         href: "/admin/federation/trust",
         labelKey: "admin.federation.trust",
-        labelZh: "信任",
-        labelEn: "Trust",
+        labelZh: "信任与密钥",
+        labelEn: "Trust & Keys",
         iconKey: "roles",
-        status: "planned",
       },
       {
         href: "/admin/federation/grants",
         labelKey: "admin.federation.grants",
-        labelZh: "授权",
+        labelZh: "授予",
         labelEn: "Grants",
         iconKey: "license",
-        status: "planned",
       },
       {
         href: "/admin/federation/remote-leases",
         labelKey: "admin.federation.remoteLeases",
         labelZh: "远端租约",
         labelEn: "Remote Leases",
-        iconKey: "adminTunnels",
-        status: "planned",
+        iconKey: "adminDashboard",
       },
       {
         href: "/admin/federation/usage",
         labelKey: "admin.federation.usage",
         labelZh: "联邦用量",
         labelEn: "Usage",
-        iconKey: "adminDashboard",
-        status: "planned",
+        iconKey: "plans",
       },
     ],
   },

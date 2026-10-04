@@ -26,6 +26,25 @@ import type {
   EgressPoolInput,
   EgressTarget,
   EgressTargetInput,
+  FederationDisableResult,
+  FederationEnableResult,
+  FederationGrant,
+  FederationGrantActionResult,
+  FederationGrantCreateResult,
+  FederationGrantInput,
+  FederationHandshakeInput,
+  FederationHandshakeResult,
+  FederationInvitation,
+  FederationInviteInput,
+  FederationKeyRotateResult,
+  FederationLease,
+  FederationPeer,
+  FederationPeerRevokeResult,
+  FederationPeerRotateResult,
+  FederationPingResult,
+  FederationPlacement,
+  FederationStatus,
+  FederationUsageRecord,
   ID,
   LicenseInfo,
   ListQuery,
@@ -772,6 +791,53 @@ export const api = {
     /** 审计日志（仅超级管理员可读） */
     auditLogs: (query?: AuditLogQuery, cookie?: string) =>
       get<Paginated<AuditLog>>("/admin/audit-logs", query as ListQuery, cookie),
+    /**
+     * V5.5 Federation（WP14/WP15/WP16）—— **只属于 Admin Console**。
+     *
+     * 路径与响应形状对齐 `backend/src/routes/admin-federation.ts`（唯一真相）。
+     * 两条前端纪律：
+     *   1. 列表端点返回 `{ data: [...] }` 信封 —— 通用解包会剥掉 `data`，这里拿到的
+     *      就是数组本身；不要在这里再包一层或改成裸数组；
+     *   2. 失败一律抛 `ApiError`，其 `data` 是后端 `federationErrorBody()` 的原始
+     *      `{ code, message, retryable, peer_panel_id, correlation_id }`。
+     *      页面必须按 `code` 分层展示「下一步」，不要压成一个 ERROR
+     *      （见 `components/admin/federation/federation-status.ts`）。
+     */
+    federation: {
+      status: (cookie?: string) => get<FederationStatus>("/admin/federation/status", undefined, cookie),
+      enable: (cookie?: string) => post<FederationEnableResult>("/admin/federation/enable", {}, cookie),
+      disable: (cookie?: string) => post<FederationDisableResult>("/admin/federation/disable", {}, cookie),
+
+      peers: (cookie?: string) => get<FederationPeer[]>("/admin/federation/peers", undefined, cookie),
+      /** 生成邀请：响应里的 `token` **只出现这一次**（库里只有 sha256），必须一次性展示。 */
+      invitePeer: (input: FederationInviteInput, cookie?: string) =>
+        post<FederationInvitation>("/admin/federation/peers/invite", input, cookie),
+      handshake: (input: FederationHandshakeInput, cookie?: string) =>
+        post<FederationHandshakeResult>("/admin/federation/peers/handshake", input, cookie),
+      pingPeer: (id: number, cookie?: string) =>
+        post<FederationPingResult>(`/admin/federation/peers/${id}/ping`, {}, cookie),
+      rotatePeerKey: (id: number, cookie?: string) =>
+        post<FederationPeerRotateResult>(`/admin/federation/peers/${id}/rotate`, {}, cookie),
+      /** 撤销信任：**不可逆**；响应给出被连带失效的租约数。 */
+      revokePeer: (id: number, cookie?: string) =>
+        del<FederationPeerRevokeResult>(`/admin/federation/peers/${id}`, cookie),
+      /** 轮转本机密钥（对所有可信 peer）。部分失败时 HTTP 502，体仍是 `FederationKeyRotateResult`。 */
+      rotateLocalKey: (cookie?: string) => post<FederationKeyRotateResult>("/admin/federation/key/rotate", {}, cookie),
+
+      grants: (cookie?: string) => get<FederationGrant[]>("/admin/federation/grants", undefined, cookie),
+      createGrant: (input: FederationGrantInput, cookie?: string) =>
+        post<FederationGrantCreateResult>("/admin/federation/grants", input, cookie),
+      revokeGrant: (ref: string, cookie?: string) =>
+        post<FederationGrantActionResult>(`/admin/federation/grants/${encodeURIComponent(ref)}/revoke`, {}, cookie),
+      suspendGrant: (ref: string, cookie?: string) =>
+        post<FederationGrantActionResult>(`/admin/federation/grants/${encodeURIComponent(ref)}/suspend`, {}, cookie),
+      resumeGrant: (ref: string, cookie?: string) =>
+        post<FederationGrantActionResult>(`/admin/federation/grants/${encodeURIComponent(ref)}/resume`, {}, cookie),
+
+      leases: (cookie?: string) => get<FederationLease[]>("/admin/federation/leases", undefined, cookie),
+      placements: (cookie?: string) => get<FederationPlacement[]>("/admin/federation/placements", undefined, cookie),
+      usage: (cookie?: string) => get<FederationUsageRecord[]>("/admin/federation/usage", undefined, cookie),
+    },
   },
 };
 
