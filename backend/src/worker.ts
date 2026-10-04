@@ -161,11 +161,23 @@ const worker = new Worker(
         deps.failoverSweep = async () => {
           const { runFailoverSweep } = await import("./services/failover-loop.ts");
           const r = await runFailoverSweep({
+            // EVERY level is printed, not just warn/error.
+            //
+            // V5.3 round 11: filtering to warn/error hid exactly the information needed to
+            // diagnose an automatic failover that did not happen — the outcome
+            // (`moved` / `waiting_lease` / `aborted:<reason>`) is reported at INFO, because a
+            // correct decision that waits is not a warning. The result was a gate failure with
+            // no trace anywhere, and a debugging round spent on guessing.
             log: (e) => {
-              if (e.level === "error") console.error("[worker] failover:", e.message, e.detail ?? "");
-              else if (e.level === "warn") console.warn("[worker] failover:", e.message, e.detail ?? "");
+              const line = `[worker] failover: ${e.message} ${e.detail ? JSON.stringify(e.detail) : ""}`;
+              if (e.level === "error") console.error(line);
+              else if (e.level === "warn") console.warn(line);
+              else console.log(line);
             },
           });
+          if (r.evaluated > 0) {
+            console.log("[worker] failover sweep:", JSON.stringify({ evaluated: r.evaluated, moved: r.moved, held: r.held }));
+          }
           return { evaluated: r.evaluated, moved: r.moved, held: r.held };
         };
         const r = await executeReconcile(deps);
