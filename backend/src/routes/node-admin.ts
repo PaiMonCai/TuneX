@@ -289,6 +289,9 @@ nodeAdminRoutes.get("/node/pools/:poolId/health", async (c) => {
     data: {
       targets: result.health.targets,
       observers: result.health.observers,
+      // V5.2: 目标身份 → 期望行 id。界面据此把状态贴到目标上，不必自己再实现一遍
+      // 归一化规则（第二份实现一旦漂移，症状是"被观测到的目标显示成没有证据"）。
+      target_ids: result.health.targetIds,
       observed_at: result.health.now.toISOString(),
     },
   });

@@ -31,6 +31,15 @@ export interface DesiredTargetRef {
 export interface TargetHealthReadResult {
   readonly targets: readonly TargetHealthView[];
   /**
+   * 每个期望目标的身份 → 它在 `egress_target` 里的 id。
+   *
+   * 存在的理由很具体：健康视图按**归一化后的 `host:port`** 标识目标，而期望行带的是
+   * `id` + 原始 host。没有这张对照表，界面只能自己再实现一遍归一化规则（trim/小写/
+   * 去尾点/去方括号）——那就是同一条规则的第二份实现，而它一旦漂移，症状是"被观测到的
+   * 目标在界面上显示成没有证据"，既静默又像是真的。
+   */
+  readonly targetIds?: Readonly<Record<string, number>>;
+  /**
    * 参与合成的观测节点 id（升序去重）。当它为空时，所有目标必然是 `unknown` ——
    * "没有任何节点观测过"和"观测过且都健康"必须是两个不同的结论，这个列表就是
    * 面板区分它们的方式。
@@ -159,7 +168,10 @@ export async function readPoolTargetHealth(input: {
 }): Promise<{ ok: true; health: TargetHealthReadResult } | { ok: false; reason: "not_found" }> {
   const pool = await db.egressPool.findUnique({
     where: { id: input.poolId },
-    select: { id: true, targets: { select: { host: true, port: true }, orderBy: { order_by: "asc" } } },
+    select: {
+      id: true,
+      targets: { select: { id: true, host: true, port: true }, orderBy: { order_by: "asc" } },
+    },
   });
   if (!pool) return { ok: false, reason: "not_found" };
   const health = await readTargetHealth({
@@ -168,5 +180,11 @@ export async function readPoolTargetHealth(input: {
     previous: input.previous ?? null,
     store: input.store,
   });
-  return { ok: true, health };
+  // The identity → desired-row id map, so the caller never has to re-derive identity.
+  const targetIds: Record<string, number> = {};
+  for (const target of pool.targets) {
+    const key = targetKeyOf(target.host, target.port);
+    if (key !== null) targetIds[key] = target.id;
+  }
+  return { ok: true, health: { ...health, targetIds } };
 }
