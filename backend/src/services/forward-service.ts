@@ -869,6 +869,22 @@ export async function createForward(
         : await reapplyRelayTunnel(tunnelId, orchestrator);
 
     if (!applied.ok) {
+      // V5.4：把**失败在哪一步**打出来。
+      //
+      // 创建失败此前只回一个 502 body，`steps` / `failedStep` 被整条丢掉，于是"出口之后到底哪一步
+      // 失败"只能靠猜 —— 而这一步的失败会**留下已发出的出口 runtime**（实测 `tunex-277-egress`
+      // 占着 22001），每次尝试都在毒化下一次。没有这行日志，那类泄漏看起来像"端口分配有 bug"。
+      const failedStep = (applied as { failedStep?: string }).failedStep ?? "unknown";
+      const trail = (applied as { steps?: Array<{ step: string; ok: boolean; error_code?: string | null }> }).steps ?? [];
+      console.error(
+        "[forward] create failed:",
+        JSON.stringify({
+          tunnel_id: tunnelId,
+          failed_step: failedStep,
+          error_code: applied.error_code,
+          trail: trail.map((s2) => `${s2.step}${s2.ok ? "" : `(${s2.error_code ?? "fail"})`}`),
+        }),
+      );
       const failed = await loadForwardRow(tunnelId, workspaceId);
       return error(502, "apply_failed", applied.error, {
         apply_error_code: applied.error_code,

@@ -1836,8 +1836,13 @@ export async function reapplyRelayTunnel(
   // 正向顺序仍是**先远后近**：出口已发 → 现在发中间跳（目标 = 出口）→ 最后才切入口（目标 = 中间跳）。
   let transitHost: string | null = null;
   if (middleNodeId != null && middlePort != null) {
-    const middleNode = (outCandidates as unknown as SchedulableNode[]).find((n) => n.id === middleNodeId)
-      ?? (inCandidates as unknown as SchedulableNode[]).find((n) => n.id === middleNodeId);
+    // 中间跳**不是调度候选**：候选按节点组筛（`inNodeGroupId` / `outNodeGroupId`），而中间跳是
+    // 用户显式选定的放置事实，通常属于**第三个**节点组 —— 从候选列表里找它永远找不到。
+    // 实测后果：`apply_transit` 报 `invariant_violated`（"中间跳节点不存在"），而出口腿已经发出去了。
+    // 所以直接按 id 读它，和"绑定后的入出口必须落在指定节点"是同一口径：**已确定的放置事实不参与重新调度**。
+    const middleNode = (await store.node.findUnique({ where: { id: middleNodeId } })) as
+      | SchedulableNode
+      | null;
     if (!middleNode) {
       await teardownDispatched("middle node missing");
       return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, `中间跳节点 ${middleNodeId} 不存在`, {
