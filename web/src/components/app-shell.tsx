@@ -1,46 +1,23 @@
-import { cookies } from "next/headers";
-import { redirect } from "next/navigation";
-import { LOCALE_COOKIE, getDictionary, normalizeLocale, type Dictionary, type Locale } from "@/lib/i18n";
-import { api } from "@/lib/api";
-import type { User } from "@/lib/types";
-import { Sidebar } from "@/components/sidebar";
-import { Topbar } from "@/components/topbar";
-import { adminNav, userNav, labelOf } from "@/lib/nav";
-
-/** 服务端 Auth 守卫：读取 cookie 转发给后端/mock 校验会话 */
-export async function requireSession(): Promise<{ user: User; cookie: string }> {
-  const store = await cookies();
-  const cookie = store.toString();
-  try {
-    const session = await api.auth.session(cookie);
-    return { user: session.user, cookie };
-  } catch {
-    redirect("/login");
-  }
-}
+import { AdminShell } from "@/components/console/admin-shell";
+import { UserShell } from "@/components/console/user-shell";
 
 /**
- * 当前语言（服务端读取 cookie）。
- * /admin 等页面会单独调用它，因此必须保持导出。
- */
-export async function currentLocale(): Promise<Locale> {
-  const store = await cookies();
-  return normalizeLocale(store.get(LOCALE_COOKIE)?.value);
-}
-
-/** 服务端 i18n：locale + 词典 + 点号取词的 t（统一的 SSR 取词入口） */
-export async function shellI18n(): Promise<{ locale: Locale; dict: Dictionary; t: (key: string) => string }> {
-  const locale = await currentLocale();
-  const dict = getDictionary(locale);
-  return { locale, dict, t: (key: string) => labelOf(locale, key) };
-}
-
-/**
- * 应用外壳（服务端组件）：侧边栏 + 顶栏，用户端/管理端共用。
- * 会话从 cookie 解析；mock 模式下 cookie=tunex_session 即视为已登录。
+ * 兼容入口：既有页面全部通过 `AppShell` 渲染。
  *
- * 传给客户端组件的 props 必须可序列化：`Sidebar` 收到的是 `iconKey` 字符串，
- * 不能是 React 组件函数（否则整页 500）。
+ * V5-WP13.5A（§9.4.1）后，外壳分成了 `UserShell` / `AdminShell`（`components/console/`），
+ * 本文件只保留「按 `adminMode` 分发 + 原导入路径继续可用」的职责：
+ * 页面无需改动即可享受新的导航边界，后续新页面可以直接用对应 shell 或 route group layout。
+ *
+ * 会话 / i18n 辅助函数仍从这里再导出（`admin/page.tsx` 等既有代码依赖
+ * `currentLocale` 的导入路径），真正实现移到了 `components/console/session.ts`。
+ */
+export { getSession, requireSession, enforceConsoleBoundary, currentLocale, shellI18n } from "@/components/console/session";
+
+/**
+ * 应用外壳（服务端组件）。
+ *
+ * 会话从 cookie 解析；mock 模式下 cookie=tunex_session 即视为已登录。
+ * 传给客户端组件的 props 必须可序列化（导航里传的是 `iconKey` 字符串，不是组件函数）。
  *
  * `showToaster` 仅为兼容既有页面调用而保留；Toast 容器统一由根 layout 挂载。
  */
@@ -58,6 +35,7 @@ export async function AppShell({
   title?: string;
   subtitleKey?: string;
   subtitle?: string;
+  /** true = Admin Console（AdminShell），false = User Console（UserShell） */
   adminMode?: boolean;
   /** 覆盖侧边栏高亮项（隧道详情等子页面用） */
   activeHref?: string;
@@ -65,26 +43,17 @@ export async function AppShell({
   showToaster?: boolean;
   children: React.ReactNode;
 }) {
-  const [{ user, cookie }, { locale, t }] = await Promise.all([requireSession(), shellI18n()]);
-  void cookie;
   void _showToaster;
-  const resolvedTitle = title ?? (titleKey ? t(titleKey) : "");
-  const resolvedSubtitle = subtitle ?? (subtitleKey ? t(subtitleKey) : undefined);
+  const Shell = adminMode ? AdminShell : UserShell;
   return (
-    <div className="flex min-h-screen bg-[var(--background)]" data-lang={locale}>
-      <Sidebar
-        items={adminMode ? adminNav : userNav}
-        locale={locale}
-        user={user}
-        adminMode={adminMode}
-        activeHref={activeHref}
-      />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar title={resolvedTitle} subtitle={resolvedSubtitle} adminMode={adminMode} />
-        <main className="mx-auto w-full max-w-[1400px] flex-1 p-4 pt-16 lg:p-6 lg:pt-6">
-          {children}
-        </main>
-      </div>
-    </div>
+    <Shell
+      titleKey={titleKey}
+      title={title}
+      subtitleKey={subtitleKey}
+      subtitle={subtitle}
+      activeHref={activeHref}
+    >
+      {children}
+    </Shell>
   );
 }

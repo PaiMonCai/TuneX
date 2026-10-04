@@ -122,8 +122,10 @@ jobs:
       # WP13：隧道编排 mock 契约（apply 状态机/revision/DIRECT+RELAY 创建/过滤）单测
       # V4：Node-first + Forward product API mock 契约单测
       # V4-WP11C/WP11B：诊断 / 支持包 / 升级入口的渲染不变量与 mock 契约一致性
-      - name: Unit tests (dashboard + node admin + V4 forwards + legacy compatibility + diagnostics)
-        run: bun test src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/forwards/__tests__/ src/components/nodes/__tests__/ src/mocks/__tests__/
+      # V5-WP13.5A：Console 边界（User/Admin 导航不变量、route group 不改变 URL、
+      #             「guard 不是授权」的回归断言）
+      - name: Unit tests (console boundary + dashboard + node admin + V4 forwards + legacy compatibility + diagnostics)
+        run: bun test src/components/console/__tests__/ src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/forwards/__tests__/ src/components/nodes/__tests__/ src/mocks/__tests__/
       - name: Build with optional billing disabled
         run: npm run build
         env:
