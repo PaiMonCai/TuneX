@@ -35,6 +35,7 @@ import * as seed from "./data";
 import type { WorkspaceCustomRole } from "@/lib/workspace-permissions";
 import { MOCK_LIFECYCLE_SEED, MOCK_PORT_LEASE_SEED } from "./node-lifecycle";
 import { buildMockFederation, type MockFederationState } from "./federation";
+import { buildMockRouteProfiles, type MockRouteProfileState } from "./route-profiles";
 
 /** build() 内复用种子数据集的时间基准（seed.now），保证演示数据时间一致 */
 const iso = (d: Date) => d.toISOString();
@@ -98,6 +99,11 @@ export interface MockStore {
    * 形状与错误码镜像见 `./federation.ts`（唯一真相是后端 admin-federation 路由）。
    */
   federation: MockFederationState;
+  /**
+   * V5-WP13.5B Route Profile：线路模板（编排面）+ 「来源指针指向它」的 Forward（impact 范围口径）。
+   * 形状与错误码镜像见 `./route-profiles.ts`。
+   */
+  routeProfiles: MockRouteProfileState;
   /** 单例创建时间，便于调试 */
   boot_at: string;
 }
@@ -307,6 +313,7 @@ function build(): MockStore {
     nodeLeases: new Map(Object.entries(MOCK_PORT_LEASE_SEED).map(([id, ports]) => [Number(id), [...ports]])),
     // V5.5：联邦状态每次 build 都重建（resetStore() 回到同一份种子）
     federation: buildMockFederation(),
+    routeProfiles: buildMockRouteProfiles(),
     boot_at: new Date().toISOString(),
   };
 }

@@ -273,19 +273,33 @@ describe("WP13.5A User Console 导航边界", () => {
     expect(ids).toEqual(["overview", "forwards", "routes", "billing", "support", "settings"]);
   });
 
-  test("可用线路分组承载 /nodes（workspace 级注册页），线路模板页为 planned 占位", () => {
+  test("可用线路分组的两条入口都是真页面（/nodes 注册页 + /routes 可用线路）", () => {
     const routesGroup = userConsoleNav.find((g) => g.id === "routes")!;
-    expect(routesGroup.items.find((i) => i.href === "/nodes")!.status ?? "available").toBe("available");
-    expect(routesGroup.items.find((i) => i.href === "/routes")!.status).toBe("planned");
+    for (const href of ["/nodes", "/routes"]) {
+      const item = routesGroup.items.find((i) => i.href === href)!;
+      expect({ href, status: item.status ?? "available" }).toEqual({ href, status: "available" });
+      // 用户侧文案不许出现编排侧的词（模板 / Route Profile / selector / transit）
+      const labels = [item.labelKey ?? "", item.labelZh ?? "", item.labelEn ?? ""].join(" ").toLowerCase();
+      for (const word of ["template", "selector", "transit", "模板"]) {
+        expect({ href, word, hit: labels.includes(word) }).toEqual({ href, word, hit: false });
+      }
+    }
   });
 
   test("planned 项绝不进入可导航列表（因此不会生成 404 链接）", () => {
-    const plannedHrefs = declaredItems(userConsoleNav)
+    // WP13.5B 落地后用户侧已无 planned 项（/routes 是真链接）；
+    // 用 admin 侧仍未落位的项验证同一条不变量，避免这条规则失去守卫。
+    const adminPlanned = declaredItems(adminConsoleNav)
       .filter((i) => i.status === "planned")
       .map((i) => i.href);
-    expect(plannedHrefs.length).toBeGreaterThan(0);
-    for (const href of plannedHrefs) {
-      expect(userItemsNavigable.some((i) => i.href === href)).toBe(false);
+    expect(adminPlanned.length).toBeGreaterThan(0);
+    for (const href of adminPlanned) {
+      expect(visibleNavItems("admin", { paymentsEnabled: true }).some((i) => i.href === href)).toBe(false);
+    }
+    // 用户侧：所有 declared 项都必须是可导航的真实入口
+    for (const item of declaredItems(userConsoleNav)) {
+      expect({ href: item.href, status: item.status ?? "available" }).toEqual({ href: item.href, status: "available" });
+      expect(userItemsNavigable.some((i) => i.href === item.href)).toBe(true);
     }
   });
 
@@ -313,16 +327,21 @@ describe("WP13.5A User Console 导航边界", () => {
 describe("WP13.5A Admin Console 导航边界", () => {
   const adminItemsNavigable = visibleNavItems("admin", { paymentsEnabled: true });
 
-  test("admin nav 含 Federation 分组，且五个子项齐全", () => {
+  test("admin nav 含 Federation 分组，六条入口齐全且已是真链接（V5.5 已落页面）", () => {
     const federation = visibleNavGroups("admin", { paymentsEnabled: true }).find((g) => g.id === "federation");
     expect(federation).toBeDefined();
     expect(federation!.items.map((i) => i.href)).toEqual([
+      "/admin/federation",
       "/admin/federation/peers",
       "/admin/federation/trust",
       "/admin/federation/grants",
       "/admin/federation/remote-leases",
       "/admin/federation/usage",
     ]);
+    // 页面落位后不许再留 planned：入口必须真的可点（否则就是 dead 入口）
+    for (const item of federation!.items) {
+      expect({ href: item.href, status: item.status ?? "available" }).toEqual({ href: item.href, status: "available" });
+    }
     // 双语标题里必须明确写「联邦 / Federation」，不能是占位名
     expect(federation!.labelZh.toLowerCase()).toContain("联邦");
     expect(federation!.labelEn.toLowerCase()).toContain("federation");
@@ -358,11 +377,14 @@ describe("WP13.5A Admin Console 导航边界", () => {
     }
   });
 
-  test("Federation 与内部概念项在页面落位前是 planned 禁用项（不进可导航列表）", () => {
+  test("Federation 与 Route Profiles 已落位；其余未落位的内部概念项仍是 planned 禁用项（不进可导航列表）", () => {
     const planned = declaredItems(adminConsoleNav).filter((i) => i.status === "planned");
     const plannedHrefs = planned.map((i) => i.href);
-    expect(plannedHrefs).toContain("/admin/federation/trust");
-    expect(plannedHrefs).toContain("/admin/route-profiles");
+    // V5.5：联邦六页已落地，不允许再挂在 planned 上（否则页面在、入口却点不动）
+    expect(plannedHrefs.some((h) => h.startsWith("/admin/federation"))).toBe(false);
+    // 其余尚未落位的目标入口继续保持「声明得到、点不进、也不 404」
+    // （WP13.5B 的 /admin/route-profiles 已落位，因此不再出现在 planned 里）
+    expect(plannedHrefs).not.toContain("/admin/route-profiles");
     expect(plannedHrefs).toContain("/admin/capacity");
     for (const href of plannedHrefs) {
       expect(adminItemsNavigable.some((i) => i.href === href)).toBe(false);

@@ -144,12 +144,15 @@ export const userConsoleNav: NavGroup[] = [
     items: [
       { href: "/nodes", labelKey: "common.nodes", iconKey: "nodes" },
       {
+        /**
+         * 用户侧只叫「可用线路」：`模板 / Route Profile` 是编排侧的词，
+         * 出现在 User Console 就是内部概念泄漏（有回归测试守着）。
+         */
         href: "/routes",
-        labelKey: "console.routes",
-        labelZh: "线路模板",
-        labelEn: "Route Profiles",
+        labelKey: "common.routes",
+        labelZh: "可用线路",
+        labelEn: "Routes",
         iconKey: "tunnels",
-        status: "planned",
       },
     ],
   },
@@ -233,7 +236,6 @@ export const adminConsoleNav: NavGroup[] = [
         labelZh: "线路模板",
         labelEn: "Route Profiles",
         iconKey: "tunnels",
-        status: "planned",
       },
       {
         href: "/admin/targets",

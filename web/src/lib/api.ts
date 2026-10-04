@@ -68,8 +68,20 @@ import type {
   NodeLifecycleView,
   NodeRole,
   NodeStateReport,
+  ConsumableRouteProfileList,
   Paginated,
   PasswordChangeInput,
+  RouteProfileApplyInput,
+  RouteProfileApplyResult,
+  RouteProfileCreateInput,
+  RouteProfileDetail,
+  RouteProfileImpact,
+  RouteProfilePatchInput,
+  RouteProfilePublishInput,
+  RouteProfilePublishResult,
+  RouteProfileVersionBody,
+  RouteProfileVersionEntry,
+  RouteProfileView,
   PortForward,
   ForwardCreateInput,
   ForwardPatchInput,
@@ -577,6 +589,43 @@ export const api = {
       post<Ticket>("/tickets", input, cookie),
   },
   // 管理端
+  /**
+   * V5-WP13.5B Route Profile（线路模板）—— **不走 `/api/admin/*`**。
+   *
+   * 后端刻意复用 workspace 域 RBAC（`resolveWorkspaceAccess` 的 `node` 资源族，
+   * 与 node-groups 同口径）、读写闸门 read/manage；Admin 与 User 只是**同一套资源
+   * 的两个 UX 面**（§9.4.1：前端 guard 只做 UX）。因此这里用普通路径。
+   *
+   * 失败形状：`{ error, code, error_layer, retryable, next_action }`（注意人读原因是
+   * `error` 而非 `message`）；`ApiError.data` 就是它，页面用 next_action 直接展示「下一步」。
+   */
+  routeProfiles: {
+    list: (query?: ListQuery, cookie?: string) => get<Paginated<RouteProfileView>>("/route-profiles", query, cookie),
+    detail: (id: ID, cookie?: string) =>
+      get<RouteProfileDetail>(`/route-profiles/${id}`, undefined, cookie),
+    create: (input: RouteProfileCreateInput, cookie?: string) =>
+      post<RouteProfileView & { version_id: number }>("/route-profiles", input, cookie),
+    /** 只改 metadata；模板内容变更必须走 publishVersion。 */
+    patch: (id: ID, input: RouteProfilePatchInput, cookie?: string) =>
+      patch<RouteProfileView>(`/route-profiles/${id}`, input, cookie),
+    /** 发布**新版本**（模板内容变更的唯一路径）。 */
+    publishVersion: (id: ID, input: RouteProfilePublishInput, cookie?: string) =>
+      post<RouteProfilePublishResult>(`/route-profiles/${id}/versions`, input, cookie),
+    versions: (id: ID, limit = 50, cookie?: string) =>
+      get<RouteProfileVersionEntry[]>(`/route-profiles/${id}/versions`, { limit }, cookie),
+    version: (id: ID, version: number, cookie?: string) =>
+      get<RouteProfileVersionBody>(`/route-profiles/${id}/versions/${version}`, undefined, cookie),
+    /** Impact Analysis：**只读**，不触发任何下发（后端保证并有用例钉住）。 */
+    impact: (id: ID, version?: number, cookie?: string) =>
+      get<RouteProfileImpact>(`/route-profiles/${id}/impact`, version === undefined ? undefined : { version }, cookie),
+    /** 显式 rollout：必须给出 forward_ids；dry_run=true 时只预览。 */
+    apply: (id: ID, input: RouteProfileApplyInput, cookie?: string) =>
+      post<RouteProfileApplyResult>(`/route-profiles/${id}/apply`, input, cookie),
+    /** 消费侧可见/可选列表（普通用户；fail-closed：没有显式授权就看不到）。 */
+    available: (cookie?: string) =>
+      get<ConsumableRouteProfileList>("/route-profiles/available", undefined, cookie),
+  },
+
   admin: {
     stats: (cookie?: string) => get<AdminDashboardStats>("/admin/stats", undefined, cookie),
     users: (query?: ListQuery, cookie?: string) => get<Paginated<User>>("/admin/users", query, cookie),

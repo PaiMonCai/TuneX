@@ -58,6 +58,8 @@ import type {
 import { getStore, resetStore, type MockNodeBinding, type MockWorkspaceInvite } from "./state";
 // V5.5：联邦 mock（自包含实现 + 错误码镜像）；路由分发在下面 admin 分支的 federation 段。
 import { handleFederationMock } from "./federation";
+// V5.5/WP13.5B：线路模板 mock（自包含实现 + 错误码镜像）；路由分发见下面的 route-profiles 段。
+import { handleRouteProfileMock } from "./route-profiles";
 // V4-WP6 §13.4.4：health 投影（mock 无法 import 后端，形状与规则镜像在这里）
 import {
   mockFleetHealth,
@@ -1598,7 +1600,9 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   // of real DB tenant isolation. Selected scope still exercises RBAC contracts.
   const scopeId = req.workspaceId ?? db.workspaces.find((w) => w.personal_user_id === user.id)?.id;
   const scopeMembership = db.workspaceMembers.find((m) => m.workspace_id === scopeId && m.user_id === user.id && m.active);
-  if (seg[0] === "nodes" || seg[0] === "node-groups" || seg[0] === "forwards") {
+  // Route Profile 与 node-groups 同资源族（后端 `resolveWorkspaceAccess(c, action, "node")`）：
+  // GET → read，写 → manage。
+  if (seg[0] === "nodes" || seg[0] === "node-groups" || seg[0] === "forwards" || seg[0] === "route-profiles") {
     if (!scopeMembership) return notFound("工作空间不存在");
     const grants = mockEffectivePermissions(db, scopeMembership);
     const resource = seg[0] === "forwards" ? "forward" : "node";
@@ -3233,6 +3237,29 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       user.updated_at = nowIso();
       return ok({ ok: true, subscription_key: key, user });
     }
+  }
+
+  // ---------- route-profiles（V5-WP13.5B；唯一真相 backend/src/routes/route-profiles.ts）----------
+  // 非 /admin 前缀：后端复用 workspace 域 RBAC（read/manage），Admin 与 User 是同一套资源的两个 UX 面。
+  if (seg[0] === "route-profiles") {
+    const membership = db.workspaceMembers.find(
+      (m) => m.workspace_id === scopeId && m.user_id === user.id && m.active,
+    );
+    const grants = membership ? mockEffectivePermissions(db, membership) : null;
+    const res = handleRouteProfileMock({
+      method,
+      seg: seg.slice(1),
+      query: q as Record<string, unknown>,
+      body: req.body,
+      state: db.routeProfiles,
+      ctx: {
+        userId: user.id,
+        workspaceId: scopeId ?? 0,
+        isManager: Boolean(grants?.permissions["node:manage"]),
+      },
+    });
+    if (res) return res;
+    return notFound(`Mock route not found: ${method} /${clean}`);
   }
 
   // ---------- admin ----------
