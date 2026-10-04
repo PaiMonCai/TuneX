@@ -112,12 +112,16 @@ describe("V5.4: adjacency needs a binding, and errors name the hop", () => {
 });
 
 describe("V5.4: a route that cannot be dispatched is REFUSED, not silently degraded", () => {
-  test("a single-hop route is admitted regardless of bindings", () => {
+  test("a single-hop route needs its neighbour binding too — and the topology has them", () => {
+    // 这条断言来自一次真实的核对：e2e 拓扑里 RELAY 的 (3 -> 4) **确实**存在 node_binding，
+    // 也就是说"相邻必须有绑定"并不是新引入的负担，而是 V4 已经在做的事。
+    // 反过来说：如果 V4 从不为单跳建立绑定，那么强制这条要求会拒绝**所有存量转发** ——
+    // 那是回归，不是收紧。核对过之后才敢把它当成准入条件。
     const relayPlacement = {
       ingress_node_id: 3, egress_node_id: 4, middle_node_id: null, tunnel_mode: "relay" as const, revision: 1,
     };
-    const admitted = admitRoute(relayPlacement, new Set());
-    expect(admitted.ok).toBe(true);
+    expect(admitRoute(relayPlacement, new Set()).ok).toBe(false);
+    expect(admitRoute(relayPlacement, new Set(["3->4"])).ok).toBe(true);
   });
 
   test("a configured middle hop is refused while multi-hop dispatch is unimplemented", () => {

@@ -2747,7 +2747,33 @@ CI/Integration/Release
 
 V5 的成功标准不是“支持的协议字符串更多”，而是：
 
-> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 15 结果：G3 = 49 PASS / 1 FAIL —— 自动迁移本身已完全通过，剩余 1 项是"迁移没完成"**
+> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 16 结果：A 的修法已定案（未落地）、B 被降级为"未验证的假设"**
+
+**A（补偿重放被拒）—— 修法已定案，本轮未落地**
+
+规则：**用不低于 Agent 已见值的 revision 承载基线内容**。两个数字都在 rollout 行里
+（`base_revision` 与目标 `revision`），取较大者即可：
+
+```ts
+const replayRevision = Math.max(Number(row.base_revision), Number(row.revision ?? row.base_revision));
+// dispatchEgress / dispatchIngress / dispatchDirect 三处都用它
+```
+
+**不需要读库** —— 试过读 `tunnel.config_revision`，两个补偿用例直接 5s 超时（离线替身），而这条
+规则本来就不依赖库里的当前值：只要呈现的 revision 不低于 Agent 已见的最高值，它就会被接受。
+
+未落地的原因：我的外科式编辑误删了 `if (!baseline)` 守卫，文件语法坏掉；在发现**行数从 2092 变成 0**
+之后已全部回滚，工作区恢复 HEAD（1712 测试全绿）。教训：大文件上的字符串替换**每一步都要核对行数与
+类型检查**；重建要用 `git show HEAD:backend/src/...`（我第一次用了错的路径前缀，拿到空串）。
+
+**B（面板账本与事实不一致）—— 降级为未验证的假设，不得当成缺陷**
+
+上一轮我写下的证据只到"面板说 active 而两侧都不服务"这一步。而"reconcile 完全没发现"这一半，
+证据来自**别的窗口**（那些窗口的原因已各自定位），并且我自己的修复动作
+（把 `applied_revision` 直接置成 `config_revision`）恰好会**掩盖**漂移检测 —— 也就是说测量被修复动作污染了。
+下一轮顺序：先落地 A → 重跑 G3 → 看迁移是否走完；B 只在**可复现状态**下重新取证。
+
+**round 15 结果：G3 = 49 PASS / 1 FAIL —— 自动迁移本身已完全通过，剩余 1 项是"迁移没完成"**
 
 通过的（这一阶段最关键的几条）：分区构造 ✅ → **owner 自己停** ✅ → 愈合后恢复 ✅ → 两阶段拒绝早接管 ✅ →
 真实接管 epoch+1 ✅ → 竞态安全 ✅ → desired 未改写 ✅ → 面板重启安全 ✅ → heartbeat 单独不迁移 ✅ →
