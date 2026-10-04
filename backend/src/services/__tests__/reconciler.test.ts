@@ -68,6 +68,7 @@ function tunnel(over: Partial<DesiredTunnel> = {}): DesiredTunnel {
     egress_port: 19002,
     ingress_node_id: 7,
     egress_node_id: 8,
+    middle_node_id: null,
     in_node_group_id: 3,
     ...over,
   };
@@ -102,6 +103,7 @@ function depsFrom(
   for (const t of tunnels) {
     if (t.ingress_node_id != null) ensureReport(t.ingress_node_id);
     if (t.egress_node_id != null) ensureReport(t.egress_node_id);
+    if (t.middle_node_id != null) ensureReport(t.middle_node_id);
   }
   for (const a of agents) {
     const owner = tunnels.find((t) => String(t.id) === a.id);
@@ -113,6 +115,16 @@ function depsFrom(
           id: `tunex-${owner.id}-relay`,
           mode: a.mode ?? "relay",
           ingress_port: a.ingress_port,
+          revision: a.revision,
+        });
+      }
+      if (owner.middle_node_id != null) {
+        ensureReport(owner.middle_node_id).tunnels.push({
+          id: `tunex-${owner.id}-egress`,
+          mode: "egress",
+          // middle 的物理端口不在 DesiredTunnel 上；presence/revision 才是
+          // reconciler 对 transit 的职责，端口所有权由 NodePortLease 单独对账。
+          egress_port: 29000,
           revision: a.revision,
         });
       }
@@ -140,7 +152,7 @@ function depsFrom(
   if (nodes.length > 0) {
     const template = nodes[0]!;
     for (const t of tunnels) {
-      for (const id of [t.ingress_node_id, t.egress_node_id]) {
+      for (const id of [t.ingress_node_id, t.middle_node_id, t.egress_node_id]) {
         if (id == null || expandedNodes.some((n) => n.node_id === id)) continue;
         expandedNodes.push({ ...template, node_id: id });
       }
@@ -186,6 +198,43 @@ describe("A. 五份事实的对比（§7.12 对比清单）", () => {
     expect(isRevisionBehind(tunnel({ applied_revision: null }))).toBe(true);
     const d = computeDrift(tunnel({ applied_revision: null }), null, node(), NOW);
     expect(d.map((x) => x.kind)).toEqual(["missing_runtime"]);
+  });
+
+  test("V5.4 三跳：middle runtime 缺失也必须判 missing_runtime 并重发整条同 revision", async () => {
+    const t = tunnel({ middle_node_id: 9 });
+    const rec = recordingSink();
+    const deps = depsFrom([t], [agent()], [node()], { sink: rec.sink });
+    const baseReports = deps.reports!;
+    deps.reports = async () => {
+      const reports = await baseReports();
+      const middle = reports.get(9);
+      if (middle) middle.tunnels = [];
+      return reports;
+    };
+
+    const out = await executeReconcile(deps);
+    expect(out.findings.some((x) => x.code === "missing_runtime")).toBe(true);
+    expect(out.resent).toBe(1);
+    expect(rec.calls).toEqual([{ tunnel_id: 1, revision: 7 }]);
+  });
+
+  test("V5.4 三跳：middle maintenance 与 ingress/egress 一样阻断自动重发", async () => {
+    const t = tunnel({ middle_node_id: 9, applied_revision: 5 });
+    const rec = recordingSink();
+    const deps = depsFrom(
+      [t],
+      [agent({ revision: 5 })],
+      [
+        node({ node_id: 7, lifecycle: "active" }),
+        node({ node_id: 8, lifecycle: "active" }),
+        node({ node_id: 9, lifecycle: "maintenance" }),
+      ],
+      { sink: rec.sink },
+    );
+    const out = await executeReconcile(deps);
+    expect(out.resent).toBe(0);
+    expect(rec.calls).toEqual([]);
+    expect(out.findings.some((x) => x.code === "node_in_maintenance")).toBe(true);
   });
 
   test("desired active 而 agent 快照没有该隧道 → missing_runtime（允许补齐）", () => {
