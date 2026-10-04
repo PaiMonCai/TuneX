@@ -2749,22 +2749,39 @@ V5 的成功标准不是“支持的协议字符串更多”，而是：
 
 > **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 16 结果：A 的修法已定案（未落地）、B 被降级为"未验证的假设"**
 
-**A（补偿重放被拒）—— 修法已定案，本轮未落地**
+**A（补偿重放被拒）—— 正确的修法比"改个版本号"更深，本轮只定案**
 
-规则：**用不低于 Agent 已见值的 revision 承载基线内容**。两个数字都在 rollout 行里
-（`base_revision` 与目标 `revision`），取较大者即可：
+第一次尝试（`replayRevision = max(base_revision, target_revision)`）**被现有测试挡住，而测试是对的**：
 
-```ts
-const replayRevision = Math.max(Number(row.base_revision), Number(row.revision ?? row.base_revision));
-// dispatchEgress / dispatchIngress / dispatchDirect 三处都用它
+```text
+CUTOVER 失败 ⇒ compensating → 补偿撤新 runtime + 重放基线
+  expect(dispatchDirect[0].revision).toBe(6)   ← 基线版本；我改成 7 后失败
 ```
 
-**不需要读库** —— 试过读 `tunnel.config_revision`，两个补偿用例直接 5s 超时（离线替身），而这条
-规则本来就不依赖库里的当前值：只要呈现的 revision 不低于 Agent 已见的最高值，它就会被接受。
+把它改成 7 会**让台账说谎**：revision 7 的含义是"用户的新配置"，而实际跑的是基线内容 ——
+面板会认为新配置已生效。这正是本项目反复修的那一类"账本与事实不一致"，只是这次由我自己制造。
 
-未落地的原因：我的外科式编辑误删了 `if (!baseline)` 守卫，文件语法坏掉；在发现**行数从 2092 变成 0**
-之后已全部回滚，工作区恢复 HEAD（1712 测试全绿）。教训：大文件上的字符串替换**每一步都要核对行数与
-类型检查**；重建要用 `git show HEAD:backend/src/...`（我第一次用了错的路径前缀，拿到空串）。
+**但保持 6 也确实是坏的**（Agent 单调拒收更低的 revision ⇒ 补偿永远失败 ⇒ rollout 停在 degraded）。
+两难说明**回滚在单调版本系统里必须产生一个新的世代**：
+
+| 方案 | 结果 |
+|---|---|
+| 重放 `base_revision`（现状） | Agent 正确地拒绝为 `stale_revision` ⇒ 补偿永远失败 ⇒ 转发停在 degraded |
+| 重放 `max(base, target)` | Agent 接受，但**内容的版本号说了谎** ⇒ 面板认为新配置已生效 |
+| **产生新世代 `max(base, target) + 1`，内容 = 基线** | 两者都成立：内容回到基线、版本继续向前、台账与事实一致 ⇒ **正确** |
+
+**下一轮要按第三种做**（一次完整的改动，不要半个）：
+1. 计算 `rollbackRevision = max(base_revision, tunnel.config_revision) + 1`；
+2. **复制基线快照行**成新 revision 的 `forwardRevision`（否则后续 rollout 的基线查找会报"不存在"）；
+3. 三处重放（egress/ingress/direct）都带 `rollbackRevision`；
+4. 成功后把 `tunnel.config_revision` 写成 `rollbackRevision`（**只有成功才写**，保持"台账跟随事实"）；
+5. 更新那两个补偿用例：它们断言的是**旧契约**（"原地重放基线版本"），新契约是"回滚产生新世代" ——
+   这是**契约变更**，必须在提交信息里写明，而不是悄悄改测试。
+
+**本轮实际落地：没有。** 编辑过程中我误删过 `if (!baseline)` 守卫（在发现**行数 2092 -> 0** 之后回滚），
+随后按上面的分析做了三处替换并让两个用例失败，证实方案二不值得，于是**再次整体回滚**，工作区恢复
+HEAD（1712 全绿）。教训：大文件上的外科式编辑**每一步都要核对行数与类型检查**；重建要用
+`git show HEAD:backend/src/...`（我第一次用错路径前缀拿到空串）。
 
 **B（面板账本与事实不一致）—— 降级为未验证的假设，不得当成缺陷**
 
