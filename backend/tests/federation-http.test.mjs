@@ -295,3 +295,61 @@ maybe("WP14 federation: 瞬态失败不留回执快照（一次抖动不得被�
     assert.deepEqual(retry.body, { code: "grant_not_active" });
   }
 });
+
+maybe("WP14 federation: 握手不得清空对端地址（否则永远回呼不到对方）", async () => {
+  await resetFederationTables();
+  await ensurePanelIdentity();
+  await setFederationEnabled(true);
+
+  const INVITED_ENDPOINT = "http://panel-a.invalid:3000";
+
+  // 1) 对方没自报地址（空串）→ 必须保留邀请里登记的那个地址
+  const invite = await createInvitation({ display_name: "面板 A", endpoint_url: INVITED_ENDPOINT });
+  const clientKeys = await generatePanelKeyPair();
+  const clientPanelId = crypto.randomUUID();
+  const empty = await req("/api/federation/v1/handshake", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      peer_panel_id: clientPanelId,
+      key_id: clientKeys.key_id,
+      public_jwk: clientKeys.public_jwk,
+      display_name: "面板 A",
+      token: invite.token,
+      endpoint_url: "",
+    }),
+  });
+  assert.equal(empty.status, 200);
+  let row = await db.federationPeer.findUnique({ where: { peer_panel_id: clientPanelId } });
+  assert.equal(row.endpoint_url, INVITED_ENDPOINT, "空串不是'清空我的地址'，而是'我没告诉你'");
+
+  // 2) 对方自报地址 → 采纳（新建一个 peer，避免复用已消费的 token）
+  const invite2 = await createInvitation({ display_name: "面板 C", endpoint_url: INVITED_ENDPOINT });
+  const keys2 = await generatePanelKeyPair();
+  const panel2 = crypto.randomUUID();
+  const advertised = await req("/api/federation/v1/handshake", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      peer_panel_id: panel2,
+      key_id: keys2.key_id,
+      public_jwk: keys2.public_jwk,
+      display_name: "面板 C",
+      token: invite2.token,
+      endpoint_url: "http://panel-c:3000",
+    }),
+  });
+  assert.equal(advertised.status, 200);
+  row = await db.federationPeer.findUnique({ where: { peer_panel_id: panel2 } });
+  assert.equal(row.endpoint_url, "http://panel-c:3000");
+});
+
+maybe("WP14 federation: 公布地址规范化（浏览器地址 ≠ 容器网络地址）", async () => {
+  const { federationSelfUrl, normalizeSelfUrl } = await import("../src/services/federation/trust.ts");
+  // 纯函数部分：尾斜杠必须被去掉，否则拼出 `//api/federation/...`，peer 侧的 URL 校验会拒
+  assert.equal(normalizeSelfUrl("http://panel:3000/"), "http://panel:3000");
+  assert.equal(normalizeSelfUrl("  http://panel:3000//  "), "http://panel:3000");
+  // 真实取值：未配置 FEDERATION_PUBLIC_URL 时回落 SITE_URL，且必须非空
+  assert.ok(federationSelfUrl().length > 0);
+  assert.equal(federationSelfUrl().endsWith("/"), false);
+});

@@ -164,7 +164,10 @@ export function createApp() {
   app.route("/api/admin", adminRoutes);
   app.route("/api/admin", nodeGrantRoutes);
   app.route("/api/admin", adminExtendedRoutes);
-  app.route("/api/admin", adminFederationRoutes);
+  // 注意前缀：联邦的管理端接口有自己的子路径（/api/admin/federation/*）。
+  // 若按 `/api/admin` 挂载，路由内的 "/status" 会变成 `/api/admin/status` —— 既与文档不符，
+  // 也会和既有 admin 路由抢同一个命名空间（实测被 Gate 抓到）。
+  app.route("/api/admin/federation", adminFederationRoutes);
   // WP10：管理端节点角色 / 凭据状态 / 出口池 / 运行态查询。与上面三个同批
   // 挂载，中间件（adminRequired → adminPermissionGuard）已在 §⑥ 统一施加。
   app.route("/api/admin", nodeAdminRoutes);

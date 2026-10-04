@@ -442,6 +442,14 @@ export interface DispatchEgressInput {
 
 export interface DispatchIngressInput {
   tunnelId: number;
+  /**
+   * V5.5 WP15：覆盖运行时 id（联邦远端入口腿用 `federatedTunnelId(ref,"relay")`）。
+   *
+   * 传了它就同时意味着"这不是本机 Forward 的腿"：host 上没有对应的 tunnel 行，
+   * 因此**不**写 `placement_lease` —— 联邦腿的归属由 `federation_lease.lease_epoch`
+   * 表达，再写一份本地归属就是第二份真相（而那份归属会指向一个不存在的隧道）。
+   */
+  runtimeId?: string;
   revision: number;
   ingressNode: OrchestratorNode;
   ingressPort: number;
@@ -1004,7 +1012,7 @@ export class Orchestrator {
   async dispatchIngress(input: DispatchIngressInput): Promise<RelayDispatchOutcome> {
     // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须
     // 停止服务的也是它），所以认领发生在这里，而不是在出口腿。
-    const relayId = Orchestrator.relayTunnelId(input.tunnelId);
+    const relayId = input.runtimeId ?? Orchestrator.relayTunnelId(input.tunnelId);
     const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
     const unreachable = await this.reachable(input.ingressNode);
@@ -1024,9 +1032,15 @@ export class Orchestrator {
     // The RELAY listener is client-facing, so this is where TLS terminates.
     // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须停止
     // 服务的也是它），所以认领发生在这里，而不是在出口腿 —— 出口节点是一份资源，不是归属持有者。
-    const ownership = await this.claimOwnership(input.tunnelId, input.ingressNode.id, input.revision);
-    if (!ownership.ok) {
-      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+    // runtimeId 非空 = 联邦远端腿：归属由 federation_lease 的 lease_epoch 表达（见入参注释），
+    // 因此**不**认领本地归属 —— 那会写出一条指向不存在隧道的 placement_lease。
+    let ownershipFields: Record<string, unknown> = {};
+    if (input.runtimeId === undefined) {
+      const ownership = await this.claimOwnership(input.tunnelId, input.ingressNode.id, input.revision);
+      if (!ownership.ok) {
+        return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+      }
+      ownershipFields = ownership.fields;
     }
 
     const tlsFields = Orchestrator.tlsFields(protocol, input);
@@ -1044,7 +1058,7 @@ export class Orchestrator {
       speed_limit: 0,
       revision: input.revision,
       ...tlsFields,
-      ...ownership.fields,
+      ...ownershipFields,
     };
 
     const envelope = createCommand({

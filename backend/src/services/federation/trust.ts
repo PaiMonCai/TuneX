@@ -16,6 +16,7 @@
 import type { JWK } from "jose";
 import { db } from "../../db.ts";
 import { recordFederationAudit } from "./audit.ts";
+import { env } from "../../env.ts";
 import { callPeer } from "./client.ts";
 import { federationStatus, type FederationErrorCode } from "./errors.ts";
 import {
@@ -44,6 +45,22 @@ import { secretEquals as invitationTokenEquals } from "./seal.ts";
 export const INVITATION_TTL_SECONDS = 900;
 /** 旧密钥的退休宽限期：24 小时内仍可验签（在途请求不会因为轮转而失败）。 */
 export const KEY_RETIRE_GRACE_MS = 24 * 60 * 60 * 1000;
+/**
+ * 本机对外公布的可达地址（peer 用它回呼我们）。
+ *
+ * 这是**必须**有的：握手只交换公钥，不交换"我怎么找到你"；如果这一步不自报地址，
+ * 对端就永远无法回呼（撤销通知、密钥轮转、ping、用量推送全部变成 peer_unreachable），
+ * 而现象是"信任建立成功但对方像是不存在"。
+ */
+export function federationSelfUrl(): string {
+  return normalizeSelfUrl(env.federationPublicUrl || env.siteUrl);
+}
+
+/** 纯函数：公布地址必须无尾斜杠（否则拼出来是 `//api/...`，peer 侧的 URL 校验会拒）。 */
+export function normalizeSelfUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/, "");
+}
+
 /** 默认信任范围：只允许"远端承载一跳链路"，其余能力必须显式授予。 */
 export const DEFAULT_TRUST_SCOPE = { hop_roles: ["egress"], can_request_leases: true } as const;
 
@@ -192,8 +209,11 @@ export async function handleHandshake(input: HandshakeRequest, now = new Date())
       where: { id: peer.id },
       data: {
         peer_panel_id: input.peer_panel_id,
-        display_name: (input.display_name ?? peer.display_name).slice(0, 120),
-        endpoint_url: input.endpoint_url.slice(0, 255),
+        // 只有对方**确实提供了**才覆盖：空串意味着"我没告诉你我的地址"，
+        // 而不是"把我的地址清空"（清空的结果是对端再也回呼不到我们）。
+        display_name: input.display_name && input.display_name.trim() !== "" ? input.display_name.slice(0, 120) : peer.display_name,
+        endpoint_url:
+          input.endpoint_url && input.endpoint_url.trim() !== "" ? input.endpoint_url.slice(0, 255) : peer.endpoint_url,
         public_keys: keys as never,
         status: "trusted",
         trust_scope: trustScope as never,
@@ -280,7 +300,8 @@ export async function performHandshake(input: {
       peer_panel_id: identity.panel_id,
       key_id: identity.key_id,
       public_jwk: identity.public_jwk,
-      endpoint_url: "",
+      // 自报**我们自己的**地址：对端要靠它回呼我们（见 federationSelfUrl 的说明）。
+      endpoint_url: federationSelfUrl(),
       display_name: input.display_name,
       token: input.token,
     });

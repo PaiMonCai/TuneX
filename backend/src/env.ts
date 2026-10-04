@@ -68,4 +68,12 @@ export const env = {
   disableWorker: (process.env.DISABLE_WORKER ?? "false") === "true",
   /** Optional billing integration; off by default, independent of RBAC. */
   paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
+  /**
+   * V5.5 WP14 —— 本 Panel 对**其他 Panel** 公布的可达地址（不含路径）。
+   *
+   * 为什么不能直接用 `siteUrl`：那是给浏览器用的地址（可能是 127.0.0.1 或外网域名），
+   * 而 peer 需要的是一个它能拨通的地址（容器网络里是 `http://panel:3000`）。
+   * 空串 = 回落到 `siteUrl`（单机/同网部署通常也对）。
+   */
+  federationPublicUrl: process.env.FEDERATION_PUBLIC_URL?.trim() || "",
 } as const;

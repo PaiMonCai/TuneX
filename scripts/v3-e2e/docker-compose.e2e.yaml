@@ -19,6 +19,9 @@ services:
       PORT: "3000"
       TZ: Asia/Shanghai
       SITE_URL: http://127.0.0.1:${WP14_PANEL_HTTP_PORT:-18180}
+      # V5.5 WP14：本 Panel 对其他 Panel 公布的可达地址。浏览器用的 SITE_URL 是宿主端口，
+      # 容器网络里的 peer 拨不通；联邦回呼（撤销通知 / 密钥轮转 / ping / 用量）都用这个。
+      FEDERATION_PUBLIC_URL: http://panel:3000
       DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
       REDIS_URL: redis://redis:6379
       AUTH_SECRET: ${AUTH_SECRET:?required}
