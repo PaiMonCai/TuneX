@@ -2065,6 +2065,21 @@ drain_ingress(旧) + release_old_lease(旧)）。
 与 desired 之间是否一致，不一致就按同 revision 重发。这样 F1、F3 与"熔断看起来没生效"一次解决，
 且不需要任何新的下发机制。
 
+**round 7 进展：内容漂移判定已实现，并已追到最后一跳**
+
+已提交：漂移判定从"存在性 + revision"扩展到**内容**（池目标集合、健康数组），并补上了**输入接线**
+（`egress_pools` 之前根本没从上报里取出来，所以新规则永不触发 —— 与"实现了但没接线"第四次同类）。
+新判定在同 revision 重发（内容不属于 revision）。
+
+**端到端构造验证**（给池加第三个目标 → desired 内容变化）：
+- `findings` 从 4 涨到 6 ✅ **漂移被检测到了**；
+- `resent: 0` 但 `failed: 1` ✅ **重发确实被尝试了一次并失败**；
+- agent 的池仍是 2 个目标 ✅ 说明那一跳失败了。
+
+⇒ 现在的问题精确到了**一跳**：sink 的 `resendSameRevision` → `orchestrator.dispatchEgress` 抛错。
+worker 的汇总日志只打 `failed: 1`，**不打 finding 的 detail**，所以下一步要先让这一跳的失败原因可见
+（例如 worker 打印 `resend_skipped` 的 detail，或直接在容器里调用 sink 复现）。这是下一轮的**第一个动作**。
+
 **仍未修**：
 - **F1**：reconcile 的漂移判定要包含**池内容**（现在只比隧道列表，"runtime 存在"就认为健康）；
 - **F3**：`resent: 0` 而 `findings > 0` 的根因未查清。已排除一个假设：`pickAgentTunnel` 在 relay 任一侧
