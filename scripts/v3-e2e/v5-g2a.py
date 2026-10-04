@@ -499,9 +499,17 @@ def g2a_9_panel_restart_is_safe():
     state = entry.get("state")
     check(state in {"healthy", "recovering", "degraded", "unknown"},
           "G2A.9 the view is served after a panel restart with a derived verdict", f"state={state}")
-    check(entry.get("facts", {}).get("observation_age_ms") is not None
-          or state == "unknown",
-          "G2A.9 the answer carries how old the evidence is", json.dumps(entry)[:200])
+    # The fact is named `age_ms` (the contract's derived age), NOT `observation_age`:
+    # the wire deliberately carries only the timestamp, and every derived age in the
+    # view is computed from it. Checking for the wrong key made this assertion fail on
+    # a perfectly healthy view.
+    facts = entry.get("facts") or {}
+    check(facts.get("age_ms") is not None or facts.get("last_observed_at") is not None or state == "unknown",
+          "G2A.9 the answer carries how old the evidence is (age_ms and/or last_observed_at)",
+          json.dumps(facts)[:200])
+    check(facts.get("evidence") is not None,
+          "G2A.9 and whether the verdict had any usable evidence at all",
+          json.dumps(facts)[:160])
 
 
 def g2a_10_single_failure_is_not_condemned():
