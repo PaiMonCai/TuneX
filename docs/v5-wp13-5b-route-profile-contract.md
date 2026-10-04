@@ -162,13 +162,18 @@ fallback             → 同 failover 的「按序取第一个 eligible」
 
 ~~~text
 exclude_node_ids[]      显式排除
-exclude_lifecycles[]    如 ["retiring","maintenance"]
-allowed_regions[]       区域白名单（非空时按严格匹配）
-require_health[]        允许的健康态（如 ["ok","degraded"]；非空时按严格匹配）
+allowed_lifecycles[]    允许的 lifecycle；**缺省 = 只允许 active**（fail-closed）
+require_health[]        允许的健康态（取值域与 node-health.ts 的 NODE_HEALTHS 一致：
+                        healthy / warning / error / unknown）；缺省 = 不额外要求
 require_node_binding    相邻跳是否必须有 NodeBinding（默认 true，交由 admitRoute 判定）
 ~~~
 
 未知的约束键 **fail-closed**（`invalid_input`），不静默忽略。
+
+**合格与否只用既有 `nodeAdmission`（§13.4.2 的唯一实现）**，本层不新增第二套准入规则：
+maintenance / disabled / retiring / 未安装凭据（waiting）都不是合格候选。「活节点」由
+**显式** `require_health` 表达 —— 既有 `nodeAdmission` 允许「已安装但当前离线」的节点
+作为候选（它可能在 apply 窗口内重连），把这一点写在这里而不是悄悄改严。
 
 ### 4.4 required capabilities
 
@@ -199,9 +204,41 @@ require_node_binding    相邻跳是否必须有 NodeBinding（默认 true，交
 | 3 | Egress NodeGroup + fallback / round_robin / random / least_conn / ip_hash | ✅ 支持 |
 | 4 | dynamic middle pool（transit 用 NodeGroup）/ 任意图 / 最短路 | ⛔ **关闭**，`unsupported_topology` fail-closed |
 
+### 4.7 三个实现期定案（2026-10-05，与上面同等效力）
+
+1. **不必为「跳」再存一份**：`resolved_hops` 就是快照自己的
+   `ingress_node_id / egress_node_id / middle_node_id`（用 `buildRoutePlan` 可逐字还
+   原成有序 hop 列表）。因此 `forward_revision` 只新增
+   `route_profile_id / route_profile_version` 两列；**带申请语义**的 hop 列表落在
+   `route_profile_application.resolved_hops`（apply 账本）。
+2. **放置比较必须规范化**：DIRECT 的计划里 `egress == ingress`（同一台机器的两个面），
+   而 `tunnel.egress_node_id` 列按定义是 NULL。比较「有没有变」时必须先把 DIRECT 的
+   出口规约成 null（实现里由唯一的 `samePlacement` 承担），否则每次重编译都会被误判成
+   「出口变了」。
+3. **apply 有两种合法结果**：解析结果 ≠ 当前放置 ⇒ 产生新 revision（`runtime_changed: true`）；
+   解析结果 == 当前放置 ⇒ 不产生新 revision（既有编辑路径判为 metadata-only），
+   但**仍然落地「来源模板 + 版本」**并回报 `runtime_changed: false` ——
+   第一次把某条 Forward「认领」到一个本来就选对的模板时，这件事必须查得到。
+
 ---
 
-## 5. Visibility / entitlement（冻结）
+## 5. Impact Analysis 的口径（只读）
+
+~~~text
+scope = "referencing_forwards"
+affected = tunnel.route_profile_id == 该 Route Profile 的 Forward
+~~~
+
+**为什么不是「所有可能被这个模板铺到的 Forward」**：模板是意图，某条 Forward 是否属于它
+只能由一次显式 apply 建立（§9.4.5）。按「可能」猜一遍等于把意图当事实，运维会看到一份
+他没同意过的受影响清单。所以第一次 apply 之前该列表为空 —— 那是正确答案，不是缺失。
+
+impact 的每一次调用都必须**只读**：不触发下发、不写 revision、不写 rollout、不改指针。
+用例里用「调用前后 `forward_revision` / `forward_rollout` 行数一致」钉住这一点。
+
+---
+
+## 6. Visibility / entitlement（冻结）
 
 ~~~text
 INTERNAL   仅本 workspace 成员（管理面）可见可用
@@ -220,7 +257,7 @@ PUBLIC     所有满足条件（enabled + capability）的用户可选
 
 ---
 
-## 6. 与 Forward / RoutePlan / NodeGroup 的边界
+## 7. 与 Forward / RoutePlan / NodeGroup 的边界
 
 | 问题 | 答案 |
 |---|---|
@@ -234,7 +271,7 @@ PUBLIC     所有满足条件（enabled + capability）的用户可选
 
 ---
 
-## 7. 错误码分层（§13）
+## 8. 错误码分层（§13）
 
 每条错误都回答：失败在哪层 / 是否可重试 / 下一步动作。
 
@@ -259,25 +296,27 @@ PUBLIC     所有满足条件（enabled + capability）的用户可选
 
 ---
 
-## 8. 存储（additive）
+## 9. 存储（additive）
 
 ~~~text
 route_profile                身份 + 当前版本投影（visibility 字符串列）
 route_profile_version        每个版本的不可变 body（唯一真相）
 route_profile_assignment     ASSIGNED 的 workspace / plan 授权行
-route_profile_application    apply 账本：forward/revision ← profile/version + resolved_hops
+route_profile_application    apply 账本：tunnel/revision ← profile/version + resolved_hops
 tunnel.route_profile_id      该 Forward 当前来源模板（可空，不加 FK）
 tunnel.route_profile_version 该来源模板上次 apply 的版本
-forward_revision.route_profile_id / _version / resolved_hops
+forward_revision.route_profile_id / _version
                              不可变快照里的 provenance（可空，不加 FK）
+                             —— 具体跳就是本行的 ingress/egress/middle（见 §4.7 第 1 条）
 ~~~
 
 迁移纪律（§3.4）：**只新增、只加可空列**，不改既有列、不加 DB enum、不删数据；
 empty DB / existing V4 DB / legacy rows / 回滚（旧二进制忽略新列）/ 历史事实保留 全部成立。
+复合索引**必须显式命名**：MySQL 标识符上限 64 字符，Prisma 默认名会超长（实测 P3018 / 1059）。
 
 ---
 
-## 9. 非目标（本 WP 明确不做）
+## 10. 非目标（本 WP 明确不做）
 
 ~~~text
 Web 编辑页面（WP13.5A 完成后另派）
@@ -290,7 +329,7 @@ Federation 的资源授权（WP14+，只复用本契约的 entitlement 方向）
 
 ---
 
-## 10. 冻结声明
+## 11. 冻结声明（含实现期定案）
 
 本文冻结后，下列问题不再需要重新讨论（改动它们等于改契约）：
 
@@ -300,3 +339,22 @@ Federation 的资源授权（WP14+，只复用本契约的 entitlement 方向）
 4. transit 第一版只允许 ordered fixed nodes，dynamic middle pool fail-closed；
 5. visibility 三类，用户侧授权指向 Route Profile / capability，不指向 Node；
 6. Route Profile 不拥有 runtime / lease / lifecycle / applied revision / 流量。
+
+---
+
+## 12. 实现与验证落点（本 WP 交付物）
+
+| 交付 | 位置 |
+|---|---|
+| 契约（本文） | `docs/v5-wp13-5b-route-profile-contract.md` |
+| 编译器（纯函数） | `backend/src/services/route-profile-compiler.ts` |
+| 服务（CRUD / 版本 / impact / apply / visibility） | `backend/src/services/route-profile.ts` |
+| HTTP 面 | `backend/src/routes/route-profiles.ts`（`/api/route-profiles`，workspace 域 RBAC） |
+| 离线契约测试（selector / 反例 / visibility / 与 buildRoutePlan 一致性） | `backend/src/services/__tests__/route-profile.test.ts`（`bun test src`） |
+| HTTP / DB 契约测试（RBAC、跨 workspace、impact 只读、apply provenance、发布不重写、消费可见性） | `backend/tests/route-profile.test.mjs`（`node --test`，需 `TUNEX_DB_TEST=1`） |
+| 迁移 | `backend/prisma/migrations/20261021000000_v5_wp13_5b_route_profile/` |
+
+**测试为什么要分两处**：`bun test src` 里多个文件用 `mock.module` 替换共享模块
+（db / auth / scheduler…），同一进程内会互相污染；DB/HTTP 用例按仓库既有口径放在
+`backend/tests/*.mjs`，由 `node --test` 每文件独立进程执行（这也是 CI `bun run test`
+的覆盖面）。
