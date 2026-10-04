@@ -145,6 +145,36 @@ describe("WP16 usage: malformed reports are rejected instead of partially believ
   });
 });
 
+describe("WP16 usage: `lease_id` is accepted as a legacy alias of `lease_ref`", () => {
+  test("the alias parses to the canonical field", () => {
+    const parsed = parseUsageReport({
+      usage_id: "u1",
+      lease_id: "lease-1",
+      window_start: 0,
+      window_end: 1,
+      bytes_in: 1,
+      bytes_out: 2,
+      connections: 3,
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.value.lease_ref).toBe("lease-1");
+  });
+
+  test("both names with the same value is fine, but disagreeing values fail closed", () => {
+    const same = parseUsageReport({ usage_id: "u1", lease_ref: "lease-1", lease_id: "lease-1", window_start: 0, window_end: 1 });
+    expect(same.ok).toBe(true);
+    const conflict = parseUsageReport({ usage_id: "u1", lease_ref: "lease-1", lease_id: "lease-2", window_start: 0, window_end: 1 });
+    expect(conflict.ok).toBe(false);
+    if (!conflict.ok) expect(conflict.message).toContain("disagree");
+  });
+
+  test("unknown keys are still rejected (the alias is not a general loosening)", () => {
+    const parsed = parseUsageReport({ usage_id: "u1", lease_id: "lease-1", foo: 1, window_start: 0, window_end: 1 });
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.message).toContain("foo");
+  });
+});
+
 /* ================================================================== */
 /* 去重                                                               */
 /* ================================================================== */

@@ -451,10 +451,13 @@ federationRoutes.delete("/leases/:ref", federationAuth(), async (c) => {
 federationRoutes.post("/usage", federationAuth(), async (c) => {
   const peer = peerOf(c)!;
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!body || !body.report) {
-    return c.json(federationErrorBody("message_malformed", "缺少 report"), 400 as never);
+  if (!body) {
+    return c.json(federationErrorBody("message_malformed", "请求体不是合法 JSON"), 400 as never);
   }
-  const parsed = parseUsageReport(body.report);
+  // 契约 §4.1 写的是**顶层**字段；早期实现要求外面再包一层 `{report: …}`。两种都接受：
+  // 上报是机器到机器的周期动作，"因为少包/多包一层就永远推不进来"是最没必要的一种失败。
+  const raw = body.report && typeof body.report === "object" ? body.report : body;
+  const parsed = parseUsageReport(raw);
   if (!parsed.ok) {
     return c.json(federationErrorBody(parsed.code, parsed.message, peer.peer_panel_id), federationStatus(parsed.code) as never);
   }

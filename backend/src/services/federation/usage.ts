@@ -44,6 +44,8 @@ const FORWARD_REF_MAX = 191;
 const USAGE_KEYS: ReadonlySet<string> = new Set([
   "usage_id",
   "lease_ref",
+  /** 契约文档早期的字段名（§4.1 曾写作 `lease_id`）。规范仍是 schema 列名 `lease_ref`。 */
+  "lease_id",
   "forward_ref",
   "window_start",
   "window_end",
@@ -102,7 +104,14 @@ export function parseUsageReport(raw: unknown): ParseResult<UsageReport> {
   if (typeof usageId !== "string" || usageId.length === 0 || usageId.length > USAGE_ID_MAX) {
     return bad(`usage_id must be a non-empty string of at most ${USAGE_ID_MAX} chars`);
   }
-  const leaseRef = raw.lease_ref;
+  // `lease_id` 是 `lease_ref` 的**别名**（契约文档早期用过这个字段名；规范名仍是 schema 的
+  // `lease_ref`）。两个都给且不一致时 fail-closed —— 含糊地挑一个会让"哪条租约"变成猜测。
+  const rawRef = raw.lease_ref;
+  const rawAlias = raw.lease_id;
+  if (typeof rawRef === "string" && typeof rawAlias === "string" && rawRef !== rawAlias) {
+    return bad("lease_ref and lease_id disagree; send one of them (lease_id is a legacy alias)");
+  }
+  const leaseRef = typeof rawRef === "string" ? rawRef : rawAlias;
   if (typeof leaseRef !== "string" || leaseRef.length === 0 || leaseRef.length > LEASE_REF_MAX) {
     return bad(`lease_ref must be a non-empty string of at most ${LEASE_REF_MAX} chars`);
   }

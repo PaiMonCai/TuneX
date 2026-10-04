@@ -633,7 +633,13 @@ export type LeaseIntentClaim =
   /** 另一次投递正在执行中（或被上一拍放弃前的窗口内）→ duplicate_message（retryable）。 */
   | { kind: "in_flight"; row: LeaseIntentRow };
 
-export function leaseIntentKey(intentId: string, revision: number, action: LeaseIntentAction): string {
+/**
+ * 台账动作键。`renew` 会带**续约窗口**后缀（`renew@<window>`）——
+ * 见 {@link renewalWindowIndex}：续约是**周期动作**，不是"同一次申请"。
+ */
+export type LeaseActionKey = LeaseIntentAction | `renew@${number}`;
+
+export function leaseIntentKey(intentId: string, revision: number, action: LeaseActionKey): string {
   return `${intentId}:${revision}:${action}`;
 }
 
@@ -654,7 +660,7 @@ export const INTENT_STATUS = { pending: "pending", ok: "ok", failed: "failed" } 
  */
 export async function claimLeaseIntent(
   d: LeaseDb,
-  input: { intent_id: string; peer_panel_id: string; revision: number; action: LeaseIntentAction; now: Date },
+  input: { intent_id: string; peer_panel_id: string; revision: number; action: LeaseActionKey; now: Date },
 ): Promise<LeaseIntentClaim> {
   try {
     await d.federationIntent.create({
@@ -705,7 +711,7 @@ export async function settleLeaseIntent(
   input: {
     intent_id: string;
     revision: number;
-    action: LeaseIntentAction;
+    action: LeaseActionKey;
     status: typeof INTENT_STATUS.ok | typeof INTENT_STATUS.failed;
     lease_id?: number | null;
     error_code?: FederationErrorCode | null;
@@ -1994,6 +2000,21 @@ async function compensateFailedApply(
 /* 续约（host 侧）                                                      */
 /* ================================================================== */
 
+/**
+ * 续约窗口序号：`floor(now / ttl)`。
+ *
+ * 为什么续约的幂等键需要它：契约的 `(intent_id, revision, action)` 对 create/apply/release 都对
+ * ——那些是"同一次申请"。但续约是**周期动作**，而 home 侧的 revision 在 Forward 没改版时**不会变**，
+ * 于是同一 `(intent_id, revision, "renew")` 会一直命中"重投递返回首次结果"，到期时间永远停在
+ * 第一次续约那一刻：一条一直在正常续约的腿会被自己的幂等机制判死。
+ *
+ * 窗口 = 以 TTL 为格的时钟，同一窗口内的网络重试仍然只推一次期（保留幂等的收益），
+ * 跨窗口就是新的一次续约（周期性续约的正常路径）。
+ */
+export function renewalWindowIndex(now: Date, ttlSeconds: number): number {
+  return Math.floor(now.getTime() / (ttlSeconds * 1000));
+}
+
 export interface RenewRemoteLeaseInput {
   lease_ref: string;
   intent_id: string;
@@ -2045,11 +2066,18 @@ export async function renewRemoteLease(
     return { ok: false, code: "duplicate_message", message: "lease is being released; renewal refuses to race it" };
   }
 
+  const ttlSeconds = input.ttlSeconds ?? d.ttlSeconds;
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+    return { ok: false, code: "message_malformed", message: "ttlSeconds must be a positive integer" };
+  }
+  // 续约的幂等键带**窗口**：同一窗口内的重试只推一次期，跨窗口是新的一次续约。
+  const action: LeaseActionKey = `renew@${renewalWindowIndex(now, ttlSeconds)}`;
+
   const claim = await claimLeaseIntent(d.db, {
     intent_id: input.intent_id,
     peer_panel_id: lease.peer_panel_id,
     revision: input.revision,
-    action: "renew",
+    action,
     now,
   });
   if (claim.kind === "in_flight") {
@@ -2060,6 +2088,7 @@ export async function renewRemoteLease(
     };
   }
   if (claim.kind === "done") {
+    // 同一窗口的重投递：返回首次结果（到期时间就是那一次推到的值，不会变）。
     return { ok: true, lease_epoch: lease.lease_epoch, expires_at: lease.expires_at };
   }
 
@@ -2068,7 +2097,7 @@ export async function renewRemoteLease(
     await settleLeaseIntent(d.db, {
       intent_id: input.intent_id,
       revision: input.revision,
-      action: "renew",
+      action,
       status: INTENT_STATUS.failed,
       error_code: "grant_not_found",
     });
@@ -2091,37 +2120,50 @@ export async function renewRemoteLease(
     now,
   });
   if (!decision.allow) {
-    // 不推时间 = 让它按原到期时刻被 expireLeases 收口。这就是"挂起期间到期不再续"的落点。
+    // 不推时间 = 让它按原到期时刻被 expireLeases 收口。这就是"挂起期间到期不再续"的落点，
+    // 换了窗口化幂等键之后这一步仍然在**任何写入之前**。
     await settleLeaseIntent(d.db, {
       intent_id: input.intent_id,
       revision: input.revision,
-      action: "renew",
+      action,
       status: INTENT_STATUS.failed,
       error_code: decision.code,
     });
     return { ok: false, code: decision.code, message: decision.message };
   }
 
-  const ttlSeconds = input.ttlSeconds ?? d.ttlSeconds;
-  if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
-    return { ok: false, code: "message_malformed", message: "ttlSeconds must be a positive integer" };
-  }
   const ttlExpiry = new Date(now.getTime() + ttlSeconds * 1000);
-  const expiresAt = decision.expires_at.getTime() < ttlExpiry.getTime() ? decision.expires_at : ttlExpiry;
+  const candidate = decision.expires_at.getTime() < ttlExpiry.getTime() ? decision.expires_at : ttlExpiry;
+  // **到期时间只许前进**：一次带更小 ttl 的续约（或时钟回拨）不得把到期时间改小，
+  // 否则"续约"会变成"提前断线"。
+  const expiresAt = new Date(Math.max(lease.expires_at.getTime(), candidate.getTime()));
 
-  // 续约是**同 epoch** 的更新：CAS 仍带 epoch + 原状态，防止和释放/撤销互相覆盖。
+  // 续约是**同 epoch** 的更新：CAS 带 epoch + 原状态 + 原到期时间，既防和释放/撤销互相覆盖，
+  // 也防两个并发续约互相覆盖（后写的不能把先写的更晚的到期时间改回来）。
   const updated = (await d.db.federationLease.updateMany({
-    where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
+    where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state, expires_at: lease.expires_at },
     data: { expires_at: expiresAt },
   })) as { count: number };
   if (updated.count === 0) {
-    return { ok: false, code: "internal_error", message: "lease renewal lost the epoch CAS race; re-read and retry" };
+    const fresh = (await d.db.federationLease.findUnique({ where: { id: lease.id } })) as FederationLeaseRow | null;
+    if (fresh !== null && fresh !== undefined && !isTerminalLeaseState(fresh.state) && fresh.expires_at.getTime() >= expiresAt.getTime()) {
+      // 并发续约已经把到期时间推得比我们打算写的更晚（或一样）：收敛，不重试。
+      await settleLeaseIntent(d.db, {
+        intent_id: input.intent_id,
+        revision: input.revision,
+        action,
+        status: INTENT_STATUS.ok,
+        lease_id: lease.id,
+      });
+      return { ok: true, lease_epoch: fresh.lease_epoch, expires_at: fresh.expires_at };
+    }
+    return { ok: false, code: "internal_error", message: "lease renewal lost the CAS race; re-read and retry" };
   }
 
   await settleLeaseIntent(d.db, {
     intent_id: input.intent_id,
     revision: input.revision,
-    action: "renew",
+    action,
     status: INTENT_STATUS.ok,
     lease_id: lease.id,
   });
@@ -2138,6 +2180,7 @@ export async function renewRemoteLease(
       revision: input.revision,
       expires_at: expiresAt.toISOString(),
       grant_epoch: decision.grant_epoch,
+      renew_window: action,
     },
   });
 

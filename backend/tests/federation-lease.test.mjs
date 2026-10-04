@@ -697,6 +697,281 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     assert.equal(recoveredRow.last_error_code, null);
   });
 
+  test("task-11: a contract-shaped ingress apply is really delivered through the HTTP route", async () => {
+    const { createApp } = await import("../src/app.ts");
+    const { ensurePanelIdentity, setFederationEnabled, resetPanelIdentityCache } = await import(
+      "../src/services/federation/identity.ts"
+    );
+    const { buildSignatureHeaders } = await import("../src/services/federation/signing.ts");
+    const { generatePanelKeyPair } = await import("../src/services/federation/keys.ts");
+    const { resetOrchestrator, setOrchestrator } = await import("../src/services/relay-wiring.ts");
+
+    const app = createApp();
+    const keys = await generatePanelKeyPair();
+    await db.federationPeer.update({
+      where: { peer_panel_id: panelId },
+      data: { public_keys: [{ key_id: keys.key_id, jwk: keys.public_jwk, state: "active", not_after: null }] },
+    });
+    await ensurePanelIdentity();
+    await setFederationEnabled(true);
+
+    // 假 orchestrator：让"经 HTTP 送达的参数"这件事本身可断言（真机 agent 不在本容器里）。
+    const seen = [];
+    const fake = {
+      async dispatchIngress(input) {
+        seen.push({ kind: "ingress", ...input });
+        return { ok: true, result: { commandId: "c-ingress", revision: input.revision, ack: {} } };
+      },
+      async dispatchEgress(input) {
+        seen.push({ kind: "egress", ...input });
+        return { ok: true, result: { commandId: "c-egress", revision: input.revision, ack: {} }, egress_host: "10.8.0.7", egress_port: input.egressPort };
+      },
+      async removeTunnel(input) {
+        seen.push({ kind: "remove", ...input });
+        return { ok: true, result: { commandId: "c-remove", revision: input.revision, ack: {} } };
+      },
+    };
+    setOrchestrator(fake);
+
+    async function signedApply(ref, body) {
+      const bodyStr = JSON.stringify(body);
+      const headers = await buildSignatureHeaders({
+        identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
+        privateJwk: keys.private_jwk,
+        body: bodyStr,
+        messageId: uuid(),
+      });
+      const res = await app.request(`http://panel.local/api/federation/v1/leases/${ref}/apply`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: bodyStr,
+      });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    }
+
+    try {
+      // ---- ingress 腿 ----
+      const ingressGrant = await makeGrant({ hopRoles: ["ingress"] });
+      const ingressRuntime = runtimeStub();
+      const ingressLease = await reserve(ingressGrant, { deps: ingressRuntime.deps, hopRole: "ingress" });
+      assert.equal(ingressLease.ok, true, ingressLease.ok ? "" : ingressLease.message);
+      const ingressRef = ingressLease.lease.lease_ref;
+
+      // 契约 §3.2 形状：link 里给 next_hop；ingress 允许空 targets。
+      const okRun = await signedApply(ingressRef, {
+        intent_id: ingressLease.lease.intent_id,
+        revision: 1,
+        link: { next_hop: "10.8.0.9:19302", targets: [] },
+      });
+      assert.equal(okRun.status, 200, `contract-shaped ingress apply must pass the route: ${JSON.stringify(okRun)}`);
+      const delivered = seen.find((c) => c.kind === "ingress");
+      assert.ok(delivered, "dispatchIngress must have been called through the real path");
+      assert.equal(delivered.nextHop, "10.8.0.9:19302", "link.next_hop must reach the orchestrator");
+      assert.equal(delivered.runtimeId, `tunex-fed-${ingressRef}-relay`);
+
+      // 缺 next_hop → 400 message_malformed（不猜地址），且不得下发。
+      const ingressGrant2 = await makeGrant({ hopRoles: ["ingress"] });
+      const secondRuntime = runtimeStub();
+      const secondLease = await reserve(ingressGrant2, { deps: secondRuntime.deps, hopRole: "ingress" });
+      assert.equal(secondLease.ok, true);
+      const before = seen.length;
+      const missingHop = await signedApply(secondLease.lease.lease_ref, {
+        intent_id: secondLease.lease.intent_id,
+        revision: 1,
+        link: { targets: [{ host: "203.0.113.9", port: 443 }] },
+      });
+      assert.equal(missingHop.status, 400);
+      assert.equal(missingHop.body?.code, "message_malformed");
+      assert.equal(seen.length, before, "a rejected apply must not reach the orchestrator");
+
+      // ---- egress 腿：空 targets 仍然是 400（"空目标 = 一条永远不通的链路"）----
+      const egressGrant = await makeGrant();
+      const egressRuntime = runtimeStub();
+      const egressLease = await reserve(egressGrant, { deps: egressRuntime.deps });
+      assert.equal(egressLease.ok, true);
+      const emptyTargets = await signedApply(egressLease.lease.lease_ref, {
+        intent_id: egressLease.lease.intent_id,
+        revision: 1,
+        link: { targets: [] },
+      });
+      assert.equal(emptyTargets.status, 400);
+      assert.equal(emptyTargets.body?.code, "message_malformed");
+
+      // 出口腿正常形状 → 200，且 targets 真的送达。
+      const egressOk = await signedApply(egressLease.lease.lease_ref, {
+        intent_id: egressLease.lease.intent_id,
+        revision: 1,
+        link: { targets: [{ host: "203.0.113.9", port: 443 }], protocol: "tcp" },
+      });
+      assert.equal(egressOk.status, 200, JSON.stringify(egressOk));
+      const egressDelivered = seen.filter((c) => c.kind === "egress").pop();
+      assert.equal(egressDelivered.targets.length, 1);
+      assert.equal(egressDelivered.targets[0].host, "203.0.113.9");
+      assert.equal(egressDelivered.runtimeId, `tunex-fed-${egressLease.lease.lease_ref}-egress`);
+    } finally {
+      resetOrchestrator();
+      await setFederationEnabled(false);
+      resetPanelIdentityCache();
+    }
+  });
+
+  test("task-11: periodic renewal really extends the deadline over HTTP (the old idempotency key killed it)", async () => {
+    const { createApp } = await import("../src/app.ts");
+    const { ensurePanelIdentity, setFederationEnabled, resetPanelIdentityCache } = await import(
+      "../src/services/federation/identity.ts"
+    );
+    const { buildSignatureHeaders } = await import("../src/services/federation/signing.ts");
+    const { generatePanelKeyPair } = await import("../src/services/federation/keys.ts");
+
+    const app = createApp();
+    const keys = await generatePanelKeyPair();
+    await db.federationPeer.update({
+      where: { peer_panel_id: panelId },
+      data: { public_keys: [{ key_id: keys.key_id, jwk: keys.public_jwk, state: "active", not_after: null }] },
+    });
+    await ensurePanelIdentity();
+    await setFederationEnabled(true);
+
+    async function signedRenew(ref, body) {
+      const bodyStr = JSON.stringify(body);
+      const headers = await buildSignatureHeaders({
+        identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
+        privateJwk: keys.private_jwk,
+        body: bodyStr,
+        messageId: uuid(),
+      });
+      const res = await app.request(`http://panel.local/api/federation/v1/leases/${ref}/renew`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: bodyStr,
+      });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    }
+
+    try {
+      const grant = await makeGrant({ expiresInMs: 3_600_000 });
+      const runtime = runtimeStub();
+      // 租约以 2s TTL 预留：这样"续约真的把到期时间往后推"是可观测的
+      // （若当前剩余时间已经比 TTL 长，monotonic max 会让续约成为 no-op —— 那是正确的防回退行为）。
+      const reserved = await reserve(grant, { deps: runtime.deps, ttlSeconds: 2 });
+      assert.equal(reserved.ok, true);
+      const ref = reserved.lease.lease_ref;
+      const intentId = reserved.lease.intent_id;
+
+      // 同一 revision（home 侧在 Forward 没改版时只能这么发），ttl=2s → 窗口每两秒一格。
+      const ttlSeconds = 2;
+      const before = Date.now();
+      const first = await signedRenew(ref, { intent_id: intentId, revision: 1, ttl_seconds: ttlSeconds });
+      assert.equal(first.status, 200, JSON.stringify(first));
+      const w1 = Math.floor(before / (ttlSeconds * 1000));
+
+      // 睡过一个窗口（并留出余量），再续一次。
+      await new Promise((r) => setTimeout(r, 2_300));
+      const mid = Date.now();
+      const second = await signedRenew(ref, { intent_id: intentId, revision: 1, ttl_seconds: ttlSeconds });
+      assert.equal(second.status, 200, JSON.stringify(second));
+      const w2 = Math.floor(mid / (ttlSeconds * 1000));
+
+      assert.ok(w2 > w1, `test needs the clock to cross a window (w1=${w1} w2=${w2})`);
+      assert.ok(
+        new Date(second.body.expires_at).getTime() > new Date(first.body.expires_at).getTime(),
+        `cross-window renewal must extend: ${first.body.expires_at} -> ${second.body.expires_at}`,
+      );
+
+      const row = await db.federationLease.findUnique({ where: { lease_ref: ref } });
+      assert.equal(row.expires_at.toISOString(), new Date(second.body.expires_at).toISOString());
+
+      // 同一窗口内的重投递：返回首次结果，**不推期**（幂等的收益还在）。
+      const t1 = Date.now();
+      const third = await signedRenew(ref, { intent_id: intentId, revision: 1, ttl_seconds: 60 });
+      const t2 = Date.now();
+      const fourth = await signedRenew(ref, { intent_id: intentId, revision: 1, ttl_seconds: 60 });
+      const sameWindow = Math.floor(t1 / 60_000) === Math.floor(t2 / 60_000);
+      if (sameWindow) {
+        assert.equal(fourth.body.expires_at, third.body.expires_at, "a same-window replay must not move the deadline");
+        const renewRows = await db.federationIntent.count({ where: { intent_id: intentId, action: { startsWith: "renew@" } } });
+        // 1s 窗口两次 + 60s 窗口一次 = 3 行；同窗口的重投递不新增行。
+        assert.equal(renewRows, 3, `expected 3 renew ledger rows, got ${renewRows}`);
+      }
+      // 不论窗口是否跨越，到期时间都不许倒退。
+      assert.ok(new Date(fourth.body.expires_at).getTime() >= new Date(third.body.expires_at).getTime());
+    } finally {
+      await setFederationEnabled(false);
+      resetPanelIdentityCache();
+    }
+  });
+
+  test("task-11: a contract-named usage push (top-level + lease_id) lands; unknown keys still 400", async () => {
+    const { createApp } = await import("../src/app.ts");
+    const { ensurePanelIdentity, setFederationEnabled, resetPanelIdentityCache } = await import(
+      "../src/services/federation/identity.ts"
+    );
+    const { buildSignatureHeaders } = await import("../src/services/federation/signing.ts");
+    const { generatePanelKeyPair } = await import("../src/services/federation/keys.ts");
+
+    const app = createApp();
+    const keys = await generatePanelKeyPair();
+    await db.federationPeer.update({
+      where: { peer_panel_id: panelId },
+      data: { public_keys: [{ key_id: keys.key_id, jwk: keys.public_jwk, state: "active", not_after: null }] },
+    });
+    await ensurePanelIdentity();
+    await setFederationEnabled(true);
+
+    async function signedPost(path, body) {
+      const bodyStr = JSON.stringify(body);
+      const headers = await buildSignatureHeaders({
+        identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
+        privateJwk: keys.private_jwk,
+        body: bodyStr,
+        messageId: uuid(),
+      });
+      const res = await app.request(`http://panel.local${path}`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: bodyStr,
+      });
+      return { status: res.status, body: await res.json().catch(() => null) };
+    }
+
+    try {
+      const usageId = `u-${uuid().slice(0, 8)}`;
+      // 契约 §4.1 形状：顶层字段 + `lease_id`（历史字段名，解析器按别名接受）。
+      const pushed = await signedPost("/api/federation/v1/usage", {
+        usage_id: usageId,
+        lease_id: `lease-usage-${nonce}`,
+        window_start: new Date(Date.now() - 60_000).toISOString(),
+        window_end: new Date().toISOString(),
+        bytes_in: 11,
+        bytes_out: 22,
+        connections: 3,
+      });
+      assert.equal(pushed.status, 200, JSON.stringify(pushed));
+      assert.equal(pushed.body.duplicate, false);
+
+      const row = await db.federationUsageRecord.findUnique({ where: { usage_id: usageId } });
+      assert.ok(row, "the usage fact must really be persisted");
+      assert.equal(row.lease_ref, `lease-usage-${nonce}`);
+      assert.equal(Number(row.bytes_in), 11);
+      assert.equal(row.attribution, "unattributed", "no placement row => unattributed bucket (by design)");
+
+      // 未知键仍然 fail-closed。
+      const bogus = await signedPost("/api/federation/v1/usage", {
+        usage_id: `u-${uuid().slice(0, 8)}`,
+        lease_ref: "lease-x",
+        window_start: new Date(Date.now() - 60_000).toISOString(),
+        window_end: new Date().toISOString(),
+        foo: 1,
+      });
+      assert.equal(bogus.status, 400, JSON.stringify(bogus));
+      assert.equal(bogus.body.code, "message_malformed");
+    } finally {
+      await db.federationUsageRecord.deleteMany({ where: { peer_panel_id: panelId } });
+      await setFederationEnabled(false);
+      resetPanelIdentityCache();
+    }
+  });
+
   /* ---------------- 清理 ---------------- */
 
   after(async () => {

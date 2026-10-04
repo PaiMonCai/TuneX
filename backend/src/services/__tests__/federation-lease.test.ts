@@ -14,6 +14,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   DEFAULT_LEASE_TTL_SECONDS,
+  renewalWindowIndex,
   applyRemoteLease,
   renewRemoteLease,
   sweepRevokedLeaseCleanup,
@@ -1329,7 +1330,9 @@ describe("WP15 lease: renewal extends the deadline only while the grant still al
     const made = makeLeaseDb({
       nodes: [nodeRow()],
       grants: [leaseGrantRow(grantOver)],
-      leases: [leaseRow({ state: "active", applied_revision: 7, ...leaseOver })],
+      // 到期时间刻意靠近 NOW：续约要"真的往后推"，否则 monotonic max 会让它保持不变
+      // （那是正确的防回退行为，但测不出"推进"这件事）。
+      leases: [leaseRow({ state: "active", applied_revision: 7, expires_at: new Date(NOW.getTime() + 60_000), ...leaseOver })],
     });
     const events: Row[] = [];
     return {
@@ -1450,6 +1453,81 @@ describe("WP15 lease (task-7 D1): a terminal lease whose port was not returned i
     const swept2 = await sweepRevokedLeaseCleanup({ now: NOW, deps: ok });
     expect(swept2.ports_released).toBe(1);
     expect(leases[0].last_error_code).toBeNull();
+  });
+});
+
+/* ================================================================== */
+/* 续约窗口幂等（"一直在续约却被自己的幂等键判死"的修复）                    */
+/* ================================================================== */
+
+describe("WP15 lease: renewal is a periodic action, so its idempotency key carries a window", () => {
+  function renewDeps(leaseOver: Row = {}) {
+    const made = makeLeaseDb({
+      nodes: [nodeRow()],
+      grants: [leaseGrantRow()],
+      leases: [leaseRow({ state: "active", applied_revision: 7, expires_at: new Date(NOW.getTime() + 5_000), ...leaseOver })],
+    });
+    return { ...made, deps: { ...hooks(made.calls), db: made.db, now: () => NOW, audit: silentAudit } };
+  }
+
+  test("the window index advances with the clock and stays stable inside one TTL", () => {
+    expect(renewalWindowIndex(NOW, 300)).toBe(Math.floor(NOW.getTime() / 300_000));
+    expect(renewalWindowIndex(new Date(NOW.getTime() + 1_000), 300)).toBe(renewalWindowIndex(NOW, 300));
+    expect(renewalWindowIndex(new Date(NOW.getTime() + 301_000), 300)).toBe(renewalWindowIndex(NOW, 300) + 1);
+  });
+
+  test("a replay inside the same window returns the first result and does NOT push again", async () => {
+    const f = renewDeps();
+    const first = await renewRemoteLease({ lease_ref: "lease-1", intent_id: "intent-1", revision: 7, ttlSeconds: 300 }, f.deps);
+    const pushed = f.leases[0].expires_at.getTime();
+    const second = await renewRemoteLease({ lease_ref: "lease-1", intent_id: "intent-1", revision: 7, ttlSeconds: 300 }, f.deps);
+    expect(first.ok && second.ok).toBe(true);
+    if (second.ok) expect(second.expires_at.getTime()).toBe(pushed);
+    // 台账里只有一行（(intent, revision, renew@<window>) 唯一）：第二次没有产生第二次写入。
+    expect(f.intents).toHaveLength(1);
+    expect(String(f.intents[0].action)).toMatch(/^renew@\d+$/);
+  });
+
+  test("crossing a window really extends the deadline (the periodic-renewal path)", async () => {
+    const f = renewDeps();
+    const first = await renewRemoteLease({ lease_ref: "lease-1", intent_id: "intent-1", revision: 7, ttlSeconds: 10 }, f.deps);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    // 下一格：时钟前进一个 TTL（同一 revision、同一 intent —— home 侧本来就只能这样发）。
+    const later = new Date(NOW.getTime() + 11_000);
+    const second = await renewRemoteLease(
+      { lease_ref: "lease-1", intent_id: "intent-1", revision: 7, ttlSeconds: 10 },
+      { ...f.deps, now: () => later },
+    );
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.expires_at.getTime()).toBeGreaterThan(first.expires_at.getTime());
+    expect(f.leases[0].expires_at.getTime()).toBe(second.expires_at.getTime());
+  });
+
+  test("expires_at never walks backwards, even with a smaller ttl", async () => {
+    const far = new Date(NOW.getTime() + 600_000);
+    const f = renewDeps({ expires_at: far });
+    const outcome = await renewRemoteLease({ lease_ref: "lease-1", intent_id: "intent-1", revision: 7, ttlSeconds: 5 }, f.deps);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.expires_at.getTime()).toBe(far.getTime());
+    expect(f.leases[0].expires_at.getTime()).toBe(far.getTime());
+  });
+
+  test("a suspended grant still refuses renewal on the windowed path (no deadline moved)", async () => {
+    const made = makeLeaseDb({
+      nodes: [nodeRow()],
+      grants: [leaseGrantRow({ status: "suspended" })],
+      leases: [leaseRow({ state: "active", applied_revision: 7 })],
+    });
+    const before = made.leases[0].expires_at.getTime();
+    const outcome = await renewRemoteLease(
+      { lease_ref: "lease-1", intent_id: "intent-1", revision: 7, ttlSeconds: 300 },
+      { ...hooks(made.calls), db: made.db, now: () => NOW, audit: silentAudit },
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("grant_not_active");
+    expect(made.leases[0].expires_at.getTime()).toBe(before);
   });
 });
 

@@ -171,6 +171,11 @@ status              active | suspended | revoked | expired（应用层字符串�
 **幂等**：`(intent_id, revision)` 是幂等键。同一 `intent_id` 的新 `revision` 是**更新**；
 重复投递同一 `(intent_id, revision)` 必须返回**首次结果**（不重复分配端口、不重复下发）。
 
+**例外：续约（renew）不是"同一次申请"而是周期动作**，因此它的幂等键必须带上续约窗口
+（`renew:<intent_id>:<revision>:<floor(now/ttl)>`）：同一窗口内的重投递返回首次结果（网络重试不重复推期），
+跨窗口则是新的一次续约。续约的硬约束：`expires_at` **单调不倒退**，且绝不越过 `grant.expires_at`；
+`grant` 处于 suspended 时续约必须被拒且不推期。
+
 **释放**：`DELETE /api/federation/v1/leases/:id` → host 停服并释放端口租约。释放幂等。
 租约到期（`expires_at` 到）未续 → host **主动停服**并释放；home 侧把对应 placement 标 `expired`。
 
@@ -198,7 +203,10 @@ status              active | suspended | revoked | expired（应用层字符串�
 ### 4.1 用量
 
 - host 侧按窗口统计该 lease 的 `bytes_in / bytes_out / connections`，周期推给 home：
-  `POST /api/federation/v1/usage`，字段含 `usage_id`（唯一）、`lease_id`、`window_start/end`、计数。
+  `POST /api/federation/v1/usage`，字段含 `usage_id`（唯一）、**`lease_ref`**、`window_start/end`、计数。
+  报文为**顶层**字段（`{usage_id, lease_ref, window_start, window_end, bytes_in, bytes_out, connections}`）；
+  兼容实现：外层可再包一层 `report`，且解析器接受 `lease_id` 作为 `lease_ref` 的**别名**
+  （别名只为兼容本文早期字段名，规范名以 schema 列 `lease_ref` 为准；其余未知键仍 fail-closed）。
 - home 侧按 `usage_id` **唯一去重**（重复/乱序投递必须安全）；归因到 `forward_ref` / workspace。
 - 缺失窗口不补 0：**"不知道"不是"零流量"**（与 `TargetObservation` 的 `latency_ms` 同口径）。
 
