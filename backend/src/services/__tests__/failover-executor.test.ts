@@ -582,33 +582,36 @@ describe("既有 rollout 路径确实能表达一次归属迁移", () => {
     binding_exists: null,
   };
 
-  test("计划策略是 node_migration，且包含搬迁所需的五阶段步骤", () => {
+  test("计划策略是 node_migration，且包含安全 handoff 所需步骤", () => {
     const plan = planRollout(placementPlanInput, TUNNEL);
     expect(plan.strategy).toBe("node_migration");
     expect(plan.blocking).toEqual([]);
     const kinds = plan.steps.map((s) => s.kind);
     expect(kinds).toContain("acquire_port");
+    expect(kinds).toContain("handoff_ingress_owner");
     expect(kinds).toContain("cutover_ingress");
-    expect(kinds).toContain("drain_ingress");
     expect(kinds).toContain("release_old_lease");
+    expect(kinds).not.toContain("drain_ingress");
   });
 
-  test("步骤方向正确：新节点接管入口，旧节点 drain 并释放", () => {
+  test("步骤方向正确：旧 owner 先 handoff，新节点再接管，旧端口最后释放", () => {
     const plan = planRollout(placementPlanInput, TUNNEL);
+    const handoff = plan.steps.find((s) => s.kind === "handoff_ingress_owner");
     const cutover = plan.steps.find((s) => s.kind === "cutover_ingress");
-    const drain = plan.steps.find((s) => s.kind === "drain_ingress");
     const release = plan.steps.find((s) => s.kind === "release_old_lease");
+    expect(handoff?.node_id).toBe(OWNER);
     expect(cutover?.node_id).toBe(CANDIDATE);
-    expect(drain?.node_id).toBe(OWNER);
     expect(release?.node_id).toBe(OWNER);
   });
 
-  test("阶段顺序不可倒置：先 cutover 再 drain，最后才释放旧租约", () => {
+  test("阶段顺序不可倒置：旧 owner handoff 必须早于新入口 cutover，最后才释放旧端口", () => {
     const plan = planRollout(placementPlanInput, TUNNEL);
-    const phaseOf = (kind: string) => plan.steps.find((s) => s.kind === kind)?.phase;
-    expect(phaseOf("cutover_ingress")).toBe("cutover");
-    expect(phaseOf("drain_ingress")).toBe("drain");
-    expect(phaseOf("release_old_lease")).toBe("cleanup");
+    const idx = (kind: string) => plan.steps.findIndex((s) => s.kind === kind);
+    expect(plan.steps[idx("handoff_ingress_owner")]?.phase).toBe("cutover");
+    expect(plan.steps[idx("cutover_ingress")]?.phase).toBe("cutover");
+    expect(plan.steps[idx("release_old_lease")]?.phase).toBe("cleanup");
+    expect(idx("handoff_ingress_owner")).toBeLessThan(idx("cutover_ingress"));
+    expect(idx("cutover_ingress")).toBeLessThan(idx("release_old_lease"));
   });
 });
 
