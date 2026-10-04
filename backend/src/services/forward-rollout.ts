@@ -134,7 +134,9 @@ export type RolloutStepKind =
   /** 旧端口租约释放（等 drain 完成）。 */
   | "release_old_lease"
   /** 撤旧 EGRESS runtime（幂等 revision+1）。 */
-  | "drop_old_egress";
+  | "drop_old_egress"
+  /** V5.4：撤旧 middle/transit runtime（物理形态仍是 EGRESS runtime）。 */
+  | "drop_old_transit";
 
 /**
  * `release_binding` 明确**不在**本表里：§13.3.1 规定 Binding 是可复用基础设施
@@ -244,10 +246,14 @@ export interface PlanRolloutInput {
     ingress: RolloutNodeFact | null;
     /** 新拓扑的出口节点（RELAY 必填）。 */
     egress: RolloutNodeFact | null;
+    /** V5.4：新拓扑的中间跳；单跳为 null。 */
+    middle?: RolloutNodeFact | null;
     /** 旧拓扑的入口节点（迁移时非空；用于 DRAIN/CLEANUP）。 */
     ingress_previous: RolloutNodeFact | null;
     /** 旧拓扑的出口节点（迁移时非空）。 */
     egress_previous: RolloutNodeFact | null;
+    /** V5.4：旧拓扑的中间跳；用于 DRAIN/CLEANUP。 */
+    middle_previous?: RolloutNodeFact | null;
   };
   /** RELAY 新 pair 的 NodeBinding 是否已存在；非 RELAY 传 null。 */
   binding_exists?: boolean | null;
@@ -332,7 +338,7 @@ export function classifyRolloutStrategy(input: {
   // 模式切换优先于一切：它同时改两端。
   if (impact.mode_change) return "mode_switch";
   // 入口或出口节点迁移（含「端口 + 入口节点同时改」合并为一档）。
-  if (impact.ingress_node_change || impact.egress_node_change) return "node_migration";
+  if (impact.ingress_node_change || impact.egress_node_change || impact.middle_node_change) return "node_migration";
   if (impact.listen_port_change) return "listener_replace";
   return "target_hot_swap";
 }
@@ -513,7 +519,10 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
     //
     // 该步骤同 revision 幂等，因此重复准备是 no-op，代价只是一次下发。
     const ingressWillRecut =
-      impact.ingress_node_change || impact.listener_replacement || impact.mode_change;
+      impact.ingress_node_change ||
+      impact.listener_replacement ||
+      impact.mode_change ||
+      impact.middle_node_change;
     if (egressIsNew) {
       // 新 pair：Binding 必须先存在（§13.3.1：新建显式、删除不自动）。
       if (input.binding_exists === false) {
@@ -595,7 +604,7 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   const ingressNeedsDispatch =
     impact.listener_replacement ||
     impact.mode_change ||
-    (relay && impact.egress_node_change) ||
+    (relay && (impact.egress_node_change || impact.middle_node_change)) ||
     (!relay && impact.target_change) ||
     applied === null;
   if (ingressNeedsDispatch) {
@@ -632,12 +641,26 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
 
   // 旧出口：换出口节点、或 RELAY→DIRECT 时旧 EGRESS 必须退场。
   const egressMustDrain = relayBefore && (impact.egress_node_change || impact.mode_change);
+  const oldMiddleNodeId = applied?.middle_node_id ?? null;
+  const newMiddleNodeId = desired.middle_node_id ?? null;
+  const middleMustDrain =
+    relayBefore &&
+    oldMiddleNodeId != null &&
+    oldMiddleNodeId !== newMiddleNodeId;
   if (egressMustDrain) {
     const oldEgress = nodes.egress_previous;
     push("drain", "drain_egress", {
       node_id: oldEgress?.id ?? (applied?.egress_node_id ?? null),
       direction: "egress",
       port: applied?.egress_port ?? null,
+    });
+  }
+  if (middleMustDrain) {
+    push("drain", "drain_egress", {
+      node_id: nodes.middle_previous?.id ?? oldMiddleNodeId,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_changed" },
     });
   }
 
@@ -668,6 +691,23 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
         port: applied.egress_port,
       });
     }
+  }
+
+  // middle 的端口不复制进 revision snapshot：NodePortLease 仍是物理端口唯一真相。
+  // 因此 cleanup 用 (tunnel,node) 在执行期精确找旧 middle 的唯一 active lease。
+  if (middleMustDrain) {
+    const oldMiddle = nodes.middle_previous?.id ?? oldMiddleNodeId;
+    push("cleanup", "drop_old_transit", {
+      node_id: oldMiddle,
+      direction: "egress",
+      port: null,
+    });
+    push("cleanup", "release_old_lease", {
+      node_id: oldMiddle,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_changed" },
+    });
   }
 
   // 去重 + 按 phase 稳定排序（同 phase 内保持生成顺序：可重排；跨 phase 严格有序）。
