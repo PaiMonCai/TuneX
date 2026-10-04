@@ -60,6 +60,18 @@ import {
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
 import { admitRoute } from "./forward-route.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
+// V5.5 WP15：远端出口腿的委托。编排只调这里的入口 —— 签名/重试/幂等键/镜像行
+// 全部有且只有一个实现（`federation/forward-hop.ts`），rollout 不再自己拼一遍。
+import {
+  checkFederatedEgressForSnapshot,
+  delegateFederatedEgress,
+  federatedEgressPeerOf,
+  recordRemoteEgressAddress,
+  releaseFederatedEgress,
+  remoteEgressAddressFor,
+  FEDERATED_EGRESS_PLAN_NODE_ID,
+  type ForwardHopSender,
+} from "./federation/forward-hop.ts";
 
 /** Existing runtime use, not a new creation/count slot. Production never defaults to allow. */
 export type RuntimeUseChecker = (workspaceId: number, resource: RuntimeUseResource) => Promise<RuntimeUseDenied | null>;
@@ -155,6 +167,14 @@ export interface RolloutDeps {
   orchestrator: Orchestrator;
   /** Re-read grants/policy/traffic before every PREPARE/CUTOVER side effect. */
   runtimeUse?: RuntimeUseChecker;
+  /**
+   * V5.5 WP15：跨面板出站的注入点（默认走 `client.callPeer`）。
+   *
+   * 只有"这条 Forward 声明了 federated_egress_peer"的路径会用到它；为空时那些
+   * 路径会走真实的 `callPeer`（签名/超时/重试的唯一实现）。测试注入假 transport，
+   * 于是"远端腿的建立/补偿/释放"可以在没有第二个 Panel 的情况下被断言。
+   */
+  federatedSender?: ForwardHopSender;
   now?: () => Date;
   /** 测试可注入无等待 sleeper；生产默认 setTimeout。 */
   sleep?: (ms: number) => Promise<void>;
@@ -388,7 +408,18 @@ interface TunnelProjection {
   desired_revision_id: number | null;
   desired_status: string;
   apply_status: string;
+  /** V5.5 WP15：远端出口声明（NULL = 出口在本机）。 */
+  federated_egress_peer?: string | null;
 }
+
+/**
+ * 计划/执行期的一份快照：`RolloutSnapshot` + WP15 的远端出口声明。
+ *
+ * `RolloutSnapshot` 归 `forward-rollout.ts`（本轮的改动范围之外），而这里只需要多读
+ * 一个**可选**字段，所以用子类型而不是去动那个契约 —— 类型层面仍然是同一个形状，
+ * 既有的构造点与替换快照一律不受影响。
+ */
+type FederatedRolloutSnapshot = RolloutSnapshot & { federated_egress_peer?: string | null };
 
 /**
  * 读 tunnel 行 + 最新 snapshot，凑出 {@link PlanRolloutInput} 的四个输入
@@ -453,8 +484,8 @@ async function loadRolloutNodes(
   tunnelId: number,
   deps: { db: RolloutDb },
 ): Promise<{
-  desired: RolloutSnapshot;
-  applied: RolloutSnapshot | null;
+  desired: FederatedRolloutSnapshot;
+  applied: FederatedRolloutSnapshot | null;
   nodes: PlanRolloutInput["nodes"];
   bindingExists: boolean | null;
 }> {
@@ -470,7 +501,7 @@ async function loadRolloutNodes(
     take: 2,
   })) as Array<Record<string, unknown>>;
 
-  const snapshotToRollout = (s: Record<string, unknown>): RolloutSnapshot => ({
+  const snapshotToRollout = (s: Record<string, unknown>): FederatedRolloutSnapshot => ({
     name: String(s.name ?? row.name),
     mode: String(s.mode ?? row.tunnel_mode) === "relay" ? "relay" : "direct",
     ingress_node_id: Number(s.ingress_node_id ?? row.ingress_node_id ?? 0),
@@ -486,6 +517,9 @@ async function loadRolloutNodes(
       ? (s.targets as Array<{ host: string; port: number; weight: number; order_by: number }>)
       : null,
     desired_status: (s.desired_status as string | null) ?? null,
+    // V5.5 WP15：这一跳"在哪一侧"必须随快照进计划 —— 续跑/补偿都靠它决定
+    // 该走本地 orchestrator 还是 peer（快照是唯一的放置事实来源）。
+    federated_egress_peer: federatedEgressPeerOf(s),
   });
 
   // desired：desired_revision_id 指向的 snapshot；缺失时用投影列合成基线
@@ -493,7 +527,7 @@ async function loadRolloutNodes(
   const desiredRow = row.desired_revision_id
     ? snapshots.find((s) => Number(s.id) === Number(row.desired_revision_id))
     : snapshots[0];
-  const desired: RolloutSnapshot = desiredRow
+  const desired: FederatedRolloutSnapshot = desiredRow
     ? snapshotToRollout(desiredRow)
     : {
         name: row.name,
@@ -509,6 +543,8 @@ async function loadRolloutNodes(
         egress_port: row.egress_port,
         egress_targets: null,
         desired_status: row.desired_status,
+        // 没有 snapshot 的存量行（报告 R5）：投影列就是唯一事实来源。
+        federated_egress_peer: federatedEgressPeerOf(row),
       };
 
   // applied：desired 之外的**次新** snapshot。
@@ -559,7 +595,22 @@ async function loadRolloutNodes(
   ]);
   const nodes: PlanRolloutInput["nodes"] = {
     ingress: nodeFact(desiredIngress),
-    egress: nodeFact(desiredEgress),
+    // ── V5.5 WP15：声明了远端 peer 时，出口跳在**另一个面板**上 ──
+    //
+    // 计划器需要一份出口节点事实（准入与路由模型都以它为前提），而本机确实没有
+    // 出口节点。这里给的是一份**显式占位**（`FEDERATED_EGRESS_PLAN_NODE_ID`）：
+    // 它只让计划通过，联邦分支第一件事就是不看它而直接走 `callPeer`。
+    // 若这里给 null，计划会在 VALIDATE 阶段被拒 —— 症状是"保存成功、什么都不发生"。
+    egress: federatedEgressPeerOf(desired) === null
+      ? nodeFact(desiredEgress)
+      : {
+          id: FEDERATED_EGRESS_PLAN_NODE_ID,
+          node_id: `federated:${federatedEgressPeerOf(desired)}`,
+          role: "egress",
+          connect_ip: null,
+          lifecycle: "active",
+          port_range_configured: false,
+        },
     middle: nodeFact(desiredMiddle),
     // 旧拓扑的节点对象：applied snapshot 里有 id 即可，运行时 DRAIN/CLEANUP
     // 只需要 node id 与端口，不需要再读一次 Node 行（避免旧节点已删时读库失败）。
@@ -592,8 +643,15 @@ async function loadRolloutNodes(
   };
 
   // Binding 存在性：只有 RELAY 且出口节点解析出来才有意义。
+  // 远端出口腿没有本机出口节点，也就没有可建的 NodeBinding（绑定是**本机**节点间
+  // 的许可关系，跨面板那一跳由 host 的 grant 授权，见契约 §3.1）。
   let bindingExists: boolean | null = null;
-  if (desired.mode === "relay" && desired.ingress_node_id != null && desired.egress_node_id != null) {
+  if (
+    federatedEgressPeerOf(desired) === null &&
+    desired.mode === "relay" &&
+    desired.ingress_node_id != null &&
+    desired.egress_node_id != null
+  ) {
     const found = (await deps.db.nodeBinding.findUnique({
       where: {
         ingress_node_id_egress_node_id: {
@@ -631,20 +689,135 @@ async function rolloutRuntimeDenial(
   const ingress = rawIngress as { node_group_id?: number } | null;
   const egress = rawEgress as { node_group_id?: number } | null;
   const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
+  // V5.5 WP15：出口腿在远端时，本机**没有**出口节点组可授权 —— 那一跳的容量与
+  // 配额权威在 host（契约 §1 的 Quota authority 答案：容量事实发生在 host）。
+  // 这里仍然严格校验入口侧与归属，不是"跳过授权"。
+  const federatedEgress = federatedEgressPeerOf(desired) !== null;
   if (!validId(tunnel?.workspace_id) || !validId(tunnel?.user_id) ||
       !validId(ingress?.node_group_id) ||
-      (desired.mode === "relay" && !validId(egress?.node_group_id))) {
+      (!federatedEgress && desired.mode === "relay" && !validId(egress?.node_group_id))) {
     return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或候选节点组已失效，无法应用目标配置" };
   }
   return (deps.runtimeUse ?? defaultRuntimeUse)(tunnel.workspace_id, {
     user_id: tunnel.user_id,
     in_node_group_id: ingress.node_group_id,
-    out_node_group_id: desired.mode === "relay" ? egress!.node_group_id! : null,
+    out_node_group_id: !federatedEgress && desired.mode === "relay" ? egress!.node_group_id! : null,
     // The canonical FACT, legacy column only as a fallback. Feeding the legacy
     // column straight in made the policy refuse a ws Forward (its column defaults
     // to 'wss') — V5-G1A.7.
     protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
   });
+}
+
+/* ================================================================== */
+/* 远端出口腿（V5.5 WP15）                                              */
+/* ================================================================== */
+
+/**
+ * 出口腿委托给 peer。
+ *
+ * 这个函数是 rollout 与 `federation/forward-hop.ts` 之间的**唯一**接缝：
+ * 计划/账本/补偿仍然全部由本文件负责，只有"那一跳怎么建"被换成了 `callPeer`。
+ * 它做的三件事：
+ *   1. 拓扑自检（同一份判定在注册时也跑过，但**续跑**可能拿到一份更早的计划）；
+ *   2. 委托（reserve → apply → 镜像行），失败时由 forward-hop 内部完成远端补偿；
+ *   3. 把 host 返回的可寻址地址登记下来 —— 入口的 next_hop 只认它。
+ */
+async function delegateRemoteEgressStep(ctx: RolloutExecContext, deps: RolloutDeps): Promise<StepOutcome> {
+  const peer = federatedEgressPeerOf(ctx.desired);
+  if (peer === null) {
+    return { ok: false, error_code: "invariant_violated", error: "远端出口分支被调用，但 desired 未声明 federated_egress_peer" };
+  }
+  const facts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+  if (facts === null) {
+    return {
+      ok: false,
+      error_code: "unsupported_protocol",
+      error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝委托远端出口",
+    };
+  }
+  const check = checkFederatedEgressForSnapshot({
+    tunnelId: ctx.tunnelId,
+    revision: ctx.revision,
+    snapshot: ctx.desired,
+    protocol: facts.protocol,
+  });
+  if (!check.ok) {
+    return { ok: false, error_code: check.code, error: check.message };
+  }
+
+  const outcome = await delegateFederatedEgress(
+    {
+      tunnelId: ctx.tunnelId,
+      revision: ctx.revision,
+      declaredPeer: peer,
+      mode: ctx.desired.mode,
+      ingress_node_id: ctx.desired.ingress_node_id,
+      local_egress_node_id: ctx.desired.egress_node_id,
+      middle_node_id: (ctx.desired as { middle_node_id?: number | null }).middle_node_id ?? null,
+      protocol: facts.protocol,
+      targets: ctx.desired.egress_targets ?? [],
+      lb_strategy: await loadEgressPoolLb(deps, ctx.desired.egress_pool_id),
+    },
+    { db: deps.db as never, sender: deps.federatedSender, now: deps.now },
+  );
+
+  if (!outcome.ok) {
+    // 远端失败**绝不**回落本机出口（契约 §5/§7）：这里只如实上报，把状态交给
+    // 既有的失败分流（PREPARE 失败 → error；CUTOVER 失败 → 补偿）。
+    const release = outcome.lease_ref
+      ? outcome.compensated
+        ? `远端租约 ${outcome.lease_ref} 已释放`
+        : `远端租约 ${outcome.lease_ref} 释放未确认（需对账）`
+      : "远端未产生租约";
+    return { ok: false, error_code: outcome.code, error: `远端出口 ${peer}: ${outcome.message}；${release}` };
+  }
+
+  if (outcome.next_hop !== null) recordRemoteEgressAddress(ctx.tunnelId, peer, outcome.next_hop);
+  return {
+    ok: true,
+    note:
+      `远端 egress peer=${peer} lease=${outcome.lease_ref} epoch=${outcome.lease_epoch} ` +
+      `applied_revision=${outcome.applied_revision} ` +
+      `next_hop=${outcome.next_hop ?? "（host 未返回可寻址地址，入口将 fail-closed）"}` +
+      `${outcome.replayed ? "（幂等重放）" : ""}`,
+  };
+}
+
+/** 本机出口池的负载均衡策略（原样转述给 host；读不到时 null = 让 host 用默认）。 */
+async function loadEgressPoolLb(deps: RolloutDeps, poolId: number | null): Promise<string | null> {
+  if (poolId == null) return null;
+  const pool = (deps.db as unknown as { egressPool?: { findUnique?: (args: unknown) => Promise<unknown> } })
+    .egressPool?.findUnique;
+  if (typeof pool !== "function") return null;
+  const row = (await pool({ where: { id: poolId }, select: { lb_strategy: true } }).catch(() => null)) as
+    | { lb_strategy?: string | null }
+    | null;
+  return typeof row?.lb_strategy === "string" && row.lb_strategy.length > 0 ? row.lb_strategy : null;
+}
+
+/** 这条被撤下的旧出口腿是不是一条**远端**腿（本机没有它的 runtime）。 */
+function appliedRemoteEgressPeer(ctx: RolloutExecContext): string | null {
+  return federatedEgressPeerOf(ctx.applied);
+}
+
+/**
+ * 释放远端出口腿（幂等）。
+ *
+ * `revision` 决定 intent_id —— 必须是**建那条腿时**的那一代，否则会去释放另一代
+ * revision 的租约（释放是幂等的，但释错人不是）。
+ */
+async function releaseRemoteEgressStep(
+  ctx: RolloutExecContext,
+  deps: RolloutDeps,
+  revision: number,
+): Promise<{ ok: boolean; message: string }> {
+  const peer = federatedEgressPeerOf(ctx.desired) ?? appliedRemoteEgressPeer(ctx);
+  const result = await releaseFederatedEgress(
+    { tunnelId: ctx.tunnelId, revision, peer_panel_id: peer },
+    { db: deps.db as never, sender: deps.federatedSender, now: deps.now },
+  );
+  return { ok: result.ok, message: result.ok ? "已释放" : `${result.code ?? "internal_error"}: ${result.message ?? ""}` };
 }
 
 /* ================================================================== */
@@ -671,6 +844,15 @@ async function runStep(
     case "acquire_port": {
       if (nodeId == null) {
         return { ok: false, error_code: "invariant_violated", error: "acquire_port 缺少 node_id" };
+      }
+      // V5.5 WP15：远端出口腿的端口/节点由 **host** 在自己的 grant 范围里分配
+      // （契约 §1.5：端口归承载方）。本机既不分端口，也不建任何 node_port_lease 行
+      // —— 建了就是第二份 ownership。
+      if (step.direction === "egress" && federatedEgressPeerOf(ctx.desired) !== null) {
+        return {
+          ok: true,
+          note: `远端出口腿：跳过本机 ${nodeId}:${step.port ?? "auto"} 的端口/节点分配（端口归 host 的 portPool）`,
+        };
       }
       const outcome: AcquirePortOutcome = await acquirePort(
         {
@@ -700,6 +882,12 @@ async function runStep(
       // §13.3.1：Binding 是显式创建的可复用基础设施关系；修改 Forward 不删它。
       // 这里已由 `binding_exists === false` 作为入步骤条件，因此 create 是
       // 新建而非 upsert；重复执行撞 @@unique 时按「已存在」算成功（幂等）。
+      //
+      // V5.5 WP15：远端出口腿没有本机出口节点 ⇒ 没有可建的 Binding。跨面板那一跳
+      // 的许可由 host 的 grant 决定（契约 §3.1），不是本机节点间的 Binding。
+      if (federatedEgressPeerOf(ctx.desired) !== null) {
+        return { ok: true, note: "远端出口腿：跳过本机 NodeBinding（跨面板那一跳由 host 的 grant 授权）" };
+      }
       const ingressId = Number(step.meta?.ingress_node_id ?? nodeId);
       const egressId = Number(step.meta?.egress_node_id ?? nodeId);
       if (!Number.isFinite(ingressId) || !Number.isFinite(egressId)) {
@@ -736,6 +924,11 @@ async function runStep(
     }
 
     case "prepare_egress": {
+      // V5.5 WP15：声明了远端 peer 时，这一跳**不走**本机 `dispatchEgress`，
+      // 而是委托给承载方（预留 → 应用 → 镜像行），拿它返回的地址当下一跳。
+      if (federatedEgressPeerOf(ctx.desired) !== null) {
+        return delegateRemoteEgressStep(ctx, deps);
+      }
       // §13.3.5 铁律：EGRESS 先 apply、ACK 后**不切入口**（入口由 CUTOVER 的
       // cutover_ingress 负责）。因此这里只做 egress 侧下发。
       if (nodeId == null) {
@@ -782,6 +975,12 @@ async function runStep(
     /* ---------------- CUTOVER ---------------- */
 
     case "cutover_egress": {
+      // V5.5 WP15：同节点只换目标池时，PREPARE 没有 egress 步，出口侧的"按新
+      // revision 生效"就发生在 CUTOVER。远端腿走同一条幂等委托：同一
+      // `(intent_id, revision)` 在 host 侧返回首次结果，host 复用 epoch。
+      if (federatedEgressPeerOf(ctx.desired) !== null) {
+        return delegateRemoteEgressStep(ctx, deps);
+      }
       // 出口侧「此刻起按新 revision 生效」的标记。Agent 侧 egress 已在
       // PREPARE apply，这里做的是把入口的 next_hop 指向它之前的那一步：
       // 若 PREPARE 已 apply 同 revision，此处是幂等重发（Agent 按 revision
@@ -873,8 +1072,11 @@ async function runStep(
       const port = resolveIngressPort(step, ctx);
 
       if (ctx.desired.mode === "relay") {
+        const remotePeer = federatedEgressPeerOf(ctx.desired);
         const egressNodeId = ctx.desired.egress_node_id;
-        if (egressNodeId == null || step.direction === "egress") {
+        // V5.5 WP15：出口腿在远端时本机**没有**出口节点，这不是"缺出口"——
+        // next_hop 由 host 的响应决定（见 resolveNextHop 的联邦分支）。
+        if ((egressNodeId == null && remotePeer === null) || step.direction === "egress") {
           return { ok: false, error_code: "invariant_violated", error: "RELAY cutover 缺少出口节点" };
         }
         // next_hop 由 PREPARE 里 dispatchEgress 的返回值决定；重放时 egress
@@ -948,6 +1150,13 @@ async function runStep(
 
     case "drain_ingress":
     case "drain_egress": {
+      // V5.5 WP15：旧出口腿在**远端**时，本机没有它的 runtime 可撤 —— 那条腿的
+      // 停服就是 CLEANUP 里的 `drop_old_egress` 发出的 `DELETE /leases/:ref`。
+      // 这里若照旧报 invariant_violated，会把一次正常的"远端出口撤下"变成
+      // DRAIN 硬失败（整条 rollout 落到 degraded）。
+      if (step.kind === "drain_egress" && nodeId == null && appliedRemoteEgressPeer(ctx) !== null) {
+        return { ok: true, note: `远端出口腿（peer=${appliedRemoteEgressPeer(ctx)}）的停服在 CLEANUP 由 DELETE /leases 完成` };
+      }
       // 报告 R3：wire 上没有 drain 原语，backend 用 `remove_tunnel` 表达
       // 「停止接受新连接后等待在途退出」（tunnel-api.ts#suspend 同一表达）。
       if (nodeId == null) {
@@ -1054,6 +1263,26 @@ async function runStep(
     case "drop_old_egress":
     case "drop_old_transit": {
       if (nodeId == null) {
+        // V5.5 WP15：这条旧出口腿在远端 ⇒ 撤它的唯一正确动作是**释放远端租约**。
+        // 顺序按契约 §3.3「先本地入口停 → 再远端释放」：CLEANUP 发生在入口已经
+        // 切到新 next_hop（或已撤下）之后，所以这里正是那一刀。
+        //
+        // intent_id 用 **applied 那一代** revision（`base_revision`）：租约是按
+        // 那一代的键建的，用别的键去释放会释错人。
+        if (step.kind === "drop_old_egress" && appliedRemoteEgressPeer(ctx) !== null) {
+          const revision = ctx.baseRevision ?? ctx.revision;
+          const released = await releaseRemoteEgressStep(ctx, deps, revision);
+          if (!released.ok) {
+            // 释放失败必须留下痕迹，且**不得**假装成功：远端残留 runtime/端口就是
+            // G4 的同族泄漏，只是它发生在另一台面板上，更不容易被看见。
+            return {
+              ok: false,
+              error_code: "federation_release_failed",
+              error: `远端出口腿释放失败（intent=fw-${ctx.tunnelId}-${revision}）：${released.message}`,
+            };
+          }
+          return { ok: true, note: `远端出口腿（intent=fw-${ctx.tunnelId}-${revision}）${released.message}` };
+        }
         return { ok: false, error_code: "invariant_violated", error: `${step.kind} 缺少 node_id` };
       }
       const outcome = await orchestrator.removeTunnel({
@@ -1283,6 +1512,13 @@ function resolveHopAddress(ctx: RolloutExecContext, nodeId: number, fallbackPort
  * 与计划、准入、纯路由模型用的是同一个字段。
  */
 function resolveNextHop(ctx: RolloutExecContext): string | null {
+  // V5.5 WP15：出口腿在远端时，"下一跳是谁"由 **host 的应用响应**决定
+  // （`node_address` + `port`）。本机没有那台节点的任何地址事实，所以这里
+  // 只能读登记表；登记不到就返回 null，让 cutover_ingress 以
+  // `next_hop_unresolved` fail-closed —— **绝不**猜 IP（猜错是每个新连接都
+  // 连不上的静默故障，这个项目已经踩过一次）。
+  const peer = federatedEgressPeerOf(ctx.desired);
+  if (peer !== null) return remoteEgressAddressFor(ctx.tunnelId, peer);
   const middle = (ctx.desired as { middle_node_id?: number | null }).middle_node_id ?? null;
   const nextHopNodeId = middle ?? ctx.desired.egress_node_id;
   if (nextHopNodeId == null) return null;
@@ -1376,6 +1612,22 @@ export async function compensateRollout(
     }
   }
 
+  // ── V5.5 WP15：本次尝试切过去的**新**远端出口腿也要撤 ──
+  //
+  // 它同样是"新 runtime"，只是不在本机；`removals` 只认本机节点。漏掉它会在另一个
+  // 面板上留下一条继续监听、继续把流量转给旧目标的腿（G4 的同族泄漏），而且它在
+  // 本机的账本里看起来"已经补偿完成"。
+  const plannedPeer = federatedEgressPeerOf(planned);
+  if (plannedPeer !== null) {
+    const released = await releaseFederatedEgress(
+      { tunnelId: row.tunnel_id, revision: row.revision, peer_panel_id: plannedPeer },
+      { db: deps.db as never, sender: deps.federatedSender, now: deps.now },
+    );
+    if (!released.ok) {
+      errors.push(`release remote egress (peer=${plannedPeer}, revision=${row.revision}): ${released.message ?? released.code}`);
+    }
+  }
+
   // 若目标入口曾经 claim 成功，但 apply/ACK 随后失败，ownership 仍会留在新节点。
   // 只有确认新入口 runtime 已撤下后才允许释放它；随后基线入口才能按新世代重新 claim。
   if (
@@ -1442,18 +1694,61 @@ export async function compensateRollout(
       if (!ingressNodeId || listenPort == null) {
         errors.push("baseline snapshot 缺 ingress_node_id / listen_port");
       } else if (String(baseline.mode) === "relay") {
+        const baselinePeer = federatedEgressPeerOf(baselinePlanned);
         const egressPort = baseline.egress_port == null ? null : Number(baseline.egress_port);
         const egressNodeId = baseline.egress_node_id == null ? null : Number(baseline.egress_node_id);
-        if (egressPort == null || egressNodeId == null) {
+        const targets = Array.isArray(baseline.targets)
+          ? (baseline.targets as Array<{ host: string; port: number; weight?: number; order_by?: number }>)
+          : [];
+        const replayEgressFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+        /**
+         * 回滚后的出口事实（host + 监听端口）。
+         *
+         * V5.5 WP15：它可能来自两处 —— 本机 `dispatchEgress` 的返回值，或**远端
+         * peer 的应用响应**。两条路的共同点是"地址只能来自承载方自己"，所以这里
+         * 归一成一个变量，入口与中间跳的指向都只认它。
+         */
+        let replayEgressHost: string | null = null;
+        let replayEgressPort: number | null = egressPort;
+
+        if (replayEgressFacts === null) {
+          errors.push(`replay egress: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
+        } else if (baselinePeer !== null) {
+          // 基线本身是一条**远端**出口腿：回滚必须再委托一次（同一个 intent 键、
+          // 新的世代号）。只撤新腿而不重建基线腿，会把入口指到一个本机并不存在的
+          // 地址上 —— 表现为"回滚成功"但整条转发不通。
+          const delegated = await delegateFederatedEgress(
+            {
+              tunnelId: row.tunnel_id,
+              revision: rollbackRevision,
+              declaredPeer: baselinePeer,
+              mode: "relay",
+              ingress_node_id: ingressNodeId,
+              local_egress_node_id: null,
+              middle_node_id: baseline.middle_node_id == null ? null : Number(baseline.middle_node_id),
+              protocol: replayEgressFacts.protocol,
+              targets: targets.map((t, i) => ({
+                host: t.host,
+                port: t.port,
+                weight: t.weight ?? 1,
+                order_by: t.order_by ?? (i + 1) * 10,
+              })),
+              lb_strategy: await loadEgressPoolLb(deps, baseline.egress_pool_id == null ? null : Number(baseline.egress_pool_id)),
+            },
+            { db: deps.db as never, sender: deps.federatedSender, now: deps.now },
+          );
+          if (!delegated.ok) {
+            errors.push(`replay egress (federated ${baselinePeer}): ${delegated.message}`);
+          } else if (delegated.next_hop === null) {
+            // host 没给可寻址地址 ⇒ 不许猜，回滚只能报错（fail-closed）。
+            errors.push(`replay egress (federated ${baselinePeer}): host 未返回可寻址 node_address`);
+          } else {
+            replayEgressHost = delegated.node_address;
+            replayEgressPort = delegated.port;
+          }
+        } else if (egressPort == null || egressNodeId == null) {
           errors.push("baseline RELAY snapshot 缺出口");
         } else {
-          const targets = Array.isArray(baseline.targets)
-            ? (baseline.targets as Array<{ host: string; port: number; weight?: number; order_by?: number }>)
-            : [];
-          const replayEgressFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
-          if (replayEgressFacts === null) {
-            errors.push(`replay egress: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
-          } else {
           const egress = await orchestrator.dispatchEgress({
             tunnelId: row.tunnel_id,
             revision: rollbackRevision,
@@ -1473,7 +1768,13 @@ export async function compensateRollout(
           if (!egress.ok) {
             errors.push(`replay egress: ${egress.error}`);
           } else {
-            let ingressNextHop = `${egress.egress_host}:${egressPort}`;
+            replayEgressHost = egress.egress_host;
+            replayEgressPort = egressPort;
+          }
+        }
+
+        if (replayEgressFacts !== null && replayEgressHost !== null && replayEgressPort != null) {
+            let ingressNextHop = `${replayEgressHost}:${replayEgressPort}`;
             const baselineMiddleId =
               baseline.middle_node_id == null ? null : Number(baseline.middle_node_id);
 
@@ -1498,7 +1799,7 @@ export async function compensateRollout(
                   revision: rollbackRevision,
                   node: nodeFor(orchestrator, baselineMiddleId),
                   port: leases[0]!.port,
-                  nextHop: `${egress.egress_host}:${egressPort}`,
+                  nextHop: `${replayEgressHost}:${replayEgressPort}`,
                   protocol: replayEgressFacts.protocol,
                 });
                 if (!transit.ok) {
@@ -1523,8 +1824,6 @@ export async function compensateRollout(
               });
               if (!ingress.ok) errors.push(`replay ingress: ${ingress.error}`);
             }
-          }
-          }
         }
       } else {
         const targetHost = (baseline.target_host as string | null) ?? null;
@@ -2184,6 +2483,15 @@ async function releasePrepared(
     if (p.kind !== "lease" || typeof p.handle !== "number") continue;
     await releaseLease({ leaseId: p.handle }, { db: db as never }).catch(() => {});
   }
+
+  // ── V5.5 WP15：远端腿不在 `prepared` 里 ──
+  //
+  // 它的句柄（peer / lease_ref）在 `federation_placement` 的镜像行上 —— 这正是那行
+  // 存在的理由之一。释放用**本次 revision 的 intent 键**，与建立时完全一致。
+  // 失败不阻塞（PREPARE 失败的清理是尽力而为），但下一拍对账仍会按同一 intent 收敛。
+  if (federatedEgressPeerOf(ctx.desired) !== null) {
+    await releaseRemoteEgressStep(ctx, deps, ctx.revision).catch(() => undefined);
+  }
 }
 
 /** PREPARE 失败：tunnel 行记 error，applied_revision 不动（§13.3.5）。 */
@@ -2332,6 +2640,33 @@ export async function registerRollout(
   //
   // 配置了中间跳 = 三跳，而当前下发只会发单跳形状：放行的话转发**会正常工作，但走的是另一条路**，
   // 没有任何错误。因此 fail-closed —— 在**任何副作用之前**拒绝，并点名是哪一跳。
+  const declaredPeerAtRegistration = federatedEgressPeerOf(desired);
+  if (declaredPeerAtRegistration !== null) {
+    // ── V5.5 WP15：远端出口的**同一强度**准入 ──
+    //
+    // 本机路由模型（`buildRoutePlan`）要求出口是一个**本机**节点 id，而声明了 peer
+    // 时出口在另一个面板上。这里用同一份 fail-closed 判定替代它，判定的强度不变：
+    // 只允许"一个远端 hop、且必须在 egress"（契约 §9），其余（远端 ingress/transit、
+    // 3+ 跳、本机与远端同时声明出口、需要节点本地证书的协议）一律拒绝。
+    // 绝不放行一个"看起来能跑但其实下发不了"的形状。
+    const facts = await dispatchFactsFor(input.tunnelId, db);
+    const federatedAdmission = checkFederatedEgressForSnapshot({
+      tunnelId: input.tunnelId,
+      revision: input.revision,
+      snapshot: desired,
+      protocol: facts?.protocol ?? null,
+    });
+    if (!federatedAdmission.ok) {
+      return {
+        ok: false,
+        rolloutId: null,
+        status: "blocked",
+        error_code: federatedAdmission.code,
+        error: federatedAdmission.message,
+        blocking: [{ code: federatedAdmission.code, message: federatedAdmission.message }],
+      };
+    }
+  } else {
   const routeAdmission = admitRoute(
     {
       ingress_node_id: desired.ingress_node_id,
@@ -2355,6 +2690,7 @@ export async function registerRollout(
       error: routeAdmission.error,
       blocking: [{ code: routeAdmission.code, message: routeAdmission.error }],
     };
+  }
   }
 
   if (!input.suspended && input.impact.runtime_change) {

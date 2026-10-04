@@ -21,6 +21,12 @@ import { checkTunnelCreation } from "./capability-policy.ts";
 import { getOrchestrator } from "./relay-wiring.ts";
 import { reapplyDirectTunnel, reapplyRelayTunnel } from "./scheduler.ts";
 import { registerRollout } from "./forward-rollout-exec.ts";
+// V5.5 WP15：远端出口腿的声明校验与释放。声明校验只有这一个实现（路由层也复用它），
+// 所以"能保存但跑不起来"不可能出现两次不同的结论。
+import {
+  releaseStaleFederatedEgressForTunnel,
+  validateFederatedEgressDeclaration,
+} from "./federation/forward-hop.ts";
 import {
   FORWARD_REVISION_ERROR_CODES,
   ForwardRevisionError,
@@ -30,6 +36,7 @@ import {
   ensureForwardBaselineRevision,
   isMetadataOnlyPatch,
   mergeForwardCandidate,
+  normalizeFederatedEgressPeer,
   validateForwardCandidate,
   validateForwardCandidateFull,
   type ForwardCandidateConfig,
@@ -91,6 +98,14 @@ export interface ForwardCreateInput {
   listen_port?: number | null;
   target_host: string;
   target_port: number;
+  /**
+   * V5.5 WP15：把这条 Forward 的**出口腿**委托给某个已信任的 peer panel
+   * （存 peer_panel_id；`undefined`/`null` = 出口在本机，即今天的行为）。
+   *
+   * 声明了它就**不能**再给 `egress_node_id`：出口腿只能在一侧（见
+   * `validateForwardCandidate` 的互斥判定）。
+   */
+  federated_egress_peer?: string | null;
 }
 
 export interface ForwardListInput {
@@ -122,6 +137,10 @@ export interface ForwardPatchInput {
    */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
+  /**
+   * V5.5 WP15：出口腿的承载方（`null` = 改回本机出口）。与 `egress_node_id` 互斥。
+   */
+  federated_egress_peer?: string | null;
   /** V4-WP1 §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
   expected_revision?: number | null;
 }
@@ -337,6 +356,23 @@ async function prepareRelayRevisionResources(
 ): Promise<RelayRevisionResources> {
   if (candidate.mode !== "relay") {
     return { poolId: null, egressPort: null, targets: null };
+  }
+  // V5.5 WP15：远端出口腿没有本机 EgressPool —— 池表达的是"某台**本机**出口节点
+  // 拨号去哪里"，而那一跳不在这台面板上（契约 §1/§7：不复制远端资源）。
+  // 目标仍要作为本版 revision 的运行态事实落到 snapshot（rollout 的 apply 会把它
+  // 交给 host），所以这里直接返回目标集合并跳过本地池的增删。
+  const federatedPeer = normalizeFederatedEgressPeer(candidate.federated_egress_peer);
+  if (federatedPeer !== null) {
+    const host = candidate.target_host ?? ctx.egressTargets?.[0]?.host ?? null;
+    const port = candidate.target_port ?? ctx.egressTargets?.[0]?.port ?? null;
+    if (host == null || port == null) {
+      throw new ForwardRevisionError("invalid_input", "远端出口腿必须至少有一个目标（host + port）");
+    }
+    return {
+      poolId: null,
+      egressPort: null,
+      targets: [{ host, port, weight: 1, order_by: 1000 }],
+    };
   }
   if (!ctx.egress || candidate.egress_node_id == null) {
     throw new ForwardRevisionError("node_unavailable", "RELAY 转发缺少出口节点");
@@ -648,11 +684,31 @@ export async function createForward(
   }
 
   const egressId = input.egress_node_id ?? null;
+  // V5.5 WP15：出口腿"在哪一侧"是这次创建的一部分。声明了 peer 时本机没有出口
+  // 节点，这不是"缺出口"，而是"出口在另一侧"（互斥判定在 validateForwardCandidate）。
+  const federatedPeer = normalizeFederatedEgressPeer(input.federated_egress_peer);
+  if (federatedPeer !== null && input.mode !== "relay") {
+    return error(400, "invalid_input", "只有 RELAY 转发才有独立的出口跳，DIRECT 不能声明远端出口");
+  }
+  if (federatedPeer !== null) {
+    // 声明必须**当场**成立（存在 + trusted + 联邦已开启）：否则会出现一条"保存成功、
+    // 每次都失败在远端"的 Forward，而用户只看到一次 201。失败给契约 §6 的错误码，
+    // 不压成 500 —— 用户/管理员据此知道下一步是去 Admin Console 建信任。
+    const declared = await validateFederatedEgressDeclaration(federatedPeer);
+    if (!declared.ok) {
+      return error(409, declared.code, `远端出口腿不可用：${declared.message}`);
+    }
+  }
   if (input.mode === "direct" && egressId !== null) {
     return error(400, "invalid_input", "DIRECT 转发不能指定出口节点");
   }
-  if (input.mode === "relay" && egressId === null) {
+  if (input.mode === "relay" && egressId === null && federatedPeer === null) {
     return error(400, "invalid_input", "RELAY 转发必须指定出口节点");
+  }
+  // 互斥：两处同时声明出口时，运行期没人知道该信哪个（本地会去分端口、远端也会去
+  // 租一条腿，而它们代表同一跳）。
+  if (federatedPeer !== null && egressId !== null) {
+    return error(400, "invalid_input", "远端出口 peer 与本机出口节点互斥：出口腿只能在一侧");
   }
 
   const ingress = await loadWorkspaceNode(input.ingress_node_id, workspaceId);
@@ -797,6 +853,10 @@ export async function createForward(
           tunnel_mode: input.mode,
           ingress_node_id: ingress.id,
           egress_node_id: egress?.id ?? null,
+          // V5.5 WP15：声明列与 Forward 行同时落库（同一事务）。远端那一跳的节点/
+          // 端口不在这里、也不在任何本地资源表里 —— 它只以 federation_placement 的
+          // 不透明引用存在（契约 §1/§7）。
+          ...(federatedPeer === null ? {} : { federated_egress_peer: federatedPeer }),
           // V5.4：三跳路由的中间跳（省略 = 单跳）。创建路径直接用 `input`（候选尚未构建）。
           middle_node_id: input.middle_node_id ?? null,
           desired_status: "inactive",
@@ -804,8 +864,13 @@ export async function createForward(
           config_revision: 0,
           applied_revision: null,
           remote_host:
-            input.mode === "direct" ? input.target_host.trim() : null,
-          remote_port: input.mode === "direct" ? input.target_port : null,
+            input.mode === "direct" || federatedPeer !== null
+              ? input.target_host.trim()
+              : null,
+          remote_port:
+            input.mode === "direct" || federatedPeer !== null
+              ? input.target_port
+              : null,
         },
         select: { id: true },
       });
@@ -918,6 +983,17 @@ export async function patchForward(
 
   const { base, candidate, ctx, metadataOnly, desiredStatus } = resolved.data;
 
+  // V5.5 WP15：声明"出口腿放到 peer X"必须当场成立（存在 + trusted + 联邦已开启），
+  // 否则会保存出一条每次都失败在远端的 Forward。只在声明**非空**时查库：
+  // 未声明（绝大多数路径）一次查询都不多，行为逐字节不变。
+  const candidatePeer = normalizeFederatedEgressPeer(candidate.federated_egress_peer);
+  if (candidatePeer !== null) {
+    const declared = await validateFederatedEgressDeclaration(candidatePeer);
+    if (!declared.ok) {
+      return error(409, declared.code, `远端出口腿不可用：${declared.message}`);
+    }
+  }
+
   if (metadataOnly) {
     // §13.3.2：纯 metadata（name）修改不生成 revision、不 bump config_revision、
     // 不触发任何 runtime 收敛。
@@ -988,6 +1064,11 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
+          // V5.5 WP15：声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
+          // 内写 snapshot 的那一列取值完全相同，来源都是候选）。
+          ...(candidate.federated_egress_peer === undefined
+            ? {}
+            : { federated_egress_peer: normalizeFederatedEgressPeer(candidate.federated_egress_peer) }),
           // V5.4：中间跳与入出口同类 —— patch 里给了就落库，没给就沿用候选里的当前值
           // （候选由 `mergeForwardCandidate` 合并，因此"没提交"永远是"不变"）。
           middle_node_id: candidate.middle_node_id ?? null,
@@ -1569,6 +1650,24 @@ export async function deleteForward(
     await db.egressPool
       .delete({ where: { id: dedicatedPoolId } })
       .catch(() => {});
+  }
+
+  // ── V5.5 WP15：删除 Forward 必须**释放远端腿** ──
+  //
+  // 本地 runtime 由 `runTunnelActionApi(delete)` 撤掉，但远端那条腿不在本机：
+  // 它不会随 tunnel 行一起消失（`federation_placement.tunnel_id` 刻意没有外键，
+  // 免得删 Forward 抹掉联邦历史）。不释放的后果是对面留一条继续监听的孤儿 runtime
+  // 与一个被占着的端口 —— G4 的同族泄漏，且它在另一台面板上，本机看不见。
+  //
+  // 顺序按契约 §3.3（先本地入口停 → 再远端释放）：这里本地已经删完。
+  // 释放失败不把删除回滚成错误（用户视角的删除已经成功，且租约到期会自然停服），
+  // 但必须留下响亮的一行，并让 placement 行停在 degraded 等对账/运维收尾。
+  const releases = await releaseStaleFederatedEgressForTunnel(id, -1).catch(() => null);
+  if (releases && releases.failed.length > 0) {
+    console.warn(
+      `[forward] 删除 Forward ${id} 后仍有远端出口腿未确认释放：` +
+        releases.failed.map((f) => `${f.intent_id}(${f.code})`).join(", "),
+    );
   }
 
   return { ok: true, data: { ok: true } };

@@ -32,6 +32,9 @@ import {
   type ForwardMode,
   tlsPathsForProtocol,
 } from "./forward-contract.ts";
+// V5.5 WP15：远端出口腿支持边界只有一处定义（`federation/forward-hop.ts`），
+// 校验与运行期必须用同一个集合 —— 各写一份就是"preview 放行、rollout 拒绝"的来源。
+import { FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS } from "./federation/forward-hop.ts";
 
 /* ================================================================== */
 /* 契约类型                                                            */
@@ -67,6 +70,18 @@ export interface ForwardCandidateConfig {
    */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
+  /**
+   * V5.5 WP15：这条 Forward 的**出口腿**由一个 peer panel 承载（存 peer_panel_id）。
+   *
+   * 它与 `egress_node_id` 是**互斥**的两件事（同一跳只能在一侧）：声明了 peer 就
+   * 表示"本机没有出口节点"，因此必须参与 current / merge / metadata-only 三处比较
+   * —— 只改它与只改 `middle_node_id` 是同一类 bug（漏在比较里 ⇒ PATCH 被当成
+   * 纯 metadata，只写个 name 就 200，而"出口在哪一侧"一个字节没变）。
+   *
+   * 可空且可缺省：`undefined` = 未提交（沿用当前值），`null` = 明确回到"本机出口"。
+   * 契约：`docs/v5-wp14-16-federation-contract.md` §3.2 / §3.4 / §9。
+   */
+  federated_egress_peer?: string | null;
 }
 
 /** patch 入参：全部可选；缺省 = 沿用当前 desired config 的值。 */
@@ -94,8 +109,11 @@ export interface ForwardRevisionRow {
   middle_node_id?: number | null;
   ingress_node: { id: number; node_id: string; role: string | null } | null;
   egress_node: { id: number; node_id: string; role: string | null } | null;
+  /** RELAY 指向的出口目标池 */
   egress_pool: { id: number; node_id: number } | null;
   egress_targets?: Array<{ host: string; port: number; weight: number; order_by: number }>;
+  /** V5.5 WP15：出口腿的远端承载方（NULL = 本机出口，V4/V5 既有语义）。 */
+  federated_egress_peer?: string | null;
   listen_ip: string | null;
   listen_port: number | null;
   remote_host: string | null;
@@ -119,6 +137,8 @@ export interface ForwardImpact {
   listener_replacement: boolean;
   ingress_node_change: boolean;
   egress_node_change: boolean;
+  /** V5.5 WP15：出口腿的承载方（本机 ↔ peer）发生了变化。 */
+  federated_egress_change?: boolean;
   /** V5.4：中间跳增加 / 删除 / 换节点。它不换 listener，但一定会改变 RELAY next_hop。 */
   middle_node_change?: boolean;
   mode_change: boolean;
@@ -254,6 +274,9 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     target_port: row.remote_port ?? null,
     tls_cert_path: row.tls_cert_path ?? null,
     tls_key_path: row.tls_key_path ?? null,
+    // V5.5 WP15：出口腿在哪一侧是**运行时放置事实**（与入出口/中间跳同类），
+    // 所以它必须出现在 current / merge / metadata-only 三处比较里。
+    federated_egress_peer: normalizeFederatedEgressPeer(row.federated_egress_peer),
   };
 }
 
@@ -280,7 +303,23 @@ export function mergeForwardCandidate(
     target_port: patch.target_port !== undefined ? patch.target_port : base.target_port,
     tls_cert_path: patch.tls_cert_path !== undefined ? patch.tls_cert_path : base.tls_cert_path,
     tls_key_path: patch.tls_key_path !== undefined ? patch.tls_key_path : base.tls_key_path,
+    federated_egress_peer:
+      patch.federated_egress_peer !== undefined
+        ? normalizeFederatedEgressPeer(patch.federated_egress_peer)
+        : normalizeFederatedEgressPeer(base.federated_egress_peer),
   };
+}
+
+/**
+ * 归一化远端出口声明：`undefined`/空串/纯空白 一律按"未声明"（null）处理。
+ *
+ * 为什么空白也算未声明：`""` 与 NULL 在运行期是同一个问题（"这一跳在本机"），
+ * 让两种写法产生两种状态只会制造一个只有靠猜才能解释的差异。
+ */
+export function normalizeFederatedEgressPeer(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const peer = value.trim();
+  return peer.length === 0 ? null : peer;
 }
 
 /** 是否纯 metadata 修改（当前只有 name）：§13.3.2 禁止为它触发 runtime 重建。 */
@@ -303,7 +342,11 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     // operator's symptom would be a "saved" rotation that keeps serving the old
     // certificate — the exact failure G1A.6 exists to prevent.
     (base.tls_cert_path ?? null) === (candidate.tls_cert_path ?? null) &&
-    (base.tls_key_path ?? null) === (candidate.tls_key_path ?? null)
+    (base.tls_key_path ?? null) === (candidate.tls_key_path ?? null) &&
+    // V5.5 WP15：改"出口腿在哪一侧"是一次真实的放置变更（远端租约要建/要释放），
+    // 绝不能被判成 metadata-only —— 那会返回 200 而什么都不发生。
+    normalizeFederatedEgressPeer(base.federated_egress_peer) ===
+      normalizeFederatedEgressPeer(candidate.federated_egress_peer)
   );
 }
 
@@ -409,6 +452,38 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     reasons.push("missing_ingress");
   }
 
+  // ── V5.5 WP15：远端出口腿的声明（契约 §9 的第一阶段边界，全部 fail-closed）──
+  //
+  // 这些判定必须在**落库之前**给出可行动的原因码：一个"声明了但跑不起来"的
+  // Forward 会让每一次 rollout 都失败在远端，而用户只看到一次保存成功。
+  const federatedPeer = normalizeFederatedEgressPeer(candidate.federated_egress_peer);
+  if (federatedPeer !== null) {
+    if (candidate.mode !== "relay") {
+      errors.push("只有 RELAY 转发才有独立的出口跳，DIRECT 不能声明远端出口");
+      reasons.push("federated_egress_requires_relay");
+      return { ok: false, errors, warnings, reasons };
+    }
+    if (candidate.egress_node_id !== null) {
+      // 互斥而不是"以某一个为准"：两处同时声明时，运行期没人知道该信哪个
+      // （本地会去分配端口、远端也会去租一条腿，而它们代表同一跳）。
+      errors.push("远端出口 peer 与本机出口节点互斥：出口腿只能在一侧（清空本机出口节点或移除 peer）");
+      reasons.push("federated_egress_conflicts_with_local_egress");
+      return { ok: false, errors, warnings, reasons };
+    }
+    if ((candidate.middle_node_id ?? null) !== null) {
+      errors.push("远端出口 + 中间跳 = 跨面板 3+ 跳，当前版本明确关闭");
+      reasons.push("federated_egress_multi_hop_unsupported");
+      return { ok: false, errors, warnings, reasons };
+    }
+    if (admittedProtocol !== null && FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS.includes(admittedProtocol)) {
+      // 证书是**节点本地文件**，本机不可能知道对端那台节点的路径；猜一个路径
+      // 等于下发一条永远起不来的监听（同"不猜 IP"的理由）。
+      errors.push(`协议 ${admittedProtocol} 需要节点本地的证书文件路径，无法交给远端 peer；当前版本远端出口只支持 tcp / ws`);
+      reasons.push("federated_egress_protocol_unsupported");
+      return { ok: false, errors, warnings, reasons };
+    }
+  }
+
   if (candidate.mode === "direct") {
     if (candidate.egress_node_id !== null) {
       errors.push("DIRECT 转发不能指定出口节点");
@@ -430,8 +505,12 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     }
   } else {
     if (candidate.egress_node_id === null) {
-      errors.push("RELAY 转发必须指定出口节点");
-      reasons.push("missing_egress");
+      // 声明了远端 peer 时"没有本地出口节点"是**正确**状态（出口腿在 peer 上）；
+      // 两种写法都缺出口才是真的缺（上面已经拦掉了互斥与非法组合）。
+      if (federatedPeer === null) {
+        errors.push("RELAY 转发必须指定出口节点");
+        reasons.push("missing_egress");
+      }
     } else if (!Number.isInteger(candidate.egress_node_id) || candidate.egress_node_id < 1) {
       errors.push("出口节点 ID 不合法");
       reasons.push("invalid_egress");
@@ -510,12 +589,16 @@ export function validateForwardCandidateWithDb(
   }
 
   if (candidate.mode === "relay") {
-    if (!ctx.egress) {
-      errors.push("出口节点不存在");
-      reasons.push("not_found");
-    } else if (ctx.egress.role !== "egress" && ctx.egress.role !== "both") {
-      errors.push(`出口节点 ${ctx.egress.node_id} 不具备出口能力`);
-      reasons.push("node_unavailable");
+    // V5.5 WP15：声明了远端出口 peer 时，本机**没有**出口节点 —— 这不是"缺出口"，
+    // 而是"出口在另一侧"。远端那一跳的容量与准入由 host 的 grant 决定（契约 §1/§3.1）。
+    if (normalizeFederatedEgressPeer(candidate.federated_egress_peer) === null) {
+      if (!ctx.egress) {
+        errors.push("出口节点不存在");
+        reasons.push("not_found");
+      } else if (ctx.egress.role !== "egress" && ctx.egress.role !== "both") {
+        errors.push(`出口节点 ${ctx.egress.node_id} 不具备出口能力`);
+        reasons.push("node_unavailable");
+      }
     }
     // Missing edit-time Binding is prepared by rollout.ensure_binding.
     // It is an impact/warning, not a reason to reject the desired topology.
@@ -601,8 +684,14 @@ export function computeForwardImpact(input: {
   const modeChange = input.current.mode !== input.candidate.mode;
   const ingressNodeChange =
     input.current.ingress_node_id !== input.candidate.ingress_node_id;
+  // V5.5 WP15：出口腿"在哪一侧"的变化与换出口节点是**同一类**放置变更 ——
+  // 计划要重新出 prepare_egress / cutover_egress，远端租约要建/要释放。
+  // 把它漏在比较外，声明变更就不会触发任何 rollout 步骤（只在 DB 里改了一列）。
+  const federatedEgressChange =
+    normalizeFederatedEgressPeer(input.current.federated_egress_peer) !==
+    normalizeFederatedEgressPeer(input.candidate.federated_egress_peer);
   const egressNodeChange =
-    input.current.egress_node_id !== input.candidate.egress_node_id;
+    input.current.egress_node_id !== input.candidate.egress_node_id || federatedEgressChange;
   const middleNodeChange =
     (input.current.middle_node_id ?? null) !== (input.candidate.middle_node_id ?? null);
   const listenPortChange =
@@ -651,6 +740,7 @@ export function computeForwardImpact(input: {
     listener_replacement: listenerReplacement,
     ingress_node_change: ingressNodeChange,
     egress_node_change: egressNodeChange,
+    federated_egress_change: federatedEgressChange,
     middle_node_change: middleNodeChange,
     mode_change: modeChange,
     target_change: targetChange,
@@ -812,6 +902,9 @@ export async function ensureForwardBaselineRevision(
         applied_revision: true,
         desired_revision_id: true,
         desired_status: true,
+        // V5.5 WP15：补基线时也要冻结"出口腿当时在哪一侧"，否则旧 runtime 的
+        // 快照会看起来像本机出口，补偿/对账会去本机找一条不存在的腿。
+        federated_egress_peer: true,
       },
     });
     if (!row || row.category !== "port_forward") return null;
@@ -858,6 +951,7 @@ export async function ensureForwardBaselineRevision(
             target_port: row.tunnel_mode === "direct" ? row.remote_port : null,
             egress_pool_id: row.tunnel_mode === "relay" ? row.egress_pool_id : null,
             egress_port: row.tunnel_mode === "relay" ? row.egress_port : null,
+            federated_egress_peer: normalizeFederatedEgressPeer(row.federated_egress_peer),
             targets,
             created_by_id: createdById,
           },
@@ -925,6 +1019,8 @@ export async function createForwardRevision(
         forward_addresses_protocol: true,
         out_node_group_id: true,
         desired_status: true,
+        // V5.5 WP15：未提交声明时"沿用当前值"（与 route_profile 指针同一取向）。
+        federated_egress_peer: true,
         // V5-WP13.5B：来源模板指针（缺省 = NULL，见 CreateForwardRevisionInput.routeProfile）。
         route_profile_id: true,
         route_profile_version: true,
@@ -948,10 +1044,27 @@ export async function createForwardRevision(
       throw new ForwardRevisionError("invalid_input", "当前版本不支持该转发协议");
     }
 
+    // V5.5 WP15：远端出口腿的目标池**不落本机 EgressPool** —— 池是"某台本机出口节点
+    // 拨号去哪里"的关系，而那一跳不在这台面板上（契约 §1/§7：不复制远端资源）。
+    // 目标作为这一版 revision 的运行态事实进 snapshot，apply 时随 grant 交给 host。
+    const federatedPeer = normalizeFederatedEgressPeer(input.candidate.federated_egress_peer);
+    const federatedRelay = federatedPeer !== null && input.candidate.mode === "relay";
+    const relayTargets =
+      federatedRelay && (!input.egressTargets || input.egressTargets.length === 0)
+        ? input.candidate.target_host && input.candidate.target_port != null
+          ? [{ host: input.candidate.target_host, port: input.candidate.target_port, weight: 1, order_by: 1000 }]
+          : []
+        : null;
+    if (federatedRelay && (!input.egressTargets || input.egressTargets.length === 0) && relayTargets!.length === 0) {
+      throw new ForwardRevisionError("invalid_input", "远端出口腿必须至少有一个目标（host + port）");
+    }
+
     const targets =
       input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
         ? (input.egressTargets as unknown as Prisma.InputJsonValue)
-        : Prisma.JsonNull;
+        : relayTargets && relayTargets.length > 0
+          ? (relayTargets as unknown as Prisma.InputJsonValue)
+          : Prisma.JsonNull;
 
     let snapshotId: number;
     try {
@@ -968,10 +1081,19 @@ export async function createForwardRevision(
           middle_node_id: input.candidate.middle_node_id ?? null,
           listen_ip: input.resolvedListenIp ?? row.listen_ip,
           listen_port: input.candidate.listen_port,
+          // 本机出口才存 target_host/port（DIRECT 的目标面在本机；RELAY 的目标在
+          // targets 快照里）。远端出口腿的目标同样只在 targets 快照里。
           target_host: input.candidate.mode === "direct" ? input.candidate.target_host : null,
           target_port: input.candidate.mode === "direct" ? input.candidate.target_port : null,
           egress_pool_id: input.egressPoolId ?? null,
           egress_port: input.egressPort ?? null,
+          // V5.5 WP15：这一跳"在哪一侧"是本次 revision 的**不可变放置事实**。
+          // 候选没提交（undefined）时沿用 tunnel 行的当前值 —— 与 route_profile
+          // 指针同一取向：不提交 ≠ 清空。
+          federated_egress_peer:
+            input.candidate.federated_egress_peer === undefined
+              ? normalizeFederatedEgressPeer(row.federated_egress_peer)
+              : normalizeFederatedEgressPeer(input.candidate.federated_egress_peer),
           targets,
           created_by_id: input.createdById,
           // V5-WP13.5B：来源模板的**不可变** provenance（§9.4.5）。显式入参优先，
@@ -1006,12 +1128,31 @@ export async function createForwardRevision(
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,
         middle_node_id: input.candidate.middle_node_id ?? null,
+        // V5.5 WP15：声明列与 snapshot 在同一事务里落库（这就是"单写者"）。
+        // 只在候选**提交了**这一字段时才写：未提交的调用方（如按模板铺出来的
+        // revision）不得因为路过这里而把用户的声明清成 NULL。
+        ...(input.candidate.federated_egress_peer === undefined
+          ? {}
+          : { federated_egress_peer: normalizeFederatedEgressPeer(input.candidate.federated_egress_peer) }),
         // 自动分配时保留当前 concrete port（编排器 apply 后再写回确切值）：
         // 把它清成 null 会让 reconciler 在「尚未 apply」的窗口里读到残缺状态。
         listen_port: input.candidate.listen_port ?? row.listen_port,
         listen_ip: input.resolvedListenIp ?? row.listen_ip,
-        remote_host: input.candidate.mode === "direct" ? input.candidate.target_host : null,
-        remote_port: input.candidate.mode === "direct" ? input.candidate.target_port : null,
+        // V5.5 WP15：远端出口腿的目标存在投影列上（RELAY 本机出口的目标在
+        // EgressPool 里，而远端腿没有本机池）。创建/重试路径要从这里读回目标再
+        // 交给 host —— 少了这一步，远端腿会拿到一个空目标集。
+        remote_host:
+          input.candidate.mode === "direct"
+            ? input.candidate.target_host
+            : federatedPeer !== null
+              ? input.candidate.target_host
+              : null,
+        remote_port:
+          input.candidate.mode === "direct"
+            ? input.candidate.target_port
+            : federatedPeer !== null
+              ? input.candidate.target_port
+              : null,
         forward_addresses: directTarget
           ? (directTarget as unknown as Prisma.InputJsonValue)
           : input.candidate.mode === "relay"

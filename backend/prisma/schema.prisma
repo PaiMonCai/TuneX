@@ -709,6 +709,19 @@ model Tunnel {
   route_profile_id      Int?
   route_profile_version Int?
 
+  // ── V5.5 WP15 产品级接线：远端出口腿的声明（migration 20261025000000）──
+  //
+  // `federated_egress_peer` = 这条 Forward 的**出口腿**由哪个 peer panel 承载
+  // （存 peer_panel_id）。它不是第二份 desired：出站仍是本机 rollout 的计划与账本，
+  // 这里只声明"那一跳不在本机"（契约 §3.4）。
+  //
+  // 为什么可空且不给默认值：NULL = 今天的行为（出口在本机），这是绝大多数行；
+  // 空声明必须让所有既有路径逐字节不变（本轮的硬约束）。给了它就意味着
+  // **本机不再有出口节点**（egress_node_id 为 NULL），本地端口/节点分配必须跳过
+  // —— 远端资源只以 `federation_placement` 的不透明引用存在，绝不复制成本地 node /
+  // node_port_lease 行（契约 §1、§7）。
+  federated_egress_peer String? @db.VarChar(64)
+
   @@index([tunnel_mode])
   @@index([forward_protocol])
   @@index([ingress_node_id])
@@ -796,6 +809,16 @@ model ForwardRevision {
   route_profile_id      Int?
   /// 来源模板的版本（最近一次由该模板 apply 的版本）。
   route_profile_version Int?
+
+  // ── V5.5 WP15：这一跳"在哪一侧"的不可变历史事实（migration 20261025000000）──
+  //
+  // 与 `ingress_node_id` / `egress_node_id` 同一层：它是某次 revision 的**放置事实**，
+  // 因此必须冻结进快照 —— 之后用户/管理员改掉 tunnel 行的声明，都不改写"revision N 当时
+  // 这条出口腿跑在谁身上"。NULL = 出口在本机（V4/V5 既有语义）。
+  //
+  // 不加外键、不复制远端 node 行：远端节点在 home panel 里**只有不透明引用**
+  // （`federation_placement.peer_node_ref`），契约 §1/§7 明令禁止把它变成本地 node。
+  federated_egress_peer String? @db.VarChar(64)
 
   @@unique([tunnel_id, revision])
   @@index([tunnel_id, created_at])

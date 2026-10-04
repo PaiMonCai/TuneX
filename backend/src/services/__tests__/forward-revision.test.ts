@@ -61,6 +61,9 @@ const BASE_CONFIG: ForwardCandidateConfig = {
   // canonical direct/tcp fixture carries them as null.
   tls_cert_path: null,
   tls_key_path: null,
+  // V5.5 WP15：远端出口声明是候选的一部分（与中间跳同类：它是**放置事实**，
+  // 只改它也必须产生新 revision）。本机出口的规范 fixture 里它是 null。
+  federated_egress_peer: null,
 };
 
 /** 一条「当前 desired」的 tunnel 行投影（存量行形态：无 snapshot）。 */
@@ -451,6 +454,10 @@ describe("F. snapshot 契约形状", () => {
     const keys = Object.keys(BASE_CONFIG).sort();
     expect(keys).toEqual([
       "egress_node_id",
+      // V5.5 WP15：出口腿"在哪一侧"（本机 / 某个 peer）与入出口节点是同一类放置事实，
+      // 因此同样属于不可变 runtime snapshot —— 少了它，重放/补偿会去本机找一条
+      // 其实在另一个面板上的腿。
+      "federated_egress_peer",
       "ingress_node_id",
       "listen_port",
       // V5.4：中间跳是运行时放置事实（谁承载这条路由），因此与入出口一样属于不可变

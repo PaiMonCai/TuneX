@@ -70,13 +70,15 @@ import {
   type ForwardRuntimePlan,
   type ForwardProtocol,
 } from "./forward-contract.ts";
+import { admitRuntimeFromStore, admissionFailureDetail, type AdmissionTarget, type CapabilityFactsLoader, type RuntimeAdmissionDenied } from "./runtime-admission.ts";
+import { normalizeFederatedEgressPeer } from "./forward-revision.ts";
 import {
-  admitRuntimeFromStore,
-  admissionFailureDetail,
-  type AdmissionTarget,
-  type CapabilityFactsLoader,
-  type RuntimeAdmissionDenied,
-} from "./runtime-admission.ts";
+  checkFederatedEgressTopology,
+  delegateFederatedEgress,
+  releaseFederatedEgress,
+  releaseStaleFederatedEgressForTunnel,
+  type ForwardHopSender,
+} from "./federation/forward-hop.ts";
 
 /* ================================================================== */
 /* 常量与状态机                                                        */
@@ -391,6 +393,13 @@ export interface SchedulerDeps {
   /** Existing apply/retry/resume only; does not consume a creation count slot. */
   runtimeUse?: RuntimeUseChecker;
   /**
+   * V5.5 WP15：跨面板出站的注入点（默认走 `client.callPeer`）。
+   *
+   * 只有声明了 `federated_egress_peer` 的 RELAY 编排会用到它；为 NULL 的路径一次
+   * 也不碰（既有的 create/retry 行为逐字节不变）。
+   */
+  federatedSender?: ForwardHopSender;
+  /**
    * V5-WP1：读取节点已上报的 v2 协商事实（默认读 `node_state_report`）。
    * 注入点是**测试**用的，生产路径只有一处实现（services/runtime-admission.ts）。
    */
@@ -421,6 +430,8 @@ function resolveDeps(over?: SchedulerDeps) {
     validator: over?.validator,
     portPoolDeps: over?.portPoolDeps,
     loadCapabilityFacts: over?.loadCapabilityFacts,
+    // V5.5 WP15：未注入时 undefined ⇒ forward-hop 用 `client.callPeer`（唯一实现）。
+    federatedSender: over?.federatedSender,
   };
 }
 
@@ -1414,6 +1425,7 @@ async function checkExistingRuntime(
   row: Record<string, unknown>,
   deps: ReturnType<typeof resolveDeps>,
   selected?: { ingress: SchedulableNode; egress?: SchedulableNode },
+  opts?: { federatedEgress?: boolean },
 ): Promise<RuntimeUseDenied | null> {
   // Concrete placements outrank the historical candidate-group columns. If a
   // Node has moved groups, retry must re-check its *new* scope before any write.
@@ -1429,8 +1441,12 @@ async function checkExistingRuntime(
   const outGroup = row.tunnel_mode === "relay"
     ? egress?.node_group_id ?? (row.egress_node_id == null ? row.out_node_group_id : null)
     : null;
+  // V5.5 WP15：出口腿在远端时，本机没有出口节点组可判 —— 那一跳的容量与配额权威在
+  // host（契约 §1 的 Quota authority 答案）。这里仍严格校验归属与入口侧，不是
+  // "跳过授权"：入口缺失一样被拒。
+  const egressScopeRequired = opts?.federatedEgress !== true;
   if (!validId(row.workspace_id) || !validId(row.user_id) || !validId(inGroup) ||
-      (row.tunnel_mode === "relay" && !validId(outGroup))) {
+      (row.tunnel_mode === "relay" && egressScopeRequired && !validId(outGroup))) {
     return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或实际节点组已失效" };
   }
   const protocol = admittedPersistedProtocol(row);
@@ -1444,7 +1460,7 @@ async function checkExistingRuntime(
   }
   return deps.runtimeUse(row.workspace_id, {
     user_id: row.user_id, in_node_group_id: inGroup,
-    out_node_group_id: outGroup as number | null,
+    out_node_group_id: egressScopeRequired && row.tunnel_mode === "relay" ? (outGroup as number | null) : null,
     protocol,
   });
 }
@@ -1516,6 +1532,18 @@ export async function reapplyRelayTunnel(
   }
   const inNodeGroupId = Number(row.in_node_group_id);
   const outNodeGroupId = row.out_node_group_id === null ? null : Number(row.out_node_group_id);
+
+  // ── V5.5 WP15：出口腿在**远端** ⇒ 走联邦分支 ──
+  //
+  // 本机没有出口节点，因此**没有**出口节点组（声明了 peer 的行 out_node_group_id 为
+  // NULL 是正确状态，不是"缺出口"）。这一跳不选点、不分配出口端口、不发
+  // dispatchEgress；入口仍在本机，它的 next_hop 是 host 返回的地址（**不猜 IP**）。
+  // 声明为 NULL 时一行都不进这里 —— 既有路径逐字节不变。
+  const federatedPeer = normalizeFederatedEgressPeer((row as { federated_egress_peer?: unknown }).federated_egress_peer);
+  if (federatedPeer !== null) {
+    return applyFederatedRelayTunnel(tunnelId, orchestrator, deps, row, federatedPeer);
+  }
+
   if (outNodeGroupId === null) {
     return fail(
       "bind_nodes",
@@ -1523,6 +1551,7 @@ export async function reapplyRelayTunnel(
       `RELAY 隧道 ${tunnelId} 没有出口节点组，无法重推`,
     );
   }
+
 
   const blockRuntimeUse = async (denied: RuntimeUseDenied): Promise<CreateRelayFailure> => {
     const { code, detail } = await recordRuntimeBlock(store, tunnelId, denied);
@@ -1940,6 +1969,282 @@ export async function reapplyRelayTunnel(
     egressNodeId: egressPick.node.id,
     ingressPort,
     egressPort,
+    steps,
+  };
+}
+
+/**
+ * V5.5 WP15 —— 出口腿在**远端**的 RELAY 编排（创建 / 重试用同一入口）。
+ *
+ * 与 {@link reapplyRelayTunnel} 的关系：**正向顺序、失败补偿、幂等口径完全相同**，
+ * 唯一的差别是"出口那一跳由谁建"——
+ *   本地：bind 出口节点 → 分配 egress 端口 → `dispatchEgress`；
+ *   远端：`delegateFederatedEgress`（reserve → apply → 镜像行），地址取 host 的返回值。
+ *
+ * 为什么不把它塞进 `reapplyRelayTunnel` 的中间：那条函数 480 行、出口腿的节点 id
+ * 出现在十几处分支里，逐处加 `if` 才是真正会把 NULL 路径改坏的做法。这里是一个
+ * **独立入口 + 单点分派**，声明为 NULL 的行永远走原函数、一行都不经过这里。
+ */
+async function applyFederatedRelayTunnel(
+  tunnelId: number,
+  orchestrator: Orchestrator,
+  deps: ReturnType<typeof resolveDeps>,
+  row: Record<string, unknown>,
+  peerPanelId: string,
+): Promise<CreateRelayTunnelResult> {
+  const store = deps.db;
+  const now = deps.now();
+  const steps: StepRecord[] = [];
+
+  const fail = (
+    step: SchedulerStep,
+    code: SchedulerErrorCode,
+    detail: string,
+    ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
+  ): CreateRelayFailure => {
+    steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
+    void persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+    return { ok: false, tunnelId, steps, failedStep: step, error_code: code, error: errorText(code, detail), retryable: isRetryable(code) };
+  };
+
+  const inNodeGroupId = Number(row.in_node_group_id);
+  const protocol = admittedPersistedProtocol(row) ?? DEFAULT_FORWARD_PROTOCOL;
+  const targetHost = typeof row.remote_host === "string" && row.remote_host.length > 0 ? row.remote_host : null;
+  const targetPort = row.remote_port == null ? null : Number(row.remote_port);
+  const middleNodeId = (row as { middle_node_id?: number | null }).middle_node_id ?? null;
+  const boundIngressId = row.ingress_node_id == null ? null : Number(row.ingress_node_id);
+
+  // ── ① 拓扑自检（与 rollout 注册时**同一份**判定，不在这里重写）──
+  //
+  // 契约 §9：第一阶段只允许"一个远端 hop，且必须在 egress"。远端 ingress/transit、
+  // 3+ 跳、tls（需要节点本地证书）都在这里 fail-closed，而且发生在**任何副作用之前**。
+  const topology = checkFederatedEgressTopology(
+    {
+      tunnelId,
+      revision: Number(row.config_revision ?? 0) + 1,
+      mode: "relay",
+      ingress_node_id: boundIngressId,
+      local_egress_node_id: row.egress_node_id == null ? null : Number(row.egress_node_id),
+      middle_node_id: middleNodeId,
+      protocol,
+    },
+    peerPanelId,
+  );
+  if (!topology.ok) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.invariant_violated, `远端出口腿不可用：${topology.message}`);
+  }
+  if (targetHost === null || targetPort === null) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.invalid_target, "远端出口腿必须至少有一个目标（host + port）");
+  }
+
+  const blockRuntimeUse = async (denied: RuntimeUseDenied): Promise<CreateRelayFailure> => {
+    const { code, detail } = await recordRuntimeBlock(store, tunnelId, denied);
+    steps.push({ step: "auth_quota", ok: false, error_code: code, detail });
+    return { ok: false, tunnelId, steps, failedStep: "auth_quota", error_code: code, error: detail, retryable: false };
+  };
+  const denied = await checkExistingRuntime(row, deps, undefined, { federatedEgress: true });
+  if (denied) return blockRuntimeUse(denied);
+  steps.push({ step: "auth_quota", ok: true });
+  steps.push({ step: "create_pending", ok: true, meta: { tunnel_id: tunnelId, reapply: true, federated_egress_peer: peerPanelId } });
+
+  // ── ② 入口选点（本机，与既有路径同一条候选过滤）──
+  const inCandidates = (await store.node.findMany({
+    where: { node_group_id: inNodeGroupId },
+    orderBy: { id: "asc" },
+  })) as unknown as SchedulableNode[];
+  const ingressCandidates = inCandidates.filter((node) => boundIngressId === null || node.id === boundIngressId);
+  const ingressPick = pickNode(ingressCandidates, "ingress", now);
+  if (!ingressPick.ok) {
+    return fail(
+      "bind_nodes",
+      ingressPick.reason === "no_credential"
+        ? SCHEDULER_ERROR_CODES.node_credential_missing
+        : SCHEDULER_ERROR_CODES.node_unavailable,
+      ingressPick.reason === "no_credential"
+        ? `入口节点组 ${inNodeGroupId} 内没有持有有效 per-node credential 的 ingress 节点`
+        : `入口节点组 ${inNodeGroupId} 内没有 role 覆盖 ingress 的节点`,
+    );
+  }
+  // 入口的 runtime admission 照旧（出口那一跳的准入在 host 侧，由 grant 决定）。
+  const admissionDenied = await admitBoundRuntime(deps, [{ nodeId: ingressPick.node.id, role: "ingress" }], protocol);
+  if (admissionDenied) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied, admissionFailureText(admissionDenied), {
+      meta: {
+        runtime_admission: {
+          node_id: admissionDenied.node_id,
+          node_role: admissionDenied.node_role,
+          layer: admissionDenied.layer,
+          reason: admissionDenied.reason,
+        },
+      },
+    });
+  }
+  const targetDenied = await checkExistingRuntime(row, deps, { ingress: ingressPick.node }, { federatedEgress: true });
+  if (targetDenied) return blockRuntimeUse(targetDenied);
+  steps.push({ step: "bind_nodes", ok: true });
+
+  await store.tunnel.update({
+    where: { id: tunnelId },
+    data: {
+      ingress_node_id: ingressPick.node.id,
+      // 出口在本机**不存在**：清掉遗留的本地出口投影，避免任何读取方把它当成一条
+      // 本地腿（远端资源只以 federation_placement 的不透明引用存在）。
+      egress_node_id: null,
+      egress_pool_id: null,
+      egress_port: null,
+      apply_status: APPLY_STATUS.applying,
+      desired_status: DESIRED_STATUS.inactive,
+      forward_protocol: protocol,
+    },
+  });
+
+  // ── ③ 端口：只分配**入口**端口（出口端口归 host 的 portPool，契约 §1.5）──
+  const ingressReserved = collectReservedPorts(
+    (
+      await store.tunnel.findMany({
+        where: { in_node_group_id: inNodeGroupId },
+        select: { id: true, listen_port: true },
+      })
+    )
+      .map((t) => t as { id: number; listen_port: number | null })
+      .filter((t) => t.id !== tunnelId),
+  );
+  const existingIngressPort = row.listen_port === null ? null : Number(row.listen_port);
+  const ingressAlloc = await allocateTunnelPort(
+    {
+      nodeId: ingressPick.node.id,
+      direction: "ingress",
+      preferred: existingIngressPort,
+      tunnelId,
+      reservedPorts: ingressReserved,
+    },
+    deps.portPoolDeps,
+  );
+  if (!ingressAlloc.ok) {
+    return fail("acquire_ports", ingressAlloc.code, ingressAlloc.detail, {
+      meta: { direction: "ingress", port: existingIngressPort },
+    });
+  }
+  const ingressPort = ingressAlloc.port;
+  await store.tunnel.update({ where: { id: tunnelId }, data: { listen_port: ingressPort, egress_port: null } });
+  steps.push({
+    step: "acquire_ports",
+    ok: true,
+    meta: { ingress_port: ingressPort, ingress_lease_id: ingressAlloc.leaseId, egress_port: null, egress_owner: "peer" },
+  });
+
+  // ── ④ revision++ ──
+  const current = await store.tunnel.findUnique({ where: { id: tunnelId }, select: { config_revision: true } });
+  const revision = (Number(current?.config_revision ?? 0) || 0) + 1;
+  await store.tunnel.update({ where: { id: tunnelId }, data: { config_revision: revision, apply_status: APPLY_STATUS.applying } });
+  steps.push({ step: "bump_revision", ok: true, meta: { revision } });
+
+  /** 本次委托拿到的远端租约（撤它的时候要用同一个键）。 */
+  let remoteLeaseRef: string | null = null;
+
+  /** 撤掉本次已发出去的东西（本地接入口租约 + 远端腿），逆序。 */
+  const teardown = async (_reason: string): Promise<void> => {
+    if (remoteLeaseRef !== null) {
+      await releaseFederatedEgress(
+        { tunnelId, revision, peer_panel_id: peerPanelId, lease_ref: remoteLeaseRef },
+        { sender: deps.federatedSender, now: deps.now },
+      ).catch(() => undefined);
+    }
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+  };
+
+  // ── ⑤ 远端出口腿：先把**上一代**的腿收掉，再委托这一代 ──
+  //
+  // 每次创建/重试都会 bump revision，而 intent_id = fw-<tunnelId>-<revision> ⇒ 在
+  // host 侧那是一条**新**租约。不先收掉旧的，每次重试都会在对面的面板上留下一条
+  // 继续监听的孤儿 runtime + 一个被占的端口（G4 的同族泄漏，且本机看不见）。
+  const stale = await releaseStaleFederatedEgressForTunnel(tunnelId, revision, {
+    sender: deps.federatedSender,
+    now: deps.now,
+  }).catch(() => null);
+  if (stale && stale.failed.length > 0) {
+    steps.push({
+      step: "apply_egress",
+      ok: true,
+      detail: `上一代远端腿释放未确认：${stale.failed.map((f) => `${f.intent_id}(${f.code})`).join(", ")}`,
+      meta: { stale_release_failed: stale.failed.length },
+    });
+  }
+  const delegated = await delegateFederatedEgress(    {
+      tunnelId,
+      revision,
+      declaredPeer: peerPanelId,
+      mode: "relay",
+      ingress_node_id: ingressPick.node.id,
+      local_egress_node_id: null,
+      middle_node_id: null,
+      protocol,
+      targets: [{ host: targetHost, port: targetPort, weight: 1, order_by: 1000 }],
+    },
+    { sender: deps.federatedSender, now: deps.now },
+  );
+  if (!delegated.ok) {
+    await teardown("remote egress delegation failed");
+    return fail(
+      "apply_egress",
+      delegated.code === "peer_unreachable" ? SCHEDULER_ERROR_CODES.egress_ack_failed : SCHEDULER_ERROR_CODES.egress_apply_rejected,
+      `远端出口腿（peer=${peerPanelId}）建立失败：${delegated.message}` +
+        (delegated.lease_ref ? `；远端租约 ${delegated.compensated ? "已释放" : "释放未确认"}` : ""),
+      { revision, meta: { federation_code: delegated.code, lease_ref: delegated.lease_ref } },
+    );
+  }
+  remoteLeaseRef = delegated.lease_ref;
+  steps.push({
+    step: "apply_egress",
+    ok: true,
+    detail: `远端出口：peer=${peerPanelId} lease=${delegated.lease_ref} epoch=${delegated.lease_epoch}`,
+    meta: { command_id: null, revision, peer_panel_id: peerPanelId },
+  });
+  steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: delegated.applied_revision } });
+
+  // ── ⑥ 入口：next_hop 只能是 host 返回的地址（**不猜 IP**）──
+  if (delegated.next_hop === null) {
+    await teardown("remote egress has no addressable host");
+    return fail(
+      "apply_ingress",
+      SCHEDULER_ERROR_CODES.invariant_violated,
+      `远端出口 ${peerPanelId} 未返回可寻址的 node_address，拒绝用猜测的地址启动入口`,
+      { revision },
+    );
+  }
+  const ingressDispatch = await orchestrator.dispatchIngress({
+    tunnelId,
+    revision,
+    ingressNode: ingressPick.node,
+    ingressPort,
+    nextHop: delegated.next_hop,
+    protocol,
+    ...tlsPathsFor(row, protocol),
+  });
+  if (!ingressDispatch.ok) {
+    await teardown("ingress apply failed");
+    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
+      revision,
+      meta: { command_id: ingressDispatch.commandId ?? null },
+    });
+  }
+  steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
+  steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
+
+  // ── ⑦ active ──
+  await persistSuccess(store, tunnelId, { revision, at: deps.now() });
+  steps.push({ step: "activate", ok: true, meta: { revision } });
+
+  return {
+    ok: true,
+    tunnelId,
+    revision,
+    ingressNodeId: ingressPick.node.id,
+    // 本机没有出口节点：如实返回 null（不是 0，也不是占位 id —— 占位只存在于
+    // 计划里，绝不能流到 API/UI 层被当成一台真节点）。
+    egressNodeId: null,
+    ingressPort,
+    egressPort: null,
     steps,
   };
 }

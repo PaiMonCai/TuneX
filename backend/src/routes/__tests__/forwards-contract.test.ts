@@ -45,6 +45,9 @@ describe("V4-WP1 /api/forwards PATCH 契约", () => {
       [
         "egress_node_id",
         "expected_revision",
+        // V5.5 WP15：出口腿"在哪一侧"（本机 / 某个 peer）与入出口节点同为运行态放置
+        // 事实，因此创建与 PATCH 两份契约都必须有它 —— 这条断言守的正是"两边不漂移"。
+        "federated_egress_peer",
         "ingress_node_id",
         "listen_port",
         // V5.4：中间跳与入出口同为运行态放置事实，因此创建与 PATCH 两份契约都必须有它 ——

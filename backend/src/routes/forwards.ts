@@ -132,6 +132,11 @@ const ForwardCreateSchema = z
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),
     target_host: z.string().trim().min(1).max(255),
     target_port: z.number().int().min(1).max(65535),
+    // V5.5 WP15：把出口腿委托给一个已信任的 peer panel（缺省 = 出口在本机）。
+    // 形状在这里判；"这个 peer 存不存在/信不信任"由 service 层的
+    // `validateFederatedEgressDeclaration` 判（唯一的实现，见 forward-hop.ts），
+    // 失败返回契约 §6 的错误码而不是 500。
+    federated_egress_peer: z.string().trim().min(1).max(64).optional(),
   })
   .strict();
 
@@ -159,6 +164,11 @@ const ForwardPatchSchema = z
     // is refused by omission rather than guessed at.
     tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     tls_key_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
+    /**
+     * V5.5 WP15：`null` = 改回本机出口；省略 = 不变（候选合并的语义）。
+     * peer 是否存在/已信任由 service 层判定（唯一实现），这里只判形状。
+     */
+    federated_egress_peer: z.string().trim().min(1).max(64).nullable().optional(),
     expected_revision: z.number().int().nonnegative().nullable().optional(),
   })
   .strict()
