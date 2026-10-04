@@ -25,6 +25,10 @@ import {
   federatedEgressIntentId,
   federatedEgressPeerOf,
   federatedEgressTargetsOf,
+  FEDERATED_LEG_ERROR_CODES,
+  FEDERATED_RECOVERY_IMPACT,
+  federatedLegVisibleError,
+  reconcileFederatedForwardHealth,
   releaseFederatedEgress,
   validateFederatedEgressDeclaration,
   type ForwardHopDb,
@@ -57,11 +61,47 @@ interface FakePlacementRow {
   updated_at: Date;
 }
 
+interface FakeTunnelRow {
+  id: number;
+  apply_status: string | null;
+  apply_error_code: string | null;
+  apply_error: string | null;
+  desired_status: string | null;
+  config_revision: number | null;
+  applied_revision: number | null;
+  ingress_node_id: number | null;
+  federated_egress_peer: string | null;
+}
+
 function fakeDb(over: {
   peer?: { peer_panel_id: string; endpoint_url: string; status: string } | null;
-} = {}): { db: ForwardHopDb; placements: FakePlacementRow[] } {
+  tunnels?: FakeTunnelRow[];
+  /** 入口节点 state report（`reconcileFederatedForwardHealth` 的默认事实来源）。 */
+  reports?: Array<{ node_id: number; tunnels: unknown; reported_at: Date | null }>;
+  /** 未完成的 rollout 行（非空 ⇒ 本拍不再触发恢复）。 */
+  inFlightRollouts?: Array<{ id: number }>;
+} = {}): {
+  db: ForwardHopDb;
+  placements: FakePlacementRow[];
+  tunnels: FakeTunnelRow[];
+  tunnelWrites: Array<Record<string, unknown>>;
+} {
   const placements: FakePlacementRow[] = [];
+  const tunnels: FakeTunnelRow[] = over.tunnels ?? [];
+  const tunnelWrites: Array<Record<string, unknown>> = [];
   let nextId = 1;
+
+  /** 只实现对账用到的三种 where 形状（等价于 Prisma 的语义子集）。 */
+  const matchesPlacement = (row: FakePlacementRow, where: Record<string, unknown>): boolean => {
+    if (typeof where.hop_role === "string" && row.hop_role !== where.hop_role) return false;
+    if (typeof where.intent_id === "string" && row.intent_id !== where.intent_id) return false;
+    if (typeof where.tunnel_id === "number" && row.tunnel_id !== where.tunnel_id) return false;
+    const tunnelFilter = where.tunnel_id as { not?: unknown } | undefined;
+    if (tunnelFilter && typeof tunnelFilter === "object" && "not" in tunnelFilter && row.tunnel_id === null) return false;
+    const stateFilter = where.state as { in?: string[] } | undefined;
+    if (stateFilter?.in && !stateFilter.in.includes(row.state)) return false;
+    return true;
+  };
 
   const db = {
     federationPeer: {
@@ -79,7 +119,10 @@ function fakeDb(over: {
         return placements.find((p) => p.peer_panel_id === key.peer_panel_id && p.intent_id === key.intent_id) ?? null;
       },
       findFirst: async () => placements[0] ?? null,
-      findMany: async () => [...placements],
+      findMany: async (args: unknown) => {
+        const where = ((args as { where?: Record<string, unknown> })?.where ?? {}) as Record<string, unknown>;
+        return placements.filter((row) => matchesPlacement(row, where));
+      },
       create: async (args: unknown) => {
         const data = (args as { data: Partial<FakePlacementRow> }).data;
         const row: FakePlacementRow = {
@@ -113,9 +156,72 @@ function fakeDb(over: {
         return { count: 1 };
       },
     },
+    tunnel: {
+      findUnique: async (args: unknown) => {
+        const id = Number((args as { where: { id: number } }).where.id);
+        return tunnels.find((t) => t.id === id) ?? null;
+      },
+      updateMany: async (args: unknown) => {
+        const { where, data } = args as { where: { id: number }; data: Record<string, unknown> };
+        const row = tunnels.find((t) => t.id === where.id);
+        if (!row) return { count: 0 };
+        tunnelWrites.push({ id: where.id, ...data });
+        Object.assign(row, data);
+        return { count: 1 };
+      },
+    },
+    forwardRollout: {
+      findMany: async () => over.inFlightRollouts ?? [],
+    },
+    nodeStateReport: {
+      findUnique: async (args: unknown) => {
+        const nodeId = Number((args as { where: { node_id: number } }).where.node_id);
+        return (over.reports ?? []).find((r) => r.node_id === nodeId) ?? null;
+      },
+    },
   } as unknown as ForwardHopDb;
 
-  return { db, placements };
+  return { db, placements, tunnels, tunnelWrites };
+}
+
+/** 一条"联邦 RELAY Forward"的 tunnel 行投影（可见状态 + 声明）。 */
+function federatedTunnel(over: Partial<FakeTunnelRow> = {}): FakeTunnelRow {
+  return {
+    id: 42,
+    apply_status: "active",
+    apply_error_code: null,
+    apply_error: null,
+    desired_status: "active",
+    config_revision: 5,
+    applied_revision: 5,
+    ingress_node_id: 11,
+    federated_egress_peer: "peer-b",
+    ...over,
+  };
+}
+
+/** 一条正对当代 revision 的 placement 行（`reconcileFederatedForwardHealth` 的输入）。 */
+function placementRow(over: { tunnel_id?: number; desired_revision?: number; state?: string } = {}) {
+  return {
+    id: 1,
+    peer_panel_id: "peer-b",
+    forward_ref: "fw-42",
+    tunnel_id: over.tunnel_id ?? 42,
+    intent_id: `fw-${over.tunnel_id ?? 42}-${over.desired_revision ?? 5}`,
+    lease_ref: "lease-1",
+    lease_epoch: 1,
+    hop_role: "egress",
+    desired_revision: over.desired_revision ?? 5,
+    applied_revision: over.desired_revision ?? 5,
+    state: over.state ?? "active",
+    peer_node_ref: "91",
+    peer_port: 22015,
+    last_error_code: null,
+    last_error: null,
+    expires_at: null,
+    created_at: new Date(),
+    updated_at: new Date(),
+  } as FakePlacementRow;
 }
 
 interface SentCall {
@@ -663,5 +769,285 @@ describe("G. 释放：移除声明 / 改回本机出口 / 删除 Forward 共用�
     expect(released.ok).toBe(true);
     expect(calls).toHaveLength(0);
     expect(placements[0]).toMatchObject({ state: "degraded", last_error_code: "peer_unreachable" });
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* H. 可见状态跟事实 + 通过既有 rollout 恢复整条腿（Gate 第二轮的 F1/F2）      */
+/* ------------------------------------------------------------------ */
+
+describe("H. 远端腿的生命周期驱动可见状态（F2：不得假活）", () => {
+  it("H1. degraded ⇒ 可见状态写 error + 可解释原因；**desired / revision 一个字节不动**", async () => {
+    const { db, placements, tunnels, tunnelWrites } = fakeDb({ tunnels: [federatedTunnel()] });
+    placements.push(placementRow({ state: "degraded" }));
+
+    const summary = await reconcileFederatedForwardHealth({}, { db, now: () => new Date() });
+    expect(summary.marked_unhealthy).toBe(1);
+    expect(summary.recovery_triggered).toBe(0);
+
+    const tunnel = tunnels[0]!;
+    expect(tunnel.apply_status).toBe("error");
+    expect(tunnel.apply_error_code).toBe(FEDERATED_LEG_ERROR_CODES.degraded);
+    // 只写这三列：改 error 绝不改写用户的期望状态与版本账本（V4 铁律）。
+    expect(Object.keys(tunnelWrites[0]!).sort()).toEqual(
+      ["apply_error", "apply_error_code", "apply_status", "id"].sort(),
+    );
+    expect(tunnel.desired_status).toBe("active");
+    expect(tunnel.config_revision).toBe(5);
+    expect(tunnel.applied_revision).toBe(5);
+    // 用户可见文案里不得出现内部概念（grant / lease / epoch / peer_panel_id）。
+    expect(tunnel.apply_error ?? "").not.toMatch(/grant|lease|epoch|peer-b/i);
+  });
+
+  it("H2. 幂等：状态已是目标值时不重复写（第二拍只记 already_unhealthy）", async () => {
+    const { db, placements, tunnelWrites } = fakeDb({ tunnels: [federatedTunnel()] });
+    placements.push(placementRow({ state: "degraded" }));
+    await reconcileFederatedForwardHealth({}, { db, now: () => new Date() });
+    const afterFirst = tunnelWrites.length;
+
+    const second = await reconcileFederatedForwardHealth({}, { db, now: () => new Date() });
+    expect(second.already_unhealthy).toBe(1);
+    expect(second.marked_unhealthy).toBe(0);
+    expect(tunnelWrites.length).toBe(afterFirst);
+  });
+
+  it("H3. expired / revoked / failed 各有自己的原因码（可解释、不混成一个 ERROR）", async () => {
+    for (const [state, code] of [
+      ["expired", FEDERATED_LEG_ERROR_CODES.expired],
+      ["revoked", FEDERATED_LEG_ERROR_CODES.revoked],
+      ["failed", FEDERATED_LEG_ERROR_CODES.failed],
+    ] as const) {
+      const { db, placements, tunnels } = fakeDb({ tunnels: [federatedTunnel()] });
+      placements.push(placementRow({ state }));
+      await reconcileFederatedForwardHealth({}, { db, now: () => new Date() });
+      expect(tunnels[0]!.apply_error_code).toBe(code);
+      expect(tunnels[0]!.apply_status).toBe("error");
+    }
+  });
+
+  it("H4. pending / active 不算不健康（别在正常编辑窗口里闪一下「失败」）", async () => {
+    for (const state of ["pending", "active"]) {
+      const { db, placements, tunnelWrites } = fakeDb({ tunnels: [federatedTunnel()] });
+      placements.push(placementRow({ state }));
+      const summary = await reconcileFederatedForwardHealth(
+        {},
+        { db, now: () => new Date(), ingressRuntimePresent: async () => true },
+      );
+      expect(summary.marked_unhealthy).toBe(0);
+      expect(tunnelWrites).toHaveLength(0);
+    }
+  });
+
+  it("H5. 上一代 placement 的终态不驱动可见状态（只看当代那一行）", async () => {
+    const { db, placements, tunnels } = fakeDb({ tunnels: [federatedTunnel({ config_revision: 6, applied_revision: 6 })] });
+    // 旧一代（revision 5）已过期，但用户已经保存出第 6 代且它是活的。
+    placements.push(placementRow({ desired_revision: 5, state: "expired" }));
+    placements.push(placementRow({ desired_revision: 6, state: "active" }));
+
+    const summary = await reconcileFederatedForwardHealth(
+      {},
+      { db, now: () => new Date(), ingressRuntimePresent: async () => true },
+    );
+    expect(summary.evaluated).toBe(1);
+    expect(summary.marked_unhealthy).toBe(0);
+    expect(tunnels[0]!.apply_status).toBe("active");
+  });
+
+  it("H6. suspended 是用户有意的可见状态，不被健康收口覆盖", async () => {
+    const { db, placements, tunnels, tunnelWrites } = fakeDb({
+      tunnels: [federatedTunnel({ apply_status: "suspended", desired_status: "inactive" })],
+    });
+    placements.push(placementRow({ state: "degraded" }));
+    const summary = await reconcileFederatedForwardHealth({}, { db, now: () => new Date() });
+    expect(summary.skipped).toBe(1);
+    expect(tunnelWrites).toHaveLength(0);
+    expect(tunnels[0]!.apply_status).toBe("suspended");
+  });
+
+  it("H7. 声明已移除（改回本机出口）⇒ 这里什么都不做（释放由编辑路径负责）", async () => {
+    const { db, placements, tunnelWrites } = fakeDb({
+      tunnels: [federatedTunnel({ federated_egress_peer: null })],
+    });
+    placements.push(placementRow({ state: "degraded" }));
+    const summary = await reconcileFederatedForwardHealth({}, { db, now: () => new Date() });
+    expect(summary.skipped).toBe(1);
+    expect(tunnelWrites).toHaveLength(0);
+  });
+});
+
+describe("H. 恢复必须重建整条腿（F1：只重建了远端半条腿）", () => {
+  it("H8. 远端腿回到 active + 可见状态仍是我们写下的 error ⇒ 触发一次恢复 rollout（同一 revision）", async () => {
+    const { db, placements } = fakeDb({
+      tunnels: [federatedTunnel({ apply_status: "error", apply_error_code: FEDERATED_LEG_ERROR_CODES.degraded })],
+    });
+    placements.push(placementRow({ state: "active" }));
+    const restarts: Array<{ tunnelId: number; revision: number; baseRevision: number | null }> = [];
+
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      restartRollout: async (input) => {
+        restarts.push(input);
+        return { ok: true };
+      },
+    });
+
+    expect(summary.recovery_triggered).toBe(1);
+    // 恢复用**同一个 revision**（⇒ 同一个 intent_id ⇒ 对面不会出现第二条租约）。
+    expect(restarts).toEqual([{ tunnelId: 42, revision: 5, baseRevision: 5 }]);
+  });
+
+  it("H9. 只触发一次：同一拍不会为同一条 Forward 重复触发", async () => {
+    const { db, placements } = fakeDb({
+      tunnels: [federatedTunnel({ apply_status: "error", apply_error_code: FEDERATED_LEG_ERROR_CODES.degraded })],
+    });
+    placements.push(placementRow({ state: "active" }));
+    let calls = 0;
+    await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      restartRollout: async () => {
+        calls++;
+        return { ok: true };
+      },
+    });
+    expect(calls).toBe(1);
+  });
+
+  it("H10. 可见状态说 active、远端在、但**本机入口腿不在**（F1 的原始形态）⇒ 同样触发恢复", async () => {
+    const { db, placements } = fakeDb({ tunnels: [federatedTunnel()] });
+    placements.push(placementRow({ state: "active" }));
+    const restarts: number[] = [];
+
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      ingressRuntimePresent: async () => false,
+      restartRollout: async (input) => {
+        restarts.push(input.revision);
+        return { ok: true };
+      },
+    });
+    expect(summary.recovery_triggered).toBe(1);
+    expect(restarts).toEqual([5]);
+  });
+
+  it("H11. 本机入口腿在（Agent 快照里有它）⇒ 不触发（幂等、不制造噪声）", async () => {
+    const { db, placements } = fakeDb({ tunnels: [federatedTunnel()] });
+    placements.push(placementRow({ state: "active" }));
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      ingressRuntimePresent: async () => true,
+      restartRollout: async () => {
+        throw new Error("不该触发");
+      },
+    });
+    expect(summary.recovery_triggered).toBe(0);
+    expect(summary.skipped).toBe(1);
+  });
+
+  it("H12. 快照过期/读不到（null = 不知道）⇒ 不据它触发", async () => {
+    const { db, placements } = fakeDb({ tunnels: [federatedTunnel()] });
+    placements.push(placementRow({ state: "active" }));
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      ingressRuntimePresent: async () => null,
+      restartRollout: async () => {
+        throw new Error("不该触发");
+      },
+    });
+    expect(summary.recovery_triggered).toBe(0);
+  });
+
+  it("H13. 恢复失败 ⇒ 记 recovery_failed，且**不**把可见状态假装成 active", async () => {
+    const { db, placements, tunnels, tunnelWrites } = fakeDb({
+      tunnels: [federatedTunnel({ apply_status: "error", apply_error_code: FEDERATED_LEG_ERROR_CODES.degraded })],
+    });
+    placements.push(placementRow({ state: "active" }));
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      restartRollout: async () => ({ ok: false, code: "no_transport", message: "通道未就绪" }),
+    });
+    expect(summary.recovery_failed).toBe(1);
+    expect(summary.recovery_triggered).toBe(0);
+    expect(tunnelWrites).toHaveLength(0);
+    expect(tunnels[0]!.apply_status).toBe("error");
+  });
+
+  it("H14. expired / revoked 是终态：只如实报状态，**不**自动恢复（要用户重新保存/重建信任）", async () => {
+    for (const state of ["expired", "revoked"]) {
+      const { db, placements, tunnels } = fakeDb({ tunnels: [federatedTunnel()] });
+      placements.push(placementRow({ state }));
+      const summary = await reconcileFederatedForwardHealth({}, {
+        db,
+        now: () => new Date(),
+        restartRollout: async () => {
+          throw new Error("终态不该触发恢复");
+        },
+      });
+      expect(summary.recovery_triggered).toBe(0);
+      expect(summary.marked_unhealthy).toBe(1);
+      expect(federatedLegVisibleError(state)!.message).toMatch(/重新保存|重新建立信任/);
+      expect(tunnels[0]!.apply_status).toBe("error");
+    }
+  });
+
+  it("H15. 恢复影响面：只声明「入口监听重建」，**不**触发旧出口的 drain/drop", () => {
+    // 这是"不产生第二份远端租约"的关键：egress_node_change=false 让计划器不生成
+    // drain_egress / drop_old_egress（否则会先 DELETE 掉刚确认健康的远端租约）。
+    expect(FEDERATED_RECOVERY_IMPACT.listener_replacement).toBe(true);
+    expect(FEDERATED_RECOVERY_IMPACT.egress_node_change).toBe(false);
+    expect(FEDERATED_RECOVERY_IMPACT.mode_change).toBe(false);
+    expect(FEDERATED_RECOVERY_IMPACT.middle_node_change).toBe(false);
+    expect(FEDERATED_RECOVERY_IMPACT.runtime_change).toBe(true);
+  });
+
+  it("H17. 已经有一次 rollout 在收敛 ⇒ 本拍不再触发第二次（不制造 phase 竞争与假告警）", async () => {
+    const { db, placements } = fakeDb({
+      tunnels: [federatedTunnel({ apply_status: "error", apply_error_code: FEDERATED_LEG_ERROR_CODES.degraded })],
+      inFlightRollouts: [{ id: 77 }],
+    });
+    placements.push(placementRow({ state: "active" }));
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      restartRollout: async () => {
+        throw new Error("已有 rollout 在收敛时不该再触发");
+      },
+    });
+    expect(summary.recovery_triggered).toBe(0);
+    expect(summary.recovery_failed).toBe(0);
+    expect(summary.skipped).toBe(1);
+  });
+
+  it("H18. 与另一个执行器竞争（rollout_in_progress）算跳过，不算恢复失败", async () => {
+    const { db, placements } = fakeDb({
+      tunnels: [federatedTunnel({ apply_status: "error", apply_error_code: FEDERATED_LEG_ERROR_CODES.degraded })],
+    });
+    placements.push(placementRow({ state: "active" }));
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      restartRollout: async () => ({ ok: false, code: "rollout_in_progress", message: "已有正在进行的更新" }),
+    });
+    expect(summary.recovery_triggered).toBe(0);
+    expect(summary.recovery_failed).toBe(0);
+    expect(summary.skipped).toBe(1);
+  });
+
+  it("H16. 读取器可选：没有 tunnel 端口时安全返回（不抛）", async () => {
+    const db = { federationPlacement: { findMany: async () => [] } } as unknown as ForwardHopDb;
+    const summary = await reconcileFederatedForwardHealth({}, { db });
+    expect(summary).toEqual({
+      evaluated: 0,
+      marked_unhealthy: 0,
+      already_unhealthy: 0,
+      recovery_triggered: 0,
+      recovery_failed: 0,
+      skipped: 0,
+    });
   });
 });

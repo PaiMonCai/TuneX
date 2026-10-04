@@ -246,6 +246,14 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     desired_address: null,
   };
 
+  /**
+   * 恢复用的影响面：**与生产实现同源**（`FEDERATED_RECOVERY_IMPACT`）。
+   *
+   * 测试里直接用它而不是另写一份，正是为了让"恢复只声明入口监听重建、不触发旧出口
+   * drain/drop"这条性质被真的覆盖到（否则测试会用一个自己编的形状，测不到生产形状）。
+   */
+  const { FEDERATED_RECOVERY_IMPACT: recoveryImpact } = await import("../src/services/federation/forward-hop.ts");
+
   /* ---------------- 测试 ---------------- */
 
   test("A. 远端委托：真库只落镜像行，本机不为那一跳建任何资源", async () => {
@@ -537,6 +545,133 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     });
     assert.equal(placement.state, "active");
     assert.equal(placement.applied_revision, Number(tunnel.config_revision));
+  });
+
+  test("H. 可见状态跟事实（F2）+ 通过既有 rollout 恢复整条腿（F1）", async () => {
+    // 健康收口是**全局一拍**（它对所有联邦 placement 生效）。清掉前面用例留下的
+    // 镜像行，让这一拍的计数只反映本用例的事实。
+    await db.federationPlacement.deleteMany({ where: { peer_panel_id: peerPanelId } });
+    const { tunnelId, revision } = await createFederatedForward(2);
+    const orch = fakeOrchestrator();
+    const { sender } = fakeSender();
+
+    // 先把它跑成 active（数据面通的那一步）。
+    const first = await registerRollout(
+      { tunnelId, impact, revision, baseRevision: null },
+      { db, orchestrator: orch, runtimeUse: async () => null, federatedSender: sender, now: () => new Date() },
+    );
+    assert.equal(first.ok, true, JSON.stringify(first));
+
+    const health = (await import("../src/services/federation/forward-hop.ts")).reconcileFederatedForwardHealth;
+    const placementWhere = {
+      peer_panel_id_intent_id: {
+        peer_panel_id: peerPanelId,
+        intent_id: federatedEgressIntentId(tunnelId, revision),
+      },
+    };
+
+    // ── F2 前半：远端腿 degraded ⇒ 可见状态必须写 error，且 desired/revision 不动 ──
+    await db.federationPlacement.updateMany({ where: { peer_panel_id: peerPanelId, tunnel_id: tunnelId }, data: { state: "degraded" } });
+    const markTick = await health({}, { db, now: () => new Date() });
+    assert.equal(markTick.marked_unhealthy, 1, JSON.stringify(markTick));
+
+    const marked = await db.tunnel.findUnique({ where: { id: tunnelId } });
+    assert.equal(marked.apply_status, "error");
+    assert.equal(marked.apply_error_code, "federation_remote_leg_unreachable");
+    assert.match(String(marked.apply_error), /远端出口/);
+    // V4 铁律：失败不得改写期望状态与版本账本。
+    assert.equal(marked.desired_status, "active");
+    assert.equal(marked.config_revision, revision);
+    assert.equal(marked.applied_revision, revision);
+
+    // ── F1：远端腿恢复（placement 回 active）⇒ 用**既有 rollout** 重建整条腿 ──
+    await db.federationPlacement.updateMany({ where: { peer_panel_id: peerPanelId, tunnel_id: tunnelId }, data: { state: "active" } });
+    const leasesBefore = await db.nodePortLease.findMany({ where: { tunnel_id: tunnelId, status: "active" } });
+    const placementBefore = await db.federationPlacement.findUnique({ where: placementWhere });
+    const ingressDispatchesBefore = orch.calls.dispatchIngress.length;
+
+    const recoverTick = await health({}, {
+      db,
+      now: () => new Date(),
+      // 走**既有 rollout 路径**（与用户点"重试"同一条），只是下行用替身。
+      restartRollout: async (input) =>
+        registerRollout(
+          { tunnelId: input.tunnelId, impact: recoveryImpact, revision: input.revision, baseRevision: input.baseRevision },
+          { db, orchestrator: orch, runtimeUse: async () => null, federatedSender: sender, now: () => new Date() },
+        ).then((r) => ({ ok: r.ok === true, code: r.error_code, message: r.error ?? r.status })),
+    });
+    assert.equal(recoverTick.recovery_triggered, 1, JSON.stringify(recoverTick));
+
+    // 本机入口腿被真的重建了：入口按 host 给的地址重新下发。
+    assert.equal(orch.calls.dispatchIngress.length, ingressDispatchesBefore + 1);
+    assert.equal(orch.calls.dispatchIngress.at(-1).nextHop, "203.0.113.60:22060");
+    // 本机出口仍然一次都没下发（这一跳在对面）。
+    assert.equal(orch.calls.dispatchEgress.length, 0);
+
+    const recovered = await db.tunnel.findUnique({ where: { id: tunnelId } });
+    assert.equal(recovered.apply_status, "active");
+    assert.equal(recovered.apply_error_code, null);
+    assert.equal(recovered.desired_status, "active");
+
+    // **同一次恢复不得产生第二份远端 lease**：placement 行仍然只有这一条，lease_ref 不变。
+    const placementsForTunnel = await db.federationPlacement.findMany({ where: { tunnel_id: tunnelId } });
+    assert.equal(placementsForTunnel.length, 1);
+    assert.equal(placementsForTunnel[0].lease_ref, placementBefore.lease_ref);
+    assert.equal(placementsForTunnel[0].state, "active");
+
+    // **不得重复占用端口**：入口端口租约仍是同一条、同一个端口，且数量没有变多。
+    const leasesAfter = await db.nodePortLease.findMany({ where: { tunnel_id: tunnelId, status: "active" } });
+    assert.equal(leasesAfter.length, leasesBefore.length);
+    assert.deepEqual(leasesAfter.map((l) => l.port).sort(), leasesBefore.map((l) => l.port).sort());
+
+    // 幂等：恢复后再跑一拍，什么都不用做（`ingressRuntimePresent` 用替身说"在"，
+    // 避免依赖 Agent 上报的时间窗）。
+    const steady = await health({}, {
+      db,
+      now: () => new Date(),
+      ingressRuntimePresent: async () => true,
+      restartRollout: async () => {
+        throw new Error("恢复完成之后不该再触发");
+      },
+    });
+    assert.equal(steady.recovery_triggered, 0);
+    assert.equal(steady.marked_unhealthy, 0);
+  });
+
+  test("I. 远端腿到期（F2 后半）：只如实报状态，不自动恢复（终态要用户重新保存）", async () => {
+    await db.federationPlacement.deleteMany({ where: { peer_panel_id: peerPanelId } });
+    const { tunnelId, revision } = await createFederatedForward(2);
+    const orch = fakeOrchestrator();
+    const { sender } = fakeSender();
+    await registerRollout(
+      { tunnelId, impact, revision, baseRevision: null },
+      { db, orchestrator: orch, runtimeUse: async () => null, federatedSender: sender, now: () => new Date() },
+    );
+
+    // 模拟"远端租约在停机窗口内离开 live"：placement 由对账收口成 expired。
+    await db.federationPlacement.updateMany({
+      where: { peer_panel_id: peerPanelId, tunnel_id: tunnelId },
+      data: { state: "expired", last_error_code: "lease_expired" },
+    });
+
+    const { reconcileFederatedForwardHealth } = await import("../src/services/federation/forward-hop.ts");
+    const summary = await reconcileFederatedForwardHealth({}, {
+      db,
+      now: () => new Date(),
+      restartRollout: async () => {
+        throw new Error("expired 是终态，不该自动恢复");
+      },
+    });
+    assert.equal(summary.marked_unhealthy, 1);
+    assert.equal(summary.recovery_triggered, 0);
+
+    const tunnel = await db.tunnel.findUnique({ where: { id: tunnelId } });
+    assert.equal(tunnel.apply_status, "error");
+    assert.equal(tunnel.apply_error_code, "federation_remote_leg_expired");
+    assert.match(String(tunnel.apply_error), /重新保存/);
+    // 期望状态与版本账本一个字节不动。
+    assert.equal(tunnel.desired_status, "active");
+    assert.equal(tunnel.config_revision, revision);
   });
 
   /* ---------------- 清理 ---------------- */

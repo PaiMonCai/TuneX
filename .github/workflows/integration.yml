@@ -94,9 +94,21 @@ jobs:
       # It runs LAST in this job on purpose: several G5 scenarios stop/start
       # containers (partition simulation) and create remote leases, so nothing
       # after it can assume the topology is untouched.
+      #
+      # On the runner both panels live in the same docker network but the gate runs
+      # on the HOST: container aliases (`panel-b`) do not resolve there, so the
+      # scripts resolve addresses in order (FED_PANEL_B_API -> alias -> published
+      # host port). These env values make that explicit instead of implicit:
+      # A is published on 18180, B on 18181; a parallel job can move them.
       - name: Bootstrap second Panel and bidirectional federation trust
+        env:
+          API: http://127.0.0.1:18180
+          FED_PANEL_B_HOST_PORT: "18181"
         run: python3 scripts/v3-e2e/bootstrap-federation.py
       - name: Run V5-G5 federation gate
+        env:
+          API: http://127.0.0.1:18180
+          FED_PANEL_B_HOST_PORT: "18181"
         run: python3 scripts/v3-e2e/v5-g5.py
       - name: Upload v3/v4/v5 integration evidence
         if: failure() || github.event_name == 'workflow_run'

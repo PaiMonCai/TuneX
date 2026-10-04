@@ -684,6 +684,18 @@ export interface ReconcileDeps {
    * 配置时自动迁移本来就不该发生（§8：必须是显式 policy）。
    */
   failoverSweep?: (() => Promise<{ evaluated: number; moved: number; held: number }>) | null;
+  /**
+   * V5.5 WP15：联邦 Forward 的健康收口（可见状态回写 + 通过既有 rollout 恢复整条腿）。
+   *
+   * 注入而不是直接 import：本模块的用例不需要数据库。生产由
+   * {@link defaultReconcileDeps} 接到 `reconcileFederatedForwardHealth`。
+   *
+   * 位置在**本地逐条对账之后**：本机缺失入口腿时，reconciler 的常规重发对联邦 Forward
+   * 是**拒发**的（sink 的 runtime-use 判定要求本机出口节点组，而联邦 Forward 没有），
+   * 所以"入口腿丢了"这件事必须由联邦这一遍用 rollout 重新建起来。
+   * 缺省 = 不做（旧行为），不是"忘了接线"的安全网。
+   */
+  federatedForwardHealth?: (() => Promise<ReconcileFederatedHealthSummaryLike>) | null;
   /** 端口租约回收的依赖注入（透传给 WP3）。 */
   leaseDeps?: unknown;
   log?: ReconcileLogger;
@@ -714,7 +726,24 @@ export interface ReconcileOutcome {
    * resend/failed 一样是**可观测的返回值**，否则"这轮到底有没有搬流量"只能靠翻日志。
    */
   failover: { evaluated: number; moved: number; held: number } | null;
+  /**
+   * V5.5 WP15：联邦 Forward 健康收口的统计（`null` = 本轮未配置该依赖）。
+   */
+  federated: ReconcileFederatedHealthSummaryLike | null;
   forbiddenSuppressed: ForbiddenActionKind[];
+}
+
+/**
+ * 联邦健康收口的统计形状（结构化类型：不 import forward-hop，避免把 db/Prisma
+ * 拖进本模块的 import 图 —— 本模块的单测必须能在不连库的前提下加载）。
+ */
+export interface ReconcileFederatedHealthSummaryLike {
+  evaluated: number;
+  marked_unhealthy: number;
+  already_unhealthy: number;
+  recovery_triggered: number;
+  recovery_failed: number;
+  skipped: number;
 }
 
 const EMPTY_LEASES = { releasedDanglingTunnel: 0, releasedExpired: 0 };
@@ -826,6 +855,11 @@ export function defaultReconcileDeps(): ReconcileDeps {
     },
     log: (message, meta) => console.warn(message, meta),
     now: () => new Date(),
+    async federatedForwardHealth() {
+      // 懒加载：本模块的单测不连库（`forward-hop` 会拖进 Prisma）。
+      const { reconcileFederatedForwardHealth } = await import("./federation/forward-hop.ts");
+      return reconcileFederatedForwardHealth();
+    },
   };
 }
 
@@ -953,6 +987,26 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     }
   }
 
+  // ── 联邦 Forward 的健康收口（V5.5 WP15）──
+  //
+  // 位置在**本地逐条对账之后、租约回收之前**，与 worker 里 "本地 reconcile 先、
+  // 联邦这一节拍后" 的顺序一致：本机该修的先修，然后由联邦这一遍回答
+  // 「远端腿还活着吗」——不健康就把可见状态改成 error（只动可见状态），健康且本机
+  // 入口腿缺失就用**既有 rollout** 把整条腿重建起来。
+  //
+  // 失败绝不阻断本轮 reconcile（与 failoverSweep 同口径）：下一拍自然重试。
+  let federatedHealth: ReconcileFederatedHealthSummaryLike | null = null;
+  if (deps.federatedForwardHealth) {
+    try {
+      federatedHealth = await deps.federatedForwardHealth();
+      if (federatedHealth.marked_unhealthy > 0 || federatedHealth.recovery_triggered > 0) {
+        log("[reconciler] federated forward health", { ...federatedHealth });
+      }
+    } catch (e) {
+      log("federated forward health failed", { detail: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   // ── 端口租约回收（§7.12 允许项三）──
   let leases: { releasedDanglingTunnel: number; releasedExpired: number } | null = null;
   const leaseReconciler = leaseReconcilerFrom(deps);
@@ -1017,6 +1071,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     noTransport,
     failover: failoverSummary,
     leases: leases ?? (leaseReconciler ? EMPTY_LEASES : null),
+    federated: federatedHealth,
     forbiddenSuppressed: [...forbidden],
   };
 }

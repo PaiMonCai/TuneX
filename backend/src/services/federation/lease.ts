@@ -2594,6 +2594,20 @@ export async function runFederationReconcile(
   const revoked = await sweepRevokedLeaseCleanup({ now: at, deps: { ...(deps?.lease ?? {}), now: () => at } });
   const placement = await reconcilePlacements({ now: at, deps: { ...(deps?.placement ?? {}), now: () => at } });
 
+  // V5.5 WP15：placement 对账**之后立刻**做 Forward 健康收口。
+  //
+  // 为什么必须在这里（而不是留给本机 reconcile 的上一拍）：本机 reconcile 跑在联邦这一拍**之前**，
+  // 它读到的永远是上一拍的 placement 状态 ⇒ "远端腿已恢复"要等下一拍（≈30s）才被本机的
+  // 入口腿重建看到。用户看到的症状是"链路明明回来了、还要再等半分钟"。
+  // 动态 import 是为了不引入静态环（forward-hop 是联邦的下游消费者）。
+  try {
+    const hop = await import("./forward-hop.ts");
+    await hop.reconcileFederatedForwardHealth({ now: at });
+  } catch (e) {
+    // 健康收口失败绝不阻断联邦对账（它只是"把事实写进可见状态 + 触发恢复"）。
+    console.warn("[federation] forward health reconcile failed:", e instanceof Error ? e.message : e);
+  }
+
   return {
     evaluated: leases.evaluated,
     expired: leases.expired,

@@ -52,6 +52,9 @@ import { callPeer } from "./client.ts";
 import type { FederationErrorCode } from "./errors.ts";
 import { isRetryableFederationError } from "./errors.ts";
 import { isFederationEnabled } from "./identity.ts";
+// 只为一个判定：「这条 Forward 是否已经有一次 rollout 在收敛」。
+// `forward-rollout.ts` 是纯计划模块（无 IO），引它不会把 Prisma 拖进来。
+import { ACTIVE_ROLLOUT_PHASES } from "../forward-rollout.ts";
 import {
   recordPlacementResult,
   upsertPlacement,
@@ -145,6 +148,12 @@ export interface ForwardHopDb {
   };
   tunnel?: {
     findUnique(args: unknown): Promise<unknown>;
+    /** 见 `reconcileFederatedForwardHealth`：可见状态回写只写这三列。 */
+    updateMany?(args: unknown): Promise<unknown>;
+  };
+  /** 只读：这条 Forward 是否已有一次未完成的 rollout（避免重复触发恢复）。 */
+  forwardRollout?: {
+    findMany?(args: unknown): Promise<unknown>;
   };
   egressPool?: {
     findUnique(args: unknown): Promise<unknown>;
@@ -1022,4 +1031,403 @@ export async function releaseStaleFederatedEgressForTunnel(
     else result.failed.push({ intent_id: row.intent_id, code: released.code ?? "internal_error", message: released.message ?? "" });
   }
   return result;
+}
+
+/* ================================================================== */
+/* 可见状态：远端腿的生命周期必须驱动 Forward 的对外状态                    */
+/* ================================================================== */
+
+/**
+ * 远端腿不健康时写进 `tunnel` 的**既有**状态词汇与原因码。
+ *
+ * 三条不许违反的规则（V4 铁律）：
+ *   1. 只写 `apply_status`（可见的"实际状态"）与两个 error 列；
+ *      **绝不**改写 `desired_status` / `config_revision` / `desired_revision_id`
+ *      —— 失败不得重写用户的期望状态。
+ *   2. 不新增状态枚举：`apply_status` 用的就是既有的 `error`（V4 里"应用失败/不健康"
+ *      的那一个值）。
+ *   3. 文案可行动、不泄露内部概念（不出现 grant / lease / epoch / peer_panel_id）。
+ *      机器可读的原因在 `apply_error_code`（稳定标识，前端按它分流）。
+ */
+export const FEDERATED_LEG_ERROR_CODE_PREFIX = "federation_remote_leg_";
+
+export const FEDERATED_LEG_ERROR_CODES = {
+  degraded: `${FEDERATED_LEG_ERROR_CODE_PREFIX}unreachable`,
+  expired: `${FEDERATED_LEG_ERROR_CODE_PREFIX}expired`,
+  revoked: `${FEDERATED_LEG_ERROR_CODE_PREFIX}revoked`,
+  failed: `${FEDERATED_LEG_ERROR_CODE_PREFIX}failed`,
+} as const;
+
+/** 该 error code 是不是"我们因为远端腿而写下的"（只有这种才由我们负责恢复）。 */
+export function isFederatedLegErrorCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && code.startsWith(FEDERATED_LEG_ERROR_CODE_PREFIX);
+}
+
+/**
+ * placement 状态 → Forward 可见状态。
+ *
+ * `pending`（刚委托、还没应用）与 `active` **都不算不健康**：那是正常的进行中状态，
+ * 把它标成错误会在每次编辑的窗口里闪一下"失败"。
+ */
+export function federatedLegVisibleError(
+  placementState: string,
+): { code: string; message: string } | null {
+  switch (placementState) {
+    case "degraded":
+      return {
+        code: FEDERATED_LEG_ERROR_CODES.degraded,
+        message:
+          "远端出口暂不可用：对端面板当前联系不上，链路已停止转发。本机入口保持不动，对端恢复后会自动重建；若长时间不恢复，请检查对端面板与两端的信任关系。",
+      };
+    case "expired":
+      return {
+        code: FEDERATED_LEG_ERROR_CODES.expired,
+        message:
+          "远端出口已到期：链路的远端一段已停止服务（对端已归还端口）。请重新保存该转发以重新申请远端出口。",
+      };
+    case "revoked":
+      return {
+        code: FEDERATED_LEG_ERROR_CODES.revoked,
+        message:
+          "远端出口已被对端撤销：链路已停止服务。请先在对端面板重新建立信任并重新授予容量，再重新保存该转发。",
+      };
+    case "failed":
+      return {
+        code: FEDERATED_LEG_ERROR_CODES.failed,
+        message:
+          "远端出口建立失败：远端一段没有建成，链路不可用。可对该转发执行重试；若持续失败，请检查对端的容量授予。",
+      };
+    default:
+      return null;
+  }
+}
+
+/**
+ * 恢复时用的影响面（**有意**只声明"入口监听需要重建"）。
+ *
+ * 既有计划器（`forward-rollout.ts`）按影响面生成步骤，`listener_replacement: true`
+ * 恰好产出这条完整序列：
+ *
+ *     acquire_port(ingress, 续用既有端口)
+ *   → prepare_egress(远端委托；同 intent / 同 revision)
+ *   → cutover_ingress(next_hop 取 host 返回的地址)
+ *
+ * 而 `egress_node_change: false` 保证**不会**生成 drain/drop 旧出口的步骤 —— 那样会把
+ * 刚确认健康的远端租约先删掉再重建（等于制造第二份租约 + 一次无谓的停服窗口）。
+ * 全程用**同一个 revision** ⇒ 同一个 `intent_id` ⇒ host 返回首次结果，不产生第二条腿。
+ */
+export const FEDERATED_RECOVERY_IMPACT = {
+  metadata_only: false,
+  runtime_change: true,
+  changes_external_address: false,
+  listen_port_change: false,
+  listener_replacement: true,
+  ingress_node_change: false,
+  egress_node_change: false,
+  federated_egress_change: false,
+  middle_node_change: false,
+  mode_change: false,
+  target_change: false,
+  egress_target_change: false,
+  nodes_prepare_drain: [] as string[],
+  binding_required: false,
+  port_status: "ok" as const,
+  desired_address: null,
+} as const;
+
+/* ================================================================== */
+/* 周期对账：可见状态回写 + 通过既有 rollout 恢复整条腿                     */
+/* ================================================================== */
+
+export interface FederatedForwardHealthSummary {
+  /** 本轮看过的 Forward 数（每个 Forward 只看它**当代**那一行）。 */
+  evaluated: number;
+  /** 因远端腿不健康而把可见状态改成 error 的条数。 */
+  marked_unhealthy: number;
+  /** 实际上已经是不健康状态、本轮无需重写的条数（幂等）。 */
+  already_unhealthy: number;
+  /** 触发恢复 rollout 的次数。 */
+  recovery_triggered: number;
+  /** 恢复失败（rollout 失败 / 没有下发通道）的次数。 */
+  recovery_failed: number;
+  /** 本轮跳过（声明已移除 / suspended / 健康且无需恢复 / 行不存在）。 */
+  skipped: number;
+}
+
+export interface FederatedForwardHealthDeps extends ForwardHopDeps {
+  /** 每轮最多看多少个 Forward（默认 100）。 */
+  limit?: number;
+  /**
+   * 恢复执行器。默认走**既有 rollout 路径**（`registerRollout` → `executeRollout`），
+   * 与用户点"重试"是同一条路；测试注入替身以断言"只触发一次"。
+   */
+  restartRollout?: (input: {
+    tunnelId: number;
+    revision: number;
+    baseRevision: number | null;
+  }) => Promise<{ ok: boolean; code?: string; message?: string }>;
+  /**
+   * "本机入口腿在不在"的事实来源。返回 `null` = 不知道（**不据此触发**，避免拿一份
+   * 过期的 Agent 快照去重建一条其实好好的链路）。
+   */
+  ingressRuntimePresent?: (tunnelId: number, ingressNodeId: number) => Promise<boolean | null>;
+}
+
+/** Agent state report 周期 30s；比这个年龄更旧的报告不再作为"腿丢了"的依据。 */
+export const FEDERATED_INGRESS_REPORT_FRESH_MS = 90_000;
+
+interface FederatedTunnelRow {
+  id: number;
+  apply_status: string | null;
+  apply_error_code: string | null;
+  desired_status: string | null;
+  config_revision: number | null;
+  applied_revision: number | null;
+  ingress_node_id: number | null;
+  federated_egress_peer: string | null;
+}
+
+/** 默认恢复执行器：**既有 rollout 路径**（联邦侧从不自己拼下发）。 */
+async function defaultRestartRollout(
+  db: ForwardHopDb,
+  input: { tunnelId: number; revision: number; baseRevision: number | null },
+): Promise<{ ok: boolean; code?: string; message?: string }> {
+  const { getOrchestrator } = await import("../relay-wiring.ts");
+  const orchestrator = getOrchestrator();
+  if (!orchestrator) {
+    // 没有下发通道就**不假装恢复成功**：状态留在 error，下一拍再试。
+    return { ok: false, code: "no_transport", message: "本机控制面下发通道未就绪" };
+  }
+  const { registerRollout } = await import("../forward-rollout-exec.ts");
+  const result = await registerRollout(
+    {
+      tunnelId: input.tunnelId,
+      impact: FEDERATED_RECOVERY_IMPACT as never,
+      revision: input.revision,
+      baseRevision: input.baseRevision,
+    },
+    { db: db as never, orchestrator: orchestrator as never },
+  );
+  return {
+    ok: result.ok === true,
+    code: result.error_code ?? (result.status === "conflict" ? "rollout_in_progress" : undefined),
+    message: result.error ?? result.status,
+  };
+}
+
+/**
+ * 这条 Forward 是否已有一次未完成的 rollout（有 ⇒ 本拍不触发第二次恢复）。
+ *
+ * 为什么要有它：上一拍触发的 rollout 若停在 `waiting`（ACK 结果未知）或还在跑，
+ * 这一拍再 register 只会撞 phase CAS，并且每 30s 打一条"恢复失败"的无用告警 ——
+ * 而真相是"已经在恢复了"。
+ */
+async function rolloutInFlight(db: ForwardHopDb, tunnelId: number): Promise<boolean> {
+  const reader = (db as unknown as { forwardRollout?: { findMany?: (args: unknown) => Promise<unknown> } })
+    .forwardRollout?.findMany;
+  if (typeof reader !== "function") return false;
+  const rows = (await reader({
+    where: { tunnel_id: tunnelId, phase: { in: [...ACTIVE_ROLLOUT_PHASES] } },
+    take: 1,
+    select: { id: true },
+  }).catch(() => [])) as Array<{ id: number }>;
+  return rows.length > 0;
+}
+
+/**
+ * 默认事实来源：读入口节点最近一次 state report 里这条 Forward 的**入口** runtime。
+ *
+ * 资源 id 与 rollout 执行器用的是同一个构造（`Orchestrator.relayTunnelId`）——
+ * 这正是"两条对同一件事的判定不能各写一份"的要求。
+ */
+async function defaultIngressRuntimePresent(
+  db: ForwardHopDb,
+  tunnelId: number,
+  ingressNodeId: number,
+  now: Date,
+): Promise<boolean | null> {
+  const reader = (db as unknown as { nodeStateReport?: { findUnique?: (args: unknown) => Promise<unknown> } })
+    .nodeStateReport?.findUnique;
+  if (typeof reader !== "function") return null;
+  const report = (await reader({
+    where: { node_id: ingressNodeId },
+    select: { tunnels: true, reported_at: true },
+  }).catch(() => null)) as { tunnels?: unknown; reported_at?: Date | string | null } | null;
+  if (!report) return null;
+  const reportedAt = report.reported_at == null ? null : new Date(report.reported_at);
+  if (reportedAt === null || !Number.isFinite(reportedAt.getTime())) return null;
+  // 过期的报告不能当事实：拿一份 5 分钟前的快照去"重建"，只会在链路其实好好的时候
+  // 多跑一次 rollout（虽然幂等，但那是噪声）。
+  if (now.getTime() - reportedAt.getTime() > FEDERATED_INGRESS_REPORT_FRESH_MS) return null;
+  if (!Array.isArray(report.tunnels)) return null;
+  const { Orchestrator } = await import("../orchestrator.ts");
+  const resourceId = Orchestrator.relayTunnelId(tunnelId);
+  return report.tunnels.some(
+    (raw) => raw != null && typeof raw === "object" && String((raw as { id?: unknown }).id ?? "") === resourceId,
+  );
+}
+
+/**
+ * 联邦这一拍的健康收口：**先让可见状态跟事实，再通过既有 rollout 恢复整条腿**。
+ *
+ * 解决的问题（Gate V5-G5 第二轮的两条 FAIL）：
+ *   · F2「远端腿已过期、数据面不通，Forward 仍声称 active」→ 把可见状态写成既有的
+ *     `apply_status = "error"` + 可解释原因（**只动可见状态，不动 desired**）；
+ *   · F1「对端恢复后只重建了远端半条腿，本机入口腿没重建，却仍报 active」→ 检测到
+ *     "远端腿已健康 + 本机入口腿缺失（或可见状态仍是我们写下的 error）"时，用**同一个
+ *     revision** 重跑既有 rollout：它重新委托远端腿（同 intent ⇒ host 返回首次结果，
+ *     不产生第二条租约）并重新拉起本机入口腿。
+ *
+ * 每一拍只改 `tunnel` 的可见状态列，或**触发**一次既有 rollout；联邦侧从不拼下发。
+ * 幂等：可见状态已是目标值时不写；rollout 进行中（conflict）时跳过，下一拍再说。
+ */
+export async function reconcileFederatedForwardHealth(
+  options: { now?: Date } = {},
+  deps?: FederatedForwardHealthDeps,
+): Promise<FederatedForwardHealthSummary> {
+  const d = resolveDeps(deps);
+  const now = options.now ?? d.now();
+  const limit = deps?.limit ?? 100;
+  const summary: FederatedForwardHealthSummary = {
+    evaluated: 0,
+    marked_unhealthy: 0,
+    already_unhealthy: 0,
+    recovery_triggered: 0,
+    recovery_failed: 0,
+    skipped: 0,
+  };
+  if (!d.db.tunnel) return summary;
+
+  const rows = (await d.db.federationPlacement
+    .findMany({
+      where: { hop_role: FEDERATED_EGRESS_HOP_ROLE, tunnel_id: { not: null } },
+      take: limit,
+    })
+    .catch(() => [])) as Array<{ tunnel_id: number | null; desired_revision: number; state: string }>;
+
+  // 一条 Forward 可能有**多代** placement 行（每次改版都是一条新 intent）。
+  // 只有"当代"那一行（desired_revision 最大）能代表它现在的远端腿状态；旧一代的
+  // expired/revoked 行是历史事实，不该把一个已经重建好的 Forward 标成坏的。
+  const latest = new Map<number, { desired_revision: number; state: string }>();
+  for (const row of rows) {
+    const tunnelId = Number(row.tunnel_id);
+    if (!Number.isInteger(tunnelId) || tunnelId <= 0) continue;
+    const prev = latest.get(tunnelId);
+    if (!prev || Number(row.desired_revision) >= prev.desired_revision) {
+      latest.set(tunnelId, { desired_revision: Number(row.desired_revision), state: row.state });
+    }
+  }
+  summary.evaluated = latest.size;
+  if (latest.size === 0) return summary;
+
+  const restart =
+    deps?.restartRollout ??
+    ((input: { tunnelId: number; revision: number; baseRevision: number | null }) =>
+      defaultRestartRollout(d.db, input));
+  const ingressPresent =
+    deps?.ingressRuntimePresent ??
+    ((tunnelId: number, nodeId: number) => defaultIngressRuntimePresent(d.db, tunnelId, nodeId, now));
+
+  for (const [tunnelId, placement] of latest) {
+    const tunnel = (await d.db.tunnel
+      .findUnique({
+        where: { id: tunnelId },
+        select: {
+          id: true,
+          apply_status: true,
+          apply_error_code: true,
+          desired_status: true,
+          config_revision: true,
+          applied_revision: true,
+          ingress_node_id: true,
+          federated_egress_peer: true,
+        },
+      })
+      .catch(() => null)) as FederatedTunnelRow | null | undefined;
+    if (!tunnel) {
+      summary.skipped++;
+      continue;
+    }
+    // 声明已被移除（改回本机出口 / 单跳）：这里没有"远端腿"可言，释放由编辑路径负责。
+    if (federatedEgressPeerOf(tunnel) === null) {
+      summary.skipped++;
+      continue;
+    }
+    // suspended 是**用户有意为之**的可见状态（存 desired 不启 runtime），不是故障，
+    // 不能被这里的健康收口覆盖成 error。
+    if (tunnel.apply_status === "suspended") {
+      summary.skipped++;
+      continue;
+    }
+
+    const unhealthy = federatedLegVisibleError(placement.state);
+    if (unhealthy !== null) {
+      if (tunnel.apply_status === "error" && tunnel.apply_error_code === unhealthy.code) {
+        summary.already_unhealthy++;
+        continue;
+      }
+      // 只在"当前声称健康"或"当前这个 error 本来就是远端腿的"时改写：不覆盖用户上一次
+      // 编辑失败留下的真实原因（那会丢掉更有用的信息）。
+      const claimsHealthy =
+        tunnel.apply_status === "active" || tunnel.apply_status === null || tunnel.apply_status === "pending";
+      if (!claimsHealthy && !isFederatedLegErrorCode(tunnel.apply_error_code)) {
+        summary.skipped++;
+        continue;
+      }
+      await d.db.tunnel
+        .updateMany?.({
+          where: { id: tunnelId },
+          // 只写可见状态与原因；desired / revision 一个字节都不动（V4 铁律）。
+          data: { apply_status: "error", apply_error_code: unhealthy.code, apply_error: unhealthy.message },
+        })
+        ?.catch(() => undefined);
+      summary.marked_unhealthy++;
+      continue;
+    }
+
+    /* ---------------- 远端腿健康：判断"整条腿"是否也健康 ---------------- */
+    if (tunnel.desired_status !== "active") {
+      summary.skipped++;
+      continue;
+    }
+    const revision = Number(tunnel.config_revision ?? 0);
+    if (!Number.isInteger(revision) || revision <= 0) {
+      summary.skipped++;
+      continue;
+    }
+
+    const markedByUs = isFederatedLegErrorCode(tunnel.apply_error_code);
+    let localLegMissing = false;
+    if (!markedByUs && tunnel.apply_status === "active" && tunnel.ingress_node_id != null) {
+      // 可见状态说 active、远端腿也活着 —— 再用**入口节点自己的上报**确认本机这一半
+      // 是否真的在跑。这正是 F1 的形态："远端在、本机入口腿不在，而系统仍报 active"。
+      localLegMissing = (await ingressPresent(tunnelId, Number(tunnel.ingress_node_id))) === false;
+    }
+    if (!markedByUs && !localLegMissing) {
+      summary.skipped++;
+      continue;
+    }
+
+    // 已经有一次 rollout 在收敛（上一次触发的还在 waiting / 正在跑）⇒ 本拍不再触发：
+    // 两处同时推同一条 Forward 只会让双方都撞上 phase CAS，且每 30s 打一条无用的告警。
+    if (await rolloutInFlight(d.db, tunnelId)) {
+      summary.skipped++;
+      continue;
+    }
+
+    const restarted = await restart({ tunnelId, revision, baseRevision: tunnel.applied_revision ?? null });
+    if (restarted.ok) {
+      summary.recovery_triggered++;
+    } else if (restarted.code === "rollout_in_progress" || restarted.code === "concurrent_transition") {
+      // 竞争失败不是恢复失败：另一个执行器已经在做同一件事（幂等键相同）。
+      summary.skipped++;
+    } else {
+      summary.recovery_failed++;
+      console.warn(
+        `[federation] forward ${tunnelId} 远端腿恢复未成功：${restarted.code ?? "unknown"} ${restarted.message ?? ""}`,
+      );
+    }
+  }
+
+  return summary;
 }

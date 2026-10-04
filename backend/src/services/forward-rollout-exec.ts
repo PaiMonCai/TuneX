@@ -784,6 +784,24 @@ async function delegateRemoteEgressStep(ctx: RolloutExecContext, deps: RolloutDe
   };
 }
 
+/**
+ * 该隧道当前**已经持有**的入口端口（本机 durable lease）。
+ *
+ * 只给联邦恢复路径用（见 `acquire_port` 的注释）：同 revision 重跑时必须续用端口，
+ * 否则同一方向会出现两条 active 租约。
+ */
+async function existingIngressPort(deps: RolloutDeps, tunnelId: number): Promise<number | null> {
+  const reader = (deps.db as unknown as { nodePortLease?: { findMany?: (args: unknown) => Promise<unknown> } })
+    .nodePortLease?.findMany;
+  if (typeof reader !== "function") return null;
+  const rows = (await reader({
+    where: { tunnel_id: tunnelId, lease_type: "ingress", status: "active" },
+    select: { port: true },
+  }).catch(() => [])) as Array<{ port: unknown }>;
+  const port = rows.length > 0 ? Number(rows[0]!.port) : NaN;
+  return Number.isInteger(port) && port > 0 ? port : null;
+}
+
 /** 本机出口池的负载均衡策略（原样转述给 host；读不到时 null = 让 host 用默认）。 */
 async function loadEgressPoolLb(deps: RolloutDeps, poolId: number | null): Promise<string | null> {
   if (poolId == null) return null;
@@ -854,11 +872,26 @@ async function runStep(
           note: `远端出口腿：跳过本机 ${nodeId}:${step.port ?? "auto"} 的端口/节点分配（端口归 host 的 portPool）`,
         };
       }
+      // V5.5 WP15：**只对联邦 Forward 的恢复路径**做的端口续用。
+      //
+      // 恢复用同一个 revision 重跑，而 `desired.listen_port` 可能是"自动分配"
+      // （NULL）—— 若照旧把 NULL 当 preferred 去 acquirePort，`portPool` 只在
+      // "preferred 明确且命中原 lease" 时续用，于是会在**同一方向**再占一个端口，
+      // 而旧租约仍然 active：库里出现双占、隧道行只记得其中一个。
+      // 本机已经持有这条隧道的入口端口 ⇒ 以它作为 preferred（续用而非重分配）。
+      //
+      // 非联邦路径**一行都不进这里**（`federatedEgressPeerOf(...) === null`）。
+      const declareFederated = federatedEgressPeerOf(ctx.desired) !== null;
+      const preferredPort =
+        step.port ??
+        (declareFederated && step.direction === "ingress"
+          ? await existingIngressPort(deps, ctx.tunnelId)
+          : null);
       const outcome: AcquirePortOutcome = await acquirePort(
         {
           nodeId,
           leaseType: step.direction === "egress" ? "egress" : "ingress",
-          preferredPort: step.port ?? null,
+          preferredPort,
           tunnelId: ctx.tunnelId,
         },
         { db: deps.db as never },
