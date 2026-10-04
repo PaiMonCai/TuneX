@@ -821,10 +821,9 @@ def g0_5_new_agent_baseline_and_manifest():
     if isinstance(manifest, dict):
         check(manifest.get("schema_version") == 2,
               "G0.5 the manifest declares schema_version 2", f"got={manifest.get('schema_version')!r}")
-        # V5.1a opened protocols, so this list moves with each Gate: today the
-        # build implements tcp, tls, ws on the stream transport. It gains udp +
-        # datagram in the V5.1b commit that lands the datagram runtime — the
-        # expectation tracks what the BRANCH actually builds, so this gate stays
+        # V5.1a/V5.1b opened protocols, so this list moves with each Gate: this
+        # branch now implements tcp/tls/ws on stream plus udp on datagram.
+        # The expectation tracks what the BRANCH actually builds, so this gate stays
         # green at every commit instead of going red in anticipation of work that
         # is not merged yet. What the check
         # is FOR has not changed — an agent must not invent capability it does not
@@ -836,8 +835,13 @@ def g0_5_new_agent_baseline_and_manifest():
         #     the wiring (`agent/internal/forwarder/factory_test.go`).
         # The first half alone could be satisfied by a lie; the second alone cannot
         # see what the node told the panel. Both are needed.
-        expected_protocols = ["tcp", "tls", "ws"]
-        expected_transports = ["stream"]
+        # V5.1b / G1B is already closed on this branch (76/0): UDP DIRECT is
+        # a real implemented protocol and its wire transport is datagram. Keep
+        # UDP RELAY closed separately at admission; the manifest advertises the
+        # protocol/transport primitives the Agent implements, not every topology
+        # combination the Panel permits.
+        expected_protocols = ["tcp", "tls", "udp", "ws"]
+        expected_transports = ["datagram", "stream"]
         check(sorted(manifest.get("protocols") or []) == sorted(expected_protocols),
               "G0.5 it advertises exactly the protocols this build implements",
               f"protocols={manifest.get('protocols')!r} expected={expected_protocols}")
