@@ -269,8 +269,11 @@ def g4_5_orphan_transit_is_cleaned():
     if getattr(H, "mid_stopped", False):
         H.docker(["start", H.mid_container], allow=True, timeout=150)
         H.mid_stopped = False
-    check(reported_transit(MID, fid),
-          "G4.5 the middle node really hosts a transit runtime before the change")
+    # 节点上报是**周期性**的（30s 一拍），创建刚返回时它的上报还可能是上一拍的快照 ——
+    # 所以这里必须**等**它出现，而不是立刻断言。立刻断言会把"上报还没刷新"读成"中间跳没被下发"。
+    check(bool(H.wait_until(lambda: reported_transit(MID, fid), timeout=90, interval=6)),
+          "G4.5 the middle node really hosts a transit runtime before the change",
+          f"node={MID} tunnel={fid}")
     # 改回单跳：去掉中间跳。
     current = tunnel_row(fid)
     status, resp, _ = H.req(
