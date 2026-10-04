@@ -339,18 +339,24 @@ federationRoutes.post("/leases/:ref/apply", federationAuth(), async (c) => {
   if (!lease || lease.peer_panel_id !== peer.peer_panel_id) {
     return c.json(federationErrorBody("lease_not_found", "租约不存在"), 404 as never);
   }
-  const targets = Array.isArray(body.targets) ? (body.targets as ApplyRemoteLeaseInput["targets"]) : [];
+  // 请求形状以**契约 §3.2** 为准：`{ intent_id, revision, link: { targets, protocol, lb_strategy } }`。
+  // 顶层同名字段保留为别名（早期实现用过），但 `link` 优先 —— 两种形状都接受是为了不让
+  // 一个历史客户端因为字段搬家而静默下发不出去，而不是为了维持两套契约。
+  const link = (body.link && typeof body.link === "object" ? body.link : {}) as Record<string, unknown>;
+  const rawTargets = Array.isArray(link.targets) ? link.targets : Array.isArray(body.targets) ? body.targets : [];
+  const targets = rawTargets as ApplyRemoteLeaseInput["targets"];
   if (targets.length === 0) {
     // 出口腿没有目标等于一条永远不通的链路：拒绝，而不是发一条空配置上去。
-    return c.json(federationErrorBody("message_malformed", "apply 必须携带至少一个 target"), 400 as never);
+    return c.json(federationErrorBody("message_malformed", "apply 必须携带至少一个 target（link.targets）"), 400 as never);
   }
   const outcome = await applyRemoteLease({
     lease_ref: lease.lease_ref,
     intent_id: body.intent_id,
     revision: Number(body.revision),
     targets,
-    lb_strategy: typeof body.lb_strategy === "string" ? body.lb_strategy : null,
-    protocol: typeof body.protocol === "string" ? body.protocol : null,
+    lb_strategy:
+      typeof link.lb_strategy === "string" ? link.lb_strategy : typeof body.lb_strategy === "string" ? body.lb_strategy : null,
+    protocol: typeof link.protocol === "string" ? link.protocol : typeof body.protocol === "string" ? body.protocol : null,
     auditDirection: "inbound",
     messageId: ctx.messageId,
   });

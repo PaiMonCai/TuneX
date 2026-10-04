@@ -64,6 +64,17 @@ export function normalizeSelfUrl(raw: string): string {
 /** 默认信任范围：只允许"远端承载一跳链路"，其余能力必须显式授予。 */
 export const DEFAULT_TRUST_SCOPE = { hop_roles: ["egress"], can_request_leases: true } as const;
 
+/**
+ * 被撤销过的 peer 行的**归档 id**：`revoked:<原 panel_id 前 40 位>:<row id>`。
+ *
+ * 为什么不是直接删掉旧行：撤销/重签的历史要可查（谁在什么时候被信任过、又为什么被撤销）。
+ * 为什么不是让两条行共用 panel_id：那会让"按 panel_id 查当前信任"变成一次有歧义的查询 ——
+ * 而这个系统的所有安全判定都建立在"一查就有唯一答案"上。
+ */
+export function archivedPeerId(panelId: string, rowId: number): string {
+  return `revoked:${panelId.slice(0, 40)}:${rowId}`;
+}
+
 export class FederationTrustError extends Error {
   readonly code: FederationErrorCode;
   readonly status: number;
@@ -197,7 +208,18 @@ export async function handleHandshake(input: HandshakeRequest, now = new Date())
   if (peer.peer_panel_id !== input.peer_panel_id) {
     const clash = await db.federationPeer.findUnique({ where: { peer_panel_id: input.peer_panel_id } });
     if (clash && clash.id !== peer.id) {
-      throw new FederationTrustError("handshake_invalid", "该 panel_id 已经建立过信任");
+      // 撤销是终态，但**身份可以重建**：契约 §2.4 要求"重新信任必须重新走带外 token"。
+      // 旧行的唯一约束会挡住新握手，所以把旧行**降级为历史**（换一个带前缀的 id），
+      // 让当前信任行持有真实 panel_id。不可逆的是"旧的 key/grant 不得复活"，
+      // 不是"这个 panel 永远不能再被信任" —— 否则一次误撤销就是一次永久隔离。
+      if (clash.status === "revoked") {
+        await db.federationPeer.update({
+          where: { id: clash.id },
+          data: { peer_panel_id: archivedPeerId(clash.peer_panel_id, clash.id) },
+        });
+      } else {
+        throw new FederationTrustError("handshake_invalid", "该 panel_id 已经建立过信任");
+      }
     }
   }
 

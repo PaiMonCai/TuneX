@@ -384,6 +384,21 @@ adminFederationRoutes.get("/placements", async (c) => {
 
 adminFederationRoutes.get("/usage", async (c) => {
   const rows = await db.federationUsageRecord.findMany({ orderBy: { id: "desc" }, take: 200 });
+
+  // 为什么未归因：**由当前事实推导**，不是编造的码。
+  //
+  // 归因时算出的 reason 只进了日志（表里只有 attribution 字段）。与其让界面显示一个
+  // 猜出来的原因，不如给出可被读者自己验证的判据：这条 lease_ref 在本机还有没有 placement 行。
+  // 有 placement 却仍未归因 = 两侧说法冲突（那才是要人工看的那一类）；没有 = 本地根本没有它的轨迹。
+  const unattributedRefs = [...new Set(rows.filter((u) => u.attribution !== "attributed").map((u) => u.lease_ref))];
+  const placements = unattributedRefs.length
+    ? await db.federationPlacement.findMany({
+        where: { lease_ref: { in: unattributedRefs } },
+        select: { lease_ref: true },
+      })
+    : [];
+  const knownLeases = new Set(placements.map((p) => p.lease_ref).filter((r): r is string => typeof r === "string"));
+
   return c.json({
     data: rows.map((u) => ({
       usage_id: u.usage_id,
@@ -397,6 +412,10 @@ adminFederationRoutes.get("/usage", async (c) => {
       bytes_out: u.bytes_out.toString(),
       connections: u.connections,
       attribution: u.attribution,
+      /** 仅对未归因行给出；值是**可验证的判据**而不是猜测的原因码。 */
+      attribution_hint:
+        u.attribution === "attributed" ? null : knownLeases.has(u.lease_ref) ? "placement_conflict" : "no_local_placement",
+      received_at: u.received_at.toISOString(),
     })),
   });
 });

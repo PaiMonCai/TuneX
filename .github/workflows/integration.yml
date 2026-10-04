@@ -87,6 +87,17 @@ jobs:
       # before main ever sees the code.
       - name: Run V5-G4 multi-hop closure gate
         run: python3 scripts/v3-e2e/v5-g4.py
+      # V5.5 / Gate V5-G5: federation is a Panel-to-Panel boundary, so it needs a
+      # SECOND real panel (own database, own worker, own Node + Agent) plus
+      # bidirectional trust. The bootstrap script is idempotent.
+      #
+      # It runs LAST in this job on purpose: several G5 scenarios stop/start
+      # containers (partition simulation) and create remote leases, so nothing
+      # after it can assume the topology is untouched.
+      - name: Bootstrap second Panel and bidirectional federation trust
+        run: python3 scripts/v3-e2e/bootstrap-federation.py
+      - name: Run V5-G5 federation gate
+        run: python3 scripts/v3-e2e/v5-g5.py
       - name: Upload v3/v4/v5 integration evidence
         if: failure() || github.event_name == 'workflow_run'
         uses: actions/upload-artifact@v7

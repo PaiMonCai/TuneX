@@ -396,3 +396,70 @@ maybe("WP14 federation: 公布地址规范化（浏览器地址 ≠ 容器网络
   assert.ok(federationSelfUrl().length > 0);
   assert.equal(federationSelfUrl().endsWith("/"), false);
 });
+
+maybe("WP14 federation: 撤销后可以按契约 §2.4 重新走带外 token 重建信任", async () => {
+  await resetFederationTables();
+  await ensureIdentityForTest();
+  await setFederationEnabled(true);
+  const { applyInboundTrustRevoke } = await import("../src/services/federation/trust.ts");
+
+  // 第一轮：建信任
+  const invite1 = await createInvitation({ display_name: "面板 R", endpoint_url: "http://panel-r:3000" });
+  const keys1 = await generatePanelKeyPair();
+  const panelId = `${TEST_PEER_PREFIX}${crypto.randomUUID()}`;
+  const first = await req("/api/federation/v1/handshake", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      peer_panel_id: panelId,
+      key_id: keys1.key_id,
+      public_jwk: keys1.public_jwk,
+      display_name: "面板 R",
+      token: invite1.token,
+      endpoint_url: "http://panel-r:3000",
+    }),
+  });
+  assert.equal(first.status, 200);
+  const beforeRevoke = await signedPost("/api/federation/v1/ping", {}, keys1, panelId);
+  assert.equal(beforeRevoke.res.status, 200);
+
+  // 撤销（对端通知我们"它撤销了"）
+  await applyInboundTrustRevoke(panelId, "test_revoke");
+
+  // 撤销后旧密钥被拒
+  const afterRevoke = await signedPost("/api/federation/v1/ping", {}, keys1, panelId);
+  assert.equal(afterRevoke.res.status, 403);
+
+  // 第二轮：重新走带外 token（新密钥）必须能重建信任
+  const invite2 = await createInvitation({ display_name: "面板 R", endpoint_url: "http://panel-r:3000" });
+  const keys2 = await generatePanelKeyPair();
+  const second = await req("/api/federation/v1/handshake", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      peer_panel_id: panelId,
+      key_id: keys2.key_id,
+      public_jwk: keys2.public_jwk,
+      display_name: "面板 R",
+      token: invite2.token,
+      endpoint_url: "http://panel-r:3000",
+    }),
+  });
+  assert.equal(second.status, 200, "一次误撤销不应变成永久隔离：契约 §2.4 要求可以重新走带外 token");
+
+  // 新密钥可用
+  const withNew = await signedPost("/api/federation/v1/ping", {}, keys2, panelId);
+  assert.equal(withNew.res.status, 200);
+
+  // 旧密钥**不得**复活（不可逆的是 key，不是这个 panel 的未来）
+  const oldKeyAgain = await signedPost("/api/federation/v1/ping", {}, keys1, panelId);
+  assert.equal(oldKeyAgain.res.status, 401);
+  assert.equal((await oldKeyAgain.res.json()).code, "key_unknown");
+
+  // 历史被保留：旧行降级为 `revoked:` 前缀，而不是被删除
+  const archived = await db.federationPeer.findFirst({ where: { peer_panel_id: { startsWith: "revoked:" } } });
+  assert.ok(archived, "被撤销的 peer 行必须作为历史保留");
+  const current = await db.federationPeer.findUnique({ where: { peer_panel_id: panelId } });
+  assert.equal(current.status, "trusted");
+  assert.equal(current.public_keys.length, 1, "重建信任后只应持有新密钥，旧密钥不得复活");
+});

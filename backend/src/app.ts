@@ -60,6 +60,18 @@ import { adminFederationRoutes } from "./routes/admin-federation.ts";
 export function createApp() {
   const app = new Hono<{ Variables: AppVariables }>();
 
+  // V5.5 WP15：联邦的停服/撤销钩子必须是**进程级**的，不能只在 worker 里注册。
+  // trust 撤销走的是 panel 进程（管理员点撤销），而钩子只在 worker 注册时，
+  // panel 里的 revokedHook 是 null ⇒ 已 apply 的远端链路最多还会服务到 worker 下一拍
+  // （实测 ~26s），而契约 §2.4 要求的是"立即停止"。ensureFederationWiring 幂等。
+  try {
+    // 同步 import 会在模块图里拉进 orchestrator/portPool；这里用一次性同步调用是刻意的：
+    // 钩子必须在第一次联邦写请求之前就位，异步注册会留下一个真实的竞态窗口。
+    void import("./services/federation/lease.ts").then((m) => m.ensureFederationWiring());
+  } catch (e) {
+    console.error("[app] federation wiring failed:", e instanceof Error ? e.message : e);
+  }
+
   // ① 请求 IP 提取 + 结构化访问日志
   app.use("*", async (c, next) => {
     c.set("ip", extractIp(c.req.raw.headers));
