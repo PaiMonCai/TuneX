@@ -113,6 +113,44 @@ function shape(input: PlanRolloutInput): string[] {
 /* 1. RELAY CONP 铁律：prepare_egress 早于 cutover_ingress             */
 /* ------------------------------------------------------------------ */
 
+describe("RELAY 只换入口节点也必须准备出口（V5.3 round 19）", () => {
+  it("ingress_node_change 单独成立时，计划里必须有 prepare_egress", () => {
+    // 这是 failover 走的那条路：只换入口节点，出口一点没变。
+    // `prepare_egress` 是**唯一**登记出口可寻址 host 的地方，而铁律是"没有 next_hop 就不允许
+    // 启入口"。漏掉它 ⇒ resolveNextHop 返回 null ⇒ next_hop_unresolved ⇒ 入口 cutover 失败 ⇒
+    // 新主人永远不服务（forward_rollout#36 的 last_error 就是这句）。
+    const input = planInput({
+      desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),
+      impact: impact({ ingress_node_change: true, listener_replacement: true }),
+      nodes: {
+        ingress: NODE_INGRESS,
+        egress: NODE_EGRESS,
+        ingress_previous: null,
+        egress_previous: null,
+      },
+    });
+    const steps = shape(input);
+    expect(steps).toContain("prepare:prepare_egress");
+    // 而且顺序仍是铁律：出口准备必须早于入口切换。
+    expect(steps.indexOf("prepare:prepare_egress")).toBeLessThan(steps.indexOf("cutover:cutover_ingress"));
+  });
+
+  it("出口没变、入口也没重切时，不额外准备出口（避免每次 rollout 多一次下发）", () => {
+    const input = planInput({
+      desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),
+      impact: impact({ egress_target_change: true }),
+      nodes: {
+        ingress: NODE_INGRESS,
+        egress: NODE_EGRESS,
+        ingress_previous: null,
+        egress_previous: null,
+      },
+    });
+    // 只换池内目标：切换发生在 CUTOVER，PREPARE 无事可做（既有契约，不能被这次修复破坏）。
+    expect(shape(input).filter((x) => x.startsWith("prepare:prepare_egress"))).toHaveLength(0);
+  });
+});
+
 describe("RELAY ordering（§13.3.5 / orchestrator 铁律）", () => {
   it("prepare_egress 严格早于 cutover_ingress", () => {
     const input = planInput({

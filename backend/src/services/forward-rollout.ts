@@ -485,6 +485,19 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   if (relay) {
     const egressNode = nodes.egress;
     const egressIsNew = impact.egress_node_change || impact.mode_change;
+    // ── 入口要重切时，出口**必须再准备一次**（V5.3 round 19）──
+    //
+    // `prepare_egress` 是**唯一**登记出口可寻址 host 的地方（`recordNextHop` 用
+    // `dispatchEgress` 返回的 `egress_host`）。而铁律是"没有 next_hop 就不允许启入口"，所以
+    // **入口要重新 cutover 时，出口在哪可达必须被重新确认一次** —— 哪怕出口自身一点没变。
+    //
+    // 漏掉它会发生什么（实测，failover 走的就是这条）：只换入口节点的迁移不在原条件里 ⇒ 没有
+    // `prepare_egress` ⇒ 没有登记 host ⇒ `resolveNextHop` 返回 null ⇒ `next_hop_unresolved` ⇒
+    // 入口 cutover 失败 ⇒ **新主人永远不服务**（`forward_rollout#36` 的 `last_error` 就是这句）。
+    //
+    // 该步骤同 revision 幂等，因此重复准备是 no-op，代价只是一次下发。
+    const ingressWillRecut =
+      impact.ingress_node_change || impact.listener_replacement || impact.mode_change;
     if (egressIsNew) {
       // 新 pair：Binding 必须先存在（§13.3.1：新建显式、删除不自动）。
       if (input.binding_exists === false) {
@@ -509,6 +522,15 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
       });
     } else if (impact.egress_target_change) {
       // 同出口节点、只换池内目标：PREPARE 无事可做，切换发生在 CUTOVER。
+    } else if (ingressWillRecut) {
+      // 出口一点没变，但**入口要重切** ⇒ 仍然要准备出口：只为拿到它的可寻址 host，
+      // 否则入口的 next_hop 无法解析（这就是只换入口节点的迁移长期失败的原因）。
+      push("prepare", "prepare_egress", {
+        node_id: egressNode?.id ?? desired.egress_node_id,
+        direction: "egress",
+        port: desired.egress_port ?? null,
+        meta: { reason: "ingress_recut" },
+      });
     }
   }
 
