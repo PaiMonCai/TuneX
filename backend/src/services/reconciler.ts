@@ -108,6 +108,8 @@ export interface DesiredTunnel {
   egress_port?: number | null;
   ingress_node_id?: number | null;
   egress_node_id?: number | null;
+  /** V5.4：三跳路由的中间节点；null = V4 单跳 RELAY。 */
+  middle_node_id?: number | null;
   in_node_group_id?: number | null;
   /**
    * V5.3（round 6/7）—— reconcile 必须能比较**内容**，不只是"存在性与 revision"：
@@ -750,6 +752,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
           egress_port: true,
           ingress_node_id: true,
           egress_node_id: true,
+          middle_node_id: true,
           in_node_group_id: true,
           // V5.3（round 7）：内容漂移判定需要**期望内容**。只取 active 目标：
           // 停用的目标不参与转发，不该因为它们触发重发。
@@ -1060,49 +1063,62 @@ function pickAgentTunnel(
   const egressReport =
     t.egress_node_id == null ? undefined : reports.get(t.egress_node_id);
   const egress = egressReport?.tunnels.find((x) => x.id === runtimeId(t.id, "egress")) ?? null;
+  const middleReport =
+    t.middle_node_id == null ? undefined : reports.get(t.middle_node_id);
+  // Transit deliberately reuses the EGRESS runtime primitive and therefore the
+  // same resource id suffix. Node id disambiguates the concrete runtime.
+  const middle =
+    t.middle_node_id == null
+      ? null
+      : middleReport?.tunnels.find((x) => x.id === runtimeId(t.id, "egress")) ?? null;
 
-  // When desired is inactive, one leftover side is enough to flag
-  // unexpected_runtime. When desired is active, both sides are required.
+  // When desired is inactive, one leftover leg is enough to flag
+  // unexpected_runtime. When desired is active, EVERY concrete leg is required.
   if (!wantsActive(t)) {
-    const any = ingress ?? egress;
+    const any = ingress ?? middle ?? egress;
     if (!any) return null;
+    const revisions = [ingress?.revision, middle?.revision, egress?.revision]
+      .filter((v): v is number => typeof v === "number");
     return {
       id: String(t.id),
       mode: "relay",
       ingress_port: ingress?.ingress_port ?? null,
       egress_port: egress?.egress_port ?? null,
-      revision: Math.min(
-        ingress?.revision ?? Number.MAX_SAFE_INTEGER,
-        egress?.revision ?? Number.MAX_SAFE_INTEGER,
-      ),
+      revision: revisions.length > 0 ? Math.min(...revisions) : 0,
     };
   }
-  if (!ingress || !egress) return null;
+  if (!ingress || !egress || (t.middle_node_id != null && !middle)) return null;
 
   const ingressMode = String(ingress.mode ?? "").toLowerCase();
+  const middleMode = String(middle?.mode ?? "").toLowerCase();
   const egressMode = String(egress.mode ?? "").toLowerCase();
-  // A RELAY resource is healthy only when its two concrete runtimes have the
-  // expected roles. Preserve an unexpected runtime mode in the collapsed view
-  // so computeDrift can emit mode_mismatch instead of normalising the error away.
+  // A RELAY resource is healthy only when every concrete runtime has its
+  // expected role. In a three-hop route the middle runtime is EGRESS-shaped.
   const mode =
     ingressMode !== "" && ingressMode !== "relay"
       ? ingressMode
-      : egressMode !== "" && egressMode !== "egress"
-        ? egressMode
-        : "relay";
+      : middleMode !== "" && middleMode !== "egress"
+        ? middleMode
+        : egressMode !== "" && egressMode !== "egress"
+          ? egressMode
+          : "relay";
+
+  const revisions = [
+    ingress.revision ?? 0,
+    ...(middle ? [middle.revision ?? 0] : []),
+    egress.revision ?? 0,
+  ];
 
   return {
     id: String(t.id),
     mode,
-    // V5.3（round 7）：把 agent **已应用**的内容带出来供内容漂移判定使用。
+    // V5.3（round 7）：业务 target/health 仍属于最终出口，不把 transit 的
+    // 单一 next-hop 伪装成业务池内容。
     applied_pool_targets: appliedPoolTargets(egressReport, t.id),
     applied_target_health: appliedTargetHealth(egress),
     ingress_port: ingress.ingress_port ?? null,
     egress_port: egress.egress_port ?? null,
-    revision: Math.min(
-      ingress.revision ?? 0,
-      egress.revision ?? 0,
-    ),
+    revision: Math.min(...revisions),
   };
 }
 
@@ -1122,19 +1138,24 @@ function pickNode(
   if (t.egress_node_id == null) return null;
   const egress = nodeById.get(t.egress_node_id);
   if (!egress) return null;
+  const middle =
+    t.middle_node_id == null ? null : nodeById.get(t.middle_node_id) ?? null;
+  if (t.middle_node_id != null && !middle) return null;
 
-  const status =
-    ingress.status === "inactive" || egress.status === "inactive"
-      ? "inactive"
-      : "active";
+  const boundNodes = [ingress, ...(middle ? [middle] : []), egress];
+  const status = boundNodes.some((n) => n.status === "inactive")
+    ? "inactive"
+    : "active";
 
   const seen = (n: NodeOnlineInput): number | null => {
     const d = n.last_seen_at ?? n.reported_at ?? null;
     return d ? new Date(d).getTime() : null;
   };
-  const a = seen(ingress);
-  const b = seen(egress);
-  const oldest = a == null || b == null ? null : new Date(Math.min(a, b));
+  const seenValues = boundNodes.map(seen);
+  const oldest =
+    seenValues.some((v) => v == null)
+      ? null
+      : new Date(Math.min(...(seenValues as number[])));
   // V4-WP5 §13.4.2：lifecycle 必须随折叠视图带出去。漏了它，
   // `executeReconcile` 的 `nodeInMaintenance` 对 RELAY 恒为 false（DIRECT 走
   // 上面的 early return 所以不受影响），维护中的入口/出口节点会被照样下发新
@@ -1142,14 +1163,15 @@ function pickNode(
   // 禁止的行为。**任一侧 maintenance 就按维护处理**：RELAY 的新 runtime 要同时
   // 落在两侧，只放行一侧等于把半态写进数据面。其余 lifecycle 取值原样投影
   // （planTunnelActions 只认 maintenance，disabled / retiring 的处理另属编排层）。
-  const anyMaintenance =
-    ingress.lifecycle === "maintenance" || egress.lifecycle === "maintenance";
+  const anyMaintenance = boundNodes.some((n) => n.lifecycle === "maintenance");
 
   return {
     node_id: ingress.node_id,
     status,
     last_seen_at: oldest,
     reported_at: oldest,
-    lifecycle: anyMaintenance ? "maintenance" : (ingress.lifecycle ?? egress.lifecycle ?? null),
+    lifecycle: anyMaintenance
+      ? "maintenance"
+      : (ingress.lifecycle ?? middle?.lifecycle ?? egress.lifecycle ?? null),
   };
 }
