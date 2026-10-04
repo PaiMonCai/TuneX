@@ -2002,6 +2002,37 @@ placement lease（每个 Forward 一行）
 | 6 | 结构前提（目的地存在/在线、epoch 可读） | 与六条件分开成 `preconditions` ✅ 对：它们不是"策略判断"，是"能不能谈" |
 | 7 | 两阶段交接不在此模块 | ✅ 对：模块看不见租约，只输出 `(expected_epoch, next_epoch)` 供调用方 CAS；租约侧由 `claimLease` 强制，两者在调用方汇合 |
 
+#### 三·补二：WP8/WP9 落地位置与遗留
+
+**已实现（提交可见）**
+
+~~~text
+agent/internal/ownership/     fence（持久化高水位，agent-id 键、原子写）+ guard（激活闸门）+ deadline（租约时钟）
+agent/internal/targetdns/     TTL 缓存解析器（单飞、上下限、失败回退上一份好地址并带年龄）
+agent/internal/manager/       闸门装在 manager 上：Apply / ReplaceListener / 快照 / 启动恢复 / 本地管理面**同一实现**
+agent/internal/reporter/      状态上报响应里的续约回程（逐条容错解码；空数组只表示"没有新信息"）
+backend/placement-lease.ts    租约表与服务；backend 侧认领在**与 epoch 附着同一处**（调用方不可能忘记）
+~~~
+
+**两条来自实现者的面板侧缺陷（都已修）**
+
+1. **TTL 与上报周期相等**（30s == 30s）：截止时刻恰好落在下一次上报**发出**的瞬间，而续约
+   要等往返回来。于是每个周期都有一个窗口，那一刻租约**确实**已过期 —— Agent 的扫描忠实地
+   看到并停掉隧道（每隧道每周期 1~10%）。已改为 **90s = 3 × 周期**，并且测试断言的是规则
+   （`>= 3 × 上报周期`）而不是数字。
+2. **假过期是否会粘住**：不会 —— reconcile 的重发走 `dispatchDirect`/`dispatchIngress`，
+   两者现在先认领，而**现任认领会无条件续约**（包括已过期的租约），因此重发的配置带的是
+   新截止时刻，而不是 Agent 会正确拒绝的旧截止时刻。这一条是**读代码验证**的，不是假设。
+
+**已知边界（如实记录）**
+
+- 租约过期即停意味着：面板失联超过一个 TTL 后，从 LKG 缓存恢复的节点在面板回来之前**不服务**。
+  这是 §8 冻结的 fail-safe 方向（"可能还有另一个主人"比"短暂中断"更危险），但它**确实**改变了
+  可用性权衡，需要让运维知道（§13.3 的缓存便利被有意压过）；
+- DIRECT/RELAY 的 `remote_host` 仍由 Go dialer 每次拨号解析（本阶段范围是出口目标）；同一套
+  缓存的注入点已经留好（`SingleHopForwarder` 的 dial）；
+- stdlib 读不到 DNS 记录 TTL，所以使用"策略 TTL + 上下限"并在常量处注明这是**偏差**。
+
 #### 四、V5.3 的 Gate（G3）要证明的
 
 `hard disconnect` / `soft timeout` / `short flap` / `node restart` / `Panel restart` /
