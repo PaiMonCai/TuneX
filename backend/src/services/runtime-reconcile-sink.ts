@@ -88,6 +88,11 @@ export interface SinkTunnel {
   egress_pool_id: number | null;
   ingress_node: (OrchestratorNode & { node_group_id: number }) | null;
   egress_node: (OrchestratorNode & { node_group_id: number; lb_strategy?: string | null }) | null;
+  /** V5.4：三跳路由的中间节点；null = 单跳。 */
+  middle_node_id?: number | null;
+  middle_node?: (OrchestratorNode & { node_group_id: number }) | null;
+  /** 物理端口仍以 NodePortLease 为唯一真相；middle listener 从这里恢复。 */
+  port_leases?: Array<{ node_id: number; port: number; status: string }>;
   egress_pool: { lb_strategy?: string | null; targets: SinkEgressTarget[] } | null;
 }
 
@@ -152,6 +157,11 @@ export function createTunnelLedger(loadDb: () => Promise<ReconcileSinkDb> = pris
         include: {
           ingress_node: true,
           egress_node: true,
+          middle_node: true,
+          port_leases: {
+            where: { status: "active" },
+            select: { node_id: true, port: true, status: true },
+          },
           egress_pool: {
             include: {
               targets: {
@@ -202,10 +212,10 @@ export function createTunnelLedger(loadDb: () => Promise<ReconcileSinkDb> = pris
 /* Sink                                                                */
 /* ================================================================== */
 
-/** 下发通道（只要 orchestrator 的三个 dispatch 方法，便于替身收窄）。 */
+/** 下发通道：三跳重发还需要唯一的 transit 原语。 */
 export type SinkOrchestrator = Pick<
   Orchestrator,
-  "dispatchDirect" | "dispatchEgress" | "dispatchIngress"
+  "dispatchDirect" | "dispatchEgress" | "dispatchIngress" | "dispatchTransit"
 >;
 
 export interface RuntimeReconcileSinkDeps {
@@ -235,7 +245,8 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
     const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
     const invalidScope = !validId(tunnel.workspace_id) || !validId(tunnel.user_id) ||
       !validId(tunnel.ingress_node?.node_group_id) ||
-      (tunnel.tunnel_mode === "relay" && !validId(tunnel.egress_node?.node_group_id));
+      (tunnel.tunnel_mode === "relay" && !validId(tunnel.egress_node?.node_group_id)) ||
+      (tunnel.middle_node_id != null && !validId(tunnel.middle_node?.node_group_id));
     const denied: RuntimeUseDenied | null = invalidScope
       ? { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或实际节点组已失效" }
       : await runtimeUse(tunnel.workspace_id, {
@@ -350,22 +361,50 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
       const host = firstHost(tunnel.egress_node.connect_ip);
       if (!host) throw new Error(`egress node ${tunnel.egress_node.id} has no connect_ip`);
 
+      let ingressNextHop = nextHop(host, tunnel.egress_port);
+      if (tunnel.middle_node_id != null) {
+        if (!tunnel.middle_node) {
+          throw new Error(`RELAY tunnel ${tunnel_id} middle node ${tunnel.middle_node_id} is missing`);
+        }
+        const middleLeases = (tunnel.port_leases ?? []).filter(
+          (lease) => lease.node_id === tunnel.middle_node_id && lease.status === "active",
+        );
+        if (middleLeases.length !== 1) {
+          throw new Error(
+            `RELAY tunnel ${tunnel_id} middle node ${tunnel.middle_node_id} active lease count=${middleLeases.length}`,
+          );
+        }
+        const middlePort = middleLeases[0]!.port;
+        // 正向仍是先远后近：final egress ACK → middle ACK → ingress ACK。
+        // 只有三条腿都确认后，下面的 CAS 才能把 applied_revision 记成成功。
+        const transit = await orchestrator.dispatchTransit({
+          tunnelId: tunnel.id,
+          revision,
+          node: tunnel.middle_node,
+          port: middlePort,
+          nextHop: nextHop(host, tunnel.egress_port),
+          protocol: relayFacts.protocol,
+        });
+        if (!transit.ok) throw new Error(transit.error);
+        ingressNextHop = nextHop(transit.host, middlePort);
+      }
+
       await assertRuntimeUse(tunnel, revision);
       const ingress = await orchestrator.dispatchIngress({
         tunnelId: tunnel.id,
         revision,
         ingressNode: tunnel.ingress_node,
         ingressPort: tunnel.listen_port,
-        nextHop: nextHop(host, tunnel.egress_port),
+        nextHop: ingressNextHop,
         protocol: relayFacts.protocol,
         tlsCertPath: relayFacts.tlsCertPath,
         tlsKeyPath: relayFacts.tlsKeyPath,
       });
       if (!ingress.ok) throw new Error(ingress.error);
 
-      // RELAY 要**两侧都 ACK** 才算这个 revision 应用成功（与 §13.3.5 的
-      // CUTOVER 判定同源：入口切断就绪前不能宣称 applied；半途失败不记账，
-      // 下一轮重发同一 revision，Agent 对等版本回 duplicate，天然幂等）。
+      // RELAY 要**所有实际腿都 ACK** 才算这个 revision 应用成功：单跳是
+      // egress+ingress，三跳则是 egress+middle+ingress。任何半途失败都不记账，
+      // 下一轮仍以同 revision 幂等重发。
       await ledger.markApplied({ tunnelId: tunnel.id, revision, at: now() });
     },
   };
