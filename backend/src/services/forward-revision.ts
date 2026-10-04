@@ -48,6 +48,13 @@ export interface ForwardCandidateConfig {
   ingress_node_id: number;
   /** direct 必须 null；relay 必填。 */
   egress_node_id: number | null;
+  /**
+   * V5.4：三跳路由的中间跳。`null` = 单跳（V4 行为，绝大多数行）。
+   *
+   * 它与入出口是同一类事实（运行时放置），因此必须参与 current / merge / metadata-only
+   * 三处比较 —— 只改它也必须产生新 revision 与 rollout。
+   */
+  middle_node_id?: number | null;
   /** NULL = 「自动分配」（与创建 contract 同义）。 */
   listen_port: number | null;
   /** direct 目标；relay 可为 null（目标在 egress targets 里）。 */
@@ -83,6 +90,8 @@ export interface ForwardRevisionRow {
   tls_key_path?: string | null;
   ingress_node_id: number | null;
   egress_node_id: number | null;
+  /** V5.4：中间跳（NULL = 单跳）。 */
+  middle_node_id?: number | null;
   ingress_node: { id: number; node_id: string; role: string | null } | null;
   egress_node: { id: number; node_id: string; role: string | null } | null;
   egress_pool: { id: number; node_id: number } | null;
@@ -231,6 +240,10 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
     ingress_node_id: row.ingress_node_id ?? 0,
     egress_node_id: row.egress_node_id ?? null,
+    // V5.4：中间跳是**运行时放置事实**，和入出口同类 —— 所以它必须出现在 current / merge /
+    // metadata-only 三处比较里。漏掉它与 V5-WP5-A1 漏掉 tls 路径是同一个 bug：
+    // PATCH 只改中间跳时会被判成"纯 metadata"，只写 name 就返回 200，而路由一个字节没变。
+    middle_node_id: row.middle_node_id ?? null,
     // 注意：这里取**请求值**语义的表格。存量行没有 snapshot，listen_port 列
     // 存的是编排后落地的 concrete port，无法与「用户请求自动」区分——按
     // 「当前占用」处理比按「自动」处理安全（不会把 fixed port 偷偷改成 auto）。
@@ -259,6 +272,7 @@ export function mergeForwardCandidate(
     ingress_node_id:
       patch.ingress_node_id !== undefined ? patch.ingress_node_id : base.ingress_node_id,
     egress_node_id: patch.egress_node_id !== undefined ? patch.egress_node_id : base.egress_node_id,
+    middle_node_id: patch.middle_node_id !== undefined ? patch.middle_node_id : base.middle_node_id,
     listen_port: patch.listen_port !== undefined ? patch.listen_port : base.listen_port,
     target_host: patch.target_host !== undefined ? patch.target_host : base.target_host,
     target_port: patch.target_port !== undefined ? patch.target_port : base.target_port,
@@ -274,6 +288,7 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     persistedForwardProtocol(base.protocol) === persistedForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
     base.egress_node_id === candidate.egress_node_id &&
+    (base.middle_node_id ?? null) === (candidate.middle_node_id ?? null) &&
     base.listen_port === candidate.listen_port &&
     (base.target_host ?? "") === (candidate.target_host ?? "") &&
     (base.target_port ?? null) === (candidate.target_port ?? null) &&

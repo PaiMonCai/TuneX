@@ -52,6 +52,8 @@ const BASE_CONFIG: ForwardCandidateConfig = {
   protocol: "tcp",
   ingress_node_id: 11,
   egress_node_id: null,
+  // V5.4：中间跳也是候选的一部分（与 tls 路径同理）—— 单跳的规范 fixture 里它是 null。
+  middle_node_id: null,
   listen_port: 19001,
   target_host: "10.0.0.10",
   target_port: 8080,
@@ -451,6 +453,9 @@ describe("F. snapshot 契约形状", () => {
       "egress_node_id",
       "ingress_node_id",
       "listen_port",
+      // V5.4：中间跳是运行时放置事实（谁承载这条路由），因此与入出口一样属于不可变
+      // runtime snapshot —— 少了它，重放出来的路由会与被批准的那一条不同。
+      "middle_node_id",
       "mode",
       "name",
       "protocol",
@@ -630,5 +635,45 @@ describe("V5.1b：udp 是 DIRECT-only，且 tls 路径属于运行态配置", ()
     expect(isMetadataOnlyPatch(tlsBase, rotated)).toBe(false);
     // 只改名字仍然是 metadata-only（V4 的老规则没被动过）。
     expect(isMetadataOnlyPatch(tlsBase, mergeForwardCandidate(tlsBase, { name: "renamed" }))).toBe(true);
+  });
+});
+
+/**
+ * V5.4：中间跳必须与入出口**同类对待** —— 它参与 current / merge / metadata-only 三处比较。
+ *
+ * 漏掉它与 V5-WP5-A1 漏掉 tls 路径是同一个 bug：PATCH 只改中间跳时会被判成"纯 metadata"，
+ * 只写 name 就返回 200，而**路由一个字节没变**（症状是"保存了但不生效"）。
+ */
+describe("V5.4：中间跳是运行时放置事实，不是 metadata", () => {
+  test("只改中间跳**不是** metadata-only：必须产生新 revision 与 rollout", () => {
+    expect(
+      isMetadataOnlyPatch(
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21 },
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21, middle_node_id: 31 },
+      ),
+    ).toBe(false);
+  });
+
+  test("去掉中间跳也不是 metadata-only（那是一次真实的路由变更）", () => {
+    expect(
+      isMetadataOnlyPatch(
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21, middle_node_id: 31 },
+        { ...BASE_CONFIG, mode: "relay", egress_node_id: 21, middle_node_id: null },
+      ),
+    ).toBe(false);
+  });
+
+  test("存量行（没有中间跳）抽出来的 desired 是 null —— V4 行为不变", () => {
+    expect(currentDesiredConfig(row()).middle_node_id).toBeNull();
+  });
+
+  test("中间跳可以通过 patch 合并进去，未提交时沿用当前值", () => {
+    const withMiddle = mergeForwardCandidate(
+      { ...BASE_CONFIG, mode: "relay", egress_node_id: 21 },
+      { middle_node_id: 31 },
+    );
+    expect(withMiddle.middle_node_id).toBe(31);
+    const untouched = mergeForwardCandidate(withMiddle, { name: "renamed" });
+    expect(untouched.middle_node_id).toBe(31);
   });
 });

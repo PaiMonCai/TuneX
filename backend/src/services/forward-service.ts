@@ -83,6 +83,11 @@ export interface ForwardCreateInput {
   tls_key_path?: string | null;
   ingress_node_id: number;
   egress_node_id?: number | null;
+  /**
+   * V5.4：三跳路由的中间跳（省略 = 单跳）。给了它就意味着入口 → 中间 → 出口，
+   * 且相邻两段都必须已有 NodeBinding（校验在创建/更新路径上统一做）。
+   */
+  middle_node_id?: number | null;
   listen_port?: number | null;
   target_host: string;
   target_port: number;
@@ -102,6 +107,8 @@ export interface ForwardPatchInput {
   mode?: ForwardMode;
   ingress_node_id?: number;
   egress_node_id?: number | null;
+  /** V5.4：中间跳（`null` = 回到单跳）。与入出口同类：改它会触发新 revision 与 rollout。 */
+  middle_node_id?: number | null;
   listen_port?: number | null;
   target_host?: string | null;
   target_port?: number | null;
@@ -685,17 +692,37 @@ export async function createForward(
   }
 
   if (egress) {
-    const binding = await db.nodeBinding.findUnique({
-      where: {
-        ingress_node_id_egress_node_id: {
-          ingress_node_id: ingress.id,
-          egress_node_id: egress.id,
+    // V5.4：三跳路由的两段邻接是 (入口→中间) 与 (中间→出口)，而 (入口→出口) 那条
+    // **不被使用** —— 只查后者会让三跳路由在没有许可的情况下被创建出来，然后在下发时才炸。
+    const middleId = input.middle_node_id ?? null;
+    if (middleId != null) {
+      const pairs = await db.nodeBinding.findMany({
+        where: {
+          OR: [
+            { ingress_node_id: ingress.id, egress_node_id: middleId },
+            { ingress_node_id: middleId, egress_node_id: egress.id },
+          ],
         },
-      },
-      select: { id: true },
-    });
-    if (!binding) {
-      return error(409, "binding_required", "该出口尚未绑定到当前入口节点");
+        select: { ingress_node_id: true, egress_node_id: true },
+      });
+      const ok1 = pairs.some((b) => b.ingress_node_id === ingress.id && b.egress_node_id === middleId);
+      const ok2 = pairs.some((b) => b.ingress_node_id === middleId && b.egress_node_id === egress.id);
+      if (!ok1 || !ok2) {
+        return error(409, "binding_required", "三跳路由要求入口→中间、中间→出口两段都已绑定");
+      }
+    } else {
+      const binding = await db.nodeBinding.findUnique({
+        where: {
+          ingress_node_id_egress_node_id: {
+            ingress_node_id: ingress.id,
+            egress_node_id: egress.id,
+          },
+        },
+        select: { id: true },
+      });
+      if (!binding) {
+        return error(409, "binding_required", "该出口尚未绑定到当前入口节点");
+      }
     }
   }
 
@@ -770,6 +797,8 @@ export async function createForward(
           tunnel_mode: input.mode,
           ingress_node_id: ingress.id,
           egress_node_id: egress?.id ?? null,
+          // V5.4：三跳路由的中间跳（省略 = 单跳）。创建路径直接用 `input`（候选尚未构建）。
+          middle_node_id: input.middle_node_id ?? null,
           desired_status: "inactive",
           apply_status: "pending",
           config_revision: 0,
@@ -943,6 +972,9 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
+          // V5.4：中间跳与入出口同类 —— patch 里给了就落库，没给就沿用候选里的当前值
+          // （候选由 `mergeForwardCandidate` 合并，因此"没提交"永远是"不变"）。
+          middle_node_id: candidate.middle_node_id ?? null,
           // V5-WP5-A1: the tls paths are part of the desired configuration, so a
           // patch that changes them must persist them — and a patch that leaves
           // them out must not silently drop them (the candidate carries the
@@ -1178,7 +1210,7 @@ async function resolveForwardCandidate(
   }
 
   // 需要读库的上下文：节点归属/能力、端口占用、NodeBinding、端口区间。
-  const [ingress, egress, binding, portHolders, siblings] = await Promise.all([
+  const [ingress, egress, binding, middleNode, middleBindings, portHolders, siblings] = await Promise.all([
     loadWorkspaceNode(candidate.ingress_node_id, workspaceId),
     candidate.egress_node_id === null
       ? Promise.resolve(null)
@@ -1194,6 +1226,23 @@ async function resolveForwardCandidate(
           select: { id: true },
         })
       : Promise.resolve(null),
+    // V5.4：中间跳的节点事实 + **两段**许可。三跳路由用到的两条邻接是
+    // (入口 → 中间) 与 (中间 → 出口)，而旧的 (入口 → 出口) 那条**不再被使用**
+    // （§9 冻结契约第 3 条：相邻两跳之间必须有绑定）。
+    candidate.mode === "relay" && candidate.middle_node_id != null
+      ? loadWorkspaceNode(candidate.middle_node_id, workspaceId)
+      : Promise.resolve(null),
+    candidate.mode === "relay" && candidate.middle_node_id != null && candidate.egress_node_id !== null
+      ? db.nodeBinding.findMany({
+          where: {
+            OR: [
+              { ingress_node_id: candidate.ingress_node_id, egress_node_id: candidate.middle_node_id },
+              { ingress_node_id: candidate.middle_node_id, egress_node_id: candidate.egress_node_id },
+            ],
+          },
+          select: { ingress_node_id: true, egress_node_id: true },
+        })
+      : Promise.resolve([]),
     candidate.listen_port === null
       ? Promise.resolve([])
       : db.nodePortLease.findMany({
@@ -1214,6 +1263,23 @@ async function resolveForwardCandidate(
   }
   if (candidate.mode === "relay" && !egress) {
     return { ok: false, error: error(404, "not_found", "出口节点不存在") };
+  }
+  // V5.4：三跳的中间跳必须存在，且**两段**邻接都必须有许可。缺任何一段都拒绝 ——
+  // 放行的后果是一条"中间那一段没有许可"的链路，它会在下发时才炸，且错误指向不了根因。
+  if (candidate.mode === "relay" && candidate.middle_node_id != null) {
+    if (!middleNode) return { ok: false, error: error(404, "not_found", "中间跳节点不存在") };
+    const hasIngressToMiddle = middleBindings.some(
+      (b) => b.ingress_node_id === candidate.ingress_node_id && b.egress_node_id === candidate.middle_node_id,
+    );
+    const hasMiddleToEgress = middleBindings.some(
+      (b) => b.ingress_node_id === candidate.middle_node_id && b.egress_node_id === candidate.egress_node_id,
+    );
+    if (!hasIngressToMiddle || !hasMiddleToEgress) {
+      return {
+        ok: false,
+        error: error(409, "binding_required", "三跳路由要求入口→中间、中间→出口两段都已绑定"),
+      };
+    }
   }
 
   // ── V4-WP5 §13.4.2：把 Forward（迁移）到新节点前先过准入 ──
