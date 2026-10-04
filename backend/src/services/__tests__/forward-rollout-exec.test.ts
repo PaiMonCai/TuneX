@@ -385,6 +385,7 @@ function impact(overrides: Partial<ForwardImpact> = {}): ForwardImpact {
     listener_replacement: false,
     ingress_node_change: false,
     egress_node_change: false,
+    middle_node_change: false,
     mode_change: false,
     target_change: false,
     egress_target_change: false,
