@@ -394,7 +394,7 @@ describe("策略分类与步骤集合（§13.3.4 判定表）", () => {
     ]);
   });
 
-  it("换入口节点 ⇒ node_migration，drain/cleanup 指向旧节点", () => {
+  it("换入口节点 ⇒ node_migration，先 handoff 旧 owner 再 cutover 新入口", () => {
     const input = planInput({
       desired: snapshot({ ingress_node_id: NODE_INGRESS_B.id }),
       applied: snapshot(),
@@ -410,11 +410,11 @@ describe("策略分类与步骤集合（§13.3.4 判定表）", () => {
     expect(steps.map((s) => `${s.phase}:${s.kind}`)).toEqual([
       "validate:validate",
       "prepare:acquire_port",
+      "cutover:handoff_ingress_owner",
       "cutover:cutover_ingress",
-      "drain:drain_ingress",
       "cleanup:release_old_lease",
     ]);
-    expect(steps.find((s) => s.phase === "drain")!.node_id).toBe(NODE_INGRESS.id);
+    expect(steps.find((s) => s.kind === "handoff_ingress_owner")!.node_id).toBe(NODE_INGRESS.id);
     expect(steps.find((s) => s.phase === "cleanup")!.node_id).toBe(NODE_INGRESS.id);
     expect(steps.find((s) => s.phase === "prepare")!.node_id).toBe(NODE_INGRESS_B.id);
   });
