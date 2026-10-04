@@ -30,6 +30,7 @@ import { authenticateNode } from "../services/node-credential.ts";
 import {
   buildReconnectSnapshot,
   extractBearerCredential,
+  renewOwnedLeases,
   submitStateReport,
 } from "../services/node-state.ts";
 import {
@@ -204,6 +205,20 @@ internalNodeRoutes.post("/node/ack", async (c) => {
 internalNodeRoutes.get("/node/desired", async (c) => {
   const auth = await authedNode(c.req.header("authorization"));
   if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
+
+  // V5.3 WP9 —— startup restore 也是一次“现任 owner 还活着”的强证明。
+  //
+  // Agent reinstall / 长时间离线后，旧 ownership lease 可能已经过期。若先构建
+  // desired snapshot，再等随后的 /node/state 才续约，快照会把**过期 deadline**
+  // 发给刚启动的 Agent；ownership guard 会正确地拒绝/停掉 runtime。后续 heartbeat
+  // 虽然把 DB lease 续上，却不会凭空重建已经没起来的 listener，表现为“控制面 online，
+  // 数据面不恢复”（V4-F2.37）。
+  //
+  // 这里只续约**本节点已经持有**的 lease；renewOwnedLeases 不会抢别人的 owner，
+  // 因而不会绕过两阶段 fencing。存储失败仍 fail-soft：快照带旧 deadline，
+  // Agent fail-closed，牺牲可用性但不制造双主。
+  await renewOwnedLeases(auth.node_id, new Date());
+
   const snapshot = await buildDesiredNodeSnapshot(auth.node_id);
   return c.json({ data: { snapshot } });
 });
