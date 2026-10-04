@@ -7,7 +7,7 @@
  */
 import { describe, expect, test } from "bun:test";
 
-import { isLeaseExpired, LEASE_RENEW_MARGIN_SECONDS, LEASE_TTL_SECONDS, type PlacementLeaseRow } from "../placement-lease.ts";
+import { isLeaseExpired, LEASE_TTL_SECONDS, type PlacementLeaseRow } from "../placement-lease.ts";
 
 const NOW = new Date("2026-10-04T12:00:00Z");
 const lease = (over: Partial<PlacementLeaseRow> = {}): PlacementLeaseRow => ({
@@ -34,11 +34,15 @@ describe("V5.3 WP9: lease expiry is the two-phase handover gate", () => {
     expect(isLeaseExpired(null, NOW)).toBe(true);
   });
 
-  test("the TTL is long enough that one report cycle cannot expire a serving owner", () => {
-    // 与 Agent 上报/观测周期同频是刻意的：一次正常上报就能覆盖续约，
-    // 连续三次失败才真的到期。TTL 短于上报周期会让面板抖一下就把 owner 自己停掉。
-    expect(LEASE_TTL_SECONDS).toBeGreaterThanOrEqual(30);
-    expect(LEASE_RENEW_MARGIN_SECONDS).toBeLessThan(LEASE_TTL_SECONDS);
+  test("the TTL is a MULTIPLE of the report cadence, not equal to it", () => {
+    // 这条断言来自一个真实的集成缺陷：第一版把 TTL 设成与上报周期相同（30s），于是截止
+    // 时刻恰好落在下一次上报**发出**的瞬间，而续约要等往返之后才回到 Agent —— 每个周期
+    // 都有一个窗口，那一刻租约**确实**已过期，Agent 会忠实地停掉隧道。
+    //
+    // 所以这里断言的**不是**"≥ 上报周期"，而是"≥ 上报周期的 3 倍"：一次上报丢失不该
+    // 让 owner 自停，连续三次丢失才该。Agent 的上报/观测周期是 30s（§7 冻结）。
+    const AGENT_REPORT_INTERVAL_SECONDS = 30;
+    expect(LEASE_TTL_SECONDS).toBeGreaterThanOrEqual(3 * AGENT_REPORT_INTERVAL_SECONDS);
   });
 });
 
