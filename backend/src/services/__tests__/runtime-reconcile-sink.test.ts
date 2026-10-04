@@ -81,6 +81,9 @@ function makeTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
     egress_pool_id: null,
     ingress_node: { id: 11, node_id: "F2-A", connect_ip: "127.0.0.1", role: "both", node_group_id: 10 },
     egress_node: null,
+    middle_node_id: null,
+    middle_node: null,
+    port_leases: [],
     egress_pool: null,
     writes: [],
     ...over,
@@ -99,6 +102,22 @@ function makeRelayTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
     egress_pool_id: 7,
     egress_node: { id: 12, node_id: "F2-B", connect_ip: "10.0.0.9", role: "egress", node_group_id: 20, lb_strategy: "round" },
     egress_pool: { lb_strategy: "round", targets: [egressTarget()] },
+    ...over,
+  });
+}
+
+/** 三跳 RELAY：入口 11 → middle 13:32000 → 出口 12:31000。 */
+function makeThreeHopTunnel(over: Partial<SinkTunnel> = {}): TunnelRow {
+  return makeRelayTunnel({
+    middle_node_id: 13,
+    middle_node: {
+      id: 13,
+      node_id: "F2-M",
+      connect_ip: "10.0.0.13",
+      role: "egress",
+      node_group_id: 30,
+    },
+    port_leases: [{ node_id: 13, port: 32000, status: "active" }],
     ...over,
   });
 }
@@ -151,8 +170,17 @@ function makeDb(rows: TunnelRow[]): ReconcileSinkDb {
 }
 
 /** 记录下发调用、失败可控的 orchestrator 替身。 */
-function makeOrchestrator(opts: { egressOk?: boolean; ingressOk?: boolean; directOk?: boolean } = {}) {
-  const calls: Array<{ kind: "direct" | "egress" | "ingress"; revision: number; tunnelId: number }> = [];
+function makeOrchestrator(
+  opts: { egressOk?: boolean; transitOk?: boolean; ingressOk?: boolean; directOk?: boolean } = {},
+) {
+  const calls: Array<{
+    kind: "direct" | "egress" | "transit" | "ingress";
+    revision: number;
+    tunnelId: number;
+    nextHop?: string;
+    nodeId?: number;
+    port?: number;
+  }> = [];
   const ok = (revision: number, commandId: string) => ({
     ok: true as const,
     result: { commandId, revision, ack: {} as never },
@@ -172,8 +200,28 @@ function makeOrchestrator(opts: { egressOk?: boolean; ingressOk?: boolean; direc
         ? fail("ack_timeout", "egress ack timeout")
         : { ...ok(input.revision, "c-egress"), egress_host: "10.0.0.9", egress_port: input.egressPort }) as never;
     },
+    dispatchTransit: async (input) => {
+      calls.push({
+        kind: "transit",
+        revision: input.revision,
+        tunnelId: input.tunnelId,
+        nextHop: input.nextHop,
+        nodeId: input.node.id,
+        port: input.port,
+      });
+      return (opts.transitOk === false
+        ? fail("ack_timeout", "transit ack timeout")
+        : { ...ok(input.revision, "c-transit"), host: "10.0.0.13", port: input.port }) as never;
+    },
     dispatchIngress: async (input) => {
-      calls.push({ kind: "ingress", revision: input.revision, tunnelId: input.tunnelId });
+      calls.push({
+        kind: "ingress",
+        revision: input.revision,
+        tunnelId: input.tunnelId,
+        nextHop: input.nextHop,
+        nodeId: input.ingressNode.id,
+        port: input.ingressPort,
+      });
       return (opts.ingressOk === false
         ? fail("ack_timeout", "ingress ack timeout")
         : ok(input.revision, "c-ingress")) as never;
@@ -253,6 +301,22 @@ describe("A. 同-revision 重发成功后必须推进 applied_revision", () => {
     expect(isRevisionBehind(row)).toBe(false);
   });
 
+  it("V5.4 三跳 RELAY：egress → middle → ingress 全部 ACK 后才记账", async () => {
+    const row = makeThreeHopTunnel();
+    const { sink, calls } = sinkFor([row]);
+    await sink.resendSameRevision({ tunnel_id: 1, revision: 3, envelope: null });
+
+    expect(calls.map((x) => x.kind)).toEqual(["egress", "transit", "ingress"]);
+    expect(calls.find((x) => x.kind === "transit")).toMatchObject({
+      nodeId: 13,
+      port: 32000,
+      nextHop: "10.0.0.9:31000",
+    });
+    expect(calls.find((x) => x.kind === "ingress")?.nextHop).toBe("10.0.0.13:32000");
+    expect(row.applied_revision).toBe(3);
+    expect(row.writes).toHaveLength(1);
+  });
+
   it("RELAY：出口 + 入口都 ACK 之后才记账，且只记一次", async () => {
     const row = makeRelayTunnel();
     const { sink, calls } = sinkFor([row]);
@@ -275,6 +339,35 @@ describe("B. 没有真实 ACK 就绝不记账", () => {
     await expect(sink.resendSameRevision({ tunnel_id: 1, revision: 3, envelope: null })).rejects.toThrow();
     expect(row.applied_revision).toBe(1);
     expect(row.writes).toHaveLength(0);
+  });
+
+  it("V5.4 middle ACK 失败 ⇒ 不打 ingress、不记账", async () => {
+    const row = makeThreeHopTunnel();
+    const { sink, calls } = sinkFor([row], { transitOk: false });
+    await expect(
+      sink.resendSameRevision({ tunnel_id: 1, revision: 3, envelope: null }),
+    ).rejects.toThrow(/transit ack timeout/);
+    expect(calls.map((x) => x.kind)).toEqual(["egress", "transit"]);
+    expect(row.applied_revision).toBe(1);
+    expect(row.writes).toHaveLength(0);
+  });
+
+  it("V5.4 middle lease 不唯一/缺失 ⇒ fail closed，绝不绕过 middle 直打 egress", async () => {
+    for (const leases of [
+      [],
+      [
+        { node_id: 13, port: 32000, status: "active" },
+        { node_id: 13, port: 32001, status: "active" },
+      ],
+    ]) {
+      const row = makeThreeHopTunnel({ port_leases: leases });
+      const { sink, calls } = sinkFor([row]);
+      await expect(
+        sink.resendSameRevision({ tunnel_id: 1, revision: 3, envelope: null }),
+      ).rejects.toThrow(/active lease count/);
+      expect(calls.map((x) => x.kind)).toEqual(["egress"]);
+      expect(row.writes).toHaveLength(0);
+    }
   });
 
   it("RELAY 入口失败（出口已 ACK）⇒ 不记账，下一轮同 revision 重试", async () => {
