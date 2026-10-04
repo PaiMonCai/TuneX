@@ -417,6 +417,37 @@ async function loadBoundPairs(db: RolloutDb): Promise<ReadonlySet<string>> {
   return new Set((rows ?? []).map((b) => `${b.ingress_node_id}->${b.egress_node_id}`));
 }
 
+/**
+ * 释放**旧的归属租约**（V5.3 round 21）。
+ *
+ * 背景：一个节点不再承载某条 Forward 之后，它**可能还持有那条 Forward 的归属租约**。这不是无害的
+ * 残留 —— 它会让每一条修复路径都撞上两阶段规则：reconcile 的重发会为**放置节点**认领归属，而旧租约
+ * 未过期 ⇒ 认领被正确地拒绝 ⇒ **重发永远失败**。实测症状：`tunnel.ingress_node_id=3`、
+ * `placement_lease.owner_node_id=5`，DB 显示 `active/applied` 而两台节点都不服务，
+ * 且没有任何自动机制能打破它（"账本说好、事实说坏"，round 15 记下、round 21 才复现并定性）。
+ *
+ * 为什么可以在这里安全地释放：这一步（`release_old_lease`）**正是在旧 runtime 已经被撤掉之后**执行的
+ * —— 迁移计划里 `drain_ingress` 先把它摘掉，CLEANUP 才轮到释放。两阶段规则要防的"旧主人还在服务"
+ * 在这里已经不成立，而"旧主人仍占着归属"恰恰是必须清掉的东西。
+ *
+ * 只在该旧节点**不再是当前放置节点**时才释放：同节点换端口的场景由上面的 `sameNodeListenerMove`
+ * 处理，那里 Forward 并没有搬走。
+ */
+async function releaseStalePlacementLease(
+  deps: RolloutDeps,
+  ctx: RolloutExecContext,
+  oldNodeId: number,
+): Promise<void> {
+  if (ctx.desired.ingress_node_id === oldNodeId) return;
+  try {
+    const { releaseLease: releasePlacementLease } = await import("./placement-lease.ts");
+    await releasePlacementLease({ tunnelId: ctx.tunnelId, nodeId: oldNodeId, now: deps.now?.() ?? new Date() });
+  } catch {
+    // 尽力而为：CLEANUP 阶段不该因为归属释放失败而整条 rollout 判失败。留在那里的旧租约会自然过期
+    // （TTL），下一轮 reconcile 就能认领 —— 届时的行为与"等待过期"一致。
+  }
+}
+
 async function loadRolloutNodes(
   tunnelId: number,
   deps: { db: RolloutDb },
@@ -944,9 +975,11 @@ async function runStep(
       // 这是幂等成功，不得退回按 tunnelId 全量释放：那会把 PREPARE 刚拿到、
       // 当前 runtime 正在使用的新端口 lease 一并释放，制造账本/runtime 分叉。
       if (oldLeaseId === null) {
+        await releaseStalePlacementLease(deps, ctx, nodeId);
         return { ok: true, note: `lease ${nodeId}:${step.port ?? "?"} 已释放（幂等）` };
       }
       const released = await releaseLease({ leaseId: oldLeaseId }, { db: deps.db as never });
+      await releaseStalePlacementLease(deps, ctx, nodeId);
       return {
         ok: true,
         note: released
