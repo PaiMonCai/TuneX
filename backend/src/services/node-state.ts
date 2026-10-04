@@ -678,19 +678,21 @@ function normalizeManifestColumn(
  * 为什么不在这里 claim：认领意味着"我打算承载它"，那是编排决策（rollout PREPARE），
  * 不是上报的副作用。上报只能说"我还在"，而"我还在"正是续约的语义。
  */
-export async function renewOwnedLeases(
-  nodeId: number,
-  tunnelIds: readonly number[],
-  now: Date,
-): Promise<LeaseFact[]> {
-  if (tunnelIds.length === 0) return [];
+export async function renewOwnedLeases(nodeId: number, now: Date): Promise<LeaseFact[]> {
+  // **续约失败绝不影响上报本身**：上报是节点的主要职责（遥测/健康/隧道列表全靠它），
+  // 而续约是面板侧的记账。让一次租约存储抖动把上报打成 500，会用一个次要功能拖垮主要功能。
+  // 失败时返回空数组 = "这次没有新的归属信息"，Agent 保持它已有的截止时刻。
+  try {
+    return await renewOwnedLeasesUnsafe(nodeId, now);
+  } catch {
+    return [];
+  }
+}
+
+async function renewOwnedLeasesUnsafe(nodeId: number, now: Date): Promise<LeaseFact[]> {
   const extended = new Date(now.getTime() + LEASE_TTL_SECONDS * 1000);
   const result = await db.placementLease.updateMany({
-    where: {
-      tunnel_id: { in: [...tunnelIds] },
-      owner_node_id: nodeId,
-      lease_expires_at: { gt: now },
-    },
+    where: { owner_node_id: nodeId },
     data: { lease_expires_at: extended },
   });
   if (result.count === 0) return [];
@@ -701,7 +703,7 @@ export async function renewOwnedLeases(
   // 上制造一次全量中断。这是本阶段实现者发现并上报的真实集成缺口。
   return db.placementLease
     .findMany({
-      where: { tunnel_id: { in: [...tunnelIds] }, owner_node_id: nodeId },
+      where: { owner_node_id: nodeId },
       select: { tunnel_id: true, epoch: true, lease_expires_at: true, revision: true },
     })
     .then((rows) => rows.map((r) => ({
@@ -873,13 +875,15 @@ export async function submitStateReport(
   // 一个节点上报它正在服务的隧道，就是它仍在承载这些 Forward 的最好证据，所以续约挂在这条
   // 既有节拍上，而不是新开一个心跳通道（第二条时间真相）。续不上（或别人是 owner）时**什么
   // 都不做**：抢别人的归属必须走显式的两阶段交接，不能靠"报告里提到了它"。
-  const renewedLeases = await renewOwnedLeases(
-    auth.node_id,
-    (report.tunnels ?? [])
-      .map((t) => Number(String((t as { id?: unknown }).id ?? "").match(/^tunex-(\d+)-/)?.[1] ?? 0))
-      .filter((id) => Number.isInteger(id) && id > 0),
-    reportedAt,
-  );
+  // V5.3 WP9（round 6 修正）：续约**不依赖"被服务方上报了它"**。
+  //
+  // 第一版按"上报的隧道"续约，于是出现一个自锁：栅栏停掉隧道 → agent 不再上报它 →
+  // 续约永远续不到 → 租约一直过期 → 隧道一直停（实测落后 83s 且不恢复）。
+  // 正确的语义是：**一次上报证明的是"这个节点"还活着**，而面板知道它**持有**哪些租约；
+  // 只要它还活着，它手里的租约就该被续上（否则"租约到期即停"会退化成"一次抖动永久停服务"）。
+  //
+  // 注意这不会让"该停的隧道停不下来"：停一条隧道靠的是配置/remove 命令，不是靠让租约烂掉。
+  const renewedLeases = await renewOwnedLeases(auth.node_id, reportedAt);
 
   // ── V5.2 WP5：目标观测投影 ──
   //

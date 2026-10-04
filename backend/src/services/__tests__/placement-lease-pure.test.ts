@@ -72,3 +72,29 @@ describe("V5.3 WP9: the renewal must travel back to the agent", () => {
     expect(src).toContain("leases: result.leases");
   });
 });
+
+/**
+ * V5.3 WP9（round 6 修正）—— 续约的依据是**节点活着**，不是"它上报了那条隧道"。
+ *
+ * 第一版按上报的隧道续约，于是自锁：栅栏停掉隧道 → agent 不再上报它 → 续约永远续不到 →
+ * 租约一直过期 → 隧道一直停（实测落后 83s 且不恢复）。
+ *
+ * 这里钉住的是**契约文本**（连库行为由 Gate 覆盖）：`renewOwnedLeases` 只接受 nodeId 与时间，
+ * 不再有"tunnelIds"这个参数 —— 一旦有人把那个参数加回来，这个测试就该失败，因为那意味着
+ * 自锁有可能被重新引入。
+ */
+describe("V5.3 WP9: renewal follows liveness, not the reported tunnnels", () => {
+  test("the renewal signature takes only the node and the clock", async () => {
+    const src = await Bun.file(new URL("../node-state.ts", import.meta.url)).text();
+    expect(src).toContain("export async function renewOwnedLeases(nodeId: number, now: Date)");
+    // 旧的"按上报隧道续约"参数不得回归。
+    expect(src).not.toContain("tunnelIds: readonly number[]");
+  });
+
+  test("renewal is fail-soft: a lease-store problem must not break the report", async () => {
+    const src = await Bun.file(new URL("../node-state.ts", import.meta.url)).text();
+    // 上报是节点的主要职责；续约是面板侧记账。让次要功能把主要功能打成 500 是错的取舍。
+    expect(src).toContain("renewOwnedLeasesUnsafe");
+    expect(src).toContain("return [];");
+  });
+});
