@@ -651,6 +651,14 @@ export type NodeReport = {
   /** Agent 自称正在运行的隧道。 */
   tunnels: AgentTunnelState[];
   last_error?: string | null;
+  /**
+   * Agent 自报的池视图（`{ "<tunnelId>": { targets: ["host:port", ...] } }`）。
+   *
+   * V5.3：**内容漂移判定需要它**。第一版没把它从上报里取出来，于是
+   * `applied_pool_targets` 恒为 null、"缺事实不判漂移"的保护让内容漂移永不触发 ——
+   * 表现就是 `resent: 0` 一直不变，而池可能已经空了。
+   */
+  egress_pools?: Record<string, { targets?: unknown }> | null;
 };
 
 export interface ReconcileDeps {
@@ -780,13 +788,27 @@ export function defaultReconcileDeps(): ReconcileDeps {
       // key 用 node.id 而非上报里的字符串 node_id：DB 外键全走主键。
       const { db } = await import("../db.ts");
       const rows = await db.nodeStateReport.findMany({
-        select: { node_id: true, reported_at: true, tunnels: true, last_error: true },
+        select: {
+          node_id: true,
+          reported_at: true,
+          tunnels: true,
+          last_error: true,
+          egress_pools: true,
+        },
       });
-      const map = new Map<number, { reported_at: Date | null; tunnels: AgentTunnelState[]; last_error: string | null }>();
+      const map = new Map<number, NodeReport>();
       for (const r of rows) {
         const raw = r.tunnels;
         const list = Array.isArray(raw) ? (raw as unknown as AgentTunnelState[]) : [];
-        map.set(r.node_id, { reported_at: r.reported_at ?? null, tunnels: list, last_error: r.last_error ?? null });
+        map.set(r.node_id, {
+          reported_at: r.reported_at ?? null,
+          tunnels: list,
+          last_error: r.last_error ?? null,
+          egress_pools:
+            r.egress_pools && typeof r.egress_pools === "object" && !Array.isArray(r.egress_pools)
+              ? (r.egress_pools as Record<string, { targets?: unknown }>)
+              : null,
+        });
       }
       return map;
     },

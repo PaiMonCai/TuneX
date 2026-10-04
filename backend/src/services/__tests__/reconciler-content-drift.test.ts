@@ -95,3 +95,27 @@ describe("V5.3: content drift (existence is not enough)", () => {
     expect(actions[0]?.revision).toBe(5);
   });
 });
+
+/**
+ * V5.3（round 7）—— 内容漂移的**输入必须真的被读出来**。
+ *
+ * 第一版写好了判定，却没把 agent 上报的 `egress_pools` 从库里取出来，于是
+ * `applied_pool_targets` 恒为 null、"缺事实不判漂移"的保护让新判定**永不触发** ——
+ * 症状是 `resent: 0` 一直不变（实测就是这样），而池可能已经空了。
+ * 这与本项目其它几次"实现了但没接线"完全同类。
+ */
+describe("V5.3: the drift check's INPUTS are wired", () => {
+  test("the report carries the agent's pool view, not only its tunnel list", async () => {
+    const src = await Bun.file(new URL("../reconciler.ts", import.meta.url)).text();
+    // 上报投影必须包含 egress_pools，否则内容漂移永远看不到"已应用的池"。
+    expect(src).toContain("egress_pools: true");
+    expect(src).toContain("egress_pools:");
+  });
+
+  test("the desired side carries the pool targets, active only", async () => {
+    const src = await Bun.file(new URL("../reconciler.ts", import.meta.url)).text();
+    expect(src).toContain("desired_pool_targets");
+    // 停用目标不参与转发，不该因为它们触发重发。
+    expect(src).toContain('t.status === "active"');
+  });
+});
