@@ -511,3 +511,51 @@ func TestSnapshotDecoderKnowsTargetHealth(t *testing.T) {
 		t.Fatalf("no entries must decode to nil (no signal), got %v", got)
 	}
 }
+
+// V5.4 —— 裁剪必须同时覆盖**出口侧**的 runtime。
+//
+// 实测缺陷：`Reconcile` 只遍历 `TunnelManager.IDs()`，而在纯出口节点上那个集合是空的
+// （出口 runtime 活在 `EgressManager` 的池表里）⇒ 一条在节点离线期间被删除的 Forward，
+// 它的出口 runtime 永远裁不掉，一直占着监听端口。面板分配器查数据库租约，于是把那个端口
+// 又发出去，Agent 正确地拒绝每一次 apply —— 症状看起来像"端口分配有 bug"。
+func TestReconcilePrunesEgressPoolsOnAnEgressOnlyNode(t *testing.T) {
+	ctx := context.Background()
+	egress := manager.NewEgressManager()
+	tunnels := manager.NewTunnelManager(egress, "127.0.0.1")
+
+	// 一个"纯出口节点"：tunnel manager 里什么都没有，出口池里有一个权威集合之外的 id。
+	egress.SetPool("tunex-272-egress", manager.RoundRobin, []forwarder.Target{
+		{Host: "target-a", Port: 3030, Weight: 1, Order: 10},
+	})
+	// 权威期望里只有另一个 id。
+	snap := &Snapshot{Tunnels: []forwarder.TunnelConfig{{ID: "tunex-2-egress"}}}
+
+	removed := Reconcile(ctx, tunnels, egress, snap)
+
+	if len(removed) != 1 || removed[0] != "tunex-272-egress" {
+		t.Fatalf("expected the orphan egress pool to be pruned, got removed=%v", removed)
+	}
+	if ids := egress.IDs(); len(ids) != 0 {
+		t.Fatalf("expected no pools left, got %v", ids)
+	}
+}
+
+// 权威集合里的出口池**不得**被裁掉（否则每次重连都会把在跑的转发拆掉）。
+func TestReconcileKeepsEgressPoolsThatAreStillWanted(t *testing.T) {
+	ctx := context.Background()
+	egress := manager.NewEgressManager()
+	tunnels := manager.NewTunnelManager(egress, "127.0.0.1")
+	egress.SetPool("tunex-2-egress", manager.RoundRobin, []forwarder.Target{
+		{Host: "target-a", Port: 3030, Weight: 1, Order: 10},
+	})
+	snap := &Snapshot{Tunnels: []forwarder.TunnelConfig{{ID: "tunex-2-egress"}}}
+
+	removed := Reconcile(ctx, tunnels, egress, snap)
+
+	if len(removed) != 0 {
+		t.Fatalf("a wanted egress pool must survive reconcile, removed=%v", removed)
+	}
+	if ids := egress.IDs(); len(ids) != 1 || ids[0] != "tunex-2-egress" {
+		t.Fatalf("expected the pool to survive, got %v", ids)
+	}
+}
