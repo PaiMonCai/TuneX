@@ -120,7 +120,7 @@ export interface ForwardImpact {
   ingress_node_change: boolean;
   egress_node_change: boolean;
   /** V5.4：中间跳增加 / 删除 / 换节点。它不换 listener，但一定会改变 RELAY next_hop。 */
-  middle_node_change: boolean;
+  middle_node_change?: boolean;
   mode_change: boolean;
   /** target host/port 热换（旧连接保持、新连接走新目标）。 */
   target_change: boolean;
