@@ -748,6 +748,9 @@ model ForwardRevision {
   protocol String @default("tcp") @db.VarChar(16)
   ingress_node_id Int
   egress_node_id  Int?
+  /// V5.4：该 revision 的中间跳放置事实。NULL = 单跳。
+  /// 不加 FK：revision snapshot 是历史事实；节点删除不能改写过去的路由。
+  middle_node_id  Int?
   /// 用户请求的监听端口；NULL = 「自动分配」。与创建 contract 同义：
   /// 编排器会在 apply 时落到 concrete port 并写回 tunnel.listen_port，
   /// 但 snapshot 保留的是**请求值**，才能还原「用户当时要自动还是指名」。
