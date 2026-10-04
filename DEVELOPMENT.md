@@ -2375,6 +2375,32 @@ ingress → middle/egress → target
 
 ### Gate V5-G4
 
+**执行结果：PASS=25 / FAIL=0**（2026-10-05，PR #30 四 Agent Integration）。
+
+本次 merge-closure 同一 HEAD 还验证了：
+
+~~~text
+V4 REST     PASS=67  FAIL=0
+V4 S10      PASS=58  FAIL=0
+V4 F1       PASS=32  FAIL=0
+V4 F2       PASS=37  FAIL=0
+V4 F3       PASS=21  FAIL=0
+V4 F4       PASS=58  FAIL=0
+V4 F5       PASS=133 FAIL=0
+V5 G0       PASS=137 FAIL=0
+V5 G4       PASS=25  FAIL=0
+~~~
+
+G4 关闭时额外确认的 durability 事实：
+
+- `middle_node_id` 进入 immutable Forward revision snapshot，拓扑编辑不会丢失旧/新 middle 事实；
+- 3-hop → 1-hop 会重新切 ingress、撤旧 transit runtime、释放旧 middle 端口租约；
+- middle Agent / ingress Agent 重启都从 desired snapshot 恢复**同一条三跳路径**，不会静默退化成单跳；
+- compensation 与 reconcile 都认识 middle，三跳重放顺序为 egress → middle → ingress；
+- V5.3 ownership fencing 与 V4 ingress migration 已统一为显式 handoff：先撤旧入口并释放旧 owner，再激活新入口；
+- 长时间离线 / reinstall 时，现任 owner 在 startup desired snapshot 前续约自己的 lease，恢复不会因过期 deadline 自锁；
+- UDP DIRECT 已是正式能力（G1B=76/0），因此 G0 manifest 正确包含 `udp` + `datagram`；UDP RELAY 仍按产品边界 fail-closed。
+
 至少：
 
 - 2-hop；
@@ -2686,19 +2712,35 @@ Known Boundaries:
 # 17. 当前下一步
 
 ~~~text
-已完成：V5.0（G0=137/0）→ V5.1a WS/TLS（G1A=73/0）→ V5.1b B1 UDP DIRECT（G1B=76/0）
-进行中：V5.2 Target Intelligence —— 契约已冻结（§7），WP5 观测 / WP6 合成在实现
-阻塞中：V5.1b B2 UDP RELAY（跨节点跳形态待产品决策，当前语义是"必须被拒绝"）
-        V5.1c QUIC（待依赖决策：引入库 / vendor / 契约层关闭 / 推迟，见 §6.3）
-待开始：V5.2 WP7 + Gate G2 → V5.3 WP8/WP9/WP10 + G3 → V5.4 WP11/WP12/WP13 + G4
-        → V5.5 WP14/WP15/WP16 + G5
+已完成：
+V5.0   G0  = 137/0
+V5.1a  G1A = 73/0
+V5.1b  G1B = 76/0（UDP DIRECT）
+V5.2   G2  = 23/0
+V5.3   G3  = 50/0
+V5.4   G4  = 25/0
+
+当前 merge-closure：
+PR #30 的 CI 全绿；
+同一 HEAD 的 V4 F1–F5、V5 G0、V5 G4 全绿；
+G4 已作为 PR Integration 的硬门禁执行，不再依赖手工证据。
+
+仍阻塞 / 明确不开放：
+V5.1b B2 UDP RELAY —— 跨节点 datagram 形态仍待产品决策，当前必须拒绝；
+V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭。
+
+下一阶段：
+V5.5 Federation。先冻结 trust / grant / remote lease / quota / usage /
+revocation / partition / reconcile 的 ownership 与 authority 边界，再进入 WP14–WP16；
+G5 关闭前不得标记 production-ready。
+~~~
 
 下一阶段的可执行顺序：
-1. 落地 V5.2 WP5（agent 观测 + 面板投影）与 WP6（纯合成 + 集中阈值）并各自提交
-2. 写 WP5/WP6 稳定 Gate；通过后进入 WP7（熔断 + 健康感知 LB）
-3. 跑 Gate V5-G2（含"desired 列表永不被遥测改写"）
-4. V5.3 先冻结 fencing 契约（split brain 是最高风险项），再动代码
-~~~
+
+1. 先冻结 V5.5 Federation 的 authority/ownership 契约，不直接写跨 Panel 资源代码；
+2. 冻结 credential issuance / rotate / revoke、remote lease 与 quota reservation；
+3. 再实现 WP14 → WP15 → WP16，并为 partition / duplicate / reorder / reconnect 建 G5；
+4. 保持 UDP RELAY、QUIC 与其它 V5.x optional 能力关闭，直到各自产品契约和独立 Gate 成立。
 
 **禁止跳过 Gate、禁止用 skip 掩盖、禁止为了赶进度删 V4 Integration Gate。**
 
@@ -2747,7 +2789,12 @@ CI/Integration/Release
 
 V5 的成功标准不是“支持的协议字符串更多”，而是：
 
-> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 33：诊断缺口已关闭（G4 23/2），剩余两条各自定性**
+> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。
+> **历史记录说明（2026-10-05）**：以下 `round 33` 及更早内容仅用于追溯调试过程，
+> 已被 §9.3 的 **G4=25/0** 与 §17 的当前状态取代。不得把其中的 `23/2`、`进行中`、
+> `下一轮` 等文字当作当前开发状态；当前真相只看上面的 Gate 结果与“当前下一步”。
+
+**round 33（历史）：诊断缺口关闭时 G4=23/2，后续已在 merge-closure 收敛到 25/0**
 
 **关闭的产品缺口**：`POST /forwards/:id/diagnose` 现在把三跳路由**拆成两段**
 （`ingress_to_middle` + `middle_to_egress` ✅ 每段各自点名两端节点与各自期望的 runtime ✅）。
