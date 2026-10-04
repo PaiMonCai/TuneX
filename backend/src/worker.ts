@@ -180,6 +180,33 @@ const worker = new Worker(
           }
           return { evaluated: r.evaluated, moved: r.moved, held: r.held };
         };
+        // V5.5 WP16：联邦的周期收口。顺序在**本地 reconcile 之后**：先修好本机能修的东西，
+        // 再处理跨面板的到期/停服/对账。每一拍都返回可打印的汇总 —— 上一阶段反复学到的
+        // 教训是"决策不留痕的机制与从未运行过的机制无法区分"。
+        let federationSummary: Record<string, number> | null = null;
+        try {
+          const { runFederationReconcile } = await import("./services/federation/lease.ts");
+          const fed = await runFederationReconcile();
+          federationSummary = {
+            evaluated: fed.evaluated,
+            expired: fed.expired,
+            tore_down: fed.tore_down,
+            teardown_failed: fed.teardown_failed,
+            ports_released: fed.ports_released,
+            ports_pending: fed.ports_pending,
+            grants_expired: fed.grants_expired,
+            placements_resent: fed.resent,
+            revoked_cleaned: fed.revoked_cleaned,
+            revoked_teardown_failed: fed.revoked_teardown_failed,
+          };
+          // 只在有事发生时打印：空闲的联邦不该刷屏，但"有事"必须留痕。
+          const busy = Object.entries(federationSummary).some(([k, v]) => k !== "evaluated" && v > 0);
+          if (busy) console.log("[worker] federation reconcile:", JSON.stringify(federationSummary));
+        } catch (e) {
+          // 联邦失败绝不阻断本地 reconcile（与之对称：本地失败也不该让联邦停摆）。
+          console.error("[worker] federation reconcile failed:", e instanceof Error ? e.message : e);
+        }
+
         const r = await executeReconcile(deps);
         const summary = {
           scanned: r.scanned,
@@ -205,7 +232,7 @@ const worker = new Worker(
             }
           }
         }
-        return summary;
+        return { ...summary, federation: federationSummary };
       }
       default:
         return { note: "cron handler not yet implemented", ms: Date.now() - started };
@@ -242,6 +269,15 @@ async function main() {
     } catch {
       await new Promise((r) => setTimeout(r, 2000));
     }
+  }
+  // V5.5 WP15：联邦的依赖接线（停服钩子 / 撤销钩子 / 端口钩子）必须在任何一拍
+  // 联邦 reconcile 之前完成 —— 否则"到期停服"会因为没有停服钩子而变成一次静默失败。
+  try {
+    const { ensureFederationWiring } = await import("./services/federation/lease.ts");
+    ensureFederationWiring();
+    console.log("[worker] federation wiring ready");
+  } catch (e) {
+    console.error("[worker] federation wiring failed:", e instanceof Error ? e.message : e);
   }
   await registerSchedules();
   console.log("[worker] ready");

@@ -26,6 +26,8 @@ export interface AppVariables {
   user?: NonNullable<AuthedUser>;
   ip?: string;
   workspace?: import("../services/workspace.ts").WorkspaceAccess;
+  /** V5.5 WP14：入站联邦请求的 peer 身份（只有 federationAuth 中间件会写）。 */
+  federation?: import("../middlewares/federation-auth.ts").FederationContext;
 }
 
 /** 统一加载用户（含 admin_roles） */
@@ -65,6 +67,11 @@ const NO_AUTH_PATTERNS: RegExp[] = [
   // 宽匹配 `.*` 是有意的：将来 `/api/internal/node/:id/...` 之类的派生
   // 端点同样按节点凭据认证，不需要回来改白名单；真实身份判定在 handler。
   /^\/api\/internal\/.*/,
+  // V5.5 WP14：联邦 Panel↔Panel 端点（`/api/federation/v1/*`）。与节点机器端点同层：
+  // 免**用户**认证，但绝不免**身份** —— 身份是已建立信任的 peer Panel 的 Ed25519
+  // 签名，判定在 `middlewares/federation-auth.ts` 与 `services/federation/signing.ts`。
+  // 必须在这里短路：否则 peer 的每一次调用都会先被用户认证挡成 401。
+  /^\/api\/federation\/.*/,
   /^\/api\/tunnel\/subscription$/,
   /^\/api\/system\/config\/site$/,
   /^\/api\/license(\/.*)?$/,

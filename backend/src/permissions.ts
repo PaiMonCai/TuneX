@@ -48,6 +48,11 @@ export const ADMIN_RESOURCES: AdminResource[] = [
   { key: "settings", label: "系统设置", group: "系统", url: "/admin/settings", business: false, apiPrefixes: ["/admin/system/config"] },
   { key: "license", label: "License 管理", group: "系统", url: "/admin/license", business: false, apiPrefixes: ["/admin/license"] },
   { key: "audit", label: "审计日志", group: "系统", url: "/admin/audit-logs", business: false, apiPrefixes: ["/admin/audit-logs"] },
+  // V5.5 WP14：联邦（Panel↔Panel 信任 / 授予 / 远端租约 / 用量）。
+  // 只属于 Admin Console：普通用户永远看不到 trust / grant / lease 概念（§9.4.1）。
+  // 用独立的资源键而不是挂到 "nodes" 上：联邦是跨安装的安全边界，
+  // 「能看节点」与「能建立跨面板信任」不该是同一种授权。
+  { key: "federation", label: "联邦", group: "联邦", url: "/admin/federation", business: false, apiPrefixes: ["/admin/federation"] },
 ];
 
 export const ADMIN_RESOURCE_KEYS: string[] = ADMIN_RESOURCES.map((r) => r.key);

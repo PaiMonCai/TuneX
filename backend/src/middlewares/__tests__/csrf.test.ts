@@ -90,8 +90,8 @@ describe("checkCsrf — 豁免路径", () => {
     }
   });
 
-  test("CSRF_EXEMPT_PATTERNS 集合（机器端点豁免：支付回调/观测/订阅/流量上报/node state）", () => {
-    expect(CSRF_EXEMPT_PATTERNS).toHaveLength(5);
+  test("CSRF_EXEMPT_PATTERNS 集合（机器端点豁免：支付回调/观测/订阅/流量上报/node state/federation）", () => {
+    expect(CSRF_EXEMPT_PATTERNS).toHaveLength(6);
     expect(CSRF_EXEMPT_PATTERNS[0]?.test("/api/pay/any-channel/callback")).toBe(true);
     expect(CSRF_EXEMPT_PATTERNS[1]?.test("/api/tunnel/observer")).toBe(true);
     expect(CSRF_EXEMPT_PATTERNS[2]?.test("/api/tunnel/traffic")).toBe(true);
@@ -99,10 +99,16 @@ describe("checkCsrf — 豁免路径", () => {
     // WP7：节点状态上报/快照走 Bearer 节点凭据，同属非浏览器机器端点。
     expect(CSRF_EXEMPT_PATTERNS[4]?.test("/api/internal/node/state")).toBe(true);
     expect(CSRF_EXEMPT_PATTERNS[4]?.test("/api/internal/node/snapshot")).toBe(true);
+    // V5.5 WP14：联邦端点是 peer Panel 到 peer Panel 的机器调用（无 cookie、无 Origin），
+    // 身份由 Ed25519 签名保证 —— 与上面几类同理，CSRF 模型不适用。
+    expect(CSRF_EXEMPT_PATTERNS[5]?.test("/api/federation/v1/handshake")).toBe(true);
+    expect(CSRF_EXEMPT_PATTERNS[5]?.test("/api/federation/v1/trust/revoke")).toBe(true);
     // 反锚定：多一段 / 少一段都不算豁免（防路径前缀误放行）
     for (const bad of ["/api/tunnel/traffics", "/api/tunnel/traffic/1", "/api/tunnel/subscribe"]) {
       for (const p of CSRF_EXEMPT_PATTERNS) expect(p.test(bad)).toBe(false);
     }
+    // 联邦的锚定：不能因为前缀相同就放行一个不存在的兄弟路径族
+    expect(CSRF_EXEMPT_PATTERNS[5]?.test("/api/federationX")).toBe(false);
   });
 });
 

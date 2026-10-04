@@ -411,6 +411,12 @@ export type RouteDispatchOutcome =
 
 export interface DispatchEgressInput {
   tunnelId: number;
+  /**
+   * V5.5 WP15：覆盖运行时 id。本地 Forward 不传（用 `tunex-<tunnelId>-egress`）；
+   * 联邦远端腿传 `Orchestrator.federatedTunnelId(leaseRef, "egress")`，
+   * 避免与 host 上同号的本地 Forward 撞 id。**additive、可选**：不传时行为与今天逐字节一致。
+   */
+  runtimeId?: string;
   revision: number;
   /** 出口节点（bind 阶段选出）。 */
   egressNode: OrchestratorNode;
@@ -477,6 +483,8 @@ export type EgressDispatchOutcome = EgressDispatchSuccess | DispatchFailure;
 
 export interface RemoveTunnelInput {
   tunnelId: number;
+  /** V5.5 WP15：见 `DispatchEgressInput.runtimeId`（联邦远端腿用 `fed-` 命名空间）。 */
+  runtimeId?: string;
   /** 在哪台节点上撤。 */
   node: OrchestratorNode;
   /** 明确 runtime 方向；不能再根据 Node.role 猜，BOTH 节点会猜错。 */
@@ -633,6 +641,20 @@ export class Orchestrator {
     return `tunex-${tunnelId}-direct`;
   }
 
+  /**
+   * V5.5 WP15 —— **联邦远端腿**的运行时 id：`tunex-fed-<leaseRef>-<direction>`。
+   *
+   * 为什么需要单独命名空间：host 侧承载的是一个远端 Forward 的一条腿，它**没有**本地
+   * Forward 行，所以不能借用 `tunnel.id` —— 同一台 host 上"本地隧道 11"与"联邦租约 11"
+   * 会算出同一个 `tunex-11-egress`，Agent 的 `map[id]` 会互相覆盖（BOTH 节点上尤其致命）。
+   * `fed-` 前缀把两类资源在**运行时 id 这一层**分开，而不是靠"数字应该不会撞"的假设。
+   *
+   * 分段与本地腿完全一致（direct/relay/egress），因此 Agent 侧不需要认识"联邦"这个概念。
+   */
+  static federatedTunnelId(leaseRef: string, direction: "direct" | "relay" | "egress"): string {
+    return `tunex-fed-${leaseRef}-${direction}`;
+  }
+
   /* ---------------------------------------------------------------- */
   /* 线性路由的下发（V5.4 WP12）                                        */
   /* ---------------------------------------------------------------- */
@@ -647,6 +669,8 @@ export class Orchestrator {
    */
   async dispatchTransit(input: {
     tunnelId: number;
+    /** V5.5 WP15：见 `DispatchEgressInput.runtimeId`。 */
+    runtimeId?: string;
     revision: number;
     node: OrchestratorNode;
     port: number;
@@ -664,6 +688,7 @@ export class Orchestrator {
     }
     const outcome = await this.dispatchEgress({
       tunnelId: input.tunnelId,
+      runtimeId: input.runtimeId,
       revision: input.revision,
       egressNode: input.node,
       egressPort: input.port,
@@ -883,7 +908,7 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
 
   async dispatchEgress(input: DispatchEgressInput): Promise<EgressDispatchOutcome> {
-    const egressId = Orchestrator.egressTunnelId(input.tunnelId);
+    const egressId = input.runtimeId ?? Orchestrator.egressTunnelId(input.tunnelId);
     const resourceId = egressId;
     const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
@@ -1138,11 +1163,12 @@ export class Orchestrator {
    */
   async removeTunnel(input: RemoveTunnelInput): Promise<RelayDispatchOutcome> {
     const id =
-      input.direction === "egress"
+      input.runtimeId ??
+      (input.direction === "egress"
         ? Orchestrator.egressTunnelId(input.tunnelId)
         : input.direction === "direct"
           ? Orchestrator.directTunnelId(input.tunnelId)
-          : Orchestrator.relayTunnelId(input.tunnelId);
+          : Orchestrator.relayTunnelId(input.tunnelId));
 
     const unreachable = await this.reachable(input.node);
     if (unreachable) return unreachable;

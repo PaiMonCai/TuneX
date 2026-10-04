@@ -56,6 +56,9 @@ export const CSRF_EXEMPT_PATTERNS: RegExp[] = [
   // WP7：节点状态上报/快照端点。与上四者同类：非浏览器客户端，不携带会话
   // cookie，凭据走 Authorization: Bearer（不会被浏览器自动附加）。
   /^\/api\/internal\/.*/,
+  // V5.5 WP14：联邦端点同样是非浏览器客户端（peer Panel 之间的机器调用），
+  // 不带 Origin、凭据不在 cookie 里；它们由 Ed25519 签名保护，CSRF 模型不适用。
+  /^\/api\/federation\/.*/,
 ];
 
 export function isCsrfExempt(path: string): boolean {
