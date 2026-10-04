@@ -24,8 +24,8 @@
  * 也绝不能因为 Agent 自报了什么就授予权限。
  */
 
+import type { AgentCapabilityFacts } from "./agent-capability.ts";
 import {
-  AgentCapabilityFacts,
   capabilityFactsFromStored,
   normalizeProtocolVersion,
 } from "./agent-capability.ts";
