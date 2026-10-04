@@ -135,6 +135,33 @@ describe("desired snapshot: the protocol fact is never invented", () => {
     expect(desiredTunnelConfigFor(directRow({ config_revision: 0 }), NODE)).toEqual({ kind: "not_for_node" });
   });
 
+  test("a V5.4 ingress restart restores next_hop through the middle node, not directly to egress", () => {
+    const outcome = desiredTunnelConfigFor(
+      directRow({
+        tunnel_mode: "relay",
+        ingress_node_id: NODE,
+        middle_node_id: 5,
+        egress_node_id: 4,
+        listen_port: 21006,
+        egress_port: 22001,
+        middle_node: { connect_ip: "10.0.0.5" },
+        egress_node: { connect_ip: "10.0.0.4" },
+        port_leases: [
+          { node_id: NODE, port: 21006, status: "active" },
+          { node_id: 5, port: 23001, status: "active" },
+          { node_id: 4, port: 22001, status: "active" },
+        ],
+      }),
+      NODE,
+    );
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.id).toBe("tunex-156-relay");
+    expect(outcome.config.next_hop).toBe("10.0.0.5:23001");
+    expect(outcome.config.remote_host).toBe("10.0.0.5");
+    expect(outcome.config.remote_port).toBe(23001);
+  });
+
   test("a V5.4 middle hop restores as the transit EGRESS runtime after an Agent restart", () => {
     const outcome = desiredTunnelConfigFor(
       directRow({
