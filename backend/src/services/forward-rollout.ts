@@ -127,7 +127,12 @@ export type RolloutStepKind =
   | "cutover_ingress"
   /** EGRESS 侧切换（换节点/换池时）。 */
   | "cutover_egress"
-  /** 旧入口 drain（端口迁移/节点迁移）。 */
+  /**
+   * 入口节点迁移的 ownership handoff：
+   * 先撤旧入口 runtime，再显式释放旧 owner，随后才允许新入口认领。
+   */
+  | "handoff_ingress_owner"
+  /** 旧入口 drain（同节点 listener move 等兼容路径）。 */
   | "drain_ingress"
   /** 旧 EGRESS drain。 */
   | "drain_egress"
@@ -602,6 +607,8 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
     });
   }
 
+  const hasPreviousRuntime = applied !== null;
+
   /* ---------------- CUTOVER ---------------- */
   // RELAY 出口侧先切（新节点 / 新池），入口随后指向新 next_hop。
   // 这里与 §13.3.4「RELAY Egress：prepare 新 Egress → cutover Ingress →
@@ -627,6 +634,21 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
     (relay && (impact.egress_node_change || impact.middle_node_change)) ||
     (!relay && impact.target_change) ||
     applied === null;
+
+  // V5.3 ownership 是 client-facing ingress 的 fencing。跨节点迁移不能
+  // "先把新主人上线，再慢慢 drain 旧主人"：旧 lease 还活着时 claim 必须拒绝，
+  // 若强行绕过则会产生双主。正确顺序是：
+  //   acquire 新节点端口 → 撤旧 runtime → 显式释放旧 ownership → 新入口认领/上线。
+  // 这里把 handoff 放进 CUTOVER，并且排在 cutover_ingress 之前。
+  if (hasPreviousRuntime && impact.ingress_node_change) {
+    push("cutover", "handoff_ingress_owner", {
+      node_id: applied?.ingress_node_id ?? null,
+      direction: "ingress",
+      port: applied?.listen_port ?? null,
+      meta: { old_mode: applied?.mode ?? "direct" },
+    });
+  }
+
   if (ingressNeedsDispatch) {
     push("cutover", "cutover_ingress", {
       node_id: desired.ingress_node_id,
@@ -647,17 +669,9 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   //     CLEANUP 仅在旧 listener 的 Stop 上限过去后释放旧 durable lease。
   //
   // `applied === null` ⇒ 从未成功 apply，没有旧 runtime 可退场。
-  const hasPreviousRuntime = applied !== null;
-  if (hasPreviousRuntime && impact.ingress_node_change) {
-    const oldNode = nodes.ingress_previous;
-    const oldPort = applied?.listen_port ?? null;
-    push("drain", "drain_ingress", {
-      node_id: oldNode?.id ?? (applied?.ingress_node_id ?? null),
-      direction: "ingress",
-      port: oldPort,
-      meta: { reason: "ingress_node_changed" },
-    });
-  }
+  // 跨节点入口迁移已经在 CUTOVER 的 handoff_ingress_owner 中完成旧 runtime
+  // 下线；这里不能再把它当普通 drain，否则会多发一次更高 revision 的 remove，
+  // 让后续故障回滚的世代关系变复杂。旧端口 lease 仍在 CLEANUP 精确释放。
 
   // 旧出口：换出口节点、或 RELAY→DIRECT 时旧 EGRESS 必须退场。
   const egressMustDrain = relayBefore && (impact.egress_node_change || impact.mode_change);
