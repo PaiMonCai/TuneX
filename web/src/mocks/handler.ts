@@ -49,6 +49,12 @@ import type {
   WorkspaceTrafficSummary,
 } from "@/lib/types";
 import * as seed from "./data";
+// V5.2 §7：目标健康视图的契约镜像（状态/理由码的 closed set 与展示派生都在那一处）。
+import { poolTargetKey } from "@/lib/target-health";
+import type {
+  TargetHealthTargetView,
+  TargetPoolHealth,
+} from "@/lib/target-health";
 import { getStore, resetStore, type MockNodeBinding, type MockWorkspaceInvite } from "./state";
 // V4-WP6 §13.4.4：health 投影（mock 无法 import 后端，形状与规则镜像在这里）
 import {
@@ -713,6 +719,84 @@ function readNodePayload(
     if (body[key] !== undefined) patch[key] = Boolean(body[key]);
   }
   return { patch };
+}
+
+/**
+ * V5.2 §7：池的目标健康响应（**mock 侧**）。
+ *
+ * 这里只做三件事，都不属于「合成」：
+ *   1. 期望清单 → 行集（顺序照期望；没夹具 → 契约事实「没有证据」）；
+ *   2. 夹具里的 `age_ms` → `last_observed_at` 时间戳（按本次请求时刻回填，
+ *      否则种子写死的日期会让一切在演示里显得过期）；
+ *   3. `observers`（响应级）= 本次真的参与观测的节点 id 升序去重。
+ *
+ * 真实状态由 `backend/src/services/target-health.ts` 合成；mock 复制的是**结论**，
+ * 不是规则（复制阈值表必然与后端分叉）。
+ */
+function mockPoolTargetHealth(
+  desired: readonly { host: string; port: number }[],
+  fixtures: readonly TargetHealthTargetView[],
+  now: number,
+): TargetPoolHealth {
+  const byTarget = new Map(fixtures.map((row) => [row.target, row]));
+  const stamp = (ageMs: number | null) =>
+    ageMs === null ? null : new Date(now - ageMs).toISOString();
+  const observers = new Set<number>();
+
+  const targets = desired.map((target) => {
+    const key = poolTargetKey(target) ?? `${target.host}:${target.port}`;
+    const fixture = byTarget.get(key);
+    if (!fixture) {
+      // 从未被观测过：契约里只能是 `unknown`（不能假定健康，也不是「故障」）。
+      return noEvidenceTargetView(key);
+    }
+    const rows = fixture.observers.map((observer) => {
+      if (typeof observer.observer?.node_id === "number") {
+        observers.add(observer.observer.node_id);
+      }
+      return { ...observer, last_observed_at: stamp(observer.age_ms) };
+    });
+    return {
+      ...fixture,
+      target: key,
+      observers: rows,
+      facts: { ...fixture.facts, last_observed_at: stamp(fixture.facts.age_ms) },
+    };
+  });
+
+  return {
+    targets,
+    observers: [...observers].sort((a, b) => a - b),
+    observed_at: new Date(now).toISOString(),
+  };
+}
+
+/** 「没有证据」视图：与后端未观测目标的合成结果同形（无观测者、无年龄事实）。 */
+function noEvidenceTargetView(target: string): TargetHealthTargetView {
+  return {
+    target,
+    state: "unknown",
+    reasons: ["no_observation"],
+    flapping: false,
+    observers: [],
+    facts: {
+      evidence: false,
+      observers: 0,
+      fresh_observers: 0,
+      stale_observers: 0,
+      unusable_observers: 0,
+      worst_observer: null,
+      reachable: null,
+      latency_ms: null,
+      consecutive_success: null,
+      consecutive_failure: null,
+      success_rate: null,
+      last_observed_at: null,
+      age_ms: null,
+      disagreement: false,
+    },
+    recent_flips: [],
+  };
 }
 
 // ------------------------------------------------- WP12 出口池 / 目标（mock）
@@ -3439,6 +3523,34 @@ export async function handleMock(method: string, path: string, req: MockRequest)
           return ok(db.nodeStates.get(node.id) ?? null);
         }
       }
+    }
+
+    // ----- V5.2 §7：出口池目标健康 —— GET /admin/node/pools/:poolId/health -----
+    /*
+     * 与真实后端同一路径（单数 `/admin/node`）与同一响应形状：
+     * `{ data: { targets, observers, observed_at } }`（mock 里 api.ts 不解包，
+     * 所以这里返回**内层**对象，与 `api.admin.poolTargetHealth` 的 `get()` 对齐）。
+     *
+     * 数据来源是 `seed.mockTargetHealthFixtures`（**夹具，不是合成**，见 data.ts）：
+     *   · 期望清单来自池当前的 targets（所以加/删目标立刻反映，且 `unhealthy` 的
+     *     目标照旧在列表里 —— 观测没有删除权）；
+     *   · 没有夹具的目标按「没有证据」渲染（`unknown` + `no_observation`）——
+     *     这不是猜，而是契约事实：从未被观测过的目标只能是 `unknown`；
+     *   · 时间戳按**本次请求时刻**回填（夹具只声明 age），否则演示数据会因为
+     *     种子日期而全部显示为过期。
+     */
+    if (seg[1] === "node" && seg[2] === "pools" && seg[4] === "health" && method === "GET") {
+      const poolId = parseId(seg[3]);
+      if (poolId === null) return badRequest("非法池 ID");
+      const entry = [...db.egressPools.entries()].find(([, pools]) =>
+        pools.some((p) => p.id === poolId),
+      );
+      if (!entry) return notFound("池不存在");
+      const pool = entry[1].find((p) => p.id === poolId)!;
+      const targets = db.egressTargets.get(poolId) ?? [];
+      const now = Date.now();
+      const outcome = mockPoolTargetHealth(targets, seed.mockTargetHealthFixtures, now);
+      return ok(outcome);
     }
 
     // ----- V4-WP6 §13.4.4 健康：单数 /admin/node/health 与前缀 /admin/node/:id/health -----

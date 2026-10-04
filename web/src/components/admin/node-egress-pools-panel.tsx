@@ -20,6 +20,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { api, API_MOCK } from "@/lib/api";
+import { PoolTargetHealth } from "@/components/admin/pool-target-health";
 import { useI18n } from "@/components/providers";
 import { LB_STRATEGIES, STATUS_OPTIONS } from "@/lib/constants";
 import { formatDateTime, strOf, toNumOrNull } from "@/lib/utils";
@@ -301,6 +302,15 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
                     )}
                   </TableBody>
                 </Table>
+              </div>
+              {/*
+                V5.2 §7：观测 + 合成（目标健康）。
+                刻意放在编辑表**下面**而不是并进同一张表：上表是「你要什么」（可写），
+                这块是「我们看到了什么」（只读）。观测没有删除权，所以这里没有任何
+                写入口 —— `unhealthy` 的目标只以状态呈现，不会被移除或停用。
+              */}
+              <div className="border-t border-[var(--border)] p-3">
+                <PoolTargetHealth pool={pool} />
               </div>
             </div>
           ))

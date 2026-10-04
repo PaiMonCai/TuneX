@@ -25,6 +25,7 @@ import type {
   User,
   UserPlan,
 } from "@/lib/types";
+import type { TargetHealthTargetView } from "@/lib/target-health";
 
 export const now = new Date("2026-09-23T10:00:00+08:00");
 const iso = (d: Date) => d.toISOString();
@@ -759,6 +760,185 @@ export const mockEgressPools: { node_id: number; pool: EgressPool; targets: Egre
         updated_at: iso(daysAgo(30)),
       },
     ],
+  },
+];
+
+/**
+ * V5.2 §7（WP5/WP6）演示夹具：**每个目标一条完整的合成视图**。
+ *
+ * ⚠️ 这不是合成实现。真实状态由 `backend/src/services/target-health.ts` 的纯函数按
+ * 阈值 + 迟滞 + flap 压制算出来；mock **不复制**那套规则 —— 复制一份阈值表就必然
+ * 与后端分叉（§7 的「阈值集中在一处」正是为了防这件事）。所以这里直接给出**结论**
+ * （state / reasons / facts / observers），只保证两件事：
+ *
+ *   1. 形状与后端 `TargetHealthView` 逐字段相同（类型由 `TargetHealthTargetView`
+ *      钉住，漏字段/写错名字是编译错误）；
+ *   2. 状态与它自己的 facts 自洽（healthy 的行不会出现连续失败；unhealthy 的行
+ *      必然有 reasons；unknown 的行 evidence=false）—— 由
+ *      `mocks/__tests__/target-health-mock.test.ts` 断言，避免夹具自己撒谎。
+ *
+ * 没有夹具的目标（例如新加的目标）由 handler 按「没有证据」渲染：这不是合成，
+ * 而是**契约事实** —— 从未被观测过的目标只能是 `unknown`（§7 状态表第一行）。
+ */
+export const mockTargetHealthFixtures: TargetHealthTargetView[] = [
+  {
+    // 两个观测者都通、都新鲜 → 唯一一个「好」的样子
+    target: "10.30.0.11:8080",
+    state: "healthy",
+    reasons: ["healthy_retained", "warmup_complete"],
+    flapping: false,
+    observers: [
+      {
+        observer: { node_id: 6, probe: "tcp_connect" },
+        observer_label: "6:tcp_connect",
+        state: "healthy",
+        evidence: true,
+        usable: true,
+        stale: false,
+        age_ms: 12_000,
+        reasons: ["healthy_retained"],
+        reachable: true,
+        latency_ms: 42,
+        consecutive_success: 9,
+        consecutive_failure: 0,
+        success_rate: 0.98,
+        last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      },
+      {
+        observer: { node_id: 9, probe: "tcp_connect" },
+        observer_label: "9:tcp_connect",
+        state: "healthy",
+        evidence: true,
+        usable: true,
+        stale: false,
+        age_ms: 26_000,
+        reasons: ["warmup_complete"],
+        reachable: true,
+        latency_ms: 88,
+        consecutive_success: 26,
+        consecutive_failure: 0,
+        success_rate: 0.95,
+        last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      },
+    ],
+    facts: {
+      evidence: true,
+      observers: 2,
+      fresh_observers: 2,
+      stale_observers: 0,
+      unusable_observers: 0,
+      worst_observer: { node_id: 6, probe: "tcp_connect" },
+      reachable: true,
+      latency_ms: 42,
+      consecutive_success: 9,
+      consecutive_failure: 0,
+      success_rate: 0.98,
+      last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      age_ms: 12_000,
+      disagreement: false,
+    },
+    recent_flips: [],
+  },
+  {
+    // 判死 + 抖动 + 两个观测者结论不同：「一个节点说通、另一个说断」的展示面，
+    // 也是「不健康的目标仍然留在池里」的展示面。
+    target: "10.30.0.12:8080",
+    state: "unhealthy",
+    reasons: ["failure_threshold", "observers_disagree", "flapping_capped"],
+    flapping: true,
+    observers: [
+      {
+        observer: { node_id: 6, probe: "tcp_connect" },
+        observer_label: "6:tcp_connect",
+        state: "unhealthy",
+        evidence: true,
+        usable: true,
+        stale: false,
+        age_ms: 8_000,
+        reasons: ["failure_threshold"],
+        reachable: false,
+        latency_ms: null,
+        consecutive_success: 0,
+        consecutive_failure: 4,
+        success_rate: 0.4,
+        last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      },
+      {
+        observer: { node_id: 9, probe: "tcp_connect" },
+        observer_label: "9:tcp_connect",
+        state: "healthy",
+        evidence: true,
+        usable: true,
+        stale: false,
+        age_ms: 15_000,
+        reasons: ["healthy_retained"],
+        reachable: true,
+        latency_ms: 120,
+        consecutive_success: 11,
+        consecutive_failure: 0,
+        success_rate: 0.96,
+        last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      },
+    ],
+    facts: {
+      evidence: true,
+      observers: 2,
+      fresh_observers: 2,
+      stale_observers: 0,
+      unusable_observers: 0,
+      worst_observer: { node_id: 6, probe: "tcp_connect" },
+      reachable: false,
+      latency_ms: null,
+      consecutive_success: 0,
+      consecutive_failure: 4,
+      success_rate: 0.4,
+      last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      age_ms: 8_000,
+      disagreement: true,
+    },
+    recent_flips: [1_760_000_000_000, 1_760_000_120_000, 1_760_000_300_000, 1_760_000_420_000, 1_760_000_600_000],
+  },
+  {
+    // 降级：有失败证据但未达阈值（可见但不判死）
+    target: "172.16.5.10:443",
+    state: "degraded",
+    reasons: ["failure_subthreshold", "success_rate_below_healthy"],
+    flapping: false,
+    observers: [
+      {
+        observer: { node_id: 7, probe: "tcp_connect" },
+        observer_label: "7:tcp_connect",
+        state: "degraded",
+        evidence: true,
+        usable: true,
+        stale: false,
+        age_ms: 41_000,
+        reasons: ["failure_subthreshold", "success_rate_below_healthy"],
+        reachable: true,
+        latency_ms: 540,
+        consecutive_success: 0,
+        consecutive_failure: 1,
+        success_rate: 0.85,
+        last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      },
+    ],
+    facts: {
+      evidence: true,
+      observers: 1,
+      fresh_observers: 1,
+      stale_observers: 0,
+      unusable_observers: 0,
+      worst_observer: { node_id: 7, probe: "tcp_connect" },
+      reachable: true,
+      latency_ms: 540,
+      consecutive_success: 0,
+      consecutive_failure: 1,
+      success_rate: 0.85,
+      last_observed_at: null, // 由 handler 按本次请求时刻回填（夹具只声明 age）
+      age_ms: 41_000,
+      disagreement: false,
+    },
+    recent_flips: [],
   },
 ];
 
