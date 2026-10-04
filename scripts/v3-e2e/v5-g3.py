@@ -272,6 +272,9 @@ def cleanup():
         if getattr(H, "partitioned", False) and getattr(H, "owner_container", None):
             rejoin_owner(H.owner_container)
             H.partitioned = False
+        if getattr(H, "owner_stopped", False) and getattr(H, "owner_container", None):
+            H.docker(["start", H.owner_container], allow=True, timeout=150)
+            H.owner_stopped = False
         if tunnel_id and owner:
             # Expire whatever the gate left, then hand it back to the original owner.
             force_lapse(tunnel_id)
@@ -346,27 +349,37 @@ def g3_3_split_brain_cannot_happen():
 
 
 def g3_4_takeover_after_lapse():
-    """A takeover needs a GENUINELY expired lease, which after the renewal fix means the
-    owner must be unable to renew — i.e. partitioned or gone.
+    """A takeover needs a GENUINELY expired lease.
 
-    Forcing the row into the past is no longer enough (and correctly so): renewal follows
-    liveness, so a live node repairs a panel-side lapse within one report. The real-world
-    precondition for moving ownership is therefore "the old owner stopped renewing", and the
-    gate now builds exactly that instead of a row-level fiction.
+    After the renewal fix, "genuinely expired" means the old owner cannot renew — so the gate
+    makes that true instead of pretending: it STOPS the owner's container, asserts that its
+    liveness is really stale (the assertion the previous version omitted, which let an
+    unestablished precondition be reported as a refused takeover), and only then claims.
+
+    G3.3 keeps the subtler network partition for the split-brain scenario; this case needs the
+    unambiguous one, because its subject is the takeover path, not the partition.
     """
-    if not getattr(H, "partitioned", False):
-        check(partition_owner(H.owner_container), "G3.4 the owner was partitioned for the takeover",
-              f"container={H.owner_container}")
-        H.partitioned = True
-        force_lapse(H.tunnel_id)
-        # Wait until the owner's liveness is genuinely stale, so its lease is really dead.
-        H.wait_until(
+    if not getattr(H, "owner_stopped", False):
+        H.docker(["stop", H.owner_container], allow=True, timeout=120)
+        H.owner_stopped = True
+        if getattr(H, "partitioned", False):
+            # The container is gone; the network membership will come back with it.
+            H.partitioned = False
+        check(bool(H.wait_until(
             lambda: int(H.scalar(
                 f"SELECT IFNULL(TIMESTAMPDIFF(SECOND, last_seen_at, NOW()), 9999) FROM node WHERE id={H.owner_node};"
             ) or 0) > 100,
-            timeout=240, interval=10,
-        )
+            timeout=300, interval=10,
+        )), "G3.4 the owner is ASSERTED to be stale before a takeover is attempted",
+              "this assertion is the fix: without it an unestablished precondition looked like a refusal")
+
     before = lease_row(H.tunnel_id)
+    # Force the row into the past as well: nothing is renewing it now, so this is not a fiction.
+    force_lapse(H.tunnel_id)
+    lapsed = lease_row(H.tunnel_id)
+    check(lapsed.get("expires_at", 0) * 1000 < time.time() * 1000,
+          "G3.4 the lease is really expired (nobody can renew it)", json.dumps(lapsed))
+
     result = claim(H.tunnel_id, H.standby_node, revision=1)
     check(result.get("ok") is True, "G3.4 a takeover is allowed once the lease has lapsed",
           json.dumps(result))
@@ -377,6 +390,10 @@ def g3_4_takeover_after_lapse():
     check(after.get("epoch", 0) == before.get("epoch", 0) + 1,
           "G3.4 and the generation advanced by exactly one",
           f"before={before.get('epoch')} after={after.get('epoch')}")
+
+    # Bring the old owner back: its fence will refuse a stale activation, which G3.7 exercises.
+    H.docker(["start", H.owner_container], allow=True, timeout=150)
+    H.owner_stopped = False
 
 
 def g3_5_epoch_is_monotone():
@@ -399,12 +416,15 @@ def g3_6_lost_race_is_safe():
     second = claim(H.tunnel_id, H.owner_node, revision=1)
     after = lease_row(H.tunnel_id)
     winners = [r for r in (first, second) if r.get("ok") is True]
+    # Only claims that CHANGED the owner advance the generation; a claim by the node that
+    # already holds it is a RENEWAL and must keep the same epoch (that is what makes renewals
+    # invisible to the agent's stale-epoch fence). Counting all successful claims made this
+    # assertion demand an advance for a renewal, which is the opposite of the contract.
+    advances = [r for r in winners if r.get("changed") is True]
     check(len(winners) >= 1, "G3.6 at least one claim succeeded", json.dumps([first, second]))
-    # After both attempts exactly one owner exists — never a state where two nodes each
-    # believe they hold the same generation.
-    check(after.get("epoch", 0) == before.get("epoch", 0) + len(winners),
-          "G3.6 the generation advanced once per SUCCESSFUL claim and no further",
-          f"before={before.get('epoch')} after={after.get('epoch')} winners={len(winners)}")
+    check(after.get("epoch", 0) == before.get("epoch", 0) + len(advances),
+          "G3.6 the generation advanced once per OWNERSHIP-CHANGING claim and no further",
+          f"before={before.get('epoch')} after={after.get('epoch')} advances={len(advances)} winners={len(winners)}")
     check(after.get("owner_node_id") in (H.standby_node, H.owner_node),
           "G3.6 exactly one owner remains", json.dumps(after))
 
