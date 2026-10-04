@@ -819,6 +819,52 @@ async function runStep(
       return { ok: true, note: `egress ${nodeId}:${egressPort} 生效于 revision ${ctx.revision}` };
     }
 
+    case "handoff_ingress_owner": {
+      if (nodeId == null || ctx.applied == null) {
+        return {
+          ok: false,
+          error_code: "invariant_violated",
+          error: "handoff_ingress_owner 缺少旧入口节点或 applied snapshot",
+        };
+      }
+
+      // 两阶段交接：先确认旧 client-facing runtime 已经撤下，再把 ownership
+      // lease 显式置为到期。绝不能反过来，否则旧 Agent 仍可能按它手里的
+      // lease_expires_at 继续服务，而新 Agent 已经能 claim —— 这就是双主窗口。
+      const direction = ctx.applied.mode === "direct" ? "direct" : "ingress";
+      const removed = await orchestrator.removeTunnel({
+        tunnelId: ctx.tunnelId,
+        node: nodeFor(orchestrator, nodeId),
+        direction,
+        // 旧 runtime 当前最多是 base revision；用目标 revision 即可单调前进。
+        // 不用 revision+1：若后续新入口 cutover 失败，补偿会用 revision+1
+        // 恢复旧入口；这里若提前占掉 +1，回滚会被 Agent 判 equal/stale。
+        revision: ctx.revision,
+        reason: `rollout ${ctx.rolloutId} ingress ownership handoff`,
+      });
+      if (!removed.ok) {
+        return { ok: false, error_code: removed.error_code, error: removed.error };
+      }
+
+      const released = await orchestrator.releaseOwnership({
+        tunnelId: ctx.tunnelId,
+        nodeId,
+        now: deps.now?.() ?? new Date(),
+      });
+      if (!released.ok && released.reason !== "not_found") {
+        return {
+          ok: false,
+          error_code: "ownership_release_failed",
+          error: `旧入口 ${nodeId} ownership 释放失败：${released.reason}`,
+        };
+      }
+
+      return {
+        ok: true,
+        note: `old ingress ${nodeId} 已撤下，ownership 已释放，允许新入口认领`,
+      };
+    }
+
     case "cutover_ingress": {
       const ingressNodeId = nodeId;
       if (ingressNodeId == null) {
@@ -1298,11 +1344,12 @@ export async function compensateRollout(
   const removeRevision = row.revision + 1;
   const planned = planSnapshot(row.steps, "desired");
   const plannedMiddle = (planned as { middle_node_id?: number | null }).middle_node_id ?? null;
-  const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number }> = [
+  const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number; isIngress?: boolean }> = [
     { direction: "egress", nodeId: planned.egress_node_id ?? 0 },
     {
       direction: planned.mode === "direct" ? "direct" : "ingress",
       nodeId: planned.ingress_node_id,
+      isIngress: true,
     },
     // V5.4：中间跳也是"新 runtime"，也必须撤。它的形态与出口跳相同（监听 + 拨号到下一跳），
     // 因此方向同样是 `egress` —— runtime id 按节点分命名空间，中间跳与真出口不会互相覆盖。
@@ -1311,7 +1358,8 @@ export async function compensateRollout(
     // 拆掉的下一跳。这类残留不报错，只静默占着端口与许可 —— 也正是 G4 明确要验的一项。
     { direction: "egress", nodeId: plannedMiddle ?? 0 },
   ];
-  for (const { direction, nodeId } of removals) {
+  let plannedIngressRemoved = false;
+  for (const { direction, nodeId, isIngress } of removals) {
     if (!nodeId) continue;
     const outcome = await orchestrator.removeTunnel({
       tunnelId: row.tunnel_id,
@@ -1320,7 +1368,26 @@ export async function compensateRollout(
       revision: removeRevision,
       reason: `rollout ${rolloutId} compensation`,
     });
-    if (!outcome.ok) errors.push(`remove ${direction}: ${outcome.error}`);
+    if (!outcome.ok) {
+      errors.push(`remove ${direction}: ${outcome.error}`);
+    } else if (isIngress) {
+      plannedIngressRemoved = true;
+    }
+  }
+
+  // 若目标入口曾经 claim 成功，但 apply/ACK 随后失败，ownership 仍会留在新节点。
+  // 只有确认新入口 runtime 已撤下后才允许释放它；随后基线入口才能按新世代重新 claim。
+  if (plannedIngressRemoved && planned.ingress_node_id) {
+    const released = await orchestrator.releaseOwnership({
+      tunnelId: row.tunnel_id,
+      nodeId: planned.ingress_node_id,
+      now: deps.now?.() ?? new Date(),
+    });
+    // not_owner/not_found 代表失败发生在 claim 之前（ownership 仍在旧主人或从未存在），
+    // 这两种都无需额外动作；真正异常会在后面的基线 replay 中继续暴露。
+    if (!released.ok && released.reason !== "not_owner" && released.reason !== "not_found") {
+      errors.push(`release planned ingress ownership: ${released.reason}`);
+    }
   }
 
   /** 回滚世代（内容 = 基线）。null = 没有基线可回（首次部署失败：撤干净即正确）。 */
