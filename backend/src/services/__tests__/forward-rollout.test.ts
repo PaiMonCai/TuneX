@@ -43,6 +43,8 @@ const NODE_INGRESS = {
 
 const NODE_INGRESS_B = { id: 12, node_id: "ing-b", role: "both", connect_ip: "10.0.0.12", lifecycle: "active" };
 const NODE_EGRESS = { id: 21, node_id: "egr-a", role: "egress", connect_ip: "10.0.1.21", lifecycle: "active" };
+/** V5.4：三跳路由的中间跳（只中转，不落目标）。 */
+const NODE_MIDDLE = { id: 22, node_id: "mid-a", role: "both", connect_ip: "10.0.1.22", lifecycle: "active" };
 const NODE_EGRESS_B = { id: 22, node_id: "egr-b", role: "egress", connect_ip: "10.0.1.22", lifecycle: "active" };
 
 const NONE_NODES = { ingress: null, egress: null, ingress_previous: null, egress_previous: null };
@@ -112,6 +114,56 @@ function shape(input: PlanRolloutInput): string[] {
 /* ------------------------------------------------------------------ */
 /* 1. RELAY CONP 铁律：prepare_egress 早于 cutover_ingress             */
 /* ------------------------------------------------------------------ */
+
+describe("V5.4：三跳路由的计划（中间跳）", () => {
+  const threeHopInput = () =>
+    planInput({
+      desired: snapshot({
+        mode: "relay",
+        target_host: null,
+        target_port: null,
+        egress_node_id: NODE_EGRESS.id,
+        middle_node_id: NODE_MIDDLE.id,
+      } as never),
+      impact: impact({ mode_change: true, egress_node_change: true, binding_required: false }),
+      nodes: {
+        ingress: NODE_INGRESS,
+        egress: NODE_EGRESS,
+        middle: NODE_MIDDLE,
+        ingress_previous: null,
+        egress_previous: null,
+      } as never,
+    });
+
+  it("中间跳有自己的端口与 apply 步骤，且顺序是出口 → 中间 → 入口", () => {
+    const steps = shape(threeHopInput());
+    expect(steps).toContain("prepare:prepare_transit");
+    // 先远后近：出口的 apply 必须早于中间跳，中间跳必须早于入口切换。
+    const egressPrepare = steps.indexOf("prepare:prepare_egress");
+    const transit = steps.indexOf("prepare:prepare_transit");
+    const ingressCut = steps.indexOf("cutover:cutover_ingress");
+    expect(egressPrepare).toBeGreaterThanOrEqual(0);
+    expect(egressPrepare).toBeLessThan(transit);
+    expect(transit).toBeLessThan(ingressCut);
+  });
+
+  it("中间跳有自己的端口租约（acquire_port 指向它）", () => {
+    const steps = planRollout(threeHopInput(), 42).steps;
+    const transitPort = steps.find((s) => s.kind === "prepare_transit");
+    const acquire = steps.find((s) => s.kind === "acquire_port" && s.node_id === NODE_MIDDLE.id);
+    expect(transitPort?.node_id).toBe(NODE_MIDDLE.id);
+    expect(acquire).toBeDefined();
+  });
+
+  it("单跳计划里**没有**任何中间跳步骤（多跳不能渗进 V4 的路径）", () => {
+    const single = planInput({
+      desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),
+      impact: impact({ mode_change: true, egress_node_change: true, binding_required: false }),
+      nodes: { ingress: NODE_INGRESS, egress: NODE_EGRESS, ingress_previous: null, egress_previous: null },
+    });
+    expect(shape(single).filter((x) => x.includes("transit"))).toHaveLength(0);
+  });
+});
 
 describe("RELAY 只换入口节点也必须准备出口（V5.3 round 19）", () => {
   it("ingress_node_change 单独成立时，计划里必须有 prepare_egress", () => {

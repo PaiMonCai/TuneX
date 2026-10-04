@@ -114,6 +114,15 @@ export type RolloutStepKind =
   | "ensure_binding"
   /** EGRESS 侧 apply（RELAY）；ACK 后不切入口。 */
   | "prepare_egress"
+  /**
+   * V5.4：中间跳的 apply（`hop_index = 1`）。
+   *
+   * 它与 `prepare_egress` 是**同一个原语**（一个监听 + 拨号到"目标"的转发），区别只在目标是谁：
+   * 出口跳指向真实目标池，中间跳指向**下一跳的节点间监听地址**。单独给一个 kind 而不是复用
+   * `prepare_egress`，是因为在执行器里两者**解析 next_hop 的来源不同**（中间跳要等下一跳登记地址），
+   * 而计划与执行器必须对同一件事用同一个名字。
+   */
+  | "prepare_transit"
   /** 入口 apply（= WP2 `ReplaceListener` 的目标形态）。 */
   | "cutover_ingress"
   /** EGRESS 侧切换（换节点/换池时）。 */
@@ -539,6 +548,29 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
         meta: { reason: "ingress_recut" },
       });
     }
+  }
+
+  /* ---------------- 中间跳（V5.4：三跳路由）---------------- */
+  //
+  // 三跳 = 入口 → 中间跳 → 出口。中间跳与出口是**同一个原语**（监听 + 拨号到"目标"），因此它的
+  // PREPARE 只需要两件事：一个**端口**（它自己的监听端口）与一次 **apply**（目标 = 下一跳，即出口）。
+  //
+  // 顺序仍是铁律：先出口、再中间、最后入口（正向先远后近）。中间跳的 apply 必须在出口的
+  // `prepare_egress` 之后、入口的 `cutover_ingress` 之前 —— 否则入口拿不到它的地址。
+  const middleNodeId = (desired as { middle_node_id?: number | null }).middle_node_id ?? null;
+  if (relay && middleNodeId != null) {
+    push("prepare", "acquire_port", {
+      node_id: middleNodeId,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_hop" },
+    });
+    push("prepare", "prepare_transit", {
+      node_id: middleNodeId,
+      direction: "egress",
+      port: null,
+      meta: { reason: "transit_hop" },
+    });
   }
 
   /* ---------------- CUTOVER ---------------- */

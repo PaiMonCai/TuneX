@@ -1012,6 +1012,64 @@ async function runStep(
     case "validate":
       return { ok: true, note: "validate（计划期已判定）" };
 
+    /* ---------------- 中间跳（V5.4 WP12）---------------- */
+
+    case "prepare_transit": {
+      // 中间跳与出口跳是**同一个原语**（一个监听 + 拨号到"目标"的转发），区别只在目标是谁：
+      // 出口指向真实目标池，中间跳指向**下一跳的节点间监听地址**。
+      //
+      // 正向先远后近 ⇒ 轮到这里时下一跳（出口）已经发过，它的可寻址 host 已登记；因此这里
+      // 用与入口同样的 `resolveNextHop`：不猜 IP，只用 dispatch 返回的地址。
+      const middleNodeId = nodeId;
+      if (middleNodeId == null) {
+        return { ok: false, error_code: "invariant_violated", error: "prepare_transit 缺少 node_id" };
+      }
+      if (ctx.desired.mode !== "relay") {
+        return { ok: false, error_code: "invariant_violated", error: "只有 RELAY 路由才有中间跳" };
+      }
+      const port = resolveIngressPort(step, ctx);
+      // 中间跳的下一跳**就是出口跳**（三跳的上限决定了中间跳最多一个）。这里不能用
+      // `resolveNextHop`：那是"入口的下一跳"，在有三跳时指向中间跳自己。
+      const egressNodeId = ctx.desired.egress_node_id;
+      const nextHop = egressNodeId == null ? null : resolveHopAddress(ctx, egressNodeId, ctx.desired.egress_port ?? null);
+      if (!nextHop) {
+        return {
+          ok: false,
+          error_code: "next_hop_unresolved",
+          error: `中间跳 ${middleNodeId} 无法解析下一跳（出口）地址：出口未就绪`,
+        };
+      }
+      const [nextHost, nextPortRaw] = nextHop.split(":");
+      const nextPort = Number(nextPortRaw);
+      if (!nextHost || !Number.isFinite(nextPort) || nextPort <= 0) {
+        return { ok: false, error_code: "next_hop_unresolved", error: `中间跳的下一跳地址非法：${nextHop}` };
+      }
+      const transmitFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (transmitFacts === null) {
+        return {
+          ok: false,
+          error_code: "unsupported_protocol",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单，拒绝中间跳",
+        };
+      }
+      const outcome = await orchestrator.dispatchEgress({
+        tunnelId: ctx.tunnelId,
+        revision: ctx.revision,
+        egressNode: nodeFor(orchestrator, middleNodeId),
+        egressPort: port,
+        // 中间跳没有自己的池：它唯一的"目标"就是下一跳。
+        poolId: null,
+        targets: [{ host: nextHost, port: nextPort, weight: 1, order_by: 10 }],
+        protocol: transmitFacts.protocol,
+      });
+      if (!outcome.ok) {
+        return { ok: false, error_code: outcome.error_code, error: outcome.error };
+      }
+      // 登记中间跳的可寻址 host：入口的 cutover 会用它拼 next_hop。
+      recordNextHop(ctx.rolloutId, middleNodeId, outcome.egress_host);
+      return { ok: true, note: `transit ${middleNodeId}:${port} → ${nextHop}` };
+    }
+
     default: {
       const exhaustive: never = step.kind;
       return { ok: false, error_code: "invariant_violated", error: `未知步骤：${String(exhaustive)}` };
@@ -1136,22 +1194,36 @@ function resolveEgressPort(step: RolloutStep, ctx: RolloutExecContext): number {
 }
 
 /** `<egress ip>:<egress port>`；解析不到 ⇒ null ⇒ cutover_ingress 拒绝执行。 */
-function resolveNextHop(ctx: RolloutExecContext): string | null {
-  const egressNodeId = ctx.desired.egress_node_id;
-  if (egressNodeId == null) return null;
-  const prepared = ctx.prepared.find(
-    (p) => p.kind === "egress_apply" && p.node_id === egressNodeId && p.port != null,
-  );
-  const lease = ctx.prepared.find(
-    (p) => p.kind === "lease" && p.node_id === egressNodeId && p.port != null,
-  );
-  const port = prepared?.port ?? lease?.port ?? ctx.desired.egress_port ?? 0;
+/**
+ * 解析**某一跳**的节点间可寻址地址（`host:port`）。
+ *
+ * 只允许从**已登记**的节点事实里取 host（`recordNextHop` 的产物，来自那台节点自己的
+ * dispatch 返回值）—— 不猜 IP：猜错就是"每个新连接都连不上"的静默故障。
+ *
+ * `fallbackPort` 只在那一跳没有自己的 lease/apply 登记时才用（单跳出口沿用了 historical
+ * `desired.egress_port`），中间跳没有这个回落：它的端口必须来自计划期的 acquire_port。
+ */
+function resolveHopAddress(ctx: RolloutExecContext, nodeId: number, fallbackPort: number | null): string | null {
+  const prepared = ctx.prepared.find((p) => p.kind === "egress_apply" && p.node_id === nodeId && p.port != null);
+  const lease = ctx.prepared.find((p) => p.kind === "lease" && p.node_id === nodeId && p.port != null);
+  const port = prepared?.port ?? lease?.port ?? fallbackPort ?? 0;
   if (port <= 0) return null;
-  // 旧实现（orchestrator.dispatchEgress 内）会拿 egress 节点的可寻址 host
-  // 拼 next_hop；这里同样只允许从**已登记**的节点事实里取，不猜 IP。
-  const host = nextHopHosts.get(ctx.rolloutId)?.get(egressNodeId);
+  const host = nextHopHosts.get(ctx.rolloutId)?.get(nodeId);
   if (!host) return null;
   return `${host}:${port}`;
+}
+
+/**
+ * 入口的 `next_hop` = **它的下一跳**。三跳时那不是出口，而是中间跳 —— 也就是"下一跳是谁"
+ * 取决于路由形状，不能写死成 egress。判定依据是同一份放置事实（`middle_node_id`），
+ * 与计划、准入、纯路由模型用的是同一个字段。
+ */
+function resolveNextHop(ctx: RolloutExecContext): string | null {
+  const middle = (ctx.desired as { middle_node_id?: number | null }).middle_node_id ?? null;
+  const nextHopNodeId = middle ?? ctx.desired.egress_node_id;
+  if (nextHopNodeId == null) return null;
+  // 中间跳的端口必须来自它自己的 lease/apply；出口跳保留 historical 回落。
+  return resolveHopAddress(ctx, nextHopNodeId, middle != null ? null : ctx.desired.egress_port ?? null);
 }
 
 /**
