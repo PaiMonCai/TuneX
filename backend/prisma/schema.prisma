@@ -489,6 +489,8 @@ model Node {
   target_observations TargetObservation[]
   /// V5.3 WP9：该节点当前持有的归属租约。
   placement_leases PlacementLease[]
+  /// V5.4 WP12：作为中间跳承载的 Forward。
+  middle_hops Tunnel[] @relation("middle_node")
 
   @@index([role])
   @@map("node")
@@ -683,6 +685,17 @@ model Tunnel {
   @@index([workspace_id])
   /// V5.3 WP9：该 Forward 的归属租约（最多一行，见 model PlacementLease）。
   placement_lease PlacementLease?
+
+  /// V5.4 WP12：2 跳 / 3 跳路由的**中间跳**节点（NULL = 单跳，V4 行为）。
+  ///
+  /// 为什么是一列而不是一张链路表：§9.1 明确推荐"先让 Forward revision snapshot 承载有序
+  /// 路由事实，再根据真实重复需求决定是否独立持久化 Link"。一条线性路由最多 3 跳，其中
+  /// hop 0 = ingress_node_id、hop N-1 = egress_node_id，因此**只多出一个中间跳**；为它开一张
+  /// 表会在第一版就引入通用图结构，而那正是 §9.3 禁止的方向。
+  ///
+  /// 归属仍只有一个持有者（hop 0），中间跳是**资源**（见 §9 冻结契约第 7 条）。
+  middle_node_id Int?
+  middle_node    Node? @relation("middle_node", fields: [middle_node_id], references: [id], onDelete: SetNull)
 
   @@index([tunnel_mode])
   @@index([forward_protocol])

@@ -40,6 +40,8 @@ import {
  * 仅插入缺失项；旧品牌默认值会更新，运营者自定义值不变。
  */
 const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
+  // V5.3 WP10：自动迁移策略（缺省即关；见 DEVELOPMENT.md §8）。
+  FAILOVER_POLICY: JSON.stringify({ auto_failover: false, auto_failback: false }),
   MIN_TOPUP_AMOUNT: "1",
   NOTICE: "",
   NOTICE_POPUP: "",
