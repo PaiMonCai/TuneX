@@ -466,12 +466,12 @@ export function defaultDiagnoseDeps(): DiagnoseDeps {
         row.middle_node == null
           ? null
           : ((await db.nodePortLease.findFirst({
-              where: {
-                tunnel_id: row.id,
-                node_id: row.middle_node.id,
-                direction: "egress",
-                status: "active",
-              },
+              // 租约表**没有** `direction` 列（方向由节点在拓扑里的角色决定，不重复存储）——
+              // 键就是 (node, tunnel, active)。我第一版加了 direction，Prisma 直接拒绝，
+              // 而路由层把它变成了 500：**查询形状的错误会以 500 的形式出现**，
+              // 所以失败时先看服务端日志，不要从客户端状态码猜原因。
+              where: { tunnel_id: row.id, node_id: row.middle_node.id, status: "active" },
+              orderBy: { id: "desc" },
               select: { port: true },
             })) as { port: number } | null)?.port ?? null;
       return {
