@@ -135,6 +135,52 @@ describe("desired snapshot: the protocol fact is never invented", () => {
     expect(desiredTunnelConfigFor(directRow({ config_revision: 0 }), NODE)).toEqual({ kind: "not_for_node" });
   });
 
+  test("a V5.4 middle hop restores as the transit EGRESS runtime after an Agent restart", () => {
+    const outcome = desiredTunnelConfigFor(
+      directRow({
+        tunnel_mode: "relay",
+        ingress_node_id: 3,
+        middle_node_id: NODE,
+        egress_node_id: 4,
+        egress_port: 22001,
+        egress_node: { connect_ip: "10.0.0.4" },
+        port_leases: [{ node_id: NODE, port: 23001, status: "active" }],
+      }),
+      NODE,
+    );
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.id).toBe("tunex-156-egress");
+    expect(outcome.config.mode).toBe("EGRESS");
+    expect(outcome.config.egress_port).toBe(23001);
+    expect(outcome.config.targets).toEqual([
+      { host: "10.0.0.4", port: 22001, weight: 1, order: 10 },
+    ]);
+  });
+
+  test("a middle hop without its durable lease is omitted instead of guessing a port", () => {
+    expect(
+      desiredTunnelConfigFor(
+        directRow({
+          tunnel_mode: "relay",
+          ingress_node_id: 3,
+          middle_node_id: NODE,
+          egress_node_id: 4,
+          egress_port: 22001,
+          egress_node: { connect_ip: "10.0.0.4" },
+          port_leases: [],
+        }),
+        NODE,
+      ),
+    ).toEqual({ kind: "not_for_node" });
+  });
+
+  test("snapshot DB selection includes middle_node_id, not only ingress/egress", async () => {
+    const src = await Bun.file(new URL("../agent-command-bus.ts", import.meta.url)).text();
+    expect(src).toContain("{ middle_node_id: nodeId }");
+    expect(src).toContain("port_leases:");
+  });
+
   test("relay rows resolve one protocol for both legs", () => {
     const ingress = desiredTunnelConfigFor(
       directRow({
