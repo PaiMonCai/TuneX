@@ -32,7 +32,14 @@ export const DIAGNOSE_MAX_TARGETS = 8;
 /** 一次诊断命令的等待上限（毫秒）。探针本身有更小的预算，这里只兜底。 */
 export const DIAGNOSE_COMMAND_TIMEOUT_MS = 20_000;
 
-export type DiagnoseSegmentName = "ingress_to_target" | "ingress_to_egress" | "egress_to_target";
+export type DiagnoseSegmentName =
+  | "ingress_to_target"
+  | "ingress_to_egress"
+  // V5.4：三跳路由把"入口↔出口"这一段**拆成两段**，因此诊断也要按 hop 分解 ——
+  // 否则三跳下只能得到"这条转发有问题"，而 G4 明确要求遥测能**定位失败跳**。
+  | "ingress_to_middle"
+  | "middle_to_egress"
+  | "egress_to_target";
 
 /**
  * How a segment's conclusion was obtained.
@@ -144,6 +151,15 @@ export interface ForwardForDiagnose {
   egress_node_key: string | null;
   egress_connect_ip: string | null;
   egress_port: number | null;
+  /**
+   * V5.4：三跳路由的中间跳（`null`/缺省 = 单跳）。诊断必须知道它，才能把
+   * "入口↔出口"拆成两段并**点名**失败的那一跳。
+   */
+  middle_node_id?: number | null;
+  middle_node_key?: string | null;
+  middle_connect_ip?: string | null;
+  /** 中间跳自己的监听端口（节点间内部端口）。 */
+  middle_port?: number | null;
   remote_host: string | null;
   remote_port: number | null;
   /** 期望两端收敛到的 revision（desired）；facts 段用它判断是否落后。 */
@@ -436,10 +452,28 @@ export function defaultDiagnoseDeps(): DiagnoseDeps {
         include: {
           ingress_node: { select: { id: true, node_id: true, connect_ip: true } },
           egress_node: { select: { id: true, node_id: true, connect_ip: true } },
+          // V5.4：中间跳也是**一跳**，诊断必须能点名它，否则三跳下只能得到
+          // "这条转发有问题"，而 G4 明确要求遥测能定位失败跳。
+          middle_node: { select: { id: true, node_id: true, connect_ip: true } },
           egress_pool: { select: { name: true, targets: { select: { host: true, port: true } } } },
         },
       });
       if (!row) return null;
+      // 中间跳的端口：与 `allocateTunnelPort({direction: "egress", nodeId: middle})` 同一个键，
+      // 因此这里按 (node, tunnel, active) 查一次即可 —— 不在 tunnel 行上再放一列，
+      // 因为"哪个节点上哪个端口"的事实本来就属于租约表。
+      const middlePort =
+        row.middle_node == null
+          ? null
+          : ((await db.nodePortLease.findFirst({
+              where: {
+                tunnel_id: row.id,
+                node_id: row.middle_node.id,
+                direction: "egress",
+                status: "active",
+              },
+              select: { port: true },
+            })) as { port: number } | null)?.port ?? null;
       return {
         id: row.id,
         mode: (row.tunnel_mode ?? "direct") as "direct" | "relay",
@@ -450,6 +484,15 @@ export function defaultDiagnoseDeps(): DiagnoseDeps {
         egress_node_key: row.egress_node?.node_id ?? null,
         egress_connect_ip: row.egress_node?.connect_ip ?? null,
         egress_port: row.egress_port ?? null,
+        // 中间跳的事实（三跳才有）。它的监听端口用 `egress_port` 这一列承载不了 ——
+        // 中间跳的端口来自它自己的 `node_port_lease`（`direction=egress`，节点是中间跳），
+        // 因此这里按同一个键取：该 (node, tunnel) 上 active 的 egress 租约。
+        middle_node_id: row.middle_node?.id ?? null,
+        middle_node_key: row.middle_node?.node_id ?? null,
+        middle_connect_ip: row.middle_node?.connect_ip ?? null,
+        // 中间跳的监听端口不在 tunnel 行上（那一列的语义是"出口的内部端口"）：它来自
+        // 中间跳自己的端口租约 `(node_id=middle, tunnel_id=row, direction=egress, active)`。
+        middle_port: middlePort,
         remote_host: row.remote_host ?? null,
         remote_port: row.remote_port ?? null,
         config_revision: row.config_revision ?? null,
