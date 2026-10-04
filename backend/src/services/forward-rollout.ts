@@ -194,6 +194,13 @@ export interface RolloutSnapshot {
   egress_port: number | null;
   egress_targets: Array<{ host: string; port: number; weight: number; order_by: number }> | null;
   desired_status: string | null;
+  /**
+   * V5.4：中间跳。NULL / 缺省 = 单跳（V4 行为，绝大多数行都是这样）。
+   *
+   * 可选而不是必填：现有所有构造点与替换快照都不需要知道它，而"缺省 = 没有中间跳"正是 V4 的
+   * 真实语义 —— 让每个构造点都必须写 `null` 只会制造噪声，不会增加安全。
+   */
+  middle_node_id?: number | null;
 }
 
 /** 计划需要的节点事实（最小投影）。 */

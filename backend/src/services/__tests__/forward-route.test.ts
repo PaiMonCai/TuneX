@@ -112,15 +112,66 @@ describe("V5.4: adjacency needs a binding, and errors name the hop", () => {
 });
 
 describe("V5.4: a route that cannot be dispatched is REFUSED, not silently degraded", () => {
-  test("a single-hop route needs its neighbour binding too — and the topology has them", () => {
-    // 这条断言来自一次真实的核对：e2e 拓扑里 RELAY 的 (3 -> 4) **确实**存在 node_binding，
-    // 也就是说"相邻必须有绑定"并不是新引入的负担，而是 V4 已经在做的事。
-    // 反过来说：如果 V4 从不为单跳建立绑定，那么强制这条要求会拒绝**所有存量转发** ——
-    // 那是回归，不是收紧。核对过之后才敢把它当成准入条件。
+  test("a single-hop route is admitted WITHOUT a pre-existing binding — the rollout creates it", () => {
+    // 这条断言的结论在 round 20 被修正过，值得留下推理过程：
+    //
+    // round 16 我核对到 e2e 拓扑里 `node_binding` 确实有 (3 -> 4)，于是把"相邻必须有绑定"也套到
+    // 单跳上。但那是个**创建之后**的状态：RELAY 首次部署时 Binding 还不存在，而 rollout 计划里
+    // 本来就有 `ensure_binding` 步骤 —— **创建它正是那次 rollout 的工作**。在准入阶段要求它，
+    // 会把每一次 RELAY 的首次部署都拒掉（实测：34 个用例失败）。
+    //
+    // 所以要问的不是"绑定存不存在"，而是"**谁负责创建它**"。单跳：rollout 创建 ⇒ 准入不管；
+    // 三跳：中间跳是新增链路，必须先有许可（§9 冻结契约第 3 条）⇒ 准入必须查。
     const relayPlacement = {
       ingress_node_id: 3, egress_node_id: 4, middle_node_id: null, tunnel_mode: "relay" as const, revision: 1,
     };
-    expect(admitRoute(relayPlacement, new Set()).ok).toBe(false);
+    expect(admitRoute(relayPlacement, new Set()).ok).toBe(true);
+    expect(admitRoute(relayPlacement, new Set(["3->4"])).ok).toBe(true);
+  });
+
+  test("but a node cannot be BOTH a middle hop and an end", () => {
+    // 那两条才是真正要禁止的，而且由 buildRoutePlan 直接拒绝（不进校验层）。
+    expect(direct({ middle_node_id: 3 })).toBeNull();
+    expect(relay({ middle_node_id: 3 })).toBeNull();
+    expect(relay({ middle_node_id: 4 })).toBeNull();
+  });
+
+  test("forward applies FAR first, compensation tears down NEAR first", () => {
+    const plan = relay({ middle_node_id: 5 })!;
+    const forward = routeSteps(plan).map((s) => s.hop_index);
+    const compensate = compensationSteps(plan).map((s) => s.hop_index);
+    // §1 铁律在 N 跳上的推广：正向先远后近（2,1,0），拆除先近后远（0,1,2）。
+    expect(forward).toEqual([2, 1, 0]);
+    expect(compensate).toEqual([0, 1, 2]);
+  });
+
+  test("every step says which role it is, so a caller cannot apply the wrong thing", () => {
+    const steps = routeSteps(relay({ middle_node_id: 5 })!);
+    expect(steps.map((s) => s.action)).toEqual(["apply_target_dial", "apply_transit", "apply_client_front"]);
+  });
+
+  test("a failure is attributed to a HOP, not just to a Forward", () => {
+    const plan = relay({ middle_node_id: 5 })!;
+    expect(attributeFailure(plan, 5)).toEqual({ hop_index: 1, node_id: 5 });
+    expect(attributeFailure(plan, 999)).toBeNull();
+  });
+});
+
+describe("V5.4: a route that cannot be dispatched is REFUSED, not silently degraded", () => {
+  test("a single-hop route is admitted WITHOUT a pre-existing binding — the rollout creates it", () => {
+    // 结论在 round 20 被修正，推理过程值得留着：
+    //
+    // round 16 我核对到 e2e 拓扑里 `node_binding` 确实有 (3 -> 4)，于是把"相邻必须有绑定"也套到
+    // 单跳上。但那是一个**创建之后**的状态：RELAY 首次部署时 Binding 还不存在，而 rollout 计划里
+    // 本来就有 `ensure_binding` 步骤 —— **创建它正是那次 rollout 的工作**。在准入阶段要求它，会把
+    // 每一次 RELAY 的首次部署都拒掉（实测：34 个用例失败）。
+    //
+    // 所以要问的不是"绑定存不存在"，而是"**谁负责创建它**"：单跳由 rollout 创建 ⇒ 准入不管；
+    // 三跳的中间跳是新增链路，必须先有许可（§9 冻结契约第 3 条）⇒ 准入必须查。
+    const relayPlacement = {
+      ingress_node_id: 3, egress_node_id: 4, middle_node_id: null, tunnel_mode: "relay" as const, revision: 1,
+    };
+    expect(admitRoute(relayPlacement, new Set()).ok).toBe(true);
     expect(admitRoute(relayPlacement, new Set(["3->4"])).ok).toBe(true);
   });
 

@@ -58,6 +58,7 @@ import {
   type DispatchFacts,
 } from "./forward-contract.ts";
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
+import { admitRoute } from "./forward-route.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
 
 /** Existing runtime use, not a new creation/count slot. Production never defaults to allow. */
@@ -397,6 +398,25 @@ interface TunnelProjection {
  * 找不到（suspend bump 出的 revision 没有 snapshot，报告 R5）时回退到投影列
  * 合成基线——与 WP1 `currentDesiredConfig` 同口径。
  */
+/**
+ * 相邻两跳的绑定集合（`"ingress->egress"`）。V5.4 路由准入需要它，而它是**外部事实**，
+ * 因此在这里一次性读出来交给纯判定。
+ *
+ * 读不到时返回空集合 = "没有绑定" ⇒ 三跳路由会被拒（fail-closed）。多跳在没有许可链路时本来
+ * 就不该下发，把"读不到"当成"有绑定"才是危险方向。
+ */
+async function loadBoundPairs(db: RolloutDb): Promise<ReadonlySet<string>> {
+  // 两级都要存在才调用：替身可以有 `nodeBinding` 却没有 `findMany`
+  // （实测：只给 `findUnique` 的替身会让 `?.findMany(...)` 抛 TypeError ——
+  // 可选链只护住了第一层，护不住第二层。这是"部分端口不该炸掉整条路径"的同一类问题）。
+  const port = (db as unknown as { nodeBinding?: { findMany?: (args: unknown) => Promise<unknown> } }).nodeBinding;
+  if (typeof port?.findMany !== "function") return new Set<string>();
+  const rows = (await port.findMany({ select: { ingress_node_id: true, egress_node_id: true } }).catch(() => [])) as
+    | Array<{ ingress_node_id: number; egress_node_id: number }>
+    | undefined;
+  return new Set((rows ?? []).map((b) => `${b.ingress_node_id}->${b.egress_node_id}`));
+}
+
 async function loadRolloutNodes(
   tunnelId: number,
   deps: { db: RolloutDb },
@@ -2065,6 +2085,35 @@ export async function registerRollout(
   }
 
   const { desired, applied, nodes, bindingExists } = await loadRolloutNodes(input.tunnelId, { db });
+
+  // ── V5.4：路由准入（整条路由已知的那一层）──
+  //
+  // 放在这里而不是每条腿各自判定：`dispatchIngress` 看不到出口节点，按腿判定会把**每一个 RELAY
+  // 都拒掉**（试过，28 个测试失败）。路由是一个整体，准入也必须看在整条路由上。
+  //
+  // 配置了中间跳 = 三跳，而当前下发只会发单跳形状：放行的话转发**会正常工作，但走的是另一条路**，
+  // 没有任何错误。因此 fail-closed —— 在**任何副作用之前**拒绝，并点名是哪一跳。
+  const routeAdmission = admitRoute(
+    {
+      ingress_node_id: desired.ingress_node_id,
+      egress_node_id: desired.egress_node_id,
+      middle_node_id: (desired as { middle_node_id?: number | null }).middle_node_id ?? null,
+      tunnel_mode: desired.mode,
+      revision: input.revision,
+    },
+    await loadBoundPairs(db),
+  );
+  if (!routeAdmission.ok) {
+    return {
+      ok: false,
+      rolloutId: null,
+      status: "blocked",
+      error_code: routeAdmission.code,
+      error: routeAdmission.error,
+      blocking: [{ code: routeAdmission.code, message: routeAdmission.error }],
+    };
+  }
+
   if (!input.suspended && input.impact.runtime_change) {
     const denied = await rolloutRuntimeDenial(input.tunnelId, desired, deps);
     if (denied) {

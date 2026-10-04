@@ -145,6 +145,7 @@ export function buildRoutePlan(placement: RoutePlacement): RoutePlan | null {
 export function routeViolations(
   plan: RoutePlan,
   boundPairs: ReadonlySet<string>,
+  opts: { requireBindings?: boolean } = {},
 ): RouteViolation[] {
   const out: RouteViolation[] = [];
   if (plan.hops.length > MAX_ROUTE_HOPS) out.push("too_many_hops");
@@ -164,6 +165,9 @@ export function routeViolations(
   if (plan.middle_node_id === plan.egress_node_id) out.push("middle_equals_egress");
 
   // 相邻跳必须有绑定（同一节点上的"两端"不需要绑定：那是同一台机器）。
+  // `requireBindings: false` 用于**单跳**准入：那一跳的 Binding 是本次 rollout 的
+  // `ensure_binding` 步骤要去创建的，要求它预先存在会拒掉每一次 RELAY 的首次部署。
+  if (opts.requireBindings === false) return out;
   for (let i = 0; i + 1 < plan.hops.length; i += 1) {
     const a = plan.hops[i]!;
     const b = plan.hops[i + 1]!;
@@ -247,7 +251,16 @@ export function admitRoute(
   if (plan === null) {
     return { ok: false, code: "route_invalid", error: "路由放置事实不完整或自相矛盾（缺入口/出口，或中间跳与端点重合）" };
   }
-  const violations = routeViolations(plan, boundPairs);
+  // ── 绑定检查只对**多跳**成立 ──
+  //
+  // 单跳（DIRECT 的两端在同一台机器上；RELAY 的入出口）不需要预先存在 Binding：rollout 计划里
+  // 本来就有 `ensure_binding` 步骤，**创建**它正是那次 rollout 的工作之一。在准入阶段要求它，
+  // 会把每一次 RELAY 的**首次部署**都拒掉 —— 实测就是这样（34 个用例失败）。
+  //
+  // 三跳则相反：中间跳是**新增的一段链路**，它必须先有许可（§9 冻结契约第 3 条），
+  // 而"先有"意味着在准入时就已经存在。
+  const requiresBindings = plan.middle_node_id !== null;
+  const violations = routeViolations(plan, boundPairs, { requireBindings: requiresBindings });
   if (violations.length > 0) {
     return {
       ok: false,
