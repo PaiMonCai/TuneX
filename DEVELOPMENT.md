@@ -2747,4 +2747,24 @@ CI/Integration/Release
 
 V5 的成功标准不是“支持的协议字符串更多”，而是：
 
-> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。**
+> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 11 结果：G3 = 44 PASS / 2 FAIL，两项都定位清楚（都不是产品缺陷）**
+
+1. `G3.6` —— **门禁脚本陈旧**：断言在本地修好了但忘了 `docker cp` 到 runner，那一轮用的仍是旧副本。
+2. `G3.11`（自动迁移）—— 补上可观测性之后**一行日志就看清了**：
+
+~~~text
+[worker] failover: failover decision {"tunnel_id":2,"detail":"action=hold blockers=target_side_failure,no_standby_candidate"}
+[worker] failover sweep: {"evaluated":1,"moved":0,"held":1}
+~~~
+
+**两个 blocker 都是产品在正确地说不**：池里还留着**永远不应答**的目标 `target-a:9` ⇒ 策略判定"问题在目标侧"，
+而迁移修不好目标（§8 明确禁止用它掩盖目标故障）；候选节点必须是**同一入口节点组**内的非现任节点，
+而 e2e 里 node 3 与 node 5 **分属不同组**。所以下一轮要改的是**fixture**（池只含全健康目标 + 在 owner 组内
+放一台可用入口节点），**不是代码** —— 把 blocker 放松到让门禁过去，恰好会删掉让自动迁移安全的两个保护。
+
+**本轮的真正收获是可观测性**：worker 的 failover 日志回调**只打 warn/error**，而"hold / 正在等租约"这类结果
+按 INFO 汇报（**正确的等待不是警告**）⇒ 一次"自动迁移没发生"的门禁失败**在日志里完全无痕**。已改为
+**所有级别都打印**并在每拍输出 `evaluated/moved/held`。规则与这一阶段反复学到的是同一条：
+**决策不留痕的机制，与从未运行过的机制无法区分。**
+
+
