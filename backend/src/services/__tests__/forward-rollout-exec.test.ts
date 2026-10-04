@@ -340,6 +340,7 @@ function fakeOrchestrator(opts: FakeOrchestratorOpts = {}) {
     dispatchIngress: [] as Array<Record<string, unknown>>,
     dispatchDirect: [] as Array<Record<string, unknown>>,
     removeTunnel: [] as Array<Record<string, unknown>>,
+    releaseOwnership: [] as Array<Record<string, unknown>>,
   };
   const fail = { error_code: opts.failCode ?? "agent_rejected", error: "fake transport failure" };
   const orch = {
@@ -368,6 +369,10 @@ function fakeOrchestrator(opts: FakeOrchestratorOpts = {}) {
       calls.removeTunnel.push(input);
       if (opts.failOn?.removeTunnel) return { ok: false as const, ...fail };
       return { ok: true as const, result: { commandId: "cmd-r", revision: Number(input.revision), ack: {} } };
+    },
+    releaseOwnership: async (input: Record<string, unknown>) => {
+      calls.releaseOwnership.push(input);
+      return { ok: true as const };
     },
   };
   return orch as unknown as RolloutDeps["orchestrator"] & typeof orch;
@@ -523,6 +528,77 @@ function modeSwitchEnv() {
 }
 
 
+/** V4-F1：建一个「DIRECT ingress 11 → 12」迁移环境。 */
+function ingressMigrationEnv(overrides: { failOn?: FakeOrchestratorOpts["failOn"] } = {}) {
+  const f = fakeDb();
+  f.addLease({
+    node_id: 11,
+    port: 10001,
+    lease_type: "ingress",
+    tunnel_id: 1,
+    status: "active",
+    expires_at: null,
+  });
+  f.addSnapshot({
+    tunnel_id: 1,
+    revision: 6,
+    name: "fwd",
+    desired_status: "active",
+    mode: "direct",
+    ingress_node_id: 11,
+    egress_node_id: null,
+    middle_node_id: null,
+    listen_port: 10001,
+    target_host: "10.9.9.9",
+    target_port: 8080,
+    egress_pool_id: null,
+    egress_port: null,
+    targets: null,
+    listen_ip: null,
+  });
+  f.addSnapshot({
+    tunnel_id: 1,
+    revision: 7,
+    name: "fwd",
+    desired_status: "active",
+    mode: "direct",
+    ingress_node_id: 12,
+    egress_node_id: null,
+    middle_node_id: null,
+    listen_port: 10001,
+    target_host: "10.9.9.9",
+    target_port: 8080,
+    egress_pool_id: null,
+    egress_port: null,
+    targets: null,
+    listen_ip: null,
+  });
+  f.addTunnel({
+    id: 1,
+    name: "fwd",
+    tunnel_mode: "direct",
+    ingress_node_id: 12,
+    egress_node_id: null,
+    middle_node_id: null,
+    listen_ip: null,
+    listen_port: 10001,
+    remote_host: "10.9.9.9",
+    remote_port: 8080,
+    egress_pool_id: null,
+    egress_port: null,
+    config_revision: 7,
+    desired_revision_id: null,
+    desired_status: "active",
+    apply_status: "pending",
+    applied_revision: 6,
+    node_id: 12,
+  });
+
+  const orch = fakeOrchestrator({ failOn: overrides.failOn });
+  const deps: RolloutDeps = { db: f.db, runtimeUse: async () => null, orchestrator: orch, sleep: async () => {} };
+  return { f, deps, orch };
+}
+
 /** V5.4：建一个「三跳 rev6 → 单跳 rev7」环境，专门覆盖 G4.6 的回切。 */
 function removeMiddleHopEnv() {
   const f = fakeDb();
@@ -592,6 +668,68 @@ function removeMiddleHopEnv() {
 /* ------------------------------------------------------------------ */
 /* 1. 正常路径                                                          */
 /* ------------------------------------------------------------------ */
+
+describe("V4-F1 ingress ownership handoff", () => {
+  it("stops old ingress and releases ownership before dispatching the new ingress", async () => {
+    const { f, deps, orch } = ingressMigrationEnv();
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({
+          ingress_node_change: true,
+          listener_replacement: true,
+          changes_external_address: true,
+        }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+
+    expect(res.ok).toBe(true);
+    expect(orch.calls.removeTunnel).toHaveLength(1);
+    expect(orch.calls.releaseOwnership).toHaveLength(1);
+    expect(orch.calls.dispatchDirect).toHaveLength(1);
+
+    const oldRemoval = orch.calls.removeTunnel[0]!;
+    expect(oldRemoval).toMatchObject({
+      tunnelId: 1,
+      revision: 7,
+      direction: "direct",
+    });
+    expect(Number((oldRemoval.node as { id?: number } | undefined)?.id)).toBe(11);
+    expect(orch.calls.releaseOwnership[0]).toMatchObject({ tunnelId: 1, nodeId: 11 });
+
+    const newDispatch = orch.calls.dispatchDirect[0]!;
+    expect(Number((newDispatch.ingressNode as { id?: number } | undefined)?.id)).toBe(12);
+
+    expect(f.leases.find((l) => l.node_id === 11 && l.port === 10001)?.status).toBe("released");
+    expect(f.leases.find((l) => l.node_id === 12 && l.port === 10001)?.status).toBe("active");
+  });
+
+  it("if new ingress cutover fails, compensation releases the attempted owner before replaying baseline", async () => {
+    const { deps, orch } = ingressMigrationEnv({ failOn: { dispatchDirect: true } });
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({
+          ingress_node_change: true,
+          listener_replacement: true,
+          changes_external_address: true,
+        }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+
+    expect(res.ok).toBe(false);
+    // handoff old owner + compensation attempted new owner release
+    expect(orch.calls.releaseOwnership.length).toBeGreaterThanOrEqual(2);
+    expect(orch.calls.releaseOwnership[0]).toMatchObject({ tunnelId: 1, nodeId: 11 });
+    expect(orch.calls.releaseOwnership.some((x) => x.nodeId === 12)).toBe(true);
+  });
+});
 
 describe("V5.4 middle-hop topology cutover", () => {
   it("removing middle hop re-cuts ingress to egress, retires transit, and releases only the transit lease", async () => {
