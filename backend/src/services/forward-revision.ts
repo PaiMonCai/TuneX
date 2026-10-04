@@ -119,6 +119,8 @@ export interface ForwardImpact {
   listener_replacement: boolean;
   ingress_node_change: boolean;
   egress_node_change: boolean;
+  /** V5.4：中间跳增加 / 删除 / 换节点。它不换 listener，但一定会改变 RELAY next_hop。 */
+  middle_node_change: boolean;
   mode_change: boolean;
   /** target host/port 热换（旧连接保持、新连接走新目标）。 */
   target_change: boolean;
@@ -601,6 +603,8 @@ export function computeForwardImpact(input: {
     input.current.ingress_node_id !== input.candidate.ingress_node_id;
   const egressNodeChange =
     input.current.egress_node_id !== input.candidate.egress_node_id;
+  const middleNodeChange =
+    (input.current.middle_node_id ?? null) !== (input.candidate.middle_node_id ?? null);
   const listenPortChange =
     (input.current.listen_port ?? null) !== (input.candidate.listen_port ?? null) ||
     (input.currentResolvedListenPort ?? null) !== (input.resolvedListenPort ?? null);
@@ -647,6 +651,7 @@ export function computeForwardImpact(input: {
     listener_replacement: listenerReplacement,
     ingress_node_change: ingressNodeChange,
     egress_node_change: egressNodeChange,
+    middle_node_change: middleNodeChange,
     mode_change: modeChange,
     target_change: targetChange,
     egress_target_change: egressTargetChange,
