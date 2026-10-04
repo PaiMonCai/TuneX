@@ -153,6 +153,21 @@ const worker = new Worker(
         // produce findings instead of automatic migration.
         const deps = defaultReconcileDeps();
         deps.sink = createRuntimeReconcileSink();
+        // V5.3 WP10: evaluate automatic failover AFTER the rollout resume above and
+        // after this tick's repairs. Order matters: a node that is merely behind gets
+        // repaired by the resend path first, and only what remains broken is considered
+        // for a migration. The sweep is fail-closed internally — with no
+        // FAILOVER_POLICY configured it does nothing at all.
+        deps.failoverSweep = async () => {
+          const { runFailoverSweep } = await import("./services/failover-loop.ts");
+          const r = await runFailoverSweep({
+            log: (e) => {
+              if (e.level === "error") console.error("[worker] failover:", e.message, e.detail ?? "");
+              else if (e.level === "warn") console.warn("[worker] failover:", e.message, e.detail ?? "");
+            },
+          });
+          return { evaluated: r.evaluated, moved: r.moved, held: r.held };
+        };
         const r = await executeReconcile(deps);
         const summary = {
           scanned: r.scanned,

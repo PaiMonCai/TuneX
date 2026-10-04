@@ -1149,6 +1149,9 @@ model TunnelTraffic {
 
 enum SystemConfigName {
   MIN_TOPUP_AMOUNT
+  /// V5.3 WP10：自动故障转移/回切的运维策略（JSON：`{auto_failover, auto_failback}`）。
+  /// 缺省不存在 ⇒ 两个都视为 false（fail-closed：策略没被配置过就不许自动搬流量）。
+  FAILOVER_POLICY
   NOTICE
   NOTICE_POPUP
   NOTICE_POPUP_INTERVAL_HOURS

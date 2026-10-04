@@ -575,6 +575,17 @@ export interface ReconcileDeps {
   sink?: ReconcileSink | null;
   /** 端口租约回收（生产 = WP3 `reconcileLeases`）。 */
   reconcileLeases?: ReconcileLeasePort | null;
+  /**
+   * V5.3 WP10：自动故障转移评估（生产 = `runFailoverSweep`）。
+   *
+   * 注入而不是直接 import，有两个理由：本模块的用例不需要数据库；以及**顺序**
+   * 必须由调用方掌握 —— 先续跑未完成的 rollout，再评估新的迁移，否则一次未完成的迁移
+   * 会被当成"又一次掉线"再迁一遍。
+   *
+   * 缺省 = 不评估（旧行为）。这不是"忘了接线"的安全网，而是**有意的缺省**：没有策略
+   * 配置时自动迁移本来就不该发生（§8：必须是显式 policy）。
+   */
+  failoverSweep?: (() => Promise<{ evaluated: number; moved: number; held: number }>) | null;
   /** 端口租约回收的依赖注入（透传给 WP3）。 */
   leaseDeps?: unknown;
   log?: ReconcileLogger;
@@ -598,6 +609,13 @@ export interface ReconcileOutcome {
   noTransport: number;
   /** 端口租约回收统计（`null` = 本轮未配置回收依赖）。 */
   leases: { releasedDanglingTunnel: number; releasedExpired: number } | null;
+  /**
+   * V5.3 WP10：自动迁移评估结果（`null` = 本轮未配置该依赖）。
+   *
+   * 放在 outcome 里而不是只写日志：迁移是"改变了谁承载流量"的动作，它的次数必须和
+   * resend/failed 一样是**可观测的返回值**，否则"这轮到底有没有搬流量"只能靠翻日志。
+   */
+  failover: { evaluated: number; moved: number; held: number } | null;
   forbiddenSuppressed: ForbiddenActionKind[];
 }
 
@@ -710,6 +728,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
   let failed = 0;
   let noTransport = 0;
 
+  let failoverSummary: { evaluated: number; moved: number; held: number } | null = null;
   const loadTunnels = deps.tunnels ?? (async () => [] as DesiredTunnel[]);
   const loadNodes = deps.nodes ?? (async () => [] as NodeOnlineInput[]);
   const loadReports = deps.reports ?? (async () => new Map<number, NodeReport>());
@@ -846,6 +865,23 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     });
   }
 
+  // ── V5.3 WP10：自动迁移评估（在逐条修复之后）──
+  //
+  // 顺序是刻意的：先把"该重发的重发、该补 runtime 的补上"，再考虑"要不要把归属搬走"。
+  // 反过来的话，一个只是暂时落后的节点会被判成故障并触发一次代价高昂的迁移。
+  if (deps.failoverSweep) {
+    try {
+      failoverSummary = await deps.failoverSweep();
+      if (failoverSummary.moved > 0) {
+        log("failover sweep", { moved: failoverSummary.moved, evaluated: failoverSummary.evaluated });
+      }
+    } catch (e) {
+      // 迁移评估失败绝不阻断本轮 reconcile：下一轮会自然重试，且失败本身已由
+      // 执行器的结构化结果记账（这里只保证不影响其它动作）。
+      log("failover sweep failed", { detail: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   return {
     scanned: tunnels.length,
     findings,
@@ -853,6 +889,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     resent,
     failed,
     noTransport,
+    failover: failoverSummary,
     leases: leases ?? (leaseReconciler ? EMPTY_LEASES : null),
     forbiddenSuppressed: [...forbidden],
   };
