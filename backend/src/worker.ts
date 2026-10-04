@@ -191,6 +191,19 @@ const worker = new Worker(
         };
         if (r.findings.length > 0 || r.failed > 0) {
           console.log("[worker] cron_reconcile_v3:", JSON.stringify(summary));
+          // V5.3 round 14: finding DETAILS, not just the count.
+          //
+          // Second time this gap cost a round: `failed: 1` says a dispatch was attempted and
+          // threw, and the reason lived only inside a finding nobody printed. A count tells you
+          // something happened; only the detail tells you what.
+          for (const f of r.findings) {
+            if (f.severity === "error" || f.code === "resend_skipped") {
+              console.log(
+                "[worker] reconcile finding:",
+                JSON.stringify({ code: f.code, tunnel_id: f.tunnel_id, node_id: f.node_id, detail: f.detail }),
+              );
+            }
+          }
         }
         return summary;
       }

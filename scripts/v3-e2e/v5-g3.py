@@ -246,25 +246,42 @@ def setup():
     # is the normal recovery path and it keeps a leftover state from looking like a defect.
     if H.owner_container:
         rejoin_owner(H.owner_container)
+    # Deterministic start: if the Forward is not serving, restart BOTH of its nodes' agents so
+    # their runtimes are re-pulled from the desired state. A single-agent restart is not enough,
+    # because an interrupted run (or a hand experiment) can leave the placement and the runtime
+    # on different nodes — and then the gate reports failures about a mechanism that is fine.
     if not H.wait_until(lambda: served(listen_port)[0], timeout=90, interval=5):
-        H.docker(["restart", H.owner_container], allow=True, timeout=150)
-        H.wait_until(lambda: served(listen_port)[0], timeout=150, interval=5)
+        containers = {H.owner_container}
+        egress_agent = owner_container(int(H.scalar(f"SELECT IFNULL(egress_node_id,0) FROM tunnel WHERE id={tunnel_id};") or 0))
+        if egress_agent:
+            containers.add(egress_agent)
+        for c in sorted(containers):
+            H.docker(["restart", c], allow=True, timeout=180)
+        H.wait_until(lambda: served(listen_port)[0], timeout=300, interval=8)
     check(served(listen_port)[0],
           "G3.setup the Forward is really serving before anything is fenced",
           f"port={listen_port}")
 
-    # Guarantee a lease exists before any case runs: a Forward that has never been claimed
-    # has nothing to fence, and "no lease yet" is a setup condition rather than a failure.
+    # ── fixture alignment ──
+    #
+    # The gate's cases read ownership from the LEASE and placement from the TUNNEL row, so the
+    # two must agree before the case starts. A hand-run experiment (or an earlier interrupted
+    # run) can leave them disagreeing — the lease handed back to one node while the tunnel row
+    # still points at the other — and then the gate computes a "standby" that is really the
+    # previous owner and reports four confusing failures around one correct migration.
+    #
+    # The lease is the source of truth for ownership (§8), so the placement is aligned to it.
     if lease_row(tunnel_id):
-        # Make it FRESH: an earlier run can legitimately have left it expired, and G3.2's
-        # premise ("a takeover while the lease is live is refused") needs a live lease.
         claim(tunnel_id, ingress_node, revision=1)
-    if not lease_row(tunnel_id):
+    else:
         created = claim(tunnel_id, ingress_node, revision=1)
         check(bool(created.get("ok")), "G3.setup a placement lease was claimed for the current owner",
               json.dumps(created))
-    check(bool(lease_row(tunnel_id)), "G3.setup the placement lease exists before any fencing case",
-          json.dumps(lease_row(tunnel_id)))
+    H.mysql(f"UPDATE tunnel SET ingress_node_id={ingress_node} WHERE id={tunnel_id};")
+    check(lease_row(tunnel_id).get("owner_node_id") == ingress_node
+          and int(H.scalar(f"SELECT IFNULL(ingress_node_id,0) FROM tunnel WHERE id={tunnel_id};") or 0) == ingress_node,
+          "G3.setup ownership (lease) and placement (tunnel) agree before any case",
+          json.dumps({"lease": lease_row(tunnel_id), "owner_node": ingress_node}))
 
 
 def cleanup():
