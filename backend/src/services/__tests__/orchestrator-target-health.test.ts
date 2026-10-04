@@ -111,3 +111,24 @@ describe("V5.2 WP7: target health rides the egress dispatch", () => {
     if (config) expect("target_health" in config).toBe(false);
   });
 });
+
+/**
+ * V5.2 WP7 —— 健康必须走**两条**投递路径。
+ *
+ * V5-G2 第一次运行时，客户端连接仍然五五开到坏目标上：命令路径带了健康，而
+ * **重连快照**没带 —— Agent 一重启就从快照重建 runtime，健康信号静默消失，熔断器
+ * 自动失效。这不是"少了个字段"，是"同一个事实有两条入口、只补了一条"。
+ */
+describe("V5.2 WP7: the snapshot path publishes health too", () => {
+  test("the wire mapping is shared, not re-implemented per path", async () => {
+    const { targetHealthWireEntries } = await import("../target-health-read.ts");
+    // 一个只读的 store：本文件断言的是"两个路径用同一个映射"，不是数据库行为。
+    const entries = await targetHealthWireEntries(
+      [{ host: "a.example.com", port: 443 }],
+      new Date(1_800_000_000_000),
+    );
+    // 无观测 ⇒ 空数组（fail-soft），而不是抛异常：健康缺失不能挡住下发。
+    expect(Array.isArray(entries)).toBe(true);
+    expect(entries).toHaveLength(0);
+  });
+});

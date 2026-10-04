@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -463,5 +464,26 @@ func TestConcurrentCacheWritesStayValid(t *testing.T) {
 	}
 	if len(loaded.Tunnels) != 1 {
 		t.Fatalf("final cache must be one complete snapshot, got %+v", loaded.Tunnels)
+	}
+}
+
+// V5.2 WP7 —— 快照里的健康必须被安装，否则**每次 Agent 重启都会关掉熔断器**。
+//
+// V5-G2 抓到过这个：恢复路径只装了 targets，于是重启后的节点把连接继续五五开送到
+// 面板判定为 unhealthy 的目标上。这不是"少个字段"，是同一个事实有两条入口、只补了
+// 一条 —— V5.1 里协议、证书路径各踩过一次。
+func TestRestoreInstallsHealthFromTheSnapshot(t *testing.T) {
+	// 这条断言在 manager 侧已经由 SetPoolAndHealth 的用例覆盖；这里守的是**调用方
+	// 必须走那条路**：一旦 restore 退回 SetPool，重启就会静默丢掉健康信号。
+	src, err := os.ReadFile("restore.go")
+	if err != nil {
+		t.Fatalf("read restore.go: %v", err)
+	}
+	body := string(src)
+	if !strings.Contains(body, "SetPoolAndHealth") {
+		t.Fatal("restore must install health from the snapshot (SetPoolAndHealth), not targets alone")
+	}
+	if !strings.Contains(body, "len(cfg.TargetHealth) > 0") {
+		t.Fatal("restore must fall back to the health-less path when the snapshot carries no health")
 	}
 }

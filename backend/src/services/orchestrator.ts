@@ -68,7 +68,7 @@ import {
   type CommandEnvelope,
 } from "./control-protocol/index.ts";
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
-import { readTargetHealth } from "./target-health-read.ts";
+import { targetHealthWireEntries } from "./target-health-read.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   wireTunnelTypeForForwardProtocol,
@@ -448,20 +448,11 @@ export interface RemoveTunnelInput {
  * 合成的结论**由面板给出**，Agent 不自己定义健康；这里产出的就是那一个模型的下发形式。
  * 失败一律回落到空数组（见 dispatchEgress 的说明）：健康是优化，不是闸门。
  */
-const defaultTargetHealthSource: TargetHealthSource = async (targets) => {
-  const health = await readTargetHealth({ desired: targets, now: new Date() });
-  return health.targets.map((view) => {
-    const facts = view.facts ?? {};
-    return {
-      host: view.target.slice(0, view.target.lastIndexOf(":")) || view.target,
-      port: Number(view.target.slice(view.target.lastIndexOf(":") + 1)) || 0,
-      state: view.state,
-      latency_ms: typeof facts.latency_ms === "number" ? facts.latency_ms : null,
-      age_ms: typeof facts.age_ms === "number" ? facts.age_ms : null,
-      evidence: facts.evidence === true,
-    };
-  });
-};
+const defaultTargetHealthSource: TargetHealthSource = async (targets) =>
+  // ONE implementation of the wire mapping, shared with the snapshot path
+  // (`buildDesiredNodeSnapshot`): two copies would drift, and the symptom of drift here
+  // is an agent that has health after a command but not after a restart.
+  targetHealthWireEntries(targets, new Date());
 
 /** V5.2 WP7：一次下发的健康来源。可注入，便于离线断言"没有健康信号"的分支。 */
 export type TargetHealthSource = (

@@ -12,6 +12,10 @@ import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
 import { admitPersistedProtocol } from "./forward-contract.ts";
 import {
+  targetHealthWireEntries,
+  type TargetHealthWireEntry,
+} from "./target-health-read.ts";
+import {
   admissionLayerLabel,
   admitAction,
   admitOnNode,
@@ -907,7 +911,17 @@ export type DesiredRowOutcome =
  * exact spot where a historical non-TCP Forward used to be silently relabelled
  * `tcp` on every node restart.
  */
-export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number): DesiredRowOutcome {
+export function desiredTunnelConfigFor(
+  row: DesiredRowProjection,
+  nodeId: number,
+  /**
+   * V5.2 WP7 —— 该转发出口池的健康事实，按隧道 id 索引。
+   *
+   * 作为**入参**而不是在这里读库：这个函数是纯的（可离线断言"哪些行该下发"），而健康
+   * 是 IO 结果。由调用方（快照构建）读一次、传进来，纯函数只负责把两类事实并排放好。
+   */
+  healthByTunnel: ReadonlyMap<number, readonly TargetHealthWireEntry[]> = new Map(),
+): DesiredRowOutcome {
   const revision = row.config_revision ?? 0;
   if (revision <= 0) return { kind: "not_for_node" };
 
@@ -962,6 +976,21 @@ export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number
       row.egress_pool?.lb_strategy === "rand" ? "RANDOM" :
       row.egress_pool?.lb_strategy === "weighted_round" ? "WEIGHTED_ROUND_ROBIN" :
       "ROUND_ROBIN";
+    const poolTargets = (row.egress_pool?.targets ?? []).map((x) => ({
+      host: x.host,
+      port: x.port,
+      weight: x.weight,
+      order: Math.trunc(x.order_by),
+    }));
+    // V5.2 WP7: the snapshot carries health too, for the same reason the command path
+    // does — and for one more that is easy to miss: an agent that RESTARTS rebuilds its
+    // runtime from this snapshot, so a snapshot without health silently disables the
+    // circuit breaker until the next command arrives. V5-G2 found it exactly that way
+    // (connections still split 50/50 onto the refusing target after a restart).
+    const health = healthByTunnel.get(row.id) ?? [];
+    const healthForTargets = health.filter((h) =>
+      poolTargets.some((t) => t.host === h.host && t.port === h.port),
+    );
     return {
       kind: "config",
       config: {
@@ -972,12 +1001,8 @@ export function desiredTunnelConfigFor(row: DesiredRowProjection, nodeId: number
         remote_host: "",
         remote_port: 0,
         next_hop: "",
-        targets: (row.egress_pool?.targets ?? []).map((x) => ({
-          host: x.host,
-          port: x.port,
-          weight: x.weight,
-          order: Math.trunc(x.order_by),
-        })),
+        targets: poolTargets,
+        ...(healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
         lb_strategy: strategy,
         protocol,
         speed_limit: 0,
@@ -1035,10 +1060,29 @@ export async function buildDesiredNodeSnapshot(
     orderBy: { id: "asc" },
   });
 
+  // V5.2 WP7: read the health for the egress pools this snapshot will publish, ONCE,
+  // and hand it to the pure mapping. A restart of this node must not silently lose the
+  // circuit breaker, so the snapshot path publishes health exactly like the command
+  // path does — one wire shape, two deliveries.
+  const egressTargets: { host: string; port: number }[] = [];
+  for (const t of rows as unknown as DesiredRowProjection[]) {
+    if (t.tunnel_mode === "relay" && t.egress_node_id === nodeId) {
+      for (const x of t.egress_pool?.targets ?? []) egressTargets.push({ host: x.host, port: x.port });
+    }
+  }
+  const healthByTunnel = new Map<number, TargetHealthWireEntry[]>();
+  if (egressTargets.length > 0) {
+    const entries = await targetHealthWireEntries(egressTargets);
+    for (const t of rows as unknown as DesiredRowProjection[]) {
+      if (t.tunnel_mode !== "relay" || t.egress_node_id !== nodeId) continue;
+      healthByTunnel.set(t.id, entries as TargetHealthWireEntry[]);
+    }
+  }
+
   const tunnels: AgentTunnelConfig[] = [];
   const skipped: Array<{ id: number; reason: string }> = [];
   for (const t of rows as unknown as DesiredRowProjection[]) {
-    const outcome = desiredTunnelConfigFor(t, nodeId);
+    const outcome = desiredTunnelConfigFor(t, nodeId, healthByTunnel);
     if (outcome.kind === "skip") {
       skipped.push({ id: t.id, reason: outcome.reason });
     } else if (outcome.kind === "config") {

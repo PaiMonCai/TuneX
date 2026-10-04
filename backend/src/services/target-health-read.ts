@@ -188,3 +188,48 @@ export async function readPoolTargetHealth(input: {
   }
   return { ok: true, health: { ...health, targetIds } };
 }
+
+/** V5.2 WP7：下发用的健康事实（与 `targets` 平行的数组元素）。 */
+export interface TargetHealthWireEntry {
+  host: string;
+  port: number;
+  state: string;
+  latency_ms: number | null;
+  age_ms: number | null;
+  evidence: boolean;
+}
+
+/**
+ * 把一批期望目标合成成**下发用的健康数组**。
+ *
+ * 两个投递路径（命令下发 `dispatchEgress` 与重连快照 `buildDesiredNodeSnapshot`）都
+ * 必须带上它，否则会出现一个很难查的缺口：**Agent 重启后健康信号静默消失，熔断器
+ * 自动失效**。这正是 V5-G2 第一次运行抓到的现象 —— 客户端连接仍然五五开到坏目标上，
+ * 因为重启走的是快照路径，而那条路径当时不带健康。
+ *
+ * 失败一律回落到空数组：健康是选择顺序的优化，不是放行闸门；一次数据库抖动不该让
+ * 任何一条转发停止下发。
+ */
+export async function targetHealthWireEntries(
+  desired: readonly DesiredTargetRef[],
+  now: Date = new Date(),
+): Promise<TargetHealthWireEntry[]> {
+  try {
+    const health = await readTargetHealth({ desired, now });
+    return health.targets.map((view) => {
+      const facts = view.facts ?? {};
+      const key = view.target;
+      const sep = key.lastIndexOf(":");
+      return {
+        host: sep > 0 ? key.slice(0, sep) : key,
+        port: sep > 0 ? Number(key.slice(sep + 1)) || 0 : 0,
+        state: view.state,
+        latency_ms: typeof facts.latency_ms === "number" ? facts.latency_ms : null,
+        age_ms: typeof facts.age_ms === "number" ? facts.age_ms : null,
+        evidence: facts.evidence === true,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
