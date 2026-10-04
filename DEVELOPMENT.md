@@ -1887,6 +1887,63 @@ V5.3 才允许系统自动改变“谁承载 Forward”。
 
 ---
 
+### V5.3 冻结契约（WP8/9/10 的共同前提，2026-10-04）
+
+§8 只说"必须定义"，没给规则。以下为冻结结论；**V5.3 的任何代码都以它为准**。
+
+#### 一、归属与租约（WP9 的核心，也是 split brain 的唯一防线）
+
+~~~text
+placement lease（每个 Forward 一行）
+  forward_id          哪个 Forward
+  owner_node_id       当前承载者
+  epoch               单调递增的所有权世代
+  lease_expires_at    租约到期时刻（DB 时钟）
+  revision            该租约对应的配置 revision
+~~~
+
+- **Agent 必须拒绝 stale epoch**：它记住自己见过的最高 epoch（本地持久化），
+  任何 `epoch < 已见最高` 的激活动作一律拒绝并上报原因。这条是**防 split brain 的
+  最后一层**——即使面板判错、网络分区导致双主，被降级的那台也不会继续服务；
+- **不许最后写入者获胜**：租约变更必须走"epoch + 1"的显式迁移，不能靠覆盖字段；
+- **租约到期即停**：owner 必须在 `lease_expires_at` 之前续约，续不上就**停止服务**
+  （fail-safe）。"可能还有另一个主"比"短暂中断"更危险；
+- **两阶段交接**：新 owner 只能在旧租约**已过期或被显式吊销**之后激活。
+  "先给新的、再收旧的"必然产生双主窗口。
+
+#### 二、故障转移必须是显式 policy（WP10）
+
+自动迁移**必须同时**满足下列全部条件（缺一不可）：
+
+~~~text
+1. 节点不可达**且**超过 stale 阈值（heartbeat 超时单独出现**不足以**迁移）
+2. 观测新鲜度可用（不能拿陈旧观测当依据）
+3. 健康问题不是"目标本身坏了"（目标坏 → 换入口节点毫无帮助，只会掩盖故障）
+4. 备用节点有可用端口（端口租约可用）
+5. 冷却期已过（同一 Forward 的迁移冷却）
+6. 运维策略允许自动迁移
+~~~
+
+**回切（failback）**：首选节点连续 `FAILBACK_HEALTHY_CHECKS` 次判定健康、且冷却期已过，
+才允许回切；回切是一次**正常的归属迁移**（epoch + 1），不是特例路径。
+
+#### 三、DNS 是输入/观测，不是第二个 desired 真相源（WP8）
+
+- **解析在 Agent 侧**（拨号的是它），面板**不解析**、不缓存解析结果；
+- 用户输入域名**永远是** desired 里存的那份，DNS 结果**绝不覆盖**它；
+- TTL 尊重但有下上限（防腐烂 TTL 与抖动）；解析失败 → 用**上一次成功解析的地址集**
+  作为 stale fallback，并标记其年龄（不是静默使用，也不是立刻判死）；
+- `NXDOMAIN` = 这个目标当前**不可达**（一条证据），**不是**删除目标的理由；
+- 多个 A/AAAA、IPv4/IPv6：全部可用，具体拨号顺序交给 Go 的 dialer（不自己实现 happy eyeballs）；
+- 地址漂移：下一次解析自然拿到新地址；**已有连接不受影响**（DNS 变化永不强杀连接）。
+
+#### 四、V5.3 的 Gate（G3）要证明的
+
+`hard disconnect` / `soft timeout` / `short flap` / `node restart` / `Panel restart` /
+**`split brain`（旧节点仍然在监听）** / `duplicate failover` / `failover 期间再次失败` /
+`old node recovery` —— 其中 **split brain 必须真的构造出来**：让旧节点在分区中继续服务，
+然后验证它在下一次收到更高 epoch 时拒绝继续，而新节点在旧租约过期前**不会被**激活。
+
 ## 8.1 V5-WP8 — DNS Dynamic Target
 
 DNS 解析是 target input/observation，不是新的 desired 真相源。
