@@ -129,6 +129,17 @@ export interface AgentTunnelConfig {
    * the dispatched protocol cannot disagree.
    */
   protocol: ForwardProtocol;
+  /**
+   * V5.3 WP9 —— 归属事实：本节点被授权承载该 Forward 的世代与租约到期时刻。
+   *
+   * Agent 侧据此拒绝 stale epoch（收到比已见最高更低的 epoch 时拒绝激活），
+   * 并在租约到期后停止服务。缺席 = 面板没有授权信息（旧面板）→ Agent 行为与今天一致。
+   *
+   * 这两个字段**必须同时出现在命令下发与重连快照两条路径上**，并且解码器必须认识它们 ——
+   * V5 里这个类别已经踩过三次（协议、证书路径、健康），症状分别是"重启后静默失效"。
+   */
+  ownership_epoch?: number;
+  lease_expires_at?: string;
   speed_limit: number;
   revision: number;
   listen_host?: string;

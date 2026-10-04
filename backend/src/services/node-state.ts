@@ -41,6 +41,7 @@
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
+import { LEASE_TTL_SECONDS } from "./placement-lease.ts";
 import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
 import { normalizeCapabilities } from "./agent-capability.ts";
 import { normalizeCapabilityManifest, type CapabilityManifest } from "./capability-manifest.ts";
@@ -668,6 +669,33 @@ function normalizeManifestColumn(
 
 /**
 /* ================================================================== */
+/* V5.3 WP9 —— 上报即续约                                              */
+/* ================================================================== */
+
+/**
+ * 续约 this node 持有的租约。只续自己的；不创建、不抢占。
+ *
+ * 为什么不在这里 claim：认领意味着"我打算承载它"，那是编排决策（rollout PREPARE），
+ * 不是上报的副作用。上报只能说"我还在"，而"我还在"正是续约的语义。
+ */
+export async function renewOwnedLeases(
+  nodeId: number,
+  tunnelIds: readonly number[],
+  now: Date,
+): Promise<number> {
+  if (tunnelIds.length === 0) return 0;
+  const result = await db.placementLease.updateMany({
+    where: {
+      tunnel_id: { in: [...tunnelIds] },
+      owner_node_id: nodeId,
+      lease_expires_at: { gt: now },
+    },
+    data: { lease_expires_at: new Date(now.getTime() + LEASE_TTL_SECONDS * 1000) },
+  });
+  return result.count;
+}
+
+/* ================================================================== */
 /* V5.2 WP5 —— 目标观测投影的同步                                       */
 /* ================================================================== */
 
@@ -801,6 +829,19 @@ export async function submitStateReport(
     create: { node_id: auth.node_id, ...core, ...telemetry },
     update: { ...core, ...telemetry },
   });
+
+  // ── V5.3 WP9：本人续约 ──
+  //
+  // 一个节点上报它正在服务的隧道，就是它仍在承载这些 Forward 的最好证据，所以续约挂在这条
+  // 既有节拍上，而不是新开一个心跳通道（第二条时间真相）。续不上（或别人是 owner）时**什么
+  // 都不做**：抢别人的归属必须走显式的两阶段交接，不能靠"报告里提到了它"。
+  await renewOwnedLeases(
+    auth.node_id,
+    (report.tunnels ?? [])
+      .map((t) => Number(String((t as { id?: unknown }).id ?? "").match(/^tunex-(\d+)-/)?.[1] ?? 0))
+      .filter((id) => Number.isInteger(id) && id > 0),
+    reportedAt,
+  );
 
   // ── V5.2 WP5：目标观测投影 ──
   //

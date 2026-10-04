@@ -1079,6 +1079,15 @@ export async function buildDesiredNodeSnapshot(
     }
   }
 
+  // V5.3 WP9: ownership facts ride the snapshot as well, for the same reason health
+  // does — an agent that restarts must still know its epoch, or the stale-epoch guard
+  // resets to "never seen anything" and a demoted node could serve again.
+  const leases = await db.placementLease.findMany({
+    where: { tunnel_id: { in: (rows as unknown as DesiredRowProjection[]).map((r) => r.id) } },
+    select: { tunnel_id: true, owner_node_id: true, epoch: true, lease_expires_at: true },
+  });
+  const leaseByTunnel = new Map(leases.map((l) => [l.tunnel_id, l]));
+
   const tunnels: AgentTunnelConfig[] = [];
   const skipped: Array<{ id: number; reason: string }> = [];
   for (const t of rows as unknown as DesiredRowProjection[]) {
@@ -1086,7 +1095,16 @@ export async function buildDesiredNodeSnapshot(
     if (outcome.kind === "skip") {
       skipped.push({ id: t.id, reason: outcome.reason });
     } else if (outcome.kind === "config") {
-      tunnels.push(outcome.config);
+      const lease = leaseByTunnel.get(t.id);
+      tunnels.push(
+        lease && lease.owner_node_id === nodeId
+          ? {
+              ...outcome.config,
+              ownership_epoch: lease.epoch,
+              lease_expires_at: lease.lease_expires_at.toISOString(),
+            }
+          : outcome.config,
+      );
     }
   }
   return { version: "tunex-v3", tunnels, skipped };
