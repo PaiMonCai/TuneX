@@ -682,17 +682,42 @@ export async function renewOwnedLeases(
   nodeId: number,
   tunnelIds: readonly number[],
   now: Date,
-): Promise<number> {
-  if (tunnelIds.length === 0) return 0;
+): Promise<LeaseFact[]> {
+  if (tunnelIds.length === 0) return [];
+  const extended = new Date(now.getTime() + LEASE_TTL_SECONDS * 1000);
   const result = await db.placementLease.updateMany({
     where: {
       tunnel_id: { in: [...tunnelIds] },
       owner_node_id: nodeId,
       lease_expires_at: { gt: now },
     },
-    data: { lease_expires_at: new Date(now.getTime() + LEASE_TTL_SECONDS * 1000) },
+    data: { lease_expires_at: extended },
   });
-  return result.count;
+  if (result.count === 0) return [];
+  // The refreshed facts are RETURNED, not just written to the row.
+  //
+  // V5.3 的关键一环：Agent 侧按契约"到期即停"，而续约只发生在库里 —— 如果不把这些事实
+  // 送回给 Agent，每个隧道都会在下发后一个 TTL（30s）到期时**自己把自己停掉**，在健康节点
+  // 上制造一次全量中断。这是本阶段实现者发现并上报的真实集成缺口。
+  return db.placementLease
+    .findMany({
+      where: { tunnel_id: { in: [...tunnelIds] }, owner_node_id: nodeId },
+      select: { tunnel_id: true, epoch: true, lease_expires_at: true, revision: true },
+    })
+    .then((rows) => rows.map((r) => ({
+      tunnel_id: r.tunnel_id,
+      epoch: r.epoch,
+      lease_expires_at: r.lease_expires_at.toISOString(),
+      revision: r.revision,
+    })));
+}
+
+/** V5.3 WP9：一次续约后回给 Agent 的归属事实。 */
+export interface LeaseFact {
+  tunnel_id: number;
+  epoch: number;
+  lease_expires_at: string;
+  revision: number;
 }
 
 /* ================================================================== */
@@ -776,7 +801,20 @@ export function extractBearerCredential(authorization: string | undefined | null
 /* ================================================================== */
 
 export type SubmitResult =
-  | { ok: true; node_id: number; scope: number; reported_at: Date }
+  | {
+      ok: true;
+      node_id: number;
+      scope: number;
+      reported_at: Date;
+      /**
+       * V5.3 WP9：本次上报续约成功的归属事实。
+       *
+       * 为什么必须回传：Agent 按契约"租约到期即停"，而续约是面板侧写的。不回传的话，
+       * 每个隧道在最后一次下发后一个 TTL 就会自停 —— 在健康节点上制造全量中断。
+       * 挂在既有响应上，不新增心跳、不新增往返。
+       */
+      leases: LeaseFact[];
+    }
   | { ok: false; status: 401 | 400 | 503; reason: string };
 
 /**
@@ -835,7 +873,7 @@ export async function submitStateReport(
   // 一个节点上报它正在服务的隧道，就是它仍在承载这些 Forward 的最好证据，所以续约挂在这条
   // 既有节拍上，而不是新开一个心跳通道（第二条时间真相）。续不上（或别人是 owner）时**什么
   // 都不做**：抢别人的归属必须走显式的两阶段交接，不能靠"报告里提到了它"。
-  await renewOwnedLeases(
+  const renewedLeases = await renewOwnedLeases(
     auth.node_id,
     (report.tunnels ?? [])
       .map((t) => Number(String((t as { id?: unknown }).id ?? "").match(/^tunex-(\d+)-/)?.[1] ?? 0))
@@ -863,7 +901,16 @@ export async function submitStateReport(
       /* 心跳刷新失败不影响上报结论 */
     });
 
-  return { ok: true, node_id: auth.node_id, scope: auth.scope, reported_at: reportedAt };
+  // V5.3 WP9: the renewed ownership facts travel back in the report's own response —
+  // zero extra round trips, zero new cadence, and the agent learns "you may keep serving
+  // until T" from the very answer it is already waiting for.
+  return {
+    ok: true,
+    node_id: auth.node_id,
+    scope: auth.scope,
+    reported_at: reportedAt,
+    leases: renewedLeases,
+  };
 }
 
 /* ================================================================== */

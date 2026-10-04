@@ -127,7 +127,15 @@ internalNodeRoutes.post("/node/state", async (c) => {
     return c.json({ ok: false, error: result.reason }, result.status);
   }
   return c.json({
-    data: { ok: true, node_id: result.node_id, reported_at: result.reported_at.toISOString() },
+    data: {
+      ok: true,
+      node_id: result.node_id,
+      reported_at: result.reported_at.toISOString(),
+      // V5.3 WP9: the agent learns here how long it may keep serving. Absent/empty means
+      // "the panel has no ownership information for you", which is also the honest answer
+      // for a node that owns nothing.
+      leases: result.leases,
+    },
   });
 });
 

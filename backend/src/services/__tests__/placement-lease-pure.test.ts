@@ -41,3 +41,30 @@ describe("V5.3 WP9: lease expiry is the two-phase handover gate", () => {
     expect(LEASE_RENEW_MARGIN_SECONDS).toBeLessThan(LEASE_TTL_SECONDS);
   });
 });
+
+/**
+ * V5.3 WP9 —— 续约必须有**回程**。
+ *
+ * 契约要求 Agent"租约到期即停"，而续约是面板侧写的。如果续约只落在库里、不回给 Agent，
+ * 那么每个隧道在最后一次下发后一个 TTL 就会自停 —— 在**健康节点**上制造全量中断。
+ * 这是本阶段实现者发现的真实集成缺口，不是理论风险。
+ *
+ * 这里钉住回程的**形状**（连库写入由 Gate 覆盖）：响应里必须带 `leases`，且每条都含
+ * 三个 Agent 真正需要的字段。
+ */
+describe("V5.3 WP9: the renewal must travel back to the agent", () => {
+  test("the submit result type carries the renewed lease facts", async () => {
+    const src = await Bun.file(new URL("../node-state.ts", import.meta.url)).text();
+    // 响应形状是线上契约的一部分：字段名与"必须存在"这两件事都值得被断言。
+    expect(src).toContain("leases: LeaseFact[]");
+    expect(src).toContain("export interface LeaseFact");
+    for (const field of ["tunnel_id", "epoch", "lease_expires_at", "revision"]) {
+      expect(src).toContain(`${field}:`);
+    }
+  });
+
+  test("the route returns them, so the agent can extend its deadline", async () => {
+    const src = await Bun.file(new URL("../../routes/internal-node.ts", import.meta.url)).text();
+    expect(src).toContain("leases: result.leases");
+  });
+});
