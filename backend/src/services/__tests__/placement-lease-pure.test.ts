@@ -56,6 +56,30 @@ describe("V5.3 WP9: lease expiry is the two-phase handover gate", () => {
  * 这里钉住回程的**形状**（连库写入由 Gate 覆盖）：响应里必须带 `leases`，且每条都含
  * 三个 Agent 真正需要的字段。
  */
+describe("V5.3 WP9: startup restore renews the current owner first", () => {
+  test("the desired endpoint renews ownership before building the restart snapshot", async () => {
+    const src = await Bun.file(new URL("../../routes/internal-node.ts", import.meta.url)).text();
+    const route = src.indexOf('internalNodeRoutes.get("/node/desired"');
+    const renew = src.indexOf("renewOwnedLeases(auth.node_id", route);
+    const snapshot = src.indexOf("buildDesiredNodeSnapshot(auth.node_id)", route);
+
+    expect(route).toBeGreaterThanOrEqual(0);
+    expect(renew).toBeGreaterThan(route);
+    expect(snapshot).toBeGreaterThan(renew);
+  });
+
+  test("startup renewal reuses the liveness renewal primitive instead of claiming ownership", async () => {
+    const src = await Bun.file(new URL("../../routes/internal-node.ts", import.meta.url)).text();
+    const routeStart = src.indexOf('internalNodeRoutes.get("/node/desired"');
+    const routeEnd = src.indexOf("\n});", routeStart);
+    const routeBody = src.slice(routeStart, routeEnd);
+
+    expect(routeBody).toContain("renewOwnedLeases");
+    expect(routeBody).not.toContain("claimLease");
+    expect(routeBody).not.toContain("claimOwnership");
+  });
+});
+
 describe("V5.3 WP9: the renewal must travel back to the agent", () => {
   test("the submit result type carries the renewed lease facts", async () => {
     const src = await Bun.file(new URL("../node-state.ts", import.meta.url)).text();
