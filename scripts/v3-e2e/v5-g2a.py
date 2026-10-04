@@ -48,8 +48,15 @@ OUT = HERE / "evidence"
 OUT.mkdir(exist_ok=True)
 RESULT = OUT / "v5-g2a-result.txt"
 
-# One reachable target and one that refuses, on the node that serves pool POOL_ID.
-POOL_ID = int(os.environ.get("G2A_POOL_ID", "8"))
+# One reachable target and one that refuses, on a pool the node actually SERVES.
+#
+# Not any pool: the observer enumerates the desired targets of the pools attached to
+# the node's live tunnels, because "observe only what the user asked for" means the
+# pools this node is really relaying through — a pool that is not attached to any
+# tunnel has no desired targets on the node, so nothing to observe. Picking a
+# detached pool made an earlier run of this gate look like a product failure
+# (`count=0` forever) when it was a fixture-choice mistake.
+POOL_ID = int(os.environ.get("G2A_POOL_ID", "0"))
 REACHABLE = ("target-a", 3030)  # the e2e target answers on 3030
 REFUSED = ("target-a", 9)  # nothing listens on 9: connect is refused immediately
 STALE_WAIT_SECONDS = int(os.environ.get("G2A_STALE_WAIT", "150"))
@@ -79,8 +86,38 @@ def case(name: str, fn, seconds: int):
 # helpers
 # ---------------------------------------------------------------------------
 
-def pool_node_id() -> int:
-    return int(H.scalar(f"SELECT node_id FROM egress_pool WHERE id={POOL_ID};") or 0)
+def served_pool_id() -> int:
+    """A pool attached to an active tunnel — i.e. one this node really serves."""
+    globally_selected()
+    if POOL_ID:
+        return POOL_ID
+    found = H.scalar(
+        "SELECT p.id FROM egress_pool p JOIN tunnel t ON t.egress_pool_id = p.id "
+        "WHERE t.apply_status = 'active' ORDER BY p.id LIMIT 1;"
+    ).strip()
+    return int(found or 0)
+
+
+def globally_selected() -> None:
+    """`POOL_ID` is resolved in setup(); this keeps the reads explicit."""
+    return None
+
+
+def pool_node_id(pool_id: int) -> int:
+    return int(H.scalar(f"SELECT node_id FROM egress_pool WHERE id={pool_id};") or 0)
+
+
+def original_targets(pool_id: int) -> list[tuple[str, int, int, int, str]]:
+    raw = H.mysql(
+        "SELECT CONCAT(host, '|', port, '|', weight, '|', order_by, '|', status) "
+        f"FROM egress_target WHERE pool_id={pool_id} ORDER BY id;"
+    ).strip()
+    out = []
+    for line in raw.splitlines():
+        parts = line.split("|")
+        if len(parts) == 5:
+            out.append((parts[0], int(parts[1]), int(parts[2]), int(parts[3]), parts[4]))
+    return out
 
 
 def node_container(node_id: int) -> str:
@@ -97,7 +134,7 @@ def node_container(node_id: int) -> str:
     return ""
 
 
-def set_pool_targets(targets: list[tuple[str, int]]) -> None:
+def set_pool_targets(pool_id: int, targets: list[tuple[str, int]]) -> None:
     """Write the pool's desired targets DIRECTLY (setup, not the subject under test).
 
     Going through the admin API would test the target-editing path; this gate is about
@@ -105,24 +142,29 @@ def set_pool_targets(targets: list[tuple[str, int]]) -> None:
     then held fixed — which is also what makes "telemetry never rewrites desired"
     checkable at all.
     """
-    H.mysql(f"DELETE FROM egress_target WHERE pool_id={POOL_ID};")
+    H.mysql(f"DELETE FROM egress_target WHERE pool_id={pool_id};")
     for host, port in targets:
         H.mysql(
             "INSERT INTO egress_target (pool_id, host, port, weight, order_by, status, created_at, updated_at) "
-            f"VALUES ({POOL_ID}, '{host}', {port}, 1, 10, 'active', NOW(3), NOW(3));"
+            f"VALUES ({pool_id}, '{host}', {port}, 1, 10, 'active', NOW(3), NOW(3));"
         )
 
 
 def desired_snapshot() -> str:
     return H.mysql(
         "SELECT GROUP_CONCAT(CONCAT(host, ':', port, '/', status, '/', weight) ORDER BY host, port) "
-        f"FROM egress_target WHERE pool_id={POOL_ID};"
+        f"FROM egress_target WHERE pool_id={H.pool_id};"
     ).strip()
 
 
 def api_health() -> dict[str, dict]:
     """The synthesized view, keyed by target identity."""
-    status, body, _ = H.req("GET", f"/api/admin/node/node/pools/{POOL_ID}/health")
+    # Mounted as `app.route("/api/admin", nodeAdminRoutes)` + route path
+    # `/node/pools/...`, so the real path has ONE "node" segment. Writing it twice
+    # (the natural mistake when reading `nodeAdminRoutes.get("/node/pools/...")`)
+    # 404s, and a 404 here would look like "the panel has no health view" rather
+    # than "the gate called the wrong URL".
+    status, body, _ = H.req("GET", f"/api/admin/node/pools/{H.pool_id}/health")
     if status != 200:
         return {}
     data = H.unwrap(body)
@@ -153,11 +195,27 @@ def wait_state(key: str, wanted: set[str], timeout: int = 240) -> tuple[bool, st
 
 
 def observations_of(node_id: int) -> list[dict]:
-    raw = H.scalar(
-        f"SELECT IFNULL(target_observations, '[]') FROM node_state_report WHERE node_id={node_id};"
-    )
+    """The facts that ARRIVED for this observer, read from the projection.
+
+    Note what this reads and why: the panel CONSUMES the reported array into
+    `target_observation` (one row per observer+target) rather than keeping a copy of
+    the raw body, so the projection IS the panel's record of what reached the wire.
+    Asserting against the raw JSON would require the panel to store a second copy of
+    the same fact — exactly the kind of duplicate truth this stage exists to avoid.
+
+    The row names are translated back to the WIRE names here, so the assertions below
+    keep talking about the contract's vocabulary rather than the column names.
+    """
+    row = H.mysql(
+        "SELECT CONCAT('[', IFNULL(GROUP_CONCAT(JSON_OBJECT("
+        "'host', host, 'port', port, 'reachable', reachable, 'latency_ms', latency_ms, "
+        "'consecutive_success', consecutive_success, 'consecutive_failure', consecutive_failure, "
+        "'success_rate', success_rate, 'last_observed_at', UNIX_TIMESTAMP(observed_at), "
+        "'observation_source', observation_source)), ''), ']') "
+        f"FROM target_observation WHERE node_id={node_id};"
+    ).strip()
     try:
-        return json.loads(raw or "[]")
+        return json.loads(row or "[]")
     except json.JSONDecodeError:
         return []
 
@@ -170,15 +228,31 @@ def setup():
     H.mysql(f"UPDATE user SET super_admin=1 WHERE email='{H.EMAIL}';")
     check(bool(wait := H.wait_until(lambda: H.req("GET", "/healthz", timeout=5)[0] == 200, timeout=60, interval=2)),
           "G2A.setup the panel is reachable")
-    node = pool_node_id()
-    check(node > 0, "G2A.setup the pool belongs to a node", f"pool={POOL_ID} node={node}")
+    H.pool_id = served_pool_id()
+    check(H.pool_id > 0,
+          "G2A.setup a pool attached to an active tunnel exists (the observer only sees served targets)",
+          f"pool={H.pool_id}")
+    if H.pool_id == 0:
+        raise RuntimeError("no pool is attached to an active tunnel; the topology has no served egress pool")
+    H.saved_targets = original_targets(H.pool_id)
+    node = pool_node_id(H.pool_id)
+    check(node > 0, "G2A.setup the pool belongs to a node", f"pool={H.pool_id} node={node}")
     container = node_container(node)
     check(bool(container), "G2A.setup the pool's node maps to a running agent container", f"node={node}")
 
     # A clean baseline: the pool's desired state is exactly one reachable and one
     # refused target, so `healthy` and `unhealthy` are both reachable inside one gate
     # run without waiting for a real outage.
-    set_pool_targets([REACHABLE, REFUSED])
+    # The desired targets are NOT rewritten. Two reasons, and both are the point of
+    # this gate rather than a convenience:
+    #   · the pool-edit path deliberately does not republish a tunnel revision (that
+    #     is the orchestrator's job), so editing rows would change nothing the agent
+    #     could see — an earlier version of this gate spent a whole run proving that;
+    #   · "telemetry never rewrites desired" is far stronger evidence when the gate
+    #     never touches desired in the first place.
+    # Instead the gate observes what the node REALLY serves and induces the failure
+    # on the target side, which is also a more honest outage: the target goes away,
+    # not the configuration.
     check(desired_snapshot() != "", "G2A.setup the pool has desired targets", desired_snapshot())
 
     # The observer only probes targets of the pools the node SERVES, and it reports on
@@ -193,6 +267,20 @@ def setup():
 
 
 def cleanup():
+    # Restore the pool's original targets: this gate borrows a LIVE pool (the only
+    # kind the observer can see), so leaving its desired state rewritten would change
+    # what every other gate and the running topology sees.
+    try:
+        if getattr(H, "pool_id", 0) and getattr(H, "saved_targets", None) is not None:
+            H.mysql(f"DELETE FROM egress_target WHERE pool_id={H.pool_id};")
+            for host, port, weight, order_by, status in H.saved_targets:
+                H.mysql(
+                    "INSERT INTO egress_target (pool_id, host, port, weight, order_by, status, created_at, updated_at) "
+                    f"VALUES ({H.pool_id}, '{host}', {port}, {weight}, {order_by}, '{status}', NOW(3), NOW(3));"
+                )
+            check(desired_snapshot() != "", "G2A.cleanup the pool's original targets were restored")
+    except Exception as exc:  # noqa: BLE001
+        record(False, f"G2A.cleanup restore pool targets: {type(exc).__name__}: {exc}")
     try:
         H.cleanup_fixtures()
     except Exception as exc:  # noqa: BLE001
@@ -202,6 +290,24 @@ def cleanup():
 # ---------------------------------------------------------------------------
 # cases
 # ---------------------------------------------------------------------------
+
+def served_target() -> tuple[str, int]:
+    """The target the node is actually observing (host, port)."""
+    observations = observations_of(H.observing_node)
+    if not observations:
+        return ("", 0)
+    first = observations[0]
+    return (str(first.get("host", "")), int(first.get("port", 0)))
+
+
+def target_container_for(host: str) -> str:
+    """The e2e container that serves a target host, if the gate may stop it."""
+    for name in (host, f"wp14-{host}"):
+        running = H.docker(["inspect", "-f", "{{.State.Running}}", name], allow=True).strip()
+        if running == "true":
+            return name
+    return ""
+
 
 def g2a_1_fact_flows():
     """The observation facts must reach the wire — the dead-wiring guard."""
@@ -219,68 +325,134 @@ def g2a_1_fact_flows():
     check("observation_age" not in first and "observation_age_ms" not in first,
           "G2A.1 no stored age is on the wire (age is derived by the reader)",
           json.dumps(first)[:160])
-    # The facts must be for the DESIRED targets only (row 2).
-    keys = {target_key(o.get("host", ""), int(o.get("port", 0))) for o in observations}
-    check(keys <= {target_key(*REACHABLE), target_key(*REFUSED)},
-          "G2A.1 only desired targets are observed", f"observed={sorted(keys)}")
+    # The facts must be for the DESIRED targets only (row 2): every observed key
+    # must be a target of the pool this node serves.
+    keys = {target_key(str(o.get("host", "")), int(o.get("port", 0))) for o in observations}
+    # Compared against the node's WHOLE desired set (every pool it serves), because
+    # that is what the observer enumerates: "only what the user asked for" is a
+    # statement about the node, not about one pool.
+    desired_keys = {
+        (line.split("|")[0] + ":" + line.split("|")[1])
+        for line in H.mysql(
+            "SELECT CONCAT(et.host, '|', et.port) FROM egress_target et "
+            f"JOIN egress_pool p ON p.id = et.pool_id WHERE p.node_id={H.observing_node};"
+        ).strip().splitlines()
+        if "|" in line
+    }
+    check(keys <= desired_keys,
+          "G2A.1 only desired targets are observed", f"observed={sorted(keys)} desired={sorted(desired_keys)}")
     H.observed_keys = keys
+    H.served = served_target()
+    check(H.served[0] != "",
+          "G2A.1 the node is observing at least one served target", f"served={H.served}")
+
+    # Bind the API read to the pool that CONTAINS the observed target.
+    #
+    # `tunnel.egress_pool_id` is not enough: a tunnel's pool can be re-pointed while
+    # the RUNNING revision still carries the targets it was published with, so the
+    # row and the agent disagree. The observations say what the node is really
+    # serving, so the pool is derived from them — otherwise the gate reads one pool's
+    # view and compares it against another pool's facts, which looks like a product
+    # bug and is not one.
+    observed_pool = H.scalar(
+        "SELECT et.pool_id FROM egress_target et JOIN egress_pool p ON p.id = et.pool_id "
+        f"WHERE p.node_id={H.observing_node} AND et.host='{H.served[0]}' AND et.port={H.served[1]} "
+        "ORDER BY et.pool_id LIMIT 1;"
+    ).strip()
+    if observed_pool:
+        H.pool_id = int(observed_pool)
+        check(True, "G2A.1 the pool that serves the observed target was identified",
+              f"pool={H.pool_id} target={H.served}")
+    else:
+        check(False, "G2A.1 a pool containing the observed target exists (view and facts must agree)",
+              f"observed={H.served} node={H.observing_node}")
 
 
 def g2a_2_projection_lands():
     node = H.observing_node
     ok = H.wait_until(
-        lambda: int(H.scalar(f"SELECT COUNT(*) FROM target_observation WHERE node_id={node};") or 0) >= 2,
+        lambda: int(H.scalar(f"SELECT COUNT(*) FROM target_observation WHERE node_id={node};") or 0) >= 1,
         timeout=180, interval=6,
     )
     check(ok, "G2A.2 the panel persisted one projection row per (observer, target)",
           H.mysql(f"SELECT GROUP_CONCAT(target_key) FROM target_observation WHERE node_id={node};").strip())
-    null_latency = H.scalar(
-        f"SELECT COUNT(*) FROM target_observation WHERE node_id={node} AND reachable=0 AND latency_ms IS NULL;")
-    check(null_latency != "0", "G2A.2 an unreachable target stores NULL latency, never 0")
+    key = target_key(*H.served)
+    rows = H.mysql(
+        "SELECT CONCAT(reachable, '|', IFNULL(latency_ms, 'NULL'), '|', observation_source) "
+        f"FROM target_observation WHERE node_id={node} AND target_key='{key}';"
+    ).strip()
+    check(rows != "", "G2A.2 the observed target has a projection row", f"key={key}")
+    # A reachable target stores a number; the NULL case is asserted after the outage
+    # below, where an unreachable target is guaranteed to exist.
+    check("|NULL|" not in rows or rows.startswith("0|"),
+          "G2A.2 a reachable target stores a concrete latency, not NULL", rows)
 
 
 def g2a_3_reachable_is_healthy():
-    ok, state = wait_state(target_key(*REACHABLE), {"healthy"}, timeout=300)
+    ok, state = wait_state(target_key(*H.served), {"healthy"}, timeout=420)
     check(ok, "G2A.3 a target that answers reaches `healthy` (warm-up respected)", f"state={state}")
 
 
 def g2a_4_failing_is_unhealthy():
-    ok, state = wait_state(target_key(*REFUSED), {"degraded", "unhealthy"}, timeout=300)
-    check(ok, "G2A.4 a target that refuses reaches `degraded` or `unhealthy`", f"state={state}")
-    # The refused target must ALSO be visible as a fact, not only as a state.
-    health = api_health().get(target_key(*REFUSED), {})
-    facts = health.get("facts") or {}
-    check(int(facts.get("consecutive_failure", 0) or 0) >= 1,
-          "G2A.4 its consecutive failures are reported as a fact", json.dumps(facts)[:160])
-    check(health.get("state") != "unknown",
-          "G2A.4 a refused target is NOT `unknown` — refusal is evidence, not silence",
-          json.dumps(health)[:160])
+    """Stop the TARGET and watch the verdict follow — a real outage, not a config edit."""
+    host = H.served[0]
+    container = target_container_for(host)
+    check(bool(container), "G2A.4 the served target runs in a container the gate may stop",
+          f"host={host}")
+    if not container:
+        return
+    key = target_key(*H.served)
+    H.stopped_target = container
+    H.docker(["stop", container], timeout=120)
+    try:
+        ok, state = wait_state(key, {"degraded", "unhealthy"}, timeout=420)
+        check(ok, "G2A.4 a target that stops answering reaches `degraded` or `unhealthy`",
+              f"target={key} state={state}")
+        health = api_health().get(key, {})
+        facts = health.get("facts") or {}
+        check(int(facts.get("consecutive_failure", 0) or 0) >= 1,
+              "G2A.4 its consecutive failures are reported as a fact", json.dumps(facts)[:160])
+        check(health.get("state") != "unknown",
+              "G2A.4 a failing target is NOT `unknown` — refusal is evidence, silence is not",
+              json.dumps(health)[:160])
+        row = H.mysql(
+            "SELECT CONCAT(reachable, '|', IFNULL(latency_ms, 'NULL')) FROM target_observation "
+            f"WHERE node_id={H.observing_node} AND target_key='{key}';"
+        ).strip()
+        check(row.startswith("0|NULL"),
+              "G2A.4 an unreachable target stores reachable=0 with NULL latency, never 0",
+              f"row={row}")
+    finally:
+        H.docker(["start", container], timeout=120)
 
 
 def g2a_5_never_observed_is_unknown():
-    """A desired target nobody has observed must be `unknown`, never `healthy`."""
-    # Add a third target nobody can have observed yet, then read BEFORE the next probe
-    # cycle: the honest answer for "no evidence" is unknown.
-    set_pool_targets([REACHABLE, REFUSED, ("target-b", 3030)])
+    """No evidence must read as `unknown`, never as `healthy`.
+
+    The evidence is removed from the PROJECTION rather than from desired state: that
+    is the only edit this gate is allowed to make, and it is exactly the situation the
+    rule exists for (rows are missing, or too old to count). The next agent report
+    restores the row, so nothing is left damaged.
+    """
+    key = target_key(*H.served)
+    H.mysql(f"DELETE FROM target_observation WHERE node_id={H.observing_node} AND target_key='{key}';")
     health = api_health()
-    state = (health.get(target_key("target-b", 3030)) or {}).get("state")
-    check(state in ("unknown", "healthy", "recovering"),
-          "G2A.5 a newly added desired target does not crash the view", f"state={state}")
-    # And the stronger, deterministic half: a target with no observation rows at all.
-    H.mysql(f"DELETE FROM target_observation WHERE target_key='{target_key('target-b', 3030)}';")
-    health = api_health()
-    state = (health.get(target_key("target-b", 3030)) or {}).get("state")
+    entry = health.get(key)
+    state = (entry or {}).get("state")
+    check(entry is not None, "G2A.5 the desired target is still in the view without observations",
+          f"key={key} keys={sorted(health)}")
     check(state == "unknown",
           "G2A.5 with no observation rows the state is `unknown`, never `healthy`",
-          f"state={state} entry={json.dumps(health.get(target_key('target-b', 3030)))[:160]}")
-    set_pool_targets([REACHABLE, REFUSED])
+          f"state={state} entry={json.dumps(entry)[:200]}")
+    check((entry or {}).get("reasons") == ["no_observation"] or "no_observation" in ((entry or {}).get("reasons") or []),
+          "G2A.5 and the reason says there is no observation", json.dumps(entry)[:200])
 
 
 def g2a_6_stale_is_unknown():
     """Stop the observer; after the staleness window the verdict must fall back."""
     H.docker(["stop", H.observing_container], timeout=120)
     try:
-        ok, state = wait_state(target_key(*REACHABLE), {"unknown"}, timeout=STALE_WAIT_SECONDS)
+        ok, state = wait_state(target_key(*H.served), {"unknown"}, timeout=STALE_WAIT_SECONDS)
         check(ok, "G2A.6 a stopped agent's evidence goes stale and the state falls back to `unknown`",
               f"waited {STALE_WAIT_SECONDS}s, last state={state}")
         check(state != "healthy",
@@ -300,15 +472,17 @@ def g2a_7_desired_untouched():
           "G2A.7 telemetry never rewrote the desired target list",
           f"before={before!r} after={after!r}")
     # And an unhealthy target is still IN desired: telemetry has no delete authority.
-    check(target_key(*REFUSED).replace(":", ":") in after or f"{REFUSED[0]}:{REFUSED[1]}" in after,
-          "G2A.7 the refused target is still desired after being judged unhealthy", after)
+    served_line = f"{H.served[0]}:{H.served[1]}"
+    check(served_line in after,
+          "G2A.7 the target judged unhealthy is STILL desired (telemetry has no delete authority)",
+          f"served={served_line} desired={after}")
 
 
 def g2a_8_restart_resumes():
     ok = H.wait_until(lambda: len(observations_of(H.observing_node)) > 0, timeout=240, interval=8)
     check(ok, "G2A.8 the agent resumes observing after a restart",
           f"node={H.observing_node} count={len(observations_of(H.observing_node))}")
-    ok2, state = wait_state(target_key(*REACHABLE), {"healthy", "recovering", "degraded"}, timeout=300)
+    ok2, state = wait_state(target_key(*H.served), {"healthy", "recovering", "degraded"}, timeout=420)
     check(ok2, "G2A.8 and the reachable target is judged again rather than stuck", f"state={state}")
 
 
@@ -321,7 +495,7 @@ def g2a_9_panel_restart_is_safe():
     # decides freshness, and age is computed at read time — so the verdict must be
     # driven by the timestamps, never by "the row exists".
     health = api_health()
-    entry = health.get(target_key(*REACHABLE)) or {}
+    entry = health.get(target_key(*H.served)) or {}
     state = entry.get("state")
     check(state in {"healthy", "recovering", "degraded", "unknown"},
           "G2A.9 the view is served after a panel restart with a derived verdict", f"state={state}")
@@ -332,8 +506,8 @@ def g2a_9_panel_restart_is_safe():
 
 def g2a_10_single_failure_is_not_condemned():
     """The prohibition at the top of §7: one failed probe never condemns a target."""
-    facts = (api_health().get(target_key(*REACHABLE)) or {}).get("facts") or {}
-    state = (api_health().get(target_key(*REACHABLE)) or {}).get("state")
+    facts = (api_health().get(target_key(*H.served)) or {}).get("facts") or {}
+    state = (api_health().get(target_key(*H.served)) or {}).get("state")
     failures = int(facts.get("consecutive_failure", 0) or 0)
     if failures == 0:
         check(state == "healthy", "G2A.10 a healthy target with no failures is `healthy`", f"state={state}")
@@ -380,7 +554,7 @@ def main():
             "# V5-G2A WP5/WP6 stability gate\n"
             f"time: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
             "topology: scripts/v3-e2e/docker-compose.e2e.yaml (real Agents observing real targets)\n"
-            f"pool: {POOL_ID} (node {H.__dict__.get('observing_node', '?')}); "
+            f"pool: {H.__dict__.get('pool_id', '?')} (node {H.__dict__.get('observing_node', '?')}); "
             f"reachable={REACHABLE}; refused={REFUSED}\n"
             f"setup={'executed' if ready else 'incomplete'}\n"
             f"elapsed_seconds: {int(time.monotonic() - START)}\n"
