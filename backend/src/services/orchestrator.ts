@@ -68,6 +68,7 @@ import {
   type CommandEnvelope,
 } from "./control-protocol/index.ts";
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
+import { readTargetHealth } from "./target-health-read.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   wireTunnelTypeForForwardProtocol,
@@ -100,6 +101,25 @@ export interface AgentTunnelConfig {
   /** RELAY 模式必填：`<egress node ip>:<egress port>`（validate 会强校验）。 */
   next_hop: string;
   targets: { host: string; port: number; weight: number; order: number }[];
+  /**
+   * V5.2 WP7 —— 合成后的目标健康，**与 `targets` 平行**而不是塞进每个 target 里。
+   *
+   * 两条理由，都不是风格问题：
+   *   1. desired 与 health 是两类事实。塞进同一个元素，下一次改动就说不清新增字段
+   *      属于哪一类；平行数组让"desired 一个字节没变"在结构上可见；
+   *   2. Agent 据此**只调整选择顺序**（熔断 + 加权），永远不改写 desired 列表。
+   *
+   * 缺失（旧面板 / 健康读取失败）= 没有健康信号 → Agent 行为与今天完全一致。
+   * 健康是**优化**，不是闸门：它读失败绝不能挡住一次下发。
+   */
+  target_health?: {
+    host: string;
+    port: number;
+    state: string;
+    latency_ms: number | null;
+    age_ms: number | null;
+    evidence: boolean;
+  }[];
   lb_strategy: "ROUND_ROBIN" | "RANDOM" | "WEIGHTED_ROUND_ROBIN";
   /**
    * V5-WP2: the product protocol this config carries, taken from the forward's
@@ -422,7 +442,42 @@ export interface RemoveTunnelInput {
   reason?: string;
 }
 
+/**
+ * V5.2 WP7 默认健康来源：读观测投影 → WP6 合成。
+ *
+ * 合成的结论**由面板给出**，Agent 不自己定义健康；这里产出的就是那一个模型的下发形式。
+ * 失败一律回落到空数组（见 dispatchEgress 的说明）：健康是优化，不是闸门。
+ */
+const defaultTargetHealthSource: TargetHealthSource = async (targets) => {
+  const health = await readTargetHealth({ desired: targets, now: new Date() });
+  return health.targets.map((view) => {
+    const facts = view.facts ?? {};
+    return {
+      host: view.target.slice(0, view.target.lastIndexOf(":")) || view.target,
+      port: Number(view.target.slice(view.target.lastIndexOf(":") + 1)) || 0,
+      state: view.state,
+      latency_ms: typeof facts.latency_ms === "number" ? facts.latency_ms : null,
+      age_ms: typeof facts.age_ms === "number" ? facts.age_ms : null,
+      evidence: facts.evidence === true,
+    };
+  });
+};
+
+/** V5.2 WP7：一次下发的健康来源。可注入，便于离线断言"没有健康信号"的分支。 */
+export type TargetHealthSource = (
+  targets: readonly { host: string; port: number }[],
+) => Promise<{
+  host: string;
+  port: number;
+  state: string;
+  latency_ms: number | null;
+  age_ms: number | null;
+  evidence: boolean;
+}[]>;
+
 export interface OrchestratorOptions {
+  /** V5.2 WP7：健康来源；省略则读观测投影并做 WP6 合成。 */
+  healthSource?: TargetHealthSource;
   transport: AgentTransport;
   /** WP6 校验器（进程级共享，revision 闸门跨请求生效）。 */
   validator?: ControlValidator;
@@ -481,11 +536,18 @@ export class Orchestrator {
   private readonly transport: AgentTransport;
   private readonly validator: ControlValidator;
   private readonly probe: boolean;
+  /**
+   * V5.2 WP7: where the per-target health comes from. Injected so the orchestrator
+   * keeps its "no IO beyond the transport" testability — a test can hand it a stub,
+   * including the empty case, without a database.
+   */
+  private readonly healthSource: TargetHealthSource;
 
   constructor(opts: OrchestratorOptions) {
     this.transport = opts.transport;
     this.validator = opts.validator ?? new ControlValidator();
     this.probe = opts.probeReachable ?? true;
+    this.healthSource = opts.healthSource ?? defaultTargetHealthSource;
   }
 
   /* ---------------------------------------------------------------- */
@@ -579,6 +641,18 @@ export class Orchestrator {
       order: t.order_by ?? (i + 1) * 10,
     }));
 
+    // V5.2 WP7: the synthesized health travels BESIDE the desired targets, and a
+    // failure to read it must never block a rollout — health is an optimization for
+    // selection order, not a gate on whether a Forward may run. So a failure becomes
+    // "no signal" (absent array), which the agent treats exactly like an older panel.
+    let targetHealth: AgentTunnelConfig["target_health"];
+    try {
+      const health = await this.healthSource(input.targets.map((t) => ({ host: t.host, port: t.port })));
+      targetHealth = health.length > 0 ? health : undefined;
+    } catch {
+      targetHealth = undefined;
+    }
+
     const config: AgentTunnelConfig = {
       id: egressId,
       mode: "EGRESS",
@@ -590,6 +664,9 @@ export class Orchestrator {
       remote_port: 0,
       next_hop: "",
       targets,
+      // Absent when there is no signal at all, so the wire says "nothing to say"
+      // rather than "every target is unknown".
+      ...(targetHealth ? { target_health: targetHealth } : {}),
       lb_strategy: normalizeLbStrategy(input.lbStrategy),
       protocol,
       speed_limit: 0,
