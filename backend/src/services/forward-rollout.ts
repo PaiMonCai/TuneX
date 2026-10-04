@@ -397,6 +397,26 @@ export function validateRolloutAdmission(input: PlanRolloutInput): Array<{
         blocking.push({ code: "node_unavailable", message: `出口节点 ${egress.node_id} 不具备出口能力` });
       }
     }
+    const middleNodeId = desired.middle_node_id ?? null;
+    if (middleNodeId != null) {
+      const middle = nodes.middle ?? null;
+      if (!middle) {
+        blocking.push({ code: "node_unavailable", message: `中间跳节点 ${middleNodeId} 不存在` });
+      } else {
+        const lifecycle = lifecycleBlocksForward(middle.lifecycle);
+        if (lifecycle) {
+          blocking.push({
+            code: lifecycle,
+            message: `中间跳节点 ${middle.node_id} 当前不可承载新 runtime（${middle.lifecycle}）`,
+          });
+        }
+        // transit 复用 EGRESS runtime 原语，因此必须具备出口能力。
+        if (middle.role !== "egress" && middle.role !== "both") {
+          blocking.push({ code: "node_unavailable", message: `中间跳节点 ${middle.node_id} 不具备出口能力` });
+        }
+      }
+    }
+
     // `binding_exists === false` **不阻断**：§3.2 判定表把 `ensure_binding`
     // 列为 PREPARE 的正式步骤，即「binding 缺失」正是要用 rollout 解决的问题，
     // 不是拒绝 rollout 的理由。真正该阻断的是「连能建 binding 的节点都没有」
