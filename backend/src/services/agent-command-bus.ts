@@ -887,6 +887,8 @@ export interface DesiredRowProjection {
   tunnel_type?: unknown;
   ingress_node_id: number | null;
   egress_node_id: number | null;
+  /** V5.4：三跳路由的中间节点；null = 单跳。 */
+  middle_node_id?: number | null;
   listen_port: number | null;
   listen_ip: string | null;
   remote_host: string | null;
@@ -894,6 +896,8 @@ export interface DesiredRowProjection {
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
+  /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
+  port_leases?: Array<{ node_id: number; port: number; status: string }>;
   /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
@@ -966,6 +970,36 @@ export function desiredTunnelConfigFor(
         speed_limit: 0,
         revision,
         listen_host: row.listen_ip ?? undefined,
+      },
+    };
+  }
+
+  // V5.4：中间跳在 Agent 上使用与 EGRESS 相同的 runtime 原语（tunex-<id>-egress），
+  // 但目标不是业务 target pool，而是最终出口节点的节点间 listener。
+  //
+  // 端口从 NodePortLease 读取，而不是复制到 Tunnel/Revision：物理端口所有权仍只有
+  // 一个真相源。没有 active lease / 出口地址时 fail closed，不猜端口、不直连 target。
+  if (row.tunnel_mode === "relay" && row.middle_node_id === nodeId) {
+    const middlePort = (row.port_leases ?? []).find(
+      (lease) => lease.node_id === nodeId && lease.status === "active",
+    )?.port;
+    const host = firstConnectIp(row.egress_node?.connect_ip ?? null);
+    if (!middlePort || !row.egress_port || !host) return { kind: "not_for_node" };
+    return {
+      kind: "config",
+      config: {
+        id: `tunex-${row.id}-egress`,
+        mode: "EGRESS",
+        ingress_port: 0,
+        egress_port: middlePort,
+        remote_host: "",
+        remote_port: 0,
+        next_hop: "",
+        targets: [{ host, port: row.egress_port, weight: 1, order: 10 }],
+        lb_strategy: "ROUND_ROBIN",
+        protocol,
+        speed_limit: 0,
+        revision,
       },
     };
   }
@@ -1056,10 +1090,14 @@ export async function buildDesiredNodeSnapshot(
       // （§3.7 的"更新失败、上一版本仍运行"），那种情况必须继续发布，否则一次失败的更新会把
       // 正在服务的转发整条撤掉。
       applied_revision: { not: null },
-      OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }],
+      OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }, { middle_node_id: nodeId }],
     },
     include: {
       egress_node: { select: { id: true, connect_ip: true } },
+      port_leases: {
+        where: { node_id: nodeId, status: "active" },
+        select: { node_id: true, port: true, status: true },
+      },
       egress_pool: {
         include: {
           targets: {
