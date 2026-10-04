@@ -36,7 +36,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
 
   const nonce = randomUUID().slice(0, 8);
   const panelId = `it-panel-${nonce}`;
-  const created = { userId: null, workspaceId: null, groupId: null, nodeId: null, peerId: null, grantRefs: [], leaseRefs: [] };
+  const created = { userId: null, workspaceId: null, groupId: null, nodeId: null, peerId: null, grantRefs: [], leaseRefs: [], extraNodeIds: [] };
 
   /* ---------------- 夹具 ---------------- */
 
@@ -972,6 +972,103 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     }
   });
 
+  test("task-12: the applied federated leg is published into the node's authoritative desired snapshot", async () => {
+    const { buildDesiredNodeSnapshot } = await import("../src/services/agent-command-bus.ts");
+    const { resetOrchestrator, setOrchestrator } = await import("../src/services/relay-wiring.ts");
+
+    const seen = [];
+    const fake = {
+      async dispatchEgress(input) {
+        seen.push({ kind: "egress", ...input });
+        return { ok: true, result: { commandId: "c-e", revision: input.revision, ack: {} }, egress_host: "10.42.0.7", egress_port: input.egressPort };
+      },
+      async dispatchIngress(input) {
+        seen.push({ kind: "ingress", ...input });
+        return { ok: true, result: { commandId: "c-i", revision: input.revision, ack: {} } };
+      },
+      async removeTunnel() {
+        return { ok: true, result: { commandId: "c-r", revision: 1, ack: {} } };
+      },
+    };
+    setOrchestrator(fake);
+    try {
+      // 0) 基线：**没有联邦腿的节点**，快照必须逐字节是今天的样子（tunnels 空、无 skipped）。
+      const bare = await db.node.create({
+        data: {
+          node_group_id: group.id,
+          node_id: `fed-bare-${nonce}`,
+          connect_ip: "10.42.0.8",
+          status: "active",
+          role: "egress",
+          port_range_min: 19400,
+          port_range_max: 19499,
+          node_credential_hash: uuid().replace(/-/g, "").padEnd(64, "0").slice(0, 64),
+          credential_revoked: false,
+        },
+      });
+      created.extraNodeIds.push(bare.id);
+      assert.deepEqual(await buildDesiredNodeSnapshot(bare.id), { version: "tunex-v3", tunnels: [], skipped: [] });
+      // 本文件里前面的用例可能已经留下活跃联邦腿，所以这里按**增量**断言，而不是裸的 0/1。
+      const before = await buildDesiredNodeSnapshot(node.id);
+
+      const grant = await makeGrant();
+      const runtime = runtimeStub();
+      const reserved = await reserve(grant, { deps: runtime.deps });
+      assert.equal(reserved.ok, true);
+      const ref = reserved.lease.lease_ref;
+
+      // 真实 apply（默认 dispatch 钩子 + 假 orchestrator）：配置必须落库。
+      const applied = await applyRemoteLease(
+        { lease_ref: ref, intent_id: reserved.lease.intent_id, revision: 1, targets: [{ host: "203.0.113.9", port: 443 }], protocol: "tcp" },
+        { db, audit: () => {}, teardown: null },
+      );
+      assert.equal(applied.ok, true, applied.ok ? "" : applied.message);
+      assert.equal(seen.length, 1);
+
+      const leaseRow = await db.federationLease.findUnique({ where: { lease_ref: ref } });
+      assert.ok(leaseRow.applied_config, "apply must persist the exact config it dispatched");
+      assert.equal(leaseRow.applied_config.id, `tunex-fed-${ref}-egress`);
+      assert.equal(leaseRow.applied_config.mode, "EGRESS");
+      assert.equal(leaseRow.applied_config.egress_port, reserved.port);
+      assert.equal(leaseRow.applied_config.revision, 1);
+
+      // 1) 快照里必须能看到这条腿（这就是 Agent 不再剪它的原因）。
+      const withLeg = await buildDesiredNodeSnapshot(node.id);
+      assert.equal(withLeg.tunnels.length, before.tunnels.length + 1, JSON.stringify(withLeg));
+      const published = withLeg.tunnels.find((t) => t.id === `tunex-fed-${ref}-egress`);
+      assert.ok(published, "the federated leg must be published");
+      assert.equal(published.revision, 1);
+      assert.equal(published.egress_port, reserved.port);
+      assert.deepEqual(published.targets, [{ host: "203.0.113.9", port: 443, weight: 1, order: 10 }]);
+      // 既有 tunnel 派生条目一条不差（同一批 id、同样的顺序前缀）。
+      assert.deepEqual(withLeg.tunnels.slice(0, before.tunnels.length).map((t) => t.id), before.tunnels.map((t) => t.id));
+      assert.equal(withLeg.skipped.length, 0);
+
+      // 2) 到期即不发布（host 到期必须停服）。
+      await db.federationLease.update({ where: { lease_ref: ref }, data: { expires_at: new Date(Date.now() - 1_000) } });
+      const expired = await buildDesiredNodeSnapshot(node.id);
+      assert.equal(expired.tunnels.some((t) => t.id === `tunex-fed-${ref}-egress`), false, JSON.stringify(expired));
+      assert.equal(expired.tunnels.length, before.tunnels.length);
+
+      // 3) 终态也不发布。
+      await db.federationLease.update({
+        where: { lease_ref: ref },
+        data: { state: "released", released_at: new Date(), expires_at: new Date(Date.now() + 3_600_000) },
+      });
+      const releasedSnapshot = await buildDesiredNodeSnapshot(node.id);
+      assert.equal(releasedSnapshot.tunnels.some((t) => t.id === `tunex-fed-${ref}-egress`), false, JSON.stringify(releasedSnapshot));
+      assert.equal(releasedSnapshot.tunnels.length, before.tunnels.length);
+
+      // 4) 回到 active 又出现（幂等，不是一次性开关）。
+      await db.federationLease.update({ where: { lease_ref: ref }, data: { state: "active" } });
+      const again = await buildDesiredNodeSnapshot(node.id);
+      assert.equal(again.tunnels.some((t) => t.id === `tunex-fed-${ref}-egress`), true);
+      assert.equal(again.tunnels.length, before.tunnels.length + 1);
+    } finally {
+      resetOrchestrator();
+    }
+  });
+
   /* ---------------- 清理 ---------------- */
 
   after(async () => {
@@ -985,6 +1082,10 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     if (created.nodeId !== null) {
       await db.nodePortLease.deleteMany({ where: { node_id: created.nodeId } });
       await db.node.deleteMany({ where: { id: created.nodeId } });
+    }
+    for (const extra of created.extraNodeIds) {
+      await db.nodePortLease.deleteMany({ where: { node_id: extra } });
+      await db.node.deleteMany({ where: { id: extra } });
     }
     if (created.groupId !== null) await db.nodeGroup.deleteMany({ where: { id: created.groupId } });
     if (created.workspaceId !== null) await db.workspace.deleteMany({ where: { id: created.workspaceId } });

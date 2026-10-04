@@ -14,6 +14,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   DEFAULT_LEASE_TTL_SECONDS,
+  buildFederatedRuntimeConfig,
   renewalWindowIndex,
   applyRemoteLease,
   renewRemoteLease,
@@ -38,8 +39,9 @@ import {
   type LeaseHostDeps,
 } from "../federation/lease.ts";
 import { PORT_RELEASE_PENDING_CODE, nextLeaseEpoch, type FederationAuditSink } from "../federation/grant.ts";
+import { federatedTunnelConfigsFor, type FederatedLegRow } from "../agent-command-bus.ts";
+import { Orchestrator, type Orchestrator as OrchestratorType } from "../orchestrator.ts";
 import { resetOrchestrator, setOrchestrator } from "../relay-wiring.ts";
-import type { Orchestrator } from "../orchestrator.ts";
 import {
   MAX_PLACEMENT_PROBES_PER_TICK,
   mapRemoteLeaseStateToPlacement,
@@ -1176,7 +1178,7 @@ describe("WP15 lease: apply dispatches through the existing orchestrator seam", 
         return { ok: true as const, result: { commandId: "c3", revision: input.revision, ack: {} } };
       },
     };
-    setOrchestrator(fake as unknown as Orchestrator);
+    setOrchestrator(fake as unknown as OrchestratorType);
     try {
       const ingress = applyFixture({ next_hop: "10.9.0.6:19002" }, { hop_role: "ingress" });
       // 不注入 dispatch/teardown → 走生产默认实现（假 orchestrator 让它们可断言）；
@@ -1921,6 +1923,163 @@ describe("WP16 placement (task-10): converged rows are probed and can degrade an
     expect(flat?.applied_revision).toBe(3);
     const nested = parseRemoteLeaseFact({ lease: { state: "expired" } });
     expect(nested?.state).toBe("expired");
+  });
+});
+
+/* ================================================================== */
+/* task-12：联邦腿必须被发布进 host 自己的权威 desired 快照                 */
+/* ================================================================== */
+
+describe("WP15 (task-12): the applied config is the single source the snapshot publishes", () => {
+  test("the EGRESS runtime config matches the dispatch shape (ports/targets/lb/protocol/revision)", () => {
+    const config = buildFederatedRuntimeConfig({
+      lease_ref: "lease-1",
+      hop_role: "egress",
+      runtime_id: "tunex-fed-lease-1-egress",
+      revision: 4,
+      listen_port: 22000,
+      link: {
+        protocol: "tcp",
+        targets: [{ host: "203.0.113.9", port: 443 }, { host: "203.0.113.10", port: 8443, weight: 3, order_by: 5 }],
+        pool_id: null,
+        lb_strategy: "WEIGHTED_ROUND_ROBIN",
+        next_hop: null,
+        tls_cert_path: null,
+        tls_key_path: null,
+      },
+    });
+    expect(config.id).toBe("tunex-fed-lease-1-egress");
+    expect(config.mode).toBe("EGRESS");
+    expect(config.egress_port).toBe(22000);
+    expect(config.ingress_port).toBe(0);
+    expect(config.lb_strategy).toBe("WEIGHTED_ROUND_ROBIN");
+    expect(config.protocol).toBe("tcp");
+    expect(config.revision).toBe(4);
+    expect(config.speed_limit).toBe(0);
+    expect(config.targets).toEqual([
+      { host: "203.0.113.9", port: 443, weight: 1, order: 10 },
+      { host: "203.0.113.10", port: 8443, weight: 3, order: 5 },
+    ]);
+  });
+
+  test("the RELAY runtime config carries the next hop (ingress leg)", () => {
+    const config = buildFederatedRuntimeConfig({
+      lease_ref: "lease-2",
+      hop_role: "ingress",
+      runtime_id: "tunex-fed-lease-2-relay",
+      revision: 1,
+      listen_port: 22001,
+      link: {
+        protocol: "tcp",
+        targets: [],
+        pool_id: null,
+        lb_strategy: null,
+        next_hop: "10.8.0.9:22000",
+        tls_cert_path: null,
+        tls_key_path: null,
+      },
+    });
+    expect(config.mode).toBe("RELAY");
+    expect(config.ingress_port).toBe(22001);
+    expect(config.egress_port).toBe(22000);
+    expect(config.remote_host).toBe("10.8.0.9");
+    expect(config.remote_port).toBe(22000);
+    expect(config.next_hop).toBe("10.8.0.9:22000");
+    expect(config.targets).toEqual([]);
+  });
+});
+
+describe("WP15 (task-12): the desired snapshot publishes exactly the live federated legs", () => {
+  const NOW2 = new Date("2026-10-05T04:00:00Z");
+  const config = (id: string, revision = 4): Row => ({
+    id,
+    mode: "EGRESS",
+    ingress_port: 0,
+    egress_port: 22000,
+    remote_host: "",
+    remote_port: 0,
+    next_hop: "",
+    targets: [{ host: "203.0.113.9", port: 443, weight: 1, order: 10 }],
+    lb_strategy: "ROUND_ROBIN",
+    protocol: "tcp",
+    speed_limit: 0,
+    revision,
+  });
+
+  function legRow(over: Partial<FederatedLegRow> = {}): FederatedLegRow {
+    return {
+      id: 1,
+      lease_ref: "lease-1",
+      node_id: 5,
+      state: "active",
+      hop_role: "egress",
+      applied_revision: 4,
+      applied_config: config("tunex-fed-lease-1-egress"),
+      expires_at: new Date(NOW2.getTime() + 60_000),
+      ...over,
+    } as FederatedLegRow;
+  }
+
+  test("an active, unexpired leg is published with the runtime id and revision from the dispatch", () => {
+    const out = federatedTunnelConfigsFor([legRow()], 5, NOW2);
+    expect(out.configs).toHaveLength(1);
+    expect(out.configs[0].id).toBe("tunex-fed-lease-1-egress");
+    expect(out.configs[0].revision).toBe(4);
+    expect(out.skipped).toEqual([]);
+  });
+
+  test("nothing is published when there are no legs (the byte-identical constraint)", () => {
+    const out = federatedTunnelConfigsFor([], 5, NOW2);
+    expect(out.configs).toEqual([]);
+    expect(out.skipped).toEqual([]);
+  });
+
+  test("every non-live condition is excluded", () => {
+    const rows = [
+      legRow({ id: 1, state: "reserved" }),
+      legRow({ id: 2, state: "releasing" }),
+      legRow({ id: 3, state: "released" }),
+      legRow({ id: 4, state: "expired" }),
+      legRow({ id: 5, state: "revoked" }),
+      legRow({ id: 6, state: "failed" }),
+      legRow({ id: 7, applied_config: null }),
+      legRow({ id: 8, expires_at: new Date(NOW2.getTime() - 1) }),
+      legRow({ id: 9, node_id: 6 }),
+    ];
+    const out = federatedTunnelConfigsFor(rows, 5, NOW2);
+    expect(out.configs).toEqual([]);
+    expect(out.skipped).toEqual([]);
+  });
+
+  test("a stale config is never published: id or revision drift is reported, not silently trusted", () => {
+    const wrongId = legRow({ id: 2, lease_ref: "lease-1", applied_config: config("tunex-fed-somewhere-else-egress") });
+    const wrongRevision = legRow({ id: 3, applied_revision: 9, applied_config: config("tunex-fed-lease-1-egress", 4) });
+    const malformed = legRow({ id: 4, applied_config: { mode: "EGRESS" } });
+    const out = federatedTunnelConfigsFor([wrongId, wrongRevision, malformed], 5, NOW2);
+    expect(out.configs).toEqual([]);
+    expect(out.skipped.map((s) => s.reason).sort()).toEqual([
+      "federation_applied_config_malformed",
+      "federation_applied_config_revision_mismatch",
+      "federation_runtime_id_mismatch",
+    ]);
+  });
+
+  test("an id already used by a tunnel-derived entry is reported as a conflict, never overwritten", () => {
+    const out = federatedTunnelConfigsFor([legRow()], 5, NOW2, new Set(["tunex-fed-lease-1-egress"]));
+    expect(out.configs).toEqual([]);
+    expect(out.skipped).toEqual([{ id: 1, reason: "federation_runtime_id_conflict" }]);
+  });
+
+  test("the runtime id comes from the same helper the dispatch used", () => {
+    expect(Orchestrator.federatedTunnelId("lease-1", "egress")).toBe("tunex-fed-lease-1-egress");
+    const ingressLeg = legRow({
+      lease_ref: "lease-9",
+      hop_role: "ingress",
+      applied_config: { ...config("tunex-fed-lease-9-relay"), mode: "RELAY" },
+    });
+    const out = federatedTunnelConfigsFor([ingressLeg], 5, NOW2);
+    expect(out.configs).toHaveLength(1);
+    expect(out.configs[0].id).toBe(Orchestrator.federatedTunnelId("lease-9", "relay"));
   });
 });
 

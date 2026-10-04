@@ -54,7 +54,7 @@ import {
 import type { FederationErrorCode } from "./errors.ts";
 import { setFederationRevokedHook } from "./trust.ts";
 import { reconcilePlacements, type PlacementDeps } from "./placement.ts";
-import { Orchestrator, splitNextHop, type OrchestratorNode } from "../orchestrator.ts";
+import { Orchestrator, splitNextHop, type AgentTunnelConfig, type OrchestratorNode } from "../orchestrator.ts";
 import { getOrchestrator } from "../relay-wiring.ts";
 import { FORWARD_PROTOCOLS, type ForwardProtocol } from "../forward-contract.ts";
 import { db } from "../../db.ts";
@@ -1320,7 +1320,17 @@ export interface LeaseDispatchInput {
   link: FederatedLegLink;
 }
 
-export type LeaseDispatchOutcome = { ok: true } | { ok: false; code?: FederationErrorCode; message: string };
+export type LeaseDispatchOutcome =
+  | {
+      ok: true;
+      /**
+       * **我们实际发出去的那份 Agent 运行时配置原文**（见 {@link buildFederatedRuntimeConfig}）。
+       * `applyRemoteLease` 会把它写进 `federation_lease.applied_config`，快照再原样发布给 Agent——
+       * 只有这一份事实，快照不重新拼装。
+       */
+      applied_config?: AgentTunnelConfig | null;
+    }
+  | { ok: false; code?: FederationErrorCode; message: string };
 
 export type LeaseDispatchHook = (input: LeaseDispatchInput) => Promise<LeaseDispatchOutcome> | LeaseDispatchOutcome;
 
@@ -1441,6 +1451,75 @@ export function validateLegLink(hopRole: string, raw: unknown): ParseResult<Fede
   return { ok: true, value: { protocol, targets, pool_id: poolId, lb_strategy: lbStrategy, next_hop: nextHop, tls_cert_path: tlsCertPath, tls_key_path: tlsKeyPath } };
 }
 
+/**
+ * 联邦腿的**运行时配置构造器（唯一那一份下发布料）**。
+ *
+ * 字段的推导规则与 `Orchestrator.dispatchEgress / dispatchIngress` 内部完全一致（EGRESS：
+ * `ingress_port=0`、`remote_*` 空、目标带 `weight/order`；RELAY：`egress_port/next_hop` 指向下一跳）。
+ * 之所以在这里构造而不是从 orchestrator 里取回：orchestrator 的入参是"更高层的意图"，
+ * 不返回它内部拼出的配置；而这份配置必须**与下发同源**，否则快照与下发迟早各说各话。
+ * 因此调用方（defaultDispatch）由这份配置**推导** orchestrator 入参，而不是反过来。
+ */
+export function buildFederatedRuntimeConfig(input: {
+  lease_ref: string;
+  hop_role: HopRole;
+  runtime_id: string;
+  revision: number;
+  listen_port: number;
+  link: FederatedLegLink;
+  /** 节点自己的可寻址地址（诊断/展示用；Agent 的 EGRESS 配置不使用它）。 */
+  node_address?: string | null;
+}): AgentTunnelConfig {
+  const protocol = (input.link.protocol ?? "tcp") as ForwardProtocol;
+  const targets = (input.link.targets ?? []).map((t, i) => ({
+    host: t.host,
+    port: t.port,
+    weight: t.weight ?? 1,
+    order: t.order_by ?? (i + 1) * 10,
+  }));
+
+  if (input.hop_role === "ingress") {
+    const hop = splitNextHop(input.link.next_hop ?? "") ?? { host: "", port: 0 };
+    return {
+      id: input.runtime_id,
+      mode: "RELAY",
+      ingress_port: input.listen_port,
+      egress_port: hop.port,
+      remote_host: hop.host,
+      remote_port: hop.port,
+      next_hop: input.link.next_hop ?? "",
+      // RELAY 侧不持有目标知识（目标在出口节点上）——与 dispatchIngress 完全一致。
+      targets: [],
+      lb_strategy: "ROUND_ROBIN",
+      protocol,
+      speed_limit: 0,
+      revision: input.revision,
+      ...(input.link.tls_cert_path && input.link.tls_key_path
+        ? { tls_cert_path: input.link.tls_cert_path, tls_key_path: input.link.tls_key_path }
+        : {}),
+    };
+  }
+
+  // EGRESS（远端出口腿）：本机节点只服务入口节点转发来的流量。
+  return {
+    id: input.runtime_id,
+    mode: "EGRESS",
+    egress_port: input.listen_port,
+    ingress_port: 0,
+    remote_host: "",
+    remote_port: 0,
+    next_hop: "",
+    targets,
+    lb_strategy: (input.link.lb_strategy ?? "ROUND_ROBIN") as AgentTunnelConfig["lb_strategy"],
+    protocol,
+    speed_limit: 0,
+    revision: input.revision,
+    ...(input.link.tls_cert_path && input.link.tls_key_path
+      ? { tls_cert_path: input.link.tls_cert_path, tls_key_path: input.link.tls_key_path }
+      : {}),
+  };
+}
+
 /** hop 角色 → 运行时 id 的方向段（与本地腿的分段一致，Agent 不需要认识"联邦"）。 */
 export const HOP_ROLE_RUNTIME_DIRECTION: Readonly<Record<HopRole, "direct" | "relay" | "egress">> = {
   ingress: "relay",
@@ -1470,6 +1549,16 @@ async function defaultDispatch(input: LeaseDispatchInput): Promise<LeaseDispatch
 
   const protocol = (input.link.protocol ?? undefined) as ForwardProtocol | undefined;
   const runtimeId = input.runtime_id;
+  // **唯一那一份下发布料**：orchestrator 的入参由它推导，落库的也是它。
+  const config = buildFederatedRuntimeConfig({
+    lease_ref: input.lease.lease_ref,
+    hop_role: (HOP_ROLES as readonly string[]).includes(input.lease.hop_role) ? (input.lease.hop_role as HopRole) : "egress",
+    runtime_id: runtimeId,
+    revision: input.revision,
+    listen_port: port,
+    link: input.link,
+    node_address: input.node.connect_ip,
+  });
   // `tunnelId` 只作为本地记账/命令 id 的一部分；**运行时身份由 runtimeId 决定**，
   // 所以这里用联邦 lease 的主键不会与本地 tunnel id 冲突（见 orchestrator 注释）。
   const tunnelId = input.lease.id;
@@ -1481,15 +1570,17 @@ async function defaultDispatch(input: LeaseDispatchInput): Promise<LeaseDispatch
         runtimeId,
         revision: input.revision,
         egressNode: input.node,
-        egressPort: port,
+        egressPort: config.egress_port,
         poolId: input.link.pool_id ?? null,
-        targets: input.link.targets ?? [],
-        lbStrategy: input.link.lb_strategy ?? null,
+        targets: config.targets.map((t) => ({ host: t.host, port: t.port, weight: t.weight, order_by: t.order })),
+        lbStrategy: config.lb_strategy,
         protocol,
         tlsCertPath: input.link.tls_cert_path ?? null,
         tlsKeyPath: input.link.tls_key_path ?? null,
       });
-      return outcome.ok ? { ok: true } : { ok: false, code: "internal_error", message: `${outcome.error_code}: ${outcome.error}` };
+      return outcome.ok
+        ? { ok: true, applied_config: config }
+        : { ok: false, code: "internal_error", message: `${outcome.error_code}: ${outcome.error}` };
     }
     case "ingress": {
       // 入参 `runtimeId` 非空时 dispatchIngress 会**跳过 placement 归属认领**：
@@ -1499,13 +1590,15 @@ async function defaultDispatch(input: LeaseDispatchInput): Promise<LeaseDispatch
         runtimeId,
         revision: input.revision,
         ingressNode: input.node,
-        ingressPort: port,
-        nextHop: input.link.next_hop ?? "",
+        ingressPort: config.ingress_port,
+        nextHop: config.next_hop,
         protocol,
         tlsCertPath: input.link.tls_cert_path ?? null,
         tlsKeyPath: input.link.tls_key_path ?? null,
       });
-      return outcome.ok ? { ok: true } : { ok: false, code: "internal_error", message: `${outcome.error_code}: ${outcome.error}` };
+      return outcome.ok
+        ? { ok: true, applied_config: config }
+        : { ok: false, code: "internal_error", message: `${outcome.error_code}: ${outcome.error}` };
     }
     case "transit": {
       const outcome = await orchestrator.dispatchTransit({
@@ -1807,6 +1900,9 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
       applied_at: now,
       last_error_code: null,
       last_error: null,
+      // 下发钩子报了配置就写它；没报（注入替身/特殊路径）则保留既有值 —— 不清空，
+      // 否则一次"没带配置的成功 apply"会把快照的发布依据抹掉，Agent 下一拍就会剪掉这条腿。
+      ...(dispatched.applied_config ? { applied_config: dispatched.applied_config as unknown as object } : {}),
     },
   })) as { count: number };
   if (updated.count === 0) {

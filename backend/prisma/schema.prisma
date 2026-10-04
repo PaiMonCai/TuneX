@@ -2019,6 +2019,9 @@ model FederationLease {
   listen_port        Int?
   requested_revision Int             @default(0)
   applied_revision   Int?
+  /// V5.5 WP15：**已应用的那份 Agent 运行时配置原文**（与下发同一份事实，不再在快照里重拼）。
+  /// host 的权威 desired 快照据此把联邦腿发布给自己的 Agent；NULL = 从未成功应用过。
+  applied_config     Json?
   last_error_code    String?         @db.VarChar(64)
   last_error         String?         @db.Text
   expires_at         DateTime

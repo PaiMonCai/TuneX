@@ -25,6 +25,7 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   AgentTransportError,
+  Orchestrator,
   RELAY_DISPATCH_ERROR_CODES,
   type AgentTransport,
   type AgentTunnelConfig,
@@ -1084,6 +1085,122 @@ export function desiredTunnelConfigFor(
   return { kind: "not_for_node" };
 }
 
+
+/**
+ * V5.5 WP15 —— 把本节点的**活跃联邦腿**追加进权威 desired 快照。
+ *
+ * 为什么需要它（Gate 用 B 的 Agent 日志定位到的根因，不是竞态）：
+ * ```
+ * 22:41:34 tunnel applied id=tunex-fed-…-egress mode=EGRESS port=22000 revision=1
+ * 22:42:18 reconcile removed runtime absent from authoritative desired state ids=tunex-fed-…-egress
+ * ```
+ * 联邦腿在 host 上**没有本地 tunnel 行**（契约 §1 的归属选择：远端资源不得复制成本地 Forward），
+ * 而这份快照原先只枚举 `db.tunnel`，于是 Agent 的"删掉不在 desired 里的 runtime"这条**正确**逻辑
+ * 稳定地把远端腿剪掉 —— 它活不过 ~30s，整条联邦数据面因此不成立。
+ *
+ * 归属与执行并不矛盾：权威仍然只有一份（租约行 + 它的 `applied_config`），
+ * 只是这条腿**必须被发布**给自己节点上的 Agent。发布的内容就是 `applyRemoteLease` 当时
+ * 实际下发的那份配置原文（不在快照里重新拼装 —— 两处各拼一次必然漂移）。
+ *
+ * 纯函数：入参是投影 + 节点 + 时刻，因此"发布什么/不发布什么"可以离线断言。
+ */
+export function federatedTunnelConfigsFor(
+  rows: readonly FederatedLegRow[],
+  nodeId: number,
+  now: Date,
+  existingIds: ReadonlySet<string> = new Set(),
+): { configs: AgentTunnelConfig[]; skipped: Array<{ id: number; reason: string }> } {
+  const configs: AgentTunnelConfig[] = [];
+  const skipped: Array<{ id: number; reason: string }> = [];
+  const seen = new Set(existingIds);
+
+  for (const row of rows) {
+    if (row.node_id !== nodeId) continue;
+    // 只有"正在服务"的腿才是期望状态：reserved 还没下发、releasing/终态都不该发布。
+    if (row.state !== "active") continue;
+    // 过期即不发布：host 到期必须停服（契约 §3.2），期望状态里留着它就等于让它继续服务。
+    if (row.expires_at.getTime() <= now.getTime()) continue;
+    if (row.applied_config === null || row.applied_config === undefined) continue;
+    if (row.applied_revision === null || row.applied_revision <= 0) {
+      skipped.push({ id: row.id, reason: "federation_lease_never_applied" });
+      continue;
+    }
+
+    const config = row.applied_config as unknown as AgentTunnelConfig;
+    if (typeof config !== "object" || config === null || typeof config.id !== "string" || typeof config.mode !== "string") {
+      skipped.push({ id: row.id, reason: "federation_applied_config_malformed" });
+      continue;
+    }
+    // id 必须与下发时同一个函数生成（方向由租户自己的 hop_role 决定），否则 Agent 会把它
+    // 当成另一条腿 —— 那会同时留下一条"没人管"的 runtime 和一条"永远起不来"的 desired。
+    const direction: "direct" | "relay" | "egress" =
+      row.hop_role === "ingress" ? "relay" : "egress";
+    const expectedId = Orchestrator.federatedTunnelId(row.lease_ref, direction);
+    if (config.id !== expectedId) {
+      skipped.push({ id: row.id, reason: "federation_runtime_id_mismatch" });
+      continue;
+    }
+    if (config.revision !== row.applied_revision) {
+      skipped.push({ id: row.id, reason: "federation_applied_config_revision_mismatch" });
+      continue;
+    }
+    // 同 id 冲突：**显式报错，不静默覆盖**（覆盖会让两条事实里的某一条无声消失）。
+    if (seen.has(config.id)) {
+      console.error(`[desired] federated leg runtime id conflict: ${config.id} (lease ${row.lease_ref})`);
+      skipped.push({ id: row.id, reason: "federation_runtime_id_conflict" });
+      continue;
+    }
+    seen.add(config.id);
+    configs.push(config);
+  }
+
+  return { configs, skipped };
+}
+
+/** 联邦租约行的最小投影（快照只需要这些列）。 */
+export interface FederatedLegRow {
+  id: number;
+  lease_ref: string;
+  node_id: number | null;
+  state: string;
+  hop_role: string;
+  applied_revision: number | null;
+  applied_config: unknown;
+  expires_at: Date;
+}
+
+/**
+ * 读本节点的活跃联邦腿。**fail-soft**：读失败不得让整份快照失败（与既有健康读取同风格），
+ * 但要在 `skipped` 里留下可见痕迹 —— "决策不留痕的机制与从未运行过的机制无法区分"。
+ */
+async function collectFederatedLegRows(
+  nodeId: number,
+  now: Date,
+): Promise<{ rows: FederatedLegRow[]; error: string | null }> {
+  try {
+    const rows = (await db.federationLease.findMany({
+      where: {
+        node_id: nodeId,
+        state: "active",
+        expires_at: { gt: now },
+      },
+      select: {
+        id: true,
+        lease_ref: true,
+        node_id: true,
+        state: true,
+        hop_role: true,
+        applied_revision: true,
+        applied_config: true,
+        expires_at: true,
+      },
+    })) as FederatedLegRow[];
+    return { rows, error: null };
+  } catch (e) {
+    return { rows: [], error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function buildDesiredNodeSnapshot(
   nodeId: number,
 ): Promise<{ version: string; tunnels: AgentTunnelConfig[]; skipped: Array<{ id: number; reason: string }> }> {
@@ -1174,5 +1291,17 @@ export async function buildDesiredNodeSnapshot(
       );
     }
   }
+  // ── V5.5 WP15：本节点的活跃联邦腿（**追加**，既有 tunnel 派生条目一条不动）──
+  const federated = await collectFederatedLegRows(nodeId, new Date());
+  if (federated.error !== null) {
+    // fail-soft：读租约出错不能让整份快照失败，但必须留下可见痕迹。
+    console.error(`[desired] federated legs unreadable for node ${nodeId}: ${federated.error}`);
+    skipped.push({ id: -1, reason: "federation_legs_read_failed" });
+  } else {
+    const appended = federatedTunnelConfigsFor(federated.rows, nodeId, new Date(), new Set(tunnels.map((t) => t.id)));
+    for (const config of appended.configs) tunnels.push(config);
+    for (const s of appended.skipped) skipped.push(s);
+  }
+
   return { version: "tunex-v3", tunnels, skipped };
 }
