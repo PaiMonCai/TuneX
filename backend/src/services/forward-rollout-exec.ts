@@ -377,6 +377,7 @@ interface TunnelProjection {
   tunnel_mode: string;
   ingress_node_id: number | null;
   egress_node_id: number | null;
+  middle_node_id?: number | null;
   listen_ip: string | null;
   listen_port: number | null;
   remote_host: string | null;
@@ -474,6 +475,7 @@ async function loadRolloutNodes(
     mode: String(s.mode ?? row.tunnel_mode) === "relay" ? "relay" : "direct",
     ingress_node_id: Number(s.ingress_node_id ?? row.ingress_node_id ?? 0),
     egress_node_id: s.egress_node_id == null ? null : Number(s.egress_node_id),
+    middle_node_id: s.middle_node_id == null ? null : Number(s.middle_node_id),
     listen_ip: (s.listen_ip as string | null) ?? row.listen_ip,
     listen_port: s.listen_port == null ? null : Number(s.listen_port),
     target_host: (s.target_host as string | null) ?? null,
@@ -498,6 +500,7 @@ async function loadRolloutNodes(
         mode: row.tunnel_mode === "relay" ? "relay" : "direct",
         ingress_node_id: row.ingress_node_id ?? 0,
         egress_node_id: row.egress_node_id ?? null,
+        middle_node_id: row.middle_node_id ?? null,
         listen_ip: row.listen_ip,
         listen_port: row.listen_port ?? null,
         target_host: row.remote_host,
@@ -542,7 +545,7 @@ async function loadRolloutNodes(
 
   // A desired revision may choose different Nodes while the tunnel projection
   // still describes the old applied topology. Admission must inspect the target.
-  const [desiredIngress, desiredEgress] = await Promise.all([
+  const [desiredIngress, desiredEgress, desiredMiddle] = await Promise.all([
     (row.ingress_node as { id?: number } | null)?.id === desired.ingress_node_id
       ? row.ingress_node
       : deps.db.node.findUnique({ where: { id: desired.ingress_node_id } }),
@@ -550,10 +553,14 @@ async function loadRolloutNodes(
       : (row.egress_node as { id?: number } | null)?.id === desired.egress_node_id
         ? row.egress_node
         : deps.db.node.findUnique({ where: { id: desired.egress_node_id } }),
+    desired.middle_node_id == null
+      ? null
+      : deps.db.node.findUnique({ where: { id: desired.middle_node_id } }),
   ]);
   const nodes: PlanRolloutInput["nodes"] = {
     ingress: nodeFact(desiredIngress),
     egress: nodeFact(desiredEgress),
+    middle: nodeFact(desiredMiddle),
     // 旧拓扑的节点对象：applied snapshot 里有 id 即可，运行时 DRAIN/CLEANUP
     // 只需要 node id 与端口，不需要再读一次 Node 行（避免旧节点已删时读库失败）。
     ingress_previous:
@@ -578,6 +585,10 @@ async function loadRolloutNodes(
         : applied && applied.egress_node_id != null
           ? { id: applied.egress_node_id, node_id: "", role: null, connect_ip: null }
           : null,
+    middle_previous:
+      applied?.middle_node_id != null
+        ? { id: applied.middle_node_id, node_id: "", role: null, connect_ip: null }
+        : null,
   };
 
   // Binding 存在性：只有 RELAY 且出口节点解析出来才有意义。
@@ -966,8 +977,14 @@ async function runStep(
         select: { id: true },
       })) as Array<{ id: number }>;
       // 取第一条：同 (node, port) 的 lease 在该节点端口区间内唯一。
+      const releaseTransitLease =
+        step.port == null &&
+        step.meta?.reason === "transit_changed" &&
+        oldLeaseRows.length === 1;
       const oldLeaseId: number | null =
-        step.port != null && oldLeaseRows.length > 0 ? oldLeaseRows[0]!.id : null;
+        (step.port != null || releaseTransitLease) && oldLeaseRows.length > 0
+          ? oldLeaseRows[0]!.id
+          : null;
 
       // 旧 rollout 行重放时那一条可能已被释放：这时回退到按 tunnelId 释放，
       // 不因差一行而让整个 rollout 判失败（§13.3.5 CLEANUP 是尽力而为）。
@@ -988,9 +1005,10 @@ async function runStep(
       };
     }
 
-    case "drop_old_egress": {
+    case "drop_old_egress":
+    case "drop_old_transit": {
       if (nodeId == null) {
-        return { ok: false, error_code: "invariant_violated", error: "drop_old_egress 缺少 node_id" };
+        return { ok: false, error_code: "invariant_violated", error: `${step.kind} 缺少 node_id` };
       }
       const outcome = await orchestrator.removeTunnel({
         tunnelId: ctx.tunnelId,
@@ -998,13 +1016,18 @@ async function runStep(
         direction: "egress",
         // revision+1：同 removeTunnel 的补偿口径，重复执行幂等。
         revision: ctx.revision + 1,
-        reason: `rollout ${ctx.rolloutId} drop old egress`,
+        reason: `rollout ${ctx.rolloutId} ${step.kind === "drop_old_transit" ? "drop old transit" : "drop old egress"}`,
       });
       if (!outcome.ok) {
         // §13.3.5：CLEANUP 失败只记 degraded，不影响已生效的新 revision。
         return { ok: false, soft: true, error_code: outcome.error_code, error: outcome.error };
       }
-      return { ok: true, note: `old egress ${nodeId} 已撤下` };
+      return {
+        ok: true,
+        note: step.kind === "drop_old_transit"
+          ? `old transit ${nodeId} 已撤下`
+          : `old egress ${nodeId} 已撤下`,
+      };
     }
 
     /* ---------------- VALIDATE（无副作用）---------------- */
@@ -2237,7 +2260,7 @@ export async function registerRollout(
   }
   indexRolloutNodes(
     deps.orchestrator,
-    [nodes.ingress, nodes.egress].filter((n) => n != null) as any,
+    [nodes.ingress, nodes.egress, nodes.middle].filter((n) => n != null) as any,
   );
 
   const planInput: PlanRolloutInput = {
