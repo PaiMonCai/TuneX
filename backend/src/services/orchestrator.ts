@@ -69,7 +69,7 @@ import {
 } from "./control-protocol/index.ts";
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
 import { targetHealthWireEntries } from "./target-health-read.ts";
-import { claimLease } from "./placement-lease.ts";
+import { claimLease, releaseLease as releasePlacementLease } from "./placement-lease.ts";
 import type { RoutePlan } from "./forward-route.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
@@ -792,6 +792,25 @@ export class Orchestrator {
    *   3. 同一节点的重新下发 = 续约（claim 对现任是幂等的），所以 reconcile/resend 不会
    *      把自己挡在门外。
    */
+  /**
+   * 显式释放入口归属（两阶段 handoff 的第一阶段）。
+   *
+   * 这里只改 ownership ledger；调用方必须先确认旧入口 runtime 已经撤下，才能
+   * 调这个方法。把这条约束留在调用方，是因为只有 rollout 知道"旧 runtime 已
+   * remove ACK"这个事实，placement-lease 模块本身不碰 Agent IO。
+   */
+  async releaseOwnership(input: {
+    tunnelId: number;
+    nodeId: number;
+    now?: Date;
+  }): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" }> {
+    return releasePlacementLease({
+      tunnelId: input.tunnelId,
+      nodeId: input.nodeId,
+      now: input.now ?? new Date(),
+    });
+  }
+
   private async claimOwnership(
     tunnelId: number,
     nodeId: number,
