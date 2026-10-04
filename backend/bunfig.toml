@@ -1,0 +1,4 @@
+# 单测环境基线：让 `bun test <任一文件>` 的结果不依赖"哪个文件先跑"。
+# 只补缺省值，不覆盖 CI 已设置的真实环境变量。见 tests/preload-env.ts 的说明。
+[test]
+preload = ["./tests/preload-env.ts"]

@@ -2697,6 +2697,28 @@ Partition behavior?
 Conflict reconciliation?
 ~~~
 
+### 10.0 契约冻结与当前状态（2026-10-05）
+
+九个所有权问题的正式答案、错误码闭集、分区行为矩阵与第一阶段不开放项，已冻结在
+**`docs/v5-wp14-16-federation-contract.md`**（本文件不再重复那 200 行）。一句话版本：
+
+> 发起方（home panel）拥有 Forward 的期望状态与 rollout 账本；承载方（host panel）拥有自己的
+> Node / 端口租约 / Agent 控制链；跨面板资源**只作不透明引用**，绝不复制成本地 node / lease 行。
+> 容量、配额与用量以 host 为准；撤销以 host 的 grant 为权威且不可逆；分区一律 fail-closed，
+> **禁止**静默回落到本地节点。
+
+状态：
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| WP14 身份 / 信任 / 签名 | **DONE（本地已验证）** | 面板身份（Ed25519，私钥密文落地）、一次性 token 握手 + HMAC proof、请求签名（JWS over raw body）+ 时间窗 + 回执去重/幂等、密钥轮转（先通知后切换 + 24h retiring 宽限）、撤销（不可逆 + 级联停服）、两侧审计 |
+| WP15 授予 / 远端租约 | **host 侧 DONE；home 侧 rollout 编排未接** | grant（epoch 单调 + scope/capacity fail-closed + suspend/revoke 语义分离）、远端租约状态机（reserved→active→releasing→released/expired/revoked/failed）、端口一律走 portPool、失败补偿不留孤儿；M2M 与 Admin 端点已接 |
+| WP16 用量 / 部分失败 / 对账 | **DONE（周期对账已接 worker）** | `usage_id` 去重 + 首写胜 + 归因不一致进 unattributed（不补 0）、到期/撤销清理、placement 重发、每拍可打印汇总 |
+| Gate V5-G5 | **见 `scripts/v3-e2e/v5-g5.py` 与 `docs/evidence/`** | 真两面板拓扑；未跑绿的场景必须显式列出，不得标 production-ready |
+
+已明确**不开放**（继续 fail-closed）：跨面板 3+ 跳 / 任意图、跨面板自动 failover、
+远端资源的本地结算、多 Panel 信任的传递闭包。
+
 ---
 
 ## 10.1 V5-WP14 — Federation Identity / Trust
@@ -2971,34 +2993,35 @@ V5.1b  G1B = 76/0（UDP DIRECT）
 V5.2   G2  = 23/0
 V5.3   G3  = 50/0
 V5.4   G4  = 25/0
+V5.5   G5  = 见 scripts/v3-e2e/evidence/ 下的最新 v5-g5 结果
 
-当前 merge-closure：
-PR #30 的 CI 全绿；
-同一 HEAD 的 V4 F1–F5、V5 G0、V5 G4 全绿；
-G4 已作为 PR Integration 的硬门禁执行，不再依赖手工证据。
+已落地（2026-10-05）：
+V5-WP13.5A Console Boundary      —— User/Admin/Auth 边界与两套 Shell，URL 零变化
+V5-WP13.5B Route Profile 冻结    —— 契约 + schema + 编译器 + API（模板不拥有 runtime）
+V5-WP14    联邦身份 / 信任 / 签名 —— 身份、一次性握手、签名+时间窗+回执幂等、
+                                     轮转（先通知后切换）、撤销（不可逆+级联停服）、两侧审计
+V5-WP15    授予 / 远端租约        —— host 侧租约状态机与真实下发；home 侧 rollout 编排**未接**
+V5-WP16    用量 / 对账            —— usage_id 去重 + 归因 + 到期/撤销清理 + placement 重发
 
 仍阻塞 / 明确不开放：
 V5.1b B2 UDP RELAY —— 跨节点 datagram 形态仍待产品决策，当前必须拒绝；
-V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭。
+V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭；
+跨面板 3+ 跳 / 任意图 / 跨面板自动 failover / 多 Panel 信任传递闭包 —— 保持关闭。
 
-当前产品架构冻结：
-V5-WP13.5 Console Split / Route Profile。
-先把 User Console / Admin Console、Route Profile / RoutePlan 边界、版本传播与 entitlement 冻结；
-不得直接把 Federation、Route Profile 或更多管理功能继续堆进 AppShell(adminMode)。
-
-下一阶段：
-WP13.5A Console Boundary → WP13.5B Route Profile Foundation → V5.5 Federation WP14–WP16；
-G5 关闭前不得标记 production-ready。
+下一阶段（按序）：
+1. 把 G5 在真实两面板拓扑上跑绿，并把逐条结果写进 docs/evidence/；
+2. 接通 home 侧 rollout 的远端 hop 编排（把已有的 lease/apply 从 API 级提升到 Forward 级）；
+3. Federation 的 Admin Console 产品表面收口（Peers / Trust / Grants / Remote Leases / Usage）；
+4. G5 关闭前不得标记 production-ready；未跑绿的场景必须显式列出，不得静默通过。
 ~~~
 
-下一阶段的可执行顺序：
+可执行顺序与硬约束：
 
-1. WP13.5A：拆 User/Admin/Auth route group 与 Shell；保持现有 URL/API/RBAC 兼容，不改 runtime；
-2. WP13.5B：冻结并实现 Route Profile contract / version / visibility / entitlement，编译到现有 RoutePlan；
-3. 冻结 V5.5 Federation 的 authority/ownership 契约，不直接写跨 Panel 资源代码；
-4. 冻结 credential issuance / rotate / revoke、remote lease 与 quota reservation；
-5. 再实现 WP14 → WP15 → WP16，并为 partition / duplicate / reorder / reconnect 建 G5；
-6. 保持 UDP RELAY、QUIC 与其它 V5.x optional 能力关闭，直到各自产品契约和独立 Gate 成立。
+1. WP13.5A/WP13.5B 已落地：**不得**再引入第二套路由模型、第二套状态机或第二套 desired；
+2. 联邦只走 `docs/v5-wp14-16-federation-contract.md` 的契约，**不得**另写第二份协议/签名；
+3. 每个新增能力都必须挂回既有的 Forward desired → revision → ACK → applied → reconcile 链；
+4. 保持 UDP RELAY、QUIC 与其它 V5.x optional 能力关闭，直到各自产品契约和独立 Gate 成立；
+5. 任何"跨面板"资源都不得在本机建第二份 node / port lease 行。
 
 **禁止跳过 Gate、禁止用 skip 掩盖、禁止为了赶进度删 V4 Integration Gate。**
 
