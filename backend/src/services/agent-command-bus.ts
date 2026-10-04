@@ -895,6 +895,7 @@ export interface DesiredRowProjection {
   remote_port: number | null;
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
+  middle_node?: { connect_ip: string | null } | null;
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
   /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
   port_leases?: Array<{ node_id: number; port: number; status: string }>;
@@ -1046,8 +1047,19 @@ export function desiredTunnelConfigFor(
   }
 
   if (row.tunnel_mode === "relay" && row.ingress_node_id === nodeId) {
-    const host = firstConnectIp(row.egress_node?.connect_ip ?? null);
-    if (!row.listen_port || !row.egress_port || !host) return { kind: "not_for_node" };
+    const middleNodeId = row.middle_node_id ?? null;
+    const nextPort =
+      middleNodeId == null
+        ? row.egress_port
+        : (row.port_leases ?? []).find(
+            (lease) => lease.node_id === middleNodeId && lease.status === "active",
+          )?.port ?? null;
+    const host = firstConnectIp(
+      middleNodeId == null
+        ? row.egress_node?.connect_ip ?? null
+        : row.middle_node?.connect_ip ?? null,
+    );
+    if (!row.listen_port || !nextPort || !host) return { kind: "not_for_node" };
     return {
       kind: "config",
       config: {
@@ -1056,8 +1068,8 @@ export function desiredTunnelConfigFor(
         ingress_port: row.listen_port,
         egress_port: 0,
         remote_host: host,
-        remote_port: row.egress_port,
-        next_hop: hostPort(host, row.egress_port),
+        remote_port: nextPort,
+        next_hop: hostPort(host, nextPort),
         targets: [],
         lb_strategy: "ROUND_ROBIN",
         protocol,
@@ -1094,8 +1106,13 @@ export async function buildDesiredNodeSnapshot(
     },
     include: {
       egress_node: { select: { id: true, connect_ip: true } },
+      middle_node: { select: { id: true, connect_ip: true } },
+      // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
+      // its next_hop, while the middle node needs its own lease to restore its
+      // EGRESS-shaped transit runtime. Keep all active leases for this Forward;
+      // NodePortLease remains the only physical-port truth.
       port_leases: {
-        where: { node_id: nodeId, status: "active" },
+        where: { status: "active" },
         select: { node_id: true, port: true, status: true },
       },
       egress_pool: {
