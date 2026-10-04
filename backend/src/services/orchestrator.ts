@@ -638,6 +638,45 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
 
   /**
+   * 中间跳的**唯一实现**：一个监听 + 拨号到下一跳的转发，与出口跳同一个原语。
+   *
+   * 为什么单独抽出来：创建路径与 rollout 路径都需要发这一腿，而"同一个事实有两个实现"是本项目
+   * 反复吃亏的形态（协议、证书路径、健康数组、池内容、schema）。**编排可以有两处，事实的实现只能有一处。**
+   *
+   * `nextHop` 必须是**下一跳自己 dispatch 返回值**里的地址，不能猜 —— 见 `dispatchRoute` 的说明。
+   */
+  async dispatchTransit(input: {
+    tunnelId: number;
+    revision: number;
+    node: OrchestratorNode;
+    port: number;
+    nextHop: string;
+    protocol?: ForwardProtocol;
+  }): Promise<{ ok: true; host: string } | DispatchFailure> {
+    const [host, portRaw] = input.nextHop.split(":");
+    const nextPort = Number(portRaw);
+    if (!host || !Number.isFinite(nextPort) || nextPort <= 0) {
+      return {
+        ok: false,
+        error_code: RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+        error: `中间跳的下一跳地址非法：${input.nextHop}`,
+      };
+    }
+    const outcome = await this.dispatchEgress({
+      tunnelId: input.tunnelId,
+      revision: input.revision,
+      egressNode: input.node,
+      egressPort: input.port,
+      // 中间跳没有自己的池：它唯一的"目标"就是下一跳。
+      poolId: null,
+      targets: [{ host, port: nextPort, weight: 1, order_by: 10 }],
+      protocol: input.protocol,
+    });
+    if (!outcome.ok) return outcome;
+    return { ok: true, host: outcome.egress_host };
+  }
+
+  /**
    * 按 `RoutePlan` 下发一条线性路由。**这是既有原语的组合，不是第二条下发通道。**
    *
    * 三跳的形状，逐跳都是既有的两段式：

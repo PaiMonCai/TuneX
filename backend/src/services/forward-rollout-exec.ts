@@ -1039,34 +1039,29 @@ async function runStep(
           error: `中间跳 ${middleNodeId} 无法解析下一跳（出口）地址：出口未就绪`,
         };
       }
-      const [nextHost, nextPortRaw] = nextHop.split(":");
-      const nextPort = Number(nextPortRaw);
-      if (!nextHost || !Number.isFinite(nextPort) || nextPort <= 0) {
-        return { ok: false, error_code: "next_hop_unresolved", error: `中间跳的下一跳地址非法：${nextHop}` };
-      }
-      const transmitFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
-      if (transmitFacts === null) {
+      // 协议事实与其它真实命令一样必须过 runtime 闸门（A1/A2 的 tls/ws 靠的就是这里）。
+      const transitFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
+      if (transitFacts === null) {
         return {
           ok: false,
           error_code: "unsupported_protocol",
-          error: "该转发使用的协议尚未进入当前 runtime 白名单，拒绝中间跳",
+          error: "该转发使用的协议尚未进入当前 runtime 白名单（或缺少该协议必需的配置），拒绝中间跳",
         };
       }
-      const outcome = await orchestrator.dispatchEgress({
+      // 中间跳只有**一份实现**（`Orchestrator.dispatchTransit`）：创建路径也用它。
+      const transit = await orchestrator.dispatchTransit({
         tunnelId: ctx.tunnelId,
         revision: ctx.revision,
-        egressNode: nodeFor(orchestrator, middleNodeId),
-        egressPort: port,
-        // 中间跳没有自己的池：它唯一的"目标"就是下一跳。
-        poolId: null,
-        targets: [{ host: nextHost, port: nextPort, weight: 1, order_by: 10 }],
-        protocol: transmitFacts.protocol,
+        node: nodeFor(orchestrator, middleNodeId),
+        port,
+        nextHop,
+        protocol: transitFacts.protocol,
       });
-      if (!outcome.ok) {
-        return { ok: false, error_code: outcome.error_code, error: outcome.error };
+      if (!transit.ok) {
+        return { ok: false, error_code: transit.error_code, error: transit.error };
       }
       // 登记中间跳的可寻址 host：入口的 cutover 会用它拼 next_hop。
-      recordNextHop(ctx.rolloutId, middleNodeId, outcome.egress_host);
+      recordNextHop(ctx.rolloutId, middleNodeId, transit.host);
       return { ok: true, note: `transit ${middleNodeId}:${port} → ${nextHop}` };
     }
 

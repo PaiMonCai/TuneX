@@ -235,6 +235,8 @@ export const SCHEDULER_STEPS = [
   "bump_revision",
   "apply_egress",
   "egress_ack",
+  // V5.4：三跳路由的中间跳（在出口之后、入口之前 —— 正向先远后近）。
+  "apply_transit",
   "apply_ingress",
   "ingress_ack",
   "activate",
@@ -1716,6 +1718,28 @@ export async function reapplyRelayTunnel(
 
   const ingressPort = ingressAlloc.port;
   const egressPort = egressAlloc.port;
+
+  // ── V5.4：三跳路由的中间跳端口（唯一新增的分配）──
+  //
+  // 创建路径此前完全不认识 `middle_node_id`：它只发入口与出口两腿，中间跳没有任何 runtime，
+  // 于是流量**绕过中间跳**走单跳路径 —— 客户端照样通，所以只看"通不通"永远发现不了
+  // （实测：中间节点上报里 has_any=0 而客户端有数据）。创建路径是"知道中间跳"的第二条路。
+  const middleNodeId = (row as { middle_node_id?: number | null }).middle_node_id ?? null;
+  let middlePort: number | null = null;
+  if (middleNodeId != null) {
+    const middleAlloc = await allocateTunnelPort(
+      { nodeId: middleNodeId, direction: "egress", preferred: null, tunnelId, reservedPorts: [] },
+      deps.portPoolDeps,
+    );
+    if (!middleAlloc.ok) {
+      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      return fail("acquire_ports", middleAlloc.code, `中间跳端口分配失败：${middleAlloc.detail}`, {
+        meta: { direction: "transit", middle_node_id: middleNodeId },
+      });
+    }
+    middlePort = middleAlloc.port;
+  }
+
   await store.tunnel.update({ where: { id: tunnelId }, data: { listen_port: ingressPort, egress_port: egressPort } });
   steps.push({
     step: "acquire_ports",
@@ -1775,6 +1799,49 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
   steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
 
+  // ── V5.4：中间跳（若有）──
+  //
+  // 与 rollout 路径**共用同一份实现**（`Orchestrator.dispatchTransit`）：编排可以有两处，
+  // 但"怎么发一条中间跳"只能有一处 —— 否则两条路径会在某次改动后悄悄分叉。
+  //
+  // 正向顺序仍是**先远后近**：出口已发 → 现在发中间跳（目标 = 出口）→ 最后才切入口（目标 = 中间跳）。
+  let transitHost: string | null = null;
+  if (middleNodeId != null && middlePort != null) {
+    const middleNode = (outCandidates as unknown as SchedulableNode[]).find((n) => n.id === middleNodeId)
+      ?? (inCandidates as unknown as SchedulableNode[]).find((n) => n.id === middleNodeId);
+    if (!middleNode) {
+      await orchestrator
+        .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "middle node missing" })
+        .catch(() => {});
+      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, `中间跳节点 ${middleNodeId} 不存在`, {
+        revision,
+      });
+    }
+    const transit = await orchestrator.dispatchTransit({
+      tunnelId,
+      revision,
+      node: {
+        id: middleNode.id,
+        node_id: String(middleNode.node_id ?? middleNode.id),
+        connect_ip: (middleNode.connect_ip as string | null) ?? null,
+        role: (middleNode.role as "both" | "egress" | "ingress" | null) ?? null,
+      },
+      port: middlePort,
+      nextHop: `${egressDispatch.egress_host}:${egressPort}`,
+      protocol: reapplyProtocol,
+    });
+    if (!transit.ok) {
+      await orchestrator
+        .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "transit apply failed" })
+        .catch(() => {});
+      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      return fail("apply_transit", mapDispatchCode("egress", transit), transit.error, { revision });
+    }
+    transitHost = transit.host;
+    steps.push({ step: "apply_transit", ok: true, meta: { middle_node_id: middleNodeId, port: middlePort } });
+  }
+
   /* ---------------- V5-WP2 RuntimePlan 自检（与创建路径同源） ---------------- */
   const plan = buildForwardRuntimePlan("relay", reapplyProtocol, {
     revision,
@@ -1789,7 +1856,11 @@ export async function reapplyRelayTunnel(
         host: t.host,
         port: t.port,
       })),
-      next_hop: `${egressDispatch.egress_host}:${egressPort}`,
+      // 三跳时入口的下一跳是**中间跳**，不是出口 —— 这正是 V5.4 之前这里会错的地方。
+      next_hop:
+        transitHost != null && middlePort != null
+          ? `${transitHost}:${middlePort}`
+          : `${egressDispatch.egress_host}:${egressPort}`,
     },
   });
   const planViolations = forwardRuntimePlanViolations(plan);
