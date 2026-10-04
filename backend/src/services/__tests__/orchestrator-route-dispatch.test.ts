@@ -146,3 +146,22 @@ describe("V5.4: multi-hop admission is wired ON in the rollout path", () => {
     expect(planner).toContain('push("prepare", "prepare_transit"');
   });
 });
+
+/**
+ * V5.4：**从未成功应用过**的转发不得被发布成期望状态。
+ *
+ * 这是一条会造成闭环的规则：失败创建 ⇒ 拆除路径撤掉 runtime ⇒ 快照又把它发布回去 ⇒
+ * Agent 重新应用 ⇒ 端口被永久占住 ⇒ 分配器（查租约）把同一端口发给下一条转发 ⇒ Agent 正确拒绝。
+ * 实测症状是"端口 22001 一直被占用"，根因是这个闭环。
+ *
+ * 反向的一半同样重要：`applied_revision` 有值（更新失败但上一版仍在跑）**必须继续发布**，
+ * 否则一次失败的更新会把正在服务的转发整条撤掉（§3.7）。
+ */
+describe("V5.4: never-applied forwards are not published as desired state", () => {
+  test("the snapshot builder requires an applied revision, and says why", async () => {
+    const src = await Bun.file(new URL("../agent-command-bus.ts", import.meta.url)).text();
+    expect(src).toContain("applied_revision: { not: null }");
+    // 反向契约写在同一处注释里，避免下一个人只改一半。
+    expect(src).toContain("更新失败、上一版本仍运行");
+  });
+});

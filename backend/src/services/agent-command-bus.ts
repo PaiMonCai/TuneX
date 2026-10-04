@@ -1044,6 +1044,18 @@ export async function buildDesiredNodeSnapshot(
   const rows = await db.tunnel.findMany({
     where: {
       desired_status: "active",
+      // ── V5.4：**从未成功应用过**的转发不得出现在期望状态里 ──
+      //
+      // `desired_status=active` 只说明用户**想要**它跑；`applied_revision IS NULL` 说明它
+      // **一次都没有成功跑起来**（首次创建就失败）。把这种行发布成期望状态会造成一个闭环：
+      // 创建失败 ⇒ 拆除路径撤掉已发出的 runtime（round 27/28 的修复）⇒ 但快照又把它发布回去 ⇒
+      // Agent 重新应用 ⇒ 它的端口被永久占住 ⇒ 而分配器查的是租约（已释放）⇒ 把同一端口发给下一条
+      // 转发 ⇒ Agent 正确地拒绝。实测症状就是"端口 22001 一直被占用"。
+      //
+      // 判据刻意保守：**只有"从未应用成功"才不发**。`applied_revision` 有值说明上一版仍在跑
+      // （§3.7 的"更新失败、上一版本仍运行"），那种情况必须继续发布，否则一次失败的更新会把
+      // 正在服务的转发整条撤掉。
+      applied_revision: { not: null },
       OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }],
     },
     include: {
