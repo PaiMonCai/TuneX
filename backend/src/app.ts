@@ -50,6 +50,12 @@ import { ticketsRoutes } from "./routes/tickets.ts";
 import { settingsRoutes } from "./routes/settings.ts";
 import { nodeGroupsRoutes } from "./routes/node-groups.ts";
 import { nodesRoutes } from "./routes/nodes.ts";
+import { routeProfilesRoutes } from "./routes/route-profiles.ts";
+// V5.5 WP14：联邦。两组端点职责不同、安全边界也不同：
+//   · /api/federation/v1/*  面板↔面板机器端点（免用户认证、必须 Ed25519 签名）
+//   · /api/admin/federation  Admin Console 接口（管理员 + federation 资源权限）
+import { federationRoutes } from "./routes/federation.ts";
+import { adminFederationRoutes } from "./routes/admin-federation.ts";
 
 export function createApp() {
   const app = new Hono<{ Variables: AppVariables }>();
@@ -147,10 +153,18 @@ export function createApp() {
   app.route("/api/settings", settingsRoutes);
   app.route("/api/node-groups", nodeGroupsRoutes);
   app.route("/api/nodes", nodesRoutes);
+  // V5-WP13.5B：Route Profile（线路模板）。与 node-groups 同属「网络/基础设施」资源族，
+  // 因此用既有 workspace 域 RBAC（read / manage on "node"），不新增 /api/admin/* 权限 key：
+  // Admin Console 与 User Console 走同一套后端资源与 RBAC，前端只做 UX 分层（§9.4.1）。
+  app.route("/api/route-profiles", routeProfilesRoutes);
+  // V5.5 WP14：联邦 M2M 端点。挂载在 publicRoutes 之前：与 /api/internal/* 同理，
+  // 路径更具体先落位；免认证白名单已整段豁免 /api/federation/*。
+  app.route("/api/federation/v1", federationRoutes);
   app.route("/api", publicRoutes);
   app.route("/api/admin", adminRoutes);
   app.route("/api/admin", nodeGrantRoutes);
   app.route("/api/admin", adminExtendedRoutes);
+  app.route("/api/admin", adminFederationRoutes);
   // WP10：管理端节点角色 / 凭据状态 / 出口池 / 运行态查询。与上面三个同批
   // 挂载，中间件（adminRequired → adminPermissionGuard）已在 §⑥ 统一施加。
   app.route("/api/admin", nodeAdminRoutes);

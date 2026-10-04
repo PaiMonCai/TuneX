@@ -752,6 +752,18 @@ export interface CreateForwardRevisionInput {
   egressPort?: number | null;
   /** egress pool 快照（由调用方在事务外解析好，避免本模块依赖池查询细节）。 */
   egressPoolId?: number | null;
+  /**
+   * V5-WP13.5B：本 revision 的来源 Route Profile（`DEVELOPMENT.md` §9.4.5）。
+   *
+   * **可选**：不传时沿用 tunnel 行上的来源指针（未从模板铺出来的 Forward 为 NULL，
+   * 于是写入的也是 NULL —— 与新增列之前的行为逐字节一致）。
+   *
+   * 语义是「来源」而不是「本次由谁生成」：指针只由 Route Profile 的显式 apply
+   * 更新，因此后续任何一次编辑都继续如实回答「这条 Forward 来自哪个模板 / 哪个
+   * 版本」。具体解析出的跳（含角色）就是本行的 ingress/egress/middle 三列，
+   * 用 `buildRoutePlan` 可还原，不再冗余存一份。
+   */
+  routeProfile?: { id: number; version: number } | null;
 }
 
 export interface CreateForwardRevisionResult {
@@ -913,6 +925,9 @@ export async function createForwardRevision(
         forward_addresses_protocol: true,
         out_node_group_id: true,
         desired_status: true,
+        // V5-WP13.5B：来源模板指针（缺省 = NULL，见 CreateForwardRevisionInput.routeProfile）。
+        route_profile_id: true,
+        route_profile_version: true,
       },
     });
     if (!row) throw new ForwardRevisionError("not_found", "端口转发不存在");
@@ -959,6 +974,10 @@ export async function createForwardRevision(
           egress_port: input.egressPort ?? null,
           targets,
           created_by_id: input.createdById,
+          // V5-WP13.5B：来源模板的**不可变** provenance（§9.4.5）。显式入参优先，
+          // 否则沿用 tunnel 行的指针（未从模板铺出来的 Forward 两列都是 NULL）。
+          route_profile_id: input.routeProfile?.id ?? row.route_profile_id ?? null,
+          route_profile_version: input.routeProfile?.version ?? row.route_profile_version ?? null,
         },
         select: { id: true },
       });

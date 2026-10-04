@@ -697,6 +697,18 @@ model Tunnel {
   middle_node_id Int?
   middle_node    Node? @relation("middle_node", fields: [middle_node_id], references: [id], onDelete: SetNull)
 
+  // ── V5-WP13.5B Route Profile provenance（DEVELOPMENT.md §9.4.2–§9.4.6）──
+  //
+  // 「这条 Forward 当前来自哪个 Route Profile / 哪个版本」。它是**指针**，不是第二份
+  // 运行时真相：真正的执行路径永远读 forward_revision 的不可变快照，本列只回答
+  // 「来源模板是谁」，供 impact analysis 使用（哪些 Forward 会被某次模板发布影响）。
+  //
+  // 为什么**不加外键**：模板在解除引用后可以被删除，而 Forward 的来源事实不能被
+  // `ON DELETE SET NULL` 静默抹掉 —— 与 middle_node_id 的历史取向一致。「正在被引用的
+  // 模板不允许删除」由服务层显式判定（409 profile_in_use），不靠级联静默发生。
+  route_profile_id      Int?
+  route_profile_version Int?
+
   @@index([tunnel_mode])
   @@index([forward_protocol])
   @@index([ingress_node_id])
@@ -769,6 +781,21 @@ model ForwardRevision {
   /// 保存人（审计上下文）。无 FK：用户删除不得改写 runtime 历史。
   created_by_id Int?
   created_at    DateTime @default(now())
+
+  // ── V5-WP13.5B Route Profile provenance（DEVELOPMENT.md §9.4.5）──
+  //
+  // 这一段回答「本次计划来自哪个 Route Profile / version」。它必须落在**不可变
+  // 快照**里，才能满足 §9.4.5 的「applied runtime 不能依赖随后可变的模板内容」：
+  // 模板之后被编辑/禁用/删除，都不改写这条 revision 的解释。
+  //
+  // 为什么**不**再存一份 resolved_hops：具体跳（含角色）就写在本行的
+  // ingress_node_id / egress_node_id / middle_node_id 里，用 `buildRoutePlan`
+  // 可以逐字还原成有序 hop 列表 —— 再存一列是第二份会漂移的真相。
+  // 「这次 apply 解析出了什么」的申请级事实在 `route_profile_application`。
+  /// 来源模板 id（无 FK：历史事实；模板删除不得改写「当时来自谁」）。
+  route_profile_id      Int?
+  /// 来源模板的版本（最近一次由该模板 apply 的版本）。
+  route_profile_version Int?
 
   @@unique([tunnel_id, revision])
   @@index([tunnel_id, created_at])
@@ -1669,4 +1696,396 @@ model NodeStateReport {
   @@index([reported_at])
   @@index([last_error_at])
   @@map("node_state_report")
+}
+
+/* ================================================================== */
+/* V5-WP13.5B —— Route Profile（DEVELOPMENT.md §9.4.2–§9.4.6）          */
+/* 契约：docs/v5-wp13-5b-route-profile-contract.md（FROZEN）            */
+/* ================================================================== */
+
+/// Route Profile = 可复用、可版本化的**线路模板/意图**。
+///
+/// 它**拥有**：模板意图（ingress selector / ordered transit[] / egress selector）、
+/// ingress·egress policy、health/placement constraints、required capabilities、
+/// name/description/visibility/enabled、version 账本、ASSIGNED 授权归属。
+///
+/// 它**不拥有**：Agent runtime、NodePortLease / placement lease、Forward lifecycle、
+/// applied revision、traffic counter、独立 reconcile、独立 restart/stop 状态机 ——
+/// 因此本表刻意没有 status / applied_* / traffic_* 列，也没有任何状态机字段。
+/// 「apply」只能通过既有 `patchForward` → `createForwardRevision` → `registerRollout`
+/// 产生效果（不新建下发通道）。
+///
+/// `version` 1 起单调递增。模板内容变更**只能**通过发布新版本（写
+/// `route_profile_version` 的不可变行），本行上的模板列只是**当前版本的投影**
+/// ——与 `tunnel` ↔ `forward_revision` 的投影关系同一模式，不是第二份真相。
+///
+/// 为什么 `workspace_id` / `user_id` **不加关系**：本文件是多人共享的 schema，
+/// 只做最小 diff（不新增 Workspace/User 的反向关系）；且 Route Profile 的删除是
+/// 服务层的显式事务（含 profile_in_use 守卫），不依赖数据库级联。
+model RouteProfile {
+  id           Int     @id @default(autoincrement())
+  workspace_id Int
+  /// 创建者（审计归属，与 node_group 口径一致）。
+  user_id      Int
+  name         String  @db.VarChar(120)
+  description  String? @db.VarChar(500)
+  /// INTERNAL | ASSIGNED | PUBLIC。**字符串列 + 应用层校验**：§3.4 禁止用 DB enum
+  /// 承载会频繁扩展的集合；未知值一律 fail-closed（不默认降级）。
+  visibility   String  @default("INTERNAL") @db.VarChar(20)
+  /// 关闭后不再可用于新的 apply、不再对消费者可见；**已应用的 Forward 不受影响**。
+  enabled      Boolean @default(true)
+  /// 当前已发布版本号（1 起）。0 = 尚未发布任何版本的残缺行（正常路径不会出现）。
+  version      Int     @default(0)
+
+  /// ── 当前版本内容的投影（唯一权威是 route_profile_version.body）──
+  /// `{kind:"fixed_node",node_id}` | `{kind:"node_group",node_group_id,strategy}`
+  ingress_selector   Json?
+  /// **有序**数组，第一版元素只允许 `{kind:"fixed_node",node_id}`（dynamic middle
+  /// pool 关闭，见 §9.4.4 第 4 条）。
+  transit_selectors  Json?
+  /// `null` = DIRECT（出口就是 ingress 那一跳）。
+  egress_selector    Json?
+  ingress_policy     Json?
+  egress_policy      Json?
+  /// health / placement 约束（白名单键；未知键 fail-closed）。
+  constraints        Json?
+  /// required capabilities（字符串数组；解析出的每个节点都必须满足）。
+  required_capabilities Json?
+
+  published_at DateTime?
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+
+  @@unique([workspace_id, name])
+  @@index([workspace_id, enabled])
+  @@index([visibility, enabled])
+  @@map("route_profile")
+}
+
+/// 某一个版本的**不可变**模板内容。
+///
+/// 存在的理由与 `forward_revision` 同源：编辑共享模板绝不能静默改写正在运行的
+/// Forward。运行时解释链是「ForwardRevision → route_profile_version → 模板内容」，
+/// 而模板行随时会变；只有这张表能回答「rev 12 当时用的是哪个版本的什么内容」。
+///
+/// 与 `forward_revision` 一样，`body` 写入后没有任何代码路径 update 它。
+model RouteProfileVersion {
+  id               Int          @id @default(autoincrement())
+  route_profile_id Int
+  /// 1 起单调递增；(route_profile_id, version) 唯一 —— 并发发布由它兜底。
+  version          Int
+  /// 该版本完整模板内容：
+  /// `{ ingress, transit[], egress, ingress_policy, egress_policy,
+  ///    constraints, required_capabilities }`
+  body             Json
+  /// 人读的变更摘要（解释链的第二来源，不参与判定）。
+  change_summary   String?      @db.VarChar(500)
+  /// 发布人（审计上下文）。无 FK：用户删除不得改写历史。
+  created_by_id    Int?
+  created_at       DateTime     @default(now())
+
+  @@unique([route_profile_id, version])
+  @@index([route_profile_id, created_at])
+  @@map("route_profile_version")
+}
+
+/// ASSIGNED 可见性的授权行：把模板显式授权给某个 Workspace 或 Plan。
+///
+/// `target_type` 用字符串列（workspace | plan，可扩展），不做 DB enum（§3.4）。
+/// `target_id` **不加 FK**：授权对象的删除不得静默改写「曾经授权过谁」的事实，
+/// 悬空引用由读取方按「无效授权 ⇒ 不可见」处理（fail-closed）。
+///
+/// 本版只做**可见性/可选性判定与只读接口**；套餐/计费的 entitlement 落库不在本 WP。
+model RouteProfileAssignment {
+  id               Int     @id @default(autoincrement())
+  route_profile_id Int
+  /// workspace | plan（应用层白名单校验）。
+  target_type      String  @db.VarChar(20)
+  target_id        Int
+  active           Boolean @default(true)
+  created_at       DateTime @default(now())
+
+  // 复合唯一索引**显式命名**：MySQL 的标识符上限是 64 字符，Prisma 默认名
+  // （route_profile_assignment_route_profile_id_target_type_target_id_key）是 67，
+  // 空库 migrate deploy 会以 MySQL 1059 直接失败。
+  @@unique([route_profile_id, target_type, target_id], map: "route_profile_assignment_target_key")
+  @@index([target_type, target_id, active])
+  @@map("route_profile_assignment")
+}
+
+/// `apply` 账本：一条 ForwardRevision 来自哪个 Route Profile / 版本，解析到了哪些具体节点。
+///
+/// **不是第二套真相，也不驱动任何状态机**：它只是申请记录 + 排障解释链
+/// （「这次为什么发到这些节点」）。真正的执行路径仍读 `forward_revision` 的
+/// `resolved_hops` / ingress / egress / middle 列；rollout 进度仍读 `forward_rollout`。
+///
+/// 保留 apply 历史（不随模板删除而消失）正是这张表的价值：模板被删掉之后，
+/// 「当时是谁申请把哪个版本铺到这条 Forward 上」仍然可查。
+model RouteProfileApplication {
+  id                    Int      @id @default(autoincrement())
+  route_profile_id      Int
+  route_profile_version Int
+  tunnel_id             Int
+  /// 本次 apply 生成的 Forward revision（与 forward_revision.revision 同值）。
+  forward_revision      Int
+  /// 编译器解析出的具体跳（[{hop_index, role, node_id}]），与 revision 快照同一份事实。
+  resolved_hops         Json
+  /// 发起人（审计上下文）。
+  applied_by_id         Int?
+  created_at            DateTime @default(now())
+
+  @@index([tunnel_id, created_at])
+  // 显式命名：默认名 route_profile_application_route_profile_id_route_profile_version_idx
+  // 是 68 字符，超过 MySQL 的 64 字符标识符上限（P3018 / MySQL 1059）。
+  @@index([route_profile_id, route_profile_version], map: "route_profile_application_profile_version_idx")
+  @@map("route_profile_application")
+}
+
+/* ================================================================== */
+/* V5.5 Federation（WP14 / WP15 / WP16）                               */
+/*                                                                     */
+/* 契约：docs/v5-wp14-16-federation-contract.md                        */
+/*                                                                     */
+/* 三条与别处一致的设计取向：                                          */
+/*   1. 会扩展的集合（status / state）用**字符串列 + 应用层校验**，不用  */
+/*      DB enum —— §3.4：enum 加值会让旧二进制读到未知值时失败。        */
+/*   2. 跨面板引用本机资源（tunnel / node / workspace）**不加外键**：    */
+/*      删掉一条 Forward 不得抹掉「当时联邦把哪条链路租给了谁」的历史，  */
+/*      校验悬空引用是读取方的职责（与 forward_revision / node_port_    */
+/*      lease 的既有先例同一取向）。                                    */
+/*   3. 私钥只以密文落地；公钥不是秘密。                                */
+/* ================================================================== */
+
+/// 本 Panel 的联邦身份。单行表（`panel_id` 唯一且不变）。
+model FederationSetting {
+  id              Int      @id @default(autoincrement())
+  /// 本机 panel_id（UUID）。卸载重装才会变。
+  panel_id        String   @unique @db.VarChar(64)
+  /// 当前签名密钥的 key_id（= sha256(public_key) 前 16 hex）。
+  key_id          String   @db.VarChar(64)
+  /// Ed25519 私钥 JWK 的密文（AES-256-GCM，密钥由 AUTH_SECRET 经 HKDF 派生）。
+  private_key_enc String   @db.Text
+  /// 公钥 JWK（明文，用于对外公布与本地校验）。
+  public_key      Json
+  /// 联邦功能总开关。默认关闭：未显式开启前所有联邦端点为 `federation_disabled`。
+  enabled         Boolean  @default(false)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  @@map("federation_setting")
+}
+
+/// 远端 Panel（peer）。本机对它的信任状态是**本机事实**，不因远端声明而改变。
+model FederationPeer {
+  id            Int       @id @default(autoincrement())
+  peer_panel_id String    @unique @db.VarChar(64)
+  display_name  String    @db.VarChar(120)
+  /// 出站调用地址（scheme://host:port，不含路径）。
+  endpoint_url  String    @db.VarChar(255)
+  /// 当前可验签的公钥集合：`[{key_id, jwk, state: active|retiring|retired, not_after}]`。
+  public_keys   Json
+  /// pending | trusted | suspended | revoked
+  status        String    @db.VarChar(32) @default("pending")
+  /// 信任范围（允许的 hop role / 能力），应用层校验；null = 未授予任何范围。
+  trust_scope   Json?
+  /// 入站请求的远端自述信息（仅诊断用，不作为授权依据）。
+  last_seen_at  DateTime?
+  revoked_at    DateTime?
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  credentials FederationCredential[]
+  grants      FederationGrant[]
+
+  @@index([status])
+  @@map("federation_peer")
+}
+
+/// 信任引导 / 密钥对接的一次性凭据（沿用 node_enrollment 的模式：
+/// 明文只出现一次，库里只有 sha256；过期 + 一次性消费 + 可撤销）。
+model FederationCredential {
+  id         Int            @id @default(autoincrement())
+  peer_id    Int
+  peer       FederationPeer @relation(fields: [peer_id], references: [id], onDelete: Cascade)
+  /// 一次性 token 的 sha256（明文不落库、不回显、不进审计 metadata）。
+  token_hash String         @unique @db.Char(64)
+  /// bootstrap | rotate
+  purpose    String         @db.VarChar(32) @default("bootstrap")
+  expires_at DateTime
+  used_at    DateTime?
+  revoked_at DateTime?
+  created_at DateTime       @default(now())
+
+  @@index([peer_id, expires_at])
+  @@map("federation_credential")
+}
+
+/// 跨面板消息回执：replay 防护（唯一键去重）+ 幂等（重投递返回首次响应快照）。
+model FederationMessageReceipt {
+  id            Int      @id @default(autoincrement())
+  /// `<direction>:<peer_panel_id>:<message_id>`
+  message_key   String   @unique @db.VarChar(191)
+  peer_panel_id String   @db.VarChar(64)
+  /// inbound | outbound
+  direction     String   @db.VarChar(16)
+  /// 归一化路径（数字段 → :id），便于两侧审计互查。
+  path          String   @db.VarChar(191)
+  status        Int
+  /// 首次响应快照；重复投递原样返回，不再执行第二次。
+  response_body Json?
+  created_at    DateTime @default(now())
+
+  @@index([created_at])
+  @@index([peer_panel_id, created_at])
+  @@map("federation_message_receipt")
+}
+
+/// 授予：host 侧权威。grant 只说明「愿意提供多少容量」，
+/// **不等于授权**（§1.6）—— 每次 intent 仍要过 host 自己的 RBAC / scope / quota。
+model FederationGrant {
+  id             Int            @id @default(autoincrement())
+  peer_id        Int
+  peer           FederationPeer @relation(fields: [peer_id], references: [id], onDelete: Cascade)
+  /// 对外引用的 UUID（内部主键不外泄）。
+  grant_ref      String         @unique @db.VarChar(64)
+  /// 允许被哪个本地 Workspace 消费（null = 该 peer 的全部已授权 workspace）。
+  workspace_id   Int?
+  /// 单调递增；容量/范围/过期任一实质变更都 +1，绝不回退。
+  grant_epoch    Int            @default(1)
+  /// active | suspended | revoked | expired
+  status         String         @db.VarChar(32) @default("active")
+  /// `{node_group_ids, hop_roles, allow_target_policy}`；应用层校验，未知键 fail-closed。
+  scope          Json
+  /// `{max_legs, max_bandwidth_mbps, max_connections}`；null 键 = 该维度不限（仍受本地 quota）。
+  capacity       Json
+  /// true = 签发即从本地 quota 预留，撤销/过期归还。
+  quota_reserved Boolean        @default(false)
+  expires_at     DateTime
+  revoked_at     DateTime?
+  created_by_id  Int?
+  created_at     DateTime       @default(now())
+  updated_at     DateTime       @updatedAt
+
+  leases FederationLease[]
+
+  @@index([peer_id, status])
+  @@index([expires_at])
+  @@map("federation_grant")
+}
+
+/// 远端租约（host 侧权威）：某个 peer 在**本机某个节点**上占用的一段运行时。
+/// host 是这张表与相关端口租约的唯一写者；home 侧只持镜像。
+model FederationLease {
+  id                 Int             @id @default(autoincrement())
+  lease_ref          String          @unique @db.VarChar(64)
+  grant_id           Int
+  grant              FederationGrant @relation(fields: [grant_id], references: [id], onDelete: Cascade)
+  peer_panel_id      String          @db.VarChar(64)
+  /// 远端 Forward 的不透明引用（home 侧自己解释；host 不建本地 Forward 行）。
+  forward_ref        String          @db.VarChar(191)
+  /// home 侧发起意图的 id（幂等键之一）。
+  intent_id          String          @db.VarChar(64)
+  /// reserved | active | releasing | released | expired | revoked | failed
+  state              String          @db.VarChar(32) @default("reserved")
+  /// 单调递增、绝不复用：撤销/过期后重新占用必须是新 epoch（fencing 依据）。
+  lease_epoch        Int             @default(1)
+  /// ingress | egress | transit
+  hop_role           String          @db.VarChar(16)
+  /// 本机节点 id（无 FK：删除节点不得改写租约历史）。
+  node_id            Int?
+  listen_port        Int?
+  requested_revision Int             @default(0)
+  applied_revision   Int?
+  last_error_code    String?         @db.VarChar(64)
+  last_error         String?         @db.Text
+  expires_at         DateTime
+  applied_at         DateTime?
+  released_at        DateTime?
+  created_at         DateTime        @default(now())
+  updated_at         DateTime        @updatedAt
+
+  intents FederationIntent[]
+
+  @@index([peer_panel_id, state])
+  @@index([expires_at])
+  @@index([node_id])
+  @@index([grant_id, state])
+  @@map("federation_lease")
+}
+
+/// 跨面板动作台账（host 侧）：(intent_id, revision, action) 幂等。
+model FederationIntent {
+  id            Int              @id @default(autoincrement())
+  intent_id     String           @db.VarChar(64)
+  peer_panel_id String           @db.VarChar(64)
+  lease_id      Int?
+  lease         FederationLease? @relation(fields: [lease_id], references: [id], onDelete: SetNull)
+  revision      Int
+  /// create | apply | release | renew
+  action        String           @db.VarChar(32)
+  /// ok | failed
+  status        String           @db.VarChar(32)
+  error_code    String?          @db.VarChar(64)
+  created_at    DateTime         @default(now())
+
+  @@unique([intent_id, revision, action])
+  @@index([peer_panel_id, created_at])
+  @@map("federation_intent")
+}
+
+/// 远端 placement 的本地镜像（home 侧）。**只是账本证据**：
+/// reconcile 的权威期望仍是 Forward desired（§1.4），本表不参与期望状态计算。
+model FederationPlacement {
+  id               Int       @id @default(autoincrement())
+  peer_panel_id    String    @db.VarChar(64)
+  forward_ref      String    @db.VarChar(191)
+  /// 本机 Forward/Tunnel id（无 FK：删 Forward 不得抹掉联邦历史）。
+  tunnel_id        Int?
+  intent_id        String    @db.VarChar(64)
+  lease_ref        String?   @db.VarChar(64)
+  lease_epoch      Int       @default(0)
+  /// ingress | egress | transit
+  hop_role         String    @db.VarChar(16)
+  desired_revision Int       @default(0)
+  applied_revision Int?
+  /// pending | active | degraded | expired | revoked | failed
+  state            String    @db.VarChar(32) @default("pending")
+  /// 不透明远端引用：仅供显示与诊断，**不得**据此建本地 node 行。
+  peer_node_ref    String?   @db.VarChar(64)
+  peer_port        Int?
+  last_error_code  String?   @db.VarChar(64)
+  last_error       String?   @db.Text
+  expires_at       DateTime?
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+
+  @@unique([peer_panel_id, intent_id])
+  @@index([tunnel_id])
+  @@index([state])
+  @@map("federation_placement")
+}
+
+/// 用量事实（home 侧收到的上报）。按 `usage_id` 去重；
+/// 缺失窗口**不补 0**（「不知道」不是「零流量」）。
+model FederationUsageRecord {
+  id            Int      @id @default(autoincrement())
+  usage_id      String   @unique @db.VarChar(96)
+  peer_panel_id String   @db.VarChar(64)
+  lease_ref     String   @db.VarChar(64)
+  forward_ref   String?  @db.VarChar(191)
+  /// 归因到的本机 Forward（无 FK，理由同 FederationPlacement）。
+  tunnel_id     Int?
+  window_start  DateTime
+  window_end    DateTime
+  bytes_in      BigInt   @default(0)
+  bytes_out     BigInt   @default(0)
+  connections   Int      @default(0)
+  /// attributed | unattributed（无法归因的用量进 unattributed 桶并告警，不静默丢弃）。
+  attribution   String   @db.VarChar(32) @default("unattributed")
+  received_at   DateTime @default(now())
+
+  @@index([lease_ref, window_start])
+  @@index([tunnel_id, window_start])
+  @@index([peer_panel_id, window_start])
+  @@map("federation_usage_record")
 }
