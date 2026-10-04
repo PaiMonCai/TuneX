@@ -81,7 +81,13 @@ jobs:
       # blocker, not a report — a red G0 is the gate doing its job.
       - name: Run V5-G0 contract compatibility gate
         run: python3 scripts/v3-e2e/v5-g0.py
-      - name: Upload v3/v4 integration evidence
+      # V5.4 / G4 is the relevant merge gate for the middle-hop work on this
+      # branch. Keep it in the same real four-Agent topology so restart,
+      # compensation, orphan-port cleanup and three-hop data flow are verified
+      # before main ever sees the code.
+      - name: Run V5-G4 multi-hop closure gate
+        run: python3 scripts/v3-e2e/v5-g4.py
+      - name: Upload v3/v4/v5 integration evidence
         if: failure() || github.event_name == 'workflow_run'
         uses: actions/upload-artifact@v7
         with:
