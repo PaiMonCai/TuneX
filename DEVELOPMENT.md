@@ -1824,6 +1824,46 @@ synthesis 仍不能改 desired。
 - LB 自己改 Forward desired；
 - 用 Agent 本地状态覆盖 Panel desired。
 
+### V5-WP7 冻结机制（WP7-C0，2026-10-04）
+
+§7.3 只列了"允许/禁止"，没说机制；机制不冻结，实现者只能各写一套。以下为冻结结论：
+
+**状态模型只有一个**：健康状态来自 WP6 的合成（面板侧），Agent **不得**自己再定义一套
+"什么叫健康"。Agent 侧允许存在的是**机制**，不是第二套状态模型。
+
+**熔断器状态机（Agent 侧机制，三态）**
+
+~~~text
+closed     正常参与选择
+open       被跳过；持续 BREAKER_COOLDOWN 后进入 half_open
+half_open  放行**一条**连接：成功 → closed；失败 → 回到 open 且退避翻倍（上限 BREAKER_MAX_COOLDOWN）
+~~~
+
+- **进入 `open` 的条件是面板说 `unhealthy`**，不是本地的单次失败 —— "单次超时永不判死"
+  在两侧都成立；
+- `degraded` / `recovering` / `unknown` **不打开熔断器**，只影响加权；
+- **全部目标都 open 时**仍然要选一个（选"最不坏"的那个）并记录这个事实：
+  "一个都不选"等于把可用性判死，比"选了最差的"更糟；
+- 熔断器只影响**选择顺序**，永不改写 desired 列表，永不删除目标。
+
+**加权选择（健康感知）**：同一策略内的优先级为
+`healthy > recovering > degraded > unknown > unhealthy`，同级内按既有策略（weight / order）
+与观测事实（`least-latency` 用观测延迟；`least-load` 用 Agent 自己的在途计数）决定。
+`unknown` 排在 `degraded` 之后、`unhealthy` 之前 —— 没有证据不等于好，但也不等于已证实故障。
+
+**线形状（加法）**：出口下发载荷里新增一个与 `targets` **平行**的数组，而不是往
+`targets[i]` 里塞字段：
+
+~~~json
+"targets":      [ { "host": "...", "port": 443, "weight": 1, "order_by": 10 } ],
+"target_health":[ { "host": "...", "port": 443, "state": "healthy",
+                    "latency_ms": 12, "age_ms": 4000, "evidence": true } ]
+~~~
+
+理由：desired 与 health 是两类事实，塞进同一个元素里，下一次改动就说不清哪个字段属于
+哪一类；平行数组让"desired 一个字节没变"这件事在结构上可见。旧 Agent 忽略未知字段，
+因此是纯加法。
+
 ### Gate V5-G2
 
 至少：
