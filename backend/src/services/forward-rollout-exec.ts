@@ -1279,12 +1279,19 @@ export async function compensateRollout(
   // 尝试切过去的那个**拓扑，而 tunnel 行可能已被后续编辑改写。
   const removeRevision = row.revision + 1;
   const planned = planSnapshot(row.steps, "desired");
+  const plannedMiddle = (planned as { middle_node_id?: number | null }).middle_node_id ?? null;
   const removals: Array<{ direction: "direct" | "egress" | "ingress"; nodeId: number }> = [
     { direction: "egress", nodeId: planned.egress_node_id ?? 0 },
     {
       direction: planned.mode === "direct" ? "direct" : "ingress",
       nodeId: planned.ingress_node_id,
     },
+    // V5.4：中间跳也是"新 runtime"，也必须撤。它的形态与出口跳相同（监听 + 拨号到下一跳），
+    // 因此方向同样是 `egress` —— runtime id 按节点分命名空间，中间跳与真出口不会互相覆盖。
+    //
+    // 漏掉它会留下一条**孤儿中转链路**：照旧监听端口、照旧接受连接，把流量转给一个已经被
+    // 拆掉的下一跳。这类残留不报错，只静默占着端口与许可 —— 也正是 G4 明确要验的一项。
+    { direction: "egress", nodeId: plannedMiddle ?? 0 },
   ];
   for (const { direction, nodeId } of removals) {
     if (!nodeId) continue;
@@ -2207,6 +2214,10 @@ export async function registerRollout(
       revision: input.revision,
     },
     await loadBoundPairs(db),
+    // V5.4：多跳的**计划 + 执行 + 补偿 + 准入**四件都齐了才打开这一位。
+    // 它存在的原因是：`admitRoute` 必须能区分"这个形状不合法"与"这个形状还没实现" ——
+    // 在实现齐备之前放行，等于让用户配了中间跳之后跑一条**别的路**且毫无提示。
+    { multiHopImplemented: true },
   );
   if (!routeAdmission.ok) {
     return {

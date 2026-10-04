@@ -130,3 +130,19 @@ describe("V5.4: a three-hop route is dispatched far-to-near with existing primit
     expect(transport.calls).toEqual(["egress:4"]);
   });
 });
+
+/**
+ * V5.4：多跳准入的**生产接线**。这一位不在库里、不在配置里，只在调用点 —— 也就是说
+ * 它最容易被"改回 false 而没人发现"或被漏掉。用一个源码断言钉住它。
+ */
+describe("V5.4: multi-hop admission is wired ON in the rollout path", () => {
+  test("registerRollout passes multiHopImplemented: true, and says why it may do so", async () => {
+    const src = await Bun.file(new URL("../forward-rollout-exec.ts", import.meta.url)).text();
+    expect(src).toContain("multiHopImplemented: true");
+    // 前置条件也一起钉住：中间跳的计划步骤与执行分支都必须在，否则"打开准入"就是放行一条
+    // 没人会走的路 —— 那正是这个项目反复吃亏的"路径存在但没接线"的镜像。
+    expect(src).toContain('case "prepare_transit"');
+    const planner = await Bun.file(new URL("../forward-rollout.ts", import.meta.url)).text();
+    expect(planner).toContain('push("prepare", "prepare_transit"');
+  });
+});
