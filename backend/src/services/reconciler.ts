@@ -110,6 +110,14 @@ export interface DesiredTunnel {
   egress_node_id?: number | null;
   in_node_group_id?: number | null;
   /**
+   * V5.3（round 6/7）—— reconcile 必须能比较**内容**，不只是"存在性与 revision"：
+   *   · `desired_pool_targets` = 池里 active 目标的 `host:port`（升序）；
+   *   · `desired_target_health` = 面板此刻的合成结论（`host:port=state`，升序）。
+   * `undefined` = 本次没有加载这些事实，此时**不**判内容漂移（"没加载" ≠ "为空"）。
+   */
+  desired_pool_targets?: string[] | null;
+  desired_target_health?: string[] | null;
+  /**
    * 协议事实（V5-WP0/WP4）。**必须**随行一起投影：resend 路径要据此判定这份事实
    * 是否可运行；缺列会被 fail-closed 拒绝（`admitPersistedProtocol` 不再把
    * 「投影忘了选列」当成 V4 的「省略协议」）。
@@ -128,6 +136,10 @@ export interface AgentTunnelState {
   ingress_port?: number | null;
   egress_port?: number | null;
   revision?: number | null;
+  /** 该节点上报的**已应用**池目标（`host:port`，升序）。 */
+  applied_pool_targets?: string[] | null;
+  /** 该节点上报的**已应用**健康数组（`host:port=state`，升序）。 */
+  applied_target_health?: string[] | null;
 }
 
 /** 节点在线性事实。 */
@@ -166,7 +178,14 @@ export type DriftKind =
   /** 节点处于 maintenance：本轮不下发，只等待（§13.4.2）。 */
   | "node_in_maintenance"
   /** 上次 apply 以 error 收尾。 */
-  | "error_state";
+  | "error_state"
+  /**
+   * 已应用的**内容**与 desired 不一致（池目标集合、健康数组）。
+   *
+   * 存在性与 revision 都对、内容却过期 —— 症状是"池变空"、"熔断看着没生效"，
+   * 而 reconcile 认为一切正常（`resent: 0`）。
+   */
+  | "content_drift";
 
 /** 一条偏差（判定结果，无副作用）。 */
 export interface Drift {
@@ -301,6 +320,33 @@ export function isNodeInMaintenance(node: NodeOnlineInput | null | undefined): b
  * 不在此处产出动作：`computeDrift` 回答「差在哪」，`planTunnelActions` 回答
  * 「允许怎么修」。混在一起会让「同一偏差只能有一种修法」的约束散落各处。
  */
+/**
+ * agent 上报的池目标（`host:port`，升序）—— "已应用内容"的一半。
+ *
+ * V5.3 round 6 实测：agent 的池可以变空，而隧道仍在列表里，于是存在性判定认为一切正常、
+ * `resent: 0`，转发却什么都转发不出去（连得上、没数据）。
+ */
+function appliedPoolTargets(report: NodeReport | undefined, tunnelId: number): string[] | null {
+  if (!report) return null;
+  const pools = (report as unknown as { egress_pools?: Record<string, { targets?: unknown }> }).egress_pools;
+  if (!pools || typeof pools !== "object") return null;
+  const pool = pools[`tunex-${tunnelId}-egress`];
+  if (!pool || !Array.isArray(pool.targets)) return null;
+  return pool.targets.filter((x): x is string => typeof x === "string").slice().sort();
+}
+
+/** agent 应用的健康数组（`host:port=state`，升序）；没带就返回 null（= 不判漂移）。 */
+function appliedTargetHealth(egress: AgentTunnelState | null): string[] | null {
+  const raw = (egress as unknown as {
+    target_health?: Array<{ host?: unknown; port?: unknown; state?: unknown }>;
+  })?.target_health;
+  if (!Array.isArray(raw)) return null;
+  return raw
+    .filter((h) => typeof h?.host === "string" && typeof h?.port === "number" && typeof h?.state === "string")
+    .map((h) => `${h.host}:${h.port}=${h.state}`)
+    .sort();
+}
+
 export function computeDrift(
   tunnel: DesiredTunnel,
   agent: AgentTunnelState | null,
@@ -329,6 +375,38 @@ export function computeDrift(
       detail: `desired=${tunnel.desired_status ?? "未声明"} 但 agent 仍在运行隧道 ${tunnel.id}`,
     });
   }
+  // ── 内容漂移（V5.3 round 6/7）──
+  //
+  // 存在性与 revision 都对，但**内容**过期。只在两侧都有事实时判定：任一侧为 undefined
+  // 表示本次没有加载，"没加载"绝不能被读成"内容为空"，否则每一拍都会重发一次。
+  if (wantsActive(tunnel) && agent !== null && !unreachable) {
+    const desiredTargets = tunnel.desired_pool_targets;
+    const appliedTargets = agent.applied_pool_targets;
+    if (Array.isArray(desiredTargets) && Array.isArray(appliedTargets)) {
+      const want = [...desiredTargets].sort().join(",");
+      const have = [...appliedTargets].sort().join(",");
+      if (want !== have) {
+        out.push({
+          kind: "content_drift",
+          detail:
+            `池目标不一致：desired=[${want || "空"}] applied=[${have || "空"}]` +
+            (appliedTargets.length === 0 && desiredTargets.length > 0
+              ? "（agent 池为空：转发会连上但转发不出数据）"
+              : ""),
+        });
+      }
+    }
+    const desiredHealth = tunnel.desired_target_health;
+    const appliedHealth = agent.applied_target_health;
+    if (Array.isArray(desiredHealth) && Array.isArray(appliedHealth) &&
+        [...desiredHealth].sort().join(",") !== [...appliedHealth].sort().join(",")) {
+      out.push({
+        kind: "content_drift",
+        detail: `健康数组不一致：desired=[${[...desiredHealth].sort().join(",")}] applied=[${[...appliedHealth].sort().join(",")}]`,
+      });
+    }
+  }
+
   if (wantsActive(tunnel) && agent !== null && isRevisionBehind(tunnel)) {
     out.push({
       kind: "revision_behind",
@@ -456,6 +534,16 @@ export function planTunnelActions(
       revision,
       tunnel_id: tunnel.id,
       node_id: tunnel.egress_node_id ?? null,
+    });
+  } else if (kinds.has("content_drift") && wantsActive(tunnel)) {
+    // 同 revision 重发：池目标与健康数组不是 revision 的一部分，它们来自面板的实时读。
+    // 这正是"存在性对了、内容过期"应有的修法 —— 不需要新机制，也不需要 bump revision。
+    actions.push({
+      kind: "resend_same_revision",
+      detail: `内容漂移，同 revision ${revision} 重发以带上当前内容`,
+      revision,
+      tunnel_id: tunnel.id,
+      node_id: tunnel.egress_node_id ?? tunnel.ingress_node_id ?? null,
     });
   } else if (kinds.has("revision_behind") && wantsActive(tunnel)) {
     const backoff = opts.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
@@ -655,9 +743,22 @@ export function defaultReconcileDeps(): ReconcileDeps {
           ingress_node_id: true,
           egress_node_id: true,
           in_node_group_id: true,
+          // V5.3（round 7）：内容漂移判定需要**期望内容**。只取 active 目标：
+          // 停用的目标不参与转发，不该因为它们触发重发。
+          egress_pool: { select: { targets: { select: { host: true, port: true, status: true } } } },
         },
       });
-      return rows as unknown as DesiredTunnel[];
+      const withContent = (rows as unknown as Array<{
+        egress_pool?: { targets?: Array<{ host: string; port: number; status: string }> } | null;
+        [key: string]: unknown;
+      }>).map((row) => {
+        const targets = (row.egress_pool?.targets ?? [])
+          .filter((t) => t.status === "active")
+          .map((t) => `${t.host}:${t.port}`);
+        const { egress_pool: _dropped, ...rest } = row;
+        return { ...rest, desired_pool_targets: targets } as unknown as DesiredTunnel;
+      });
+      return withContent;
     },
     async nodes() {
       const { db } = await import("../db.ts");
@@ -971,6 +1072,9 @@ function pickAgentTunnel(
   return {
     id: String(t.id),
     mode,
+    // V5.3（round 7）：把 agent **已应用**的内容带出来供内容漂移判定使用。
+    applied_pool_targets: appliedPoolTargets(egressReport, t.id),
+    applied_target_health: appliedTargetHealth(egress),
     ingress_port: ingress.ingress_port ?? null,
     egress_port: egress.egress_port ?? null,
     revision: Math.min(
