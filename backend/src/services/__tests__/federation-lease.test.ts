@@ -40,7 +40,10 @@ import { PORT_RELEASE_PENDING_CODE, nextLeaseEpoch, type FederationAuditSink } f
 import { resetOrchestrator, setOrchestrator } from "../relay-wiring.ts";
 import type { Orchestrator } from "../orchestrator.ts";
 import {
+  MAX_PLACEMENT_PROBES_PER_TICK,
   mapRemoteLeaseStateToPlacement,
+  parseRemoteLeaseFact,
+  planPlacementSync as planSync,
   planPlacementSync,
   reconcilePlacements,
   recordPlacementResult,
@@ -1537,8 +1540,10 @@ function makePlacementDb(seed: { placements?: Row[]; peers?: Row[] } = {}) {
       async findFirst(args: any) {
         return this.findUnique(args);
       },
-      async findMany() {
-        return placements.map((p) => ({ ...p }));
+      async findMany(args: any) {
+        const wanted: string[] | undefined = args?.where?.state?.in;
+        const rows = placements.filter((p) => wanted === undefined || wanted.includes(p.state)).map((p) => ({ ...p }));
+        return typeof args?.take === "number" ? rows.slice(0, args.take) : rows;
       },
       async create(args: any) {
         calls.create.push(args.data);
@@ -1575,14 +1580,16 @@ describe("WP15 placement: the home mirror resends by (intent_id, revision) or de
       placementRow({ intent_id: "i-never", applied_revision: null, desired_revision: 3 }),
       placementRow({ intent_id: "i-revoked", state: "revoked" }),
     ];
-    const online = planPlacementSync(rows, { peerReachable: true });
-    expect(online.converged.map((r) => r.intent_id)).toEqual(["i-converged"]);
+    const online = planPlacementSync(rows, { peerReachable: true, now: NOW });
+    // task-10 起：已收敛**不再直接 continue**，而是进探活桶（这正是原先的缺口）。
+    expect(online.probes.map((r) => r.intent_id)).toEqual(["i-converged"]);
     expect(online.resends.map((r) => r.intent_id).sort()).toEqual(["i-behind", "i-never"]);
     expect(online.skipped.map((r) => r.intent_id)).toEqual(["i-revoked"]);
     expect(online.degraded).toEqual([]);
+    expect(online.expired).toEqual([]);
 
     // peer 不可达：**一条都不重发**，全部降级（不回落本地节点）。
-    const offline = planPlacementSync(rows, { peerReachable: false });
+    const offline = planPlacementSync(rows, { peerReachable: false, now: NOW });
     expect(offline.resends).toEqual([]);
     // §5 矩阵：host 不可达 → placement 一律 degraded(unreachable)；已"收敛"的行也不例外，
     // 因为"远端确认过"与"现在够得着"是两件事。
@@ -1682,6 +1689,160 @@ describe("WP15 placement: the home mirror resends by (intent_id, revision) or de
     // 绝不回落本地：隧道引用与状态事实都没被改写成本地节点。
     expect(offline.placements.every((p) => p.peer_panel_id === "panel-b")).toBe(true);
     expect(offline.placements.every((p) => p.applied_revision === 6)).toBe(true);
+  });
+});
+
+/* ================================================================== */
+/* task-10：本地到期 + 已收敛行探活                                       */
+/* ================================================================== */
+
+function convergedRow(over: Partial<FederationPlacementRow> = {}): FederationPlacementRow {
+  return placementRow({
+    state: "active",
+    applied_revision: 7,
+    desired_revision: 7,
+    lease_ref: "lease-1",
+    expires_at: new Date(NOW.getTime() + 600_000),
+    ...over,
+  });
+}
+
+describe("WP16 placement (task-10): local expiry terminates without asking the peer", () => {
+  test("an expired mirror becomes expired locally and issues NO remote call at all", async () => {
+    const { db, placements, peers } = makePlacementDb({
+      placements: [placementRow({ state: "active", expires_at: new Date(NOW.getTime() - 1000) })],
+    });
+    const sends: Row[] = [];
+    const sender = async (i: Row) => {
+      sends.push(i);
+      return { ok: true as const, status: 200, body: {}, messageId: "m" };
+    };
+    const plan = planSync(placements as unknown as FederationPlacementRow[], { peerReachable: true, now: NOW });
+    expect(plan.expired).toHaveLength(1);
+    expect(plan.probes).toHaveLength(0);
+    expect(plan.resends).toHaveLength(0);
+
+    const result = await reconcilePlacements({ now: NOW, deps: { db, sender } });
+    expect(result.expired).toBe(1);
+    expect(result.probed).toBe(0);
+    expect(sends).toHaveLength(0); // 到期不需要网络
+    expect(peers).toHaveLength(1); // 夹具自检（peer 行存在，因此不是因为"没有 peer"而跳过）
+    expect(placements[0].state).toBe("expired");
+    expect(placements[0].last_error_code).toBe("lease_expired");
+
+    // 终态吸收：下一拍不再是候选，也不会被探活。
+    const again = await reconcilePlacements({ now: NOW, deps: { db, sender } });
+    expect(again.evaluated).toBe(0);
+    expect(sends).toHaveLength(0);
+  });
+
+  test("a peer-less mirror still expires locally (the host is gone but the clock is ours)", async () => {
+    const { db, placements } = makePlacementDb({
+      placements: [placementRow({ state: "degraded", expires_at: new Date(NOW.getTime() - 1) })],
+      peers: [],
+    });
+    const result = await reconcilePlacements({ now: NOW, deps: { db, sender: async () => ({ ok: true as const, status: 200, body: {}, messageId: "m" }) } });
+    expect(result.expired).toBe(1);
+    expect(result.degraded).toBe(0);
+    expect(placements[0].state).toBe("expired");
+  });
+});
+
+describe("WP16 placement (task-10): converged rows are probed and can degrade and recover", () => {
+  test("probe failure → degraded with an explainable code; a later good probe → back to active", async () => {
+    const { db, placements } = makePlacementDb({ placements: [convergedRow()] });
+    const sends: Row[] = [];
+    const sender = async (i: Row) => {
+      sends.push(i);
+      if (sends.length === 1) {
+        return { ok: false as const, code: "peer_unreachable" as const, status: 0, message: "connection refused", retryable: true, messageId: "m1" };
+      }
+      return { ok: true as const, status: 200, body: { lease_ref: "lease-1", state: "active", applied_revision: 7 }, messageId: "m2" };
+    };
+
+    const first = await reconcilePlacements({ now: NOW, deps: { db, sender } });
+    expect(first.probed).toBe(1);
+    expect(first.degraded).toBe(1);
+    expect(placements[0].state).toBe("degraded");
+    expect(placements[0].last_error_code).toBe("peer_unreachable");
+
+    const second = await reconcilePlacements({ now: NOW, deps: { db, sender } });
+    expect(second.recovered).toBe(1);
+    expect(placements[0].state).toBe("active");
+    expect(placements[0].last_error_code).toBeNull();
+    expect(sends[0].method).toBe("GET");
+    expect(sends[0].path).toBe("/api/federation/v1/leases/lease-1");
+  });
+
+  test("one unreachable peer is not probed row by row in the same tick", async () => {
+    const { db, placements } = makePlacementDb({
+      placements: [
+        convergedRow({ id: 1, intent_id: "i-1" }),
+        convergedRow({ id: 2, intent_id: "i-2" }),
+        convergedRow({ id: 3, intent_id: "i-3" }),
+      ],
+    });
+    const sends: Row[] = [];
+    const sender = async (i: Row) => {
+      sends.push(i);
+      return { ok: false as const, code: "peer_unreachable" as const, status: 0, message: "down", retryable: true, messageId: "m" };
+    };
+    const result = await reconcilePlacements({ now: NOW, deps: { db, sender } });
+    expect(sends).toHaveLength(1); // 只探一次
+    expect(result.degraded).toBe(3);
+    expect(placements.every((p) => p.state === "degraded")).toBe(true);
+  });
+
+  test("a remote revoked lease mirrors to revoked (not degraded), using the shared mapping", async () => {
+    const { db, placements } = makePlacementDb({ placements: [convergedRow()] });
+    const result = await reconcilePlacements({
+      now: NOW,
+      deps: { db, sender: async () => ({ ok: true as const, status: 200, body: { lease_ref: "lease-1", state: "revoked", applied_revision: 7 }, messageId: "m" }) },
+    });
+    expect(result.probed).toBe(1);
+    expect(result.revoked).toBe(1);
+    expect(result.degraded).toBe(0);
+    expect(placements[0].state).toBe("revoked");
+  });
+
+  test("a 404 lease_not_found mirrors to expired instead of a vague failure", async () => {
+    const { db, placements } = makePlacementDb({ placements: [convergedRow()] });
+    const result = await reconcilePlacements({
+      now: NOW,
+      deps: {
+        db,
+        sender: async () => ({ ok: false as const, code: "lease_not_found" as const, status: 404, message: "gone", retryable: false, messageId: "m" }),
+      },
+    });
+    expect(result.expired).toBe(1);
+    expect(placements[0].state).toBe("expired");
+  });
+
+  test("the probe budget bounds one tick, and the rest are deferred instead of degraded", async () => {
+    const rows = Array.from({ length: MAX_PLACEMENT_PROBES_PER_TICK + 3 }, (_, i) => convergedRow({ id: i + 1, intent_id: `i-${i + 1}` }));
+    const { db, placements } = makePlacementDb({ placements: rows });
+    const sends: Row[] = [];
+    const sender = async (i: Row) => {
+      sends.push(i);
+      return { ok: true as const, status: 200, body: { state: "active", applied_revision: 7 }, messageId: "m" };
+    };
+    const result = await reconcilePlacements({ now: NOW, deps: { db, sender } });
+    expect(sends).toHaveLength(MAX_PLACEMENT_PROBES_PER_TICK);
+    expect(result.probed).toBe(MAX_PLACEMENT_PROBES_PER_TICK);
+    expect(result.deferred).toBe(3);
+    // 没被探到的行保持原状：既没被降级，也没被写成别的状态（"没轮到"不等于"坏了"）。
+    expect(placements.length).toBe(MAX_PLACEMENT_PROBES_PER_TICK + 3);
+    expect(placements.filter((p) => p.last_error_code !== null)).toHaveLength(0);
+  });
+
+  test("the probe response parser refuses to guess when the payload has no state", async () => {
+    expect(parseRemoteLeaseFact({ applied_revision: 3 })).toBeNull();
+    expect(parseRemoteLeaseFact("nope")).toBeNull();
+    const flat = parseRemoteLeaseFact({ state: "active", applied_revision: 3, lease_epoch: 2, expires_at: "2026-10-05T06:00:00Z" });
+    expect(flat?.state).toBe("active");
+    expect(flat?.applied_revision).toBe(3);
+    const nested = parseRemoteLeaseFact({ lease: { state: "expired" } });
+    expect(nested?.state).toBe("expired");
   });
 });
 

@@ -30,6 +30,16 @@ export type PlacementState = (typeof PLACEMENT_STATES)[number];
 
 export const PLACEMENT_TERMINAL_STATES: readonly PlacementState[] = ["expired", "revoked"];
 
+/**
+ * 每拍**探活上限**。
+ *
+ * 探活是对 peer 的一次真实 `GET /leases/:ref`：它必须"有界"，否则一台挂掉的 host + 上千条
+ * 远端腿会让 worker 那一拍卡在超时里（每条几秒 × N）。20 条的取值理由：worker 节拍是 30s，
+ * 单条探活超时 8s（callPeer 默认），即使 20 条全部串行超时也仍在两拍之内；
+ * 超过上限的行**按原状态留到下一拍**（不降级、不假装成功），并计进 `deferred` 让日志看得见。
+ */
+export const MAX_PLACEMENT_PROBES_PER_TICK = 20;
+
 export function isTerminalPlacementState(state: string): boolean {
   return (PLACEMENT_TERMINAL_STATES as readonly string[]).includes(state);
 }
@@ -87,9 +97,13 @@ export interface FederationPlacementRow {
 }
 
 export interface PlacementSyncPlan {
+  /** 本地可判定到期（`expires_at <= now`）的行：不需要网络就能收口成 `expired`。 */
+  expired: FederationPlacementRow[];
+  /** 已收敛（`applied_revision >= desired_revision`）且需要探活确认的行。 */
+  probes: FederationPlacementRow[];
   /** 需要按 (intent_id, desired_revision) 重发的行。 */
   resends: FederationPlacementRow[];
-  /** 远端已确认到 desired_revision 的行。 */
+  /** 已收敛、但这一拍**没轮到探活**（预算用尽）的行：保持原状，下一拍再说。 */
   converged: FederationPlacementRow[];
   /** peer 不可达 → 只能标 degraded，**不重发、不回落本地**。 */
   degraded: FederationPlacementRow[];
@@ -100,30 +114,102 @@ export interface PlacementSyncPlan {
 /**
  * 纯函数：给定镜像行与 peer 可达性，算出这一拍该做什么。
  *
- * `peerReachable = false` 时**一条都不重发**：往一个已经不可达的 peer 上打请求只会
- * 制造超时与噪声，而且掩盖真实状态（"重试中"与"已知不可达"是两件事）。
+ * 分类顺序（**有意的**，每一步都在缩小"我们真的知道什么"）：
+ *   1. 终态 → 跳过（历史事实不可重写）；
+ *   2. `expires_at <= now` → `expired`：到期是**两侧都知道的事实**，不需要问对端，
+ *      也不需要网络。放它在最前面，是为了让"host 挂了"这种最坏情况下本地照样能收口；
+ *   3. peer 不可达 → `degraded`（不重发、不猜，也不回落本地）；
+ *   4. 已收敛（`applied_revision >= desired_revision`）→ **探活**（有界）；
+ *      这一条正是此前的缺口：以前"已收敛"就 `continue`，于是 host 停机后 active 的行永远
+ *      不会变 degraded、远端已 expired 的行也不会被镜像；
+ *   5. 其余 → 走既有重发路径。
  */
 export function planPlacementSync(
   placements: readonly FederationPlacementRow[],
-  opts: { peerReachable: boolean },
+  opts: { peerReachable: boolean; now: Date; probeBudget?: number },
 ): PlacementSyncPlan {
-  const plan: PlacementSyncPlan = { resends: [], converged: [], degraded: [], skipped: [] };
+  const plan: PlacementSyncPlan = { expired: [], probes: [], resends: [], converged: [], degraded: [], skipped: [] };
+  let budget = Math.max(0, opts.probeBudget ?? MAX_PLACEMENT_PROBES_PER_TICK);
+
   for (const row of placements) {
     if (isTerminalPlacementState(row.state)) {
       plan.skipped.push(row);
+      continue;
+    }
+    const expiresAt = row.expires_at === null ? null : new Date(row.expires_at).getTime();
+    if (expiresAt !== null && Number.isFinite(expiresAt) && expiresAt <= opts.now.getTime()) {
+      plan.expired.push(row);
       continue;
     }
     if (!opts.peerReachable) {
       plan.degraded.push(row);
       continue;
     }
-    if (row.applied_revision !== null && row.applied_revision >= row.desired_revision) {
+    const converged = row.applied_revision !== null && row.applied_revision >= row.desired_revision;
+    if (converged && budget > 0) {
+      // 没有 lease_ref 就无从探活（例如只预留过、从未拿到引用）：退回重发路径，
+      // 重发本身会带回 lease_ref，比"跳过它"更接近收敛。
+      if (row.lease_ref !== null && row.lease_ref !== "") {
+        plan.probes.push(row);
+        budget--;
+        continue;
+      }
+      plan.resends.push(row);
+      continue;
+    }
+    if (converged) {
       plan.converged.push(row);
       continue;
     }
     plan.resends.push(row);
   }
+
   return plan;
+}
+
+/* ================================================================== */
+/* 探活：远端租约事实的读取（GET /leases/:ref）                            */
+/* ================================================================== */
+
+/** host 侧租约的探活投影（`GET /leases/:ref` 的响应形状）。 */
+export interface RemoteLeaseFact {
+  state: string;
+  applied_revision: number | null;
+  lease_epoch: number | null;
+  expires_at: Date | null;
+}
+
+/** 从探活响应里读事实。读不出 `state` 返回 null —— 由调用方标 degraded，绝不猜。 */
+export function parseRemoteLeaseFact(body: unknown): RemoteLeaseFact | null {
+  if (typeof body !== "object" || body === null) return null;
+  const raw = body as Record<string, unknown>;
+  // 兼容 `{lease:{...}}` 包装（路由今天返回扁平结构，包装是给未来留的读取口）。
+  const obj = (typeof raw.lease === "object" && raw.lease !== null ? (raw.lease as Record<string, unknown>) : raw);
+  if (typeof obj.state !== "string" || obj.state.length === 0) return null;
+  const applied = obj.applied_revision;
+  const epoch = obj.lease_epoch;
+  const expires = obj.expires_at;
+  return {
+    state: obj.state,
+    applied_revision: typeof applied === "number" && Number.isInteger(applied) ? applied : null,
+    lease_epoch: typeof epoch === "number" && Number.isInteger(epoch) ? epoch : null,
+    expires_at:
+      typeof expires === "string" && !Number.isNaN(new Date(expires).getTime())
+        ? new Date(expires)
+        : expires instanceof Date
+          ? expires
+          : null,
+  };
+}
+
+/**
+ * 探活失败的错误码 → 镜像终态（能定终态的就不该停在 degraded）。
+ * 其余码（网络类、5xx）由调用方标 `degraded`，保持"可解释的降级"而不是猜终态。
+ */
+export function terminalPlacementForProbeError(code: string): PlacementState | null {
+  if (code === "lease_not_found" || code === "lease_expired") return "expired";
+  if (code === "lease_revoked" || code === "peer_revoked") return "revoked";
+  return null;
 }
 
 /* ================================================================== */
@@ -206,6 +292,13 @@ export interface UpsertPlacementInput {
   tunnel_id?: number | null;
   lease_ref?: string | null;
   lease_epoch?: number | null;
+  /**
+   * 远端**已经确认**的 revision。写镜像时显式给出（例如重连对账前先从 `GET /leases/:ref`
+   * 读回事实，或从一次成功回复里带回来）；不给则保持原值。
+   * 注意这里不做单调保护——单调保护在 {@link recordPlacementResult} 里（那是"收到远端回答"的路径）；
+   * 这里是"我明确知道这个事实"的路径。
+   */
+  applied_revision?: number | null;
   peer_node_ref?: string | null;
   peer_port?: number | null;
   expires_at?: Date | null;
@@ -242,6 +335,7 @@ export async function upsertPlacement(
     ...(input.tunnel_id === undefined ? {} : { tunnel_id: input.tunnel_id }),
     ...(input.lease_ref === undefined ? {} : { lease_ref: input.lease_ref }),
     ...(input.lease_epoch === undefined || input.lease_epoch === null ? {} : { lease_epoch: input.lease_epoch }),
+    ...(input.applied_revision === undefined ? {} : { applied_revision: input.applied_revision }),
     ...(input.peer_node_ref === undefined ? {} : { peer_node_ref: input.peer_node_ref }),
     ...(input.peer_port === undefined ? {} : { peer_port: input.peer_port }),
     ...(input.expires_at === undefined ? {} : { expires_at: input.expires_at }),
@@ -347,29 +441,154 @@ export async function recordPlacementResult(
 
 export interface PlacementReconcileResult {
   evaluated: number;
+  /** 本地判定到期、直接收口成 `expired` 的条数（**不发任何请求**）。 */
+  expired: number;
+  /** 实际发出的探活次数（受 `MAX_PLACEMENT_PROBES_PER_TICK` 约束）。 */
+  probed: number;
+  /** 探活/重发后发现远端已收敛、且本行从非 active 回到 `active` 的条数（恢复）。 */
+  recovered: number;
   /** 重发并拿到远端确认的条数。 */
   resent: number;
-  /** 已确认到 desired_revision 的条数。 */
+  /** 已确认到 desired_revision（探活确认）的条数。 */
   converged: number;
-  /** peer 不可达 → degraded(unreachable) 的条数（**没有**本地回落）。 */
+  /** 降级为 `degraded` 的条数（不可达/无法解释的远端回答）。 */
   degraded: number;
+  /** 远端已撤销、镜像成 `revoked` 的条数。 */
+  revoked: number;
   /** 重发失败（远端明确拒绝或错误）的条数。 */
   failed: number;
   /** 终态，跳过。 */
   skipped: number;
+  /** 因为探活预算用尽而留到下一拍的行数（**保持原状**，不降级）。 */
+  deferred: number;
+}
+
+/** 探活/重发共用的发送封装：只描述"发了什么"，不解释结果。 */
+function resendPlacement(
+  d: ResolvedPlacementDeps,
+  peer: FederationPeerRef,
+  row: FederationPlacementRow,
+  deps: PlacementDeps | undefined,
+): Promise<IntentSendOutcome> {
+  void d;
+  void deps;
+  return Promise.resolve(
+    (d.sender as FederationIntentSender)({
+      peer,
+      method: "POST",
+      // 重连后重发的是**同一次申请**：同 intent、同 revision（幂等键两端一致）。
+      path: "/api/federation/v1/leases",
+      // 形状对齐 host 的 handler：`{ grant_ref?, intent: {...} }`。
+      // **不传 grant_ref**：placement 行里没有这一列（重连后 home 也不该"记得"额度），
+      // host 侧的解析顺序②（同 (peer,intent_id) 已有非终态 lease 的 grant）会把它找回来。
+      body: {
+        intent: {
+          intent_id: row.intent_id,
+          revision: row.desired_revision,
+          hop_role: row.hop_role,
+          forward_ref: row.forward_ref,
+          requested: row.peer_node_ref === null ? {} : { node_ref: row.peer_node_ref },
+        },
+      },
+      retries: 1,
+    }),
+  );
+}
+
+/** 从 host 的预留/探活响应里读出可回填的远端事实（缺字段就保持原值，不猜）。 */
+function remoteFactsFromBody(body: unknown): {
+  lease_ref: string | null;
+  lease_epoch: number | null;
+  applied_revision: number | null;
+  peer_node_ref: string | null;
+  peer_port: number | null;
+  expires_at: Date | null;
+} {
+  const empty = {
+    lease_ref: null,
+    lease_epoch: null,
+    applied_revision: null,
+    peer_node_ref: null,
+    peer_port: null,
+    expires_at: null,
+  };
+  if (typeof body !== "object" || body === null) return empty;
+  const raw = body as Record<string, unknown>;
+  const obj = (typeof raw.lease === "object" && raw.lease !== null ? (raw.lease as Record<string, unknown>) : raw);
+  const num = (v: unknown) => (typeof v === "number" && Number.isInteger(v) ? v : null);
+  const str = (v: unknown) => (typeof v === "string" && v.length > 0 ? v : null);
+  const expiresRaw = raw.expires_at ?? obj.expires_at;
+  const expires =
+    typeof expiresRaw === "string" && !Number.isNaN(new Date(expiresRaw).getTime()) ? new Date(expiresRaw) : null;
+  return {
+    lease_ref: str(raw.lease_ref) ?? str(obj.lease_ref),
+    lease_epoch: num(raw.lease_epoch) ?? num(obj.lease_epoch),
+    applied_revision: num(raw.applied_revision) ?? num(obj.applied_revision),
+    peer_node_ref: typeof raw.node_ref === "string" ? raw.node_ref : typeof obj.node_ref === "string" ? obj.node_ref : null,
+    peer_port: num(raw.port) ?? num(obj.port) ?? (typeof raw.port === "number" ? raw.port : null),
+    expires_at: expires,
+  };
+}
+
+/** 本地到期收口：**终态吸收**，不发任何请求（到期是两侧都知道的事实）。 */
+async function markPlacementExpired(
+  d: ResolvedPlacementDeps,
+  row: FederationPlacementRow,
+  now: Date,
+): Promise<void> {
+  await d.db.federationPlacement.updateMany({
+    where: { id: row.id },
+    data: {
+      state: "expired",
+      last_error_code: "lease_expired",
+      last_error: `placement expired locally at ${now.toISOString()} (lease expires_at passed)`,
+    },
+  });
+}
+
+/** 降级：只改这一行，**绝不**碰任何本地 tunnel/runtime（不回落本地节点）。 */
+async function markPlacementDegraded(
+  d: ResolvedPlacementDeps,
+  row: FederationPlacementRow,
+  code: string,
+  message: string | null,
+): Promise<void> {
+  await d.db.federationPlacement.updateMany({
+    where: { id: row.id },
+    data: { state: "degraded", last_error_code: code, last_error: message },
+  });
 }
 
 /**
- * 重连对账：把 `desired_revision` 尚未被远端确认的 placement 按 `(intent_id, revision)` 重发。
+ * 重连对账 + **探活**。每拍做三件事，顺序固定：
  *
- * 每拍只做**幂等**的重发：host 侧按 `(intent_id, revision)` 去重（`federation_intent` 唯一键），
- * 所以重复投递返回首次结果而不是再建一条腿 —— 这正是两条幂等机制互相咬合的地方。
+ *   1. **本地到期**：`expires_at <= now` → `expired`（不发请求；host 挂了也要能收口）；
+ *   2. **探活**已收敛但有 lease_ref 的行（`GET /leases/:ref`，有界）：远端已终态 → 镜像；
+ *      远端仍 live 且未落后 → 保持/回到 `active`（恢复）；远端落后 → 走重发；
+ *      不可达/5xx/读不懂 → `degraded` + 可解释码，且同一 peer 本拍不再逐行重试；
+ *   3. **重发**未确认的 intent（既有路径，`(intent_id, revision)` 幂等）。
+ *
+ * 每一步只改 `federation_placement` 这一行；**任何分支都不去动本地节点或本地 runtime** ——
+ * "网络不可达就改用本地节点"是被契约 §7 明确禁止的隐式重放置。
  */
 export async function reconcilePlacements(
   options: { now?: Date; limit?: number; peer_panel_id?: string | null; deps?: PlacementDeps } = {},
 ): Promise<PlacementReconcileResult> {
   const d = resolvePlacementDeps(options.deps);
-  const result: PlacementReconcileResult = { evaluated: 0, resent: 0, converged: 0, degraded: 0, failed: 0, skipped: 0 };
+  const now = options.now ?? d.now();
+  const result: PlacementReconcileResult = {
+    evaluated: 0,
+    expired: 0,
+    probed: 0,
+    recovered: 0,
+    resent: 0,
+    converged: 0,
+    degraded: 0,
+    revoked: 0,
+    failed: 0,
+    skipped: 0,
+    deferred: 0,
+  };
 
   const rows = (await d.db.federationPlacement.findMany({
     where: {
@@ -382,97 +601,214 @@ export async function reconcilePlacements(
   if (rows.length === 0) return result;
 
   const peerIds = [...new Set(rows.map((r) => r.peer_panel_id))];
-  const peers: FederationPeerRef[] = [];
+  const peers = new Map<string, FederationPeerRef>();
   for (const id of peerIds) {
     const peer = (await d.db.federationPeer.findUnique({
       where: { peer_panel_id: id },
       select: { peer_panel_id: true, endpoint_url: true, status: true },
     })) as (FederationPeerRef & { status?: string }) | null;
     if (peer && peer.status !== "revoked" && typeof peer.endpoint_url === "string" && peer.endpoint_url.length > 0) {
-      peers.push({ peer_panel_id: peer.peer_panel_id, endpoint_url: peer.endpoint_url });
+      peers.set(peer.peer_panel_id, { peer_panel_id: peer.peer_panel_id, endpoint_url: peer.endpoint_url });
     }
   }
 
-  for (const peer of peers) {
-    const mine = rows.filter((r) => r.peer_panel_id === peer.peer_panel_id);
-    let reachable = true;
-    for (const row of mine) {
-      if (isTerminalPlacementState(row.state)) {
-        result.skipped++;
-        continue;
-      }
-      if (row.applied_revision !== null && row.applied_revision >= row.desired_revision) {
-        result.converged++;
-        continue;
-      }
-      if (!reachable) {
-        // 已知这个 peer 不可达：剩下的行不再逐个打请求，但**每一行都要留下可解释的事实**，
-        // 否则"降级"只存在于这一拍的返回值里，库里看不到原因。
-        result.degraded++;
-        await recordPlacementResult(
-          { peer_panel_id: peer.peer_panel_id, intent_id: row.intent_id, ok: false, code: "peer_unreachable", message: "peer is unreachable in this tick" },
-          options.deps,
-        );
-        continue;
-      }
+  let probeBudget = MAX_PLACEMENT_PROBES_PER_TICK;
 
-      const sent = await d.sender({
+  for (const [peerId, peer] of peers) {
+    const mine = rows.filter((r) => r.peer_panel_id === peerId);
+    let reachable = true;
+    const plan = planPlacementSync(mine, { peerReachable: true, now, probeBudget });
+    probeBudget -= plan.probes.length;
+
+    // 1) 本地到期：不发请求
+    for (const row of plan.expired) {
+      await markPlacementExpired(d, row, now);
+      result.expired++;
+    }
+
+    // 2) 探活
+    for (const row of plan.probes) {
+      if (!reachable) {
+        await markPlacementDegraded(d, row, "peer_unreachable", "peer already judged unreachable in this tick");
+        result.degraded++;
+        continue;
+      }
+      result.probed++;
+      const leaseRef = row.lease_ref ?? "";
+      const probe = await d.sender({
         peer,
-        method: "POST",
-        // 重连后重发的是**同一次申请**：同 intent、同 revision（幂等键两端一致）。
-        path: "/api/federation/v1/leases",
-        // 形状对齐 host 的 handler：`{ grant_ref?, intent: {...} }`。
-        // **不传 grant_ref**：placement 行里没有这一列（重连后 home 也不该"记得"额度），
-        // host 侧的解析顺序②（同 (peer,intent_id) 已有非终态 lease 的 grant）会把它找回来。
-        body: {
-          intent: {
-            intent_id: row.intent_id,
-            revision: row.desired_revision,
-            hop_role: row.hop_role,
-            forward_ref: row.forward_ref,
-            requested: row.peer_node_ref === null ? {} : { node_ref: row.peer_node_ref },
-          },
-        },
-        retries: 1,
+        method: "GET",
+        path: `/api/federation/v1/leases/${encodeURIComponent(leaseRef)}`,
+        retries: 0,
       });
 
+      if (!probe.ok) {
+        if (probe.code === "peer_unreachable") reachable = false;
+        const terminal = terminalPlacementForProbeError(probe.code);
+        if (terminal !== null) {
+          await recordPlacementResult(
+            { peer_panel_id: peerId, intent_id: row.intent_id, ok: true, remote_state: terminal === "expired" ? "expired" : "revoked" },
+            options.deps,
+          );
+          if (terminal === "expired") result.expired++;
+          else result.revoked++;
+          continue;
+        }
+        if (probe.status >= 500 || probe.code === "internal_error") {
+          await markPlacementDegraded(d, row, probe.code, probe.message);
+          result.degraded++;
+          continue;
+        }
+        await markPlacementDegraded(d, row, probe.code, probe.message);
+        result.degraded++;
+        continue;
+      }
+
+      const fact = parseRemoteLeaseFact(probe.body);
+      if (fact === null) {
+        await markPlacementDegraded(d, row, "internal_error", "probe response is unreadable (no lease state)");
+        result.degraded++;
+        continue;
+      }
+      const mapped = mapRemoteLeaseStateToPlacement(fact.state);
+      if (mapped === null) {
+        await markPlacementDegraded(d, row, "internal_error", `unknown remote lease state "${fact.state}"`);
+        result.degraded++;
+        continue;
+      }
+      if (mapped.state === "expired" || mapped.state === "revoked") {
+        await recordPlacementResult(
+          {
+            peer_panel_id: peerId,
+            intent_id: row.intent_id,
+            ok: true,
+            remote_state: fact.state,
+            lease_epoch: fact.lease_epoch,
+            expires_at: fact.expires_at,
+          },
+          options.deps,
+        );
+        if (mapped.state === "expired") result.expired++;
+        else result.revoked++;
+        continue;
+      }
+      if (fact.applied_revision !== null && fact.applied_revision >= row.desired_revision) {
+        await recordPlacementResult(
+          {
+            peer_panel_id: peerId,
+            intent_id: row.intent_id,
+            ok: true,
+            remote_state: fact.state,
+            applied_revision: fact.applied_revision,
+            lease_epoch: fact.lease_epoch,
+            expires_at: fact.expires_at,
+          },
+          options.deps,
+        );
+        result.converged++;
+        if (row.state !== "active") result.recovered++;
+        continue;
+      }
+
+      // 远端还落后 → 走既有重发路径（不新写一条链路）。
+      const sent = await resendPlacement(d, peer, row, options.deps);
       if (sent.ok) {
         result.resent++;
+        const facts = remoteFactsFromBody(sent.body);
         await recordPlacementResult(
-          { peer_panel_id: peer.peer_panel_id, intent_id: row.intent_id, ok: true, applied_revision: row.applied_revision },
+          {
+            peer_panel_id: peerId,
+            intent_id: row.intent_id,
+            ok: true,
+            applied_revision: facts.applied_revision ?? row.applied_revision,
+            lease_ref: facts.lease_ref,
+            lease_epoch: facts.lease_epoch,
+            peer_node_ref: facts.peer_node_ref,
+            peer_port: facts.peer_port,
+            expires_at: facts.expires_at,
+          },
           options.deps,
         );
         continue;
       }
-
       if (sent.code === "peer_unreachable") {
-        // 一个 peer 不可达 → 它剩下的行这一拍不再逐个重试（省掉一串必然的超时）。
         reachable = false;
         result.degraded++;
+        await markPlacementDegraded(d, row, sent.code, sent.message);
+        continue;
+      }
+      result.failed++;
+      await recordPlacementResult(
+        { peer_panel_id: peerId, intent_id: row.intent_id, ok: false, code: sent.code, message: sent.message },
+        options.deps,
+      );
+    }
+
+    // 3) 重发未确认的 intent
+    for (const row of plan.resends) {
+      if (!reachable) {
+        await markPlacementDegraded(d, row, "peer_unreachable", "peer is unreachable in this tick");
+        result.degraded++;
+        continue;
+      }
+      const sent = await resendPlacement(d, peer, row, options.deps);
+      if (sent.ok) {
+        result.resent++;
+        const facts = remoteFactsFromBody(sent.body);
         await recordPlacementResult(
-          { peer_panel_id: peer.peer_panel_id, intent_id: row.intent_id, ok: false, code: sent.code, message: sent.message },
+          {
+            peer_panel_id: peerId,
+            intent_id: row.intent_id,
+            ok: true,
+            applied_revision: facts.applied_revision ?? row.applied_revision,
+            lease_ref: facts.lease_ref,
+            lease_epoch: facts.lease_epoch,
+            peer_node_ref: facts.peer_node_ref,
+            peer_port: facts.peer_port,
+            expires_at: facts.expires_at,
+          },
           options.deps,
         );
         continue;
       }
-
+      if (sent.code === "peer_unreachable") {
+        reachable = false;
+        result.degraded++;
+        await markPlacementDegraded(d, row, sent.code, sent.message);
+        continue;
+      }
       result.failed++;
       await recordPlacementResult(
-        { peer_panel_id: peer.peer_panel_id, intent_id: row.intent_id, ok: false, code: sent.code, message: sent.message },
+        { peer_panel_id: peerId, intent_id: row.intent_id, ok: false, code: sent.code, message: sent.message },
         options.deps,
       );
     }
+
+    // 4) 预算用尽而没探到的行：保持原状，下一拍再说（**不**降级 —— 我们并不知道它坏了）。
+    for (const row of plan.degraded) {
+      await markPlacementDegraded(d, row, "peer_unreachable", "peer is not usable in this tick");
+      result.degraded++;
+    }
+    result.converged += plan.converged.length;
+    result.deferred += plan.converged.length;
+    result.skipped += plan.skipped.length;
   }
 
-  // 没有 peer 行（被删/被撤销）的镜像行：标 degraded，同样不回落本地。
+  // 没有 peer 行（被删/被撤销）的镜像行：先按本地到期收口，其余标 degraded，同样不回落本地。
   for (const row of rows) {
-    if (!peers.some((p) => p.peer_panel_id === row.peer_panel_id)) {
-      result.degraded++;
-      await recordPlacementResult(
-        { peer_panel_id: row.peer_panel_id, intent_id: row.intent_id, ok: false, code: "peer_unreachable", message: "peer is not usable (missing or revoked)" },
-        options.deps,
-      );
+    if (peers.has(row.peer_panel_id)) continue;
+    const expiresAt = row.expires_at === null ? null : new Date(row.expires_at).getTime();
+    if (!isTerminalPlacementState(row.state) && expiresAt !== null && Number.isFinite(expiresAt) && expiresAt <= now.getTime()) {
+      await markPlacementExpired(d, row, now);
+      result.expired++;
+      continue;
     }
+    if (isTerminalPlacementState(row.state)) {
+      result.skipped++;
+      continue;
+    }
+    await markPlacementDegraded(d, row, "peer_unreachable", "peer is not usable (missing or revoked)");
+    result.degraded++;
   }
 
   return result;

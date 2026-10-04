@@ -211,7 +211,9 @@ maybe("WP14 federation: 签名请求可用；重复投递返回首次快照而�
   const secondBody = await second.res.json();
   assert.deepEqual(secondBody, firstBody, "重复投递返回的是快照，不是重新执行的第二次结果");
 
-  const receipts = await db.federationMessageReceipt.count();
+  // 只数**本 peer** 的回执：node --test 会并行跑多个文件、共用同一个库，
+  // 数全局行数就变成了"依赖别人运气"的断言（这个错误已经被真实地抓到过一次）。
+  const receipts = await db.federationMessageReceipt.count({ where: { peer_panel_id: peer.panelId } });
   assert.equal(receipts, 1, "同一条消息只应留下一条回执");
 });
 

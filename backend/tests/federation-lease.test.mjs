@@ -599,6 +599,104 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     await db.federationPlacement.deleteMany({ where: { peer_panel_id: panelId } });
   });
 
+  test("task-10: a placement past its expires_at terminates locally without any remote call", async () => {
+    const { upsertPlacement, reconcilePlacements } = await import("../src/services/federation/placement.ts");
+    const intentId = `intent-exp-${uuid().slice(0, 8)}`;
+
+    const written = await upsertPlacement(
+      {
+        peer_panel_id: panelId,
+        forward_ref: `fwd-${nonce}`,
+        intent_id: intentId,
+        hop_role: "egress",
+        desired_revision: 1,
+        applied_revision: 1,
+        state: "active",
+        lease_ref: `lease-exp-${nonce}`,
+        expires_at: new Date(Date.now() - 1_000),
+      },
+      { db },
+    );
+    assert.equal(written.ok, true);
+
+    const sends = [];
+    const sender = async (input) => {
+      sends.push(input);
+      return { ok: true, status: 200, body: {}, messageId: "probe-0" };
+    };
+    const result = await reconcilePlacements({ deps: { db, sender } });
+
+    assert.equal(result.expired >= 1, true, JSON.stringify(result));
+    assert.equal(sends.length, 0, "expiry is local knowledge: the peer must not be asked");
+    const row = await db.federationPlacement.findUnique({
+      where: { peer_panel_id_intent_id: { peer_panel_id: panelId, intent_id: intentId } },
+    });
+    assert.equal(row.state, "expired");
+    assert.equal(row.last_error_code, "lease_expired");
+
+    // 终态吸收：下一拍不再是候选。
+    const again = await reconcilePlacements({ deps: { db, sender } });
+    assert.equal(again.expired, 0);
+    assert.equal(sends.length, 0);
+  });
+
+  test("task-10: an active mirror goes degraded when the peer cannot be probed, and recovers later", async () => {
+    const { upsertPlacement, reconcilePlacements } = await import("../src/services/federation/placement.ts");
+    const intentId = `intent-live-${uuid().slice(0, 8)}`;
+
+    const written = await upsertPlacement(
+      {
+        peer_panel_id: panelId,
+        forward_ref: `fwd-${nonce}`,
+        intent_id: intentId,
+        hop_role: "egress",
+        desired_revision: 1,
+        applied_revision: 1,
+        state: "active",
+        lease_ref: `lease-live-${nonce}`,
+        expires_at: new Date(Date.now() + 3_600_000),
+      },
+      { db },
+    );
+    assert.equal(written.ok, true);
+
+    // 1) 探活不可达（host 停机）→ degraded，且码可解释。
+    const down = [];
+    const downSender = async (input) => {
+      down.push(input);
+      return { ok: false, code: "peer_unreachable", status: 0, message: "connection refused", retryable: true, messageId: "probe-down" };
+    };
+    const degradedResult = await reconcilePlacements({ deps: { db, sender: downSender } });
+    assert.equal(down.length, 1, "the converged row must actually be probed");
+    assert.equal(down[0].method, "GET");
+    assert.equal(down[0].path, `/api/federation/v1/leases/lease-live-${nonce}`);
+    assert.equal(degradedResult.probed, 1);
+    assert.equal(degradedResult.degraded >= 1, true, JSON.stringify(degradedResult));
+
+    const degradedRow = await db.federationPlacement.findUnique({
+      where: { peer_panel_id_intent_id: { peer_panel_id: panelId, intent_id: intentId } },
+    });
+    assert.equal(degradedRow.state, "degraded");
+    assert.equal(degradedRow.last_error_code, "peer_unreachable");
+
+    // 2) host 恢复：探活成功且远端已收敛 → 回到 active（"恢复后收敛"）。
+    const upSender = async () => ({
+      ok: true,
+      status: 200,
+      body: { lease_ref: `lease-live-${nonce}`, state: "active", applied_revision: 1, lease_epoch: 1, expires_at: new Date(Date.now() + 3_600_000).toISOString() },
+      messageId: "probe-up",
+    });
+    const recoveredResult = await reconcilePlacements({ deps: { db, sender: upSender } });
+    assert.equal(recoveredResult.probed, 1);
+    assert.equal(recoveredResult.recovered >= 1, true, JSON.stringify(recoveredResult));
+
+    const recoveredRow = await db.federationPlacement.findUnique({
+      where: { peer_panel_id_intent_id: { peer_panel_id: panelId, intent_id: intentId } },
+    });
+    assert.equal(recoveredRow.state, "active");
+    assert.equal(recoveredRow.last_error_code, null);
+  });
+
   /* ---------------- 清理 ---------------- */
 
   after(async () => {

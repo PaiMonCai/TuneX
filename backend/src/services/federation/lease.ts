@@ -2510,6 +2510,12 @@ export interface FederationReconcileSummary {
   resent: number;
   /** peer 不可达而降级的 placement 条数（**没有**本地回落）。 */
   placement_degraded: number;
+  /** 本轮实际发出的探活次数（task-10：已收敛行也要复核远端）。 */
+  placements_probed: number;
+  /** 探活后发现远端仍 live 且未落后、本行从非 active 回到 active 的条数。 */
+  placements_recovered: number;
+  /** 本地判定到期（或探活发现远端已终态）而收口成 expired 的条数。 */
+  placements_expired: number;
   /** 已撤销但停服未确认、本轮补停成功的租约条数（扫尾）。 */
   revoked_cleaned: number;
   /** 扫尾里仍然停不下来的条数（下一拍继续）。 */
@@ -2557,6 +2563,9 @@ export async function runFederationReconcile(
     revoked_leases: revoked.stopped,
     resent: placement.resent,
     placement_degraded: placement.degraded,
+    placements_probed: placement.probed,
+    placements_recovered: placement.recovered,
+    placements_expired: placement.expired,
     revoked_cleaned: revoked.stopped,
     revoked_teardown_failed: revoked.teardown_failed,
   };
