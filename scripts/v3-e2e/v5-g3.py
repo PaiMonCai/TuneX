@@ -166,9 +166,25 @@ def rejoin_owner(container: str) -> bool:
     return CONTROL_NETWORK in out
 
 
-def served(port: int, timeout: float = 4.0) -> tuple[bool, str]:
+def current_ingress_ip() -> str:
+    """The Forward's CURRENT ingress node address, read from the database.
+
+    Hardcoding one node's IP was a real gate bug: the gate moves placements (that is half of what
+    it tests), so after a migration the listener lives on the new owner while the probe still
+    knocked on the old one — and the setup then failed for a reason that had nothing to do with
+    the product. Ownership is read from the lease and placement from the tunnel, so the probe must
+    follow the same facts.
+    """
+    node_id = int(H.scalar(f"SELECT IFNULL(ingress_node_id,0) FROM tunnel WHERE id={H.tunnel_id};") or 0)
+    if node_id <= 0:
+        return ""
+    return node_connect_ip(node_id)
+
+
+def served(port: int, timeout: float = 4.0, ip: str | None = None) -> tuple[bool, str]:
+    target = ip if ip is not None else (current_ingress_ip() or H.INGRESS_DATA_IP)
     try:
-        with socket.create_connection((H.INGRESS_DATA_IP, port), timeout=timeout) as sock:
+        with socket.create_connection((target, port), timeout=timeout) as sock:
             sock.settimeout(timeout)
             data = sock.recv(256)
             return bool(data), repr(data[:40])
@@ -257,7 +273,16 @@ def setup():
             containers.add(egress_agent)
         for c in sorted(containers):
             H.docker(["restart", c], allow=True, timeout=180)
-        H.wait_until(lambda: served(listen_port)[0], timeout=300, interval=8)
+        if not H.wait_until(lambda: served(listen_port)[0], timeout=180, interval=8):
+            # Operator recovery for a Forward left behind by an interrupted run: force a fresh
+            # revision so a real rollout runs and the runtime converges. This is the documented
+            # recovery path, not a workaround — without it a killed run's leftovers look like a
+            # product failure at the first check.
+            H.mysql(
+                f"UPDATE tunnel SET config_revision = config_revision + 1, apply_status='pending' "
+                f"WHERE id={tunnel_id};"
+            )
+            H.wait_until(lambda: served(listen_port)[0], timeout=300, interval=10)
     check(served(listen_port)[0],
           "G3.setup the Forward is really serving before anything is fenced",
           f"port={listen_port}")
