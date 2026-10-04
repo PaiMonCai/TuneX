@@ -218,13 +218,21 @@ federationRoutes.post("/leases", federationAuth(), async (c) => {
   //   2. 没给，但同 (peer, intent_id) 已有非终态 lease → 沿用那条 lease 的 grant；
   //   3. 都没有 → 若该 peer 恰有一条覆盖本 hop_role 的 active grant 就用它，
   //      多于一条则拒绝并点名"必须显式指定"（含糊地替调用方选一条 = 用错额度）。
-  let grant =
-    typeof body.grant_ref === "string"
-      ? await db.federationGrant.findUnique({
-          where: { grant_ref: body.grant_ref },
-          include: { peer: { select: { peer_panel_id: true } } },
-        })
-      : null;
+  const explicitGrantRef = typeof body.grant_ref === "string" && body.grant_ref.trim() !== "" ? body.grant_ref.trim() : null;
+  let grant = explicitGrantRef
+    ? await db.federationGrant.findUnique({
+        where: { grant_ref: explicitGrantRef },
+        include: { peer: { select: { peer_panel_id: true } } },
+      })
+    : null;
+
+  // **显式引用必须被尊重**：给了 grant_ref 但查不到 → 404，绝不"回落到自动解析"。
+  // 静默回落会让调用方以为自己在用某张特定的授予（例如刚被撤销的那张），实际用的是另一张 ——
+  // 那正是 §13 里"不同的问题不许混成一个"的反面案例（Gate 的探针实测踩到过：显式给了不存在的
+  // grant_ref，host 却回落到该 peer 唯一一条 active grant 并真的分配了租约）。
+  if (explicitGrantRef && !grant) {
+    return c.json(federationErrorBody("grant_not_found", "显式指定的 grant_ref 不存在"), 404 as never);
+  }
 
   if (!grant) {
     const liveLease = await db.federationLease.findFirst({
