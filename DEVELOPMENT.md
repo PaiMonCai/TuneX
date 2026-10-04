@@ -2747,7 +2747,36 @@ CI/Integration/Release
 
 V5 的成功标准不是“支持的协议字符串更多”，而是：
 
-> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 13 结果：自动迁移的**决策**已经被证明是对的，卡在"过期后的第二次尝试"**
+> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 15 结果：G3 = 49 PASS / 1 FAIL —— 自动迁移本身已完全通过，剩余 1 项是"迁移没完成"**
+
+通过的（这一阶段最关键的几条）：分区构造 ✅ → **owner 自己停** ✅ → 愈合后恢复 ✅ → 两阶段拒绝早接管 ✅ →
+真实接管 epoch+1 ✅ → 竞态安全 ✅ → desired 未改写 ✅ → 面板重启安全 ✅ → heartbeat 单独不迁移 ✅ →
+**`the loop migrated ownership away from the dead owner BY ITSELF`** ✅ → **epoch 恰好 +1** ✅ →
+**放置跟着归属走** ✅ → **被栅栏挡住的老主人确实不在服务** ✅。
+
+唯一失败：**"新主人没有在服务"** —— 而它的原因由**rollout 自己的台账**完整给出：
+
+~~~text
+forward_rollout#35 (tunnel 2, revision 3, strategy=node_migration)
+  phase: degraded
+  last_error_code: compensation_failed
+  last_error:      RELAY 缺少 next_hop            ← 迁移的 rollout 在 cutover 时拿不到 next_hop
+  compensation_error: replay egress: 拒绝 stale_revision（期望 revision=2，当前 revision=4）
+~~~
+
+**两个新的、范围明确的真实缺陷（下一轮修）**
+
+| # | 缺陷 | 证据 |
+|---|---|---|
+| **A** | 迁移触发的 rollout 失败后，**补偿把"基版本"当成重放目标**，而该行已经前进到更高的 revision ⇒ 补偿被 `stale_revision` 拒绝 ⇒ 转发停在 `degraded`，两侧都不服务 | 上面那段 `compensation_error` |
+| **B** | 之后**面板的账本与事实不一致**：`apply_status=active`、`applied_revision == config_revision`，而两台节点都没有这条 runtime；reconcile 对它**没有产生任何 drift** ⇒ 直到**强制一个新 revision** 才恢复 | 实测：DB 显示 active，两侧 21002 都是 ConnectionRefused；强制 revision 后立刻 4/4 恢复 |
+
+缺陷 B 是"面板相信自己的账本而不是 agent 的报表"这一族里最危险的一种：**它让一个已经下线的转发看起来完全健康**。
+它的上游很可能是 A（迁移失败留下的中间态），但"失败之后无人发现"是独立的问题，必须单独修。
+
+**round 14 结果（历史）：自动故障转移已被证明可行**
+
+**round 13 结果：自动迁移的**决策**已经被证明是对的，卡在"过期后的第二次尝试"**
 
 worker 日志（现在所有级别都打印）给出了完整答案：
 
