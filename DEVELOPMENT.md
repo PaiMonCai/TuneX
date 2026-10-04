@@ -2747,7 +2747,44 @@ CI/Integration/Release
 
 V5 的成功标准不是“支持的协议字符串更多”，而是：
 
-> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 16 结果：A 的修法已定案（未落地）、B 被降级为"未验证的假设"**
+> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 18 结果：A 已落地（回滚 = 新世代），而 G3.11 的真正阻塞点被定位到**一行条件**
+
+A 已按第三种方案实现并提交（`8138391`）：回滚产生新世代（`max(base, target) + 1`）、为新世代复制基线快照、
+三处重放都用它、**只有补偿完全成功才**把 `config_revision/applied_revision/apply_status` 一起前进、
+无基线时保持旧语义。两个补偿用例断言的是**旧契约**，已按新契约改写（这是契约变更，提交信息里写明）。
+
+**但 G3.11 仍然是 49/1** —— A 是真实缺陷，却不是那个阻塞点。新的 rollout 台账把真正的阻塞点指了出来：
+
+~~~text
+forward_rollout#36 (tunnel 2, revision 5, base 4)
+  last_error:          RELAY 缺少 next_hop
+  compensation_error:  baseline snapshot revision=4 不存在
+~~~
+
+**真正的阻塞点（下一轮的第一个动作，预计一行条件 + 一个用例）**
+
+`prepare_egress` 只在**出口侧发生变化**时才被排入计划：
+
+~~~ts
+if (relay && (impact.egress_node_change || impact.egress_target_change || impact.mode_change)) {
+  push("prepare", "prepare_egress", { ... });   // 只有这里会 recordNextHop(...) 登记 egress host
+}
+~~~
+
+而**只换入口节点**的迁移（failover 走的就是这条）恰恰不在这个条件里 ⇒ **没有 `prepare_egress` ⇒ 没有登记
+egress host ⇒ `resolveNextHop` 返回 null ⇒ `next_hop_unresolved` ⇒ 入口 cutover 失败 ⇒ 新主人永远不服务**。
+
+修法：把"入口将要重切"也纳入出口 prepare 的条件（`impact.ingress_node_change`）。这也与铁律的措辞一致 ——
+**没有 next_hop 就不允许启入口**，所以入口要重切时，出口的"可寻址地址"必须被重新确认一次（该步骤同 revision
+幂等，重放是 no-op）。
+
+**第二条（属于我自己的 fixture 损伤，不是产品缺陷）**：`baseline snapshot revision=4 不存在` —— 我早前
+"强制一个新 revision" 的修复只改了 `config_revision`，没有写快照行。它顺带证明了新代码在缺基线时**如实失败**
+而不是静默退回旧路径。
+
+**round 17 结果（历史）：A 的正确修法比"改个版本号"更深**
+
+**round 16 结果：A 的修法已定案（未落地）、B 被降级为"未验证的假设"**
 
 **A（补偿重放被拒）—— 正确的修法比"改个版本号"更深，本轮只定案**
 
