@@ -43,7 +43,15 @@ export interface PlacementLeaseRow {
 
 export type LeaseClaimResult =
   | { ok: true; lease: PlacementLeaseRow; epoch: number; changed_owner: boolean }
-  | { ok: false; reason: "not_owner" | "not_expired" | "not_found"; current?: PlacementLeaseRow };
+  | {
+      ok: false;
+      /**
+       * `not_expired` = 有人可能还在服务（两阶段交接的正确拒绝）；
+       * `lost_race`   = 并发的认领里别人先写成功（重读后再决定）。
+       */
+      reason: "not_owner" | "not_expired" | "not_found" | "lost_race";
+      current?: PlacementLeaseRow;
+    };
 
 /** 当前租约（可能已过期——到期判定由调用方按它自己的时钟做，见 `isLeaseExpired`）。 */
 export async function loadLease(tunnelId: number): Promise<PlacementLeaseRow | null> {
@@ -129,23 +137,34 @@ export async function claimLease(input: {
   if (!isLeaseExpired(current, input.now)) {
     return { ok: false, reason: "not_expired", current };
   }
-  const moved = await db.placementLease.update({
-    where: { tunnel_id: input.tunnelId },
+
+  // The move is a real COMPARE-AND-SWAP, not a read-then-write.
+  //
+  // 读后写在这里会出真事故：两个候选节点同时看到"租约已过期"，于是各自把 epoch 从 N 写成
+  // N+1 —— 两行都自称 epoch N+1、两个主人。CAS 把"我看到的那个世代"变成写入前提，输的一方
+  // 得到 lost_race 而不是一次成功的迁移。
+  const moved = await db.placementLease.updateMany({
+    where: {
+      tunnel_id: input.tunnelId,
+      epoch: current.epoch,
+      owner_node_id: current.owner_node_id,
+    },
     data: {
       owner_node_id: input.nodeId,
       epoch: current.epoch + 1,
       lease_expires_at: expiresAt,
       revision: input.revision,
     },
-    select: {
-      tunnel_id: true,
-      owner_node_id: true,
-      epoch: true,
-      lease_expires_at: true,
-      revision: true,
-    },
   });
-  return { ok: true, lease: moved, epoch: moved.epoch, changed_owner: true };
+  if (moved.count === 0) {
+    // Someone else moved first. Report it as a race, not as success — the caller must
+    // re-read and decide again rather than assume it holds ownership.
+    const fresh = await loadLease(input.tunnelId);
+    return { ok: false, reason: "lost_race", current: fresh ?? undefined };
+  }
+  const after = await loadLease(input.tunnelId);
+  if (after === null) return { ok: false, reason: "not_found" };
+  return { ok: true, lease: after, epoch: after.epoch, changed_owner: true };
 }
 
 /**
