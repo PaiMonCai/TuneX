@@ -1884,6 +1884,41 @@ half_open  放行**一条**连接：成功 → closed；失败 → 回到 open �
 
 ### Gate V5-G2
 
+**执行结果：PASS=23 / FAIL=0**（证据 `docs/evidence/v5-g2-result-20261004.txt`）
+
+观测对象是**客户端体验**而不是内部状态：e2e 里 Agent 的管理端口是关的，所以门禁用一条真实
+RELAY（池里一个会应答的目标 + 一个会拒绝的目标）来测——没有健康感知选择时，负载均衡会把
+连接平摊到两者，约一半客户端连接失败。
+
+~~~text
+G2.1  面板结论              一个 healthy、一个 unhealthy
+G2.2  熔断真的在起作用      经 RELAY 的连接不再落到被判 unhealthy 的目标上（≥90%，轮询基线约 50%）
+G2.3  desired 未被改写      池的期望行全程逐字节不变；unhealthy 的目标仍在视图里
+G2.4  全 unhealthy 仍服务   全部熔断时连接仍被**接受**（强制选最不坏），而不是直接拒绝
+G2.5  LB 重新纳入           目标恢复后流量回到它身上
+G2.6  Agent 重启            健康是活状态，服务自动恢复
+G2.7  面板重启              desired 不变、数据面照常
+~~~
+
+**这一阶段抓到的三个真实缺陷 —— 同一个类别**：**一个新事实有两条投递路径，只给其中一条补上了。**
+
+| # | 缺陷 | 症状 |
+|---|---|---|
+| 1 | 面板只在**命令下发**带健康，**重连快照**不带 | Agent 一重启就从快照重建 → 熔断静默失效 |
+| 2 | Agent 的 **restore** 用 `SetPool`（只有 targets）而不是 `SetPoolAndHealth` | 同上，重启即失效 |
+| 3 | Agent 的**快照解码器**不认识 `target_health` | 同上；而"有时候连接失败"看起来像网络抖动，不像配置缺失 |
+
+前两次同源缺陷在 V5.0（协议）与 V5.1a（证书路径）各出现一次，这是第三次。因此这条纪律现在
+写成硬规则：**新事实必须同时出现在"命令"与"快照"两条投递路径上，并且解码器要认识它**。
+
+**其余 Gate V5-G2 的原始清单覆盖情况**：`healthy → unhealthy → recovering → healthy`（G2A.3/G2A.4/G2A.5 + G2.1/G2.5）、
+`latency degradation`（合成侧由 WP6 单测覆盖，端到端不构造延迟退化）、`flap`（WP6 单测）、
+`stale observation`（G2A.6）、`target restore`（G2.5）、`Panel restart`（G2.7）、`Agent restart`（G2.6）、
+`circuit open/half-open/close`（WP7 单测 18 例 + G2.2 端到端）、`LB 重新纳入恢复 target`（G2.5）、
+`desired 列表始终不被 telemetry 改写`（G2.3，端到端逐字节断言）。
+
+### Gate V5-G2（原始清单）
+
 至少：
 
 - healthy → unhealthy → recovering → healthy；
