@@ -53,6 +53,10 @@ TUNNEL_ID = int(os.environ.get("G3_TUNNEL_ID", "0"))
 STANDBY_NODE_ID = int(os.environ.get("G3_STANDBY_NODE", "0"))
 LAPSE_TIMEOUT = int(os.environ.get("G3_LAPSE_TIMEOUT", "240"))
 OVERALL_SECONDS = int(os.environ.get("G3_OVERALL_SECONDS", "2400"))
+# Optional case selector (`G3_CASES=G3.4,G3.5`): the cases need real waiting (partitions,
+# staleness windows, healing), so a full run is ~50 minutes. A re-run after a one-line fix
+# should not have to pay for the cases that already passed.
+CASE_FILTER = [x.strip() for x in os.environ.get("G3_CASES", "").split(",") if x.strip()]
 START = time.monotonic()
 
 
@@ -620,6 +624,8 @@ def main():
             ("G3.10 heartbeat alone", g3_10_heartbeat_alone_moves_nothing, 240),
             ("G3.11 automatic failover", g3_11_automatic_failover, 1500),
         ]:
+            if CASE_FILTER and not any(name.startswith(f) for f in CASE_FILTER):
+                continue
             case(name, fn, budget)
     except Exception as exc:  # noqa: BLE001
         record(False, f"G3 prerequisite/setup: {type(exc).__name__}: {exc}; remaining tests NOT EXECUTED")
