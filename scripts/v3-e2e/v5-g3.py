@@ -530,6 +530,32 @@ def set_policy(auto_failover: bool, auto_failback: bool = False) -> None:
     )
 
 
+def pool_targets(pool_id: int) -> list[tuple[str, int, int, int, str]]:
+    raw = H.mysql(
+        "SELECT CONCAT(host, '|', port, '|', weight, '|', order_by, '|', status) "
+        f"FROM egress_target WHERE pool_id={pool_id} ORDER BY id;"
+    ).strip()
+    out = []
+    for line in raw.splitlines():
+        parts = line.split("|")
+        if len(parts) == 5:
+            out.append((parts[0], int(parts[1]), int(parts[2]), int(parts[3]), parts[4]))
+    return out
+
+
+def set_pool_targets(pool_id: int, targets: list[tuple[str, int]]) -> None:
+    H.mysql(f"DELETE FROM egress_target WHERE pool_id={pool_id};")
+    for host, port in targets:
+        H.mysql(
+            "INSERT INTO egress_target (pool_id, host, port, weight, order_by, status, created_at, updated_at) "
+            f"VALUES ({pool_id}, '{host}', {port}, 1, 10, 'active', NOW(3), NOW(3));"
+        )
+
+
+def pool_id_of(tunnel_id: int) -> int:
+    return int(H.scalar(f"SELECT IFNULL(egress_pool_id,0) FROM tunnel WHERE id={tunnel_id};") or 0)
+
+
 def g3_11_automatic_failover():
     """The closure of V5.3: the loop must move a Forward BY ITSELF when its owner dies.
 
@@ -546,6 +572,26 @@ def g3_11_automatic_failover():
     before = lease_row(H.tunnel_id)
     epoch_before = int(before.get("epoch", 0))
     H.owner_container = container
+
+    # ── fixture ──
+    #
+    # The policy refuses to move for two reasons that are both CORRECT and both caused by the
+    # fixture rather than the code (round 11's log said so in one line):
+    #   · `target_side_failure`: the pool held a target that never answers, so the panel judged
+    #     the problem to be target-side — and a migration cannot fix a broken target;
+    #   · `no_standby_candidate`: candidates must be non-owner ingress-capable nodes in the SAME
+    #     ingress node group, and this topology's two ingress nodes live in different groups.
+    # Relaxing either rule to make the gate pass would delete a protection, so the fixture is
+    # what changes: a pool of healthy targets, and a standby inside the owner's group.
+    H.pool_id = pool_id_of(H.tunnel_id)
+    H.saved_pool_targets = pool_targets(H.pool_id)
+    set_pool_targets(H.pool_id, [("target-a", 3030)])
+    H.saved_standby_group = int(H.scalar(f"SELECT IFNULL(node_group_id,0) FROM node WHERE id={standby};") or 0)
+    owner_group = int(H.scalar(f"SELECT IFNULL(node_group_id,0) FROM node WHERE id={owner};") or 0)
+    if H.saved_standby_group != owner_group:
+        H.mysql(f"UPDATE node SET node_group_id={owner_group} WHERE id={standby};")
+        check(True, "G3.11 the standby was placed in the owner's node group (fixture)",
+              f"standby={standby} group {H.saved_standby_group} -> {owner_group}")
 
     set_policy(True)
     try:
@@ -588,6 +634,10 @@ def g3_11_automatic_failover():
     finally:
         H.docker(["start", container], timeout=120)
         set_policy(False)
+        if getattr(H, "pool_id", 0) and getattr(H, "saved_pool_targets", None) is not None:
+            set_pool_targets(H.pool_id, [(h, p) for h, p, _w, _o, _s in H.saved_pool_targets])
+        if getattr(H, "saved_standby_group", 0):
+            H.mysql(f"UPDATE node SET node_group_id={H.saved_standby_group} WHERE id={standby};")
 
 
 def _served_at(ip: str, port: int, timeout: float = 4.0) -> bool:

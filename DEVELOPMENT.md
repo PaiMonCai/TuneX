@@ -2747,7 +2747,25 @@ CI/Integration/Release
 
 V5 的成功标准不是“支持的协议字符串更多”，而是：
 
-> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 11 结果：G3 = 44 PASS / 2 FAIL，两项都定位清楚（都不是产品缺陷）**
+> **能力边界扩大以后，系统仍然只有一份真相、一个控制链、一个 ownership 模型，并且故障行为可解释、可恢复、可验证。****round 12 结果：fixture 修对了（blocker 从 2 降到 1），但 G3.11 仍未跑完**
+
+两处 fixture 改动**已被证据验证是正确方向**：把池改成全健康目标 + 把备用节点放进 owner 所在的入口节点组之后，
+worker 日志里的 blocker 从
+
+~~~text
+action=hold blockers=target_side_failure,no_standby_candidate   ← 改之前
+action=hold blockers=owner_reachable                            ← 改之后
+~~~
+
+**只剩一个 `owner_reachable`** —— 也就是说策略的其余五条（观测新鲜度、目标侧归因、端口可用、冷却、策略开关）
+**全部通过** ✅ 剩下的只是等 owner 真的 stale 这一步。
+
+**但 G3.11 这轮没跑完**：进程在等待期间被外部终止（日志停在两行 PASS、没有 FAIL 行），因此
+**自动迁移本身仍未得到验证**。下次要用一次不被打断的运行把它跑完。
+
+fixture 已被还原（node 5 回组 5、池恢复两个目标），拓扑干净。
+
+**round 11 结果（历史）：G3 = 44 PASS / 2 FAIL，两项都定位清楚（都不是产品缺陷）**
 
 1. `G3.6` —— **门禁脚本陈旧**：断言在本地修好了但忘了 `docker cp` 到 runner，那一轮用的仍是旧副本。
 2. `G3.11`（自动迁移）—— 补上可观测性之后**一行日志就看清了**：
