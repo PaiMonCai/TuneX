@@ -50,10 +50,11 @@
  * ── 决策对象：未满足的条件**全部**列出 ──
  *
  * `conditions` / `preconditions` 是事实快照：`true` / `false` = 已评估的事实，
- * `null` = 本次决策路径**没有评估**这一条（例如 failover 路径上不存在回切健康计数
- * 这个事实，回切路径上不要求 owner 失联）。`blockers` 则是「这次为什么没有迁移」的
- * 全部原因，一条未满足条件一个条目（**不是只报第一条**）。不变量（有用例钉住）：
- * 每个 blocker 都对应一个 `false` 的事实条目，且 `reasons` 一定以 blocker 的原因开头。
+ * `null` = 本次决策路径**没有这个事实**（回切路径上不要求 owner 失联；failover 路径上
+ * 不存在「连续健康计数」；没有目的地时就没有「它在线吗 / 它有端口吗」这两个答案）。
+ * `blockers` 则是「这次为什么没有迁移」的全部原因，一条未满足条件一个条目
+ * （**不是只报第一条**）。不变量（有用例钉住）：每个 blocker 都对应一个 `false` 的
+ * 事实条目，且 `reasons` 一定以 blocker 的原因开头。
  *
  * ── 与 WP6 的关系 ──
  *
@@ -551,10 +552,10 @@ function evaluateTargetSide(
 interface DestinationEvaluation {
   /** 前提：存在可迁移的目的地。 */
   readonly exists: Requirement;
-  /** 前提：目的地节点在线。 */
-  readonly online: Requirement;
-  /** 条件 4：目的地有可用端口。 */
-  readonly port: Requirement;
+  /** 前提：目的地节点在线；**null = 没有目的地，因此没有这个事实**。 */
+  readonly online: Requirement | null;
+  /** 条件 4：目的地有可用端口；**null = 没有目的地，因此没有这个事实**。 */
+  readonly port: Requirement | null;
 }
 
 function evaluateDestination(
@@ -568,11 +569,9 @@ function evaluateDestination(
   const portReason: FailoverReason = path === "failback" ? "failback_port_unavailable" : "standby_port_unavailable";
 
   if (!candidate) {
-    return {
-      exists: unmet(missingReason),
-      online: unmet(offlineReason, "没有目的地节点"),
-      port: unmet(portReason, "没有目的地节点"),
-    };
+    // 没有目的地时，「它在线吗 / 它有端口吗」这两个问题**没有答案**：报 null（未评估），
+    // 而不是把同一个根因写成三条 blocker ——「没有候选」本身就是完整的原因。
+    return { exists: unmet(missingReason), online: null, port: null };
   }
 
   const online = candidate.reachable === true
@@ -734,7 +733,8 @@ export function decideFailover(input: FailoverInput): FailoverDecision {
     owner_unreachable_beyond_stale: failbackPath ? null : ownerIsDown,
     observation_fresh: observations.requirement.met,
     target_not_side_failure: targetSide.requirement.met,
-    standby_port_available: destination.port.met,
+    // 没有目的地时端口事实不存在 → null（未评估），不是 false。
+    standby_port_available: destination.port === null ? null : destination.port.met,
     cooldown_elapsed: cooldown.requirement.met,
     policy_allows: policy.met,
     // failover/hold 路径上不存在「连续健康计数」这个事实，所以是 null 而不是 false。
@@ -742,50 +742,33 @@ export function decideFailover(input: FailoverInput): FailoverDecision {
   };
   const preconditions: Record<PlacementPrecondition, boolean | null> = {
     standby_candidate: destination.exists.met,
-    standby_online: destination.online.met,
+    standby_online: destination.online === null ? null : destination.online.met,
     placement_epoch: epochOk,
     // failover 路径上没有评估「回切目标」，所以是 null；hold/failback 路径上是事实。
     failback_configured: failbackPath ? true : ownerIsDown ? null : failbackConfigured,
   };
 
   // 本次路径上「要求成立」的条目，顺序即 §8 的顺序（回切路径去掉条件 1、加上回切条件）。
-  const required: Array<{ condition: PlacementRequirement; requirement: Requirement }> = failbackPath
-    ? [
-        { condition: "observation_fresh", requirement: observations.requirement },
-        { condition: "target_not_side_failure", requirement: targetSide.requirement },
-        { condition: "standby_candidate", requirement: destination.exists },
-        { condition: "standby_online", requirement: destination.online },
-        { condition: "placement_epoch", requirement: epochRequirement },
-        { condition: "standby_port_available", requirement: destination.port },
-        { condition: "cooldown_elapsed", requirement: cooldown.requirement },
-        { condition: "policy_allows", requirement: policy },
-        { condition: "failback_healthy_checks", requirement: checksRequirement ?? met("failback_checks_met") },
-      ]
-    : ownerIsDown
-      ? [
-          { condition: "observation_fresh", requirement: observations.requirement },
-          { condition: "target_not_side_failure", requirement: targetSide.requirement },
-          { condition: "standby_candidate", requirement: destination.exists },
-          { condition: "standby_online", requirement: destination.online },
-          { condition: "placement_epoch", requirement: epochRequirement },
-          { condition: "standby_port_available", requirement: destination.port },
-          { condition: "cooldown_elapsed", requirement: cooldown.requirement },
-          { condition: "policy_allows", requirement: policy },
-        ]
-      : [
-          // hold 路径：唯一「应该成立却没成立」的迁移条件就是条件 1 ——
-          // 「仍可达」「还在 stale 窗口内」「年龄不可知」是三种不同的运维事实，
-          // 必须精确区分。其余条目仍然是事实快照（可能成立、也可能同时也不成立）。
-          { condition: "owner_unreachable_beyond_stale", requirement: ownerRequirement },
-          { condition: "observation_fresh", requirement: observations.requirement },
-          { condition: "target_not_side_failure", requirement: targetSide.requirement },
-          { condition: "standby_candidate", requirement: destination.exists },
-          { condition: "standby_online", requirement: destination.online },
-          { condition: "placement_epoch", requirement: epochRequirement },
-          { condition: "standby_port_available", requirement: destination.port },
-          { condition: "cooldown_elapsed", requirement: cooldown.requirement },
-          { condition: "policy_allows", requirement: policy },
-        ];
+  // `require` 会跳过 null（没有这个事实的条目既不是成立、也不是不成立）。
+  const required: Array<{ condition: PlacementRequirement; requirement: Requirement }> = [];
+  const need = (condition: PlacementRequirement, requirement: Requirement | null): void => {
+    if (requirement !== null) required.push({ condition, requirement });
+  };
+
+  // hold 路径上唯一「应该成立却没成立」的迁移条件就是条件 1 ——「仍可达」「还在 stale
+  // 窗口内」「年龄不可知」是三种不同的运维事实，必须精确区分。
+  if (!failbackPath && !ownerIsDown) {
+    need("owner_unreachable_beyond_stale", ownerRequirement);
+  }
+  need("observation_fresh", observations.requirement);
+  need("target_not_side_failure", targetSide.requirement);
+  need("standby_candidate", destination.exists);
+  need("standby_online", destination.online);
+  need("placement_epoch", epochRequirement);
+  need("standby_port_available", destination.port);
+  need("cooldown_elapsed", cooldown.requirement);
+  need("policy_allows", policy);
+  need("failback_healthy_checks", checksRequirement);
 
   const blockers: FailoverBlocker[] = [];
   for (const entry of required) {
