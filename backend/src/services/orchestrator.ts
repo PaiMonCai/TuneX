@@ -70,6 +70,7 @@ import {
 import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts";
 import { targetHealthWireEntries } from "./target-health-read.ts";
 import { claimLease } from "./placement-lease.ts";
+import type { RoutePlan } from "./forward-route.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   wireTunnelTypeForForwardProtocol,
@@ -386,6 +387,28 @@ export class HttpAgentTransport implements AgentTransport {
 /* Orchestrator                                                        */
 /* ================================================================== */
 
+/** V5.4：线性路由的下发输入（`dispatchRoute`）。 */
+export interface DispatchRouteInput {
+  readonly tunnelId: number;
+  readonly revision: number;
+  readonly plan: RoutePlan;
+  /** 每一跳的节点（`hop_index` → 节点事实）。 */
+  readonly hop_nodes: Readonly<Record<number, OrchestratorNode>>;
+  /** 每一跳的端口（来自计划阶段的 `acquire_port`；这里不选端口）。 */
+  readonly hop_ports: Readonly<Record<number, number>>;
+  /** 出口跳的真实目标池。 */
+  readonly targets: readonly { host: string; port: number; weight?: number; order_by?: number }[];
+  readonly poolId: number | null;
+  readonly lbStrategy?: string | null;
+  readonly protocol?: ForwardProtocol;
+  readonly tlsCertPath?: string | null;
+  readonly tlsKeyPath?: string | null;
+}
+
+export type RouteDispatchOutcome =
+  | { ok: true; plan: RoutePlan; hops_dispatched: readonly number[] }
+  | DispatchFailure;
+
 export interface DispatchEgressInput {
   tunnelId: number;
   revision: number;
@@ -608,6 +631,103 @@ export class Orchestrator {
   /** DIRECT 隧道 id：`tunex-<tunnelId>-direct`。 */
   static directTunnelId(tunnelId: number): string {
     return `tunex-${tunnelId}-direct`;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* 线性路由的下发（V5.4 WP12）                                        */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * 按 `RoutePlan` 下发一条线性路由。**这是既有原语的组合，不是第二条下发通道。**
+   *
+   * 三跳的形状，逐跳都是既有的两段式：
+   *   · hop N-1（出口）：`dispatchEgress` 指向**真实目标池**；
+   *   · 中间跳：同一个 `dispatchEgress` 形状，只是它的"目标"是**下一跳的节点间监听地址**
+   *     （一跳的出口就是下一跳的入口 —— 这正是 RELAY 两段式的本质）；
+   *   · hop 0（入口）：`dispatchIngress`，`next_hop` 指向它的下一跳。
+   *
+   * 顺序不可交换（§1 铁律在 N 跳上的推广）：**正向先远后近** —— 最远的一跳先起，客户端面前最后。
+   * 任何一跳失败时调用方按 `compensationSteps()` 逆序拆除。
+   *
+   * 每一跳的端口必须已经由计划阶段 `acquire_port` 拿到：这里**不选端口**，端口分配是调度决策。
+   * 每一跳的"可寻址地址"来自**该跳自己的 dispatch 返回值**，不猜 IP —— 猜错就是每个新连接都
+   * 连不上的静默故障（这也是既有两段式一直遵守的规则）。
+   */
+  async dispatchRoute(input: DispatchRouteInput): Promise<RouteDispatchOutcome> {
+    const hops = [...input.plan.hops];
+    const last = hops[hops.length - 1];
+    if (last === undefined) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: "路由为空" };
+    }
+
+    const listeningAt = new Map<number, { host: string; port: number }>();
+
+    for (let i = hops.length - 1; i >= 0; i -= 1) {
+      const hop = hops[i]!;
+      const port = input.hop_ports[hop.hop_index];
+      const node = input.hop_nodes[hop.hop_index];
+      if (node === undefined || port === undefined) {
+        return {
+          ok: false,
+          error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+          error: `hop ${hop.hop_index} 缺少节点或端口事实（计划阶段应先 acquire_port）`,
+        };
+      }
+
+      if (hop.role === "ingress") {
+        const next = listeningAt.get(hop.hop_index + 1);
+        if (next === undefined) {
+          return {
+            ok: false,
+            error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+            error: "入口的下一跳没有就绪（正向必须先远后近）",
+          };
+        }
+        const ingress = await this.dispatchIngress({
+          tunnelId: input.tunnelId,
+          revision: input.revision,
+          ingressNode: node,
+          ingressPort: port,
+          nextHop: `${next.host}:${next.port}`,
+          protocol: input.protocol,
+          tlsCertPath: input.tlsCertPath ?? null,
+          tlsKeyPath: input.tlsKeyPath ?? null,
+        });
+        if (!ingress.ok) return ingress;
+        listeningAt.set(hop.hop_index, { host: next.host, port });
+        continue;
+      }
+
+      const isEgress = hop.role === "egress";
+      let targets: readonly { host: string; port: number; weight?: number; order_by?: number }[] | null;
+      if (isEgress) {
+        targets = input.targets;
+      } else {
+        const next = listeningAt.get(hop.hop_index + 1);
+        targets = next === undefined ? null : [{ host: next.host, port: next.port, weight: 1, order_by: 10 }];
+      }
+      if (targets === null) {
+        return {
+          ok: false,
+          error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable,
+          error: `hop ${hop.hop_index} 的下一跳没有就绪（正向必须先远后近）`,
+        };
+      }
+      const dispatched = await this.dispatchEgress({
+        tunnelId: input.tunnelId,
+        revision: input.revision,
+        egressNode: node,
+        egressPort: port,
+        poolId: isEgress ? input.poolId : null,
+        targets,
+        lbStrategy: isEgress ? input.lbStrategy : null,
+        protocol: input.protocol,
+      });
+      if (!dispatched.ok) return dispatched;
+      listeningAt.set(hop.hop_index, { host: dispatched.egress_host, port });
+    }
+
+    return { ok: true, plan: input.plan, hops_dispatched: hops.map((h) => h.hop_index) };
   }
 
   /* ---------------------------------------------------------------- */
