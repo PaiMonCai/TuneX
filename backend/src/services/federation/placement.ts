@@ -421,12 +421,17 @@ export async function reconcilePlacements(
         method: "POST",
         // 重连后重发的是**同一次申请**：同 intent、同 revision（幂等键两端一致）。
         path: "/api/federation/v1/leases",
+        // 形状对齐 host 的 handler：`{ grant_ref?, intent: {...} }`。
+        // **不传 grant_ref**：placement 行里没有这一列（重连后 home 也不该"记得"额度），
+        // host 侧的解析顺序②（同 (peer,intent_id) 已有非终态 lease 的 grant）会把它找回来。
         body: {
-          intent_id: row.intent_id,
-          revision: row.desired_revision,
-          hop_role: row.hop_role,
-          forward_ref: row.forward_ref,
-          requested: { node_ref: row.peer_node_ref ?? undefined },
+          intent: {
+            intent_id: row.intent_id,
+            revision: row.desired_revision,
+            hop_role: row.hop_role,
+            forward_ref: row.forward_ref,
+            requested: row.peer_node_ref === null ? {} : { node_ref: row.peer_node_ref },
+          },
         },
         retries: 1,
       });

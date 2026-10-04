@@ -33,6 +33,8 @@ import {
   expireGrants,
   isTerminalLeaseState,
   nextLeaseEpoch,
+  PORT_RELEASE_PENDING_CODE,
+  PEER_REVOKE_PENDING_CODE,
   registerFederationCascadeHooks,
   type EvaluateGrantInput,
   type FederationAuditSink,
@@ -542,18 +544,22 @@ async function defaultReleasePort(input: { node_id: number; port: number }) {
  * 注册而不是让 grant.ts import lease.ts：避免 `grant ↔ lease` 循环依赖，
  * 同时保证**只有一份**停服实现（别在这里再写第二份）。
  */
-registerFederationCascadeHooks({ teardown: defaultTeardown, releasePort: defaultReleasePort });
+registerFederationCascadeHooks({
+  teardown: (input) => defaultTeardown(input, defaultLeaseDb),
+  releasePort: defaultReleasePort,
+});
 
 function resolveLeaseDeps(over?: LeaseHostDeps): ResolvedLeaseDeps {
+  const db = over?.db ?? defaultLeaseDb;
   return {
-    db: over?.db ?? defaultLeaseDb,
+    db,
     audit: over?.audit ?? defaultFederationAuditSink,
     now: over?.now ?? (() => new Date()),
-    dispatch: over?.dispatch === undefined ? defaultDispatch : (over.dispatch ?? disabledDispatch),
+    dispatch: over?.dispatch === undefined ? (input) => defaultDispatch(input) : (over.dispatch ?? disabledDispatch),
     allocatePort: over?.allocatePort ?? defaultAllocatePort,
     releasePort: over?.releasePort ?? defaultReleasePort,
-    // `undefined` = 用生产默认（orchestrator）；`null` = 显式禁用（测试）。
-    teardown: over?.teardown === undefined ? defaultTeardown : over.teardown,
+    // `undefined` = 用生产默认（orchestrator + 本调用的 db 接缝）；`null` = 显式禁用（测试）。
+    teardown: over?.teardown === undefined ? (input) => defaultTeardown(input, db) : over.teardown,
     ttlSeconds: over?.ttlSeconds ?? DEFAULT_LEASE_TTL_SECONDS,
   };
 }
@@ -571,8 +577,6 @@ const disabledDispatch: LeaseDispatchHook = () => ({
  */
 export function defaultLeaseHostDeps(): LeaseHostDeps {
   return {
-    dispatch: defaultDispatch,
-    teardown: defaultTeardown,
     allocatePort: defaultAllocatePort,
     releasePort: defaultReleasePort,
   };
@@ -819,7 +823,9 @@ export async function reserveRemoteLease(input: ReserveLeaseInput, deps?: LeaseH
   });
 
   // --- revision 更新：复用既有占用（同一节点、同一端口、同一 epoch）---
-  if (existing !== null && !isTerminalLeaseState(existing.state)) {
+  // 「已过期但还没被收口」的行**不**复用：对它做 revision 更新，紧接着的 apply 必然
+  // 以 lease_expired 拒绝，home 侧会看到 ok→error 的跳变。过期即按新占用处理（epoch+1）。
+  if (existing !== null && !isTerminalLeaseState(existing.state) && existing.expires_at.getTime() > now.getTime()) {
     const planned = planLeaseApply({
       intent,
       grant: input.grant,
@@ -1249,8 +1255,8 @@ export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseH
       state: "released",
       released_at: now,
       // 端口没还上不代表"还在服务"，但它确实是一笔待办：留痕给 reconcile，不静默。
-      last_error_code: portReleased ? null : "internal_error",
-      last_error: portReleased ? null : "port release failed; portPool reconcile will reclaim it",
+      last_error_code: portReleased ? null : PORT_RELEASE_PENDING_CODE,
+      last_error: portReleased ? null : "port release failed; the sweeper will retry, and portPool reconcile reclaims it as a backstop",
     },
   })) as { count: number };
   if (done.count === 0) {
@@ -1391,6 +1397,14 @@ export function validateLegLink(hopRole: string, raw: unknown): ParseResult<Fede
       const entry = t as Record<string, unknown>;
       if (typeof entry.host !== "string" || entry.host.length === 0) return bad("link.targets[].host must be a non-empty string");
       if (!isValidPort(entry.port)) return bad(`link.targets[].port ${String(entry.port)} is not a valid port`);
+      // 非数字的 weight/order_by **拒绝**而不是丢弃：其余字段都是一票否决，
+      // 这里静默丢弃会让调用方以为给了权重而实际没有（"配置生效了，但不是你要的"）。
+      if (entry.weight !== undefined && entry.weight !== null && typeof entry.weight !== "number") {
+        return bad("link.targets[].weight must be a number");
+      }
+      if (entry.order_by !== undefined && entry.order_by !== null && typeof entry.order_by !== "number") {
+        return bad("link.targets[].order_by must be a number");
+      }
       targets.push({
         host: entry.host,
         port: entry.port as number,
@@ -1437,11 +1451,10 @@ export function federatedRuntimeId(leaseRef: string, hopRole: string): string {
 /**
  * 默认下发实现：复用既有 orchestrator（契约 §7「不新建下发通道」）。
  *
- * 远端 **ingress** 目前明确拒绝：`dispatchIngress` 硬编码 `relayTunnelId(tunnelId)`，
- * 并且会 `claimOwnership(tunnelId, ...)` 写 `placement_lease` —— 联邦腿在 host 上没有本地
- * tunnel 行，拿 lease id 去 claim 会在归属表里留下一条指向不存在隧道的行（第二份真相）。
- * 需要 orchestrator 给 dispatchIngress 加可选 `runtimeId` 并在给了它时跳过 claimOwnership，
- * 这一条已报给 Lead；在它落地前，远端 ingress **fail-closed** 而不是冒险撞 id。
+ * 远端 ingress 与 egress 都走**同一个** orchestrator，只是运行时 id 的方向段不同
+ * （`tunex-fed-<ref>-relay` / `-egress`）；`runtimeId` 同时让 `dispatchIngress` 跳过
+ * placement 归属认领（联邦腿的归属由 `federation_lease.lease_epoch` 表达，不需要第二份）。
+ * 拆除时方向必须与建立时一致（relay ↔ ingress），见 {@link defaultTeardown}。
  */
 async function defaultDispatch(input: LeaseDispatchInput): Promise<LeaseDispatchOutcome> {
   const orchestrator = getOrchestrator();
@@ -1466,6 +1479,22 @@ async function defaultDispatch(input: LeaseDispatchInput): Promise<LeaseDispatch
         poolId: input.link.pool_id ?? null,
         targets: input.link.targets ?? [],
         lbStrategy: input.link.lb_strategy ?? null,
+        protocol,
+        tlsCertPath: input.link.tls_cert_path ?? null,
+        tlsKeyPath: input.link.tls_key_path ?? null,
+      });
+      return outcome.ok ? { ok: true } : { ok: false, code: "internal_error", message: `${outcome.error_code}: ${outcome.error}` };
+    }
+    case "ingress": {
+      // 入参 `runtimeId` 非空时 dispatchIngress 会**跳过 placement 归属认领**：
+      // 联邦腿在 host 上没有本地 tunnel 行，认领会写出一条指向不存在隧道的归属行（第二份真相）。
+      const outcome = await orchestrator.dispatchIngress({
+        tunnelId,
+        runtimeId,
+        revision: input.revision,
+        ingressNode: input.node,
+        ingressPort: port,
+        nextHop: input.link.next_hop ?? "",
         protocol,
         tlsCertPath: input.link.tls_cert_path ?? null,
         tlsKeyPath: input.link.tls_key_path ?? null,
@@ -1500,11 +1529,11 @@ async function defaultDispatch(input: LeaseDispatchInput): Promise<LeaseDispatch
  * 用失败那次的 revision 撤可能被拒 → 补偿静默失效 → 端口继续被占。
  * Agent 对未知 id 的 remove 是 no-op，因此这个补偿天然幂等。
  */
-async function defaultTeardown(input: LeaseTeardownInput): Promise<HookOutcome> {
+async function defaultTeardown(input: LeaseTeardownInput, leaseDb: LeaseDb): Promise<HookOutcome> {
   const orchestrator = getOrchestrator();
   if (orchestrator === null) return { ok: false, message: "orchestrator is not wired" };
   if (input.node_id === null) return { ok: true, message: "lease has no node; nothing to stop" };
-  const node = await loadOrchestratorNode(defaultLeaseDb, input.node_id);
+  const node = await loadOrchestratorNode(leaseDb, input.node_id);
   if (node === null) return { ok: false, message: `node ${input.node_id} no longer exists` };
 
   const direction = HOP_ROLE_RUNTIME_DIRECTION[input.hop_role] ?? "egress";
@@ -1543,6 +1572,12 @@ export interface ApplyRemoteLeaseInput {
   /** home 侧本次要应用的 revision。 */
   revision: number;
   targets: readonly { host: string; port: number; weight?: number; order_by?: number }[];
+  /**
+   * 远端 **ingress** 腿必填：上一跳（或目标）的 `<host>:<port>`。
+   * 缺它 → `message_malformed`（**不猜地址**：猜出来的下一跳就是一条永远不通的链路）。
+   * egress 腿忽略该字段。
+   */
+  next_hop?: string | null;
   lb_strategy?: string | null;
   /** 缺省 tcp。 */
   protocol?: string | null;
@@ -1650,9 +1685,9 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
     };
   }
 
-  // 第一版只有远端 egress（契约 §9）。远端 ingress/transit 需要 orchestrator 给
-  // dispatchIngress 加 runtimeId 并在给了它时跳过 placement 归属 claim —— 见 defaultDispatch 注释。
-  if (lease.hop_role !== "egress") {
+  // 契约 §9：第一版只支持**一个远端 hop**（远端 ingress **或** 远端 egress）。
+  // 跨面板 transit 是 §9.4.4 明确的关闭项，必须 fail-closed 拒绝而不是"顺手支持"。
+  if (lease.hop_role === "transit") {
     await settleLeaseIntent(d.db, {
       intent_id: input.intent_id,
       revision: input.revision,
@@ -1663,8 +1698,18 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
     return {
       ok: false,
       code: "unsupported_topology",
-      message: `remote ${lease.hop_role} hops are not dispatchable yet (orchestrator dispatchIngress runtimeId support pending)`,
+      message: "cross-panel transit hops are closed in the first version (contract §9); only one remote hop is supported",
     };
+  }
+  if (lease.hop_role !== "egress" && lease.hop_role !== "ingress") {
+    await settleLeaseIntent(d.db, {
+      intent_id: input.intent_id,
+      revision: input.revision,
+      action: "apply",
+      status: INTENT_STATUS.failed,
+      error_code: "message_malformed",
+    });
+    return { ok: false, code: "message_malformed", message: `unknown hop_role "${lease.hop_role}" in lease row` };
   }
 
   const linkParsed = validateLegLink(lease.hop_role, {
@@ -1672,7 +1717,7 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
     targets: input.targets,
     lb_strategy: input.lb_strategy ?? null,
     pool_id: null,
-    next_hop: null,
+    next_hop: input.next_hop ?? null,
     tls_cert_path: null,
     tls_key_path: null,
   });
@@ -1719,25 +1764,37 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
 
   if (!dispatched.ok) {
     // 失败补偿：把可能已经建起来的 runtime 撤掉、把端口还回去，再如实报告失败。
-    const compensated = await compensateFailedApply(d, lease, dispatched.message);
+    // 例外：如果我们这次 revision 已经被更**新**的 revision 超越，runtime 归新的那次，
+    // 拆它等于把健康链路干掉（旧 revision 在 Agent 闸门上被判 stale 时正是这条路径）。
+    const outcome = await compensateFailedApply(d, lease, input.revision, dispatched.message);
+    const code = outcome.superseded ? "intent_revision_stale" : (dispatched.code ?? "internal_error");
     await settleLeaseIntent(d.db, {
       intent_id: input.intent_id,
       revision: input.revision,
       action: "apply",
       status: INTENT_STATUS.failed,
-      error_code: dispatched.code ?? "internal_error",
+      error_code: code,
     });
     return {
       ok: false,
-      code: dispatched.code ?? "internal_error",
-      message: compensated
-        ? dispatched.message
-        : `${dispatched.message} (compensation incomplete; reconcile will retry)`,
+      code,
+      message: outcome.superseded
+        ? `${dispatched.message} (revision ${input.revision} was superseded by a newer one; its runtime was left untouched)`
+        : outcome.compensated
+          ? dispatched.message
+          : `${dispatched.message} (compensation incomplete; reconcile will retry)`,
     };
   }
 
   const updated = (await d.db.federationLease.updateMany({
-    where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
+    where: {
+      id: lease.id,
+      lease_epoch: lease.lease_epoch,
+      state: lease.state,
+      // `applied_revision` 也是 CAS 前提：并发里**被超越的 revision 不能把状态往回写**
+      // （只带 epoch+state 时，rev8 与 rev9 会双双命中，后写的那次可能是旧的）。
+      applied_revision: lease.applied_revision ?? null,
+    },
     data: {
       state: "active",
       applied_revision: input.revision,
@@ -1747,14 +1804,67 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
     },
   })) as { count: number };
   if (updated.count === 0) {
-    // 并发方（多半是 revoke）在我们下发期间改了状态：它是对的，我们刚建起来的 runtime 必须撤掉。
-    const compensated = await compensateFailedApply(d, lease, "state changed concurrently during apply");
+    const fresh = (await d.db.federationLease.findUnique({ where: { id: lease.id } })) as FederationLeaseRow | null;
+
+    // (1) 被更新的 revision 超越：runtime 归它，我们**只记账、不拆**。
+    if (fresh !== null && fresh.applied_revision !== null && fresh.applied_revision > input.revision) {
+      await settleLeaseIntent(d.db, {
+        intent_id: input.intent_id,
+        revision: input.revision,
+        action: "apply",
+        status: INTENT_STATUS.failed,
+        error_code: "intent_revision_stale",
+      });
+      await audit(d, {
+        action: "lease.apply.superseded",
+        direction: input.auditDirection ?? "local",
+        peer_panel_id: lease.peer_panel_id,
+        message_id: input.messageId ?? null,
+        status: 409,
+        detail: {
+          intent_id: input.intent_id,
+          lease_ref: lease.lease_ref,
+          revision: input.revision,
+          applied_revision: fresh.applied_revision,
+        },
+      });
+      return {
+        ok: false,
+        code: "intent_revision_stale",
+        message: `revision ${input.revision} was superseded by ${fresh.applied_revision} during apply; the newer runtime was left untouched`,
+      };
+    }
+
+    // (2) 同一 revision 已被另一次投递落库：这就是重投递，返回首次结果（同样不拆）。
+    if (fresh !== null && fresh.applied_revision === input.revision) {
+      await settleLeaseIntent(d.db, {
+        intent_id: input.intent_id,
+        revision: input.revision,
+        action: "apply",
+        status: INTENT_STATUS.ok,
+        lease_id: lease.id,
+      });
+      return {
+        ok: true,
+        state: "active",
+        applied_revision: input.revision,
+        lease_epoch: fresh.lease_epoch,
+        replayed: true,
+        node_ref: node.node_id,
+        port: fresh.listen_port ?? lease.listen_port,
+      };
+    }
+
+    // (3) 世代/状态真的变了（revoke / release / expire / epoch 前进）：刚建起来的 runtime 必须撤掉。
+    const outcome = await compensateFailedApply(d, lease, input.revision, "lease state changed concurrently during apply");
     return {
       ok: false,
-      code: compensated ? "duplicate_message" : "internal_error",
-      message: compensated
-        ? "lease state changed concurrently during apply; the freshly dispatched runtime was rolled back"
-        : "lease state changed concurrently during apply and the rollback failed; reconcile will retry",
+      code: outcome.compensated ? "duplicate_message" : outcome.superseded ? "intent_revision_stale" : "internal_error",
+      message: outcome.superseded
+        ? `revision ${input.revision} was superseded while applying; the newer runtime was left untouched`
+        : outcome.compensated
+          ? "lease state changed concurrently during apply; the freshly dispatched runtime was rolled back"
+          : "lease state changed concurrently during apply and the rollback failed; reconcile will retry",
     };
   }
 
@@ -1797,9 +1907,38 @@ export async function applyRemoteLease(input: ApplyRemoteLeaseInput, deps?: Leas
 /**
  * apply 失败/被抢的补偿：先撤 runtime（可能没建起来，Agent 对未知 id 是 no-op），
  * 再还端口，最后把行记 `failed` + 可解释原因。
- * 返回 true = 补偿完成（端口已归还、runtime 已确认撤下）。
+ *
+ * ── 被超越时**只记账不拆** ──
+ * 补偿前先重读：若这一行已经被**更晚**的 revision 应用（`applied_revision > failedRevision`），
+ * 那么 `tunex-fed-<ref>-<dir>` 这个 runtime 现在属于新的 revision。补偿用的 remove 是
+ * `revision = lease_epoch + 1`（必然通过 Agent 闸门），拆下去会把刚建好的健康链路干掉，
+ * 而库里还留着 `active@N` —— 静默的数据面中断。所以这种情况只写审计台账、**不调 teardown**、
+ * 也不把行改成 `failed`。
  */
-async function compensateFailedApply(d: ResolvedLeaseDeps, lease: FederationLeaseRow, message: string): Promise<boolean> {
+async function compensateFailedApply(
+  d: ResolvedLeaseDeps,
+  lease: FederationLeaseRow,
+  failedRevision: number,
+  message: string,
+): Promise<{ compensated: boolean; superseded: boolean }> {
+  const fresh = (await d.db.federationLease.findUnique({ where: { id: lease.id } })) as FederationLeaseRow | null;
+  if (fresh !== null && fresh !== undefined && fresh.applied_revision !== null && fresh.applied_revision > failedRevision) {
+    await audit(d, {
+      action: "lease.apply.superseded",
+      direction: "local",
+      peer_panel_id: lease.peer_panel_id,
+      status: 409,
+      detail: {
+        intent_id: lease.intent_id,
+        lease_ref: lease.lease_ref,
+        failed_revision: failedRevision,
+        applied_revision: fresh.applied_revision,
+        superseded_by: fresh.applied_revision,
+      },
+    });
+    return { compensated: false, superseded: true };
+  }
+
   const hopRole = (HOP_ROLES as readonly string[]).includes(lease.hop_role) ? (lease.hop_role as HopRole) : "egress";
   let stopped = true;
   let stopNote: string | null = null;
@@ -1829,15 +1968,26 @@ async function compensateFailedApply(d: ResolvedLeaseDeps, lease: FederationLeas
   }
 
   const ok = stopped && portReleased;
-  await d.db.federationLease.updateMany({
-    where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
+  // 这里的写入同样带 CAS 前提（含 applied_revision）：若在我们补偿期间又有新 revision 落库，
+  // 这次写入应当**失败**（0 行）而不是把新状态覆盖成 failed。
+  const marked = (await d.db.federationLease.updateMany({
+    where: {
+      id: lease.id,
+      lease_epoch: lease.lease_epoch,
+      state: lease.state,
+      applied_revision: lease.applied_revision ?? null,
+    },
     data: {
       state: "failed",
-      last_error_code: ok ? null : "internal_error",
+      last_error_code: ok ? null : stopped ? PORT_RELEASE_PENDING_CODE : "internal_error",
       last_error: ok ? `apply failed and was compensated: ${message}` : `apply failed; compensation pending: ${stopNote}`,
     },
-  });
-  return ok;
+  })) as { count: number };
+  if (marked.count === 0) {
+    // 补偿期间状态又变了：不覆盖（新状态的所有者会负责自己的收尾），如实报告未完成。
+    return { compensated: false, superseded: false };
+  }
+  return { compensated: ok, superseded: false };
 }
 
 /* ================================================================== */
@@ -2000,23 +2150,29 @@ export async function renewRemoteLease(
 
 export interface SweepRevokedResult {
   evaluated: number;
-  /** 确认停服成功的条数。 */
+  /** 本轮确认停服成功的条数（只统计真正调过 teardown 的行）。 */
   stopped: number;
   teardown_failed: number;
   ports_released: number;
   ports_pending: number;
+  /** 只补还端口、不需要再停服的行数（`expired`/`released`，或已带端口待还标记的 revoked 行）。 */
+  port_only_retried: number;
   skipped: number;
 }
 
 /**
- * 扫尾"已撤销但停服未确认"的租约（peer 撤销 / grant 撤销 / 到期时停服失败都会留下这种行）。
+ * 扫尾"终态但收尾未确认"的租约。两类：
+ *   1. `revoked` 且停服未确认（`peer_revoked` / `internal_error`）→ 补停服 + 还端口；
+ *   2. 只剩端口没还（`port_release_failed`），无论 state 是 `revoked` / `expired` / `released` → **只补还端口**。
  *
- * 为什么必须有它：撤销路径**先落状态再尽力停服**（fail-closed：拿不准时它必须停），
- * 于是"状态已 revoked、runtime 可能还在"是一个正常存在的中间态。没有这个扫尾，
- * 那条链路会永远留在库里，端口也永远不还——这正是"机制不存在"与"机制运行过但不生效"的差别。
+ * 为什么必须有它：撤销/到期路径**先落状态再尽力收尾**（fail-closed：拿不准时它必须停），
+ * 于是"状态已终态、runtime 可能还在 / 端口还没还"是正常存在的中间态。没有扫尾，这种行会
+ * 永远留在库里、端口也永远不还——"机制不存在"与"机制运行过但不生效"的区别就在这里。
  *
- * 幂等：确认完成后把 `last_error_code` 置空（它正是候选筛选条件），因此不会重复撤同一个 runtime；
- * Agent 对未知 id 的 remove 也是 no-op，重复撤也不会炸。
+ * 判据用的是**显式标记**（`PORT_RELEASE_PENDING_CODE` / `PEER_REVOKE_PENDING_CODE` /
+ * `internal_error`），不是"靠 state 猜"：schema 没有独立的"端口已归还"列，那就用一个
+ * 明确的码表达它，而不是第二个隐式约定。幂等：确认完成后标记被清空（不再是候选）；
+ * Agent 对未知 id 的 remove 也是 no-op，重复撤不会炸。
  */
 export async function sweepRevokedLeaseCleanup(
   options: { peer_panel_id?: string | null; now?: Date; limit?: number; deps?: LeaseHostDeps } = {},
@@ -2026,8 +2182,8 @@ export async function sweepRevokedLeaseCleanup(
 
   const candidates = (await d.db.federationLease.findMany({
     where: {
-      state: "revoked",
-      last_error_code: { in: ["peer_revoked", "internal_error"] },
+      last_error_code: { in: [PEER_REVOKE_PENDING_CODE, PORT_RELEASE_PENDING_CODE, "internal_error"] },
+      state: { in: ["revoked", "expired", "released"] },
       ...(options.peer_panel_id ? { peer_panel_id: options.peer_panel_id } : {}),
     },
     take: options.limit ?? EXPIRE_BATCH_LIMIT,
@@ -2039,53 +2195,62 @@ export async function sweepRevokedLeaseCleanup(
     teardown_failed: 0,
     ports_released: 0,
     ports_pending: 0,
+    port_only_retried: 0,
     skipped: 0,
   };
 
   for (const lease of candidates) {
-    if (lease.node_id === null && lease.listen_port === null) {
-      // 从来没落过节点端口（预留阶段就失败的行）：没有运行时也没有端口，直接确认收口。
+    const hasPort = lease.node_id !== null && lease.listen_port !== null;
+    // `revoked` + 端口待还标记 = 停服早就成功过，只剩端口；终态 expired/released 同理，不可能还需要拆。
+    const needsTeardown = lease.state === "revoked" && lease.last_error_code !== PORT_RELEASE_PENDING_CODE;
+
+    if (!needsTeardown && !hasPort) {
+      // 既没有要拆的 runtime 也没有要还的端口：直接确认收口。
       await d.db.federationLease.updateMany({
-        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
-        data: { last_error_code: null, last_error: `revoked without runtime; cleanup confirmed at ${now.toISOString()}` },
+        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
+        data: { last_error_code: null, last_error: `cleanup confirmed (nothing to stop or release) at ${now.toISOString()}` },
       });
       result.skipped++;
       continue;
     }
 
-    const hopRole = (HOP_ROLES as readonly string[]).includes(lease.hop_role) ? (lease.hop_role as HopRole) : "egress";
-    let stopped = false;
-    let note: string | null = null;
-    if (d.teardown === null) {
-      note = "teardown hook is not wired";
-    } else {
-      const res = await d.teardown({
-        lease_ref: lease.lease_ref,
-        peer_panel_id: lease.peer_panel_id,
-        intent_id: lease.intent_id,
-        node_id: lease.node_id,
-        listen_port: lease.listen_port,
-        hop_role: hopRole,
-        lease_epoch: lease.lease_epoch,
-        reason: "revoked",
-      });
-      stopped = res.ok;
-      if (!res.ok) note = res.message ?? "teardown failed";
-    }
+    if (!needsTeardown) result.port_only_retried++;
 
-    if (!stopped) {
-      result.teardown_failed++;
-      await d.db.federationLease.updateMany({
-        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
-        data: { last_error_code: "internal_error", last_error: note },
-      });
-      continue;
+    if (needsTeardown) {
+      const hopRole = (HOP_ROLES as readonly string[]).includes(lease.hop_role) ? (lease.hop_role as HopRole) : "egress";
+      let stopped = false;
+      let note: string | null = null;
+      if (d.teardown === null) {
+        note = "teardown hook is not wired";
+      } else {
+        const res = await d.teardown({
+          lease_ref: lease.lease_ref,
+          peer_panel_id: lease.peer_panel_id,
+          intent_id: lease.intent_id,
+          node_id: lease.node_id,
+          listen_port: lease.listen_port,
+          hop_role: hopRole,
+          lease_epoch: lease.lease_epoch,
+          reason: "revoked",
+        });
+        stopped = res.ok;
+        if (!res.ok) note = res.message ?? "teardown failed";
+      }
+      if (!stopped) {
+        result.teardown_failed++;
+        await d.db.federationLease.updateMany({
+          where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
+          data: { last_error_code: "internal_error", last_error: note },
+        });
+        continue;
+      }
+      result.stopped++;
     }
-    result.stopped++;
 
     let portReleased = true;
-    if (lease.node_id !== null && lease.listen_port !== null) {
-      const rel = await d.releasePort({ node_id: lease.node_id, port: lease.listen_port });
+    let note: string | null = null;
+    if (hasPort) {
+      const rel = await d.releasePort({ node_id: lease.node_id as number, port: lease.listen_port as number });
       portReleased = rel.ok;
       if (rel.ok) result.ports_released++;
       else {
@@ -2095,11 +2260,11 @@ export async function sweepRevokedLeaseCleanup(
     }
 
     await d.db.federationLease.updateMany({
-      where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
+      where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
       data: {
-        last_error_code: portReleased ? null : "internal_error",
+        last_error_code: portReleased ? null : PORT_RELEASE_PENDING_CODE,
         last_error: portReleased
-          ? `revoked: runtime stopped and port released (confirmed at ${now.toISOString()})`
+          ? `settled: runtime stopped and port released (confirmed at ${now.toISOString()})`
           : note,
       },
     });
@@ -2265,7 +2430,7 @@ export async function expireLeases(
       data: {
         state: "expired",
         released_at: now,
-        last_error_code: portReleased ? null : "internal_error",
+        last_error_code: portReleased ? null : PORT_RELEASE_PENDING_CODE,
         last_error: portReleased ? null : `port release pending: ${portMessage}`,
       },
     })) as { count: number };
@@ -2307,7 +2472,10 @@ let federationWired = false;
  */
 export function ensureFederationWiring(deps?: LeaseHostDeps): void {
   if (federationWired && deps === undefined) return;
-  registerFederationCascadeHooks({ teardown: defaultTeardown, releasePort: defaultReleasePort });
+  registerFederationCascadeHooks({
+  teardown: (input) => defaultTeardown(input, defaultLeaseDb),
+  releasePort: defaultReleasePort,
+});
   setFederationRevokedHook(async (peerPanelId: string) => {
     const cleanup = await sweepRevokedLeaseCleanup({ peer_panel_id: peerPanelId, deps });
     console.log(`[federation] peer ${peerPanelId} revoked: ${JSON.stringify(cleanup)}`);

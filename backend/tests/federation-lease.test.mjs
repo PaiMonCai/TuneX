@@ -21,6 +21,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   process.env.LICENSE_SECRET ??= "test-only-license-secret-must-not-be-used-in-production";
   process.env.PAYMENTS_ENABLED = "false";
 
+  const { randomUUID: uuid } = await import("node:crypto");
   const { db } = await import("../src/db.ts");
   // Redis 是 portPool 的并发锁通道（本文件会真的走 acquirePort）。它惰性连接但**不会自己退出**，
   // 不显式断开，node:test 会一直挂在事件循环上（与 workspace-db.test.mjs 同款收尾）。
@@ -427,11 +428,184 @@ if (process.env.TUNEX_DB_TEST !== "1") {
     assert.equal(portRows[0].status, "released");
   });
 
+  test("task-7 A: a revision superseded mid-dispatch neither rolls back nor tears down the newer runtime", async () => {
+    const grant = await makeGrant();
+    const runtime = runtimeStub();
+
+    const reserved = await reserve(grant, { deps: runtime.deps });
+    assert.equal(reserved.ok, true);
+    const ref = reserved.lease.lease_ref;
+    const port = reserved.port;
+
+    // revision 1 先落地（正常路径）。
+    const first = await applyRemoteLease(
+      { lease_ref: ref, intent_id: reserved.lease.intent_id, revision: 1, targets: [{ host: "203.0.113.9", port: 443 }] },
+      runtime.deps,
+    );
+    assert.equal(first.ok, true);
+
+    // revision 2 下发期间，revision 3 已经落库（并发）。补偿**不得**碰 runtime。
+    const racing = {
+      ...runtime.deps,
+      dispatch: async (input) => {
+        runtime.calls.dispatch.push(input);
+        await db.federationLease.update({ where: { lease_ref: ref }, data: { applied_revision: 3, state: "active" } });
+        return { ok: true };
+      },
+    };
+    const superseded = await applyRemoteLease(
+      { lease_ref: ref, intent_id: reserved.lease.intent_id, revision: 2, targets: [{ host: "203.0.113.9", port: 443 }] },
+      racing,
+    );
+
+    assert.equal(superseded.ok, false);
+    assert.equal(superseded.code, "intent_revision_stale");
+    assert.equal(runtime.calls.teardown.length, 0, "a superseded revision must not tear down the newer runtime");
+
+    const row = await db.federationLease.findUnique({ where: { lease_ref: ref } });
+    assert.equal(row.applied_revision, 3, "applied_revision must stay monotonic");
+    assert.equal(row.state, "active");
+    const portRows = await activePortLeases(port);
+    assert.equal(portRows[0].status, "active", "the port still belongs to the live lease");
+  });
+
+  test("task-7 D1: an expired lease whose port release failed is retried port-only by the sweeper", async () => {
+    const grant = await makeGrant();
+    const runtime = runtimeStub();
+
+    const reserved = await reserve(grant, { deps: runtime.deps, ttlSeconds: 1 });
+    assert.equal(reserved.ok, true);
+    const ref = reserved.lease.lease_ref;
+    const port = reserved.port;
+
+    const applied = await applyRemoteLease(
+      { lease_ref: ref, intent_id: reserved.lease.intent_id, revision: 1, targets: [{ host: "203.0.113.9", port: 443 }] },
+      runtime.deps,
+    );
+    assert.equal(applied.ok, true);
+
+    // 到期：停服成功，但还端口失败 → 必须留下显式标记，且状态照样收口。
+    const failingRelease = {
+      ...runtime.deps,
+      releasePort: () => ({ ok: false, message: "portPool is down" }),
+    };
+    const expired = await expireLeases({ now: new Date(Date.now() + 5_000), deps: failingRelease });
+    assert.equal(expired.expired >= 1, true);
+    assert.equal(expired.ports_pending >= 1, true);
+
+    const afterExpiry = await db.federationLease.findUnique({ where: { lease_ref: ref } });
+    assert.equal(afterExpiry.state, "expired");
+    assert.equal(afterExpiry.last_error_code, "port_release_failed");
+
+    // 下一拍扫尾：只补还端口（**不再**拆一次 runtime），随后标记清空。
+    const { sweepRevokedLeaseCleanup } = await import("../src/services/federation/lease.ts");
+    const teardownsBefore = runtime.calls.teardown.length;
+    const swept = await sweepRevokedLeaseCleanup({ now: new Date(Date.now() + 10_000), deps: runtime.deps });
+    assert.equal(swept.port_only_retried >= 1, true);
+    assert.equal(swept.ports_released >= 1, true);
+    assert.equal(runtime.calls.teardown.length, teardownsBefore, "the sweeper must not tear down an already-stopped runtime");
+
+    const settled = await db.federationLease.findUnique({ where: { lease_ref: ref } });
+    assert.equal(settled.last_error_code, null);
+    const portRows = await activePortLeases(port);
+    assert.equal(portRows[0].status, "released", "the port must really be returned on the retry");
+  });
+
+  test("task-7 B1: the reconnect resend payload is accepted by the real /leases handler (not a 400)", async () => {
+    const { createApp } = await import("../src/app.ts");
+    const { ensurePanelIdentity, setFederationEnabled, resetPanelIdentityCache } = await import(
+      "../src/services/federation/identity.ts"
+    );
+    const { buildSignatureHeaders } = await import("../src/services/federation/signing.ts");
+    const { generatePanelKeyPair } = await import("../src/services/federation/keys.ts");
+    const { upsertPlacement, reconcilePlacements } = await import("../src/services/federation/placement.ts");
+
+    const app = createApp();
+
+    // 我的"对端 panel"身份：与夹具里那条 trusted peer 共用（它拿着私钥，本机只存公钥）。
+    const keys = await generatePanelKeyPair();
+    await db.federationPeer.update({
+      where: { peer_panel_id: panelId },
+      data: { public_keys: [{ key_id: keys.key_id, jwk: keys.public_jwk, state: "active", not_after: null }] },
+    });
+    await ensurePanelIdentity();
+    await setFederationEnabled(true);
+    // 路由选点要求 120s 内有 state report。
+    await db.nodeStateReport.upsert({
+      where: { node_id: node.id },
+      create: { node_id: node.id, role: "egress", reported_at: new Date() },
+      update: { reported_at: new Date() },
+    });
+
+    // 已有一次预留（非终态）：路由按解析顺序 ② 就能找回 grant，无需 home 记得 grant_ref。
+    const grant = await makeGrant();
+    const runtime = runtimeStub();
+    const reserved = await reserve(grant, { deps: runtime.deps });
+    assert.equal(reserved.ok, true);
+
+    // 镜像行落后于期望 → 需要对账重发。
+    const mirrored = await upsertPlacement(
+      {
+        peer_panel_id: panelId,
+        forward_ref: `fwd-${nonce}`,
+        intent_id: reserved.lease.intent_id,
+        hop_role: "egress",
+        desired_revision: 2,
+        applied_revision: 1,
+        state: "active",
+        tunnel_id: null,
+      },
+      { db },
+    );
+    assert.equal(mirrored.ok, true);
+
+    const seen = [];
+    const signedSender = async (input) => {
+      const bodyStr = JSON.stringify(input.body ?? {});
+      const headers = await buildSignatureHeaders({
+        identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
+        privateJwk: keys.private_jwk,
+        body: bodyStr,
+        messageId: uuid(),
+      });
+      const res = await app.request(`http://panel.local${input.path}`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: bodyStr,
+      });
+      const json = await res.json().catch(() => null);
+      seen.push({ status: res.status, body: json, sent: input.body });
+      if (res.status < 400) return { ok: true, status: res.status, body: json, messageId: "resend-1" };
+      return {
+        ok: false,
+        code: json?.code ?? "internal_error",
+        status: res.status,
+        message: json?.message ?? `HTTP ${res.status}`,
+        retryable: Boolean(json?.retryable),
+        messageId: "resend-1",
+      };
+    };
+
+    const result = await reconcilePlacements({ deps: { db, sender: signedSender } });
+    assert.equal(seen.length, 1, `the mirror should have been resent exactly once, got ${JSON.stringify(seen)}`);
+    assert.notEqual(seen[0].status, 400, `the resend payload must parse (got ${JSON.stringify(seen[0])})`);
+    assert.notEqual(seen[0].body?.code, "message_malformed");
+    assert.equal(result.resent, 1);
+    assert.equal(result.degraded, 0);
+
+    // 收尾：关掉开关，避免影响同库的其它套件。
+    await setFederationEnabled(false);
+    resetPanelIdentityCache();
+    await db.federationPlacement.deleteMany({ where: { peer_panel_id: panelId } });
+  });
+
   /* ---------------- 清理 ---------------- */
 
   after(async () => {
     // 只清本文件造的夹具（按 id/前缀），避免影响同一个库里的其它测试。
     await db.federationLease.deleteMany({ where: { peer_panel_id: panelId } });
+    await db.federationPlacement.deleteMany({ where: { peer_panel_id: panelId } });
+    if (created.nodeId !== null) await db.nodeStateReport.deleteMany({ where: { node_id: created.nodeId } });
     await db.federationIntent.deleteMany({ where: { peer_panel_id: panelId } });
     await db.federationGrant.deleteMany({ where: { peer_id: created.peerId ?? -1 } });
     await db.federationPeer.deleteMany({ where: { peer_panel_id: panelId } });

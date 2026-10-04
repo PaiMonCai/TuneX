@@ -88,6 +88,15 @@ export function isLeaseState(state: string): state is LeaseState {
   return (LEASE_STATES as readonly string[]).includes(state);
 }
 
+/**
+ * `federation_lease.last_error_code` 里的**账本标记**（不是契约 §6 的错误码）：
+ * schema 没有独立的"端口已归还"指示位，于是用一个显式标记把"停服已成功、只剩还端口"
+ * 与"停服本身就失败"区分开。靠 state 或靠 last_error 的文案去猜，会在第一次改文案时失效。
+ */
+export const PORT_RELEASE_PENDING_CODE = "port_release_failed";
+/** `trust.ts` 的撤销级联留下的标记：租约已 revoked、停服尚未确认。 */
+export const PEER_REVOKE_PENDING_CODE = "peer_revoked";
+
 /** 跨面板动作台账里的动作（`federation_intent.action`，契约 §3.2 幂等键）。 */
 export const LEASE_INTENT_ACTIONS = ["create", "apply", "release", "renew"] as const;
 export type LeaseIntentAction = (typeof LEASE_INTENT_ACTIONS)[number];
@@ -1038,7 +1047,7 @@ async function cascadeRevokeLeases(
         await d.db.federationLease.updateMany({
           where: { id: lease.id, lease_epoch: lease.lease_epoch },
           data: {
-            last_error_code: "internal_error",
+            last_error_code: PORT_RELEASE_PENDING_CODE,
             last_error: "port release hook is not wired; port lease will be reclaimed by portPool reconcile",
           },
         });
@@ -1047,10 +1056,11 @@ async function cascadeRevokeLeases(
         if (rel.ok) portsReleased++;
         else {
           portsPending++;
+          // 停服已成功、只剩端口：用**显式标记**记着，扫尾据此只重试还端口而不是再拆一次 runtime。
           await d.db.federationLease.updateMany({
             where: { id: lease.id, lease_epoch: lease.lease_epoch },
             data: {
-              last_error_code: "internal_error",
+              last_error_code: PORT_RELEASE_PENDING_CODE,
               last_error: rel.message ?? "port release failed",
             },
           });

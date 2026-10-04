@@ -36,7 +36,7 @@ import {
   type LeaseDb,
   type LeaseHostDeps,
 } from "../federation/lease.ts";
-import { nextLeaseEpoch, type FederationAuditSink } from "../federation/grant.ts";
+import { PORT_RELEASE_PENDING_CODE, nextLeaseEpoch, type FederationAuditSink } from "../federation/grant.ts";
 import { resetOrchestrator, setOrchestrator } from "../relay-wiring.ts";
 import type { Orchestrator } from "../orchestrator.ts";
 import {
@@ -156,6 +156,7 @@ function makeLeaseDb(fx: { leases?: Row[]; intents?: Row[]; nodes?: Row[]; grant
     if (w.hop_role !== undefined && l.hop_role !== w.hop_role) return false;
     if (w.expires_at?.lte !== undefined && l.expires_at.getTime() > w.expires_at.lte.getTime()) return false;
     if (w.last_error_code?.in !== undefined && !w.last_error_code.in.includes(l.last_error_code)) return false;
+    if (w.applied_revision !== undefined && (l.applied_revision ?? null) !== w.applied_revision) return false;
     return true;
   }
 
@@ -283,6 +284,37 @@ function hooks(calls: { dispatch: Row[]; allocate: Row[]; releasePort: Row[]; te
     ...over,
   };
 }
+
+function applyFixture(over: Row = {}, leaseOver: Row = {}) {
+  const made = makeLeaseDb({
+    nodes: [nodeRow()],
+    grants: [leaseGrantRow()],
+    leases: [leaseRow({ state: "reserved", applied_revision: null, ...leaseOver })],
+  });
+  const events: Row[] = [];
+  const out = {
+    ...made,
+    events,
+    deps: {
+      ...hooks(made.calls),
+      db: made.db,
+      audit: (e: Row) => {
+        events.push(e);
+      },
+    },
+    input: {
+      lease_ref: "lease-1",
+      intent_id: "intent-1",
+      revision: 7,
+      targets: [{ host: "203.0.113.9", port: 443 }],
+      lb_strategy: "ROUND_ROBIN",
+      protocol: "tcp",
+      ...over,
+    },
+  };
+  return out;
+}
+
 
 function reserveInput(over: Row = {}) {
   return {
@@ -989,35 +1021,6 @@ describe("WP15 lease: a new revision of the same intent updates the lease instea
 /* ================================================================== */
 
 describe("WP15 lease: apply dispatches through the existing orchestrator seam", () => {
-  function applyFixture(over: Row = {}, leaseOver: Row = {}) {
-    const made = makeLeaseDb({
-      nodes: [nodeRow()],
-      grants: [leaseGrantRow()],
-      leases: [leaseRow({ state: "reserved", applied_revision: null, ...leaseOver })],
-    });
-    const events: Row[] = [];
-    const out = {
-      ...made,
-      events,
-      deps: {
-        ...hooks(made.calls),
-        db: made.db,
-        audit: (e: Row) => {
-          events.push(e);
-        },
-      },
-      input: {
-        lease_ref: "lease-1",
-        intent_id: "intent-1",
-        revision: 7,
-        targets: [{ host: "203.0.113.9", port: 443 }],
-        lb_strategy: "ROUND_ROBIN",
-        protocol: "tcp",
-        ...over,
-      },
-    };
-    return out;
-  }
 
   test("a reserved lease becomes active with applied_revision and the opaque node_ref", async () => {
     const f = applyFixture();
@@ -1209,11 +1212,108 @@ describe("WP15 lease: apply dispatches through the existing orchestrator seam", 
     }
   });
 
+  test("F1: an expired-but-uncollected lease is NOT reused (a revision update starts a new occupancy)", async () => {
+    const past = new Date(NOW.getTime() - 60_000);
+    const { db, leases, calls } = makeLeaseDb({
+      nodes: [nodeRow()],
+      grants: [leaseGrantRow()],
+      leases: [leaseRow({ state: "active", applied_revision: 7, lease_epoch: 4, expires_at: past })],
+    });
+    const outcome = await reserveRemoteLease(
+      reserveInput({ intent: intent({ revision: 8 }), appliedRevision: 7, previousEpoch: 4 }),
+      { ...hooks(calls), db, now: () => NOW },
+    );
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.reused).toBeUndefined();
+    expect(outcome.lease_epoch).toBe(5); // 谱系最大 4 → 新占用必须是 5
+    expect(leases).toHaveLength(2);
+    expect(leases[1].state).toBe("reserved");
+  });
+
+  test("C1: a non-numeric target weight is rejected instead of being silently dropped", async () => {
+    const f = applyFixture({ targets: [{ host: "203.0.113.9", port: 443, weight: "5" as unknown as number }] });
+    const outcome = await applyRemoteLease(f.input, f.deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("message_malformed");
+      expect(outcome.message).toContain("weight");
+    }
+    expect(f.calls.dispatch).toHaveLength(0);
+  });
+
   test("an unknown lease_ref is lease_not_found", async () => {
     const f = applyFixture({ lease_ref: "ghost" });
     const outcome = await applyRemoteLease(f.input, f.deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("lease_not_found");
+  });
+});
+
+/* ================================================================== */
+/* task-7 A：被超越的 revision 不得回退状态 / 不得拆掉新 runtime            */
+/* ================================================================== */
+
+describe("WP15 lease (task-7 A): a superseded revision never rolls state back nor tears down the newer runtime", () => {
+  test("A3-1/2: if a newer revision lands during our dispatch, we neither write back nor tear down", async () => {
+    const f = applyFixture({ revision: 8 }, { applied_revision: 7, state: "active" });
+    // 并发模拟：我们下发期间，revision 9 已经落库（同一个 runtimeId）。
+    const racing = {
+      ...f.deps,
+      dispatch: (i: Row) => {
+        f.calls.dispatch.push(i);
+        f.leases[0].applied_revision = 9;
+        f.leases[0].state = "active";
+        return { ok: true as const };
+      },
+    };
+    const outcome = await applyRemoteLease(f.input, racing);
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("intent_revision_stale");
+    // 关键断言 1：没有拆掉 revision 9 的 runtime。
+    expect(f.calls.teardown).toHaveLength(0);
+    // 关键断言 2：applied_revision 没有被写回 8（状态单调）。
+    expect(f.leases[0].applied_revision).toBe(9);
+    expect(f.leases[0].state).toBe("active");
+  });
+
+  test("A3-2: a dispatch failure on a superseded revision is recorded, not compensated", async () => {
+    const f = applyFixture({ revision: 8 }, { applied_revision: 7, state: "active" });
+    const racing = {
+      ...f.deps,
+      dispatch: (i: Row) => {
+        f.calls.dispatch.push(i);
+        // Agent 对旧 revision 回 409 stale 的同一时刻，新 revision 已落库。
+        f.leases[0].applied_revision = 9;
+        return { ok: false as const, message: "agent_rejected: stale revision" };
+      },
+    };
+    const outcome = await applyRemoteLease(f.input, racing);
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("intent_revision_stale");
+    expect(f.calls.teardown).toHaveLength(0);
+    expect(f.calls.releasePort).toHaveLength(0);
+    expect(f.leases[0].applied_revision).toBe(9);
+    // 被超越也留痕：审计里有 superseded 事实，台账里没有"我们成功过"的假记录。
+    expect(f.events.some((e) => e.action === "lease.apply.superseded")).toBe(true);
+  });
+
+  test("A3-2 对照：真正被撤销时仍然补偿（不是所有 CAS 失败都放过）", async () => {
+    const f = applyFixture({ revision: 8 }, { applied_revision: 7, state: "active" });
+    const revokedMidFlight = {
+      ...f.deps,
+      dispatch: (i: Row) => {
+        f.calls.dispatch.push(i);
+        f.leases[0].state = "revoked"; // 并发撤销
+        return { ok: true as const };
+      },
+    };
+    const outcome = await applyRemoteLease(f.input, revokedMidFlight);
+    expect(outcome.ok).toBe(false);
+    expect(f.calls.teardown).toHaveLength(1);
+    expect(f.calls.releasePort).toEqual([{ node_id: 5, port: 19001 }]);
   });
 });
 
@@ -1291,6 +1391,62 @@ describe("WP15 lease: renewal extends the deadline only while the grant still al
       expect(outcome.ok).toBe(false);
       if (!outcome.ok) expect(outcome.code).toBe(code);
     }
+  });
+});
+
+/* ================================================================== */
+/* task-7 D1：终态但端口未归还的行必须被下一拍补还                          */
+/* ================================================================== */
+
+describe("WP15 lease (task-7 D1): a terminal lease whose port was not returned is retried, port-only", () => {
+  test("expiry with a failing port release marks it, and the next sweep returns the port without re-tearing-down", async () => {
+    const { db, leases, calls } = makeLeaseDb({ leases: [leaseRow({ state: "active", expires_at: NOW })] });
+    const failingRelease = {
+      ...hooks(calls),
+      db,
+      releasePort: (i: Row) => {
+        calls.releasePort.push(i);
+        return { ok: false, message: "portPool is down" };
+      },
+    };
+    const first = await expireLeases({ now: NOW, deps: failingRelease });
+
+    expect(first.expired).toBe(1); // 停服成功 → 状态照样收口
+    expect(first.ports_pending).toBe(1);
+    expect(leases[0].state).toBe("expired");
+    expect(leases[0].last_error_code).toBe(PORT_RELEASE_PENDING_CODE);
+
+    const sweeping = { ...hooks(calls), db };
+    const swept = await sweepRevokedLeaseCleanup({ now: NOW, deps: sweeping });
+    expect(swept.evaluated).toBe(1);
+    expect(swept.port_only_retried).toBe(1);
+    expect(swept.ports_released).toBe(1);
+    expect(calls.teardown).toHaveLength(1); // 只有到期那一次；扫尾**没有**再拆一次
+    expect(leases[0].last_error_code).toBeNull();
+    expect(calls.releasePort).toEqual([
+      { node_id: 5, port: 19001 },
+      { node_id: 5, port: 19001 },
+    ]);
+
+    // 幂等：清空标记后不再是候选。
+    const again = await sweepRevokedLeaseCleanup({ now: NOW, deps: sweeping });
+    expect(again.evaluated).toBe(0);
+  });
+
+  test("a released lease with a pending port is also picked up, and a wired-but-failing port keeps the marker", async () => {
+    const { db, leases, calls } = makeLeaseDb({
+      leases: [leaseRow({ state: "released", applied_revision: 7, last_error_code: PORT_RELEASE_PENDING_CODE, last_error: "port release failed" })],
+    });
+    const stillFailing = { ...hooks(calls), db, releasePort: () => ({ ok: false, message: "still down" }) };
+    const swept = await sweepRevokedLeaseCleanup({ now: NOW, deps: stillFailing });
+    expect(swept.ports_pending).toBe(1);
+    expect(leases[0].last_error_code).toBe(PORT_RELEASE_PENDING_CODE);
+    expect(calls.teardown).toHaveLength(0); // released 行不需要再停服
+
+    const ok = { ...hooks(calls), db };
+    const swept2 = await sweepRevokedLeaseCleanup({ now: NOW, deps: ok });
+    expect(swept2.ports_released).toBe(1);
+    expect(leases[0].last_error_code).toBeNull();
   });
 });
 
@@ -1502,7 +1658,13 @@ describe("WP15 placement: the home mirror resends by (intent_id, revision) or de
     expect(result.resent).toBe(2);
     expect(calls.send).toHaveLength(2);
     expect(calls.send[0].path).toBe("/api/federation/v1/leases");
-    expect((calls.send[0].body as Row).intent_id).toBe("intent-1");
+    // B1：形状对齐 host 的 handler（`{grant_ref?, intent:{...}}`），且不假装记得 grant。
+    const sentBody = calls.send[0].body as Row;
+    expect(sentBody.intent.intent_id).toBe("intent-1");
+    expect(sentBody.intent.revision).toBe(7);
+    expect(sentBody.intent.hop_role).toBe("egress");
+    expect(sentBody.intent.forward_ref).toBe("fwd-1");
+    expect("grant_ref" in sentBody).toBe(false);
     expect(placements[0].state).toBe("active");
 
     const offline = makePlacementDb({

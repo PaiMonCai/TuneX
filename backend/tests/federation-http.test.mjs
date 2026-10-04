@@ -36,17 +36,60 @@ const { verifyHandshakeProof } = await import("../src/services/federation/tokens
 
 const APPLICATION = createApp();
 
+/**
+ * 本文件**只清理自己造的数据**。
+ *
+ * 教训：第一版直接 `deleteMany({})` 清空全部 federated 表 —— 结果在 `bun run test`
+ * （node --test 并行跑多个文件、共用同一个库）里把**别的文件**正在用的 peer 一起删了，
+ * 对端报 `peer ... is not known`。破坏性 reset 是共享库测试里的经典自杀行为：
+ * 它在单跑时"通过"，在全量时随机失败。所以 peer 一律带 `test-wp14-` 前缀，
+ * 只删这个命名空间下的行。
+ */
+const TEST_PEER_PREFIX = "test-wp14-";
+
 async function resetFederationTables() {
-  await db.federationUsageRecord.deleteMany({});
-  await db.federationIntent.deleteMany({});
-  await db.federationLease.deleteMany({});
-  await db.federationGrant.deleteMany({});
-  await db.federationPlacement.deleteMany({});
-  await db.federationMessageReceipt.deleteMany({});
-  await db.federationCredential.deleteMany({});
-  await db.federationPeer.deleteMany({});
-  await db.federationSetting.deleteMany({});
-  resetPanelIdentityCache();
+  const mine = await db.federationPeer.findMany({
+    where: { peer_panel_id: { startsWith: TEST_PEER_PREFIX } },
+    select: { id: true, peer_panel_id: true },
+  });
+  const ids = mine.map((p) => p.id);
+  const panelIds = mine.map((p) => p.peer_panel_id);
+  if (ids.length > 0) {
+    await db.federationLease.deleteMany({ where: { grant_id: { in: await grantIdsFor(ids) } } });
+    await db.federationGrant.deleteMany({ where: { peer_id: { in: ids } } });
+    await db.federationCredential.deleteMany({ where: { peer_id: { in: ids } } });
+  }
+  if (panelIds.length > 0) {
+    await db.federationMessageReceipt.deleteMany({ where: { peer_panel_id: { in: panelIds } } });
+    await db.federationPlacement.deleteMany({ where: { peer_panel_id: { in: panelIds } } });
+    await db.federationUsageRecord.deleteMany({ where: { peer_panel_id: { in: panelIds } } });
+    await db.federationIntent.deleteMany({ where: { peer_panel_id: { in: panelIds } } });
+    await db.federationLease.deleteMany({ where: { peer_panel_id: { in: panelIds } } });
+  }
+  await db.federationPeer.deleteMany({ where: { peer_panel_id: { startsWith: TEST_PEER_PREFIX } } });
+}
+
+async function grantIdsFor(peerIds) {
+  const rows = await db.federationGrant.findMany({ where: { peer_id: { in: peerIds } }, select: { id: true } });
+  return rows.map((r) => r.id);
+}
+
+/**
+ * 保证本机身份可用。**不删**身份行（那是全局共享状态，别的文件也在用）：
+ * 只有当它已经被**另一个 AUTH_SECRET** 加过密（解封失败）时才重建 —— 否则同一台机器上
+ * 换一次测试密钥就会让所有相关用例一起失败，而原因看起来像"签名坏了"。
+ */
+async function ensureIdentityForTest() {
+  const { loadSigningKey } = await import("../src/services/federation/identity.ts");
+  try {
+    await loadSigningKey();
+    return;
+  } catch {
+    await db.federationSetting.deleteMany({});
+    resetPanelIdentityCache();
+    await ensurePanelIdentity();
+    await loadSigningKey();
+  }
 }
 
 function req(path, init = {}) {
@@ -70,7 +113,7 @@ async function signedPost(path, body, keys, panelId, overrides = {}) {
 /** 造一个"对端 panel"：自己的密钥对 + 已在本机登记为 trusted 的 peer 行。 */
 async function makePeer(displayName = "Peer B") {
   const keys = await generatePanelKeyPair();
-  const panelId = crypto.randomUUID();
+  const panelId = `${TEST_PEER_PREFIX}${crypto.randomUUID()}`;
   const peer = await db.federationPeer.create({
     data: {
       peer_panel_id: panelId,
@@ -98,9 +141,9 @@ test.after(async () => {
 
 maybe("WP14 federation: 未开启时拒绝所有联邦端点（fail-closed）", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(false);
-  const { res } = await signedPost("/api/federation/v1/ping", {}, await generatePanelKeyPair(), crypto.randomUUID());
+  const { res } = await signedPost("/api/federation/v1/ping", {}, await generatePanelKeyPair(), `${TEST_PEER_PREFIX}${crypto.randomUUID()}`);
   // 开关关闭时连"验签"都不该发生：先拒，再谈身份。
   assert.equal(res.status, 403);
   const body = await res.json();
@@ -109,12 +152,12 @@ maybe("WP14 federation: 未开启时拒绝所有联邦端点（fail-closed）", 
 
 maybe("WP14 federation: 握手是一次性的，且响应能被 token 持有者验证", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
 
   const invite = await createInvitation({ display_name: "面板 A", endpoint_url: "http://127.0.0.1:18181" });
   const clientKeys = await generatePanelKeyPair();
-  const clientPanelId = crypto.randomUUID();
+  const clientPanelId = `${TEST_PEER_PREFIX}${crypto.randomUUID()}`;
 
   const handshakeBody = {
     peer_panel_id: clientPanelId,
@@ -153,7 +196,7 @@ maybe("WP14 federation: 握手是一次性的，且响应能被 token 持有者�
 
 maybe("WP14 federation: 签名请求可用；重复投递返回首次快照而不是再执行一次", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
   const peer = await makePeer();
 
@@ -174,7 +217,7 @@ maybe("WP14 federation: 签名请求可用；重复投递返回首次快照而�
 
 maybe("WP14 federation: 篡改 / 时钟偏移 / 未知 peer 都被拒", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
   const peer = await makePeer();
 
@@ -203,14 +246,14 @@ maybe("WP14 federation: 篡改 / 时钟偏移 / 未知 peer 都被拒", async ()
 
   // 3) 未知 panel
   const stranger = await generatePanelKeyPair();
-  const unknown = await signedPost("/api/federation/v1/ping", {}, stranger, crypto.randomUUID());
+  const unknown = await signedPost("/api/federation/v1/ping", {}, stranger, `${TEST_PEER_PREFIX}${crypto.randomUUID()}`);
   assert.equal(unknown.res.status, 403);
   assert.equal((await unknown.res.json()).code, "peer_unknown");
 });
 
 maybe("WP14 federation: 密钥轮转先通知后生效，旧钥匙在宽限期内仍可验签", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
   const peer = await makePeer();
   const nextKeys = await generatePanelKeyPair();
@@ -245,7 +288,7 @@ maybe("WP14 federation: 密钥轮转先通知后生效，旧钥匙在宽限期�
 
 maybe("WP14 federation: 撤销是终态，撤销后该 peer 的调用一律被拒", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
   const peer = await makePeer();
 
@@ -266,7 +309,7 @@ maybe("WP14 federation: 撤销是终态，撤销后该 peer 的调用一律被�
 
 maybe("WP14 federation: 瞬态失败不留回执快照（一次抖动不得被永久化）", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
   const peer = await makePeer();
 
@@ -298,7 +341,7 @@ maybe("WP14 federation: 瞬态失败不留回执快照（一次抖动不得被�
 
 maybe("WP14 federation: 握手不得清空对端地址（否则永远回呼不到对方）", async () => {
   await resetFederationTables();
-  await ensurePanelIdentity();
+  await ensureIdentityForTest();
   await setFederationEnabled(true);
 
   const INVITED_ENDPOINT = "http://panel-a.invalid:3000";
@@ -306,7 +349,7 @@ maybe("WP14 federation: 握手不得清空对端地址（否则永远回呼不�
   // 1) 对方没自报地址（空串）→ 必须保留邀请里登记的那个地址
   const invite = await createInvitation({ display_name: "面板 A", endpoint_url: INVITED_ENDPOINT });
   const clientKeys = await generatePanelKeyPair();
-  const clientPanelId = crypto.randomUUID();
+  const clientPanelId = `${TEST_PEER_PREFIX}${crypto.randomUUID()}`;
   const empty = await req("/api/federation/v1/handshake", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -326,7 +369,7 @@ maybe("WP14 federation: 握手不得清空对端地址（否则永远回呼不�
   // 2) 对方自报地址 → 采纳（新建一个 peer，避免复用已消费的 token）
   const invite2 = await createInvitation({ display_name: "面板 C", endpoint_url: INVITED_ENDPOINT });
   const keys2 = await generatePanelKeyPair();
-  const panel2 = crypto.randomUUID();
+  const panel2 = `${TEST_PEER_PREFIX}${crypto.randomUUID()}`;
   const advertised = await req("/api/federation/v1/handshake", {
     method: "POST",
     headers: { "content-type": "application/json" },
