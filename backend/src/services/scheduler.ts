@@ -1306,6 +1306,10 @@ export async function createRelayTunnel(
   });
   const planViolations = forwardRuntimePlanViolations(plan);
   if (planViolations.length > 0) {
+    // 注意：这是 `createRelayTunnel`（另一条编排），**不认识中间跳** —— 见 §9 里
+    // "两条编排里只有一条认识中间跳"的记录。这里保留它原来的内联拆除，不做半套改动：
+    // 把中间跳支持搬过来需要与 `reapplyRelayTunnel` 同等的一套（端口分配 + 中转腿 + 逆序拆除），
+    // 而那属于"先确认它是否可达"之后的事。
     await orchestrator
       .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
       .catch(() => {});
@@ -1726,6 +1730,8 @@ export async function reapplyRelayTunnel(
   // （实测：中间节点上报里 has_any=0 而客户端有数据）。创建路径是"知道中间跳"的第二条路。
   const middleNodeId = (row as { middle_node_id?: number | null }).middle_node_id ?? null;
   let middlePort: number | null = null;
+  /** 中间跳的节点事实（发出去之后供 teardownDispatched 逆序拆除）。 */
+  let transitNode: { id: number; node_id: string; connect_ip: string | null; role: "both" | "egress" | "ingress" | null } | null = null;
   if (middleNodeId != null) {
     const middleAlloc = await allocateTunnelPort(
       { nodeId: middleNodeId, direction: "egress", preferred: null, tunnelId, reservedPorts: [] },
@@ -1799,6 +1805,29 @@ export async function reapplyRelayTunnel(
   steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
   steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
 
+  /**
+   * 撤掉本次**已经发出去**的腿，逆序（先中间、后出口），并释放端口租约。
+   *
+   * 为什么要收敛成一个函数：这条路径原先在每个失败分支里各写一次 `removeTunnel(egress)`，
+   * 而 V5.4 新增了"中间跳"这条腿之后，**没有任何一个分支记得撤它** —— 实测症状是
+   * Agent 侧留下端口守卫（`port 22001 is already used by another tunnel`），DB 租约却已释放，
+   * 于是下一次分配又选中同一个端口、被 Agent 正确地拒绝，看起来像"端口分配有 bug"。
+   *
+   * 一个失败分支漏撤一条腿 = 一次永久性资源泄漏，而泄漏只在**下一次**创建时才显形。
+   * 所以它必须是一处、且必须逆序（正向先远后近 ⇒ 拆除先近后远）。
+   */
+  const teardownDispatched = async (reason: string): Promise<void> => {
+    if (transitNode != null) {
+      await orchestrator
+        .removeTunnel({ tunnelId, node: transitNode, direction: "egress", revision: revision + 1, reason: `${reason} (transit)` })
+        .catch(() => {});
+    }
+    await orchestrator
+      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason })
+      .catch(() => {});
+    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+  };
+
   // ── V5.4：中间跳（若有）──
   //
   // 与 rollout 路径**共用同一份实现**（`Orchestrator.dispatchTransit`）：编排可以有两处，
@@ -1810,10 +1839,7 @@ export async function reapplyRelayTunnel(
     const middleNode = (outCandidates as unknown as SchedulableNode[]).find((n) => n.id === middleNodeId)
       ?? (inCandidates as unknown as SchedulableNode[]).find((n) => n.id === middleNodeId);
     if (!middleNode) {
-      await orchestrator
-        .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "middle node missing" })
-        .catch(() => {});
-      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      await teardownDispatched("middle node missing");
       return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, `中间跳节点 ${middleNodeId} 不存在`, {
         revision,
       });
@@ -1832,13 +1858,16 @@ export async function reapplyRelayTunnel(
       protocol: reapplyProtocol,
     });
     if (!transit.ok) {
-      await orchestrator
-        .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "transit apply failed" })
-        .catch(() => {});
-      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      await teardownDispatched("transit apply failed");
       return fail("apply_transit", mapDispatchCode("egress", transit), transit.error, { revision });
     }
     transitHost = transit.host;
+    transitNode = {
+      id: middleNode.id,
+      node_id: String(middleNode.node_id ?? middleNode.id),
+      connect_ip: (middleNode.connect_ip as string | null) ?? null,
+      role: (middleNode.role as "both" | "egress" | "ingress" | null) ?? null,
+    };
     steps.push({ step: "apply_transit", ok: true, meta: { middle_node_id: middleNodeId, port: middlePort } });
   }
 
@@ -1865,10 +1894,7 @@ export async function reapplyRelayTunnel(
   });
   const planViolations = forwardRuntimePlanViolations(plan);
   if (planViolations.length > 0) {
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    await teardownDispatched("runtime plan invalid");
     return fail(
       "apply_ingress",
       SCHEDULER_ERROR_CODES.invariant_violated,
@@ -1888,10 +1914,7 @@ export async function reapplyRelayTunnel(
     ...tlsPathsFor(row, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, revision: revision + 1, reason: "ingress apply failed" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    await teardownDispatched("ingress apply failed");
     return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
       revision,
       meta: { command_id: ingressDispatch.commandId ?? null },

@@ -224,6 +224,12 @@ def g4_3_failure_names_the_hop():
         return
     row = tunnel_row(fid)
     port = int(row.get("listen_port") or 0)
+    # **先断言它曾经在服务**。没有这一条，"停掉中间跳 → 客户端失败"在**路由根本没通**时也会通过，
+    # 于是一条完全不可用的路由反而让这条断言变成假阳性（实测发生过）。断言的强弱决定它能否
+    # 区分两种世界：这里的两种世界是"中间跳在链路上"与"中间跳根本不在链路上"。
+    was_serving = H.wait_until(lambda: relay_serves(ING, port)[0], timeout=SERVE_TIMEOUT, interval=8)
+    check(was_serving, "G4.3 the route is serving BEFORE the middle hop is taken down",
+          f"port={port}（若这里就不通，说明三跳根本没建立，后面的断言没有意义）")
     H.docker(["stop", container], allow=True, timeout=120)
     H.mid_stopped = True
     # 中间跳消失后客户端必须失败（否则说明流量绕过了它，那"三跳"就不是真的）。
