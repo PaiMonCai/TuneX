@@ -710,15 +710,20 @@ export class Orchestrator {
       order: t.order_by ?? (i + 1) * 10,
     }));
 
+    // V5.3 —— EGRESS **不认领归属**。
+    //
+    // 归属（placement ownership）属于**承载该 Forward 的那台入口节点**：RELAY 下客户端连的是入口
+    // listener，被降级时必须停止服务的也是它。出口节点是一份**资源**（它只服务入口节点的流量），
+    // 不是归属持有者。
+    //
+    // 第一版让出口腿也认领，于是出现一个自锁式的假故障：租约由入口节点（3）持有，出口侧向出口节点
+    // （4）认领被两阶段规则正确地拒绝，**整条重发路径因此永久失败**（实测 `failed: 1`、池永远不更新）。
+    // 规则没错，是问错了对象。
+
     // V5.2 WP7: the synthesized health travels BESIDE the desired targets, and a
     // failure to read it must never block a rollout — health is an optimization for
     // selection order, not a gate on whether a Forward may run. So a failure becomes
     // "no signal" (absent array), which the agent treats exactly like an older panel.
-    const ownership = await this.claimOwnership(input.tunnelId, input.egressNode.id, input.revision);
-    if (!ownership.ok) {
-      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
-    }
-
     let targetHealth: AgentTunnelConfig["target_health"];
     try {
       const health = await this.healthSource(input.targets.map((t) => ({ host: t.host, port: t.port })));
@@ -741,7 +746,6 @@ export class Orchestrator {
       // Absent when there is no signal at all, so the wire says "nothing to say"
       // rather than "every target is unknown".
       ...(targetHealth ? { target_health: targetHealth } : {}),
-      ...ownership.fields,
       lb_strategy: normalizeLbStrategy(input.lbStrategy),
       protocol,
       speed_limit: 0,
@@ -786,6 +790,8 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
 
   async dispatchIngress(input: DispatchIngressInput): Promise<RelayDispatchOutcome> {
+    // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须
+    // 停止服务的也是它），所以认领发生在这里，而不是在出口腿。
     const relayId = Orchestrator.relayTunnelId(input.tunnelId);
     const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
@@ -804,6 +810,13 @@ export class Orchestrator {
     }
 
     // The RELAY listener is client-facing, so this is where TLS terminates.
+    // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须停止
+    // 服务的也是它），所以认领发生在这里，而不是在出口腿 —— 出口节点是一份资源，不是归属持有者。
+    const ownership = await this.claimOwnership(input.tunnelId, input.ingressNode.id, input.revision);
+    if (!ownership.ok) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
+    }
+
     const tlsFields = Orchestrator.tlsFields(protocol, input);
     const config: AgentTunnelConfig = {
       id: relayId,
@@ -819,6 +832,7 @@ export class Orchestrator {
       speed_limit: 0,
       revision: input.revision,
       ...tlsFields,
+      ...ownership.fields,
     };
 
     const envelope = createCommand({
