@@ -784,6 +784,7 @@ export async function ensureForwardBaselineRevision(
         forward_protocol: true,
         ingress_node_id: true,
         egress_node_id: true,
+        middle_node_id: true,
         listen_ip: true,
         listen_port: true,
         remote_host: true,
@@ -833,6 +834,7 @@ export async function ensureForwardBaselineRevision(
             protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
+            middle_node_id: row.middle_node_id,
             listen_ip: row.listen_ip,
             listen_port: row.listen_port,
             target_host: row.tunnel_mode === "direct" ? row.remote_host : null,
@@ -943,6 +945,7 @@ export async function createForwardRevision(
           protocol,
           ingress_node_id: input.candidate.ingress_node_id,
           egress_node_id: input.candidate.egress_node_id,
+          middle_node_id: input.candidate.middle_node_id ?? null,
           listen_ip: input.resolvedListenIp ?? row.listen_ip,
           listen_port: input.candidate.listen_port,
           target_host: input.candidate.mode === "direct" ? input.candidate.target_host : null,
@@ -978,6 +981,7 @@ export async function createForwardRevision(
         forward_protocol: protocol,
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,
+        middle_node_id: input.candidate.middle_node_id ?? null,
         // 自动分配时保留当前 concrete port（编排器 apply 后再写回确切值）：
         // 把它清成 null 会让 reconciler 在「尚未 apply」的窗口里读到残缺状态。
         listen_port: input.candidate.listen_port ?? row.listen_port,
