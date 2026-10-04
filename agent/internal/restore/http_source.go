@@ -71,6 +71,25 @@ type tunnelPayload struct {
 	// node restart while create and hot reload were fine).
 	TLSCertPath string `json:"tls_cert_path"`
 	TLSKeyPath  string `json:"tls_key_path"`
+	// V5.2 WP7: the health facts that travel with the desired targets.
+	//
+	// They MUST be decoded here, and this is the third time in V5 that a new fact
+	// needed adding on a second path (the protocol, then the tls paths, now health):
+	// this payload is what an Agent rebuilds from after every restart, so a decoder
+	// that drops the field turns a working circuit breaker into a silent 50/50 split
+	// onto a target the panel already called unhealthy — which is precisely what
+	// V5-G2 measured before this line existed.
+	TargetHealth []targetHealthPayload `json:"target_health"`
+}
+
+// targetHealthPayload is one entry of the parallel health array.
+type targetHealthPayload struct {
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	State     string `json:"state"`
+	LatencyMS *int64 `json:"latency_ms"`
+	AgeMS     *int64 `json:"age_ms"`
+	Evidence  bool   `json:"evidence"`
 }
 
 // FetchSnapshot implements Source with the strict classification above.

@@ -487,3 +487,27 @@ func TestRestoreInstallsHealthFromTheSnapshot(t *testing.T) {
 		t.Fatal("restore must fall back to the health-less path when the snapshot carries no health")
 	}
 }
+
+// V5.2 WP7 —— 快照解码器必须认识 `target_health`。
+//
+// 这是 V5 里第三次"新事实有两条入口、只补了一条"（先是协议，然后证书路径，现在是健康）。
+// 解码器丢掉这个字段的症状特别隐蔽：Agent 每次重启都从快照重建 runtime，健康静默消失，
+// 熔断器失效，而客户端连接只是"有时候失败"——看起来像网络抖动，不像配置问题。
+func TestSnapshotDecoderKnowsTargetHealth(t *testing.T) {
+	entries := decodeTargetHealth([]targetHealthPayload{
+		{Host: "a.example.com", Port: 443, State: "unhealthy"},
+		{Host: "b.example.com", Port: 443, State: "healthy"},
+		{Host: "", Port: 443, State: "healthy"},   // 没有地址 → 丢掉（无法归属）
+		{Host: "c.example.com", Port: 0, State: "healthy"}, // 没有端口 → 丢掉
+	})
+	if len(entries) != 2 {
+		t.Fatalf("decoded %d health entries, want 2 (addressable ones only)", len(entries))
+	}
+	if entries[0].Host != "a.example.com" || entries[0].State != "unhealthy" {
+		t.Fatalf("first entry lost its fact: %+v", entries[0])
+	}
+	// 没有健康条目时返回 nil，而不是空切片：调用方据此走"没有信号"的分支。
+	if got := decodeTargetHealth(nil); got != nil {
+		t.Fatalf("no entries must decode to nil (no signal), got %v", got)
+	}
+}
