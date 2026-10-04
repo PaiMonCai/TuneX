@@ -219,3 +219,52 @@ export function attributeFailure(
   const hop = plan.hops.find((h) => h.node_id === failedNodeId);
   return hop ? { hop_index: hop.hop_index, node_id: hop.node_id } : null;
 }
+
+/* ================================================================== */
+/* 下发前的路由准入（fail-closed）                                      */
+/* ================================================================== */
+
+export type RouteAdmission =
+  | { ok: true; plan: RoutePlan; hop_indices: readonly number[] }
+  | { ok: false; code: "route_invalid" | "route_not_dispatchable"; error: string; violation?: RouteViolation };
+
+/**
+ * 下发前判定这条路由**能不能**按当前实现发出去。
+ *
+ * 为什么必须在这里拒绝而不是"先按单跳发出去"：`middle_node_id` 非空意味着用户要的是三跳。
+ * 如果实现只发单跳形状，转发**会正常工作，但走的是另一条路** —— 没有任何错误、没有告警，
+ * 只有拓扑与用户配置不一致。这类"静默地做了别的事"是本项目最贵的一类缺陷，因此这里
+ * **fail-closed**：未实现的多跳一律拒绝，并且错误里点名"哪一跳"和"哪个约束"。
+ *
+ * `boundPairs` 由调用方作为事实传入（相邻跳必须有 NodeBinding）；本函数不读库。
+ */
+export function admitRoute(
+  placement: RoutePlacement,
+  boundPairs: ReadonlySet<string>,
+  opts: { multiHopImplemented?: boolean } = {},
+): RouteAdmission {
+  const plan = buildRoutePlan(placement);
+  if (plan === null) {
+    return { ok: false, code: "route_invalid", error: "路由放置事实不完整或自相矛盾（缺入口/出口，或中间跳与端点重合）" };
+  }
+  const violations = routeViolations(plan, boundPairs);
+  if (violations.length > 0) {
+    return {
+      ok: false,
+      code: "route_invalid",
+      error: `路由校验未通过：${[...new Set(violations)].join(", ")}`,
+      violation: violations[0],
+    };
+  }
+  // 三跳 = 存在中间跳。除非调用方明确声明多跳下发已实现，否则拒绝。
+  if (plan.middle_node_id !== null && opts.multiHopImplemented !== true) {
+    return {
+      ok: false,
+      code: "route_not_dispatchable",
+      error:
+        `该转发配置了中间跳（hop 1 = 节点 ${plan.middle_node_id}，共 ${plan.hops.length} 跳），` +
+        "但多跳下发尚未实现（WP12）。拒绝下发以避免静默地按单跳工作",
+    };
+  }
+  return { ok: true, plan, hop_indices: plan.hops.map((h) => h.hop_index) };
+}

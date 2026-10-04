@@ -180,6 +180,15 @@ export type RelayDispatchOutcome =
  * 映射，这里只报协议层能区分的东西）。
  */
 export const RELAY_DISPATCH_ERROR_CODES = {
+  /**
+   * V5.4：路由本身不合法，或**尚未实现的形状**。
+   *
+   * 这是一个"宁可拒绝"的错误码，不是临时占位：`middle_node_id` 一旦非空，`RoutePlan`
+   * 就是三跳，而当前下发链路只会发出单跳形状的配置。若在这里放行，用户配了中间跳之后
+   * 转发会**静默地按单跳工作** —— 那正是本项目反复吃亏的一类失败（配置生效了，但不是
+   * 用户要的那条路）。实现 WP12 之前，多跳必须在这里被明确拒绝并点名原因。
+   */
+  route_not_dispatchable: "route_not_dispatchable",
   /** 命令明确未建立可用管理面连接：DNS / 连接拒绝等。 */
   agent_unreachable: "agent_unreachable",
   /** outbound command 已入队，但同步等待窗口内没有收到 ACK；执行结果未知。 */

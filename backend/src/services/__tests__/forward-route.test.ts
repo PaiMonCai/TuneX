@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   MAX_ROUTE_HOPS,
+  admitRoute,
   attributeFailure,
   buildRoutePlan,
   compensationSteps,
@@ -107,5 +108,61 @@ describe("V5.4: adjacency needs a binding, and errors name the hop", () => {
     const plan = relay({ middle_node_id: 5 })!;
     expect(attributeFailure(plan, 5)).toEqual({ hop_index: 1, node_id: 5 });
     expect(attributeFailure(plan, 999)).toBeNull();
+  });
+});
+
+describe("V5.4: a route that cannot be dispatched is REFUSED, not silently degraded", () => {
+  test("a single-hop route is admitted regardless of bindings", () => {
+    const relayPlacement = {
+      ingress_node_id: 3, egress_node_id: 4, middle_node_id: null, tunnel_mode: "relay" as const, revision: 1,
+    };
+    const admitted = admitRoute(relayPlacement, new Set());
+    expect(admitted.ok).toBe(true);
+  });
+
+  test("a configured middle hop is refused while multi-hop dispatch is unimplemented", () => {
+    // 这是本阶段最重要的一条：`middle_node_id` 非空意味着用户要三跳，而当前下发只会发出
+    // 单跳形状 —— 放行的话转发**会正常工作，但走的是另一条路**，没有任何错误。因此拒绝。
+    const admitted = admitRoute(
+      { ingress_node_id: 3, egress_node_id: 4, middle_node_id: 5, tunnel_mode: "relay", revision: 1 },
+      new Set(["3->5", "5->4"]),
+    );
+    expect(admitted.ok).toBe(false);
+    if (!admitted.ok) {
+      expect(admitted.code).toBe("route_not_dispatchable");
+      // 错误必须点名"哪一跳"—— 三跳下"这条转发失败了"无法定位。
+      expect(admitted.error).toContain("hop 1");
+      expect(admitted.error).toContain("节点 5");
+    }
+  });
+
+  test("multi-hop is admitted once the caller declares it implemented", () => {
+    const admitted = admitRoute(
+      { ingress_node_id: 3, egress_node_id: 4, middle_node_id: 5, tunnel_mode: "relay", revision: 1 },
+      new Set(["3->5", "5->4"]),
+      { multiHopImplemented: true },
+    );
+    expect(admitted.ok).toBe(true);
+    if (admitted.ok) expect(admitted.hop_indices).toEqual([0, 1, 2]);
+  });
+
+  test("a multi-hop route whose neighbours are not bound is route_invalid, not just refused", () => {
+    // 两种拒绝必须可区分：一个是"这个形状还没做"，一个是"这个配置根本不合法"。
+    const admitted = admitRoute(
+      { ingress_node_id: 3, egress_node_id: 4, middle_node_id: 5, tunnel_mode: "relay", revision: 1 },
+      new Set(),
+      { multiHopImplemented: true },
+    );
+    expect(admitted.ok).toBe(false);
+    if (!admitted.ok) expect(admitted.code).toBe("route_invalid");
+  });
+
+  test("contradictory placement facts are refused before anything else", () => {
+    const admitted = admitRoute(
+      { ingress_node_id: 3, egress_node_id: null, middle_node_id: null, tunnel_mode: "relay", revision: 1 },
+      new Set(),
+    );
+    expect(admitted.ok).toBe(false);
+    if (!admitted.ok) expect(admitted.code).toBe("route_invalid");
   });
 });
