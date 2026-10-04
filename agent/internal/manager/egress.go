@@ -57,12 +57,73 @@ func (p *Pool) Select() forwarder.Target {
 // SwapTargets replaces the pool contents under the write lock. An empty/invalid
 // target list is ignored rather than clearing the pool: losing the pool would
 // black-hole every egress tunnel on the node.
+//
+// It carries no health, so it clears the pool's health view (see
+// LoadBalancer.UpdateTargets): a target-only update says nothing about how the
+// panel judges the pool.
 func (p *Pool) SwapTargets(strategy Strategy, targets []forwarder.Target) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// The empty-list guard lives inside UpdateTargets; passing it straight
 	// through keeps the balancer the single owner of the validation rules.
 	p.balancer.UpdateTargets(strategy, targets)
+}
+
+// SwapTargetsAndHealth installs both parallel arrays of one egress dispatch
+// payload: the desired targets and the panel's health facts (§7.3). Keeping
+// them one call makes it hard to apply half a payload by accident, and it is
+// the call the command path uses for an EGRESS apply.
+func (p *Pool) SwapTargetsAndHealth(strategy Strategy, targets []forwarder.Target, health []forwarder.TargetHealth) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.balancer.UpdateTargetsAndHealth(strategy, targets, health)
+}
+
+// SetHealth installs the panel's health facts for this pool without touching
+// the desired targets. nil/empty means "no health signal" and switches the
+// WP7 mechanism off for the pool.
+func (p *Pool) SetHealth(health []forwarder.TargetHealth) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.balancer.UpdateHealth(health)
+}
+
+// ReportDial implements forwarder.TargetReporter: the running egress forwarder
+// hands back the outcome of the dial it just made, which is the only evidence
+// that can resolve a half-open probe. A pool without health facts has no
+// breaker, so the outcome is dropped (the WP5 ledger still records it).
+func (p *Pool) ReportDial(t forwarder.Target, ok bool) {
+	p.mu.RLock()
+	balancer := p.balancer
+	p.mu.RUnlock()
+	balancer.reportDial(t, ok)
+}
+
+// ForcedPicks returns how many connections this pool served while nothing was
+// admissible (every target open or mid-probe) — the §7.3 "still pick the
+// least-bad, and record it" fact.
+func (p *Pool) ForcedPicks() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.balancer.ForcedPicks()
+}
+
+// BreakerStates reports the pool's per-target breaker view (empty when the pool
+// has never received health).
+func (p *Pool) BreakerStates() []BreakerState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.balancer.BreakerStates()
+}
+
+// SetBreakerBounds installs the breaker bounds and clock of this pool's
+// balancer. Production uses the frozen defaults; the seam exists for tests and
+// for an operator deliberately deviating from §7.3.
+func (p *Pool) SetBreakerBounds(bounds BreakerBounds) {
+	p.mu.RLock()
+	balancer := p.balancer
+	p.mu.RUnlock()
+	balancer.SetBreakerBounds(bounds)
 }
 
 // Targets returns a copy of the pool (for /health and tests).
@@ -104,6 +165,11 @@ type PoolSnapshot struct {
 	TunnelID string   `json:"tunnel_id"`
 	Strategy string   `json:"strategy"`
 	Targets  []string `json:"targets"`
+	// ForcedPicks is the WP7 "nothing was admissible, so the least-bad target
+	// was served anyway" count (§7.3 requires that trade to be recorded). A
+	// non-zero value is not an error — refusing to pick anything is the worse
+	// failure — but it is the number an operator wants when a pool looks slow.
+	ForcedPicks uint64 `json:"forced_picks,omitempty"`
 }
 
 // EgressManager owns the egress side of the node: the target pools of the EGRESS
@@ -163,6 +229,31 @@ func (e *EgressManager) UpdateTargets(tunnelID string, strategy Strategy, target
 	}
 	p.SwapTargets(strategy, targets)
 	return nil
+}
+
+// UpdateTargetsAndHealth hot-updates one tunnel's pool from a dispatch payload
+// that carried both parallel arrays (§7.3): the desired targets and the panel's
+// health facts. It is the health-aware sibling of UpdateTargets, and the one the
+// EGRESS command path uses.
+func (e *EgressManager) UpdateTargetsAndHealth(tunnelID string, strategy Strategy, targets []forwarder.Target, health []forwarder.TargetHealth) error {
+	e.mu.RLock()
+	p, ok := e.pools[tunnelID]
+	e.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrPoolNotFound, tunnelID)
+	}
+	p.SwapTargetsAndHealth(strategy, targets, health)
+	return nil
+}
+
+// SetPoolAndHealth creates or replaces the pool for tunnelID together with the
+// health facts that arrived in the same payload. It is SetPool plus SetHealth,
+// kept as one call so a dispatch cannot install the desired targets and forget
+// the health that came with them.
+func (e *EgressManager) SetPoolAndHealth(tunnelID string, strategy Strategy, targets []forwarder.Target, health []forwarder.TargetHealth) *Pool {
+	p := e.SetPool(tunnelID, strategy, targets)
+	p.SetHealth(health)
+	return p
 }
 
 // DropPool removes a tunnel's pool (called when the tunnel is removed).
@@ -276,12 +367,26 @@ func (e *EgressManager) Snapshot() map[string]PoolSnapshot {
 	out := make(map[string]PoolSnapshot, len(e.pools))
 	for id, p := range e.pools {
 		out[id] = PoolSnapshot{
-			TunnelID: id,
-			Strategy: string(p.balancer.Strategy()),
-			Targets:  p.balancer.Addrs(),
+			TunnelID:    id,
+			Strategy:    string(p.balancer.Strategy()),
+			Targets:     p.balancer.Addrs(),
+			ForcedPicks: p.balancer.ForcedPicks(),
 		}
 	}
 	return out
+}
+
+// BreakerStates returns the WP7 breaker view of one tunnel's pool, ordered by
+// target. It is empty for an unknown tunnel and for a tunnel whose pool has
+// never received health — "no data" is the honest answer in both cases.
+func (e *EgressManager) BreakerStates(tunnelID string) []BreakerState {
+	e.mu.RLock()
+	p, ok := e.pools[tunnelID]
+	e.mu.RUnlock()
+	if !ok {
+		return []BreakerState{}
+	}
+	return p.BreakerStates()
 }
 
 // Compile-time proof that a pool is a forwarder.TargetSelector.

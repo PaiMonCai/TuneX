@@ -469,17 +469,25 @@ func (c *Client) prepareEgressPool(cfg forwarder.TunnelConfig) (func(), error) {
 				oldStrategy = parsed
 			}
 		}
-		if err := c.egress.UpdateTargets(cfg.ID, strategy, cfg.Targets); err != nil {
+		// Both arrays travel in the same payload (§7.3): the desired targets
+		// and the panel's health facts, applied together so the health-aware
+		// mechanism never runs against a pool it was not computed for.
+		if err := c.egress.UpdateTargetsAndHealth(cfg.ID, strategy, cfg.Targets, cfg.TargetHealth); err != nil {
 			return func() {}, err
 		}
 		return func() {
 			if len(oldTargets) > 0 {
+				// The rollback restores what this agent can still know: the
+				// previous desired targets and strategy. The previous health
+				// facts are NOT retained (health is a live fact, never cached —
+				// §7.3), so the rollback clears them, which is the safe
+				// direction: a missing breaker behaves like the pre-WP7 agent.
 				_ = c.egress.UpdateTargets(cfg.ID, oldStrategy, oldTargets)
 			}
 		}, nil
 	}
 
-	c.egress.SetPool(cfg.ID, strategy, cfg.Targets)
+	c.egress.SetPoolAndHealth(cfg.ID, strategy, cfg.Targets, cfg.TargetHealth)
 	return func() { c.egress.DropPool(cfg.ID) }, nil
 }
 

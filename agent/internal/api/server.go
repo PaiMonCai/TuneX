@@ -351,10 +351,16 @@ func (s *Server) handleRemoveTunnel(w http.ResponseWriter, r *http.Request) {
 }
 
 // targetsRequest is the PATCH /node/targets body.
+//
+// TargetHealth is the V5.2-WP7 parallel array (§7.3): the same predicate the
+// control-plane dispatch carries, so the local hot-update surface cannot apply
+// the desired targets while silently discarding the health that came with them.
+// Absent means "no health signal" and restores the pre-WP7 behaviour.
 type targetsRequest struct {
-	TunnelID string             `json:"tunnel_id"`
-	Strategy manager.Strategy   `json:"strategy"`
-	Targets  []forwarder.Target `json:"targets"`
+	TunnelID     string                   `json:"tunnel_id"`
+	Strategy     manager.Strategy         `json:"strategy"`
+	Targets      []forwarder.Target       `json:"targets"`
+	TargetHealth []forwarder.TargetHealth `json:"target_health,omitempty"`
 }
 
 func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
@@ -380,7 +386,7 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "tunnel_id is required")
 		return
 	}
-	if err := s.egress.UpdateTargets(req.TunnelID, req.Strategy, req.Targets); err != nil {
+	if err := s.egress.UpdateTargetsAndHealth(req.TunnelID, req.Strategy, req.Targets, req.TargetHealth); err != nil {
 		if errors.Is(err, manager.ErrPoolNotFound) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return

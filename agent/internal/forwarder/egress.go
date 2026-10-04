@@ -241,6 +241,15 @@ func (f *EgressForwarder) Start() error {
 		start := time.Now()
 		raw, err := net.DialTimeout("tcp", addr, dialTimeout)
 		health.recordDial(t, time.Since(start), err)
+		// V5.2-WP7: hand the outcome back to the selector when it asks for it.
+		// The selector may be running a circuit breaker, and a half-open probe
+		// can only be resolved by a real connection result — there is no other
+		// honest source. A selector without this capability is simply never
+		// told, which is why the assertion is optional and the call sits after
+		// the ledger (WP5's record is unconditional; WP7's feedback is not).
+		if reporter, ok := sel.(TargetReporter); ok {
+			reporter.ReportDial(t, err == nil)
+		}
 		if err != nil {
 			return nil, err
 		}

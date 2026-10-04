@@ -234,6 +234,122 @@ func (t Target) Addr() string {
 
 func (t Target) usable() bool { return strings.TrimSpace(t.Host) != "" && validPort(t.Port) }
 
+// Key returns the identity a target and its health entry are joined on.
+func (t Target) Key() string { return TargetKey(t.Host, t.Port) }
+
+// TargetKey is the ONE identity two facts about the same upstream are joined
+// on (V5.2-WP7's parallel arrays, §7.3).
+//
+// It is deliberately not Addr(): the panel's target identity normalises a host
+// before publishing it (`targetKeyOf` in node-state.ts trims, lower-cases and
+// strips the square brackets of an IPv6 literal), and Addr() must NOT do that —
+// it is the string handed to the dialer and to the WP5 ledger, where changing
+// the spelling of a target would break both. A health array whose host came
+// back lower-cased must still meet its target, or the breaker would silently
+// never open for any target the panel re-spelled, which is exactly the kind of
+// quiet no-op that looks like "health had nothing to say".
+//
+// Normalisation is the minimum that makes the two spellings the same name:
+// trim, drop one layer of brackets, lower-case, drop one trailing root dot. It
+// cannot invent a match — every step maps a name to itself under DNS rules.
+func TargetKey(host string, port int) string {
+	if !validPort(port) {
+		return ""
+	}
+	h := strings.TrimSpace(host)
+	if len(h) > 1 && strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = h[1 : len(h)-1]
+	}
+	h = strings.TrimSuffix(strings.ToLower(h), ".")
+	if h == "" {
+		return ""
+	}
+	return net.JoinHostPort(h, strconv.Itoa(port))
+}
+
+// TargetHealthState is one of the five conclusions the panel's WP6 synthesis can
+// report for a target (DEVELOPMENT.md §7.3 "线形状（加法）").
+//
+// The agent does not decide what "healthy" means. These five values arrive on
+// the wire, and this side only folds them onto the frozen vocabulary — the
+// health MODEL stays on the panel (§7.3: "状态模型只有一个"). The names are
+// spelled exactly as the panel spells them, so a value that survives a round
+// trip is recognisably the panel's word and not an agent invention.
+type TargetHealthState string
+
+const (
+	// TargetHealthUnknown means "no evidence": never observed, the observation
+	// is stale, or unreadable. It is not a synonym for healthy, and not proof
+	// of failure either — WP7 ranks it after `degraded` and before `unhealthy`.
+	TargetHealthUnknown TargetHealthState = "unknown"
+	// TargetHealthHealthy is the panel's positive conclusion.
+	TargetHealthHealthy TargetHealthState = "healthy"
+	// TargetHealthDegraded means evidence of trouble below the "broken" line.
+	TargetHealthDegraded TargetHealthState = "degraded"
+	// TargetHealthUnhealthy is the one state that opens the circuit breaker.
+	TargetHealthUnhealthy TargetHealthState = "unhealthy"
+	// TargetHealthRecovering means "just left unhealthy, not proven stable".
+	TargetHealthRecovering TargetHealthState = "recovering"
+)
+
+// ParseTargetHealthState folds a wire value onto the five frozen states.
+//
+// Anything unrecognised — an older or newer panel's spelling, a typo, an empty
+// string — becomes TargetHealthUnknown. Refusing it would turn a health label
+// the agent cannot read into a routing decision, which is the one thing the
+// agent must never do; treating it as unknown keeps it out of the fast path
+// without declaring the target broken.
+func ParseTargetHealthState(s string) TargetHealthState {
+	switch TargetHealthState(strings.ToLower(strings.TrimSpace(s))) {
+	case TargetHealthHealthy:
+		return TargetHealthHealthy
+	case TargetHealthDegraded:
+		return TargetHealthDegraded
+	case TargetHealthUnhealthy:
+		return TargetHealthUnhealthy
+	case TargetHealthRecovering:
+		return TargetHealthRecovering
+	default:
+		return TargetHealthUnknown
+	}
+}
+
+// TargetHealth is one entry of the `target_health` array that travels PARALLEL
+// to `targets` (§7.3 "线形状（加法）"): same identities, not the same facts.
+//
+// The shape is additive on purpose. Desired and health are two different kinds
+// of fact, and folding a health field into `Target` would make it impossible to
+// say which fields a later change belongs to; two parallel arrays keep "desired
+// is byte-for-byte unchanged" structurally visible, and an older agent that
+// ignores the unknown key still works.
+type TargetHealth struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	// State is the panel's conclusion, kept as the raw string on purpose: it
+	// must pass through ParseTargetHealthState before anything acts on it.
+	State string `json:"state"`
+	// LatencyMs / AgeMs / Evidence are the supporting facts. They are carried
+	// (so a diag view can show why the panel concluded what it did) but the
+	// agent does not re-derive a state from them — that would be the second
+	// health model §7.3 forbids.
+	LatencyMs int64 `json:"latency_ms,omitempty"`
+	AgeMs     int64 `json:"age_ms,omitempty"`
+	Evidence  bool  `json:"evidence,omitempty"`
+}
+
+// Key returns the identity this entry is joined to its target on. It uses the
+// same normalisation as the target side (TargetKey), never Target.Addr(): the
+// panel publishes health under its own normalised identity, and a join that
+// depended on which side spelled the host first would drop facts silently.
+func (h TargetHealth) Key() string {
+	return TargetKey(h.Host, h.Port)
+}
+
+// StateValue is the parsed form of State.
+func (h TargetHealth) StateValue() TargetHealthState {
+	return ParseTargetHealthState(h.State)
+}
+
 // TunnelConfig describes one tunnel as the control plane wants it to run on
 // this node. JSON tags are the panel contract (snake_case) so a decoded payload
 // can be handed straight to a Forwarder.
@@ -262,6 +378,19 @@ type TunnelConfig struct {
 	SpeedLimit int64           `json:"speed_limit"`
 	Revision   int64           `json:"revision"`
 	ListenHost string          `json:"listen_host,omitempty"`
+	// TargetHealth is the panel's per-target health, parallel to Targets
+	// (V5.2-WP7, §7.3): the same identities in the same order, carrying a
+	// different kind of fact.
+	//
+	// Absent (an older panel, or a health read that failed) means "no health
+	// signal": the agent must then behave exactly as it did before WP7 — no
+	// breaker, no reordering. That is why this field is additive and optional
+	// rather than something the agent fills in from local observation.
+	//
+	// It is deliberately NOT validated: health is an optimisation, not a gate.
+	// A config that is otherwise applicable must never be refused because a
+	// health label was unreadable.
+	TargetHealth []TargetHealth `json:"target_health,omitempty"`
 	// TLSCertPath / TLSKeyPath are the node-local file paths of the certificate
 	// and its private key, used when Protocol is tls on a client-facing listener
 	// (DIRECT / RELAY). The control plane carries PATHS, never key material
@@ -276,6 +405,10 @@ func (c TunnelConfig) Clone() TunnelConfig {
 	if len(c.Targets) > 0 {
 		out.Targets = make([]Target, len(c.Targets))
 		copy(out.Targets, c.Targets)
+	}
+	if len(c.TargetHealth) > 0 {
+		out.TargetHealth = make([]TargetHealth, len(c.TargetHealth))
+		copy(out.TargetHealth, c.TargetHealth)
 	}
 	return out
 }
@@ -590,6 +723,21 @@ var ErrUpstreamNotSwappable = errors.New("forwarder: upstream is not swappable")
 // about the manager (that would be an import cycle).
 type TargetSelector interface {
 	Select() Target
+}
+
+// TargetReporter is the OPTIONAL other half of a TargetSelector: the egress
+// forwarder tells the selector how the dial it just asked for turned out
+// (V5.2-WP7 half-open probing).
+//
+// It is a separate interface rather than a second method on TargetSelector so
+// every existing selector still satisfies the narrow contract. A selector that
+// does not implement it simply never hears an outcome, and that is the safe
+// direction: without an outcome the breaker can only ever be opened by the
+// panel's word, never by the agent's own guess.
+type TargetReporter interface {
+	// ReportDial reports the outcome of one dial to the target Select handed
+	// out. ok is false when the dial failed.
+	ReportDial(t Target, ok bool)
 }
 
 // ErrAlreadyStarted is returned when Start is called on a listening forwarder.

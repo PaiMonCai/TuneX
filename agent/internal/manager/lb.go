@@ -9,12 +9,12 @@
 package manager
 
 import (
-	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/tunex/agent/internal/forwarder"
+	"github.com/tunex/agent/internal/logx"
 )
 
 // Strategy identifies a selection policy.
@@ -93,6 +93,18 @@ type LoadBalancer struct {
 	// connections and a handful of heavy targets.
 	weighted []weightSlot
 	cursor   uint64 // round-robin position, atomic to dodge the hot lock
+
+	// V5.2-WP7 state. health is nil until a payload carries a `target_health`
+	// array: nil is the structural form of "no health signal", and Select takes
+	// the pre-WP7 path verbatim while it is nil. bounds are the breaker's
+	// injectable bounds/clock (the zero value is the frozen default).
+	//
+	// forcedPicks counts the connections served while no target was admissible
+	// (all open or mid-probe); §7.3 requires that trade to be recorded rather
+	// than hidden.
+	health      *healthTable
+	bounds      BreakerBounds
+	forcedPicks uint64
 }
 
 // weightSlot maps a range of the round-robin cursor onto one target.
@@ -117,6 +129,29 @@ func New(strategy Strategy, targets []forwarder.Target) *LoadBalancer {
 // maxSlotsPerTarget caps how many expanded slots one target may occupy, so a
 // typo like weight=1000000 cannot allocate a huge slice.
 const maxSlotsPerTarget = 1024
+
+// slotCount is how many "connection turns" one target occupies under a
+// strategy: exactly the expansion `canonical` applies. Keeping it a function of
+// the strategy and the weight — rather than a second table — is what lets the
+// WP7 rank picker reproduce the strategy's distribution inside a rank without
+// the two ever drifting apart.
+//
+// ROUND_ROBIN and RANDOM get one slot per target regardless of weight (round
+// robin means every target in turn; random is uniform by definition).
+// WEIGHTED_ROUND_ROBIN expands a target into its weight worth of slots.
+func slotCount(t forwarder.Target, strategy Strategy) int {
+	if strategy != WeightedRoundRobin {
+		return 1
+	}
+	n := t.Weight
+	if n < 1 {
+		n = 1
+	}
+	if n > maxSlotsPerTarget {
+		n = maxSlotsPerTarget
+	}
+	return n
+}
 
 // canonical validates a pool and expands it into the selection tables.
 //
@@ -165,49 +200,46 @@ func canonical(in []forwarder.Target, strategy Strategy) (clean, slots []forward
 // Select returns the next target, or a zero Target when the pool is empty.
 // It satisfies forwarder.TargetSelector; a zero Target's Addr() is "" and the
 // caller treats that as "no upstream".
+//
+// With no health signal the body is the pre-WP7 strategy, unchanged. With one,
+// the same strategy is applied inside the best admissible WP7 rank
+// (internal/manager/health.go): health reorders, it never replaces the policy.
 func (l *LoadBalancer) Select() forwarder.Target {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
-	switch l.strategy {
-	case Random:
-		// math/rand's global source is safe for concurrent use.
-		if len(l.slots) == 0 {
-			return forwarder.Target{}
-		}
-		return l.slots[rand.Intn(len(l.slots))]
-	case WeightedRoundRobin:
-		if len(l.weighted) == 0 {
-			return forwarder.Target{}
-		}
-		// Walk the cursor modulo the total weight and binary-search the
-		// boundary: the distribution matches the weights exactly, and O(log
-		// n) keeps a pool with many targets cheap.
-		total := l.weighted[len(l.weighted)-1].upto
-		idx := atomic.AddUint64(&l.cursor, 1)
-		want := idx % total
-		lo := 0
-		for hi := len(l.weighted) - 1; lo < hi; {
-			mid := int(uint(lo+hi) >> 1)
-			if l.weighted[mid].upto > want {
-				hi = mid
-			} else {
-				lo = mid + 1
-			}
-		}
-		return l.weighted[lo].target
-	default: // RoundRobin and any unknown strategy degrade to in-turn order.
-		if len(l.slots) == 0 {
-			return forwarder.Target{}
-		}
-		idx := int(atomic.AddUint64(&l.cursor, 1)-1) % len(l.slots)
-		return l.slots[idx]
+	h := l.health
+	var (
+		target  forwarder.Target
+		entered bool
+	)
+	if h == nil {
+		target = l.selectPlain()
+	} else {
+		target, entered = l.selectHealthAware(h)
 	}
+	l.mu.RUnlock()
+
+	if entered {
+		// Logged outside every lock, and once per episode: this line marks a
+		// state transition (the pool had nothing admissible to offer), not a
+		// per-connection event — one line per connection would be noise that
+		// buries the transition, and the counter still counts them all.
+		logx.Warn("egress pool served the least-bad target: nothing is admissible",
+			"target", target.Addr(),
+			"reason", "every target is open or waiting for a half-open probe result")
+	}
+	return target
 }
 
 // UpdateTargets atomically replaces the pool and the strategy. Already-open
 // connections keep their upstream; every following connection of every
 // forwarder using this balancer sees the new pool. The pool is never cleared by
 // a bad payload: an empty/invalid target list is ignored rather than installed.
+//
+// A plain target update carries no `target_health`, so it clears the health
+// view: the caller is saying what the pool should BE without saying anything
+// about how the panel judges it, and the pre-WP7 behaviour (no breaker, no
+// reordering) is the honest reading of that. Use UpdateTargetsAndHealth for a
+// dispatch payload that carries both arrays.
 func (l *LoadBalancer) UpdateTargets(strategy Strategy, targets []forwarder.Target) {
 	s, ok := ParseStrategy(string(strategy))
 	if !ok {
@@ -215,6 +247,9 @@ func (l *LoadBalancer) UpdateTargets(strategy Strategy, targets []forwarder.Targ
 	}
 	clean, slots, weighted := canonical(targets, s)
 	if len(clean) == 0 {
+		// The payload was ignored, so it says nothing about health either:
+		// dropping the breaker here would be a state change from a payload that
+		// was refused.
 		return
 	}
 
@@ -227,6 +262,22 @@ func (l *LoadBalancer) UpdateTargets(strategy Strategy, targets []forwarder.Targ
 	// Reset the cursor so round robin restarts at the head of the new pool
 	// instead of resuming mid-way through an unrelated ordering.
 	atomic.StoreUint64(&l.cursor, 0)
+	l.UpdateHealth(nil)
+}
+
+// UpdateTargetsAndHealth installs BOTH parallel arrays of one egress dispatch
+// payload: the desired targets and the panel's health facts.
+//
+// The two installs are separately locked, and that is enough: a health entry
+// only ever speaks about one address, and a target the health array does not
+// mention is treated as `unknown` with a closed breaker. So a connection that
+// slips between the two installs sees either the old health against the new
+// pool (unmentioned targets are unknown, survivors keep a fact that is still
+// true of them) or the new health against the new pool — never a wrong pairing
+// of a fact with a different target.
+func (l *LoadBalancer) UpdateTargetsAndHealth(strategy Strategy, targets []forwarder.Target, health []forwarder.TargetHealth) {
+	l.UpdateTargets(strategy, targets)
+	l.UpdateHealth(health)
 }
 
 // rawStrategy reads the active strategy without holding the write lock.

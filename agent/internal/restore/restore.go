@@ -101,6 +101,11 @@ func Apply(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.
 			}
 			// An EGRESS tunnel's pool must exist before the forwarder is
 			// built (the balancer is a constructor argument).
+			//
+			// V5.2-WP7: restore installs desired targets ONLY. Health is a live
+			// fact (§7.3), never a cached one: a restored pool therefore starts
+			// with no health signal, i.e. exactly the pre-WP7 behaviour, until
+			// the panel dispatches a health array again.
 			if _, ok := egress.Targets(cfg.ID); !ok {
 				strategy, ok := manager.ParseStrategy(string(cfg.LBStrategy))
 				if !ok {
