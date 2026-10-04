@@ -487,6 +487,8 @@ model Node {
   state_report   NodeStateReport?
   /// V5.2 WP5：该节点上报的目标观测（每个 (节点, 目标) 一行）。
   target_observations TargetObservation[]
+  /// V5.3 WP9：该节点当前持有的归属租约。
+  placement_leases PlacementLease[]
 
   @@index([role])
   @@map("node")
@@ -679,6 +681,9 @@ model Tunnel {
   // 同一 NodeGroup 内不同入口节点允许复用相同 listen_port。
   @@index([in_node_group_id, listen_port])
   @@index([workspace_id])
+  /// V5.3 WP9：该 Forward 的归属租约（最多一行，见 model PlacementLease）。
+  placement_lease PlacementLease?
+
   @@index([tunnel_mode])
   @@index([forward_protocol])
   @@index([ingress_node_id])
@@ -1486,6 +1491,38 @@ model EmailVerification {
 ///
 /// `success_rate` 由**观测方**计算并上报（契约第 6 条）：面板不重算，
 /// 否则同一个事实会有两个可能不一致的算法。
+
+/// V5.3 WP9 —— 归属租约（fencing）。这是防 split brain 的**唯一**机制。
+///
+/// 危险场景（§8.2）：面板以为 A 掉线 → 让 B 接管 → A 其实只是被分区，仍在监听。
+/// 于是同一个 Forward 有两个主人。防它的不是"更准的心跳"，而是**所有权世代（epoch）**：
+/// 只有持有当前 epoch 的节点才允许服务；被降级的节点在收到更高 epoch 时拒绝继续。
+///
+/// 关键字段与为什么存在：
+///   · `epoch` 单调递增，"最后写入者获胜"被明确禁止（§8）；任何归属变更都是 epoch+1；
+///   · `lease_expires_at` 到期即**停**（fail-safe）："可能还有另一个主人"比"短暂中断"更危险；
+///   · `revision` 把租约钉在某个配置版本上，避免"新主人用旧配置"或反之；
+///   · 每个 tunnel 只有一行（`@unique`），因此不存在"两条租约都自称有效"的表示法。
+model PlacementLease {
+  id         Int      @id @default(autoincrement())
+  tunnel_id  Int      @unique
+  tunnel     Tunnel   @relation(fields: [tunnel_id], references: [id], onDelete: Cascade)
+  /// 当前承载该 Forward 的节点。
+  owner_node_id Int
+  owner_node Node    @relation(fields: [owner_node_id], references: [id], onDelete: Cascade)
+  /// 所有权世代：单调递增，绝不回退（回退会被 Agent 侧拒绝）。
+  epoch      Int      @default(0)
+  /// 租约到期时刻（DB 时钟）。到期未续 = 不允许继续服务。
+  lease_expires_at DateTime
+  /// 该租约对应的配置 revision。
+  revision   Int
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([owner_node_id, lease_expires_at])
+  @@map("placement_lease")
+}
+
 model TargetObservation {
   id         Int    @id @default(autoincrement())
   node_id    Int
