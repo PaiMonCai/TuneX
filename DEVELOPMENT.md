@@ -2014,6 +2014,25 @@ agent/internal/reporter/      状态上报响应里的续约回程（逐条容�
 backend/placement-lease.ts    租约表与服务；backend 侧认领在**与 epoch 附着同一处**（调用方不可能忘记）
 ~~~
 
+**WP10 执行器（已提交，与 G3 同一提交）**
+
+`backend/src/services/failover-executor.ts`：`now → 读事实 → decideFailover → CAS → 认领目的节点 → patchForward 迁移`。
+**没有第二套下发**：迁移走的就是用户在界面上改入口节点的那条路（`node_migration` 计划），
+用例用**真实纯规划器**证明（desired=新入口/applied=旧入口 ⇒ acquire_port + cutover_ingress(新) +
+drain_ingress(旧) + release_old_lease(旧)）。
+
+**它的端到端用例抓到一个会静默失效的真 bug**：读路径最初只带出 `reachable`、丢掉 `last_seen_at`，
+于是策略**永远无法**证明"不可达且超过 stale 阈值" ⇒ 自动迁移一次都不会发生，而所有单测全绿。
+这正是本项目反复出现的那一类（"实现了但不接线/读不到"）。
+
+**V5.3 剩余（下一次要做的三件事，已定方向，不再给实现者猜）**
+
+| # | 缺口 | 决定 |
+|---|---|---|
+| 1 | **自动迁移循环**（谁周期性调用执行器） | 挂在 reconcile 既有节拍上（不新开时间心跳）；与 `resumeRollouts` 同一处，先恢复未完成的 rollout，再评估迁移 |
+| 2 | **三个决策输入没有存储归属** | ① 运维策略（auto_failover/auto_failback）→ 复用既有 settings 存储（不新增表）；② preferred/standby 目的节点 → **由调度器在同一入口节点组内挑选非现任节点**（这是调度关注点，不需要存储）；③ 回切健康计数 → 由观测事实推导（连续 N 次判健康），默认 fail-closed（0 ⇒ 自动回切不发生，直到接线） |
+| 3 | **迁移这条腿不能离线端到端测** | 在 `forward-service` 增加依赖注入的 `applyPlacementChange(tunnelId, workspaceId, nodeId, deps)`（与 `RolloutDeps` 同风格），让"迁移"整链可离线断言；`patchForward` 本身保持不动，避免改动用户路径 |
+
 **两条来自实现者的面板侧缺陷（都已修）**
 
 1. **TTL 与上报周期相等**（30s == 30s）：截止时刻恰好落在下一次上报**发出**的瞬间，而续约
