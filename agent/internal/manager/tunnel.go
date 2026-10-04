@@ -69,6 +69,11 @@ type TunnelManager struct {
 	// does not pin one. Empty means all interfaces.
 	listenHost string
 
+	// targetDial is the dialer EGRESS pools dial their targets with (V5.3-WP8).
+	// nil keeps Go's own dialer, i.e. the pre-WP8 behaviour, which is also what
+	// every existing test and a build without the resolver wired gets.
+	targetDial forwarder.DialFunc
+
 	// closing is the WP11A shutdown latch: once set, Apply refuses new work so a
 	// config arriving mid-teardown cannot rebind a port that was just closed.
 	closing bool
@@ -86,6 +91,63 @@ type TunnelManager struct {
 	// API and startup restore, which is why it lives in the manager rather than
 	// in each caller.
 	mutationHook func()
+
+	// ownership is the V5.3 WP9 activation gate (ownership.Guard): the epoch
+	// fence plus the lease clock. It runs on BOTH activation entries, before any
+	// lock or listener, so every path that can start serving a tunnel — the
+	// control dispatch, the reconnect snapshot, startup restore and the local
+	// admin plane — is fenced by one implementation instead of four. nil means
+	// "this node does not fence" (an older build, or a test).
+	ownership OwnershipGuard
+}
+
+// OwnershipGuard is the V5.3 WP9 gate an activation must pass before anything is
+// bound. It is an interface (not ownership.Guard) so the manager keeps knowing
+// nothing about epochs and leases: it asks one question and reports the answer.
+//
+// The returned error is expected to be a typed refusal (ownership.Refusal) whose
+// code the control path carries back to the panel; the manager only propagates
+// it.
+type OwnershipGuard interface {
+	Admit(cfg forwarder.TunnelConfig) error
+}
+
+// SetOwnershipGuard installs the activation gate. It is safe to call at any time
+// and passing nil removes the gate. It is a setter rather than a constructor
+// argument because the guard is built after the managers (it needs their
+// registry) and because every existing caller of NewTunnelManager keeps working
+// unfenced.
+func (m *TunnelManager) SetOwnershipGuard(g OwnershipGuard) {
+	m.mu.Lock()
+	m.ownership = g
+	m.mu.Unlock()
+}
+
+// AdmitActivation runs the V5.3 WP9 activation gate WITHOUT applying anything.
+//
+// The manager already gates its own apply entries (so no caller can bypass it);
+// this exported form exists for a caller that mutates something else first. The
+// control path stages an EGRESS target pool before it can build the forwarder,
+// and staging it for an activation that is about to be refused would briefly
+// rewrite a RUNNING pool's targets — a mutation of a fenced tunnel, which is
+// exactly what "the refusal happens before any mutation" forbids. Calling this
+// first makes the refusal free of side effects; the gate inside Apply then
+// re-checks under the same monotone rules.
+func (m *TunnelManager) AdmitActivation(cfg forwarder.TunnelConfig) error {
+	return m.admitOwnership(cfg)
+}
+
+// admitOwnership runs the activation gate outside the manager's lock: the guard
+// may write a durable file, and holding m.mu across an fsync would stall every
+// other tunnel operation behind one activation.
+func (m *TunnelManager) admitOwnership(cfg forwarder.TunnelConfig) error {
+	m.mu.RLock()
+	guard := m.ownership
+	m.mu.RUnlock()
+	if guard == nil {
+		return nil
+	}
+	return guard.Admit(cfg)
 }
 
 // SetMutationHook installs the post-mutation observer. It is safe to call at any
@@ -257,6 +319,11 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Runtime, er
 // comparison on the outside of the lock: the hook must never run while m.mu is
 // held, because it re-reads the registry.
 func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	// V5.3 WP9: the ownership gate runs before the lock and before anything can
+	// bind, so a refused activation is never half-applied.
+	if err := m.admitOwnership(cfg); err != nil {
+		return nil, err
+	}
 	normalized := cfg.Clone()
 	if normalized.ListenHost == "" {
 		normalized.ListenHost = m.listenHost
@@ -305,6 +372,8 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	return forwarder.BuildRuntime(cfg, forwarder.BuildDeps{
 		StreamBuildDeps: forwarder.StreamBuildDeps{
+			// V5.3-WP8: the target resolver's dialer, when the runtime wired one.
+			Dial: m.targetDial,
 			SelectorFor: func(tunnelID string) (forwarder.TargetSelector, error) {
 				if m.egress == nil {
 					return nil, fmt.Errorf("manager: EGRESS tunnel %s has no egress manager wired", tunnelID)
@@ -461,27 +530,54 @@ func isStale(next, current int64) bool {
 // nil when the id is unknown, so a duplicate remove_tunnel command from the
 // panel cannot erase a tunnel that was legitimately recreated.
 func (m *TunnelManager) Remove(id string) error {
-	before := m.fingerprint()
-	err := m.removeInner(id)
-	if err == nil {
-		m.notifyIfChanged(before)
-	}
+	_, err := m.RemoveIf(id, nil)
 	return err
 }
 
+// RemoveIf removes a tunnel only while cond still holds for its live config.
+//
+// It exists for the V5.3 WP9 lease clock: the ownership guard observes "this
+// tunnel's authorisation has lapsed", but between that observation and the stop
+// a renewal may have arrived. Evaluating cond under the manager's lock turns
+// check-then-act into check-and-act, so a tunnel that was just renewed is not
+// killed by a decision made on a stale read.
+//
+// It returns whether the tunnel was actually removed. cond runs while the
+// manager's lock is held, so it must be pure and must never call back into the
+// manager (a nil cond always removes, which is exactly Remove).
+func (m *TunnelManager) RemoveIf(id string, cond func(forwarder.TunnelConfig) bool) (bool, error) {
+	before := m.fingerprint()
+	removed, err := m.removeInnerIf(id, cond)
+	if err == nil && removed {
+		m.notifyIfChanged(before)
+	}
+	return removed, err
+}
+
 func (m *TunnelManager) removeInner(id string) error {
+	_, err := m.removeInnerIf(id, nil)
+	return err
+}
+
+// removeInnerIf is the locked body of Remove/RemoveIf. Caller must not hold m.mu.
+func (m *TunnelManager) removeInnerIf(id string, cond func(forwarder.TunnelConfig) bool) (bool, error) {
 	m.mu.Lock()
 	e, ok := m.tunnels[id]
 	if !ok {
 		m.mu.Unlock()
-		return nil
+		return false, nil
+	}
+	if cond != nil && !cond(e.cfg) {
+		// The tunnel changed under us (renewed or replaced): leave it alone.
+		m.mu.Unlock()
+		return false, nil
 	}
 	delete(m.tunnels, id)
 	m.releasePortLocked(e.cfg)
 	m.mu.Unlock()
 
 	m.stopEntry(e)
-	return nil
+	return true, nil
 }
 
 // Get returns the live cfg for a tunnel.
@@ -713,6 +809,21 @@ func splitPortGuardKey(key string) (namespace string, port int) {
 		return "", 0
 	}
 	return namespace + ":", p
+}
+
+// SetTargetDialer installs the dialer EGRESS pools use for their upstreams.
+//
+// It is a setter rather than a constructor argument for the same reason
+// SetOwnershipGuard is: the resolver is built after the managers (it is wired
+// into the runtime) and every existing caller keeps working undialed. It only
+// affects egress forwarders BUILT AFTER the call — an already-running pool keeps
+// the dialer it was built with, which is the honest behaviour: swapping the
+// dialer under a live forwarder would change how in-flight retries resolve
+// without anything recording that it happened.
+func (m *TunnelManager) SetTargetDialer(dial forwarder.DialFunc) {
+	m.mu.Lock()
+	m.targetDial = dial
+	m.mu.Unlock()
 }
 
 // SetListenHost overrides the interface tunnels bind. Running tunnels keep

@@ -243,6 +243,12 @@ func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.R
 }
 
 func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	// V5.3 WP9: same gate as applyInner, for the same reason. This is the entry
+	// the control plane actually uses for a listener change, so a fence that only
+	// covered Apply would be a fence production never passes through.
+	if err := m.admitOwnership(cfg); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

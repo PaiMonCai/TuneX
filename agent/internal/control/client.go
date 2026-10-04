@@ -21,6 +21,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
+	"github.com/tunex/agent/internal/ownership"
 	"github.com/tunex/agent/internal/selfinfo"
 )
 
@@ -332,6 +333,16 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 			cfg.Revision = cmd.Envelope.Revision
 		}
 
+		// V5.3 WP9: the ownership gate runs BEFORE anything is staged. A refusal
+		// must not leave a trace — staging an EGRESS pool first would briefly
+		// apply a fenced activation's targets to a running pool before the
+		// refusal landed. The manager gates again when it applies; this call is
+		// what makes the refusal side-effect free.
+		if err := c.tunnels.AdmitActivation(cfg); err != nil {
+			ack.ErrorCode, ack.Error = ackCodeFor(err), err.Error()
+			return ack
+		}
+
 		// EGRESS forwarders depend on a target selector at construction time.
 		// Online commands must therefore install/update the target pool before
 		// TunnelManager.Apply, exactly like startup restore does. Otherwise the
@@ -351,11 +362,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		_, err = c.applyByPlan(cfg)
 		if err != nil {
 			rollbackPool()
-			if errors.Is(err, manager.ErrStaleRevision) {
-				ack.ErrorCode = "stale_revision"
-			} else {
-				ack.ErrorCode = "apply_failed"
-			}
+			ack.ErrorCode = ackCodeFor(err)
 			ack.Error = err.Error()
 			return ack
 		}
@@ -412,6 +419,26 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.Error = "unsupported action: " + cmd.Envelope.Action
 	}
 	return ack
+}
+
+// ackCodeFor maps an apply failure onto the ACK's error_code.
+//
+// The code is the panel's vocabulary for WHAT happened, so a refusal keeps its
+// own name instead of collapsing into "apply_failed": an operator (and the
+// reconciler) must be able to tell "this node was demoted" from "the port was
+// taken", and a fence whose refusals look like generic failures is a fence
+// nobody can audit.
+func ackCodeFor(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, manager.ErrStaleRevision) {
+		return "stale_revision"
+	}
+	if code, ok := ownership.RefusalCode(err); ok {
+		return code
+	}
+	return "apply_failed"
 }
 
 // applyByPlan routes one apply_tunnel command through the hot-reload

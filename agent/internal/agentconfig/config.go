@@ -62,6 +62,26 @@ func (c *Config) LKGPath() string {
 	return filepath.Join(dir, "desired-lkg.json")
 }
 
+// OwnershipFencePath is the V5.3-WP9 epoch fence inside StateDir.
+//
+// It lives in the SAME durable directory as the last-known-good cache because it
+// answers the same kind of question ("what does this node remember across a
+// restart?") and is subject to the same lifecycle: an operator who wipes or
+// mounts that directory has made one decision about durable agent state, not
+// two. It is a separate file, not a field of the cache, so a corrupted desired
+// snapshot can never cost the fence — the fence is the one fact whose loss turns
+// a restart into a split-brain risk.
+//
+// Empty StateDir returns "" and the fence then lives only in memory, which the
+// node reports (ownership.Facts.Durable) instead of hiding.
+func (c *Config) OwnershipFencePath() string {
+	dir := strings.TrimSpace(c.StateDir)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "ownership-epoch.json")
+}
+
 // Node roles (the panel's NodeRole enum).
 const (
 	// RoleIngress runs ingress tunnels only (DIRECT/RELAY listeners).

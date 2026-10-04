@@ -88,6 +88,10 @@ func decodeSnapshot(version string, tunnels []tunnelPayload) (*Snapshot, error) 
 			ListenHost:  t.ListenHost,
 			TLSCertPath: t.TLSCertPath,
 			TLSKeyPath:  t.TLSKeyPath,
+			// V5.3 WP9: the ownership facts ride the snapshot so a restart keeps
+			// both the epoch fence's input and the lease clock's deadline.
+			OwnershipEpoch: t.OwnershipEpoch,
+			LeaseExpiresAt: t.LeaseExpiresAt,
 			// V5.2 WP7: health rides the snapshot with the targets, so a restart does
 			// not silently disable the circuit breaker.
 			TargetHealth: decodeTargetHealth(t.TargetHealth),

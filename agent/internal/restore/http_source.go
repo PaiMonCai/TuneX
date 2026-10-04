@@ -71,6 +71,19 @@ type tunnelPayload struct {
 	// node restart while create and hot reload were fine).
 	TLSCertPath string `json:"tls_cert_path"`
 	TLSKeyPath  string `json:"tls_key_path"`
+	// V5.3 WP9: the ownership facts. They MUST be decoded here for the fourth
+	// time in V5's history (protocol, tls paths, health, now ownership): this
+	// payload is what an Agent rebuilds from after every restart, and a decoder
+	// that drops the epoch resets the "highest seen" to nothing — so a demoted
+	// node that restarts during a partition would happily serve again. The
+	// deadline matters just as much: without it a restored tunnel has no lease
+	// clock and would keep serving past the authorisation the panel granted.
+	//
+	// Absent means "the panel sent no ownership information" (an older panel),
+	// and the agent then behaves exactly as it did before V5.3.
+	OwnershipEpoch int64  `json:"ownership_epoch"`
+	LeaseExpiresAt string `json:"lease_expires_at"`
+
 	// V5.2 WP7: the health facts that travel with the desired targets.
 	//
 	// They MUST be decoded here, and this is the third time in V5 that a new fact

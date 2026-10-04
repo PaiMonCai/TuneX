@@ -17,6 +17,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -397,6 +398,26 @@ type TunnelConfig struct {
 	// (§6.1 "Where are certificates owned?").
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
 	TLSKeyPath  string `json:"tls_key_path,omitempty"`
+
+	// ── V5.3 WP9 ownership facts (DEVELOPMENT.md §8) ──
+	//
+	// These two are the panel's statement that THIS node is the recorded owner
+	// of the tunnel, and for how long: OwnershipEpoch is the generation it is
+	// authorised to serve, LeaseExpiresAt is when that authorisation runs out
+	// (RFC 3339, the panel's clock).
+	//
+	// They are OPTIONAL and their ABSENCE is meaningful: a config without them
+	// is an older panel that sent no ownership information at all, and the node
+	// must then behave exactly as it did before WP9 — no fencing, no lease
+	// clock. Treating absent as epoch 0 would refuse every activation on such a
+	// panel, which is why ownership.EpochFromConfig keys on presence-by-value:
+	// epochs are >= 1 by contract (placement-lease.ts starts at 1 and 0 means
+	// "never owned"), so zero can never be a legitimate generation.
+	//
+	// Neither field changes what the tunnel IS: the hostname/ports/targets stay
+	// the only desired facts, and an epoch never rewrites one.
+	OwnershipEpoch int64  `json:"ownership_epoch,omitempty"`
+	LeaseExpiresAt string `json:"lease_expires_at,omitempty"`
 }
 
 // Clone returns a copy that shares no mutable state with c.
@@ -716,6 +737,12 @@ type DatagramRuntime interface {
 // ErrUpstreamNotSwappable is returned by SetUpstream on a forwarder whose
 // upstream is not one swappable address (an EGRESS pool).
 var ErrUpstreamNotSwappable = errors.New("forwarder: upstream is not swappable")
+
+// DialFunc dials one address. Its shape is net.Dialer.DialContext, so a dialer
+// that does more than Go's (V5.3-WP8's target resolver: TTL cache, stale
+// fallback, observable facts) can be injected without the data plane knowing
+// anything about DNS.
+type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 // TargetSelector picks the upstream for the next egress connection. The egress
 // forwarder depends only on this narrow interface so the hot-updatable

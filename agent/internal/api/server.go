@@ -39,6 +39,8 @@ import (
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/manager"
+	"github.com/tunex/agent/internal/ownership"
+	"github.com/tunex/agent/internal/targetdns"
 )
 
 // DefaultPort is the admin port from the v3 deployment layout (agent port 9090,
@@ -70,6 +72,31 @@ type Options struct {
 	NodeID     string // reported by /health
 	Version    string // reported by /health
 	Role       string // reported by /health
+
+	// Ownership is the V5.3-WP9 fencing view: the durable epoch fence plus the
+	// lease clock's counters. nil omits the section entirely (an older build, or
+	// a test), which is why the field is optional rather than a required source.
+	Ownership OwnershipFacts
+
+	// TargetDNS is the V5.3-WP8 resolution view: what each target name currently
+	// resolves to, how old that answer is, and why the last lookup failed. It is
+	// the "report the fact" half of NXDOMAIN handling — the node keeps serving
+	// from its last good addresses, and this is where an operator can see that it
+	// is doing so on stale evidence.
+	TargetDNS TargetDNSFacts
+}
+
+// TargetDNSFacts is the resolution view /health publishes. targetdns.Resolver
+// satisfies it.
+type TargetDNSFacts interface {
+	Facts() []targetdns.Fact
+}
+
+// OwnershipFacts is the report /health publishes about fencing. It is an
+// interface so this package never imports the enforcement side; ownership.Guard
+// satisfies it with Facts().
+type OwnershipFacts interface {
+	Facts() ownership.Facts
 }
 
 // NodeState is the /health payload. Field names match the panel's Node model
@@ -81,6 +108,14 @@ type NodeState struct {
 	Tunnels   []forwarder.TunnelConfig        `json:"tunnels"`
 	UsedPorts []int                           `json:"used_ports"`
 	Egress    map[string]manager.PoolSnapshot `json:"egress_pools,omitempty"`
+	// TargetDNS is the V5.3-WP8 resolution fact set, additive and optional.
+	TargetDNS []targetdns.Fact `json:"target_dns,omitempty"`
+	// Ownership is the V5.3-WP9 fencing fact set. It is ADDITIVE and optional:
+	// a node without a guard simply has no key, and every pre-V5.3 reader keeps
+	// working. It exists because a refused activation must be a fact somebody
+	// can read — the ACK tells the panel, the ledger carries it in the report,
+	// and this is the surface that says WHY without opening the agent log.
+	Ownership *ownership.Facts `json:"ownership,omitempty"`
 }
 
 // StateFunc builds the node snapshot. main wires it to the running managers;
@@ -428,6 +463,13 @@ func (s *Server) snapshot() NodeState {
 	sort.Ints(st.UsedPorts)
 	if s.egress != nil {
 		st.Egress = s.egress.Snapshot()
+	}
+	if s.opts.Ownership != nil {
+		facts := s.opts.Ownership.Facts()
+		st.Ownership = &facts
+	}
+	if s.opts.TargetDNS != nil {
+		st.TargetDNS = s.opts.TargetDNS.Facts()
 	}
 	return st
 }

@@ -38,6 +38,10 @@ type StreamBuildDeps struct {
 	SelectorFor func(tunnelID string) (TargetSelector, error)
 	// Observer receives per-target dial failures (EGRESS only). Nil is a no-op.
 	Observer TargetObserver
+	// Dial overrides the EGRESS upstream dialer (V5.3-WP8: the runtime injects a
+	// resolver-backed one so target names get a TTL cache and a stale fallback).
+	// Nil keeps Go's own dialer.
+	Dial DialFunc
 	// ServerName overrides the TLS server name. Tests set it; production leaves
 	// it empty (the listener serves whatever SNI the client sends).
 	ServerName string
@@ -353,7 +357,7 @@ func buildTCPStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, erro
 		if err != nil {
 			return nil, err
 		}
-		return NewEgressWithHealth(cfg, sel, deps.Observer)
+		return NewEgressWithOptions(cfg, sel, EgressOptions{Observer: deps.Observer, Dial: deps.Dial})
 	default:
 		return nil, fmt.Errorf("forwarder: unsupported tunnel mode %q", cfg.Mode)
 	}

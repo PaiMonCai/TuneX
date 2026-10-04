@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -291,6 +292,22 @@ func WithDiagnostics(lister DiagnosticsLister) Option {
 	return func(c *Config) { c.diagnostics = lister }
 }
 
+// LeaseSink receives the ownership facts a state report's answer carries
+// (V5.3-WP9). Implemented by the ownership guard; declared here so the reporter
+// never imports the enforcement side.
+//
+// ObserveLeases is called on the reporting goroutine and must not block: the
+// reporter's tick is not allowed to depend on the lease clock's speed.
+type LeaseSink interface {
+	ObserveLeases(leases []LeaseRenewal, at time.Time)
+}
+
+// WithLeases attaches the lease sink that consumes the state report's answer.
+// Omitted = the answer's `leases` are ignored, which is the pre-V5.3 behaviour.
+func WithLeases(sink LeaseSink) Option {
+	return func(c *Config) { c.leases = sink }
+}
+
 // WithTargetObservations attaches the V5.2-WP5 target observer. Omitted = the
 // report carries no `target_observations` key, which the panel reads as
 // "unknown", exactly like an older agent.
@@ -397,6 +414,11 @@ type Config struct {
 	// "no problems found".
 	targetObs TargetObservationLister
 
+	// V5.3-WP9: the ownership facts the panel returns in the state report's
+	// answer. nil = this node tracks no leases (nothing to renew, nothing to
+	// expire) — which is also how it behaves with an older panel.
+	leases LeaseSink
+
 	// ── V4-WP6 telemetry sources (all optional) ──
 	//
 	// host     : hostname/os/arch + one resource sample per beat;
@@ -411,8 +433,11 @@ type Config struct {
 	revisions *RevisionState
 	startedAt time.Time
 
-	// post overrides the HTTP call (tests). Defaults to httpPost.
-	post func(ctx context.Context, url string, body []byte, headers map[string]string) error
+	// post overrides the HTTP call (tests). Defaults to httpPost. It returns the
+	// panel's response body: the V5.3-WP9 lease renewal rides the state report's
+	// own answer, and a transport that threw it away would make every tunnel
+	// self-stop one TTL after its config (see sendState).
+	post func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error)
 	// now overrides time.Now (tests).
 	now func() time.Time
 }
@@ -443,7 +468,23 @@ func WithEgress(e EgressLister) Option { return func(c *Config) { c.egress = e }
 
 // WithPost replaces the HTTP transport (tests). The headers map carries the
 // credential for the state report; the legacy heartbeat sends nil headers.
+//
+// It is the error-only shape, so a test that does not care about the panel's
+// answer keeps working unchanged; the body it discards is what
+// WithPostResponse exists for.
 func WithPost(fn func(ctx context.Context, url string, body []byte, headers map[string]string) error) Option {
+	return func(c *Config) {
+		c.post = func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
+			return nil, fn(ctx, url, body, headers)
+		}
+	}
+}
+
+// WithPostResponse replaces the HTTP transport with the shape that can also read
+// what the panel answered. The state report's response carries the ownership
+// leases this node may keep serving under (V5.3 WP9), so discarding bodies is
+// no longer equivalent to ignoring them.
+func WithPostResponse(fn func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error)) Option {
 	return func(c *Config) { c.post = fn }
 }
 
@@ -709,7 +750,9 @@ func (r *Reporter) send(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	_ = r.cfg.post(ctx, r.Endpoint(), body, nil)
+	// The legacy heartbeat has no response contract: whatever comes back is
+	// ignored, exactly as before.
+	_, _ = r.cfg.post(ctx, r.Endpoint(), body, nil)
 }
 
 // sendState posts one WP7 state report (best effort, same reasoning as send).
@@ -728,13 +771,93 @@ func (r *Reporter) sendState(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	err = r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
 	if isCredentialRejected(err) {
 		logx.Warn("state report rejected: node credential is invalid or revoked",
 			"node_id", r.cfg.NodeID)
 	}
+	if err == nil {
+		r.deliverLeases(answer)
+	}
+}
+
+// deliverLeases hands the ownership facts a state report's answer carries to the
+// lease sink. It NEVER fails the report and never invents facts: an absent key,
+// an empty list and an unparseable body all mean "the panel told us nothing
+// about ownership", which is exactly how an older panel behaves.
+//
+// This is the renewal channel V5.3 WP9 depends on (see WithLeases): the panel
+// extends the lease row when a node reports it still serves a tunnel, and the
+// refreshed deadline must come BACK, or a healthy node stops every tunnel one
+// TTL after its last config.
+func (r *Reporter) deliverLeases(raw []byte) {
+	if r.cfg.leases == nil || len(raw) == 0 {
+		return
+	}
+	leases, present := decodeLeaseAnswer(raw)
+	if !present {
+		return
+	}
+	r.cfg.leases.ObserveLeases(leases, r.cfg.now())
+}
+
+// stateAnswer is the state report's response envelope. Only the ownership part
+// is decoded; every other field belongs to other packages.
+type stateAnswer struct {
+	Data *struct {
+		Leases *[]json.RawMessage `json:"leases"`
+	} `json:"data"`
+}
+
+// LeaseRenewal is one ownership fact the panel returned: "you may keep serving
+// this tunnel until LeaseExpiresAt, at generation Epoch".
+//
+// TunnelRef is the panel's lease key (the database tunnel id). The agent names
+// its tunnels with strings, so joining the two is the consumer's job — the
+// reporter only carries the fact faithfully.
+type LeaseRenewal struct {
+	TunnelRef int64  `json:"tunnel_id"`
+	Epoch     int64  `json:"epoch"`
+	ExpiresAt string `json:"lease_expires_at"`
+	Revision  int64  `json:"revision"`
+}
+
+// decodeLeaseAnswer extracts the lease list, tolerating the shapes a deployment
+// can actually produce:
+//
+//   - no `data.leases` key at all -> (nil, false): an older panel, nothing said;
+//   - `"leases": []`             -> (empty, true): "no ownership information",
+//     which the sink treats exactly like silence (it extends nothing);
+//   - individual bad entries     -> skipped, the rest are delivered. A lease row
+//     is evidence about one tunnel; one unreadable row must not blind the node
+//     to the other transitions in the same answer.
+func decodeLeaseAnswer(raw []byte) ([]LeaseRenewal, bool) {
+	var answer stateAnswer
+	if err := json.Unmarshal(raw, &answer); err != nil {
+		logx.Debug("state report answer was not JSON; ownership facts unavailable",
+			"err", err.Error())
+		return nil, false
+	}
+	if answer.Data == nil || answer.Data.Leases == nil {
+		return nil, false
+	}
+	entries := *answer.Data.Leases
+	out := make([]LeaseRenewal, 0, len(entries))
+	for _, entry := range entries {
+		var lease LeaseRenewal
+		if err := json.Unmarshal(entry, &lease); err != nil {
+			logx.Debug("skipping unreadable lease statement in the state report answer",
+				"err", err.Error())
+			continue
+		}
+		if lease.TunnelRef <= 0 || strings.TrimSpace(lease.ExpiresAt) == "" {
+			continue
+		}
+		out = append(out, lease)
+	}
+	return out, true
 }
 
 // errRejected is returned by the post hook when the panel answers 401/403.
@@ -760,9 +883,16 @@ func (r *Reporter) ReportOnce(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	return r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
+	if err == nil {
+		// The closing report renews the leases as much as any other one: a node
+		// that is draining still owns what it serves, and its last statement
+		// should not be the one that skips the answer.
+		r.deliverLeases(answer)
+	}
+	return err
 }
 
 // Stop makes a running Run return. Safe before/after Run and more than once.
@@ -782,10 +912,10 @@ func (r *Reporter) Stop() {
 //
 // headers is nil for the legacy heartbeat and carries Authorization for the
 // state report; the credential value is never included in the error text.
-func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) error {
+func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
@@ -793,14 +923,28 @@ func httpPost(ctx context.Context, url string, body []byte, headers map[string]s
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("heartbeat post %s: %w", url, err)
+		return nil, fmt.Errorf("heartbeat post %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			return fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
+			return nil, fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
 		}
-		return fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
 	}
-	return nil
+	// Bounded read: the answer carries lease facts, not a document. A panel that
+	// streams megabytes at the agent must not be able to grow its heap.
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, MaxAnswerBytes))
+	if err != nil {
+		// The report itself was accepted; only the answer was lost. That is not
+		// a failed report (the DB write already happened), so report success.
+		logx.Debug("state report answer could not be read", "err", err.Error())
+		return nil, nil
+	}
+	return answer, nil
 }
+
+// MaxAnswerBytes bounds the state report's response body. The lease list is a
+// few dozen bytes per tunnel the node serves; anything beyond this is a
+// misbehaving or hostile panel.
+const MaxAnswerBytes = 1 << 20
