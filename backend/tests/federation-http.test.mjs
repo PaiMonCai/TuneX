@@ -26,7 +26,7 @@ const maybe = enabled ? test : test.skip;
 
 const { db } = await import("../src/db.ts");
 const { createApp } = await import("../src/app.ts");
-const { ensurePanelIdentity, setFederationEnabled, resetPanelIdentityCache } = await import(
+const { ensurePanelIdentity, setFederationEnabled, resetPanelIdentityCache, isFederationEnabled } = await import(
   "../src/services/federation/identity.ts"
 );
 const { createInvitation } = await import("../src/services/federation/trust.ts");
@@ -142,12 +142,20 @@ test.after(async () => {
 maybe("WP14 federation: 未开启时拒绝所有联邦端点（fail-closed）", async () => {
   await resetFederationTables();
   await ensureIdentityForTest();
-  await setFederationEnabled(false);
-  const { res } = await signedPost("/api/federation/v1/ping", {}, await generatePanelKeyPair(), `${TEST_PEER_PREFIX}${crypto.randomUUID()}`);
-  // 开关关闭时连"验签"都不该发生：先拒，再谈身份。
-  assert.equal(res.status, 403);
-  const body = await res.json();
-  assert.equal(body.code, "federation_disabled");
+  // 这个用例必须**临时**关掉全局开关，所以它天生不能和别的用例并行跑：
+  // 一旦并发，别人会看到"联邦被关了"。`bun run test` 因此固定 --test-concurrency=1
+  // （这些 .mjs 共用同一个库，并行本来就不安全）。这里同时用 try/finally 保证恢复。
+  const wasEnabled = await isFederationEnabled().catch(() => true);
+  try {
+    await setFederationEnabled(false);
+    const { res } = await signedPost("/api/federation/v1/ping", {}, await generatePanelKeyPair(), `${TEST_PEER_PREFIX}${crypto.randomUUID()}`);
+    // 开关关闭时连"验签"都不该发生：先拒，再谈身份。
+    assert.equal(res.status, 403);
+    const body = await res.json();
+    assert.equal(body.code, "federation_disabled");
+  } finally {
+    await setFederationEnabled(wasEnabled).catch(() => undefined);
+  }
 });
 
 maybe("WP14 federation: 握手是一次性的，且响应能被 token 持有者验证", async () => {

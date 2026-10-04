@@ -9,7 +9,7 @@
     "worker": "bun src/worker.ts",
     "build": "bun build src/index.ts --target=bun --external external --outdir=dist && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --test tests/*.test.mjs",
+    "test": "node --experimental-transform-types --test --test-concurrency=1 tests/*.test.mjs",
     "test:unit": "bun test src",
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
