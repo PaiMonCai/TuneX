@@ -1401,19 +1401,56 @@ export async function compensateRollout(
           if (!egress.ok) {
             errors.push(`replay egress: ${egress.error}`);
           } else {
-            const host = egress.egress_host;
-            const ingress = await orchestrator.dispatchIngress({
-              tunnelId: row.tunnel_id,
-              revision: rollbackRevision,
-              ingressNode: nodeFor(orchestrator, ingressNodeId),
-              ingressPort: listenPort,
-              nextHop: `${host}:${egressPort}`,
-              // The same facts the egress leg just used: one Forward, one protocol.
-              protocol: replayEgressFacts.protocol,
-              tlsCertPath: replayEgressFacts.tlsCertPath,
-              tlsKeyPath: replayEgressFacts.tlsKeyPath,
-            });
-            if (!ingress.ok) errors.push(`replay ingress: ${ingress.error}`);
+            let ingressNextHop = `${egress.egress_host}:${egressPort}`;
+            const baselineMiddleId =
+              baseline.middle_node_id == null ? null : Number(baseline.middle_node_id);
+
+            // V5.4：如果基线本身是三跳，回滚也必须先恢复 middle，再让 ingress 指向它。
+            // middle 的物理端口不复制进 snapshot；它仍由 NodePortLease 唯一持有。
+            if (baselineMiddleId != null) {
+              const leases = (await deps.db.nodePortLease.findMany({
+                where: {
+                  node_id: baselineMiddleId,
+                  tunnel_id: row.tunnel_id,
+                  status: "active",
+                },
+                select: { port: true },
+              })) as Array<{ port: number }>;
+              if (leases.length !== 1) {
+                errors.push(
+                  `replay transit: middle ${baselineMiddleId} active lease 数量=${leases.length}，无法唯一解析端口`,
+                );
+              } else {
+                const transit = await orchestrator.dispatchTransit({
+                  tunnelId: row.tunnel_id,
+                  revision: rollbackRevision,
+                  node: nodeFor(orchestrator, baselineMiddleId),
+                  port: leases[0]!.port,
+                  nextHop: `${egress.egress_host}:${egressPort}`,
+                  protocol: replayEgressFacts.protocol,
+                });
+                if (!transit.ok) {
+                  errors.push(`replay transit: ${transit.error}`);
+                } else {
+                  ingressNextHop = `${transit.host}:${leases[0]!.port}`;
+                }
+              }
+            }
+
+            if (!errors.some((message) => message.startsWith("replay transit:"))) {
+              const ingress = await orchestrator.dispatchIngress({
+                tunnelId: row.tunnel_id,
+                revision: rollbackRevision,
+                ingressNode: nodeFor(orchestrator, ingressNodeId),
+                ingressPort: listenPort,
+                nextHop: ingressNextHop,
+                // The same facts the egress leg just used: one Forward, one protocol.
+                protocol: replayEgressFacts.protocol,
+                tlsCertPath: replayEgressFacts.tlsCertPath,
+                tlsKeyPath: replayEgressFacts.tlsKeyPath,
+              });
+              if (!ingress.ok) errors.push(`replay ingress: ${ingress.error}`);
+            }
           }
           }
         }
