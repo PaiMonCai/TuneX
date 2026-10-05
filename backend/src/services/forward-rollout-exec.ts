@@ -410,20 +410,11 @@ async function loadBoundPairs(db: RolloutDb): Promise<ReadonlySet<string>> {
 }
 
 /**
- * 释放**旧的归属租约**（）。
+ * Release ownership held by a node that no longer hosts the Forward.
  *
- * 背景：一个节点不再承载某条 Forward 之后，它**可能还持有那条 Forward 的归属租约**。这不是无害的
- * 残留 —— 它会让每一条修复路径都撞上两阶段规则：reconcile 的重发会为**放置节点**认领归属，而旧租约
- * 未过期 ⇒ 认领被正确地拒绝 ⇒ **重发永远失败**。Observed failure mode: `tunnel.ingress_node_id=3`、
- * `placement_lease.owner_node_id=5`，DB 显示 `active/applied` 而两台节点都不服务，
- * 且没有任何自动机制能打破它（"账本说好、事实说坏"，the stale lease can otherwise block the new owner until expiry）。
- *
- * 为什么可以在这里安全地释放：这一步（`release_old_lease`）**正是在旧 runtime 已经被撤掉之后**执行的
- * —— 迁移计划里 `drain_ingress` 先把它摘掉，CLEANUP 才轮到释放。两阶段规则要防的"旧主人还在服务"
- * 在这里已经不成立，而"旧主人仍占着归属"恰恰是必须清掉的东西。
- *
- * 只在该旧节点**不再是当前放置节点**时才释放：同节点换端口的场景由上面的 `sameNodeListenerMove`
- * 处理，那里 Forward 并没有搬走。
+ * This runs only after the old ingress runtime has been drained, so releasing the
+ * obsolete lease cannot create dual ownership. Same-node listener moves keep the
+ * lease because ownership did not move.
  */
 async function releaseStalePlacementLease(
   deps: RolloutDeps,
@@ -1672,18 +1663,9 @@ export async function compensateRollout(
     if (!baseline) {
       errors.push(`baseline snapshot revision=${row.base_revision} 不存在`);
     } else {
-      // Rollback creates a new generation carrying baseline content; replaying an
-      // older revision would violate the Agent's monotonic revision fence.，从 Agent 角度看就是一条迟到的旧命令，
-      // 拒绝是对的。observed后果：补偿永远失败，rollout 停在 degraded，两侧都不服务
-      // （`forward_rollout#35` 的 `compensation_error` 就是这句话）。
-      //
-      // 把重放号改成"目标 revision"也不行：那样 Agent 会接受，但**运行时挂在目标版本号上**，
-      // 而它跑的是基线内容 —— 下一次 rollout 的基线查找（按 applied_revision）就会拿到一个
-      // 名不副实的版本。两个方案都坏，说明模型错了：**回滚必须是一个新的世代**。
-      //
-      // 于是：内容 = 基线，版本 = 继续向前的新号。既保住 Agent 的单调性规则，也让台账与事实一致。
-      // 这与 §3.4「desired 不回退」并不冲突 —— desired 不是往回退，而是前进到一个"内容等于基线"
-      // 的新世代，UI 因此可以如实显示"已回滚到上一版本的内容"。
+      // Rollback is a new generation carrying baseline content. Replaying an older
+      // revision would violate the Agent's monotonic revision fence; reusing the
+      // failed target revision would make revision identity disagree with content.
       const rollbackGeneration = Math.max(
         Number(row.base_revision),
         Number(row.revision ?? row.base_revision),
