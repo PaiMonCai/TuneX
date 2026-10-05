@@ -22,7 +22,9 @@
 #   scripts/ops/install.sh --check   install --version <git-sha>       # 只做前置检查（真实探测，零副作用）
 #
 # 选项：--allow-floating（配合 --version latest）、--standalone、--agent-image <ref>、
-#       --purge-data、--yes、--dry-run、--check、--no-docker（仅与 --dry-run/--check 合用）
+#       --purge-data、--yes、--reuse-env（install 专用：仅在 .env 校验通过且 TUNEX_IMAGE 与请求版本
+#       一致时，允许复用"上次半途失败留下的 .env"）、--dry-run、--check、
+#       --no-docker（仅与 --dry-run/--check 合用）
 #
 # 退出码：2 用法/参数；3 非 root；4 平台或 Docker/Compose 不满足；5 缺必需命令/文件；
 #         6 同机 tunex 项目冲突；7 .env 校验不通过；8 已有部署（幂等拒绝，不再产生第二套副作用）；
@@ -78,6 +80,7 @@ TX_AGENT_IMAGE_OPT=""
 TX_ALLOW_FLOATING=0
 TX_STANDALONE=0
 TX_PURGE_DATA=0
+TX_REUSE_ENV=0
 TX_ASSUME_YES=0
 TX_DRY_RUN=0
 TX_CHECK=0
@@ -648,15 +651,20 @@ tx_resolve_images() {
   fi
 }
 
+# .env 里当前声明的面板镜像（没有 .env 时为空）。
+tx_env_current_image() {
+  if [ -f "$TX_ENV_FILE" ]; then tx_env_get "$TX_ENV_FILE" TUNEX_IMAGE; fi
+}
+
+# 幂等三态。**调用方必须先自己执行** `TX_ENV_IMAGE_VALUE="$(tx_env_current_image)"`：
+# tx_deploy_state 是用 `state="$(tx_deploy_state)"` 调用的，命令替换跑在子 shell 里，
+# 函数内部对 TX_ENV_IMAGE_VALUE 的赋值传不回父 shell（早期版本就踩了这个坑：拒绝信息里
+# "当前版本"恒为空）。
 tx_deploy_state() {
-  local count has_env=0
+  local count
   count="$(tx_project_container_count)"
-  TX_ENV_IMAGE_VALUE=""
-  if [ -f "$TX_ENV_FILE" ]; then
-    has_env=1
-    TX_ENV_IMAGE_VALUE="$(tx_env_get "$TX_ENV_FILE" TUNEX_IMAGE)"
-  fi
-  tx_classify_deploy_state "$has_env" "$TX_ENV_IMAGE_VALUE" "${count:-0}" "$TX_PANEL_IMAGE"
+  tx_classify_deploy_state "$([ -f "$TX_ENV_FILE" ] && printf 1 || printf 0)" \
+    "${TX_ENV_IMAGE_VALUE:-}" "${count:-0}" "$TX_PANEL_IMAGE"
 }
 
 tx_refuse_install_state() { # <state>
@@ -685,15 +693,35 @@ tx_action_install() {
   tx_resolve_images
   tx_preflight install
   tx_prepare_compose_args
-  local state
+  local state reuse_env=0
+  TX_ENV_IMAGE_VALUE="$(tx_env_current_image)"
   state="$(tx_deploy_state)"
-  if [ "$state" != "none" ]; then tx_refuse_install_state "$state"; fi
-  tx_log "探测：本机没有 tunex 生产栈（无 .env、无项目容器）→ 继续"
-  # 走到这里状态一定是 none：`.env` 存在的那三种情况（same/different/partial）都在上面被拒绝了，
-  # 所以安装器在结构上不可能覆盖用户既有配置 —— 这是 FROZEN-1 §3「.env 已存在永不覆盖」的更强形式。
-  tx_env_generate
+  if [ "$state" = "partial" ]; then
+    # partial = 有 .env、无容器（上次安装半途失败）。默认拒绝；
+    # `--reuse-env` 是**显式**复位开关，且只在"校验通过 + 版本一致"两条件同时满足时放行。
+    if [ "$TX_REUSE_ENV" -ne 1 ]; then
+      tx_refuse_install_state "$state"
+    fi
+    if [ "$TX_ENV_IMAGE_VALUE" != "$TX_PANEL_IMAGE" ]; then
+      tx_fail "$TX_E_STATE" "install --reuse-env 拒绝：.env 里的 TUNEX_IMAGE=${TX_ENV_IMAGE_VALUE:-空} 与本次请求 $TX_PANEL_IMAGE 不一致。
+  保留数据升级请用： sudo $TX_SELF upgrade --version <sha>
+  要从头再来请人工处理 .env（安装器不覆盖既有配置）"
+    fi
+    tx_log "--reuse-env：.env 校验通过且 TUNEX_IMAGE 与请求版本一致（$TX_PANEL_IMAGE）→ 复用既有 .env（值不改、权限不动）"
+    reuse_env=1
+  elif [ "$state" != "none" ]; then
+    tx_refuse_install_state "$state"
+  fi
+  if [ "$reuse_env" -eq 1 ]; then
+    tx_log "复用既有 .env：$TX_ENV_FILE（不覆盖、不重写任何键）"
+  else
+    tx_log "探测：本机没有 tunex 生产栈（无 .env、无项目容器）→ 继续"
+    # 走到这里状态一定是 none：`.env` 存在的那三种情况（same/different/partial）都在上面被拒绝了，
+    # 所以安装器在结构上不可能覆盖用户既有配置 —— 这是 FROZEN-1 §3「.env 已存在永不覆盖」的更强形式。
+    tx_env_generate
+  fi
   tx_load_env
-  # .env 现在一定存在（刚生成），compose 的 --env-file 必须跟着更新。
+  # .env 现在一定存在（刚生成或复用），compose 的 --env-file 必须跟着更新。
   tx_prepare_compose_args
   tx_log "拉取镜像：$TX_PANEL_IMAGE"
   tx_pull "$TX_PANEL_IMAGE" || tx_fail "$TX_E_RUNTIME" "docker pull 失败：$TX_PANEL_IMAGE（本机未做任何变更）"
@@ -712,6 +740,7 @@ tx_action_upgrade() {
   tx_preflight upgrade
   tx_prepare_compose_args
   local state
+  TX_ENV_IMAGE_VALUE="$(tx_env_current_image)"
   state="$(tx_deploy_state)"
   if [ "$state" = "none" ] || [ "$state" = "partial" ]; then
     tx_fail "$TX_E_STATE" "upgrade 拒绝：没有可升级的运行中部署（状态=$state）。首次部署请用 sudo $TX_SELF install --version <sha>"
@@ -919,6 +948,7 @@ tx_main() {
       --allow-floating) TX_ALLOW_FLOATING=1; shift ;;
       --standalone)   TX_STANDALONE=1; shift ;;
       --purge-data)   TX_PURGE_DATA=1; shift ;;
+      --reuse-env)    TX_REUSE_ENV=1; shift ;;
       --yes|-y)       TX_ASSUME_YES=1; shift ;;
       --dry-run)      TX_DRY_RUN=1; shift ;;
       --check)        TX_CHECK=1; shift ;;
@@ -930,6 +960,9 @@ tx_main() {
   [ -n "$TX_ACTION" ] || tx_usage "$TX_E_USAGE"
   if [ "$TX_NO_DOCKER" -eq 1 ] && [ "$TX_DRY_RUN" -ne 1 ] && [ "$TX_CHECK" -ne 1 ]; then
     tx_fail "$TX_E_USAGE" "--no-docker 只允许与 --dry-run 或 --check 合用（真实部署必须真的检测 Docker）"
+  fi
+  if [ "$TX_REUSE_ENV" -eq 1 ] && [ "$TX_ACTION" != "install" ]; then
+    tx_fail "$TX_E_USAGE" "--reuse-env 只对 install 有意义（当前动作：$TX_ACTION）"
   fi
 
   case "$TX_ACTION" in

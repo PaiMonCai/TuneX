@@ -366,6 +366,10 @@ has "status" "拒绝信息指向 status"
 has "upgrade" "拒绝信息指向 upgrade"
 hasnt "docker pull" "拒绝时没有发生 pull 计划"
 
+# D4b 拒绝信息里的"当前版本"必须非空（`state="$(...)"` 是子 shell，早期实现这里恒为空）
+run_install "$FX_SAME" "$SB_SAME" install --dry-run --version "$SHA_FAKE"
+has "TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA_FAKE" "同版本拒绝信息带出当前 TUNEX_IMAGE（不是空值）"
+
 # D5 异版本已部署 → 拒绝并指向 upgrade / uninstall
 FX_DIFF="$(mkfix diff project_container_count=6 project_working_dirs="$SB_SAME" project_image=old)"
 run_install "$FX_DIFF" "$SB_SAME" install --dry-run --version "1111111111111111111111111111111111111111"
@@ -377,6 +381,30 @@ FX_PARTIAL="$(mkfix partial project_container_count=0)"
 run_install "$FX_PARTIAL" "$SB_SAME" install --dry-run --version "$SHA_FAKE"
 expect_rc 8 "有 .env 无容器（半途失败）→ install 拒绝"
 has "不自动复用" "拒绝信息说明不自动复用/清理"
+
+# D6b --reuse-env：显式复位开关（仅在 .env 校验通过 + 版本一致时放行；缺一仍 fail-closed）
+FX_PARTIAL0="$(mkfix partial0 project_container_count=0)"
+run_install "$FX_PARTIAL0" "$SB_SAME" install --dry-run --version "$SHA_FAKE" --reuse-env
+expect_rc 0 "--reuse-env + .env 校验通过 + 版本一致 → 允许继续"
+has "复用既有 .env" "复用路径明确打印『复用既有 .env』"
+hasnt "cp $SB_SAME/.env.production.example" "复用时不再复制模板生成 .env"
+has "docker pull ghcr.io/paimoncai/tunex:$SHA_FAKE" "复用后照常走 pull/up/健康"
+
+run_install "$FX_PARTIAL0" "$SB_SAME" install --dry-run --version "1111111111111111111111111111111111111111" --reuse-env
+expect_rc 8 "--reuse-env 但版本不一致 → 仍然拒绝（exit 8）"
+has "--reuse-env 拒绝" "拒绝信息点明 --reuse-env"
+has "upgrade --version" "拒绝信息给出 upgrade 出路"
+hasnt "docker pull" "版本不一致时没有 pull 计划"
+
+FX_SAME_CONTAINERS="$(mkfix same_containers project_container_count=6 project_working_dirs="$SB_SAME")"
+run_install "$FX_SAME_CONTAINERS" "$SB_SAME" install --dry-run --version "$SHA_FAKE" --reuse-env
+expect_rc 8 "--reuse-env 不适用于『真的有部署在跑』（同版本）"
+SB_REUSE_BAD="$TMP/sandbox-reuse-bad"; mk_sandbox "$SB_REUSE_BAD"
+grep -v '^AUTH_SECRET=' "$ENV_GOOD" > "$SB_REUSE_BAD/.env"; chmod 600 "$SB_REUSE_BAD/.env"
+run_install "$FX_PARTIAL0" "$SB_REUSE_BAD" install --dry-run --version "$SHA_FAKE" --reuse-env
+expect_rc 7 "--reuse-env 但 .env 校验不过（缺 AUTH_SECRET）→ 仍然 7（校验优先于复用）"
+run_install "$FX_NONE" "$SB" uninstall --dry-run --reuse-env
+expect_rc 2 "--reuse-env 用在非 install 动作 → 用法错误"
 
 # D7 非 root（DoD 4）
 FX_NONROOT="$(mkfix nonroot uid=1000)"
