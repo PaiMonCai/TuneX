@@ -1,19 +1,12 @@
-// Package forwarder holds the v3 data plane: the Forwarder contract that every
-// tunnel mode implements plus the TCP implementations for DIRECT, RELAY and
-// EGRESS tunnels.
+// Package forwarder owns the Agent's protocol/data-plane contract.
 //
-// The interface and the TunnelConfig shape are the WP4 freeze (see
-// docs/tunex-devmap-v3.md §7.1): later protocols (UDP / WS / TLS / QUIC) are
-// expected to satisfy the same contract without changing it. Like the rest of
-// the agent module this package is standard-library only, so `go build ./...`
-// keeps working fully offline.
+// TCP, TLS, WebSocket and UDP all enter through TunnelConfig and are owned by
+// manager.TunnelManager / manager.EgressManager. Topology mode and protocol are
+// separate dimensions, and the implemented protocol table in this package is
+// the source of truth for both parsing and capability advertisement.
 //
-// Nothing here talks to the control plane. A Forwarder is built from a
-// TunnelConfig and is owned by manager.TunnelManager, the only place that knows
-// about revisions, node roles and the shared port guard. DIRECT and RELAY share
-// one implementation (singhop.go); EGRESS has its own because it load-balances
-// over a pool. Since WP15 there is exactly one data plane per tunnel mode and no
-// second "legacy" implementation to fall back to.
+// Nothing here talks directly to the Panel. The package is standard-library
+// only so the Agent remains fully offline-buildable.
 package forwarder
 
 import (
@@ -62,29 +55,27 @@ func ParseTunnelMode(s string) (TunnelMode, error) {
 // It is deliberately separate from TunnelMode: DIRECT/RELAY/EGRESS describes
 // topology/role, while protocol describes how bytes/packets are transported.
 // New protocol constants must not be added merely because a legacy Panel enum
-// contains the name; they are opened only with their V5 protocol Gate.
+// contains the name; parser/runtime/capability support must land together.
 type ForwardProtocol string
 
 const (
 	ProtocolTCP ForwardProtocol = "tcp"
 	// ProtocolTLS is the same stream lifecycle with a TLS-terminated
-	// client-facing listener (V5-WP5-A1). See the semantics contract in
+	// client-facing listener. See the semantics contract in
 	// DEVELOPMENT.md §6.1: TLS stops at the INGRESS listener; the inter-node hop
 	// stays plain TCP.
 	ProtocolTLS ForwardProtocol = "tls"
 	// ProtocolWS is the stream lifecycle with a WebSocket front: the client's
-	// frame payloads are unwrapped into the byte stream forwarded to the target
-	// (V5-WP5-A2). Framing and transport security are separate dimensions, which
+	// frame payloads are unwrapped into the byte stream forwarded to the target.
+	// Framing and transport security are separate dimensions, which
 	// is why there is no `wss` protocol value.
 	ProtocolWS ForwardProtocol = "ws"
-	// ProtocolUDP is the client-facing datagram front (V5-WP5-B1). The client
-	// speaks connectionless UDP datagrams, so this protocol is carried by the
-	// datagram transport below, never by the stream one: there is no accepted
-	// connection to map to an upstream, no connection count and no drain of
-	// connections. Its semantics are frozen in
-	// docs/v5-1b-datagram-contract-draft.md; V5.1b opens UDP **DIRECT only**, so
-	// the RELAY/EGRESS shapes are refused in Validate instead of being
-	// half-implemented.
+	// ProtocolUDP is the client-facing datagram front. It uses the datagram
+	// transport below rather than the stream lifecycle: there is no accepted
+	// connection to map to an upstream and no connection drain. The released
+	// product supports UDP DIRECT and single-hop RELAY; multi-hop and cross-panel
+	// UDP remain fail-closed. Full semantics live in
+	// docs/v5-1b-datagram-contract-draft.md.
 	ProtocolUDP ForwardProtocol = "udp"
 )
 
@@ -131,7 +122,7 @@ var protocolRuntimes = []protocolRuntime{
 }
 
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
-// whose V5 runtime Gate has not been opened yet.
+// not implemented by the current runtime.
 func ParseForwardProtocol(s string) (ForwardProtocol, error) {
 	name := strings.ToLower(strings.TrimSpace(s))
 	if name == "" {
@@ -185,7 +176,7 @@ func ImplementedTransports() []string {
 }
 
 // LBStrategy selects how an EGRESS tunnel spreads connections over its pool.
-// The values are the devmap §3 enum names; ParseLBStrategy also accepts the
+// ParseLBStrategy also accepts the
 // panel's short EgressPool spellings ("round" / "rand" / "weighted_round") so
 // a payload from either side of the wire is understood.
 type LBStrategy string
