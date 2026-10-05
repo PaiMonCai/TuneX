@@ -482,27 +482,23 @@ func (c *TunnelConfig) Validate() error {
 	if protocol == ProtocolWS && mode == ModeEgress {
 		return errors.New("forwarder: ws terminates at the client-facing listener; an EGRESS tunnel cannot be ws")
 	}
-	// UDP is a client-facing datagram front. V5.1b opens DIRECT (WP5-B1) and now
-	// the EXIT half of RELAY (WP5-B2, contract §9.1):
+	// UDP is a client-facing datagram front. V5.1b opens DIRECT (WP5-B1) and BOTH
+	// halves of RELAY (WP5-B2, contract §9.1 — the hop is datagram end to end):
 	//
-	//   - EGRESS: allowed. The datagram hop is UDP end to end, so this node
-	//     listens on UDP and is fed hop packets by the paired ingress. The peer is
-	//     not implied by a handshake (there is none) — `hop_peer` tells this exit
-	//     who may feed it, and the datagram egress constructor REFUSES to build
-	//     without it.
-	//   - RELAY: still refused, but no longer because the shape is undecided —
-	//     §9.1 froze it as "datagram end to end". It is refused here because the
-	//     ingress half of that hop has no runtime in this build yet. Accepting the
-	//     config would produce exactly the failure the old comment warned about:
-	//     a config that validates, reaches the node and fails where nobody looks.
-	//     The refusal disappears in the same commit that lands the ingress runtime.
-	if protocol == ProtocolUDP && mode == ModeRelay {
-		return fmt.Errorf(
-			"forwarder: udp RELAY needs the datagram hop ingress runtime, which is not wired in this build (the exit half is; see docs/v5-1b-datagram-contract-draft.md §12)")
-	}
+	//   - EGRESS: allowed, and `hop_peer` is REQUIRED. The hop is UDP, so unlike
+	//     TCP there is no handshake to tell this exit who the peer is; without the
+	//     field the exit would have to either guess or accept anyone, and accepting
+	//     anyone turns it into a relay to its configured targets.
+	//   - RELAY: allowed. The ingress keeps one socket toward the exit and carries
+	//     every client mapping over it, tagged with a hop header; `next_hop` names
+	//     that socket's destination, so an empty one is refused with that name.
 	if protocol == ProtocolUDP && mode == ModeEgress && strings.TrimSpace(c.HopPeer) == "" {
 		return fmt.Errorf(
 			"forwarder: udp EGRESS tunnel %s needs hop_peer (the paired ingress address); refusing to accept hop packets from an unattested source", c.ID)
+	}
+	if protocol == ProtocolUDP && mode == ModeRelay && strings.TrimSpace(c.NextHop) == "" {
+		return fmt.Errorf(
+			"forwarder: udp RELAY tunnel %s needs next_hop (the egress node address) to send client datagrams to", c.ID)
 	}
 
 	if strategy := strings.TrimSpace(string(c.LBStrategy)); strategy != "" {

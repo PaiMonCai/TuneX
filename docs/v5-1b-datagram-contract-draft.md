@@ -896,17 +896,30 @@ G1B.regress tcp/tls/ws + udp DIRECT 全绿，且**连跑两遍逐行一致**
    就能打到配置目标"的中继。缺失时 `Validate()` 与构造函数**双双拒绝**，并且拒绝文案要点
    名 `hop_peer`（拒绝信息读不出原因等于没拒绝）。
 
-**落地顺序（本轮的半边）**：出口半边先落地（Agent 侧 `DatagramEgress` + `Validate` 打开
-`udp + EGRESS`（要求 `hop_peer`）），**入口半边尚未落地**，因此：
+**落地顺序（2026-10-05 更新：Agent 两侧均已落地）**
 
-- Agent 仍拒绝 `udp + RELAY`，但理由**换了**——不再是"形态未定"（形态已冻结），而是
-  "入口侧运行时在这个 build 里还不存在"；文案必须点名这一半。
-- **面板继续保持拒绝** `udp + RELAY`（`forward-revision.ts` 的
-  `datagram_relay_unsupported`）：能建但永远服务不了的 Forward 比建不出来更糟。它**与入口
-  运行时同一个提交**一起放开，并在同一次提交里把 Gate 断言从"被拒"翻转为"可用"——
-  翻转必须**写明**，不得静默删除。
-- 门禁 **V5-G1B.5 今天仍然成立**：它是**面板级**断言（创建被拒、出口节点上没有 udp
-  runtime），不因 Agent 侧多了一个出口运行时而失效。
+Agent 侧：**出口半边与入口半边都已落地**（`DatagramEgress` / `DatagramRelay`），
+`Validate()` 对 `udp + EGRESS`（要求 `hop_peer`）与 `udp + RELAY`（要求 `next_hop`）
+均已打开；factory 按 role 分派；manager 把目标池与观测器接进 datagram deps
+（此前是空结构，出口运行时在生产里拿不到 selector —— 这是本轮修掉的接线缺口）。
+
+**面板侧仍未放开** `udp + RELAY`（`forward-revision.ts` 的 `datagram_relay_unsupported`），
+原因是面板那条链还缺两样东西，缺了就会造出**能建但服务不了**的 Forward：
+
+1. 出口腿必须带上 `hop_peer`（= 配对入口节点的地址），否则出口按 §12.5 第 3 条拒绝构建；
+2. 出口池必须有协议维度（`EgressTarget.protocol`），否则 `TargetDescriptor.protocol`
+   这个**已经存在**的 wire 字段仍然在下发链路上被丢弃（§10 第 6 条）。
+
+因此落地规则修正为：**面板与 Agent 不在同一次提交里放开，而是以"面板下发的配置必须完整"
+为准**——面板放开的那个提交必须同时满足上面两条，并同步把 Gate V5-G1B.5 的断言从
+"被拒"翻转为"可用"（翻转必须写明，不得静默删除）。在此之前，门禁
+**V5-G1B.5 仍然成立**：它是**面板级**断言（创建被拒、出口节点上没有 udp runtime），
+不因 Agent 侧多出两个运行时而失效。
+
+**回填第 4 条（本轮实现发现）**：**入口侧的 `Retarget` 只接受空操作。** 每个映射共用
+**一个**朝向出口的 socket，所以"活映射继续走旧跳、新映射走新跳"是这条链路给不了的承诺
+（§3.4 的那条语义是**目标**变更的语义，不是**跳地址**变更的语义）。因此地址真的变了就返回
+`ErrUpstreamNotSwappable`——manager 把它读作"这个 runtime 需要重建"，而重建恰好是正确答案。
 
 ---
 

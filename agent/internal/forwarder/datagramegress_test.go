@@ -3,7 +3,6 @@ package forwarder
 import (
 	"bytes"
 	"net"
-	"strings"
 	"testing"
 	"time"
 )
@@ -304,9 +303,9 @@ func TestDatagramEgressDropsOversizeReplyInsteadOfTruncating(t *testing.T) {
 
 // ---------------------------------------------------------------- factory -----
 
-// The factory must route each ROLE to its own runtime and keep refusing the role
-// that has no runtime yet. This is the check that keeps "not implemented" from
-// becoming "validates and fails far away".
+// The factory must route each ROLE to its own runtime. A role that resolves to the
+// wrong constructor is the §4.1 mistake expressed as a map; here it is checked
+// instead of being discovered as a wrong listener in production.
 func TestBuildUDPDatagramRoutesByRole(t *testing.T) {
 	targetAddr, stopTarget := udpEchoTarget(t, "T")
 	defer stopTarget()
@@ -314,27 +313,31 @@ func TestBuildUDPDatagramRoutesByRole(t *testing.T) {
 	deps := DatagramBuildDeps{SelectorFor: func(string) (TargetSelector, error) { return sel, nil }}
 
 	direct := TunnelConfig{ID: "d", Mode: ModeDirect, Protocol: ProtocolUDP, IngressPort: freeUDPPort(t), RemoteHost: "127.0.0.1", RemotePort: targetPortOf(t, targetAddr)}
-	if _, err := buildUDPDatagram(direct, deps); err != nil {
+	if got, err := buildUDPDatagram(direct, deps); err != nil {
 		t.Fatalf("DIRECT was refused: %v", err)
+	} else if _, ok := got.(*DatagramForwarder); !ok {
+		t.Fatalf("DIRECT resolved to %T, want the DIRECT datagram runtime", got)
 	}
 
 	egress := egressTestConfig(t, freeUDPPort(t), "127.0.0.1")
-	if _, err := buildUDPDatagram(egress, deps); err != nil {
+	if got, err := buildUDPDatagram(egress, deps); err != nil {
 		t.Fatalf("EGRESS was refused: %v", err)
+	} else if _, ok := got.(*DatagramEgress); !ok {
+		t.Fatalf("EGRESS resolved to %T, want the datagram egress runtime", got)
 	}
 
 	relay := TunnelConfig{ID: "r", Mode: ModeRelay, Protocol: ProtocolUDP, IngressPort: freeUDPPort(t), NextHop: "127.0.0.1:1234"}
-	_, err := buildUDPDatagram(relay, deps)
-	if err == nil {
-		t.Fatal("RELAY was accepted although the hop ingress runtime does not exist yet")
-	}
-	if !strings.Contains(err.Error(), "ingress") {
-		t.Fatalf("the RELAY refusal must name the missing half, got: %v", err)
+	if got, err := buildUDPDatagram(relay, deps); err != nil {
+		t.Fatalf("RELAY was refused: %v", err)
+	} else if _, ok := got.(*DatagramRelay); !ok {
+		t.Fatalf("RELAY resolved to %T, want the datagram relay ingress runtime", got)
 	}
 
-	// Validate is the gate that runs BEFORE the factory: it must refuse the same
-	// role, so a bad config never reaches a builder at all.
-	if err := relay.Validate(); err == nil {
-		t.Fatal("Validate accepted udp RELAY")
+	// Validate gates the same field the RELAY constructor needs, so a config
+	// missing next_hop never reaches a builder at all.
+	bare := relay.Clone()
+	bare.NextHop = ""
+	if err := bare.Validate(); err == nil {
+		t.Fatal("Validate accepted udp RELAY without next_hop")
 	}
 }

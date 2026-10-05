@@ -214,14 +214,9 @@ var datagramBuilders = map[ForwardProtocol]DatagramBuilder{
 // Roles are not interchangeable and the builder does not pretend otherwise:
 //
 //   - DIRECT: client datagrams to a local target (WP5-B1, gated by V5-G1B 76/0);
-//   - EGRESS: hop packets from the paired ingress to a pooled target (WP5-B2,
-//     contract §9.1 — the datagram hop is UDP end to end, so the exit listens on
-//     UDP rather than framing datagrams inside a TCP stream);
-//   - RELAY: the ingress half of that hop. Its runtime lands in the same WP; until
-//     it exists this role is REFUSED here rather than half-implemented — a relay
-//     ingress with no hop runtime would accept client datagrams and silently drop
-//     them, which is exactly the "校验通过、运行失败" failure the contract warns
-//     about (§3.3).
+//   - EGRESS: hop packets from the paired ingress to a pooled target (WP5-B2);
+//   - RELAY: the ingress half of that hop — client mappings carried to the exit
+//     over one shared socket, demultiplexed by the hop header (WP5-B2).
 //
 // The idle timeout and mapping ceiling are package defaults on every role: the
 // contract freezes one value for DIRECT and RELAY so the two cannot drift (§9.2).
@@ -243,8 +238,10 @@ func buildUDPDatagram(cfg TunnelConfig, deps DatagramBuildDeps) (DatagramRuntime
 			Observer:    deps.Observer,
 		})
 	case ModeRelay:
-		return nil, fmt.Errorf(
-			"forwarder: udp RELAY (datagram hop ingress) has no runtime in this build; the exit half exists, the ingress half is not wired yet")
+		return NewDatagramRelay(cfg, DatagramRelayOptions{
+			IdleTimeout: deps.IdleTimeout,
+			MaxMappings: deps.MaxMappings,
+		})
 	default:
 		return nil, errModeNot(ModeDirect, cfg.Mode)
 	}
