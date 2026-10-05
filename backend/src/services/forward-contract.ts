@@ -13,7 +13,7 @@ export type ForwardMode = (typeof FORWARD_MODES)[number];
 /**
  * Product protocols the runtime has opened.
  *
- * A value lands here only together with its own Gate (V5-G0 established the
+ * A value lands here only together with its own Gate (regression coverage established the
  * "enum presence is not product support" rule;  enforced it). V5.1a adds
  * `tls` — the same stream lifecycle with a TLS-terminated client-facing listener
  * (DEVELOPMENT.md §6.1). `ws` follows in . `udp` follows in V5.1b
@@ -305,7 +305,7 @@ export function firstConnectIp(raw: string | null | undefined): string | null {
 
 /** `ip:port` / `[v6]:port` / 裸地址 → 地址部分；空串或非字符串 → null。
  *
- * 导出是因为**编排层也要用它**：入口 ACK 回报的是 `ip:port`，而面板要拿地址部分去与
+ * 导出是因为**编排层也要用它** 入口 ACK 回报的是 `ip:port`，而面板要拿地址部分去与
  * `connect_ip` 比对，才能判断这次下发的取证地址是不是错的。第二份解析就是漂移的开始。 */
 export function addressPartOfEndpoint(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -328,13 +328,13 @@ export function addressPartOfEndpoint(raw: unknown): string | null {
  * **优先用入口自己上报的跳端点**（`diag.hop_local_addr`），回落到 `connect_ip`。
  *
  * 为什么不能只用 `connect_ip`：那个值在多宿节点上是**错的**。跳的源地址由内核按路由选，
- * 可能是面板完全不知道的那张网——真拓扑上的实测就是"入口从出口网地址发出，面板却告诉出口
+ * 可能是面板完全不知道的那张网——真拓扑上的observed就是"入口从出口网地址发出，面板却告诉出口
  * 接受它的入口网地址"，于是每个跳报文都被丢弃（`ingress packets_in=1` /
  * `egress drops=1, packets_in=0`）。而"告诉入口该用哪个源地址"也不行：跨子网源地址会被
- * 当作 martian 丢弃（实测绑定源地址后**没有任何回应**）。所以这个地址只能由**真正知道它
+ * 当作 martian 丢弃（observed绑定源地址后**没有任何回应**）。所以这个地址只能由**真正知道它
  * 的那一端**发布——与 `next_hop` 的流向（出口 → 面板 → 入口）恰好相反。
  *
- * **只取地址部分，不取端口**：端口是临时的，入口一重启就变；把它写进出口腿的配置会让
+ * **只取地址部分，不取端口** 端口是临时的，入口一重启就变；把它写进出口腿的配置会让
  * 配置在每次重启后都不一样（无谓的 revision 抖动），而出口本来就只钉地址、忽略端口。
  */
 export function datagramHopPeerFor(input: {
@@ -525,7 +525,7 @@ export function buildForwardRuntimePlan(
  *
  * 为什么需要一个校验函数而不是只定义类型：这些规则用类型表达不了，而它们恰好是
  * 「协议对了、传输对了，但计划自相矛盾」的那一类错误——例如 RELAY 计划没有
- * next_hop、DIRECT 计划却带着出口节点。Gate V5-G0 与后续协议都会读计划，
+ * next_hop、DIRECT 计划却带着出口节点。regression coverage 与后续协议都会读计划，
  * 与其每个消费者各自假设，不如在这里一次说清。
  *
  * 纯函数，不抛：调用方（Gate、诊断、未来协议）需要把违规当成数据收集起来。
