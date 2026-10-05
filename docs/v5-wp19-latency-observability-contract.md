@@ -346,13 +346,44 @@
 - **O9 跨租户聚合**：今天 `target_observation` 经 `Node → NodeGroup → workspace` 隔离，
   新表必须继承同一条链；任何跨租户看板都是新契约，不在本 WP。
 
+
+## WP19-C 交付记录（2026-10-05）
+
+**交付物**：`backend/src/services/forward-topology.ts`（只读投影 + 编排 + 生产接线）+
+`GET /api/forwards/:id/topology`。
+
+**兑现「不新建拓扑真相」的三条**：
+1. **段结构**直接取自 `probeTargetsForForward()` 的 `node_facts` 段（"入口↔出口拆成两段、每段
+   点名两端节点与期望 runtime"本来就是那条能力的实现），**不再算一遍**；
+2. **活事实**按 runtime id 从节点**自己的上报**里取，复用 `wp19-F` 的 `diagOfTunnel` 类型化视图
+   （不重新解析原始 JSON、不重新组装 diag —— 那会是第二份 diag 真相）；
+3. **行事实**复用诊断路径的 `loadForward`（`ForwardForDiagnose`），不另写查询。
+
+**这个视图存在的理由**：`running` 回答的是"这条 runtime 出现在该节点**最近一次上报**里吗"。
+`apply_status=active` 只说明面板收到了 ACK —— **"面板全绿、数据面不通"正是两者不一致的形态**
+（① 里就是这样：出口把每个报文都丢掉，而控制面全绿、两侧账本健康）。
+
+**三处刻意的区分（都落成断言）**：
+- **"从没上报过" vs "上报里没有它"**：前者 `reported_at === null`，后者有值但 `running === false`；
+  压成一个"不健康"会让排障从"看数据"退化成"猜"；
+- **DIRECT 没有节点间段是正常的**（链路是"入口 → 目标"），不是失败；
+- **"缺出口地址"不会让计划失败**（计划照样给段、`hop` 为 null = 没法拨号），而"没有入口节点"
+  才是真的不成立 ⇒ 前者 200、后者 409。混起来会把"出口地址还没配好"误报成"拓扑不成立"。
+
+**可达性用行为验证**：除源码级顺序守卫（`forward-route-order.test.ts`）外，
+`forward-route-topology.test.ts` 挂**真实** router 打一次 `app.request()` —— 本仓在同一个 WP 里
+被"单独 mount 的路由测试验证不了它在应用里真的可达"咬过两次（`POST /:id/dns` 被 catch-all 吃掉、
+`preferred-ingress` 因 Prisma 字段写错 500），而两次的单元测试都是绿的。
+
+**边界（明确不做）**：不探测（diag / Looking Glass）、不读 DNS、不聚合延迟（WP19-B）。
+
 ## 5. WP 拆分
 
 | WP | 名称 | 范围 | 依赖 |
 |---|---|---|---|
 | WP19-A | 契约（本文） | 语义/边界/Gate 映射 | — |
 | **WP19-F** | **`diag` 的面板读路径（建议先做）** | 把线上已在跑的 `ReportedTunnel.diag` 变成面板一等事实（校验+投影+Web），收口 §1.4 | 无 |
-| WP19-C | 链路拓扑与逐跳明细 | 复用 route plan / 三跳段（`forward-probe-plan.ts:153-189`）与 diag 逐跳结果；**不新建拓扑真相** | 无 |
+| WP19-C | 链路拓扑与逐跳明细 | 复用 route plan / 三跳段（`forward-probe-plan.ts:153-189`）与 diag 逐跳结果；**不新建拓扑真相** | 无 —— **已交付 2026-10-05**：`services/forward-topology.ts` + `GET /api/forwards/:id/topology`；12 条断言（投影 8 + 路由可达性 4） | 不探测、不读 DNS、不聚合延迟 |
 | WP19-B | 延迟历史序列 | 新表+保留期+清理+读路径+Web 图 | O1/O4 |
 | WP19-D | Looking Glass | 新 action + 白名单 + 配额 + 审计 + 视图；复用 D8 四处 | O2/O6/O7/O8 |
 | WP19-E | 带宽 / 跳测 | Go 内建等价物 或 明确不做 | O5 |
