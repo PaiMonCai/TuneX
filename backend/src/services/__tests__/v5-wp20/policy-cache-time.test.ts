@@ -106,10 +106,10 @@ test("策略缓存：noCache 不写、TTL 按墙钟（未来时刻不得污染�
       TUNEX_CACHE_ROOT: root,
       // 模块在 import 期读这个值 ⇒ 必须在 import 之前设好（子进程环境里给）
       POLICY_CACHE_TTL_MS: "50",
-      DATABASE_URL: process.env.DATABASE_URL ?? "mysql://tunex-test:tunex-test@127.0.0.1:3306/tunex_test_unused",
+      DATABASE_URL: process.env.DATABASE_URL ?? "mysql://tunex-test:tunex-test@127.0.0.1:3306/tunex_test_unused", // secret-scan:allow — local test fixture
       REDIS_URL: process.env.REDIS_URL ?? "redis://127.0.0.1:6379/15",
-      AUTH_SECRET: process.env.AUTH_SECRET ?? "tunex-unit-test-auth-secret-not-a-real-secret",
-      LICENSE_SECRET: process.env.LICENSE_SECRET ?? "tunex-unit-test-license-secret-not-a-real-secret",
+      AUTH_SECRET: process.env.AUTH_SECRET ?? "tunex-unit-test-auth-secret-not-a-real-secret", // secret-scan:allow — local test fixture
+      LICENSE_SECRET: process.env.LICENSE_SECRET ?? "tunex-unit-test-license-secret-not-a-real-secret", // secret-scan:allow — local test fixture
     },
     encoding: "utf8",
     timeout: 30_000,
