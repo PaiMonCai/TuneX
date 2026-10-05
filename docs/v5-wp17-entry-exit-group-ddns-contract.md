@@ -355,7 +355,7 @@
 |---|---|---|
 | WP17.0 | 本文档冻结（状态行改 FROZEN + 冻结清单） | 任何代码 |
 | WP17.1 | 候选集同源化：`failover-loop` 的候选来源与 Route Profile 编译来源一致（同一份 `nodeAdmission` + constraints，`deriveConnection` 判在线），离线用例钉死「不放行 ⇒ 不迁 + 原因码」 | 不改 `decideFailover` 词表 |
-| WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 | 不写 DNS、不建 provider 适配 |
+| WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 —— **已交付 2026-10-05**：`services/ddns-binding.ts` + `routes/ddns.ts` + `forwards.ts` 的 `/:id/dns`；38 条断言（服务层 33 + 路由层 5，后者钉住 `settings:manage` 这条接线） | 不写 DNS、不建 provider 适配 |
 | WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 | 不接 failover、不碰 rollout |
 | WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 | 不新增定时器、不改 rollout 步骤词表 |
 | WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 | 不改 G3/G4/G5 断言 |

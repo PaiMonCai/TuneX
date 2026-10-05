@@ -10,6 +10,16 @@ import { z } from "zod";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { db } from "../db.ts";
 import { canWorkspaceResourceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
+import {
+  DDNS_ERROR_CODES,
+  DDNS_TTL_SECONDS,
+  DNS_MODES,
+  DNS_RECORD_TYPES,
+  bindForwardDns,
+  dnsBindingState,
+  unbindForwardDns,
+} from "../services/ddns-binding.ts";
+import type { DdnsDb, DdnsDeps, DdnsResult, DnsBindingRow } from "../services/ddns-binding.ts";
 import { defaultDiagnoseDeps, diagnoseForward } from "../services/agent-diagnose.ts";
 import {
   createForward,
@@ -390,4 +400,114 @@ forwardsRoutes.delete("/:id", async (c) => {
   const denied = await authorizeForward(c, id, "delete");
   if (denied) return denied;
   return send(c, await deleteForward(id, workspace(c).id));
+});
+
+/* ================================================================== */
+/* V5-WP17.2 —— DNS 前门：绑定 / 解绑 / 状态（**零外呼**）               */
+/* ================================================================== */
+
+/**
+ * 为什么这三个端点挂在 `/api/forwards/:id/dns` 而不是 `/api/ddns/...`：
+ * DNS 前门是**某一条转发**的属性，不是独立资源。挂在转发下面，`authorizeForward`
+ * 那套"工作空间 + creator guard"的作用域判定就直接复用了 —— 换个前缀就得再写一遍
+ * 作用域判定，而每多写一遍就多一个漏判的机会（契约 F6 ③ 的跨租户规则正是靠它兜底）。
+ *
+ * 权限：读 = `forward:read`，写 = `forward:update`（改的是这条转发的前门）。
+ * provider 的增删在 `/api/ddns/providers`，走 `settings:*` —— 凭据属于设置域，不属于某条转发。
+ */
+const DnsBindSchema = z
+  .object({
+    domain: z.string().trim().min(1).max(253),
+    record_type: z.enum(DNS_RECORD_TYPES),
+    mode: z.enum(DNS_MODES),
+    provider_id: z.number().int().positive().nullable().optional(),
+    auto_resolve: z.boolean().optional(),
+    ttl_seconds: z.number().int().min(DDNS_TTL_SECONDS.min).max(DDNS_TTL_SECONDS.max).optional(),
+  })
+  .strict();
+
+function ddnsDeps(c: Ctx): DdnsDeps {
+  return {
+    db: db as unknown as DdnsDb,
+    // 平台级 provider 与平台共享入口组都看 `super_admin`（与中间件同一判据，
+    // 不新造"平台管理员"的第二种定义）。
+    isPlatformAdmin: async () => user(c).super_admin === true,
+  };
+}
+
+function sendDdns<T>(c: Ctx, result: DdnsResult<T>, successStatus: 200 | 201 = 200) {
+  if (!result.ok) {
+    const status =
+      result.code === DDNS_ERROR_CODES.ddns_not_found || result.code === DDNS_ERROR_CODES.dns_provider_not_found
+        ? 404
+        : result.code === DDNS_ERROR_CODES.dns_provider_forbidden ||
+            result.code === DDNS_ERROR_CODES.shared_group_dns_denied
+          ? 403
+          : 400;
+    return c.json({ error: result.error, code: result.code, error_layer: "ddns" }, status);
+  }
+  return c.json({ data: result.value }, successStatus);
+}
+
+/** 读一条转发的 DNS 前门状态（含推导出的期望值集，见 `dnsBindingState`）。 */
+forwardsRoutes.get("/:id/dns", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "read");
+  if (denied) return denied;
+  const row = (await db.tunnel.findFirst({
+    where: { id, workspace_id: workspace(c).id, category: "port_forward" },
+    select: {
+      dns_domain: true,
+      dns_record_type: true,
+      dns_mode: true,
+      dns_provider_id: true,
+      dns_confirmed_values: true,
+      dns_synced_at: true,
+      dns_verified: true,
+      dns_last_error: true,
+      ingress_node: { select: { connect_ip: true } },
+    },
+  })) as
+    | (DnsBindingRow & { dns_provider_id?: unknown; ingress_node?: { connect_ip: string | null } | null })
+    | null;
+  if (!row) return c.json({ error: "端口转发不存在", code: "not_found" }, 404);
+  const owner = row.ingress_node?.connect_ip?.trim() ?? "";
+  return c.json({ data: dnsBindingState(row, owner === "" ? [] : [owner]) });
+});
+
+forwardsRoutes.post("/:id/dns", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const parsed = DnsBindSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "DNS 绑定参数不合法", code: "invalid_input" }, 400);
+  }
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
+  const result = await bindForwardDns(ddnsDeps(c), {
+    workspaceId: workspace(c).id,
+    userId: user(c).id,
+    tunnelId: id,
+    domain: parsed.data.domain,
+    recordType: parsed.data.record_type,
+    mode: parsed.data.mode,
+    providerId: parsed.data.provider_id ?? null,
+    autoResolve: parsed.data.auto_resolve ?? false,
+    ...(parsed.data.ttl_seconds === undefined ? {} : { ttlSeconds: parsed.data.ttl_seconds }),
+  });
+  return sendDdns(c, result);
+});
+
+forwardsRoutes.delete("/:id/dns", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
+  const result = await unbindForwardDns(ddnsDeps(c), {
+    workspaceId: workspace(c).id,
+    userId: user(c).id,
+    tunnelId: id,
+  });
+  return sendDdns(c, result);
 });

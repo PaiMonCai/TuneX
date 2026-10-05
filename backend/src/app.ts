@@ -43,6 +43,7 @@ import { payRoutes } from "./routes/pay.ts";
 import { dashboardRoutes } from "./routes/dashboard.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
 import { forwardsRoutes } from "./routes/forwards.ts";
+import { ddnsRoutes } from "./routes/ddns.ts";
 import { plansRoutes } from "./routes/plans.ts";
 import { topupsRoutes } from "./routes/topups.ts";
 import { paymentsRoutes } from "./routes/topups.ts";
@@ -156,6 +157,8 @@ export function createApp() {
   app.route("/api/dashboard", dashboardRoutes);
   app.route("/api/tunnels", tunnelsRoutes);
   app.route("/api/forwards", forwardsRoutes);
+  // V5-WP17.2：DNS provider（凭据属于设置域）。
+  app.route("/api/ddns", ddnsRoutes);
   app.route("/api/workspaces", workspaceRoutes);
   app.route("/api/workspaces", workspaceRolesRoutes);
   app.route("/api/plans", plansRoutes);
