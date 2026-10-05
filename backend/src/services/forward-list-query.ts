@@ -1,22 +1,8 @@
 /**
- * V4-WP9 §13.6「server pagination / filter / sort」——**纯函数**解析层。
+ * Pure Forward list query parser for pagination, filtering and stable sorting.
  *
- * 为什么单独一个模块而不是写在路由里：
- *   · 路由的 zod schema 只校验请求体，query string 的钳制/回落规则无法复用；
- *   · 分页与排序是「产品契约」，前端 mock（web/src/mocks/handler.ts）必须镜像
- *     同一套口径，否则 mock 下的分页行为与真实后端静默不一致；
- *   · 纯函数可离线单测（无 DB / 无 Redis），符合本仓库「CI 绿 ≠ 运行时对，
- *     但纯逻辑必须本地可验」的分工。
- *
- * 口径（与 §13.6 的 DoD 对齐）：
- *   · `page` ≥ 1，非数字回落 1；
- *   · `page_size` 钳到 [1, 200]，缺省 20 —— 与 `routes/node-groups.ts`、
- *     `routes/tunnels.ts` 的既有分页口径一致（同一产品里不能有两套上限）；
- *   · `sort` 走**白名单**，未知值回落默认键（不报错：UI 传错值不该看到空列表，
- *     与 mock 的「未知过滤值被忽略」同一取向）；
- *   · `order` 只接受 asc/desc，未知回落 `DEFAULT_FORWARD_SORT_ORDER`；
- *   · 排序**永远**追加 `id desc` 兜底：同名/同 order_by 的行必须稳定，
- *     否则翻页时同一行可能在两页出现或被跳过（keyset 之外最常见的分页 bug）。
+ * Page size is bounded, sort keys are allow-listed, and `id desc` is always a
+ * deterministic tiebreak so rows do not jump or disappear between pages.
  */
 import type { ForwardApplyStatus, ForwardMode } from "./forward-service.ts";
 
@@ -49,7 +35,7 @@ export const FORWARD_SORT_KEYS = Object.keys(
 ) as ForwardSortKey[];
 
 /**
- * 默认排序保持 WP4 之前的列表口径（`order_by asc, id desc`）。
+ * 默认排序保持  之前的列表口径（`order_by asc, id desc`）。
  *
  * 为什么默认不是 created_at desc：改造分页是「让大列表好用」，不是「改变用户
  * 已经熟悉的默认视图」。用户想按时间看，显式点表头即可。
