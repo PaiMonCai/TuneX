@@ -1,26 +1,9 @@
 /**
- * V4-WP6 — Node health service（DB 读路径 + health synthesis 接线）
+ * Node health DB read service.
  *
- * 依据 `DEVELOPMENT.md` §13.4.4。分工：
- *   · `services/node-health.ts`  纯判定（无 IO，可离线穷举单测）；
- *   · 本文件                    读事实（node / node_state_report / tunnel）
- *                              然后调用纯判定，并把上报快照投影成给 UI 的
- *                              遥测视图（版本 / 资源 / runtime / 端口）。
- *
- * ── 为什么单独一个文件而不是改 node-admin.ts ──
- * WP6 只消费 node-admin 的既有读接口（`resolveNodeId`）而不修改它：WP9（列表
- * 分页/筛选）与 WP10（权限/NodeGroup）之后都要动 node-admin 的查询面，把
- * health 混进去会让三方在同一个函数里冲突。这里的查询面是**只读**的，且
- * 只依赖 schema 里已存在的列。
- *
- * ── desired runtime 的 id 约定 ──
- * 与 `services/reconciler.ts` 的 runtimeId 同源（`tunex-<id>-direct|relay|egress`），
- * 直接 import 复用而不是复制一份字符串拼接——两处各拼一次，Agent 侧改了
- * id 规则时就会出现「reconciler 说落后、health 说没运行」的分叉。
- *
- * ── 凭据纪律 ──
- * 本文件不 select `node_credential_hash`：health 只需要「有没有凭据」这一个
- * 布尔（`deriveConnection` 的 waiting 判定）。哈希绝不进入返回值。
+ * It reads the current node/runtime/telemetry facts and delegates health
+ * synthesis to the pure node-health module. Missing optional configuration
+ * means "no threshold configured", not a test/runtime failure.
  */
 import {
   synthesiseHealth,
@@ -244,7 +227,7 @@ export interface NodeTelemetryView {
     /** 正在运行的 runtime id 列表。 */
     running: string[];
     /**
-     * V5-WP19-F：按 runtime id 索引的**协议专属事实**（udp/tls/ws 的
+     *：按 runtime id 索引的**协议专属事实**（udp/tls/ws 的
      * `drops`/`packets_*`/证书到期…）。**只有真的带 diag 的 runtime 才有键**：
      * 一条 tcp 隧道不产生键，而不是产生一个空对象 —— 「这个协议没有事实」与
      * 「这个协议的事实全是空」在 UI 上必须是两个答案（一个把每个报文都丢掉的出口
@@ -290,7 +273,7 @@ function telemetryView(
     arch: snapshot.arch ?? null,
     agent_started_at: startedAt ? startedAt.toISOString() : null,
     uptime_seconds: startedAt ? Math.max(0, Math.round((now.getTime() - startedAt.getTime()) / 1000)) : null,
-    // V5-WP19-F：与 `running` 同一次解析（parseReportedRuntimes 已带上 diag），
+    //：与 `running` 同一次解析（parseReportedRuntimes 已带上 diag），
     // 所以视图里「哪些 runtime 在跑」和「它们各自的协议事实」永远来自同一份上报，
     // 不会出现「列表里有这个 runtime、diag 却来自另一次上报」的错位。
     runtime: {
