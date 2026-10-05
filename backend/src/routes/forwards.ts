@@ -355,57 +355,18 @@ forwardsRoutes.post("/:id/preview", async (c) => {
   );
 });
 
-/**
- * V4-WP9 §13.6：批量 retry / suspend / resume。
- *
- * 为什么是独立路径 `/batch` 而不是给 `POST /api/forwards/:id/:action` 加数组形态：
- * 单条与批量的**错误语义不同**——单条失败整请求失败（4xx/5xx），批量失败是
- * 逐条结果 + 200。把两种语义塞进一个端点会让客户端无法判断该看 `error` 还是
- * `results`。路由注册在 `/:id/:action` **之前**，否则 `:id` 会吃掉 "batch"。
- *
- * 限流：见 rate-limit.ts 的 `forward-batch` 规则（必须在 `api-global` 之前命中）。
- */
-forwardsRoutes.post("/batch", async (c) => {
-  const parsed = parseForwardBatchRequest(
-    await c.req.json().catch(() => null),
-  );
-  if ("message" in parsed) {
-    return c.json({ error: parsed.message, code: "invalid_input" }, 400);
-  }
-  const payload = await runForwardBatch(
-    parsed.ids,
-    parsed.action,
-    workspace(c).id,
-    (row: { user_id: number }) => canWorkspaceResourceAction(
-      workspace(c), "update", "forward", row.user_id === user(c).id,
-    ),
-  );
-  return c.json({ data: payload });
-});
-
-forwardsRoutes.post("/:id/:action", async (c) => {
-  const id = idParam(c, "id");
-  const action = c.req.param("action") as ForwardAction;
-  if (id === null) {
-    return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
-  }
-  if (!ACTIONS.has(action)) {
-    return c.json({ error: "不支持的端口转发动作", code: "invalid_input" }, 400);
-  }
-  const denied = await authorizeForward(c, id, "update");
-  if (denied) return denied;
-  return send(c, await runForwardAction(id, action, workspace(c).id));
-});
-
-forwardsRoutes.delete("/:id", async (c) => {
-  const id = idParam(c, "id");
-  if (id === null) {
-    return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
-  }
-  const denied = await authorizeForward(c, id, "delete");
-  if (denied) return denied;
-  return send(c, await deleteForward(id, workspace(c).id));
-});
+/* ================================================================== */
+/* V5-WP17 —— DNS 前门与首选入口（**必须注册在任何 `/:id/:参数` catch-all 之前**） */
+/* ================================================================== */
+//
+// 为什么这段必须在这个位置：Hono 对同一方法**按注册顺序**匹配。文件后段还有一个
+// `post("/:id/:action")` 的 catch-all（它把 `action` 当动词分派）；如果本区块注册在它之后，
+// `POST /:id/dns` 会被那个 catch-all 先吃掉，返回 400「不支持的端口转发动作」——
+// 症状是 **DNS 前门根本绑不上**，而 GET/DELETE 因为同路径没有 catch-all 反而正常。
+//
+// 这不是猜想：WP17.5 的 Gate 在真实 API 上实测到过（`POST /api/forwards/70/dns` → 400），
+// 而当时 38 条断言全部通过 —— 因为路由级用例是**单独 mount** 这个 router 的，绕过了注册顺序。
+// 所以除了位置，还有一条源码级守卫看着它（见 `__tests__/forward-route-order.test.ts`）。
 
 /* ================================================================== */
 /* V5-WP17.2 —— DNS 前门：绑定 / 解绑 / 状态（**零外呼**）               */
@@ -549,4 +510,56 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
     return c.json({ error: result.error, code: result.code, error_layer: "failover" }, status);
   }
   return c.json({ data: result.value });
+});
+
+/**
+ * V4-WP9 §13.6：批量 retry / suspend / resume。
+ *
+ * 为什么是独立路径 `/batch` 而不是给 `POST /api/forwards/:id/:action` 加数组形态：
+ * 单条与批量的**错误语义不同**——单条失败整请求失败（4xx/5xx），批量失败是
+ * 逐条结果 + 200。把两种语义塞进一个端点会让客户端无法判断该看 `error` 还是
+ * `results`。路由注册在 `/:id/:action` **之前**，否则 `:id` 会吃掉 "batch"。
+ *
+ * 限流：见 rate-limit.ts 的 `forward-batch` 规则（必须在 `api-global` 之前命中）。
+ */
+forwardsRoutes.post("/batch", async (c) => {
+  const parsed = parseForwardBatchRequest(
+    await c.req.json().catch(() => null),
+  );
+  if ("message" in parsed) {
+    return c.json({ error: parsed.message, code: "invalid_input" }, 400);
+  }
+  const payload = await runForwardBatch(
+    parsed.ids,
+    parsed.action,
+    workspace(c).id,
+    (row: { user_id: number }) => canWorkspaceResourceAction(
+      workspace(c), "update", "forward", row.user_id === user(c).id,
+    ),
+  );
+  return c.json({ data: payload });
+});
+
+forwardsRoutes.post("/:id/:action", async (c) => {
+  const id = idParam(c, "id");
+  const action = c.req.param("action") as ForwardAction;
+  if (id === null) {
+    return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  }
+  if (!ACTIONS.has(action)) {
+    return c.json({ error: "不支持的端口转发动作", code: "invalid_input" }, 400);
+  }
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
+  return send(c, await runForwardAction(id, action, workspace(c).id));
+});
+
+forwardsRoutes.delete("/:id", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) {
+    return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  }
+  const denied = await authorizeForward(c, id, "delete");
+  if (denied) return denied;
+  return send(c, await deleteForward(id, workspace(c).id));
 });
