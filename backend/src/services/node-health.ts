@@ -1,5 +1,12 @@
 /**
- * V4-WP6 — Node health synthesis（`DEVELOPMENT.md` §13.4.4）
+ * Pure Node health synthesis.
+ *
+ * Lifecycle, connection/runtime state and telemetry remain separate layers.
+ * This module consumes facts and returns health/status reasons; it never mutates
+ * Node desired state or runtime state.
+ */
+
+ *  — Node health synthesis（`DEVELOPMENT.md` §13.4.4）
  *
  * ── 单一职责：把**事实**变成 `healthy | warning | error | unknown` ──
  *
@@ -13,10 +20,10 @@
  * 所以 Agent 侧（reporter）只发数字，判定阈值与优先级全部在本文件。
  *
  * ── 四态语义（与 §13.4.4 一一对应）──
- *   healthy  ：Connection online，关键 runtime/revision 一致，无持续错误；
- *   warning  ：在线但 revision 落后、部分 Forward error、版本落后或资源接近阈值；
- *   error    ：Agent/runtime 初始化失败或关键 runtime 持续不可用；
- *   unknown  ：尚未安装 / 没有足够报告。
+ *   healthy：Connection online，关键 runtime/revision 一致，无持续错误；
+ *   warning：在线但 revision 落后、部分 Forward error、版本落后或资源接近阈值；
+ *   error：Agent/runtime 初始化失败或关键 runtime 持续不可用；
+ *   unknown：尚未安装 / 没有足够报告。
  *
  * ── 三条不允许走捷径的判定纪律 ──
  *   1. **Offline ≠ error**（§13.4.4 末句）。掉线是 Connection 状态，不是
@@ -146,7 +153,7 @@ export interface ReportedRuntime {
   egress_port?: number | null;
   revision?: number | null;
   /**
-   * V5-WP19-F：这条 runtime 的**协议专属事实**（tls 证书/握手、ws upgrade、udp
+   *：这条 runtime 的**协议专属事实**（tls 证书/握手、ws upgrade、udp
    * `mappings`/`packets_*`/`bytes_*`/`drops`/`idle_timeout_seconds`、RELAY 的
    * `hop_local_addr`）。键集开放、由 Agent 拥有；视图层只做类型化 + 有界化
    * （`services/tunnel-diag.ts`）。
@@ -163,7 +170,7 @@ export interface DesiredRuntime {
   /** 用户可见的 Forward 标识（用于理由文案，避免暴露内部 runtime id）。 */
   label: string;
   runtime_id: string;
-  /** 期望 revision；null = 未进入 v3 期望模型，不参与落后判定。 */
+  /** Desired revision; null means the row is outside the revisioned desired-state model. */
   config_revision?: number | null;
   /** `tunnel.apply_status`；`error` 即该 Forward 上次应用失败。 */
   apply_status?: string | null;
@@ -298,7 +305,7 @@ export function parseHostMetrics(input: unknown): HostMetrics | null {
 /**
  * 快照里的 tunnels JSON → runtime 列表（坏形状按空列表，不抛错）。
  *
- * V5-WP19-F：每条 runtime 同时带上它自己的**协议专属事实**（`diag`）。这个函数是
+ *：每条 runtime 同时带上它自己的**协议专属事实**（`diag`）。这个函数是
  * 「凡重建上报形状处都必须带上 diag」在**面板读路径**上的锚点 —— 它曾经只留
  * id/mode/端口/revision，于是 Agent 上报的 udp `drops`/`packets_*`、tls 证书到期
  * 在面板侧被静默丢掉（库里一直有值，读的人永远看不到）。
