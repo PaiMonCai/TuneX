@@ -284,6 +284,57 @@ C. 状态判定必须调用既有函数（deriveConnection / nodeAdmission / isL
 
 ---
 
+
+## 事实类通知的投递触发器 —— 三项新决定（Lead 裁定，2026-10-05）
+
+背景：`deliverNotificationFacts()` 在生产里目前**只有公告**一条调用路径；`platformChannelTargets(config, "webhook")`
+曾因此没有消费者（WP18.6 已按"没有调用者就删掉"的纪律移除）。触发器 WP 此前未立项，因为它要定的
+是**新决定**。下面三条把它定死，剩下的实现不再需要产品判断。
+
+### 决定 1：本期只投递 **E 类事实**（Forward 下发被拒）与其恢复
+
+- 依据契约 §1 的事实清单：**E 是唯一"已经有持久化真相"的一类** —— `runtime-reconcile-sink.ts`
+  的 `markBlocked()` 写 `tunnel.apply_status="error"` + `apply_error_code` + `apply_error`，
+  `markApplied()` 清错误并推进 `applied_revision` ✓。
+- **G 类（对账 findings / 联邦每拍汇总）本期排除**：它们今天**只打日志**，而 N3 已经写明
+  *"若要通知必须先把 finding 落成持久行（否则是「日志当真相」）"* ⇒ 它需要先有持久化，属**另一个 WP** ✓。
+- 每台隧道的"被拒 → 恢复"是**两个事实**：拒绝（`apply_status="error"`）与恢复（`markApplied` 清错误）；
+  恢复必须**也**投递，否则运维只知道坏了、不知道好了 ✗。
+
+### 决定 2：骑**既有 reconcile 节拍**，不新增 cron
+
+- 与 ① 的 `dnsGate`/`dnsSuccessor` 同一条做法（F5："挂在既有 reconcile 节拍上"）✓；
+- 每拍计算一次是**廉价查询**（`apply_status="error"` 的隧道）✓；重复投递由**既有的**静默期 + 账本
+  幂等键（**必须带渠道**，见 WP18.6 的 `notificationCooldownKey(fact, channelKind)`）吸收 ✓；
+- **不新增 cron**：新增节拍等于新增一份"什么时候该说话"的真相 ✗。
+
+### 决定 3：受众 = 该隧道的可见受众 + 平台级渠道
+
+- **用户侧**：与公告同一口径（读侧可见受众 ✓）—— 即该 workspace 的活跃成员，按各自的 `email`/`tg_id`
+  取目标（未绑定的自然没有目标 ✓，不猜 ✓）；
+- **平台级 webhook**：本期**要把它加回来**（这正是 WP18.6 删除时留的那句"届时要加回平台级 webhook
+  目标"✓）—— 它的消费者就是本触发器；目标来自 `notification_channel` 的**启用行**（有 URL 才算 ✓，
+  与 WP18.6 的口径一致 ✓）；
+- **渠道清单必须显式**：只投递给 `enabledNotificationChannels()` 里真正打开的渠道；一个都没打开 ⇒
+  **不投递、零账本行**（不留 `not_configured` 噪音）✓。
+
+### 硬约束（违反即打回）
+
+1. **不改 `markBlocked`/`markApplied` 的写入语义**（契约 §8 第 7 条：不动 V4 冻结判定与写入语义）
+   —— 触发器只**读**它们 ✓；
+2. **不建第二条投递路径**：发信/账本/重试/静默期/免打扰全部复用 18.1–18.4 的实现（源码级断言：
+   触发器文件里不得出现 `.send(`、`notificationDelivery.create`、`setTimeout`、`scopedKey`）✓；
+3. **观测不得反驱**：投递结果不得成为任何判定（归属/准入/迁移）的输入 ✓；
+4. 失败要**可见**（账本行 + `storage_error` 而非空配置）✓。
+
+### 验收（将来那个 WP 的 DoD）
+
+- 一条被拒的 Forward：**恰好一次**投递到每个打开的渠道；同一事实第二次不重复 ✗（静默期生效 ✓）；
+- `markApplied` 之后：恢复事实**也**投递一次 ✓；
+- 没有打开的渠道时：零账本行 ✓；
+- G 类事实**仍未**进入投递（并有一条断言钉住"本期只 E"）✓；
+- 端到端至少覆盖一条真实路径（不是纯函数替身）✓。
+
 ## 5. 开放决策（**不猜**：候选 + 代价）
 
 > ### 5.0 Lead 裁决（2026-10-05）：O1–O4 **已冻结**
