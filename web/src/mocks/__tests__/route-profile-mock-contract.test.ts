@@ -72,7 +72,7 @@ describe("A. 错误模型与后端逐项一致", () => {
   });
 
   test("HTTP 状态表逐项一致", () => {
-    const entries = tableEntries("const ROUTE_PROFILE_ERROR_STATUS", "/** 错误码 → 失败发生在", /\d+/);
+    const entries = tableEntries("const ROUTE_PROFILE_ERROR_STATUS", /\d+/);
     expect(entries.length).toBe(ROUTE_PROFILE_ERROR_CODES.length);
     for (const [code, status] of entries) {
       expect({ code, status: ROUTE_PROFILE_ERROR_STATUS[code] }).toEqual({ code, status: Number(status) });
