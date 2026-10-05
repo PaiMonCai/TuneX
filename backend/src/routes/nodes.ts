@@ -101,11 +101,11 @@ const nodeSelect = {
   node_group_id: true,
   node_credential_hash: true,
   credential_revoked: true,
-  // V4-WP8 §13.4.1：用户侧也要能回答「这台机器现在能不能接新业务」。
-  // lifecycle 是 Lifecycle 层的唯一真相列（WP5）；本文件**不重复**判定它，
+  //  §13.4.1：用户侧也要能回答「这台机器现在能不能接新业务」。
+  // lifecycle 是 Lifecycle 层的唯一真相列（）；本文件**不重复**判定它，
   // 只把它交给 services/node-lifecycle.ts 的 nodeAdmission。
   lifecycle: true,
-  // 展示用（WP7 的备注；不参与任何判定）。
+  // 展示用（ 的备注；不参与任何判定）。
   lifecycle_note: true,
   lifecycle_updated_at: true,
   node_group: { select: { id: true, name: true, node_type: true, workspace_id: true } },
@@ -127,7 +127,7 @@ interface UserNodeRow {
   node_group_id: number;
   node_credential_hash?: string | null;
   credential_revoked?: boolean;
-  /** V4-WP5 生命周期列（schema `@default(active)`）；缺省 = 未 select 到。 */
+  /**  生命周期列（schema `@default(active)`）；缺省 = 未 select 到。 */
   lifecycle?: string | null;
   lifecycle_note?: string | null;
   lifecycle_updated_at?: Date | null;
@@ -135,10 +135,10 @@ interface UserNodeRow {
 }
 
 /**
- * V4-WP8 §13.4.1 —— 用户侧节点投影。
+ *  §13.4.1 —— 用户侧节点投影。
  *
  * 三层状态的**判定不在本文件**，全部来自 `services/node-view.ts`
- * （它只调 WP5 的 `deriveConnection` / `nodeAdmission`）。这里负责：
+ * （它只调  的 `deriveConnection` / `nodeAdmission`）。这里负责：
  *   · 去掉 credential hash（既不明文也不哈希地外泄）；
  *   · 把判定结果摊平进响应体。
  *
@@ -195,7 +195,7 @@ nodesRoutes.post("/:ingressId/enrollment", async (c) => {
 });
 
 /**
- * V4-WP11C —— `GET /api/nodes/:id/diagnostics`
+ *  —— `GET /api/nodes/:id/diagnostics`
  *
  * Node 级诊断：回答"这个节点现在到底在跑什么"。事实来自两处——面板持有的状态上报，
  * 以及节点进程的**自述**（collect_diagnostics）。离线节点**先判活再决定是否下发**，
@@ -215,7 +215,7 @@ nodesRoutes.get("/:ingressId/diagnostics", async (c) => {
 });
 
 /**
- * V4-WP11B —— `POST /api/nodes/:id/upgrade-command`
+ *  —— `POST /api/nodes/:id/upgrade-command`
  *
  * 返回一段**由 Panel 渲染、由操作者在节点上执行**的升级脚本。控制面不远程替换
  * 节点上的 Agent：Agent 没有 Docker 权限，Panel 也不主动连节点（§13.6）。
@@ -272,7 +272,7 @@ nodesRoutes.post("/:ingressId/upgrade-command", async (c) => {
 });
 
 /**
- * V4-WP11C —— `GET /api/nodes/:id/support-bundle`
+ *  —— `GET /api/nodes/:id/support-bundle`
  *
  * 一次排障快照。两条纪律：
  *   1. **白名单采集 + 确定性脱敏**（services/support-bundle.ts），凭据哈希永不入内；
@@ -321,7 +321,7 @@ nodesRoutes.get("/:ingressId/bindings", async (c) => {
     },
   });
 
-  // V4-WP9 §13.6「Binding usage」：一次 groupBy 拿到全部出口的使用量，
+  //  §13.6「Binding usage」：一次 groupBy 拿到全部出口的使用量，
   // 而不是每个绑定查一次（N+1 在绑定量上来后是列表页的主要延迟来源）。
   const usageVisible = canWorkspaceResourceAction(ws, "read", "forward");
   const usage = bindingUsageMap(
@@ -397,7 +397,7 @@ nodesRoutes.post("/:ingressId/bindings", async (c) => {
     data: {
       ...created,
       egress_node: nodeView(egress),
-      // V4-WP9 §13.6：新建绑定必然 0 使用量；仍显式返回，让前端的绑定行
+      //  §13.6：新建绑定必然 0 使用量；仍显式返回，让前端的绑定行
       // 处理逻辑不需要区分「刚创建」与「列表返回」两种形状。
       ...bindingUsage(0),
     },
@@ -425,7 +425,7 @@ nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
     },
   });
   if (used > 0) {
-    // V4-WP9 §13.6：409 文案由 `binding-usage.ts` 单点提供，与列表响应里的
+    //  §13.6：409 文案由 `binding-usage.ts` 单点提供，与列表响应里的
     // `used_by_forward_count` / `unbind_blocked` 用同一份判定；并回传使用量，
     // 让前端在错误分支也能刷新按钮状态（而不是只弹一句话）。
     return c.json(
@@ -449,7 +449,7 @@ nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
 /* PortForward compatibility API                                      */
 /* ------------------------------------------------------------------ */
 /**
- * @deprecated V4 clients use /api/forwards. Keep these routes for one
+ * @deprecated Use /api/forwards. Keep these routes for compatibility.
  * compatibility cycle; all behavior delegates to forward-service so there is
  * no second creation/runtime implementation.
  */
@@ -462,7 +462,7 @@ nodesRoutes.get("/:ingressId/forwards", async (c) => {
   if (!ingress) return c.json({ error: "入口节点不存在" }, 404);
 
   const rows = await listForwardsService(ws.id, { ingress_node_id: ingressId });
-  // V4-WP9：兼容端点保持**裸数组**契约（E2E 脚本与旧客户端按数组解析）；
+  //：兼容端点保持**裸数组**契约（E2E 脚本与旧客户端按数组解析）；
   // 「取全部」的上限由 `listForwards` 服务层统一施加，这里不重复截断。
   return c.json({ data: rows });
 });
