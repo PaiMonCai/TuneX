@@ -1,6 +1,6 @@
 # TuneX
 
-> 多租户 TCP 端口转发控制面，围绕 **Node + Forward** 管理 DIRECT / RELAY 数据面。
+> 多租户网络转发控制面，围绕 **Node + Route Profile + Forward** 管理 DIRECT / RELAY / Multi-hop 数据面。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
 [![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
@@ -30,7 +30,7 @@
 
 TuneX 已具备：
 
-- TCP DIRECT / RELAY 转发；
+- TCP / TLS / WebSocket / UDP 转发；TCP/TLS/WS 支持 DIRECT / RELAY，UDP 支持 DIRECT / 单跳 RELAY；
 - Node enrollment、不可变 `agent_id`、INGRESS / EGRESS / BOTH；
 - Forward 全字段编辑、revision、hot reload、desired/applied reconcile；
 - Node lifecycle、health、telemetry、maintenance / disabled / retiring；
@@ -41,7 +41,7 @@ TuneX 已具备：
 - 有界优雅关机（关闭监听 → 排空 → 强制收敛 → 最终上报）；
 - 控制协议协商：Agent 上报协议版本与真实实现的能力清单，面板在下发前拒绝节点未实现的动作；
 - MySQL / Redis / Worker / Web / Go Agent；
-- CI、真实多 Agent Integration Gate 与统一 Docker 镜像验证。
+- CI、真实多 Agent Integration Gate 与统一 Docker 镜像验证；PR 走快速真实拓扑回归，main 走完整历史回归后再 Release。
 
 V4 当前 Gate：
 
@@ -124,9 +124,9 @@ go build ./...
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署。
 - [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构约束与迁移背景。
 
-**当前进度：V4 已正式完成技术收口，V5 已完成到 V5.5 Federation 的机制与产品表面。**
+**当前进度（2026-10-05）：V4 已正式完成技术收口；V5.0–V5.5 主线已完成，V5.6+ 的 DDNS、公告/通知、延迟观测、订阅计费与安装器已进入实际交付/收口。PR #32 正在做最终 CI/Integration closure。**
 
-- V5.0–V5.4 各自 Gate 已绿（G0 137/0、G1A 73/0、G1B 76/0、G2 23/0、G3 50/0、G4 25/0）；
+- V5.0–V5.4 各自 Gate 已绿（G0 137/0、G1A 73/0、G1B 77/0、G2 23/0、G3 50/0、G4 25/0）；
 - V5-WP13.5 Console Split / Route Profile：控制台边界、Route Profile 契约与双端页面已落地；
 - V5.5 Federation（WP14/WP15/WP16）：面板身份与信任、授予与远端租约、用量与对账、
   **Forward 的远端出口腿委托**、Admin Console 的联邦页面均已落地；
@@ -135,7 +135,7 @@ go build ./...
   （且是在 G5 的两轮分区模拟之后跑的）。逐条证据见
   [docs/evidence/v5-g5-result-20261005.txt](<docs/evidence/v5-g5-result-20261005.txt>)。
 
-明确的开放边界（fail-closed，不在承诺内）：UDP RELAY / QUIC、跨面板 3+ 跳与远端中间跳、
+明确的开放边界（fail-closed，不在承诺内）：QUIC、UDP 分片重组 / packets 计费 / hop 加密 / 跨面板 UDP 腿、跨面板 3+ 跳与远端中间跳、
 跨面板自动 failover、tls 远端出口、多 Panel 信任的传递闭包；
 远端 ingress 的服务层与 M2M 路由已可用，但**产品级创建路径目前只接线远端 egress**；
 host 侧"同一 peer 只能有一条覆盖 egress 的 active grant"是**有意**的 fail-closed 约束（不是缺陷）。
