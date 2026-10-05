@@ -69,6 +69,16 @@ export type DnsState = (typeof DNS_STATES)[number];
 export const DNS_RECORD_TYPES = ["A", "AAAA", "CNAME"] as const;
 export type DnsRecordType = (typeof DNS_RECORD_TYPES)[number];
 export const DNS_MODES = ["multi_entry", "single_active"] as const;
+/**
+ * `DNSProviderType` 的取值（与 `prisma/schema.prisma` 的枚举**逐字一致**）。
+ *
+ * 为什么要在这里再列一次、而不是让路由收自由字符串：`type` 列是 DB 枚举 ⇒ 传一个枚举外的值
+ * 在真库里是**运行期错误**（本次就是：路由收 `z.string()`，服务直接把它塞进 Prisma，
+ * 收紧缝隙类型后编译期才报出来）。列成常量既能被路由拿去校验（非法值 → **400** 而不是 500），
+ * 也能被测试断言"服务端接受的就是这两个"。
+ */
+export const DNS_PROVIDER_TYPES = ["cloudflare", "huawei"] as const;
+export type DnsProviderType = (typeof DNS_PROVIDER_TYPES)[number];
 export type DnsMode = (typeof DNS_MODES)[number];
 
 /* ================================================================== */
@@ -199,19 +209,26 @@ export function dnsBindingState(
 /* 依赖（测试注入替身）                                                 */
 /* ================================================================== */
 
+/**
+ * DNS 前门的依赖缝隙。
+ *
+ * **参数类型必须是真实 Prisma 参数类型**（不是 `unknown`）。`unknown` 会把 Prisma 的字段与
+ * **关系名**校验一起关掉：替身不认识它们，编译期也不认识 —— 于是"关系名写成表名"这种错误
+ * 既过单测也过 tsc，直到真库里 500（本 WP 里就这样被抓到三处，另见 `f334f1c`）。
+ */
 export interface DdnsDb {
   tunnel: {
-    findFirst: (args: unknown) => Promise<unknown>;
-    update: (args: unknown) => Promise<unknown>;
+    findFirst: (args: Prisma.TunnelFindFirstArgs) => Promise<unknown>;
+    update: (args: Prisma.TunnelUpdateArgs) => Promise<unknown>;
   };
   dNSProvider: {
-    findFirst: (args: unknown) => Promise<unknown>;
-    findMany: (args: unknown) => Promise<unknown[]>;
-    create: (args: unknown) => Promise<unknown>;
-    delete: (args: unknown) => Promise<unknown>;
+    findFirst: (args: Prisma.DNSProviderFindFirstArgs) => Promise<unknown>;
+    findMany: (args: Prisma.DNSProviderFindManyArgs) => Promise<unknown[]>;
+    create: (args: Prisma.DNSProviderCreateArgs) => Promise<unknown>;
+    delete: (args: Prisma.DNSProviderDeleteArgs) => Promise<unknown>;
   };
-  nodeGroupGrant: { findFirst: (args: unknown) => Promise<unknown> };
-  node: { findUnique: (args: unknown) => Promise<unknown> };
+  nodeGroupGrant: { findFirst: (args: Prisma.NodeGroupGrantFindFirstArgs) => Promise<unknown> };
+  node: { findUnique: (args: Prisma.NodeFindUniqueArgs) => Promise<unknown> };
 }
 
 export interface DdnsDeps {
@@ -405,7 +422,10 @@ export async function bindForwardDns(deps: DdnsDeps, input: DnsBindingRequest): 
     where: {
       node_group_id: node.node_group_id,
       active: true,
-      user: { workspace_members: { none: { workspace_id: input.workspaceId } } },
+      // 关系名是 **`workspace_memberships`**（`User` 上的字段名），不是 `workspace_members` ——
+      // 后者是 `WorkspaceMember` 的 **@@map 表名**，两者只差几个字母，而这个错误在真库里是
+      // **500**：这段查询只要 `provider_id !== null` 就无条件执行 ⇒ 任何合法绑定都建不上。
+      user: { workspace_memberships: { none: { workspace_id: input.workspaceId } } },
     },
     select: { id: true },
   })) as { id: number } | null;
@@ -506,7 +526,8 @@ export interface DnsProviderCreateRequest {
   workspaceId: number;
   userId: number;
   name: string;
-  type: string;
+  /** 只能是 `DNS_PROVIDER_TYPES` 里的取值（DB 枚举）。厂商差异靠 `endpoint` 覆盖，不靠新类型。 */
+  type: DnsProviderType;
   credential: DdnsCredentialPlaintext;
   /** 平台管理员可以建**平台级** provider（workspace_id = NULL）。 */
   platformLevel?: boolean;

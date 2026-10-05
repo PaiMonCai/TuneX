@@ -18,6 +18,7 @@ import type { AppVariables } from "../middlewares/auth.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import {
   DDNS_ERROR_CODES,
+  DNS_PROVIDER_TYPES,
   createDnsProvider,
   deleteDnsProvider,
   listDnsProviders,
@@ -76,7 +77,8 @@ function sendDdns<T>(c: Ctx, result: DdnsResult<T>, successStatus: 200 | 201 = 2
 const ProviderSchema = z
   .object({
     name: z.string().trim().min(1).max(120),
-    type: z.string().trim().min(1).max(40),
+    // DB 枚举：非法值应当是 **400**（可解释），而不是 500（Prisma 在写入时才炸）。
+    type: z.enum(DNS_PROVIDER_TYPES),
     credential: z
       .object({
         token: z.string().trim().min(1).max(4096),

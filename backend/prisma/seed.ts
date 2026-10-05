@@ -45,6 +45,12 @@ import {
 const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
   // V5.3 WP10：自动迁移策略（缺省即关；见 DEVELOPMENT.md §8）。
   FAILOVER_POLICY: JSON.stringify({ auto_failover: false, auto_failback: false }),
+  // V5-WP19-B：延迟档案保留期。`Record<SystemConfigName, string>` 的穷尽性正是本文件的用意 ——
+  // 加了枚举值却忘了这里，**编译期**就会红（本次就是这么被发现的，不是运行期）。
+  // 值与 `services/latency-history.ts` 的 `DEFAULT_RAW_RETENTION_HOURS` /
+  // `DEFAULT_BUCKET_RETENTION_DAYS` 一致（Lead 裁决：原始 24h + 小时桶 30d）。
+  LATENCY_RAW_RETENTION_HOURS: "24",
+  LATENCY_BUCKET_RETENTION_DAYS: "30",
   MIN_TOPUP_AMOUNT: "1",
   NOTICE: "",
   NOTICE_POPUP: "",
