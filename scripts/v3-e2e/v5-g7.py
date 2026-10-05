@@ -433,14 +433,8 @@ await db.workspacePolicyAssignment.create({
   assert("G7.9c", billingDayKeyStamp(new Date("2026-09-30T18:00:00.000Z")).toISOString() === stampFromLabel.toISOString(),
     `stamp=${billingDayKeyStamp(new Date("2026-09-30T18:00:00.000Z")).toISOString()}`);
 
-  // ── 为什么这里要显式失效策略缓存 ──
-  // `getEffectivePolicy` 的缓存**与调用方传入的 `now` 无关**：条目按 workspace 存，
-  // 有效性判定用的是「调用方的 now − 计算时的 now < TTL」，而且 `noCache: true` **只跳过读、
-  // 仍然会写**（`if (!opts.client) cache.set(...)`）。本门禁在 G7.6b 用**未来时间**（NOW+10d）
-  // 调过一次 wsA（那一次是在验证 fail-closed），于是缓存里被放进了"未来那一刻"的策略
-  // （deny_scope ⇒ limits = UNLIMITED_LIMITS ⇒ traffic_period = "total"），
-  // 后面的展示路径读到的就是它 —— 这正是"合成时间 + 与时间无关的缓存"这族陷阱。
-  // 生产里 `now ≈ Date.now()`，所以症状轻得多；但**这个坑本身是真实存在的**，已单独报给 Lead。
+  // Synthetic-time cases can populate the workspace policy cache with a different time view.
+  // Invalidate it before validating the current-time reporting path.
   invalidatePolicyCache(wsA.id);
 
   // 两条读路径同源：用量报告的 traffic_used == 按**它自己给出的周期**做的窗口求和。
@@ -448,10 +442,8 @@ await db.workspacePolicyAssignment.create({
   const sameSource = await sumWorkspaceTraffic(wsA.id, report.limits.traffic_period, NOW);
   assert("G7.9d", report.traffic_used === sameSource, `report=${report.traffic_used} same_source_sum=${sameSource} period=${report.limits.traffic_period}`);
 
-  // ── 生效周期语义（Lead 2026-10-05 裁决）──
-  // **生效周期 = 适用策略中声明的「最长」周期；只有当某条策略真的声明 total 时才是 total。**
-  // 这条曾经是缺陷：union 的累加初值 UNLIMITED_LIMITS（total）是"恒胜元"，
-  // 于是单条 month 策略也会被算成 total ⇒ 月额度按全量累计判定、永不复位。
+  // Effective traffic period is the longest period declared by applicable policies;
+  // `total` applies only when an applicable policy explicitly declares it.
   const policyMonth = await db.capabilityPolicy.create({
     data: { key: `g7_m_${Date.now()}`, name: "G7 Month", source: "admin_grant", tunnel_types: ["tcp"], traffic_limit: 5000, traffic_period: "month" },
   });
