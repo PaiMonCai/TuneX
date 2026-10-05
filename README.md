@@ -62,7 +62,7 @@ python3 scripts/v3-e2e/v4-gate-f4.py
 python3 scripts/v3-e2e/v4-gate-f5.py
 ```
 
-高级协议、HA/failover、multi-hop、Panel federation 等已经移入 **V5 Roadmap**，不再扩大 V4 范围。
+V4 作为冻结兼容基线保留；当前产品能力与下一阶段以 V5 / V1 产品化状态为准。
 
 ## 架构
 
@@ -124,7 +124,7 @@ go build ./...
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署。
 - [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构约束与迁移背景。
 
-**当前进度（2026-10-05）：V4 已正式完成技术收口；V5.0–V5.5 主线已完成，V5.6+ 的 DDNS、公告/通知、延迟观测、订阅计费与安装器已进入实际交付/收口。PR #32 正在做最终 CI/Integration closure。**
+**当前进度（2026-10-05）：V5 主线与 WP17–WP21 已合入 `main`。合并提交 `8d0ac83` 已通过 Source CI、完整 Integration、Unified Image 与 Release；项目进入 V1 产品化整理阶段。**
 
 - V5.0–V5.4 各自 Gate 已绿（G0 137/0、G1A 73/0、G1B 77/0、G2 23/0、G3 50/0、G4 25/0）；
 - V5-WP13.5 Console Split / Route Profile：控制台边界、Route Profile 契约与双端页面已落地；
