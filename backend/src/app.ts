@@ -213,9 +213,9 @@ export function createApp() {
   app.route("/api/admin", nodeHealthRoutes);
   // V5-WP19-D：Looking Glass（默认关闭；打开见 LOOKING_GLASS_ENABLED）。
   app.route("/api/looking-glass", lookingGlassRoutes);
-  // V5-WP18.5：平台公告（发布 / 撤回 / 列全部）。前缀 `/admin/announcements` 尚未登记进
-  // `ADMIN_RESOURCES`（那是 WP18.6）：adminPermissionGuard 对未登记前缀一律 403，
-  // 只放行 super_admin —— 契约 F7「不登记 = 只有超管」，也正是 18.6 断言「登记生效」的起点。
+  // V5-WP18.5/18.6：平台公告（发布 / 撤回 / 列全部）。前缀
+  // `/admin/announcements` 已登记为独立的 announcements 管理资源；读写级别继续由
+  // adminPermissionGuard 按 HTTP 方法判定，未授权管理员 fail-closed，super_admin 仍直接放行。
   app.route("/api/admin", announcementAdminRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
