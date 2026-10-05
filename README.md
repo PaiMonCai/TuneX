@@ -1,86 +1,71 @@
 # TuneX
 
-> 多租户网络转发控制面，围绕 **Node + Route Profile + Forward** 管理 DIRECT / RELAY / Multi-hop 数据面。
+> 多租户网络转发平台：通过线路（Route Profile）与转发（Forward）组织 TCP / TLS / WebSocket / UDP 数据面。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
 [![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
-> [!NOTE]
-> **2026-10-02：Gate V4-F4 与 V4-F5 已在真实四 Agent 拓扑上通过。**
->
-> ```text
-> v3 verify 51/0 · F1 rollout 30/0 · F1 REST 67/0 · F1 S10 58/0 · F1 topology 32/0
-> F2 37/0 · F3 21/0 · F4 58/0 · F5 133/0
-> ```
->
-> 本轮补齐：WP11B 升级闭环（真实拓扑验证：排空期间拒新连接、重建后 agent_id 不变、
-> 既有 Forward 再收敛、回退锚点可用）与 WP11A 关机顺序/缓存并发收口。
->
-> 补齐范围：WP10 权限模型（F4）、WP11A 耐久性/关机、WP11B 能力协商与升级闭环、
-> WP11C Forward/Node 诊断与 Support Bundle、WP11D 运维脚本与发布文档，以及前端入口
-> （诊断面板 / 支持包下载 / 升级命令生成）。逐条状态与已知边界见
-> [V4 发布说明](<docs/release-notes-v4.md>) 与 [DEVELOPMENT](<DEVELOPMENT.md>)。
->
-> **V4.5 Stable 已完成技术发布闭环**：发布窗口以 `14305c8` 完成升级/回滚/Agent 升级演练；
-> 最终收口提交 `dd95713` 又通过 **CI #493 → Integration #139 → Release #30**。Release 已把
-> Panel/Worker 与 Agent 的 `latest` 和 `dd957131204ee6a7c34c5b3aa101cc64cd28b23f` 标签推送到 GHCR。
-> 详细证据见《[V4.5 发布记录](<docs/release-record-v4.5.md>)》。V4 功能范围至此冻结，后续新能力进入 V5。
-
 ## 当前状态
 
-TuneX 已具备：
+TuneX 已进入 **V1 产品化 / Production Beta 准备阶段**。V5 主线与 WP17–WP21 已合入 `main`；
+基线提交 `8d0ac83` 已通过 Source CI、完整 Integration、Unified Image 与 Release。
 
-- TCP / TLS / WebSocket / UDP 转发；TCP/TLS/WS 支持 DIRECT / RELAY，UDP 支持 DIRECT / 单跳 RELAY；
-- Node enrollment、不可变 `agent_id`、INGRESS / EGRESS / BOTH；
-- Forward 全字段编辑、revision、hot reload、desired/applied reconcile；
-- Node lifecycle、health、telemetry、maintenance / disabled / retiring；
-- 服务端分页、筛选、批量操作、Binding usage、Dashboard attention；
-- outbound-only Agent 控制链；
-- 工作空间 RBAC：固定四角色 + 自定义角色，资源级判定与逐项批量鉴权；
-- Agent 耐久性：面板中断时从本地已知良好配置恢复，面板恢复后按权威期望状态对账；
-- 有界优雅关机（关闭监听 → 排空 → 强制收敛 → 最终上报）；
-- 控制协议协商：Agent 上报协议版本与真实实现的能力清单，面板在下发前拒绝节点未实现的动作；
-- MySQL / Redis / Worker / Web / Go Agent；
-- CI、真实多 Agent Integration Gate 与统一 Docker 镜像验证；PR 走快速真实拓扑回归，main 走完整历史回归后再 Release。
+当前主要能力：
 
-V4 当前 Gate：
+- TCP / TLS / WebSocket / UDP；TCP/TLS/WS 支持 DIRECT / RELAY，UDP 支持 DIRECT / 单跳 RELAY；
+- 2-hop / 3-hop 路径、HA、fencing、自动 failover / failback；
+- Node enrollment、NodeGroup、Route Profile、Forward revision / hot reload / reconcile；
+- Node lifecycle、health、telemetry、诊断、Support Bundle 与 Agent 升级命令；
+- Workspace RBAC、自定义角色、套餐/订单/支付、订阅周期与流量结算；
+- DDNS、公告、Email / Webhook / Telegram 通知渠道；
+- 延迟历史、链路拓扑、默认关闭的 Looking Glass；
+- Federation 的身份、信任、授权、远端租约、用量与产品级 remote egress；
+- 一键安装、备份/恢复/回滚、真实多 Agent Integration 与发布流水线。
+
+当前明确保持关闭的边界：QUIC、UDP 分片重组 / packets 计费 / hop AEAD/MAC / 跨面板 UDP、
+remote transit、跨面板 3+ hop / arbitrary graph、跨面板自动 failover、TLS remote egress 与多 Panel
+信任传递闭包。未开放能力均保持 fail-closed。
+
+## 产品模型
+
+普通用户主要面对：
 
 ```text
-F1 Forward Edit / Hot Reload        ✅ 已关闭
-F2 Managed Node Lifecycle           ✅ 已关闭
-F3 Monitoring / Scale / UX          ✅ 已关闭
-F4 Authorization / NodeGroup        ✅ 已关闭（真实拓扑 PASS=58 / FAIL=0）
-F5 Durability / Ops / Capability    ✅ 已关闭（真实拓扑 PASS=133 / FAIL=0）
-   └ 含升级闭环、Forward/Node 诊断、Support Bundle、能力协商与 F5.13 真实备份/恢复
+线路（Route Profile）
+        ↓
+转发（Forward）
+        ↓
+流量 / 套餐 / 支持
 ```
 
-Gate 命令（需要 Docker 与真实多 Agent 拓扑）：
-
-```bash
-bash scripts/v3-e2e/setup.sh
-python3 scripts/v3-e2e/v4-gate-f4.py
-python3 scripts/v3-e2e/v4-gate-f5.py
-```
-
-V4 作为冻结兼容基线保留；当前产品能力与下一阶段以 V5 / V1 产品化状态为准。
+管理员负责 Node、NodeGroup、Route Profile、容量/健康、诊断与 Federation 等基础设施能力。
+`Tunnel` 保留为兼容与内部 desired/runtime 对象，不再作为新的用户产品入口。
 
 ## 架构
 
 ```text
 Browser
-  │
-  ▼
-Web / Backend ── MySQL / Redis / Worker
-       ▲
-       │ outbound HTTP poll / ACK / state report
-       │
-     Agent
-       │
-       ├─ DIRECT ─────────────→ Target
-       └─ RELAY → Egress Agent → Target
+   │
+   ▼
+Web / Backend ───── MySQL / Redis / Worker
+   │
+   ├─ Route Profile / Forward / Policy
+   │
+   └─ desired → revision → ACK → applied → reconcile
+                              │
+                              ▼
+                            Agent
+                              │
+             ┌────────────────┼────────────────┐
+             ▼                ▼                ▼
+          DIRECT           RELAY          Multi-hop
+             │                │                │
+             └────────────────┴────────────────┘
+                              ▼
+                            Target
 ```
 
-用户侧只需要理解 **Node** 和 **Forward**；`Tunnel` 继续作为内部 desired/runtime 对象。
+Agent 只主动连接 Panel，不要求公网开放 Agent 管理端口。
 
 ## 快速开始
 
@@ -101,16 +86,17 @@ docker compose ps
 curl http://localhost:8787/healthz
 ```
 
-默认本地入口为 `http://localhost:9091`。生产部署请优先参考
-[docs/production-deploy.md](docs/production-deploy.md)，使用
-`docker-compose.prod.yaml`；宿主机 Nginx/宝塔/1Panel 可直接负责 TLS，Caddy 为可选入口层。
+默认本地入口为 `http://localhost:9091`。
+
+生产部署请使用 [docs/production-deploy.md](docs/production-deploy.md) 与
+`docker-compose.prod.yaml`。已有 Nginx / 宝塔 / 1Panel 时可直接负责 TLS；
+无宿主机反代时可使用 standalone Caddy overlay。
 
 ## Agent
 
-推荐在 Web 的「节点」页面创建 Node，然后直接使用 Panel 生成的一键 Docker 安装命令。
-Agent 只需要主动连接 Panel，不要求公网开放 Agent 管理端口。
+推荐在管理界面创建 Node，再使用 Panel 生成的一键安装命令部署 Agent。
 
-本地构建：
+本地验证：
 
 ```bash
 cd agent
@@ -118,27 +104,29 @@ go test ./...
 go build ./...
 ```
 
-## 开发文档
+## 验证
 
-- [DEVELOPMENT.md](DEVELOPMENT.md)：V4/V5 路线、状态机、Gate、恢复开发入口。
-- [docs/production-deploy.md](docs/production-deploy.md)：生产部署。
-- [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构约束与迁移背景。
+当前冻结基线的主要 Gate：
 
-**当前进度（2026-10-05）：V5 主线与 WP17–WP21 已合入 `main`。合并提交 `8d0ac83` 已通过 Source CI、完整 Integration、Unified Image 与 Release；项目进入 V1 产品化整理阶段。**
+```text
+G0   contract compatibility     137/0
+G1A  TLS / WebSocket             73/0
+G1B  UDP DIRECT / RELAY          77/0
+G2   target intelligence         23/0
+G3   resilience / HA             50/0
+G4   multi-hop                   25/0
+G5   federation                 206/0
+G6   DDNS / placement            72/0
+G7   subscription billing        33/0
+```
 
-- V5.0–V5.4 各自 Gate 已绿（G0 137/0、G1A 73/0、G1B 77/0、G2 23/0、G3 50/0、G4 25/0）；
-- V5-WP13.5 Console Split / Route Profile：控制台边界、Route Profile 契约与双端页面已落地；
-- V5.5 Federation（WP14/WP15/WP16）：面板身份与信任、授予与远端租约、用量与对账、
-  **Forward 的远端出口腿委托**、Admin Console 的联邦页面均已落地；
-- **Gate V5-G5 = 206/0**（连跑两遍逐行一致）在**真实两面板拓扑**上执行：两个 Panel、各自
-  DB/worker/Node/Agent、真实 Ed25519 签名 M2M；同一镜像上 **G0 = 137/0、G4 = 25/0** 回归通过
-  （且是在 G5 的两轮分区模拟之后跑的）。逐条证据见
-  [docs/evidence/v5-g5-result-20261005.txt](<docs/evidence/v5-g5-result-20261005.txt>)。
+PR 走 Source CI + Fast Integration；`main` 在 Source CI 后执行完整 Integration、统一镜像验证，再进入 Release。
+历史 Gate、冻结不变量与证据索引见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
-明确的开放边界（fail-closed，不在承诺内）：QUIC、UDP 分片重组 / packets 计费 / hop 加密 / 跨面板 UDP 腿、跨面板 3+ 跳与远端中间跳、
-跨面板自动 failover、tls 远端出口、多 Panel 信任的传递闭包；
-远端 ingress 的服务层与 M2M 路由已可用，但**产品级创建路径目前只接线远端 egress**；
-host 侧"同一 peer 只能有一条覆盖 egress 的 active grant"是**有意**的 fail-closed 约束（不是缺陷）。
+## 文档
 
-V4 的兼容边界与已验证能力见 [V4 发布说明](<docs/release-notes-v4.md>)；
-V5 的阶段状态、硬不变量与下一步见 [DEVELOPMENT.md](DEVELOPMENT.md) §10 / §17。
+- [DEVELOPMENT.md](DEVELOPMENT.md)：冻结架构、Gate、不变量与 V1 产品化下一步；
+- [docs/production-deploy.md](docs/production-deploy.md)：生产部署、升级、备份、恢复与回滚；
+- [docs/release-notes-v4.md](docs/release-notes-v4.md)：V4 冻结兼容基线；
+- [docs/release-record-v4.5.md](docs/release-record-v4.5.md)：V4.5 历史发布记录；
+- [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构与迁移背景。
