@@ -378,6 +378,10 @@
   （范围外）；ACK 路径按裁决不动；`diag` 不进 `runtime_counts`（封闭键集）。
 - **Gate**：G19.1 的"面板接口可见"现在落在 `GET /api/admin/node/:id/health` 的
   `telemetry.runtime.diags`；G19.2（未知 diag 键不毁上报）由行为断言直接钉住。
+- **证据**：`bun test src/services/__tests__/v5-wp19/` → **23 pass / 0 fail / 100 断言**；
+  加相关既有文件（`node-telemetry-contract` / `node-health` / `v5-wp5-b2-ack-field-flow`）
+  → **95 pass / 0 fail**；`bunx tsc --noEmit` 本 WP 文件 0 报错。G19.1 的**端到端**条目仍需
+  真拓扑（跑 tls/ws/udp 三条并读面板接口），本次只覆盖到"面板接口能读到"的那一层。
 
 ### 5.2 WP19-B 交付记录（2026-10-05，④）
 
