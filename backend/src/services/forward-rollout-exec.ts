@@ -21,7 +21,7 @@ import {
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
 import { admitRoute } from "./forward-route.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
-//：远端出口腿的委托。编排只调这里的入口 —— 签名/重试/幂等键/镜像行
+// 远端出口腿的委托。编排只调这里的入口 —— 签名/重试/幂等键/镜像行
 // 全部有且只有一个实现（`federation/forward-hop.ts`），rollout 不再自己拼一遍。
 import {
   checkFederatedEgressForSnapshot,
@@ -115,7 +115,7 @@ export interface RolloutExecResult {
 /** `executeRollout` 的依赖注入（测试替身）。 */
 export interface RolloutDeps {
   /**
-   * 数据访问。**必填**：调用方（route/worker）显式传 `db`，测试传内存替身。
+   * 数据访问。**必填** 调用方（route/worker）显式传 `db`，测试传内存替身。
    * 做成可选会让「忘了注入就静默走进程单例」成为可能——而那正是 rollout
    * 这类跨请求状态最容易出静默数据错乱的地方。
    */
@@ -129,7 +129,7 @@ export interface RolloutDeps {
   /** Re-read grants/policy/traffic before every PREPARE/CUTOVER side effect. */
   runtimeUse?: RuntimeUseChecker;
   /**
-   *：跨面板出站的注入点（默认走 `client.callPeer`）。
+   * 跨面板出站的注入点（默认走 `client.callPeer`）。
    *
    * 只有"这条 Forward 声明了 federated_egress_peer"的路径会用到它；为空时那些
    * 路径会走真实的 `callPeer`（签名/超时/重试的唯一实现）。测试注入假 transport，
@@ -369,7 +369,7 @@ interface TunnelProjection {
   desired_revision_id: number | null;
   desired_status: string;
   apply_status: string;
-  /**：远端出口声明（NULL = 出口在本机）。 */
+  /** 远端出口声明（NULL = 出口在本机）。 */
   federated_egress_peer?: string | null;
 }
 
@@ -410,13 +410,13 @@ async function loadBoundPairs(db: RolloutDb): Promise<ReadonlySet<string>> {
 }
 
 /**
- * 释放**旧的归属租约**（V5.3 round 21）。
+ * 释放**旧的归属租约**（）。
  *
  * 背景：一个节点不再承载某条 Forward 之后，它**可能还持有那条 Forward 的归属租约**。这不是无害的
  * 残留 —— 它会让每一条修复路径都撞上两阶段规则：reconcile 的重发会为**放置节点**认领归属，而旧租约
- * 未过期 ⇒ 认领被正确地拒绝 ⇒ **重发永远失败**。实测症状：`tunnel.ingress_node_id=3`、
+ * 未过期 ⇒ 认领被正确地拒绝 ⇒ **重发永远失败**。Observed failure mode: `tunnel.ingress_node_id=3`、
  * `placement_lease.owner_node_id=5`，DB 显示 `active/applied` 而两台节点都不服务，
- * 且没有任何自动机制能打破它（"账本说好、事实说坏"，round 15 记下、round 21 才复现并定性）。
+ * 且没有任何自动机制能打破它（"账本说好、事实说坏"，the stale lease can otherwise block the new owner until expiry）。
  *
  * 为什么可以在这里安全地释放：这一步（`release_old_lease`）**正是在旧 runtime 已经被撤掉之后**执行的
  * —— 迁移计划里 `drain_ingress` 先把它摘掉，CLEANUP 才轮到释放。两阶段规则要防的"旧主人还在服务"
@@ -477,7 +477,7 @@ async function loadRolloutNodes(
       ? (s.targets as Array<{ host: string; port: number; weight: number; order_by: number }>)
       : null,
     desired_status: (s.desired_status as string | null) ?? null,
-    //：这一跳"在哪一侧"必须随快照进计划 —— 续跑/补偿都靠它决定
+    // 这一跳"在哪一侧"必须随快照进计划 —— 续跑/补偿都靠它决定
     // 该走本地 orchestrator 还是 peer（快照是唯一的放置事实来源）。
     federated_egress_peer: federatedEgressPeerOf(s),
   });
@@ -512,7 +512,7 @@ async function loadRolloutNodes(
   // 而 §13.3.5 的 DRAIN/CLEANUP 需要的「旧 runtime」= 上一次成功 apply 的
   // 配置，在快照序列里正是次新。
   //
-  // **排除 desired 用 revision 数值而不是对象引用**：fallback 分支里 desired
+  // **排除 desired 用 revision 数值而不是对象引用** fallback 分支里 desired
   // 是从投影列合成的、不在 snapshots 数组里，用 `s !== desiredRow` 排除不掉
   // 任何一行 ⇒ applied 会取到次新的第一条（= desired 自己那次）⇒ 新旧对调，
   // CUTOVER 切旧端口、DRAIN 撤新监听。这种错法不会抛异常，只会把端口换错。
@@ -649,7 +649,7 @@ async function rolloutRuntimeDenial(
   const ingress = rawIngress as { node_group_id?: number } | null;
   const egress = rawEgress as { node_group_id?: number } | null;
   const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
-  //：出口腿在远端时，本机**没有**出口节点组可授权 —— 那一跳的容量与
+  // 出口腿在远端时，本机**没有**出口节点组可授权 —— 那一跳的容量与
   // 配额权威在 host（契约 §1 的 Quota authority 答案：容量事实发生在 host）。
   // 这里仍然严格校验入口侧与归属，不是"跳过授权"。
   const federatedEgress = federatedEgressPeerOf(desired) !== null;
@@ -822,7 +822,7 @@ async function runStep(
       if (nodeId == null) {
         return { ok: false, error_code: "invariant_violated", error: "acquire_port 缺少 node_id" };
       }
-      //：远端出口腿的端口/节点由 **host** 在自己的 grant 范围里分配
+      // 远端出口腿的端口/节点由 **host** 在自己的 grant 范围里分配
       // （契约 §1.5：端口归承载方）。本机既不分端口，也不建任何 node_port_lease 行
       // —— 建了就是第二份 ownership。
       if (step.direction === "egress" && federatedEgressPeerOf(ctx.desired) !== null) {
@@ -831,7 +831,7 @@ async function runStep(
           note: `远端出口腿：跳过本机 ${nodeId}:${step.port ?? "auto"} 的端口/节点分配（端口归 host 的 portPool）`,
         };
       }
-      //：**只对联邦 Forward 的恢复路径**做的端口续用。
+      // **只对联邦 Forward 的恢复路径**做的端口续用。
       //
       // 恢复用同一个 revision 重跑，而 `desired.listen_port` 可能是"自动分配"
       // （NULL）—— 若照旧把 NULL 当 preferred 去 acquirePort，`portPool` 只在
@@ -877,7 +877,7 @@ async function runStep(
       // 这里已由 `binding_exists === false` 作为入步骤条件，因此 create 是
       // 新建而非 upsert；重复执行撞 @@unique 时按「已存在」算成功（幂等）。
       //
-      //：远端出口腿没有本机出口节点 ⇒ 没有可建的 Binding。跨面板那一跳
+      // 远端出口腿没有本机出口节点 ⇒ 没有可建的 Binding。跨面板那一跳
       // 的许可由 host 的 grant 决定（契约 §3.1），不是本机节点间的 Binding。
       if (federatedEgressPeerOf(ctx.desired) !== null) {
         return { ok: true, note: "远端出口腿：跳过本机 NodeBinding（跨面板那一跳由 host 的 grant 授权）" };
@@ -918,7 +918,7 @@ async function runStep(
     }
 
     case "prepare_egress": {
-      //：声明了远端 peer 时，这一跳**不走**本机 `dispatchEgress`，
+      // 声明了远端 peer 时，这一跳**不走**本机 `dispatchEgress`，
       // 而是委托给承载方（预留 → 应用 → 镜像行），拿它返回的地址当下一跳。
       if (federatedEgressPeerOf(ctx.desired) !== null) {
         return delegateRemoteEgressStep(ctx, deps);
@@ -972,7 +972,7 @@ async function runStep(
     /* ---------------- CUTOVER ---------------- */
 
     case "cutover_egress": {
-      //：同节点只换目标池时，PREPARE 没有 egress 步，出口侧的"按新
+      // 同节点只换目标池时，PREPARE 没有 egress 步，出口侧的"按新
       // revision 生效"就发生在 CUTOVER。远端腿走同一条幂等委托：同一
       // `(intent_id, revision)` 在 host 侧返回首次结果，host 复用 epoch。
       if (federatedEgressPeerOf(ctx.desired) !== null) {
@@ -1074,7 +1074,7 @@ async function runStep(
       if (ctx.desired.mode === "relay") {
         const remotePeer = federatedEgressPeerOf(ctx.desired);
         const egressNodeId = ctx.desired.egress_node_id;
-        //：出口腿在远端时本机**没有**出口节点，这不是"缺出口"——
+        // 出口腿在远端时本机**没有**出口节点，这不是"缺出口"——
         // next_hop 由 host 的响应决定（见 resolveNextHop 的联邦分支）。
         if ((egressNodeId == null && remotePeer === null) || step.direction === "egress") {
           return { ok: false, error_code: "invariant_violated", error: "RELAY cutover 缺少出口节点" };
@@ -1150,7 +1150,7 @@ async function runStep(
 
     case "drain_ingress":
     case "drain_egress": {
-      //：旧出口腿在**远端**时，本机没有它的 runtime 可撤 —— 那条腿的
+      // 旧出口腿在**远端**时，本机没有它的 runtime 可撤 —— 那条腿的
       // 停服就是 CLEANUP 里的 `drop_old_egress` 发出的 `DELETE /leases/:ref`。
       // 这里若照旧报 invariant_violated，会把一次正常的"远端出口撤下"变成
       // DRAIN 硬失败（整条 rollout 落到 degraded）。
@@ -1263,7 +1263,7 @@ async function runStep(
     case "drop_old_egress":
     case "drop_old_transit": {
       if (nodeId == null) {
-        //：这条旧出口腿在远端 ⇒ 撤它的唯一正确动作是**释放远端租约**。
+        // 这条旧出口腿在远端 ⇒ 撤它的唯一正确动作是**释放远端租约**。
         // 顺序按契约 §3.3「先本地入口停 → 再远端释放」：CLEANUP 发生在入口已经
         // 切到新 next_hop（或已撤下）之后，所以这里正是那一刀。
         //
@@ -1386,7 +1386,7 @@ async function runStep(
  * 从节点索引里取 `OrchestratorNode`；索引里没有（旧节点已删、或 drain
  * 的是本轮回迁之外的节点）时给一个最小可用形态。
  *
- * 注意**不按方向区分**：节点索引是 id → Node 的映射，同一台 BOTH 节点无论
+ * 注意**不按方向区分** 节点索引是 id → Node 的映射，同一台 BOTH 节点无论
  * 当 ingress 还是 egress 都是同一行。方向只影响 `removeTunnel` 拼哪个
  * tunnel id（`-relay` / `-egress` / `-direct`），那由 direction 参数自己决定。
  */
@@ -1525,7 +1525,7 @@ function resolveHopAddress(ctx: RolloutExecContext, nodeId: number, fallbackPort
  * 与计划、准入、纯路由模型用的是同一个字段。
  */
 function resolveNextHop(ctx: RolloutExecContext): string | null {
-  //：出口腿在远端时，"下一跳是谁"由 **host 的应用响应**决定
+  // 出口腿在远端时，"下一跳是谁"由 **host 的应用响应**决定
   // （`node_address` + `port`）。本机没有那台节点的任何地址事实，所以这里
   // 只能读登记表；登记不到就返回 null，让 cutover_ingress 以
   // `next_hop_unresolved` fail-closed —— **绝不**猜 IP（猜错是每个新连接都
@@ -1604,7 +1604,7 @@ export async function compensateRollout(
     // V5.4：中间跳也是"新 runtime"，也必须撤。它的形态与出口跳相同（监听 + 拨号到下一跳），
     // 因此方向同样是 `egress` —— runtime id 按节点分命名空间，中间跳与真出口不会互相覆盖。
     //
-    // 漏掉它会留下一条**孤儿中转链路**：照旧监听端口、照旧接受连接，把流量转给一个已经被
+    // 漏掉它会留下一条**孤儿中转链路** 照旧监听端口、照旧接受连接，把流量转给一个已经被
     // 拆掉的下一跳。这类残留不报错，只静默占着端口与许可 —— 也正是 G4 明确要验的一项。
     { direction: "egress", nodeId: plannedMiddle ?? 0 },
   ];
@@ -1674,7 +1674,7 @@ export async function compensateRollout(
     } else {
       // Rollback creates a new generation carrying baseline content; replaying an
       // older revision would violate the Agent's monotonic revision fence.，从 Agent 角度看就是一条迟到的旧命令，
-      // 拒绝是对的。实测后果：补偿永远失败，rollout 停在 degraded，两侧都不服务
+      // 拒绝是对的。observed后果：补偿永远失败，rollout 停在 degraded，两侧都不服务
       // （`forward_rollout#35` 的 `compensation_error` 就是这句话）。
       //
       // 把重放号改成"目标 revision"也不行：那样 Agent 会接受，但**运行时挂在目标版本号上**，
@@ -1714,7 +1714,7 @@ export async function compensateRollout(
         /**
          * 回滚后的出口事实（host + 监听端口）。
          *
-         *：它可能来自两处 —— 本机 `dispatchEgress` 的返回值，或**远端
+         * 它可能来自两处 —— 本机 `dispatchEgress` 的返回值，或**远端
          * peer 的应用响应**。两条路的共同点是"地址只能来自承载方自己"，所以这里
          * 归一成一个变量，入口与中间跳的指向都只认它。
          */
@@ -1884,7 +1884,7 @@ export async function compensateRollout(
     );
     // ── 补偿成功后的记账（V5.3：回滚是**新世代**）──
     //
-    // 内容已经回到基线，而它挂在一个新的版本号上，所以台账必须**一起前进**：三列写成同一个
+    // 内容已经回到基线，而它挂在一个新的版本号上，所以台账必须**一起前进** 三列写成同一个
     // rollbackRevision，`apply_status` 回到 `active`（回滚后的状态是"正在按要求运行"，
     // 而不是"更新失败"）。§3.4 的"desired 不回退"没有被违反 —— desired 前进到了一个内容等于
     // 基线的新世代；用户看到的是"已回滚到上一版本的内容"，而不是一个名不副实的版本号。
@@ -2198,7 +2198,7 @@ async function executeRolloutOwned(
     plan,
     completed,
     prepared,
-    // `notes` 是**追加式流水账**：`transitionRollout` 写 `notes: ctx.notes` 时
+    // `notes` 是**追加式流水账** `transitionRollout` 写 `notes: ctx.notes` 时
     // 走的是 Prisma 的 `{ push }`，若此处重新置 []，第一次 patch 就会把上一轮
     // （崩溃前的阶段）落账抹掉，`§13.3.2` 要求「可追溯到本轮结束」就断了。
     // 因此必须从当前行读起；列为 NULL（迁移前存量行）时按空数组开始。
@@ -2386,7 +2386,7 @@ async function executeRolloutOwned(
         }
         const comp = await compensateRollout(rolloutId, deps);
         return {
-          // **补偿成功也是失败**：`comp.ok=true` 只说明「回退到旧版本成功」，
+          // **补偿成功也是失败** `comp.ok=true` 只说明「回退到旧版本成功」，
           // 本次 desired revision 没有生效。报 ok:true 会让 patchForward 认为
           // 新配置已在跑，从而把「更新失败，上一版本仍运行」显示成成功。
           ok: false,
@@ -2527,7 +2527,7 @@ async function markTunnelFailed(
 /**
  * 全部阶段完成：tunnel 行回到 active（desired 与 applied 一致）。
  *
- * **必须写 `applied_revision`（与 `config_revision` 同值）**：这正是 §13.3.5
+ * **必须写 `applied_revision`（与 `config_revision` 同值）** 这正是 §13.3.5
  * 「成功推进 applied」的那一步，也是 Agent ACK 顺序之后唯一能让
  * `reconciler.isRevisionBehind()`（`applied < config`）安静下来的地方。只写
  * `config_revision` 会留下一个静默故障：rollout 记 done、Agent 已在跑新配置，
