@@ -1,10 +1,6 @@
-// Package control implements the v3 outbound-only control transport.
-//
-// V4-WP6 (§13.4.4) adds two optional observers so the state report can describe
-// *why* a node is behind: the newest revision seen in an envelope and the
-// apply/runtime failures. Both are plain interfaces (not a dependency on
-// reporter) so the transport stays testable on its own and the reporter owns the
-// ledger implementation.
+// Package control implements the Agent's outbound-only command transport.
+// Optional observer interfaces record seen revisions and runtime failures without
+// coupling command execution to the reporter package.
 package control
 
 import (
@@ -32,9 +28,7 @@ const (
 	httpTimeout  = 12 * time.Second
 )
 
-// ErrorRecorder files one apply/runtime failure message (V4-WP6 §13.4.4
-// "最近 runtime/apply error"). reporter.Ledger satisfies it; a nil recorder
-// keeps the transport silent, which is what every existing test expects.
+// ErrorRecorder records an apply/runtime failure. reporter.Ledger satisfies it.
 type ErrorRecorder interface {
 	Record(message string)
 }
@@ -50,7 +44,7 @@ type Config struct {
 	PanelURL   string
 	Credential string
 
-	// Optional V4-WP6 telemetry sinks (both default to nil = no recording).
+	// Optional telemetry sinks; nil disables recording.
 	Errors    ErrorRecorder
 	Revisions RevisionObserver
 
@@ -60,7 +54,7 @@ type Config struct {
 	DescribeSelf func() selfinfo.Facts
 
 	// Reconnected is called once on every transition from "panel unreachable"
-	// to "panel reachable" (WP11A/A4). The agent uses it to reconcile its
+	// to "panel reachable". The Agent uses it to reconcile its
 	// runtime against a freshly fetched authoritative desired state: a node that
 	// restored from its local cache during an outage must drop listeners the
 	// panel no longer knows about, because nothing else on this side ever would.
@@ -489,16 +483,14 @@ func ackCodeFor(err error) string {
 	return "apply_failed"
 }
 
-// applyByPlan routes one apply_tunnel command through the hot-reload
-// primitive that matches its plan, so the panel's edit semantics
-// (DEVELOPMENT.md §13.3.4) are honoured by the command path and not only by
-// the local admin API:
+// applyByPlan routes one apply_tunnel command through the same hot-reload
+// primitive used by the runtime manager:
 //
 //   - a listener move (port / mode) binds the new listener BEFORE draining
 //     the old one;
 //   - an upstream-only change on a running listener is swapped in place, so
 //     the live connections keep relaying and the byte counter survives;
-//   - EGRESS and everything else keep the previous behaviour verbatim.
+//   - EGRESS and other changes use the manager's normal replacement path.
 //
 // ReplaceListener is that router: the plan is evaluated inside the manager,
 // against the running config, under the manager's lock — the same evaluation
@@ -544,8 +536,7 @@ func (c *Client) prepareEgressPool(cfg forwarder.TunnelConfig) (func(), error) {
 				oldStrategy = parsed
 			}
 		}
-		// Both arrays travel in the same payload (§7.3): the desired targets
-		// and the panel's health facts, applied together so the health-aware
+		// Desired targets and panel health facts are applied together so the health-aware
 		// mechanism never runs against a pool it was not computed for.
 		if err := c.egress.UpdateTargetsAndHealth(cfg.ID, strategy, cfg.Targets, cfg.TargetHealth); err != nil {
 			return func() {}, err
@@ -553,10 +544,8 @@ func (c *Client) prepareEgressPool(cfg forwarder.TunnelConfig) (func(), error) {
 		return func() {
 			if len(oldTargets) > 0 {
 				// The rollback restores what this agent can still know: the
-				// previous desired targets and strategy. The previous health
-				// facts are NOT retained (health is a live fact, never cached —
-				// §7.3), so the rollback clears them, which is the safe
-				// direction: a missing breaker behaves like the pre-WP7 agent.
+				// Roll back the desired targets and strategy. Health is a live fact,
+				// so rollback intentionally clears it instead of restoring stale evidence.
 				_ = c.egress.UpdateTargets(cfg.ID, oldStrategy, oldTargets)
 			}
 		}, nil

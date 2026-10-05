@@ -1,12 +1,5 @@
-// Package agentconfig parses the agent's command line (and optional YAML config
-// file) using only the standard library.
-//
-// WP15 removed the legacy shutdown surface with the legacy data plane: the
-// flags only the old engine read (-server/-token for the Socket.IO session,
-// -connect-ip, --port-range and the per-protocol fixed ports that fed
-// `register`) are gone. What is left is the v3 runtime's own configuration:
-// node identity, the panel it reports to, its local admin plane, the role and
-// the port ranges the managers may bind.
+// Package agentconfig parses the Agent's CLI, environment and optional flat
+// YAML configuration using only the Go standard library.
 package agentconfig
 
 import (
@@ -35,17 +28,15 @@ type Config struct {
 	IngressRange    string
 	EgressRange     string
 
-	// NodeCredential is the WP7 per-node credential (services/node-credential.ts).
-	// It authenticates the state report POST /api/internal/node/state; empty
-	// means "no credential provisioned", in which case the heartbeat keeps its
-	// legacy shape and the state report is skipped (the node still works).
+	// NodeCredential authenticates the production command/state path. Without
+	// it the Agent cannot poll revisioned commands or post authenticated state.
 	NodeCredential string
 
 	ShowVersion bool
 	ConfigFile  string
 
-	// StateDir holds agent-local durable state. Today it is the last-known-good
-	// desired-state cache (WP11A) that lets a restart during a panel outage come
+	// StateDir holds agent-local durable state, including the last-known-good
+	// desired-state cache that lets a restart during a panel outage come
 	// back with its listeners instead of empty. Empty disables the cache.
 	StateDir string
 }
@@ -62,7 +53,7 @@ func (c *Config) LKGPath() string {
 	return filepath.Join(dir, "desired-lkg.json")
 }
 
-// OwnershipFencePath is the V5.3-WP9 epoch fence inside StateDir.
+// OwnershipFencePath is the ownership epoch fence inside StateDir.
 //
 // It lives in the SAME durable directory as the last-known-good cache because it
 // answers the same kind of question ("what does this node remember across a
@@ -92,7 +83,7 @@ const (
 	// the two ranges from clashing.
 	RoleBoth = "BOTH"
 
-	// DefaultAgentAdminPort is the v3 admin plane port (devmap §8: 9090).
+	// DefaultAgentAdminPort is the optional local admin API port.
 	DefaultAgentAdminPort = 9090
 )
 
@@ -134,8 +125,8 @@ func Parse(args []string, version string) (*Config, error) {
 	cfg := &Config{
 		ConfigFile:     DefaultConfigFile(),
 		AgentAdminPort: DefaultAgentAdminPort,
-		// The durable state directory is on by default: a node that restarts
-		// during a panel outage should come back with its listeners (WP11A).
+		// Durable state is on by default so a node restarted during a Panel
+		// outage can restore its last-known-good listeners.
 		// An explicitly empty TUNEX_STATE_DIR disables the cache.
 		StateDir: DefaultStateDir,
 	}
@@ -165,14 +156,14 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.StringVar(&cfg.ListenIP, "l", cfg.ListenIP, "Interface tunnels bind (shorthand)")
 	fs.StringVar(&cfg.Role, "role", cfg.Role, "Node role: INGRESS, EGRESS or BOTH")
 	fs.StringVar(&cfg.Role, "R", cfg.Role, "Node role (shorthand)")
-	fs.StringVar(&cfg.PanelHTTPURL, "panel-http-url", cfg.PanelHTTPURL, "Panel HTTP base URL for heartbeat/state reporting, e.g. http://panel:3001")
+	fs.StringVar(&cfg.PanelHTTPURL, "panel-http-url", cfg.PanelHTTPURL, "Panel HTTP base URL for control and reporting, e.g. http://panel:3000")
 	fs.StringVar(&cfg.AgentAdminToken, "agent-admin-token", cfg.AgentAdminToken, "Bearer token for the local admin API on AGENT_ADMIN_PORT")
 	fs.IntVar(&cfg.AgentAdminPort, "agent-admin-port", cfg.AgentAdminPort, "Local admin API port; 0 disables it")
 	fs.StringVar(&cfg.IngressRange, "ingress-range", cfg.IngressRange, "Port range the ingress tunnels may bind, e.g. 10000-30000")
 	fs.StringVar(&cfg.EgressRange, "egress-range", cfg.EgressRange, "Port range the egress tunnels may bind, e.g. 30001-60000")
-	// WP7：per-node credential。绝不明文进日志（usage 文本里也不回显值）。
-	fs.StringVar(&cfg.NodeCredential, "node-credential", cfg.NodeCredential, "Per-node credential for the state report (WP7)")
-	// WP11A：durable state directory (last-known-good desired-state cache).
+	// Per-node credential must never be echoed in logs or usage output.
+	fs.StringVar(&cfg.NodeCredential, "node-credential", cfg.NodeCredential, "Per-node credential for command polling and state reporting")
+	// Durable state directory for restore and ownership fencing.
 	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "Directory for durable agent state (last-known-good desired cache); empty disables it")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "version for TuneX agent")
 	fs.BoolVar(&cfg.ShowVersion, "v", false, "version for TuneX agent (shorthand)")
@@ -249,11 +240,8 @@ func applyDefaults(cfg *Config, file string) error {
 			*dst = v
 		}
 	}
-	// envInt assigns on a SUCCESSFUL parse. The previous condition was inverted
-	// (`if err != nil`), so a valid value was ignored — the installer writes
-	// TUNEX_AGENT_ADMIN_PORT=0 and the agent silently kept the default 9090 — while
-	// a malformed value silently became 0. Both directions are wrong for a knob an
-	// operator sets through the env file, which is the documented install path.
+	// Integer environment values fail closed when malformed; silently falling
+	// back would make the running Agent disagree with the operator's config.
 	envInt := func(key string, dst *int) error {
 		v, ok := os.LookupEnv("TUNEX_" + key)
 		if !ok || strings.TrimSpace(v) == "" {
@@ -280,9 +268,7 @@ func applyDefaults(cfg *Config, file string) error {
 	if v, ok := os.LookupEnv("TUNEX_STATE_DIR"); ok {
 		cfg.StateDir = strings.TrimSpace(v)
 	}
-	// Propagated, not swallowed: ignoring it would leave the agent running with the
-	// DEFAULT port while the operator believes their value applied — the exact
-	// silent-ignore this fix is about.
+	// Propagate invalid numeric configuration instead of silently using a default.
 	if err := envInt("AGENT_ADMIN_PORT", &cfg.AgentAdminPort); err != nil {
 		return err
 	}
