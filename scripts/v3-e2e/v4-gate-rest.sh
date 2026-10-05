@@ -485,6 +485,9 @@ else
     echo "     body: $(head -c 400 s7-restore.json 2>/dev/null | tr -d '\n')"
     echo "     tunnel: $(mysqlc "SELECT CONCAT(IFNULL(apply_status,''),' | code=',IFNULL(apply_error_code,'-'),' | ',LEFT(IFNULL(apply_error,''),220)) FROM tunnel WHERE id=$FORWARD_ID;")"
     echo "     ingress used_ports: $(mysqlc "SELECT IFNULL(used_ports,'') FROM node_state_report s JOIN tunnel t ON t.ingress_node_id=s.node_id WHERE t.id=$FORWARD_ID;")"
+    # 同时打印 Agent 认为**在跑**的 runtime：这样能直接区分"守卫里有个残留的挂账"与
+    # "Agent 还留着一个 runtime 条目"（两者的修法完全不同，不能靠猜）。
+    echo "     ingress runtimes: $(mysqlc "SELECT LEFT(IFNULL(tunnels,''),400) FROM node_state_report s JOIN tunnel t ON t.ingress_node_id=s.node_id WHERE t.id=$FORWARD_ID;")"
     echo "     rollout: $(mysqlc "SELECT CONCAT('phase=',IFNULL(phase,'-'),' err=',IFNULL(last_error_code,'-'),' ',LEFT(IFNULL(last_error,''),200)) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID ORDER BY id DESC LIMIT 1;")"
   fi
   assert_eq "$S7_STATUS" "200" "S7.2 还原夹具端口 PATCH HTTP 200"

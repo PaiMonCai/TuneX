@@ -107,3 +107,37 @@ func TestPortGuardIsFreedWhenListenerMovesToAnotherPort(t *testing.T) {
 		t.Fatalf("reusing the released port must work, got: %v", err)
 	}
 }
+
+// "挂账"必须有界：正常路径由 Stop 返回时清账（drain 上界 3s），但**清账动作没跑到**
+// 不能等于"这个端口永远不可用" —— 这正是 S7 事故的形态（21003 早在 S3 就被移走，
+// 几分钟后 Agent 的 used_ports 里还留着它，面板于是再也发不出这个端口）。
+// 这里直接构造一个过期的挂账，断言它在重建时被抹掉、端口可以立刻复用。
+func TestStoppingPortNoteExpiresInsteadOfHoldingThePortForever(t *testing.T) {
+	em := NewEgressManager()
+	tm := NewTunnelManager(em, "127.0.0.1")
+	em.SetPool("exp", RoundRobin, []forwarder.Target{tg("127.0.0.1", 1)})
+
+	port := freePort(t)
+	cfg := egressCfgFor("exp", port, 1)
+
+	// 模拟"Stop 已发起、清账没跑到"：登记挂账，然后把它标成早已过期。
+	tm.mu.Lock()
+	tm.noteStoppingLocked(cfg)
+	key := portGuardKey(cfg)
+	tm.stoppingPorts[key] = stoppingNote{count: 1, until: time.Now().Add(-time.Second)}
+	tm.rebuildPortGuardLocked()
+	_, stillHeld := tm.stoppingPorts[key]
+	tm.mu.Unlock()
+	// 读取守卫视图要在**解锁之后**：UsedPorts() 自己也取锁，RWMutex 不可重入。
+	held := tm.UsedPorts()[port]
+
+	if stillHeld {
+		t.Fatalf("an expired stopping note must be dropped by the rebuild")
+	}
+	if held {
+		t.Fatalf("port %d must not stay guarded once the note expired", port)
+	}
+	if _, err := tm.Apply(cfg); err != nil {
+		t.Fatalf("the port must be usable again after the note expired, got: %v", err)
+	}
+}

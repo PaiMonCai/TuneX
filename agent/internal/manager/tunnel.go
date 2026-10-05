@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
@@ -64,15 +65,20 @@ type TunnelManager struct {
 	tunnels  map[string]*entry
 	usedPort map[string]bool // "<socket namespace>:<port>" guard shared with EgressManager
 
-	// stoppingPorts 记录"Stop 已经发起、但监听还没真正关闭"的端口（多重集）。
+	// stoppingPorts 记录"Stop 已经发起、但监听还没真正关闭"的端口 —— 带**截止时间**的挂账。
 	//
 	// 为什么需要它：端口守卫是**派生状态** —— 它必须恰好等于"还有 runtime 在听这个端口"。
 	// 而"还在听"包含两类：`tunnels` 里的 entry，以及正在 drain 的旧 entry（它的监听还没关，
 	// 内核层面这个端口仍被占）。只按 `tunnels` 重建会在 drain 期间把端口错放出去
 	// （下一次 bind 直接 `address already in use`）；只按手工 mark/release 维护则会**漏**
-	// （实测：runtime 早已 removed，`used_ports` 里还留着 22001，于是复用该端口的下一条路由
-	// 被 Agent 拒绝，而面板的端口租约早已释放 —— 两边对"端口归谁"给了不同答案）。
-	stoppingPorts map[string]int
+	// （实测：runtime 早已 removed，`used_ports` 里还留着 22001/21003，于是复用该端口的下一条
+	// 路由被 Agent 拒绝，而面板的端口租约早已释放 —— 两边对"端口归谁"给了不同答案）。
+	//
+	// 截止时间是**第二道自愈**：正常路径下挂账由 Stop 返回时清掉（drain 上界只有 3s），
+	// 但"清账动作因为任何原因没跑到"不能等于"这个端口永远不可用" —— 那正是本次事故的形态
+	// （端口早已无人监听，守卫却一直占着）。超过 {@link stoppingPortGrace} 后挂账自动失效，
+	// 以内核为准：内核里真占着，bind 会如实失败；已经不占了，端口就该能被复用。
+	stoppingPorts map[string]stoppingNote
 
 	egress *EgressManager
 	// listenHost is the interface ingress/egress tunnels bind when the config
@@ -201,9 +207,9 @@ func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 	return &TunnelManager{
 		tunnels:       make(map[string]*entry),
 		usedPort:      make(map[string]bool),
-		stoppingPorts: make(map[string]int),
-		egress:     egress,
-		listenHost: listenHost,
+		stoppingPorts: make(map[string]stoppingNote),
+		egress:        egress,
+		listenHost:    listenHost,
 	}
 }
 
@@ -443,6 +449,9 @@ func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Ru
 	if port <= 0 {
 		return fwd.Start()
 	}
+	// 先按事实重建一次：挂账到期必须**立刻**失效，不能等到下一次 Apply/Remove 才被抹平
+	// （否则面板按 DB 发的端口会在这里被一个"早就该过期"的挂账挡回去）。
+	m.rebuildPortGuardLocked()
 	if !m.portBoundLocked(port) {
 		return fwd.Start()
 	}
@@ -469,13 +478,26 @@ func (m *TunnelManager) markPortUsedLocked(cfg forwarder.TunnelConfig) {
 	}
 }
 
+// stoppingPortGrace 是"挂账"的存活上界：正常 drain 由 forwarder 的 drainTimeout(3s) 界定，
+// 这里留一个远大于它的余量，只用来兜住"清账动作没跑到"这种故障，而不是用来延长占用。
+const stoppingPortGrace = 30 * time.Second
+
+// stoppingNote 是一个端口的挂账：重数（并发/重复登记）与失效时刻。
+type stoppingNote struct {
+	count int
+	until time.Time
+}
+
 // noteStoppingLocked records that this config's listener is being torn down and its
 // port is therefore not yet reclaimable. Caller must hold m.mu.
 func (m *TunnelManager) noteStoppingLocked(cfg forwarder.TunnelConfig) {
 	if cfg.ListenPort() <= 0 {
 		return
 	}
-	m.stoppingPorts[portGuardKey(cfg)]++
+	m.stoppingPorts[portGuardKey(cfg)] = stoppingNote{
+		count: m.stoppingPorts[portGuardKey(cfg)].count + 1,
+		until: time.Now().Add(stoppingPortGrace),
+	}
 }
 
 // clearStoppingLocked is the matching decrement, run once Stop returned (the
@@ -485,8 +507,8 @@ func (m *TunnelManager) clearStoppingLocked(cfg forwarder.TunnelConfig) {
 		return
 	}
 	key := portGuardKey(cfg)
-	if n := m.stoppingPorts[key]; n > 1 {
-		m.stoppingPorts[key] = n - 1
+	if n := m.stoppingPorts[key]; n.count > 1 {
+		m.stoppingPorts[key] = stoppingNote{count: n.count - 1, until: n.until}
 	} else {
 		delete(m.stoppingPorts, key)
 	}
@@ -507,10 +529,18 @@ func (m *TunnelManager) rebuildPortGuardLocked() {
 			next[portGuardKey(e.cfg)] = true
 		}
 	}
+	now := time.Now()
 	for key, n := range m.stoppingPorts {
-		if n > 0 {
-			next[key] = true
+		if n.count <= 0 {
+			delete(m.stoppingPorts, key)
+			continue
 		}
+		if !now.Before(n.until) {
+			// 挂账过期：清账动作没跑到（或 Stop 卡住）不能等于"这个端口永远不可用"。
+			delete(m.stoppingPorts, key)
+			continue
+		}
+		next[key] = true
 	}
 	m.usedPort = next
 }
@@ -810,7 +840,7 @@ func (m *TunnelManager) StopAll() {
 		delete(m.tunnels, id)
 	}
 	m.usedPort = make(map[string]bool)
-	m.stoppingPorts = make(map[string]int)
+	m.stoppingPorts = make(map[string]stoppingNote)
 	m.mu.Unlock()
 
 	var wg sync.WaitGroup
