@@ -1,22 +1,11 @@
 /**
- * V5-WP17.4 —— DNS **后继**与**就绪性前置闸门**（契约 F5、§5 表）。
+ * DDNS readiness gate and post-migration successor.
  *
- * 挂在**既有** reconcile 节拍上（`worker.ts` 已经把 `runFailoverSweep` 挂在
- * `ReconcileDeps.failoverSweep`）。**不新开定时器、不下发给 Agent、不改 rollout 步骤词表** ——
- * 这个项目已经为"第二条时间真相"付过学费，DNS 也不是 Agent 该知道的事。
- *
- * ── 两件事，各有各的失败方向 ──────────────────────────────────────────
- *
- * **① 就绪性闸门（执行器之前）**：开了 `dns_auto_resolve` 的转发，如果 DNS 这条路根本写不通
- * （provider 没配好 / 凭据缺失 / 最近既没有成功写、只读探测也失败），那么**迁移就不该开始**。
- * 理由是不对称代价：迁移让客户端在 TTL 内连旧地址是"短暂中断"；而面板显示已切换、DNS 却还是
- * 旧地址，是"看着正常实际全挂"。所以不 ready ⇒ **不调用执行器**，记 `dns_path_unready`，
- * **epoch 不动**（契约 F5 ④）。
- *
- * **② 后继（执行器之后）**：迁移真正"到达新入口"之后才写 DNS。顺序不能反：先写再搬 =
- * 把客户端指向还没监听的机器；搬完不写 = 客户端一直连已停机的旧地址。而 rollout 是**异步**的，
- * 所以这里必须**自己判"到了没有"**（`applied_revision == config_revision`），没到就这一拍不做、
- * 下一拍再看 —— 而不是假装搬完就立刻写。
+ * Automatic DNS participates in the existing failover/reconciliation cadence;
+ * it does not create another timer or Agent command path. When automatic DNS is
+ * enabled, migration starts only if the provider path is demonstrably usable.
+ * After placement changes, DNS is updated only once the new Forward revision is
+ * actually applied, preventing clients from being pointed at an unready ingress.
  */
 import { createHttpDdnsProviderClient, syncForwardDns, type DdnsProviderClient, type DdnsSyncDeps, type DdnsSyncResult } from "./ddns-executor.ts";
 import { isSealedDdnsConfig, openDdnsCredential } from "./ddns-binding.ts";
