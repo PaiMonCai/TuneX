@@ -1,14 +1,11 @@
 /**
- * V5.5 Federation —— 本 Panel 身份（WP14，契约 §2.1）。
+ * Persistent identity for this Panel's federation endpoint.
  *
- * 事实：本仓库此前**不存在**任何「本机实例身份 / 公钥」概念（Lead 调研已核实）。
- * 这里新建的是一份**身份**，不是第二份业务真相：它只回答「我是谁、我用哪把钥匙签名」。
- *
- * 三条硬约束：
- *   1. 私钥只以密文落地（seal.ts），永不进入 API 响应 / 审计 / 诊断 / Support Bundle；
- *   2. `panel_id` 稳定（卸载重装才变）；每次读取都返回同一个值；
- *   3. 私钥解不开 = 身份不可用（抛错），**不得**静默重新生成 —— 静默重建身份
- *      会让所有已有 peer 的信任指向一个已经不存在的 Panel，且外面看不出来。
+ * The Panel id is stable for the installation. Private signing keys are stored
+ * only in sealed form and never exposed through API/audit/diagnostic surfaces.
+ * Failure to decrypt an existing key is fatal for federation identity and must
+ * never silently regenerate a new identity. Ensuring an identity exists does not
+ * itself enable federation.
  */
 import { importJWK, type JWK } from "jose";
 import { db } from "../../db.ts";
