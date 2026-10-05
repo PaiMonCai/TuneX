@@ -13,7 +13,7 @@ export interface RuntimeUseResource {
    * It used to be called `tunnel_type` and callers fed it the legacy COLUMN
    * value. That is not the same fact: a `ws` Forward has no value in the legacy
    * Prisma enum, so the column takes its historical default (`wss`) and the
-   * policy layer then refused the Forward's own protocol — Gate V5-G1A.7 caught
+   * policy layer then refused the Forward's own protocol — Gate a regression case caught
    * it as "a ws Forward cannot be retargeted: protocol_not_allowed (wss)".
    */
   protocol?: string;
