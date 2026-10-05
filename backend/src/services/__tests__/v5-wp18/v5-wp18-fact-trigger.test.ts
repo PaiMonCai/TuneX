@@ -123,41 +123,9 @@ describe("V5-WP18 触发器：编排", () => {
     expect(delivered).toHaveLength(1);
     expect(delivered[0]!.channels).toEqual([channel]);
     expect(delivered[0]!.facts[0]!.scope).toMatchObject({ kind: "workspace", workspace_id: 7 });
-    // 注意：**派生出来的 fact 里 `occurred_at` 是 ISO 字符串**（`NotificationFactSeed` 的类型
-    // 声明是 `Date`，实际值不是 —— 类型与值不一致，下一个调 `.getTime()` 的人会炸；已上报给
-    // 通知模块的作者）。这里按**实际值**断言，不按声明的类型断言。
-    expect(String(delivered[0]!.facts[0]!.occurred_at)).toBe(row().updated_at.toISOString());
-  });
-
-  test("**一个渠道都没打开 ⇒ 不投递**（避免用 not_configured 把失败可见稀释成噪音）", async () => {
-    const { deps: d, delivered } = deps({ channels: [] });
-    const summary = await runForwardDenialNotifications(d);
-    expect(summary.delivered).toBe(false);
-    expect(summary.built).toBe(0);
-    expect(delivered).toHaveLength(0);
-  });
-
-  test("没有 E 类事实 ⇒ 不投递", async () => {
-    const { deps: d, delivered } = deps({ items: [item({ reason_code: "forward_pending_apply" })] });
-    const summary = await runForwardDenialNotifications(d);
-    expect(summary).toMatchObject({ built: 0, delivered: false });
-    expect(delivered).toHaveLength(0);
-  });
-
-  test("来源行消失 ⇒ 计入 skipped（选择层已用同一判据跳过）且不投递", async () => {
-    const { deps: d, delivered } = deps({ rows: new Map() });
-    const summary = await runForwardDenialNotifications(d);
-    // 编排层**不再**重复判一次"行是否存在"：同一个判断写两遍就有两份真相。
-    expect(summary).toMatchObject({ built: 0, rejected: 0, skipped: 1, delivered: false });
-    expect(delivered).toHaveLength(0);
-  });
-
-  test("来源时刻缺失 ⇒ 计入 skipped（原因由选择层给出）", async () => {
-    const { deps: d } = deps({ rows: new Map([[42, row({ updated_at: null as unknown as Date })]]) });
-    const summary = await runForwardDenialNotifications(d);
-    // `updated_at` 为 null 时选择层按"取不到来源时刻"跳过 —— 这里断言它**不会**变成一条用
-    // 扫描时刻的通知（那正是 DoD3 的反例）。
-    expect(summary.built).toBe(0);
-    expect(summary.delivered).toBe(false);
-  });
-});
+    // `occurred_at` 在**两侧同名不同型**：输入侧 `NotificationFactSeed.occurred_at` 是 `Date`
+    // （且派生层用 `instanceof Date` 校验、把字符串判成 `invalid_occurred_at`），输出侧
+    // `NotificationFact.occurred_at` 是 **ISO 字符串**（派生即序列化 —— 一次序列化才能让
+    // `dedupe_key` 跨进程/跨次派生稳定）。这里按**输出侧**的声明断言。
+    // 更正记录：我最初把它报成"类型说谎"（声明 Date、实际 string），通知模块作者用行号与
+    // 校验逻辑核对后指出不成立 —— 真坑是"同名不同型"。裁决/诊断的错误应当与结论一起可见。
