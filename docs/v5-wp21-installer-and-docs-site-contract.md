@@ -197,7 +197,7 @@ install.sh upgrade --version <git-sha>            # 必需；不接受省略
 
 **结论（三段信任边界，逐段给校验手段）**
 
-1. **引导段（`curl | bash` 不可避免的那一段）**：只做一件事——把仓库按指定 sha 检出到部署目录，然后用**检出后的脚本**继续（有副作用的动作永远发生在"已被内容寻址校验过的代码"上）。`git rev-parse HEAD` 必须等于请求的 sha，否则 `rm -rf` 临时目录并非零退出。**禁止**引导脚本含凭据、写 `.env`、pull 镜像或 `up -d`。
+1. **引导段（`curl | bash` 不可避免的那一段）**：只做一件事——把仓库按指定版本检出到部署目录，然后用**检出后的脚本**继续（有副作用的动作永远发生在"已被内容寻址校验过的代码"上）。**版本形态决定切法**（§4.0 OPEN-1 修订版）：裸 SHA ⇒ 完整克隆 + `checkout --detach`；tag/branch ⇒ `ls-remote` 解析出 sha 后 `--depth 1 --branch <ref>` 浅克隆。两条路径都必须 `git rev-parse HEAD` 等于锚定版本，否则 `rm -rf` 该临时目录并非零退出。**禁止**引导脚本含凭据、写 `.env`、pull 镜像或 `up -d`；**禁止** `--depth 1 --branch <裸 sha>`，也**禁止**把 `fetch --depth 1 origin <sha>` 当回落（§11.1）。
 2. **安装器主体段**：只从**本地已检出的仓库**读取（`scripts/ops/*.sh`、compose、`.env.*.example`），**运行期不下载任何脚本或二进制**；镜像只经 `docker pull <image>:<sha|digest>` 获取，升级后把实际 digest 记入 `var/ops/deploy-history.jsonl`（复用 `rollback.sh` 字段口径）。镜像引用必须通过**与 `node-upgrade.ts:IMAGE_REF_RE` 同形**的窄校验；语义权威是 `node-upgrade.ts`，shell 侧是**登记在案的派生副本**（DoD 16 要求两者结论一致）。
 3. **面板 ↔ Agent 段（现状，不改）**：一次性 enrollment token 的过期与重放结论由代码给出：32B 熵 / **TTL 600s** / 只存 sha256 / 原子单次消费 / **重发即撤销同节点所有未用 token** / 消费成功再撤销同级未用 token / 过期与撤销在读与写两处判定 / 认证失败 10 次 60s 即封 300s / DB 不可用回 503 不放行。**没有任何"面板下发整份配置"的通道**：安装脚本只写封闭的 **7 个必需 + 2 个可选** env 键（`TUNEX_PANEL_HTTP_URL`、`TUNEX_AGENT_ID`、`TUNEX_NODE_ID`、`TUNEX_NODE_CREDENTIAL`、`TUNEX_ROLE`、`TUNEX_AGENT_ADMIN_PORT=0`、`TUNEX_STATE_DIR`；可选 `TUNEX_INGRESS_RANGE` / `TUNEX_EGRESS_RANGE`），Forward 期望状态仍走既有 outbound desired/ACK。
 
@@ -295,7 +295,7 @@ install.sh upgrade --version <git-sha>            # 必需；不接受省略
 >
 > | ID | 裁决 | 理由 |
 > |---|---|---|
-> | **OPEN-1** 引导方式 | **(a) `git clone --depth 1 --branch <sha>` + `rev-parse` 断言**（内容寻址） | 引导段**不执行任何来自网络的脚本**，信任边界才讲得硬。代价（需要 git / 可达远端）明确接受：这是安装前提，不是运行时依赖 |
+> | **OPEN-1** 引导方式 | **按版本形态分流**（2026-10-05 修订，见 §11.1 的实测）：<br>(a) 版本是**裸 SHA**（`^[0-9a-f]{7,40}$`）⇒ `git clone <repo> <dir>` + `git -C <dir> checkout --detach <sha>`（**完整克隆**，任何服务器都可用）；<br>(b) 版本是 **ref**（tag/branch）⇒ 先 `git ls-remote` 解析出 sha，再 `git clone --depth 1 --single-branch --branch <ref>`，并用解析出的 sha 断言；<br>(c) 两条路径**都以 `git rev-parse HEAD` 断言收尾**，不等则删目录并非零退出；<br>(d) **禁止** `--depth 1 --branch <裸 sha>`（必然 fatal）、**禁止**依赖 `fetch --depth 1 origin <sha>`（服务器配置依赖）。 | 引导段**不执行任何来自网络的脚本**，信任边界才讲得硬；而"裸 SHA"没有可移植的浅克隆路径（实测）。代价（需要 git / 可达远端）明确接受：这是安装前提，不是运行时依赖 |
 > | **OPEN-2** 自动装 Docker | **(a) 永不**：缺 Docker 即拒绝并给三条手工路径 | 把未校验的 root 代码执行写进产品路径违背 fail-closed。将来若做，只能是显式 opt-in + sha256 pin，且单独立项 |
 > | **OPEN-3** 独立文档站 | **不立项** | `docs/` 是单一真相；独立站点会引入第 4 条流水线 + 第三套前端工具链，收益不抵"第二份真相"的风险 |
 > | **OPEN-4** 下载加速器 | **不立项** | 等于把第三方代理写进产品下载路径；国内可达性由部署方自选镜像解决，不由产品硬编码 |
@@ -306,7 +306,7 @@ install.sh upgrade --version <git-sha>            # 必需；不接受省略
 
 | ID | 问题 | 候选 | 代价 |
 |---|---|---|---|
-| **OPEN-1** | 引导方式（"第一段"怎么把代码拿到机器上） | (a) `git clone --depth 1 --branch <sha>` + `rev-parse` 断言（**推荐**，内容可验证、无 raw 依赖）；(b) `curl -fsSL <repo>/install.sh \| sudo sh`（Forwardx 式，最顺滑但内容不可验证）；(c) 两者都给（新手用 b、审计场景用 a） | (a) 需要 git 与可达的 git 远端（国内 git 托管/镜像可由部署方自选）；(b) 需要额外信任"能改 raw 响应的一切"；(c) 维护两条入口、文档要写清差异 |
+| **OPEN-1** | 引导方式（"第一段"怎么把代码拿到机器上） | (a) **已修订为按形态分流**：裸 SHA ⇒ 完整克隆 + 分离检出；tag/branch ⇒ `ls-remote` 解析 sha 后 `--depth 1 --branch <ref>`；两者都以 `rev-parse` 断言收尾（见 §4.0 与 §11.1）；(b) `curl -fsSL <repo>/install.sh \| sudo sh`（Forwardx 式，最顺滑但内容不可验证）；(c) 两者都给（新手用 b、审计场景用 a） | (a) 裸 SHA 形态要多拉一次完整历史（慢一点），但**哪里都能用**且内容寻址强度不变；`--branch <裸 sha>` 与 `fetch --depth 1 origin <sha>` 都已实测淘汰 (§11.1)；(b) 需要额外信任"能改 raw 响应的一切"；(c) 维护两条入口、文档要写清差异 |
 | **OPEN-2** | 是否允许安装器自动装 Docker | (a) 永不（**推荐**，缺 Docker 即拒绝并给三条手工路径）；(b) 显式开关 `--install-docker --docker-script-sha256 <hex>`（必须 pin 校验和，拒绝裸 `curl\|sh`）；(c) 默认自动（Forwardx 语义） | (a) 全新机器多一步人工；(b) 需要人工维护/更新 sha256 并防"sha 过期导致安装失败"；(c) 把未校验的 root 代码执行写进产品路径，违背 fail-closed |
 | **OPEN-3** | 是否需要面向终端用户的独立文档站 | (a) 不做站点，只在 `docs/` 写用户指南（**本期结论**）；(b) 做站点但只从 `docs/` 渲染（VitePress，需新增根工具链 + 第四条流水线）；(c) 用现有 README 摘要承担用户文档 | (a) 用户需在 GitHub 阅读 md；(b) 新增依赖/锁文件/CI 与"第二份真相"风险；(c) README 会膨胀，且与 `docs/` 交叉引用变多 |
 | **OPEN-4** | 下载加速是否立项（形态已由 FROZEN-4 冻结） | (a) 不做（本期结论）；(b) 做，但仅作用于"部署方自选的镜像源/仓库镜像"，**不进产品代码**；(c) 做，按 FROZEN-4 的开关形态进产品 | (a) 国内拉 GHCR 仍需部署方自建 mirror；(b) 需要文档教部署方改 Docker daemon；(c) 把 MITM 位置引入分发链路，必须默认关 + 显式信任 |
@@ -410,3 +410,181 @@ install.sh upgrade --version <git-sha>            # 必需；不接受省略
 - 本文冻结 **FROZEN-1 … FROZEN-7**；**OPEN-1 … OPEN-5** 在 Lead 拍板前**不得**进入实现（实现方不得"先做一版再说"）。
 - 交付物落点：契约 = 本文；实现 = `scripts/ops/install.sh`（新增）+ WP21D 的三处增补；验证 = DoD §6 的 18 条 + Gate §7 的三层接法。
 - 与既有文档的关系：`docs/production-deploy.md` 仍是**手动路径与日常运维的唯一真相**；本文只新增"自动化入口"的语义，不复制其内容，不改变其结论。
+
+---
+
+## 11. 实现记录（WP21 安装器支；2026-10-05）
+
+> 本节记录**已实现**的东西与**实现中发现并改判**的东西。凡是与 §3/§4 冲突的，以本节标注的"修订"为准；
+> §1–§10 的其余冻结项不变。文件：`scripts/ops/install.sh`（新增）、`scripts/ops/bootstrap.sh`（新增）、
+> `scripts/ops/tests/installer-static.sh`（新增，门禁）；既有 5 个 ops 脚本与既有 workflow **零改动**。
+
+### 11.1 实测：为什么不能用 `git clone --branch <裸 sha>`（OPEN-1 由此改判）
+
+**命令与输出（git 2.39.5；本地 `file://` 远端；普通路径远端结果相同）**
+
+~~~text
+$ git clone --depth 1 --single-branch --branch e8e15c120660d87a980e9062d1860d553728b48e \
+      file:///tmp/gitclone-test/src dst1
+Cloning into 'dst1'...
+warning: Could not find remote branch e8e15c120660d87a980e9062d1860d553728b48e to clone.
+fatal: Remote branch e8e15c120660d87a980e9062d1860d553728b48e not found in upstream origin
+$ echo $?
+128
+~~~
+
+原因：`--branch` 只解析 **ref 名**（分支 / tag），不解析裸 commit sha。因此"`clone --branch <sha>` 锚定版本"
+在原裁决下**不可能成功**，不是环境特例。
+
+**同样实测淘汰的回落路径**：`git fetch --depth 1 origin <sha>`
+
+~~~text
+$ git init -q d4 && git -C d4 remote add origin file:///tmp/gitclone-test/src
+$ git -C d4 fetch -q --depth 1 origin e8e15c120660d87a980e9062d1860d553728b48e
+（file:// 成功 —— 本地传输可以直接读对象）
+~~~
+
+在 `file://` 上它"能用"，正是因为本地传输绕过了服务端协商；换到 HTTP(S) 远端就需要服务端打开
+`uploadpack.allowAnySHA1InWant`（默认 **off**），也就是把"安装成功"变成"看服务器配置"。所以它**不能**当回落。
+
+**改判后的两条路径（都实测通过）**
+
+~~~text
+# 裸 SHA（^[0-9a-f]{7,40}$）：完整克隆 + 分离检出，任何服务器都可用
+$ git clone file:///tmp/gitclone-test/src d2 && git -C d2 checkout --detach b79ed212...
+d2 HEAD=b79ed2129b93a05b173a3b5eb9adbf1d69be86ca   shallow=no
+
+# ref（tag/branch）：先 ls-remote 解析 sha，再浅克隆，用解析出的 sha 断言
+$ git ls-remote --exit-code file:///tmp/gitclone-test/src refs/tags/v1.5.0
+b79ed2129b93a05b173a3b5eb9adbf1d69be86ca	refs/tags/v1.5.0
+$ git clone --depth 1 --single-branch --branch v1.5.0 file:///tmp/gitclone-test/src d1
+d1 HEAD=b79ed2129b93a05b173a3b5eb9adbf1d69be86ca   shallow=yes
+~~~
+
+两条路径的共同收尾：`git -C <dir> rev-parse HEAD` 必须等于锚定版本（短 sha 用前缀比较），
+不等则 `rm -rf <dir>` 并非零退出（`--check` 与真实路径都会执行到这里）。
+
+### 11.2 `scripts/ops/bootstrap.sh`（引导段）
+
+| 项 | 实现 |
+|---|---|
+| 只做什么 | 按版本检出到部署目录 → `rev-parse` 断言 → `exec <dir>/scripts/ops/install.sh <action> --version <解析出的完整 sha>` |
+| 不做什么 | 不写 `.env`、不 pull 镜像、不 `up -d`、不装 Docker、不含任何凭据（静态门禁断言这些字符串不存在） |
+| 版本形态 | 裸 SHA ⇒ 完整克隆 + `checkout --detach`；tag/branch ⇒ `ls-remote` → 浅克隆 → 用解析出的 sha 断言 |
+| 目标目录已存在 | 同一版本 ⇒ 复用并跳过克隆；**不是**同一版本 ⇒ 拒绝（不做静默复用、不自动删既有目录） |
+| 交接 | 把 ref 固化成**完整 sha** 后交给安装器（面板镜像 tag 就是 git sha，语义与 FROZEN-2 一致） |
+| 模式 | `--dry-run` 只打印计划（不联网、不建目录）；`--check` **真克隆 + 真断言但不 exec** |
+| 退出码 | 2 用法；3 缺 git 或远端不可达；4 检出/断言失败（已清掉本次克隆的目录）；5 目标目录版本不符 |
+
+### 11.3 `scripts/ops/install.sh`（安装器）
+
+动作集严格等于 FROZEN-1 的 4 个动词：`install` / `upgrade` / `uninstall` / `status`。
+
+**退出码表（2–9，与 §3 FROZEN-1 的矩阵对齐）**
+
+| 码 | 含义 | 触发点 |
+|---|---|---|
+| 2 | 用法/参数 | 缺 `--version`、`latest` 缺 `--allow-floating`、`--purge-data` 非交互缺 `--yes`、`--no-docker` 单独使用 |
+| 3 | 非 root | `install/upgrade/uninstall`（`status` 不要求 root） |
+| 4 | 平台/Docker | 非 Linux；缺 Docker（**给指引不代装**）；缺 Compose v2；`--standalone` 时 Compose < 2.24.4 |
+| 5 | 缺必需命令/文件 | `curl/openssl/sha256sum/jq`；compose 文件不存在；路径含空白字符 |
+| 6 | 同机项目名冲突 | 项目 `tunex` 的容器属于别的部署目录（生产/开发栈同名，见 `production-deploy.md` §1） |
+| 7 | `.env` 校验不通过 | 缺键 / 仍是 `change-me`·`replace-with` 占位 / 权限不是 600（**只报键名，绝不回显值**） |
+| 8 | 已有部署（幂等拒绝） | `install` 撞上同版本 / 异版本 / 半途失败；`upgrade` 没有可升级的部署 |
+| 9 | 运行期失败 | `docker pull`、`compose up`、`db-migrate` 非 0、健康验收失败（升级路径已走回退） |
+
+**与契约的三处补充裁决（实现时发现契约没写死，这里补齐，不猜）**
+
+1. **第四态 `partial`（有 `.env`、无容器）**：契约 §3 FROZEN-1 只写了无/同/异三态。实现把"有 `.env` 但没有运行中容器"
+   单列为 `partial`：`install` **拒绝**，不自动复用、不自动清理，提示"先 `status` 判断；要从头再来请人工把 `.env` 移走"。
+   理由：这正是"上次安装半途失败"的现场，静默复用会把半套凭据带进新部署；自动清理则违反"半途失败不自动清理"。
+2. **`var/ops/deploy-history.jsonl` 的写入口径**：FROZEN-6 说"账本由既有脚本写、安装器只读"，但 FROZEN-3/DoD 7 要求安装器
+   **记录升级后的 digest**。实现取后者：`install`/`upgrade` 成功后**各追加一条**，字段与 `rollback.sh:current_state()`
+   完全同形（`{commit,image,digest,at}` + `action`）。副作用是 `rollback.sh --to previous`（`tail -2 | head -1`）
+   仍然解析到"变更前的那一条"，语义不变。安装器**不创建**别的状态文件（无进度文件）。
+3. **安装器不拉 Agent 镜像**：`TUNEX_AGENT_IMAGE` 只写进 `.env`；Agent 镜像由**节点**匿名拉取（§8 第 8 条、`docs/production-deploy.md` §2.3）
+   ——面板主机拉一份多架构 Agent 镜像没有用途，还会把节点侧信任面搬到面板。升级时本机只 `docker pull` 面板镜像。
+
+**其它实现细节（都可被静态检查或 dry-run 断言）**
+
+- `--version` 接受三种输入：40 位 git sha（→ `ghcr.io/paimoncai/tunex:<sha>`）、`latest`（必须 `--allow-floating`）、
+  **完整镜像引用**（DoD 8 的失败注入用的就是这种；形状校验与 `node-upgrade.ts:validateAgentImageRef` 同结论，见 §11.4）。
+  `--agent-image <ref>` 可显式覆盖推导出的 Agent 镜像（同样过形状校验）。
+- `--dry-run`：确定性、零副作用、**零 docker 依赖**（所有 docker 事实来自 `TUNEX_DRYRUN_FIXTURES` 夹具文件），
+  只打印会执行的命令；`--check` 是**真实只读探测**，做完前置检查就退出（`tx_after_preflight`，不会落到真实部署动作）。
+  `--no-docker` 只允许与 `--dry-run/--check` 合用（真实部署必须真的检测 Docker）。
+- 调用既有脚本时**显式传环境**：`COMPOSE_FILE=<root>/docker-compose.prod.yaml`、`COMPOSE_PROJECT_NAME=tunex`、
+  `TUNEX_ENV_FILE=<root>/.env`、`OPS_DIR`、`BACKUP_DIR`；compose 调用一律带 `-p tunex -f <prod compose> --env-file <env>`
+  （不依赖 `.env` 在 CWD 的隐式加载）。**口令只经环境变量**传递：`export BACKUP_PASSPHRASE` 后交给子进程，
+  不进 argv、不进日志、不进文件（静态门禁断言不存在 `BACKUP_PASSPHRASE=` 赋值）。
+- `install` 生成 `.env`：从 `.env.production.example` 复制（`umask 077`），随机生成 5 个密钥
+  （`openssl rand -base64 32 | tr '+/' '-_'`，命令与 §3 FROZEN-3/模板注释一致，**含 `=` 填充**）、
+  把同一口令写进 `DATABASE_URL`、写入 `TUNEX_IMAGE`/`TUNEX_AGENT_IMAGE`/`TUNEX_AGENT_LATEST_VERSION`，`chmod 600`；
+  只打印**键名**与 `.admin-credentials` 路径（内容由 `db-migrate` 写出，安装器不读不打印）。
+- 缺 Docker 的指引（唯一真相在 `tx_docker_guidance`）：官方文档 URL + 按 `/etc/os-release` 给出 apt/dnf/zypper/apk/pacman
+  包管理器路径 + 离线静态包路径；**不含** `get.docker.com`、**不含** `curl | sh`（静态门禁断言）。
+- 升级顺序（FROZEN-2）：`docker pull`（先拉后变）→ `backup.sh`（非 0 **或** 没有新增 manifest 即拒绝）→ 写 `.env`
+  （事前 `cp .env var/ops/.env.before-installer-upgrade`）→ `up -d backend worker web` → 等 `db-migrate` 退出码 0 →
+  `/healthz`+`/readyz`+三服务 running → 成功追加 deploy-history；失败 `rollback.sh --to previous --yes`。
+  **数据层绝不自动回退**（提示人工 `restore.sh <backup-id> --yes`）。
+- `uninstall`：`compose down`（默认保卷）／`--purge-data --yes` 才 `down -v`；非交互缺 `--yes` 直接拒绝。
+- `status`：只读打印容器/镜像/digest/健康/db-migrate 退出码/最近备份/部署历史/节点升级提醒；Docker 不可用时
+  降级为文件系统事实 + 指引（仍只读）。`.env` 有问题时以 7 退出（可操作），不打印值。
+
+### 11.4 验证入口（本支的门禁，可重复跑）
+
+~~~bash
+bash scripts/ops/tests/installer-static.sh          # 196 项断言，零 docker 依赖、零网络、零机器状态改动
+bash -n scripts/ops/install.sh && sh -n scripts/ops/install.sh
+bash -n scripts/ops/bootstrap.sh && sh -n scripts/ops/bootstrap.sh
+~~~
+
+覆盖：语法（`bash -n`/`sh -n`）→ 静态红线（无 `eval`、无第三方加速域名、无 `get.docker.com`/`curl|sh`、
+无明文口令赋值、不自建备份/迁移、不写 crontab、不把开发栈当目标）→ 纯函数单测（镜像引用**与
+`node-upgrade.ts` 的 `IMAGE_REF_RE` 逐条 parity**、幂等三态、`.env` 校验、Docker 指引、备份口令非交互拒绝、
+bootstrap 版本形态）→ 真实 `.env` 生成（600/必需键/DATABASE_URL 同口令/`docker compose config -q` 通过）→
+`--dry-run` 全流程（覆盖 DoD 1–3、5–11 的退出码与命令顺序、零副作用，含 `--standalone` 的 overlay 与
+Compose 版本门）→ **真实 `status`**（只读，断言健康码是 3 位整数而非 `000000`）→ bootstrap **真克隆**
+（tag 浅克隆、裸 SHA 完整克隆且断言 `HEAD == sha`、断言失败自清、目录冲突拒绝、`--check` 不 exec）。
+
+**DoD 14 的另一种证据**：本支 diff **不触碰** `scripts/ops/{alert,backup,capacity,restore,rollback}.sh`
+（`git diff HEAD --name-only -- scripts/ops/` 只有新增的 `install.sh`/`bootstrap.sh`/`tests/`），
+并已**直接执行 `v4-gate-f5.py` 里 `f5_8_ops_scripts()` 的原始断言代码**（只读三个脚本）：`PASS=22 FAIL=0`。
+注意：`v4-gate-f5.py` 无法单独 `import`（模块级 `load_state()` 需要 `scripts/v3-e2e/setup.sh` 先拉起拓扑），
+所以这里是用 `exec(function_source)` 跑它的原始断言，而不是复制一份。
+
+**CI 接法（WP21D 的 `installer-static` 作业，本次未动 `ci.yml`）**：该作业只需
+`bash -n`/`sh -n` + `bash scripts/ops/tests/installer-static.sh`（纯静态 + 桩化，无 Docker、无网络，
+目标 ≤1 分钟），不修改既有作业。
+
+### 11.5 OPEN-5 的落点与 backend 侧要求（`backend/src/services/node-enrollment.ts` 归 Lead）
+
+**事实**：Agent 节点的安装脚本不是仓库里的文件，而是**面板在运行期渲染**的字符串
+（`node-enrollment.ts:renderNodeInstallScript()`，经 `GET /api/internal/node/install.sh` 下发），
+所以"收紧 get.docker.com"只能改那个渲染函数；安装器（本 WP 的文件）与它**没有代码共享**，两者只能**口径一致**。
+
+**backend 侧要做到的（请以此为准，本支不落代码）**：
+
+1. **不执行任何未校验的下载**：缺 Docker 时**删除** `curl -fsSL https://get.docker.com -o tmp && sh tmp` 这一段；
+   渲染出的脚本里**不得出现** `get.docker.com`，也不得出现 `curl | sh`/`curl -o …  && sh`。
+2. **失败可见**：打印分发行版的可执行指引（与安装器 `tx_docker_guidance` 同口径：官方文档
+   `https://docs.docker.com/engine/install/` + apt/dnf/zypper/apk/pacman 包管理器路径 + 离线静态包路径），
+   然后**非零退出**，不继续（现在"装完继续"的语义要改成"停在这里"）。
+3. **不消耗一次性 token**：该分支必须在 `POST /api/internal/node/enroll` **之前**退出（现状已满足，别在改动里破坏）。
+4. **与文档一致**：指引文案不要出现"自动安装""一条命令装好"之类承诺；`docs/production-deploy.md`/面板提示保持同一句口径。
+5. **形状断言**：请补一条测试，断言 `renderNodeInstallScript()` 的产物里
+   `grep -E 'get\.docker\.com|curl[^|]*\|[[:space:]]*(sh|bash)'` 为空（这是本条的唯一机械守卫）。
+
+**若将来要恢复"自动装"**：只能显式 opt-in + sha256 pin（`--docker-script-sha256 <hex>`），且单独立项（§4 OPEN-2 候选 b）。
+
+### 11.6 仍未归档 / 需要 Lead 或后续 WP 处理
+
+| 事项 | 归属 | 说明 |
+|---|---|---|
+| `ci.yml` 新增 `installer-static` 作业 | WP21D（本次未动） | 命令见 §11.4，只做"新增作业"，不改既有作业 |
+| `.env.production.example` 增 `TUNEX_AGENT_LATEST_VERSION` | WP21D（本次未动） | 安装器已会写这个键；模板补注释即可（§1.1 已记录它当前不在模板里） |
+| `docs/production-deploy.md` 增"一键安装（自动化入口）"并降级手动步骤 | WP21D（本次未动） | 本次只在安装器里打印交接命令与文档引用，**不**复制 §2 的操作细节 |
+| 真实环境门禁 Gate V5-G6 | WP21E（可选，需 Lead 批） | 按 §6 DoD 1–11 在干净可丢弃机器上跑并留证据；不进 PR 路径 |
+| 离线/内网分发（无外网 git、无 GHCR） | **未决（需产品决策）** | 本支未实现：`--dry-run` 可先给计划；若产品需要，形态应是"部署方自建 git/registry 镜像 + 同一 sha 锚定"，而不是产品内置加速器（FROZEN-4） |
+| `install` 撞上「有 `.env`、无容器」时的复位体验 | **未决（建议加显式开关）** | 现状是拒绝并要求人工把 `.env` 移走（§11.3 第 1 条）。若产品认为"上次只跑到 `.env` 就被打断"太常见，建议加**显式** `--reuse-env`（只在 .env 通过校验且 `TUNEX_IMAGE` 与请求版本一致时允许），而不是恢复静默复用 —— 后者与 FROZEN-1 的 fail-closed 冲突 |
+| 多架构 Agent 镜像在面板主机的可选预拉 | 未决 | 现在不拉（见 §11.3 第 3 条）。若产品要求"面板主机预缓存"，应显式加 `--prefetch-agent-image`，默认关 |
