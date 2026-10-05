@@ -28,6 +28,9 @@ import { resolveWorkspaceAccess, resolveWorkspaceMembership, canWorkspaceResourc
 import { collectAttention } from "../services/attention.ts";
 import { projectUserNode } from "../services/node-view.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
+import { billingDayStart, billingMonthStart } from "../services/billing-time.ts";
+import { getEffectivePolicy, sumWorkspaceTraffic } from "../services/policy-service.ts";
+import { fillDays } from "../services/traffic.ts";
 
 export const dashboardRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -39,23 +42,25 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
   return user;
 }
 
-/** 取本地零点（避免 UTC 偏移导致「今日」错位） */
-function startOfToday(): Date {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
+/**
+ * 当日日首（V5-WP20-6：固定 `Asia/Shanghai`，不再跟随进程时区）。
+ *
+ * 旧实现是 `new Date()` + `setHours(0,0,0,0)`：缺少 `TZ=Asia/Shanghai` 的部署上，
+ * 「今日」会按宿主时区取整，与归档行的日标签差一天。
+ */
+function startOfToday(now: Date = new Date()): Date {
+  return billingDayStart(now);
 }
 
-/** 近 N 天（含今天）的日期键，升序 */
-function dayKeys(days: number): string[] {
-  const out: string[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - i);
-    out.push(d.toISOString().slice(0, 10));
-  }
-  return out;
+/**
+ * 近 N 天（含今天）的日期键，升序。
+ *
+ * V5-WP20-6：改为复用 `services/traffic.ts#fillDays`（与 `tunnels.ts` 的图表同一实现）。
+ * 旧实现是「本地零点 + `toISOString().slice(0,10)`」——UTC+8 下本地午夜落在**前一天 16:00Z**，
+ * `toISOString` 因此回退一天，图表键与归档行的日标签整体错开一格。
+ */
+function dayKeys(days: number, now: Date = new Date()): string[] {
+  return fillDays(days, now);
 }
 
 /* ------------------------------------------------------------------ */
@@ -106,10 +111,12 @@ dashboardRoutes.get("/stats", async (c) => {
   const workspace = await resolveWorkspaceMembership(c);
   const forwardsVisible = canWorkspaceResourceAction(workspace, "read", "forward");
   const nodesVisible = canWorkspaceResourceAction(workspace, "read", "node");
-  const monthStart = startOfToday();
-  monthStart.setDate(1);
+  // V5-WP20-6：日/月界都来自固定时区（`billing-time.ts`）。
+  const now = new Date();
+  const todayStart = startOfToday(now);
+  const monthStart = billingMonthStart(now);
 
-  const [userPlan, tunnelCount, nodes, todayAgg, monthAgg] = await Promise.all([
+  const [userPlan, tunnelCount, nodes, todayAgg, monthAgg, policyView] = await Promise.all([
     workspace.kind === "personal" ? db.userPlan.findUnique({ where: { user_id: user.id }, include: { plan: true } }) : null,
     forwardsVisible ? db.tunnel.count({ where: { workspace_id: workspace.id } }) : 0,
     nodesVisible ? db.node.findMany({
@@ -128,14 +135,23 @@ dashboardRoutes.get("/stats", async (c) => {
       },
     }) : [],
     forwardsVisible ? db.tunnelTraffic.aggregate({
-      where: { date: { gte: startOfToday() }, tunnel: { workspace_id: workspace.id } },
+      where: { date: { gte: todayStart }, tunnel: { workspace_id: workspace.id } },
       _sum: { traffic: true },
     }) : { _sum: { traffic: 0 } },
     forwardsVisible ? db.tunnelTraffic.aggregate({
       where: { date: { gte: monthStart }, tunnel: { workspace_id: workspace.id } },
       _sum: { traffic: true },
     }) : { _sum: { traffic: 0 } },
+    // 生效策略：决定「已用流量」的**窗口口径**（与额度判定、workspaces/:id/traffic 同源）。
+    // 读失败不给仪表盘挂掉：回落 `total`（全量窗口，数字不会因为策略故障而缺字段）。
+    forwardsVisible
+      ? getEffectivePolicy(workspace.id, { now }).catch(() => null)
+      : Promise.resolve(null),
   ]);
+  // 已用流量 = 窗口求和（`tunnel_traffic` 的事实），与 `sumWorkspaceTraffic` 同一实现。
+  const trafficUsed = forwardsVisible
+    ? await sumWorkspaceTraffic(workspace.id, policyView?.limits.traffic_period ?? "total", now)
+    : 0;
 
   const activeNodes = nodes.filter((n) =>
     projectUserNode({
@@ -154,8 +170,13 @@ dashboardRoutes.get("/stats", async (c) => {
     commission_balance: workspace.kind === "personal" ? user.commission_balance : 0,
     tunnel_count: tunnelCount,
     max_tunnels: userPlan?.max_tunnels ?? userPlan?.plan?.max_tunnels ?? null,
-    traffic_used: userPlan?.traffic_used ?? 0,
-    traffic_limit: userPlan?.traffic ?? null,
+    // V5-WP20-6：已用流量改读**窗口求和**（`tunnel_traffic` 的事实），不再读
+    // `UserPlan.traffic_used` —— 后者是冻结的 legacy 展示列，没有任何写入方
+    // （购买路径已改为不写它），因此它的值只会是过期基线。
+    traffic_used: trafficUsed,
+    // 上限也必须跟着换：否则会出现「用量按策略窗口、上限按旧列」的错配（两个数字不可比）。
+    // 策略读不到时回落 legacy 列，保证仪表盘不因策略故障而缺字段。
+    traffic_limit: policyView?.limits.traffic_limit ?? userPlan?.traffic ?? null,
     plan_name: userPlan?.plan?.name ?? null,
     expired_at: userPlan?.expired_at ?? null,
     active_nodes: activeNodes,

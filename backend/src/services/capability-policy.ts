@@ -17,6 +17,9 @@
  *  · 无任何有效策略 → 拒绝（fail-closed），不因“没有套餐”默认放行
  */
 
+// V5-WP20-6：计量窗口的日/月界来自**固定时区**的纯函数模块（本身无 IO，不破坏本层的可离线单测）。
+import { billingDayStart, billingMonthStart } from "./billing-time.ts";
+
 export type PolicySourceName = "system_default" | "admin_grant" | "trial" | "purchase";
 export type TrafficPeriodName = "total" | "month" | "day";
 
@@ -451,12 +454,18 @@ export function checkMemberAddition(policy: EffectivePolicy, memberCount: number
   return { allowed: true };
 }
 
-/** 计量周期起点（total 返回 null = 不限窗口）。 */
+/**
+ * 计量周期起点（total 返回 null = 不限窗口）。
+ *
+ * V5-WP20-6：窗口起点**委托** `billing-time.ts`（固定 `Asia/Shanghai`、进程时区无关），
+ * 不再用 `setHours`/`setDate` 按进程本地时区取整。
+ *
+ * 反例（旧实现为什么必须换掉）：`.env` 里缺 `TZ=Asia/Shanghai` 时，同一个瞬时点在
+ * 宿主时区下会算出**不同的月首**（例如 UTC 与 UTC+8 在 `2026-01-31T16:00Z` 上有 8 小时分歧，
+ * 跨月那一秒直接落进上个月），于是「额度耗尽」判定与账本各算一个月。
+ * 这也是 DoD 第 8 条要守的东西：本文件里不允许再出现 `setHours(0, 0, 0, 0)`。
+ */
 export function trafficWindowStart(period: TrafficPeriodName, now: Date): Date | null {
   if (period === "total") return null;
-  const d = new Date(now.getTime());
-  d.setHours(0, 0, 0, 0);
-  if (period === "day") return d;
-  d.setDate(1);
-  return d;
+  return period === "day" ? billingDayStart(now) : billingMonthStart(now);
 }

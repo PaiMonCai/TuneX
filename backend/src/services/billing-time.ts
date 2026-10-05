@@ -181,6 +181,26 @@ export function billingDayStart(reference: Date | number): Date {
 }
 
 /**
+ * `reference` 所属上海自然日的**归档戳**：该日标签在 **UTC 午夜**的瞬时点。
+ *
+ * 这是 `tunnel_traffic.date` 的存储约定（F14：`traffic.ts#localDayKey` 出标签、
+ * `traffic-archive.ts#trafficDate` 把标签拼成 UTC 午夜）。WP20-6 之前它散在三处：
+ * 写入端（archive）、读取端（dashboard/tunnels 的图表窗口）、保留期端（retention）。
+ * 三处各自用 `setHours`/`toISOString` 拼，于是**读取端与写入端差一天**
+ * （`setHours(0,0,0,0)` 后在 UTC+8 下 `toISOString().slice(0,10)` 会回退一天）。
+ *
+ * 现在这三处都从这里取：读到的键与写入的戳同源，**保留期仍然按 UTC 取整**
+ * （它与存储戳同口径：`date < cutoff` 且两边都是 UTC 午夜）。
+ *
+ * 反例（为什么不能让 `date` 改成上海午夜）：存量行的 `date` 全是 UTC 午夜，改口径要求
+ * 一次全表回填 + 保留期同步改，否则同一列里会同时存在两种日界 —— 那是账本一致性问题，
+ * 不是显示问题。
+ */
+export function billingDayKeyStamp(reference: Date | number): Date {
+  return new Date(`${billingPeriodKey(reference, "day")}T00:00:00.000Z`);
+}
+
+/**
  * 上海时区下的**周期键**：`YYYY-MM` / `YYYY-MM-DD`。
  *
  * 用途：`subscription_period_settlement.period_key`（WP20-2 冻结为 `VARCHAR(16)`，值域就是这两个形状）

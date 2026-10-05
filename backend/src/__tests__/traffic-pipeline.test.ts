@@ -43,17 +43,6 @@ const {
   TRAFFIC_ARCHIVE_LOCK_TTL_S,
 } = archive;
 
-/**
- * 本地日期的 `YYYY-MM-DD` 基准值。
- *
- * 禁用 `new Date(...).toISOString().slice(0,10)` 做期望：UTC+8 下本地午夜
- * 是前一天 16:00Z，toISOString 会倒退一天，期望值本身就是错的。
- */
-function localKey(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
 /** 入库 Date（UTC 午夜）→ `YYYY-MM-DD`。 */
 function UTCDayKey(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -529,7 +518,7 @@ describe("accumulateTraffic", () => {
 describe("trafficDayKey", () => {
   test("本地零点日界", () => {
     const d = new Date(2026, 8, 24, 23, 30, 0); // 2026-09-24 23:30 local
-    expect(trafficDayKey(d)).toBe(localKey(new Date(2026, 8, 24)));
+    expect(trafficDayKey(d)).toBe("2026-09-24");
   });
 });
 
@@ -618,20 +607,27 @@ describe("aggregateTrafficRows 聚合口径", () => {
 });
 
 describe("fillDays / dayKeyOf", () => {
-  test("本地零点序列，末位是今天", () => {
-    const keys = fillDays(3, new Date(2026, 8, 24, 15, 0, 0));
-    expect(keys).toHaveLength(3);
-    expect(keys[2]).toBe(localKey(new Date(2026, 8, 24)));
-    expect(keys[0]).toBe(localKey(new Date(2026, 8, 22)));
+  // V5-WP20-6：日标签**冻结为 `Asia/Shanghai`**（契约 §3.1 结论 1 / 风险 R1），
+  // 不再跟随进程时区。原来这三条用 `new Date(2026, 8, 24, 15, 0)`（本地分量构造）
+  // 配 `localKey()`（本地分量读取）做期望 —— 那是把「跟随进程 TZ」当成了契约：
+  // 在 `TZ=UTC` 下 `new Date(2026,8,24,23,59)` 是上海 09-25 07:59，标签自然就是 09-25，
+  // 旧期望 09-24 才是错的。现在用**显式 UTC 瞬时点 + 上海标签**断言，任何 TZ 下都成立。
+  test("日序列：末位是「上海今天」，回退按归档戳", () => {
+    const keys = fillDays(3, new Date("2026-09-24T15:00:00.000Z")); // 上海 09-24 23:00
+    expect(keys).toEqual(["2026-09-22", "2026-09-23", "2026-09-24"]);
   });
 
   test("跨月边界", () => {
-    const keys = fillDays(2, new Date(2026, 9, 1, 0, 0, 0)); // 10 月 1 日
-    expect(keys[0]).toBe(localKey(new Date(2026, 8, 30)));
-    expect(keys[1]).toBe(localKey(new Date(2026, 9, 1)));
+    // 上海 2026-10-01 00:30 = UTC 2026-09-30T16:30Z：标签必须是 10-01，前一天是 09-30
+    const keys = fillDays(2, new Date("2026-09-30T16:30:00.000Z"));
+    expect(keys).toEqual(["2026-09-30", "2026-10-01"]);
   });
 
-  test("dayKeyOf 归一化到日", () => {
-    expect(dayKeyOf(new Date(2026, 8, 24, 23, 59))).toBe(localKey(new Date(2026, 8, 24)));
+  test("dayKeyOf 归一化到日：上海日界，而不是进程 TZ 的日界", () => {
+    // UTC 2026-09-24T23:59Z = 上海 09-25 07:59 ⇒ 标签 09-25（旧实现跟随 TZ 才得到 09-24）
+    expect(dayKeyOf(new Date("2026-09-24T23:59:00.000Z"))).toBe("2026-09-25");
+    // 上海日界两侧各 1ms
+    expect(dayKeyOf(new Date("2026-09-24T15:59:59.999Z"))).toBe("2026-09-24");
+    expect(dayKeyOf(new Date("2026-09-24T16:00:00.000Z"))).toBe("2026-09-25");
   });
 });

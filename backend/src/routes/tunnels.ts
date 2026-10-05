@@ -34,6 +34,9 @@ import {
   sumWorkspaceTraffic,
   withWorkspaceQuotaLock,
 } from "../services/policy-service.ts";
+import { billingDayKeyStamp } from "../services/billing-time.ts";
+// V5-WP20-6：图表键与 dashboard 共用同一实现（`fillDays`），不再各写一份本地零点逻辑。
+import { fillDays } from "../services/traffic.ts";
 import { checkTunnelCreation } from "../services/capability-policy.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
@@ -361,9 +364,10 @@ tunnelsRoutes.get("/:id/traffic", async (c) => {
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
 
   const days = Math.max(1, Math.min(90, Number(c.req.query("days") ?? 14) || 14));
-  const since = new Date();
-  since.setHours(0, 0, 0, 0);
-  since.setDate(since.getDate() - (days - 1));
+  // V5-WP20-6：下界用**归档戳**口径（= 当日标签的 UTC 午夜），与 `tunnel_traffic.date` 逐字可比。
+  // 旧实现是「本地零点回退 days-1」，在 UTC+8 下拿到的其实是前一天，图表整体偏一格。
+  const now = new Date();
+  const since = new Date(billingDayKeyStamp(now).getTime() - (days - 1) * 86_400_000);
 
   const rows = await db.tunnelTraffic.findMany({
     where: { tunnel_id: tunnel.id, date: { gte: since } },
@@ -380,13 +384,11 @@ tunnelsRoutes.get("/:id/traffic", async (c) => {
     byDate.set(key, acc);
   }
 
-  // 补齐缺失日期为 0，保证前端图表点数稳定
+  // 补齐缺失日期为 0，保证前端图表点数稳定。
+  // 键来自 `fillDays`（与 dashboard 图表、`traffic.ts#dayKeyOf` **同一实现**）：
+  // 旧的本地零点 + toISOString 会回退一天，把「今天」画成昨天。
   const points: { date: string; traffic: number; traffic_cost: number }[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0, 10);
+  for (const key of fillDays(days, now)) {
     const hit = byDate.get(key);
     points.push({
       date: key,

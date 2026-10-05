@@ -17,6 +17,8 @@
  */
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { db } from "../db.ts";
+// V5-WP20-6：计量窗口起点统一委托固定时区的纯函数模块（DoD 第 8 条）。
+import { billingDayStart, billingMonthStart } from "./billing-time.ts";
 import {
   composeEffectivePolicy,
   type ComposeInput,
@@ -272,18 +274,64 @@ export async function sumWorkspaceTraffic(
   return agg._sum.traffic ?? 0;
 }
 
+/**
+ * 计量周期起点（V5-WP20-6：委托 `billing-time.ts` 的固定时区实现）。
+ *
+ * 与 `capability-policy.ts#trafficWindowStart` 是**同一件事**（DoD 第 8 条要求这两个文件里
+ * 都不再出现 `setHours(0, 0, 0, 0)`）；保留两个入口是因为调用方分别在 DB 层与纯函数层，
+ * 但两者的实现都只有一行委托，永远不会再漂移。
+ */
 function trafficStart(period: TrafficPeriodName, now: Date): Date | null {
   if (period === "total") return null;
-  const d = new Date(now.getTime());
-  d.setHours(0, 0, 0, 0);
-  if (period === "day") return d;
-  d.setDate(1);
-  return d;
+  return period === "day" ? billingDayStart(now) : billingMonthStart(now);
+}
+
+/**
+ * **联邦远端腿用量**（字节）：已归因到本 workspace 的隧道的那些行。
+ *
+ * 契约 §3.3.5 / O5 裁决：联邦用量**不计入**本面板额度（与「Usage authority = host panel」一致），
+ * 但缺口必须**可观测**——所以它作为独立字段出现在用量报告里，**不**加进 `traffic_used`。
+ *
+ * 为什么不并进 `traffic_used`：那会把两个账本（`tunnel_traffic` 与 `federation_usage_record`）
+ * 合成一个数，从而引入「谁权威」的模糊（契约 §10）。这个字段的语义就是「额度看不见的那部分」。
+ *
+ * 归因规则（唯一实现）：按 `tunnel_id` 关联本 workspace 的隧道求和。
+ * `tunnel_id IS NULL` 的行**无法归因到任何 workspace**（联邦侧收不到归属），
+ * 它们属于平台级不可归因桶，不会出现在某个租户的报告里 —— 这也是为什么本函数按 workspace 查。
+ *
+ * 用原生 SQL 而不是 Prisma 的 relation filter：`federation_usage_record.tunnel_id` **没有外键**
+ * （联邦表统一取向：跨面板引用不加 FK），Prisma 侧没有关系可走；把本 workspace 的 tunnel id
+ * 全查出来再 `IN (...)` 会在隧道多的租户上退化。`bytes_*` 是 `BigInt`，这里转 `number`
+ * （流量以字节计，`Number.MAX_SAFE_INTEGER` ≈ 9 PB，超出才有精度损失，属可接受边界，已在此注明）。
+ */
+export async function sumFederatedUnattributedTraffic(
+  workspaceId: number,
+  client: FederatedUsageClient = db,
+): Promise<number> {
+  const rows = await client.$queryRaw<Array<{ total: bigint | number | null }>>`
+    SELECT COALESCE(SUM(f.bytes_in + f.bytes_out), 0) AS total
+    FROM federation_usage_record f
+    JOIN tunnel t ON t.id = f.tunnel_id
+    WHERE t.workspace_id = ${workspaceId}`;
+  const total = rows[0]?.total ?? 0;
+  return typeof total === "bigint" ? Number(total) : Number(total ?? 0);
+}
+
+/** {@link sumFederatedUnattributedTraffic} 的最小依赖面（便于单测注入）。 */
+export interface FederatedUsageClient {
+  /** 与 Prisma 的 `$queryRaw` 同形：`T` 是**结果集**类型（`Array<...>`），不是行类型。 */
+  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>;
 }
 
 export interface WorkspaceUsageReport extends WorkspaceUsage {
   policy: EffectivePolicy;
   limits: PolicyLimitSet;
+  /**
+   * 联邦远端腿用量（字节，**不计入** `traffic_used`；契约 §3.3.5 的可观测缺口）。
+   * 注意：本报告目前**没有挂载端点**（见契约 §5.6 的未决项），字段为将来的 capabilities
+   * 端点准备；当前唯一对外可见的用量面是 `GET /api/workspaces/:id/traffic`。
+   */
+  traffic_used_unattributed_federated: number;
 }
 
 /** 给 `/api/me/capabilities` 与仪表盘用的完整用量 + 限额视图。 */
@@ -293,13 +341,22 @@ export async function getWorkspaceUsageReport(
 ): Promise<WorkspaceUsageReport> {
   const now = opts.now ?? new Date();
   const policy = await getEffectivePolicy(workspaceId, { now });
-  const [tunnels, nodes, members, traffic_used] = await Promise.all([
+  const [tunnels, nodes, members, traffic_used, federated] = await Promise.all([
     countWorkspaceTunnels(workspaceId),
     countWorkspaceNodes(workspaceId),
     countWorkspaceMembers(workspaceId),
     sumWorkspaceTraffic(workspaceId, policy.limits.traffic_period, now),
+    sumFederatedUnattributedTraffic(workspaceId),
   ]);
-  return { tunnels, nodes, members, traffic_used, policy, limits: policy.limits };
+  return {
+    tunnels,
+    nodes,
+    members,
+    traffic_used,
+    traffic_used_unattributed_federated: federated,
+    policy,
+    limits: policy.limits,
+  };
 }
 
 /* ------------------------------------------------------------------ */

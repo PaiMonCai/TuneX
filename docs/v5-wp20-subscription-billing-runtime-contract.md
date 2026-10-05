@@ -2,8 +2,8 @@
 
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
 > （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）、
-> WP20-4（支付 → 发放接线 + 续期执行器）、WP20-4b（套餐 ↔ 策略绑定入口）已交付**
-> （§5.1–§5.5）。除这五处记录外，本契约其余部分仍**不含实现**。
+> WP20-4（支付 → 发放接线 + 续期执行器）、WP20-4b（套餐 ↔ 策略绑定入口）、
+> WP20-6（流量口径统一）已交付**（§5.1–§5.6）。除这六处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -325,7 +325,7 @@ worker 新增一个 tick。
 | **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | ✅ **已交付**（2026-10-05，见 §5.4）：`policy-service.ts#grantPolicyFromPurchase` + `subscription-purchase.ts`（购买/续期共用实现）+ `routes/plans.ts` 事务内调用 + `invalidatePolicyCache`；并把续期执行器 `renewSubscriptionPeriod` 接上 | WP20-2 |
 | **WP20-4b** | 套餐 ↔ 策略绑定入口（WP20-4 的写入路径补完） | ✅ **已交付**（2026-10-05，见 §5.5）：`services/plan-subscription.ts` + 套餐 CRUD 的 `policy_id` + 只读选项端点 + 前端字段 | WP20-4 |
 | **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
-| **WP20-6** | 流量口径统一 | F13 两函数收敛到 `billing-time.ts`；`traffic_used_unattributed_federated`；`traffic_used` 读取路径切换 | WP20-1（可与 20-3 并行） |
+| **WP20-6** | 流量口径统一 | ✅ **已交付**（2026-10-05，见 §5.6）：三处日/月界收敛到 `billing-time.ts`、`traffic_used` 读取路径切换、`traffic_used_unattributed_federated` 落在已挂载的用量端点上 | WP20-1 |
 | **WP20-7** | （条件）流量倍率 | 仅当 O3 选 B 时立项，需独立契约补充 + Gate 断言 | O3 拍板 |
 
 顺序约束：**一次只做一个 WP**（`DEVELOPMENT.md` §3.1）。WP20-6 与 WP20-3 无共享文件，可并行；其余串行。
@@ -617,7 +617,7 @@ DATABASE_URL=... bunx prisma migrate diff --from-schema-datamodel <改动前> --
 - **全树 `tsc` 有一处不属于本 WP 的红**：`prisma/seed.ts` 的 `DEFAULT_CONFIG` 缺
   `LATENCY_RAW_RETENTION_HOURS` / `LATENCY_BUCKET_RETENTION_DAYS`（WP19 的枚举值已在 `7895b40` 落地但没补 seed 键；
   它们的默认值在自己的 `services/latency-history.ts` 里是 24 / 30）。**不是我的文件，我没有代改**（猜产品默认值不对）。
-- WP20-5（到期降级可观测）、WP20-6（流量口径统一）未做；`DEVELOPMENT.md` §4 登记（DoD 11）不在本 WP 范围。
+- WP20-5（到期降级可观测）未做（WP20-6 已于 §5.6 交付）；`DEVELOPMENT.md` §4 登记（DoD 11）不在本 WP 范围。
 
 **证据**
 
@@ -692,6 +692,83 @@ bun test src/services/__tests__/v5-wp20/plan-policy-binding.test.ts → 14 pass 
 **未决**：批量导入 / CLI 绑定入口（复用同一 `resolvePlanPolicyBinding` 即可，无需新语义）；
 策略被停用后**已绑定**的套餐会静默失去发放（这是「停用策略」的既有语义，不是本 WP 引入的），
 运营侧需要一条「哪些套餐绑了停用策略」的巡检 —— 可作为 `attention` 的后续条目。
+
+---
+
+### 5.6 WP20-6 落地记录 —— 流量口径统一（2026-10-05）
+
+**交付物**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/src/services/billing-time.ts` | 追加 `billingDayKeyStamp`（当日标签的 UTC 午夜戳 = `tunnel_traffic.date` 的存储口径） |
+| `backend/src/services/capability-policy.ts` | `trafficWindowStart` 委托 `billing-time`（**DoD 8**：该文件里不再有 `setHours(0, 0, 0, 0)`） |
+| `backend/src/services/policy-service.ts` | `trafficStart` 同样委托；新增 `sumFederatedUnattributedTraffic`；用量报告补 `traffic_used_unattributed_federated` |
+| `backend/src/services/traffic.ts` | `dayKeyOf`/`fillDays` 与趋势窗口下界收敛到 `billing-time`；用量汇总带出联邦缺口 |
+| `backend/src/routes/dashboard.ts` | 日首/月首收敛；`dayKeys` 改为复用 `fillDays`；**已用流量改读窗口求和**（并让上限同源） |
+| `backend/src/routes/tunnels.ts` | 单隧道图表窗口与补键改为 `billingDayKeyStamp` + `fillDays`（同一实现） |
+| `backend/src/services/__tests__/v5-wp20/traffic-window-convergence.test.ts` | 新增 13 条断言（跨模块逐字相等 + DoD 8 守卫 + 缺口语义） |
+
+**冻结的语义与理由（都带反例）**
+
+1. **三处口径收敛为一处**（§3.1.3）：① 窗口起点（`capability-policy#trafficWindowStart` 与
+   `policy-service#trafficStart`）→ `billingDayStart`/`billingMonthStart`；② 图表日键
+   （`dayKeyOf`/`fillDays`，dashboard 与 tunnels 共用**同一实现**）；③ 归档戳
+   `billingDayKeyStamp` 与写入端 `traffic-archive#trafficDate` **逐字相等**（有断言）。
+   反例（②的旧实现）：`setHours(0,0,0,0)` 后再 `toISOString().slice(0,10)`，UTC+8 下本地午夜
+   落在**前一天 16:00Z** ⇒ 键整体回退一天，图表永远匹配不上库里的行。
+2. **存储戳仍然是 UTC 午夜，不改成上海午夜**。反例：改口径要求全表回填 + 保留期同步改，
+   否则同一列里会同时存在两种日界 —— 那是账本一致性问题，不是显示问题。保留期因此**不动**
+   （它本来就按 UTC 取整，与存储戳同口径）。
+3. **`traffic_used` 读路径切换**（§3.3.2）：dashboard `/stats` 改读
+   `sumWorkspaceTraffic(workspace, 生效策略的 traffic_period)`，不再读 `UserPlan.traffic_used`
+   —— 后者是冻结的 legacy 列，且购买路径已不再写它（WP20-4），读它只会拿到过期基线。
+   **上限也一并换成策略**（`policyView.limits.traffic_limit`）：不然会出现「用量按策略窗口、
+   上限按旧列」的错配，两个数字不可比 —— 那是修好一个显示、造出另一个。策略读不到时回落 legacy 列。
+4. **联邦缺口是独立字段，不并进任何用量**（§3.3.5 / O5）：
+   `traffic_used_unattributed_federated` = 按 `tunnel_id` 关联到本 workspace 隧道的
+   `federation_usage_record` 字节和。反例：并进 `traffic_used` 就是把两本账合一，引入
+   「谁权威」的模糊（§10）。`tunnel_id IS NULL` 的行**无法归因到某个租户**（联邦侧收不到归属），
+   属于平台级桶，不会出现在任何 workspace 的报告里 —— 这条决定了门禁夹具要造 > 0 的观测值，
+   必须把 usage 行归因到该 workspace 的 tunnel。
+   实现用原生 SQL（`JOIN tunnel`）而不是 Prisma relation filter：那张表**没有外键**（联邦统一取向）；
+   `bytes_*` 是 `BigInt`，转 `number` 的精度边界（≈9 PB）已注明。
+5. **缺口落在已挂载的端点上**：`GET /api/workspaces/:id/traffic`（`getWorkspaceTrafficSummary`）
+   带上该字段，读失败时给 `null` 而不是 0（「读不到」与「真的是 0」必须区分，否则缺口重新变不可见）。
+
+**两处既有测试的改动（都写明了为什么）**
+
+- `src/__tests__/traffic-pipeline.test.ts` 的 `fillDays / dayKeyOf` 三条：它们用
+  `new Date(2026, 8, 24, 15, 0)`（本地分量构造）+ 本地分量期望 —— 那是把「跟随进程 TZ」当成了契约。
+  在 `TZ=UTC` 下 `new Date(2026,8,24,23,59)` 其实是上海 09-25 07:59，旧期望 09-24 才是错的。
+  已改为**显式 UTC 瞬时点 + 上海标签**断言（三个时区下都过），并保留一条「不跟随进程 TZ」的守卫。
+- `src/routes/__tests__/workspace-rbac-v4.test.ts` 的替身补了两个出口（`fillDays`、
+  `sumFederatedUnattributedTraffic`、`getEffectivePolicy`）：该文件整体在 `String.raw` 模板串里，
+  注释**不能出现反引号**（会终止模板串），已在文件里注明。这两处都属于「替身必须语义完整」那条
+  既有结论（见 `src/__tests__/lifecycle-db-stub.ts` 顶部）。
+
+**未决（交棒）**
+
+1. **`GET /api/me/capabilities` 不存在**，而 §3.3.2 让前端改读它。现实里唯一挂载的用量面是
+   `GET /api/workspaces/:id/traffic`（已带上缺口字段）。`getWorkspaceUsageReport` 目前
+   **零调用者**（死代码）—— 要么补那个端点，要么删掉它，属于产品/API 决策，不在本 WP 擅自决定。
+2. **≤10 分钟计量滞后的产品文案**（§3.3.4 末句）未做：WP20-6 的交付物清单里没有「文案」一项，
+   且措辞是产品决策。建议独立小 WP（或并入前端线的文案改动）。
+3. `UserPlan` 的 `traffic_limit`/`max_tunnels`/`plan_name` 仍由 dashboard 从 legacy 读出（本 WP 只换了
+   用量与上限的流量口径）——「展示基线全量切换」属 WP20-5/后续。
+
+**证据**
+
+```
+bun test src/services/__tests__/v5-wp20/                                    → 131 pass / 0 fail / 521 expect()
+bun test src/__tests__/traffic-pipeline.test.ts                             → 38 pass（TZ=UTC 与默认 TZ 各跑一次，均 0 fail）
+for tz in Asia/Shanghai UTC America/Los_Angeles; do TZ=$tz bun test …; done  → 三时区均 0 fail
+grep -rn "setHours(0, 0, 0, 0)" src/services/policy-service.ts src/services/capability-policy.ts → 0 命中（DoD 8）
+bunx tsc --noEmit（backend/）                                                → 本 WP 文件 0 报错
+```
+
+**DoD 覆盖矩阵（针对 WP20-6）**：**第 8 条 ✅（含断言）**；第 3 条 ✅（WP20-1 的三时区金样本仍全绿）；
+第 1/2/4/5/7/9 条不回归（全绿）；第 6 条 ⏳ 属 WP20-5；第 10 条 ⏳（e2e 未跑）；第 11 条 ⏳（登记不在本 WP）。
 
 ---
 
