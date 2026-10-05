@@ -3517,3 +3517,58 @@ fixture 已被还原（node 5 回组 5、池恢复两个目标），拓扑干净
 **决策不留痕的机制，与从未运行过的机制无法区分。**
 
 
+
+---
+
+## 17.5 round — "端口已经空了，谁也拿不到"：端口守卫的三次收敛
+
+**症状**（CI 上反复红，且每次红的样子都不同）：
+V4 rollout 门禁一次红 8 条、V5-G5 一次红 15 条、V4 rest 门禁红 3 条、`git push` 两轮之间"红了又绿"。
+共同点只有一个：**某条路由建不起来**，而错误码离原因很远（`apply_status=error` / `502`）。
+
+**证据链**（每一环都是读出来的，不是猜的）：
+
+1. 门禁 S7 只报 `502`。先补诊断，才拿到真正的错误码与现场：
+   ~~~text
+   tunnel:  error | code=port_port_taken   rollout: phase=failed err=port_port_taken
+   ingress used_ports: [21001, 21002, 21003]
+   ~~~
+2. 面板本机读 DB（`node_port_lease` 已 released）⇒ 端口是空的；agent 读自己的守卫 ⇒ 端口被占。
+   **同一个端口，两个事实来源**。
+3. Agent 自己的上报是决定性证据：
+   ~~~text
+   node_state_report.used_ports = [22000, 22001]      ← 守卫认为两个端口都被占
+   node_state_report.tunnels    = [tunex-2-egress]    ← 实际只有 22000 有 runtime
+   ~~~
+   面板于是把 22001 发给下一条路由，Agent 正确地拒绝：
+   `manager: port 22001 is already used by another tunnel`。
+
+**三次收敛**（每次都由上一次没覆盖到的缝推动）：
+
+1. **守卫改成派生状态**（`10dfe61`）。原来 `usedPort` 由散落各处的 mark/release 手工维护，漏一条路径就留下
+   "没人监听、却谁也拿不到"的端口。改为每次改动 `tunnels` 后按事实重建：
+   `守卫 = {还有 runtime 在听的端口} ∪ {Stop 已发起、监听尚未关闭的端口}`。
+2. **挂账加上界 + 自愈**（`0470367`）。第二道缝：drain 挂账只在 `Stop()` 返回时清账，清账一旦没跑到就**永久**占着 ——
+   而它与"内核是否还占着"早已脱节。挂账改为带上界（30s，远大于 drain 上界 3s），过期即失效、以内核为准；
+   端口检查前先重建一次，过期挂账不能挡回一次合法分配。
+3. **占用检查排除"本隧道自己的 runtime"**（`cd83a4c`）。第三道缝出在面板侧：让分配器先问 Agent 是对的，
+   但不区分持有者就变成**自冲突** —— 把 Forward 的 `listen_port` 改成它**当前正在使用**的那个值
+   （幂等编辑 / 失败重试 / 门禁"还原夹具端口"）会被自己挡回去，症状是 502 `port_taken`，
+   而那个端口明明就是这条隧道自己的腿在听。
+
+**留下的判据**（写给下一次）：端口归属只有一个权威方向 —— **Host/Agent 的守卫是事实，面板的发放必须服从它**；
+面板可以与它不一致（drain 窗口、残留、漂移），但只能"少发一个"，绝不能"多发一个"。
+`capability ≠ authorization` 的另一个面：**DB 里没租约 ≠ 端口可用**。
+
+**顺带修掉的两个"测试会随时间翻转"的坑**：
+- `federation-lease` 的并发认领用例用夹具时间戳造 pending intent，却没固定"现在" —— 真实时间越过 60s 接管窗口后
+  它就从"拒绝重投递"变成"接管"（与改动无关地变红）。注入 hooks 统一带 `now: () => NOW`。
+- `v5-g1a.py` 的 401 重认证分支调用了 3 参 `record()`，把真正的 401 掩盖成看不懂的 `TypeError`。
+
+**门禁诊断补强**（这一轮最值的投资）：S7 失败时打印响应体、`tunnel.apply_error`、
+Agent 上报的 `used_ports` 与 runtime 列表（`id@port rRev`）、rollout 台账；G4.1/G4.5 打印响应体。
+**没有这些，前面三轮都只能靠猜。**
+
+**结果**：`cd83a4c` 上 CI / Integration / Release **全绿** —— v3 基线、V4 全套（rollout/REST/S10/F1–F5）、
+V5-G0、V5-G4、双面板 bootstrap、V5-G5（206 断言）全部通过；agent `go test ./...` 12/12 包、
+backend `bun run test:unit` 2017 pass / 0 fail、`bunx tsc --noEmit` exit 0。
