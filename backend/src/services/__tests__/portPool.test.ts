@@ -269,7 +269,7 @@ describe("1. 并发分配无重复（§7.6 DoD）", () => {
     // 日志里只有一个 `*_apply_rejected`，离原因很远。
     // 这里钉住的是修法：分配器把节点**自己报的** used_ports 也算作占用。
     const h = harness();
-    seedNode(1, [19000, 19001, 19002]);
+    seedNode(1, [19000, 19002]); // 区间 [min,max]（不是端口列表）：正好三个可选端口
 
     const first = await pool.acquirePort({ nodeId: 1, leaseType: "ingress", tunnelId: 1, deps: h.deps });
     expect(first.ok).toBe(true);
