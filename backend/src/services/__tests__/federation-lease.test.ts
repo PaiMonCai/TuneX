@@ -274,16 +274,14 @@ function hooks(calls: { dispatch: Row[]; allocate: Row[]; releasePort: Row[]; te
     //
     // 为什么必须是**默认**而不是逐用例注入：本文件的种子把时间钉成绝对时刻
     //（`NOW` / `GOOD_UNTIL`），而"这份授予还有效吗"比的是**服务读到的时钟**
-    //（`const now = d.now()`），不是 DB 侧的。不注入，整个 `reserveRemoteLease`
-    // 区块就会随墙上时钟腐化：`GOOD_UNTIL = 2026-10-05T05:00:00Z`（本地 13:00）
-    // 一过，30 多个用例在**没有任何代码变更**的情况下同时变红——实测发生于
-    // 2026-10-05 13:00 CST。注入夹具时钟之后，断言才真的在说它说的那件事。
+    //（`const now = d.now()`），不是 DB 侧的。不注入，这个文件就会**随墙上时钟腐化**：
+    //   · `GOOD_UNTIL = 2026-10-05T05:00:00Z`（本地 13:00）一过，整个 `reserveRemoteLease`
+    //     区块 30 多个用例在没有任何代码变更的情况下同时变红（实测发生于 13:00 CST）；
+    //   · `a concurrent in-flight claim …` 会在夹具的 NOW 之后 60s（pending 接管窗口）从
+    //     "拒绝重投递"变成"接管"，于是一个与改动无关的用例某天突然开始失败。
+    // 注入夹具时钟之后，断言才真的在说它说的那件事。
     now: () => NOW,
     audit: silentAudit,
-    // 固定时钟：夹具里的时间戳（NOW）与"现在"必须一致，否则依赖窗口的用例会**随时间翻转**——
-    // 实测：`a concurrent in-flight claim ...` 在夹具的 NOW 之后 60s（pending 接管窗口）
-    // 就会从"拒绝重投递"变成"接管"，于是一个与改动无关的用例在某一天突然开始失败。
-    now: () => NOW,
     dispatch: (i) => {
       calls.dispatch.push(i as unknown as Row);
       return { ok: true };
