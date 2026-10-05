@@ -1,31 +1,12 @@
 /**
- * V5-WP18.2 —— 投递账本 + 静默期 + 渠道接口（契约 §F3 / §F4 / §F5 的最小实现面）。
+ * Notification delivery ledger, cooldown and channel orchestration.
  *
- * ── 这一层解决什么 ──
- * WP18.1 回答"有哪些事实值得投递"，本层回答"发出去没有、发给谁、发了几次"。三件事必须
- * 同时成立，缺一件就会出运维事故：
- *   ① **至少一次 + 幂等**（F4.1/F4.2）：api 与 worker 是**两个进程**，同一事实可能被两边
- *      同时派生 → 投递表唯一索引 `(dedupe_key, channel_kind)` 兜底，抢占失败就放弃投递；
- *   ② **静默期**（F4.4/F4.5）：同一 `(scope, source_kind, source_id, reason_code)` 在
- *      `NOTIFICATION_COOLDOWN_SECONDS` 内只投递一次，键落 **Redis** 且经 `scopedKey()`
- *      ——进程内 Map 会在两个进程里各发一次、重启即失忆（F4.5 明令禁止）；
- *   ③ **失败可见、主业务不受影响**（F4.6）：每次尝试留一行（目标/渠道/结果/错误摘要），
- *      任何异常都收敛成结果，**永不抛出**（`mail.ts` / `audit.ts` 同一取向）。
- *
- * ── 三条刻意的"不"──
- *  · **不重写发信**：email 渠道就是 `mail.ts` 的 `sendMail()` 本身。第二份 SMTP 实现意味着
- *    第二份注入防护（CRLF 剥离 / `^\.` 转义）与第二份凭据处理，迟早会分叉。
- *  · **不假装成功**：未配置的渠道（`not_configured`）、没解析到收件人（`rejected_target`）、
- *    本期没实现的渠道类型（`unsupported_channel`）都是**失败**，都落一行账。
- *    宁可显示"没发出去"，也不显示"已通知"（C3 / F3）。
- *  · **不把账本当真相**：这张表只描述"尝试投递"。删光它不影响任何判定（C2）；
- *    通知的真相永远在它派生的那张既有表上。
- *
- * ── 静默期降级（Lead 裁决 O2，2026-10-05）──
- * Redis 不可用时**仍然发送**，去重降级为进程内近似并在这行记录里标 `degraded`。
- * 理由：静默期是**抑制**机制，抑制失效时应当多报——漏报一次真实故障比重复报一次危险得多。
- * 注意这与 F4.5「禁止进程内 Map」不矛盾：禁的是**拿进程内 Map 当主去重层**；
- * 这里是 Redis 失效时的替代路径，且它**不假装自己是真相**（每个降级投递都留痕）。
+ * Delivery is at-least-once with a persisted dedupe key per channel. Cooldowns
+ * are normally coordinated in Redis, while every attempt remains visible in the
+ * delivery ledger and channel failures never become false success. Notification
+ * delivery is derived from existing product facts; the ledger is not a second
+ * source of truth. If Redis is unavailable, sending may degrade to local
+ * best-effort suppression so real incidents are not silently dropped.
  */
 import { isMailConfigured, sendMail, type MailMessage, type MailResult } from "./mail.ts";
 import type { NotificationFact, NotificationScope } from "./notification-facts.ts";
