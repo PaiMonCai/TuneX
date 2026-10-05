@@ -104,11 +104,14 @@ const BOUNDARIES: readonly DiagBoundary[] = [
     occurrences: 2,
   },
   {
-    site: "⑨ 回收/下发行投影：state_report 取整块 tunnels",
+    site: "⑨ 回收/下发行投影：state_report 取整块 tunnels（原始通路，不是类型化投影）",
     file: "src/services/runtime-reconcile-sink.ts",
     anchor: "state_report: { select: { tunnels: true } }",
     required: ["tunnels: true"],
-    forbidden: ["ingress_port"],
+    // 与 ⑦⑧ 同一条纪律：这里读的是**原始上报**（下游 `datagramHopPeerFor` 要从
+    // `tunnels[].diag.hop_local_addr` 推出口取证地址）。改成类型化视图 = 改了口径，
+    // 必须是有意识的决定（先改这条守卫）。
+    forbidden: ["ingress_port", "normalizeTunnelDiag", "tunnelDiagsById"],
   },
   {
     site: "⑩ Agent 侧线上键名：JSON 键必须还是 `diag`（改名 = 面板静默读不到）",
