@@ -1405,8 +1405,25 @@ enum SystemConfigName {
   /// V5.3 WP10：自动故障转移/回切的运维策略（JSON：`{auto_failover, auto_failback}`）。
   /// 缺省不存在 ⇒ 两个都视为 false（fail-closed：策略没被配置过就不许自动搬流量）。
   FAILOVER_POLICY
+  /// @deprecated V5-WP18.5（契约 F6.7）：公告的真相已经迁到 `announcement` 表。
+  ///
+  /// **只读保留**：迁移 `20261033000000_v5_wp18_announcements` 把非空值读走成一条
+  /// `type="normal"` 公告（读 `config`，**从不写回**），`routes/public.ts` 已把它从免认证
+  /// 下发面移除，写入路径也不再使用它 —— 留着就是一个「沉睡又被免认证下发」的键，
+  /// 正是双份公告真相的来源。
+  ///
+  /// 枚举值**一个都不能删**：MySQL 的 ENUM 是序号存储，删值会让旧二进制读到未知值时直接失败
+  /// （契约 §9.8 / §F6.7）。
   NOTICE
+  /// @deprecated V5-WP18.5（契约 F6.7）：弹窗开关。
+  ///
+  /// 弹窗现在由 `announcement.type="popup"` + `active_popup_key` 上的唯一索引表达
+  /// （同 scope 只允许一条活跃）。本键**不做内容迁移**：它是布尔开关，不是内容 ——
+  /// 内容在 `NOTICE` 里，已经迁走。保留仅为旧二进制读取不失败。
   NOTICE_POPUP
+  /// @deprecated V5-WP18.5（契约 F6.7）：弹窗间隔小时数。
+  ///
+  /// 同 `NOTICE_POPUP`：**不迁移、不删值**。间隔语义属于前端展示节奏，不是公告事实。
   NOTICE_POPUP_INTERVAL_HOURS
   SITE_NAME
   SITE_DESCRIPTION
@@ -1442,6 +1459,15 @@ enum SystemConfigName {
   /// 为什么必须可配而不是常量：超时越小越容易重复执行同一周期（结算据此必须幂等可重放），
   /// 越大则崩溃遗留的 pending 越晚被接管；两者是运维权衡，不该由一次发版决定。
   BILLING_SETTLEMENT_TAKEOVER_MINUTES
+  /// V5-WP19-B：延迟档案的保留期（原始样本小时数 / 小时桶天数）。
+  ///
+  /// 这两个键是**被代码用到但当时不在枚举里**的（`latency-history.ts` 的
+  /// `LATENCY_RETENTION_CONFIG_KEYS`）。列是 DB ENUM ⇒ 不在枚举里的键**根本存不进去**：
+  /// 读取永远得到 null（静默回落到默认值），运维也永远设不上 —— 一个"可调"的参数实际上是常量。
+  /// 补在**枚举末尾**是有意的：MySQL 的 ENUM 是序号存储，中间插值会让存量行错位，
+  /// 追加才是可加的。
+  LATENCY_RAW_RETENTION_HOURS
+  LATENCY_BUCKET_RETENTION_DAYS
 }
 
 model SystemConfig {
@@ -2494,4 +2520,92 @@ model NotificationDelivery {
   @@index([source_kind, source_id], map: "notification_delivery_source_idx")
   @@index([status, created_at], map: "notification_delivery_status_created_idx")
   @@map("notification_delivery")
+}
+
+/* ================================================================== */
+/* V5-WP18.5（契约 F6）—— 公告 / 已读 / 免打扰                        */
+/* ================================================================== */
+
+/// 公告：平台或租户写给「人」的内容，有生命周期与已读状态（契约 §0 的定位）。
+///
+/// ── 为什么它**不**经过 `NotificationFact` ──
+/// F1 把通知层的地基写成「既有状态机 / 对账事件的派生物」，而公告的真相**就在这张表里**
+/// （F2-N6：来源 = 公告表自身）。把它塞进 `NotificationFact.reason_code`（= 同一份
+/// `AttentionReasonCode`）就必须为「公告」新造一个 attention 原因码 —— 那等于在
+/// 「通知只消费既有词表」这条不变量上开一个例外。因此公告的推送走渠道层的
+/// `RenderedNotification` + 同一套免打扰判据（`announcement-mute.ts`），
+/// 投递账本与静默期仍归 WP18.2 的 `notification-delivery.ts`（见契约 §12）。
+model Announcement {
+  id               Int       @id @default(autoincrement())
+  /// platform | workspace。与 `NotificationScope`（`notification-facts.ts`）同源：
+  /// `platform` ⟹ `workspace_id = NULL`。**用结构表达边界**（F6.2）——服务层的入参类型
+  /// 就是那个判别联合（`AnnouncementScope = NotificationScope`），
+  /// 「平台公告挂到某个租户」在类型层面写不出来，不靠约定或调用方自觉。
+  scope_kind       String    @db.VarChar(16)
+  /// 归属租户。platform 一律 NULL；租户侧的读取条件由 `visibleAnnouncementWhere()` 强制给出。
+  workspace_id     Int?
+  /// normal | popup。`upgrade_popup` 不移植（O3：TuneX 用 git sha，没有权威版本矩阵）。
+  type             String    @db.VarChar(16)
+  title            String    @db.VarChar(200)
+  /// 正文是**纯文本**：全仓零 HTML 净化器、零 `dangerouslySetInnerHTML`（F6.6 / DoD7）。
+  /// 不引入 HTML 就没有 XSS 面 —— 存普通文本 + 前端纯文本渲染是这条纪律的可执行形式。
+  body             String    @db.Text
+  /// 活跃弹窗的**结构唯一键**：`platform` / `workspace:<id>`；normal 或已撤回时为 NULL。
+  ///
+  /// 为什么不写成 `@@unique([scope_kind, workspace_id, type])`：MySQL 的唯一索引把 NULL
+  /// 当作互不相等 ⇒ 平台行（`workspace_id IS NULL`）之间永远不会冲突，约束形同虚设。
+  /// 这一列把「哪一格被占」写成一个**非空标量**，于是唯一索引真的能拒绝第二条活跃弹窗：
+  /// Forwardx 靠「先关旧的再插新的」，并发下会留下两条（契约 F6.3 的反面教材）。
+  active_popup_key String?   @unique(map: "announcement_active_popup_key") @db.VarChar(64)
+  /// 发布时间（可见性起点）。迁移来的旧 `NOTICE` 用 `config.updated_at` ——
+  /// **来源表上的既有时间戳**，不是「迁移跑起来的时刻」。
+  published_at     DateTime
+  /// 撤回时刻。撤回 ≠ 删除：发出去过的内容撤下后仍留存（R3 的「同一发布里切换」）。
+  revoked_at       DateTime?
+  /// 发布者。**可空**且**不建外键**（理由与 `notification_delivery` 一致）：
+  /// ① 迁移来的旧公告没有作者，不猜一个出来；② 删用户不该把公告一起抹掉，
+  /// 而加外键要给既有 `User` 模型补反向关系列 —— 那是改别人的模型。
+  created_by_id    Int?
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+
+  dismissals AnnouncementDismissal[]
+
+  @@index([scope_kind, workspace_id, published_at], map: "announcement_scope_published_idx")
+  @@map("announcement")
+}
+
+/// 已读 = **每用户一条 dismiss 记录**（F6.5），不是全量已读清单：
+/// 公告数量会增长，而「这个人读过哪几条」一行一条就够，不需要为每条公告写 N 行。
+model AnnouncementDismissal {
+  id              Int      @id @default(autoincrement())
+  announcement_id Int
+  user_id         Int
+  dismissed_at    DateTime @default(now())
+
+  /// 外键只指向**本 WP 自己的表**（Cascade）：公告被删时它的已读记录没有意义。
+  /// 注意 `user_id` 刻意**不**建外键 —— 同样是「不改别人的模型」。
+  announcement Announcement @relation(fields: [announcement_id], references: [id], onDelete: Cascade)
+
+  @@unique([announcement_id, user_id], map: "announcement_dismissal_unique")
+  @@map("announcement_dismissal")
+}
+
+/// 免打扰 = **每用户 × 每渠道 × 每类别**三元映射（F6.5）。只影响**推送**：
+/// `GET /api/announcements` 与 dismiss **结构上**不读这张表（服务的入参里没有 mutes），
+/// 所以「用户免打扰了 email」不会让站内公告消失、也不会改变已读状态。
+model NotificationMute {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  /// `NOTIFICATION_CHANNEL_KINDS`（`notification-delivery.ts`）：email | webhook | telegram。
+  /// 复用既有闭集：渠道类型只允许一处定义，否则「哪个渠道能被静音」会有两份答案。
+  channel_kind String   @db.VarChar(16)
+  /// 类别 = `NOTIFICATION_SOURCE_KINDS`（`notification-facts.ts`）。**不新造类别词表**：
+  /// 免打扰要回答的是「这类通知要不要推给我」，而类别本身就来自通知触发源的封闭白名单。
+  category     String   @db.VarChar(32)
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  @@unique([user_id, channel_kind, category], map: "notification_mute_unique")
+  @@map("notification_mute")
 }
