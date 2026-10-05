@@ -478,10 +478,16 @@ F4.3 的 3 次重试，而解析不了的目标重试同样次数是同样的结
 理由：WHATWG 解析器（Bun 与 Node 行为一致，已实测）会把多余斜杠静默吞掉、把 `hook` 当主机名 ——
 操作员写的路径变成主机名这种归一化必须显式拒，不能靠解析器的宽容。
 
+**D7（修正，提交 `94d0da6`）IPv6 字面量目标不发 SNI。**
+WP18.4 收尾自查时发现：`URL.hostname` 对 IPv6 字面量带方括号（`[2606:4700::1111]`），
+而 `isIP()` 不认方括号 —— 原实现会把 IP 目标当域名、给它发一个 `[..]` 形态的 SNI。
+Bun 容忍这种取值（不会当场报错），属于**会静默生效的错**，所以单独修掉并把判断收成纯函数
+`webhookTlsServername()`（可断言：5 例单测）。**教训写在这里**：F9.4 的"连接固定到已校验 IP"
+让 `url.hostname` 承担了两个角色（SNI 的主机名 / IP 判定的输入），这两种形态对 IPv6 不一致。
+
 **契约未覆盖、本期未做**：不做 webhook 签名（F9 明确）、不做每租户 webhook（O6 未拍板）、
-不做投递日志租户页（F7）。**仍未落地的契约项**：F5 的 `notification_channel` 表
-（见 §12.2-D4 的阻塞说明）—— 本期的渠道配置以「调用方解析目标」的形态接入
-（18.2 的 `NotificationTargetResolver` 契约），表本身与接线归 WP18.6 之前的一个小提交。
+不做投递日志租户页（F7）。**F5 的 `notification_channel` 表**当时未落（schema.prisma 被并行改动占用），
+已由 §12.2-D4 补上（该条展开）。
 
 ### 12.2 WP18.4 —— Telegram 渠道 + token 密文存储 + `tg_id` 绑定语义（2026-10-05）
 
@@ -493,10 +499,10 @@ F4.3 的 3 次重试，而解析不了的目标重试同样次数是同样的结
 `backend/src/services/__tests__/v5-wp18-delivery.test.ts`（改一条已交付断言的**语义**，见 D5）、
 `backend/src/services/__tests__/v5-wp18-webhook.test.ts`（同一条清单断言同步到三个渠道）。
 
-**D1（判断，**需 Lead 确认**）telegram 也加部署级开关，默认关（`TUNEX_NOTIFICATION_TELEGRAM_ENABLED`）。**
+**D1（判断；Lead 2026-10-05 已批准）telegram 也加部署级开关，默认关（`TUNEX_NOTIFICATION_TELEGRAM_ENABLED`）。**
 契约只在 O4 里点名了 webhook，但 Lead 给的**理由**是通用的：「新增的出站通道默认关，要开必须显式
-打开」。而且 telegram 比 webhook 更需要它：**`User.tg_id` 今天没有任何验证**（见 D3 的残余风险）。
-如果 Lead 要 telegram 默认开，改一行默认值即可，本条记录随之作废。
+打开」。Lead 追加的理由：默认关 + 显式打开的通道，出问题时**第一嫌疑人是配置而不是代码**，
+排查成本差一个数量级。telegram 比 webhook 更需要它 —— `User.tg_id` 今天没有任何验证（见 D3）。
 
 **D2（判断）失败原因闭集新增 `secret_unreadable`。**
 F3 的 `ChannelResult` 写的是 `{not_configured | transport_error | rejected_target | ...}`，
@@ -517,32 +523,25 @@ F3 的 `ChannelResult` 写的是 `{not_configured | transport_error | rejected_t
    本期因此：(a) 渠道默认关（D1）；(b) 收件人由调用方按 scope 解析（18.2 契约），
    本模块不提供「给所有用户发」这种默认；(c) 绑定表/握手留给打开 O6 时单独立项。
 
-**D4（阻塞，需 Lead 处置）F5 的 `notification_channel` 表与迁移**本期未落**。**
-原因：`prisma/schema.prisma` 现在被**并行成员**占用 —— `git status` 显示 WP20 的枚举值
-（`BILLING_SETTLEMENT_TAKEOVER_MINUTES`）已 staged、WP18.5 的枚举注释（`NOTICE*` deprecated）在
-unstaged 区。`git add backend/prisma/schema.prisma` 会把别人的在建改动扫进我的提交（纪律 2 明令禁止，
-且这个仓库已经出过一次同样的事故）。**本期交付的是表的「使用侧」**：
-`telegramSealedTokenFromRow()`（F5 行 → 渠道依赖的纯映射，判定表见测试 I 组）+ `sealNotificationSecret()`
-（唯一落库入口）+ 渠道的解封/使用闭环，全部可测。
-**待落地的 DDL（接线 WP 直接照抄即可，唯一约束的取舍见附注）**：
-~~~prisma
-model NotificationChannel {
-  id            Int      @id @default(autoincrement())
-  scope_kind    String   @db.VarChar(16)  // platform | workspace（与 NotificationScope 同源）
-  workspace_id  Int?                      // platform ⟹ NULL（结构上表达 F5 的边界）
-  kind          String   @db.VarChar(16)  // email | webhook | telegram
-  target        String   @db.VarChar(512) // webhook URL / chat id —— **token 不放这里**
-  secret_enc    String?  @db.Text         // AES-256-GCM，`v1.<iv>.<ct>.<tag>`（notification-seal）
-  enabled       Boolean  @default(true)
-  created_by_id Int?
-  created_at    DateTime @default(now())
-  updated_at    DateTime @updatedAt
-  @@map("notification_channel")
-}
-~~~
-附注（留一个**不能靠唯一索引解决**的坑）：不要顺手加 `@@unique([scope_kind, workspace_id, kind])` ——
-platform 行的 `workspace_id` 是 NULL，而 MySQL 的唯一索引里 NULL 互不相等，这个约束会给出**假的排他性**
-（平台侧照样能插两条 telegram）。真要做「一 scope 一 kind」得用生成列或在应用层加锁，那是接线 WP 的取舍。
+**D4（判断；原为阻塞项，Lead 2026-10-05 解锁后**已落地**）F5 的 `notification_channel` 表。**
+最初的阻塞：`prisma/schema.prisma` 当时被并行成员占用（WP20 的枚举值 staged、WP18.5 的枚举注释
+unstaged），`git add` 会把别人的在建改动扫进我的提交（纪律 2 明令禁止）。Lead 先串行落地了三条线
+（`7895b40`）并解锁；随后 WP20-4 又开始在同一个文件里改，因此**本次提交只暂存自己那几行**
+（`git update-index --cacheinfo` 一个自建 blob），工作树里别人的改动**原封不动留在 unstaged 区**。
+落地物：`prisma/schema.prisma` 的 `model NotificationChannel` + 迁移
+`prisma/migrations/20261036000000_v5_wp18_notification_channel/migration.sql`
+（时间戳避开了已被占用的 `20261035`）。**未加唯一索引**：`(scope_kind, workspace_id, kind)` 看似该唯一，
+但 platform 行的 `workspace_id` 是 NULL，MySQL 唯一索引里 NULL 互不相等 ⇒ 它只会给出**假的排他性**。
+这一条**实测过**（见下面的验证记录），真要做「一 scope 一 kind」得用生成列或在应用层加锁，那是接线 WP 的取舍。
+**验证记录（可复现）**：
+1. `prisma validate` 通过；
+2. 空库上把 `prisma/migrations/*` 全部按序 apply（**47 条**，含本条）→ `OK`，`SHOW CREATE TABLE
+   notification_channel` 与 `prisma migrate diff --from-empty --to-schema-datamodel` 生成的 DDL **逐列一致**；
+3. 假的排他性实验：在 `notification_channel` 上**手工**加 `UNIQUE(scope_kind, workspace_id, kind)` 后，
+   再插第三条 `('platform', NULL, 'telegram', …)` **仍然成功**（3 行并存）—— 即该唯一索引并不阻止
+   "平台侧两条 telegram"，这正是本表不加它的理由。
+   （实验在一台 e2e MySQL 的**一次性 scratch 库**里做，做完即 `DROP DATABASE`，未触碰 `tunex` 库。）
+4. 附带把 `NotificationDelivery.failure_reason` 的列注释补齐到含 `secret_unreadable`（注释增量，无 DDL 变化）。
 
 **D5（判断）telegram 的 `transport_error` 会触发 F4.3 的重试，因此把「确定性目标问题」映射成
 `rejected_target`**：Telegram 返回 `error_code=400`（chat not found / 参数不可接受）与

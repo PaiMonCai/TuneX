@@ -2496,7 +2496,9 @@ model NotificationDelivery {
   target         String   @db.VarChar(512)
   /// sending | sent | failed。
   status         String   @db.VarChar(16) @default("sending")
-  /// 失败原因（not_configured | transport_error | rejected_target | unsupported_channel | ledger_unavailable）。
+  /// 失败原因（not_configured | transport_error | rejected_target | unsupported_channel |
+  /// secret_unreadable | ledger_unavailable）。`secret_unreadable` 是 WP18.4 追加的：
+  /// 凭据存在但解不开/不可用必须与"没配置"分开，否则一次密钥事故会被显示成"看起来没配"。
   failure_reason String?  @db.VarChar(32)
   /// 实际尝试次数（有界：≤ 3）。
   attempts       Int      @default(0)
@@ -2520,6 +2522,50 @@ model NotificationDelivery {
   @@index([source_kind, source_id], map: "notification_delivery_source_idx")
   @@index([status, created_at], map: "notification_delivery_status_created_idx")
   @@map("notification_delivery")
+}
+
+/// V5-WP18.3 / WP18.4 —— 通知渠道配置（契约 F5）。
+///
+/// ── 为什么是独立表，而不是 `SystemConfig` 键 ──
+/// `config.value` 是**明文**、按名字 upsert、且公网免认证下发面会读它（`routes/public.ts`）。
+/// 把 bot token / webhook URL 放进去，等于把凭据写进一张"可能被非超管读到、且无轮换语义"的表。
+/// 渠道配置要按 scope 归属、要有密文列、要能被停用 —— 这三件事都需要真正的列。
+///
+/// ── 三条设计要点 ──
+///   · `secret_enc` 只存**密文**（AES-256-GCM，`v1.<iv>.<ct>.<tag>` 单行），密钥由
+///     `notification-seal.ts` 用**独立 HKDF info**（`tunex-notification-v1`）派生 ——
+///     绝不与联邦/DDNS 共用派生密钥（R5：一处泄漏不该等于两处泄漏）。明文只出现一次
+///     （写入响应体），此后任何读取路径都不得回显它。
+///   · **不建唯一索引**（`(scope_kind, workspace_id, kind)` 看起来很像该唯一，其实不成立）：
+///     platform 行的 `workspace_id` 是 NULL，而 MySQL 唯一索引里 NULL 互不相等 ——
+///     加了它只会给出**假的排他性**（平台侧照样能插两条 telegram）。
+///     "一 scope 一 kind" 若要成立，得用生成列或在应用层加锁，那是接线 WP 的取舍。
+///   · 不建外键（与 `NotificationDelivery` 同一取向）：渠道配置是运维资产，
+///     删 workspace 该由接线层显式清理，而不是被级联删掉后无人知晓。
+model NotificationChannel {
+  id            Int      @id @default(autoincrement())
+  /// platform | workspace（与 NotificationScope 同源）。
+  scope_kind    String   @db.VarChar(16)
+  /// platform ⟹ NULL（结构上表达 F5 的边界，不用"约定"）。
+  workspace_id  Int?
+  /// email | webhook | telegram（与 NotificationChannelKind 同源；不用 DB enum，见上）。
+  kind          String   @db.VarChar(16)
+  /// 投递目标（webhook URL / chat id / 收件人）。**token 不放这里**：它属于 `secret_enc`。
+  /// 注意 webhook URL 本身常常就是凭据（Slack/Discord 的 hook URL），因此**写进投递账本**时
+  /// 必须经渠道的 `redactTarget()` 脱敏（WP18.3），而不是把这里的原文抄过去。
+  target        String   @db.VarChar(512)
+  /// 凭据密文（`notification-seal.ts` 的 `sealNotificationSecret()` 是唯一落库入口）。
+  secret_enc    String?  @db.Text
+  /// 停用 ≠ 删除：停用后 `telegramSealedTokenFromRow()` 返回 null ⇒ 渠道未配置
+  /// ⇒ 投递层留一条 `not_configured`，而不是静默不发。
+  enabled       Boolean  @default(true)
+  /// 创建者（平台超管 / 租户管理员）。**不做外键**：审计线索比约束更重要。
+  created_by_id Int?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@index([scope_kind, workspace_id, kind], map: "notification_channel_scope_idx")
+  @@map("notification_channel")
 }
 
 /* ================================================================== */
