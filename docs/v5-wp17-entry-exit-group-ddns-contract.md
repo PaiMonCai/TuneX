@@ -29,9 +29,9 @@
 ### 1.1 「组」今天在哪里
 
 - **Forward 已有入口/出口组列 + 具体节点列**：`schema.prisma` `model Tunnel` 的
-  `in_node_group_id`（必填）/ `out_node_group_id`，以及 `ingress_node_id` /
-  `egress_node_id` / `middle_node_id`。该 model 注释即上游不变量：**「NodeGroup 只是候选
-  集合，运行时恢复/删除/对账不得再根据组重新猜节点」**。
+  `in_node_group_id`（必填）/ `out_node_group_id`，以及 `ingress_node_id` / `egress_node_id` /
+  `middle_node_id`；该 model 注释即上游不变量：**「NodeGroup 只是候选集合，运行时恢复/删除/
+  对账不得再根据组重新猜节点」**。
 - **方向语义的最终真相是 `Node.role`**（`enum NodeRole = ingress|egress|both`），不是
   `NodeGroup.node_type`（`enum NodeType = in|out`）——schema 注释明写 v3 逻辑不得以前者为准。
 - **共享/授权**：`model NodeGroupGrant`（`direction` + `active`，`@@unique([user_id,
@@ -50,8 +50,6 @@
 - **apply 落在既有变更路径**：`route-profile.ts` `applyRouteProfile` 最终调
   `forward-service.patchForward`，只写 `mode / ingress_node_id / egress_node_id /
   middle_node_id`。
-- **v2 遗留 `model TunnelChain`**（`tunnel_id / node_type / node_group_id`，无顺序无策略）在
-  生产路径只被删除时清理，不承载任何路由语义。
 
 ### 1.2 故障转移链路（已有且已接线）
 
@@ -96,8 +94,7 @@
   DNSProviderType = cloudflare|huawei`；`model InNodeGroupDNS{in_node_group_id,
   dns_provider_id, ttl, ipv6, status}` —— **没有 domain 列**（`CREATE TABLE
   in_node_group_dns` 逐字核对）。
-- `model Node.dns_status` 只是管理面透传字段（`services/node-admin.ts` 投影、
-  `routes/admin-extended.ts` 写入、`web/src` 一个开关）。
+- `model Node.dns_status` 只是管理面透传字段（`node-admin.ts` 投影、`admin-extended.ts` 写入、`web/src` 一个开关）。
 - **全仓 `ddns` 关键字命中 0**（`backend/src`、`web/src`、`agent`）；`InNodeGroupDNS` /
   `DNSProvider` 的唯一生产引用是 `routes/admin-extended.ts` 的两处 `deleteMany`。
   ⇒ DNS 是**遗留 schema**：没有服务层、没有触发器，**连「更新哪个域名」都表达不出来**。
@@ -163,12 +160,9 @@
 
 ### 2.4 三件明确不照搬（对应硬约束）
 
-1. **不把 shell-out 多引擎当主数据面**：Forwardx 的出口选择落在数据面引擎；TuneX 的出口是
-   编译期解析出的具体节点，数据面只有 Go Agent 的既有 manager。
-2. **不容忍型默认值**：`normalizeExitGroupStrategy` 的「未知 → round_robin」与多个
-   `!!xxxEnabled` 宽松解析，TuneX 一律改为**未知值 fail-closed + 默认关**。
-3. **不面板下发整份配置**：只走既有 desired→revision→ACK→applied→reconcile；DDNS 是面板对
-   第三方 DNS 的**外呼副作用**，Agent 不知道 DNS 存在。
+1. **不把 shell-out 多引擎当主数据面**：TuneX 的出口是编译期解析的具体节点，数据面只有 Go Agent 既有 manager。
+2. **不容忍型默认值**：`normalizeExitGroupStrategy` 的「未知 → round_robin」一律改为**未知值 fail-closed + 默认关**。
+3. **不面板下发整份配置**：只走 desired→revision→ACK→applied→reconcile；DDNS 是面板对第三方 DNS 的外呼副作用。
 
 ## 3. 冻结决策
 
@@ -325,11 +319,10 @@
 ### D4 — 首选入口（`preferred_node_id`）的存储与自动回切
 
 - 事实：`failover-policy` 已支持 `failback` 路径，但 `pickFailoverDestination` 恒返回
-  `preferred_node_id = null` ⇒ **自动回切今天永不发生**。
-- **A** 绑在 Forward（`tunnel.preferred_ingress_node_id`，可空列）；**B** 绑在 Route Profile
-  的 ingress selector（= 改 FROZEN 契约字段表）；**C** 不提供自动回切，只允许人工迁移。
-- **代价/影响**：决定回切是产品能力还是运维动作，也决定 `FAILBACK_HEALTHY_CHECKS` 的连续
-  健康计数由谁累计（今天缺省 0）。**请 Lead 拍板**。
+  `preferred_node_id = null` ⇒ **自动回切今天永不发生**。候选：**A** 绑在 Forward
+  （`tunnel.preferred_ingress_node_id`，可空列）；**B** 绑在 Route Profile 的 ingress selector
+  （= 改 FROZEN 契约字段表）；**C** 不提供自动回切。**代价/影响**：决定回切是产品能力还是运维
+  动作，也决定 `FAILBACK_HEALTHY_CHECKS` 由谁累计（今天缺省 0）。**请 Lead 拍板**。
 
 ## 5. WP 拆分（一个 WP 一个可交付物；次序 17.1/17.2 并行 → 17.3 → 17.4 → 17.5）
 
@@ -403,5 +396,5 @@ provider 配置用 **endpoint 覆盖**指向它 —— **不新增 `DNSProviderT
    `node_group_grant` + workspace 归属，否则会出现静默放行或静默拒绝。
 6. **`preferred_node_id` 缺存储**（D4）：定案前自动回切**不可能发生**，文案不得暗示它存在。
 7. **候选集同源化（WP17.1）会改变今天的行为**：从只看 `role + state_report(5 分钟)` 改成
-   `nodeAdmission` + constraints 后，某些今天能迁的场景会变成 `hold`（更严格）。这是**有意
-   的** fail-closed，但必须在 Gate 里钉住「为什么没迁」的原因码，避免变成新的静默。
+   `nodeAdmission` + constraints 后，某些今天能迁的场景会变成 `hold`（更严格）。这是**有意**的
+   fail-closed，但必须在 Gate 里钉住「为什么没迁」的原因码，避免变成新的静默。

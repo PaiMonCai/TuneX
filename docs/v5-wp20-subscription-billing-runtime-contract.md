@@ -19,22 +19,21 @@
 
 ## 0. 一句话定义
 
-订阅计费运行时 = **把「谁在什么时间拥有哪一份能力策略」做成一条可重放的时间函数**，
-并把「每个计费周期只结算一次」做成一条**先占位后执行**的账本事实。
-它**不**新增权限判定、**不**新增状态机、**不**新增 desired：策略判定仍只有
-`capability-policy.ts` 一份真相，到期仍只是策略发放上的一个时间比较。
+订阅计费运行时 = **把「谁在什么时间拥有哪一份能力策略」做成一条可重放的时间函数**，并把「每个计费
+周期只结算一次」做成一条**先占位后执行**的账本事实。它**不**新增权限判定、**不**新增状态机、
+**不**新增 desired：策略判定仍只有 `capability-policy.ts` 一份真相，到期仍只是策略发放上的时间比较。
 
 ~~~text
-新增（纯函数） billing-time.ts @ Asia/Shanghai  →  新增（账本，先占位后执行）
-                SubscriptionPeriodSettlement UNIQUE(plan_subscription_id, period_key)
-                ↓ 既有（判定，不动）composeEffectivePolicy ← WorkspacePolicyAssignment
+新增（纯函数） billing-time.ts @ Asia/Shanghai → 新增（账本，先占位后执行）
+   SubscriptionPeriodSettlement UNIQUE(plan_subscription_id, period_key)
+   ↓ 既有（判定，不动）composeEffectivePolicy ← WorkspacePolicyAssignment
 ~~~
 
 ---
 
 ## 1. 仓库现状事实
 
-### 1.1 权限与额度：已只有一份真相，且与计费解耦
+### 1.1 权限 / 额度 / 计费与订单现状（已只有一份真相，且与计费解耦）
 
 | # | 事实 | 证据（文件:符号） |
 |---|---|---|
@@ -50,7 +49,7 @@
 | F10 | 同套餐续期从 `max(now, 原到期)` 起算，但 `traffic`/`max_tunnels` 覆盖写、`traffic_used` **不重置**；只有换套餐才置 0 | `routes/plans.ts:187`、`:192`、`:203`、`:213` |
 | F11 | 支付开关只**屏蔽路由**、不影响权限（GET/HEAD 永远放行）；`ENABLE_SUBSCRIPTION` 只是设置白名单项，**无运行时行为**；`license.ts` 是实例级商用许可，不是用户订阅 | `billing-access.ts:2 isBillingBlocked`、`app.ts:124`、`env.ts:70 paymentsEnabled`、`schema.prisma:1252`、`routes/public.ts:173`、`services/license.ts:24`/`:44` |
 
-### 1.3 流量口径现状（三处口径，其中一处只对 UTC+0..+11 正确）
+### 1.2 流量口径现状（三处口径，其中一处只对 UTC+0..+11 正确）
 
 | # | 事实 | 证据 |
 |---|---|---|
@@ -66,7 +65,7 @@
 > `docker-compose.prod.yaml:93 env_file: [.env]`、`scripts/v3-e2e/docker-compose.e2e.yaml:20`），
 > 但那只是部署约定，**不是**契约级保证。
 
-### 1.4 联邦缺口 / 并发占位 / 定时任务 / 归属
+### 1.3 联邦缺口 / 并发占位 / 定时任务 / 归属
 
 | # | 事实 | 证据 |
 |---|---|---|
@@ -111,17 +110,16 @@
    `total/month/day`（`schema.prisma:123`）；per-workspace 时区会同时污染账本、审计与 Gate。
 3. **三处口径收敛为一处**：F13 的 `trafficStart`/`trafficWindowStart` 改为委托 `billing-time.ts`，
    使窗口起点、归档日标签（F14）、保留期 cutoff 同源。
-4. **幂等 = 先占位后执行，不是「再查一遍」**。新增账本表（`plan_subscription_id` + `period_key`
-   唯一；`period_key` = Asia/Shanghai 下的 `YYYY-MM`（月切）或 `YYYY-MM-DD`（日切）；
-   另有 `state pending|settled|failed`、`attempts`、`order_id`、`error`、`started_at`、`settled_at`）。
+4. **幂等 = 先占位后执行，不是「再查一遍」**。新增账本表：`plan_subscription_id` + `period_key`
+   唯一（`period_key` = Asia/Shanghai 下的 `YYYY-MM` 或 `YYYY-MM-DD`），另有
+   `state pending|settled|failed`、`attempts`、`order_id`、`error`、`started_at`、`settled_at`。
    固定顺序：**① `create` 占位（唯一键即幂等闸门，命中 `P2002` 即本轮跳过）→ ② 扣款/发放 →
-   ③ 置 `settled`**。崩溃在 ① 之后 ② 之前留下的 `pending`，由下一轮**接管续跑**（复用
+   ③ 置 `settled`**。崩溃在 ① 之后 ② 之前留下的 `pending` 由下一轮**接管续跑**（复用
    `forward-rollout-recovery.ts` 已证明的「捞起未完成相位续跑」模式，不新建机制）。
 
-**依据**：F2/F3、F7、F13/F14、F23；仓库内先例 `federation/usage.ts:575`。
-
-**影响面**：`policy-service.ts` 两处窗口函数、`traffic-retention.ts` 调用方、
-`routes/dashboard.ts`/`routes/tunnels.ts` 图表窗口；一张新表；worker 新增一个 tick。
+**依据** F2/F3、F7、F13/F14、F23、`federation/usage.ts:575`。**影响面** `policy-service.ts` 两处
+窗口函数、`traffic-retention.ts` 调用方、`routes/dashboard.ts`/`routes/tunnels.ts` 图表窗口；一张新表；
+worker 新增一个 tick。
 
 **明确不做**：不引入 per-workspace 时区列；不引入用户可配的「结算日」（`resetDay` 固定为 `1`，
 即自然月月初，该参数只为实现完备性保留）。
@@ -308,29 +306,17 @@
 
 ## 6. DoD
 
-1. **不变量（CRITICAL）**：`grep -rn "checkTunnelCreation\|max_tunnels" backend/src/services/payment
-   backend/src/services/subscription-billing.ts` **必须为空** —— 计费侧不得出现任何额度判定（F5/F6）。
-2. `workspacePolicyAssignment` 写入点从 **1** 变 **2** 且仅此两个（`assignDefaultPolicy` +
-   `grantPolicyFromPurchase`）：`grep -rn "workspacePolicyAssignment.create\|workspacePolicyAssignment.upsert"`
-   精确命中 2 处。
-3. `billing-time.ts` 同一组断言在 `TZ=UTC`/`TZ=Asia/Shanghai`/`TZ=America/Los_Angeles` 下逐字相等
-   （先例 `Forwardx/server/billingTime.test.ts:53`，**重写不复用**）。
-4. 结算幂等可证：同一 `(plan_subscription_id, period_key)` 连跑两轮，第二轮 `settled`/`skipped` 为 0，
-   且 `PlanOrder`/`BalanceLog`/余额三者均无变化。
-5. 结算崩溃可恢复：手工插入 `state="pending"` 且 `started_at` 早于接管超时的行，下一轮必须**恰好一次**
-   推到 `settled`。
-6. 到期语义可证：`purchase` 发放过期后 `getEffectivePolicy` 返回 `grace_policies` 非空 +
-   `deny_reason="policy_expired"`；再越过 `POLICY_GRACE_MS` 后若仍有 `system_default` 则额度**降级**而非
-   `deny_scope`（证据=合成前后 `limits` 差异）。
+1. **不变量（CRITICAL）**：`grep -rn "checkTunnelCreation\|max_tunnels" backend/src/services/payment backend/src/services/subscription-billing.ts` **必须为空** —— 计费侧不得出现任何额度判定（F5/F6）。
+2. `workspacePolicyAssignment` 写入点从 **1** 变 **2** 且仅此两个（`assignDefaultPolicy` + `grantPolicyFromPurchase`）：`grep -rn "workspacePolicyAssignment.create\|workspacePolicyAssignment.upsert"` 精确命中 2 处。
+3. `billing-time.ts` 同一组断言在 `TZ=UTC`/`TZ=Asia/Shanghai`/`TZ=America/Los_Angeles` 下逐字相等（先例 `Forwardx/server/billingTime.test.ts:53`，**重写不复用**）。
+4. 结算幂等可证：同一 `(plan_subscription_id, period_key)` 连跑两轮，第二轮 `settled`/`skipped` 为 0，且 `PlanOrder`/`BalanceLog`/余额三者均无变化。
+5. 结算崩溃可恢复：手工插入 `state="pending"` 且 `started_at` 早于接管超时的行，下一轮必须**恰好一次**推到 `settled`。
+6. 到期语义可证：`purchase` 发放过期后 `getEffectivePolicy` 返回 `grace_policies` 非空 + `deny_reason="policy_expired"`；再越过 `POLICY_GRACE_MS` 后若仍有 `system_default` 则额度**降级**而非 `deny_scope`（证据=合成前后 `limits` 差异）。
 7. **无新状态机**：`grep -rn "enum .*Status" backend/prisma/schema.prisma` 的枚举数量**不增加**。
-8. 流量口径只有一个实现：`grep -rn "setHours(0, 0, 0, 0)" backend/src/services` 在
-   `policy-service.ts`/`capability-policy.ts` 中 **0** 命中（已收敛到 `billing-time.ts`）。
-9. 自动动作默认关闭：新建订阅路径 `auto_renew` 默认 `false`；`grep -rn "auto_renew" backend/src` 无
-   「默认开启」赋值。
-10. V4 冻结基线未破：`scripts/v3-e2e/verify.sh`（T0–T8）与 `v5-g0`/`g1b`/`g4`/`g5` 在**不改断言**的
-    前提下全部通过。
-11. `DEVELOPMENT.md` §4 路线表登记 WP20 各子项状态，并在 §6.2「packets 计费」条目下补一行
-    「订阅计费运行时见 WP20 契约」。
+8. 流量口径只有一个实现：`grep -rn "setHours(0, 0, 0, 0)" backend/src/services` 在 `policy-service.ts`/`capability-policy.ts` 中 **0** 命中（已收敛到 `billing-time.ts`）。
+9. 自动动作默认关闭：新建订阅路径 `auto_renew` 默认 `false`；`grep -rn "auto_renew" backend/src` 无「默认开启」赋值。
+10. V4 冻结基线未破：`scripts/v3-e2e/verify.sh`（T0–T8）与 `v5-g0`/`g1b`/`g4`/`g5` 在**不改断言**的前提下全部通过。
+11. `DEVELOPMENT.md` §4 路线表登记 WP20 各子项状态，并在 §6.2「packets 计费」条目下补一行「订阅计费运行时见 WP20 契约」。
 
 ---
 
@@ -358,38 +344,23 @@
 **需要，但不需要真的穿越时钟。** 冻结三条：
 
 1. **纯函数层**：周期边界函数必须接受显式 `now` 参数，测试直接用 `new Date("...")` 断言 —— 零夹具。
-2. **编排层**：沿用既有**依赖注入**先例（`scheduler.ts:873 deps.now()`、
-   `traffic-archive.ts#defaultTrafficArchiveDeps`、`reconciler.ts#ReconcileDeps`），结算服务必须暴露
-   `settleDuePeriods(deps, now)`。**禁止** patch 全局 `Date.now`。
-3. **Gate 侧不注入时钟，而是直接预置状态**：① 往 `subscription_period_settlement` 插一条上一周期的
-   `pending` 行；② 通过可显式触发的 tick 入口（cron 名 + BullMQ 立即入队）跑一轮。新增夹具
-   `scripts/v3-e2e/fixtures/billing-clock.json`（预置行 + 期望计数）与
-   `docs/evidence/v5-g6-result-<date>.txt` 证据文件。
-4. 若确需端到端跨月验证，**唯一**允许方式是 `tick(name, { now })` 显式入参（worker 读 env
-   `TUNEX_BILLING_NOW`，仅 e2e compose 设置）；但这引入一个生产可被误设的时间覆盖开关，
-   故**默认不实现**，列为 O4 的延伸决策。
+2. **编排层**：沿用既有**依赖注入**先例（`scheduler.ts:873 deps.now()`、`traffic-archive.ts#defaultTrafficArchiveDeps`、`reconciler.ts#ReconcileDeps`），结算服务必须暴露 `settleDuePeriods(deps, now)`。**禁止** patch 全局 `Date.now`。
+3. **Gate 侧不注入时钟，而是直接预置状态**：① 往 `subscription_period_settlement` 插一条上一周期的 `pending` 行；② 通过可显式触发的 tick 入口（cron 名 + BullMQ 立即入队）跑一轮。新增夹具 `scripts/v3-e2e/fixtures/billing-clock.json`（预置行 + 期望计数）与 `docs/evidence/v5-g6-result-<date>.txt` 证据文件。
+4. 若确需端到端跨月验证，**唯一**允许方式是 `tick(name, { now })` 显式入参（worker 读 env `TUNEX_BILLING_NOW`，仅 e2e compose 设置）；但这引入一个生产可被误设的时间覆盖开关，故**默认不实现**，列为 O4 的延伸决策。
 
 ---
 
 ## 8. 明确不做
 
-1. **不引入第二套状态机**：不新增 `SubscriptionStatus`/`AssignmentStatus` 枚举；订阅「有效」=
-   `started_at <= now < expires_at`，与 `isAssignmentActive` 同构。
-2. **不引入第二份 desired**：订阅不生成任何「期望配置」，不进入 Forward desired → revision → ACK →
-   applied 链。
-3. **不引入第二套权限判定**：计费模块不得 import `capability-policy.ts` 的判定函数，不得读
-   `max_tunnels`/`traffic_limit`/`tunnel_types`（F5/F6/F24）。
-4. **不照搬 Forwardx 三件事**：① 不做 shell-out 多引擎当主数据面（计费不触发任何 Agent/引擎命令）；
-   ② 不做容忍型自动动作默认打开（自动续费默认 `false`，到期不做「先续上再说」的兜底）；
-   ③ 不向面板下发整份配置（发放变化只 `invalidatePolicyCache()`）。
-5. **不改 V4 冻结基线**：不改 `NodePortLease` 唯一性语义、不改 `WorkspacePolicyAssignment` 形状、
-   不改 `tunnel_traffic` 唯一键、不删 `verify.sh` 任何断言。
+1. **不引入第二套状态机**：不新增 `SubscriptionStatus`/`AssignmentStatus` 枚举；订阅「有效」= `started_at <= now < expires_at`，与 `isAssignmentActive` 同构。
+2. **不引入第二份 desired**：订阅不生成任何「期望配置」，不进入 Forward desired → revision → ACK → applied 链。
+3. **不引入第二套权限判定**：计费模块不得 import `capability-policy.ts` 的判定函数，不得读 `max_tunnels`/`traffic_limit`/`tunnel_types`（F5/F6/F24）。
+4. **不照搬 Forwardx 三件事**：① 不做 shell-out 多引擎当主数据面（计费不触发任何 Agent/引擎命令）；② 不做容忍型自动动作默认打开（自动续费默认 `false`，到期不做「先续上再说」的兜底）；③ 不向面板下发整份配置（发放变化只 `invalidatePolicyCache()`）。
+5. **不改 V4 冻结基线**：不改 `NodePortLease` 唯一性语义、不改 `WorkspacePolicyAssignment` 形状、不改 `tunnel_traffic` 唯一键、不删 `verify.sh` 任何断言。
 6. **不跑 Docker 门禁、不装依赖**（WP20-0 的唯一交付物是本文件；本会话未跑任何容器）。
 7. **不做跨面板计费**：`federation_usage_record` 只做归因展示，不参与本面板额度（O5 候选 A）。
 8. **不引入进程内预留/锁**（`ruleQuotaReservations.ts` 的反面教材）。
-9. **不做支付渠道侧改动**：`payment/{epay,bepusdt,heleket}.ts` 与 `handleCallback` 的幂等形状（F7）
-   **不动**；WP20-4 只在「入账成功之后」接一条发放动作，且必须复用既有 `afterCredit` 钩子槽位
-   （`payment/order.ts:347`）。
+9. **不做支付渠道侧改动**：`payment/{epay,bepusdt,heleket}.ts` 与 `handleCallback` 的幂等形状（F7）**不动**；WP20-4 只在「入账成功之后」接一条发放动作，且必须复用既有 `afterCredit` 钩子槽位（`payment/order.ts:347`）。
 
 ---
 
