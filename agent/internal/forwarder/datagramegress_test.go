@@ -347,6 +347,63 @@ func TestBuildUDPDatagramRoutesByRole(t *testing.T) {
 // pin the ADDRESS only: the port is ephemeral and changes when the ingress restarts, so
 // pinning it would turn a normal restart into a permanent outage — while the property we
 // need ("only the paired ingress may feed this exit") is a property of the address.
+// A live mapping is stricter than the tunnel-level IP attestation: once the
+// mapping exists, its generation is pinned to the source endpoint that created
+// it. A second socket on the same (attested) IP must not be able to reuse the
+// mapping id/generation and steal or inject into its reply path.
+func TestDatagramEgressPinsLiveMappingToCreatingEndpoint(t *testing.T) {
+	targetAddr, stopTarget := udpEchoTarget(t, "T")
+	defer stopTarget()
+	port := freeUDPPort(t)
+	e := startEgress(t, egressTestConfig(t, port, "127.0.0.1"),
+		staticSelector{t: Target{Host: "127.0.0.1", Port: targetPortOf(t, targetAddr)}},
+		DatagramEgressOptions{})
+
+	owner := hopClient(t, port)
+	stranger := hopClient(t, port)
+
+	if _, payload, ok := sendHop(t, owner, 9, 41, []byte("owner"), 2*time.Second); !ok {
+		t.Fatal("owner mapping did not receive its first reply")
+	} else if string(payload) != "T:owner" {
+		t.Fatalf("owner payload = %q", payload)
+	}
+
+	wire, err := appendDatagramHop(nil, datagramHopHeader{MappingID: 9, Generation: 41}, []byte("hijack"))
+	if err != nil {
+		t.Fatalf("append hijack packet: %v", err)
+	}
+	if _, err := stranger.Write(wire); err != nil {
+		t.Fatalf("write hijack packet: %v", err)
+	}
+
+	// The foreign source port is refused before the target write, so neither
+	// socket receives a second reply.
+	if err := stranger.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		t.Fatalf("set stranger deadline: %v", err)
+	}
+	buf := make([]byte, datagramHopMTU)
+	if _, err := stranger.Read(buf); err == nil || !isTimeout(err) {
+		t.Fatalf("same-IP foreign endpoint received a reply: err=%v", err)
+	}
+	if err := owner.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+		t.Fatalf("set owner deadline: %v", err)
+	}
+	if _, err := owner.Read(buf); err == nil || !isTimeout(err) {
+		t.Fatalf("foreign endpoint packet reached the target/reply path: err=%v", err)
+	}
+
+	stats := e.Stats()
+	if stats.MappingsCreated != 1 || stats.Mappings != 1 {
+		t.Fatalf("mapping facts = %+v, want the original mapping only", stats)
+	}
+	if stats.PacketsIn != 1 {
+		t.Fatalf("packets in = %d, want only the owner's accepted packet", stats.PacketsIn)
+	}
+	if stats.DropsUnknownSource != 1 || stats.Drops != 1 {
+		t.Fatalf("drops = %+v, want one endpoint-mismatch drop", stats)
+	}
+}
+
 func TestDatagramEgressAttestsAnEndpointByItsAddress(t *testing.T) {
 	targetAddr, stopTarget := udpEchoTarget(t, "T")
 	defer stopTarget()
