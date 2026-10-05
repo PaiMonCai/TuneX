@@ -1,12 +1,10 @@
 /**
  * DDNS provider execution service.
  *
- * This is the only DDNS layer that performs provider network calls. Desired
- * addresses are normalized as a set, changes are written, and providers with
- * read capability are verified before reporting `synced`; otherwise success is
- * explicitly `synced_unverified`. Failures update DNS sync/audit facts only and
- * never alter Forward ownership or placement epochs. Retry timing is driven by
- * the existing reconciliation cadence and bounded backoff.
+ * This is the DDNS layer that performs provider network calls. Desired addresses
+ * are normalized as a set, provider writes are verified when possible, and
+ * failures update DNS synchronization/audit facts without changing Forward
+ * ownership or placement state.
  */
 import { buildAuditEntry, type AuditEntry, type AuditSink } from "./audit.ts";
 
