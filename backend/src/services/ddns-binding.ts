@@ -41,7 +41,7 @@ export const DDNS_ERROR_CODES = {
 
 export type DdnsErrorCode = (typeof DDNS_ERROR_CODES)[keyof typeof DDNS_ERROR_CODES];
 
-/** 契约 §6：TTL 下限抗抖动、上限把"客户端最坏切换窗口"压在 1 小时内。 */
+/** TTL 下限用于抑制抖动，上限把客户端最坏切换窗口限制在 1 小时内。 */
 export const DDNS_TTL_SECONDS = { min: 60, max: 3600, default: 300 } as const;
 
 /**
