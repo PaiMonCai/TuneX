@@ -42,6 +42,8 @@ import { publicRoutes } from "./routes/public.ts";
 import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
 import { dashboardRoutes } from "./routes/dashboard.ts";
+// V5-WP20-6b：`/api/me/*` 的当前用户视图（契约 §3.3.2 指定的已用流量读路径）。
+import { meRoutes } from "./routes/me.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
 import { forwardsRoutes } from "./routes/forwards.ts";
 import { ddnsRoutes } from "./routes/ddns.ts";
@@ -161,6 +163,8 @@ export function createApp() {
   app.route("/api/internal", internalNodeRoutes);
   app.route("/api/pay", payRoutes);
   app.route("/api/dashboard", dashboardRoutes);
+  // V5-WP20-6b：`/api/me/capabilities` —— 额度/用量视图（窗口求和口径，见 routes/me.ts）。
+  app.route("/api/me", meRoutes);
   app.route("/api/tunnels", tunnelsRoutes);
   app.route("/api/forwards", forwardsRoutes);
   // V5-WP17.2：DNS provider（凭据属于设置域）。

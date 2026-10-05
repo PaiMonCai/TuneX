@@ -3,7 +3,8 @@
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
 > （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）、
 > WP20-4（支付 → 发放接线 + 续期执行器）、WP20-4b（套餐 ↔ 策略绑定入口）、
-> WP20-6（流量口径统一）已交付**（§5.1–§5.6）。除这六处记录外，本契约其余部分仍**不含实现**。
+> WP20-6（流量口径统一）、WP20-6b（`/api/me/capabilities` 端点）已交付**
+> （§5.1–§5.7）。除这七处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -326,6 +327,7 @@ worker 新增一个 tick。
 | **WP20-4b** | 套餐 ↔ 策略绑定入口（WP20-4 的写入路径补完） | ✅ **已交付**（2026-10-05，见 §5.5）：`services/plan-subscription.ts` + 套餐 CRUD 的 `policy_id` + 只读选项端点 + 前端字段 | WP20-4 |
 | **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
 | **WP20-6** | 流量口径统一 | ✅ **已交付**（2026-10-05，见 §5.6）：三处日/月界收敛到 `billing-time.ts`、`traffic_used` 读取路径切换、`traffic_used_unattributed_federated` 落在已挂载的用量端点上 | WP20-1 |
+| **WP20-6b** | 补 `GET /api/me/capabilities`（契约 §3.3.2 的读路径落点） | ✅ **已交付**（2026-10-05，见 §5.7）：`routes/me.ts` + `app.ts` 挂载 + 子进程 HTTP 契约 | WP20-6 |
 | **WP20-7** | （条件）流量倍率 | 仅当 O3 选 B 时立项，需独立契约补充 + Gate 断言 | O3 拍板 |
 
 顺序约束：**一次只做一个 WP**（`DEVELOPMENT.md` §3.1）。WP20-6 与 WP20-3 无共享文件，可并行；其余串行。
@@ -769,6 +771,48 @@ bunx tsc --noEmit（backend/）                                                �
 
 **DoD 覆盖矩阵（针对 WP20-6）**：**第 8 条 ✅（含断言）**；第 3 条 ✅（WP20-1 的三时区金样本仍全绿）；
 第 1/2/4/5/7/9 条不回归（全绿）；第 6 条 ⏳ 属 WP20-5；第 10 条 ⏳（e2e 未跑）；第 11 条 ⏳（登记不在本 WP）。
+
+---
+
+### 5.7 WP20-6b 落地记录 —— 补 `GET /api/me/capabilities`（给死代码一个调用者）
+
+> **为什么补**：§3.3.2 指定「前端展示已用流量改读 `GET /api/me/capabilities`」，
+> 而那个端点在代码里**从来不存在**；它背后的 `policy-service#getWorkspaceUsageReport` 是
+> **零调用者的死代码**。死代码只有两种解法：删掉，或给它一个调用者。契约已经写死了读路径的名字，
+> 所以按 **Lead 裁决**选后者（删掉会让 §3.3.2 失去落点）。
+
+**交付物**：`backend/src/routes/me.ts`（新）+ `backend/src/app.ts`（挂载 `/api/me`，一行）
++ `backend/src/routes/__tests__/me-capabilities-route.test.ts`（子进程隔离的 HTTP 契约）。
+
+**冻结的语义**
+
+1. **口径与 dashboard 同源**：同一个 `resolveWorkspaceMembership`（`x-workspace-id` 头优先、缺省个人空间），
+   同一次请求里只取一个 `now` 并透传（否则跨月那一秒的月首会被算两遍，读路径与判定层可能差一个月）。
+   返回的就是 `getWorkspaceUsageReport`：`traffic_used` = **窗口求和**（生效策略的 `traffic_period`），
+   `traffic_used_unattributed_federated` = 联邦缺口，`limits`/`policy` = 生效策略。
+2. **权限面 = 该工作空间的成员**（解析函数自己拒非成员）。**不叠加** `forward:read` 之类的资源权限：
+   本端点返回的是「租户自己的额度与用量」，成员本就可见；dashboard 的可见性开关管的是**资源明细**，
+   不是额度。反例：若这里要求 `forward:read`，一个只有节点权限的管理员就看不到自家额度，
+   而额度判定恰恰会拒绝他的建隧道请求 —— 那才是真正需要解释的 403。
+3. **端点必须真的可达**：本仓已有机械守卫 `route-mount-coverage.test.ts`（凡 `*Routes` 导出都必须在
+   `app.ts` 被引用），本 WP 另外把**具体前缀**钉住（`app.route("/api/me", meRoutes)`）并断言
+   报告函数**有生产调用点** —— 这正是「模块存在、路由没挂」那族缺陷的正面守卫。
+4. **前端不必切换**：dashboard 的 `/stats` 在 WP20-6 里已经改成窗口求和（同一口径），
+   所以前端即使仍读 `/api/dashboard/stats` 也不会拿到错数；`/api/me/capabilities` 供需要
+   **完整能力视图**（policy/limits/联邦缺口）的调用方。两者由同一函数供数，不会各算一套。
+
+**未决**：无（死代码缺口已消掉）。`≤10 分钟计量滞后`的产品文案仍在待办（§3.3.4，措辞属产品决策）。
+
+**证据**
+
+```
+bun test src/routes/__tests__/me-capabilities-route.test.ts → 2 pass（401 不触碰服务层 / 200 且口径来自生效策略
+   period=month、traffic_used=窗口求和值、缺字段在 / 传下去的 workspace id = 解析结果 / now 是 Date）
+bun test src/routes/__tests__/route-mount-coverage.test.ts  → 3 pass（机械守卫：router 都已挂载）
+bun test src/services/__tests__/v5-wp20/ + 上述两个文件     → 136 pass / 0 fail / 530 expect()
+```
+
+**DoD 覆盖矩阵（针对 WP20-6b）**：不新增 DoD 条目；它消掉的是 §3.3.2 的「读路径指向不存在的端点」缺口。
 
 ---
 
