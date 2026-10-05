@@ -487,7 +487,13 @@ else
     echo "     ingress used_ports: $(mysqlc "SELECT IFNULL(used_ports,'') FROM node_state_report s JOIN tunnel t ON t.ingress_node_id=s.node_id WHERE t.id=$FORWARD_ID;")"
     # 同时打印 Agent 认为**在跑**的 runtime：这样能直接区分"守卫里有个残留的挂账"与
     # "Agent 还留着一个 runtime 条目"（两者的修法完全不同，不能靠猜）。
-    echo "     ingress runtimes: $(mysqlc "SELECT LEFT(IFNULL(tunnels,''),400) FROM node_state_report s JOIN tunnel t ON t.ingress_node_id=s.node_id WHERE t.id=$FORWARD_ID;")"
+    # 紧凑列出 (id, 端口)：能一眼看出"哪个 runtime 还占着那个端口"，而不是被 JSON 截断。
+    echo "     ingress runtimes: $(mysqlc "SELECT IFNULL(tunnels,'[]') FROM node_state_report s JOIN tunnel t ON t.ingress_node_id=s.node_id WHERE t.id=$FORWARD_ID;" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("(unparsable)"); raise SystemExit
+print(", ".join(f"{t.get(\"id\")}@{t.get(\"ingress_port\")}r{t.get(\"revision\")}" for t in d) or "(none)")' 2>/dev/null)"
     echo "     rollout: $(mysqlc "SELECT CONCAT('phase=',IFNULL(phase,'-'),' err=',IFNULL(last_error_code,'-'),' ',LEFT(IFNULL(last_error,''),200)) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID ORDER BY id DESC LIMIT 1;")"
   fi
   assert_eq "$S7_STATUS" "200" "S7.2 还原夹具端口 PATCH HTTP 200"
