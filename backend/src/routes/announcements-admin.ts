@@ -1,25 +1,11 @@
 /**
- * V5-WP18.5 —— 平台公告的管理端接口（契约 §F6 / §F7）。挂载于 `/api/admin/announcements`。
+ * Platform announcement management mounted at `/api/admin/announcements`.
  *
- * 端点：
- *   GET  /api/admin/announcements                平台公告（含已撤回）
- *   POST /api/admin/announcements                发布平台公告（`type`: normal | popup）
- *   POST /api/admin/announcements/:id/revoke     撤回平台公告
- *
- * ── 权限：本文件**故意不碰** `permissions.ts` ──
- * `/api/admin/*` 的 `adminRequired` + `adminPermissionGuard` 由 `app.ts` 统一施加
- * （§⑥），而 `adminPermissionGuard` 对**未登记前缀**一律 403、只放行 `super_admin`
- * —— 这正是契约 F7 写的行为（「不登记 = 只有超管」fail-closed）。
- *
- * 把 `/admin/announcements` 登记进 `ADMIN_RESOURCES`（让被授权的管理员角色也能用）是
- * **WP18.6 的动作**：权限接线与实现分开交付，这里不预先登记 —— 一旦这里登记了，18.6 的
- * 「登记生效」断言就没有可观察的起点（改动前 403 → 改动后 200 才是它的证据）。
- *
- * ── 为什么平台公告不能由租户管理员发布 ──
- * `createAnnouncement` 的 scope 是 `{kind:"platform", workspace_id:null}`（判别联合，
- * 类型层面就带不上 workspace_id）。租户侧的发布入口在 `announcements.ts`，它只构造
- * `workspace` 作用域 —— 两条路径各写各的，不存在"用请求体指定 scope"的入口（那才是
- * 越权面）。因此这里**没有**任何来自请求体的 scope 参数：scope 由"挂在哪个路由上"决定。
+ * Admin authentication and the registered `announcements` resource permission
+ * are enforced by the application-level admin guards. Scope is structural:
+ * this router can only create platform announcements and accepts no request-body
+ * scope override, so tenant callers cannot escalate a workspace announcement
+ * into a platform announcement.
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -89,12 +75,11 @@ announcementAdminRoutes.post("/announcements", async (c) => {
     type: typeof body.type === "string" ? body.type : "",
     title: body.title,
     body: body.body,
-    // 发布者 = 当前超管；审计面另有 audit_log（本层不写审计：公告表本身就是事实）。
+    // Publisher is the authenticated admin; the announcement row is the content fact.
     userId: user.id,
   });
   if (result.ok) {
-    // 投递是旁路：不 await、不冒泡（公告已落库、站内已可见）。受众 = 全体活跃用户，
-    // 与读侧可见性同口径；走同一本账本与同一套免打扰/静默判据（§12.3-D10/D11）。
+    // Delivery is a side effect after the durable announcement exists; failures do not roll back visibility.
     void deliverAnnouncementOnPublish(db as unknown as AnnouncementPublishDb, {
       row: result.value,
       scope,
