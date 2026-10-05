@@ -28,7 +28,7 @@ export function nextAttemptDelayMs(attempt: number): number {
   return DDNS_BACKOFF_MS[index] ?? DDNS_BACKOFF_MS[DDNS_BACKOFF_MS.length - 1]!;
 }
 
-/** 单次 provider 调用的上限（契约 §6：≤10s）。 */
+/** 单次 provider 调用的超时上限。 */
 export const DDNS_PROVIDER_TIMEOUT_MS = 10_000;
 
 /* ================================================================== */
@@ -88,7 +88,7 @@ export function planDdnsValueChanges(
  * - `single_active` ⇒ 当前 owner 的 `connect_ip`；
  * - `multi_entry`（首选） ⇒ 当前**可用**入口集合。
  *
- * 可用性由调用方给（WP17.4 用与 failover 同一份候选判定算出来）。`ownerIp` 为空且形态是
+ * 可用性由调用方使用与 failover 相同的候选判定提供。`ownerIp` 为空且形态是
  * `single_active` 时返回空集 —— 空集**不是**"写一个空记录集"，调用方必须把它当成
  * "地址不可用 ⇒ 什么都不做"（否则一次缺地址的同步会把整个域名清空）。
  */
