@@ -277,3 +277,58 @@ export function selectForwardRecoveryFacts(input: {
 
   return { seeds, skipped };
 }
+
+/* ================================================================== */
+/* 账本读取 seam：哪些拒绝**还没配对恢复**                                */
+/* ================================================================== */
+
+/** 一条"开着的"拒绝 episode（按渠道）：`(source_id, channel_kind)` 上最新一条是拒绝。 */
+export interface OpenDenialRow {
+  readonly source_id: string;
+  readonly channel_kind: string;
+}
+
+/**
+ * 取"最新一条仍是拒绝"的 `(转发, 渠道)` 组合。
+ *
+ * ── 为什么按 `(source_id, channel_kind)` 而不是只按 `source_id` ──
+ * 与"静默期键必须带渠道"是同一条口径（WP18.6 那处缺陷）：**投递是每渠道一件事**。只按 source_id
+ * 分组时，email 已经恢复、telegram 还没恢复的中间状态会被算成"已恢复"，于是 telegram 的恢复
+ * 永远发不出去。
+ *
+ * ── 为什么用窗口函数而不是 Prisma 的 `distinct` ──
+ * MySQL 上 Prisma 的 `distinct` 配 `orderBy` 的"每组取哪一条"语义不直观（它在内存里去重），
+ * 而这里的正确性完全依赖"每组取 id 最大的一条" ⇒ 用**显式** SQL 写出来，并且这条 SQL
+ * **在真库上验过**（一次性 scratch 库：拒绝→恢复、两个渠道、两个转发四种组合）。
+ *
+ * `id` 是自增主键，等价于"投递先后" ⇒ 用 `ORDER BY id DESC` 而不是 `occurred_at`：
+ * `occurred_at` 来自来源表（可能早于投递），排序它会得出与实际投递顺序不同的结论。
+ */
+export async function listOpenForwardDenials(deps: {
+  readonly queryRows: () => Promise<readonly OpenDenialRow[]>;
+}): Promise<OpenDenialRow[]> {
+  return [...(await deps.queryRows())];
+}
+
+/** 生产实现：平台库上的窗口函数查询（惰性 import `db`）。 */
+export function defaultOpenDenialsDeps(): { queryRows: () => Promise<OpenDenialRow[]> } {
+  return {
+    queryRows: async () => {
+      const { db } = await import("../db.ts");
+      const rows = await db.$queryRaw<Array<{ source_id: string; channel_kind: string }>>`
+        WITH ranked AS (
+          SELECT source_id,
+                 channel_kind,
+                 reason_code,
+                 ROW_NUMBER() OVER (PARTITION BY source_id, channel_kind ORDER BY id DESC) AS rn
+          FROM notification_delivery
+          WHERE source_kind = 'forward'
+        )
+        SELECT source_id, channel_kind
+        FROM ranked
+        WHERE rn = 1 AND reason_code = 'forward_apply_error'
+      `;
+      return rows.map((r) => ({ source_id: String(r.source_id), channel_kind: String(r.channel_kind) }));
+    },
+  };
+}
