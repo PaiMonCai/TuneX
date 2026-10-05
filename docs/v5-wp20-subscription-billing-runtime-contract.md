@@ -1,7 +1,8 @@
 # V5-WP20 订阅计费运行时契约（周期结算 / 流量周期 / 配额预留）
 
-> **状态：PROPOSED — 待 Lead 冻结（2026-10-05）。本文不含任何实现**：无代码补丁，不改
-> schema / `DEVELOPMENT.md` / 其它文档，唯一产物是语义与边界。
+> **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
+> （§4.0），**WP20-1（计费时钟纯函数）已交付**（§5.1）。除 §5.1 记录的那一个 WP 外，本契约
+> 其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -317,7 +318,7 @@ worker 新增一个 tick。
 | WP | 内容 | 交付物 | 依赖 |
 |---|---|---|---|
 | **WP20-0** | 本契约冻结（含 §7 Gate 与时间夹具规格）+ Lead 对 O2/O3 拍板 | 本文件 + `DEVELOPMENT.md` §4 登记 | — |
-| **WP20-1** | 计费时钟纯函数 | `backend/src/services/billing-time.ts` + `backend/src/__tests__/billing-time.test.ts`（三进程时区逐字相等） | WP20-0 |
+| **WP20-1** | 计费时钟纯函数 | ✅ **已交付**（2026-10-05，见 §5.1）：`backend/src/services/billing-time.ts` + `backend/src/services/__tests__/v5-wp20/billing-time.test.ts`（三进程时区逐字相等） | WP20-0 |
 | **WP20-2** | 账本与归属 schema | migration：`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`(nullable)；`UserPlan` 冻结注释 | WP20-1 |
 | **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | `backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时） | WP20-2 |
 | **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | `policy-service.ts#grantPolicyFromPurchase` + `routes/plans.ts` 事务内调用 + `invalidatePolicyCache` | WP20-2 |
@@ -327,7 +328,74 @@ worker 新增一个 tick。
 
 顺序约束：**一次只做一个 WP**（`DEVELOPMENT.md` §3.1）。WP20-6 与 WP20-3 无共享文件，可并行；其余串行。
 
+### 5.1 WP20-1 落地记录（2026-10-05，分支 `feature/v5-1b-udp-relay`）
+
+> 本表按顺序执行得到：**WP20-0 已由 Lead 冻结（§4.0 + 本文件）**，故第一个可交付 WP 是
+> **WP20-1（计费时钟）**，不是「套餐归属落库」——归属落库是 WP20-2，它**依赖** WP20-1。
+
+**交付物（实际路径 + 与上表的一处偏差）**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/src/services/billing-time.ts` | 纯函数模块，唯一导出面 = `BILLING_TIME_ZONE`、`BillingCalendarParts`、`billingCalendarParts`、`billingMonthStart`、`billingMonthlyBoundary`、`billingAddMonthsClamped`（即 §3.1 点名的四个函数 + 时区常量/类型） |
+| `backend/src/services/__tests__/v5-wp20/billing-time.test.ts` | 24 条断言，含「三子进程时区逐字相等」 |
+| `backend/src/services/__tests__/v5-wp20/billing-clock-canonical.ts` | 测试专用金样本生成器（被本进程与三个子进程共同调用） |
+
+**偏差（记录理由，不静默）**：上表把测试写成 `backend/src/__tests__/billing-time.test.ts`，实际落在
+`backend/src/services/__tests__/v5-wp20/`。理由：① 这是本次任务的 writeScope 划定范围；
+② `backend/src/__tests__/` 与 `backend/src/services/__tests__/` 两个目录并存是既有事实，
+而 `services/` 下的被测模块配套测试一直在 `src/services/__tests__/`（如 `traffic-retention.test.ts`）；
+③ `v5-wp20` 子目录让后续 WP20-2/20-3 的测试同址聚集。**符号名与断言不受影响。**
+
+**语义冻结（实现里做实的判定，均带反例测试）**
+
+1. **固定 `Asia/Shanghai`，进程时区无关**：日历分量只能来自
+   `Intl.DateTimeFormat("en-US-u-nu-latn", { timeZone: "Asia/Shanghai", hourCycle: "h23" })`。
+   *反例（为什么不沿用 F13 的 `setHours(0,0,0,0)`）*：同一瞬时点 `2026-01-31T16:00:00Z`，
+   `TZ=UTC` 下 `setDate(1)` 得 `2026-01-01T00:00:00Z`，`TZ=Asia/Shanghai` 下得
+   `2025-12-31T16:00:00Z` —— 一个时刻两个答案，正是 R1 的成因。
+2. **`billingCalendarParts` 只接受显式时间点**（`Date | number`），非法值抛 `RangeError`（fail-closed）。
+   `hourCycle: "h23"` 保证上海午夜是 `00` 而不是 `24`（有断言）。
+3. **`billingMonthStart`** = 上海当月 1 日 00:00:00.000（= 上月末 16:00Z）。这就是
+   `traffic_period="month"` 的窗口起点语义。*反例*：`2026-02-28T15:59:59.999Z` → `2026-01-31T16:00:00Z`，
+   而 `2026-02-28T16:00:00.000Z` → `2026-02-28T16:00:00Z`（差 1ms 差整月）。
+4. **`billingMonthlyBoundary(reference, resetDay, monthOffset=0, maximumResetDay=28)`**：目标月 = 上海月 +
+   `monthOffset`；日期**两层夹取、顺序固定**：先 `min(requested, maximumResetDay)`（默认 28，避免 2 月跳变），
+   再 `min(…, 该月实际天数)`（闰年 2 月 = 29）。
+   `resetDay` 非法（`0`/负数/空串/`NaN`/小数取整后 <1）一律回落 **1**；`maximumResetDay` 非法回落 **1**
+   （比下限更严，方向是收紧而非放宽，故不构成放松）。
+   *反例（为什么必须有 28 上限）*：`resetDay=31`、无上限时「1 月 31 日 + 1 月」在 JS 里会溢出成 3 月 3 日；
+   夹取后是 2 月 28 日。产品侧固定 `resetDay=1`（§3.1「不做用户可配结算日」），该参数只为实现完备性保留。
+5. **`billingAddMonthsClamped(reference, months)`**：按月推进、日夹取到目标月长度、**保留上海墙钟的
+   时/分/秒/毫秒**。*反例（为什么不按 UTC 偏移加月）*：带 DST 的时区里按偏移加月会在月末凭空多/少 1 小时，
+   「1 月 31 日 10:30 买的月付，2 月 28 日 10:30 到期」这句用户可见语义会被破坏；
+   实际断言：`2026-01-31T15:59:59.999Z` +1 月 = `2026-02-28T15:59:59.999Z`（毫秒都在），
+   `2028-01-31T02:30Z` +1 月 = `2028-02-29T02:30Z`（闰年）。
+
+**明确延期（不在 WP20-1，避免越界与第二真相）**
+
+- **`period_key`（`YYYY-MM` / `YYYY-MM-DD`）格式化不在此 WP**：它的形状由
+  `SubscriptionPeriodSettlement UNIQUE(plan_subscription_id, period_key)`（WP20-2 的 schema）定义，
+  放在 WP20-1 会先冻一个没有消费者的形状。→ 归 WP20-2/WP20-3。
+- **`policy-service.ts#trafficStart` 与 `capability-policy.ts#trafficWindowStart` 未改**：§3.1.3 的
+  收敛属 **WP20-6**。因此 **DoD 第 8 条在 WP20-1 交付后仍不满足**（别误判为回归）。
+- **无 schema 改动**：`grep -rn "enum .*Status" backend/prisma/schema.prisma` 数量不变 ⇒ DoD 第 7 条成立。
+- **未注册 cron、未新增依赖、未碰 docker/e2e 拓扑与 `worker.ts`**。
+
+**证据**
+
+```
+# 三时区逐字相等（DoD 3）：24 pass / 0 fail / 88 expect() calls，三次输出（剥离耗时）byte-identical
+for tz in UTC Asia/Shanghai America/Los_Angeles; do \
+  TZ=$tz bun test src/services/__tests__/v5-wp20/billing-time.test.ts; done
+# 类型：TMPDIR=/tmp bunx tsc --noEmit（在 backend/）→ exit 0
+```
+
+**DoD 覆盖矩阵（仅针对 WP20-1）**：第 3 条 ✅（真跑子进程，跑不起来即 FAIL，不 skip）；
+第 7 条 ✅（零 schema 改动）；第 8 条 ⏳ 属 WP20-6；第 1/2/4/5/6/9/10/11 条不适用（WP20-2 起）。
+
 ---
+
 
 ## 6. DoD
 
