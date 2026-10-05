@@ -2,7 +2,8 @@
 
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
 > （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）、
-> WP20-4（支付 → 发放接线 + 续期执行器）已交付**（§5.1–§5.4）。除这四处记录外，本契约其余部分仍**不含实现**。
+> WP20-4（支付 → 发放接线 + 续期执行器）、WP20-4b（套餐 ↔ 策略绑定入口）已交付**
+> （§5.1–§5.5）。除这五处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -322,6 +323,7 @@ worker 新增一个 tick。
 | **WP20-2** | 账本与归属 schema | ✅ **已交付**（2026-10-05，见 §5.2）：migration `20261031000000_v5_wp20_subscription_ledger`（`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`(nullable)）+ `UserPlan` 冻结注释 | WP20-1 |
 | **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | ✅ **已交付**（2026-10-05，见 §5.3）：`backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时 `45 * * * *`） | WP20-2 |
 | **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | ✅ **已交付**（2026-10-05，见 §5.4）：`policy-service.ts#grantPolicyFromPurchase` + `subscription-purchase.ts`（购买/续期共用实现）+ `routes/plans.ts` 事务内调用 + `invalidatePolicyCache`；并把续期执行器 `renewSubscriptionPeriod` 接上 | WP20-2 |
+| **WP20-4b** | 套餐 ↔ 策略绑定入口（WP20-4 的写入路径补完） | ✅ **已交付**（2026-10-05，见 §5.5）：`services/plan-subscription.ts` + 套餐 CRUD 的 `policy_id` + 只读选项端点 + 前端字段 | WP20-4 |
 | **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
 | **WP20-6** | 流量口径统一 | F13 两函数收敛到 `billing-time.ts`；`traffic_used_unattributed_federated`；`traffic_used` 读取路径切换 | WP20-1（可与 20-3 并行） |
 | **WP20-7** | （条件）流量倍率 | 仅当 O3 选 B 时立项，需独立契约补充 + Gate 断言 | O3 拍板 |
@@ -634,15 +636,75 @@ prisma validate / migrate diff                       → valid / 迁移语句与
 
 ---
 
+### 5.5 WP20-4b 落地记录 —— 套餐 ↔ 策略绑定入口（2026-10-05）
+
+> **为什么补一个 4b**：WP20-4 落了 `Plan.policy_id` 与购买时的发放分支，但**没有任何写入路径**能设它
+> ⇒「套餐 → `purchase` 发放」在真实系统里**永远不会被触发**。本仓反复出现这一类缺陷
+> （能力写好了、没有任何写入方：`preferred_node_id`、`diag` 都栽在这里），所以本 WP 的验收标准
+> 由 Lead 明确为「**能真的绑上，并且绑上之后发放分支被触发**」，而不是「CRUD 返回 200」。
+
+**交付物**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/src/services/plan-subscription.ts` | 新增：`parsePlanPolicyBinding`（纯）/ `resolvePlanPolicyBinding`（校验）/ `listBindablePolicies`（选项） |
+| `backend/src/routes/admin-extended.ts` | 套餐 CRUD 的 POST/PATCH 解析 `body.policy_id`；新增只读 `GET /plan-policy-options`；套餐读投影 `include` 出 `policy` 摘要 |
+| `backend/src/services/__tests__/v5-wp20/plan-policy-binding.test.ts` | 14 条断言，含**端到端那条**（D 组） |
+| `web/src/lib/types.ts` / `web/src/lib/api.ts` / `web/src/components/admin/plans-manager.tsx` | 前端字段与选项加载（写路径的最后一环） |
+
+**范围偏差（记录，不静默）**：Lead 授权写 `backend/src/routes/admin.ts`，但**套餐 CRUD 实际在
+`routes/admin-extended.ts`**（`admin.ts` 只有 `/plan/stats`）。改的是真实位置。
+
+**校验口径（与发放语义同一真相）**
+
+1. **策略未启用 ⇒ 拒绝**。`capability-policy.ts#isAssignmentActive` 要求 `policy.status === "active"`：
+   绑一条未启用的策略 = 用户付了钱、拿到一条**永远不生效**的发放（静默 no-op）。要卖它，先启用。
+2. **`is_ceiling` 模板 ⇒ 拒绝**。它是「所有 workspace 的绝对上界，不直接发放」；允许绑定等于把一个商品
+   卖成一份『上限』而不是一份『权益』。
+3. **部分更新语义**：`undefined`（不带字段）= 不改动；`null`/`""` = **显式解绑**（绑错要能退回来）；
+   正整数/数字字符串 = 绑定；其它（0/负数/小数/非数字）⇒ 400 fail-closed。
+4. **UI 与校验同口径**：`GET /plan-policy-options` 只列「可绑」集合，与 `resolvePlanPolicyBinding`
+   的接受集合**逐项等价**（有断言：列出的必被接受、没列出的一定被拒）。否则就会出现
+   「UI 能选、保存 400」这种最招人烦的形态。
+
+**前端两处实现细节（都有反例）**
+
+- 「不绑定」的 Select 值是哨兵 `"none"` 而**不是空串**：Radix 的 `<Select.Item value="">` 会直接抛错。
+  到 payload 才映射成 `null`（且**显式发送** null —— 省略等于「不改动」，语义完全不同）。
+- 编辑一个「绑了已停用策略」的套餐时，该策略不在可绑集合里；表单把它**补进选项**并标注不可绑，
+  否则 Select 显示为空、管理员一保存就把绑定悄悄清掉。
+
+**验收证据（本 WP 的核心）**
+
+```
+bun test src/services/__tests__/v5-wp20/plan-policy-binding.test.ts → 14 pass / 0 fail / 44 expect()
+  D 组「能真的绑上，且绑上之后发放分支被触发」：
+    ① 管理端提交 policy_id → resolvePlanPolicyBinding 给出 bind（policy_id 一路贯通）
+    ② 未绑定套餐 → 同一段 applyPlanPurchase 返回 granted=false / plan_policy_unbound
+    ③ 绑定套餐 → 真实 applyPlanPurchase 走完，purchase 发放的 policy_id=8、
+       且 expires_at 与订阅到期点**同源**
+  E 组静态守卫：POST 与 PATCH 各一次解析 `body.policy_id`；选项端点存在；前端确实发出 `policy_id`
+```
+
+**DoD 影响**：不新增 DoD 条目；它补的是「G7.2 / DoD 6 的到期语义在真实系统里可发生」的前提 ——
+在此之前，即使 WP20-4 全绿，生产里也不会有任何一条 `purchase` 发放被创建。
+
+**未决**：批量导入 / CLI 绑定入口（复用同一 `resolvePlanPolicyBinding` 即可，无需新语义）；
+策略被停用后**已绑定**的套餐会静默失去发放（这是「停用策略」的既有语义，不是本 WP 引入的），
+运营侧需要一条「哪些套餐绑了停用策略」的巡检 —— 可作为 `attention` 的后续条目。
+
+---
+
 ## 7. Gate 映射（`scripts/v3-e2e/`）与时间夹具
 
-### 7.1 新增 Gate `v5-g6.py`（Billing Runtime Gate）
+### 7.1 新增 Gate `v5-g7.py`（Billing Runtime Gate）
 
-> **命名冲突（2026-10-05 实测，需 Lead 拍板）**：`scripts/v3-e2e/v5-g6.py` 这个文件已被
-> **WP17.5 的 DDNS 前门门禁**占用（其 docstring 第一行即「V5-G6 gate — DDNS 前门」）。
-> 因此本节的断言编号 `G6.1..G6.10` 与文件名**都不能照抄落地**。本 WP（WP20）**没有改任何门禁**
-> （不改他人文件名、不改冻结的断言编号），只记录事实：落地时应改为 `v5-g7.py` + `G7.x`，
-> 或由 Lead 指定其它编号 —— 这与 DoD 第 10 条（不改既有门禁断言）同向。
+> **编号裁决（Lead 2026-10-05 拍板）：本门禁的文件名是 `v5-g7.py`、断言编号是 `G7.x`。**
+> 本节标题与下文表格里遗留的 `v5-g6.py` / `G6.x` 字样一律按此替换。
+> 冲突事实：`scripts/v3-e2e/v5-g6.py` 已被 **WP17.5 的 DDNS 前门门禁**占用
+> （其 docstring 第一行即「V5-G6 gate — DDNS 前门」），且那个门禁已在真拓扑上跑过并产出证据、
+> **不可改名**（改名会让既有证据指不到文件）。因此 `G6.1..G6.10` 这些编号**不能照抄落地**。
+> 本 WP（WP20）**没有改任何门禁**（不改他人文件名、不改已冻结的断言编号）。
 
 | 断言 | 内容 | 依赖的真实证据 |
 |---|---|---|

@@ -827,6 +827,14 @@ export const api = {
       patch<NodeGroup>(`/admin/node-groups/${id}`, input, cookie),
     removeNodeGroup: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/node-groups/${id}`, cookie),
     plans: (query?: ListQuery, cookie?: string) => get<Paginated<Plan>>("/admin/plans", query, cookie),
+    /// V5-WP20-4b：套餐表单的「绑定策略」下拉只用可绑集合（后端同一口径：
+    /// 启用中且非平台上限模板），避免"UI 能选、保存 400"。
+    planPolicyOptions: (cookie?: string) =>
+      get<{ id: number; key: string; name: string; status: string; is_ceiling: boolean }[]>(
+        "/admin/plan-policy-options",
+        undefined,
+        cookie,
+      ),
     createPlan: (input: PlanInput, cookie?: string) => post<Plan>("/admin/plans", input, cookie),
     updatePlan: (id: number, input: Partial<PlanInput>, cookie?: string) =>
       patch<Plan>(`/admin/plans/${id}`, input, cookie),

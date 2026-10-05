@@ -477,6 +477,10 @@ export interface Plan {
   renewable: boolean;
   stock: number | null;
   order_by: number;
+  /// V5-WP20-4b：套餐 → 能力策略的显式绑定。NULL = 未绑定（购买时不发放 purchase 发放）。
+  policy_id?: ID | null;
+  /// 管理端读投影：绑定的策略摘要（列表/保存响应里由后端 `include` 带出）。
+  policy?: { id: ID; key: string; name: string; status: Status; is_ceiling: boolean } | null;
   created_at: string;
   updated_at: string;
   node_groups?: Pick<NodeGroup, "id" | "name">[];
@@ -877,6 +881,8 @@ export interface PlanInput {
   allow_custom_out_node_group: boolean;
   all_in_node_groups: boolean;
   all_out_node_groups: boolean;
+  /// V5-WP20-4b：`null` = 显式解绑；`undefined`（不传）= 不改动（PATCH 部分更新语义）。
+  policy_id?: ID | null;
 }
 
 /** 管理端：节点组新建/编辑 */
