@@ -1,11 +1,10 @@
-# TuneX v3 Real Integration Gate（WP14）
+# TuneX Real Integration Gate
 
-这个目录是 TuneX 当前 **WP14 真实网络发布 Gate**。它不是只搭拓扑的历史 harness：
-`.github/workflows/integration.yml` 会在 PR 和 main CI 之后实际执行
-`setup.sh → verify.sh → teardown.sh`，失败会阻断 Integration。
+这个目录承载 TuneX 的真实网络 Integration Gate。`.github/workflows/integration.yml`
+在 PR 上运行基础真实拓扑 + 协议回归，在 main 上运行完整历史回归；失败会阻断后续发布。
 
-WP14 已完成。当前 main 的 DIRECT / RELAY 都使用 v3 runtime，WP15 也已经删除
-legacy DIRECT engine。
+当前 DIRECT / RELAY 使用统一 runtime。这里的脚本验证真实容器、真实 Agent、真实 API
+与真实数据链路，不以 mock 或直接写数据库代替产品行为。
 
 ---
 
@@ -128,7 +127,7 @@ Panel 只接控制网，从网络结构上无法直接访问 Agent 数据监听�
 | `verify.sh` | 当前正式 T0–T8 Gate |
 | `teardown.sh` | 销毁 wp14-e2e 自己的容器、网络、卷和可选镜像 |
 | `_bootstrap.py` | 只通过真实 HTTP API provision 测试对象 |
-| `fixtures/` | 静态测试输入 |
+| `fixtures/` | 静态输入：`topology.json`、`workspaces.json`、`tunnels.json`、`forward-edit.json` 与历史 Gate fixture |
 | `backend/tests/v3-e2e/` | 可复用 E2E harness 与 DIRECT/RELAY 断言代码 |
 
 CI 的正式发布 Gate 以 `scripts/v3-e2e/verify.sh` 为准；`backend/tests/v3-e2e/*.mjs`
@@ -154,21 +153,25 @@ CI 的正式发布 Gate 以 `scripts/v3-e2e/verify.sh` 为准；`backend/tests/v
 
 ---
 
-## 6. WP14 与后续能力的边界
+## 6. 当前覆盖与边界
 
-早期 WP14 文档曾把 weighted target、hot update、change Egress、backup/restore 等
-全部列为同一个 Gate。项目实现后已经重新收敛边界：
+`verify.sh` 保留基础 DIRECT / RELAY 的 T0–T8 基线；V4/V5 Gate 在同一真实拓扑上继续验证
+协议、路由、高可用、联邦和产品运行时，避免出现第二套“只在 mock 中成立”的真相。
 
-- **WP14**：验证当前默认公开的 TCP DIRECT/RELAY、outbound-only 控制、恢复、权限、
-  lease 和 Reconciler 能作为一个整体真实运行。
-- **WP15**：删除 legacy DIRECT engine，让 DIRECT/RELAY 统一到 v3 runtime；已完成。
-- **高级数据面能力**（advanced LB、UDP、WS/TLS、QUIC、HA、failover、multi-hop）：
-  进入 WP16+，各自增加 contract + tests + real E2E。
-- **backup/restore/rollback**：由 `scripts/ops/` 和生产部署演练负责，不和网络数据面
-  Gate 混成一个无法定位责任的测试包。
+当前 main 已覆盖：
 
-不要通过放宽 `verify.sh`、把失败改成 skip、或直接写数据库状态来“修绿” Integration。
-Gate 的意义就是证明真实控制链和真实 TCP 链路仍然成立。
+- TCP DIRECT / RELAY 基线；
+- TLS / WebSocket；
+- UDP DIRECT 与单跳 UDP RELAY；
+- target health、HA / failover / failback；
+- multi-hop；
+- Federation；
+- DDNS、订阅计费等后续 Gate。
+
+QUIC、跨面板 UDP、多跳 UDP、UDP hop encryption 等仍按冻结契约 fail-closed，不应通过
+修改 Gate 或删除断言来“开放”。
+
+backup / restore / rollback 属于 `scripts/ops/` 的生产运维链，不与网络数据面 Gate 混在一起。
 
 ---
 

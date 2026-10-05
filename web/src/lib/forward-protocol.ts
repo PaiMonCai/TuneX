@@ -37,9 +37,6 @@ export const DEFAULT_FORWARD_PROTOCOL: ForwardProtocol = "tcp";
 /** 需要节点本地证书/私钥路径的协议。 */
 export const TLS_FORWARD_PROTOCOL: ForwardProtocol = "tls";
 
-/** 报文（无连接）协议。V5.1b 第一位成员。 */
-export const UDP_FORWARD_PROTOCOL: ForwardProtocol = "udp";
-
 /**
  * 已开放的**传输**契约。与 `FORWARD_PROTOCOLS` 是两个维度：
  * protocol 回答「客户端说什么」，transport 回答「报文/字节在节点里怎么走」。
@@ -191,36 +188,11 @@ export function forwardProtocolLabel(value: unknown, legacy?: unknown): string {
  * 创建时可用的协议：只有契约值可用；历史值（`wss` / `quic` / `mtcp` …）**不能**被
  * 原样再创建（后端 `z.enum(FORWARD_PROTOCOLS)` 会 400），由调用方显式改选。
  *
- * 注意 `udp` 自 V5.1b 起**是**契约值 —— 它过去被当作「枚举里有、运行时没开放」的
- * 例子，那个例子现在换成 `quic`/`mtcp` 之类的值才算数。
+ * `udp` 是当前契约值；`quic` / `mtcp` 等历史值仍不可直接重新创建。
  */
 export function forwardProtocolForCreate(value: unknown): ForwardProtocol | null {
   const fact = forwardProtocolFact(value);
   return isForwardProtocol(fact) ? fact : null;
-}
-
-/**
- * 本版本（V5.1b B1）**只开放 udp 直连**：中继/出口上的 udp 会被运行时拒绝
- * （跨节点跳的形态是开放产品决策，未冻结）。
- *
- * 依据（不是前端自己发明的规则）：
- *   · `DEVELOPMENT.md` §6.2「实施边界（B1）」——「只做 UDP DIRECT。`udp` 在
- *     EGRESS/RELAY 上必须被**拒绝**并给出明确错误，而不是半实现」；
- *   · Agent 侧同一个边界已经落地：`agent/internal/forwarder/interface.go` 的
- *     `TunnelConfig.Validate()` 对 `ProtocolUDP && (ModeEgress || ModeRelay)` 返回
- *     「udp is a DIRECT-only datagram front in this build」。
- *
- * 返回 i18n key（与 {@link tlsPathFieldErrors} 同一形态）。**只用于告警，不用于禁用
- * 提交**：拒绝的执行点是后端/运行时，面板在这里自己拦下来就等于把一个产品规则
- * 变成「只有界面知道」的第二份真相（接口调用不会经过它）。等后端在 create/preview
- * 上也拒绝之后，这条告警应该被后端的错误码取代。
- */
-export function datagramRelayBoundaryKey(
-  protocol: ForwardProtocolFact,
-  mode: "direct" | "relay" | string | null | undefined,
-): string | null {
-  if (forwardProtocolFact(protocol) !== UDP_FORWARD_PROTOCOL) return null;
-  return mode === "relay" ? "forward.udpRelayUnsupported" : null;
 }
 
 /* ================================================================== */

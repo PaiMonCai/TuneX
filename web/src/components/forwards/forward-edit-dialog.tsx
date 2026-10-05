@@ -35,7 +35,6 @@ import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-bad
 import {
   FORWARD_TLS_PATH_MAX,
   TLS_FORWARD_PROTOCOL,
-  datagramRelayBoundaryKey,
   forwardProtocolFact,
   forwardProtocolNote,
   forwardProtocolPatchFields,
@@ -257,9 +256,6 @@ export function ForwardEditDialog({
    * 措辞：那种行根本不会被下发（preview 会先拒绝），措辞不可能被用户看到。
    */
   const datagram = forwardTransportFor(forward.protocol) === "datagram";
-  /** udp 在本版本只开放直连：中继会被运行时拒绝，这里只**告警**（见 lib 注释）。 */
-  const datagramRelayWarningKey = datagramRelayBoundaryKey(forward.protocol, draft.mode);
-
   // 打开时重置草稿；forward 变化（刷新后）也重置，避免拿旧草稿覆盖别人保存。
   useEffect(() => {
     if (open) {
@@ -635,23 +631,6 @@ export function ForwardEditDialog({
                   />
                 </Field>
               </>
-            ) : null}
-
-            {/*
-              V5.1b B1：udp 在本版本只开放直连，中继/出口上的 udp 会被运行时拒绝
-              （§6.2 实施边界）。这里是**告警**而不是禁用提交：拒绝的执行点在后端与
-              运行时，面板自己拦下来会让「接口可用、界面不可用」，那是第二份真相。
-            */}
-            {datagramRelayWarningKey ? (
-              <div
-                data-testid="forward-datagram-relay-warning"
-                className="rounded-md border border-[var(--warning,var(--border))]/40 bg-[var(--muted)]/40 p-3 text-xs sm:col-span-2"
-              >
-                <div className="flex items-start gap-2">
-                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-                  <span>{t(datagramRelayWarningKey)}</span>
-                </div>
-              </div>
             ) : null}
 
             {/*

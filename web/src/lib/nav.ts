@@ -3,37 +3,16 @@ import { getDictionary } from "@/lib/i18n";
 import type { IconKey } from "@/components/nav-icon";
 
 /**
- * 控制台导航模型（V5-WP13.5A，DEVELOPMENT.md §9.4.1）。
+ * User / Admin Console 导航模型。
  *
- * 产品表面正式拆成两个控制台，共享组件库与视觉 token，但导航边界与信息密度分别设计：
- *
- * ~~~text
- * User Console                    Admin Console
- *   Overview                        Overview
- *   Forwards                        Infrastructure (Nodes / Node Groups / Capacity·Health)
- *   Routes / 可用线路                Network (Forwards / Route Profiles / Targets·Diagnostics)
- *   Billing                          Users / Workspaces / Permissions
- *   Support                          Commerce
- *   Settings                         Operations
- *                                    Federation
- *                                    System
- * ~~~
- *
- * 硬性约束（不要为了「整齐」破坏它们）：
- * 1. **route group 不产生 URL 段**：`(user)` / `(admin)` / `(auth)` 只是目录组织，
- *    `/dashboard`、`/admin/nodes`、`/login` 等对外 URL 一字不改（见 `CONSOLE_ROUTE_GROUPS`）。
- * 2. **Federation / trust / grant / remote lease / audit 等内部概念只进 Admin Console**；
- *    普通用户只看到「线路是否可用、延迟、流量、套餐、可行动错误」。
- * 3. 这里只描述「界面入口」，**不是授权**：真正的 RBAC / workspace scope 真相在后端。
- *    前端 guard 仅负责 UX（见 `components/console/console-guard.ts`）。
- * 4. `items` 里只能放可序列化字段（href / labelKey / iconKey 字符串）：`Sidebar` 是客户端组件，
- *    服务端组件不能把 React 组件当 props 传过去（传组件函数会直接 500）。
+ * Route group 不改变外部 URL；内部运维概念只进入 Admin Console。
+ * 本文件只定义界面入口，不承担 RBAC；导航项必须保持可序列化。
  */
 
 /** 控制台标识 */
 export type ConsoleId = "user" | "admin";
 
-/** 产品表面：两个控制台 + 认证页 + 无壳页面（`/` 落地页等） */
+/** 产品表面：两个控制台、认证页和公共页面。 */
 export type ConsoleSurface = ConsoleId | "auth" | "public";
 
 export interface NavItem {
@@ -44,10 +23,7 @@ export interface NavItem {
   /** 新增项的回退文案（词典尚未收录时的中文 / 英文） */
   labelZh?: string;
   labelEn?: string;
-  /**
-   * `"planned"` = §9.4.1 已冻结、但页面尚未落位（WP13.5B 线路编辑页 / V5.5 Federation）。
-   * 这类项在侧栏渲染为**禁用项**，绝不产生 404 链接，点击不导航。
-   */
+  /** 尚未交付的页面以禁用项展示，不产生可点击链接。 */
   status?: "available" | "planned";
   /** 仅在 NEXT_PUBLIC_PAYMENTS_ENABLED=true 时进入可导航列表（保留既有 billing gate 语义） */
   requiresPayments?: boolean;
@@ -72,11 +48,11 @@ export const CONSOLE_ROUTE_GROUPS: Record<ConsoleSurface, string> = {
   user: "(user)",
   admin: "(admin)",
   auth: "(auth)",
-  /** `.` = 不在任何 route group 内（根布局下的独立页面，如 `/` 落地页） */
+  /** `.` = 根布局下的公共页面。 */
   public: ".",
 };
 
-/** 认证页（(auth) group）：未登录可用，已登录访问也不重定向（不改变既有行为） */
+/** 认证页路径。 */
 export const AUTH_PATHS: readonly string[] = [
   "/login",
   "/register",
@@ -112,14 +88,7 @@ export const INTERNAL_CONCEPT_PREFIXES: readonly string[] = [
 /* User Console（§9.4.1）                                                      */
 /* -------------------------------------------------------------------------- */
 
-/**
- * 普通用户控制台导航。
- *
- * `/nodes` 是 **workspace 级** UserNode 注册页（`node:read` / `node:manage` 权限，
- * 见 `components/nodes/node-workspace.tsx`），不是 Admin 的 raw node ops（那是 `/admin/nodes`）。
- * §9.4.1 的「Routes / 可用线路」在第一阶段由它承载；WP13.5B 的线路模板页（`/routes`）落地后
- * 由 `planned` 项接管。无论怎么调整入口，**对外 URL 不变**。
- */
+/** 普通用户控制台导航。/nodes 是 workspace 级节点入口，不是 Admin 节点运维页。 */
 export const userConsoleNav: NavGroup[] = [
   {
     id: "overview",
@@ -144,10 +113,7 @@ export const userConsoleNav: NavGroup[] = [
     items: [
       { href: "/nodes", labelKey: "common.nodes", iconKey: "nodes" },
       {
-        /**
-         * 用户侧只叫「可用线路」：`模板 / Route Profile` 是编排侧的词，
-         * 出现在 User Console 就是内部概念泄漏（有回归测试守着）。
-         */
+        /** 用户侧使用“可用线路”，不暴露 Route Profile 编排术语。 */
         href: "/routes",
         labelKey: "common.routes",
         labelZh: "可用线路",
@@ -180,7 +146,6 @@ export const userConsoleNav: NavGroup[] = [
     labelEn: "Settings",
     items: [
       { href: "/settings", labelKey: "common.settings", iconKey: "settings" },
-      // TEN-01：团队空间成员管理（与「设置」同级，切换器下拉亦可进入）
       { href: "/settings/workspace", labelKey: "common.workspace", iconKey: "workspace" },
     ],
   },
@@ -190,12 +155,7 @@ export const userConsoleNav: NavGroup[] = [
 /* Admin Console（§9.4.1）                                                     */
 /* -------------------------------------------------------------------------- */
 
-/**
- * 管理控制台导航，分组顺序与 §9.4.1 一致。
- *
- * Federation 分组从第一天就只落在 Admin Console（V5.5 才落页面，故本期为 `planned` 禁用项）：
- * 这样「Federation 不向普通用户暴露」是**结构上**成立的，而不是靠后续人工小心。
- */
+/** 管理控制台导航；Federation 等内部能力只存在于这里。 */
 export const adminConsoleNav: NavGroup[] = [
   {
     id: "overview",
@@ -282,12 +242,6 @@ export const adminConsoleNav: NavGroup[] = [
     labelEn: "Operations",
     items: [
       { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
-      // V5-WP18.5：平台公告（写给所有人的内容）。挂"运营"而非"系统"：它是内容/沟通，与工单同类。
-      //
-      // `planned` 在 WP18.5 是**过渡态**（页面已落，但资源键未登记 ⇒ 非超管点进去只有 403）；
-      // WP18.6 登记了 `announcements` 资源键，因此这里**放开为可导航**，两件事在同一个 WP 里收口。
-      // 闭环由 `backend/tests/v5-wp18-announcement-rbac.test.mjs` 的最后一组断言钉住
-      // （菜单项 ↔ 资源键 url ↔ 页面文件三者指向同一路径）。
       { href: "/admin/announcements", labelKey: "admin.announcements", iconKey: "announcements" },
       { href: "/admin/audit-logs", labelKey: "admin.auditLogs", iconKey: "license" },
       {
@@ -305,11 +259,7 @@ export const adminConsoleNav: NavGroup[] = [
     labelKey: "console.group.federation",
     labelZh: "联邦",
     labelEn: "Federation",
-    /**
-     * V5.5 落地后整组都是**真页面**（`(admin)/admin/federation/*`，消费真实后端 API）。
-     * 这组从第一天起就只属于 Admin Console：User Console 的结构里没有它的位置，
-     * 用户侧文案也不允许出现 trust / grant / lease / epoch（有回归测试守着）。
-     */
+    /** Federation 只属于 Admin Console。 */
     items: [
       {
         href: "/admin/federation",

@@ -1,26 +1,14 @@
 import type { ConsoleSurface } from "@/lib/nav";
 
 /**
- * 前端控制台边界规则（V5-WP13.5A §9.4.1 要求 3）。
- *
- * **这里的每一条都只是 UX，不是授权。**
- * 真正的 RBAC / workspace scope 真相在后端：
- * - `/api/admin/*` 由后端校验 `super_admin` 或后台角色（`admin_roles`）；
- * - workspace 资源由后端按 `node:read` / `node:manage` 等权限裁剪。
- *
- * 为什么前端**不能**按 `super_admin` 做重定向：
- * `/api/auth/me` 只返回 `super_admin`，不返回 `admin_roles`（见 backend/src/routes/auth.ts
- * 的 `publicUser()`），而后端存在「有后台角色的 admin」（`services/audit.ts` 的
- * `classifyActor()` 明确区分 `super_admin` 与 `admin`）。
- * 若前端用 `super_admin === false` 把用户踢回 `/dashboard`，就会误伤这些合法的角色管理员，
- * 把「前端猜测」变成事实上的授权判定 —— 正是 §9.4.1 禁止的方向。
- * 因此：前端只做「未登录 → /login」，其余交给后端。
+ * 前端 guard 只处理登录态，不承担授权。
+ * `/api/auth/me` 无法完整表达后台角色，因此 Admin Console 是否可访问必须由后端 RBAC 判定。
  */
 
-/** 未登录时的落点（既有行为） */
+/** 未登录时的落点。 */
 export const LOGIN_PATH = "/login";
 
-/** 用户端首页（管理端「返回用户端」入口） */
+/** 用户端首页。 */
 export const USER_HOME_PATH = "/dashboard";
 
 export type GuardDecision =

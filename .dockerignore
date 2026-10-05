@@ -6,7 +6,6 @@
 !.env.example
 !.env.production.example
 var/
-reports/
 backups/
 .admin-credentials
 
@@ -19,7 +18,6 @@ agent/dist/
 # Unified app image only needs backend + web source trees
 docs/
 scripts/
-mysql-init/
 Caddyfile
 Caddyfile.prod
 docker-compose*.yaml

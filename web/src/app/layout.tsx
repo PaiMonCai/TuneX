@@ -6,10 +6,7 @@ import { WorkspaceProvider } from "@/components/workspace/workspace-context";
 import { Toaster } from "sonner";
 import "./globals.css";
 
-/**
- * 元信息跟随语言 cookie：`<title>` / description 在 SSR 阶段就按 tunex_locale 输出，
- * 与页面正文语言保持一致（curl 带 Cookie 即可验证中英切换）。
- */
+/** 元信息跟随语言 cookie，在 SSR 阶段与页面正文保持一致。 */
 export async function generateMetadata(): Promise<Metadata> {
   const store = await cookies();
   const locale = normalizeLocale(store.get(LOCALE_COOKIE)?.value);
@@ -18,8 +15,8 @@ export async function generateMetadata(): Promise<Metadata> {
     title: { default: `TuneX — ${dict.common.tagline}`, template: "%s · TuneX" },
     description:
       locale === "zh"
-        ? "TuneX：多协议隧道、节点组编排、流量计费。"
-        : "TuneX: multi-protocol tunnels, node groups and usage-based billing.",
+        ? "TuneX：多协议网络转发、线路编排与流量计费。"
+        : "TuneX: multi-protocol forwarding, route orchestration and usage-based billing.",
     applicationName: "TuneX",
   };
 }
@@ -33,13 +30,7 @@ export const viewport: Viewport = {
   ],
 };
 
-/**
- * 根布局（服务端组件）。
- *
- * - `<html lang>` 与词典都由 tunex_locale cookie 决定 → 中英切换体现在 SSR 输出里；
- * - `suppressHydrationWarning` 是 next-themes（class 策略暗色模式）在 <html> 上注入 class 所必需的；
- * - Toaster 全局只挂载一次，AppShell 内不再重复挂载（避免重复弹窗）。
- */
+/** 根布局：语言、主题 Provider、workspace 上下文和全局 Toaster。 */
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const store = await cookies();
   const locale = normalizeLocale(store.get(LOCALE_COOKIE)?.value);
@@ -49,7 +40,6 @@ export default async function RootLayout({ children }: { children: React.ReactNo
     <html lang={locale === "zh" ? "zh-CN" : "en"} suppressHydrationWarning>
       <body className="min-h-screen bg-[var(--background)] text-[var(--foreground)] antialiased">
         <AppProviders locale={locale} dict={dict}>
-          {/* TEN-01：workspace 上下文挂在根布局，让顶栏切换器、成员页、邀请弹窗共享同一份状态 */}
           <WorkspaceProvider>{children}</WorkspaceProvider>
           <Toaster richColors position="top-center" />
         </AppProviders>

@@ -36,7 +36,7 @@ export default async function RouteProfilesPage() {
         "Reusable, versioned routing intent (no runtime state machine)",
       )}
       adminMode
-      showToaster={false}
+     
     >
       <Suspense fallback={<div className="h-64 animate-pulse rounded-lg bg-[var(--muted)]" />}>
         <RouteProfilesBody locale={locale} />

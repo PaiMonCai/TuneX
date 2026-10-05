@@ -16,9 +16,8 @@
  *  - plan.bandwidth_limit  : Mbps（10 / 100 / 500）
  *  - plan.max_tunnels      : 条
  *
- * 依据: db_schema_report.md §3.1（config 枚举）、
- *       auth-rbac-source-verification-report.md、
- *       reports/reference-schema.sql（plan / node_group / node / plan_node_group）
+ * Schema truth is `backend/prisma/schema.prisma` + migrations; this seed only
+ * supplies idempotent defaults and demo/bootstrap records.
  */
 import { db } from "../src/db.ts";
 import { createPersonalWorkspace, ensurePersonalWorkspace } from "../src/services/workspace.ts";

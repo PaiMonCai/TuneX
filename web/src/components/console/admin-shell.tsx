@@ -5,18 +5,8 @@ import { adminAccessState } from "@/components/console/console-guard";
 import { visibleNavGroups } from "@/lib/nav";
 
 /**
- * AdminShell —— 管理控制台外壳（服务端组件，V5-WP13.5A §9.4.1）。
- *
- * 与 `UserShell` 分离，信息密度明显更高：
- * - 侧栏更宽（w-64）、导航按 §9.4.1 分八组（Infrastructure / Network / … / Federation / System）；
- * - topbar 常驻 ADMIN 标识与环境徽章，去掉面向用户的 workspace 切换器；
- * - 内容区更宽（max-w-[1800px]）且纵向更紧凑 —— 管理页是「扫表 + 就地编辑」场景。
- *
- * Federation / trust / grant / remote lease / audit / license 等内部概念只在这里出现；
- * 管理端页面可以展开 revision / lease / Agent ACK / diagnostics（§9.4.7）。
- *
- * `data-admin-access` 只表达「前端能否判定超管」（`super_admin` / `delegated`），
- * **不做任何拦截**：授权真相在后端 RBAC（见 console-guard.ts 文件头说明）。
+ * 管理控制台外壳。管理端允许展示 revision / lease / Agent ACK / diagnostics 等内部事实；
+ * `data-admin-access` 仅用于展示和诊断，授权真相始终在后端 RBAC。
  */
 export async function AdminShell({
   titleKey,

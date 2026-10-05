@@ -1,12 +1,12 @@
-# TuneX V5 开发执行规范（Agent Handoff）
+# TuneX 开发执行规范（V5 Frozen Baseline / V1 Productization）
 
-> **文档地位：本文件是 V5 唯一可执行开发方案。**
+> **文档地位：本文件是当前工程执行与产品化收口的主入口。**
 >
-> 本文件面向将直接在仓库中编码、测试、提交、开 PR 的开发 Agent。它不是历史复盘，也不是产品宣传。
-> 任何 Agent 接手 V5 时，应优先遵守本文件；若本文与旧 V3/V4 过程文档冲突，以当前 main 代码事实、
-> 本文的 V4 frozen baseline 与最新已合并迁移为准。
+> V5 已作为能力基线冻结；当前工作目标是 TuneX V1 / Production Beta。历史章节用于解释仍需保持的
+> 协议、迁移和 Gate 不变量，当前优先级与下一步统一看 §17。若历史过程描述与当前 main 代码事实冲突，
+> 以当前代码、迁移、冻结契约和最新 Gate 为准。
 >
-> **不要再创建第二份 V5 路线图。** 设计决策、阶段状态、Gate 与下一步都更新在这里。
+> **不要为同一能力再创建第二套路由图、状态机或路线图。**
 
 ---
 
@@ -16,15 +16,16 @@
 
 ### 0.1 main 状态
 
-V4.5 已完成技术闭环，V4 功能范围冻结；V5-WP0 已进入 main。当前活动发布候选为 **PR #32 / `feature/v5-1b-udp-relay`**：V5.1–V5.5 主线与 WP17–WP21 的交付正在一次性收口。历史 Gate 证据已覆盖 G0/G1A/G1B/G2/G3/G4/G5/G6/G7；PR 合并前仍以“最终 head 的 Source CI + PR fast Integration 全绿”为放行条件。
+V4.5 已完成技术闭环，V4 功能范围冻结。V5 主线与 WP17–WP21 已通过 PR #32 合入 `main`，merge commit 为 `8d0ac83`。该提交已通过 Source CI、完整 Integration、Unified Image 与 Release。项目从“能力扩展”切换为 **V1 产品化整理阶段**：优先收口用户体验、产品表面、仓库结构、发布一致性与安全评审，不再以新增 WP 数量衡量进度。
 
-已验证发布链：
+当前 V1 产品化基线：
 
 ~~~text
-CI #493           success
-Integration #139  success
-Release #30       success
-V4-F5             PASS=133 / FAIL=0
+main              8d0ac83
+Source CI         success
+Full Integration  success
+Unified Image     success
+Release           success
 ~~~
 
 V4 发布证据与历史细节不再重复写入本文件，统一查阅：
@@ -35,7 +36,7 @@ V4 发布证据与历史细节不再重复写入本文件，统一查阅：
 - docs/production-deploy.md —— 生产部署与运维；
 - scripts/v3-e2e/evidence/ —— Integration Gate 证据。
 
-### 0.2 V5-WP0 已进入 main：禁止重做
+### 0.2 冻结基线：禁止重复实现
 
 `feature/v5-wp0-contract` 已通过 PR #29 合入 `main`（合并提交 `61a8615`）。
 旧的候选分支引用（`b34cd9b` / CI #512）已失效，**不要**再去拉那条分支。
@@ -54,19 +55,19 @@ WP0 落地内容（已冻结，改动它等于破坏 V5.0 契约）：
 - unsupported_protocol 前端可行动错误文案；
 - WP0 合入时未实现 UDP / TLS / WS / QUIC；**这是 WP0 的历史冻结点，不是当前能力状态**。后续 V5.1 已实现 TLS / WS / UDP（含单跳 UDP RELAY），QUIC 仍关闭。
 
-**接手 Agent 的第一件事不是重做 WP0，而是确认它仍在 main 上生效。**
+**接手新工作的第一件事是确认现有能力是否已经存在，并确认不会制造第二套实现。**
 
-当前接手点：**PR #32 merge closure / 产品化收口**。Console Split、Route Profile、Federation、DDNS、公告/通知基础、延迟观测、订阅计费与安装器均已进入代码；不要按旧章节标题重复实现已经交付的 WP。当前真实缺口与下一步统一看 §17。
+当前接手点：**V1 产品化整理 / Production Beta 准备**。Console Split、Route Profile、Federation、DDNS、公告/通知基础、延迟观测、订阅计费与安装器均已进入代码；不要按旧章节标题重复实现已经交付的 WP。当前真实缺口与下一步统一看 §17。
 
-接手新工作前的固定动作（§3.2）：
+接手新工作前：
 
-1. 拉取最新 main，确认 WP0 的契约文件仍在；
-2. 阅读本 WP 相关现有代码与测试；
-3. 搜索是否已经存在同名/同义实现（V5-WP1 已落地，不要重做协商层）；
-4. 写出当前事实与目标差异；
-5. 只在确认「没有第二套实现」后开始修改。
+1. 从最新 main 开始；
+2. 先读现有代码、测试、契约和当前产品表面；
+3. 搜索同名/同义实现，确认没有第二套真相；
+4. 写清“当前事实 → 用户/工程缺口”再修改；
+5. 每次改动保持小批、可回滚，并让对应 CI / Gate 证明没有破坏冻结基线。
 
-不允许复制粘贴已有 WP 的代码到另一条新分支制造双实现。
+不允许复制已有实现到另一条新路径制造双实现。
 
 ---
 
@@ -1739,7 +1740,7 @@ B1 期间"RELAY 必须被拒绝"是那一步的通过条件，B2 会**同时**�
 > **翻转面比 UDP 大**：开 QUIC 要同批改 G0.5/G0.7 + 5 个 backend 测试 + 3 个 agent 测试
 > + web 的「未开放协议」渲染/复制断言。
 
-QUIC 只有 UDP Gate 全绿后开始（**该条件已满足：G1B = 76/0**；现在的阻塞是上面的依赖决策）。
+QUIC 只有 UDP Gate 全绿后开始（**该条件已满足：最终 G1B = 77/0**；现在的阻塞是上面的依赖决策）。
 
 ### 强制先冻结
 
@@ -3114,59 +3115,48 @@ Known Boundaries:
 # 17. 当前下一步
 
 ~~~text
-历史已验证能力（2026-10-05）：
-V5.0   G0  = 137/0
-V5.1a  G1A = 73/0
-V5.1b  G1B = 77/0（UDP DIRECT + 单跳 UDP RELAY；独立拓扑证据）
-V5.2   G2  = 23/0
-V5.3   G3  = 50/0
-V5.4   G4  = 25/0
-V5.5   G5  = 206/0（连跑两遍逐行一致）
-V5.6   G6  = 72/0（DDNS / ingress placement）
-WP20   G7  = 33/0（订阅计费运行时）
+V1 产品化基线（2026-10-05）：
+main merge     = 8d0ac83
+Source CI      = success
+Full Integration = success
+Unified Image  = success
+Release        = success
 
-PR #32 merge-closure 状态：
-- Source CI：最新已完成轮次全绿（backend / web / agent / race / secret / installer / perf）。
-- PR Fast Integration：baseline verify 已绿；G1B 暴露的是 CI harness 自包含问题，不是已确认的数据面回归：
-  ① host-run 环境没有历史 `g0-runner`；
-  ② internal Docker network 未显式填写 IPAM Gateway；
-  ③ G1B 单独运行时此前隐式依赖 G1A 留下的 byte-echo listener。
-- `dbebb2a` 已把 G1B 改成自包含：从运行中 Agent 反查实际 network/subnet 并推导 host bridge 地址，
-  同时由 G1B 自己启动 stream regression 的 echo target。最终 head 仍须重新跑绿后才能合并。
+历史能力 Gate：
+G0 137/0 · G1A 73/0 · G1B 77/0 · G2 23/0 · G3 50/0 ·
+G4 25/0 · G5 206/0 · G6 72/0 · G7 33/0
+~~~
 
-已经落地：
-- User / Admin / Auth Console Boundary + Route Profile；
-- TLS / WS / UDP DIRECT / UDP RELAY；
-- Target Intelligence、HA/fencing、自动 failover/failback、2/3-hop；
-- Federation 的 identity/trust/grant/remote lease/usage + 产品级 remote egress；
-- WP17 DDNS；
-- WP18 公告 + Email/Webhook/Telegram + 投递账本（事实触发器最后接线除外）；
-- WP19 diag / latency history / topology / Looking Glass（Web 历史图表除外）；
-- WP20 subscription billing runtime；
-- WP21 installer + production deploy docs + static/dry-run verification。
+当前阶段目标不是继续堆协议，而是把现有能力整理成可独立上线的 **TuneX V1 / Production Beta**。
 
-当前产品收口优先级：
-1. 让 PR #32 的最终 Source CI + Fast Integration 全绿并合并；
-2. 接完 WP18 Forward 拒绝/恢复事实通知 → 既有 worker reconcile 节拍；
-3. 补 WP19 延迟历史 Web 图表/产品展示；
-4. 把发布流水线继续演进为“Build once → test candidate artifact → promote same digest”，避免 Release 再次重建不同字节；
-5. Federation / Looking Glass 在宣称 production-ready 前做独立安全评审。
+产品整理优先级：
+
+1. **用户产品面**：普通用户只需要理解“线路（Route Profile）→ 转发（Forward）→ 流量 → 套餐”，
+   隐藏 revision / lease / placement epoch / runtime plan 等内部概念；
+2. **Admin Console**：整理 Node / NodeGroup / Route Profile / Forward / Plan / Announcement /
+   Diagnostics / Federation 的信息架构与操作层级；
+3. **WP18 收口**：把 Forward 拒绝/恢复事实通知正式接到既有 worker reconcile 节拍，不新增第二个 cron；
+4. **WP19 收口**：补延迟历史 Web 图表与必要的产品展示，Looking Glass 继续默认关闭；
+5. **发布一致性**：演进到 Build once → test candidate artifact → promote same digest；
+6. **Production Beta 演练**：干净机器安装 → 建 Node → 装 Agent → 建 Forward → 流量 →
+   upgrade → backup → rollback → restore；
+7. **安全评审**：Federation、Looking Glass、Webhook/Telegram、支付回调、Agent enrollment、RBAC。
+
+仓库整理规则：
+
+- 删除前必须证明“无引用 / 已被替代 / 不承担迁移、兼容、回滚、Gate 或安全职责”；
+- migrations、release/integration evidence、backup/restore/rollback、installer、兼容 shim、安全测试默认保留；
+- 删除一次性脚本、旧分支 handoff、失效 schema dump、被当前 E2E 体系替代的旧测试栈；
+- 注释只保留“不变量、边界、为什么不能这么改”；删除调试过程、历史踩坑叙事和可从代码直接读出的说明；
+- 清理改动仍必须通过 PR CI；不得为了“干净”弱化断言、删 Gate 或改兼容语义。
 
 明确仍不开放（fail-closed）：
+
 - QUIC；
 - UDP 分片重组、packets 计费、hop AEAD/MAC、跨面板 UDP 腿；
 - remote ingress 的产品级创建路径、remote transit、跨面板 3+ hop / arbitrary graph；
 - 跨面板自动 failover、tls remote egress、多 Panel 信任传递闭包；
 - 生产业务链上的主动带宽压测。
-~~~
-
-可执行硬约束：
-
-1. 不得再引入第二套路由模型、第二套状态机、第二份 desired 或第二个端口所有权；
-2. 联邦只走 `docs/v5-wp14-16-federation-contract.md`，跨 Panel 资源不复制成本地 Node / lease；
-3. 每个新增能力必须挂回既有 Forward desired → revision → ACK → applied → reconcile 链；
-4. Gate 失败先区分产品缺陷与 harness 缺陷；两者都要修，但不得通过删断言/skip 伪造绿色；
-5. PR 走快线不等于删除历史覆盖：V4/V5 重型 Gate 保留在 main / release qualification。
 
 ---
 

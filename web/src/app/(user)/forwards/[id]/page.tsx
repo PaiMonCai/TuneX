@@ -26,7 +26,7 @@ export default async function ForwardDetailPage({ params }: { params: Promise<{ 
 
   if (!forward) {
     return (
-      <AppShell title={t("common.notFound")} subtitleKey="forward.detailSubtitle" activeHref="/forwards" showToaster={false}>
+      <AppShell title={t("common.notFound")} subtitleKey="forward.detailSubtitle" activeHref="/forwards">
         <Card>
           <CardHeader>
             <CardTitle>{t("forward.notFound")}</CardTitle>
@@ -45,7 +45,7 @@ export default async function ForwardDetailPage({ params }: { params: Promise<{ 
   }
 
   return (
-    <AppShell title={forward.name} subtitleKey="forward.detailSubtitle" activeHref="/forwards" showToaster={false}>
+    <AppShell title={forward.name} subtitleKey="forward.detailSubtitle" activeHref="/forwards">
       <ForwardDetail forward={forward} traffic={traffic} />
     </AppShell>
   );

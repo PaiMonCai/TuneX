@@ -1,5 +1,5 @@
 /**
- * WP13.5A Console Boundary — 导航边界 / route group 布局单测（纯逻辑 + 文件系统断言）。
+ * Console Boundary — 导航边界 / route group 布局单测（纯逻辑 + 文件系统断言）。
  *
  * 覆盖交付要求（DEVELOPMENT.md §9.4.1）：
  *   1. **route group 不改变对外 URL**：从 `web/src/app` 真实文件系统解析出路由表
@@ -9,7 +9,7 @@
  *      （federation / trust / grant / lease / audit / license …），href 与中英文案两个维度都查；
  *   3. **admin nav 含 Federation 分组**（Peers / Trust / Grants / Remote Leases / Usage），
  *      页面未落位时只作为禁用项声明，绝不进入可导航列表（因此不会 404）；
- *   4. billing / commerce gate 语义与 V4 一致；
+ *   4. billing / commerce gate 保持既有产品语义；
  *   5. 两个控制台外壳是**不同模块**（UserShell / AdminShell），导航与信息密度分别配置，
  *      且既有页面仍只从 `@/components/app-shell` 引入外壳（导入路径零破坏）。
  *
@@ -93,7 +93,7 @@ function matchRoute(url: string, routes: RouteEntry[]): RouteEntry | undefined {
 
 const ROUTES = collectRoutes();
 
-/** §9.4.1 要求 1：这些对外 URL 一个都不能变（含 V4 遗留兼容跳转） */
+/** 对外 URL 不得因 route group 重组而变化（含兼容跳转）。 */
 const LEGACY_URLS = [
   "/dashboard",
   "/forwards",
@@ -158,7 +158,7 @@ function expectRouted(url: string, expectGroup?: string) {
   return hit!;
 }
 
-describe("WP13.5A route group 边界不改变 URL", () => {
+describe("route group 边界不改变 URL", () => {
   test("旧 URL 全部仍可达（按真实路由表解析，含动态段）", () => {
     for (const url of LEGACY_URLS) expectRouted(url);
   });
@@ -239,7 +239,7 @@ describe("WP13.5A route group 边界不改变 URL", () => {
   });
 });
 
-describe("WP13.5A User Console 导航边界", () => {
+describe("User Console 导航边界", () => {
   const userItemsAll = declaredItems(userConsoleNav);
   const userItemsNavigable = visibleNavItems("user", { paymentsEnabled: true });
 
@@ -287,7 +287,7 @@ describe("WP13.5A User Console 导航边界", () => {
   });
 
   test("planned 项绝不进入可导航列表（因此不会生成 404 链接）", () => {
-    // WP13.5B 落地后用户侧已无 planned 项（/routes 是真链接）；
+    // 用户侧当前没有 planned 项；/routes 是实际可用页面。
     // 用 admin 侧仍未落位的项验证同一条不变量，避免这条规则失去守卫。
     const adminPlanned = declaredItems(adminConsoleNav)
       .filter((i) => i.status === "planned")
@@ -303,7 +303,7 @@ describe("WP13.5A User Console 导航边界", () => {
     }
   });
 
-  test("billing gate 保持 V4 语义", () => {
+  test("billing gate 保持既有语义", () => {
     const on = visibleNavItems("user", { paymentsEnabled: true }).map((i) => i.href);
     const off = visibleNavItems("user", { paymentsEnabled: false }).map((i) => i.href);
     expect(on).toContain("/plans");
@@ -324,10 +324,10 @@ describe("WP13.5A User Console 导航边界", () => {
   });
 });
 
-describe("WP13.5A Admin Console 导航边界", () => {
+describe("Admin Console 导航边界", () => {
   const adminItemsNavigable = visibleNavItems("admin", { paymentsEnabled: true });
 
-  test("admin nav 含 Federation 分组，六条入口齐全且已是真链接（V5.5 已落页面）", () => {
+  test("admin nav 含 Federation 分组，六条入口齐全且是真链接", () => {
     const federation = visibleNavGroups("admin", { paymentsEnabled: true }).find((g) => g.id === "federation");
     expect(federation).toBeDefined();
     expect(federation!.items.map((i) => i.href)).toEqual([
@@ -380,10 +380,9 @@ describe("WP13.5A Admin Console 导航边界", () => {
   test("Federation 与 Route Profiles 已落位；其余未落位的内部概念项仍是 planned 禁用项（不进可导航列表）", () => {
     const planned = declaredItems(adminConsoleNav).filter((i) => i.status === "planned");
     const plannedHrefs = planned.map((i) => i.href);
-    // V5.5：联邦六页已落地，不允许再挂在 planned 上（否则页面在、入口却点不动）
+    // Federation 页面已落地，不允许再挂 planned。
     expect(plannedHrefs.some((h) => h.startsWith("/admin/federation"))).toBe(false);
-    // 其余尚未落位的目标入口继续保持「声明得到、点不进、也不 404」
-    // （WP13.5B 的 /admin/route-profiles 已落位，因此不再出现在 planned 里）
+    // 尚未落位的目标入口保持禁用；已落位的 /admin/route-profiles 不得留在 planned。
     expect(plannedHrefs).not.toContain("/admin/route-profiles");
     expect(plannedHrefs).toContain("/admin/capacity");
     for (const href of plannedHrefs) {
@@ -405,7 +404,7 @@ describe("WP13.5A Admin Console 导航边界", () => {
     );
   });
 
-  test("V4 既有 admin 入口一个都没丢", () => {
+  test("既有 admin 入口一个都没丢", () => {
     const hrefs = visibleNavItems("admin", { paymentsEnabled: false }).map((i) => i.href);
     for (const legacy of [
       "/admin",
@@ -424,7 +423,7 @@ describe("WP13.5A Admin Console 导航边界", () => {
   });
 });
 
-describe("WP13.5A 两个控制台外壳真的分开了", () => {
+describe("User/Admin 两个控制台外壳保持分离", () => {
   const readConsole = (name: string) => readFileSync(resolve(CONSOLE_DIR, name), "utf8");
   const readComponent = (name: string) => readFileSync(resolve(COMPONENTS_DIR, name), "utf8");
 

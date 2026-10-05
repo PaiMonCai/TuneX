@@ -15,17 +15,8 @@ import { api } from "@/lib/api";
 import { toast } from "sonner";
 
 /**
- * 侧边栏（客户端组件），User Console / Admin Console 共用同一实现、不同参数。
- *
- * 重要：`groups` 里只能有可序列化字段（href / labelKey / iconKey 字符串），
- * 图标由客户端 `NavIcon` 按 key 解析 —— 服务端组件不能把组件函数当 props 传过来。
- *
- * 控制台差异（V5-WP13.5A §9.4.1）：
- * - admin：更宽（w-64）、分组标题常显、行更紧凑（py-1.5）、无 workspace 语境；
- * - user：w-60、行距更松（py-2）、首页分组不显示标题。
- *
- * `status:"planned"` 的项（Route Profiles / Federation …）渲染为**禁用项**：不是链接，
- * 因此不会产生 404，也不会把未落位的内部概念做成可点击入口。
+ * User / Admin Console 共用侧栏实现。导航项只携带可序列化数据；
+ * `status:"planned"` 项显示为禁用入口，避免链接到尚未交付的页面。
  */
 export function Sidebar({
   groups,
@@ -80,7 +71,7 @@ export function Sidebar({
   const brand = (
     <div className={cn("flex items-center gap-2 px-3", isAdmin ? "py-3" : "py-4")}>
       <div className="grid size-8 place-items-center rounded-md bg-[var(--primary)] text-sm font-bold text-[var(--primary-foreground)]">
-        R
+        TX
       </div>
       <div className="leading-tight">
         <div className="text-sm font-semibold">{t("common.siteName")}</div>
@@ -96,7 +87,7 @@ export function Sidebar({
     const at = activeHref ?? pathname;
     const active = at === item.href || (item.href !== "/admin" && at.startsWith(`${item.href}/`));
 
-    // planned：§9.4.1 已冻结但页面未落位 —— 只用禁用项表达，绝不生成 404 链接
+    // 未交付页面只展示禁用状态，不生成可点击链接。
     if (item.status === "planned") {
       return (
         <span
@@ -204,7 +195,7 @@ export function Sidebar({
 
   return (
     <>
-      {/* 移动端顶部按钮（仅在 < lg 显示，和 Topbar 同高对齐） */}
+      {/* 移动端菜单按钮 */}
       <Button
         variant="ghost"
         size="icon"
@@ -217,7 +208,7 @@ export function Sidebar({
         {open ? <X className="size-5" /> : <Menu className="size-5" />}
       </Button>
 
-      {/* 桌面端固定侧栏 */}
+      {/* 桌面侧栏 */}
       <aside
         data-testid="sidebar"
         data-nav-console={consoleId}
@@ -231,7 +222,7 @@ export function Sidebar({
         {footer}
       </aside>
 
-      {/* 移动端抽屉 */}
+      {/* 移动端侧栏 */}
       {open && (
         <div className="fixed inset-0 z-30 flex lg:hidden">
           <div

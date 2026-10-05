@@ -59,10 +59,7 @@ OUT = HERE / "evidence"
 OUT.mkdir(exist_ok=True)
 RESULT = OUT / "v5-g1b-result.txt"
 UDP_ECHO_PORT = 3040  # the UDP byte-echo target this gate starts
-# 本门禁自己跑在哪个容器里：两个 helper 都要用它取自己的数据网地址（`hostname -i`）。
-# 写成一个常量是为了让"门禁从哪个容器跑"只有一处说法——散落的字面量正是那种
-# "换了个 runner 名字就静默取到空地址"的坑（实测：名字不对时 `runner_data_ip()` 返回空，
-# 于是 target_host 为空、所有 udp 创建返回 400）。
+# Single source of truth for container-run mode; host-run PR CI falls back to bridge discovery.
 RUNNER_CONTAINER = "g0-runner"
 
 # Instantiated in setup(), once the class below is defined: Python runs module-level
@@ -244,19 +241,10 @@ def runner_data_ip() -> str:
 
 
 def runner_egress_ip() -> str:
-    """The runner's own address on the EGRESS data network (WP5-B2 relay case).
+    """Address reachable by the exit node on the EGRESS data network.
 
-    Why a second helper instead of reusing the ingress one: a RELAY fixture's pool
-    target is reached **by the exit node**, and the exit lives on the egress network.
-    Handing it the runner's *ingress*-side address gives the exit a destination it has
-    no route to — which is exactly how the first version of G1B.5 failed
-    (`the client reaches the target THROUGH the datagram hop [TimeoutError]`), with the
-    control plane fully green (create + converge + a real udp runtime on the exit). The
-    runner is attached to both data networks, so both addresses exist; they are simply
-    not interchangeable.
-
-    The subnet is derived from the egress node's own `connect_ip` rather than hardcoded,
-    so the helper keeps working when the topology's addressing changes.
+    The relay target must be reachable from the exit network; derive the subnet from
+    the egress node's `connect_ip` so topology addressing can change safely.
     """
     egress_node_ip = (H.scalar("SELECT connect_ip FROM node WHERE id=%d;" % H.EGR) or "").strip()
     prefix = egress_node_ip.rsplit(".", 1)[0] + "." if egress_node_ip else ""
@@ -356,9 +344,7 @@ def setup():
           f"rows_without_udp={missing}")
 
     check(H.ensure_second_target(), "G1B.setup target-a serves the TCP byte-echo port", f"port={H.ECHO_TARGET_PORT}")
-    # G1B is now a standalone PR gate. Historically G1A ran immediately before
-    # it and happened to leave the byte-echo listener on 3032 alive. Make the
-    # prerequisite explicit so the fast PR path does not depend on another gate.
+    # G1B owns its stream echo prerequisite so it can run independently in PR CI.
     check(H.ensure_echo_target(), "G1B.setup target-a serves the byte-echo port used by stream regression",
           f"port={H.ECHO_TARGET_PORT}")
     global ECHO_TARGET_HOST
@@ -374,8 +360,7 @@ def setup():
     ok_alt, detail_alt = probe_echo(ECHO_ALT)
     check(ok_main, "G1B.setup the UDP echo target answers on the runner", detail_main)
     check(ok_alt, "G1B.setup a SECOND UDP echo target answers (for the hot-reload case)", detail_alt)
-    # Repeatedly, to prove it is not one-shot: this is the exact failure that made
-    # the first version of this gate look like a product bug.
+    # Verify the echo target remains usable across repeated datagrams.
     for i in range(3):
         ok, detail = probe_echo(ECHO_MAIN, b"repeat-%d" % i)
         if not ok:
@@ -491,22 +476,11 @@ def g1b_4_idle_expiry():
 def g1b_5_relay_end_to_end():
     """WP5-B2（契约 §9.1，2026-10-05 冻结）：datagram 跳是"端到端 UDP"，两半都落地。
 
-    这条断言在 B1 时写的是"udp RELAY **必须被拒**"，它当时守的是**跳形态未冻结**。
-    形态冻结、且 Agent 两侧运行时（入口 `DatagramRelay` / 出口 `DatagramEgress`）落地之后，
-    它**翻转**成"可用"——翻转是明写的，不是静默删除：单跳 udp RELAY 现在必须建立，而且
-    客户端的数据报必须真的**穿过这一跳**到达目标再回来。
-
-    仍然被拒的是**多跳**（每个映射共用一个朝向出口的 socket，而中转跳是被它前一跳喂的，
-    不是被入口喂的）：那是纯校验事实，断言在 backend 单测里
-    (`forward-revision.test.ts` 的 "udp + RELAY 带中间跳仍被拒")，不在这里复刻一个依赖
-    拓扑里"恰好有第三台节点"的脆弱版本。
+    单跳 UDP RELAY 必须建立并完成真实往返。UDP 多跳仍由 backend admission 单测
+    fail-closed 验证，本门禁不重复构造第三节点拓扑。
     """
-    # The relay's pool target is dialled by the **exit** node, so it must be an address on
-    # the EGRESS data network. Using the ingress-side echo address here is what made the
-    # first version of this case fail with a fully green control plane (create + converge +
-    # a real udp runtime on the exit): the exit simply had no route to the destination.
-    # Fail loudly if that address cannot be determined — a silently empty target would
-    # turn a topology problem into "the product does not work".
+    # The relay target is dialled by the exit node and must be reachable on its data network.
+    # Fail loudly if the address cannot be determined so topology errors do not masquerade as product failures.
     egress_target = runner_egress_ip()
     check(bool(egress_target),
           "G1B.5 the runner has an address on the egress data network (the exit must be able to reach the target)",

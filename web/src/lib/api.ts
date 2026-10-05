@@ -113,10 +113,9 @@ import type {
   WorkspaceTrafficSummary,
 } from "./types";
 import { normalizeHealthSummary } from "./node-health";
-// V5-WP18.5：公告类型与 `lib/types.ts` 分开 —— 那个文件是全局 schema 镜像表，
-// 由多条线并行编辑；公告只被公告组件用到，放自己文件里避免互相干扰。
+// 公告类型单独维护在 announcements.ts。
 import type { Announcement } from "./announcements";
-// V5.2 §7：目标健康视图的契约镜像（状态/理由码的 closed set 在那一处）。
+// 目标健康状态与理由码在 target-health.ts 维护。
 import type { TargetPoolHealth } from "./target-health";
 import { shouldRedirectToLogin } from "./workspace-permissions";
 import type { EffectiveWorkspacePermissions, WorkspaceCustomRole, WorkspaceCustomRoleInput, WorkspaceMemberRoleInput } from "./workspace-permissions";
@@ -132,15 +131,8 @@ export const API_BASE =
   API_MOCK ? "" : typeof window === "undefined" ? SERVER_BASE : "";
 
 /**
- * TEN-01：当前工作空间 ID。
- * 后端（services/workspace.ts resolveWorkspaceAccess）对 /api/tunnels、/api/node-groups、
- * /api/dashboard 等都按请求头 `x-workspace-id` 解析作用域；缺省 = 个人空间。
- * 因此切换工作空间时必须让后续请求带上这个头，否则读写的仍是个人空间的资源。
- *
- * 存储策略：
- *   - 浏览器：模块级单例（client bundle 内所有客户端组件共享同一实例），切换即生效；
- *   - 服务端：读 `tunex_workspace` cookie（切换时一并写入），保证 SSR 首次渲染就是目标空间。
- * 两者都缺失时 = 不带头 = 后端回落到个人空间。
+ * 当前工作空间通过 `x-workspace-id` 传给后端；缺省时后端回落到个人空间。
+ * 浏览器使用模块级状态，SSR 使用 `tunex_workspace` cookie。
  */
 export const WORKSPACE_HEADER = "x-workspace-id";
 export const WORKSPACE_COOKIE = "tunex_workspace";
@@ -191,13 +183,13 @@ export interface RequestOptions {
   /** 401 时不跳转（用于登录接口自身、静默探测） */
   noRedirect?: boolean;
   cache?: RequestCache;
-  /** TEN-01：显式指定作用域工作空间（服务端组件用；缺失时后端回落个人空间 */
+  /** 服务端组件可显式指定作用域工作空间；缺失时后端回落个人空间。 */
   workspaceId?: number;
   /**
    * 是否剥掉响应的一层 `{ data }`（默认 true）。
    *
    * 只有「信封带旁路字段」的端点才需要 false：通用解包认识 `data`，但会把
-   * `total` / `summary` 一起丢掉（WP6 的 `/admin/node/health` 就是这种形状）。
+   * `total` / `summary` 一起丢掉（如 `/admin/node/health`）。
    * 拿原始信封的调用方**必须自己**判空，不能假定字段一定存在。
    */
   unwrap?: boolean;
@@ -301,7 +293,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 /**
  * 统一解析响应：错误时抛 ApiError，成功时剥掉一层 { data }。
  *
- * `unwrap === false` 用于**带旁路字段的信封**（如 WP6 的
+ * `unwrap === false` 用于带旁路字段的信封（例如
  * `{ data, total, summary }`）：通用解包只认识 `data`，会把 summary/total
  * 一起丢掉，所以这类端点必须自己拿原始信封。
  */
@@ -319,14 +311,7 @@ async function finalize<T>(res: Response, noRedirect?: boolean, unwrap = true): 
   }
 
   if (!res.ok) {
-    // V4-WP8 N2 —— 人读原因的取值顺序（后端两族错误体形状不同）：
-    //   · node-lifecycle 族：`{ error, message, code, condition }` → `message`
-    //   · forwards 族：      `{ error, code, apply_error_code, data }` → **没有**
-    //     `message`，原因在 `error` 里
-    // 改造前只读 `message`，于是 Forward 的写操作失败在真实后端下只剩
-    // 「Request failed with status 409」—— 用户拿不到原因，WP8 的「错误 →
-    // 下一步」也就无从谈起。mock 的 `fail()` 恰好带 `message`，所以这个缺口
-    // 在 mock 演示里看不出来。
+    // 后端错误体可能用 message 或 error；优先保留可行动的人读原因。
     const body = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
     const pick = (key: string): string | null => {
       const value = body?.[key];
@@ -356,10 +341,7 @@ const patch = <T>(path: string, body?: unknown, cookie?: string) =>
   request<T>(path, { method: "PATCH", body, cookie });
 const del = <T>(path: string, cookie?: string) => request<T>(path, { method: "DELETE", cookie });
 export const api = {
-  // ---- TEN-01 工作空间（个人/团队切换、成员、邀请）----
-  // 对应 backend/src/routes/workspaces.ts（挂载于 /api/workspaces）。
-  // 这几个端点全部按「会话 cookie」鉴权（Bearer token 会被后端 403 拒绝），
-  // 因此浏览器侧请求不要带 Authorization 头。
+  // 工作空间（个人/团队切换、成员、邀请）；浏览器使用会话 cookie 鉴权。
   workspaces: {
     permissions: (id: number) => request<EffectiveWorkspacePermissions>(`/workspaces/${id}/permissions`, { noRedirect: true, workspaceId: id }),
     roles: (id: number) => get<WorkspaceCustomRole[]>(`/workspaces/${id}/roles`),
@@ -384,9 +366,9 @@ export const api = {
     removeMember: (id: number, userId: number, cookie?: string) =>
       del<{ ok: boolean }>(`/workspaces/${id}/members/${userId}`, cookie),
     /**
-     * OPS-03：workspace 流量聚合（按 workspace 归属，口径与策略流量一致）。
+     * workspace 流量聚合（口径与策略流量一致）。
      * 返回总流量 + 按隧道排行 + 按日界补齐的趋势序列。
-     * @param id workspace id（TEN-01 切换空间时必须传当前空间）
+     * @param id workspace id
      * @param params.days 趋势天数（1–90，默认 14，后端 `TRAFFIC_DEFAULT_DAYS`）
      * @param params.period 计量周期（day/month/total）；缺省取该空间生效策略的 traffic_period
      */
@@ -429,21 +411,21 @@ export const api = {
       clearMockSessionCookie();
       return res;
     },
-    /** TEN-03：点击邮件链接验证邮箱（GET + query，后端返回 { status }） */
+    /** 点击邮件链接验证邮箱。 */
     verifyEmail: (token: string) =>
       request<{ status: "verified" | "invalid"; message: string }>(
         `/auth/verify-email?token=${encodeURIComponent(token)}`,
         { method: "GET", noRedirect: true },
       ),
-    /** TEN-03：重新发送验证邮件（需登录） */
+    /** 重新发送验证邮件（需登录）。 */
     resendVerification: async () => post<{ ok: boolean; expires_in: number }>("/auth/resend-verification"),
     /**
-     * TEN-03：忘记密码。**响应与邮箱是否存在无关**（后端防枚举），
+     * 忘记密码响应与邮箱是否存在无关，避免账号枚举。
      * 故前端不做「该邮箱未注册」的错误分支。
      */
     forgotPassword: async (email: string) =>
       post<{ ok: boolean; expires_in: number }>("/auth/forgot-password", { email }),
-    /** TEN-03：用邮件里的 token 设置新密码 */
+    /** 用邮件 token 设置新密码。 */
     resetPassword: async (token: string, password: string) =>
       post<{ ok: boolean }>("/auth/reset-password", { token, password }),
   },
@@ -463,7 +445,7 @@ export const api = {
     stats: (cookie?: string) => get<DashboardStats>("/dashboard/stats", undefined, cookie),
     traffic: (days = 14, cookie?: string) => get<TrafficPoint[]>("/dashboard/traffic", { days }, cookie),
     /**
-     * V4-WP8 §13.7 Wave 4：需要处理的节点/转发（离线、等待安装、管理态、
+     * 需要处理的节点/转发（离线、等待安装、管理态、
      * 下发失败、未收敛）。
      *
      * 后端在聚合失败时会返回**空清单 + `degraded: true`**（不是 5xx：Dashboard
@@ -474,7 +456,7 @@ export const api = {
       get<AttentionPayload>("/dashboard/attention", undefined, cookie),
   },
   /**
-   * V5-WP18.5：公告（用户侧）。
+   * 用户侧公告。
    *
    * 只有两个方法：读列表、标记已读。**没有**免打扰偏好的读写 —— 契约 §9.5 明确本期
    * 不做通知中心前端（渠道偏好矩阵 UI），后端那两个端点由后端契约测试覆盖；
@@ -492,14 +474,12 @@ export const api = {
         cookie,
       ),
   },
-  // User-facing forwarding is V4-only from this point onward.
-  // Legacy /api/tunnels stays backend-compatible, but the Web client no longer
-  // exposes it as a product API. Admin tunnel inspection remains below.
+  // 用户产品面统一使用 /forwards；/api/tunnels 仅保留后端兼容。
   forwards: {
     summary: (cookie?: string) =>
       get<ForwardSummary>("/forwards/summary", undefined, cookie),
     /**
-     * V4-WP9 §13.6：列表支持服务端分页 / 排序 / 过滤。
+     * 列表支持服务端分页、排序和过滤。
      *
      * 带 `page` / `page_size` / `sort` / `order` 任一参数时后端返回
      * `Paginated<PortForward>`；不带则返回裸数组（冻结的旧契约）。
@@ -511,7 +491,7 @@ export const api = {
     page: (query: ForwardListQuery, cookie?: string) =>
       get<Paginated<PortForward>>("/forwards", query, cookie),
     /**
-     * V4-WP9 §13.6：批量 retry / suspend / resume。
+     * 批量 retry / suspend / resume。
      *
      * 逐条结果 + 200（部分失败不改整体状态码），因此调用方必须读
      * `succeeded` / `failed` 而不是只看 promise 是否 reject。
@@ -529,7 +509,7 @@ export const api = {
     update: (id: ID, input: ForwardPatchInput, cookie?: string) =>
       patch<PortForward>(`/forwards/${id}`, input, cookie),
     /**
-     * V4-WP4 §13.3.3 preview：保存前影响面（不写库）。
+     * 保存前影响预览（不写库）。
      *
      * 与 update 共用后端同一个 candidate resolver，因此本方法放行 ⇔ update 接受。
      * UI 在每次字段变更后调用它渲染 impact warning。
@@ -544,7 +524,7 @@ export const api = {
     remove: (id: ID, cookie?: string) =>
       del<{ ok: true }>(`/forwards/${id}`, cookie),
     /**
-     * V4-WP11C：Forward 诊断（只读）。
+     * Forward 诊断（只读）。
      *
      * 探针目标由**后端**从该转发的已授权期望状态推导，请求体不带 host/port ——
      * 因此这里刻意不接受任何参数：一个"带目标参数的诊断"就是把客户端变成内网扫描器。
@@ -563,17 +543,17 @@ export const api = {
     unbindEgress: (ingressId: ID, egressId: ID, cookie?: string) =>
       del<{ ok: boolean }>(`/nodes/${ingressId}/bindings/${egressId}`, cookie),
     /**
-     * V4-WP11C：Node 级诊断。后端会**先判活**：上报过期即返回 offline，不下发命令。
+     * Node 级诊断；上报过期时后端返回 offline，不下发命令。
      */
     diagnostics: (id: ID, cookie?: string) =>
       get<NodeDiagnosticsReport>(`/nodes/${id}/diagnostics`, undefined, cookie),
     /**
-     * V4-WP11C：Support Bundle（白名单采集 + 脱敏）。返回整份产物用于另存为 JSON。
+     * Support Bundle 使用白名单采集和脱敏，返回 JSON 产物。
      */
     supportBundle: (id: ID, cookie?: string) =>
       get<Record<string, unknown>>(`/nodes/${id}/support-bundle`, undefined, cookie),
     /**
-     * V4-WP11B：渲染升级脚本。
+     * 渲染 Agent 升级脚本。
      *
      * 返回的是**操作者需要在节点上执行**的脚本；控制面不会远程替换 Agent。
      * `allow_active` 为 false 时后端会拒绝非 maintenance 节点（409）。
@@ -656,11 +636,7 @@ export const api = {
       patch<User>(`/admin/users/${id}`, input, cookie),
     removeUser: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/users/${id}`, cookie),
     /**
-     * V5-WP18.5：平台公告（列出含已撤回 / 发布 / 撤回）。
-     *
-     * 前缀 `/admin/announcements` 的 RBAC 登记是 WP18.6 的动作：在它登记之前，
-     * `adminPermissionGuard` 对未登记前缀 fail-closed —— 只有 `super_admin` 能用。
-     * 前端因此**不做**"看起来能用其实 403"的乐观渲染：失败一律把后端原因显示出来。
+     * 平台公告管理；授权由后端 RBAC 判定，前端直接展示后端失败原因。
      */
     announcements: {
       list: (cookie?: string) => get<Announcement[]>("/admin/announcements", undefined, cookie),
@@ -675,8 +651,7 @@ export const api = {
       patch<Node>(`/admin/nodes/${id}`, input, cookie),
     removeNode: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/nodes/${id}`, cookie),
     /**
-     * 节点凭据（WP7，已随 main 合并；对应 backend/src/routes/admin.ts 的
-     * `/node/:id/credential[/rotate|/revoke]`）。
+     * 节点凭据端点：`/node/:id/credential[/rotate|/revoke]`。
      *
      * 三条端点都只接受节点主键（数字）或字符串 node_id 作 :id。
      * 其中 issue 已在上面那段注释之外额外多一条约束：**已持有有效凭据的节点
@@ -700,16 +675,11 @@ export const api = {
     revokeNodeCredential: (id: ID, cookie?: string) =>
       post<NodeCredentialRevoked>(`/admin/node/${id}/credential/revoke`, {}, cookie),
     /**
-     * 节点详情（WP10）：列表字段 + 出口池 + 运行态快照。
-     *
-     * 注：WP10 的 Admin API 尚未合入 main（§7.14 允许前端在 contract 冻结后
-     * 先 mock 开发）。详情端点与出口池 CRUD 由 mock handler 提供，契约冻结后
-     * 这里只需把路径指向真实实现，页面代码不用改。
+     * 节点详情：列表字段 + 出口池 + 运行态快照。
      */
     nodeDetail: (id: ID, cookie?: string) => get<NodeDetail>(`/admin/nodes/${id}`, undefined, cookie),
     /**
-     * 出口池 / 出口目标 CRUD（WP10 Admin API，mock 中；契约见 devmap v3
-     * `/api/admin/nodes/:id/targets*` 与 schema 的 EgressPool/EgressTarget）。
+     * 出口池 / 出口目标 CRUD。
      *
      * 不变式由后端保证、前端必须如实展示的两条：
      *   1. 池内至少一个 active 且 weight>0 的目标（删到空 = 拒绝，属于服务层

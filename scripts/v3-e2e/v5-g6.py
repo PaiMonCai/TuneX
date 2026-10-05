@@ -34,7 +34,7 @@
 只断言"值集 = 真在服务的地址、且不含任何非 owner 的机器"。同一条记录的完整理由见契约
 「F4 更正」与 WP17.5 交付记录。
 
-## 环境事实（写在这里，避免下一个人重新踩）
+## 运行前提
 
 * 自动解析的执行挂在 **failover 扫描**的逐条循环里，而扫描在
   `FAILOVER_POLICY` 两个开关都为 false 时**提前返回** ⇒ 策略关闭时 `auto_resolve`
@@ -149,12 +149,8 @@ class DdnsStub:
                    —— 这正是"provider 接受了写入"与"记录真的对了"之间的那道缝
                    （契约 D2/F7 的禁止假成功）。
 
-    **为什么响应走 HTTP/1.0（无 keep-alive）**：`stop()` 只关掉**监听**套接字，
-    已经被接受、停在 keep-alive 上的连接由各自的 handler 线程继续服务 —— 于是"停掉
-    stub"之后面板仍能通过连接池里的旧连接读到、写到它（实测：G6.7 的闸门因此没触发，
-    而那一轮看起来像产品缺陷）。HTTP/1.0 + `connection: close` 让每个请求一条新连接，
-    `stop()` 之后新连接被拒 —— 这才是"provider 不可达"的真形状。`dead` 是对已经建立
-    的连接的兜底（回 503），两层都不许让"停掉"变成一句空话。
+    **HTTP/1.0（无 keep-alive）**保证 `stop()` 后新请求真实不可达；`dead` 对已建立连接
+    返回 503。两层共同保证 provider-down 场景不是连接池假象。
     """
 
     def __init__(self) -> None:
@@ -334,16 +330,10 @@ def runner_ctrl_ip() -> str:
 
 
 def worker_logs(since_epoch: float | None = None) -> str:
-    """worker 从 `since_epoch` 起的日志（**stdout + stderr 都要**）。
+    """Read worker logs since a timestamp, including stdout and stderr.
 
-    两个都不是"顺手写写"的细节，各错过一次：
-
-    · **stderr**：`docker logs` 把容器的 stderr 转发到**客户端自己的 stderr**，而 harness
-      的 `run()` 只返回 stdout。闸门那行是 `console.warn`（stderr）⇒ 老写法永远看不到它，
-      于是"原因不可见"看起来像产品缺陷（实测：手动 `docker logs 2>&1 | grep` 能看到三行，
-      而门禁读到 0 行）。断言建立在"这一行出现过"上，读日志的方式就要把两条流都拿回来。
-    · **RFC3339 UTC 而不是裸 epoch 整数**：同一段窗口两种写法返回过不同内容，时间窗不该
-      是概率性的。往前抹 2 秒，避免秒级截断切掉窗口开头那一行。
+    Use RFC3339 UTC and a two-second cushion so second-level truncation cannot drop
+    the first line in the assertion window.
     """
     args = ["docker", "logs"]
     if since_epoch is not None:
@@ -485,13 +475,7 @@ def plant_binding_via_sql(fid: int, domain: str, *, auto: bool, mode: str, recor
 
 
 def g6_pre_bind_route():
-    """G6.PRE —— **WP17 的写入口必须是可达的**（契约 §5 WP17.2 的交付物）。
-
-    为什么值得单独一条：这个端点曾经被同文件里注册更早的 `POST /:id/:action` 吃掉
-    （Hono 同方法按注册顺序匹配），DNS 前门因此在产品里**根本绑不上**，而 WP17.2 的
-    38 条断言全绿 —— 因为路由级用例**单独 mount router**，绕过了注册顺序。修复与守卫见
-    契约 WP17.5 记录。这条断言的存在就是为了让"写入口再次被挡住"变成一次响亮的红。
-    """
+    """G6.PRE —— ensure the DDNS binding route is reachable and not shadowed by `POST /:id/:action`."""
     optin = FIXTURES["gate_tunnel_optin"]
     ok, data, note = bind_dns(optin["id"], optin["domain"], auto=False, provider_id=FIXTURES["provider_id"])
     check(ok, "G6.PRE `POST /api/forwards/:id/dns` reaches the DDNS binding route "
@@ -602,15 +586,10 @@ def setup():
 
 
 def g6_0_trigger_wiring():
-    """G6.0 —— 触发器接线（**事实记录**，不是契约要求的行为断言）。
+    """G6.0 —— record the current trigger wiring.
 
-    发现（写 WP17.5 时实测）：DNS 后继挂在 failover 扫描的逐条循环里，而扫描在
-    `FAILOVER_POLICY` 两个开关都为 false 时**提前返回** ⇒ 只打开 `dns_auto_resolve`
-    不会产生任何同步。本门禁因此把"策略打开"当成前置条件，并在此把这条耦合**显式断言**
-    出来（两种状态各断言一次），让下一个人不必再从"为什么 pending 一直是 pending"反推。
-
-    口径：这里断言的是"今天的接线事实"，**不是**"这是正确设计"。契约 WP17.5 记录里
-    把这一点登记为需要 Lead 裁决的发现。
+    DDNS successor execution is coupled to the failover scan, so auto-resolve requires
+    the failover policy loop to run. This gate asserts that implementation fact explicitly.
     """
     main = FIXTURES["main"]
     # 前一段：策略关闭 ⇒ 零外呼（此刻夹具还没绑定 DNS，先绑上再看）。
@@ -770,16 +749,8 @@ def g6_4_non_owner_node_updown():
 
     H.docker(["stop", INGRESS_B_CONTAINER], timeout=120)
     node_status = lambda: H.scalar(f"SELECT IFNULL(status,'') FROM node WHERE id={ingress_b};")
-    # ── "下线"在这个拓扑里**长什么样**（实测，不猜）────────────────────────────
-    #
-    # 这些 Agent 走 **HTTP 轮询**（`/api/internal/node/commands`），而面板翻转
-    # `node.status = inactive` 的唯一路径是 **websocket 断开标记**（`socket/offline-detector.ts`
-    # 消费 `ws:<scope>:node:<gid>:<id>:offline`）。实测：Redis 里根本没有 `ws:...:node:...`
-    # 或 heartbeat 键，把 5 号 Agent 停掉 4 分钟，它的 `node.status` 始终是 `active`。
-    #
-    # 所以这条断言**不**等一个永远不来的状态翻转（那会变成一条永远红的假断言），而是断言
-    # 面板侧**真的**观测到的那个事实：**该节点自己的上报停止了刷新**。`status` 不翻转这件事
-    # 记进观察与报告 —— 它是产品可观测性的缺口，不该由这条门禁替它圆场。
+    # HTTP-polling Agents do not drive the websocket offline marker, so this gate uses
+    # stale node_state_report timestamps as the observable offline fact.
     stale = lambda: H.scalar(
         "SELECT COUNT(*) FROM node_state_report WHERE node_id=%d AND "
         "reported_at > NOW() - INTERVAL 90 SECOND;" % ingress_b
@@ -944,12 +915,10 @@ def g6_7_readiness_gate():
           f"ok={ok_bind} {note} state={state.get('state')}")
 
     t0 = time.time()
-    # 写次数必须是**本窗口内的增量**：这条域上早就有 G6.3b 那次成功写，用总数去比
-    # 会让一条正确的系统也红（第一版就是这个错，`writes=2` 看起来像产品多写了一次）。
+    # Compare writes within this assertion window; earlier successful writes are unrelated.
     writes_before_gate = STUB.write_count(domain)
     ticks = wait_ticks(DEADLINE_TICKS + 1)
-    # 日志要**轮询**着找，不能只读一次：读日志这条路本身在真环境里不是即时的
-    # （实测同一条命令先返回 0 行、稍后又返回 3 行），而"原因可见"是这条断言的另一半。
+    # Poll logs because container log visibility is not guaranteed to be immediate.
     saw_gate = H.wait_until(lambda: bool(gated_lines(t0, fid)), timeout=WAIT_TICKS_S, interval=6)
     lines = gated_lines(t0, fid)
     check(saw_gate and bool(lines),

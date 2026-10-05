@@ -22,7 +22,7 @@ export default async function FederationPeersPage() {
       title={localizedLabel(locale, "admin.federation.peers", "对等面板", "Peers")}
       subtitle={localizedLabel(locale, "admin.federation.subtitle", "跨面板信任、授予与远端租约", "Cross-panel trust, grants and remote leases")}
       adminMode
-      showToaster={false}
+     
     >
       <div className="flex flex-col gap-4">
         <FederationTabs active="peers" locale={locale} />
