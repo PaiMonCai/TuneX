@@ -1,5 +1,5 @@
 /**
- * V4 user-facing Forward API.
+ * User-facing Forward API.
  *
  * Forward is the product object. Tunnel stays an internal runtime record.
  */
@@ -63,7 +63,7 @@ forwardsRoutes.use("*", async (c, next) => {
   else if (method === "POST" && /\/api\/forwards\/?$/.test(path)) {
     action = "create";
   } else if (method === "POST" && /\/diagnose\/?$/.test(path)) {
-    // V4-WP11C: the probe is read-only (no desired-state change, no revision
+    // : the probe is read-only (no desired-state change, no revision
     // bump). Requiring forward:update would tell a read-only role "you may not
     // diagnose the forward you can see", which is not the product rule.
     action = "read";
@@ -133,7 +133,7 @@ const ForwardCreateSchema = z
     name: z.string().trim().min(1).max(60),
     mode: z.enum(["direct", "relay"]),
     protocol: z.enum(FORWARD_PROTOCOLS).optional(),
-    // V5-WP5-A1: paths only. Shape is enforced here; existence is the Agent's
+    // : paths only. Shape is enforced here; existence is the Agent's
     // check (the panel cannot see the node's filesystem), and a missing file is
     // a build-time refusal on the node.
     tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
@@ -148,7 +148,7 @@ const ForwardCreateSchema = z
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),
     target_host: z.string().trim().min(1).max(255),
     target_port: z.number().int().min(1).max(65535),
-    // V5.5 WP15：把出口腿委托给一个已信任的 peer panel（缺省 = 出口在本机）。
+    //：把出口腿委托给一个已信任的 peer panel（缺省 = 出口在本机）。
     // 形状在这里判；"这个 peer 存不存在/信不信任"由 service 层的
     // `validateFederatedEgressDeclaration` 判（唯一的实现，见 forward-hop.ts），
     // 失败返回契约 §6 的错误码而不是 500。
@@ -157,7 +157,7 @@ const ForwardCreateSchema = z
   .strict();
 
 /**
- * V4-WP1 §13.3.1 / §13.3.3：可编辑全集（与 create 的字段一致）+ `expected_revision`。
+ *  §13.3.1 / §13.3.3：可编辑全集（与 create 的字段一致）+ `expected_revision`。
  *
  * `expected_revision` 是可选的乐观并发凭据，不是筛选条件——缺失说明客户端是
  * 首次请求或有意跳过并发检查；存在但不匹配 → 409（见 patchForward 内闸门）。
@@ -173,7 +173,7 @@ const ForwardPatchSchema = z
     listen_port: z.number().int().min(1).max(65535).nullable().optional(),
     target_host: z.string().trim().min(1).max(255).nullable().optional(),
     target_port: z.number().int().min(1).max(65535).nullable().optional(),
-    // V5-WP5-A1: the tls front's paths are editable, with the SAME shape rule as
+    // : the tls front's paths are editable, with the SAME shape rule as
     // create. The protocol itself is deliberately NOT here: turning a tcp Forward
     // into a tls one is a different operation (port lease, target semantics and
     // the RELAY shape all change), and §6.1 did not freeze that semantics — so it
@@ -181,7 +181,7 @@ const ForwardPatchSchema = z
     tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     tls_key_path: z.string().trim().min(1).max(512).startsWith("/").optional(),
     /**
-     * V5.5 WP15：`null` = 改回本机出口；省略 = 不变（候选合并的语义）。
+     *：`null` = 改回本机出口；省略 = 不变（候选合并的语义）。
      * peer 是否存在/已信任由 service 层判定（唯一实现），这里只判形状。
      */
     federated_egress_peer: z.string().trim().min(1).max(64).nullable().optional(),
@@ -200,7 +200,7 @@ const ForwardPatchSchema = z
 const ACTIONS = new Set<ForwardAction>(["retry", "suspend", "resume"]);
 
 /**
- * V4-WP9 §13.6：列表改为**服务端**分页 / 排序。
+ *  §13.6：列表改为**服务端**分页 / 排序。
  *
  * 响应形状 `{ data: { data, total, page, page_size } }`（前端 request() 剥一层
  * 后即 `Paginated<PortForward>`），与 `GET /api/node-groups`、
@@ -208,7 +208,7 @@ const ACTIONS = new Set<ForwardAction>(["retry", "suspend", "resume"]);
  *
  * 兼容口径（重要）：
  *   · 客户端**显式带 page / page_size**才走分页信封；
- *   · 不带分页参数时返回裸数组（保持 WP4 及之前 `api.forwards.list()` 的契约，
+ *   · 不带分页参数时返回裸数组（保持  及之前 `api.forwards.list()` 的契约，
  *     以及 E2E 脚本 / 仪表盘的 `slice(0,5)` 取用方式）。
  *   这条不是"过渡期双轨"：分页信封与裸数组都是冻结契约，前者是新 UI 的形态，
  *   后者是「取全部」的显式语义（服务端仍施加上限，防止无界查询）。
@@ -270,7 +270,7 @@ forwardsRoutes.get("/:id/traffic", async (c) => {
 });
 
 /**
- * V5-WP19-C —— `GET /api/forwards/:id/topology`（**只读**拓扑与逐跳明细）。
+ *  —— `GET /api/forwards/:id/topology`（**只读**拓扑与逐跳明细）。
  *
  * 位置要求：**必须**注册在任何 `/:id/:参数` catch-all 之前（Hono 同方法按注册顺序匹配）。
  * 这不是注释里的提醒而已 —— `forward-route-order.test.ts` 会机械地检查它，而
@@ -308,7 +308,7 @@ forwardsRoutes.get("/:id", async (c) => {
 });
 
 forwardsRoutes.patch("/:id", async (c) => {
-  // V4-WP1：PATCH 是「编辑」语义而非「改名字」——不再只接受 name 补丁。
+  //：PATCH 是「编辑」语义而非「改名字」——不再只接受 name 补丁。
   // 单用户/单窗口编辑最快，但两个浏览器标签先后保存必须被 expected_revision
   // 拦下（409），否则后保存者会静默覆盖前者的端口/节点选择。
   const id = idParam(c, "id");
@@ -328,7 +328,7 @@ forwardsRoutes.patch("/:id", async (c) => {
 });
 
 /**
- * V4-WP11C —— `POST /api/forwards/:id/diagnose`
+ *  —— `POST /api/forwards/:id/diagnose`
  *
  * 只读诊断：探针目标由服务端从该转发的**已授权期望状态**推导（见
  * services/forward-probe-plan.ts），请求体不携带任何 host/port —— 否则这个
@@ -350,7 +350,7 @@ forwardsRoutes.post("/:id/diagnose", async (c) => {
 });
 
 /**
- * V4-WP1 §13.3.3 preview：保存前影响面（不写库、不触发 apply）。
+ *  §13.3.3 preview：保存前影响面（不写库、不触发 apply）。
  *
  * 路由与 mutation 同源：同一个 zod schema、同一个 candidate resolver。
  * 因此「preview 显示可保存」与「PATCH 实际接受」不可能出现两种结论。
@@ -383,7 +383,7 @@ forwardsRoutes.post("/:id/preview", async (c) => {
 });
 
 /* ================================================================== */
-/* V5-WP17 —— DNS 前门与首选入口（**必须注册在任何 `/:id/:参数` catch-all 之前**） */
+/*  —— DNS 前门与首选入口（**必须注册在任何 `/:id/:参数` catch-all 之前**） */
 /* ================================================================== */
 //
 // 为什么这段必须在这个位置：Hono 对同一方法**按注册顺序**匹配。文件后段还有一个
@@ -391,12 +391,12 @@ forwardsRoutes.post("/:id/preview", async (c) => {
 // `POST /:id/dns` 会被那个 catch-all 先吃掉，返回 400「不支持的端口转发动作」——
 // 症状是 **DNS 前门根本绑不上**，而 GET/DELETE 因为同路径没有 catch-all 反而正常。
 //
-// 这不是猜想：WP17.5 的 Gate 在真实 API 上实测到过（`POST /api/forwards/70/dns` → 400），
+// 这不是猜想： 的 Gate 在真实 API 上实测到过（`POST /api/forwards/70/dns` → 400），
 // 而当时 38 条断言全部通过 —— 因为路由级用例是**单独 mount** 这个 router 的，绕过了注册顺序。
 // 所以除了位置，还有一条源码级守卫看着它（见 `__tests__/forward-route-order.test.ts`）。
 
 /* ================================================================== */
-/* V5-WP17.2 —— DNS 前门：绑定 / 解绑 / 状态（**零外呼**）               */
+/*  —— DNS 前门：绑定 / 解绑 / 状态（**零外呼**）               */
 /* ================================================================== */
 
 /**
@@ -506,7 +506,7 @@ forwardsRoutes.delete("/:id/dns", async (c) => {
 });
 
 /* ================================================================== */
-/* V5-WP17.1（契约 D4）—— 首选入口节点                                  */
+/* （契约 D4）—— 首选入口节点                                  */
 /* ================================================================== */
 
 /**
@@ -540,7 +540,7 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
 });
 
 /**
- * V4-WP9 §13.6：批量 retry / suspend / resume。
+ *  §13.6：批量 retry / suspend / resume。
  *
  * 为什么是独立路径 `/batch` 而不是给 `POST /api/forwards/:id/:action` 加数组形态：
  * 单条与批量的**错误语义不同**——单条失败整请求失败（4xx/5xx），批量失败是
