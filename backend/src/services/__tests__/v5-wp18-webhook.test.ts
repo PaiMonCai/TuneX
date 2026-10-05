@@ -558,7 +558,11 @@ describe("F. 解析结果全量校验：任一内网即拒（零出站）", () =
 /* ------------------------------------------------------------------ */
 
 describe("G. 目标脱敏（F5 / 18.2 target 列注释）", () => {
-  const slack = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX";
+  // 注意：这里**不要**写成 Slack 真实 webhook 的形态（`/services/T…/B…/<token>`）——
+  // 那是 GitHub push protection 的匹配形状，即使全是占位符也会**拒绝推送**（实测 GH013）。
+  // 本测试要的只是"一个带凭据形态的 https URL"，路径随便写即可：改后断言全部不变
+  // （`startsWith("https://hooks.slack.com/***")`、不含占位串、摘要稳定且可区分）。
+  const slack = "https://hooks.slack.com/services/PLACEHOLDER-NOT-A-REAL-WEBHOOK";
 
   test("脱敏形态：保留 origin，丢掉 path/query，附稳定短摘要", () => {
     const masked = redactWebhookTarget(slack);
