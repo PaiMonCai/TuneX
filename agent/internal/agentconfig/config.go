@@ -83,7 +83,7 @@ const (
 	// the two ranges from clashing.
 	RoleBoth = "BOTH"
 
-	// DefaultAgentAdminPort is the v3 admin plane port (devmap §8: 9090).
+	// DefaultAgentAdminPort is the optional local admin API port.
 	DefaultAgentAdminPort = 9090
 )
 
@@ -162,7 +162,7 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.StringVar(&cfg.IngressRange, "ingress-range", cfg.IngressRange, "Port range the ingress tunnels may bind, e.g. 10000-30000")
 	fs.StringVar(&cfg.EgressRange, "egress-range", cfg.EgressRange, "Port range the egress tunnels may bind, e.g. 30001-60000")
 	// Per-node credential must never be echoed in logs or usage output.
-	fs.StringVar(&cfg.NodeCredential, "node-credential", cfg.NodeCredential, "Per-node credential for the state report (WP7)")
+	fs.StringVar(&cfg.NodeCredential, "node-credential", cfg.NodeCredential, "Per-node credential for command polling and state reporting")
 	// Durable state directory for restore and ownership fencing.
 	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "Directory for durable agent state (last-known-good desired cache); empty disables it")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "version for TuneX agent")
@@ -240,11 +240,8 @@ func applyDefaults(cfg *Config, file string) error {
 			*dst = v
 		}
 	}
-	// envInt assigns on a SUCCESSFUL parse. The previous condition was inverted
-	// (`if err != nil`), so a valid value was ignored — the installer writes
-	// TUNEX_AGENT_ADMIN_PORT=0 and the agent silently kept the default 9090 — while
-	// a malformed value silently became 0. Both directions are wrong for a knob an
-	// operator sets through the env file, which is the documented install path.
+	// Integer environment values fail closed when malformed; silently falling
+	// back would make the running Agent disagree with the operator's config.
 	envInt := func(key string, dst *int) error {
 		v, ok := os.LookupEnv("TUNEX_" + key)
 		if !ok || strings.TrimSpace(v) == "" {
@@ -271,9 +268,7 @@ func applyDefaults(cfg *Config, file string) error {
 	if v, ok := os.LookupEnv("TUNEX_STATE_DIR"); ok {
 		cfg.StateDir = strings.TrimSpace(v)
 	}
-	// Propagated, not swallowed: ignoring it would leave the agent running with the
-	// DEFAULT port while the operator believes their value applied — the exact
-	// silent-ignore this fix is about.
+	// Propagate invalid numeric configuration instead of silently using a default.
 	if err := envInt("AGENT_ADMIN_PORT", &cfg.AgentAdminPort); err != nil {
 		return err
 	}
