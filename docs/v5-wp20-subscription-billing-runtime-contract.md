@@ -3,8 +3,9 @@
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
 > （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）、
 > WP20-4（支付 → 发放接线 + 续期执行器）、WP20-4b（套餐 ↔ 策略绑定入口）、
-> WP20-5（到期降级与可观测）、WP20-6（流量口径统一）、WP20-6b（`/api/me/capabilities` 端点）已交付**
-> （§5.1–§5.8）。除这八处记录外，本契约其余部分仍**不含实现**。
+> WP20-5（到期降级与可观测）、WP20-6（流量口径统一）、WP20-6b（`/api/me/capabilities` 端点）已交付**，
+> 并由 **V5-G7 门禁**（§7.1）在真 MySQL 上验证；**额度周期语义修正**见 §5.9（月额度可复位）。
+> 除 §5.1–§5.9 这九处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -875,6 +876,57 @@ bunx tsc --noEmit（backend/ 与 web/）                → 本 WP 文件 0 报�
 **DoD 覆盖矩阵（针对 WP20-5）**：**第 6 条 ✅**（宽限 / 降级 / fail-closed / 边界 / 撤销）；
 第 7 条 ✅ 不回归（枚举集合逐字不变）；第 1/2/4/5/8/9 条不回归；第 10 条 ⏳（e2e 未跑）；
 第 11 条 ⏳（`DEVELOPMENT.md` 登记不在本 WP）。
+
+---
+
+### 5.9 额度语义修正：生效周期 = 声明的最长周期（Lead 2026-10-05 裁决 (a)）
+
+> **一句话语义（本节是额度周期的唯一一句话）**：
+> **生效周期 = 适用策略中声明的「最长」周期；只有当某条策略真的声明 `total` 时才是 `total`。**
+
+**缺陷（由 V5-G7 门禁抓到，既有、非 WP20 引入）**
+`composeEffectivePolicy` 的累计初值是 `UNLIMITED_LIMITS`（`traffic_period: "total"`），而
+`unionLimits` 对周期取「更宽松（更长窗口）」。数值上限的初值 `null`（不限）确实是 `maxNullable`
+的中性元 ✓，但**周期用 `total` 是恒胜元** ✗ ⇒ 无论策略声明什么周期，结果都停在 `total`。
+纯函数一行复现：单条 `traffic_period:"month"` 策略 ⇒ `limits.traffic_period === "total"`。
+后果：① `sumWorkspaceTraffic` 按**全量累计**求和 ⇒ **月额度永不复位**（用户累计超过一个月额度后被持续拒绝）；
+② 面板的 `traffic_used` 显示「全量已用」而不是「本月已用」（WP20-6 的读路径同源是对的，
+**同源的那个周期本身是错的**）。
+
+**为什么算缺陷而不是语义**：`unionLimits` 自己的注释写的是「取更宽松（更长窗口）的一方」，
+`intersectCeiling` 里也早就把 `total` 当「无约束」（`ceiling.traffic_period === "total" ? grant.traffic_period : …`）。
+修法**恢复的是这两处已经声明的意图**，不是重新设计语义，也不改 V4 冻结基线。
+
+**条件一（先查是否已有测试在守护这个 bug）—— 结论：没有**
+证据：`grep -rn "traffic_period" src/ --include=*.test.ts | grep -E "toBe\(|toEqual\("`
+全仓只命中 `src/routes/__tests__/me-capabilities-route.test.ts`，而那是**替身 fixture 的返回值**
+（不经过 `composeEffectivePolicy`）。因此本次**没有删除或改写任何既有断言**，
+也就不存在「原断言守护的是缺陷行为」需要记录的情形（与 `traffic-pipeline.test.ts` 那次不同）。
+
+**修法**：累计从**第一条策略**起折（`null` 累加器），不再依赖「初值必须刚好是中性元」。
+同一次提交里补了两层断言：
+- 纯函数（`traffic-window-convergence.test.ts` 的 C2 组 6 条）：单条 month ⇒ month；单条 day ⇒ day；
+  month + day ⇒ month；**month + total ⇒ total**；ceiling 的 total 表示「无约束」不得拉宽；
+  数值上限不受影响；以及「下月窗口起点 > 上月归档戳」的复位证明。
+- 门禁（`v5-g7.py`）：**G7.9e** 单条 month ⇒ `month`；**G7.9f** month+total 并存 ⇒ `total`；
+  **G7.9g** 跨月复位（10 月读数 222 / 11 月读数 777，互不串月）。
+
+**修好后 ⑤ 的收口口径**：至此「**月额度会复位**」才可以算进本期承诺（Lead 明示）。
+
+**顺带发现的第二条缺陷（cache 与时间无关），已单独报 Lead，尚未裁决**
+`getEffectivePolicy` 的缓存条目**与调用方传入的 `now` 无关**：有效性判定是
+`调用方 now − 计算时 now < TTL`，而且 **`noCache: true` 只跳过读、仍然写缓存**
+（`if (!opts.client) cache.set(...)`）。本门禁自己踩到它：G7.6b 用**未来时间**（`NOW+10d`）
+验证 fail-closed 之后，缓存里被放进「未来那一刻」的策略（`deny_scope` ⇒ `limits = UNLIMITED_LIMITS`
+⇒ `period = total`），于是后面**展示路径**读到的是它。
+生产里 `now ≈ Date.now()`，症状轻得多；但形状是真的：任何用合成时间的调用方（回填、门禁、将来的
+`TUNNEL_BILLING_NOW` 类开关）都会污染展示路径。门禁侧已用 `invalidatePolicyCache` 显式规避并注明原因；
+**修不修、怎么修（`noCache` 是否应同时不写、TTL 是否应按墙钟计）请 Lead 裁决**，本节只留痕。
+
+**V5-G7 门禁**（§7.1）：33 断言全绿（含 G7.7/G7.8 的「不覆盖 + 理由」），证据
+`docs/evidence/v5-g7-result-20261005.txt`。门禁抓到的两条夹具陷阱（合成 `now` vs 真实墙钟的
+`effective_at`；窗口上界开放 ⇒ 未来行会被算进当前月）都写进了脚本注释 —— 它们属于
+「**断言因为错误的理由走向另一个分支**」那一族。
 
 ---
 

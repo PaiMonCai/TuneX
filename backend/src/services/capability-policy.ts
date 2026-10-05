@@ -321,14 +321,33 @@ export function composeEffectivePolicy(input: ComposeInput): EffectivePolicy {
     };
   }
 
-  let grantedLimits: PolicyLimitSet = { ...UNLIMITED_LIMITS };
-  let entitlement: PolicyEntitlement = { ...EMPTY_ENTITLEMENT };
+  // ── 累计为什么从**第一条策略**开始，而不是从 `UNLIMITED_LIMITS` 开始 ──
+  //
+  // 数值上限的初值 `null`（不限）确实是 `maxNullable` 的中性元 ✓；但 `traffic_period` 的初值
+  // `"total"` **不是** `unionLimits`（取更宽松：`total > month > day`）的中性元 —— 它是**恒胜元**：
+  // 无论策略声明什么周期，union 的结果都会停在 `total`。
+  //
+  // 后果（修前实测，纯函数即可复现）：**单条 `traffic_period:"month"` 策略 ⇒ 生效周期 = `total`** ⇒
+  // `sumWorkspaceTraffic` 按**全量累计**求和，月度额度永远不复位（用户累计超过一个月额度后被持续拒绝），
+  // 面板的 `traffic_used` 也显示「全量已用」而不是「本月已用」。
+  //
+  // 修法只是恢复 `unionLimits` 自己声明的意图（「取更宽松的一方」），不是重新设计语义：
+  //   **生效周期 = 适用策略中声明的「最长」周期；只有当某条策略真的声明 `total` 时才是 `total`。**
+  // 用 `null` 累加器从第一条起折，避免再引入一个「必须刚好是中性元」的常量。
+  let grantedLimits: PolicyLimitSet | null = null;
+  let entitlement: PolicyEntitlement | null = null;
   let revision = 0;
   for (const p of activePolicies) {
-    grantedLimits = unionLimits(grantedLimits, limitsFromPolicy(p));
-    entitlement = unionEntitlement(entitlement, entitlementFromPolicy(p));
+    const policyLimits = limitsFromPolicy(p);
+    grantedLimits = grantedLimits === null ? policyLimits : unionLimits(grantedLimits, policyLimits);
+    const policyEntitlement = entitlementFromPolicy(p);
+    entitlement =
+      entitlement === null ? policyEntitlement : unionEntitlement(entitlement, policyEntitlement);
     revision += p.revision;
   }
+  // `activePolicies` 在上面已保证非空（空集走 `deny_scope` 早返回）；这两行只是让类型收敛。
+  grantedLimits ??= { ...UNLIMITED_LIMITS };
+  entitlement ??= { ...EMPTY_ENTITLEMENT };
 
   // 平台硬上限收紧协议白名单（交集）与额度（min）。
   const ceilingPolicies = input.ceilings ?? [];

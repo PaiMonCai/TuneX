@@ -247,7 +247,7 @@ SCENARIO = r'''
 /** V5-G7 场景：真 MySQL 上的 DoD 断言（由 v5-g7.py 写入临时文件后执行）。 */
 import { db } from "./db.ts";
 import { billingPeriodKey, billingDayKeyStamp } from "./services/billing-time.ts";
-import { getEffectivePolicy, sumWorkspaceTraffic, sumFederatedUnattributedTraffic, getWorkspaceUsageReport } from "./services/policy-service.ts";
+import { getEffectivePolicy, invalidatePolicyCache, sumWorkspaceTraffic, sumFederatedUnattributedTraffic, getWorkspaceUsageReport } from "./services/policy-service.ts";
 import { defaultSettlementDeps, settleDuePeriods } from "./services/subscription-billing.ts";
 import { applyPlanPurchase } from "./services/subscription-purchase.ts";
 
@@ -433,17 +433,61 @@ await db.workspacePolicyAssignment.create({
   assert("G7.9c", billingDayKeyStamp(new Date("2026-09-30T18:00:00.000Z")).toISOString() === stampFromLabel.toISOString(),
     `stamp=${billingDayKeyStamp(new Date("2026-09-30T18:00:00.000Z")).toISOString()}`);
 
+  // ── 为什么这里要显式失效策略缓存 ──
+  // `getEffectivePolicy` 的缓存**与调用方传入的 `now` 无关**：条目按 workspace 存，
+  // 有效性判定用的是「调用方的 now − 计算时的 now < TTL」，而且 `noCache: true` **只跳过读、
+  // 仍然会写**（`if (!opts.client) cache.set(...)`）。本门禁在 G7.6b 用**未来时间**（NOW+10d）
+  // 调过一次 wsA（那一次是在验证 fail-closed），于是缓存里被放进了"未来那一刻"的策略
+  // （deny_scope ⇒ limits = UNLIMITED_LIMITS ⇒ traffic_period = "total"），
+  // 后面的展示路径读到的就是它 —— 这正是"合成时间 + 与时间无关的缓存"这族陷阱。
+  // 生产里 `now ≈ Date.now()`，所以症状轻得多；但**这个坑本身是真实存在的**，已单独报给 Lead。
+  invalidatePolicyCache(wsA.id);
+
   // 两条读路径同源：用量报告的 traffic_used == 按**它自己给出的周期**做的窗口求和。
-  // （刻意不写死 "month"：见下面的 FINDING —— 生效周期与策略声明不一致是既有缺陷，
-  //   本门禁不断言它，但必须让它可见，不能假装没事。）
   const report = await getWorkspaceUsageReport(wsA.id, { now: NOW });
   const sameSource = await sumWorkspaceTraffic(wsA.id, report.limits.traffic_period, NOW);
   assert("G7.9d", report.traffic_used === sameSource, `report=${report.traffic_used} same_source_sum=${sameSource} period=${report.limits.traffic_period}`);
-  if (report.limits.traffic_period !== "month") {
-    console.log(`G7.FINDING 生效周期=${report.limits.traffic_period}，而两份策略都声明 traffic_period="month"：` +
-      `unionLimits 的初值是 UNLIMITED_LIMITS（total）而 union 取"更宽松"，于是 total 恒胜。` +
-      `后果：额度判定与图表都按**全量累计**而不是自然月 ⇒ 月额度永不复位。属既有缺陷（非 WP20 引入），需 Lead 裁决。`);
+
+  // ── 生效周期语义（Lead 2026-10-05 裁决）──
+  // **生效周期 = 适用策略中声明的「最长」周期；只有当某条策略真的声明 total 时才是 total。**
+  // 这条曾经是缺陷：union 的累加初值 UNLIMITED_LIMITS（total）是"恒胜元"，
+  // 于是单条 month 策略也会被算成 total ⇒ 月额度按全量累计判定、永不复位。
+  const policyMonth = await db.capabilityPolicy.create({
+    data: { key: `g7_m_${Date.now()}`, name: "G7 Month", source: "admin_grant", tunnel_types: ["tcp"], traffic_limit: 5000, traffic_period: "month" },
+  });
+  // ① 单条 month ⇒ month。先给 A 补一条**长期有效**的 month 授予：否则 A 在 NOW 之后会因
+  //    "宽限也过了"而 deny_scope，而 deny_scope 的 limits 是 UNLIMITED_LIMITS（period=total），
+  //    断言就会走到另一个分支（又是"夹具让断言指向别处"那族）。
+  await db.workspacePolicyAssignment.create({
+    data: { workspace_id: wsA.id, policy_id: policyMonth.id, source: "admin_grant", effective_at: new Date(NOW.getTime() - 30 * DAY) },
+  });
+  invalidatePolicyCache(wsA.id);
+  const octReport = await getWorkspaceUsageReport(wsA.id, { now: NOW });
+  assert("G7.9e", octReport.limits.traffic_period === "month", `period=${octReport.limits.traffic_period}`);
+
+  // ② month + total 并存 ⇒ total（更宽松者是声明者之一）
+  const policyTotal = await db.capabilityPolicy.create({
+    data: { key: `g7_t_${Date.now()}`, name: "G7 Total", source: "admin_grant", tunnel_types: ["tcp"], traffic_limit: 5000, traffic_period: "total" },
+  });
+  for (const policy of [policyMonth, policyTotal]) {
+    await db.workspacePolicyAssignment.create({
+      data: { workspace_id: wsB.id, policy_id: policy.id, source: "admin_grant", effective_at: new Date(NOW.getTime() - 30 * DAY) },
+    });
   }
+  invalidatePolicyCache(wsB.id);
+  const both = await getEffectivePolicy(wsB.id, { now: NOW, noCache: true });
+  assert("G7.9f", both.limits.traffic_period === "total", `period=${both.limits.traffic_period}（month+total 并存）`);
+
+  // ③ 跨月复位（可执行证明）：11 月的行不计入"10 月的已用流量"。
+  //    顺序要紧：**先**取 10 月的读数，**再**插 11 月的行 —— 窗口是 `date >= 窗口起点`（上界开放），
+  //    先插后读会把"未来那一行"算进 10 月（生产里不存在未来行，但夹具必须尊重这条口径）。
+  const octUsed = octReport.traffic_used;
+  await db.tunnelTraffic.create({ data: { tunnel_id: tunnel.id, traffic: 777, traffic_cost: 777, date: new Date("2026-11-01T00:00:00.000Z") } });
+  const NOV = new Date("2026-11-15T05:30:00.000Z");
+  invalidatePolicyCache(wsA.id);
+  const novUsed = (await getWorkspaceUsageReport(wsA.id, { now: NOV })).traffic_used;
+  assert("G7.9g", octUsed === 222 && novUsed === 777,
+    `oct=${octUsed} nov=${novUsed}（月额度复位：11 月不含 10 月的 222，10 月不含 11 月的 777）`);
 }
 
 // ── G7.10 联邦缺口可观测且不并账 ──
@@ -582,7 +626,7 @@ def main() -> int:
                     "G7.4a", "G7.4b",
                     "G7.5a", "G7.5b", "G7.5c",
                     "G7.6a", "G7.6b",
-                    "G7.9a", "G7.9b", "G7.9c", "G7.9d",
+                    "G7.9a", "G7.9b", "G7.9c", "G7.9d", "G7.9e", "G7.9f", "G7.9g",
                     "G7.10a", "G7.10b",
                 }
                 missing = sorted(expected - produced)

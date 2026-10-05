@@ -23,7 +23,7 @@ import {
   billingMonthStart,
   billingPeriodKey,
 } from "../../billing-time.ts";
-import { trafficWindowStart } from "../../capability-policy.ts";
+import { composeEffectivePolicy, trafficWindowStart, type PolicyRecord } from "../../capability-policy.ts";
 import { dayKeyOf, fillDays } from "../../traffic.ts";
 import { trafficDate } from "../../traffic-archive.ts";
 import { sumFederatedUnattributedTraffic, type FederatedUsageClient } from "../../policy-service.ts";
@@ -150,6 +150,115 @@ describe("C. traffic_used_unattributed_federated：缺口可观测，但不并�
     expect(source).not.toMatch(/traffic_used:\s*[^,\n]*\+\s*federated/);
   });
 });
+
+
+// ─────────────────────────── C2. 生效周期 = 声明的最长周期（既有缺陷修复） ───────────────────────────
+
+/** 造一条策略（只填判定用得上的字段）。 */
+function pol(over: Partial<PolicyRecord> & { id: number; key: string }): PolicyRecord {
+  return {
+    id: over.id,
+    key: over.key,
+    name: over.name ?? over.key,
+    source: over.source ?? "purchase",
+    applies_to: over.applies_to ?? null,
+    is_ceiling: over.is_ceiling ?? false,
+    status: over.status ?? "active",
+    revision: over.revision ?? 1,
+    tunnel_types: over.tunnel_types ?? ["tcp"],
+    allow_custom_in_group: false,
+    allow_custom_out_group: false,
+    allowed_in_group_ids: null,
+    allowed_out_group_ids: null,
+    allow_shared_entry: false,
+    max_tunnels: over.max_tunnels ?? null,
+    max_nodes: null,
+    max_members: null,
+    traffic_limit: over.traffic_limit ?? null,
+    traffic_period: over.traffic_period ?? "total",
+    bandwidth_limit: null,
+    client_limit: null,
+    ip_limit: null,
+    whitelist_ips: null,
+  };
+}
+
+const assignOf = (policy: PolicyRecord, ceilings: PolicyRecord[] = []) => ({
+  workspace_id: 1,
+  now: new Date("2026-10-05T05:30:00.000Z"),
+  graceMs: 0,
+  assignments: [
+    { policy, source: policy.source, effective_at: new Date("2026-09-01T00:00:00.000Z"), expires_at: null, revoked_at: null, note: null },
+  ],
+  ceilings: ceilings.map((c) => c),
+});
+
+describe("C2. 生效周期 = 适用策略中声明的**最长**周期（修既有缺陷：union 初值曾让 total 恒胜）", () => {
+  test("单条 month ⇒ month（修前是 total ⇒ 月额度按全量累计判定、永不复位）", () => {
+    const policy = composeEffectivePolicy(assignOf(pol({ id: 1, key: "pro", traffic_period: "month", traffic_limit: 100 })));
+    expect(policy.limits.traffic_period).toBe("month");
+    expect(policy.limits.traffic_limit).toBe(100);
+  });
+
+  test("单条 day ⇒ day；month + day ⇒ month（更宽松者是声明者之一）", () => {
+    const day = composeEffectivePolicy(assignOf(pol({ id: 1, key: "d", traffic_period: "day" })));
+    expect(day.limits.traffic_period).toBe("day");
+
+    const both = composeEffectivePolicy({
+      workspace_id: 1,
+      now: new Date("2026-10-05T05:30:00.000Z"),
+      graceMs: 0,
+      assignments: [
+        { policy: pol({ id: 1, key: "m", traffic_period: "month" }), source: "purchase", effective_at: new Date("2026-09-01T00:00:00.000Z"), expires_at: null, revoked_at: null, note: null },
+        { policy: pol({ id: 2, key: "d", traffic_period: "day" }), source: "admin_grant", effective_at: new Date("2026-09-01T00:00:00.000Z"), expires_at: null, revoked_at: null, note: null },
+      ],
+    });
+    expect(both.limits.traffic_period).toBe("month");
+  });
+
+  test("month + total 并存 ⇒ total（只有当某条策略**声明** total 时才是 total）", () => {
+    const both = composeEffectivePolicy({
+      workspace_id: 1,
+      now: new Date("2026-10-05T05:30:00.000Z"),
+      graceMs: 0,
+      assignments: [
+        { policy: pol({ id: 1, key: "m", traffic_period: "month" }), source: "purchase", effective_at: new Date("2026-09-01T00:00:00.000Z"), expires_at: null, revoked_at: null, note: null },
+        { policy: pol({ id: 2, key: "t", traffic_period: "total" }), source: "admin_grant", effective_at: new Date("2026-09-01T00:00:00.000Z"), expires_at: null, revoked_at: null, note: null },
+      ],
+    });
+    expect(both.limits.traffic_period).toBe("total");
+  });
+
+  test("ceiling 的 total 表示「无约束」，不得把已声明的 month 拉宽（与 intersectCeiling 的既有口径一致）", () => {
+    const policy = composeEffectivePolicy(
+      assignOf(pol({ id: 1, key: "pro", traffic_period: "month", traffic_limit: 100 }), [
+        pol({ id: 9, key: "platform_ceiling", is_ceiling: true, traffic_period: "total", traffic_limit: 1000, max_tunnels: 100 }),
+      ]),
+    );
+    expect(policy.limits.traffic_period).toBe("month");
+    expect(policy.ceiling.traffic_period).toBe("total");
+  });
+
+  test("数值上限不受此次修复影响（初值 null 是 max 的中性元，折法等价）", () => {
+    const policy = composeEffectivePolicy(assignOf(pol({ id: 1, key: "pro", max_tunnels: 7, traffic_limit: 500 })));
+    expect(policy.limits.max_tunnels).toBe(7);
+    expect(policy.limits.traffic_limit).toBe(500);
+  });
+
+  test("复位是可执行的：下个月的窗口起点**晚于**上个月的归档戳（所以上月不计入本月用量）", () => {
+    const oct = new Date("2026-10-05T05:30:00.000Z");
+    const nov = new Date("2026-11-05T05:30:00.000Z");
+    // 上月戳：10-05 的归档戳（UTC 午夜）；下月窗口起点：11-01 上海 00:00
+    const octStamp = billingDayKeyStamp(oct);
+    const novWindowStart = billingWindowForMonth(nov);
+    expect(novWindowStart.getTime()).toBeGreaterThan(octStamp.getTime());
+  });
+});
+
+/** 生效月窗口起点（与 `sumWorkspaceTraffic(ws, "month", now)` 内部用的同一个函数）。 */
+function billingWindowForMonth(now: Date): Date {
+  return trafficWindowStart("month", now) as Date;
+}
 
 // ─────────────────────────── D. DoD 第 8 条与读路径切换（静态守卫） ───────────────────────────
 
