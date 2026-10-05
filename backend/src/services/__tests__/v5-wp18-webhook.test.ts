@@ -56,6 +56,7 @@ import {
   redactWebhookDetail,
   redactWebhookTarget,
   resolveWebhookTarget,
+  webhookTlsServername,
   type ResolvedAddress,
   type WebhookAddressClass,
   type WebhookTargetRejection,
@@ -744,6 +745,15 @@ describe("H. 传输层：连的是已校验 IP，只发一次，不跟随重定�
     expect(parseWebhookStatusLine("HTTP/2 200 OK")).toBe(null);
     expect(parseWebhookStatusLine("garbage")).toBe(null);
     expect(parseWebhookStatusLine("HTTP/1.1 999 Weird")).toBe(null);
+  });
+
+  test("SNI 只对域名发；IP 字面量（含带方括号的 IPv6）不发", () => {
+    expect(webhookTlsServername("hooks.example.com")).toBe("hooks.example.com");
+    // URL.hostname 对 IPv6 是带方括号的，而 isIP() 不认方括号 —— 这一条就是防那个坑
+    expect(webhookTlsServername("[2606:4700::1111]")).toBe(undefined);
+    expect(webhookTlsServername("2606:4700::1111")).toBe(undefined);
+    expect(webhookTlsServername("8.8.8.8")).toBe(undefined);
+    expect(webhookTlsServername("")).toBe(undefined);
   });
 });
 

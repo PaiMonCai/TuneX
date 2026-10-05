@@ -484,6 +484,19 @@ export interface WebhookTransportResponse {
 
 export type WebhookTransport = (request: WebhookTransportRequest) => Promise<WebhookTransportResponse>;
 
+/**
+ * TLS SNI 的取值：**域名才发 SNI**，IP 字面量（含带方括号的 IPv6）一律不发。
+ *
+ * 为什么要单独一个函数：`URL.hostname` 对 IPv6 字面量是**带方括号**的（`[2606:4700::1111]`），
+ * 而 `isIP()` 不认方括号 —— 直接拿 `url.hostname` 去判会把 IP 当域名、给它发一个 `[..]` 形态的 SNI。
+ * SNI 的语义是"我要访问哪个**主机名**"，对 IP 目标发 SNI 只会让证书校验的失败信息变得难以理解。
+ */
+export function webhookTlsServername(hostname: string): string | undefined {
+  const bare = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  if (bare === "" || isIP(bare) !== 0) return undefined;
+  return hostname;
+}
+
 /** 请求行/头里出现 CRLF 就拒绝：Host 与路径都必须来自 URL 解析结果，不允许任何拼接注入。 */
 function assertNoCrlf(value: string, what: string): void {
   if (/[\r\n]/.test(value)) throw new Error(`webhook: CRLF in ${what}`);
@@ -549,6 +562,7 @@ export function createPinnedSocketTransport(): WebhookTransport {
         fn();
       };
 
+      const sni = webhookTlsServername(request.url.hostname);
       const socket: Socket =
         request.url.protocol === "https:"
           ? tlsConnect(
@@ -556,8 +570,8 @@ export function createPinnedSocketTransport(): WebhookTransport {
                 host: request.address.address,
                 port,
                 // SNI + 证书校验都对着**域名**：固定 IP 只影响"连到哪"，不影响"信任谁"。
-                // IP 字面量目标（`https://<public-ip>/`）没有 SNI 可言，省略（Node 明确不接受 IP 作 servername）。
-                ...(isIP(request.url.hostname) === 0 ? { servername: request.url.hostname } : {}),
+                // IP 字面量目标没有 SNI 可言，省略（见 webhookTlsServername）。
+                ...(sni === undefined ? {} : { servername: sni }),
               },
               onConnect,
             )
