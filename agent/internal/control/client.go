@@ -106,6 +106,17 @@ type ackPayload struct {
 	Results []diag.Result `json:"results,omitempty"`
 	// Facts carries the node-level self report (collect_diagnostics).
 	Facts *selfinfo.Facts `json:"facts,omitempty"`
+	// HopLocalAddr answers "where does this node's datagram hop come from" for a
+	// RELAY leg (V5.1b WP5-B2): `ip:port` of the socket this node carries client
+	// mappings through.
+	//
+	// It rides on the ACK because the panel needs it SYNCHRONOUSLY: the exit leg is
+	// dispatched BEFORE the ingress exists (§3.2's ordering rule), so its attestation
+	// address cannot be known until this very moment. Waiting for the periodic state
+	// report would leave every new datagram relay dead for up to a reporting cycle,
+	// and the panel would have no way to tell "not serving yet" from "serving".
+	// `next_hop` travels the other way on the egress ACK for exactly the same reason.
+	HopLocalAddr string `json:"hop_local_addr,omitempty"`
 }
 
 type Client struct {
@@ -359,7 +370,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		// reload contract exists to prevent. An upstream-only change rides on
 		// Apply's same-port path (stop old, then start new is acceptable
 		// there because the listener did not move).
-		_, err = c.applyByPlan(cfg)
+		fwd, err := c.applyByPlan(cfg)
 		if err != nil {
 			rollbackPool()
 			ack.ErrorCode = ackCodeFor(err)
@@ -369,6 +380,14 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.OK = true
 		rev := cfg.Revision
 		ack.AppliedRevision = &rev
+		// A datagram RELAY publishes where its hop comes from, so the panel can tell the
+		// exit who may feed it (see HopLocalAddr). Read from the runtime it just built:
+		// the socket exists now, and this is the only moment the fact is fresh.
+		if d, ok := fwd.(forwarder.Diagnostician); ok {
+			if diag, ok := d.ProtocolDiagnostics(); ok && diag.HopLocalAddr != "" {
+				ack.HopLocalAddr = diag.HopLocalAddr
+			}
+		}
 	case ActionDiagnoseTunnel:
 		if cmd.Probe == nil {
 			ack.ErrorCode, ack.Error = "invalid_payload", "missing probe request"

@@ -295,6 +295,16 @@ export interface CommandAckPayload {
   error?: string;
   /** 可选的状态回执（响应 state_request 时携带）。 */
   state?: ResourceSnapshot | null;
+  /**
+   * V5.1b WP5-B2：datagram RELAY 的入口在这个 ACK 里回报**它实际使用的跳端点**
+   *（`ip:port`），面板据此告诉出口该对谁取证。
+   *
+   * 为什么必须走 ACK 而不是周期上报：出口腿**先于**入口腿下发（§3.2 铁律），所以那一刻
+   * 该地址还不存在；等一拍上报（30s）会让每条新建的 datagram relay 在第一个周期内**必然
+   * 不可用**，而面板分不清"还没服务"与"正在服务"。`next_hop` 正是走 egress ACK 回流的，
+   * 一跳的两个方向只差方向不同。
+   */
+  hop_local_addr?: string;
 }
 
 export type CommandPayload =

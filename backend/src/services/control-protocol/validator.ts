@@ -165,7 +165,19 @@ export const ACTION_PAYLOAD_KEYS = {
   update_targets: new Set(["targets"]),
   suspend_tunnel: new Set(["reason"]),
   state_request: new Set<string>(),
-  command_ack: new Set(["acked_command_id", "applied_revision", "status", "error_code", "error", "state"]),
+  command_ack: new Set([
+    "acked_command_id",
+    "applied_revision",
+    "status",
+    "error_code",
+    "error",
+    "state",
+    // V5.1b WP5-B2：datagram RELAY 的入口在 ACK 里回报自己的跳端点，面板用它告诉出口
+    // 该对谁取证。**加这一条是必需的**——这个集合是封闭的，未知键会让整条 ACK 被判非法。
+    // 兼容性：只有新面板能下发 udp RELAY，所以「新 Agent + 老面板」这一组合不可能真的
+    // 发出这个键（老面板在校验层就拒绝该形状）。
+    "hop_local_addr",
+  ]),
   // V4-WP11C: read-only probe. `targets` is derived from the tunnel's own
   // authorized desired state by the panel; the validator only bounds its shape.
   diagnose_tunnel: new Set(["targets", "timeout_ms"]),
