@@ -1,11 +1,9 @@
 /**
  * DDNS readiness gate and post-migration successor.
  *
- * Automatic DNS participates in the existing failover/reconciliation cadence;
- * it does not create another timer or Agent command path. When automatic DNS is
- * enabled, migration starts only if the provider path is demonstrably usable.
- * After placement changes, DNS is updated only once the new Forward revision is
- * actually applied, preventing clients from being pointed at an unready ingress.
+ * Automatic DNS reuses the failover/reconciliation cadence. Migration is gated
+ * on a usable provider path, and DNS changes are published only after the new
+ * Forward revision is applied so clients are never pointed at an unready ingress.
  */
 import { createHttpDdnsProviderClient, syncForwardDns, type DdnsProviderClient, type DdnsSyncDeps, type DdnsSyncResult } from "./ddns-executor.ts";
 import { isSealedDdnsConfig, openDdnsCredential } from "./ddns-binding.ts";
