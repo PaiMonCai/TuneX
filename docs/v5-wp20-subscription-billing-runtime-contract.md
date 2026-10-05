@@ -913,15 +913,33 @@ bunx tsc --noEmit（backend/ 与 web/）                → 本 WP 文件 0 报�
 
 **修好后 ⑤ 的收口口径**：至此「**月额度会复位**」才可以算进本期承诺（Lead 明示）。
 
-**顺带发现的第二条缺陷（cache 与时间无关），已单独报 Lead，尚未裁决**
-`getEffectivePolicy` 的缓存条目**与调用方传入的 `now` 无关**：有效性判定是
-`调用方 now − 计算时 now < TTL`，而且 **`noCache: true` 只跳过读、仍然写缓存**
-（`if (!opts.client) cache.set(...)`）。本门禁自己踩到它：G7.6b 用**未来时间**（`NOW+10d`）
-验证 fail-closed 之后，缓存里被放进「未来那一刻」的策略（`deny_scope` ⇒ `limits = UNLIMITED_LIMITS`
-⇒ `period = total`），于是后面**展示路径**读到的是它。
-生产里 `now ≈ Date.now()`，症状轻得多；但形状是真的：任何用合成时间的调用方（回填、门禁、将来的
-`TUNNEL_BILLING_NOW` 类开关）都会污染展示路径。门禁侧已用 `invalidatePolicyCache` 显式规避并注明原因；
-**修不修、怎么修（`noCache` 是否应同时不写、TTL 是否应按墙钟计）请 Lead 裁决**，本节只留痕。
+**第二条缺陷：策略缓存的「两种时间观」混用（同一门禁调试中撞到，Lead 裁决 (a) 已修）**
+
+**一句话语义**：**缓存的到期是墙钟概念，策略的计算时刻是调用方概念 —— 两者不可混用。**
+
+机制（修前）：`getEffectivePolicy` 的条目里存的是「按调用方 `now` 算出来的策略」+「那个 `now`」，
+有效性判定用 `调用方 now − 计算时 now < TTL`，而且 `noCache: true` **只跳过读、仍然写**
+（`if (!opts.client) cache.set(...)`）。两条合起来有两种坏法：
+- 一个声明「我要按这个时刻重算」的调用方（**契约 §3.2.1 指定的判定侧路径**）反而把结果**发布**给所有其它调用方；
+- 任何传**未来时刻**的调用方（门禁 / 回填 / 将来的 `TUNNEL_BILLING_NOW` 类开关）让条目在调用方时间轴上"永远年轻"
+  （`now − at` 恒为负），把「未来那一刻」的策略钉给**展示路径**。
+
+实测（本门禁自己复现）：G7.6b 用 `NOW+10d` 验证 fail-closed 之后，缓存里留下「那一刻」的策略
+（`deny_scope` ⇒ `limits = UNLIMITED_LIMITS` ⇒ `period = total`），随后 `getWorkspaceUsageReport`
+读到它 ⇒ 面板周期变成 `total`。生产里 `now ≈ Date.now()`，症状轻得多（TTL 默认 1s），但**形状是真的**。
+
+修法两处（都在 `policy-service.ts`）：
+1. `const cacheable = !opts.client && !opts.noCache;` —— **读与写用同一个判据**：`noCache` = 不读**也不写**；
+2. 条目改存 `stored_at_ms = Date.now()`（**墙钟**），TTL 比较也用 `Date.now()`。
+
+**未删除/放宽任何既有断言**：全仓对缓存语义的既有依赖只有 `policy-concurrency.test.ts` 两处
+`{ noCache: true }` 调用（它们断言的是并发锁行为，不是缓存 TTL）—— 本次 **0 处删除、0 处放宽**；
+新增 `src/services/__tests__/v5-wp20/policy-cache-time.test.ts`（子进程 + 可控 db 替身）把两条新语义钉住：
+① TTL 内命中、按**墙钟**过期；② **按未来时刻的 `noCache` 调用不得污染后续调用**；
+③ `noCache` 不读缓存、也不改写它。**并验证了这条守卫会红**：临时还原成修前两行后该测试 FAIL，
+还原后 PASS（与「重复建表守卫」那次同一做法：守卫必须被证明能抓到修复前状态）。
+受影响的 8 个既有套件（policy-concurrency / forward-capability-v4 / scheduler / tunnel-api / wp20 /
+me-capabilities-route / workspace-rbac-v4 / traffic-pipeline）**全部复跑 0 fail**，全树 `tsc` 0 报错。
 
 **V5-G7 门禁**（§7.1）：33 断言全绿（含 G7.7/G7.8 的「不覆盖 + 理由」），证据
 `docs/evidence/v5-g7-result-20261005.txt`。门禁抓到的两条夹具陷阱（合成 `now` vs 真实墙钟的

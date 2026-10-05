@@ -127,7 +127,18 @@ const POLICY_SELECT = {
 /* 缓存（显式失效 + 短 TTL 兜底）                                       */
 /* ------------------------------------------------------------------ */
 
-const cache = new Map<number, { value: EffectivePolicy; at: number }>();
+/**
+ * 策略缓存：`Map<workspace_id, { value, stored_at_ms }>`。
+ *
+ * **两种时间观必须分开**（V5-WP20 修）：条目里的 `stored_at_ms` 是**墙钟**（`Date.now()`），
+ * 它决定「这条缓存还能用多久」；而 `value` 是**按调用方传入的 `now` 计算出来的**策略内容。
+ * 混用两者会得出很坏的结果：
+ *   · 用**调用方 now** 当基准 ⇒ 一个传未来时刻的调用方（门禁、回填、将来的 `TUNNEL_BILLING_NOW`
+ *     类开关）会让条目"永远年轻"（`now - at` 恒为负/极小），把「未来那一刻」的策略钉给所有人；
+ *   · `noCache: true` 若仍然**写**缓存 ⇒ 一个声明"我要按这个时刻重算"的调用方反而成了**污染源** ——
+ *     而契约 §3.2.1 恰恰要求**判定侧**走 `noCache` 每次重算。所以：`noCache` = 不读**也不写**。
+ */
+const cache = new Map<number, { value: EffectivePolicy; stored_at_ms: number }>();
 const CACHE_TTL_MS = Number(process.env.POLICY_CACHE_TTL_MS ?? 1000);
 
 /** 策略发放变更（授予/撤销/到期/修改）后必须调用，保证「撤权立即生效」。 */
@@ -177,13 +188,18 @@ export async function getEffectivePolicy(
   opts: { now?: Date; client?: DbLike; noCache?: boolean } = {},
 ): Promise<EffectivePolicy> {
   const now = opts.now ?? new Date();
-  if (!opts.client && !opts.noCache) {
+  // `noCache` = 不读**也不写**：判定侧按契约 §3.2.1 走这条路"每次重算"，
+  // 若仍然写缓存，它就会把"按这个时刻算出来的结果"发布给所有其它调用方。
+  // 传了 `client`（注入型调用）同样完全不碰进程级缓存。
+  const cacheable = !opts.client && !opts.noCache;
+  if (cacheable) {
     const hit = cache.get(workspaceId);
-    if (hit && now.getTime() - hit.at < CACHE_TTL_MS) return hit.value;
+    // TTL 用**墙钟**衡量（缓存寿命是进程的真实时间），与策略内容的计算时刻 `now` 无关。
+    if (hit && Date.now() - hit.stored_at_ms < CACHE_TTL_MS) return hit.value;
   }
   const inputs = await loadPolicyInputs(workspaceId, opts.client ?? db);
   const policy = composeEffectivePolicy({ workspace_id: workspaceId, ...inputs, now, graceMs: POLICY_GRACE_MS });
-  if (!opts.client) cache.set(workspaceId, { value: policy, at: now.getTime() });
+  if (cacheable) cache.set(workspaceId, { value: policy, stored_at_ms: Date.now() });
   return policy;
 }
 
