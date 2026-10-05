@@ -1,5 +1,5 @@
 /**
- * WP9 — Reconciler / Retry / Recovery（`DEVELOPMENT.md` §7.12）。
+ *  — Reconciler / Retry / Recovery（`DEVELOPMENT.md` §7.12）。
  *
  * ── 把五份事实放在一起比 ──
  *   1. DB desired state    `tunnel.desired_status` + `config_revision`
@@ -11,12 +11,12 @@
  * ── 只有四类动作可以自动执行（§7.12「只允许自动」）──
  *   A. {@link AutoActionKind} `resend_same_revision` —— 以**同一个** revision
  *      重发。Agent 侧等版本会回 duplicate ACK，因此重发天然幂等。
- *      **绝不允许抬高 revision**：抬高期望版本是 WP8 编排器的专属权力，
+ *      **绝不允许抬高 revision**：抬高期望版本是  编排器的专属权力，
  *      reconciler bump revision 等于偷偷改掉用户的期望状态。
  *   B. `fill_missing_runtime` —— desired=active 而 agent 快照里根本没有这条
  *      隧道时，用同 revision 补一遍 apply（A 的特例，分开计数是为了让
  *      「Agent 丢了 runtime」与「ACK 落后」在巡检里可区分）。
- *   C. `release_orphan_lease` —— 只回收**确认无主**的租约，实现直接复用 WP3
+ *   C. `release_orphan_lease` —— 只回收**确认无主**的租约，实现直接复用 
  *      的 `reconcileLeases`（悬空 `tunnel_id` / 过期预分配）。「DB 有租约但
  *      agent 没上报该端口」**不是**无主，那是瞬态，回收它会让下一次分配双绑。
  *   D. `record_finding` —— 记 error/warning。本模块所有不自动执行的偏差都以
@@ -29,10 +29,10 @@
  *   · `delete_on_stale` 心跳超时就删资源（v3 铁律：失败保留 Tunnel，§4.1。
  *     离线节点上的隧道照样保留，节点回来重发同 revision 即恢复）
  *
- * ── 依赖姿态：只定义接口 + 纯逻辑，不等 WP8 ──
- * 下发通道（transport）由 WP8 编排器接线，本模块通过 {@link ReconcileSink}
+ * ── 依赖姿态：只定义接口 + 纯逻辑，不等  ──
+ * 下发通道（transport）由  编排器接线，本模块通过 {@link ReconcileSink}
  * 注入；未注入时默认 sink 只记录 `no_transport` finding，**不会**凭空声称
- * 已重发。端口租约回收复用 WP3 `reconcileLeases` 的判定，不在本模块复制
+ * 已重发。端口租约回收复用  `reconcileLeases` 的判定，不在本模块复制
  * 第二套孤儿规则。
  *
  * 纯判定函数（{@link computeDrift} / {@link planTunnelActions}）不碰 IO，
@@ -86,7 +86,7 @@ export type AutoActionKind = (typeof AUTO_ACTIONS)[number];
 export type ForbiddenActionKind = (typeof FORBIDDEN_AUTO_ACTIONS)[number];
 
 /* ================================================================== */
-/* 输入形状（对照 WP1 schema 的同名列，字段名保持 snake_case）             */
+/* 输入形状（对照  schema 的同名列，字段名保持 snake_case）             */
 /* ================================================================== */
 
 /** DB 侧 desired 事实（`tunnel` 行的最小投影）。 */
@@ -94,7 +94,7 @@ export interface DesiredTunnel {
   id: number;
   name?: string | null;
   tunnel_mode?: "direct" | "relay" | null;
-  /** 期望状态；NULL = 未被 v3 显式声明过（WP2 只回填 mode，不猜状态）。 */
+  /** 期望状态；NULL = 未被 v3 显式声明过（ 只回填 mode，不猜状态）。 */
   desired_status?: string | null;
   /** 控制面期望版本；NULL = 这条隧道还没进入 v3 期望状态模型。 */
   config_revision?: number | null;
@@ -120,13 +120,13 @@ export interface DesiredTunnel {
   desired_pool_targets?: string[] | null;
   desired_target_health?: string[] | null;
   /**
-   * 协议事实（V5-WP0/WP4）。**必须**随行一起投影：resend 路径要据此判定这份事实
+   * 协议事实（/）。**必须**随行一起投影：resend 路径要据此判定这份事实
    * 是否可运行；缺列会被 fail-closed 拒绝（`admitPersistedProtocol` 不再把
    * 「投影忘了选列」当成 V4 的「省略协议」）。
    */
   forward_protocol?: string | null;
   tunnel_type?: string | null;
-  /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
+  /** : node-local tls front paths (paths only, never key material). */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
 }
@@ -153,9 +153,9 @@ export interface NodeOnlineInput {
   /** state_report.reported_at：面板侧收到上报的时刻（DB 侧真相）。 */
   reported_at?: Date | null;
   /**
-   * WP5 `node.lifecycle`（desired 管理态，§13.4.1）。**与 status 正交**：
+   *  `node.lifecycle`（desired 管理态，§13.4.1）。**与 status 正交**：
    * status 是「连没连上」（事实），lifecycle 是「允不允许接新业务」（期望）。
-   * 缺省 undefined = 读到的行没有这一列（WP5 之前的替身/旧查询），此时
+   * 缺省 undefined = 读到的行没有这一列（ 之前的替身/旧查询），此时
    * 不据此等待。
    */
   lifecycle?: string | null;
@@ -296,7 +296,7 @@ export function isErrorState(t: DesiredTunnel): boolean {
 }
 
 /**
- * 节点是否处于「等待应用」状态（V4-WP5 §13.4.2 maintenance）。
+ * 节点是否处于「等待应用」状态（ §13.4.2 maintenance）。
  *
  * maintenance 的三条语义在本函数落地：
  *   1. **不接受需要立即应用的新 runtime 变化** ⇒ reconciler 本轮不下发；
@@ -356,9 +356,8 @@ export function computeDrift(
   now: Date,
   opts: { staleAfterMs?: number } = {},
 ): Drift[] {
-  // 未被 v3 显式声明过的隧道不进 reconciler 视野：legacy DIRECT 的真相在
-  // config-generator / legacy allocator（§5.2），reconciler 对它没有任何
-  // desired 可比，强行对照只会产出噪声 finding。
+  // Rows outside the revisioned desired-state model are compatibility data and
+  // have no authoritative desired snapshot to reconcile here.
   if (!hasDeclaredDesired(tunnel)) return [];
 
   const out: Drift[] = [];
@@ -506,7 +505,7 @@ export function decideAutoAction(
  *      error 且距上次 apply 太近 → 延迟到下一轮，不每轮都打 agent。
  *      `missing_runtime` 不受退避限制：agent 根本就没有这条隧道，等下去只会
  *      无限期缺失。
- *   4. **maintenance 节点等待**（WP5 §13.4.2）。只有 `active` 才承载新
+ *   4. **maintenance 节点等待**（ §13.4.2）。只有 `active` 才承载新
  *      runtime；维护中的节点本轮不下发，退出后自然收敛（见
  *      {@link isNodeInMaintenance}）。`disabled` / `retiring` 不在此列——
  *      那两种状态的 runtime 归属是编排决策，不是巡检该悄悄做的。
@@ -520,7 +519,7 @@ export function planTunnelActions(
   if (!hasDeclaredDesired(tunnel)) return [];
   // 节点不在场 ⇒ 什么都不自动做（离线补不上缺失的 runtime，只能等回来）。
   if (opts.nodeReachable === false) return [];
-  // V4-WP5 §13.4.2：maintenance 节点**等待**。存量 runtime 一行不动、新
+  //  §13.4.2：maintenance 节点**等待**。存量 runtime 一行不动、新
   // desired revision 一条不发——退出维护后 wantsActive + isRevisionBehind
   // 会自然把最新 revision 应用掉，所以这里不需要「记住待办」的队列。
   if (opts.nodeInMaintenance === true) return [];
@@ -618,9 +617,9 @@ export function planFindings(
 /* ================================================================== */
 
 /**
- * 下发通道（由 WP8 编排器接线）。
+ * 下发通道（由  编排器接线）。
  *
- * 只接受 `envelope`（已构造好的 WP6 信封）：reconciler **不**自己拼命令，
+ * 只接受 `envelope`（已构造好的  信封）：reconciler **不**自己拼命令，
  * 否则就是 §7.13 禁令的「第二套下发逻辑」。`resolveRevision` 的作用是把
  * 「重发哪一版」这件事收敛到调用方 —— reconciler 只会传 tunnel 自身的
  * `config_revision`，绝不自造版本号。
@@ -634,9 +633,9 @@ export interface ReconcileSink {
   }): Promise<void>;
 }
 
-/** 端口租约回收依赖（复用 WP3 的孤儿判定，不复制第二套规则）。 */
+/** 端口租约回收依赖（复用  的孤儿判定，不复制第二套规则）。 */
 export interface ReconcileLeasePort {
-  /** WP3 `reconcileLeases` 的返回值形状。 */
+  /**  `reconcileLeases` 的返回值形状。 */
   (options: { dryRun?: boolean; now?: Date; deps?: unknown }): Promise<{
     releasedDanglingTunnel: number;
     releasedExpired: number;
@@ -648,7 +647,7 @@ export type ReconcileLogger = (message: string, meta: Record<string, unknown>) =
 
 /** 每个节点最近一次上报快照（key = `Node.id`）。 */
 export type NodeReport = {
-  /** 面板收到上报的时刻（DB 侧真相，WP7 写入）。 */
+  /** 面板收到上报的时刻（DB 侧真相， 写入）。 */
   reported_at: Date | null;
   /** Agent 自称正在运行的隧道。 */
   tunnels: AgentTunnelState[];
@@ -671,10 +670,10 @@ export interface ReconcileDeps {
   nodes?(): Promise<NodeOnlineInput[]>;
   /** 下发通道；未提供 = 重发类动作只能记 finding（`no_transport`）。 */
   sink?: ReconcileSink | null;
-  /** 端口租约回收（生产 = WP3 `reconcileLeases`）。 */
+  /** 端口租约回收（生产 =  `reconcileLeases`）。 */
   reconcileLeases?: ReconcileLeasePort | null;
   /**
-   * V5.3 WP10：自动故障转移评估（生产 = `runFailoverSweep`）。
+   *：自动故障转移评估（生产 = `runFailoverSweep`）。
    *
    * 注入而不是直接 import，有两个理由：本模块的用例不需要数据库；以及**顺序**
    * 必须由调用方掌握 —— 先续跑未完成的 rollout，再评估新的迁移，否则一次未完成的迁移
@@ -685,7 +684,7 @@ export interface ReconcileDeps {
    */
   failoverSweep?: (() => Promise<{ evaluated: number; moved: number; held: number }>) | null;
   /**
-   * V5.5 WP15：联邦 Forward 的健康收口（可见状态回写 + 通过既有 rollout 恢复整条腿）。
+   *：联邦 Forward 的健康收口（可见状态回写 + 通过既有 rollout 恢复整条腿）。
    *
    * 注入而不是直接 import：本模块的用例不需要数据库。生产由
    * {@link defaultReconcileDeps} 接到 `reconcileFederatedForwardHealth`。
@@ -696,7 +695,7 @@ export interface ReconcileDeps {
    * 缺省 = 不做（旧行为），不是"忘了接线"的安全网。
    */
   federatedForwardHealth?: (() => Promise<ReconcileFederatedHealthSummaryLike>) | null;
-  /** 端口租约回收的依赖注入（透传给 WP3）。 */
+  /** 端口租约回收的依赖注入（透传给 ）。 */
   leaseDeps?: unknown;
   log?: ReconcileLogger;
   now?(): Date;
@@ -720,14 +719,14 @@ export interface ReconcileOutcome {
   /** 端口租约回收统计（`null` = 本轮未配置回收依赖）。 */
   leases: { releasedDanglingTunnel: number; releasedExpired: number } | null;
   /**
-   * V5.3 WP10：自动迁移评估结果（`null` = 本轮未配置该依赖）。
+   *：自动迁移评估结果（`null` = 本轮未配置该依赖）。
    *
    * 放在 outcome 里而不是只写日志：迁移是"改变了谁承载流量"的动作，它的次数必须和
    * resend/failed 一样是**可观测的返回值**，否则"这轮到底有没有搬流量"只能靠翻日志。
    */
   failover: { evaluated: number; moved: number; held: number } | null;
   /**
-   * V5.5 WP15：联邦 Forward 健康收口的统计（`null` = 本轮未配置该依赖）。
+   *：联邦 Forward 健康收口的统计（`null` = 本轮未配置该依赖）。
    */
   federated: ReconcileFederatedHealthSummaryLike | null;
   forbiddenSuppressed: ForbiddenActionKind[];
@@ -758,13 +757,13 @@ export function defaultReconcileDeps(): ReconcileDeps {
         select: {
           id: true,
           name: true,
-          // V5-WP4/G0: the protocol fact travels with the row, because the sink
+          // /G0: the protocol fact travels with the row, because the sink
           // that resends it must decide whether this fact is runnable. Without
           // these columns `admitPersistedProtocol` sees "no fact at all" and the
           // old default would have replayed a historical non-TCP Forward as TCP.
           forward_protocol: true,
           tunnel_type: true,
-          // V5-WP5-A1/A2: the tls front's paths travel with the row, so a resend
+          // /A2: the tls front's paths travel with the row, so a resend
           // can dispatch the same configuration the create did. Without them a
           // tls Forward would be resendable but un-dispatchable.
           tls_cert_path: true,
@@ -803,7 +802,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
     async nodes() {
       const { db } = await import("../db.ts");
       const rows = await db.node.findMany({
-        // WP5：lifecycle 是 §13.4.1 的另一半状态。缺了它，maintenance 节点会被
+        //：lifecycle 是 §13.4.1 的另一半状态。缺了它，maintenance 节点会被
         // 当成「可达且 active」而照样下发新 revision——那正是 §13.4.2 禁的行为。
         select: { id: true, status: true, last_seen_at: true, lifecycle: true, state_report: { select: { reported_at: true } } },
       });
@@ -816,7 +815,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
       })) as NodeOnlineInput[];
     },
     async reports() {
-      // Agent 侧 applied state：WP7 的 node_state_report 快照（每节点一行）。
+      // Agent 侧 applied state： 的 node_state_report 快照（每节点一行）。
       // key 用 node.id 而非上报里的字符串 node_id：DB 外键全走主键。
       const { db } = await import("../db.ts");
       const rows = await db.nodeStateReport.findMany({
@@ -844,7 +843,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
       }
       return map;
     },
-    // 端口租约回收：**复用 WP3 的孤儿判定**（悬空 tunnel_id / 过期预分配），
+    // 端口租约回收：**复用  的孤儿判定**（悬空 tunnel_id / 过期预分配），
     // 不在本模块复制第二套规则（§7.12「清理确认无主 lease」的唯一实现点）。
     async reconcileLeases(options: { dryRun?: boolean; now?: Date; deps?: unknown }) {
       const { reconcileLeases } = await import("./portPool.ts");
@@ -965,7 +964,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         });
         continue;
       }
-      // envelope 由调用方（WP8 编排器）在 sink 内构造：reconciler 只声明
+      // envelope 由调用方（ 编排器）在 sink 内构造：reconciler 只声明
       // 「用这个 tunnel 的哪个 revision」，绝不自己拼命令信封。
       try {
         await deps.sink.resendSameRevision({ tunnel_id: t.id, revision: a.revision as number, envelope: null });
@@ -987,7 +986,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     }
   }
 
-  // ── 联邦 Forward 的健康收口（V5.5 WP15）──
+  // ── 联邦 Forward 的健康收口（）──
   //
   // 位置在**本地逐条对账之后、租约回收之前**，与 worker 里 "本地 reconcile 先、
   // 联邦这一节拍后" 的顺序一致：本机该修的先修，然后由联邦这一遍回答
@@ -1045,7 +1044,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     });
   }
 
-  // ── V5.3 WP10：自动迁移评估（在逐条修复之后）──
+  // ──：自动迁移评估（在逐条修复之后）──
   //
   // 顺序是刻意的：先把"该重发的重发、该补 runtime 的补上"，再考虑"要不要把归属搬走"。
   // 反过来的话，一个只是暂时落后的节点会被判成故障并触发一次代价高昂的迁移。
@@ -1077,7 +1076,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
 }
 
 /**
- * Agent 侧 runtime id 的**唯一**拼接口径（V4-WP6 的 health synthesis 也用它，
+ * Agent 侧 runtime id 的**唯一**拼接口径（ 的 health synthesis 也用它，
  * 所以是 export：两处各拼一次的话，Agent 侧改了规则就会出现「reconciler 说
  * 落后、health 说没运行」的分叉）。
  */
@@ -1211,7 +1210,7 @@ function pickNode(
     seenValues.some((v) => v == null)
       ? null
       : new Date(Math.min(...(seenValues as number[])));
-  // V4-WP5 §13.4.2：lifecycle 必须随折叠视图带出去。漏了它，
+  //  §13.4.2：lifecycle 必须随折叠视图带出去。漏了它，
   // `executeReconcile` 的 `nodeInMaintenance` 对 RELAY 恒为 false（DIRECT 走
   // 上面的 early return 所以不受影响），维护中的入口/出口节点会被照样下发新
   // desired revision——正是 §13.4.2「不接受需要立即应用的新 runtime 变化」
