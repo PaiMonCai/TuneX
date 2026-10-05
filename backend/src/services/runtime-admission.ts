@@ -1,12 +1,20 @@
 /**
- * V5-WP1 —— Runtime admission（能力协商的**唯一**判定入口）。
+ * Runtime admission is the single decision point for command action, product
+ * protocol and transport capability.
+ *
+ * A dispatch is admitted only when all required dimensions are supported by the
+ * target Agent. Unknown/unsupported product protocols never fall back to TCP.
+ * Missing historical capability facts use only the frozen compatibility baseline.
+ */
+
+ *  —— Runtime admission（能力协商的**唯一**判定入口）。
  *
  * §13.5 的第 5 层：命令入队前的最后一道条件。三个正交维度必须**同时**成立，
  * 命令才可以被放进队列：
  *
- *   action      该节点实现了这个动作             ← V4 WP11B（agent-capability.ts）
- *   protocol    该节点实现了这个产品协议          ← V5 WP1（capability-manifest.ts）
- *   transport   该节点实现了这个传输契约          ← V5 WP1
+ *   action      该节点实现了这个动作             ← V4 （agent-capability.ts）
+ *   protocol    该节点实现了这个产品协议          ← V5 （capability-manifest.ts）
+ *   transport   该节点实现了这个传输契约          ← V5 
  *
  * 为什么要有这个模块，而不是让两个调用点各自拼一遍：
  * 「先查动作、再查协议、再查传输」的顺序、以及**哪一个节点**（DIRECT 的入口 /
@@ -44,7 +52,7 @@ import {
 /* 形状                                                                */
 /* ================================================================== */
 
-/** 一次下发的三个正交维度。`protocol` 已通过 WP0 白名单。 */
+/** 一次下发的三个正交维度。`protocol` 已通过  白名单。 */
 export interface RuntimeAdmissionRequest {
   action: string;
   protocol: unknown;
@@ -113,8 +121,8 @@ export function admitOnNode(
 
   const protocol = normalizeForwardProtocol(request.protocol);
   if (protocol === null) {
-    // 走到这里说明调用方跳过了 WP0 的白名单准入。仍然拒绝，且**不**回退成 TCP：
-    // 「未知协议当 TCP 处理」正是 WP0 要消灭的那种静默降级。
+    // 走到这里说明调用方跳过了  的白名单准入。仍然拒绝，且**不**回退成 TCP：
+    // 「未知协议当 TCP 处理」正是  要消灭的那种静默降级。
     return deny(
       node,
       "protocol",
@@ -263,7 +271,7 @@ export interface AdmissionTarget {
 /**
  * 生产实现：读 `node_state_report`。
  *
- * 与 WP11B 同样**懒加载**：本模块被 worker 引用，顶层 import Prisma 会在单测里
+ * 与  同样**懒加载**：本模块被 worker 引用，顶层 import Prisma 会在单测里
  * 建立连接。读失败按「无事实」处理（baseline 动作仍可下发），但**坏形状的库值
  * 不在此处吞掉**——`capabilityFactsFromStoredV2` 把它记成 flag，判定会 fail-closed。
  */
