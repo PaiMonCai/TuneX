@@ -57,7 +57,7 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
 /**
  * 候选节点：同一**入口节点组**内、非现任、且**通过编译器同一份判定**的节点。
  *
- * V5-WP17.1 之前它用 `role + state_report(5 分钟)` 判断，那与编译器的判据**不同源**：
+ * 候选判定必须与编译器同源；仅用 `role + state_report` 会产生判定漂移：
  * 一台凭据已被吊销、或生命周期停在 `suspended` 的机器，在编译器眼里不可用，在这里却"可用"
  * —— 于是迁移会把一条转发搬到一台**面板指挥不动**的机器上。现在两边共用
  * `candidateRejection()`（准入 → 生命周期 → 角色 → 在线），差异只剩一个显式开关：
@@ -74,7 +74,7 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
  * 参数类型用**真实 Prisma 参数类型**（而不是 `unknown`）—— 这不是洁癖，是把它当成最后一道
  * 类型防线：`db.node.findMany({ select: { has_credential: true } })` 曾在这里**静默通过**
  * （`Node` 根本没有这一列，它是派生事实 `node_credential_hash != null`），后果是**每一拍
- * failover 扫描都抛错中止**，而闸门与 DNS 后继就在那个循环里 ⇒ WP17.4 在运行期从未执行过。
+ * failover 扫描都可能抛错中止**，连带阻断同一循环中的闸门与 DNS 后继。
  * 缝隙用 `unknown` 就等于把 Prisma 的字段校验关掉了：替身不认识字段，编译期也不认识。
  */
 export interface FailoverCandidateDb {
