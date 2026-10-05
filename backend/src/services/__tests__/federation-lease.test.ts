@@ -271,6 +271,10 @@ function intent(over: Row = {}): Row {
 function hooks(calls: { dispatch: Row[]; allocate: Row[]; releasePort: Row[]; teardown: Row[] }, over: LeaseHostDeps = {}): LeaseHostDeps {
   return {
     audit: silentAudit,
+    // 固定时钟：夹具里的时间戳（NOW）与"现在"必须一致，否则依赖窗口的用例会**随时间翻转**——
+    // 实测：`a concurrent in-flight claim ...` 在夹具的 NOW 之后 60s（pending 接管窗口）
+    // 就会从"拒绝重投递"变成"接管"，于是一个与改动无关的用例在某一天突然开始失败。
+    now: () => NOW,
     dispatch: (i) => {
       calls.dispatch.push(i as unknown as Row);
       return { ok: true };

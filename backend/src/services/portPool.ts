@@ -297,13 +297,54 @@ export interface PortPoolDeps {
   redis?: PortPoolRedis;
   /** 默认 {@link DEFAULT_LOCK_TTL_S}。 */
   lockTtlS?: number;
+  /**
+   * 该节点**自己上报**的占用端口（Agent 的端口守卫视图）。
+   *
+   * 为什么分配器必须看它：端口归属有两个事实来源 —— 面板的 `node_port_lease`（分配器读的）
+   * 与 Agent 的 `usedPort` 守卫（runtime 真的在听哪个端口）。两者短期不一致是**正常**的
+   * （Remove 之后监听还在关闭、失败创建的残留、守卫漂移），但面板按 DB 发放的后果是
+   * Agent 正确地拒绝 apply，而症状离原因很远：一条路由永远建不起来，日志里只有一个
+   * `*_apply_rejected`。把 Agent 的事实也算作占用，等于让分配器**先问一句**再发端口。
+   *
+   * 注入是为了可测（离线单测传数组），默认实现读 `node_state_report.used_ports`。
+   */
+  agentUsedPorts?: (nodeId: number) => Promise<readonly number[]>;
 }
 
 /** 进程级默认依赖（路由/编排器直接用）。 */
+/**
+ * 默认实现：读该节点最近一次上报里的 `used_ports`（Agent 的端口守卫视图）。
+ *
+ * 失败一律回落到空集：读不到上报**不能**阻断分配（那会把"上报迟到"升级成"建不了隧道"），
+ * 但真实存在的不一致会因此少一层保护 —— 所以失败要留痕。
+ */
+async function defaultAgentUsedPorts(nodeId: number): Promise<readonly number[]> {
+  try {
+    const row = (await (db as unknown as {
+      nodeStateReport: { findUnique(args: unknown): Promise<unknown> };
+    }).nodeStateReport.findUnique({
+      where: { node_id: nodeId },
+      select: { used_ports: true },
+    })) as { used_ports?: unknown } | null;
+    const raw = row?.used_ports;
+    if (!Array.isArray(raw)) return [];
+    const out: number[] = [];
+    for (const v of raw) {
+      const n = typeof v === "number" ? v : Number(v);
+      if (Number.isInteger(n) && n > 0) out.push(n);
+    }
+    return out;
+  } catch (e) {
+    console.warn("[portPool] agent used_ports unavailable:", e instanceof Error ? e.message : e);
+    return [];
+  }
+}
+
 const defaultDeps: Required<PortPoolDeps> = {
   db: db as unknown as PortPoolDb,
   redis: redis as unknown as PortPoolRedis,
   lockTtlS: DEFAULT_LOCK_TTL_S,
+  agentUsedPorts: defaultAgentUsedPorts,
 };
 
 /** 合并调用方注入的依赖（只注入需要的部分，其余走默认单例）。 */
@@ -312,6 +353,7 @@ function deps(over: PortPoolDeps | undefined): Required<PortPoolDeps> {
     db: over?.db ?? defaultDeps.db,
     redis: over?.redis ?? defaultDeps.redis,
     lockTtlS: over?.lockTtlS ?? defaultDeps.lockTtlS,
+    agentUsedPorts: over?.agentUsedPorts ?? defaultDeps.agentUsedPorts,
   };
 }
 
@@ -464,7 +506,7 @@ export async function acquirePort(
   input: AcquirePortInput,
   inject?: PortPoolDeps,
 ): Promise<AcquirePortOutcome> {
-  const { db: pdb, redis: rdb, lockTtlS } = deps(input.deps ?? inject);
+  const { db: pdb, redis: rdb, lockTtlS, agentUsedPorts } = deps(input.deps ?? inject);
   const context = await resolveContext(pdb, input.nodeId);
   if (!context.ok) return { ok: false, code: context.code };
   const { scope, range } = context.ctx;
@@ -500,6 +542,12 @@ export async function acquirePort(
     }
   }
   for (const row of activeRows) reserved.add(row.port);
+  // Agent 自己报的占用端口同样算占用（见 PortPoolDeps.agentUsedPorts 的说明）：
+  // 面板的租约表可能比 Agent 的守卫更早释放（Remove 立即释放、监听稍后关闭），
+  // 也可能更晚（失败创建的残留）。两份事实取并集，Agent 才不会拒绝一次我们以为合法的分配。
+  for (const p of await agentUsedPorts(input.nodeId)) {
+    if (isValidPort(p)) reserved.add(p);
+  }
 
   // 预分配默认 TTL：NULL expiry 的预分配是 reconcile 收不回的孤儿
   // （删隧道会把 tunnel_id 打成 NULL，无法与「活着的新建中」区分）。

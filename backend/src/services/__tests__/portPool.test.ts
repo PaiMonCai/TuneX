@@ -263,6 +263,32 @@ afterEach(() => {
 /* ================================================================== */
 
 describe("1. 并发分配无重复（§7.6 DoD）", () => {
+  test("Agent 上报的占用端口会被跳过（面板的租约表不是唯一事实）", async () => {
+    // 现场根因：面板按 DB 租约发端口，而 Agent 的端口守卫仍占着那个端口（Remove 之后监听
+    // 还在关闭、或守卫漂移），Agent 于是**正确地**拒绝 apply —— 症状是一条路由永远建不起来，
+    // 日志里只有一个 `*_apply_rejected`，离原因很远。
+    // 这里钉住的是修法：分配器把节点**自己报的** used_ports 也算作占用。
+    const h = harness();
+    seedNode(1, [19000, 19001, 19002]);
+
+    const first = await pool.acquirePort({ nodeId: 1, leaseType: "ingress", tunnelId: 1, deps: h.deps });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const taken = first.result.port;
+
+    // 该端口在 DB 里被 released（面板视角空闲），但 Agent 仍然占着它。
+    leases.length = 0;
+    const second = await pool.acquirePort({
+      nodeId: 1,
+      leaseType: "ingress",
+      tunnelId: 2,
+      deps: { ...h.deps, agentUsedPorts: async () => [taken] },
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.result.port).not.toBe(taken);
+  });
+
   test("50 个并发 acquire 拿到 50 个互不相同的端口", async () => {
     const h = harness();
     seedNode(1, [19000, 19200]); // 201 个端口远大于 50 并发，必定成功
