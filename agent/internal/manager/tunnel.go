@@ -64,6 +64,16 @@ type TunnelManager struct {
 	tunnels  map[string]*entry
 	usedPort map[string]bool // "<socket namespace>:<port>" guard shared with EgressManager
 
+	// stoppingPorts 记录"Stop 已经发起、但监听还没真正关闭"的端口（多重集）。
+	//
+	// 为什么需要它：端口守卫是**派生状态** —— 它必须恰好等于"还有 runtime 在听这个端口"。
+	// 而"还在听"包含两类：`tunnels` 里的 entry，以及正在 drain 的旧 entry（它的监听还没关，
+	// 内核层面这个端口仍被占）。只按 `tunnels` 重建会在 drain 期间把端口错放出去
+	// （下一次 bind 直接 `address already in use`）；只按手工 mark/release 维护则会**漏**
+	// （实测：runtime 早已 removed，`used_ports` 里还留着 22001，于是复用该端口的下一条路由
+	// 被 Agent 拒绝，而面板的端口租约早已释放 —— 两边对"端口归谁"给了不同答案）。
+	stoppingPorts map[string]int
+
 	egress *EgressManager
 	// listenHost is the interface ingress/egress tunnels bind when the config
 	// does not pin one. Empty means all interfaces.
@@ -189,8 +199,9 @@ func (m *TunnelManager) notifyIfChanged(before string) {
 // EGRESS tunnels are then rejected. listenHost may be empty.
 func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 	return &TunnelManager{
-		tunnels:    make(map[string]*entry),
-		usedPort:   make(map[string]bool),
+		tunnels:       make(map[string]*entry),
+		usedPort:      make(map[string]bool),
+		stoppingPorts: make(map[string]int),
 		egress:     egress,
 		listenHost: listenHost,
 	}
@@ -443,6 +454,10 @@ func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Ru
 		delete(m.usedPort, portGuardKey(old.cfg))
 		return fwd.Start()
 	}
+	// 端口被拒绝必须留痕。这次定位根因时，"Agent 为什么拒绝"在日志里完全没有痕迹，
+	// 只能从数据库里的 apply_error 反推 —— 决策不留痕的机制与从未运行过的机制无法区分。
+	logx.Warn("apply rejected: port is guarded by another runtime",
+		"id", cfg.ID, "port", port, "protocol", string(cfg.Protocol), "revision", cfg.Revision)
 	return fmt.Errorf("manager: port %d is already used by another tunnel", port)
 }
 
@@ -452,6 +467,52 @@ func (m *TunnelManager) markPortUsedLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
 		m.usedPort[portGuardKey(cfg)] = true
 	}
+}
+
+// noteStoppingLocked records that this config's listener is being torn down and its
+// port is therefore not yet reclaimable. Caller must hold m.mu.
+func (m *TunnelManager) noteStoppingLocked(cfg forwarder.TunnelConfig) {
+	if cfg.ListenPort() <= 0 {
+		return
+	}
+	m.stoppingPorts[portGuardKey(cfg)]++
+}
+
+// clearStoppingLocked is the matching decrement, run once Stop returned (the
+// listener is closed and the port is genuinely free at the OS level).
+func (m *TunnelManager) clearStoppingLocked(cfg forwarder.TunnelConfig) {
+	if cfg.ListenPort() <= 0 {
+		return
+	}
+	key := portGuardKey(cfg)
+	if n := m.stoppingPorts[key]; n > 1 {
+		m.stoppingPorts[key] = n - 1
+	} else {
+		delete(m.stoppingPorts, key)
+	}
+}
+
+// rebuildPortGuardLocked 从**事实**重新推导端口守卫：
+//
+//	守卫 = {还有 runtime 在听的端口} ∪ {Stop 已发起但尚未返回的端口}
+//
+// 这是这次修复的核心：守卫是派生状态，不该由散落在各处的 mark/release 手工维护 ——
+// 只要漏掉一条路径（或有并发交错），就会留下一个"没人监听、却谁也拿不到"的端口，
+// 而它的症状出现在很远的地方（下一条复用该端口的路由被拒，日志里看起来像端口分配有 bug）。
+// 每次改动 `tunnels` 之后重建一次，这类漂移就不可能持续存在。Caller must hold m.mu.
+func (m *TunnelManager) rebuildPortGuardLocked() {
+	next := make(map[string]bool, len(m.tunnels)+len(m.stoppingPorts))
+	for _, e := range m.tunnels {
+		if e.cfg.ListenPort() > 0 {
+			next[portGuardKey(e.cfg)] = true
+		}
+	}
+	for key, n := range m.stoppingPorts {
+		if n > 0 {
+			next[key] = true
+		}
+	}
+	m.usedPort = next
 }
 
 // releasePortLocked frees the port held by cfg. Caller must hold m.mu.
@@ -484,12 +545,20 @@ func (m *TunnelManager) stopEntry(e *entry) {
 // (Stop blocks for drainTimeout); onStopped is invoked from the goroutine, after
 // Stop returned. A nil hook is the plain "Stop and log" case.
 func (m *TunnelManager) stopEntryAsync(e *entry, onStopped func()) {
+	// 注意：**不在这里加锁**。调用方可能仍持有 m.mu（applyLocked 的 defer 就是这种情形），
+	// 同步取锁会直接死锁（实测把整个套件挂住 30s+）。"正在关闭"的登记由**持锁的改动路径**
+	// 负责（removeInnerIf / applyLocked 的换端口分支），这里只负责在 Stop 返回后清账。
 	go func() {
 		if err := e.fwd.Stop(); err != nil {
 			logx.Warn("tunnel stop failed", "id", e.cfg.ID, "err", err.Error())
 			// Fall through anyway: the forwarder is out of the registry, so
 			// the port is ours to keep or free whatever Stop managed to do.
 		}
+		// Stop 返回 = 监听已关 = 端口真的可以再分配：清掉"正在关闭"标记并按事实重建守卫。
+		m.mu.Lock()
+		m.clearStoppingLocked(e.cfg)
+		m.rebuildPortGuardLocked()
+		m.mu.Unlock()
 		if onStopped != nil {
 			onStopped()
 		}
@@ -574,6 +643,9 @@ func (m *TunnelManager) removeInnerIf(id string, cond func(forwarder.TunnelConfi
 	}
 	delete(m.tunnels, id)
 	m.releasePortLocked(e.cfg)
+	// 按事实重建：Remove 的既有契约是"立即释放"（swap_test 明确钉住了这条语义 —— 排空不是移除，
+	// 移除就该把端口交出来），所以这里**不**登记 stopping；重建只是把任何漂移的键抹平。
+	m.rebuildPortGuardLocked()
 	m.mu.Unlock()
 
 	m.stopEntry(e)
@@ -738,6 +810,7 @@ func (m *TunnelManager) StopAll() {
 		delete(m.tunnels, id)
 	}
 	m.usedPort = make(map[string]bool)
+	m.stoppingPorts = make(map[string]int)
 	m.mu.Unlock()
 
 	var wg sync.WaitGroup

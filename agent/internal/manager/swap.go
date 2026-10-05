@@ -416,6 +416,7 @@ func (m *TunnelManager) replaceSiblingTransportLocked(
 	}
 	m.markPortUsedLocked(cfg)
 	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
+	m.rebuildPortGuardLocked()
 	logx.Info("tunnel ingress transport replaced",
 		"old_id", oldID, "id", cfg.ID, "mode", string(cfg.Mode),
 		"port", cfg.ListenPort(), "revision", cfg.Revision)
@@ -585,6 +586,11 @@ func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwa
 			// advertise a port the kernel still has bound. The reservation
 			// is dropped in the teardown hook, never from this goroutine,
 			// and only if no other tunnel has taken the port by then.
+			//
+			// 我们在锁内先把它记为"正在关闭"：下面那次 rebuildPortGuardLocked 是按**事实**
+			// 重建的，而此刻旧 entry 已经不在 m.tunnels 里 —— 不登记的话重建会立刻把旧端口
+			// 放出去，恰好违反这条注释所承诺的语义（swap_test 有专门的断言钉住它）。
+			m.noteStoppingLocked(old.cfg)
 			m.stopEntryAsync(old, m.releasePortAfterStop(old.cfg))
 		} else {
 			// Same port: the new forwarder already owns the reservation,
@@ -595,6 +601,7 @@ func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwa
 		// The old instance is already tearing down; nothing to defer.
 	}
 	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
+	m.rebuildPortGuardLocked()
 	logx.Info("tunnel listener replaced", "id", cfg.ID, "mode", string(cfg.Mode),
 		"old_port", oldPortOf(old, hadOld), "port", cfg.ListenPort(), "revision", cfg.Revision)
 
@@ -627,6 +634,10 @@ func (m *TunnelManager) applyLocked(cfg forwarder.TunnelConfig) (forwarder.Runti
 			// stopped. On the same-port path startLocked already stopped it,
 			// so its listener is closed; either way the reservation is
 			// dropped only after Stop returns, never before.
+			//
+			// 我们在锁内登记"这个旧端口正在关闭"（Stop 返回前内核仍占着它），
+			// 清账交给 stopEntryAsync 的 goroutine。
+			m.noteStoppingLocked(old.cfg)
 			defer m.stopEntryAsync(old, m.releasePortAfterStop(old.cfg))
 		} else {
 			// Same port, same owner: the new forwarder holds the key, so the
@@ -636,6 +647,9 @@ func (m *TunnelManager) applyLocked(cfg forwarder.TunnelConfig) (forwarder.Runti
 	}
 	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
 	m.markPortUsedLocked(cfg)
+	// 登记完成后按**事实**重建守卫：手工 mark/release 只在当前这一拍成立，
+	// 重建把"守卫 = 还在听的 runtime ∪ 正在关闭的 runtime"这条不变量钉死。
+	m.rebuildPortGuardLocked()
 	logx.Info("tunnel applied", "id", cfg.ID, "mode", string(cfg.Mode),
 		"port", cfg.ListenPort(), "revision", cfg.Revision)
 	return fwd, nil
