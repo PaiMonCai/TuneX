@@ -21,6 +21,7 @@ import { db } from "../db.ts";
 import { billingDayStart, billingMonthStart } from "./billing-time.ts";
 import {
   composeEffectivePolicy,
+  describeDeny,
   type ComposeInput,
   type EffectivePolicy,
   type PolicyAssignment,
@@ -332,6 +333,49 @@ export interface WorkspaceUsageReport extends WorkspaceUsage {
    * 端点准备；当前唯一对外可见的用量面是 `GET /api/workspaces/:id/traffic`。
    */
   traffic_used_unattributed_federated: number;
+  /** 到期/宽限的可观测投影（V5-WP20-5，见 {@link buildUsageExpiryView}）。 */
+  expiry: UsageExpiryView;
+}
+
+/**
+ * 到期 / 宽限的可观测投影（V5-WP20-5）。
+ *
+ * **它只是 `EffectivePolicy` 的投影，不是第二真相**：所有值都由入参现算，不落库、不参与判定。
+ * 存在的理由是让前端少写一套派生逻辑（尤其 `deny_message` —— 拒绝文案的唯一实现是
+ * `capability-policy#describeDeny`，前端不该再抄一份中文）。
+ *
+ * 四条语义（每条都有反例测试）：
+ *   · `policy_expires_at` = **当前生效发放**里最早的到期点；全部终身 / 无生效发放 ⇒ `null`。
+ *     反例：取「最晚」会把「最早消失的那条」藏起来，用户看到还有余额却突然被拒。
+ *   · `in_grace` = 一条有效发放都没有、但仍有**在宽限期内**的已到期发放（F3）。
+ *     此时策略仍放行，只是 `deny_reason="policy_expired"`。
+ *   · `grace_expires_at` = 宽限窗口的终点（过了它就 `deny_scope`）。
+ *   · `deny_message` = `describeDeny(deny_reason)` 的原文（`null` = 没有被拒绝）。
+ *     `deny_scope=true` 时 `deny_reason="no_active_policy"`，文案同样是后端给的。
+ */
+export interface UsageExpiryView {
+  policy_expires_at: string | null;
+  in_grace: boolean;
+  grace_expires_at: string | null;
+  deny_scope: boolean;
+  deny_reason: string | null;
+  deny_message: string | null;
+}
+
+/** {@link UsageExpiryView} 的唯一实现（纯函数：喂 `EffectivePolicy` 即得）。 */
+export function buildUsageExpiryView(policy: EffectivePolicy): UsageExpiryView {
+  const expiries = policy.active_policies
+    .map((p) => (p.expires_at ? Date.parse(p.expires_at) : Number.NaN))
+    .filter((ms) => Number.isFinite(ms));
+  const in_grace = policy.grace_policies.length > 0;
+  return {
+    policy_expires_at: expiries.length ? new Date(Math.min(...expiries)).toISOString() : null,
+    in_grace,
+    grace_expires_at: policy.grace_expires_at,
+    deny_scope: policy.deny_scope,
+    deny_reason: policy.deny_reason,
+    deny_message: policy.deny_reason ? describeDeny(policy.deny_reason) : null,
+  };
 }
 
 /** 给 `/api/me/capabilities` 与仪表盘用的完整用量 + 限额视图。 */
@@ -354,6 +398,7 @@ export async function getWorkspaceUsageReport(
     members,
     traffic_used,
     traffic_used_unattributed_federated: federated,
+    expiry: buildUsageExpiryView(policy),
     policy,
     limits: policy.limits,
   };

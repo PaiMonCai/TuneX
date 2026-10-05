@@ -11,6 +11,7 @@ import { serverT } from "@/lib/server-i18n";
 import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
 import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
 import { AttentionPanel } from "@/components/dashboard/attention-panel";
+import { PlanExpiryNotice } from "@/components/dashboard/plan-expiry-notice";
 import { AnnouncementBanner } from "@/components/announcements/announcement-banner";
 import { normalizeAnnouncements, type Announcement } from "@/lib/announcements";
 import { forwardProductBadgeVariant, forwardProductStatus } from "@/lib/forward-status";
@@ -145,6 +146,8 @@ export async function DashboardBody() {
               <span className="text-[var(--muted-foreground)]">{t("dashboard.expiresAt")}</span>
               <span>{formatDate(stats?.expired_at ?? null)}</span>
             </div>
+            {/* V5-WP20-5：到期/宽限的提示（纯展示组件，见 plan-expiry-notice.tsx）。 */}
+            <PlanExpiryNotice expiry={stats?.expiry} expiresLabel={t("dashboard.expiresAt")} />
             <div className="flex items-center justify-between text-sm">
               <span className="text-[var(--muted-foreground)]">{t("dashboard.todayTraffic")}</span>
               <span>{formatBytes(stats?.today_traffic ?? 0)}</span>

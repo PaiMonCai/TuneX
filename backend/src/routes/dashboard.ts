@@ -29,7 +29,7 @@ import { collectAttention } from "../services/attention.ts";
 import { projectUserNode } from "../services/node-view.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { billingDayStart, billingMonthStart } from "../services/billing-time.ts";
-import { getEffectivePolicy, sumWorkspaceTraffic } from "../services/policy-service.ts";
+import { buildUsageExpiryView, getEffectivePolicy, sumWorkspaceTraffic } from "../services/policy-service.ts";
 import { fillDays } from "../services/traffic.ts";
 
 export const dashboardRoutes = new Hono<{ Variables: AppVariables }>();
@@ -177,6 +177,10 @@ dashboardRoutes.get("/stats", async (c) => {
     // 上限也必须跟着换：否则会出现「用量按策略窗口、上限按旧列」的错配（两个数字不可比）。
     // 策略读不到时回落 legacy 列，保证仪表盘不因策略故障而缺字段。
     traffic_limit: policyView?.limits.traffic_limit ?? userPlan?.traffic ?? null,
+    // V5-WP20-5：到期/宽限的可观测投影（同一个纯函数，与 /api/me/capabilities 同源）。
+    // `null` = 策略读取失败（与「没有到期点」区分开：后者是 `policy_expires_at: null`）。
+    // `plan_expired_at` 是 legacy 列的展示值，保留以兼容现有前端；新前端应优先读 `expiry`。
+    expiry: policyView ? buildUsageExpiryView(policyView) : null,
     plan_name: userPlan?.plan?.name ?? null,
     expired_at: userPlan?.expired_at ?? null,
     active_nodes: activeNodes,

@@ -3,8 +3,8 @@
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
 > （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）、
 > WP20-4（支付 → 发放接线 + 续期执行器）、WP20-4b（套餐 ↔ 策略绑定入口）、
-> WP20-6（流量口径统一）、WP20-6b（`/api/me/capabilities` 端点）已交付**
-> （§5.1–§5.7）。除这七处记录外，本契约其余部分仍**不含实现**。
+> WP20-5（到期降级与可观测）、WP20-6（流量口径统一）、WP20-6b（`/api/me/capabilities` 端点）已交付**
+> （§5.1–§5.8）。除这八处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -325,7 +325,7 @@ worker 新增一个 tick。
 | **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | ✅ **已交付**（2026-10-05，见 §5.3）：`backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时 `45 * * * *`） | WP20-2 |
 | **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | ✅ **已交付**（2026-10-05，见 §5.4）：`policy-service.ts#grantPolicyFromPurchase` + `subscription-purchase.ts`（购买/续期共用实现）+ `routes/plans.ts` 事务内调用 + `invalidatePolicyCache`；并把续期执行器 `renewSubscriptionPeriod` 接上 | WP20-2 |
 | **WP20-4b** | 套餐 ↔ 策略绑定入口（WP20-4 的写入路径补完） | ✅ **已交付**（2026-10-05，见 §5.5）：`services/plan-subscription.ts` + 套餐 CRUD 的 `policy_id` + 只读选项端点 + 前端字段 | WP20-4 |
-| **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
+| **WP20-5** | 到期降级与可观测 | ✅ **已交付**（2026-10-05，见 §5.8）：`buildUsageExpiryView` 投影落在 `/api/me/capabilities` 与 `/api/dashboard/stats`；前端 `PlanExpiryNotice` 渲染后端文案；**DoD 6 证明**（不新增状态机） | WP20-4 |
 | **WP20-6** | 流量口径统一 | ✅ **已交付**（2026-10-05，见 §5.6）：三处日/月界收敛到 `billing-time.ts`、`traffic_used` 读取路径切换、`traffic_used_unattributed_federated` 落在已挂载的用量端点上 | WP20-1 |
 | **WP20-6b** | 补 `GET /api/me/capabilities`（契约 §3.3.2 的读路径落点） | ✅ **已交付**（2026-10-05，见 §5.7）：`routes/me.ts` + `app.ts` 挂载 + 子进程 HTTP 契约 | WP20-6 |
 | **WP20-7** | （条件）流量倍率 | 仅当 O3 选 B 时立项，需独立契约补充 + Gate 断言 | O3 拍板 |
@@ -619,7 +619,7 @@ DATABASE_URL=... bunx prisma migrate diff --from-schema-datamodel <改动前> --
 - **全树 `tsc` 有一处不属于本 WP 的红**：`prisma/seed.ts` 的 `DEFAULT_CONFIG` 缺
   `LATENCY_RAW_RETENTION_HOURS` / `LATENCY_BUCKET_RETENTION_DAYS`（WP19 的枚举值已在 `7895b40` 落地但没补 seed 键；
   它们的默认值在自己的 `services/latency-history.ts` 里是 24 / 30）。**不是我的文件，我没有代改**（猜产品默认值不对）。
-- WP20-5（到期降级可观测）未做（WP20-6 已于 §5.6 交付）；`DEVELOPMENT.md` §4 登记（DoD 11）不在本 WP 范围。
+- WP20-5（到期降级可观测）与 WP20-6（流量口径统一）分别见 §5.8 / §5.6；`DEVELOPMENT.md` §4 登记（DoD 11）不在本 WP 范围。
 
 **证据**
 
@@ -813,6 +813,68 @@ bun test src/services/__tests__/v5-wp20/ + 上述两个文件     → 136 pass /
 ```
 
 **DoD 覆盖矩阵（针对 WP20-6b）**：不新增 DoD 条目；它消掉的是 §3.3.2 的「读路径指向不存在的端点」缺口。
+
+---
+
+### 5.8 WP20-5 落地记录 —— 到期降级与可观测（2026-10-05）
+
+**交付物**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/src/services/policy-service.ts` | 新增纯函数 `buildUsageExpiryView(policy)` + `UsageExpiryView`；用量报告带上 `expiry` |
+| `backend/src/routes/dashboard.ts` | `/stats` 带上同一个 `expiry`（两条读路径同一个实现） |
+| `backend/src/services/__tests__/v5-wp20/policy-expiry-degrade.test.ts` | 新增 17 条断言（**DoD 第 6 条**的完整证明） |
+| `web/src/components/dashboard/plan-expiry-notice.tsx` + `dashboard-body.tsx` + `lib/types.ts` | 用户可见的到期/宽限提示（渲染后端文案） |
+| `web/src/components/dashboard/__tests__/plan-expiry-notice.test.tsx` | 5 条渲染断言 |
+
+**冻结的语义**
+
+1. **没有新状态机、没有翻转任务**（§3.2.1）：三种用户可见状态全部由 `expires_at` 上的时间比较得出，
+   代码侧一行都没加 —— 本 WP 只**证明**它并按需**投影**它。守卫：`*Status` 枚举集合仍逐字等于
+   `Status`/`TopupOrderStatus`/`WithdrawStatus`/`TicketStatus`；`policy-service.ts` 里不出现
+   `status: "expired"` 或 `AssignmentStatus`。
+2. **DoD 6 的完整证明**（顺序即用户经历）：
+   - **宽限内**：只有 `purchase` 且刚过期 ⇒ `grace_policies=["pro_monthly"]`、`deny_reason="policy_expired"`、
+     `deny_scope=false`，且**额度不缩水**（10 条 / tcp+udp 全在）；
+   - **自动降级**：`purchase` 过期而 `system_default` 有效 ⇒ 权限收窄到剩下的那份
+     （max_tunnels 10→1、traffic_limit 100000→1000、协议 2→1），`deny_reason=null`；
+     并断言**单调收窄**（额度只可能变小或持平）；
+   - **fail-closed**：越过宽限且无有效发放 ⇒ `deny_scope=true` + `no_active_policy`；
+     边界两侧各 1ms 都有断言；显式撤销（`revoked_at`）**不吃宽限**（F3）。
+3. **`buildUsageExpiryView` 是投影，不是第二真相**：所有值现算自 `EffectivePolicy`，不落库、不参与判定。
+   四条语义各有反例测试：
+   - `policy_expires_at` 取**最早**到期点（取最晚会把「最早消失的那条」藏起来，用户看到还有余额却突然被拒）；
+   - 全部终身 ⇒ `null`（不是「很远的一天」）；
+   - `in_grace` = 一条有效发放都没有、但仍有宽限内的已到期发放（此时**仍放行**）；
+   - `deny_message` = `describeDeny(deny_reason)` 的原文 —— **拒绝文案的唯一实现**，前端渲染它，
+     不在前端抄中文（测试断言组件源码里不含那句中文，防止「后端改词、前端永远显示旧那句」）。
+4. **一处用测试发现、而不是用测试固化的语义**：宽限期内 `active_policies` **不是空的** ——
+   它的语义是「**当前有效**的发放集合」，宽限中的已到期行也在其中（这正是宽限内仍放行的实现方式），
+   `grace_policies` 只是给它们打标记。我起初断言为空，跑出真值后改成断言真值并写进这里
+   （「用测试固化自己的猜测」比「没测」更坏）。
+
+**守卫新纪律（采纳 Lead 的判据）**：前端那条「文案唯一实现」的守卫**先剥注释再匹配**。
+门禁若把注释也算进去，就会惩罚写解释性注释的人 —— 而注释恰恰是最有价值的文档。
+（反例语境：我这次第一版守卫就被自己文档注释里的「已到期」三个字命中。）
+
+**未决**
+- `≤10 分钟计量滞后`的产品文案仍是待办（措辞属产品决策，与 §5.6 的同一项）。
+- `dashboard.stats.expired_at` 保留为 legacy 兼容值（新前端优先读 `expiry`）；两者对个人购买路径是同步的
+  （WP20-4 双写），但真相是订阅/发放，不是这一列。
+- `dashboard.stats.max_tunnels`/`plan_name` 仍读 legacy（额度展示的其余部分属后续）。
+
+**证据**
+
+```
+bun test src/services/__tests__/v5-wp20/            → 148 pass / 0 fail / 582 expect()（其中 expiry 组 17 条）
+bun test web/src/components/dashboard/__tests__/plan-expiry-notice.test.tsx → 5 pass
+bunx tsc --noEmit（backend/ 与 web/）                → 本 WP 文件 0 报错
+```
+
+**DoD 覆盖矩阵（针对 WP20-5）**：**第 6 条 ✅**（宽限 / 降级 / fail-closed / 边界 / 撤销）；
+第 7 条 ✅ 不回归（枚举集合逐字不变）；第 1/2/4/5/8/9 条不回归；第 10 条 ⏳（e2e 未跑）；
+第 11 条 ⏳（`DEVELOPMENT.md` 登记不在本 WP）。
 
 ---
 

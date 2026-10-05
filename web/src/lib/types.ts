@@ -632,6 +632,21 @@ export interface DashboardStats {
   traffic_limit: number | null;
   plan_name: string | null;
   expired_at: string | null;
+  /**
+   * V5-WP20-5：到期/宽限的可观测投影（后端 `policy-service#buildUsageExpiryView` 的输出）。
+   * `null` = 策略读取失败（与「没有到期点」区分：后者是 `policy_expires_at: null`）。
+   *
+   * 为什么展示层要读它而不是自己判断到期：拒绝文案的唯一实现是后端的 `describeDeny`，
+   * 前端抄一份中文就会出现两处口径（改一处忘一处）。这里只渲染后端给的 `deny_message`。
+   */
+  expiry?: {
+    policy_expires_at: string | null;
+    in_grace: boolean;
+    grace_expires_at: string | null;
+    deny_scope: boolean;
+    deny_reason: string | null;
+    deny_message: string | null;
+  } | null;
   active_nodes: number;
   total_nodes: number;
   today_traffic: number;
