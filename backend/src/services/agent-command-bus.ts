@@ -359,6 +359,16 @@ export async function storeAgentCommandAck(
   } = {
     command_id: commandId,
     ok: ack.ok === true,
+    // V5.1b WP5-B2: a datagram RELAY's hop endpoint, straight off its apply ACK.
+    //
+    // This record is REBUILT FIELD BY FIELD before it goes to Redis, so a field missing
+    // from this list is dropped here — and the panel then never learns which address the
+    // exit must attest. The agent proved it sends it
+    // (`type=*forwarder.DatagramRelay diag_ok=true hop=172.41.20.10:56588`), so every
+    // silent hop along this chain is one of these whitelists.
+    ...(typeof ack.hop_local_addr === "string" && ack.hop_local_addr.trim() !== ""
+      ? { hop_local_addr: ack.hop_local_addr.slice(0, ACK_ERROR_MAX_CHARS) }
+      : {}),
     applied_revision:
       typeof ack.applied_revision === "number" && Number.isFinite(ack.applied_revision)
         ? ack.applied_revision
@@ -371,6 +381,7 @@ export async function storeAgentCommandAck(
       typeof ack.error === "string" && ack.error !== ""
         ? ack.error.slice(0, ACK_ERROR_MAX_CHARS)
         : null,
+
   };
 
   // A node cannot have applied a revision newer than the one it was told to
