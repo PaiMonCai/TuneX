@@ -9,31 +9,6 @@
  * absence fails closed. Unknown future manifest schema versions are never guessed.
  */
 
- *  —— 能力协商 v2（纯函数，无 IO）。
- *
- *  只回答了「这个节点能不能收到这个**动作**」（见 agent-capability.ts）。
- * V5 要在这条既有链上扩展协议 / 传输 / runtime 能力，因此需要第二组正交事实，
- * 但它们必须**挂在同一套纪律上**，而不是新造一套协商机制：
- *
- *   · 缺失（旧 Agent 从未上报）      → baseline：V4 冻结时就存在的组合继续可用，
- *                                       baseline 以外一律拒绝（升级提示）。
- *   · 存在但坏形状                    → fail-closed，且**不得**静默降级成「未上报」。
- *   · 存在但不含该项                  → 明确不支持（这就是协商的全部意义）。
- *   · 凭据轮换晚于上报                → 那份广告描述的是已经不存在的进程，作废。
- *   · 未知条目名                      → 不构成任何许可；判定只做**精确匹配**。
- *
- * ── 为什么用 additive 的 `capability_manifest` 而不是把 capabilities 改成 object ──
- * `capabilities` 是 string[]，旧 Panel / 旧工具链（Support Bundle、诊断快照）
- * 已经按数组读它。原地改成 object 会让每一个读它的人都静默拿到 undefined，
- * 把「节点支持 apply_tunnel」变成「什么都不知道」。所以 v2 事实走新字段，
- * 旧字段的语义一字不改。
- *
- * ── 能力仍然不是授权 ──
- * 这一层只回答「对端实现了没有」，是 §13.5 五层里的第 5 层（Runtime Admission）
- * 的一个子条件。它**不**参与工作空间 RBAC、资源作用域、能力策略或额度判定，
- * 也绝不能因为 Agent 自报了什么就授予权限。
- */
-
 import type { AgentCapabilityFacts } from "./agent-capability.ts";
 import {
   capabilityFactsFromStored,
