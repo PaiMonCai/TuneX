@@ -463,7 +463,8 @@ export function checkMemberAddition(policy: EffectivePolicy, memberCount: number
  * 反例（旧实现为什么必须换掉）：`.env` 里缺 `TZ=Asia/Shanghai` 时，同一个瞬时点在
  * 宿主时区下会算出**不同的月首**（例如 UTC 与 UTC+8 在 `2026-01-31T16:00Z` 上有 8 小时分歧，
  * 跨月那一秒直接落进上个月），于是「额度耗尽」判定与账本各算一个月。
- * 这也是 DoD 第 8 条要守的东西：本文件里不允许再出现 `setHours(0, 0, 0, 0)`。
+ * 这也是 DoD 第 8 条要守的东西：本文件里不允许再出现按进程时区取整的日界调用
+ * （那条 grep 是字面匹配，注释里也不留，免得下一个人照着抄）。
  */
 export function trafficWindowStart(period: TrafficPeriodName, now: Date): Date | null {
   if (period === "total") return null;

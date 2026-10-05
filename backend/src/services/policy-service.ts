@@ -278,7 +278,7 @@ export async function sumWorkspaceTraffic(
  * 计量周期起点（V5-WP20-6：委托 `billing-time.ts` 的固定时区实现）。
  *
  * 与 `capability-policy.ts#trafficWindowStart` 是**同一件事**（DoD 第 8 条要求这两个文件里
- * 都不再出现 `setHours(0, 0, 0, 0)`）；保留两个入口是因为调用方分别在 DB 层与纯函数层，
+ * 都不再出现按进程时区取整的日界调用）；保留两个入口是因为调用方分别在 DB 层与纯函数层，
  * 但两者的实现都只有一行委托，永远不会再漂移。
  */
 function trafficStart(period: TrafficPeriodName, now: Date): Date | null {
