@@ -14,6 +14,7 @@
  *     端口事实读不到 ⇒ 执行器按 0 处理（不迁移）。
  */
 
+import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { systemConfig } from "./config.ts";
 import { candidateRejection, type CandidateFacts } from "./ingress-candidate.ts";
@@ -75,9 +76,18 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
  * 也照原样报出** —— 判定留给策略（`failback_healthy_checks` 那条条件），这样运维看到的原因是
  * "首选节点不可达 / 端口不可用 / 连续健康次数不够"，而不是一句无信息量的"没有回切"。
  */
+/**
+ * 候选查询的依赖缝隙。
+ *
+ * 参数类型用**真实 Prisma 参数类型**（而不是 `unknown`）—— 这不是洁癖，是把它当成最后一道
+ * 类型防线：`db.node.findMany({ select: { has_credential: true } })` 曾在这里**静默通过**
+ * （`Node` 根本没有这一列，它是派生事实 `node_credential_hash != null`），后果是**每一拍
+ * failover 扫描都抛错中止**，而闸门与 DNS 后继就在那个循环里 ⇒ WP17.4 在运行期从未执行过。
+ * 缝隙用 `unknown` 就等于把 Prisma 的字段校验关掉了：替身不认识字段，编译期也不认识。
+ */
 export interface FailoverCandidateDb {
-  tunnel: { findUnique: (args: unknown) => Promise<unknown> };
-  node: { findMany: (args: unknown) => Promise<unknown[]> };
+  tunnel: { findUnique: (args: Prisma.TunnelFindUniqueArgs) => Promise<unknown> };
+  node: { findMany: (args: Prisma.NodeFindManyArgs) => Promise<unknown[]> };
 }
 
 export async function pickFailoverDestination(
@@ -112,11 +122,19 @@ export async function pickFailoverDestination(
       lifecycle: true,
       status: true,
       last_seen_at: true,
-      has_credential: true,
+      // `has_credential` **不是列**：它是派生事实（`node_credential_hash != null`），
+      // 与 `forward-service.ts` / `attention.ts` / `support-bundle.ts` 同口径。
+      // 直接 select 它会让 Prisma 抛 "Unknown field"，而扫描是**逐条循环**里的调用 ⇒
+      // 一条坏查询会让整轮扫描中止（连带闸门与 DNS 后继都不跑）。
+      node_credential_hash: true,
       credential_revoked: true,
     },
     orderBy: { id: "asc" },
-  })) as unknown as Array<CandidateFacts & { id: number }>).map((row) => ({ ...row, node_id: row.id }));
+  })) as unknown as Array<CandidateFacts & { id: number; node_credential_hash?: string | null }>).map((row) => ({
+    ...row,
+    node_id: row.id,
+    has_credential: Boolean(row.node_credential_hash),
+  }));
 
   const eligible = rows.filter(
     (node) =>

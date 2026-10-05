@@ -18,6 +18,7 @@
  * 所以偏好是一条**调度意图**，不是运行态事实：写它不 bump revision、不触发 rollout，
  * 由 failover sweep 在后续节拍里按策略决定要不要真的回切（那才是一次正常的 epoch+1 迁移）。
  */
+import { Prisma } from "@prisma/client";
 import { roleAcceptsPosition, type CandidateFacts } from "./ingress-candidate.ts";
 
 export const PREFERRED_INGRESS_ERROR_CODES = {
@@ -32,9 +33,14 @@ export const PREFERRED_INGRESS_ERROR_CODES = {
 export type PreferredIngressErrorCode =
   (typeof PREFERRED_INGRESS_ERROR_CODES)[keyof typeof PREFERRED_INGRESS_ERROR_CODES];
 
+/**
+ * 依赖缝隙。参数用**真实 Prisma 参数类型**：`has_credential` 不是 `Node` 的列（它是
+ * `node_credential_hash != null` 的派生事实），而这个缝隙原本写成 `unknown` ⇒ 把 Prisma 的
+ * 字段校验关掉了，于是那次写错在**编译期与单测里都通过**，直到真拓扑里 500 才暴露。
+ */
 export interface PreferredIngressDb {
-  tunnel: { findFirst: (args: unknown) => Promise<unknown>; update: (args: unknown) => Promise<unknown> };
-  node: { findUnique: (args: unknown) => Promise<unknown> };
+  tunnel: { findFirst: (args: Prisma.TunnelFindFirstArgs) => Promise<unknown>; update: (args: Prisma.TunnelUpdateArgs) => Promise<unknown> };
+  node: { findUnique: (args: Prisma.NodeFindUniqueArgs) => Promise<unknown> };
 }
 
 export interface PreferredIngressDeps {
@@ -84,10 +90,11 @@ export async function setPreferredIngressNode(
         lifecycle: true,
         status: true,
         last_seen_at: true,
-        has_credential: true,
+        // 见上：`has_credential` 是派生事实，不是列。
+        node_credential_hash: true,
         credential_revoked: true,
       },
-    })) as NodeRow | null;
+    })) as (NodeRow & { node_credential_hash?: string | null }) | null;
     if (!node) {
       return { ok: false, code: PREFERRED_INGRESS_ERROR_CODES.preferred_not_found, error: "节点不存在" };
     }

@@ -155,7 +155,7 @@ function stubPreferredDb(over: {
               lifecycle: "active",
               status: "active",
               last_seen_at: NOW,
-              has_credential: true,
+              node_credential_hash: "hash",
               credential_revoked: false,
             }
           : over.node,
@@ -188,7 +188,7 @@ describe("V5-WP17.1（D4 收口）: 首选入口的写入路径", () => {
 
   test("角色当不了入口的节点被拒（否则每一拍都算出一个永不满足的条件）", async () => {
     const db = stubPreferredDb({
-      node: { id: 6, node_group_id: 2, role: "egress", lifecycle: "active", status: "active", has_credential: true },
+      node: { id: 6, node_group_id: 2, role: "egress", lifecycle: "active", status: "active", node_credential_hash: "hash" },
     });
     const result = await setPreferredIngressNode({ db }, { workspaceId: 7, tunnelId: 11, nodeId: 6 });
     expect(result.ok).toBe(false);
@@ -204,7 +204,7 @@ describe("V5-WP17.1（D4 收口）: 首选入口的写入路径", () => {
         lifecycle: "active",
         status: "offline",
         last_seen_at: new Date(NOW.getTime() - 6 * 60 * 60_000),
-        has_credential: true,
+        node_credential_hash: "hash",
         credential_revoked: false,
       },
     });
@@ -237,6 +237,12 @@ function stubCandidateDb(rows: Array<Record<string, unknown>>, preferred: number
   };
 }
 
+/**
+ * 替身行必须是**真实 DB 形状**：`Node` 没有 `has_credential` 列，它是派生的
+ * （`node_credential_hash != null`）。本文件原来给的是 `has_credential: true` —— 那正是
+ * "替身比真库更宽松"的例子：字段写错在单测里永远通过，直到真拓扑里 Prisma 抛
+ * `Unknown field` 才暴露（该错误曾让每一拍 failover 扫描中止，闸门与 DNS 后继因此从未运行）。
+ */
 const row = (over: Record<string, unknown> = {}) => ({
   id: 6,
   node_group_id: 2,
@@ -244,7 +250,7 @@ const row = (over: Record<string, unknown> = {}) => ({
   lifecycle: "active",
   status: "active",
   last_seen_at: NOW,
-  has_credential: true,
+  node_credential_hash: "hash",
   credential_revoked: false,
   ...over,
 });
