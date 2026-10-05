@@ -1,11 +1,10 @@
 /**
  * Notification fact selection and delivery orchestration.
  *
- * The pure selection step turns persisted attention facts into deliverable facts
- * without loading data, sending messages, writing the ledger or reading cooldown
- * state. Source timestamps, not scan time, drive dedupe identity so a continuing
- * fault does not become a new notification on every reconcile pass. Delivery is
- * injected and remains on the shared notification path.
+ * Pure selection converts persisted attention facts into deliverable facts.
+ * Source timestamps, not scan time, define dedupe identity so a continuing fault
+ * does not become a new notification on every reconciliation pass. Delivery
+ * remains on the shared notification path.
  */
 import type { AttentionItem } from "./attention.ts";
 import { buildNotificationFact, workspaceNotificationScope, type NotificationFactSeed } from "./notification-facts.ts";
