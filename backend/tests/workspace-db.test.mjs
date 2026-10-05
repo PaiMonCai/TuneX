@@ -12,6 +12,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   const { app } = await import("../src/app.ts");
   const { db } = await import("../src/db.ts");
   const { redis } = await import("../src/redis.ts");
+  const { billingDayKeyStamp } = await import("../src/services/billing-time.ts");
   after(async () => { redis.disconnect(); await db.$disconnect(); });
   const nonce = randomUUID().slice(0, 12);
   const aEmail = `workspace-a-${nonce}@example.test`;
@@ -157,8 +158,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       const tunnelId = tunnelPayload.data.id;
       assert.equal((await db.tunnel.findUniqueOrThrow({ where: { id: tunnelId } })).ingress_node_id, teamIngress.node.id);
 
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const today = billingDayKeyStamp(new Date());
       await db.tunnelTraffic.create({ data: { tunnel_id: tunnelId, traffic: 8192, traffic_cost: 0, date: today } });
 
       const personalGroup = await request("/api/node-groups", "POST", a.cookie, { name: "Personal ingress", node_type: "in" });
