@@ -661,6 +661,14 @@ model Tunnel {
   dns_verified         Boolean       @default(false)
   /// 上次失败的原因码（脱敏，不含凭据）
   dns_last_error       String?       @db.VarChar(120)
+  /// V5-WP17.3：DNS 同步的**退避状态**。
+  ///
+  /// 契约 F7 要求"下一节拍按退避重试"，而"退避"是一个跨节拍的事实：没有这两列，
+  /// 执行器每拍都会立刻重试同一次失败的写 —— 对端限流时那正是最坏的输入。
+  /// 位置在 Forward 上（不是 provider 上）：同一个 provider 下不同域名的失败互相独立。
+  dns_attempt_count    Int           @default(0)
+  /// 下一次允许尝试的**最早**时刻。`NULL` = 没有待重试的失败。
+  dns_next_attempt_at  DateTime?
   /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?

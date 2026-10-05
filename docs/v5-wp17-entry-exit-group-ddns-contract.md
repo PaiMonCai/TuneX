@@ -371,6 +371,29 @@
 `"online"`，于是"一台一切正常的节点"被判成离线 —— 断言先坏在夹具上，而生产数据本来就是对的。
 记在这里是因为它很容易被下一次踩到（同一族的还有仓库已付过两次学费的"夹具绝对时间"）。
 
+### WP17.3 交付记录：实现时定下的六条（2026-10-05）
+
+1. **退避需要两个事实**（`dns_attempt_count` / `dns_next_attempt_at`，additive 迁移）：契约 F7 说
+   "下一节拍按退避重试"，而"退避"是**跨节拍**的状态 —— 缺了它，执行器每拍都会立刻重试同一次
+   失败，对端限流时那正是最坏的输入。阶梯 `5s → 15s → 60s → 300s → 900s` 封顶，且与
+   `DDNS_SYNC_DEADLINE_MS`（一次同步的期限）**不是一回事**。
+2. **`unavailable` 绝不写空值集**：期望值集为空（owner 没有 `connect_ip`、组内没有可用入口）
+   时的正确动作是"什么都不做"，而不是"把记录集写成空" —— 后者会把整个域名抹掉，而面板会
+   显示"同步成功"。这条现在有断言。
+3. **零外呼有四层判据**，层层都在"真正要说的话"之前：未绑定 → 未开启自动解析 → 退避窗口内
+   → 值集没变。最后一条顺带意味着**连凭据都不读**（一个坏配置不该在没有工作要做时变成告警）。
+4. **不可重试的错误不排退避**：4xx（凭据错、域名不存在）重试一万次也不会变对，而挂着
+   `next_attempt_at` 会让运维以为"系统在重试"。区分落在 `DdnsProviderError.retryable` 上。
+5. **provider 适配器是一个窄契约**（`GET /records` / `POST /records`，endpoint 可覆盖）：
+   它不去模仿各家厂商的真实 API（那是按需增加适配器的事），而是先把"面板 ↔ 执行器"的边界
+   固定下来，让值集规划、读回、退避这些**与厂商无关**的部分能被真实地测。契约 F6 要求的
+   "不新增 provider 类型"因此成立。
+6. **审计借用既有 sink**，用一条**合成的真实路径**（`/api/forwards/<id>/dns`）让 `analyzePath`
+   把事件归属到同一条 Forward —— 于是 DNS 事件与"谁改了这条转发"落在同一批审计里，
+   而不是另起一页（WP17.2 已拒绝过"第二套审计机制"）。
+
+**边界**：本 WP 不接 failover、不碰 rollout —— 触发点、就绪性闸门与 DNS 后继属于 WP17.4。
+
 ## 5. WP 拆分（一个 WP 一个可交付物；次序 17.1/17.2 并行 → 17.3 → 17.4 → 17.5）
 
 | WP | 可交付物（单件） | 明确不含 |
@@ -378,7 +401,7 @@
 | WP17.0 | 本文档冻结（状态行改 FROZEN + 冻结清单） | 任何代码 |
 | WP17.1 | 候选集同源化：`failover-loop` 的候选来源与 Route Profile 编译来源一致（同一份 `nodeAdmission` + constraints，`deriveConnection` 判在线），离线用例钉死「不放行 ⇒ 不迁 + 原因码」 —— **已交付 2026-10-05**：`services/ingress-candidate.ts`（唯一实现，编译器与循环共用）+ D4 收口（`preferred_ingress_node_id` / `failback_healthy_checks` 两列 + `PUT /:id/preferred-ingress` 写入路径 + 扫描维护连续健康计数）；20 条断言 | 不改 `decideFailover` 词表 |
 | WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 —— **已交付 2026-10-05**：`services/ddns-binding.ts` + `routes/ddns.ts` + `forwards.ts` 的 `/:id/dns`；38 条断言（服务层 33 + 路由层 5，后者钉住 `settings:manage` 这条接线） | 不写 DNS、不建 provider 适配 |
-| WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 | 不接 failover、不碰 rollout |
+| WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 —— **已交付 2026-10-05**：`services/ddns-executor.ts`（唯一的外呼入口）+ 退避两列（additive 迁移）；25 条断言 | 不接 failover、不碰 rollout |
 | WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 | 不新增定时器、不改 rollout 步骤词表 |
 | WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 | 不改 G3/G4/G5 断言 |
 

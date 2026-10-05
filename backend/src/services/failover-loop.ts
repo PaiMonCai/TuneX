@@ -200,7 +200,8 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
       readFailoverDecisionFacts(input, {
         db: options.db ?? (db as unknown as FailoverExecutorDb),
         policy: () => policy,
-        destinations: (ctx) => pickFailoverDestination({ ...ctx, now }),
+        // `now` 在这里是**函数**（扫描级时钟），候选判定要的是**时刻**。
+    destinations: (ctx) => pickFailoverDestination({ ...ctx, now: now() }),
     // V5-WP17.1（契约 D4）：回切的"连续健康次数"必须**有一处真的在累计**，否则它恒为 0，
     // `FAILBACK_HEALTHY_CHECKS` 那条条件永远不满足 —— 偏好照样存了，回切照样不会发生。
     failbackHealthyChecks: async (tunnelId) => {
