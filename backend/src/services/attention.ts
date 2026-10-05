@@ -58,7 +58,11 @@ export type AttentionReasonCode =
   | "forward_apply_error"
   | "runtime_revision_behind"
   // ── 本层新增：仅「等待下发」这一个状态在既有词表里没有对应码 ──
-  | "forward_pending_apply";
+  | "forward_pending_apply"
+  // ── V5-WP18：恢复事实（Lead 裁定，追加在**末尾**）──
+  // 与 DB ENUM 同一条纪律：**追加，不改写、不复用、不重排**。它是"曾被拒的 Forward 恢复为
+  // 已应用"，与 `forward_apply_error` 是同一个 episode 的两端。
+  | "forward_apply_recovered";
 
 export interface AttentionItem {
   kind: AttentionKind;

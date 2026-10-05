@@ -931,6 +931,74 @@ Lead 要求"先挂 `planned`、登记后再摘掉，两件事在同一个 WP 里
 3. web 全量 `bun test src` → **615 pass / 0 fail**（5657 expect，31 文件）；`tsc --noEmit` web/backend **全绿**
    （backend 此刻为零错误 —— 前几轮那些他人在途的错误已由各自所有者收口）。
 
+### 12.5 WP18.7 —— Gate / 契约测试收口（2026-10-05）
+
+**交付**（`backend/tests/`，node:test，CI 的 `bun run test` 用 `tests/*.test.mjs` glob 自动收）：
+- `v5-wp18-announcement-rbac.test.mjs`（6 test；18.6 已落，本次补"完整检出才跑"的显式 skip）
+- `v5-wp18-delivery-db.test.mjs`（8 test）—— DoD2 / DoD3 / DoD4 的**真账本 + 真 Redis** 半边
+- `v5-wp18-announcement-tenant-db.test.mjs`（5 test）—— DoD6 的**真 MySQL** 半边
+- `v5-wp18-permissions-http.test.mjs`（3 test）—— DoD9 的 **HTTP 端到端**半边
+- 另：`notification-facts.ts` 的类型注释 + `v5-wp18-facts.test.ts` 的两条类型断言（见 D2）
+
+**DoD 收口表（哪条落哪、要不要 DB、结果）**
+
+| DoD | 落在哪 | 需要 DB/Redis？ | 结果 |
+|---|---|---|---|
+| 1 派生纯函数逐字段确定 | `src/services/__tests__/v5-wp18-facts.test.ts`（18.1） | ❌ | 通过（含新增的两侧类型断言） |
+| 2 并发派生 → 投递表只有 1 行 | `tests/v5-wp18-delivery-db.test.mjs` | ✅ MySQL | **通过**（5 并发 → 1 行；唯一索引由 `information_schema` 反查坐实，且列序 = `(dedupe_key, channel_kind)`） |
+| 3 静默期：窗口内不新增、过后新增 | 同上（**真 Redis**） | ✅ MySQL+Redis | **通过**（Supressed → 1 行；TTL>0 证明键真的在 Redis；跨窗口 → 2 行） |
+| 4 fail-closed 反例 | 同上（真账本留失败行） | ✅ MySQL | **通过**（`unsupported_channel` / `secret_unreadable` 各留一行；未知 source/reason/缺 id 连候选都不产生） |
+| 5 SSRF 反例零出站 | `src/services/__tests__/v5-wp18-webhook.test.ts`（18.3） | ❌（注入 transport） | 通过；**未**在 DB 层重复（§12.1-D1 已记录"注入点叫 transport 而不是 fetch"的等价性） |
+| 6 公告跨租户 | `tests/v5-wp18-announcement-tenant-db.test.mjs` | ✅ MySQL | **通过**（含"坏行对任何租户不可见"与 raw SQL 被唯一索引拒绝两条结构性证据） |
+| 7 无 HTML 渲染 | `src/services/__tests__/v5-wp18-announcements.test.ts` + web 渲染测试（18.5） | ❌ | 通过（去注释后扫描 + 真渲染转义断言） |
+| 8 `NOTICE` 迁移 | Lead 的联机跑法 + 静态断言（18.5/§12.3 验证记录 0） | ✅（已由 Lead 跑） | 通过 |
+| 9 权限（403/201 端到端） | `tests/v5-wp18-permissions-http.test.mjs` + `v5-wp18-announcement-rbac.test.mjs` | ✅ MySQL+Redis | **通过**（未认证 401 / 别资源 403 / 未登记 403 / read 只能读 / write 能写 / 超管直通 / 租户侧 member 403·owner 201·可见列表 member 200） |
+| 10 不新增第二判定 | `v5-wp18-facts.test.ts` G 组 + 全套回归 | ❌ | 通过 |
+
+**D1（判断）18.7 只动测试与注释，不动生产行为。** 收口的意义是"证明已交付的东西成立"，不是
+趁机改口径；唯一的生产文件改动是 `notification-facts.ts` 的**注释**（D2），零行为变化 ——
+这样"收口"这个动作本身不会成为新的风险源（Lead 也提醒过：`worker.ts` / `notification-*` 有别的线在动）。
+
+**D2（核对 Lead 的反馈；结论与反馈不同，值得写清）`occurred_at` 的声明**本来就与值一致**。**
+Lead 报告："`buildNotificationFact` 返回的 fact 里 `occurred_at` 实际是 ISO 字符串，而声明类型是
+`Date`"。**逐行核对结果**：`NotificationFact.occurred_at` 在第 250 行声明为 `string`，
+值在第 392 行是 `occurredAt.toISOString()`；声明 `Date` 的是**另一侧的**
+`NotificationFactSeed.occurred_at`（第 309 行，输入侧，且 `buildNotificationFact` 用
+`instanceof Date` 校验后拒绝字符串）。所以**不存在"声明 Date、实际 string"的类型说谎**。
+但 Lead 踩到的坑是真的：**同一个字段名在输入侧是 `Date`、输出侧是 `string`**，读代码的人很容易
+把两侧当成同一个类型（他们的断言写了 `.getTime()` 就崩在这里）。按 Lead 给的第二种方案落地：
+① 两侧的类型注释都写明"输出 string / 输入 Date"以及**为什么**（输出侧序列化一次是为了让
+`dedupe_key` 在不同进程/两次派生之间稳定）；② `v5-wp18-facts.test.ts` 新增两条运行时断言：
+事实侧 `typeof === "string"` 且**没有** `getTime`、种子侧传 ISO 字符串 ⇒ `invalid_occurred_at`。
+**给 Lead 的回执**：他们触发器的断言可以按**声明类型**改成"字符串"并删掉那句"为什么不按声明断言"
+的旁注 —— 声明是对的，坑是两侧同名。若仍希望输出侧改回 `Date`（Lead 的选项 a），代价是
+幂等键的输入从"规范串"退回"进程相关的 `Date` 表示"，我建议不做。
+
+**D3（判断）跨端断言在"只有 backend 的容器"里**显式 skip**，不伪装成失败。**
+最后一条闭环断言要同时读后端权限表与前端 `nav.ts`/页面文件。后端专用容器里没有 `web/`，
+原先会以 `ENOENT` 失败（看起来像产品 bug，实际是夹具缺失）。改成 `existsSync` 守卫 +
+node:test 的 `skip(reason)`：CI 的完整检出里**照常执行**，专用容器里**打出 skip 与理由**。
+两条路都实测过（有 `web/` → pass；临时移走 → skip）。
+
+**D4（判断）测试自身的两个坑，值得单独记**（都是"断言因为错误的理由变绿/变红"）：
+① **CSRF**：带会话 cookie 的 POST 少了自定义头会拿到 `403 CSRF_REJECTED`，而"member 发布被拒"
+   这条断言**会因此变绿**（403 不是权限给的）—— 我最初的 HTTP 测试就踩了；修法是显式带
+   `x-csrf-token`（自定义头存在即凭证），并在注释里写明"这个 403 必须来自权限而不是 CSRF"。
+② **个人空间**：租户侧路由先 `resolveWorkspaceMembership()`，缺个人空间直接 403
+   （"个人空间不存在"），于是 `member` 与 `owner` **都**拿 403，看起来像"权限接线错了"。
+   夹具必须给每个用户建个人空间。
+
+**运行方式（可复现；Lead 给的容器跑法 + 我实际用的两处适配）**
+Lead 的配方里 `node --test` 需要一个带 node 的镜像，而 `b2x-backend:ci` **只有 bun**；
+并且这个沙箱**访问不到宿主机发布端口**（`docker run -p 127.0.0.1:13306:3306` 之后宿主机仍连不上），
+所以最终用的是：两个自己的容器（`wp18-db` mysql:8.4.11、`wp18-redis` redis:7.4-alpine）+ 一个
+跑测容器（`wp18-runner`，`--network b2x_ctrl`，把 worktree 的 `src/`、`tests/`、`prisma/` 拷进去），
+在**容器内**用 `bun test tests/*.test.mjs`（已验证 bun 能跑 node:test 文件）。全程没碰
+`b2x-mysql` / `b2x-panel`（Gate 的那套拓扑），跑完 `docker rm -f` 三个容器。
+具体命令与输出见交付报告；要点是 `prisma migrate deploy`（48 条迁移）在空库上全绿，
+四个文件 **22 test / 0 fail**（其中 1 条在"无 web 树"时按设计 skip）。
+
+
 ---
 
 **验证记录（可复现，2026-10-05）**

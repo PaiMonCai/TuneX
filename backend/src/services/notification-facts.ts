@@ -140,6 +140,8 @@ const REASON_CODE_REGISTRY: Record<AttentionReasonCode, true> = {
   forward_apply_error: true,
   runtime_revision_behind: true,
   forward_pending_apply: true,
+  // V5-WP18（Lead 裁定）：恢复事实。追加在**末尾** —— 与 DB ENUM 同一条纪律。
+  forward_apply_recovered: true,
 };
 
 /** 可投递的原因码全集（顺序 = 登记顺序，便于快照断言）。 */
@@ -185,6 +187,11 @@ export const NOTIFICATION_COOLDOWN_SECONDS = Object.freeze({
   connection_offline: 300,
   /** 下发被拒：15 分钟。节点侧重试/编排修复通常以分钟计，短于此会与编排的自身节奏打架。 */
   forward_apply_error: 900,
+  // V5-WP18（Lead 裁定）：恢复事实。与拒绝**同窗口**（900s）—— 它们是同一个 episode 的两端，
+  // 共用一档最不容易被误读。为什么有这个窗口就够、而不是要"精确一次"：静默期**不延迟首次
+  // 投递**（首次立刻发），只压窗口内的重复 ⇒ 它压的正是"拒绝↔恢复"抖动；而几十分钟后的
+  // 第二次真实故障（新 episode）仍会各发一次。
+  forward_apply_recovered: 900,
 });
 /** 未单列的原因码走这里（契约 O2 的「其余 30 分钟」）。 */
 export const DEFAULT_NOTIFICATION_COOLDOWN_SECONDS = 1_800;
@@ -246,7 +253,21 @@ export interface NotificationFact {
    * 它不进幂等键，也不参与任何判定；渲染前按 F10 剥 CRLF + 截断。
    */
   readonly resource_name: string | null;
-  /** 事实的发生时刻（来源表上的既有时间戳，ISO 8601）。 */
+  /**
+   * 事实的发生时刻：**ISO 8601 字符串**（不是 `Date`）。
+   *
+   * ── 为什么输出侧是字符串（"派生即序列化"）──
+   * `occurred_at` 参与算 `window_start` 与 `dedupe_key`（哈希进幂等键）。字符串是**规范形态**：
+   * 一次派生与另一次派生、api 与 worker 两个进程之间，同一个时刻必须得到同一串字节，
+   * 幂等键才稳定；把 `Date` 往下传则等于把"哪个进程、哪个时区、毫秒怎么截"这些变量
+   * 带进了键的输入。需要时间的调用方在**边界**上转一次：`new Date(fact.occurred_at)`。
+   *
+   * ⚠️ **与 `NotificationFactSeed.occurred_at` 同名但不同型**（那边是 `Date`，因为它是**输入**，
+   * 由调用方从来源表的时间戳给进来）。这条不对称是刻意的，但踩过一次：
+   * 有人在断言里对**事实**的字段写了 `.getTime()` ⇒ `TypeError: ...getTime is not a function`。
+   * 判据很简单：**输出侧 string / 输入侧 Date**；拿不准就用 `new Date(...)` 转，
+   * 不要对这里的值调用任何 `Date` 方法（`v5-wp18-facts.test.ts` 有一条运行时类型断言钉住它）。
+   */
   readonly occurred_at: string;
   /** 幂等键的时间窗下界（ISO 8601）。 */
   readonly window_start: string;
@@ -302,9 +323,13 @@ export function notificationDedupeKey(input: {
 export interface NotificationFactSeed {
   readonly item: AttentionItem;
   /**
-   * 发生时刻。**必须来自来源表**（`node.last_seen_at` / `tunnel.updated_at`），
+   * 发生时刻（**输入侧 = `Date`**；输出侧 `NotificationFact.occurred_at` 同名字段是 **ISO 字符串** ——
+   * 两侧同名不同型是刻意的：输入用 `Date` 由调用方从来源表直接给，输出序列化一次以保证幂等键稳定）。
+   *
+   * **必须来自来源表**（`node.last_seen_at` / `tunnel.updated_at`），
    * 不能用「本次扫描的时刻」：那样每扫一次时间窗就前进一格，幂等键随之改变 ——
    * 一条持续存在的故障会变成每 30 分钟一条新通知，静默期形同虚设（DoD3 的反例）。
+   * 传非 `Date`（例如 ISO 字符串）会被 `buildNotificationFact` 判为 `invalid_occurred_at`（fail-closed）。
    */
   readonly occurred_at: Date;
   /** 更细的诊断码（可选；缺省取 `item.apply_error_code`）。 */
