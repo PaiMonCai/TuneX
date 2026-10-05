@@ -34,7 +34,7 @@ export interface SelectResult {
  *
  * `occurredAtOf` 由调用方从**来源表**提供（`tunnel.updated_at`）。为什么不让本函数自己取
  * "现在"：`NotificationFactSeed.occurred_at` 参与幂等键，而**用扫描时刻会让时间窗每扫一次
- * 前进一格** —— 一条持续存在的故障就会变成每拍一条新通知，静默期形同虚设（契约 DoD3 的反例，
+ * 前进一格** —— 一条持续存在的故障就会变成每拍一条新通知，静默期形同虚设（反例说明
  * 原文写在 `notification-facts.ts` 的类型注释里）。
  *
  * 取不到来源时刻时**跳过并记录原因**，而不是回落到"现在"：回落正是上面那个反例的实现方式。
