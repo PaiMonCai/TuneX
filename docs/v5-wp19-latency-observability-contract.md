@@ -419,8 +419,125 @@
 
 
 
+### 5.3 WP19-D 交付记录（2026-10-05，④）
+
+- **落地范围**（O2 裁决的执行：新 action + 白名单 + 默认关 + 既有四处复用）：
+  - `backend/src/services/looking-glass.ts`（新）：策略与编排的全部纯函数 + 生产装配。
+    含**唯一**的地址准入函数 `classifyTargetAddress`（规范 IPv4/IPv6 解析 → 非公网段表 →
+    映射形式先还原）、`NON_PUBLIC_V4_RANGES`/`NON_PUBLIC_V6_RANGES`（逐条注明命中说明）、
+    写法变体判定 `looksLikeAddressLiteralVariant`、目标计划 `planLookingGlassTargets`
+    （用户输入 → 解析 → 公网判定 → **钉死地址**）、单飞锁 `LookingGlassLocks`、
+    结果归一 `normalizeLookingGlassResults`、编排 `runLookingGlass`、开关解析
+    `lookingGlassEnabledFromEnv`；
+  - `backend/src/routes/looking-glass.ts`（新）：`GET /status` + `POST /nodes/:id/tests`；
+    **路由工厂**（可注入 service/workspace/nodeId 解析/管理员判定），因此四类拒绝能在
+    不连 DB/Redis 的测试里逐个钉死；
+  - `backend/src/services/control-protocol/{types,validator,index}.ts`（**增量**）：
+    `COMMAND_ACTIONS` += `looking_glass`、`ACTION_SPECS.looking_glass`（只读 / node /
+    revision 0）、`ACTION_PAYLOAD_KEYS.looking_glass = {method, targets, timeout_ms}`
+    与形状校验、线形上限常量 `LOOKING_GLASS_MAX_TARGETS=4`/`LOOKING_GLASS_MAX_TIMEOUT_MS=5000`；
+  - `backend/src/services/agent-command-bus.ts`（**增量**）：`QueuedAgentCommand.looking_glass`
+    兄弟字段（与 `probe` 并列，理由见该字段注释）、`enqueueAgentCommand` 末尾可选参数、
+    `issueAgentLookingGlass`、ACK 覆盖性校验从 `diagnose_tunnel` 推广到"探针形状动作"；
+  - `agent/internal/diag/lookingglass.go`（新）+ `lookingglass_test.go`：Agent 侧独立复判
+    （同一张非公网段表）、**只拨字面地址**、先校验全部目标再发第一个包；
+  - `agent/internal/control/protocol.go` / `client.go`（**增量**）：新 action 常量 + 广告 +
+    分派臂 + `QueuedCommand.LookingGlass` 兄弟字段；
+  - `backend/src/env.ts`（**增量**）：`lookingGlassEnabled`，默认关闭；
+  - 测试：`backend/src/services/__tests__/v5-wp19/v5-wp19-d-looking-glass.test.ts`、
+    `backend/src/routes/__tests__/v5-wp19-d-looking-glass-route.test.ts`；
+    `control-protocol.test.ts` 的"动作清单冻结断言"**有意**扩一项（理由写在该测试文件里：
+    这是契约扩容，不是放宽）。
+- **四个关键设计决定**（都为了"少一个会静默失效的边界"）：
+  1. **面板解析、节点只拨字面地址**：命令里带的是**钉死的公网字面量**，Agent **不做任何
+     名称解析**。这让 DNS 重绑定（TOCTOU）在结构上不成立，而不是"靠检查挡住"。代价：
+     本功能**不能**回答"节点侧 DNS 能否解析该域名"——写进 `caveats`，不假装覆盖。
+  2. **两侧各自实现同一张策略表**：面板判一次、Agent 再判一次，因此"面板被攻破/有 bug"
+     不足以让私网包发出去。两侧用同一张测试向量表（`lookingglass_test.go:lookingGlassVectors`
+     与 `d-looking-glass.test.ts:ADDRESS_VECTORS`）证明一致性——只断言 allow/deny 这一位，
+     不断言拒绝文案（两侧解析器不同，文案绑死只会制造无意义的红）。
+  3. **结果复用既有 ACK 字段 `results`**：`diagnose_tunnel` 已经把它走通了（五处逐字段重建
+     全部带它）。**不新增 ACK 字段**＝少一个"漏了某处重建 ⇒ 面板永远读到 null"的机会。
+     命令下行必须加兄弟字段，因此下行链的每一处都用源码级守卫钉住（见 §5.3 证据）。
+  4. **开关关闭时的答复是明确拒绝**：`403 + code=looking_glass_disabled + error_layer=capability`
+     + 文案里指回环境变量名。**不是**空结果、不是 200 + 空列表。
+- **契约内部张力的裁决（留痕，免得下一个人重开）**：任务约束 3（"关闭时明确拒绝"）与 D7④
+  （"关闭时普通成员拒绝、管理员可用"）字面有张力。**Lead 2026-10-05 裁决：按 D7④ 执行**，
+  两个前提：① 关闭时的拒绝必须是**明确 code**（已做）；② 管理员越权使用必须在审计里
+  一眼可辨（`admin_override: true`，已做）。理由：默认关要防的是**租户**把它当免费探针；
+  "关掉之后运维自己也看不了"会把一个排障能力变成死开关。
+- **O7（配额数值）仍未冻结 ⇒ 显式拒绝形态**：本 WP **不实现**"每 workspace 每日次数"这类
+  数值配额（数值是产品决策），已冻结的只有 D7③ 的**每节点单飞**；超限**拒绝而非排队**
+  （排队会让调用者以为"我发起了"，而它可能一分钟后才从客户机房发包）。
+- **明确未做 / 待补**：
+  - **多副本部署下的全局单飞**：锁是进程内的（`LookingGlassLocks`），多副本时可以各自放行
+    一次。这是**已知且记录**的边界（TTL 30s 有界，不会永久锁死），要修就得引入 Redis 锁 ——
+    在 O7 数值冻结时一起做；
+  - **真拓扑端到端 Gate**（G19.9/G19.10/G19.13 的"真节点"半截）：见证据文件 §6/§7，
+    本 WP 只覆盖到"拒绝发生在发包之前"的替身层；
+  - **Web 入口**（`web/` 范围外）：前端类型与按钮待补；
+  - **HTTP/TLS 探测**（重定向/降级/凭据那一整类威胁模型）：不做，另立契约；
+  - **每日次数/速率配额**：不做（O7 开放）。
+- **路由挂载（本提交**不含**，需 Lead 落）**：`backend/src/app.ts` 当前有别的 WP 的在途改动
+  （13 行 announcements 挂载），为避免"扫走别人在途文件"，本 WP 不提交它。需要的一行：
+  ```diff
+  --- a/backend/src/app.ts
+  +++ b/backend/src/app.ts
+  @@
+  import { nodeHealthRoutes } from "./routes/node-health.ts";
+  +import { lookingGlassRoutes } from "./routes/looking-glass.ts";
+  @@
+     app.route("/api/route-profiles", routeProfilesRoutes);
+  +  // V5-WP19-D：Looking Glass（默认关闭；打开见 LOOKING_GLASS_ENABLED）。
+  +  app.route("/api/looking-glass", lookingGlassRoutes);
+  ```
+- **证据**：`docs/evidence/v5-wp19-d-looking-glass-20261005.txt`
+  —— 服务层 **150 pass / 0 fail / 474 断言**；路由层 **11 pass / 0 fail / 45 断言**；
+  含既有文件的回归 **344 pass / 0 fail / 1206 断言**（连跑 3 次一致）；
+  `bunx tsc --noEmit` 本 WP 文件 0 报错；`go build ./...` OK；
+  `go test ./internal/diag/ ./internal/control/` 两个包全绿。
+
+### 5.4 WP19-D 安全审查（面向上线前独立评审）
+
+> 这一节回答的不是"我们实现了什么"，而是"**我们检查过哪些绕过路径、哪些明确不防、为什么**"。
+> 结论按"能防 / 不防但已记录 / 结构性不存在"三档给出，避免把"不存在这条代码路径"读成"忘了处理"。
+
+| # | 绕过路径 | 结论 | 依据 / 为什么 |
+|---|---|---|---|
+| 1 | **重定向跟随**（3xx 跳到内网） | **结构性不存在** | 本功能只做 TCP connect（`tcp_connect` 是唯一方法），**不发任何 HTTP 请求**，因此没有 3xx 概念、没有 Location 头、没有 cookie/凭据可被重放。将来若加 HTTP 探测：必须逐跳重判公网、禁止降级、禁止携带凭据，且另立契约。 |
+| 2 | **DNS 重绑定（TOCTOU）** | **能防（结构性）** | 面板解析一次并把地址**钉死**进命令；Agent **只拨字面地址**、自己不解析（源码级守卫：`lookingglass.go` 的执行代码里不得出现任何解析调用）。两次判定针对同一个字节序列，中间**没有第二次解析**，所以重绑定没有窗口。 |
+| 3 | **HTTPS 降级** | **结构性不存在** | 没有 TLS 会话、没有 HTTP 层，谈不上降级；TCP connect 不发送任何字节，因此不可能泄漏 header/cookie/证书信任问题。 |
+| 4 | **写法变体**（十进制 `2130706433`、八进制 `0177.0.0.1`、十六进制 `0x7f000001`、短形式 `127.1`、前导零、尾点、段数过多） | **能防（拒绝而非解释）** | 面板侧先判"规范字面量"，**不解释**任何非规范写法，并且**不把它们交给解析器**（测试断言解析器替身调用次数 = 0）；Agent 侧用 `netip.ParseAddr`（严格）同样拒绝。`::ffff:127.0.0.1` 这类映射形式**先还原成内嵌 IPv4 再判定**，所以映射不是绕过；大小写归一；方括号 `[::1]` 与 zone id `fe80::1%eth0` 在**两侧都拒绝**（两处规则不对称比一种写法被拒更难查）。 |
+| 5 | **内嵌 IPv4 的 v6 隧道形式**（6to4 `2002::/16`、Teredo `2001::/32`、NAT64 `64:ff9b::/96`） | **能防（整段拒绝）** | 不做内嵌解析：把一个内网 v4 包装成 v6 是这类地址的正当用途，逐段判断只会给绕过留缝，因此整段拒绝。 |
+| 6 | **别名域名打内网**（split-horizon、CNAME/AAAA 指向内网） | **能防（整请求拒绝）** | 解析结果里**每一个**地址都必须是公网单播；任何一个不合格 ⇒ 整请求拒绝（不是"跳过私网那条"）。地址数超上限 ⇒ 拒绝而非截断。解析失败 ⇒ 明确拒绝，**不**退回"让节点自己解析"。 |
+| 7 | **扫描放大 / DDoS 跳板** | **能防（有界）+ 一处未冻结** | ≤4 个用户目标、解析后 ≤4 个地址、无端口范围语法、无排队、每节点单飞、每次发起写审计。**没有**"每日次数"配额：那是 O7 的开放数值决策，本 WP 不猜（不假装支持）。 |
+| 8 | **审计绕过** | **能防（fail-closed）** | 三类事件：`test_refused` / `test_issued` / `test_completed`；审计写失败（返回 false 或抛错）⇒ **拒绝发起**（"没有记录的主动探测"不成立）。管理员在关闭状态下使用时，审计行带 `admin_override: true`。 |
+| 9 | **能力绕过**（旧 Agent / 未广告动作） | **能防（入队前）** | 面板 `decideCapability(..., "looking_glass")` 前置拒绝（新动作**不在** baseline，未上报即拒绝），测试断言"整条请求 < 500ms 返回"以证明没有 ACK 等待窗口；Agent 侧的能力广告是编译期常量 + `TestAdvertisedCapabilitiesMatchExecute` 钉住。 |
+| 10 | **面板被攻破 / 面板有 bug** | **能防（防御纵深）** | Agent 侧独立复判同一张策略表：**面板放行不足以让私网包发出去**。这是本设计里最重要的一条：把"信任面板"从安全边界里去掉。 |
+| 11 | **跨租户借用节点** | **能防** | 节点查询按 `(nodeId, workspaceId)` 成对；不匹配 ⇒ 404（不泄漏节点是否存在），连 DNS 都不做，零下发，审计记录 actor。 |
+| 12 | **结果里夹带凭据/载荷** | **能防** | 结果**逐字段重建**（未知字段丢弃）、状态闭集、detail 截断 160 并过 `redact`；`resolved_ip` 非空 ⇒ **整份结果拒绝**（那是"节点做了名称解析"的证据，比删字段更有价值）。 |
+| 13 | **"关闭"被实现成静默空结果**（最容易被忽略的一条） | **能防** | 关闭 ⇒ 403 + `code=looking_glass_disabled` + `error_layer=capability` + 文案指回环境变量名；有测试钉住"有 code、有 error_layer、不是空列表"。 |
+
+**明确不防（写清楚比假装安全重要）**：
+
+- 不防**目标地址本身属于攻击者**：他会看到"某个公网节点连过我"。这是这个功能的本意
+  （证明可达性）的固有代价，不是缺陷；因此它**默认关闭**并需要独立评审。
+- 不防**路由/BGP 劫持**把包带到别处：我们能保证"只发给这个公网地址"，不能保证"这个地址的
+  运营者是谁、路径经过谁"。
+- 不防**"公网 IP 其实 NAT 到内网"**：我们只能判地址；这类目标会被真的连上（一次 TCP 连接
+  就能证明某公网端口开着）。
+- **不做节点侧 DNS 诊断**：解析由面板完成（这是防重绑定的代价）。split-horizon 部署下，
+  报告反映的是**面板看到的地址**；这一点必须出现在 `caveats` 里（已做）。
+- **单飞锁不是分布式的**：多副本面板可以各自放行一次（有 TTL，不会永久锁死）。已在 §5.3
+  记为待办。
+- 不做速率令牌桶、不做每日配额（O7 未冻结）。
+
+**上线前要求**（沿用 §4.0 O2 的纪律）：独立安全评审 + G19.9/G19.10/G19.13 的真拓扑条目
+（见证据文件 §6/§7 的未覆盖清单）。
+
 推荐顺序：**F → C → D → B → E**（F 是既有缺陷收口、成本最低；C 不需开放决策；
 B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每个自带 Gate，不改 desired 语义。
+（2026-10-05 实施状态：F、B、D 已交付；C 在途。）
 
 ## 6. DoD
 
@@ -457,6 +574,14 @@ B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每�
 | G19.13 | LG 结果脱敏 | 发起一次测试 | 产物不含数据面载荷/凭据（同 `G1B.13` 模型） |
 | G19.14 | 快照路径不丢新事实 | 重启 Agent 走快照恢复 | 新事实仍在（D11；模型：G2 三个同源缺陷） |
 | G19.15 | TCP/UDP 回归 | 重跑 G0/G1A/G1B 关键项 | 全绿，不得因本 WP 翻转 |
+
+**WP19-D 实施状态（2026-10-05）**：G19.9–G19.13 已在**单测层与路由层**落地——替身层
+断言"拒绝发生在发包之前"（`issue` 替身调用次数 = 0），Agent 侧断言"整请求拒绝且
+`dialed == 0`"。**真拓扑那半截**（真节点 + 抓 Agent 日志与产物 + A 身份用 B 的 nodeId）
+尚未覆盖：本工作树没有可用 docker 拓扑，且任务纪律要求不动 docker/e2e 拓扑；它需要等
+①（UDP RELAY）线落地后在 `v5-g1b` 那套里补。逐条覆盖与"为什么没覆盖"见
+`docs/evidence/v5-wp19-d-looking-glass-20261005.txt` §6/§7。
+G19.11 另有一条**已知边界**：单飞锁是**进程内**的，多副本部署时不是全局锁（§5.3 待办）。
 
 **不改既有 Gate**：`G1B.12`/`G1B.10` 保持原样；若被本 WP 弄红，那是回归，不是「改断言」。
 
@@ -498,3 +623,4 @@ B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每�
 | 2026-10-05 | Lead 裁决（§4.0）：O1+O4 冻结为"独立档案表、只 INSERT、24h 原始 + 30d 小时桶、永不作为判定输入"，并正式关闭既有开放项"是否保留观测历史"；O2 冻结为"新 action + 白名单 + 默认关闭 + 独立 Gate + 先过安全评审"，排在 WP19-F 之后；O3 冻结为"v1 不产生 udp 延迟事实，且不改 §7 合成语义"；WP19-F 采纳，排在 ① 之后执行。O5–O9 仍开放 | 开发 Lead（核实：Agent 上报 `diag` 但面板零消费点，缺陷成立） |
 | 2026-10-05 | **§1.4.1 实测更正**：`diag` 在落库路径上**一直有值**（`validateStateReport` 透传未知字段、`node_state_report.tunnels` 整块落库；`datagramHopPeerFor` 依赖它，① 的出口取证纠正在真拓扑生效）。真正的丢点是**面板类型化读路径**（`parseReportedRuntimes` 重建 runtime 时丢 diag、无 typed 读路径、Web 类型缺）。Lead 裁决 WP19-F 取 **A（上报侧一等化）**、**不做 B（ACK 侧）**。§5.1 记录交付 | ④ WP19-F（实测与更正由 Lead 确认） |
 | 2026-10-05 | **WP19-B 落地**（O1+O4 裁决的执行）：两张只追加档案表 + 迁移 `20261032000000_v5_wp19_latency_history` + `services/latency-history.ts`（保留期/UTC 分桶/rollup/prune/读路径）+ 上报侧追加 + `cron_latency_history`（先聚合后清理）。保留期走 `system_config` 字符串键，刻意不动 `SystemConfigName` 枚举。§5.2 记录交付与边界；Web 图表待补 | ④ WP19-B |
+| 2026-10-05 | **WP19-D 落地**（O2 裁决的执行）：新 action `looking_glass`（面板 validator + Go control 两侧）、公网白名单两侧各自实现（同一张测试向量表）、面板解析并**钉死**地址、Agent **不做名称解析**（DNS 重绑定结构性关闭）、部署级开关**默认关**（关闭 = 明确拒绝；管理员例外带 `admin_override` 审计标记）、每节点单飞、三类审计（写失败即拒绝发起）、结果复用既有 ACK `results` 字段以避免新增重建边界。§5.3 记录交付/裁决留痕/待补；§5.4 新增**安全审查**（13 条绕过路径逐条给结论 + 明确不防清单）。证据 `docs/evidence/v5-wp19-d-looking-glass-20261005.txt`。**路由挂载那一行不在本提交**（`app.ts` 有别的 WP 在途改动），补丁见 §5.3 | ④ WP19-D（Looking Glass） |

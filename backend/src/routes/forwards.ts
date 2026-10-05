@@ -10,6 +10,7 @@ import { z } from "zod";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { db } from "../db.ts";
 import { canWorkspaceResourceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
+import { defaultTopologyDeps, loadForwardTopology } from "../services/forward-topology.ts";
 import {
   DDNS_ERROR_CODES,
   DDNS_TTL_SECONDS,
@@ -266,6 +267,32 @@ forwardsRoutes.get("/:id/traffic", async (c) => {
     Math.min(90, Number(c.req.query("days") ?? 14) || 14),
   );
   return send(c, await getForwardTraffic(id, workspace(c).id, days));
+});
+
+/**
+ * V5-WP19-C —— `GET /api/forwards/:id/topology`（**只读**拓扑与逐跳明细）。
+ *
+ * 位置要求：**必须**注册在任何 `/:id/:参数` catch-all 之前（Hono 同方法按注册顺序匹配）。
+ * 这不是注释里的提醒而已 —— `forward-route-order.test.ts` 会机械地检查它，而
+ * `forward-route-topology.test.ts` 会在**行为上**证明它真的可达。
+ *
+ * 权限：`forward:read`（它不改任何东西、不发任何命令：计划与 live facts 都来自既有的
+ * route plan 与节点上报）。
+ */
+forwardsRoutes.get("/:id/topology", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "read");
+  if (denied) return denied;
+  const result = await loadForwardTopology(defaultTopologyDeps(), {
+    forwardId: id,
+    workspaceId: workspace(c).id,
+  });
+  if (!result.ok) {
+    const status = result.code === "not_found" ? 404 : 409;
+    return c.json({ error: result.message, code: result.code, error_layer: "resource_scope" }, status);
+  }
+  return c.json({ data: result.topology });
 });
 
 forwardsRoutes.get("/:id", async (c) => {
