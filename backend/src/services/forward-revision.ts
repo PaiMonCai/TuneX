@@ -1,28 +1,9 @@
 /**
- * V4-WP1 — Forward Revision Foundation（`DEVELOPMENT.md` §13.3.2 / §13.3.3）。
+ * Forward revision foundation.
  *
- * ── 本模块是 Forward 编辑模型的**单一规则实现** ──
- * §13.3.3 硬约束：「校验逻辑只能有一个 Service 实现，preview 与真实 update
- * 不得各写一份规则」。因此这里导出：
- *
- *   · {@link mergeForwardCandidate} —— 读取当前 desired config → 合并 patch
- *     得到**完整候选 config**；
- *   · {@link validateForwardCandidate} —— 对完整候选 config 一次性校验；
- *   · {@link computeForwardImpact} —— 从 current → candidate 的差异算出
- *     §13.3.3 要求的 preview 影响面（外部地址 / NodeBinding / 端口 / 节点 /
- *     listener replacement / warning-blocking）；
- *   · {@link createForwardRevision} —— 事务内生成不可变 snapshot + 写
- *     `tunnel.desired_revision_id` + bump `config_revision`（同一事务）。
- *
- * preview（只读不落库）与 update（落库 + 收敛）都调同一组函数，**不可能**出现
- * 「preview 放行、update 拒绝」或反之。
- *
- * ── 为什么 revision 是「读库取 max 再 +1」而不是自增列 ──
- * `tunnel.config_revision` 是 Agent 侧的 wire 版本计数器（WP2 幂等闸门认它），
- * 必须与 snapshot 的 revision 同值。并发两次编辑时 `@@unique([tunnel_id,
- * revision])` 保证只有一个成功，另一个撞 P2002 → 由本模块统一翻译成
- * `409 revision_conflict` 并回带最新 revision（见 {@link handleRevisionConflict}），
- * 绝不静默覆写。
+ * A revision freezes one desired configuration snapshot and its runtime placement
+ * facts. Candidate validation is fail-closed before persistence; mutable product
+ * edits create a new revision while provenance/placement facts remain auditable.
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
@@ -32,7 +13,7 @@ import {
   type ForwardMode,
   tlsPathsForProtocol,
 } from "./forward-contract.ts";
-// V5.5 WP15：远端出口腿支持边界只有一处定义（`federation/forward-hop.ts`），
+//：远端出口腿支持边界只有一处定义（`federation/forward-hop.ts`），
 // 校验与运行期必须用同一个集合 —— 各写一份就是"preview 放行、rollout 拒绝"的来源。
 import { FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS } from "./federation/forward-hop.ts";
 
@@ -64,14 +45,14 @@ export interface ForwardCandidateConfig {
   target_host: string | null;
   target_port: number | null;
   /**
-   * V5-WP5-A1：tls 前端的节点本地证书路径。它与 `protocol` 属于同一份 desired
+   *：tls 前端的节点本地证书路径。它与 `protocol` 属于同一份 desired
    * 配置，所以同样可合并 —— 否则运维换一个证书文件名就必须删了重建（而重建还会
    * 重新分配监听端口）。
    */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
   /**
-   * V5.5 WP15：这条 Forward 的**出口腿**由一个 peer panel 承载（存 peer_panel_id）。
+   *：这条 Forward 的**出口腿**由一个 peer panel 承载（存 peer_panel_id）。
    *
    * 它与 `egress_node_id` 是**互斥**的两件事（同一跳只能在一侧）：声明了 peer 就
    * 表示"本机没有出口节点"，因此必须参与 current / merge / metadata-only 三处比较
@@ -100,7 +81,7 @@ export interface ForwardRevisionRow {
   tunnel_mode: string | null;
   tunnel_type?: string | null;
   forward_protocol?: string | null;
-  /** V5-WP5-A1：tls 前端的节点本地路径（只有路径，永远没有密钥内容）。 */
+  /**：tls 前端的节点本地路径（只有路径，永远没有密钥内容）。 */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
   ingress_node_id: number | null;
@@ -112,7 +93,7 @@ export interface ForwardRevisionRow {
   /** RELAY 指向的出口目标池 */
   egress_pool: { id: number; node_id: number } | null;
   egress_targets?: Array<{ host: string; port: number; weight: number; order_by: number }>;
-  /** V5.5 WP15：出口腿的远端承载方（NULL = 本机出口，V4/V5 既有语义）。 */
+  /**：出口腿的远端承载方（NULL = 本机出口，V4/V5 既有语义）。 */
   federated_egress_peer?: string | null;
   listen_ip: string | null;
   listen_port: number | null;
@@ -137,7 +118,7 @@ export interface ForwardImpact {
   listener_replacement: boolean;
   ingress_node_change: boolean;
   egress_node_change: boolean;
-  /** V5.5 WP15：出口腿的承载方（本机 ↔ peer）发生了变化。 */
+  /**：出口腿的承载方（本机 ↔ peer）发生了变化。 */
   federated_egress_change?: boolean;
   /** V5.4：中间跳增加 / 删除 / 换节点。它不换 listener，但一定会改变 RELAY next_hop。 */
   middle_node_change?: boolean;
@@ -263,7 +244,7 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     ingress_node_id: row.ingress_node_id ?? 0,
     egress_node_id: row.egress_node_id ?? null,
     // V5.4：中间跳是**运行时放置事实**，和入出口同类 —— 所以它必须出现在 current / merge /
-    // metadata-only 三处比较里。漏掉它与 V5-WP5-A1 漏掉 tls 路径是同一个 bug：
+    // metadata-only 三处比较里。漏掉它与  漏掉 tls 路径是同一个 bug：
     // PATCH 只改中间跳时会被判成"纯 metadata"，只写 name 就返回 200，而路由一个字节没变。
     middle_node_id: row.middle_node_id ?? null,
     // 注意：这里取**请求值**语义的表格。存量行没有 snapshot，listen_port 列
@@ -274,7 +255,7 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     target_port: row.remote_port ?? null,
     tls_cert_path: row.tls_cert_path ?? null,
     tls_key_path: row.tls_key_path ?? null,
-    // V5.5 WP15：出口腿在哪一侧是**运行时放置事实**（与入出口/中间跳同类），
+    //：出口腿在哪一侧是**运行时放置事实**（与入出口/中间跳同类），
     // 所以它必须出现在 current / merge / metadata-only 三处比较里。
     federated_egress_peer: normalizeFederatedEgressPeer(row.federated_egress_peer),
   };
@@ -333,7 +314,7 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     base.listen_port === candidate.listen_port &&
     (base.target_host ?? "") === (candidate.target_host ?? "") &&
     (base.target_port ?? null) === (candidate.target_port ?? null) &&
-    // V5-WP5-A1: the tls paths are runtime configuration, exactly like the target
+    // : the tls paths are runtime configuration, exactly like the target
     // is — so changing ONLY them must produce a revision and a rollout.
     //
     // Leaving them out of this comparison made a paths-only PATCH "metadata only":
@@ -343,7 +324,7 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     // certificate — the exact failure G1A.6 exists to prevent.
     (base.tls_cert_path ?? null) === (candidate.tls_cert_path ?? null) &&
     (base.tls_key_path ?? null) === (candidate.tls_key_path ?? null) &&
-    // V5.5 WP15：改"出口腿在哪一侧"是一次真实的放置变更（远端租约要建/要释放），
+    //：改"出口腿在哪一侧"是一次真实的放置变更（远端租约要建/要释放），
     // 绝不能被判成 metadata-only —— 那会返回 200 而什么都不发生。
     normalizeFederatedEgressPeer(base.federated_egress_peer) ===
       normalizeFederatedEgressPeer(candidate.federated_egress_peer)
@@ -414,7 +395,7 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     return { ok: false, errors, warnings, reasons };
   }
 
-  // V5-WP5-A1: the tls path rule lives in ONE place (`tlsPathsForProtocol`) and is
+  // : the tls path rule lives in ONE place (`tlsPathsForProtocol`) and is
   // now applied on the pure validation path, so create, preview and patch answer
   // with the same reason. Before this, create returned 400 for a non-tls with paths
   // while PATCH silently discarded them — the same rule with two behaviours, which
@@ -435,7 +416,7 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     }
   }
 
-  // V5.1b WP5-B2 boundary (contract §9.1 / §12): the datagram hop shape IS frozen
+  // V5.1b  boundary (contract §9.1 / §12): the datagram hop shape IS frozen
   // ("datagram end to end") and BOTH halves now exist in the Agent — the ingress
   // runtime carries client mappings across the hop, the exit attests its ingress and
   // sends to its own pool. So `udp` is accepted on both modes now.
@@ -451,7 +432,7 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     return { ok: false, errors, warnings, reasons };
   }
 
-  // V5.1b WP5-B2 boundary (contract §9.1 / §12: "明确不做——跨面板的 UDP 腿"): a datagram
+  // V5.1b  boundary (contract §9.1 / §12: "明确不做——跨面板的 UDP 腿"): a datagram
   // Forward must not declare a FEDERATED remote egress either. That leg is dispatched by
   // the HOST panel, and its exit would have to attest an ingress living on a different
   // panel — a fact neither side owns today. Without this refusal the declaration is
@@ -470,7 +451,7 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     reasons.push("missing_ingress");
   }
 
-  // ── V5.5 WP15：远端出口腿的声明（契约 §9 的第一阶段边界，全部 fail-closed）──
+  // ──：远端出口腿的声明（契约 §9 的第一阶段边界，全部 fail-closed）──
   //
   // 这些判定必须在**落库之前**给出可行动的原因码：一个"声明了但跑不起来"的
   // Forward 会让每一次 rollout 都失败在远端，而用户只看到一次保存成功。
@@ -537,7 +518,7 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
       reasons.push("same_ingress_egress");
     }
     // RELAY 的目标端口可以缺省（目标在 EgressTarget 上）；若同时给了 host/port，
-    // 必须成对出现（RELAY 的 target 快照由 WP3 编排器从池里取）。
+    // 必须成对出现（RELAY 的 target 快照由  编排器从池里取）。
     const hasHost = candidate.target_host !== null && normalizeTargetHost(candidate.target_host) !== null;
     const hasPort = candidate.target_port !== null;
     if (hasHost !== hasPort) {
@@ -607,7 +588,7 @@ export function validateForwardCandidateWithDb(
   }
 
   if (candidate.mode === "relay") {
-    // V5.5 WP15：声明了远端出口 peer 时，本机**没有**出口节点 —— 这不是"缺出口"，
+    //：声明了远端出口 peer 时，本机**没有**出口节点 —— 这不是"缺出口"，
     // 而是"出口在另一侧"。远端那一跳的容量与准入由 host 的 grant 决定（契约 §1/§3.1）。
     if (normalizeFederatedEgressPeer(candidate.federated_egress_peer) === null) {
       if (!ctx.egress) {
@@ -655,7 +636,7 @@ export function validateForwardCandidateFull(
 }
 
 /* ================================================================== */
-/* 纯函数：影响面（preview 的核心；WP3 五阶段的计划输入）                 */
+/* 纯函数：影响面（preview 的核心； 五阶段的计划输入）                 */
 /* ================================================================== */
 
 /**
@@ -702,7 +683,7 @@ export function computeForwardImpact(input: {
   const modeChange = input.current.mode !== input.candidate.mode;
   const ingressNodeChange =
     input.current.ingress_node_id !== input.candidate.ingress_node_id;
-  // V5.5 WP15：出口腿"在哪一侧"的变化与换出口节点是**同一类**放置变更 ——
+  //：出口腿"在哪一侧"的变化与换出口节点是**同一类**放置变更 ——
   // 计划要重新出 prepare_egress / cutover_egress，远端租约要建/要释放。
   // 把它漏在比较外，声明变更就不会触发任何 rollout 步骤（只在 DB 里改了一列）。
   const federatedEgressChange =
@@ -861,7 +842,7 @@ export interface CreateForwardRevisionInput {
   /** egress pool 快照（由调用方在事务外解析好，避免本模块依赖池查询细节）。 */
   egressPoolId?: number | null;
   /**
-   * V5-WP13.5B：本 revision 的来源 Route Profile（`DEVELOPMENT.md` §9.4.5）。
+   * .5B：本 revision 的来源 Route Profile（`DEVELOPMENT.md` §9.4.5）。
    *
    * **可选**：不传时沿用 tunnel 行上的来源指针（未从模板铺出来的 Forward 为 NULL，
    * 于是写入的也是 NULL —— 与新增列之前的行为逐字节一致）。
@@ -920,7 +901,7 @@ export async function ensureForwardBaselineRevision(
         applied_revision: true,
         desired_revision_id: true,
         desired_status: true,
-        // V5.5 WP15：补基线时也要冻结"出口腿当时在哪一侧"，否则旧 runtime 的
+        //：补基线时也要冻结"出口腿当时在哪一侧"，否则旧 runtime 的
         // 快照会看起来像本机出口，补偿/对账会去本机找一条不存在的腿。
         federated_egress_peer: true,
       },
@@ -1037,9 +1018,9 @@ export async function createForwardRevision(
         forward_addresses_protocol: true,
         out_node_group_id: true,
         desired_status: true,
-        // V5.5 WP15：未提交声明时"沿用当前值"（与 route_profile 指针同一取向）。
+        //：未提交声明时"沿用当前值"（与 route_profile 指针同一取向）。
         federated_egress_peer: true,
-        // V5-WP13.5B：来源模板指针（缺省 = NULL，见 CreateForwardRevisionInput.routeProfile）。
+        // .5B：来源模板指针（缺省 = NULL，见 CreateForwardRevisionInput.routeProfile）。
         route_profile_id: true,
         route_profile_version: true,
       },
@@ -1062,7 +1043,7 @@ export async function createForwardRevision(
       throw new ForwardRevisionError("invalid_input", "当前版本不支持该转发协议");
     }
 
-    // V5.5 WP15：远端出口腿的目标池**不落本机 EgressPool** —— 池是"某台本机出口节点
+    //：远端出口腿的目标池**不落本机 EgressPool** —— 池是"某台本机出口节点
     // 拨号去哪里"的关系，而那一跳不在这台面板上（契约 §1/§7：不复制远端资源）。
     // 目标作为这一版 revision 的运行态事实进 snapshot，apply 时随 grant 交给 host。
     const federatedPeer = normalizeFederatedEgressPeer(input.candidate.federated_egress_peer);
@@ -1105,7 +1086,7 @@ export async function createForwardRevision(
           target_port: input.candidate.mode === "direct" ? input.candidate.target_port : null,
           egress_pool_id: input.egressPoolId ?? null,
           egress_port: input.egressPort ?? null,
-          // V5.5 WP15：这一跳"在哪一侧"是本次 revision 的**不可变放置事实**。
+          //：这一跳"在哪一侧"是本次 revision 的**不可变放置事实**。
           // 候选没提交（undefined）时沿用 tunnel 行的当前值 —— 与 route_profile
           // 指针同一取向：不提交 ≠ 清空。
           federated_egress_peer:
@@ -1114,7 +1095,7 @@ export async function createForwardRevision(
               : normalizeFederatedEgressPeer(input.candidate.federated_egress_peer),
           targets,
           created_by_id: input.createdById,
-          // V5-WP13.5B：来源模板的**不可变** provenance（§9.4.5）。显式入参优先，
+          // .5B：来源模板的**不可变** provenance（§9.4.5）。显式入参优先，
           // 否则沿用 tunnel 行的指针（未从模板铺出来的 Forward 两列都是 NULL）。
           route_profile_id: input.routeProfile?.id ?? row.route_profile_id ?? null,
           route_profile_version: input.routeProfile?.version ?? row.route_profile_version ?? null,
@@ -1146,7 +1127,7 @@ export async function createForwardRevision(
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,
         middle_node_id: input.candidate.middle_node_id ?? null,
-        // V5.5 WP15：声明列与 snapshot 在同一事务里落库（这就是"单写者"）。
+        //：声明列与 snapshot 在同一事务里落库（这就是"单写者"）。
         // 只在候选**提交了**这一字段时才写：未提交的调用方（如按模板铺出来的
         // revision）不得因为路过这里而把用户的声明清成 NULL。
         ...(input.candidate.federated_egress_peer === undefined
@@ -1156,7 +1137,7 @@ export async function createForwardRevision(
         // 把它清成 null 会让 reconciler 在「尚未 apply」的窗口里读到残缺状态。
         listen_port: input.candidate.listen_port ?? row.listen_port,
         listen_ip: input.resolvedListenIp ?? row.listen_ip,
-        // V5.5 WP15：远端出口腿的目标存在投影列上（RELAY 本机出口的目标在
+        //：远端出口腿的目标存在投影列上（RELAY 本机出口的目标在
         // EgressPool 里，而远端腿没有本机池）。创建/重试路径要从这里读回目标再
         // 交给 host —— 少了这一步，远端腿会拿到一个空目标集。
         remote_host:
