@@ -26,11 +26,11 @@
  * 而漂移的方向永远是「某类修改被漏掉」。
  *
  * ── 两条硬约束（写死在步骤生成里）──
- *  1. **CONP 顺序**：RELAY 的 steps 中 `prepare_egress` 一定早于
+ *  1. **CONP 顺序** RELAY 的 steps 中 `prepare_egress` 一定早于
  *     `cutover_ingress`。否则入口先指向一个还不存在的 next_hop——每个进来的
  *     连接都拿 connection refused。与 `orchestrator.ts` 现存铁律
  *     （`dispatchEgress` 必须先于 `dispatchIngress`）同源。
- *  2. **同 phase 内步骤可重排，跨 phase 严格有序**：同 phase 内没有步骤对同一
+ *  2. **同 phase 内步骤可重排，跨 phase 严格有序** 同 phase 内没有步骤对同一
  *     资源产生互斥顺序（便于未来并行 PREPARE）。
  *
  * ── 不做什么 ──
@@ -422,7 +422,7 @@ export function validateRolloutAdmission(input: PlanRolloutInput): Array<{
       }
     }
 
-    // `binding_exists === false` **不阻断**：§3.2 判定表把 `ensure_binding`
+    // `binding_exists === false` **不阻断** §3.2 判定表把 `ensure_binding`
     // 列为 PREPARE 的正式步骤，即「binding 缺失」正是要用 rollout 解决的问题，
     // 不是拒绝 rollout 的理由。真正该阻断的是「连能建 binding 的节点都没有」
     // （上面的 node_unavailable）。（§13.3.1：Binding 创建显式，不自动。）
@@ -532,13 +532,13 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   if (relay) {
     const egressNode = nodes.egress;
     const egressIsNew = impact.egress_node_change || impact.mode_change;
-    // ── 入口要重切时，出口**必须再准备一次**（V5.3 round 19）──
+    // ── 入口要重切时，出口**必须再准备一次**（）──
     //
     // `prepare_egress` 是**唯一**登记出口可寻址 host 的地方（`recordNextHop` 用
     // `dispatchEgress` 返回的 `egress_host`）。而铁律是"没有 next_hop 就不允许启入口"，所以
     // **入口要重新 cutover 时，出口在哪可达必须被重新确认一次** —— 哪怕出口自身一点没变。
     //
-    // 漏掉它会发生什么（实测，failover 走的就是这条）：只换入口节点的迁移不在原条件里 ⇒ 没有
+    // 漏掉它会发生什么（observed，failover 走的就是这条）：只换入口节点的迁移不在原条件里 ⇒ 没有
     // `prepare_egress` ⇒ 没有登记 host ⇒ `resolveNextHop` 返回 null ⇒ `next_hop_unresolved` ⇒
     // 入口 cutover 失败 ⇒ **新主人永远不服务**（`forward_rollout#36` 的 `last_error` 就是这句）。
     //
@@ -661,9 +661,9 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
   /* ---------------- DRAIN ---------------- */
   // 旧入口退场分两种完全不同的所有权：
   //
-  //   · **Ingress 节点迁移**：新旧 runtime 在不同 Agent 上，backend 必须显式
+  //   · **Ingress 节点迁移** 新旧 runtime 在不同 Agent 上，backend 必须显式
   //     remove 旧节点上的 resource，因此生成 drain_ingress。
-  //   · **同节点 listen_port 变化**：Agent 的 ReplaceListener 已经先启动新 listener，
+  //   · **同节点 listen_port 变化** Agent 的 ReplaceListener 已经先启动新 listener，
   //     再异步 Stop/drain 旧 listener。此时如果 backend 再对同 logical resource 发
   //     remove_tunnel，会把刚切好的新 listener 一起删掉。这里绝不能生成远程 drain；
   //     CLEANUP 仅在旧 listener 的 Stop 上限过去后释放旧 durable lease。
