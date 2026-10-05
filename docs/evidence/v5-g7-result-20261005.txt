@@ -1,0 +1,39 @@
+V5-G7 Billing Runtime gate —— 2026-10-05T10:45:47.895823+00:00
+repo=/workspace/TuneX/.worktrees/v5-1b-udp-relay
+mysql_image=mysql:8.4.11（一次性容器，跑完删除）
+不覆盖：G7.7/G7.8（建 Forward 的占位顺序需要真面板 + 真 Agent 编排；见脚本 docstring 的理由）
+
+# V5-G7 Billing Runtime gate @ 2026-10-05T10:45:47.895823+00:00
+G7.0 OK 前提齐备
+# 一次性环境：网络=tunex-g7-net-723e82 MySQL=tunex-g7-db-723e82 应用容器=tunex-g7-app-723e82 库=tunex_g7
+G7.migrate OK 48 条迁移全部应用
+G7.client OK Prisma client 按新 schema 生成
+G7.1 OK 两个进程时区输出逐字相等
+G7.2 OK source=purchase
+G7.2b OK sub=1 granted=true
+G7.2c OK legacy_plan=1
+G7.3a OK due=2 settled=2
+G7.3b OK settled=0 skipped=0 due=0
+G7.3c OK orders 2->2 logs 0->0 balance 1000->1000
+G7.3d OK settled_rows=2
+G7.3e OK settled=2 balance 1000->980 orders 2->3
+G7.3f OK anchor_order=3 state=settled
+G7.3g OK round2 skipped=0 balance 980->980 orders 3->3
+G7.4a OK taken_over=1 state=settled
+G7.4b OK taken_over=0 attempts 1->1
+G7.5a OK grace=["g7_pro_1791197216072"] reason=policy_expired deny=false
+G7.5b OK max_tunnels=10
+G7.5c OK apply_status active->active（到期不得停掉存量 Forward）
+G7.6a OK deny=false max_tunnels=1 types=tcp
+G7.6b OK revoked=1 deny=true reason=no_active_policy grace=0
+G7.9a OK month=222（只应含 10 月的 222）
+G7.9b OK day=0（10-05 当天没有行）
+G7.9c OK stamp=2026-10-01T00:00:00.000Z
+G7.9d OK report=333 same_source_sum=333 period=total
+G7.FINDING 生效周期=total，而两份策略都声明 traffic_period="month"：unionLimits 的初值是 UNLIMITED_LIMITS（total）而 union 取"更宽松"，于是 total 恒胜。后果：额度判定与图表都按**全量累计**而不是自然月 ⇒ 月额度永不复位。属既有缺陷（非 WP20 引入），需 Lead 裁决。
+G7.10a OK federated=5000 report=5000
+G7.10b OK before=333 after=333 report=333（联邦用量不得并入额度账本）
+G7.scenario OK 场景全部产出结论
+G7.11 OK 0 命中
+G7.12 OK 写入点=['assignDefaultPolicy', 'grantPolicyFromPurchase']
+V5-G7 TOTAL PASS=30 FAIL=0
