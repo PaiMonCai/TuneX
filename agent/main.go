@@ -1,19 +1,10 @@
-// Command tunex-agent is the node-side agent for the TuneX control plane.
+// Command tunex-agent is the node-side data plane for TuneX.
 //
-// Since WP15 there is exactly one runtime: the v3 data plane built from
-// manager.TunnelManager / manager.EgressManager owns every listener and
-// forwarder (DIRECT, RELAY and EGRESS alike), the local admin API serves the
-// mutation surface, and reporter sends the state report to the panel. The
-// Socket.IO / Fernet-config session that used to carry the old DIRECT engine
-// was removed with it: a node now learns its tunnels from the panel's control
-// contract (revisioned apply commands) instead of a pushed gost config.
-//
-// Wire facts the control transport relies on:
-//
-//   - the heartbeat / state report is an agent-initiated HTTPS POST, so a node
-//     behind NAT only ever makes outbound connections (§7.9);
-//   - the panel never dials the agent; the admin plane is bound to loopback
-//     and the orchestrator reaches it over the node's connect_ip.
+// There is one production runtime: TunnelManager / EgressManager own the
+// listeners and forwarding state, while the Agent initiates every production
+// control-plane interaction with the Panel (command polling, ACK, heartbeat and
+// state reporting). The optional local admin API binds to loopback and is not
+// required for Panel-to-Agent orchestration.
 //
 // Only the Go standard library is used, so the module builds fully offline.
 package main
@@ -41,12 +32,11 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
-// run starts the v3 runtime and blocks until the process is signalled. It
-// returns a process exit code.
+// run starts the runtime and blocks until the process is signalled.
 //
 // Startup order is fixed:
 //
-//  1. v3 managers (TunnelManager + EgressManager; one shared port guard)
+//  1. managers (TunnelManager + EgressManager; one shared port guard)
 //  2. restore: pull the node's ACTIVE tunnels so ports are re-bound after a
 //     restart (devmap §5.5).
 //  3. admin API (:9090) — the mutation surface
