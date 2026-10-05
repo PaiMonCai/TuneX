@@ -327,8 +327,11 @@ export function firstConnectIp(raw: string | null | undefined): string | null {
   return raw.split(",").map((s) => s.trim()).find(Boolean) ?? null;
 }
 
-/** `ip:port` / `[v6]:port` / 裸地址 → 地址部分；空串或非字符串 → null。 */
-function addressPartOfEndpoint(raw: unknown): string | null {
+/** `ip:port` / `[v6]:port` / 裸地址 → 地址部分；空串或非字符串 → null。
+ *
+ * 导出是因为**编排层也要用它**：入口 ACK 回报的是 `ip:port`，而面板要拿地址部分去与
+ * `connect_ip` 比对，才能判断这次下发的取证地址是不是错的。第二份解析就是漂移的开始。 */
+export function addressPartOfEndpoint(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const value = raw.trim();
   if (!value) return null;

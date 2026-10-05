@@ -64,6 +64,7 @@ import {
   DEFAULT_FORWARD_PROTOCOL,
   admitPersistedProtocol,
   buildForwardRuntimePlan,
+  addressPartOfEndpoint,
   datagramHopPeerFor,
   firstConnectIp,
   forwardRuntimePlanViolations,
@@ -243,6 +244,8 @@ export const SCHEDULER_STEPS = [
   "apply_transit",
   "apply_ingress",
   "ingress_ack",
+  // V5.1b WP5-B2：入口 ACK 回报的跳端点与首次下发用的地址不同时，纠正出口腿的取证地址。
+  "correct_hop_peer",
   "activate",
 ] as const;
 export type SchedulerStep = (typeof SCHEDULER_STEPS)[number];
@@ -1242,7 +1245,8 @@ export async function createRelayTunnel(
     where: { id: tunnelId },
     select: { config_revision: true },
   });
-  const revision = (Number(current?.config_revision ?? 0) || 0) + 1;
+  // `let`：datagram 的取证纠正会把它抬一格（见下面的 correct_hop_peer）。
+  let revision = (Number(current?.config_revision ?? 0) || 0) + 1;
   await store.tunnel.update({
     where: { id: tunnelId },
     data: { config_revision: revision, apply_status: APPLY_STATUS.applying },
@@ -1389,6 +1393,69 @@ export async function createRelayTunnel(
     ok: true,
     meta: { applied_revision: ingressDispatch.result.revision },
   });
+
+  /* -------- V5.1b WP5-B2：用入口 ACK 回报的跳端点纠正出口腿的取证地址 -------- */
+  //
+  // 为什么必须在这里做：出口腿**先于**入口腿下发（铁律一），那一刻入口连 runtime 都还没有，
+  // 面板只能按 `connect_ip` 取证；多宿节点上那是**另一张网**的地址，出口会把每个跳报文都丢掉
+  //（实测 ingress packets_in=1 / egress drops=1）。而这条 ACK 是唯一**当场**给出真实端点的
+  // 时刻——此后所有下发（reapply / rollout / reconcile / 期望快照）都会从入口的周期上报里读到
+  // 同一个地址，所以纠正只需要在**创建**这一条路径做一次。
+  const learnedHopPeer = addressPartOfEndpoint(ingressDispatch.result.ack.hop_local_addr);
+  if (protocol === "udp" && learnedHopPeer && learnedHopPeer !== firstConnectIp(ingressPick.node.connect_ip)) {
+    // 抬 revision 并落库：Agent 的闸门把「同 revision 的第二次下发」当重复 —— 那是它该做的，
+    // 配置变了就必须是新 revision。
+    const correctedRevision = revision + 1;
+    await store.tunnel.update({
+      where: { id: tunnelId },
+      data: { config_revision: correctedRevision, apply_status: APPLY_STATUS.applying },
+    });
+    const egressCorrected = await orchestrator.dispatchEgress({
+      tunnelId,
+      revision: correctedRevision,
+      egressNode: egressPick.node,
+      egressPort: egressAlloc.port,
+      poolId,
+      targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+      protocol,
+      hopPeer: learnedHopPeer,
+    });
+    const ingressCorrected = egressCorrected.ok
+      ? await orchestrator.dispatchIngress({
+          tunnelId,
+          revision: correctedRevision,
+          ingressNode: ingressPick.node,
+          ingressPort: ingressAlloc.port,
+          nextHop: plan.upstream.next_hop as string,
+          protocol: plan.protocol.name,
+          ...tlsPathsFor(asRow<Record<string, unknown>>(created) as Record<string, unknown>, plan.protocol.name),
+        })
+      : null;
+    if (!egressCorrected.ok || ingressCorrected === null || !ingressCorrected.ok) {
+      // 纠正失败 ⇒ 出口此刻对**错的**地址取证（数据面不通），而且两条腿的 revision 已经不一致。
+      // 按既有口径补偿到"两侧都没有 runtime"，并把这次编排报成失败——不做半成功。
+      await orchestrator
+        .removeTunnel({ tunnelId, node: ingressPick.node, direction: "ingress", revision: correctedRevision + 1, reason: "hop peer correction failed" })
+        .catch(() => {});
+      await orchestrator
+        .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: correctedRevision + 1, reason: "hop peer correction failed" })
+        .catch(() => {});
+      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+      // 分步取错因：联合类型要逐分支收窄，别在这里用可选链糊过去。
+      let correctionError = "unknown";
+      if (!egressCorrected.ok) correctionError = egressCorrected.error;
+      else if (ingressCorrected !== null && !ingressCorrected.ok) correctionError = ingressCorrected.error;
+      return fail(
+        "apply_ingress",
+        SCHEDULER_ERROR_CODES.invariant_violated,
+        `datagram 跳取证的纠正下发失败：${correctionError}`,
+        { tunnelId, revision: correctedRevision, meta: { hop_peer: learnedHopPeer } },
+      );
+    }
+    // 「两条腿共用同一个 config_revision」是不变量（§3.2）：纠正把两者一起抬到新 revision。
+    revision = correctedRevision;
+    steps.push({ step: "correct_hop_peer", ok: true, meta: { revision, hop_peer: learnedHopPeer } });
+  }
 
   /* ---------------- ⑩ active ---------------- */
   await persistSuccess(store, tunnelId, { revision, at: deps.now() });

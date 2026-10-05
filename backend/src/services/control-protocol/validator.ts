@@ -895,6 +895,13 @@ export class ControlValidator {
       cmd.payload.applied_revision ?? entry.outcome.applied_revision,
       cmd.payload.state ?? null,
     );
+    // V5.1b WP5-B2: carry the datagram hop endpoint onto the memoized ACK. It has to be
+    // set BEFORE `rememberAck`, because the replays below return the remembered object —
+    // a field that only existed on the first pass would vanish exactly when a command is
+    // retried, and the panel would then never correct the exit's attestation.
+    if (typeof cmd.payload.hop_local_addr === "string" && cmd.payload.hop_local_addr.trim() !== "") {
+      ack.hop_local_addr = cmd.payload.hop_local_addr;
+    }
     this.rememberAck(cmd.command_id, ack);
     return ack;
   }

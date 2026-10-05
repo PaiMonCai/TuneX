@@ -53,6 +53,12 @@ export interface AgentCommandAck {
   results?: AgentDiagnoseResult[] | null;
   /** V4-WP11C: the node's own bounded self report (collect_diagnostics). */
   facts?: NodeSelfFacts | null;
+  /**
+   * V5.1b WP5-B2: a datagram RELAY's own hop endpoint (`ip:port`), reported in the ACK
+   * of the apply that built the runtime (see `control.CommandAckPayload.hop_local_addr`
+   * for why this cannot wait for the periodic state report).
+   */
+  hop_local_addr?: string | null;
 }
 
 /**
@@ -699,7 +705,18 @@ export class OutboundAgentTransport implements AgentTransport {
         error: `agent acknowledged ${envelope.command_id} without applied_revision`,
       };
     }
-    return { ok: true, applied_revision: ack.applied_revision };
+    return {
+      ok: true,
+      applied_revision: ack.applied_revision,
+      // V5.1b WP5-B2: a datagram RELAY's hop endpoint has to survive this return as well.
+      // It is the third place the agent's ACK fields are copied (the agent sets it, then
+      // the ledger remembers it, then this) and every one of them is a place it can be
+      // silently dropped — which is how "the panel never corrects the exit" happens while
+      // both sides look healthy.
+      ...(typeof ack.hop_local_addr === "string" && ack.hop_local_addr.trim() !== ""
+        ? { hop_local_addr: ack.hop_local_addr }
+        : {}),
+    };
   }
 
   applyEgress(node: OrchestratorNode, config: AgentTunnelConfig, envelope?: CommandEnvelope): Promise<unknown> {

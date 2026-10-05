@@ -582,7 +582,9 @@ export interface OrchestratorOptions {
  */
 function parseAgentAck(
   raw: unknown,
-): { ok: true; applied_revision?: number } | { ok: false; error_code?: string; error?: string } {
+):
+  | { ok: true; applied_revision?: number; hop_local_addr?: string }
+  | { ok: false; error_code?: string; error?: string } {
   if (raw === null || raw === undefined) return { ok: true };
   if (typeof raw !== "object") return { ok: false, error: `非对象响应体: ${String(raw)}` };
   const r = raw as Record<string, unknown>;
@@ -602,7 +604,16 @@ function parseAgentAck(
     };
   }
   const rev = r.applied_revision ?? r.revision;
-  return { ok: true, applied_revision: typeof rev === "number" ? rev : undefined };
+  return {
+    ok: true,
+    applied_revision: typeof rev === "number" ? rev : undefined,
+    // V5.1b WP5-B2: the datagram RELAY agent reports the hop endpoint it actually uses.
+    // Read it here so it can ride the synthesized `command_ack` below — the response body
+    // is the only place this fact exists.
+    ...(typeof r.hop_local_addr === "string" && r.hop_local_addr.trim() !== ""
+      ? { hop_local_addr: r.hop_local_addr }
+      : {}),
+  };
 }
 
 /**
@@ -1401,6 +1412,13 @@ export class Orchestrator {
           // Agent 回显 applied_revision；没有就给下发值（老版本 agent）。
           applied_revision: ack.applied_revision ?? envelope.revision,
           status: "applied",
+          // V5.1b WP5-B2: carry the datagram hop endpoint the agent just reported. This
+          // is the ONE place the agent's own ACK fields are folded into the synthesized
+          // `command_ack` envelope, so a field not listed here is silently dropped —
+          // and the panel would then never learn which address to attest.
+          ...(typeof ack.hop_local_addr === "string" && ack.hop_local_addr.trim() !== ""
+            ? { hop_local_addr: ack.hop_local_addr }
+            : {}),
         },
       });
     } catch (e) {

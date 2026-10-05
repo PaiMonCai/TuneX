@@ -391,6 +391,13 @@ export interface CommandAck {
   state?: ResourceSnapshot | null;
   /** 生成 ACK 的时刻（ISO 8601）。 */
   acked_at?: string;
+  /**
+   * V5.1b WP5-B2：datagram RELAY 的入口回报的跳端点（`ip:port`）。
+   *
+   * 它必须**跟着 ACK 一起被记忆**：账本会把 ACK 存下来供重放（重复 ACK / 换页重投递），
+   * 若重放时丢掉这个字段，纠正就会**静默不发生**——而面板两侧的账本看起来都正常。
+   */
+  hop_local_addr?: string;
 }
 
 /**
