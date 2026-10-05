@@ -1,23 +1,34 @@
 /**
- * WP6 — Command / Revision / ACK 协议契约（transport-agnostic）
+ * Transport-agnostic Command / Revision / ACK wire contract.
  *
- * 依据 `DEVELOPMENT.md` §7.9「WP6 — Command / Revision / ACK Contract」
- * （Track B/C，可与 WP1/WP4 并行）。
+ * The protocol defines data shapes only: no Hono, Redis, Prisma or transport
+ * imports belong here. Mutation commands are revisioned and idempotent; read-only
+ * diagnostic actions never enter the mutation revision gate.
+ *
+ * Product protocol names are copied as wire literals so the protocol package
+ * stays independent from database/client generation. Runtime admission remains
+ * fail-closed when a capability is not advertised/implemented.
+ */
+
+ *  — Command / Revision / ACK 协议契约（transport-agnostic）
+ *
+ * 依据 `DEVELOPMENT.md` §7.9「 — Command / Revision / ACK Contract」
+ * （Track B/C，可与 / 并行）。
  *
  * ── 本模块的边界（写死，防范围蔓延）──
  *  · 只定义**协议契约**：命令信封、ACK、revision 语义、错误码。
- *  · **不实现 orchestrator**（WP8 的 Egress/Ingress 编排、端口分配、补偿回滚都不在这里）。
+ *  · **不实现 orchestrator**（ 的 Egress/Ingress 编排、端口分配、补偿回滚都不在这里）。
  *  · **不绑定 transport**：不 import hono / socket.io / fetch；信封是纯数据，
  *    上层用 HTTP、WebSocket、Socket.IO 还是测试桩都随调用方。
  *  · **不要求 Panel 主动连 Agent**：§7.9 明确「控制 transport 仍由 Agent 主动出站」，
  *    本模块因此只描述「消息长什么样、按什么规则被接受/拒绝」，不描述通道谁发起。
  *  · **零运行时依赖**：本文件不 import 任何东西（连 node:crypto 都不要），
- *    保证契约测试可以在任何环境离线跑，也保证 WP8/WP7 引入它时不拖进 DB/Redis 客户端。
+ *    保证契约测试可以在任何环境离线跑，也保证 / 引入它时不拖进 DB/Redis 客户端。
  *
  * ── 与 Prisma schema 的关系 ──
- *  WP6 允许与 WP1（schema 契约）并行，因此这里刻意**不 import @prisma/client**：
+ *   允许与 （schema 契约）并行，因此这里刻意**不 import @prisma/client**：
  *  `TUNNEL_TYPES` / `LOAD_BALANCE_TYPES` 等枚举值在本文件内按现有 schema 抄录一份，
- *  并注明「WP1 合并后复核」。schema 定稿后若要改为从 Prisma 引用，必须同步更新
+ *  并注明「 合并后复核」。schema 定稿后若要改为从 Prisma 引用，必须同步更新
  *  `__tests__/control-protocol.test.ts` 的对应断言。
  *
  * ── 版本纪律 ──
@@ -34,7 +45,7 @@
  * §7.9 冻结的六个统一命令。
  *
  *  - `apply_tunnel`     新建/全量重放一条隧道（幂等的完整快照，非增量）。
- *  - `remove_tunnel`    下线一条隧道（保留数据，不物理删除；补偿语义见 WP8）。
+ *  - `remove_tunnel`    下线一条隧道（保留数据，不物理删除；补偿语义见 ）。
  *  - `update_targets`   热更新目标池（不重建 listener）。
  *  - `suspend_tunnel`   暂停转发（保留隧道与配置）。
  *  - `state_request`    查询对端当前状态（非变更，返回 ResourceSnapshot）。
@@ -47,16 +58,16 @@ export const COMMAND_ACTIONS = [
   "suspend_tunnel",
   "state_request",
   "command_ack",
-  // V4-WP11C: read-only, bounded reachability probe. It never mutates the
+  // : read-only, bounded reachability probe. It never mutates the
   // runtime, so it is declared non-mutating and needs no revision floor — but it
   // is also NOT a baseline action: an agent only accepts it after advertising
   // the capability (see services/agent-capability.ts).
   "diagnose_tunnel",
-  // V4-WP11C: Node-level self report. Read-only, no payload, capability-gated
+  // : Node-level self report. Read-only, no payload, capability-gated
   // exactly like diagnose_tunnel (an old agent must not receive it).
   "collect_diagnostics",
-  // V5-WP19-D: Looking Glass — a bounded, public-target-only active test issued
-  // by a user (contract §3 D7 / §5 WP19-D). It is a **new** action rather than a
+  // : Looking Glass — a bounded, public-target-only active test issued
+  // by a user (contract §3 D7 / §5 ). It is a **new** action rather than a
   // reuse of diagnose_tunnel on purpose: diagnose targets come from a Forward's
   // own desired state (never from user input), while this one carries a target
   // the caller typed. Those two facts need different admission rules, different
@@ -71,13 +82,13 @@ export const COMMAND_ACTIONS = [
 export type CommandAction = (typeof COMMAND_ACTIONS)[number];
 
 /**
- * Prisma 枚举的**抄录副本**（WP1 合并后复核是否改为直接引用）。
- * 抄录而不是 import：WP6 允许与 WP1 schema 契约并行，本模块不能被 schema
+ * Prisma 枚举的**抄录副本**（ 合并后复核是否改为直接引用）。
+ * 抄录而不是 import： 允许与  schema 契约并行，本模块不能被 schema
  * 的落地进度阻塞；同时这里不进 @prisma/client，契约测试零环境依赖。
  */
 export const TUNNEL_TYPES = [
   "tcp",
-  // V5-WP5-A2: `ws` is a PRODUCT protocol whose name the legacy Prisma enum does
+  // : `ws` is a PRODUCT protocol whose name the legacy Prisma enum does
   // not carry (it has `wss`, the historical wrapper). This whitelist is the WIRE
   // vocabulary, and it is allowed to lead the DB enum: the payload's
   // `tunnel_type` is a descriptive echo (the canonical fact is `protocol`, and
@@ -99,7 +110,7 @@ export const LOAD_BALANCE_TYPES = ["round", "rand", "fifo", "hash", "ll", "lc"] 
 export const IP_TYPES = ["auto", "ipv4", "ipv6"] as const;
 export const TARGET_PROTOCOLS = ["tcp", "udp"] as const;
 
-/** 被指挥的资源种类。v3 RELAY 阶段只有 tunnel 可直接指挥；node/agent 预留给 WP7/WP8。 */
+/** 被指挥的资源种类。v3 RELAY 阶段只有 tunnel 可直接指挥；node/agent 预留给 /。 */
 export const COMMAND_RESOURCES = ["tunnel", "node", "node_group", "agent"] as const;
 export type CommandResource = (typeof COMMAND_RESOURCES)[number];
 
@@ -113,7 +124,7 @@ export type CommandResource = (typeof COMMAND_RESOURCES)[number];
  *    其余必须 ≥1（0 视为未初始化，禁止当版本号用）。
  */
 /**
- * V4-WP11C diagnose payload.
+ *  diagnose payload.
  *
  * The panel builds this list from the tunnel's own authorized desired state —
  * never from a request body — so a caller cannot use the diagnose endpoint to
@@ -127,7 +138,7 @@ export interface DiagnoseTunnelPayload {
 }
 
 /**
- * V4-WP11C Node diagnostic payload: deliberately empty.
+ *  Node diagnostic payload: deliberately empty.
  *
  * A node self-report takes no input. Accepting one would invite "collect this
  * path" / "collect this process", which is how a diagnostic becomes a remote
@@ -138,7 +149,7 @@ export interface CollectDiagnosticsPayload {
 }
 
 /**
- * V5-WP19-D Looking Glass payload.
+ *  Looking Glass payload.
  *
  * **这里只有"钉死的公网字面地址"**：域名由面板解析、面板判公网，然后把地址写进
  * 命令；Agent 不会再解析任何名字（它是 DNS 重绑定的最后一道防线）。
@@ -178,7 +189,7 @@ export const ACTION_SPECS: Readonly<Record<CommandAction, ActionSpec>> = {
   command_ack: { mutating: false, resources: ["tunnel", "node", "node_group", "agent"], minRevision: 1 },
   diagnose_tunnel: { mutating: false, resources: ["tunnel", "node"], minRevision: 0 },
   collect_diagnostics: { mutating: false, resources: ["node"], minRevision: 0 },
-  // V5-WP19-D: read-only, node-scoped, no revision floor. It must never enter the
+  // : read-only, node-scoped, no revision floor. It must never enter the
   // mutation path: a diagnostic that advances a resource's revision is not a
   // diagnostic (same rule as diagnose_tunnel / collect_diagnostics).
   looking_glass: { mutating: false, resources: ["node"], minRevision: 0 },
@@ -198,7 +209,7 @@ export const DEFAULT_APPLIED_STATUS: Readonly<Record<string, ResourceStatus>> = 
 
 /**
  * ACK 的 `status` 四态。区分「协议层拒绝」与「执行失败」是故意的：
- * WP8 需要知道一条命令是**根本没被接受**（rejected，别重试同版本）还是
+ *  需要知道一条命令是**根本没被接受**（rejected，别重试同版本）还是
  * **接受了但没做成**（failed，可修完再发新版本）。
  */
 export const ACK_STATUSES = ["applied", "duplicate", "rejected", "failed"] as const;
@@ -248,7 +259,7 @@ export type ErrorCode = (typeof ERROR_CODES)[number];
  *  - `active`    正常生效。
  *  - `suspended` 已暂停。
  *  - `removed`   已下线（数据保留）。
- *  - `error`     上次执行失败（对应 WP8 的 apply_status=error，不物理删除）。
+ *  - `error`     上次执行失败（对应  的 apply_status=error，不物理删除）。
  */
 export const RESOURCE_STATUSES = ["unknown", "applying", "active", "suspended", "removed", "error"] as const;
 export type ResourceStatus = (typeof RESOURCE_STATUSES)[number];
@@ -297,7 +308,7 @@ export interface TargetDescriptor {
 export interface ApplyTunnelPayload {
   tunnel: {
     name: string;
-    /** 对齐 Prisma `TunnelType`（抄录版，WP1 合并后复核）。 */
+    /** 对齐 Prisma `TunnelType`（抄录版， 合并后复核）。 */
     tunnel_type: string;
     listen_port: number;
     listen_ip?: string;
@@ -338,7 +349,7 @@ export interface CommandAckPayload {
   /** 可选的状态回执（响应 state_request 时携带）。 */
   state?: ResourceSnapshot | null;
   /**
-   * V5.1b WP5-B2：datagram RELAY 的入口在这个 ACK 里回报**它实际使用的跳端点**
+   * V5.1b：datagram RELAY 的入口在这个 ACK 里回报**它实际使用的跳端点**
    *（`ip:port`），面板据此告诉出口该对谁取证。
    *
    * 为什么必须走 ACK 而不是周期上报：出口腿**先于**入口腿下发（§3.2 铁律），所以那一刻
@@ -437,7 +448,7 @@ export interface CommandAck {
   /** 生成 ACK 的时刻（ISO 8601）。 */
   acked_at?: string;
   /**
-   * V5.1b WP5-B2：datagram RELAY 的入口回报的跳端点（`ip:port`）。
+   * V5.1b：datagram RELAY 的入口回报的跳端点（`ip:port`）。
    *
    * 它必须**跟着 ACK 一起被记忆**：账本会把 ACK 存下来供重放（重复 ACK / 换页重投递），
    * 若重放时丢掉这个字段，纠正就会**静默不发生**——而面板两侧的账本看起来都正常。
