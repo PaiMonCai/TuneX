@@ -540,7 +540,7 @@ Prisma 的字段与关系名校验、DB 枚举列的取值域。前面两个都�
 | WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 —— **已交付 2026-10-05**：`services/ddns-binding.ts` + `routes/ddns.ts` + `forwards.ts` 的 `/:id/dns`；38 条断言（服务层 33 + 路由层 5，后者钉住 `settings:manage` 这条接线） | 不写 DNS、不建 provider 适配 |
 | WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 —— **已交付 2026-10-05**：`services/ddns-executor.ts`（唯一的外呼入口）+ 退避两列（additive 迁移）；25 条断言 | 不接 failover、不碰 rollout |
 | WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 —— **已交付 2026-10-05**：`services/ddns-successor.ts`（闸门 + 后继 + 生产接线）+ `failover-loop` 接线；13 条断言 | 不新增定时器、不改 rollout 步骤词表 |
-| WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 —— **已交付 2026-10-05**：`scripts/v3-e2e/v5-g6.py`（七条性质 + 自带 stub provider，零出网）+ `docs/evidence/v5-g6-result-20261005.txt` / `v5-g6-http.json`；交付记录见 §4 的「WP17.5 交付记录」（含它抓到的三处「单测绿、真拓扑红」：`b171460` / `f334f1c` / `178fe47`） | 不改 G3/G4/G5 断言 |
+| WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 —— **已交付 2026-10-05**：`scripts/v3-e2e/v5-g6.py`（七条性质 + 自带 stub provider，零出网，`TOTAL PASS=72 FAIL=0`）+ `docs/evidence/v5-g6-result-20261005.txt` / `v5-g6-http.json`；交付记录见 §4 的「WP17.5 交付记录」（含它抓到的**四处**「单测绿、真拓扑红」：`b171460` / `f334f1c` / `178fe47` / `43762e2`，以及由此修掉的产品可观测性缺口 `c0108c0`） | 不改 G3/G4/G5 断言 |
 
 ## 6. DoD（可断言的检查）
 **时间与数值**（实现选值，可调，理由随附）：`DDNS_SYNC_DEADLINE_MS = 120_000`（迁移秒级、
