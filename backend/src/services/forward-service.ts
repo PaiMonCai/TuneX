@@ -21,7 +21,7 @@ import { checkTunnelCreation } from "./capability-policy.ts";
 import { getOrchestrator } from "./relay-wiring.ts";
 import { reapplyDirectTunnel, reapplyRelayTunnel } from "./scheduler.ts";
 import { registerRollout } from "./forward-rollout-exec.ts";
-//：远端出口腿的声明校验与释放。声明校验只有这一个实现（路由层也复用它），
+// 远端出口腿的声明校验与释放。声明校验只有这一个实现（路由层也复用它），
 // 所以"能保存但跑不起来"不可能出现两次不同的结论。
 import {
   releaseStaleFederatedEgressForTunnel,
@@ -99,7 +99,7 @@ export interface ForwardCreateInput {
   target_host: string;
   target_port: number;
   /**
-   *：把这条 Forward 的**出口腿**委托给某个已信任的 peer panel
+   * 把这条 Forward 的**出口腿**委托给某个已信任的 peer panel
    * （存 peer_panel_id；`undefined`/`null` = 出口在本机，即今天的行为）。
    *
    * 声明了它就**不能**再给 `egress_node_id`：出口腿只能在一侧（见
@@ -128,7 +128,7 @@ export interface ForwardPatchInput {
   target_host?: string | null;
   target_port?: number | null;
   /**
-   *：tls 前端的证书/私钥路径可改，规则与创建时完全相同（只有 tls 能带，
+   * tls 前端的证书/私钥路径可改，规则与创建时完全相同（只有 tls 能带，
    * 且必须成对）—— 由 `tlsPathsForProtocol` 统一判定，不在这里复制一份规则。
    *
    * 协议本身仍然不可改：`protocol` 不在 patch 白名单里。把一个 tcp 转发改成 tls
@@ -138,7 +138,7 @@ export interface ForwardPatchInput {
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
   /**
-   *：出口腿的承载方（`null` = 改回本机出口）。与 `egress_node_id` 互斥。
+   * 出口腿的承载方（`null` = 改回本机出口）。与 `egress_node_id` 互斥。
    */
   federated_egress_peer?: string | null;
   /**  §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
@@ -174,7 +174,7 @@ async function reloadOrMinimal(
  *
  * 创建 Forward / 迁移到新节点前必须过这里。判定逻辑一行都不在本文件——
  * lifecycle 与 connection 的口径全在 `services/node-lifecycle.ts` 的
- * `nodeAdmission`（// 共用），两边各自判一遍必然漂移。
+ * `nodeAdmission`（共用），两边各自判一遍必然漂移。
  *
  * 返回 null = 放行；否则是 { code, message } 形状的阻断（`data` 里可选附带
  * 具体 condition，供 §13.5 的可区分错误码）。
@@ -209,10 +209,10 @@ const nodeSelect = {
   role: true,
   node_group_id: true,
   lb_strategy: true,
-  //：自动分配端口前必须确认节点配置了区间（§7.6「未配置区间拒绝分配」）。
+  // 自动分配端口前必须确认节点配置了区间（§7.6「未配置区间拒绝分配」）。
   port_range_min: true,
   port_range_max: true,
-  //：§13.4.2 准入判定需要 lifecycle（desired 管理态）。它和下面 role
+  // §13.4.2 准入判定需要 lifecycle（desired 管理态）。它和下面 role
   // 的能力判定是两个正交维度：role=ingress 的节点也可能正处于 maintenance。
   lifecycle: true,
   // §13.4.1 Connection 层事实：准入谓词要求「已安装且未撤销」。
@@ -306,7 +306,7 @@ export function forwardView(t: any) {
     apply_status: t.apply_status,
     config_revision: t.config_revision,
     applied_revision: t.applied_revision,
-    //：desired revision 指针 + 最新 revision 号。前端保存时把它们作为
+    // desired revision 指针 + 最新 revision 号。前端保存时把它们作为
     // expected_revision 回传（§13.3.3 乐观并发）。
     desired_revision_id: t.desired_revision_id ?? null,
     latest_revision: t.config_revision ?? 0,
@@ -357,7 +357,7 @@ async function prepareRelayRevisionResources(
   if (candidate.mode !== "relay") {
     return { poolId: null, egressPort: null, targets: null };
   }
-  //：远端出口腿没有本机 EgressPool —— 池表达的是"某台**本机**出口节点
+  // 远端出口腿没有本机 EgressPool —— 池表达的是"某台**本机**出口节点
   // 拨号去哪里"，而那一跳不在这台面板上（契约 §1/§7：不复制远端资源）。
   // 目标仍要作为本版 revision 的运行态事实落到 snapshot（rollout 的 apply 会把它
   // 交给 host），所以这里直接返回目标集合并跳过本地池的增删。
@@ -684,7 +684,7 @@ export async function createForward(
   }
 
   const egressId = input.egress_node_id ?? null;
-  //：出口腿"在哪一侧"是这次创建的一部分。声明了 peer 时本机没有出口
+  // 出口腿"在哪一侧"是这次创建的一部分。声明了 peer 时本机没有出口
   // 节点，这不是"缺出口"，而是"出口在另一侧"（互斥判定在 validateForwardCandidate）。
   const federatedPeer = normalizeFederatedEgressPeer(input.federated_egress_peer);
   if (federatedPeer !== null && input.mode !== "relay") {
@@ -853,7 +853,7 @@ export async function createForward(
           tunnel_mode: input.mode,
           ingress_node_id: ingress.id,
           egress_node_id: egress?.id ?? null,
-          //：声明列与 Forward 行同时落库（同一事务）。远端那一跳的节点/
+          // 声明列与 Forward 行同时落库（同一事务）。远端那一跳的节点/
           // 端口不在这里、也不在任何本地资源表里 —— 它只以 federation_placement 的
           // 不透明引用存在（契约 §1/§7）。
           ...(federatedPeer === null ? {} : { federated_egress_peer: federatedPeer }),
@@ -937,7 +937,7 @@ export async function createForward(
       // V5.4：把**失败在哪一步**打出来。
       //
       // 创建失败此前只回一个 502 body，`steps` / `failedStep` 被整条丢掉，于是"出口之后到底哪一步
-      // 失败"只能靠猜 —— 而这一步的失败会**留下已发出的出口 runtime**（实测 `tunex-277-egress`
+      // 失败"只能靠猜 —— 而这一步的失败会**留下已发出的出口 runtime**（observed `tunex-277-egress`
       // 占着 22001），每次尝试都在毒化下一次。没有这行日志，那类泄漏看起来像"端口分配有 bug"。
       const failedStep = (applied as { failedStep?: string }).failedStep ?? "unknown";
       const trail = (applied as { steps?: Array<{ step: string; ok: boolean; error_code?: string | null }> }).steps ?? [];
@@ -983,7 +983,7 @@ export async function patchForward(
 
   const { base, candidate, ctx, metadataOnly, desiredStatus } = resolved.data;
 
-  //：声明"出口腿放到 peer X"必须当场成立（存在 + trusted + 联邦已开启），
+  // 声明"出口腿放到 peer X"必须当场成立（存在 + trusted + 联邦已开启），
   // 否则会保存出一条每次都失败在远端的 Forward。只在声明**非空**时查库：
   // 未声明（绝大多数路径）一次查询都不多，行为逐字节不变。
   const candidatePeer = normalizeFederatedEgressPeer(candidate.federated_egress_peer);
@@ -1064,7 +1064,7 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
-          //：声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
+          // 声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
           // 内写 snapshot 的那一列取值完全相同，来源都是候选）。
           ...(candidate.federated_egress_peer === undefined
             ? {}
@@ -1568,7 +1568,7 @@ export async function runForwardAction(
  * 形态约束（与 `forward-batch.ts` 的决策文档一致）：
  *   · **顺序执行**，不并发：每个 action 都可能触发 rollout（下发 + 租约），
  *     并发对同一入口节点发起 N 个动作会让 apply 状态机互相踩踏；
- *   · **逐条结果**：一条失败不影响其它条，返回 `{ id, ok, code, message }`，
+ *   · **逐条结果** 一条失败不影响其它条，返回 `{ id, ok, code, message }`，
  *     部分失败对用户可见——这是「批量删除不做」的同一条理由的反面（删除的
  *     部分成功无法解释，retry/suspend 的部分成功可以）；
  *   · 工作空间作用域由 `runForwardAction` 内部检查（越权 id 得到 404，
