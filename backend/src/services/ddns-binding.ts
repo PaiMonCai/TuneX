@@ -1,11 +1,10 @@
 /**
  * DDNS binding and provider-credential service.
  *
- * This layer persists the DNS front-door configuration and enforces workspace
- * scope/RBAC, but never calls a DNS provider. Published addresses come only from
- * the selected ingress node's `connect_ip`; provider credentials are stored
- * sealed with the DDNS-specific key derivation. DNS status is a projection of
- * persisted sync facts, and only `synced` represents a confirmed switch.
+ * Persists DNS front-door configuration and enforces workspace scope/RBAC, but
+ * never calls a DNS provider. Published addresses come from eligible ingress
+ * nodes, credentials remain sealed, and DNS status is derived from persisted
+ * synchronization facts rather than a second state machine.
  */
 import type { Prisma } from "@prisma/client";
 import { deriveDdnsSealKey, sealSecret, unsealSecret } from "./federation/seal.ts";
