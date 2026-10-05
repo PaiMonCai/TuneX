@@ -704,7 +704,18 @@ describe("WP15 lease: reserve allocates exactly once and compensates on failure"
         { id: 1, intent_id: "intent-1", peer_panel_id: "panel-a", revision: 7, action: "create", status: "pending", lease_id: null, error_code: null, created_at: NOW },
       ],
     });
-    const outcome = await reserveRemoteLease(reserveInput(), { ...hooks(calls), db });
+    // The CLOCK MUST BE INJECTED here — through the deps, which is where this
+    // service reads it (`const now = d.now()`), not through the input.
+    //
+    // The seed above pins the pending row at NOW, and "in flight" means
+    // `now - created_at < LEASE_INTENT_PENDING_TTL_MS` (60s). Reading the real
+    // clock instead makes this test a wall-clock time bomb: it is green while the
+    // real time is BEFORE NOW (negative age) and for exactly one minute after it,
+    // then red forever. That is not hypothetical — it went red on 2026-10-05 at
+    // 12:01 CST (04:01Z), on main and on this branch alike, with no code change
+    // involved. Injecting the instant the seeded row claims makes the assertion
+    // mean what it says: a claim that is in flight RIGHT NOW is refused.
+    const outcome = await reserveRemoteLease(reserveInput(), { ...hooks(calls, { now: () => NOW }), db });
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("duplicate_message");
     expect(calls.allocate).toHaveLength(0);
