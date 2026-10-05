@@ -1,67 +1,11 @@
 /**
- * V5.3 WP10 — 故障转移/回切策略（纯函数：无 IO、无 DB、无环境时钟）。
+ * Pure Forward failover and failback policy.
  *
- * §8 冻结契约二写着「故障转移必须是显式 policy」：自动迁移**必须同时**满足六条条件，
- * 缺一不可。这个模块就是那六条条件的唯一实现 —— 输入是已经读出来的事实（节点存活、
- * 观测新鲜度、目标健康、端口可用性、冷却、策略），输出是 `move` / `hold` / `failback`
- * **以及每一条未满足条件的具体原因**。
- *
- * ── 为什么这一层必须存在（§8.3 的真实危险）──
- *
- * 「节点心跳超时 → 自动迁移」是错的，而且是**危险**的错：
- *
- *   · heartbeat 超时单独出现**不足以**迁移（§8.3 明文）：连接还在、只是心跳卡住的
- *     节点仍然在服务，此时搬走流量会制造双主窗口（§8.2 的 split brain）；
- *   · 如果问题是**目标本身坏了**，换谁承载都毫无帮助，只会把故障藏起来 ——
- *     这正是「一个故障转移系统」和「一个靠搬流量掩盖坏目标的系统」的分界；
- *   · 没有新鲜观测时迁移等于猜；
- *   · 备用节点没有端口时迁移只是把「不可用」从一个节点搬到另一个节点；
- *   · 冷却期内的第二次迁移会把一次抖动放大成环路。
- *
- * 所以本模块**只输出结论，不输出动作**：它不删除、不改写、不重排任何目标列表，
- * 也不接受目标列表作为输入 —— 它决定的是「**谁**承载这条 Forward」，不是「它指向
- * 什么」（§7.3 与 §8.3 的禁止项）。
- *
- * ── 六条条件（§8 冻结，顺序与 §8 一致）──
- *
- *   1. `owner_unreachable_beyond_stale`：节点不可达**且**超过 stale 阈值
- *      （heartbeat 超时单独出现不足；两个子条件必须同时成立）
- *   2. `observation_fresh`：观测新鲜度可用
- *   3. `target_not_side_failure`：健康问题不是「目标本身坏了」
- *   4. `standby_port_available`：备用节点有可用端口（§1.5 的端口租约）
- *   5. `cooldown_elapsed`：同一 Forward 的迁移冷却已过
- *   6. `policy_allows`：运维策略允许自动迁移
- *
- * 另有四条**结构前提**（不是策略条件，而是「这条决策能不能表达出来」）：
- * 目的地在、目的地在线、租约 epoch 可读（迁移指令必须是 epoch + 1）、回切目标已配置。
- *
- * ── 回切（failback）不是特例路径 ──
- *
- * §8：「首选节点连续 `FAILBACK_HEALTHY_CHECKS` 次判定健康、且冷却期已过，才允许回切；
- * 回切是一次**正常的归属迁移**（epoch + 1），不是特例路径。」因此：
- *
- *   · 回切走同一个 `PlacementMigration` 形状、同一个 `epoch + 1` 指令，调用方只需要
- *     一条执行路径：`const m = placementMigration(decision); if (m) apply(m);`
- *   · 回切路径上**条件 1 不适用**（`null`）：回切恰恰发生在当前 owner 正常的时候，
- *     要求它失联是自相矛盾的；
- *   · 但条件 2/3/4/5/6 对回切**同样成立**：不能拿陈旧观测回切、不能为了掩盖目标故障
- *     而回切、首选节点要有端口、冷却期内不许回切、策略要允许自动回切。
- *
- * ── 决策对象：未满足的条件**全部**列出 ──
- *
- * `conditions` / `preconditions` 是事实快照：`true` / `false` = 已评估的事实，
- * `null` = 本次决策路径**没有这个事实**（回切路径上不要求 owner 失联；failover 路径上
- * 不存在「连续健康计数」；没有目的地时就没有「它在线吗 / 它有端口吗」这两个答案）。
- * `blockers` 则是「这次为什么没有迁移」的全部原因，一条未满足条件一个条目
- * （**不是只报第一条**）。不变量（有用例钉住）：每个 blocker 都对应一个 `false` 的
- * 事实条目，且 `reasons` 一定以 blocker 的原因开头。
- *
- * ── 与 WP6 的关系 ──
- *
- * 五态词表与 `isTargetHealthState` 从 `target-health.ts` 取，不在这里复制：
- * 「healthy / recovering / degraded / unhealthy / unknown」只有一个定义。
- * 判定「目标本身坏了」用的是 WP6 的结论：`unhealthy` 或 `degraded` 就是目标侧在报坏，
- * 此时迁移只会掩盖故障。
+ * The policy consumes already-read liveness, observation, target-health, port,
+ * cooldown and operator-policy facts and returns a structured move/hold/failback
+ * decision with every blocker. It never performs IO or mutates route targets.
+ * Failback uses the same placement migration and epoch progression as failover;
+ * it is not a separate mutation path.
  */
 import { isTargetHealthState, type TargetHealthValue } from "./target-health.ts";
 import {
