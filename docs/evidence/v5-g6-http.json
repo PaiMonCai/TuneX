@@ -1,0 +1,322 @@
+{
+  "http": [
+    {
+      "method": "GET",
+      "path": "/api/ddns/providers",
+      "status": 401,
+      "body": {
+        "error": "Unauthorized"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/ddns/providers",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/ddns/providers",
+      "status": 201
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards",
+      "status": 201
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards",
+      "status": 201
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards",
+      "status": 201
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards/15/dns",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/15/dns",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/forwards/13",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/forwards/13",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/13/dns",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/api/forwards/14/dns",
+      "status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/forwards/13",
+      "status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/forwards/14",
+      "status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/forwards/15",
+      "status": 200
+    }
+  ]
+}

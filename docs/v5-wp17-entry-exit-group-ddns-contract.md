@@ -438,6 +438,99 @@
    "两个地址 + 客户端用另一个连通"这一条**不在本 WP 的 Gate 里**（它需要 (i) 双宿 owner 或
    (ii) 上述多节点服务能力）；契约在此明确记录，避免下一个人把它当成"漏测"。
 
+### WP17.5 交付记录：Gate V5-G6，以及它抓到的四处「单测绿、真拓扑红」（2026-10-05）
+
+**交付物**：`scripts/v3-e2e/v5-g6.py`（七条性质 + 门禁自带的 stub provider，零出网）
++ `docs/evidence/v5-g6-result-20261005.txt`、`docs/evidence/v5-g6-http.json`。
+**实测**：`V5-G6 TOTAL PASS=72 FAIL=0`，耗时 646s。关键数值（都在证据头的 `observations` 里）：
+首次同步 28.3s、**归属迁移到 DNS 落定 25.1s（期限 120s）**、读回不一致落定 28.4s、
+闸门窗口 3 拍 / 6 行 `dns_path_unready`、路径恢复后 24.2s 内同步成功；
+停掉非 owner Agent 后 `node.status` 在 92s 内翻成 `inactive`（见下第 2 条）。
+（逐条结果见证据文件；下面记的是口径、踩到的坑，以及每一处缺陷的归属提交。）
+
+**口径**（照上面「F4 更正」第 3 条）：① 未开 `auto_resolve` ⇒ 零外呼；② 开启 ⇒ **恰好一次**
+写、值 = owner `connect_ip`、读回一致 ⇒ `synced`；③ 值集**不含任何非 owner 的节点地址**；
+④ 非 owner 入口节点上下线 ⇒ 零写；⑤ 归属迁移 ⇒ 值集跟随新 owner 且 ≤120s；⑥ 读回不一致 ⇒
+`synced_unverified`（禁止假成功）；⑦ DNS 路径不可用 + `auto_failover` ⇒ 不迁移、epoch 不变、
+`dns_path_unready` 可见。**DoD 1 的"两个地址 + 客户端用另一个连通"不在本 Gate**（理由见 F4 更正）。
+
+**这个 Gate 的价值有一半在"它不是来看看的"—— 它抓到的四处缺陷，全部是单测绿、真拓扑红：**
+
+1. **`POST /api/forwards/:id/dns` 从来不可达**（提交 `b171460`）。同一文件里 `post("/:id/:action")`
+   注册在 `post("/:id/dns")` **之前**，Hono 同方法按注册顺序匹配 ⇒ 绑定写入口被 catch-all 吃掉，
+   返回 400。也就是说：WP17 的 DNS 前门**在今天的产品里根本绑不上**（读/解绑正常，因为
+   GET/DELETE 没有 `/:id/:action`）。修法是把 DNS 区块移到 catch-all 之前，并加了**类级守卫**
+   `backend/src/routes/__tests__/forward-route-order.test.ts`（对每个方法：任何 `/:id/<末段字面量>`
+   必须早于 `/:id/:<末段参数>`；反向验证过它会精确报出行号与拦截者）。
+   **为什么 WP17.2 的 38 条断言没抓到**：路由级用例**单独 mount router**，绕过了注册顺序 ——
+   "单独 mount 的路由测试"验证不了"这个 router 在应用里真的可达"。
+2. **把不存在的列当 Prisma 字段 select**（提交 `f334f1c`）。`has_credential` **不是 `Node` 的列**
+   （它是派生事实 `node_credential_hash != null`，仓内其它调用点都这么算），而
+   `failover-loop.ts` 的候选查询与 `preferred-ingress.ts` 都把它当列读 ⇒ Prisma 校验失败。
+   后果比"一条用例红"严重得多：`runFailoverSweep` **每一拍都在逐条循环里中止**，而 WP17.4 的
+   就绪闸门与 DNS 后继**恰好就在那个循环里** ⇒ **整套 WP17.4 在运行期从未存在过**，
+   `PUT /:id/preferred-ingress` 也是 500（回切偏好写不进去）。修法除改字段外，还把注入缝隙的
+   参数类型从 `unknown` 换成真实 Prisma 参数类型（`Prisma.NodeFindManyArgs` 等）。
+3. **关系名写成表名**（提交 `178fe47`）。`ddns-binding.ts` 写 `user: { workspace_members: … }`，
+   而 `User` 上的字段名是 **`workspace_memberships`**（`workspace_member` 只是 `WorkspaceMember`
+   的 `@@map` 表名，两者只差几个字母）⇒ 这条查询只要 `provider_id !== null` 就无条件执行 ⇒
+   **任何**合法绑定都是 500。它是在第 2 条"把缝隙类型换成真实 Prisma 类型"之后**当场暴露**的：
+   同一个收紧动作还揪出 `createDnsProvider` 把自由字符串当 `DNSProviderType` 枚举传（现在非法值
+   返回 400 而不是 500）。
+4. **闸门拒绝了，但拒绝的理由只写进了 stderr**（提交 `43762e2`）。`runFailoverSweep` 一直在
+   返回值里带着 `dns_gated: [{tunnel_id, reason}]`，但 `worker.ts` 的**汇总日志**只打印
+   `{evaluated, moved, held}` ⇒ 运维看到的是"迁移没有发生"，与"这台机器根本没在跑扫描"**无法
+   区分**（fail-closed 但不可见）。修法不新造机制：把**已有**字段露出来（`dns_gated` 计数恒在，
+   `dns_gated_reasons` 仅在非空时附带、封顶 5 条）。讽刺的是同一段代码上面几行就写着
+   "决策不留痕的机制与从未运行过的机制无法区分" —— 教训写下来了，却没落到这条日志上。
+
+**共同教训（一个 WP 被咬了四次，值得留给下一个人）**：**单独 mount 的 router 测试、单独注入替身的
+service 测试，验证不了"它在应用里真的可达 / 真的可用"**。三处全是运行期才现形的东西：注册顺序、
+Prisma 的字段与关系名校验、DB 枚举列的取值域。前面两个都被"缝隙参数类型写成 `unknown`"掩盖，
+所以修复的第二半（换成真实 Prisma 参数类型）比第一半更重要 —— 它把这一类从"靠真拓扑撞"变成
+**编译期就红**。
+
+（这一条另有门禁侧的一半，见下面第 3 条；两半都是真的：产品没把理由打进汇总日志，
+而门禁读完日志的方式本身也漏掉了 stderr。）
+
+**还有三条是门禁自己的坑（同样会伪装成产品缺陷，一并记下）**：
+
+1. **"停掉一个 HTTP 测试替身" ≠ "对端不可达"**：只关监听套接字时，客户端 keep-alive 连接池里
+   已建立的连接仍被 handler 线程继续服务 ⇒ 闸门看起来"没触发"、同步反而成功了。stub 因此改说
+   **HTTP/1.0 + `connection: close`**（每个请求一条新连接），并加 `dead` 兜底（已建立的连接回 503）。
+   实测：停掉后新连接被拒（`Connection refused`）。
+2. **断言"节点离线"之前，先确认这个拓扑里"离线"长什么样**：这些 Agent 走 **HTTP 轮询**
+   （`/api/internal/node/commands`），而 `node.status = inactive` 的唯一写入者是
+   `socket/offline-detector.ts`，它消费 **websocket 断开标记**（`ws:<scope>:node:<gid>:<id>:offline`）。
+   实测（修复前）Redis 里没有这类键，把入口 Agent 停掉 4 分钟 `status` 始终是 `active`（只有
+   `node_state_report.reported_at` 变陈旧）。门禁因此**不**等这个当时永不发生的翻转，改为断言
+   面板**真的**观测到的事实："该节点自己的上报停止刷新"。
+   这条**被报成了一个真缺陷**（不只是夹具问题）：`status` 不翻转意味着"某台入口掉线"在面板上
+   不可见，而自动迁移的候选判定（`requireOnline`）正读它 —— 提交 `c0108c0` 按**上报新鲜度**收敛
+   （并顺手覆盖 `last_seen_at IS NULL` 的三值逻辑）。**最终一轮的实测印证了修复**：停掉 Agent 后
+   92s，`node.status` 翻成 `inactive`（证据头 `stopped_agent_status_flips: true`）。
+   门禁的断言没有跟着改回"等状态翻转"：它依赖的是"上报停了"这个**原因**，而状态翻转是产品
+   对它的**解释** —— 断言前者比断言后者更稳，也不替产品圆场。
+3. **`docker logs` 把容器的两条流**分开**转发**：容器 stderr → 客户端 stderr，而 harness 的
+   `run()` 只返回 stdout。闸门那行是 `console.warn`（stderr）⇒ 门禁**永远读不到它**，于是
+   "原因不可见"连续两轮看起来像产品缺陷（手动 `docker logs … 2>&1 | grep` 能看到，门禁读到 0 行，
+   而两边的窗口与容器完全相同）。修法是把两条流都抓回来（`subprocess.run(capture_output=True)`
+   的 `stdout + stderr`）。**教训**：当断言建立在"日志里出现过这一行"上时，"怎么读日志"就是断言
+   的一部分 —— 读法错了会稳定地假红，而且红得指向产品。
+
+**明写"没做/做不到"**：
+- F4 更正第 3 条：不做"两个地址 + 客户端用另一个连通"（需要双宿 owner 或多节点服务能力）。
+- ⑦ 只断言"扫描被闸门拦住 + epoch/归属不变 + 原因可见"，**不**断言"路径就绪后它就会迁移" ——
+  自动迁移还要满足其余五条条件（观测新鲜度、目标侧、端口、冷却），那是 failover 自己的 Gate。
+  本 Gate 的对照是：**同一条扫描**在路径恢复后不再拦它、并完成同步，证明"拦它的唯一变量是 DNS 就绪性"。
+- 观察（不是要求）：读回不一致期间 `dns_confirmed_values` 不更新 ⇒ 下一拍仍判定"值集变了"，
+  因此**会再次写入**（写入本身"成功"、不排退避）。证据头里记的是
+  `rewrites_observed_in_one_tick_window`（最终一轮实测 = 1）—— 名字带"一拍窗口"是因为窗口只有
+  一拍、写入发生在拍内，所以要把它变成断言需要另一条专门的用例；这里只把它记为形状。
+- 本 WP 不提交一次性排障脚本：写门禁时用过一支 `v5-g6-probe.py`（只为在真拓扑上单独验证
+  "策略打开后后继是否真的跑、`dns_path_unready` 是否真的出现"），它一次性、且带着当时的错误前提
+  （只用 stdout 读日志）；结论已并入本记录与门禁本身，文件不再保留。
+
 ## 5. WP 拆分（一个 WP 一个可交付物；次序 17.1/17.2 并行 → 17.3 → 17.4 → 17.5）
 
 | WP | 可交付物（单件） | 明确不含 |
@@ -447,7 +540,7 @@
 | WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 —— **已交付 2026-10-05**：`services/ddns-binding.ts` + `routes/ddns.ts` + `forwards.ts` 的 `/:id/dns`；38 条断言（服务层 33 + 路由层 5，后者钉住 `settings:manage` 这条接线） | 不写 DNS、不建 provider 适配 |
 | WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 —— **已交付 2026-10-05**：`services/ddns-executor.ts`（唯一的外呼入口）+ 退避两列（additive 迁移）；25 条断言 | 不接 failover、不碰 rollout |
 | WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 —— **已交付 2026-10-05**：`services/ddns-successor.ts`（闸门 + 后继 + 生产接线）+ `failover-loop` 接线；13 条断言 | 不新增定时器、不改 rollout 步骤词表 |
-| WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 | 不改 G3/G4/G5 断言 |
+| WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 —— **已交付 2026-10-05**：`scripts/v3-e2e/v5-g6.py`（七条性质 + 自带 stub provider，零出网）+ `docs/evidence/v5-g6-result-20261005.txt` / `v5-g6-http.json`；交付记录见 §4 的「WP17.5 交付记录」（含它抓到的三处「单测绿、真拓扑红」：`b171460` / `f334f1c` / `178fe47`） | 不改 G3/G4/G5 断言 |
 
 ## 6. DoD（可断言的检查）
 **时间与数值**（实现选值，可调，理由随附）：`DDNS_SYNC_DEADLINE_MS = 120_000`（迁移秒级、

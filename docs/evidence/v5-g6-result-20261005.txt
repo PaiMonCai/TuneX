@@ -1,0 +1,186 @@
+# V5-G6 DDNS front-door gate (WP17.5)
+time: 2026-10-05T10:58:38+0000
+topology: scripts/v3-e2e/docker-compose.e2e.yaml (b2x-* containers, real Agents)
+trigger: worker cron_reconcile_v3 (~30s) -> failover sweep -> dns gate -> successor
+fixture: V5-G6-1791197271; setup=executed
+elapsed_seconds: 646
+ddns_sync_deadline_ms: 120000
+{
+  "provider_id": 4,
+  "observations": {
+    "first_sync_settle_ms": 28317,
+    "agent_reports_stale_after_s": 92,
+    "stopped_agent_node_status": "inactive",
+    "stopped_agent_status_flips": true,
+    "migration_settle_ms": 25106,
+    "unverified_settle_ms": 28398,
+    "rewrites_observed_in_one_tick_window": 1,
+    "gated_ticks": 3,
+    "gated_lines": 6,
+    "control_resync_ms": 24246
+  },
+  "stub_endpoint": "http://172.41.0.2:44707",
+  "records": {
+    "g6-main-1791197275.tunex.test|A": [
+      "172.41.10.20"
+    ],
+    "g6-gate-1791197275.tunex.test|A": [
+      "172.41.10.20"
+    ]
+  },
+  "writes": [
+    {
+      "domain": "g6-main-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197340.7456515
+    },
+    {
+      "domain": "g6-main-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197430.9324174
+    },
+    {
+      "domain": "g6-gate-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197461.044663
+    },
+    {
+      "domain": "g6-main-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.21"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197700.6409552
+    },
+    {
+      "domain": "g6-main-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197730.6848218
+    },
+    {
+      "domain": "g6-main-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197760.7412488
+    },
+    {
+      "domain": "g6-main-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197790.684413
+    },
+    {
+      "domain": "g6-gate-1791197275.tunex.test",
+      "type": "A",
+      "values": [
+        "172.41.10.20"
+      ],
+      "ttl": 300,
+      "zone": null,
+      "at": 1791197910.664994
+    }
+  ]
+}
+PASS | G6.setup the panel serves the DDNS provider API (image rebuilt)
+PASS | G6.setup tunnel.dns_attempt_count exists (WP17.2/17.3 migration applied)
+PASS | G6.setup tunnel.dns_next_attempt_at exists (WP17.2/17.3 migration applied)
+PASS | G6.setup tunnel.dns_auto_resolve exists (WP17.2/17.3 migration applied)
+PASS | G6.setup tunnel.dns_confirmed_values exists (WP17.2/17.3 migration applied)
+PASS | G6.setup the gate knows its own address on the control network
+PASS | G6.setup the panel can reach the gate's stub provider over the control network
+PASS | G6.setup a DDNS provider is created with the stub endpoint
+PASS | G6.setup the provider's credential is sealed and never echoed back
+PASS | G6.setup the main-path fixture Forward converges
+PASS | G6.setup the readiness-gate fixture Forward converges
+PASS | G6.setup both fixtures hold a placement lease (the sweep only walks leased Forwards)
+PASS | G6.setup the opt-in fixture Forward converges
+PASS | G6.PRE `POST /api/forwards/:id/dns` reaches the DDNS binding route (it must not be shadowed by POST /:id/:action)
+PASS | G6.PRE a valid binding lands as `pending` (never self-declared `synced`)
+PASS | G6.PRE the binding's suggested value set is the owner's connect_ip
+PASS | G6.0 the fixture binds with auto_resolve=true (state starts at `pending`)
+PASS | G6.0 [fact] with FAILOVER_POLICY off the successor never runs: zero outbound even though auto_resolve=true
+PASS | G6.0 [fact] with FAILOVER_POLICY on the same Forward syncs on the reconcile tick
+PASS | G6.0 the worker really runs the failover sweep each tick (that is the tick DNS hangs off)
+PASS | G6.1 零外呼：the stub received no write while auto_resolve=false
+PASS | G6.1 the state stays `pending` (not `synced`, not `error`) with auto_resolve off
+PASS | G6.1 it still reports the suggested value set (the owner's connect_ip), just without writing it
+PASS | G6.2 rebinding with auto_resolve=true resets the state to `pending`
+PASS | G6.2 the sync reaches `synced` (write + read-back agreed) within the deadline
+PASS | G6.2 `synced` carries `verified=true` (it is the read-back that made it so)
+PASS | G6.2 exactly ONE write reached the provider (the next tick is a no-op)
+PASS | G6.2 the provider's own record set is exactly the owner's connect_ip
+PASS | G6.2 the panel's confirmed value set equals the owner's connect_ip
+PASS | G6.2 a DNS sync never touches the placement epoch (DNS is a side effect, not a placement fact)
+PASS | G6.3 the DNS value set contains NO address of a node that is not serving this Forward
+PASS | G6.3 every value ever written for this domain is the owner's connect_ip
+PASS | G6.3 the record set is exactly {owner.connect_ip} — not the node group, not the candidate list
+PASS | G6.3b a multi_entry binding is accepted
+PASS | G6.3b the multi_entry binding syncs within the deadline
+PASS | G6.3b multi_entry ALSO resolves to exactly the owner's address (F4 更正: no group-scraped values)
+PASS | G6.3b the panel reports the declared multi_entry mode
+PASS | G6.4 [offline] the stopped Agent really stops reporting (panel-side freshness, since node.status only flips on a websocket disconnect)
+PASS | G6.4 [offline] zero DNS writes when a NON-owner ingress node goes down
+PASS | G6.4 [offline] the record set is unchanged (still exactly the owner)
+PASS | G6.4 [online again] the node's own reports resume (it is really back)
+PASS | G6.4 [online again] still zero DNS writes when the NON-owner node comes back
+PASS | G6.4 [online again] the record set is still unchanged
+PASS | G6.5 the ownership migration is accepted
+PASS | G6.5 the rollout to the new ingress reaches applied_revision == config_revision
+PASS | G6.5 the Forward's owner really moved
+PASS | G6.5 the DNS value set follows the NEW owner within DDNS_SYNC_DEADLINE_MS
+PASS | G6.5 that settling really happened inside the frozen deadline
+PASS | G6.5 the provider's record set is exactly the new owner's address (the old one was removed)
+PASS | G6.5 the previous owner's address is gone from the record set
+PASS | G6.6 the migration that forces a DNS write is accepted
+PASS | G6.6 that rollout reaches applied
+PASS | G6.6 the provider accepted the write but the read-back disagreed (write + read-back are two facts)
+PASS | G6.6 the state is `synced_unverified` — NOT `synced`
+PASS | G6.6 (explicit) a failed read-back never produces the product-visible `synced`
+PASS | G6.6 it is not misreported as `error` either: the write succeeded, the confirmation did not
+PASS | G6.6 once the read-back agrees the state becomes `synced` (self-healing, no manual step)
+PASS | G6.6 and the record set really is the current owner's address
+PASS | G6.7 the gate fixture is bound with auto_resolve=true and has never synced
+PASS | G6.7 the sweep reports `dns_path_unready` for this Forward (the reason is visible, not silent)
+PASS | G6.7 the reason code is exactly `dns_path_unready`
+PASS | G6.7 [gated] the placement epoch did NOT move (fail-closed: no migration with a broken DNS path)
+PASS | G6.7 [gated] ownership is unchanged
+PASS | G6.7 [gated] and it did not sneak a write in: the successor was never called
+PASS | G6.7 [gated] no failed attempt was recorded either: the successor was never CALLED (not merely unsuccessful)
+PASS | G6.7 [control] once the DNS path is reachable the same Forward syncs within the deadline
+PASS | G6.7 [control] the gate stops firing for this Forward — the only difference was DNS readiness
+PASS | G6.7 [control] still no migration was triggered by DNS facts (DNS never drives placement)
+PASS | G6.7 [control] the record set is the owner's address, and only it
+PASS | G6.cleanup FAILOVER_POLICY restored to its pre-gate value
+PASS | G6.cleanup every fixture Forward this gate created was removed
+PASS | G6.cleanup the fixture DNS provider (sealed credential) was removed
+V5-G6 TOTAL PASS=72 FAIL=0
