@@ -29,8 +29,10 @@ import {
   BILLING_TIME_ZONE,
   billingAddMonthsClamped,
   billingCalendarParts,
+  billingDayStart,
   billingMonthStart,
   billingMonthlyBoundary,
+  billingPeriodKey,
 } from "../../billing-time.ts";
 import { CANONICAL_INSTANTS, canonicalText } from "./billing-clock-canonical.ts";
 
@@ -301,5 +303,45 @@ describe("F. 进程时区无关：三个子进程逐字相等（DoD 第 3 条）
     expect(text).toContain("2028-02-29T02:30:00.000Z"); // 闰年夹取的金样本确实在里面
     expect(text).toContain("2026-02-28T15:59:59.999Z"); // 非闰年夹取
     expect(text).toContain(BILLING_TIME_ZONE);
+    // WP20-3：周期键进唯一键，必须也在三时区逐字相等的那组断言里
+    expect(text).toContain("\"period_key_month\":\"2026-02\"");
+    expect(text).toContain("\"period_key_day\":\"2026-02-01\"");
+  });
+});
+
+describe("G. billingPeriodKey / billingDayStart：账本唯一键的口径（WP20-3）", () => {
+  test("月结键取上海月，不取 UTC 月（跨月那一秒的反例）", () => {
+    // 上海 2026-02-01 00:00 == UTC 2026-01-31T16:00Z：UTC 口径会给出 "2026-01"
+    expect(billingPeriodKey(new Date("2026-01-31T16:00:00.000Z"), "month")).toBe("2026-02");
+    expect(billingPeriodKey(new Date("2026-01-31T15:59:59.999Z"), "month")).toBe("2026-01");
+    expect(billingPeriodKey(new Date("2026-12-31T16:00:00.000Z"), "month")).toBe("2027-01");
+  });
+
+  test("日结键与日首同源：键里的日子就是日首那一天", () => {
+    const at = new Date("2026-03-31T17:30:00.000Z"); // 上海 2026-04-01 01:30
+    expect(billingPeriodKey(at, "day")).toBe("2026-04-01");
+    const start = billingDayStart(at);
+    expect(start.toISOString()).toBe("2026-03-31T16:00:00.000Z");
+    expect(billingPeriodKey(start, "day")).toBe("2026-04-01");
+    // 日首落在当天 00:00:00（上海）
+    expect(billingCalendarParts(start)).toEqual({
+      year: 2026,
+      month: 4,
+      day: 1,
+      hour: 0,
+      minute: 0,
+      second: 0,
+    });
+  });
+
+  test("周期键形状固定为 YYYY-MM / YYYY-MM-DD（账本列是 VARCHAR(16)）", () => {
+    const at = new Date("2026-05-05T05:05:05.000Z");
+    expect(billingPeriodKey(at, "month")).toMatch(/^\d{4}-\d{2}$/);
+    expect(billingPeriodKey(at, "day")).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(billingPeriodKey(at, "month")).toHaveLength(7);
+    expect(billingPeriodKey(at, "day")).toHaveLength(10);
+    // 两位数补零（否则 "2026-2-1" 会与账本值域不符）
+    expect(billingPeriodKey(new Date("2026-02-01T04:00:00.000Z"), "month")).toBe("2026-02");
+    expect(billingPeriodKey(new Date("2026-02-01T04:00:00.000Z"), "day")).toBe("2026-02-01");
   });
 });

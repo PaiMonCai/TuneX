@@ -13,8 +13,10 @@ import {
   BILLING_TIME_ZONE,
   billingAddMonthsClamped,
   billingCalendarParts,
+  billingDayStart,
   billingMonthStart,
   billingMonthlyBoundary,
+  billingPeriodKey,
 } from "../../billing-time.ts";
 
 /** 金样本输入（毫秒时间戳以 ISO 字符串给出，避免读系统时钟）。 */
@@ -33,6 +35,9 @@ export interface CanonicalRow {
   instant: string;
   parts: string;
   month_start: string;
+  day_start: string;
+  period_key_month: string;
+  period_key_day: string;
   boundary_reset1: string;
   boundary_prev_month: string;
   boundary_reset31_capped: string;
@@ -51,6 +56,10 @@ export function canonicalRows(): CanonicalRow[] {
       instant,
       parts: [parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second].join("-"),
       month_start: billingMonthStart(at).toISOString(),
+      // V5-WP20-3 新增：结算周期键与日首也必须进程时区无关（它们进账本唯一键，漂移 = 跨月错账）。
+      day_start: billingDayStart(at).toISOString(),
+      period_key_month: billingPeriodKey(at, "month"),
+      period_key_day: billingPeriodKey(at, "day"),
       boundary_reset1: billingMonthlyBoundary(at, 1).toISOString(),
       boundary_prev_month: billingMonthlyBoundary(at, 1, -1).toISOString(),
       boundary_reset31_capped: billingMonthlyBoundary(at, 31).toISOString(),

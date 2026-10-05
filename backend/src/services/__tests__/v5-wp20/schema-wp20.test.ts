@@ -217,3 +217,42 @@ describe("F. 迁移是纯 additive：不动 V4 冻结基线（契约 §8.5）", 
     expect([...MIGRATION.matchAll(/ENUM\(/g)]).toHaveLength(1);
   });
 });
+
+describe("G. WP20-3：接管超时配置项只在既有 ENUM 尾部追加", () => {
+  const CONFIG_MIGRATION_NAME = "20261032000000_v5_wp20_settlement_config";
+  const CONFIG_MIGRATION = readFileSync(
+    new URL(`../../../../prisma/migrations/${CONFIG_MIGRATION_NAME}/migration.sql`, import.meta.url),
+    "utf8",
+  );
+
+  test("迁移存在、命名符合 WP20 约定、且只做一次 MODIFY", () => {
+    expect(CONFIG_MIGRATION_NAME).toMatch(/^2026103\d{7}_v5_wp20_/);
+    expect([...CONFIG_MIGRATION.matchAll(/ALTER TABLE/g)]).toHaveLength(1);
+    expect([...CONFIG_MIGRATION.matchAll(/MODIFY/g)]).toHaveLength(1);
+    expect(CONFIG_MIGRATION).toContain("`config`");
+  });
+
+  test("新值追加在**尾部**（MySQL ENUM 按序号存储，中间插入会让存量行含义错位）", () => {
+    const enumBody = CONFIG_MIGRATION.match(/ENUM\((.*?)\)/s)?.[1];
+    expect(enumBody).toBeDefined();
+    const values = [...enumBody!.matchAll(/'([A-Z_]+)'/g)].map((match) => match[1]);
+    expect(values[values.length - 1]).toBe("BILLING_SETTLEMENT_TAKEOVER_MINUTES");
+    expect(values).toHaveLength(35);
+    // 追加不得改动任何既有值的相对顺序（逐字比对前缀）
+    expect(values.slice(0, -1)).toEqual([
+      "MIN_TOPUP_AMOUNT", "FAILOVER_POLICY", "NOTICE", "NOTICE_POPUP", "NOTICE_POPUP_INTERVAL_HOURS",
+      "SITE_NAME", "SITE_DESCRIPTION", "ALLOW_REGISTER", "LOGO_URL", "HIDE_NODE_STATUS",
+      "AUTO_UPDATE_AGENT", "CHATWOOT_BASE_URL", "CHATWOOT_TOKEN", "TUNNEL_TRAFFIC_RETENTION_DAYS",
+      "HIDE_FOOTER", "HIDE_DOCS", "LANDING_PAGE_URL", "REFERRAL_COMMISSION_RATE", "REFERRAL_FIRST_ONLY",
+      "REFERRAL_MODE", "OBSERVER_PERIOD", "EMAIL_PROVIDER", "SMTP_HOST", "SMTP_PORT", "SMTP_SECURE",
+      "SMTP_USER", "SMTP_PASS", "SMTP_FROM", "RESEND_API_KEY", "RESEND_FROM", "MIN_WITHDRAW_AMOUNT",
+      "WITHDRAW_METHODS", "LIMIT_SCOPE", "ENABLE_SUBSCRIPTION",
+    ]);
+  });
+
+  test("schema 与 seed 都登记了这个配置项（缺省时代码回落 10 分钟）", () => {
+    expect(SCHEMA).toContain("BILLING_SETTLEMENT_TAKEOVER_MINUTES");
+    const seed = readFileSync(new URL("../../../../prisma/seed.ts", import.meta.url), "utf8");
+    expect(seed).toContain('BILLING_SETTLEMENT_TAKEOVER_MINUTES: "10"');
+  });
+});

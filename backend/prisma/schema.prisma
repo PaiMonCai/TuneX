@@ -1437,6 +1437,11 @@ enum SystemConfigName {
   WITHDRAW_METHODS
   LIMIT_SCOPE
   ENABLE_SUBSCRIPTION
+  /// V5-WP20-3（契约 §3.1.4 / O4）：结算 `pending` 行的**接管超时**（分钟，字符串数字）。
+  /// 缺省不存在 ⇒ 回落 `DEFAULT_SETTLEMENT_TAKEOVER_MINUTES`（10，与充值订单超时同口径）。
+  /// 为什么必须可配而不是常量：超时越小越容易重复执行同一周期（结算据此必须幂等可重放），
+  /// 越大则崩溃遗留的 pending 越晚被接管；两者是运维权衡，不该由一次发版决定。
+  BILLING_SETTLEMENT_TAKEOVER_MINUTES
 }
 
 model SystemConfig {

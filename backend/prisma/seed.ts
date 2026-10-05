@@ -34,7 +34,10 @@ import {
 } from "@prisma/client";
 
 /**
- * config 表默认值（覆盖 schema 中 SystemConfigName 枚举全量 33 项）。
+ * config 表默认值（覆盖 schema 中 SystemConfigName 枚举全量；本次改动时实测 35 项）。
+ * 注：本行原写「全量 33 项」，在 V5-WP20-3 之前就已经对不上（实测 34）——数字写死在注释里
+ * 一定会腐烂，故不再把它当作断言，只把它当「这里有全量表」的提示；真正的强制来自下面的
+ * `Record<SystemConfigName, string>` 类型：漏一个键就编译不过。
  * 说明：原版 config 表初始为空、由后台设置页首次写入；此处给出可用的
  * 本地栈默认值，使前端/接口在未配置时仍有确定行为。
  * 仅插入缺失项；旧品牌默认值会更新，运营者自定义值不变。
@@ -75,6 +78,9 @@ const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
   WITHDRAW_METHODS: "[]",
   LIMIT_SCOPE: "global",
   ENABLE_SUBSCRIPTION: "true",
+  // V5-WP20-3（契约 O4）：结算 `pending` 行的接管超时（分钟）。缺省行不存在时代码回落同一个
+  // 10 分钟；这里给出显式默认值是为了让运营在设置页看得见、改得动（改值不需要发版）。
+  BILLING_SETTLEMENT_TAKEOVER_MINUTES: "10",
 };
 
 const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? "admin@tunex.local";

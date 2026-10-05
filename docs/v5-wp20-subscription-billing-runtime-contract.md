@@ -1,8 +1,8 @@
 # V5-WP20 订阅计费运行时契约（周期结算 / 流量周期 / 配额预留）
 
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
-> （§4.0），**WP20-1（计费时钟纯函数）与 WP20-2（账本与归属 schema）已交付**（§5.1 / §5.2）。
-> 除这两处记录外，本契约其余部分仍**不含实现**。
+> （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）已交付**
+> （§5.1 / §5.2 / §5.3）。除这三处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -320,7 +320,7 @@ worker 新增一个 tick。
 | **WP20-0** | 本契约冻结（含 §7 Gate 与时间夹具规格）+ Lead 对 O2/O3 拍板 | 本文件 + `DEVELOPMENT.md` §4 登记 | — |
 | **WP20-1** | 计费时钟纯函数 | ✅ **已交付**（2026-10-05，见 §5.1）：`backend/src/services/billing-time.ts` + `backend/src/services/__tests__/v5-wp20/billing-time.test.ts`（三进程时区逐字相等） | WP20-0 |
 | **WP20-2** | 账本与归属 schema | ✅ **已交付**（2026-10-05，见 §5.2）：migration `20261031000000_v5_wp20_subscription_ledger`（`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`(nullable)）+ `UserPlan` 冻结注释 | WP20-1 |
-| **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | `backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时） | WP20-2 |
+| **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | ✅ **已交付**（2026-10-05，见 §5.3）：`backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时 `45 * * * *`） | WP20-2 |
 | **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | `policy-service.ts#grantPolicyFromPurchase` + `routes/plans.ts` 事务内调用 + `invalidatePolicyCache` | WP20-2 |
 | **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
 | **WP20-6** | 流量口径统一 | F13 两函数收敛到 `billing-time.ts`；`traffic_used_unattributed_federated`；`traffic_used` 读取路径切换 | WP20-1（可与 20-3 并行） |
@@ -467,6 +467,77 @@ bunx tsc --noEmit（仅本 WP 四个文件，--ignoreConfig）        → exit 0
 
 **DoD 覆盖矩阵（针对 WP20-2）**：第 7 条 ✅（含断言）；第 5/6 条不适用（WP20-3/20-5）；
 第 10 条 ⏳（e2e 未跑，本会话禁跑容器）；第 4 条 ⏳ 属 WP20-3。
+
+### 5.3 WP20-3 落地记录（2026-10-05，分支 `feature/v5-1b-udp-relay`）
+
+**交付物**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/src/services/subscription-billing.ts` | 结算编排（占位 → 执行 → 终态 + 崩溃接管）+ 纯判别函数 + 生产依赖（懒加载 db） |
+| `backend/src/worker.ts` | **增量**：`CRON_JOBS` **末尾**追加 `cron_settle_billing`（`45 * * * *`）、switch 追加一个 case、注释块加一行。既有 5 条 cron 的名称/顺序/节拍逐字未动（有断言） |
+| `backend/prisma/schema.prisma` | `SystemConfigName` **尾部追加** `BILLING_SETTLEMENT_TAKEOVER_MINUTES` |
+| `backend/prisma/migrations/20261032000000_v5_wp20_settlement_config/` | 一条 `MODIFY COLUMN config.name ENUM(...)`（追加值，零数据影响） |
+| `backend/prisma/seed.ts` | 一行默认值 `"10"`。**越界说明**：`DEFAULT_CONFIG` 是 `Record<SystemConfigName, string>`，新增枚举值会**编译不过** ⇒ 这一行是编译强制，不是可选装饰 |
+| `backend/src/services/billing-time.ts` | 追加 `billingPeriodKey` / `billingDayStart`（WP20-1 刻意延期的那个「账本唯一键口径」，见 §5.1） |
+| `backend/src/services/__tests__/v5-wp20/subscription-billing.test.ts` | 24 条断言（含内存账本 fake：唯一键 + CAS 都是真约束，执行器每次执行真的动钱） |
+| `billing-time.test.ts` / `schema-wp20.test.ts` | 扩展：周期键进三时区金样本；新增「ENUM 只在尾部追加」与「seed/schema 都登记」守卫 |
+
+**冻结的语义与理由（都带反例）**
+
+1. **幂等 = 先占位后执行，闸门是 DB 唯一键**（§3.1.4）。DoD 4 里「第二轮 `settled`/`skipped` 为 0」
+   的正确读法：第二轮**连 `due` 都是 0**（到期查询会排除已有占位行的周期），`skipped` 只在**并发**
+   下出现（两个 worker 同一拍，输的一方撞 `P2002` ⇒ 跳过且**不执行**）。所以测试里两条都断言：
+   串行双跑（第二轮零动作、订单/余额零变化）与并发撞键（`skipped=1`、执行器零调用）。
+2. **结算节奏 = 上海自然月**（`period_key = YYYY-MM`），**与 `Plan.billing_cycle` 无关**：
+   `billing_cycle` 决定的是购买期限（落到 `started_at`/`expires_at`），结算账本记的是
+   「每个周期只记账一次」的占位单位。反例：若按 `billing_cycle` 分档（年付 → `YYYY`），
+   `period_key` 会超出 WP20-2 冻结的 `VARCHAR(16)` 值域（`YYYY` 也不是已冻结的两种形状之一），
+   且续期的幂等闸门要等一整年才能复用；季度/半年同理。**日结**（`YYYY-MM-DD`）只为实现完备性
+   保留，tick 默认月结。
+3. **`taken_over` 与 `settled` 语义分离**：`settled` 数**结果**，`taken_over` 数**相位**。
+   反例（本次修掉的真 bug）：把「接管后落 settled 的」才计入 `taken_over`，会让一条**每次都
+   `deferred`** 的续期永远显示 `taken_over=0` —— 运维据此以为「没有行被卡住」，而它恰恰是唯一被卡住的那类行。
+4. **执行器是注入的接缝，WP20-3 的生产执行器只记账**（不扣款、不写 `PlanOrder`/`BalanceLog`、
+   不写 `WorkspacePolicyAssignment`，有静态守卫）：契约 §3.5.3「只记账、只降级，绝不默认扣款续期」
+   + DoD 2「发放写入点恰好两个」（`assignDefaultPolicy` + WP20-4 的 `grantPolicyFromPurchase`）。
+   `auto_renew = true` 的续期**留在 `pending`** 并记 `error="renewal_executor_not_wired"`、
+   `attempts+1`，由接管重试直到 WP20-4 接线。两条反例：
+   - 假装落 `settled` = 谎报「钱已经动过」；
+   - 落 `failed` = **`failed` 不参与接管**（只有 `pending` 会被捞），等于把一条钱路径永久静默丢掉。
+   今天没有任何路径会把 `auto_renew` 写成 true（默认 `false`，DoD 9 有全仓守卫），这条分支是接缝不是行为。
+5. **接管超时**：`SystemConfig.BILLING_SETTLEMENT_TAKEOVER_MINUTES`，代码默认 10（与充值订单超时同口径）、
+   夹取 `[1, 1440]` 分钟、缺省/非法回落且**可观测**（`takeover_config_missing`/`invalid` 进结果与日志）。
+   O4 的已知代价照实接受：超时小于真实执行耗时会**重复执行**同一周期 ⇒ **执行器必须幂等可重放**
+   （F8 条件扣款 + 发放 `upsert`）是 **WP20-4 的义务**，不是本模块能代偿的。本模块只保证
+   「最多重复一次执行，绝不重复落终态」（占位唯一键 + `markSettled` 的 `where state="pending"` CAS）。
+6. **过期订阅的收口谓词**：`listDuePeriods` 只取「本周期开始时仍有效」的订阅
+   （`expires_at IS NULL OR expires_at > period_start`）。反例：不加这个谓词，一个 1 月就过期的订阅
+   会在每个后续月份都产生一行「本周期已收口」的账本事实 —— 那是在记录一个**不存在的周期**。
+
+**交棒给 WP20-4（本 WP 刻意不做，避免第二份真相/第三个写入点）**
+
+- `executePeriod` 的生产接线：条件扣款（F8）→ 发 `PlanOrder`/`BalanceLog` → `grantPolicyFromPurchase`
+  （`purchase` 发放的**唯一**写入点）+ `invalidatePolicyCache`。
+- `Plan.policy_id`（套餐 → 策略的显式绑定，§3.5.3）。
+- 到期通知仍不做（O6 裁决：本 WP 之后由 WP18 单独登记通知源）。
+
+**证据**
+
+```
+bun test src/services/__tests__/v5-wp20/                        → 74 pass / 0 fail / 290 expect()
+  · 三时区（UTC / Asia/Shanghai / America/Los_Angeles）三次输出剥离耗时后 byte-identical（含周期键金样本）
+  · DoD 4：连跑两轮 → 第二轮 due/settled/skipped 全 0、订单与余额零变化；并发撞键 → skipped=1 且执行器零调用
+  · DoD 5：11 分钟前的 pending → 接管并在下一轮恰好一次落 settled（orders/executions 不再增长）
+bunx tsc --noEmit（backend/）                                    → exit 0（**全树干净**）
+prisma validate / prisma generate                               → valid / exit 0
+DATABASE_URL=... bunx prisma migrate diff --from-schema-datamodel <改动前> --to-schema-datamodel prisma/schema.prisma
+                                                                → 唯一 DDL 就是那条 MODIFY（新值在尾部）
+```
+
+**DoD 覆盖矩阵（针对 WP20-3）**：第 1 条 ✅（静态守卫：无 `checkTunnelCreation`/`max_tunnels`/判定层 import）；
+第 4 条 ✅；第 5 条 ✅；第 7 条 ✅（不新增枚举类型，只追加值）；第 9 条 ✅（全仓无 `auto_renew` 默认开启赋值 + schema 默认 `false`）；
+第 8 条 ⏳ 属 WP20-6；第 2/6 条 ⏳ 属 WP20-4；第 10 条 ⏳（e2e 未跑，本会话禁跑容器）。
 
 ---
 

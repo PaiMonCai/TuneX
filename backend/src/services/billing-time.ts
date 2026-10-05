@@ -167,6 +167,42 @@ export function billingMonthStart(reference: Date | number): Date {
   return wallClockToInstant({ year, month, day: 1, hour: 0, minute: 0, second: 0, millisecond: 0 });
 }
 
+/** 结算周期键的粒度：`month` → `YYYY-MM`（月结，默认）；`day` → `YYYY-MM-DD`（日结）。 */
+export type BillingPeriodGranularity = "month" | "day";
+
+/**
+ * `reference` 所在**上海自然日的日首**（当日 00:00:00.000 上海）。
+ * 与 {@link billingMonthStart} 同构：`traffic_period="day"` 的窗口起点与
+ * {@link billingPeriodKey}`(…, "day")` 必须同源，否则日界两侧会差一天。
+ */
+export function billingDayStart(reference: Date | number): Date {
+  const { year, month, day } = billingCalendarParts(reference);
+  return wallClockToInstant({ year, month, day, hour: 0, minute: 0, second: 0, millisecond: 0 });
+}
+
+/**
+ * 上海时区下的**周期键**：`YYYY-MM` / `YYYY-MM-DD`。
+ *
+ * 用途：`subscription_period_settlement.period_key`（WP20-2 冻结为 `VARCHAR(16)`，值域就是这两个形状）
+ * —— 它是「每个周期只结算一次」这条账本事实的**唯一键**，因此必须与窗口起点（{@link billingMonthStart}）
+ * 用**同一个**固定时区派生：否则账本的「一个月」与额度的「一个月」会各自解释一次跨月。
+ *
+ * 为什么这个函数不在 WP20-1 交付：那时 `period_key` 的列形状还没冻结（WP20-2 才定 `VARCHAR(16)`），
+ * 先冻一个没有消费者的格式等于让形状脱离使用点决策（记录在契约 §5.1「明确延期」）。
+ *
+ * 反例（为什么不能用 `toISOString().slice(0, 7)`）：`2026-01-31T16:00:00Z` 在上海已是 2 月 1 日，
+ * UTC 口径会把它算成 `2026-01` —— 跨月那一秒的账本行会落到上一个月里。
+ */
+export function billingPeriodKey(
+  reference: Date | number,
+  granularity: BillingPeriodGranularity = "month",
+): string {
+  const { year, month, day } = billingCalendarParts(reference);
+  const monthPart = `${year}-${String(month).padStart(2, "0")}`;
+  if (granularity === "month") return monthPart;
+  return `${monthPart}-${String(day).padStart(2, "0")}`;
+}
+
 /**
  * 计费月边界：`reference` 所在上海月 + `monthOffset` 的月内第 `resetDay` 日 00:00:00.000（上海）。
  *
