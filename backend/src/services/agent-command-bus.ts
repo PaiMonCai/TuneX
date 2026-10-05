@@ -1,5 +1,5 @@
 /**
- * v3 outbound-only Agent command bus.
+ * Outbound Agent command bus.
  *
  * The panel never dials an Agent. Orchestrator commands are queued in Redis and
  * the authenticated Agent polls /api/internal/node/commands over its existing
@@ -35,10 +35,10 @@ import {
 export interface QueuedAgentCommand {
   envelope: CommandEnvelope;
   config: AgentTunnelConfig | null;
-  /** V4-WP11C diagnose payload; delivered beside the envelope, like `config`. */
+  /**  diagnose payload; delivered beside the envelope, like `config`. */
   probe?: { targets: { host: string; port: number }[]; timeout_ms?: number } | null;
   /**
-   * V5-WP19-D Looking Glass payload. A sibling field rather than a second `probe`,
+   *  Looking Glass payload. A sibling field rather than a second `probe`,
    * for the same reason `probe` is not a synthetic TunnelConfig: the two carry
    * different facts and obey different rules — a diagnose target comes from the
    * panel's own desired state, while every entry here is a user-typed target that
@@ -46,7 +46,7 @@ export interface QueuedAgentCommand {
    * one field would make "which admission rules apply?" depend on the action
    * name, which is exactly the ambiguity the separate action exists to remove.
    *
-   * NOTE: this is one of the "rebuild boundaries" (see the WP19-D delivery record):
+   * NOTE: this is one of the "rebuild boundaries" (see the  delivery record):
    * `dequeueAgentCommand` parses the stored JSON whole and the internal route hands
    * that object straight to the agent, so a field present here survives the trip —
    * but a field NOT added here would be dropped silently while every layer reports
@@ -56,7 +56,7 @@ export interface QueuedAgentCommand {
   queued_at: string;
 }
 
-/** V5-WP19-D: pinned public literals; the agent must never resolve a name. */
+/** : pinned public literals; the agent must never resolve a name. */
 export interface QueuedLookingGlassRequest {
   method: string;
   targets: { address: string; port: number }[];
@@ -72,12 +72,12 @@ export interface AgentCommandAck {
   applied_revision?: number | null;
   error_code?: string | null;
   error?: string | null;
-  /** V4-WP11C: a read-only action's findings (diagnose). Bounded below. */
+  /** : a read-only action's findings (diagnose). Bounded below. */
   results?: AgentDiagnoseResult[] | null;
-  /** V4-WP11C: the node's own bounded self report (collect_diagnostics). */
+  /** : the node's own bounded self report (collect_diagnostics). */
   facts?: NodeSelfFacts | null;
   /**
-   * V5.1b WP5-B2: a datagram RELAY's own hop endpoint (`ip:port`), reported in the ACK
+   * V5.1b : a datagram RELAY's own hop endpoint (`ip:port`), reported in the ACK
    * of the apply that built the runtime (see `control.CommandAckPayload.hop_local_addr`
    * for why this cannot wait for the periodic state report).
    */
@@ -141,7 +141,7 @@ const ACK_POLL_MS = 100;
 /** Hard ceiling on a stored ACK body; anything larger is refused, not truncated
  * into a shape the caller would read as a real result. */
 const ACK_MAX_BYTES = 8 * 1024;
-/** V4-WP11C caps: a probe request may carry at most this many results back. */
+/**  caps: a probe request may carry at most this many results back. */
 export const DIAGNOSE_RESULT_MAX_ITEMS = 8;
 const DIAGNOSE_RESULT_HOST_MAX = 253;
 const DIAGNOSE_RESULT_DETAIL_MAX = 160;
@@ -251,7 +251,7 @@ export async function enqueueAgentCommand(
   probe?: QueuedAgentCommand["probe"],
   deps: EnqueueDeps = {},
   /**
-   * V5-WP19-D：Looking Glass 请求。放在**末尾**而不是塞进 `probe`/`config` 里：
+   *：Looking Glass 请求。放在**末尾**而不是塞进 `probe`/`config` 里：
    * 既有调用方（调度器/rollout/诊断）一个都不用改，也就不会因为"多了一个参数"
    * 而在别处被静默改成传错的形状。
    */
@@ -392,7 +392,7 @@ export async function storeAgentCommandAck(
   } = {
     command_id: commandId,
     ok: ack.ok === true,
-    // V5.1b WP5-B2: a datagram RELAY's hop endpoint, straight off its apply ACK.
+    // V5.1b : a datagram RELAY's hop endpoint, straight off its apply ACK.
     //
     // This record is REBUILT FIELD BY FIELD before it goes to Redis, so a field missing
     // from this list is dropped here — and the panel then never learns which address the
@@ -441,7 +441,7 @@ export async function storeAgentCommandAck(
 
   const results = normalizeDiagnoseResults(ack.results);
   if (results) {
-    // A probe-shaped answer must cover exactly the requested target set. V5-WP19-D
+    // A probe-shaped answer must cover exactly the requested target set. 
     // widened "probe-shaped" from one action to two (diagnose_tunnel, looking_glass)
     // rather than duplicating the rule: both ACK a bounded list of host/port
     // observations, and for both a partial list reads as "this path is fine".
@@ -650,8 +650,8 @@ export async function waitAgentCommandAck(
 }
 
 /**
- * Read the node's latest advertised capability facts (V4-WP11B actions +
- * V5-WP1 manifest).
+ * Read the node's latest advertised capability facts ( actions +
+ *  manifest).
  *
  * Deliberately narrow and lazy: this module is imported by the worker, so a
  * top-level Prisma import would connect during unit tests. The read itself
@@ -685,7 +685,7 @@ export class OutboundAgentTransport implements AgentTransport {
   /**
    * Refuse to queue a command the node has not advertised support for.
    *
-   * V5-WP1: the gate now covers all three orthogonal dimensions (action +
+   * : the gate now covers all three orthogonal dimensions (action +
    * protocol + transport) through the panel's single admission implementation.
    * The protocol is taken from the outgoing config, which is the very fact the
    * agent will act on — reading it from anywhere else would let the gate and the
@@ -735,7 +735,7 @@ export class OutboundAgentTransport implements AgentTransport {
         "outbound transport requires command envelope",
       );
     }
-    // WP11B + WP1: never send an action/protocol/transport this node has not
+    //  + : never send an action/protocol/transport this node has not
     // told us it implements.
     await this.assertCapability(node, String(envelope.action ?? ""), config);
     const { scope } = await enqueueAgentCommand(node.id, envelope, config, this.store);
@@ -760,7 +760,7 @@ export class OutboundAgentTransport implements AgentTransport {
     return {
       ok: true,
       applied_revision: ack.applied_revision,
-      // V5.1b WP5-B2: a datagram RELAY's hop endpoint has to survive this return as well.
+      // V5.1b : a datagram RELAY's hop endpoint has to survive this return as well.
       // It is the third place the agent's ACK fields are copied (the agent sets it, then
       // the ledger remembers it, then this) and every one of them is a place it can be
       // silently dropped — which is how "the panel never corrects the exit" happens while
@@ -921,7 +921,7 @@ export async function issueAgentDiagnostics(
 }
 
 /**
- * V5-WP19-D —— 向一个节点下发一次 Looking Glass 测试并等它的探测事实。
+ *  —— 向一个节点下发一次 Looking Glass 测试并等它的探测事实。
  *
  * 与 `issueAgentDiagnose` 的三点**有意**不同（不是复制粘贴）：
  *  1. 目标不是面板的 desired 状态，而是**用户输入 + 面板已钉死的公网字面地址**，
@@ -1028,7 +1028,7 @@ function hostPort(host: string, port: number): string {
  * Only concrete node bindings are considered; NodeGroup is never re-interpreted
  * as placement.
  *
- * V5-WP4/G0: this is the one dispatch-ish path that deliberately bypasses the
+ * /G0: this is the one dispatch-ish path that deliberately bypasses the
  * orchestrator — the Agent *pulls* its desired state — so the protocol gate has
  * to run here too. Before, every entry was emitted with `protocol: "tcp"`, and a
  * historical non-TCP Forward whose row is still `desired_status='active'` was
@@ -1060,7 +1060,7 @@ export interface DesiredRowProjection {
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
   middle_node?: { connect_ip: string | null } | null;
-  /** V5.1b WP5-B2：datagram 出口的取证地址来自**入口**节点（优先用它的上报）。 */
+  /** V5.1b：datagram 出口的取证地址来自**入口**节点（优先用它的上报）。 */
   ingress_node?: {
     connect_ip: string | null;
     state_report?: { tunnels?: unknown } | null;
@@ -1068,7 +1068,7 @@ export interface DesiredRowProjection {
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
   /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
   port_leases?: Array<{ node_id: number; port: number; status: string }>;
-  /** V5-WP5-A1: node-local tls front paths (paths only, never key material). */
+  /** : node-local tls front paths (paths only, never key material). */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
 }
@@ -1081,15 +1081,13 @@ export type DesiredRowOutcome =
 /**
  * One desired row → the Agent config for `nodeId` (pure).
  *
- * Extracted so the protocol decision is testable without a database: this is the
- * exact spot where a historical non-TCP Forward used to be silently relabelled
- * `tcp` on every node restart.
+ * Extracted so protocol admission and restore projection stay testable without a database.
  */
 export function desiredTunnelConfigFor(
   row: DesiredRowProjection,
   nodeId: number,
   /**
-   * V5.2 WP7 —— 该转发出口池的健康事实，按隧道 id 索引。
+   *  —— 该转发出口池的健康事实，按隧道 id 索引。
    *
    * 作为**入参**而不是在这里读库：这个函数是纯的（可离线断言"哪些行该下发"），而健康
    * 是 IO 结果。由调用方（快照构建）读一次、传进来，纯函数只负责把两类事实并排放好。
@@ -1107,7 +1105,7 @@ export function desiredTunnelConfigFor(
   });
   if (protocol === null) return { kind: "skip", reason: "protocol_not_supported" };
 
-  // V5-WP5-A1: a tls front needs both paths. Without them the row is a broken
+  // : a tls front needs both paths. Without them the row is a broken
   // configuration, and the honest outcome is to keep it out of the snapshot —
   // the Agent must never be told "serve TLS" without a certificate.
   const tlsPaths =
@@ -1186,7 +1184,7 @@ export function desiredTunnelConfigFor(
       weight: x.weight,
       order: Math.trunc(x.order_by),
     }));
-    // V5.2 WP7: the snapshot carries health too, for the same reason the command path
+    // : the snapshot carries health too, for the same reason the command path
     // does — and for one more that is easy to miss: an agent that RESTARTS rebuilds its
     // runtime from this snapshot, so a snapshot without health silently disables the
     // circuit breaker until the next command arrives. V5-G2 found it exactly that way
@@ -1215,7 +1213,7 @@ export function desiredTunnelConfigFor(
         next_hop: "",
         targets: poolTargets,
         ...(healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
-        // V5.1b WP5-B2: the datagram exit attests its ingress. Omitted when there is
+        // V5.1b : the datagram exit attests its ingress. Omitted when there is
         // no address to attest — the exit then refuses to build, which is the honest
         // outcome (a datagram exit that accepts anyone is a relay for whoever finds
         // the port). Never emitted for stream protocols: the field would be a fact
@@ -1269,7 +1267,7 @@ export function desiredTunnelConfigFor(
 
 
 /**
- * V5.5 WP15 —— 把本节点的**活跃联邦腿**追加进权威 desired 快照。
+ *  —— 把本节点的**活跃联邦腿**追加进权威 desired 快照。
  *
  * 为什么需要它（Gate 用 B 的 Agent 日志定位到的根因，不是竞态）：
  * ```
@@ -1406,13 +1404,13 @@ export async function buildDesiredNodeSnapshot(
     include: {
       egress_node: { select: { id: true, connect_ip: true } },
       middle_node: { select: { id: true, connect_ip: true } },
-      // V5.1b WP5-B2: a datagram exit is told which ingress may feed it, and the
+      // V5.1b : a datagram exit is told which ingress may feed it, and the
       // ingress address is this node's. The command path reads it from the dispatch
       // facts; this path reads it from the same column, because an agent that
       // RESTARTS rebuilds its runtime from this snapshot — a snapshot without
       // `hop_peer` would leave a datagram exit refusing to build after every
       // restart, which is precisely the class of bug V5-G2 found on health.
-      // V5.1b WP5-B2：`state_report` 一起带出来，因为**真正为真的**取证地址是入口自己
+      // V5.1b：`state_report` 一起带出来，因为**真正为真的**取证地址是入口自己
       // 上报的跳端点（多宿节点上 `connect_ip` 是错的——见 forward-contract 的说明）。
       ingress_node: { select: { id: true, connect_ip: true, state_report: { select: { tunnels: true } } } },
       // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
@@ -1435,7 +1433,7 @@ export async function buildDesiredNodeSnapshot(
     orderBy: { id: "asc" },
   });
 
-  // V5.2 WP7: read the health for the egress pools this snapshot will publish, ONCE,
+  // : read the health for the egress pools this snapshot will publish, ONCE,
   // and hand it to the pure mapping. A restart of this node must not silently lose the
   // circuit breaker, so the snapshot path publishes health exactly like the command
   // path does — one wire shape, two deliveries.
@@ -1454,7 +1452,7 @@ export async function buildDesiredNodeSnapshot(
     }
   }
 
-  // V5.3 WP9: ownership facts ride the snapshot as well, for the same reason health
+  // : ownership facts ride the snapshot as well, for the same reason health
   // does — an agent that restarts must still know its epoch, or the stale-epoch guard
   // resets to "never seen anything" and a demoted node could serve again.
   const leases = await db.placementLease.findMany({
@@ -1482,7 +1480,7 @@ export async function buildDesiredNodeSnapshot(
       );
     }
   }
-  // ── V5.5 WP15：本节点的活跃联邦腿（**追加**，既有 tunnel 派生条目一条不动）──
+  // ──：本节点的活跃联邦腿（**追加**，既有 tunnel 派生条目一条不动）──
   const federated = await collectFederatedLegRows(nodeId, new Date());
   if (federated.error !== null) {
     // fail-soft：读租约出错不能让整份快照失败，但必须留下可见痕迹。
