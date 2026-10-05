@@ -992,6 +992,9 @@ async function runStep(
         protocol: egressFacts.protocol,
         tlsCertPath: egressFacts.tlsCertPath,
         tlsKeyPath: egressFacts.tlsKeyPath,
+        // V5.1b WP5-B2: the datagram exit attests its ingress. Derived once, in the
+        // dispatch facts, so both legs of the hop name the same address.
+        hopPeer: egressFacts.hopPeer,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -1046,6 +1049,9 @@ async function runStep(
         protocol: egressFacts.protocol,
         tlsCertPath: egressFacts.tlsCertPath,
         tlsKeyPath: egressFacts.tlsKeyPath,
+        // V5.1b WP5-B2: the datagram exit attests its ingress. Derived once, in the
+        // dispatch facts, so both legs of the hop name the same address.
+        hopPeer: egressFacts.hopPeer,
       });
       if (!outcome.ok) {
         return { ok: false, error_code: outcome.error_code, error: outcome.error };
@@ -1462,12 +1468,18 @@ async function dispatchFactsFor(
       tunnel_type: true,
       tls_cert_path: true,
       tls_key_path: true,
+      // V5.1b WP5-B2: the datagram exit's attestation address comes from the
+      // INGRESS node, so the facts read it here. Every dispatch site that already
+      // uses this helper therefore gets `hopPeer` without re-deriving it — two
+      // sites deriving it is how the two legs would name different addresses.
+      ingress_node: { select: { connect_ip: true } },
     },
   })) as {
     forward_protocol?: unknown;
     tunnel_type?: unknown;
     tls_cert_path?: unknown;
     tls_key_path?: unknown;
+    ingress_node?: { connect_ip?: unknown } | null;
   } | null;
   return row ? dispatchFactsFromRow(row) : null;
 }
@@ -1799,6 +1811,7 @@ export async function compensateRollout(
             protocol: replayEgressFacts.protocol,
             tlsCertPath: replayEgressFacts.tlsCertPath,
             tlsKeyPath: replayEgressFacts.tlsKeyPath,
+            hopPeer: replayEgressFacts.hopPeer,
           });
           if (!egress.ok) {
             errors.push(`replay egress: ${egress.error}`);

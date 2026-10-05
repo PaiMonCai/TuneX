@@ -64,6 +64,7 @@ import {
   DEFAULT_FORWARD_PROTOCOL,
   admitPersistedProtocol,
   buildForwardRuntimePlan,
+  firstConnectIp,
   forwardRuntimePlanViolations,
   normalizeForwardProtocol,
   persistedForwardProtocol,
@@ -1274,6 +1275,10 @@ export async function createRelayTunnel(
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
     protocol,
+    // V5.1b WP5-B2: a datagram exit must be told who may feed it. This is the
+    // same `connect_ip` the ingress leg uses for its `next_hop` — one hop, one
+    // address, picked by the same helper.
+    hopPeer: firstConnectIp(ingressPick.node.connect_ip),
   });
   if (!egressDispatch.ok) {
     // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。

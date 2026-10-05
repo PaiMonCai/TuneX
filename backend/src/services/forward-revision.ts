@@ -435,21 +435,18 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     }
   }
 
-  // V5.1b B2 boundary (contract §9.1 / §12, 2026-10-05): the datagram hop shape IS
-  // frozen now ("datagram end to end"), and the Agent already carries the EXIT half
-  // of it. What is still missing is the INGRESS half — the relay runtime that takes
-  // client mappings across the hop — so the panel keeps refusing udp RELAY here.
+  // V5.1b WP5-B2 boundary (contract §9.1 / §12): the datagram hop shape IS frozen
+  // ("datagram end to end") and BOTH halves now exist in the Agent — the ingress
+  // runtime carries client mappings across the hop, the exit attests its ingress and
+  // sends to its own pool. So `udp` is accepted on both modes now.
   //
-  // The refusal stays in the panel even though the Agent refuses such a config too,
-  // for the reason B1 established: a boundary enforced in only one layer is a
-  // boundary the next caller can bypass, and the UI must be able to rely on
-  // validation rather than on a warning of its own.
-  //
-  // It is lifted in the same commit that lands the ingress runtime — not before: a
-  // Forward that can be created but can never be served is worse than one that
-  // cannot be created at all, and this gate (V5-G1B.5) asserts the refusal.
-  if (admittedProtocol === "udp" && candidate.mode !== "direct") {
-    errors.push("UDP 转发当前只支持 DIRECT：跨节点跳已冻结为 datagram 端到端，但入口侧运行时尚未落地");
+  // What is still refused is a datagram route with a MIDDLE hop: every mapping of an
+  // ingress shares one socket toward the exit, and a transit hop is fed by the hop
+  // before it rather than by the ingress, so its attestation story is a different
+  // one that B2 did not freeze. Refusing here (rather than letting the Agent refuse
+  // a transit it cannot attest) keeps the boundary in the layer the UI reads.
+  if (admittedProtocol === "udp" && candidate.mode !== "direct" && (candidate.middle_node_id ?? null) !== null) {
+    errors.push("UDP 转发当前只支持单跳出口：datagram 的中间跳形态尚未冻结");
     reasons.push("datagram_relay_unsupported");
     return { ok: false, errors, warnings, reasons };
   }

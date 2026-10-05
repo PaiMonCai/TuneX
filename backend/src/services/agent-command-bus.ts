@@ -10,7 +10,7 @@
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
-import { admitPersistedProtocol } from "./forward-contract.ts";
+import { admitPersistedProtocol, firstConnectIp } from "./forward-contract.ts";
 import {
   targetHealthWireEntries,
   type TargetHealthWireEntry,
@@ -855,11 +855,6 @@ function hostPort(host: string, port: number): string {
   const h = host.trim();
   return h.includes(":") && !h.startsWith("[") ? `[${h}]:${port}` : `${h}:${port}`;
 }
-function firstConnectIp(raw: string | null): string | null {
-  if (!raw) return null;
-  return raw.split(",").map((s) => s.trim()).find(Boolean) ?? null;
-}
-
 /**
  * Canonical desired snapshot used by Agent startup restore.
  * Only concrete node bindings are considered; NodeGroup is never re-interpreted
@@ -897,6 +892,8 @@ export interface DesiredRowProjection {
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
   middle_node?: { connect_ip: string | null } | null;
+  /** V5.1b WP5-B2：datagram 出口的取证地址来自**入口**节点。 */
+  ingress_node?: { connect_ip: string | null } | null;
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
   /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
   port_leases?: Array<{ node_id: number; port: number; status: string }>;
@@ -1027,6 +1024,7 @@ export function desiredTunnelConfigFor(
     const healthForTargets = health.filter((h) =>
       poolTargets.some((t) => t.host === h.host && t.port === h.port),
     );
+    const hopPeer = protocol === "udp" ? firstConnectIp(row.ingress_node?.connect_ip ?? null) : null;
     return {
       kind: "config",
       config: {
@@ -1039,6 +1037,12 @@ export function desiredTunnelConfigFor(
         next_hop: "",
         targets: poolTargets,
         ...(healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
+        // V5.1b WP5-B2: the datagram exit attests its ingress. Omitted when there is
+        // no address to attest — the exit then refuses to build, which is the honest
+        // outcome (a datagram exit that accepts anyone is a relay for whoever finds
+        // the port). Never emitted for stream protocols: the field would be a fact
+        // nobody reads.
+        ...(hopPeer ? { hop_peer: hopPeer } : {}),
         lb_strategy: strategy,
         protocol,
         speed_limit: 0,
@@ -1224,6 +1228,13 @@ export async function buildDesiredNodeSnapshot(
     include: {
       egress_node: { select: { id: true, connect_ip: true } },
       middle_node: { select: { id: true, connect_ip: true } },
+      // V5.1b WP5-B2: a datagram exit is told which ingress may feed it, and the
+      // ingress address is this node's. The command path reads it from the dispatch
+      // facts; this path reads it from the same column, because an agent that
+      // RESTARTS rebuilds its runtime from this snapshot — a snapshot without
+      // `hop_peer` would leave a datagram exit refusing to build after every
+      // restart, which is precisely the class of bug V5-G2 found on health.
+      ingress_node: { select: { id: true, connect_ip: true } },
       // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
       // its next_hop, while the middle node needs its own lease to restore its
       // EGRESS-shaped transit runtime. Keep all active leases for this Forward;

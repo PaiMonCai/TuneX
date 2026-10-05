@@ -8,7 +8,9 @@ executable cases against the real four-Agent topology:
   G1B.2  udp DIRECT positive      a datagram goes out and the answer comes back
   G1B.3  mapping semantics        two clients get two mappings; the target is not part of the key
   G1B.4  idle expiry              a mapping ends by timeout, and the fact is reported
-  G1B.5  udp RELAY refused        RELAY/EGRESS is refused outright, never half-implemented
+  G1B.5  udp RELAY end to end   the datagram hop carries a client through both halves
+                                (B1 asserted the OPPOSITE — "refused" — while the hop
+                                shape was unfrozen; WP5-B2 flipped it, see the case)
   G1B.6  malformed datagrams      garbage and oversized payloads do not kill the listener
   G1B.7  old Agent admission      an Agent that does not advertise udp/datagram is refused first
   G1B.8  Agent restart            a udp Forward survives the node restarting
@@ -400,21 +402,40 @@ def g1b_4_idle_expiry():
     check(ok_after, "G1B.4 a new client is served after the expiry", detail_after)
 
 
-def g1b_5_relay_refused():
-    status, fid, _port, resp = udp_create("RELAY", mode="relay", egress=True)
+def g1b_5_relay_end_to_end():
+    """WP5-B2（契约 §9.1，2026-10-05 冻结）：datagram 跳是"端到端 UDP"，两半都落地。
+
+    这条断言在 B1 时写的是"udp RELAY **必须被拒**"，它当时守的是**跳形态未冻结**。
+    形态冻结、且 Agent 两侧运行时（入口 `DatagramRelay` / 出口 `DatagramEgress`）落地之后，
+    它**翻转**成"可用"——翻转是明写的，不是静默删除：单跳 udp RELAY 现在必须建立，而且
+    客户端的数据报必须真的**穿过这一跳**到达目标再回来。
+
+    仍然被拒的是**多跳**（每个映射共用一个朝向出口的 socket，而中转跳是被它前一跳喂的，
+    不是被入口喂的）：那是纯校验事实，断言在 backend 单测里
+    (`forward-revision.test.ts` 的 "udp + RELAY 带中间跳仍被拒")，不在这里复刻一个依赖
+    拓扑里"恰好有第三台节点"的脆弱版本。
+    """
+    status, fid, port, resp = udp_create("RELAY", mode="relay", egress=True)
     body = json.dumps(resp, ensure_ascii=False)
-    check(status not in (200, 201),
-          "G1B.5 a udp RELAY Forward is refused (the inter-node hop shape is NOT frozen)",
+    check(status in (200, 201),
+          "G1B.5 a single-hop udp RELAY Forward is accepted (hop shape frozen: datagram end to end)",
           f"status={status} body={body[:200]}")
-    if fid is not None:
-        check(not H.wait_active(int(fid), timeout=25),
-              "G1B.5 and it never converges to active", f"id={fid}")
-        row = H.tunnel_row(int(fid))
-        check("active" not in row.split("|")[0],
-              "G1B.5 the row is left in error rather than reported as running", row[:160])
-    check(not H.wait_until(lambda: "udp" in H.scalar(
+    if fid is None:
+        return
+    check(H.wait_active(int(fid)),
+          "G1B.5 and it converges to active", f"id={fid} port={port}")
+
+    # The property that matters: one client datagram in, the same payload back, having
+    # gone through BOTH hops (the echo target lives on the egress side, so a
+    # DIRECT-shaped listener could not answer at all).
+    ok, detail = udp_probe(port, b"relay-e2e")
+    check(ok, "G1B.5 the client reaches the target THROUGH the datagram hop", detail)
+
+    # And the exit really hosts a datagram runtime: "the panel says active" is not the
+    # same fact as "the node runs it".
+    check(H.wait_until(lambda: "udp" in H.scalar(
         "SELECT IFNULL(tunnels,'[]') FROM node_state_report WHERE node_id=%d;" % H.EGR), timeout=20, interval=4),
-        "G1B.5 no udp runtime was created on the egress node")
+        "G1B.5 the egress node really hosts a udp runtime")
 
 
 def g1b_6_malformed_datagrams():
@@ -622,7 +643,7 @@ def main():
             ("G1B.2 udp positive", g1b_2_udp_positive, 240),
             ("G1B.3 mapping semantics", g1b_3_mapping_semantics, 300),
             ("G1B.4 idle expiry", g1b_4_idle_expiry, 420),
-            ("G1B.5 relay refused", g1b_5_relay_refused, 240),
+            ("G1B.5 relay end to end", g1b_5_relay_end_to_end, 300),
             ("G1B.6 malformed datagrams", g1b_6_malformed_datagrams, 300),
             ("G1B.7 old Agent admission", g1b_7_old_agent_admission, 420),
             ("G1B.11 hot reload", g1b_11_hot_reload, 300),

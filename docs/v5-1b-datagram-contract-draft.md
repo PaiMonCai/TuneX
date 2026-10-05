@@ -694,12 +694,15 @@ client ══UDP══> ingress listener(udp)
 
 - `factory.go` 的 builder 拆分要新增 **datagram EGRESS** 分支（今天只有 stream 分支）；
 - 出口端口所有权：走既有 `NodePortLease` + 端口守卫，**不新增 owner、不新增表**；
-- 目标池协议维度：`EgressTarget` 没有 protocol 列，而 wire 上
-  `TargetDescriptor.protocol?: "tcp" | "udp"`（`types.ts`）**已经存在**——这是既有的
-  "半实现"，B2 把它接上（落库 + 投影），**wire 契约零改动**；
+- ~~目标池协议维度：`EgressTarget` 加 protocol 列 + 投影~~ → **改判（2026-10-05，见
+  §12.5 第 5 条）**：**不加这一列**。传输由**隧道协议派生**（`udp` → UDP，其余 → TCP），
+  而这正是 runtime class 已经在做的事；加一列等于引入"目标协议 ≠ 隧道协议"这个**无效状态**，
+  还要为它写校验。wire 上那个既有的可选字段保持不动（TuneX 不下发它，也不读它）。
+  边界写明：**不支持混合协议目标池**，也不支持 udp→tcp 的转换（那是另一个能力）。
 - `TunnelConfig.Validate()` 今天只拒 tls/ws 的 EGRESS（`interface.go`），`udp` 会一路
   通过校验直达一个不存在的 runtime；B2 必须同时改校验，与面板侧
-  `forward-revision.ts` 的 `datagram_relay_unsupported` 判据（今天会主动拒绝 udp+RELAY）。
+  `forward-revision.ts` 的 `datagram_relay_unsupported` 判据（B2 期间它从"udp 一切
+  非 DIRECT"收窄为"**udp 多跳**"——单跳在两侧运行时落地后放开，见 §12.5 第 6 条）。
 
 ### 9.2 空闲超时：沿用 B1 的默认值，不新增 per-Forward 列
 
@@ -828,10 +831,11 @@ ownership/rotation，属安全评审范围（`DEVELOPMENT.md` §14）。
 
 ~~~text
 面板侧
-  · EgressTarget 增 protocol 列（migration）+ 出口池校验/UI 的协议维度
-  · 出口腿下发：把 protocol 真正投影到 TargetDescriptor（今天被丢弃）
-  · 放开 udp+RELAY 的两处拒绝：forward-revision.ts 的 datagram_relay_unsupported、
-    TunnelConfig.Validate() 对 EGRESS+udp 的裁决
+  · ~~EgressTarget 增 protocol 列~~ → **改判见 §12.5 第 5 条**：传输由隧道协议派生，不加列
+  · 出口腿下发 `hop_peer`（配对入口地址）：在 dispatchFactsFromRow 里**只推导一次**，
+    由 6 条投递路径共用（§12.5 第 6 条）；缺失时以 `datagram_hop_peer_missing` 在面板层拒绝
+  · 放开 udp+RELAY 的两处拒绝：forward-revision.ts 的 datagram_relay_unsupported
+    收窄为"**多跳**不支持"、TunnelConfig.Validate() 对 EGRESS+udp 的裁决
   · 出口节点为 datagram 出口申请/释放端口租约（复用 portPool，不新增 owner）
 Agent 侧
   · factory：新增 datagram EGRESS builder（与 stream builder 并列，不新增 manager）
@@ -863,6 +867,8 @@ G1B.relay   udp RELAY 端到端（真两跳拓扑 + 真 UDP 载荷 + 回包）
 G1B.relay   多客户端映射隔离 + 回程 generation 负例
 G1B.relay   出口来源取证负例（伪造源地址 → 丢弃且计数）
 G1B.relay   目标池协议维度（池内 udp 目标被选中，池内 tcp 目标不被选中）
+            ↑ **改判（§12.5 第 5 条）**：没有"池内协议"这回事，传输由隧道协议派生。
+              该行改为断言**出口真的按 UDP 发给池内目标**（即端到端那一行的强化）。
 G1B.relay   超长/畸形报文丢弃且计数（不静默）
 G1B.relay   出口端口租约与释放（无孤儿监听）
 G1B.regress tcp/tls/ws + udp DIRECT 全绿，且**连跑两遍逐行一致**
@@ -921,6 +927,37 @@ Agent 侧：**出口半边与入口半边都已落地**（`DatagramEgress` / `Da
 （§3.4 的那条语义是**目标**变更的语义，不是**跳地址**变更的语义）。因此地址真的变了就返回
 `ErrUpstreamNotSwappable`——manager 把它读作"这个 runtime 需要重建"，而重建恰好是正确答案。
 
+**回填第 5 条（面板侧实现发现）**：**不加 `EgressTarget.protocol`。** §9.1 原来写的是
+"把既有的半实现接上（落库 + 投影）"。写出口运行时的时候这件事被证伪了：出口用哪个传输
+（TCP 还是 UDP）**由隧道协议决定**，而 runtime class 已经在做这件事——`DatagramEgress`
+只 `DialUDP`，stream 出口只 `Dial` TCP。给目标再加一列，等于允许"目标协议 ≠ 隧道协议"
+这种状态存在，然后为它写校验；而它唯一可能的用途（混合协议目标池 / udp→tcp 转换）
+是**另一个能力**，不是 B2。
+
+因此冻结改为：
+- 传输 = 派生量（`FORWARD_PROTOCOL_SPECS[protocol].transport`），不是第二个字段 ——
+  与"transport 由 protocol 派生"这条早已冻结的纪律同源；
+- wire 上既有的 `TargetDescriptor.protocol?` **保持不动**：TuneX 不下发也不读它；
+- **明确边界**：不支持混合协议目标池，也不支持 udp→tcp 的目标转换。
+
+**回填第 6 条（面板侧实现发现）**：**`hop_peer` 只推导一次，且只有 datagram 会下发它。**
+- 推导点 = `forward-contract.dispatchFactsFromRow`（"隧道行 → 下发事实"的唯一入口），
+  地址取 `Node.connect_ip` 的**第一个非空项**（`firstConnectIp`）。这与 `next_hop` 是
+  同一条事实的两个方向，必须是同一次挑选的结果——两个点各自挑一次，两条腿就会指向不同地址。
+- 投递路径有 **6 处**（scheduler / rollout exec ×3 / reconcile sink / route dispatch），
+  全部经由同一份 facts 或同一个 `firstConnectIp`；漏掉任何一处，datagram 出口在**那条路径**
+  上就会构建失败（这正是仓库反复学到的"一份事实必须有两条以上投递路径"）。
+- **只有 datagram 传输会带它**：门是 `transport === "datagram"`，不是协议名字面量，
+  这样未来新增的 datagram 协议自动继承这条要求，而不是悄悄漏掉。
+- 缺了它就**在面板层拒绝**（`datagram_hop_peer_missing`），不发一份"出口必然拒绝"的配置：
+  故障停在拥有该要求的那一层，并点名缺了哪个字段。
+
+**回填第 7 条（Gate 翻转，明写）**：`G1B.5` 从"udp RELAY **必须被拒**"翻转为
+"**单跳 udp RELAY 必须端到端可用**"。旧断言守的是"跳形态未冻结"，形态冻结后它必须翻转；
+**翻转写在用例里而不是删掉**，并且**多跳仍被拒**这条边界改由 backend 单测断言
+（`forward-revision.test.ts` 的 "udp + RELAY 带中间跳仍被拒"）——纯校验事实不该在
+真实拓扑门禁里复刻成"恰好有第三台节点"的脆弱版本。
+
 ---
 
 ## 13. 变更记录
@@ -929,3 +966,5 @@ Agent 侧：**出口半边与入口半边都已落地**（`DatagramEgress` / `Da
 |---|---|---|
 | 2026-10-04 | DRAFT 初版：八个问题的回答 + Gate V5-G1B 映射 + 10 条与现有代码的不一致 | V5-WP5-B0（草案，待评审） |
 | 2026-10-05 | §9 全部冻结（跳形态取候选 (b) datagram 端到端；其余 7 条沿用 B1 既有语义）；§3.3 结论更新；新增 §12 WP5-B2 实施规格与 DoD/Gate 增量；文档状态由 DRAFT 改为"B0 冻结 + §9 决策冻结" | 开发 Lead |
+| 2026-10-05 | 实现回填 §12.5 第 1–4 条（取证按 IP、新世代接管 id、hop_peer 必填、Retarget 只收空操作）；Agent 两侧运行时落地 | 开发 Lead |
+| 2026-10-05 | 面板侧落地：回填第 5 条（**不加 `EgressTarget.protocol`**，传输由隧道协议派生）、第 6 条（`hop_peer` 在 facts 里只推导一次、6 条路径共用、只有 datagram 下发、缺失时 `datagram_hop_peer_missing` 面板层拒绝）、第 7 条（**Gate G1B.5 由"被拒"翻转为"端到端可用"**，多跳拒改由 backend 单测断言）；单跳 udp RELAY 在面板侧放开 | 开发 Lead |

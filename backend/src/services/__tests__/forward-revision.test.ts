@@ -581,7 +581,7 @@ describe("G. applied baseline snapshot", () => {
 /* V5.1b B1：datagram 边界与 tls 路径的"改动分类"                        */
 /* ------------------------------------------------------------------ */
 
-describe("V5.1b：udp 是 DIRECT-only，且 tls 路径属于运行态配置", () => {
+describe("V5.1b：udp 的 DIRECT/RELAY 边界，且 tls 路径属于运行态配置", () => {
   const udpDirect: ForwardCandidateConfig = {
     ...BASE_CONFIG,
     protocol: "udp",
@@ -591,7 +591,10 @@ describe("V5.1b：udp 是 DIRECT-only，且 tls 路径属于运行态配置", ()
     expect(validateForwardCandidate(udpDirect)).toMatchObject({ ok: true });
   });
 
-  test("udp + RELAY 被拒，并且是一个可解释的原因码", () => {
+  // WP5-B2（契约 §9.1）冻结了跨节点跳的形态，Agent 两侧运行时也已落地，所以
+  // **单跳** udp RELAY 现在是一条合法配置。这条断言是那次翻转的显式记录：旧断言
+  // 写的是"udp + RELAY 必须被拒"，而它当时守的其实是"跳形态未冻结"。
+  test("udp + RELAY（单跳）通过纯校验", () => {
     const v = validateForwardCandidate({
       ...udpDirect,
       mode: "relay",
@@ -599,11 +602,26 @@ describe("V5.1b：udp 是 DIRECT-only，且 tls 路径属于运行态配置", ()
       target_host: null,
       target_port: null,
     });
+    expect(v.reasons).not.toContain("datagram_relay_unsupported");
+    expect(v.ok).toBe(true);
+  });
+
+  // 仍然被拒的是**多跳**：每个映射共用一个朝向出口的 socket，而中转跳是被它前一跳
+  // 喂的、不是被入口喂的，它的取证故事 B2 没有冻结。
+  test("udp + RELAY 带中间跳仍被拒，并且是一个可解释的原因码", () => {
+    const v = validateForwardCandidate({
+      ...udpDirect,
+      mode: "relay",
+      egress_node_id: 22,
+      middle_node_id: 33,
+      target_host: null,
+      target_port: null,
+    });
     expect(v.ok).toBe(false);
-    // 跨节点跳的形态是**未冻结的产品决策**（DEVELOPMENT.md §6.2 §9.1），所以面板在
-    // 纯校验层就拒绝，而不是让 Agent 成为唯一说"不行"的地方 —— 只在一层设防的边界
-    // 会被下一个调用方绕过，而界面必须能依赖校验结果，而不是靠自己的警告。
+    // 边界留在纯校验层，而不是让 Agent 成为唯一说"不行"的地方 —— 只在一层设防的
+    // 边界会被下一个调用方绕过，而界面必须能依赖校验结果。
     expect(v.reasons).toContain("datagram_relay_unsupported");
+    expect(v.errors.join(" ")).toContain("单跳");
   });
 
   test("非 tls 携带证书路径：create / preview / patch 得到同一个原因", () => {

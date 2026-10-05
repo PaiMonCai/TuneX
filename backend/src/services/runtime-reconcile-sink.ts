@@ -296,6 +296,11 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
           tunnel_type: tunnel.tunnel_type,
           tls_cert_path: tunnel.tls_cert_path,
           tls_key_path: tunnel.tls_key_path,
+          // V5.1b WP5-B2: the reconcile replay is a SECOND delivery path for the
+          // same fact — a replayed datagram exit must carry the same attestation
+          // address the original dispatch did (the repo has paid for this lesson
+          // three times over: protocol, certificate paths, health).
+          ingress_node: tunnel.ingress_node,
         });
         if (facts === null) {
           throw new Error(
@@ -339,6 +344,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         tunnel_type: tunnel.tunnel_type,
         tls_cert_path: tunnel.tls_cert_path,
         tls_key_path: tunnel.tls_key_path,
+        ingress_node: tunnel.ingress_node,
       });
       if (relayFacts === null) {
         throw new Error(
@@ -355,6 +361,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         targets,
         lbStrategy: tunnel.egress_pool?.lb_strategy ?? tunnel.egress_node.lb_strategy,
         protocol: relayFacts.protocol,
+        hopPeer: relayFacts.hopPeer,
       });
       if (!egress.ok) throw new Error(egress.error);
 

@@ -304,6 +304,27 @@ export interface DispatchFacts {
   readonly protocol: ForwardProtocol;
   readonly tlsCertPath?: string;
   readonly tlsKeyPath?: string;
+  /**
+   * V5.1b WP5-B2：datagram 跳上"配对入口节点"的地址，出口腿据此取证。
+   *
+   * 只有 datagram 协议会带上它：TCP/TLS/WS 的跳是裸 TCP，握手本身就说明了对面是谁，
+   * 多带一个字段只会是一个**没人读**的字段（而"没人读的字段"正是慢慢漂移的开始）。
+   *
+   * 它是**地址**而不是 `ip:port`：入口对出口只有一个 socket，它的**源端口是临时的**，
+   * 入口 runtime 一重启端口就变——钉住端口会把一次正常重启变成永久故障。
+   */
+  readonly hopPeer?: string;
+}
+
+/**
+ * `Node.connect_ip` 可能是一串以逗号分隔的候选地址（历史上一个节点挂过多个地址）。
+ * 面板在下发任何"对端可达地址"时必须挑**同一个**第一个非空项，否则两条腿会指向
+ * 不同的地址：RELAY 的 `next_hop`（入口 → 出口）与 datagram 跳的 `hop_peer`
+ *（出口 → 入口）必须是同一次挑选的结果。
+ */
+export function firstConnectIp(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).find(Boolean) ?? null;
 }
 
 export function dispatchFactsFromRow(row: {
@@ -311,6 +332,8 @@ export function dispatchFactsFromRow(row: {
   tunnel_type?: unknown;
   tls_cert_path?: unknown;
   tls_key_path?: unknown;
+  /** 配对入口节点（只有 datagram 协议会用到；缺了它 = 出口无法取证）。 */
+  ingress_node?: { connect_ip?: unknown } | null;
 }): DispatchFacts | null {
   const protocol = admitPersistedProtocol(row);
   if (protocol === null) return null;
@@ -318,10 +341,20 @@ export function dispatchFactsFromRow(row: {
   if (!paths.ok) return null;
   const cert = paths.columns.tls_cert_path;
   const key = paths.columns.tls_key_path;
+  // A datagram hop has no handshake, so the peer cannot be implied — the panel has
+  // to say who may feed the exit. The address is derived HERE, in the one place
+  // that turns a tunnel row into dispatch facts, rather than at each dispatch
+  // site: two sites deriving it independently is how `next_hop` and `hop_peer`
+  // would end up naming different addresses for the same hop.
+  const hopPeer =
+    FORWARD_PROTOCOL_SPECS[protocol].transport === "datagram"
+      ? firstConnectIp(row.ingress_node?.connect_ip as string | null | undefined)
+      : null;
   return {
     protocol,
     ...(cert ? { tlsCertPath: cert } : {}),
     ...(key ? { tlsKeyPath: key } : {}),
+    ...(hopPeer ? { hopPeer } : {}),
   };
 }
 
