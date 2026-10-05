@@ -350,6 +350,15 @@ function audienceDb(over: {
   users?: Array<{ id: number; email: string | null; tg_id: string | null }>;
   members?: Array<{ user_id: number }>;
   fail?: "user" | "member";
+  channelRows?: Array<{
+    id: number;
+    scope_kind: string;
+    workspace_id: number | null;
+    kind: string;
+    target: string;
+    secret_enc: string | null;
+    enabled: boolean;
+  }>;
 }) {
   const db: AnnouncementPublishDb = {
     user: {
@@ -380,6 +389,12 @@ function audienceDb(over: {
       },
       async createMany() {
         return {};
+      },
+    },
+    // F5 的渠道行：默认没有（= 这台安装没配任何 db 级渠道）。
+    notificationChannel: {
+      async findMany() {
+        return over.channelRows ?? [];
       },
     },
   };
@@ -454,6 +469,23 @@ describe("E. 发布后的投递入口", () => {
     });
     expect(outcomes).toEqual([]);
     expect(warnings.join("\n")).toContain("audience_too_large");
+  });
+
+  test("渠道走 F5 加载器：没配行 + 没配 SMTP ⇒ 不投递、零账本、告警（不制造 not_configured 噪音）", async () => {
+    const db = audienceDb({ users: [{ id: 1, email: "a@example.com", tg_id: "1001" }] });
+    const ledger = memoryLedger();
+    const warnings: string[] = [];
+
+    const outcomes = await deliverAnnouncementOnPublish(
+      db,
+      { row: ROW, scope: platformNotificationScope(), onWarn: (m) => warnings.push(m) },
+      // 只覆盖账本与静默期：**渠道由加载器决定**（这条断言要验的正是它）。
+      { ledger: ledger.store, cooldown: memoryCooldown().store },
+    );
+
+    expect(outcomes).toEqual([]);
+    expect(ledger.rows.length).toBe(0);
+    expect(warnings.join("\n")).toContain("没有打开任何公告渠道");
   });
 
   test("入口永不抛出（db 全挂也只是告警）", async () => {

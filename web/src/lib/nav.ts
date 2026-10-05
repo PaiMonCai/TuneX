@@ -282,17 +282,13 @@ export const adminConsoleNav: NavGroup[] = [
     labelEn: "Operations",
     items: [
       { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
-      // V5-WP18.5 落地页面、**WP18.6 才登记 RBAC 资源键**：在登记之前只有超管能访问
-      // `/api/admin/announcements*`（`adminPermissionGuard` 对未登记前缀 fail-closed），
-      // 所以这一条先挂 `planned`（既有形态：声明得到、点不进、也不 404）——
-      // 让菜单不出现"所有管理员都看得到、点进去只有 403"的坏体验。
-      // WP18.6 登记资源键时把 `status` 摘掉，两件事在同一个 WP 里闭环（见契约 §12.4）。
-      {
-        href: "/admin/announcements",
-        labelKey: "admin.announcements",
-        iconKey: "announcements",
-        status: "planned",
-      },
+      // V5-WP18.5：平台公告（写给所有人的内容）。挂"运营"而非"系统"：它是内容/沟通，与工单同类。
+      //
+      // `planned` 在 WP18.5 是**过渡态**（页面已落，但资源键未登记 ⇒ 非超管点进去只有 403）；
+      // WP18.6 登记了 `announcements` 资源键，因此这里**放开为可导航**，两件事在同一个 WP 里收口。
+      // 闭环由 `backend/tests/v5-wp18-announcement-rbac.test.mjs` 的最后一组断言钉住
+      // （菜单项 ↔ 资源键 url ↔ 页面文件三者指向同一路径）。
+      { href: "/admin/announcements", labelKey: "admin.announcements", iconKey: "announcements" },
       { href: "/admin/audit-logs", labelKey: "admin.auditLogs", iconKey: "license" },
       {
         href: "/admin/alerts",

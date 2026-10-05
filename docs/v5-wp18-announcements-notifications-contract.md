@@ -738,6 +738,13 @@ F4.4 的措辞"同一 `(scope, source_kind, source_id, reason_code)` 只投递�
 语义依据：F3（每渠道各自一条投递记录）、F6.5（免打扰是"每用户 × 每渠道 × 每类别"—— 用户靠**静音某个
 渠道**少收通知，若静默期跨渠道生效，"给不给这个渠道发"就取决于渠道顺序，用户没有旋钮）、
 F4.6（账本记的是"这个渠道给谁发过"）。所以 F4.4 的"只投递一次"在**每渠道**这个粒度上成立。
+**更一般的结论（Lead 2026-10-05 要求补写）**：「同一事实只投递一次」这句话**必须显式声明
+投递单位**，否则它的含义会随渠道数量悄悄变化。本 WP 的单位是**每渠道**（F3 每渠道一条记录 /
+F6.5 用户靠静音渠道少收通知 / F4.6 账本记"这个渠道给谁发过"）；写成"每事实"就得到上面那个
+缺陷：渠道从 1 个变成 3 个时，语义从"每个渠道各一次"退化成"只有一个渠道能发"，而**没有任何
+断言会红**。判据：任何一个"只投递一次/只提醒一次"的机制，都必须能回答"以什么为单位"，
+并且这个单位要出现在键（或唯一索引）里，而不是靠调用点恰好只传一个渠道。
+
 **影响面（写清）**：`notificationCooldownKey` 的签名与键形状变了 ⇒ 18.1 的 facts 测试与 18.2 的
 delivery 测试里各有**字面量**断言随之更新（**只改字面量，断言的意图不变**）；部署窗口内旧键不再匹配，
 最坏情况是升级后"每个事件 × 渠道"多投一次（v5 未发布形态，可接受；要严格避免可在升级时清
@@ -765,6 +772,77 @@ delivery 测试里各有**字面量**断言随之更新（**只改字面量，�
    读侧两道保证，DoD6 的断言在 `v5-wp18-announcements.test.ts` 的 A/B 组）。
 3. ~~**D1 的接线**与管理端**发布公告的 UI**~~ —— 已由 Lead 指派并落地，见 D10/D13。
    仍**未做**的是 **D11 里 webhook 是否进公告受众**（等 Lead 定夺）与"平台级渠道受众"的设计。
+
+
+### 12.4 WP18.6 —— 权限接线：`/admin/announcements` 登记 + F5 渠道配置加载器（2026-10-05）
+
+**交付**：
+- `backend/src/permissions.ts`：`ADMIN_RESOURCES` 新增 `announcements`
+  （`label:"公告管理"`, `group:"运营"`, `url:"/admin/announcements"`, `apiPrefixes:["/admin/announcements"]`）。
+- `backend/src/services/notification-channel-config.ts`（新增）：F5 的 `notification_channel` 行 →
+  渠道配置（webhook URL 清单 / telegram 密文 token）→ 三个渠道实例。
+- `backend/src/services/announcement-delivery.ts`：发布入口改为**用加载器给出的渠道**
+  （在此之前 telegram 永远"未配置"，见 D3）。
+- `web/src/lib/nav.ts`：公告入口 `planned → available`（与登记同一个 WP 内收口；过渡态在
+  `dd67543` 单独一个提交里，见 D5）。
+- `backend/tests/v5-wp18-announcement-rbac.test.mjs`（新增，6 test，node:test，进 CI 的 `tests/*.test.mjs`）。
+- `backend/src/services/__tests__/v5-wp18-channel-config.test.ts`（新增，10 test）。
+
+**D1（判断）「登记生效」的**可观察形态**是"能授权"，不是"表里多了一行"。**
+`adminPermissionGuard` 的语义是「未登记前缀 ⇒ 403，只放行超管」，所以登记只能靠**判定变化**证明：
+登记前 `sanitizePermissions()` 会**丢掉** `announcements` 这个键（角色存不下它），登记后它被保留；
+`getEffectiveAccess()` 对 `{announcements:"read"}` 的持有者放行 GET、拒绝 POST（`requiredLevel`
+按方法分级），`{announcements:"write"}` 两样都行，而**只有 `{nodes:"write"}` 的角色仍然拿不到
+`announcements`** —— 最后这条是"fail-closed 没被顺手拆掉"的对照。另加一条对照：未登记前缀
+（`/admin/definitely-not-registered`）解析结果仍是 `undefined`，那条规则没有因为本次登记而消失。
+**为什么单独一个资源键、不复用 `settings`**：面向全体租户的**对外内容**与站点设置是两种风险面；
+"能改站点名字"不该顺带等于"能以平台名义对所有人发公告"。这也与 F7 的表格一致（F7 只要求
+**租户侧**复用 `settings:*`）。
+
+**D2（判断）租户侧**不新增权限键**，用户侧可见列表只要"活跃成员"。**
+发布/撤回复用 `settings:manage`、管理面读用 `settings:read`（F7）；用户侧的可见列表与已读
+**不经过**这一层（§12.3-D4 的反例：挂在 `settings:read` 上会让缺该键的自定义角色成员看不到平台公告）。
+测试把两件事都钉住：`canWorkspaceResourceAction` 对 `(manage, settings)` / `(read, settings)` 的
+判定矩阵，以及**源码级断言**"路由确实选了这两对判据"（行为层要跑通得先有 DB + 认证链，
+那是 18.7 的 HTTP 契约测试；这里钉住的是"选了哪对判据"，因为选错判据正是这类 WP 最容易出的错）。
+
+**D3（判断）F5 行 → 渠道配置的加载器**必须**单独存在，否则渠道永远"未配置"。**
+两个渠道工厂的注释都写着"配置由调用方给出"（`createWebhookChannel` 的 target、
+`createTelegramChannel` 的 `sealedToken`），而那个调用方此前**不存在**：`createTelegramChannel()`
+的默认 `sealedToken` 恒为 `() => null` ⇒ 即便运维把行配好了，telegram 也永远 `isConfigured === false`，
+而账本里会显示 `not_configured`（看起来像"没人配过"，实际是"没人接上"）。三条口径：
+① **只读平台级**（`scope_kind="platform"` 且 `workspace_id IS NULL`；O6 冻结了"本期只有平台级渠道"）；
+② **停用 ≠ 删除**：`enabled=false` 的行留在 `rows` 里可诊断，但不产生目标/密文；
+③ **不猜**：F5 的表**没有**"一 scope 一 kind"的唯一索引（MySQL 里 NULL 互不相等，见 §12.2-D4 的实测），
+所以"多行"是**真实可发生的状态** —— telegram 取 `id` 最新的一条并把这件事写进 `warnings`，
+webhook 则把每条启用行当一个独立接收方（全部是目标，按 `id` 升序，结果确定）。
+另外两条细节：**有 URL 才把 webhook 放进注册表**（否则渠道"配置好了"却没有目标，
+会在账本里留 `rejected_target` —— 正是 Lead 点名的"把失败可见稀释成噪音"）；
+**读不到配置 = `storage_error`，不是"空配置"**（把一次 DB 抖动说成"这台安装没配渠道"是谎）。
+
+**D4（交付时上报的缺口，需 Lead 定夺）事实类通知的**投递触发器**仍未实现。**
+`deliverNotificationFacts()` 在生产里目前**只有公告这一条调用路径**；"派生 attention 事实 → 投递"
+的那个 worker/cron 不在任何 WP 行里（§6 的 18.1 是纯函数派生、18.2 是投递层、18.3/18.4 是渠道、
+18.5 公告、18.6 权限、18.7 Gate 收口）。因此 `platformChannelTargets(config, "webhook")`
+（给事实类通知用的平台级目标）**现在没有生产消费者** —— 我在代码注释里写明了这一点，
+**不假装它已经接上**。要不要在这个 WP 补触发器、还是单开一个 WP（它涉及"哪些事实进投递、
+多久跑一次、worker 与 api 谁跑"这些新决定），请 Lead 定；若归 18.7，那 18.7 就不只是"收口"。
+
+**D5（判断）过渡态的粒度：`planned` 单独一个提交。**
+Lead 要求"先挂 `planned`、登记后再摘掉，两件事在同一个 WP 里闭环"。落地为两个提交：
+`dd67543`（挂 `planned`）与本次（登记 + 摘掉 + 断言闭环）。分开的理由是**每个提交自身都自洽**：
+如果本次登记因为任何原因迟到或被回退，`dd67543` 那个状态不会让所有管理员点进一个 403 页面。
+闭环本身是可断言的：`tests/v5-wp18-announcement-rbac.test.mjs` 最后一组断言同时检查
+"菜单项不再 planned""labelKey 在""页面文件真的存在"。
+
+**验证记录（2026-10-05）**
+1. backend WP18 八个文件 `bun test` → **201 pass / 0 fail**（5834 expect；18.6 新增 10 test / 26 expect）。
+2. `node --experimental-transform-types --test tests/v5-wp18-announcement-rbac.test.mjs tests/authorization.test.mjs`
+   → **10 pass / 0 fail**（前者 6 条为本次新增；后者是既有 RBAC 回归，证明登记没破坏既有判据）。
+3. web 全量 `bun test src` → **615 pass / 0 fail**（5657 expect，31 文件）；`tsc --noEmit` web/backend **全绿**
+   （backend 此刻为零错误 —— 前几轮那些他人在途的错误已由各自所有者收口）。
+
+---
 
 **验证记录（可复现，2026-10-05）**
 

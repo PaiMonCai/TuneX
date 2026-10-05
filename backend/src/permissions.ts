@@ -48,6 +48,15 @@ export const ADMIN_RESOURCES: AdminResource[] = [
   { key: "settings", label: "系统设置", group: "系统", url: "/admin/settings", business: false, apiPrefixes: ["/admin/system/config"] },
   { key: "license", label: "License 管理", group: "系统", url: "/admin/license", business: false, apiPrefixes: ["/admin/license"] },
   { key: "audit", label: "审计日志", group: "系统", url: "/admin/audit-logs", business: false, apiPrefixes: ["/admin/audit-logs"] },
+  // V5-WP18.6（契约 F7）：平台公告（发布 / 撤回 / 列全部）。
+  //
+  // 为什么**单独**一个资源键、而不是复用 `settings`：面向全体租户的**对外内容**与站点设置
+  // 是两种风险面 —— "能改站点名字"不该顺带等于"能以平台名义对所有人发布公告"。
+  // 登记这一步本身就是契约 F7 的可执行形式：**未登记前缀 = 只有超管**（fail-closed），
+  // 登记之后被授权的管理员角色才能用它；`tests/v5-wp18-announcement-rbac.test.mjs`
+  // 显式断言"登记生效"（键可授权 / 读写得按方法分级 / 别的资源键仍然拦得住）。
+  // 租户侧的公告走的是**既有** `settings:read` / `settings:manage`（不新增租户权限键）。
+  { key: "announcements", label: "公告管理", group: "运营", url: "/admin/announcements", business: false, apiPrefixes: ["/admin/announcements"] },
   // V5.5 WP14：联邦（Panel↔Panel 信任 / 授予 / 远端租约 / 用量）。
   // 只属于 Admin Console：普通用户永远看不到 trust / grant / lease 概念（§9.4.1）。
   // 用独立的资源键而不是挂到 "nodes" 上：联邦是跨安装的安全边界，

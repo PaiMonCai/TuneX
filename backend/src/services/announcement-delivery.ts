@@ -43,6 +43,11 @@ import {
   notificationWindowStartMs,
   type NotificationScope,
 } from "./notification-facts.ts";
+import {
+  buildPlatformNotificationChannels,
+  loadPlatformChannelConfig,
+  type NotificationChannelConfigDb,
+} from "./notification-channel-config.ts";
 import { isMuted, loadMutesByUserIds, type NotificationMute, type NotificationMuteDb } from "./announcement-mute.ts";
 import { renderAnnouncementText } from "./announcement.ts";
 
@@ -346,7 +351,7 @@ export async function deliverAnnouncement(
 /* 生产入口：发布公告后触发（fire-and-forget，永不抛出）                  */
 /* ================================================================== */
 
-export interface AnnouncementPublishDb extends AnnouncementAudienceDb, NotificationMuteDb {}
+export interface AnnouncementPublishDb extends AnnouncementAudienceDb, NotificationMuteDb, NotificationChannelConfigDb {}
 
 export interface PublishDeliveryOptions {
   row: AnnouncementDeliverySource;
@@ -382,6 +387,17 @@ export async function deliverAnnouncementOnPublish(
       return [];
     }
 
+    // 渠道实例从 F5 的 `notification_channel` 行接上（WP18.6 的加载器）：接上之后
+    // "配置了 telegram 行"才会让 telegram 真的进入投递 —— 在那之前
+    // `createTelegramChannel()` 的 `sealedToken` 恒为 null，渠道永远"未配置"。
+    // 读不到配置时**不假装有渠道**（fallback 到"只有部署级 gate 能判定的渠道"），
+    // 因为把读取失败说成"这台安装没配渠道"同样是一次谎。
+    const config = await loadPlatformChannelConfig(db);
+    const configuredChannels = config.ok
+      ? announcementChannels(enabledNotificationChannels(buildPlatformNotificationChannels(config.value)))
+      : undefined;
+    if (!config.ok) warn("渠道配置读取失败，按「只有部署级 gate 能判定的渠道」继续");
+
     const mutes = await loadMutesByUserIds(db, audience.recipients.map((r) => r.user_id));
     if (!mutes.ok) {
       // 免打扰读不到 = **不知道谁静音了**。方向按 O2 的裁决：抑制机制失效时**多报**
@@ -390,7 +406,13 @@ export async function deliverAnnouncementOnPublish(
     }
 
     return await deliverAnnouncement(
-      { ledger: overrides.ledger ?? createPrismaLedgerStore(), ...overrides, onWarn: options.onWarn },
+      {
+        ledger: overrides.ledger ?? createPrismaLedgerStore(),
+        // 渠道由上面的 F5 加载器给出；调用方仍可用 overrides 覆盖（测试 / 将来的接线）。
+        ...(configuredChannels === undefined ? {} : { channels: configuredChannels }),
+        ...overrides,
+        onWarn: options.onWarn,
+      },
       {
         row: options.row,
         scope: options.scope,
