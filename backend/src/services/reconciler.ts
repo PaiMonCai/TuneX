@@ -11,7 +11,7 @@
  * ── 只有四类动作可以自动执行（§7.12「只允许自动」）──
  *   A. {@link AutoActionKind} `resend_same_revision` —— 以**同一个** revision
  *      重发。Agent 侧等版本会回 duplicate ACK，因此重发天然幂等。
- *      **绝不允许抬高 revision**：抬高期望版本是  编排器的专属权力，
+ *      **绝不允许抬高 revision** 抬高期望版本是  编排器的专属权力，
  *      reconciler bump revision 等于偷偷改掉用户的期望状态。
  *   B. `fill_missing_runtime` —— desired=active 而 agent 快照里根本没有这条
  *      隧道时，用同 revision 补一遍 apply（A 的特例，分开计数是为了让
@@ -47,7 +47,7 @@
  * Agent 状态上报视为过期的时间窗。
  *
  * 心跳 30s 一次（见 routes 侧的限流口径与 `cron_push_node_config`），3 个周期
- * 没更新即认为「这个节点现在联系不上」。**过期不等于资源可删**：§7.12 明确
+ * 没更新即认为「这个节点现在联系不上」。**过期不等于资源可删** §7.12 明确
  * 禁止「心跳超时即删除资源」，过期只把该隧道的所有自动动作降级为告警。
  */
 export const DEFAULT_NODE_STALE_AFTER_MS = 90_000;
@@ -72,7 +72,7 @@ export const AUTO_ACTIONS = [
 /**
  * 默认禁止自动的动作。
  *
- * 这份列表是**声明式禁令**：即使将来有人想给 reconciler 加新能力，也必须先
+ * 这份列表是**声明式禁令** 即使将来有人想给 reconciler 加新能力，也必须先
  * 在这里显式讨论，而不是默默实现。测试对数组内容做锚定断言。
  */
 export const FORBIDDEN_AUTO_ACTIONS = [
@@ -112,7 +112,7 @@ export interface DesiredTunnel {
   middle_node_id?: number | null;
   in_node_group_id?: number | null;
   /**
-   * V5.3（round 6/7）—— reconcile 必须能比较**内容**，不只是"存在性与 revision"：
+   * reconcile 必须能比较**内容**，不只是"存在性与 revision"：
    *   · `desired_pool_targets` = 池里 active 目标的 `host:port`（升序）；
    *   · `desired_target_health` = 面板此刻的合成结论（`host:port=state`，升序）。
    * `undefined` = 本次没有加载这些事实，此时**不**判内容漂移（"没加载" ≠ "为空"）。
@@ -153,7 +153,7 @@ export interface NodeOnlineInput {
   /** state_report.reported_at：面板侧收到上报的时刻（DB 侧真相）。 */
   reported_at?: Date | null;
   /**
-   *  `node.lifecycle`（desired 管理态，§13.4.1）。**与 status 正交**：
+   *  `node.lifecycle`（desired 管理态，§13.4.1）。**与 status 正交** 
    * status 是「连没连上」（事实），lifecycle 是「允不允许接新业务」（期望）。
    * 缺省 undefined = 读到的行没有这一列（ 之前的替身/旧查询），此时
    * 不据此等待。
@@ -246,7 +246,7 @@ export function isRevisionBehind(t: DesiredTunnel): boolean {
 }
 
 /**
- * 端口是否不一致。**只比较「两边都知道」的端口**：agent 没上报该端口时不做
+ * 端口是否不一致。**只比较「两边都知道」的端口** agent 没上报该端口时不做
  * 判定（`null` / 缺失 = 不知道，不是不一致）。这正是 reconciler 不该把
  * 「agent 少报了一个字段」当成 `port_mismatch` 的原因。
  */
@@ -325,7 +325,7 @@ export function isNodeInMaintenance(node: NodeOnlineInput | null | undefined): b
 /**
  * agent 上报的池目标（`host:port`，升序）—— "已应用内容"的一半。
  *
- * V5.3 round 6 实测：agent 的池可以变空，而隧道仍在列表里，于是存在性判定认为一切正常、
+ * agent 的池可以变空，而隧道仍在列表里，于是存在性判定认为一切正常、
  * `resent: 0`，转发却什么都转发不出去（连得上、没数据）。
  */
 function appliedPoolTargets(report: NodeReport | undefined, tunnelId: number): string[] | null {
@@ -472,7 +472,7 @@ export function computeDrift(
 /**
  * 把一个「打算做的动作」过一遍白名单。
  *
- * 这是 §7.12 两条清单的**代码落点**：
+ * 这是 §7.12 两条清单的**代码落点** 
  *   · 在 {@link AUTO_ACTIONS} 内 → 允许；
  *   · 在 {@link FORBIDDEN_AUTO_ACTIONS} 内 或任何未知值 → 拒绝并显式返回
  *     `suppressed`，让调用方（日志/告警）能说出「压掉了什么」。
@@ -673,23 +673,23 @@ export interface ReconcileDeps {
   /** 端口租约回收（生产 =  `reconcileLeases`）。 */
   reconcileLeases?: ReconcileLeasePort | null;
   /**
-   *：自动故障转移评估（生产 = `runFailoverSweep`）。
+   * 自动故障转移评估（生产 = `runFailoverSweep`）。
    *
    * 注入而不是直接 import，有两个理由：本模块的用例不需要数据库；以及**顺序**
    * 必须由调用方掌握 —— 先续跑未完成的 rollout，再评估新的迁移，否则一次未完成的迁移
    * 会被当成"又一次掉线"再迁一遍。
    *
-   * 缺省 = 不评估（旧行为）。这不是"忘了接线"的安全网，而是**有意的缺省**：没有策略
+   * 缺省 = 不评估（旧行为）。这不是"忘了接线"的安全网，而是**有意的缺省** 没有策略
    * 配置时自动迁移本来就不该发生（§8：必须是显式 policy）。
    */
   failoverSweep?: (() => Promise<{ evaluated: number; moved: number; held: number }>) | null;
   /**
-   *：联邦 Forward 的健康收口（可见状态回写 + 通过既有 rollout 恢复整条腿）。
+   * 联邦 Forward 的健康收口（可见状态回写 + 通过既有 rollout 恢复整条腿）。
    *
    * 注入而不是直接 import：本模块的用例不需要数据库。生产由
    * {@link defaultReconcileDeps} 接到 `reconcileFederatedForwardHealth`。
    *
-   * 位置在**本地逐条对账之后**：本机缺失入口腿时，reconciler 的常规重发对联邦 Forward
+   * 位置在**本地逐条对账之后** 本机缺失入口腿时，reconciler 的常规重发对联邦 Forward
    * 是**拒发**的（sink 的 runtime-use 判定要求本机出口节点组，而联邦 Forward 没有），
    * 所以"入口腿丢了"这件事必须由联邦这一遍用 rollout 重新建起来。
    * 缺省 = 不做（旧行为），不是"忘了接线"的安全网。
@@ -719,14 +719,14 @@ export interface ReconcileOutcome {
   /** 端口租约回收统计（`null` = 本轮未配置回收依赖）。 */
   leases: { releasedDanglingTunnel: number; releasedExpired: number } | null;
   /**
-   *：自动迁移评估结果（`null` = 本轮未配置该依赖）。
+   * 自动迁移评估结果（`null` = 本轮未配置该依赖）。
    *
    * 放在 outcome 里而不是只写日志：迁移是"改变了谁承载流量"的动作，它的次数必须和
    * resend/failed 一样是**可观测的返回值**，否则"这轮到底有没有搬流量"只能靠翻日志。
    */
   failover: { evaluated: number; moved: number; held: number } | null;
   /**
-   *：联邦 Forward 健康收口的统计（`null` = 本轮未配置该依赖）。
+   * 联邦 Forward 健康收口的统计（`null` = 本轮未配置该依赖）。
    */
   federated: ReconcileFederatedHealthSummaryLike | null;
   forbiddenSuppressed: ForbiddenActionKind[];
@@ -782,7 +782,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
           egress_node_id: true,
           middle_node_id: true,
           in_node_group_id: true,
-          // V5.3（round 7）：内容漂移判定需要**期望内容**。只取 active 目标：
+          // 内容漂移判定需要**期望内容**。只取 active 目标：
           // 停用的目标不参与转发，不该因为它们触发重发。
           egress_pool: { select: { targets: { select: { host: true, port: true, status: true } } } },
         },
@@ -802,7 +802,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
     async nodes() {
       const { db } = await import("../db.ts");
       const rows = await db.node.findMany({
-        //：lifecycle 是 §13.4.1 的另一半状态。缺了它，maintenance 节点会被
+        // lifecycle 是 §13.4.1 的另一半状态。缺了它，maintenance 节点会被
         // 当成「可达且 active」而照样下发新 revision——那正是 §13.4.2 禁的行为。
         select: { id: true, status: true, last_seen_at: true, lifecycle: true, state_report: { select: { reported_at: true } } },
       });
@@ -917,7 +917,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     const node = pickNode(nodeById, t);
 
     // 找不到归属节点（DIRECT 隧道没有 egress_node_id、或节点行已被删）⇒
-    // **不视为可达**：此时无从判断 agent 是否在场，更不能往一个不存在的
+    // **不视为可达** 此时无从判断 agent 是否在场，更不能往一个不存在的
     // 节点上重发。语义与 isNodeUnreachable(node=null) 对齐：只产 finding。
     const reachable = node !== null && !isNodeUnreachable(node, now, deps.staleAfterMs);
     const drifts = computeDrift(t, agent, node, now, { staleAfterMs: deps.staleAfterMs });
@@ -1166,7 +1166,7 @@ function pickAgentTunnel(
   return {
     id: String(t.id),
     mode,
-    // V5.3（round 7）：业务 target/health 仍属于最终出口，不把 transit 的
+    // 业务 target/health 仍属于最终出口，不把 transit 的
     // 单一 next-hop 伪装成业务池内容。
     applied_pool_targets: appliedPoolTargets(egressReport, t.id),
     applied_target_health: appliedTargetHealth(egress),
@@ -1214,7 +1214,7 @@ function pickNode(
   // `executeReconcile` 的 `nodeInMaintenance` 对 RELAY 恒为 false（DIRECT 走
   // 上面的 early return 所以不受影响），维护中的入口/出口节点会被照样下发新
   // desired revision——正是 §13.4.2「不接受需要立即应用的新 runtime 变化」
-  // 禁止的行为。**任一侧 maintenance 就按维护处理**：RELAY 的新 runtime 要同时
+  // 禁止的行为。**任一侧 maintenance 就按维护处理** RELAY 的新 runtime 要同时
   // 落在两侧，只放行一侧等于把半态写进数据面。其余 lifecycle 取值原样投影
   // （planTunnelActions 只认 maintenance，disabled / retiring 的处理另属编排层）。
   const anyMaintenance = boundNodes.some((n) => n.lifecycle === "maintenance");
