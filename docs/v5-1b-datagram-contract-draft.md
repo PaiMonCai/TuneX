@@ -1025,6 +1025,27 @@ Agent 侧：**出口半边与入口半边都已落地**（`DatagramEgress` / `Da
 多宿 + 伪造 + 重放的形态（先例：FXP 的 32 字节头 + AEAD），但是**独立 WP**，且需要密钥
 ownership 与轮转设计；本 WP 只做"地址正确"。
 
+**闭环记录（2026-10-05，隔离拓扑 + 本分支镜像）**：
+
+```
+V5-G1A TOTAL PASS=73  FAIL=0        （stream 基线未被破坏）
+V5-G1B TOTAL PASS=77  FAIL=0        （首次全绿）
+PASS | G1B.5 the client reaches the target THROUGH the datagram hop
+PASS | G1B.5 the egress node really hosts a udp runtime for THIS Forward
+```
+
+实现过程中最值得留下的两条教训：
+
+1. **这个字段从 Agent 到编排层要穿过五个"逐字段重建"的边界**（HTTP 入口 / Redis 落库 /
+   传输层返回值 / `parseAgentAck` / 合成 `command_ack` 信封）。少补一个的表现是：**每一层看起来
+   都正常、控制面全绿、两侧账本健康，而面板读到的永远是 `null`** —— 而 Agent 侧一直是对的
+   （实测 `type=*forwarder.DatagramRelay diag_ok=true hop=172.41.20.10:56588`）。所以它现在由一条
+   **机械守卫**看着（`v5-wp5-b2-ack-field-flow.test.ts`）：六处边界逐一定位，窗口内必须同时出现
+   `applied_revision` 与 `hop_local_addr`，并断言锚点唯一（守卫不能空转或在错的位置通过）。
+2. **同一份事实的投递路径在编排层也会分叉**：`createRelayTunnel`（隧道 API）与
+   `reapplyRelayTunnel`（前向 API 的创建/重入 —— Gate 走的正是它）都下发入口腿。第一版只接了
+   一条，于是纠正一次都没触发（出口腿只被应用过 rev1）。现在是一处实现、两处调用。
+
 ---
 
 ## 13. 变更记录

@@ -1496,10 +1496,21 @@ Gate V5-G1A
 > ~~~text
 > WP5-B0  datagram 语义契约         DONE（上文链接；§9 八项决策已冻结）
 > WP5-B1  UDP DIRECT               **DONE**（Gate V5-G1B GREEN 76/0）
-> WP5-B2  UDP RELAY                **UNBLOCKED**：跳形态已冻结为「datagram 端到端
->                                  （egress 监听 UDP）」；实施规格见契约 §12
+> WP5-B2  UDP RELAY                **DONE**（2026-10-05 真拓扑全绿 77/0，见下）
 > WP5-B3  UDP telemetry/accounting 未开工（分片重组与 packets 计费都在这里）
-> Gate V5-G1B                      **GREEN PASS=76 / FAIL=0**（`scripts/v3-e2e/v5-g1b.py`，证据 `docs/evidence/v5-g1b-result-20261004.txt`）；B2 按契约 §12.3 追加 relay 断言，**不得删除现有 76 条中的任何一条**
+> Gate V5-G1B                      **GREEN PASS=77 / FAIL=0**（`scripts/v3-e2e/v5-g1b.py`，证据 `docs/evidence/v5-g1b-result-20261005.txt`，隔离拓扑 + 本分支镜像）；**B1 的 76 条一条未删**，新增的是 B2 把原「udp RELAY 必须被拒」翻转成「单跳 udp RELAY 必须建立，且客户端的数据报真的穿过跳」——翻转是明写的（契约 §12.5 第 5 条），不是静默删除
+>
+> **B2 真拓扑闭环记录（2026-10-05）**
+>
+> ~~~text
+> V5-G1A  PASS=73 / FAIL=0     stream 基线（tcp/tls/ws）未被 B2 破坏
+> V5-G1B  PASS=77 / FAIL=0     首次全绿
+> ~~~
+>
+> 两次真跑各抓到一个**只可能被真实数据报暴露**的缺陷，都记在契约 §12.5（第 8、9 条）：
+> ① 出口的取证地址在多宿节点上取的是"另一张网"的地址 ⇒ 出口丢弃每一个跳报文，而控制面全绿；
+> ② 该地址必须由入口**发布**、面板在入口 ACK 之后**抬 revision 重发出口腿**来纠正，而这条
+> 字段要穿过五个逐字段重建的边界（少一个就静默失效 ⇒ 已有机械守卫）。
 > ~~~
 >
 > **§9 冻结摘要（2026-10-05，逐条依据见契约 §9）**
