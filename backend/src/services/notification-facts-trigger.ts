@@ -164,3 +164,68 @@ export async function runForwardDenialNotifications(
   await deps.deliver(facts, channels);
   return { considered: source.items.length, built: facts.length, rejected, skipped: skipped.length, delivered: true };
 }
+
+/* ================================================================== */
+/* 恢复事实：与拒绝**配对**的那一半                                      */
+/* ================================================================== */
+
+/**
+ * 一条**尚未配对恢复**的拒绝（由注入的账本读取提供）。
+ *
+ * 为什么是"账本读取"而不是"再查一次隧道状态"：一条拒绝是否已经说过、以及是否已经配过恢复，
+ * 是**投递事实**，只有账本知道。用隧道当前状态去反推"上次说过没有"会让同一件事有两个判断
+ * 入口，而本仓已经为"同一个判断写两遍"付过学费。
+ */
+export interface OpenDenialEpisode {
+  readonly forward_id: number;
+  /** 展示名来自来源行（账本不存名字）；不允许从别处猜一个出来。 */
+  readonly name: string;
+}
+
+/**
+ * 从"未配对的拒绝"里选出**已经不再被拒**的那些，作为恢复事实的种子。
+ *
+ * 只在这里合成 `AttentionItem`：attention 派生的是**当前**状态，而"曾经被拒、现在好了"是
+ * 一条**时间上的**事实，只能由配对得到。合成时**只**填四个可确定字段（kind/id/severity/reason_code），
+ * 名字由调用方从来源行给出，其余（错误码、可重试性）一律 `null` —— 恢复事实不该带故障期的字段。
+ */
+export function selectForwardRecoveryFacts(input: {
+  readonly openDenials: readonly OpenDenialEpisode[];
+  /** 本拍仍在拒绝中的转发 id（来自 attention 派生，不另算一遍）。 */
+  readonly stillDeniedIds: ReadonlySet<number>;
+  readonly occurredAtOf: (forwardId: number) => Date | null;
+}): SelectResult {
+  const seeds: NotificationFactSeed[] = [];
+  const skipped: SkippedDenialFact[] = [];
+  const seen = new Set<number>();
+
+  for (const episode of input.openDenials) {
+    if (seen.has(episode.forward_id)) continue;
+    seen.add(episode.forward_id);
+    // 仍在拒绝中 ⇒ 还没有恢复，这一拍不说。
+    if (input.stillDeniedIds.has(episode.forward_id)) continue;
+
+    const occurredAt = input.occurredAtOf(episode.forward_id);
+    if (!occurredAt) {
+      skipped.push({ forward_id: episode.forward_id, reason: "occurred_at_unavailable" });
+      continue;
+    }
+    seeds.push({
+      item: {
+        kind: "forward",
+        id: episode.forward_id,
+        name: episode.name,
+        // 好消息与故障分档：混档会污染"需要人处理"的筛选。
+        severity: "info",
+        reason_code: "forward_apply_recovered",
+        // 恢复事实不带故障期的字段 —— 写 `null` 是"我不知道"，不是"它没有"。
+        apply_error_code: null,
+        retryable: null,
+      },
+      occurred_at: occurredAt,
+      detail_code: null,
+    });
+  }
+
+  return { seeds, skipped };
+}

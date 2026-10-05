@@ -14,6 +14,7 @@ import {
   FORWARD_DENIAL_REASON,
   runForwardDenialNotifications,
   selectForwardDenialFacts,
+  selectForwardRecoveryFacts,
 } from "../../notification-facts-trigger.ts";
 import type { DeliverableNotification, NotificationChannel } from "../../notification-delivery.ts";
 import type { AttentionItem } from "../../attention.ts";
@@ -162,5 +163,56 @@ describe("V5-WP18 触发器：编排", () => {
     // 扫描时刻的通知（那正是 DoD3 的反例）。
     expect(summary.built).toBe(0);
     expect(summary.delivered).toBe(false);
+  });
+});
+
+/* ================================================================== */
+/* 恢复事实：与拒绝配对的那一半                                          */
+/* ================================================================== */
+
+describe("V5-WP18 触发器：恢复事实", () => {
+  const rows = new Map<number, Date>([[42, new Date("2026-10-05T03:00:00.000Z")]]);
+  const sel = (over: Partial<{ openDenials: { forward_id: number; name: string }[]; still: number[] }> = {}) =>
+    selectForwardRecoveryFacts({
+      openDenials: over.openDenials ?? [{ forward_id: 42, name: "office-web" }],
+      stillDeniedIds: new Set(over.still ?? []),
+      occurredAtOf: (id) => rows.get(id) ?? null,
+    });
+
+  test("未配对的拒绝 + 已不再被拒 ⇒ 一条恢复事实（新码 / info / 来源表时刻）", () => {
+    const { seeds, skipped } = sel();
+    expect(skipped).toEqual([]);
+    expect(seeds).toHaveLength(1);
+    expect(seeds[0]!.item.reason_code).toBe("forward_apply_recovered");
+    expect(seeds[0]!.item.severity).toBe("info");
+    expect(seeds[0]!.item.id).toBe(42);
+    expect(seeds[0]!.item.name).toBe("office-web");
+    expect(seeds[0]!.occurred_at.getTime()).toBe(rows.get(42)!.getTime());
+  });
+
+  test("**仍在拒绝中 ⇒ 不产生恢复事实**（同一台 Forward 不能被同时说成坏了和好了）", () => {
+    expect(sel({ still: [42] }).seeds).toEqual([]);
+  });
+
+  test("恢复事实**不带故障期的字段**：错误码与可重试性一律 null（不是编一个出来）", () => {
+    const { seeds } = sel();
+    expect(seeds[0]!.item.apply_error_code).toBeNull();
+    expect(seeds[0]!.item.retryable).toBeNull();
+    expect(seeds[0]!.detail_code).toBeNull();
+  });
+
+  test("取不到来源时刻 ⇒ 跳过并说明原因（绝不回落到「现在」，否则幂等键每拍变）", () => {
+    const { seeds, skipped } = selectForwardRecoveryFacts({
+      openDenials: [{ forward_id: 99, name: "x" }],
+      stillDeniedIds: new Set(),
+      occurredAtOf: () => null,
+    });
+    expect(seeds).toEqual([]);
+    expect(skipped).toEqual([{ forward_id: 99, reason: "occurred_at_unavailable" }]);
+  });
+
+  test("同一转发出现两条未配对拒绝 ⇒ 只产生一条恢复（重复的事实就是重复的通知）", () => {
+    const { seeds } = sel({ openDenials: [{ forward_id: 42, name: "a" }, { forward_id: 42, name: "b" }] });
+    expect(seeds).toHaveLength(1);
   });
 });
