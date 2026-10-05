@@ -28,7 +28,7 @@ export default async function AdminNodeDetailPage({ params }: { params: Promise<
     detail = await nodeDetailServer(nodeId);
   } catch {
     return (
-      <AppShell title={t("admin.nodeDetailTitle")} subtitle={t("admin.management")} adminMode showToaster={false}>
+      <AppShell title={t("admin.nodeDetailTitle")} subtitle={t("admin.management")} adminMode>
         <div className="flex flex-col items-center gap-3 py-20 text-center text-sm text-[var(--muted-foreground)]">
           <p>{t("common.loadFailed")}</p>
           <Link href="/admin/nodes" className="text-[var(--primary)] underline">
@@ -45,7 +45,6 @@ export default async function AdminNodeDetailPage({ params }: { params: Promise<
       title={`${t("admin.nodeDetailTitle")} · ${detail.node_id}`}
       subtitle={t("admin.management")}
       adminMode
-      showToaster
     >
       <Suspense fallback={<div className="h-96 animate-pulse rounded-lg bg-[var(--muted)]" />}>
         <NodeDetailManager nodeId={nodeId} initial={detail} />
