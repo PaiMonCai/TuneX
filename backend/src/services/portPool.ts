@@ -1,60 +1,10 @@
 /**
- * v3 端口分配器（WP3，DEVELOPMENT.md §7.6）。
+ * Per-node port ownership allocator.
  *
- * ── 两层真相：DB 是终审，Redis 只是并发协调 ──
- * 端口**所有权**的唯一真相源是 `node_port_lease` 上的
- * `UNIQUE(node_id, port)`。Redis NX 锁只负责把「同一 (node, port) 的并发分配」
- * 从「每次都打到 DB 唯一约束」降为「通常只打一次」。因此三条硬约束：
- *
- *   1. **抢到锁 ≠ 拿到端口**：`acquire` 在锁内仍走 DB insert，撞 P2002 是
- *      **正常路径**（说明别人已经持有），调用方应继续尝试下一个候选端口，
- *      而不是当成故障。
- *   2. **锁必须有 TTL**：进程在「拿到锁 → 释放锁」之间崩掉，不能让别人
- *      永远分不到这个端口（{@link DEFAULT_LOCK_TTL_S}）。
- *   3. **锁丢了不代表租约失效**：{@link leaseHolder} / {@link reconcileLeases}
- *      只认 DB 行，绝不用「Redis 里没有这个 key」反推「这个端口现在空闲」——
- *      Redis 可以是 fake/被 flush/正在重启。
- *
- * ── ingress 与 egress 共用同一物理 namespace ──
- * `lease_type`（ingress/egress）只是**元数据**，不构成隔离：DB 唯一键是
- * `(node_id, port)`，与方向无关。这正是 schema 注释里「否则 BOTH 节点会用同一
- * 端口同时双绑 ingress/egress」的意思——一个角色为 `both` 的节点，它的入口池与
- * 出口池哪怕在管理端配成两个区间，也共用同一张物理端口表。
- *
- * 本模块不负责校验「区间不重叠」（那是节点配置的职责，见 §7.6「BOTH Node 同
- * port 冲突」），本模块负责的是：**只要两次分配来自同一个 node_id，
- * 无论方向，都必须在物理端口上互斥**。区间重叠在这里表现为 `port_taken`，
- * 由调用方改成可解释的 error，而不是两个 listener 各自 bind 上同一个端口。
- *
- * 反过来说：**不同 node_id 天然隔离**。入口节点 7 拿 19000、出口节点 8 也拿
- * 19000 完全合法——它们是两台物理机。
- *
- * ── legacy DIRECT 端口不可被抢占 ──
- * 存量 DIRECT 隧道仍由 `socket/port-allocator.ts`（legacy）在**入口组**内做
- * 确定性分配，最终落在 `tunnel.listen_port` 上，agent 直接 bind。那条路径没有
- * `node_port_lease` 行，因此**本模块对 DIRECT 端口一无所知**。
- *
- * 这就是 `AcquirePortInput.reservedPorts` 存在的原因：调用方（编排器/建隧道
- * 端点）必须把「同节点现有 DIRECT 隧道的 `listen_port`」灌进来，v3 分配才会
- * 避开它们。否则新分配的 v3 端口会与存量 agent 正在 bind 的端口撞号——而那种
- * 撞号**没有任何 DB 约束兜底**，比 v3 内部撞号危险得多。
- *
- * ── released 行仍占用唯一键（WP1 schema 的既有决定）──
- * `@@unique([node_id, port])` 不带 `status` 过滤，而 `releaseLease` 是**软删除**
- * （`status='released'`，保留行供对账，见 model 注释）。于是「端口用过一次就
- * 永久不能再分」会是一个真实的 bug——长期运行的节点会把区间耗尽。
- *
- * 因此 `acquirePort` 的写入是 **revive-or-create**：先原子地「认领」一条已释放
- * 的行（`updateMany` 带 `status='released'` 守卫，MySQL 行锁保证并发下第二个
- * 调用方看到 0 行），认领不到再 `create`。这样 DB 唯一约束依然是一切的所有权
- * 终审（P2002 = 真被占用），端口本身仍可回收再用。
- *
- * ── 不做什么（明确的边界）──
- *  · 不接路由/HTTP：WP3 只交付服务层 + 单测，WP8 编排器才消费它。
- *  · 不做 agent 实际 bind 探测：端口在 OS 层的可用性由 agent 的
- *    `EADDRINUSE` 反馈，控制面只保证「自己不再重复分配」。
- *  · 不做 Node.role 校验：role 只是能力声明，端口物理互斥与它无关（§7.6
- *    要求 BOTH 节点同 port 冲突，那正是 role 无关的物理互斥）。
+ * Active/reserved leases are the authoritative ownership ledger for revisioned
+ * runtimes. Compatibility listeners that predate lease rows must still be
+ * supplied as externally occupied ports so a new allocation cannot collide with
+ * a live listener.
  */
 import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
@@ -584,7 +534,7 @@ export async function acquirePort(
   //
   // 但**本隧道自己的 runtime 占的端口要放行**：否则把 listen_port 改成它正在用的那个值
   // （幂等编辑 / 失败重试 / 还原夹具）会被自己挡回去，症状是 502 port_taken 但端口明明
-  // 就是这条隧道在听（实测踩到过）。
+  // It may already be the listener owned by this same Forward.
   const ownRuntimeIds = new Set(input.ownRuntimeIds ?? []);
   for (const holder of await agentUsedPorts(input.nodeId)) {
     if (!isValidPort(holder.port)) continue;
