@@ -20,9 +20,9 @@ export type PaymentMethod = "epay" | "bepusdt" | "heleket";
 export type BalanceLogType = "topup" | "plan" | "commission_transfer" | "admin_adjust";
 export type PermissionLevel = "read" | "write";
 export type LicenseType = "none" | "personal" | "business";
-/** v3 节点角色（WP1 schema enum NodeRole）。NULL = 尚未声明，不可默认成 ingress */
+/** 节点角色。NULL = 尚未声明，不可默认成 ingress。 */
 export type NodeRole = "ingress" | "egress" | "both";
-/** v3 出口池默认策略（schema enum LBStrategy）；池内策略优先于节点默认值 */
+/** 出口池默认策略；池内策略优先于节点默认值。 */
 export type LBStrategy = "round" | "rand";
 
 export interface User {
@@ -46,7 +46,7 @@ export interface User {
   status: Status;
   created_at: string;
   updated_at: string;
-  /** TEN-03：邮箱验证时间；null = 未验证（0.1 阶段软约束，不阻断登录） */
+  /** 邮箱验证时间；null = 未验证。 */
   email_verified_at: string | null;
   // 关联（可选，由后端 include 决定）
   user_plan?: UserPlan | null;
@@ -82,10 +82,7 @@ export interface AdminResourceMeta {
   granted: PermissionLevel | null;
 }
 
-/* ------------------------------------------------------------------ *
- * TEN-01 工作空间（Workspace / Membership / Invite）
- * 字段与 backend/prisma/schema.prisma 及 backend/src/routes/workspaces.ts 对齐。
- * ------------------------------------------------------------------ */
+/* Workspace / Membership / Invite —— 与后端 schema/routes 对齐。 */
 
 /** personal = 注册时自动创建的个人空间；team = 手动创建的团队空间 */
 export type WorkspaceKind = "personal" | "team";
@@ -271,26 +268,25 @@ export interface Node {
   updated_at: string;
   online?: boolean;
   traffic?: number;
-  // ── v3 增量字段（WP1 schema：全部可空，存量行 = 尚未声明 / 从未配置）──
   /**
-   * v3 节点角色。NULL = 尚未声明（WP2 回填策略「不改 / 不猜」的产物）。
+   * 节点角色。NULL = 尚未声明；不得替历史节点猜成 ingress。
    * 面板必须显式展示「未声明」并允许设置，不得默认成 ingress —— 那会让
    * 未声明节点被误当入口参与调度（DEVELOPMENT.md §7.1）。
    */
   role?: NodeRole | null;
   /** 最近一次心跳；NULL = 从未心跳（不替代 offline-detector 的 Redis 防抖） */
   last_seen_at?: string | null;
-  /** 可分配端口区间（WP3 NodePortLease 的分配域）；NULL = 未配置 */
+  /** 可分配端口区间；NULL = 未配置。 */
   port_range_min?: number | null;
   port_range_max?: number | null;
   /** egress/both 节点的默认池策略；NULL = 回落 round */
   lb_strategy?: LBStrategy | null;
   /**
-   * 节点生命周期（WP5 schema 枚举 NodeLifecycle，默认 active）。
+   * 节点生命周期，默认 active。
    *
    * 与 `connection` 正交（§13.4.1）：连接是**事实**，生命周期是**期望**。
    * 「维护中」的在线节点不是故障，所以面板把它渲染成中性的 maintenance
-   * 徽章，而不是红色 error——WP6 的 health 视图据此展示，不做第二套判定。
+   * 徽章，而不是红色 error；health 视图据此展示，不做第二套判定。
    */
   lifecycle?: NodeLifecycleValue | null;
   /**
@@ -303,7 +299,6 @@ export interface Node {
   lifecycle_note?: string | null;
   /** 最近一次 lifecycle 变更时刻（展示「维护了多久」）。 */
   lifecycle_updated_at?: string | null;
-  // ── v3 增量字段（WP7 per-node credential）──
   /**
    * 服务端**绝不下发** `node_credential_hash`（列表/详情接口不含该列），
    * 前端只凭这三个派生状态渲染凭据区块：
@@ -319,14 +314,12 @@ export interface Node {
 }
 
 /**
- * v3 隧道模式（schema enum TunnelMode，DEVELOPMENT.md §2.1）。
- * NULL = 存量行 / 未参与 v3 编排的 legacy DIRECT 隧道，**不得**默认成 direct
- * 之外的任何值——存量隧道在补列当口就是「未声明」，与 NodeRole 同理。
+ * 兼容 Tunnel 的模式。NULL = 补列前存量行，必须保持“未声明”，不得自行猜成 direct/relay。
  */
 export type TunnelMode = "direct" | "relay";
 
 /**
- * v3 隧道 apply 状态机（schema 注释 / DEVELOPMENT.md §4.1）。
+ * 兼容 Tunnel 的 apply 状态机。
  *
  *   pending   —— 已生成期望状态（desired_status + config_revision），尚未下发
  *   applying  —— 已下发，等待 Agent ACK
@@ -354,15 +347,15 @@ export interface Tunnel {
   forward_addresses: string[];
   forward_addresses_protocol: string[] | null;
   /**
-   * V5-WP0/A1 行级协议事实（`Tunnel.forward_protocol` 列）。
+   * 行级协议事实（`Tunnel.forward_protocol` 列）。
    *
    * 只给 **mock 的 store** 用：mock 的行是 DB 行（含 `remote_host` 等运行态列）的
    * 镜像，而 `forward_protocol` 是 `PortForward.protocol` 投影的唯一来源，
-   * mock 若不存它就必然把每条 Forward 谎报成 `tcp`（V5-G0 抓到的正是这种形态）。
+   * mock 必须保留它，否则历史协议会被错误回落成 `tcp`。
    * 真实 `/api/tunnels` 的响应是否携带该列由后端决定，前端不依赖它。
    */
   forward_protocol?: string | null;
-  /** V5-WP5-A1：tls 入口的证书/私钥路径列（仅路径，无密钥内容）。 */
+  /** tls 入口的证书/私钥路径列（仅路径，无密钥内容）。 */
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
   load_balance_type: LoadBalanceType;
@@ -386,11 +379,8 @@ export interface Tunnel {
   // 运行态（由 agent 上报，非 schema 列）
   online?: boolean;
   client_count?: number;
-  // ---------------------------------------------------------------
-  // v3 RELAY 增量字段（WP1 schema：全部可空，存量行 = 未参与 v3 编排）
-  // ---------------------------------------------------------------
   /**
-   * v3 隧道模式。NULL = 存量 legacy DIRECT（§7.1「不改 / 不猜」）。
+   * Tunnel 模式。NULL = 存量 legacy 行；不得替它猜模式。
    * 面板必须显式渲染「未声明」，不得默认成 direct。
    */
   tunnel_mode?: TunnelMode | null;
@@ -421,7 +411,7 @@ export interface Tunnel {
   apply_error?: string | null;
   last_applied_at?: string | null;
   /**
-   * RELAY 编排步骤摘要（WP8 十步有序的只读回放，用于解释「卡在哪一步」）。
+   * RELAY 编排步骤摘要（只读回放，用于解释“卡在哪一步”）。
    * 后端返回 steps 列表；前端只展示，不据此发明状态。
    */
   apply_steps?: TunnelApplyStep[] | null;
@@ -440,9 +430,9 @@ export interface TunnelCreateInput {
   bandwidth_limit?: number | null;
   client_limit?: number | null;
   ip_limit?: number | null;
-  // ── v3（WP11 Tunnel RELAY API 契约；后端未落地字段一律不下发）──
+  // Legacy Tunnel orchestration fields.
   /**
-   * v3 模式：direct = 单跳到 remote_host/remote_port；relay = 双跳经出口节点。
+   * direct = 单跳到 remote_host/remote_port；relay = 双跳经出口节点。
    * 缺省 = 交给后端按 forward_addresses 推导（存量路径不变）。
    */
   tunnel_mode?: TunnelMode;
@@ -795,8 +785,8 @@ export interface TunnelUpdateInput {
   client_limit?: number | null;
   ip_limit?: number | null;
   order_by?: number;
-  // ── v3（WP11 契约；只改 desired state，revision 自增由控制面负责）──
-  /** v3 模式切换（direct ↔ relay）；relay 必须给出口组/池 */
+  // Legacy Tunnel desired-state fields.
+  /** 模式切换（direct ↔ relay）；relay 必须给出口组/池。 */
   tunnel_mode?: TunnelMode;
   out_node_group_id?: ID | null;
   egress_pool_id?: ID | null;
@@ -807,14 +797,9 @@ export interface TunnelUpdateInput {
   desired_status?: TunnelDesiredStatus;
 }
 
-/* ================================================================== */
-/* WP13 Tunnel Web —— v3 隧道编排运行态契约（mock 标注见 api.tunnels）   */
-/* ================================================================== */
+/* Legacy Tunnel runtime compatibility types. */
 
-/**
- * WP8 十步编排的一步（只读回放）。前端只用于解释「卡在哪一步」，
- * 不据此推导状态机（状态真相是 apply_status）。
- */
+/** 编排步骤的只读回放；状态真相始终是 apply_status。 */
 export interface TunnelApplyStep {
   step: string;
   ok: boolean;
@@ -822,27 +807,27 @@ export interface TunnelApplyStep {
   error?: string | null;
 }
 
-/** retry / suspend / resume 三个运行操作的统一响应（WP11 unified orchestrator）。 */
+/** retry / suspend / resume 三个兼容运行操作的统一响应。 */
 export interface TunnelRuntimeAction {
   tunnel: Tunnel;
   /** 操作后隧道进入的状态（前端据此刷新徽章，不自行推断） */
   apply_status: TunnelApplyStatus;
-  /** 操作后的 revision（retry 会 +1；suspend/resume 不变） */
+  /** 操作后的 revision；retry 重放当前 revision，resume 可推进 desired revision。 */
   config_revision: number | null;
   /** 编排是否已重入（幂等键命中时 true，不算失败） */
   reentered?: boolean;
 }
 
-/** 隧道列表查询（WP11：按 apply_status 过滤替代 legacy status） */
+/** 兼容 Tunnel 列表查询。 */
 export interface TunnelListQuery {
   page?: number;
   page_size?: number;
   keyword?: string;
   /** legacy 开关列过滤 */
   status?: Status;
-  /** v3 apply 状态机过滤（pending/applying/active/error/suspended） */
+  /** apply 状态过滤（pending/applying/active/error/suspended）。 */
   apply_status?: TunnelApplyStatus;
-  /** v3 模式过滤 */
+  /** 模式过滤。 */
   tunnel_mode?: TunnelMode;
   /** 只看「待下发」：applied_revision < config_revision */
   pending_only?: boolean;
@@ -1031,7 +1016,7 @@ export interface PortForward {
   id: ID;
   name: string;
   /**
-   * V5-WP5-A1：这一行的**协议事实**（后端投影：`forward_protocol` 优先，回落
+   * 这一行的**协议事实**（后端投影：`forward_protocol` 优先，回落
    * legacy `tunnel_type`，所以协议列出现之前的行也会报告它当时是什么）。
    *
    * 联合类型给出本契约开放的取值（`tcp` / `tls` / `ws` / `udp`，见
@@ -1041,12 +1026,12 @@ export interface PortForward {
    */
   protocol: ForwardProtocolFact;
   /**
-   * V5-WP5-A1：当前运行时是否开放这个协议（后端 `protocol_supported`）。
+   * 当前运行时是否开放这个协议（后端 `protocol_supported`）。
    * `false` = 历史/未开放的协议事实：按原样展示，**不得**替换成缺省值。
    */
   protocol_supported: boolean;
   /**
-   * V5-WP5-A1：tls 入口的节点本地证书/私钥路径（**只有路径**，永远没有密钥内容）。
+   * tls 入口的节点本地证书/私钥路径（**只有路径**，永远没有密钥内容）。
    * 后端 `forwardView` 对非 tls 行投影 `null`，所以这里恒有两个字段。
    * 详情页展示它们，编辑器用它们做 tls 路径编辑的「当前值」。
    */
@@ -1069,9 +1054,9 @@ export interface PortForward {
   apply_status: TunnelApplyStatus | null;
   config_revision: number | null;
   applied_revision: number | null;
-  /** V4-WP1：指向最新 desired snapshot 的指针（前端作审计展示，不自行解析） */
+  /** 指向最新 desired snapshot 的指针（前端作审计展示，不自行解析）。 */
   desired_revision_id: number | null;
-  /** V4-WP1：最新 revision 号（与 config_revision 同值）；保存时作 expected_revision 回传 */
+  /** 最新 revision 号（与 config_revision 同值）；保存时作 expected_revision 回传。 */
   latest_revision: number;
   apply_error_code: string | null;
   apply_error: string | null;
@@ -1088,17 +1073,17 @@ export interface PortForwardCreateInput {
   egress_node_id?: ID | null;
 }
 
-/** V4 product API payload. Forward owns the explicit mode + ingress choice. */
+/** Forward 创建载荷：Forward 显式拥有 mode 与 ingress 选择。 */
 export interface ForwardCreateInput extends PortForwardCreateInput {
   mode: "direct" | "relay";
   ingress_node_id: ID;
   /**
-   * V5-WP5-A1：创建时选定的协议。省略时后端按 V4 语义回落 `tcp`；界面总是显式
+   * 创建时选定的协议。省略时后端兼容回落 `tcp`；界面总是显式
    * 携带（创建了什么就发什么）。取值只能是契约白名单里的值。
    */
   protocol?: ForwardProtocolFact;
   /**
-   * V5-WP5-A1：`tls` 入口监听使用的证书/私钥路径 —— **只有路径**，绝不含密钥内容
+   * `tls` 入口监听使用的证书/私钥路径 —— **只有路径**，绝不含密钥内容
    * （§6.1：证书归运维，以节点本地文件存在）。非 tls 协议携带它们是 400，因此
    * 只能经 `forwardProtocolFields()` 生成，保证非 tls 的请求里这两个键不存在。
    */
@@ -1107,10 +1092,10 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
 }
 
 /**
- * V4-WP1 全字段编辑 patch（与后端 ForwardPatchSchema 同形）。
+ * Forward 全字段编辑 patch（与后端 ForwardPatchSchema 同形）。
  * `expected_revision` 是可选的乐观并发凭据；缺失 = 首次请求或有意跳过检查。
  *
- * V5-WP5-A1（后续修订）：`tls_cert_path` / `tls_key_path` **已被 patch schema 接受**
+ * `tls_cert_path` / `tls_key_path` 被 patch schema 接受；
  * —— 证书路径属于一条转发的 desired 配置，运维换文件名不该被迫删了重建（重建还会
  * 重新分配监听端口）。规则与创建完全相同（只有 tls 能带、且必须成对）。
  *
