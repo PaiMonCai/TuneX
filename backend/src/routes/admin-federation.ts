@@ -1,10 +1,10 @@
 /**
- * V5.5 Federation —— Admin Console 接口（WP14）。
+ * V5.5 Federation —— Admin Console 接口（）。
  *
  * 挂载点：`/api/admin/federation`（需要管理员身份 + `federation` 资源权限，
  * 由 app.ts 的 `/api/admin/*` 两道闸统一保证）。
  *
- * **这些接口只属于 Admin Console**（契约 §9.4.1 / §10）：普通用户永远看不到
+ * These interfaces belong only to Admin Console: ordinary users never see
  * trust / grant / remote lease。这里不复制任何业务真相：enable/disable 只改开关，
  * 邀请/握手/轮转/撤销都是信任层动作，租约与用量在各自模块里。
  *
@@ -237,7 +237,7 @@ adminFederationRoutes.post("/key/rotate", async (c) => {
 });
 
 /* ---------------------------------------------------------------- */
-/* WP15 / WP16 —— Admin Console 的授予、租约与用量视图                */
+/*  /  —— Admin Console 的授予、租约与用量视图                */
 /*                                                                    */
 /* 这些端点只服务管理界面与 Gate：它们**不**参与数据面决策，也不复制     */
 /* 任何真相（grant/lease 的权威永远是各自的表）。                        */
