@@ -37,6 +37,7 @@ import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { nodeAdminRoutes } from "./routes/node-admin.ts";
 import { nodeLifecycleRoutes } from "./routes/node-lifecycle.ts";
 import { nodeHealthRoutes } from "./routes/node-health.ts";
+import { lookingGlassRoutes } from "./routes/looking-glass.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
@@ -206,6 +207,8 @@ export function createApp() {
   // health 是**读**接口（判定由 services/node-health.ts 的纯函数给出），
   // 因此不新增限流规则，走 api-global。
   app.route("/api/admin", nodeHealthRoutes);
+  // V5-WP19-D：Looking Glass（默认关闭；打开见 LOOKING_GLASS_ENABLED）。
+  app.route("/api/looking-glass", lookingGlassRoutes);
   // V5-WP18.5：平台公告（发布 / 撤回 / 列全部）。前缀 `/admin/announcements` 尚未登记进
   // `ADMIN_RESOURCES`（那是 WP18.6）：adminPermissionGuard 对未登记前缀一律 403，
   // 只放行 super_admin —— 契约 F7「不登记 = 只有超管」，也正是 18.6 断言「登记生效」的起点。
