@@ -73,6 +73,39 @@
 - ⇒ 今天 udp/tls/ws 的数据面事实是「上报 200、库里 JSON 有、**面板接口与 UI 永远读不到**」，
   即第三个「白名单陷阱」（`node-state.ts:571-573`、`:576-577` 已两次点名）。
 
+#### 1.4.1 实测更正（2026-10-05，WP19-F 开工时核实）：`diag` 在哪里丢、在哪里**不**丢
+
+> 上面 §1.4 的结论方向对，但"丢在哪"说错过一次（Lead 已更正）。写下来是为了下一个人
+> **不用重新踩一遍**——这条缺陷有很强的误导性：它看起来很像是"落库路径丢字段"。
+
+- **不丢**（落库路径是干净的）：
+  - `node-state.ts:validateStateReport` 的 `tunnels` 白名单只逐项校验 `id`/端口/`revision`/
+    `targets`，**未知字段整体透传**；投影里也有 `tunnels`。实测（在本工作树跑）：
+    `validateStateReport({version, tunnels:[{id,mode,ingress_port,diag:{...}}]})` 的
+    `report.tunnels[0].diag` **原样在**（含 `hop_local_addr`）；
+  - `submitStateReport` 写的是 `tunnels: report.tunnels`（整块 JSON 列），所以
+    `node_state_report.tunnels[].diag` **一直有值**；
+  - 判据不止代码：`forward-contract.ts:datagramHopPeerFor`、`scheduler.ts`、`runtime-reconcile-sink.ts`
+    今天就靠 `tunnels[].diag.hop_local_addr` 工作，① 的出口取证纠正在真拓扑上生效（G1B 77/0）。
+- **丢**（面板的**类型化读路径**零消费点）：
+  - `node-state.ts:ReportedTunnel` / `StateSnapshot` 没有 typed `diag`，全仓没有一处把
+    per-tunnel `diag` 当成一等事实读出来（`backend/src`、`web/src` 都没有消费点）；
+  - `node-health.ts:parseReportedRuntimes` 把上报的 `tunnels` 重建成 runtime 列表时只留
+    `id/mode/ingress_port/egress_port/revision` ⇒ **`diag` 在这里被丢掉**，于是 health 遥测视图
+    （`GET /api/admin/node/:id/health` 的 `telemetry.runtime`）与 UI 永远看不到；
+  - `web/src/lib/types.ts:1296` 的隧道快照类型里没有 `diag`（**前端类型待补**，见 §5 WP19-F）。
+- **为什么 G1B.12 却读得到**：gate 直接
+  `SELECT IFNULL(tunnels,'[]') FROM node_state_report`（`scripts/v3-e2e/v5-g1b.py:tunnel_diag`），
+  **绕过了面板接口**。这正好反过来证明"面板零消费点"，而不是"库里没有"。
+- **后果的准确表述**：不是"少一个字段"，而是**一个把每个报文都丢掉的出口，和一个空闲的出口
+  在面板上长得一模一样**（`drops` 读不到；且 Agent 侧零值 `omit`，"没有 diag 块"与"diag 里全 0"
+  也是两个事实）。
+- **修法（已交付，见 §5 WP19-F）**：落库投影显式带上 `diag`（坏形状整键丢弃、绝不 400）+
+  类型化读取视图 `services/tunnel-diag.ts` + 面板读路径接线 + 源码级机械守卫。
+  **不动** ACK 路径：诊断是观测路径，等一个上报周期是可接受的；把观测塞进可用性路径
+  （控制协议封闭键集 + `parseAgentAck`/合成 ack/账本重放 + Go `control`）不成比例，
+  而且会让正确性依赖遥测。
+
 ### 1.5 datagram 事实形状已冻结：**没有连接数**
 - `docs/v5-1b-datagram-contract-draft.md` §4.4（`:330-349`）与 §6.1（`:443-461`）冻结
   `mappings_active/created/expired/rejected`、`packets_in|out`、分方向 `bytes_in|out`、
@@ -324,6 +357,29 @@
 | WP19-D | Looking Glass | 新 action + 白名单 + 配额 + 审计 + 视图；复用 D8 四处 | O2/O6/O7/O8 |
 | WP19-E | 带宽 / 跳测 | Go 内建等价物 或 明确不做 | O5 |
 
+### 5.1 WP19-F 交付记录（2026-10-05，④）
+
+- **落地范围**（Lead 裁决：只做**上报侧一等化**，**不动 ACK 路径**——诊断是观测路径，
+  不塞进可用性路径）：
+  - `backend/src/services/tunnel-diag.ts`（新）：`diag` 的**类型化读取视图**。键集开放
+    （未知键照样进视图）、坏值（嵌套/NaN/Inf）不进视图、视图有界且越界标 `truncated`、
+    **永不回写原始块**（`hop_local_addr` 通路与 G1B.12 的原始 JSON 必须原样）；
+  - `backend/src/services/node-state.ts`：`ReportedTunnel.diag` typed；新增 `projectReportedTunnels`
+    显式投影（`diag` 原样带走，坏形状整键丢弃、绝不 400）；快照读取/重连快照（重放面）
+    继续整块透传并加注；
+  - `backend/src/services/node-health.ts`：`parseReportedRuntimes` 带上 `diag`
+    （**这里就是过去丢它的那个重建点**，`undefined` ≠ `{ facts: {} }`）；
+  - `backend/src/services/node-health-service.ts`：health 遥测视图新增
+    `telemetry.runtime.diags`（按 runtime id 索引）——**面板接口第一次能读到 per-tunnel diag**；
+  - 机械守卫 + 行为断言：`backend/src/services/__tests__/v5-wp19/`（源码级边界守卫，
+    锚点唯一 + 窗口内**代码级**片段；另加"原始通路读点仍读原始 `tunnels[].diag`"的锚点，
+    见 Lead 追加要求）。
+- **明确未做 / 待补**：`web/src/lib/types.ts`（前端类型与展示）**待补**，本 WP 不触碰 `web/`
+  （范围外）；ACK 路径按裁决不动；`diag` 不进 `runtime_counts`（封闭键集）。
+- **Gate**：G19.1 的"面板接口可见"现在落在 `GET /api/admin/node/:id/health` 的
+  `telemetry.runtime.diags`；G19.2（未知 diag 键不毁上报）由行为断言直接钉住。
+
+
 推荐顺序：**F → C → D → B → E**（F 是既有缺陷收口、成本最低；C 不需开放决策；
 B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每个自带 Gate，不改 desired 语义。
 
@@ -401,3 +457,4 @@ B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每�
 |---|---|---|
 | 2026-10-05 | 初版：六问回答（D1–D12 + O1–O9）、WP19-F 收口建议、Gate G19.1–G19.15 | V5-WP19-C0（草案，待评审） |
 | 2026-10-05 | Lead 裁决（§4.0）：O1+O4 冻结为"独立档案表、只 INSERT、24h 原始 + 30d 小时桶、永不作为判定输入"，并正式关闭既有开放项"是否保留观测历史"；O2 冻结为"新 action + 白名单 + 默认关闭 + 独立 Gate + 先过安全评审"，排在 WP19-F 之后；O3 冻结为"v1 不产生 udp 延迟事实，且不改 §7 合成语义"；WP19-F 采纳，排在 ① 之后执行。O5–O9 仍开放 | 开发 Lead（核实：Agent 上报 `diag` 但面板零消费点，缺陷成立） |
+| 2026-10-05 | **§1.4.1 实测更正**：`diag` 在落库路径上**一直有值**（`validateStateReport` 透传未知字段、`node_state_report.tunnels` 整块落库；`datagramHopPeerFor` 依赖它，① 的出口取证纠正在真拓扑生效）。真正的丢点是**面板类型化读路径**（`parseReportedRuntimes` 重建 runtime 时丢 diag、无 typed 读路径、Web 类型缺）。Lead 裁决 WP19-F 取 **A（上报侧一等化）**、**不做 B（ACK 侧）**。§5.1 记录交付 | ④ WP19-F（实测与更正由 Lead 确认） |
