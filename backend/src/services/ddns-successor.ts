@@ -9,7 +9,7 @@ import { createHttpDdnsProviderClient, syncForwardDns, type DdnsProviderClient, 
 import { isSealedDdnsConfig, openDdnsCredential } from "./ddns-binding.ts";
 import { candidateRejection } from "./ingress-candidate.ts";
 
-/** 契约 §6：就绪性判据的"最近一次成功写"有效期。 */
+/** 就绪性判据中“最近一次成功写”的有效期。 */
 export const DDNS_PROOF_MAX_AGE_MS = 600_000;
 
 export const DDNS_GATE_REASONS = {
