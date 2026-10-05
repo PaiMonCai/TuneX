@@ -1,8 +1,8 @@
 # V5-WP20 订阅计费运行时契约（周期结算 / 流量周期 / 配额预留）
 
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
-> （§4.0），**WP20-1（计费时钟纯函数）已交付**（§5.1）。除 §5.1 记录的那一个 WP 外，本契约
-> 其余部分仍**不含实现**。
+> （§4.0），**WP20-1（计费时钟纯函数）与 WP20-2（账本与归属 schema）已交付**（§5.1 / §5.2）。
+> 除这两处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -319,7 +319,7 @@ worker 新增一个 tick。
 |---|---|---|---|
 | **WP20-0** | 本契约冻结（含 §7 Gate 与时间夹具规格）+ Lead 对 O2/O3 拍板 | 本文件 + `DEVELOPMENT.md` §4 登记 | — |
 | **WP20-1** | 计费时钟纯函数 | ✅ **已交付**（2026-10-05，见 §5.1）：`backend/src/services/billing-time.ts` + `backend/src/services/__tests__/v5-wp20/billing-time.test.ts`（三进程时区逐字相等） | WP20-0 |
-| **WP20-2** | 账本与归属 schema | migration：`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`(nullable)；`UserPlan` 冻结注释 | WP20-1 |
+| **WP20-2** | 账本与归属 schema | ✅ **已交付**（2026-10-05，见 §5.2）：migration `20261031000000_v5_wp20_subscription_ledger`（`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`(nullable)）+ `UserPlan` 冻结注释 | WP20-1 |
 | **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | `backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时） | WP20-2 |
 | **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | `policy-service.ts#grantPolicyFromPurchase` + `routes/plans.ts` 事务内调用 + `invalidatePolicyCache` | WP20-2 |
 | **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
@@ -393,6 +393,80 @@ for tz in UTC Asia/Shanghai America/Los_Angeles; do \
 
 **DoD 覆盖矩阵（仅针对 WP20-1）**：第 3 条 ✅（真跑子进程，跑不起来即 FAIL，不 skip）；
 第 7 条 ✅（零 schema 改动）；第 8 条 ⏳ 属 WP20-6；第 1/2/4/5/6/9/10/11 条不适用（WP20-2 起）。
+
+### 5.2 WP20-2 落地记录（2026-10-05，分支 `feature/v5-1b-udp-relay`）
+
+**交付物**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/prisma/schema.prisma` | **增量**：`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`（可空）、`Workspace`/`Plan`/`PlanOrder` 反向关系、`UserPlan` 冻结注释。未删/未改任何既有列与约束 |
+| `backend/prisma/migrations/20261031000000_v5_wp20_subscription_ledger/migration.sql` | 纯 additive：2 张新表 + 1 个可空列 + 1 个索引 + 5 个外键；DDL 由 `prisma migrate diff` 生成（不是手写） |
+| `backend/src/services/__tests__/v5-wp20/schema-wp20.test.ts` | 20 条静态不变量断言（读 schema + 迁移文本，不连 DB） |
+
+**冻结的语义与理由（都带反例或实证）**
+
+1. **`state` / `source` 用 VARCHAR + 应用层校验，不新增任何枚举**（DoD 7、§8.1）：订阅「有效」=
+   `started_at <= now < expires_at` 的时间比较，不是状态列。证据：`enum` 总数 30 → 30，
+   `*Status` 集合逐字不变（`Status`/`TopupOrderStatus`/`WithdrawStatus`/`TicketStatus`）。
+   反例：一旦引入 `SubscriptionStatus`，就会出现「订阅状态」与「发放是否有效」两个真相。
+2. **`expires_at` 可空**：`BillingCycle` 含 `lifetime`（F25），终身订阅没有到期点。反例：NOT NULL
+   会逼出一个魔法日期（`9999-12-31`），成为第二个真相 + 边界 bug。
+3. **快照只含商务口径（`plan_name` / `billing_cycle` / `price`），刻意不抄额度数字**。
+   反例：若在此列 `traffic_limit`/`max_tunnels`，读方（含未来的我们）会拿它当额度判定输入 ——
+   那就同时违反 §3.5.3「不做套餐 → 策略的隐式推导」与 §8.3/F5「额度唯一真相是显式发放」。
+   断言里把 `max_tunnels`/`traffic_limit`/`policy_id` 列为**禁止出现**在 `PlanSubscription` 里。
+4. **`PlanOrder.workspace_id` 可空、零回填**：历史行 `NULL` 是合法历史，不猜（R5）；新行归属由
+   WP20-4 应用层保证。反例：若 `NOT NULL` + 默认值，会把「历史未归属」伪装成「归属到某个 workspace」。
+5. **外键取向是被既有删用户流程倒推的，不是偏好**（`routes/admin-extended.ts:400-440`：同一事务里
+   先 `workspace.deleteMany` 删个人 workspace，**之后**才删 `planOrder`）：
+   - `plan_subscription.workspace_id` → **Cascade**。反例：`Restrict` 会让「删用户」在存在订阅时
+     直接抛错，即打破既有管理路径。
+   - `plan_order.workspace_id` → **SetNull**（Prisma 对可空关系的默认，也正好等于 R5 的语义）。
+   - `settlement.order_id` → **SetNull**；`settlement.plan_subscription_id` → **Cascade**。
+   **代价明确接受**：删用户会连带删掉其订阅与结算占位 —— 但这与该流程**本就**删除
+   `planOrder`/`balanceLog`/`userPlan` 是同一口径，不新增语义损失；「账本不可变」靠
+   「没有应用层删除路径」保证（§2 先例语义）。
+6. **`period_key` 形状在此冻结**：`VARCHAR(16)`，值域 `YYYY-MM`（月结）/ `YYYY-MM-DD`（日结），
+   上海时区下的标签；这正是 WP20-1 刻意延期的那个决定。
+
+**事故与修复（必须留痕）**
+
+本 WP 在建过程中发生一次**并发编辑事故**，两个独立原因叠加：
+
+1. 另一位成员提交时用了「把所有工作树改动一起 add」的方式，把**本 WP 尚未提交的在建文件**
+   （`schema.prisma` 的增量、本迁移、本测试）扫进了 `feat(v5-wp17.4)` / `fix(v5-wp21)` 两个提交。
+2. 更危险的一半：`prisma migrate diff` 的输入是「HEAD schema → 当前工作树 schema」的**差集**，
+   在生成期间对方的 `NotificationDelivery` 已进入共享 schema，于是**对方的建表语句被夹进本迁移**，
+   与对方自己的 `20261030000000_v5_wp18_notification_delivery` **重复建表** —— 空库
+   `prisma migrate deploy` 会在本迁移直接失败（`ER_TABLE_EXISTS_ERROR`）。本迁移已删除该段并复核。
+
+**纪律结论（写给后续 WP）**：① 共享 `schema.prisma` 上生成迁移后，必须**复核生成物只含自己的模型**
+（本次的守卫断言即为此）；② 多人在同一工作树并行时**禁止**「一次性 add 全部改动」的提交方式，
+提交只 add 自己名下的路径；③ 迁移的「表」维度需要一条全仓守卫，本次已加：
+`没有任何表被两次建出`（修复前状态会被它抓到，已验证）。
+
+**未决 / 不在本 WP**
+
+- `Plan.policy_id`（套餐 → 策略的**显式**绑定，§3.5.3）不在本 WP ⇒ WP20-4。
+- `prisma generate` 已本地跑通（client 认出新模型）；**迁移未在真实 MySQL 上 apply 过** ——
+  本会话没有 DB 且 §8.6 禁止跑容器门禁，故迁移只做了 `prisma validate` + DDL 复核 + 静态守卫。
+- 观察（交 owner 判断，**不在本 WP 修**）：`20261030000000_v5_wp18_notification_delivery` 里的索引名
+  （如 `notification_delivery_dedupe_channel_key`）与 Prisma 由 `@@unique([dedupe_key, channel_kind])`
+  推导出的默认名（`notification_delivery_dedupe_key_channel_kind_key`，`migrate diff --from-empty` 实测）
+  不一致，后续 `migrate dev`/`diff` 可能把它报成漂移。
+
+**证据**
+
+```
+DATABASE_URL=... bunx prisma validate                      → valid 🚀
+DATABASE_URL=... bunx prisma generate                      → exit 0
+bun test src/services/__tests__/v5-wp20/schema-wp20.test.ts → 20 pass / 0 fail / 62 expect()
+bunx tsc --noEmit（仅本 WP 四个文件，--ignoreConfig）        → exit 0
+```
+
+**DoD 覆盖矩阵（针对 WP20-2）**：第 7 条 ✅（含断言）；第 5/6 条不适用（WP20-3/20-5）；
+第 10 条 ⏳（e2e 未跑，本会话禁跑容器）；第 4 条 ⏳ 属 WP20-3。
 
 ---
 

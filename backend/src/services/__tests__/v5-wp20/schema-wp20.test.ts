@@ -13,8 +13,8 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 
-const SCHEMA = readFileSync(new URL("../../../prisma/schema.prisma", import.meta.url), "utf8");
-const MIGRATIONS_DIR = new URL("../../../prisma/migrations/", import.meta.url);
+const SCHEMA = readFileSync(new URL("../../../../prisma/schema.prisma", import.meta.url), "utf8");
+const MIGRATIONS_DIR = new URL("../../../../prisma/migrations/", import.meta.url);
 const MIGRATION_NAME = "20261031000000_v5_wp20_subscription_ledger";
 const MIGRATION_PATH = new URL(`${MIGRATION_NAME}/migration.sql`, MIGRATIONS_DIR);
 const MIGRATION = readFileSync(MIGRATION_PATH, "utf8");
@@ -32,6 +32,20 @@ function modelBlock(name: string): string {
 
 function enumNames(): string[] {
   return [...SCHEMA.matchAll(/^enum (\w+) \{/gm)].map((match) => match[1] ?? "");
+}
+
+/** 迁移 SQL 里被建出的表名（先剥掉 `--` 注释，避免注释里的示例被当成真语句）。 */
+function createdTables(sql: string): string[] {
+  return [...stripLineComments(sql).matchAll(/CREATE TABLE (?:IF NOT EXISTS )?`(\w+)`/g)].map(
+    (match) => match[1] ?? "",
+  );
+}
+
+function stripLineComments(sql: string): string {
+  return sql
+    .split("\n")
+    .map((line) => line.replace(/--.*$/, ""))
+    .join("\n");
 }
 
 describe("A. DoD 第 7 条：不新增状态机 / 不新增枚举", () => {
@@ -89,8 +103,16 @@ describe("C. 幂等闸门：SubscriptionPeriodSettlement", () => {
   });
 
   test("接管续跑所需的字段与索引齐全（attempts / started_at / settled_at / error / order_id）", () => {
-    for (const field of ["attempts     Int", "started_at           DateTime", "settled_at           DateTime?", "error                String?", "order_id             Int?"]) {
-      expect(settlement).toContain(field);
+    // 用正则而不是逐字对齐的字符串：schema 里的列是对齐排版的，缩进变化不该让守卫失效
+    const expected: [string, RegExp][] = [
+      ["attempts", /attempts\s+Int\s+@default\(0\)/],
+      ["started_at", /started_at\s+DateTime\s+@default\(now\(\)\)/],
+      ["settled_at", /settled_at\s+DateTime\?/],
+      ["error", /error\s+String\?\s+@db\.Text/],
+      ["order_id", /order_id\s+Int\?/],
+    ];
+    for (const [field, pattern] of expected) {
+      expect({ field, matches: pattern.test(settlement) }).toEqual({ field, matches: true });
     }
     expect(settlement).toContain("@@index([state, started_at])");
   });
@@ -145,6 +167,39 @@ describe("F. 迁移是纯 additive：不动 V4 冻结基线（契约 §8.5）", 
     expect(MIGRATION).toContain("CREATE TABLE `subscription_period_settlement`");
     expect([...MIGRATION.matchAll(/ALTER TABLE `\w+` ADD COLUMN/g)]).toHaveLength(1);
     expect(MIGRATION).toContain("CREATE INDEX `plan_order_workspace_id_idx` ON `plan_order`(`workspace_id`)");
+  });
+
+  test("本迁移只建自己 WP 的表：没有别的 WP 的表被并发编辑带进来", () => {
+    // 真实事故（2026-10-05）：`prisma migrate diff` 是「HEAD schema → 当前工作树 schema」的差集，
+    // 期间另一位成员把 `NotificationDelivery` 加进了共享的 schema.prisma，于是别人的建表语句
+    // 被夹进本 WP 的迁移，与对方自己的迁移重复建表 ⇒ 空库 `migrate deploy` 会直接失败。
+    // 这里把「本迁移建的表集合」钉死，任何人再夹带都会被这条断言拦住。
+    const created = createdTables(MIGRATION);
+    expect(created.sort()).toEqual(["plan_subscription", "subscription_period_settlement"]);
+    expect(MIGRATION).not.toContain("notification_delivery");
+  });
+
+  test("全仓守卫：没有任何表被两次建出（跨迁移的重复建表）", () => {
+    const createdBy = new Map<string, string>();
+    const violations: string[] = [];
+    const dirs = readdirSync(MIGRATIONS_DIR)
+      .filter((entry) => existsSync(new URL(`${entry}/migration.sql`, MIGRATIONS_DIR)))
+      .sort();
+    for (const dir of dirs) {
+      const sql = stripLineComments(readFileSync(new URL(`${dir}/migration.sql`, MIGRATIONS_DIR), "utf8"));
+      for (const statement of sql.split(";")) {
+        const create = statement.match(/CREATE TABLE (?:IF NOT EXISTS )?`(\w+)`/);
+        if (create?.[1]) {
+          const table = create[1];
+          const previous = createdBy.get(table);
+          if (previous) violations.push(`${table}: ${previous} 与 ${dir} 重复建表`);
+          createdBy.set(table, dir);
+        }
+        const drop = statement.match(/DROP TABLE (?:IF EXISTS )?`(\w+)`/);
+        if (drop?.[1]) createdBy.delete(drop[1]);
+      }
+    }
+    expect(violations).toEqual([]);
   });
 
   test("外键取向是被删用户流程倒推出来的（Cascade / SetNull，见迁移注释）", () => {

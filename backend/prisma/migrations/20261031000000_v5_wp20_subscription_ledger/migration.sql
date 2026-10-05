@@ -73,37 +73,6 @@ CREATE TABLE `subscription_period_settlement` (
     PRIMARY KEY (`id`)
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- CreateTable
-CREATE TABLE `notification_delivery` (
-    `id` INTEGER NOT NULL AUTO_INCREMENT,
-    `scope_kind` VARCHAR(16) NOT NULL,
-    `workspace_id` INTEGER NULL,
-    `dedupe_key` VARCHAR(64) NOT NULL,
-    `source_kind` VARCHAR(32) NOT NULL,
-    `source_id` VARCHAR(191) NOT NULL,
-    `reason_code` VARCHAR(64) NOT NULL,
-    `severity` VARCHAR(16) NOT NULL,
-    `resource_type` VARCHAR(64) NOT NULL,
-    `resource_id` VARCHAR(191) NOT NULL,
-    `channel_kind` VARCHAR(16) NOT NULL,
-    `target` VARCHAR(512) NOT NULL,
-    `status` VARCHAR(16) NOT NULL DEFAULT 'sending',
-    `failure_reason` VARCHAR(32) NULL,
-    `attempts` INTEGER NOT NULL DEFAULT 0,
-    `degraded` BOOLEAN NOT NULL DEFAULT false,
-    `error` TEXT NULL,
-    `occurred_at` DATETIME(3) NOT NULL,
-    `window_start` DATETIME(3) NOT NULL,
-    `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    `updated_at` DATETIME(3) NOT NULL,
-
-    INDEX `notification_delivery_workspace_id_created_at_idx`(`workspace_id`, `created_at`),
-    INDEX `notification_delivery_source_kind_source_id_idx`(`source_kind`, `source_id`),
-    INDEX `notification_delivery_status_created_at_idx`(`status`, `created_at`),
-    UNIQUE INDEX `notification_delivery_dedupe_key_channel_kind_key`(`dedupe_key`, `channel_kind`),
-    PRIMARY KEY (`id`)
-) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
 -- CreateIndex
 CREATE INDEX `plan_order_workspace_id_idx` ON `plan_order`(`workspace_id`);
 
