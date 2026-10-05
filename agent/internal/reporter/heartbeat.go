@@ -360,7 +360,7 @@ type Reporter struct {
 
 // Config configures the reporter.
 type Config struct {
-	PanelURL string // e.g. "http://panel:3001"; empty disables reporting
+	PanelURL string // e.g. "http://panel:3000"; empty disables reporting
 	AgentID  string
 	NodeID   string
 	Version  string
