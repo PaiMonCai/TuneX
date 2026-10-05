@@ -144,6 +144,9 @@ model Workspace {
   tunnels          Tunnel[]
   policy_assignments WorkspacePolicyAssignment[]
   custom_roles     WorkspaceCustomRole[]
+  /// V5-WP17（契约 F6）：该租户拥有的 DNS 凭据。NULL 归属的 provider 是平台级，
+  /// 不在任何租户的列表里。
+  dns_providers    DNSProvider[]     @relation("workspace_dns_providers")
 
   @@map("workspace")
 }
@@ -623,6 +626,39 @@ model Tunnel {
   tls_cert_path   String? @db.VarChar(512)
   /// tls 监听使用的私钥文件路径（节点本地；NULL = 非 tls）
   tls_key_path    String? @db.VarChar(512)
+
+  // ── V5-WP17 DDNS 前门（docs/v5-wp17-entry-exit-group-ddns-contract.md §3 F3/F4/F7）──
+  //
+  // 为什么**挂 Forward 而不是 Route Profile**（F3）：模板与域名是 N:1——同一个 Profile 可以
+  // 被多条 Forward apply，域名若属模板就会互相打架；而域名必须随 config_revision 被 ACK，
+  // 落在 tunnel 行上才是同一份 desired。
+  //
+  // 为什么值来源只认 node.connect_ip（F3）：写进 DNS 的是"客户端该连哪里"，那正是面板
+  // 观察到的连接 IP。`connect_ip IS NULL` ⇒ **拒绝写**（dns_unbound_address），绝不回落
+  // listen_ip 或节点组的遗留列——回落就是猜地址。
+  //
+  // 全部可空 + 无默认值：只有配置了前门域名的 Forward 才填，其余行 NULL 是**明确事实**
+  //（"这条 Forward 没有前门"），不是"还没填"。
+  /// 前门域名；NULL = 这条 Forward 没有前门
+  dns_domain           String?       @db.VarChar(255)
+  /// 记录类型。多值只允许 A/AAAA；CNAME 只允许单值（F4）
+  dns_record_type      DNSRecordType?
+  /// 多入口（记录集 = 可用入口集合，首选）还是单活跃（记录集 = 当前 owner）（F4）
+  dns_mode             DNSMode?
+  dns_provider_id      Int?
+  dns_provider         DNSProvider?  @relation("tunnel_dns_provider", fields: [dns_provider_id], references: [id], onDelete: SetNull)
+  /// 显式 opt-in：缺省 false 表示**零外呼**，只返回建议值集（F5.3）
+  dns_auto_resolve     Boolean       @default(false)
+  /// 上次**已确认**的值集。"值集未变就不写"这条判据读它（F5.3），也是"多入口挂掉一个
+  /// 入口无需写 DNS"能成立的依据
+  dns_confirmed_values Json?
+  /// 上次成功写入（且按被冻结的强度确认）的时刻；就绪性闸门按它算 proof age（F5.4）
+  dns_synced_at        DateTime?
+  /// 上次成功是**读回确认**（true）还是仅写入成功（false）。后者投影为
+  /// `synced_unverified`——**不允许**把"写成功"说成"已切换"（Lead 裁决 D2）
+  dns_verified         Boolean       @default(false)
+  /// 上次失败的原因码（脱敏，不含凭据）
+  dns_last_error       String?       @db.VarChar(120)
   /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?
@@ -1423,17 +1459,54 @@ enum DNSProviderType {
   huawei
 }
 
+/// V5-WP17（契约 F4）：记录类型。多值只允许 A/AAAA；CNAME 只允许单值——多值 CNAME 在
+/// DNS 语义上不成立，用枚举把"表示不出来的状态"直接排除，而不是靠校验去事后拦。
+enum DNSRecordType {
+  A
+  AAAA
+  CNAME
+}
+
+/// V5-WP17（契约 F4）：两种前门形态。
+///
+/// - `multi_entry`（首选）：记录集 = 当前**可用入口集合**（通常 ≥2）。单个入口挂掉
+///   **不需要写 DNS**，客户端靠记录集里的其它地址自愈 —— 这一支把"DNS 写延迟"从
+///   可用性关键路径上摘掉；
+/// - `single_active`：记录集 = 当前 owner 的 `connect_ip`，每次归属迁移都要写。
+enum DNSMode {
+  multi_entry
+  single_active
+}
+
 model DNSProvider {
   id                Int              @id @default(autoincrement())
   name              String           @db.VarChar(255)
   type              DNSProviderType
+  /// 凭据。V5-WP17（契约 F6）：**必须**是 `services/federation/seal.ts` 的
+  /// `sealSecret` 输出（AES-256-GCM + HKDF(AUTH_SECRET)），**禁止明文 JSON**。
+  /// 列的形状不变（仍是 JSON），约定的是内容形态——这样不需要新表，也不会
+  /// 与既有的密钥体系并列出第二套。
   config            Json
+  /// 创建者。**不是**作用域：历史行只有它，读权限看下面的 workspace_id。
   user_id           Int
   user              User             @relation(fields: [user_id], references: [id])
+  /// V5-WP17（契约 F6）：凭据的**作用域**。`user_id` 是错的粒度——凭据属于资源域，
+  /// 不属于个人。
+  ///
+  /// - 非 NULL = 租户凭据，只有该 workspace 能读写；
+  /// - NULL   = 遗留全局行 / 平台级凭据。**非平台管理员读取即 fail-closed**
+  ///   （历史行按 F6 需要一次显式迁移策略，不允许"NULL 就等于人人可用"）。
+  workspace_id      Int?
+  workspace         Workspace?       @relation("workspace_dns_providers", fields: [workspace_id], references: [id], onDelete: SetNull)
   created_at        DateTime         @default(now())
   updated_at        DateTime         @updatedAt
   in_node_group_dns InNodeGroupDNS[]
+  /// V5-WP17：使用这个 provider 作为前门的 Forward。删除 provider 时 Forward 被
+  /// SetNull（前门回落到"未绑定"），而不是级联删掉 Forward——丢掉一条转发是
+  /// 不可逆的事故，而丢一个 DNS 绑定是"重新配一次"。
+  tunnels           Tunnel[]         @relation("tunnel_dns_provider")
 
+  @@index([workspace_id])
   @@map("dns_provider")
 }
 
