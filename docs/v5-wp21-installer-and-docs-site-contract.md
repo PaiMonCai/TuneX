@@ -1,10 +1,7 @@
-# V5-WP21 — 一键安装器 / 用户文档站 / 下载加速 契约（DRAFT-CONTRACT）
+# V5-WP21 — 一键安装器 / 用户文档站 / 下载加速 契约
 
-> **状态：DRAFT-CONTRACT（2026-10-05，工作树 `.worktrees/v5-1b-udp-relay`，分支 `feature/v5-1b-udp-relay`）。**
-> **冻结项：FROZEN-1 … FROZEN-7** —— 本文是这三件事的**唯一语义来源**：动作集、幂等口径、
-> 升级/回滚路径、信任边界、下载加速红线、文档真相归属、安装器与 OPS-02 的边界。
-> 实现（脚本 / CI / 文档）若与本文冲突，以本文为准并回来改契约，不允许实现悄悄改写语义。
-> **未决项：OPEN-1 … OPEN-5** —— 明确**不猜**，需 Lead 拍板后才进入实现（每条含候选与代价）。
+> **状态：FROZEN + IMPLEMENTED（2026-10-05，分支 `feature/v5-1b-udp-relay`）。**
+> FROZEN-1 … FROZEN-7 与 OPEN-1 … OPEN-5 均已裁决；`bootstrap.sh` / `install.sh`、生产部署文档与 CI `installer-static` 已落地。静态 + 桩化门禁当前覆盖 196 项断言；真实干净机器安装门禁仍保持为专用环境/人工发布验证，不进入每次 PR。独立文档站与下载加速器本期明确不立项。
 > 关联阅读：`DEVELOPMENT.md` §0.1（文档索引）、§1.1（禁止第二份真相）；
 > `docs/production-deploy.md`（OPS-02 生产运维手册，本 WP **不夺其真相权**，只在其前加一个入口）。
 
