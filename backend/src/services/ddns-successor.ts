@@ -252,63 +252,24 @@ export function productionSuccessorDeps(db: DdnsSuccessorDeps["db"]): DdnsSucces
       });
     },
     desiredValues: async ({ tunnelId, mode, ownerNodeId }) => {
-      const now = new Date();
-      if (mode === "single_active") {
-        if (ownerNodeId === null) return { ok: false as const, reason: "owner 未知" };
-        const node = (await (db as unknown as {
-          node: { findUnique: (a: unknown) => Promise<unknown> };
-        }).node.findUnique({ where: { id: ownerNodeId }, select: { connect_ip: true } })) as { connect_ip?: string | null } | null;
-        const ip = node?.connect_ip?.trim() ?? "";
-        return ip === "" ? { ok: false as const, reason: "owner 没有 connect_ip" } : { ok: true as const, values: [ip] };
-      }
-      const tunnel = (await db.tunnel.findFirst({
-        where: { id: tunnelId },
-        select: { in_node_group_id: true },
-      })) as { in_node_group_id: number } | null;
-      if (!tunnel) return { ok: false as const, reason: "转发不存在" };
-      const rows = (await (db as unknown as {
-        node: { findMany: (a: unknown) => Promise<unknown[]> };
-      }).node.findMany({
-        where: { node_group_id: tunnel.in_node_group_id, role: { in: ["ingress", "both"] } },
-        select: {
-          id: true,
-          node_group_id: true,
-          role: true,
-          lifecycle: true,
-          status: true,
-          last_seen_at: true,
-          has_credential: true,
-          credential_revoked: true,
-          connect_ip: true,
-        },
-        orderBy: { id: "asc" },
-      })) as Array<{
-        id: number;
-        node_group_id: number;
-        role: string | null;
-        lifecycle: string | null;
-        status: string | null;
-        last_seen_at: Date | null;
-        has_credential: boolean;
-        credential_revoked: boolean;
-        connect_ip: string | null;
-      }>;
-      // **这里刻意不要求"此刻在线"**（与故障转移的候选判定不同）：
+      // ── 值集只能包含**真的在服务这条转发**的地址 ──────────────────────────────
       //
-      //   · 多入口记录集的语义是"客户端**可以试**哪些地址"，而一个入口临时掉线时，记录集
-      //     本来就不该动 —— 客户端靠集合里的另一个地址自愈，这正是多入口形态的全部意义
-      //     （DoD 1：停掉一个入口 ⇒ **零 DNS 写**）。按在线过滤会让每次掉线都写一次 DNS，
-      //     把"多入口免写"变成"每次抖动都写"，也把 provider 的限流风险拉满。
-      //   · 故障转移问的是另一个问题："哪台机器**现在**能接管"。它要 `requireOnline`。
+      // 这条规则压过一切：`Tunnel.ingress_node_id` 是**单一 owner**，今天没有任何
+      // "一条转发由多个入口同时服务"的机制。所以按"入口组里合格的节点"去凑多值记录集，
+      // 会**把不服务这条转发的机器写进 A 记录** —— 那不是"多入口"，那是把大约一半客户端
+      // 送进黑洞（比少写一条记录坏得多：前者静默地坏，后者至少连不上会重试）。
       //
-      // 两个问题共用同一份判定函数，但**答案可以不同** —— 差异必须是有意识的，写在这里。
-      const values = rows
-        .filter((n) => candidateRejection({ ...n, node_id: n.id }, "ingress", { now }) === null)
-        .map((n) => (n.connect_ip ?? "").trim())
-        .filter((ip) => ip !== "");
-      return values.length === 0
-        ? { ok: false as const, reason: "入口节点组里没有可用入口" }
-        : { ok: true as const, values };
+      // 于是今天两种形态算出的是**同一个值集**（owner 的 `connect_ip`）：多值机器是现成的
+      // （值集本来就是数组、写的是整集合），但它**只有在一个真的多节点服务能力落地之后**
+      // 才可能有第二个元素 —— 那是另一个 WP，不是 DNS 这一片。
+      void tunnelId;
+      void mode;
+      if (ownerNodeId === null) return { ok: false as const, reason: "owner 未知" };
+      const node = (await (db as unknown as {
+        node: { findUnique: (a: unknown) => Promise<unknown> };
+      }).node.findUnique({ where: { id: ownerNodeId }, select: { connect_ip: true } })) as { connect_ip?: string | null } | null;
+      const ip = node?.connect_ip?.trim() ?? "";
+      return ip === "" ? { ok: false as const, reason: "owner 没有 connect_ip" } : { ok: true as const, values: [ip] };
     },
   };
 }
