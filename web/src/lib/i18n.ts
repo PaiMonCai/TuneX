@@ -861,6 +861,13 @@ const zh = {
     referralRate: "返佣比例",
     node: "节点",
   },
+  // V5-WP18.5：公告展示（只做最小展示：读、已读；不做偏好矩阵 UI，见契约 §9.5）。
+  announcements: {
+    popupBadge: "重要",
+    dismiss: "知道了",
+    publishedAt: "发布于",
+    unavailable: "公告暂时取不到（这不代表没有公告）",
+  },
 };
 
 type LooseDict<T> = {
@@ -1706,6 +1713,12 @@ const en: Dict = {
     autoRenew: "Auto-renew",
     referralRate: "Referral rate",
     node: "Node",
+  },
+  announcements: {
+    popupBadge: "Important",
+    dismiss: "Got it",
+    publishedAt: "Published",
+    unavailable: "Announcements are unavailable right now (this does not mean there are none)",
   },
 };
 

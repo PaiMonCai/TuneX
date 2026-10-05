@@ -563,4 +563,155 @@ F9.4 的连接级 IP 固定在这里没有对应问题。但 token 在 URL 路�
 `&`→`&amp;`、`<`→`&lt;`、`>`→`&gt;`（先换 `&`），超 4096 字符时回退到最后一个未闭合实体之前 ——
 把 `&amp;` 切成 `&am` 会被 Telegram 返回 400，那会变成一条"我们渲染坏了"的假故障（测试 H 组）。
 
+### 12.3 WP18.5 —— 公告：表 + API + 已读 + 免打扰 + `NOTICE` 只读迁移 + 前端最小展示（2026-10-05）
+
+**交付**：
+- schema / 迁移（三个模型 + `NOTICE*` 的 `@deprecated` 注释 + 只读回填）—— 已随 Lead 的串行化提交
+  `7895b40` 落地（`prisma/schema.prisma`、
+  `prisma/migrations/20261033000000_v5_wp18_announcements/migration.sql`）。
+- `backend/src/services/announcement.ts`、`backend/src/services/announcement-mute.ts`（新增）。
+- `backend/src/routes/announcements.ts`、`backend/src/routes/announcements-admin.ts`（新增）；
+  `backend/src/app.ts` 挂载两处；`backend/src/routes/public.ts` 的免认证白名单去掉三个 `NOTICE` 键。
+- 测试：`src/services/__tests__/v5-wp18-announcements.test.ts`（32 test / 134 expect）、
+  `src/services/__tests__/v5-wp18-announcement-mute.test.ts`（19 test / 58 expect）。
+- Web：`src/lib/announcements.ts`、`src/components/announcements/announcement-banner.tsx`、
+  `src/components/announcements/__tests__/announcement-banner.test.tsx`（7 test / 24 expect）、
+  `src/lib/api.ts`（+`announcements` 组）、`src/lib/i18n.ts`（+`announcements` 词条）、
+  `src/components/dashboard/dashboard-body.tsx`（挂载）、
+  `src/components/admin/settings-manager.tsx`（`NOTICE*` 组标注「已废弃」）。
+
+**D1（判断；契约在这里缺一条 —— 我没有默默决定，请 Lead 确认）公告**不经过** `NotificationFact`。**
+F1 把 `reason_code` 冻结成「既有词表」= **同一份** `AttentionReasonCode`，而 F2-N6 又说公告的派生依据
+是「公告表自身」—— 这两条联立后，公告**没有**可用的原因码：`AttentionReasonCode` 里没有、也不该有
+「公告」这种码（它是「需要处理」的码表，公告不是待办）。候选：
+(a) 把 `NotificationReasonCode` 扩成 `AttentionReasonCode | AnnouncementReasonCode`（改的是 18.1 已冻结
+的形状，需要 18.1/18.2 的所有者同意，且不在本 WP 的文件范围内）；
+(b) 公告不走 `NotificationFact`：投递用渠道层的 `RenderedNotification` + 同一套免打扰判据；
+(c) 借用某个既有码（**禁止**：那就是发明事实）。
+**取舍 = (b)（本期）**。理由：把公告塞进「通知 = 既有事实链的派生」会让 F1 的地基出现一个例外，
+而公告的真相本来就在公告表里（C2 已写明「公告真相在公告表」），不需要 `AttentionItem` 当载体。
+落地物：`renderAnnouncementText()`（纯文本、无模板引擎、无 HTML）产出与渠道层同形的 `RenderedNotification`。
+**交付缺口（明确记下）**：本 WP 只交付「渲染 + 免打扰判据」，**没有**任何 worker / 路由在公告发布时去投递它；
+若 Lead 选 (a)，这条接线自然变成「派生一条 announcement 事实」，否则需要一个非 `NotificationFact` 的投递入口
+（建议与 WP18.6 一起做，因为那时才有 `notification_channel` 的读侧）。
+
+**D2（判断）免打扰的两个词表**复用**既有闭集，不做副本。**
+类别 = `NOTIFICATION_SOURCE_KINDS`（`notification-facts.ts`）、渠道 = `NOTIFICATION_CHANNEL_KINDS`
+（`notification-delivery.ts`），并且是**引用相等**（测试 `toBe` 钉住）而不仅是"内容一样"。
+理由：F6.5 的「类别」要回答的就是「这类通知」，而通知的类别本来就是它的**触发源**；另造一套分类词表
+等于两处映射，迟早不一致。未知渠道 / 未知类别在 JSON 边界**整份拒绝**（`unknown_channel_kind` /
+`unknown_category`），不做「丢掉不认识的项」的降级（C3）。
+
+**D3（判断）免打扰是"偏好"、静默期是"速率"，两者互补且**只有一个接触点**。**
+静默期（O2）的键是 `(scope, source_kind, source_id, reason_code)`，回答「**同一条事实**刚投过没有」；
+免打扰的键是 `(user_id, channel_kind, category)`，回答「这个**用户**要不要在这个渠道收这一类」。
+因此本层**不实现任何冷却/时间窗常量**（测试 G 组静态断言：两个新模块不含时长常量、不 import redis、
+不引用 `NOTIFICATION_COOLDOWN_SECONDS` / `notificationCooldownKey` / `cooldownSecondsForReason`）。
+唯一接触点是 `createMuteAwareTargetResolver()` —— 它只替换 `DeliverNotificationDeps.resolveTargets`，
+投递层的静默期 / 账本抢占 / 有界重试**一行未改**。
+两条容易做错的边界，都用断言写明：① 被静音的目标**根本不进账本**（`target` 里没有它，不是"发了再假装没发"）；
+② 全员静音 ⇒ 空目标 ⇒ 走既有语义记一条 `rejected_target` 失败行（**失败可见**，既不改写成 `sent`，
+也不静默跳过）。证据：mute 测试 E 组五条（目标不进账本 / 同一事实第二次仍是 `suppressed` 且不新增账本行 /
+类别与渠道各自独立 / 全员静音留失败行 / 无静音时与不装免打扰完全一致）。
+
+**D4（判断；F7 的一处口径补充，请 Lead 确认）「读公告」= 活跃成员，不是 `settings:read`。**
+F7 的表里写「发布/撤回租户公告 | 复用 `settings:manage`（读用 `settings:read`）」。我把那句「读」解释为
+**管理面的读**（`GET /manage`：含已撤回的完整列表），而**用户侧**的可见列表与已读只需**活跃成员**
+（`resolveWorkspaceMembership`）。理由是一条反例：公告是**发给所有人**的内容；若可见列表挂在
+`settings:read` 上，任何自定义角色里没有该键的成员就看不到平台公告 —— 那不是把权限收紧，是把功能做坏。
+落地：`GET /` 与 `POST /:id/dismiss` 只做成员解析；`GET /manage` / `POST /` / `POST /:id/revoke`
+走 `resolveWorkspaceAccess(c, "read"|"manage", "settings")`（**不新增**租户权限键，F7 明确不做）。
+另外，免打扰的两个端点是**用户级**（F6.5 的三元映射里没有 workspace），放在 `/announcements/preferences`
+只认会话用户、不经过工作空间权限判定。
+
+**D5（判断）弹窗冲突 = 409 拒绝，不「先关旧的再插新的」。**
+F6.3 只要求「同 scope 一条活跃 + 用 DB 唯一约束表达」，没写冲突时怎么办。Forwardx 的做法是自动关旧的
+—— 它的问题正是"没有约束、并发下留下两条"。本实现：`active_popup_key` 是**非空标量**
+（`popup:global` / `popup:<id>`）+ 唯一索引，第二条活跃弹窗被 **DB 拒绝**，服务层收敛成
+`active_popup_exists` → **409**；撤回时把该列清回 NULL（槽位释放），否则一条已撤回的弹窗会永久占位。
+不做自动撤回：悄悄关掉另一个管理员正在用的公告，比一个 409 危险得多。
+为什么不用 `@@unique([scope_kind, workspace_id, type])`：MySQL 的唯一索引把 NULL 视为互不相等，
+平台行（`workspace_id IS NULL`）之间永远不冲突 —— 与 §12.2-D4 对 `notification_channel` 的实测结论同一条。
+证据：announcements 测试 D 组五条（唯一键形态 / 第二条被拒且 normal 不受影响 / 撤回释放槽位 /
+撤回幂等且不改首次时刻 / 撤回要求作用域**恰好相等**）。
+
+**D6（判断）`platform ⟹ workspace_id = NULL` 的结构表达 = 类型 + 唯一转换点；DB 层**故意不加** CHECK。**
+F6.2 要求「用结构约束表达，不用约定」。落地方式与 WP18.1 同源：`AnnouncementScope` **就是**
+`NotificationScope`（判别联合 —— `kind:"platform"` 时 `workspace_id` 只能是 `null`），
+`isAnnouncementScope` 是 `isNotificationScope` 的**别名**（测试用 `toBe` 钉住"不是两份实现"）；
+落库值只经 `announcementScopeColumns()` 这**一个**出口；读侧另有 `visibleAnnouncementWhere()`（查询条件）
+与 `isAnnouncementVisible()`（行级判定）两道。坏行（`scope_kind="platform"` 且 `workspace_id != NULL`）
+对**任何**租户都不可见（fail-closed，测试 B 组覆盖）。
+**不加 DB `CHECK` 的理由**：`schema.prisma` 表达不了 CHECK，而这条线的门禁是
+`prisma migrate diff` 零漂移；本沙箱没有 MySQL，我**无法证明** CHECK 不会造成漂移 ⇒ 宁可不加，
+让坏行的代价被限制在"读不到"而不是"证明不了"。若 Lead 要求 DB 级硬约束，建议照 `active_popup_key`
+的思路用**生成列 + 唯一索引**表达，并先在一台 e2e MySQL 上复验 `migrate diff` 仍为
+`No difference detected.`。
+
+**D7（判断）`NOTICE` 只读迁移：迁什么、不迁什么，以及幂等判据为什么挂在临时表上。**
+- **只读**：迁移文件里没有任何一条语句写 `config`（测试 G 用正则断言不含 `UPDATE`/`INSERT INTO`/
+  `DELETE FROM`/`ALTER TABLE`/`DROP TABLE \`config\``，也不含 `TRUNCATE`），确实只 `SELECT` 它。
+- **迁什么**：非空 `NOTICE` → **一条** `scope_kind="platform"` + `type="normal"` 的公告，标题固定
+  「站点公告」，正文 = `TRIM(value)`，`published_at = COALESCE(updated_at, created_at, now)` ——
+  **来源表上的既有时间戳**，不是"迁移跑起来的时刻"；`created_by_id` 留 **NULL**（旧键没有作者，不猜）。
+- **不迁什么**：`NOTICE_POPUP` / `NOTICE_POPUP_INTERVAL_HOURS` 不做内容迁移 —— 它们是布尔开关与展示间隔，
+  不是内容（内容在 `NOTICE` 里，已经迁走）。三个枚举值**一个都没删**，且都标了 `@deprecated`
+  （测试 G 逐条正则断言「紧邻上方有 `@deprecated`」，不是口头承诺）。
+- **幂等判据为什么挂在临时表上**：MySQL 手册 13.2.5.1 明写 *"you cannot insert into a table and select
+  from the same table in a subquery"* ⇒ `INSERT INTO announcement … WHERE NOT EXISTS (SELECT 1 FROM
+  announcement …)` 这种写法**根本写不出来**。判据因此挂在 `INSERT INTO <临时表>` 上（该语句的目标表不是
+  `announcement`），回填语句只读临时表。于是手工重复执行本文件成为 no-op（正常路径下 Prisma 的
+  `_prisma_migrations` 台账已经保证至多执行一次，这是第二道闸）。
+- **同一次发布里停掉旧下发面**：`routes/public.ts` 的免认证白名单去掉三个 `NOTICE` 键（`web/src` 对它们
+  **零消费者**，契约 §1.2 已核实）。否则老客户端读旧键、新客户端读公告表，就是两份公告真相（R3）。
+- 未纳入的：`NOTICE_POPUP=true` **不**转成 `type="popup"` 公告 —— 契约只写了「非空 `NOTICE` 值」，
+  把布尔开关猜成"要一条什么样的弹窗"没有依据。
+
+**D8（判断）前端只做**最小展示**：不做偏好矩阵 UI（§9.5 已明确）、不做管理端发布 UI、弹窗不做模态。**
+- 取数在服务端（`DashboardBody`；作用域从 `tunex_workspace` cookie 解析，与同一处的 `forwards.list`
+  同源），客户端组件只负责显示与「知道了」。已读后 `router.refresh()` 让服务端重取 ——
+  前端**不**维护第二份"我读过什么"（C2）。
+- **三态**：有内容 → 列出未已读的（弹窗优先，其余按发布时间倒序）；没有 → **什么都不渲染**（不占版面、
+  不说「暂无公告」）；取不到 → 一句「公告暂时取不到（这不代表没有公告）」。`null` 与 `[]` 必须分开：
+  把抖动读成"平台没有话说"正是本仓库反复禁止的那种谎。
+- **纯文本**：正文一律作为 React **文本节点**渲染（`{item.body}`，自动转义）。DoD7 的 grep 断言由
+  `v5-wp18-announcements.test.ts` 实现（递归扫描 `web/src` 的 `.ts/.tsx`），另有一条**真渲染**断言
+  `<script>alert(1)</script>` 被转义成 `&lt;script&gt;`（"没有那个属性"只是必要条件，不等于渲染安全）。
+- **一条值得写下来的教训（Lead 2026-10-05 给的"可执行反馈"，已改）**：DoD7 的第一版断言是
+  `src.includes("…")`，跑出来命中的**全是**"我们没有用它、为什么不用"的注释 —— 一个把好行为
+  （把理由写在代码旁边）逼走的断言，**错的是断言**。修法是**修断言，不是删注释**：
+  扫描改成**先去注释再匹配**（对象：行注释、块注释、JSX 注释；用状态机而不是逐行正则 ——
+  逐行 `/\/\/.*$/` 会把 `title="https://x"` 之后的**真命中**一起删掉，而 URL 字符串在 web 里很常见），
+  并按本仓库既有源码守卫的样式（`system-config-enum.test.ts`、`v5-wp5-b2-ack-field-flow.test.ts`）
+  补一条**口径自检**，钉住四件事：注释里的字不算命中 / 真代码里的算命中 / 含 `https://` 字符串的同一行
+  后面仍算命中 / 扫到的文件数 > 50（防路径写错造成的"零命中"假通过）。
+  于是那三处解释性注释**照原样保留**（并把名字写回去）。
+
+**D9（未决 / 移交）**
+1. **WP18.6**：`/admin/announcements` 前缀的 RBAC 登记。本 WP **故意不预先登记** ——
+   现在未登记 ⇒ 非超管 403、超管可用（契约 F7「不登记 = 只有超管」），这正是 18.6「登记生效」断言
+   （改动前 403 → 改动后 200）的起点。`app.ts` 与 `routes/announcements-admin.ts` 都写明了这一点。
+2. **WP18.7 / Gate**：DoD8 的**真实 apply**（空库 + 存量 V4 库，含"非空 `NOTICE`"夹具；以及
+   `scope_kind="platform"` 坏行的写入尝试）需要 MySQL。本沙箱既无 MySQL 也无法起容器（禁止动 docker），
+   我能做到的只有静态断言；**漂移那一半已被 Lead 在 `7895b40` 证明**（`migrate diff` →
+   `No difference detected.`），**回填语义那一半仍需真实库**。
+3. **D1 的接线**（公告发布后谁去投递）与管理端**发布公告的 UI**：见 D1 与 D8，均未做。
+   注意 §9.5 已排除"通知中心前端"，但**公告编辑**不在该排除项里 —— 若需要，另立小项（F6 明确不做富文本）。
+
+**验证记录（可复现，2026-10-05）**
+1. `bun test src/services/__tests__/v5-wp18-announcements.test.ts src/services/__tests__/v5-wp18-announcement-mute.test.ts
+   src/services/__tests__/v5-wp18-facts.test.ts src/services/__tests__/v5-wp18-delivery.test.ts`
+   → **104 pass / 0 fail**（5426 expect）。其中本 WP 新增 **51 test / 192 expect**；
+   18.1/18.2 的既有 54 test 作为回归一起跑。
+2. `bun test src/components/announcements/__tests__/announcement-banner.test.tsx`（web）→ **7 pass / 0 fail**（24 expect）。
+3. `bunx tsc --noEmit`（backend）与 `tsc --noEmit`（web）→ 本 WP 的文件**零错误**。
+   注：backend 全量 tsc 当时有 3 条**别人在途**的错误（`prisma/seed.ts` 缺 WP19 新增的两个枚举键、
+   `services/looking-glass.ts` + `control-protocol/types.ts` 的 `looking_glass`），与 WP18.5 无关，
+   已在交付报告里点名。
+4. DoD 对照：**DoD1/2/3/4/5**（18.1/18.2 已交付）、**DoD6**（公告跨租户：B 组 6 test）、
+   **DoD7**（去注释后的扫描 + 口径自检 + 真渲染转义）、**DoD8 的离线半边**（G 组 7 test）、
+   **DoD10**（两个新模块无时长常量）
+   均已断言；**DoD8 的联机半边**与 **DoD9**（权限）分别归 WP18.7 与 WP18.6，见 D9。
+
+
 

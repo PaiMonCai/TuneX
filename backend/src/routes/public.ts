@@ -155,15 +155,24 @@ publicRoutes.get("/tunnel/subscription", async (c) => {
   return c.json({ data: { tunnels: await db.tunnel.findMany({ where: { workspace_id: personal.id } }) } });
 });
 
-/** GET /api/system/config/site —— 站点公开配置（免认证） */
+/**
+ * GET /api/system/config/site —— 站点公开配置（免认证）
+ *
+ * V5-WP18.5（契约 F6.7）：**不再下发** `NOTICE` / `NOTICE_POPUP` /
+ * `NOTICE_POPUP_INTERVAL_HOURS`。
+ *
+ * 它们是「沉睡又被免认证下发」的键：`web/src` 里零消费者（只有管理端编辑器按前缀分组），
+ * 却出现在这个免认证白名单里。公告的真相已经迁到 `announcement` 表（只读迁移见
+ * `20261033000000_v5_wp18_announcements`），继续下发就会形成**两份公告真相**：
+ * 老客户端读到旧 `NOTICE`，新客户端读到公告表，两边说的不一样（R3）。
+ *
+ * 三个枚举值本身**一个都没删**（§9.8）：只是不再从这里读。
+ */
 publicRoutes.get("/system/config/site", async (c) => {
   const names = [
     "SITE_NAME",
     "SITE_DESCRIPTION",
     "LOGO_URL",
-    "NOTICE",
-    "NOTICE_POPUP",
-    "NOTICE_POPUP_INTERVAL_HOURS",
     "ALLOW_REGISTER",
     "HIDE_NODE_STATUS",
     "HIDE_FOOTER",

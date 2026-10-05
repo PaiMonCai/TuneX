@@ -44,6 +44,11 @@ import { dashboardRoutes } from "./routes/dashboard.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
 import { forwardsRoutes } from "./routes/forwards.ts";
 import { ddnsRoutes } from "./routes/ddns.ts";
+// V5-WP18.5：公告（用户侧/租户侧 + 平台管理端）。平台前缀 `/admin/announcements` 的
+// RBAC 登记是 WP18.6 的动作；本 WP 只挂路由 —— 未登记前缀由 adminPermissionGuard
+// fail-closed 到 super_admin（契约 F7）。
+import { announcementRoutes } from "./routes/announcements.ts";
+import { announcementAdminRoutes } from "./routes/announcements-admin.ts";
 import { plansRoutes } from "./routes/plans.ts";
 import { topupsRoutes } from "./routes/topups.ts";
 import { paymentsRoutes } from "./routes/topups.ts";
@@ -172,6 +177,10 @@ export function createApp() {
   // 因此用既有 workspace 域 RBAC（read / manage on "node"），不新增 /api/admin/* 权限 key：
   // Admin Console 与 User Console 走同一套后端资源与 RBAC，前端只做 UX 分层（§9.4.1）。
   app.route("/api/route-profiles", routeProfilesRoutes);
+  // V5-WP18.5：公告。用户/租户侧挂 `/api/announcements`（免 workspace 权限的读 +
+  // settings:read/manage 的管理面），平台侧挂 `/api/admin/announcements`（§⑥ 的
+  // adminRequired + adminPermissionGuard 已统一施加）。
+  app.route("/api/announcements", announcementRoutes);
   // V5.5 WP14：联邦 M2M 端点。挂载在 publicRoutes 之前：与 /api/internal/* 同理，
   // 路径更具体先落位；免认证白名单已整段豁免 /api/federation/*。
   app.route("/api/federation/v1", federationRoutes);
@@ -197,6 +206,10 @@ export function createApp() {
   // health 是**读**接口（判定由 services/node-health.ts 的纯函数给出），
   // 因此不新增限流规则，走 api-global。
   app.route("/api/admin", nodeHealthRoutes);
+  // V5-WP18.5：平台公告（发布 / 撤回 / 列全部）。前缀 `/admin/announcements` 尚未登记进
+  // `ADMIN_RESOURCES`（那是 WP18.6）：adminPermissionGuard 对未登记前缀一律 403，
+  // 只放行 super_admin —— 契约 F7「不登记 = 只有超管」，也正是 18.6 断言「登记生效」的起点。
+  app.route("/api/admin", announcementAdminRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 

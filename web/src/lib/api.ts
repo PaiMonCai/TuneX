@@ -113,6 +113,9 @@ import type {
   WorkspaceTrafficSummary,
 } from "./types";
 import { normalizeHealthSummary } from "./node-health";
+// V5-WP18.5：公告类型与 `lib/types.ts` 分开 —— 那个文件是全局 schema 镜像表，
+// 由多条线并行编辑；公告只被公告组件用到，放自己文件里避免互相干扰。
+import type { Announcement } from "./announcements";
 // V5.2 §7：目标健康视图的契约镜像（状态/理由码的 closed set 在那一处）。
 import type { TargetPoolHealth } from "./target-health";
 import { shouldRedirectToLogin } from "./workspace-permissions";
@@ -469,6 +472,25 @@ export const api = {
      */
     attention: (cookie?: string) =>
       get<AttentionPayload>("/dashboard/attention", undefined, cookie),
+  },
+  /**
+   * V5-WP18.5：公告（用户侧）。
+   *
+   * 只有两个方法：读列表、标记已读。**没有**免打扰偏好的读写 —— 契约 §9.5 明确本期
+   * 不做通知中心前端（渠道偏好矩阵 UI），后端那两个端点由后端契约测试覆盖；
+   * 没有 UI 的客户端方法就是死代码。
+   *
+   * 可见性（platform ∪ 本 workspace、未撤回）与"我是否已读"都由后端算好，
+   * 前端不重判（`lib/announcements.ts` 只做形状校验与展示排序）。
+   */
+  announcements: {
+    list: (cookie?: string) => get<Announcement[]>("/announcements", undefined, cookie),
+    dismiss: (id: ID, cookie?: string) =>
+      post<{ announcement_id: number; already: boolean; dismissed_at: string }>(
+        `/announcements/${id}/dismiss`,
+        {},
+        cookie,
+      ),
   },
   // User-facing forwarding is V4-only from this point onward.
   // Legacy /api/tunnels stays backend-compatible, but the Web client no longer
