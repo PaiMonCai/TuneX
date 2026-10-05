@@ -411,13 +411,15 @@ export async function syncForwardDns(
     return base({ action: "error", desired, confirmed, plan, error: "provider 凭据不可用（未封存或缺失）" });
   }
 
-  const client = deps.clientFor({
-    providerId: row.dns_provider_id,
-    sealedConfig: sealed,
-    recordType: row.dns_record_type,
-  });
-
   try {
+    // 客户端构造**在 try 里面**：解封失败（密钥轮换过、数据被改坏）是"数据不可用"，
+    // 必须是可解释的 `error` 结果 + 退避，而不是一个抛到调用方那里的异常 —— 后者会让
+    // 扫描日志里出现一次"崩溃"，而真实情况是"这一条凭据需要人来处理"。
+    const client = deps.clientFor({
+      providerId: row.dns_provider_id,
+      sealedConfig: sealed,
+      recordType: row.dns_record_type,
+    });
     await client.writeValues({ domain: row.dns_domain, recordType: row.dns_record_type, values: desired, ttlSeconds: TTL_SECONDS });
 
     // ── L1 读回（禁止假成功的落点）──

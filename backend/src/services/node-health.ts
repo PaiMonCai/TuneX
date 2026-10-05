@@ -30,6 +30,7 @@
  *      完全缺失/落后，或 apply_status=error。
  */
 import { deriveConnection, type NodeConnectionValue } from "./node-lifecycle.ts";
+import { normalizeTunnelDiag, type TunnelProtocolDiag } from "./tunnel-diag.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -144,6 +145,17 @@ export interface ReportedRuntime {
   ingress_port?: number | null;
   egress_port?: number | null;
   revision?: number | null;
+  /**
+   * V5-WP19-F：这条 runtime 的**协议专属事实**（tls 证书/握手、ws upgrade、udp
+   * `mappings`/`packets_*`/`bytes_*`/`drops`/`idle_timeout_seconds`、RELAY 的
+   * `hop_local_addr`）。键集开放、由 Agent 拥有；视图层只做类型化 + 有界化
+   * （`services/tunnel-diag.ts`）。
+   *
+   * **缺省（`undefined`）≠ `facts: {}`**：前者是「这条隧道没有 diag 块」（tcp 隧道、
+   * 旧 Agent），后者是「报了，只是这次没有标量事实」。把两者合并，就正好是
+   * 「一个把每个报文都丢掉的出口」与「一个空闲的出口」在面板上变得无法区分的方式。
+   */
+  diag?: TunnelProtocolDiag;
 }
 
 /** 面板侧的 desired runtime（每条 Forward 在本节点上应有的运行态）。 */

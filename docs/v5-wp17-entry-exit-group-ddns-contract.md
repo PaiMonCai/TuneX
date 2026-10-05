@@ -394,6 +394,25 @@
 
 **边界**：本 WP 不接 failover、不碰 rollout —— 触发点、就绪性闸门与 DNS 后继属于 WP17.4。
 
+### WP17.4 交付记录：为什么闸门在前、后继在后，以及后继为什么"每拍都看"（2026-10-05）
+
+- **闸门（执行器之前）**：开了自动解析但 DNS 写不通时**不迁移**。代价不对称 —— 迁移让客户端在
+  TTL 内连旧地址是"短暂中断"，而"面板显示已切换、DNS 还是旧地址"是看着正常实际全挂。
+  不 ready ⇒ 不调用执行器、**epoch 不动**，并把 `dns_path_unready` 记成可观测量
+  （静默地不迁移与"没有需要迁移的"在日志里长得一样，而前者排查成本极高）。
+- **"就绪"必须有证据**：provider 行存在只是**配置**；"最近一次成功写的新鲜度"
+  （`DDNS_PROOF_MAX_AGE_MS` 内）或"只读探测成功"才是**证据**。一个刚配好、从来没写通过的
+  provider 不该让迁移开始。新鲜度命中时**不做探测**（省一次出网）。探测抛错 = 不可用，不是崩溃。
+- **后继（执行器之后）**：必须等 `applied_revision == config_revision`。先写再搬 = 把客户端指向
+  还没监听的机器；没到就这一拍不做、**下一拍再看**。
+- **后继由扫描每拍调用**，而不是"迁移完成时回调一次"：rollout 是异步的、会失败、会重试，
+  而一对回调只有在"它一定成功且一定会通知我们"时才成立。每拍调用之所以免费，是因为
+  `syncForwardDns` 的第一层判据（值集没变 ⇒ 零外呼）让它什么都不做。
+- **可用入口集合的算法与故障转移候选同一份**（WP17.1 的 `candidateRejection`）：两处各自
+  "算对了"却给出不同答案（迁移到 A、DNS 写 B）是最难查的一类不一致。
+
+**边界**：本 WP 只做"闸门 + 后继 + 接线"，Gate V5-G6 与证据（WP17.5）尚未做。
+
 ## 5. WP 拆分（一个 WP 一个可交付物；次序 17.1/17.2 并行 → 17.3 → 17.4 → 17.5）
 
 | WP | 可交付物（单件） | 明确不含 |
@@ -402,7 +421,7 @@
 | WP17.1 | 候选集同源化：`failover-loop` 的候选来源与 Route Profile 编译来源一致（同一份 `nodeAdmission` + constraints，`deriveConnection` 判在线），离线用例钉死「不放行 ⇒ 不迁 + 原因码」 —— **已交付 2026-10-05**：`services/ingress-candidate.ts`（唯一实现，编译器与循环共用）+ D4 收口（`preferred_ingress_node_id` / `failback_healthy_checks` 两列 + `PUT /:id/preferred-ingress` 写入路径 + 扫描维护连续健康计数）；20 条断言 | 不改 `decideFailover` 词表 |
 | WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 —— **已交付 2026-10-05**：`services/ddns-binding.ts` + `routes/ddns.ts` + `forwards.ts` 的 `/:id/dns`；38 条断言（服务层 33 + 路由层 5，后者钉住 `settings:manage` 这条接线） | 不写 DNS、不建 provider 适配 |
 | WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 —— **已交付 2026-10-05**：`services/ddns-executor.ts`（唯一的外呼入口）+ 退避两列（additive 迁移）；25 条断言 | 不接 failover、不碰 rollout |
-| WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 | 不新增定时器、不改 rollout 步骤词表 |
+| WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 —— **已交付 2026-10-05**：`services/ddns-successor.ts`（闸门 + 后继 + 生产接线）+ `failover-loop` 接线；13 条断言 | 不新增定时器、不改 rollout 步骤词表 |
 | WP17.5 | Gate V5-G6 + `docs/evidence/` 证据 | 不改 G3/G4/G5 断言 |
 
 ## 6. DoD（可断言的检查）

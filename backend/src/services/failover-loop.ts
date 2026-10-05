@@ -17,6 +17,10 @@
 import { db } from "../db.ts";
 import { systemConfig } from "./config.ts";
 import { candidateRejection, type CandidateFacts } from "./ingress-candidate.ts";
+// V5-WP17.4：闸门与后继。**静态** import 是安全的：这两个模块都不在 import 期读 env
+//（`ddns-successor` 里的 `db` 是延迟 import），所以本模块仍然可以在没有 DATABASE_URL 的
+// 进程里被 import 与断言。
+import { defaultDnsGate, defaultDdnsSuccessor } from "./ddns-successor.ts";
 import {
   executeFailoverForTunnel,
   readFailoverDecisionFacts,
@@ -153,6 +157,16 @@ export interface FailoverSweepOptions {
   /** 只评估这些 tunnel 时用的执行器（测试注入替身）。 */
   readonly execute?: typeof executeFailoverForTunnel;
   /**
+   * V5-WP17.4 —— **就绪性前置闸门**（契约 F5 ④）。缺省走生产实现。
+   * 不可用 ⇒ **不调用执行器**、记 `dns_path_unready`、epoch 不动。
+   */
+  readonly dnsGate?: (tunnelId: number) => Promise<{ applicable: boolean; ready: boolean; reason?: string }>;
+  /**
+   * V5-WP17.4 —— **DNS 后继**（迁移/回切之后写 DNS）。缺省走生产实现。
+   * 每拍对每条开启自动解析的转发调用一次；值集没变时它**零外呼**，所以"每拍都看"不产生额外成本。
+   */
+  readonly dnsSuccessor?: (tunnelId: number) => Promise<{ outcome: string }>;
+  /**
    * V5-WP17.1：记录"首选节点这一拍是否合格"。缺省写 `tunnel.failback_healthy_checks`。
    *
    * 做成可注入的钩子而不是往 `FailoverExecutorDb` 上加 `update`：那个接口是**执行器**的
@@ -167,6 +181,12 @@ export interface FailoverSweepResult {
   readonly moved: number;
   readonly held: number;
   readonly results: readonly FailoverExecutionResult[];
+  /**
+   * 因 DNS 路径不可用而**没有调用执行器**的转发（含原因码）。
+   * 它们是**观测事实**，必须能被看见：静默地不迁移与"没有需要迁移的"在日志里长得一样，
+   * 而前者的排查成本极高（契约 §7 第 7 条对这一点有明确要求）。
+   */
+  readonly dns_gated: readonly { readonly tunnel_id: number; readonly reason: string }[];
 }
 
 /**
@@ -186,7 +206,7 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
   }
   // 策略关闭时**不扫描**：省掉每拍的读库，也让"没开自动迁移"在日志里是静默的而不是每拍一条 hold。
   if (!policy.auto_failover && !policy.auto_failback) {
-    return { evaluated: 0, moved: 0, held: 0, results: [] };
+    return { evaluated: 0, moved: 0, held: 0, results: [], dns_gated: [] };
   }
 
   const tunnelIds = options.tunnelIds
@@ -225,9 +245,29 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
   };
 
   const results: FailoverExecutionResult[] = [];
+  const dnsGated: Array<{ tunnel_id: number; reason: string }> = [];
   let moved = 0;
   let held = 0;
+  const dnsGate = options.dnsGate ?? defaultDnsGate;
+  const dnsSuccessor = options.dnsSuccessor ?? defaultDdnsSuccessor;
   for (const tunnelId of tunnelIds) {
+    // ── V5-WP17.4 ① 就绪性闸门（**执行器之前**）──
+    //
+    // 开了自动解析但 DNS 这条路写不通时**不迁移**：迁移让客户端在 TTL 内连旧地址是"短暂中断"，
+    // 而"面板显示已切换、DNS 还是旧地址"是看着正常实际全挂。代价不对称 ⇒ 宁可不动（epoch 不动，
+    // 契约 F5 ④），并把原因记成可观测的事实（静默地不迁移与"没有需要迁移的"在日志里长得一样）。
+    const gate = await dnsGate(tunnelId);
+    if (gate.applicable && !gate.ready) {
+      const reason = gate.reason ?? "dns_path_unready";
+      dnsGated.push({ tunnel_id: tunnelId, reason });
+      logFn({
+        level: "warn",
+        message: "failover gated: DNS 路径不可用，本轮不迁移",
+        detail: { tunnel_id: tunnelId, reason },
+      });
+      continue;
+    }
+
     const result = await (options.execute ?? executeFailoverForTunnel)(tunnelId, deps);
     results.push(result);
     if (result.outcome === "moved") moved += 1;
@@ -251,8 +291,27 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
     if (result.outcome !== "hold") {
       logFn({ level: "info", message: `failover ${result.outcome}`, detail: result });
     }
+
+    // ── V5-WP17.4 ② DNS 后继（**执行器之后**）──
+    //
+    // 每拍对每条走过闸门的转发各一次：值集没变时 `syncForwardDns` 的第一层判据让它**零外呼**，
+    // 所以"每拍都看"不产生额外成本，换来的是自愈（迁移完成、退避到期、人工改了拓扑都会自然收敛）。
+    // "迁移完成时回调一次"不够：rollout 是异步的，而且会失败、会重试。
+    try {
+      const after = await dnsSuccessor(tunnelId);
+      if (after.outcome === "synced") {
+        logFn({ level: "info", message: "ddns successor", detail: { tunnel_id: tunnelId } });
+      }
+    } catch (e) {
+      // DNS 后继失败**不**影响迁移判定：迁移已经完成，DNS 有自己的退避与重试节拍。
+      logFn({
+        level: "warn",
+        message: "ddns successor failed",
+        detail: { tunnel_id: tunnelId, error: (e as Error)?.message ?? String(e) },
+      });
+    }
   }
-  return { evaluated: tunnelIds.length, moved, held, results };
+  return { evaluated: tunnelIds.length, moved, held, results, dns_gated: dnsGated };
 }
 
 /**

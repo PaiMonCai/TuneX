@@ -147,6 +147,11 @@ model Workspace {
   /// V5-WP17（契约 F6）：该租户拥有的 DNS 凭据。NULL 归属的 provider 是平台级，
   /// 不在任何租户的列表里。
   dns_providers    DNSProvider[]     @relation("workspace_dns_providers")
+  /// V5-WP20-2（契约 §3.5.2）：套餐归属的唯一真相。「一个租户一份订阅」由
+  /// `PlanSubscription.workspace_id @unique` 保证。
+  plan_subscription PlanSubscription?
+  /// V5-WP20-2（契约 §3.5.4）：本租户名下的购买订单（历史行可为 NULL = 未归属，R5）。
+  plan_orders      PlanOrder[]
 
   @@map("workspace")
 }
@@ -1132,6 +1137,21 @@ model AdminRole {
   @@map("admin_role")
 }
 
+/// V5-WP20-2（契约 `docs/v5-wp20-subscription-billing-runtime-contract.md` §3.3/§3.5.2）：
+/// **legacy 展示视图，冻结**。不要把它接回任何判定路径。
+///
+/// 三条冻结理由（契约 §4.0 Lead 裁决）：
+///  1. 判定链全部按 **workspace**（`WorkspacePolicyAssignment` → `composeEffectivePolicy`），
+///     而本表是**用户级单例**（`user_id @unique`），在 team workspace 下无法表达
+///     「一个租户一份套餐、多成员共享额度」；套餐归属的唯一真相是
+///     `PlanSubscription`（`workspace_id @unique`）。
+///  2. `traffic_used` **禁止回写**：流量真相是「已归档事实（`tunnel_traffic`）的窗口求和」，
+///     回写本列会产生第二份用量真相。前端要展示已用流量请读 `GET /api/me/capabilities`。
+///  3. `traffic` / `max_tunnels` / `whitelist_ips` 同理是**历史快照**，不得当作额度判定输入
+///     （额度唯一真相是显式发放）。
+///
+/// 本表仍由 `personal` workspace 的购买路径**双写**（保持 dashboard/admin 展示不破），
+/// 双写同事务，且 `PlanSubscription` 是真相、本表是投影。
 model UserPlan {
   id            Int       @id @default(autoincrement())
   user_id       Int       @unique
@@ -1185,6 +1205,7 @@ model Plan {
   node_groups PlanNodeGroup[]
   orders      PlanOrder[]
   user_plans  UserPlan[]
+  subscriptions PlanSubscription[]
 
   @@map("plan")
 }
@@ -1212,10 +1233,103 @@ model PlanOrder {
   balance    Float
   coupon_id  Int?
   coupon     PlanCoupon? @relation(fields: [coupon_id], references: [id])
+  /// V5-WP20-2（契约 §3.5.4）：这笔钱**买给哪个租户**。`user_id` 保持「谁点的购买谁付款」，
+  /// 本列是归属维度。**历史行 NULL 是合法历史，不猜**（契约 R5）——所以可空、无默认值、
+  /// 无回填；新行必填由 WP20-4 的应用层保证。
+  /// 删除语义：`SetNull`（Prisma 对可空关系的默认）——既有删用户流程会先 `workspace.deleteMany`
+  /// 再删 `planOrder`（`routes/admin-extended.ts:424` 起），`Restrict` 会让删用户直接失败。
+  workspace_id Int?
+  workspace  Workspace?  @relation(fields: [workspace_id], references: [id], onDelete: SetNull)
   created_at DateTime    @default(now())
   updated_at DateTime    @updatedAt
 
+  settlements SubscriptionPeriodSettlement[]
+
+  @@index([workspace_id])
   @@map("plan_order")
+}
+
+/// V5-WP20-2（契约 §3.5.2）：**订阅归属的唯一真相** —— 套餐属于 **Workspace**，不属于 user。
+///
+/// 为什么不继续用 `UserPlan`：判定链（额度、资源计数、`sumWorkspaceTraffic`）全部按 workspace，
+/// 而 `UserPlan.user_id @unique` 是用户级单例，无法表达 team workspace 下
+/// 「一个租户一份套餐、多成员共享额度」。本表 `workspace_id @unique` 直接表达该形状。
+///
+/// 快照字段**只含商务口径**（`plan_name` / `billing_cycle` / `price`）：套餐改价改名后，
+/// 历史订阅仍要能对账。**刻意不抄 `traffic` / `max_tunnels` 等额度数字** —— 额度判定的唯一
+/// 真相是显式发放（`WorkspacePolicyAssignment` → `composeEffectivePolicy`），把额度抄进订阅行
+/// 会制造第二份额度真相并诱导读方做「套餐 → 策略」的隐式推导（契约 §3.5.3、§8.3、F5/F6）。
+model PlanSubscription {
+  id            Int           @id @default(autoincrement())
+  /// 一个 workspace 至多一份有效订阅（契约 §3.5.2 的目标形状）。
+  workspace_id  Int           @unique
+  /// 删除语义 = `Cascade`：既有删用户流程会删掉 `personal` workspace
+  /// （`routes/admin-extended.ts:424` 的 `workspace.deleteMany`），`Restrict` 会让「删用户」
+  /// 直接失败；订阅随租户消失是该流程的既有意图。
+  workspace     Workspace     @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  plan_id       Int
+  plan          Plan          @relation(fields: [plan_id], references: [id])
+  started_at    DateTime
+  /// **可空**：`BillingCycle` 含 `lifetime`（F25），终身订阅没有到期点。若设 NOT NULL，
+  /// 终身套餐会被迫写一个魔法日期（如 9999-12-31），那就是第二个真相 + 边界 bug。
+  expires_at    DateTime?
+  /// 自动续费 fail-closed 默认关闭（契约 §3.5.3）：结算任务只记账、只降级，绝不默认扣款续期。
+  auto_renew    Boolean       @default(false)
+  /// 订阅来源。**VARCHAR 而不是新枚举**：加值不该要求一次 schema 变更（联邦同取向，
+  /// 见 `20261022000000_v5_wp14_federation_identity` 的注释）；合法值由应用层校验，
+  /// 当前集合 `{purchase, admin_grant}`，默认 `purchase`。
+  source        String        @db.VarChar(32) @default("purchase")
+  /// 购买当时的套餐名快照（套餐改名后历史订阅仍可对账）。
+  plan_name     String        @db.VarChar(255)
+  /// 购买当时的计费周期快照。
+  billing_cycle BillingCycle
+  /// 购买当时的价格快照（`PlanOrder.price` 是实付，本列是当时标价，两者不同不矛盾）。
+  price         Float
+  created_at    DateTime      @default(now())
+  updated_at    DateTime      @updatedAt
+
+  settlements SubscriptionPeriodSettlement[]
+
+  @@index([plan_id])
+  /// 到期扫描（`started_at <= now < expires_at`，契约 §8.1：订阅「有效」是时间比较，不是状态列）。
+  @@index([expires_at])
+  @@map("plan_subscription")
+}
+
+/// V5-WP20-2（契约 §3.1.4）：**周期结算账本**，「每个周期只结算一次」的幂等闸门。
+///
+/// 幂等不是「再查一遍」，而是**先占位后执行**（先例 `federation/usage.ts:575` 的唯一索引取向）：
+///   ① `create` 占位（唯一键 `(plan_subscription_id, period_key)` 命中 `P2002` ⇒ 本轮跳过）
+///   → ② 扣款/发放 → ③ 置 `settled`。崩溃在 ① 与 ② 之间的 `pending` 由下一轮**接管续跑**。
+/// 因此本表不得有应用层删除路径；「重置展示」与「篡改账本」必须分离（契约 §2 吸收语义）。
+model SubscriptionPeriodSettlement {
+  id                   Int              @id @default(autoincrement())
+  plan_subscription_id Int
+  plan_subscription    PlanSubscription @relation(fields: [plan_subscription_id], references: [id], onDelete: Cascade)
+  /// 周期标记：Asia/Shanghai 下的 `YYYY-MM`（月结）或 `YYYY-MM-DD`（日结）。
+  /// **形状由 WP20-2 冻结**（WP20-1 刻意不先冻一个没有消费者的格式）。
+  period_key           String           @db.VarChar(16)
+  /// `pending` | `settled` | `failed`。VARCHAR + 应用层校验，不用新枚举（DoD 第 7 条：
+  /// `enum .*Status` 数量不得增加；状态集合还会长，枚举加值会让旧二进制读未知值即失败）。
+  state                String           @db.VarChar(16) @default("pending")
+  /// 接管续跑的尝试计数（超时由 `SystemConfig` 提供，默认 10 分钟，不硬编码 —— 契约 O4）。
+  attempts             Int              @default(0)
+  /// 本次结算产生的订单（未扣款的周期为 NULL）。账本行删掉时置 NULL，不连带抹掉结算占位。
+  order_id             Int?
+  order                PlanOrder?       @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  /// 失败原因（给人看；判定与重试不依赖它的内容）。
+  error                String?          @db.Text
+  /// 本次结算**开始**时间：接管判定的基准（`state="pending"` 且 `started_at` 早于超时 ⇒ 可接管）。
+  started_at           DateTime         @default(now())
+  settled_at           DateTime?
+  created_at           DateTime         @default(now())
+  updated_at           DateTime         @updatedAt
+
+  /// 幂等闸门：同一订阅的同一周期只能有一行。
+  @@unique([plan_subscription_id, period_key])
+  /// 接管续跑扫描：按「状态 + 开始时间」捞超时的 `pending`。
+  @@index([state, started_at])
+  @@map("subscription_period_settlement")
 }
 
 enum TopupOrderStatus {
@@ -2213,4 +2327,67 @@ model FederationUsageRecord {
   @@index([tunnel_id, window_start])
   @@index([peer_panel_id, window_start])
   @@map("federation_usage_record")
+}
+
+/// V5-WP18.2 —— 通知投递账本（契约 F3/F4）。
+///
+/// 这张表**只描述「尝试投递」**，不是事实源（C2）：删掉全部行不影响任何判定，
+/// 通知的真相永远在它派生的那张既有表（`node` / `tunnel` / …）。
+///
+/// 设计要点：
+///   · `dedupe_key` = sha256(scope, source_kind, source_id, reason_code, window_start)，
+///     与 `channel_kind` 组成唯一索引：同一事实同一渠道在一个静默窗内**只落一行**
+///     （F4.2 的"唯一索引兜底"，api 与 worker 两个进程并发派生也不会各发一次）；
+///   · 唯一索引必须带 `channel_kind`：契约 F3 要求"每渠道各自一条投递记录"，
+///     而 F4.2 的 `dedupe_key` 组成里**没有**渠道——两处要求联立后只剩这一种解；
+///   · `status` 从 `sending` 起步再收敛为 `sent`/`failed`：先占位、后投递，
+///     并发下第二个进程会在唯一索引上撞键而不是发出第二封信（R7 的三层防线）；
+///   · `degraded` 记「静默期降级」：Redis 不可用时仍发送（O2 裁决），但必须留下
+///     "这次去重是进程内近似"的痕迹，否则事后无法解释重复投递；
+///   · 不建 workspace 外键（与 FederationPlacement 同一取向）：账本是历史证据，
+///     删 workspace 不该抹掉"我们给谁发过什么"，孤儿 id 比级联删除更可接受；
+///   · 全部用 String 而不是 DB enum：F5 已冻结"additive、不引 DB enum"——
+///     enum 增删值都会让旧二进制读到未知值时失败。
+model NotificationDelivery {
+  id             Int      @id @default(autoincrement())
+  /// platform | workspace（与 NotificationScope 同源；结构上 platform ⟹ workspace_id = NULL）。
+  scope_kind     String   @db.VarChar(16)
+  workspace_id   Int?
+  /// 幂等键（64 位十六进制），与契约 F4.2 的组成一一对应。
+  dedupe_key     String   @db.VarChar(64)
+  /// N1–N6 封闭枚举（node | forward | reconcile_finding | workspace_event | federation_event | announcement）。
+  source_kind    String   @db.VarChar(32)
+  /// 既有表主键（F8-B：不存在指向不存在行的投递）。
+  source_id      String   @db.VarChar(191)
+  /// 既有词表的原因码（attention 的 AttentionReasonCode）。
+  reason_code    String   @db.VarChar(64)
+  severity       String   @db.VarChar(16)
+  resource_type  String   @db.VarChar(64)
+  resource_id    String   @db.VarChar(191)
+  channel_kind   String   @db.VarChar(16)
+  /// 投递目标（邮箱地址 / webhook URL / chat id）。**绝不含凭据**：
+  /// webhook 的密钥不得出现在这里，URL 必须由渠道自己脱敏后回传（WP18.3）。
+  target         String   @db.VarChar(512)
+  /// sending | sent | failed。
+  status         String   @db.VarChar(16) @default("sending")
+  /// 失败原因（not_configured | transport_error | rejected_target | unsupported_channel | ledger_unavailable）。
+  failure_reason String?  @db.VarChar(32)
+  /// 实际尝试次数（有界：≤ 3）。
+  attempts       Int      @default(0)
+  /// 静默期判定是否降级（Redis 不可用 → 进程内近似去重）。
+  degraded       Boolean  @default(false)
+  /// 错误摘要（已截断；不允许原文里的凭据落地）。
+  error          String?  @db.Text
+  /// 事实的发生时刻（来源表上的既有时间戳）。
+  occurred_at    DateTime
+  /// 幂等键的时间窗下界（诊断列：回答"下一条要等多久"）。
+  window_start   DateTime
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  @@unique([dedupe_key, channel_kind])
+  @@index([workspace_id, created_at])
+  @@index([source_kind, source_id])
+  @@index([status, created_at])
+  @@map("notification_delivery")
 }
