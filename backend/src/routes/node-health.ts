@@ -1,32 +1,9 @@
 /**
- * V4-WP6 — Node health API（管理端：单节点健康 + 全量巡检）
+ * Read-only Admin Node health surface.
  *
- * 依据 `DEVELOPMENT.md` §13.4.4。挂载（app.ts）：`/api/admin`，与
- * node-admin.ts / node-lifecycle.ts 同批，认证与权限由挂载点统一施加
- * （adminRequired → adminPermissionGuard），本文件不重复挂。
- *
- * ── 端点总览 ──
- *   GET /api/admin/node/:id/health   单节点：三层状态 + health 判定 + 遥测视图
- *   GET /api/admin/node/health       全量巡检（?health=/?lifecycle=）+ 计数摘要
- *
- * ── RBAC 归属（不新增资源键，复用 `nodes`）──
- * 两个路径都在 `/admin/node` 前缀下，与 WP5/WP10 的节点端点同一资源
- * （permissions.ts 的 `nodes`）。health 是节点管理面的读能力，不是独立业务域：
- * 新增资源键会让同一个「看节点」的动作散落到两个授权项上。
- *
- * ── 为什么把 health 放在独立文件而不是塞进 node-admin.ts ──
- * node-admin.ts 是 WP10 的池/目标/凭据 CRUD（有写路径、有 §2.2 池不变式），
- * health 是纯读的派生视图。混进去会让「池不变式」与「健康阈值」两套规则在
- * 同一个文件里演化，也让 WP6 的测试不得不替身一整张池/目标表。本文件只读
- * node / node_state_report / tunnel 三张表。
- *
- * ── 凭据纪律 ──
- * 响应只由 `NodeHealthView` 组成：没有 `node_credential_hash`，也没有明文
- * （health 判定只需要「有没有凭据」这一个布尔）。
- *
- * ── 限流 ──
- * 两条都是 GET（巡检页会轮询），走 `api-global`（600/min，user 维度）；
- * 不新建专属规则——读端点不会因额度小而被误伤，也不需要更严的写保护。
+ * Health is derived from node lifecycle, connection/runtime facts and telemetry.
+ * These routes share the existing `nodes` resource permission and intentionally
+ * remain separate from the mutable egress/credential control surface.
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
