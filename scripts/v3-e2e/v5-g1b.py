@@ -479,9 +479,23 @@ def g1b_5_relay_end_to_end():
 
     # And the exit really hosts a datagram runtime: "the panel says active" is not the
     # same fact as "the node runs it".
-    check(H.wait_until(lambda: "udp" in H.scalar(
-        "SELECT IFNULL(tunnels,'[]') FROM node_state_report WHERE node_id=%d;" % H.EGR), timeout=20, interval=4),
-        "G1B.5 the egress node really hosts a udp runtime")
+    #
+    # Two things this assertion has to get right, and neither is cosmetic:
+    #
+    #   · It must name THIS tunnel's egress leg. `"udp" in <the whole report>` is satisfied
+    #     by any udp runtime the node happens to have — including a leftover from another
+    #     case — so it could pass while this Forward has no exit at all.
+    #   · The window must span more than one reporting cycle. The node reports every ~30s
+    #     (and the hop-peer correction re-dispatches this leg once it learns the ingress's
+    #     endpoint, which moves the revision it reports). A 20s window against a 30s
+    #     cadence is a coin flip, not a test.
+    check(H.wait_until(lambda: any(
+        isinstance(t, dict) and str(t.get("id", "")) == f"tunex-{fid}-egress"
+        and str(t.get("protocol", "")) == "udp"
+        for t in json.loads(H.scalar(
+            "SELECT IFNULL(tunnels,'[]') FROM node_state_report WHERE node_id=%d;" % H.EGR) or "[]")
+    ), timeout=75, interval=5),
+        "G1B.5 the egress node really hosts a udp runtime for THIS Forward")
 
 
 def g1b_6_malformed_datagrams():
