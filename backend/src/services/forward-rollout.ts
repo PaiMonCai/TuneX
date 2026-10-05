@@ -1,5 +1,5 @@
 /**
- * V4-WP3 — Forward Rollout Orchestrator（`DEVELOPMENT.md` §13.3.5 / §13.3.4）。
+ *  — Forward Rollout Orchestrator（`DEVELOPMENT.md` §13.3.5 / §13.3.4）。
  *
  * ── 本模块是什么 ──
  * §13.3.5 要求所有 runtime 相关 Forward 编辑统一建模为
@@ -8,8 +8,8 @@
  * VALIDATE → PREPARE → CUTOVER → DRAIN → CLEANUP
  * ```
  *
- * 上游已冻结构：目标 config（WP1 snapshot + `computeForwardImpact` 的影响面）、
- * 每跳能力（WP2 原语）、传输（`Orchestrator` 的四个 dispatch 方法）、账本
+ * 上游已冻结构：目标 config（ snapshot + `computeForwardImpact` 的影响面）、
+ * 每跳能力（ 原语）、传输（`Orchestrator` 的四个 dispatch 方法）、账本
  * （`ControlValidator`）。缺的正是把它们按五阶段串起来、且**每一步都可从 DB
  * 续跑**的一层——本文件就是那一层的前半：**纯计划**。
  *
@@ -20,7 +20,7 @@
  * 副作用也做不到。单测因此可以离线跑完整矩阵。
  *
  * ── 单一真相：不重算差异 ──
- * `planRollout` 接收 WP1 `computeForwardImpact` 的**输出**作为输入，自己不算
+ * `planRollout` 接收  `computeForwardImpact` 的**输出**作为输入，自己不算
  * 「改了什么」。§13.3.3 的硬约束是「校验逻辑只能有一个 Service 实现」，把差异
  * 计算复制一份到这里就等于给 §13.3.4 的分类表开出第二处定义——两处必然漂移，
  * 而漂移的方向永远是「某类修改被漏掉」。
@@ -36,7 +36,7 @@
  * ── 不做什么 ──
  *  · 不加新 wire `CommandAction`：五阶段只是 backend 对既有 `apply_tunnel` /
  *    `remove_tunnel` 的编排顺序（§2.2 out of scope）。
- *  · 不复制 runtime 事实：端口/节点/目标的真值在 tunnel 行 + WP1 snapshot，
+ *  · 不复制 runtime 事实：端口/节点/目标的真值在 tunnel 行 +  snapshot，
  *    本模块只产出「该动哪个资源的哪一面」。
  */
 
@@ -123,7 +123,7 @@ export type RolloutStepKind =
    * 而计划与执行器必须对同一件事用同一个名字。
    */
   | "prepare_transit"
-  /** 入口 apply（= WP2 `ReplaceListener` 的目标形态）。 */
+  /** 入口 apply（=  `ReplaceListener` 的目标形态）。 */
   | "cutover_ingress"
   /** EGRESS 侧切换（换节点/换池时）。 */
   | "cutover_egress"
@@ -189,10 +189,10 @@ export interface RolloutPlan {
 /**
  * rollout 视角的一份快照。
  *
- * 形状与 WP1 `ForwardCandidateConfig` 同源但**多出运行期解析值**
+ * 形状与  `ForwardCandidateConfig` 同源但**多出运行期解析值**
  * （listen_ip / egress_port / egress_pool_id / egress_targets /
  * desired_status）：计划要决定「在哪个节点哪个端口上下发」，只有业务字段不够。
- * 它由调用方从 WP1 `forward_revision` 行或兼容投影列合成——本模块不碰 IO，
+ * 它由调用方从  `forward_revision` 行或兼容投影列合成——本模块不碰 IO，
  * 因此**不复制 runtime 事实**这件事在类型层面成立。
  */
 export interface RolloutSnapshot {
@@ -226,7 +226,7 @@ export interface RolloutNodeFact {
   role: string | null;
   connect_ip: string | null;
   /**
-   * WP5 `Node.lifecycle`（§13.4.1 三层状态的 Lifecycle 层）。
+   *  `Node.lifecycle`（§13.4.1 三层状态的 Lifecycle 层）。
    * 判定统一走 node-lifecycle.ts 的 `lifecycleAcceptsBusiness()` / 
    * `businessRejectionCode()`，本文件不再持有任何等价常量副本。
    */
@@ -239,7 +239,7 @@ export interface PlanRolloutInput {
   revision: number;
   base_revision: number | null;
   /**
-   * WP1 `computeForwardImpact` 的输出。**唯一**的差异来源——本函数不重算。
+   *  `computeForwardImpact` 的输出。**唯一**的差异来源——本函数不重算。
    */
   impact: ForwardImpact;
   /** 目标（desired）快照。 */
@@ -265,15 +265,15 @@ export interface PlanRolloutInput {
 }
 
 /* ================================================================== */
-/* 节点准入（V4-WP5 §13.4.2 —— 单一真相在 node-lifecycle.ts）            */
+/* 节点准入（ §13.4.2 —— 单一真相在 node-lifecycle.ts）            */
 /* ================================================================== */
 /*
  * 这里曾经有一份「逐字一致」的本地副本（ROLLOUT_ADMITTED_LIFECYCLES +
  * ROLLOUT_LIFECYCLE_BLOCKING_CODES）。那正是 §13.4.2 / 审计 R7 明令禁止的
  * 双实现漂移点：两份拷贝可以各自演进，于是「准入」会静默地取决于调的是哪份。
- * WP5 已把 lifecycle 服务层收拢到 node-lifecycle.ts，此处删副本、改为 import。
+ *  已把 lifecycle 服务层收拢到 node-lifecycle.ts，此处删副本、改为 import。
  *
- * 迁移未跑的老库里 `node.lifecycle` 读到 null：WP5 的 businessRejectionCode
+ * 迁移未跑的老库里 `node.lifecycle` 读到 null： 的 businessRejectionCode
  * 对 null/undefined 一律 fail-closed 兜底 node_disabled，即存量 Forward 会
  * 被拒绝而非写坏。这是 §13.4.2 的有意选择（宁可拒绝，不可误放行）。
  */
@@ -281,7 +281,7 @@ export interface PlanRolloutInput {
  * 该 lifecycle 是否阻断承载 Forward（§13.4.2：只有 active 接新业务）。
  *
  * 只放行 active；maintenance/disabled/retiring 一律拒绝。
- * 判定与拒绝码都来自 WP5 单一真相，避免两套口径漂移。
+ * 判定与拒绝码都来自  单一真相，避免两套口径漂移。
  */
 export function lifecycleBlocksForward(lifecycle: string | null | undefined): string | null {
   if (lifecycle !== null && lifecycle !== undefined && lifecycleAcceptsBusiness(lifecycle)) {
@@ -290,7 +290,7 @@ export function lifecycleBlocksForward(lifecycle: string | null | undefined): st
   return businessRejectionCode(lifecycle);
 }
 
-/** 端口黑名单：与 `portPool.PORT_BLACKLIST` / WP1 `RESERVED_PORTS` 同口径。 */
+/** 端口黑名单：与 `portPool.PORT_BLACKLIST` /  `RESERVED_PORTS` 同口径。 */
 const RESERVED_PORTS = [22, 80, 443, 3306, 5432, 6379, 27017, 9090, 9191];
 
 /* ================================================================== */
@@ -326,7 +326,7 @@ export function rolloutStepKey(input: {
 /* ================================================================== */
 
 /**
- * 从 WP1 影响面推出 §13.3.4 的策略名。
+ * 从  影响面推出 §13.3.4 的策略名。
  *
  * 优先级从「改动面最大」往下：一次编辑可能同时改多个字段（§13.3.4「多字段同时改
  * = 一个完整 revision / 一个 rollout plan」），策略必须报**最重**的那一档，
@@ -355,7 +355,7 @@ export function classifyRolloutStrategy(input: {
 /**
  * VALIDATE 阶段的准入判定（纯函数）。
  *
- * 与 WP1 `validateForwardCandidateWithDb` 的分工：那边回答「这次编辑合不合法」，
+ * 与  `validateForwardCandidateWithDb` 的分工：那边回答「这次编辑合不合法」，
  * 这边只回答「现在**这一刻**允不允许下发」。同一个编辑在 preview 时合法、
  * 在 rollout 时可能被 `node_in_maintenance` 挡住——那不是矛盾，是 §13.3.6 明文
  * 的「用户仍可保存 desired config，节点退出维护后再由 Reconciler 应用」。
@@ -433,7 +433,7 @@ export function validateRolloutAdmission(input: PlanRolloutInput): Array<{
     }
   }
 
-  // 指名端口仍要走黑名单判定（与 WP1 `validateForwardCandidate` 同口径）。
+  // 指名端口仍要走黑名单判定（与  `validateForwardCandidate` 同口径）。
   const port = desired.listen_port;
   if (port !== null && port !== undefined) {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -776,7 +776,7 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
  * 拿不到 db」来保证，不靠调用方记得。
  *
  * `strategy === "metadata_only"` ⇒ 不生成任何步骤：§13.3.2 禁止为改名生成
- * revision 或触发 listener 重建；WP1 也已不再为纯 metadata 生成 snapshot。
+ * revision 或触发 listener 重建； 也已不再为纯 metadata 生成 snapshot。
  * 这里的防御性分支只让调用方有一个可记录的 noop，不让它误以为要跑五阶段。
  */
 export function planRollout(input: PlanRolloutInput, tunnelId: number): RolloutPlan {
