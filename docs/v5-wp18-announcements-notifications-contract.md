@@ -419,3 +419,67 @@ DoD 2/3/4/5/6/9 落在 `backend/tests/*.mjs`（HTTP/DB 契约测试），只把�
 3. **O4**：SSRF 硬化是**本期最小边界**还是**独立 WP**。
 
 > 交付物：契约即本文。`DEVELOPMENT.md` 的 WP18 路线图登记是 **Lead 的动作**（本文不改该文件）；后续实现落点见 §6。本文不含任何代码、schema 或既有文件改动。
+
+---
+
+## 12. 交付记录
+
+> 本节的纪律：**实现的每一处"契约没写清楚"的判断都写在这里**（含理由与反例），
+> 而不是让读者去 diff 里猜。编号一经写入不修改，后续 WP 如需推翻，另起一条并说明原因。
+
+### 12.1 WP18.3 —— Webhook 渠道 + 出站 SSRF 边界（2026-10-05，`feature/v5-1b-udp-relay`）
+
+**交付**：`backend/src/services/notification-webhook.ts`（新增）、
+`backend/src/services/__tests__/v5-wp18-webhook.test.ts`（新增，35 test / 180 expect）、
+`backend/src/services/notification-delivery.ts`（追加：`IMPLEMENTED_CHANNEL_KINDS` += `webhook`、
+`defaultNotificationChannels()` += webhook、`NotificationChannel.redactTarget?` 可选钩子）、
+`backend/src/services/__tests__/v5-wp18-delivery.test.ts`（**改一条已交付断言**，见 D2）。
+
+**D1（判断）出站传输用手写最小客户端（net/tls），**不是** `fetch`，并把这条写成静态守卫。**
+理由：F9.4 要求「解析一次并连接到该解析结果」。`fetch` 在仓库运行时 Bun 上**无法**指定连接 IP
+（不暴露 dispatcher/Agent），只能退化成「二次解析比对」，仍有绑定窗口；而 `mail.ts` 的 `SmtpClient`
+已经确立了「手写最小协议客户端」的先例。实现因此做到了三件结构性的事：连接目标 IP 是**参数**
+（`createPinnedSocketTransport` 的 `address`）、Host/SNI 仍用域名、只读响应头即断开。
+反例证据：`v5-wp18-webhook.test.ts` 的 H 组用**本机回环真 socket** 断言「域名不可解析仍能连上 →
+连的是传入的 IP」与「302 之后只有 1 次请求」；J 组静态断言模块内不出现 `fetch(`。
+**与 DoD5 措辞的差异（需要 Lead 知悉）**：DoD5 写的是「注入 fetch 断言未被调用」，
+本实现把注入点命名为 `transport`（`WebhookTransport`），断言等价（零出站 = 替身调用次数为 0），
+但**没有**在渠道层保留 `fetch` 这个依赖名。理由同上：留一个永远不会被调用的 `fetch` 依赖
+只会让人误以为出站走的是 `fetch`。
+
+**D2（判断）给 `NotificationChannel` 追加可选 `redactTarget?`，并在 18.2 的投递编排里使用它。**
+理由：F5 与 18.2 的 `NotificationDelivery.target` 列注释都要求「webhook 的密钥不得出现在账本里，
+URL 必须由渠道自己脱敏后回传」，但 18.2 写账本用的是 `valid.join(",")`，渠道没有插手的余地。
+加了**可选**钩子（缺省行为不变，email 完全不受影响），webhook 用它写
+`<origin>/***<sha256 前 12 位>`：保留 origin 让运维能定位接收方，丢掉 path/query 因为
+Slack/Discord/飞书的凭据就在这两段里，摘要让同一 host 上的多个 hook 可区分而不泄露 URL。
+反例证据：G 组三例（脱敏形态稳定性 / 端到端账本不含 `XXXX` 而出站仍是完整 URL /
+传输层抛出的错误里的 URL 也被替换）。
+
+**D3（判断）webhook 载荷冻结为中性 JSON 信封 v1：`{version, source, subject, text}`。**
+理由：契约没写载荷形状。F9 明确「不做用户自定义 URL 模板」，而把 `alert.sh` 那套
+钉钉/企微/Slack JSON 搬进控制面，等于给每家格式留一份实现与一份测试。
+中性信封 + `text`（F10 渲染出的纯文本）把「怎么显示」留给接收方。
+**明确不做**：不引入结构化业务字段 —— 那需要扩 F3 的 `send(rendered, target)` 签名，
+本期不动接口（如需，另起判断条目）。
+
+**D4（判断）DNS 解析失败 = `rejected_target`（不是 `transport_error`）。**
+理由：F9.4 写明「校验失败 → 留 `rejected_target` 且不重试」；`transport_error` 会触发
+F4.3 的 3 次重试，而解析不了的目标重试同样次数是同样的结果。反例证据：F 组「ENOTFOUND / 空结果
+→ rejected_target 且零出站」。
+
+**D5（判断）地址分类比 F9.2 列出的更严**：额外拒绝 CGNAT `100.64/10`、保留段
+（`192.0.0/24`、`192.0.2/24`、`198.51.100/24`、`203.0.113/24`、`198.18/15`、`192.88.99/24`、
+`240/4`）、IPv4-mapped/兼容形态、6to4 与 NAT64 前缀。方向由 F9 背书（白名单只有 `public` 一格）。
+**副作用（已实测）**：用文档段地址（如 `203.0.113.9`）做"公网"夹具会失败 —— 测试夹具必须用
+真实公网段（单测里用 `93.184.216.34`）。
+
+**D6（判断）`https:///hook` 这类空 authority 形态显式拒（`malformed_url`）。**
+理由：WHATWG 解析器（Bun 与 Node 行为一致，已实测）会把多余斜杠静默吞掉、把 `hook` 当主机名 ——
+操作员写的路径变成主机名这种归一化必须显式拒，不能靠解析器的宽容。
+
+**契约未覆盖、本期未做**：不做 webhook 签名（F9 明确）、不做每租户 webhook（O6 未拍板）、
+不做投递日志租户页（F7）。**仍未落地的契约项**：F5 的 `notification_channel` 表
+（见 §12.3 的阻塞说明）—— 本期的渠道配置以「调用方解析目标」的形态接入
+（18.2 的 `NotificationTargetResolver` 契约），表本身与接线归 WP18.6 之前的一个小提交。
+

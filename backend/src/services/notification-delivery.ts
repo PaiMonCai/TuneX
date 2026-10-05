@@ -30,20 +30,22 @@
 import { isMailConfigured, sendMail, type MailMessage, type MailResult } from "./mail.ts";
 import type { NotificationFact, NotificationScope } from "./notification-facts.ts";
 import { cooldownSecondsForReason, notificationCooldownKey } from "./notification-facts.ts";
+import { createWebhookChannel } from "./notification-webhook.ts";
 
 /* ================================================================== */
 /* 渠道类型与结果（F3）                                                */
 /* ================================================================== */
 
-/** 渠道类型（封闭枚举；F3 的三个实现里本期只有 email）。 */
+/** 渠道类型（封闭枚举；三个实现见 IMPLEMENTED_CHANNEL_KINDS）。 */
 export const NOTIFICATION_CHANNEL_KINDS = ["email", "webhook", "telegram"] as const;
 export type NotificationChannelKind = (typeof NOTIFICATION_CHANNEL_KINDS)[number];
 
 /**
- * 本期**已实现**的渠道。webhook / telegram 在枚举里占位但没有任何实现，
- * 它们出现时一律按 `unsupported_channel` 拒绝并留失败记录 —— 不做"注册了就算支持"的假装。
+ * 本期**已实现契约**的渠道（`kind` 落在闭集之外的、或尚未实现的，一律拒绝并留失败记录
+ * —— 不做"注册了就算支持"的假装）。清单随各 WP 的落地而增长：
+ * WP18.2 email、WP18.3 webhook、WP18.4 telegram。
  */
-export const IMPLEMENTED_CHANNEL_KINDS: readonly NotificationChannelKind[] = ["email"];
+export const IMPLEMENTED_CHANNEL_KINDS: readonly NotificationChannelKind[] = ["email", "webhook"];
 
 /** 投递失败/拒绝原因（`ChannelResult.reason` 的闭集；对应契约 F3 的 `{sent, reason}`）。 */
 export type NotificationFailureReason =
@@ -90,6 +92,17 @@ export interface NotificationChannel {
   isConfigured(scope: NotificationScope): boolean;
   validateConfig(input: { target: string | null | undefined }): ChannelConfigCheck;
   send(rendered: RenderedNotification, target: string): Promise<ChannelResult>;
+  /**
+   * 可选：把目标脱敏成**可落账本**的形态（WP18.3 追加）。
+   *
+   * 为什么需要它：账本是"给谁发过"的证据，而 webhook URL **本身就是凭据**
+   * （Slack / Discord 的 hook URL 拿到就能发消息）。18.2 的 `target` 列注释已经写明
+   * "webhook 的密钥不得出现在这里，URL 必须由渠道自己脱敏后回传"，但写这行的
+   * `deliverNotificationFacts` 只有 `valid.join(",")` —— 渠道没有插手的余地。
+   * 因此加一个**可选**钩子：渠道有它就用来写账本，没有就沿用原值
+   * （email 的收件人地址是投递目标本身，F10 没把它列为凭据，行为不变）。
+   */
+  redactTarget?(target: string): string;
 }
 
 /* ================================================================== */
@@ -225,9 +238,15 @@ export function createEmailChannel(deps: EmailChannelDeps = {}): NotificationCha
   };
 }
 
-/** 默认渠道注册表（本期只有 email；webhook/telegram 由 18.3/18.4 追加）。 */
+/**
+ * 默认渠道注册表。**每一个渠道都有自己的闸门**（email = SMTP 凭据齐备、webhook = 部署开关），
+ * 未配置的渠道会留下一条 `not_configured` 失败行、零出站 —— 可见，不假装成功。
+ *
+ * 接线（WP18.6）如果只想给"本安装真正打开的渠道"记账，应当显式传 `channels`，
+ * 免得上线后账本被一堆 `not_configured` 行填满而失去"失败可见"的意义。
+ */
 export function defaultNotificationChannels(): NotificationChannel[] {
-  return [createEmailChannel()];
+  return [createEmailChannel(), createWebhookChannel()];
 }
 
 /* ================================================================== */
@@ -421,7 +440,7 @@ export type NotificationTargetResolver = (
 ) => readonly string[] | Promise<readonly string[]>;
 
 export interface DeliverNotificationDeps {
-  /** 渠道注册表（默认 `defaultNotificationChannels()`：本期只有 email）。 */
+  /** 渠道注册表（默认 `defaultNotificationChannels()`：email + webhook，各自有闸门）。 */
   channels?: readonly NotificationChannel[];
   resolveTargets: NotificationTargetResolver;
   ledger: NotificationLedgerStore;
@@ -548,7 +567,10 @@ export async function deliverNotificationFacts(
       if (!allowed) return { ...base, status: "suppressed", reason: null, attempts: 0, degraded };
 
       // ── 抢占账本行（唯一索引兜底）──
-      const targetField = valid.join(",").slice(0, TARGET_COLUMN_MAX);
+      // 账本落的是**脱敏后**的目标（渠道提供 `redactTarget` 时用它）：webhook URL 本身是凭据，
+      // 而账本是可被运维检索的历史证据（F5 / 18.2 的 `target` 列注释）。
+      const stored = channel.redactTarget ? valid.map((t) => channel.redactTarget!(t)) : valid;
+      const targetField = stored.join(",").slice(0, TARGET_COLUMN_MAX);
       let claimed: LedgerClaimResult;
       try {
         claimed = await ledger.claim({

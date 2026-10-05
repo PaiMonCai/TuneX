@@ -27,6 +27,7 @@ import {
   DEGRADED_COOLDOWN_MAX_ENTRIES,
   EMAIL_TARGET_MAX,
   NOTIFICATION_CHANNEL_KINDS,
+  IMPLEMENTED_CHANNEL_KINDS,
   NOTIFICATION_MAX_ATTEMPTS,
   NOTIFICATION_RENDER_LIMITS,
   NOTIFICATION_RETRY_BACKOFF_BASE_MS,
@@ -426,8 +427,12 @@ describe("E. 静默期存储不可用时照发（Lead 裁决 O2）", () => {
 /* ------------------------------------------------------------------ */
 
 describe("F. fail-closed：未知/未实现/无收件人一律拒绝并留记录", () => {
-  test("本期未实现的渠道类型（webhook / telegram）→ unsupported_channel + 零出站", async () => {
-    for (const kind of NOTIFICATION_CHANNEL_KINDS.filter((k) => k !== "email")) {
+  test("枚举里尚未实现契约的渠道类型 → unsupported_channel + 零出站", async () => {
+    // 过滤条件用 IMPLEMENTED_CHANNEL_KINDS（而不是写死 webhook/telegram）：18.4 落地 telegram
+    // 之后本条的期望值必须被重新审视 —— 下面的非空断言会逼着人改，不允许退化成空循环式的假通过。
+    const pending = NOTIFICATION_CHANNEL_KINDS.filter((k) => !IMPLEMENTED_CHANNEL_KINDS.includes(k));
+    expect(pending).toEqual(["telegram"]);
+    for (const kind of pending) {
       const ledger = memoryLedger();
       let called = 0;
       const channel: NotificationChannel = {
