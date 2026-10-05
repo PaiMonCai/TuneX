@@ -1073,6 +1073,26 @@ docs/evidence/v5-g0-result-*.txt       每次运行的原始结果
 另外把「协议值写成字面量」本身变成了 CI 守卫（`no source file writes a protocol
 value as a literal`）：协议值只能来自契约常量或行本身。
 
+#### 第五处（WP17.5 的 Gate 在真拓扑里发现）：HTTP 轮询型 Agent 掉线后 `node.status` 永不翻转
+
+- **症状**：把一台走 HTTP 轮询的入口 Agent 停掉，`node.status` **一直**是 `active`（实测 4 分钟不翻转），
+  只有 `node_state_report.reported_at` 变陈旧。
+- **根因**：`inactive` 的唯一写入者是 **websocket 断开**路径（`socket/offline-detector.ts` 消费
+  `dc:<gid>:<nodeId>` 标记，其前缀常量本身就叫 `DISCONNECT_MARKER_PREFIX_LEGACY`）。HTTP 轮询型
+  Agent 从不写这个标记（Redis 里实测无任何相关键）⇒ 这条判定对它们**结构性地**不生效。
+- **影响面（实测修正过，不是推断）**：**展示层**。`deriveConnection()` 把"在线"定义为
+  `status === "active"` **且** `last_seen_at` 落在 `CONNECTION_ONLINE_WINDOW_MS`(90s) 内，所以
+  候选节点判定（`requireOnline`）**本来就有新鲜度保护**，不会因此把死节点当活的。真正的问题是
+  **库里那一列会在很长时间里说反话**（面板显示"活着"，判定说"离线"）—— 同一件事有两份相反答案。
+- **修法**：在同一个 10s 的 `cron_check_node_offline` 里加**与断开标记无关的第二遍**：按上报新鲜度
+  批量置 `inactive`，并且
+  ① **用与 `deriveConnection` 同一个窗口常量**（两个阈值就是两份真相）；
+  ② 把 **`last_seen_at IS NULL` 一并覆盖** —— SQL 三值逻辑下 `last_seen_at < cutoff` 对 NULL
+     **不成立**，只写严格比较会留下一类"永远显示 active 却被派生判定成离线的节点"（e2e 库里就有两台
+     这样的预置节点，是**只读探针** `SELECT … WHERE status='active' AND last_seen_at < NOW() - INTERVAL 90 SECOND`
+     发现的）；③ 计数单独列出（`flipped_stale`），不并进标记触发的 `flipped`：两个信号源混成一个数，
+     就看不出"哪一类节点在掉线"了。
+
 #### 教训（写给下一个接手的人）
 
 **「下发路径」不止 `dispatch*`。** G0 的三次红→绿迭代中，前两次修复都只覆盖了

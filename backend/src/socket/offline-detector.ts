@@ -54,6 +54,7 @@ export const DISCONNECT_MARKER_TTL_S =
  * 键工厂从 tenant-scope 单一真相源导入，本地用完之后再转发导出，保持既有
  * import 路径（../offline-detector.ts）可用，业务代码不应再自行拼装 key。
  */
+import { CONNECTION_ONLINE_WINDOW_MS } from "../services/node-lifecycle.ts";
 import {
   disconnectMarkerKey,
   heartbeatKey,
@@ -174,6 +175,14 @@ export interface OfflineCheckDeps {
   clearMarker(key: string): Promise<void>;
   /** 该组是否仍有 active 节点（用于 alive_groups 清理）。 */
   groupHasActiveNode(groupId: number): Promise<boolean>;
+  /**
+   * V5.1b 修复：把**停止上报**的 active 节点批量置 inactive，返回真正翻转的行数。
+   *
+   * 为什么它必须是一个窄接口而不是让调用方自己查：翻转条件（`status="active"` 且
+   * `last_seen_at < cutoff`）是这条判定的**全部语义**，把它留在 detector 里、让实现只负责
+   * 一条 `updateMany`，测试才能用三行替身把它钉死。
+   */
+  markStaleInactive(cutoff: Date): Promise<number>;
   /** 从**指定 scope 的** alive_groups 移除该组。 */
   removeAliveGroup(scope: number, groupId: number): Promise<void>;
   /** 当前毫秒时间戳。 */
@@ -196,6 +205,8 @@ export interface OfflineCheckResult {
   nodeMissing: number;
   /** 因组内已无 active 节点而从 alive_groups 移除的组；形如 `<scope>:<groupId>`。 */
   clearedGroups: string[];
+  /** 因**上报过期**（与断开标记无关）被置为 inactive 的节点数。 */
+  flippedStale: number;
   /** 处理失败的标记数（异常已吞，仅计数）。 */
   errors: number;
 }
@@ -235,6 +246,24 @@ export function defaultOfflineDeps(): OfflineCheckDeps {
         select: { status: true },
       });
       return row ? row.status : "missing";
+    },
+    async markStaleInactive(cutoff) {
+      const { db } = await import("../db.ts");
+      // 只动 `status="active"` 且上报已过期的行：幂等，且不去碰已经 inactive / 从未上报的节点
+      // （后者由"从未上报 ⇒ 不产生 session"那条路径表达，不在这里顺手改语义）。
+      const r = await db.node.updateMany({
+        where: {
+          status: "active",
+          // **必须把 `last_seen_at IS NULL` 也算进来**：`deriveConnection()` 对"从未上报过"
+          // 的节点明确返回 `offline`（`if (!seen) return "offline"`），而 SQL 的三值逻辑下
+          // `last_seen_at < cutoff` 对 NULL **不成立** ⇒ 只写严格比较会留下一类永远显示
+          // `active`、却被派生判定成离线的节点（e2e 库里就有两台这样的预置节点，
+          // 是我用只读探针 `SELECT ... WHERE status='active' AND last_seen_at < ...` 发现的）。
+          OR: [{ last_seen_at: { lt: cutoff } }, { last_seen_at: null }],
+        },
+        data: { status: "inactive" },
+      });
+      return r.count;
     },
     async markInactive(nodeId) {
       const { db } = await import("../db.ts");
@@ -281,6 +310,7 @@ export async function runOfflineCheck(deps: OfflineCheckDeps): Promise<OfflineCh
     alreadyInactive: 0,
     nodeMissing: 0,
     clearedGroups: [],
+    flippedStale: 0,
     errors: 0,
   };
 
@@ -363,6 +393,28 @@ export async function runOfflineCheck(deps: OfflineCheckDeps): Promise<OfflineCh
         err: (e as Error)?.message,
       });
     }
+  }
+
+  /* ── 第二遍：**与断开标记无关**的上报新鲜度判定 ──────────────────────────────
+   *
+   * 为什么必须有这一遍：断开标记（socket 层）只是"节点离线"的**一个**信号源 —— HTTP 轮询型
+   * Agent 从不写它，于是它们停掉之后 `node.status` 会永远停在 `active`（实测停 4 分钟不翻转）。
+   * 而 `deriveConnection()` 本来就把"在线"定义为 `status === "active"` **且**
+   * `last_seen_at` 落在 `CONNECTION_ONLINE_WINDOW_MS` 内 ⇒ 库里那一列与派生判定会长期
+   * 互相矛盾：展示层信 `status`（说它活着），判定层信新鲜度（说它离线）。
+   *
+   * 这里让两者用**同一个窗口常量**收敛：**停止上报就是离线**。刻意不新造阈值 —— 两个阈值
+   * 就是两份真相，而"库里说 A、判定说 B"正是这次缺陷的形态。
+   *
+   * 幂等：`markStaleInactive` 只动 `status="active"` 的行，多 worker 并存也不会重复计数。
+   */
+  try {
+    result.flippedStale = await deps.markStaleInactive(
+      new Date(now - CONNECTION_ONLINE_WINDOW_MS),
+    );
+  } catch (e) {
+    // 与标记路径同口径：单遍失败记 errors、不影响已得到的结论。
+    result.errors++;
   }
 
   return result;

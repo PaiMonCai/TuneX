@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { CONNECTION_ONLINE_WINDOW_MS } from "../../services/node-lifecycle.ts";
 import { test, expect, describe } from "bun:test";
 import {
   parseDisconnectMarkerKey,
@@ -168,6 +172,9 @@ function fakeDeps(opts: {
       }
       return false;
     },
+    // V5.1b 修复：新增的「上报过期」遍。默认 0 = 没有过期节点 ⇒ 既有断言（含
+    // per-marker failure 那条对 errors 的计数）语义完全不变。
+    markStaleInactive: async () => 0,
     clearMarker: async (k) => {
       deleted.push(k);
     },
@@ -335,5 +342,78 @@ describe("runOfflineCheck", () => {
     const r2 = await runOfflineCheck(second.deps);
     expect(r2.flipped).toBe(0);
     expect(r2.alreadyInactive).toBe(1);
+  });
+});
+
+/* ================================================================== */
+/* V5.1b 修复：按「上报新鲜度」置 inactive（与断开标记无关）             */
+/* ================================================================== */
+
+describe("runOfflineCheck: 上报过期也要置 inactive（HTTP 轮询型 Agent 的离线信号）", () => {
+  const baseDeps = (over: Partial<OfflineCheckDeps> = {}) =>
+    ({
+      listMarkers: async () => [],
+      hasHeartbeat: async () => false,
+      getNodeStatus: async () => "active" as const,
+      markInactive: async () => false,
+      clearMarker: async () => {},
+      groupHasActiveNode: async () => true,
+      removeFromAliveGroups: async () => {},
+      now: () => 1_000_000_000,
+      log: () => {},
+      ...over,
+    }) as OfflineCheckDeps;
+
+  test("过期翻转的计数会进结果（两个信号源各自可见，不混成一个数）", async () => {
+    const result = await runOfflineCheck(baseDeps({ markStaleInactive: async () => 3 }));
+    expect(result.flippedStale).toBe(3);
+    expect(result.flipped).toBe(0);
+  });
+
+  test("阈值用的是**与 deriveConnection 同一个窗口**（两份阈值就是两份真相）", async () => {
+    let seen: Date | null = null;
+    const nowMs = 1_700_000_000_000;
+    await runOfflineCheck(
+      baseDeps({
+        now: () => nowMs,
+        markStaleInactive: async (cutoff) => {
+          seen = cutoff;
+          return 0;
+        },
+      }),
+    );
+    expect(seen).not.toBeNull();
+    expect(seen!.getTime()).toBe(nowMs - CONNECTION_ONLINE_WINDOW_MS);
+  });
+
+  test("这一遍抛错只记 errors，不影响标记那一遍已经得到的结论", async () => {
+    const result = await runOfflineCheck(
+      baseDeps({
+        markStaleInactive: async () => {
+          throw new Error("db down");
+        },
+      }),
+    );
+    expect(result.errors).toBeGreaterThanOrEqual(1);
+    expect(result.flippedStale).toBe(0);
+  });
+});
+
+describe("V5.1b 修复：从未上报过的节点也算离线（与 deriveConnection 完全一致）", () => {
+  test("where 必须同时覆盖「过期」与「从未上报（NULL）」两种情况", async () => {
+    // 这条断言读的是**实现源码**：`updateMany` 的 where 形状是这个判定的全部语义，而它
+    // 恰好在 SQL 三值逻辑上有一个坑 —— `x < cutoff` 对 NULL 不成立，只写严格比较会留下
+    // 一类"永远显示 active 却被判定离线"的节点。用只读探针在真库里发现过（两台预置节点）。
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "offline-detector.ts"), "utf8");
+    // 取「从实现起点到该方法结束」的**整段**，不用魔法数字：这段实现的注释很长，
+    // 固定窗口会随注释增长而失效（本断言第一版就是这么红的 —— 窗口太窄，看不到 where）。
+    const at = src.indexOf("async markStaleInactive(cutoff");
+    expect(at).toBeGreaterThan(0);
+    const end = src.indexOf("\n    },", src.indexOf("updateMany", at));
+    expect(end, "找不到该方法的结尾").toBeGreaterThan(at);
+    const window = src.slice(at, end + 6);
+    expect(window).toContain("last_seen_at: { lt: cutoff }");
+    expect(window, "缺少 NULL 分支：从未上报的节点会被漏掉").toContain("last_seen_at: null");
+    expect(window).toContain('status: "active"');
   });
 });

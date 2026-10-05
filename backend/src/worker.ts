@@ -137,9 +137,12 @@ const worker = new Worker(
           flipped: r.flipped,
           skipped: r.skippedWithinDebounce + r.skippedHeartbeatAlive,
           cleared_groups: r.clearedGroups,
+          // V5.1b 修复：上报过期（与断开标记无关）翻转的节点数。单独一列是有意的：它与
+          // flipped（标记触发的）是两个不同信号源，混成一个数就看不出是哪一类节点在掉线。
+          flipped_stale: r.flippedStale,
           errors: r.errors,
         };
-        if (r.flipped > 0 || r.errors > 0) {
+        if (r.flipped > 0 || r.flippedStale > 0 || r.errors > 0) {
           console.log("[worker] cron_check_node_offline:", JSON.stringify(summary));
         }
         return summary;
