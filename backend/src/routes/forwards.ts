@@ -20,6 +20,11 @@ import {
   unbindForwardDns,
 } from "../services/ddns-binding.ts";
 import type { DdnsDb, DdnsDeps, DdnsResult, DnsBindingRow } from "../services/ddns-binding.ts";
+import {
+  PREFERRED_INGRESS_ERROR_CODES,
+  setPreferredIngressNode,
+} from "../services/preferred-ingress.ts";
+import type { PreferredIngressDb } from "../services/preferred-ingress.ts";
 import { defaultDiagnoseDeps, diagnoseForward } from "../services/agent-diagnose.ts";
 import {
   createForward,
@@ -510,4 +515,38 @@ forwardsRoutes.delete("/:id/dns", async (c) => {
     tunnelId: id,
   });
   return sendDdns(c, result);
+});
+
+/* ================================================================== */
+/* V5-WP17.1（契约 D4）—— 首选入口节点                                  */
+/* ================================================================== */
+
+/**
+ * 为什么是独立端点而不是 `PATCH` 的一个字段：`PATCH` 是"编辑运行态字段"，它会生成新 revision
+ * 并触发 rollout —— 改一个**偏好**不该重启转发，更不该立刻把归属搬到首选节点（那会绕过
+ * `FAILBACK_HEALTHY_CHECKS` 与冷却期，而它们正是这条策略的意义）。偏好是调度意图，
+ * 由 failover sweep 在后续节拍里按策略决定要不要真的回切。
+ *
+ * 权限：`forward:update`（它是这条转发的一个属性）。
+ */
+const PreferredIngressSchema = z.object({ node_id: z.number().int().positive().nullable() }).strict();
+
+forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const parsed = PreferredIngressSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "node_id 不合法", code: "invalid_input" }, 400);
+  }
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
+  const result = await setPreferredIngressNode(
+    { db: db as unknown as PreferredIngressDb },
+    { workspaceId: workspace(c).id, tunnelId: id, nodeId: parsed.data.node_id },
+  );
+  if (!result.ok) {
+    const status = result.code === PREFERRED_INGRESS_ERROR_CODES.preferred_not_found ? 404 : 400;
+    return c.json({ error: result.error, code: result.code, error_layer: "failover" }, status);
+  }
+  return c.json({ data: result.value });
 });

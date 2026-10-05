@@ -349,12 +349,34 @@
   （= 改 FROZEN 契约字段表）；**C** 不提供自动回切。**代价/影响**：决定回切是产品能力还是运维
   动作，也决定 `FAILBACK_HEALTHY_CHECKS` 由谁累计（今天缺省 0）。**请 Lead 拍板**。
 
+### D4 收口记录（实现时发现的四件事，2026-10-05）
+
+1. **存储选 A 的理由补全**：候选 B（Route Profile 的 ingress selector）要改 FROZEN 的字段表，
+   候选 C（不提供自动回切）与本条裁决"把首选入口接到真实写入路径"直接矛盾 ⇒ `tunnel.preferred_ingress_node_id`。
+2. **回切需要第二列才算真的通**：策略要求"**连续** N 次健康"，而"连续"是跨节拍的事实 ——
+   从单次观测推导不出来。原来 `failbackHealthyChecks` 恒为 0，所以偏好存下来也照样不会回切。
+   `failback_healthy_checks` 由扫描维护（健康 `+1`、否则 `=0`，用原子 `increment`）。
+   **判定读上一拍的值、这一拍写下一拍的值**：同一拍里既判又算会让阈值退化成 1。
+3. **"在线"要把凭据被吊销分出来**：`deriveConnection` 把"吊销"和"很久没上报"一起归成 `offline`，
+   于是运维只能看到"节点不在线"——而这两件事的下一步动作完全不同（重新登记 vs 等它回来）。
+   共享判定里吊销**先于**在线报出（`node_credential_revoked`）。
+4. **编译器的注释与现实不符（行为是对的，注释误导）**：`constraints.allowed_lifecycles` 注释写
+   "显式白名单才放宽"，但 `nodeAdmission` 已经要求 `lifecycle === "active"`
+   （`lifecycleAcceptsBusiness`），所以那条白名单**只能收窄、放不宽**。共享判定按实际语义工作，
+   并把这个事实写在了代码注释里。
+
+### D5 观察：`Node.status` 的连接态取值是 `active`
+
+`deriveConnection` 要求 `status === "active"`，不是 `"online"`。写本 WP 的断言时夹具用了
+`"online"`，于是"一台一切正常的节点"被判成离线 —— 断言先坏在夹具上，而生产数据本来就是对的。
+记在这里是因为它很容易被下一次踩到（同一族的还有仓库已付过两次学费的"夹具绝对时间"）。
+
 ## 5. WP 拆分（一个 WP 一个可交付物；次序 17.1/17.2 并行 → 17.3 → 17.4 → 17.5）
 
 | WP | 可交付物（单件） | 明确不含 |
 |---|---|---|
 | WP17.0 | 本文档冻结（状态行改 FROZEN + 冻结清单） | 任何代码 |
-| WP17.1 | 候选集同源化：`failover-loop` 的候选来源与 Route Profile 编译来源一致（同一份 `nodeAdmission` + constraints，`deriveConnection` 判在线），离线用例钉死「不放行 ⇒ 不迁 + 原因码」 | 不改 `decideFailover` 词表 |
+| WP17.1 | 候选集同源化：`failover-loop` 的候选来源与 Route Profile 编译来源一致（同一份 `nodeAdmission` + constraints，`deriveConnection` 判在线），离线用例钉死「不放行 ⇒ 不迁 + 原因码」 —— **已交付 2026-10-05**：`services/ingress-candidate.ts`（唯一实现，编译器与循环共用）+ D4 收口（`preferred_ingress_node_id` / `failback_healthy_checks` 两列 + `PUT /:id/preferred-ingress` 写入路径 + 扫描维护连续健康计数）；20 条断言 | 不改 `decideFailover` 词表 |
 | WP17.2 | DNS 绑定落库 + RBAC + sealed 凭据（additive 迁移 + 服务 + 路由），**零外呼**；含 `dns_state` 投影 —— **已交付 2026-10-05**：`services/ddns-binding.ts` + `routes/ddns.ts` + `forwards.ts` 的 `/:id/dns`；38 条断言（服务层 33 + 路由层 5，后者钉住 `settings:manage` 这条接线） | 不写 DNS、不建 provider 适配 |
 | WP17.3 | DDNS 执行器：provider 适配（endpoint 可覆盖）+ 值集规划（`updates/creates/removals`）+ L1 read-back + 退避 + 审计 | 不接 failover、不碰 rollout |
 | WP17.4 | 迁移/回切的 DNS 后继 + 就绪性前置闸门（`dns_path_unready`），挂既有 reconcile 节拍 | 不新增定时器、不改 rollout 步骤词表 |

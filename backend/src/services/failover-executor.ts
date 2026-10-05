@@ -264,6 +264,17 @@ export interface FailoverExecutionResult {
   readonly lease_after: PlacementLeaseRow | null;
   /** 迁移端口的结果（未走到迁移时为 null）。 */
   readonly move: PlacementMoveResult | null;
+  /**
+   * V5-WP17.1（契约 D4）：**首选节点此刻是否合格**。
+   *
+   * - `null` = 这条转发没有偏好（或没读到事实）⇒ 调用方**不要动**计数（偏好可能刚被设上）；
+   * - `true` / `false` = 首选节点可达且端口可用 / 否则。
+   *
+   * 为什么它是执行器的输出而不是调用方自己再判一次：`readDestination` 的结果只在这里拿到，
+   * 而"连续健康 N 次"必须由**同一个判据**累计 —— 两处各判一次，就会出现"策略按 A 判定、
+   * 计数按 B 累计"，而两者不一致时表现为回切在毫无变化的情况下突然发生或永不发生。
+   */
+  readonly failback_ready: boolean | null;
 }
 
 /* ================================================================== */
@@ -387,6 +398,7 @@ export async function executeFailoverForTunnel(
     lease_before: null,
     lease_after: null,
     move: null,
+    failback_ready: null,
   } satisfies Omit<FailoverExecutionResult, "outcome" | "reason" | "detail">;
 
   // ── 1. 事实 ──
@@ -411,7 +423,16 @@ export async function executeFailoverForTunnel(
   // ── 2. 纯策略判定 ──
   const decision = decideFailover(buildDecisionInput(facts, now));
   const migration = placementMigration(decision);
-  const decisionResult = { ...base, decision, migration };
+  const decisionResult = {
+    ...base,
+    decision,
+    migration,
+    // 合格 = 可达 + 端口可用（与策略的 failback 条件同一份事实，不另立判据）。
+    failback_ready:
+      facts.failback === null
+        ? null
+        : facts.failback.candidate.reachable && facts.failback.candidate.port_available,
+  };
   log({
     level: "info",
     event: "decision",

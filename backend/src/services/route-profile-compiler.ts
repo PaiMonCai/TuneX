@@ -27,7 +27,7 @@ import {
   type RouteStep,
   type RouteViolation,
 } from "./forward-route.ts";
-import { nodeAdmission } from "./node-lifecycle.ts";
+import { candidateRejection as sharedCandidateRejection, roleAcceptsPosition } from "./ingress-candidate.ts";
 
 /* ================================================================== */
 /* 1. 产品可见性（§9.4.6）                                             */
@@ -445,12 +445,11 @@ export interface CompiledRouteProfile {
 export type CompileRouteProfileResult = CompiledRouteProfile | CompileFailure;
 
 /** 角色的能力判定（与 `forward-service.ts` 的创建路径同口径）。 */
-function roleAccepts(role: string | null | undefined, position: "ingress" | "egress" | "transit"): boolean {
-  if (position === "ingress") return role === "ingress" || role === "both";
-  // 中间跳的物理形态是 EGRESS runtime（`forward-rollout.ts` 的三跳准入同口径：
-  // middle 必须 role=egress|both），因此这里与出口同一要求。
-  return role === "egress" || role === "both";
-}
+// V5-WP17.1：角色判定搬到 `ingress-candidate.ts`，与故障转移循环**共用一份** ——
+// 两处各判一次正是"编译器说可用、迁移却挑了一台指挥不动的机器"的来源。
+// 语义（含 transit 与 egress 同口径）原样保留，只是换了个家。
+const roleAccepts = (role: string | null | undefined, position: "ingress" | "egress" | "transit"): boolean =>
+  roleAcceptsPosition(role ?? null, position);
 
 function nodeLabel(facts: RouteNodeFacts): string {
   return facts.label ? `${facts.node_id}(${facts.label})` : String(facts.node_id);
@@ -473,22 +472,24 @@ function candidateRejection(
   const constraints = template.constraints ?? null;
   if (constraints?.exclude_node_ids?.includes(facts.node_id)) return "excluded_by_constraint";
 
-  const admission = nodeAdmission({
-    lifecycle: facts.lifecycle ?? null,
-    status: facts.status ?? null,
-    last_seen_at: facts.last_seen_at == null ? null : new Date(facts.last_seen_at),
-    has_credential: facts.has_credential ?? false,
-    credential_revoked: facts.credential_revoked ?? false,
-  });
-  if (!admission.ok) return admission.condition;
-
-  // 缺省只允许 active：显式白名单才放宽（fail-closed，不给默认放行）。
-  const allowedLifecycles = constraints?.allowed_lifecycles ?? ["active"];
-  if (!allowedLifecycles.includes(facts.lifecycle ?? "")) return "lifecycle_not_allowed";
-
-  if (!roleAccepts(facts.role, position)) {
-    return facts.role == null ? "role_undeclared" : "role_mismatch";
-  }
+  // V5-WP17.1：准入 → 生命周期 → 角色这一段与故障转移循环**同一份实现**。
+  // 这里**不要求在线**（编译器编译的是一份可以稍后生效的计划，离线节点仍可入选），
+  // 而故障转移会打开那个开关 —— 差异只有一处且显式。
+  const shared = sharedCandidateRejection(
+    {
+      node_id: facts.node_id,
+      node_group_id: facts.node_group_id ?? 0,
+      role: facts.role ?? null,
+      lifecycle: facts.lifecycle ?? null,
+      status: facts.status ?? null,
+      last_seen_at: facts.last_seen_at == null ? null : new Date(facts.last_seen_at),
+      has_credential: facts.has_credential ?? false,
+      credential_revoked: facts.credential_revoked ?? false,
+    },
+    position,
+    constraints?.allowed_lifecycles ? { allowedLifecycles: constraints.allowed_lifecycles } : {},
+  );
+  if (shared !== null) return shared;
 
   const requireHealth = constraints?.require_health;
   if (requireHealth && requireHealth.length > 0 && !requireHealth.includes(facts.health ?? "unknown")) {

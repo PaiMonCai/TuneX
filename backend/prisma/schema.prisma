@@ -415,6 +415,8 @@ model Node {
   updated_at  DateTime @updatedAt
 
   node_group_id Int
+  /// V5-WP17.1：以它为首选入口的 Forward（见 Tunnel.preferred_ingress_node_id）。
+  preferred_ingress_tunnels Tunnel[] @relation("preferred_ingress_node")
   node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
 
   // ── v3 增量字段（WP1，全部可空 → expand-and-contract，见迁移 20260926040000）──
@@ -663,6 +665,22 @@ model Tunnel {
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?
   ingress_node    Node?      @relation("ingress_node", fields: [ingress_node_id], references: [id], onDelete: SetNull)
+  /// V5-WP17.1（契约 D4 收口）：**首选入口节点**。
+  ///
+  /// 它之前根本不存在，而 `pickFailoverDestination` 又恒返回 `preferred_node_id = null` ⇒
+  /// **自动回切永远不可能发生**（"写了功能但没有任何写入路径"的一类，与 `diag` 白名单陷阱同源）。
+  /// 存储选在 Forward 上（契约 D4 的候选 A）：候选 B 要改 FROZEN 的 Route Profile 字段表，
+  /// 候选 C 与 Lead 的"接到真实写入路径"直接矛盾。
+  ///
+  /// NULL = 没有偏好 ⇒ 今天的行为（不回切）。它与 `ingress_node_id` 是**两件事**：
+  /// 后者是"现在归谁"，前者是"希望归谁"。混在一起会让一次回切看起来像配置被改写。
+  preferred_ingress_node_id Int?
+  preferred_ingress_node     Node? @relation("preferred_ingress_node", fields: [preferred_ingress_node_id], references: [id], onDelete: SetNull)
+  /// V5-WP17.1：首选节点**连续**判定健康的次数，由 failover sweep 维护（健康 +1、否则归零）。
+  ///
+  /// 为什么必须是一列：策略要求"连续 N 次健康才允许回切"，而"连续"是**跨节拍**的事实 ——
+  /// 从任何单次观测都推导不出来。缺了它，`failbackHealthyChecks` 恒为 0，回切一样永远不会发生。
+  failback_healthy_checks Int @default(0)
   /// RELAY 实际出口节点；DIRECT 为 NULL（DEVELOPMENT.md §2.1）。
   /// 只保存 Node 而不只存 out_node_group：否则组内多 Agent 重启时无法判断
   /// 隧道真正属于谁。

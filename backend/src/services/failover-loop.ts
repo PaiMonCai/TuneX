@@ -16,6 +16,7 @@
 
 import { db } from "../db.ts";
 import { systemConfig } from "./config.ts";
+import { candidateRejection, type CandidateFacts } from "./ingress-candidate.ts";
 import {
   executeFailoverForTunnel,
   readFailoverDecisionFacts,
@@ -57,36 +58,84 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
 }
 
 /**
- * 候选节点：同一**入口节点组**内、非现任、在线、角色能当入口的节点。
+ * 候选节点：同一**入口节点组**内、非现任、且**通过编译器同一份判定**的节点。
  *
- * 这是调度关注点，因此不需要存储：§8 说的 preferred/standby 是"谁更适合承载"，
- * 而今天能回答这个问题的唯一事实来源就是节点组与节点角色。找不到就返回空
- * —— 执行器会给出 `standby_candidate` 这条 blocker，而不是拿一个随便的节点去迁。
+ * V5-WP17.1 之前它用 `role + state_report(5 分钟)` 判断，那与编译器的判据**不同源**：
+ * 一台凭据已被吊销、或生命周期停在 `suspended` 的机器，在编译器眼里不可用，在这里却"可用"
+ * —— 于是迁移会把一条转发搬到一台**面板指挥不动**的机器上。现在两边共用
+ * `candidateRejection()`（准入 → 生命周期 → 角色 → 在线），差异只剩一个显式开关：
+ * 故障转移额外要求"此刻在线"，因为它要挑一台**现在就能接管**的机器。
+ *
+ * **首选入口（契约 D4 收口）**：`tunnel.preferred_ingress_node_id` 之前没有存储、而这里又恒返回
+ * `preferred_node_id = null` ⇒ 自动回切永远不可能发生。现在偏好从列里读，并且**即使它今天不合格
+ * 也照原样报出** —— 判定留给策略（`failback_healthy_checks` 那条条件），这样运维看到的原因是
+ * "首选节点不可达 / 端口不可用 / 连续健康次数不够"，而不是一句无信息量的"没有回切"。
  */
-export async function pickFailoverDestination(ctx: {
-  tunnel_id: number;
-  workspace_id: number;
-  owner_node_id: number | null;
-}): Promise<FailoverDestinations> {
-  const tunnel = await db.tunnel.findUnique({
+export interface FailoverCandidateDb {
+  tunnel: { findUnique: (args: unknown) => Promise<unknown> };
+  node: { findMany: (args: unknown) => Promise<unknown[]> };
+}
+
+export async function pickFailoverDestination(
+  ctx: {
+    tunnel_id: number;
+    workspace_id: number;
+    owner_node_id: number | null;
+    /** 显式时钟：在线判定不能读真实时钟，否则扫描结论随墙上时钟漂移。 */
+    now?: Date;
+  },
+  // 缺省走进程级 `db`，测试传替身（与本模块其余部分的依赖注入同一取向）。
+  // 值得注入的理由很具体：候选过滤的规则是这条 WP 的核心，而"哪台机器算合格"必须在
+  // **没有数据库**的进程里就能断言。
+  candidateDb: FailoverCandidateDb = db as unknown as FailoverCandidateDb,
+): Promise<FailoverDestinations> {
+  const tunnel = (await candidateDb.tunnel.findUnique({
     where: { id: ctx.tunnel_id },
-    select: { in_node_group_id: true },
-  });
+    select: { in_node_group_id: true, preferred_ingress_node_id: true },
+  })) as { in_node_group_id: number; preferred_ingress_node_id: number | null } | null;
   if (!tunnel) return { candidate_node_id: null, preferred_node_id: null };
-  const candidates = await db.node.findMany({
+
+  const rows = ((await candidateDb.node.findMany({
     where: {
       node_group_id: tunnel.in_node_group_id,
       id: ctx.owner_node_id === null ? undefined : { not: ctx.owner_node_id },
       role: { in: ["ingress", "both"] },
-      // 只看"这个节点自己说自己还活着"的节点：面板最近收到过它的上报。
-      state_report: { reported_at: { gt: new Date(Date.now() - 5 * 60_000) } },
     },
-    select: { id: true },
+    select: {
+      id: true,
+      node_group_id: true,
+      role: true,
+      lifecycle: true,
+      status: true,
+      last_seen_at: true,
+      has_credential: true,
+      credential_revoked: true,
+    },
     orderBy: { id: "asc" },
-  });
-  // 今天没有"首选节点"的存储归属，所以不做偏好排序：按 id 取第一个可用候选。
-  // 这是**刻意的**：偏好是产品决定，没有地方表达时就不该由实现者挑一个当默认。
-  return { candidate_node_id: candidates[0]?.id ?? null, preferred_node_id: null };
+  })) as unknown as Array<CandidateFacts & { id: number }>).map((row) => ({ ...row, node_id: row.id }));
+
+  const eligible = rows.filter(
+    (node) =>
+      candidateRejection(node, "ingress", {
+        requireOnline: true,
+        ...(ctx.now ? { now: ctx.now } : {}),
+      }) === null,
+  );
+
+  // 偏好等于现任 ⇒ 没有"回切"可言（回切的定义就是离开现任）。报 null 而不是原样透出，
+  // 否则每一拍都会有一条"回切条件不满足"的噪音，而它描述的是一件本就不需要发生的事。
+  const preferredId =
+    tunnel.preferred_ingress_node_id !== null && tunnel.preferred_ingress_node_id !== ctx.owner_node_id
+      ? tunnel.preferred_ingress_node_id
+      : null;
+
+  // 候选按 id 升序取第一个合格者：没有偏好时不做"更聪明"的排序 —— 排序是产品决定，
+  // 没有地方表达它时就不该由实现者挑一个当默认。
+  //
+  // 排序**显式写在函数里**而不是依赖查询的 `orderBy`：那是"选哪一台"这条行为的一部分，
+  // 交给调用方的查询去保证，等于让它成为一条隐式契约（替身按别的顺序返回就会静默改掉选择）。
+  const first = [...eligible].sort((a, b) => a.node_id - b.node_id)[0];
+  return { candidate_node_id: first?.node_id ?? null, preferred_node_id: preferredId };
 }
 
 export interface FailoverSweepOptions {
@@ -103,6 +152,14 @@ export interface FailoverSweepOptions {
   readonly readPolicy?: typeof readFailoverPolicy;
   /** 只评估这些 tunnel 时用的执行器（测试注入替身）。 */
   readonly execute?: typeof executeFailoverForTunnel;
+  /**
+   * V5-WP17.1：记录"首选节点这一拍是否合格"。缺省写 `tunnel.failback_healthy_checks`。
+   *
+   * 做成可注入的钩子而不是往 `FailoverExecutorDb` 上加 `update`：那个接口是**执行器**的
+   * 读面，为了一个计数写放大所有替身（本仓有十几处）不成比例；而"连续 N 次"这条规则的
+   * 断言恰恰需要能在**不连数据库**的进程里跑。
+   */
+  readonly recordFailbackCheck?: (tunnelId: number, ready: boolean) => Promise<void>;
 }
 
 export interface FailoverSweepResult {
@@ -143,7 +200,16 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
       readFailoverDecisionFacts(input, {
         db: options.db ?? (db as unknown as FailoverExecutorDb),
         policy: () => policy,
-        destinations: (ctx) => pickFailoverDestination(ctx),
+        destinations: (ctx) => pickFailoverDestination({ ...ctx, now }),
+    // V5-WP17.1（契约 D4）：回切的"连续健康次数"必须**有一处真的在累计**，否则它恒为 0，
+    // `FAILBACK_HEALTHY_CHECKS` 那条条件永远不满足 —— 偏好照样存了，回切照样不会发生。
+    failbackHealthyChecks: async (tunnelId) => {
+      const row = (await (options.db ?? (db as unknown as FailoverExecutorDb)).tunnel.findUnique({
+        where: { id: tunnelId },
+        select: { failback_healthy_checks: true },
+      })) as { failback_healthy_checks: number } | null;
+      return row?.failback_healthy_checks ?? 0;
+    },
       }),
     loadLease: async (tunnelId) => (await import("./placement-lease.ts")).loadLease(tunnelId),
     claimLease: async (input) => (await import("./placement-lease.ts")).claimLease(input),
@@ -165,12 +231,39 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
     results.push(result);
     if (result.outcome === "moved") moved += 1;
     if (result.outcome === "hold") held += 1;
+    // V5-WP17.1（契约 D4）：维护"首选节点连续健康次数"。
+    //
+    // 位置有意放在**判定之后**：判定读的是上一拍的值，这一拍的结果写给下一拍看 ——
+    // 于是"连续 N 次健康"是真的 N 次观测，而不是同一拍里既判又算（那会让阈值退化成 1）。
+    //
+    // `null`（没有偏好 / 没读到事实）**什么都不做**：偏好可能刚被设上、或刚被清掉，
+    // 这时清零会把运维刚表达完的意图立刻抹掉，而它其实还没被观测过一次。
+    if (result.failback_ready !== null) {
+      try {
+        await (options.recordFailbackCheck ?? defaultRecordFailbackCheck)(result.tunnel_id, result.failback_ready);
+      } catch (e) {
+        // 计数写失败**不能**让整轮扫描失败：迁移判定本身已经完成，而"计数差一次"比
+        // "因为写计数失败而丢掉这一拍的全部结论"轻得多。
+        logFn({ level: "warn", message: "failback 健康计数写入失败", detail: (e as Error)?.message ?? String(e) });
+      }
+    }
     if (result.outcome !== "hold") {
       logFn({ level: "info", message: `failover ${result.outcome}`, detail: result });
     }
   }
   return { evaluated: tunnelIds.length, moved, held, results };
 }
+
+/**
+ * 缺省的计数写入：`increment` 是**原子**的 —— 读-改-写会在并发扫描下丢更新，
+ * 而丢更新的表现是"回切永远差一次"，从现象几乎反推不出来。
+ */
+const defaultRecordFailbackCheck = async (tunnelId: number, ready: boolean): Promise<void> => {
+  await db.tunnel.update({
+    where: { id: tunnelId },
+    data: ready ? { failback_healthy_checks: { increment: 1 } } : { failback_healthy_checks: 0 },
+  });
+};
 
 /**
  * 生产接线：走**既有**的 Forward 变更路径（用户在界面上改入口节点走的就是那条）。
