@@ -124,8 +124,11 @@ jobs:
       # V4-WP11C/WP11B：诊断 / 支持包 / 升级入口的渲染不变量与 mock 契约一致性
       # V5-WP13.5A：Console 边界（User/Admin 导航不变量、route group 不改变 URL、
       #             「guard 不是授权」的回归断言）
+      # V5-WP18.5：公告渲染（用户侧最小展示：纯文本转义/三态；管理端发布表单不变量）
+      #             —— 新增测试目录必须进这份清单：没被 CI 执行的测试等于没写
+      #             （`web/src/components/dashboard/__tests__/wp8-attention.test.ts` 的 E 组反查它）。
       - name: Unit tests (console boundary + dashboard + node admin + V4 forwards + legacy compatibility + diagnostics)
-        run: bun test src/components/console/__tests__/ src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/forwards/__tests__/ src/components/nodes/__tests__/ src/mocks/__tests__/
+        run: bun test src/components/console/__tests__/ src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/announcements/__tests__/ src/components/forwards/__tests__/ src/components/nodes/__tests__/ src/mocks/__tests__/
       - name: Build with optional billing disabled
         run: npm run build
         env:

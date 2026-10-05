@@ -38,6 +38,7 @@ import {
   isValidEmailTarget,
   notificationRetryDelayMs,
   renderNotificationText,
+  type DeliverableNotification,
   type LedgerClaimResult,
   type NewNotificationDelivery,
   type NotificationChannel,
@@ -148,7 +149,9 @@ function depsOf(over: {
   ledger: NotificationLedgerStore;
   cooldown?: NotificationCooldownStore;
   channel?: NotificationChannel;
-  targets?: (fact: NotificationFact) => readonly string[];
+  // 类型注解随 WP18.5 的放宽同步（投递层入参 = `DeliverableNotification`，`NotificationFact` 是它的超集）：
+  // **只改这一行类型**，断言与行为一字未动。
+  targets?: (fact: DeliverableNotification) => readonly string[];
   degradedCooldown?: (key: string, ttl: number) => boolean;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -309,8 +312,11 @@ describe("C. 静默期（F4.4 / DoD3）", () => {
     );
     expect(other[0]!.status).toBe("sent");
     expect(ledger.rows.length).toBe(2);
-    expect(cooldown.keys.has("ws:7:notification:cooldown:node:11:connection_offline")).toBe(true);
-    expect(cooldown.keys.has("ws:7:notification:cooldown:node:12:node_in_maintenance")).toBe(true);
+    // 键字面量随 WP18.5 的修正同步：静默期键**带渠道**（不带渠道会让同一事实的第 2 个渠道
+    // 被静默掉，见 `notificationCooldownKey` 的注释）。**只改字面量，断言的意图不变**：
+    // 两条不同的 reason_code 各有一条配额。
+    expect(cooldown.keys.has("ws:7:notification:cooldown:node:11:connection_offline:email")).toBe(true);
+    expect(cooldown.keys.has("ws:7:notification:cooldown:node:12:node_in_maintenance:email")).toBe(true);
   });
 
   test("静默期在配置校验**之后**消费：渠道没配好不会吞掉配好后的第一封信", async () => {

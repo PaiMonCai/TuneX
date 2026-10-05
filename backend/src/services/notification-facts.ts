@@ -441,7 +441,7 @@ export function deriveNotificationFacts(
  * 静默期键：`ws:<scope>:notification:cooldown:<source_kind>:<source_id>:<reason_code>`
  * （契约 F4.5）。
  *
- * 粒度是 **(scope, source_kind, source_id, reason_code)**，**不含时间窗** ——
+ * 粒度是 **(scope, source_kind, source_id, reason_code, channel_kind)**，**不含时间窗** ——
  * 这正是与 `dedupe_key` 的分工：「离线」与「恢复」各有各的配额（F4.4），不同原因码
  * 互不吞掉；而同一原因码在静默期内只投递一次，靠的就是这个键存在。
  *
@@ -455,7 +455,16 @@ export function deriveNotificationFacts(
  * 但键**仍**只经 `scopedKey` 生成 —— 业务代码手拼键名是这个仓库明令禁止的。
  */
 export function notificationCooldownKey(
-  fact: Pick<NotificationFact, "scope" | "source_kind" | "source_id" | "reason_code">,
+  // 结构性入参（不是 `Pick<NotificationFact, …>`）：投递层在 WP18.5 放宽成
+  // `DeliverableNotification`（公告也要走同一条投递路径），而键**只**取这几个字段，
+  // 所以把类型写成它真正用到的东西，既保住"同一份键形状"，也不强迫公告伪装成
+  // `NotificationFact`。`NotificationFact` 结构上满足它，18.1/18.2 的调用点未变。
+  fact: { scope: NotificationScope; source_kind: string; source_id: string; reason_code: string },
+  /**
+   * **渠道**。必填（不是可选、没有默认值）：见下面"键为什么必须带渠道"。
+   * 写成必填是有意的 —— 漏传会编译不过，于是"只改了一半调用点"这种半修状态不存在。
+   */
+  channelKind: string,
 ): string {
   return scopedKey(
     scopeId(fact.scope.workspace_id),
@@ -464,5 +473,31 @@ export function notificationCooldownKey(
     fact.source_kind,
     fact.source_id,
     fact.reason_code,
+    channelKind,
   );
 }
+
+/*
+ * ── 键为什么必须带渠道（WP18.5 修的真实缺陷）──
+ *
+ * F4.4 的措辞是"同一 `(scope, source_kind, source_id, reason_code)` 在静默期内只投递一次"，
+ * 于是第一版把键落成了这四个字段。当时**只有一个渠道**（email），所以看不出来。
+ * 18.3/18.4 把 webhook/telegram 加进注册表之后，这个键变成了一个会静默生效的缺陷：
+ * 同一个事实循环到第 2 个渠道时，`SET NX` 已经被第 1 个渠道置位 ⇒ 第 2 个渠道拿到
+ * `suppressed`（**不是失败**，账本里连一行都不会有）。实测（WP18.5 接线时用两个假渠道跑
+ * `deliverNotificationFacts`）：`email:sent`、`telegram:suppressed`、账本 1 行。
+ * 也就是说：**打开 webhook 会把 telegram 静音**，而账本看不出任何异常。
+ *
+ * 正确粒度是**每渠道**，理由全在契约里：
+ *   · F3：每渠道各自一条投递记录，"不做「扇出 N 渠道后聚合出一个成功」的模糊判定"；
+ *   · F6.5：免打扰是 `(用户 × 渠道 × 类别)` —— 用户靠**静音某个渠道**来少收通知；
+ *     若静默期跨渠道生效，"给不给这个渠道发"就取决于渠道顺序，用户没有可用的旋钮；
+ *   · F4.6：账本记的是"**这个渠道**给谁发过"，而目标本来就不一定同一个（邮件给运维、
+ *     telegram 给绑定用户、webhook 给机器）。
+ * 所以 F4.4 的"只投递一次"在**每渠道**这个粒度上成立：一次事件可以在多个渠道各投一次，
+ * 但同一渠道在静默期内不会重复打扰。
+ *
+ * 升级影响（写清楚，不含糊）：键形状变了 ⇒ 部署前已存在的旧键不再匹配，最坏情况是升级后
+ * 每个"事件 × 渠道"多投一次。当期是 v5 未发布形态，可接受；若要严格避免，可在升级窗口把
+ * Redis 里的 `ws:*:notification:cooldown:*` 一并清掉。
+ */

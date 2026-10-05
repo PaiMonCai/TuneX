@@ -170,12 +170,19 @@ describe("B. 幂等键（F4.2 / R2）", () => {
     const offline = factsOf([seed()]).facts[0]!;
     const behind = factsOf([seed({ item: item({ reason_code: "runtime_revision_behind" }) })]).facts[0]!;
     const otherNode = factsOf([seed({ item: item({ id: 12 }) })]).facts[0]!;
-    expect(notificationCooldownKey(offline)).toBe("ws:7:notification:cooldown:node:11:connection_offline");
-    expect(notificationCooldownKey(behind)).not.toBe(notificationCooldownKey(offline));
-    expect(notificationCooldownKey(otherNode)).not.toBe(notificationCooldownKey(offline));
+    // 键带**渠道**（WP18.5 修：不带渠道会让同一事实的第 2 个渠道被静默掉，见该函数注释）。
+    expect(notificationCooldownKey(offline, "email")).toBe(
+      "ws:7:notification:cooldown:node:11:connection_offline:email",
+    );
+    expect(notificationCooldownKey(behind, "email")).not.toBe(notificationCooldownKey(offline, "email"));
+    expect(notificationCooldownKey(otherNode, "email")).not.toBe(notificationCooldownKey(offline, "email"));
+    // 同一事实、不同渠道 = **两条配额**（F3 每渠道各自一条记录；用户靠静音渠道少收通知）。
+    expect(notificationCooldownKey(offline, "telegram")).not.toBe(notificationCooldownKey(offline, "email"));
     // 平台级事实落 ws:global，不落进任何租户的键域。
     const platform = factsOf([seed()], platformNotificationScope()).facts[0]!;
-    expect(notificationCooldownKey(platform)).toBe("ws:global:notification:cooldown:node:11:connection_offline");
+    expect(notificationCooldownKey(platform, "email")).toBe(
+      "ws:global:notification:cooldown:node:11:connection_offline:email",
+    );
   });
 });
 

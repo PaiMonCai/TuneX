@@ -29,7 +29,11 @@
  */
 import { isMailConfigured, sendMail, type MailMessage, type MailResult } from "./mail.ts";
 import type { NotificationFact, NotificationScope } from "./notification-facts.ts";
-import { cooldownSecondsForReason, notificationCooldownKey } from "./notification-facts.ts";
+import {
+  cooldownSecondsForReason,
+  notificationCooldownKey,
+  platformNotificationScope,
+} from "./notification-facts.ts";
 import { createWebhookChannel } from "./notification-webhook.ts";
 import { createTelegramChannel } from "./notification-telegram.ts";
 
@@ -88,6 +92,46 @@ export type ChannelConfigCheck = { ok: true } | { ok: false; reason: Notificatio
 export interface RenderedNotification {
   subject: string;
   text: string;
+}
+
+/**
+ * 投递核心需要的最小事实形状。**结构性类型，不是第二个真相来源**。
+ *
+ * ── 为什么会有它（WP18.5 的 D1 裁决 = (b)，Lead 2026-10-05 批准）──
+ * `NotificationFact`（WP18.1）是**注意力派生**的结果，它的 `reason_code` 冻结成
+ * `AttentionReasonCode`（「通知只消费既有词表」）。而公告的真相在公告表、不是 attention 的
+ * 派生（契约 F2-N6）—— 把它塞进 `NotificationFact` 就得为「公告」新造一个 attention 原因码，
+ * 那正是在那条不变量上开口子。
+ * 同时 Lead 要求：公告**必须走同一本账本、同一套免打扰与静默判据**，**不得**开第二条投递路径。
+ * 两件事同时成立的唯一做法是 —— **放宽投递层的输入类型，而不是复制投递层**。
+ *
+ * `NotificationFact` 结构上是它的**超集**，所以既有的 `deliverNotificationFacts(facts, …)`
+ * 调用点一字未改（18.1/18.2/18.3/18.4 的测试全部照跑，这就是"没有第二条路径"的证据）。
+ */
+export interface DeliverableNotification {
+  readonly scope: NotificationScope;
+  /** 封闭枚举里的来源种类（`NOTIFICATION_SOURCE_KINDS`；公告是 `"announcement"`）。 */
+  readonly source_kind: string;
+  /** 既有表主键（F8-B：不存在指向不存在行的投递）。 */
+  readonly source_id: string;
+  /**
+   * 原因码。attention 派生的事实这里仍然是 `AttentionReasonCode`（那边的类型没变），
+   * 公告用自己的码空间（`announcement-delivery.ts` 的 `ANNOUNCEMENT_NOTIFICATION_REASON_CODES`）；
+   * 未知码的静默期按 `cooldownSecondsForReason` 的既定行为回落默认值（30 分钟）。
+   */
+  readonly reason_code: string;
+  readonly severity: string;
+  readonly resource_type: string;
+  readonly resource_id: string;
+  /** 展示名（只用于渲染；不进幂等键、不参与判定）。 */
+  readonly resource_name?: string | null;
+  readonly occurred_at: string;
+  /** 幂等键的时间窗下界（ISO 8601）。 */
+  readonly window_start: string;
+  /** 幂等键：`sha256(scope, source_kind, source_id, reason_code, window_start)`。 */
+  readonly dedupe_key: string;
+  /** 更细的既有诊断码（可选，只用于渲染与排障）。 */
+  readonly detail_code?: string | null;
 }
 
 /**
@@ -153,7 +197,7 @@ function renderTime(iso: string): string {
  * 注意正文里**没有**"人类可读文案"：`attention.ts` 的取向是文案归前端
  * （`reasonAction`），后端再抄一份就会分叉。邮件里给的是**码**——码是可查、可对上工单的。
  */
-export function renderNotificationText(fact: NotificationFact): RenderedNotification {
+export function renderNotificationText(fact: DeliverableNotification): RenderedNotification {
   const subject = sanitizeInterpolation(
     `[TuneX][${fact.severity}] ${fact.reason_code}`,
     NOTIFICATION_RENDER_LIMITS.SUBJECT_MAX,
@@ -256,6 +300,29 @@ export function createEmailChannel(deps: EmailChannelDeps = {}): NotificationCha
  */
 export function defaultNotificationChannels(): NotificationChannel[] {
   return [createEmailChannel(), createWebhookChannel(), createTelegramChannel()];
+}
+
+/**
+ * 只保留**本安装真正打开了**的渠道（WP18.5 接线用；契约 §12.3-D10）。
+ *
+ * 为什么不能直接拿 `defaultNotificationChannels()` 去投递：那个注册表回答的是"**支持**哪些渠道"，
+ * 未配置的渠道在投递时会各留一条 `not_configured` 失败行 —— 一次公告因此变成
+ * "1 条 sent + 2 条 not_configured"。**一个没人要求投递、也默认关闭的渠道，不是"投递失败"，
+ * 而是"这次投递与它无关"**；把两者混在一起，账本就不再是"谁收到过什么"的证据。
+ *
+ * 判据用渠道自己的 `isConfigured(平台作用域)`（实例级：SMTP 凭据齐备 / 部署开关 + 密文）；
+ * 判定抛错一律当作"没打开"（fail-closed —— 判不出来就别发，也不会误报成功）。
+ */
+export function enabledNotificationChannels(
+  channels: readonly NotificationChannel[] = defaultNotificationChannels(),
+): NotificationChannel[] {
+  return channels.filter((channel) => {
+    try {
+      return channel.isConfigured(platformNotificationScope());
+    } catch {
+      return false;
+    }
+  });
 }
 
 /* ================================================================== */
@@ -444,13 +511,22 @@ export interface NotificationOutcome {
  * `rejected_target` 失败记录（fail-closed，可见）。
  */
 export type NotificationTargetResolver = (
-  fact: NotificationFact,
+  fact: DeliverableNotification,
   channel: NotificationChannel,
 ) => readonly string[] | Promise<readonly string[]>;
 
 export interface DeliverNotificationDeps {
-  /** 渠道注册表（默认 `defaultNotificationChannels()`：email + webhook，各自有闸门）。 */
+  /**
+   * 渠道注册表。默认 `defaultNotificationChannels()`（支持哪些渠道）；
+   * **接线层应当显式传 `enabledNotificationChannels()`**（本安装真正打开的渠道）。
+   */
   channels?: readonly NotificationChannel[];
+  /**
+   * 渲染器。默认 `renderNotificationText`（码式正文，给运维看的）；
+   * 公告用自己的渲染器（`announcement-delivery.ts` 的纯文本公告正文）——
+   * 这是"同一本账本、同一套判据，但内容各按自己的真相渲染"的落点。
+   */
+  render?: (fact: DeliverableNotification) => RenderedNotification;
   resolveTargets: NotificationTargetResolver;
   ledger: NotificationLedgerStore;
   /** 默认平台 Redis；单测注入内存替身。 */
@@ -472,7 +548,7 @@ const defaultWarn = (message: string, err?: unknown): void => {
 /** 落库的目标字段上限（`target` 列 = 512 字符）。 */
 const TARGET_COLUMN_MAX = 512;
 
-function scopeColumns(fact: NotificationFact): { scope_kind: "platform" | "workspace"; workspace_id: number | null } {
+function scopeColumns(fact: DeliverableNotification): { scope_kind: "platform" | "workspace"; workspace_id: number | null } {
   return fact.scope.kind === "platform"
     ? { scope_kind: "platform", workspace_id: null }
     : { scope_kind: "workspace", workspace_id: fact.scope.workspace_id };
@@ -504,7 +580,7 @@ function scopeColumns(fact: NotificationFact): { scope_kind: "platform" | "works
  *    写不进去还发出去会产生不可审计的投递，且静默期键可能已置位导致这次投递永久丢失。
  */
 export async function deliverNotificationFacts(
-  facts: readonly NotificationFact[],
+  facts: readonly DeliverableNotification[],
   deps: DeliverNotificationDeps,
 ): Promise<NotificationOutcome[]> {
   const channels = deps.channels ?? defaultNotificationChannels();
@@ -526,7 +602,7 @@ export async function deliverNotificationFacts(
 
   /* ---------------------------------------------------------------- */
 
-  async function deliverOne(fact: NotificationFact, channel: NotificationChannel): Promise<NotificationOutcome> {
+  async function deliverOne(fact: DeliverableNotification, channel: NotificationChannel): Promise<NotificationOutcome> {
     const base = { dedupe_key: fact.dedupe_key, channel_kind: String(channel.kind) };
     const fail = (reason: NotificationFailureReason, attempts = 0, degraded = false): NotificationOutcome => ({
       ...base,
@@ -562,7 +638,9 @@ export async function deliverNotificationFacts(
       }
 
       // ── 静默期 ──
-      const cooldownKey = notificationCooldownKey(fact);
+      // 静默期的粒度是**每渠道**（键带 `channel.kind`，WP18.5 修）：否则同一事实的
+      // 第 2 个渠道会被第 1 个渠道置的 `SET NX` 静默掉，而账本里看不出任何异常。
+      const cooldownKey = notificationCooldownKey(fact, channel.kind);
       const cooldownTtl = cooldownSecondsForReason(fact.reason_code);
       let degraded = false;
       let allowed: boolean;
@@ -608,7 +686,7 @@ export async function deliverNotificationFacts(
       }
 
       // ── 发送（有界重试；**只重投失败的目标**，成功的不再发第二封）──
-      const rendered = renderNotificationText(fact);
+      const rendered = (deps.render ?? renderNotificationText)(fact);
       let attempts = 0;
       let failureReason: NotificationFailureReason | null = null;
       let detail: string | null = null;
@@ -664,7 +742,7 @@ export async function deliverNotificationFacts(
    * 抢占失败说明这一格已经有记录了，不必也不能再写一行。
    */
   async function recordRejection(
-    fact: NotificationFact,
+    fact: DeliverableNotification,
     channel: NotificationChannel,
     reason: NotificationFailureReason,
   ): Promise<void> {

@@ -282,6 +282,9 @@ export const adminConsoleNav: NavGroup[] = [
     labelEn: "Operations",
     items: [
       { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
+      // V5-WP18.5：平台公告（写给所有人的内容）。挂"运营"而不是"系统"：它是内容/沟通，
+      // 与工单同类；RBAC 资源键的登记在 WP18.6（登记前只有超管可用，入口照常显示）。
+      { href: "/admin/announcements", labelKey: "admin.announcements", iconKey: "announcements" },
       { href: "/admin/audit-logs", labelKey: "admin.auditLogs", iconKey: "license" },
       {
         href: "/admin/alerts",

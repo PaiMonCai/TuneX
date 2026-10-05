@@ -655,6 +655,20 @@ export const api = {
     updateUser: (id: number, input: Partial<AdminUserInput>, cookie?: string) =>
       patch<User>(`/admin/users/${id}`, input, cookie),
     removeUser: (id: number, cookie?: string) => del<{ ok: boolean }>(`/admin/users/${id}`, cookie),
+    /**
+     * V5-WP18.5：平台公告（列出含已撤回 / 发布 / 撤回）。
+     *
+     * 前缀 `/admin/announcements` 的 RBAC 登记是 WP18.6 的动作：在它登记之前，
+     * `adminPermissionGuard` 对未登记前缀 fail-closed —— 只有 `super_admin` 能用。
+     * 前端因此**不做**"看起来能用其实 403"的乐观渲染：失败一律把后端原因显示出来。
+     */
+    announcements: {
+      list: (cookie?: string) => get<Announcement[]>("/admin/announcements", undefined, cookie),
+      create: (input: { type: string; title: string; body: string }, cookie?: string) =>
+        post<Announcement>("/admin/announcements", input, cookie),
+      revoke: (id: ID, cookie?: string) =>
+        post<Announcement>(`/admin/announcements/${id}/revoke`, {}, cookie),
+    },
     nodes: (query?: ListQuery, cookie?: string) => get<Paginated<Node>>("/admin/nodes", query, cookie),
     createNode: (input: NodeInput, cookie?: string) => post<Node>("/admin/nodes", input, cookie),
     updateNode: (id: number, input: Partial<NodeInput>, cookie?: string) =>

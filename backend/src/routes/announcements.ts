@@ -32,6 +32,10 @@ import type { AppVariables } from "../middlewares/auth.ts";
 import { resolveWorkspaceMembership, resolveWorkspaceAccess } from "../services/workspace.ts";
 import { workspaceNotificationScope } from "../services/notification-facts.ts";
 import {
+  deliverAnnouncementOnPublish,
+  type AnnouncementPublishDb,
+} from "../services/announcement-delivery.ts";
+import {
   createAnnouncement,
   dismissAnnouncement,
   listAnnouncementsForManagement,
@@ -62,6 +66,25 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
 
 function deps(): AnnouncementDeps {
   return { db: db as unknown as AnnouncementDeps["db"] };
+}
+
+/**
+ * 发布成功后的**投递接线**（V5-WP18.5 §12.3-D10）。
+ *
+ * 三条纪律：
+ *  ① **不 await、不冒泡**：公告已经落库、站内已可见，投递是旁路（`mail.ts`/`audit.ts` 同一取向）。
+ *     `deliverAnnouncementOnPublish` 自己吞掉所有异常，`.catch` 只是防"不可达的拒绝"变成
+ *     进程级 unhandled rejection。
+ *  ② **scope 由调用点决定**（不由请求体决定）：平台公告只会在管理端路由里生成，
+ *     租户公告只在这里 —— 请求体里没有 scope 参数，也就没有越权的入口。
+ *  ③ 走**同一本账本、同一套免打扰/静默判据**：`deliverAnnouncementOnPublish` 内部就是
+ *     一次 `deliverNotificationFacts()` 调用。
+ */
+function fireAnnouncementDelivery(
+  row: { id: number; type: string; title: string; body: string; published_at: string },
+  scope: ReturnType<typeof workspaceNotificationScope>,
+): void {
+  void deliverAnnouncementOnPublish(db as unknown as AnnouncementPublishDb, { row, scope }).catch(() => {});
 }
 
 /** 错误码 → HTTP 状态。未知码一律 500（不把编程错误伪装成业务拒绝）。 */
@@ -171,13 +194,15 @@ announcementRoutes.post("/", async (c) => {
   const user = requireUser(c);
   const body = await readCreateBody(c);
   if (!body) return c.json({ error: "请求体不是合法 JSON 对象", code: "invalid_body" }, 400);
+  const scope = workspaceNotificationScope(access.id);
   const result = await createAnnouncement(deps(), {
-    scope: workspaceNotificationScope(access.id),
+    scope,
     type: body.type,
     title: body.title,
     body: body.body,
     userId: user.id,
   });
+  if (result.ok) fireAnnouncementDelivery(result.value, scope);
   return send(c, result, 201);
 });
 

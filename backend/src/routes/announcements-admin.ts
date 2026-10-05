@@ -28,6 +28,10 @@ import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { platformNotificationScope } from "../services/notification-facts.ts";
 import {
+  deliverAnnouncementOnPublish,
+  type AnnouncementPublishDb,
+} from "../services/announcement-delivery.ts";
+import {
   createAnnouncement,
   listAnnouncementsForManagement,
   revokeAnnouncement,
@@ -79,14 +83,23 @@ announcementAdminRoutes.post("/announcements", async (c) => {
     return c.json({ error: "请求体不是合法 JSON 对象", code: "invalid_body" }, 400);
   }
   const body = raw as { type?: unknown; title?: unknown; body?: unknown };
+  const scope = platformNotificationScope();
   const result = await createAnnouncement(deps(), {
-    scope: platformNotificationScope(),
+    scope,
     type: typeof body.type === "string" ? body.type : "",
     title: body.title,
     body: body.body,
     // 发布者 = 当前超管；审计面另有 audit_log（本层不写审计：公告表本身就是事实）。
     userId: user.id,
   });
+  if (result.ok) {
+    // 投递是旁路：不 await、不冒泡（公告已落库、站内已可见）。受众 = 全体活跃用户，
+    // 与读侧可见性同口径；走同一本账本与同一套免打扰/静默判据（§12.3-D10/D11）。
+    void deliverAnnouncementOnPublish(db as unknown as AnnouncementPublishDb, {
+      row: result.value,
+      scope,
+    }).catch(() => {});
+  }
   return send(c, result, 201);
 });
 

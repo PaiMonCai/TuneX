@@ -24,9 +24,13 @@
  * 「用户静音了 email 的 announcement」不会让站内公告消失，也不会改变已读状态（F6.5）。
  */
 import { NOTIFICATION_CHANNEL_KINDS } from "./notification-delivery.ts";
-import type { NotificationChannel, NotificationChannelKind } from "./notification-delivery.ts";
+import type {
+  DeliverableNotification,
+  NotificationChannel,
+  NotificationChannelKind,
+} from "./notification-delivery.ts";
 import { NOTIFICATION_SOURCE_KINDS } from "./notification-facts.ts";
-import type { NotificationFact, NotificationSourceKind } from "./notification-facts.ts";
+import type { NotificationSourceKind } from "./notification-facts.ts";
 
 /* ================================================================== */
 /* 词表与三元映射                                                      */
@@ -143,12 +147,12 @@ export function mutesForUser(
  */
 export function createMuteAwareTargetResolver(options: {
   recipients: (
-    fact: NotificationFact,
+    fact: DeliverableNotification,
     channel: NotificationChannel,
   ) => readonly MuteRecipient[] | Promise<readonly MuteRecipient[]>;
   /** 免打扰清单：按 user_id 索引（调用方一次查出，避免逐条 round-trip）。 */
   mutes: ReadonlyMap<number, readonly NotificationMute[]>;
-}): (fact: NotificationFact, channel: NotificationChannel) => Promise<readonly string[]> {
+}): (fact: DeliverableNotification, channel: NotificationChannel) => Promise<readonly string[]> {
   return async (fact, channel) => {
     const recipients = await options.recipients(fact, channel);
     return filterRecipientsByMute(recipients, options.mutes, channel.kind, fact.source_kind).map(
