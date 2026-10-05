@@ -1,5 +1,12 @@
 /**
- * V4-WP11B —— 控制协议能力协商（纯函数，无 IO）。
+ * Agent command-capability negotiation.
+ *
+ * Stored state reports describe which command actions an Agent implements.
+ * Missing capability facts are treated according to the compatibility baseline;
+ * explicit unsupported actions fail closed with an upgrade-required reason.
+ */
+
+ *  —— 控制协议能力协商（纯函数，无 IO）。
  *
  * 这一层回答一个问题：**这个节点现在能不能收到这个动作？**
  *
@@ -32,7 +39,7 @@ export const CONTROL_PROTOCOL_VERSION = 1;
 /**
  * 协议冻结时就已经存在的动作。
  *
- * 这些动作在 WP11B 之前就随 WP7/WP11 的 Agent 发布，因此"未上报能力"的旧
+ * 这些动作在  之前就随 / 的 Agent 发布，因此"未上报能力"的旧
  * Agent 必须继续被认为支持它们——否则升级期间整批旧节点会被拒绝下发。
  *
  * 新增动作（诊断、drain、升级……）**不在**此表内：它们必须被明确上报，
