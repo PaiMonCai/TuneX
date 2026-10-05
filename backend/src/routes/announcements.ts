@@ -1,5 +1,5 @@
 /**
- * V5-WP18.5 —— 公告的**用户侧 + 租户侧**接口（契约 §F6 / §F7）。
+ *  —— 公告的**用户侧 + 租户侧**接口（契约 §F6 / §F7）。
  *
  * 端点：
  *   GET    /api/announcements                可见公告（platform ∪ 本 workspace）+ 本用户已读标记
@@ -16,7 +16,7 @@
  *   · 可见列表 / 已读 = **活跃成员**即可（`resolveWorkspaceMembership`，任何角色都能读）；
  *   · 管理面（列全部含已撤回 / 发布 / 撤回）= F7 的口径，复用 `settings:read` / `settings:manage`，
  *     **不新增**权限键（`WORKSPACE_PERMISSIONS` 是白名单，改它要同步 UI + 测试）。
- * 这条取舍已写回契约 §12，等 Lead 复核。
+ * 该权限边界由 workspace membership / settings permissions 固化。
  *
  * ── 免打扰为什么在 `/announcements/preferences` 而不是工作空间作用域 ──
  * 它是**用户级**偏好（F6.5 的三元映射里没有 workspace），所以这两个端点只认会话用户、
@@ -69,7 +69,7 @@ function deps(): AnnouncementDeps {
 }
 
 /**
- * 发布成功后的**投递接线**（V5-WP18.5 §12.3-D10）。
+ * 发布成功后的**投递接线**（ §12.3-D10）。
  *
  * 三条纪律：
  *  ① **不 await、不冒泡**：公告已经落库、站内已可见，投递是旁路（`mail.ts`/`audit.ts` 同一取向）。

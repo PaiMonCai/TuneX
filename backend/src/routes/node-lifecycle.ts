@@ -1,35 +1,10 @@
 /**
- * V4-WP5 — Node Lifecycle API（管理端：生命周期变更 / 影响检查 / 退役删除）
+ * Admin Node lifecycle, impact and retiring-delete surface.
  *
- * 依据 `DEVELOPMENT.md` §13.4。挂载（app.ts）：`/api/admin`。
- * 认证/权限沿用挂载点的中间件（adminRequired → adminPermissionGuard）。
- *
- * ── 端点总览（全部落在 `nodes` 资源前缀，见文件末 RBAC 说明）──
- *   GET    /api/admin/node/:id/lifecycle        单节点生命周期视图（含三层状态投影）
- *   PATCH  /api/admin/node/:id/lifecycle        变更生命周期（+note）
- *   GET    /api/admin/node/:id/impact           影响检查（删除/收缩前先看这里）
- *   DELETE /api/admin/node/:id/lifecycle        retiring 后物理删除
- *
- * ── 与 node-admin.ts 的分工（避免两文件同时改同一路径）──
- * node-admin.ts 负责角色 / 出口池 / 凭据状态（WP10），本文件负责生命周期
- * （WP5）。两者共用 `resolveNodeId`（同一声明的 id → 主键解析口径），但
- * **不共享路由注册表**：node-admin.ts 已注册 `/node/:id/role` 等，本文件新增的
- * 是 `/node/:id/lifecycle` 与 `/node/:id/impact`、`DELETE /node/:id/lifecycle`，
- * 不发生覆盖。Hono 按注册顺序匹配，同路径后者覆盖前者；本文件注册在
- * node-admin.ts 之后（app.ts），但因路径不同，无冲突。
- *
- * ── 凭据纪律 ──
- * 响应只回 LifecycleNodeRow 投影（见 `lifecycleViewResponse`）：凭据只给布尔
- * `has_credential`，**既不明文也不哈希**。与 node-admin.ts 的
- * `const { node_credential_hash: _hash, ...node }` 同一纪律。
- *
- * ── 限流 ──
- * PATCH / DELETE 是敏感写，沿用 `api-global`（app.ts 全局，user 维度）。
- * 决策记录（偏离报告 §4 的 `node-lifecycle` 专用规则）：不单独挂更严的规则。
- * 理由：lifecycle 变更不是凭据轮换那种高频攻击面，且非法变更会被 409 挡住，
- * 滥用者拿不到额外能力。若运营后证明需要更严的用户维度限额，再加规则时必须
- * 插在 `api-global` **之前**（rate-limit.ts 按注册顺序首个命中生效），否则
- * 会被 api-global 先匹配而静默失效。
+ * The app-level admin guards provide authentication/RBAC. Responses expose only
+ * lifecycle projections and credential presence, never credential material.
+ * Lifecycle changes and physical deletion keep dependency checks explicit and do
+ * not implicitly cascade Forward ownership.
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -54,9 +29,8 @@ type Ctx = Context<{ Variables: AppVariables }>;
 
 /**
  * 统一错误响应：`{ error, message, code, condition?, dependencies? }`
- * （message 兼容前端 ApiError 取文案；condition/dependencies 原样透传，
- * §13.5 要求「运行条件拒绝必须使用可区分的错误码」——丢掉 condition 就等于
- * 把所有拒绝渲染成同一句「操作失败」）。
+ * message supports the Web error surface; condition/dependencies remain intact
+ * so runtime-condition refusals stay distinguishable.
  */
 function lifecycleError(
   c: Ctx,
@@ -111,7 +85,7 @@ function lifecycleViewResponse(node: Record<string, unknown>) {
  * 返回三层状态投影：
  *   lifecycle    —— 管理期望态（本层，active/maintenance/disabled/retiring）
  *   connection   —— 节点/凭据推导（waiting/online/offline，**不新增列**）
- *   health       —— 本期不回（WP6 telemetry）
+ *   health       —— 本期不回（ telemetry）
  * 另含 accepts_new_business + admission_rejection（前端据此禁用创建按钮）与
  * allowed_transitions（前端据此渲染迁移按钮）。
  */
@@ -182,7 +156,7 @@ nodeLifecycleRoutes.get("/node/:id/impact", async (c) => {
   if (!result.ok) return lifecycleError(c, result);
 
   // 角色收缩检查：调用方可选传 `?next_role=` / `?port_min=` / `?port_max=`，
-  // 命中则一并把收缩可行性判了（与 WP10 的 PATCH role 判定同源）。
+  // 命中则一并把收缩可行性判了（与  的 PATCH role 判定同源）。
   // `current_role` 缺省时按「不改角色」处理（只判端口区间悬空）。
   const nextRoleParam = c.req.query("next_role");
   const portMin = c.req.query("port_min");

@@ -1,28 +1,19 @@
 /**
- * WP7 — 节点状态上报 / 重连快照 HTTP 端点（免认证，Bearer 节点凭据）
+ * Agent machine endpoints mounted under `/api/internal`.
  *
- * 挂在 `/api/internal` 下（app.ts 中 `app.route("/api", publicRoutes)` 之前挂载），
- * 与既有 `/api/tunnel/observer`、`/api/tunnel/traffic` 同一类「机器端点」：
- *   · **免用户认证**：调用方是 Agent，没有用户会话（auth.ts 的 NO_AUTH_PATTERNS
- *     里有 `^\/api\/internal\/.*` 的显式豁免，见该处批注）；
- *   · **不免身份校验**：身份 = Bearer 节点凭据（services/node-credential.ts），
- *     解析出的 node_id 即归属，载荷里的任何 node 标识一律忽略；
- *   · **CSRF 豁免**：非浏览器客户端，不携带会话 cookie（middlewares/csrf.ts 的
- *     CSRF_EXEMPT_PATTERNS 与本文件路径一一对应，两边同步加）；
- *   · **专属限流规则**：按 IP 维度（节点没有 userId），规则必须排在 api-global
- *     之前，否则全部节点按 anon 共用一桶互相误伤（WP1 防爆破键同源的教训）。
+ * These routes bypass user-session authentication but never bypass machine
+ * identity: enrollment uses a short-lived one-time token; steady-state control
+ * uses the per-node Bearer credential. CSRF is not applicable because Agents do
+ * not use browser session cookies.
  *
- * 端点：
- *   POST /api/internal/node/state     —— 上报状态快照（upsert 每节点一行）
- *   GET  /api/internal/node/snapshot  —— 重连快照（断线重连后恢复自己那份状态）
+ * Production control is Agent-initiated HTTP(S):
+ * - POST /api/internal/node/state
+ * - GET  /api/internal/node/snapshot
+ * - GET  /api/internal/node/commands
+ * - POST /api/internal/node/ack
  *
- * 「NAT Agent 只靠出站连接工作」在这里落地为：两个端点都由 Agent 主动发起
- * （POST 上报 / GET 拉取），面板从不主动连 Agent；面板给 Agent 的下发仍走
- * Socket.IO（Agent 出站建连）——与 §7.9「控制 transport 由 Agent 主动出站」
- * 完全一致。
- *
- * ⚠️ 日志纪律：本文件**不**把 Authorization 头、请求体或任何凭据片段写进
- * console；响应体也永不含凭据。凭据明文只存在于 rotate 的响应（管理端点）。
+ * The Panel never needs to dial an Agent management port. Authorization headers,
+ * request credentials and credential fragments must never be logged.
  */
 import { Hono } from "hono";
 import type { AppVariables } from "../middlewares/auth.ts";
@@ -132,7 +123,7 @@ internalNodeRoutes.post("/node/state", async (c) => {
       ok: true,
       node_id: result.node_id,
       reported_at: result.reported_at.toISOString(),
-      // V5.3 WP9: the agent learns here how long it may keep serving. Absent/empty means
+      // : the agent learns here how long it may keep serving. Absent/empty means
       // "the panel has no ownership information for you", which is also the honest answer
       // for a node that owns nothing.
       leases: result.leases,
@@ -184,11 +175,11 @@ internalNodeRoutes.post("/node/ack", async (c) => {
       applied_revision: typeof body.applied_revision === "number" ? body.applied_revision : null,
       error_code: typeof body.error_code === "string" ? body.error_code : null,
       error: typeof body.error === "string" ? body.error.slice(0, 500) : null,
-      // V4-WP11C: a read-only action may return structured findings. They are
+      // : a read-only action may return structured findings. They are
       // validated and bounded in the bus, not trusted as-is.
       ...(body.results !== undefined ? { results: body.results as never } : {}),
       ...(body.facts !== undefined ? { facts: body.facts as never } : {}),
-      // V5.1b WP5-B2: a datagram RELAY's own hop endpoint rides its apply ACK
+      // V5.1b : a datagram RELAY's own hop endpoint rides its apply ACK
       // (`ip:port`; see CommandAckPayload.hop_local_addr for why it cannot wait for
       // the periodic state report).
       //
@@ -220,7 +211,7 @@ internalNodeRoutes.get("/node/desired", async (c) => {
   const auth = await authedNode(c.req.header("authorization"));
   if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
 
-  // V5.3 WP9 —— startup restore 也是一次“现任 owner 还活着”的强证明。
+  //  —— startup restore 也是一次“现任 owner 还活着”的强证明。
   //
   // Agent reinstall / 长时间离线后，旧 ownership lease 可能已经过期。若先构建
   // desired snapshot，再等随后的 /node/state 才续约，快照会把**过期 deadline**

@@ -158,7 +158,7 @@ publicRoutes.get("/tunnel/subscription", async (c) => {
 /**
  * GET /api/system/config/site —— 站点公开配置（免认证）
  *
- * V5-WP18.5（契约 F6.7）：**不再下发** `NOTICE` / `NOTICE_POPUP` /
+ * （契约 F6.7）：**不再下发** `NOTICE` / `NOTICE_POPUP` /
  * `NOTICE_POPUP_INTERVAL_HOURS`。
  *
  * 它们是「沉睡又被免认证下发」的键：`web/src` 里零消费者（只有管理端编辑器按前缀分组），
@@ -166,7 +166,7 @@ publicRoutes.get("/tunnel/subscription", async (c) => {
  * `20261033000000_v5_wp18_announcements`），继续下发就会形成**两份公告真相**：
  * 老客户端读到旧 `NOTICE`，新客户端读到公告表，两边说的不一样（R3）。
  *
- * 三个枚举值本身**一个都没删**（§9.8）：只是不再从这里读。
+ * the legacy config keys remain stored only for compatibility/migration.
  */
 publicRoutes.get("/system/config/site", async (c) => {
   const names = [

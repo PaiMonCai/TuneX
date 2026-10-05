@@ -35,7 +35,7 @@ import {
   withWorkspaceQuotaLock,
 } from "../services/policy-service.ts";
 import { billingDayKeyStamp } from "../services/billing-time.ts";
-// V5-WP20-6：图表键与 dashboard 共用同一实现（`fillDays`），不再各写一份本地零点逻辑。
+//：图表键与 dashboard 共用同一实现（`fillDays`），不再各写一份本地零点逻辑。
 import { fillDays } from "../services/traffic.ts";
 import { checkTunnelCreation } from "../services/capability-policy.ts";
 import {
@@ -203,17 +203,17 @@ tunnelsRoutes.post("/", async (c) => {
   if (!name) return c.json({ error: "隧道名称不能为空" }, 400);
   if (name.length > 60) return c.json({ error: "隧道名称长度不能超过 60 字符" }, 400);
 
-  // WP15 后 legacy 多协议引擎已删除。旧入口仍可保留 URL，但只能创建
+  //  后 legacy 多协议引擎已删除。旧入口仍可保留 URL，但只能创建
   // v3 已实现的 TCP DIRECT，不能把未实现协议写成“active”。
   const tunnelType = String(body.tunnel_type ?? "tcp").toLowerCase();
   if (tunnelType !== "tcp") {
-    return c.json({ error: "当前 v3 runtime 仅支持 TCP DIRECT；其它协议尚未启用" }, 400);
+    return c.json({ error: "兼容 Tunnel 创建入口仅支持 TCP DIRECT；其他协议请使用 /api/forwards" }, 400);
   }
   if (body.out_node_group_id !== undefined && body.out_node_group_id !== null && body.out_node_group_id !== "") {
-    return c.json({ error: "RELAY 请使用 /api/tunnels/v3/relay，并配置出口目标池" }, 400);
+    return c.json({ error: "RELAY 请使用 /api/forwards 创建转发" }, 400);
   }
   if (body.category === "remote_port_forward") {
-    return c.json({ error: "当前 v3 runtime 尚未启用 remote_port_forward" }, 400);
+    return c.json({ error: "兼容 Tunnel 创建入口不支持 remote_port_forward；请使用 /api/forwards" }, 400);
   }
 
   const inGroupId = Number(body.in_node_group_id);
@@ -230,8 +230,8 @@ tunnelsRoutes.post("/", async (c) => {
   const bad = forward.find((a) => !FORWARD_RE.test(a));
   if (bad) return c.json({ error: `转发目标格式应为 host:port（${bad}）` }, 400);
 
-  // v3 DIRECT 当前只有一个目标；不再保留 legacy JSON 多目标“看起来可用”
-  // 但 runtime 实际只读首目标的歧义。
+  // Compatibility DIRECT accepts exactly one target; multi-target JSON would
+  // imply behavior the current runtime does not provide on this legacy route.
   const first = forward[0]!;
   const ipv6 = /^\[([^\]]+)\]:(\d+)$/.exec(first);
   const hostPort = ipv6 ?? /^([^:]+):(\d+)$/.exec(first);
@@ -364,7 +364,7 @@ tunnelsRoutes.get("/:id/traffic", async (c) => {
   if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
 
   const days = Math.max(1, Math.min(90, Number(c.req.query("days") ?? 14) || 14));
-  // V5-WP20-6：下界用**归档戳**口径（= 当日标签的 UTC 午夜），与 `tunnel_traffic.date` 逐字可比。
+  //：下界用**归档戳**口径（= 当日标签的 UTC 午夜），与 `tunnel_traffic.date` 逐字可比。
   // 旧实现是「本地零点回退 days-1」，在 UTC+8 下拿到的其实是前一天，图表整体偏一格。
   const now = new Date();
   const since = new Date(billingDayKeyStamp(now).getTime() - (days - 1) * 86_400_000);
@@ -437,7 +437,7 @@ tunnelsRoutes.patch("/:id", async (c) => {
     return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
   }
   if ((tunnel.tunnel_mode ?? "direct") !== "direct") {
-    return c.json({ error: "RELAY 配置请使用 v3 隧道接口" }, 409);
+    return c.json({ error: "RELAY 配置请使用 /api/forwards" }, 409);
   }
 
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
@@ -445,7 +445,7 @@ tunnelsRoutes.patch("/:id", async (c) => {
 
   for (const forbidden of ["in_node_group_id", "out_node_group_id", "mode", "tunnel_mode", "category", "tunnel_type"]) {
     if (body[forbidden] !== undefined) {
-      return c.json({ error: `兼容 PATCH 不允许修改 ${forbidden}；拓扑变更请走 v3 流程` }, 409);
+      return c.json({ error: `兼容 PATCH 不允许修改 ${forbidden}；拓扑变更请使用 /api/forwards` }, 409);
     }
   }
 
@@ -455,7 +455,7 @@ tunnelsRoutes.patch("/:id", async (c) => {
   if (body.forward_addresses !== undefined) {
     forward = parseForward(body.forward_addresses);
     if (forward.length !== 1) {
-      return c.json({ error: "v3 DIRECT 当前要求且仅允许一个转发目标" }, 400);
+      return c.json({ error: "兼容 DIRECT 入口要求且仅允许一个转发目标" }, 400);
     }
     const target = forward[0]!;
     if (!FORWARD_RE.test(target)) return c.json({ error: "转发目标格式应为 host:port" }, 400);
@@ -595,7 +595,7 @@ tunnelsRoutes.delete("/:id", async (c) => {
 });
 
 /* ================================================================== */
-/* WP11 — RELAY 隧道端点（`DEVELOPMENT.md` §7.13）                       */
+/*  — RELAY 隧道端点（`DEVELOPMENT.md` §7.13）                       */
 /*                                                                      */
 /* 端点（v3 前缀 `/v3` 与 legacy 分开，避免同一路径下两种语义打架）：     */
 /*   GET    /v3/modes        可用模式（direct/relay）                    */
@@ -731,7 +731,7 @@ tunnelsRoutes.post("/v3/relay", async (c) => {
 
   const tunnelType = String(body.tunnel_type ?? "tcp").toLowerCase();
   if (tunnelType !== "tcp") {
-    return c.json({ error: "当前 v3/V5 runtime 仅支持已开放的 Forward 协议" }, 400);
+    return c.json({ error: "当前 runtime 仅支持已开放的 Forward 协议" }, 400);
   }
 
   const result = await createTunnelApi(
@@ -865,6 +865,6 @@ tunnelsRoutes.delete("/v3/:id", async (c) => {
   });
   if (!result.ok) return apiError(c, result);
 
-  // WP15：删完由 reconciler 拉齐，让节点上的监听下线。
+  //：删完由 reconciler 拉齐，让节点上的监听下线。
   return ok(c, { ok: true, id, action: "delete" });
 });

@@ -1,4 +1,4 @@
-/** WP10 session-only routes; mount at /api/workspaces alongside workspaceRoutes. */
+/**  session-only routes; mount at /api/workspaces alongside workspaceRoutes. */
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { AppVariables } from "../middlewares/auth.ts";

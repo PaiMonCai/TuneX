@@ -71,7 +71,7 @@ nodeGroupsRoutes.get("/", async (c) => {
     db.nodeGroup.count({ where }),
   ]);
 
-  // 在线节点数：节点 status=active 即视为在线（与 mock / 前端口径一致）
+  // Online count uses the node status projection consumed by the current UI.
   const groupIds = rows.map((g) => g.id);
   const onlineCounts = await db.node.groupBy({
     by: ["node_group_id"],
