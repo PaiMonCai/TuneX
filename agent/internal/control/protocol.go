@@ -2,9 +2,9 @@ package control
 
 import "sort"
 
-// V4-WP11B control-protocol negotiation.
+// Control-protocol negotiation.
 //
-// The panel must never send an action this agent does not implement, and it must
+// The Panel must never send an action this Agent does not implement, and it must
 // be able to tell "this agent implements X" from "this agent never told me".
 // Both facts travel on the existing state report:
 //
@@ -21,8 +21,8 @@ import "sort"
 // ProtocolVersion is the control-contract version this agent implements. It is
 // monotone: the panel may require a minimum version before using a new action.
 //
-// V5-WP1 moved it to 2: the state report now also carries `capability_manifest`
-// (control/manifest.go). Bumping the version is how an older panel can tell
+// Version 2 adds `capability_manifest` to the state report. Bumping the version
+// lets an older Panel tell
 // "this agent speaks a contract I only partly understand" without having to
 // parse the manifest first.
 const ProtocolVersion = 2
@@ -37,7 +37,7 @@ const (
 	// ActionCollectDiagnostics is the Node-level sibling: it reports what the
 	// process itself is running, instead of probing a target path.
 	ActionCollectDiagnostics = "collect_diagnostics"
-	// ActionLookingGlass (V5-WP19-D) is the one action whose target comes from
+	// ActionLookingGlass is the one action whose target comes from
 	// **user input** rather than from the panel's own desired state. That is why
 	// it is a separate action instead of a diagnose: it needs its own admission
 	// (public-only literals, enforced on both sides), its own caps and its own
