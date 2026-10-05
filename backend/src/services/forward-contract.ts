@@ -521,14 +521,8 @@ export function buildForwardRuntimePlan(
 }
 
 /**
- * 计划的**内部一致性**检查，返回违规清单（空 = 通过）。
- *
- * 为什么需要一个校验函数而不是只定义类型：这些规则用类型表达不了，而它们恰好是
- * 「协议对了、传输对了，但计划自相矛盾」的那一类错误——例如 RELAY 计划没有
- * next_hop、DIRECT 计划却带着出口节点。regression coverage 与后续协议都会读计划，
- * 与其每个消费者各自假设，不如在这里一次说清。
- *
- * 纯函数，不抛：调用方（Gate、诊断、未来协议）需要把违规当成数据收集起来。
+ * Internal consistency validation for a pure RuntimePlan. The function returns
+ * violations as data so callers can report all inconsistencies without throwing.
  */
 export function forwardRuntimePlanViolations(plan: ForwardRuntimePlan): string[] {
   const out: string[] = [];
