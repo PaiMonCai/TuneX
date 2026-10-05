@@ -13,7 +13,7 @@
  * 响应封装：前端 request() 剥掉 **一层** 顶层 data —— 列表返回
  *   { data: { data: rows, total, page, page_size } }，单对象返回 { data: obj }。
  *
- * 购买流程（V5-WP20-4 起，契约 §3.5）：
+ * 购买流程（ 起，契约 §3.5）：
  *   ① 套餐存在且 active ② 库存校验 ③ 优惠码折算 ④ 余额校验
  *   ⑤ 单事务：扣余额 + BalanceLog + 订单（带 `workspace_id`）+ **订阅** + **purchase 发放**
  *   ⑥ 事务提交后 `invalidatePolicyCache`
@@ -118,7 +118,7 @@ plansRoutes.post("/purchase", async (c) => {
   if (plan.status !== "active") return c.json({ error: "该套餐已下架" }, 400);
   if (plan.stock !== null && plan.stock <= 0) return c.json({ error: "库存不足" }, 400);
 
-  // 购买归属到用户的 `personal` workspace（契约 §3.5.2：套餐属 workspace，不属 user）。
+  // 购买归属到用户的 `personal` workspace。
   // 这里用幂等修复而不是「查不到就拒绝」：workspace 由注册流程创建，但**早于**该流程的存量账号
   // 可能没有；为一次合法购买返回 500 是最差的选择，而 `ensurePersonalWorkspace` 本来就是
   // 为这种账号准备的幂等修复（内含 `assignDefaultPolicy`，即既有那条 system_default 发放）。
@@ -154,7 +154,7 @@ plansRoutes.post("/purchase", async (c) => {
 
   // ---- 单事务：扣款 → 订单 → 订阅（PlanSubscription 唯一真相 + legacy 双写）→ purchase 发放 ----
   //
-  // 顺序即契约（§3.5.2/R6）：扣款、订单、订阅、发放必须**同事务** —— 授权同步失败要回滚，
+  // 顺序即契约：扣款、订单、订阅、发放必须**同事务** —— 授权同步失败要回滚，
   // 不得「扣了钱却不留权」。缓存失效（`invalidatePolicyCache`）放在**提交之后**。
   const result = await db.$transaction(async (tx) => {
     // ① 扣余额（条件更新，防并发超扣）
