@@ -4,7 +4,7 @@
  * 端点（挂载于 /api/dashboard）：
  *   GET /stats      个人概览：余额 / 佣金 / 隧道数 / 套餐流量 / 节点数 / 今日流量
  *   GET /traffic    近 N 天流量趋势（TrafficPoint[]）
- *   GET /attention  V4-WP8 §13.7 Wave 4：需要处理的异常/离线/等待安装条目
+ *   GET /attention   §13.7 Wave 4：需要处理的异常/离线/等待安装条目
  *                   （离线或未安装的节点、管理态挡掉新业务的节点、失败或
  *                   仍在下发中的 Forward），每条带既有理由码供前端给下一步
  *
@@ -43,7 +43,7 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
 }
 
 /**
- * 当日日首（V5-WP20-6：固定 `Asia/Shanghai`，不再跟随进程时区）。
+ * 当日日首（：固定 `Asia/Shanghai`，不再跟随进程时区）。
  *
  * 旧实现是 `new Date()` + `setHours(0,0,0,0)`：缺少 `TZ=Asia/Shanghai` 的部署上，
  * 「今日」会按宿主时区取整，与归档行的日标签差一天。
@@ -55,7 +55,7 @@ function startOfToday(now: Date = new Date()): Date {
 /**
  * 近 N 天（含今天）的日期键，升序。
  *
- * V5-WP20-6：改为复用 `services/traffic.ts#fillDays`（与 `tunnels.ts` 的图表同一实现）。
+ *：改为复用 `services/traffic.ts#fillDays`（与 `tunnels.ts` 的图表同一实现）。
  * 旧实现是「本地零点 + `toISOString().slice(0,10)`」——UTC+8 下本地午夜落在**前一天 16:00Z**，
  * `toISOString` 因此回退一天，图表键与归档行的日标签整体错开一格。
  */
@@ -111,7 +111,7 @@ dashboardRoutes.get("/stats", async (c) => {
   const workspace = await resolveWorkspaceMembership(c);
   const forwardsVisible = canWorkspaceResourceAction(workspace, "read", "forward");
   const nodesVisible = canWorkspaceResourceAction(workspace, "read", "node");
-  // V5-WP20-6：日/月界都来自固定时区（`billing-time.ts`）。
+  //：日/月界都来自固定时区（`billing-time.ts`）。
   const now = new Date();
   const todayStart = startOfToday(now);
   const monthStart = billingMonthStart(now);
@@ -121,7 +121,7 @@ dashboardRoutes.get("/stats", async (c) => {
     forwardsVisible ? db.tunnel.count({ where: { workspace_id: workspace.id } }) : 0,
     nodesVisible ? db.node.findMany({
       where: { node_group: { workspace_id: workspace.id } },
-      // V4-WP8：节点计数也要用 Connection 层的事实。改造前这里只数
+      //：节点计数也要用 Connection 层的事实。改造前这里只数
       // `status === "active"`（legacy 列），所以「从未安装过 Agent 的节点」
       // 与「已装但掉线的节点」都会被算成在线 —— Dashboard 的节点卡片因此
       // 与节点页显示的在线数不一致。这里改读同一批事实列，判定交给
@@ -170,14 +170,14 @@ dashboardRoutes.get("/stats", async (c) => {
     commission_balance: workspace.kind === "personal" ? user.commission_balance : 0,
     tunnel_count: tunnelCount,
     max_tunnels: userPlan?.max_tunnels ?? userPlan?.plan?.max_tunnels ?? null,
-    // V5-WP20-6：已用流量改读**窗口求和**（`tunnel_traffic` 的事实），不再读
+    //：已用流量改读**窗口求和**（`tunnel_traffic` 的事实），不再读
     // `UserPlan.traffic_used` —— 后者是冻结的 legacy 展示列，没有任何写入方
     // （购买路径已改为不写它），因此它的值只会是过期基线。
     traffic_used: trafficUsed,
     // 上限也必须跟着换：否则会出现「用量按策略窗口、上限按旧列」的错配（两个数字不可比）。
     // 策略读不到时回落 legacy 列，保证仪表盘不因策略故障而缺字段。
     traffic_limit: policyView?.limits.traffic_limit ?? userPlan?.traffic ?? null,
-    // V5-WP20-5：到期/宽限的可观测投影（同一个纯函数，与 /api/me/capabilities 同源）。
+    //：到期/宽限的可观测投影（同一个纯函数，与 /api/me/capabilities 同源）。
     // `null` = 策略读取失败（与「没有到期点」区分开：后者是 `policy_expires_at: null`）。
     // `plan_expired_at` 是 legacy 列的展示值，保留以兼容现有前端；新前端应优先读 `expiry`。
     expiry: policyView ? buildUsageExpiryView(policyView) : null,
@@ -197,10 +197,10 @@ dashboardRoutes.get("/stats", async (c) => {
 /* ------------------------------------------------------------------ */
 
 /**
- * V4-WP8 §13.7 Wave 4：Dashboard 优先显示异常、离线、等待安装与快捷操作。
+ *  §13.7 Wave 4：Dashboard 优先显示异常、离线、等待安装与快捷操作。
  *
- * 判定全部在 `services/attention.ts` 里（复用 WP5 的 `deriveConnection` /
- * `nodeAdmission` 与 WP3 的 `isRetryable`）；本路由只做三件事：
+ * 判定全部在 `services/attention.ts` 里（复用  的 `deriveConnection` /
+ * `nodeAdmission` 与  的 `isRetryable`）；本路由只做三件事：
  *   · 用 `resolveWorkspaceAccess` 落到当前 workspace（不跨空间泄漏节点/转发）；
  *   · 把结果装进标准 `{ data }` 信封；
  *   · 让 DB 不可用时**不 500** —— Dashboard 是首页，一个聚合查询失败不该让
