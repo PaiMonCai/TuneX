@@ -451,6 +451,20 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     return { ok: false, errors, warnings, reasons };
   }
 
+  // V5.1b WP5-B2 boundary (contract §9.1 / §12: "明确不做——跨面板的 UDP 腿"): a datagram
+  // Forward must not declare a FEDERATED remote egress either. That leg is dispatched by
+  // the HOST panel, and its exit would have to attest an ingress living on a different
+  // panel — a fact neither side owns today. Without this refusal the declaration is
+  // accepted and the failure only shows up much later, on the host, as a missing
+  // `hop_peer` during rollout (which is exactly how the gate found the sibling bug at
+  // scheduler.ts:1823). Refusing at declaration time keeps the boundary where the person
+  // typing it can see the reason.
+  if (admittedProtocol === "udp" && normalizeFederatedEgressPeer(candidate.federated_egress_peer) !== null) {
+    errors.push("UDP 转发暂不支持联邦远端出口：跨面板 datagram 腿尚未冻结");
+    reasons.push("datagram_federated_unsupported");
+    return { ok: false, errors, warnings, reasons };
+  }
+
   if (!Number.isInteger(candidate.ingress_node_id) || candidate.ingress_node_id < 1) {
     errors.push("必须指定入口节点");
     reasons.push("missing_ingress");

@@ -1835,6 +1835,13 @@ export async function reapplyRelayTunnel(
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
     protocol: reapplyProtocol,
+    // V5.1b WP5-B2: the SAME fact the create path passes (a datagram exit attests its
+    // ingress, and the hop has no handshake to imply it). This site was missed on the
+    // first pass — Gate V5-G1B caught it as `egress_apply_rejected … hop_peer`, which is
+    // exactly what the orchestrator's fail-closed check is for. `reapplyRelayTunnel` is
+    // the SECOND delivery path for an egress leg; a fact that only one of them carries
+    // is a fact that works until the day the other one runs.
+    hopPeer: firstConnectIp(ingressPick.node.connect_ip),
   });
   if (!egressDispatch.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});

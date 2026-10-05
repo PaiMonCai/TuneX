@@ -624,6 +624,23 @@ describe("V5.1b：udp 的 DIRECT/RELAY 边界，且 tls 路径属于运行态配
     expect(v.errors.join(" ")).toContain("单跳");
   });
 
+  // B2 明确不做跨面板的 UDP 腿（契约 §9.1/§12）。这条断言守的是"在**声明时**拒绝"：
+  // 不带它，声明会被接受，失败要到 host 面板的 rollout 里才以"缺 hop_peer"的形式出现
+  // （而那正是 Gate 抓到的那个 sibling bug 的形态）。
+  test("udp + 联邦远端出口被拒，理由精确到跨面板", () => {
+    const v = validateForwardCandidate({
+      ...udpDirect,
+      mode: "relay",
+      egress_node_id: 22,
+      federated_egress_peer: "peer-panel-a",
+      target_host: null,
+      target_port: null,
+    });
+    expect(v.ok).toBe(false);
+    expect(v.reasons).toContain("datagram_federated_unsupported");
+    expect(v.errors.join(" ")).toContain("联邦");
+  });
+
   test("非 tls 携带证书路径：create / preview / patch 得到同一个原因", () => {
     const v = validateForwardCandidate({
       ...BASE_CONFIG,
