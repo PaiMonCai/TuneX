@@ -10,33 +10,6 @@
  * fail-closed when a capability is not advertised/implemented.
  */
 
- *  — Command / Revision / ACK 协议契约（transport-agnostic）
- *
- * 依据 `DEVELOPMENT.md` §7.9「 — Command / Revision / ACK Contract」
- * （Track B/C，可与 / 并行）。
- *
- * ── 本模块的边界（写死，防范围蔓延）──
- *  · 只定义**协议契约**：命令信封、ACK、revision 语义、错误码。
- *  · **不实现 orchestrator**（ 的 Egress/Ingress 编排、端口分配、补偿回滚都不在这里）。
- *  · **不绑定 transport**：不 import hono / socket.io / fetch；信封是纯数据，
- *    上层用 HTTP、WebSocket、Socket.IO 还是测试桩都随调用方。
- *  · **不要求 Panel 主动连 Agent**：§7.9 明确「控制 transport 仍由 Agent 主动出站」，
- *    本模块因此只描述「消息长什么样、按什么规则被接受/拒绝」，不描述通道谁发起。
- *  · **零运行时依赖**：本文件不 import 任何东西（连 node:crypto 都不要），
- *    保证契约测试可以在任何环境离线跑，也保证 / 引入它时不拖进 DB/Redis 客户端。
- *
- * ── 与 Prisma schema 的关系 ──
- *   允许与 （schema 契约）并行，因此这里刻意**不 import @prisma/client**：
- *  `TUNNEL_TYPES` / `LOAD_BALANCE_TYPES` 等枚举值在本文件内按现有 schema 抄录一份，
- *  并注明「 合并后复核」。schema 定稿后若要改为从 Prisma 引用，必须同步更新
- *  `__tests__/control-protocol.test.ts` 的对应断言。
- *
- * ── 版本纪律 ──
- *  信封字段一经冻结**只增不禁**：新增字段必须可选且旧实现可安全忽略。但校验侧对
- *  **未知顶层字段一律拒绝**（见 validator.ts）—— 宁可让拼写错误立刻炸掉，也不要
- *  静默吞掉一个本该生效的字段。回调方向（agent → panel）同样严格。
- */
-
 /* ================================================================== */
 /* 命令动作                                                             */
 /* ================================================================== */
