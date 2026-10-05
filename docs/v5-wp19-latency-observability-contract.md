@@ -379,6 +379,41 @@
 - **Gate**：G19.1 的"面板接口可见"现在落在 `GET /api/admin/node/:id/health` 的
   `telemetry.runtime.diags`；G19.2（未知 diag 键不毁上报）由行为断言直接钉住。
 
+### 5.2 WP19-B 交付记录（2026-10-05，④）
+
+- **落地范围**（Lead 裁决 O1+O4：独立档案表、只 INSERT、原始 24h + 小时桶 30d）：
+  - schema（**纯 additve**）：`TargetLatencySample`（`@@map("target_latency_sample")`，
+    BigInt 主键 + `observed_at` / `(node_id, target_key, observed_at)` 两条索引）与
+    `TargetLatencyHourly`（`@@map("target_latency_hourly")`，唯一键
+    `(node_id, target_key, hour_start, observation_source)` + `hour_start` 索引）；
+    迁移 `20261032000000_v5_wp19_latency_history`（两张表 + 两个外键，零既有列改动、
+    零回填；索引/约束名与 Prisma canonical 名逐字一致，避免 `migrate diff` 漂移）；
+  - `backend/src/services/latency-history.ts`：保留期解析（脏值回落默认，**绝不**"一条不删"
+    或"全删"）、UTC 整点口径、聚合 merge（`success + failure == sample_count` 不变量，
+    两次聚合间不自洽则整条跳过而不是 clamp）、rollup（只处理已结束且过了 1h grace 的小时，
+    `create` + 唯一冲突跳过 ⇒ 桶表只追加）、prune（按索引边界删）、读路径
+    （`sample` / `hour` 两种粒度，`sample` 窗口超出原始保留期时**显式拒绝**而不是返回空序列）；
+  - `node-state.ts`：同一份观测在 `syncTargetObservations` 之后**追加**进档案
+    （身份仍用同一个 `targetKeyOf`；写失败 fail-soft，不拖垮上报）；
+  - `worker.ts`：新 cron `cron_latency_history`（每小时 :15，**先聚合后清理**——顺序反了会在
+    "原始行已删、桶还没建"的窗口里永久丢一段历史）。
+- **保留期配置**：`LATENCY_RAW_RETENTION_HOURS`（默认 24）/`LATENCY_BUCKET_RETENTION_DAYS`
+  （默认 30），走既有 `system_config` 的**字符串键**读取（`services/config.ts:getConfig`
+  本来就接受任意键名）。**刻意不新增 `SystemConfigName` 枚举成员**：那是 MySQL enum 列，
+  加值要 `ALTER TABLE ... MODIFY COLUMN`，在共享 schema 上与并行 WP 冲突；将来要进管理端
+  下拉再补（纯 additive）。
+- **明确不做 / 待补**：Web 图表与前端类型（`web/` 范围外，**待补**）；跨租户聚合（§8 第 11 条）；
+  分钟桶（裁决只给了原始 + 小时两档）；档案**永不**作为健康判定输入（D3/D4，没有任何判定
+  路径 import 本模块的读函数）。
+- **证据**：`bun test src/services/__tests__/v5-wp19/` → **45 pass / 0 fail / 179 断言**
+  （其中 WP19-B 22 条：保留期回落、UTC 边界、聚合不变量、G19.8 的"超期消失/未超期完好/
+  桶先建后删"、先聚合后清理的调用顺序、读路径"空 ≠ 被清理掉了"）。G19.8 的**端到端**条目
+  仍需真拓扑（写入真实上报 + 触发 cron），本次只覆盖到纯函数与流水线替身层。
+- **失败语义**：写路径 fail-soft（附着在节点上报上，不能因为档案失败把上报打成 500）；
+  维护作业**不吞错**（表缺失/DB 故障由 worker 的 failed 事件显式暴露 + BullMQ 重试），
+  因为静默失败会让"档案在跑"这个假设长期不成立，而原始样本 24h 后就不可恢复。
+
+
 
 推荐顺序：**F → C → D → B → E**（F 是既有缺陷收口、成本最低；C 不需开放决策；
 B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每个自带 Gate，不改 desired 语义。
@@ -458,3 +493,4 @@ B/D/E 各被一个开放决策卡住）。纪律：一次只做一个 WP，每�
 | 2026-10-05 | 初版：六问回答（D1–D12 + O1–O9）、WP19-F 收口建议、Gate G19.1–G19.15 | V5-WP19-C0（草案，待评审） |
 | 2026-10-05 | Lead 裁决（§4.0）：O1+O4 冻结为"独立档案表、只 INSERT、24h 原始 + 30d 小时桶、永不作为判定输入"，并正式关闭既有开放项"是否保留观测历史"；O2 冻结为"新 action + 白名单 + 默认关闭 + 独立 Gate + 先过安全评审"，排在 WP19-F 之后；O3 冻结为"v1 不产生 udp 延迟事实，且不改 §7 合成语义"；WP19-F 采纳，排在 ① 之后执行。O5–O9 仍开放 | 开发 Lead（核实：Agent 上报 `diag` 但面板零消费点，缺陷成立） |
 | 2026-10-05 | **§1.4.1 实测更正**：`diag` 在落库路径上**一直有值**（`validateStateReport` 透传未知字段、`node_state_report.tunnels` 整块落库；`datagramHopPeerFor` 依赖它，① 的出口取证纠正在真拓扑生效）。真正的丢点是**面板类型化读路径**（`parseReportedRuntimes` 重建 runtime 时丢 diag、无 typed 读路径、Web 类型缺）。Lead 裁决 WP19-F 取 **A（上报侧一等化）**、**不做 B（ACK 侧）**。§5.1 记录交付 | ④ WP19-F（实测与更正由 Lead 确认） |
+| 2026-10-05 | **WP19-B 落地**（O1+O4 裁决的执行）：两张只追加档案表 + 迁移 `20261032000000_v5_wp19_latency_history` + `services/latency-history.ts`（保留期/UTC 分桶/rollup/prune/读路径）+ 上报侧追加 + `cron_latency_history`（先聚合后清理）。保留期走 `system_config` 字符串键，刻意不动 `SystemConfigName` 枚举。§5.2 记录交付与边界；Web 图表待补 | ④ WP19-B |

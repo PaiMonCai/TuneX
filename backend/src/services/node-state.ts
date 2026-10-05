@@ -46,6 +46,11 @@ import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
 import { normalizeCapabilities } from "./agent-capability.ts";
 import { normalizeCapabilityManifest, type CapabilityManifest } from "./capability-manifest.ts";
 import { isPlainObject, type TunnelProtocolDiag } from "./tunnel-diag.ts";
+import {
+  appendLatencySamples,
+  defaultLatencyHistoryDeps,
+  type LatencySampleRow,
+} from "./latency-history.ts";
 
 /* ================================================================== */
 /* 形状（与 agent/internal/api 的 NodeState 字段对齐）                  */
@@ -826,6 +831,59 @@ export async function syncTargetObservations(
   await db.targetObservation.deleteMany({ where: { node_id: nodeId, target_key: { notIn: seen } } });
 }
 
+/* ================================================================== */
+/* V5-WP19-B —— 观测历史档案（只追加；与上面的投影并列，互不写入）        */
+/* ================================================================== */
+
+/**
+ * 一次上报的观测 → 档案样本行（**纯函数**，不碰 DB）。
+ *
+ * 身份用同一个 {@link targetKeyOf}：档案与投影必须指向同一个目标 —— 在这里自己拼一份
+ * `host:port` 就等于有了第二份归一化，两边一旦漂移，历史会挂到一个投影里不存在的目标上。
+ *
+ * `latency_ms` 再钉一次「不可达 = NULL」：投影层已经归一化过，但档案是**只追加**的，
+ * 写错一行没有 upsert 可以修正 —— 宁可在两个入口各钉一次（同一件事不允许有两个答案）。
+ */
+export function latencySampleRows(observations: readonly ReportedTargetObservation[]): LatencySampleRow[] {
+  const rows: LatencySampleRow[] = [];
+  for (const o of observations) {
+    const key = targetKeyOf(o.host, o.port);
+    if (!key) continue;
+    rows.push({
+      target_key: key,
+      host: o.host,
+      port: o.port,
+      reachable: o.reachable,
+      latency_ms: o.reachable ? o.latency_ms : null,
+      success_rate: o.success_rate,
+      observed_at: new Date(o.last_observed_at * 1000),
+      observation_source: o.observation_source,
+    });
+  }
+  return rows;
+}
+
+/**
+ * 把这次上报的观测追加进历史档案（V5-WP19-B，契约 §4.0 裁决 O1+O4）。
+ *
+ * **失败必须 fail-soft**：档案是**附加事实**（D4：永不作为判定输入），而这一拍上报还背着
+ * 隧道/端口/健康/租约续期。让一次档案写失败把上报打成 500，等于节点因为一个"观众"掉线 ——
+ * 与 `renewOwnedLeases` 同一取向（次要功能不得拖垮主要功能）。原始样本的 24h 窗口由
+ * 后续节拍继续填，丢掉一拍不改变任何判定。
+ */
+export async function archiveObservationSamples(
+  nodeId: number,
+  observations: readonly ReportedTargetObservation[],
+): Promise<void> {
+  try {
+    const rows = latencySampleRows(observations);
+    if (rows.length === 0) return;
+    await appendLatencySamples(defaultLatencyHistoryDeps(), nodeId, rows);
+  } catch {
+    /* 档案写不进去不影响上报结论（见函数头）。 */
+  }
+}
+
 /**
  * unix 秒 → Date，`undefined`/`0` → null。
  *
@@ -944,6 +1002,10 @@ export async function submitStateReport(
   //     整张观测表，把"没有证据"伪造成"刚刚观测过且什么都没有"。
   if (report.target_observations !== undefined) {
     await syncTargetObservations(auth.node_id, report.target_observations, reportedAt);
+    // V5-WP19-B：同一份观测再追加进**档案**（只 INSERT）。与投影并列、互不写入：
+    // 投影回答"现在怎么样"（会被下面的 deleteMany 收窄），档案回答"过去怎么样"
+    // （24h 原始样本 + 30d 小时桶，见 services/latency-history.ts）。fail-soft。
+    await archiveObservationSamples(auth.node_id, report.target_observations);
   }
 
   // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（WP1 列，WP7 首次写入）。
