@@ -1,20 +1,18 @@
 /**
- * Automatic Forward placement evaluation on the existing reconcile cadence.
+ * Periodic Forward failover/failback orchestration.
  *
- * The loop selects Forwards with placement state, supplies policy/candidate facts
- * that are not owned by the executor, invokes the existing failover executor and
- * preserves its structured result. Missing policy, destination or required port
- * facts fail closed. The loop does not create a second timer, roll placement
- * epochs backward or invent a separate compensation path.
+ * Reads policy and candidate facts, delegates decisions/execution to the shared
+ * placement path, and integrates DDNS readiness/successor handling into the same
+ * reconciliation cadence. Automatic migration is disabled unless explicitly
+ * enabled by operator policy.
  */
 
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { systemConfig } from "./config.ts";
 import { candidateRejection, type CandidateFacts } from "./ingress-candidate.ts";
-// V5-WP17.4：闸门与后继。**静态** import 是安全的：这两个模块都不在 import 期读 env
-//（`ddns-successor` 里的 `db` 是延迟 import），所以本模块仍然可以在没有 DATABASE_URL 的
-// 进程里被 import 与断言。
+// DDNS readiness and successor modules are safe static dependencies: they do
+// not read environment or database state at import time.
 import { defaultDnsGate, defaultDdnsSuccessor } from "./ddns-successor.ts";
 import {
   executeFailoverForTunnel,
