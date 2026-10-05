@@ -13,7 +13,7 @@
  *      rotate 报 404（fail-closed，不静默生成）。
  *   8. 状态上报：载荷校验 fail-closed + upsert 每节点一行 + 重连快照只回自己那份。
  */
-import { test, expect, describe, beforeEach, mock } from "bun:test";
+import { test, expect, describe, beforeEach, afterAll, mock } from "bun:test";
 import { createHash } from "node:crypto";
 
 /* ------------------------------------------------------------------ */
@@ -930,4 +930,18 @@ describe("NAT Agent 只靠出站连接工作", () => {
       }
     }
   });
+});
+
+/*
+ * 收尾时**恢复模块注册表**。
+ *
+ * `mock.module` 是**进程级**替换，而本文件的 db 替身只覆盖了节点相关的模型。同进程后续
+ * 加载的文件若走到别的默认依赖（例如联邦撤销级联 → portPool → 默认 db 的 `nodePortLease`），
+ * 拿到的就是这个替身，于是 `pdb.nodePortLease.findUnique` 抛 TypeError。
+ *
+ * CI 上真实发生过一次：表现是"一个与联邦毫无关系的测试红"，而本地全绿 —— 这种"只在 CI 红"
+ * 的失败最贵。恢复注册表后，本文件的影响范围就被限制在自身。
+ */
+afterAll(() => {
+  mock.restore();
 });

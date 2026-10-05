@@ -1052,7 +1052,11 @@ async function cascadeRevokeLeases(
           },
         });
       } else {
-        const rel = await d.releasePort({ node_id: lease.node_id, port: lease.listen_port });
+        // 钩子**抛**也必须被接住：它是在级联中途调用的，一次抛异常会让"撤销做了一半且没有记录"。
+        // 任何异常都退化成"停服成功、端口待还"这个已有状态（扫尾只补还端口，不再拆 runtime）。
+        const rel = await Promise.resolve()
+          .then(() => d.releasePort!({ node_id: lease.node_id!, port: lease.listen_port! }))
+          .catch((e: unknown) => ({ ok: false as const, message: e instanceof Error ? e.message : String(e) }));
         if (rel.ok) portsReleased++;
         else {
           portsPending++;

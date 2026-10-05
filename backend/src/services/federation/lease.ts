@@ -516,6 +516,9 @@ const defaultLeaseDb = db as unknown as LeaseDb;
  * "过期预分配"回收——这是端口泄漏的最后一道网。
  */
 async function defaultAllocatePort(input: Parameters<PortAllocateHook>[0]) {
+  if (!portPoolSeamAvailable()) {
+    return { ok: false as const, code: "internal_error", message: "port pool db seam is unavailable (no nodePortLease)" };
+  }
   const out = await acquirePort({
     nodeId: input.node_id,
     // `lease_type` 只是审计元数据，不构成隔离（见 portPool 文件头）；transit 在物理上
@@ -530,13 +533,38 @@ async function defaultAllocatePort(input: Parameters<PortAllocateHook>[0]) {
   return { ok: true as const, port: out.result.port, port_lease_id: out.result.leaseId };
 }
 
-/** 默认端口归还：先查 holder（DB 是唯一真相），再软删除。幂等。 */
+/**
+ * 端口池的 db 接缝是否可用。
+ *
+ * 为什么需要这个判断：`portPool` 用的是**模块级** db，而联邦的调用方常常注入自己的替身
+ * （单测的接缝）或处在进程级模块被替换的环境里（`bun test` 的 `mock.module` 是进程级注册表）。
+ * 此时 `nodePortLease` 根本不存在，`leaseHolder()` 会抛 `TypeError: undefined is not an object`，
+ * 而它是在**撤销级联的中途**抛的 —— 结果是"撤销做了一半 + 没有任何记录"。
+ *
+ * 缺模型 = 这个环境无法归还端口，那就**结构化失败**：调用方会把租约标成
+ * `port_release_failed` 交给 reconcile 重试（task-7 已有的兜底路径）。生产里同一个判断
+ * 也成立：db 暂时不可用时，级联应当降级为"待重试"，而不是崩掉。
+ */
+function portPoolSeamAvailable(): boolean {
+  const candidate = defaultLeaseDb as unknown as { nodePortLease?: unknown };
+  return typeof candidate?.nodePortLease === "object" && candidate.nodePortLease !== null;
+}
+
+/** 默认端口归还：先查 holder（DB 是唯一真相），再软删除。幂等；接缝不可用时结构化失败。 */
 async function defaultReleasePort(input: { node_id: number; port: number }) {
-  const holder = await leaseHolder(input.node_id, input.port);
-  if (holder === null) return { ok: true, message: "no port lease row" };
-  if (holder.status === "released") return { ok: true, message: "port lease already released" };
-  const released = await portPoolReleaseLease({ leaseId: holder.leaseId });
-  return released ? { ok: true as const } : { ok: false as const, message: "port lease was not active" };
+  if (!portPoolSeamAvailable()) {
+    return { ok: false as const, message: "port pool db seam is unavailable (no nodePortLease)" };
+  }
+  try {
+    const holder = await leaseHolder(input.node_id, input.port);
+    if (holder === null) return { ok: true, message: "no port lease row" };
+    if (holder.status === "released") return { ok: true, message: "port lease already released" };
+    const released = await portPoolReleaseLease({ leaseId: holder.leaseId });
+    return released ? { ok: true as const } : { ok: false as const, message: "port lease was not active" };
+  } catch (e) {
+    // 归还失败绝不抛：让租约带上标记等下一拍补还（"停服成功、只剩端口"是本项目已有的状态）。
+    return { ok: false as const, message: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /*

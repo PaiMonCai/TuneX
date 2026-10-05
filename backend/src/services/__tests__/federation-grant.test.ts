@@ -664,6 +664,38 @@ describe("WP15 grant: revoke is irreversible, cascades teardown, and never lies 
     expect(leases[0].state).toBe("revoked");
   });
 
+  test("a port-release hook that THROWS must not abort the cascade (regression: CI 上真实发生过)", async () => {
+    // 背景：`bun test` 的 `mock.module` 是**进程级**注册表，同进程别的套件把 `db.ts` 换成替身之后，
+    // portPool 的默认 db 会缺 `nodePortLease`，于是默认还端口钩子抛
+    // `TypeError: undefined is not an object`。它是在**撤销级联中途**抛的 ——
+    // 若直接冒泡，结果是"撤销做了一半、没有任何记录"，而且表现为一个与联邦无关的测试红。
+    // 这里钉住的是契约：**钩子抛 ≠ 级联失败**，必须退化成"停服成功、端口待还"这个已有状态。
+    const { db, leases } = makeGrantDb({
+      peer: { id: 9, peer_panel_id: "panel-a", status: "trusted" },
+      grants: [grantRow()],
+      leases: [leaseRow({ id: 11, state: "active", node_id: 5, listen_port: 19001 })],
+    });
+    const outcome = await revokeGrant(
+      { grantRef: "grant-1", now: NOW },
+      {
+        db,
+        audit: silentAudit,
+        teardown: () => ({ ok: true }),
+        releasePort: () => {
+          throw new TypeError("undefined is not an object (evaluating 'pdb.nodePortLease.findUnique')");
+        },
+      },
+    );
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.leases_revoked).toBe(1);
+    expect(outcome.ports_released).toBe(0);
+    expect(outcome.ports_pending).toBe(1);
+    expect(leases[0].state).toBe("revoked");
+    expect(leases[0].last_error_code).toBe("port_release_failed");
+    expect(String(leases[0].last_error)).toContain("nodePortLease");
+  });
+
   test("unknown grant is a 404-class code, and a lost CAS is reported instead of silently winning", async () => {
     const none = makeGrantDb({ peer: { id: 9, peer_panel_id: "panel-a", status: "trusted" } });
     const missing = await revokeGrant({ grantRef: "nope", now: NOW }, { db: none.db, audit: silentAudit });
