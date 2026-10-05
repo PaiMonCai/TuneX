@@ -1,51 +1,10 @@
 /**
- * WP10 — Admin Node / Egress API（管理端：节点角色 / 凭据状态 / 出口池 / 运行态）
+ * Admin Node / Egress control surface.
  *
- * 依据 `DEVELOPMENT.md` §7.13「WP10 / WP11 — API Track」。
- * 挂载（app.ts）：`app.route("/api/admin", nodeAdminRoutes);`
- * 中间件由 app.ts 统一施加（adminRequired → adminPermissionGuard），
- * 因此本模块不重复挂认证/权限。
- *
- * ── RBAC 归属（不新增资源键，复用既有 `nodes`）──
- * 全部路径都以 `/node` 开头，落在 `permissions.ts` 的 `nodes` 资源
- * （`apiPrefixes: ["/admin/node", "/admin/nodes"]`）下：GET 需 read、
- * 写需 write。WP10 是节点/出口能力的控制面，不是独立业务域——新增资源键
- * 会让角色编辑器里多出一个无法单独授权的重复入口，也会让同一个「改节点」
- * 动作散落在两个权限上。
- * 凭据签发/轮换/撤销仍在 WP7 的 routes/admin.ts（本文件只做 list/get）。
- *
- * ── 没有「下发」逻辑（§7.13 对 WP11 立的规矩对 WP10 同样生效）──
- * 这里只改 DB 里的 desired state（角色 / 池 / 目标）。revision 自增、
- * Agent 通知、补偿回滚都归 WP8 编排器。任何「下发」路径都不经本文件。
- *
- * ── 凭据纪律（与 WP7 完全对齐）──
- * 明文唯一出口是 WP7 的 issue/rotate 响应；本文件只在 credential list/get
- * 里回状态投影（布尔 + 时间戳），**既不明文也不哈希**。
- * 所有非 GET 请求都会被 middlewares/audit.ts 自动落审计，凭据相关字段
- * 由 services/audit.ts 的 SENSITIVE_RE 丢 metadata，本文件不写日志。
- *
- * ── 限流 ──
- * 敏感写操作（凭据轮换）沿用 WP7 的 `node-credential-rotation` 规则
- * （middlewares/rate-limit.ts，POST /api/admin/node/:id/credential*，
- * 60s/5 次，user 维度）；本文件其余端点走 `api-global` 600/min。
- *
- * 端点总览（全部落在 `nodes` 资源的 `/admin/node` 前缀下，见上方 RBAC 说明）：
- *   PATCH  /api/admin/node/:id/role              节点角色（+端口区间/默认策略）
- *   GET    /api/admin/node/:id/detail            节点详情（含池与目标，凭据脱敏）
- *   GET    /api/admin/node/:id/credential        单节点凭据状态
- *   GET    /api/admin/node/credentials           全量凭据状态（?role/?online/?stale）
- *   GET    /api/admin/node/:id/pools             某节点的池（含目标）
- *   POST   /api/admin/node/:id/pools             建池
- *   GET    /api/admin/node/pools                 全量池（?node_id/?targets）
- *   PATCH  /api/admin/node/pools/:poolId          改池
- *   DELETE /api/admin/node/pools/:poolId          删池
- *   GET    /api/admin/node/pools/:poolId/targets  池内目标
- *   POST   /api/admin/node/pools/:poolId/targets  加目标
- *   PUT    /api/admin/node/pools/:poolId/targets  整批替换目标集
- *   PATCH  /api/admin/node/targets/:targetId      改单条目标
- *   DELETE /api/admin/node/targets/:targetId      删目标
- *   GET    /api/admin/node/:id/state             单节点运行态
- *   GET    /api/admin/node/states                全量运行态（?role/?online/?stale）
+ * Application-level admin authentication and the `nodes` resource permission
+ * guard protect these routes. This module manages desired node roles, egress
+ * pools/targets and read-only credential/runtime projections; credential secrets
+ * are never returned here and runtime dispatch remains owned by the orchestrator.
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -81,9 +40,7 @@ type Ctx = Context<{ Variables: AppVariables }>;
 function adminError(c: Ctx, e: NodeAdminError) {
   const status = ADMIN_ERROR_STATUS[e.code] ?? 500;
   const body: Record<string, unknown> = { error: e.message, message: e.message, code: e.code };
-  // §13.5「权限拒绝、能力拒绝、额度拒绝、运行条件拒绝必须使用可区分的错误码，
-  // Web 才能给用户正确下一步」：条件拒绝（角色/端口区间收缩被依赖阻止）带上
-  // condition + 依赖清单，形状与 GET /node/:id/impact 的 role_check 一致。
+  // Preserve condition/dependency details so the Web can distinguish runtime-condition refusals.
   if (e.condition !== undefined) body.condition = e.condition;
   if (e.dependencies !== undefined) body.dependencies = e.dependencies;
   return c.json(body, status);
@@ -150,7 +107,7 @@ nodeAdminRoutes.get("/node/:id/detail", async (c) => {
 });
 
 /* ------------------------------------------------------------------ *
- * credential list / get（WP7 的 rotate/revoke 之外补的读端点）
+ * credential list / get（ 的 rotate/revoke 之外补的读端点）
  * ------------------------------------------------------------------ */
 
 /** GET /api/admin/node/:id/credential —— 单节点凭据状态（不明文、不哈希）。 */
@@ -273,7 +230,7 @@ nodeAdminRoutes.get("/node/pools/:poolId/targets", async (c) => {
 });
 
 /**
- * GET /api/admin/node/pools/:poolId/health —— V5.2 WP5/WP6 的目标健康视图。
+ * GET /api/admin/node/pools/:poolId/health —— / 的目标健康视图。
  *
  * 与 `.../targets` 分开而不是塞进同一个响应：那是**期望**（用户要什么），
  * 这是**观测 + 合成**（我们看到了什么、据此判断什么）。混在一个响应里，
