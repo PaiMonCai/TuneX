@@ -1,11 +1,10 @@
 /**
  * Persistent identity for this Panel's federation endpoint.
  *
- * The Panel id is stable for the installation. Private signing keys are stored
- * only in sealed form and never exposed through API/audit/diagnostic surfaces.
- * Failure to decrypt an existing key is fatal for federation identity and must
- * never silently regenerate a new identity. Ensuring an identity exists does not
- * itself enable federation.
+ * The Panel id is installation-stable. Signing keys are stored only in sealed
+ * form; failure to decrypt an existing key is fatal and must never regenerate a
+ * different identity silently. Creating identity material does not enable
+ * federation.
  */
 import { importJWK, type JWK } from "jose";
 import { db } from "../../db.ts";
