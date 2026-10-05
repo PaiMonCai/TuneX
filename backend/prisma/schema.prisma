@@ -313,6 +313,9 @@ model CapabilityPolicy {
   updated_at DateTime @updatedAt
 
   assignments WorkspacePolicyAssignment[]
+  /// V5-WP20-4：把本策略作为商品出售的套餐（`Plan.policy_id` 的反向关系）。
+  /// 与 `assignments` 分开：发放是「谁在用」，这里是「哪个商品对应它」。
+  plans       Plan[]
 
   @@index([source, status])
   @@map("capability_policy")
@@ -1210,6 +1213,18 @@ model Plan {
   renewable                   Boolean      @default(true)
   stock                       Int?
   order_by                    Float        @default(1000)
+  /// V5-WP20-4（契约 §3.5.3）：套餐 → 能力策略的**显式**绑定，购买时据此发 `purchase` 发放。
+  ///
+  /// 为什么必须显式、不能推导：`composeEffectivePolicy` 只认「哪一条发放存在」（F1/F5），
+  /// 从 `Plan.max_tunnels`/`traffic` 反推一条策略会造出第二份额度真相（§3.5.3 明确不做③）。
+  ///
+  /// **NULL 的语义**（不是错误）：该套餐没有绑定策略。历史套餐与尚未配置的套餐都是 NULL，
+  /// 此时购买路径**不发放** `purchase` 发放，也不因此拒绝购买 —— 扣款、订单、订阅照常，
+  /// 用户的准入继续由既有的 `system_default` 发放决定（= 今天的行为，逐字节不变）。
+  /// 反例：① 若 NULL 就拒绝购买，存量商品会当场不可售；② 若 NULL 就随便挑一条模板发放，
+  /// 就是上面禁止的隐式推导（用户会拿到一条他没买过的策略）。
+  policy_id                   Int?
+  policy                      CapabilityPolicy? @relation(fields: [policy_id], references: [id], onDelete: SetNull)
   created_at                  DateTime     @default(now())
   updated_at                  DateTime     @updatedAt
 

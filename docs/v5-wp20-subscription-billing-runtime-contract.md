@@ -1,8 +1,8 @@
 # V5-WP20 订阅计费运行时契约（周期结算 / 流量周期 / 配额预留）
 
 > **状态：PROPOSED → 部分落地（2026-10-05）**：Lead 已冻结归属 / `traffic_used` / 倍率 / O5 / O6
-> （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）已交付**
-> （§5.1 / §5.2 / §5.3）。除这三处记录外，本契约其余部分仍**不含实现**。
+> （§4.0），**WP20-1（计费时钟）、WP20-2（账本与归属 schema）、WP20-3（周期结算 tick）、
+> WP20-4（支付 → 发放接线 + 续期执行器）已交付**（§5.1–§5.4）。除这四处记录外，本契约其余部分仍**不含实现**。
 > 依据：`DEVELOPMENT.md` §1（V4 frozen baseline）、§3（工作纪律）、§4（V5 总路线）、
 > §6.2（UDP 边界「packets 计费」）、§9.4.6（套餐授权指向 capability entitlement）。
 > 先例（**只读语义，不复制代码**；AGPL-3.0）：`Forwardx(参考项目，不进入git提交）/` 的
@@ -321,7 +321,7 @@ worker 新增一个 tick。
 | **WP20-1** | 计费时钟纯函数 | ✅ **已交付**（2026-10-05，见 §5.1）：`backend/src/services/billing-time.ts` + `backend/src/services/__tests__/v5-wp20/billing-time.test.ts`（三进程时区逐字相等） | WP20-0 |
 | **WP20-2** | 账本与归属 schema | ✅ **已交付**（2026-10-05，见 §5.2）：migration `20261031000000_v5_wp20_subscription_ledger`（`PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`(nullable)）+ `UserPlan` 冻结注释 | WP20-1 |
 | **WP20-3** | 周期结算 tick（幂等占位 + 接管续跑） | ✅ **已交付**（2026-10-05，见 §5.3）：`backend/src/services/subscription-billing.ts`（纯判定 + 注入依赖）+ `worker.ts` 新增 `cron_settle_billing`（每小时 `45 * * * *`） | WP20-2 |
-| **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | `policy-service.ts#grantPolicyFromPurchase` + `routes/plans.ts` 事务内调用 + `invalidatePolicyCache` | WP20-2 |
+| **WP20-4** | 支付 → 策略发放接线（`purchase` 唯一写入点） | ✅ **已交付**（2026-10-05，见 §5.4）：`policy-service.ts#grantPolicyFromPurchase` + `subscription-purchase.ts`（购买/续期共用实现）+ `routes/plans.ts` 事务内调用 + `invalidatePolicyCache`；并把续期执行器 `renewSubscriptionPeriod` 接上 | WP20-2 |
 | **WP20-5** | 到期降级与可观测 | 复用 `describeDeny` 文案 + 用量报告补充到期/宽限字段（**不新增状态机**） | WP20-4 |
 | **WP20-6** | 流量口径统一 | F13 两函数收敛到 `billing-time.ts`；`traffic_used_unattributed_federated`；`traffic_used` 读取路径切换 | WP20-1（可与 20-3 并行） |
 | **WP20-7** | （条件）流量倍率 | 仅当 O3 选 B 时立项，需独立契约补充 + Gate 断言 | O3 拍板 |
@@ -558,9 +558,91 @@ DATABASE_URL=... bunx prisma migrate diff --from-schema-datamodel <改动前> --
 
 ---
 
+### 5.4 WP20-4 落地记录（2026-10-05，分支 `feature/v5-1b-udp-relay`）
+
+**交付物**
+
+| 文件 | 说明 |
+|---|---|
+| `backend/src/services/policy-service.ts` | **增量**：新增 `grantPolicyFromPurchase(tx, input)`（`purchase` 发放的**唯一**写入点，DoD 2 的第 2 处） |
+| `backend/src/services/subscription-purchase.ts` | 新增：`nextSubscriptionTerm`（纯函数）+ `applyPlanPurchase`（**购买与续期共用的唯一落库实现**） |
+| `backend/src/routes/plans.ts` | `POST /purchase`：事务内改调 `applyPlanPurchase`；订单带 `workspace_id`；提交后 `invalidatePolicyCache` |
+| `backend/src/services/subscription-billing.ts` | 续期执行器 `renewSubscriptionPeriod`（`auto_renew=true` 的生产实现）；`auto_renew=false` 仍是「只记账」 |
+| `backend/prisma/schema.prisma` | 增量：`Plan.policy_id`（可空）+ `CapabilityPolicy.plans` 反向关系 |
+| `backend/prisma/migrations/20261036000000_v5_wp20_plan_policy_binding/` | 一条 `ADD COLUMN` + 一个外键（DDL 与 `prisma migrate diff` 逐字一致） |
+| `backend/src/services/__tests__/v5-wp20/subscription-purchase.test.ts` / `subscription-renewal.test.ts` | 30 条断言（含 db 替身的钱路径） |
+
+**冻结的语义与理由（都带反例）**
+
+1. **`Plan.policy_id` 显式绑定，NULL = 不发放、也不拒绝购买**。反例：① NULL 就拒绝购买 → 存量商品
+   当场不可售；② NULL 就挑一条模板发放 → 正是 §3.5.3 禁止的隐式推导（用户拿到没买过的策略）。
+   NULL 时购买照常（扣款/订单/订阅），准入继续由既有 `system_default` 发放决定 = 今天的行为不变。
+   治理副作用见「未决」：目前**没有管理入口**能写这一列。
+2. **`grantPolicyFromPurchase` 的 `effective_at` 只前移不后移**：续期取 `min(原 effective_at, now)`。
+   反例：若设成 `max(now, 旧到期)`，**提前续费**的用户会在付款瞬间从「已生效」变成「尚未生效」——
+   付了钱却当场失去准入。
+3. **换套餐 = 撤销旧套餐的 `purchase` 发放**（只撤 `purchase` 来源）。
+   反例：不撤 → 两份套餐的发放按并集同时生效（F1 的并集语义），用户白拿两份权益。
+   同套餐续期 = 延长 `expires_at`，`started_at` 保留（F10 的既有语义）。
+4. **`UserPlan` 仍是 legacy 投影，但 `traffic_used` 从此一个字节都不写**：历史实现里「换套餐置 0」
+   被**删除**（§3.3.2 / §4.0 冻结：它是派生/只读的，回写会产生第二份用量真相）。
+   代价明确接受：dashboard 的已用流量在 WP20-6 切换读路径前会显示旧基线（不是新错误，是旧数字）。
+   额度快照两列（`traffic`/`max_tunnels`）在**购买**时写、在**续期**时省略（同套餐额度不变）。
+   这条省略也是 DoD 1 成立的前提：`subscription-billing.ts` 里因此**一个额度字段名都不出现**。
+5. **续期执行器的幂等锚点 = 账本行上的 `order_id`**（`SELECT ... FOR UPDATE` → 已有 `order_id` 即短路）。
+   反例（为什么光有唯一键占位不够）：接管机制**允许**同一周期被执行两次，只有占位键而无订单锚点时，
+   接管那一次会**重复扣款**。WP20-3 里写的「执行器必须幂等可重放」在这一 WP 落地为可断言的形状：
+   `order_id` 已存在 ⇒ 不扣款、不建单、只复用（有断言）。
+6. **该做不了的事一律 `deferred`（留 `pending`）**：余额不足、团队 workspace 无钱包主体
+   （`personal_user_id` 为 NULL，余额在 `User` 上、没有可扣主体）、商品下架/不可续费。
+   反例：记 `failed` → `failed` 不参与接管，自动续费永远不再发生；假装 `settled` → 谎报钱已动。
+   终身订阅（`expires_at = null`）与「用户在结算这一刻关掉 `auto_renew`」则按**只记账**收口，不扣款。
+7. **`PlanOrder.workspace_id` 新行必填（应用层）**，历史行 NULL 不猜（R5）。续期产生的订单同样带上它。
+
+**守卫的演化（不是放松，是更精确）**
+
+- DoD 1：现在 `grep -rn "checkTunnelCreation\|max_tunnels" backend/src/services/payment backend/src/services/subscription-billing.ts`
+  **字面为空** —— 连注释里都不许出现那些字段名（注释里出现它，就是下一个人伸手去用的地方）。
+- DoD 2：`workspacePolicyAssignment.create|upsert` 全仓**恰好 2 处**，且断言它们分别落在
+  `assignDefaultPolicy` 与 `grantPolicyFromPurchase` 两个函数里（按函数名断言，不按行号 —— 行号会腐烂）。
+- WP20-3 那条「计费侧不写 `PlanOrder`/`BalanceLog`」的守卫升级为：**引擎本体（占位/接管/终态）一行都不碰钱**，
+  订单与流水只允许出现在 `renewSubscriptionPeriod` 里，且必须与扣款/订阅/发放/锚点同在一个 `$transaction`。
+
+**未决 / 交棒**
+
+- **没有管理入口写 `Plan.policy_id`**（`routes/admin.ts` 的套餐 CRUD 不在本 WP 范围）⇒ 现存套餐全是 NULL，
+  购买路径的发放分支目前**不会触发**（行为等同今天）。要真正启用，需要一次「套餐 ↔ 策略」绑定入口（独立小 WP）。
+- **全树 `tsc` 有一处不属于本 WP 的红**：`prisma/seed.ts` 的 `DEFAULT_CONFIG` 缺
+  `LATENCY_RAW_RETENTION_HOURS` / `LATENCY_BUCKET_RETENTION_DAYS`（WP19 的枚举值已在 `7895b40` 落地但没补 seed 键；
+  它们的默认值在自己的 `services/latency-history.ts` 里是 24 / 30）。**不是我的文件，我没有代改**（猜产品默认值不对）。
+- WP20-5（到期降级可观测）、WP20-6（流量口径统一）未做；`DEVELOPMENT.md` §4 登记（DoD 11）不在本 WP 范围。
+
+**证据**
+
+```
+bun test src/services/__tests__/v5-wp20/          → 104 pass / 0 fail / 387 expect()
+  · 其中 subscription-renewal.test.ts（11 条，db 模块级替身）：幂等锚点短路 / 单事务钱路径 /
+    余额不足·无钱包·不可续费 ⇒ deferred 且一分钱不动 / 终身与关闭续费 ⇒ 只记账
+grep -rn "checkTunnelCreation\|max_tunnels" src/services/payment src/services/subscription-billing.ts → 0 命中（DoD 1）
+grep -rn "workspacePolicyAssignment.create\|workspacePolicyAssignment.upsert" src/ → 恰好 2 处（DoD 2）
+bunx tsc --noEmit（backend/）                        → 唯一错误是上面那条 seed.ts（非本 WP 文件）
+prisma validate / migrate diff                       → valid / 迁移语句与生成的 DDL 逐字一致
+```
+
+**DoD 覆盖矩阵（针对 WP20-4）**：第 1 条 ✅；第 2 条 ✅（含函数级断言）；第 4/5 条 ✅（WP20-3 + 续期幂等锚点）；
+第 9 条 ✅；第 6 条 ⏳ 属 WP20-5；第 8 条 ⏳ 属 WP20-6；第 10/11 条 ⏳（e2e 与 `DEVELOPMENT.md` 登记不在本 WP）。
+
+---
+
 ## 7. Gate 映射（`scripts/v3-e2e/`）与时间夹具
 
 ### 7.1 新增 Gate `v5-g6.py`（Billing Runtime Gate）
+
+> **命名冲突（2026-10-05 实测，需 Lead 拍板）**：`scripts/v3-e2e/v5-g6.py` 这个文件已被
+> **WP17.5 的 DDNS 前门门禁**占用（其 docstring 第一行即「V5-G6 gate — DDNS 前门」）。
+> 因此本节的断言编号 `G6.1..G6.10` 与文件名**都不能照抄落地**。本 WP（WP20）**没有改任何门禁**
+> （不改他人文件名、不改冻结的断言编号），只记录事实：落地时应改为 `v5-g7.py` + `G7.x`，
+> 或由 Lead 指定其它编号 —— 这与 DoD 第 10 条（不改既有门禁断言）同向。
 
 | 断言 | 内容 | 依赖的真实证据 |
 |---|---|---|

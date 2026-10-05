@@ -9,10 +9,10 @@
  * ── 这一层是什么、不是什么 ──
  * 是：**「每个计费周期只结算一次」这条账本事实的编排**——占位、执行、落终态、崩溃接管。
  * 不是：不做额度判定、不读 `CapabilityPolicy`、不新增 `WorkspacePolicyAssignment` 写入点
- * （DoD 1/2：计费侧不得出现 `checkTunnelCreation`/`max_tunnels`；`purchase` 发放的唯一写入点是
- * WP20-4 的 `grantPolicyFromPurchase`）。因此「扣款 / 发放」这一步是**注入的执行器**
- * （{@link SubscriptionSettlementDeps.executePeriod}）：WP20-4 把它的生产实现换成
- * 「条件扣款（F8）+ `upsert` 发放 + `PlanOrder`/`BalanceLog`」即可，本模块一行都不用改。
+ * （DoD 1/2：本文件里**连一个额度字段名都不许出现**，哪怕是注释 —— 那个 grep 是硬门禁；
+ * `purchase` 发放的唯一写入点是 WP20-4 的 `grantPolicyFromPurchase`）。因此「扣款 / 发放」
+ * 这一步是**注入的执行器**（{@link SubscriptionSettlementDeps.executePeriod}）：
+ * WP20-4 接上它的生产实现（条件扣款 F8 + `upsert` 发放 + 订单/流水台账）。
  *
  * ── 幂等为什么是「先占位后执行」而不是「再查一遍」──
  * 固定顺序（§3.1.4，顺序本身即契约）：
@@ -508,22 +508,20 @@ export function defaultSettlementDeps(): SubscriptionSettlementDeps {
     },
 
     async executePeriod({ row, phase, now }) {
-      // ── WP20-3 的生产执行器：**只记账** ──
+      // ── 生产执行器（V5-WP20-4 接线）──
       //
-      // 契约 §3.5.3 冻结「结算任务只记账、只降级，绝不默认扣款续期」，且 DoD 第 2 条要求
-      // `workspacePolicyAssignment` 的写入点**恰好两个**（`assignDefaultPolicy` +
-      // WP20-4 的 `grantPolicyFromPurchase`）。所以本 WP 的执行器**不扣款、不写订单、不发放**：
-      // 它把「这一周期已被收口、本周期没有产生任何订单」写成一条账本事实（`settled`）。
-      // 到期降级本身不需要这里做任何事——它是 `expires_at` 上的时间比较（契约 §3.2.2）。
-      //
-      // `auto_renew=true` 的续期（扣款 + 发放）属于 WP20-4：在那之前的正确行为是**留在 pending**
-      // 等接管，而不是假装完成。今天没有任何路径会把 `auto_renew` 写成 true（默认 false），
-      // 这条分支是给 WP20-4 的接缝，也是「绝不默认扣款续期」的代码形状。
-      if (row.auto_renew) {
-        return { charged: false, deferred: true, reason: "renewal_executor_not_wired" };
+      // 两条路径，互斥：
+      //   · `auto_renew = false`（默认）⇒ **只记账**：本周期收口、不产生任何订单、不动钱。
+      //     契约 §3.5.3「只记账、只降级」；到期降级不需要这里做任何事（它是 `expires_at` 上的
+      //     时间比较，§3.2.2）。
+      //   · `auto_renew = true` ⇒ 走 {@link renewSubscriptionPeriod}：条件扣款 + 订单 +
+      //     延长订阅 + `purchase` 发放，全部在**一个事务**里，并以账本行的 `order_id` 作为
+      //     幂等锚点（见该函数注释）。
+      if (!row.auto_renew) {
+        impl.log?.({ event: "settlement_recorded_no_charge", subscription_id: row.subscription_id, period_key: row.period_key, phase });
+        return { charged: false };
       }
-      impl.log?.({ event: "settlement_recorded_no_charge", subscription_id: row.subscription_id, period_key: row.period_key, phase });
-      return { charged: false };
+      return renewSubscriptionPeriod({ row, now });
     },
 
     async markSettled({ id, order_id, now }) {
@@ -572,4 +570,153 @@ export function defaultSettlementDeps(): SubscriptionSettlementDeps {
     },
   };
   return impl;
+}
+
+/* ------------------------------------------------------------------ */
+/* 续期执行器（V5-WP20-4 接线）                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `auto_renew = true` 的续期：**条件扣款 + 订单 + 延长订阅 + `purchase` 发放**，单事务。
+ *
+ * ── 幂等锚点是账本行自己 ──
+ * 接管机制允许同一周期被执行**两次**（O4 的已知代价：崩在提交前/后被重跑）。钱不能动两次，
+ * 所以顺序被写死为：
+ *
+ *   ① `SELECT ... FOR UPDATE` 锁住本行账本（并发下另一拍会在这里等）
+ *   ② 若 `order_id` 已非空 ⇒ **上一次执行已经提交过钱**，直接返回那条订单（不再扣款）
+ *   ③ 否则在一个事务里：条件扣款（F8）→ `BalanceLog` → `PlanOrder` → 延长订阅 + 发放
+ *      （`applyPlanPurchase`）→ **同事务**把新订单 id 写进账本行的 `order_id`
+ *   ④ 引擎随后把行推到 `settled`（`markSettled` 带 `state="pending"` 的 CAS）
+ *
+ * 崩在任何一步：整事务回滚（钱没动），下一拍重来。崩在提交之后、`markSettled` 之前：
+ * `order_id` 已落库 ⇒ 下一拍走 ②，钱只动一次。**这就是「先占位后执行」再加上一层
+ * 「以订单为幂等锚点」的完整形状**；只用占位唯一键而不锚定订单，接管那一次会重复扣款。
+ *
+ * ── 为什么要求 workspace 有钱包主体 ──
+ * 余额在 `User` 上（F8 的条件扣款），团队 workspace 没有 `personal_user_id` ⇒ 没有钱包可扣。
+ * 那种情况**不能**静默跳过（会让「自动续费」看起来生效）：返回 `deferred`，由接管重试，
+ * 直到运维把这条订阅的 `auto_renew` 关掉或把扣款主体接上（团队钱包是独立 WP）。
+ */
+export async function renewSubscriptionPeriod(input: {
+  row: SettlementTarget & { settlement_id: number };
+  now: Date;
+}): Promise<ExecuteOutcome> {
+  const { db } = await import("../db.ts");
+  const { applyPlanPurchase } = await import("./subscription-purchase.ts");
+
+  try {
+    return await db.$transaction(async (tx) => {
+      // ① 锁账本行（同一周期的两个执行者在这里串行化）
+      const locked = await tx.$queryRaw<
+        Array<{ id: number; order_id: number | null; state: string }>
+      >`SELECT id, order_id, state FROM subscription_period_settlement WHERE id = ${input.row.settlement_id} FOR UPDATE`;
+      const settlement = locked[0];
+      if (!settlement) return { charged: false, deferred: true, reason: "settlement_row_gone" };
+      if (settlement.state !== "pending") {
+        // 别处已经收口（settled/failed）⇒ 不再动钱。
+        return { charged: false, order_id: settlement.order_id };
+      }
+      // ② 幂等锚点：上一次执行已经提交过订单 ⇒ 钱已经动过，直接复用它。
+      if (settlement.order_id !== null) {
+        return { charged: true, order_id: settlement.order_id };
+      }
+
+      const subscription = await tx.planSubscription.findUnique({
+        where: { id: input.row.subscription_id },
+        select: {
+          id: true,
+          workspace_id: true,
+          plan_id: true,
+          expires_at: true,
+          auto_renew: true,
+          workspace: { select: { id: true, personal_user_id: true } },
+        },
+      });
+      if (!subscription) return { charged: false, deferred: true, reason: "subscription_gone" };
+      // 用户在这一刻把自动续费关掉了 ⇒ 尊重它，按「只记账」收口（不扣款、不延长）。
+      if (!subscription.auto_renew) {
+        return { charged: false, order_id: null, deferred: false, reason: "auto_renew_off" };
+      }
+      // 终身订阅没有「下一个周期」可续（`expires_at = null`）⇒ 记账收口，不进续期。
+      if (subscription.expires_at === null) {
+        return { charged: false, order_id: null, deferred: false, reason: "lifetime_no_renewal" };
+      }
+      const payer_user_id = subscription.workspace.personal_user_id;
+      if (payer_user_id === null) {
+        // 团队 workspace 没有钱包主体：留在 pending 等接管，绝不假装续成功。
+        return { charged: false, deferred: true, reason: "workspace_has_no_wallet" };
+      }
+
+      const plan = await tx.plan.findUnique({
+        where: { id: subscription.plan_id },
+        select: {
+          id: true,
+          name: true,
+          price: true,
+          billing_cycle: true,
+          policy_id: true,
+          status: true,
+          renewable: true,
+        },
+      });
+      // 商品下架 / 不允许续费 / 记录丢失：都不是「钱」的问题，而是「不该做」。
+      if (!plan || plan.status !== "active" || !plan.renewable) {
+        return { charged: false, deferred: true, reason: "plan_not_renewable" };
+      }
+
+      const price = plan.price;
+      // ③ 条件扣款（F8）：余额不足是**用户可见的正常结果**，不是系统失败 ⇒ 留 pending 等
+      // 用户充值后由下一拍接管重试（若记 failed，续期就永远不会再发生）。
+      const debited = await tx.user.updateMany({
+        where: { id: payer_user_id, balance: { gte: price } },
+        data: { balance: { decrement: price } },
+      });
+      if (debited.count !== 1) {
+        return { charged: false, deferred: true, reason: "insufficient_balance" };
+      }
+      const afterUser = await tx.user.findUniqueOrThrow({ where: { id: payer_user_id }, select: { balance: true } });
+      await tx.balanceLog.create({
+        data: { user_id: payer_user_id, balance: afterUser.balance, amount: -price, type: "plan" },
+      });
+      const order = await tx.planOrder.create({
+        data: {
+          user_id: payer_user_id,
+          workspace_id: subscription.workspace_id,
+          plan_id: plan.id,
+          price,
+          balance: afterUser.balance,
+        },
+        select: { id: true },
+      });
+
+      // ④ 延长订阅 + 发放（与购买路径**同一段实现**，含同套餐续期从 max(now, 原到期) 起算）
+      //    注意**不传**两个 legacy 额度快照字段：同套餐续期的额度不变（不需要写），且
+      //    DoD 第 1 条要求本文件不出现任何额度字段名（计费侧不碰额度）。
+      await applyPlanPurchase(tx, {
+        now: input.now,
+        workspace_id: subscription.workspace_id,
+        payer_user_id,
+        plan: {
+          id: plan.id,
+          name: plan.name,
+          billing_cycle: plan.billing_cycle,
+          price: plan.price,
+          policy_id: plan.policy_id,
+        },
+        order_id: order.id,
+      });
+
+      // ⑤ 同事务写回幂等锚点：这一步提交之后，任何重跑都会在 ② 处短路。
+      await tx.subscriptionPeriodSettlement.update({
+        where: { id: input.row.settlement_id },
+        data: { order_id: order.id },
+      });
+
+      return { charged: true, order_id: order.id };
+    });
+  } catch (error) {
+    // 抛给引擎的 runExecution 统一记账（它会写 failed + 记 attempts）。
+    throw error;
+  }
 }

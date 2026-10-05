@@ -13,15 +13,26 @@
  * 响应封装：前端 request() 剥掉 **一层** 顶层 data —— 列表返回
  *   { data: { data: rows, total, page, page_size } }，单对象返回 { data: obj }。
  *
- * 购买流程（对齐原版 + 前端 mock handler 语义）：
+ * 购买流程（V5-WP20-4 起，契约 §3.5）：
  *   ① 套餐存在且 active ② 库存校验 ③ 优惠码折算 ④ 余额校验
- *   ⑤ 事务内：扣余额 + BalanceLog + 订单 + UserPlan（同套餐续期 / 换套餐重置）
+ *   ⑤ 单事务：扣余额 + BalanceLog + 订单（带 `workspace_id`）+ **订阅** + **purchase 发放**
+ *   ⑥ 事务提交后 `invalidatePolicyCache`
+ *
+ * 三处与旧实现的语义差异（**不是重写，是接线**）：
+ *   · 订阅的真相从 `UserPlan`（用户级单例）改为 `PlanSubscription`（**workspace 级**，§3.5.2）；
+ *     `UserPlan` 降级为 legacy 展示投影，仍在同一事务里双写，按 user 维度。
+ *   · 落库 + 发放的唯一实现是 `services/subscription-purchase.ts#applyPlanPurchase` ——
+ *     周期结算的续期执行器用的是**同一段**（两处各写一份正是契约禁止的第二份真相）。
+ *   · `UserPlan.traffic_used` **不再被写**（§3.3.2 / §4.0 冻结：它是派生/只读的 legacy 列）。
  */
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
+import { invalidatePolicyCache } from "../services/policy-service.ts";
+import { applyPlanPurchase, planTrafficBytes } from "../services/subscription-purchase.ts";
+import { ensurePersonalWorkspace } from "../services/workspace.ts";
 
 export const plansRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -32,17 +43,6 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
   if (!user) throw new HTTPException(401, { message: "Unauthorized" });
   return user;
 }
-
-/** 账单周期 → 天数（lifetime 用 100 年近似） */
-const CYCLE_DAYS: Record<string, number> = {
-  month: 30,
-  quarter: 90,
-  half_year: 180,
-  year: 365,
-  lifetime: 36500,
-};
-
-const GB = 1024 * 1024 * 1024;
 
 /* ------------------------------------------------------------------ */
 /* GET / —— 列表                                                       */
@@ -118,6 +118,12 @@ plansRoutes.post("/purchase", async (c) => {
   if (plan.status !== "active") return c.json({ error: "该套餐已下架" }, 400);
   if (plan.stock !== null && plan.stock <= 0) return c.json({ error: "库存不足" }, 400);
 
+  // 购买归属到用户的 `personal` workspace（契约 §3.5.2：套餐属 workspace，不属 user）。
+  // 这里用幂等修复而不是「查不到就拒绝」：workspace 由注册流程创建，但**早于**该流程的存量账号
+  // 可能没有；为一次合法购买返回 500 是最差的选择，而 `ensurePersonalWorkspace` 本来就是
+  // 为这种账号准备的幂等修复（内含 `assignDefaultPolicy`，即既有那条 system_default 发放）。
+  const workspace = await ensurePersonalWorkspace({ id: user.id, email: user.email });
+
   // ---- 优惠码折算 ----
   let total = plan.price + (plan.setup_fee ?? 0);
   let couponId: number | null = null;
@@ -146,10 +152,10 @@ plansRoutes.post("/purchase", async (c) => {
 
   if (user.balance < total) return c.json({ error: "余额不足，请先充值" }, 400);
 
-  const days = CYCLE_DAYS[String(plan.billing_cycle)] ?? 30;
-  const trafficBytes = plan.traffic === null ? null : plan.traffic * GB;
-
-  // ---- 单事务：扣款 → 订单 → 订阅 ----
+  // ---- 单事务：扣款 → 订单 → 订阅（PlanSubscription 唯一真相 + legacy 双写）→ purchase 发放 ----
+  //
+  // 顺序即契约（§3.5.2/R6）：扣款、订单、订阅、发放必须**同事务** —— 授权同步失败要回滚，
+  // 不得「扣了钱却不留权」。缓存失效（`invalidatePolicyCache`）放在**提交之后**。
   const result = await db.$transaction(async (tx) => {
     // ① 扣余额（条件更新，防并发超扣）
     const debited = await tx.user.updateMany({
@@ -169,10 +175,11 @@ plansRoutes.post("/purchase", async (c) => {
       await tx.plan.update({ where: { id: plan.id }, data: { stock: { decrement: 1 } } });
     }
 
-    // ③ 订单
+    // ③ 订单（`workspace_id` 表达「这笔钱买给哪个租户」，R5：历史行 NULL 不猜）
     const order = await tx.planOrder.create({
       data: {
         user_id: user.id,
+        workspace_id: workspace.id,
         plan_id: plan.id,
         price: total,
         balance: afterUser.balance,
@@ -180,45 +187,28 @@ plansRoutes.post("/purchase", async (c) => {
       },
     });
 
-    // ④ 订阅：同套餐续期，否则换新
-    const existing = await tx.userPlan.findUnique({ where: { user_id: user.id } });
-    let userPlan;
-    if (existing && existing.plan_id === plan.id) {
-      const base = Math.max(Date.now(), existing.expired_at ? existing.expired_at.getTime() : Date.now());
-      userPlan = await tx.userPlan.update({
-        where: { user_id: user.id },
-        data: {
-          expired_at: plan.billing_cycle === "lifetime" ? null : new Date(base + days * 86400000),
-          traffic: trafficBytes,
-          max_tunnels: plan.max_tunnels,
-        },
-      });
-    } else if (existing) {
-      userPlan = await tx.userPlan.update({
-        where: { user_id: user.id },
-        data: {
-          plan_id: plan.id,
-          expired_at: plan.billing_cycle === "lifetime" ? null : new Date(Date.now() + days * 86400000),
-          traffic: trafficBytes,
-          traffic_used: 0,
-          max_tunnels: plan.max_tunnels,
-        },
-      });
-    } else {
-      userPlan = await tx.userPlan.create({
-        data: {
-          user_id: user.id,
-          plan_id: plan.id,
-          traffic: trafficBytes,
-          traffic_used: 0,
-          max_tunnels: plan.max_tunnels,
-          expired_at: plan.billing_cycle === "lifetime" ? null : new Date(Date.now() + days * 86400000),
-        },
-      });
-    }
+    // ④ 订阅 + 发放：唯一实现见 services/subscription-purchase.ts（续期执行器用的是同一段）
+    const purchase = await applyPlanPurchase(tx, {
+      now: new Date(),
+      workspace_id: workspace.id,
+      payer_user_id: user.id,
+      plan: {
+        id: plan.id,
+        name: plan.name,
+        billing_cycle: plan.billing_cycle,
+        price: plan.price,
+        policy_id: plan.policy_id,
+        traffic_bytes: planTrafficBytes(plan.traffic),
+        max_tunnels: plan.max_tunnels,
+      },
+      order_id: order.id,
+    });
 
-    return { order, userPlan, balance: afterUser.balance };
+    return { order, purchase, balance: afterUser.balance };
   });
+
+  // 事实已提交 ⇒ 现在才失效缓存（若在事务内失效，别人可能读到尚未提交的旧发放）。
+  invalidatePolicyCache(workspace.id);
 
   return c.json({
     data: {
@@ -227,7 +217,20 @@ plansRoutes.post("/purchase", async (c) => {
       plan_id: plan.id,
       price: total,
       balance: result.balance,
-      user_plan: result.userPlan,
+      subscription: {
+        id: result.purchase.subscription_id,
+        started_at: result.purchase.started_at,
+        expires_at: result.purchase.expires_at,
+        renewed_same_plan: result.purchase.renewed_same_plan,
+      },
+      // 可观测：套餐没绑策略时购买照常但不发放（原因码随响应返回，前端/运营能看见）。
+      grant: {
+        granted: result.purchase.grant.granted,
+        policy_id: result.purchase.grant.policy_id,
+        reason: result.purchase.grant.reason ?? null,
+        replaced: result.purchase.grant.revoked,
+      },
+      user_plan: result.purchase.legacy_user_plan,
     },
   });
 });

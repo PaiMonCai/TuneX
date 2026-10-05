@@ -563,10 +563,25 @@ describe("F. 静态守卫：计费侧不做额度判定 / 不新增发放写入�
     }
   });
 
-  test("DoD 第 2 条：计费侧不写 WorkspacePolicyAssignment / PlanOrder / BalanceLog（发放是 WP20-4 的唯一写入点）", () => {
-    for (const forbidden of ["workspacePolicyAssignment", "planOrder", "balanceLog", "planOrder.create", "user.update"]) {
-      expect({ forbidden, hits: SERVICE_CODE.includes(forbidden) }).toEqual({ forbidden, hits: false });
+  test("DoD 第 2 条：计费侧**不直接**写发放/订单/流水表 —— 只能经 WP20-4 的接缝", () => {
+    // WP20-3 的原始形态是「这三张表一个都不出现」；WP20-4 把续期执行器接在这个文件里之后，
+    // `planOrder`/`balanceLog` **必须**出现（契约 §3.2.4 的「唯一新增执行者只写四类台账」）。
+    // 所以守卫改成更有信息量的形态：**发放永远不许直接写**（唯一写入点仍是 policy-service
+    // 的两个函数，由 subscription-purchase/20-4 的守卫断言），订单/流水只允许出现在
+    // `renewSubscriptionPeriod` 里 —— 引擎本体（占位/接管/终态）一行都不碰钱。
+    expect(SERVICE_CODE).not.toContain("workspacePolicyAssignment");
+
+    const renewalStart = SERVICE_CODE.indexOf("export async function renewSubscriptionPeriod");
+    expect(renewalStart).toBeGreaterThan(0);
+    const engineCode = SERVICE_CODE.slice(0, renewalStart);
+    const renewCode = SERVICE_CODE.slice(renewalStart);
+    for (const table of ["planOrder", "balanceLog"]) {
+      expect({ table, in_engine: engineCode.includes(table) }).toEqual({ table, in_engine: false });
+      expect({ table, in_renewal: renewCode.includes(table) }).toEqual({ table, in_renewal: true });
     }
+    // 续期执行器必须是「同一个事务」：扣款、订单、订阅、发放、幂等锚点写在一次 $transaction 里
+    expect(renewCode).toContain("db.$transaction");
+    expect(renewCode).toContain("FOR UPDATE");
   });
 
   test("DoD 第 9 条：全仓没有把 auto_renew 默认开启的赋值（生产代码）", () => {

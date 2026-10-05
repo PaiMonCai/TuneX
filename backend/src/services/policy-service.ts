@@ -335,6 +335,108 @@ export async function ensureDefaultPolicy(workspaceId: number): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
+/* 购买 → 发放接线（V5-WP20-4）                                         */
+/* ------------------------------------------------------------------ */
+
+/** {@link grantPolicyFromPurchase} 的输入：一次已完成的购买事实。 */
+export interface PurchaseGrantInput {
+  workspace_id: number;
+  /** 套餐显式绑定的策略（`Plan.policy_id`）。NULL ⇒ **不发放**，见函数注释。 */
+  policy_id: number | null;
+  /** 发放到期点 = 订阅到期点（`null` = 终身）。两者必须同源，否则会出现「订阅还在、权限已过」。 */
+  expires_at: Date | null;
+  /**
+   * 换套餐时被替换掉的旧策略 id（旧套餐绑定的那条）。同事务把它的 `purchase` 发放**显式撤销**，
+   * 避免「两份套餐的并集」并存 —— 与 `routes/plans.ts` 的「换套餐 = 替换期限」语义一致。
+   */
+  replace_policy_id?: number | null;
+  /** 审计备注（订单号等），进 `note`。 */
+  note?: string | null;
+  /** 时间点（默认 `new Date()`；调用方在同事务里应传同一个 `now`）。 */
+  now?: Date;
+}
+
+/** {@link grantPolicyFromPurchase} 的结果（可观测：为什么没发）。 */
+export interface PurchaseGrantResult {
+  granted: boolean;
+  policy_id: number | null;
+  /** 未发放时的原因码（给人看，判定不依赖它）。 */
+  reason?: "plan_policy_unbound";
+  /** 同事务撤销掉的旧 purchase 发放条数。 */
+  revoked: number;
+}
+
+/**
+ * **`purchase` 来源发放的唯一写入点**（契约 §3.2.2 / DoD 第 2 条）。
+ *
+ * 调用约定：**必须在购买事务内**调用（与扣款、订单、订阅同事务 —— 契约 §3.5 的 R6：
+ * 授权同步失败必须回滚，不得扣钱不留权）；提交**之后**由调用方执行
+ * `invalidatePolicyCache(workspace_id)`，因为缓存失效只该发生在事实已经落库之后。
+ *
+ * 三条不变量：
+ *   1. **发放必须显式**：只认 `input.policy_id`（来自 `Plan.policy_id`）。`NULL` ⇒ 不发放、
+ *      返回 `reason="plan_policy_unbound"`。**绝不**从 `Plan.max_tunnels`/`traffic` 反推策略，
+ *      也不挑一条模板顶上（§3.5.3 明确不做③；F5/F6：判定只认「哪条发放存在」）。
+ *   2. **幂等**：同一 `(workspace_id, policy_id)` 重复调用只更新那一行（同套餐续期 = 延长
+ *      `expires_at`），靠既有 `@@unique([workspace_id, policy_id])`。
+ *   3. **`effective_at` 不后移**：续期时取 `min(原 effective_at, now)`。反例：若把 `effective_at`
+ *      设成新到期点之前的某刻（如 `max(now, 旧到期)`），提前续费的用户会从「已生效」变成
+ *      「尚未生效」——付了钱却当场失去准入。
+ */
+export async function grantPolicyFromPurchase(
+  tx: Prisma.TransactionClient,
+  input: PurchaseGrantInput,
+): Promise<PurchaseGrantResult> {
+  if (input.policy_id === null) {
+    return { granted: false, policy_id: null, reason: "plan_policy_unbound", revoked: 0 };
+  }
+  const now = input.now ?? new Date();
+
+  // 换套餐：先撤掉旧套餐的 purchase 发放（只撤 purchase，不动 admin_grant/system_default）。
+  let revoked = 0;
+  if (input.replace_policy_id && input.replace_policy_id !== input.policy_id) {
+    const result = await tx.workspacePolicyAssignment.updateMany({
+      where: {
+        workspace_id: input.workspace_id,
+        policy_id: input.replace_policy_id,
+        source: "purchase",
+        revoked_at: null,
+      },
+      data: { revoked_at: now },
+    });
+    revoked = result.count;
+  }
+
+  const existing = await tx.workspacePolicyAssignment.findUnique({
+    where: { workspace_id_policy_id: { workspace_id: input.workspace_id, policy_id: input.policy_id } },
+    select: { effective_at: true },
+  });
+  const effective_at =
+    existing && existing.effective_at.getTime() < now.getTime() ? existing.effective_at : now;
+
+  await tx.workspacePolicyAssignment.upsert({
+    where: { workspace_id_policy_id: { workspace_id: input.workspace_id, policy_id: input.policy_id } },
+    create: {
+      workspace_id: input.workspace_id,
+      policy_id: input.policy_id,
+      source: "purchase",
+      effective_at,
+      expires_at: input.expires_at,
+      note: input.note ?? null,
+    },
+    // 续期：解封（曾因过期被撤销/置空的行）并把截止点推到新到期点；`effective_at` 只前移不后移。
+    update: {
+      revoked_at: null,
+      effective_at,
+      expires_at: input.expires_at,
+      note: input.note ?? null,
+    },
+  });
+
+  return { granted: true, policy_id: input.policy_id, revoked };
+}
+
+/* ------------------------------------------------------------------ */
 /* 并发原子额度守卫                                                    */
 /* ------------------------------------------------------------------ */
 
