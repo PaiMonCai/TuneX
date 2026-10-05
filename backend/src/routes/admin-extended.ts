@@ -366,7 +366,7 @@ async function updateUser(c: Ctx) {
     return user;
   });
 
-  // WP15：用户状态切换不再触发 legacy 推送；v3 由 reconciler 拉齐 apply 命令。
+  //：用户状态切换不再触发 legacy 推送；v3 由 reconciler 拉齐 apply 命令。
 
   return one(c, updated);
 }
@@ -396,8 +396,7 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     return bad(c, `该用户仍有 ${tunnelCount} 条隧道，请先删除隧道`, 409);
   }
 
-  // WP15：旧 collectAffectedNodeGroups*（为 legacy 配置推送计算受影响节点组）
-  // 随 config-refresh 一起删除；v3 传播不依赖它。
+  //：旧 collectAffectedNodeGroups*（为 legacy 配置推送计算受影响节点组）
 
   await db.$transaction(async (tx) => {
     // 解除角色绑定（隐式多对多）
@@ -440,7 +439,7 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     await tx.user.delete({ where: { id } });
   });
 
-  // WP15：用户删除后由 reconciler 拉齐 apply 命令，无需 legacy 推送。
+  //：用户删除后由 reconciler 拉齐 apply 命令，无需 legacy 推送。
   return one(c, { ok: true });
 });
 
@@ -834,7 +833,7 @@ adminExtendedRoutes.delete("/node-groups/:id", async (c) => {
     await tx.nodeGroup.delete({ where: { id } });
   });
 
-  // WP15：节点组删除不再触发 legacy 推送；v3 由 reconciler 拉齐。
+  //：节点组删除不再触发 legacy 推送；v3 由 reconciler 拉齐。
 
   return one(c, { ok: true });
 });
@@ -855,7 +854,7 @@ function planView<T extends { node_groups?: { node_group: { id: number; name: st
 }
 
 /**
- * V5-WP20-4b：可绑定的策略选项（只读，给套餐表单的下拉框用）。
+ *：可绑定的策略选项（只读，给套餐表单的下拉框用）。
  *
  * 与套餐 CRUD 的校验**同一口径**（见 `services/plan-subscription.ts#listBindablePolicies`）：
  * 列出的一定能被接受，没列出的一定会被拒。若把整个策略表都列出来，
@@ -882,7 +881,7 @@ adminExtendedRoutes.get("/plans", async (c) => {
       take,
       include: {
         node_groups: { include: { node_group: { select: { id: true, name: true } } } },
-        // V5-WP20-4b：管理端要能看见「这个套餐卖的是哪条策略」（未绑定 = null）。
+        //：管理端要能看见「这个套餐卖的是哪条策略」（未绑定 = null）。
         policy: { select: { id: true, key: true, name: true, status: true, is_ceiling: true } },
       },
     }),
@@ -934,7 +933,7 @@ adminExtendedRoutes.post("/plans", async (c) => {
   let created;
   try {
     created = await db.$transaction(async (tx) => {
-      // V5-WP20-4b：套餐 → 能力策略的**显式绑定**（契约 §3.5.3）。校验在服务层，
+      //：套餐 → 能力策略的**显式绑定**（契约 §3.5.3）。校验在服务层，
       // 与发放语义同口径（未启用 / 平台上限模板都会被拒；理由见 services/plan-subscription.ts）。
       const binding = await resolvePlanPolicyBinding(tx, body.policy_id);
       if (binding.kind === "reject") throw new HTTPException(400, { message: binding.message });
@@ -979,7 +978,7 @@ adminExtendedRoutes.post("/plans", async (c) => {
     where: { id: created.id },
     include: {
       node_groups: { include: { node_group: { select: { id: true, name: true } } } },
-      // V5-WP20-4b：保存后的回读也要带出绑定的策略（前端据此刷新表单与列表）。
+      //：保存后的回读也要带出绑定的策略（前端据此刷新表单与列表）。
       policy: { select: { id: true, key: true, name: true, status: true, is_ceiling: true } },
     },
   });
@@ -1057,12 +1056,11 @@ async function updatePlan(c: Ctx) {
   const nodeGroupIds =
     body.node_group_ids === undefined ? undefined : parseIntList(body.node_group_ids) ?? [];
 
-  // WP15：plan 变更的「受影响节点组」预读（configAffectingChange / oldBoundGroupIds）
-  // 与 config-refresh 一起删除——它只为 legacy 配置推送计算 scope。
+  //：plan 变更的「受影响节点组」预读（configAffectingChange / oldBoundGroupIds）
 
   try {
     await db.$transaction(async (tx) => {
-      // V5-WP20-4b：`policy_id` 是**显式绑定**入口（PATCH 部分更新语义：
+      //：`policy_id` 是**显式绑定**入口（PATCH 部分更新语义：
       // 不传 = 不动；传 null/"" = 解绑；传 id = 换绑，校验同 POST）。
       const binding = await resolvePlanPolicyBinding(tx, body.policy_id);
       if (binding.kind === "reject") throw new HTTPException(400, { message: binding.message });
@@ -1078,13 +1076,13 @@ async function updatePlan(c: Ctx) {
     throw e;
   }
 
-  // WP15：套餐/绑定变更不再触发 legacy 推送；v3 由 reconciler 拉齐。
+  //：套餐/绑定变更不再触发 legacy 推送；v3 由 reconciler 拉齐。
 
   const full = await db.plan.findUniqueOrThrow({
     where: { id },
     include: {
       node_groups: { include: { node_group: { select: { id: true, name: true } } } },
-      // V5-WP20-4b：保存后的回读也要带出绑定的策略（前端据此刷新表单与列表）。
+      //：保存后的回读也要带出绑定的策略（前端据此刷新表单与列表）。
       policy: { select: { id: true, key: true, name: true, status: true, is_ceiling: true } },
     },
   });
@@ -1118,7 +1116,7 @@ adminExtendedRoutes.delete("/plans/:id", async (c) => {
     await tx.plan.delete({ where: { id } });
   });
 
-  // WP15：套餐删除不再触发 legacy 推送；v3 由 reconciler 拉齐。
+  //：套餐删除不再触发 legacy 推送；v3 由 reconciler 拉齐。
 
   return one(c, { ok: true });
 });
