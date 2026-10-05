@@ -95,6 +95,13 @@ export interface ForwardDenialRow {
 export interface DiscoveryBacklogSource {
   /** 载入本拍的候选条目（生产实现复用 `collectAttention()`）。 */
   readonly items: readonly AttentionItem[];
+  /**
+   * 账本里**尚未配对恢复**的拒绝 episode（由注入的读取提供）。
+   *
+   * 为什么这一项也来自"载入"而不是另开一条注入：它和 `items` 属于**同一拍**的输入快照 ✓ ——
+   * 分两次注入会出现"拿到的是两个时刻的世界"，那正是配对语义最容易出错的地方。
+   */
+  readonly openDenials: readonly OpenDenialEpisode[];
   /** 按转发 id 取来源行；缺行 = 该转发在扫描后已消失（不猜、跳过）。 */
   readonly rowOf: (forwardId: number) => ForwardDenialRow | null;
 }
@@ -119,6 +126,8 @@ export interface ForwardDenialRunSummary {
   /** 取了来源行但被派生层拒绝（scope/字段不合法）—— 同样要可见，不能静默丢。 */
   readonly rejected: number;
   readonly skipped: number;
+  /** 本拍投出去的**恢复**事实数（与拒绝分开计数：混成一个数就看不出"在坏"还是"在好"）。 */
+  readonly recovered: number;
   /** 是否真的调用了投递（一个渠道都没打开时为 false，且此时不应产生任何账本行）。 */
   readonly delivered: boolean;
 }
@@ -154,15 +163,54 @@ export async function runForwardDenialNotifications(
     facts.push(built.fact);
   }
 
+  // 恢复：同一拍、同一批依赖、**同一次投递调用**（不建第二条投递路径）。
+  const stillDenied = new Set(
+    source.items
+      .filter((i) => i.kind === "forward" && i.reason_code === FORWARD_DENIAL_REASON)
+      .map((i) => i.id),
+  );
+  const recovery = selectForwardRecoveryFacts({
+    openDenials: source.openDenials,
+    stillDeniedIds: stillDenied,
+    occurredAtOf: (id) => source.rowOf(id)?.updated_at ?? null,
+  });
+  for (const seed of recovery.seeds) {
+    const row = source.rowOf(seed.item.id);
+    if (!row) {
+      rejected += 1;
+      continue;
+    }
+    const built = buildNotificationFact(workspaceNotificationScope(row.workspace_id), seed);
+    if (!built.ok) {
+      rejected += 1;
+      continue;
+    }
+    facts.push(built.fact);
+  }
+
   const channels = deps.channels();
   if (facts.length === 0 || channels.length === 0) {
     // 没有事实、或**一个渠道都没打开**：不投递、不产生账本行（避免用 `not_configured`
     // 把"失败可见"稀释成噪音）。
-    return { considered: source.items.length, built: 0, rejected, skipped: skipped.length, delivered: false };
+    return {
+      considered: source.items.length,
+      built: 0,
+      recovered: 0,
+      rejected,
+      skipped: skipped.length + recovery.skipped.length,
+      delivered: false,
+    };
   }
 
   await deps.deliver(facts, channels);
-  return { considered: source.items.length, built: facts.length, rejected, skipped: skipped.length, delivered: true };
+  return {
+    considered: source.items.length,
+    built: facts.length,
+    recovered: recovery.seeds.length,
+    rejected,
+    skipped: skipped.length + recovery.skipped.length,
+    delivered: true,
+  };
 }
 
 /* ================================================================== */

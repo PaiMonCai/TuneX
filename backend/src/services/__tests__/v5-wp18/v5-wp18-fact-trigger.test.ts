@@ -95,6 +95,7 @@ describe("V5-WP18 触发器：编排", () => {
   const deps = (
     over: Partial<{
       items: AttentionItem[];
+      openDenials: { forward_id: number; name: string }[];
       rows: Map<number, ReturnType<typeof row>>;
       channels: NotificationChannel[];
       delivered: Array<{ facts: readonly DeliverableNotification[]; channels: readonly NotificationChannel[] }>;
@@ -105,6 +106,8 @@ describe("V5-WP18 触发器：编排", () => {
       deps: {
         load: async () => ({
           items: over.items ?? [item()],
+          // 默认没有未配对的拒绝 ⇒ 既有断言语义不变（"恢复"是新增的一路输入）。
+          openDenials: over.openDenials ?? [],
           rowOf: (id: number) => (over.rows ?? new Map([[42, row()]])).get(id) ?? null,
         }),
         deliver: async (facts: readonly DeliverableNotification[], channels: readonly NotificationChannel[]) => {
@@ -214,5 +217,52 @@ describe("V5-WP18 触发器：恢复事实", () => {
   test("同一转发出现两条未配对拒绝 ⇒ 只产生一条恢复（重复的事实就是重复的通知）", () => {
     const { seeds } = sel({ openDenials: [{ forward_id: 42, name: "a" }, { forward_id: 42, name: "b" }] });
     expect(seeds).toHaveLength(1);
+  });
+});
+
+describe("V5-WP18 触发器：拒绝与恢复走**同一次投递**", () => {
+  test("未配对的拒绝 + 已不在拒绝集 ⇒ 同一批里既有拒绝也有恢复，且只调一次投递", async () => {
+    const delivered: Array<{ facts: readonly DeliverableNotification[] }> = [];
+    const summary = await runForwardDenialNotifications({
+      load: async () => ({
+        // 42 仍在拒绝中（会产生拒绝事实），77 曾被拒但已恢复（会产生恢复事实）
+        items: [
+          { kind: "forward", id: 42, name: "a", severity: "error", reason_code: "forward_apply_error", apply_error_code: "port_in_use", retryable: false },
+        ],
+        openDenials: [{ forward_id: 42, name: "a" }, { forward_id: 77, name: "b" }],
+        rowOf: (id: number) =>
+          id === 42 || id === 77
+            ? { updated_at: new Date("2026-10-05T02:00:00.000Z"), workspace_id: 7 }
+            : null,
+      }),
+      deliver: async (facts) => {
+        delivered.push({ facts });
+        return [];
+      },
+      channels: () => [{ kind: "email" } as unknown as NotificationChannel],
+    });
+
+    expect(delivered).toHaveLength(1);
+    const codes = delivered[0]!.facts.map((f) => f.reason_code).sort();
+    expect(codes).toEqual(["forward_apply_error", "forward_apply_recovered"]);
+    expect(summary).toMatchObject({ built: 2, recovered: 1, delivered: true });
+  });
+
+  test("只有恢复、没有新拒绝时也照常投递（否则「好了」这件事永远说不出口）", async () => {
+    const delivered: Array<{ facts: readonly DeliverableNotification[] }> = [];
+    const summary = await runForwardDenialNotifications({
+      load: async () => ({
+        items: [],
+        openDenials: [{ forward_id: 77, name: "b" }],
+        rowOf: () => ({ updated_at: new Date("2026-10-05T02:00:00.000Z"), workspace_id: 7 }),
+      }),
+      deliver: async (facts) => {
+        delivered.push({ facts });
+        return [];
+      },
+      channels: () => [{ kind: "email" } as unknown as NotificationChannel],
+    });
+    expect(delivered[0]!.facts.map((f) => f.reason_code)).toEqual(["forward_apply_recovered"]);
+    expect(summary).toMatchObject({ built: 1, recovered: 1, delivered: true });
   });
 });
