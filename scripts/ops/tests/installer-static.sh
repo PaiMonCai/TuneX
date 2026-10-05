@@ -209,12 +209,12 @@ state_case 0 "" 2 "ghcr.io/paimoncai/tunex:$SHA_FAKE" different
 # C3 .env 校验（DoD 5）
 ENV_GOOD="$TMP/env.good"
 cat > "$ENV_GOOD" <<EOF
-AUTH_SECRET=AbCdEf0123456789-_AbCdEf0123456789
-LICENSE_SECRET=AbCdEf0123456789-_AbCdEf0123456789
-TUNEX_CONFIG_KEY=AbCdEf0123456789-_AbCdEf0123456789
-TUNEX_LICENSE_KEY=AbCdEf0123456789-_AbCdEf0123456789
+AUTH_SECRET=AbCdEf0123456789-_AbCdEf0123456789 # secret-scan:allow — deterministic installer test fixture
+LICENSE_SECRET=AbCdEf0123456789-_AbCdEf0123456789 # secret-scan:allow — deterministic installer test fixture
+TUNEX_CONFIG_KEY=AbCdEf0123456789-_AbCdEf0123456789 # secret-scan:allow — deterministic installer test fixture
+TUNEX_LICENSE_KEY=AbCdEf0123456789-_AbCdEf0123456789 # secret-scan:allow — deterministic installer test fixture
 MYSQL_ROOT_PASSWORD=AbCdEf0123456789-_AbCdEf0123456789
-DATABASE_URL=mysql://root:AbCdEf0123456789-_AbCdEf0123456789@mysql:3306/tunex
+DATABASE_URL=mysql://root:AbCdEf0123456789-_AbCdEf0123456789@mysql:3306/tunex # secret-scan:allow — deterministic installer test fixture
 SITE_URL=https://tunex.example.com
 TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA_FAKE
 TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:$SHA_FAKE
