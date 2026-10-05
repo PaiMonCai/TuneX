@@ -22,7 +22,7 @@ export default async function FederationUsagePage() {
       title={localizedLabel(locale, "admin.federation.usage", "联邦用量", "Federation usage")}
       subtitle={localizedLabel(locale, "admin.federation.subtitle", "跨面板信任、授予与远端租约", "Cross-panel trust, grants and remote leases")}
       adminMode
-      showToaster={false}
+     
     >
       <div className="flex flex-col gap-4">
         <FederationTabs active="usage" locale={locale} />
