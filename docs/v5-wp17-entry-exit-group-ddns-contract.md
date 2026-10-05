@@ -1,7 +1,6 @@
-# V5-WP17 — 入口组 / 出口组 / DDNS 联动契约（DRAFT，待冻结）
+# V5-WP17 — 入口组 / 出口组 / DDNS 联动契约
 
-> **状态：契约草案（2026-10-05，未冻结）。** 本文只回答语义，不含实现：不新增代码、不改
-> schema、不改 `DEVELOPMENT.md`、不改任何既有契约文档。冻结由 Lead 拍板后回写状态行。
+> **状态：FROZEN + IMPLEMENTED（2026-10-05）。** D1–D4 已裁决；WP17.1–WP17.5 已交付，Gate V5-G6 `PASS=72 / FAIL=0`。本文既记录冻结语义，也保留实现期发现的边界与 Gate 证据；当前实现仍遵守“不新增第二套状态机 / desired / 端口所有权”的约束。
 >
 > 上游权威：`DEVELOPMENT.md` §8（WP10 六条件 + 回切）、§9.4（Route Profile / Console 边界）、
 > §5.1（端口租约）。冻结基线：`docs/v5-wp13-5b-route-profile-contract.md`（FROZEN）、
