@@ -620,3 +620,29 @@ func (m *datagramEgressMapping) close() {
 		_ = m.conn.Close()
 	}
 }
+
+// compiled guards: the exit must satisfy both contracts. The DatagramRuntime half is
+// what it is built as; the Diagnostician half is what makes its facts REACHABLE —
+// without it the manager reports nothing for this tunnel, so an exit that is
+// dropping every hop packet looks exactly like an idle one (which is how the
+// multi-homed attestation bug hid during the first real G1B run: the control plane
+// was green, both legs were "running", and no counter said otherwise).
+var (
+	_ DatagramRuntime = (*DatagramEgress)(nil)
+	_ Diagnostician   = (*DatagramEgress)(nil)
+)
+
+// ProtocolDiagnostics reports this tunnel's frozen datagram facts (§6.1).
+func (e *DatagramEgress) ProtocolDiagnostics() (ProtocolDiagnostics, bool) {
+	return ProtocolDiagnostics{
+		Protocol:           string(ProtocolUDP),
+		Mappings:           int64(e.LiveMappings()),
+		MappingsExpired:    e.mappingsExpired.Load(),
+		PacketsIn:          e.packetsIn.Load(),
+		PacketsOut:         e.packetsOut.Load(),
+		BytesIn:            e.bytesIn.Load(),
+		BytesOut:           e.bytesOut.Load(),
+		Drops:              e.drops.Load(),
+		IdleTimeoutSeconds: int64(e.idleTimeout / time.Second),
+	}, true
+}

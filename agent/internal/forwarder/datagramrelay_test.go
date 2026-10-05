@@ -1,6 +1,7 @@
 package forwarder
 
 import (
+	"strings"
 	"bytes"
 	"net"
 	"strconv"
@@ -397,5 +398,68 @@ func TestDatagramRelayReportsMappingsNotConnections(t *testing.T) {
 	_ = egress.next(t, 2*time.Second)
 	if got := r.LiveMappings(); got != 1 {
 		t.Fatalf("live mappings after one client = %d, want 1", got)
+	}
+}
+
+// Both new runtimes must be Diagnosticians: the manager collects per-tunnel facts by
+// interface assertion, so a runtime without it reports nothing at all — a tunnel that
+// is silently dropping everything then looks exactly like an idle one. That is
+// precisely how the multi-homed attestation bug hid on the first real G1B run.
+func TestDatagramRelayAndEgressReportProtocolDiagnostics(t *testing.T) {
+	egress := startFakeEgress(t)
+	port := freeUDPPort(t)
+	relay := startRelay(t, relayTestConfig(t, port, egress.addr()), DatagramRelayOptions{})
+	client := datagramClient(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	got := egress.next(t, 2*time.Second)
+	egress.reply(t, got.from, got.header.MappingID, got.header.Generation, []byte("T:hello"))
+	_ = readDatagram(t, client)
+
+	var d DatagramRuntime = relay
+	diag, ok := d.(Diagnostician).ProtocolDiagnostics()
+	if !ok {
+		t.Fatal("the relay reports no protocol diagnostics")
+	}
+	if diag.Protocol != "udp" {
+		t.Fatalf("diag protocol = %q, want udp", diag.Protocol)
+	}
+	if diag.Mappings != 1 || diag.PacketsIn != 1 || diag.PacketsOut != 1 {
+		t.Fatalf("relay diag = %+v, want one live mapping and one packet each way", diag)
+	}
+	if diag.IdleTimeoutSeconds <= 0 {
+		t.Fatalf("relay diag reports no idle timeout: %+v", diag)
+	}
+}
+
+// The relay must publish the endpoint the kernel actually chose for the hop: that is
+// the only address the exit can attest. On a multi-homed node it is NOT the node's
+// configured connect_ip — the first real G1B run failed precisely because the panel
+// told the exit the ingress-network address while the hop left from the egress one.
+func TestDatagramRelayPublishesItsHopEndpoint(t *testing.T) {
+	egress := startFakeEgress(t)
+	port := freeUDPPort(t)
+	relay := startRelay(t, relayTestConfig(t, port, egress.addr()), DatagramRelayOptions{})
+
+	diag, ok := relay.ProtocolDiagnostics()
+	if !ok {
+		t.Fatal("the relay reports no diagnostics")
+	}
+	if diag.HopLocalAddr == "" {
+		t.Fatal("the relay does not publish its hop endpoint: the exit would have nothing to attest")
+	}
+	if !strings.Contains(diag.HopLocalAddr, ":") {
+		t.Fatalf("hop endpoint %q is not an ip:port endpoint", diag.HopLocalAddr)
+	}
+	// And it must agree with the address a client datagram actually leaves from.
+	client := datagramClient(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if _, err := client.Write([]byte("hello")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	got := egress.next(t, 2*time.Second)
+	if want := got.from.String(); want != diag.HopLocalAddr {
+		t.Fatalf("published hop endpoint %q != the source the exit sees (%q)", diag.HopLocalAddr, want)
 	}
 }

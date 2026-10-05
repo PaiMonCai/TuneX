@@ -341,3 +341,35 @@ func TestBuildUDPDatagramRoutesByRole(t *testing.T) {
 		t.Fatal("Validate accepted udp RELAY without next_hop")
 	}
 }
+
+// The panel will hand this exit the ingress's LEARNED hop endpoint (`ip:port`, as the
+// ingress actually sends from). Attestation must therefore accept the endpoint form and
+// pin the ADDRESS only: the port is ephemeral and changes when the ingress restarts, so
+// pinning it would turn a normal restart into a permanent outage — while the property we
+// need ("only the paired ingress may feed this exit") is a property of the address.
+func TestDatagramEgressAttestsAnEndpointByItsAddress(t *testing.T) {
+	targetAddr, stopTarget := udpEchoTarget(t, "T")
+	defer stopTarget()
+	sel := staticSelector{t: Target{Host: "127.0.0.1", Port: targetPortOf(t, targetAddr)}}
+
+	// Accepted: the paired address, given as ip:port, with a port the client is NOT using.
+	pairedPort := freeUDPPort(t)
+	startEgress(t, egressTestConfig(t, pairedPort, "127.0.0.1:65000"), sel, DatagramEgressOptions{})
+	pairedClient := hopClient(t, pairedPort)
+	if _, payload, ok := sendHop(t, pairedClient, 1, 1, []byte("endpoint-form"), 2*time.Second); !ok {
+		t.Fatal("an ip:port hop_peer rejected the paired ingress: the port must not be pinned")
+	} else if string(payload) != "T:endpoint-form" {
+		t.Fatalf("payload = %q", payload)
+	}
+
+	// Refused: a different address, same endpoint form.
+	strangerPort := freeUDPPort(t)
+	stranger := startEgress(t, egressTestConfig(t, strangerPort, "10.255.255.1:65000"), sel, DatagramEgressOptions{})
+	strangerClient := hopClient(t, strangerPort)
+	if _, _, ok := sendHop(t, strangerClient, 1, 1, []byte("nope"), 300*time.Millisecond); ok {
+		t.Fatal("an unpaired address was accepted")
+	}
+	if stats := stranger.Stats(); stats.DropsUnknownSource != 1 || stats.MappingsCreated != 0 {
+		t.Fatalf("unpaired-source facts = %+v, want exactly one unknown-source drop and no mapping", stats)
+	}
+}

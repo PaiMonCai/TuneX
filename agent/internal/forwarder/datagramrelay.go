@@ -69,6 +69,12 @@ type DatagramRelay struct {
 
 	// hopAddr is the resolved address of the paired egress.
 	hopAddr *net.UDPAddr
+	// hopLocalAddr is THIS node's endpoint on the hop (`ip:port`), recorded once the
+	// hop socket exists. It is published through ProtocolDiagnostics so the panel can
+	// hand it to the exit: the exit has to attest this ingress by address, and the
+	// address the kernel actually uses is the only one that is true — see the field's
+	// comment in diagnostics.go for the two measurements that settled it.
+	hopLocalAddr string
 
 	mu       sync.Mutex
 	listener *net.UDPConn
@@ -205,6 +211,12 @@ func (r *DatagramRelay) Start() error {
 	}
 	r.listener = listener
 	r.hop = hop
+	// Record the endpoint the kernel actually chose for the hop. This is the fact the
+	// panel needs to tell the exit who may feed it; on a multi-homed node it is NOT the
+	// node's configured `connect_ip`, which is exactly how the first real run failed.
+	if local := hop.LocalAddr(); local != nil {
+		r.hopLocalAddr = local.String()
+	}
 	r.running = true
 	r.mu.Unlock()
 
@@ -532,3 +544,32 @@ func (r *DatagramRelay) LiveMappings() int {
 
 // compiled guard: the relay must satisfy the datagram runtime contract.
 var _ DatagramRuntime = (*DatagramRelay)(nil)
+
+// compiled guard (V5-WP5-A3): the manager collects per-tunnel facts by asking for
+// this interface, so a runtime that does not implement it reports NOTHING — the
+// tunnel looks healthy and invisible at the same time. The DIRECT runtime has had
+// this assertion since B1; the relay half gets it with its facts.
+var _ Diagnostician = (*DatagramRelay)(nil)
+
+// ProtocolDiagnostics reports this tunnel's frozen datagram facts (§6.1).
+//
+// The names are a WIRE contract (V5-G1B reads them, the panel stores the object
+// as-is), so they are not free to be renamed — and there is deliberately no
+// connection count: a datagram front counts mappings.
+func (r *DatagramRelay) ProtocolDiagnostics() (ProtocolDiagnostics, bool) {
+	r.mu.Lock()
+	hopLocal := r.hopLocalAddr
+	r.mu.Unlock()
+	return ProtocolDiagnostics{
+		Protocol:           string(ProtocolUDP),
+		Mappings:           int64(r.LiveMappings()),
+		MappingsExpired:    r.mappingsExpired.Load(),
+		PacketsIn:          r.packetsIn.Load(),
+		PacketsOut:         r.packetsOut.Load(),
+		BytesIn:            r.bytesIn.Load(),
+		BytesOut:           r.bytesOut.Load(),
+		Drops:              r.drops.Load(),
+		IdleTimeoutSeconds: int64(r.idleTimeout / time.Second),
+		HopLocalAddr:       hopLocal,
+	}, true
+}
