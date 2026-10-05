@@ -1,12 +1,12 @@
 /**
- * V5-WP13.5B —— Route Profile HTTP 面（`DEVELOPMENT.md` §9.4.2–§9.4.6）。
+ * .5B —— Route Profile HTTP 面（`DEVELOPMENT.md` §9.4.2–§9.4.6）。
  *
  * 挂载：`app.route("/api/route-profiles", routeProfilesRoutes)`（app.ts 一行）。
  * 契约（FROZEN）：`docs/v5-wp13-5b-route-profile-contract.md`。
  *
  * ── 为什么不是 /api/admin/* ──
  * Admin Console 与 User Console 走**同一套后端资源与 RBAC**，前端只做 UX 分层
- * （§9.4.1：前端 guard 只负责 UX，backend RBAC / workspace scope 才是安全真相）。
+ * Frontend guards are UX only; backend RBAC/workspace scope remains authoritative.
  * 因此这里用 workspace 域角色（`resolveWorkspaceAccess` 的 `node` 资源族，与
  * `routes/node-groups.ts` 同口径），而不是新增一个 admin 权限 key —— 多一个 key
  * 就多一处「谁该看到什么」的分叉。
@@ -67,7 +67,7 @@ function auditCtx(c: Ctx) {
   });
 }
 
-/** 统一出口：成功 `{data}`；失败带 code / error_layer / retryable / next_action（§13）。 */
+/** Unified result shape: success {data}; failure keeps code/layer/retryability/next action. */
 function send<T>(c: Ctx, result: RouteProfileResult<T>, successStatus: 200 | 201 = 200) {
   if (!result.ok) {
     const e: RouteProfileServiceError = result;
