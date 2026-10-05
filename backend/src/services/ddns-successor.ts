@@ -228,7 +228,7 @@ export async function defaultDdnsSuccessor(tunnelId: number): Promise<{ outcome:
 /**
  * 后继的生产依赖。
  *
- * `desiredValues` **复用 WP17.1 那份候选判定**（`candidateRejection`）来算"哪些入口算可用"：
+ * `desiredValues` **复用 WP17.1 那份候选判定**（`candidateRejection`）来算"哪些入口合格"：
  * DNS 值集与故障转移候选必须是**同一批机器**，否则会出现"迁移把归属搬到 A，而 DNS 里写的是
  * B"——两个各自都"算对了"的判定给出的不同答案，是最难查的一类。
  */
@@ -293,8 +293,17 @@ export function productionSuccessorDeps(db: DdnsSuccessorDeps["db"]): DdnsSucces
         credential_revoked: boolean;
         connect_ip: string | null;
       }>;
+      // **这里刻意不要求"此刻在线"**（与故障转移的候选判定不同）：
+      //
+      //   · 多入口记录集的语义是"客户端**可以试**哪些地址"，而一个入口临时掉线时，记录集
+      //     本来就不该动 —— 客户端靠集合里的另一个地址自愈，这正是多入口形态的全部意义
+      //     （DoD 1：停掉一个入口 ⇒ **零 DNS 写**）。按在线过滤会让每次掉线都写一次 DNS，
+      //     把"多入口免写"变成"每次抖动都写"，也把 provider 的限流风险拉满。
+      //   · 故障转移问的是另一个问题："哪台机器**现在**能接管"。它要 `requireOnline`。
+      //
+      // 两个问题共用同一份判定函数，但**答案可以不同** —— 差异必须是有意识的，写在这里。
       const values = rows
-        .filter((n) => candidateRejection({ ...n, node_id: n.id }, "ingress", { requireOnline: true, now }) === null)
+        .filter((n) => candidateRejection({ ...n, node_id: n.id }, "ingress", { now }) === null)
         .map((n) => (n.connect_ip ?? "").trim())
         .filter((ip) => ip !== "");
       return values.length === 0
