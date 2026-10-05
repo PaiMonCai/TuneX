@@ -105,7 +105,7 @@ adminRoutes.get("/node", async (c) => {
 });
 
 /* ------------------------------------------------------------------ *
- * node credential — /api/admin/node/:id/credential*（WP7）
+ * node credential — /api/admin/node/:id/credential*（）
  *
  * 路径已落在 `nodes` 资源的 apiPrefixes（`/admin/node`）上，因此
  * adminPermissionGuard 自动要求 nodes 资源的 write 权限；
