@@ -1,5 +1,5 @@
 /**
- * V4 Forward product service.
+ * Forward product service.
  *
  * Product boundary:
  *   Forward = user-facing business object
@@ -21,7 +21,7 @@ import { checkTunnelCreation } from "./capability-policy.ts";
 import { getOrchestrator } from "./relay-wiring.ts";
 import { reapplyDirectTunnel, reapplyRelayTunnel } from "./scheduler.ts";
 import { registerRollout } from "./forward-rollout-exec.ts";
-// V5.5 WP15：远端出口腿的声明校验与释放。声明校验只有这一个实现（路由层也复用它），
+//：远端出口腿的声明校验与释放。声明校验只有这一个实现（路由层也复用它），
 // 所以"能保存但跑不起来"不可能出现两次不同的结论。
 import {
   releaseStaleFederatedEgressForTunnel,
@@ -79,10 +79,10 @@ export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume"
 export interface ForwardCreateInput {
   name: string;
   mode: ForwardMode;
-  /** V5-WP0: omitted by V4 clients => tcp; explicit unknown values fail closed. */
+  /** : omitted by V4 clients => tcp; explicit unknown values fail closed. */
   protocol?: ForwardProtocol;
   /**
-   * V5-WP5-A1: node-local certificate/key paths for a tls front. Paths, never
+   * : node-local certificate/key paths for a tls front. Paths, never
    * key material (§6.1). Ignored for every other protocol — the panel does not
    * silently turn a stray path into a TLS front.
    */
@@ -99,7 +99,7 @@ export interface ForwardCreateInput {
   target_host: string;
   target_port: number;
   /**
-   * V5.5 WP15：把这条 Forward 的**出口腿**委托给某个已信任的 peer panel
+   *：把这条 Forward 的**出口腿**委托给某个已信任的 peer panel
    * （存 peer_panel_id；`undefined`/`null` = 出口在本机，即今天的行为）。
    *
    * 声明了它就**不能**再给 `egress_node_id`：出口腿只能在一侧（见
@@ -118,7 +118,7 @@ export interface ForwardListInput {
 
 export interface ForwardPatchInput {
   name?: string;
-  /** V4-WP1 §13.3.1：创建后可编辑的全部业务字段。 */
+  /**  §13.3.1：创建后可编辑的全部业务字段。 */
   mode?: ForwardMode;
   ingress_node_id?: number;
   egress_node_id?: number | null;
@@ -128,7 +128,7 @@ export interface ForwardPatchInput {
   target_host?: string | null;
   target_port?: number | null;
   /**
-   * V5-WP5-A1：tls 前端的证书/私钥路径可改，规则与创建时完全相同（只有 tls 能带，
+   *：tls 前端的证书/私钥路径可改，规则与创建时完全相同（只有 tls 能带，
    * 且必须成对）—— 由 `tlsPathsForProtocol` 统一判定，不在这里复制一份规则。
    *
    * 协议本身仍然不可改：`protocol` 不在 patch 白名单里。把一个 tcp 转发改成 tls
@@ -138,10 +138,10 @@ export interface ForwardPatchInput {
   tls_cert_path?: string | null;
   tls_key_path?: string | null;
   /**
-   * V5.5 WP15：出口腿的承载方（`null` = 改回本机出口）。与 `egress_node_id` 互斥。
+   *：出口腿的承载方（`null` = 改回本机出口）。与 `egress_node_id` 互斥。
    */
   federated_egress_peer?: string | null;
-  /** V4-WP1 §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
+  /**  §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
   expected_revision?: number | null;
 }
 
@@ -170,11 +170,11 @@ async function reloadOrMinimal(
 }
 
 /**
- * V4-WP5 §13.4.2：节点准入判定的**唯一**转发出口。
+ *  §13.4.2：节点准入判定的**唯一**转发出口。
  *
  * 创建 Forward / 迁移到新节点前必须过这里。判定逻辑一行都不在本文件——
  * lifecycle 与 connection 的口径全在 `services/node-lifecycle.ts` 的
- * `nodeAdmission`（WP1/WP3/WP8 共用），两边各自判一遍必然漂移。
+ * `nodeAdmission`（// 共用），两边各自判一遍必然漂移。
  *
  * 返回 null = 放行；否则是 { code, message } 形状的阻断（`data` 里可选附带
  * 具体 condition，供 §13.5 的可区分错误码）。
@@ -209,10 +209,10 @@ const nodeSelect = {
   role: true,
   node_group_id: true,
   lb_strategy: true,
-  // V4-WP1：自动分配端口前必须确认节点配置了区间（§7.6「未配置区间拒绝分配」）。
+  //：自动分配端口前必须确认节点配置了区间（§7.6「未配置区间拒绝分配」）。
   port_range_min: true,
   port_range_max: true,
-  // V4-WP5：§13.4.2 准入判定需要 lifecycle（desired 管理态）。它和下面 role
+  //：§13.4.2 准入判定需要 lifecycle（desired 管理态）。它和下面 role
   // 的能力判定是两个正交维度：role=ingress 的节点也可能正处于 maintenance。
   lifecycle: true,
   // §13.4.1 Connection 层事实：准入谓词要求「已安装且未撤销」。
@@ -282,7 +282,7 @@ export function forwardView(t: any) {
     name: t.name,
     protocol,
     protocol_supported: normalizeForwardProtocol(protocol) !== null,
-    // V5-WP5-A1: the paths are part of a tls Forward's configuration, so the view
+    // : the paths are part of a tls Forward's configuration, so the view
     // carries them. Without them the detail page can say "TLS" but never which
     // certificate, and an operator cannot verify a path without reading the DB —
     // the projection is the API, and an unexposed fact is an unavailable one.
@@ -306,7 +306,7 @@ export function forwardView(t: any) {
     apply_status: t.apply_status,
     config_revision: t.config_revision,
     applied_revision: t.applied_revision,
-    // V4-WP1：desired revision 指针 + 最新 revision 号。前端保存时把它们作为
+    //：desired revision 指针 + 最新 revision 号。前端保存时把它们作为
     // expected_revision 回传（§13.3.3 乐观并发）。
     desired_revision_id: t.desired_revision_id ?? null,
     latest_revision: t.config_revision ?? 0,
@@ -357,7 +357,7 @@ async function prepareRelayRevisionResources(
   if (candidate.mode !== "relay") {
     return { poolId: null, egressPort: null, targets: null };
   }
-  // V5.5 WP15：远端出口腿没有本机 EgressPool —— 池表达的是"某台**本机**出口节点
+  //：远端出口腿没有本机 EgressPool —— 池表达的是"某台**本机**出口节点
   // 拨号去哪里"，而那一跳不在这台面板上（契约 §1/§7：不复制远端资源）。
   // 目标仍要作为本版 revision 的运行态事实落到 snapshot（rollout 的 apply 会把它
   // 交给 host），所以这里直接返回目标集合并跳过本地池的增删。
@@ -452,7 +452,7 @@ async function prepareRelayRevisionResources(
 }
 
 /**
- * V4-WP9 §13.6：列表 where 的唯一构造点。
+ *  §13.6：列表 where 的唯一构造点。
  *
  * `listForwards`（兼容裸数组）与 `listForwardsPage`（产品分页端点）共用它，
  * 否则「筛选口径」会出现两份实现——那是 §13.3.3 明确要消灭的漂移形态。
@@ -514,7 +514,7 @@ export async function listForwards(workspaceId: number, input: ForwardListInput 
 }
 
 /**
- * V4-WP9 §13.6：服务端分页 / 排序的 Forward 列表。
+ *  §13.6：服务端分页 / 排序的 Forward 列表。
  *
  * `orderBy` 由 `forward-list-query.ts` 的白名单派生（含 `id desc` 稳定兜底），
  * 因此路由层不拼列名、前端 mock 与真实后端共用同一套键表。
@@ -661,7 +661,7 @@ export async function createForward(
   if (protocol === null) {
     return error(400, "invalid_input", "当前版本不支持该转发协议");
   }
-  // V5-WP5-A1: a tls front needs both paths, and only a tls front accepts them.
+  // : a tls front needs both paths, and only a tls front accepts them.
   // The panel cannot check that the files exist (they live on the node); what it
   // must not do is dispatch "serve TLS" without a certificate, or quietly attach
   // paths to a protocol that has no TLS front.
@@ -684,7 +684,7 @@ export async function createForward(
   }
 
   const egressId = input.egress_node_id ?? null;
-  // V5.5 WP15：出口腿"在哪一侧"是这次创建的一部分。声明了 peer 时本机没有出口
+  //：出口腿"在哪一侧"是这次创建的一部分。声明了 peer 时本机没有出口
   // 节点，这不是"缺出口"，而是"出口在另一侧"（互斥判定在 validateForwardCandidate）。
   const federatedPeer = normalizeFederatedEgressPeer(input.federated_egress_peer);
   if (federatedPeer !== null && input.mode !== "relay") {
@@ -853,7 +853,7 @@ export async function createForward(
           tunnel_mode: input.mode,
           ingress_node_id: ingress.id,
           egress_node_id: egress?.id ?? null,
-          // V5.5 WP15：声明列与 Forward 行同时落库（同一事务）。远端那一跳的节点/
+          //：声明列与 Forward 行同时落库（同一事务）。远端那一跳的节点/
           // 端口不在这里、也不在任何本地资源表里 —— 它只以 federation_placement 的
           // 不透明引用存在（契约 §1/§7）。
           ...(federatedPeer === null ? {} : { federated_egress_peer: federatedPeer }),
@@ -975,7 +975,7 @@ export async function patchForward(
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
 
-  // ── V4-WP1 §13.3.3：校验逻辑只有一个实现 ──
+  // ──  §13.3.3：校验逻辑只有一个实现 ──
   // patchForward 与 previewForwardUpdate 都走 resolveForwardCandidate() → 同一个
   // 合并 + 同一个校验 + 同一个影响面计算；两者只差「是否落库」。
   const resolved = await resolveForwardCandidate(id, workspaceId, patch, actorId);
@@ -983,7 +983,7 @@ export async function patchForward(
 
   const { base, candidate, ctx, metadataOnly, desiredStatus } = resolved.data;
 
-  // V5.5 WP15：声明"出口腿放到 peer X"必须当场成立（存在 + trusted + 联邦已开启），
+  //：声明"出口腿放到 peer X"必须当场成立（存在 + trusted + 联邦已开启），
   // 否则会保存出一条每次都失败在远端的 Forward。只在声明**非空**时查库：
   // 未声明（绝大多数路径）一次查询都不多，行为逐字节不变。
   const candidatePeer = normalizeFederatedEgressPeer(candidate.federated_egress_peer);
@@ -1064,7 +1064,7 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
-          // V5.5 WP15：声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
+          //：声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
           // 内写 snapshot 的那一列取值完全相同，来源都是候选）。
           ...(candidate.federated_egress_peer === undefined
             ? {}
@@ -1072,7 +1072,7 @@ export async function patchForward(
           // V5.4：中间跳与入出口同类 —— patch 里给了就落库，没给就沿用候选里的当前值
           // （候选由 `mergeForwardCandidate` 合并，因此"没提交"永远是"不变"）。
           middle_node_id: candidate.middle_node_id ?? null,
-          // V5-WP5-A1: the tls paths are part of the desired configuration, so a
+          // : the tls paths are part of the desired configuration, so a
           // patch that changes them must persist them — and a patch that leaves
           // them out must not silently drop them (the candidate carries the
           // current values forward). This is the same rule the protocol follows,
@@ -1101,7 +1101,7 @@ export async function patchForward(
   // Missing Binding is deliberately left to rollout PREPARE/ensure_binding.
   // Pre-creating it here would erase the preview/plan impact and split semantics.
 
-  // ── WP3 §13.3.2/§13.3.4：影响面 = rollout 计划的唯一输入 ──
+  // ──  §13.3.2/§13.3.4：影响面 = rollout 计划的唯一输入 ──
   // 与 previewForwardUpdate（下面同一 resolveForwardCandidate 的形状）逐字同一
   // 组入参，§13.3.3「preview 与 update 同源」：planRollout 不重算差异。
   const resolvedListenPort = candidate.listen_port ?? current.listen_port ?? null;
@@ -1118,16 +1118,16 @@ export async function patchForward(
     bindingRequired: candidate.mode === "relay" && ctx.bindingExists === false,
   });
 
-  // ── WP3 接入点：落库后走五阶段 rollout，替换 WP1 的"同步 reapply"出口 ──
+  // ──  接入点：落库后走五阶段 rollout，替换  的"同步 reapply"出口 ──
   //
-  // 为什么替换而不是并存（报告 §5 C6 + §1.1「WP1 的收敛出口必须替换」）：
+  // 为什么替换而不是并存（报告 §5 C6 + §1.1「 的收敛出口必须替换」）：
   // 旧的 `reapplyDirectTunnel/reapplyRelayTunnel` 是**创建路径**的编排器——
   // 它自己 bind_nodes、自己 allocateTunnelPort、自己 config_revision = 读回 + 1、
   // 失败时 desired_status=inactive，语义上是"重推一遍创建"，不是"按预先生成的
   // revision 滚动"。两条路径并存会让"改端口"有时走五阶段有时走创建路径，
   // 而后者会重新选节点/端口——正是 §13.3.5 要消灭的那类分叉。
   //
-  // 契约不变的部分（WP1 冻结，WP4 依赖）：
+  // 契约不变的部分（ 冻结， 依赖）：
   //   · 成功仍返回 200 + forwardView；
   //   · 失败仍返回 502 `apply_failed` + `apply_error_code` + 当前行快照；
   //   · `applied_revision` 不动、revision 历史不删（§4.1 铁律）。
@@ -1149,7 +1149,7 @@ export async function patchForward(
 
   // orchestrator 未接线（relay-wiring 失败）⇒ 跳过本轮执行，不回错误。
   // 保存本身已成功（snapshot + revision 已落库，§4.1 铁律不破），worker 下一轮
-  // `resumeRollouts()` 会补上——与 WP1「orchestrator 缺失就跳过 reapply」同口径。
+  // `resumeRollouts()` 会补上——与 「orchestrator 缺失就跳过 reapply」同口径。
   // 注意：此分支**不会**创建 rollout 行，因此不需要回 502/409。
   if (runtime && runtime.status === "conflict") {
     // 同期已有未完成 rollout（§13.3.5 抢占闸门）⇒ 409，前端刷新后重试。
@@ -1159,7 +1159,7 @@ export async function patchForward(
     });
   }
   if (runtime && runtime.status === "blocked") {
-    // ── V4-WP5 §13.4.2 + §13.3.5 失败规则一 ──
+    // ──  §13.4.2 + §13.3.5 失败规则一 ──
     // rollout 的 VALIDATE 拒绝（节点此刻 maintenance / retiring / disabled /
     // 未安装）。**desired 与 revision 已可靠落库**，只是不启 runtime——这正是
     // §13.3.6「用户仍可保存 desired config，节点退出维护后再由 Reconciler 应用」。
@@ -1185,7 +1185,7 @@ export async function patchForward(
 }
 
 /**
- * V4-WP1 preview：**不写库**，只回答「这次编辑会发生什么」。
+ *  preview：**不写库**，只回答「这次编辑会发生什么」。
  *
  * 与 {@link patchForward} 共用 {@link resolveForwardCandidate} 与
  * {@link computeForwardImpact}，因此 preview 放行 ⇔ update 接受（§13.3.3）。
@@ -1379,7 +1379,7 @@ async function resolveForwardCandidate(
     }
   }
 
-  // ── V4-WP5 §13.4.2：把 Forward（迁移）到新节点前先过准入 ──
+  // ──  §13.4.2：把 Forward（迁移）到新节点前先过准入 ──
   //
   // 只判「新选的节点」，不判「当前已在跑的节点」：maintenance 的语义是
   // 「不接受新业务 + 存量 runtime 尽量保持」，用户**可以**在维护期间保存
@@ -1563,7 +1563,7 @@ export async function runForwardAction(
 }
 
 /**
- * V4-WP9 §13.6：批量 retry / suspend / resume。
+ *  §13.6：批量 retry / suspend / resume。
  *
  * 形态约束（与 `forward-batch.ts` 的决策文档一致）：
  *   · **顺序执行**，不并发：每个 action 都可能触发 rollout（下发 + 租约），
@@ -1652,7 +1652,7 @@ export async function deleteForward(
       .catch(() => {});
   }
 
-  // ── V5.5 WP15：删除 Forward 必须**释放远端腿** ──
+  // ──：删除 Forward 必须**释放远端腿** ──
   //
   // 本地 runtime 由 `runTunnelActionApi(delete)` 撤掉，但远端那条腿不在本机：
   // 它不会随 tunnel 行一起消失（`federation_placement.tunnel_id` 刻意没有外键，
