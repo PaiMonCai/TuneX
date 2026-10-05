@@ -16,7 +16,8 @@
  * 事实真相**（这是契约 D1「观测不得成为第二份真相」对通知的同一要求）。
  */
 import type { AttentionItem } from "./attention.ts";
-import type { NotificationFactSeed } from "./notification-facts.ts";
+import { buildNotificationFact, workspaceNotificationScope, type NotificationFactSeed } from "./notification-facts.ts";
+import type { DeliverableNotification, NotificationChannel } from "./notification-delivery.ts";
 
 /**
  * E 类的理由码（取自既有词表 `AttentionReasonCode`，不是新造的字符串）。
@@ -77,4 +78,89 @@ export function selectForwardDenialFacts(input: {
   }
 
   return { seeds, skipped };
+}
+
+/* ================================================================== */
+/* 第二步：编排（可注入、可测）                                          */
+/* ================================================================== */
+
+/** 一条 E 类事实在**来源表**里的两个必要字段（都在隧道行上，不需要新查询面）。 */
+export interface ForwardDenialRow {
+  /** 来源时刻：`tunnel.updated_at`（**必须**来自这里，理由见本文件顶部）。 */
+  readonly updated_at: Date;
+  /** 隧道所属 workspace —— 事实的 scope。 */
+  readonly workspace_id: number;
+}
+
+export interface DiscoveryBacklogSource {
+  /** 载入本拍的候选条目（生产实现复用 `collectAttention()`）。 */
+  readonly items: readonly AttentionItem[];
+  /** 按转发 id 取来源行；缺行 = 该转发在扫描后已消失（不猜、跳过）。 */
+  readonly rowOf: (forwardId: number) => ForwardDenialRow | null;
+}
+
+export interface DeliveryBacklogDeps {
+  readonly load: () => Promise<DiscoveryBacklogSource>;
+  /**
+   * 投递核心。**注入**而不是 import：本模块不得自带第二条投递路径
+   * （发信/账本/重试/静默期/免打扰全部属于 `deliverNotificationFacts`）。
+   */
+  readonly deliver: (
+    facts: readonly DeliverableNotification[],
+    channels: readonly NotificationChannel[],
+  ) => Promise<unknown>;
+  /** 本安装真正打开的渠道。缺省由调用方给出 —— 一个都没打开时**不投递**、零账本行。 */
+  readonly channels: () => readonly NotificationChannel[];
+}
+
+export interface ForwardDenialRunSummary {
+  readonly considered: number;
+  readonly built: number;
+  /** 取了来源行但被派生层拒绝（scope/字段不合法）—— 同样要可见，不能静默丢。 */
+  readonly rejected: number;
+  readonly skipped: number;
+  /** 是否真的调用了投递（一个渠道都没打开时为 false，且此时不应产生任何账本行）。 */
+  readonly delivered: boolean;
+}
+
+/**
+ * 本拍的事实投递。
+ *
+ * 幂等由**投递层**保证（账本幂等键 + 静默期，键**带渠道**）—— 所以本函数可以每拍被调用，
+ * 而"要不要说话"这件事只有一份真相。
+ */
+export async function runForwardDenialNotifications(
+  deps: DeliveryBacklogDeps,
+): Promise<ForwardDenialRunSummary> {
+  const source = await deps.load();
+  const { seeds, skipped } = selectForwardDenialFacts({
+    items: source.items,
+    occurredAtOf: (id) => source.rowOf(id)?.updated_at ?? null,
+  });
+
+  const facts: DeliverableNotification[] = [];
+  let rejected = 0;
+  for (const seed of seeds) {
+    // 注意这里**没有**"行不见了就跳过"的分支：`selectForwardDenialFacts` 已经用同一个
+    // `rowOf` 判过并计入 `skipped`，再判一次就是同一判据的第二份实现（本分支上我写过这段，
+    // 被自己的测试证明不可达 —— 那正是"同一个判断写两遍"的味道，删掉）。
+    // 所以 `row` 在这一步一定存在；`rejected` 只统计**派生层**的拒绝。
+    const row = source.rowOf(seed.item.id)!;
+    const built = buildNotificationFact(workspaceNotificationScope(row.workspace_id), seed);
+    if (!built.ok) {
+      rejected += 1;
+      continue;
+    }
+    facts.push(built.fact);
+  }
+
+  const channels = deps.channels();
+  if (facts.length === 0 || channels.length === 0) {
+    // 没有事实、或**一个渠道都没打开**：不投递、不产生账本行（避免用 `not_configured`
+    // 把"失败可见"稀释成噪音）。
+    return { considered: source.items.length, built: 0, rejected, skipped: skipped.length, delivered: false };
+  }
+
+  await deps.deliver(facts, channels);
+  return { considered: source.items.length, built: facts.length, rejected, skipped: skipped.length, delivered: true };
 }

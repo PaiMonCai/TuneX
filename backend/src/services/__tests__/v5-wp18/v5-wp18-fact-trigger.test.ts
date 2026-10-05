@@ -10,7 +10,12 @@
  * ④ 细码取既有的 `apply_error_code`，不新造字段。
  */
 import { describe, expect, test } from "bun:test";
-import { FORWARD_DENIAL_REASON, selectForwardDenialFacts } from "../../notification-facts-trigger.ts";
+import {
+  FORWARD_DENIAL_REASON,
+  runForwardDenialNotifications,
+  selectForwardDenialFacts,
+} from "../../notification-facts-trigger.ts";
+import type { DeliverableNotification, NotificationChannel } from "../../notification-delivery.ts";
 import type { AttentionItem } from "../../attention.ts";
 
 const item = (over: Partial<AttentionItem> = {}): AttentionItem => ({
@@ -71,5 +76,88 @@ describe("V5-WP18 触发器：只选 E 类事实", () => {
   test("同一 id 重复出现只产生一条事实（重复的事实就是重复的通知）", () => {
     const { seeds } = selectForwardDenialFacts({ items: [item(), item()], occurredAtOf: () => at });
     expect(seeds).toHaveLength(1);
+  });
+});
+
+/* ================================================================== */
+/* 第二步：编排 —— 投递只走既有核心、渠道显式、失败不稀释              */
+/* ================================================================== */
+
+describe("V5-WP18 触发器：编排", () => {
+  const row = (over: Partial<{ updated_at: Date; workspace_id: number }> = {}) => ({
+    updated_at: new Date("2026-10-05T02:00:00.000Z"),
+    workspace_id: 7,
+    ...over,
+  });
+  const channel = { kind: "email" } as unknown as NotificationChannel;
+
+  const deps = (
+    over: Partial<{
+      items: AttentionItem[];
+      rows: Map<number, ReturnType<typeof row>>;
+      channels: NotificationChannel[];
+      delivered: Array<{ facts: readonly DeliverableNotification[]; channels: readonly NotificationChannel[] }>;
+    }> = {},
+  ) => {
+    const delivered = over.delivered ?? [];
+    return {
+      deps: {
+        load: async () => ({
+          items: over.items ?? [item()],
+          rowOf: (id: number) => (over.rows ?? new Map([[42, row()]])).get(id) ?? null,
+        }),
+        deliver: async (facts: readonly DeliverableNotification[], channels: readonly NotificationChannel[]) => {
+          delivered.push({ facts, channels });
+          return [];
+        },
+        channels: () => over.channels ?? [channel],
+      },
+      delivered,
+    };
+  };
+
+  test("有事实且有渠道 ⇒ 调用投递核心一次，fact 的 scope 是**该隧道所属工作空间**", async () => {
+    const { deps: d, delivered } = deps();
+    const summary = await runForwardDenialNotifications(d);
+    expect(summary).toMatchObject({ built: 1, rejected: 0, skipped: 0, delivered: true });
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.channels).toEqual([channel]);
+    expect(delivered[0]!.facts[0]!.scope).toMatchObject({ kind: "workspace", workspace_id: 7 });
+    // 注意：**派生出来的 fact 里 `occurred_at` 是 ISO 字符串**（`NotificationFactSeed` 的类型
+    // 声明是 `Date`，实际值不是 —— 类型与值不一致，下一个调 `.getTime()` 的人会炸；已上报给
+    // 通知模块的作者）。这里按**实际值**断言，不按声明的类型断言。
+    expect(String(delivered[0]!.facts[0]!.occurred_at)).toBe(row().updated_at.toISOString());
+  });
+
+  test("**一个渠道都没打开 ⇒ 不投递**（避免用 not_configured 把失败可见稀释成噪音）", async () => {
+    const { deps: d, delivered } = deps({ channels: [] });
+    const summary = await runForwardDenialNotifications(d);
+    expect(summary.delivered).toBe(false);
+    expect(summary.built).toBe(0);
+    expect(delivered).toHaveLength(0);
+  });
+
+  test("没有 E 类事实 ⇒ 不投递", async () => {
+    const { deps: d, delivered } = deps({ items: [item({ reason_code: "forward_pending_apply" })] });
+    const summary = await runForwardDenialNotifications(d);
+    expect(summary).toMatchObject({ built: 0, delivered: false });
+    expect(delivered).toHaveLength(0);
+  });
+
+  test("来源行消失 ⇒ 计入 skipped（选择层已用同一判据跳过）且不投递", async () => {
+    const { deps: d, delivered } = deps({ rows: new Map() });
+    const summary = await runForwardDenialNotifications(d);
+    // 编排层**不再**重复判一次"行是否存在"：同一个判断写两遍就有两份真相。
+    expect(summary).toMatchObject({ built: 0, rejected: 0, skipped: 1, delivered: false });
+    expect(delivered).toHaveLength(0);
+  });
+
+  test("来源时刻缺失 ⇒ 计入 skipped（原因由选择层给出）", async () => {
+    const { deps: d } = deps({ rows: new Map([[42, row({ updated_at: null as unknown as Date })]]) });
+    const summary = await runForwardDenialNotifications(d);
+    // `updated_at` 为 null 时选择层按"取不到来源时刻"跳过 —— 这里断言它**不会**变成一条用
+    // 扫描时刻的通知（那正是 DoD3 的反例）。
+    expect(summary.built).toBe(0);
+    expect(summary.delivered).toBe(false);
   });
 });
