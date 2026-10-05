@@ -1,4 +1,4 @@
-/** WP10 runtime-use gate. No RBAC or creation-count semantics live here. */
+/**  runtime-use gate. No RBAC or creation-count semantics live here. */
 import { checkTunnelUse, type EffectivePolicy } from "./capability-policy.ts";
 import { DEFAULT_FORWARD_PROTOCOL } from "./forward-contract.ts";
 
@@ -7,7 +7,7 @@ export interface RuntimeUseResource {
   in_node_group_id: number;
   out_node_group_id: number | null;
   /**
-   * The **canonical** protocol of the Forward (V5-WP0 `forward_protocol`, or the
+   * The **canonical** protocol of the Forward ( `forward_protocol`, or the
    * legacy column read as a fact through `persistedForwardProtocol`).
    *
    * It used to be called `tunnel_type` and callers fed it the legacy COLUMN
