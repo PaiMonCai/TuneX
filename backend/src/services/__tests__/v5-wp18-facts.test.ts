@@ -187,6 +187,32 @@ describe("B. 幂等键（F4.2 / R2）", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* B'. 类型与值一致：输出侧 string / 输入侧 Date（Lead 2026-10-05 反馈） */
+/* ------------------------------------------------------------------ */
+
+describe("B'. `occurred_at` 的两侧类型：输出**字符串**、输入 **Date**（同名不同型，钉死）", () => {
+  test("事实侧是 ISO 字符串，不是 Date（写 `.getTime()` 会 TypeError）", () => {
+    const fact = factsOf([seed()]).facts[0]!;
+    expect(typeof fact.occurred_at).toBe("string");
+    expect(typeof fact.window_start).toBe("string");
+    expect(fact.occurred_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // 字符串能被边界层安全地转回来（这正是调用方该用的方式）。
+    expect(new Date(fact.occurred_at).getTime()).toBe(OCCURRED.getTime());
+    // 断言 `Date` 方法在这里**不存在**：写错时立刻红，而不是等到运行期崩。
+    expect((fact.occurred_at as unknown as Date).getTime).toBeUndefined();
+  });
+
+  test("种子侧必须是 Date：传字符串 ⇒ `invalid_occurred_at`（fail-closed，不猜）", () => {
+    const bad = buildNotificationFact(workspaceNotificationScope(7), {
+      item: item(),
+      // 故意传"看起来一样"的 ISO 串：这是最容易犯的错（两侧同名）。
+      occurred_at: "2026-01-01T11:58:00.000Z" as unknown as Date,
+    });
+    expect(bad).toEqual({ ok: false, reason: "invalid_occurred_at" });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* C. 静默期数值（O2 裁决）                                             */
 /* ------------------------------------------------------------------ */
 

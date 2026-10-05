@@ -20,7 +20,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   ADMIN_RESOURCE_KEYS,
   ADMIN_RESOURCES,
@@ -38,6 +38,15 @@ import { canWorkspaceResourceAction } from "../src/services/workspace.ts";
 //   `../../`  → `<repo>/`（web/ 与 backend/ 的父目录）
 const BACKEND = new URL("../", import.meta.url);
 const WEB = new URL("../../web/", import.meta.url);
+/**
+ * 最后一条"闭环"断言要同时看后端权限表**与**前端导航/页面，所以它需要完整检出。
+ * 后端专用容器（只拷了 `backend/`）里没有 `web/` —— 那时**显式跳过并说明理由**，
+ * 而不是让"路径不存在"伪装成断言失败（也不是静默跳过：node:test 会把 skip 打出来）。
+ */
+const HAS_WEB_TREE = existsSync(new URL("src/lib/nav.ts", WEB));
+const NEEDS_WEB = HAS_WEB_TREE
+  ? false
+  : "web/ 不在这个检出里（后端专用容器）：这条跨端闭环由完整检出（CI）执行";
 
 test("登记生效：/admin/announcements 解析到 announcements，且读写按方法分级", () => {
   assert.equal(isAdminResourceKey("announcements"), true);
@@ -113,7 +122,7 @@ test("路由确实按上面的口径接线（源码级；行为层受 DB 认证�
   assert.match(routes, /put\("\/preferences",[\s\S]{0,200}requireUser\(c\)/);
 });
 
-test("闭环：菜单入口不再挂 planned，且与资源键指向同一路径（同一个 WP 里收口）", () => {
+test("闭环：菜单入口不再挂 planned，且与资源键指向同一路径（同一个 WP 里收口）", { skip: NEEDS_WEB }, () => {
   const nav = readFileSync(new URL("src/lib/nav.ts", WEB), "utf8");
   const item = nav.slice(nav.indexOf('href: "/admin/announcements"'));
   const block = item.slice(0, item.indexOf("},"));
