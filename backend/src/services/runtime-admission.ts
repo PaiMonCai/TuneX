@@ -7,25 +7,6 @@
  * Missing historical capability facts use only the frozen compatibility baseline.
  */
 
- *  —— Runtime admission（能力协商的**唯一**判定入口）。
- *
- * §13.5 的第 5 层：命令入队前的最后一道条件。三个正交维度必须**同时**成立，
- * 命令才可以被放进队列：
- *
- *   action      该节点实现了这个动作             ← V4 （agent-capability.ts）
- *   protocol    该节点实现了这个产品协议          ← V5 （capability-manifest.ts）
- *   transport   该节点实现了这个传输契约          ← V5 
- *
- * 为什么要有这个模块，而不是让两个调用点各自拼一遍：
- * 「先查动作、再查协议、再查传输」的顺序、以及**哪一个节点**（DIRECT 的入口 /
- * RELAY 的进出口两端）必须满足，是编排知识。让 scheduler 和 command bus 各写
- * 一遍，迟早出现「调度器查了两端、下发只查了一端」这种半开的口子，而它正好
- * 只在 RELAY 失败路径上暴露。
- *
- * 这里返回**结构化原因**，调用方负责翻译成各自的错误码空间：scheduler 落
- * `Tunnel.apply_error_code`，command bus 抛 `AgentTransportError`。判定本身
- * 只有一处实现。
- */
 
 import {
   capabilityErrorBody,
