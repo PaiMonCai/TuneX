@@ -1,7 +1,7 @@
 /**
- * WP13.5A Console Boundary — 前端 guard 单测（纯函数，无浏览器 / 无 docker）。
+ * Console guard 单测（纯函数，无浏览器 / 无 docker）。
  *
- * 最重要的一条：**前端 guard 不是授权**（§9.4.1 要求 3）。
+ * 最重要的一条：**前端 guard 不是授权**。
  * `/api/auth/me` 只返回 `super_admin`，不返回 `admin_roles`，而后端存在「有后台角色的 admin」，
  * 因此前端**绝不能**用 `super_admin === false` 把用户重定向走 —— 那会误伤合法管理员，
  * 并把前端猜测变成事实授权。下面的回归测试把这个结论钉死。
