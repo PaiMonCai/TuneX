@@ -44,7 +44,7 @@ export const PREALLOC_TTL_S = 15 * 60;
 /**
  * 单个 `acquirePort` 最多尝试的候选端口数。
  *
- * **安全上限，不是分配策略**：候选集已过黑名单 + DB active 租约 + 调用方
+ * **安全上限，不是分配策略** 候选集已过黑名单 + DB active 租约 + 调用方
  * reservedPorts 三重过滤，正常路径第一个候选就命中。只有「拿锁之外的真实
  * 并发竞态」才会走到第二、第三个。设上限是防止病态区间（例如区间里大量
  * released 行互相 revive 竞争）把调用拖成上千次 Redis/DB 往返。
@@ -204,7 +204,7 @@ export function expandAvailablePorts(range: { min: number; max: number }): numbe
 /**
  * 生成候选端口（升序）。
  *
- * user-specified port 与 auto port 走**同一函数**：指定端口时候选集退化为
+ * user-specified port 与 auto port 走**同一函数** 指定端口时候选集退化为
  * `[port]`，随后的黑名单/区间/唯一性校验完全一致。这是 §7.6「user-specified
  * port 与 auto port 走同一规则」的落点——不可能出现「指定端口跳过某项校验」。
  */
@@ -219,7 +219,7 @@ export function portCandidates(
 /**
  * 任一端点上的「是否同一台物理机同一端口」判定。
  *
- * `lease_type` **不出现在任何判定里**：physical uniqueness 的语义就是
+ * `lease_type` **不出现在任何判定里** physical uniqueness 的语义就是
  * `(node_id, port)`，方向只是标签。写测试时不要期望「ingress 与 egress
  * 各自独立编号」——那正是 §7.6 要禁的 BOTH 双绑。
  */
@@ -269,9 +269,9 @@ export interface PortPoolDeps {
    * Agent 正确地拒绝 apply，而症状离原因很远：一条路由永远建不起来，日志里只有一个
    * `*_apply_rejected`。把 Agent 的事实也算作占用，等于让分配器**先问一句**再发端口。
    *
-   * **必须带上 runtime id**：否则会误伤"这条隧道自己已经持有的端口"——把一条 Forward 的
+   * **必须带上 runtime id** 否则会误伤"这条隧道自己已经持有的端口"——把一条 Forward 的
    * listen_port 改成它**当前正在用**的那个端口（幂等编辑、失败重试、还原夹具）时，
-   * 分配器会把它判成"别人占用"而拒绝，症状是自冲突（实测：门禁 S7 还原端口 502
+   * 分配器会把它判成"别人占用"而拒绝，症状是自冲突（Observed behavior: 门禁 S7 还原端口 502
    * `port_taken`，而那个端口正是这条隧道自己的 runtime 在听）。调用方通过
    * {@link AcquirePortInput.ownRuntimeIds} 声明"哪些 runtime 属于本次申请的隧道"。
    *
@@ -477,7 +477,7 @@ interface LeaseRow {
  *   1. 纯函数过滤：黑名单 / 节点区间 / reservedPorts（user-specified 与 auto
  *      共用同一套，`portCandidates` 之后的判定对两者一模一样）；
  *   2. Redis NX 抢占锁（拿不到 → 仍然尝试写 DB，靠唯一约束兜底）；
- *   3. **revive-or-create**：
+ *   3. **revive-or-create** 
  *        a. `updateMany({ node_id, port, status: 'released' })` 带守卫地认领
  *           一条已释放的行（端口回收再用的唯一途径，见文件头「released 行」）；
  *        b. 认领不到 → `create`；撞 P2002 = **真被占用**（正常路径）→ 下一个候选；
@@ -532,7 +532,7 @@ export async function acquirePort(
   // 面板的租约表可能比 Agent 的守卫更早释放（Remove 立即释放、监听稍后关闭），
   // 也可能更晚（失败创建的残留）。两份事实取并集，Agent 才不会拒绝一次我们以为合法的分配。
   //
-  // 但**本隧道自己的 runtime 占的端口要放行**：否则把 listen_port 改成它正在用的那个值
+  // 但**本隧道自己的 runtime 占的端口要放行** 否则把 listen_port 改成它正在用的那个值
   // （幂等编辑 / 失败重试 / 还原夹具）会被自己挡回去，症状是 502 port_taken 但端口明明
   // It may already be the listener owned by this same Forward.
   const ownRuntimeIds = new Set(input.ownRuntimeIds ?? []);
@@ -715,7 +715,7 @@ export async function releaseLease(
 /**
  * 查询某个端口当前的持有者。
  *
- * **只认 DB 行**：签名里刻意没有 Redis——「锁还在不在」与「端口归谁」是两个
+ * **只认 DB 行** 签名里刻意没有 Redis——「锁还在不在」与「端口归谁」是两个
  * 问题，混在一起就会写出「Redis flush 之后把所有端口判成空闲」的 bug
  * （`tenant-scope.ts` 里 `portLeaseLockKey` 的第三条使用约束就是禁这个）。
  */
@@ -774,11 +774,11 @@ export async function availablePorts(
 /**
  * {@link reconcileLeases} 判定「孤儿」的规则（集中一处，测试直接引用）。
  *
- *   A. **悬空隧道**：`tunnel_id` 非空但 Tunnel 已不存在。无条件回收——
+ *   A. **悬空隧道** `tunnel_id` 非空但 Tunnel 已不存在。无条件回收——
  *      「租约活得比隧道久」本身就是异常，不看 expires_at。
  *      （`tunnel_id` 是 `ON DELETE SET NULL` 软外键，删隧道只会把指针打成
  *      NULL，所以这条主要覆盖行被外部清理的形状；语义与 B 不同，故分开计数。）
- *   B. **过期预分配**：`tunnel_id IS NULL` 且 `expires_at` 已过，或为 NULL。
+ *   B. **过期预分配** `tunnel_id IS NULL` 且 `expires_at` 已过，或为 NULL。
  *      NULL expiry 一并回收：`acquirePort` 给预分配兜底了
  *      {@link PREALLOC_TTL_S}，库里不该存在「没有 expiry 的预分配」。
  *
@@ -862,7 +862,7 @@ export async function reconcileLeases(
 /**
  * 扫描 Redis 侧残留的抢占锁 key（`RedisKeys.portLeaseLockScan`）。
  *
- * **只做清理，不做判定**：key 存在与否不影响端口所有权（那在 DB）。
+ * **只做清理，不做判定** key 存在与否不影响端口所有权（那在 DB）。
  * 锁的 TTL 是 {@link DEFAULT_LOCK_TTL_S}，正常路径绝不会残留；能扫到的都是
  * 「进程在 set 之后、del 之前被 kill」的遗留。删掉它们只是让 keyspace
  * 干净，`acquire` 的正确性从不依赖这一步。
