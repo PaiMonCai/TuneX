@@ -35,6 +35,7 @@ import {
   type TelemetrySnapshot,
 } from "./node-health.ts";
 import { runtimeId } from "./reconciler.ts";
+import type { TunnelProtocolDiag } from "./tunnel-diag.ts";
 import { env } from "../env.ts";
 import { NODE_LIFECYCLES } from "./node-lifecycle.ts";
 
@@ -242,6 +243,14 @@ export interface NodeTelemetryView {
     counts: ReturnType<typeof parseRuntimeCounts>;
     /** 正在运行的 runtime id 列表。 */
     running: string[];
+    /**
+     * V5-WP19-F：按 runtime id 索引的**协议专属事实**（udp/tls/ws 的
+     * `drops`/`packets_*`/证书到期…）。**只有真的带 diag 的 runtime 才有键**：
+     * 一条 tcp 隧道不产生键，而不是产生一个空对象 —— 「这个协议没有事实」与
+     * 「这个协议的事实全是空」在 UI 上必须是两个答案（一个把每个报文都丢掉的出口
+     * 与一个空闲的出口，区别就在这里）。
+     */
+    diags: Record<string, TunnelProtocolDiag>;
   };
   used_ports: number[];
   /** 轻量资源采样；旧 Agent 不报时为 null。 */
@@ -281,7 +290,16 @@ function telemetryView(
     arch: snapshot.arch ?? null,
     agent_started_at: startedAt ? startedAt.toISOString() : null,
     uptime_seconds: startedAt ? Math.max(0, Math.round((now.getTime() - startedAt.getTime()) / 1000)) : null,
-    runtime: { counts: parseRuntimeCounts(snapshot.runtime_counts), running: running.map((r) => r.id) },
+    // V5-WP19-F：与 `running` 同一次解析（parseReportedRuntimes 已带上 diag），
+    // 所以视图里「哪些 runtime 在跑」和「它们各自的协议事实」永远来自同一份上报，
+    // 不会出现「列表里有这个 runtime、diag 却来自另一次上报」的错位。
+    runtime: {
+      counts: parseRuntimeCounts(snapshot.runtime_counts),
+      running: running.map((r) => r.id),
+      diags: Object.fromEntries(
+        running.filter((r) => r.diag !== undefined).map((r) => [r.id, r.diag as TunnelProtocolDiag]),
+      ),
+    },
     // 与判定同源（同一次解析）：视图里显示的端口清单和「是否真实占用」的
     // 结论必须来自同一份事实，否则会出现「列表里有 8443 但判端口未占用」。
     used_ports: [...parseUsedPorts(snapshot.used_ports)].sort((a, b) => a - b),

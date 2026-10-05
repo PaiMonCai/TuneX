@@ -282,6 +282,13 @@ export const adminConsoleNav: NavGroup[] = [
     labelEn: "Operations",
     items: [
       { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
+      // V5-WP18.5：平台公告（写给所有人的内容）。挂"运营"而非"系统"：它是内容/沟通，与工单同类。
+      //
+      // `planned` 在 WP18.5 是**过渡态**（页面已落，但资源键未登记 ⇒ 非超管点进去只有 403）；
+      // WP18.6 登记了 `announcements` 资源键，因此这里**放开为可导航**，两件事在同一个 WP 里收口。
+      // 闭环由 `backend/tests/v5-wp18-announcement-rbac.test.mjs` 的最后一组断言钉住
+      // （菜单项 ↔ 资源键 url ↔ 页面文件三者指向同一路径）。
+      { href: "/admin/announcements", labelKey: "admin.announcements", iconKey: "announcements" },
       { href: "/admin/audit-logs", labelKey: "admin.auditLogs", iconKey: "license" },
       {
         href: "/admin/alerts",

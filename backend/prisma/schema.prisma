@@ -144,6 +144,14 @@ model Workspace {
   tunnels          Tunnel[]
   policy_assignments WorkspacePolicyAssignment[]
   custom_roles     WorkspaceCustomRole[]
+  /// V5-WP17（契约 F6）：该租户拥有的 DNS 凭据。NULL 归属的 provider 是平台级，
+  /// 不在任何租户的列表里。
+  dns_providers    DNSProvider[]     @relation("workspace_dns_providers")
+  /// V5-WP20-2（契约 §3.5.2）：套餐归属的唯一真相。「一个租户一份订阅」由
+  /// `PlanSubscription.workspace_id @unique` 保证。
+  plan_subscription PlanSubscription?
+  /// V5-WP20-2（契约 §3.5.4）：本租户名下的购买订单（历史行可为 NULL = 未归属，R5）。
+  plan_orders      PlanOrder[]
 
   @@map("workspace")
 }
@@ -305,6 +313,9 @@ model CapabilityPolicy {
   updated_at DateTime @updatedAt
 
   assignments WorkspacePolicyAssignment[]
+  /// V5-WP20-4：把本策略作为商品出售的套餐（`Plan.policy_id` 的反向关系）。
+  /// 与 `assignments` 分开：发放是「谁在用」，这里是「哪个商品对应它」。
+  plans       Plan[]
 
   @@index([source, status])
   @@map("capability_policy")
@@ -412,6 +423,8 @@ model Node {
   updated_at  DateTime @updatedAt
 
   node_group_id Int
+  /// V5-WP17.1：以它为首选入口的 Forward（见 Tunnel.preferred_ingress_node_id）。
+  preferred_ingress_tunnels Tunnel[] @relation("preferred_ingress_node")
   node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
 
   // ── v3 增量字段（WP1，全部可空 → expand-and-contract，见迁移 20260926040000）──
@@ -487,12 +500,23 @@ model Node {
   state_report   NodeStateReport?
   /// V5.2 WP5：该节点上报的目标观测（每个 (节点, 目标) 一行）。
   target_observations TargetObservation[]
+  /// V5-WP19-B：该节点的观测**档案** —— 原始样本（24h）+ 小时桶（30d）。
+  /// 与上面的投影**互不写入**：档案永不被健康判定读取（契约 D3/D4）。
+  latency_samples TargetLatencySample[]
+  latency_buckets TargetLatencyHourly[]
   /// V5.3 WP9：该节点当前持有的归属租约。
   placement_leases PlacementLease[]
   /// V5.4 WP12：作为中间跳承载的 Forward。
   middle_hops Tunnel[] @relation("middle_node")
 
   @@index([role])
+  // V5-WP17：这两条索引**只存在于迁移里**，schema 一直没有声明它们 —— 后果不是"缺个索引"，
+  // 而是**任何人跑一次 `migrate dev`，Prisma 都会把它们当成多余的东西删掉**：一条在
+  // `credential_revoked`（认证/准入判定），一条在 `lifecycle`（维护态过滤）。
+  // 漂移检查实测过一次（`migrate diff --from-migrations --to-schema-datamodel`），
+  // 加上这两行之后归零。它们早已在库里，所以**不需要新迁移**。
+  @@index([credential_revoked])
+  @@index([lifecycle])
   @@map("node")
 }
 
@@ -623,10 +647,67 @@ model Tunnel {
   tls_cert_path   String? @db.VarChar(512)
   /// tls 监听使用的私钥文件路径（节点本地；NULL = 非 tls）
   tls_key_path    String? @db.VarChar(512)
+
+  // ── V5-WP17 DDNS 前门（docs/v5-wp17-entry-exit-group-ddns-contract.md §3 F3/F4/F7）──
+  //
+  // 为什么**挂 Forward 而不是 Route Profile**（F3）：模板与域名是 N:1——同一个 Profile 可以
+  // 被多条 Forward apply，域名若属模板就会互相打架；而域名必须随 config_revision 被 ACK，
+  // 落在 tunnel 行上才是同一份 desired。
+  //
+  // 为什么值来源只认 node.connect_ip（F3）：写进 DNS 的是"客户端该连哪里"，那正是面板
+  // 观察到的连接 IP。`connect_ip IS NULL` ⇒ **拒绝写**（dns_unbound_address），绝不回落
+  // listen_ip 或节点组的遗留列——回落就是猜地址。
+  //
+  // 全部可空 + 无默认值：只有配置了前门域名的 Forward 才填，其余行 NULL 是**明确事实**
+  //（"这条 Forward 没有前门"），不是"还没填"。
+  /// 前门域名；NULL = 这条 Forward 没有前门
+  dns_domain           String?       @db.VarChar(255)
+  /// 记录类型。多值只允许 A/AAAA；CNAME 只允许单值（F4）
+  dns_record_type      DNSRecordType?
+  /// 多入口（记录集 = 可用入口集合，首选）还是单活跃（记录集 = 当前 owner）（F4）
+  dns_mode             DNSMode?
+  dns_provider_id      Int?
+  dns_provider         DNSProvider?  @relation("tunnel_dns_provider", fields: [dns_provider_id], references: [id], onDelete: SetNull)
+  /// 显式 opt-in：缺省 false 表示**零外呼**，只返回建议值集（F5.3）
+  dns_auto_resolve     Boolean       @default(false)
+  /// 上次**已确认**的值集。"值集未变就不写"这条判据读它（F5.3），也是"多入口挂掉一个
+  /// 入口无需写 DNS"能成立的依据
+  dns_confirmed_values Json?
+  /// 上次成功写入（且按被冻结的强度确认）的时刻；就绪性闸门按它算 proof age（F5.4）
+  dns_synced_at        DateTime?
+  /// 上次成功是**读回确认**（true）还是仅写入成功（false）。后者投影为
+  /// `synced_unverified`——**不允许**把"写成功"说成"已切换"（Lead 裁决 D2）
+  dns_verified         Boolean       @default(false)
+  /// 上次失败的原因码（脱敏，不含凭据）
+  dns_last_error       String?       @db.VarChar(120)
+  /// V5-WP17.3：DNS 同步的**退避状态**。
+  ///
+  /// 契约 F7 要求"下一节拍按退避重试"，而"退避"是一个跨节拍的事实：没有这两列，
+  /// 执行器每拍都会立刻重试同一次失败的写 —— 对端限流时那正是最坏的输入。
+  /// 位置在 Forward 上（不是 provider 上）：同一个 provider 下不同域名的失败互相独立。
+  dns_attempt_count    Int           @default(0)
+  /// 下一次允许尝试的**最早**时刻。`NULL` = 没有待重试的失败。
+  dns_next_attempt_at  DateTime?
   /// 实际入口节点。DIRECT / RELAY 都必须持久化；NULL 只允许存量未完成绑定行。
   /// NodeGroup 只是候选集合，运行时恢复/删除/对账不得再根据组重新猜节点。
   ingress_node_id Int?
   ingress_node    Node?      @relation("ingress_node", fields: [ingress_node_id], references: [id], onDelete: SetNull)
+  /// V5-WP17.1（契约 D4 收口）：**首选入口节点**。
+  ///
+  /// 它之前根本不存在，而 `pickFailoverDestination` 又恒返回 `preferred_node_id = null` ⇒
+  /// **自动回切永远不可能发生**（"写了功能但没有任何写入路径"的一类，与 `diag` 白名单陷阱同源）。
+  /// 存储选在 Forward 上（契约 D4 的候选 A）：候选 B 要改 FROZEN 的 Route Profile 字段表，
+  /// 候选 C 与 Lead 的"接到真实写入路径"直接矛盾。
+  ///
+  /// NULL = 没有偏好 ⇒ 今天的行为（不回切）。它与 `ingress_node_id` 是**两件事**：
+  /// 后者是"现在归谁"，前者是"希望归谁"。混在一起会让一次回切看起来像配置被改写。
+  preferred_ingress_node_id Int?
+  preferred_ingress_node     Node? @relation("preferred_ingress_node", fields: [preferred_ingress_node_id], references: [id], onDelete: SetNull)
+  /// V5-WP17.1：首选节点**连续**判定健康的次数，由 failover sweep 维护（健康 +1、否则归零）。
+  ///
+  /// 为什么必须是一列：策略要求"连续 N 次健康才允许回切"，而"连续"是**跨节拍**的事实 ——
+  /// 从任何单次观测都推导不出来。缺了它，`failbackHealthyChecks` 恒为 0，回切一样永远不会发生。
+  failback_healthy_checks Int @default(0)
   /// RELAY 实际出口节点；DIRECT 为 NULL（DEVELOPMENT.md §2.1）。
   /// 只保存 Node 而不只存 out_node_group：否则组内多 Agent 重启时无法判断
   /// 隧道真正属于谁。
@@ -883,7 +964,7 @@ model ForwardRollout {
   last_error_code String? @db.VarChar(64)
   last_error String? @db.VarChar(500)
   created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  updated_at DateTime @default(now()) @updatedAt
 
   @@index([tunnel_id, revision])
   @@index([phase])
@@ -1070,6 +1151,21 @@ model AdminRole {
   @@map("admin_role")
 }
 
+/// V5-WP20-2（契约 `docs/v5-wp20-subscription-billing-runtime-contract.md` §3.3/§3.5.2）：
+/// **legacy 展示视图，冻结**。不要把它接回任何判定路径。
+///
+/// 三条冻结理由（契约 §4.0 Lead 裁决）：
+///  1. 判定链全部按 **workspace**（`WorkspacePolicyAssignment` → `composeEffectivePolicy`），
+///     而本表是**用户级单例**（`user_id @unique`），在 team workspace 下无法表达
+///     「一个租户一份套餐、多成员共享额度」；套餐归属的唯一真相是
+///     `PlanSubscription`（`workspace_id @unique`）。
+///  2. `traffic_used` **禁止回写**：流量真相是「已归档事实（`tunnel_traffic`）的窗口求和」，
+///     回写本列会产生第二份用量真相。前端要展示已用流量请读 `GET /api/me/capabilities`。
+///  3. `traffic` / `max_tunnels` / `whitelist_ips` 同理是**历史快照**，不得当作额度判定输入
+///     （额度唯一真相是显式发放）。
+///
+/// 本表仍由 `personal` workspace 的购买路径**双写**（保持 dashboard/admin 展示不破），
+/// 双写同事务，且 `PlanSubscription` 是真相、本表是投影。
 model UserPlan {
   id            Int       @id @default(autoincrement())
   user_id       Int       @unique
@@ -1117,12 +1213,25 @@ model Plan {
   renewable                   Boolean      @default(true)
   stock                       Int?
   order_by                    Float        @default(1000)
+  /// V5-WP20-4（契约 §3.5.3）：套餐 → 能力策略的**显式**绑定，购买时据此发 `purchase` 发放。
+  ///
+  /// 为什么必须显式、不能推导：`composeEffectivePolicy` 只认「哪一条发放存在」（F1/F5），
+  /// 从 `Plan.max_tunnels`/`traffic` 反推一条策略会造出第二份额度真相（§3.5.3 明确不做③）。
+  ///
+  /// **NULL 的语义**（不是错误）：该套餐没有绑定策略。历史套餐与尚未配置的套餐都是 NULL，
+  /// 此时购买路径**不发放** `purchase` 发放，也不因此拒绝购买 —— 扣款、订单、订阅照常，
+  /// 用户的准入继续由既有的 `system_default` 发放决定（= 今天的行为，逐字节不变）。
+  /// 反例：① 若 NULL 就拒绝购买，存量商品会当场不可售；② 若 NULL 就随便挑一条模板发放，
+  /// 就是上面禁止的隐式推导（用户会拿到一条他没买过的策略）。
+  policy_id                   Int?
+  policy                      CapabilityPolicy? @relation(fields: [policy_id], references: [id], onDelete: SetNull)
   created_at                  DateTime     @default(now())
   updated_at                  DateTime     @updatedAt
 
   node_groups PlanNodeGroup[]
   orders      PlanOrder[]
   user_plans  UserPlan[]
+  subscriptions PlanSubscription[]
 
   @@map("plan")
 }
@@ -1150,10 +1259,103 @@ model PlanOrder {
   balance    Float
   coupon_id  Int?
   coupon     PlanCoupon? @relation(fields: [coupon_id], references: [id])
+  /// V5-WP20-2（契约 §3.5.4）：这笔钱**买给哪个租户**。`user_id` 保持「谁点的购买谁付款」，
+  /// 本列是归属维度。**历史行 NULL 是合法历史，不猜**（契约 R5）——所以可空、无默认值、
+  /// 无回填；新行必填由 WP20-4 的应用层保证。
+  /// 删除语义：`SetNull`（Prisma 对可空关系的默认）——既有删用户流程会先 `workspace.deleteMany`
+  /// 再删 `planOrder`（`routes/admin-extended.ts:424` 起），`Restrict` 会让删用户直接失败。
+  workspace_id Int?
+  workspace  Workspace?  @relation(fields: [workspace_id], references: [id], onDelete: SetNull)
   created_at DateTime    @default(now())
   updated_at DateTime    @updatedAt
 
+  settlements SubscriptionPeriodSettlement[]
+
+  @@index([workspace_id])
   @@map("plan_order")
+}
+
+/// V5-WP20-2（契约 §3.5.2）：**订阅归属的唯一真相** —— 套餐属于 **Workspace**，不属于 user。
+///
+/// 为什么不继续用 `UserPlan`：判定链（额度、资源计数、`sumWorkspaceTraffic`）全部按 workspace，
+/// 而 `UserPlan.user_id @unique` 是用户级单例，无法表达 team workspace 下
+/// 「一个租户一份套餐、多成员共享额度」。本表 `workspace_id @unique` 直接表达该形状。
+///
+/// 快照字段**只含商务口径**（`plan_name` / `billing_cycle` / `price`）：套餐改价改名后，
+/// 历史订阅仍要能对账。**刻意不抄 `traffic` / `max_tunnels` 等额度数字** —— 额度判定的唯一
+/// 真相是显式发放（`WorkspacePolicyAssignment` → `composeEffectivePolicy`），把额度抄进订阅行
+/// 会制造第二份额度真相并诱导读方做「套餐 → 策略」的隐式推导（契约 §3.5.3、§8.3、F5/F6）。
+model PlanSubscription {
+  id            Int           @id @default(autoincrement())
+  /// 一个 workspace 至多一份有效订阅（契约 §3.5.2 的目标形状）。
+  workspace_id  Int           @unique
+  /// 删除语义 = `Cascade`：既有删用户流程会删掉 `personal` workspace
+  /// （`routes/admin-extended.ts:424` 的 `workspace.deleteMany`），`Restrict` 会让「删用户」
+  /// 直接失败；订阅随租户消失是该流程的既有意图。
+  workspace     Workspace     @relation(fields: [workspace_id], references: [id], onDelete: Cascade)
+  plan_id       Int
+  plan          Plan          @relation(fields: [plan_id], references: [id])
+  started_at    DateTime
+  /// **可空**：`BillingCycle` 含 `lifetime`（F25），终身订阅没有到期点。若设 NOT NULL，
+  /// 终身套餐会被迫写一个魔法日期（如 9999-12-31），那就是第二个真相 + 边界 bug。
+  expires_at    DateTime?
+  /// 自动续费 fail-closed 默认关闭（契约 §3.5.3）：结算任务只记账、只降级，绝不默认扣款续期。
+  auto_renew    Boolean       @default(false)
+  /// 订阅来源。**VARCHAR 而不是新枚举**：加值不该要求一次 schema 变更（联邦同取向，
+  /// 见 `20261022000000_v5_wp14_federation_identity` 的注释）；合法值由应用层校验，
+  /// 当前集合 `{purchase, admin_grant}`，默认 `purchase`。
+  source        String        @db.VarChar(32) @default("purchase")
+  /// 购买当时的套餐名快照（套餐改名后历史订阅仍可对账）。
+  plan_name     String        @db.VarChar(255)
+  /// 购买当时的计费周期快照。
+  billing_cycle BillingCycle
+  /// 购买当时的价格快照（`PlanOrder.price` 是实付，本列是当时标价，两者不同不矛盾）。
+  price         Float
+  created_at    DateTime      @default(now())
+  updated_at    DateTime      @updatedAt
+
+  settlements SubscriptionPeriodSettlement[]
+
+  @@index([plan_id])
+  /// 到期扫描（`started_at <= now < expires_at`，契约 §8.1：订阅「有效」是时间比较，不是状态列）。
+  @@index([expires_at])
+  @@map("plan_subscription")
+}
+
+/// V5-WP20-2（契约 §3.1.4）：**周期结算账本**，「每个周期只结算一次」的幂等闸门。
+///
+/// 幂等不是「再查一遍」，而是**先占位后执行**（先例 `federation/usage.ts:575` 的唯一索引取向）：
+///   ① `create` 占位（唯一键 `(plan_subscription_id, period_key)` 命中 `P2002` ⇒ 本轮跳过）
+///   → ② 扣款/发放 → ③ 置 `settled`。崩溃在 ① 与 ② 之间的 `pending` 由下一轮**接管续跑**。
+/// 因此本表不得有应用层删除路径；「重置展示」与「篡改账本」必须分离（契约 §2 吸收语义）。
+model SubscriptionPeriodSettlement {
+  id                   Int              @id @default(autoincrement())
+  plan_subscription_id Int
+  plan_subscription    PlanSubscription @relation(fields: [plan_subscription_id], references: [id], onDelete: Cascade)
+  /// 周期标记：Asia/Shanghai 下的 `YYYY-MM`（月结）或 `YYYY-MM-DD`（日结）。
+  /// **形状由 WP20-2 冻结**（WP20-1 刻意不先冻一个没有消费者的格式）。
+  period_key           String           @db.VarChar(16)
+  /// `pending` | `settled` | `failed`。VARCHAR + 应用层校验，不用新枚举（DoD 第 7 条：
+  /// `enum .*Status` 数量不得增加；状态集合还会长，枚举加值会让旧二进制读未知值即失败）。
+  state                String           @db.VarChar(16) @default("pending")
+  /// 接管续跑的尝试计数（超时由 `SystemConfig` 提供，默认 10 分钟，不硬编码 —— 契约 O4）。
+  attempts             Int              @default(0)
+  /// 本次结算产生的订单（未扣款的周期为 NULL）。账本行删掉时置 NULL，不连带抹掉结算占位。
+  order_id             Int?
+  order                PlanOrder?       @relation(fields: [order_id], references: [id], onDelete: SetNull)
+  /// 失败原因（给人看；判定与重试不依赖它的内容）。
+  error                String?          @db.Text
+  /// 本次结算**开始**时间：接管判定的基准（`state="pending"` 且 `started_at` 早于超时 ⇒ 可接管）。
+  started_at           DateTime         @default(now())
+  settled_at           DateTime?
+  created_at           DateTime         @default(now())
+  updated_at           DateTime         @updatedAt
+
+  /// 幂等闸门：同一订阅的同一周期只能有一行。
+  @@unique([plan_subscription_id, period_key])
+  /// 接管续跑扫描：按「状态 + 开始时间」捞超时的 `pending`。
+  @@index([state, started_at])
+  @@map("subscription_period_settlement")
 }
 
 enum TopupOrderStatus {
@@ -1218,8 +1420,25 @@ enum SystemConfigName {
   /// V5.3 WP10：自动故障转移/回切的运维策略（JSON：`{auto_failover, auto_failback}`）。
   /// 缺省不存在 ⇒ 两个都视为 false（fail-closed：策略没被配置过就不许自动搬流量）。
   FAILOVER_POLICY
+  /// @deprecated V5-WP18.5（契约 F6.7）：公告的真相已经迁到 `announcement` 表。
+  ///
+  /// **只读保留**：迁移 `20261033000000_v5_wp18_announcements` 把非空值读走成一条
+  /// `type="normal"` 公告（读 `config`，**从不写回**），`routes/public.ts` 已把它从免认证
+  /// 下发面移除，写入路径也不再使用它 —— 留着就是一个「沉睡又被免认证下发」的键，
+  /// 正是双份公告真相的来源。
+  ///
+  /// 枚举值**一个都不能删**：MySQL 的 ENUM 是序号存储，删值会让旧二进制读到未知值时直接失败
+  /// （契约 §9.8 / §F6.7）。
   NOTICE
+  /// @deprecated V5-WP18.5（契约 F6.7）：弹窗开关。
+  ///
+  /// 弹窗现在由 `announcement.type="popup"` + `active_popup_key` 上的唯一索引表达
+  /// （同 scope 只允许一条活跃）。本键**不做内容迁移**：它是布尔开关，不是内容 ——
+  /// 内容在 `NOTICE` 里，已经迁走。保留仅为旧二进制读取不失败。
   NOTICE_POPUP
+  /// @deprecated V5-WP18.5（契约 F6.7）：弹窗间隔小时数。
+  ///
+  /// 同 `NOTICE_POPUP`：**不迁移、不删值**。间隔语义属于前端展示节奏，不是公告事实。
   NOTICE_POPUP_INTERVAL_HOURS
   SITE_NAME
   SITE_DESCRIPTION
@@ -1250,6 +1469,20 @@ enum SystemConfigName {
   WITHDRAW_METHODS
   LIMIT_SCOPE
   ENABLE_SUBSCRIPTION
+  /// V5-WP20-3（契约 §3.1.4 / O4）：结算 `pending` 行的**接管超时**（分钟，字符串数字）。
+  /// 缺省不存在 ⇒ 回落 `DEFAULT_SETTLEMENT_TAKEOVER_MINUTES`（10，与充值订单超时同口径）。
+  /// 为什么必须可配而不是常量：超时越小越容易重复执行同一周期（结算据此必须幂等可重放），
+  /// 越大则崩溃遗留的 pending 越晚被接管；两者是运维权衡，不该由一次发版决定。
+  BILLING_SETTLEMENT_TAKEOVER_MINUTES
+  /// V5-WP19-B：延迟档案的保留期（原始样本小时数 / 小时桶天数）。
+  ///
+  /// 这两个键是**被代码用到但当时不在枚举里**的（`latency-history.ts` 的
+  /// `LATENCY_RETENTION_CONFIG_KEYS`）。列是 DB ENUM ⇒ 不在枚举里的键**根本存不进去**：
+  /// 读取永远得到 null（静默回落到默认值），运维也永远设不上 —— 一个"可调"的参数实际上是常量。
+  /// 补在**枚举末尾**是有意的：MySQL 的 ENUM 是序号存储，中间插值会让存量行错位，
+  /// 追加才是可加的。
+  LATENCY_RAW_RETENTION_HOURS
+  LATENCY_BUCKET_RETENTION_DAYS
 }
 
 model SystemConfig {
@@ -1423,17 +1656,54 @@ enum DNSProviderType {
   huawei
 }
 
+/// V5-WP17（契约 F4）：记录类型。多值只允许 A/AAAA；CNAME 只允许单值——多值 CNAME 在
+/// DNS 语义上不成立，用枚举把"表示不出来的状态"直接排除，而不是靠校验去事后拦。
+enum DNSRecordType {
+  A
+  AAAA
+  CNAME
+}
+
+/// V5-WP17（契约 F4）：两种前门形态。
+///
+/// - `multi_entry`（首选）：记录集 = 当前**可用入口集合**（通常 ≥2）。单个入口挂掉
+///   **不需要写 DNS**，客户端靠记录集里的其它地址自愈 —— 这一支把"DNS 写延迟"从
+///   可用性关键路径上摘掉；
+/// - `single_active`：记录集 = 当前 owner 的 `connect_ip`，每次归属迁移都要写。
+enum DNSMode {
+  multi_entry
+  single_active
+}
+
 model DNSProvider {
   id                Int              @id @default(autoincrement())
   name              String           @db.VarChar(255)
   type              DNSProviderType
+  /// 凭据。V5-WP17（契约 F6）：**必须**是 `services/federation/seal.ts` 的
+  /// `sealSecret` 输出（AES-256-GCM + HKDF(AUTH_SECRET)），**禁止明文 JSON**。
+  /// 列的形状不变（仍是 JSON），约定的是内容形态——这样不需要新表，也不会
+  /// 与既有的密钥体系并列出第二套。
   config            Json
+  /// 创建者。**不是**作用域：历史行只有它，读权限看下面的 workspace_id。
   user_id           Int
   user              User             @relation(fields: [user_id], references: [id])
+  /// V5-WP17（契约 F6）：凭据的**作用域**。`user_id` 是错的粒度——凭据属于资源域，
+  /// 不属于个人。
+  ///
+  /// - 非 NULL = 租户凭据，只有该 workspace 能读写；
+  /// - NULL   = 遗留全局行 / 平台级凭据。**非平台管理员读取即 fail-closed**
+  ///   （历史行按 F6 需要一次显式迁移策略，不允许"NULL 就等于人人可用"）。
+  workspace_id      Int?
+  workspace         Workspace?       @relation("workspace_dns_providers", fields: [workspace_id], references: [id], onDelete: SetNull)
   created_at        DateTime         @default(now())
   updated_at        DateTime         @updatedAt
   in_node_group_dns InNodeGroupDNS[]
+  /// V5-WP17：使用这个 provider 作为前门的 Forward。删除 provider 时 Forward 被
+  /// SetNull（前门回落到"未绑定"），而不是级联删掉 Forward——丢掉一条转发是
+  /// 不可逆的事故，而丢一个 DNS 绑定是"重新配一次"。
+  tunnels           Tunnel[]         @relation("tunnel_dns_provider")
 
+  @@index([workspace_id])
   @@map("dns_provider")
 }
 
@@ -1627,6 +1897,90 @@ model TargetObservation {
   @@map("target_observation")
 }
 
+/// V5-WP19-B —— 目标观测的**原始样本档案**（契约 §4.0 Lead 裁决 O1+O4）。
+///
+/// 与 `target_observation` **投影并列，不是它的历史行**：投影回答"现在怎么样"
+/// （每 (节点,目标) 一行、upsert、还被 `deleteMany(notIn: seen)` 收窄），档案回答
+/// "过去怎么样"（只追加、永不被投影读取、永不作为健康判定输入）。
+///
+/// 「只 INSERT」不是修辞：本表没有 upsert 路径，也没有 updated_at —— 一行样本一旦
+/// 写下就只有一个含义（`tunnels[].diag` 那类"重建成另一个形状"的事在这里不允许发生）。
+/// 保留期 24h（可配置），清理按 `observed_at` 索引删，与写入节拍同源。
+///
+/// 为什么用 BigInt 主键：一次状态上报为每个目标追加一行，节拍 ~30s，
+/// 单个目标就是 2880 行/天；Int 主键（21 亿）在千级节点 × 数十目标的规模下
+/// 一年多就会溢出。主键**不出现在任何读路径**（避免 BigInt → JSON 的坑）。
+model TargetLatencySample {
+  id      BigInt @id @default(autoincrement())
+  node_id Int
+  node    Node   @relation(fields: [node_id], references: [id], onDelete: Cascade)
+
+  /// 与投影同一套身份（`node-state.ts:targetKeyOf`）：两侧必须同步，单改一侧 =
+  /// 历史与投影对不上同一个目标。
+  target_key String @db.VarChar(288)
+  host       String @db.VarChar(255)
+  port       Int
+
+  /// 该次观测的事实。`latency_ms` 为 NULL = 这次没有测到延迟（不可达）；
+  /// **不是 0**（0 是"瞬间可达"）。档案里也保持这个区分。
+  reachable  Boolean
+  latency_ms Int?
+  success_rate Float @default(0)
+  /// 谁说的（观测节点角色 + 探测种类）。入桶键的一部分：不同口径的延迟**不可平均在一起**。
+  observation_source String @db.VarChar(64)
+
+  /// `observed_at` = Agent 观测时刻（序列的横轴）；`reported_at` = 面板收到该上报的时刻。
+  observed_at DateTime
+  reported_at DateTime @default(now())
+
+  /// 清理：`observed_at < cutoff` 按索引删（G19.8 的"按索引清理"）。
+  @@index([observed_at])
+  /// 读路径：一条 (节点, 目标) 序列的时间窗口。
+  @@index([node_id, target_key, observed_at])
+  @@map("target_latency_sample")
+}
+
+/// V5-WP19-B —— 小时桶档案（保留期 30d）。原始样本过期后，这是"过去抖不抖"的唯一答案。
+///
+/// 桶由**已结束的整点小时**的原始样本聚合而来（`latency-history.ts:rollUpLatencyBuckets`），
+/// 因此同一 (节点, 目标, 小时, 口径) 只有一行，且聚合是幂等的：小时结束后不再有新样本，
+/// 重算结果相同。桶一旦写入不再改写（`create` + 唯一冲突跳过），保持档案的只追加性质。
+///
+/// **延迟统计只统计真的测到延迟的样本**（`latency_samples` = 参与统计的样本数）：
+/// 不可达样本计入 `sample_count`/`failure_count`，但不进平均 —— 把"没测到"算成 0ms
+/// 会让一次断线在图上显示成"延迟骤降 0"，那是最坏的一类谎言。
+model TargetLatencyHourly {
+  id      Int  @id @default(autoincrement())
+  node_id Int
+  node    Node @relation(fields: [node_id], references: [id], onDelete: Cascade)
+
+  target_key String   @db.VarChar(288)
+  /// 该小时桶的起点（UTC 整点）。横轴口径：`observed_at` 落在 [hour_start, hour_start+1h)。
+  hour_start DateTime
+  /// 观测口径（与样本同源）：不同 source 的延迟**不并排、不平均**（D12）。
+  observation_source String @db.VarChar(64)
+
+  /// 样本总数与可达/不可达分解（`success_count + failure_count == sample_count`）。
+  sample_count  Int
+  success_count Int
+  failure_count Int
+
+  /// 延迟统计：`latency_sum_ms / latency_samples` = 平均值；`latency_samples = 0`
+  /// 时平均值是 NULL（**不是 0**）。min/max 让抖动在小时粒度上也留痕。
+  latency_samples  Int
+  latency_sum_ms   Float
+  latency_min_ms   Int?
+  latency_max_ms   Int?
+  last_observed_at DateTime
+
+  created_at DateTime @default(now())
+
+  @@unique([node_id, target_key, hour_start, observation_source])
+  /// 清理：`hour_start < cutoff` 按索引删。
+  @@index([hour_start])
+  @@map("target_latency_hourly")
+}
+
 model NodeStateReport {
   id      Int  @id @default(autoincrement())
   node_id Int  @unique
@@ -1648,7 +2002,7 @@ model NodeStateReport {
   last_error      String?  @db.VarChar(500)
   /// 面板收到本次上报的时刻（非 Agent 时钟，供离线判定用 DB 侧单一真相）
   reported_at     DateTime @default(now())
-  updated_at      DateTime @updatedAt
+  updated_at      DateTime @default(now()) @updatedAt
 
   // ── V4-WP6 Agent Telemetry（§13.4.4，迁移 20260928000000）──
   //
@@ -2114,4 +2468,205 @@ model FederationUsageRecord {
   @@index([tunnel_id, window_start])
   @@index([peer_panel_id, window_start])
   @@map("federation_usage_record")
+}
+
+/// V5-WP18.2 —— 通知投递账本（契约 F3/F4）。
+///
+/// 这张表**只描述「尝试投递」**，不是事实源（C2）：删掉全部行不影响任何判定，
+/// 通知的真相永远在它派生的那张既有表（`node` / `tunnel` / …）。
+///
+/// 设计要点：
+///   · `dedupe_key` = sha256(scope, source_kind, source_id, reason_code, window_start)，
+///     与 `channel_kind` 组成唯一索引：同一事实同一渠道在一个静默窗内**只落一行**
+///     （F4.2 的"唯一索引兜底"，api 与 worker 两个进程并发派生也不会各发一次）；
+///   · 唯一索引必须带 `channel_kind`：契约 F3 要求"每渠道各自一条投递记录"，
+///     而 F4.2 的 `dedupe_key` 组成里**没有**渠道——两处要求联立后只剩这一种解；
+///   · `status` 从 `sending` 起步再收敛为 `sent`/`failed`：先占位、后投递，
+///     并发下第二个进程会在唯一索引上撞键而不是发出第二封信（R7 的三层防线）；
+///   · `degraded` 记「静默期降级」：Redis 不可用时仍发送（O2 裁决），但必须留下
+///     "这次去重是进程内近似"的痕迹，否则事后无法解释重复投递；
+///   · 不建 workspace 外键（与 FederationPlacement 同一取向）：账本是历史证据，
+///     删 workspace 不该抹掉"我们给谁发过什么"，孤儿 id 比级联删除更可接受；
+///   · 全部用 String 而不是 DB enum：F5 已冻结"additive、不引 DB enum"——
+///     enum 增删值都会让旧二进制读到未知值时失败。
+model NotificationDelivery {
+  id             Int      @id @default(autoincrement())
+  /// platform | workspace（与 NotificationScope 同源；结构上 platform ⟹ workspace_id = NULL）。
+  scope_kind     String   @db.VarChar(16)
+  workspace_id   Int?
+  /// 幂等键（64 位十六进制），与契约 F4.2 的组成一一对应。
+  dedupe_key     String   @db.VarChar(64)
+  /// N1–N6 封闭枚举（node | forward | reconcile_finding | workspace_event | federation_event | announcement）。
+  source_kind    String   @db.VarChar(32)
+  /// 既有表主键（F8-B：不存在指向不存在行的投递）。
+  source_id      String   @db.VarChar(191)
+  /// 既有词表的原因码（attention 的 AttentionReasonCode）。
+  reason_code    String   @db.VarChar(64)
+  severity       String   @db.VarChar(16)
+  resource_type  String   @db.VarChar(64)
+  resource_id    String   @db.VarChar(191)
+  channel_kind   String   @db.VarChar(16)
+  /// 投递目标（邮箱地址 / webhook URL / chat id）。**绝不含凭据**：
+  /// webhook 的密钥不得出现在这里，URL 必须由渠道自己脱敏后回传（WP18.3）。
+  target         String   @db.VarChar(512)
+  /// sending | sent | failed。
+  status         String   @db.VarChar(16) @default("sending")
+  /// 失败原因（not_configured | transport_error | rejected_target | unsupported_channel |
+  /// secret_unreadable | ledger_unavailable）。`secret_unreadable` 是 WP18.4 追加的：
+  /// 凭据存在但解不开/不可用必须与"没配置"分开，否则一次密钥事故会被显示成"看起来没配"。
+  failure_reason String?  @db.VarChar(32)
+  /// 实际尝试次数（有界：≤ 3）。
+  attempts       Int      @default(0)
+  /// 静默期判定是否降级（Redis 不可用 → 进程内近似去重）。
+  degraded       Boolean  @default(false)
+  /// 错误摘要（已截断；不允许原文里的凭据落地）。
+  error          String?  @db.Text
+  /// 事实的发生时刻（来源表上的既有时间戳）。
+  occurred_at    DateTime
+  /// 幂等键的时间窗下界（诊断列：回答"下一条要等多久"）。
+  window_start   DateTime
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  // `map:` 是**有意的**：迁移是手写的，索引名是人挑的可读名（`..._dedupe_channel_key`）。
+  // 不写 map，Prisma 会按列名推导出 `..._dedupe_key_channel_kind_key` 并认为两边不一致 ⇒
+  // 漂移检查每次都报"重命名"，而 `migrate dev` 会真的去重命名。名字要么在 schema 里定死，
+  // 要么在迁移里改成 Prisma 的默认推导 —— 这里选前者（可读性优先，且迁移已经落地）。
+  @@unique([dedupe_key, channel_kind], map: "notification_delivery_dedupe_channel_key")
+  @@index([workspace_id, created_at], map: "notification_delivery_workspace_created_idx")
+  @@index([source_kind, source_id], map: "notification_delivery_source_idx")
+  @@index([status, created_at], map: "notification_delivery_status_created_idx")
+  @@map("notification_delivery")
+}
+
+/// V5-WP18.3 / WP18.4 —— 通知渠道配置（契约 F5）。
+///
+/// ── 为什么是独立表，而不是 `SystemConfig` 键 ──
+/// `config.value` 是**明文**、按名字 upsert、且公网免认证下发面会读它（`routes/public.ts`）。
+/// 把 bot token / webhook URL 放进去，等于把凭据写进一张"可能被非超管读到、且无轮换语义"的表。
+/// 渠道配置要按 scope 归属、要有密文列、要能被停用 —— 这三件事都需要真正的列。
+///
+/// ── 三条设计要点 ──
+///   · `secret_enc` 只存**密文**（AES-256-GCM，`v1.<iv>.<ct>.<tag>` 单行），密钥由
+///     `notification-seal.ts` 用**独立 HKDF info**（`tunex-notification-v1`）派生 ——
+///     绝不与联邦/DDNS 共用派生密钥（R5：一处泄漏不该等于两处泄漏）。明文只出现一次
+///     （写入响应体），此后任何读取路径都不得回显它。
+///   · **不建唯一索引**（`(scope_kind, workspace_id, kind)` 看起来很像该唯一，其实不成立）：
+///     platform 行的 `workspace_id` 是 NULL，而 MySQL 唯一索引里 NULL 互不相等 ——
+///     加了它只会给出**假的排他性**（平台侧照样能插两条 telegram）。
+///     "一 scope 一 kind" 若要成立，得用生成列或在应用层加锁，那是接线 WP 的取舍。
+///   · 不建外键（与 `NotificationDelivery` 同一取向）：渠道配置是运维资产，
+///     删 workspace 该由接线层显式清理，而不是被级联删掉后无人知晓。
+model NotificationChannel {
+  id            Int      @id @default(autoincrement())
+  /// platform | workspace（与 NotificationScope 同源）。
+  scope_kind    String   @db.VarChar(16)
+  /// platform ⟹ NULL（结构上表达 F5 的边界，不用"约定"）。
+  workspace_id  Int?
+  /// email | webhook | telegram（与 NotificationChannelKind 同源；不用 DB enum，见上）。
+  kind          String   @db.VarChar(16)
+  /// 投递目标（webhook URL / chat id / 收件人）。**token 不放这里**：它属于 `secret_enc`。
+  /// 注意 webhook URL 本身常常就是凭据（Slack/Discord 的 hook URL），因此**写进投递账本**时
+  /// 必须经渠道的 `redactTarget()` 脱敏（WP18.3），而不是把这里的原文抄过去。
+  target        String   @db.VarChar(512)
+  /// 凭据密文（`notification-seal.ts` 的 `sealNotificationSecret()` 是唯一落库入口）。
+  secret_enc    String?  @db.Text
+  /// 停用 ≠ 删除：停用后 `telegramSealedTokenFromRow()` 返回 null ⇒ 渠道未配置
+  /// ⇒ 投递层留一条 `not_configured`，而不是静默不发。
+  enabled       Boolean  @default(true)
+  /// 创建者（平台超管 / 租户管理员）。**不做外键**：审计线索比约束更重要。
+  created_by_id Int?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@index([scope_kind, workspace_id, kind], map: "notification_channel_scope_idx")
+  @@map("notification_channel")
+}
+
+/* ================================================================== */
+/* V5-WP18.5（契约 F6）—— 公告 / 已读 / 免打扰                        */
+/* ================================================================== */
+
+/// 公告：平台或租户写给「人」的内容，有生命周期与已读状态（契约 §0 的定位）。
+///
+/// ── 为什么它**不**经过 `NotificationFact` ──
+/// F1 把通知层的地基写成「既有状态机 / 对账事件的派生物」，而公告的真相**就在这张表里**
+/// （F2-N6：来源 = 公告表自身）。把它塞进 `NotificationFact.reason_code`（= 同一份
+/// `AttentionReasonCode`）就必须为「公告」新造一个 attention 原因码 —— 那等于在
+/// 「通知只消费既有词表」这条不变量上开一个例外。因此公告的推送走渠道层的
+/// `RenderedNotification` + 同一套免打扰判据（`announcement-mute.ts`），
+/// 投递账本与静默期仍归 WP18.2 的 `notification-delivery.ts`（见契约 §12）。
+model Announcement {
+  id               Int       @id @default(autoincrement())
+  /// platform | workspace。与 `NotificationScope`（`notification-facts.ts`）同源：
+  /// `platform` ⟹ `workspace_id = NULL`。**用结构表达边界**（F6.2）——服务层的入参类型
+  /// 就是那个判别联合（`AnnouncementScope = NotificationScope`），
+  /// 「平台公告挂到某个租户」在类型层面写不出来，不靠约定或调用方自觉。
+  scope_kind       String    @db.VarChar(16)
+  /// 归属租户。platform 一律 NULL；租户侧的读取条件由 `visibleAnnouncementWhere()` 强制给出。
+  workspace_id     Int?
+  /// normal | popup。`upgrade_popup` 不移植（O3：TuneX 用 git sha，没有权威版本矩阵）。
+  type             String    @db.VarChar(16)
+  title            String    @db.VarChar(200)
+  /// 正文是**纯文本**：全仓零 HTML 净化器、零 `dangerouslySetInnerHTML`（F6.6 / DoD7）。
+  /// 不引入 HTML 就没有 XSS 面 —— 存普通文本 + 前端纯文本渲染是这条纪律的可执行形式。
+  body             String    @db.Text
+  /// 活跃弹窗的**结构唯一键**：`platform` / `workspace:<id>`；normal 或已撤回时为 NULL。
+  ///
+  /// 为什么不写成 `@@unique([scope_kind, workspace_id, type])`：MySQL 的唯一索引把 NULL
+  /// 当作互不相等 ⇒ 平台行（`workspace_id IS NULL`）之间永远不会冲突，约束形同虚设。
+  /// 这一列把「哪一格被占」写成一个**非空标量**，于是唯一索引真的能拒绝第二条活跃弹窗：
+  /// Forwardx 靠「先关旧的再插新的」，并发下会留下两条（契约 F6.3 的反面教材）。
+  active_popup_key String?   @unique(map: "announcement_active_popup_key") @db.VarChar(64)
+  /// 发布时间（可见性起点）。迁移来的旧 `NOTICE` 用 `config.updated_at` ——
+  /// **来源表上的既有时间戳**，不是「迁移跑起来的时刻」。
+  published_at     DateTime
+  /// 撤回时刻。撤回 ≠ 删除：发出去过的内容撤下后仍留存（R3 的「同一发布里切换」）。
+  revoked_at       DateTime?
+  /// 发布者。**可空**且**不建外键**（理由与 `notification_delivery` 一致）：
+  /// ① 迁移来的旧公告没有作者，不猜一个出来；② 删用户不该把公告一起抹掉，
+  /// 而加外键要给既有 `User` 模型补反向关系列 —— 那是改别人的模型。
+  created_by_id    Int?
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+
+  dismissals AnnouncementDismissal[]
+
+  @@index([scope_kind, workspace_id, published_at], map: "announcement_scope_published_idx")
+  @@map("announcement")
+}
+
+/// 已读 = **每用户一条 dismiss 记录**（F6.5），不是全量已读清单：
+/// 公告数量会增长，而「这个人读过哪几条」一行一条就够，不需要为每条公告写 N 行。
+model AnnouncementDismissal {
+  id              Int      @id @default(autoincrement())
+  announcement_id Int
+  user_id         Int
+  dismissed_at    DateTime @default(now())
+
+  /// 外键只指向**本 WP 自己的表**（Cascade）：公告被删时它的已读记录没有意义。
+  /// 注意 `user_id` 刻意**不**建外键 —— 同样是「不改别人的模型」。
+  announcement Announcement @relation(fields: [announcement_id], references: [id], onDelete: Cascade)
+
+  @@unique([announcement_id, user_id], map: "announcement_dismissal_unique")
+  @@map("announcement_dismissal")
+}
+
+/// 免打扰 = **每用户 × 每渠道 × 每类别**三元映射（F6.5）。只影响**推送**：
+/// `GET /api/announcements` 与 dismiss **结构上**不读这张表（服务的入参里没有 mutes），
+/// 所以「用户免打扰了 email」不会让站内公告消失、也不会改变已读状态。
+model NotificationMute {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  /// `NOTIFICATION_CHANNEL_KINDS`（`notification-delivery.ts`）：email | webhook | telegram。
+  /// 复用既有闭集：渠道类型只允许一处定义，否则「哪个渠道能被静音」会有两份答案。
+  channel_kind String   @db.VarChar(16)
+  /// 类别 = `NOTIFICATION_SOURCE_KINDS`（`notification-facts.ts`）。**不新造类别词表**：
+  /// 免打扰要回答的是「这类通知要不要推给我」，而类别本身就来自通知触发源的封闭白名单。
+  category     String   @db.VarChar(32)
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  @@unique([user_id, channel_kind, category], map: "notification_mute_unique")
+  @@map("notification_mute")
 }

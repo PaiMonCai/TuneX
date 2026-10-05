@@ -7,8 +7,10 @@ on:
     types: [completed]
     branches: [main]
 
-# PRs run Integration directly. On main, Integration starts only after CI
-# completed successfully for that exact main commit.
+# Development and release have different feedback needs:
+# - PR: short real-topology smoke + current protocol regression.
+# - main: the complete historical regression matrix before Release.
+# This keeps every old Gate, but stops charging every edit for all of them.
 concurrency:
   group: integration-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.workflow_run.head_branch || github.head_ref || github.ref_name }}
   cancel-in-progress: true
@@ -17,13 +19,44 @@ permissions:
   contents: read
 
 jobs:
-  agent-image:
-    if: github.event_name == 'pull_request' || github.event.workflow_run.conclusion == 'success'
+  pr-integration:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start real topology and run core DIRECT / RELAY smoke
+        run: |
+          bash scripts/v3-e2e/setup.sh
+          bash scripts/v3-e2e/verify.sh
+      # G1B already contains TCP/TLS/WS regression plus UDP DIRECT/RELAY,
+      # restart, diagnostics, hot reload and port ownership. It is the highest
+      # value protocol gate for the current V5 data-plane and is substantially
+      # cheaper than replaying the whole V4/V5 history on every edit.
+      - name: Run protocol regression (V5-G1B)
+        run: python3 scripts/v3-e2e/v5-g1b.py
+      - name: Upload PR integration evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-integration-evidence
+          path: scripts/v3-e2e/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Teardown PR integration topology
+        if: always()
+        run: DELETE_IMAGES=1 bash scripts/v3-e2e/teardown.sh
+
+  # The full matrix deliberately runs only after a commit has landed on main
+  # and its source CI is green. This is our regression/release qualification
+  # suite, not the inner development loop.
+  full-agent-image:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - name: Build Docker Agent image
         uses: docker/build-push-action@v6
@@ -36,17 +69,17 @@ jobs:
           cache-from: type=gha,scope=tunex-agent
           cache-to: type=gha,mode=max,scope=tunex-agent
       - name: Smoke test Docker Agent image
-        run: |
-          docker run --rm --entrypoint /usr/local/bin/tunex-agent tunex-agent:ci --help >/dev/null
+        run: docker run --rm --entrypoint /usr/local/bin/tunex-agent tunex-agent:ci --help >/dev/null
 
-  v3-integration:
-    needs: [agent-image]
+  full-integration:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    needs: [full-agent-image]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
       - name: Run outbound-only DIRECT / RELAY integration gate
         run: |
           bash scripts/v3-e2e/setup.sh
@@ -57,7 +90,7 @@ jobs:
         run: bash scripts/v3-e2e/v4-gate-rest.sh
       - name: Run V4 Forward interruption and recovery gate
         env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: bash scripts/v3-e2e/v4-gate-s10.sh
       - name: Run V4-F1 topology closure gate
         run: bash scripts/v3-e2e/v4-gate-topology.sh
@@ -67,39 +100,16 @@ jobs:
         run: python3 scripts/v3-e2e/v4-gate-f3.py
       - name: Run V4-F4 authorization and NodeGroup closure gate
         run: python3 scripts/v3-e2e/v4-gate-f4.py
-      # V4-WP11 / F5: durability (last-known-good cache, fail-closed fallback,
-      # authoritative prune), graceful shutdown with a live connection, and the
-      # ops-script rewrite guards. It stops and recreates real Agents on purpose.
       - name: Run V4-F5 durability shutdown and ops closure gate
         run: python3 scripts/v3-e2e/v4-gate-f5.py
-      # V5-WP4 / Gate V5-G0: the V5 contract work (protocol facts, capability
-      # negotiation, runtime abstraction) must not have broken anything V4
-      # promised. It reuses the topology above and touches it (stops/restarts
-      # Agents, plants historical rows), so it runs last.
-      #
-      # §5.5: FAIL > 0 means V5.1 must not start. This step is therefore a hard
-      # blocker, not a report — a red G0 is the gate doing its job.
       - name: Run V5-G0 contract compatibility gate
         run: python3 scripts/v3-e2e/v5-g0.py
-      # V5.4 / G4 is the relevant merge gate for the middle-hop work on this
-      # branch. Keep it in the same real four-Agent topology so restart,
-      # compensation, orphan-port cleanup and three-hop data flow are verified
-      # before main ever sees the code.
+      - name: Run V5-G1A TLS and WebSocket protocol gate
+        run: python3 scripts/v3-e2e/v5-g1a.py
+      - name: Run V5-G1B UDP protocol and relay gate
+        run: python3 scripts/v3-e2e/v5-g1b.py
       - name: Run V5-G4 multi-hop closure gate
         run: python3 scripts/v3-e2e/v5-g4.py
-      # V5.5 / Gate V5-G5: federation is a Panel-to-Panel boundary, so it needs a
-      # SECOND real panel (own database, own worker, own Node + Agent) plus
-      # bidirectional trust. The bootstrap script is idempotent.
-      #
-      # It runs LAST in this job on purpose: several G5 scenarios stop/start
-      # containers (partition simulation) and create remote leases, so nothing
-      # after it can assume the topology is untouched.
-      #
-      # On the runner both panels live in the same docker network but the gate runs
-      # on the HOST: container aliases (`panel-b`) do not resolve there, so the
-      # scripts resolve addresses in order (FED_PANEL_B_API -> alias -> published
-      # host port). These env values make that explicit instead of implicit:
-      # A is published on 18180, B on 18181; a parallel job can move them.
       - name: Bootstrap second Panel and bidirectional federation trust
         env:
           API: http://127.0.0.1:18180
@@ -110,25 +120,26 @@ jobs:
           API: http://127.0.0.1:18180
           FED_PANEL_B_HOST_PORT: "18181"
         run: python3 scripts/v3-e2e/v5-g5.py
-      - name: Upload v3/v4/v5 integration evidence
-        if: failure() || github.event_name == 'workflow_run'
+      - name: Upload full integration evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: v3-integration-evidence
+          name: full-integration-evidence
           path: scripts/v3-e2e/evidence/
           if-no-files-found: warn
           retention-days: 14
-      - name: Teardown v3 integration topology
+      - name: Teardown full integration topology
         if: always()
         run: DELETE_IMAGES=1 bash scripts/v3-e2e/teardown.sh
 
   unified-image:
-    needs: [v3-integration]
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    needs: [full-integration]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: docker/setup-buildx-action@v3
       - name: Build unified TuneX image
         uses: docker/build-push-action@v6

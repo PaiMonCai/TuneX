@@ -30,6 +30,7 @@
  *      完全缺失/落后，或 apply_status=error。
  */
 import { deriveConnection, type NodeConnectionValue } from "./node-lifecycle.ts";
+import { normalizeTunnelDiag, type TunnelProtocolDiag } from "./tunnel-diag.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -144,6 +145,17 @@ export interface ReportedRuntime {
   ingress_port?: number | null;
   egress_port?: number | null;
   revision?: number | null;
+  /**
+   * V5-WP19-F：这条 runtime 的**协议专属事实**（tls 证书/握手、ws upgrade、udp
+   * `mappings`/`packets_*`/`bytes_*`/`drops`/`idle_timeout_seconds`、RELAY 的
+   * `hop_local_addr`）。键集开放、由 Agent 拥有；视图层只做类型化 + 有界化
+   * （`services/tunnel-diag.ts`）。
+   *
+   * **缺省（`undefined`）≠ `facts: {}`**：前者是「这条隧道没有 diag 块」（tcp 隧道、
+   * 旧 Agent），后者是「报了，只是这次没有标量事实」。把两者合并，就正好是
+   * 「一个把每个报文都丢掉的出口」与「一个空闲的出口」在面板上变得无法区分的方式。
+   */
+  diag?: TunnelProtocolDiag;
 }
 
 /** 面板侧的 desired runtime（每条 Forward 在本节点上应有的运行态）。 */
@@ -283,7 +295,17 @@ export function parseHostMetrics(input: unknown): HostMetrics | null {
   return seen ? out : null;
 }
 
-/** 快照里的 tunnels JSON → runtime 列表（坏形状按空列表，不抛错）。 */
+/**
+ * 快照里的 tunnels JSON → runtime 列表（坏形状按空列表，不抛错）。
+ *
+ * V5-WP19-F：每条 runtime 同时带上它自己的**协议专属事实**（`diag`）。这个函数是
+ * 「凡重建上报形状处都必须带上 diag」在**面板读路径**上的锚点 —— 它曾经只留
+ * id/mode/端口/revision，于是 Agent 上报的 udp `drops`/`packets_*`、tls 证书到期
+ * 在面板侧被静默丢掉（库里一直有值，读的人永远看不到）。
+ *
+ * 坏 diag 块（非对象）按「这条隧道没有协议事实」处理，**不影响**该 runtime 的其它字段：
+ * 观测类坏形状逐条丢弃，绝不升级为「整条 runtime 消失」。
+ */
 export function parseReportedRuntimes(input: unknown): ReportedRuntime[] {
   if (!Array.isArray(input)) return [];
   const out: ReportedRuntime[] = [];
@@ -291,12 +313,16 @@ export function parseReportedRuntimes(input: unknown): ReportedRuntime[] {
     if (!raw || typeof raw !== "object") continue;
     const o = raw as Record<string, unknown>;
     if (typeof o.id !== "string" || o.id.length === 0) continue;
+    const diag = normalizeTunnelDiag(o.diag);
     out.push({
       id: o.id,
       mode: typeof o.mode === "string" ? o.mode : null,
       ingress_port: num(o.ingress_port),
       egress_port: num(o.egress_port),
       revision: num(o.revision),
+      // 只在真的有 diag 块时才有这个键：`undefined`（没有协议事实，如 tcp）与
+      // `{ facts: {} }`（报了、但这次没有标量）在读取方必须可区分。
+      ...(diag ? { diag } : {}),
     });
   }
   return out;

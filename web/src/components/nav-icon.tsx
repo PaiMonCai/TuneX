@@ -9,6 +9,7 @@ import {
   CreditCard,
   LayoutDashboard,
   LifeBuoy,
+  Megaphone,
   Network,
   Package,
   Server,
@@ -46,6 +47,8 @@ export const NAV_ICONS = {
   roles: Shield,
   orders: ShoppingCart,
   adminTickets: LifeBuoy,
+  /** V5-WP18.5：平台公告（喇叭 = 公告语）。 */
+  announcements: Megaphone,
   license: BadgeCheck,
 } satisfies Record<string, LucideIcon>;
 

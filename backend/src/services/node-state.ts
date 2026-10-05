@@ -45,6 +45,12 @@ import { LEASE_TTL_SECONDS } from "./placement-lease.ts";
 import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
 import { normalizeCapabilities } from "./agent-capability.ts";
 import { normalizeCapabilityManifest, type CapabilityManifest } from "./capability-manifest.ts";
+import { isPlainObject, type TunnelProtocolDiag } from "./tunnel-diag.ts";
+import {
+  appendLatencySamples,
+  defaultLatencyHistoryDeps,
+  type LatencySampleRow,
+} from "./latency-history.ts";
 
 /* ================================================================== */
 /* 形状（与 agent/internal/api 的 NodeState 字段对齐）                  */
@@ -76,6 +82,19 @@ export interface ReportedTunnel {
   speed_limit?: number;
   listen_host?: string;
   targets?: ReportedTarget[];
+  /**
+   * V5-WP19-F —— 该 runtime 的**协议专属事实**（`forwarder.ProtocolDiagnostics`）：
+   * tls 的证书到期 / 握手失败、ws 的 upgrade 拒绝、udp 的 `mappings`/`packets_*`/
+   * `bytes_*`/`drops`/`idle_timeout_seconds`，以及 RELAY 入口腿的 `hop_local_addr`。
+   *
+   * 落库时**原样透传**（这个块也是 `forward-contract.ts:datagramHopPeerFor` 读
+   * `hop_local_addr` 的唯一来源，绝不能在这里重建成白名单字段）。面板侧的类型化读视图
+   * 在 `services/tunnel-diag.ts`（键集开放、坏值不进视图、绝不回写）。
+   *
+   * **不在这里的字段一律视为「该协议没有这个事实」，不是 0**：Agent 侧零值 `omit`，
+   * 所以 tcp 隧道 / 旧 Agent 干脆没有这个键（`undefined`），而不是一个空对象。
+   */
+  diag?: TunnelProtocolDiag;
 }
 
 /** Agent 上报的出口池快照（对齐 agent reporter.EgressPool）。 */
@@ -407,6 +426,36 @@ function normalizeTargetObservation(raw: unknown): ReportedTargetObservation | n
   };
 }
 
+/**
+ * V5-WP19-F —— 上报隧道列表的**显式投影**：`diag` 必须被带过去。
+ *
+ * 这是「凡重建上报形状处都必须带上 diag」这条纪律在**落库路径**上的那一个锚点
+ * （同一条纪律的另一半在 `services/tunnel-diag.ts` 的读取侧，机械守卫见
+ * `src/services/__tests__/v5-wp19/`）。它做的只有两件事：
+ *
+ *   · **未知字段原样保留**（`remote_host`/`protocol`/`targets`/将来新增的都在里面），
+ *     面板不在上报层做语义判断（与顶层校验同一取向）；
+ *   · `diag` **原样带走**（不是 `normalizeTunnelDiag` 的输出！）—— 那个块是
+ *     `datagramHopPeerFor` 读 `hop_local_addr` 的唯一来源，也是 G1B.12 直接查的原始 JSON，
+ *     重建成白名单字段就会把它废掉。这里唯一会动 `diag` 的情况是**它根本不是对象**
+ *     （`"not-an-object"` / 数组 / `null`）：那不是事实，落库只会让读取方猜形状，
+ *     所以整键丢弃 —— 丢掉的是**这一条信息**，不是整份上报（观测类坏形状逐条丢弃，
+ *     绝不升级成整份 400，方向与 capability fail-closed 相反）。
+ */
+export function projectReportedTunnels(
+  tunnels: ReportedTunnel[] | undefined,
+): ReportedTunnel[] | undefined {
+  if (tunnels === undefined) return undefined;
+  return tunnels.map((tunnel) => {
+    const record = tunnel as unknown as Record<string, unknown>;
+    if (!Object.hasOwn(record, "diag") || isPlainObject(record.diag)) {
+      return { ...record } as unknown as ReportedTunnel;
+    }
+    const { diag: _dropped, ...rest } = record;
+    return { ...rest } as unknown as ReportedTunnel;
+  });
+}
+
 export function validateStateReport(body: unknown): { ok: true; report: StateReportInput } | { ok: false; reason: StateReportRejection } {
   // 数组也是 object，但状态载荷必须是「带名字段的对象」——`[1,2]` / `[]`
   // 一律坏形状（Agent 不会把状态报成一个列表）。
@@ -554,7 +603,11 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       agent_id: b.agent_id as string | undefined,
       version: b.version as string | undefined,
       role: b.role as string | undefined,
-      tunnels: b.tunnels as ReportedTunnel[] | undefined,
+      // V5-WP19-F：走**显式投影**而不是直接 `b.tunnels` —— 每隧道的 `diag`
+      // （协议专属事实）必须落进 `node_state_report.tunnels` 原样带走，坏形状逐条丢弃。
+      // 这里曾经是"看起来只是类型断言"的那种写法，而在这个仓库里，"看起来等价"
+      // 的字段拷贝点正是事实静默消失的地方（WP5-B2 的六处边界）。
+      tunnels: projectReportedTunnels(b.tunnels as ReportedTunnel[] | undefined),
       used_ports: b.used_ports as number[] | undefined,
       egress_pools: b.egress_pools as Record<string, ReportedEgressPool> | undefined,
       reported_revision: b.reported_revision as number | undefined,
@@ -778,6 +831,59 @@ export async function syncTargetObservations(
   await db.targetObservation.deleteMany({ where: { node_id: nodeId, target_key: { notIn: seen } } });
 }
 
+/* ================================================================== */
+/* V5-WP19-B —— 观测历史档案（只追加；与上面的投影并列，互不写入）        */
+/* ================================================================== */
+
+/**
+ * 一次上报的观测 → 档案样本行（**纯函数**，不碰 DB）。
+ *
+ * 身份用同一个 {@link targetKeyOf}：档案与投影必须指向同一个目标 —— 在这里自己拼一份
+ * `host:port` 就等于有了第二份归一化，两边一旦漂移，历史会挂到一个投影里不存在的目标上。
+ *
+ * `latency_ms` 再钉一次「不可达 = NULL」：投影层已经归一化过，但档案是**只追加**的，
+ * 写错一行没有 upsert 可以修正 —— 宁可在两个入口各钉一次（同一件事不允许有两个答案）。
+ */
+export function latencySampleRows(observations: readonly ReportedTargetObservation[]): LatencySampleRow[] {
+  const rows: LatencySampleRow[] = [];
+  for (const o of observations) {
+    const key = targetKeyOf(o.host, o.port);
+    if (!key) continue;
+    rows.push({
+      target_key: key,
+      host: o.host,
+      port: o.port,
+      reachable: o.reachable,
+      latency_ms: o.reachable ? o.latency_ms : null,
+      success_rate: o.success_rate,
+      observed_at: new Date(o.last_observed_at * 1000),
+      observation_source: o.observation_source,
+    });
+  }
+  return rows;
+}
+
+/**
+ * 把这次上报的观测追加进历史档案（V5-WP19-B，契约 §4.0 裁决 O1+O4）。
+ *
+ * **失败必须 fail-soft**：档案是**附加事实**（D4：永不作为判定输入），而这一拍上报还背着
+ * 隧道/端口/健康/租约续期。让一次档案写失败把上报打成 500，等于节点因为一个"观众"掉线 ——
+ * 与 `renewOwnedLeases` 同一取向（次要功能不得拖垮主要功能）。原始样本的 24h 窗口由
+ * 后续节拍继续填，丢掉一拍不改变任何判定。
+ */
+export async function archiveObservationSamples(
+  nodeId: number,
+  observations: readonly ReportedTargetObservation[],
+): Promise<void> {
+  try {
+    const rows = latencySampleRows(observations);
+    if (rows.length === 0) return;
+    await appendLatencySamples(defaultLatencyHistoryDeps(), nodeId, rows);
+  } catch {
+    /* 档案写不进去不影响上报结论（见函数头）。 */
+  }
+}
+
 /**
  * unix 秒 → Date，`undefined`/`0` → null。
  *
@@ -896,6 +1002,10 @@ export async function submitStateReport(
   //     整张观测表，把"没有证据"伪造成"刚刚观测过且什么都没有"。
   if (report.target_observations !== undefined) {
     await syncTargetObservations(auth.node_id, report.target_observations, reportedAt);
+    // V5-WP19-B：同一份观测再追加进**档案**（只 INSERT）。与投影并列、互不写入：
+    // 投影回答"现在怎么样"（会被下面的 deleteMany 收窄），档案回答"过去怎么样"
+    // （24h 原始样本 + 30d 小时桶，见 services/latency-history.ts）。fail-soft。
+    await archiveObservationSamples(auth.node_id, report.target_observations);
   }
 
   // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（WP1 列，WP7 首次写入）。
@@ -938,6 +1048,9 @@ export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot 
       version: true,
       role: true,
       reported_revision: true,
+      // V5-WP19-F：`tunnels` 是**整块 JSON**，每隧道的 `diag`（协议专属事实）就在里面。
+      // 不要把这里改成逐字段投影（那会把 diag 丢在一次"看起来等价"的重构里）；
+      // 读取侧用 `services/tunnel-diag.ts` 的 `tunnelDiagsById(snapshot.tunnels)` 取类型化视图。
       tunnels: true,
       egress_pools: true,
       used_ports: true,
@@ -965,6 +1078,10 @@ export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot 
  * 只回**Agent 自己那一份**（nodeDbId 由凭据解析，不接受路径参数指定别的节点）——
  * 否则 A 的凭据就能读 B 的快照。字段保持在 Agent 侧可消费的最小集：
  * 版本、角色、revision、隧道、端口、池。不回 reported_at 之类面板内部字段。
+ *
+ * V5-WP19-F：`tunnels` **整块原样回给 Agent**（不逐字段重建）—— 每隧道的 `diag`
+ * 就在里面。这条路径是"重放"面：Agent 重启后拿到的快照必须与它上次上报的一致，
+ * 在这里做一次字段白名单重建，就等于把 Agent 自己刚发来的事实丢掉（G19.14 模型）。
  */
 export async function buildReconnectSnapshot(nodeDbId: number): Promise<Record<string, unknown> | null> {
   const snap = await loadNodeSnapshot(nodeDbId);
@@ -973,6 +1090,7 @@ export async function buildReconnectSnapshot(nodeDbId: number): Promise<Record<s
     version: snap.version,
     role: snap.role,
     reported_revision: snap.reported_revision,
+    // 不要改成逐条 `{ id, mode, ingress_port, ... }`：per-tunnel `diag` 会整块消失。
     tunnels: snap.tunnels ?? [],
     used_ports: snap.used_ports ?? [],
     egress_pools: snap.egress_pools ?? {},

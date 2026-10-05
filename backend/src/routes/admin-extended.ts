@@ -44,6 +44,7 @@ import { db } from "../db.ts";
 import { hashPassword, newApiKey } from "../auth.ts";
 import { hashKey } from "../services/user-keys.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
+import { listBindablePolicies, resolvePlanPolicyBinding } from "../services/plan-subscription.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const adminExtendedRoutes = new Hono<{ Variables: AppVariables }>();
@@ -853,6 +854,18 @@ function planView<T extends { node_groups?: { node_group: { id: number; name: st
   };
 }
 
+/**
+ * V5-WP20-4b：可绑定的策略选项（只读，给套餐表单的下拉框用）。
+ *
+ * 与套餐 CRUD 的校验**同一口径**（见 `services/plan-subscription.ts#listBindablePolicies`）：
+ * 列出的一定能被接受，没列出的一定会被拒。若把整个策略表都列出来，
+ * 就会出现「UI 能选、保存 400」这种最招人烦的形态。
+ */
+adminExtendedRoutes.get("/plan-policy-options", async (c) => {
+  const rows = await listBindablePolicies(db);
+  return c.json({ data: rows });
+});
+
 adminExtendedRoutes.get("/plans", async (c) => {
   const { page, limit, skip, take, keyword, status } = readPage(c);
 
@@ -867,7 +880,11 @@ adminExtendedRoutes.get("/plans", async (c) => {
       orderBy: [{ order_by: "asc" }, { id: "desc" }],
       skip,
       take,
-      include: { node_groups: { include: { node_group: { select: { id: true, name: true } } } } },
+      include: {
+        node_groups: { include: { node_group: { select: { id: true, name: true } } } },
+        // V5-WP20-4b：管理端要能看见「这个套餐卖的是哪条策略」（未绑定 = null）。
+        policy: { select: { id: true, key: true, name: true, status: true, is_ceiling: true } },
+      },
     }),
     db.plan.count({ where }),
   ]);
@@ -917,10 +934,16 @@ adminExtendedRoutes.post("/plans", async (c) => {
   let created;
   try {
     created = await db.$transaction(async (tx) => {
+      // V5-WP20-4b：套餐 → 能力策略的**显式绑定**（契约 §3.5.3）。校验在服务层，
+      // 与发放语义同口径（未启用 / 平台上限模板都会被拒；理由见 services/plan-subscription.ts）。
+      const binding = await resolvePlanPolicyBinding(tx, body.policy_id);
+      if (binding.kind === "reject") throw new HTTPException(400, { message: binding.message });
+      const boundPolicyId = binding.kind === "bind" ? binding.policy_id : null;
       const plan = await tx.plan.create({
         data: {
           name,
           price,
+          policy_id: boundPolicyId,
           description: strOrNull(body.description),
           original_price: numOrNull(body.original_price),
           max_tunnels: numOrNull(body.max_tunnels),
@@ -954,7 +977,11 @@ adminExtendedRoutes.post("/plans", async (c) => {
 
   const full = await db.plan.findUniqueOrThrow({
     where: { id: created.id },
-    include: { node_groups: { include: { node_group: { select: { id: true, name: true } } } } },
+    include: {
+      node_groups: { include: { node_group: { select: { id: true, name: true } } } },
+      // V5-WP20-4b：保存后的回读也要带出绑定的策略（前端据此刷新表单与列表）。
+      policy: { select: { id: true, key: true, name: true, status: true, is_ceiling: true } },
+    },
   });
   return one(c, planView(full), 201);
 });
@@ -1035,6 +1062,11 @@ async function updatePlan(c: Ctx) {
 
   try {
     await db.$transaction(async (tx) => {
+      // V5-WP20-4b：`policy_id` 是**显式绑定**入口（PATCH 部分更新语义：
+      // 不传 = 不动；传 null/"" = 解绑；传 id = 换绑，校验同 POST）。
+      const binding = await resolvePlanPolicyBinding(tx, body.policy_id);
+      if (binding.kind === "reject") throw new HTTPException(400, { message: binding.message });
+      if (binding.kind !== "skip") data.policy_id = binding.policy_id;
       await tx.plan.update({ where: { id }, data: data as never });
       if (nodeGroupIds !== undefined) {
         const err = await syncPlanNodeGroups(tx, id, nodeGroupIds);
@@ -1050,7 +1082,11 @@ async function updatePlan(c: Ctx) {
 
   const full = await db.plan.findUniqueOrThrow({
     where: { id },
-    include: { node_groups: { include: { node_group: { select: { id: true, name: true } } } } },
+    include: {
+      node_groups: { include: { node_group: { select: { id: true, name: true } } } },
+      // V5-WP20-4b：保存后的回读也要带出绑定的策略（前端据此刷新表单与列表）。
+      policy: { select: { id: true, key: true, name: true, status: true, is_ceiling: true } },
+    },
   });
   return one(c, planView(full));
 }

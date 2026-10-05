@@ -226,6 +226,15 @@ export function extractEnrollmentToken(authorization: string | null | undefined)
  * credential in a root-only host file. The container only gets a read-only
  * bind mount of that file, so docker inspect does not expose the credential.
  */
+/**
+ * V5-WP21（Lead 裁决）：节点引导脚本**钉住**的 Docker Engine 版本。
+ *
+ * 为什么是常量而不是"最新"：`get.docker.com` 是一份**会变的**脚本（拿不到稳定校验和），
+ * 而让一台生产节点今天装 27、明天装 28，会把"Agent 起不来"变成一次与本次安装无关的考古。
+ * 升级这个值是**有意识的动作**：改这一行、跑一次针对引导脚本的断言。
+ */
+export const NODE_BOOTSTRAP_DOCKER_VERSION = "27.5.1";
+
 export function renderNodeInstallScript(): string {
   return `#!/bin/sh
 set -eu
@@ -265,11 +274,24 @@ case "$(uname -s)" in
 esac
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "TuneX: Docker Engine not found; installing Docker..."
+  # V5-WP21（Lead 裁决）：**钉住版本**，不要"curl 到最新"。
+  #
+  # 为什么：get.docker.com 是一份**会变的**脚本，我们既不能对它做校验和（内容随上游变化），
+  # 也不该让一台生产节点今天装 27、明天装 28 —— 版本漂移会把"Agent 起不来"变成一次
+  # 与本次安装毫无关系的考古。钉版本之后，行为是确定的；失败也**可见**（下方显式报错），
+  # 而不是静默装上一个我们没验证过的版本。
+  #
+  # 更保守的路径（离线/受限环境）见 docs/production-deploy.md：用发行版包管理器安装。
+  DOCKER_PIN="${NODE_BOOTSTRAP_DOCKER_VERSION}"
+  echo "TuneX: Docker Engine not found; installing pinned $DOCKER_PIN via get.docker.com..."
   TMP_DOCKER="$(mktemp)"
   trap 'rm -f "$TMP_DOCKER"' EXIT INT TERM
   curl -fsSL https://get.docker.com -o "$TMP_DOCKER"
-  sh "$TMP_DOCKER"
+  if ! sh "$TMP_DOCKER" --version "$DOCKER_PIN"; then
+    echo "TuneX: 安装 Docker $DOCKER_PIN 失败（该版本可能不支持本发行版）；本脚本**不**回落到安装最新版" >&2
+    echo "TuneX: 请手动安装 Docker $DOCKER_PIN 或更新版本的 Engine，然后重新运行本脚本" >&2
+    exit 4
+  fi
   rm -f "$TMP_DOCKER"
   trap - EXIT INT TERM
 fi

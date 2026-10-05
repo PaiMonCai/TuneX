@@ -64,6 +64,9 @@ import {
   DEFAULT_FORWARD_PROTOCOL,
   admitPersistedProtocol,
   buildForwardRuntimePlan,
+  addressPartOfEndpoint,
+  datagramHopPeerFor,
+  firstConnectIp,
   forwardRuntimePlanViolations,
   normalizeForwardProtocol,
   persistedForwardProtocol,
@@ -241,6 +244,8 @@ export const SCHEDULER_STEPS = [
   "apply_transit",
   "apply_ingress",
   "ingress_ack",
+  // V5.1b WP5-B2：入口 ACK 回报的跳端点与首次下发用的地址不同时，纠正出口腿的取证地址。
+  "correct_hop_peer",
   "activate",
 ] as const;
 export type SchedulerStep = (typeof SCHEDULER_STEPS)[number];
@@ -496,6 +501,10 @@ export interface SchedulableNode {
   node_id: string;
   role: "ingress" | "egress" | "both" | null;
   connect_ip: string | null;
+  /** V5.1b WP5-B2：入口上报的跳端点藏在这里（`tunnels[].diag.hop_local_addr`）。
+   *  取证地址必须优先用它——多宿节点上 `connect_ip` 指的是**另一张网**的地址，
+   *  出口会因此把每个跳报文都丢弃（真拓扑实测）。 */
+  state_report?: { tunnels?: unknown } | null;
   /** 端口分配区间；NULL 由 portPool 判 `node_range_unset`。 */
   port_range_min: number | null;
   port_range_max: number | null;
@@ -870,6 +879,93 @@ async function persistSuccess(
  *        默认构造一个基于 WP6 ControlValidator 的进程级 orchestrator。
  * @param deps   见 {@link SchedulerDeps}
  */
+/**
+ * V5.1b WP5-B2（契约 §12.5 第 9 条）：用入口 ACK 回报的跳端点**纠正**出口腿的取证地址。
+ *
+ * 为什么必须做：出口腿**先于**入口腿下发（铁律一），那一刻入口连 runtime 都还没有，面板只能按
+ * `connect_ip` 取证；多宿节点上那是**另一张网**的地址，出口会把每个跳报文都丢掉（实测
+ * ingress packets_in=1 / egress drops=1，而控制面全绿）。这条 ACK 是唯一**当场**给出真实端点
+ * 的时刻——此后所有下发都会从入口的周期上报里读到同一地址，所以纠正只在编排里做一次。
+ *
+ * 为什么是**一处实现、两处调用**：`createRelayTunnel`（隧道 API）与 `reapplyRelayTunnel`
+ *（前向 API 的创建/重入）**都会**下发入口腿。第一版只接了一条，于是真拓扑上的纠正一次都没触发
+ *（出口腿只被应用过 rev1）——"同一份事实有两条投递路径"这条教训，这次落在编排层。
+ */
+async function correctDatagramHopPeerAfterIngressAck(args: {
+  tunnelId: number;
+  revision: number;
+  protocol: ForwardProtocol;
+  ingressAckHopLocalAddr: unknown;
+  connectIp: string | null;
+  egressNode: SchedulableNode;
+  egressPort: number;
+  poolId: number | null;
+  egressTargets: readonly { host: string; port: number; weight?: number; order_by?: number }[];
+  ingressNode: SchedulableNode;
+  ingressPort: number;
+  nextHop: string;
+  tlsPaths: Record<string, unknown>;
+  orchestrator: Orchestrator;
+  /** `resolveDeps()` 之后的 store（它必有值；`SchedulerDeps.db` 本身是可选的）。 */
+  store: SchedulerDb;
+  deps: SchedulerDeps;
+}): Promise<
+  | { ok: true; revision: number; corrected: boolean; hopPeer: string | null }
+  | { ok: false; revision: number; error: string; hopPeer: string | null }
+> {
+  const learned = addressPartOfEndpoint(args.ingressAckHopLocalAddr);
+  if (args.protocol !== "udp" || !learned || learned === firstConnectIp(args.connectIp)) {
+    // 没有纠正要做：不是 datagram、agent 没报（老 Agent）、或报的就是首次下发用的那个地址。
+    return { ok: true, revision: args.revision, corrected: false, hopPeer: learned ?? null };
+  }
+  const correctedRevision = args.revision + 1;
+  // 抬 revision 并落库：Agent 的闸门把「同 revision 的第二次下发」当重复——那是它该做的，
+  // 配置变了就必须是新 revision。
+  await args.store.tunnel.update({
+    where: { id: args.tunnelId },
+    data: { config_revision: correctedRevision, apply_status: APPLY_STATUS.applying },
+  });
+  const egress = await args.orchestrator.dispatchEgress({
+    tunnelId: args.tunnelId,
+    revision: correctedRevision,
+    egressNode: args.egressNode,
+    egressPort: args.egressPort,
+    poolId: args.poolId,
+    targets: args.egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    protocol: args.protocol,
+    hopPeer: learned,
+  });
+  const ingress = egress.ok
+    ? await args.orchestrator.dispatchIngress({
+        tunnelId: args.tunnelId,
+        revision: correctedRevision,
+        ingressNode: args.ingressNode,
+        ingressPort: args.ingressPort,
+        nextHop: args.nextHop,
+        protocol: args.protocol,
+        ...(args.tlsPaths as Record<string, string>),
+      })
+    : null;
+  if (!egress.ok || ingress === null || !ingress.ok) {
+    // 纠正失败 ⇒ 出口此刻对**错的**地址取证（数据面不通），而两条腿的 revision 已不一致。
+    // 按既有口径补偿到"两侧都没有 runtime"，并把这次编排报成失败——不做半成功。
+    const reason = "hop peer correction failed";
+    await args.orchestrator
+      .removeTunnel({ tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason })
+      .catch(() => {});
+    await args.orchestrator
+      .removeTunnel({ tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason })
+      .catch(() => {});
+    await releaseLease({ tunnelId: args.tunnelId }, args.deps.portPoolDeps).catch(() => {});
+    let error = "unknown";
+    if (!egress.ok) error = egress.error;
+    else if (ingress !== null && !ingress.ok) error = ingress.error;
+    return { ok: false, revision: correctedRevision, error: `datagram 跳取证的纠正下发失败：${error}`, hopPeer: learned };
+  }
+  // 「两条腿共用同一个 config_revision」是不变量（§3.2）：纠正把两者一起抬到新 revision。
+  return { ok: true, revision: correctedRevision, corrected: true, hopPeer: learned };
+}
+
 export async function createRelayTunnel(
   input: CreateRelayTunnelInput,
   orchestrator: Orchestrator,
@@ -1033,6 +1129,8 @@ export async function createRelayTunnel(
     store.node.findMany({
       where: { node_group_id: input.inNodeGroupId },
       orderBy: { id: "asc" },
+      // 取证地址要看入口**上报**的跳端点，所以候选查询必须带出上报。
+      include: { state_report: { select: { tunnels: true } } },
     }),
     store.node.findMany({
       where: { node_group_id: input.outNodeGroupId },
@@ -1234,7 +1332,8 @@ export async function createRelayTunnel(
     where: { id: tunnelId },
     select: { config_revision: true },
   });
-  const revision = (Number(current?.config_revision ?? 0) || 0) + 1;
+  // `let`：datagram 的取证纠正会把它抬一格（见下面的 correct_hop_peer）。
+  let revision = (Number(current?.config_revision ?? 0) || 0) + 1;
   await store.tunnel.update({
     where: { id: tunnelId },
     data: { config_revision: revision, apply_status: APPLY_STATUS.applying },
@@ -1274,6 +1373,15 @@ export async function createRelayTunnel(
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
     protocol,
+    // V5.1b WP5-B2: a datagram exit must be told who may feed it. This is the
+    // same `connect_ip` the ingress leg uses for its `next_hop` — one hop, one
+    // address, picked by the same helper.
+    hopPeer: datagramHopPeerFor({
+      // 入口**上报**的跳端点优先；没有上报（还没跑过一拍）才回落 connect_ip。
+      ingressRuntimeId: Orchestrator.relayTunnelId(tunnelId),
+      ingressConnectIp: ingressPick.node.connect_ip,
+      ingressReportedTunnels: ingressPick.node.state_report?.tunnels,
+    }),
   });
   if (!egressDispatch.ok) {
     // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。
@@ -1372,6 +1480,36 @@ export async function createRelayTunnel(
     ok: true,
     meta: { applied_revision: ingressDispatch.result.revision },
   });
+
+  const ingressAckHop = await correctDatagramHopPeerAfterIngressAck({
+    tunnelId,
+    revision,
+    protocol,
+    ingressAckHopLocalAddr: ingressDispatch.result.ack.hop_local_addr,
+    connectIp: ingressPick.node.connect_ip,
+    egressNode: egressPick.node,
+    egressPort: egressAlloc.port,
+    poolId,
+    egressTargets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    ingressNode: ingressPick.node,
+    ingressPort: ingressAlloc.port,
+    nextHop: plan.upstream.next_hop as string,
+    tlsPaths: tlsPathsFor(asRow<Record<string, unknown>>(created) as Record<string, unknown>, plan.protocol.name) as Record<string, unknown>,
+    orchestrator,
+    store,
+    deps,
+  });
+  if (!ingressAckHop.ok) {
+    return fail("apply_ingress", SCHEDULER_ERROR_CODES.invariant_violated, ingressAckHop.error, {
+      tunnelId,
+      revision: ingressAckHop.revision,
+      meta: { hop_peer: ingressAckHop.hopPeer },
+    });
+  }
+  if (ingressAckHop.corrected) {
+    revision = ingressAckHop.revision;
+    steps.push({ step: "correct_hop_peer", ok: true, meta: { revision, hop_peer: ingressAckHop.hopPeer } });
+  }
 
   /* ---------------- ⑩ active ---------------- */
   await persistSuccess(store, tunnelId, { revision, at: deps.now() });
@@ -1576,7 +1714,11 @@ export async function reapplyRelayTunnel(
 
   /* ---------------- ③ bind nodes ---------------- */
   const [inCandidatesRaw, outCandidatesRaw] = await Promise.all([
-    store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
+    store.node.findMany({
+      where: { node_group_id: inNodeGroupId },
+      orderBy: { id: "asc" },
+      include: { state_report: { select: { tunnels: true } } },
+    }),
     store.node.findMany({ where: { node_group_id: outNodeGroupId }, orderBy: { id: "asc" } }),
   ]);
   // Initial apply may schedule from the group. Once concrete placement exists,
@@ -1800,7 +1942,8 @@ export async function reapplyRelayTunnel(
   // 从库里读当前 revision 再 +1：上一次失败可能已推进 applied_revision，
   // 复用同值会被 Agent 的 stale 闸门拒掉，retry 就静默失效。
   const current = await store.tunnel.findUnique({ where: { id: tunnelId }, select: { config_revision: true } });
-  const revision = (Number(current?.config_revision ?? 0) || 0) + 1;
+  // `let`：datagram 的取证纠正会把它抬一格（见 correctDatagramHopPeerAfterIngressAck）。
+  let revision = (Number(current?.config_revision ?? 0) || 0) + 1;
   await store.tunnel.update({
     where: { id: tunnelId },
     data: { config_revision: revision, apply_status: APPLY_STATUS.applying },
@@ -1830,6 +1973,18 @@ export async function reapplyRelayTunnel(
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
     protocol: reapplyProtocol,
+    // V5.1b WP5-B2: the SAME fact the create path passes (a datagram exit attests its
+    // ingress, and the hop has no handshake to imply it). This site was missed on the
+    // first pass — Gate V5-G1B caught it as `egress_apply_rejected … hop_peer`, which is
+    // exactly what the orchestrator's fail-closed check is for. `reapplyRelayTunnel` is
+    // the SECOND delivery path for an egress leg; a fact that only one of them carries
+    // is a fact that works until the day the other one runs.
+    hopPeer: datagramHopPeerFor({
+      // 入口**上报**的跳端点优先；没有上报（还没跑过一拍）才回落 connect_ip。
+      ingressRuntimeId: Orchestrator.relayTunnelId(tunnelId),
+      ingressConnectIp: ingressPick.node.connect_ip,
+      ingressReportedTunnels: ingressPick.node.state_report?.tunnels,
+    }),
   });
   if (!egressDispatch.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
@@ -1963,6 +2118,40 @@ export async function reapplyRelayTunnel(
   }
   steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
   steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
+
+  // V5.1b WP5-B2：前向 API 的**创建**走的就是这条路径（`forward-service` → `reapplyRelayTunnel`），
+  // 所以纠正必须在这里也接上——第一版只接了 `createRelayTunnel`，真拓扑上一次都没触发。
+  const ingressAckHop = await correctDatagramHopPeerAfterIngressAck({
+    tunnelId,
+    revision,
+    protocol: reapplyProtocol,
+    ingressAckHopLocalAddr: ingressDispatch.result.ack.hop_local_addr,
+    connectIp: ingressPick.node.connect_ip,
+    egressNode: egressPick.node,
+    egressPort,
+    poolId,
+    egressTargets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    ingressNode: ingressPick.node,
+    ingressPort,
+    nextHop: plan.upstream.next_hop as string,
+    tlsPaths: tlsPathsFor(row, plan.protocol.name) as Record<string, unknown>,
+    orchestrator,
+    store,
+    deps,
+  });
+  if (!ingressAckHop.ok) {
+    await teardownDispatched("hop peer correction failed");
+    // 注意：reapply 的 `fail()` 只收 `{ revision, meta }`（tunnelId 是它的第一个参数所隐含的），
+    // 与 create 的那份签名不同 —— 照抄 create 的调用形状会被 tsc 拦住。
+    return fail("apply_ingress", SCHEDULER_ERROR_CODES.invariant_violated, ingressAckHop.error, {
+      revision: ingressAckHop.revision,
+      meta: { hop_peer: ingressAckHop.hopPeer },
+    });
+  }
+  if (ingressAckHop.corrected) {
+    revision = ingressAckHop.revision;
+    steps.push({ step: "correct_hop_peer", ok: true, meta: { revision, hop_peer: ingressAckHop.hopPeer } });
+  }
 
   /* ---------------- ⑩ active ---------------- */
   await persistSuccess(store, tunnelId, { revision, at: deps.now() });

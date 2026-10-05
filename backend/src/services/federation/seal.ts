@@ -42,7 +42,26 @@ function fromB64url(s: string): Buffer {
  * 32 字节输出 = AES-256。
  */
 export function deriveSealKey(secret: string): Buffer {
-  const out = hkdfSync("sha256", Buffer.from(secret, "utf8"), HKDF_SALT, Buffer.from(FEDERATION_SEAL_INFO, "utf8"), KEY_BYTES);
+  return deriveKeyFor(FEDERATION_SEAL_INFO, secret);
+}
+
+/**
+ * V5-WP17.2：DDNS 凭据的 HKDF info。
+ *
+ * 独立 info 不是洁癖：同一把派生密钥被两个用途共用时，一处泄漏就等于两处都泄漏，
+ * 而"换用途"本该是**改一行 info** 就能做到的事。契约 F6 明确要求 DDNS 凭据用封存形态，
+ * 本常量就是它的域分离标签。
+ */
+export const DDNS_SEAL_INFO = "tunex-ddns-v1";
+
+/** DDNS 凭据的封装密钥（与联邦那套**不共用**）。 */
+export function deriveDdnsSealKey(secret: string): Buffer {
+  return deriveKeyFor(DDNS_SEAL_INFO, secret);
+}
+
+/** 通用派生：info 是唯一区分用途的东西（见上面两条注释）。 */
+function deriveKeyFor(info: string, secret: string): Buffer {
+  const out = hkdfSync("sha256", Buffer.from(secret, "utf8"), HKDF_SALT, Buffer.from(info, "utf8"), KEY_BYTES);
   return Buffer.from(out);
 }
 

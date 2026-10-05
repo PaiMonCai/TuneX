@@ -1,0 +1,97 @@
+V5-WP19-D Looking Glass —— Gate 证据（2026-10-05）
+工作树: /workspace/TuneX/.worktrees/v5-1b-udp-relay   分支: feature/v5-1b-udp-relay
+契约依据: docs/v5-wp19-latency-observability-contract.md §3 D7 / §4.0 O2 / §5 WP19-D / §7 G19.9–G19.13
+证据生成方式: 每条命令都是原样执行后把真实输出贴进来（不是手抄的期望值）。
+
+── 1. 面板侧服务层（我的新文件）──
+$ cd backend && TMPDIR=/tmp bun test src/services/__tests__/v5-wp19/v5-wp19-d-looking-glass.test.ts
+ 150 pass
+ 0 fail
+ 474 expect() calls
+Ran 150 tests across 1 file.
+
+覆盖: 地址向量表 79 条（与 Go 侧同一张表）/ 写法变体不进解析器 8 条 /
+别名域名解析到私网 5 条 / 默认开关 5 条（含"关闭时明确 code 而不是空结果"、
+"管理员例外必须在审计里可辨认"）/ 跨租户 2 条 / 单飞 5 条（含失败也释放、TTL 兜底）/
+能力协商 4 条 / 结果完整性与脱敏 7 条 / 线形与上限 8 条 / 审计纪律 4 条 /
+源码级重建边界守卫 15 条 / 命令总线与 ACK 覆盖性 5 条。
+
+── 2. 面板侧路由层（Hono app.request，不连 DB/Redis）──
+$ cd backend && TMPDIR=/tmp bun test src/routes/__tests__/v5-wp19-d-looking-glass-route.test.ts
+ 11 pass
+ 0 fail
+ 45 expect() calls
+Ran 11 tests across 1 file.
+
+覆盖: 200 成功路径 + GET /status（关闭时不 403，只如实回 enabled=false）/
+G19.9 私网与写法变体 ⇒ 400 且零下发 / G19.10 跨租户 ⇒ 404 且零下发 /
+G19.11 并发第二条 ⇒ 409 looking_glass_busy 且第一条不受影响 /
+G19.12 未广告动作 ⇒ 409 upgrade_required 且**入队前**拒绝（无 ACK 等待窗口）/
+默认关 ⇒ 403 looking_glass_disabled（有 code 与 error_layer）/ G19.13 响应无凭据无载荷。
+
+── 3. 回归（既有文件；确认没有把别人的断言弄红）──
+$ cd backend && TMPDIR=/tmp bun test \
+    src/services/__tests__/control-protocol.test.ts \
+    src/services/__tests__/diagnose-contract-v4.test.ts \
+    src/services/__tests__/agent-command-bus-ack.test.ts \
+    src/services/__tests__/agent-diagnose-v4.test.ts \
+    src/services/__tests__/runtime-admission-v5.test.ts \
+    src/services/__tests__/node-telemetry-contract.test.ts \
+    src/services/__tests__/v5-wp19/v5-wp19-b-latency-history.test.ts \
+    src/services/__tests__/v5-wp19/v5-wp19-f-diag-boundaries.test.ts \
+    src/services/__tests__/v5-wp19/v5-wp19-f-diag-facts.test.ts \
+    src/services/__tests__/v5-wp19/v5-wp19-d-looking-glass.test.ts \
+    src/routes/__tests__/v5-wp19-d-looking-glass-route.test.ts
+ 344 pass
+ 0 fail
+ 1206 expect() calls
+Ran 344 tests across 11 files.
+（这一批连跑 3 次结果一致。control-protocol.test.ts 里"动作清单冻结断言"被**有意**加上
+ `looking_glass`，理由写在该测试文件里：那是契约扩容，不是放宽。）
+
+注意（给下一个人）：**不要**用 `bun test src/services/__tests__/v5-wp19/`（整个目录）当回归命令。
+这个目录里有另外两位成员在途写的文件，实测在别人保存到一半时批量跑会报出与本次改动无关的
+2 条失败（同一命令随后连跑三次都是 344/0/1206）。用显式文件路径。
+
+── 4. 类型检查 ──
+$ cd backend && TMPDIR=/tmp bunx tsc --noEmit
+本 WP 触碰的文件: 0 报错（按 looking-glass|control-protocol|agent-command-bus|v5-wp19|src/env.ts 过滤无命中）。
+当前工作树另有 2 条报错，都在**别的 WP 的在途文件**里（v5-wp18-delivery.test.ts /
+v5-wp18-announcement-mute.test.ts 的 NotificationFact.source_kind 收窄）；本 WP 未 import
+这些模块，交集为空。
+
+── 5. Agent 侧（Go）──
+$ cd agent && GOCACHE=/tmp/gocache-tunex GOTMPDIR=/tmp go build ./...            → BUILD OK
+$ cd agent && GOCACHE=/tmp/gocache-tunex GOTMPDIR=/tmp go test -count=1 ./internal/diag/ ./internal/control/
+ok  	github.com/tunex/agent/internal/diag	0.038s
+ok  	github.com/tunex/agent/internal/control	11.842s
+
+Go 侧覆盖: 与面板同一张地址向量表（含 IPv4/IPv6 私网/环回/链路本地/多播/保留段/
+映射形式/十进制/八进制/十六进制/短形式/方括号/zone）; 混入一个私网目标 ⇒ 整请求拒绝且
+`dialed == 0`（零发包）; 拨号串必须是"字面地址:端口"（`[v6]:port` 形式）; 结果里不得出现
+`resolved_ip`; 方法闭集/端口/重复目标上限; 超时被硬上限 clamp 且每次尝试都带 deadline;
+**源码级守卫**：`lookingglass.go` 的执行代码里不得出现任何名称解析调用
+（LookupHost/LookupIP/Resolve*/net.ParseIP/net.Dial(），拨号串必须由
+`JoinHostPort(规范化字面地址, 端口)` 拼装。
+
+── 6. Gate 映射（契约 §7）──
+G19.9 LG 拒私网            ✅ 单测层：面板 400 + 零下发；Agent 侧整请求拒绝 + 零发包。
+                             ❗真拓扑条目（对真节点发起、看 Agent 日志里没有连接尝试）需要
+                             ① 的 UDP RELAY 线落地后一起跑，见下方"未覆盖"。
+G19.10 LG 跨租户拒绝        ✅ 路由层 404 + 零下发 + 审计留痕（连解析都不做）。
+                             ❗真拓扑条目（A 的凭据/工作空间用 B 的 nodeId）同上。
+G19.11 LG 单节点单任务      ✅ 服务层 + 路由层：在途第二条 409，第一条不受影响；失败也释放。
+                             ⚠️ 已知边界：锁是**进程内**的，多副本部署时不是全局锁（契约 §5.3 待办）。
+G19.12 LG 未广告 action     ✅ 路由层：409 upgrade_required，且断言整条请求 < 500ms 返回
+                             （"入队前拒绝"= 没有 ACK 等待窗口的机械证据）。
+G19.13 LG 结果脱敏          ✅ 单测层：响应/结果逐字段重建、未知字段丢弃、detail 截断 160；
+                             审计只记 方法/目标/结果码，不含载荷。
+                             ❗真拓扑条目（跑一次真实测试后抓产物）待跑。
+
+── 7. 未覆盖 / 明确做不到的 ──
+· 真拓扑端到端（G19.9/G19.10/G19.13 的"真节点"版本）：本工作树没有可用 docker 拓扑，
+  且任务纪律要求不动 docker/e2e 拓扑。因此这些条目只覆盖到"拒绝发生在发包之前"的替身层，
+  真拓扑那半截需要 ①（UDP RELAY）线落地后在 v5-g1b 那套里补。
+· 面板侧 DNS 行为：替身解析器不模拟真实 DNS；"面板用 resolve4/resolve6、不读 /etc/hosts"
+  是**代码事实**（源码级守卫断言唯一出站解析调用是 `node:dns/promises`），不是测试事实。
+· 多副本部署下的全局单飞：未实现（进程内锁），已在契约 §5.3 记为待办，不假装支持。

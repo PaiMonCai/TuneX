@@ -1,0 +1,21 @@
+-- V5-WP20-3 —— 结算 `pending` 行的接管超时登记为 SystemConfig 项（契约 §3.1.4 / O4）。
+--
+-- 契约：docs/v5-wp20-subscription-billing-runtime-contract.md §3.1.4（先占位后执行的幂等 +
+-- 崩溃接管）、O4（「接管超时取多少」= 可实现层默认，**须登记**，不得硬编码）。
+--
+-- 唯一改动：给既有 `config.name` 这个 MySQL ENUM **尾部追加**一个值
+-- `BILLING_SETTLEMENT_TAKEOVER_MINUTES`（分钟，字符串数字）。这是本仓既有先例
+-- （`20261019000000_v5_wp10_failover_policy` 追加 `FAILOVER_POLICY` 的同一形状）。
+--
+-- 为什么加在**尾部**：MySQL ENUM 的值是按序号存储的，插入到中间会让既有行的含义整体错位；
+-- 追加在尾部则所有存量行逐字节不变（本迁移对数据零影响，也没有回填）。
+--
+-- 为什么不是代码常量：超时越小越容易重复执行同一周期（所以结算必须幂等可重放，见
+-- `services/subscription-billing.ts` 的唯一键占位），越大则崩溃遗留的 `pending` 越晚被接管。
+-- 这是运维权衡，不该由发版决定；缺省行不存在时代码回落 10 分钟（与充值订单超时同口径）。
+--
+-- 为什么用 ENUM 而不是 VARCHAR：`config.name` 本来就是这个枚举，改类型会牵动全部读配置的代码
+-- （契约 §8.5「不改 V4 冻结基线」）；追加一个值不新增枚举类型，DoD 第 7 条（`enum .*Status`
+-- 数量不增加）不受影响。
+
+ALTER TABLE `config` MODIFY `name` ENUM('MIN_TOPUP_AMOUNT', 'FAILOVER_POLICY', 'NOTICE', 'NOTICE_POPUP', 'NOTICE_POPUP_INTERVAL_HOURS', 'SITE_NAME', 'SITE_DESCRIPTION', 'ALLOW_REGISTER', 'LOGO_URL', 'HIDE_NODE_STATUS', 'AUTO_UPDATE_AGENT', 'CHATWOOT_BASE_URL', 'CHATWOOT_TOKEN', 'TUNNEL_TRAFFIC_RETENTION_DAYS', 'HIDE_FOOTER', 'HIDE_DOCS', 'LANDING_PAGE_URL', 'REFERRAL_COMMISSION_RATE', 'REFERRAL_FIRST_ONLY', 'REFERRAL_MODE', 'OBSERVER_PERIOD', 'EMAIL_PROVIDER', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'RESEND_API_KEY', 'RESEND_FROM', 'MIN_WITHDRAW_AMOUNT', 'WITHDRAW_METHODS', 'LIMIT_SCOPE', 'ENABLE_SUBSCRIPTION', 'BILLING_SETTLEMENT_TAKEOVER_MINUTES') NOT NULL;

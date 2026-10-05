@@ -17,8 +17,11 @@
  */
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { db } from "../db.ts";
+// V5-WP20-6：计量窗口起点统一委托固定时区的纯函数模块（DoD 第 8 条）。
+import { billingDayStart, billingMonthStart } from "./billing-time.ts";
 import {
   composeEffectivePolicy,
+  describeDeny,
   type ComposeInput,
   type EffectivePolicy,
   type PolicyAssignment,
@@ -124,7 +127,18 @@ const POLICY_SELECT = {
 /* 缓存（显式失效 + 短 TTL 兜底）                                       */
 /* ------------------------------------------------------------------ */
 
-const cache = new Map<number, { value: EffectivePolicy; at: number }>();
+/**
+ * 策略缓存：`Map<workspace_id, { value, stored_at_ms }>`。
+ *
+ * **两种时间观必须分开**（V5-WP20 修）：条目里的 `stored_at_ms` 是**墙钟**（`Date.now()`），
+ * 它决定「这条缓存还能用多久」；而 `value` 是**按调用方传入的 `now` 计算出来的**策略内容。
+ * 混用两者会得出很坏的结果：
+ *   · 用**调用方 now** 当基准 ⇒ 一个传未来时刻的调用方（门禁、回填、将来的 `TUNNEL_BILLING_NOW`
+ *     类开关）会让条目"永远年轻"（`now - at` 恒为负/极小），把「未来那一刻」的策略钉给所有人；
+ *   · `noCache: true` 若仍然**写**缓存 ⇒ 一个声明"我要按这个时刻重算"的调用方反而成了**污染源** ——
+ *     而契约 §3.2.1 恰恰要求**判定侧**走 `noCache` 每次重算。所以：`noCache` = 不读**也不写**。
+ */
+const cache = new Map<number, { value: EffectivePolicy; stored_at_ms: number }>();
 const CACHE_TTL_MS = Number(process.env.POLICY_CACHE_TTL_MS ?? 1000);
 
 /** 策略发放变更（授予/撤销/到期/修改）后必须调用，保证「撤权立即生效」。 */
@@ -174,13 +188,18 @@ export async function getEffectivePolicy(
   opts: { now?: Date; client?: DbLike; noCache?: boolean } = {},
 ): Promise<EffectivePolicy> {
   const now = opts.now ?? new Date();
-  if (!opts.client && !opts.noCache) {
+  // `noCache` = 不读**也不写**：判定侧按契约 §3.2.1 走这条路"每次重算"，
+  // 若仍然写缓存，它就会把"按这个时刻算出来的结果"发布给所有其它调用方。
+  // 传了 `client`（注入型调用）同样完全不碰进程级缓存。
+  const cacheable = !opts.client && !opts.noCache;
+  if (cacheable) {
     const hit = cache.get(workspaceId);
-    if (hit && now.getTime() - hit.at < CACHE_TTL_MS) return hit.value;
+    // TTL 用**墙钟**衡量（缓存寿命是进程的真实时间），与策略内容的计算时刻 `now` 无关。
+    if (hit && Date.now() - hit.stored_at_ms < CACHE_TTL_MS) return hit.value;
   }
   const inputs = await loadPolicyInputs(workspaceId, opts.client ?? db);
   const policy = composeEffectivePolicy({ workspace_id: workspaceId, ...inputs, now, graceMs: POLICY_GRACE_MS });
-  if (!opts.client) cache.set(workspaceId, { value: policy, at: now.getTime() });
+  if (cacheable) cache.set(workspaceId, { value: policy, stored_at_ms: Date.now() });
   return policy;
 }
 
@@ -272,18 +291,107 @@ export async function sumWorkspaceTraffic(
   return agg._sum.traffic ?? 0;
 }
 
+/**
+ * 计量周期起点（V5-WP20-6：委托 `billing-time.ts` 的固定时区实现）。
+ *
+ * 与 `capability-policy.ts#trafficWindowStart` 是**同一件事**（DoD 第 8 条要求这两个文件里
+ * 都不再出现按进程时区取整的日界调用）；保留两个入口是因为调用方分别在 DB 层与纯函数层，
+ * 但两者的实现都只有一行委托，永远不会再漂移。
+ */
 function trafficStart(period: TrafficPeriodName, now: Date): Date | null {
   if (period === "total") return null;
-  const d = new Date(now.getTime());
-  d.setHours(0, 0, 0, 0);
-  if (period === "day") return d;
-  d.setDate(1);
-  return d;
+  return period === "day" ? billingDayStart(now) : billingMonthStart(now);
+}
+
+/**
+ * **联邦远端腿用量**（字节）：已归因到本 workspace 的隧道的那些行。
+ *
+ * 契约 §3.3.5 / O5 裁决：联邦用量**不计入**本面板额度（与「Usage authority = host panel」一致），
+ * 但缺口必须**可观测**——所以它作为独立字段出现在用量报告里，**不**加进 `traffic_used`。
+ *
+ * 为什么不并进 `traffic_used`：那会把两个账本（`tunnel_traffic` 与 `federation_usage_record`）
+ * 合成一个数，从而引入「谁权威」的模糊（契约 §10）。这个字段的语义就是「额度看不见的那部分」。
+ *
+ * 归因规则（唯一实现）：按 `tunnel_id` 关联本 workspace 的隧道求和。
+ * `tunnel_id IS NULL` 的行**无法归因到任何 workspace**（联邦侧收不到归属），
+ * 它们属于平台级不可归因桶，不会出现在某个租户的报告里 —— 这也是为什么本函数按 workspace 查。
+ *
+ * 用原生 SQL 而不是 Prisma 的 relation filter：`federation_usage_record.tunnel_id` **没有外键**
+ * （联邦表统一取向：跨面板引用不加 FK），Prisma 侧没有关系可走；把本 workspace 的 tunnel id
+ * 全查出来再 `IN (...)` 会在隧道多的租户上退化。`bytes_*` 是 `BigInt`，这里转 `number`
+ * （流量以字节计，`Number.MAX_SAFE_INTEGER` ≈ 9 PB，超出才有精度损失，属可接受边界，已在此注明）。
+ */
+export async function sumFederatedUnattributedTraffic(
+  workspaceId: number,
+  client: FederatedUsageClient = db,
+): Promise<number> {
+  const rows = await client.$queryRaw<Array<{ total: bigint | number | null }>>`
+    SELECT COALESCE(SUM(f.bytes_in + f.bytes_out), 0) AS total
+    FROM federation_usage_record f
+    JOIN tunnel t ON t.id = f.tunnel_id
+    WHERE t.workspace_id = ${workspaceId}`;
+  const total = rows[0]?.total ?? 0;
+  return typeof total === "bigint" ? Number(total) : Number(total ?? 0);
+}
+
+/** {@link sumFederatedUnattributedTraffic} 的最小依赖面（便于单测注入）。 */
+export interface FederatedUsageClient {
+  /** 与 Prisma 的 `$queryRaw` 同形：`T` 是**结果集**类型（`Array<...>`），不是行类型。 */
+  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>;
 }
 
 export interface WorkspaceUsageReport extends WorkspaceUsage {
   policy: EffectivePolicy;
   limits: PolicyLimitSet;
+  /**
+   * 联邦远端腿用量（字节，**不计入** `traffic_used`；契约 §3.3.5 的可观测缺口）。
+   * 注意：本报告目前**没有挂载端点**（见契约 §5.6 的未决项），字段为将来的 capabilities
+   * 端点准备；当前唯一对外可见的用量面是 `GET /api/workspaces/:id/traffic`。
+   */
+  traffic_used_unattributed_federated: number;
+  /** 到期/宽限的可观测投影（V5-WP20-5，见 {@link buildUsageExpiryView}）。 */
+  expiry: UsageExpiryView;
+}
+
+/**
+ * 到期 / 宽限的可观测投影（V5-WP20-5）。
+ *
+ * **它只是 `EffectivePolicy` 的投影，不是第二真相**：所有值都由入参现算，不落库、不参与判定。
+ * 存在的理由是让前端少写一套派生逻辑（尤其 `deny_message` —— 拒绝文案的唯一实现是
+ * `capability-policy#describeDeny`，前端不该再抄一份中文）。
+ *
+ * 四条语义（每条都有反例测试）：
+ *   · `policy_expires_at` = **当前生效发放**里最早的到期点；全部终身 / 无生效发放 ⇒ `null`。
+ *     反例：取「最晚」会把「最早消失的那条」藏起来，用户看到还有余额却突然被拒。
+ *   · `in_grace` = 一条有效发放都没有、但仍有**在宽限期内**的已到期发放（F3）。
+ *     此时策略仍放行，只是 `deny_reason="policy_expired"`。
+ *   · `grace_expires_at` = 宽限窗口的终点（过了它就 `deny_scope`）。
+ *   · `deny_message` = `describeDeny(deny_reason)` 的原文（`null` = 没有被拒绝）。
+ *     `deny_scope=true` 时 `deny_reason="no_active_policy"`，文案同样是后端给的。
+ */
+export interface UsageExpiryView {
+  policy_expires_at: string | null;
+  in_grace: boolean;
+  grace_expires_at: string | null;
+  deny_scope: boolean;
+  deny_reason: string | null;
+  deny_message: string | null;
+}
+
+/** {@link UsageExpiryView} 的唯一实现（纯函数：喂 `EffectivePolicy` 即得）。 */
+export function buildUsageExpiryView(policy: EffectivePolicy): UsageExpiryView {
+  const expiries = policy.active_policies
+    .map((p) => (p.expires_at ? Date.parse(p.expires_at) : Number.NaN))
+    .filter((ms) => Number.isFinite(ms));
+  const in_grace = policy.grace_policies.length > 0;
+  return {
+    policy_expires_at: expiries.length ? new Date(Math.min(...expiries)).toISOString() : null,
+    in_grace,
+    grace_expires_at: policy.grace_expires_at,
+    deny_scope: policy.deny_scope,
+    deny_reason: policy.deny_reason,
+    deny_message: policy.deny_reason ? describeDeny(policy.deny_reason) : null,
+  };
 }
 
 /** 给 `/api/me/capabilities` 与仪表盘用的完整用量 + 限额视图。 */
@@ -293,13 +401,23 @@ export async function getWorkspaceUsageReport(
 ): Promise<WorkspaceUsageReport> {
   const now = opts.now ?? new Date();
   const policy = await getEffectivePolicy(workspaceId, { now });
-  const [tunnels, nodes, members, traffic_used] = await Promise.all([
+  const [tunnels, nodes, members, traffic_used, federated] = await Promise.all([
     countWorkspaceTunnels(workspaceId),
     countWorkspaceNodes(workspaceId),
     countWorkspaceMembers(workspaceId),
     sumWorkspaceTraffic(workspaceId, policy.limits.traffic_period, now),
+    sumFederatedUnattributedTraffic(workspaceId),
   ]);
-  return { tunnels, nodes, members, traffic_used, policy, limits: policy.limits };
+  return {
+    tunnels,
+    nodes,
+    members,
+    traffic_used,
+    traffic_used_unattributed_federated: federated,
+    expiry: buildUsageExpiryView(policy),
+    policy,
+    limits: policy.limits,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -332,6 +450,108 @@ export async function ensureDefaultPolicy(workspaceId: number): Promise<void> {
     await assignDefaultPolicy(tx, { id: ws.id, kind: ws.kind });
   });
   invalidatePolicyCache(workspaceId);
+}
+
+/* ------------------------------------------------------------------ */
+/* 购买 → 发放接线（V5-WP20-4）                                         */
+/* ------------------------------------------------------------------ */
+
+/** {@link grantPolicyFromPurchase} 的输入：一次已完成的购买事实。 */
+export interface PurchaseGrantInput {
+  workspace_id: number;
+  /** 套餐显式绑定的策略（`Plan.policy_id`）。NULL ⇒ **不发放**，见函数注释。 */
+  policy_id: number | null;
+  /** 发放到期点 = 订阅到期点（`null` = 终身）。两者必须同源，否则会出现「订阅还在、权限已过」。 */
+  expires_at: Date | null;
+  /**
+   * 换套餐时被替换掉的旧策略 id（旧套餐绑定的那条）。同事务把它的 `purchase` 发放**显式撤销**，
+   * 避免「两份套餐的并集」并存 —— 与 `routes/plans.ts` 的「换套餐 = 替换期限」语义一致。
+   */
+  replace_policy_id?: number | null;
+  /** 审计备注（订单号等），进 `note`。 */
+  note?: string | null;
+  /** 时间点（默认 `new Date()`；调用方在同事务里应传同一个 `now`）。 */
+  now?: Date;
+}
+
+/** {@link grantPolicyFromPurchase} 的结果（可观测：为什么没发）。 */
+export interface PurchaseGrantResult {
+  granted: boolean;
+  policy_id: number | null;
+  /** 未发放时的原因码（给人看，判定不依赖它）。 */
+  reason?: "plan_policy_unbound";
+  /** 同事务撤销掉的旧 purchase 发放条数。 */
+  revoked: number;
+}
+
+/**
+ * **`purchase` 来源发放的唯一写入点**（契约 §3.2.2 / DoD 第 2 条）。
+ *
+ * 调用约定：**必须在购买事务内**调用（与扣款、订单、订阅同事务 —— 契约 §3.5 的 R6：
+ * 授权同步失败必须回滚，不得扣钱不留权）；提交**之后**由调用方执行
+ * `invalidatePolicyCache(workspace_id)`，因为缓存失效只该发生在事实已经落库之后。
+ *
+ * 三条不变量：
+ *   1. **发放必须显式**：只认 `input.policy_id`（来自 `Plan.policy_id`）。`NULL` ⇒ 不发放、
+ *      返回 `reason="plan_policy_unbound"`。**绝不**从 `Plan.max_tunnels`/`traffic` 反推策略，
+ *      也不挑一条模板顶上（§3.5.3 明确不做③；F5/F6：判定只认「哪条发放存在」）。
+ *   2. **幂等**：同一 `(workspace_id, policy_id)` 重复调用只更新那一行（同套餐续期 = 延长
+ *      `expires_at`），靠既有 `@@unique([workspace_id, policy_id])`。
+ *   3. **`effective_at` 不后移**：续期时取 `min(原 effective_at, now)`。反例：若把 `effective_at`
+ *      设成新到期点之前的某刻（如 `max(now, 旧到期)`），提前续费的用户会从「已生效」变成
+ *      「尚未生效」——付了钱却当场失去准入。
+ */
+export async function grantPolicyFromPurchase(
+  tx: Prisma.TransactionClient,
+  input: PurchaseGrantInput,
+): Promise<PurchaseGrantResult> {
+  if (input.policy_id === null) {
+    return { granted: false, policy_id: null, reason: "plan_policy_unbound", revoked: 0 };
+  }
+  const now = input.now ?? new Date();
+
+  // 换套餐：先撤掉旧套餐的 purchase 发放（只撤 purchase，不动 admin_grant/system_default）。
+  let revoked = 0;
+  if (input.replace_policy_id && input.replace_policy_id !== input.policy_id) {
+    const result = await tx.workspacePolicyAssignment.updateMany({
+      where: {
+        workspace_id: input.workspace_id,
+        policy_id: input.replace_policy_id,
+        source: "purchase",
+        revoked_at: null,
+      },
+      data: { revoked_at: now },
+    });
+    revoked = result.count;
+  }
+
+  const existing = await tx.workspacePolicyAssignment.findUnique({
+    where: { workspace_id_policy_id: { workspace_id: input.workspace_id, policy_id: input.policy_id } },
+    select: { effective_at: true },
+  });
+  const effective_at =
+    existing && existing.effective_at.getTime() < now.getTime() ? existing.effective_at : now;
+
+  await tx.workspacePolicyAssignment.upsert({
+    where: { workspace_id_policy_id: { workspace_id: input.workspace_id, policy_id: input.policy_id } },
+    create: {
+      workspace_id: input.workspace_id,
+      policy_id: input.policy_id,
+      source: "purchase",
+      effective_at,
+      expires_at: input.expires_at,
+      note: input.note ?? null,
+    },
+    // 续期：解封（曾因过期被撤销/置空的行）并把截止点推到新到期点；`effective_at` 只前移不后移。
+    update: {
+      revoked_at: null,
+      effective_at,
+      expires_at: input.expires_at,
+      note: input.note ?? null,
+    },
+  });
+
+  return { granted: true, policy_id: input.policy_id, revoked };
 }
 
 /* ------------------------------------------------------------------ */

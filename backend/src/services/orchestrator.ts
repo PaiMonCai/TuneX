@@ -73,6 +73,8 @@ import { claimLease, releaseLease as releasePlacementLease } from "./placement-l
 import type { RoutePlan } from "./forward-route.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
+  FORWARD_PROTOCOL_SPECS,
+  firstConnectIp,
   wireTunnelTypeForForwardProtocol,
   type ForwardProtocol,
 } from "./forward-contract.ts";
@@ -102,6 +104,17 @@ export interface AgentTunnelConfig {
   remote_port: number;
   /** RELAY 模式必填：`<egress node ip>:<egress port>`（validate 会强校验）。 */
   next_hop: string;
+  /**
+   * V5.1b WP5-B2 —— datagram（`protocol=udp`）**出口腿**的取证地址：配对入口节点的地址。
+   *
+   * UDP 的跳没有握手，出口无法推断谁可以喂它；缺了它出口会拒绝构建（Agent 侧是硬校验）。
+   * 只在 `protocol=udp` 下发：其他协议的跳是裸 TCP，字段带了没人读。
+   *
+   * 与 `next_hop` 是**同一条事实的两个方向**（入口怎么找到出口 / 出口只认哪个入口），
+   * 因此两者必须由同一处挑选（`forward-contract.dispatchFactsFromRow` 的 `firstConnectIp`），
+   * 否则两条腿会指向不同的地址。
+   */
+  hop_peer?: string;
   targets: { host: string; port: number; weight: number; order: number }[];
   /**
    * V5.2 WP7 —— 合成后的目标健康，**与 `targets` 平行**而不是塞进每个 target 里。
@@ -204,6 +217,15 @@ export const RELAY_DISPATCH_ERROR_CODES = {
   revision_mismatch: "revision_mismatch",
   /** 节点没有可用于转发的地址（connect_ip 解析不出）。 */
   node_unaddressable: "node_unaddressable",
+  /**
+   * V5.1b WP5-B2：datagram（udp）出口腿没有 `hop_peer`。
+   *
+   * 与 `route_not_dispatchable` 同一取向的"宁可拒绝"：datagram 的跳是 UDP，
+   * **没有握手能说明对面是谁**，出口必须被明确告知谁可以喂它。入口节点的地址只有面板
+   * 知道，所以这条事实缺了就是缺了——在这里拒绝，而不是把一份出口会拒绝的配置发出去
+   * （那会让故障出现在很远的地方，且以 agent_rejected 的形式掩盖真实原因）。
+   */
+  datagram_hop_peer_missing: "datagram_hop_peer_missing",
 } as const;
 
 export type RelayDispatchErrorCode =
@@ -438,6 +460,13 @@ export interface DispatchEgressInput {
   /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
   tlsCertPath?: string | null;
   tlsKeyPath?: string | null;
+  /**
+   * V5.1b WP5-B2：配对**入口**节点的地址（`protocol=udp` 时必填）。
+   *
+   * UDP 的跳没有握手，出口无法自行推断谁可以喂它；这个地址就是出口取证的那条事实。
+   * 其他协议不读它——它们的跳是裸 TCP，带一个没人读的字段只会慢慢漂移。
+   */
+  hopPeer?: string | null;
 }
 
 export interface DispatchIngressInput {
@@ -553,7 +582,9 @@ export interface OrchestratorOptions {
  */
 function parseAgentAck(
   raw: unknown,
-): { ok: true; applied_revision?: number } | { ok: false; error_code?: string; error?: string } {
+):
+  | { ok: true; applied_revision?: number; hop_local_addr?: string }
+  | { ok: false; error_code?: string; error?: string } {
   if (raw === null || raw === undefined) return { ok: true };
   if (typeof raw !== "object") return { ok: false, error: `非对象响应体: ${String(raw)}` };
   const r = raw as Record<string, unknown>;
@@ -573,7 +604,16 @@ function parseAgentAck(
     };
   }
   const rev = r.applied_revision ?? r.revision;
-  return { ok: true, applied_revision: typeof rev === "number" ? rev : undefined };
+  return {
+    ok: true,
+    applied_revision: typeof rev === "number" ? rev : undefined,
+    // V5.1b WP5-B2: the datagram RELAY agent reports the hop endpoint it actually uses.
+    // Read it here so it can ride the synthesized `command_ack` below — the response body
+    // is the only place this fact exists.
+    ...(typeof r.hop_local_addr === "string" && r.hop_local_addr.trim() !== ""
+      ? { hop_local_addr: r.hop_local_addr }
+      : {}),
+  };
 }
 
 /**
@@ -752,6 +792,15 @@ export class Orchestrator {
 
     const listeningAt = new Map<number, { host: string; port: number }>();
 
+    // V5.1b WP5-B2: the exit hop of a datagram route must attest its ingress, and
+    // the ingress is the FIRST hop of this plan — resolved once, here, because the
+    // reverse dispatch order (far to near) would otherwise make "who fed me"
+    // depend on which hop happened to be dispatched first.
+    const ingressHop = input.plan.hops.find((h) => h.role === "ingress");
+    const ingressAddress = ingressHop
+      ? firstConnectIp(input.hop_nodes[ingressHop.hop_index]?.connect_ip ?? null)
+      : null;
+
     for (let i = hops.length - 1; i >= 0; i -= 1) {
       const hop = hops[i]!;
       const port = input.hop_ports[hop.hop_index];
@@ -812,6 +861,12 @@ export class Orchestrator {
         targets,
         lbStrategy: isEgress ? input.lbStrategy : null,
         protocol: input.protocol,
+        // Only the EXIT hop attests an ingress: a transit hop is fed by the hop
+        // before it, not by the ingress, so handing it the ingress address would be
+        // a wrong attestation rather than a missing one. (Datagram transit is not
+        // supported in v1 — omitting the field makes the orchestrator refuse it
+        // loudly instead of building a transit that cannot attest anyone.)
+        ...(isEgress ? { hopPeer: ingressAddress } : {}),
       });
       if (!dispatched.ok) return dispatched;
       listeningAt.set(hop.hop_index, { host: dispatched.egress_host, port });
@@ -970,6 +1025,24 @@ export class Orchestrator {
       targetHealth = undefined;
     }
 
+    // V5.1b WP5-B2: a datagram exit attests who may feed it, and the hop is UDP —
+    // there is no handshake to imply the peer. Refusing HERE (rather than shipping a
+    // config the exit will refuse) keeps the failure at the layer that owns the
+    // requirement, and the error code names the missing fact.
+    //
+    // The gate is the TRANSPORT, not the protocol name: "a datagram exit attests its
+    // ingress" is a property of the datagram hop, so a future datagram protocol
+    // inherits it instead of quietly missing it.
+    const isDatagram = FORWARD_PROTOCOL_SPECS[protocol].transport === "datagram";
+    const hopPeer = (input.hopPeer ?? "").trim();
+    if (isDatagram && hopPeer === "") {
+      return {
+        ok: false,
+        error_code: RELAY_DISPATCH_ERROR_CODES.datagram_hop_peer_missing,
+        error: `datagram EGRESS 腿 ${egressId} 缺少 hop_peer（配对入口地址）：datagram 跳没有握手，出口无法取证`,
+      };
+    }
+
     const config: AgentTunnelConfig = {
       id: egressId,
       mode: "EGRESS",
@@ -984,6 +1057,9 @@ export class Orchestrator {
       // Absent when there is no signal at all, so the wire says "nothing to say"
       // rather than "every target is unknown".
       ...(targetHealth ? { target_health: targetHealth } : {}),
+      // Only datagram tunnels carry it: for a stream hop the field would be a fact
+      // nobody reads, and an unread fact is how two paths drift apart.
+      ...(isDatagram && hopPeer ? { hop_peer: hopPeer } : {}),
       lb_strategy: normalizeLbStrategy(input.lbStrategy),
       protocol,
       speed_limit: 0,
@@ -1336,6 +1412,13 @@ export class Orchestrator {
           // Agent 回显 applied_revision；没有就给下发值（老版本 agent）。
           applied_revision: ack.applied_revision ?? envelope.revision,
           status: "applied",
+          // V5.1b WP5-B2: carry the datagram hop endpoint the agent just reported. This
+          // is the ONE place the agent's own ACK fields are folded into the synthesized
+          // `command_ack` envelope, so a field not listed here is silently dropped —
+          // and the panel would then never learn which address to attest.
+          ...(typeof ack.hop_local_addr === "string" && ack.hop_local_addr.trim() !== ""
+            ? { hop_local_addr: ack.hop_local_addr }
+            : {}),
         },
       });
     } catch (e) {

@@ -15,7 +15,10 @@ import type { SystemConfigItem } from "@/lib/types";
 /** 配置项分组（按 name 前缀归类，未知项落到「其他」） */
 function groupOf(name: string): string {
   if (name.startsWith("SITE_") || name === "LOGO_URL" || name.startsWith("HIDE_")) return "站点";
-  if (name.startsWith("NOTICE")) return "公告";
+  // V5-WP18.5：`NOTICE*` 三个键已废弃 —— 公告的真相迁到了 `announcement` 表，
+  // 免认证下发面也不再读它们（契约 F6.7）。这里**仍然显示**（旧值要能看见/清理），
+  // 但组名写明废弃，避免有人继续往"能写、但没人读"的键里填内容。
+  if (name.startsWith("NOTICE")) return "公告（已废弃）";
   if (name.startsWith("SMTP_") || name.startsWith("EMAIL_") || name.startsWith("RESEND_")) return "邮件";
   if (name.startsWith("REFERRAL_")) return "推广";
   if (name.startsWith("WITHDRAW_") || name === "MIN_WITHDRAW_AMOUNT") return "提现";
@@ -33,7 +36,7 @@ function isBoolValue(v: string): boolean {
 /** 长文本配置：渲染成 textarea */
 const TEXTAREA_KEYS = ["NOTICE", "WITHDRAW_METHODS"];
 
-const GROUP_ORDER = ["站点", "公告", "邮件", "推广", "提现", "客服", "运营", "隧道", "其他"];
+const GROUP_ORDER = ["站点", "公告（已废弃）", "邮件", "推广", "提现", "客服", "运营", "隧道", "其他"];
 
 export function AdminSettingsManager({ initialData }: { initialData: SystemConfigItem[] }) {
   const { t } = useI18n();

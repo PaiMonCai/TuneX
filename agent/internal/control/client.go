@@ -82,6 +82,17 @@ type QueuedCommand struct {
 	// synthetic TunnelConfig: a probe is not a tunnel, and pretending otherwise
 	// would let a malformed probe look like a config apply.
 	Probe *diag.Request `json:"probe,omitempty"`
+	// LookingGlass carries a V5-WP19-D request: user-originated, panel-resolved,
+	// and pinned to **public literal addresses only**.
+	//
+	// A third sibling field for the same reason as `Probe`, plus one more that is
+	// specific to this action: it is the only place where a target the caller
+	// typed reaches the agent, so it must not be confused with either
+	// (config = panel-owned desired state, probe = panel-derived tunnel targets).
+	// The agent-side validation in internal/diag/lookingglass.go re-checks every
+	// address: whoever holds the panel's node credential cannot turn this into a
+	// scan primitive even if the panel never validated.
+	LookingGlass *diag.LookingGlassRequest `json:"looking_glass,omitempty"`
 }
 
 type commandResponse struct {
@@ -106,6 +117,17 @@ type ackPayload struct {
 	Results []diag.Result `json:"results,omitempty"`
 	// Facts carries the node-level self report (collect_diagnostics).
 	Facts *selfinfo.Facts `json:"facts,omitempty"`
+	// HopLocalAddr answers "where does this node's datagram hop come from" for a
+	// RELAY leg (V5.1b WP5-B2): `ip:port` of the socket this node carries client
+	// mappings through.
+	//
+	// It rides on the ACK because the panel needs it SYNCHRONOUSLY: the exit leg is
+	// dispatched BEFORE the ingress exists (§3.2's ordering rule), so its attestation
+	// address cannot be known until this very moment. Waiting for the periodic state
+	// report would leave every new datagram relay dead for up to a reporting cycle,
+	// and the panel would have no way to tell "not serving yet" from "serving".
+	// `next_hop` travels the other way on the egress ACK for exactly the same reason.
+	HopLocalAddr string `json:"hop_local_addr,omitempty"`
 }
 
 type Client struct {
@@ -359,7 +381,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		// reload contract exists to prevent. An upstream-only change rides on
 		// Apply's same-port path (stop old, then start new is acceptable
 		// there because the listener did not move).
-		_, err = c.applyByPlan(cfg)
+		fwd, err := c.applyByPlan(cfg)
 		if err != nil {
 			rollbackPool()
 			ack.ErrorCode = ackCodeFor(err)
@@ -369,6 +391,14 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.OK = true
 		rev := cfg.Revision
 		ack.AppliedRevision = &rev
+		// A datagram RELAY publishes where its hop comes from, so the panel can tell the
+		// exit who may feed it (see HopLocalAddr). Read from the runtime it just built:
+		// the socket exists now, and this is the only moment the fact is fresh.
+		if d, ok := fwd.(forwarder.Diagnostician); ok {
+			if diag, ok := d.ProtocolDiagnostics(); ok && diag.HopLocalAddr != "" {
+				ack.HopLocalAddr = diag.HopLocalAddr
+			}
+		}
 	case ActionDiagnoseTunnel:
 		if cmd.Probe == nil {
 			ack.ErrorCode, ack.Error = "invalid_payload", "missing probe request"
@@ -398,6 +428,24 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.Facts = &facts
 		// Read-only: the runtime revision does not move, so the ACK echoes the
 		// revision it was given.
+		rev := cmd.Envelope.Revision
+		ack.AppliedRevision = &rev
+	case ActionLookingGlass:
+		if cmd.LookingGlass == nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", "missing looking glass request"
+			return ack
+		}
+		// diag.LookingGlass validates EVERY target before it dials anything, and it
+		// never resolves a name: a request mixing a public and a private target
+		// produces zero packets and one error. Read-only, so the ACK echoes the
+		// revision it was given.
+		results, err := diag.LookingGlass(ctx, *cmd.LookingGlass, nil)
+		if err != nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", err.Error()
+			return ack
+		}
+		ack.OK = true
+		ack.Results = results
 		rev := cmd.Envelope.Revision
 		ack.AppliedRevision = &rev
 	case ActionRemoveTunnel, ActionSuspendTunnel:

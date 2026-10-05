@@ -17,6 +17,9 @@
  *  · 无任何有效策略 → 拒绝（fail-closed），不因“没有套餐”默认放行
  */
 
+// V5-WP20-6：计量窗口的日/月界来自**固定时区**的纯函数模块（本身无 IO，不破坏本层的可离线单测）。
+import { billingDayStart, billingMonthStart } from "./billing-time.ts";
+
 export type PolicySourceName = "system_default" | "admin_grant" | "trial" | "purchase";
 export type TrafficPeriodName = "total" | "month" | "day";
 
@@ -318,14 +321,33 @@ export function composeEffectivePolicy(input: ComposeInput): EffectivePolicy {
     };
   }
 
-  let grantedLimits: PolicyLimitSet = { ...UNLIMITED_LIMITS };
-  let entitlement: PolicyEntitlement = { ...EMPTY_ENTITLEMENT };
+  // ── 累计为什么从**第一条策略**开始，而不是从 `UNLIMITED_LIMITS` 开始 ──
+  //
+  // 数值上限的初值 `null`（不限）确实是 `maxNullable` 的中性元 ✓；但 `traffic_period` 的初值
+  // `"total"` **不是** `unionLimits`（取更宽松：`total > month > day`）的中性元 —— 它是**恒胜元**：
+  // 无论策略声明什么周期，union 的结果都会停在 `total`。
+  //
+  // 后果（修前实测，纯函数即可复现）：**单条 `traffic_period:"month"` 策略 ⇒ 生效周期 = `total`** ⇒
+  // `sumWorkspaceTraffic` 按**全量累计**求和，月度额度永远不复位（用户累计超过一个月额度后被持续拒绝），
+  // 面板的 `traffic_used` 也显示「全量已用」而不是「本月已用」。
+  //
+  // 修法只是恢复 `unionLimits` 自己声明的意图（「取更宽松的一方」），不是重新设计语义：
+  //   **生效周期 = 适用策略中声明的「最长」周期；只有当某条策略真的声明 `total` 时才是 `total`。**
+  // 用 `null` 累加器从第一条起折，避免再引入一个「必须刚好是中性元」的常量。
+  let grantedLimits: PolicyLimitSet | null = null;
+  let entitlement: PolicyEntitlement | null = null;
   let revision = 0;
   for (const p of activePolicies) {
-    grantedLimits = unionLimits(grantedLimits, limitsFromPolicy(p));
-    entitlement = unionEntitlement(entitlement, entitlementFromPolicy(p));
+    const policyLimits = limitsFromPolicy(p);
+    grantedLimits = grantedLimits === null ? policyLimits : unionLimits(grantedLimits, policyLimits);
+    const policyEntitlement = entitlementFromPolicy(p);
+    entitlement =
+      entitlement === null ? policyEntitlement : unionEntitlement(entitlement, policyEntitlement);
     revision += p.revision;
   }
+  // `activePolicies` 在上面已保证非空（空集走 `deny_scope` 早返回）；这两行只是让类型收敛。
+  grantedLimits ??= { ...UNLIMITED_LIMITS };
+  entitlement ??= { ...EMPTY_ENTITLEMENT };
 
   // 平台硬上限收紧协议白名单（交集）与额度（min）。
   const ceilingPolicies = input.ceilings ?? [];
@@ -451,12 +473,19 @@ export function checkMemberAddition(policy: EffectivePolicy, memberCount: number
   return { allowed: true };
 }
 
-/** 计量周期起点（total 返回 null = 不限窗口）。 */
+/**
+ * 计量周期起点（total 返回 null = 不限窗口）。
+ *
+ * V5-WP20-6：窗口起点**委托** `billing-time.ts`（固定 `Asia/Shanghai`、进程时区无关），
+ * 不再用 `setHours`/`setDate` 按进程本地时区取整。
+ *
+ * 反例（旧实现为什么必须换掉）：`.env` 里缺 `TZ=Asia/Shanghai` 时，同一个瞬时点在
+ * 宿主时区下会算出**不同的月首**（例如 UTC 与 UTC+8 在 `2026-01-31T16:00Z` 上有 8 小时分歧，
+ * 跨月那一秒直接落进上个月），于是「额度耗尽」判定与账本各算一个月。
+ * 这也是 DoD 第 8 条要守的东西：本文件里不允许再出现按进程时区取整的日界调用
+ * （那条 grep 是字面匹配，注释里也不留，免得下一个人照着抄）。
+ */
 export function trafficWindowStart(period: TrafficPeriodName, now: Date): Date | null {
   if (period === "total") return null;
-  const d = new Date(now.getTime());
-  d.setHours(0, 0, 0, 0);
-  if (period === "day") return d;
-  d.setDate(1);
-  return d;
+  return period === "day" ? billingDayStart(now) : billingMonthStart(now);
 }

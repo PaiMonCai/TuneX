@@ -11,6 +11,12 @@
  *                                                TUNNEL_TRAFFIC_RETENTION_DAYS，幂等，
  *                                                见 services/traffic-retention.ts）
  *   cron_check_node_offline     每 10s         离线检测（消费 dc:* 标记，防抖到点置 inactive）
+ *   cron_latency_history        每小时 :15     观测档案：小时桶聚合 + 过期清理（V5-WP19-B，
+ *                                               先聚合后清理，幂等，见 services/latency-history.ts）
+ *   cron_settle_billing         每小时 :45     订阅周期结算（V5-WP20-3：先占位后执行，唯一键
+ *                                               是幂等闸门，崩在中间的 pending 由下一轮接管续跑。
+ *                                               只记账、不扣款、不做权限判定，
+ *                                               见 services/subscription-billing.ts）
  *
  * WP15 已删除：
  *   cron_push_node_config       每 5s          旧 Agent 的 gost 配置推送（Fernet 加密 + Socket.IO
@@ -56,14 +62,20 @@ import { defaultOfflineDeps, runOfflineCheck } from "./socket/offline-detector.t
 import { defaultRolloutResumeDeps, resumeRollouts } from "./services/forward-rollout-recovery.ts";
 import { defaultTrafficArchiveDeps, flushTrafficBuffer } from "./services/traffic-archive.ts";
 import { defaultTrafficRetentionDeps, deleteExpiredTraffic } from "./services/traffic-retention.ts";
+import { defaultLatencyHistoryDeps, runLatencyHistoryMaintenance } from "./services/latency-history.ts";
 import { defaultReconcileDeps, executeReconcile } from "./services/reconciler.ts";
+import { defaultSettlementDeps, settleDuePeriods } from "./services/subscription-billing.ts";
 import { createRuntimeReconcileSink } from "./services/runtime-reconcile-sink.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步（OPS-01/OPS-03，幂等）" },
   { name: "cron_delete_tunnel_traffic", pattern: "0 0 * * *", desc: "删除过期流量记录（OPS-03，按保留期，幂等）" },
+  { name: "cron_latency_history", pattern: "15 * * * *", desc: "观测档案：小时桶聚合 + 过期清理（原始 24h / 桶 30d，幂等）" },
   { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
   { name: "cron_reconcile_v3", everyMs: 30_000, desc: "v3 desired/runtime/lease 同 revision 对账修复" },
+  // V5-WP20-3（契约 §5 的 WP20-3 行：每小时）。刻意错开 :15 的观测档案与整点归档，
+  // 让「三件事用同一分钟」不会被误读成同一件事；周期结算本身与它们无共享资源。
+  { name: "cron_settle_billing", pattern: "45 * * * *", desc: "订阅周期结算：占位 → 执行 → 终态，崩溃接管（幂等）" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
@@ -103,6 +115,19 @@ const worker = new Worker(
         }
         return r;
       }
+      case "cron_latency_history": {
+        // V5-WP19-B：观测档案的**先聚合、后清理**（顺序是硬约束，见
+        // services/latency-history.ts 的 runLatencyHistoryMaintenance）：
+        //   · rollup：把 ≥1h 前**已结束**的整点小时按 (节点, 目标, 口径) 聚合进桶表
+        //     （`create` + 唯一冲突跳过 ⇒ 只追加、幂等）；
+        //   · prune：原始样本 >24h、桶 >30d 按索引删（保留期走 system_config，脏值回落默认）。
+        // 反过来会在"原始行已删、桶还没建"的窗口里永久丢一段历史（原始样本不可恢复）。
+        const r = await runLatencyHistoryMaintenance(defaultLatencyHistoryDeps());
+        if (r.rollup.inserted > 0 || r.prune.deleted_samples > 0 || r.prune.deleted_buckets > 0) {
+          console.log("[worker] cron_latency_history:", JSON.stringify(r));
+        }
+        return r;
+      }
       case "cron_check_node_offline": {
         // 消费 `dc:<gid>:<nodeId>` 标记：防抖（60s）到点且无心跳 → 节点置 inactive。
         // 幂等：重复消费/多 worker 并存均不会重复翻转（updateMany where status=active）。
@@ -112,9 +137,12 @@ const worker = new Worker(
           flipped: r.flipped,
           skipped: r.skippedWithinDebounce + r.skippedHeartbeatAlive,
           cleared_groups: r.clearedGroups,
+          // V5.1b 修复：上报过期（与断开标记无关）翻转的节点数。单独一列是有意的：它与
+          // flipped（标记触发的）是两个不同信号源，混成一个数就看不出是哪一类节点在掉线。
+          flipped_stale: r.flippedStale,
           errors: r.errors,
         };
-        if (r.flipped > 0 || r.errors > 0) {
+        if (r.flipped > 0 || r.flippedStale > 0 || r.errors > 0) {
           console.log("[worker] cron_check_node_offline:", JSON.stringify(summary));
         }
         return summary;
@@ -176,9 +204,21 @@ const worker = new Worker(
             },
           });
           if (r.evaluated > 0) {
-            console.log("[worker] failover sweep:", JSON.stringify({ evaluated: r.evaluated, moved: r.moved, held: r.held }));
+            console.log("[worker] failover sweep:", JSON.stringify({
+              evaluated: r.evaluated,
+              moved: r.moved,
+              held: r.held,
+              // V5-WP17.4 修复：**DNS 闸门拒绝的原因必须可见**。
+              // fail-closed 只保证"没做错事"；"为什么没做"不留痕，运维看到的就是"迁移没发生"，
+              // 与"这台机器根本没在跑扫描"无法区分 —— 正是下面那句注释说的那件事
+              // （决策不留痕的机制与从未运行过的机制无法区分）。这个字段在返回值里一直都有，
+              // 只是从未被打印出来。
+              dns_gated: r.dns_gated.length,
+              // 只在真的有被闸住的隧道时附带原因，避免每拍刷噪音；条数封顶，日志长度有界。
+              ...(r.dns_gated.length > 0 ? { dns_gated_reasons: r.dns_gated.slice(0, 5) } : {}),
+            }));
           }
-          return { evaluated: r.evaluated, moved: r.moved, held: r.held };
+          return { evaluated: r.evaluated, moved: r.moved, held: r.held, dns_gated: r.dns_gated.length };
         };
         // V5.5 WP16：联邦的周期收口。顺序在**本地 reconcile 之后**：先修好本机能修的东西，
         // 再处理跨面板的到期/停服/对账。每一拍都返回可打印的汇总 —— 上一阶段反复学到的
@@ -233,6 +273,54 @@ const worker = new Worker(
           }
         }
         return { ...summary, federation: federationSummary };
+      }
+      case "cron_settle_billing": {
+        // V5-WP20-3（契约 §3.1/§3.2.4/§3.5.3，DoD 4/5）：订阅周期结算。
+        //
+        // 幂等 = 先占位后执行，**不是**「再查一遍」：闸门是
+        // `subscription_period_settlement UNIQUE(plan_subscription_id, period_key)` 这个 DB 唯一键；
+        // 崩在「占位之后、执行之前」的 `pending` 由下一轮按 O4 的超时（SystemConfig
+        // `BILLING_SETTLEMENT_TAKEOVER_MINUTES`，缺省 10 分钟）接管续跑。
+        //
+        // 这一拍**只记账**：不扣款、不发放、不做任何额度/权限判定（契约 §3.2.4/§3.5.3，
+        // DoD 1/2）。续期的扣款 + 发放（purchase 发放的唯一写入点）由 WP20-4 接进
+        // `deps.executePeriod`；在那之前 `auto_renew=true` 的订阅会被**留在 pending** 等接管，
+        // 而不是假装结算完成 —— 「绝不默认扣款续期」在代码里就是这个形状。
+        const r = await settleDuePeriods(defaultSettlementDeps());
+        const summary = {
+          period_key: r.period_key,
+          due: r.due,
+          settled: r.settled,
+          skipped: r.skipped,
+          deferred: r.deferred,
+          failed: r.failed,
+          taken_over: r.taken_over,
+          truncated: r.truncated,
+        };
+        // 只在「有事」时打印（与 federation reconcile 同取向）：空闲的结算不该刷屏，
+        // 但每个非零计数都是钱路径上的信号，必须留痕；脏配置（missing/invalid）也要可见。
+        const busy =
+          r.settled > 0 ||
+          r.skipped > 0 ||
+          r.deferred > 0 ||
+          r.failed > 0 ||
+          r.taken_over > 0 ||
+          r.takeover_config_missing ||
+          r.takeover_config_invalid ||
+          r.truncated;
+        if (busy) {
+          console.log(
+            "[worker] cron_settle_billing:",
+            JSON.stringify({
+              ...summary,
+              takeover_minutes: r.takeover_minutes,
+              takeover_config_missing: r.takeover_config_missing,
+              takeover_config_invalid: r.takeover_config_invalid,
+              errors: r.errors,
+            }),
+          );
+        }
+        return summary;
       }
       default:
         return { note: "cron handler not yet implemented", ms: Date.now() - started };

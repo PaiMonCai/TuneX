@@ -9,8 +9,8 @@
  */
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
-import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
-import { admitPersistedProtocol } from "./forward-contract.ts";
+import { validatePayload, LOOKING_GLASS_MAX_TIMEOUT_MS, type CommandEnvelope } from "./control-protocol/index.ts";
+import { admitPersistedProtocol, datagramHopPeerFor, firstConnectIp } from "./forward-contract.ts";
 import {
   targetHealthWireEntries,
   type TargetHealthWireEntry,
@@ -37,7 +37,30 @@ export interface QueuedAgentCommand {
   config: AgentTunnelConfig | null;
   /** V4-WP11C diagnose payload; delivered beside the envelope, like `config`. */
   probe?: { targets: { host: string; port: number }[]; timeout_ms?: number } | null;
+  /**
+   * V5-WP19-D Looking Glass payload. A sibling field rather than a second `probe`,
+   * for the same reason `probe` is not a synthetic TunnelConfig: the two carry
+   * different facts and obey different rules — a diagnose target comes from the
+   * panel's own desired state, while every entry here is a user-typed target that
+   * the panel already resolved and pinned to a public literal. Folding them into
+   * one field would make "which admission rules apply?" depend on the action
+   * name, which is exactly the ambiguity the separate action exists to remove.
+   *
+   * NOTE: this is one of the "rebuild boundaries" (see the WP19-D delivery record):
+   * `dequeueAgentCommand` parses the stored JSON whole and the internal route hands
+   * that object straight to the agent, so a field present here survives the trip —
+   * but a field NOT added here would be dropped silently while every layer reports
+   * healthy.
+   */
+  looking_glass?: QueuedLookingGlassRequest | null;
   queued_at: string;
+}
+
+/** V5-WP19-D: pinned public literals; the agent must never resolve a name. */
+export interface QueuedLookingGlassRequest {
+  method: string;
+  targets: { address: string; port: number }[];
+  timeout_ms?: number;
 }
 
 export interface AgentCommandAck {
@@ -53,6 +76,12 @@ export interface AgentCommandAck {
   results?: AgentDiagnoseResult[] | null;
   /** V4-WP11C: the node's own bounded self report (collect_diagnostics). */
   facts?: NodeSelfFacts | null;
+  /**
+   * V5.1b WP5-B2: a datagram RELAY's own hop endpoint (`ip:port`), reported in the ACK
+   * of the apply that built the runtime (see `control.CommandAckPayload.hop_local_addr`
+   * for why this cannot wait for the periodic state report).
+   */
+  hop_local_addr?: string | null;
 }
 
 /**
@@ -221,15 +250,25 @@ export async function enqueueAgentCommand(
   store: CommandBusStore = redisStore,
   probe?: QueuedAgentCommand["probe"],
   deps: EnqueueDeps = {},
+  /**
+   * V5-WP19-D：Looking Glass 请求。放在**末尾**而不是塞进 `probe`/`config` 里：
+   * 既有调用方（调度器/rollout/诊断）一个都不用改，也就不会因为"多了一个参数"
+   * 而在别处被静默改成传错的形状。
+   */
+  lookingGlass?: QueuedLookingGlassRequest | null,
 ): Promise<{ scope: number }> {
   const scope = await (deps.resolveScope ?? nodeScope)(nodeId);
   const item: QueuedAgentCommand = {
     envelope,
     config,
     ...(probe ? { probe } : {}),
+    ...(lookingGlass ? { looking_glass: lookingGlass } : {}),
     queued_at: new Date().toISOString(),
   };
   const key = queueKey(scope, nodeId);
+  const pushedTargets = probe?.targets
+    ? probe.targets.map((t) => ({ host: t.host, port: t.port }))
+    : (lookingGlass?.targets ?? []).map((t) => ({ host: t.address, port: t.port }));
   const pending: PendingCommand = {
     command_id: envelope.command_id,
     action: String(envelope.action ?? ""),
@@ -237,7 +276,7 @@ export async function enqueueAgentCommand(
     revision: Number(envelope.revision ?? 0),
     issued_at: item.queued_at,
     expires_at: String(envelope.expires_at ?? ""),
-    expected_targets: probe?.targets ? probe.targets.map((t) => ({ host: t.host, port: t.port })) : null,
+    expected_targets: pushedTargets.length > 0 ? pushedTargets : null,
   };
   // Register the binding BEFORE publishing the command. The reverse order has a
   // real race: a fast agent can execute and ACK between the two writes, and the
@@ -353,6 +392,16 @@ export async function storeAgentCommandAck(
   } = {
     command_id: commandId,
     ok: ack.ok === true,
+    // V5.1b WP5-B2: a datagram RELAY's hop endpoint, straight off its apply ACK.
+    //
+    // This record is REBUILT FIELD BY FIELD before it goes to Redis, so a field missing
+    // from this list is dropped here — and the panel then never learns which address the
+    // exit must attest. The agent proved it sends it
+    // (`type=*forwarder.DatagramRelay diag_ok=true hop=172.41.20.10:56588`), so every
+    // silent hop along this chain is one of these whitelists.
+    ...(typeof ack.hop_local_addr === "string" && ack.hop_local_addr.trim() !== ""
+      ? { hop_local_addr: ack.hop_local_addr.slice(0, ACK_ERROR_MAX_CHARS) }
+      : {}),
     applied_revision:
       typeof ack.applied_revision === "number" && Number.isFinite(ack.applied_revision)
         ? ack.applied_revision
@@ -365,6 +414,7 @@ export async function storeAgentCommandAck(
       typeof ack.error === "string" && ack.error !== ""
         ? ack.error.slice(0, ACK_ERROR_MAX_CHARS)
         : null,
+
   };
 
   // A node cannot have applied a revision newer than the one it was told to
@@ -391,20 +441,28 @@ export async function storeAgentCommandAck(
 
   const results = normalizeDiagnoseResults(ack.results);
   if (results) {
-    // A diagnose answer must cover exactly the requested target set.
-    if (pending.action === "diagnose_tunnel") {
+    // A probe-shaped answer must cover exactly the requested target set. V5-WP19-D
+    // widened "probe-shaped" from one action to two (diagnose_tunnel, looking_glass)
+    // rather than duplicating the rule: both ACK a bounded list of host/port
+    // observations, and for both a partial list reads as "this path is fine".
+    const probeLike = pending.action === "diagnose_tunnel" || pending.action === "looking_glass";
+    if (probeLike) {
       const expected = pending.expected_targets ?? [];
       const problem = matchExpectedTargets(expected, results);
       if (problem) throw new TypeError(problem);
       if (!ack.ok) {
-        // A refused diagnose may legitimately carry no results.
+        // A refused probe may legitimately carry no results.
       } else if (results.length !== expected.length) {
-        throw new TypeError(`diagnose ack returned ${results.length} results for ${expected.length} targets`);
+        throw new TypeError(
+          `${pending.action} ack returned ${results.length} results for ${expected.length} targets`,
+        );
       }
     }
     normalized.results = results;
-  } else if (pending.action === "diagnose_tunnel" && ack.ok) {
-    throw new TypeError("diagnose ack returned no results");
+  } else if (
+    (pending.action === "diagnose_tunnel" || pending.action === "looking_glass") && ack.ok
+  ) {
+    throw new TypeError(`${pending.action} ack returned no results`);
   }
 
   const payload = JSON.stringify(normalized);
@@ -699,7 +757,18 @@ export class OutboundAgentTransport implements AgentTransport {
         error: `agent acknowledged ${envelope.command_id} without applied_revision`,
       };
     }
-    return { ok: true, applied_revision: ack.applied_revision };
+    return {
+      ok: true,
+      applied_revision: ack.applied_revision,
+      // V5.1b WP5-B2: a datagram RELAY's hop endpoint has to survive this return as well.
+      // It is the third place the agent's ACK fields are copied (the agent sets it, then
+      // the ledger remembers it, then this) and every one of them is a place it can be
+      // silently dropped — which is how "the panel never corrects the exit" happens while
+      // both sides look healthy.
+      ...(typeof ack.hop_local_addr === "string" && ack.hop_local_addr.trim() !== ""
+        ? { hop_local_addr: ack.hop_local_addr }
+        : {}),
+    };
   }
 
   applyEgress(node: OrchestratorNode, config: AgentTunnelConfig, envelope?: CommandEnvelope): Promise<unknown> {
@@ -851,15 +920,109 @@ export async function issueAgentDiagnostics(
   return { ok: true, facts: ack.facts };
 }
 
+/**
+ * V5-WP19-D —— 向一个节点下发一次 Looking Glass 测试并等它的探测事实。
+ *
+ * 与 `issueAgentDiagnose` 的三点**有意**不同（不是复制粘贴）：
+ *  1. 目标不是面板的 desired 状态，而是**用户输入 + 面板已钉死的公网字面地址**，
+ *     因此这里不做任何"从 desired 派生目标"的事；
+ *  2. payload 走 `looking_glass` 这个动作自己的封闭键集（`method`/`targets`/`timeout_ms`），
+ *     目标是 `{address, port}` 而不是 `{host, port}` —— 名字在这里是**不合法**的，
+ *     因为面板已解析过，Agent 再解析一次就是把 DNS 重绑定窗口重新打开；
+ *  3. 结果复用 `results`（既有字段、既有的五处重建边界都已经带它），
+ *     覆盖性校验同样按"恰好覆盖"处理（见 `storeAgentCommandAck`）。
+ */
+export async function issueAgentLookingGlass(
+  input: {
+    nodeId: number;
+    nodeKey: string;
+    method: string;
+    targets: { address: string; port: number }[];
+    /** 单次连接尝试的超时（毫秒）。**不是**等 ACK 的总预算——两者混用会把
+     *  "等 15 秒"静默写进 payload 的 per-attempt 语义里。 */
+    perAttemptTimeoutMs?: number;
+    /** 等 ACK 的总预算（毫秒）；由调用方按目标数算好并封顶。 */
+    ackWaitMs?: number;
+  },
+  deps: {
+    capabilityFacts?: (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
+    store?: CommandBusStore;
+  } = {},
+): Promise<{ ok: true; results: AgentDiagnoseResult[] } | { ok: false; error_code: string; error: string }> {
+  const factsReader = deps.capabilityFacts ?? loadCapabilityFacts;
+  const store = deps.store ?? redisStore;
+
+  const payload = {
+    method: input.method,
+    targets: input.targets.map((t) => ({ address: t.address, port: t.port })),
+    ...(input.perAttemptTimeoutMs
+      ? { timeout_ms: Math.min(input.perAttemptTimeoutMs, LOOKING_GLASS_MAX_TIMEOUT_MS) }
+      : {}),
+  };
+  // Same frozen contract as every other action: a Looking Glass command that
+  // bypassed the validator would be a second, weaker command path.
+  const payloadError = validatePayload("looking_glass", payload);
+  if (payloadError) {
+    return { ok: false, error_code: "invalid_payload", error: payloadError };
+  }
+  const ackWaitMs = input.ackWaitMs ?? 20_000;
+  const envelope = {
+    command_id: randomUUID(),
+    resource: "node",
+    resource_id: `node-${input.nodeId}`,
+    revision: 0, // read-only: it never advances a runtime revision
+    action: "looking_glass",
+    payload,
+    expires_at: new Date(Date.now() + ackWaitMs).toISOString(),
+  } as unknown as CommandEnvelope;
+
+  let facts: AgentV2CapabilityFacts | null = null;
+  try {
+    facts = await factsReader(input.nodeId);
+  } catch {
+    return {
+      ok: false,
+      error_code: "incompatible_agent",
+      error: `节点 ${input.nodeId} 的能力上报形状非法，拒绝下发 Looking Glass`,
+    };
+  }
+  // Action-only, same reason as diagnose: a node-scoped probe has no protocol or
+  // transport dimension to negotiate.
+  const decision = admitAction({ nodeId: input.nodeId, role: "ingress", facts }, "looking_glass");
+  if (!decision.ok) {
+    return { ok: false, error_code: decision.reason, error: decision.detail };
+  }
+
+  const lookingGlassRequest: QueuedLookingGlassRequest = {
+    method: input.method,
+    targets: payload.targets,
+    ...(payload.timeout_ms ? { timeout_ms: payload.timeout_ms } : {}),
+  };
+  const { scope } = await enqueueAgentCommand(
+    input.nodeId,
+    envelope,
+    null,
+    store,
+    null,
+    {},
+    lookingGlassRequest,
+  );
+  let ack: AgentCommandAck;
+  try {
+    ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, ackWaitMs, store);
+  } catch (error) {
+    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+  }
+  if (!ack.ok) {
+    return { ok: false, error_code: ack.error_code ?? "looking_glass_failed", error: ack.error ?? "节点拒绝执行 Looking Glass" };
+  }
+  return { ok: true, results: ack.results ?? [] };
+}
+
 function hostPort(host: string, port: number): string {
   const h = host.trim();
   return h.includes(":") && !h.startsWith("[") ? `[${h}]:${port}` : `${h}:${port}`;
 }
-function firstConnectIp(raw: string | null): string | null {
-  if (!raw) return null;
-  return raw.split(",").map((s) => s.trim()).find(Boolean) ?? null;
-}
-
 /**
  * Canonical desired snapshot used by Agent startup restore.
  * Only concrete node bindings are considered; NodeGroup is never re-interpreted
@@ -897,6 +1060,11 @@ export interface DesiredRowProjection {
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
   middle_node?: { connect_ip: string | null } | null;
+  /** V5.1b WP5-B2：datagram 出口的取证地址来自**入口**节点（优先用它的上报）。 */
+  ingress_node?: {
+    connect_ip: string | null;
+    state_report?: { tunnels?: unknown } | null;
+  } | null;
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
   /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
   port_leases?: Array<{ node_id: number; port: number; status: string }>;
@@ -1027,6 +1195,14 @@ export function desiredTunnelConfigFor(
     const healthForTargets = health.filter((h) =>
       poolTargets.some((t) => t.host === h.host && t.port === h.port),
     );
+    const hopPeer =
+      protocol === "udp"
+        ? datagramHopPeerFor({
+            ingressRuntimeId: `tunex-${row.id}-relay`,
+            ingressConnectIp: row.ingress_node?.connect_ip ?? null,
+            ingressReportedTunnels: row.ingress_node?.state_report?.tunnels,
+          })
+        : null;
     return {
       kind: "config",
       config: {
@@ -1039,6 +1215,12 @@ export function desiredTunnelConfigFor(
         next_hop: "",
         targets: poolTargets,
         ...(healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
+        // V5.1b WP5-B2: the datagram exit attests its ingress. Omitted when there is
+        // no address to attest — the exit then refuses to build, which is the honest
+        // outcome (a datagram exit that accepts anyone is a relay for whoever finds
+        // the port). Never emitted for stream protocols: the field would be a fact
+        // nobody reads.
+        ...(hopPeer ? { hop_peer: hopPeer } : {}),
         lb_strategy: strategy,
         protocol,
         speed_limit: 0,
@@ -1224,6 +1406,15 @@ export async function buildDesiredNodeSnapshot(
     include: {
       egress_node: { select: { id: true, connect_ip: true } },
       middle_node: { select: { id: true, connect_ip: true } },
+      // V5.1b WP5-B2: a datagram exit is told which ingress may feed it, and the
+      // ingress address is this node's. The command path reads it from the dispatch
+      // facts; this path reads it from the same column, because an agent that
+      // RESTARTS rebuilds its runtime from this snapshot — a snapshot without
+      // `hop_peer` would leave a datagram exit refusing to build after every
+      // restart, which is precisely the class of bug V5-G2 found on health.
+      // V5.1b WP5-B2：`state_report` 一起带出来，因为**真正为真的**取证地址是入口自己
+      // 上报的跳端点（多宿节点上 `connect_ip` 是错的——见 forward-contract 的说明）。
+      ingress_node: { select: { id: true, connect_ip: true, state_report: { select: { tunnels: true } } } },
       // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
       // its next_hop, while the middle node needs its own lease to restore its
       // EGRESS-shaped transit runtime. Keep all active leases for this Forward;

@@ -270,11 +270,18 @@ function intent(over: Row = {}): Row {
 /** 默认全套钩子：分配成功、停服成功、还端口成功，并记录调用。 */
 function hooks(calls: { dispatch: Row[]; allocate: Row[]; releasePort: Row[]; teardown: Row[] }, over: LeaseHostDeps = {}): LeaseHostDeps {
   return {
-    audit: silentAudit,
-    // 固定时钟：夹具里的时间戳（NOW）与"现在"必须一致，否则依赖窗口的用例会**随时间翻转**——
-    // 实测：`a concurrent in-flight claim ...` 在夹具的 NOW 之后 60s（pending 接管窗口）
-    // 就会从"拒绝重投递"变成"接管"，于是一个与改动无关的用例在某一天突然开始失败。
+    // V5-WP15 fixture clock —— 默认注入，`over` 仍可覆盖（它在最后展开）。
+    //
+    // 为什么必须是**默认**而不是逐用例注入：本文件的种子把时间钉成绝对时刻
+    //（`NOW` / `GOOD_UNTIL`），而"这份授予还有效吗"比的是**服务读到的时钟**
+    //（`const now = d.now()`），不是 DB 侧的。不注入，这个文件就会**随墙上时钟腐化**：
+    //   · `GOOD_UNTIL = 2026-10-05T05:00:00Z`（本地 13:00）一过，整个 `reserveRemoteLease`
+    //     区块 30 多个用例在没有任何代码变更的情况下同时变红（实测发生于 13:00 CST）；
+    //   · `a concurrent in-flight claim …` 会在夹具的 NOW 之后 60s（pending 接管窗口）从
+    //     "拒绝重投递"变成"接管"，于是一个与改动无关的用例某天突然开始失败。
+    // 注入夹具时钟之后，断言才真的在说它说的那件事。
     now: () => NOW,
+    audit: silentAudit,
     dispatch: (i) => {
       calls.dispatch.push(i as unknown as Row);
       return { ok: true };
@@ -704,7 +711,18 @@ describe("WP15 lease: reserve allocates exactly once and compensates on failure"
         { id: 1, intent_id: "intent-1", peer_panel_id: "panel-a", revision: 7, action: "create", status: "pending", lease_id: null, error_code: null, created_at: NOW },
       ],
     });
-    const outcome = await reserveRemoteLease(reserveInput(), { ...hooks(calls), db });
+    // The CLOCK MUST BE INJECTED here — through the deps, which is where this
+    // service reads it (`const now = d.now()`), not through the input.
+    //
+    // The seed above pins the pending row at NOW, and "in flight" means
+    // `now - created_at < LEASE_INTENT_PENDING_TTL_MS` (60s). Reading the real
+    // clock instead makes this test a wall-clock time bomb: it is green while the
+    // real time is BEFORE NOW (negative age) and for exactly one minute after it,
+    // then red forever. That is not hypothetical — it went red on 2026-10-05 at
+    // 12:01 CST (04:01Z), on main and on this branch alike, with no code change
+    // involved. Injecting the instant the seeded row claims makes the assertion
+    // mean what it says: a claim that is in flight RIGHT NOW is refused.
+    const outcome = await reserveRemoteLease(reserveInput(), { ...hooks(calls, { now: () => NOW }), db });
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.code).toBe("duplicate_message");
     expect(calls.allocate).toHaveLength(0);

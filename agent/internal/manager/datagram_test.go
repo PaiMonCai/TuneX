@@ -228,21 +228,26 @@ func TestUDPRefusedOnRelayAndEgressLeavesNoPortReserved(t *testing.T) {
 	tm := NewTunnelManager(NewEgressManager(), "127.0.0.1")
 	defer tm.StopAll()
 
-	relay := forwarder.TunnelConfig{
-		ID: "tunex-9-relay", Mode: forwarder.ModeRelay, IngressPort: freeUDPPort(t),
-		NextHop: "127.0.0.1:3040", Protocol: forwarder.ProtocolUDP, Revision: 1,
+	// WP5-B2 opened both datagram roles, so "refused because the role is closed" is
+	// no longer the trigger. What is still refused is a config that cannot work: the
+	// hop has no handshake to imply its fields, so a missing one is a hard error.
+	// The invariant this test guards is unchanged — a REFUSED apply must leave no
+	// tunnel registered and no port reserved.
+	relayBare := forwarder.TunnelConfig{
+		ID: "tunex-9-relay-bare", Mode: forwarder.ModeRelay, IngressPort: freeUDPPort(t),
+		Protocol: forwarder.ProtocolUDP, Revision: 1,
 	}
-	if _, err := tm.Apply(relay); err == nil {
-		t.Fatal("udp RELAY must be refused: the inter-node hop shape is an open product decision")
+	if _, err := tm.Apply(relayBare); err == nil {
+		t.Fatal("udp RELAY without next_hop must be refused: there is nowhere to send client datagrams")
 	}
 
-	egress := forwarder.TunnelConfig{
-		ID: "tunex-9-egress", Mode: forwarder.ModeEgress, EgressPort: freeUDPPort(t),
+	egressBare := forwarder.TunnelConfig{
+		ID: "tunex-9-egress-bare", Mode: forwarder.ModeEgress, EgressPort: freeUDPPort(t),
 		Targets:  []forwarder.Target{{Host: "127.0.0.1", Port: 3040}},
 		Protocol: forwarder.ProtocolUDP, Revision: 1,
 	}
-	if _, err := tm.Apply(egress); err == nil {
-		t.Fatal("udp EGRESS must be refused: this binary has no datagram egress runtime")
+	if _, err := tm.Apply(egressBare); err == nil {
+		t.Fatal("udp EGRESS without hop_peer must be refused: the exit cannot attest a peer it was not told about")
 	}
 
 	if tm.Len() != 0 {
@@ -250,6 +255,20 @@ func TestUDPRefusedOnRelayAndEgressLeavesNoPortReserved(t *testing.T) {
 	}
 	if ports := tm.UsedPorts(); len(ports) != 0 {
 		t.Fatalf("a refused apply must not reserve a port, got %v", ports)
+	}
+
+	// The positive direction, which is what WP5-B2 added: supplying the field the hop
+	// needs makes the same role apply — and then it DOES hold its port.
+	relayOK := relayBare.Clone()
+	relayOK.NextHop = "127.0.0.1:3040"
+	if _, err := tm.Apply(relayOK); err != nil {
+		t.Fatalf("udp RELAY with next_hop must apply: %v", err)
+	}
+	if tm.Len() != 1 {
+		t.Fatalf("an accepted apply must register exactly one tunnel, got %d", tm.Len())
+	}
+	if ports := tm.UsedPorts(); len(ports) != 1 {
+		t.Fatalf("an accepted datagram relay must reserve its port, got %v", ports)
 	}
 }
 

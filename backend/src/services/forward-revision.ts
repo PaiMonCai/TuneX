@@ -435,15 +435,33 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     }
   }
 
-  // V5.1b B1 boundary (DEVELOPMENT.md §6.2): udp is DIRECT-only in this build. The
-  // inter-node hop shape for a datagram RELAY is an OPEN product decision, so the
-  // panel refuses it here rather than letting the Agent be the only place that says
-  // no — a boundary enforced in one layer is a boundary that can be bypassed by the
-  // next caller, and the UI must be able to rely on validation, not on a warning of
-  // its own.
-  if (admittedProtocol === "udp" && candidate.mode !== "direct") {
-    errors.push("UDP 转发当前只支持 DIRECT：跨节点跳的形态尚未冻结");
+  // V5.1b WP5-B2 boundary (contract §9.1 / §12): the datagram hop shape IS frozen
+  // ("datagram end to end") and BOTH halves now exist in the Agent — the ingress
+  // runtime carries client mappings across the hop, the exit attests its ingress and
+  // sends to its own pool. So `udp` is accepted on both modes now.
+  //
+  // What is still refused is a datagram route with a MIDDLE hop: every mapping of an
+  // ingress shares one socket toward the exit, and a transit hop is fed by the hop
+  // before it rather than by the ingress, so its attestation story is a different
+  // one that B2 did not freeze. Refusing here (rather than letting the Agent refuse
+  // a transit it cannot attest) keeps the boundary in the layer the UI reads.
+  if (admittedProtocol === "udp" && candidate.mode !== "direct" && (candidate.middle_node_id ?? null) !== null) {
+    errors.push("UDP 转发当前只支持单跳出口：datagram 的中间跳形态尚未冻结");
     reasons.push("datagram_relay_unsupported");
+    return { ok: false, errors, warnings, reasons };
+  }
+
+  // V5.1b WP5-B2 boundary (contract §9.1 / §12: "明确不做——跨面板的 UDP 腿"): a datagram
+  // Forward must not declare a FEDERATED remote egress either. That leg is dispatched by
+  // the HOST panel, and its exit would have to attest an ingress living on a different
+  // panel — a fact neither side owns today. Without this refusal the declaration is
+  // accepted and the failure only shows up much later, on the host, as a missing
+  // `hop_peer` during rollout (which is exactly how the gate found the sibling bug at
+  // scheduler.ts:1823). Refusing at declaration time keeps the boundary where the person
+  // typing it can see the reason.
+  if (admittedProtocol === "udp" && normalizeFederatedEgressPeer(candidate.federated_egress_peer) !== null) {
+    errors.push("UDP 转发暂不支持联邦远端出口：跨面板 datagram 腿尚未冻结");
+    reasons.push("datagram_federated_unsupported");
     return { ok: false, errors, warnings, reasons };
   }
 

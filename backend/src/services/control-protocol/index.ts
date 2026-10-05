@@ -33,6 +33,11 @@ export type {
   CommandResource,
   CreateCommandInput,
   ErrorCode,
+  // V5-WP19-D: Looking Glass 的形状出口（调用方只需要形状；语义白名单在
+  // services/looking-glass.ts）。
+  LookingGlassEnvelope,
+  LookingGlassPayload,
+  LookingGlassTargetPayload,
   RemoveTunnelEnvelope,
   RemoveTunnelPayload,
   ResourceRecord,
@@ -76,6 +81,8 @@ export {
   ControlProtocolError,
   ControlValidator,
   DEFAULT_COMMAND_TTL_MS,
+  LOOKING_GLASS_MAX_TARGETS,
+  LOOKING_GLASS_MAX_TIMEOUT_MS,
   MAX_ADDRESS_LEN,
   MAX_COMMAND_ID_LEN,
   MAX_LEDGER_ENTRIES,

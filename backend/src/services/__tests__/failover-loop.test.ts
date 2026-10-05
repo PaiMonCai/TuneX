@@ -80,11 +80,16 @@ describe("V5.3 WP10: the automatic loop is fail-closed on policy", () => {
     const result = await runFailoverSweep({
       readPolicy: async () => ({ auto_failover: true, auto_failback: false }),
       execute: (async () => ({ outcome: outcomes[i++ % outcomes.length], reason: "x" }) as never) as never,
+      // V5-WP17.4：扫描新增了两个协作者（DNS 就绪闸门 / DNS 后继）。与 `readPolicy`、`execute`
+      // 同一取向：**注入替身**，于是这条"计数只统计终态"的断言完全不依赖数据库。
+      dnsGate: async () => ({ applicable: false, ready: true }),
+      dnsSuccessor: async () => ({ outcome: "not_applicable" }),
       tunnelIds: [1, 2, 3],
       log: () => undefined,
     });
     expect(result.evaluated).toBe(3);
     expect(result.results).toHaveLength(3);
+    expect(result.dns_gated).toEqual([]);
     // 计数只统计终态：hold 不算 moved，也不需要被当成失败。
     expect(result.moved).toBe(1);
     expect(result.held).toBe(1);

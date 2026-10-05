@@ -11,6 +11,9 @@ import { serverT } from "@/lib/server-i18n";
 import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
 import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
 import { AttentionPanel } from "@/components/dashboard/attention-panel";
+import { PlanExpiryNotice } from "@/components/dashboard/plan-expiry-notice";
+import { AnnouncementBanner } from "@/components/announcements/announcement-banner";
+import { normalizeAnnouncements, type Announcement } from "@/lib/announcements";
 import { forwardProductBadgeVariant, forwardProductStatus } from "@/lib/forward-status";
 import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import type { DashboardStats, PortForward } from "@/lib/types";
@@ -25,13 +28,22 @@ export async function DashboardBody() {
   // 缺失时不猜个人空间、直接进入空态——让页面显示「未选择空间」而非别的空间的流量。
   const workspaceId = workspaceIdFromCookie(cookie);
 
-  const [stats, traffic, forwardRows] = await Promise.all([
+  const [stats, traffic, forwardRows, announcements] = await Promise.all([
     api.dashboard.stats(cookie).catch(() => null as DashboardStats | null),
     loadDashboardTraffic({
       workspaceId,
       fetchTraffic: (id, days) => api.workspaces.traffic(id, { days }),
     }).catch(() => null),
     api.forwards.list(undefined, cookie).catch(() => [] as PortForward[]),
+    // V5-WP18.5：公告在服务端取。作用域与 `forwards.list` 同源：由 `tunex_workspace`
+    // cookie 决定，缺 cookie 时后端回落个人空间（与其它用户侧端点一致；上面那条流量
+    // 请求是特例 —— 它有"未选择空间"的空态要求，所以缺 cookie 时不发请求）。
+    // 前端只展示。取不到时给 `null`（不是 `[]`）：`AnnouncementBanner` 据此区分
+    // 「平台没有话说」与「读不到」—— 把后者显示成前者就是一次谎。
+    api.announcements
+      .list(cookie)
+      .then((rows) => normalizeAnnouncements(rows))
+      .catch(() => null as Announcement[] | null),
   ]);
   const forwards = forwardRows.slice(0, 5);
   const paymentsEnabled = process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true";
@@ -39,6 +51,13 @@ export async function DashboardBody() {
 
   return (
     <div className="flex flex-col gap-5" data-testid="dashboard-body">
+      {/*
+        V5-WP18.5：公告放在最前面 —— 它是"平台对你说的话"（维护通知、政策变更），
+        与 attention 的「先看有没有事」同一条阅读顺序。没有公告时组件不渲染任何东西，
+        因此默认版面与之前完全一致。
+      */}
+      <AnnouncementBanner announcements={announcements} />
+
       <div className={`grid gap-4 sm:grid-cols-2 ${paymentsEnabled ? "xl:grid-cols-4" : "xl:grid-cols-3"}`}>
         {paymentsEnabled && <StatCard
           title={t("dashboard.balance")}
@@ -127,6 +146,8 @@ export async function DashboardBody() {
               <span className="text-[var(--muted-foreground)]">{t("dashboard.expiresAt")}</span>
               <span>{formatDate(stats?.expired_at ?? null)}</span>
             </div>
+            {/* V5-WP20-5：到期/宽限的提示（纯展示组件，见 plan-expiry-notice.tsx）。 */}
+            <PlanExpiryNotice expiry={stats?.expiry} expiresLabel={t("dashboard.expiresAt")} />
             <div className="flex items-center justify-between text-sm">
               <span className="text-[var(--muted-foreground)]">{t("dashboard.todayTraffic")}</span>
               <span>{formatBytes(stats?.today_traffic ?? 0)}</span>

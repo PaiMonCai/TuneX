@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/card";
@@ -30,6 +30,9 @@ interface PlanForm {
   order_by: string;
   billing_cycle: Plan["billing_cycle"];
   status: Plan["status"];
+  /// V5-WP20-4b：策略绑定。`"none"` 是**哨兵**而不是空串 —— Radix Select 不允许空串 value
+  /// （`<Select.Item value="">` 会直接抛错），所以「未绑定」必须有自己的值，到 payload 再映射成 null。
+  policy_id: string;
   renewable: boolean;
   allow_custom_in_node_group: boolean;
   allow_custom_out_node_group: boolean;
@@ -53,6 +56,7 @@ const EMPTY: PlanForm = {
   order_by: "1000",
   billing_cycle: "month",
   status: "active",
+  policy_id: "none",
   renewable: true,
   allow_custom_in_node_group: true,
   allow_custom_out_node_group: true,
@@ -77,6 +81,7 @@ function toForm(p: Plan): PlanForm {
     order_by: strOf(p.order_by),
     billing_cycle: p.billing_cycle,
     status: p.status,
+    policy_id: p.policy_id === null || p.policy_id === undefined ? "none" : String(p.policy_id),
     renewable: p.renewable,
     allow_custom_in_node_group: p.allow_custom_in_node_group,
     allow_custom_out_node_group: p.allow_custom_out_node_group,
@@ -102,6 +107,8 @@ function toPayload(f: PlanForm): PlanInput {
     order_by: toNumOrNull(f.order_by) ?? 1000,
     billing_cycle: f.billing_cycle,
     status: f.status,
+    // 显式把「未绑定」发成 null（不是省略）：省略 = 不改动，null = 解绑。
+    policy_id: f.policy_id === "none" ? null : Number(f.policy_id),
     renewable: f.renewable,
     allow_custom_in_node_group: f.allow_custom_in_node_group,
     allow_custom_out_node_group: f.allow_custom_out_node_group,
@@ -121,6 +128,43 @@ export function AdminPlansManager({ initialData }: { initialData: Paginated<Plan
   const [deleteTarget, setDeleteTarget] = useState<Plan | null>(null);
   const [deleting, setDeleting] = useState(false);
   const { form, set, setForm } = useForm<PlanForm>(EMPTY);
+  /// V5-WP20-4b：可绑定的策略选项（后端 `/admin/plan-policy-options`，与保存时的校验同一口径）。
+  const [policyOptions, setPolicyOptions] = useState<Array<{ value: string; zh: string; en: string }>>([
+    { value: "none", zh: "不绑定（购买不发放）", en: "Unbound (no grant on purchase)" },
+  ]);
+
+  useEffect(() => {
+    let alive = true;
+    api.admin
+      .planPolicyOptions()
+      .then((rows) => {
+        if (!alive) return;
+        setPolicyOptions([
+          { value: "none", zh: "不绑定（购买不发放）", en: "Unbound (no grant on purchase)" },
+          ...rows.map((row) => ({ value: String(row.id), zh: `${row.name}（${row.key}）`, en: `${row.name} (${row.key})` })),
+        ]);
+      })
+      // 拉不到选项不是致命错误：下拉保留「不绑定」，保存时后端仍会校验。
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /// 编辑一个「绑了已停用策略」的套餐时，该策略不在可绑集合里；把它补进选项，
+  /// 否则 Select 会显示成空、管理员一保存就把绑定悄悄清掉。
+  const policyChoices = useMemo(() => {
+    const bound = editing?.policy;
+    if (!bound || policyOptions.some((option) => option.value === String(bound.id))) return policyOptions;
+    return [
+      ...policyOptions,
+      {
+        value: String(bound.id),
+        zh: `${bound.name}（${bound.key}，当前已停用/不可绑）`,
+        en: `${bound.name} (${bound.key}, currently not bindable)`,
+      },
+    ];
+  }, [editing, policyOptions]);
 
   const cycles = useMemo(
     () => BILLING_CYCLES.map((c) => ({ value: c.value, zh: c.zh, en: c.en })),
@@ -236,7 +280,16 @@ export function AdminPlansManager({ initialData }: { initialData: Paginated<Plan
                     {BILLING_CYCLES.find((c) => c.value === p.billing_cycle)?.[locale === "zh" ? "zh" : "en"] ??
                       p.billing_cycle}
                   </TableCell>
-                  <TableCell className="text-xs">{p.traffic ? `${p.traffic} GB` : t("plan.unlimited")}</TableCell>
+                  <TableCell className="text-xs">
+                    {p.traffic ? `${p.traffic} GB` : t("plan.unlimited")}
+                    <div className="text-[11px] text-muted-foreground">
+                      {p.policy
+                        ? `${locale === "zh" ? "策略" : "policy"}: ${p.policy.key}`
+                        : locale === "zh"
+                          ? "策略：未绑定"
+                          : "policy: unbound"}
+                    </div>
+                  </TableCell>
                   <TableCell className="text-xs">{p.max_tunnels ?? t("plan.unlimited")}</TableCell>
                   <TableCell>
                     <Badge variant={p.status === "active" ? "success" : "muted"}>{p.status}</Badge>
@@ -289,6 +342,18 @@ export function AdminPlansManager({ initialData }: { initialData: Paginated<Plan
               onValueChange={(v) => set("status", v as Plan["status"])}
               options={STATUS_OPTIONS}
               locale={locale}
+            />
+          </Field>
+          <Field
+            label={locale === "zh" ? "策略绑定" : "Policy binding"}
+            hint={locale === "zh" ? "购买后发放这条策略" : "granted on purchase"}
+          >
+            <OptionSelect
+              value={form.policy_id}
+              onValueChange={(v) => set("policy_id", v)}
+              options={policyChoices}
+              locale={locale}
+              testId="plan-policy-binding"
             />
           </Field>
           <Field label={t("plan.traffic")} hint="GB">

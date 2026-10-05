@@ -304,6 +304,83 @@ export interface DispatchFacts {
   readonly protocol: ForwardProtocol;
   readonly tlsCertPath?: string;
   readonly tlsKeyPath?: string;
+  /**
+   * V5.1b WP5-B2：datagram 跳上"配对入口节点"的地址，出口腿据此取证。
+   *
+   * 只有 datagram 协议会带上它：TCP/TLS/WS 的跳是裸 TCP，握手本身就说明了对面是谁，
+   * 多带一个字段只会是一个**没人读**的字段（而"没人读的字段"正是慢慢漂移的开始）。
+   *
+   * 它是**地址**而不是 `ip:port`：入口对出口只有一个 socket，它的**源端口是临时的**，
+   * 入口 runtime 一重启端口就变——钉住端口会把一次正常重启变成永久故障。
+   */
+  readonly hopPeer?: string;
+}
+
+/**
+ * `Node.connect_ip` 可能是一串以逗号分隔的候选地址（历史上一个节点挂过多个地址）。
+ * 面板在下发任何"对端可达地址"时必须挑**同一个**第一个非空项，否则两条腿会指向
+ * 不同的地址：RELAY 的 `next_hop`（入口 → 出口）与 datagram 跳的 `hop_peer`
+ *（出口 → 入口）必须是同一次挑选的结果。
+ */
+export function firstConnectIp(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).find(Boolean) ?? null;
+}
+
+/** `ip:port` / `[v6]:port` / 裸地址 → 地址部分；空串或非字符串 → null。
+ *
+ * 导出是因为**编排层也要用它**：入口 ACK 回报的是 `ip:port`，而面板要拿地址部分去与
+ * `connect_ip` 比对，才能判断这次下发的取证地址是不是错的。第二份解析就是漂移的开始。 */
+export function addressPartOfEndpoint(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (!value) return null;
+  if (value.startsWith("[")) {
+    const close = value.indexOf("]");
+    if (close > 1) return value.slice(1, close);
+  }
+  const lastColon = value.lastIndexOf(":");
+  if (lastColon > 0 && /^\d+$/.test(value.slice(lastColon + 1))) {
+    return value.slice(0, lastColon);
+  }
+  return value;
+}
+
+/**
+ * 出口该取证的地址（V5.1b WP5-B2，契约 §12.5 回填第 8 条）。
+ *
+ * **优先用入口自己上报的跳端点**（`diag.hop_local_addr`），回落到 `connect_ip`。
+ *
+ * 为什么不能只用 `connect_ip`：那个值在多宿节点上是**错的**。跳的源地址由内核按路由选，
+ * 可能是面板完全不知道的那张网——真拓扑上的实测就是"入口从出口网地址发出，面板却告诉出口
+ * 接受它的入口网地址"，于是每个跳报文都被丢弃（`ingress packets_in=1` /
+ * `egress drops=1, packets_in=0`）。而"告诉入口该用哪个源地址"也不行：跨子网源地址会被
+ * 当作 martian 丢弃（实测绑定源地址后**没有任何回应**）。所以这个地址只能由**真正知道它
+ * 的那一端**发布——与 `next_hop` 的流向（出口 → 面板 → 入口）恰好相反。
+ *
+ * **只取地址部分，不取端口**：端口是临时的，入口一重启就变；把它写进出口腿的配置会让
+ * 配置在每次重启后都不一样（无谓的 revision 抖动），而出口本来就只钉地址、忽略端口。
+ */
+export function datagramHopPeerFor(input: {
+  /** 入口腿的运行时 id（`tunex-<id>-relay`）；缺了就无从在报告里找到它。 */
+  ingressRuntimeId?: string | null;
+  ingressConnectIp?: string | null;
+  /** 入口节点最近一次上报的 `tunnels`（原样，未解析）。 */
+  ingressReportedTunnels?: unknown;
+}): string | null {
+  const { ingressRuntimeId, ingressReportedTunnels } = input;
+  if (ingressRuntimeId && Array.isArray(ingressReportedTunnels)) {
+    for (const entry of ingressReportedTunnels) {
+      if (!entry || typeof entry !== "object") continue;
+      const record = entry as { id?: unknown; diag?: unknown };
+      if (String(record.id ?? "") !== ingressRuntimeId) continue;
+      const diag = record.diag as { hop_local_addr?: unknown } | null | undefined;
+      const reported = addressPartOfEndpoint(diag?.hop_local_addr);
+      if (reported) return reported;
+      break;
+    }
+  }
+  return firstConnectIp(input.ingressConnectIp ?? null);
 }
 
 export function dispatchFactsFromRow(row: {
@@ -311,6 +388,14 @@ export function dispatchFactsFromRow(row: {
   tunnel_type?: unknown;
   tls_cert_path?: unknown;
   tls_key_path?: unknown;
+  /** 配对入口节点（只有 datagram 协议会用到；缺了它 = 出口无法取证）。 */
+  ingress_node?: {
+    connect_ip?: unknown;
+    /** 该节点最近一次上报（`node_state_report`）。跳端点就藏在它的 `tunnels` 里。 */
+    state_report?: { tunnels?: unknown } | null;
+  } | null;
+  /** 入口腿的运行时 id：在入口的上报里定位跳端点用（见 `datagramHopPeerFor`）。 */
+  ingress_runtime_id?: unknown;
 }): DispatchFacts | null {
   const protocol = admitPersistedProtocol(row);
   if (protocol === null) return null;
@@ -318,10 +403,24 @@ export function dispatchFactsFromRow(row: {
   if (!paths.ok) return null;
   const cert = paths.columns.tls_cert_path;
   const key = paths.columns.tls_key_path;
+  // A datagram hop has no handshake, so the peer cannot be implied — the panel has
+  // to say who may feed the exit. The address is derived HERE, in the one place
+  // that turns a tunnel row into dispatch facts, rather than at each dispatch
+  // site: two sites deriving it independently is how `next_hop` and `hop_peer`
+  // would end up naming different addresses for the same hop.
+  const hopPeer =
+    FORWARD_PROTOCOL_SPECS[protocol].transport === "datagram"
+      ? datagramHopPeerFor({
+          ingressRuntimeId: typeof row.ingress_runtime_id === "string" ? row.ingress_runtime_id : null,
+          ingressConnectIp: row.ingress_node?.connect_ip as string | null | undefined,
+          ingressReportedTunnels: row.ingress_node?.state_report?.tunnels,
+        })
+      : null;
   return {
     protocol,
     ...(cert ? { tlsCertPath: cert } : {}),
     ...(key ? { tlsKeyPath: key } : {}),
+    ...(hopPeer ? { hopPeer } : {}),
   };
 }
 

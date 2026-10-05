@@ -134,6 +134,24 @@ Panel 只接控制网，从网络结构上无法直接访问 Agent 数据监听�
 CI 的正式发布 Gate 以 `scripts/v3-e2e/verify.sh` 为准；`backend/tests/v3-e2e/*.mjs`
 保留为可复用的更细粒度测试工具，不是另一套发布真相源。
 
+> **这些 `*-gate*.py` / `v5-g*.py` 模块不能单独 `import`**：模块级会 `load_state()`，没先跑
+> `bash scripts/v3-e2e/setup.sh` 就抛 `missing e2e state`。想只跑其中**一个**断言函数（例如
+> `v4-gate-f5.py` 的 `f5_8_ops_scripts()`，它只读 `scripts/ops/*.sh`），正确姿势是取出函数源码
+> `exec()`，而不是 `import`：
+>
+> ```bash
+> python3 - <<'PY'
+> import re, subprocess, pathlib
+> src = pathlib.Path("scripts/v3-e2e/v4-gate-f5.py").read_text(encoding="utf-8")
+> m = re.search(r"^def f5_8_ops_scripts\(\):\n(?:[ \t].*\n|\n)+", src, re.M)
+> ns = {"HERE": pathlib.Path("scripts/v3-e2e"), "subprocess": subprocess, "re": re,
+>       "check": lambda ok, msg, detail="": print(("PASS " if ok else "FAIL ") + msg)}
+> exec(m.group(0), ns); ns["f5_8_ops_scripts"]()
+> PY
+> ```
+>
+> 代价说清楚：这样做等于**绕过**模块级前置，断言与拓扑状态无关时才安全（上面这条只读文件）。
+
 ---
 
 ## 6. WP14 与后续能力的边界

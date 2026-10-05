@@ -128,6 +128,14 @@ describe("A. 统一命令（§7.9 六个动作 + V4-WP11C 诊断）", () => {
     // 这份清单是**冻结契约**：列表变化必须是刻意的决定，所以这里逐项写死。
     // V4-WP11C 增加 `diagnose_tunnel` 时同步改了本断言——那是契约变更，不该
     // 让"多一个动作"悄悄发生。
+    //
+    // V5-WP19-D 增加 `looking_glass` 时又改了一次。**这是一次有意的扩容，不是放宽**：
+    //   · 它不是"把某条既有能力放开"，而是一个**新的**、只读的、node 级动作；
+    //   · 它没有进 baseline（旧 Agent 不会收到它），并且必须被 Agent 显式广告；
+    //   · 它带来的是本项目里**唯一**一个"目标来自用户输入"的动作用例，因此它自带
+    //     独立的白名单（公网单飞地址）、独立的 Gate 与独立的安全评审（契约 §5 WP19-D）。
+    // 之所以不能复用一个既有动作：diagnose_tunnel 的目标契约写死了"来自面板自己的
+    // desired 状态"，把用户输入塞进那条通道会让"目标归谁管"这件事失去唯一答案。
     expect([...COMMAND_ACTIONS]).toEqual([
       "apply_tunnel",
       "remove_tunnel",
@@ -137,6 +145,7 @@ describe("A. 统一命令（§7.9 六个动作 + V4-WP11C 诊断）", () => {
       "command_ack",
       "diagnose_tunnel",
       "collect_diagnostics",
+      "looking_glass",
     ]);
     for (const action of COMMAND_ACTIONS) {
       expect(ACTION_SPECS[action]).toBeDefined();
@@ -167,6 +176,21 @@ describe("A. 统一命令（§7.9 六个动作 + V4-WP11C 诊断）", () => {
     expect(ACTION_SPECS.collect_diagnostics.resources).toEqual(["node"]);
     expect(validatePayload("collect_diagnostics", {})).toBeNull();
     expect(validatePayload("collect_diagnostics", { path: "/etc/shadow" })).toMatch(/未定义字段/);
+
+    // V5-WP19-D：Looking Glass 同一个"只读 + 无 revision 门槛 + node 级"的形状，
+    // 但它**有** payload（面板钉死的公网字面地址），而且目标里不允许出现域名：
+    // 解析在面板侧完成，Agent 只拨地址（DNS 重绑定的最后一道防线）。
+    expect(ACTION_SPECS.looking_glass.mutating).toBe(false);
+    expect(ACTION_SPECS.looking_glass.minRevision).toBe(0);
+    expect(ACTION_SPECS.looking_glass.resources).toEqual(["node"]);
+    expect(validatePayload("looking_glass", {
+      method: "tcp_connect",
+      targets: [{ address: "93.184.216.34", port: 443 }],
+    })).toBeNull();
+    expect(validatePayload("looking_glass", {
+      method: "tcp_connect",
+      targets: [{ address: "example.com", port: 443 }],
+    })).toMatch(/字面 IP/);
   });
 
   test("apply_tunnel：合法命令 → applied，状态推进到 active", async () => {

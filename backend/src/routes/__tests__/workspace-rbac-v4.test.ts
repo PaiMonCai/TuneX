@@ -58,13 +58,24 @@ mock.module(root + "db.ts", () => ({ db: {
 mock.module(root + "services/policy-service.ts", () => ({
   assignDefaultPolicy: async () => {}, withWorkspaceQuotaLock: async () => { throw Error("unexpected quota write"); },
   countWorkspaceTunnels: async () => 0, sumWorkspaceTraffic: async () => 0,
+  // V5-WP20-6：services/traffic.ts 的用量汇总会带上联邦缺口字段，替身要给同一出口。
+  sumFederatedUnattributedTraffic: async () => 0,
+  // dashboard 的「已用流量」读路径改用策略窗口（生效策略 + 窗口求和），替身同样补齐。
+  getEffectivePolicy: async () => ({ limits: { traffic_period: "total", traffic_limit: null } }),
 }));
 mock.module(root + "services/node-enrollment.ts", () => ({ createNodeEnrollment: async () => { writes.push("enrollment"); return {}; } }));
 mock.module(root + "services/node-view.ts", () => ({ projectUserNode: () => ({}) }));
 mock.module(root + "services/node-group-access.ts", () => ({ canUseNodeGroup: async () => false }));
 mock.module(root + "services/relay-wiring.ts", () => ({ getOrchestrator: () => null }));
 mock.module(root + "services/scheduler.ts", () => ({ reapplyDirectTunnel: async () => { writes.push("apply"); return {ok:true}; } }));
-mock.module(root + "services/traffic.ts", () => ({ getWorkspaceTrafficSummary: async () => ({total:0}) }));
+// V5-WP20-6：routes/tunnels.ts 与 routes/dashboard.ts 现在从本模块导入 fillDays
+// （图表键的唯一实现）。替身必须语义完整，否则具名导入处会炸 SyntaxError ——
+// 这正是 src/__tests__/lifecycle-db-stub.ts 顶部记录过的同族问题。
+// 注意：本文件整体在 String.raw 模板串里，注释里不得出现反引号（会终止模板串）。
+mock.module(root + "services/traffic.ts", () => ({
+  getWorkspaceTrafficSummary: async () => ({ total: 0 }),
+  fillDays: () => [],
+}));
 function mutation(id, ws) {
   const row = scoped(id, ws);
   if (!row) return {ok:false, status:404, code:"not_found", message:"missing"};

@@ -29,8 +29,11 @@
  * `getWorkspaceTrafficSummary` 负责 DB 编排，可离线单测。
  */
 import type { Prisma } from "@prisma/client";
+// V5-WP20-6：日标签与序号推导统一走固定时区的纯函数模块。
+import { billingDayKeyStamp, billingPeriodKey } from "./billing-time.ts";
 import { db } from "../db.ts";
 import { trafficWindowStart, type TrafficPeriodName } from "./capability-policy.ts";
+import { sumFederatedUnattributedTraffic } from "./policy-service.ts";
 import { getEffectivePolicy } from "./policy-service.ts";
 
 /** 单日聚合点（前端 TrafficPoint 同构，便于直接替换）。 */
@@ -71,6 +74,11 @@ export interface WorkspaceTrafficSummary {
   total_traffic_cost: number;
   by_tunnel: TunnelTrafficGroup[];
   by_day: TrafficDayPoint[];
+  /**
+   * 联邦远端腿用量（字节）：**不计入** `total_traffic` 的可观测缺口（契约 §3.3.5）。
+   * `null` = 该值读取失败（与「真的是 0」区分开：静默吞错会让缺口重新变成不可见）。
+   */
+  traffic_used_unattributed_federated: number | null;
   /** 窗口内未归属到任何隧道的孤立行数（恒 0：归档时已丢弃，仅作监控位）。 */
   orphan_rows: number;
 }
@@ -94,23 +102,19 @@ export interface TrafficAggRow {
 /* 纯函数                                                              */
 /* ================================================================== */
 
-/** 本地日界键 `YYYY-MM-DD`（与 dashboard/tunnels 的图表口径一致）。 */
-export function dayKeyOf(d: Date): string {
-  const x = new Date(d.getTime());
-  x.setHours(0, 0, 0, 0);
-  return localDayKey(x);
-}
-
 /**
- * 本地日期的 `YYYY-MM-DD`。
+ * 日界键 `YYYY-MM-DD`（与 dashboard/tunnels 的图表口径一致）。
  *
- * 必须用本地分量拼字符串，**不能** `toISOString().slice(0,10)`：
- * UTC+8 下本地午夜 = 前一天 16:00Z，toISOString 会回退一天
- * （dashboard/tunnels 的既有图表口径就是这么错的，此处不再沿袭）。
+ * V5-WP20-6：标签来自 `billing-time.ts` 的**固定时区**（`Asia/Shanghai`）派生，
+ * 不再用进程本地分量。旧实现的两个问题：
+ *   1. 跟随进程时区 ⇒ 缺 `TZ=Asia/Shanghai` 的部署会与写入端（同样按上海标签）差一天；
+ *   2. `dashboard`/`tunnels` 各自的兄弟实现用 `setHours(0,0,0,0)` 后再
+ *      `toISOString().slice(0,10)` —— UTC+8 下本地午夜是前一天 16:00Z，**必然回退一天**，
+ *      于是图表键与归档行的日标签错开，曲线整体偏移。
+ * 现在两者都走这里（`fillDays` 也走），键与写入行的标签同源。
  */
-function localDayKey(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+export function dayKeyOf(d: Date): string {
+  return billingPeriodKey(d, "day");
 }
 
 /**
@@ -119,11 +123,12 @@ function localDayKey(d: Date): string {
  */
 export function fillDays(days: number, now: Date = new Date()): string[] {
   const out: string[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(now.getTime());
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - i);
-    out.push(dayKeyOf(d));
+  const count = Number.isInteger(days) && days >= 1 ? days : 1;
+  for (let i = count - 1; i >= 0; i--) {
+    // 用**归档戳**（UTC 午夜）做减日：它是 `tunnel_traffic.date` 的存储口径，
+    // 也天然避开「本地午夜 + setDate 在月末/夏令时上的夹取问题」。
+    const stamp = billingDayKeyStamp(now);
+    out.push(dayKeyOf(new Date(stamp.getTime() - i * 86_400_000)));
   }
   return out;
 }
@@ -258,16 +263,20 @@ export async function getWorkspaceTrafficSummary(
 
   // total → 不限窗口；day/month → 与 policy-service#trafficStart 同源的窗口起点。
   const windowStart = trafficWindowStart(period, now);
-  const since = windowStart ?? new Date(now.getTime());
-  since.setHours(0, 0, 0, 0);
-  since.setDate(since.getDate() - (days - 1));
+  // 趋势窗口的下界：**归档戳**（= 当日标签的 UTC 午夜）往前推 days-1 天。
+  // `tunnel_traffic.date` 存的就是这个口径的戳，所以这里与它逐字可比。
+  const trendStart = new Date(billingDayKeyStamp(now).getTime() - (days - 1) * 86_400_000);
   // 有明确窗口时取「策略窗口与趋势窗口的较大值」：趋势只展示窗口内的天数。
-  const effectiveSince = windowStart && windowStart > since ? windowStart : since;
+  // （`total` 时 windowStart 为 null ⇒ 直接用趋势下界，等价于旧实现的
+  //  `now → 本地零点 → 回退 days-1`，但现在是固定时区 + 归档戳口径。）
+  const effectiveSince = windowStart && windowStart > trendStart ? windowStart : trendStart;
 
   const where: Prisma.TunnelTrafficWhereInput = {
     tunnel: { workspace_id: workspaceId },
     date: { gte: effectiveSince },
   };
+  // 联邦远端腿用量：不计入额度，但**必须可观测**（契约 §3.3.5）。
+  // 计算只有一处实现（policy-service#sumFederatedUnattributedTraffic），这里只是把它带出来。
 
   const rows = await db.tunnelTraffic.findMany({
     where,
@@ -290,6 +299,14 @@ export async function getWorkspaceTrafficSummary(
   });
 
   const agg = aggregateTrafficRows(rows as unknown as TrafficAggRow[], { days, now });
+  // 联邦远端腿用量：**独立字段**，不加进 total_traffic（契约 §3.3.5 / O5：
+  // 不合并两本账，只让缺口可观测）。读失败不该让整张用量视图塌掉 —— 它只是缺口提示。
+  let federated: number | null = null;
+  try {
+    federated = await sumFederatedUnattributedTraffic(workspaceId);
+  } catch {
+    federated = null;
+  }
   return {
     workspace_id: workspaceId,
     period,
@@ -298,6 +315,8 @@ export async function getWorkspaceTrafficSummary(
     total_traffic_cost: agg.total_traffic_cost,
     by_tunnel: agg.by_tunnel,
     by_day: agg.by_day,
+    /// 联邦远端腿用量（字节，**不计入** `total_traffic`）；读失败为 `null`（区别于「真的是 0」）。
+    traffic_used_unattributed_federated: federated,
     orphan_rows: 0,
   };
 }

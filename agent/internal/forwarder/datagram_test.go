@@ -678,10 +678,18 @@ func TestDatagramMappingKeyIsNormalisedAndTargetFree(t *testing.T) {
 	}
 }
 
-// udp is DIRECT-only in this build: RELAY would need an inter-node hop shape that
-// is still an open product decision (§9.1), and there is no datagram EGRESS
-// runtime at all. Both must be refused by Validate — before a listener exists.
-func TestDatagramValidateRefusesRelayAndEgress(t *testing.T) {
+// Every udp role is now open, and each one names the field it cannot work without.
+//
+// WP5-B2 (contract §9.1, frozen 2026-10-05) froze the hop as "datagram end to end"
+// and lands both halves in the same WP. Validate is where the two new fields show
+// up, because a datagram has no handshake to imply them:
+//
+//   - EGRESS needs `hop_peer`: who may feed this exit;
+//   - RELAY needs `next_hop`: where this ingress sends client datagrams.
+//
+// Each refusal must NAME the missing field: a refusal a reader cannot act on is
+// the thing this test exists to prevent.
+func TestDatagramValidateOpensAllUdpRolesAndNamesMissingFields(t *testing.T) {
 	direct := udpDirectConfig("tunex-1-direct", 20098, 3040)
 	if err := direct.Validate(); err != nil {
 		t.Fatalf("udp DIRECT must validate: %v", err)
@@ -690,24 +698,36 @@ func TestDatagramValidateRefusesRelayAndEgress(t *testing.T) {
 		t.Fatalf("protocol normalised to %q, want udp", direct.Protocol)
 	}
 
-	relay := direct.Clone()
-	relay.Mode = ModeRelay
-	relay.NextHop = "127.0.0.1:3040"
-	if err := relay.Validate(); err == nil {
-		t.Fatal("udp RELAY must be refused: the inter-node hop for UDP is an open product decision")
-	} else if !strings.Contains(err.Error(), "DIRECT-only") {
-		t.Fatalf("the refusal must say why, got %v", err)
-	}
-
+	// EGRESS without hop_peer: refused, and the refusal names the field.
 	egress := direct.Clone()
 	egress.Mode = ModeEgress
 	egress.EgressPort = direct.IngressPort
 	if err := egress.Validate(); err == nil {
-		t.Fatal("udp EGRESS must be refused: this binary has no datagram egress runtime")
+		t.Fatal("udp EGRESS must be refused without hop_peer: the exit cannot attest a peer it was not told about")
+	} else if !strings.Contains(err.Error(), "hop_peer") {
+		t.Fatalf("the EGRESS refusal must name hop_peer, got %v", err)
+	}
+	attested := egress.Clone()
+	attested.HopPeer = "127.0.0.1"
+	if err := attested.Validate(); err != nil {
+		t.Fatalf("udp EGRESS with hop_peer must validate: %v", err)
+	}
+
+	// RELAY without next_hop: refused, and the refusal names the field.
+	relay := direct.Clone()
+	relay.Mode = ModeRelay
+	if err := relay.Validate(); err == nil {
+		t.Fatal("udp RELAY must be refused without next_hop")
+	} else if !strings.Contains(err.Error(), "next_hop") {
+		t.Fatalf("the RELAY refusal must name next_hop, got %v", err)
+	}
+	relay.NextHop = "127.0.0.1:3040"
+	if err := relay.Validate(); err != nil {
+		t.Fatalf("udp RELAY with next_hop must validate: %v", err)
 	}
 
 	if _, err := NewDatagram(relay, DatagramOptions{}); err == nil {
-		t.Fatal("the constructor must refuse a non-DIRECT mode as well")
+		t.Fatal("the DIRECT constructor must still refuse a non-DIRECT mode")
 	}
 }
 

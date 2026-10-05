@@ -37,12 +37,21 @@ import { adminExtendedRoutes } from "./routes/admin-extended.ts";
 import { nodeAdminRoutes } from "./routes/node-admin.ts";
 import { nodeLifecycleRoutes } from "./routes/node-lifecycle.ts";
 import { nodeHealthRoutes } from "./routes/node-health.ts";
+import { lookingGlassRoutes } from "./routes/looking-glass.ts";
 import { publicRoutes } from "./routes/public.ts";
 import { internalNodeRoutes } from "./routes/internal-node.ts";
 import { payRoutes } from "./routes/pay.ts";
 import { dashboardRoutes } from "./routes/dashboard.ts";
+// V5-WP20-6b：`/api/me/*` 的当前用户视图（契约 §3.3.2 指定的已用流量读路径）。
+import { meRoutes } from "./routes/me.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
 import { forwardsRoutes } from "./routes/forwards.ts";
+import { ddnsRoutes } from "./routes/ddns.ts";
+// V5-WP18.5：公告（用户侧/租户侧 + 平台管理端）。平台前缀 `/admin/announcements` 的
+// RBAC 登记是 WP18.6 的动作；本 WP 只挂路由 —— 未登记前缀由 adminPermissionGuard
+// fail-closed 到 super_admin（契约 F7）。
+import { announcementRoutes } from "./routes/announcements.ts";
+import { announcementAdminRoutes } from "./routes/announcements-admin.ts";
 import { plansRoutes } from "./routes/plans.ts";
 import { topupsRoutes } from "./routes/topups.ts";
 import { paymentsRoutes } from "./routes/topups.ts";
@@ -154,8 +163,12 @@ export function createApp() {
   app.route("/api/internal", internalNodeRoutes);
   app.route("/api/pay", payRoutes);
   app.route("/api/dashboard", dashboardRoutes);
+  // V5-WP20-6b：`/api/me/capabilities` —— 额度/用量视图（窗口求和口径，见 routes/me.ts）。
+  app.route("/api/me", meRoutes);
   app.route("/api/tunnels", tunnelsRoutes);
   app.route("/api/forwards", forwardsRoutes);
+  // V5-WP17.2：DNS provider（凭据属于设置域）。
+  app.route("/api/ddns", ddnsRoutes);
   app.route("/api/workspaces", workspaceRoutes);
   app.route("/api/workspaces", workspaceRolesRoutes);
   app.route("/api/plans", plansRoutes);
@@ -169,6 +182,10 @@ export function createApp() {
   // 因此用既有 workspace 域 RBAC（read / manage on "node"），不新增 /api/admin/* 权限 key：
   // Admin Console 与 User Console 走同一套后端资源与 RBAC，前端只做 UX 分层（§9.4.1）。
   app.route("/api/route-profiles", routeProfilesRoutes);
+  // V5-WP18.5：公告。用户/租户侧挂 `/api/announcements`（免 workspace 权限的读 +
+  // settings:read/manage 的管理面），平台侧挂 `/api/admin/announcements`（§⑥ 的
+  // adminRequired + adminPermissionGuard 已统一施加）。
+  app.route("/api/announcements", announcementRoutes);
   // V5.5 WP14：联邦 M2M 端点。挂载在 publicRoutes 之前：与 /api/internal/* 同理，
   // 路径更具体先落位；免认证白名单已整段豁免 /api/federation/*。
   app.route("/api/federation/v1", federationRoutes);
@@ -194,6 +211,12 @@ export function createApp() {
   // health 是**读**接口（判定由 services/node-health.ts 的纯函数给出），
   // 因此不新增限流规则，走 api-global。
   app.route("/api/admin", nodeHealthRoutes);
+  // V5-WP19-D：Looking Glass（默认关闭；打开见 LOOKING_GLASS_ENABLED）。
+  app.route("/api/looking-glass", lookingGlassRoutes);
+  // V5-WP18.5/18.6：平台公告（发布 / 撤回 / 列全部）。前缀
+  // `/admin/announcements` 已登记为独立的 announcements 管理资源；读写级别继续由
+  // adminPermissionGuard 按 HTTP 方法判定，未授权管理员 fail-closed，super_admin 仍直接放行。
+  app.route("/api/admin", announcementAdminRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 

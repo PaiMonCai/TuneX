@@ -251,3 +251,62 @@ describe("desired snapshot: the protocol fact is never invented", () => {
     expect(historical.kind).toBe("skip");
   });
 });
+
+/* ------------------------------------------------------------------ */
+
+/**
+ * V5.1b WP5-B2 —— 快照里的 datagram 出口腿必须带 `hop_peer`。
+ *
+ * 这条与"协议""证书路径""健康"是同一类：**下发路径不止 dispatch***。这条快照是
+ * Agent 重启后重建 runtime 的唯一依据，缺了 `hop_peer` 的 datagram 出口**每次重启都会
+ * 拒绝构建**（Agent 侧缺它就是硬校验）——而面板两侧的账本都还显示 active。
+ */
+describe("V5.1b WP5-B2: the snapshot tells a datagram exit which ingress may feed it", () => {
+  const udpEgressRow = (over: Partial<DesiredRowProjection> = {}): DesiredRowProjection =>
+    directRow({
+      id: 170,
+      tunnel_mode: "relay",
+      forward_protocol: "udp",
+      tunnel_type: "udp",
+      ingress_node_id: 9,
+      egress_node_id: NODE,
+      listen_port: 21030,
+      remote_host: null,
+      remote_port: null,
+      egress_port: 22001,
+      egress_node: { connect_ip: "10.0.0.4" },
+      egress_pool: { lb_strategy: "round", targets: [{ host: "192.168.1.10", port: 5353, weight: 1, order_by: 10 }] },
+      // The address the exit must attest comes from the INGRESS node, not from the
+      // node running this leg.
+      ingress_node: { connect_ip: "10.0.0.9, 10.0.0.10" },
+      ...over,
+    });
+
+  test("a udp egress leg carries hop_peer, taken from the ingress node's first address", () => {
+    const outcome = desiredTunnelConfigFor(udpEgressRow(), NODE);
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.mode).toBe("EGRESS");
+    expect(outcome.config.protocol).toBe("udp");
+    // Comma-separated candidate list → the FIRST entry, the same pick the ingress
+    // leg makes for its next_hop (one hop, one address).
+    expect(outcome.config.hop_peer).toBe("10.0.0.9");
+  });
+
+  test("a stream egress leg never carries it", () => {
+    const outcome = desiredTunnelConfigFor(
+      udpEgressRow({ forward_protocol: "tcp", tunnel_type: "tcp" }),
+      NODE,
+    );
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.hop_peer).toBeUndefined();
+  });
+
+  test("with no readable ingress address the snapshot omits the field, so the exit refuses to build rather than accepting anyone", () => {
+    const outcome = desiredTunnelConfigFor(udpEgressRow({ ingress_node: null }), NODE);
+    expect(outcome.kind).toBe("config");
+    if (outcome.kind !== "config") return;
+    expect(outcome.config.hop_peer).toBeUndefined();
+  });
+});

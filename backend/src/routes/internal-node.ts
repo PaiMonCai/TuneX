@@ -188,6 +188,20 @@ internalNodeRoutes.post("/node/ack", async (c) => {
       // validated and bounded in the bus, not trusted as-is.
       ...(body.results !== undefined ? { results: body.results as never } : {}),
       ...(body.facts !== undefined ? { facts: body.facts as never } : {}),
+      // V5.1b WP5-B2: a datagram RELAY's own hop endpoint rides its apply ACK
+      // (`ip:port`; see CommandAckPayload.hop_local_addr for why it cannot wait for
+      // the periodic state report).
+      //
+      // This route is the HTTP boundary where an ACK is REBUILT FIELD BY FIELD, so a
+      // field not listed here is dropped before anything else on the panel can see it:
+      // the agent set it (`type=*forwarder.DatagramRelay diag_ok=true hop=172.41.20.10:56588`),
+      // the ledger and the orchestrator were both ready to carry it, and the correction
+      // still never fired — the fact died right here. Same closed-key-set shape as
+      // `ACTION_PAYLOAD_KEYS.command_ack` and `runtime_counts`; it is worth assuming every
+      // boundary in this path has one.
+      ...(typeof body.hop_local_addr === "string" && body.hop_local_addr.trim() !== ""
+        ? { hop_local_addr: body.hop_local_addr }
+        : {}),
     });
   } catch {
     return c.json({ ok: false, error: "invalid_ack" }, 400);

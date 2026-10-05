@@ -14,6 +14,18 @@ function requireSecret(name: string): string {
   if (!value) throw new Error(`${name} is required and has no default`);
   return value;
 }
+
+/**
+ * 开关解析必须与 `services/looking-glass.ts:lookingGlassEnabledFromEnv` 同一语义。
+ *
+ * 这里复制而不是 import：env.ts 是**最底层**模块（services 会 import 它），反向
+ * import 会形成环。两处语义一致性由 `v5-wp19/d-looking-glass.test.ts` 直接断言
+ * （同一张"哪些取值算开"的表跑两个实现）。
+ */
+function lookingGlassEnabledFromEnv(raw: string | undefined): boolean {
+  const value = (raw ?? "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   isProduction: (process.env.NODE_ENV ?? "development") === "production",
@@ -68,6 +80,17 @@ export const env = {
   disableWorker: (process.env.DISABLE_WORKER ?? "false") === "true",
   /** Optional billing integration; off by default, independent of RBAC. */
   paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
+  /**
+   * V5-WP19-D —— Looking Glass（从节点向公网目标发一次有界 TCP 连接测试）。
+   *
+   * **默认关闭**，与契约 §3 D7④ 一致：这是一个"让别人的机器替我发包"的能力，
+   * 上线前要独立安全评审，因此不能因为没配置就默认打开。
+   *
+   * 解析走 `lookingGlassEnabledFromEnv`（services/looking-glass.ts）：显式真值
+   * `1/true/yes/on` 才算开，拼写错误（`ture`/`enable`）等于关。方向刻意的——
+   * 宽松解析会让一次拼写错误悄悄打开一个向客户机房发探测包的功能。
+   */
+  lookingGlassEnabled: lookingGlassEnabledFromEnv(process.env.LOOKING_GLASS_ENABLED),
   /**
    * V5.5 WP14 —— 本 Panel 对**其他 Panel** 公布的可达地址（不含路径）。
    *

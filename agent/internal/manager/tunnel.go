@@ -411,7 +411,21 @@ func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Runti
 		// mapping ceiling are product decisions (§9.2/§9.3) with no per-Forward
 		// column yet, so inventing values here would put a second, invisible copy
 		// of them in the control plane's way.
-		Datagram: forwarder.DatagramBuildDeps{},
+		//
+		// What a datagram runtime DOES need from its owner is the same pool the
+		// stream egress reads (V5.1b WP5-B2): the destination of a datagram exit is
+		// never on the wire, so the selector is the only thing that can name one.
+		// Until this was wired, an EGRESS datagram config reached the factory with
+		// nothing to resolve and had to be refused there.
+		Datagram: forwarder.DatagramBuildDeps{
+			SelectorFor: func(tunnelID string) (forwarder.TargetSelector, error) {
+				if m.egress == nil {
+					return nil, fmt.Errorf("manager: EGRESS tunnel %s has no egress manager wired", tunnelID)
+				}
+				return m.egress.SelectorFor(tunnelID)
+			},
+			Observer: egressObserver(cfg.ID),
+		},
 	})
 }
 

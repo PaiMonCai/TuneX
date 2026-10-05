@@ -97,6 +97,28 @@ type ProtocolDiagnostics struct {
 	PacketsOut         int64 `json:"packets_out,omitempty"`
 	BytesIn            int64 `json:"bytes_in,omitempty"`
 	BytesOut           int64 `json:"bytes_out,omitempty"`
+
+	// HopLocalAddr is the RELAY ingress's own endpoint on the hop: `ip:port` of the
+	// socket it carries client mappings through (V5.1b WP5-B2).
+	//
+	// It exists because that address must be LEARNED, not dictated. The exit attests
+	// the paired ingress by address, and "the ingress node's address" is ambiguous the
+	// moment a node is multi-homed: the hop's source address is chosen by the kernel
+	// from the route, and it can be a network the panel knows nothing about. Two
+	// measurements from the real topology settled it:
+	//
+	//   · a dual-homed ingress sent from its egress-network address while the panel had
+	//     told the exit to accept its ingress-network address → every hop packet was
+	//     dropped (ingress packets_in=1 / exit drops=1 and packets_in=0);
+	//   · binding the source to the address the exit expects does NOT work either: the
+	//     bound-source probe got no answer at all (a cross-subnet source address is
+	//     dropped as a martian), so the fix cannot be "tell the ingress which source
+	//     address to use".
+	//
+	// So the ingress publishes the endpoint and the panel hands it to the exit — exactly
+	// how `next_hop` travels the other way (exit → panel → ingress). It is an ADDRESS
+	// fact, never a credential: it says where the hop comes from, not who may send on it.
+	HopLocalAddr string `json:"hop_local_addr,omitempty"`
 	Drops              int64 `json:"drops,omitempty"`
 	IdleTimeoutSeconds int64 `json:"idle_timeout_seconds,omitempty"`
 }

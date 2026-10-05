@@ -8,7 +8,9 @@ executable cases against the real four-Agent topology:
   G1B.2  udp DIRECT positive      a datagram goes out and the answer comes back
   G1B.3  mapping semantics        two clients get two mappings; the target is not part of the key
   G1B.4  idle expiry              a mapping ends by timeout, and the fact is reported
-  G1B.5  udp RELAY refused        RELAY/EGRESS is refused outright, never half-implemented
+  G1B.5  udp RELAY end to end   the datagram hop carries a client through both halves
+                                (B1 asserted the OPPOSITE — "refused" — while the hop
+                                shape was unfrozen; WP5-B2 flipped it, see the case)
   G1B.6  malformed datagrams      garbage and oversized payloads do not kill the listener
   G1B.7  old Agent admission      an Agent that does not advertise udp/datagram is refused first
   G1B.8  Agent restart            a udp Forward survives the node restarting
@@ -57,6 +59,11 @@ OUT = HERE / "evidence"
 OUT.mkdir(exist_ok=True)
 RESULT = OUT / "v5-g1b-result.txt"
 UDP_ECHO_PORT = 3040  # the UDP byte-echo target this gate starts
+# 本门禁自己跑在哪个容器里：两个 helper 都要用它取自己的数据网地址（`hostname -i`）。
+# 写成一个常量是为了让"门禁从哪个容器跑"只有一处说法——散落的字面量正是那种
+# "换了个 runner 名字就静默取到空地址"的坑（实测：名字不对时 `runner_data_ip()` 返回空，
+# 于是 target_host 为空、所有 udp 创建返回 400）。
+RUNNER_CONTAINER = "g0-runner"
 
 # Instantiated in setup(), once the class below is defined: Python runs module-level
 # statements in order, and creating them here raised NameError before any case ran.
@@ -181,18 +188,90 @@ def probe_echo(server: UDPEcho, payload: bytes = b"target-check", timeout: float
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def runner_data_ip() -> str:
-    """The runner's own address on the ingress data network.
+def _host_bridge_address(container: str, prefix: str) -> str:
+    """Return the host-side bridge address for the data network used by *container*.
 
-    A literal address, not a name: the Forward's target must be reachable from the
-    Agent, and the Agent resolves names on that network — but relying on DNS for a
-    container the gate itself owns would add a dependency the test does not need.
+    Docker leaves `IPAM.Config[].Gateway` empty when Compose only declares a
+    subnet on an internal network. That made the first host-run PR fallback
+    return an empty string even though the bridge itself existed. Discover the
+    *actual* network through the running container instead of relying on a
+    Compose project/network name; prefer Docker's runtime Gateway and, when it
+    is omitted, derive the bridge's first host address from the inspected subnet.
     """
-    out = H.docker(["exec", "g0-runner", "sh", "-c", "hostname -i"], allow=True).strip()
+    try:
+        raw = H.docker(["inspect", container], allow=True)
+        inspected = json.loads(raw or "[]")
+        networks = ((inspected[0] if inspected else {}).get("NetworkSettings") or {}).get("Networks") or {}
+    except (json.JSONDecodeError, IndexError, TypeError):
+        networks = {}
+
+    for network_name, facts in networks.items():
+        ip = str((facts or {}).get("IPAddress") or "")
+        if not ip.startswith(prefix):
+            continue
+        gateway = str((facts or {}).get("Gateway") or "")
+        if gateway:
+            return gateway
+        try:
+            network_raw = H.docker(["network", "inspect", network_name], allow=True)
+            network_info = json.loads(network_raw or "[]")
+            configs = ((network_info[0] if network_info else {}).get("IPAM") or {}).get("Config") or []
+            for config in configs:
+                subnet = str((config or {}).get("Subnet") or "")
+                gateway = str((config or {}).get("Gateway") or "")
+                if gateway:
+                    return gateway
+                if subnet:
+                    import ipaddress
+                    return str(ipaddress.ip_network(subnet, strict=False).network_address + 1)
+        except (json.JSONDecodeError, IndexError, TypeError, ValueError):
+            pass
+    return ""
+
+
+def runner_data_ip() -> str:
+    """Address of the gate's UDP echo target on the ingress data network.
+
+    Historical/manual runs may still provide `g0-runner`; PR CI runs the gate on
+    the Docker host. Prefer the container address when present and fall back to the
+    bridge gateway, which reaches the host-bound echo server from the Agent.
+    """
+    out = H.docker(["exec", RUNNER_CONTAINER, "sh", "-c", "hostname -i"], allow=True).strip()
     for candidate in out.split():
         if candidate.startswith("172.31.10."):
             return candidate
-    return out.split()[0] if out.split() else ""
+    return _host_bridge_address(H.INGRESS_CONTAINER, "172.31.10.")
+
+
+def runner_egress_ip() -> str:
+    """The runner's own address on the EGRESS data network (WP5-B2 relay case).
+
+    Why a second helper instead of reusing the ingress one: a RELAY fixture's pool
+    target is reached **by the exit node**, and the exit lives on the egress network.
+    Handing it the runner's *ingress*-side address gives the exit a destination it has
+    no route to — which is exactly how the first version of G1B.5 failed
+    (`the client reaches the target THROUGH the datagram hop [TimeoutError]`), with the
+    control plane fully green (create + converge + a real udp runtime on the exit). The
+    runner is attached to both data networks, so both addresses exist; they are simply
+    not interchangeable.
+
+    The subnet is derived from the egress node's own `connect_ip` rather than hardcoded,
+    so the helper keeps working when the topology's addressing changes.
+    """
+    egress_node_ip = (H.scalar("SELECT connect_ip FROM node WHERE id=%d;" % H.EGR) or "").strip()
+    prefix = egress_node_ip.rsplit(".", 1)[0] + "." if egress_node_ip else ""
+    out = H.docker(["exec", RUNNER_CONTAINER, "sh", "-c", "hostname -i"], allow=True).strip()
+    if prefix:
+        for candidate in out.split():
+            if candidate.startswith(prefix):
+                return candidate
+
+    # PR Integration executes on the Docker host. The host-side echo server is
+    # reachable from the egress Agent through this network's bridge gateway.
+    gateway = _host_bridge_address(H.EGRESS_CONTAINER, prefix)
+    if prefix and gateway.startswith(prefix):
+        return gateway
+    return gateway
 
 
 ECHO_ALT_PORT = UDP_ECHO_PORT + 1
@@ -226,13 +305,17 @@ def wait_diag(fid: int, predicate, timeout: int = 60) -> tuple[bool, dict]:
 
 
 def udp_create(name: str, mode: str = "direct", *, target_port: int = UDP_ECHO_PORT,
-               listen_port: int | None = None, egress: bool = False):
+               listen_port: int | None = None, egress: bool = False,
+               target_host: str | None = None):
     body: dict = {
         "name": f"{FIXTURE_PREFIX}-{name}",
         "mode": mode,
         "protocol": "udp",
         "ingress_node_id": H.ING,
-        "target_host": ECHO_TARGET_HOST,
+        # DIRECT: the ingress node dials the target, so the runner's INGRESS-side address
+        # is the right one. A RELAY fixture passes `target_host` explicitly (the exit node
+        # needs an address on ITS network — see runner_egress_ip).
+        "target_host": target_host or ECHO_TARGET_HOST,
         "target_port": target_port,
     }
     if listen_port is not None:
@@ -273,6 +356,11 @@ def setup():
           f"rows_without_udp={missing}")
 
     check(H.ensure_second_target(), "G1B.setup target-a serves the TCP byte-echo port", f"port={H.ECHO_TARGET_PORT}")
+    # G1B is now a standalone PR gate. Historically G1A ran immediately before
+    # it and happened to leave the byte-echo listener on 3032 alive. Make the
+    # prerequisite explicit so the fast PR path does not depend on another gate.
+    check(H.ensure_echo_target(), "G1B.setup target-a serves the byte-echo port used by stream regression",
+          f"port={H.ECHO_TARGET_PORT}")
     global ECHO_TARGET_HOST
     ECHO_TARGET_HOST = runner_data_ip()
     check(bool(ECHO_TARGET_HOST),
@@ -400,21 +488,66 @@ def g1b_4_idle_expiry():
     check(ok_after, "G1B.4 a new client is served after the expiry", detail_after)
 
 
-def g1b_5_relay_refused():
-    status, fid, _port, resp = udp_create("RELAY", mode="relay", egress=True)
+def g1b_5_relay_end_to_end():
+    """WP5-B2（契约 §9.1，2026-10-05 冻结）：datagram 跳是"端到端 UDP"，两半都落地。
+
+    这条断言在 B1 时写的是"udp RELAY **必须被拒**"，它当时守的是**跳形态未冻结**。
+    形态冻结、且 Agent 两侧运行时（入口 `DatagramRelay` / 出口 `DatagramEgress`）落地之后，
+    它**翻转**成"可用"——翻转是明写的，不是静默删除：单跳 udp RELAY 现在必须建立，而且
+    客户端的数据报必须真的**穿过这一跳**到达目标再回来。
+
+    仍然被拒的是**多跳**（每个映射共用一个朝向出口的 socket，而中转跳是被它前一跳喂的，
+    不是被入口喂的）：那是纯校验事实，断言在 backend 单测里
+    (`forward-revision.test.ts` 的 "udp + RELAY 带中间跳仍被拒")，不在这里复刻一个依赖
+    拓扑里"恰好有第三台节点"的脆弱版本。
+    """
+    # The relay's pool target is dialled by the **exit** node, so it must be an address on
+    # the EGRESS data network. Using the ingress-side echo address here is what made the
+    # first version of this case fail with a fully green control plane (create + converge +
+    # a real udp runtime on the exit): the exit simply had no route to the destination.
+    # Fail loudly if that address cannot be determined — a silently empty target would
+    # turn a topology problem into "the product does not work".
+    egress_target = runner_egress_ip()
+    check(bool(egress_target),
+          "G1B.5 the runner has an address on the egress data network (the exit must be able to reach the target)",
+          f"ip={egress_target!r}")
+    if not egress_target:
+        return
+    status, fid, port, resp = udp_create("RELAY", mode="relay", egress=True, target_host=egress_target)
     body = json.dumps(resp, ensure_ascii=False)
-    check(status not in (200, 201),
-          "G1B.5 a udp RELAY Forward is refused (the inter-node hop shape is NOT frozen)",
+    check(status in (200, 201),
+          "G1B.5 a single-hop udp RELAY Forward is accepted (hop shape frozen: datagram end to end)",
           f"status={status} body={body[:200]}")
-    if fid is not None:
-        check(not H.wait_active(int(fid), timeout=25),
-              "G1B.5 and it never converges to active", f"id={fid}")
-        row = H.tunnel_row(int(fid))
-        check("active" not in row.split("|")[0],
-              "G1B.5 the row is left in error rather than reported as running", row[:160])
-    check(not H.wait_until(lambda: "udp" in H.scalar(
-        "SELECT IFNULL(tunnels,'[]') FROM node_state_report WHERE node_id=%d;" % H.EGR), timeout=20, interval=4),
-        "G1B.5 no udp runtime was created on the egress node")
+    if fid is None:
+        return
+    check(H.wait_active(int(fid)),
+          "G1B.5 and it converges to active", f"id={fid} port={port}")
+
+    # The property that matters: one client datagram in, the same payload back, having
+    # gone through BOTH hops (the echo target lives on the egress side, so a
+    # DIRECT-shaped listener could not answer at all).
+    ok, detail = udp_probe(port, b"relay-e2e")
+    check(ok, "G1B.5 the client reaches the target THROUGH the datagram hop", detail)
+
+    # And the exit really hosts a datagram runtime: "the panel says active" is not the
+    # same fact as "the node runs it".
+    #
+    # Two things this assertion has to get right, and neither is cosmetic:
+    #
+    #   · It must name THIS tunnel's egress leg. `"udp" in <the whole report>` is satisfied
+    #     by any udp runtime the node happens to have — including a leftover from another
+    #     case — so it could pass while this Forward has no exit at all.
+    #   · The window must span more than one reporting cycle. The node reports every ~30s
+    #     (and the hop-peer correction re-dispatches this leg once it learns the ingress's
+    #     endpoint, which moves the revision it reports). A 20s window against a 30s
+    #     cadence is a coin flip, not a test.
+    check(H.wait_until(lambda: any(
+        isinstance(t, dict) and str(t.get("id", "")) == f"tunex-{fid}-egress"
+        and str(t.get("protocol", "")) == "udp"
+        for t in json.loads(H.scalar(
+            "SELECT IFNULL(tunnels,'[]') FROM node_state_report WHERE node_id=%d;" % H.EGR) or "[]")
+    ), timeout=75, interval=5),
+        "G1B.5 the egress node really hosts a udp runtime for THIS Forward")
 
 
 def g1b_6_malformed_datagrams():
@@ -622,7 +755,7 @@ def main():
             ("G1B.2 udp positive", g1b_2_udp_positive, 240),
             ("G1B.3 mapping semantics", g1b_3_mapping_semantics, 300),
             ("G1B.4 idle expiry", g1b_4_idle_expiry, 420),
-            ("G1B.5 relay refused", g1b_5_relay_refused, 240),
+            ("G1B.5 relay end to end", g1b_5_relay_end_to_end, 300),
             ("G1B.6 malformed datagrams", g1b_6_malformed_datagrams, 300),
             ("G1B.7 old Agent admission", g1b_7_old_agent_admission, 420),
             ("G1B.11 hot reload", g1b_11_hot_reload, 300),

@@ -36,7 +36,52 @@ scripts/ops/alert.sh
 
 ## 2. 首次部署
 
+### 2.0 一键安装（默认路径）
+
+> **默认路径是这一节。** 下面 `2.1`–`2.5` 是**手动 fallback**：只在安装器前置不满足、或需要逐步审计时走。
+> 手动步骤的内容不在这里复制 —— 语义权威仍是本节的 §2.1–§2.5 与
+> `docs/v5-wp21-installer-and-docs-site-contract.md`（FROZEN-1…FROZEN-7 是安装器的唯一语义来源）。
+
+```bash
+# 0) 前置：root、git、Docker Engine ≥ 24 + Compose v2。
+#    安装器**不会**替你装 Docker：缺 Docker 时它只打印官方安装文档与各发行版包管理器路径
+#    （见 2.1 的版本要求），然后非零退出 —— 这是刻意的 fail-closed。
+# 1) 引导段：把仓库按**明确版本**检出到部署目录，断言 HEAD 就是该版本，再交给安装器。
+#    版本是裸 sha ⇒ 完整克隆 + 分离检出；版本是 tag ⇒ ls-remote 解析出 sha 后浅克隆。
+sudo -E scripts/ops/bootstrap.sh --repo <git-url> --version <git-sha 或 tag> --dir /opt/TuneX
+
+# 2) 只想先看计划 / 只做前置检查（两者都不改机器状态）：
+sudo scripts/ops/install.sh --dry-run install --version <git-sha>
+sudo scripts/ops/install.sh --check   install --version <git-sha>
+```
+
+`install.sh` 的动作集是封闭的 4 个（没有第二个入口）：
+
+| 动作 | 做什么 |
+|---|---|
+| `install --version <sha>` | 首次部署：生成/校验 `.env`（`chmod 600`）→ `docker pull` → `up -d` → 等 `db-migrate` 退出码 0 → `/healthz` + `/readyz` 验收 |
+| `upgrade --version <sha>` | 升级：先 pull → **先备份**（`scripts/ops/backup.sh`，失败即拒绝）→ 切 `TUNEX_IMAGE` → `up -d backend worker web` → 健康；失败自动 `scripts/ops/rollback.sh --to previous --yes`（**只回退镜像**，数据层退回必须人工 `restore.sh`） |
+| `uninstall` | 停容器；**默认保留数据卷**（删卷必须 `--purge-data --yes`，非交互缺 `--yes` 直接拒绝） |
+| `status` | 只读：容器 / 镜像与 digest / 健康 / `db-migrate` 退出码 / 最近备份 / 部署历史 |
+
+口径与 §1 一致（都是踩过的坑）：
+
+- 安装器**显式**带 `-p tunex -f docker-compose.prod.yaml --env-file .env`，不依赖调用者 shell 的隐式默认值
+  （§1 那条"ops 脚本默认读开发栈 `docker-compose.yaml`"）。
+- `.env` **已存在即永不覆盖**；缺必需键 / 仍是 `change-me`·`replace-with` 占位 / 权限不是 600 ⇒ 拒绝，
+  且**只报键名、不回显值**。若上次安装只跑到写 `.env` 就被打断（有 `.env`、无容器），用
+  `sudo scripts/ops/install.sh install --reuse-env --version <sha>` 显式复用 —— 它要求 `.env` 校验通过
+  **且** `TUNEX_IMAGE` 与请求版本一致，任一不满足仍然拒绝。
+- 升级的备份口令**只经环境变量**传递（不进 argv、不进日志、不进文件）：
+  `sudo -E env BACKUP_PASSPHRASE=… scripts/ops/install.sh upgrade --version <sha>`。
+- 备份 / 恢复 / 回滚 / 告警 / 容量仍归 `scripts/ops/{backup,restore,rollback,alert,capacity}.sh`（§4–§8）；
+  面板主机升级**不包含**节点 Agent —— 节点安装/升级走面板生成的命令
+  （`POST /api/nodes/:id/enrollment`、`POST /api/nodes/:id/upgrade-command`），安装器结束时也会再提示一次。
+- 一键安装**不写 crontab**：装完后按 §4/§5 自己加监控与备份节律；随时用 `scripts/ops/install.sh status` 巡检。
+
 ### 2.1 前置
+
+> **fallback（手动路径）**：以下 2.1–2.5 是手动步骤；默认走 §2.0 的一键安装。
 
 - Docker Engine ≥ 24 + Compose v2（standalone overlay 使用 `!override`，需要 Compose ≥ 2.24.4）。
 - 推荐宿主机已有 Nginx / 宝塔 / 1Panel：公网域名 A/AAAA 指向宿主机，由宿主机统一处理 80/443 与证书。
@@ -72,6 +117,8 @@ openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 | `TUNEX_AGENT_IMAGE` | 节点一键安装使用的多架构 Agent 镜像；生产建议与 Panel 使用同一 git sha |
 | `SMTP_*` | 公网服务必须配，否则验证/重置邮件只进日志 |
 | `BACKUP_PASSPHRASE` | cron 回滚前备份必需，否则备份脚本交互读取失败并终止回滚 |
+
+可选的**主动出站能力默认全部关闭**：`LOOKING_GLASS_ENABLED=false`、`TUNEX_NOTIFICATION_WEBHOOK_ENABLED=false`、`TUNEX_NOTIFICATION_TELEGRAM_ENABLED=false`。其中 Looking Glass 只做有界 TCP connect 公网探测；开启前应确认审计与目标网络策略符合部署要求。Webhook/Telegram 的目标与凭据配置见 `.env.production.example` 及管理端配置。
 
 `ALLOW_REGISTER_FALLBACK=false`（邀请制 Beta）+ `PAYMENTS_ENABLED=false` 是
 PLAN.md 的既定默认，**不要**在生产环境打开以"图方便"。
