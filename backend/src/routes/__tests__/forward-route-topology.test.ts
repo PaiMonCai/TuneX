@@ -2,17 +2,37 @@
  * V5-WP19-C —— `GET /api/forwards/:id/topology` 的**行为级可达性**测试。
  *
  * 为什么单有"注册顺序守卫"还不够：`forward-route-order.test.ts` 是**读源码**判断顺序的，
- * 它能挡住"把新路由写到 catch-all 之后"，但挡不住"路由写对了顺序却因为别的原因不可达"
- * （例如路径拼错、方法写错、被更早的同形状路由吃掉）。所以这里挂**真实**的
- * `forwardsRoutes`，用 `app.request()` 真的打一次 —— 顺序、方法、路径三者一起被验证。
+ * 它能挡住"把新路由写到 catch-all 之后"，但挡不住"路由写对了顺序却因为别的原因不可达"。
+ * 所以这里挂**真实**的 `forwardsRoutes`，用 `app.request()` 真的打一次。
  *
- * 这条测试的由来值得写下来：本仓在同一个 WP 里被"单独 mount 的路由测试验证不了它在应用里
- * 真的可达"咬过两次（`POST /:id/dns` 被 catch-all 吃掉；`preferred-ingress` 因 Prisma 字段
- * 写错 500）。两次都是**真拓扑**发现的，而两次的单元测试都是绿的。
+ * ── 2026-10-05 修正：mock 必须**透传**真实模块的全部导出 ──
+ * `mock.module` 是**进程级**注册表，而它替换的是**整个模块**。本文件原先这样写：
+ *
+ *   mock.module("../../services/forward-topology.ts", () => ({ defaultTopologyDeps, loadForwardTopology }))
+ *
+ * 于是同一进程里**别的测试文件**一旦 import 该模块的其它导出（`v5-wp19-c-topology.test.ts`
+ * 要 `projectForwardTopology`），就在**加载阶段**失败：
+ *
+ *   SyntaxError: Export named 'projectForwardTopology' not found in module '…/forward-topology.ts'
+ *
+ * **而这条失败的输出没有 `(fail)` 前缀** ⇒ 我几次用 `grep '^(fail)'` 查它都没命中，把它误判成
+ * "负载敏感假红" ✗（真实情况是：全量套件**稳定地** `2747 pass / 1 fail`，而 WP19-C 的断言
+ * 其实**从未真正跑过**）。这是本会话里我最该记住的一次误判 —— **只按一种"失败长什么样"去查，
+ * 没有去读错误原文**。
+ *
+ * 修法：先 import 真实模块，再把两个要替身的导出覆盖掉、其余**原样透传**：
+ *   `mock.module(path, () => ({ ...real, one: …, two: … }))`
+ * 这样别的文件的 import 依旧拿到真实现 ✓，而本文件仍然能控制路由看到的数据 ✓。
+ * （仓库里另一条路是整段搬进子进程 —— 见 `workspace-rbac-v4.test.ts`；那更适合"连 mock 之间
+ * 也会互相污染"的场景，本文件用透传就够，且不必处理子进程的退出与 Redis 重连问题。）
  */
-import { describe, expect, test, beforeEach, mock } from "bun:test";
+import { beforeEach, describe, expect, test, mock } from "bun:test";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
+
+const TOPOLOGY_MODULE = "../../services/forward-topology.ts";
+// 先拿真实现（后面透传它）：`mock.module` 会替换整个模块，凡是别人也 import 的导出都必须保留。
+const realTopology = await import(TOPOLOGY_MODULE);
 
 const accesses: Array<{ action: string; resource: string }> = [];
 let deny = false;
@@ -31,7 +51,9 @@ mock.module("../../services/workspace.ts", () => ({
   workspacePermissionDenied: () => new HTTPException(403, { message: "工作空间角色无权操作" }),
 }));
 
-mock.module("../../services/forward-topology.ts", () => ({
+// 只覆盖这两个导出，其余**透传**（关键是 `projectForwardTopology` 必须还在）。
+mock.module(TOPOLOGY_MODULE, () => ({
+  ...realTopology,
   defaultTopologyDeps: () => ({}),
   loadForwardTopology: async () => topologyResult,
 }));
