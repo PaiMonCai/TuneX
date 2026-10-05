@@ -1,5 +1,5 @@
 /**
- * V4-WP9：复制 Forward + auto-port 语义的**纯逻辑**（无 React / 无网络）。
+ * 复制 Forward + auto-port 的纯逻辑（无 React / 无网络）。
  *
  * 契约边界：
  *  · 复制走**真实** create 契约（后端 `ForwardCreateSchema`，`.strict()` —— 多一个
@@ -33,7 +33,7 @@ export type ForwardDraft = {
 };
 
 /**
- * V5-WP5-A1：创建/复制草稿 = 编辑草稿 + 协议字段。
+ * 创建/复制草稿 = 编辑草稿 + 协议字段。
  *
  * 分开定义（而不是把协议塞进 {@link ForwardDraft}）是因为**协议本身不可编辑**：
  * 后端 `ForwardPatchSchema` 不接受 `protocol`（把 tcp 改成 tls 不是一次编辑），
@@ -120,7 +120,7 @@ export function forwardCopyName(forward: PortForward, suffix: string): string {
  * mode / ingress / egress / target 原样带过（这些就是要复制的业务配置）；
  * `listen_port` 置空 = 自动分配。
  *
- * 协议与协议专属配置（V5-WP5-A1）：
+ * 协议与协议专属配置：
  *   · 源行的协议事实在契约白名单里 → 原样带过（复制一条 tls 转发必须还是 tls，
  *     悄悄降级成 tcp 等于把入口的传输安全偷偷关掉）；
  *   · 历史协议（`wss` / `quic` …）**不能**被再创建（`z.enum` 会 400），此时草稿回到
@@ -139,7 +139,7 @@ export function forwardCopyDraft(forward: PortForward, suffix: string): ForwardC
     mode,
     ingressId: forward.ingress_node_id ? String(forward.ingress_node_id) : "",
     // direct 不允许带出口：后端对 `direct` + `egress_node_id` 直接
-    // 400 `mode_topology_mismatch`（V4-WP1 不变量）。
+    // 保持 mode 与拓扑一致，否则后端返回 mode_topology_mismatch。
     egressId:
       mode === "relay" && forward.egress_node_id ? String(forward.egress_node_id) : "",
     listenPort: "", // 自动分配：绝不复制源端口
