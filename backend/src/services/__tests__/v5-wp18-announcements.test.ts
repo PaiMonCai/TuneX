@@ -542,26 +542,46 @@ describe("E. 正文是纯文本：规范化 + 拒绝超长 + 不做标签剥离�
   }
 
   /**
-   * 递归扫描 `web/src`：返回**代码中**使用 HTML 注入属性的文件，以及扫了多少个文件
-   * （后者用来防"路径写错 ⇒ 一个文件都没扫 ⇒ 零命中 ⇒ 假通过"）。
+   * 递归扫描 `web/src`：返回**代码中**使用 HTML 注入属性的文件（带命中处的原文，便于一眼看出
+   * 是"真用法"还是"注释碎片"）、扫了多少个文件、以及**读起来可疑**的文件。
+   *
+   * ── 为什么要把"读得可不可信"也算出来（Lead 2026-10-05 的发现，见契约 §12.5-D5）──
+   * 整树静态扫描在**并行**测试负载下会被 I/O 饿到慢下来甚至读到中途状态：
+   * Lead 那条同型的守卫单独跑 54ms 全绿，放进 103 文件并行的整套件变成 6167ms 且失败，
+   * 隔离复跑 3 次皆绿。放在**我这里**的具体风险是：读到中途的 `// ...` 片段会被去注释状态机
+   * 当成"代码"，于是**假红**。所以：
+   *   · `scanned` 防"路径写错 ⇒ 零命中 ⇒ 假通过"；
+   *   · `truncated` 抓"文件明明有内容、读出来却是空"（中途状态的最直接形态）；
+   *   · 命中项带上原文，**假红时一眼能看出**它是线程/注释碎片而不是真用法。
    */
-  function scanWebForUnsafeHtml(): { hits: string[]; scanned: number } {
+  function scanWebForUnsafeHtml(): { hits: string[]; scanned: number; truncated: string[] } {
     const webSrc = fileURLToPath(new URL("../../../../web/src/", import.meta.url));
     const hits: string[] = [];
+    const truncated: string[] = [];
     let scanned = 0;
     const walk = (dir: string): void => {
       for (const entry of readdirSync(dir)) {
         if (entry === "node_modules" || entry === ".next") continue;
         const full = join(dir, entry);
-        if (statSync(full).isDirectory()) walk(full);
-        else if (/\.(ts|tsx)$/.test(entry)) {
-          scanned += 1;
-          if (INJECTION_ATTRIBUTE.test(stripTsComments(readFileSync(full, "utf8")))) hits.push(full);
+        const stat = statSync(full);
+        if (stat.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!/\.(ts|tsx)$/.test(entry)) continue;
+        scanned += 1;
+        const raw = readFileSync(full, "utf8");
+        if (stat.size > 0 && raw.length === 0) truncated.push(full);
+        const stripped = stripTsComments(raw);
+        const match = INJECTION_ATTRIBUTE.exec(stripped);
+        if (match) {
+          const line = stripped.slice(0, match.index).split("\n").length;
+          hits.push(`${full}:${line} …${stripped.slice(match.index, match.index + 60).split("\n")[0]}…`);
         }
       }
     };
     walk(webSrc);
-    return { hits, scanned };
+    return { hits, scanned, truncated };
   }
 
   test("DoD7 口径自检（守卫不空转）：注释里的字不算命中，代码里的算", () => {
@@ -589,15 +609,28 @@ describe("E. 正文是纯文本：规范化 + 拒绝超长 + 不做标签剥离�
     expect(stripTsComments('const label = "dangerouslySetInnerHTML";')).toMatch(INJECTION_ATTRIBUTE);
   });
 
-  test("DoD7：`web/src` 里零 HTML 注入属性（去注释后；保持今天的状态）", () => {
-    const { hits, scanned } = scanWebForUnsafeHtml();
-    // 非空转的另一半：扫描确实读到了文件（路径写错会让它"零命中"地假通过）。
-    expect(scanned, "扫到的 web/src 文件数为 0 ⇒ 扫描路径失效，这条断言等于没跑").toBeGreaterThan(50);
-    expect(
-      hits,
-      "这些文件在代码里把字符串当 HTML 插入：web/src 必须保持零命中（DoD7）",
-    ).toEqual([]);
-  });
+  test(
+    "DoD7：`web/src` 里零 HTML 注入属性（去注释后；保持今天的状态）",
+    () => {
+      const { hits, scanned, truncated } = scanWebForUnsafeHtml();
+      // 读得可不可信，先于"有没有命中"：整树扫描在并行负载下会读到中途状态（§12.5-D5）。
+      expect(
+        truncated,
+        "这些文件有内容却读成了空 ⇒ 整树扫描读到了中途状态（并行 I/O 饿死）。" +
+          "请在安静环境单独跑本文件复验，不要把它当成「真的有命中」",
+      ).toEqual([]);
+      // 非空转的另一半：扫描确实读到了文件（路径写错会让它"零命中"地假通过）。
+      expect(scanned, "扫到的 web/src 文件数为 0 ⇒ 扫描路径失效，这条断言等于没跑").toBeGreaterThan(50);
+      expect(
+        hits,
+        "这些文件在代码里把字符串当 HTML 插入：web/src 必须保持零命中（DoD7）。" +
+          "命中带原文：若看起来像注释碎片，先怀疑并行 I/O 读到中途状态，而不是去删注释",
+      ).toEqual([]);
+    },
+    // 整树扫描本来就慢；给它一个**明确的预算**，而不是让"并行负载下被饿死"伪装成断言失败
+    // （bun:test 的第三个参数是超时毫秒）。
+    30_000,
+  );
 
   test("视图不下发 `created_by_id`（少一个可枚举字段）", () => {
     const view = toAnnouncementView(makeRow({ created_by_id: 5 }), null);
