@@ -64,7 +64,7 @@
 | 项 | 现状 | 下一步（已精确记录） |
 |---|---|---|
 | **事实类通知的投递接线** | 逻辑层完成并验证（选择/恢复/编排/账本 seam，含真 MySQL 验过的配对 SQL） | 契约 `v5-wp18-*` §"触发器接线现状与剩余步骤"：① 把公告路径里**内联闭包**的 `resolveTargets` 提成共用解析器（**不许**另写一条 ⇒ 那就是第二条投递路径）；② loader 先取"有被拒转发的工作空间清单"（`collectAttention` 是按工作空间的）；③ 挂既有 reconcile 节拍、不新增 cron |
-| **① 的 G1B 重跑** | 现有证据是分支早期的 | **比预想便宜**：已核实 runner 里的 agent 源码与 `b2x-agent:ci` 镜像**都含 ① 的 datagram 实现**（`forwarder/datagramhop.go`、`control/client.go` 的 `HopLocalAddr`、`diagnostics.go`）⇒ **不需要重建镜像**，只差一个空闲拓扑。脚本 `/tmp/rerun-g1b.sh`（**自带守卫**：检测到别的门禁在跑就拒绝执行，已实测会拦）会同步源码 → 重建镜像 → 重建 4 个 agent → 跑 G1B → 收证据；若只想跑门禁，直接 `docker exec -w /repo/scripts/v3-e2e b2x-runner python3 scripts/v3-e2e/v5-g1b.py` |
+| **① 的 G1B 重跑** | 现有证据是分支早期的 | **注意：本地隔离拓扑已在推送后清理掉**（容器/卷/网络全删，`b2x-*` 归零）。重跑需要先**重建拓扑**：`/tmp/rebuild-b2x.sh`（按名字清理 → 重建 runner 24h → 灌 b2x 版脚本 → 灌 agent/backend 两棵源码树 → 自检）→ 跑 `setup.sh` → 再跑 G1B。**两个便宜之处仍在**：① runner 与 agent 镜像（`tunex-e2e-runner:ci` / `b2x-backend:ci` / `b2x-agent:ci`）**保留着**，不必重建；② 已验证 runner 的 agent 源码含 ① 的 datagram 实现（`datagramhop.go`/`HopLocalAddr`/`diagnostics.go`），所以 G1B 覆盖的就是这段代码。`/tmp/rerun-g1b.sh` 自带守卫（检测到别的门禁在跑就拒绝执行，已实测会拦），但它假定拓扑已存在。 |
 | **WP21E 真实环境安装门禁** | 未做（可选，需授权） | 安装器的静态门禁已进 CI；真实环境那半截需要一台干净机器 |
 | **≤10 分钟计量滞后的产品文案** | 记为待办 | 措辞是产品决策，并入前端文案线 |
 | **`Plan.policy_id` 批量/CLI 绑定入口** | 不立项 | 单套餐管理入口已覆盖真实使用 |
