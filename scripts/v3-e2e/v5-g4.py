@@ -187,7 +187,10 @@ def cleanup() -> None:
 
 def g4_1_create_three_hop():
     status, data = create_route("g4-three-hop", middle=MID)
-    check(status in (200, 201), "G4.1 a three-hop route is accepted", f"status={status}")
+    # 失败时把**响应体**带进 detail：502 的 body 里有 steps / failedStep / error_code，
+    # 那是"哪一跳失败了"的唯一线索。只报 status=502 会让下一轮必须重新猜（实测踩到过）。
+    check(status in (200, 201), "G4.1 a three-hop route is accepted",
+          f"status={status} body={json.dumps(data, ensure_ascii=False)[:500]}")
     fid = int((data or {}).get("id") or 0)
     check(fid > 0, "G4.1 and it has an id", json.dumps(data)[:200])
     if fid <= 0:
@@ -281,7 +284,8 @@ def g4_5_orphan_transit_is_cleaned():
         {"middle_node_id": None, "expected_revision": current.get("config_revision")},
         timeout=120,
     )
-    check(status in (200, 201), "G4.5 the route can be changed back to a single hop", f"status={status}")
+    check(status in (200, 201), "G4.5 the route can be changed back to a single hop",
+          f"status={status} body={json.dumps(H.unwrap(resp), ensure_ascii=False)[:500]}")
     cleaned = H.wait_until(lambda: not reported_transit(MID, fid), timeout=300, interval=8)
     check(cleaned, "G4.5 the middle hop's runtime is gone — no orphan transit link",
           f"node={MID} tunnel={fid}")

@@ -216,8 +216,9 @@ def req(method: str, path: str, body=None, cookie=None, timeout=90, retry_auth=T
             if status2 == 200 and cookie2:
                 COOKIE = cookie2
                 return req(method, path, body, COOKIE, timeout, retry_auth=False)
-            record(False, f"G1A.session: re-authentication failed after a 401 on {path}",
-                   f"login_status={status2}")
+            # `record()` 只接受 (passed, message)：多传一个 detail 会让这一行自己抛
+            # TypeError，把真正的 401 掩盖成一个看不懂的报错（实测踩到过）。
+            record(False, f"G1A.session: re-authentication failed after a 401 on {path} [login_status={status2}]")
         return e.code, parsed, e.headers
     except (urllib.error.URLError, OSError) as e:
         return 0, {"error": str(e)}, {}
