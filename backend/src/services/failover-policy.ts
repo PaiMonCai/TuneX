@@ -1,11 +1,10 @@
 /**
  * Pure Forward failover and failback policy.
  *
- * The policy consumes already-read liveness, observation, target-health, port,
- * cooldown and operator-policy facts and returns a structured move/hold/failback
- * decision with every blocker. It never performs IO or mutates route targets.
- * Failback uses the same placement migration and epoch progression as failover;
- * it is not a separate mutation path.
+ * Consumes liveness, observation, target-health, port, cooldown and operator
+ * policy facts and returns a structured move/hold/failback decision. It performs
+ * no IO. Failback uses the same placement migration and epoch progression as
+ * failover rather than a separate mutation path.
  */
 import { isTargetHealthState, type TargetHealthValue } from "./target-health.ts";
 import {
