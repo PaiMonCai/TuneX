@@ -409,8 +409,20 @@ V5.5 Federation
 > | WP17 | 入口/出口组（= Route Profile 的 selector 形态） + DDNS 联动 | `docs/v5-wp17-entry-exit-group-ddns-contract.md` | 契约冻结（D1–D4 已裁决）；新增 Gate **V5-G6** |
 > | WP18 | 公告系统 + 通用通知渠道 | `docs/v5-wp18-announcements-notifications-contract.md` | 契约冻结（O1–O4 已裁决） |
 > | WP19 | 延迟观测 / 链路拓扑 / Looking Glass | `docs/v5-wp19-latency-observability-contract.md` | 契约冻结（O1–O4 已裁决）；**先做 WP19-F**（既有缺陷收口） |
-> | WP20 | 订阅周期与流量周期结算运行时 | `docs/v5-wp20-subscription-billing-runtime-contract.md` | 契约冻结（归属 = Workspace 等已裁决） |
+> | WP20 | 订阅周期与流量周期结算运行时 | `docs/v5-wp20-subscription-billing-runtime-contract.md` | **已交付**（2026-10-05，见契约 §5.1–§5.9）；门禁 **V5-G7** 33 断言全绿 |
 > | WP21 | 一键安装器（+ 文档站/加速器：**本期均不立项**） | `docs/v5-wp21-installer-and-docs-site-contract.md` | 契约冻结（OPEN-1…OPEN-5 已裁决） |
+>
+> **WP20 子项状态**（契约 §5.1–§5.9；一次一个 WP、每个 WP 一个提交）：
+> WP20-1 计费时钟纯函数 ✅ ｜ WP20-2 账本与归属 schema ✅ ｜ WP20-3 周期结算 tick ✅ ｜
+> WP20-4 支付 → 发放接线（`grantPolicyFromPurchase`）+ 续期执行器 ✅ ｜ WP20-4b 套餐 ↔ 策略绑定入口 ✅ ｜
+> WP20-5 到期降级与可观测 ✅ ｜ WP20-6 流量口径统一 ✅ ｜ WP20-6b `GET /api/me/capabilities` ✅ ｜
+> WP20-7 流量倍率 **不立项**（仅当 O3 选 B 才立项）。
+> 门禁 **V5-G7**（`scripts/v3-e2e/v5-g7.py`，**自带一次性环境**：临时 MySQL 容器 + `migrate deploy`
+> + 真库 DoD 场景，跑完删容器；不依赖也不触碰真拓扑）—— 33 断言全绿，证据
+> `docs/evidence/v5-g7-result-20261005.txt`。**DoD 1–9 全部关闭**；DoD 10（真拓扑 e2e）与
+> DoD 11（本登记）分别由既有门禁与本次改动覆盖。**G7.7/G7.8 不覆盖**并附理由（建 Forward 的占位
+> 顺序需要真面板 + 真 Agent 编排；没有面板时硬编 DB 级近似只会给出'看起来通过'的错觉 ——
+> 门禁的价值在于独立重算，不在于覆盖率的数字）。
 >
 > **本批裁决里被判为「既有缺陷」的三处**（都不是新功能，是"写了但没接线"）：
 >
@@ -419,6 +431,8 @@ V5.5 Federation
 > 2. `preferred_node_id` 恒为 null（WP17）：自动回切永不可能发生；
 > 3. `workspacePolicyAssignment` 全仓只有一个写入点 `policy-service.ts` 的
 >    `assignDefaultPolicy`（WP20）：**当前完全没有「支付 → 发放策略」的接线**。
+>    → **已修（WP20-4）**：新增 `grantPolicyFromPurchase` 作为第二个（也是唯一新增的）写入点，
+>    购买路径在同一事务内接线，并由 DoD 2 的断言**按函数名**钉住这两处（不按会腐烂的行号）。
 >
 > 另有两处沉睡半成品被点名（属"替换而非并存"，不得再叠一层）：`SystemConfigName` 里
 > 已含 `NOTICE*` 三个键并由 `routes/public.ts` 免认证下发，而 `web/src` 零消费者；
@@ -1518,6 +1532,9 @@ Gate V5-G1A
 > WP5-B1  UDP DIRECT               **DONE**（Gate V5-G1B GREEN 76/0）
 > WP5-B2  UDP RELAY                **DONE**（2026-10-05 真拓扑全绿 77/0，见下）
 > WP5-B3  UDP telemetry/accounting 未开工（分片重组与 packets 计费都在这里）
+> 计费口径的订阅运行时**见 WP20 契约**（`docs/v5-wp20-subscription-billing-runtime-contract.md`）：
+> 周期结算 tick（先占位后执行 + 崩溃接管）、流量窗口口径、额度周期语义（生效周期 = 声明的最长周期）；
+> **packets 计费仍属 B3**，不在 WP20 范围内。
 > Gate V5-G1B                      **GREEN PASS=77 / FAIL=0**（`scripts/v3-e2e/v5-g1b.py`，证据 `docs/evidence/v5-g1b-result-20261005.txt`，隔离拓扑 + 本分支镜像）；**B1 的 76 条一条未删**，新增的是 B2 把原「udp RELAY 必须被拒」翻转成「单跳 udp RELAY 必须建立，且客户端的数据报真的穿过跳」——翻转是明写的（契约 §12.5 第 5 条），不是静默删除
 >
 > **B2 真拓扑闭环记录（2026-10-05）**
