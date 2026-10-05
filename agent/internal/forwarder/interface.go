@@ -370,6 +370,20 @@ type TunnelConfig struct {
 	RemoteHost  string     `json:"remote_host"`
 	RemotePort  int        `json:"remote_port"`
 	NextHop     string     `json:"next_hop"`
+	// HopPeer is the paired ingress node's ADDRESS for a datagram EGRESS
+	// (V5.1b WP5-B2, contract §9.1).
+	//
+	// It exists because the hop is UDP: TCP gets "the peer really is the peer"
+	// from the handshake, UDP does not, so the exit has to be told who may feed
+	// it. An empty value on a datagram egress is REFUSED at construction — never
+	// treated as "accept anyone", which would make the exit a relay to its
+	// configured targets for whoever finds the port.
+	//
+	// It is an address (IP), not IP:port, on purpose: the ingress's source port is
+	// ephemeral and changes when its runtime restarts, so pinning the port would
+	// turn a normal restart into a permanent outage. The security property we need
+	// is a property of the address.
+	HopPeer string `json:"hop_peer,omitempty"`
 	// omitempty keeps an empty pool from being emitted as `null`: the panel
 	// treats absent as "no targets of its own", which is what a RELAY ingress
 	// tunnel actually has.
@@ -468,22 +482,27 @@ func (c *TunnelConfig) Validate() error {
 	if protocol == ProtocolWS && mode == ModeEgress {
 		return errors.New("forwarder: ws terminates at the client-facing listener; an EGRESS tunnel cannot be ws")
 	}
-	// UDP is a client-facing datagram front. V5.1b (WP5-B1) opens DIRECT only:
+	// UDP is a client-facing datagram front. V5.1b opens DIRECT (WP5-B1) and now
+	// the EXIT half of RELAY (WP5-B2, contract §9.1):
 	//
-	//   - EGRESS: this binary has no datagram egress runtime. The egress node
-	//     listens for the ingress node, and that hop is a single TCP listener by
-	//     contract, which cannot carry datagram boundaries;
-	//   - RELAY: the shape of the UDP inter-node hop is an OPEN product decision
-	//     (§9.1 of docs/v5-1b-datagram-contract-draft.md: bare TCP + length
-	//     prefixing, a UDP egress listener, or no UDP RELAY at all). Refusing it
-	//     here is the difference between "not implemented yet" and a config that
-	//     validates, reaches an egress node and fails where nobody is looking —
-	//     Validate used to only refuse tls/ws for EGRESS, so `udp` would have
-	//     passed straight through to a runtime that does not exist.
-	if protocol == ProtocolUDP && (mode == ModeEgress || mode == ModeRelay) {
+	//   - EGRESS: allowed. The datagram hop is UDP end to end, so this node
+	//     listens on UDP and is fed hop packets by the paired ingress. The peer is
+	//     not implied by a handshake (there is none) — `hop_peer` tells this exit
+	//     who may feed it, and the datagram egress constructor REFUSES to build
+	//     without it.
+	//   - RELAY: still refused, but no longer because the shape is undecided —
+	//     §9.1 froze it as "datagram end to end". It is refused here because the
+	//     ingress half of that hop has no runtime in this build yet. Accepting the
+	//     config would produce exactly the failure the old comment warned about:
+	//     a config that validates, reaches the node and fails where nobody looks.
+	//     The refusal disappears in the same commit that lands the ingress runtime.
+	if protocol == ProtocolUDP && mode == ModeRelay {
 		return fmt.Errorf(
-			"forwarder: udp is a DIRECT-only datagram front in this build (mode %s): the UDP inter-node hop for RELAY/EGRESS is not implemented",
-			mode)
+			"forwarder: udp RELAY needs the datagram hop ingress runtime, which is not wired in this build (the exit half is; see docs/v5-1b-datagram-contract-draft.md §12)")
+	}
+	if protocol == ProtocolUDP && mode == ModeEgress && strings.TrimSpace(c.HopPeer) == "" {
+		return fmt.Errorf(
+			"forwarder: udp EGRESS tunnel %s needs hop_peer (the paired ingress address); refusing to accept hop packets from an unattested source", c.ID)
 	}
 
 	if strategy := strings.TrimSpace(string(c.LBStrategy)); strategy != "" {

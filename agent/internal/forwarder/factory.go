@@ -153,6 +153,12 @@ type DatagramBuildDeps struct {
 	IdleTimeout time.Duration
 	// MaxMappings is the mapping ceiling (§2.4). Zero uses the package default.
 	MaxMappings int
+	// SelectorFor resolves the egress target pool for a tunnel id. Only the
+	// EGRESS role reads it; a DIRECT or RELAY build must not require one.
+	SelectorFor func(tunnelID string) (TargetSelector, error)
+	// Observer receives per-target connect failures (EGRESS only). Nil is a no-op;
+	// failures are counted either way.
+	Observer TargetObserver
 }
 
 // DatagramBuilder constructs the datagram runtime for ONE protocol.
@@ -203,23 +209,65 @@ var datagramBuilders = map[ForwardProtocol]DatagramBuilder{
 	ProtocolUDP: buildUDPDatagram,
 }
 
-// buildUDPDatagram constructs the UDP DIRECT datagram runtime.
+// buildUDPDatagram constructs the UDP datagram runtime for the config's ROLE.
 //
-// UDP needs no configuration beyond the protocol name yet (the idle timeout and
-// the mapping ceiling are package defaults until §9.2/§9.3 decide whether they
-// become per-Forward columns). RELAY and EGRESS never reach this builder:
-// TunnelConfig.Validate refuses them, because the UDP inter-node hop is an open
-// product decision (§9.1) and a datagram egress runtime does not exist.
+// Roles are not interchangeable and the builder does not pretend otherwise:
+//
+//   - DIRECT: client datagrams to a local target (WP5-B1, gated by V5-G1B 76/0);
+//   - EGRESS: hop packets from the paired ingress to a pooled target (WP5-B2,
+//     contract §9.1 — the datagram hop is UDP end to end, so the exit listens on
+//     UDP rather than framing datagrams inside a TCP stream);
+//   - RELAY: the ingress half of that hop. Its runtime lands in the same WP; until
+//     it exists this role is REFUSED here rather than half-implemented — a relay
+//     ingress with no hop runtime would accept client datagrams and silently drop
+//     them, which is exactly the "校验通过、运行失败" failure the contract warns
+//     about (§3.3).
+//
+// The idle timeout and mapping ceiling are package defaults on every role: the
+// contract freezes one value for DIRECT and RELAY so the two cannot drift (§9.2).
 func buildUDPDatagram(cfg TunnelConfig, deps DatagramBuildDeps) (DatagramRuntime, error) {
-	if cfg.Mode != ModeDirect {
-		// Unreachable through Validate; kept so a caller cannot get a datagram
-		// runtime for a role the datagram contract does not define.
+	switch cfg.Mode {
+	case ModeDirect:
+		return NewDatagram(cfg, DatagramOptions{
+			IdleTimeout: deps.IdleTimeout,
+			MaxMappings: deps.MaxMappings,
+		})
+	case ModeEgress:
+		sel, err := datagramSelector(cfg, deps)
+		if err != nil {
+			return nil, err
+		}
+		return NewDatagramEgress(cfg, sel, DatagramEgressOptions{
+			IdleTimeout: deps.IdleTimeout,
+			MaxMappings: deps.MaxMappings,
+			Observer:    deps.Observer,
+		})
+	case ModeRelay:
+		return nil, fmt.Errorf(
+			"forwarder: udp RELAY (datagram hop ingress) has no runtime in this build; the exit half exists, the ingress half is not wired yet")
+	default:
 		return nil, errModeNot(ModeDirect, cfg.Mode)
 	}
-	return NewDatagram(cfg, DatagramOptions{
-		IdleTimeout: deps.IdleTimeout,
-		MaxMappings: deps.MaxMappings,
-	})
+}
+
+// datagramSelector resolves the exit's target pool.
+//
+// A datagram EGRESS without a selector has no destination to send to — and since
+// the destination is deliberately never carried on the wire (contract §9.1), the
+// pool is the ONLY thing that could name one. Missing it is therefore a hard
+// error, not a runtime surprise on the first packet.
+func datagramSelector(cfg TunnelConfig, deps DatagramBuildDeps) (TargetSelector, error) {
+	if deps.SelectorFor == nil {
+		return nil, fmt.Errorf("forwarder: datagram EGRESS tunnel %q has no target selector injected", cfg.ID)
+	}
+	sel, err := deps.SelectorFor(cfg.ID)
+	if err != nil {
+		return nil, fmt.Errorf("forwarder: datagram EGRESS tunnel %q target pool: %w", cfg.ID, err)
+	}
+	if sel == nil {
+		return nil, fmt.Errorf("forwarder: datagram EGRESS tunnel %q resolved to an empty target pool", cfg.ID)
+	}
+	return sel, nil
 }
 
 // BuildDeps is everything the manager's single build entry point may need, split

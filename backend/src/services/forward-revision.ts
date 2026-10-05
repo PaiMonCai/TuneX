@@ -435,14 +435,21 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     }
   }
 
-  // V5.1b B1 boundary (DEVELOPMENT.md §6.2): udp is DIRECT-only in this build. The
-  // inter-node hop shape for a datagram RELAY is an OPEN product decision, so the
-  // panel refuses it here rather than letting the Agent be the only place that says
-  // no — a boundary enforced in one layer is a boundary that can be bypassed by the
-  // next caller, and the UI must be able to rely on validation, not on a warning of
-  // its own.
+  // V5.1b B2 boundary (contract §9.1 / §12, 2026-10-05): the datagram hop shape IS
+  // frozen now ("datagram end to end"), and the Agent already carries the EXIT half
+  // of it. What is still missing is the INGRESS half — the relay runtime that takes
+  // client mappings across the hop — so the panel keeps refusing udp RELAY here.
+  //
+  // The refusal stays in the panel even though the Agent refuses such a config too,
+  // for the reason B1 established: a boundary enforced in only one layer is a
+  // boundary the next caller can bypass, and the UI must be able to rely on
+  // validation rather than on a warning of its own.
+  //
+  // It is lifted in the same commit that lands the ingress runtime — not before: a
+  // Forward that can be created but can never be served is worse than one that
+  // cannot be created at all, and this gate (V5-G1B.5) asserts the refusal.
   if (admittedProtocol === "udp" && candidate.mode !== "direct") {
-    errors.push("UDP 转发当前只支持 DIRECT：跨节点跳的形态尚未冻结");
+    errors.push("UDP 转发当前只支持 DIRECT：跨节点跳已冻结为 datagram 端到端，但入口侧运行时尚未落地");
     reasons.push("datagram_relay_unsupported");
     return { ok: false, errors, warnings, reasons };
   }
