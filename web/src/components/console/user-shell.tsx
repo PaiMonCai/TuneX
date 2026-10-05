@@ -4,15 +4,8 @@ import { requireSession, shellI18n } from "@/components/console/session";
 import { visibleNavGroups } from "@/lib/nav";
 
 /**
- * UserShell —— 普通用户控制台外壳（服务端组件，V5-WP13.5A §9.4.1）。
- *
- * 与 `AdminShell` 分离：sidebar 分组、topbar 内容、内容区信息密度各自设计，
- * 但底层 UI / form / table / chart 组件与视觉 token 完全复用，不复制 design system。
- *
- * 用户体验取向：**宽间距、少而大的入口**。不出现 raw Node / Agent / lease / revision /
- * Federation 等运维概念（那些属于 Admin Console）。
- *
- * `AppShell`（兼容入口）按 `adminMode` 分发到这里；route group `(user)` 的 layout 负责边界。
+ * 普通用户控制台外壳。用户侧保持较低信息密度，不暴露 lease / revision /
+ * Federation 等内部运维概念。
  */
 export async function UserShell({
   titleKey,
