@@ -204,9 +204,21 @@ const worker = new Worker(
             },
           });
           if (r.evaluated > 0) {
-            console.log("[worker] failover sweep:", JSON.stringify({ evaluated: r.evaluated, moved: r.moved, held: r.held }));
+            console.log("[worker] failover sweep:", JSON.stringify({
+              evaluated: r.evaluated,
+              moved: r.moved,
+              held: r.held,
+              // V5-WP17.4 修复：**DNS 闸门拒绝的原因必须可见**。
+              // fail-closed 只保证"没做错事"；"为什么没做"不留痕，运维看到的就是"迁移没发生"，
+              // 与"这台机器根本没在跑扫描"无法区分 —— 正是下面那句注释说的那件事
+              // （决策不留痕的机制与从未运行过的机制无法区分）。这个字段在返回值里一直都有，
+              // 只是从未被打印出来。
+              dns_gated: r.dns_gated.length,
+              // 只在真的有被闸住的隧道时附带原因，避免每拍刷噪音；条数封顶，日志长度有界。
+              ...(r.dns_gated.length > 0 ? { dns_gated_reasons: r.dns_gated.slice(0, 5) } : {}),
+            }));
           }
-          return { evaluated: r.evaluated, moved: r.moved, held: r.held };
+          return { evaluated: r.evaluated, moved: r.moved, held: r.held, dns_gated: r.dns_gated.length };
         };
         // V5.5 WP16：联邦的周期收口。顺序在**本地 reconcile 之后**：先修好本机能修的东西，
         // 再处理跨面板的到期/停服/对账。每一拍都返回可打印的汇总 —— 上一阶段反复学到的
