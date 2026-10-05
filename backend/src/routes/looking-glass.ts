@@ -1,7 +1,7 @@
 /**
- * V5-WP19-D —— Looking Glass API（用户侧）。
+ *  —— Looking Glass API（用户侧）。
  *
- * 契约：`docs/v5-wp19-latency-observability-contract.md` §3 D7 / §5 WP19-D / §7 G19.9–G19.13。
+ * 契约：`docs/v5-wp19-latency-observability-contract.md` §3 D7 / §5  / §7 G19.9–G19.13。
  *
  * ── 端点 ──
  *   GET  /api/looking-glass/status          开关与线形上限（UI 据此决定是否显示入口）
