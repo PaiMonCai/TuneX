@@ -21,10 +21,8 @@ import (
 //	node-credential: xxxxxxxx
 //
 // It intentionally does not support nested maps, anchors or multi-document
-// files — the agent config is flat. Unknown keys are ignored, so a config file
-// written before WP15 still loads; its legacy keys (server, token, port-range,
-// the per-protocol fixed ports, connect-ip) simply have no effect any more
-// because the legacy data plane they configured no longer exists.
+// files. Unknown keys are ignored so older flat configs remain parseable even
+// when they contain fields the current runtime no longer uses.
 func applyYAML(cfg *Config, text string) {
 	lines := strings.Split(text, "\n")
 	for i := 0; i < len(lines); i++ {
@@ -50,8 +48,7 @@ func applyYAML(cfg *Config, text string) {
 	}
 }
 
-// setScalar applies the survivors of the legacy/​v3 key merge: the v3 runtime's
-// own configuration only.
+// setScalar applies the current runtime's supported flat keys.
 func setScalar(cfg *Config, key, val string) {
 	switch key {
 	case "agent-id", "agent_id":
