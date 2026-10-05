@@ -1,17 +1,11 @@
 /**
- * V5.3 WP10 —— 自动故障转移**循环**（把执行器挂到既有节拍上）。
+ * Automatic Forward placement evaluation on the existing reconcile cadence.
  *
- * 本模块只做三件事，且每件都必须由调用方看见结果：
- *   1. 找出"值得评估"的 Forward（有归属租约、是 RELAY/DIRECT 的承载者）；
- *   2. 为每个 Forward 提供策略与候选节点这两个**没有 schema 归属**的输入（§8 的开放项）；
- *   3. 调用既有执行器，并把它的结构化结果原样汇总出去（不吞、不简化成布尔）。
- *
- * 刻意的取舍：
- *   · **不新开时间心跳**：挂在既有 reconcile 节拍上（先恢复未完成的 rollout，再评估迁移），
- *     第二条时间真相是本项目反复禁止的；
- *   · **不做补偿**：执行器失败即失败，epoch 永不回退（回退=重开双主窗口）；
- *   · **fail-closed**：策略没被配置过 ⇒ `auto_failover=false`；候选节点找不到 ⇒ 不迁移；
- *     端口事实读不到 ⇒ 执行器按 0 处理（不迁移）。
+ * The loop selects Forwards with placement state, supplies policy/candidate facts
+ * that are not owned by the executor, invokes the existing failover executor and
+ * preserves its structured result. Missing policy, destination or required port
+ * facts fail closed. The loop does not create a second timer, roll placement
+ * epochs backward or invent a separate compensation path.
  */
 
 import { Prisma } from "@prisma/client";

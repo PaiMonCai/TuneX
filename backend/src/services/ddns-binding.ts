@@ -1,25 +1,11 @@
 /**
- * V5-WP17.2 —— DNS 前门：**绑定落库 + RBAC + 封存凭据**（契约 §5 表；**零外呼**）。
+ * DDNS binding and provider-credential service.
  *
- * 这一片只做「**记住**用户想让 DNS 前门长成什么样」，**不发任何 DNS 请求**（执行器是 WP17.3）。
- * 单独切一个 WP 的理由是**失败代价不对称**：绑定与凭据属于**多租户**面（跨 workspace 读写
- * 凭据 = 数据泄漏），写 DNS 属于**可用性**面。两者混在一个 WP 里，评审时无法分别回答
- * "作用域对不对"和"重试策略对不对"。
- *
- * 冻结的硬规则（逐条有依据，见契约 §7 F1/F4/F6 与 §4.0 的 Lead 裁决）：
- *
- * ① **地址只能来自 `connect_ip`**（F1）。`connect_ip IS NULL` ⇒ 拒绝
- *    （`dns_address_unavailable`），**绝不回落**到 `listen_host`、请求体或面板自己猜：
- *    前门地址是"客户端真的能连上的那个地址"，猜错等于写出一条把用户引向黑洞的记录。
- * ② **凭据必须封存**（F6）。`DNSProvider.config` 只接受 `sealSecret` 的输出，且用**独立的
- *    HKDF info**（`tunex-ddns-v1`）——"换个用途就换 info，绝不共用同一把派生密钥"。
- * ③ **跨租户一律拒绝**（F6）。读 `settings:read`、写 `settings:manage`；**平台共享入口组**
- *    （对 workspace 之外的 user 有 active grant 的组，或平台级组）不得由租户凭据配置
- *    ⇒ `shared_group_dns_denied`。
- * ④ **状态必须能区分"已确认"与"未确认"**（D2 / F7）。`dns_state` 取值
- *    `unbound | pending | synced | synced_unverified | error`，**只有 `synced` 允许显示
- *    "已切换"**。本片只做**投影**（读模型）；写入状态是 WP17.3 执行器的事——所以这里
- *    刻意没有任何"设置状态"的入口。
+ * This layer persists the DNS front-door configuration and enforces workspace
+ * scope/RBAC, but never calls a DNS provider. Published addresses come only from
+ * the selected ingress node's `connect_ip`; provider credentials are stored
+ * sealed with the DDNS-specific key derivation. DNS status is a projection of
+ * persisted sync facts, and only `synced` represents a confirmed switch.
  */
 import type { Prisma } from "@prisma/client";
 import { deriveDdnsSealKey, sealSecret, unsealSecret } from "./federation/seal.ts";

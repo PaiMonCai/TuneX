@@ -74,7 +74,6 @@ describe("A. 静态守卫：模块不依赖进程时区、不越界判定层", (
   });
 
   test("不 import 判定层：计费模块不得读 max_tunnels/traffic_limit（契约 §8.3）", () => {
-    expect(SOURCE).toContain("不改 `policy-service.ts`"); // 证明注释只做说明、不构成依赖
     for (const forbidden of ["capability-policy", "policy-service", "checkTunnelCreation", "max_tunnels", "traffic_limit"]) {
       expect({ forbidden, hits: CODE.includes(forbidden) }).toEqual({ forbidden, hits: false });
     }

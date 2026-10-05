@@ -1,43 +1,17 @@
 /**
- * WP7 — per-node credential（生成 / 校验 / 轮换 / 撤销）+ server-side node identity
+ * Per-node credential lifecycle and server-side Agent identity.
  *
- * 依据 `DEVELOPMENT.md` §7.10「WP7 — Node Credential / Session / State Report」
- * （Track B/C，依赖 WP6 控制协议）。
+ * `node_group.token` is a group/enrollment concept; it never proves that a
+ * machine is a specific Node. The per-node credential is the identity source
+ * for Agent machine endpoints. Authentication derives node identity from the
+ * credential lookup, never from a request body's self-reported node id.
  *
- * ── 与 node_group.token 的分工（写死，别再混）──
- *   · `node_group.token`（既有，一组一凭证）回答「这个 Agent 属于哪个组」，
- *     它决定 Socket.IO 配置下发范围，**不**回答「这个 Agent 是哪个节点」。
- *   · 本模块的节点凭据（一节点一凭证）回答「这个 Agent 就是节点 N 本人」，
- *     是控制面 node/agent 资源的身份真相源。WP8/WP9/WP10 指挥 node 前必须
- *     走 {@link authenticateNode} 拿到 `{ node_id, scope }`，而不是信载荷里
- *     自报的 node_id —— 免认证机器端点「不信任自报归属」这条老规矩（见
- *     routes/public.ts 的 observer 批注）在这里升格成「身份与归属都由凭据定」。
+ * Credentials are random 32-byte base64url values; only sha256(token) is stored.
+ * Plaintext is returned only on issue/rotate and must not enter logs or audit
+ * metadata. Revocation and rotation take effect immediately.
  *
- * ── 验收口径逐条落地位置 ──
- *   · A token 不能冒充 B：认证按 `node_credential_hash` 唯一列等值查找，
- *     命中行是哪个节点就返回哪个节点；凭证与节点一对一，无法把 A 的 token
- *     投递成 B 的身份。找不到 / 不匹配一律 401（见 {@link authenticateNode}）。
- *   · revoked token 不能重连：`credential_revoked` 参与 status 判定与
- *     `where` 条件双保险（撤销在两次请求之间生效也拦得住）。
- *   · rotate 后旧 token 失效：rotate 覆盖哈希列，旧哈希立即查不到
- *     （与 rotateKey / rotateEmailToken 同一模式）。
- *   · token 不写日志：本模块不引入任何 console/logger 调用；明文只经
- *     {@link IssueCredentialResult.plaintext} 返回一次，调用方必须只放进
- *     响应体。审计（middlewares/audit.ts）本就只落 method/path/status/ip，
- *     且 `services/audit.ts` 的 SENSITIVE_RE 命中 *token* 会强制丢 metadata。
- *   · NAT Agent 只靠出站连接工作：本模块只解析凭证、不监听端口、不主动
- *     连接 Agent。上报（node-state.ts）由 Agent POST 上来；下发走既有
- *     Socket.IO（Agent 主动出站建连）——与 WP6 §7.9 的 transport 纪律一致。
- *
- * ── 存储 ──
- * 只存 `sha256(token)` hex（`CHAR(64)` 唯一列）。明文 = 32 随机字节 base64url
- * （约 43 字符，URL/header 安全），熵足够且不解码。明文**不落库、不进日志、
- * 不进审计**：issue/rotate 的返回值是它唯一的出现场合。
- *
- * ── 速率限制的边界 ──
- * 认证失败计数走 {@link nodeRegisterBlockKey}（WP1 已就位的 global 段防爆破键，
- * 值只描述「凭据指纹的失败次数」，不描述任何租户资产）。窗口与阈值在本模块
- * 以常量固定，HTTP 侧另有限流规则（middlewares/rate-limit.ts）兜底。
+ * Production Agents authenticate their outbound HTTP command/state channel with
+ * this credential. No Panel-to-Agent connection is required.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { db } from "../db.ts";
@@ -95,8 +69,8 @@ export type NodeAuthResult =
 /**
  * 认证一态判定（纯函数，无 IO）：给定节点行的凭据相关列 + 提供的哈希 → 是否放行。
  *
- * 三条硬规则都在这一个函数里，调用方（HTTP / Socket.IO / 未来 transport）只
- * 需要把「查到的行」喂进来，不再各自实现判定逻辑：
+ * The decision is transport-independent: callers provide the stored credential
+ * state and presented hash, and all machine transports share the same rules:
  *   1. 没签过凭据（`hash === null`）→ invalid_credential。**不回落**到
  *      node_group.token：那会让泄露的组 token 冒充组内任意节点。
  *   2. `revoked` → revoked。撤销优先级高于哈希比对：撤销后即使有人拿到了

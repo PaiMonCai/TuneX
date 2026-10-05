@@ -1,39 +1,11 @@
 /**
- * V5-WP20-3 —— 订阅**周期结算 tick**（幂等占位 + 崩溃接管续跑）。
+ * Periodic subscription settlement orchestration.
  *
- * 契约：`docs/v5-wp20-subscription-billing-runtime-contract.md` §3.1（计费时钟与「每周期只结算一次」
- * 的幂等）、§3.2.4（唯一新增执行者是 worker 的 `cron_settle_billing`，**不做任何权限判定**）、
- * §3.5.3（自动续费 fail-closed，只记账、只降级）、§7.2.2（编排层必须注入时钟，禁止 patch 全局 `Date.now`）、
- * O4（接管超时登记在 `SystemConfig`，默认 10 分钟）；DoD 第 1/4/5/9 条。
- *
- * ── 这一层是什么、不是什么 ──
- * 是：**「每个计费周期只结算一次」这条账本事实的编排**——占位、执行、落终态、崩溃接管。
- * 不是：不做额度判定、不读 `CapabilityPolicy`、不新增 `WorkspacePolicyAssignment` 写入点
- * （DoD 1/2：本文件里**连一个额度字段名都不许出现**，哪怕是注释 —— 那个 grep 是硬门禁；
- * `purchase` 发放的唯一写入点是 WP20-4 的 `grantPolicyFromPurchase`）。因此「扣款 / 发放」
- * 这一步是**注入的执行器**（{@link SubscriptionSettlementDeps.executePeriod}）：
- * WP20-4 接上它的生产实现（条件扣款 F8 + `upsert` 发放 + 订单/流水台账）。
- *
- * ── 幂等为什么是「先占位后执行」而不是「再查一遍」──
- * 固定顺序（§3.1.4，顺序本身即契约）：
- *
- *   ① `create` 占位（DB 唯一键 `(plan_subscription_id, period_key)` 是**唯一**闸门；
- *      并发下输的一侧撞 `P2002` ⇒ 本轮跳过，而不是「先查后写」——先查后写有 TOCTOU 窗口）
- *   ② 执行（扣款/发放，注入）
- *   ③ 置 `settled`
- *
- * 崩在 ① 与 ② 之间留下的 `pending` 行由**下一轮接管续跑**（同 `forward-rollout-recovery.ts`
- * 的「捞起未完成相位续跑」模式，见 worker 的 `cron_reconcile_v3` 先跑 `resumeRollouts`）：
- * 接管判定 = `state="pending"` 且 `started_at <= now - 接管超时`。
- *
- * 为什么接管会**重复执行**同一周期（O4 的已知代价）：超时是运维量、不是事实，只要它小于真实执行
- * 耗时，同一个周期就会被执行两次。所以**执行器必须幂等可重放**（F8 的条件扣款 + 发放的 `upsert`），
- * 而本模块用「唯一键占位 + 落终态前的 CAS」把重复压缩到「最多重复一次执行」，不会重复落终态。
- *
- * ── 失败语义 ──
- * 单条失败不拖垮整轮（worker 是共享进程里的一拍）：逐条 try/catch，错误进 `errors`，下一轮自然重试
- * （与 `resumeRollouts` 同取向）。DB 整体不可用则整轮抛出，由 worker 的 `failed` 事件记录 +
- * BullMQ 重试——**不吞错**（静默失败会让「结算已生效」的假设长期不成立）。
+ * The database unique key on subscription + period is the idempotency gate:
+ * workers claim a period before executing it, then mark the claim settled.
+ * Stale pending claims may be taken over and replayed, so the injected period
+ * executor must itself be idempotent. This module coordinates settlement state;
+ * entitlement evaluation and purchase-grant semantics live in their own layers.
  */
 import {
   billingDayStart,
@@ -63,7 +35,7 @@ export const MAX_SETTLEMENT_TAKEOVER_MINUTES = 1440;
  */
 export const SETTLEMENT_BATCH_LIMIT = 200;
 
-/** 账本行的状态（WP20-2 冻结为 `VARCHAR(16)` 的三个值，不新增枚举）。 */
+/** Persisted settlement states. */
 export type SettlementState = "pending" | "settled" | "failed";
 
 /** 结算周期键（`YYYY-MM` / `YYYY-MM-DD`，上海时区）。 */
@@ -108,7 +80,7 @@ export function resolveTakeoverTimeoutMinutes(
   return { minutes: numeric, missing: false, invalid: false };
 }
 
-/** 本轮结算的周期（默认月结；`day` 只为实现完备性保留，见契约 §3.1.4 的 `period_key` 值域）。 */
+/** Settlement period for the current tick; monthly is the production default. */
 export function settlementPeriodFor(
   now: Date,
   granularity: BillingPeriodGranularity = "month",

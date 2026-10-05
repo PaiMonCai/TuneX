@@ -1,43 +1,13 @@
 /**
- * WP7 — Node state report（上报落库） + reconnect snapshot（重连恢复）
+ * Authenticated Node state reporting and reconnect snapshot service.
  *
- * 依据 `DEVELOPMENT.md` §7.10「WP7 — Node Credential / Session / State Report」。
+ * Agent reports are the durable control-plane view of what a node says it is
+ * running: applied revisions, protocol capabilities, telemetry, target
+ * observations and ownership renewal facts. The Panel stores facts here and
+ * derives health/reconciliation decisions elsewhere.
  *
- * ── 上报的形状（Agent → 面板，Agent 主动出站 POST）──
- *   `POST /api/internal/node/state`  `Authorization: Bearer <node credential>`
- *   {
- *     "version": "0.13.22", "role": "BOTH",
- *     "tunnels":    [ { "id", "mode", "ingress_port", "egress_port", "revision", "targets"? } ],
- *     "used_ports": [ 8443, 30001 ],
- *     "egress_pools": { "<tunnelId>": { "strategy": "round", "targets": ["10.0.0.2:80"] } },
- *     "reported_revision": 17, "last_error": null
- *   }
- * 身份**不来自载荷**：node 由 Bearer 凭据解析（services/node-credential.ts），
- * 载荷里的 role 只作展示对齐，不一致以 `node.role` 为准（面板管理员显式设置的
- * 才是真相，§7.4「role 不回填、不猜」的延伸）。
- *
- * ── 为什么每节点一行（upsert）而不是追加时序 ──
- *   · reconnect snapshot 的语义是「这个节点当前是什么状态」，时序表要再查最近
- *     一条才能得到同一结论，且历史行会无限膨胀（节点每分钟心跳一次）；
- *   · WP9 reconciler 对比 desired / applied 需要 O(1) 取到「Agent 自述事实」；
- *   · 离线判定用 `reported_at` + Redis 心跳键（§7.10 的状态查询不替代
- *     offline-detector 的防抖），本表只回答「最近一次报的是什么」。
- *
- * ── 与 WP6 控制协议的关系 ──
- * 上报是**回报类**（非 mutating）：它不推进任何 revision，只更新事实快照。
- * `reported_revision` 是否落后于 `tunnel.config_revision` 由调用方判定
- * （WP9 reconciler：落后 = 该重发，不是该拒绝）。
- *
- * ── V4-WP6 遥测扩展（§13.4.4）──
- * `hostname/os/arch`、`known_revision`、`started_at`、`runtime_counts`、
- * `host`（轻量资源采样）与 `error_count/last_error_at` 都进**同一份**上报
- * （§13.4.4 明文禁止第二套 Node 监控真相），全部可选：旧 Agent 不报 →
- * 列保持 NULL → health synthesis 判 `unknown`（不是 0）。校验只拦「类型错」，
- * 不拦「缺失」，因此新旧 Agent 用的是同一个端点、同一份契约。
- *
- * ── 日志纪律 ──
- * 本模块不写 console。载荷里没有凭据，路由层也不得把 Authorization 头回显
- * 到任何日志/响应（见 routes/node-state.ts 的批注）。
+ * The reconnect snapshot returns authoritative desired state; it does not let
+ * reported runtime state redefine desired configuration.
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
@@ -83,7 +53,7 @@ export interface ReportedTunnel {
   listen_host?: string;
   targets?: ReportedTarget[];
   /**
-   * V5-WP19-F —— 该 runtime 的**协议专属事实**（`forwarder.ProtocolDiagnostics`）：
+   *  —— 该 runtime 的**协议专属事实**（`forwarder.ProtocolDiagnostics`）：
    * tls 的证书到期 / 握手失败、ws 的 upgrade 拒绝、udp 的 `mappings`/`packets_*`/
    * `bytes_*`/`drops`/`idle_timeout_seconds`，以及 RELAY 入口腿的 `hop_local_addr`。
    *
@@ -110,9 +80,9 @@ export interface StateReportInput {
   role?: string;
   tunnels?: ReportedTunnel[];
   /**
-   * V5.2 WP5 —— 该节点观测到的目标事实（DEVELOPMENT.md §7）。
+   *  —— 该节点观测到的目标事实（DEVELOPMENT.md §7）。
    *
-   * 每条是**这个观测视角**的事实，不是目标的"健康状态"：合成（WP6）是面板的事，
+   * 每条是**这个观测视角**的事实，不是目标的"健康状态"：合成（）是面板的事，
    * Agent 只报它测到的 8 个事实。`observation_age` 刻意不在线上——它是
    * `now - last_observed_at`，由读取方计算。
    */
@@ -122,7 +92,7 @@ export interface StateReportInput {
   reported_revision?: number;
   last_error?: string | null;
 
-  // ── V4-WP6（§13.4.4）──
+  // ── （§13.4.4）──
   /** Agent 在信封里见过的最新 revision（与 reported_revision 比较 = 是否卡住）。 */
   known_revision?: number;
   /** Agent 进程启动时刻，unix 秒（面板据此算 uptime）。 */
@@ -139,13 +109,13 @@ export interface StateReportInput {
   /** 最近一次错误时刻，unix 秒。 */
   last_error_at?: number;
 
-  // ── V4-WP11B：控制协议能力协商 ──
+  // ──：控制协议能力协商 ──
   /** Agent 实现的控制协议版本（缺失 = 旧 Agent 未上报）。 */
   control_protocol_version?: number;
   /** Agent 实际实现的控制动作清单（缺失 = 未上报，与空数组语义不同）。 */
   capabilities?: string[];
 
-  // ── V5-WP1：能力协商 v2 ──
+  // ──：能力协商 v2 ──
   /** Agent 实际实现的协议 / 传输 / runtime 能力清单（缺失 = 旧 Agent 未上报）。 */
   capability_manifest?: CapabilityManifestInput;
 }
@@ -153,7 +123,7 @@ export interface StateReportInput {
 /**
  * Agent 上报的 v2 能力清单（对齐 agent/internal/control.Manifest 的 JSON 形态）。
  *
- * 字段全部可选：Agent 侧尚未上报的维度会整键省略，面板按「这一维什么都没说」
+ * Capability fields are optional: omitted dimensions mean the Agent made no claim about that dimension.
  * 处理（空集 → fail-closed），而不是补一个默认值。**不要**在这里加默认协议，
  * 那会把「未上报」变成「上报了 tcp」，恰好抹掉协商的意义。
  */
@@ -205,7 +175,7 @@ export interface StateSnapshot {
   last_error: string | null;
   reported_at: Date;
 
-  // ── V4-WP6 遥测（全部可空：旧 Agent / 未上报 = NULL = 未知）──
+  // ──  遥测（全部可空：旧 Agent / 未上报 = NULL = 未知）──
   known_revision: number | null;
   agent_started_at: Date | null;
   hostname: string | null;
@@ -232,13 +202,13 @@ export type StateReportRejection =
   | "bad_egress_pools"
   | "bad_revision"
   | "bad_last_error"
-  /** V4-WP6：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
+  /**：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
   | "bad_telemetry"
-  /** V5.2 WP5：观测载荷根本不是数组（逐条坏记录会被丢弃，不进这里）。 */
+  /**：观测载荷根本不是数组（逐条坏记录会被丢弃，不进这里）。 */
   | "bad_target_observations"
-  /** V4-WP11B：能力协商字段形状坏（版本非非负整数 / 能力不是字符串数组）。 */
+  /**：能力协商字段形状坏（版本非非负整数 / 能力不是字符串数组）。 */
   | "bad_capabilities"
-  /** V5-WP1：capability_manifest 形状坏（非对象 / schema_version 非整数 / 维度不是字符串数组）。 */
+  /**：capability_manifest 形状坏（非对象 / schema_version 非整数 / 维度不是字符串数组）。 */
   | "bad_capability_manifest";
 
 /**
@@ -342,7 +312,7 @@ function isHostMetrics(v: unknown): boolean {
   return true;
 }
 
-/** V5.2 WP5：单个目标的观测事实（线上形状）。 */
+/**：单个目标的观测事实（线上形状）。 */
 export interface ReportedTargetObservation {
   host: string;
   port: number;
@@ -427,7 +397,7 @@ function normalizeTargetObservation(raw: unknown): ReportedTargetObservation | n
 }
 
 /**
- * V5-WP19-F —— 上报隧道列表的**显式投影**：`diag` 必须被带过去。
+ *  —— 上报隧道列表的**显式投影**：`diag` 必须被带过去。
  *
  * 这是「凡重建上报形状处都必须带上 diag」这条纪律在**落库路径**上的那一个锚点
  * （同一条纪律的另一半在 `services/tunnel-diag.ts` 的读取侧，机械守卫见
@@ -487,7 +457,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       }
       // targets：Agent 报的可能是旧形状（address）或新形状（host）。只要求
       // 「数组里的每项是对象、port 是数字」，其余字段缺失不拦——面板侧
-      // reconciler（WP9）自己决定能不能用这个 target，上报层不做语义判断。
+      // reconciler（）自己决定能不能用这个 target，上报层不做语义判断。
       // `null` is what a Go nil slice marshals to, and every RELAY ingress
       // tunnel has no targets of its own — treating null as a type error made
       // those nodes' reports permanently 400 (no telemetry, no health), for a
@@ -514,7 +484,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
     if (!b.used_ports.every((p) => typeof p === "number")) return { ok: false, reason: "bad_used_ports" };
   }
 
-  // ── V4-WP6 遥测（§13.4.4）──
+  // ──  遥测（§13.4.4）──
   //
   // 校验纪律与上面一致：**类型错拒绝，缺失容忍**。新旧 Agent 共用这个端点，
   // 所以「没这个键」必须是合法形状；但「给了个字符串计数」必须拦——那会让
@@ -544,7 +514,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
     return { ok: false, reason: "bad_telemetry" };
   }
 
-  // ── V4-WP11B：能力协商 ──
+  // ──：能力协商 ──
   //
   // 与遥测同一纪律：**缺失容忍、类型错拒绝**。这里额外多一条要求：坏形状
   // 绝不能退化成"未上报"——那会把 fail-closed（Agent 报了坏清单）静默降级成
@@ -561,7 +531,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
     }
   }
 
-  // ── V5-WP1：能力协商 v2 ──
+  // ──：能力协商 v2 ──
   //
   // 三条纪律，与上面完全一致：
   //   · 缺失容忍        —— 旧 Agent 不发这个字段，上报照收（面板按 baseline 判定）；
@@ -603,10 +573,10 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       agent_id: b.agent_id as string | undefined,
       version: b.version as string | undefined,
       role: b.role as string | undefined,
-      // V5-WP19-F：走**显式投影**而不是直接 `b.tunnels` —— 每隧道的 `diag`
+      //：走**显式投影**而不是直接 `b.tunnels` —— 每隧道的 `diag`
       // （协议专属事实）必须落进 `node_state_report.tunnels` 原样带走，坏形状逐条丢弃。
       // 这里曾经是"看起来只是类型断言"的那种写法，而在这个仓库里，"看起来等价"
-      // 的字段拷贝点正是事实静默消失的地方（WP5-B2 的六处边界）。
+      // 的字段拷贝点正是事实静默消失的地方（ 的六处边界）。
       tunnels: projectReportedTunnels(b.tunnels as ReportedTunnel[] | undefined),
       used_ports: b.used_ports as number[] | undefined,
       egress_pools: b.egress_pools as Record<string, ReportedEgressPool> | undefined,
@@ -621,15 +591,15 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       host: b.host as HostMetricsInput | undefined,
       error_count: b.error_count as number | undefined,
       last_error_at: b.last_error_at as number | undefined,
-      // V4-WP11B：这条投影是**白名单**——校验通过但没列在这里的字段会被静默
+      //：这条投影是**白名单**——校验通过但没列在这里的字段会被静默
       // 丢掉。新增协商字段时必须同步这里，否则症状是"校验通过、库里永远是
       // NULL"，即面板一直以为该 Agent 未上报能力（fail-closed 但不报错）。
       control_protocol_version: b.control_protocol_version as number | undefined,
       capabilities: b.capabilities as string[] | undefined,
-      // V5-WP1：同一个白名单陷阱——校验通过但没列在这里的字段会被静默丢掉，
+      //：同一个白名单陷阱——校验通过但没列在这里的字段会被静默丢掉，
       // 症状是"上报 200、库里永远 NULL"，即面板一直以为该 Agent 没有 v2 能力。
       capability_manifest: b.capability_manifest as CapabilityManifestInput | undefined,
-      // V5.2 WP5：白名单陷阱同样适用。用**归一化后**的列表，坏记录已经在
+      //：白名单陷阱同样适用。用**归一化后**的列表，坏记录已经在
       // validateTargetObservations 里被逐条丢弃。
       //
       // `undefined` 与 `[]` 必须保持区别：前者是"这个 Agent 没有观测能力"
@@ -645,7 +615,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
 }
 
 /**
- * 上报载荷 → 遥测列对象（V4-WP6，纯函数：无 IO，可离线断言映射）。
+ * 上报载荷 → 遥测列对象（，纯函数：无 IO，可离线断言映射）。
  *
  * 与隧道段同一取舍：**键缺失 = 这个 Agent 不报该事实 = NULL**（health
  * synthesis 判 unknown），空对象/空数组 = 「现在是空的」= 有意义的事实。
@@ -691,7 +661,7 @@ export function telemetryColumns(report: StateReportInput): {
     capabilities: report.capabilities
       ? (normalizeCapabilities(report.capabilities) as unknown as Prisma.InputJsonValue)
       : Prisma.JsonNull,
-    // V5-WP1：落库的是**规范化后**的清单（去重 + 排序 + 维度补齐为空数组），
+    //：落库的是**规范化后**的清单（去重 + 排序 + 维度补齐为空数组），
     // 判定函数因此不必在每次下发时再规整一遍。读不懂的 schema 版本落 NULL，
     // 与「未上报」同义：baseline 放行、其余拒绝（见 capability-manifest.ts）。
     capability_manifest: normalizeManifestColumn(report.capability_manifest),
@@ -722,7 +692,7 @@ function normalizeManifestColumn(
 
 /**
 /* ================================================================== */
-/* V5.3 WP9 —— 上报即续约                                              */
+/*  —— 上报即续约                                              */
 /* ================================================================== */
 
 /**
@@ -767,7 +737,7 @@ async function renewOwnedLeasesUnsafe(nodeId: number, now: Date): Promise<LeaseF
     })));
 }
 
-/** V5.3 WP9：一次续约后回给 Agent 的归属事实。 */
+/**：一次续约后回给 Agent 的归属事实。 */
 export interface LeaseFact {
   tunnel_id: number;
   epoch: number;
@@ -776,7 +746,7 @@ export interface LeaseFact {
 }
 
 /* ================================================================== */
-/* V5.2 WP5 —— 目标观测投影的同步                                       */
+/*  —— 目标观测投影的同步                                       */
 /* ================================================================== */
 
 /** 目标身份：归一化 host + 端口。空 host 或非法端口返回 null（调用方跳过）。 */
@@ -791,7 +761,7 @@ export function targetKeyOf(host: string, port: number): string | null {
 }
 
 /**
- * 把一次上报里的观测同步进 `target_observation` 投影（V5.2 WP5，DEVELOPMENT.md §7）。
+ * 把一次上报里的观测同步进 `target_observation` 投影（，DEVELOPMENT.md §7）。
  *
  * 唯一键 (node_id, target_key)：同一 host:port 被两个节点观测是**两条独立事实**
  * （观察视角不同），合并成一条会抹掉"一个节点通、另一个不通"这个信号。
@@ -832,7 +802,7 @@ export async function syncTargetObservations(
 }
 
 /* ================================================================== */
-/* V5-WP19-B —— 观测历史档案（只追加；与上面的投影并列，互不写入）        */
+/*  —— 观测历史档案（只追加；与上面的投影并列，互不写入）        */
 /* ================================================================== */
 
 /**
@@ -864,7 +834,7 @@ export function latencySampleRows(observations: readonly ReportedTargetObservati
 }
 
 /**
- * 把这次上报的观测追加进历史档案（V5-WP19-B，契约 §4.0 裁决 O1+O4）。
+ * 把这次上报的观测追加进历史档案（，契约 §4.0 裁决 O1+O4）。
  *
  * **失败必须 fail-soft**：档案是**附加事实**（D4：永不作为判定输入），而这一拍上报还背着
  * 隧道/端口/健康/租约续期。让一次档案写失败把上报打成 500，等于节点因为一个"观众"掉线 ——
@@ -915,7 +885,7 @@ export type SubmitResult =
       scope: number;
       reported_at: Date;
       /**
-       * V5.3 WP9：本次上报续约成功的归属事实。
+       *：本次上报续约成功的归属事实。
        *
        * 为什么必须回传：Agent 按契约"租约到期即停"，而续约是面板侧写的。不回传的话，
        * 每个隧道在最后一次下发后一个 TTL 就会自停 —— 在健康节点上制造全量中断。
@@ -976,12 +946,12 @@ export async function submitStateReport(
     update: { ...core, ...telemetry },
   });
 
-  // ── V5.3 WP9：本人续约 ──
+  // ──：本人续约 ──
   //
   // 一个节点上报它正在服务的隧道，就是它仍在承载这些 Forward 的最好证据，所以续约挂在这条
   // 既有节拍上，而不是新开一个心跳通道（第二条时间真相）。续不上（或别人是 owner）时**什么
   // 都不做**：抢别人的归属必须走显式的两阶段交接，不能靠"报告里提到了它"。
-  // V5.3 WP9（round 6 修正）：续约**不依赖"被服务方上报了它"**。
+  // （round 6 修正）：续约**不依赖"被服务方上报了它"**。
   //
   // 第一版按"上报的隧道"续约，于是出现一个自锁：栅栏停掉隧道 → agent 不再上报它 →
   // 续约永远续不到 → 租约一直过期 → 隧道一直停（实测落后 83s 且不恢复）。
@@ -991,7 +961,7 @@ export async function submitStateReport(
   // 注意这不会让"该停的隧道停不下来"：停一条隧道靠的是配置/remove 命令，不是靠让租约烂掉。
   const renewedLeases = await renewOwnedLeases(auth.node_id, reportedAt);
 
-  // ── V5.2 WP5：目标观测投影 ──
+  // ──：目标观测投影 ──
   //
   // 两种"缺失"含义完全不同，必须分开：
   //   · 字段**存在**（哪怕是空数组）= 这个 Agent 会观测，且这就是它现在的全部
@@ -1002,20 +972,20 @@ export async function submitStateReport(
   //     整张观测表，把"没有证据"伪造成"刚刚观测过且什么都没有"。
   if (report.target_observations !== undefined) {
     await syncTargetObservations(auth.node_id, report.target_observations, reportedAt);
-    // V5-WP19-B：同一份观测再追加进**档案**（只 INSERT）。与投影并列、互不写入：
+    //：同一份观测再追加进**档案**（只 INSERT）。与投影并列、互不写入：
     // 投影回答"现在怎么样"（会被下面的 deleteMany 收窄），档案回答"过去怎么样"
     // （24h 原始样本 + 30d 小时桶，见 services/latency-history.ts）。fail-soft。
     await archiveObservationSamples(auth.node_id, report.target_observations);
   }
 
-  // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（WP1 列，WP7 首次写入）。
+  // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（ 列， 首次写入）。
   await db.node
     .updateMany({ where: { id: auth.node_id }, data: { last_seen_at: reportedAt } })
     .catch(() => {
       /* 心跳刷新失败不影响上报结论 */
     });
 
-  // V5.3 WP9: the renewed ownership facts travel back in the report's own response —
+  // : the renewed ownership facts travel back in the report's own response —
   // zero extra round trips, zero new cadence, and the agent learns "you may keep serving
   // until T" from the very answer it is already waiting for.
   return {
@@ -1038,7 +1008,7 @@ export async function submitStateReport(
  * 「这个节点上次的状态是什么」，与 restore（Agent 侧拉 ACTIVE 隧道）互补：
  *   · restore 给 Agent **该运行的**（desired）；
  *   · 本函数给面板**它曾运行的**（reported）。
- * 两者的差就是 WP9 reconciler 的输入。
+ * 两者的差就是  reconciler 的输入。
  */
 export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot | null> {
   const row = await db.nodeStateReport.findUnique({
@@ -1048,7 +1018,7 @@ export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot 
       version: true,
       role: true,
       reported_revision: true,
-      // V5-WP19-F：`tunnels` 是**整块 JSON**，每隧道的 `diag`（协议专属事实）就在里面。
+      //：`tunnels` 是**整块 JSON**，每隧道的 `diag`（协议专属事实）就在里面。
       // 不要把这里改成逐字段投影（那会把 diag 丢在一次"看起来等价"的重构里）；
       // 读取侧用 `services/tunnel-diag.ts` 的 `tunnelDiagsById(snapshot.tunnels)` 取类型化视图。
       tunnels: true,
@@ -1056,7 +1026,7 @@ export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot 
       used_ports: true,
       last_error: true,
       reported_at: true,
-      // V4-WP6：health synthesis 的事实来源（见 services/node-health.ts）。
+      //：health synthesis 的事实来源（见 services/node-health.ts）。
       known_revision: true,
       agent_started_at: true,
       hostname: true,
@@ -1079,7 +1049,7 @@ export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot 
  * 否则 A 的凭据就能读 B 的快照。字段保持在 Agent 侧可消费的最小集：
  * 版本、角色、revision、隧道、端口、池。不回 reported_at 之类面板内部字段。
  *
- * V5-WP19-F：`tunnels` **整块原样回给 Agent**（不逐字段重建）—— 每隧道的 `diag`
+ *：`tunnels` **整块原样回给 Agent**（不逐字段重建）—— 每隧道的 `diag`
  * 就在里面。这条路径是"重放"面：Agent 重启后拿到的快照必须与它上次上报的一致，
  * 在这里做一次字段白名单重建，就等于把 Agent 自己刚发来的事实丢掉（G19.14 模型）。
  */
@@ -1101,7 +1071,7 @@ export async function buildReconnectSnapshot(nodeDbId: number): Promise<Record<s
  * 指纹：上报内容的稳定摘要（用于「这次上报和上次有区别吗」的低成本比较）。
  * 不存明文凭据，也不存任何密钥——输入只有快照字段。
  *
- * V4-WP6 把遥测里**会变但对排障有意义**的字段纳入指纹：`error_count` 与
+ *  把遥测里**会变但对排障有意义**的字段纳入指纹：`error_count` 与
  * `last_error_at`（同一个错误反复出现时内容指纹不变，但计数会动，排障时
  * 「这次上报和上次一样吗」的答案应该是「不一样」）；`known_revision` 同理。
  * `host_metrics` 刻意**不**入指纹——内存/负载每 30s 必然变化，纳入就等于

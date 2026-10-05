@@ -1,20 +1,12 @@
 /**
- * V5-WP17.3 —— DDNS 执行器（契约 §5 表）：值集规划 → provider 写 → **L1 读回** → 退避 → 审计。
+ * DDNS provider execution service.
  *
- * 这一片是**唯一会真的发出网外请求**的地方（WP17.2 刻意零外呼）。它**不接 failover、不碰
- * rollout**（那是 WP17.4）：本模块只回答"给定期望值集，怎么把它落到 provider 上，以及
- * 怎么诚实地报告结果"。
- *
- * ── 冻结的三条纪律 ──────────────────────────────────────────────────────
- *
- * ① **禁止假成功**（D2/F7）。provider 接受写入只证明"我们发了请求"；`synced` 必须**至少**满足
- *    L1（读回来确实是我们要的值）。provider 没有读回能力时，状态是显式的
- *    `synced_unverified` —— UI 禁止把它显示成"已切换"。多租户下"面板说切了、客户端还连旧 IP"
- *    是最坏的一类故障，宁可显示未确认。
- * ② **值集是集合，不是序列**。规划前排序去重：否则同一组地址的不同顺序会被判成"变了"，
- *    于是每一拍都写一次 DNS（并且把幂等性做成了随机行为）。
- * ③ **失败不改归属、不回退 epoch**（F7）。这里只写 `dns_*` 列与审计；重试由**下一节拍**按
- *    退避进行（不新开定时器），失败也不会触发第二次迁移。
+ * This is the only DDNS layer that performs provider network calls. Desired
+ * addresses are normalized as a set, changes are written, and providers with
+ * read capability are verified before reporting `synced`; otherwise success is
+ * explicitly `synced_unverified`. Failures update DNS sync/audit facts only and
+ * never alter Forward ownership or placement epochs. Retry timing is driven by
+ * the existing reconciliation cadence and bounded backoff.
  */
 import { buildAuditEntry, type AuditEntry, type AuditSink } from "./audit.ts";
 

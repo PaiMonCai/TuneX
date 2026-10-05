@@ -1,23 +1,10 @@
 /**
- * V5-WP19-C —— 链路拓扑与逐跳明细（**只读投影**）。
+ * Read-only Forward topology projection.
  *
- * 契约的硬约束（§5 WP19-C 行）：**复用 route plan / 三跳段与 diag 逐跳结果；不新建拓扑真相**。
- * 这一条不是风格要求，而是这个仓库反复付学费的地方：一旦出现第二份拓扑真相，它就会和第一份
- * 漂移，而"两处各自都对、只是不同"是最难查的一类故障（同样的话写在 `forward-contract.ts`
- * 关于 `hop_peer` 的注释里）。
- *
- * 所以本模块只做两件事：
- *
- *   ① **段结构**直接取自 `probeTargetsForForward()` 的 `node_facts` 段 —— 它本来就是
- *      "入口↔出口被拆成两段，每段点名它两端的节点与期望 runtime"，也就是"失败的那一段就是
- *      失败的那一跳"这条能力的实现；这里不再算一遍。
- *   ② **活事实**从每个节点**自己的上报**里按 runtime id 取（`diagOfTunnel`）——
- *      "面板说 active" 与 "节点真的在跑那条 runtime" 是两件事，本视图把后者摆在明面上：
- *      `running` 就是"这条 runtime 出现在该节点最近一次上报里吗"。
- *
- * ── 明确的边界 ──
- * 本模块**不探测**（那是 diag / Looking Glass 的事）、**不读 DNS**、**不聚合延迟**
- * （延迟序列是 WP19-B）。它只是把"现在的拓扑长什么样、每一跳各自在报什么"如实拼出来。
+ * Segment structure is reused from the diagnostic route plan and live endpoint
+ * facts come from each node's own state report. This module deliberately creates
+ * no second topology model and performs no active probing, DNS resolution or
+ * latency aggregation.
  */
 import { probeTargetsForForward, type NodeFactsSegment } from "./forward-probe-plan.ts";
 import type { ForwardForDiagnose } from "./agent-diagnose.ts";

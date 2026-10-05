@@ -1,42 +1,19 @@
 /**
- * V4-WP11B —— 控制协议能力协商（纯函数，无 IO）。
+ * Agent command-capability negotiation.
  *
- * 这一层回答一个问题：**这个节点现在能不能收到这个动作？**
- *
- * ── 为什么需要协商 ──
- * 面板与 Agent 的版本独立滚动：面板先升级、节点稍后才换镜像，是常态。没有
- * 协商时，面板对"新动作"只有两种选择，两种都错：
- *   · 假设旧 Agent 能执行 → 发出一条它不认识、也不会 ACK 的命令，节点侧只能
- *     回 `unsupported_action`，面板把超时当成网络问题，排障方向从一开始就错；
- *   · 假设旧 Agent 不能执行 → 升级窗口内所有旧节点立刻停止收命令，把一次
- *     平滑升级变成一次全网中断。
- * 所以协商必须能表达第三种状态：**"这个 Agent 还没告诉我"**。
- *
- * ── 两种"没有能力"必须区分 ──
- *   `capabilities` 缺失（旧 Agent 从未上报）
- *       → 按 baseline 处理：协议冻结时就存在的动作继续可用，
- *         baseline 以外的新动作一律拒绝（升级提示）。
- *   `capabilities` 存在但坏形状 / 不含该动作
- *       → fail-closed：连 baseline 动作也不再假设支持，明确要求升级。
- * 把两者混为一谈，就会在上面两个错误里二选一。
- *
- * ── 能力不是授权 ──
- * 这里的判定只回答"对端实现了没有"。它**不**参与工作空间 RBAC、资源作用域、
- * 能力策略或额度判定（§13.5 五层里的第 5 层 Runtime Admission 的一个子条件）。
- * Agent 自报的能力绝不能用来授予任何权限：它是节点对自己实现的描述。
+ * Stored state reports describe which command actions an Agent implements.
+ * Missing capability facts are treated according to the compatibility baseline;
+ * explicit unsupported actions fail closed with an upgrade-required reason.
  */
 
 /** 控制协议版本：面板当前实现的版本。 */
 export const CONTROL_PROTOCOL_VERSION = 1;
 
 /**
- * 协议冻结时就已经存在的动作。
+ * Baseline actions supported by pre-capability Agents.
  *
- * 这些动作在 WP11B 之前就随 WP7/WP11 的 Agent 发布，因此"未上报能力"的旧
- * Agent 必须继续被认为支持它们——否则升级期间整批旧节点会被拒绝下发。
- *
- * 新增动作（诊断、drain、升级……）**不在**此表内：它们必须被明确上报，
- * 未上报即视为不支持（这就是协商的全部意义）。
+ * When an older Agent has never reported a capability list, these established
+ * actions remain compatible. Any newer action must be advertised explicitly.
  */
 export const BASELINE_COMMAND_ACTIONS = ["apply_tunnel", "remove_tunnel", "suspend_tunnel"] as const;
 

@@ -1,5 +1,5 @@
 /**
- * V4-WP3 — Rollout 恢复面（`DEVELOPMENT.md` §3.5 Reconciler 恢复接缝 / §13.3.2）。
+ *  — Rollout 恢复面（`DEVELOPMENT.md` §3.5 Reconciler 恢复接缝 / §13.3.2）。
  *
  * ── 本模块是什么 ──
  * `forward-rollout-exec.ts` 交付了「登记 + 执行 + 补偿」三个入口，全部要求
@@ -13,7 +13,7 @@
  * 模块；这里只回答「扫哪些行、按什么顺序、一条失败了要不要继续」。
  *
  * ── 为什么不在 `reconciler.ts` 里做 ──
- * 报告 §3.5 明文「WP3 不修改 reconciler.ts / runtime-reconcile-sink.ts 的
+ * 报告 §3.5 明文「 不修改 reconciler.ts / runtime-reconcile-sink.ts 的
  * 语义」。reconciler 的白名单动作是「同 revision 重发 / 补缺失 runtime」，
  * 它既没有阶段概念也没有补偿概念；把 rollout 续跑塞进去等于给它开第二套
  * 完全不同的语义。接法是 worker 的 `cron_reconcile_v3` case 在调

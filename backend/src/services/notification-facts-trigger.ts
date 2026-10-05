@@ -1,19 +1,11 @@
 /**
- * V5-WP18 —— **事实类通知的投递触发器：事实选择**（第一步，纯函数）。
+ * Notification fact selection and delivery orchestration.
  *
- * 作用域由契约里 Lead 的三条裁定定死（`docs/v5-wp18-announcements-notifications-contract.md`）：
- *
- *   1. **本期只投 E 类事实**（Forward 下发被拒，reason_code = `forward_apply_error`）与其恢复。
- *      它是既有事实清单里**唯一已经有持久化真相**的一类（`tunnel.apply_status="error"` +
- *      `apply_error_code`，由 `markBlocked()` 写）；G 类（对账 findings / 联邦汇总）今天**只打日志**，
- *      而 N3 已写明"若要通知必须先把 finding 落成持久行" ⇒ 属另一个 WP。
- *   2. 骑既有 reconcile 节拍（不在本文件；本文件只管"这一拍该说哪些事实"）。
- *   3. 受众与渠道在投递层解决（本文件不碰）。
- *
- * ── 本文件刻意**不**做的事 ──
- * 不加载数据、不发信、不写账本、不读静默期。它只把"既有的 attention 条目"翻译成"可投递的事实
- * 种子"，因此可以在一张纯函数测试里被穷尽断言。派生本身复用 `collectAttention()` —— **不新建
- * 事实真相**（这是契约 D1「观测不得成为第二份真相」对通知的同一要求）。
+ * The pure selection step turns persisted attention facts into deliverable facts
+ * without loading data, sending messages, writing the ledger or reading cooldown
+ * state. Source timestamps, not scan time, drive dedupe identity so a continuing
+ * fault does not become a new notification on every reconcile pass. Delivery is
+ * injected and remains on the shared notification path.
  */
 import type { AttentionItem } from "./attention.ts";
 import { buildNotificationFact, workspaceNotificationScope, type NotificationFactSeed } from "./notification-facts.ts";
