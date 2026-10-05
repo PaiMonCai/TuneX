@@ -9,7 +9,7 @@
  */
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
-import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
+import { validatePayload, LOOKING_GLASS_MAX_TIMEOUT_MS, type CommandEnvelope } from "./control-protocol/index.ts";
 import { admitPersistedProtocol, datagramHopPeerFor, firstConnectIp } from "./forward-contract.ts";
 import {
   targetHealthWireEntries,
@@ -37,7 +37,30 @@ export interface QueuedAgentCommand {
   config: AgentTunnelConfig | null;
   /** V4-WP11C diagnose payload; delivered beside the envelope, like `config`. */
   probe?: { targets: { host: string; port: number }[]; timeout_ms?: number } | null;
+  /**
+   * V5-WP19-D Looking Glass payload. A sibling field rather than a second `probe`,
+   * for the same reason `probe` is not a synthetic TunnelConfig: the two carry
+   * different facts and obey different rules — a diagnose target comes from the
+   * panel's own desired state, while every entry here is a user-typed target that
+   * the panel already resolved and pinned to a public literal. Folding them into
+   * one field would make "which admission rules apply?" depend on the action
+   * name, which is exactly the ambiguity the separate action exists to remove.
+   *
+   * NOTE: this is one of the "rebuild boundaries" (see the WP19-D delivery record):
+   * `dequeueAgentCommand` parses the stored JSON whole and the internal route hands
+   * that object straight to the agent, so a field present here survives the trip —
+   * but a field NOT added here would be dropped silently while every layer reports
+   * healthy.
+   */
+  looking_glass?: QueuedLookingGlassRequest | null;
   queued_at: string;
+}
+
+/** V5-WP19-D: pinned public literals; the agent must never resolve a name. */
+export interface QueuedLookingGlassRequest {
+  method: string;
+  targets: { address: string; port: number }[];
+  timeout_ms?: number;
 }
 
 export interface AgentCommandAck {
@@ -227,15 +250,25 @@ export async function enqueueAgentCommand(
   store: CommandBusStore = redisStore,
   probe?: QueuedAgentCommand["probe"],
   deps: EnqueueDeps = {},
+  /**
+   * V5-WP19-D：Looking Glass 请求。放在**末尾**而不是塞进 `probe`/`config` 里：
+   * 既有调用方（调度器/rollout/诊断）一个都不用改，也就不会因为"多了一个参数"
+   * 而在别处被静默改成传错的形状。
+   */
+  lookingGlass?: QueuedLookingGlassRequest | null,
 ): Promise<{ scope: number }> {
   const scope = await (deps.resolveScope ?? nodeScope)(nodeId);
   const item: QueuedAgentCommand = {
     envelope,
     config,
     ...(probe ? { probe } : {}),
+    ...(lookingGlass ? { looking_glass: lookingGlass } : {}),
     queued_at: new Date().toISOString(),
   };
   const key = queueKey(scope, nodeId);
+  const pushedTargets = probe?.targets
+    ? probe.targets.map((t) => ({ host: t.host, port: t.port }))
+    : (lookingGlass?.targets ?? []).map((t) => ({ host: t.address, port: t.port }));
   const pending: PendingCommand = {
     command_id: envelope.command_id,
     action: String(envelope.action ?? ""),
@@ -243,7 +276,7 @@ export async function enqueueAgentCommand(
     revision: Number(envelope.revision ?? 0),
     issued_at: item.queued_at,
     expires_at: String(envelope.expires_at ?? ""),
-    expected_targets: probe?.targets ? probe.targets.map((t) => ({ host: t.host, port: t.port })) : null,
+    expected_targets: pushedTargets.length > 0 ? pushedTargets : null,
   };
   // Register the binding BEFORE publishing the command. The reverse order has a
   // real race: a fast agent can execute and ACK between the two writes, and the
@@ -408,20 +441,28 @@ export async function storeAgentCommandAck(
 
   const results = normalizeDiagnoseResults(ack.results);
   if (results) {
-    // A diagnose answer must cover exactly the requested target set.
-    if (pending.action === "diagnose_tunnel") {
+    // A probe-shaped answer must cover exactly the requested target set. V5-WP19-D
+    // widened "probe-shaped" from one action to two (diagnose_tunnel, looking_glass)
+    // rather than duplicating the rule: both ACK a bounded list of host/port
+    // observations, and for both a partial list reads as "this path is fine".
+    const probeLike = pending.action === "diagnose_tunnel" || pending.action === "looking_glass";
+    if (probeLike) {
       const expected = pending.expected_targets ?? [];
       const problem = matchExpectedTargets(expected, results);
       if (problem) throw new TypeError(problem);
       if (!ack.ok) {
-        // A refused diagnose may legitimately carry no results.
+        // A refused probe may legitimately carry no results.
       } else if (results.length !== expected.length) {
-        throw new TypeError(`diagnose ack returned ${results.length} results for ${expected.length} targets`);
+        throw new TypeError(
+          `${pending.action} ack returned ${results.length} results for ${expected.length} targets`,
+        );
       }
     }
     normalized.results = results;
-  } else if (pending.action === "diagnose_tunnel" && ack.ok) {
-    throw new TypeError("diagnose ack returned no results");
+  } else if (
+    (pending.action === "diagnose_tunnel" || pending.action === "looking_glass") && ack.ok
+  ) {
+    throw new TypeError(`${pending.action} ack returned no results`);
   }
 
   const payload = JSON.stringify(normalized);
@@ -877,6 +918,105 @@ export async function issueAgentDiagnostics(
     return { ok: false, error_code: "incomplete_result", error: "节点没有返回自检事实" };
   }
   return { ok: true, facts: ack.facts };
+}
+
+/**
+ * V5-WP19-D —— 向一个节点下发一次 Looking Glass 测试并等它的探测事实。
+ *
+ * 与 `issueAgentDiagnose` 的三点**有意**不同（不是复制粘贴）：
+ *  1. 目标不是面板的 desired 状态，而是**用户输入 + 面板已钉死的公网字面地址**，
+ *     因此这里不做任何"从 desired 派生目标"的事；
+ *  2. payload 走 `looking_glass` 这个动作自己的封闭键集（`method`/`targets`/`timeout_ms`），
+ *     目标是 `{address, port}` 而不是 `{host, port}` —— 名字在这里是**不合法**的，
+ *     因为面板已解析过，Agent 再解析一次就是把 DNS 重绑定窗口重新打开；
+ *  3. 结果复用 `results`（既有字段、既有的五处重建边界都已经带它），
+ *     覆盖性校验同样按"恰好覆盖"处理（见 `storeAgentCommandAck`）。
+ */
+export async function issueAgentLookingGlass(
+  input: {
+    nodeId: number;
+    nodeKey: string;
+    method: string;
+    targets: { address: string; port: number }[];
+    /** 单次连接尝试的超时（毫秒）。**不是**等 ACK 的总预算——两者混用会把
+     *  "等 15 秒"静默写进 payload 的 per-attempt 语义里。 */
+    perAttemptTimeoutMs?: number;
+    /** 等 ACK 的总预算（毫秒）；由调用方按目标数算好并封顶。 */
+    ackWaitMs?: number;
+  },
+  deps: {
+    capabilityFacts?: (nodeId: number) => Promise<AgentV2CapabilityFacts | null>;
+    store?: CommandBusStore;
+  } = {},
+): Promise<{ ok: true; results: AgentDiagnoseResult[] } | { ok: false; error_code: string; error: string }> {
+  const factsReader = deps.capabilityFacts ?? loadCapabilityFacts;
+  const store = deps.store ?? redisStore;
+
+  const payload = {
+    method: input.method,
+    targets: input.targets.map((t) => ({ address: t.address, port: t.port })),
+    ...(input.perAttemptTimeoutMs
+      ? { timeout_ms: Math.min(input.perAttemptTimeoutMs, LOOKING_GLASS_MAX_TIMEOUT_MS) }
+      : {}),
+  };
+  // Same frozen contract as every other action: a Looking Glass command that
+  // bypassed the validator would be a second, weaker command path.
+  const payloadError = validatePayload("looking_glass", payload);
+  if (payloadError) {
+    return { ok: false, error_code: "invalid_payload", error: payloadError };
+  }
+  const ackWaitMs = input.ackWaitMs ?? 20_000;
+  const envelope = {
+    command_id: randomUUID(),
+    resource: "node",
+    resource_id: `node-${input.nodeId}`,
+    revision: 0, // read-only: it never advances a runtime revision
+    action: "looking_glass",
+    payload,
+    expires_at: new Date(Date.now() + ackWaitMs).toISOString(),
+  } as unknown as CommandEnvelope;
+
+  let facts: AgentV2CapabilityFacts | null = null;
+  try {
+    facts = await factsReader(input.nodeId);
+  } catch {
+    return {
+      ok: false,
+      error_code: "incompatible_agent",
+      error: `节点 ${input.nodeId} 的能力上报形状非法，拒绝下发 Looking Glass`,
+    };
+  }
+  // Action-only, same reason as diagnose: a node-scoped probe has no protocol or
+  // transport dimension to negotiate.
+  const decision = admitAction({ nodeId: input.nodeId, role: "ingress", facts }, "looking_glass");
+  if (!decision.ok) {
+    return { ok: false, error_code: decision.reason, error: decision.detail };
+  }
+
+  const lookingGlassRequest: QueuedLookingGlassRequest = {
+    method: input.method,
+    targets: payload.targets,
+    ...(payload.timeout_ms ? { timeout_ms: payload.timeout_ms } : {}),
+  };
+  const { scope } = await enqueueAgentCommand(
+    input.nodeId,
+    envelope,
+    null,
+    store,
+    null,
+    {},
+    lookingGlassRequest,
+  );
+  let ack: AgentCommandAck;
+  try {
+    ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, ackWaitMs, store);
+  } catch (error) {
+    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+  }
+  if (!ack.ok) {
+    return { ok: false, error_code: ack.error_code ?? "looking_glass_failed", error: ack.error ?? "节点拒绝执行 Looking Glass" };
+  }
+  return { ok: true, results: ack.results ?? [] };
 }
 
 function hostPort(host: string, port: number): string {

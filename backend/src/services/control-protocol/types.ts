@@ -55,6 +55,18 @@ export const COMMAND_ACTIONS = [
   // V4-WP11C: Node-level self report. Read-only, no payload, capability-gated
   // exactly like diagnose_tunnel (an old agent must not receive it).
   "collect_diagnostics",
+  // V5-WP19-D: Looking Glass — a bounded, public-target-only active test issued
+  // by a user (contract §3 D7 / §5 WP19-D). It is a **new** action rather than a
+  // reuse of diagnose_tunnel on purpose: diagnose targets come from a Forward's
+  // own desired state (never from user input), while this one carries a target
+  // the caller typed. Those two facts need different admission rules, different
+  // caps and a different audit story, so they must not share an action name —
+  // sharing one would let a user-typed target ride a path whose contract says
+  // "targets are panel-owned".
+  //
+  // Read-only (no revision floor) and NOT a baseline action: an old agent has no
+  // arm for it and must receive it only after advertising it.
+  "looking_glass",
 ] as const;
 export type CommandAction = (typeof COMMAND_ACTIONS)[number];
 
@@ -125,6 +137,32 @@ export interface CollectDiagnosticsPayload {
   readonly _empty?: never;
 }
 
+/**
+ * V5-WP19-D Looking Glass payload.
+ *
+ * **这里只有"钉死的公网字面地址"**：域名由面板解析、面板判公网，然后把地址写进
+ * 命令；Agent 不会再解析任何名字（它是 DNS 重绑定的最后一道防线）。
+ *
+ * 校验分层（与 diagnose_tunnel 同一条纪律，见文件头）：
+ *   · 本文件/validator 只管**形状**（键集闭合、类型、条数、长度上限）；
+ *   · 语义白名单（公网段、规范写法、方法闭集）在 `services/looking-glass.ts`
+ *     里**下发之前**判一次，Agent 侧再判一次 —— 校验器保持零依赖，不 import 业务策略。
+ */
+export interface LookingGlassTargetPayload {
+  /** 规范 IPv4/IPv6 字面地址（面板解析后钉死；Agent 直接拨它）。 */
+  address: string;
+  port: number;
+}
+
+export interface LookingGlassPayload {
+  /** 方法闭集（v1 只有 `tcp_connect`）；未知方法拒绝而不是降级。 */
+  method: "tcp_connect";
+  /** 面板钉死的公网目标（上限见 `looking-glass.ts` 常量表）。 */
+  targets: LookingGlassTargetPayload[];
+  /** 单次尝试超时（毫秒）；Agent 侧还有自己的硬上限。 */
+  timeout_ms?: number;
+}
+
 export interface ActionSpec {
   readonly mutating: boolean;
   readonly resources: readonly CommandResource[];
@@ -140,6 +178,10 @@ export const ACTION_SPECS: Readonly<Record<CommandAction, ActionSpec>> = {
   command_ack: { mutating: false, resources: ["tunnel", "node", "node_group", "agent"], minRevision: 1 },
   diagnose_tunnel: { mutating: false, resources: ["tunnel", "node"], minRevision: 0 },
   collect_diagnostics: { mutating: false, resources: ["node"], minRevision: 0 },
+  // V5-WP19-D: read-only, node-scoped, no revision floor. It must never enter the
+  // mutation path: a diagnostic that advances a resource's revision is not a
+  // diagnostic (same rule as diagnose_tunnel / collect_diagnostics).
+  looking_glass: { mutating: false, resources: ["node"], minRevision: 0 },
 };
 
 /** 变更动作默认会把资源推到哪个状态（apply handler 可覆盖）。 */
@@ -310,6 +352,7 @@ export interface CommandAckPayload {
 export type CommandPayload =
   | CollectDiagnosticsPayload
   | DiagnoseTunnelPayload
+  | LookingGlassPayload
   | ApplyTunnelPayload
   | RemoveTunnelPayload
   | UpdateTargetsPayload
@@ -343,11 +386,13 @@ export type StateRequestEnvelope = CommandEnvelopeBase & { action: "state_reques
 export type CommandAckEnvelope = CommandEnvelopeBase & { action: "command_ack"; payload: CommandAckPayload };
 export type DiagnoseTunnelEnvelope = CommandEnvelopeBase & { action: "diagnose_tunnel"; payload: DiagnoseTunnelPayload };
 export type CollectDiagnosticsEnvelope = CommandEnvelopeBase & { action: "collect_diagnostics"; payload: CollectDiagnosticsPayload };
+export type LookingGlassEnvelope = CommandEnvelopeBase & { action: "looking_glass"; payload: LookingGlassPayload };
 
 /** 判别联合：`switch (env.action)` 即可把 payload 收敛到具体类型。 */
 export type CommandEnvelope =
   | CollectDiagnosticsEnvelope
   | DiagnoseTunnelEnvelope
+  | LookingGlassEnvelope
   | ApplyTunnelEnvelope
   | RemoveTunnelEnvelope
   | UpdateTargetsEnvelope

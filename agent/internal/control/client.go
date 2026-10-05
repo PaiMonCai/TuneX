@@ -82,6 +82,17 @@ type QueuedCommand struct {
 	// synthetic TunnelConfig: a probe is not a tunnel, and pretending otherwise
 	// would let a malformed probe look like a config apply.
 	Probe *diag.Request `json:"probe,omitempty"`
+	// LookingGlass carries a V5-WP19-D request: user-originated, panel-resolved,
+	// and pinned to **public literal addresses only**.
+	//
+	// A third sibling field for the same reason as `Probe`, plus one more that is
+	// specific to this action: it is the only place where a target the caller
+	// typed reaches the agent, so it must not be confused with either
+	// (config = panel-owned desired state, probe = panel-derived tunnel targets).
+	// The agent-side validation in internal/diag/lookingglass.go re-checks every
+	// address: whoever holds the panel's node credential cannot turn this into a
+	// scan primitive even if the panel never validated.
+	LookingGlass *diag.LookingGlassRequest `json:"looking_glass,omitempty"`
 }
 
 type commandResponse struct {
@@ -417,6 +428,24 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.Facts = &facts
 		// Read-only: the runtime revision does not move, so the ACK echoes the
 		// revision it was given.
+		rev := cmd.Envelope.Revision
+		ack.AppliedRevision = &rev
+	case ActionLookingGlass:
+		if cmd.LookingGlass == nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", "missing looking glass request"
+			return ack
+		}
+		// diag.LookingGlass validates EVERY target before it dials anything, and it
+		// never resolves a name: a request mixing a public and a private target
+		// produces zero packets and one error. Read-only, so the ACK echoes the
+		// revision it was given.
+		results, err := diag.LookingGlass(ctx, *cmd.LookingGlass, nil)
+		if err != nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", err.Error()
+			return ack
+		}
+		ack.OK = true
+		ack.Results = results
 		rev := cmd.Envelope.Revision
 		ack.AppliedRevision = &rev
 	case ActionRemoveTunnel, ActionSuspendTunnel:

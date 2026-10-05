@@ -183,6 +183,11 @@ export const ACTION_PAYLOAD_KEYS = {
   diagnose_tunnel: new Set(["targets", "timeout_ms"]),
   // No payload: the only accepted shape is an empty object.
   collect_diagnostics: new Set<string>(),
+  // V5-WP19-D: `targets` carries **pinned public literals** (the panel resolved
+  // the names; the agent must not resolve anything). Shape only — the
+  // public-address policy lives in services/looking-glass.ts on both sides, and
+  // keeping it out of here keeps this module free of business imports.
+  looking_glass: new Set(["method", "targets", "timeout_ms"]),
 } as const;
 
 const TUNNEL_KEYS = new Set([
@@ -309,6 +314,20 @@ function validateReasonField(payload: Record<string, unknown>): string | null {
 export const DIAGNOSE_MAX_TARGETS = 8;
 export const DIAGNOSE_MAX_TIMEOUT_MS = 5000;
 
+/**
+ * V5-WP19-D 线形上限（**结构**边界，不是安全策略）。
+ *
+ * 方向：这里的上限必须 **≥** `services/looking-glass.ts` 的同名常量，否则一条
+ * 策略上合法的请求会先在本地校验被拒（"策略说可以、线形说不行"是一种很难查的
+ * 漂移）。两者的一致性由 `v5-wp19/d-looking-glass.test.ts` 断言。
+ *
+ * 为什么比 diagnose 更小（4 < 8）：diagnose 的目标来自面板自己的 desired 状态，
+ * 而这里的每一个目标都是**用户输入的**公网地址 —— 一次请求能打出的包数越少，
+ * 这个功能离"端口扫描器"就越远。
+ */
+export const LOOKING_GLASS_MAX_TARGETS = 4;
+export const LOOKING_GLASS_MAX_TIMEOUT_MS = 5000;
+
 /** payload schema 校验（白名单字段 + 值域）。 */
 export function validatePayload(action: CommandAction, payload: unknown): string | null {
   if (!isPlainObject(payload)) return "payload 必须是对象";
@@ -393,6 +412,43 @@ export function validatePayload(action: CommandAction, payload: unknown): string
       }
       if (payload.timeout_ms !== undefined) {
         const err = validateIntField(payload.timeout_ms, "payload.timeout_ms", 1, DIAGNOSE_MAX_TIMEOUT_MS);
+        if (err) return err;
+      }
+      return null;
+    }
+    case "looking_glass": {
+      // V5-WP19-D：形状校验。语义白名单（公网段/规范写法/方法闭集）不在这里，
+      // 由 services/looking-glass.ts 在下发前判、Agent 侧再判一次。
+      const extra = unknownKeys(payload, [...ACTION_PAYLOAD_KEYS.looking_glass]);
+      if (extra.length > 0) return `payload 含未定义字段: ${extra.join(", ")}`;
+      const methods = ["tcp_connect"];
+      if (typeof payload.method !== "string" || !methods.includes(payload.method)) {
+        return `payload.method 必须是 ${methods.join("/")}`;
+      }
+      if (!Array.isArray(payload.targets) || payload.targets.length === 0) {
+        return "payload.targets 必须是非空数组";
+      }
+      if (payload.targets.length > LOOKING_GLASS_MAX_TARGETS) {
+        return `payload.targets 超过上限 ${LOOKING_GLASS_MAX_TARGETS}`;
+      }
+      for (let i = 0; i < payload.targets.length; i += 1) {
+        const entry = payload.targets[i];
+        if (!isPlainObject(entry)) return `payload.targets[${i}] 必须是对象`;
+        const entryExtra = unknownKeys(entry, ["address", "port"]);
+        if (entryExtra.length > 0) return `payload.targets[${i}] 含未定义字段: ${entryExtra.join(", ")}`;
+        if (typeof entry.address !== "string" || entry.address.trim() === "") {
+          return `payload.targets[${i}].address 不能为空`;
+        }
+        if (entry.address.length > MAX_ADDRESS_LEN) return `payload.targets[${i}].address 过长`;
+        // 只接受"地址字符集"，不做语义判定：真正判定在 looking-glass.ts 与 Agent。
+        if (!/^[0-9a-fA-F:.]+$/.test(entry.address.trim())) {
+          return `payload.targets[${i}].address 必须是字面 IP（不允许域名：解析在面板侧完成）`;
+        }
+        const portErr = validateIntField(entry.port, `payload.targets[${i}].port`, 1, 65535);
+        if (portErr) return portErr;
+      }
+      if (payload.timeout_ms !== undefined) {
+        const err = validateIntField(payload.timeout_ms, "payload.timeout_ms", 1, LOOKING_GLASS_MAX_TIMEOUT_MS);
         if (err) return err;
       }
       return null;

@@ -37,6 +37,12 @@ const (
 	// ActionCollectDiagnostics is the Node-level sibling: it reports what the
 	// process itself is running, instead of probing a target path.
 	ActionCollectDiagnostics = "collect_diagnostics"
+	// ActionLookingGlass (V5-WP19-D) is the one action whose target comes from
+	// **user input** rather than from the panel's own desired state. That is why
+	// it is a separate action instead of a diagnose: it needs its own admission
+	// (public-only literals, enforced on both sides), its own caps and its own
+	// audit story. See internal/diag/lookingglass.go for the agent-side half.
+	ActionLookingGlass = "looking_glass"
 )
 
 // advertisedActions is the single source of truth for what this agent
@@ -48,6 +54,7 @@ var advertisedActions = []string{
 	ActionSuspendTunnel,
 	ActionDiagnoseTunnel,
 	ActionCollectDiagnostics,
+	ActionLookingGlass,
 }
 
 // Capabilities returns the actions this agent implements, sorted. The caller
