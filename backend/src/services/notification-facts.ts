@@ -388,6 +388,7 @@ export function buildNotificationFact(
       severity: item.severity,
       resource_type: RESOURCE_TYPE_BY_SOURCE[kind]!,
       resource_id: sourceId,
+      resource_name: typeof item.name === "string" && item.name !== "" ? item.name : null,
       occurred_at: occurredAt.toISOString(),
       window_start: new Date(windowStartMs).toISOString(),
       dedupe_key: notificationDedupeKey({

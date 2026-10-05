@@ -88,6 +88,7 @@ describe("A. 派生的确定性（DoD1）", () => {
       severity: "warning",
       resource_type: "node",
       resource_id: "11",
+      resource_name: "hk-in-01",
       occurred_at: "2026-01-01T11:58:00.000Z",
       window_start: "2026-01-01T11:55:00.000Z",
       dedupe_key: first.facts[0]!.dedupe_key,
