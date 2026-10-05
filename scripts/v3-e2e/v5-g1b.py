@@ -188,18 +188,45 @@ def probe_echo(server: UDPEcho, payload: bytes = b"target-check", timeout: float
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _network_gateway(network: str) -> str:
-    """Return the Docker bridge gateway that is reachable from containers.
+def _host_bridge_address(container: str, prefix: str) -> str:
+    """Return the host-side bridge address for the data network used by *container*.
 
-    PR Integration runs this gate on the Actions host, not inside the historical
-    `g0-runner` container. The host-side UDP echo server binds 0.0.0.0, so the
-    bridge gateway is the stable address Agents can use to reach that process
-    without granting a test container access to the Docker socket.
+    Docker leaves `IPAM.Config[].Gateway` empty when Compose only declares a
+    subnet on an internal network. That made the first host-run PR fallback
+    return an empty string even though the bridge itself existed. Discover the
+    *actual* network through the running container instead of relying on a
+    Compose project/network name; prefer Docker's runtime Gateway and, when it
+    is omitted, derive the bridge's first host address from the inspected subnet.
     """
-    return H.docker(
-        ["network", "inspect", "-f", "{{(index .IPAM.Config 0).Gateway}}", network],
-        allow=True,
-    ).strip()
+    try:
+        raw = H.docker(["inspect", container], allow=True)
+        inspected = json.loads(raw or "[]")
+        networks = ((inspected[0] if inspected else {}).get("NetworkSettings") or {}).get("Networks") or {}
+    except (json.JSONDecodeError, IndexError, TypeError):
+        networks = {}
+
+    for network_name, facts in networks.items():
+        ip = str((facts or {}).get("IPAddress") or "")
+        if not ip.startswith(prefix):
+            continue
+        gateway = str((facts or {}).get("Gateway") or "")
+        if gateway:
+            return gateway
+        try:
+            network_raw = H.docker(["network", "inspect", network_name], allow=True)
+            network_info = json.loads(network_raw or "[]")
+            configs = ((network_info[0] if network_info else {}).get("IPAM") or {}).get("Config") or []
+            for config in configs:
+                subnet = str((config or {}).get("Subnet") or "")
+                gateway = str((config or {}).get("Gateway") or "")
+                if gateway:
+                    return gateway
+                if subnet:
+                    import ipaddress
+                    return str(ipaddress.ip_network(subnet, strict=False).network_address + 1)
+        except (json.JSONDecodeError, IndexError, TypeError, ValueError):
+            pass
+    return ""
 
 
 def runner_data_ip() -> str:
@@ -213,7 +240,7 @@ def runner_data_ip() -> str:
     for candidate in out.split():
         if candidate.startswith("172.31.10."):
             return candidate
-    return _network_gateway("wp14_ingress_data")
+    return _host_bridge_address(H.INGRESS_CONTAINER, "172.31.10.")
 
 
 def runner_egress_ip() -> str:
@@ -241,7 +268,7 @@ def runner_egress_ip() -> str:
 
     # PR Integration executes on the Docker host. The host-side echo server is
     # reachable from the egress Agent through this network's bridge gateway.
-    gateway = _network_gateway("wp14_egress_data")
+    gateway = _host_bridge_address(H.EGRESS_CONTAINER, prefix)
     if prefix and gateway.startswith(prefix):
         return gateway
     return gateway
@@ -329,6 +356,11 @@ def setup():
           f"rows_without_udp={missing}")
 
     check(H.ensure_second_target(), "G1B.setup target-a serves the TCP byte-echo port", f"port={H.ECHO_TARGET_PORT}")
+    # G1B is now a standalone PR gate. Historically G1A ran immediately before
+    # it and happened to leave the byte-echo listener on 3032 alive. Make the
+    # prerequisite explicit so the fast PR path does not depend on another gate.
+    check(H.ensure_echo_target(), "G1B.setup target-a serves the byte-echo port used by stream regression",
+          f"port={H.ECHO_TARGET_PORT}")
     global ECHO_TARGET_HOST
     ECHO_TARGET_HOST = runner_data_ip()
     check(bool(ECHO_TARGET_HOST),
