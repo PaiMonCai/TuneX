@@ -59,6 +59,11 @@ OUT = HERE / "evidence"
 OUT.mkdir(exist_ok=True)
 RESULT = OUT / "v5-g1b-result.txt"
 UDP_ECHO_PORT = 3040  # the UDP byte-echo target this gate starts
+# 本门禁自己跑在哪个容器里：两个 helper 都要用它取自己的数据网地址（`hostname -i`）。
+# 写成一个常量是为了让"门禁从哪个容器跑"只有一处说法——散落的字面量正是那种
+# "换了个 runner 名字就静默取到空地址"的坑（实测：名字不对时 `runner_data_ip()` 返回空，
+# 于是 target_host 为空、所有 udp 创建返回 400）。
+RUNNER_CONTAINER = "g0-runner"
 
 # Instantiated in setup(), once the class below is defined: Python runs module-level
 # statements in order, and creating them here raised NameError before any case ran.
@@ -190,11 +195,36 @@ def runner_data_ip() -> str:
     Agent, and the Agent resolves names on that network — but relying on DNS for a
     container the gate itself owns would add a dependency the test does not need.
     """
-    out = H.docker(["exec", "g0-runner", "sh", "-c", "hostname -i"], allow=True).strip()
+    out = H.docker(["exec", RUNNER_CONTAINER, "sh", "-c", "hostname -i"], allow=True).strip()
     for candidate in out.split():
         if candidate.startswith("172.31.10."):
             return candidate
     return out.split()[0] if out.split() else ""
+
+
+def runner_egress_ip() -> str:
+    """The runner's own address on the EGRESS data network (WP5-B2 relay case).
+
+    Why a second helper instead of reusing the ingress one: a RELAY fixture's pool
+    target is reached **by the exit node**, and the exit lives on the egress network.
+    Handing it the runner's *ingress*-side address gives the exit a destination it has
+    no route to — which is exactly how the first version of G1B.5 failed
+    (`the client reaches the target THROUGH the datagram hop [TimeoutError]`), with the
+    control plane fully green (create + converge + a real udp runtime on the exit). The
+    runner is attached to both data networks, so both addresses exist; they are simply
+    not interchangeable.
+
+    The subnet is derived from the egress node's own `connect_ip` rather than hardcoded,
+    so the helper keeps working when the topology's addressing changes.
+    """
+    egress_node_ip = (H.scalar("SELECT connect_ip FROM node WHERE id=%d;" % H.EGR) or "").strip()
+    prefix = egress_node_ip.rsplit(".", 1)[0] + "." if egress_node_ip else ""
+    out = H.docker(["exec", RUNNER_CONTAINER, "sh", "-c", "hostname -i"], allow=True).strip()
+    if prefix:
+        for candidate in out.split():
+            if candidate.startswith(prefix):
+                return candidate
+    return ""
 
 
 ECHO_ALT_PORT = UDP_ECHO_PORT + 1
@@ -228,13 +258,17 @@ def wait_diag(fid: int, predicate, timeout: int = 60) -> tuple[bool, dict]:
 
 
 def udp_create(name: str, mode: str = "direct", *, target_port: int = UDP_ECHO_PORT,
-               listen_port: int | None = None, egress: bool = False):
+               listen_port: int | None = None, egress: bool = False,
+               target_host: str | None = None):
     body: dict = {
         "name": f"{FIXTURE_PREFIX}-{name}",
         "mode": mode,
         "protocol": "udp",
         "ingress_node_id": H.ING,
-        "target_host": ECHO_TARGET_HOST,
+        # DIRECT: the ingress node dials the target, so the runner's INGRESS-side address
+        # is the right one. A RELAY fixture passes `target_host` explicitly (the exit node
+        # needs an address on ITS network — see runner_egress_ip).
+        "target_host": target_host or ECHO_TARGET_HOST,
         "target_port": target_port,
     }
     if listen_port is not None:
@@ -415,7 +449,19 @@ def g1b_5_relay_end_to_end():
     (`forward-revision.test.ts` 的 "udp + RELAY 带中间跳仍被拒")，不在这里复刻一个依赖
     拓扑里"恰好有第三台节点"的脆弱版本。
     """
-    status, fid, port, resp = udp_create("RELAY", mode="relay", egress=True)
+    # The relay's pool target is dialled by the **exit** node, so it must be an address on
+    # the EGRESS data network. Using the ingress-side echo address here is what made the
+    # first version of this case fail with a fully green control plane (create + converge +
+    # a real udp runtime on the exit): the exit simply had no route to the destination.
+    # Fail loudly if that address cannot be determined — a silently empty target would
+    # turn a topology problem into "the product does not work".
+    egress_target = runner_egress_ip()
+    check(bool(egress_target),
+          "G1B.5 the runner has an address on the egress data network (the exit must be able to reach the target)",
+          f"ip={egress_target!r}")
+    if not egress_target:
+        return
+    status, fid, port, resp = udp_create("RELAY", mode="relay", egress=True, target_host=egress_target)
     body = json.dumps(resp, ensure_ascii=False)
     check(status in (200, 201),
           "G1B.5 a single-hop udp RELAY Forward is accepted (hop shape frozen: datagram end to end)",
