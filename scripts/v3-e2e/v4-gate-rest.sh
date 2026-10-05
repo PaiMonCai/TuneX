@@ -479,6 +479,14 @@ if [[ "$(mysqlc "SELECT IFNULL(listen_port,0) FROM tunnel WHERE id=$FORWARD_ID;"
   ok "S7.1 夹具端口已经是原始端口（无需还原）"
 else
   S7_STATUS=$(api_patch "{\"listen_port\":$FORWARD_PORT,\"expected_revision\":$S7_REV}" s7-restore.json)
+  if [[ "$S7_STATUS" != "200" ]]; then
+    # 还原失败必须**当场留下原因**：这一条曾经只报一个 502，而真正的原因（哪一跳被拒、
+    # Agent 的端口守卫此刻认为哪些端口被占）都在别处，害得排查要先重建整个拓扑。
+    echo "     body: $(head -c 400 s7-restore.json 2>/dev/null | tr -d '\n')"
+    echo "     tunnel: $(mysqlc "SELECT CONCAT(IFNULL(apply_status,''),' | code=',IFNULL(apply_error_code,'-'),' | ',LEFT(IFNULL(apply_error,''),220)) FROM tunnel WHERE id=$FORWARD_ID;")"
+    echo "     ingress used_ports: $(mysqlc "SELECT IFNULL(used_ports,'') FROM node_state_report s JOIN tunnel t ON t.ingress_node_id=s.node_id WHERE t.id=$FORWARD_ID;")"
+    echo "     rollout: $(mysqlc "SELECT CONCAT('phase=',IFNULL(phase,'-'),' err=',IFNULL(last_error_code,'-'),' ',LEFT(IFNULL(last_error,''),200)) FROM forward_rollout WHERE tunnel_id=$FORWARD_ID ORDER BY id DESC LIMIT 1;")"
+  fi
   assert_eq "$S7_STATUS" "200" "S7.2 还原夹具端口 PATCH HTTP 200"
   S7_REV2=$(jget s7-restore.json "['data']['config_revision']")
   S7_PROBE=""
