@@ -124,7 +124,21 @@ go build ./...
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署。
 - [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构约束与迁移背景。
 
-**当前进度：V4 已正式完成技术收口。** Gate F4 = 58/0、Gate F5 = 133/0；最终
-`dd95713` 已在 GitHub Actions 上重新取得 CI / Integration / Release 全绿证据，并完成
-GHCR 镜像推送。V4 的兼容边界与已验证能力见 [V4 发布说明](<docs/release-notes-v4.md>)；
-下一阶段从 DEVELOPMENT.md §14 的 V5 Contract Freeze 开始。
+**当前进度：V4 已正式完成技术收口，V5 已完成到 V5.5 Federation 的机制与产品表面。**
+
+- V5.0–V5.4 各自 Gate 已绿（G0 137/0、G1A 73/0、G1B 76/0、G2 23/0、G3 50/0、G4 25/0）；
+- V5-WP13.5 Console Split / Route Profile：控制台边界、Route Profile 契约与双端页面已落地；
+- V5.5 Federation（WP14/WP15/WP16）：面板身份与信任、授予与远端租约、用量与对账、
+  **Forward 的远端出口腿委托**、Admin Console 的联邦页面均已落地；
+- **Gate V5-G5 = 206/0**（连跑两遍逐行一致）在**真实两面板拓扑**上执行：两个 Panel、各自
+  DB/worker/Node/Agent、真实 Ed25519 签名 M2M；同一镜像上 **G0 = 137/0、G4 = 25/0** 回归通过
+  （且是在 G5 的两轮分区模拟之后跑的）。逐条证据见
+  [docs/evidence/v5-g5-result-20261005.txt](<docs/evidence/v5-g5-result-20261005.txt>)。
+
+明确的开放边界（fail-closed，不在承诺内）：UDP RELAY / QUIC、跨面板 3+ 跳与远端中间跳、
+跨面板自动 failover、tls 远端出口、多 Panel 信任的传递闭包；
+远端 ingress 的服务层与 M2M 路由已可用，但**产品级创建路径目前只接线远端 egress**；
+host 侧"同一 peer 只能有一条覆盖 egress 的 active grant"是**有意**的 fail-closed 约束（不是缺陷）。
+
+V4 的兼容边界与已验证能力见 [V4 发布说明](<docs/release-notes-v4.md>)；
+V5 的阶段状态、硬不变量与下一步见 [DEVELOPMENT.md](DEVELOPMENT.md) §10 / §17。

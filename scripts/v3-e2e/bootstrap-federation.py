@@ -326,8 +326,17 @@ def drop_container(name: str) -> None:
     step(f"已移除旧容器 {name}（镜像已变更）")
 
 
+def container_publishes(name: str, host_port: str) -> bool:
+    raw = inspect("{{json .HostConfig.PortBindings}}", name).strip()
+    return f'"{host_port}/tcp"' in raw or f"{host_port}/tcp" in raw
+
+
 def ensure_panel_b(image: str, env_pairs: list[str]) -> None:
+    host_port = os.environ.get("FED_PANEL_B_HOST_PORT", "18181")
     if container_exists(PANEL_B) and not container_uses_image(PANEL_B, image):
+        drop_container(PANEL_B)
+    if container_exists(PANEL_B) and host_port not in ("", "0") and not container_publishes(PANEL_B, host_port):
+        # 老容器没有端口映射 → 重建（宿主上跑 CI 的地址就靠它）
         drop_container(PANEL_B)
     if container_exists(PANEL_B):
         step(f"复用既有 {PANEL_B}（image={image}）")
@@ -335,13 +344,20 @@ def ensure_panel_b(image: str, env_pairs: list[str]) -> None:
             docker(["start", PANEL_B])
         return
 
+    host_port = os.environ.get("FED_PANEL_B_HOST_PORT", "18181")
     cmd = ["run", "-d", "--name", PANEL_B, "--restart", "unless-stopped",
            "--network", NET, "--network-alias", "panel-b"]
+    if host_port and host_port != "0":
+        # 为什么必须发布一个宿主端口：Gate 跑在哪里决定了它能不能解析 `panel-b` 这个名字。
+        #   · 容器内跑（本项目当前的沙箱）：`panel-b` 由 docker 内嵌 DNS 解析，走容器网络；
+        #   · **GitHub CI 跑在宿主机上**：宿主机解析不了容器网络别名（内嵌 DNS 只服务容器），
+        #     所以那边只能走"发布的宿主端口"。两个世界都要能跑，所以端口发布 + 候选地址解析。
+        cmd += ["-p", f"{host_port}:3000"]
     for pair in env_pairs:
         cmd += ["-e", pair]
     cmd.append(image)
     docker(cmd)
-    step(f"已启动 {PANEL_B}（image={image}，network={NET}）")
+    step(f"已启动 {PANEL_B}（image={image}，network={NET}，host_port={host_port}）")
 
 
 def ensure_migrated(image: str, env_pairs: list[str]) -> None:
@@ -370,12 +386,29 @@ def ensure_migrated(image: str, env_pairs: list[str]) -> None:
         step("跳过 seed（capability_policy 已存在）")
 
 
+def panel_b_api() -> str:
+    """Panel B 的地址：优先显式覆盖，其次容器网络别名，最后宿主端口。
+
+    三个候选对应三种跑法（容器内 / 容器内但别名被占 / **宿主机上跑 CI**）。
+    找不到任何一个可用地址时必须说出来 —— 否则后面每条联邦断言都会以"连不上"的形式红，
+    而那看起来像产品故障。
+    """
+    candidates = [os.environ.get("FED_PANEL_B_API", ""), "http://panel-b:3000",
+                  f"http://127.0.0.1:{os.environ.get('FED_PANEL_B_HOST_PORT', '18181')}"]
+    for cand in candidates:
+        if cand and http("GET", cand, "/healthz", timeout=5)[0] == 200:
+            return cand.rstrip("/")
+    return ""
+
+
 def ensure_panel_b_healthy() -> None:
-    ok = wait_until(lambda: http("GET", API_B, "/healthz", timeout=10)[0] == 200, timeout=180, interval=3)
+    ok = wait_until(lambda: bool(panel_b_api()), timeout=180, interval=3)
     if not ok:
         logs = docker(["logs", "--tail", "60", PANEL_B], allow=True, timeout=120)
-        die(f"Panel B /healthz 不可达（{API_B}）；容器日志：\n{logs}")
-    step(f"Panel B healthy：{API_B}")
+        die(f"Panel B 的 /healthz 在三个候选地址上都不可达（环境变量 FED_PANEL_B_API / "
+            f"http://panel-b:3000 / http://127.0.0.1:{os.environ.get('FED_PANEL_B_HOST_PORT', '18181')}）；"
+            f"容器日志：\n{logs}")
+    step(f"Panel B healthy：{panel_b_api()}")
 
 
 # ---------------------------------------------------------------------------

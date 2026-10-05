@@ -2711,10 +2711,24 @@ Conflict reconciliation?
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| WP14 身份 / 信任 / 签名 | **DONE（本地已验证）** | 面板身份（Ed25519，私钥密文落地）、一次性 token 握手 + HMAC proof、请求签名（JWS over raw body）+ 时间窗 + 回执去重/幂等、密钥轮转（先通知后切换 + 24h retiring 宽限）、撤销（不可逆 + 级联停服）、两侧审计 |
-| WP15 授予 / 远端租约 | **host 侧 DONE；home 侧 rollout 编排未接** | grant（epoch 单调 + scope/capacity fail-closed + suspend/revoke 语义分离）、远端租约状态机（reserved→active→releasing→released/expired/revoked/failed）、端口一律走 portPool、失败补偿不留孤儿；M2M 与 Admin 端点已接 |
-| WP16 用量 / 部分失败 / 对账 | **DONE（周期对账已接 worker）** | `usage_id` 去重 + 首写胜 + 归因不一致进 unattributed（不补 0）、到期/撤销清理、placement 重发、每拍可打印汇总 |
-| Gate V5-G5 | **见 `scripts/v3-e2e/v5-g5.py` 与 `docs/evidence/`** | 真两面板拓扑；未跑绿的场景必须显式列出，不得标 production-ready |
+| WP14 身份 / 信任 / 签名 | **DONE** | 面板身份（Ed25519，私钥 AES-256-GCM 密文落地，密钥由 HKDF(AUTH_SECRET) 派生）、一次性 token 握手 + HMAC proof（防中间人冒充对端）、请求签名（JWS over raw body）+ 时间窗（60s 偏移容忍 / 300s 上限）+ 回执去重与幂等（**瞬态失败不留快照**）、密钥轮转（先通知后切换 + 24h retiring 宽限）、撤销（不可逆 + 级联停服 + panel 进程内即时生效 + 可用新 token 重建信任）、两侧审计 |
+| WP15 授予 / 远端租约 | **DONE（含产品级接线）** | grant（epoch 单调 + scope/capacity fail-closed + suspend/revoke 语义分离）、远端租约状态机（reserved→active→releasing→released/expired/revoked/failed）、端口一律走 portPool、失败补偿不留孤儿；M2M 与 Admin 端点；**Forward 可声明远端出口腿**（`federated_egress_peer`）并由既有 rollout 流程建立/改版/补偿/释放，入口 next_hop 只认 host 返回的 `node_address:port` |
+| WP16 用量 / 部分失败 / 对账 | **DONE（周期对账已接 worker）** | `usage_id` 去重 + 首写胜 + 归因不一致进 unattributed（不补 0）、到期/撤销清理、placement 重发、**已收敛行有界探活**（不可达 → degraded，恢复 → active，每拍上限 20）、到期**本地**转终态（零远端调用）、每拍可打印汇总 |
+| Gate V5-G5 | **GREEN：PASS=206 / FAIL=0（连跑两遍逐行一致）** | 真两面板拓扑（两个 Panel、各自 DB/worker/Node/Agent、真实 Ed25519 签名 M2M）；19 个场景 / 206 条断言，含 Forward 级 G5.16–G5.19。同一镜像上 G0 = 137/0、G4 = 25/0。证据：`docs/evidence/v5-g5-result-20261005.txt` |
+| Gate V5-G0（回归） | **GREEN：137/0** | 同一镜像、G5 的两轮分区模拟之后运行 ⇒ "`federated_egress_peer=NULL` 路径逐字节不变"在真实四 Agent 拓扑上成立 |
+| Gate V5-G4（回归） | **GREEN：25/0** | 同上；证明 G5 的破坏性操作没留下残留 |
+
+**一条容易漏掉、但决定联邦是否真的可用的不变量**：host 侧必须把它的联邦腿**发布进自己的权威
+desired 快照**（`federation_lease.applied_config` + `buildDesiredNodeSnapshot` 追加）。
+只在命令路径下发是不够的 —— Agent 的 reconcile 会正确地删掉"不在权威期望状态里的 runtime"，
+于是远端腿会活不过一个上报周期，而面板两侧账本都还显示 active（用户看到的是"系统说活着、
+链路不通"）。**同一份事实必须有两条投递路径**（命令 + 快照），这是 V4 已经在协议、证书路径、
+健康数组上反复学到的那条。
+
+WP15 第一版**明确不做**（fail-closed）：远端 ingress / 远端 transit / 跨面板 3+ 跳、
+`tls` 远端出口（证书是节点本地文件，apply 形状未冻结这一维）。
+（远端 ingress 的服务层与 HTTP 路由均已打通，但产品级创建路径目前只接线了远端 egress；
+远端 ingress 仍不开放。）
 
 已明确**不开放**（继续 fail-closed）：跨面板 3+ 跳 / 任意图、跨面板自动 failover、
 远端资源的本地结算、多 Panel 信任的传递闭包。
@@ -2986,33 +3000,43 @@ Known Boundaries:
 # 17. 当前下一步
 
 ~~~text
-已完成：
+已完成（2026-10-05 收口读数，同一镜像 sha256:c3803203…）：
 V5.0   G0  = 137/0
 V5.1a  G1A = 73/0
 V5.1b  G1B = 76/0（UDP DIRECT）
 V5.2   G2  = 23/0
 V5.3   G3  = 50/0
 V5.4   G4  = 25/0
-V5.5   G5  = 见 scripts/v3-e2e/evidence/ 下的最新 v5-g5 结果
+V5.5   G5  = 206/0（连跑两遍逐行一致）
 
 已落地（2026-10-05）：
 V5-WP13.5A Console Boundary      —— User/Admin/Auth 边界与两套 Shell，URL 零变化
-V5-WP13.5B Route Profile 冻结    —— 契约 + schema + 编译器 + API（模板不拥有 runtime）
-V5-WP14    联邦身份 / 信任 / 签名 —— 身份、一次性握手、签名+时间窗+回执幂等、
-                                     轮转（先通知后切换）、撤销（不可逆+级联停服）、两侧审计
-V5-WP15    授予 / 远端租约        —— host 侧租约状态机与真实下发；home 侧 rollout 编排**未接**
-V5-WP16    用量 / 对账            —— usage_id 去重 + 归因 + 到期/撤销清理 + placement 重发
+V5-WP13.5B Route Profile 冻结    —— 契约 + schema + 编译器 + API + Admin/用户侧页面
+V5-WP14    联邦身份 / 信任 / 签名 —— 身份、一次性握手 + HMAC proof、签名+时间窗+回执幂等、
+                                     轮转（先通知后切换）、撤销（不可逆 + 级联停服 + panel 内即时）、
+                                     撤销后可用新 token 重建信任、两侧审计
+V5-WP15    授予 / 远端租约        —— host 侧租约状态机与真实下发；**home 侧产品级接线**：
+                                     Forward 声明远端出口腿 → 既有 rollout 委托 → placement 镜像
+V5-WP16    用量 / 对账            —— usage_id 去重 + 归因 + 到期/撤销清理 + placement 重发 +
+                                     已收敛行有界探活（degraded/恢复）+ 到期本地终态
+Federation Admin Console         —— Peers / Trust / Grants / Remote Leases / Usage（只在 Admin）
 
 仍阻塞 / 明确不开放：
 V5.1b B2 UDP RELAY —— 跨节点 datagram 形态仍待产品决策，当前必须拒绝；
 V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭；
-跨面板 3+ 跳 / 任意图 / 跨面板自动 failover / 多 Panel 信任传递闭包 —— 保持关闭。
+跨面板 3+ 跳 / 远端 ingress / 远端 transit / 任意图 / 跨面板自动 failover /
+tls 远端出口 / 多 Panel 信任传递闭包 —— 一律 fail-closed 保持关闭。
 
 下一阶段（按序）：
-1. 把 G5 在真实两面板拓扑上跑绿，并把逐条结果写进 docs/evidence/；
-2. 接通 home 侧 rollout 的远端 hop 编排（把已有的 lease/apply 从 API 级提升到 Forward 级）；
-3. Federation 的 Admin Console 产品表面收口（Peers / Trust / Grants / Remote Leases / Usage）；
-4. G5 关闭前不得标记 production-ready；未跑绿的场景必须显式列出，不得静默通过。
+1. 把"远端 hop 的更多形态"单独立项：**远端 ingress 的产品级创建路径**（服务层与 HTTP 路由已通，
+   但创建/编辑流程目前只接线远端 egress）、跨面板中间跳 —— 都需要先冻结 apply 契约缺失的那一维
+   （证书路径 / next_hop 语义 / 中间跳的目标池）；
+2. 把 G5 纳入 CI 常跑（脚本已幂等，README §7.7 记了需要什么：第二个 Panel 的独立 DB/Redis/worker、
+   两张数据网、宿主端口与 `API` 显式设置）；G0/G4 已随本轮在同一镜像上回归通过；
+3. host 上"同一 peer 只能有一条覆盖 egress 的 active grant"这条运维约束若要放松，
+   需要先在契约里定义歧义解析规则（当前**有意** fail-closed）；
+4. G5 已绿、G0/G4 回归绿 ⇒ V5.5 达到"可交给评审"的状态；**production-ready 仍需独立安全评审**
+   （§14：federation 单独安全评审）。
 ~~~
 
 可执行顺序与硬约束：

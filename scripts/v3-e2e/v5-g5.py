@@ -35,6 +35,7 @@ Panel B 由 `scripts/v3-e2e/bootstrap-federation.py` 建立（独立库 `tunex_b
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -64,7 +65,25 @@ OUT.mkdir(exist_ok=True)
 RESULT = OUT / "v5-g5-result.txt"
 
 API_A = H.API
-API_B = os.environ.get("FED_PANEL_B_API", "http://panel-b:3000").rstrip("/")
+FED_PANEL_B_CANDIDATES = [
+    os.environ.get("FED_PANEL_B_API", ""),
+    "http://panel-b:3000",
+    f"http://127.0.0.1:{os.environ.get('FED_PANEL_B_HOST_PORT', '18181')}",
+]
+API_B = (os.environ.get("FED_PANEL_B_API") or "http://panel-b:3000").rstrip("/")
+
+
+def resolve_api_b() -> str:
+    """Panel B 的可用地址：显式覆盖 → 容器网络别名 → 发布的宿主端口。
+
+    三种跑法（容器内沙箱 / 容器内但别名不可用 / **宿主机上的 GitHub CI**）各自只有一种能通：
+    宿主机解析不了 docker 的容器别名，容器里又够不到宿主机发布的端口。所以按顺序探，
+    探不到就返回空 —— 让 setup 明确报"地址不可达"，而不是让后面每条断言各自超时。
+    """
+    for cand in FED_PANEL_B_CANDIDATES:
+        if cand and http("GET", cand, "/healthz", timeout=5)[0] == 200:
+            return cand.rstrip("/")
+    return ""
 
 PANEL_A = "wp14-panel"
 PANEL_B = "wp14-panel-b"
@@ -376,8 +395,13 @@ def setup() -> None:
 
     check(bool(H.wait_until(lambda: http("GET", API_A, "/healthz", timeout=5)[0] == 200, timeout=60, interval=2)),
           "G5.setup Panel A 可达")
-    check(bool(H.wait_until(lambda: http("GET", API_B, "/healthz", timeout=5)[0] == 200, timeout=60, interval=2)),
-          "G5.setup Panel B 可达（先跑 bootstrap-federation.py）", API_B)
+    # Panel B 的地址在 setup 时**重新解析**（见 resolve_api_b）：容器内跑走 `panel-b`，
+    # 宿主机上跑（GitHub CI）只能走发布的宿主端口。硬编码一种就会在另一个世界里全红，
+    # 而那种红看起来像产品故障 —— 正是最贵的一类误读。
+    global API_B
+    API_B = resolve_api_b()
+    check(bool(API_B), "G5.setup Panel B 可达（先跑 bootstrap-federation.py）",
+          f"试过 {FED_PANEL_B_CANDIDATES}")
 
     B_EMAIL = os.environ.get("FED_PANEL_B_ADMIN_EMAIL", "wp14-e2e-b@tunex.local")
     st, _body_login, set_cookie = http("POST", API_B, "/api/auth/login",
@@ -460,12 +484,16 @@ def setup() -> None:
     # 门禁自己发不出请求（例如签名工具坏了），绝不能算成"端点存在"。
     # 端点存在性的判据是**联邦错误体**（code + correlation_id），不是裸 HTTP 状态：
     # 一个不存在的 grant 会得到 404 grant_not_found —— 那恰恰证明路由在。
-    no_grant = "V5-G5-no-such-grant"
+    # 用**形状非法**的 intent 探路由（不产生任何副作用）。
+    # 曾经用"不存在的 grant_ref"来探 —— 结果发现 host 会把显式给错/给不存在的 grant_ref
+    # **静默忽略**并回落到"该 peer 唯一一条 active grant"，于是这条探测真地预留了一条租约
+    # （留下孤儿端口）。探针不该有副作用；那条回落行为本身另记一条 FINDING（见汇报）。
     st_leases, body_leases, _ = fed_call(PANEL_A, API_B, "POST", "/api/federation/v1/leases",
-                                         {"grant_ref": no_grant,
-                                          "intent": intent(f"{FIXTURE_PREFIX}-probe")})
+                                         {"grant_ref": "V5-G5-no-such-grant",
+                                          "intent": {"intent_id": "", "revision": -1, "hop_role": "nope",
+                                                     "forward_ref": ""}})
     check(is_federation_error(body_leases), "G5.0c POST /api/federation/v1/leases 已挂载且可达",
-          f"status={st_leases} body={json.dumps(body_leases)[:160]}")
+          f"status={st_leases} body={json.dumps(body_leases)[:200]}")
     material_apply = fed_sign_material(PANEL_A, API_B, "POST", "/api/federation/v1/leases/no-such-lease/apply",
                                        {"intent_id": "probe", "revision": 1,
                                         "link": {"protocol": "tcp", "targets": [{"host": "target-a", "port": 3030}]}})
@@ -488,24 +516,51 @@ def cleanup() -> None:
         H.record(False, f"G5.cleanup 恢复被本门禁停掉的容器失败: {type(exc).__name__}: {exc}")
 
     # Forward 级 fixture：先删 Forward（走产品自己的释放路径），再清它留下的 placement 行。
+    db_a = H.parse_env(H.ENVF).get("MYSQL_DATABASE", "tunex")
     for tid in list(FED_FORWARD_IDS):
         try:
             H.req("DELETE", f"/api/forwards/{tid}", None, timeout=120)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            scalar_a(f"DELETE FROM federation_placement WHERE tunnel_id={tid};")
-        except Exception:  # noqa: BLE001
-            pass
+    # placement 行按**创建过的名单**清（含场景自己删掉 Forward 的那些），
+    # 不再依赖"此刻还在 FED_FORWARD_IDS 里" —— 那正是上一轮留下 11 行终态残留的原因。
+    try:
+        if FED_FORWARD_ALL:
+            ids = ",".join(str(int(t)) for t in FED_FORWARD_ALL)
+            mysql_on(db_a, f"DELETE FROM federation_placement WHERE tunnel_id IN ({ids});")
+    except Exception:  # noqa: BLE001
+        pass
     # 兜底：按名字清掉本门禁留下的 Forward 行（例如创建成功但响应丢失的情况）
     try:
-        scalar_a(f"DELETE FROM federation_placement WHERE forward_ref IN "
-                 f"(SELECT CONCAT('fw-', id) FROM tunnel WHERE name LIKE '{FIXTURE_PREFIX}%');")
-        mysql_on(H.parse_env(H.ENVF).get("MYSQL_DATABASE", "tunex"),
-                 f"DELETE FROM tunnel WHERE name LIKE '{FIXTURE_PREFIX}%';")
+        mysql_on(db_a, f"DELETE FROM federation_placement WHERE forward_ref IN "
+                       f"(SELECT CONCAT('fw-', id) FROM tunnel WHERE name LIKE '{FIXTURE_PREFIX}%');")
+        mysql_on(db_a, f"DELETE FROM tunnel WHERE name LIKE '{FIXTURE_PREFIX}%';")
+    except Exception:  # noqa: BLE001
+        pass
+    # 孤儿历史清扫：终态 placement 指向一条**已经不存在的** tunnel，且 forward_ref 是
+    # 这个门禁的 `fw-<数字>` 形状 —— 那是历次运行留下的残留，不是任何现存 Forward 的状态。
+    # 不扫这一步，"11 行历史 expired"会一直混进证据里（Lead 明确指出要收干净）。
+    try:
+        mysql_on(db_a,
+                 "DELETE p FROM federation_placement p LEFT JOIN tunnel t ON t.id = p.tunnel_id "
+                 "WHERE p.state IN ('expired','revoked') AND t.id IS NULL "
+                 "AND p.forward_ref REGEXP '^fw-[0-9]+$';")
     except Exception:  # noqa: BLE001
         pass
 
+    # 远端租约：按 fixture 名单扫一遍 B 侧（含创建失败时留下的 reserved 行 —— 那是产品补偿
+    # 没走的路径，门禁自己不能因此把端口留在对端）
+    for tid in list(FED_FORWARD_ALL):
+        try:
+            refs = mysql_on(DB_B, f"SELECT lease_ref FROM federation_lease WHERE forward_ref='fw-{tid}' "
+                                  "AND state IN ('reserved','active','releasing');")
+            for ref in [r.strip() for r in refs.splitlines() if r.strip()]:
+                fed_call(PANEL_A, API_B, "DELETE", f"/api/federation/v1/leases/{ref}",
+                         {"intent_id": f"fw-{tid}", "revision": 1, "reason": "gate_cleanup"}, timeout=20)
+                if ref not in CREATED_LEASES:
+                    CREATED_LEASES.append(ref)
+        except Exception:  # noqa: BLE001
+            pass
     for ref in list(CREATED_LEASES):
         try:
             fed_call(PANEL_A, API_B, "DELETE", f"/api/federation/v1/leases/{ref}", {"reason": "gate_cleanup"},
@@ -1259,7 +1314,9 @@ def g5_12_reconnect_reconcile():
         # 断言的是**对账收敛**（applied 追上 desired），不是"此刻必须活着"：
         # 远端租约的 TTL 只有 300s，一个跑得久的总门禁完全可能在落到这里时它已经到期
         # —— 那时 home 账本仍然必须收敛且可解释。活体链路另有 G5.16 专门验。
-        check(pr0.get("applied_revision") >= pr0.get("desired_revision") and pr0.get("desired_revision") > 0,
+        has_row = bool(pr0)
+        check(has_row and int(pr0.get("applied_revision") or -1) >= int(pr0.get("desired_revision") or 0)
+              and int(pr0.get("desired_revision") or 0) > 0,
               "G5.12 该 placement 的 applied_revision 追上 desired_revision（对账收敛）", json.dumps(pr0))
         check(pr0.get("state") == "active" or bool(pr0.get("last_error_code")),
               "G5.12 不在 active 时必须有可解释原因（不带理由的状态漂移=不可解释）", json.dumps(pr0))
@@ -1370,7 +1427,12 @@ def g5_13_cross_tenant_isolation():
 # 里把它放宽。
 # ---------------------------------------------------------------------------
 
+# `FED_FORWARD_IDS` = 当前**还活着**的 fixture（G5.12/G5.17 用它挑对象）；
+# `FED_FORWARD_ALL` = 本轮**创建过**的全部 id，永不摘除 —— 场景自己删掉 Forward 之后，
+# placement 的终态行仍然要有人收（否则下一轮读数里会一直混着"历史 expired"，
+# 未来的人分不清那是残留还是真状态）。
 FED_FORWARD_IDS: list[int] = []
+FED_FORWARD_ALL: list[int] = []
 FED_FORWARD_MARKER = "fed_fw_tid"
 
 
@@ -1403,15 +1465,16 @@ def forward_row_a(tid: int) -> dict:
     raw = scalar_a(
         "SELECT CONCAT(IFNULL(tunnel_mode,''),'|',IFNULL(apply_status,''),'|',IFNULL(listen_port,0),'|',"
         "IFNULL(config_revision,0),'|',IFNULL(applied_revision,0),'|',IFNULL(ingress_node_id,0),'|',"
-        "IFNULL(egress_node_id,0),'|',IFNULL(federated_egress_peer,''),'|',IFNULL(forward_protocol,'')) "
+        "IFNULL(egress_node_id,0),'|',IFNULL(federated_egress_peer,''),'|',IFNULL(forward_protocol,''),'|',"
+        "IFNULL(apply_error_code,'')) "
         f"FROM tunnel WHERE id={tid};"
     )
     if "|" not in raw:
         return {}
-    mode, status, port, cfg, applied, ing, egr, peer, proto = raw.split("|")
+    mode, status, port, cfg, applied, ing, egr, peer, proto, err = raw.split("|")
     return {"mode": mode, "apply_status": status, "listen_port": int(port), "config_revision": int(cfg),
             "applied_revision": int(applied), "ingress_node_id": int(ing), "egress_node_id": int(egr),
-            "federated_egress_peer": peer, "protocol": proto, "raw": raw}
+            "federated_egress_peer": peer, "protocol": proto, "apply_error_code": err, "raw": raw}
 
 
 def placement_row_a(peer_panel_id: str, intent_id: str) -> dict:
@@ -1457,8 +1520,11 @@ def create_federated_forward(name: str, peer_panel_id: str) -> tuple[int, dict]:
     data = unwrap(resp)
     data = data if isinstance(data, dict) else {}
     tid = int(data.get("id") or 0)
-    if tid and tid not in FED_FORWARD_IDS:
-        FED_FORWARD_IDS.append(tid)
+    if tid:
+        if tid not in FED_FORWARD_IDS:
+            FED_FORWARD_IDS.append(tid)
+        if tid not in FED_FORWARD_ALL:
+            FED_FORWARD_ALL.append(tid)
     return status, data
 
 
@@ -1493,18 +1559,32 @@ def g5_16_federated_forward_use():
         A_PANEL_ID, {"node_group_ids": [B_GROUP_ID], "hop_roles": ["egress"], "allow_target_policy": None},
         {"max_legs": 5}, workspace_id=B_WS_ID, expires_in_seconds=3600,
     )
-    check(bool((grant or {}).get("grant_ref")),
-          "G5.16 为远端出口准备唯一一条 active grant（多于一条会被 fail-closed 拒绝）",
-          f"revoked_others={revoked} grant={json.dumps(grant)[:160]}")
+    _s2, grants_now, _ = req_b("GET", f"{ADMIN_B}/grants")
+    active_now = [g for g in as_list(unwrap(grants_now))
+                  if g.get("status") in ("active", "suspended")]
+    check(len(active_now) == 1,
+          "G5.16 该 peer 上此刻**恰好一条**可用 grant（多于一条时 rollout 会被 fail-closed 拒绝）",
+          f"revoked_others={revoked} active={[(g.get('grant_ref'), g.get('status')) for g in active_now][:4]}")
 
     status, data = create_federated_forward(f"{FIXTURE_PREFIX}-fedfw", B_PANEL_ID)
     check(status in (200, 201), "G5.16 A 上创建声明远端出口（federated_egress_peer=B）的 RELAY Forward",
           f"status={status} apply_status={(data or {}).get('apply_status')} "
-          f"apply_error_code={(data or {}).get('apply_error_code')} body={json.dumps(data)[:200]}")
+          f"apply_error_code={(data or {}).get('apply_error_code')} "
+          f"apply_error={str((data or {}).get('apply_error'))[:220]}")
     tid = int((data or {}).get("id") or 0)
     if tid <= 0:
         return
+    # create 的**响应**与 rollout 的**最终结果**是两件事：实测见过 502 但行还在 `applying`
+    # （API 说了失败、而实际还在跑），也见过 502 且行落到 error。所以这里不把响应当结论，
+    # 而是等这条 Forward 的 apply_status 稳定下来再断言 —— 这样"API 层不一致"与
+    # "远端腿建不起来"会各自留下独立的一条 FAIL，而不是互相掩盖成一串级联。
+    settled = H.wait_until(lambda: forward_row_a(tid).get("apply_status") in ("active", "error"),
+                           timeout=180, interval=5)
     row = forward_row_a(tid)
+    check(settled, "G5.16 创建请求返回后 Forward 的 apply_status 能稳定下来（不长期 pending/applying）",
+          json.dumps(row))
+    check(row.get("apply_status") == "active", "G5.16 该 Forward 最终收敛到 active",
+          f"row={json.dumps(row)} apply_error_code={row.get('apply_error_code')}")
     check(row.get("egress_node_id", 0) == 0 and row.get("federated_egress_peer") == B_PANEL_ID,
           "G5.16 出口腿真的被委托出去：本机没有 egress 节点，只有声明", json.dumps(row))
     check(int(row.get("listen_port") or 0) > 0, "G5.16 本机入口端口已分配", json.dumps(row))
@@ -1538,6 +1618,34 @@ def g5_16_federated_forward_use():
     _, detail = ingress_probe(port)
     check(ok_data, "G5.16 数据面：经 A 的入口端口真的到达远端出口腿后面的 target-a（由 wp14-client 发起）",
           detail)
+
+    # ── 稳定性钉子（最直接钉住根因的那条）──
+    # host 侧如果**没有把联邦腿发布进自己的权威 desired 快照**，Agent 的"删掉不在 desired
+    # 里的 runtime"这条正确逻辑会在 ~20–45s 内把它剪掉（实测：`tunnel applied` 紧跟
+    # `reconcile removed runtime absent from authoritative desired state`），而控制面每一行
+    # 仍是 active。所以"60 秒后还连得上"比任何分区场景都更短、更稳、更准确地复现它。
+    time.sleep(120)
+    ok_stable, detail_stable = ingress_probe(port)
+    lease_now = str(prow.get("lease_ref") or "")
+    b_reported = b_runtime_reported(lease_now)
+    check(ok_stable,
+          "G5.16 远端腿建立 120s 后**仍在服务**（host 的 desired 快照必须包含这条联邦腿）",
+          f"{detail_stable} b_runtime_in_node_report={b_reported} "
+          f"tunnel={json.dumps(forward_row_a(tid))}")
+
+    # 同一条根因的**日志级**断言：host 的 Agent 不得把联邦 runtime 当成"不在权威 desired 里"
+    # 剪掉。这条与上一条互为独立证据（一个看数据面、一个看 Agent 的判定），
+    # 也是 task-12 修复前那条 `reconcile removed runtime absent from authoritative desired state`
+    # 的直接对照。
+    agent_log = H.docker(["logs", "--since", "20m", AGENT_B], allow=True, timeout=120)
+    hits = [ln for ln in agent_log.splitlines()
+            if "reconcile removed runtime absent from authoritative desired state" in ln
+            and "tunex-fed-" in ln and (lease_now == "" or lease_now in ln)]
+    check(not hits,
+          "G5.16 host 侧 Agent 不再把联邦腿当成「不在权威 desired 里」而剪掉（task-12 的直接对照）",
+          f"matches={len(hits)} last={hits[-1][:220] if hits else ''}")
+    _after, _detail_after = ingress_probe(port)
+    check(_after, "G5.16 该腿在整个稳定窗口结束时仍可连（不出现「建立后短命」）", _detail_after)
 
     # ── 停 B：home 账本必须 degraded，且**不回落本地** ──
     try:
@@ -1575,12 +1683,14 @@ def g5_16_federated_forward_use():
         r = placement_row_a(B_PANEL_ID, intent_id)
         return r.get("state") == "active" and r.get("applied_revision") == r.get("desired_revision")
 
-    check(bool(H.wait_until(_converged, timeout=120, interval=4)),
+    check(bool(H.wait_until(_converged, timeout=180, interval=5)),
           "G5.16 恢复后按 (intent_id, revision) 收敛（applied 追上 desired）",
           json.dumps(placement_row_a(B_PANEL_ID, intent_id)))
     check(remote_lease_for_b(f"fw-{tid}").get("state") == "active",
           "G5.16 恢复后 B 侧租约仍是同一条 active", json.dumps(remote_lease_for_b(f"fw-{tid}")))
-    ok_back = H.wait_until(lambda: ingress_probe(port)[0], timeout=120, interval=5)
+    # 入口腿重建是**异步**的（要等一次 rollout 收敛）：这里等"active 且数据面通"，
+    # 而不是"某一瞬间必须 active"。中间态（apply_status=error → resume）是如实的，不是失败。
+    ok_back = H.wait_until(lambda: ingress_probe(port)[0], timeout=180, interval=5)
     _, detail_back = ingress_probe(port)
     local_runtimes = scalar_a("SELECT IFNULL(GROUP_CONCAT(IFNULL(tunnels,'[]')),'') FROM node_state_report;")
     check(ok_back, "G5.16 恢复后数据面重新可用（同一条链路）",
@@ -1639,15 +1749,22 @@ def g5_19_no_silent_lie_after_lease_expiry():
     check(bool(H.wait_until(lambda: http("GET", API_B, "/healthz", timeout=5)[0] == 200, timeout=120, interval=3)),
           "G5.19 B 恢复上线")
 
-    # 给 home 侧对账留一拍，然后读**最终事实**
+    # 给 home 侧对账留一拍，然后读**最终事实**。
     H.wait_until(lambda: placement_row_a(B_PANEL_ID, intent_id).get("state") in
                  ("expired", "revoked", "failed", "active"), timeout=180, interval=6)
+
+    # 诚实性要求是"**最终**不得继续声称 active"，而不是"某一瞬间必须已经是 error"：
+    # 可见状态的收口由 worker 的 30s 一拍驱动（placement 到期 → 健康收口），所以这里等一个
+    # 上界（180s ≈ 6 拍），等的是"要么数据面真的通了、要么不再声称 active"。
+    # 采样单一时刻会把"还没轮到"读成产品缺陷 —— 那是门禁自己的错，与"永远不纠正"必须区分开。
+    def _honest() -> bool:
+        return ingress_probe(port)[0] or forward_row_a(tid).get("apply_status") != "active"
+
+    honest = H.wait_until(_honest, timeout=180, interval=6)
     final_tunnel = forward_row_a(tid)
     final_place = placement_row_a(B_PANEL_ID, intent_id)
-    serves = H.wait_until(lambda: ingress_probe(port)[0], timeout=60, interval=5)
     _, probe_detail = ingress_probe(port)
-
-    check(serves or final_tunnel.get("apply_status") != "active",
+    check(honest,
           "G5.19 远端腿已过期且数据面不通时，Forward **不得**继续声称 active（不许静默假活）",
           f"tunnel={json.dumps(final_tunnel)} placement={json.dumps(final_place)} probe={probe_detail}")
 
@@ -1856,10 +1973,30 @@ def code_provenance() -> str:
                 ["inspect", "-f", "{{.Image}} started={{.State.StartedAt}}", name], allow=True, timeout=60)
     except Exception as exc:  # noqa: BLE001
         return f"checkout_commit={commit or 'unknown'}\nimage=unavailable ({exc})"
+
+    # **源码指纹**：容器里实际跑的 `src/` 清单哈希。为什么必须有它：
+    # 镜像 digest 只能证明"跑的是某个镜像"，证明不了"那个镜像是这个 checkout 建的"。
+    # 实测踩过一次：同步时把 runner 的 /repo 用另一个容器的**旧副本**覆盖了，
+    # 于是整轮读数都是旧代码跑出来的，而镜像 digest 看起来完全正常。
+    # 把两侧容器里 `src/` 的清单哈希写进证据，读数与代码的对应关系就变成可核对的。
+    # 门禁脚本**自己**的指纹：和 panel_src_manifest 同一个道理 —— 读数必须能对上脚本版本。
+    # 踩过一次"改了脚本但没同步进 runner，于是跑的是旧脚本"，症状与"产品行为不一致"无法区分。
+    try:
+        self_md5 = hashlib.md5(Path(__file__).read_bytes()).hexdigest()
+    except Exception:  # noqa: BLE001
+        self_md5 = "unavailable"
+
+    manifests = {}
+    for name in (PANEL_A, PANEL_B):
+        manifests[name] = H.docker(
+            ["exec", name, "sh", "-c", "cd /app && find src -type f | sort | xargs md5sum | md5sum"],
+            allow=True, timeout=120).strip()
     return (
         f"checkout_commit={commit or 'unknown'}\n"
         f"image={image}\n"
-        f"containers={json.dumps(panels, ensure_ascii=False)}"
+        f"containers={json.dumps(panels, ensure_ascii=False)}\n"
+        f"panel_src_manifest={json.dumps(manifests, ensure_ascii=False)}\n"
+        f"gate_script_md5={self_md5}"
     )
 
 

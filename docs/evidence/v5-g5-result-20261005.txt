@@ -1,11 +1,13 @@
 # V5-G5 two-panel federation gate (WP14/WP15/WP16)
-time: 2026-10-04T20:34:34+0000
+time: 2026-10-04T23:52:06+0000
 topology: A=http://panel:3000 (home) B=http://panel-b:3000 (host, container wp14-panel-b, db tunex_b)
-fixture: V5-G5-1791145192; setup=executed
+fixture: V5-G5-1791157058; setup=executed
 checkout_commit=(git 不可用)
-image=sha256:353837bdbee106d339d59088c4779e749a28c149cbf1d09343672dcd744250e0 2026-10-04T19:25:35.760793191Z
-containers={"wp14-panel": "sha256:353837bdbee106d339d59088c4779e749a28c149cbf1d09343672dcd744250e0 started=2026-10-04T20:29:24.017189475Z", "wp14-panel-b": "sha256:353837bdbee106d339d59088c4779e749a28c149cbf1d09343672dcd744250e0 started=2026-10-04T20:33:08.959977283Z"}
-elapsed_seconds: 882
+image=sha256:c3803203bc264a83061ea1fb99455fded20c0f86ff34c42e22138b8a4ec1ee88 2026-10-04T23:22:06.220154419Z
+containers={"wp14-panel": "sha256:c3803203bc264a83061ea1fb99455fded20c0f86ff34c42e22138b8a4ec1ee88 started=2026-10-04T23:47:34.860537396Z", "wp14-panel-b": "sha256:c3803203bc264a83061ea1fb99455fded20c0f86ff34c42e22138b8a4ec1ee88 started=2026-10-04T23:52:02.032420866Z"}
+panel_src_manifest={"wp14-panel": "7d314fada56016a171032414dd79ade5  -", "wp14-panel-b": "7d314fada56016a171032414dd79ade5  -"}
+gate_script_md5=aad132c3a4b6ee298d4432a0db22896a
+elapsed_seconds: 867
 PASS | G5.setup Panel A 管理员可登录
 PASS | G5.setup Panel A 可达
 PASS | G5.setup Panel B 可达（先跑 bootstrap-federation.py）
@@ -86,8 +88,10 @@ PASS | G5.11 阶段 1 失败**没有**留下租约行（补偿/无副作用）
 PASS | G5.11 阶段 1 失败**没有**多占端口
 PASS | G5.11 阶段 2 的空目标被 fail-closed 拒绝（不把「永远不通的链路」下发上去）
 PASS | G5.11 被拒的 apply 没有把租约留成「已激活」
-PASS | G5.16 为远端出口准备唯一一条 active grant（多于一条会被 fail-closed 拒绝）
+PASS | G5.16 该 peer 上此刻**恰好一条**可用 grant（多于一条时 rollout 会被 fail-closed 拒绝）
 PASS | G5.16 A 上创建声明远端出口（federated_egress_peer=B）的 RELAY Forward
+PASS | G5.16 创建请求返回后 Forward 的 apply_status 能稳定下来（不长期 pending/applying）
+PASS | G5.16 该 Forward 最终收敛到 active
 PASS | G5.16 出口腿真的被委托出去：本机没有 egress 节点，只有声明
 PASS | G5.16 本机入口端口已分配
 PASS | G5.16 A 侧 federation_placement 出现该 (peer, intent_id) 行
@@ -98,6 +102,9 @@ PASS | G5.16 placement 记录了 host 决定的 lease_ref（不是 home 猜的�
 PASS | G5.16 B 侧 lease active 且 applied_revision 已落库
 PASS | G5.16 host 侧**真实 runtime** 出现在节点自己的上报里
 PASS | G5.16 数据面：经 A 的入口端口真的到达远端出口腿后面的 target-a（由 wp14-client 发起）
+PASS | G5.16 远端腿建立 120s 后**仍在服务**（host 的 desired 快照必须包含这条联邦腿）
+PASS | G5.16 host 侧 Agent 不再把联邦腿当成「不在权威 desired 里」而剪掉（task-12 的直接对照）
+PASS | G5.16 该腿在整个稳定窗口结束时仍可连（不出现「建立后短命」）
 PASS | G5.16 停掉 B 后 A 侧 placement → degraded（不静默、不假装 active）
 PASS | G5.16 degraded 带可解释错误码
 PASS | G5.16 错误码在契约 §6 闭集内
@@ -106,7 +113,7 @@ PASS | G5.16 A 侧也没有出现本地出口 runtime（不回落）
 PASS | G5.16 B 恢复上线
 PASS | G5.16 恢复后按 (intent_id, revision) 收敛（applied 追上 desired）
 PASS | G5.16 恢复后 B 侧租约仍是同一条 active
-FAIL | G5.16 恢复后数据面重新可用（同一条链路） [[docker exec wp14-client sh -c 'nc -w 6 172.31.10.20 21000 </dev/null 2>&1 | head -c 64'] raw='' tunnel={"mode": "relay", "apply_status": "active", "listen_port": 21000, "config_revision": 1, "applied_revision": 1, "ingress_node_id": 3, "egress_node_id": 0, "federated_egress_peer": "ed2a8609-7d9c-41ba-bebd-3a97c52053d8", "protocol": "tcp", "raw": "relay|active|21000|1|1|3|0|ed2a8609-7d9c-41ba-bebd-3a97c52053d8|tcp"} local_runtimes=[{"id": "tunex-2-egress", "mode": "EGRESS", "targets": [{"host": "target-b", "port": 3030, "order": 1000, "weight": 1}], "next_hop": "", "protocol": "tcp", "revision": 1, "egress_port": 22000, "lb_str]
+PASS | G5.16 恢复后数据面重新可用（同一条链路）
 PASS | G5.12 home(A) 侧有 Forward 级 placement 账本行（reconnect reconcile 的对象）
 PASS | G5.12 该 placement 的 applied_revision 追上 desired_revision（对账收敛）
 PASS | G5.12 不在 active 时必须有可解释原因（不带理由的状态漂移=不可解释）
@@ -173,7 +180,7 @@ PASS | G5.19 远端腿先真的 active
 PASS | G5.19 停机前数据面是通的（否则后面的断言没有对照）
 PASS | G5.19 租约在 B 停机期间离开 live 状态（host 侧 fail-closed）
 PASS | G5.19 B 恢复上线
-FAIL | G5.19 远端腿已过期且数据面不通时，Forward **不得**继续声称 active（不许静默假活） [tunnel={"mode": "relay", "apply_status": "active", "listen_port": 21004, "config_revision": 1, "applied_revision": 1, "ingress_node_id": 3, "egress_node_id": 0, "federated_egress_peer": "ed2a8609-7d9c-41ba-bebd-3a97c52053d8", "protocol": "tcp", "raw": "relay|active|21004|1|1|3|0|ed2a8609-7d9c-41ba-bebd-3a97c52053d8|tcp"} placement={"state": "expired", "desired_revision": 1, "applied_revision": 1, "lease_ref": "5e8392cd-5255-4532-a003-4140197a0d2b", "lease_epoch": 1, "peer_port": 22000, "peer_node_ref": "1", "last_error_code": "lease_expired", "tunnel_id": 15, "raw": "expired|1|1|5e8392cd-5255-4532-a003-4140197a0d2b|1|22000|1|lease_expired|15"} probe=[docker exec wp14-client sh -c 'nc -w 6 172.31.10.20 21004 </dev/null 2>&1 | head -c 64'] raw='']
+PASS | G5.19 远端腿已过期且数据面不通时，Forward **不得**继续声称 active（不许静默假活）
 PASS | G5.19 清理这条 Forward fixture
 PASS | G5.17 删除声明远端出口的 Forward
 PASS | G5.17 删除后远端租约被释放（不是留成 active 的孤儿）
@@ -207,4 +214,4 @@ PASS | G5.3 撤销后**重新走带外 token 可以重建信任**（契约 §2.4
 PASS | G5.3 重建后 B 侧只有一条 trusted 行持有真实 panel_id
 PASS | G5.3 重建信任后新密钥立刻可用
 PASS | G5.3 撤销前那把旧密钥**不复活**（重建信任只写新公钥）
-V5-G5 TOTAL PASS=199 FAIL=2
+V5-G5 TOTAL PASS=206 FAIL=0

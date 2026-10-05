@@ -282,3 +282,79 @@ placement 行，并把两侧 revoked/pending 的 peer 行清掉后重跑 bootstr
 
 证据头部会记录这一轮读数对应**哪一版代码**：镜像 ID + 构建时间 + 两个 panel 容器实际使用的
 镜像 digest 与启动时间。容器里没有 `git`，checkout 的 commit 由汇报里给出。
+
+### 7.7 把 G5 放进 CI 需要什么（清单）
+
+这一节是给"下一轮要复现它的人"看的：下面每一条都是**实际踩过**才写下来的，不是设计意图。
+
+**A. runner（不能是宿主机）**
+
+G5 必须在容器里跑。宿主机有两件事做不到：看不到 `internal` 的数据网，也够不到容器名 DNS。
+
+| 要求 | 为什么 | 实际值（本仓库） |
+| --- | --- | --- |
+| 挂 docker socket | 门禁要 `docker exec/inspect` 真实容器、看真实 Agent 上报 | `-v /var/run/docker.sock:/var/run/docker.sock` |
+| docker CLI + compose 插件 | `docker exec wp14-mysql mysql …`、G0 要 `compose up --force-recreate` | `-v /usr/bin/docker`, `-v /usr/libexec/docker/cli-plugins` |
+| 接 `wp14_ctrl` | 面板 / MySQL / Redis 都在这张网上（`panel:3000`、`mysql`、`redis`） | `--network wp14_ctrl` |
+| **再接两张数据网** | G4 的数据面断言由 runner **自己开 socket** 连 `172.31.10.20`；G5/G0 虽然借 `wp14-client`，但同一 runner 跑全套就必须具备 | `wp14_ingress_data` + `wp14_egress_data` |
+| `python3` / `openssl` / `curl` | 门禁本体 / 证书 / 健康检查 | 镜像 `tunex-e2e-runner:ci` |
+| 仓库在内 | 脚本、`state.json`、`.env.wp14`、`.passwords.env` | 宿主机 `tar` 同步到容器 `/repo` |
+
+```bash
+# 本仓库实际用的 runner（与 tunex-e2e 同镜像，额外接两张数据网）
+docker run -d --name tunex-g5-runner --network wp14_ctrl \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /usr/bin/docker:/usr/bin/docker \
+  -v /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins \
+  -v /workspace/TuneX:/workspace/TuneX tunex-e2e-runner:ci sleep infinity
+docker network connect wp14_ingress_data tunex-g5-runner
+docker network connect wp14_egress_data tunex-g5-runner
+# 预检：两条数据面各探一次（探不到就是 runner 的问题，不是产品的）
+docker exec tunex-g5-runner python3 -c "
+import socket
+for ip,p in (('172.31.10.20',21001),('172.31.20.20',22000)):
+    s=socket.create_connection((ip,p),timeout=5); s.sendall(b'x'); print(ip,p,s.recv(32))"
+```
+
+**B. Panel B 需要的额外资源（bootstrap 会建，CI 要知道它们存在）**
+
+- 独立数据库 `tunex_b`（**不能**与 A 共用 `tunex`：那会让"两个面板"变成一份真相）
+- 独立 Redis db index `redis://redis:6379/2`（避免与 A 抢锁）
+- `wp14-panel-b`（`wp14-backend:ci`，ctrl + 别名 `panel-b`，`FEDERATION_PUBLIC_URL=http://panel-b:3000`）
+- **`wp14-worker-b`（必需，不是可选）**：联邦的"租约到期 host 主动停服"挂在 worker 的
+  `cron_reconcile_v3`（everyMs=30s）。没有它，A 侧/ B 侧的到期收口永远不会发生
+- `wp14-agent-b1`（`wp14-agent:ci`，指 `http://panel-b:3000`，ctrl + egress 数据网静态 IP）
+- 两侧管理员凭据：A 用 `state.json` + `.passwords.env`；B 由 bootstrap 建（邮箱固定）
+
+**C. 迁移（两个面板各自跑）**
+
+- A 侧：`--force-recreate` **不会** apply 迁移，必须 `docker compose … run --rm db-migrate`（对 `tunex`）
+- B 侧：`bootstrap-federation.py` 每轮都跑 `prisma migrate deploy`（对 `tunex_b`，幂等）
+- 跑前预检：两侧都必须存在 `tunnel.federated_egress_peer`（G5.setup 里有这条断言）
+
+**D. 环境变量**
+
+- 所有 Gate 都必须显式 `API=http://panel:3000`：既有 harness 默认 `http://127.0.0.1:18180`
+  （那在容器里必然不通，症状是"每条断言都 401/连不上"）
+- `FED_PANEL_B_API` 默认已是 `http://panel-b:3000`；`FED_SKIP_BUILD=1` 可跳过 bootstrap 的镜像重建
+
+**E. 时间与预算**
+
+| 项 | 量级 |
+| --- | --- |
+| G5 单轮（19 场景，含停/启容器与到期等待） | ~15 min（`G5_OVERALL_SECONDS` 默认 5400s） |
+| 幂等证据（同版本连跑两遍） | ~30 min |
+| G0 / G4 | 各自独立计时，且都会 stop/start 拓扑 |
+
+**F. 破坏性操作（CI 必须独占拓扑，且跑完要校验恢复）**
+
+- G5：stop/start `wp14-panel`（A）与 `wp14-panel-b`（B）——`finally` 里无条件启回
+- G0：stop/start panel+worker，`--force-recreate` 两个 agent（`--no-deps`）
+- G4：stop 中间跳 agent，然后启回
+- 因此**不能**与其他 job 并行；G5 放在回归门禁之前跑还有一个附带好处：跑完就证明它没留下残留
+
+**G. 判定口径**
+
+- 末行 `V5-G5 TOTAL PASS=n FAIL=m`；证据头部记录 checkout commit + 镜像 digest/构建时间 + 两个 panel 容器实际使用的镜像与启动时间
+- 同一 checkout 连跑两遍，`PASS/FAIL` 文本序列必须**逐行一致**（跑出来不一致就不是 CI 可用的门禁）
+- `scripts/v3-e2e/evidence/` 是生成目录（gitignore）；要长期留存请由 CI 作为 artifact 上传，或 snapshot 到 `docs/evidence/`
