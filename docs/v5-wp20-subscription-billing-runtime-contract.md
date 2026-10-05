@@ -948,6 +948,37 @@ me-capabilities-route / workspace-rbac-v4 / traffic-pipeline）**全部复跑 0 
 
 ---
 
+### 5.10 交付索引（一页）
+
+> ⑨ 项记录（§5.1–§5.9）压成一页。**一个 WP 一个提交**；每条都能独立复核（提交 + 断言 + 证据）。
+
+| WP | 提交 | 交付物 | 关键断言 / 证据 |
+|---|---|---|---|
+| WP20-1 计费时钟 | `0ea812f` | `services/billing-time.ts`（4 个纯函数）+ 3 名字段金样本 | 24 断言；**三进程时区输出逐字相等**（子进程真跑） |
+| WP20-2 账本与归属 schema | `94d89ec`（schema 增量部分随 `9d86c08` 落地） | `PlanSubscription`、`SubscriptionPeriodSettlement`、`PlanOrder.workspace_id`、migration `20261031` | 20 断言（DoD 7 枚举不变 + 唯一键 + 纯 additive + 跨迁移重复建表守卫） |
+| WP20-3 周期结算 tick | `1649611` | `services/subscription-billing.ts` + `worker.ts` 的 `cron_settle_billing` | DoD 4（连跑两轮零动作）/ DoD 5（接管恰好一次）：44 断言 |
+| WP20-4 支付 → 发放 + 续期 | `2fca809` | `grantPolicyFromPurchase` + `subscription-purchase.ts` + `Plan.policy_id` + 续期执行器 | DoD 2 按**函数名**钉住两处写入点；续期幂等锚点 = 账本 `order_id`：104 断言 |
+| WP20-4b 套餐 ↔ 策略绑定入口 | `0a4f99a` | `services/plan-subscription.ts` + 套餐 CRUD + 只读选项端点 + 前端字段 | "**能真的绑上，且绑上后发放分支被触发**"（端到端）+ 三处接线守卫：14 断言 |
+| WP20-5 到期降级与可观测 | `c632ea2` | `buildUsageExpiryView` + 两条读路径 + 前端 `PlanExpiryNotice` | **DoD 6**（宽限 / 降级 / fail-closed / 边界 / 撤销）：17 + 5 断言 |
+| WP20-6 流量口径统一 | `b346521` + `a073b33` | 三处日/月界收敛到 `billing-time`；`traffic_used` 读路径切换；联邦缺口字段 | **DoD 8**；三时区复跑；跨模块逐字相等：19 断言 |
+| WP20-6b `/api/me/capabilities` | `dac8116` | `routes/me.ts` + `app.ts` 挂载 | 端点可达三重确认（机械守卫 + 具体前缀 + 中间件链）：2 断言 |
+| 额度周期语义修正 | `2152a00` | `capability-policy.ts` 累计从第一条策略起折 | 纯函数 6 条 + 门禁 G7.9e/f/g（**跨月复位**：10 月 222 / 11 月 777） |
+| 缓存时间观修正 | `4483205` | `noCache` 不再写缓存；TTL 改墙钟 | 新增守卫并**验证它会红**（临时还原 ⇒ FAIL）；8 个受影响套件复跑 0 fail |
+| V5-G7 门禁 | `cc2a3c6` | `scripts/v3-e2e/v5-g7.py`（自带一次性环境）+ 证据 | **33 断言全绿**（真 MySQL）；G7.7/G7.8 不覆盖并附理由 |
+| DoD 11 登记 | `2b91f0c` | `DEVELOPMENT.md` §4.1 子项状态 + §6.2 计费指针 | 同时修掉一条**已过期**的既有缺陷登记（"没有支付→发放接线"） |
+
+**当前测试面**：`bun test src/services/__tests__/v5-wp20/` → **155 pass / 0 fail / 593 断言**（9 个文件）。
+**DoD 状态**：**1–9 全部关闭**；10（真拓扑 e2e）由既有门禁覆盖、本契约不改任何既有断言；11 见上表。
+
+**本 WP 抓到的两条既有缺陷**（都不是 WP20 引入，都已在会话内修 + 留痕）：
+1. `unionLimits` 的周期初值是"恒胜元" ⇒ **月额度永不复位**（§5.9 前半，`2152a00`）；
+2. 策略缓存把"缓存的到期"与"策略的计算时刻"混成一个时间 ⇒ 判定侧（`noCache`）反而污染展示路径（§5.9 后半，`4483205`）。
+
+**明确未做**（避免"看起来都做了"）：`≤10 分钟计量滞后`的产品文案（措辞属产品决策）；
+`Plan.policy_id` 的批量/CLI 绑定入口（Lead 裁决不立项）；WP20-7 流量倍率（需 O3 选 B）。
+
+---
+
 ## 7. Gate 映射（`scripts/v3-e2e/`）与时间夹具
 
 ### 7.1 新增 Gate `v5-g7.py`（Billing Runtime Gate）
