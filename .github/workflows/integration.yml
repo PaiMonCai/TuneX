@@ -81,6 +81,13 @@ jobs:
       # blocker, not a report — a red G0 is the gate doing its job.
       - name: Run V5-G0 contract compatibility gate
         run: python3 scripts/v3-e2e/v5-g0.py
+      # V5.1a / V5.1b protocol gates must run on the FINAL PR tree, not only be
+      # carried as historical evidence from the development branch. G1B imports
+      # G1A as its shared harness, so keep them adjacent and sequential.
+      - name: Run V5-G1A TLS and WebSocket protocol gate
+        run: python3 scripts/v3-e2e/v5-g1a.py
+      - name: Run V5-G1B UDP protocol and relay gate
+        run: python3 scripts/v3-e2e/v5-g1b.py
       # V5.4 / G4 is the relevant merge gate for the middle-hop work on this
       # branch. Keep it in the same real four-Agent topology so restart,
       # compensation, orphan-port cleanup and three-hop data flow are verified
