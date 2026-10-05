@@ -10,7 +10,7 @@
 import { db } from "../db.ts";
 import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, type CommandEnvelope } from "./control-protocol/index.ts";
-import { admitPersistedProtocol, firstConnectIp } from "./forward-contract.ts";
+import { admitPersistedProtocol, datagramHopPeerFor, firstConnectIp } from "./forward-contract.ts";
 import {
   targetHealthWireEntries,
   type TargetHealthWireEntry,
@@ -892,8 +892,11 @@ export interface DesiredRowProjection {
   egress_port: number | null;
   egress_node?: { connect_ip: string | null } | null;
   middle_node?: { connect_ip: string | null } | null;
-  /** V5.1b WP5-B2：datagram 出口的取证地址来自**入口**节点。 */
-  ingress_node?: { connect_ip: string | null } | null;
+  /** V5.1b WP5-B2：datagram 出口的取证地址来自**入口**节点（优先用它的上报）。 */
+  ingress_node?: {
+    connect_ip: string | null;
+    state_report?: { tunnels?: unknown } | null;
+  } | null;
   egress_pool?: { lb_strategy: string | null; targets: Array<{ host: string; port: number; weight: number; order_by: number }> } | null;
   /** 当前节点为该 Forward 持有的 active 物理端口租约；中间跳恢复用它找自己的 listener。 */
   port_leases?: Array<{ node_id: number; port: number; status: string }>;
@@ -1024,7 +1027,14 @@ export function desiredTunnelConfigFor(
     const healthForTargets = health.filter((h) =>
       poolTargets.some((t) => t.host === h.host && t.port === h.port),
     );
-    const hopPeer = protocol === "udp" ? firstConnectIp(row.ingress_node?.connect_ip ?? null) : null;
+    const hopPeer =
+      protocol === "udp"
+        ? datagramHopPeerFor({
+            ingressRuntimeId: `tunex-${row.id}-relay`,
+            ingressConnectIp: row.ingress_node?.connect_ip ?? null,
+            ingressReportedTunnels: row.ingress_node?.state_report?.tunnels,
+          })
+        : null;
     return {
       kind: "config",
       config: {
@@ -1234,7 +1244,9 @@ export async function buildDesiredNodeSnapshot(
       // RESTARTS rebuilds its runtime from this snapshot — a snapshot without
       // `hop_peer` would leave a datagram exit refusing to build after every
       // restart, which is precisely the class of bug V5-G2 found on health.
-      ingress_node: { select: { id: true, connect_ip: true } },
+      // V5.1b WP5-B2：`state_report` 一起带出来，因为**真正为真的**取证地址是入口自己
+      // 上报的跳端点（多宿节点上 `connect_ip` 是错的——见 forward-contract 的说明）。
+      ingress_node: { select: { id: true, connect_ip: true, state_report: { select: { tunnels: true } } } },
       // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
       // its next_hop, while the middle node needs its own lease to restore its
       // EGRESS-shaped transit runtime. Keep all active leases for this Forward;

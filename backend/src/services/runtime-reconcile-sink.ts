@@ -32,7 +32,7 @@
  * `defaultReconcileDeps`、`forward-rollout-recovery.ts` 的
  * `defaultRolloutResumeDeps` 同口径）。
  */
-import type { Orchestrator, OrchestratorNode } from "./orchestrator.ts";
+import { Orchestrator, type OrchestratorNode } from "./orchestrator.ts";
 import { dispatchFactsFromRow, persistedForwardProtocol } from "./forward-contract.ts";
 import type { ReconcileSink } from "./reconciler.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
@@ -86,7 +86,13 @@ export interface SinkTunnel {
   remote_port: number | null;
   egress_port: number | null;
   egress_pool_id: number | null;
-  ingress_node: (OrchestratorNode & { node_group_id: number }) | null;
+  ingress_node:
+    | (OrchestratorNode & {
+        node_group_id: number;
+        /** V5.1b WP5-B2：入口上报的跳端点藏在这里（`diag.hop_local_addr`）。 */
+        state_report?: { tunnels?: unknown } | null;
+      })
+    | null;
   egress_node: (OrchestratorNode & { node_group_id: number; lb_strategy?: string | null }) | null;
   /** V5.4：三跳路由的中间节点；null = 单跳。 */
   middle_node_id?: number | null;
@@ -155,7 +161,7 @@ export function createTunnelLedger(loadDb: () => Promise<ReconcileSinkDb> = pris
       const tunnel = await db.tunnel.findUnique({
         where: { id: tunnelId },
         include: {
-          ingress_node: true,
+          ingress_node: { include: { state_report: { select: { tunnels: true } } } },
           egress_node: true,
           middle_node: true,
           port_leases: {
@@ -296,6 +302,8 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
           tunnel_type: tunnel.tunnel_type,
           tls_cert_path: tunnel.tls_cert_path,
           tls_key_path: tunnel.tls_key_path,
+          // V5.1b WP5-B2：取证地址优先用入口**上报**的跳端点（多宿节点上 connect_ip 是错的）。
+          ingress_runtime_id: Orchestrator.relayTunnelId(tunnel.id),
           // V5.1b WP5-B2: the reconcile replay is a SECOND delivery path for the
           // same fact — a replayed datagram exit must carry the same attestation
           // address the original dispatch did (the repo has paid for this lesson
@@ -344,6 +352,9 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         tunnel_type: tunnel.tunnel_type,
         tls_cert_path: tunnel.tls_cert_path,
         tls_key_path: tunnel.tls_key_path,
+        // V5.1b WP5-B2：重放是同一份事实的第二条投递路径，取证地址必须与首次下发一致
+        //（优先用入口**上报**的跳端点——多宿节点上 connect_ip 是错的）。
+        ingress_runtime_id: Orchestrator.relayTunnelId(tunnel.id),
         ingress_node: tunnel.ingress_node,
       });
       if (relayFacts === null) {

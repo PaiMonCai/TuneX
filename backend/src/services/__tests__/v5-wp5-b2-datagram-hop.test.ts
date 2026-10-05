@@ -15,7 +15,7 @@ import { describe, expect, test } from "bun:test";
 
 import { Orchestrator, type AgentTunnelConfig, type OrchestratorNode } from "../orchestrator.ts";
 import type { AgentTransport } from "../orchestrator.ts";
-import { dispatchFactsFromRow } from "../forward-contract.ts";
+import { datagramHopPeerFor, dispatchFactsFromRow } from "../forward-contract.ts";
 
 describe("V5.1b WP5-B2: dispatch facts carry the datagram exit's attestation address", () => {
   test("udp: the address comes from the INGRESS node, picked the same way next_hop is", () => {
@@ -121,5 +121,81 @@ describe("V5.1b WP5-B2: a datagram exit without an attested ingress is refused b
     const outcome = await orchestrator.dispatchEgress(egressInput({ protocol: "tcp", hopPeer: "10.0.0.3" }));
     expect(outcome.ok).toBe(true);
     expect(transport.configs[0]!.hop_peer).toBeUndefined();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+
+/**
+ * V5.1b WP5-B2（契约 §12.5 回填第 8 条）：出口取证的地址**优先用入口上报的跳端点**。
+ *
+ * 为什么不是 `connect_ip`：多宿节点上跳的源地址由内核按路由选，可能是面板不知道的那张网。
+ * 真拓扑实测：入口从出口网地址发出、面板却告诉出口接受它的入口网地址 ⇒ 出口把每个跳报文
+ * 都当陌生来源丢弃（`ingress packets_in=1` / `egress drops=1, packets_in=0`）。
+ */
+describe("V5.1b WP5-B2: the exit attests the address the ingress REPORTED using", () => {
+  const reportWithEndpoint = (id: string, endpoint: string) => [
+    { id: "tunex-2-egress", diag: { hop_local_addr: "10.9.9.9:1111" } },
+    { id, diag: { hop_local_addr: endpoint } },
+  ];
+
+  test("the reported hop endpoint wins over connect_ip, and only its ADDRESS is used", () => {
+    expect(
+      datagramHopPeerFor({
+        ingressRuntimeId: "tunex-42-relay",
+        // The panel-known address is the WRONG one on a multi-homed node.
+        ingressConnectIp: "172.31.10.20",
+        ingressReportedTunnels: reportWithEndpoint("tunex-42-relay", "172.31.20.10:53121"),
+      }),
+    ).toBe("172.31.20.10");
+  });
+
+  test("the port is stripped, never pinned: an ingress restart must not change the exit's config", () => {
+    const first = datagramHopPeerFor({
+      ingressRuntimeId: "tunex-42-relay",
+      ingressConnectIp: null,
+      ingressReportedTunnels: reportWithEndpoint("tunex-42-relay", "172.31.20.10:53121"),
+    });
+    const afterRestart = datagramHopPeerFor({
+      ingressRuntimeId: "tunex-42-relay",
+      ingressConnectIp: null,
+      // Same ingress, new runtime → new ephemeral port, same address.
+      ingressReportedTunnels: reportWithEndpoint("tunex-42-relay", "172.31.20.10:60999"),
+    });
+    expect(afterRestart).toBe(first);
+  });
+
+  test("an IPv6 endpoint keeps its address and loses the bracket", () => {
+    expect(
+      datagramHopPeerFor({
+        ingressRuntimeId: "tunex-42-relay",
+        ingressConnectIp: null,
+        ingressReportedTunnels: reportWithEndpoint("tunex-42-relay", "[fd00::10]:53121"),
+      }),
+    ).toBe("fd00::10");
+  });
+
+  test("no report yet (or no matching leg) falls back to connect_ip", () => {
+    expect(
+      datagramHopPeerFor({ ingressRuntimeId: "tunex-42-relay", ingressConnectIp: "172.31.10.20", ingressReportedTunnels: [] }),
+    ).toBe("172.31.10.20");
+    expect(
+      datagramHopPeerFor({
+        ingressRuntimeId: "tunex-42-relay",
+        ingressConnectIp: "172.31.10.20",
+        // A report that only knows about OTHER tunnels must not be mistaken for this one.
+        ingressReportedTunnels: [{ id: "tunex-7-relay", diag: { hop_local_addr: "172.31.20.99:1" } }],
+      }),
+    ).toBe("172.31.10.20");
+  });
+
+  test("a leg whose diag has no endpoint yet also falls back", () => {
+    expect(
+      datagramHopPeerFor({
+        ingressRuntimeId: "tunex-42-relay",
+        ingressConnectIp: "172.31.10.20",
+        ingressReportedTunnels: [{ id: "tunex-42-relay", diag: null }],
+      }),
+    ).toBe("172.31.10.20");
   });
 });

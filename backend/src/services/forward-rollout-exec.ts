@@ -1472,16 +1472,23 @@ async function dispatchFactsFor(
       // INGRESS node, so the facts read it here. Every dispatch site that already
       // uses this helper therefore gets `hopPeer` without re-deriving it — two
       // sites deriving it is how the two legs would name different addresses.
-      ingress_node: { select: { connect_ip: true } },
+      //
+      // `state_report` rides along because the address that is actually TRUE is the
+      // one the ingress reported using (`hop_local_addr`), not its `connect_ip`:
+      // on a multi-homed node those differ, and using `connect_ip` made the exit
+      // drop every hop packet.
+      ingress_node: { select: { connect_ip: true, state_report: { select: { tunnels: true } } } },
     },
   })) as {
     forward_protocol?: unknown;
     tunnel_type?: unknown;
     tls_cert_path?: unknown;
     tls_key_path?: unknown;
-    ingress_node?: { connect_ip?: unknown } | null;
+    ingress_node?: { connect_ip?: unknown; state_report?: { tunnels?: unknown } | null } | null;
   } | null;
-  return row ? dispatchFactsFromRow(row) : null;
+  return row
+    ? dispatchFactsFromRow({ ...row, ingress_runtime_id: Orchestrator.relayTunnelId(tunnelId) })
+    : null;
 }
 
 function nodeFor(orchestrator: Orchestrator, nodeId: number): Parameters<Orchestrator["removeTunnel"]>[0]["node"] {

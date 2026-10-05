@@ -64,6 +64,7 @@ import {
   DEFAULT_FORWARD_PROTOCOL,
   admitPersistedProtocol,
   buildForwardRuntimePlan,
+  datagramHopPeerFor,
   firstConnectIp,
   forwardRuntimePlanViolations,
   normalizeForwardProtocol,
@@ -497,6 +498,10 @@ export interface SchedulableNode {
   node_id: string;
   role: "ingress" | "egress" | "both" | null;
   connect_ip: string | null;
+  /** V5.1b WP5-B2：入口上报的跳端点藏在这里（`tunnels[].diag.hop_local_addr`）。
+   *  取证地址必须优先用它——多宿节点上 `connect_ip` 指的是**另一张网**的地址，
+   *  出口会因此把每个跳报文都丢弃（真拓扑实测）。 */
+  state_report?: { tunnels?: unknown } | null;
   /** 端口分配区间；NULL 由 portPool 判 `node_range_unset`。 */
   port_range_min: number | null;
   port_range_max: number | null;
@@ -1034,6 +1039,8 @@ export async function createRelayTunnel(
     store.node.findMany({
       where: { node_group_id: input.inNodeGroupId },
       orderBy: { id: "asc" },
+      // 取证地址要看入口**上报**的跳端点，所以候选查询必须带出上报。
+      include: { state_report: { select: { tunnels: true } } },
     }),
     store.node.findMany({
       where: { node_group_id: input.outNodeGroupId },
@@ -1278,7 +1285,12 @@ export async function createRelayTunnel(
     // V5.1b WP5-B2: a datagram exit must be told who may feed it. This is the
     // same `connect_ip` the ingress leg uses for its `next_hop` — one hop, one
     // address, picked by the same helper.
-    hopPeer: firstConnectIp(ingressPick.node.connect_ip),
+    hopPeer: datagramHopPeerFor({
+      // 入口**上报**的跳端点优先；没有上报（还没跑过一拍）才回落 connect_ip。
+      ingressRuntimeId: Orchestrator.relayTunnelId(tunnelId),
+      ingressConnectIp: ingressPick.node.connect_ip,
+      ingressReportedTunnels: ingressPick.node.state_report?.tunnels,
+    }),
   });
   if (!egressDispatch.ok) {
     // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。
@@ -1581,7 +1593,11 @@ export async function reapplyRelayTunnel(
 
   /* ---------------- ③ bind nodes ---------------- */
   const [inCandidatesRaw, outCandidatesRaw] = await Promise.all([
-    store.node.findMany({ where: { node_group_id: inNodeGroupId }, orderBy: { id: "asc" } }),
+    store.node.findMany({
+      where: { node_group_id: inNodeGroupId },
+      orderBy: { id: "asc" },
+      include: { state_report: { select: { tunnels: true } } },
+    }),
     store.node.findMany({ where: { node_group_id: outNodeGroupId }, orderBy: { id: "asc" } }),
   ]);
   // Initial apply may schedule from the group. Once concrete placement exists,
@@ -1841,7 +1857,12 @@ export async function reapplyRelayTunnel(
     // exactly what the orchestrator's fail-closed check is for. `reapplyRelayTunnel` is
     // the SECOND delivery path for an egress leg; a fact that only one of them carries
     // is a fact that works until the day the other one runs.
-    hopPeer: firstConnectIp(ingressPick.node.connect_ip),
+    hopPeer: datagramHopPeerFor({
+      // 入口**上报**的跳端点优先；没有上报（还没跑过一拍）才回落 connect_ip。
+      ingressRuntimeId: Orchestrator.relayTunnelId(tunnelId),
+      ingressConnectIp: ingressPick.node.connect_ip,
+      ingressReportedTunnels: ingressPick.node.state_report?.tunnels,
+    }),
   });
   if (!egressDispatch.ok) {
     await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
