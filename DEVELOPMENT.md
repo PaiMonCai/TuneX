@@ -16,7 +16,7 @@
 
 ### 0.1 main 状态
 
-V4.5 已完成技术闭环，V4 功能范围冻结。V5.0–V5.4 已完成并通过硬门禁；当前进入 V5.5 前置的 Console / Route Profile 产品架构冻结。
+V4.5 已完成技术闭环，V4 功能范围冻结；V5-WP0 已进入 main。当前活动发布候选为 **PR #32 / `feature/v5-1b-udp-relay`**：V5.1–V5.5 主线与 WP17–WP21 的交付正在一次性收口。历史 Gate 证据已覆盖 G0/G1A/G1B/G2/G3/G4/G5/G6/G7；PR 合并前仍以“最终 head 的 Source CI + PR fast Integration 全绿”为放行条件。
 
 已验证发布链：
 
@@ -52,13 +52,11 @@ WP0 落地内容（已冻结，改动它等于破坏 V5.0 契约）：
 - Agent ForwardProtocol typed contract（`agent/internal/forwarder/interface.go`）；
 - LKG/snapshot 入口解析协议并 fail-closed；
 - unsupported_protocol 前端可行动错误文案；
-- 未实现 UDP / TLS / WS / QUIC。
+- WP0 合入时未实现 UDP / TLS / WS / QUIC；**这是 WP0 的历史冻结点，不是当前能力状态**。后续 V5.1 已实现 TLS / WS / UDP（含单跳 UDP RELAY），QUIC 仍关闭。
 
 **接手 Agent 的第一件事不是重做 WP0，而是确认它仍在 main 上生效。**
 
-当前接手点：**V5-WP13.5 Console Split / Route Profile Contract Freeze**（见 §9.4）。
-
-V5.5 Federation 仍是下一项分布式能力，但 **WP14 不得早于 §9.4 的产品边界冻结进入实现**。
+当前接手点：**PR #32 merge closure / 产品化收口**。Console Split、Route Profile、Federation、DDNS、公告/通知基础、延迟观测、订阅计费与安装器均已进入代码；不要按旧章节标题重复实现已经交付的 WP。当前真实缺口与下一步统一看 §17。
 
 接手新工作前的固定动作（§3.2）：
 
@@ -398,19 +396,18 @@ V5.5 Federation
 | V5-WP4 / G0 | **GREEN：PASS=137 / FAIL=0** | 真实四 Agent 拓扑，452s |
 | V5.1+ | **UNBLOCKED** | G0 全绿，按 §6 顺序开始 V5.1a WS/TLS |
 
-### 4.1 V5.6+ 候选（**契约已落，实现未开工**）
+### 4.1 V5.6+ 产品化扩展（**已进入交付 / 收口**）
 
-> 这五份契约在 2026-10-05 由并行子代理产出、Lead 复核并冻结了各自的开放决策。
-> 它们**尚未登记过路线表**，接手 Agent 会找不到——本节就是登记处。**纪律不变**：
-> 一次一个 WP、契约先于实现、每个能力自带 DoD 与 Gate。
+> 这五个 WP 已不再是“只写了契约”的候选项。当前状态以代码、Gate 与各契约的交付记录为准。
+> 纪律不变：一次一个 WP、契约先于实现、运行时能力必须回到既有 Forward desired/revision/reconcile 链。
 >
-> | WP | 主题 | 契约（单一真相） | 状态 |
+> | WP | 主题 | 契约（单一真相） | 当前状态 |
 > |---|---|---|---|
-> | WP17 | 入口/出口组（= Route Profile 的 selector 形态） + DDNS 联动 | `docs/v5-wp17-entry-exit-group-ddns-contract.md` | 契约冻结（D1–D4 已裁决）；新增 Gate **V5-G6** |
-> | WP18 | 公告系统 + 通用通知渠道 | `docs/v5-wp18-announcements-notifications-contract.md` | 契约冻结（O1–O4 已裁决） |
-> | WP19 | 延迟观测 / 链路拓扑 / Looking Glass | `docs/v5-wp19-latency-observability-contract.md` | 契约冻结（O1–O4 已裁决）；**先做 WP19-F**（既有缺陷收口） |
-> | WP20 | 订阅周期与流量周期结算运行时 | `docs/v5-wp20-subscription-billing-runtime-contract.md` | **已交付**（2026-10-05，见契约 §5.1–§5.9）；门禁 **V5-G7** 33 断言全绿 |
-> | WP21 | 一键安装器（+ 文档站/加速器：**本期均不立项**） | `docs/v5-wp21-installer-and-docs-site-contract.md` | 契约冻结（OPEN-1…OPEN-5 已裁决） |
+> | WP17 | 入口/出口组（Route Profile selector）+ DDNS 联动 | `docs/v5-wp17-entry-exit-group-ddns-contract.md` | **DONE**：17.1–17.5 已交付；Gate **V5-G6 = 72/0** |
+> | WP18 | 公告系统 + 通用通知渠道 | `docs/v5-wp18-announcements-notifications-contract.md` | **MOSTLY DONE**：公告、Email/Webhook/Telegram、账本/RBAC 已落地；剩事实类 Forward 拒绝/恢复触发器接入 worker reconcile |
+> | WP19 | 延迟观测 / 链路拓扑 / Looking Glass | `docs/v5-wp19-latency-observability-contract.md` | **PARTIALLY DONE**：diag、历史、拓扑、Looking Glass 已落地；延迟历史 Web 图表待补；带宽压测明确不做 |
+> | WP20 | 订阅周期与流量周期结算运行时 | `docs/v5-wp20-subscription-billing-runtime-contract.md` | **DONE**：DoD 1–9 关闭；Gate **V5-G7 = 33/0** |
+> | WP21 | 一键安装器（独立文档站/下载加速本期不立项） | `docs/v5-wp21-installer-and-docs-site-contract.md` | **DONE（PR 静态/桩化层）**：bootstrap/install + production docs + installer-static（196 项）；干净宿主机真实安装仍是发布环境验证 |
 >
 > **WP20 子项状态**（契约 §5.1–§5.9；一次一个 WP、每个 WP 一个提交）：
 > WP20-1 计费时钟纯函数 ✅ ｜ WP20-2 账本与归属 schema ✅ ｜ WP20-3 周期结算 tick ✅ ｜
@@ -2984,20 +2981,34 @@ npm run build
 
 ## 12.4 Integration
 
-继续复用当前 workflow：
+从 PR #32 起，CI 分成**开发快线**与**主干/发布全量回归**，不再让每次小提交串行重跑全部历史 Gate：
 
 ~~~text
-V3 baseline
-V4 F1
-V4 F2
-V4 F3
-V4 F4
-V4 F5
-V5 G0
-future V5 G*
+Pull Request
+  Source CI
+    backend / web / agent / race / secret / installer / perf-harness
+  +
+  Fast Integration
+    real topology setup + baseline verify
+    V5-G1B protocol regression
+        ↓
+      merge
+
+main
+  Source CI
+      ↓
+  Full Integration / release qualification
+    V3 baseline
+    V4 rollout + F1/F2/F3/F4/F5
+    V5 G0 / G1A / G1B / G4 / G5
+    unified image smoke
+      ↓
+    Release
 ~~~
 
-新 Gate 应追加，不删除旧 Gate 来换取更快 CI。
+历史 Gate **没有删除**，只是从开发内循环移到 main 的 release qualification。新增 Gate 应按失败面放进合适层：快速且高价值的协议/核心回归可进 PR；重型、多 Panel、破坏性场景放 main / release。不得靠删除断言、skip 或改弱判据换取绿色。
+
+Agent CI 的并发/runtime 安全线固定包含 `go test -race ./...`。Feature branch 不再同时跑 push CI 与 PR CI，避免同一 SHA 重复消耗 runner。
 
 ---
 
@@ -3103,61 +3114,60 @@ Known Boundaries:
 # 17. 当前下一步
 
 ~~~text
-已完成（2026-10-05 收口读数，同一镜像 sha256:c3803203…）：
+历史已验证能力（2026-10-05）：
 V5.0   G0  = 137/0
 V5.1a  G1A = 73/0
-V5.1b  G1B = 76/0（UDP DIRECT）
+V5.1b  G1B = 77/0（UDP DIRECT + 单跳 UDP RELAY；独立拓扑证据）
 V5.2   G2  = 23/0
 V5.3   G3  = 50/0
 V5.4   G4  = 25/0
 V5.5   G5  = 206/0（连跑两遍逐行一致）
+V5.6   G6  = 72/0（DDNS / ingress placement）
+WP20   G7  = 33/0（订阅计费运行时）
 
-已落地（2026-10-05）：
-V5-WP13.5A Console Boundary      —— User/Admin/Auth 边界与两套 Shell，URL 零变化
-V5-WP13.5B Route Profile 冻结    —— 契约 + schema + 编译器 + API + Admin/用户侧页面
-V5-WP14    联邦身份 / 信任 / 签名 —— 身份、一次性握手 + HMAC proof、签名+时间窗+回执幂等、
-                                     轮转（先通知后切换）、撤销（不可逆 + 级联停服 + panel 内即时）、
-                                     撤销后可用新 token 重建信任、两侧审计
-V5-WP15    授予 / 远端租约        —— host 侧租约状态机与真实下发；**home 侧产品级接线**：
-                                     Forward 声明远端出口腿 → 既有 rollout 委托 → placement 镜像
-V5-WP16    用量 / 对账            —— usage_id 去重 + 归因 + 到期/撤销清理 + placement 重发 +
-                                     已收敛行有界探活（degraded/恢复）+ 到期本地终态
-Federation Admin Console         —— Peers / Trust / Grants / Remote Leases / Usage（只在 Admin）
+PR #32 merge-closure 状态：
+- Source CI：最新已完成轮次全绿（backend / web / agent / race / secret / installer / perf）。
+- PR Fast Integration：baseline verify 已绿；G1B 暴露的是 CI harness 自包含问题，不是已确认的数据面回归：
+  ① host-run 环境没有历史 `g0-runner`；
+  ② internal Docker network 未显式填写 IPAM Gateway；
+  ③ G1B 单独运行时此前隐式依赖 G1A 留下的 byte-echo listener。
+- `dbebb2a` 已把 G1B 改成自包含：从运行中 Agent 反查实际 network/subnet 并推导 host bridge 地址，
+  同时由 G1B 自己启动 stream regression 的 echo target。最终 head 仍须重新跑绿后才能合并。
 
-仍阻塞 / 明确不开放：
-V5.1b B2 UDP RELAY —— **已解冻**（2026-10-05 跳形态冻结为 datagram 端到端），
-                     实施规格见契约 §12；剩余未开放的是它的边界：分片重组、
-                     packets 计费、hop 加密、跨面板 UDP 腿；
-V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭；
-跨面板 3+ 跳 / 远端 ingress / 远端 transit / 任意图 / 跨面板自动 failover /
-tls 远端出口 / 多 Panel 信任传递闭包 —— 一律 fail-closed 保持关闭。
+已经落地：
+- User / Admin / Auth Console Boundary + Route Profile；
+- TLS / WS / UDP DIRECT / UDP RELAY；
+- Target Intelligence、HA/fencing、自动 failover/failback、2/3-hop；
+- Federation 的 identity/trust/grant/remote lease/usage + 产品级 remote egress；
+- WP17 DDNS；
+- WP18 公告 + Email/Webhook/Telegram + 投递账本（事实触发器最后接线除外）；
+- WP19 diag / latency history / topology / Looking Glass（Web 历史图表除外）；
+- WP20 subscription billing runtime；
+- WP21 installer + production deploy docs + static/dry-run verification。
 
-下一阶段（按序）：
-1. 把"远端 hop 的更多形态"单独立项：**远端 ingress 的产品级创建路径**（服务层与 HTTP 路由已通，
-   但创建/编辑流程目前只接线远端 egress）、跨面板中间跳 —— 都需要先冻结 apply 契约缺失的那一维
-   （证书路径 / next_hop 语义 / 中间跳的目标池）；
-2. 把 G5 纳入 CI 常跑（脚本已幂等，README §7.7 记了需要什么：第二个 Panel 的独立 DB/Redis/worker、
-   两张数据网、宿主端口与 `API` 显式设置）；G0/G4 已随本轮在同一镜像上回归通过；
-3. host 上"同一 peer 只能有一条覆盖 egress 的 active grant"这条运维约束若要放松，
-   需要先在契约里定义歧义解析规则（当前**有意** fail-closed）；
-4. G5 已绿、G0/G4 回归绿 ⇒ V5.5 达到"可交给评审"的状态；**production-ready 仍需独立安全评审**
-   （§14：federation 单独安全评审）。
+当前产品收口优先级：
+1. 让 PR #32 的最终 Source CI + Fast Integration 全绿并合并；
+2. 接完 WP18 Forward 拒绝/恢复事实通知 → 既有 worker reconcile 节拍；
+3. 补 WP19 延迟历史 Web 图表/产品展示；
+4. 把发布流水线继续演进为“Build once → test candidate artifact → promote same digest”，避免 Release 再次重建不同字节；
+5. Federation / Looking Glass 在宣称 production-ready 前做独立安全评审。
+
+明确仍不开放（fail-closed）：
+- QUIC；
+- UDP 分片重组、packets 计费、hop AEAD/MAC、跨面板 UDP 腿；
+- remote ingress 的产品级创建路径、remote transit、跨面板 3+ hop / arbitrary graph；
+- 跨面板自动 failover、tls remote egress、多 Panel 信任传递闭包；
+- 生产业务链上的主动带宽压测。
 ~~~
 
-可执行顺序与硬约束：
+可执行硬约束：
 
-1. WP13.5A/WP13.5B 已落地：**不得**再引入第二套路由模型、第二套状态机或第二套 desired；
-2. 联邦只走 `docs/v5-wp14-16-federation-contract.md` 的契约，**不得**另写第二份协议/签名；
-3. 每个新增能力都必须挂回既有的 Forward desired → revision → ACK → applied → reconcile 链；
-4. 保持 UDP RELAY、QUIC 与其它 V5.x optional 能力关闭，直到各自产品契约和独立 Gate 成立；
-5. 任何"跨面板"资源都不得在本机建第二份 node / port lease 行。
-
-**禁止跳过 Gate、禁止用 skip 掩盖、禁止为了赶进度删 V4 Integration Gate。**
-
-**禁止在 WP0 未进 main 时另写第二份 protocol contract。**
-
-**禁止为了赶进度删除 V4 Integration Gate。**
-
+1. 不得再引入第二套路由模型、第二套状态机、第二份 desired 或第二个端口所有权；
+2. 联邦只走 `docs/v5-wp14-16-federation-contract.md`，跨 Panel 资源不复制成本地 Node / lease；
+3. 每个新增能力必须挂回既有 Forward desired → revision → ACK → applied → reconcile 链；
+4. Gate 失败先区分产品缺陷与 harness 缺陷；两者都要修，但不得通过删断言/skip 伪造绿色；
+5. PR 走快线不等于删除历史覆盖：V4/V5 重型 Gate 保留在 main / release qualification。
+~~~
 ---
 
 # 18. 本文件已主动删除的旧内容
