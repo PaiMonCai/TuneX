@@ -3167,7 +3167,7 @@ PR #32 merge-closure 状态：
 3. 每个新增能力必须挂回既有 Forward desired → revision → ACK → applied → reconcile 链；
 4. Gate 失败先区分产品缺陷与 harness 缺陷；两者都要修，但不得通过删断言/skip 伪造绿色；
 5. PR 走快线不等于删除历史覆盖：V4/V5 重型 Gate 保留在 main / release qualification。
-~~~
+
 ---
 
 # 18. 本文件已主动删除的旧内容
