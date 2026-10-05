@@ -21,8 +21,7 @@ import { checkTunnelCreation } from "./capability-policy.ts";
 import { getOrchestrator } from "./relay-wiring.ts";
 import { reapplyDirectTunnel, reapplyRelayTunnel } from "./scheduler.ts";
 import { registerRollout } from "./forward-rollout-exec.ts";
-// 远端出口腿的声明校验与释放。声明校验只有这一个实现（路由层也复用它），
-// 所以"能保存但跑不起来"不可能出现两次不同的结论。
+// Federated egress declaration/release is centralized in federation/forward-hop.ts.
 import {
   releaseStaleFederatedEgressForTunnel,
   validateFederatedEgressDeclaration,
@@ -79,7 +78,7 @@ export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume"
 export interface ForwardCreateInput {
   name: string;
   mode: ForwardMode;
-  /** : omitted by V4 clients => tcp; explicit unknown values fail closed. */
+  /** Omitted by compatibility clients => tcp; explicit unknown values fail closed. */
   protocol?: ForwardProtocol;
   /**
    * : node-local certificate/key paths for a tls front. Paths, never
@@ -170,14 +169,10 @@ async function reloadOrMinimal(
 }
 
 /**
- *  §13.4.2：节点准入判定的**唯一**转发出口。
+ * Single Forward-facing node-admission adapter.
  *
- * 创建 Forward / 迁移到新节点前必须过这里。判定逻辑一行都不在本文件——
- * lifecycle 与 connection 的口径全在 `services/node-lifecycle.ts` 的
- * `nodeAdmission`（共用），两边各自判一遍必然漂移。
- *
- * 返回 null = 放行；否则是 { code, message } 形状的阻断（`data` 里可选附带
- * 具体 condition，供 §13.5 的可区分错误码）。
+ * Lifecycle/connection semantics remain authoritative in `node-lifecycle.ts`;
+ * this service only maps a refusal into the product error shape.
  */
 function nodeAdmissionError(node: {
   lifecycle?: string | null;
