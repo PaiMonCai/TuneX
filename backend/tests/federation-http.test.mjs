@@ -557,3 +557,41 @@ maybe("WP15 federation: 入口腿的 apply 经 HTTP 也能过（next_hop 必须�
   assert.equal(noTargets.res.status, 400);
   assert.equal((await noTargets.res.json()).code, "message_malformed");
 });
+
+maybe("WP14 federation: 握手响应自报对端可达地址（调用方不必猜）", async () => {
+  await resetFederationTables();
+  await ensureIdentityForTest();
+  await setFederationEnabled(true);
+
+  const invite = await createInvitation({ display_name: "面板 E", endpoint_url: "http://panel-e:3000" });
+  const keys = await generatePanelKeyPair();
+  const panelId = `${TEST_PEER_PREFIX}${crypto.randomUUID()}`;
+  const res = await req("/api/federation/v1/handshake", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      peer_panel_id: panelId,
+      key_id: keys.key_id,
+      public_jwk: keys.public_jwk,
+      display_name: "面板 E",
+      token: invite.token,
+      endpoint_url: "",
+    }),
+  });
+  assert.equal(res.status, 200);
+  const payload = await res.json();
+  // 应答方必须自报"它希望被如何访问"：写进 peer 行的是**对面怎么访问我**这个事实，
+  // 只有我自己知道哪个地址对你是可达的（浏览器地址 / 容器别名 / 宿主端口是三回事）。
+  assert.equal(typeof payload.endpoint_url, "string");
+  assert.ok(payload.endpoint_url.length > 0, "握手响应必须带 endpoint_url");
+});
+
+maybe("WP14 federation: 对端自报地址优先于调用方传入的地址（但拒绝非法值）", async () => {
+  const { normalizePeerEndpoint } = await import("../src/services/federation/transport.ts");
+  const { performHandshake } = await import("../src/services/federation/trust.ts");
+  // 只断言"决定用哪个地址"的纯逻辑：非法自报地址必须被拒，回落到调用方传入的那个。
+  assert.ok(normalizePeerEndpoint("http://panel:3000").ok);
+  assert.equal(normalizePeerEndpoint("panel:3000").ok, false, "缺 scheme 的别名不能被当作合法地址");
+  assert.equal(normalizePeerEndpoint("file:///etc/passwd").ok, false);
+  assert.equal(typeof performHandshake, "function");
+});

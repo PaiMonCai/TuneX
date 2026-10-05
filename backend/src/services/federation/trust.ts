@@ -29,6 +29,7 @@ import {
   type PanelIdentity,
 } from "./identity.ts";
 import { parsePeerKeys, type PeerKeyRecord } from "./signing.ts";
+import { normalizePeerEndpoint } from "./transport.ts";
 import {
   computeHandshakeProof,
   generateInvitationToken,
@@ -174,6 +175,18 @@ export interface HandshakeResponse {
   public_jwk: JWK;
   display_name: string;
   trust_scope: unknown;
+  /**
+   * 本机**对端可达**地址（`federationSelfUrl()`）。
+   *
+   * 为什么由应答方给出而不是由调用方猜：写进 peer 行的是"**对面怎么访问我**"这个事实，
+   * 而只有我自己知道哪个地址对**你**是可达的（浏览器地址、容器别名、宿主端口是三回事）。
+   * 由调用方猜的结果就是：gate 在宿主机上跑时把 `127.0.0.1:18181` 写进对面，
+   * 于是对面（容器）每次回呼都在打自己 —— 症状是"信任建立成功但互相够不着"。
+   *
+   * 它是**提示**而不是权威：proof 保护的是身份（持有 token 这件事），不含这个字段，
+   * 所以调用方只在它能解析成合法 http(s) 地址时才采纳，否则回落到自己传入的地址。
+   */
+  endpoint_url: string;
   proof: string;
 }
 
@@ -265,6 +278,7 @@ export async function handleHandshake(input: HandshakeRequest, now = new Date())
     public_jwk: identity.public_jwk,
     display_name: "TuneX Panel",
     trust_scope: trustScope,
+    endpoint_url: federationSelfUrl(),
     proof: computeHandshakeProof(input.token, {
       panel_id: identity.panel_id,
       key_id: identity.key_id,
@@ -353,12 +367,19 @@ export async function performHandshake(input: {
   const trustScope = input.trust_scope ?? (body.trust_scope ?? DEFAULT_TRUST_SCOPE);
   const now = new Date();
 
+  // 对端自报的可达地址优先于调用方传入的地址（见 HandshakeResponse.endpoint_url 的说明）。
+  // 只在它能被规范化成干净的 http(s) origin 时才采纳 —— 否则一条非法字符串会变成一个
+  // "永远拨不通"的 peer 行，而故障点离这里很远。
+  const advertised = typeof body.endpoint_url === "string" ? body.endpoint_url.trim() : "";
+  const advertisedOk = advertised !== "" && normalizePeerEndpoint(advertised).ok;
+  const peerEndpoint = advertisedOk ? advertised.slice(0, 255) : input.endpoint_url.slice(0, 255);
+
   const existing = await db.federationPeer.findUnique({ where: { peer_panel_id: panelId } });
   const peer = existing
     ? await db.federationPeer.update({
         where: { id: existing.id },
         data: {
-          endpoint_url: input.endpoint_url.slice(0, 255),
+          endpoint_url: peerEndpoint,
           public_keys: keys as never,
           status: "trusted",
           trust_scope: trustScope as never,
@@ -370,7 +391,7 @@ export async function performHandshake(input: {
         data: {
           peer_panel_id: panelId,
           display_name: input.display_name.slice(0, 120),
-          endpoint_url: input.endpoint_url.slice(0, 255),
+          endpoint_url: peerEndpoint,
           public_keys: keys as never,
           status: "trusted",
           trust_scope: trustScope as never,

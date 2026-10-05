@@ -53,6 +53,17 @@ PASSF = HERE / ".passwords.env"
 API_A = os.environ.get("API", "http://panel:3000").rstrip("/")
 API_B = os.environ.get("FED_PANEL_B_API", "http://panel-b:3000").rstrip("/")
 
+# ── 两种地址必须分开：**我**怎么访问面板 vs **对端**怎么访问面板 ──
+#
+# 在 GitHub runner 上，gate 跑在宿主机：它访问两个面板走发布端口（127.0.0.1:18180/18181），
+# 但**面板之间**互相访问只能走容器网络别名（panel:3000 / panel-b:3000）—— 宿主机上的
+# 127.0.0.1 从容器里看是它自己。
+#
+# 把它们混成一个变量，症状是"bootstrap 成功、信任建立了，但两个面板互相够不着"，
+# 而错误会以 `peer_unreachable` 的形式出现在很远的地方（撤销通知/密钥轮转/租约下发全部失败）。
+ALIAS_A = os.environ.get("FED_PANEL_A_ALIAS", "http://panel:3000").rstrip("/")
+ALIAS_B = os.environ.get("FED_PANEL_B_ALIAS", "http://panel-b:3000").rstrip("/")
+
 PANEL_A = "wp14-panel"
 MYSQL = "wp14-mysql"
 REDIS = "wp14-redis"
@@ -393,11 +404,16 @@ def panel_b_api() -> str:
     找不到任何一个可用地址时必须说出来 —— 否则后面每条联邦断言都会以"连不上"的形式红，
     而那看起来像产品故障。
     """
-    candidates = [os.environ.get("FED_PANEL_B_API", ""), "http://panel-b:3000",
+    global API_B
+    candidates = [os.environ.get("FED_PANEL_B_API", ""), ALIAS_B,
                   f"http://127.0.0.1:{os.environ.get('FED_PANEL_B_HOST_PORT', '18181')}"]
     for cand in candidates:
         if cand and http("GET", cand, "/healthz", timeout=5)[0] == 200:
-            return cand.rstrip("/")
+            resolved = cand.rstrip("/")
+            # **必须写回**：下面几十处调用都用模块级 API_B。只 return 不赋值的话，
+            # 解析结果只影响这一处，下游依旧打在别名上 —— CI 上就是这样红的第一步。
+            API_B = resolved
+            return resolved
     return ""
 
 
@@ -406,7 +422,7 @@ def ensure_panel_b_healthy() -> None:
     if not ok:
         logs = docker(["logs", "--tail", "60", PANEL_B], allow=True, timeout=120)
         die(f"Panel B 的 /healthz 在三个候选地址上都不可达（环境变量 FED_PANEL_B_API / "
-            f"http://panel-b:3000 / http://127.0.0.1:{os.environ.get('FED_PANEL_B_HOST_PORT', '18181')}）；"
+            f"{ALIAS_B} / http://127.0.0.1:{os.environ.get('FED_PANEL_B_HOST_PORT', '18181')}）；"
             f"容器日志：\n{logs}")
     step(f"Panel B healthy：{panel_b_api()}")
 
@@ -692,7 +708,8 @@ def ensure_trust(cookie_a: str, cookie_b: str) -> dict:
         # B 出邀请（带外 token），A 拿 token 发起握手 —— 契约 §2.2 的真实路径。
         status, body, _ = http(
             "POST", API_B, f"{ab_b}/peers/invite",
-            {"display_name": "Panel A (home)", "endpoint_url": API_A, "ttl_seconds": 900},
+            # 这里登记的是"**B 怎么访问 A**"，所以必须是容器网络别名，不是宿主侧地址。
+            {"display_name": "Panel A (home)", "endpoint_url": ALIAS_A, "ttl_seconds": 900},
             cookie_b,
         )
         if status not in (200, 201):
@@ -705,7 +722,8 @@ def ensure_trust(cookie_a: str, cookie_b: str) -> dict:
 
         status, body, _ = http(
             "POST", API_A, f"{ab_a}/peers/handshake",
-            {"endpoint_url": API_B, "token": token, "display_name": "Panel B (host)"},
+            # 同理：这里登记的是"**A 怎么访问 B**"（B 的握手请求体里带的是它自己的对端地址）。
+            {"endpoint_url": ALIAS_B, "token": token, "display_name": "Panel B (host)"},
             cookie_a, timeout=90,
         )
         if status not in (200, 201):

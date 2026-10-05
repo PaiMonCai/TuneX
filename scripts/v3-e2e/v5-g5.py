@@ -72,6 +72,12 @@ FED_PANEL_B_CANDIDATES = [
 ]
 API_B = (os.environ.get("FED_PANEL_B_API") or "http://panel-b:3000").rstrip("/")
 
+# 与 bootstrap 同一条纪律：**宿主侧调用地址**（API_A/API_B，runner 上走发布端口）与
+# **对端互访地址**（ALIAS_A/ALIAS_B，容器网络别名）必须分开 —— 写进 peer 行的 endpoint_url
+# 是后者，因为真正去调它的是另一个面板（容器），不是这个 gate（宿主机）。
+ALIAS_A = os.environ.get("FED_PANEL_A_ALIAS", "http://panel:3000").rstrip("/")
+ALIAS_B = os.environ.get("FED_PANEL_B_ALIAS", "http://panel-b:3000").rstrip("/")
+
 
 def resolve_api_b() -> str:
     """Panel B 的可用地址：显式覆盖 → 容器网络别名 → 发布的宿主端口。
@@ -862,7 +868,7 @@ def g5_3_credential_revoke():
         revoke_grant(grant_ref, "g5_revoke_cleanup")
     status_inv, invitation, _ = req_b(
         "POST", f"{ADMIN_B}/peers/invite",
-        {"display_name": "Panel A (retry)", "endpoint_url": API_A, "ttl_seconds": 900})
+        {"display_name": "Panel A (retry)", "endpoint_url": ALIAS_A, "ttl_seconds": 900})
     token = str((unwrap(invitation) or {}).get("token") or "")
     check(status_inv in (200, 201) and bool(token), "G5.3 撤销后 B 仍能签发新的带外邀请",
           f"status={status_inv}")
@@ -875,7 +881,7 @@ def g5_3_credential_revoke():
 
         status_hs, body_hs, _ = req_a(
             "POST", f"{ADMIN_A}/peers/handshake",
-            {"endpoint_url": API_B, "token": token, "display_name": "Panel B (retry)"})
+            {"endpoint_url": ALIAS_B, "token": token, "display_name": "Panel B (retry)"})
         check(status_hs in (200, 201), "G5.3 撤销后**重新走带外 token 可以重建信任**（契约 §2.4）",
               f"status={status_hs} body={json.dumps(body_hs)[:200]}")
 
