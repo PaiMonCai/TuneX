@@ -497,12 +497,23 @@ model Node {
   state_report   NodeStateReport?
   /// V5.2 WP5：该节点上报的目标观测（每个 (节点, 目标) 一行）。
   target_observations TargetObservation[]
+  /// V5-WP19-B：该节点的观测**档案** —— 原始样本（24h）+ 小时桶（30d）。
+  /// 与上面的投影**互不写入**：档案永不被健康判定读取（契约 D3/D4）。
+  latency_samples TargetLatencySample[]
+  latency_buckets TargetLatencyHourly[]
   /// V5.3 WP9：该节点当前持有的归属租约。
   placement_leases PlacementLease[]
   /// V5.4 WP12：作为中间跳承载的 Forward。
   middle_hops Tunnel[] @relation("middle_node")
 
   @@index([role])
+  // V5-WP17：这两条索引**只存在于迁移里**，schema 一直没有声明它们 —— 后果不是"缺个索引"，
+  // 而是**任何人跑一次 `migrate dev`，Prisma 都会把它们当成多余的东西删掉**：一条在
+  // `credential_revoked`（认证/准入判定），一条在 `lifecycle`（维护态过滤）。
+  // 漂移检查实测过一次（`migrate diff --from-migrations --to-schema-datamodel`），
+  // 加上这两行之后归零。它们早已在库里，所以**不需要新迁移**。
+  @@index([credential_revoked])
+  @@index([lifecycle])
   @@map("node")
 }
 
@@ -950,7 +961,7 @@ model ForwardRollout {
   last_error_code String? @db.VarChar(64)
   last_error String? @db.VarChar(500)
   created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  updated_at DateTime @default(now()) @updatedAt
 
   @@index([tunnel_id, revision])
   @@index([phase])
@@ -1840,6 +1851,90 @@ model TargetObservation {
   @@map("target_observation")
 }
 
+/// V5-WP19-B —— 目标观测的**原始样本档案**（契约 §4.0 Lead 裁决 O1+O4）。
+///
+/// 与 `target_observation` **投影并列，不是它的历史行**：投影回答"现在怎么样"
+/// （每 (节点,目标) 一行、upsert、还被 `deleteMany(notIn: seen)` 收窄），档案回答
+/// "过去怎么样"（只追加、永不被投影读取、永不作为健康判定输入）。
+///
+/// 「只 INSERT」不是修辞：本表没有 upsert 路径，也没有 updated_at —— 一行样本一旦
+/// 写下就只有一个含义（`tunnels[].diag` 那类"重建成另一个形状"的事在这里不允许发生）。
+/// 保留期 24h（可配置），清理按 `observed_at` 索引删，与写入节拍同源。
+///
+/// 为什么用 BigInt 主键：一次状态上报为每个目标追加一行，节拍 ~30s，
+/// 单个目标就是 2880 行/天；Int 主键（21 亿）在千级节点 × 数十目标的规模下
+/// 一年多就会溢出。主键**不出现在任何读路径**（避免 BigInt → JSON 的坑）。
+model TargetLatencySample {
+  id      BigInt @id @default(autoincrement())
+  node_id Int
+  node    Node   @relation(fields: [node_id], references: [id], onDelete: Cascade)
+
+  /// 与投影同一套身份（`node-state.ts:targetKeyOf`）：两侧必须同步，单改一侧 =
+  /// 历史与投影对不上同一个目标。
+  target_key String @db.VarChar(288)
+  host       String @db.VarChar(255)
+  port       Int
+
+  /// 该次观测的事实。`latency_ms` 为 NULL = 这次没有测到延迟（不可达）；
+  /// **不是 0**（0 是"瞬间可达"）。档案里也保持这个区分。
+  reachable  Boolean
+  latency_ms Int?
+  success_rate Float @default(0)
+  /// 谁说的（观测节点角色 + 探测种类）。入桶键的一部分：不同口径的延迟**不可平均在一起**。
+  observation_source String @db.VarChar(64)
+
+  /// `observed_at` = Agent 观测时刻（序列的横轴）；`reported_at` = 面板收到该上报的时刻。
+  observed_at DateTime
+  reported_at DateTime @default(now())
+
+  /// 清理：`observed_at < cutoff` 按索引删（G19.8 的"按索引清理"）。
+  @@index([observed_at])
+  /// 读路径：一条 (节点, 目标) 序列的时间窗口。
+  @@index([node_id, target_key, observed_at])
+  @@map("target_latency_sample")
+}
+
+/// V5-WP19-B —— 小时桶档案（保留期 30d）。原始样本过期后，这是"过去抖不抖"的唯一答案。
+///
+/// 桶由**已结束的整点小时**的原始样本聚合而来（`latency-history.ts:rollUpLatencyBuckets`），
+/// 因此同一 (节点, 目标, 小时, 口径) 只有一行，且聚合是幂等的：小时结束后不再有新样本，
+/// 重算结果相同。桶一旦写入不再改写（`create` + 唯一冲突跳过），保持档案的只追加性质。
+///
+/// **延迟统计只统计真的测到延迟的样本**（`latency_samples` = 参与统计的样本数）：
+/// 不可达样本计入 `sample_count`/`failure_count`，但不进平均 —— 把"没测到"算成 0ms
+/// 会让一次断线在图上显示成"延迟骤降 0"，那是最坏的一类谎言。
+model TargetLatencyHourly {
+  id      Int  @id @default(autoincrement())
+  node_id Int
+  node    Node @relation(fields: [node_id], references: [id], onDelete: Cascade)
+
+  target_key String   @db.VarChar(288)
+  /// 该小时桶的起点（UTC 整点）。横轴口径：`observed_at` 落在 [hour_start, hour_start+1h)。
+  hour_start DateTime
+  /// 观测口径（与样本同源）：不同 source 的延迟**不并排、不平均**（D12）。
+  observation_source String @db.VarChar(64)
+
+  /// 样本总数与可达/不可达分解（`success_count + failure_count == sample_count`）。
+  sample_count  Int
+  success_count Int
+  failure_count Int
+
+  /// 延迟统计：`latency_sum_ms / latency_samples` = 平均值；`latency_samples = 0`
+  /// 时平均值是 NULL（**不是 0**）。min/max 让抖动在小时粒度上也留痕。
+  latency_samples  Int
+  latency_sum_ms   Float
+  latency_min_ms   Int?
+  latency_max_ms   Int?
+  last_observed_at DateTime
+
+  created_at DateTime @default(now())
+
+  @@unique([node_id, target_key, hour_start, observation_source])
+  /// 清理：`hour_start < cutoff` 按索引删。
+  @@index([hour_start])
+  @@map("target_latency_hourly")
+}
+
 model NodeStateReport {
   id      Int  @id @default(autoincrement())
   node_id Int  @unique
@@ -1861,7 +1956,7 @@ model NodeStateReport {
   last_error      String?  @db.VarChar(500)
   /// 面板收到本次上报的时刻（非 Agent 时钟，供离线判定用 DB 侧单一真相）
   reported_at     DateTime @default(now())
-  updated_at      DateTime @updatedAt
+  updated_at      DateTime @default(now()) @updatedAt
 
   // ── V4-WP6 Agent Telemetry（§13.4.4，迁移 20260928000000）──
   //
@@ -2385,9 +2480,13 @@ model NotificationDelivery {
   created_at     DateTime @default(now())
   updated_at     DateTime @updatedAt
 
-  @@unique([dedupe_key, channel_kind])
-  @@index([workspace_id, created_at])
-  @@index([source_kind, source_id])
-  @@index([status, created_at])
+  // `map:` 是**有意的**：迁移是手写的，索引名是人挑的可读名（`..._dedupe_channel_key`）。
+  // 不写 map，Prisma 会按列名推导出 `..._dedupe_key_channel_kind_key` 并认为两边不一致 ⇒
+  // 漂移检查每次都报"重命名"，而 `migrate dev` 会真的去重命名。名字要么在 schema 里定死，
+  // 要么在迁移里改成 Prisma 的默认推导 —— 这里选前者（可读性优先，且迁移已经落地）。
+  @@unique([dedupe_key, channel_kind], map: "notification_delivery_dedupe_channel_key")
+  @@index([workspace_id, created_at], map: "notification_delivery_workspace_created_idx")
+  @@index([source_kind, source_id], map: "notification_delivery_source_idx")
+  @@index([status, created_at], map: "notification_delivery_status_created_idx")
   @@map("notification_delivery")
 }
