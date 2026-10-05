@@ -1,6 +1,5 @@
 /**
  * 支付路由 —— 用户侧下单 + 网关异步回调
- * 依据: pay-channel-analysis-report.md §6-§7（源码级还原 rurets/pay.ts + routes/topup.ts）
  *
  * 端点：
  *   GET  /api/pay                      支付方式列表（仅非敏感字段，需认证）
