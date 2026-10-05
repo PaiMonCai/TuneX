@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Bell, ExternalLink, LayoutGrid, ShieldCheck } from "lucide-react";
+import { ExternalLink, LayoutGrid, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/card";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -10,14 +10,7 @@ import { WorkspaceSwitcher } from "@/components/workspace/workspace-switcher";
 import { useI18n } from "@/components/providers";
 import type { ConsoleId } from "@/lib/nav";
 
-/**
- * 顶栏（客户端组件）：页面标题 + 通知/语言/主题/控制台切换。
- * 标题由服务端 shell 按 cookie 语言解析后传入，保证 SSR 文案正确。
- *
- * User / Admin 变体（§9.4.1「topbar 分别设计」）：
- * - user：workspace 切换器 + 通知铃 + 「管理后台」入口；
- * - admin：ADMIN 标识 + 环境徽章 + 「返回用户端」入口，无 workspace 语境（管理端不参与 workspace scope）。
- */
+/** 顶栏：页面标题、语言/主题和 User/Admin Console 切换。 */
 export function Topbar({
   title,
   subtitle,
@@ -65,13 +58,7 @@ export function Topbar({
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1">
-        {/* TEN-01：工作空间切换器（仅用户端；管理后台不参与 workspace 作用域） */}
         {!isAdmin && <WorkspaceSwitcher />}
-        {!isAdmin && (
-          <Button variant="ghost" size="icon" aria-label={t("common.tickets")} className="hidden sm:inline-flex">
-            <Bell className="size-4" />
-          </Button>
-        )}
         <LocaleSwitcher />
         <ThemeToggle />
         <span aria-hidden="true" className="mx-1 hidden h-5 w-px bg-[var(--border)] sm:block" />
@@ -90,9 +77,11 @@ export function Topbar({
             </Link>
           </Button>
         )}
-        <Badge variant="outline" className="hidden md:inline-flex" data-testid="mock-badge">
-          {process.env.NEXT_PUBLIC_API_MOCK === "1" ? "MOCK API" : "LIVE API"}
-        </Badge>
+        {process.env.NEXT_PUBLIC_API_MOCK === "1" && (
+          <Badge variant="outline" className="hidden md:inline-flex" data-testid="mock-badge">
+            MOCK API
+          </Badge>
+        )}
       </div>
     </header>
   );
