@@ -118,6 +118,8 @@ openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 | `SMTP_*` | 公网服务必须配，否则验证/重置邮件只进日志 |
 | `BACKUP_PASSPHRASE` | cron 回滚前备份必需，否则备份脚本交互读取失败并终止回滚 |
 
+可选的**主动出站能力默认全部关闭**：`LOOKING_GLASS_ENABLED=false`、`TUNEX_NOTIFICATION_WEBHOOK_ENABLED=false`、`TUNEX_NOTIFICATION_TELEGRAM_ENABLED=false`。其中 Looking Glass 只做有界 TCP connect 公网探测；开启前应确认审计与目标网络策略符合部署要求。Webhook/Telegram 的目标与凭据配置见 `.env.production.example` 及管理端配置。
+
 `ALLOW_REGISTER_FALLBACK=false`（邀请制 Beta）+ `PAYMENTS_ENABLED=false` 是
 PLAN.md 的既定默认，**不要**在生产环境打开以"图方便"。
 
