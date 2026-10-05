@@ -1,22 +1,6 @@
-// Package reporter is the agent's outbound telemetry.
-//
-// Every 30s the agent POSTs its version, role, node id, running tunnels and
-// their ports to the panel, so the panel can place the node in the v3
-// orchestration without polling it.
-//
-// V4-WP6 (§13.4.4) extends the same report instead of adding a second one:
-// host identity, one lightweight resource sample, runtime counts and the
-// apply/runtime error ledger travel inside the WP7 state report. The agent only
-// reports raw facts — the panel computes Health from them.
-//
-// Traffic and per-metric history reporters are still later work packages: WP6
-// deliberately keeps this an O(1)-per-heartbeat sampler, not a Prometheus
-// exporter.
-//
-// Transport contract (devmap §6.1 "内部上报"): the heartbeat is a machine
-// endpoint POST <panel>/api/internal/heartbeat, sent by the agent as an
-// outbound request (the control transport stays agent-initiated, per the WP6
-// rule that no public agent HTTP dependency is introduced).
+// Package reporter implements the Agent's outbound heartbeat and authenticated
+// state report. The Agent reports raw runtime facts; the Panel derives health and
+// product status from them. Reporting never requires Panel-to-Agent connectivity.
 //
 // The post function is injected so unit tests never touch the network.
 package reporter
@@ -39,7 +23,7 @@ import (
 	"github.com/tunex/agent/internal/targetobs"
 )
 
-// Interval is the heartbeat cadence (devmap v0.3: 每 30s 上报一次).
+// Interval is the heartbeat cadence.
 const Interval = 30 * time.Second
 
 // ClientTimeout bounds a single heartbeat POST: a hung panel endpoint must not
@@ -49,9 +33,8 @@ const ClientTimeout = 10 * time.Second
 // HeartbeatPath is the panel endpoint the agent posts to.
 const HeartbeatPath = "/api/internal/heartbeat"
 
-// StatePath is the WP7 state-report endpoint (services/node-state.ts). V4-WP6
-// carries the telemetry extension in the *same* body: §13.4.4 forbids a second
-// node-monitoring truth, so there is no /telemetry endpoint.
+// StatePath is the authenticated node-state endpoint. Telemetry extends this
+// same report instead of creating a second node-monitoring truth.
 const StatePath = "/api/internal/node/state"
 
 // CredentialHeader carries the per-node credential (services/node-credential.ts).
@@ -79,12 +62,9 @@ type Payload struct {
 	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
 }
 
-// StatePayload is the WP7 state-report body (POST /api/internal/node/state).
-//
-// It is the heartbeat's stats superset: everything the panel needs to re-derive
-// "what is this node doing right now" without touching the agent, which is what
-// makes a reconnect snapshot possible (devmap §5.5 "节点重启 → 拉取 ACTIVE 隧道"
-// mirrored on the panel side). Shape is owned by services/node-state.ts.
+// StatePayload is the authenticated state-report body. It is the heartbeat
+// superset the Panel uses to derive current node/runtime facts without dialing
+// the Agent. Shape is owned by services/node-state.ts.
 type StatePayload struct {
 	AgentID     string                `json:"agent_id,omitempty"`
 	Version     string                `json:"version,omitempty"`
@@ -96,7 +76,7 @@ type StatePayload struct {
 	Revision int64  `json:"reported_revision,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
 
-	// ── V4-WP6 telemetry (DEVELOPMENT.md §13.4.4) ──────────────────────
+	// Telemetry facts are additive and optional.
 	//
 	// All of it is optional and additive: an older panel ignores the unknown
 	// keys (validateStateReport tolerates unknown fields), and an older agent
@@ -386,9 +366,8 @@ type Config struct {
 	Version  string
 	Role     string
 
-	// Credential is the WP7 per-node credential (services/node-credential.ts).
-	// Empty keeps the legacy heartbeat shape and skips the state report — a
-	// node that predates credentials must keep working unchanged.
+	// Credential authenticates state reporting. Empty disables the authenticated
+	// state report; the unauthenticated heartbeat remains best-effort compatibility.
 	Credential string
 
 	tunnels  TunnelLister
@@ -419,7 +398,7 @@ type Config struct {
 	// expire) — which is also how it behaves with an older panel.
 	leases LeaseSink
 
-	// ── V4-WP6 telemetry sources (all optional) ──
+	// Optional telemetry sources.
 	//
 	// host     : hostname/os/arch + one resource sample per beat;
 	// ledger   : apply/runtime error counters (shared with the control loop);
@@ -434,7 +413,7 @@ type Config struct {
 	startedAt time.Time
 
 	// post overrides the HTTP call (tests). Defaults to httpPost. It returns the
-	// panel's response body: the V5.3-WP9 lease renewal rides the state report's
+	// panel's response body: ownership lease renewal rides the state report's
 	// own answer, and a transport that threw it away would make every tunnel
 	// self-stop one TTL after its config (see sendState).
 	post func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error)
@@ -629,7 +608,7 @@ func copyObservations(in []targetobs.Observation) []targetobs.Observation {
 	return append([]targetobs.Observation(nil), in...)
 }
 
-// fillTelemetry adds the V4-WP6 facts (§13.4.4). Everything here is derived
+// fillTelemetry adds derived telemetry facts. Everything here is read
 // from injected sources and cannot fail the report: a missing sampler means the
 // field group is absent, which the panel reads as "unknown".
 //
@@ -672,8 +651,7 @@ func (r *Reporter) fillTelemetry(p *StatePayload) {
 }
 
 // StateEndpoint returns the full state-report URL, or "" when credential-less.
-// A node without a credential keeps the legacy heartbeat only: the panel has no
-// way to attribute a state report for it anyway.
+// A node without a credential cannot send an authenticated state report.
 func (r *Reporter) StateEndpoint() string {
 	base := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
 	if base == "" || strings.TrimSpace(r.cfg.Credential) == "" {
@@ -697,8 +675,8 @@ func sortedPorts(in map[int]bool) []int {
 }
 
 // Run blocks, sending a heartbeat every Interval until ctx is cancelled or Stop
-// is called. The first beat goes out immediately so the panel sees the node
-// right after a restart (devmap §5.5: 节点重启 → 启动时拉取 ACTIVE 隧道).
+// is called. The first beat goes out immediately so the Panel sees the node
+// promptly after restart.
 //
 // A failed beat is dropped and retried on the next tick; reporting never makes
 // the agent exit. Returns ErrNoPanelURL immediately when reporting is off, and
