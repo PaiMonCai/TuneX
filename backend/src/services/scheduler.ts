@@ -714,6 +714,12 @@ export async function allocateTunnelPort(
   },
   inject?: SchedulerDeps["portPoolDeps"],
 ): Promise<PortAllocationSuccess | PortAllocationFailure> {
+  // 本隧道自己的 runtime 占着某个端口 ≠ 别人占用：把 listen_port 改成它当前正在用的值、
+  // 或失败后重试同一端口，都必须成功（否则会 502 port_taken，而端口本就是这条隧道在听）。
+  const ownRuntimeIds =
+    args.tunnelId === null || args.tunnelId === undefined
+      ? []
+      : Orchestrator.localRuntimeIdsForTunnel(Number(args.tunnelId));
   const outcome = await acquirePort(
     {
       nodeId: args.nodeId,
@@ -721,6 +727,7 @@ export async function allocateTunnelPort(
       preferredPort: args.preferred ?? null,
       tunnelId: args.tunnelId ?? null,
       reservedPorts: args.reservedPorts ?? [],
+      ownRuntimeIds,
       deps: inject,
     },
     inject,

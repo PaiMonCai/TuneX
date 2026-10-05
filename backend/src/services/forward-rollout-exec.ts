@@ -893,6 +893,8 @@ async function runStep(
           leaseType: step.direction === "egress" ? "egress" : "ingress",
           preferredPort,
           tunnelId: ctx.tunnelId,
+          // 同上：本隧道自己的腿占着的端口不算冲突（幂等编辑/重试/还原端口都必须能过）。
+          ownRuntimeIds: Orchestrator.localRuntimeIdsForTunnel(ctx.tunnelId),
         },
         { db: deps.db as never },
       );

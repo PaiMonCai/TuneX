@@ -118,6 +118,12 @@ export type LeaseStatus = (typeof LEASE_STATUS)[keyof typeof LEASE_STATUS];
 export type LeaseDirection = "ingress" | "egress";
 
 /** 分配请求。 */
+/** Agent 守卫里的一个占用：端口 + 持有它的 runtime id（老 Agent 可能不报 id）。 */
+export interface AgentPortHolder {
+  port: number;
+  runtime_id?: string | null;
+}
+
 export interface AcquirePortInput {
   /** 节点主键（`Node.id`，即 `node_port_lease.node_id` 的外键值）。 */
   nodeId: number;
@@ -142,7 +148,14 @@ export interface AcquirePortInput {
    * 预分配未传时按 {@link PREALLOC_TTL_S} 兜底（见该常量注释）。
    */
   expiresAt?: Date | null;
-  /** 依赖注入接缝（测试替身）；未传则走进程级默认的 db/redis 单例。 */
+  /**
+   * 本次申请**所属隧道**自己的 runtime id（`tunex-<tunnelId>-<方向>`）。
+   *
+   * 这些 runtime 占着某个端口不代表"别人占用"：把 Forward 的 listen_port 改成它当前
+   * 正在使用的端口、或在失败后重试同一端口，都是合法且必须成功的编辑。不声明就会自冲突。
+   */
+  ownRuntimeIds?: readonly string[];
+  /** 依赖注入接缝（测试替身）；未传则进程级默认的 db/redis 单例。 */
   deps?: PortPoolDeps;
 }
 
@@ -298,7 +311,7 @@ export interface PortPoolDeps {
   /** 默认 {@link DEFAULT_LOCK_TTL_S}。 */
   lockTtlS?: number;
   /**
-   * 该节点**自己上报**的占用端口（Agent 的端口守卫视图）。
+   * 该节点**自己上报**的占用端口（Agent 的端口守卫视图），带持有者 runtime id。
    *
    * 为什么分配器必须看它：端口归属有两个事实来源 —— 面板的 `node_port_lease`（分配器读的）
    * 与 Agent 的 `usedPort` 守卫（runtime 真的在听哪个端口）。两者短期不一致是**正常**的
@@ -306,32 +319,55 @@ export interface PortPoolDeps {
    * Agent 正确地拒绝 apply，而症状离原因很远：一条路由永远建不起来，日志里只有一个
    * `*_apply_rejected`。把 Agent 的事实也算作占用，等于让分配器**先问一句**再发端口。
    *
-   * 注入是为了可测（离线单测传数组），默认实现读 `node_state_report.used_ports`。
+   * **必须带上 runtime id**：否则会误伤"这条隧道自己已经持有的端口"——把一条 Forward 的
+   * listen_port 改成它**当前正在用**的那个端口（幂等编辑、失败重试、还原夹具）时，
+   * 分配器会把它判成"别人占用"而拒绝，症状是自冲突（实测：门禁 S7 还原端口 502
+   * `port_taken`，而那个端口正是这条隧道自己的 runtime 在听）。调用方通过
+   * {@link AcquirePortInput.ownRuntimeIds} 声明"哪些 runtime 属于本次申请的隧道"。
+   *
+   * 注入是为了可测（离线单测传数组），默认实现读 `node_state_report.tunnels`。
    */
-  agentUsedPorts?: (nodeId: number) => Promise<readonly number[]>;
+  agentUsedPorts?: (nodeId: number) => Promise<readonly AgentPortHolder[]>;
 }
 
 /** 进程级默认依赖（路由/编排器直接用）。 */
 /**
- * 默认实现：读该节点最近一次上报里的 `used_ports`（Agent 的端口守卫视图）。
+ * 默认实现：读该节点最近一次上报里的 runtime 列表与 `used_ports`（Agent 的端口守卫视图）。
  *
- * 失败一律回落到空集：读不到上报**不能**阻断分配（那会把"上报迟到"升级成"建不了隧道"），
- * 但真实存在的不一致会因此少一层保护 —— 所以失败要留痕。
+ * 优先用 `tunnels`（能给出每个端口属于哪个 runtime，本隧道自己的端口要放行）；
+ * `used_ports` 只有端口号、没有持有者，所以只在 `tunnels` 缺失时兜底使用 —— 那种情况下
+ * 宁可少一层保护（不误伤可能的自复用），也不要制造假冲突。
+ *
+ * 失败一律回落到空集：读不到上报**不能**阻断分配（那会把"上报迟到"升级成"建不了隧道"）。
  */
-async function defaultAgentUsedPorts(nodeId: number): Promise<readonly number[]> {
+async function defaultAgentUsedPorts(nodeId: number): Promise<readonly AgentPortHolder[]> {
   try {
     const row = (await (db as unknown as {
       nodeStateReport: { findUnique(args: unknown): Promise<unknown> };
     }).nodeStateReport.findUnique({
       where: { node_id: nodeId },
-      select: { used_ports: true },
-    })) as { used_ports?: unknown } | null;
-    const raw = row?.used_ports;
-    if (!Array.isArray(raw)) return [];
-    const out: number[] = [];
-    for (const v of raw) {
-      const n = typeof v === "number" ? v : Number(v);
-      if (Number.isInteger(n) && n > 0) out.push(n);
+      select: { used_ports: true, tunnels: true },
+    })) as { used_ports?: unknown; tunnels?: unknown } | null;
+
+    const out: AgentPortHolder[] = [];
+    const tunnels = row?.tunnels;
+    if (Array.isArray(tunnels)) {
+      for (const t of tunnels) {
+        if (t === null || typeof t !== "object") continue;
+        const rec = t as Record<string, unknown>;
+        const id = typeof rec.id === "string" ? rec.id : null;
+        for (const key of ["ingress_port", "egress_port"]) {
+          const n = Number(rec[key]);
+          if (Number.isInteger(n) && n > 0) out.push({ port: n, runtime_id: id });
+        }
+      }
+      if (out.length > 0) return out;
+    }
+    if (Array.isArray(row?.used_ports)) {
+      for (const v of row.used_ports) {
+        const n = typeof v === "number" ? v : Number(v);
+        if (Number.isInteger(n) && n > 0) out.push({ port: n, runtime_id: null });
+      }
     }
     return out;
   } catch (e) {
@@ -545,8 +581,15 @@ export async function acquirePort(
   // Agent 自己报的占用端口同样算占用（见 PortPoolDeps.agentUsedPorts 的说明）：
   // 面板的租约表可能比 Agent 的守卫更早释放（Remove 立即释放、监听稍后关闭），
   // 也可能更晚（失败创建的残留）。两份事实取并集，Agent 才不会拒绝一次我们以为合法的分配。
-  for (const p of await agentUsedPorts(input.nodeId)) {
-    if (isValidPort(p)) reserved.add(p);
+  //
+  // 但**本隧道自己的 runtime 占的端口要放行**：否则把 listen_port 改成它正在用的那个值
+  // （幂等编辑 / 失败重试 / 还原夹具）会被自己挡回去，症状是 502 port_taken 但端口明明
+  // 就是这条隧道在听（实测踩到过）。
+  const ownRuntimeIds = new Set(input.ownRuntimeIds ?? []);
+  for (const holder of await agentUsedPorts(input.nodeId)) {
+    if (!isValidPort(holder.port)) continue;
+    if (holder.runtime_id && ownRuntimeIds.has(holder.runtime_id)) continue;
+    reserved.add(holder.port);
   }
 
   // 预分配默认 TTL：NULL expiry 的预分配是 reconcile 收不回的孤儿

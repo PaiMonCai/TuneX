@@ -650,6 +650,24 @@ export class Orchestrator {
   }
 
   /**
+   * 一条本地 Forward 在某个节点上**可能**使用的全部 runtime id。
+   *
+   * 用途之一是端口分配：Agent 上报"某个端口被某个 runtime 占着"时，面板要能判断
+   * "那是这条隧道自己的腿"还是"别人的"。少了这一层，把 listen_port 改成它当前正在用的
+   * 值（幂等编辑 / 失败重试 / 还原夹具）会被自己挡回去。
+   *
+   * 只列本地腿；联邦远端腿走 `federatedTunnelId` 的独立命名空间（它没有本地 Forward 行，
+   * 端口也归 host 的 portPool，不参与本地分配）。
+   */
+  static localRuntimeIdsForTunnel(tunnelId: number): string[] {
+    return [
+      Orchestrator.directTunnelId(tunnelId),
+      Orchestrator.relayTunnelId(tunnelId),
+      Orchestrator.egressTunnelId(tunnelId),
+    ];
+  }
+
+  /**
    * V5.5 WP15 —— **联邦远端腿**的运行时 id：`tunex-fed-<leaseRef>-<direction>`。
    *
    * 为什么需要单独命名空间：host 侧承载的是一个远端 Forward 的一条腿，它**没有**本地

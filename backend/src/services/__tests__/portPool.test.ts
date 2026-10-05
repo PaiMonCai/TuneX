@@ -282,11 +282,32 @@ describe("1. 并发分配无重复（§7.6 DoD）", () => {
       nodeId: 1,
       leaseType: "ingress",
       tunnelId: 2,
-      deps: { ...h.deps, agentUsedPorts: async () => [taken] },
+      deps: { ...h.deps, agentUsedPorts: async () => [{ port: taken, runtime_id: "tunex-9-relay" }] },
     });
     expect(second.ok).toBe(true);
     if (!second.ok) return;
     expect(second.result.port).not.toBe(taken);
+  });
+
+  test("本隧道自己的 runtime 占用的端口不算冲突（幂等编辑 / 失败重试必须成功）", async () => {
+    // 实测踩到过：把 Forward 的 listen_port 改回它**正在使用**的那个值（还原夹具 / 重试），
+    // 若把 Agent 上报的占用一律当成"别人占用"，分配器会拒绝自己的端口 → 502 port_taken，
+    // 而那个端口明明就是这条隧道本隧道在听。ownRuntimeIds 就是用来区分这一点的。
+    const h = harness();
+    seedNode(1, [19000, 19002]);
+    const mine = "tunex-7-direct";
+
+    const outcome = await pool.acquirePort({
+      nodeId: 1,
+      leaseType: "ingress",
+      tunnelId: 7,
+      preferredPort: 19000,
+      ownRuntimeIds: [mine, "tunex-7-relay"],
+      deps: { ...h.deps, agentUsedPorts: async () => [{ port: 19000, runtime_id: mine }] },
+    });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.result.port).toBe(19000);
   });
 
   test("50 个并发 acquire 拿到 50 个互不相同的端口", async () => {
