@@ -238,6 +238,14 @@ export interface NotificationFact {
   /** 指向的具体资源（今天与 source 同行；N3 这类来源两者会分离，见 F1）。 */
   readonly resource_type: string;
   readonly resource_id: string;
+  /**
+   * 资源展示名（节点 `node_id` / 转发 `name`）。
+   *
+   * 契约 F1 的字段表没列它，但 F10 明确允许把「节点/转发名」插进邮件正文 ——
+   * 一封只有主键的通知（"tunnel 31 出错了"）对收件人没有意义。名字**只用于渲染**：
+   * 它不进幂等键，也不参与任何判定；渲染前按 F10 剥 CRLF + 截断。
+   */
+  readonly resource_name: string | null;
   /** 事实的发生时刻（来源表上的既有时间戳，ISO 8601）。 */
   readonly occurred_at: string;
   /** 幂等键的时间窗下界（ISO 8601）。 */
