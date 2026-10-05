@@ -38,7 +38,7 @@ export type NotificationFailureReason =
   | "rejected_target"
   | "unsupported_channel"
   /**
-   * 凭据存在但**解不开/不可用**（WP18.4 追加；密文用错主密钥、被截断、或解出来的东西形状不对）。
+   * 凭据存在但**解不开/不可用**（例如密文使用错误主密钥、被截断或解出的形状无效）。
    *
    * 为什么必须与 `not_configured` 分开：把一次密钥轮换事故显示成"没配置"，
    * 等于用"看起来没配"掩盖一次数据损坏 —— 这正是 C3 禁止的降级（F5「解封失败一律抛错」）。
@@ -76,8 +76,8 @@ export interface RenderedNotification {
 /**
  * 投递核心需要的最小事实形状。**结构性类型，不是第二个真相来源**。
  *
- * ── 为什么会有它（WP18.5 的 D1 裁决 = (b)，Lead 2026-10-05 批准）──
- * `NotificationFact`（WP18.1）是**注意力派生**的结果，它的 `reason_code` 冻结成
+ * ── 为什么需要这个结构 ──
+ * `NotificationFact` 是**注意力派生**的结果，它的 `reason_code` 使用
  * `AttentionReasonCode`（「通知只消费既有词表」）。而公告的真相在公告表、不是 attention 的
  * 派生（契约 F2-N6）—— 把它塞进 `NotificationFact` 就得为「公告」新造一个 attention 原因码，
  * 那正是在那条不变量上开口子。
@@ -125,7 +125,7 @@ export interface NotificationChannel {
   validateConfig(input: { target: string | null | undefined }): ChannelConfigCheck;
   send(rendered: RenderedNotification, target: string): Promise<ChannelResult>;
   /**
-   * 可选：把目标脱敏成**可落账本**的形态（WP18.3 追加）。
+   * 可选：把目标脱敏成**可落账本**的形态。
    *
    * 为什么需要它：账本是"给谁发过"的证据，而 webhook URL **本身就是凭据**
    * （Slack / Discord 的 hook URL 拿到就能发消息）。18.2 的 `target` 列注释已经写明
