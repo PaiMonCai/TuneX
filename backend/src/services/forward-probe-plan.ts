@@ -1,26 +1,11 @@
 /**
- * V4-WP11C — 诊断探针计划（纯函数，无 IO）。
+ * Pure diagnostic plan derived from an authorized Forward's desired state.
  *
- * 这个模块的**全部职责**是把一条 Forward 的已授权期望状态翻译成诊断计划。
- * 它存在的理由有两个，都不是"方便"，而是边界：
- *
- * 1. **不要把用户输入当成探测目标**。诊断端点如果接受 host/port 参数，它就变成了
- *    "用别人的机器扫我的内网"的 SSRF 工具——节点在客户机房，能到达面板本身到不了
- *    的地址。目标只能来自 desired state。
- *
- * 2. **不要拨业务监听端口**。入口→出口那一段的真实地址是**出口节点的业务 EGRESS
- *    listener**：拨它会触发一次真实业务连接（Agent 会 accept、选目标、建上游、计入
- *    业务连接与 Stats）。那已经不是"诊断"，而是"替用户发了一次业务流量"，还会污染
- *    计费与连接额度事实。因此这一段**不做 TCP 探测**，只核对两端 Agent 上报的运行态
- *    事实，并明确标注"未经连通性验证"。
- *
- * 分段与验证方式：
- *   DIRECT：入口节点 → 目标           （TCP 直探目标；不经过任何业务监听端口）
- *   RELAY ：入口 ←→ 出口              （仅节点事实核对，verified=false）
- *           出口节点 → 目标池目标      （TCP 直探目标；同样不经过业务监听端口）
- *
- * 刻意**不**从入口节点直连目标来"模拟"整条 RELAY：那样探测的是面板的一个假设，
- * 不是这条转发真实的路径。
+ * Probe targets always come from stored desired state, never arbitrary user
+ * input. Business listener ports are not actively probed because doing so would
+ * create real traffic and contaminate connection/accounting facts. Inter-node
+ * segments therefore use reported runtime facts; target segments use bounded TCP
+ * probes from the appropriate node.
  */
 
 import type { ForwardForDiagnose } from "./agent-diagnose.ts";
