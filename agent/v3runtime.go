@@ -21,9 +21,7 @@ import (
 	"github.com/tunex/agent/internal/targetobs"
 )
 
-// v3Runtime bundles the WP4 components so main can start and stop them as one
-// unit. Since WP15 it is the agent's only runtime: there is no legacy session
-// beside it.
+// v3Runtime bundles the Agent components so main can start and stop them as one unit.
 type v3Runtime struct {
 	cfg     *agentconfig.Config
 	tunnels *manager.TunnelManager
@@ -31,17 +29,17 @@ type v3Runtime struct {
 	api     *api.Server
 	control *control.Client
 	heart   *reporter.Reporter
-	// ledger is the V4-WP6 apply/runtime error ledger, kept on the runtime so a
+	// ledger is the shared apply/runtime error ledger, kept on the runtime so a
 	// later admin surface can record operator-triggered failures into the same
 	// place the panel reads.
 	ledger *reporter.Ledger
-	// ownership is the V5.3-WP9 activation gate and lease clock. Kept on the
+	// ownership is the activation gate and lease clock. Kept on the
 	// runtime because Shutdown reports its final facts.
 	ownership *ownership.Guard
-	// resolver is the V5.3-WP8 target resolver, kept for the same reason.
+	// resolver is the target resolver, kept for the same reason.
 	resolver *targetdns.Resolver
 	started  bool
-	// cache is the WP11A last-known-good desired state. It is written only from
+	// cache is the last-known-good desired state. It is written only from
 	// state the manager actually applied and read only when the panel is
 	// unreachable.
 	cache restore.LKG
@@ -94,13 +92,12 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		logx.Warn("v3 runtime idle: no AGENT_ADMIN_PORT and no PANEL_HTTP_URL; this node cannot receive tunnels")
 	}
 
-	// V4-WP6 telemetry: one error ledger and one revision tracker shared by the
+	// One error ledger and one revision tracker are shared by the
 	// control loop (writer) and the reporter (reader). Sharing is the point —
 	// a second copy on either side would make the panel's `known vs applied`
 	// comparison and `error_count` describe different processes.
 	//
-	// Built here rather than with the rest of the telemetry wiring because the
-	// V5.3-WP9 ownership gate below must be able to file its refusals into the
+	// Build these before restore so the ownership gate can record refusals into the
 	// ledger, and the FIRST thing that can apply a tunnel is the restore in the
 	// next block — a guard whose complaints only start being recorded after
 	// startup would go silent in exactly the window a fence matters.
@@ -108,10 +105,8 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 	revisions := reporter.NewRevisionState()
 	rt.ledger = ledger
 
-	// V5.3 WP9: the epoch fence and the lease clock, installed BEFORE the first
-	// apply so the restore path is fenced like every other activation path
-	// (V5-G2's lesson: a fact that has two delivery paths and only one of them
-	// learns about it is a fact that is wrong half the time).
+	// Install the epoch fence and lease clock BEFORE the first apply so restore
+	// is fenced exactly like every other activation path.
 	//
 	// The fence lives in the durable state directory next to the last-known-good
 	// cache: a node that forgets its highest epoch across a restart is the node
@@ -145,11 +140,8 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		}
 	}
 
-	// V5.3 WP8: the target resolver. Built BEFORE the restore for the same
-	// reason the ownership gate is: a restored EGRESS forwarder is constructed
-	// with the dialer that exists at that moment, and wiring it afterwards would
-	// leave the first listeners resolving once per connection — the "implemented
-	// but never wired" failure this project has already paid for twice.
+	// Build the target resolver BEFORE restore because restored EGRESS forwarders
+	// capture the dialer available at construction time.
 	//
 	// IP literals bypass it, a lookup failure falls back to the last good
 	// addresses, and the fact that it is doing so is logged and filed in the
@@ -368,7 +360,7 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 
 	rt.startedAt = time.Now()
 	rt.started = true
-	// WP11A: keep the local cache close to the truth without hooking every
+	// Keep the local cache close to the running truth without hooking every
 	// mutation path. The manager registry is the running state by construction,
 	// so a periodic snapshot of it can never contain a config the node failed to
 	// apply — which is exactly the "last known good" contract.
@@ -418,7 +410,7 @@ func (rt *v3Runtime) writeCache(version string) {
 	restore.RefreshCache(rt.cache, rt.cfg.AgentID, rt.tunnels, version)
 }
 
-// runtimeManifest builds the V5-WP1 capability manifest from the subsystems this
+// runtimeManifest builds the capability manifest from the subsystems this
 // process actually constructed.
 //
 // Why it takes a fact instead of being a package-level constant: the manifest is
@@ -495,7 +487,7 @@ const ShutdownTimeout = 10 * time.Second
 // the point is to leave a trace, not to hold up a container stop.
 const FinalReportTimeout = 3 * time.Second
 
-// Shutdown tears the v3 components down in a fixed order (WP11A):
+// Shutdown tears the runtime down in a fixed order:
 //
 //  1. refuse new applies (manager.BeginShutdown) — a command arriving mid-teardown
 //     must not be able to rebind a port;
@@ -579,19 +571,10 @@ func (rt *v3Runtime) Shutdown() {
 	rt.egress = nil
 }
 
-// restoreTunnels pulls the node's ACTIVE tunnels from the panel and re-applies
-// them. Until the WP1 Prisma contract lands, the source is a no-op: the wiring
-// point is exactly this function, and swapping in the real client is a one-line
-// change in source() below.
-//
-// EGRESS tunnels additionally need their target pool (devmap §5.5: "RELAY 模式
-// 的出口节点需同时拉取 EgressTarget"), which restore.Apply registers before the
-// forwarder is built.
-// restoreTunnels applies the node's desired state and reports where it came
-// from, so the control loop can reconcile once the panel answers again.
-// restoreTunnels applies the node's desired state and reports where it came
-// from. writeMu is the cache write lock shared with the writer loop and Shutdown,
-// so a restore cannot race a refresh into the same file.
+// restoreTunnels applies the node's desired state and reports whether it came
+// from the Panel or the last-known-good cache. EGRESS state restores its target
+// pool before the forwarder is built. writeMu shares the cache lock with the
+// writer loop and Shutdown so restore cannot race a refresh into the same file.
 func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.EgressManager, role string, cfg *agentconfig.Config, cache restore.LKG, writeMu *sync.Mutex) (string, error) {
 	if role == agentconfig.RoleIngress {
 		// An ingress node has no egress pools of its own; a nil EgressManager
@@ -602,7 +585,7 @@ func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress 
 	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// WP11A: a panel outage falls back to the local last-known-good cache; an
+	// A Panel outage falls back to the local last-known-good cache; an
 	// auth/identity/malformed answer does not (see restore.FetchAuthoritative).
 	snap, source, err := restore.FetchAuthoritative(rctx, source(cfg), cache, cfg.AgentID)
 	if err != nil {
