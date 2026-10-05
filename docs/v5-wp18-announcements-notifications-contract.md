@@ -786,7 +786,8 @@ delivery 测试里各有**字面量**断言随之更新（**只改字面量，�
 - `web/src/lib/nav.ts`：公告入口 `planned → available`（与登记同一个 WP 内收口；过渡态在
   `dd67543` 单独一个提交里，见 D5）。
 - `backend/tests/v5-wp18-announcement-rbac.test.mjs`（新增，6 test，node:test，进 CI 的 `tests/*.test.mjs`）。
-- `backend/src/services/__tests__/v5-wp18-channel-config.test.ts`（新增，10 test）。
+- `backend/src/services/__tests__/v5-wp18-channel-config.test.ts`（新增，8 test —— 初版 10 条里
+  2 条随 D4 的"未接线出口"一起删掉）。
 
 **D1（判断）「登记生效」的**可观察形态**是"能授权"，不是"表里多了一行"。**
 `adminPermissionGuard` 的语义是「未登记前缀 ⇒ 403，只放行超管」，所以登记只能靠**判定变化**证明：
@@ -820,13 +821,23 @@ webhook 则把每条启用行当一个独立接收方（全部是目标，按 `i
 会在账本里留 `rejected_target` —— 正是 Lead 点名的"把失败可见稀释成噪音"）；
 **读不到配置 = `storage_error`，不是"空配置"**（把一次 DB 抖动说成"这台安装没配渠道"是谎）。
 
-**D4（交付时上报的缺口，需 Lead 定夺）事实类通知的**投递触发器**仍未实现。**
+**D4（**待定 WP**：事实类通知的投递触发器 —— Lead 2026-10-05 裁决「不归 18.7」）**
 `deliverNotificationFacts()` 在生产里目前**只有公告这一条调用路径**；"派生 attention 事实 → 投递"
-的那个 worker/cron 不在任何 WP 行里（§6 的 18.1 是纯函数派生、18.2 是投递层、18.3/18.4 是渠道、
-18.5 公告、18.6 权限、18.7 Gate 收口）。因此 `platformChannelTargets(config, "webhook")`
-（给事实类通知用的平台级目标）**现在没有生产消费者** —— 我在代码注释里写明了这一点，
-**不假装它已经接上**。要不要在这个 WP 补触发器、还是单开一个 WP（它涉及"哪些事实进投递、
-多久跑一次、worker 与 api 谁跑"这些新决定），请 Lead 定；若归 18.7，那 18.7 就不只是"收口"。
+的那个 worker/cron **不在任何 WP 行里**（18.1 纯函数派生、18.2 投递层、18.3/18.4 渠道、18.5 公告、
+18.6 权限、18.7 Gate 收口）。**为什么单独立项**：它要定的是**新决定**，而且牵动 F1 的地基 ——
+  1. **哪些事实进投递**（F2 的 N1–N6 里今天只有 N1/N2 有派生实现）；
+  2. **多久跑一次**（跟随 `cron_check_node_offline` 的 10s 节拍，还是独立 cron）；
+  3. **worker 还是 api 跑**（两个进程各自派生会让静默期与账本承受双倍压力 —— 18.2 的唯一索引与
+     Redis SETNX 能兜住，但"谁跑"仍要显式决定）。
+把它塞进"收口"会让 18.7 既收口又开局，所以单独记在这里。
+
+**同一条裁决带出的删除（Lead 2026-10-05：「给它一个调用者，或者删掉它」）**：
+`platformChannelTargets(config, "webhook")` 与它的测试**已删**，`createWebhookChannel()` 也**不再进**
+`buildPlatformNotificationChannels()` 的注册表（它构造出来就会被唯一调用者丢掉）。理由：那个
+"平台级 webhook 目标"的领取者正是上面这个未立项的触发器 —— 留着的未接线出口，下一个接手的人
+很容易当成已接线。**触发器 WP 的待办里要有一件**：把"谁拿走 `webhook_targets`"连同
+`createWebhookChannel()` 一起加回注册表（`webhook_targets` 作为**加载器产物**仍然保留，
+缺的不是数据，而是那个决定）。
 
 **D5（判断）过渡态的粒度：`planned` 单独一个提交。**
 Lead 要求"先挂 `planned`、登记后再摘掉，两件事在同一个 WP 里闭环"。落地为两个提交：
@@ -836,7 +847,8 @@ Lead 要求"先挂 `planned`、登记后再摘掉，两件事在同一个 WP 里
 "菜单项不再 planned""labelKey 在""页面文件真的存在"。
 
 **验证记录（2026-10-05）**
-1. backend WP18 八个文件 `bun test` → **201 pass / 0 fail**（5834 expect；18.6 新增 10 test / 26 expect）。
+1. backend WP18 八个文件 `bun test` → **199 pass / 0 fail**（5825 expect；18.6 净新增 **8 test / 17 expect**
+   —— 初版 10 条里 2 条随 D4 的未接线出口一起删掉）。
 2. `node --experimental-transform-types --test tests/v5-wp18-announcement-rbac.test.mjs tests/authorization.test.mjs`
    → **10 pass / 0 fail**（前者 6 条为本次新增；后者是既有 RBAC 回归，证明登记没破坏既有判据）。
 3. web 全量 `bun test src` → **615 pass / 0 fail**（5657 expect，31 文件）；`tsc --noEmit` web/backend **全绿**

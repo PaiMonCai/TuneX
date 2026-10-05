@@ -15,23 +15,19 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildPlatformNotificationChannels,
   loadPlatformChannelConfig,
-  platformChannelTargets,
   type NotificationChannelConfigDb,
   type NotificationChannelRow,
 } from "../notification-channel-config.ts";
-import { enabledNotificationChannels, NOTIFICATION_CHANNEL_KINDS } from "../notification-delivery.ts";
+import { NOTIFICATION_CHANNEL_KINDS } from "../notification-delivery.ts";
 import { TELEGRAM_ENABLED_ENV } from "../notification-telegram.ts";
-import { WEBHOOK_ENABLED_ENV } from "../notification-webhook.ts";
 
 const ORIGINAL_ENV = {
   telegram: process.env[TELEGRAM_ENABLED_ENV],
-  webhook: process.env[WEBHOOK_ENABLED_ENV],
 };
 
 afterEach(() => {
   for (const [key, value] of [
     [TELEGRAM_ENABLED_ENV, ORIGINAL_ENV.telegram],
-    [WEBHOOK_ENABLED_ENV, ORIGINAL_ENV.webhook],
   ] as const) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -134,17 +130,12 @@ describe("A. 只认平台级启用行（停用 ≠ 删除）", () => {
 /* ================================================================== */
 
 describe("B. 配了行之后渠道真的变成可用（部署开关仍各自把关）", () => {
-  test("有 URL 才有 webhook 渠道；没 URL 就不进注册表（免得留 rejected_target 噪音）", async () => {
-    const without = buildPlatformNotificationChannels(await load([]));
-    const withUrl = buildPlatformNotificationChannels(
-      await load([row({ kind: "webhook", target: "https://hooks.example.com/a" })]),
-    );
-    expect(without.map((c) => c.kind)).not.toContain("webhook");
-    expect(withUrl.map((c) => c.kind)).toContain("webhook");
-    // 不变的三个 kind 仍是闭集里的那三个。
-    for (const channel of [...without, ...withUrl]) {
-      expect(NOTIFICATION_CHANNEL_KINDS as readonly string[]).toContain(channel.kind);
-    }
+  test("注册表只含今天**真有消费者**的渠道：webhook 即便配了 URL 也不进（未接线出口已删）", async () => {
+    const config = await load([row({ kind: "webhook", target: "https://hooks.example.com/a" })]);
+    // 数据仍被加载出来（触发器 WP 会用它），但不产生"看起来能用"的渠道实例。
+    expect(config.webhook_targets).toEqual(["https://hooks.example.com/a"]);
+    expect(buildPlatformNotificationChannels(config).map((c) => c.kind)).toEqual(["email", "telegram"]);
+    expect(NOTIFICATION_CHANNEL_KINDS as readonly string[]).toContain("webhook");
   });
 
   test("telegram：开关关 ⇒ 即使行里有密文也不算配置好；开关开 + 有密文 ⇒ 可用", async () => {
@@ -163,22 +154,4 @@ describe("B. 配了行之后渠道真的变成可用（部署开关仍各自把�
     delete process.env[TELEGRAM_ENABLED_ENV];
   });
 
-  test("webhook：开关关 ⇒ 不算配置好（`enabledNotificationChannels` 把它滤掉）", async () => {
-    const config = await load([row({ kind: "webhook", target: "https://hooks.example.com/a" })]);
-    const channels = buildPlatformNotificationChannels(config).filter((c) => c.kind === "webhook");
-
-    delete process.env[WEBHOOK_ENABLED_ENV];
-    expect(enabledNotificationChannels(channels)).toEqual([]);
-
-    process.env[WEBHOOK_ENABLED_ENV] = "true";
-    expect(enabledNotificationChannels(channels).map((c) => c.kind)).toEqual(["webhook"]);
-    delete process.env[WEBHOOK_ENABLED_ENV];
-  });
-
-  test("平台级目标：只有 webhook 有（email/telegram 的目标属于收件人，不走这里）", async () => {
-    const config = await load([row({ kind: "webhook", target: "https://hooks.example.com/a" })]);
-    expect(platformChannelTargets(config, "webhook")).toEqual(["https://hooks.example.com/a"]);
-    expect(platformChannelTargets(config, "email")).toEqual([]);
-    expect(platformChannelTargets(config, "telegram")).toEqual([]);
-  });
 });

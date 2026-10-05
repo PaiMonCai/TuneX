@@ -30,7 +30,6 @@
 import { createEmailChannel, type NotificationChannel } from "./notification-delivery.ts";
 // webhook 工厂从它自己的模块取：`notification-delivery.ts` 只是**用它**（默认注册表），
 // 并不转出它 —— 从那里 import 会在 tsc 下立刻红（这是好事：依赖方向清楚）。
-import { createWebhookChannel } from "./notification-webhook.ts";
 import { createTelegramChannel, telegramSealedTokenFromRow } from "./notification-telegram.ts";
 
 /** 一行的最小形状（本模块只认这几列；`SELECT` 出来直接用）。 */
@@ -121,9 +120,8 @@ export async function loadPlatformChannelConfig(
  * 配置 → 渠道实例。用的就是 18.2/18.3/18.4 的那三个工厂（**不是第二套实现**），
  * 只是把"从哪拿到 URL / token"接上：
  *   · email：SMTP 凭据齐备（部署级 env，与 F5 表无关）；
- *   · webhook：**只有配置里真有 URL 时才进注册表**。理由：渠道的 `isConfigured` 只回答
- *     "部署开关开着没有"，没有目标却把渠道塞进注册表，投递层会记一条 `rejected_target`
- *     失败行 —— 那正是 Lead 点名的"把失败可见稀释成噪音"（没人要求给 webhook 发，就与它无关）；
+ *   · webhook：**不进注册表**（今天没有消费者，见文件末尾）。它的 URL 仍会被加载出来
+ *     （`webhook_targets` 是数据，不是假装能用的出口）；
  *   · telegram：行里带密文才可能 `isConfigured`（`createTelegramChannel` 自己判"开关 + 有密文"，
  *     且**不试解封** —— 解不开是 `secret_unreadable`，是可排查的坏数据，不是"没配"）。
  *
@@ -132,22 +130,24 @@ export async function loadPlatformChannelConfig(
  * 才不会让一次开关误判变成"这台安装没有渠道"。
  */
 export function buildPlatformNotificationChannels(config: PlatformChannelConfig): NotificationChannel[] {
-  const channels: NotificationChannel[] = [createEmailChannel()];
-  if (config.webhook_targets.length > 0) channels.push(createWebhookChannel());
-  channels.push(createTelegramChannel({ sealedToken: () => config.telegram_sealed_token }));
-  return channels;
+  // **只给今天真有消费者的渠道**：email（SMTP）与 telegram（公告推送，WP18.5 的接线）。
+  // webhook 不进这里 —— 领取它那些 URL 的调用者（事实类通知的投递触发器）还不存在；
+  // 把"构造出来就被丢掉"的渠道塞进注册表，就是 Lead 说的"未接线出口"，
+  // 下一个接手的人会以为它已经接上了（触发器 WP 立起来时与目标一起加回）。
+  return [
+    createEmailChannel(),
+    createTelegramChannel({ sealedToken: () => config.telegram_sealed_token }),
+  ];
 }
 
-/**
- * 平台级渠道的**投递目标**（本期只有 webhook 有：它的目标来自配置行，而不是"某个用户"）。
+/*
+ * ── 这里**故意没有**"平台级渠道目标"的出口（Lead 2026-10-05 裁决）──
  *
- * email / telegram 的目标属于**收件人**（用户的邮箱 / `tg_id`），由各自的受众解析器给出，
- * 不走这里 —— 把两者混在一起会让"发给谁"出现两个答案。
+ * 曾经有一个 `platformChannelTargets(config, "webhook")`：把配置里的 webhook URL 交出去，
+ * 而**调用者不存在**（事实类通知的投递触发器还没立项）。Lead 的裁决是「给它一个调用者，
+ * 或者删掉它」—— 留着的未接线出口，下一个接手的人很容易当成已接线。函数与它的测试都删了。
  *
- * **当前消费者**：无。事实类通知（节点离线、下发失败…）的**投递触发器**还没有实现
- * （`deliverNotificationFacts` 在生产里只有公告那一条调用路径）—— 这是 18.6 交付时
- * 明确上报的缺口（见契约 §12.4-D4），不是"写了没人用"的含糊状态。
+ * `webhook_targets` 本身留在配置里，因为它是**加载器的产物（数据）**，不是出口：
+ * 谁需要它，谁就在触发器 WP 里连同"哪些事实要送 webhook、多久送一次"一起决定。
+ * 触发器 WP 的三件待办见契约 §12.4-D4。
  */
-export function platformChannelTargets(config: PlatformChannelConfig, kind: string): string[] {
-  return kind === "webhook" ? [...config.webhook_targets] : [];
-}
