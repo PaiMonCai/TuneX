@@ -801,8 +801,8 @@ describe("J. 静态守卫：出站实现不得改回 fetch", () => {
     expect(source.includes("createPinnedSocketTransport")).toBe(true);
   });
 
-  test("webhook 已登记为实现渠道（与 telegram 区分）", () => {
-    expect(IMPLEMENTED_CHANNEL_KINDS).toEqual(["email", "webhook"]);
+  test("webhook 已登记为实现渠道（telegram 在 WP18.4 登记）", () => {
+    expect(IMPLEMENTED_CHANNEL_KINDS).toEqual(["email", "webhook", "telegram"]);
     expect(IMPLEMENTED_CHANNEL_KINDS.includes("webhook")).toBe(true);
   });
 });

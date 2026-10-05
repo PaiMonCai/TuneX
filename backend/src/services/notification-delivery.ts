@@ -31,6 +31,7 @@ import { isMailConfigured, sendMail, type MailMessage, type MailResult } from ".
 import type { NotificationFact, NotificationScope } from "./notification-facts.ts";
 import { cooldownSecondsForReason, notificationCooldownKey } from "./notification-facts.ts";
 import { createWebhookChannel } from "./notification-webhook.ts";
+import { createTelegramChannel } from "./notification-telegram.ts";
 
 /* ================================================================== */
 /* 渠道类型与结果（F3）                                                */
@@ -45,7 +46,7 @@ export type NotificationChannelKind = (typeof NOTIFICATION_CHANNEL_KINDS)[number
  * —— 不做"注册了就算支持"的假装）。清单随各 WP 的落地而增长：
  * WP18.2 email、WP18.3 webhook、WP18.4 telegram。
  */
-export const IMPLEMENTED_CHANNEL_KINDS: readonly NotificationChannelKind[] = ["email", "webhook"];
+export const IMPLEMENTED_CHANNEL_KINDS: readonly NotificationChannelKind[] = ["email", "webhook", "telegram"];
 
 /** 投递失败/拒绝原因（`ChannelResult.reason` 的闭集；对应契约 F3 的 `{sent, reason}`）。 */
 export type NotificationFailureReason =
@@ -53,6 +54,13 @@ export type NotificationFailureReason =
   | "transport_error"
   | "rejected_target"
   | "unsupported_channel"
+  /**
+   * 凭据存在但**解不开/不可用**（WP18.4 追加；密文用错主密钥、被截断、或解出来的东西形状不对）。
+   *
+   * 为什么必须与 `not_configured` 分开：把一次密钥轮换事故显示成"没配置"，
+   * 等于用"看起来没配"掩盖一次数据损坏 —— 这正是 C3 禁止的降级（F5「解封失败一律抛错」）。
+   */
+  | "secret_unreadable"
   /** 账本写不进去（DB 不可用）——不投递，见 {@link deliverNotificationFacts} 的顺序说明。 */
   | "ledger_unavailable";
 
@@ -61,6 +69,7 @@ export const NOTIFICATION_FAILURE_REASONS = [
   "transport_error",
   "rejected_target",
   "unsupported_channel",
+  "secret_unreadable",
   "ledger_unavailable",
 ] as const;
 
@@ -239,14 +248,14 @@ export function createEmailChannel(deps: EmailChannelDeps = {}): NotificationCha
 }
 
 /**
- * 默认渠道注册表。**每一个渠道都有自己的闸门**（email = SMTP 凭据齐备、webhook = 部署开关），
- * 未配置的渠道会留下一条 `not_configured` 失败行、零出站 —— 可见，不假装成功。
+ * 默认渠道注册表。**每一个渠道都有自己的闸门**（email = SMTP 凭据齐备、webhook/telegram =
+ * 各自的部署开关），未配置的渠道会留下一条 `not_configured` 失败行、零出站 —— 可见，不假装成功。
  *
  * 接线（WP18.6）如果只想给"本安装真正打开的渠道"记账，应当显式传 `channels`，
  * 免得上线后账本被一堆 `not_configured` 行填满而失去"失败可见"的意义。
  */
 export function defaultNotificationChannels(): NotificationChannel[] {
-  return [createEmailChannel(), createWebhookChannel()];
+  return [createEmailChannel(), createWebhookChannel(), createTelegramChannel()];
 }
 
 /* ================================================================== */

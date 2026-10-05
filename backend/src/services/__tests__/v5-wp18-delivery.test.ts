@@ -427,29 +427,11 @@ describe("E. 静默期存储不可用时照发（Lead 裁决 O2）", () => {
 /* ------------------------------------------------------------------ */
 
 describe("F. fail-closed：未知/未实现/无收件人一律拒绝并留记录", () => {
-  test("枚举里尚未实现契约的渠道类型 → unsupported_channel + 零出站", async () => {
-    // 过滤条件用 IMPLEMENTED_CHANNEL_KINDS（而不是写死 webhook/telegram）：18.4 落地 telegram
-    // 之后本条的期望值必须被重新审视 —— 下面的非空断言会逼着人改，不允许退化成空循环式的假通过。
-    const pending = NOTIFICATION_CHANNEL_KINDS.filter((k) => !IMPLEMENTED_CHANNEL_KINDS.includes(k));
-    expect(pending).toEqual(["telegram"]);
-    for (const kind of pending) {
-      const ledger = memoryLedger();
-      let called = 0;
-      const channel: NotificationChannel = {
-        kind,
-        isConfigured: () => true,
-        validateConfig: () => ({ ok: true }),
-        send: async () => {
-          called++;
-          return { sent: true };
-        },
-      };
-      const outcomes = await deliverNotificationFacts([FACT], depsOf({ ledger: ledger.store, channel }));
-      expect(outcomes[0]!.status).toBe("failed");
-      expect(outcomes[0]!.reason).toBe("unsupported_channel");
-      expect(called).toBe(0);
-      expect(ledger.rows[0]!.settled?.failure_reason).toBe("unsupported_channel");
-    }
+  test("三个渠道类型已全部落地；闸门只对**枚举外**的 kind 生效", () => {
+    // 18.3/18.4 把 webhook / telegram 落成实现之后，本条的语义变了：枚举里不再有"未实现"的 kind。
+    // 显式断言"没漏"，而不是留一个空循环假装通过（`unsupported_channel` 分支由下一条用
+    // 枚举外的 kind 覆盖，那条断言不是空转的）。
+    expect(IMPLEMENTED_CHANNEL_KINDS).toEqual([...NOTIFICATION_CHANNEL_KINDS]);
   });
 
   test("枚举外的渠道类型 → 同样拒绝（不是「注册了就算支持」）", async () => {

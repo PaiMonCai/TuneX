@@ -480,6 +480,88 @@ F4.3 的 3 次重试，而解析不了的目标重试同样次数是同样的结
 
 **契约未覆盖、本期未做**：不做 webhook 签名（F9 明确）、不做每租户 webhook（O6 未拍板）、
 不做投递日志租户页（F7）。**仍未落地的契约项**：F5 的 `notification_channel` 表
-（见 §12.3 的阻塞说明）—— 本期的渠道配置以「调用方解析目标」的形态接入
+（见 §12.2-D4 的阻塞说明）—— 本期的渠道配置以「调用方解析目标」的形态接入
 （18.2 的 `NotificationTargetResolver` 契约），表本身与接线归 WP18.6 之前的一个小提交。
+
+### 12.2 WP18.4 —— Telegram 渠道 + token 密文存储 + `tg_id` 绑定语义（2026-10-05）
+
+**交付**：`backend/src/services/notification-seal.ts`（新增）、
+`backend/src/services/notification-telegram.ts`（新增）、
+`backend/src/services/__tests__/v5-wp18-telegram.test.ts`（新增，29 test / 138 expect）、
+`backend/src/services/notification-delivery.ts`（追加：`IMPLEMENTED_CHANNEL_KINDS` += `telegram`、
+`defaultNotificationChannels()` += telegram、失败原因闭集 += **`secret_unreadable`**）、
+`backend/src/services/__tests__/v5-wp18-delivery.test.ts`（改一条已交付断言的**语义**，见 D5）、
+`backend/src/services/__tests__/v5-wp18-webhook.test.ts`（同一条清单断言同步到三个渠道）。
+
+**D1（判断，**需 Lead 确认**）telegram 也加部署级开关，默认关（`TUNEX_NOTIFICATION_TELEGRAM_ENABLED`）。**
+契约只在 O4 里点名了 webhook，但 Lead 给的**理由**是通用的：「新增的出站通道默认关，要开必须显式
+打开」。而且 telegram 比 webhook 更需要它：**`User.tg_id` 今天没有任何验证**（见 D3 的残余风险）。
+如果 Lead 要 telegram 默认开，改一行默认值即可，本条记录随之作废。
+
+**D2（判断）失败原因闭集新增 `secret_unreadable`。**
+F3 的 `ChannelResult` 写的是 `{not_configured | transport_error | rejected_target | ...}`，
+这个 `...` 就是给它留的位置。**必须**与 `not_configured` 分开：密文存在但解不开（换错主密钥、
+被截断、解出来的东西不是 bot token）是**可排查的数据损坏**，把它显示成"没配置"就是用"看起来没配"
+掩盖一次密钥事故 —— C3 明令禁止这种降级。证据：测试 E 组三例（错主密钥 / 解出非 token / 空主密钥
+→ 全部 `secret_unreadable` + 零出站 + 账本留行）。
+
+**D3（判断）`tg_id` 绑定语义冻结，并**明写残余风险**。**
+1. 收件人**只能**来自 `User.tg_id`：`trim` 后为空 = `unbound`，形状非法（非十进制整数/超 19 位）= `invalid_tg_id`，
+   两者都**不投递**，落一条 `rejected_target`（可见，不是静默丢弃）。
+2. 「绝不猜用户」用**类型**表达：`resolveTelegramChatTarget(recipient)` 的入参只有 `tg_id`，
+   不接受 user id / email / 昵称 —— 「未绑定时拿 `User.id` 顶上」这种写法**写不出来**。
+3. **残余风险（不含糊）**：`tg_id` 是用户可自由编辑且**无验证**的字段
+   （`routes/settings.ts` 的 `PATCH /profile`），所以「已绑定」只等于「填了一个形状合法的 chat id」，
+   **不等于**「这个 chat 属于这个用户」。真正的绑定验证需要**入站 bot 握手**（`/start` 回传一次性码），
+   而契约 §9.4 明确本期不做入站 —— 缺口记在这里，**不假装验证过**。
+   本期因此：(a) 渠道默认关（D1）；(b) 收件人由调用方按 scope 解析（18.2 契约），
+   本模块不提供「给所有用户发」这种默认；(c) 绑定表/握手留给打开 O6 时单独立项。
+
+**D4（阻塞，需 Lead 处置）F5 的 `notification_channel` 表与迁移**本期未落**。**
+原因：`prisma/schema.prisma` 现在被**并行成员**占用 —— `git status` 显示 WP20 的枚举值
+（`BILLING_SETTLEMENT_TAKEOVER_MINUTES`）已 staged、WP18.5 的枚举注释（`NOTICE*` deprecated）在
+unstaged 区。`git add backend/prisma/schema.prisma` 会把别人的在建改动扫进我的提交（纪律 2 明令禁止，
+且这个仓库已经出过一次同样的事故）。**本期交付的是表的「使用侧」**：
+`telegramSealedTokenFromRow()`（F5 行 → 渠道依赖的纯映射，判定表见测试 I 组）+ `sealNotificationSecret()`
+（唯一落库入口）+ 渠道的解封/使用闭环，全部可测。
+**待落地的 DDL（接线 WP 直接照抄即可，唯一约束的取舍见附注）**：
+~~~prisma
+model NotificationChannel {
+  id            Int      @id @default(autoincrement())
+  scope_kind    String   @db.VarChar(16)  // platform | workspace（与 NotificationScope 同源）
+  workspace_id  Int?                      // platform ⟹ NULL（结构上表达 F5 的边界）
+  kind          String   @db.VarChar(16)  // email | webhook | telegram
+  target        String   @db.VarChar(512) // webhook URL / chat id —— **token 不放这里**
+  secret_enc    String?  @db.Text         // AES-256-GCM，`v1.<iv>.<ct>.<tag>`（notification-seal）
+  enabled       Boolean  @default(true)
+  created_by_id Int?
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+  @@map("notification_channel")
+}
+~~~
+附注（留一个**不能靠唯一索引解决**的坑）：不要顺手加 `@@unique([scope_kind, workspace_id, kind])` ——
+platform 行的 `workspace_id` 是 NULL，而 MySQL 的唯一索引里 NULL 互不相等，这个约束会给出**假的排他性**
+（平台侧照样能插两条 telegram）。真要做「一 scope 一 kind」得用生成列或在应用层加锁，那是接线 WP 的取舍。
+
+**D5（判断）telegram 的 `transport_error` 会触发 F4.3 的重试，因此把「确定性目标问题」映射成
+`rejected_target`**：Telegram 返回 `error_code=400`（chat not found / 参数不可接受）与
+`403`（bot 被拉黑 / 不在群里）都是**重试无用**的，归 `rejected_target`；429 / 5xx / 3xx / `ok=false`
+归 `transport_error`（有界重试 ≤3 次，测试 G 组断言 attempts=3）。
+同时，18.2 里那条「枚举里尚未实现契约的渠道类型」的断言语义失效（枚举里不再有未实现的 kind），
+改成显式断言「`IMPLEMENTED_CHANNEL_KINDS` == `NOTIFICATION_CHANNEL_KINDS`」，
+`unsupported_channel` 分支继续由「枚举外的 kind」那条覆盖 —— 不留空循环式的假通过。
+
+**D6（判断）telegram 出站用 `fetch`（与 webhook 刻意不同），token 的脱敏在渠道层做。**
+理由：Telegram 的目标是 chat id，端点 `TELEGRAM_API_BASE` 是**硬编码常量**，没有「用户指定 URL」这回事，
+F9.4 的连接级 IP 固定在这里没有对应问题。但 token 在 URL 路径里（协议如此），
+所以：`detail` 与账本 `error` 必须经 `redactTelegramToken()` 脱敏（含 URL 编码形态），
+账本 `target` 只落 chat id（`redactTarget` 对非 chat id 形状**一律返回 `***`**，防调用方把 URL 当目标传进来）。
+证据：测试 F 组的「传输层错误带完整 URL」与「description 回显 token」两例，断言账本 `error` 里
+不含 token、且含 `***`。**chat_id 以 JSON 字符串下发**：它是 64 位整数，走 JSON number 会在大 id 上丢精度。
+
+**D7（判断）渲染：`parse_mode=HTML` 必须转义，且截断**不得切断实体**。**
+`&`→`&amp;`、`<`→`&lt;`、`>`→`&gt;`（先换 `&`），超 4096 字符时回退到最后一个未闭合实体之前 ——
+把 `&amp;` 切成 `&am` 会被 Telegram 返回 400，那会变成一条"我们渲染坏了"的假故障（测试 H 组）。
+
 
