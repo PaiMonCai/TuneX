@@ -46,7 +46,7 @@ export default async function AdminAnnouncementsPage() {
         "Platform announcements: content for everyone (plain text; in-app + enabled channels)",
       )}
       adminMode
-      showToaster={false}
+     
     >
       <Suspense fallback={<div className="h-96 animate-pulse rounded-lg bg-[var(--muted)]" />}>
         <AnnouncementsBody locale={locale} />
