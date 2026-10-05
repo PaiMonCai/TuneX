@@ -188,18 +188,32 @@ def probe_echo(server: UDPEcho, payload: bytes = b"target-check", timeout: float
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def runner_data_ip() -> str:
-    """The runner's own address on the ingress data network.
+def _network_gateway(network: str) -> str:
+    """Return the Docker bridge gateway that is reachable from containers.
 
-    A literal address, not a name: the Forward's target must be reachable from the
-    Agent, and the Agent resolves names on that network — but relying on DNS for a
-    container the gate itself owns would add a dependency the test does not need.
+    PR Integration runs this gate on the Actions host, not inside the historical
+    `g0-runner` container. The host-side UDP echo server binds 0.0.0.0, so the
+    bridge gateway is the stable address Agents can use to reach that process
+    without granting a test container access to the Docker socket.
+    """
+    return H.docker(
+        ["network", "inspect", "-f", "{{(index .IPAM.Config 0).Gateway}}", network],
+        allow=True,
+    ).strip()
+
+
+def runner_data_ip() -> str:
+    """Address of the gate's UDP echo target on the ingress data network.
+
+    Historical/manual runs may still provide `g0-runner`; PR CI runs the gate on
+    the Docker host. Prefer the container address when present and fall back to the
+    bridge gateway, which reaches the host-bound echo server from the Agent.
     """
     out = H.docker(["exec", RUNNER_CONTAINER, "sh", "-c", "hostname -i"], allow=True).strip()
     for candidate in out.split():
         if candidate.startswith("172.31.10."):
             return candidate
-    return out.split()[0] if out.split() else ""
+    return _network_gateway("wp14_ingress_data")
 
 
 def runner_egress_ip() -> str:
@@ -224,7 +238,13 @@ def runner_egress_ip() -> str:
         for candidate in out.split():
             if candidate.startswith(prefix):
                 return candidate
-    return ""
+
+    # PR Integration executes on the Docker host. The host-side echo server is
+    # reachable from the egress Agent through this network's bridge gateway.
+    gateway = _network_gateway("wp14_egress_data")
+    if prefix and gateway.startswith(prefix):
+        return gateway
+    return gateway
 
 
 ECHO_ALT_PORT = UDP_ECHO_PORT + 1
