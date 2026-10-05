@@ -1,13 +1,18 @@
-# V5.1b — UDP Datagram 语义契约（草案 / DRAFT）
+# V5.1b — UDP Datagram 语义契约（WP5-B0）
 
-> **状态：DRAFT（2026-10-04），未冻结。** 本文是 `DEVELOPMENT.md` §6.2 的前置契约
-> 文档，对应拆分项 `WP5-B0 Datagram contract`（`DEVELOPMENT.md:1405`）。Lead 评审并
-> 合并进 §6.2 之后，本文即被取代。
+> **状态：§1–§8、§10 冻结于 2026-10-04（B0）；§9 的八项产品决策冻结于 2026-10-05。**
+> 本文是 `DEVELOPMENT.md` §6.2 的前置契约文档，对应拆分项 `WP5-B0 Datagram
+> contract`。WP5-B1（UDP DIRECT）已按本文实现并过 Gate V5-G1B（76/0）；**WP5-B2
+> （UDP RELAY）据此解冻**，实施规格见 §12。
+>
+> **文件名保持不变**（`v5-1b-datagram-contract-draft.md`）：它已被
+> `agent/internal/forwarder/interface.go` 等代码注释与 `DEVELOPMENT.md` §6.2 引用，
+> 改名会让引用漂移。档名里的 `draft` 是历史，**状态以本段为准**。
 >
 > 本文**不含任何实现**：没有补丁、没有 Go/TS 代码，也不修改任何代码文件。它唯一的
-> 产物是**语义**。与被冻结的 §6.1（WS/TLS 语义契约，`DEVELOPMENT.md:1118-1332`）同一
-> 条纪律：每条结论要么指向仓库事实（`文件:行`），要么指向已经冻结的 V5 不变量；仓库
-> 事实无法唯一回答的，写进 §9「需要产品决策」并**不猜**，而不是从枚举名字猜行为。
+> 产物是**语义**。与被冻结的 §6.1（WS/TLS 语义契约）同一条纪律：每条结论要么指向仓库
+> 事实（`文件:行`或符号名），要么指向已经冻结的 V5 不变量。§9 在 2026-10-05 之前是
+> "不猜清单"，**现在它是冻结的产品决策**——凡与 §9 冲突的旧表述以 §9 为准。
 >
 > **行号说明**：下文行号取自 2026-10-04 本草案写作时刻的工作树。`backend/**`、
 > `agent/**`、`web/src/**`、`DEVELOPMENT.md` 正被其他成员并行编辑，行号可能漂移；
@@ -19,14 +24,14 @@
 
 | # | 问题 | 回答位置 | 结论是否已冻结 |
 |---|---|---|---|
-| 1 | UDP「会话」是什么，什么结束它 | §2 | 结构冻结，数值待产品决策（§9.2/9.3） |
+| 1 | UDP「会话」是什么，什么结束它 | §2 | 结构冻结；数值沿用 B1（30s / 1024，见 §9.2 / §9.3） |
 | 2 | 用户可见 protocol vs 内部 transport | §1 | **冻结** |
-| 3 | DIRECT / RELAY / 跨节点跳 | §3 | DIRECT 冻结；RELAY 的跳形态**未冻结**（§9.1） |
+| 3 | DIRECT / RELAY / 跨节点跳 | §3 | DIRECT 冻结；**RELAY 的跳形态已冻结**（§3.3 + §9.1：datagram 端到端） |
 | 4 | StreamRuntime 各方法对 datagram 的意义 | §4 | **冻结**（Drain/SetUpstream 明确不适用） |
-| 5 | 端口所有权 | §5 | 冻结（并暴露一处 schema 层面的取舍，§9.4） |
-| 6 | 健康/观测必须上报的事实 | §6 | 事实清单冻结，落点待决策（§9.5） |
-| 7 | Gate V5-G1B 映射到可执行检查 | §7 | **冻结** |
-| 8 | 未猜测的开放产品决策 | §9 | — |
+| 5 | 端口所有权 | §5 | 冻结；TCP 与 UDP **不共享端口号**（§9.4） |
+| 6 | 健康/观测必须上报的事实 | §6 | 事实清单冻结；落点见 §9.5（v1 只观测）与 §10 第 2 条（封闭键集） |
+| 7 | Gate V5-G1B 映射到可执行检查 | §7 | **冻结**（B2 的增量见 §12.3，且不得删旧断言） |
+| 8 | 未猜测的开放产品决策 | §9 | **已全部冻结（2026-10-05）** |
 
 ---
 
@@ -160,7 +165,7 @@ value     这条 mapping 现在把包发给哪个 target/上游（以及它自�
 ### 2.3 什么结束一条 mapping（冻结三种，穷尽）
 
 ~~~text
-① idle 到期          双向空闲超过 idle timeout → 回收（§9.2 定数值与是否可配）
+① idle 到期          双向空闲超过 idle timeout → 回收（§9.2：沿用 B1 的 30s，不新增列）
 ② 显式关闭            UDP **没有**显式关闭语义：不存在 FIN/RST，客户端不发包就是全部信号
 ③ Agent 停止/退出     Stop / ShutdownAll / 进程退出 → socket 关闭，全部 mapping 一起消失
 ~~~
@@ -184,7 +189,7 @@ socket（§4.3）。
   一个无上限的 UDP 入口 = 一个可以用伪造源地址把 Agent 内存吃光的放大器；同时
   UDP 的源地址是可伪造的，所以「每个源地址一条 mapping」这条朴素规则在对手手里
   就是资源耗尽攻击。
-- 上限与超限行为（丢弃新包 / 拒绝新 mapping / 淘汰最久未用）是**产品决策**，见 §9.3。
+- 上限与超限行为已于 §9.3 冻结（沿用 B1：上限 1024，超限**丢弃新来源的报文**并计数）。
   无论选哪个，Gate 都必须能断言「超限后的行为是确定的、可观测的」，见 §7 G1B.6。
 
 ---
@@ -221,7 +226,7 @@ client ══ UDP ══> ingress listener(udp) → [跨节点跳：见 §3.3] �
   各自等各自 ACK，共用同一个 `config_revision`（`orchestrator.ts:24-30`）。
 - 出口池、LB 策略、健康视图不变（§6.1 同款论断）。
 
-### 3.3 跨节点跳：本草案**唯一不冻结**的核心问题
+### 3.3 跨节点跳：形态（2026-10-05 **已冻结**为 datagram 端到端）
 
 §6.1 对 ws/tls 的答案是「这一跳仍然是裸 TCP」，理由是运维信任域 + 拒绝在协议 WP 里
 引入第二套跨节点传输（`DEVELOPMENT.md:1141-1145`）。**这个理由不能机械照搬**，因为：
@@ -245,9 +250,11 @@ client ══ UDP ══> ingress listener(udp) → [跨节点跳：见 §3.3] �
    也就是说这个字段今天在下发链路上被丢弃，出口节点无论目标是 TCP 还是 UDP 都只会
    `net.DialTimeout("tcp", ...)`（`agent/internal/forwarder/egress.go:242`）。
 
-**因此冻结到这里为止**：WP5-B1（UDP DIRECT）不依赖这个问题的答案，可以先做并且必须
-先做（§6.2「UDP DIRECT 先于 UDP RELAY」，`DEVELOPMENT.md:1425-1439`）；WP5-B2
-（UDP RELAY）在 §9.1 决策落地前**不得开工**。三种候选与代价写在 §9.1，本文不作选择。
+**冻结（2026-10-05，§9.1 决策）**：候选 **(b) —— 跳是 datagram 端到端**（egress 监听
+UDP），**不是**裸 TCP + 分帧。WP5-B1（UDP DIRECT）不依赖这个问题的答案，已经先做并且
+必须先做（§6.2「UDP DIRECT 先于 UDP RELAY」），且已过 Gate V5-G1B（76/0）；WP5-B2
+（UDP RELAY）据此解冻。三种候选的取舍、hop 头布局、取证规则与不做项全部记在 §9.1，
+实施规格见 §12。本节上文对三种候选的描述保留为**决策前的分析**。
 
 ### 3.4 target 生命周期 vs TCP connection（冻结）
 
@@ -403,9 +410,10 @@ agent guard     map[string]bool，键是 "tcp:<port>"（tunnel.go:58、130-131�
 
 冻结：Agent 侧 guard 必须按协议命名空间记键（`"udp:<port>"`），并且对外暴露事实时
 必须保留命名空间（新增一个协议维度的视图，或在既有视图旁增加 UDP 专属字段）。
-**不得**把两个命名空间压平后上报。面板是否需要同步改，取决于 §9.4 的产品决策：
-若冻结「同号不允许」，扁平 `used_ports` 对「端口是否真的被绑」这个判定仍然正确（§6.3），
-只需新增「这条绑定属于哪个协议」的可选事实；若改为允许同号，则两侧都必须协议化。
+**不得**把两个命名空间压平后上报。§9.4 已冻结「同一节点上 TCP 与 UDP **不共享端口号**」，
+因此扁平 `used_ports` 对「端口是否真的被绑」这个判定仍然正确（§6.3），只需新增
+「这条绑定属于哪个协议」的可选事实。**若将来放宽为允许同号，两侧都必须协议化**——
+这正是 §9.4 把它列为"另开 WP"的原因。
 
 ### 5.4 lease 与 legacy DIRECT 的关系（对 UDP 同样成立）
 
@@ -495,7 +503,8 @@ UDP 的对应规则：转发失败或被丢弃的包不计入 bytes，只进 dro
 
 结论：**「packet accounting」是新建一条链，不是复用一条链**。契约只能冻结事实的形状
 （§6.1）与口径纪律（delivered、分方向、drops 不入账），落点（状态上报 vs 计量端点）与
-是否计费属于产品决策，见 §9.5。Gate 也必须按**被选中的那条链**写断言（§7 G1B.12）。
+是否计费已于 §9.5 冻结（v1 **只做观测、不入账**；packets 计费属 B3）。
+Gate 也必须按**被选中的那条链**写断言（§7 G1B.12）。
 
 ### 6.4 面板侧需要改的契约点（按文件）
 
@@ -544,7 +553,7 @@ agent/internal/forwarder/*                新 datagram runtime 的计数实现
 | G1B.12 | packet accounting | 见 §6.3 | 被选中的链上能看到单调递增的 packets/bytes；drops 不计入 bytes |
 | G1B.13 | lease conflict | 对已被占用的端口再申请 | 拒绝且 `port_taken`；无第二个 listener；无重复 bind |
 | G1B.14 | DIRECT | 完整 DIRECT 用例 | 端到端可用，且协议事实/transport 事实正确 |
-| G1B.15 | RELAY | 见 §9.1 | **决策落地前不得开跑**；落地后：先出口后入口可观测、失败补偿不留半条隧道 |
+| G1B.15 | RELAY | 按 §9.1 已冻结的跳形态（datagram 端到端） | **已解冻**；断言按 §12.3 追加：两跳端到端、映射隔离、来源取证、超限可观测、先出口后入口可观测、失败补偿不留半条隧道 |
 | G1B.16 | old Agent rejected before dispatch | 旧 Agent（无 udp 广告）创建 udp Forward | 面板在入队前拒绝（`upgrade_required` / `protocol_not_supported`），**没有**租约、**没有** listener |
 
 ### 7.2 必须补的负例与回归（对齐 G1A 的负例纪律）
@@ -616,8 +625,9 @@ backend/src/services/__tests__/dispatch-protocol-v5.test.ts    历史 udp 被当
 WP5-B0 Datagram contract      本文档；不改代码
 WP5-B1 UDP DIRECT             agent/internal/forwarder 新 datagram runtime + factory
                               分支；backend 的协议/transport 契约与 entitlement 数据
-                              migration；面板观测字段（按 §9.5 决策）
-WP5-B2 UDP RELAY              §9.1 决策之后；编排顺序不变，跳形态按决策
+                              migration；面板观测字段（按 §9.5：v1 只观测）
+WP5-B2 UDP RELAY              **已解冻**（§9.1 决策已落地）；编排顺序不变，跳形态为
+                              datagram 端到端；实施规格与 DoD 见 §12
 WP5-B3 UDP telemetry/account  §6.3 的链落地 + health/panel 契约
 Gate V5-G1B                   scripts/v3-e2e/v5-g1b.py（模型 v5-g1a.py）+ evidence 文件
 ~~~
@@ -627,44 +637,137 @@ Gate V5-G1B                   scripts/v3-e2e/v5-g1b.py（模型 v5-g1a.py）+ ev
 
 ---
 
-## 9. 需要产品决策（**不猜**）
+## 9. 产品决策（**2026-10-05 已冻结**）
 
-以下每一条都是本草案**没有**回答的，因为仓库事实无法唯一回答。它们不是"实现细节"，
-选择不同会让契约形状不同。
+> 本节在 2026-10-05 由开发 Lead 冻结，取代原来的"不猜清单"。每条给：**结论 / 依据
+> （仓库事实或先例）/ 影响面 / 明确不做的事**。B2 的实施规格见 §12。
+>
+> 冻结的原则没有变，只是对象变了：**能从仓库事实唯一推出的就推出来，推不出来的才
+> 拍板**。因此下面 8 条里有 5 条其实是"沿用 B1 已实现的既有语义"（不引入第二个值），
+> 只有 §9.1 是本轮真正的新决策。
 
-1. **跨节点跳的形态（§3.3）。** 三个候选：
-   - (a) 跳保持裸 TCP + 新增长度前缀分帧 → 复用现有 EGRESS/端口/健康，但引入第二套
-     跨节点传输真相与新的失败面（§6.1 反对的那种）；
-   - (b) 跳改为 UDP（egress 监听 UDP）→ 端到端语义最自然，但需要 datagram EGRESS
-     runtime、出口端口所有权、目标池协议维度（§3.3 第 3 点）、以及新的可靠性问题
-     （丢包/无重传/MTU）；
-   - (c) V5.1b **不做** UDP RELAY（只做 DIRECT）→ 最保守，但 §6.2 的 Gate 里 RELAY
-     条目与「UDP DIRECT 先于 UDP RELAY」的拆分初衷要一并调整。
-   影响面：`agent/internal/forwarder/factory.go` 的 builder 拆分、出口腿的协议投影
-   （`orchestrator.ts`/`agent-command-bus.ts` 今天三条腿都带 protocol）、
-   `TunnelConfig.Validate()` 对 EGRESS+udp 的裁决。
-2. **idle timeout 的数值与可配置性。** 面板今天没有对应列（`forward_protocol` 与
-   `tls_*` 是 V5 加过的两列，`schema.prisma:600-617`）。要么固定常量（简单，但一条
-   被墙的 DNS 客户端也是这个量级），要么新增 per-Forward 列（要 migration + 校验 +
-   计划字段）。数值本身是产品决策。
-3. **mapping ceiling 的数值与超限行为。** 丢弃新包 / 拒绝新 mapping / 淘汰最久未用
-   三者对客户端体验完全不同；§2.4 只冻结了「必须有界」。
-4. **同一节点上 TCP 与 UDP 能否同号。** 见 §5.2：沿用现有 lease 唯一键就是「不能」
-   （保守）；要「能」就必须把 `@@unique([node_id, port])` 扩成含协议维度，并同步
-   `used_ports` 的协议化（§6.2 第 2 点）。这是 V5.1b 最容易被默默做错的取舍。
-5. **UDP 是否计费、packets 是否入账。** 现有计量链只认 bytes（
-   `traffic-archive.ts:427-467`），`tunnel_traffic` 没有 packets 列。是"只做观测"、
-   还是"进计费"、packets 是否单独计费，都是产品决策；它决定了 §6.4 的落点。
-6. **IPv4/IPv6 的绑定与归一化策略。** 入口 socket 是否双栈、v4-mapped 客户端是否归一到
-   同一 mapping、`listen_host` 的既有语义（`interface.go:240-242`）如何映射到 UDP 绑定。
-   仓库没有 UDP 绑定代码，无法唯一回答。
-7. **UDP 是否需要"这条转发加不加 TLS/DTLS"之类的正交维度。** 本草案按 §6.1 的做法把
-   维度拆开、不新增枚举名（`DEVELOPMENT.md:1175-1183`）。若产品要求 udp+DTLS，那是一个
-   新 WP，必须自带密钥 ownership/rotation（§14，`DEVELOPMENT.md:2066`）。
-8. **是否需要在面板暴露 per-protocol 的开关/配额。** 今天唯一的现有开关是能力策略的
-   `tunnel_types`（`capability-policy.ts:396-398`）。用户能否"只允许 tcp 不允许 udp"
-   不构成新机制；但"同一 Forward 是否允许 tcp 与 udp 同一个监听端口/同一个业务名"
-   是产品模型问题（§1.1 的用户产品模型是 Node + Forward）。
+### 9.1 跨节点跳的形态（原 §3.3 的开放问题）
+
+**结论：候选 (b) —— 跳是 datagram 端到端（egress 监听 UDP），不是裸 TCP + 分帧。**
+
+依据：
+
+1. **传输对称律。** 今天 TCP 转发的跳是"裸 TCP"：`singhop.go` 的 `net.DialTimeout("tcp",
+   f.up.get(), dialTimeout)` 一次拨号。同一条律推广到 datagram 就是"裸 UDP"——**一跳
+   一种传输形态**，而不是"一跳一个协议形态"。
+2. **候选 (a) 正是 §6.1 拒绝过的东西。** 在 TCP 上承载报文边界必须新增长度前缀分帧，
+   那是第二套跨节点传输（队头阻塞、粘包半包、MTU 全部要重新定义），与"只有一份
+   transport 真相"直接冲突。
+3. **先例已在大规模生产验证。** Forwardx 的 FXP 出口侧就是 UDP 监听（`udpExitPort` /
+   `UDPRelayExitPort`，出口配置里的 `udpTarget`），随 v2.3.281 在线运行。它的论断与本
+   契约同向且值得抄进不变量：*"UDP direct packets never carry a destination, so a
+   valid tunnel key cannot be used as an arbitrary UDP relay."*
+4. **候选 (c) 的代价更大。** 不做 RELAY 意味着"UDP 只能单机使用"要写进产品承诺；而
+   contract §3.2 的编排顺序（先出口 ACK，再启入口）在 datagram 上并不需要新的编排
+   语义——B2 复用同一条链，不新建编排。
+
+**跳的形状（冻结）**
+
+~~~text
+client ══UDP══> ingress listener(udp)
+                     │  每个映射：16 字节固定 hop 头 + 原样载荷
+                     ▼
+            egress listener(udp)（用自己的一份端口租约）
+                     │  按出口池选目标——不读报文里的任何地址
+                     ▼
+                  target:port (UDP)
+   回程：target → egress → ingress（同一 hop 头带回）→ 原客户端
+~~~
+
+| 冻结项 | 结论 | 为什么不能是别的 |
+|---|---|---|
+| hop 头 | **固定 16 字节**：`magic(4) + version(1) + reserved(3) + mapping_id(4) + generation(4)` | 入口对全部客户端只用一个 socket，出口无法靠来源端口分辨映射 ⇒ 映射身份**必须**在带内；`magic+version` 给 B3 的分片留升级位 |
+| 目的地址 | **永不进带内**。出口只按自己配置的目标池发送 | 与 B1 的出口语义一致；即使 UDP 源地址可伪造，出口也**不是**任意中继（FXP 同款论断） |
+| 来源取证 | 出口**只接受配对入口节点地址**的报文，其余丢弃并计数 | TCP 有握手、源地址不可伪；**UDP 没有**——这条是 datagram 跳必须新增的，不能靠"沿用 TCP 的做法" |
+| `mapping_id` | 单个 runtime 生命周期内**单调不复用** | 复用会让"回程迟到的报文被投给新客户端"成为可能（跨客户端串流） |
+| `generation` | runtime 启动时随机种子；**回程必须匹配** | 重启后 id 从头开始，没有 generation 就无法分辨上一世代迟到的回程 |
+| 超限 / 畸形 | 未知 mapping、未知 generation、非法 magic、超长一律**丢弃并计数** | 与 B1「超限丢新映射」同一取向：可观测，不静默 |
+| hop 保密 / 完整性 | **v1 不提供**（与今天的裸 TCP 跳一致），另立决策 | 只给 UDP 加密会造出"TCP 明文、UDP 密文"的新不对称；正解是数据面级的统一决策（先例：FXP 用 32 字节头 + AEAD），属独立 WP |
+| 分片重组 | **v1 不做**：单报文载荷 ≤ **1264** 字节，超长丢弃并计数 | 1280 = IPv6 最小 MTU，故 `16 + 1264 = 1280` 是任何公网路径都能承载的上界，且覆盖 EDNS0(1232) 与常见业务；重组需要独立的有界状态机与自己的 Gate（→ B3）。**这是 v1 的明确用户可见边界** |
+
+**影响面（B2 必须一起改的四处，全部是既有事实）**
+
+- `factory.go` 的 builder 拆分要新增 **datagram EGRESS** 分支（今天只有 stream 分支）；
+- 出口端口所有权：走既有 `NodePortLease` + 端口守卫，**不新增 owner、不新增表**；
+- 目标池协议维度：`EgressTarget` 没有 protocol 列，而 wire 上
+  `TargetDescriptor.protocol?: "tcp" | "udp"`（`types.ts`）**已经存在**——这是既有的
+  "半实现"，B2 把它接上（落库 + 投影），**wire 契约零改动**；
+- `TunnelConfig.Validate()` 今天只拒 tls/ws 的 EGRESS（`interface.go`），`udp` 会一路
+  通过校验直达一个不存在的 runtime；B2 必须同时改校验，与面板侧
+  `forward-revision.ts` 的 `datagram_relay_unsupported` 判据（今天会主动拒绝 udp+RELAY）。
+
+### 9.2 空闲超时：沿用 B1 的默认值，不新增 per-Forward 列
+
+**结论：30s 固定默认（可注入供测试），v1 不开面板列。**
+
+依据：B1 已以 `defaultDatagramIdleTimeout = 30 * time.Second` 实现，且 Gate 的断言是
+"按 runtime **自己上报**的超时等待，不猜常量"（`datagram.go`）。B2 沿用同一常量与同一
+上报，DIRECT 与 RELAY 因此不会出现两个空闲语义。
+**不做**：新增 `forward_idle_timeout` 列——要 migration + 校验 + 计划字段，还会让 B1/B2
+行为分叉。将来若要用户可配，是一次独立决策（两处一起改）。
+
+### 9.3 映射上限与超限行为：沿用 B1（1024，丢新来源的报文）
+
+**结论：ceiling = 1024/隧道；超限时丢弃无映射来源的报文并计数（`drops` +
+`mappings_rejected`）。**
+
+依据：B1 已冻结并有 Gate 覆盖（`defaultDatagramMaxMappings = 1024`），源码注释写明
+"Over the ceiling, datagrams from sources with no mapping are DROPPED … so the ceiling is
+observable instead of invisible"（`datagram.go`）。
+**不做**：LRU 淘汰最久未用（会把正在等回包的客户端静默踢掉）；per-source-IP 二级上限
+（Forwardx 的 `fxpUDPMaxSessionsPerIP = 64` 是个好加固候选，但属**新增行为**，不在 B2）。
+
+### 9.4 同一节点 TCP/UDP 是否同号：**不共享**（沿用既有冻结）
+
+**结论：保持 `UNIQUE(node_id, port)` 不变；同一节点上 TCP 与 UDP 不共享端口号。**
+
+依据：`DEVELOPMENT.md` §6.2 已冻结这条保守规则，且 Gate V5-G1B 的断言里就有
+"TCP/UDP 不共享端口号"。
+**代价（必须写进用户可见边界）**：想同时提供 `53/tcp` 与 `53/udp` 的用户，两个端口号
+不会相同。先例同向：Forwardx 也是分开的 `listenPort` / `udpListenPort`。
+**不做**：扩唯一键、`used_ports` 协议化——那是在**端口所有权这张最吃重的表**上做迁移，
+风险与 B2 的收益不成比例；产品若坚持，另开 WP（自带 migration + Gate）。
+
+### 9.5 计费：v1 只做观测，packets 不入账
+
+**结论：UDP 的 packets/bytes 只进观测与诊断，不进计费链；不新增 packets 列。**
+
+依据：现有计量链只认 bytes（`traffic-archive.ts`），`tunnel_traffic` 没有 packets 列；
+`DEVELOPMENT.md` §6.2 已把 "UDP telemetry/accounting" 单独列为 **WP5-B3**。把计费塞进
+B2 会让一个数据面 WP 同时改账本，而"packets 是否计费"本身是商务决策。
+**不做**：packets 列、按报文计费、B3 的范围扩张。
+
+### 9.6 IPv4/IPv6：沿用 B1（v4-mapped 归一 + `listen_host` 既有语义）
+
+**结论：绑定与归一化语义完全沿用 B1，不为 RELAY 另立规则。**
+
+依据：B1 已实现 `ip.To4()` 归一与 `ListenHost` 的既有含义（"empty means all
+interfaces"，`datagram.go`/`interface.go`），并被 Gate 覆盖。hop 侧只多一条：出口接受
+的来源必须与配对入口地址**同族**（否则来源取证无意义）。
+**不做**：双栈入口 socket 的新语义、把 v4-mapped 拆成两个映射。
+
+### 9.7 udp + DTLS：不做，是独立维度
+
+**结论：v1 不新增 "udp+DTLS" 这类正交维度。**
+
+依据：与 §6.1 同一做法（维度拆开、不新增枚举名）。DTLS 需要自己的密钥
+ownership/rotation，属安全评审范围（`DEVELOPMENT.md` §14）。
+**不做**：把 DTLS 塞进 protocol 枚举、给 UDP 单独加证书路径。
+
+### 9.8 per-protocol 套餐开关：沿用 `tunnel_types`，不新增机制
+
+**结论：用户/租户能不能用 UDP，继续由能力策略的 `tunnel_types` 决定。**
+
+依据：`capability-policy.ts` 的 `checkTunnelCreation` 已用
+`policy.entitlements.tunnel_types.includes(ctx.protocol)` 裁决，B1 已接入。
+"同一 Forward 是否允许 tcp 与 udp 同名"是产品模型问题，且已被 §9.4 的端口规则现实地
+约束住（不同号），因此不构成新机制。
+**不做**：第二套配额体系、per-protocol 的监听开关。
 
 ---
 
@@ -710,13 +813,74 @@ Gate V5-G1B                   scripts/v3-e2e/v5-g1b.py（模型 v5-g1a.py）+ ev
 
 - 不写任何 Go/TS 代码、不提出补丁、不改任何代码文件；
 - 不创建第二套端口所有权、第二个 manager、第二份 desired state；
-- 不定义 idle timeout / ceiling 的具体数值，不选择跨节点跳形态（§9）；
+- ~~不定义 idle timeout / ceiling 的具体数值，不选择跨节点跳形态（§9）~~ → **已于
+  2026-10-05 由 §9 冻结**（数值沿用 B1；跳形态取候选 (b)）；
 - 不把「枚举里有 `udp`」当作产品支持，也不因为"内核允许同号"就放宽端口所有权。
 
 ---
 
-## 12. 变更记录
+## 12. WP5-B2 实施规格（2026-10-05 解冻）
+
+**前置**：§9.1–§9.8 已冻结（本节即执行依据）。**不重做** B0/B1 的任何已冻结语义，
+不删除 Gate V5-G1B 现有 76 条断言中的任何一条。
+
+### 12.1 范围（一个 WP 只做这些）
+
+~~~text
+面板侧
+  · EgressTarget 增 protocol 列（migration）+ 出口池校验/UI 的协议维度
+  · 出口腿下发：把 protocol 真正投影到 TargetDescriptor（今天被丢弃）
+  · 放开 udp+RELAY 的两处拒绝：forward-revision.ts 的 datagram_relay_unsupported、
+    TunnelConfig.Validate() 对 EGRESS+udp 的裁决
+  · 出口节点为 datagram 出口申请/释放端口租约（复用 portPool，不新增 owner）
+Agent 侧
+  · factory：新增 datagram EGRESS builder（与 stream builder 并列，不新增 manager）
+  · hop 编解码（16 字节头：magic/version/mapping_id/generation）
+  · 入口侧：每映射 id + generation 分配、回程 generation 校验、超限/畸形计数
+  · 出口侧：来源取证（只接受配对入口地址）、按池选目标、回程原路带回 hop 头
+  · 观测：复用既有 diag 通道与**封闭键集**（不得新增未知键，见 §10 第 2 条）
+~~~
+
+### 12.2 DoD（每条都可断言，不是"看起来对"）
+
+- 一台入口 + 一台出口：客户端 UDP 经**两跳**到达目标并收到回包（端到端，不是"单跳通"）；
+- 多客户端 → 多映射：两个客户端两条映射互不串流，含**回程 generation 校验的负例**
+  （构造迟到回程，断言不被投递）；
+- 出口只接受配对入口地址：伪造来源的报文被丢弃**且计数**（负例必须有断言）；
+- 目的地址不来自带内：让出口池里的目标与"客户端想去的地方"不同，断言流量只去池内目标；
+- 超长 / 畸形 / magic 错误 / 未知 mapping：丢弃 + 计数 + 不影响其余映射；
+- 目标热更新：existing mapping 保持旧目标、新 mapping 用新目标（§3.4 平移）；
+- 出口重启 / 入口重启 / 面板中断：按既有 reconcile + LKG 收敛，**不产生孤儿端口**；
+- 端口租约：出口端口来自租约，释放后不残留监听；
+- tcp / tls / ws 与 udp DIRECT 回归全绿；
+- 旧 Agent 准入：不支持 datagram egress 的 Agent 必须在**下发前**被能力协商拒绝，
+  而不是"下发后失败"。
+
+### 12.3 Gate 增量（`scripts/v3-e2e/v5-g1b.py`）
+
+~~~text
+G1B.relay   udp RELAY 端到端（真两跳拓扑 + 真 UDP 载荷 + 回包）
+G1B.relay   多客户端映射隔离 + 回程 generation 负例
+G1B.relay   出口来源取证负例（伪造源地址 → 丢弃且计数）
+G1B.relay   目标池协议维度（池内 udp 目标被选中，池内 tcp 目标不被选中）
+G1B.relay   超长/畸形报文丢弃且计数（不静默）
+G1B.relay   出口端口租约与释放（无孤儿监听）
+G1B.regress tcp/tls/ws + udp DIRECT 全绿，且**连跑两遍逐行一致**
+~~~
+
+### 12.4 明确不做（B2 的边界）
+
+- 分片重组（→ B3；§9.1 冻结的单报文 1264 字节上限就是 v1 的**用户可见边界**）；
+- packets 计费与账本改动（→ B3）；
+- DTLS / hop 加密（独立 WP，需安全评审）；
+- TCP/UDP 同号（另开 WP，自带 migration + Gate）；
+- **跨面板（federation）的 UDP 腿**——B2 只做单面板内的 ingress→egress。
+
+---
+
+## 13. 变更记录
 
 | 日期 | 变更 | 作者 |
 |---|---|---|
 | 2026-10-04 | DRAFT 初版：八个问题的回答 + Gate V5-G1B 映射 + 10 条与现有代码的不一致 | V5-WP5-B0（草案，待评审） |
+| 2026-10-05 | §9 全部冻结（跳形态取候选 (b) datagram 端到端；其余 7 条沿用 B1 既有语义）；§3.3 结论更新；新增 §12 WP5-B2 实施规格与 DoD/Gate 增量；文档状态由 DRAFT 改为"B0 冻结 + §9 决策冻结" | 开发 Lead |

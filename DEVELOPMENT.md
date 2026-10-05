@@ -1462,17 +1462,38 @@ Gate V5-G1A
 
 ## 6.2 V5.1b — UDP
 
-> **契约已冻结（WP5-B0，2026-10-04）**：完整语义见
+> **契约已冻结（WP5-B0，2026-10-04；§9 的产品决策于 2026-10-05 冻结）**：完整语义见
 > [`docs/v5-1b-datagram-contract-draft.md`](docs/v5-1b-datagram-contract-draft.md)，
-> 该文档由 `DEVELOPMENT.md` §6.2 的要求驱动写成，回答八个问题并列出未猜测的开放
-> 产品决策；本文只保留结论与实施边界。拆分：
+> 该文档由 `DEVELOPMENT.md` §6.2 的要求驱动写成；本文只保留结论与实施边界。拆分：
 >
 > ~~~text
-> WP5-B0  datagram 语义契约         DONE（上文链接）
+> WP5-B0  datagram 语义契约         DONE（上文链接；§9 八项决策已冻结）
 > WP5-B1  UDP DIRECT               **DONE**（Gate V5-G1B GREEN 76/0）
-> WP5-B2  UDP RELAY                阻塞：跨节点跳的形态是开放产品决策，不猜
-> Gate V5-G1B                      **GREEN PASS=76 / FAIL=0**（`scripts/v3-e2e/v5-g1b.py`，证据 `docs/evidence/v5-g1b-result-20261004.txt`）
+> WP5-B2  UDP RELAY                **UNBLOCKED**：跳形态已冻结为「datagram 端到端
+>                                  （egress 监听 UDP）」；实施规格见契约 §12
+> WP5-B3  UDP telemetry/accounting 未开工（分片重组与 packets 计费都在这里）
+> Gate V5-G1B                      **GREEN PASS=76 / FAIL=0**（`scripts/v3-e2e/v5-g1b.py`，证据 `docs/evidence/v5-g1b-result-20261004.txt`）；B2 按契约 §12.3 追加 relay 断言，**不得删除现有 76 条中的任何一条**
 > ~~~
+>
+> **§9 冻结摘要（2026-10-05，逐条依据见契约 §9）**
+>
+> | # | 决策 |
+> |---|---|
+> | 跳形态 | 候选 (b)：**datagram 端到端**，出口监听 UDP。裸 TCP + 分帧被拒（那是第二套跨节点传输）；不做 RELAY 的候选 (c) 代价更大。先例：Forwardx FXP 的出口侧就是 UDP 监听 |
+> | hop 头 | 固定 **16 字节**（magic / version / mapping_id / generation）：入口只有一个 socket，映射身份必须在带内 |
+> | 目的地址 | **永不进带内**，出口只按自己的目标池发送 —— 即使源地址可伪造，出口也不是任意中继 |
+> | 来源取证 | 出口**只接受配对入口节点地址**的报文；UDP 没有握手，这条是 datagram 跳必须新增的 |
+> | 单报文上限 | **1264 字节载荷**（16 + 1264 = 1280 = IPv6 最小 MTU），超长丢弃并计数；**分片重组留 B3** |
+> | 空闲超时 | 沿用 B1 的 30s（可注入），**不新增 per-Forward 列** |
+> | 映射上限 | 沿用 B1 的 1024，超限**丢弃新来源的报文**并计数 |
+> | TCP/UDP 同号 | **不共享**（沿用既有冻结）；想 `53/tcp` + `53/udp` 的用户会拿到两个不同端口号 —— 写进用户可见边界 |
+> | 计费 | v1 **只做观测**，packets 不入账（属 B3） |
+> | IPv4/IPv6 | 沿用 B1（v4-mapped 归一 + `listen_host` 语义） |
+> | udp+DTLS | 不做，是独立维度（需安全评审） |
+> | 套餐开关 | 沿用能力策略的 `tunnel_types`，不新增机制 |
+>
+> **明确不做（B2 边界）**：跨面板（federation）的 UDP 腿、hop 加密、分片重组、
+> TCP/UDP 同号 —— 每一项都有各自的 WP 与 Gate。
 >
 > **已冻结的结论（摘要）**
 >
@@ -1486,9 +1507,14 @@ Gate V5-G1A
 > | 端口所有权 | 仍走 NodePortLease + 端口守卫；但租约键是 `UNIQUE(node_id, port)` 而内核里 TCP/UDP 是两个命名空间 —— 因此冻结**保守规则：同一节点上 TCP 与 UDP 不共享端口号** |
 > | 观测 | 不得假装存在"连接数"；事实走 V5-WP5-A3 的每隧道 `diag` 通道（`runtime_counts` 是**封闭键集**，加未知键会让整份上报 400） |
 >
-> **开放产品决策（不猜，等产品回答）**：UDP RELAY 的跨节点跳形态（裸 TCP + 分帧 / UDP 出口 / 5.1b 不做 RELAY）、空闲超时取值与可配置性、映射上限与超限行为、TCP 与 UDP 是否允许共用端口号、UDP 是否计费及计在哪个链上、IPv4/IPv6 绑定与 v4-mapped 归一化、udp+DTLS 这一正交维度、以及协议级的套餐开关。
+> **产品决策状态**：原先那八条"不猜清单"已于 2026-10-05 全部冻结（见上文 §9 冻结摘要
+> 与契约 §9），本节的"开放产品决策"已无遗留项。
 >
-> **实施边界（B1）**：只做 UDP **DIRECT**。`udp` 在 EGRESS/RELAY 上必须被**拒绝**并给出明确错误，而不是半实现 —— 跨节点跳的形态未冻结。
+> **实施边界（B1，已完成）**：只做 UDP **DIRECT**。`udp` 在 EGRESS/RELAY 上必须被
+> **拒绝**并给出明确错误，而不是半实现 —— 这是 B1 当时的边界。
+> **实施边界（B2，已解冻）**：按契约 §12 实施 udp RELAY（datagram 端到端跳）；
+> 单报文 1264 字节上限、hop 明文、无分片、无跨面板 UDP 腿都是 B2 的**明确边界**，
+> 不是"暂时没做"。
 >
 > **无第二条实现**：datagram runtime 是新类型（不复用 `pipeTracker` 的连接模型），但生命周期、端口守卫、清单派生、诊断通道**复用既有机制**，不另建一套。
 
@@ -1572,10 +1598,12 @@ client → ingress → egress → target
 | 4 | gate 自己的 UDP echo target 是一次性的 | busybox `nc -lu` 收一个报文就退出，gate 的"就绪探测"把它吃掉了 —— 于是每条数据报都超时，看起来像产品故障。gate 现在自带 echo 服务（可重复、可区分目标）。 |
 | 5 | gate 会与自身并发 | 两个 gate 进程同时改共享拓扑（一个种假 Agent 清单、一个建 ws 转发）→ 幽灵故障。现在有单实例锁。 |
 
-**关于 UDP 的开放决策**：B2（UDP RELAY）**未做**，因为跨节点跳的形态是开放产品决策（见 §6.2 与契约 §9.1）。
-这不是"跳过"：契约冻结了 B1 只做 DIRECT，Gate 也把"RELAY 必须被拒绝"作为通过条件之一。
-实现层为其余开放项选了**有文档、可注入**的默认值（空闲 30s、映射上限 1024、超限丢新映射、拨号 3s 上限、
-读错误退避 20ms；最坏内存约 64 MiB/隧道）。
+**关于 UDP 的决策状态（2026-10-05 更新）**：B2（UDP RELAY）**已解冻**——跨节点跳的形态
+于 2026-10-05 冻结为"datagram 端到端（egress 监听 UDP）"，见 §6.2 与契约 §9.1/§12。
+B1 期间"RELAY 必须被拒绝"是那一步的通过条件，B2 会**同时**改掉面板与 Agent 两侧的
+拒绝判据，并保证不删除 Gate V5-G1B 的现有 76 条断言。
+实现层为其余项选了**有文档、可注入**的默认值（空闲 30s、映射上限 1024、超限丢新映射、
+拨号 3s 上限、读错误退避 20ms；最坏内存约 64 MiB/隧道），B2 **沿用**这些值而不是另立一套。
 
 至少：
 
@@ -3022,7 +3050,9 @@ V5-WP16    用量 / 对账            —— usage_id 去重 + 归因 + 到期/�
 Federation Admin Console         —— Peers / Trust / Grants / Remote Leases / Usage（只在 Admin）
 
 仍阻塞 / 明确不开放：
-V5.1b B2 UDP RELAY —— 跨节点 datagram 形态仍待产品决策，当前必须拒绝；
+V5.1b B2 UDP RELAY —— **已解冻**（2026-10-05 跳形态冻结为 datagram 端到端），
+                     实施规格见契约 §12；剩余未开放的是它的边界：分片重组、
+                     packets 计费、hop 加密、跨面板 UDP 腿；
 V5.1c QUIC —— 依赖/实现方式未冻结，继续保持关闭；
 跨面板 3+ 跳 / 远端 ingress / 远端 transit / 任意图 / 跨面板自动 failover /
 tls 远端出口 / 多 Panel 信任传递闭包 —— 一律 fail-closed 保持关闭。
