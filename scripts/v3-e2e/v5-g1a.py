@@ -60,10 +60,7 @@ MYSQL_CONTAINER = "wp14-mysql"
 STATE_DIR = "/var/lib/tunex-agent"
 CERT_DIR = f"{STATE_DIR}/tls"
 INGRESS_DATA_IP = "172.31.10.20"
-# The e2e target serves 3030 with a greeting. A hot-reload case needs a SECOND
-# reachable target, otherwise "the tunnel stopped working after the reload" is
-# indistinguishable from "the tunnel now points at a closed port" — which is
-# exactly how the first version of this gate mis-read its own probe.
+# A second reachable target lets hot-reload tests distinguish retargeting from a closed port.
 TARGET_A_IP = "172.31.10.30"
 TARGET_A_SECOND_PORT = 3031
 # A byte-echo listener the gate starts itself (see ensure_echo_target).
@@ -175,14 +172,7 @@ def _raw_login():
 
 
 def req(method: str, path: str, body=None, cookie=None, timeout=90, retry_auth=True):
-    """One API call with the session attached.
-
-    The session is attached by DEFAULT. The first version only attached it when
-    the caller passed one — and no caller did — so every request relied on the
-    401-retry below to authenticate: two round trips per call, and a single
-    failure in the retry surfaced as a cascade of Unauthorized in unrelated
-    cases (which is exactly what happened after the panel-restart case).
-    """
+    """One API call with the current session attached by default."""
     global COOKIE
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(API + path, data=data, method=method)
@@ -206,18 +196,11 @@ def req(method: str, path: str, body=None, cookie=None, timeout=90, retry_auth=T
             parsed = {"raw": raw}
         HTTP.append({"method": method, "path": path, "status": e.code, "body": parsed})
         if e.code == 401 and retry_auth and path != "/api/auth/login":
-            # The session can expire or be invalidated by a panel restart (the
-            # gate restarts the panel on purpose). Re-authenticating once keeps
-            # that case from failing every case after it — but a failed re-login
-            # is recorded loudly here, because the alternative is what this gate
-            # did on its first runs: a dozen unrelated checks "failing" on
-            # Unauthorized.
+            # Panel restart may invalidate the session; re-authenticate once and fail loudly if it cannot recover.
             status2, cookie2 = login()
             if status2 == 200 and cookie2:
                 COOKIE = cookie2
                 return req(method, path, body, COOKIE, timeout, retry_auth=False)
-            # `record()` 只接受 (passed, message)：多传一个 detail 会让这一行自己抛
-            # TypeError，把真正的 401 掩盖成一个看不懂的报错（实测踩到过）。
             record(False, f"G1A.session: re-authentication failed after a 401 on {path} [login_status={status2}]")
         return e.code, parsed, e.headers
     except (urllib.error.URLError, OSError) as e:
@@ -290,10 +273,7 @@ def tls_probe(port: int, expect_echo: bool = True, timeout: float = 8.0, payload
                     return True, "handshake-only"
                 tls.sendall(payload)
                 got = b""
-                # Set the deadline on the TLS object, not on `raw`: after
-                # wrap_socket the original socket's fd belongs to the SSLSocket,
-                # and touching `raw` again raises EBADF (which is how this gate
-                # first reported three "TLS failures" that were its own bug).
+                # After wrap_socket the SSLSocket owns the fd, so set the deadline on `tls`.
                 _ = tls.settimeout(timeout)
                 while len(got) < len(payload):
                     chunk = tls.recv(256)
@@ -432,10 +412,7 @@ def create_forward(name: str, protocol: str, mode: str = "direct", *,
         body["egress_node_id"] = EGR
     status, resp, _ = req("POST", "/api/forwards", body)
     if status == 401:
-        # An unauthenticated request must never be read as "the product refused
-        # this" — a 401 satisfies every "status not in (200,201)" assertion in
-        # this file, which is how one session bug once looked like five product
-        # failures. It is an infrastructure error, so it raises.
+        # Authentication failure is test infrastructure failure, not product admission behavior.
         raise RuntimeError(f"create {name} got 401 Unauthorized (session problem, not a product decision)")
     data = unwrap(resp)
     fid = data.get("id") if isinstance(data, dict) else None
@@ -474,14 +451,7 @@ LOCK = HERE / ".v5-g1a.lock"
 
 
 def acquire_lock() -> None:
-    """Refuse to run two gates at once.
-
-    This gate plants a fake Agent manifest and restarts shared containers. Two
-    concurrent runs therefore corrupt each other: one run's planted "old Agent"
-    is another run's unexplained `protocol_not_supported` failure. That is not a
-    hypothetical — it cost a debugging round, and the symptom pointed at the
-    product rather than at the harness.
-    """
+    """Refuse concurrent runs because this gate mutates shared Agent state and containers."""
     if LOCK.exists():
         try:
             pid = int(LOCK.read_text().strip())
@@ -520,12 +490,7 @@ def setup():
     check(ensure_echo_target(),
           "G1A.setup target-a serves a byte-echo port (the e2e target only greets)",
           f"port={ECHO_TARGET_PORT}")
-    # Start from an empty port guard. A previous run of this gate (or of G0) can
-    # leave a listener behind when a case failed mid-way; the node then refuses
-    # the next fixture's port and the gate reports a product failure that is
-    # really its own residue. Restarting the data-plane Agents also re-proves the
-    # restore path, because they rebuild their listeners from the panel's desired
-    # state.
+    # Restart data-plane Agents to clear stale listeners and re-prove desired-state restoration.
     for container in (INGRESS_CONTAINER, EGRESS_CONTAINER):
         docker(["restart", container], timeout=120)
     check(bool(wait_until(lambda: req("GET", "/healthz", timeout=5)[0] == 200, timeout=60, interval=2)),
@@ -754,10 +719,7 @@ def g1a_10_old_agent_admission():
     check(isinstance(original, dict), "G1A.10 the node's manifest was readable", f"got={type(original).__name__}")
     try:
         for protocol in ("tls", "ws"):
-            # Re-plant before EACH attempt: the Agent re-reports on its own
-            # heartbeat (~30s), and the first attempt's waits are long enough for
-            # it to overwrite the planted manifest — which is exactly how the ws
-            # half of this case first passed a dispatch it should have refused.
+            # Re-plant before each attempt because the Agent heartbeat can overwrite the synthetic old manifest.
             plant_old_manifest()
             check(still_old_manifest(),
                   f"G1A.10 the old-Agent shape is planted before the {protocol} attempt")
