@@ -106,10 +106,10 @@ test("GET /api/me/capabilities：401 / 200 + 生效策略口径 / 传对 workspa
       TUNEX_ME_ROOT: root,
       // 与 tests/preload-env.ts 同口径的占位值：`bun -e` 不加载 preload，
       // 而路由的传递依赖里可能有 `env.ts` 的 requireSecret（只在 import 期读）。
-      DATABASE_URL: process.env.DATABASE_URL ?? "mysql://tunex-test:tunex-test@127.0.0.1:3306/tunex_test_unused",
+      DATABASE_URL: process.env.DATABASE_URL ?? "mysql://tunex-test:tunex-test@127.0.0.1:3306/tunex_test_unused", // secret-scan:allow — local test fixture
       REDIS_URL: process.env.REDIS_URL ?? "redis://127.0.0.1:6379/15",
-      AUTH_SECRET: process.env.AUTH_SECRET ?? "tunex-unit-test-auth-secret-not-a-real-secret",
-      LICENSE_SECRET: process.env.LICENSE_SECRET ?? "tunex-unit-test-license-secret-not-a-real-secret",
+      AUTH_SECRET: process.env.AUTH_SECRET ?? "tunex-unit-test-auth-secret-not-a-real-secret", // secret-scan:allow — local test fixture
+      LICENSE_SECRET: process.env.LICENSE_SECRET ?? "tunex-unit-test-license-secret-not-a-real-secret", // secret-scan:allow — local test fixture
     },
     encoding: "utf8",
     timeout: 30_000,
