@@ -1,5 +1,5 @@
 /**
- * V5.5 Federation —— 面板到面板（M2M）端点（WP14，契约 §2/§3）。
+ * V5.5 Federation —— 面板到面板（M2M）端点（，契约 §2/§3）。
  *
  * 挂载点：`/api/federation/v1`。安全边界：
  *   · 免**用户**认证（无 cookie/会话），但除握手外**全部**要求 Ed25519 签名；
@@ -151,7 +151,7 @@ federationRoutes.post("/trust/revoke", federationAuth(), async (c) => {
 });
 
 /* ---------------------------------------------------------------- */
-/* WP15：远端租约端点（host 侧权威）                                  */
+/*：远端租约端点（host 侧权威）                                  */
 /*                                                                    */
 /* 契约 §3.2 两阶段：POST /leases 预留（分配端口 → reserved），        */
 /* POST /leases/:ref/apply 应用（下发到自己的 Agent → active）。       */
@@ -450,7 +450,7 @@ federationRoutes.delete("/leases/:ref", federationAuth(), async (c) => {
 });
 
 /* ---------------------------------------------------------------- */
-/* WP16：用量端点（home 侧接收事实）                                  */
+/*：用量端点（home 侧接收事实）                                  */
 /*                                                                    */
 /* 用量是**事实**不是期望状态：按 usage_id 去重、首写胜、无法归因时进        */
 /* unattributed 桶并告警，绝不静默丢弃或补 0。                          */
@@ -462,7 +462,7 @@ federationRoutes.post("/usage", federationAuth(), async (c) => {
   if (!body) {
     return c.json(federationErrorBody("message_malformed", "请求体不是合法 JSON"), 400 as never);
   }
-  // 契约 §4.1 写的是**顶层**字段；早期实现要求外面再包一层 `{report: …}`。两种都接受：
+  // Accept both the canonical top-level shape and the historical {report: …} wrapper for compatibility:
   // 上报是机器到机器的周期动作，"因为少包/多包一层就永远推不进来"是最没必要的一种失败。
   const raw = body.report && typeof body.report === "object" ? body.report : body;
   const parsed = parseUsageReport(raw);
