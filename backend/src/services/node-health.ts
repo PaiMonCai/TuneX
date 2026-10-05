@@ -6,36 +6,6 @@
  * Node desired state or runtime state.
  */
 
- *  — Node health synthesis（`DEVELOPMENT.md` §13.4.4）
- *
- * ── 单一职责：把**事实**变成 `healthy | warning | error | unknown` ──
- *
- * 本模块不查询 DB、不发请求、不写日志：输入是已经读出来的事实（node 行、
- * state_report 快照、desired runtime 集合），输出是 Health 判定 + 理由清单。
- * 所有 IO 由调用方（node-admin 的读路径）完成，因此规则可离线穷举单测。
- *
- * ── 为什么必须由面板算（§13.4.1 明文）──
- *   「Health：Backend 根据事实计算；Agent 只上报原始状态，不允许一句
- *    `health=healthy` 成为最终真相。」
- * 所以 Agent 侧（reporter）只发数字，判定阈值与优先级全部在本文件。
- *
- * ── 四态语义（与 §13.4.4 一一对应）──
- *   healthy：Connection online，关键 runtime/revision 一致，无持续错误；
- *   warning：在线但 revision 落后、部分 Forward error、版本落后或资源接近阈值；
- *   error：Agent/runtime 初始化失败或关键 runtime 持续不可用；
- *   unknown：尚未安装 / 没有足够报告。
- *
- * ── 三条不允许走捷径的判定纪律 ──
- *   1. **Offline ≠ error**（§13.4.4 末句）。掉线是 Connection 状态，不是
- *      健康故障：一个正常关机维护的节点不该在健康列里显示成红色故障。掉线
- *      且无其它事实时返回 `unknown`（「没有足够报告」），而不是 `error`。
- *   2. **缺字段 = unknown，不是 0**。资源阈值只在对应的采样字段真实存在时
- *      参与判定；旧 Agent 不报内存，面板就不该判它内存超限。
- *   3. **只有「持续错误」才是 error**。单次历史错误（一个 `error_count > 0`
- *      但 `last_error_at` 早已过期，或所有 runtime 都已按最新 revision 起来）
- *      降级为 warning。持续 = 最近一个上报窗口内仍在出错，或关键 runtime
- *      完全缺失/落后，或 apply_status=error。
- */
 import { deriveConnection, type NodeConnectionValue } from "./node-lifecycle.ts";
 import { normalizeTunnelDiag, type TunnelProtocolDiag } from "./tunnel-diag.ts";
 
