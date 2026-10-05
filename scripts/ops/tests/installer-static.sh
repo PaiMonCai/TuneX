@@ -563,12 +563,16 @@ expect_rc 2 "--no-docker 单独使用 → 拒绝"
 SB_REAL="$TMP/sandbox-real"; mk_sandbox "$SB_REAL"
 LAST_RC=0
 LAST_OUT="$(env TUNEX_PROJECT_ROOT="$SB_REAL" bash "$INSTALL" --check install --version "$SHA_FAKE" 2>&1)" || LAST_RC=$?
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  expect_rc 0 "check 真探测（本机 Docker 可用、干净沙箱）→ 前置全过"
-  has "check 全部通过" "check 明确报告未做变更"
-else
-  if [ "$LAST_RC" != "0" ]; then ok "check 真探测：本机 Docker 不可用 → 非零（exit=$LAST_RC）"; else bad "check 在无 Docker 机器上竟通过"; fi
-fi
+# 这条要在**任何主机形态**下成立（CI runner 是非 root、且可能没有 docker 守护进程）：
+# 前置矩阵拦住谁、就以谁的退出码收场；唯一不允许的是"没通过却成功"。
+case "$LAST_RC" in
+  0) ok "check 真探测（root + Docker 可用）→ 前置全过"
+     has "check 全部通过" "check 明确报告未做变更" ;;
+  3) ok "check 真探测（非 root，CI runner 的常态）→ 前置矩阵第一条拦住（exit=3）"
+     has "sudo" "非 root 的 check 给出 sudo 提示" ;;
+  4|5) ok "check 真探测（本机 Docker/命令不满足）→ 前置矩阵拦住（exit=$LAST_RC）" ;;
+  *) bad "check 真探测返回了不该出现的退出码：$LAST_RC"; dump ;;
+esac
 if [ ! -e "$SB_REAL/.env" ]; then ok "--check 未创建 .env（检查模式零副作用）"; else bad "--check 创建了 .env"; fi
 
 # =============================================================================

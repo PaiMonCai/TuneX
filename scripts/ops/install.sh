@@ -869,8 +869,12 @@ tx_action_status() {
     printf '[dry-run] %s\n' "$(tx_quote_cmd docker compose -p "$TX_COMPOSE_PROJECT" $TX_STANDALONE_FLAGS -f "$TX_COMPOSE_FILE" $TX_ENVFILE_FLAGS ps -a)"
     printf '[installer] 健康       : /healthz=%s /readyz=%s\n' "$(tx_fixture health_http 200)" "$(tx_fixture ready_http 200)"
   elif tx_docker_present && tx_compose_available; then
+    # docker CLI 在、但守护进程不可达（未加入 docker 组 / socket 不通）是常态：
+    # status 必须继续降级打印事实，而不是被 set -e 打死。
     tx_log "容器："
-    tx_compose_capture ps -a 2>/dev/null | sed 's/^/  /' || tx_warn "compose ps 失败（无部署？）"
+    if ! tx_compose_capture ps -a 2>/dev/null | sed 's/^/  /'; then
+      tx_warn "读不到容器列表（docker 守护进程不可达？）—— 只打印文件系统事实"
+    fi
     local backend_img=""
     backend_img="$(docker inspect -f '{{.Config.Image}}' tunex-backend 2>/dev/null || true)"
     if [ -n "$backend_img" ]; then
@@ -884,7 +888,7 @@ tx_action_status() {
     printf '[installer] 健康       : /healthz=%s /readyz=%s\n' \
       "$(tx_http_code "$(tx_health_url)")" "$(tx_http_code "$(tx_ready_url)")"
     local mig_cid mig_state mig_exit
-    mig_cid="$(docker ps -a --filter "label=com.docker.compose.project=$TX_COMPOSE_PROJECT" --filter "name=tunex-$TX_MIGRATE_SERVICE" --format '{{.ID}}' 2>/dev/null | head -1)"
+    mig_cid="$(docker ps -a --filter "label=com.docker.compose.project=$TX_COMPOSE_PROJECT" --filter "name=tunex-$TX_MIGRATE_SERVICE" --format '{{.ID}}' 2>/dev/null | head -1 || true)"
     if [ -n "$mig_cid" ]; then
       mig_state="$(docker inspect -f '{{.State.Status}}' "$mig_cid" 2>/dev/null || printf unknown)"
       mig_exit="$(docker inspect -f '{{.State.ExitCode}}' "$mig_cid" 2>/dev/null || printf unknown)"

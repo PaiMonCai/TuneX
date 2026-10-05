@@ -553,9 +553,33 @@ Compose 版本门）→ **真实 `status`**（只读，断言健康码是 3 位�
 注意：`v4-gate-f5.py` 无法单独 `import`（模块级 `load_state()` 需要 `scripts/v3-e2e/setup.sh` 先拉起拓扑），
 所以这里是用 `exec(function_source)` 跑它的原始断言，而不是复制一份。
 
-**CI 接法（WP21D 的 `installer-static` 作业，本次未动 `ci.yml`）**：该作业只需
-`bash -n`/`sh -n` + `bash scripts/ops/tests/installer-static.sh`（纯静态 + 桩化，无 Docker、无网络，
-目标 ≤1 分钟），不修改既有作业。
+**CI 接法（WP21D 已落地，`ci.yml` 里新增作业 `installer-static`）**：
+
+~~~yaml
+  installer-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shell syntax (bash -n / sh -n)      # 4 条：两个脚本 × bash/sh
+      - name: Installer static + dry-run gate
+        run: bash scripts/ops/tests/installer-static.sh
+~~~
+
+`ci.yml` 的 diff 是**纯新增**（+24/-0）：既有 `secret-scan`/`backend`/`web`/`agent`/`perf-harness`
+五个作业的 name、steps、矩阵与缓存键一个字节都没动（`git diff .github/workflows/ci.yml` 只有插入）。
+该作业纯静态 + 桩化：不需要 Docker 守护进程、不联网、不改机器状态，目标 ≤1 分钟；
+**不加 shellcheck**（runner 上没有、apt 安装要联网，与"无网络"约束冲突）。
+
+门禁的**主机形态无关性**已实测：同一份 `installer-static.sh` 在
+①root + Docker 可用 ⇒ `208/208`；②非 root 且 **docker 守护进程不可达**（用
+`setpriv --reuid=65534` 模拟最差 runner）⇒ `208/208`。为此 `--check` 那条用例改成按前置矩阵
+拦住的层报退出码（0/3/4/5 都算"拦对了"，只有"没通过却成功"判失败），并修掉了一个真实缺陷：
+`status` 在"docker CLI 在、守护进程不可达"时会因为 `docker ps | head` 的 pipefail 被 `set -e` 打死，
+现在降级为打印文件系统事实 + 一条 WARN。
+
+**DoD 17 的模板半边**：`.env.production.example` 增补注释键后，
+`cp .env.production.example .env && TUNEX_IMAGE=tunex-unified:ci docker compose -f docker-compose.prod.yaml config -q`
+在本地复跑**仍为 0**（与 `integration.yml:157-162` 同口径）。
 
 ### 11.5 OPEN-5 的落点与 backend 侧要求（`backend/src/services/node-enrollment.ts` 归 Lead）
 
@@ -581,9 +605,10 @@ Compose 版本门）→ **真实 `status`**（只读，断言健康码是 3 位�
 
 | 事项 | 归属 | 说明 |
 |---|---|---|
-| `ci.yml` 新增 `installer-static` 作业 | WP21D（本次未动） | 命令见 §11.4，只做"新增作业"，不改既有作业 |
-| `.env.production.example` 增 `TUNEX_AGENT_LATEST_VERSION` | WP21D（本次未动） | 安装器已会写这个键；模板补注释即可（§1.1 已记录它当前不在模板里） |
-| `docs/production-deploy.md` 增"一键安装（自动化入口）"并降级手动步骤 | WP21D（本次未动） | 本次只在安装器里打印交接命令与文档引用，**不**复制 §2 的操作细节 |
+| `ci.yml` 新增 `installer-static` 作业 | **WP21D 已完成** | 见 §11.4；diff 为纯新增（+24/-0），既有 5 个作业零改动；无 Docker/无网络，目标 ≤1 分钟 |
+| `.env.production.example` 增 `TUNEX_AGENT_LATEST_VERSION` | **WP21D 已完成** | 以**注释键**形式补上（`# TUNEX_AGENT_LATEST_VERSION=…`）：留空=不判落后是默认，写死占位值会让面板把所有节点判成落后。安装器升级时会把它解注释并写成同一个 sha；DoD 17 的 `config -q` 已复跑为 0 |
+| `docs/production-deploy.md` 增"一键安装（自动化入口）"并降级手动步骤 | **WP21D 已完成** | 新增 `### 2.0 一键安装（默认路径）`，`2.1`–`2.5` 明确标注 **fallback（手动路径）**；2.0 只给命令与口径、**不复制** 既有 §2 的操作细节（链接到本文 §1/§4–§8 与契约） |
+| `scripts/v3-e2e/README.md` 记一条"模块不能单独 import" | **已完成** | `v4-gate-f5.py` / `v5-g*.py` 在模块级会 `load_state()`，没先 `setup.sh` 就 import 会抛 `missing e2e state`；README §5 补了原因 + 只跑单个断言函数时的 `exec()` 姿势 + 它的代价（绕过了模块级前置，只在断言与拓扑无关时才安全）。这正是本 WP 用 `exec()` 跑 F5.8 原始断言的成本来源 |
 | 真实环境门禁 Gate V5-G6 | WP21E（可选，需 Lead 批） | 按 §6 DoD 1–11 在干净可丢弃机器上跑并留证据；不进 PR 路径 |
 | 离线/内网分发（无外网 git、无 GHCR） | **本期不做；形态已冻结** | 形态：**部署方自建 git / registry 镜像 + 同一 sha 锚定** —— 引导段仍走 §4.0 的形态分流与 `rev-parse` 断言，镜像经 Docker **registry mirror** 或自建 registry 获取；**不**在引导段或产品里内置任何第三方加速地址（FROZEN-4 红线）。将来立项时以此为起点，不重新讨论 |
 | `install` 撞上「有 `.env`、无容器」时的复位体验 | **已裁决并实现**（`--reuse-env`） | 见 §11.3 第 1 条的 Lead 裁决：**显式**开关 + 双条件（`.env` 校验通过 **且** `TUNEX_IMAGE` 与请求版本一致），缺任一条件仍然 fail-closed（7 / 8）；不传开关时行为与引入前逐字相同 |

@@ -170,4 +170,28 @@ jobs:
       - name: Performance baseline harness self-test
         run: python3 scripts/perf/test_v5_tcp_baseline.py
 
+  # V5-WP21：安装器的**静态 + 桩化**门（scripts/ops/install.sh / bootstrap.sh）。
+  #
+  # 安装器会改机器状态（docker、部署目录、13001–13003、卷），也就没法在 CI runner 上反复
+  # 真跑 —— 而且生产栈与 e2e 栈共用 `tunex` 项目名，同时 up 会互相踩（docs/production-deploy.md §1）。
+  # 真实环境门禁交给 V5-G6 在专用机器上跑（contract §7）；这里只钉住两类**确定**的事：
+  #   1. `bash -n` 与 `sh -n`：安装器必须同时是 bash 与 POSIX 可解析的（引导段可能被 `sh` 执行）；
+  #   2. `installer-static.sh`：静态红线（无第三方加速域名 / 无 get.docker.com / 无 curl|sh /
+  #      口令不进 argv / 不自建备份迁移 / 不把开发栈当目标）+ 纯函数单测（含与
+  #      node-upgrade.ts 的镜像引用 parity）+ dry-run 全流程（夹具驱动，零副作用）
+  #      + 临时 git 仓库里的真克隆（tag 浅克隆 / 裸 SHA 完整克隆 / 断言失败自清）。
+  # 不依赖 docker 守护进程（本机没有也能跑）、不联网、不改机器状态；目标 ≤1 分钟。
+  installer-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shell syntax (bash -n / sh -n)
+        run: |
+          bash -n scripts/ops/install.sh
+          sh -n scripts/ops/install.sh
+          bash -n scripts/ops/bootstrap.sh
+          sh -n scripts/ops/bootstrap.sh
+      - name: Installer static + dry-run gate
+        run: bash scripts/ops/tests/installer-static.sh
+
 
