@@ -376,10 +376,8 @@ export function computeDrift(
       detail: `desired=${tunnel.desired_status ?? "未声明"} 但 agent 仍在运行隧道 ${tunnel.id}`,
     });
   }
-  // ── 内容漂移（V5.3 round 6/7）──
-  //
-  // 存在性与 revision 都对，但**内容**过期。只在两侧都有事实时判定：任一侧为 undefined
-  // 表示本次没有加载，"没加载"绝不能被读成"内容为空"，否则每一拍都会重发一次。
+  // Content drift is evaluated only when both desired and applied facts were
+  // loaded. Missing facts are unknown, never equivalent to an empty configuration.
   if (wantsActive(tunnel) && agent !== null && !unreachable) {
     const desiredTargets = tunnel.desired_pool_targets;
     const appliedTargets = agent.applied_pool_targets;
