@@ -141,8 +141,8 @@ must not keep serving only because the local runtime is still alive.
 The Agent polls:
 
 ```text
-GET/POST /api/internal/node/commands
-POST     /api/internal/node/ack
+GET  /api/internal/node/commands
+POST /api/internal/node/ack
 ```
 
 and reports to:
