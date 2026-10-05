@@ -64,9 +64,12 @@ type datagramEgressMapping struct {
 	// restart when the ingress restarts, so the newer incarnation is the one that
 	// must receive the replies.
 	generation uint32
-	// peer is the address replies go back to: the ingress source address this
-	// mapping was last fed from. It is the IP that was attested; the port is the
-	// ingress's ephemeral one and is only used to address the reply.
+	// peer is the immutable source endpoint that CREATED this mapping generation.
+	// The configured attestation deliberately pins only the ingress IP because a
+	// runtime restart chooses a new ephemeral source port; that restart also gets a
+	// new generation. Inside one generation, however, the hop socket endpoint must
+	// stay stable. Pinning IP+port here prevents a same-IP/different-port sender
+	// from stealing the reply path and makes replyLoop's lock-free read race-free.
 	peer *net.UDPAddr
 	// conn is the connected target socket for this mapping.
 	conn net.Conn
@@ -355,7 +358,19 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 	}
 	existing := e.mappings[header.MappingID]
 	if existing != nil && existing.generation == header.Generation {
-		existing.peer = src
+		// A mapping generation is bound to the hop socket endpoint that created it.
+		// A legitimate ingress restart changes both source port AND generation; a
+		// same-generation packet from a different endpoint is therefore not a
+		// migration signal — it is an unauthorised attempt to reuse live state.
+		if src == nil || existing.peer == nil ||
+			existing.peer.Port != src.Port ||
+			existing.peer.Zone != src.Zone ||
+			!existing.peer.IP.Equal(src.IP) {
+			e.mu.Unlock()
+			e.drops.Add(1)
+			e.dropsUnknownSrc.Add(1)
+			return nil
+		}
 		e.mu.Unlock()
 		return existing
 	}
@@ -402,9 +417,13 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 		e.dropsSendError.Add(1)
 		return nil
 	}
+	// Copy the source address: the mapping owns this immutable endpoint for the
+	// lifetime of the generation, independent of any address object returned by
+	// later ReadFromUDP calls.
+	peer := &net.UDPAddr{IP: append(net.IP(nil), src.IP...), Port: src.Port, Zone: src.Zone}
 	m := &datagramEgressMapping{
 		generation: header.Generation,
-		peer:       src,
+		peer:       peer,
 		conn:       c,
 		target:     addr,
 	}
