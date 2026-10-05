@@ -1,13 +1,15 @@
 name: CI
 
 on:
+  # Feature branches are validated by the pull_request event. Running the same
+  # SHA again on push only wastes runner time and usually gets cancelled moments
+  # later by the PR run. Main still validates every landed commit.
   push:
-    branches: [main, "feature/**"]
+    branches: [main]
   pull_request:
 
-# A branch can receive many small commits while an integration repair is in
-# progress. Keep only the newest CI for that branch; a PR run and a push run for
-# the same head branch also collapse into the same concurrency group.
+# Keep only the newest CI for a branch/PR. Feature pushes no longer create a
+# duplicate run; pull_request is the single development CI entry point.
 concurrency:
   group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
