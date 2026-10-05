@@ -36,7 +36,6 @@ import {
   FORWARD_TLS_PATH_MAX,
   FORWARD_TRANSPORTS,
   FORWARD_TRANSPORT_SPECS,
-  datagramRelayBoundaryKey,
   forwardProtocolFact,
   forwardProtocolFields,
   forwardProtocolForCreate,
@@ -251,15 +250,13 @@ describe("A3. udp 没有协议专属配置（§6.2）：选它不需要、也不
     expect(Object.keys(input)).not.toContain("tls_cert_path");
   });
 
-  test("udp + relay 在本版本会被运行时拒绝：只告警，不装作可用（也不代替后端拒绝）", () => {
-    expect(datagramRelayBoundaryKey("udp", "relay")).toBe("forward.udpRelayUnsupported");
-    expect(datagramRelayBoundaryKey("udp", "direct")).toBeNull();
-    expect(datagramRelayBoundaryKey("tcp", "relay")).toBeNull();
-    expect(datagramRelayBoundaryKey("wss", "relay")).toBeNull();
-    // 告警不是闸门：提交按钮的 disabled 条件里不能出现它（拒绝点是后端/运行时）
-    expect(WORKSPACE).toContain("datagramRelayWarningKey");
-    expect(WORKSPACE).not.toContain("!datagramRelayWarningKey");
+  test("udp + relay 不再暴露旧的 DIRECT-only 产品警告", () => {
+    expect(WORKSPACE).not.toContain("datagramRelayWarningKey");
+    expect(WORKSPACE).not.toContain("forward-datagram-relay-warning");
+    expect(EDIT_DIALOG).not.toContain("datagramRelayWarningKey");
+    expect(EDIT_DIALOG).not.toContain("forward-datagram-relay-warning");
   });
+
 });
 
 describe("B. tls 路径规则：与后端 tlsPathsForProtocol / zod schema 同形", () => {
@@ -735,12 +732,7 @@ describe("F. 措辞接线：凡假设「连接」的地方都按传输切换（�
     expect(EDIT_DIALOG).toContain("if (impact.metadata_only)");
   });
 
-  test("创建表单：udp + relay 只告警（data-testid 可见），提交按钮的 disabled 不含它", () => {
-    expect(WORKSPACE).toContain('data-testid="forward-datagram-relay-warning"');
-    expect(WORKSPACE).toContain("datagramRelayBoundaryKey(protocol, createMode)");
-    expect(EDIT_DIALOG).toContain('data-testid="forward-datagram-relay-warning"');
-    expect(EDIT_DIALOG).toContain("datagramRelayBoundaryKey(forward.protocol, draft.mode)");
-  });
+
 });
 
 describe("E. 新增词条：中英双语齐备且不画成原始 key", () => {
@@ -755,12 +747,11 @@ describe("E. 新增词条：中英双语齐备且不画成原始 key", () => {
     "tlsPathAbsolute",
     "tlsPathTooLong",
     "tlsPathNotAllowed",
-    // V5.1b：datagram（udp）面 —— 生命周期措辞 + 本版本的 udp 直连边界
+    // datagram（udp）生命周期措辞
     "sessionModel",
     "sessionModelMapping",
     "impactListenerDatagram",
     "impactTargetDatagram",
-    "udpRelayUnsupported",
     "impactMetadataOnlyTlsPaths",
   ] as const;
 
