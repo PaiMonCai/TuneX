@@ -251,6 +251,31 @@ worker 新增一个 tick。
 
 ## 4. 开放决策（不猜；候选与代价）
 
+> ### 4.0 Lead 裁决（2026-10-05）：归属、`traffic_used`、倍率 **已冻结**
+>
+> **归属（本契约最大的取舍）—— 套餐属 Workspace，不属 user。**
+> 新增 `PlanSubscription`（`workspace_id @unique`）作为唯一真相；`UserPlan` 冻结为
+> **legacy 读路径**（不删列、不删表）。依据：TuneX 的**全部额度判定都已经按 workspace**
+> （`policy-service` 的 assignment、`capability-policy` 的行锁守卫、`sumWorkspaceTraffic`），
+> 而 `UserPlan.user_id @unique` 是一个与判定链不一致的旧形状。代价明确接受：WP20-2 多两张
+> 表与一处可空列，dashboard 的读取路径要跟着切。
+>
+> **`UserPlan.traffic_used` —— 保留为 legacy 展示列，禁止回写。**
+> 与第 3.4 条（流量真相是窗口求和）一致；不删列以免丢掉历史快照并引发前端大改。
+>
+> **流量倍率 —— v1 不引入。** `traffic_cost` 当前恒等于 `traffic` 且没有任何口径读它；
+> 一旦引入，所有存量用户的已用流量数字会当场变化，需要口径切换公告 + Gate 回归，而
+> `traffic_cost` 的历史值不可比。要做是独立 WP。
+>
+> **O5 联邦远端腿用量 —— 不计入额度**（与"Usage authority = host panel"一致），只保留
+> `traffic_used_unattributed_federated` 作为可观测缺口，**不合并两本账**。
+>
+> **O6 到期通知 —— 不在本 WP**，与 WP18 的 O1 裁决一致：本 WP 落地**之后**该事实源才
+> 存在，届时由 WP18 单独登记为通知源。
+>
+> **O1/O4**：O1 不抽象统一 Reservation（收益为零且会碰 V4 冻结的端口所有权路径，取文档
+> 的推荐项）；O4 接管超时**登记进 SystemConfig**（默认 10 分钟，可调，不得硬编码）。
+
 > 以下**均未冻结**，落地前需 Lead 明确拍板，不允许实现者自行选择。
 
 **O1 · 端口租约是否纳入统一的「配额预留」抽象？（非阻塞）**

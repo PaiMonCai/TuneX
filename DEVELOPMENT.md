@@ -398,6 +398,33 @@ V5.5 Federation
 | V5-WP4 / G0 | **GREEN：PASS=137 / FAIL=0** | 真实四 Agent 拓扑，452s |
 | V5.1+ | **UNBLOCKED** | G0 全绿，按 §6 顺序开始 V5.1a WS/TLS |
 
+### 4.1 V5.6+ 候选（**契约已落，实现未开工**）
+
+> 这五份契约在 2026-10-05 由并行子代理产出、Lead 复核并冻结了各自的开放决策。
+> 它们**尚未登记过路线表**，接手 Agent 会找不到——本节就是登记处。**纪律不变**：
+> 一次一个 WP、契约先于实现、每个能力自带 DoD 与 Gate。
+>
+> | WP | 主题 | 契约（单一真相） | 状态 |
+> |---|---|---|---|
+> | WP17 | 入口/出口组（= Route Profile 的 selector 形态） + DDNS 联动 | `docs/v5-wp17-entry-exit-group-ddns-contract.md` | 契约冻结（D1–D4 已裁决）；新增 Gate **V5-G6** |
+> | WP18 | 公告系统 + 通用通知渠道 | `docs/v5-wp18-announcements-notifications-contract.md` | 契约冻结（O1–O4 已裁决） |
+> | WP19 | 延迟观测 / 链路拓扑 / Looking Glass | `docs/v5-wp19-latency-observability-contract.md` | 契约冻结（O1–O4 已裁决）；**先做 WP19-F**（既有缺陷收口） |
+> | WP20 | 订阅周期与流量周期结算运行时 | `docs/v5-wp20-subscription-billing-runtime-contract.md` | 契约冻结（归属 = Workspace 等已裁决） |
+> | WP21 | 一键安装器（+ 文档站/加速器：**本期均不立项**） | `docs/v5-wp21-installer-and-docs-site-contract.md` | 契约冻结（OPEN-1…OPEN-5 已裁决） |
+>
+> **本批裁决里被判为「既有缺陷」的三处**（都不是新功能，是"写了但没接线"）：
+>
+> 1. `diag` 白名单陷阱（WP19-F）：Agent 已上报 UDP/TLS/WS 协议诊断，面板 `ReportedTunnel`
+>    没有该字段、全仓零消费点 ⇒ 数据面事实"上报 200、库里 JSON 有、界面永远读不到"；
+> 2. `preferred_node_id` 恒为 null（WP17）：自动回切永不可能发生；
+> 3. `workspacePolicyAssignment` 全仓只有一个写入点 `policy-service.ts` 的
+>    `assignDefaultPolicy`（WP20）：**当前完全没有「支付 → 发放策略」的接线**。
+>
+> 另有两处沉睡半成品被点名（属"替换而非并存"，不得再叠一层）：`SystemConfigName` 里
+> 已含 `NOTICE*` 三个键并由 `routes/public.ts` 免认证下发，而 `web/src` 零消费者；
+> `DNSProvider` / `InNodeGroupDNS` 是遗留死 schema（全仓 `ddns` 命中 0，两表唯一生产
+> 引用是 `routes/admin-extended.ts` 的 `deleteMany`）。
+
 ---
 
 # 5. V5.0 — Contract Freeze
