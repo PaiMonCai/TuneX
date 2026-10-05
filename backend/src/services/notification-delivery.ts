@@ -1,12 +1,11 @@
 /**
  * Notification delivery ledger, cooldown and channel orchestration.
  *
- * Delivery is at-least-once with a persisted dedupe key per channel. Cooldowns
- * are normally coordinated in Redis, while every attempt remains visible in the
- * delivery ledger and channel failures never become false success. Notification
- * delivery is derived from existing product facts; the ledger is not a second
- * source of truth. If Redis is unavailable, sending may degrade to local
- * best-effort suppression so real incidents are not silently dropped.
+ * Delivery is at-least-once with persisted per-channel dedupe. Attempts remain
+ * visible in the ledger, channel failures never become false success, and the
+ * ledger is not a second source of product truth. Redis coordinates cooldowns;
+ * temporary Redis loss may degrade suppression but must not silently drop real
+ * incidents.
  */
 import { isMailConfigured, sendMail, type MailMessage, type MailResult } from "./mail.ts";
 import type { NotificationFact, NotificationScope } from "./notification-facts.ts";
@@ -27,9 +26,8 @@ export const NOTIFICATION_CHANNEL_KINDS = ["email", "webhook", "telegram"] as co
 export type NotificationChannelKind = (typeof NOTIFICATION_CHANNEL_KINDS)[number];
 
 /**
- * 本期**已实现契约**的渠道（`kind` 落在闭集之外的、或尚未实现的，一律拒绝并留失败记录
- * —— 不做"注册了就算支持"的假装）。清单随各 WP 的落地而增长：
- * WP18.2 email、WP18.3 webhook、WP18.4 telegram。
+ * Implemented channel kinds. Values outside this closed set are rejected and
+ * recorded as failures rather than treated as supported.
  */
 export const IMPLEMENTED_CHANNEL_KINDS: readonly NotificationChannelKind[] = ["email", "webhook", "telegram"];
 
