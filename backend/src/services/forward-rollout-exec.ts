@@ -1,49 +1,10 @@
 /**
- * V4-WP3 — Forward Rollout Orchestrator **执行面**（`DEVELOPMENT.md` §13.3.5
- * 五阶段 / §3.3 五阶段执行器 / §3.4 compensation / §3.5 可续跑记账）。
+ * Forward rollout execution, recovery and compensation.
  *
- * C3 交付了纯计划（`planRollout`），本文件交付「把计划跑完」：
- *
- * ```text
- *   registerRollout(tunnelId)          ← 读库 → plan → 写 rollout 行
- *   executeRollout(rolloutId)          ← 按已完成集合续跑未完成 steps
- *   compensate(rollout)                ← CUTOVER 失败后回退（§3.4）
- * ```
- *
- * ── 三条设计主轴 ──
- *
- * 1. **rollout 行是流水账，不是真相**（§13.3.5 + §3.5）。
- *    真相只有三处：`tunnel` 投影列（当前 applied）、WP1 `forward_revision`
- *    snapshot（desired 的历史）、Agent runtime。rollout 行只记「计划了什么、
- *    推进到哪、哪些步骤已完成」，因此它**随时可以丢**：丢了就重新 plan，
- *    不会让系统进入错误状态。这也意味着本文件所有写库都是「追加式 patch」
- *    （`steps.push` / `prepared.push` / `cleaned.push`），用 `updateMany` 带
- *    phase 条件做乐观并发，而不是 read-modify-write。
- *
- * 2. **续跑 = 重放 + 幂等键去重**（§3.5）。
- *    重启后读回 rollout 行，按 `completed`（step 幂等键集合）决定下一步。
- *    因此每个执行器必须**自己幂等**——这是复用的既有保证而不是新造的：
- *      · `acquirePort` 对同 tunnel 同方向的 preferred port 幂等续用；
- *      · `releaseLease` 对已 released 是 no-op；
- *    · `removeTunnel` 换 Agent 侧未知 id 返回 ok（`orchestrator.ts` 注释）。
- *
- * 3. **失败分流严格按 §13.3.5 第三张表**：
- *      VALIDATE 失败 → `failed`，**完全不写** rollout 行（planRollout 是纯函数，
- *                 它返回 blocking 时调用方还没落库）；
- *      PREPARE 明确失败 → 释放本轮 prepared 的 lease + 撤已 ACK 的 egress → `failed`，
- *                 `applied_revision` 不动、旧 runtime 继续；
- *      CUTOVER 明确失败 → `compensating`，接着跑 `compensate()`；
- *      PREPARE/CUTOVER 的 `ack_timeout` → `waiting`，因为 outbound command
- *                 已入队但 ACK 超时并不能证明「未生效」；恢复时按同 revision
- *                 幂等重放，只有明确 reject/failed 才允许补偿；
- *      DRAIN 失败 → 只记 warning，**不阻塞** CLEANUP（在途连接由 kernel 超时兜底）；
- *      CLEANUP 失败 → 记 `degraded`，不影响已生效的新 revision。
- *
- * ── 边界 ──
- * · 不改 `reconciler.ts` / `runtime-reconcile-sink.ts`（§3.5 明文）；
- * · 不加新 wire `CommandAction`：所有步骤都是既有 `apply_tunnel` /
- *   `remove_tunnel` 的不同编排顺序；
- * · 不复制 runtime 事实：端口来自 `acquirePort` 的返回值，节点来自 DB 行。
+ * Rollout rows are resumable execution ledgers, not desired/runtime truth.
+ * Executors replay idempotent steps, keep uncertain ACK timeouts in a waiting
+ * state, compensate only after explicit cutover failure, and preserve the last
+ * known applied revision until a replacement is confirmed.
  */
 
 import { randomUUID } from "node:crypto";
@@ -60,7 +21,7 @@ import {
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
 import { admitRoute } from "./forward-route.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
-// V5.5 WP15：远端出口腿的委托。编排只调这里的入口 —— 签名/重试/幂等键/镜像行
+//：远端出口腿的委托。编排只调这里的入口 —— 签名/重试/幂等键/镜像行
 // 全部有且只有一个实现（`federation/forward-hop.ts`），rollout 不再自己拼一遍。
 import {
   checkFederatedEgressForSnapshot,
@@ -168,7 +129,7 @@ export interface RolloutDeps {
   /** Re-read grants/policy/traffic before every PREPARE/CUTOVER side effect. */
   runtimeUse?: RuntimeUseChecker;
   /**
-   * V5.5 WP15：跨面板出站的注入点（默认走 `client.callPeer`）。
+   *：跨面板出站的注入点（默认走 `client.callPeer`）。
    *
    * 只有"这条 Forward 声明了 federated_egress_peer"的路径会用到它；为空时那些
    * 路径会走真实的 `callPeer`（签名/超时/重试的唯一实现）。测试注入假 transport，
@@ -408,12 +369,12 @@ interface TunnelProjection {
   desired_revision_id: number | null;
   desired_status: string;
   apply_status: string;
-  /** V5.5 WP15：远端出口声明（NULL = 出口在本机）。 */
+  /**：远端出口声明（NULL = 出口在本机）。 */
   federated_egress_peer?: string | null;
 }
 
 /**
- * 计划/执行期的一份快照：`RolloutSnapshot` + WP15 的远端出口声明。
+ * 计划/执行期的一份快照：`RolloutSnapshot` +  的远端出口声明。
  *
  * `RolloutSnapshot` 归 `forward-rollout.ts`（本轮的改动范围之外），而这里只需要多读
  * 一个**可选**字段，所以用子类型而不是去动那个契约 —— 类型层面仍然是同一个形状，
@@ -423,12 +384,12 @@ type FederatedRolloutSnapshot = RolloutSnapshot & { federated_egress_peer?: stri
 
 /**
  * 读 tunnel 行 + 最新 snapshot，凑出 {@link PlanRolloutInput} 的四个输入
- * 里的两个（`desired` / `applied`）+ WP1 impact 之外的节点事实。
+ * 里的两个（`desired` / `applied`）+  impact 之外的节点事实。
  *
  * **不复制 runtime 事实**（§13.3.5）：这里读出来的就是 tunnel 投影列与
  * snapshot 行本身，`desired` 取 `desired_revision_id` 指向的那一行；
  * 找不到（suspend bump 出的 revision 没有 snapshot，报告 R5）时回退到投影列
- * 合成基线——与 WP1 `currentDesiredConfig` 同口径。
+ * 合成基线——与  `currentDesiredConfig` 同口径。
  */
 /**
  * 相邻两跳的绑定集合（`"ingress->egress"`）。V5.4 路由准入需要它，而它是**外部事实**，
@@ -438,9 +399,8 @@ type FederatedRolloutSnapshot = RolloutSnapshot & { federated_egress_peer?: stri
  * 就不该下发，把"读不到"当成"有绑定"才是危险方向。
  */
 async function loadBoundPairs(db: RolloutDb): Promise<ReadonlySet<string>> {
-  // 两级都要存在才调用：替身可以有 `nodeBinding` 却没有 `findMany`
-  // （实测：只给 `findUnique` 的替身会让 `?.findMany(...)` 抛 TypeError ——
-  // 可选链只护住了第一层，护不住第二层。这是"部分端口不该炸掉整条路径"的同一类问题）。
+  // Treat a partial dependency surface as "no bindings loaded" rather than
+  // crashing a rollout before the fail-closed route admission check.
   const port = (db as unknown as { nodeBinding?: { findMany?: (args: unknown) => Promise<unknown> } }).nodeBinding;
   if (typeof port?.findMany !== "function") return new Set<string>();
   const rows = (await port.findMany({ select: { ingress_node_id: true, egress_node_id: true } }).catch(() => [])) as
@@ -517,13 +477,13 @@ async function loadRolloutNodes(
       ? (s.targets as Array<{ host: string; port: number; weight: number; order_by: number }>)
       : null,
     desired_status: (s.desired_status as string | null) ?? null,
-    // V5.5 WP15：这一跳"在哪一侧"必须随快照进计划 —— 续跑/补偿都靠它决定
+    //：这一跳"在哪一侧"必须随快照进计划 —— 续跑/补偿都靠它决定
     // 该走本地 orchestrator 还是 peer（快照是唯一的放置事实来源）。
     federated_egress_peer: federatedEgressPeerOf(s),
   });
 
   // desired：desired_revision_id 指向的 snapshot；缺失时用投影列合成基线
-  // （报告 R5 的 suspend bump 场景；口径与 WP1 currentDesiredConfig 一致）。
+  // （报告 R5 的 suspend bump 场景；口径与  currentDesiredConfig 一致）。
   const desiredRow = row.desired_revision_id
     ? snapshots.find((s) => Number(s.id) === Number(row.desired_revision_id))
     : snapshots[0];
@@ -570,7 +530,7 @@ async function loadRolloutNodes(
       node_id: String(rec.node_id ?? ""),
       role: (rec.role as string | null) ?? null,
       connect_ip: (rec.connect_ip as string | null) ?? null,
-      // WP5 lifecycle 列已随 WP5 schema 落地：节点行（include: true）会带上它，
+      //  lifecycle 列已随  schema 落地：节点行（include: true）会带上它，
       // 因此 validateRolloutAdmission 能真的拦住维护中/退役中节点。undefined
       // 只出现在构造入参（注入的替身）没这个字段时，行为退化为 fail-closed。
       lifecycle: (rec.lifecycle as string | null | undefined) ?? undefined,
@@ -595,7 +555,7 @@ async function loadRolloutNodes(
   ]);
   const nodes: PlanRolloutInput["nodes"] = {
     ingress: nodeFact(desiredIngress),
-    // ── V5.5 WP15：声明了远端 peer 时，出口跳在**另一个面板**上 ──
+    // ──：声明了远端 peer 时，出口跳在**另一个面板**上 ──
     //
     // 计划器需要一份出口节点事实（准入与路由模型都以它为前提），而本机确实没有
     // 出口节点。这里给的是一份**显式占位**（`FEDERATED_EGRESS_PLAN_NODE_ID`）：
@@ -689,7 +649,7 @@ async function rolloutRuntimeDenial(
   const ingress = rawIngress as { node_group_id?: number } | null;
   const egress = rawEgress as { node_group_id?: number } | null;
   const validId = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v > 0;
-  // V5.5 WP15：出口腿在远端时，本机**没有**出口节点组可授权 —— 那一跳的容量与
+  //：出口腿在远端时，本机**没有**出口节点组可授权 —— 那一跳的容量与
   // 配额权威在 host（契约 §1 的 Quota authority 答案：容量事实发生在 host）。
   // 这里仍然严格校验入口侧与归属，不是"跳过授权"。
   const federatedEgress = federatedEgressPeerOf(desired) !== null;
@@ -702,15 +662,14 @@ async function rolloutRuntimeDenial(
     user_id: tunnel.user_id,
     in_node_group_id: ingress.node_group_id,
     out_node_group_id: !federatedEgress && desired.mode === "relay" ? egress!.node_group_id! : null,
-    // The canonical FACT, legacy column only as a fallback. Feeding the legacy
-    // column straight in made the policy refuse a ws Forward (its column defaults
-    // to 'wss') — V5-G1A.7.
+    // Policy checks use the canonical product protocol; the legacy DB projection
+    // is only a persisted-fact fallback.
     protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
   });
 }
 
 /* ================================================================== */
-/* 远端出口腿（V5.5 WP15）                                              */
+/* 远端出口腿（）                                              */
 /* ================================================================== */
 
 /**
@@ -863,7 +822,7 @@ async function runStep(
       if (nodeId == null) {
         return { ok: false, error_code: "invariant_violated", error: "acquire_port 缺少 node_id" };
       }
-      // V5.5 WP15：远端出口腿的端口/节点由 **host** 在自己的 grant 范围里分配
+      //：远端出口腿的端口/节点由 **host** 在自己的 grant 范围里分配
       // （契约 §1.5：端口归承载方）。本机既不分端口，也不建任何 node_port_lease 行
       // —— 建了就是第二份 ownership。
       if (step.direction === "egress" && federatedEgressPeerOf(ctx.desired) !== null) {
@@ -872,7 +831,7 @@ async function runStep(
           note: `远端出口腿：跳过本机 ${nodeId}:${step.port ?? "auto"} 的端口/节点分配（端口归 host 的 portPool）`,
         };
       }
-      // V5.5 WP15：**只对联邦 Forward 的恢复路径**做的端口续用。
+      //：**只对联邦 Forward 的恢复路径**做的端口续用。
       //
       // 恢复用同一个 revision 重跑，而 `desired.listen_port` 可能是"自动分配"
       // （NULL）—— 若照旧把 NULL 当 preferred 去 acquirePort，`portPool` 只在
@@ -918,7 +877,7 @@ async function runStep(
       // 这里已由 `binding_exists === false` 作为入步骤条件，因此 create 是
       // 新建而非 upsert；重复执行撞 @@unique 时按「已存在」算成功（幂等）。
       //
-      // V5.5 WP15：远端出口腿没有本机出口节点 ⇒ 没有可建的 Binding。跨面板那一跳
+      //：远端出口腿没有本机出口节点 ⇒ 没有可建的 Binding。跨面板那一跳
       // 的许可由 host 的 grant 决定（契约 §3.1），不是本机节点间的 Binding。
       if (federatedEgressPeerOf(ctx.desired) !== null) {
         return { ok: true, note: "远端出口腿：跳过本机 NodeBinding（跨面板那一跳由 host 的 grant 授权）" };
@@ -959,7 +918,7 @@ async function runStep(
     }
 
     case "prepare_egress": {
-      // V5.5 WP15：声明了远端 peer 时，这一跳**不走**本机 `dispatchEgress`，
+      //：声明了远端 peer 时，这一跳**不走**本机 `dispatchEgress`，
       // 而是委托给承载方（预留 → 应用 → 镜像行），拿它返回的地址当下一跳。
       if (federatedEgressPeerOf(ctx.desired) !== null) {
         return delegateRemoteEgressStep(ctx, deps);
@@ -992,7 +951,7 @@ async function runStep(
         protocol: egressFacts.protocol,
         tlsCertPath: egressFacts.tlsCertPath,
         tlsKeyPath: egressFacts.tlsKeyPath,
-        // V5.1b WP5-B2: the datagram exit attests its ingress. Derived once, in the
+        // V5.1b : the datagram exit attests its ingress. Derived once, in the
         // dispatch facts, so both legs of the hop name the same address.
         hopPeer: egressFacts.hopPeer,
       });
@@ -1013,7 +972,7 @@ async function runStep(
     /* ---------------- CUTOVER ---------------- */
 
     case "cutover_egress": {
-      // V5.5 WP15：同节点只换目标池时，PREPARE 没有 egress 步，出口侧的"按新
+      //：同节点只换目标池时，PREPARE 没有 egress 步，出口侧的"按新
       // revision 生效"就发生在 CUTOVER。远端腿走同一条幂等委托：同一
       // `(intent_id, revision)` 在 host 侧返回首次结果，host 复用 epoch。
       if (federatedEgressPeerOf(ctx.desired) !== null) {
@@ -1049,7 +1008,7 @@ async function runStep(
         protocol: egressFacts.protocol,
         tlsCertPath: egressFacts.tlsCertPath,
         tlsKeyPath: egressFacts.tlsKeyPath,
-        // V5.1b WP5-B2: the datagram exit attests its ingress. Derived once, in the
+        // V5.1b : the datagram exit attests its ingress. Derived once, in the
         // dispatch facts, so both legs of the hop name the same address.
         hopPeer: egressFacts.hopPeer,
       });
@@ -1115,7 +1074,7 @@ async function runStep(
       if (ctx.desired.mode === "relay") {
         const remotePeer = federatedEgressPeerOf(ctx.desired);
         const egressNodeId = ctx.desired.egress_node_id;
-        // V5.5 WP15：出口腿在远端时本机**没有**出口节点，这不是"缺出口"——
+        //：出口腿在远端时本机**没有**出口节点，这不是"缺出口"——
         // next_hop 由 host 的响应决定（见 resolveNextHop 的联邦分支）。
         if ((egressNodeId == null && remotePeer === null) || step.direction === "egress") {
           return { ok: false, error_code: "invariant_violated", error: "RELAY cutover 缺少出口节点" };
@@ -1130,7 +1089,7 @@ async function runStep(
             error: "RELAY 入口切换前无法解析 next_hop（出口未就绪）",
           };
         }
-        // V5-WP4/G0: a cutover issues a real command, so it carries the
+        // /G0: a cutover issues a real command, so it carries the
         // Forward's persisted protocol instead of letting the orchestrator
         // default an absent one to tcp.
         const ingressFacts = await dispatchFactsFor(ctx.tunnelId, deps.db);
@@ -1191,7 +1150,7 @@ async function runStep(
 
     case "drain_ingress":
     case "drain_egress": {
-      // V5.5 WP15：旧出口腿在**远端**时，本机没有它的 runtime 可撤 —— 那条腿的
+      //：旧出口腿在**远端**时，本机没有它的 runtime 可撤 —— 那条腿的
       // 停服就是 CLEANUP 里的 `drop_old_egress` 发出的 `DELETE /leases/:ref`。
       // 这里若照旧报 invariant_violated，会把一次正常的"远端出口撤下"变成
       // DRAIN 硬失败（整条 rollout 落到 degraded）。
@@ -1304,7 +1263,7 @@ async function runStep(
     case "drop_old_egress":
     case "drop_old_transit": {
       if (nodeId == null) {
-        // V5.5 WP15：这条旧出口腿在远端 ⇒ 撤它的唯一正确动作是**释放远端租约**。
+        //：这条旧出口腿在远端 ⇒ 撤它的唯一正确动作是**释放远端租约**。
         // 顺序按契约 §3.3「先本地入口停 → 再远端释放」：CLEANUP 发生在入口已经
         // 切到新 next_hop（或已撤下）之后，所以这里正是那一刀。
         //
@@ -1351,7 +1310,7 @@ async function runStep(
     case "validate":
       return { ok: true, note: "validate（计划期已判定）" };
 
-    /* ---------------- 中间跳（V5.4 WP12）---------------- */
+    /* ---------------- 中间跳（）---------------- */
 
     case "prepare_transit": {
       // 中间跳与出口跳是**同一个原语**（一个监听 + 拨号到"目标"的转发），区别只在目标是谁：
@@ -1432,7 +1391,7 @@ async function runStep(
  * tunnel id（`-relay` / `-egress` / `-direct`），那由 direction 参数自己决定。
  */
 /**
- * The admitted protocol of an existing Forward (V5-WP4/G0).
+ * The admitted protocol of an existing Forward (/G0).
  *
  * Rollout steps issue real commands to real Agents, so they must carry the
  * Forward's protocol fact instead of letting the orchestrator default to tcp —
@@ -1468,7 +1427,7 @@ async function dispatchFactsFor(
       tunnel_type: true,
       tls_cert_path: true,
       tls_key_path: true,
-      // V5.1b WP5-B2: the datagram exit's attestation address comes from the
+      // V5.1b : the datagram exit's attestation address comes from the
       // INGRESS node, so the facts read it here. Every dispatch site that already
       // uses this helper therefore gets `hopPeer` without re-deriving it — two
       // sites deriving it is how the two legs would name different addresses.
@@ -1566,7 +1525,7 @@ function resolveHopAddress(ctx: RolloutExecContext, nodeId: number, fallbackPort
  * 与计划、准入、纯路由模型用的是同一个字段。
  */
 function resolveNextHop(ctx: RolloutExecContext): string | null {
-  // V5.5 WP15：出口腿在远端时，"下一跳是谁"由 **host 的应用响应**决定
+  //：出口腿在远端时，"下一跳是谁"由 **host 的应用响应**决定
   // （`node_address` + `port`）。本机没有那台节点的任何地址事实，所以这里
   // 只能读登记表；登记不到就返回 null，让 cutover_ingress 以
   // `next_hop_unresolved` fail-closed —— **绝不**猜 IP（猜错是每个新连接都
@@ -1666,7 +1625,7 @@ export async function compensateRollout(
     }
   }
 
-  // ── V5.5 WP15：本次尝试切过去的**新**远端出口腿也要撤 ──
+  // ──：本次尝试切过去的**新**远端出口腿也要撤 ──
   //
   // 它同样是"新 runtime"，只是不在本机；`removals` 只认本机节点。漏掉它会在另一个
   // 面板上留下一条继续监听、继续把流量转给旧目标的腿（G4 的同族泄漏），而且它在
@@ -1713,11 +1672,8 @@ export async function compensateRollout(
     if (!baseline) {
       errors.push(`baseline snapshot revision=${row.base_revision} 不存在`);
     } else {
-      // ── 回滚产生**新世代**（内容 = 基线），而不是原地重放基线版本 ──
-      //
-      // 第一版按 `base_revision` 重放，于是被 Agent 正确地拒绝为 `stale_revision`：版本在系统里
-      // 是**单调**的（Agent 拒收比它已见更低的 revision，这正是防乱序 apply 的机制），而回滚发生在
-      // 该行已经前进到更高 revision 之后 —— 重放一个更低的号，从 Agent 角度看就是一条迟到的旧命令，
+      // Rollback creates a new generation carrying baseline content; replaying an
+      // older revision would violate the Agent's monotonic revision fence.，从 Agent 角度看就是一条迟到的旧命令，
       // 拒绝是对的。实测后果：补偿永远失败，rollout 停在 degraded，两侧都不服务
       // （`forward_rollout#35` 的 `compensation_error` 就是这句话）。
       //
@@ -1758,7 +1714,7 @@ export async function compensateRollout(
         /**
          * 回滚后的出口事实（host + 监听端口）。
          *
-         * V5.5 WP15：它可能来自两处 —— 本机 `dispatchEgress` 的返回值，或**远端
+         *：它可能来自两处 —— 本机 `dispatchEgress` 的返回值，或**远端
          * peer 的应用响应**。两条路的共同点是"地址只能来自承载方自己"，所以这里
          * 归一成一个变量，入口与中间跳的指向都只认它。
          */
@@ -2279,7 +2235,7 @@ async function executeRolloutOwned(
         return concurrentTakeoverResult(rolloutId, fresh, completed.size);
       }
 
-      // WP10: registration is not an authorization lease. Re-read CURRENT target
+      // : registration is not an authorization lease. Re-read CURRENT target
       // scope/capability before *each* lease/binding/command write, including a
       // recovered pending rollout. Blocking keeps the ledger recoverable and the
       // old applied runtime intact; do not turn denial into destructive rollback.
@@ -2539,7 +2495,7 @@ async function releasePrepared(
     await releaseLease({ leaseId: p.handle }, { db: db as never }).catch(() => {});
   }
 
-  // ── V5.5 WP15：远端腿不在 `prepared` 里 ──
+  // ──：远端腿不在 `prepared` 里 ──
   //
   // 它的句柄（peer / lease_ref）在 `federation_placement` 的镜像行上 —— 这正是那行
   // 存在的理由之一。释放用**本次 revision 的 intent 键**，与建立时完全一致。
@@ -2577,7 +2533,7 @@ async function markTunnelFailed(
  * `config_revision` 会留下一个静默故障：rollout 记 done、Agent 已在跑新配置，
  * 而 tunnel 行永远显示「落后」——reconciler 每轮 `resend_same_revision` 重发
  * 同一 revision，被 Agent 的 stale 闸门拒绝后又进入重试退避，循环空转。
- * `markTunnelApplied` 是 WP3 对 tunnel 行成功记账的唯一出口，与
+ * `markTunnelApplied` 是  对 tunnel 行成功记账的唯一出口，与
  * `scheduler.persistSuccess`（创建路径）保持同一组列，避免两条写入路径语义分叉。
  *
  * `last_applied_at` 同样要写：reconciler 的 `DEFAULT_RETRY_BACKOFF_MS` 退避
@@ -2630,9 +2586,9 @@ async function markTunnelApplied(
 
 export interface RegisterRolloutInput {
   tunnelId: number;
-  /** WP1 `computeForwardImpact` 的输出（preview 已算过，直接透传）。 */
+  /**  `computeForwardImpact` 的输出（preview 已算过，直接透传）。 */
   impact: Parameters<typeof planRollout>[0]["impact"];
-  /** 期望的 revision（已由 WP1 `createForwardRevision` 落库）。 */
+  /** 期望的 revision（已由  `createForwardRevision` 落库）。 */
   revision: number;
   baseRevision: number | null;
   /** suspended 编辑 ⇒ noop rollout（§3.6）。 */
@@ -2697,7 +2653,7 @@ export async function registerRollout(
   // 没有任何错误。因此 fail-closed —— 在**任何副作用之前**拒绝，并点名是哪一跳。
   const declaredPeerAtRegistration = federatedEgressPeerOf(desired);
   if (declaredPeerAtRegistration !== null) {
-    // ── V5.5 WP15：远端出口的**同一强度**准入 ──
+    // ──：远端出口的**同一强度**准入 ──
     //
     // 本机路由模型（`buildRoutePlan`）要求出口是一个**本机**节点 id，而声明了 peer
     // 时出口在另一个面板上。这里用同一份 fail-closed 判定替代它，判定的强度不变：
