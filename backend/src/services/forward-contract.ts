@@ -1,11 +1,10 @@
 /**
- * V5-WP0 — canonical Forward protocol/topology contract.
+ * Canonical Forward protocol/topology contract.
  *
- * This module deliberately does NOT mirror Prisma's legacy TunnelType enum.
- * TunnelType contains historical implementation/wrapper names (wss/mtls/tunex...)
- * and "the enum contains a value" must never be interpreted as "the product
- * supports it". V5 protocols become product-visible only by being added here
- * together with their independent Gate.
+ * Product support is defined here, not by the historical Prisma TunnelType enum.
+ * A protocol becomes usable only when parser, runtime, capability advertisement
+ * and regression coverage agree on it. Legacy DB projection is compatibility
+ * metadata and never a product-support signal.
  */
 
 export const FORWARD_MODES = ["direct", "relay"] as const;
@@ -14,10 +13,10 @@ export type ForwardMode = (typeof FORWARD_MODES)[number];
 /**
  * Product protocols the runtime has opened.
  *
- * A value lands here only together with its own Gate (V5-G0 established the
- * "enum presence is not product support" rule; V5-WP0 enforced it). V5.1a adds
+ * A value lands here only together with its own Gate (regression coverage established the
+ * "enum presence is not product support" rule;  enforced it). V5.1a adds
  * `tls` — the same stream lifecycle with a TLS-terminated client-facing listener
- * (DEVELOPMENT.md §6.1). `ws` follows in V5-WP5-A2. `udp` follows in V5.1b
+ * (DEVELOPMENT.md §6.1). `ws` follows in . `udp` follows in V5.1b
  * (DEVELOPMENT.md §6.2, `docs/v5-1b-datagram-contract-draft.md`), and it is the
  * first protocol whose TRANSPORT is not `stream`; `quic` comes last.
  */
@@ -67,7 +66,7 @@ export interface ForwardProtocolSpec {
    *
    * So the honest projection is "nothing useful to say here": the write omits
    * the column and the canonical `forward_protocol` remains the only protocol
-   * fact (WP0 made it authoritative and it is never NULL for a new Forward).
+   * fact ( made it authoritative and it is never NULL for a new Forward).
    */
   readonly legacy_tunnel_type: string | null;
 }
@@ -177,7 +176,7 @@ export function legacyTunnelTypeForForwardProtocol(
 }
 
 /* ================================================================== */
-/* RuntimePlan（V5-WP0 立形，V5-WP2 补全为可用的纯计划）                  */
+/* RuntimePlan（ 立形， 补全为可用的纯计划）                  */
 /* ================================================================== */
 
 /**
@@ -191,27 +190,15 @@ export function legacyTunnelTypeForForwardProtocol(
  * The persisted protocol fact of a Forward row, **if the current runtime admits
  * it**; `null` means "this fact is not runnable".
  *
- * This is the single implementation used by every dispatch path — the scheduler,
- * the reconcile sink and the rollout executor. It lives here rather than in
- * scheduler.ts because a second copy is how one path ends up admitting a fact the
- * others refuse: the V5-G0 gate caught exactly that, with a historical `wss`
- * Forward being dispatched as TCP by the reconcile sink because that path passed
- * no protocol at all and the orchestrator's default is tcp.
+ * This is the single implementation used by scheduler, reconcile and rollout
+ * paths so a persisted protocol cannot be interpreted differently by each path.
  */
 export function admitPersistedProtocol(row: {
   forward_protocol?: unknown;
   tunnel_type?: unknown;
 }): ForwardProtocol | null {
-  // A persisted row must CARRY a protocol fact. If neither column is present the
-  // projection is wrong (a forgotten `select`), and "absent means tcp" — which is
-  // correct at the V4 *ingest* boundary, where a client legitimately omits the
-  // field — becomes catastrophic here: the row's own fact is silently replaced by
-  // the default and a historical `wss` Forward is dispatched as TCP.
-  //
-  // Gate V5-G0 caught exactly that: the reconciler's desired-state projection did
-  // not select the protocol columns, so every resend through the reconcile sink
-  // admitted the default. Failing closed turns a missing column into a refusal
-  // (visible, diagnosable) instead of a wrong runtime (invisible, live).
+  // Persisted rows must carry a protocol fact. Missing projection columns fail
+  // closed instead of silently reinterpreting the runtime as TCP.
   if (row.forward_protocol == null && row.tunnel_type == null) return null;
   try {
     return normalizeForwardProtocol(persistedForwardProtocol(row.forward_protocol, row.tunnel_type));
@@ -221,7 +208,7 @@ export function admitPersistedProtocol(row: {
 }
 
 /**
- * V5-WP5-A1: validate the tls front's paths for a given protocol.
+ * : validate the tls front's paths for a given protocol.
  *
  * Two rules, both fail-closed:
  *   · `protocol === "tls"` requires BOTH paths — dispatching "serve TLS" without
@@ -286,26 +273,15 @@ export function legacyTunnelTypeColumn(
 }
 
 /**
- * Everything a dispatch needs to know about a persisted Forward, resolved in ONE
- * place: the protocol and its protocol-specific configuration.
- *
- * This exists because "the protocol" and "the fields that protocol needs" are one
- * fact, and splitting them across call sites is how a new required field is
- * forgotten on one path. Gate G0 and G1A each found a version of that: first a
- * dispatch path with no protocol at all, then (after `tls` arrived) a path that
- * carried the protocol but not the certificate paths, so every hot reload of a
- * tls Forward failed while create and restore worked.
- *
- * `null` means "this row must not be dispatched": either its protocol is not
- * admitted, or it is a tls row without a complete certificate pair. Callers
- * refuse; none of them re-derive the answer locally.
+ * Resolve protocol plus protocol-specific dispatch configuration in one place.
+ * `null` means the persisted row is not runnable and callers must fail closed.
  */
 export interface DispatchFacts {
   readonly protocol: ForwardProtocol;
   readonly tlsCertPath?: string;
   readonly tlsKeyPath?: string;
   /**
-   * V5.1b WP5-B2：datagram 跳上"配对入口节点"的地址，出口腿据此取证。
+   * V5.1b：datagram 跳上"配对入口节点"的地址，出口腿据此取证。
    *
    * 只有 datagram 协议会带上它：TCP/TLS/WS 的跳是裸 TCP，握手本身就说明了对面是谁，
    * 多带一个字段只会是一个**没人读**的字段（而"没人读的字段"正是慢慢漂移的开始）。
@@ -329,7 +305,7 @@ export function firstConnectIp(raw: string | null | undefined): string | null {
 
 /** `ip:port` / `[v6]:port` / 裸地址 → 地址部分；空串或非字符串 → null。
  *
- * 导出是因为**编排层也要用它**：入口 ACK 回报的是 `ip:port`，而面板要拿地址部分去与
+ * 导出是因为**编排层也要用它** 入口 ACK 回报的是 `ip:port`，而面板要拿地址部分去与
  * `connect_ip` 比对，才能判断这次下发的取证地址是不是错的。第二份解析就是漂移的开始。 */
 export function addressPartOfEndpoint(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -347,18 +323,18 @@ export function addressPartOfEndpoint(raw: unknown): string | null {
 }
 
 /**
- * 出口该取证的地址（V5.1b WP5-B2，契约 §12.5 回填第 8 条）。
+ * 出口该取证的地址（V5.1b ，契约 §12.5 回填第 8 条）。
  *
  * **优先用入口自己上报的跳端点**（`diag.hop_local_addr`），回落到 `connect_ip`。
  *
  * 为什么不能只用 `connect_ip`：那个值在多宿节点上是**错的**。跳的源地址由内核按路由选，
- * 可能是面板完全不知道的那张网——真拓扑上的实测就是"入口从出口网地址发出，面板却告诉出口
+ * 可能是面板完全不知道的那张网——真拓扑上的observed就是"入口从出口网地址发出，面板却告诉出口
  * 接受它的入口网地址"，于是每个跳报文都被丢弃（`ingress packets_in=1` /
  * `egress drops=1, packets_in=0`）。而"告诉入口该用哪个源地址"也不行：跨子网源地址会被
- * 当作 martian 丢弃（实测绑定源地址后**没有任何回应**）。所以这个地址只能由**真正知道它
+ * 当作 martian 丢弃（observed绑定源地址后**没有任何回应**）。所以这个地址只能由**真正知道它
  * 的那一端**发布——与 `next_hop` 的流向（出口 → 面板 → 入口）恰好相反。
  *
- * **只取地址部分，不取端口**：端口是临时的，入口一重启就变；把它写进出口腿的配置会让
+ * **只取地址部分，不取端口** 端口是临时的，入口一重启就变；把它写进出口腿的配置会让
  * 配置在每次重启后都不一样（无谓的 revision 抖动），而出口本来就只钉地址、忽略端口。
  */
 export function datagramHopPeerFor(input: {
@@ -459,7 +435,7 @@ export interface ForwardRuntimeUpstreamFacts {
 /**
  * `RuntimePlan`：**纯计划**，不含 socket、不含 goroutine、不含任何可失败的资源。
  *
- * WP2 的职责是把它补全成一个"能回答后续所有协议/HA/multi-hop 需要的问题"的
+ *  的职责是把它补全成一个"能回答后续所有协议/HA/multi-hop 需要的问题"的
  * 形状，而不引入第二份真相：
  *
  *   topology  —— 用户选的拓扑（direct / relay）
@@ -470,7 +446,7 @@ export interface ForwardRuntimeUpstreamFacts {
  *   listener  —— 入口绑定事实
  *   upstream  —— 远端事实
  *
- * WP2 仍然只生成 TCP/stream 计划：这里没有任何"未来协议"的字段。
+ *  仍然只生成 TCP/stream 计划：这里没有任何"未来协议"的字段。
  */
 export interface ForwardRuntimePlan {
   readonly topology: { readonly mode: ForwardMode };
@@ -487,7 +463,7 @@ export interface ForwardRuntimePlan {
   readonly upstream: ForwardRuntimeUpstreamFacts;
 }
 
-/** 计划里尚未确定的事实（WP0 调用方保持可用的默认值）。 */
+/** 计划里尚未确定的事实（ 调用方保持可用的默认值）。 */
 export const EMPTY_FORWARD_RUNTIME_PLACEMENT: ForwardRuntimePlacement = Object.freeze({
   ingress_node_id: null,
   egress_node_id: null,
@@ -508,7 +484,7 @@ export interface ForwardRuntimePlanFacts {
 /**
  * 构造纯计划。
  *
- * 前两个参数是 WP0 的冻结签名：不传 `facts` 时得到的就是 WP0 的那个最小计划
+ * 前两个参数是  的冻结签名：不传 `facts` 时得到的就是  的那个最小计划
  * （外加一组显式的"尚未确定"事实），所以既有调用方无需改动。
  */
 export function buildForwardRuntimePlan(
@@ -545,14 +521,8 @@ export function buildForwardRuntimePlan(
 }
 
 /**
- * 计划的**内部一致性**检查，返回违规清单（空 = 通过）。
- *
- * 为什么需要一个校验函数而不是只定义类型：这些规则用类型表达不了，而它们恰好是
- * 「协议对了、传输对了，但计划自相矛盾」的那一类错误——例如 RELAY 计划没有
- * next_hop、DIRECT 计划却带着出口节点。Gate V5-G0 与后续协议都会读计划，
- * 与其每个消费者各自假设，不如在这里一次说清。
- *
- * 纯函数，不抛：调用方（Gate、诊断、未来协议）需要把违规当成数据收集起来。
+ * Internal consistency validation for a pure RuntimePlan. The function returns
+ * violations as data so callers can report all inconsistencies without throwing.
  */
 export function forwardRuntimePlanViolations(plan: ForwardRuntimePlan): string[] {
   const out: string[] = [];

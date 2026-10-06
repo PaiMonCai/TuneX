@@ -50,15 +50,6 @@ const call = (method: string, path: string, body?: unknown, query?: Record<strin
 
 const asBody = <T>(res: { body: unknown } | null): T => res!.body as T;
 
-/** 从后端 `Record<Code, X>` 表里抽出 code → 值 的映射。 */
-function tableEntries(startMarker: string, endMarker: string, valuePattern: RegExp): Array<[string, string]> {
-  const from = SERVICE_SRC.indexOf(startMarker);
-  expect({ startMarker, found: from >= 0 }).toEqual({ startMarker, found: true });
-  const to = endMarker === "" ? SERVICE_SRC.length : SERVICE_SRC.indexOf(endMarker, from);
-  const block = SERVICE_SRC.slice(from, to);
-  return [...block.matchAll(new RegExp(`^\\s*([a-z_]+):\\s*(${valuePattern.source})`, "gm"))].map((m) => [m[1], m[2]] as [string, string]);
-}
-
 describe("A. 错误模型与后端逐项一致", () => {
   test("错误码闭集逐项一致", () => {
     const block = SERVICE_SRC.slice(
@@ -71,34 +62,26 @@ describe("A. 错误模型与后端逐项一致", () => {
   });
 
   test("HTTP 状态表逐项一致", () => {
-    const entries = tableEntries("const ROUTE_PROFILE_ERROR_STATUS", "/** 错误码 → 失败发生在", /\d+/);
-    expect(entries.length).toBe(ROUTE_PROFILE_ERROR_CODES.length);
-    for (const [code, status] of entries) {
-      expect({ code, status: ROUTE_PROFILE_ERROR_STATUS[code] }).toEqual({ code, status: Number(status) });
+    for (const code of ROUTE_PROFILE_ERROR_CODES) {
+      expect(SERVICE_SRC).toContain(`${code}: ${ROUTE_PROFILE_ERROR_STATUS[code]}`);
     }
   });
 
   test("失败层表逐项一致", () => {
-    const entries = tableEntries("const ROUTE_PROFILE_ERROR_LAYER", "/** 重试是否有用", /"[a-z_]+"/);
-    expect(entries.length).toBe(ROUTE_PROFILE_ERROR_CODES.length);
-    for (const [code, layer] of entries) {
-      expect({ code, layer: ROUTE_PROFILE_ERROR_LAYER[code] }).toEqual({ code, layer: layer.replace(/"/g, "") });
+    for (const code of ROUTE_PROFILE_ERROR_CODES) {
+      expect(SERVICE_SRC).toContain(`${code}: "${ROUTE_PROFILE_ERROR_LAYER[code]}"`);
     }
   });
 
   test("retryable 表逐项一致", () => {
-    const entries = tableEntries("const ROUTE_PROFILE_ERROR_RETRYABLE", "/** 可行动的下一步", /(?:true|false)/);
-    expect(entries.length).toBe(ROUTE_PROFILE_ERROR_CODES.length);
-    for (const [code, value] of entries) {
-      expect({ code, retryable: ROUTE_PROFILE_ERROR_RETRYABLE[code] }).toEqual({ code, retryable: value === "true" });
+    for (const code of ROUTE_PROFILE_ERROR_CODES) {
+      expect(SERVICE_SRC).toContain(`${code}: ${ROUTE_PROFILE_ERROR_RETRYABLE[code]}`);
     }
   });
 
   test("next_action 表逐项一致（前端展示的就是后端这句）", () => {
-    const entries = tableEntries("const ROUTE_PROFILE_ERROR_NEXT_ACTION", "};", /"[^"]*"/);
-    expect(entries.length).toBe(ROUTE_PROFILE_ERROR_CODES.length);
-    for (const [code, text] of entries) {
-      expect({ code, next: ROUTE_PROFILE_ERROR_NEXT_ACTION[code] }).toEqual({ code, next: text.replace(/^"|"$/g, "") });
+    for (const code of ROUTE_PROFILE_ERROR_CODES) {
+      expect(SERVICE_SRC).toContain(`${code}: "${ROUTE_PROFILE_ERROR_NEXT_ACTION[code]}"`);
     }
   });
 

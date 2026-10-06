@@ -1,28 +1,14 @@
 /**
- * V5-WP20-1 计费时钟（纯函数模块，**进程时区无关**）。
+ * Canonical billing calendar helpers.
  *
- * 契约：`docs/v5-wp20-subscription-billing-runtime-contract.md` §3.1（计费时钟与幂等）、
- * §7.2（时间夹具：边界函数必须接受显式 `now`）、风险 R1（进程时区漂移）。
- * DoD 第 3 条：同一组断言必须在 `TZ=UTC` / `TZ=Asia/Shanghai` / `TZ=America/Los_Angeles`
- * 下**逐字相等** —— 因此本模块：
- *   1. **不读**进程时区环境变量（`TZ`），**不读**系统时钟（所有函数都要显式时间点入参）；
- *   2. **不用** `setHours` / `setDate` / `getHours` / `toISOString().slice(...)` 这类跟随进程
- *      时区的 API（它们是 F13 旧口径的成因）；
- *   3. 只从**固定时区** `Asia/Shanghai` 的 `Intl.DateTimeFormat` 派生日历分量。
- *
- * 为什么固定单区域时区（契约 §3.1.2）：`Workspace` / `CapabilityPolicy` 没有时区列，
- * per-workspace 时区会同时污染账本日标签（`tunnel_traffic.date`）、审计与 Gate；而窗口起点
- * 若跟随进程 TZ，缺失 `TZ=Asia/Shanghai` 的部署会让跨月边界整体偏移一天（R1）。
- *
- * 与 `Forwardx(参考项目，不进入git提交）/shared/billingTime.ts` 的关系：只**吸收语义**
- * （固定时区派生日历分量 + 月内日期夹取 + `maxResetDay=28` 上限避免 2 月跳变），
- * **实现独立重写、无代码复用**（契约 §2）。
- *
- * 本 WP 的边界：**只交付纯函数**。不改 `policy-service.ts` / `capability-policy.ts` 的读路径
- * （那是 WP20-6），不新增 schema、不注册 cron、不引入进程内缓存或单例时钟。
+ * All billing boundaries are derived from the fixed Asia/Shanghai calendar and
+ * explicit input timestamps, so results do not depend on the process timezone
+ * or ambient system clock. Workspace policy currently has no per-workspace
+ * timezone, therefore month/day windows and persisted traffic-day labels must
+ * share this single calendar definition.
  */
 
-/** 计费日历所属时区（契约 §3.1：单区域，不引入 per-workspace 时区）。 */
+/** Canonical billing timezone used by all billing windows and day labels. */
 export const BILLING_TIME_ZONE = "Asia/Shanghai";
 
 /** 上海墙钟日历分量（`month` 1..12、`day` 1..31、`hour` 0..23，`hourCycle: "h23"` 下午夜是 0 不是 24）。 */

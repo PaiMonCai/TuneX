@@ -1,27 +1,12 @@
 /**
- * V5-WP1 —— 能力协商 v2（纯函数，无 IO）。
+ * Agent runtime capability manifest.
  *
- * V4-WP11B 只回答了「这个节点能不能收到这个**动作**」（见 agent-capability.ts）。
- * V5 要在这条既有链上扩展协议 / 传输 / runtime 能力，因此需要第二组正交事实，
- * 但它们必须**挂在同一套纪律上**，而不是新造一套协商机制：
+ * Action capability and runtime capability are orthogonal: the former answers
+ * whether an Agent can execute a command action; this manifest answers which
+ * product protocols/transports/runtime features it actually implements.
  *
- *   · 缺失（旧 Agent 从未上报）      → baseline：V4 冻结时就存在的组合继续可用，
- *                                       baseline 以外一律拒绝（升级提示）。
- *   · 存在但坏形状                    → fail-closed，且**不得**静默降级成「未上报」。
- *   · 存在但不含该项                  → 明确不支持（这就是协商的全部意义）。
- *   · 凭据轮换晚于上报                → 那份广告描述的是已经不存在的进程，作废。
- *   · 未知条目名                      → 不构成任何许可；判定只做**精确匹配**。
- *
- * ── 为什么用 additive 的 `capability_manifest` 而不是把 capabilities 改成 object ──
- * `capabilities` 是 string[]，旧 Panel / 旧工具链（Support Bundle、诊断快照）
- * 已经按数组读它。原地改成 object 会让每一个读它的人都静默拿到 undefined，
- * 把「节点支持 apply_tunnel」变成「什么都不知道」。所以 v2 事实走新字段，
- * 旧字段的语义一字不改。
- *
- * ── 能力仍然不是授权 ──
- * 这一层只回答「对端实现了没有」，是 §13.5 五层里的第 5 层（Runtime Admission）
- * 的一个子条件。它**不**参与工作空间 RBAC、资源作用域、能力策略或额度判定，
- * 也绝不能因为 Agent 自报了什么就授予权限。
+ * Missing manifests use the frozen compatibility baseline. Explicitly advertised
+ * absence fails closed. Unknown future manifest schema versions are never guessed.
  */
 
 import type { AgentCapabilityFacts } from "./agent-capability.ts";
@@ -39,7 +24,7 @@ import { FORWARD_PROTOCOLS, FORWARD_TRANSPORTS } from "./forward-contract.ts";
  * `capability_manifest` 的 schema 版本。
  *
  * 面板只认这一个值。更高（或更低）的版本不是「坏形状」，而是**不可读**：
- * 未来的 Agent 用 v3 描述自己时，本面板看不懂它的语义，因此按「未上报」处理
+ * Unknown future schema versions are treated as unavailable rather than guessed.
  * ——baseline TCP 继续跑（不制造全网中断），baseline 以外一律拒绝。
  * 反过来把一个更新版 Agent 判成 malformed 并 fail-closed 全部动作，会让一次
  * Agent 灰度升级变成整批节点停摆，方向恰好错反。
@@ -92,7 +77,7 @@ export interface CapabilityManifest {
 }
 
 /**
- * baseline：V4 协议冻结时就已经存在的组合。
+ * Baseline: combinations that predate explicit runtime capability reporting.
  *
  * 未上报 manifest 的旧 Agent 必须继续被认为支持它们——否则升级窗口内所有旧
  * 节点立刻停止收命令，把一次平滑升级变成一次全网中断。baseline 之外的新组合

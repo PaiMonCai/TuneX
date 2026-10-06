@@ -1,5 +1,5 @@
 /**
- * V5.4 WP11/WP12 —— 线性路由（RoutePlan）的**纯**模型。
+ * / —— 线性路由（RoutePlan）的**纯**模型。
  *
  * 契约冻结在 `DEVELOPMENT.md` §9 的「V5.4 冻结契约」。这里只做三件事，且都是纯函数：
  *   1. 把一跳 / 两跳 / 三跳的放置事实整理成**有序路由**（hop 0 … hop N-1）；
@@ -235,10 +235,8 @@ export type RouteAdmission =
 /**
  * 下发前判定这条路由**能不能**按当前实现发出去。
  *
- * 为什么必须在这里拒绝而不是"先按单跳发出去"：`middle_node_id` 非空意味着用户要的是三跳。
- * 如果实现只发单跳形状，转发**会正常工作，但走的是另一条路** —— 没有任何错误、没有告警，
- * 只有拓扑与用户配置不一致。这类"静默地做了别的事"是本项目最贵的一类缺陷，因此这里
- * **fail-closed**：未实现的多跳一律拒绝，并且错误里点名"哪一跳"和"哪个约束"。
+ * A caller that cannot execute a route shape must fail closed instead of silently
+ * collapsing it to a simpler topology. `boundPairs` is supplied as an external fact.
  *
  * `boundPairs` 由调用方作为事实传入（相邻跳必须有 NodeBinding）；本函数不读库。
  */
@@ -251,14 +249,8 @@ export function admitRoute(
   if (plan === null) {
     return { ok: false, code: "route_invalid", error: "路由放置事实不完整或自相矛盾（缺入口/出口，或中间跳与端点重合）" };
   }
-  // ── 绑定检查只对**多跳**成立 ──
-  //
-  // 单跳（DIRECT 的两端在同一台机器上；RELAY 的入出口）不需要预先存在 Binding：rollout 计划里
-  // 本来就有 `ensure_binding` 步骤，**创建**它正是那次 rollout 的工作之一。在准入阶段要求它，
-  // 会把每一次 RELAY 的**首次部署**都拒掉 —— 实测就是这样（34 个用例失败）。
-  //
-  // 三跳则相反：中间跳是**新增的一段链路**，它必须先有许可（§9 冻结契约第 3 条），
-  // 而"先有"意味着在准入时就已经存在。
+  // Single-hop rollout can create its binding during PREPARE. A middle hop adds
+  // an already-authorized adjacency, so multi-hop requires those bindings up front.
   const requiresBindings = plan.middle_node_id !== null;
   const violations = routeViolations(plan, boundPairs, { requireBindings: requiresBindings });
   if (violations.length > 0) {
@@ -276,7 +268,7 @@ export function admitRoute(
       code: "route_not_dispatchable",
       error:
         `该转发配置了中间跳（hop 1 = 节点 ${plan.middle_node_id}，共 ${plan.hops.length} 跳），` +
-        "但多跳下发尚未实现（WP12）。拒绝下发以避免静默地按单跳工作",
+        "当前调用方未声明多跳执行能力，拒绝下发以避免静默地按单跳工作",
     };
   }
   return { ok: true, plan, hop_indices: plan.hops.map((h) => h.hop_index) };

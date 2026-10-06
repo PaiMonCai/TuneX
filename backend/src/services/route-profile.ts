@@ -1,21 +1,11 @@
 /**
- * V5-WP13.5B —— Route Profile 服务层（DEVELOPMENT.md §9.4.2–§9.4.6）。
+ * Route Profile service.
  *
- * 契约（FROZEN）：`docs/v5-wp13-5b-route-profile-contract.md`。
- *
- * ── 本模块是 Route Profile 的**唯一**读写入口，且刻意不做三件事 ──
- *   1. 不拥有 runtime：没有 lease、没有 Forward lifecycle、没有 applied revision、
- *      没有流量计数、没有独立 reconcile —— 这些语义全部留在既有模块里；
- *   2. 不新建下发通道：`apply` 只是把「模板解析出的具体节点」交给既有
- *      `services/forward-service.ts#patchForward`（→ `createForwardRevision` →
- *      rollout），因此 revision 递增、rollout 五阶段、补偿全部沿用既有实现；
- *   3. 不发第二份路由事实：`RoutePlan` 一律来自 `services/forward-route.ts`。
- *
- * ── 变更传播（§9.4.5 的硬要求）──
- *   模板内容变更**只能**通过发布新版本（`publishRouteProfileVersion`）；
- *   `patchRouteProfile` 只改 metadata，收到模板键会直接 400。因此「编辑共享模板」
- *   这个动作在实现上不可能触发任何 Forward 的运行时变化 —— 传播只能来自显式
- *   `applyRouteProfile`（它要求显式 forward_ids，并逐条做 expected_revision 闸门）。
+ * Profiles are templates only: they do not own runtime state, leases, traffic,
+ * reconciliation or a second route truth. Applying a profile resolves concrete
+ * nodes and delegates the actual Forward change to the existing Forward service,
+ * preserving its revision, rollout and compensation semantics. Template content
+ * changes are versioned explicitly; metadata edits never mutate live Forwards.
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
@@ -38,7 +28,7 @@ import { patchForward, type ForwardPatchInput } from "./forward-service.ts";
 import { listNodeHealth } from "./node-health-service.ts";
 
 /* ================================================================== */
-/* 1. 错误模型（§13：分层 + 可重试性 + 下一步动作）                     */
+/* Error model                                                        */
 /* ================================================================== */
 
 export const ROUTE_PROFILE_ERROR_CODES = {
@@ -88,7 +78,7 @@ export const ROUTE_PROFILE_ERROR_STATUS: Record<RouteProfileErrorCode, 400 | 403
   db_unavailable: 503,
 };
 
-/** 错误码 → 失败发生在**哪一层**（§13 的六层模型）。 */
+/** Error code -> product layer where the failure occurred. */
 export const ROUTE_PROFILE_ERROR_LAYER: Record<RouteProfileErrorCode, RouteProfileErrorLayer> = {
   invalid_input: "resource_scope",
   unsupported_topology: "capability",
@@ -106,7 +96,7 @@ export const ROUTE_PROFILE_ERROR_LAYER: Record<RouteProfileErrorCode, RouteProfi
   db_unavailable: "data_plane",
 };
 
-/** 重试是否有用（§13「whether retry helps」）。 */
+/** Whether retrying the same operation may succeed. */
 export const ROUTE_PROFILE_ERROR_RETRYABLE: Record<RouteProfileErrorCode, boolean> = {
   invalid_input: false,
   unsupported_topology: false,
@@ -124,7 +114,7 @@ export const ROUTE_PROFILE_ERROR_RETRYABLE: Record<RouteProfileErrorCode, boolea
   db_unavailable: true,
 };
 
-/** 可行动的下一步（§13「what next action is」；前端直接展示这句）。 */
+/** User-facing next action for each failure. */
 export const ROUTE_PROFILE_ERROR_NEXT_ACTION: Record<RouteProfileErrorCode, string> = {
   invalid_input: "修正请求内容后重试",
   unsupported_topology: "把中间跳改为固定的具体节点（动态中间池未开放）",

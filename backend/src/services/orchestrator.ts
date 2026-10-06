@@ -1,62 +1,18 @@
 /**
- * WP8 — RELAY Orchestrator（Track C）。
+ * Forward runtime orchestrator.
  *
- * 依据 `DEVELOPMENT.md` §4.2「RELAY 编排铁律」、§1.1「RELAY 必须**先准备出口，
- * 再启入口**」与 devmap v3「tunnelOrchestrator 补全 RELAY 模式（两次下发逻辑）」。
+ * RELAY ordering is safety-significant: prepare the egress runtime first, then
+ * activate the ingress listener. This prevents a newly bound user-facing port
+ * from accepting traffic before its next hop exists. DIRECT, RELAY and EGRESS
+ * all use the same revisioned command/ACK contract.
  *
- * ── 铁律一：先出口，后入口 ──
+ * Port ownership is resolved outside this module; the orchestrator consumes
+ * already-selected nodes/ports and owns dispatch ordering plus compensation.
  *
- * ```text
- * 5. 向 Egress 发送 apply，等待 ACK N。
- * 6. Egress 成功后向 Ingress 发送 apply，等待 ACK N。
- * 7. 两端均成功后 apply_status=active。
- * ```
- *
- * 为什么这个顺序不可交换（不是风格问题）：入口 listener 一旦 bind 就开始
- * 收用户流量，而它的 next-hop 指向出口节点。若入口先起、出口还没就绪，
- * 每一个进来的连接都会拿到 connection refused / timeout —— 用户侧看到的是
- * 「隧道建好了但连不上」，比「还在创建中」难排查得多。反过来先起出口：
- * 出口在等一个还没有人连接它的端口，对外完全不可见，零用户影响。
- *
- * 因此 {@link Orchestrator.dispatchIngress} 的入参里 `next_hop` 是**必填**——
- * 没有出口地址就不允许启入口。`dispatchEgress` 返回的 `egress_host` 就是它的
- * 唯一来源（见 {@link Orchestrator} 的两个方法如何配合）。
- *
- * ── 铁律二：两次下发，不是一次 ──
- * RELAY 在**两台物理机**上各有一条隧道，它们是两条独立 resource：
- *  · 出口节点上：一条 `EGRESS` 模式的隧道（监听 egress_port → 目标池 LB）；
- *  · 入口节点上：一条 `RELAY` 模式的隧道（监听 ingress_port → 出口节点）。
- *
- * WP4 Agent 的 `TunnelConfig` 就按这个模型建（`mode: EGRESS` / `mode: RELAY`，
- * `forwarder/interface.go`）。所以编排器必须**分别**下发两次，各自等各自
- * 的 ACK，各自记各自的 revision（两端用的是同一个 `config_revision` N，
- * 这样一次重发对两端都是同一个版本，WP9 reconciler 才能按版本对齐）。
- *
- * ── 铁律三：端口分配在编排器之外 ──
- * 本模块**不 import portPool**：端口是 WP3 的所有权（§5.1），编排器只消费
- * 已经拿到的端口号。把分配与下发分开，WP3 的并发/对账逻辑就不会被编排的
- * 失败路径污染（例如「入口下发失败要不要释放出口端口」属于编排补偿，
- * 属于本模块；「端口还能不能再分」属于所有权，属于 WP3）。
- *
- * ── transport 边界 ──
- * 下发动作全部走 {@link AgentTransport} 接口。默认实现 {@link HttpAgentTransport}
- * 经 WP4 Agent 的 `POST /tunnel` 管理面（127.0.0.1:9090，AGENT_ADMIN_TOKEN
- * bearer）；真正生产用的出站长连接（§3.1「私网 Agent 只需出站连接控制面」）
- * 由 WP7 node session 提供，届时替换这一个实现即可，编排顺序不变。
- *
- * ── 节点身份（§3.3 + WP7）──
- * 编排器**不**在这里验身份，但它在两个点上与 WP7 强绑定：
- *  1. `HttpAgentTransportOptions.tokenForNode` 返回的 bearer 必须是 WP7 的
- *     per-node credential（不是 `node_group.token`：一把组 token 能冒充组内
- *     任意节点，正是 §3.3 禁止的形态）。凭据的签发/轮换/撤销与解析都在
- *     `services/node-credential.ts`，本模块只消费 opaque token；
- *  2. 「这个节点有没有资格被编排」由 `scheduler.ts` 的 bind 阶段用 WP7 的
- *     {@link decideNodeAuth} 判定（见该文件 `nodeCredentialUsable`）。没有
- *     有效凭据的节点根本进不到下发这一步。
- *
- * 载荷统一经 WP6 {@link createCommand} 构造 + {@link ControlValidator} 走闸门：
- * stale / duplicate / expired 三条硬规则因此对**编排器自身**也生效——重放
- * 一次创建不会让 Agent 重建 listener（§3.2 hard rule 2）。
+ * The transport is injected. Production wiring in `relay-wiring.ts` uses
+ * `OutboundAgentTransport`: the Panel queues commands and authenticated Agents
+ * poll/ACK over outbound HTTP. `HttpAgentTransport` remains an optional
+ * compatibility/test transport and is not the production default.
  */
 
 import { createHash } from "node:crypto";
@@ -80,7 +36,7 @@ import {
 } from "./forward-contract.ts";
 
 /* ================================================================== */
-/* Agent 管理面契约（WP4 api.Server 的镜像）                            */
+/* Runtime dispatch contract.                                           */
 /* ================================================================== */
 
 /** 编排器眼里的节点投影（只需要寻址 + 角色，其余字段与调度无关）。 */
@@ -92,11 +48,11 @@ export interface OrchestratorNode {
   role: "ingress" | "egress" | "both" | null;
 }
 
-/** Agent 侧的隧道配置（与 WP4 `forwarder.TunnelConfig` JSON 对齐）。 */
+/** Agent runtime configuration mirrored by the Go forwarder contract. */
 export interface AgentTunnelConfig {
   /** 稳定 id：`tunex-<tunnelId>-<direction>`。Agent 以它为幂等键。 */
   id: string;
-  /** EGRESS = 出口侧；RELAY = 入口侧（WP4 `forwarder.Mode`）。 */
+  /** EGRESS = exit-side runtime; RELAY = ingress-side runtime. */
   mode: "DIRECT" | "EGRESS" | "RELAY";
   ingress_port: number;
   egress_port: number;
@@ -105,7 +61,7 @@ export interface AgentTunnelConfig {
   /** RELAY 模式必填：`<egress node ip>:<egress port>`（validate 会强校验）。 */
   next_hop: string;
   /**
-   * V5.1b WP5-B2 —— datagram（`protocol=udp`）**出口腿**的取证地址：配对入口节点的地址。
+   * V5.1b  —— datagram（`protocol=udp`）**出口腿**的取证地址：配对入口节点的地址。
    *
    * UDP 的跳没有握手，出口无法推断谁可以喂它；缺了它出口会拒绝构建（Agent 侧是硬校验）。
    * 只在 `protocol=udp` 下发：其他协议的跳是裸 TCP，字段带了没人读。
@@ -117,7 +73,7 @@ export interface AgentTunnelConfig {
   hop_peer?: string;
   targets: { host: string; port: number; weight: number; order: number }[];
   /**
-   * V5.2 WP7 —— 合成后的目标健康，**与 `targets` 平行**而不是塞进每个 target 里。
+   *  —— 合成后的目标健康，**与 `targets` 平行**而不是塞进每个 target 里。
    *
    * 两条理由，都不是风格问题：
    *   1. desired 与 health 是两类事实。塞进同一个元素，下一次改动就说不清新增字段
@@ -137,7 +93,7 @@ export interface AgentTunnelConfig {
   }[];
   lb_strategy: "ROUND_ROBIN" | "RANDOM" | "WEIGHTED_ROUND_ROBIN";
   /**
-   * V5-WP2: the product protocol this config carries, taken from the forward's
+   * : the product protocol this config carries, taken from the forward's
    * RuntimePlan. It is no longer typed as the literal "tcp": the plan is the
    * single source of this fact, and the agent's outbound gate reads the very
    * same field (services/agent-command-bus.ts), so the admitted protocol and
@@ -145,13 +101,12 @@ export interface AgentTunnelConfig {
    */
   protocol: ForwardProtocol;
   /**
-   * V5.3 WP9 —— 归属事实：本节点被授权承载该 Forward 的世代与租约到期时刻。
+   *  —— 归属事实：本节点被授权承载该 Forward 的世代与租约到期时刻。
    *
    * Agent 侧据此拒绝 stale epoch（收到比已见最高更低的 epoch 时拒绝激活），
    * 并在租约到期后停止服务。缺席 = 面板没有授权信息（旧面板）→ Agent 行为与今天一致。
    *
-   * 这两个字段**必须同时出现在命令下发与重连快照两条路径上**，并且解码器必须认识它们 ——
-   * V5 里这个类别已经踩过三次（协议、证书路径、健康），症状分别是"重启后静默失效"。
+   * These facts must travel on both command dispatch and reconnect snapshots so restart recovery preserves fencing.
    */
   ownership_epoch?: number;
   lease_expires_at?: string;
@@ -159,7 +114,7 @@ export interface AgentTunnelConfig {
   revision: number;
   listen_host?: string;
   /**
-   * V5-WP5-A1: node-local certificate/key PATHS for a tls front. The control
+   * : node-local certificate/key PATHS for a tls front. The control
    * plane never carries key material (§6.1 "Where are certificates owned?").
    * Omitted for every other protocol — the Agent refuses a tls tunnel without
    * them, so an omission cannot silently degrade into "TLS but unauthenticated".
@@ -200,7 +155,7 @@ export const RELAY_DISPATCH_ERROR_CODES = {
    * 这是一个"宁可拒绝"的错误码，不是临时占位：`middle_node_id` 一旦非空，`RoutePlan`
    * 就是三跳，而当前下发链路只会发出单跳形状的配置。若在这里放行，用户配了中间跳之后
    * 转发会**静默地按单跳工作** —— 那正是本项目反复吃亏的一类失败（配置生效了，但不是
-   * 用户要的那条路）。实现 WP12 之前，多跳必须在这里被明确拒绝并点名原因。
+   * 用户要的那条路）。实现  之前，多跳必须在这里被明确拒绝并点名原因。
    */
   route_not_dispatchable: "route_not_dispatchable",
   /** 命令明确未建立可用管理面连接：DNS / 连接拒绝等。 */
@@ -218,7 +173,7 @@ export const RELAY_DISPATCH_ERROR_CODES = {
   /** 节点没有可用于转发的地址（connect_ip 解析不出）。 */
   node_unaddressable: "node_unaddressable",
   /**
-   * V5.1b WP5-B2：datagram（udp）出口腿没有 `hop_peer`。
+   * V5.1b：datagram（udp）出口腿没有 `hop_peer`。
    *
    * 与 `route_not_dispatchable` 同一取向的"宁可拒绝"：datagram 的跳是 UDP，
    * **没有握手能说明对面是谁**，出口必须被明确告知谁可以喂它。入口节点的地址只有面板
@@ -266,15 +221,15 @@ export class AgentTransportError extends Error {
 }
 
 /* ================================================================== */
-/* HTTP transport（WP4 agent internal/api 的客户端）                     */
+/* Optional direct-HTTP Agent transport (compatibility/test use).       */
 /* ================================================================== */
 
-/** 默认管理面端口：devmap v3 的 agent port 9090（与 9191 上报口隔离）。 */
+/** Default loopback/local Agent admin API port for the optional direct transport. */
 export const DEFAULT_AGENT_ADMIN_PORT = 9090;
 
 export interface HttpAgentTransportOptions {
   /**
-   * 每节点 bearer token。**语义是 WP7 per-node credential**（§3.3），不是
+   * Per-node bearer credential, never a group credential.
    * `node_group.token`：后者一组一把，能冒充组内任意节点。缺失的节点 =
    * 拒绝下发（`agent_rejected`）。凭据的签发/轮换/撤销在
    * `services/node-credential.ts`，调用方从那里取。
@@ -289,14 +244,10 @@ export interface HttpAgentTransportOptions {
 }
 
 /**
- * 经 Agent 本地管理面 HTTP API 下发（WP4 `internal/api/server.go`）。
- *
- * 寻址规则：`http://<connect_ip>:<port>`。`connect_ip` 可能是逗号分隔多 IP
- * （`config-generator.ts` 的 `getConnectIP` 已在处理这个），这里取**第一个**
- * 可解析项——控制面到节点是私网/内网直连，不做 IP 优选。
- *
- * `127.0.0.1` / `localhost` 也允许：v3 部署拓扑里节点与 agent 同机，
- * 单机 BOTH 场景面板与 agent 同机部署时 connect_ip 常写成回环。
+ * Optional direct HTTP transport for local/compatibility environments.
+ * Production wiring uses the outbound command bus instead. This transport
+ * addresses the first usable `connect_ip` and authenticates with the per-node
+ * credential.
  */
 export class HttpAgentTransport implements AgentTransport {
   private readonly tokens: HttpAgentTransportOptions["tokenForNode"];
@@ -387,7 +338,7 @@ export class HttpAgentTransport implements AgentTransport {
   }
 
   applyEgress(node: OrchestratorNode, config: AgentTunnelConfig): Promise<unknown> {
-    // WP4 agent 的 POST /tunnel 同时接嵌套 TunnelConfig 与带 revision 的扁平
+    //  agent 的 POST /tunnel 同时接嵌套 TunnelConfig 与带 revision 的扁平
     // 信封（applyRequest），这里直接用嵌套形态。
     return this.post(node, "/tunnel", config);
   }
@@ -434,7 +385,7 @@ export type RouteDispatchOutcome =
 export interface DispatchEgressInput {
   tunnelId: number;
   /**
-   * V5.5 WP15：覆盖运行时 id。本地 Forward 不传（用 `tunex-<tunnelId>-egress`）；
+   *：覆盖运行时 id。本地 Forward 不传（用 `tunex-<tunnelId>-egress`）；
    * 联邦远端腿传 `Orchestrator.federatedTunnelId(leaseRef, "egress")`，
    * 避免与 host 上同号的本地 Forward 撞 id。**additive、可选**：不传时行为与今天逐字节一致。
    */
@@ -442,7 +393,7 @@ export interface DispatchEgressInput {
   revision: number;
   /** 出口节点（bind 阶段选出）。 */
   egressNode: OrchestratorNode;
-  /** 出口端口（WP3 分配的节点间内部端口）。 */
+  /** 出口端口（ 分配的节点间内部端口）。 */
   egressPort: number;
   /** 目标池 id（`egress_pool_id`，未指定 default 池时为 null）。 */
   poolId: number | null;
@@ -455,13 +406,13 @@ export interface DispatchEgressInput {
   }[];
   /** 池/节点上的 LB 策略；NULL = ROUND_ROBIN。 */
   lbStrategy?: string | null;
-  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  /** : 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
   protocol?: ForwardProtocol;
-  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  /** : tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
   tlsCertPath?: string | null;
   tlsKeyPath?: string | null;
   /**
-   * V5.1b WP5-B2：配对**入口**节点的地址（`protocol=udp` 时必填）。
+   * V5.1b：配对**入口**节点的地址（`protocol=udp` 时必填）。
    *
    * UDP 的跳没有握手，出口无法自行推断谁可以喂它；这个地址就是出口取证的那条事实。
    * 其他协议不读它——它们的跳是裸 TCP，带一个没人读的字段只会慢慢漂移。
@@ -472,7 +423,7 @@ export interface DispatchEgressInput {
 export interface DispatchIngressInput {
   tunnelId: number;
   /**
-   * V5.5 WP15：覆盖运行时 id（联邦远端入口腿用 `federatedTunnelId(ref,"relay")`）。
+   *：覆盖运行时 id（联邦远端入口腿用 `federatedTunnelId(ref,"relay")`）。
    *
    * 传了它就同时意味着"这不是本机 Forward 的腿"：host 上没有对应的 tunnel 行，
    * 因此**不**写 `placement_lease` —— 联邦腿的归属由 `federation_lease.lease_epoch`
@@ -484,9 +435,9 @@ export interface DispatchIngressInput {
   ingressPort: number;
   /** `<egress ip>:<egress port>`，来自 {@link dispatchEgress} 的返回值。 */
   nextHop: string;
-  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  /** : 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
   protocol?: ForwardProtocol;
-  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  /** : tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
   tlsCertPath?: string | null;
   tlsKeyPath?: string | null;
 }
@@ -499,9 +450,9 @@ export interface DispatchDirectInput {
   remoteHost: string;
   remotePort: number;
   listenHost?: string | null;
-  /** V5-WP2: 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
+  /** : 该转发 RuntimePlan 里的协议；缺省 = V4 的 TCP。 */
   protocol?: ForwardProtocol;
-  /** V5-WP5-A1: tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
+  /** : tls 前端的证书/私钥路径（仅 protocol=tls 时下发）。 */
   tlsCertPath?: string | null;
   tlsKeyPath?: string | null;
 }
@@ -520,7 +471,7 @@ export type EgressDispatchOutcome = EgressDispatchSuccess | DispatchFailure;
 
 export interface RemoveTunnelInput {
   tunnelId: number;
-  /** V5.5 WP15：见 `DispatchEgressInput.runtimeId`（联邦远端腿用 `fed-` 命名空间）。 */
+  /**：见 `DispatchEgressInput.runtimeId`（联邦远端腿用 `fed-` 命名空间）。 */
   runtimeId?: string;
   /** 在哪台节点上撤。 */
   node: OrchestratorNode;
@@ -532,7 +483,7 @@ export interface RemoveTunnelInput {
 }
 
 /**
- * V5.2 WP7 默认健康来源：读观测投影 → WP6 合成。
+ *  默认健康来源：读观测投影 →  合成。
  *
  * 合成的结论**由面板给出**，Agent 不自己定义健康；这里产出的就是那一个模型的下发形式。
  * 失败一律回落到空数组（见 dispatchEgress 的说明）：健康是优化，不是闸门。
@@ -543,7 +494,7 @@ const defaultTargetHealthSource: TargetHealthSource = async (targets) =>
   // is an agent that has health after a command but not after a restart.
   targetHealthWireEntries(targets, new Date());
 
-/** V5.2 WP7：一次下发的健康来源。可注入，便于离线断言"没有健康信号"的分支。 */
+/**：一次下发的健康来源。可注入，便于离线断言"没有健康信号"的分支。 */
 export type TargetHealthSource = (
   targets: readonly { host: string; port: number }[],
 ) => Promise<{
@@ -556,10 +507,10 @@ export type TargetHealthSource = (
 }[]>;
 
 export interface OrchestratorOptions {
-  /** V5.2 WP7：健康来源；省略则读观测投影并做 WP6 合成。 */
+  /**：健康来源；省略则读观测投影并做  合成。 */
   healthSource?: TargetHealthSource;
   transport: AgentTransport;
-  /** WP6 校验器（进程级共享，revision 闸门跨请求生效）。 */
+  /**  校验器（进程级共享，revision 闸门跨请求生效）。 */
   validator?: ControlValidator;
   /** 下发前先探测节点可达性（默认 true；离线节点快速失败）。 */
   probeReachable?: boolean;
@@ -571,7 +522,7 @@ export interface OrchestratorOptions {
  * 呼吸契约是：2xx + `{"ok":true, "id":…, "revision":N}` = 应用成功；其余
  * （`{"ok":false,...}`、`{"error":…}`、空 body、数组、null）一律不是成功。
  *
- * 为什么不能只看 HTTP 状态码：WP4 agent 的 `handleApplyTunnel` 对
+ * 为什么不能只看 HTTP 状态码： agent 的 `handleApplyTunnel` 对
  * `ErrStaleRevision` 回 **409**、别的错误回 400，HTTP transport 已经把它们
  * 变成 throw。但**非 HTTP transport**（测试替身、未来的消息队列）会直接返回
  * body，此时 body 才是唯一真相。两者都要覆盖，所以解析放在这里而不是
@@ -607,7 +558,7 @@ function parseAgentAck(
   return {
     ok: true,
     applied_revision: typeof rev === "number" ? rev : undefined,
-    // V5.1b WP5-B2: the datagram RELAY agent reports the hop endpoint it actually uses.
+    // V5.1b : the datagram RELAY agent reports the hop endpoint it actually uses.
     // Read it here so it can ride the synthesized `command_ack` below — the response body
     // is the only place this fact exists.
     ...(typeof r.hop_local_addr === "string" && r.hop_local_addr.trim() !== ""
@@ -628,7 +579,7 @@ export class Orchestrator {
   private readonly validator: ControlValidator;
   private readonly probe: boolean;
   /**
-   * V5.2 WP7: where the per-target health comes from. Injected so the orchestrator
+   * : where the per-target health comes from. Injected so the orchestrator
    * keeps its "no IO beyond the transport" testability — a test can hand it a stub,
    * including the empty case, without a database.
    */
@@ -646,7 +597,7 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
 
   /**
-   * V5-WP5-A1: the tls front's paths, or nothing.
+   * : the tls front's paths, or nothing.
    *
    * Only emitted for `protocol=tls`, and only as a pair: a half-configured TLS
    * front would otherwise reach an Agent that must then decide which half to
@@ -708,7 +659,7 @@ export class Orchestrator {
   }
 
   /**
-   * V5.5 WP15 —— **联邦远端腿**的运行时 id：`tunex-fed-<leaseRef>-<direction>`。
+   *  —— **联邦远端腿**的运行时 id：`tunex-fed-<leaseRef>-<direction>`。
    *
    * 为什么需要单独命名空间：host 侧承载的是一个远端 Forward 的一条腿，它**没有**本地
    * Forward 行，所以不能借用 `tunnel.id` —— 同一台 host 上"本地隧道 11"与"联邦租约 11"
@@ -722,7 +673,7 @@ export class Orchestrator {
   }
 
   /* ---------------------------------------------------------------- */
-  /* 线性路由的下发（V5.4 WP12）                                        */
+  /* 线性路由的下发（）                                        */
   /* ---------------------------------------------------------------- */
 
   /**
@@ -735,7 +686,7 @@ export class Orchestrator {
    */
   async dispatchTransit(input: {
     tunnelId: number;
-    /** V5.5 WP15：见 `DispatchEgressInput.runtimeId`。 */
+    /**：见 `DispatchEgressInput.runtimeId`。 */
     runtimeId?: string;
     revision: number;
     node: OrchestratorNode;
@@ -792,7 +743,7 @@ export class Orchestrator {
 
     const listeningAt = new Map<number, { host: string; port: number }>();
 
-    // V5.1b WP5-B2: the exit hop of a datagram route must attest its ingress, and
+    // V5.1b : the exit hop of a datagram route must attest its ingress, and
     // the ingress is the FIRST hop of this plan — resolved once, here, because the
     // reverse dispatch order (far to near) would otherwise make "who fed me"
     // depend on which hop happened to be dispatched first.
@@ -876,7 +827,7 @@ export class Orchestrator {
   }
 
   /* ---------------------------------------------------------------- */
-  /* 归属事实（V5.3 WP9）                                              */
+  /* 归属事实（）                                              */
   /* ---------------------------------------------------------------- */
 
   /**
@@ -1013,7 +964,7 @@ export class Orchestrator {
     // （4）认领被两阶段规则正确地拒绝，**整条重发路径因此永久失败**（实测 `failed: 1`、池永远不更新）。
     // 规则没错，是问错了对象。
 
-    // V5.2 WP7: the synthesized health travels BESIDE the desired targets, and a
+    // : the synthesized health travels BESIDE the desired targets, and a
     // failure to read it must never block a rollout — health is an optimization for
     // selection order, not a gate on whether a Forward may run. So a failure becomes
     // "no signal" (absent array), which the agent treats exactly like an older panel.
@@ -1025,7 +976,7 @@ export class Orchestrator {
       targetHealth = undefined;
     }
 
-    // V5.1b WP5-B2: a datagram exit attests who may feed it, and the hop is UDP —
+    // V5.1b : a datagram exit attests who may feed it, and the hop is UDP —
     // there is no handshake to imply the peer. Refusing HERE (rather than shipping a
     // config the exit will refuse) keeps the failure at the layer that owns the
     // requirement, and the error code names the missing fact.
@@ -1047,7 +998,7 @@ export class Orchestrator {
       id: egressId,
       mode: "EGRESS",
       egress_port: input.egressPort,
-      // EGRESS 模式不使用这两个字段，但 WP4 validate 要求结构完整
+      // EGRESS 模式不使用这两个字段，但  validate 要求结构完整
       //（ingress_port 仅在 DIRECT/RELAY 时强校验，这里给 0 表示不适用）。
       ingress_port: 0,
       remote_host: "",
@@ -1066,7 +1017,7 @@ export class Orchestrator {
       revision: input.revision,
     };
 
-    // 经 WP6 工厂构造：坏 payload 在这里就抛，不会走到 Agent 才炸。
+    // 经  工厂构造：坏 payload 在这里就抛，不会走到 Agent 才炸。
     const envelope = createCommand({
       resource: "tunnel",
       resource_id: resourceId,
@@ -1166,7 +1117,7 @@ export class Orchestrator {
           tunnel_type: wireTunnelTypeForForwardProtocol(protocol),
           ...tlsFields,
           listen_port: input.ingressPort,
-          // 入口侧的唯一「目标」是出口节点；WP6 的 targets 只是为了让信封
+          // 入口侧的唯一「目标」是出口节点； 的 targets 只是为了让信封
           // 结构合法（apply_tunnel 要求非空），Agent 的 RELAY forwarder 不读它。
           targets: [{ address: hop.host, port: hop.port }],
           listen_ip: undefined,
@@ -1266,7 +1217,7 @@ export class Orchestrator {
    * `applied_revision`，用同一 revision 重发会被判 stale 而撤不掉——
    * 补偿就会静默失效，出口端口继续被占。加 1 保证 remove 能过去。
    *
-   * 幂等：Agent 侧未知 id 返回 ok（WP4 `manager.Remove` 对未知 id 是 no-op），
+   * 幂等：Agent 侧未知 id 返回 ok（ `manager.Remove` 对未知 id 是 no-op），
    * 因此补偿重复执行是安全的。
    */
   async removeTunnel(input: RemoveTunnelInput): Promise<RelayDispatchOutcome> {
@@ -1310,7 +1261,7 @@ export class Orchestrator {
   /* ---------------------------------------------------------------- */
 
   /**
-   * 走 transport 发一次配置，再把 Agent 的 HTTP 响应翻成 WP6 `command_ack`
+   * 走 transport 发一次配置，再把 Agent 的 HTTP 响应翻成  `command_ack`
    * 信封，最后过一遍 {@link ControlValidator}。
    *
    * 为什么 ACK 也要过 validator：`command_ack` 是 §7.9 冻结的六种命令之一，
@@ -1412,7 +1363,7 @@ export class Orchestrator {
           // Agent 回显 applied_revision；没有就给下发值（老版本 agent）。
           applied_revision: ack.applied_revision ?? envelope.revision,
           status: "applied",
-          // V5.1b WP5-B2: carry the datagram hop endpoint the agent just reported. This
+          // V5.1b : carry the datagram hop endpoint the agent just reported. This
           // is the ONE place the agent's own ACK fields are folded into the synthesized
           // `command_ack` envelope, so a field not listed here is silently dropped —
           // and the panel would then never learn which address to attest.
@@ -1480,7 +1431,7 @@ export class Orchestrator {
     }
   }
 
-  /** 只读出口：当前校验器的 revision 闸门状态（WP9 reconciler 会用）。 */
+  /** 只读出口：当前校验器的 revision 闸门状态（ reconciler 会用）。 */
   snapshot(resource_id: string) {
     return this.validator.snapshot("tunnel", resource_id);
   }
@@ -1534,7 +1485,7 @@ export function normalizeLbStrategy(value: string | null | undefined): AgentTunn
       return "RANDOM";
     case "weighted_round":
     case "weighted_round_robin":
-      // WP4 的 LoadBalancer 接受该串并退化为等权轮询（见 lb.go 注释）；
+      //  的 LoadBalancer 接受该串并退化为等权轮询（见 lb.go 注释）；
       // v1.1 真正的平滑加权落地前，显式传它就是显式记录意图。
       return "WEIGHTED_ROUND_ROBIN";
     default:

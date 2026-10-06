@@ -1,32 +1,10 @@
 /**
- * WP6 — 命令校验与 revision 闸门（transport-agnostic，零框架/零 DB 依赖）
+ * Transport-agnostic command validation, idempotency and revision gating.
  *
- * 依据 `DEVELOPMENT.md` §7.9。本文件实现四条硬规则，并把「结构合法性」与
- * 「revision 冲突判定」彻底分开：前者是纯函数，后者读状态。分开之后，双方都能
- * 被单独钉死，不会因为状态不干净而掩盖一个拼写错误。
- *
- * ── 四条硬规则（验收口径，逐条对应到本文件）──
- *  1. **stale revision reject**：`applied_revision > revision` → `stale_revision`。
- *     迟到的旧命令不得回滚已生效状态（WP8 里尤其致命：晚到的 remove 会把 active 抹掉）。
- *  2. **equal revision idempotent ACK**：`applied_revision === revision` → 不重复执行，
- *     直接回放上次结果（`status: "duplicate"`，`applied_revision` 原样带回）。
- *  3. **newer revision atomic apply**：`applied_revision < revision` → 执行，并在执行
- *     成功后整体推进 `applied_revision`。同一资源的执行被 per-resource 互斥串行化，
- *     因此「执行」与「推进版本」之间没有其他命令能插入。
- *  4. **expired command reject**：`expires_at < now` → `command_expired`。
- *     边界取「大于等于都算有效」（`expires_at === now` 时仍接受），宁可放行一个
- *     刚好踩线的命令，也不要让时钟漂移把正常命令全拒掉。
- *
- * ── 为什么 command_id 与 (resource, revision) 都是幂等键 ──
- *  command_id 管「同一条命令重发」（网络重试、双击），(resource, revision) 管
- * 「同一意图用不同 ID 重发」。只有前者会被拒成 `duplicate_command_id`——
- * 那是真正的客户端 bug。
- *
- * ── 不做什么 ──
- *  · 不落库、不发网络请求：状态在内存（`ControlValidator` 的 Map）。持久化是
- *    WP8/WP9 的事，它们据本模块的 `CommandOutcome` 写自己的表。
- *  · 不实现 orchestrator：`applier` 回调由调用方提供（apply Egress / apply Ingress
- *    之类的编排顺序在 WP8，不在协议层）。
+ * The validator owns envelope/payload shape checks and in-process duplicate/
+ * stale-revision handling. It does not decide orchestration order, database
+ * ownership or cross-process locking; those remain in their persistence/runtime
+ * layers.
  */
 
 import {
@@ -69,7 +47,7 @@ export const MAX_COMMAND_ID_LEN = 64;
 export const MAX_RESOURCE_ID_LEN = 128;
 /** 单地址长度上界（含 IPv6 最坏情况 + 域名 FQDN）。 */
 export const MAX_ADDRESS_LEN = 253;
-/** V5-WP5-A1: 证书/私钥路径长度上界（与 Prisma `VarChar(512)` 对齐）。 */
+/** : 证书/私钥路径长度上界（与 Prisma `VarChar(512)` 对齐）。 */
 const MAX_PATH_LEN = 512;
 
 /** 名称长度上界（与 Prisma `VarChar(255)` 对齐）。 */
@@ -172,18 +150,18 @@ export const ACTION_PAYLOAD_KEYS = {
     "error_code",
     "error",
     "state",
-    // V5.1b WP5-B2：datagram RELAY 的入口在 ACK 里回报自己的跳端点，面板用它告诉出口
+    // V5.1b：datagram RELAY 的入口在 ACK 里回报自己的跳端点，面板用它告诉出口
     // 该对谁取证。**加这一条是必需的**——这个集合是封闭的，未知键会让整条 ACK 被判非法。
     // 兼容性：只有新面板能下发 udp RELAY，所以「新 Agent + 老面板」这一组合不可能真的
     // 发出这个键（老面板在校验层就拒绝该形状）。
     "hop_local_addr",
   ]),
-  // V4-WP11C: read-only probe. `targets` is derived from the tunnel's own
+  // : read-only probe. `targets` is derived from the tunnel's own
   // authorized desired state by the panel; the validator only bounds its shape.
   diagnose_tunnel: new Set(["targets", "timeout_ms"]),
   // No payload: the only accepted shape is an empty object.
   collect_diagnostics: new Set<string>(),
-  // V5-WP19-D: `targets` carries **pinned public literals** (the panel resolved
+  // : `targets` carries **pinned public literals** (the panel resolved
   // the names; the agent must not resolve anything). Shape only — the
   // public-address policy lives in services/looking-glass.ts on both sides, and
   // keeping it out of here keeps this module free of business imports.
@@ -199,7 +177,7 @@ const TUNNEL_KEYS = new Set([
   "load_balance",
   "ip_type",
   "targets",
-  // V5-WP5-A1: TLS front. Additive + optional per §3.5 — an Agent that predates
+  // : TLS front. Additive + optional per §3.5 — an Agent that predates
   // them ignores them, and one that knows them still refuses a tls tunnel whose
   // paths are absent (forwarder.TunnelConfig.Validate). The control plane
   // carries paths, never key material (DEVELOPMENT.md §6.1).
@@ -266,7 +244,7 @@ function validateApplyTunnel(payload: Record<string, unknown>): string | null {
   if (tunnel.protocol !== undefined && typeof tunnel.protocol !== "string") {
     return "payload.tunnel.protocol 必须是字符串";
   }
-  // V5-WP5-A1: TLS paths. Shape only — the panel cannot see the node's
+  // : TLS paths. Shape only — the panel cannot see the node's
   // filesystem, so existence is the Agent's check (fail closed before binding).
   // What the control plane CAN guarantee is that these are node-local absolute
   // paths and not a smuggled blob: an unbounded string here would turn the
@@ -310,12 +288,12 @@ function validateReasonField(payload: Record<string, unknown>): string | null {
   return null;
 }
 
-/** V4-WP11C caps, shared with the agent's own limits. */
+/**  caps, shared with the agent's own limits. */
 export const DIAGNOSE_MAX_TARGETS = 8;
 export const DIAGNOSE_MAX_TIMEOUT_MS = 5000;
 
 /**
- * V5-WP19-D 线形上限（**结构**边界，不是安全策略）。
+ *  线形上限（**结构**边界，不是安全策略）。
  *
  * 方向：这里的上限必须 **≥** `services/looking-glass.ts` 的同名常量，否则一条
  * 策略上合法的请求会先在本地校验被拒（"策略说可以、线形说不行"是一种很难查的
@@ -417,7 +395,7 @@ export function validatePayload(action: CommandAction, payload: unknown): string
       return null;
     }
     case "looking_glass": {
-      // V5-WP19-D：形状校验。语义白名单（公网段/规范写法/方法闭集）不在这里，
+      //：形状校验。语义白名单（公网段/规范写法/方法闭集）不在这里，
       // 由 services/looking-glass.ts 在下发前判、Agent 侧再判一次。
       const extra = unknownKeys(payload, [...ACTION_PAYLOAD_KEYS.looking_glass]);
       if (extra.length > 0) return `payload 含未定义字段: ${extra.join(", ")}`;
@@ -607,7 +585,7 @@ export interface ControlValidatorOptions {
  * 有状态校验器：持有 per-resource revision 状态 + command_id 幂等账本。
  *
  * 线程/进程安全边界：**同一实例内的并发安全由 per-resource 串行队列保证**（见
- * `withResourceLock`）；跨进程/跨副本不保证——那属于 WP8/WP9 的持久化仲裁层。
+ * `withResourceLock`）；跨进程/跨副本不保证——那属于 / 的持久化仲裁层。
  */
 export class ControlValidator {
   private readonly maxTtlMs: number;
@@ -822,7 +800,7 @@ export class ControlValidator {
         };
       }
       case "diagnose_tunnel":
-        // V4-WP11C: a diagnose is READ-ONLY. It must not enter the mutation path,
+        // : a diagnose is READ-ONLY. It must not enter the mutation path,
         // which would apply the revision gate and advance the resource status —
         // a diagnostic that mutates is not a diagnostic.
         return this.recordReadOnlyProbe(cmd, nowMs);
@@ -951,7 +929,7 @@ export class ControlValidator {
       cmd.payload.applied_revision ?? entry.outcome.applied_revision,
       cmd.payload.state ?? null,
     );
-    // V5.1b WP5-B2: carry the datagram hop endpoint onto the memoized ACK. It has to be
+    // V5.1b : carry the datagram hop endpoint onto the memoized ACK. It has to be
     // set BEFORE `rememberAck`, because the replays below return the remembered object —
     // a field that only existed on the first pass would vanish exactly when a command is
     // retried, and the panel would then never correct the exit's attestation.

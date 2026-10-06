@@ -1,20 +1,12 @@
 /**
- * WP6 Command / Revision / ACK 协议 —— 统一出口。
+ * Command / Revision / ACK protocol public surface.
  *
- * 契约定义见 `types.ts`，校验/闸门见 `validator.ts`。本文件只做 re-export，
- * 让调用方（WP7/WP8/WP9、agent 侧 Go 实现的镜像校对）只有一个 import 路径。
+ * Shape lives in `types.ts`; validation, idempotency and revision gating live
+ * in `validator.ts`. This module only provides one import surface for Panel,
+ * Agent mirrors and tests.
  *
- * 用法速览：
- *
- *   1. 用 createCommand 构造下发信封（会立刻校验 payload，坏 payload 当场抛错）。
- *   2. 用 ControlValidator.handle(cmd, applier) 跑校验 + revision 闸门 + 执行。
- *   3. 读返回的 ACK：applied / duplicate / rejected / failed。
- *
- *   同 revision 再下发得到 duplicate，更低 revision 得到 stale_revision，
- *   超过 expires_at 才到得到 command_expired。
- *
- * 本模块不含 Panel 到 Agent 的连接管理、不含鉴权、不含持久化：transport 由
- * 调用方决定（HTTP / WebSocket / Socket.IO 皆可），权威状态在 WP1 的 schema 里。
+ * Transport, authentication and persistence are deliberately outside this
+ * package. Production delivery uses the outbound Agent command bus.
  */
 
 export type {
@@ -33,7 +25,7 @@ export type {
   CommandResource,
   CreateCommandInput,
   ErrorCode,
-  // V5-WP19-D: Looking Glass 的形状出口（调用方只需要形状；语义白名单在
+  // : Looking Glass 的形状出口（调用方只需要形状；语义白名单在
   // services/looking-glass.ts）。
   LookingGlassEnvelope,
   LookingGlassPayload,
