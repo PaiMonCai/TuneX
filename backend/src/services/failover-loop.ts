@@ -246,6 +246,7 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
       }),
     loadLease: async (tunnelId) => (await import("./placement-lease.ts")).loadLease(tunnelId),
     claimLease: async (input) => (await import("./placement-lease.ts")).claimLease(input),
+    releaseLease: async (input) => (await import("./placement-lease.ts")).releaseLease(input),
     applyPlacementMove: defaultApplyPlacementMove,
     now,
     log: (event) =>
