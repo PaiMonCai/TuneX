@@ -44,6 +44,10 @@ import { db } from "../db.ts";
 import { hashPassword } from "../auth.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import { listBindablePolicies, resolvePlanPolicyBinding } from "../services/plan-subscription.ts";
+import {
+  deleteNode as deleteManagedNode,
+  LIFECYCLE_ERROR_STATUS,
+} from "../services/node-lifecycle.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const adminExtendedRoutes = new Hono<{ Variables: AppVariables }>();
@@ -672,10 +676,23 @@ adminExtendedRoutes.delete("/nodes/:id", async (c) => {
   const id = readId(c);
   if (id === null) return bad(c, "非法的节点 ID");
 
-  const node = await db.node.findUnique({ where: { id } });
-  if (!node) return bad(c, "节点不存在", 404);
-
-  await db.node.delete({ where: { id } });
+  // Compatibility endpoint delegates to the lifecycle deletion state machine.
+  // Direct Prisma delete bypasses retiring + impact gates and can erase a node
+  // while a middle-hop/Federation runtime still owns it.
+  const result = await deleteManagedNode(id);
+  if (!result.ok) {
+    const status = LIFECYCLE_ERROR_STATUS[result.code] ?? 409;
+    return c.json(
+      {
+        error: result.message,
+        message: result.message,
+        code: result.code,
+        ...(result.condition ? { condition: result.condition } : {}),
+        ...(result.dependencies ? { dependencies: result.dependencies } : {}),
+      },
+      status,
+    );
+  }
   return one(c, { ok: true });
 });
 
