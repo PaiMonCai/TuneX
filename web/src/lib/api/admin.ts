@@ -387,7 +387,4 @@ export const adminApi = {
       placements: (cookie?: string) => get<FederationPlacement[]>("/admin/federation/placements", undefined, cookie),
       usage: (cookie?: string) => get<FederationUsageRecord[]>("/admin/federation/usage", undefined, cookie),
     },
-  },
 };
-
-export default api;

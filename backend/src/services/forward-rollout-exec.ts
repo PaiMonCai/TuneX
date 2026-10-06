@@ -1690,6 +1690,7 @@ function concurrentTakeoverResult(
 
 /* Executor ownership and runtime confirmation are isolated from the main loop. */
 import {
+  SAME_NODE_LISTENER_RETIRE_WAIT_MS,
   claimRolloutExecutor,
   renewRolloutExecutor,
   releaseRolloutExecutor,
