@@ -66,6 +66,8 @@ import {
   legacyTunnelTypeColumn,
 } from "./forward-contract.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
+import { billingDayKeyStamp } from "./billing-time.ts";
+import { dayKeyOf, fillDays } from "./traffic.ts";
 import {
   forwardBatchSummary,
   type ForwardBatchAction,
@@ -573,8 +575,11 @@ export async function getForwardSummary(
       db.tunnel.count({
         where: { ...base, apply_status: { in: ["pending", "applying"] } },
       }),
-      db.tunnel.aggregate({
-        where: base,
+      // Traffic is an archived accounting fact. The live Tunnel traffic columns
+      // are legacy projections with no current writer and must not drive product
+      // summaries. workspace_id on the ledger survives Forward deletion.
+      db.tunnelTraffic.aggregate({
+        where: { workspace_id: workspaceId },
         _sum: { traffic: true, traffic_cost: true },
       }),
     ]);
@@ -620,37 +625,37 @@ export async function getForwardTraffic(
   if (!current) return error(404, "not_found", "端口转发不存在");
 
   const windowDays = Math.max(1, Math.min(90, Math.floor(days) || 14));
-  const since = new Date();
-  since.setHours(0, 0, 0, 0);
-  since.setDate(since.getDate() - (windowDays - 1));
+  const now = new Date();
+  const since = new Date(
+    billingDayKeyStamp(now).getTime() - (windowDays - 1) * 86_400_000,
+  );
 
   const rows = await db.tunnelTraffic.findMany({
-    where: { tunnel_id: current.id, date: { gte: since } },
+    where: {
+      tunnel_id: current.id,
+      workspace_id: workspaceId,
+      date: { gte: since },
+    },
     orderBy: { date: "asc" },
   });
 
   const byDate = new Map<string, { traffic: number; traffic_cost: number }>();
   for (const row of rows) {
-    const key = row.date.toISOString().slice(0, 10);
+    const key = dayKeyOf(row.date);
     const acc = byDate.get(key) ?? { traffic: 0, traffic_cost: 0 };
     acc.traffic += row.traffic;
     acc.traffic_cost += row.traffic_cost;
     byDate.set(key, acc);
   }
 
-  const points: { date: string; traffic: number; traffic_cost: number }[] = [];
-  for (let i = windowDays - 1; i >= 0; i--) {
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - i);
-    const key = date.toISOString().slice(0, 10);
+  const points = fillDays(windowDays, now).map((key) => {
     const hit = byDate.get(key);
-    points.push({
+    return {
       date: key,
       traffic: hit ? Number(hit.traffic.toFixed(2)) : 0,
       traffic_cost: hit ? Number(hit.traffic_cost.toFixed(4)) : 0,
-    });
-  }
+    };
+  });
 
   return { ok: true, data: points };
 }
