@@ -687,6 +687,40 @@ before_fix: {"sent":false,"reason":"smtp_error"} [mail] 发送失败：SMTP EHLO
 
 **未覆盖（留给最终验收）**：Looking Glass 的**真实发起**（本轮只看渲染，未点 run——真实发包有副作用）；通知偏好的**点击往返**（已由 `notify-center` 在隔离副本上验过）；升级的**真实执行**（刻意不做）。
 
+## 3.30 Round 34–35：冻结门禁 + 最终浏览器验收（含真实 GA 卡与 admin 渠道页）
+
+### 冻结树全量门禁（指纹在运行前后一致 ⇒ 有效）
+| 检查 | 结果 |
+|---|---|
+| backend `tsc` | 0 错 |
+| backend `bun test src` | **2908 pass / 0 fail**（134 文件） |
+| web `tsc` | 0 错 |
+| web `bun test src` | **1292 pass / 0 fail**（66 文件） |
+| web `npm run build` | 成功 |
+
+### 最终浏览器验收（重启到新构建 + 真实后端 + 假 DNS provider）
+- **DNS 前门**：`bind → pending → synced`，**浏览器里真实显示已切换态**；清理后 `providersLeft=0`、`forward2DnsState=unbound`。
+- **Forward 详情**：RELAY/DIRECT 两页共 **43 / 41 个相关 testid**（链路、DNS、延迟、高可用四块同屏）；DIRECT 的延迟是 `no-observer + reason`（按构造无维度 ≠ 无数据）。
+- **节点页**：升级卡片（8 个 testid）+ Looking Glass 面板（17 个 testid：`admin-override`/`caps`/`method`/`scope`/`write-warning`/`max-targets`/`timeout`/`idle`/`caveats`）。
+- **/settings**：通知偏好矩阵（3 渠道）。
+- **/admin/notification-channels**：task-20 交付后已有命中（独立目录，URL 正确）。
+- **全局**：`apiErrors` **为空**；禁用词（正常/健康/可达）在这些"未知/降级"语境里**零命中**。
+
+### Looking Glass 的真实发起：拒绝路径已在浏览器验证；带目标的发起在 API 层验证
+- 浏览器点击 `looking-glass-run` 且表单未填目标 ⇒ 面板如实显示 **「本次发起被拒绝 / 这次没有发出任何测试（拒绝发生在发包之前）/ 没有可用的目标：本面板没有发出任何请求」**（不谎称"没有发出"以外的任何事、也不编结果）。
+- **带目标**的发起已由 `web-ddns` 在 API 层验证（200 真报告 + 409 `looking_glass_busy` 单飞 + 审计计数 issued/completed/refused）。
+- 浏览器层"填目标后点 run"未点通（脚本选择器未命中表单输入）⇒ **如实记为未覆盖**，不作为通过。
+
+## 3.31 新增切片（Round 35 派发）
+| 任务 | 内容 |
+|---|---|
+| `task-30` | 替身泄漏的**剩余现场**：`forward-route-topology` / `forward-batch-route` / `me-capabilities`（后者"碰巧安全"）的 `workspace.ts` 替身改 spread + 守卫覆盖 |
+| `task-29` | **F1 收口**：探针改为 **agent 自实现 HTTP**（Go stdlib，`CheckRedirect: http.ErrUseLastResponse` **永不跟随重定向**）——从根上消除"凭据随 3xx 外发"这一类，并顺带消掉 curl/jq 两次镜像增长（+5.19MB / +0.92MB）与"两条分支结论可能不一致"；要求保留旧镜像兜底并**如实标注是兜底**、A/B 两台独立 server、响应体矩阵、体积前后真实数字、反向变异、独立镜像标签 |
+| `task-13` | N4 投递失败可见性（用户域只读投影）：Lead 追加两条硬要求——**target 对非本人行必须脱敏到不可还原**（否则把同事联系方式泄漏给全空间）；`error` 需二次脱敏且断言密文/明文/完整 target 逐字不出现 |
+
+### 机制发现（值得记住）
+`mock.module` 只对**之后首次 import 该模块的文件**生效 ⇒ **本文件永远看不到自己的替身**（同 specifier 与绝对路径两种形态实测都返回真实现）⇒ 受害方永远是**另一个文件**，这正是"替身泄漏"只在特定跑法下红的原因（`backend-truth` 实测并写进注释）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
