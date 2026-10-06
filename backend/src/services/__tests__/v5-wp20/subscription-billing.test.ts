@@ -625,7 +625,8 @@ describe("F. 静态守卫：计费侧不做额度判定 / 不新增发放写入�
     expect(WORKER_SOURCE).toContain('case "cron_settle_billing"');
     const caseBody = WORKER_SOURCE.slice(WORKER_SOURCE.indexOf('case "cron_settle_billing"'));
     expect(caseBody.slice(0, caseBody.indexOf("default:"))).toContain("settleDuePeriods(defaultSettlementDeps())");
-    expect(WORKER_SOURCE).toContain('return { note: "cron handler not yet implemented", ms: Date.now() - started };');
+    expect(WORKER_SOURCE).toContain("default:");
+    expect(WORKER_SOURCE).toContain("unknown cron job:");
   });
 
   test("引擎不读系统时钟之外的时间：时间点只能来自参数（§7.2.2 禁止 patch Date.now）", () => {
