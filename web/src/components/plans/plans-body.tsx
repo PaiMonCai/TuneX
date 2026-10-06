@@ -19,11 +19,15 @@ export function PlansBody() {
   const router = useRouter();
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   useEffect(() => {
     api.plans.list({ status: "active", page_size: 50 })
       .then((r) => setPlans(r.data))
-      .catch((e) => toast.error(e instanceof Error ? e.message : "加载失败"))
+      .catch((e) => {
+        setLoadFailed(true);
+        toast.error(e instanceof Error ? e.message : t("plan.loadFailed"));
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -40,6 +44,8 @@ export function PlansBody() {
   const cycleLabel = (c: string) => BILLING_CYCLES.find((x) => x.value === c)?.[locale === "zh" ? "zh" : "en"] ?? c;
 
   if (loading) return <div className="h-96 animate-pulse rounded-lg bg-[var(--muted)]" />;
+  if (loadFailed) return <p className="text-sm text-[var(--destructive)]">{t("plan.loadFailed")}</p>;
+  if (plans.length === 0) return <p className="text-sm text-[var(--muted-foreground)]">{t("plan.empty")}</p>;
 
   return (
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -65,7 +71,7 @@ export function PlansBody() {
               <ul className="flex flex-col gap-1.5 text-sm">
                 <Feature ok label={`${t("plan.maxTunnels")}: ${plan.max_tunnels ?? t("plan.unlimited")}`} />
                 <Feature ok label={`${t("plan.traffic")}: ${plan.traffic ? `${plan.traffic} GB` : t("plan.unlimited")}`} />
-                <Feature ok label={`${t("plan.bandwidth")}: ${bandwidth(plan.bandwidth_limit)}`} />
+                <Feature ok label={`${t("plan.bandwidth")}: ${bandwidth(plan.bandwidth_limit, t("plan.unlimited"))}`} />
                 <Feature ok label={`${t("plan.clientLimit")}: ${plan.client_limit ?? t("plan.unlimited")}`} />
                 <Feature ok label={`${t("plan.ipLimit")}: ${plan.ip_limit ?? t("plan.unlimited")}`} />
                 <Feature ok={plan.allow_custom_in_node_group} label={t("plan.allowCustomInNodeGroup") ?? "自定义入口节点组"} />
@@ -84,8 +90,8 @@ export function PlansBody() {
   );
 }
 
-function bandwidth(v: number | null) {
-  if (!v) return "不限";
+function bandwidth(v: number | null, unlimited: string) {
+  if (!v) return unlimited;
   return v >= 1000 ? `${v / 1000} Gbps` : `${v} Mbps`;
 }
 
