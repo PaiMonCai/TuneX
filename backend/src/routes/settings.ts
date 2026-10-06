@@ -148,8 +148,7 @@ settingsRoutes.post("/password", async (c) => {
 
 async function regenerateApiKey(c: Context<{ Variables: AppVariables }>) {
   const user = requireUser(c);
-  const license = await licenseService.getLicense();
-  if (license?.type !== "business") {
+  if (!(await licenseService.hasBusinessLicense())) {
     return c.json({ error: "API Key 仅 Business License 可用", code: "business_license_required" }, 403);
   }
   // SEC-02：轮换 = 新 UUID 覆盖 api_key_hash、清空 legacy 明文列。旧凭据立即失效
