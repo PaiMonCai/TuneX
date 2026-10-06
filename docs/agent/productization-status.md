@@ -1151,6 +1151,43 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 **#10 三级门槛（评审定义，我采纳）**：**未达成** = ①未支撑 或 ①支撑但②未闭合（**当前**）→ **基本达成** = ①支撑 **+ ②闭合**（一条日常宽度差距**真机可验证闭合**）→ **达成** = 上述 + 覆盖面再收一条（LG 3→≥5 / DDNS 2→≥4）。
 ⇒ **下一目标明确：闭合要件②**。我计划用**已验证的 enroll→online 流程** + `task-37` 的 **stamp 镜像**，让 `version_drift: behind` 在**真机首次出现**（"默认部署永不提示版本落后"这条日常宽度差距当场闭合）。
 
+## 3.54 Round 54（Lead 一手）：**要件 ② 闭合** —— `version_drift: behind` 真机首次出现（含反向验证）
+
+### 实验（最小改动，无需重建镜像）
+现有 4 台 agent 跑的是**旧镜像**（源码常量 `0.13.22`），因此只需**给面板配基线**即可制造"落后"：
+1. 在 scratch compose 的 `panel`/`worker` env 加 `TUNEX_AGENT_LATEST_VERSION: "0.14.0"` → `docker compose up -d --no-deps panel worker`（**不重建镜像**），面板 healthy；
+2. 真机 HTTP `GET /api/nodes/1/upgrade-state`：
+```
+reported: { version: "0.13.22", role:"INGRESS", reported_at:"2026-10-06T21:41:49.717Z", age_seconds:57 }
+target:   { image:"ghcr.io/paimoncai/tunex-agent:latest", image_source:"builtin_default",
+            expected_version:"0.14.0", version_drift:"behind" }        ← ★★ 真机首次出现
+precondition: { ok:false, code:"node_not_in_maintenance",
+                message:"升级前请先把节点置为 maintenance（避免在调度窗口内替换 Agent）；确认可以带业务升级时传 allow_active=true" }
+```
+3. **反向验证（因果证明）**：把基线从 compose 移除并重启面板 ⇒ **同一节点、同一上报版本**：
+```
+target: { expected_version: null, version_drift: "unknown" }            ← 回到「无法判定」，**不是**「已最新」
+```
+⇒ 因果链成立：**是基线把判定翻成 `behind`**，移除后如实回到 `unknown`（**没有把"未声明"说成"已最新"**，符合措辞纪律）。
+
+### 这条为什么正好闭合评审的要件 ②
+回顾 R5-A/R6 的表述：**"默认部署永不提示版本落后"**（`TUNEX_AGENT_LATEST_VERSION` 缺省 `""` → `version_drift` 永为 `unknown`；`install.sh --version <sha>` 又会写进不可比较的 git sha）。本周期完成的三段修复链：
+1. **task-26**：语义判定为「Agent 版本号」，`install.sh` 新增 `--agent-version`（**fail-closed**：sha/`latest`/`unknown` ⇒ exit 2），`--version` 的 sha 不再入该槽位，服务侧复用同一个比较函数；
+2. **task-37**：Agent 镜像 **stamp 版本**（`ARG AGENT_VERSION`，默认 `unknown`、空值构建失败，前导 `v` 去掉）；
+3. **本轮**：真机 `behind` 出现 + 反向验证。
+⇒ 「一条日常宽度差距在真机可验证地闭合」**成立**。按评审定义的三级门槛：**① 支撑 + ② 闭合 ⇒ #10 应为「基本达成」**（已提请评审复核改判）。
+
+### 环境还原
+compose 里的基线已移除、panel/worker 已重启（`TUNEX_AGENT_LATEST_VERSION` 未设置）；未新增节点/容器；`tunex-it-*` 8 个完好。
+
+## 3.55 `task-42` 交付：Looking Glass 方法集 **3 → 5**（复用 ForwardX 的 traceroute 能力，无特权实现）
+- **agent 侧**（真机、生产 caps、**走 agent 自己的代码路径**）：`capabilities` 出现 `looking_glass:traceroute|traceroute6`；`traceroute 1.1.1.1` **真出跳**（`172.17.0.1 → 172.17.0.1 → 103.185.248.1 (7ms)`）；`traceroute6` 如实 `error: send failed`（本节点无 v6 出网路径）；`ping` reachable；**私网目标发包前拒绝**；`mtr` 拒绝（不在闭集）。镜像 `15,003,286 → 15,634,726`（**+4.2%，就是 iputils**）。
+- **★ 靠测量发现并修掉的真缺陷**：首次真机 traceroute **一跳都没有** —— 不是 tracepath 不行，而是 **tracepath 在管道里块缓冲，被 context kill 时未 flush 的输出整段丢失**。修法：**跳数上限 ≈ 时间预算 ×70% + flush 余量**（5000ms ⇒ 3 跳），随后立刻拿到真实跳（教训写进注释，否则后人会误判 tracepath 不稳）。
+- **面板**：闭集 **3→5**；`unavailable_methods` **只剩 `mtr`/`mtr6`**（无二进制 + 默认需 raw socket）；`caveats` 改写为 **8 条真实边界**（并去掉 Markdown 标记）；**`method_unavailable_on_node` 已实现**（节点没上报该方法 ⇒ **409 且零指令下发**，含反向验证）。
+- **Web**：`caps.methods` / `unavailable_methods` **已消费并渲染**（en 用本地化通用原因以免混中文）；本地 caveats 文案 4→8 跟上服务端。
+- **门禁**：Go 13 包 0 FAIL；backend `tsc` 0 + **2969 pass / 0 fail**；web `tsc` 0 + **1354 pass / 0 fail**。
+- **未完成（明列）**：① 面板 HTTP 侧真机 `/api/looking-glass/status` 响应与**审计行**未取证（只验了 agent 侧）；② **Web 不渲染 `hops`**（后端已下发逐跳，UI 只显示 status/detail）；③ `MaxTimeoutMS` 仍 5000 ⇒ 路径跟踪最多 3 跳（放宽属 caps 语义变更，未擅自动）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
