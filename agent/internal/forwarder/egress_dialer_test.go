@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// V5.3-WP8: the egress data plane must dial through the injected dialer, because
+// The egress data plane must dial through the injected dialer, because
 // a wired-but-unused injection is the exact failure this project has already paid
 // for twice (the health facts, the tls cert paths). The behaviour of the injected
 // dialer itself — TTL cache, stale fallback, "a DNS change never kills an
@@ -93,7 +93,7 @@ func TestEgressForwarderDefaultsToGoDialerWhenUninjected(t *testing.T) {
 	var upPort int
 	fmt.Sscanf(upPortS, "%d", &upPort)
 
-	// The pre-V5.3 path: no injection at all. It must keep working exactly as it
+	// The default path has no injected resolver. It must keep working exactly as it
 	// did, which is what makes the resolver an addition rather than a
 	// replacement.
 	sel := &countingSelector{seq: []Target{{Host: "127.0.0.1", Port: upPort}}}

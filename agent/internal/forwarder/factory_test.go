@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// V5-WP2 runtime factory tests.
+// Runtime factory tests.
 //
 // The factory exists to answer one question *before* anything binds: "which
 // runtime class carries this config, and does this binary implement it?" These
@@ -39,8 +39,7 @@ func TestResolveRuntimeTargetForTCP(t *testing.T) {
 	}
 }
 
-// An omitted protocol is the V4 client shape. Resolving it must not fail — that
-// is the whole compatibility contract of V5-WP0/WP1/WP2.
+// An omitted protocol is the compatibility payload shape. Resolving it must not fail.
 func TestResolveRuntimeTargetDefaultsToTCP(t *testing.T) {
 	cfg := factoryDirectConfig()
 	cfg.Protocol = ""
@@ -90,7 +89,7 @@ func TestBuildStreamRefusesUnknownProtocolWithoutBinding(t *testing.T) {
 	}
 }
 
-// V5-WP5-A1: tls is a stream protocol, resolved like any other.
+// TLS is a stream protocol, resolved like any other.
 func TestResolveRuntimeTargetForTLS(t *testing.T) {
 	cfg := factoryDirectConfig()
 	cfg.Protocol = ProtocolTLS
@@ -193,7 +192,7 @@ func (s staticSelector) Select() Target { return s.t }
 // set of protocols. Lists that can drift are exactly how an agent ends up
 // advertising something it cannot run.
 //
-// V5.1b made this a per-TRANSPORT question: udp is advertised, and it has a
+// This is a per-transport question: udp is advertised, and it has a
 // datagram builder, not a stream one. The invariant is therefore "every
 // advertised protocol has a builder in the registry its transport names, and no
 // registry holds a protocol the parser rejects" — which is stronger than the old
@@ -231,7 +230,7 @@ func TestEveryAdvertisedProtocolHasABuilder(t *testing.T) {
 }
 
 func TestParseForwardTransportFailsClosed(t *testing.T) {
-	// V5.1b opened the datagram transport, so it moved out of the fail-closed list
+	// The datagram transport is supported, so it is outside the fail-closed list
 	// together with its protocol — the two leaves this list only as a pair.
 	for _, want := range []ForwardTransport{TransportStream, TransportDatagram} {
 		if got, err := ParseForwardTransport(string(want)); err != nil || got != want {

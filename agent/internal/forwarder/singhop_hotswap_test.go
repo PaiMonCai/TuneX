@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// WP2 — hot reload primitives on the data plane (DEVELOPMENT.md §13.3.4).
+// Hot-reload primitives on the data plane.
 //
 // These tests use real loopback sockets, because the property under test is
 // "the listener never moved, the connections never dropped" — no mock forwarder
@@ -67,7 +67,7 @@ func readLabel(t *testing.T, addr string) string {
 func singleHopCfg(t *testing.T, port int, upstream string) TunnelConfig {
 	t.Helper()
 	cfg := TunnelConfig{
-		ID:          "wp2-hotswap",
+		ID:          "hotswap",
 		Mode:        ModeDirect,
 		IngressPort: port,
 		RemoteHost:  hostOf(upstream),
@@ -601,7 +601,7 @@ func waitForConn(t *testing.T, fwd *SingleHopForwarder) bool {
 func TestEgressSetUpstreamNotSwappable(t *testing.T) {
 	sel := &recordingSelector{target: Target{Host: "127.0.0.1", Port: 1}}
 	fwd, err := NewEgress(TunnelConfig{
-		ID: "wp2-egress", Mode: ModeEgress, EgressPort: freePort(t), Protocol: "tcp",
+		ID: "egress", Mode: ModeEgress, EgressPort: freePort(t), Protocol: "tcp",
 	}, sel)
 	if err != nil {
 		t.Fatalf("NewEgress: %v", err)
@@ -622,7 +622,7 @@ func TestEgressDrainStopsAcceptingButKeepsThePort(t *testing.T) {
 	sel := &recordingSelector{target: Target{Host: "127.0.0.1", Port: 1}}
 	port := freePort(t)
 	fwd, err := NewEgress(TunnelConfig{
-		ID: "wp2-egress-drain", Mode: ModeEgress, EgressPort: port, Protocol: "tcp",
+		ID: "egress-drain", Mode: ModeEgress, EgressPort: port, Protocol: "tcp",
 	}, sel)
 	if err != nil {
 		t.Fatalf("NewEgress: %v", err)

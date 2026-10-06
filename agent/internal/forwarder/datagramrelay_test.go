@@ -10,9 +10,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// V5.1b WP5-B2 — datagram RELAY ingress (the client-facing half of the hop).
+// Datagram RELAY ingress (the client-facing half of the hop).
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md §9.1 (frozen 2026-10-05).
+// These tests pin the datagram relay ingress contract.
 //
 // The peer here is a FAKE egress: a bare UDP socket that parses hop packets and
 // answers only when the test tells it to. That is deliberate — the properties that
@@ -326,7 +326,7 @@ func TestDatagramRelayRefusesMissingOrMalformedNextHop(t *testing.T) {
 	}
 }
 
-// The two halves of WP5-B2 must COMPOSE: a datagram from a client goes through a
+// The two relay halves must compose: a datagram from a client goes through a
 // real ingress runtime and a real exit runtime (both with real sockets, in this
 // process) to a real UDP target and back. Everything else in this file tests one
 // half against a fake peer; this is the test that would catch the two halves each
