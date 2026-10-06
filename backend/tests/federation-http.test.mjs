@@ -18,7 +18,6 @@ process.env.DATABASE_URL =
   process.env.DATABASE_URL ?? "mysql://root:verify-only@127.0.0.1:3306/tunex_verify";
 process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
 process.env.AUTH_SECRET = process.env.AUTH_SECRET ?? "federation-test-auth-secret";
-process.env.LICENSE_SECRET = process.env.LICENSE_SECRET ?? "federation-test-license-secret";
 process.env.PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED ?? "false";
 
 const enabled = process.env.TUNEX_DB_TEST === "1";
