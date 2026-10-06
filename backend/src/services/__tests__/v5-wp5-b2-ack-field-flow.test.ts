@@ -9,7 +9,6 @@ describe("command ACK hop endpoint contract", () => {
 
     const issued = await validator.handle(
       {
-        type: "command",
         command_id: commandId,
         resource: "tunnel",
         resource_id: "tunex-42-relay",
@@ -24,7 +23,6 @@ describe("command ACK hop endpoint contract", () => {
 
     const ack = await validator.handle(
       {
-        type: "command",
         command_id: "ack-hop-endpoint",
         resource: "tunnel",
         resource_id: "tunex-42-relay",
