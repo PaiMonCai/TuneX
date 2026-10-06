@@ -120,7 +120,7 @@ describe("A. 协议白名单：前端镜像后端契约，不多不少", () => {
 
   test("创建表单的协议下拉**由常量渲染**，不是手抄的选项列表", () => {
     // 选项来自 FORWARD_PROTOCOLS（后端加协议时前端只需更新常量，不会漏一个下拉项）
-    expect(CREATE_DIALOG).toContain("{FORWARD_PROTOCOLS.map((value) => (");
+    expect(CREATE_DIALOG).toMatch(/FORWARD_PROTOCOLS\.map\(\(value\)\s*=>/);
     expect(CREATE_DIALOG).toContain('data-testid="forward-protocol-select"');
     // 没有手抄的选项值（udp 也必须是常量渲染出来的，不能是硬编码的一项）
     expect(CREATE_DIALOG).not.toMatch(/<SelectItem value="(tcp|tls|ws|udp|quic|wss|mtls|mwss|mtcp|tunex)"/);
@@ -456,20 +456,21 @@ describe("C. payload：tls 带路径，tcp/ws 结构上带不了", () => {
   });
 
   test("创建表单接线：提交按钮按同一份预检禁用，且路径经纯函数进入 payload", () => {
-    expect(CREATE_DIALOG).toContain("tlsPathFieldErrors(draft.protocol, draft.tlsCertPath, draft.tlsKeyPath)");
+    // 这里只守住组件边界：预检结果控制提交；具体协议校验/字段构造由上面的纯函数测试覆盖。
+    expect(CREATE_DIALOG).toContain("forwardCreateProtocolErrors(draft)");
     expect(CREATE_DIALOG).toContain("!protocolReady");
-    expect(WEB("components/forwards/forward-create-model.ts")).toContain("...forwardProtocolFields(draft.protocol, draft.tlsCertPath, draft.tlsKeyPath),");
-    // 切走 tls 必须清空路径（否则残留路径会被后端 400）
-    expect(CREATE_DIALOG).toContain("forwardCreateProtocolDraft(draft, value)");
-    expect(WEB("components/forwards/forward-create-model.ts")).toContain('tlsKeyPath: ""');
+    expect(WORKSPACE).toContain("forwardProtocolFields(createDraft.protocol");
+    // 切走 tls 的清空语义由 changeForwardCreateProtocol 的行为测试负责，组件只需调用它。
+    expect(CREATE_DIALOG).toContain("changeForwardCreateProtocol(draft, value as ForwardProtocol)");
   });
 
   test("tls 的两个路径输入只在 protocol==='tls' 时出现，且标了必填", () => {
     expect(CREATE_DIALOG).toContain('{draft.protocol === "tls" ? (');
-    const block = WORKSPACE.slice(
-      WORKSPACE.indexOf('{protocol === "tls" ? ('),
-      WORKSPACE.indexOf('<Field label={t("forward.ingressNode")}'),
-    );
+    const start = CREATE_DIALOG.indexOf('{draft.protocol === "tls" ?');
+    const end = CREATE_DIALOG.indexOf('<Field label={t("forward.ingressNode")}>');
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const block = CREATE_DIALOG.slice(start, end);
     expect(block).toContain('data-testid="forward-tls-cert-path"');
     expect(block).toContain('data-testid="forward-tls-key-path"');
     expect(block).toContain("protocolErrors.tls_cert_path");
