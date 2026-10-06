@@ -40,6 +40,24 @@ jobs:
       - uses: actions/checkout@v7
       - name: Start PR topology
         run: bash scripts/integration/setup.sh
+      - name: Smoke federation signer contract
+        run: |
+          set -euo pipefail
+          docker cp scripts/integration/federation-sign.ts tunex-it-panel:/tmp/federation-sign.ts
+          material="$(docker exec -w /app tunex-it-panel bun /tmp/federation-sign.ts \
+            --url http://panel:3000 \
+            --method POST \
+            --path /api/federation/v1/leases \
+            --body '{}')"
+          MATERIAL="$material" python3 - <<'PY'
+          import json
+          import os
+
+          material = json.loads(os.environ["MATERIAL"])
+          assert material["method"] == "POST"
+          assert material["url"].endswith("/api/federation/v1/leases")
+          assert isinstance(material.get("headers"), dict) and material["headers"]
+          PY
       # One current protocol suite owns the PR end-to-end signal. Historical
       # Diagnostic-only checks stay outside the automatic release path.
       - name: Current protocol regression
