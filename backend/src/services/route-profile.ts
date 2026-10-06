@@ -1405,29 +1405,42 @@ export async function applyRouteProfile(
     const patched = await patchForward(forwardId, input.workspaceId, patch, input.audit?.actorId ?? undefined);
     if (!patched.ok) {
       // 补偿：恢复指针，避免「指针说来自模板、但放置事实没变」的半套状态。
-      await db.tunnel
-        .update({
+      // 恢复失败不能吞：此时 runtime edit 没成功，但 provenance 指针已被改掉，
+      // 再把它报告成普通 rollout_conflict 会制造一条可见事实与实际放置不一致的记录。
+      let pointerRestoreError: string | null = null;
+      try {
+        await db.tunnel.update({
           where: { id: forwardId },
           data: {
             route_profile_id: previousPointer.route_profile_id,
             route_profile_version: previousPointer.route_profile_version,
           },
-        })
-        .catch(() => undefined);
+        });
+      } catch (error) {
+        pointerRestoreError = error instanceof Error ? error.message : String(error);
+      }
       outcomes.push({
         forward_id: forwardId,
         name: forward.name,
         status: "failed",
-        error: {
-          code: patched.code === "revision_conflict" ? "rollout_conflict" : "route_invalid",
-          message: patched.message,
-          error_layer: asRouteProfileLayer(patched.error_layer),
-          retryable: patched.code === "revision_conflict",
-          next_action:
-            patched.code === "revision_conflict"
-              ? "等待该 Forward 正在进行的更新结束后重试"
-              : "检查该 Forward 的配置（模式/目标）是否与模板解析结果相容",
-        },
+        error: pointerRestoreError
+          ? {
+              code: "db_unavailable",
+              message: `Forward 更新失败，且来源模板指针恢复失败：${pointerRestoreError}`,
+              error_layer: "data_plane",
+              retryable: true,
+              next_action: "刷新 Forward 当前状态并重试；必要时人工核对 route_profile 指针",
+            }
+          : {
+              code: patched.code === "revision_conflict" ? "rollout_conflict" : "route_invalid",
+              message: patched.message,
+              error_layer: asRouteProfileLayer(patched.error_layer),
+              retryable: patched.code === "revision_conflict",
+              next_action:
+                patched.code === "revision_conflict"
+                  ? "等待该 Forward 正在进行的更新结束后重试"
+                  : "检查该 Forward 的配置（模式/目标）是否与模板解析结果相容",
+            },
       });
       continue;
     }
