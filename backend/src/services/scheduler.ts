@@ -2766,7 +2766,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] 协议未通过当前 runtime Gate`,
       },
-    }).catch(() => {});
+    });
     return {
       ok: false,
       tunnelId,
@@ -2815,7 +2815,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] DIRECT 入口节点不可用`,
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: "DIRECT 入口节点不可用", retryable: isRetryable(code) };
   }
 
@@ -2831,7 +2831,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] DIRECT 目标无效`,
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: "DIRECT 目标无效", retryable: false };
   }
 
@@ -2861,7 +2861,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: detail.slice(0, 500),
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
   }
 
@@ -2891,7 +2891,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] ${alloc.detail}`.slice(0, 500),
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: alloc.detail, retryable: isRetryable(code) };
   }
   ingressPort = alloc.port;
@@ -2924,18 +2924,36 @@ export async function reapplyDirectTunnel(
   });
   const directPlanViolations = forwardRuntimePlanViolations(directPlan);
   if (directPlanViolations.length > 0) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    const code = SCHEDULER_ERROR_CODES.invariant_violated;
-    const detail = `RuntimePlan 自检未通过：${directPlanViolations.join("; ")}`;
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        {
+          tunnelId,
+          node: pick.node,
+          direction: "direct",
+          revision: revision + 1,
+          reason: "direct runtime plan invalid",
+        },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const code = compensation.ok
+      ? SCHEDULER_ERROR_CODES.invariant_violated
+      : SCHEDULER_ERROR_CODES.compensation_failed;
+    const detail =
+      `RuntimePlan 自检未通过：${directPlanViolations.join("; ")}` +
+      (compensation.ok ? "" : `；${compensation.error}`);
     await store.tunnel.update({
       where: { id: tunnelId },
       data: {
         apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
         apply_error_code: code,
         apply_error: detail.slice(0, 500),
       },
-    }).catch(() => {});
-    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+    });
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: isRetryable(code) };
   }
 
   const dispatched = await orchestrator.dispatchDirect({
@@ -2950,19 +2968,38 @@ export async function reapplyDirectTunnel(
     ...tlsPathsFor(row, directPlan.protocol.name),
   });
   if (!dispatched.ok) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    const code = mapDispatchCode("ingress", dispatched);
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        {
+          tunnelId,
+          node: pick.node,
+          direction: "direct",
+          revision: revision + 1,
+          reason: "direct apply failed",
+        },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const originalCode = mapDispatchCode("ingress", dispatched);
+    const code = compensation.ok
+      ? originalCode
+      : SCHEDULER_ERROR_CODES.compensation_failed;
+    const detail = compensation.ok
+      ? dispatched.error
+      : `${dispatched.error}；${compensation.error}`;
     await store.tunnel.update({
       where: { id: tunnelId },
       data: {
         apply_status: APPLY_STATUS.error,
         desired_status: DESIRED_STATUS.inactive,
         apply_error_code: code,
-        apply_error: `[${code}] ${dispatched.error}`.slice(0, 500),
+        apply_error: `[${code}] ${detail}`.slice(0, 500),
         config_revision: revision,
       },
-    }).catch(() => {});
-    return { ok: false, tunnelId, error_code: code, error: dispatched.error, retryable: isRetryable(code) };
+    });
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: isRetryable(code) };
   }
 
   await store.tunnel.update({
