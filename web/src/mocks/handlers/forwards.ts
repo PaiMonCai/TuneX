@@ -37,6 +37,7 @@ import type {
   WorkspaceRole,
   WorkspaceTrafficSummary,
 } from "@/lib/types";
+import type { ForwardPatchInput } from "@/lib/types";
 import type { TargetHealthTargetView, TargetPoolHealth } from "@/lib/target-health";
 import type { MockNodeBinding, MockWorkspaceInvite } from "../state";
 import type { ForwardProtocol } from "@/lib/forward-protocol";
