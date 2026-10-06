@@ -220,7 +220,7 @@ describe("加载 / 错误状态不变量", () => {
 
 describe("复制 Forward / Binding usage 在列表侧的接线", () => {
   test("行菜单有复制入口，且草稿复用共享纯逻辑（不在组件里另写一套）", () => {
-    expect(COMPONENT).toContain("forwardCopyDraft(");
+    expect(COMPONENT).toContain("copiedForwardCreateDraft(");
     expect(TABLE).toMatch(/data-testid=\{`forward-copy-\$\{forward\.id\}`\}/);
   });
 
