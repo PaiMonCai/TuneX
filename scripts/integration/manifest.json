@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "current": {
+    "setup": "scripts/integration/setup.sh",
+    "protocol": "scripts/integration/current-protocol.py",
+    "multi_hop": "scripts/integration/multi-hop.py",
+    "federation_bootstrap": "scripts/integration/bootstrap-federation.py",
+    "federation": "scripts/integration/federation.py",
+    "teardown": "scripts/integration/teardown.sh"
+  },
+  "compatibility_root": "scripts/v3-e2e",
+  "historical_evidence": "docs/evidence"
+}

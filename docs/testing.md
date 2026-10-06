@@ -58,4 +58,4 @@ PR 根据变更 surface 运行 Backend、Web、Agent、Ops 与 secret scan。当
 
 ## 历史 Gate
 
-V3/V4/V5 Gate 名称属于历史追溯标识。仍被当前 workflow 调用的脚本是 compatibility / acceptance assets，不代表当前产品版本。索引见 [history/README.md](history/README.md)。
+V3/V4/V5 Gate 名称属于历史追溯标识。当前 workflow 只调用 `scripts/integration/` 的稳定入口；这些入口可委托给 `scripts/v3-e2e/` 中保留原名的 compatibility assets。当前/历史映射见 [`scripts/integration/README.md`](../scripts/integration/README.md)，历史背景见 [history/README.md](history/README.md)。
