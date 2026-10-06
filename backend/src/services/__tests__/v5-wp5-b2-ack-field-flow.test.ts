@@ -1,34 +1,47 @@
 import { describe, expect, test } from "bun:test";
-import { ControlProtocolValidator } from "../control-protocol/validator.ts";
+import { ControlValidator } from "../control-protocol/validator.ts";
 
 describe("command ACK hop endpoint contract", () => {
-  test("control protocol preserves hop_local_addr in the acknowledged command", () => {
-    const validator = new ControlProtocolValidator();
+  test("control protocol preserves hop_local_addr on an acknowledged command", async () => {
+    const validator = new ControlValidator();
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
     const commandId = "cmd-hop-endpoint";
-    const apply = {
-      type: "command" as const,
-      command_id: commandId,
-      resource: "tunnel" as const,
-      resource_id: "tunex-42-relay",
-      revision: 7,
-      action: "apply_tunnel" as const,
-      expires_at: new Date(Date.now() + 60_000).toISOString(),
-      payload: { config: { id: "tunex-42-relay" } },
-    };
-    const issued = validator.validateCommand(apply as never);
-    expect(issued.ok).toBe(true);
 
-    const ack = validator.validateCommand({
-      ...apply,
-      action: "command_ack",
-      payload: {
-        acked_command_id: commandId,
-        ok: true,
-        applied_revision: 7,
-        hop_local_addr: "172.31.20.10:53121",
+    const issued = await validator.handle(
+      {
+        type: "command",
+        command_id: commandId,
+        resource: "tunnel",
+        resource_id: "tunex-42-relay",
+        revision: 7,
+        action: "suspend_tunnel",
+        expires_at: expiresAt,
+        payload: {},
       },
-    } as never);
-    expect(ack.ok).toBe(true);
-    if (ack.ok) expect(ack.command.payload.hop_local_addr).toBe("172.31.20.10:53121");
+      async () => undefined,
+    );
+    expect(issued.status).toBe("applied");
+
+    const ack = await validator.handle(
+      {
+        type: "command",
+        command_id: "ack-hop-endpoint",
+        resource: "tunnel",
+        resource_id: "tunex-42-relay",
+        revision: 7,
+        action: "command_ack",
+        expires_at: expiresAt,
+        payload: {
+          acked_command_id: commandId,
+          status: "applied",
+          applied_revision: 7,
+          hop_local_addr: "172.31.20.10:53121",
+        },
+      },
+      async () => undefined,
+    );
+
+    expect(ack.status).toBe("applied");
+    expect(ack.hop_local_addr).toBe("172.31.20.10:53121");
   });
 });
