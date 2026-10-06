@@ -109,7 +109,9 @@ export type LifecycleConditionCode =
   | "node_still_used_as_ingress"
   /** 仍有 Forward 以该节点为出口 */
   | "node_still_used_as_egress"
-  /** 仍有入口-出口绑定 / 端口租约 / 出口池未清（未细分，具体见 dependencies 计数） */
+  /** 仍有 Forward 以该节点作为中间跳 */
+  | "node_still_used_as_middle"
+  /** 仍有入口-出口绑定 / 端口租约 / 出口池 / 联邦租约未清（见 dependencies） */
   | "dependency_blocked"
   /** 收缩端口区间会让 active 租约落到区间外 */
   | "port_range_would_orphan_leases";
@@ -336,6 +338,7 @@ export function deleteGates(input: {
   const blockers: Array<[number, LifecycleConditionCode, string]> = [
     [input.impact.ingress_forward_count, "node_still_used_as_ingress", "仍有端口转发以该节点为入口"],
     [input.impact.egress_forward_count, "node_still_used_as_egress", "仍有端口转发以该节点为出口"],
+    [input.impact.middle_forward_count, "node_still_used_as_middle", "仍有端口转发以该节点作为中间跳"],
   ];
   for (const [count, condition, message] of blockers) {
     if (count > 0) return { ok: false, condition, message, dependencies: input.impact };
@@ -344,6 +347,7 @@ export function deleteGates(input: {
     [input.impact.binding_count, "dependency_blocked", "仍存在涉及该节点的入口-出口绑定"],
     [input.impact.active_port_lease_count, "dependency_blocked", "仍存在未释放的端口租约"],
     [input.impact.egress_pool_count, "dependency_blocked", "仍存在出口池"],
+    [input.impact.federated_lease_count, "dependency_blocked", "仍存在未完成清理的联邦租约"],
   ];
   for (const [count, condition, message] of emptyGate) {
     if (count > 0) {
@@ -381,12 +385,16 @@ export interface NodeImpact {
   ingress_forward_count: number;
   /** 以该节点为出口的 Forward 数（`tunnel.egress_node_id`）。 */
   egress_forward_count: number;
+  /** 以该节点作为中间跳的 Forward 数（`tunnel.middle_node_id`）。 */
+  middle_forward_count: number;
   /** 涉及该节点的 NodeBinding 数（ingress 或 egress 任一指向它）。 */
   binding_count: number;
   /** 未释放的端口租约数（`node_port_lease.status = "active"`）。 */
   active_port_lease_count: number;
   /** 该节点上的出口池数。 */
   egress_pool_count: number;
+  /** 该节点仍可能拥有 runtime/port 清理责任的 FederationLease 数。 */
+  federated_lease_count: number;
   /** 阻塞当前操作的具体原因（空数组 = 无阻塞）。 */
   blockers: string[];
 }
@@ -396,9 +404,11 @@ export function emptyImpact(): NodeImpact {
   return {
     ingress_forward_count: 0,
     egress_forward_count: 0,
+    middle_forward_count: 0,
     binding_count: 0,
     active_port_lease_count: 0,
     egress_pool_count: 0,
+    federated_lease_count: 0,
     blockers: [],
   };
 }
@@ -429,6 +439,9 @@ export interface LifecycleDb {
     findMany(args: unknown): Promise<unknown>;
   };
   egressPool: {
+    count(args: unknown): Promise<unknown>;
+  };
+  federationLease: {
     count(args: unknown): Promise<unknown>;
   };
 }
@@ -522,7 +535,7 @@ async function loadNode(
 /**
  * 统计节点的依赖影响（impact check 的唯一实现）。
  *
- * 五条计数各查一次 count，不做 join/N+1：单节点详情页一次查询五条 COUNT
+ * 七类依赖各查一次 count，不做 join/N+1：单节点详情页一次并行查询七条 COUNT
  * 在 Node 表规模（百级到千级）下没有可感知差异，而 join 会让替身测试复杂一倍。
  *
  * `blockers` 只填**与角色收缩相关**的通用阻塞描述；生命周期/删除的具体拒绝码
@@ -537,22 +550,38 @@ export async function getNodeImpact(
   const node = await loadNode(pd, nodeId);
   if (!node) return err("not_found", "节点不存在");
 
-  const [ingressForward, egressForward, binding, lease, pool] = await Promise.all([
-    pd.tunnel.count({ where: { ingress_node_id: nodeId } }),
-    pd.tunnel.count({ where: { egress_node_id: nodeId } }),
-    pd.nodeBinding.count({ where: { OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }] } }),
-    pd.nodePortLease.count({ where: { node_id: nodeId, status: "active" } }),
-    pd.egressPool.count({ where: { node_id: nodeId } }),
-  ]);
+  const [ingressForward, egressForward, middleForward, binding, lease, pool, federationLease] =
+    await Promise.all([
+      pd.tunnel.count({ where: { ingress_node_id: nodeId } }),
+      pd.tunnel.count({ where: { egress_node_id: nodeId } }),
+      pd.tunnel.count({ where: { middle_node_id: nodeId } }),
+      pd.nodeBinding.count({ where: { OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }] } }),
+      pd.nodePortLease.count({ where: { node_id: nodeId, status: "active" } }),
+      pd.egressPool.count({ where: { node_id: nodeId } }),
+      pd.federationLease.count({
+        where: {
+          node_id: nodeId,
+          OR: [
+            { state: { in: ["reserved", "active", "releasing", "failed"] } },
+            {
+              state: { in: ["revoked", "expired", "released"] },
+              last_error_code: { not: null },
+            },
+          ],
+        },
+      }),
+    ]);
 
   return {
     ok: true,
     impact: {
       ingress_forward_count: asCount(ingressForward),
       egress_forward_count: asCount(egressForward),
+      middle_forward_count: asCount(middleForward),
       binding_count: asCount(binding),
       active_port_lease_count: asCount(lease),
       egress_pool_count: asCount(pool),
+      federated_lease_count: asCount(federationLease),
       blockers: [],
     },
   };
