@@ -12,13 +12,15 @@ import { FORWARD_PROTOCOLS, FORWARD_TLS_PATH_MAX, forwardProtocolLabel, forwardP
 import type { Locale } from "@/lib/i18n";
 import type { NodeBinding, UserNode } from "@/lib/types";
 
+import type { ForwardListTextKey } from "@/components/forwards/forward-list-model";
 type Translate = (key: string, params?: Record<string, string | number>) => string;
+type ListText = (key: ForwardListTextKey, params?: Record<string, string | number>) => string;
 
 export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBindings, availableEgressNodes, canManageNodes,
   bindingBusy, busy, locale, t, text, onOpenChange, onDraftChange, onBindEgress, onCreate }: {
   open: boolean; draft: ForwardCreateDraft; ingressNodes: UserNode[]; selectedBindings: NodeBinding[];
   availableEgressNodes: UserNode[]; canManageNodes: boolean; bindingBusy: boolean; busy: boolean; locale: Locale;
-  t: Translate; text: Translate; onOpenChange: (open: boolean) => void; onDraftChange: (draft: ForwardCreateDraft) => void;
+  t: Translate; text: ListText; onOpenChange: (open: boolean) => void; onDraftChange: (draft: ForwardCreateDraft) => void;
   onBindEgress: () => void; onCreate: () => void;
 }) {
   const protocolErrors = forwardCreateProtocolErrors(draft);
