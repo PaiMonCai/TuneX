@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TuneX v3 real E2E bootstrap.
+"""TuneX real Integration bootstrap.
 
 Two phases are intentional:
   provision: user/workspaces/groups -> concrete Nodes + one-time credentials.
@@ -14,14 +14,14 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-ERR = "[v3-e2e] "
+ERR = "[integration] "
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures")
 API = os.environ["API"]
 STATE = os.environ["STATE"]
-PHASE = os.environ.get("WP14_BOOTSTRAP_PHASE", "provision").strip().lower()
-USER_EMAIL = os.environ.get("WP14_USER_EMAIL", "wp14-e2e@tunex.local")
-USER_PASSWORD = os.environ["WP14_USER_PASSWORD"]
+PHASE = os.environ.get("TUNEX_IT_BOOTSTRAP_PHASE", "provision").strip().lower()
+USER_EMAIL = os.environ.get("TUNEX_IT_USER_EMAIL", "tunex-it-e2e@tunex.local")
+USER_PASSWORD = os.environ["TUNEX_IT_USER_PASSWORD"]
 
 
 def _load(name):
@@ -233,7 +233,7 @@ def _target(spec):
 
 
 def _v4_target(spec):
-    """V4 Forward fixture 的初始目标（显式 host/port 字段，不用 forward_addresses）。"""
+    """baseline Forward fixture 的初始目标（显式 host/port 字段，不用 forward_addresses）。"""
     return str(spec["target_host"]).strip("[]"), int(spec["target_port"])
 
 
@@ -241,9 +241,9 @@ V4_SPEC = FORWARD_FIX["v4_forward"]
 
 
 def create_v4_forward(cookie, workspace_id, ingress_node):
-    """Phase 3: the V4 Forward product object (same runtime row as the tunnel).
+    """Phase 3: the baseline Forward product object (same runtime row as the tunnel).
 
-    It is the entity the V4 scenarios edit through PATCH /api/forwards/:id,
+    It is the entity the baseline scenarios edit through PATCH /api/forwards/:id,
     so it must exist with a real ACKed runtime before any scenario runs.
     """
     host, port = _v4_target(V4_SPEC)
@@ -260,15 +260,15 @@ def create_v4_forward(cookie, workspace_id, ingress_node):
         {"x-workspace-id": str(workspace_id)},
         timeout=60,
     )
-    assert status in (200, 201), f"{ERR}V4 Forward create -> {status} {body}"
+    assert status in (200, 201), f"{ERR}baseline Forward create -> {status} {body}"
     forward = unwrap(body)
-    assert isinstance(forward, dict), f"{ERR}V4 forward 不是对象: {forward!r}"
-    assert forward.get("mode") == "direct", f"{ERR}V4 mode mismatch: {forward}"
-    assert forward.get("apply_status") == "active", f"{ERR}V4 not active: {forward}"
-    assert forward.get("ingress_node_id") == ingress_node["id"], f"{ERR}V4 ingress mismatch"
-    assert forward.get("listen_port") == V4_SPEC["listen_port"], f"{ERR}V4 listen_port mismatch: {forward}"
-    assert forward.get("target_host") == host, f"{ERR}V4 target_host mismatch: {forward}"
-    assert forward.get("target_port") == port, f"{ERR}V4 target_port mismatch: {forward}"
+    assert isinstance(forward, dict), f"{ERR}baseline forward 不是对象: {forward!r}"
+    assert forward.get("mode") == "direct", f"{ERR}baseline mode mismatch: {forward}"
+    assert forward.get("apply_status") == "active", f"{ERR}baseline not active: {forward}"
+    assert forward.get("ingress_node_id") == ingress_node["id"], f"{ERR}baseline ingress mismatch"
+    assert forward.get("listen_port") == V4_SPEC["listen_port"], f"{ERR}baseline listen_port mismatch: {forward}"
+    assert forward.get("target_host") == host, f"{ERR}baseline target_host mismatch: {forward}"
+    assert forward.get("target_port") == port, f"{ERR}baseline target_port mismatch: {forward}"
     return forward
 
 
@@ -392,7 +392,7 @@ if PHASE == "provision":
             },
         },
         "tunnels": {},
-        "markers": {"target_a": "WP14-TARGET-A", "target_b": "WP14-TARGET-B"},
+        "markers": {"target_a": "Integration-TARGET-A", "target_b": "Integration-TARGET-B"},
     }
     write_state(state)
     print(
@@ -438,7 +438,7 @@ elif PHASE == "forward":
     )
     state["forward"] = forward
     write_state(state)
-    print(f"{ERR}v4 forward id={forward['id']} revision={forward.get('config_revision')}")
+    print(f"{ERR}forward id={forward['id']} revision={forward.get('config_revision')}")
     print(f"{ERR}wrote {STATE}")
 else:
-    raise SystemExit(f"{ERR}unknown WP14_BOOTSTRAP_PHASE={PHASE!r}")
+    raise SystemExit(f"{ERR}unknown TUNEX_IT_BOOTSTRAP_PHASE={PHASE!r}")

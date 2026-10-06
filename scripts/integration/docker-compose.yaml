@@ -1,9 +1,9 @@
-# TuneX v3 real integration topology.
+# TuneX real Integration topology.
 #
 # Control is Agent -> Panel only. Both Agents have AGENT_ADMIN_PORT=0.
 # Tunnel listeners bind only data-network IPs; Panel is attached to ctrl only,
 # so it cannot reach either Agent data listener or any management port.
-name: wp14-e2e
+name: tunex-integration
 
 x-target-common: &target-common
   image: busybox:1.36
@@ -11,24 +11,24 @@ x-target-common: &target-common
 
 services:
   panel:
-    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
-    container_name: wp14-panel
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-tunex-it-backend:ci}}
+    container_name: tunex-it-panel
     restart: unless-stopped
     environment:
       NODE_ENV: production
       PORT: "3000"
       TZ: Asia/Shanghai
-      SITE_URL: http://127.0.0.1:${WP14_PANEL_HTTP_PORT:-18180}
-      # V5.5 WP14：本 Panel 对其他 Panel 公布的可达地址。浏览器用的 SITE_URL 是宿主端口，
+      SITE_URL: http://127.0.0.1:${TUNEX_IT_PANEL_HTTP_PORT:-18180}
+      # current Integration：本 Panel 对其他 Panel 公布的可达地址。浏览器用的 SITE_URL 是宿主端口，
       # 容器网络里的 peer 拨不通；联邦回呼（撤销通知 / 密钥轮转 / ping / 用量）都用这个。
       FEDERATION_PUBLIC_URL: http://panel:3000
-      DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
+      DATABASE_URL: ${DATABASE_URL:-mysql://root:tunex-it-only@mysql:3306/tunex}
       REDIS_URL: redis://redis:6379
       AUTH_SECRET: ${AUTH_SECRET:?required}
       LICENSE_SECRET: ${LICENSE_SECRET:?required}
       TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
       TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
-      JWT_ISSUER: wp14
+      JWT_ISSUER: integration
       JWT_TTL_SECONDS: "43200"
       COOKIE_SECURE: "false"
       # Production seed defaults registration off; this disposable topology explicitly enables it.
@@ -37,11 +37,11 @@ services:
       RATE_LIMIT_ENABLED: "true"
       AUDIT_LOG_ENABLED: "true"
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.10
         aliases: [panel]
     ports:
-      - "${WP14_PANEL_HTTP_PORT:-18180}:3000"
+      - "${TUNEX_IT_PANEL_HTTP_PORT:-18180}:3000"
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
@@ -55,37 +55,37 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
-    container_name: wp14-worker
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-tunex-it-backend:ci}}
+    container_name: tunex-it-worker
     restart: unless-stopped
     environment:
       NODE_ENV: production
-      DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
+      DATABASE_URL: ${DATABASE_URL:-mysql://root:tunex-it-only@mysql:3306/tunex}
       REDIS_URL: redis://redis:6379
       AUTH_SECRET: ${AUTH_SECRET:?required}
       LICENSE_SECRET: ${LICENSE_SECRET:?required}
       TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
       TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
-      JWT_ISSUER: wp14
+      JWT_ISSUER: integration
       DISABLE_WORKER: "false"
     command: ["bun", "src/worker.ts"]
     depends_on:
       panel:
         condition: service_healthy
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.14
 
   mysql:
     image: mysql:8.4.11
-    container_name: wp14-mysql
+    container_name: tunex-it-mysql
     restart: unless-stopped
     command: --skip-log-bin --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?required}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-tunex}
     volumes:
-      - wp14_mysql_data:/var/lib/mysql
+      - tunex_it_mysql_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:?required}"]
       interval: 5s
@@ -93,12 +93,12 @@ services:
       retries: 30
       start_period: 15s
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.11
 
   redis:
     image: redis:7.4-alpine
-    container_name: wp14-redis
+    container_name: tunex-it-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "no"]
     healthcheck:
@@ -107,20 +107,20 @@ services:
       timeout: 3s
       retries: 30
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.12
 
   db-migrate:
-    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-wp14-backend:ci}}
-    container_name: wp14-db-migrate
+    image: ${TUNEX_BACKEND_IMAGE:-${TUNEX_IMAGE:-tunex-it-backend:ci}}
+    container_name: tunex-it-db-migrate
     environment:
-      DATABASE_URL: ${DATABASE_URL:-mysql://root:wp14-only@mysql:3306/tunex}
+      DATABASE_URL: ${DATABASE_URL:-mysql://root:tunex-it-only@mysql:3306/tunex}
       REDIS_URL: redis://redis:6379
       AUTH_SECRET: ${AUTH_SECRET:?required}
       LICENSE_SECRET: ${LICENSE_SECRET:?required}
       TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
       TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
-      JWT_ISSUER: wp14
+      JWT_ISSUER: integration
       ALLOW_REGISTER_FALLBACK: "true"
       SEED_DEMO_DATA: "false"
     command: ["sh", "-c", "bunx prisma migrate deploy && bun prisma/seed.ts"]
@@ -131,18 +131,18 @@ services:
       redis:
         condition: service_healthy
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.13
 
   ingress-agent:
-    image: ${WP14_AGENT_IMAGE:?required}
-    container_name: wp14-ingress-agent
+    image: ${TUNEX_IT_AGENT_IMAGE:?required}
+    container_name: tunex-it-ingress-agent
     restart: unless-stopped
     command:
       - --panel-http-url
       - http://panel:3000
       - --node-id
-      - WP14-IN-A-NODE
+      - Integration-IN-A-NODE
       - --listen-ip
       - 172.31.10.20
       - --role
@@ -150,9 +150,9 @@ services:
       - --agent-admin-port
       - "0"
       - --agent-id
-      - ${WP14_INGRESS_AGENT_ID:?provision phase must export WP14_INGRESS_AGENT_ID}
+      - ${TUNEX_IT_INGRESS_AGENT_ID:?provision phase must export TUNEX_IT_INGRESS_AGENT_ID}
       - --node-credential
-      - ${WP14_INGRESS_CREDENTIAL:?provision phase must export WP14_INGRESS_CREDENTIAL}
+      - ${TUNEX_IT_INGRESS_CREDENTIAL:?provision phase must export TUNEX_IT_INGRESS_CREDENTIAL}
       - --ingress-range
       - 21000-21099
       - --state-dir
@@ -161,26 +161,26 @@ services:
     volumes:
       - ingress_agent_state:/var/lib/tunex-agent
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.20
-      wp14-ingress-data:
+      tunex-it-ingress-data:
         ipv4_address: 172.31.10.20
         aliases: [ingress-agent]
-      wp14-egress-data:
+      tunex-it-egress-data:
         ipv4_address: 172.31.20.10
     depends_on:
       panel:
         condition: service_healthy
 
   egress-agent:
-    image: ${WP14_AGENT_IMAGE:?required}
-    container_name: wp14-egress-agent
+    image: ${TUNEX_IT_AGENT_IMAGE:?required}
+    container_name: tunex-it-egress-agent
     restart: unless-stopped
     command:
       - --panel-http-url
       - http://panel:3000
       - --node-id
-      - WP14-OUT-A-NODE
+      - Integration-OUT-A-NODE
       - --listen-ip
       - 172.31.20.20
       - --role
@@ -188,9 +188,9 @@ services:
       - --agent-admin-port
       - "0"
       - --agent-id
-      - ${WP14_EGRESS_AGENT_ID:?provision phase must export WP14_EGRESS_AGENT_ID}
+      - ${TUNEX_IT_EGRESS_AGENT_ID:?provision phase must export TUNEX_IT_EGRESS_AGENT_ID}
       - --node-credential
-      - ${WP14_EGRESS_CREDENTIAL:?provision phase must export WP14_EGRESS_CREDENTIAL}
+      - ${TUNEX_IT_EGRESS_CREDENTIAL:?provision phase must export TUNEX_IT_EGRESS_CREDENTIAL}
       - --egress-range
       - 22000-22099
       - --state-dir
@@ -199,9 +199,9 @@ services:
     volumes:
       - egress_agent_state:/var/lib/tunex-agent
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.30
-      wp14-egress-data:
+      tunex-it-egress-data:
         ipv4_address: 172.31.20.20
         aliases: [egress-agent]
     depends_on:
@@ -209,14 +209,14 @@ services:
         condition: service_healthy
 
   ingress-agent-b:
-    image: ${WP14_AGENT_IMAGE:?required}
-    container_name: wp14-ingress-agent-b
+    image: ${TUNEX_IT_AGENT_IMAGE:?required}
+    container_name: tunex-it-ingress-agent-b
     restart: unless-stopped
     command:
       - --panel-http-url
       - http://panel:3000
       - --node-id
-      - WP14-IN-C-NODE
+      - Integration-IN-C-NODE
       - --listen-ip
       - 172.31.10.21
       - --role
@@ -224,9 +224,9 @@ services:
       - --agent-admin-port
       - "0"
       - --agent-id
-      - ${WP14_INGRESS_B_AGENT_ID:-UNPROVISIONED}
+      - ${TUNEX_IT_INGRESS_B_AGENT_ID:-UNPROVISIONED}
       - --node-credential
-      - ${WP14_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
+      - ${TUNEX_IT_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
       - --ingress-range
       - 21000-21099
       - --state-dir
@@ -235,25 +235,25 @@ services:
     volumes:
       - ingress_agent_b_state:/var/lib/tunex-agent
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.21
-      wp14-ingress-data:
+      tunex-it-ingress-data:
         ipv4_address: 172.31.10.21
-      wp14-egress-data:
+      tunex-it-egress-data:
         ipv4_address: 172.31.20.11
     depends_on:
       panel:
         condition: service_healthy
 
   egress-agent-b:
-    image: ${WP14_AGENT_IMAGE:?required}
-    container_name: wp14-egress-agent-b
+    image: ${TUNEX_IT_AGENT_IMAGE:?required}
+    container_name: tunex-it-egress-agent-b
     restart: unless-stopped
     command:
       - --panel-http-url
       - http://panel:3000
       - --node-id
-      - WP14-OUT-B-NODE
+      - Integration-OUT-B-NODE
       - --listen-ip
       - 172.31.20.21
       - --role
@@ -261,9 +261,9 @@ services:
       - --agent-admin-port
       - "0"
       - --agent-id
-      - ${WP14_EGRESS_B_AGENT_ID:-UNPROVISIONED}
+      - ${TUNEX_IT_EGRESS_B_AGENT_ID:-UNPROVISIONED}
       - --node-credential
-      - ${WP14_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
+      - ${TUNEX_IT_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
       - --egress-range
       - 22000-22099
       - --state-dir
@@ -272,9 +272,9 @@ services:
     volumes:
       - egress_agent_b_state:/var/lib/tunex-agent
     networks:
-      wp14-ctrl:
+      tunex-it-ctrl:
         ipv4_address: 172.31.0.31
-      wp14-egress-data:
+      tunex-it-egress-data:
         ipv4_address: 172.31.20.21
     depends_on:
       panel:
@@ -282,31 +282,31 @@ services:
 
   target-a:
     <<: *target-common
-    container_name: wp14-target-a
-    command: ["sh", "-c", "nc -lk -p 3030 -e echo WP14-TARGET-A"]
+    container_name: tunex-it-target-a
+    command: ["sh", "-c", "nc -lk -p 3030 -e echo Integration-TARGET-A"]
     networks:
-      wp14-ingress-data:
+      tunex-it-ingress-data:
         ipv4_address: 172.31.10.30
-      wp14-egress-data:
+      tunex-it-egress-data:
         ipv4_address: 172.31.20.30
 
   target-b:
     <<: *target-common
-    container_name: wp14-target-b
-    command: ["sh", "-c", "nc -lk -p 3030 -e echo WP14-TARGET-B"]
+    container_name: tunex-it-target-b
+    command: ["sh", "-c", "nc -lk -p 3030 -e echo Integration-TARGET-B"]
     networks:
-      wp14-ingress-data:
+      tunex-it-ingress-data:
         ipv4_address: 172.31.10.31
-      wp14-egress-data:
+      tunex-it-egress-data:
         ipv4_address: 172.31.20.31
 
   client:
     image: busybox:1.36
-    container_name: wp14-client
+    container_name: tunex-it-client
     command: ["sh", "-c", "sleep 365d"]
     restart: unless-stopped
     networks:
-      wp14-ingress-data:
+      tunex-it-ingress-data:
         ipv4_address: 172.31.10.40
 
 volumes:
@@ -314,32 +314,32 @@ volumes:
   # immutable agent_id, so a shared directory would have four nodes overwriting
   # (and rejecting) each other's cache.
   ingress_agent_state:
-    name: wp14-ingress-agent-state
+    name: tunex-it-ingress-agent-state
   egress_agent_state:
-    name: wp14-egress-agent-state
+    name: tunex-it-egress-agent-state
   ingress_agent_b_state:
-    name: wp14-ingress-agent-b-state
+    name: tunex-it-ingress-agent-b-state
   egress_agent_b_state:
-    name: wp14-egress-agent-b-state
-  wp14_mysql_data:
-    name: wp14_mysql_data
+    name: tunex-it-egress-agent-b-state
+  tunex_it_mysql_data:
+    name: tunex_it_mysql_data
 
 networks:
-  wp14-ctrl:
-    name: wp14_ctrl
+  tunex-it-ctrl:
+    name: tunex_it_ctrl
     driver: bridge
     ipam:
       config:
         - subnet: 172.31.0.0/24
-  wp14-ingress-data:
-    name: wp14_ingress_data
+  tunex-it-ingress-data:
+    name: tunex_it_ingress_data
     driver: bridge
     internal: true
     ipam:
       config:
         - subnet: 172.31.10.0/24
-  wp14-egress-data:
-    name: wp14_egress_data
+  tunex-it-egress-data:
+    name: tunex_it_egress_data
     driver: bridge
     internal: true
     ipam:

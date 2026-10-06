@@ -7,7 +7,6 @@ on:
       - "agent/**"
       - "shared/**"
       - "scripts/integration/**"
-      - "scripts/v3-e2e/**"
       - "Dockerfile"
       - "agent/Dockerfile"
       - "docker-compose*.yaml"
@@ -40,7 +39,7 @@ jobs:
       - name: Start PR topology
         run: bash scripts/integration/setup.sh
       # One current protocol suite owns the PR end-to-end signal. Historical
-      # V4/V5 milestone gates remain available as diagnostics, never automatic.
+      # Diagnostic-only checks stay outside the automatic release path.
       - name: Current protocol regression
         run: python3 scripts/integration/current-protocol.py
       - name: Upload PR integration evidence
@@ -48,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pr-integration-evidence
-          path: scripts/v3-e2e/evidence/
+          path: scripts/integration/evidence/
           if-no-files-found: warn
           retention-days: 14
       - name: Teardown PR integration topology
@@ -155,10 +154,8 @@ jobs:
           path: candidate-metadata.json
           retention-days: 30
 
-  # Main qualification is intentionally small: qualify the current protocol,
-  # multi-hop and federation surfaces against the exact candidate digests.
-  # Historical V4/V5 milestone gates remain in scripts/v3-e2e for manual
-  # diagnosis only and MUST NOT return to the automatic release path.
+  # Main qualification verifies the current protocol, multi-hop and Federation
+  # surfaces against the exact candidate digests.
   release-qualification:
     if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
     needs: [candidate-images]
@@ -169,7 +166,7 @@ jobs:
       packages: read
     env:
       TUNEX_BACKEND_IMAGE: ghcr.io/paimoncai/tunex@${{ needs.candidate-images.outputs.panel_digest }}
-      WP14_AGENT_IMAGE: ghcr.io/paimoncai/tunex-agent@${{ needs.candidate-images.outputs.agent_digest }}
+      TUNEX_IT_AGENT_IMAGE: ghcr.io/paimoncai/tunex-agent@${{ needs.candidate-images.outputs.agent_digest }}
       FED_PANEL_B_AGENT_IMAGE: ghcr.io/paimoncai/tunex-agent@${{ needs.candidate-images.outputs.agent_digest }}
       FED_SKIP_BUILD: "1"
     steps:
@@ -186,7 +183,7 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "$TUNEX_BACKEND_IMAGE"
-          docker pull "$WP14_AGENT_IMAGE"
+          docker pull "$TUNEX_IT_AGENT_IMAGE"
 
       - name: Start candidate topology
         run: bash scripts/integration/setup.sh
@@ -214,7 +211,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-qualification-evidence
-          path: scripts/v3-e2e/evidence/
+          path: scripts/integration/evidence/
           if-no-files-found: warn
           retention-days: 30
 
