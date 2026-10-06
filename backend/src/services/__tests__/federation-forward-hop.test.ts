@@ -834,7 +834,7 @@ describe("G. 释放：移除声明 / 改回本机出口 / 删除 Forward 共用�
     expect(block).toContain("stale_release_lookup_failed");
     expect(block).toContain("SCHEDULER_ERROR_CODES.compensation_failed");
     expect(block).toContain("if (stale.failed.length > 0)");
-    expect(block).toContain("return fail(");
+    expect(block).toContain("return failAfterTeardown(");
     expect(block).not.toContain("ok: true");
   });
 
