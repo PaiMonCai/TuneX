@@ -883,6 +883,21 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 - **`Agent enroll → online` 仍未达成**，但**根因已精确定位**且**归因于执行方**：它把**一次性 `--enroll-token`（43 字符）当长期凭据**塞进 `TUNEX_NODE_CREDENTIAL`，**跳过了安装器的 enroll 交换** ⇒ Agent 能连上面板（`restore done … source=panel`）但状态上报被拒：**`state report rejected: node credential is invalid or revoked`**，节点停在 `waiting`。它明确要求记为"**我方执行错误**"，**不计入产品/文档缺陷**（并且这条拒绝恰恰证明"一次性 token 重放应失败"是**正确行为**）。客观障碍：真跑 `install.sh` 需要节点主机 `sudo` + 宿主 docker/systemd + `--network host`，沙箱（容器化、看不到宿主 `/tmp`）无法原样执行。
 - **CSRF 方法不对称 → 判定为产品侧问题，未写入文档**（它的判断）：`POST` 带常量 `x-csrf-token` 即可，`DELETE` **额外要求 `Origin`**；**浏览器用户无感**（浏览器必带 `Origin`、前端必带该头），受影响的是**脚本/自动化客户端**。⇒ 记入收尾清单；**本周期不改**安全中间件（在没有专门威胁评审的情况下，末期改 CSRF 判据的风险大于这条不一致本身）。
 
+## 3.40 Round 47：`task-36` 交付（通知端到端投递证据 = #10 翻转要件 ①）+ 一处**在途**门禁红
+
+### `task-36`：通知端到端真实投递（证据已交，**待 `misc-truth` 独立复核**）
+实验拓扑（唯一名容器，用完即删）：`t36-smtp`（**2525 先发 `220` 问候语**＝RFC 5321 形态；**2526 发 `554`**）、`t36-a/b/c`（同源码，不同 SMTP/开关）；事实来源为临时 workspace + member（邮箱取自用户资料）+ `tunnel.apply_status='error'`；渠道行仅 3 行。
+1. **成功路径**：`tick1={considered:1,built:1,recovered:0,rejected:0,skipped:0,delivered:true}`；账本 `status='sent'`、`attempts=1`；**假 SMTP 侧记录到完整报文**（`To` = 成员自己的邮箱、`Subject:[TuneX][error] forward_apply_error`、正文含原因码/严重度/资源/发生时间/诊断码、命令序列 `EHLO,AUTH,MAIL,RCPT,DATA,QUIT`）。幂等旁证：同事实再现 ⇒ 账本仍 2 行、无第二封。
+2. **失败路径三条**：`transport_error`（554 问候语 ⇒ **attempts=3**，容器日志 `SMTP 问候语异常（期望 220，实际 554）`，**2526 端口从未收到任何报文** ⇒ P1 的 fail-closed 在"真 MTA 形态"下成立）；`secret_unreadable`；`rejected_target`。**读投影**（task-13 端点）把三条失败逐条呈现：`summary{total:6,sent:3,failed:3,by_failure_reason:{secret_unreadable:1,rejected_target:2}}`、行内 `target:"***"` + `target_masked:true`，对原始邮箱 `grep -c` = **0 命中**。
+3. **与简报预期不同（它写成了发现）**："保存但开关未开"的实际行为是**零账本行**，不是 `not_configured`——根因是 task-11 的 `channels()` 只把 `isConfigured()===true` 的渠道交给投递层（**有意**避免噪音）⇒ `not_configured` 成为**防御性分支**（只在 tick 内配置变坏时可达）。它建议若要"保存了也留一行"，须**改投递契约**（不在 job 里加判据）——**我不在本周期改**，记入 backlog。
+4. **清理对照**：workspace 6→4、member 6→4、tunnel 8→3、`notification_channel` 3→0、`notification_delivery` 8→0、`user.tg_id` 还原 NULL、Redis 静默期键 0、4 容器全删；`tunex-it-*` 全程未受影响。
+5. **它自列的未验证**：真实公网 MTA（465/587）、Telegram 真投递、`degraded=true` 真机、**未经 BullMQ 调度器**（直接调 handler 所用函数 ⇒ "每 30s 真被调度"由本专项的真机日志覆盖）；并主动提醒：运行中的 worker 会看到它临时插入的事实（渠道列表为空 ⇒ `delivered:false`、零账本行），若复核者看到 `considered>0` 的几拍属**实验旁路影响，不是回归**。
+
+**复核已派出**：交 `misc-truth` 按它**预先写死的 8 条判据**逐条给"支撑/部分支撑/不支撑 + 缺什么"，并重新钉 SHA；结论写进其报告新小节，**不改写 §1–§6**。
+
+### 一处**在途**门禁红（非回归，待落定）
+第 47 轮预备门禁时 backend 报 `src/routes/forwards.ts(734,27): error TS2304: Cannot find name 'preferenceOptions'` + 2 条测试失败——该文件同时是 `task-38`（HA 转发组）与 `task-39`（带宽序列）的写入范围 ⇒ 判定为**在途中途态**。web 侧同时刻 `tsc` 0 错 + 1325 pass / 0 fail + `next build` 成功。**结论以落定后重跑为准。**
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
