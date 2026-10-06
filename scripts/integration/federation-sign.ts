@@ -38,8 +38,7 @@ if (body.length > 0) {
   }
 }
 
-// 模块根目录：默认 /app（面板镜像里的仓库位置）。用 TUNEX_SRC_DIR 指向别的 checkout 即可复用。
-const srcDir = (process.env.TUNEX_SRC_DIR ?? "/app/src").replace(/\/+$/, "");
+// The unified production image keeps backend sources under /app/backend/src.\n// TUNEX_SRC_DIR remains available for local/alternate image layouts.\nconst srcDir = (process.env.TUNEX_SRC_DIR ?? "/app/backend/src").replace(/\\/+$/, "");
 const { loadSigningKey } = await import(`${srcDir}/services/federation/identity.ts`);
 const { buildSignatureHeaders } = await import(`${srcDir}/services/federation/signing.ts`);
 
