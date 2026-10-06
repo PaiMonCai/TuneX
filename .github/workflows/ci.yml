@@ -199,6 +199,8 @@ jobs:
           sh -n scripts/ops/install.sh
           bash -n scripts/ops/bootstrap.sh
           sh -n scripts/ops/bootstrap.sh
+          bash -n scripts/ops/backup.sh
+          bash -n scripts/ops/restore.sh
       - name: Installer static + dry-run gate
         run: bash scripts/ops/tests/installer-static.sh
 
