@@ -38,6 +38,8 @@ const workspace: WorkspaceContextValue = {
 };
 
 const COMPONENT = readFileSync(new URL("../forward-workspace.tsx", import.meta.url), "utf8");
+const TABLE = readFileSync(new URL("../forward-table.tsx", import.meta.url), "utf8");
+const CREATE_DIALOG = readFileSync(new URL("../forward-create-dialog.tsx", import.meta.url), "utf8");
 
 const render = (locale: "zh" | "en") =>
   renderToStaticMarkup(
@@ -219,7 +221,7 @@ describe("加载 / 错误状态不变量", () => {
 describe("复制 Forward / Binding usage 在列表侧的接线", () => {
   test("行菜单有复制入口，且草稿复用共享纯逻辑（不在组件里另写一套）", () => {
     expect(COMPONENT).toContain("forwardCopyDraft(");
-    expect(COMPONENT).toMatch(/data-testid=\{`forward-copy-\$\{forward\.id\}`\}/);
+    expect(TABLE).toMatch(/data-testid=\{`forward-copy-\$\{forward\.id\}`\}/);
   });
 
   test("复制最终落到真实 create 契约（没有第二条写路径）", () => {
@@ -229,9 +231,9 @@ describe("复制 Forward / Binding usage 在列表侧的接线", () => {
   });
 
   test("出口下拉展示绑定使用量，且读的是后端投影而不是前端重算", () => {
-    expect(COMPONENT).toContain("bindingUsageView(");
-    expect(COMPONENT).toContain("hasBindingUsage(");
-    expect(COMPONENT).not.toMatch(/used_by_forward_count\s*>:?/);
+    expect(CREATE_DIALOG).toContain("bindingUsageView(");
+    expect(CREATE_DIALOG).toContain("hasBindingUsage(");
+    expect(CREATE_DIALOG).not.toMatch(/used_by_forward_count\s*>:?/);
   });
 });
 
