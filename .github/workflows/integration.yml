@@ -160,6 +160,7 @@ jobs:
             set -eu
             bun --version
             node --version
+            test "$(id -u)" -ne 0
             test -f /app/backend/src/index.ts
             test -f /app/backend/prisma/schema.prisma
             test -f /app/web/server.js
