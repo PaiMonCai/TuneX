@@ -190,7 +190,7 @@ const (
 	LBWeightedRoundRobin LBStrategy = "WEIGHTED_ROUND_ROBIN"
 )
 
-// ParseLBStrategy normalises a wire value. Both the long devmap names and the
+// ParseLBStrategy normalises a wire value. Both the canonical long names and the
 // short EgressPool names ("round" / "rand" / "weighted_round") resolve to the
 // same policy. Unknown strategies are an error: silently falling back would
 // route live traffic under a policy the operator did not choose.
@@ -600,10 +600,6 @@ type StreamRuntime interface {
 	// the ceiling. It is safe to call before Start and more than once.
 	Drain(timeout time.Duration) error
 }
-
-// Forwarder is a compatibility alias for StreamRuntime. New code should prefer
-// StreamRuntime so transport-specific contracts remain explicit.
-type Forwarder = StreamRuntime
 
 // Runtime is the transport-agnostic handle manager.TunnelManager keeps for one
 // tunnel: whatever carries the payload, "a tunnel this node runs" means "a
