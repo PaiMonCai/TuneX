@@ -72,6 +72,7 @@ describe("V4 forward edit UX — 字段集等同于创建表单", () => {
     );
   });
 
+});
 
 describe("V4 forward edit UX — 单 PATCH 增量语义", () => {
   test("未改动的字段不进 patch（后端沿用 current desired）", () => {
