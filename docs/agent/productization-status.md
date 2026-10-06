@@ -162,6 +162,12 @@ E1 的实现与 Leader 独立推导一致：`services/node-state.ts` 在**通过
 
 即：修复后**真实可执行**，且**不可能在没有 HTTP 200 的情况下说"通过"**。同一节点在此期间 `connection` 自动为 `online`，E1 的修复在 production 形状下再次成立。
 
+### E1 的补充证据（独立镜像 + 一次性 scratch 栈，已清理）
+
+E1 自行用**独立标签派生镜像**（`tunex-e1-fixed:local` / `tunex-e1-old:local`，只 `COPY src /app/src`——镜像内应用在 `/app/src`，外层 bind mount 无效）搭了一次性 MySQL/Redis/Panel/Worker + 真实 Agent 容器，给出 **A/B 决定性对照**：换回 pre-fix Panel 时 Agent 启动后 `last_seen_age=2.3s`（上报完全新鲜）却仍 `offline`；换回 fixed 镜像、其余不变 → 下一拍上报即 `online`。并排除时区/时钟偏差（MySQL `NOW()` 与服务端一致）、确认 Redis 里**零** socket 标记键、worker 日志 `flipped_stale:4` 一次性闩死 4 台真实 Agent。定向 12 个连接相关文件 **509 pass / 0 fail**，含 A/B 自证（临时移除写点 → 4 fail）。
+
+E1 的剩余风险（如实记录，未修）：心跳写入仍 fail-soft（DB 抖动最多 offline 30s，下一拍自愈）；socket 时代残留的 `markInactive` 理论上能翻掉仍在 HTTP 上报的节点（生产 Redis 零标记键，属理论路径，下一拍自愈）；`/node/desired` 刻意不恢复 status（保持单一"活着"定义，代价是最迟 30s）。
+
 ### 下一批切片队列（按 ROI 与写入冲突排序）
 
 | 序 | 切片 | 前置 | 说明 |
