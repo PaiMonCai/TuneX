@@ -1060,10 +1060,34 @@ export async function releaseFederatedEgress(
     return { ok: true, released: true };
   }
   // 失败要留下事实：镜像行记 degraded + 真实错误码，下一拍/下一轮仍按同一 intent 重试。
-  await recordPlacementResult(
-    { peer_panel_id: peerPanelId, intent_id: intentId, ok: false, code: released.code ?? "internal_error", message: released.message ?? null },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
+  // If even that recovery ledger write fails, surface BOTH failures. Returning
+  // only the remote DELETE error would make the caller believe the local retry
+  // fact is durable when it is not.
+  try {
+    await recordPlacementResult(
+      {
+        peer_panel_id: peerPanelId,
+        intent_id: intentId,
+        ok: false,
+        code: released.code ?? "internal_error",
+        message: released.message ?? null,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      released: false,
+      code: "internal_error",
+      message:
+        "远端释放失败（" +
+        (released.code ?? "internal_error") +
+        ": " +
+        (released.message ?? "unknown") +
+        "），且本地恢复账本写入失败：" +
+        (error instanceof Error ? error.message : String(error)),
+    };
+  }
   return { ok: false, released: false, code: released.code, message: released.message };
 }
 
