@@ -1,11 +1,11 @@
-// The egress target-pool load balancer. Lives in package manager (devmap §7.2
+// The egress target-pool load balancer. Lives in package manager (
 // "manager/lb.go — 轮询/随机"), so TunnelManager and EgressManager can share the
 // port guard with it.
 //
 // The contract the egress forwarder depends on is forwarder.TargetSelector;
 // LoadBalancer satisfies it and adds atomic snapshot replacement so a
 // PATCH /node/targets can retarget every new connection instantly without
-// restarting the listener ("Target snapshot hot update", devmap §5.3).
+// restarting the listener (target snapshot hot update).
 package manager
 
 import (
@@ -31,7 +31,7 @@ const (
 	// connections of a weight-1 target. Listed twice on purpose — the panel
 	// has sent both spellings for the same policy.
 	WeightedRoundRobin Strategy = "WEIGHTED_ROUND_ROBIN"
-	// WeightedRound is the DEVELOPMENT.md §2.2 spelling of the same policy
+	// WeightedRound is the canonical spelling of the same policy
 	// ("第一版负载均衡支持 round / rand / weighted_round"). Both values are
 	// accepted so a hand-written or older panel payload still works; they
 	// are aliases, not two policies.
@@ -43,7 +43,7 @@ const (
 // Two families of spellings are accepted, because both are live on the wire:
 //
 //   - the long, upper-case enum names (ROUND_ROBIN / RANDOM /
-//     WEIGHTED_ROUND_ROBIN) — the devmap §3 form, and what TunnelConfig
+//     WEIGHTED_ROUND_ROBIN) — the persisted form, and what TunnelConfig
 //     JSON carries;
 //   - the short, lower-case EgressPool names (round / rand / weighted_round) —
 //     the Prisma `LBStrategy` enum and the legacy gost selector names

@@ -86,7 +86,7 @@ func PlanForwardSwap(old, new_ forwarder.TunnelConfig) SwapPlan {
 	}
 	if old.Mode == forwarder.ModeEgress || new_.Mode == forwarder.ModeEgress {
 		// An EGRESS tunnel's upstream is a pool, not one address: the hot
-		// path is EgressManager/Pool.SwapTargets (devmap §5.3), never a
+		// path is EgressManager/Pool.SwapTargets, never a
 		// listener rebuild driven by a config diff.
 		return SwapPlan{
 			Strategy: SwapRecreate,

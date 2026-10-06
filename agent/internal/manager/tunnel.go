@@ -5,7 +5,7 @@
 // ("newer revision atomic apply, equal revision idempotent, older revision
 // stale-reject"). EgressManager owns the target pools and hands out the
 // (swappable) load balancers the egress forwarders use. LoadBalancer itself
-// lives here too (devmap §7.2 "manager/lb.go").
+// lives here too in manager/lb.go.
 //
 // Ports: a BOTH node runs ingress and egress tunnels in
 // one process and the two pools can overlap numerically, so a single shared

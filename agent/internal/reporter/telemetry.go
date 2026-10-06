@@ -5,7 +5,7 @@
 // The wire shape (StatePayload) and the POST loop stay in heartbeat.go; keeping
 // the two apart is what makes both testable without a network or a wall clock.
 //
-// Design rules taken from DEVELOPMENT.md §13.4.4:
+// Design rules for Agent telemetry:
 //
 //   - The panel computes Health. The agent only reports raw facts, so nothing
 //     here produces "healthy/warning" — it produces numbers.

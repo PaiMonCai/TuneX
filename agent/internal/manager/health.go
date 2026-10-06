@@ -20,7 +20,7 @@
 //
 // Everything is bounded, and every bound says WHY at its constant: an unbounded
 // cooldown is "remove the target forever" arrived at by arithmetic, and the
-// pre-WP7 §7.3 rule forbids exactly that.
+// no-health behavior forbids exactly that.
 package manager
 
 import (

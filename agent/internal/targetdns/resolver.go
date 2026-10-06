@@ -1,5 +1,5 @@
 // Package targetdns implements Agent-side dynamic target DNS (
-// DEVELOPMENT.md §8.1 "DNS 是输入/观测，不是第二个 desired 真相源").
+// DNS is input/observation, never a second desired-state source).
 //
 // The panel never resolves and never caches a resolution: the agent is the side
 // that dials, so it is the side that must know what a name currently points at,
