@@ -231,6 +231,41 @@ E1 的剩余风险（如实记录，未修）：心跳写入仍 fail-soft（DB �
 
 **安全性核查（重要）**：全仓**没有**任何"操作者主动把 `node.status` 置为 inactive"的写点——admin 侧只读 `status='active'` 做统计（`admin-extended.ts:427,731,885`），`node-admin.ts` 不写 status；操作者维度是 `lifecycle`（maintenance/disabled/retiring，独立判定）。因此"一次已认证上报 ⇒ status=active"**不会**撤销任何人的停用决定，也不会绕过凭据撤销（认证在写点之前）。
 
+## 3.6 待解决回归：路由模块作用域引入 redis（会让全量变红）
+
+**现象**：`bun test src --timeout 10000` 中 `workspace-rbac.test.ts`（WP10 子进程用例）稳定在 ~10s 超时失败；00:11 时它还是 178ms 通过。
+
+**根因（D4 受控实验定位，非猜测）**：延迟历史切片在 `backend/src/routes/forwards.ts:52` **模块作用域**引入 `import { targetKeyOf } from "../services/node-state.ts"`；`node-state.ts` 传递依赖 `redis.ts`（`lazyConnect:false`，连不上无限重试）⇒ 任何 import `forwards.ts` 的子进程都**不会自然退出**。`workspace-rbac.test.ts` 的子进程只 mock 了 forward-service / tunnel-api，没有 mock node-state，靠"进程自然退出"收尾，于是被外层 `--timeout 10000` 判失败（它自己的 spawn 预算是 30s，两者本身也错配）。
+- 实验：只 mock `forward-service` 再 import `routes/forwards.ts` → 10s 不退出；**再多 mock 一条 `node-state`** → 549ms 正常退出。差别只有 node-state。
+- 归因：排除新增测试文件后重跑全量（125 文件）同样红，与 D4 的 DDNS 改动无关。
+
+**Leader 独立验证 + 依赖链追查（结论可直接执行）**：
+- 单独跑 `bun test src/routes/__tests__/workspace-rbac.test.ts --timeout 10000` → **10.01s 超时失败**，日志里出现 `[redis] error: connect ECONNREFUSED 127.0.0.1:6379`，与"子进程因打开的 Redis 句柄无法退出"一致。
+- 完整依赖链：`routes/forwards.ts:52` → `services/node-state.ts:15` → **`services/node-credential.ts`（node-state 依赖图中唯一 import `redis.ts` 的模块，5 处命中）** → `services/redis.ts`（`lazyConnect:false`）。
+- 因此"只删 `targetKeyOf` 这条模块作用域 import（或改惰性 `await import`）"是**有效**修法；mock 其它模块（forward-service/tunnel-api）无效，因为 redis 是被 node-state 这一条链拉进来的。
+
+**修法（优先级从高到低）**：
+1. 让 `routes/forwards.ts` 不在模块作用域把 redis 拉进来（改用不依赖 node-state 的本地实现/已有 helper，或惰性 `await import`）；若 `targetKeyOf` 可不用最好；
+2. 或修 `workspace-rbac.test.ts` 的收尾（`process.exit(0)`）——但这只是掩盖，必须同时说明为什么模块作用域 import 是合理的；
+3. 不允许用测试改绿来掩盖真实问题。
+
+**状态**：已要求 D6 在其任务内修（其简报本就要求全量 0 fail），因 `send_message` 对普通子代理不可用，无法中途指挥。**若 D6 交付时仍红，由 Leader 直接修**（此时代码已停止写入）。在修好之前不跑"官方门禁"结论。
+
+## 3.7 团队形态调整（用户决定，2026-10-07）
+
+**背景**：普通一次性子代理在本专项暴露出三个结构性限制——① `send_message` 对其返回 `active teammate ... not found`，**无法中途指挥**（D4 诊断出 D6 引入的回归时我无法把反馈送进去）；② `list_agents` 看不到它们，**无法观测谁在跑**，只能靠文件 mtime 猜；③ 没有共享任务板，写入范围只是简报里的口头声明，**冲突无法被系统校验**（D5 与 W1 撞同一棵树导致我的门禁作废）。
+
+**决定**：收干净当前 3 个在途子代理（D5/D6/E2）后，**切换到 Agent Teams**：为剩余切片创建持久队友，用共享任务板声明写入范围与 `blocked_by` 依赖，Lead 只做集成与验收。
+
+**已建立的共享任务（先于队友创建，便于直接认领）**：
+| 任务 | 内容 | 写入范围要点 | 依赖 |
+|---|---|---|---|
+| `task-1` | DDNS Web：设置页服务商 CRUD + `forward-dns-card.tsx`（自包含） | `lib/api/ddns.ts`、`lib/ddns-i18n.ts`、`components/ddns/`、`mocks/handlers/ddns.ts`、`lib/api.ts`、`lib/nav.ts` | 无 |
+| `task-2` | Forward 详情：`forward-topology.tsx`（topology 首次消费）+ 修 F11 死列 | `components/forwards/forward-topology.tsx`、`lib/api/forwards.ts`、`mocks/handlers/forwards.ts` | 无 |
+| `task-3` | 集成：把两块卡片挂进 `forward-detail.tsx`（**Lead 独占写点**） | 仅 `components/forwards/forward-detail.tsx` | task-1、task-2 |
+
+把 `forward-detail.tsx` 单独抽成集成任务的用意：DDNS 切片与链路切片都想改它，这正是先前并行双写产生冲突的同型问题；现在两个组件任务都被要求**不碰**该文件，冲突点在任务板层面被消解。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
