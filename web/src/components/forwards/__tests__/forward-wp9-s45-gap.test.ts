@@ -23,6 +23,7 @@ const WORKSPACE = readFileSync(
   new URL("../forward-workspace.tsx", import.meta.url),
   "utf8",
 );
+const TABLE = readFileSync(new URL("../forward-table.tsx", import.meta.url), "utf8");
 const DETAIL = readFileSync(
   new URL("../forward-detail.tsx", import.meta.url),
   "utf8",
@@ -79,14 +80,10 @@ describe("V4-WP9 S4 列表 / 详情：`:auto` 字面量必须消失", () => {
   });
 
   test("列表新增「访问地址」列，且单元格走同一份纯逻辑 + 待确定文案", () => {
-    expect(WORKSPACE).toContain('t("forward.accessAddress")');
-    expect(norm(WORKSPACE)).toContain(
-      'forwardAccessAddress(forward) ?? t("forward.addressPending")',
-    );
+    expect(TABLE).toContain('t("forward.accessAddress")');
+    expect(norm(TABLE)).toContain('forwardAccessAddress(forward) ?? t("forward.addressPending")');
     // 端口列保留（排序键仍是 listen_port），但空值渲染成文字而不是 `auto`
-    expect(norm(WORKSPACE)).toContain(
-      'forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`',
-    );
+    expect(norm(TABLE)).toContain('forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`');
   });
 
   test("两语言都有访问地址 / 待确定词条且非空", () => {
@@ -158,12 +155,12 @@ describe("V4-WP9 S5 / Wave 4：普通用户 Forward 文案去 Tunnel", () => {
 
 describe("V4-WP9 S4 表格几何：新增列后占位格必须同步", () => {
   test("表头列数与 loading / empty 的 colSpan 一致", () => {
-    const header = WORKSPACE.match(/<TableHeader>([\s\S]*?)<\/TableHeader>/)?.[1] ?? "";
+    const header = TABLE.match(/<TableHeader>([\\s\\S]*?)<\\/TableHeader>/)?.[1] ?? "";
     const columns =
       (header.match(/<TableHead\b/g) ?? []).length +
       (header.match(/<SortableHead\b/g) ?? []).length;
     expect(columns).toBeGreaterThan(0);
-    const spans = [...WORKSPACE.matchAll(/colSpan=\{(\d+)\}/g)].map((m) => Number(m[1]));
+    const spans = [...TABLE.matchAll(/colSpan=\\{(\\d+)\\}/g)].map((m) => Number(m[1]));
     expect(spans.length).toBeGreaterThan(0);
     for (const span of spans) expect(span).toBe(columns);
   });
