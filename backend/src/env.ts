@@ -55,7 +55,11 @@ export const env = {
   /** secure 开关：明文 HTTP 本地栈置 false，TLS 环境必须 true */
   cookieSecure: (process.env.COOKIE_SECURE ?? "false") === "true",
 
-  allowRegisterFallback: (process.env.ALLOW_REGISTER_FALLBACK ?? "true") === "true",
+  // Invitation-only beta must fail closed in production when the variable is omitted.
+  // Development keeps the convenient historical default.
+  allowRegisterFallback:
+    (process.env.ALLOW_REGISTER_FALLBACK ??
+      ((process.env.NODE_ENV ?? "development") === "production" ? "false" : "true")) === "true",
 
   /** TEN-03 邮件服务（SMTP）。全部未配置 → 邮件内容落日志（开发环境可用）。 */
   mail: {
