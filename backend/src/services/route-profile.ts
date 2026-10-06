@@ -355,6 +355,7 @@ function parseAssignments(raw: unknown): { ok: true; rows: AssignmentInput[] } |
   if (raw === undefined || raw === null) return { ok: true, rows: [] };
   if (!Array.isArray(raw)) return routeProfileError("invalid_input", "assignments 必须是数组");
   const rows: AssignmentInput[] = [];
+  const seen = new Set<string>();
   for (let i = 0; i < raw.length; i += 1) {
     const item = raw[i];
     if (!isPlainObject(item)) return routeProfileError("invalid_input", `assignments[${i}] 必须是对象`);
@@ -368,9 +369,18 @@ function parseAssignments(raw: unknown): { ok: true; rows: AssignmentInput[] } |
     if (item.active !== undefined && typeof item.active !== "boolean") {
       return routeProfileError("invalid_input", `assignments[${i}].active 必须是布尔值`);
     }
+    const targetId = item.target_id as number;
+    const key = `${targetType}:${targetId}`;
+    if (seen.has(key)) {
+      return routeProfileError(
+        "invalid_input",
+        `assignments[${i}] 与前面的 ${targetType}:${targetId} 重复`,
+      );
+    }
+    seen.add(key);
     rows.push({
       target_type: targetType,
-      target_id: item.target_id as number,
+      target_id: targetId,
       active: item.active === undefined ? true : (item.active as boolean),
     });
   }
@@ -389,7 +399,7 @@ function normalizeDescription(raw: unknown): string | null | undefined {
   if (raw === null) return null;
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
-  return trimmed === "" ? null : trimmed.slice(0, 500);
+  return trimmed === "" ? null : trimmed;
 }
 
 /* ================================================================== */
@@ -621,6 +631,13 @@ export async function createRouteProfile(
   if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
     return fail(routeProfileError("invalid_input", "enabled 必须是布尔值"));
   }
+  if (
+    input.description !== undefined &&
+    input.description !== null &&
+    (typeof input.description !== "string" || input.description.trim().length > 500)
+  ) {
+    return fail(routeProfileError("invalid_input", "description 必须是最多 500 个字符的字符串或 null"));
+  }
 
   const parsedTemplate = parseRouteProfileTemplate(input.template);
   if (!parsedTemplate.ok) {
@@ -746,6 +763,13 @@ export async function patchRouteProfile(
   }
   if (patch.enabled !== undefined && typeof patch.enabled !== "boolean") {
     return fail(routeProfileError("invalid_input", "enabled 必须是布尔值"));
+  }
+  if (
+    patch.description !== undefined &&
+    patch.description !== null &&
+    (typeof patch.description !== "string" || patch.description.trim().length > 500)
+  ) {
+    return fail(routeProfileError("invalid_input", "description 必须是最多 500 个字符的字符串或 null"));
   }
   const description = normalizeDescription(patch.description);
   const assignments = parseAssignments(patch.assignments);
