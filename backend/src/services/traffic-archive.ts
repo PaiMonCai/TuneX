@@ -37,6 +37,7 @@
  * 且归属明确的记录；解析不到归属的一律丢弃并计数（见 {@link flushTrafficBuffer}）。
  */
 import type { Prisma } from "@prisma/client";
+import { billingPeriodKey } from "./billing-time.ts";
 import {
   trafficBufferPrefix,
   trafficBufferKey,
@@ -378,16 +379,11 @@ export { trafficBufferPrefix, trafficBufferKey, parseBufferKey as parseTrafficBu
 /* ================================================================== */
 
 /**
- * 本地计量日界键 `YYYY-MM-DD`（与 tunnel_traffic.date 的日界口径一致）。
- *
- * 用本地分量拼字符串，**不能** `toISOString().slice(0,10)`：
- * UTC+8 下本地午夜 = 前一天 16:00Z，那会把日界整体回退一天。
+ * Canonical billing-day key. It must not depend on the worker/container TZ:
+ * billing windows, archived labels and quota accounting all use Asia/Shanghai.
  */
 export function trafficDayKey(now: Date = new Date()): string {
-  const d = new Date(now.getTime());
-  d.setHours(0, 0, 0, 0);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return billingPeriodKey(now, "day");
 }
 
 /** 一条 agent 上报的隧道流量增量。 */
