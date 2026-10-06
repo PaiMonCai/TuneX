@@ -771,7 +771,7 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 
 | # | 条件 | R5-A 当时 | 现在的事实（证据） | 现在的判定 | 仍缺什么（诚实列出） |
 |---|---|---|---|---|---|
-| **1** | 新用户可快速部署 | 基本达成 | **演练实测：照文档走不通**（`task-31`）——在"第一台 Agent online"之前就有两个未记载的阻断点：① 发布镜像要求 `LICENSE_SECRET` 而示例/文档都没有 ⇒ `db-migrate` exit 1、`up -d` 直接失败；② 按 `$(git rev-parse HEAD)` 钉镜像 ⇒ `manifest unknown`（静默回退 `:latest` 未记载且与源码不匹配）。另 8 条文档缺陷（README 与生产文档分叉、硬编码容器/卷/网络名导致无法隔离、CSRF 方法不对称、占位值不在启动期 fail-closed 等） | **未达成（今天）** | 修文档/环境模板（`task-34`）+ 修种子与 license 的产品缺陷（`task-35`）+ 用**本地构建镜像**重跑到 online；公网 TLS/反代路径仍无环境验证 |
+| **1** | 新用户可快速部署 | 基本达成 | **两轮演练**：第一轮（`task-31`）照文档走不通（缺 `LICENSE_SECRET` ⇒ `up -d` 失败；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；**第二轮（`task-34`，修复 + 本地构建镜像）文档路径已通**——`db-migrate Exited(0)`、迁移/种子/管理员凭据（`.admin-credentials`）/8 个 cron/建带区间组 201 + provision 201 全绿，`up -d` **172s**、到"节点已创建 + 命令已生成"约 **8 分钟**；并证明第一轮两个阻断点**只在发布镜像侧**成立（本地构建下 `SEED_DEMO_DATA=false` 被正确尊重：`demo plans/nodes skipped`、计数 0/0/0） | **基本达成（文档路径已通）** | ① **`Agent enroll → online` 仍未验证**（第二轮是我方执行错误：裸 `-e` 而非安装器写的 env 文件、正则用了 `--token` 而真机是 `--enroll-token`）⇒ 已授权重跑；② **新发现文档缺口**：`SITE_URL` 只绑 `127.0.0.1` 时一键命令的 `--panel` 地址**节点侧不可达** ⇒ 已授权补写前置条件；③ 公网 TLS/反代、备份/恢复/回滚、云主机资源限额未验证；④ 占位值不在启动期 fail-closed、CSRF 方法不对称待处置 |
 | **2** | 可从 Web 指引完成第一台 Node | 达成 | 浏览器端到端：闩锁 → 真 Agent → **5s 内 online** → CTA `/forwards?ingress_node_id=`；round 33 门禁重跑仍绿 | **达成** | — |
 | **3** | 直观创建 Direct/Relay/Multi-hop | 基本达成（多跳在途） | Direct/Relay 早已交付；**多跳已接线**（`forward-multihop-model/select` + `middle_node_id` 入请求 + 两段绑定前置 + 预览改「四步三段」）；**真实三跳未跑通**（scratch 4 台节点无一 `role=both`） | **基本达成** | 真实三跳创建 + 真机 topology 两段 + `apply_transit` 端到端（需临时改一台节点角色） |
 | **4** | Forward 状态与链路清晰可见 | 基本达成 | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 浏览器验收 43/41 个相关 testid、禁用词零命中 | **达成** | 带宽/吞吐时间序列（后端无该数据源） |
@@ -824,6 +824,46 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 **它给出的最短路径 → 已派**：① `task-36`（通知端到端真实投递：成功 + 失败 + 保存≠投递，含假 SMTP 收信证据，"会发 220 问候语"）；② `task-26`（让默认部署能给出"落后/无法判定"）；③（可选）LG 补方法。
 
 **闭环一条悬疑**：评审注意到 `deliveries/5` 曾在 03:16 返回 200 而现在整表 0 行、"原因未查明"——**原因是 `notify-center` 做 task-13 真机验证时临时插入 3 行、验完即删**（零残留）。评审当时**没有把它当证据**，这个判断是对的。评审的完整性另有一条自我约束：真机跑的是 `n4-0314` 镜像 ≠ HEAD，它明说"真机 HTTP 只作某次构建行为读"（反例：该镜像仍列出 `SMTP_*`，而 HEAD 已 400 拒写）。
+
+## 3.37 Round 44：部署路径第二轮演练（文档已通）+ 两处新发现
+
+### `task-34`：修复 + 用**本地构建镜像**重跑（把"发布镜像陈旧"与"文档错误"分开）
+**Changed（逐处有理由）**：`.env.production.example` 补 `LICENSE_SECRET`（+ 用途与生成方式）；`production-deploy.md` §2.2 补该键与第二条 `openssl rand`；§2.3 把"钉 `$(git rev-parse HEAD)`"改成**可执行**做法（`docker manifest inspect` 先校验，未发布时**明确报错并给两条出路**，不再静默回退 `:latest`）；§1.1 按 Lead 的**实测精度**重写污染风险（**开发栈**硬编码卷名 ⇒ 不共机；**生产栈**卷项目内隔离；两套都硬编码 `container_name` ⇒ 只有辨识/误删风险）；§2.5 追加"迁移与管理员账号从哪来"与"第一台真实节点怎么才算成功"；`README` 快速部署段先让用户**选路径**并写明"启动时自动发生的三件事"（迁移/管理员/worker cron）。
+
+**第二轮结果**：`up -d` **不再失败**（`db-migrate Exited(0)`）、迁移全部应用、种子 `super_admin created=true` 且 **`demo plans/nodes skipped (SEED_DEMO_DATA=false)`**（计数 `nodeGroup:0,node:0,plan:0`）、`.admin-credentials` 落部署根、worker 注册 **8 个** cron（含 `cron_notification_facts`）、建带区间组 201 → provision **201**（返回 `port_range 30000-30099` + 一键命令）。
+**耗时**：`up -d` **172s**；到"节点已创建 + 命令已生成"≈ **8 分钟**（对比 30 分钟口径：**文档路径本身已通**）。
+⇒ **结论：task-31 的两个阻断点属于"发布镜像陈旧"，不是文档/模板错误**（本地构建下 `SEED_DEMO_DATA` 被正确尊重）。
+
+### 未达成项与两处新发现（如实）
+- **`Agent enroll → online` 未达成，归因于执行方**：`web-ddns` 用裸 `docker run -e TUNEX_*` 而非安装器写的 env 文件 ⇒ agent 报 `missing readable env file: /run/tunex-agent/agent.env`；且它提取 token 的正则用了 `--token`（真机是 `--enroll-token`）。它**主动要求不要把这条记成产品缺陷**。已授权它重跑（用安装器 env 文件 + 真机参数名 + 节点可达的 panel 地址）。
+- **新文档缺陷（真实）**：`SITE_URL` 只绑 `127.0.0.1:13001-13003` 时，生成的一键命令 `--panel 'http://127.0.0.1:13003'` **节点侧不可达**。已授权补写前置条件。
+- **待处置余项**：占位值不在启动期 fail-closed（`SMTP_HOST=replace-with-…` 也能启动）→ 拟并入 `task-35`；CSRF 方法不对称 → 已授权判断是"文档注意"还是"产品不一致"。
+
+## 3.38 Round 45：**口径变更——用户授权直接复用 ForwardX 代码**（AGPL-3.0-only，知情接受）
+
+**决定**：用户直接指令"直接借用 forwardx 的逻辑和相关的代码，加快开发速度"，并在 Lead 明确告知后果后选择"**直接复制代码，我接受 AGPL-3.0 后果**"；对"最想加速的目标"回答"**全部**"。
+
+**Lead 已履行的告知**（在动手前）：ForwardX 是 **AGPL-3.0-only**；复制其代码会使**被复制部分（乃至整体）受 AGPL 约束**；若 TuneX 作为**网络服务**对外提供，AGPL 要求向使用者提供**完整对应源代码**；事后剥离成本高；且两栈不同（Node/Express/React vs Bun/Hono/Prisma/Next/Go）。用户知情后仍选择该口径。
+
+**由此变更的约束**：`productization-harvest.md` 与各 recon 文档原写"ForwardX 仅作行为参考、clean-room、禁止复制代码或文案"——**自本决定起按用户授权放开**。
+
+**仍然有效的纪律**（不是许可问题，是工程纪律，已写进台账 `docs/agent/forwardx-code-reuse.md`）：
+1. **参考目录仍不得进入 git**（只把移植后的代码提交进源码树）；
+2. **每一处复用必须登记**（TuneX 文件 → ForwardX 源文件 → 复用范围 → 许可），台账由 Lead 维护；
+3. **每个含来源的文件头部必须带来源与许可标注**（格式见台账 §2）；
+4. **不得声称自研**，也不得遗漏 AGPL 许可信息；
+5. **复用代码仍须通过全部门禁**（tsc / 单测 / 真机证据 / 三态与措辞纪律）——"照搬"不是"免检"；
+6. **不得搬它的"第二份真相"**（进程内 Map 记状态、配置表存 lastSent 之类）：只借产品逻辑，不借状态管理；
+7. 必须接入我们的**权限与 workspace 作用域**（它没有 tenant 概念）；失败/降级仍须可见（不得因为它只 `console.warn` 就丢掉我们的账本与退避呈现）；凭据治理照旧。
+
+**派发的三个照搬切片（目标"全部"）**：
+| 任务 | 内容 | owner |
+|---|---|---|
+| `task-38` | ① 多入口/转发组（ForwardX `ForwardGroups` → TuneX，含优先级/策略/恢复后切回） | `ha-ui` |
+| `task-39` | ② 带宽/吞吐时间序列（ForwardX 流量面 → TuneX 用户域，**优先复用现有账本**） | `web-forward` |
+| `task-40` | ③ Looking Glass 方法集扩展（1 → 与 ForwardX 同量级；面板侧照搬、Agent 侧 Go 镜像） | `backend-truth` |
+
+**与退出条件的关系**：R6 终局评审把"多入口分组/带宽面/LG 方法集"记为"刻意不做"或"方法集落后"——**自本决定起改为"按用户决定照搬补齐"**。⇒ **`#10` 必须在这三个切片落地后重评**，且重评时应注明"其中若干能力来自 AGPL 代码移植"，避免把"照搬来的对齐"当成"自研达到的水平"。
 
 ## 4. Capability Map
 
