@@ -51,6 +51,7 @@ export function NodeWorkspace() {
   const [selectedIngressId, setSelectedIngressId] = useState<number | null>(null);
   const [bindings, setBindings] = useState<NodeBinding[]>([]);
   const [loading, setLoading] = useState(true);
+  const [groupsLoadFailed, setGroupsLoadFailed] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [nodeId, setNodeId] = useState("");
   const [groupId, setGroupId] = useState("");
@@ -80,13 +81,16 @@ export function NodeWorkspace() {
   async function loadNodes() {
     const ticket = ++nodeSeq.current;
     const scope = currentId;
-    setNodes([]); setGroups([]);
+    setNodes([]); setGroups([]); setGroupsLoadFailed(false);
     if (!canRead) { setLoading(false); return; }
     setLoading(true);
     try {
       const [nodeRows, groupRows] = await Promise.all([
         api.nodes.list(),
-        canManage ? api.nodeGroups.list({ page: 1, page_size: 100 }).catch(() => ({ data: [] })) : Promise.resolve({ data: [] }),
+        canManage ? api.nodeGroups.list({ page: 1, page_size: 100 }).catch(() => {
+          setGroupsLoadFailed(true);
+          return { data: [] };
+        }) : Promise.resolve({ data: [] }),
       ]);
       if (ticket !== nodeSeq.current || scope !== getActiveWorkspace()) return;
       setNodes(nodeRows);
@@ -97,7 +101,7 @@ export function NodeWorkspace() {
         return ingressRows[0] ? Number(ingressRows[0].id) : null;
       });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("common.noData"));
+      toast.error(err instanceof Error ? err.message : t("node.loadFailed"));
     } finally {
       if (ticket === nodeSeq.current) setLoading(false);
     }
@@ -115,7 +119,7 @@ export function NodeWorkspace() {
       const rows = await api.nodes.bindings(id);
       if (ticket === bindingSeq.current && scope === getActiveWorkspace()) setBindings(rows);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("common.noData"));
+      toast.error(err instanceof Error ? err.message : t("node.bindingsLoadFailed"));
     }
   }
 
@@ -152,7 +156,7 @@ export function NodeWorkspace() {
     if (!canManage) { toast.error(PERMISSION_DENIED); return; }
     const gid = Number(groupId);
     if (!nodeId.trim() || !Number.isInteger(gid)) {
-      toast.error("请填写节点 ID 并选择节点组");
+      toast.error(t("node.createRequired"));
       return;
     }
     setBusy(true);
@@ -168,7 +172,7 @@ export function NodeWorkspace() {
       toast.success(t("node.createSuccess"));
       await loadNodes();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "创建节点失败");
+      toast.error(err instanceof Error ? err.message : t("node.createFailed"));
     } finally {
       setBusy(false);
     }
@@ -180,7 +184,7 @@ export function NodeWorkspace() {
     try {
       setInstall(await api.nodes.enrollment(node.id));
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "生成安装命令失败");
+      toast.error(err instanceof Error ? err.message : t("node.installerFailed"));
     } finally {
       setBusy(false);
     }
@@ -193,7 +197,7 @@ export function NodeWorkspace() {
       await navigator.clipboard.writeText(install.install_command);
       toast.success(t("node.copySuccess"));
     } catch {
-      toast.error("复制失败，请手动复制");
+      toast.error(t("node.copyFailed"));
     }
   }
 
@@ -208,7 +212,7 @@ export function NodeWorkspace() {
       toast.success(t("node.bindSuccess"));
       await loadBindings(selectedIngressId);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "绑定出口失败");
+      toast.error(err instanceof Error ? err.message : t("node.bindFailed"));
     } finally {
       setBusy(false);
     }
@@ -223,7 +227,7 @@ export function NodeWorkspace() {
       toast.success(t("node.unbindSuccess"));
       await loadBindings(selectedIngressId);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "解除绑定失败");
+      toast.error(err instanceof Error ? err.message : t("node.unbindFailed"));
     } finally {
       setBusy(false);
     }
@@ -244,7 +248,7 @@ export function NodeWorkspace() {
               {t("common.forwards")}
             </Link>
           </Button>
-          <Button disabled={!canManage} onClick={() => setCreateOpen(true)}>
+          <Button disabled={!canManage || groupsLoadFailed} onClick={() => setCreateOpen(true)}>
             <Plus className="size-4" />
             {t("node.create")}
           </Button>
