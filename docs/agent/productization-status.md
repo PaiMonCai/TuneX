@@ -572,6 +572,39 @@ web 干净检出 `build` 未跑；web/后端**测试刻意未跑**（工作树�
 ### F. 它对"刻意不同"的复核结论（要点）
 全部仍成立，但**两条需要补充**：① "不做 per-forward 通知开关"成立，**但**在"6 类里只有 `announcement` 真会投递"时，"等价可用"的呈现风险仍在（这是 #6 未达成的根因之一，不能只靠"刻意不同"解释）；② "不做远程自升级波次"成立，**但**不能因此接受"升级 UX 不可用"——当前是**卡片没挂、端点没提交**（缺口），不是取舍。
 
+## 3.25 R5-B 缺陷检修结论（钉在 SHA 上）+ Lead 处置
+
+审查方法：结论**全部钉在 SHA**（审计期间 HEAD 被并发推进 5 次），复核一律在 `git archive HEAD` 的**干净检出**上跑；报告把"已复核通过/在途未评/未验证"分列（含唯一一条未执行的静态路径追踪，已标注）。
+
+### 已处置
+| 编号 | 缺陷 | 处置 |
+|---|---|---|
+| **P0-1** | **HEAD 后端不可构建**：`node-upgrade.test.ts:499` 多一个 `}` 提前闭合 describe（干净检出 backend tsc 4 错、bun test 1 error）。**由我自己的 `bb44309` 引入** | 已修（`6b1625e`），并用审查者原命令在干净检出自证双端 tsc = 0 |
+| **P0-2** | 同源半提交家族（`forward-latency.tsx` 从未被提交、`bindingsUnavailable` 消费者半边未提交）⇒ `147a0cf` 与 §3.12 的"tsc 0 错/build 成功"都是**脏工作树产物**，不可外推 | 已由 R5-A 的 `5ac794d` + 我的整体落地修复；**门禁纪律升级**：提交前必须在干净检出上跑、禁止半提交、粒度以自洽为准 |
+| **P2-6** | 「绑定事实取不到 ≠ 没有可用出口」在**整张节点表取不到**这条路径上仍失守（`setBindingsUnavailable` 不执行而 `setReferenceLoaded(true)` 照执行） | 已修（`6b1625e`）：catch 里一并置位 |
+| **P3-7/P3-8** | 4 个 i18n 裸键；`GET /api/admin/node` 下发 `node_credential_hash` | **均非本专项引入**（`origin/main` 同款）⇒ 记入收尾清单，不占用当前关键路径 |
+
+### 已派发（`task-27`，交 `web-forward` —— 它自己查出来的，修起来最准）
+- **P1-3**：mock `GET /admin/node/:id/state` 的"有上报"分支返回**落库行**而非 `NodeStateView`（缺 10 键/多 10 键，真机恰好 19 键）；已交付的契约测试只断言两形状的**公共子集**，测不出 ⇒ 改成两个分支都断言完整键集。
+- **P2-4**：`node-runtime-panel.tsx` 把面板侧 `role` 渲染在「Agent 自报角色」标签下（真机 `role="ingress"` vs `reported_role="INGRESS"`）⇒ **生产错、mock 掩盖**；并把后端特意给出却无人消费的 `role_mismatch`/`stale`/`age_seconds` 显式展示（`stale` 不得渲染成"离线/异常"）。
+- **P2-5**：mock provision **无额度门控**（真机 403 `node_limit`，mock 在 `max_nodes=1/used=7` 下连发 5 次 201）⇒ 按真机同序补 `checkNodeCreation` + parity 测试 + 补进本文档的分叉表。
+
+### 它"已复核通过"的项（可计入验收）
+干净检出 web tsc 0 错 / web tests 1151 pass 0 fail；`/admin/node/:id/detail` 与 `projectNodeDetail` 一致；`pools` 两层信封一致；**capabilities 投影吃真实载荷正确且不泄 `policy`/`ceiling`/`whitelist_ips`**；DDNS 状态集合与客户端逐字一致；新 `notification-channels` 端点 GET 无凭据材料、webhook 显式拒 `secret`、读不到返 503；**zh/en 叶子键集完全相等**；web 侧无 localStorage、凭据不进 URL；`NodeInstallPoller` 语义与注释一致。
+
+## 3.26 Round 30–31：四切片落地、三卡片挂载、门禁快照
+
+**`7d669f5` 集成了四个切片**（每片都有队友真实证据）：高可用（task-16）/ 升级用户流程（task-17）/ Looking Glass 诊断（task-25）/ jq 真解析 + F2 审计（task-21、22）。
+
+**Lead 集成动作**：
+1. **三块卡片挂载**：`ForwardHaCard` 进 Forward 详情（四块卡片同屏）；`NodeUpgradeCard` 与 `LookingGlassPanel` 进节点页诊断区。
+2. **退役旧内联升级块**（`node-diagnostics.tsx`）：它不是"重复"，而是**缺三件事实**——把管理配置字段 `node.version` 当版本依据（真机 9 台全 `unknown`）、没有服务端前置（用户先撞 409 才明白要切维护）、生成脚本后**没有执行后可见性**。退役同时清掉它的死代码（`buildUpgrade`/`requestUpgrade`/5 个状态）并把一条 a11y 断言改指新卡片（保持"英文界面不得出现写死中文"这条回归）。
+3. **共享注册表接线**：HA 的 `handleForwardHaMock` 接入（`handleForwardsMock` 之前）；looking-glass 因 `web-ddns` 已自接而**去重**。可达性实测：`handleMock` 对 `forwards/1/ha`、`looking-glass/status`、`announcements/preferences` **均 200**（不再落进 `handleForwardsMock` 的 404）。
+
+**门禁快照（第 31 轮，非门禁——指纹在运行期间变化）**：后端 **2897 pass / 0 fail**；web 有 2 条失败 + tsc 报错，**全部来自 `task-27` 的中途态**（`node-runtime-panel.tsx`），等其落地后重跑。
+
+**已交付但尚未挂载/验证的点（如实）**：`enabled:true` 的 Looking Glass 真机路径未验证（scratch 开关关闭，需改验收环境）；真实三跳创建未跑通（scratch 无 `role=both` 节点）；升级完整流程未在真实节点执行（刻意不升级那 4 台）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
