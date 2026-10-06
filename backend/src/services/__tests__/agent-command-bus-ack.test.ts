@@ -98,6 +98,18 @@ describe("WP11B ACK binding", () => {
     expect(JSON.parse(raw!).applied_revision).toBe(5);
   });
 
+  test("hop_local_addr survives ACK storage and delivery", async () => {
+    await pendingFor(harness.store, "cmd-hop", 5);
+    await storeAgentCommandAck(
+      SCOPE,
+      NODE,
+      { command_id: "cmd-hop", ok: true, applied_revision: 5, hop_local_addr: "172.31.20.10:53121" },
+      harness.store,
+    );
+    const ack = await waitAgentCommandAck(SCOPE, NODE, "cmd-hop", 1_000, harness.store);
+    expect(ack.hop_local_addr).toBe("172.31.20.10:53121");
+  });
+
   test("an applied revision ahead of the issued revision is refused", async () => {
     await pendingFor(harness.store, "cmd-3", 4);
     await expect(
