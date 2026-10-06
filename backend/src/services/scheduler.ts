@@ -40,6 +40,47 @@
  * 镜像——撤的时候也必须先撤出口，否则入口还在往一个已经拆掉的出口灌流量。
  */
 
+/* 依赖（全部可注入）                                                  */
+/* ================================================================== */
+
+import { db } from "../db.ts";
+import { decideNodeAuth } from "./node-credential.ts";
+import { acquirePort, releaseLease } from "./portPool.ts";
+import type { AcquirePortOutcome } from "./portPool.ts";
+import {
+  countWorkspaceTunnels,
+  getEffectivePolicy,
+  sumWorkspaceTraffic,
+} from "./policy-service.ts";
+import { checkTunnelCreation } from "./capability-policy.ts";
+import { canUseNodeGroup } from "./node-group-access.ts";
+import { Orchestrator, type DispatchFailure, type EgressDispatchOutcome, type RelayDispatchOutcome } from "./orchestrator.ts";
+import type { ControlValidator } from "./control-protocol/index.ts";
+import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
+import type { RuntimeUseDenied } from "./forward-capability.ts";
+import {
+  DEFAULT_FORWARD_PROTOCOL,
+  admitPersistedProtocol,
+  buildForwardRuntimePlan,
+  addressPartOfEndpoint,
+  datagramHopPeerFor,
+  firstConnectIp,
+  forwardRuntimePlanViolations,
+  normalizeForwardProtocol,
+  persistedForwardProtocol,
+  type ForwardRuntimePlan,
+  type ForwardProtocol,
+} from "./forward-contract.ts";
+import { admitRuntimeFromStore, admissionFailureDetail, type AdmissionTarget, type CapabilityFactsLoader, type RuntimeAdmissionDenied } from "./runtime-admission.ts";
+import { normalizeFederatedEgressPeer } from "./forward-revision.ts";
+import {
+  checkFederatedEgressTopology,
+  delegateFederatedEgress,
+  releaseFederatedEgress,
+  releaseStaleFederatedEgressForTunnel,
+  type ForwardHopSender,
+} from "./federation/forward-hop.ts";
+
 /* Scheduler contract and support primitives are split from orchestration flows. */
 import { APPLY_STATUS, DESIRED_STATUS, SCHEDULER_ERROR_CODES, isRetryable } from "./scheduler-contract.ts";
 import type { SchedulerErrorCode, SchedulerStep, StepRecord, CreateRelayTunnelInput, CreateRelayFailure, CreateRelayTunnelResult } from "./scheduler-contract.ts";
