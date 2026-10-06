@@ -749,6 +749,49 @@ describe("G. 释放：移除声明 / 改回本机出口 / 删除 Forward 共用�
     expect(calls.map((c) => c.path)).toEqual(["/api/federation/v1/leases/lease-9"]);
   });
 
+  it("G7. placement DB 读取失败不得伪装成“没有远端资源”成功", async () => {
+    const made = fakeDb();
+    made.db.federationPlacement.findMany = async () => {
+      throw new Error("placement db unavailable");
+    };
+    const { sender, calls } = fakeSender(() => OK);
+
+    const released = await releaseFederatedEgress(
+      { tunnelId: 42, revision: 5 },
+      deps(made.db, sender),
+    );
+
+    expect(released.ok).toBe(false);
+    expect(released.released).toBe(false);
+    expect(released.code).toBe("internal_error");
+    expect(released.message).toContain("placement db unavailable");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("G8. 远端已释放但本地 expired 记账失败时返回部分成功，而不是假装完全收敛", async () => {
+    const made = fakeDb();
+    made.db.federationPlacement.findUnique = async () => {
+      throw new Error("mirror write pre-read failed");
+    };
+    const { sender, calls } = fakeSender(() => OK);
+
+    const released = await releaseFederatedEgress(
+      {
+        tunnelId: 42,
+        revision: 5,
+        peer_panel_id: "peer-b",
+        lease_ref: "lease-9",
+      },
+      deps(made.db, sender),
+    );
+
+    expect(calls.map((c) => c.path)).toEqual(["/api/federation/v1/leases/lease-9"]);
+    expect(released.ok).toBe(false);
+    expect(released.released).toBe(true);
+    expect(released.code).toBe("internal_error");
+    expect(released.message).toContain("本地镜像记账失败");
+  });
+
   it("G6. 行在但从未建成远端腿（reserve 就失败）⇒ 释放不得把 degraded 抹成 expired", async () => {
     // 这条守的是"可解释性"：reserve 失败留下的 degraded(unreachable) 是下一步动作的
     // 依据（等对账/等网络恢复）；把它写成 expired 会让它看起来像"这件事已经结束"。
