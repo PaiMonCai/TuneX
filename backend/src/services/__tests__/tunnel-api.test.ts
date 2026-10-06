@@ -268,6 +268,11 @@ function makeDb(): TunnelApiDb {
         return { _sum: { traffic: archivedTraffic } };
       },
     },
+    tunnelChain: {
+      async deleteMany() {
+        return { count: 0 };
+      },
+    },
     node: {
       async findUnique({ where }: { where: Record<string, unknown> }) {
         if (where.id !== undefined) return nodes.find((n) => n.id === where.id) ?? null;
@@ -373,6 +378,7 @@ function deps(over: TunnelApiDeps = {}): TunnelApiDeps {
     loadPolicy,
     quotaLock,
     runtimeUse: async () => null,
+    releasePortLeases: async () => true,
     orchestrator: fakeOrchestrator as never,
     applyDirect: successDirect(),
     now: () => new Date("2026-09-25T12:00:00.000Z"),
@@ -1041,6 +1047,61 @@ describe("C. 运行操作统一走 orchestrator", () => {
     expect(tunnels.has(2051)).toBe(true);
     // Egress failed, but ingress teardown was still attempted to reduce orphaned runtime surface.
     expect(orchestratorCalls.filter((c) => c.kind === "remove")).toHaveLength(2);
+  });
+
+  test("C6c. delete：runtime 已撤但端口 lease 释放写库失败 ⇒ 保留 Tunnel，不能制造 active 孤儿 lease", async () => {
+    seedTunnel({ id: 2052, config_revision: 7, egress_node_id: 2, in_node_group_id: 10 });
+
+    const r = await runTunnelAction(
+      2052,
+      "delete",
+      7,
+      deps({
+        releasePortLeases: async () => {
+          throw new Error("lease db unavailable");
+        },
+      }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("db_unavailable");
+    expect(r.message).toContain("端口租约释放失败");
+    expect(r.message).toContain("lease db unavailable");
+    expect(tunnels.has(2052)).toBe(true);
+    expect(orchestratorCalls.filter((c) => c.kind === "remove").map((c) => c.direction))
+      .toEqual(["ingress", "egress"]);
+  });
+
+  test("C6d. delete：runtime/lease 都收口后，子表清理 DB 失败也不得回成功或删 Tunnel", async () => {
+    const t = seedTunnel({ id: 2053, config_revision: 7, egress_node_id: 2, in_node_group_id: 10 });
+    const fakeDb = makeDb();
+    fakeDb.tunnelChain = {
+      async deleteMany() {
+        throw new Error("chain db unavailable");
+      },
+    };
+    let releases = 0;
+
+    const r = await runTunnelAction(
+      t.id,
+      "delete",
+      7,
+      deps({
+        db: fakeDb,
+        releasePortLeases: async () => {
+          releases++;
+          return true;
+        },
+      }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("db_unavailable");
+    expect(r.message).toContain("删除 Tunnel 账本失败");
+    expect(releases).toBe(1);
+    expect(tunnels.has(t.id)).toBe(true);
   });
 
   test("C7. delete：编排器不可用时 fail-closed，保留行避免孤儿 runtime", async () => {
