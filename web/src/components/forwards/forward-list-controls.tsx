@@ -9,7 +9,9 @@ import {
   type ForwardSortOrder,
 } from "@/components/forwards/forward-list-model";
 
+import type { ForwardListTextKey } from "@/components/forwards/forward-list-model";
 type Translate = (key: string, params?: Record<string, string | number>) => string;
+type ListText = (key: ForwardListTextKey, params?: Record<string, string | number>) => string;
 
 export function ForwardListControls({
   loading,
@@ -34,7 +36,7 @@ export function ForwardListControls({
   sort: ForwardSortKey;
   order: ForwardSortOrder;
   t: Translate;
-  text: Translate;
+  text: ListText;
   onPageChange: (page: number) => void;
   onPageSizeChange: (size: number) => void;
   onSortChange: (sort: ForwardSortKey) => void;
