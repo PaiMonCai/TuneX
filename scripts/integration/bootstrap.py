@@ -16,25 +16,52 @@ from typing import Any
 
 ERR = "[integration] "
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIX = os.path.join(HERE, "fixtures")
 API = os.environ["API"]
 STATE = os.environ["STATE"]
 PHASE = os.environ.get("TUNEX_IT_BOOTSTRAP_PHASE", "provision").strip().lower()
 USER_EMAIL = os.environ.get("TUNEX_IT_USER_EMAIL", "tunex-it-e2e@tunex.local")
 USER_PASSWORD = os.environ["TUNEX_IT_USER_PASSWORD"]
 
-
-def _load(name):
-    with open(os.path.join(FIX, name), encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-WORKSPACE_FIX = _load("workspaces.json")
-TUNNEL_FIX = _load("tunnels.json")
-FORWARD_FIX = _load("forward-edit.json")
-WORKSPACES = {w["key"]: w for w in WORKSPACE_FIX["workspaces"]}
-GROUP_SPECS = {g["key"]: g for g in TUNNEL_FIX["node_groups"]}
-TUNNEL_SPECS = {t["key"]: t for t in TUNNEL_FIX["tunnels"]}
+# The integration topology is code, not an external fixture pack. Keeping the
+# small deterministic specification beside the bootstrap prevents clean CI
+# checkouts from depending on untracked local JSON files.
+WORKSPACES = {
+    "primary": {"name": "Integration Primary"},
+}
+GROUP_SPECS = {
+    "ingress": {
+        "name": "Integration Ingress A", "workspace": "primary", "node_type": "in",
+        "port_range": "21000-21999", "node_id": "Integration-IN-A-NODE", "connect_ip": "172.31.10.20",
+    },
+    "egress": {
+        "name": "Integration Egress A", "workspace": "primary", "node_type": "out",
+        "port_range": "22000-22999", "node_id": "Integration-OUT-A-NODE", "connect_ip": "172.31.20.20",
+    },
+    "ingress-secondary": {
+        "name": "Integration Ingress B", "workspace": "primary", "node_type": "in",
+        "port_range": "23000-23999", "node_id": "Integration-IN-C-NODE", "connect_ip": "172.31.10.21",
+    },
+    "egress-secondary": {
+        "name": "Integration Egress B", "workspace": "primary", "node_type": "out",
+        "port_range": "24000-24999", "node_id": "Integration-OUT-B-NODE", "connect_ip": "172.31.20.21",
+    },
+}
+TUNNEL_SPECS = {
+    "direct": {
+        "name": "Integration DIRECT", "listen_port": 21100,
+        "forward_addresses": ["target-a:3030"],
+    },
+    "relay": {
+        "name": "Integration RELAY", "listen_port": 21101,
+        "forward_addresses": ["target-b:3030"],
+    },
+}
+BASELINE_FORWARD_SPEC = {
+    "name": "Integration Baseline Forward",
+    "listen_port": 21102,
+    "target_host": "target-a",
+    "target_port": 3030,
+}
 
 
 def req(method, path, body=None, cookie=None, headers=None, timeout=30):
@@ -232,27 +259,24 @@ def _target(spec):
     return host.strip("[]"), int(port)
 
 
-def _v4_target(spec):
+def _baseline_target(spec):
     """baseline Forward fixture 的初始目标（显式 host/port 字段，不用 forward_addresses）。"""
     return str(spec["target_host"]).strip("[]"), int(spec["target_port"])
 
 
-V4_SPEC = FORWARD_FIX["v4_forward"]
-
-
-def create_v4_forward(cookie, workspace_id, ingress_node):
+def create_baseline_forward(cookie, workspace_id, ingress_node):
     """Phase 3: the baseline Forward product object (same runtime row as the tunnel).
 
     It is the entity the baseline scenarios edit through PATCH /api/forwards/:id,
     so it must exist with a real ACKed runtime before any scenario runs.
     """
-    host, port = _v4_target(V4_SPEC)
+    host, port = _baseline_target(BASELINE_FORWARD_SPEC)
     status, body, _ = req(
         "POST",
         "/api/nodes/%d/forwards" % ingress_node["id"],
         {
-            "name": V4_SPEC["name"],
-            "listen_port": V4_SPEC["listen_port"],
+            "name": BASELINE_FORWARD_SPEC["name"],
+            "listen_port": BASELINE_FORWARD_SPEC["listen_port"],
             "target_host": host,
             "target_port": port,
         },
@@ -266,7 +290,7 @@ def create_v4_forward(cookie, workspace_id, ingress_node):
     assert forward.get("mode") == "direct", f"{ERR}baseline mode mismatch: {forward}"
     assert forward.get("apply_status") == "active", f"{ERR}baseline not active: {forward}"
     assert forward.get("ingress_node_id") == ingress_node["id"], f"{ERR}baseline ingress mismatch"
-    assert forward.get("listen_port") == V4_SPEC["listen_port"], f"{ERR}baseline listen_port mismatch: {forward}"
+    assert forward.get("listen_port") == BASELINE_FORWARD_SPEC["listen_port"], f"{ERR}baseline listen_port mismatch: {forward}"
     assert forward.get("target_host") == host, f"{ERR}baseline target_host mismatch: {forward}"
     assert forward.get("target_port") == port, f"{ERR}baseline target_port mismatch: {forward}"
     return forward
@@ -431,7 +455,7 @@ elif PHASE == "forward":
         state = json.load(fh)
     cookie = login()
     primary = state["workspaces"]["primary"]["id"]
-    forward = create_v4_forward(
+    forward = create_baseline_forward(
         cookie,
         primary,
         state["nodes"]["ingress"],
