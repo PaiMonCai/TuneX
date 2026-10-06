@@ -1,7 +1,6 @@
 import { AppShell } from "@/components/app-shell";
 import { Suspense } from "react";
 import { PlansBody } from "@/components/plans/plans-body";
-import { requireSession } from "@/components/app-shell";
 
 export default function PlansPage() {
   return (
