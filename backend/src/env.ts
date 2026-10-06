@@ -2,11 +2,10 @@
  * 环境变量集中读取。
  *
  * Security: secrets have no built-in default. Deployments must supply
- * AUTH_SECRET and LICENSE_SECRET. Missing secrets fail fast instead of
- * silently using a shared value.
+ * AUTH_SECRET. Missing secrets fail fast instead of silently using a shared value.
  *
- * WP15：TUNEX_CONFIG_KEY / TUNEX_LICENSE_KEY 不再读取也不再校验——它们只为
- * legacy agent 的 Fernet config 下发与 license 签名存在，随 Socket.IO 层删除。
+ * Legacy TUNEX_CONFIG_KEY / TUNEX_LICENSE_KEY / LICENSE_SECRET inputs are no longer
+ * runtime dependencies; the old Socket.IO/Fernet/license-signing paths were removed.
  */
 
 function requireSecret(name: string): string {
@@ -75,7 +74,6 @@ export const env = {
 
   licenseType: process.env.LICENSE_TYPE ?? "business",
   licenseExpiredAt: Number(process.env.LICENSE_EXPIRED_AT ?? 0),
-  licenseSecret: requireSecret("LICENSE_SECRET"),
 
   disableWorker: (process.env.DISABLE_WORKER ?? "false") === "true",
   /** Optional billing integration; off by default, independent of RBAC. */
