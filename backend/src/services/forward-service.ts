@@ -144,6 +144,14 @@ export interface ForwardPatchInput {
   expected_revision?: number | null;
 }
 
+export interface ForwardPatchOptions {
+  /**
+   * Internal provenance supplied by Route Profile apply. This is deliberately
+   * not part of the HTTP patch schema: users cannot forge provenance.
+   */
+  routeProfile?: { id: number; version: number } | null;
+}
+
 export type ForwardServiceError = {
   ok: false;
   status: 400 | 403 | 404 | 409 | 502 | 503;
@@ -966,6 +974,7 @@ export async function patchForward(
   workspaceId: number,
   patch: ForwardPatchInput,
   actorId?: number,
+  options: ForwardPatchOptions = {},
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
@@ -989,26 +998,51 @@ export async function patchForward(
     }
   }
 
-  if (metadataOnly) {
-    // §13.3.2：纯 metadata（name）修改不生成 revision、不 bump config_revision、
-    // 不触发任何 runtime 收敛。
-    await db.tunnel.update({
-      where: { id: current.id },
-      data: { name: candidate.name.trim() },
-    });
-    const renamed = await loadForwardRow(id, workspaceId);
-    if (!renamed) return error(404, "not_found", "端口转发不存在");
-    return { ok: true, data: forwardView(renamed) };
-  }
-
-  // expected_revision 闸门：在落库前比对，过期直接 409（§13.3.3）。
-  if (patch.expected_revision !== undefined && patch.expected_revision !== null) {
+  // expected_revision applies to EVERY patch, including metadata-only writes.
+  // Otherwise a stale client can rename/rebind provenance after a newer runtime
+  // revision has already landed simply because this branch does not bump revision.
+  const hasExpectedRevision =
+    patch.expected_revision !== undefined && patch.expected_revision !== null;
+  if (hasExpectedRevision) {
     const latest = Number(current.config_revision ?? 0);
     if (Number(patch.expected_revision) !== latest) {
       return error(409, "revision_conflict", "该转发已被他人修改，请刷新后重新确认", {
         data: { latest_revision: latest },
       });
     }
+  }
+
+  if (metadataOnly) {
+    // §13.3.2：纯 metadata 修改不生成 revision、不触发 runtime 收敛。
+    // When optimistic concurrency or internal provenance is involved, use a CAS
+    // on the exact revision fact we just observed. config_revision may be NULL
+    // on legacy rows, so match the raw value rather than coercing it to zero.
+    const data = {
+      name: candidate.name.trim(),
+      ...(options.routeProfile !== undefined
+        ? {
+            route_profile_id: options.routeProfile?.id ?? null,
+            route_profile_version: options.routeProfile?.version ?? null,
+          }
+        : {}),
+    };
+    if (hasExpectedRevision || options.routeProfile !== undefined) {
+      const updated = await db.tunnel.updateMany({
+        where: { id: current.id, config_revision: current.config_revision },
+        data,
+      });
+      if (updated.count !== 1) {
+        const fresh = await loadForwardRow(id, workspaceId);
+        return error(409, "revision_conflict", "该转发已被他人修改，请刷新后重新确认", {
+          data: { latest_revision: Number(fresh?.config_revision ?? 0) },
+        });
+      }
+    } else {
+      await db.tunnel.update({ where: { id: current.id }, data });
+    }
+    const renamed = await loadForwardRow(id, workspaceId);
+    if (!renamed) return error(404, "not_found", "端口转发不存在");
+    return { ok: true, data: forwardView(renamed) };
   }
 
   // 存量/创建路径自愈：已经有真实 applied runtime 但还没有 snapshot 指针时，
@@ -1046,6 +1080,7 @@ export async function patchForward(
             : null,
           egressPort: resources.egressPort,
           egressPoolId: resources.poolId,
+          routeProfile: options.routeProfile,
         },
         tx,
       );
@@ -1059,6 +1094,12 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
+          ...(options.routeProfile !== undefined
+            ? {
+                route_profile_id: options.routeProfile?.id ?? null,
+                route_profile_version: options.routeProfile?.version ?? null,
+              }
+            : {}),
           // 声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
           // 内写 snapshot 的那一列取值完全相同，来源都是候选）。
           ...(candidate.federated_egress_peer === undefined
