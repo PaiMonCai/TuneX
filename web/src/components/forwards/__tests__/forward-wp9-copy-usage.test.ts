@@ -124,13 +124,13 @@ describe("V4-WP9 复制 Forward — 走真实 create 契约", () => {
   });
 
   test("列表入口的复制复用同一份纯逻辑，并落到真实 create 契约", () => {
-    const workspace = readFileSync(
-      new URL("../forward-workspace.tsx", import.meta.url),
-      "utf8",
-    );
+    const workspace = readFileSync(new URL("../forward-workspace.tsx", import.meta.url), "utf8");
+    const createModel = readFileSync(new URL("../forward-create-model.ts", import.meta.url), "utf8");
+    const table = readFileSync(new URL("../forward-table.tsx", import.meta.url), "utf8");
+    const surface = workspace + createModel + table;
     // 草稿由 forward-copy.ts 构造（与单测同一份规则，不另写一套）
-    expect(workspace).toContain("forward-copy");
-    expect(workspace).toContain("forwardCopyDraft(");
+    expect(surface).toContain("forward-copy");
+    expect(surface).toContain("forwardCopyDraft(");
     // 复制最终走产品 create 端点，没有第二条实现
     expect(workspace).toContain("api.forwards.create(");
   });
