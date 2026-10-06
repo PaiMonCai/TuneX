@@ -215,9 +215,21 @@ describe("WP12 出口池 / 出口目标 CRUD", () => {
     expect((await call("DELETE", `/admin/nodes/${NODE}/pools/999`, {})).status).toBe(404);
   });
 
-  test("state 端点无上报时返回 null（面板显示空态而非报错）", async () => {
-    const res = await call<unknown>("GET", `/admin/nodes/${NODE}/state`);
+  /*
+   * D5 修正：这条用例原来断言「无上报时返回 null（面板显示空态而非报错）」，
+   * 而且打的是**复数** `/admin/nodes/:id/state` —— 那正是「取不到 = 没有」这个
+   * 降级形态的来源，也是 mock 把线上 404 盖住的地方。真实契约是：
+   *   · 路径单数（`backend/src/routes/node-admin.ts` 的 `/node/:id/state`）；
+   *   · 节点存在时一律 200，从未上报 = `reported_at: null` 的空态视图。
+   * 「取不到（404/5xx/形状不认识）」与「没有上报」的分辨见
+   * `node-runtime-state.test.tsx` 与 `node-runtime-state-mock.test.ts`。
+   */
+  test("state 端点走单数路径；无上报是 200 空态视图（不是 null、不是 404）", async () => {
+    const res = await call<{ reported_at: string | null }>("GET", `/admin/node/${NODE}/state`);
     expect(res.status).toBe(200);
-    expect(res.body).toBeNull();
+    expect(res.body).not.toBeNull();
+    expect(res.body.reported_at).toBeNull();
+    // 复数路径在 mock 与真实后端都不存在（旧实现的路径，必然 404）
+    expect((await call("GET", `/admin/nodes/${NODE}/state`)).status).toBe(404);
   });
 });

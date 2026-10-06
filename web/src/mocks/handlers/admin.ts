@@ -340,10 +340,10 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
         }
         // ----- WP12 出口池：/admin/nodes/:id/pools[/:poolId[/targets[/:targetId]]] -----
         if (seg[3] === "pools") return handleEgressPools(db, node, method, seg.slice(4), req);
-        // ----- WP12 运行态：/admin/nodes/:id/state -----
-        if (seg[3] === "state" && method === "GET") {
-          return ok(db.nodeStates.get(node.id) ?? null);
-        }
+        // 注意：**没有** /admin/nodes/:id/state（复数）分支。
+        // 真实后端只有单数 `nodeAdminRoutes.get("/node/:id/state")`；
+        // mock 曾经实现复数路径，于是本地/mock 永远看不到线上的 404 —— 那种「mock 骗人」
+        // 比缺实现更坏。运行态在下面与其它单数 `/admin/node/...` 端点一起分发。
       }
     }
 
@@ -373,6 +373,24 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
       const now = Date.now();
       const outcome = mockPoolTargetHealth(targets, seed.mockTargetHealthFixtures, now);
       return ok(outcome);
+    }
+
+    // ----- WP7/WP12 运行态：GET /admin/node/:id/state（单数，与真实后端同路同形）-----
+    /*
+     * 唯一真相是 `backend/src/routes/node-admin.ts` 的
+     * `nodeAdminRoutes.get("/node/:id/state")` + `services/node-admin-state.ts`
+     * 的 `NodeStateView`：
+     *   · 节点存在 → **一律 200**：从未上报是 `reported_at: null` 的空态视图
+     *     （`tunnels: []` / `used_ports: []` / `egress_pools: {}` / `stale: true`），
+     *     既不是 404，也不是 `null` 载荷 —— 「没有上报」与「取不到」必须可分；
+     *   · 节点不存在 → 404（`resolveNodeId` 失败）。
+     * 响应是**解包后**的载荷（mock 模式下 api.ts 不再剥 `{ data }` 信封）。
+     */
+    if (seg[1] === "node" && method === "GET" && seg[3] === "state") {
+      const node = mockResolveNode(db.nodes, seg[2]);
+      if (!node) return notFound("节点不存在");
+      const report = db.nodeStates.get(node.id);
+      return ok(report ?? mockEmptyNodeState(node));
     }
 
     // ----- V4-WP6 §13.4.4 健康：单数 /admin/node/health 与前缀 /admin/node/:id/health -----
@@ -771,4 +789,37 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
     return notFound(`Mock route not found: ${method} /${clean}`);
   }
   return null;
+}
+
+/**
+ * 从未上报的**空态视图**（形状 = 真实后端 `NodeStateView`，字段逐个对齐
+ * `backend/src/services/node-admin-state.ts` 的 `getNodeState`）。
+ *
+ * 为什么不是 `null`：客户端把「载荷为 null」判成**响应形状不认识 = 取不到**
+ * （见 `lib/node-runtime-state.ts`），而「从未上报」是 200 的契约事实。
+ * 两者混成同一个值，界面就又会把「接口坏了」显示成「节点还没上报」。
+ */
+function mockEmptyNodeState(node: Node) {
+  return {
+    node_id: node.id,
+    node_key: node.node_id,
+    role: node.role ?? null,
+    reported_role: null,
+    role_mismatch: false,
+    online: node.status === "active",
+    status: node.status,
+    last_seen_at: node.last_seen_at ?? null,
+    reported_at: null,
+    age_seconds: null,
+    // 无快照 = 无新鲜证据（后端 `snapshot ? isStaleState(...) : true` 同一口径）
+    stale: true,
+    version: null,
+    reported_revision: null,
+    tunnels: [],
+    used_ports: [],
+    egress_pools: {},
+    last_error: null,
+    control_protocol_version: null,
+    capabilities: null,
+  };
 }
