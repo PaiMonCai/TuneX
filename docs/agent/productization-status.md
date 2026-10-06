@@ -777,7 +777,7 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 | **4** | Forward 状态与链路清晰可见 | 基本达成 | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 浏览器验收 43/41 个相关 testid、禁用词零命中 | **达成** | 带宽/吞吐时间序列（后端无该数据源） |
 | **5** | DDNS 可从 UI 使用 | 基本达成 | 写入闸门真解耦（`cron_ddns_sync`）；**真机 `pending → synced` + 读回确认 + 浏览器「已切换」**；缺口补齐：`auto_resolve=false` 缺省态现在**明说"不会跟随、要你自己维护"**（`dec70f4`） | **达成** | 只支持 2 种 provider（cloudflare/huawei）；多入口 `multi_entry` 首发未开放 |
 | **6** | Notification 可从 UI 配置 | **未达成** | **四块都到位**：渠道配置端点（task-10）+ **admin 渠道 UI**（task-20，独立目录）+ 用户偏好矩阵（task-12）+ **事实类投递节拍**（task-11，真机三拍：真 email 送达 / 被投递层静默期拦住 / 恢复配对）+ **投递失败可见性**（task-13，真机脱敏与跨空间隔离）+ SMTP 问候语 P1 已修 | **基本达成** | **真实外部投递**未验证（SMTP 只验明文会话、未对真实公网 MTA；telegram 从未真发到 api.telegram.org）；`degraded=true` 真机触发；`secret_state=unreadable` 真机 |
-| **7** | Agent upgrade 有完整用户流程 | 基本达成（完整流程在途） | 只读投影 `GET /api/nodes/:id/upgrade-state`（用**实际上报版本**而非配置列，前置与 `checkUpgradePrecondition` 逐字同源）+ **卡片已挂载**（与"生成命令"同一入口，旧内联块已退役）+ 版本基线语义已审计（`install.sh` 写 sha 导致永不触发 → task-26） | **基本达成** | **真实节点完整升级未跑**（刻意不动那 4 台）；`version_drift=behind` 真机未出现 |
+| **7** | Agent upgrade 有完整用户流程 | **达成** | 只读 `upgrade-state`（**实际上报版本** + 前置逐字同源）+ 卡片挂载（旧内联入口退役）+ 版本基线语义修复（task-26）+ 镜像 stamp（task-37）+ `version_drift:behind` 真机首现（Round 54）+ **Round 56 Lead 一手跑通真实节点完整升级**：旧镜像 agent（上报 `0.13.22`、`behind`）→ 跑面板生成的**真实升级脚本**（registry 拉取 → 停旧 → 用新镜像重建 → **身份校验通过**："HTTP 200 + Panel JSON 真解析；agent 内置探针，不跟随重定向；同一个 node_id/agent_id 已重新连上 Panel"）→ 新 agent 上报 **`0.15.0`** ⇒ **`version_drift: not_behind`**；节点全程 `active/online`、**身份与 Forward 关系未变（无重新 enroll）** | **达成** | ① 我沙箱内的偏差已披露：`--network host`→控制网、宿主文件挂载→**命名卷 + docker cp**（因 daemon 文件系统视图 ≠ 沙箱视图，见 §3.58）；② **真实公网 registry/TLS** 未测（用本地 registry 代理）；③ 回退路径（新镜像起不来 → 自动回退旧镜像）**未真机触发**（脚本里有该分支，本次未走到） |
 | **8** | 常见故障有诊断入口 | 基本达成 | 诊断面板 + 支持包 + 转发错误→下一步；**Looking Glass 已消费并挂载**（五态 + `admin_override` 按观察者 + 写操作警告 + caveats），开关真机验证（含普通成员可进）、真实发起在 API 层验证（200 报告 / 409 单飞 / 审计计数） | **达成** | 后端只 1 种方法 `tcp_connect`（相对 ForwardX 的 8 种）；`refused`/`invalid_target` 等结果态无真机样本 |
 | **9** | 不需理解 Lease/Revision/Fencing | 达成 | 用户域零命中（唯一命中在管理端联邦页）；`Revision` 只在默认折叠的技术详情块内；routes 页假承诺已删 | **达成** | — |
 | **10** | 核心日常体验不再明显落后 ForwardX | **未达成**（但**距"基本达成"只差要件 ② 一条**） | 三条落后理由复核：② HA **已消除**、③ 诊断**部分消除**（方法集 1→3 已部署；`task-42` 正在推到 5）、① 通知 **部分消除**→**R6 §12 已改判要件① = 支撑**（评审自我复核库身份 `@@server_uuid` 逐字相同 + `SHOW CREATE TABLE` 绕开统计缓存读出真计数器 `workspace 12/tunnel 14/delivery 25`，与其引用 id 一对一吻合；八条判据 6 支撑 / 1 部分支撑（SQL 直插事实）/ 1 不支撑（契约）） | **未达成** | **评审给的三级门槛**：未达成 = ①未支撑 或 ①支撑但②未闭合（**当前**）；**基本达成 = ①支撑 + ②闭合**（一条日常宽度差距真机可验证闭合，如 `task-26`/`task-37`）；达成 = 上述 + 覆盖面再收一条（LG ≥5、DDNS ≥4）。⇒ 下一目标明确：**闭合要件②**（我计划用 enroll 流程 + stamp 镜像做 `version_drift:behind` 真机首现）。另有评审 §12.4 的**判决实验**（`task-45`）在办 |
@@ -967,7 +967,7 @@ mtr                     → MISSING（镜像无该二进制）
 | **4** Forward 状态与链路 | **达成** | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 本周期最终浏览器验收：`/forwards/1|2` 渲染 43/16 个相关 testid、禁用词零命中 | 带宽序列仅到"日均吞吐"；上下行/小时桶/连接数**不可派生**（账本只有一列 `traffic`） |
 | **5** DDNS 可从 UI 用 | **达成** | 写入闸门真解耦；真机 `pending → synced` + 读回确认 + 浏览器「已切换」；缺省态真话已补 | 仅 2 家 provider；`multi_entry` 首发未开放 |
 | **6** Notification 可从 UI 配置 | **基本达成** | 端点 + admin UI + 用户偏好 + **事实类投递节拍**（真机三拍）+ **失败可见性**（脱敏/跨空间隔离/平台行不下发）+ **P1 邮件缺陷修复**（真机 A/B）+ **端到端投递**（`task-36/41`：真账本 `sent` + 落盘 SMTP transcript + **调度器那一拍**） | **真实公网 MTA / Telegram 真投递未验**；`degraded=true` 真机未触发；③"保存≠投递"契约差异（未启用渠道不进投递层 ⇒ 零账本行）**未改**；**R6 §10 质疑"投递库的出处"未澄清** |
-| **7** Agent upgrade 完整流程 | **基本达成** | 只读 `upgrade-state`（**实际上报版本** + 前置逐字同源）+ 卡片挂载（旧内联入口退役）+ 版本基线语义修复 + **镜像 stamp 版本**（两版实测上报不同 version） | **真实节点完整升级未跑**；`version_drift:behind` **真机未出现**（需发布方注入 tag + 节点升级 + 配基线） |
+| **7** | Agent upgrade 有完整用户流程 | **达成** | 只读 `upgrade-state`（**实际上报版本** + 前置逐字同源）+ 卡片挂载（旧内联入口退役）+ 版本基线语义修复（task-26）+ 镜像 stamp（task-37）+ `version_drift:behind` 真机首现（Round 54）+ **Round 56 Lead 一手跑通真实节点完整升级**：旧镜像 agent（上报 `0.13.22`、`behind`）→ 跑面板生成的**真实升级脚本**（registry 拉取 → 停旧 → 用新镜像重建 → **身份校验通过**："HTTP 200 + Panel JSON 真解析；agent 内置探针，不跟随重定向；同一个 node_id/agent_id 已重新连上 Panel"）→ 新 agent 上报 **`0.15.0`** ⇒ **`version_drift: not_behind`**；节点全程 `active/online`、**身份与 Forward 关系未变（无重新 enroll）** | **达成** | ① 我沙箱内的偏差已披露：`--network host`→控制网、宿主文件挂载→**命名卷 + docker cp**（因 daemon 文件系统视图 ≠ 沙箱视图，见 §3.58）；② **真实公网 registry/TLS** 未测（用本地 registry 代理）；③ 回退路径（新镜像起不来 → 自动回退旧镜像）**未真机触发**（脚本里有该分支，本次未走到） |
 | **8** 常见故障诊断入口 | **达成** | 诊断面板 + 支持包 + 转发错误→下一步；Looking Glass 已消费并挂载、开关真机验证、真实发起 API 层验证；**ICMP 实测修正**（ping 可用、traceroute/mtr 如实不可用） | LG **Web 侧未消费 `unavailable_methods`**；`method_unavailable_on_node` 未实现；**走 agent 代码路径的真机 ping 证据未跑** |
 | **9** 不需理解 Lease/Revision/Fencing | **达成** | 用户域零命中；`Revision` 仅在默认折叠的技术详情块内；routes 页假承诺已删 | — |
 | **10** 核心日常体验不再明显落后 | **基本达成**（R6 §13 改判） | 要件① = **支撑**（§12.3 四方互锁）；要件② = **闭合**（评审自核三点：面板 env 里基线 0 次出现 / `unknown` 分支真机实测 / `behind` 分支代码判据一致，且**不存在第三个"假装已最新"的分支**） | **"达成"只差覆盖面一条**（评审原话）：① 把 LG 5 方法落到运行镜像 + 面板 HTTP 侧证据 ⇒ **本轮已完成**（`/status` caps=5 + 真实运行审计行 200/409）；② 或 DDNS 2→≥4。另：`task-45` 若判"部署 worker 对同库事实不可见"，要件①按预承诺**重新打开** |
@@ -1225,6 +1225,35 @@ RUN chmod -R a+rX /app/src /app/prisma
 
 ### C. 一条**看起来像缺陷、实为旧镜像噪声**的观察（记录以免后人误判）
 `audit_log` 里高频出现 **`POST /api/internal/heartbeat` → 404**。查证：**HEAD 里不存在该路由**（`internal-node.ts`/`app.ts` 均无），且 agent 代码注释明确写着"`/api/internal/heartbeat` **Panel 从未实现**、已移除"。⇒ 404 来自**旧镜像 `cafaaba`**（它仍打这条路径），**不是当前缺陷**；它反而印证了"节点需要升级"这件事的真实性（旧 agent 会持续产生 404 噪声）。
+
+## 3.57 Round 56（Lead 一手）：真实节点**完整升级**跑通（退出条件 #7 → 达成）
+
+### 链路（全部真机，脚本来自面板、未手改逻辑）
+```
+旧状态：容器 tunex-harvest-agent:cafaaba（源码常量 0.13.22）→ upgrade-state: reported 0.13.22 | expected 0.15.0 | version_drift=behind
+执行：面板生成的升级脚本（sh 执行）
+  tunex-upgrade: 当前镜像: tunex-harvest-agent:cafaaba
+  tunex-upgrade: 目标镜像: 127.0.0.1:5050/tunex-agent:0.15.0
+  tunex-upgrade: 拉取目标镜像（此时节点仍在正常服务）→ Status: Image is up to date
+  tunex-upgrade: 停止旧 Agent（SIGTERM，最多 15 秒完成排空）
+  tunex-upgrade: 用目标镜像重建容器（复用 agent.env 与 LKG 目录）
+  tunex-upgrade: 身份校验通过（HTTP 200 + Panel JSON 真解析；agent 内置探针，不跟随重定向）：同一个 node_id/agent_id 已重新连上 Panel
+  tunex-upgrade: 升级完成：当前运行 127.0.0.1:5050/tunex-agent:0.15.0，节点身份与 Forward 关系未变（身份校验：通过）
+新状态：reported.version = 0.15.0 | expected 0.15.0 | version_drift = not_behind；节点 active/online；容器镜像 127.0.0.1:5050/tunex-agent:0.15.0
+```
+⇒ 同时验证了三件本周期才建成的东西：**镜像 stamp（task-37）**、**真实上报版本驱动的升级判定（task-26）**、**升级脚本里的身份探针（task-29/42）**。
+
+### 顺带撞出的 **P0**（本周期最有价值的一次真实执行）：升级脚本**语法非法**
+- 现象：`bash -n` / `dash -n` 双双 **rc=2**、`line 169: syntax error near unexpected token '('` ⇒ **任何节点都无法用生成的命令升级**；更糟的是它在"**已停掉旧容器**"之后才炸，节点会停在**无 agent**（本次实验就是这样）。
+- 根因：探针块处于外层 shell 的单引号串里（`PROBE="$(docker exec … sh -c '…')"`），块内又出现 `jq -e 'type=="object" and (.data|type=="object")'` ⇒ **内层单引号提前终结外层引号**，`(.data|…)` 的 `(` 成了未加引号 token。
+- 修法：内层单引号按 POSIX 写成 `'\''`（提交 `a1bba56`）；测试侧抽 `unescapeInnerBlock()`（`probeBody`/`identitySection` 两处还原转义，否则测的是**外层文本**而不是被测对象），并新增回归用例：对**渲染结果**跑 `sh -n`/`bash -n`/`dash -n` + 断言非空。
+- **为什么此前 49 条用例没拦住**：它们全是**字符串断言**（"脚本里有这一步"），没有一条**解析/执行**渲染结果。另：这次我自己还踩过一次"**对空文件做语法检查**"的假绿，已把非空门槛写进用例。
+
+### 一条**环境事实**（含对先前误判的更正）
+宿主路径挂载在本沙箱**不可靠**：我 `stat` 宿主 `/tmp/…/agent.env` 是 **regular file**，而容器内同一路径是 **directory**；连 `alpine` 助手容器也看不到我的 `/tmp` ⇒ **docker daemon 的文件系统视图 ≠ 本沙箱视图**。
+- **更正**：Round 56 早期我判断"另一个 DSH 会话把 `/etc/tunex-agent/agent.env` 写回去了"——**该归因是错的**；真因是 daemon 看到的是**它自己那边的** `/etc/tunex-agent/agent.env`。
+- **可行做法**（本次采用）：配置走**命名卷**，用 `docker create` + `docker cp` 把 env 文件写进卷（`docker cp` 走 API，不经文件系统视图）。
+- 这也解释了 `web-ddns` 早前报的那条"沙箱看不到宿主 `/tmp` 直接路径"——他当时判为"沙箱 artifact"，**判对了**。
 
 ## 4. Capability Map## 4. Capability Map
 
