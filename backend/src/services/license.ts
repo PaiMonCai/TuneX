@@ -32,6 +32,12 @@ class LicenseService {
     };
   }
 
+  async hasBusinessLicense(now: Date = new Date()): Promise<boolean> {
+    const license = await this.getLicense();
+    if (license?.type !== "business") return false;
+    // 0 means no expiry. Positive values are Unix seconds, matching the legacy contract.
+    return license.expired_at <= 0 || license.expired_at > Math.floor(now.getTime() / 1000);
+  }
 }
 
 export const licenseService = new LicenseService();
