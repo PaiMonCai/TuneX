@@ -526,6 +526,52 @@ t+5s → state=synced  verified=true  confirmed=["172.33.10.20"]  attempt=0  nex
 
 **一处观察（非缺陷，但值得记）**：`/admin/notification-channels` 在页面尚未实现时被 `app/(admin)/admin/[segment]/page.tsx` 的 `normalize()` **静默回落成节点管理页**（渲染出 37 个 testid 且该页文本含「健康」）。这正好印证我给 `task-20` 写下的警示：admin 新页**必须建独立目录**，否则用户访问一个不存在的地址会看到另一个页面（而且没有任何提示）。
 
+## 3.24 R5-A 独立审查结论（ForwardX 对齐，HEAD 1199324 + 工作树快照）
+
+审查人自述口径：**只读**、以 HEAD `1199324`（01:45）+ 工作树为准、带时间戳（审计期间分支被并发推进 20→25 提交）；所有"未跑"项如实列出。
+
+### A. 它抓到的 P0：**提交的 HEAD 不可构建**（已修）
+干净检出 `git archive HEAD | tsc` → **恰好 2 错**，两处都是"slice 只提交了一半"：
+1. `forward-detail.tsx(14)` 找不到 `@/components/forwards/forward-latency`（`2715313` 只提交挂载，组件未提交）；
+2. `forward-workspace.tsx(730)` 传的 `bindingsUnavailable` 在提交版 dialog 上不存在（`147a0cf` 只提交生产端）。
+
+→ **Lead 已修**（`bb44309` 整体落地自洽工作树 + 0600→644；`904e2db` 注册表与模块成对提交），并**用 R5-A 的原命令自证干净检出 tsc = 0 错**。
+**门禁纪律更新（已生效）**：① 提交前必须在**干净检出**上跑 `tsc`/`build`；② 禁止只提交一个 slice 的半数文件（挂载与被挂载、prop 与消费者必须同 commit）；③ 提交粒度以**自洽**为准，不以目录为准（我第一次修的时候按目录挑着提交，又造出两处同类半提交）。
+
+### B. 退出条件逐条判定（R5-A）
+| # | 判定 | 一句证据 |
+|---|---|---|
+| 1 快速部署 | 基本达成（工具面）／未验证（真实主机） | `README:25` + `production-deploy.md` + `scripts/ops/install.sh`（`--dry-run/--check`）；未在真实主机跑过 |
+| 2 Web 完成第一台 Node | 基本达成 | `node-onboarding.tsx` + `lib/node-install-polling.ts` 已挂载；真机 `GET /api/nodes` 4/4 `online`/`active`/`has_credential:true` |
+| 3 Direct/Relay/Multi-hop | Direct/Relay 基本达成；**多跳未达成** | HEAD dialog 有 direct/relay + 路径预览；多跳整套当时未提交（现已由 task-19 交付） |
+| 4 Forward 状态与链路 | **达成** | `forward-detail.tsx` 挂 topology/DNS/latency 三卡 + 账本口径；真机 topology 200 |
+| 5 DDNS 可从 UI 用 | 基本达成 | 设置页 + provider 管理 + 前门卡片都在 HEAD；写入闸门已修（A8） |
+| 6 Notification 可从 UI 配置 | **未达成** | Web 0 消费者、无页面（A5/A6）、HEAD worker 无通知 job |
+| 7 Agent 升级完整流程 | **未达成** | 卡片 0 生产挂载、后端 `upgrade-state` 未提交（A4） |
+| 8 常见故障诊断入口 | 基本达成（弱）；**最强诊断不可达** | `NodeDiagnostics` + 支持包可用，但 **Looking Glass 后端/Agent/协议全齐、Web 0 消费者、缺省关**（A3） |
+| 9 不需理解 Lease/Revision/Fencing | **达成** | `console/user-shell.tsx:9` + 词表守卫测试；真机 `/api/nodes` 投影不含这些字段 |
+| 10 不落后 ForwardX | **未达成** | 见其 Top3；且当时 HEAD 不可构建 |
+
+### C. 它**新发现**的断点（本专项此前未记录）
+| 断点 | 证据 | 处理 |
+|---|---|---|
+| **Looking Glass 全链路完备、Web 0 消费者、`LOOKING_GLASS_ENABLED` 缺省关** | `routes/looking-glass.ts` + `app.ts:202` + `agent/internal/diag/lookingglass.go` + 控制协议 `:168`；真机 `GET /api/looking-glass/status` → 200 `{"enabled":false,...,"method":"tcp_connect","caps":{"max_targets":4}}`；`grep looking web/src/lib/api` = 0 | **新建 task-25**（已派 `web-ddns`） |
+| `/admin/notification-channels` 权限 URL 无页面 ⇒ HEAD 下**静默渲染成节点管理页** | `permissions.ts:75` 登记 URL，`admin-resource-list.tsx:25-37` 的 `ADMIN_SEGMENTS` 不含它，`admin/[segment]/page.tsx` 的 `normalize()` 未知段回落 `nodes` | task-20（admin 渠道 UI，必须独立目录）；我干跑时也独立观察到同一现象（§3.23） |
+| **0600 规则被系统性违反（27 文件）** | `find ... -perm 600 | wc -l` = 27（含 `node-upgrade-card.tsx`、`forward-multihop-*.tsx`） | 已统一 644 |
+| F5 幽灵心跳**仍在运行实例 404**（旧 Agent 镜像） | `docker logs tunex-it-panel` 有 `POST /api/internal/heartbeat → 404`；4 台 Agent 镜像均为修复前构建 | "删除代码 ≠ 运行链路已干净" ⇒ 需升级验收环境里的 Agent 镜像（Lead 的验收动作） |
+| 多跳真实可用性受**角色模型**限制 | `POST /nodes/1/bindings{3}` → 409「出口节点角色必须是 egress 或 both」；`GET /nodes/2/bindings`（源 egress）→ 409「该节点不具备入口能力」⇒ 仅 `role=both` 能一次建成两段；scratch 4 台**无一是 both** | task-19 已如实呈现；真实三跳验证需 Lead 临时改一台节点角色 |
+
+### D. 它给的差距 Top3（最短路径，Lead 采纳为当前执行序）
+1. **让 HEAD 可交付**（纯收口，无新功能）→ **已完成**（`bb44309`/`904e2db` + 干净检出自证）。
+2. **打通"后端完备、产品面为零"的通知与诊断** → 通知：task-11（worker job + `resolveTargets`）+ task-20（admin UI，独立目录）+ task-12（用户偏好）；诊断：**task-25（Looking Glass）**。
+3. **多跳先"可走完"再谈直观** → task-19 已交付（含"第二段要去哪里建"的指路与不可选原因），真实三跳需验收环境支持。
+
+### E. R5-A 明确列出的"未验证"（不得写成通过）
+web 干净检出 `build` 未跑；web/后端**测试刻意未跑**（工作树同期在被写，快照不构成判定）；DDNS 浏览器端到端未由它执行；升级完整流程未跑；Looking Glass 未开启开关、未发 `POST`；ForwardX 侧结论是**源码级行为**而非实测；多跳真机未构造；0600 的运行期影响未复现。
+
+### F. 它对"刻意不同"的复核结论（要点）
+全部仍成立，但**两条需要补充**：① "不做 per-forward 通知开关"成立，**但**在"6 类里只有 `announcement` 真会投递"时，"等价可用"的呈现风险仍在（这是 #6 未达成的根因之一，不能只靠"刻意不同"解释）；② "不做远程自升级波次"成立，**但**不能因此接受"升级 UX 不可用"——当前是**卡片没挂、端点没提交**（缺口），不是取舍。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
