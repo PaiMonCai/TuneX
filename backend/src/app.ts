@@ -58,12 +58,13 @@ export function createApp() {
   const app = new Hono<{ Variables: AppVariables }>();
 
   // Federation stop/revocation hooks must also exist in the Panel process, not only the worker.
-  try {
-    // Start process-level federation wiring during app construction; the operation is idempotent.
-    void import("./services/federation/lease.ts").then((m) => m.ensureFederationWiring());
-  } catch (e) {
-    console.error("[app] federation wiring failed:", e instanceof Error ? e.message : e);
-  }
+  // Dynamic-import failures are asynchronous, so handle the promise explicitly; a surrounding
+  // synchronous try/catch cannot observe a rejected import or wiring promise.
+  void import("./services/federation/lease.ts")
+    .then((m) => m.ensureFederationWiring())
+    .catch((e) => {
+      console.error("[app] federation wiring failed:", e instanceof Error ? e.message : e);
+    });
 
   // ① 请求 IP 提取 + 结构化访问日志
   app.use("*", async (c, next) => {
