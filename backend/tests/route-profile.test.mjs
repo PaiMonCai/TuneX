@@ -181,6 +181,41 @@ if (!DB_TEST) {
     assert.equal(badVisibility.status, 400);
     assert.equal((await json(badVisibility)).code, "invalid_input");
 
+    // metadata 也 fail-closed：错误类型不能静默当成“没传”，超长不能静默截断。
+    const badDescription = await request(
+      `/api/route-profiles/${profileId}`,
+      "PATCH",
+      owner.cookie,
+      { description: 42 },
+      owner.workspaceId,
+    );
+    assert.equal(badDescription.status, 400);
+    assert.equal((await json(badDescription)).code, "invalid_input");
+
+    const tooLongDescription = await request(
+      `/api/route-profiles/${profileId}`,
+      "PATCH",
+      owner.cookie,
+      { description: "x".repeat(501) },
+      owner.workspaceId,
+    );
+    assert.equal(tooLongDescription.status, 400);
+
+    const duplicateAssignments = await request(
+      `/api/route-profiles/${profileId}`,
+      "PATCH",
+      owner.cookie,
+      {
+        assignments: [
+          { target_type: "workspace", target_id: owner.workspaceId },
+          { target_type: "workspace", target_id: owner.workspaceId },
+        ],
+      },
+      owner.workspaceId,
+    );
+    assert.equal(duplicateAssignments.status, 400);
+    assert.equal((await json(duplicateAssignments)).code, "invalid_input");
+
     // dynamic middle pool / 超跳数：422 unsupported_topology（合法但未开放的形态）。
     const unsupported = await request(
       "/api/route-profiles",
