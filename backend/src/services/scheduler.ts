@@ -1348,12 +1348,26 @@ export async function createRelayTunnel(
     deps.portPoolDeps,
   );
   if (!egressAlloc.ok) {
-    // 补偿：入口租约已产生，先释放再报错。
-    await releaseLease({ leaseId: ingressAlloc.leaseId }, deps.portPoolDeps).catch(() => {});
-    return fail("acquire_ports", egressAlloc.code, `出口端口分配失败：${egressAlloc.detail}`, {
+    // New Tunnel: no runtime exists yet, so releasing the single acquired lease
+    // is safe. If that release cannot be confirmed, surface compensation_failed
+    // instead of pretending the allocator is clean.
+    const compensation = await compensateRuntimesThenRelease({
       tunnelId,
-      meta: { direction: "egress", ingress_port: ingressAlloc.port },
+      orchestrator,
+      removals: [],
+      portPoolDeps: deps.portPoolDeps,
     });
+    return fail(
+      "acquire_ports",
+      compensation.ok ? egressAlloc.code : SCHEDULER_ERROR_CODES.compensation_failed,
+      compensation.ok
+        ? `出口端口分配失败：${egressAlloc.detail}`
+        : `出口端口分配失败：${egressAlloc.detail}；${compensation.error}`,
+      {
+        tunnelId,
+        meta: { direction: "egress", ingress_port: ingressAlloc.port },
+      },
+    );
   }
 
   await store.tunnel.update({
@@ -1406,11 +1420,19 @@ export async function createRelayTunnel(
   // 落成 apply_egress 失败 —— 否则调用方收到的是一个 TypeError 而不是
   // Tunnel 记录上的 apply_status=error，排障时对不上号。
   if (poolId !== null && egressTargets.length === 0) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const detail = `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`;
     return fail(
       "apply_egress",
-      SCHEDULER_ERROR_CODES.egress_apply_rejected,
-      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`,
+      compensation.ok
+        ? SCHEDULER_ERROR_CODES.egress_apply_rejected
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      compensation.ok ? detail : `${detail}；${compensation.error}`,
       { tunnelId, revision },
     );
   }
@@ -1434,15 +1456,36 @@ export async function createRelayTunnel(
     }),
   });
   if (!egressDispatch.ok) {
-    // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。
-    // 必须先释放——否则这条隧道的端口被一条永远不会 active 的记录占着，
-    // reconcile（WP9）要等 15 分钟预分配 TTL 才收得回。
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    return fail("apply_egress", mapDispatchCode("egress", egressDispatch), egressDispatch.error, {
+    // A failed/unknown dispatch may still have created the listener. Confirm a
+    // higher-revision remove before releasing either port lease.
+    const compensation = await compensateRuntimesThenRelease({
       tunnelId,
-      revision,
-      meta: { command_id: egressDispatch.commandId ?? null },
+      orchestrator,
+      removals: [
+        {
+          tunnelId,
+          node: egressPick.node,
+          direction: "egress",
+          revision: revision + 1,
+          reason: "egress apply failed",
+        },
+      ],
+      portPoolDeps: deps.portPoolDeps,
     });
+    return fail(
+      "apply_egress",
+      compensation.ok
+        ? mapDispatchCode("egress", egressDispatch)
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      compensation.ok
+        ? egressDispatch.error
+        : `${egressDispatch.error}；${compensation.error}`,
+      {
+        tunnelId,
+        revision,
+        meta: { command_id: egressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({
     step: "apply_egress",
@@ -1497,7 +1540,9 @@ export async function createRelayTunnel(
     const compensationDetail = compensation.ok ? "" : `；${compensation.error}`;
     return fail(
       "apply_ingress",
-      SCHEDULER_ERROR_CODES.invariant_violated,
+      compensation.ok
+        ? SCHEDULER_ERROR_CODES.invariant_violated
+        : SCHEDULER_ERROR_CODES.compensation_failed,
       `RuntimePlan 自检未通过：${planViolations.join("; ")}${compensationDetail}`,
       { tunnelId, revision, meta: { runtime_plan_violations: planViolations } },
     );
@@ -1514,11 +1559,13 @@ export async function createRelayTunnel(
     ...tlsPathsFor(asRow<Record<string, unknown>>(created) as Record<string, unknown>, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
-    /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
+    // The ingress command was sent; timeout/invalid ACK is an UNKNOWN outcome,
+    // not proof that no listener exists. Remove near→far, then release ports.
     const compensation = await compensateRuntimesThenRelease({
       tunnelId,
       orchestrator,
       removals: [
+        { tunnelId, node: ingressPick.node, direction: "ingress", revision: revision + 1, reason: "ingress apply failed" },
         { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" },
       ],
       portPoolDeps: deps.portPoolDeps,
@@ -1526,11 +1573,18 @@ export async function createRelayTunnel(
     const detail = compensation.ok
       ? ingressDispatch.error
       : `${ingressDispatch.error}；${compensation.error}`;
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), detail, {
-      tunnelId,
-      revision,
-      meta: { command_id: ingressDispatch.commandId ?? null },
-    });
+    return fail(
+      "apply_ingress",
+      compensation.ok
+        ? mapDispatchCode("ingress", ingressDispatch)
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      detail,
+      {
+        tunnelId,
+        revision,
+        meta: { command_id: ingressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({
     step: "apply_ingress",
@@ -1952,11 +2006,11 @@ export async function reapplyRelayTunnel(
     deps.portPoolDeps,
   );
   if (!egressAlloc.ok) {
-    if (!ingressAlloc.reused) {
-      await releaseLease({ leaseId: ingressAlloc.leaseId }, deps.portPoolDeps).catch(() => {});
-    }
+    // Existing Tunnel: even a newly materialised lease may protect an old
+    // listener on the persisted port. Keep ownership until a runtime teardown
+    // is explicitly confirmed.
     return fail("acquire_ports", egressAlloc.code, `出口端口分配失败：${egressAlloc.detail}`, {
-      meta: { direction: "egress", ingress_port: ingressAlloc.port },
+      meta: { direction: "egress", ingress_port: ingressAlloc.port, leases_retained: true },
     });
   }
 
@@ -1978,9 +2032,8 @@ export async function reapplyRelayTunnel(
       deps.portPoolDeps,
     );
     if (!middleAlloc.ok) {
-      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
       return fail("acquire_ports", middleAlloc.code, `中间跳端口分配失败：${middleAlloc.detail}`, {
-        meta: { direction: "transit", middle_node_id: middleNodeId },
+        meta: { direction: "transit", middle_node_id: middleNodeId, leases_retained: true },
       });
     }
     middlePort = middleAlloc.port;
@@ -2018,12 +2071,11 @@ export async function reapplyRelayTunnel(
       ? await store.egressTarget.findMany({ where: { pool_id: poolId, status: "active" }, orderBy: { order_by: "asc" } })
       : [];
   if (poolId !== null && egressTargets.length === 0) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
     return fail(
       "apply_egress",
       SCHEDULER_ERROR_CODES.egress_apply_rejected,
-      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`,
-      { revision },
+      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）；现有端口租约保留给可能仍在运行的旧 runtime`,
+      { revision, meta: { leases_retained: true } },
     );
   }
 
@@ -2049,11 +2101,18 @@ export async function reapplyRelayTunnel(
     }),
   });
   if (!egressDispatch.ok) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    return fail("apply_egress", mapDispatchCode("egress", egressDispatch), egressDispatch.error, {
-      revision,
-      meta: { command_id: egressDispatch.commandId ?? null },
-    });
+    // Unknown dispatch outcome: do not free ports under a possibly-live old/new
+    // runtime. Reconciler sees desired=inactive + apply=error and owns the later
+    // runtime cleanup; the lease remains the collision barrier until then.
+    return fail(
+      "apply_egress",
+      mapDispatchCode("egress", egressDispatch),
+      `${egressDispatch.error}；端口租约保留，等待 runtime 对账确认后回收`,
+      {
+        revision,
+        meta: { command_id: egressDispatch.commandId ?? null, leases_retained: true },
+      },
+    );
   }
   steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
   steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
@@ -2070,7 +2129,15 @@ export async function reapplyRelayTunnel(
    * 所以它必须是一处、且必须逆序（正向先远后近 ⇒ 拆除先近后远）。
    */
   const teardownDispatched = async (reason: string): Promise<string | null> => {
-    const removals: CompensationRemoval[] = [];
+    const removals: CompensationRemoval[] = [
+      {
+        tunnelId,
+        node: ingressPick.node,
+        direction: "ingress",
+        revision: revision + 1,
+        reason: `${reason} (ingress)`,
+      },
+    ];
     if (transitNode != null) {
       removals.push({
         tunnelId,
@@ -2114,9 +2181,14 @@ export async function reapplyRelayTunnel(
     if (!middleNode) {
       const compensationError = await teardownDispatched("middle node missing");
       const detail = `中间跳节点 ${middleNodeId} 不存在${compensationError ? `；${compensationError}` : ""}`;
-      return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, detail, {
-        revision,
-      });
+      return fail(
+        "apply_transit",
+        compensationError
+          ? SCHEDULER_ERROR_CODES.compensation_failed
+          : SCHEDULER_ERROR_CODES.invariant_violated,
+        detail,
+        { revision },
+      );
     }
     const transit = await orchestrator.dispatchTransit({
       tunnelId,
@@ -2134,7 +2206,14 @@ export async function reapplyRelayTunnel(
     if (!transit.ok) {
       const compensationError = await teardownDispatched("transit apply failed");
       const detail = compensationError ? `${transit.error}；${compensationError}` : transit.error;
-      return fail("apply_transit", mapDispatchCode("egress", transit), detail, { revision });
+      return fail(
+        "apply_transit",
+        compensationError
+          ? SCHEDULER_ERROR_CODES.compensation_failed
+          : mapDispatchCode("egress", transit),
+        detail,
+        { revision },
+      );
     }
     transitHost = transit.host;
     transitNode = {
@@ -2173,7 +2252,9 @@ export async function reapplyRelayTunnel(
     const detail = `RuntimePlan 自检未通过：${planViolations.join("; ")}${compensationError ? `；${compensationError}` : ""}`;
     return fail(
       "apply_ingress",
-      SCHEDULER_ERROR_CODES.invariant_violated,
+      compensationError
+        ? SCHEDULER_ERROR_CODES.compensation_failed
+        : SCHEDULER_ERROR_CODES.invariant_violated,
       detail,
       { revision, meta: { runtime_plan_violations: planViolations } },
     );
@@ -2192,10 +2273,17 @@ export async function reapplyRelayTunnel(
   if (!ingressDispatch.ok) {
     const compensationError = await teardownDispatched("ingress apply failed");
     const detail = compensationError ? `${ingressDispatch.error}；${compensationError}` : ingressDispatch.error;
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), detail, {
-      revision,
-      meta: { command_id: ingressDispatch.commandId ?? null },
-    });
+    return fail(
+      "apply_ingress",
+      compensationError
+        ? SCHEDULER_ERROR_CODES.compensation_failed
+        : mapDispatchCode("ingress", ingressDispatch),
+      detail,
+      {
+        revision,
+        meta: { command_id: ingressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
   steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
