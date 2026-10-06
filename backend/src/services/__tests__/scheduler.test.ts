@@ -373,8 +373,13 @@ class FakeAgentTransport {
   }
   async removeTunnel(node: { id: number }, tunnelId: string) {
     this.applies.push({ kind: "remove", nodeId: node.id, config: { tunnelId } });
+    const script = this.takeFailure("remove");
+    if (script) {
+      if (script.mode === "bad_revision") return { ok: false, error: "revision mismatch" };
+      const code = script.mode === "unreachable" ? "agent_unreachable" : "agent_rejected";
+      throw new AgentTransportErrorLike(code, `agent ${node.id} failed remove`);
+    }
     // remove 的补偿必须幂等：假 Agent 对未知 id 也报 ok（与 WP4 一致）。
-    this.consume("remove");
     return { ok: true, id: tunnelId };
   }
   async isReachable() {
@@ -387,9 +392,8 @@ class FakeAgentTransport {
     config: Record<string, unknown>,
   ) {
     this.applies.push({ kind, nodeId: node.id, config });
-    const script = this.scriptedFailures.shift() ?? this.failNext;
-    if (script && script.kind === kind) {
-      this.failNext = null;
+    const script = this.takeFailure(kind);
+    if (script) {
       if (script.mode === "unreachable") {
         throw new AgentTransportErrorLike("agent_unreachable", `agent ${node.id} unreachable`);
       }
@@ -402,9 +406,15 @@ class FakeAgentTransport {
     return { ok: true, revision: Number(config.revision ?? 0) };
   }
 
-  private consume(kind: "egress" | "relay" | "remove") {
-    const script = this.scriptedFailures.shift() ?? this.failNext;
-    if (script && script.kind === kind) this.failNext = null;
+  private takeFailure(kind: "direct" | "egress" | "relay" | "remove") {
+    const scripted = this.scriptedFailures[0];
+    if (scripted?.kind === kind) return this.scriptedFailures.shift() ?? null;
+    if (this.failNext?.kind === kind) {
+      const next = this.failNext;
+      this.failNext = null;
+      return next;
+    }
+    return null;
   }
 }
 
@@ -1179,6 +1189,23 @@ describe("C. 端口分配集成", () => {
     const owned = leases.filter((l) => l.tunnel_id === result.tunnelId);
     expect(owned.length).toBe(2);
     expect(owned.every((l) => l.status === "released")).toBe(true);
+  });
+
+  test("C10b. runtime teardown 未确认成功时保留端口租约，绝不把仍可能监听的端口重新分配", async () => {
+    fakeAgent.scriptedFailures.push(
+      { kind: "relay", mode: "reject" },
+      { kind: "remove", mode: "unreachable" },
+    );
+
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+
+    const owned = leases.filter((l) => l.tunnel_id === result.tunnelId);
+    expect(owned).toHaveLength(2);
+    expect(owned.every((l) => l.status === "active")).toBe(true);
+    expect(result.error).toContain("保留端口租约等待 reconcile");
+    expect(fakeAgent.applies.some((a) => a.kind === "remove")).toBe(true);
   });
 });
 
