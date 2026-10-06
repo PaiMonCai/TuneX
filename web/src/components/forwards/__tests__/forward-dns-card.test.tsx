@@ -353,6 +353,17 @@ describe("写权限与首发边界", () => {
     expect(html).toContain('data-testid="forward-dns-bind-warning"');
     expect(html).toContain("不会写入");
   });
+
+  // R5-A 复核点出过这条缺口：只写"开启后会怎样"，用户会以为关着也没关系——而**缺省就是关闭**。
+  test("自动同步关闭时，必须说清「面板不会跟随、要你自己维护」", () => {
+    const off = card({ view: { kind: "ready", binding: binding({ state: "synced", auto_resolve: false }) } });
+    expect(off).toContain('data-testid="forward-dns-auto-resolve-off-note"');
+    expect(off).toContain("不会跟着改");
+    expect(off).toContain("自己维护");
+    // 开启时不出现这条（否则就变成"开着也警告"，同样误导）
+    const on = card({ view: { kind: "ready", binding: binding({ state: "synced", auto_resolve: true }) } });
+    expect(on).not.toContain('data-testid="forward-dns-auto-resolve-off-note"');
+  });
 });
 
 describe("凭据纪律：卡片里不出现任何凭据材料", () => {

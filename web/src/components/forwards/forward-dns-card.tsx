@@ -244,6 +244,13 @@ export function ForwardDnsCardBody({
               {text.autoResolve}：{binding.auto_resolve ? text.autoResolveOn : text.autoResolveOff}
             </span>
             <span className="field-hint">{text.autoResolveHint}</span>
+            {/* 关闭时**必须**说清后果：缺省就是关闭，而"绑定了就会跟着走"是最容易产生的误解。
+                R5-A 复核专门点出过这条：只写"开启后会怎样"，用户会以为关着也没关系。 */}
+            {!binding.auto_resolve && (
+              <span className="field-hint" data-testid="forward-dns-auto-resolve-off-note">
+                {text.autoResolveOffHint}
+              </span>
+            )}
           </div>
         )}
 

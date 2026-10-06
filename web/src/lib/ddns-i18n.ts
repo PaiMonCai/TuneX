@@ -92,6 +92,8 @@ export interface DdnsText {
   autoResolveOn: string;
   autoResolveOff: string;
   autoResolveHint: string;
+  /** **关闭时**发生了什么（缺省即关闭 ⇒ 用户最容易误以为"绑定了就会跟着走"）。 */
+  autoResolveOffHint: string;
   autoResolveUnavailableHint: string;
   retryScheduled: string;
   retryNoPlan: string;
@@ -223,6 +225,8 @@ const zh: DdnsText = {
   autoResolveOff: "已关闭",
   autoResolveHint:
     "开启后，执行器会在入口地址变化时改写这条记录。注意：DNS 路径不可用时，自动迁移会被闸住（epoch 不动），不会带着不可用的地址下线。",
+  autoResolveOffHint:
+    "当前未开启自动同步（这是默认值）：解析记录只在你绑定那一刻被写入一次，之后入口地址变了它不会跟着改，面板也不会替你去动它。要让它跟随，请先解绑、再在绑定表单里勾上「自动同步」；不勾就意味着由你自己维护这条记录。",
   autoResolveUnavailableHint: "自动同步开关需要 DNS 前门写权限（forward:update）。",
   retryScheduled: "服务端计划：将于 {time} 自动重试（已连续失败 {count} 次）",
   retryNoPlan: "服务端没有待重试的计划：不会自动重试",
@@ -367,6 +371,8 @@ const en: DdnsText = {
   autoResolveOff: "off",
   autoResolveHint:
     "When on, the executor rewrites this record as the ingress address changes. Note: while the DNS path is unavailable, automatic migration is gated (epoch does not move).",
+  autoResolveOffHint:
+    "Auto-sync is currently OFF (that is the default): the record was written once when you bound the domain, and it will NOT follow later ingress changes — the panel will not touch it for you. To follow changes, unbind and rebind with auto-sync checked; leaving it unchecked means you maintain this record yourself.",
   autoResolveUnavailableHint: "Toggling auto-sync requires forward:update.",
   retryScheduled: "The server plans to retry at {time} (after {count} consecutive failure(s))",
   retryNoPlan: "The server has no pending retry: it will not retry automatically",
