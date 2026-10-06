@@ -201,6 +201,7 @@ export interface IngressMemberView {
    * 凭据 + 在线）。`false` 时 {@link takeover_rejection} 给出**第一个**不满足的条件码。
    */
   can_take_over: boolean;
+  /** `can_take_over=false` 时**第一个**不满足的条件码；现任为 `current_owner`。 */
   takeover_rejection: string | null;
   /**
    * 平台当前的接管次序（1 起）；不能接管的成员为 `null`。
@@ -242,12 +243,14 @@ export function buildIngressMemberViews(
       credential_revoked: row.credential_revoked,
       lifecycle: row.lifecycle,
     });
-    // 现任不能被当作"接管者"（failover 的定义就是离开现任），所以先排除再算次序。
-    const rejection =
-      input.activeIngressId !== null && row.id === input.activeIngressId
-        ? null
-        : candidateRejection(facts, "ingress", { requireOnline: true, now: input.now });
-    const canTakeOver = input.activeIngressId !== null && row.id === input.activeIngressId ? false : rejection === null;
+    // 现任不能被当作"接管者"（failover 的定义就是离开现任，`pickFailoverDestination` 也是这样
+    // 显式排除的），所以先排除再算次序。`current_owner` 是**这条排除规则**的名字，不是新判定：
+    // 准入/角色/凭据/在线四条仍然全部来自 `candidateRejection`。
+    const isOwner = input.activeIngressId !== null && row.id === input.activeIngressId;
+    const rejection = isOwner
+      ? "current_owner"
+      : candidateRejection(facts, "ingress", { requireOnline: true, now: input.now });
+    const canTakeOver = rejection === null;
     if (canTakeOver) rank += 1;
     views.push({
       node_id: row.id,

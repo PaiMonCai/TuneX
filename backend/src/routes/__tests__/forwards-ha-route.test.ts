@@ -49,7 +49,7 @@ const FORWARD_ID = 11;
 const GROUP = 1;
 // 现任入口 / 合格候选 / 离线 / 角色不符 / 未声明角色 / 维护中 / 别的组
 const N_ACTIVE = 51, N_CANDIDATE = 52, N_OFFLINE = 53;
-const N_EGRESS = 54, N_NOROLE = 55, N_MAINTENANCE = 56, N_FOREIGN_GROUP = 57;
+const N_EGRESS = 54, N_NOROLE = 55, N_MAINTENANCE = 56, N_FOREIGN_GROUP = 57, N_REVOKED = 58;
 
 let role = "owner", roleId = null, permissions = null, active = true;
 let requestWorkspace = WS;
@@ -77,6 +77,7 @@ function seedNodes() {
     nodeRow({ id: N_NOROLE, role: null }),
     nodeRow({ id: N_MAINTENANCE, role: "ingress", lifecycle: "maintenance" }),
     nodeRow({ id: N_FOREIGN_GROUP, role: "ingress", node_group_id: 2 }),
+    nodeRow({ id: N_REVOKED, role: "ingress", credential_revoked: true }),
   ];
 }
 function nodeRow(over) {
@@ -233,7 +234,7 @@ function reqPath(path, method, body) {
 }
 async function ha() { const res = await status(await req(), 200); return (await res.json()).data; }
 function nodeOf(data, id) {
-  return data.preference_options.nodes.filter(function (n) { return n.node_id === id; })[0];
+  return data.ingress_members.nodes.filter(function (n) { return n.node_id === id; })[0];
 }
 
 /* 分组执行器：组内 status 断言计数必须**恰好**等于写死的数字。 */
@@ -247,10 +248,12 @@ async function group(name, expectChecks, fn) {
   }
   console.log("GROUP " + name + "=" + checks);
 }
-const DATA_KEYS = ["active_ingress_node_id","failover_candidate","forward_id","policy","preference_options","preferred_ingress_node_id"].sort();
+const DATA_KEYS = ["active_ingress_node_id","failback","failover_candidate","forward_id","ingress_members","member_priority","policy","preferred_ingress_node_id"].sort();
+const FAILBACK_KEYS = ["auto_failback","preferred_ingress_node_id","progress","target_node_id"].sort();
+const PRIORITY_KEYS = ["custom_order_supported","source"].sort();
 const POLICY_KEYS = ["auto_failback","auto_failover","parse_error"].sort();
 const CANDIDATE_KEYS = ["node_id","reason","status"].sort();
-const OPTION_KEYS = ["accepts_new_business","admission_rejection","can_be_preferred","connection","is_active_ingress","is_preferred","lifecycle","name","node_group_id","node_id","preference_rejection","role"].sort();
+const OPTION_KEYS = ["accepts_new_business","admission_rejection","can_be_preferred","can_take_over","connection","failover_rank","is_active_ingress","is_failback_target","is_preferred","lifecycle","name","node_group_id","node_id","preference_rejection","role","takeover_rejection"].sort();
 `;
 
 /* ------------------------------------------------------------------ */
@@ -334,7 +337,7 @@ await group("permissions-and-scope", 6, async () => {
 /* ------------------------------------------------------------------ */
 
 const SCENARIO_TRUTH = String.raw`
-await group("projection-truth", 7, async () => {
+await group("projection-truth", 8, async () => {
   reset();
   asRole("owner");
 
@@ -353,12 +356,40 @@ await group("projection-truth", 7, async () => {
   /* 候选：现任被排除，最低 id 的合格在线入口就是它（与 failover 同一份判定）。 */
   expect(data.failover_candidate).toEqual({ status: "available", node_id: N_CANDIDATE, reason: null });
 
-  /* 备选集合：只列这条转发的入口组，键集冻结，且**不含凭据材料**。 */
-  expect(data.preference_options.status).toBe("ok");
-  const ids = data.preference_options.nodes.map(function (n) { return n.node_id; });
-  expect(ids).toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE]);
-  data.preference_options.nodes.forEach(function (n) {
+  /* 入口成员：只列这条转发的入口组，键集冻结，且**不含凭据材料**。 */
+  expect(data.ingress_members.status).toBe("ok");
+  const ids = data.ingress_members.nodes.map(function (n) { return n.node_id; });
+  expect(ids).toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE, N_REVOKED]);
+  data.ingress_members.nodes.forEach(function (n) {
     expect(Object.keys(n).sort()).toEqual(OPTION_KEYS);
+  });
+
+  /* task-38：顺序是**平台规则**（合格候选按 node id 升序），且契约明说不可自定义。 */
+  expect(Object.keys(data.member_priority).sort()).toEqual(PRIORITY_KEYS);
+  expect(data.member_priority).toEqual({ source: "platform_rule_node_id_asc", custom_order_supported: false });
+
+  /* 「能不能接管」与「能不能当首选」是两个不同答案，逐台分开断言（含第一个不满足的条件码）。 */
+  expect(nodeOf(data, N_ACTIVE).can_take_over).toBe(false);
+  expect(nodeOf(data, N_ACTIVE).takeover_rejection).toBe("current_owner");
+  expect(nodeOf(data, N_ACTIVE).failover_rank).toBe(null);
+  expect(nodeOf(data, N_CANDIDATE).can_take_over).toBe(true);
+  expect(nodeOf(data, N_CANDIDATE).takeover_rejection).toBe(null);
+  expect(nodeOf(data, N_CANDIDATE).failover_rank).toBe(1);
+  expect(nodeOf(data, N_OFFLINE).can_take_over).toBe(false);
+  expect(nodeOf(data, N_OFFLINE).takeover_rejection).toBe("node_not_online");
+  expect(nodeOf(data, N_MAINTENANCE).can_take_over).toBe(false);
+  expect(nodeOf(data, N_MAINTENANCE).takeover_rejection).toBe("node_in_maintenance");
+  expect(nodeOf(data, N_EGRESS).takeover_rejection).toBe("role_mismatch");
+  expect(nodeOf(data, N_NOROLE).takeover_rejection).toBe("role_undeclared");
+  expect(nodeOf(data, N_REVOKED).takeover_rejection).toBe("node_credential_revoked");
+
+  /* 回切：平台开关真值 + 进度（阈值来自 failover-thresholds 的单一数值来源）。 */
+  expect(Object.keys(data.failback).sort()).toEqual(FAILBACK_KEYS);
+  expect(data.failback).toEqual({
+    auto_failback: false,
+    target_node_id: null,
+    preferred_ingress_node_id: null,
+    progress: { healthy_checks: 0, required_checks: 3, met: false },
   });
   expect(JSON.stringify(data)).not.toContain(SEALED);
   expect(JSON.stringify(data)).not.toContain("node_credential_hash");
@@ -413,6 +444,10 @@ await group("projection-truth", 7, async () => {
   nodes = nodes.filter(function (n) { return n.id !== N_CANDIDATE; });
   data = await ha();
   expect(data.failover_candidate).toEqual({ status: "none", node_id: null, reason: null });
+  /* 同一事实的细粒度：成员还在（非空），但没有一台能接管（rank 全 null）。 */
+  expect(data.ingress_members.nodes.length).toBeGreaterThan(0);
+  expect(data.ingress_members.nodes.every(function (n) { return n.can_take_over === false; })).toBe(true);
+  expect(data.ingress_members.nodes.every(function (n) { return n.failover_rank === null; })).toBe(true);
   /* 只有"在线"这一个维度的差异就能翻状态：把唯一候选取回但让它离线 ⇒ 仍是 none。 */
   nodes = nodes.filter(function (n) { return n.id !== N_CANDIDATE; }).concat([nodeRow({ id: N_CANDIDATE, role: "ingress", last_seen_at: STALE })]);
   data = await ha();
@@ -422,15 +457,23 @@ await group("projection-truth", 7, async () => {
   failoverQueryThrows = true;
   data = await ha();
   expect(data.failover_candidate).toEqual({ status: "unavailable", node_id: null, reason: "candidate_query_failed" });
-  /* 候选读不到时，备选集合仍然照常给出（两个事实各自独立降级）。 */
-  expect(data.preference_options.status).toBe("ok");
+  /* 候选读不到时，成员列表仍然照常给出（两个事实各自独立降级）。 */
+  expect(data.ingress_members.status).toBe("ok");
 
   /* 反向：备选集合读不到 ⇒ 它自己是 unavailable，候选判定仍然可用。 */
   failoverQueryThrows = false;
   optionsQueryThrows = true;
   data = await ha();
-  expect(data.preference_options).toEqual({ status: "unavailable", nodes: [] });
+  // ①「读不到成员列表」——不许与"没有成员"共用形状。
+  expect(data.ingress_members).toEqual({ status: "unavailable", nodes: [] });
   expect(data.failover_candidate.status).toBe("none");
+
+  // ②「组里确实没有成员」——status 仍是 ok，但 nodes 为空。
+  optionsQueryThrows = false;
+  nodes = nodes.filter(function (n) { return n.node_group_id !== GROUP; });
+  data = await ha();
+  expect(data.ingress_members).toEqual({ status: "ok", nodes: [] });
+  expect(data.failover_candidate).toEqual({ status: "none", node_id: null, reason: null });
 });
 `;
 
@@ -455,6 +498,15 @@ await group("write-then-read", 7, async () => {
   expect(data.active_ingress_node_id).toBe(N_ACTIVE);
   expect(nodeOf(data, N_OFFLINE).is_preferred).toBe(true);
   expect(nodeOf(data, N_OFFLINE).connection).toBe("offline");
+  /* 偏好 ≠ 现任 ⇒ 它此刻是**回切目标**；但平台开关仍是关的（期望 ≠ 会被执行）。 */
+  expect(nodeOf(data, N_OFFLINE).is_failback_target).toBe(true);
+  expect(nodeOf(data, N_ACTIVE).is_failback_target).toBe(false);
+  expect(data.failback.target_node_id).toBe(N_OFFLINE);
+  expect(data.failback.preferred_ingress_node_id).toBe(N_OFFLINE);
+  expect(data.failback.auto_failback).toBe(false);
+  expect(data.failback.progress.healthy_checks).toBe(0);
+  expect(data.failback.progress.required_checks).toBe(3);
+  expect(data.failback.progress.met).toBe(false);
 
   /* 清除偏好（node_id = null）⇒ 回到"没有偏好"。 */
   const cleared = await status(await reqPath(PATH.replace(/\/ha$/, "/preferred-ingress"), "PUT", { node_id: null }), 200);
@@ -490,7 +542,7 @@ test("GET /api/forwards/:id/ha（权限与作用域）", () => {
 
 test("GET /api/forwards/:id/ha（投影真值：期望 vs 事实、策略、候选三态）", () => {
   const output = runScenario(SCENARIO_TRUTH);
-  expect(output).toContain("GROUP projection-truth=7");
+  expect(output).toContain("GROUP projection-truth=8");
 });
 
 test("GET /api/forwards/:id/ha（写入路径未改动 + 读后写 + 顺序纪律）", () => {

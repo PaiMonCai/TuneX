@@ -23,15 +23,15 @@ import {
 import type { DdnsDb, DdnsDeps, DdnsResult, DnsBindingRow } from "../services/ddns-binding.ts";
 import {
   PREFERRED_INGRESS_ERROR_CODES,
+  buildIngressMemberViews,
   setPreferredIngressNode,
 } from "../services/preferred-ingress.ts";
-import type { PreferredIngressDb } from "../services/preferred-ingress.ts";
-import { roleAcceptsPosition } from "../services/ingress-candidate.ts";
-import { projectUserNode } from "../services/node-view.ts";
+import type { IngressMemberView, PreferredIngressDb } from "../services/preferred-ingress.ts";
 import {
   pickFailoverDestination,
   readFailoverPolicy,
 } from "../services/failover-loop.ts";
+import { FAILOVER_THRESHOLDS } from "../services/failover-thresholds.ts";
 import { defaultDiagnoseDeps, diagnoseForward } from "../services/agent-diagnose.ts";
 import {
   createForward,
@@ -56,6 +56,8 @@ import {
 } from "../services/latency-history.ts";
 import type { LatencyGranularity } from "../services/latency-history.ts";
 import { parseForwardBatchRequest } from "../services/forward-batch.ts";
+import { BILLING_TIME_ZONE, billingDayKeyStamp } from "../services/billing-time.ts";
+import { dayKeyOf, fillDays } from "../services/traffic.ts";
 import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
 import {
   forwardListShape,
@@ -280,6 +282,144 @@ forwardsRoutes.get("/:id/traffic", async (c) => {
     Math.min(90, Number(c.req.query("days") ?? 14) || 14),
   );
   return send(c, await getForwardTraffic(id, workspace(c).id, days));
+});
+
+/** 窗口上限（天）：与 `/:id/traffic` 的钳制口径一致（同一张账本、同一条横轴）。 */
+const MAX_THROUGHPUT_WINDOW_DAYS = 90;
+/** 归档节拍（分钟）：与 `worker.ts` 里 `cron_save_traffic` 的节拍一致（每 10 分钟）。 */
+const THROUGHPUT_ARCHIVE_INTERVAL_MINUTES = 10;
+
+/**
+ * `GET /api/forwards/:id/throughput` —— **日均吞吐序列**（只读，零副作用）。
+ *
+ * 行为参照：ForwardX（AGPL-3.0-only）——流量面「带标签的时间窗 + 分桶 + 单位标注」的产品逻辑；
+ * 代码为本项目改写（复用我们自己的 `tunnel_traffic` 归档账本与既有 day-key helper），未复制其实现。
+ * 参照溯源：`docs/agent/forwardx-code-reuse.md`。
+ *
+ * ── 为什么不能直接复用 `/:id/traffic` ──
+ * 那个端点为了给详情页柱状图一条连续横轴，会把窗口内**没有归档行的日子补成 0**
+ * （`services/forward-service.ts` 的 `fillDays(...).map(key => hit ? … : 0)`）。调用方因此
+ * **无法区分**两件完全不同的事：
+ *   · 那天有归档行、流量确实是 0（**测到的零**）；
+ *   · 那天根本没有归档行（**缺口**：节点没跑 / 归档没到 / 超出保留期）。
+ * 吞吐视图的价值恰恰在于"缺口看得见"，所以这里给一条**把缺口保留成 `null`** 的只读投影，
+ * 并**不改** `/traffic` 的既有契约（详情页图表与账本累计都在消费它）。
+ *
+ * ── 口径（全部由服务端给出；前端不自算窗口，也不补零）──
+ *   · 粒度 **day**：账本是 `@@unique([tunnel_id, date])` 的日行，归档节拍只把 Redis 缓冲
+ *     同步进**当天那一行** ⇒ 不存在日内分辨率（不假装有）；
+ *   · 横轴：`fillDays(days, now)` 的稠密日键（Asia/Shanghai 日界），与 `/traffic` 同一套 helper；
+ *   · 点值：`bytes: number | null`（`null` = 该日没有归档行）、`rate_bps: number | null`
+ *     （日均速率 = 该日字节 ÷ 该日已过秒数；缺口与 `bytes` 同步为 `null`，**不是** 0）；
+ *   · `complete`：今天是不完整日 ⇒ `false`（分母只算已过时间，界面不得把它与完整日直接比较）；
+ *   · `summary.avg_rate_bps_over_window`：整窗平均（分母 = 整窗秒数），另给
+ *     `coverage.{days_with_data,days_missing}`，避免把"缺了一半的日子"读成低吞吐。
+ *
+ * ── 明确不派生（账本里不存在；需要改 schema，本切片不动）──
+ *   · 上行/下行分开：ForwardX 的面板有 `bytesIn`/`bytesOut`，我们的账本只有一列 `traffic`；
+ *   · 小时桶 / 峰值：日行没有日内分辨率；
+ *   · 连接数：账本没有连接数事实。
+ * 这三条写进交付报告的"不可派生"清单，**不做**替代或估算。
+ *
+ * 权限/作用域与 `/traffic`、`/topology`、`/latency` 同一条（`forward:read`）；跨 Workspace 与
+ * "真不存在"返回逐字同形的 404。注册位置同样必须在参数化 catch-all 之前。
+ */
+forwardsRoutes.get("/:id/throughput", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "read");
+  if (denied) return denied;
+  const ws = workspace(c);
+  const days = Math.max(
+    1,
+    Math.min(MAX_THROUGHPUT_WINDOW_DAYS, Number(c.req.query("days") ?? 14) || 14),
+  );
+
+  const row = await db.tunnel.findFirst({
+    where: { id, workspace_id: ws.id, category: "port_forward" },
+    select: { id: true },
+  });
+  if (!row) {
+    return c.json(
+      { error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" },
+      404,
+    );
+  }
+
+  const now = new Date();
+  const todayKey = dayKeyOf(billingDayKeyStamp(now));
+  const since = new Date(billingDayKeyStamp(now).getTime() - (days - 1) * 86_400_000);
+  const rows = await db.tunnelTraffic.findMany({
+    where: { tunnel_id: id, workspace_id: ws.id, date: { gte: since } },
+    orderBy: { date: "asc" },
+    select: { date: true, traffic: true },
+  });
+
+  // 同一日键可能有多行（历史分片/补录）：与 `/traffic` 一样按日求和，而不是"只取一行"。
+  const bytesByDay = new Map<string, number>();
+  for (const trafficRow of rows) {
+    const key = dayKeyOf(trafficRow.date);
+    bytesByDay.set(key, (bytesByDay.get(key) ?? 0) + Number(trafficRow.traffic ?? 0));
+  }
+
+  // 今天的分母只算已过时间：拿不完整日与完整日比，会把正常波动读成业务下降。
+  const elapsedTodaySeconds = Math.max(
+    1,
+    Math.floor((now.getTime() - billingDayKeyStamp(now).getTime()) / 1000),
+  );
+
+  const keys = fillDays(days, now);
+  const series = keys.map((date) => {
+    const hasRow = bytesByDay.has(date);
+    const bytes = hasRow ? (bytesByDay.get(date) as number) : null;
+    const complete = date !== todayKey;
+    const seconds = complete ? 86_400 : elapsedTodaySeconds;
+    return {
+      date,
+      bytes,
+      /** 日均速率（bytes/s）；缺口与 `bytes` 同步为 `null`，**不是** 0。 */
+      rate_bps: bytes === null ? null : Math.round((bytes / seconds) * 1000) / 1000,
+      /** `false` = 不完整日（今天）：速率分母只算已过时间。 */
+      complete,
+    };
+  });
+
+  const daysWithData = series.filter((point) => point.bytes !== null).length;
+  const totalBytes = series.reduce((sum, point) => sum + (point.bytes ?? 0), 0);
+  const windowSeconds = days * 86_400;
+
+  return c.json({
+    data: {
+      forward_id: id,
+      /** 聚合粒度：账本只有日行分辨率，如实标 `day`。 */
+      granularity: "day",
+      /** 点值单位：图表与表格共用（日均速率用 bytes_per_second，总量用 bytes）。 */
+      unit: "bytes_per_second",
+      window: {
+        from: keys[0] ?? null,
+        to: keys[keys.length - 1] ?? null,
+        days,
+        time_zone: BILLING_TIME_ZONE,
+      },
+      series,
+      summary: {
+        total_bytes: totalBytes,
+        /** 整窗平均速率（分母 = 整窗秒数）——与"只按有数据的天算"是两回事，名字里写清。 */
+        avg_rate_bps_over_window: Math.round((totalBytes / windowSeconds) * 1000) / 1000,
+        coverage: {
+          days_with_data: daysWithData,
+          days_missing: series.length - daysWithData,
+        },
+      },
+      archive: {
+        interval_minutes: THROUGHPUT_ARCHIVE_INTERVAL_MINUTES,
+        today_key: todayKey,
+        /** 今天永远是不完整日：账本按日累计，且滞后不超过一个归档节拍。 */
+        today_incomplete: true,
+      },
+      limits: { max_days: MAX_THROUGHPUT_WINDOW_DAYS },
+    },
+  });
 });
 
 /**
@@ -566,8 +706,14 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
 });
 
 /* ================================================================== */
-/* task-16 —— 高可用只读投影（GET /:id/ha）                             */
+/* task-16 / task-38 —— 高可用只读投影（GET /:id/ha）                    */
 /* ================================================================== */
+//
+// 行为参照：ForwardX（AGPL-3.0-only）——多入口/转发组（成员集合与优先级、"故障窗口后切到
+// 下一个可用成员"、"恢复后切回"开关、以及"在线 ≠ 可用"的成员状态口径）；**代码为本项目改写，
+// 未复制其实现**。参照的是**行为语义**，落点全部是本项目既有原语（节点组 = 成员集合、
+// `pickFailoverDestination` = 顺序与候选、`FAILOVER_POLICY` = 两个开关、
+// `failback_healthy_checks` = 回切进度）；**没有**引入它的资源模型，也没有新增任何存储。
 //
 // 为什么要有这条**只读**端点：`FAILOVER_POLICY`、`tunnel.preferred_ingress_node_id`、
 // `pickFailoverDestination` 全都已经在后端存在（策略、存储、执行器、候选判定），而用户域
@@ -586,13 +732,31 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
 //      而不是"运维没开" ⇒ `parse_error` 必须如实带出来，两者下一步动作不同；
 //   ④ `failover_candidate` = 与 failover 循环**同一份判定**（`pickFailoverDestination`：非现任
 //      + 准入 + 角色 + **此刻在线**）。三态必须可分：`available` / `none`（确实没有合格候选）
-//      / `unavailable`（这次读不到）—— 把"读不到"渲染成"没有高可用"是本专项反复吃过亏的形态。
+//      / `unavailable`（这次读不到）—— 把"读不到"渲染成"没有高可用"是本项目反复吃过亏的形态。
 //
-// `preference_options`（首选入口的备选集合）的 `can_be_preferred` **只用写入路径自己检查的
-// 两条规则**（同入口组 + `role ∈ {ingress,both}`，与 `preferred-ingress.ts` 同源），而
-// `connection` / `accepts_new_business` 是**这张卡旁边的事实**，不是能不能当首选的判据 ——
-// 拿 `candidateRejection()`（那还要求生命周期与在线）来算"能不能设为首选"会让 UI 说得比
-// 写入路径更严，于是用户看到"不能设"却 PUT 成功。两个问题两份答案，各自同源。
+// ── 成员视图（`ingress_members`）与它的三个**不同**的态 ──
+//
+// 成员集合就是这条转发的入口节点组（既有真相，不是新表）；每台成员带
+// `connection`（事实）/ `accepts_new_business`（准入结论）/ `can_take_over`（此刻能不能接管）
+// / `failover_rank`（平台当前的接管次序）/ `is_failback_target`（是不是回切目标）。
+// 契约上必须分得开的三个态：
+//   · `status: "unavailable"` —— 这次**读不到**成员列表（不许说成"没有成员"）；
+//   · `status: "ok"` + `nodes: []` —— 组里**确实没有成员**；
+//   · `nodes` 非空但没有任何 `can_take_over` —— 有成员，但**此刻没有能接管的**（各成员自己的
+//     `takeover_rejection` 说明第一个不满足的条件；这与 `failover_candidate: none` 是同一事实的
+//     两种粒度，UI 用细粒度的原因码解释"为什么切不过去"）。
+//
+// 「能不能当首选」（`can_be_preferred`）**只用写入路径自己检查的两条规则**（同入口组 +
+// `role ∈ {ingress,both}`，与 `preferred-ingress.ts` 同源）；`can_take_over` 才是 failover
+// 的判定（还要求生命周期与在线）。两者不同源、也不同答案：一台维护中的机器
+// `can_be_preferred=true` 但 `can_take_over=false`，UI 必须分开说。
+//
+// ── 顺序（task-38 的诚实边界）──
+//
+// `member_priority.custom_order_supported = false`：平台此刻的接管次序是既有规则
+// （合格候选按 `node_id` 升序，`pickFailoverDestination` 的显式排序），**不是**用户可以随意
+// 拖动的列表。按转发自定义成员顺序需要一份"按转发的"存储；节点组是多条转发共享的资源，
+// 把顺序塞进节点列会让共用该组的其它转发一起变形 —— 因此本切片不做，交由 Lead 裁决。
 //
 // 顺序纪律：**literal 子路由一律注册在参数化 catch-all 之前**（本文件 `post("/:id/:action")`
 // 在文件末段）。DNS 前门与延迟端点都在这条规则上踩过，所以这里同样前置，并由
@@ -629,6 +793,7 @@ interface HaTunnelRow {
   in_node_group_id: number;
   ingress_node_id: number | null;
   preferred_ingress_node_id: number | null;
+  failback_healthy_checks: number;
 }
 
 interface HaFailoverCandidate {
@@ -647,7 +812,13 @@ forwardsRoutes.get("/:id/ha", async (c) => {
 
   const tunnel = (await db.tunnel.findFirst({
     where: { id, workspace_id: ws.id, category: "port_forward" },
-    select: { id: true, in_node_group_id: true, ingress_node_id: true, preferred_ingress_node_id: true },
+    select: {
+      id: true,
+      in_node_group_id: true,
+      ingress_node_id: true,
+      preferred_ingress_node_id: true,
+      failback_healthy_checks: true,
+    },
   })) as HaTunnelRow | null;
   if (!tunnel) {
     return c.json({ error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" }, 404);
@@ -658,6 +829,7 @@ forwardsRoutes.get("/:id/ha", async (c) => {
 
   // ④ 候选入口：与 failover 循环**同一份判定**。
   let failoverCandidate: HaFailoverCandidate;
+  let failbackTargetNodeId: number | null = null;
   try {
     const destinations = await pickFailoverDestination({
       tunnel_id: tunnel.id,
@@ -665,6 +837,7 @@ forwardsRoutes.get("/:id/ha", async (c) => {
       owner_node_id: tunnel.ingress_node_id,
       now: new Date(),
     });
+    failbackTargetNodeId = destinations.preferred_node_id;
     failoverCandidate =
       destinations.candidate_node_id === null
         ? { status: "none", node_id: null, reason: null }
@@ -674,26 +847,9 @@ forwardsRoutes.get("/:id/ha", async (c) => {
     failoverCandidate = { status: "unavailable", node_id: null, reason: "candidate_query_failed" };
   }
 
-  // 首选入口的备选集合：只列**这条转发的入口节点组**内的节点（与用户节点列表同一可见域）。
-  let preferenceOptions:
-    | {
-        status: "ok";
-        nodes: Array<{
-          node_id: number;
-          name: string;
-          role: string | null;
-          node_group_id: number;
-          is_active_ingress: boolean;
-          is_preferred: boolean;
-          can_be_preferred: boolean;
-          preference_rejection: string | null;
-          connection: string;
-          lifecycle: string;
-          accepts_new_business: boolean;
-          admission_rejection: string | null;
-        }>;
-      }
-    | { status: "unavailable"; nodes: [] };
+  // 入口成员视图（有序）：只列**这条转发的入口节点组**内的节点（与用户节点列表同一可见域），
+  // 顺序与「此刻能不能接管」都由 `preferred-ingress.ts` 的纯函数按既有判定算出来。
+  let ingressMembers: IngressMemberView[] | null = null;
   try {
     const rows = (await db.node.findMany({
       where: {
@@ -703,38 +859,28 @@ forwardsRoutes.get("/:id/ha", async (c) => {
       select: HA_NODE_SELECT,
       orderBy: { id: "asc" },
     })) as unknown as HaNodeRow[];
-    preferenceOptions = {
-      status: "ok",
-      nodes: rows.map((node) => {
-        const role = node.role ?? null;
-        const canBePreferred = roleAcceptsPosition(role, "ingress");
-        const facts = projectUserNode({
-          status: node.status,
-          last_seen_at: node.last_seen_at,
-          has_credential: Boolean(node.node_credential_hash),
-          credential_revoked: node.credential_revoked,
-          lifecycle: node.lifecycle,
-        });
-        return {
-          node_id: node.id,
-          name: node.node_id,
-          role,
-          node_group_id: node.node_group_id,
-          is_active_ingress: node.id === tunnel.ingress_node_id,
-          is_preferred: node.id === tunnel.preferred_ingress_node_id,
-          can_be_preferred: canBePreferred,
-          // 词表与 `ingress-candidate.ts` 的 `role_undeclared` / `role_mismatch` 同一套。
-          preference_rejection: canBePreferred ? null : role === null ? "role_undeclared" : "role_mismatch",
-          connection: facts.connection,
-          lifecycle: facts.lifecycle,
-          accepts_new_business: facts.accepts_new_business,
-          admission_rejection: facts.admission_rejection,
-        };
-      }),
-    };
+    ingressMembers = buildIngressMemberViews(rows, {
+      activeIngressId: tunnel.ingress_node_id,
+      preferredId: tunnel.preferred_ingress_node_id,
+      now: new Date(),
+    });
   } catch {
-    preferenceOptions = { status: "unavailable", nodes: [] };
+    ingressMembers = null;
   }
+
+  // 回切事实：平台开关（只读）+ 首选节点"连续健康"进度（`failback_healthy_checks` 是跨节拍
+  // 的唯一计数，阈值取 `failover-thresholds.ts` 的单一数值来源，不在路由里写字面量）。
+  const failback = {
+    auto_failback: policy.auto_failback === true,
+    /** 偏好 ≠ 现任时，平台此刻会把它当回切目标；否则 null（没有回切可言）。 */
+    target_node_id: failbackTargetNodeId,
+    preferred_ingress_node_id: tunnel.preferred_ingress_node_id,
+    progress: {
+      healthy_checks: tunnel.failback_healthy_checks,
+      required_checks: FAILOVER_THRESHOLDS.FAILBACK_HEALTHY_CHECKS,
+      met: tunnel.failback_healthy_checks >= FAILOVER_THRESHOLDS.FAILBACK_HEALTHY_CHECKS,
+    },
+  };
 
   return c.json({
     data: {
@@ -750,7 +896,24 @@ forwardsRoutes.get("/:id/ha", async (c) => {
         parse_error: policy.parse_error ?? null,
       },
       failover_candidate: failoverCandidate,
-      preference_options: preferenceOptions,
+      /**
+       * 入口成员的**有序**视图（行为参照 ForwardX 的「成员顺序即优先级」）。
+       *
+       *  `status: "unavailable"` = 这次读不到成员列表（**不是**"没有成员"）；
+       *  `status: "ok"` + `nodes: []` = 这个入口节点组里**确实一台成员都没有**；
+       *  `nodes` 非空但 `failover_rank` 全为 `null` = 有成员、但此刻**没有能接管的**
+       *  —— 三个态在契约上就是三个不同的形状，Web 必须分开呈现。
+       */
+      ingress_members: ingressMembers === null
+        ? { status: "unavailable" as const, nodes: [] as const }
+        : { status: "ok" as const, nodes: ingressMembers },
+      /** 平台为"按转发自定义成员顺序"提供的支持（当前为 false：需要一份按转发的存储）。 */
+      member_priority: {
+        source: "platform_rule_node_id_asc" as const,
+        custom_order_supported: false,
+      },
+      /** 「恢复后切回」的真值与进度（阈值来自 `failover-thresholds.ts`，此处不写字面量）。 */
+      failback,
     },
   });
 });
