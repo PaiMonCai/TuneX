@@ -465,8 +465,9 @@ describe("C. payload：tls 带路径，tcp/ws 结构上带不了", () => {
   });
 
   test("tls 的两个路径输入只在 protocol==='tls' 时出现，且标了必填", () => {
-    expect(CREATE_DIALOG).toContain('{draft.protocol === "tls" ? (');
-    const start = CREATE_DIALOG.indexOf('{draft.protocol === "tls" ?');
+    // 不绑定 Fragment/括号排版，只守住 TLS 条件分支与可访问性契约。
+    expect(CREATE_DIALOG).toMatch(/draft\.protocol\s*===\s*"tls"\s*\?/);
+    const start = CREATE_DIALOG.search(/draft\.protocol\s*===\s*"tls"\s*\?/);
     const end = CREATE_DIALOG.indexOf('<Field label={t("forward.ingressNode")}>');
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
