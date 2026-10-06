@@ -5,7 +5,7 @@
  *   · 任何 Redis key 都必须带 `ws:<scope>:` 前缀；
  *   · 同一个资源 id 在不同 scope 下必须是不同 key（否则两个租户的同 ID 资源
  *     会撞在同一个键上，互相覆盖心跳/指纹/离线标记/端口表）；
- *   · 全局共享的 key（系统配置、支付回调、token 自作用域）走 `ws:global:`；
+ *   · 全局共享的 key（token / 限流等身份级状态）走 `ws:global:`；
  *   · key 的解析必须与生成同源（worker 扫描用的是同一套解析器）。
  *
  * 为什么值得单测：读取方（worker SCAN、config-generator、offline-detector）
@@ -253,9 +253,7 @@ describe("RedisKeys 工厂（集中于 redis.ts）", () => {
   test("所有工厂产出都带 ws: 前缀", async () => {
     const { RedisKeys } = await import("../redis.ts");
     const produced = [
-      RedisKeys.license,
       RedisKeys.observerBuffer(1),
-      RedisKeys.payCallback("epay"),
       RedisKeys.rateLimit("auth-login", "ip:1.2.3.4"),
       RedisKeys.userSub("sub-1"),
       RedisKeys.impersonation("tok-b"),
@@ -272,14 +270,11 @@ describe("RedisKeys 工厂（集中于 redis.ts）", () => {
 
   test("全局/平台段键不含租户 id 段", async () => {
     const { RedisKeys } = await import("../redis.ts");
-    // license 是实例级配置
-    expect(RedisKeys.license).toBe("ws:global:license");
     // 账户数据
     expect(RedisKeys.userSub("abc")).toBe("ws:global:user:abc:id");
     expect(RedisKeys.impersonation("abc")).toBe("ws:global:impersonation:abc");
-    // 限流计数 / 支付回调：值只是计数或留痕
+    // 限流计数按身份隔离
     expect(RedisKeys.rateLimit("r", "ip:1")).not.toBe(RedisKeys.rateLimit("r", "ip:2"));
-    expect(RedisKeys.payCallback("epay")).toBe("ws:global:pay:callback:epay");
   });
 
   test("租户段键带 workspace id", async () => {
