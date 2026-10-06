@@ -865,6 +865,24 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 
 **与退出条件的关系**：R6 终局评审把"多入口分组/带宽面/LG 方法集"记为"刻意不做"或"方法集落后"——**自本决定起改为"按用户决定照搬补齐"**。⇒ **`#10` 必须在这三个切片落地后重评**，且重评时应注明"其中若干能力来自 AGPL 代码移植"，避免把"照搬来的对齐"当成"自研达到的水平"。
 
+## 3.39 Round 46：口径再变更（**改写而非复刻**）+ 四个切片交付
+
+### 口径变更（用户最新指令，取代上一条）
+用户先授权"直接复制代码（接受 AGPL 后果）"，**随后改为「进行符合项目的改写，不要复刻」** ⇒ 台账 `docs/agent/forwardx-code-reuse.md` 顶部已加**口径变更横幅**：**不得逐字复制**其代码/注释/文案；ForwardX 仅作**行为与逻辑参照**，在**本项目架构与既有原语**上改写；文件头标注从"许可声明"改为**参照声明**；台账用途从"许可溯源"变为"参照溯源"；三处工程边界（第二份真相 / 失败可见 / 权限与作用域）继续有效。
+**纠正时点恰好**：三个切片（task-38/39/40）都在读码阶段、**尚无文件产出** ⇒ 无需回退任何提交。
+
+### 四个切片交付（`1a198dd`；backend 2966/0、web 1325/0）
+| 任务 | 关键结论/证据 |
+|---|---|
+| **task-26** 版本基线语义 | `TUNEX_AGENT_LATEST_VERSION` 判定为**「Agent 版本号」**（证据链：谁读/和什么比/上报的是什么/比较语义/安装器旧行为/env.ts 意图）；修法 (a)：新增 `--agent-version` **fail-closed**（sha/`latest`/`unknown` ⇒ exit 2）、`--version` 的 sha **不再**入该槽位、旧 `.env` 里的 sha 由 `status` **三态分开打印**且**不擅自改写**；服务侧 `classifyAgentBaseline` **复用同一比较函数**（无第二份解析规则）。安装器断言 **241 pass**。**未验证**：真实部署跑 `install --agent-version` |
+| **task-33** 配置键穷举审计 | 以**真实响应**的 36 键为输入（不是只读源码）：**13 个未接线键** → `config_not_wired`、**6 个 SMTP 键** → `deployment_level_config`、**3 个 NOTICE 键** → `config_deprecated`（**只读保留旧值**，理由：旧值要能看见）；**10 个有读者的键不动**（逐条给读取点）。真机：`GET` 键集 **36 → 18**；历史行**原样在位**（忽略 ≠ 删除） |
+| **task-34** 部署文档修复 + 第二轮演练 | 文档与环境模板 6 处修复（`LICENSE_SECRET`、**可执行**的镜像钉版本、污染风险按实测精度重写、迁移/管理员/第一台节点步骤、README 选路径与"启动时自动发生的事"、**`SITE_URL` 节点可达前置**）。演练：`up -d` **235s**，种子 `demo plans/nodes skipped`（0/0/0），provision **201** |
+| **task-35** 生产首启可用性 | **仓库侧两条本已正确**（`SEED_DEMO_DATA=false` 能跳过；license 生产缺省 `none` fail-closed）⇒ task-31 撞到的是**镜像陈旧**。它把判定抽成纯函数 `seed-scope.ts` + 14 条**行为级**测试（含 **truth table**、结构守卫、额度机制、license fail-closed 子进程实测）与**反向变异三条变红**；并用**两个全新库**复现机制：`SEED_DEMO_DATA=true` ⇒ 演示数据占额度 ⇒ 首台真实节点 **403 `node_limit`**；`false` ⇒ **201** |
+
+### `task-34` 的最终未达成项与两条新发现（如实）
+- **`Agent enroll → online` 仍未达成**，但**根因已精确定位**且**归因于执行方**：它把**一次性 `--enroll-token`（43 字符）当长期凭据**塞进 `TUNEX_NODE_CREDENTIAL`，**跳过了安装器的 enroll 交换** ⇒ Agent 能连上面板（`restore done … source=panel`）但状态上报被拒：**`state report rejected: node credential is invalid or revoked`**，节点停在 `waiting`。它明确要求记为"**我方执行错误**"，**不计入产品/文档缺陷**（并且这条拒绝恰恰证明"一次性 token 重放应失败"是**正确行为**）。客观障碍：真跑 `install.sh` 需要节点主机 `sudo` + 宿主 docker/systemd + `--network host`，沙箱（容器化、看不到宿主 `/tmp`）无法原样执行。
+- **CSRF 方法不对称 → 判定为产品侧问题，未写入文档**（它的判断）：`POST` 带常量 `x-csrf-token` 即可，`DELETE` **额外要求 `Origin`**；**浏览器用户无感**（浏览器必带 `Origin`、前端必带该头），受影响的是**脚本/自动化客户端**。⇒ 记入收尾清单；**本周期不改**安全中间件（在没有专门威胁评审的情况下，末期改 CSRF 判据的风险大于这条不一致本身）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
