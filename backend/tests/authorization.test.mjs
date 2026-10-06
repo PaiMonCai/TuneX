@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { isBillingBlocked } from "../src/services/billing-access.ts";
 import { isNodeGroupGranted } from "../src/services/node-group-policy.ts";
 import { getEffectiveAccess, levelSatisfies, resolveAdminRoute } from "../src/permissions.ts";
+import { isUUID } from "../src/auth.ts";
 
 test("billing disabled: every order entry and unauthenticated gateway callback is denied", () => {
   for (const [path, method] of [
@@ -44,4 +45,12 @@ test("RBAC works without billing: roles merge and writes require a write grant",
   assert.equal(access.has("unknown"), false);
   assert.equal(levelSatisfies(access.get("tickets"), "write"), false);
   assert.equal(resolveAdminRoute("/admin/node/1")?.key, "nodes");
+});
+
+
+test("API keys accept only RFC 4122 UUID v4 shape", () => {
+  assert.equal(isUUID("550e8400-e29b-41d4-a716-446655440000"), true);
+  assert.equal(isUUID("550e8400-e29b-11d4-a716-446655440000"), false);
+  assert.equal(isUUID("550e8400-e29b-41d4-7716-446655440000"), false);
+  assert.equal(isUUID("not-a-key"), false);
 });
