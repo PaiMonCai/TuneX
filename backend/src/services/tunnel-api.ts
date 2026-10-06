@@ -34,8 +34,12 @@ import {
   type CreateRelayTunnelResult,
 } from "./scheduler.ts";
 import type { Orchestrator } from "./orchestrator.ts";
-import { getEffectivePolicy } from "./policy-service.ts";
-import { checkTunnelCreation, type EffectivePolicy } from "./capability-policy.ts";
+import { getEffectivePolicy, withWorkspaceQuotaLock } from "./policy-service.ts";
+import {
+  checkTunnelCreation,
+  trafficWindowStart,
+  type EffectivePolicy,
+} from "./capability-policy.ts";
 import { releaseLease } from "./portPool.ts";
 import { checkForwardRuntimeUse, type RuntimeUseDenied, type RuntimeUseResource } from "./forward-capability.ts";
 import { normalizeForwardProtocol } from "./forward-contract.ts";
@@ -191,6 +195,9 @@ export interface TunnelApiDb {
     update(args: unknown): Promise<unknown>;
     delete(args: unknown): Promise<unknown>;
   };
+  tunnelTraffic: {
+    aggregate(args: unknown): Promise<unknown>;
+  };
   node: {
     findUnique(args: unknown): Promise<unknown>;
   };
@@ -236,6 +243,14 @@ export interface TunnelApiDeps {
   orchestrator?: Orchestrator | null;
   /** 策略读取（默认 {@link getEffectivePolicy}，noCache）。 */
   loadPolicy?: (workspaceId: number) => Promise<EffectivePolicy>;
+  /**
+   * Creation quota critical section. Production locks the workspace row and
+   * re-reads policy in the same transaction; tests inject an in-memory adapter.
+   */
+  quotaLock?: <T>(
+    workspaceId: number,
+    fn: (tx: TunnelApiDb, policy: EffectivePolicy) => Promise<T>,
+  ) => Promise<T>;
   /** Existing runtime use, not new-resource quota. Tests may inject this gate. */
   runtimeUse?: (workspaceId: number, resource: RuntimeUseResource) => Promise<RuntimeUseDenied | null>;
   /** 覆盖「现在」（测试注入固定时间）。 */
@@ -249,12 +264,19 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
   applyReapply: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<CreateRelayTunnelResult>;
   applyDirect: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<ApplyDirectResult>;
   runtimeUse: NonNullable<TunnelApiDeps["runtimeUse"]>;
+  quotaLock: NonNullable<TunnelApiDeps["quotaLock"]>;
   now: () => Date;
 } {
   return {
     db: over?.db ?? (db as unknown as TunnelApiDb),
     loadPolicy: over?.loadPolicy ?? ((workspaceId: number) => getEffectivePolicy(workspaceId, { noCache: true })),
     runtimeUse: over?.runtimeUse ?? ((workspaceId, resource) => checkForwardRuntimeUse(workspaceId, resource)),
+    quotaLock:
+      over?.quotaLock ??
+      ((workspaceId, fn) =>
+        withWorkspaceQuotaLock(workspaceId, (tx, policy) =>
+          fn(tx as unknown as TunnelApiDb, policy),
+        )),
     applyCreate:
       over?.applyCreate ?? (createRelayTunnel as unknown as (i: unknown, o: Orchestrator) => Promise<CreateRelayTunnelResult>),
     applyReapply:
@@ -263,6 +285,25 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
       over?.applyDirect ?? (reapplyDirectTunnel as unknown as (t: number, o: Orchestrator, d?: unknown) => Promise<ApplyDirectResult>),
     now: over?.now ?? (() => new Date()),
   };
+}
+
+async function creationUsage(
+  tx: TunnelApiDb,
+  workspaceId: number,
+  policy: EffectivePolicy,
+  now: Date,
+): Promise<{ tunnelCount: number; trafficUsed: number }> {
+  const since = trafficWindowStart(policy.limits.traffic_period, now);
+  const where: Record<string, unknown> = { workspace_id: workspaceId };
+  if (since) where.date = { gte: since };
+  const [tunnelCount, traffic] = await Promise.all([
+    tx.tunnel.count({ where: { workspace_id: workspaceId } }),
+    tx.tunnelTraffic.aggregate({ where, _sum: { traffic: true } }),
+  ]);
+  const trafficUsed = Number(
+    (traffic as { _sum?: { traffic?: number | null } } | null)?._sum?.traffic ?? 0,
+  );
+  return { tunnelCount: Number(tunnelCount), trafficUsed };
 }
 
 /** 把一行 unknown 收窄成行类型。 */
@@ -551,57 +592,52 @@ export async function createTunnel(
     const inGroup = asRow<NodeGroupRow>(await pdb.nodeGroup.findUnique({ where: { id: input.inNodeGroupId } }));
     if (!inGroup) return err("not_found", "入口节点组不存在");
 
-    const pending = asRow<TunnelRow>(
-      await pdb.tunnel.create({
-        data: {
-          name,
-          tunnel_type: protocol,
-          forward_protocol: protocol,
-          listen_ip: "0.0.0.0",
-          listen_port: input.listenPort ?? null,
-          listen_protocol: [protocol],
-          status: "active",
-          forward_addresses: forward,
-          load_balance_type: "round",
-          ip_type: "ipv4",
-          in_node_group_id: input.inNodeGroupId,
-          out_node_group_id: null,
-          user_id: input.userId,
-          workspace_id: input.workspaceId,
-          tunnel_mode: "direct",
-          desired_status: "inactive",
-          apply_status: "pending",
-          config_revision: 0,
-          applied_revision: null,
-          remote_host: remoteHost,
-          remote_port: remotePort,
-        },
-      }),
-    );
-    if (!pending) return err("db_unavailable", "创建失败");
+    const reserved = await deps.quotaLock(input.workspaceId, async (tx, policy) => {
+      const usage = await creationUsage(tx, input.workspaceId, policy, deps.now());
+      const decision = checkTunnelCreation(policy, {
+        ...usage,
+        protocol,
+        inGroupOwned: inGroup.workspace_id === input.workspaceId,
+        inGroupId: inGroup.id,
+        outGroupId: null,
+        outGroupOwned: true,
+      });
+      if (!decision.allowed) return { denied: decision } as const;
 
-    const policy = await deps.loadPolicy(input.workspaceId);
-    const decision = checkTunnelCreation(policy, {
-      tunnelCount: 0,
-      trafficUsed: 0,
-      protocol: protocol,
-      inGroupOwned: inGroup.workspace_id === input.workspaceId,
-      inGroupId: inGroup.id,
-      outGroupId: null,
-      outGroupOwned: true,
+      const pending = asRow<TunnelRow>(
+        await tx.tunnel.create({
+          data: {
+            name,
+            tunnel_type: protocol,
+            forward_protocol: protocol,
+            listen_ip: "0.0.0.0",
+            listen_port: input.listenPort ?? null,
+            listen_protocol: [protocol],
+            status: "active",
+            forward_addresses: forward,
+            load_balance_type: "round",
+            ip_type: "ipv4",
+            in_node_group_id: input.inNodeGroupId,
+            out_node_group_id: null,
+            user_id: input.userId,
+            workspace_id: input.workspaceId,
+            tunnel_mode: "direct",
+            desired_status: "inactive",
+            apply_status: "pending",
+            config_revision: 0,
+            applied_revision: null,
+            remote_host: remoteHost,
+            remote_port: remotePort,
+          },
+        }),
+      );
+      return { pending } as const;
     });
-    if (!decision.allowed) {
-      await pdb.tunnel.update({
-        where: { id: pending.id },
-        data: {
-          apply_status: "error",
-          desired_status: "inactive",
-          apply_error_code: SCHEDULER_ERROR_CODES.policy_denied,
-          apply_error: `[${SCHEDULER_ERROR_CODES.policy_denied}] ${decision.message ?? "策略拒绝"}`,
-        },
-      }).catch(() => {});
-      return err("policy_denied", decision.message ?? "策略拒绝");
+    if ("denied" in reserved) {
+      return err("policy_denied", reserved.denied.message ?? "策略拒绝");
     }
+    const pending = reserved.pending;
+    if (!pending) return err("db_unavailable", "创建失败");
 
     const orchestrator = over?.orchestrator ?? null;
     if (!orchestrator) return { ok: true, tunnelId: pending.id, mode: "direct", revision: 0 };
@@ -633,32 +669,50 @@ export async function createTunnel(
   );
   if (!outGroup) return err("not_found", "出口节点组不存在");
 
-  const pending = asRow<TunnelRow>(
-    await pdb.tunnel.create({
-      data: {
-        name,
-        tunnel_type: protocol,
-        forward_protocol: protocol,
-        listen_ip: "0.0.0.0",
-        listen_port: input.listenPort ?? null,
-        listen_protocol: [protocol],
-        status: "active",
-        forward_addresses: [],
-        load_balance_type: "round",
-        ip_type: "ipv4",
-        in_node_group_id: input.inNodeGroupId,
-        out_node_group_id: input.outNodeGroupId,
-        user_id: input.userId,
-        workspace_id: input.workspaceId,
-        tunnel_mode: "relay",
-        desired_status: "inactive",
-        apply_status: "pending",
-        config_revision: 0,
-        applied_revision: null,
-        egress_pool_id: input.egressPoolId ?? null,
-      },
-    }),
-  );
+  const reserved = await deps.quotaLock(input.workspaceId, async (tx, policy) => {
+    const usage = await creationUsage(tx, input.workspaceId, policy, deps.now());
+    const decision = checkTunnelCreation(policy, {
+      ...usage,
+      protocol,
+      inGroupOwned: inGroup.workspace_id === input.workspaceId,
+      inGroupId: inGroup.id,
+      outGroupId: outGroup.id,
+      outGroupOwned: outGroup.workspace_id === input.workspaceId,
+    });
+    if (!decision.allowed) return { denied: decision } as const;
+
+    const pending = asRow<TunnelRow>(
+      await tx.tunnel.create({
+        data: {
+          name,
+          tunnel_type: protocol,
+          forward_protocol: protocol,
+          listen_ip: "0.0.0.0",
+          listen_port: input.listenPort ?? null,
+          listen_protocol: [protocol],
+          status: "active",
+          forward_addresses: [],
+          load_balance_type: "round",
+          ip_type: "ipv4",
+          in_node_group_id: input.inNodeGroupId,
+          out_node_group_id: input.outNodeGroupId,
+          user_id: input.userId,
+          workspace_id: input.workspaceId,
+          tunnel_mode: "relay",
+          desired_status: "inactive",
+          apply_status: "pending",
+          config_revision: 0,
+          applied_revision: null,
+          egress_pool_id: input.egressPoolId ?? null,
+        },
+      }),
+    );
+    return { pending } as const;
+  });
+  if ("denied" in reserved) {
+    return err("policy_denied", reserved.denied.message ?? "策略拒绝");
+  }
+  const pending = reserved.pending;
   if (!pending) return err("db_unavailable", "创建失败");
 
   const orchestrator = over?.orchestrator ?? null;
@@ -667,31 +721,6 @@ export async function createTunnel(
     // 调用方拿到的是「未下发」而不是「已 active」。reconciler 有 sink
     // 之后会按同 revision 补发（§7.12 fill_missing_runtime）。
     return { ok: true, tunnelId: pending.id, mode: "relay", revision: 0 };
-  }
-
-  const policy = await deps.loadPolicy(input.workspaceId);
-  const decision = checkTunnelCreation(policy, {
-    tunnelCount: 0,
-    trafficUsed: 0,
-    protocol: protocol,
-    inGroupOwned: inGroup.workspace_id === input.workspaceId,
-    inGroupId: inGroup.id,
-    outGroupId: outGroup.id,
-    outGroupOwned: outGroup.workspace_id === input.workspaceId,
-  });
-  if (!decision.allowed) {
-    await pdb.tunnel
-      .update({
-        where: { id: pending.id },
-        data: {
-          apply_status: "error",
-          desired_status: "inactive",
-          apply_error_code: SCHEDULER_ERROR_CODES.policy_denied,
-          apply_error: `[${SCHEDULER_ERROR_CODES.policy_denied}] ${decision.message ?? "策略拒绝"}`,
-        },
-      })
-      .catch(() => {});
-    return err("policy_denied", decision.message ?? "策略拒绝");
   }
 
   const result = over?.applyCreate
