@@ -334,6 +334,45 @@ mock 与真实后端对齐时发现两处**结构性差异**（都属于"mock �
 
 定向测试现状（`src/mocks/__tests__ src/components/admin/__tests__ src/components/forwards src/components/nodes`）：**696 pass / 3 fail → 修完 1 条后剩 2 条**，两条都与 provision 相关：`POST /node-groups/:id/nodes` 在**合跑**时返回 201 但 body 无 `node`（**单跑通过**），已带精确证据交回拥有 `mocks/handlers/catalog.ts` 的 `backend-truth`（合跑/单跑差异属跨文件共享 mock state，需他们按真实形状定位并补可复现的行为测试）。
 
+## 3.12 最终集成门禁与真实浏览器验收（2026-10-07 01:0x，冻结工作树）
+
+**门禁（由 Lead 亲自运行，并在运行期间校验工作树指纹未变 → 结论对应当前代码）**：
+
+| 检查 | 结果 |
+|---|---|
+| backend `tsc --noEmit` | 0 错 |
+| backend `bun test src` | **2825 pass / 0 fail**（126 文件，15384 assertions） |
+| web `npx tsc --noEmit` | 0 错 |
+| web `bun test src` | **958 pass / 0 fail**（53 文件，7420 assertions） |
+| web `npm run build` | 成功（Next 16.3.6，38 页） |
+| 工作树指纹 | 运行前后一致 → 门禁有效 |
+
+**真实浏览器 + 真实后端验收（同一冻结构建）**：
+
+A) Forward 详情两块卡片（RELAY `/forwards/2` 与 DIRECT `/forwards/1`）：
+- 链路卡片与 DNS 前门卡片**都渲染**；
+- DIRECT 正确呈现「直连」与「无节点间跳是设计结论」措辞；
+- 累计流量按账本口径显示 **「无数据」而非 `0 B`**，并标注窗口（2026-09-24~10-07，Asia/Shanghai 日界）、归档节奏（每 10 分钟，今天是不完整日，最多滞后 10 分钟，面板无实时速率）与口径来源；
+- DNS 卡片显示 `unbound` + 服务端推导的期望地址；**禁用词（正常/健康/可达）零命中**；无 ≥400 API 错误。
+
+B) Onboarding 端到端（重跑，验证最终构建）：
+- 先复现闩锁（`inactive|NULL` → connection `waiting`）；
+- 消费真实 enrollment + 启动真 Agent 容器 → **5 秒内 `online`**（`registered/has_credential/accepts_new_business` 齐备）；
+- 成功 CTA「创建第一条转发」→ `/forwards?ingress_node_id=9`；一次性 enrollment **重放 401**；无 API 错误。
+
+## 3.13 仍未关闭的项（不得当作已完成）
+
+| 项 | 说明 | 归属 |
+|---|---|---|
+| F1 残留 | busybox wget 无法禁止跟随重定向 → **跨主机跳转时凭据是否外发未验证**；且「响应体像 Panel JSON」是结构性 grep 判定（镜像内无解析器），刻意构造 `{"data": <非 JSON>}` 仍会被判通过 | 新小切片 |
+| F2 | 「90s 窗口只有一处定义」全局不成立（reconciler / target-health / scheduler 各自写字面量，web 侧另 3 处） | 未派 |
+| F5 | Agent 心跳 `/api/internal/heartbeat` 后端无路由，每 30s 404（`task-6`，未派） | 未派 |
+| F8/F9 | `dispose()` 在从未 `start()` 时不回调 `onStop`；`stopTimeoutS/checkTimeoutS` 未过 `safeToken`（当前不可注入） | 未派 |
+| DDNS 运行时四态 | `synced` / `synced_unverified` / `error` / 退避在真实环境**未观察到**（无可写目标 + 30s 节拍） | 未验证 |
+| 升级完整流程 | 仅验证了探针在真实镜像下对真/假端点的行为，**未在真实节点跑完整 pull→stop→run→校验** | 未验证 |
+| 延迟端点 Web 消费 | D6 已交付只读端点（含四态与截断语义），Web 侧尚未消费 | 新切片 |
+| mock 与真实剩余分叉 | 已存在节点 + 显式不同 `role` → 真实 409（mock 不判）；带 `targets` 的重装 → 真实 409（mock 忽略） | 记录在案 |
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
