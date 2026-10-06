@@ -31,7 +31,9 @@ services:
       JWT_ISSUER: wp14
       JWT_TTL_SECONDS: "43200"
       COOKIE_SECURE: "false"
+      # Production seed defaults registration off; this disposable topology explicitly enables it.
       ALLOW_REGISTER_FALLBACK: "true"
+      SEED_DEMO_DATA: "false"
       RATE_LIMIT_ENABLED: "true"
       AUDIT_LOG_ENABLED: "true"
     networks:
@@ -119,6 +121,8 @@ services:
       TUNEX_CONFIG_KEY: ${TUNEX_CONFIG_KEY:?required}
       TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
       JWT_ISSUER: wp14
+      ALLOW_REGISTER_FALLBACK: "true"
+      SEED_DEMO_DATA: "false"
     command: ["sh", "-c", "bunx prisma migrate deploy && bun prisma/seed.ts"]
     restart: "no"
     depends_on:
