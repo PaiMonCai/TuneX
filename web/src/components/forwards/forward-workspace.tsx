@@ -516,16 +516,26 @@ export function ForwardWorkspace() {
     // Independent permissions and partial loads: denied nodes must not erase Forward summary.
     const summaryTask = canRead ? api.forwards.summary().then((value) => {
       if (current()) setSummary(value);
-    }).catch(() => {}) : Promise.resolve();
+    }).catch((err) => {
+      if (current()) toast.error(err instanceof Error ? err.message : t("forward.summaryLoadFailed"));
+    }) : Promise.resolve();
     const nodesTask = canReadNodes ? api.nodes.list().then(async (nodeRows) => {
       if (!current()) return;
       setNodes(nodeRows);
       const rows = await Promise.all(nodeRows.filter(isIngress).map(async (node) => ({
-        id: Number(node.id), bindings: await api.nodes.bindings(node.id).catch(() => []),
+        id: Number(node.id), bindings: await api.nodes.bindings(node.id).catch(() => null),
       })));
       if (!current()) return;
       const map: Record<number, NodeBinding[]> = {};
-      for (const row of rows) map[row.id] = row.bindings;
+      let bindingsFailed = false;
+      for (const row of rows) {
+        if (row.bindings === null) {
+          bindingsFailed = true;
+          continue;
+        }
+        map[row.id] = row.bindings;
+      }
+      if (bindingsFailed) toast.error(t("forward.bindingsLoadFailed"));
       setBindings(map);
     }).catch((err) => { if (current()) toast.error(err instanceof Error ? err.message : t("forward.loadFailed")); }) : Promise.resolve();
     await Promise.all([summaryTask, nodesTask]);
