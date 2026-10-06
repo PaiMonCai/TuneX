@@ -1,8 +1,7 @@
 /**
- * WP8 — Scheduler + RELAY Orchestrator（Track C，集成型工作包）。
+ * Scheduler + RELAY Orchestrator（Track C，集成型工作包）。
  *
- * 依据 `DEVELOPMENT.md` §7.11「WP8 — Scheduler + RELAY Orchestrator」与
- * §4.1「Tunnel 是期望状态，不是一次 HTTP 操作」、§4.2「RELAY 编排铁律」。
+ * RELAY 编排遵循期望状态与单一编排路径原则。
  *
  * ── 本模块负责什么 ──
  *  把「用户要一条 RELAY 隧道」这个意图，按 §7.11 冻结的**固定顺序**编排到底：
