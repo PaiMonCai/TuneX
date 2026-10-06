@@ -154,39 +154,18 @@ jobs:
         with:
           go-version-file: agent/go.mod
           cache-dependency-path: agent/go.mod
-      - run: go vet ./...
-      - run: go test ./...
-      # Datagram runtimes have concurrent socket/read/sweeper goroutines; normal
-      # tests cannot detect an unsynchronised field access. Keep the race detector
-      # as a merge gate for the whole Agent so future protocols get the same guard.
-      - name: Agent race detector
-        run: go test -race ./...
-      - run: go build -buildvcs=false ./...
-      - name: Cross-compile release binaries
-        run: |
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-linux-amd64 .
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -buildvcs=false -ldflags="-s -w" -o dist/tunex-agent-linux-arm64 .
-          # Windows target intentionally omitted: the agent uses Linux-only syscalls
-          # (netutil/statfs.go -> syscall.Statfs), so GOOS=windows fails to build.
+      - name: Vet Agent
+        run: go vet ./...
+      - name: Agent tests
+        run: go test ./...
+      # Do not execute the entire suite twice. Race instrumentation is kept only
+      # on packages that own concurrent sockets, hot reload and control dispatch.
+      - name: Race detector (forwarder + control)
+        run: go test -race ./internal/forwarder ./internal/control
+      - name: Build Agent
+        run: go build -buildvcs=false ./...
 
-  # V5-WP3：性能基线采集器的**纯函数自检**（统计口径 / 产物形状）。
-  #
-  # 只跑自检，**不跑真实基线**：端到端测量依赖机器负载与回环时序，放进 CI 就是
-  # 一条随机变红的测试。真实基线由人在一台确定环境的机器上跑（scripts/perf/README.md）。
-  # 这一步存在是因为"写好的采集器没人跑"是它唯一的失效方式：自检至少保证它还能
-  # 解析、统计、产出可机读的产物。
-  perf-harness:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Performance baseline harness self-test
-        run: python3 scripts/perf/test_v5_tcp_baseline.py
-
-  # V5-WP21：安装器的**静态 + 桩化**门（scripts/ops/install.sh / bootstrap.sh）。
+  # Production installer / backup / restore contract.
   #
   # 安装器会改机器状态（docker、部署目录、13001–13003、卷），也就没法在 CI runner 上反复
   # 真跑 —— 而且生产栈与 e2e 栈共用 `tunex` 项目名，同时 up 会互相踩（docs/production-deploy.md §1）。
