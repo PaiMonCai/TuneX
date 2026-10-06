@@ -1,19 +1,11 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowDown,
   ArrowLeftRight,
-  ArrowUp,
-  ArrowUpDown,
-  Copy,
   Loader2,
-  MoreHorizontal,
-  Pencil,
   Plus,
   Route,
-  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
@@ -40,8 +32,8 @@ import {
   type ForwardProtocol,
 } from "@/lib/forward-protocol";
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
-import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import { ForwardListControls } from "@/components/forwards/forward-list-controls";
+import { ForwardTable } from "@/components/forwards/forward-table";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -53,23 +45,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Input, Label } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
-  applyErrorAction,
   forwardErrorActions,
   forwardErrorInfo,
-  forwardProductBadgeVariant,
-  forwardProductStatus,
 } from "@/lib/forward-status";
-import { formatBytes, formatDateTime } from "@/lib/utils";
+import { formatBytes } from "@/lib/utils";
 import type {
   ForwardBatchAction,
   ForwardSummary,
@@ -129,44 +111,6 @@ const EMPTY_FORWARD: PortForward = {
   target_port: null,
   created_at: "",
 } as PortForward;
-
-/** 可点表头（后端 sort 白名单里本表真实展示的列）。 */
-function SortableHead({
-  label,
-  sortKey,
-  sort,
-  order,
-  onSort,
-}: {
-  label: string;
-  sortKey: ForwardSortKey;
-  sort: ForwardSortKey;
-  order: ForwardSortOrder;
-  onSort: (key: ForwardSortKey) => void;
-}) {
-  const active = sort === sortKey;
-  return (
-    <TableHead aria-sort={active ? (order === "asc" ? "ascending" : "descending") : "none"}>
-      <button
-        type="button"
-        className="inline-flex items-center gap-1 text-left hover:underline"
-        onClick={() => onSort(sortKey)}
-        data-testid={`forward-sort-${sortKey}`}
-      >
-        {label}
-        {active ? (
-          order === "asc" ? (
-            <ArrowUp className="size-3" />
-          ) : (
-            <ArrowDown className="size-3" />
-          )
-        ) : (
-          <ArrowUpDown className="size-3 opacity-40" />
-        )}
-      </button>
-    </TableHead>
-  );
-}
 
 export function ForwardWorkspace() {
   const { t, locale } = useI18n();
@@ -967,197 +911,29 @@ export function ForwardWorkspace() {
             }}
           />
 
-          <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)]">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-10">
-                    <input
-                      type="checkbox"
-                      className="size-4 cursor-pointer"
-                      data-testid="forward-select-all"
-                      aria-label={L("forward.selectAll")}
-                      disabled={!can("forward:update") || pageIds.length === 0}
-                      checked={allPageSelected}
-                      onChange={(event) => toggleSelectAllOnPage(event.target.checked)}
-                    />
-                  </TableHead>
-                  <SortableHead
-                    label={t("common.name")}
-                    sortKey="name"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <SortableHead
-                    label={t("forward.mode")}
-                    sortKey="mode"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  {/* V5-WP5-A1：协议列。与「模式」是两个维度，不共用一格。 */}
-                  <TableHead>{t("forward.protocol")}</TableHead>
-                  <TableHead>{t("forward.ingressNode")}</TableHead>
-                  <TableHead>{t("forward.egressNode")}</TableHead>
-                  <SortableHead
-                    label={t("forward.listenPort")}
-                    sortKey="listen_port"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <TableHead>{t("forward.accessAddress")}</TableHead>
-                  <TableHead>{t("forward.target")}</TableHead>
-                  <SortableHead
-                    label={t("common.status")}
-                    sortKey="status"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <SortableHead
-                    label={t("common.createdAt")}
-                    sortKey="created_at"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <TableHead className="w-12" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {loading ? (
-                  <TableRow>
-                    <TableCell colSpan={12} className="h-24 text-center text-[var(--muted-foreground)]">
-                      {t("common.loading")}
-                    </TableCell>
-                  </TableRow>
-                ) : forwards.length === 0 ? (
-                  <TableEmpty colSpan={12} text={t("common.noData")} />
-                ) : (
-                  forwards.map((forward) => (
-                    <TableRow key={String(forward.id)}>
-                      <TableCell>
-                        <input
-                          type="checkbox"
-                          className="size-4 cursor-pointer"
-                          data-testid={`forward-select-${forward.id}`}
-                          aria-label={L("forward.selectRow")}
-                          disabled={!canForward(forward, "update")}
-                          checked={selectedIds.has(Number(forward.id))}
-                          onChange={(event) =>
-                            toggleSelected(Number(forward.id), event.target.checked)
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="font-medium">
-                        <Link href={"/forwards/" + forward.id} className="hover:underline">
-                          {forward.name}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>
-                          {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        {/* 共用徽标：`tls` / `ws` / 历史 `wss` 都照实渲染，无 unknown 兜底。 */}
-                        <ForwardProtocolBadge forward={forward} />
-                      </TableCell>
-                      <TableCell>{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
-                      <TableCell>{forward.egress_node?.node_id ?? "—"}</TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {forwardAccessAddress(forward) ?? t("forward.addressPending")}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {forward.target_host ?? "—"}{forward.target_port ? ":" + forward.target_port : ""}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-col gap-1">
-                          {(() => {
-                            // V4-WP8 §13.7：产品状态取代 raw apply_status 枚举
-                            //（唯一实现见 lib/forward-status.ts）。
-                            const product = forwardProductStatus(forward);
-                            return (
-                              <Badge
-                                variant={forwardProductBadgeVariant(product.state)}
-                                data-testid={`forward-status-${forward.id}`}
-                              >
-                                {t(`forward.product.${product.state}`)}
-                              </Badge>
-                            );
-                          })()}
-                          {forward.apply_error ? (
-                            /* V4-WP8 §13.5：先给「下一步」，原文仍保留（排障用）。 */
-                            <span className="max-w-52 text-xs text-[var(--destructive)]">
-                              {applyErrorAction(locale, forward.apply_error_code) ? (
-                                <span className="block">
-                                  {applyErrorAction(locale, forward.apply_error_code)}
-                                </span>
-                              ) : null}
-                              <span className="block truncate font-mono opacity-70">
-                                {forward.apply_error}
-                              </span>
-                            </span>
-                          ) : null}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-xs text-[var(--muted-foreground)]">
-                        {formatDateTime(forward.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button variant="ghost" size="icon" disabled={actionBusy === Number(forward.id)}>
-                              <MoreHorizontal className="size-4" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            {canForward(forward, "update") && forward.apply_status === "error" ? (
-                              <DropdownMenuItem onClick={() => void runAction(forward, "retry")}>
-                                {t("forward.retry")}
-                              </DropdownMenuItem>
-                            ) : null}
-                            {canForward(forward, "update") && forward.apply_status === "active" ? (
-                              <DropdownMenuItem onClick={() => void runAction(forward, "suspend")}>
-                                {t("forward.suspend")}
-                              </DropdownMenuItem>
-                            ) : null}
-                            {canForward(forward, "update") && forward.apply_status === "suspended" ? (
-                              <DropdownMenuItem onClick={() => void runAction(forward, "resume")}>
-                                {t("forward.resume")}
-                              </DropdownMenuItem>
-                            ) : null}
-                            <DropdownMenuItem disabled={!canForward(forward, "update")} onClick={() => setEditTarget(forward)}>
-                              <Pencil className="size-4" />
-                              {t("forward.editForward")}
-                            </DropdownMenuItem>
-                            {/* V4-WP9 §13.6：复制 = 同一份 create 契约再建一条（端口自动分配）。 */}
-                            <DropdownMenuItem
-                              disabled={!canCreate}
-                               data-testid={`forward-copy-${forward.id}`}
-                              onClick={() => copyForward(forward)}
-                            >
-                              <Copy className="size-4" />
-                              {L("forward.copyForward")}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem disabled={!canForward(forward, "delete")} className="text-[var(--destructive)]" onClick={() => void removeForward(forward)}>
-                              <Trash2 className="size-4" />
-                              {t("common.delete")}
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </div>
+          <ForwardTable
+            forwards={forwards}
+            loading={loading}
+            sort={sort}
+            order={order}
+            selectedIds={selectedIds}
+            allPageSelected={allPageSelected}
+            canUpdateAny={can("forward:update")}
+            canCreate={canCreate}
+            actionBusy={actionBusy}
+            locale={locale}
+            t={t}
+            text={L}
+            canUpdate={(forward) => canForward(forward, "update")}
+            canDelete={(forward) => canForward(forward, "delete")}
+            onSort={toggleSort}
+            onSelectAll={toggleSelectAllOnPage}
+            onSelect={toggleSelected}
+            onAction={(forward, action) => void runAction(forward, action)}
+            onEdit={setEditTarget}
+            onCopy={copyForward}
+            onDelete={(forward) => void removeForward(forward)}
+          />>
         </div>
       )}
 
