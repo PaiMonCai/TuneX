@@ -295,6 +295,35 @@ describe("A. 五份事实的对比（§7.12 对比清单）", () => {
     expect(isNodeUnreachable(node({ last_seen_at: fresh, reported_at: fresh }), NOW)).toBe(false);
   });
 
+  test("last_seen 落后但 state report 新鲜时仍视为在线", () => {
+    const stale = new Date(NOW.getTime() - DEFAULT_NODE_STALE_AFTER_MS - 1);
+    const freshReport = new Date(NOW.getTime() - 1_000);
+    expect(
+      isNodeUnreachable(
+        node({ last_seen_at: stale, reported_at: freshReport }),
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  test("RELAY 折叠节点也使用最新活动时间，不因旧 last_seen 压掉自动修复", async () => {
+    const stale = new Date(NOW.getTime() - DEFAULT_NODE_STALE_AFTER_MS - 1);
+    const freshReport = new Date(NOW.getTime() - 1_000);
+    const rec = recordingSink();
+    const out = await executeReconcile(
+      depsFrom(
+        [tunnel({ applied_revision: 5 })],
+        [agent({ revision: 5 })],
+        [node({ last_seen_at: stale, reported_at: freshReport })],
+        { sink: rec.sink },
+      ),
+    );
+
+    expect(out.findings.some((x) => x.code === "node_unreachable")).toBe(false);
+    expect(out.resent).toBe(1);
+    expect(rec.calls).toEqual([{ tunnel_id: 1, revision: 7 }]);
+  });
+
   test("从未心跳（last_seen/reported 皆 null）→ 视为不可达", () => {
     expect(isNodeUnreachable(node({ last_seen_at: null, reported_at: null }), NOW)).toBe(true);
   });
