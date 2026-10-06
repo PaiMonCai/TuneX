@@ -863,6 +863,51 @@ async function persistSuccess(
   });
 }
 
+
+type CompensationRemoval = Parameters<Orchestrator["removeTunnel"]>[0];
+
+/**
+ * Fail-closed compensation: runtime removal is the safety barrier before a
+ * NodePortLease may be released. If any runtime cannot be confirmed removed,
+ * keep every lease owned by the tunnel so the allocator cannot hand a possibly
+ * still-listening port to another runtime. Reconcile can retry cleanup later.
+ */
+async function compensateRuntimesThenRelease(input: {
+  tunnelId: number;
+  orchestrator: Orchestrator;
+  removals: readonly CompensationRemoval[];
+  portPoolDeps: SchedulerDeps["portPoolDeps"];
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const failures: string[] = [];
+  for (const removal of input.removals) {
+    try {
+      const result = await input.orchestrator.removeTunnel(removal);
+      if (!result.ok) failures.push(`${removal.direction ?? "runtime"}: ${result.error}`);
+    } catch (error) {
+      failures.push(
+        `${removal.direction ?? "runtime"}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  if (failures.length > 0) {
+    return {
+      ok: false,
+      error: `runtime teardown 未确认完成，保留端口租约等待 reconcile：${failures.join("; ")}`,
+    };
+  }
+
+  try {
+    await releaseLease({ tunnelId: input.tunnelId }, input.portPoolDeps);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `runtime 已撤除，但端口租约释放失败：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /* ================================================================== */
 /* 主入口                                                              */
 /* ================================================================== */
@@ -949,16 +994,20 @@ async function correctDatagramHopPeerAfterIngressAck(args: {
     // 纠正失败 ⇒ 出口此刻对**错的**地址取证（数据面不通），而两条腿的 revision 已不一致。
     // 按既有口径补偿到"两侧都没有 runtime"，并把这次编排报成失败——不做半成功。
     const reason = "hop peer correction failed";
-    await args.orchestrator
-      .removeTunnel({ tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason })
-      .catch(() => {});
-    await args.orchestrator
-      .removeTunnel({ tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason })
-      .catch(() => {});
-    await releaseLease({ tunnelId: args.tunnelId }, args.deps.portPoolDeps).catch(() => {});
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId: args.tunnelId,
+      orchestrator: args.orchestrator,
+      // Reverse of activation order: near side first, then far side.
+      removals: [
+        { tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason },
+        { tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason },
+      ],
+      portPoolDeps: args.deps.portPoolDeps,
+    });
     let error = "unknown";
     if (!egress.ok) error = egress.error;
     else if (ingress !== null && !ingress.ok) error = ingress.error;
+    if (!compensation.ok) error += `；${compensation.error}`;
     return { ok: false, revision: correctedRevision, error: `datagram 跳取证的纠正下发失败：${error}`, hopPeer: learned };
   }
   // 「两条腿共用同一个 config_revision」是不变量（§3.2）：纠正把两者一起抬到新 revision。
@@ -975,17 +1024,19 @@ export async function createRelayTunnel(
   const now = deps.now();
   const steps: StepRecord[] = [];
 
-  const fail = (
+  const fail = async (
     step: SchedulerStep,
     code: SchedulerErrorCode,
     detail: string,
     ctx: { tunnelId?: number; revision?: number | null; meta?: Record<string, unknown> },
-  ): CreateRelayFailure => {
+  ): Promise<CreateRelayFailure> => {
     steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
     if (ctx.tunnelId !== undefined) {
-      // 保留 Tunnel（§7.11）：只写 error，不删行。写库失败不能吞——
-      // 否则调会方拿到失败却看不到 DB 里的原因，Retry 时状态还是 pending。
-      void persistFailure(store, ctx.tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+      // The response may only claim a durable failure after the ledger write
+      // completes. If the DB write itself fails, propagate that storage error:
+      // returning a neat apply error while the row is still pending/applying is
+      // a false terminal state and makes Retry/reconcile reason from stale facts.
+      await persistFailure(store, ctx.tunnelId, { code, detail, revision: ctx.revision });
     }
     return {
       ok: false,
@@ -1297,12 +1348,26 @@ export async function createRelayTunnel(
     deps.portPoolDeps,
   );
   if (!egressAlloc.ok) {
-    // 补偿：入口租约已产生，先释放再报错。
-    await releaseLease({ leaseId: ingressAlloc.leaseId }, deps.portPoolDeps).catch(() => {});
-    return fail("acquire_ports", egressAlloc.code, `出口端口分配失败：${egressAlloc.detail}`, {
+    // New Tunnel: no runtime exists yet, so releasing the single acquired lease
+    // is safe. If that release cannot be confirmed, surface compensation_failed
+    // instead of pretending the allocator is clean.
+    const compensation = await compensateRuntimesThenRelease({
       tunnelId,
-      meta: { direction: "egress", ingress_port: ingressAlloc.port },
+      orchestrator,
+      removals: [],
+      portPoolDeps: deps.portPoolDeps,
     });
+    return fail(
+      "acquire_ports",
+      compensation.ok ? egressAlloc.code : SCHEDULER_ERROR_CODES.compensation_failed,
+      compensation.ok
+        ? `出口端口分配失败：${egressAlloc.detail}`
+        : `出口端口分配失败：${egressAlloc.detail}；${compensation.error}`,
+      {
+        tunnelId,
+        meta: { direction: "egress", ingress_port: ingressAlloc.port },
+      },
+    );
   }
 
   await store.tunnel.update({
@@ -1355,11 +1420,19 @@ export async function createRelayTunnel(
   // 落成 apply_egress 失败 —— 否则调用方收到的是一个 TypeError 而不是
   // Tunnel 记录上的 apply_status=error，排障时对不上号。
   if (poolId !== null && egressTargets.length === 0) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const detail = `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`;
     return fail(
       "apply_egress",
-      SCHEDULER_ERROR_CODES.egress_apply_rejected,
-      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`,
+      compensation.ok
+        ? SCHEDULER_ERROR_CODES.egress_apply_rejected
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      compensation.ok ? detail : `${detail}；${compensation.error}`,
       { tunnelId, revision },
     );
   }
@@ -1383,15 +1456,36 @@ export async function createRelayTunnel(
     }),
   });
   if (!egressDispatch.ok) {
-    // 补偿：出口侧没成功，两侧都没有 listener 活着，但**两个端口租约已产生**。
-    // 必须先释放——否则这条隧道的端口被一条永远不会 active 的记录占着，
-    // reconcile（WP9）要等 15 分钟预分配 TTL 才收得回。
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    return fail("apply_egress", mapDispatchCode("egress", egressDispatch), egressDispatch.error, {
+    // A failed/unknown dispatch may still have created the listener. Confirm a
+    // higher-revision remove before releasing either port lease.
+    const compensation = await compensateRuntimesThenRelease({
       tunnelId,
-      revision,
-      meta: { command_id: egressDispatch.commandId ?? null },
+      orchestrator,
+      removals: [
+        {
+          tunnelId,
+          node: egressPick.node,
+          direction: "egress",
+          revision: revision + 1,
+          reason: "egress apply failed",
+        },
+      ],
+      portPoolDeps: deps.portPoolDeps,
     });
+    return fail(
+      "apply_egress",
+      compensation.ok
+        ? mapDispatchCode("egress", egressDispatch)
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      compensation.ok
+        ? egressDispatch.error
+        : `${egressDispatch.error}；${compensation.error}`,
+      {
+        tunnelId,
+        revision,
+        meta: { command_id: egressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({
     step: "apply_egress",
@@ -1435,14 +1529,21 @@ export async function createRelayTunnel(
     // "两条编排里只有一条认识中间跳"的记录。这里保留它原来的内联拆除，不做半套改动：
     // 把中间跳支持搬过来需要与 `reapplyRelayTunnel` 同等的一套（端口分配 + 中转腿 + 逆序拆除），
     // 而那属于"先确认它是否可达"之后的事。
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const compensationDetail = compensation.ok ? "" : `；${compensation.error}`;
     return fail(
       "apply_ingress",
-      SCHEDULER_ERROR_CODES.invariant_violated,
-      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      compensation.ok
+        ? SCHEDULER_ERROR_CODES.invariant_violated
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      `RuntimePlan 自检未通过：${planViolations.join("; ")}${compensationDetail}`,
       { tunnelId, revision, meta: { runtime_plan_violations: planViolations } },
     );
   }
@@ -1458,16 +1559,32 @@ export async function createRelayTunnel(
     ...tlsPathsFor(asRow<Record<string, unknown>>(created) as Record<string, unknown>, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
-    /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
+    // The ingress command was sent; timeout/invalid ACK is an UNKNOWN outcome,
+    // not proof that no listener exists. Remove near→far, then release ports.
+    const compensation = await compensateRuntimesThenRelease({
       tunnelId,
-      revision,
-      meta: { command_id: ingressDispatch.commandId ?? null },
+      orchestrator,
+      removals: [
+        { tunnelId, node: ingressPick.node, direction: "ingress", revision: revision + 1, reason: "ingress apply failed" },
+        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" },
+      ],
+      portPoolDeps: deps.portPoolDeps,
     });
+    const detail = compensation.ok
+      ? ingressDispatch.error
+      : `${ingressDispatch.error}；${compensation.error}`;
+    return fail(
+      "apply_ingress",
+      compensation.ok
+        ? mapDispatchCode("ingress", ingressDispatch)
+        : SCHEDULER_ERROR_CODES.compensation_failed,
+      detail,
+      {
+        tunnelId,
+        revision,
+        meta: { command_id: ingressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({
     step: "apply_ingress",
@@ -1631,14 +1748,14 @@ export async function reapplyRelayTunnel(
   const now = deps.now();
   const steps: StepRecord[] = [];
 
-  const fail = (
+  const fail = async (
     step: SchedulerStep,
     code: SchedulerErrorCode,
     detail: string,
     ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
-  ): CreateRelayFailure => {
+  ): Promise<CreateRelayFailure> => {
     steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
-    void persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+    await persistFailure(store, tunnelId, { code, detail, revision: ctx.revision });
     return {
       ok: false,
       tunnelId,
@@ -1889,11 +2006,11 @@ export async function reapplyRelayTunnel(
     deps.portPoolDeps,
   );
   if (!egressAlloc.ok) {
-    if (!ingressAlloc.reused) {
-      await releaseLease({ leaseId: ingressAlloc.leaseId }, deps.portPoolDeps).catch(() => {});
-    }
+    // Existing Tunnel: even a newly materialised lease may protect an old
+    // listener on the persisted port. Keep ownership until a runtime teardown
+    // is explicitly confirmed.
     return fail("acquire_ports", egressAlloc.code, `出口端口分配失败：${egressAlloc.detail}`, {
-      meta: { direction: "egress", ingress_port: ingressAlloc.port },
+      meta: { direction: "egress", ingress_port: ingressAlloc.port, leases_retained: true },
     });
   }
 
@@ -1915,9 +2032,8 @@ export async function reapplyRelayTunnel(
       deps.portPoolDeps,
     );
     if (!middleAlloc.ok) {
-      await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
       return fail("acquire_ports", middleAlloc.code, `中间跳端口分配失败：${middleAlloc.detail}`, {
-        meta: { direction: "transit", middle_node_id: middleNodeId },
+        meta: { direction: "transit", middle_node_id: middleNodeId, leases_retained: true },
       });
     }
     middlePort = middleAlloc.port;
@@ -1955,12 +2071,11 @@ export async function reapplyRelayTunnel(
       ? await store.egressTarget.findMany({ where: { pool_id: poolId, status: "active" }, orderBy: { order_by: "asc" } })
       : [];
   if (poolId !== null && egressTargets.length === 0) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
     return fail(
       "apply_egress",
       SCHEDULER_ERROR_CODES.egress_apply_rejected,
-      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）`,
-      { revision },
+      `出口池 ${poolId} 下没有 active 目标（EgressTarget 全部下线或未配置）；现有端口租约保留给可能仍在运行的旧 runtime`,
+      { revision, meta: { leases_retained: true } },
     );
   }
 
@@ -1986,11 +2101,18 @@ export async function reapplyRelayTunnel(
     }),
   });
   if (!egressDispatch.ok) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    return fail("apply_egress", mapDispatchCode("egress", egressDispatch), egressDispatch.error, {
-      revision,
-      meta: { command_id: egressDispatch.commandId ?? null },
-    });
+    // Unknown dispatch outcome: do not free ports under a possibly-live old/new
+    // runtime. Reconciler sees desired=inactive + apply=error and owns the later
+    // runtime cleanup; the lease remains the collision barrier until then.
+    return fail(
+      "apply_egress",
+      mapDispatchCode("egress", egressDispatch),
+      `${egressDispatch.error}；端口租约保留，等待 runtime 对账确认后回收`,
+      {
+        revision,
+        meta: { command_id: egressDispatch.commandId ?? null, leases_retained: true },
+      },
+    );
   }
   steps.push({ step: "apply_egress", ok: true, meta: { command_id: egressDispatch.result.commandId, revision } });
   steps.push({ step: "egress_ack", ok: true, meta: { applied_revision: egressDispatch.result.revision } });
@@ -2006,16 +2128,39 @@ export async function reapplyRelayTunnel(
    * 一个失败分支漏撤一条腿 = 一次永久性资源泄漏，而泄漏只在**下一次**创建时才显形。
    * 所以它必须是一处、且必须逆序（正向先远后近 ⇒ 拆除先近后远）。
    */
-  const teardownDispatched = async (reason: string): Promise<void> => {
+  const teardownDispatched = async (reason: string): Promise<string | null> => {
+    const removals: CompensationRemoval[] = [
+      {
+        tunnelId,
+        node: ingressPick.node,
+        direction: "ingress",
+        revision: revision + 1,
+        reason: `${reason} (ingress)`,
+      },
+    ];
     if (transitNode != null) {
-      await orchestrator
-        .removeTunnel({ tunnelId, node: transitNode, direction: "egress", revision: revision + 1, reason: `${reason} (transit)` })
-        .catch(() => {});
+      removals.push({
+        tunnelId,
+        node: transitNode,
+        direction: "egress",
+        revision: revision + 1,
+        reason: `${reason} (transit)`,
+      });
     }
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    removals.push({
+      tunnelId,
+      node: egressPick.node,
+      direction: "egress",
+      revision: revision + 1,
+      reason,
+    });
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals,
+      portPoolDeps: deps.portPoolDeps,
+    });
+    return compensation.ok ? null : compensation.error;
   };
 
   // ── V5.4：中间跳（若有）──
@@ -2034,10 +2179,16 @@ export async function reapplyRelayTunnel(
       | SchedulableNode
       | null;
     if (!middleNode) {
-      await teardownDispatched("middle node missing");
-      return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, `中间跳节点 ${middleNodeId} 不存在`, {
-        revision,
-      });
+      const compensationError = await teardownDispatched("middle node missing");
+      const detail = `中间跳节点 ${middleNodeId} 不存在${compensationError ? `；${compensationError}` : ""}`;
+      return fail(
+        "apply_transit",
+        compensationError
+          ? SCHEDULER_ERROR_CODES.compensation_failed
+          : SCHEDULER_ERROR_CODES.invariant_violated,
+        detail,
+        { revision },
+      );
     }
     const transit = await orchestrator.dispatchTransit({
       tunnelId,
@@ -2053,8 +2204,16 @@ export async function reapplyRelayTunnel(
       protocol: reapplyProtocol,
     });
     if (!transit.ok) {
-      await teardownDispatched("transit apply failed");
-      return fail("apply_transit", mapDispatchCode("egress", transit), transit.error, { revision });
+      const compensationError = await teardownDispatched("transit apply failed");
+      const detail = compensationError ? `${transit.error}；${compensationError}` : transit.error;
+      return fail(
+        "apply_transit",
+        compensationError
+          ? SCHEDULER_ERROR_CODES.compensation_failed
+          : mapDispatchCode("egress", transit),
+        detail,
+        { revision },
+      );
     }
     transitHost = transit.host;
     transitNode = {
@@ -2089,11 +2248,14 @@ export async function reapplyRelayTunnel(
   });
   const planViolations = forwardRuntimePlanViolations(plan);
   if (planViolations.length > 0) {
-    await teardownDispatched("runtime plan invalid");
+    const compensationError = await teardownDispatched("runtime plan invalid");
+    const detail = `RuntimePlan 自检未通过：${planViolations.join("; ")}${compensationError ? `；${compensationError}` : ""}`;
     return fail(
       "apply_ingress",
-      SCHEDULER_ERROR_CODES.invariant_violated,
-      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      compensationError
+        ? SCHEDULER_ERROR_CODES.compensation_failed
+        : SCHEDULER_ERROR_CODES.invariant_violated,
+      detail,
       { revision, meta: { runtime_plan_violations: planViolations } },
     );
   }
@@ -2109,11 +2271,19 @@ export async function reapplyRelayTunnel(
     ...tlsPathsFor(row, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
-    await teardownDispatched("ingress apply failed");
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
-      revision,
-      meta: { command_id: ingressDispatch.commandId ?? null },
-    });
+    const compensationError = await teardownDispatched("ingress apply failed");
+    const detail = compensationError ? `${ingressDispatch.error}；${compensationError}` : ingressDispatch.error;
+    return fail(
+      "apply_ingress",
+      compensationError
+        ? SCHEDULER_ERROR_CODES.compensation_failed
+        : mapDispatchCode("ingress", ingressDispatch),
+      detail,
+      {
+        revision,
+        meta: { command_id: ingressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
   steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
@@ -2139,7 +2309,9 @@ export async function reapplyRelayTunnel(
     deps,
   });
   if (!ingressAckHop.ok) {
-    await teardownDispatched("hop peer correction failed");
+    // correctDatagramHopPeerAfterIngressAck already performed fail-closed
+    // compensation at correctedRevision + 1. Repeating teardown here would use
+    // this closure's older revision and can itself be rejected as stale.
     // 注意：reapply 的 `fail()` 只收 `{ revision, meta }`（tunnelId 是它的第一个参数所隐含的），
     // 与 create 的那份签名不同 —— 照抄 create 的调用形状会被 tsc 拦住。
     return fail("apply_ingress", SCHEDULER_ERROR_CODES.invariant_violated, ingressAckHop.error, {
@@ -2191,14 +2363,14 @@ async function applyFederatedRelayTunnel(
   const now = deps.now();
   const steps: StepRecord[] = [];
 
-  const fail = (
+  const fail = async (
     step: SchedulerStep,
     code: SchedulerErrorCode,
     detail: string,
     ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
-  ): CreateRelayFailure => {
+  ): Promise<CreateRelayFailure> => {
     steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
-    void persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+    await persistFailure(store, tunnelId, { code, detail, revision: ctx.revision });
     return { ok: false, tunnelId, steps, failedStep: step, error_code: code, error: errorText(code, detail), retryable: isRetryable(code) };
   };
 
@@ -2337,15 +2509,81 @@ async function applyFederatedRelayTunnel(
   /** 本次委托拿到的远端租约（撤它的时候要用同一个键）。 */
   let remoteLeaseRef: string | null = null;
 
-  /** 撤掉本次已发出去的东西（本地接入口租约 + 远端腿），逆序。 */
-  const teardown = async (_reason: string): Promise<void> => {
-    if (remoteLeaseRef !== null) {
-      await releaseFederatedEgress(
-        { tunnelId, revision, peer_panel_id: peerPanelId, lease_ref: remoteLeaseRef },
-        { sender: deps.federatedSender, now: deps.now },
-      ).catch(() => undefined);
+  /**
+   * Fail-closed teardown for the federated reapply path.
+   *
+   * The local ingress may be an OLD runtime that was still serving when this
+   * retry started. Releasing its NodePortLease without first confirming the
+   * listener is gone lets the allocator hand a live port to another Forward.
+   * Stop the near side first, then release its lease; remote cleanup is tracked
+   * independently but any uncertainty is returned to the caller.
+   */
+  const teardown = async (reason: string): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const errors: string[] = [];
+    let ingressRemoved = false;
+    try {
+      const removed = await orchestrator.removeTunnel({
+        tunnelId,
+        node: ingressPick.node,
+        direction: "ingress",
+        revision: revision + 1,
+        reason,
+      });
+      if (removed.ok) ingressRemoved = true;
+      else errors.push(`ingress runtime: ${removed.error}`);
+    } catch (error) {
+      errors.push(
+        `ingress runtime: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+
+    if (ingressRemoved) {
+      try {
+        await releaseLease({ tunnelId }, deps.portPoolDeps);
+      } catch (error) {
+        errors.push(
+          `local port lease: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    if (remoteLeaseRef !== null) {
+      try {
+        const released = await releaseFederatedEgress(
+          { tunnelId, revision, peer_panel_id: peerPanelId, lease_ref: remoteLeaseRef },
+          { sender: deps.federatedSender, now: deps.now },
+        );
+        if (!released.ok) {
+          errors.push(
+            `remote egress: ${released.code ?? "internal_error"} ${released.message ?? ""}`.trim(),
+          );
+        }
+      } catch (error) {
+        errors.push(
+          `remote egress: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    return errors.length === 0
+      ? { ok: true }
+      : { ok: false, error: errors.join("; ") };
+  };
+
+  const failAfterTeardown = async (
+    step: SchedulerStep,
+    originalCode: SchedulerErrorCode,
+    detail: string,
+    reason: string,
+    ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
+  ): Promise<CreateRelayFailure> => {
+    const cleanup = await teardown(reason);
+    return fail(
+      step,
+      cleanup.ok ? originalCode : SCHEDULER_ERROR_CODES.compensation_failed,
+      cleanup.ok ? detail : `${detail}；补偿未确认：${cleanup.error}`,
+      ctx,
+    );
   };
 
   // ── ⑤ 远端出口腿：先把**上一代**的腿收掉，再委托这一代 ──
@@ -2353,17 +2591,32 @@ async function applyFederatedRelayTunnel(
   // 每次创建/重试都会 bump revision，而 intent_id = fw-<tunnelId>-<revision> ⇒ 在
   // host 侧那是一条**新**租约。不先收掉旧的，每次重试都会在对面的面板上留下一条
   // 继续监听的孤儿 runtime + 一个被占的端口（G4 的同族泄漏，且本机看不见）。
-  const stale = await releaseStaleFederatedEgressForTunnel(tunnelId, revision, {
-    sender: deps.federatedSender,
-    now: deps.now,
-  }).catch(() => null);
-  if (stale && stale.failed.length > 0) {
-    steps.push({
-      step: "apply_egress",
-      ok: true,
-      detail: `上一代远端腿释放未确认：${stale.failed.map((f) => `${f.intent_id}(${f.code})`).join(", ")}`,
-      meta: { stale_release_failed: stale.failed.length },
+  let stale: Awaited<ReturnType<typeof releaseStaleFederatedEgressForTunnel>>;
+  try {
+    stale = await releaseStaleFederatedEgressForTunnel(tunnelId, revision, {
+      sender: deps.federatedSender,
+      now: deps.now,
     });
+  } catch (error) {
+    return failAfterTeardown(
+      "apply_egress",
+      SCHEDULER_ERROR_CODES.compensation_failed,
+      `无法确认上一代远端腿是否已释放：${error instanceof Error ? error.message : String(error)}`,
+      "stale remote egress lookup failed",
+      { revision, meta: { stale_release_lookup_failed: true } },
+    );
+  }
+  if (stale.failed.length > 0) {
+    // Creating the new generation now would knowingly permit two remote
+    // runtimes/ports for the same Forward. Stop the local ingress and keep the
+    // failure durable; do not delegate this revision yet.
+    return failAfterTeardown(
+      "apply_egress",
+      SCHEDULER_ERROR_CODES.compensation_failed,
+      `上一代远端腿释放未确认：${stale.failed.map((f) => `${f.intent_id}(${f.code})`).join(", ")}`,
+      "stale remote egress release unconfirmed",
+      { revision, meta: { stale_release_failed: stale.failed.length } },
+    );
   }
   const delegated = await delegateFederatedEgress(    {
       tunnelId,
@@ -2379,12 +2632,17 @@ async function applyFederatedRelayTunnel(
     { sender: deps.federatedSender, now: deps.now },
   );
   if (!delegated.ok) {
-    await teardown("remote egress delegation failed");
-    return fail(
+    // A failed delegate may still have created a remote lease before the failure
+    // became known. Carry that ref into teardown so we make one more idempotent
+    // release attempt instead of relying on the delegate's best effort alone.
+    remoteLeaseRef = delegated.lease_ref;
+    return failAfterTeardown(
       "apply_egress",
-      delegated.code === "peer_unreachable" ? SCHEDULER_ERROR_CODES.egress_ack_failed : SCHEDULER_ERROR_CODES.egress_apply_rejected,
-      `远端出口腿（peer=${peerPanelId}）建立失败：${delegated.message}` +
-        (delegated.lease_ref ? `；远端租约 ${delegated.compensated ? "已释放" : "释放未确认"}` : ""),
+      delegated.code === "peer_unreachable"
+        ? SCHEDULER_ERROR_CODES.egress_ack_failed
+        : SCHEDULER_ERROR_CODES.egress_apply_rejected,
+      `远端出口腿（peer=${peerPanelId}）建立失败：${delegated.message}`,
+      "remote egress delegation failed",
       { revision, meta: { federation_code: delegated.code, lease_ref: delegated.lease_ref } },
     );
   }
@@ -2399,11 +2657,11 @@ async function applyFederatedRelayTunnel(
 
   // ── ⑥ 入口：next_hop 只能是 host 返回的地址（**不猜 IP**）──
   if (delegated.next_hop === null) {
-    await teardown("remote egress has no addressable host");
-    return fail(
+    return failAfterTeardown(
       "apply_ingress",
       SCHEDULER_ERROR_CODES.invariant_violated,
       `远端出口 ${peerPanelId} 未返回可寻址的 node_address，拒绝用猜测的地址启动入口`,
+      "remote egress has no addressable host",
       { revision },
     );
   }
@@ -2417,11 +2675,16 @@ async function applyFederatedRelayTunnel(
     ...tlsPathsFor(row, protocol),
   });
   if (!ingressDispatch.ok) {
-    await teardown("ingress apply failed");
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
-      revision,
-      meta: { command_id: ingressDispatch.commandId ?? null },
-    });
+    return failAfterTeardown(
+      "apply_ingress",
+      mapDispatchCode("ingress", ingressDispatch),
+      ingressDispatch.error,
+      "ingress apply failed",
+      {
+        revision,
+        meta: { command_id: ingressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
   steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
@@ -2503,7 +2766,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] 协议未通过当前 runtime Gate`,
       },
-    }).catch(() => {});
+    });
     return {
       ok: false,
       tunnelId,
@@ -2552,7 +2815,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] DIRECT 入口节点不可用`,
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: "DIRECT 入口节点不可用", retryable: isRetryable(code) };
   }
 
@@ -2568,7 +2831,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] DIRECT 目标无效`,
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: "DIRECT 目标无效", retryable: false };
   }
 
@@ -2598,7 +2861,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: detail.slice(0, 500),
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
   }
 
@@ -2628,7 +2891,7 @@ export async function reapplyDirectTunnel(
         apply_error_code: code,
         apply_error: `[${code}] ${alloc.detail}`.slice(0, 500),
       },
-    }).catch(() => {});
+    });
     return { ok: false, tunnelId, error_code: code, error: alloc.detail, retryable: isRetryable(code) };
   }
   ingressPort = alloc.port;
@@ -2661,18 +2924,36 @@ export async function reapplyDirectTunnel(
   });
   const directPlanViolations = forwardRuntimePlanViolations(directPlan);
   if (directPlanViolations.length > 0) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    const code = SCHEDULER_ERROR_CODES.invariant_violated;
-    const detail = `RuntimePlan 自检未通过：${directPlanViolations.join("; ")}`;
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        {
+          tunnelId,
+          node: pick.node,
+          direction: "direct",
+          revision: revision + 1,
+          reason: "direct runtime plan invalid",
+        },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const code = compensation.ok
+      ? SCHEDULER_ERROR_CODES.invariant_violated
+      : SCHEDULER_ERROR_CODES.compensation_failed;
+    const detail =
+      `RuntimePlan 自检未通过：${directPlanViolations.join("; ")}` +
+      (compensation.ok ? "" : `；${compensation.error}`);
     await store.tunnel.update({
       where: { id: tunnelId },
       data: {
         apply_status: APPLY_STATUS.error,
+        desired_status: DESIRED_STATUS.inactive,
         apply_error_code: code,
         apply_error: detail.slice(0, 500),
       },
-    }).catch(() => {});
-    return { ok: false, tunnelId, error_code: code, error: detail, retryable: false };
+    });
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: isRetryable(code) };
   }
 
   const dispatched = await orchestrator.dispatchDirect({
@@ -2687,19 +2968,38 @@ export async function reapplyDirectTunnel(
     ...tlsPathsFor(row, directPlan.protocol.name),
   });
   if (!dispatched.ok) {
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    const code = mapDispatchCode("ingress", dispatched);
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        {
+          tunnelId,
+          node: pick.node,
+          direction: "direct",
+          revision: revision + 1,
+          reason: "direct apply failed",
+        },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const originalCode = mapDispatchCode("ingress", dispatched);
+    const code = compensation.ok
+      ? originalCode
+      : SCHEDULER_ERROR_CODES.compensation_failed;
+    const detail = compensation.ok
+      ? dispatched.error
+      : `${dispatched.error}；${compensation.error}`;
     await store.tunnel.update({
       where: { id: tunnelId },
       data: {
         apply_status: APPLY_STATUS.error,
         desired_status: DESIRED_STATUS.inactive,
         apply_error_code: code,
-        apply_error: `[${code}] ${dispatched.error}`.slice(0, 500),
+        apply_error: `[${code}] ${detail}`.slice(0, 500),
         config_revision: revision,
       },
-    }).catch(() => {});
-    return { ok: false, tunnelId, error_code: code, error: dispatched.error, retryable: isRetryable(code) };
+    });
+    return { ok: false, tunnelId, error_code: code, error: detail, retryable: isRetryable(code) };
   }
 
   await store.tunnel.update({

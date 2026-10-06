@@ -56,6 +56,7 @@ import { isFederationEnabled } from "./identity.ts";
 // `forward-rollout.ts` 是纯计划模块（无 IO），引它不会把 Prisma 拖进来。
 import { ACTIVE_ROLLOUT_PHASES } from "../forward-rollout.ts";
 import {
+  isTerminalPlacementState,
   recordPlacementResult,
   upsertPlacement,
   type FederationPeerRef,
@@ -543,8 +544,21 @@ export async function delegateFederatedEgress(
     // 连 peer 都没解析出来 ⇒ 没有任何远端副作用；但**仍然留下可解释的镜像行**，
     // 否则"这条 Forward 声明了远端出口却没接上"在库里看不到（§4.3 的教训：
     // 决策不留痕的机制与从未运行过的机制无法区分）。
-    await mirrorFailure(d, { peer: peerPanelId, forwardRef, intentId, tunnelId: request.tunnelId, revision: request.revision, code: resolved.code, message: resolved.message });
-    return failure(resolved.code, resolved.message, { peer: peerPanelId, intentId, leaseRef: null, compensated: true });
+    const failureMirror = await mirrorFailure(d, {
+      peer: peerPanelId,
+      forwardRef,
+      intentId,
+      tunnelId: request.tunnelId,
+      revision: request.revision,
+      code: resolved.code,
+      message: resolved.message,
+    });
+    return failure(resolved.code, withMirrorFailure(resolved.message, failureMirror), {
+      peer: peerPanelId,
+      intentId,
+      leaseRef: null,
+      compensated: true,
+    });
   }
   const peer = resolved.peer;
 
@@ -569,6 +583,18 @@ export async function delegateFederatedEgress(
       compensated: true,
     });
   }
+  if (isTerminalPlacementState(mirrored.placement.state)) {
+    return failure(
+      mirrored.placement.state === "revoked" ? "lease_revoked" : "lease_expired",
+      `intent ${intentId} 已处于终态 ${mirrored.placement.state}，拒绝用同一 revision 重新创建远端腿`,
+      {
+        peer: peerPanelId,
+        intentId,
+        leaseRef: mirrored.placement.lease_ref,
+        compensated: true,
+      },
+    );
+  }
 
   /* ---------------- 阶段 1：host 侧预留 ---------------- */
   const reserved = await d.sender({
@@ -589,7 +615,7 @@ export async function delegateFederatedEgress(
     retries: 1,
   });
   if (!reserved.ok) {
-    await mirrorFailure(d, {
+    const failureMirror = await mirrorFailure(d, {
       peer: peer.peer_panel_id,
       forwardRef,
       intentId,
@@ -598,22 +624,28 @@ export async function delegateFederatedEgress(
       code: reserved.code,
       message: reserved.message,
     });
-    return failure(reserved.code, reserved.message, { peer: peer.peer_panel_id, intentId, leaseRef: null, compensated: true });
+    return failure(reserved.code, withMirrorFailure(reserved.message, failureMirror), {
+      peer: peer.peer_panel_id,
+      intentId,
+      leaseRef: null,
+      compensated: true,
+    });
   }
   const parsed = parseReserveResponse(reserved.body);
   if (!parsed.ok) {
     // 响应形状不认识 ⇒ 远端可能已经建了腿。**不猜**，标记 degraded 让对账重发同一 intent
     // （同键重投递在 host 侧返回首次结果，不会产生第二条腿）。
-    await mirrorFailure(d, {
+    const originalMessage = `reserve 响应无法解析：${parsed.message}`;
+    const failureMirror = await mirrorFailure(d, {
       peer: peer.peer_panel_id,
       forwardRef,
       intentId,
       tunnelId: request.tunnelId,
       revision: request.revision,
       code: "message_malformed",
-      message: `reserve 响应无法解析：${parsed.message}`,
+      message: originalMessage,
     });
-    return failure("message_malformed", `reserve 响应无法解析：${parsed.message}`, {
+    return failure("message_malformed", withMirrorFailure(originalMessage, failureMirror), {
       peer: peer.peer_panel_id,
       intentId,
       leaseRef: null,
@@ -622,21 +654,50 @@ export async function delegateFederatedEgress(
   }
   const lease = parsed.value;
 
-  await recordPlacementResult(
-    {
-      peer_panel_id: peer.peer_panel_id,
-      intent_id: intentId,
-      ok: true,
-      lease_ref: lease.lease_ref,
-      lease_epoch: lease.lease_epoch,
-      peer_node_ref: lease.node_ref,
-      peer_port: lease.port,
-      expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
-      remote_state: lease.state ?? "reserved",
-      applied_revision: lease.applied_revision,
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  );
+  try {
+    await recordPlacementResult(
+      {
+        peer_panel_id: peer.peer_panel_id,
+        intent_id: intentId,
+        ok: true,
+        lease_ref: lease.lease_ref,
+        lease_epoch: lease.lease_epoch,
+        peer_node_ref: lease.node_ref,
+        peer_port: lease.port,
+        expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
+        remote_state: lease.state ?? "reserved",
+        applied_revision: lease.applied_revision,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+  } catch (error) {
+    const ledgerMessage =
+      `远端 reserve 已成功，但本地 lease 镜像写入失败：${error instanceof Error ? error.message : String(error)}`;
+    const compensation = await releaseRemoteLease(
+      d,
+      peer,
+      lease.lease_ref,
+      intentId,
+      request.revision,
+    );
+    const failureMirror = await mirrorFailure(d, {
+      peer: peer.peer_panel_id,
+      forwardRef,
+      intentId,
+      tunnelId: request.tunnelId,
+      revision: request.revision,
+      code: "internal_error",
+      message: ledgerMessage,
+      leaseRef: lease.lease_ref,
+    });
+    return failure("internal_error", withMirrorFailure(ledgerMessage, failureMirror), {
+      peer: peer.peer_panel_id,
+      intentId,
+      leaseRef: lease.lease_ref,
+      compensated: compensation.ok,
+      compensationError: compensation.ok ? undefined : compensation.message,
+    });
+  }
 
   /* ---------------- 阶段 2：host 侧应用 ---------------- */
   // 远端已把本 revision 应用过（重放/重试）⇒ 不再重复下发，但仍要把 next_hop 交给调用方。
@@ -663,7 +724,7 @@ export async function delegateFederatedEgress(
 
     if (!applied.ok) {
       const compensation = await releaseRemoteLease(d, peer, lease.lease_ref, intentId, request.revision);
-      await mirrorFailure(d, {
+      const failureMirror = await mirrorFailure(d, {
         peer: peer.peer_panel_id,
         forwardRef,
         intentId,
@@ -673,7 +734,7 @@ export async function delegateFederatedEgress(
         message: applied.message,
         leaseRef: lease.lease_ref,
       });
-      return failure(applied.code, applied.message, {
+      return failure(applied.code, withMirrorFailure(applied.message, failureMirror), {
         peer: peer.peer_panel_id,
         intentId,
         leaseRef: lease.lease_ref,
@@ -687,17 +748,18 @@ export async function delegateFederatedEgress(
       // apply 的**响应**坏了，但命令很可能已经生效。按 §4.2「结果未知不当作失败」处理：
       // 保留租约与镜像（degraded），让对账按同一 (intent_id, revision) 重发；
       // 释放它才是错的 —— 那会把一条可能正在服务的链路拆掉。
-      await mirrorFailure(d, {
+      const originalMessage = `apply 响应无法解析：${applyParsed.message}`;
+      const failureMirror = await mirrorFailure(d, {
         peer: peer.peer_panel_id,
         forwardRef,
         intentId,
         tunnelId: request.tunnelId,
         revision: request.revision,
         code: "message_malformed",
-        message: `apply 响应无法解析：${applyParsed.message}`,
+        message: originalMessage,
         leaseRef: lease.lease_ref,
       });
-      return failure("message_malformed", `apply 响应无法解析：${applyParsed.message}`, {
+      return failure("message_malformed", withMirrorFailure(originalMessage, failureMirror), {
         peer: peer.peer_panel_id,
         intentId,
         leaseRef: lease.lease_ref,
@@ -709,21 +771,50 @@ export async function delegateFederatedEgress(
     port = applyParsed.port ?? port;
   }
 
-  await recordPlacementResult(
-    {
-      peer_panel_id: peer.peer_panel_id,
-      intent_id: intentId,
-      ok: true,
-      lease_ref: lease.lease_ref,
-      lease_epoch: lease.lease_epoch,
-      remote_state: "active",
-      applied_revision: appliedRevision,
-      peer_node_ref: lease.node_ref,
-      peer_port: port,
-      expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  );
+  try {
+    await recordPlacementResult(
+      {
+        peer_panel_id: peer.peer_panel_id,
+        intent_id: intentId,
+        ok: true,
+        lease_ref: lease.lease_ref,
+        lease_epoch: lease.lease_epoch,
+        remote_state: "active",
+        applied_revision: appliedRevision,
+        peer_node_ref: lease.node_ref,
+        peer_port: port,
+        expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+  } catch (error) {
+    const ledgerMessage =
+      `远端 apply 已成功，但本地 active 镜像写入失败：${error instanceof Error ? error.message : String(error)}`;
+    const compensation = await releaseRemoteLease(
+      d,
+      peer,
+      lease.lease_ref,
+      intentId,
+      request.revision,
+    );
+    const failureMirror = await mirrorFailure(d, {
+      peer: peer.peer_panel_id,
+      forwardRef,
+      intentId,
+      tunnelId: request.tunnelId,
+      revision: request.revision,
+      code: "internal_error",
+      message: ledgerMessage,
+      leaseRef: lease.lease_ref,
+    });
+    return failure("internal_error", withMirrorFailure(ledgerMessage, failureMirror), {
+      peer: peer.peer_panel_id,
+      intentId,
+      leaseRef: lease.lease_ref,
+      compensated: compensation.ok,
+      compensationError: compensation.ok ? undefined : compensation.message,
+    });
+  }
 
   return {
     ok: true,
@@ -756,30 +847,45 @@ async function mirrorFailure(
     message: string;
     leaseRef?: string | null;
   },
-): Promise<void> {
-  await upsertPlacement(
-    {
-      peer_panel_id: input.peer,
-      forward_ref: input.forwardRef,
-      intent_id: input.intentId,
-      hop_role: FEDERATED_EGRESS_HOP_ROLE,
-      desired_revision: input.revision,
-      tunnel_id: input.tunnelId,
-      ...(input.leaseRef === undefined ? {} : { lease_ref: input.leaseRef }),
-      state: "pending",
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
-  await recordPlacementResult(
-    {
-      peer_panel_id: input.peer,
-      intent_id: input.intentId,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const mirrored = await upsertPlacement(
+      {
+        peer_panel_id: input.peer,
+        forward_ref: input.forwardRef,
+        intent_id: input.intentId,
+        hop_role: FEDERATED_EGRESS_HOP_ROLE,
+        desired_revision: input.revision,
+        tunnel_id: input.tunnelId,
+        ...(input.leaseRef === undefined ? {} : { lease_ref: input.leaseRef }),
+        state: "pending",
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+    if (!mirrored.ok) {
+      return { ok: false, message: `写入 failure placement 失败：${mirrored.message}` };
+    }
+    await recordPlacementResult(
+      {
+        peer_panel_id: input.peer,
+        intent_id: input.intentId,
+        ok: false,
+        code: input.code,
+        message: input.message,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+    return { ok: true };
+  } catch (error) {
+    return {
       ok: false,
-      code: input.code,
-      message: input.message,
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
+      message: `写入 failure placement 异常：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function withMirrorFailure(message: string, mirrored: { ok: true } | { ok: false; message: string }): string {
+  return mirrored.ok ? message : `${message}；本地恢复账本缺失：${mirrored.message}`;
 }
 
 /* ================================================================== */
@@ -875,28 +981,44 @@ export async function releaseFederatedEgress(
   const d = resolveDeps(deps);
   const intentId = federatedEgressIntentId(request.tunnelId, request.revision);
 
-  // 先找镜像行：它同时给出 peer 与 lease_ref（前者我们可能不知道，后者只有 host 知道）。
-  const placement = (await d.db.federationPlacement
-    .findUnique({
-      where: {
-        peer_panel_id_intent_id: {
-          peer_panel_id: request.peer_panel_id ?? "",
-          intent_id: intentId,
-        },
-      },
-    })
-    .catch(() => null)) as { peer_panel_id: string; lease_ref: string | null; state: string } | null;
-
-  let row = placement;
-  if (!row) {
-    const rows = (await d.db.federationPlacement
-      .findMany({ where: { tunnel_id: request.tunnelId, intent_id: intentId }, take: 1 })
-      .catch(() => [])) as Array<{ peer_panel_id: string; lease_ref: string | null; state: string }>;
-    row = rows.length > 0 ? rows[0]! : null;
+  // If the caller already holds both remote identifiers (e.g. immediate
+  // compensation after reserve/apply), release must not depend on the local DB.
+  // Otherwise the placement ledger is required to discover the missing fact,
+  // and a DB read failure is NOT equivalent to "no remote resource exists".
+  let row: { peer_panel_id: string; lease_ref: string | null; state: string } | null = null;
+  if (request.peer_panel_id == null || request.lease_ref == null) {
+    try {
+      if (request.peer_panel_id != null) {
+        row = (await d.db.federationPlacement.findUnique({
+          where: {
+            peer_panel_id_intent_id: {
+              peer_panel_id: request.peer_panel_id,
+              intent_id: intentId,
+            },
+          },
+        })) as { peer_panel_id: string; lease_ref: string | null; state: string } | null;
+      }
+      if (!row) {
+        const rows = (await d.db.federationPlacement.findMany({
+          where: { tunnel_id: request.tunnelId, intent_id: intentId },
+          take: 1,
+        })) as Array<{ peer_panel_id: string; lease_ref: string | null; state: string }>;
+        row = rows.length > 0 ? rows[0]! : null;
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        released: false,
+        code: "internal_error",
+        message: `读取远端出口镜像失败，无法确认是否存在待释放资源：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
   }
 
-  const peerPanelId = row?.peer_panel_id ?? request.peer_panel_id ?? null;
-  const leaseRef = row?.lease_ref ?? request.lease_ref ?? null;
+  const peerPanelId = request.peer_panel_id ?? row?.peer_panel_id ?? null;
+  const leaseRef = request.lease_ref ?? row?.lease_ref ?? null;
 
   // 没有镜像行也没有 lease_ref：没有可释放的远端资源（从未建成）。
   if (peerPanelId === null) return { ok: true, released: true };
@@ -910,20 +1032,62 @@ export async function releaseFederatedEgress(
   const resolved = await resolvePeer(peerPanelId, d);
   if (!resolved.ok) {
     // peer 已经被撤销：host 侧会因信任撤销而自行停服（契约 §2.4），我们只能如实标注。
-    await markPlacementExpired(d, peerPanelId, intentId, resolved.code);
+    try {
+      await markPlacementExpired(d, peerPanelId, intentId, resolved.code);
+    } catch (error) {
+      return {
+        ok: false,
+        released: false,
+        code: "internal_error",
+        message: `远端信任已失效，且本地镜像记账失败：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     return { ok: resolved.code === "peer_unknown" || resolved.code === "peer_revoked", released: false, code: resolved.code, message: resolved.message };
   }
 
   const released = await releaseRemoteLease(d, resolved.peer, leaseRef, intentId, request.revision);
   if (released.ok) {
-    await markPlacementExpired(d, peerPanelId, intentId);
+    try {
+      await markPlacementExpired(d, peerPanelId, intentId);
+    } catch (error) {
+      return {
+        ok: false,
+        released: true,
+        code: "internal_error",
+        message: `远端出口已释放，但本地镜像记账失败：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     return { ok: true, released: true };
   }
   // 失败要留下事实：镜像行记 degraded + 真实错误码，下一拍/下一轮仍按同一 intent 重试。
-  await recordPlacementResult(
-    { peer_panel_id: peerPanelId, intent_id: intentId, ok: false, code: released.code ?? "internal_error", message: released.message ?? null },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
+  // If even that recovery ledger write fails, surface BOTH failures. Returning
+  // only the remote DELETE error would make the caller believe the local retry
+  // fact is durable when it is not.
+  try {
+    await recordPlacementResult(
+      {
+        peer_panel_id: peerPanelId,
+        intent_id: intentId,
+        ok: false,
+        code: released.code ?? "internal_error",
+        message: released.message ?? null,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      released: false,
+      code: "internal_error",
+      message:
+        "远端释放失败（" +
+        (released.code ?? "internal_error") +
+        ": " +
+        (released.message ?? "unknown") +
+        "），且本地恢复账本写入失败：" +
+        (error instanceof Error ? error.message : String(error)),
+    };
+  }
   return { ok: false, released: false, code: released.code, message: released.message };
 }
 
@@ -933,9 +1097,9 @@ async function markPlacementExpired(
   intentId: string,
   code?: FederationErrorCode,
 ): Promise<void> {
-  const existing = (await d.db.federationPlacement
-    .findUnique({ where: { peer_panel_id_intent_id: { peer_panel_id: peerPanelId, intent_id: intentId } } })
-    .catch(() => null)) as { forward_ref: string; desired_revision: number } | null;
+  const existing = (await d.db.federationPlacement.findUnique({
+    where: { peer_panel_id_intent_id: { peer_panel_id: peerPanelId, intent_id: intentId } },
+  })) as { forward_ref: string; desired_revision: number } | null;
   if (!existing) return;
   await upsertPlacement(
     {
@@ -947,12 +1111,12 @@ async function markPlacementExpired(
       state: "expired",
     },
     { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
+  );
   if (code) {
     await recordPlacementResult(
       { peer_panel_id: peerPanelId, intent_id: intentId, ok: false, code, message: null },
       { db: d.db as never, sender: d.sender as never, now: d.now },
-    ).catch(() => undefined);
+    );
   }
 }
 
@@ -1009,16 +1173,18 @@ export async function releaseStaleFederatedEgressForTunnel(
   deps?: ForwardHopDeps,
 ): Promise<ReleaseStaleFederatedEgressResult> {
   const d = resolveDeps(deps);
-  const rows = (await d.db.federationPlacement
-    .findMany({
-      where: {
-        tunnel_id: tunnelId,
-        hop_role: FEDERATED_EGRESS_HOP_ROLE,
-        state: { in: ["pending", "active", "degraded", "failed"] },
-      },
-      take: 20,
-    })
-    .catch(() => [])) as Array<{ peer_panel_id: string; intent_id: string; desired_revision: number }>;
+  // This is a cleanup precondition for creating the next remote generation.
+  // A DB read failure is NOT equivalent to "there are no stale legs": doing so
+  // would allow a new lease to be created while an old remote runtime may still
+  // be listening. Query every non-terminal row for this one Forward and surface
+  // storage errors to the caller.
+  const rows = (await d.db.federationPlacement.findMany({
+    where: {
+      tunnel_id: tunnelId,
+      hop_role: FEDERATED_EGRESS_HOP_ROLE,
+      state: { in: ["pending", "active", "degraded", "failed"] },
+    },
+  })) as Array<{ peer_panel_id: string; intent_id: string; desired_revision: number }>;
 
   const result: ReleaseStaleFederatedEgressResult = { evaluated: rows.length, released: 0, failed: [] };
   for (const row of rows) {
@@ -1226,11 +1392,13 @@ async function rolloutInFlight(db: ForwardHopDb, tunnelId: number): Promise<bool
   const reader = (db as unknown as { forwardRollout?: { findMany?: (args: unknown) => Promise<unknown> } })
     .forwardRollout?.findMany;
   if (typeof reader !== "function") return false;
+  // Unknown is unsafe here: if the ledger cannot be read, treating it as
+  // "no rollout" can start a second recovery against the same Forward.
   const rows = (await reader({
     where: { tunnel_id: tunnelId, phase: { in: [...ACTIVE_ROLLOUT_PHASES] } },
     take: 1,
     select: { id: true },
-  }).catch(() => [])) as Array<{ id: number }>;
+  })) as Array<{ id: number }>;
   return rows.length > 0;
 }
 
@@ -1298,12 +1466,12 @@ export async function reconcileFederatedForwardHealth(
   };
   if (!d.db.tunnel) return summary;
 
-  const rows = (await d.db.federationPlacement
-    .findMany({
-      where: { hop_role: FEDERATED_EGRESS_HOP_ROLE, tunnel_id: { not: null } },
-      take: limit,
-    })
-    .catch(() => [])) as Array<{ tunnel_id: number | null; desired_revision: number; state: string }>;
+  // A failed placement-ledger read must bubble to Reconciler, which records a
+  // subsystem_failed finding. Returning [] would falsely report a clean sweep.
+  const rows = (await d.db.federationPlacement.findMany({
+    where: { hop_role: FEDERATED_EGRESS_HOP_ROLE, tunnel_id: { not: null } },
+    take: limit,
+  })) as Array<{ tunnel_id: number | null; desired_revision: number; state: string }>;
 
   // 一条 Forward 可能有**多代** placement 行（每次改版都是一条新 intent）。
   // 只有"当代"那一行（desired_revision 最大）能代表它现在的远端腿状态；旧一代的
@@ -1329,21 +1497,19 @@ export async function reconcileFederatedForwardHealth(
     ((tunnelId: number, nodeId: number) => defaultIngressRuntimePresent(d.db, tunnelId, nodeId, now));
 
   for (const [tunnelId, placement] of latest) {
-    const tunnel = (await d.db.tunnel
-      .findUnique({
-        where: { id: tunnelId },
-        select: {
-          id: true,
-          apply_status: true,
-          apply_error_code: true,
-          desired_status: true,
-          config_revision: true,
-          applied_revision: true,
-          ingress_node_id: true,
-          federated_egress_peer: true,
-        },
-      })
-      .catch(() => null)) as FederatedTunnelRow | null | undefined;
+    const tunnel = (await d.db.tunnel.findUnique({
+      where: { id: tunnelId },
+      select: {
+        id: true,
+        apply_status: true,
+        apply_error_code: true,
+        desired_status: true,
+        config_revision: true,
+        applied_revision: true,
+        ingress_node_id: true,
+        federated_egress_peer: true,
+      },
+    })) as FederatedTunnelRow | null | undefined;
     if (!tunnel) {
       summary.skipped++;
       continue;
@@ -1374,13 +1540,27 @@ export async function reconcileFederatedForwardHealth(
         summary.skipped++;
         continue;
       }
-      await d.db.tunnel
-        .updateMany?.({
-          where: { id: tunnelId },
-          // 只写可见状态与原因；desired / revision 一个字节都不动（V4 铁律）。
-          data: { apply_status: "error", apply_error_code: unhealthy.code, apply_error: unhealthy.message },
-        })
-        ?.catch(() => undefined);
+      const writer = d.db.tunnel.updateMany;
+      if (typeof writer !== "function") {
+        throw new Error("federation health requires tunnel.updateMany");
+      }
+      const updated = (await writer({
+        // CAS against the visible/revision facts we evaluated. A concurrent user
+        // edit or rollout must win rather than have its fresh status overwritten
+        // by a health decision based on the previous row.
+        where: {
+          id: tunnelId,
+          config_revision: tunnel.config_revision,
+          apply_status: tunnel.apply_status,
+          apply_error_code: tunnel.apply_error_code,
+        },
+        // 只写可见状态与原因；desired / revision 一个字节都不动（V4 铁律）。
+        data: { apply_status: "error", apply_error_code: unhealthy.code, apply_error: unhealthy.message },
+      })) as { count?: number };
+      if (Number(updated?.count ?? 0) !== 1) {
+        summary.skipped++;
+        continue;
+      }
       summary.marked_unhealthy++;
       continue;
     }

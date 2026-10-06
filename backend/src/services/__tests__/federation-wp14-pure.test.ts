@@ -174,6 +174,8 @@ describe("WP14 signing: 出站签名头", () => {
       identity: { panel_id: "p-1", key_id: kp.key_id, public_jwk: kp.public_jwk },
       privateJwk: kp.private_jwk,
       body,
+      method: "POST",
+      path: "/api/federation/v1/ping",
       messageId: "msg-1",
       nowMs: Date.parse("2026-10-05T02:00:00Z"),
     });
@@ -185,7 +187,9 @@ describe("WP14 signing: 出站签名头", () => {
 
     const { compactVerify } = await import("jose");
     const res = await compactVerify(headers[HDR.signature]!, await importJWK(kp.public_jwk, "EdDSA"));
-    expect(new TextDecoder().decode(res.payload)).toBe(body);
+    expect(new TextDecoder().decode(res.payload)).toBe(JSON.stringify(["POST", "/api/federation/v1/ping", body]));
+    expect(headers[HDR.method]).toBe("POST");
+    expect(headers[HDR.path]).toBe("/api/federation/v1/ping");
   });
 
   test("an empty body is still signed (empty-body requests cannot be swapped)", async () => {
@@ -194,11 +198,13 @@ describe("WP14 signing: 出站签名头", () => {
       identity: { panel_id: "p-1", key_id: kp.key_id, public_jwk: kp.public_jwk },
       privateJwk: kp.private_jwk,
       body: "",
+      method: "GET",
+      path: "/api/federation/v1/whoami",
       messageId: "msg-2",
     });
     const { compactVerify } = await import("jose");
     const res = await compactVerify(headers[HDR.signature]!, await importJWK(kp.public_jwk, "EdDSA"));
-    expect(res.payload.byteLength).toBe(0);
+    expect(new TextDecoder().decode(res.payload)).toBe(JSON.stringify(["GET", "/api/federation/v1/whoami", ""]));
   });
 });
 

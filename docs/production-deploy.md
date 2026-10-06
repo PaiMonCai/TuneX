@@ -97,9 +97,6 @@ chmod 600 .env
 
 # 每套部署独立生成（示例输出为随机值，直接粘贴到 .env）
 openssl rand -base64 32 | tr '+/' '-_'   # → AUTH_SECRET
-openssl rand -base64 32 | tr '+/' '-_'   # → LICENSE_SECRET
-openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_CONFIG_KEY
-openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 ```
 
 必改项（有默认占位值的都不算改完）：
@@ -111,8 +108,7 @@ openssl rand -base64 32 | tr '+/' '-_'   # → TUNEX_LICENSE_KEY
 | `TUNEX_HTTP_PORT` | 默认 13000；仅启用可选 Caddy profile 时使用 |
 | `ACME_EMAIL` | 仅 standalone 模式必需；Caddy ACME 账号邮箱 |
 | `MYSQL_ROOT_PASSWORD` | 必须同时改 `DATABASE_URL` 里的口令（两边一致） |
-| `AUTH_SECRET` / `LICENSE_SECRET` | ≥32 随机字节，禁止跨环境复用 |
-| `TUNEX_CONFIG_KEY` / `TUNEX_LICENSE_KEY` | 32 字节 base64url Fernet 密钥，两把必须不同 |
+| `AUTH_SECRET` | ≥32 随机字节，禁止跨环境复用 |
 | `TUNEX_IMAGE` | 统一 Panel 应用镜像，钉到具体 git sha（见下） |
 | `TUNEX_AGENT_IMAGE` | 节点一键安装使用的多架构 Agent 镜像；生产建议与 Panel 使用同一 git sha |
 | `SMTP_*` | 公网服务必须配，否则验证/重置邮件只进日志 |

@@ -901,6 +901,11 @@ export async function ensureForwardBaselineRevision(
         applied_revision: true,
         desired_revision_id: true,
         desired_status: true,
+        // Baseline is an immutable explanation of the currently applied runtime.
+        // If this Forward has already been explicitly claimed by a Route Profile
+        // (possibly metadata-only), provenance must survive into the snapshot.
+        route_profile_id: true,
+        route_profile_version: true,
         // 补基线时也要冻结"出口腿当时在哪一侧"，否则旧 runtime 的
         // 快照会看起来像本机出口，补偿/对账会去本机找一条不存在的腿。
         federated_egress_peer: true,
@@ -953,6 +958,8 @@ export async function ensureForwardBaselineRevision(
             federated_egress_peer: normalizeFederatedEgressPeer(row.federated_egress_peer),
             targets,
             created_by_id: createdById,
+            route_profile_id: row.route_profile_id ?? null,
+            route_profile_version: row.route_profile_version ?? null,
           },
           select: { id: true },
         });

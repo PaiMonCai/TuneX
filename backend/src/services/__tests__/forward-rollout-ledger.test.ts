@@ -100,7 +100,25 @@ const fakeDb = () => {
         const a = args as { where: { id: number } };
         return leases.find((l) => l.id === a.where.id) ?? null;
       },
-      findMany: async () => leases.filter((l) => l.status === "active"),
+      findMany: async (args?: unknown) => {
+        const a = (args ?? {}) as {
+          where?: Record<string, unknown>;
+          select?: Record<string, boolean>;
+        };
+        const where = a.where ?? {};
+        const rows = leases.filter((lease) =>
+          Object.entries(where).every(([key, value]) => value === undefined || lease[key] === value),
+        );
+        const select = a.select;
+        if (!select) return rows.map((lease) => ({ ...lease }));
+        return rows.map((lease) => {
+          const selected: Record<string, unknown> = {};
+          for (const [key, enabled] of Object.entries(select)) {
+            if (enabled) selected[key] = lease[key];
+          }
+          return selected;
+        });
+      },
       update: async (args: unknown) => {
         const a = args as { where: { id: number }; data: Record<string, unknown> };
         const row = leases.find((l) => l.id === a.where.id);
@@ -693,7 +711,7 @@ describe("compensated + compensation_error：§13.3.5 第三张表的两个终�
     expect(String(f.rollouts[0]!.last_error_code)).toBe("compensation_failed");
   });
 
-  it("PREPARE 失败 ⇒ 不进补偿：compensated 保持 false、compensation_error 为空", async () => {
+  it("PREPARE 失败且清理未确认 ⇒ 不伪装 failed，保持 degraded + 可见清理错误", async () => {
     const { f } = modeSwitchEnv();
     const d2 = { db: f.db, runtimeUse: async () => null, orchestrator: fakeOrchestrator({ failOn: { dispatchEgress: true } }) } as RolloutDeps;
     const res = await registerRollout(
@@ -706,9 +724,10 @@ describe("compensated + compensation_error：§13.3.5 第三张表的两个终�
       d2,
     );
     expect(res.ok).toBe(false);
-    expect(f.rollouts[0]!.phase).toBe("failed");
+    expect(f.rollouts[0]!.phase).toBe("degraded");
     expect(f.rollouts[0]!.compensated).toBe(false);
-    expect(f.rollouts[0]!.compensation_error).toBeNull();
+    expect(f.rollouts[0]!.compensation_error).toBeTruthy();
+    expect(String(f.rollouts[0]!.last_error_code)).toBe("compensation_failed");
   });
 });
 

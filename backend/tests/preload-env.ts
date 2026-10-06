@@ -12,5 +12,4 @@
 process.env.DATABASE_URL ??= "mysql://tunex-test:tunex-test@127.0.0.1:3306/tunex_test_unused";
 process.env.REDIS_URL ??= "redis://127.0.0.1:6379/15";
 process.env.AUTH_SECRET ??= "tunex-unit-test-auth-secret-not-a-real-secret";
-process.env.LICENSE_SECRET ??= "tunex-unit-test-license-secret-not-a-real-secret";
 process.env.PAYMENTS_ENABLED ??= "false";

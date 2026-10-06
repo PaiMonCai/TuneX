@@ -465,6 +465,7 @@ export interface LeaseDb {
     findUnique(args: unknown): Promise<unknown>;
     create(args: unknown): Promise<unknown>;
     update(args: unknown): Promise<unknown>;
+    updateMany(args: unknown): Promise<{ count: number }>;
   };
   /** apply / teardown 需要节点的编排投影（id / node_id / connect_ip / role）。 */
   node: {
@@ -721,14 +722,27 @@ export async function claimLeaseIntent(
     return { kind: "in_flight", row: existing };
   }
 
+  // CAS 接管：普通 update 会让两个并发请求都成功把同一行写成 pending，
+  // 从而都拿到 claimed 并重复执行。把“我刚刚读到的状态 + created_at”一起放进
+  // updateMany 的 where；赢家同时把 created_at 刷到本次认领时刻，既能区分 stale
+  // pending，也会重新开始 in-flight TTL。只有真正改到 1 行的请求才拥有执行权。
   try {
-    await d.federationIntent.update({
-      where: { intent_id_revision_action: key },
-      data: { status: INTENT_STATUS.pending, error_code: null },
+    const takeover = await d.federationIntent.updateMany({
+      where: {
+        id: existing.id,
+        status: existing.status,
+        created_at: existing.created_at,
+      },
+      data: {
+        status: INTENT_STATUS.pending,
+        error_code: null,
+        created_at: input.now,
+      },
     });
-    return { kind: "claimed" };
+    if (takeover.count === 1) return { kind: "claimed" };
+    return { kind: "in_flight", row: existing };
   } catch {
-    // 接管失败（别人抢先）→ 让调用方稍后重投，仍然不重复执行。
+    // 接管失败（别人抢先 / DB 瞬时失败）→ 让调用方稍后重投，仍然不重复执行。
     return { kind: "in_flight", row: existing };
   }
 }
@@ -1140,6 +1154,22 @@ export type ReleaseLeaseOutcome =
  * 中间态才是"停服做了一半、下一拍必须重试"的载体。停服失败 → `failed` + last_error，
  * 由 `expireLeases` / reconcile 重试；**失败绝不静默变成 released**。
  */
+function terminalCleanupFacts(lease: FederationLeaseRow): {
+  stopped: boolean;
+  port_released: boolean;
+} {
+  if (lease.last_error_code === PORT_RELEASE_PENDING_CODE) {
+    return { stopped: true, port_released: false };
+  }
+  if (
+    lease.last_error_code === PEER_REVOKE_PENDING_CODE ||
+    lease.last_error_code === "internal_error"
+  ) {
+    return { stopped: false, port_released: false };
+  }
+  return { stopped: true, port_released: true };
+}
+
 export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseHostDeps): Promise<ReleaseLeaseOutcome> {
   const d = resolveLeaseDeps(deps);
   const now = input.now ?? d.now();
@@ -1184,19 +1214,23 @@ export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseH
   }
   if (claim.kind === "done") {
     const done = await loadLeaseByIdOrIntent(d.db, claim.row.lease_id, input.intent_id);
+    const current = done ?? lease;
+    const cleanup = terminalCleanupFacts(current);
     return {
       ok: true,
       state: "released",
       already_released: true,
-      lease_epoch: done?.lease_epoch ?? lease.lease_epoch,
-      stopped: true,
-      port_released: true,
+      lease_epoch: current.lease_epoch,
+      stopped: cleanup.stopped,
+      port_released: cleanup.port_released,
       replayed: true,
     };
   }
 
   if (isTerminalLeaseState(lease.state)) {
-    // 已经是终态：释放的语义已经达成（幂等成功）。不重写历史行。
+    // Terminal means authorization is over; it does NOT automatically prove
+    // teardown/port cleanup completed. Preserve those two facts explicitly.
+    const cleanup = terminalCleanupFacts(lease);
     await settleLeaseIntent(d.db, {
       intent_id: input.intent_id,
       revision: input.revision,
@@ -1210,15 +1244,22 @@ export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseH
       peer_panel_id: lease.peer_panel_id,
       message_id: input.messageId ?? null,
       status: 200,
-      detail: { intent_id: input.intent_id, lease_ref: lease.lease_ref, state: lease.state, already_terminal: true },
+      detail: {
+        intent_id: input.intent_id,
+        lease_ref: lease.lease_ref,
+        state: lease.state,
+        already_terminal: true,
+        stopped: cleanup.stopped,
+        port_released: cleanup.port_released,
+      },
     });
     return {
       ok: true,
       state: "released",
       already_released: true,
       lease_epoch: lease.lease_epoch,
-      stopped: true,
-      port_released: true,
+      stopped: cleanup.stopped,
+      port_released: cleanup.port_released,
       replayed: false,
     };
   }
@@ -1247,16 +1288,23 @@ export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseH
   if (d.teardown === null) {
     stopMessage = "teardown hook is not wired; refusing to mark the lease released while the runtime may still be up";
   } else {
-    const res = await d.teardown({
-      lease_ref: lease.lease_ref,
-      peer_panel_id: lease.peer_panel_id,
-      intent_id: lease.intent_id,
-      node_id: lease.node_id,
-      listen_port: lease.listen_port,
-      hop_role: hopRole,
-      lease_epoch: lease.lease_epoch,
-      reason,
-    });
+    const res = await Promise.resolve()
+      .then(() =>
+        d.teardown!({
+          lease_ref: lease.lease_ref,
+          peer_panel_id: lease.peer_panel_id,
+          intent_id: lease.intent_id,
+          node_id: lease.node_id,
+          listen_port: lease.listen_port,
+          hop_role: hopRole,
+          lease_epoch: lease.lease_epoch,
+          reason,
+        }),
+      )
+      .catch((error: unknown) => ({
+        ok: false as const,
+        message: error instanceof Error ? error.message : String(error),
+      }));
     stopped = res.ok;
     if (!res.ok) stopMessage = res.message ?? "teardown failed";
   }
@@ -1264,7 +1312,7 @@ export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseH
   if (!stopped) {
     // 先停服、后还端口（§3.3）：停不下来就**不还**端口。留 failed + last_error 让下一拍重试。
     await d.db.federationLease.updateMany({
-      where: { id: lease.id, lease_epoch: lease.lease_epoch },
+      where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "releasing" },
       data: { state: "failed", last_error_code: "internal_error", last_error: stopMessage },
     });
     await settleLeaseIntent(d.db, {
@@ -1278,19 +1326,28 @@ export async function releaseRemoteLease(input: ReleaseLeaseInput, deps?: LeaseH
   }
 
   let portReleased = true;
+  let portReleaseMessage: string | null = null;
   if (lease.node_id !== null && lease.listen_port !== null) {
-    const rel = await d.releasePort({ node_id: lease.node_id, port: lease.listen_port });
+    const rel = await Promise.resolve()
+      .then(() => d.releasePort({ node_id: lease.node_id as number, port: lease.listen_port as number }))
+      .catch((error: unknown) => ({
+        ok: false as const,
+        message: error instanceof Error ? error.message : String(error),
+      }));
     portReleased = rel.ok;
+    if (!rel.ok) portReleaseMessage = rel.message ?? "port release failed";
   }
 
   const done = (await d.db.federationLease.updateMany({
-    where: { id: lease.id, lease_epoch: lease.lease_epoch },
+    where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "releasing" },
     data: {
       state: "released",
       released_at: now,
       // 端口没还上不代表"还在服务"，但它确实是一笔待办：留痕给 reconcile，不静默。
       last_error_code: portReleased ? null : PORT_RELEASE_PENDING_CODE,
-      last_error: portReleased ? null : "port release failed; the sweeper will retry, and portPool reconcile reclaims it as a backstop",
+      last_error: portReleased
+        ? null
+        : `port release failed; the sweeper will retry: ${portReleaseMessage ?? "unknown"}`,
     },
   })) as { count: number };
   if (done.count === 0) {
@@ -2390,16 +2447,23 @@ export async function sweepRevokedLeaseCleanup(
       if (d.teardown === null) {
         note = "teardown hook is not wired";
       } else {
-        const res = await d.teardown({
-          lease_ref: lease.lease_ref,
-          peer_panel_id: lease.peer_panel_id,
-          intent_id: lease.intent_id,
-          node_id: lease.node_id,
-          listen_port: lease.listen_port,
-          hop_role: hopRole,
-          lease_epoch: lease.lease_epoch,
-          reason: "revoked",
-        });
+        const res = await Promise.resolve()
+          .then(() =>
+            d.teardown!({
+              lease_ref: lease.lease_ref,
+              peer_panel_id: lease.peer_panel_id,
+              intent_id: lease.intent_id,
+              node_id: lease.node_id,
+              listen_port: lease.listen_port,
+              hop_role: hopRole,
+              lease_epoch: lease.lease_epoch,
+              reason: "revoked",
+            }),
+          )
+          .catch((error: unknown) => ({
+            ok: false as const,
+            message: error instanceof Error ? error.message : String(error),
+          }));
         stopped = res.ok;
         if (!res.ok) note = res.message ?? "teardown failed";
       }
@@ -2417,7 +2481,17 @@ export async function sweepRevokedLeaseCleanup(
     let portReleased = true;
     let note: string | null = null;
     if (hasPort) {
-      const rel = await d.releasePort({ node_id: lease.node_id as number, port: lease.listen_port as number });
+      const rel = await Promise.resolve()
+        .then(() =>
+          d.releasePort({
+            node_id: lease.node_id as number,
+            port: lease.listen_port as number,
+          }),
+        )
+        .catch((error: unknown) => ({
+          ok: false as const,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       portReleased = rel.ok;
       if (rel.ok) result.ports_released++;
       else {
@@ -2551,16 +2625,23 @@ export async function expireLeases(
     if (d.teardown === null) {
       stopMessage = "teardown hook is not wired";
     } else {
-      const res = await d.teardown({
-        lease_ref: lease.lease_ref,
-        peer_panel_id: lease.peer_panel_id,
-        intent_id: lease.intent_id,
-        node_id: lease.node_id,
-        listen_port: lease.listen_port,
-        hop_role: hopRole,
-        lease_epoch: lease.lease_epoch,
-        reason: "expired",
-      });
+      const res = await Promise.resolve()
+        .then(() =>
+          d.teardown!({
+            lease_ref: lease.lease_ref,
+            peer_panel_id: lease.peer_panel_id,
+            intent_id: lease.intent_id,
+            node_id: lease.node_id,
+            listen_port: lease.listen_port,
+            hop_role: hopRole,
+            lease_epoch: lease.lease_epoch,
+            reason: "expired",
+          }),
+        )
+        .catch((error: unknown) => ({
+          ok: false as const,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       stopped = res.ok;
       if (!res.ok) stopMessage = res.message ?? "teardown failed";
     }
@@ -2569,7 +2650,7 @@ export async function expireLeases(
       result.teardown_failed++;
       if (lease.node_id !== null && lease.listen_port !== null) result.ports_pending++;
       await d.db.federationLease.updateMany({
-        where: { id: lease.id, lease_epoch: lease.lease_epoch },
+        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "releasing" },
         data: { state: "failed", last_error_code: "internal_error", last_error: stopMessage },
       });
       continue;
@@ -2580,7 +2661,17 @@ export async function expireLeases(
     let portReleased = true;
     let portMessage: string | null = null;
     if (lease.node_id !== null && lease.listen_port !== null) {
-      const rel = await d.releasePort({ node_id: lease.node_id, port: lease.listen_port });
+      const rel = await Promise.resolve()
+        .then(() =>
+          d.releasePort({
+            node_id: lease.node_id as number,
+            port: lease.listen_port as number,
+          }),
+        )
+        .catch((error: unknown) => ({
+          ok: false as const,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       portReleased = rel.ok;
       if (!rel.ok) {
         portMessage = rel.message ?? "port release failed";

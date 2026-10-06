@@ -66,6 +66,8 @@ import {
   legacyTunnelTypeColumn,
 } from "./forward-contract.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
+import { billingDayKeyStamp } from "./billing-time.ts";
+import { dayKeyOf, fillDays } from "./traffic.ts";
 import {
   forwardBatchSummary,
   type ForwardBatchAction,
@@ -142,6 +144,14 @@ export interface ForwardPatchInput {
   federated_egress_peer?: string | null;
   /**  §13.3.3：乐观并发；不匹配 → 409 revision_conflict。 */
   expected_revision?: number | null;
+}
+
+export interface ForwardPatchOptions {
+  /**
+   * Internal provenance supplied by Route Profile apply. This is deliberately
+   * not part of the HTTP patch schema: users cannot forge provenance.
+   */
+  routeProfile?: { id: number; version: number } | null;
 }
 
 export type ForwardServiceError = {
@@ -565,8 +575,11 @@ export async function getForwardSummary(
       db.tunnel.count({
         where: { ...base, apply_status: { in: ["pending", "applying"] } },
       }),
-      db.tunnel.aggregate({
-        where: base,
+      // Traffic is an archived accounting fact. The live Tunnel traffic columns
+      // are legacy projections with no current writer and must not drive product
+      // summaries. workspace_id on the ledger survives Forward deletion.
+      db.tunnelTraffic.aggregate({
+        where: { workspace_id: workspaceId },
         _sum: { traffic: true, traffic_cost: true },
       }),
     ]);
@@ -612,37 +625,37 @@ export async function getForwardTraffic(
   if (!current) return error(404, "not_found", "端口转发不存在");
 
   const windowDays = Math.max(1, Math.min(90, Math.floor(days) || 14));
-  const since = new Date();
-  since.setHours(0, 0, 0, 0);
-  since.setDate(since.getDate() - (windowDays - 1));
+  const now = new Date();
+  const since = new Date(
+    billingDayKeyStamp(now).getTime() - (windowDays - 1) * 86_400_000,
+  );
 
   const rows = await db.tunnelTraffic.findMany({
-    where: { tunnel_id: current.id, date: { gte: since } },
+    where: {
+      tunnel_id: current.id,
+      workspace_id: workspaceId,
+      date: { gte: since },
+    },
     orderBy: { date: "asc" },
   });
 
   const byDate = new Map<string, { traffic: number; traffic_cost: number }>();
   for (const row of rows) {
-    const key = row.date.toISOString().slice(0, 10);
+    const key = dayKeyOf(row.date);
     const acc = byDate.get(key) ?? { traffic: 0, traffic_cost: 0 };
     acc.traffic += row.traffic;
     acc.traffic_cost += row.traffic_cost;
     byDate.set(key, acc);
   }
 
-  const points: { date: string; traffic: number; traffic_cost: number }[] = [];
-  for (let i = windowDays - 1; i >= 0; i--) {
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - i);
-    const key = date.toISOString().slice(0, 10);
+  const points = fillDays(windowDays, now).map((key) => {
     const hit = byDate.get(key);
-    points.push({
+    return {
       date: key,
       traffic: hit ? Number(hit.traffic.toFixed(2)) : 0,
       traffic_cost: hit ? Number(hit.traffic_cost.toFixed(4)) : 0,
-    });
-  }
+    };
+  });
 
   return { ok: true, data: points };
 }
@@ -966,6 +979,7 @@ export async function patchForward(
   workspaceId: number,
   patch: ForwardPatchInput,
   actorId?: number,
+  options: ForwardPatchOptions = {},
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
@@ -989,26 +1003,51 @@ export async function patchForward(
     }
   }
 
-  if (metadataOnly) {
-    // §13.3.2：纯 metadata（name）修改不生成 revision、不 bump config_revision、
-    // 不触发任何 runtime 收敛。
-    await db.tunnel.update({
-      where: { id: current.id },
-      data: { name: candidate.name.trim() },
-    });
-    const renamed = await loadForwardRow(id, workspaceId);
-    if (!renamed) return error(404, "not_found", "端口转发不存在");
-    return { ok: true, data: forwardView(renamed) };
-  }
-
-  // expected_revision 闸门：在落库前比对，过期直接 409（§13.3.3）。
-  if (patch.expected_revision !== undefined && patch.expected_revision !== null) {
+  // expected_revision applies to EVERY patch, including metadata-only writes.
+  // Otherwise a stale client can rename/rebind provenance after a newer runtime
+  // revision has already landed simply because this branch does not bump revision.
+  const hasExpectedRevision =
+    patch.expected_revision !== undefined && patch.expected_revision !== null;
+  if (hasExpectedRevision) {
     const latest = Number(current.config_revision ?? 0);
     if (Number(patch.expected_revision) !== latest) {
       return error(409, "revision_conflict", "该转发已被他人修改，请刷新后重新确认", {
         data: { latest_revision: latest },
       });
     }
+  }
+
+  if (metadataOnly) {
+    // §13.3.2：纯 metadata 修改不生成 revision、不触发 runtime 收敛。
+    // When optimistic concurrency or internal provenance is involved, use a CAS
+    // on the exact revision fact we just observed. config_revision may be NULL
+    // on legacy rows, so match the raw value rather than coercing it to zero.
+    const data = {
+      name: candidate.name.trim(),
+      ...(options.routeProfile !== undefined
+        ? {
+            route_profile_id: options.routeProfile?.id ?? null,
+            route_profile_version: options.routeProfile?.version ?? null,
+          }
+        : {}),
+    };
+    if (hasExpectedRevision || options.routeProfile !== undefined) {
+      const updated = await db.tunnel.updateMany({
+        where: { id: current.id, config_revision: current.config_revision },
+        data,
+      });
+      if (updated.count !== 1) {
+        const fresh = await loadForwardRow(id, workspaceId);
+        return error(409, "revision_conflict", "该转发已被他人修改，请刷新后重新确认", {
+          data: { latest_revision: Number(fresh?.config_revision ?? 0) },
+        });
+      }
+    } else {
+      await db.tunnel.update({ where: { id: current.id }, data });
+    }
+    const renamed = await loadForwardRow(id, workspaceId);
+    if (!renamed) return error(404, "not_found", "端口转发不存在");
+    return { ok: true, data: forwardView(renamed) };
   }
 
   // 存量/创建路径自愈：已经有真实 applied runtime 但还没有 snapshot 指针时，
@@ -1046,6 +1085,7 @@ export async function patchForward(
             : null,
           egressPort: resources.egressPort,
           egressPoolId: resources.poolId,
+          routeProfile: options.routeProfile,
         },
         tx,
       );
@@ -1059,6 +1099,12 @@ export async function patchForward(
               : null,
           egress_pool_id: resources.poolId,
           egress_port: resources.egressPort,
+          ...(options.routeProfile !== undefined
+            ? {
+                route_profile_id: options.routeProfile?.id ?? null,
+                route_profile_version: options.routeProfile?.version ?? null,
+              }
+            : {}),
           // 声明列与 snapshot 在同一事务落库（与 `createForwardRevision`
           // 内写 snapshot 的那一列取值完全相同，来源都是候选）。
           ...(candidate.federated_egress_peer === undefined
@@ -1139,13 +1185,33 @@ export async function patchForward(
           suspended,
         },
         { db: db as never, orchestrator: orchestrator as never },
-      ).catch(() => null)
+      ).catch((cause) => ({
+        ok: false as const,
+        status: "failed" as const,
+        rolloutId: -1,
+        phase: "failed" as const,
+        error_code: "rollout_register_failed",
+        error: cause instanceof Error ? cause.message : String(cause),
+      }))
     : null;
 
-  // orchestrator 未接线（relay-wiring 失败）⇒ 跳过本轮执行，不回错误。
-  // 保存本身已成功（snapshot + revision 已落库，§4.1 铁律不破），worker 下一轮
-  // `resumeRollouts()` 会补上——与 「orchestrator 缺失就跳过 reapply」同口径。
-  // 注意：此分支**不会**创建 rollout 行，因此不需要回 502/409。
+  // orchestrator 未接线时没有执行器能登记 rollout。desired/revision 虽已保存，
+  // 但不能声称 worker 会自动恢复一个根本不存在的账本；明确标记为可见错误。
+  if (!orchestrator) {
+    await db.tunnel.updateMany({
+      where: { id: current.id, workspace_id: workspaceId, config_revision: revision },
+      data: {
+        apply_status: "error",
+        apply_error_code: "orchestrator_unavailable",
+        apply_error: "控制面编排器未就绪，目标配置已保存但尚未登记 rollout",
+      },
+    });
+    const failed = await loadForwardRow(current.id, workspaceId);
+    return error(503, "apply_failed", "控制面编排器未就绪，目标配置已保存但尚未应用", {
+      apply_error_code: "orchestrator_unavailable",
+      data: failed ? forwardView(failed) : { id: current.id, revision },
+    });
+  }
   if (runtime && runtime.status === "conflict") {
     // 同期已有未完成 rollout（§13.3.5 抢占闸门）⇒ 409，前端刷新后重试。
     // 必须先于通用 !ok 判断，否则 conflict 会被错误折叠成 502 apply_failed。

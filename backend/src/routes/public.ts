@@ -10,36 +10,47 @@
  */
 import { Hono } from "hono";
 import { db } from "../db.ts";
-import { redis, RedisKeys, observerBufferKey, OBSERVER_BUFFER_MAX, trafficBufferKey } from "../redis.ts";
+import { redis, observerBufferKey, OBSERVER_BUFFER_MAX } from "../redis.ts";
 import { systemConfig } from "../services/config.ts";
 import { resolveUserByKey } from "../services/user-keys.ts";
 import { decideTrafficReport, accumulateTraffic } from "../services/traffic-archive.ts";
+import { authenticateNode } from "../services/node-credential.ts";
+import { extractBearerCredential } from "../services/node-state.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const publicRoutes = new Hono<{ Variables: AppVariables }>();
 
-/** POST /api/tunnel/observer —— agent 观测数据回传（免认证） */
+async function reportingNode(c: { req: { header(name: string): string | undefined } }, claimedNodeId: string) {
+  const credential = extractBearerCredential(c.req.header("authorization") ?? null);
+  if (!credential) return { ok: false as const, status: 401 as const, reason: "missing_credential" };
+  const auth = await authenticateNode(credential);
+  if (!auth.ok) {
+    return {
+      ok: false as const,
+      status: auth.reason === "db_unavailable" ? 503 as const : 401 as const,
+      reason: auth.reason,
+    };
+  }
+  const node = await db.node.findUnique({
+    where: { id: auth.node_id },
+    select: { node_id: true, node_group: { select: { workspace_id: true } } },
+  });
+  if (!node || node.node_id !== claimedNodeId || node.node_group.workspace_id === null) {
+    return { ok: false as const, status: 401 as const, reason: "node_identity_mismatch" };
+  }
+  return { ok: true as const, workspaceId: node.node_group.workspace_id };
+}
+
+/** POST /api/tunnel/observer —— legacy agent 观测回传（节点凭据认证） */
 publicRoutes.post("/tunnel/observer", async (c) => {
   const nodeId = c.req.query("node_id") ?? "";
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json({ error: "invalid json" }, 400);
   if (!nodeId) return c.json({ error: "missing node_id" }, 400);
 
-  // node_id → 组 → workspace。解析失败就丢弃：无归属的回传写进任何桶都是错的。
-  let workspaceId: number | null = null;
-  try {
-    const node = await db.node.findUnique({
-      where: { node_id: nodeId },
-      select: { node_group: { select: { workspace_id: true } } },
-    });
-    workspaceId = node?.node_group?.workspace_id ?? null;
-  } catch {
-    /* DB 不可用时按下方丢弃处理 */
-  }
-  if (workspaceId === null) {
-    // 返回 200 而非 4xx：agent 对 4xx 可能重试，而无归属的数据重试也不会变对。
-    return c.json({ data: { ok: true, dropped: "unknown node" } });
-  }
+  const identity = await reportingNode(c, nodeId);
+  if (!identity.ok) return c.json({ error: identity.reason }, identity.status);
+  const workspaceId = identity.workspaceId;
 
   // Writes to Redis buffer; DB persistence via HINCRBYFLOAT + cron archiving.
   try {
@@ -58,7 +69,7 @@ publicRoutes.post("/tunnel/observer", async (c) => {
 });
 
 /**
- * POST /api/tunnel/traffic —— agent 隧道流量上报（免认证，凭 node_id 归属）
+ * POST /api/tunnel/traffic —— legacy agent 隧道流量上报（节点凭据认证 + node_id 绑定）
  *
  * OPS-03 采集入口。载荷：`{ items: [{ tunnel_id, bytes }, ...] }`，`bytes` 是
  * **本轮新增字节数**（不是累计值）—— agent 侧按上报周期取差。
@@ -78,20 +89,9 @@ publicRoutes.post("/tunnel/traffic", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!nodeId || !body) return c.json({ error: "missing node_id or body" }, 400);
 
-  // node_id → 组 → workspace（与 observer 同一套反查；失败即丢弃）。
-  let workspaceId: number | null = null;
-  try {
-    const node = await db.node.findUnique({
-      where: { node_id: nodeId },
-      select: { node_group: { select: { workspace_id: true } } },
-    });
-    workspaceId = node?.node_group?.workspace_id ?? null;
-  } catch {
-    /* DB 不可用按下方丢弃处理 */
-  }
-  if (workspaceId === null) {
-    return c.json({ data: { ok: true, dropped: "unknown node" } });
-  }
+  const identity = await reportingNode(c, nodeId);
+  if (!identity.ok) return c.json({ error: identity.reason }, identity.status);
+  const workspaceId = identity.workspaceId;
 
   const rawItems = (body as { items?: unknown }).items;
   let decided: ReturnType<typeof decideTrafficReport>;
@@ -196,18 +196,3 @@ publicRoutes.get("/license", async (c) => {
   return c.json({ data: (await licenseService.getLicense()) ?? { type: "none" } });
 });
 
-/** POST /api/pay/:id/callback —— 支付网关回调（免认证，原文缓冲） */
-publicRoutes.post("/pay/:id/callback", async (c) => {
-  const id = c.req.param("id");
-  const raw = await c.req.text();
-  try {
-    // TEN-02：回调缓冲是全局审计留痕（按网关 id），走平台段 `ws:global:pay:callback:<id>`。
-    await redis.rpush(
-      RedisKeys.payCallback(id),
-      JSON.stringify({ at: Date.now(), raw }),
-    );
-  } catch {
-    /* ignore */
-  }
-  return c.text("success");
-});

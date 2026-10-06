@@ -41,10 +41,13 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
-import { hashPassword, newApiKey } from "../auth.ts";
-import { hashKey } from "../services/user-keys.ts";
+import { hashPassword } from "../auth.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import { listBindablePolicies, resolvePlanPolicyBinding } from "../services/plan-subscription.ts";
+import {
+  deleteNode as deleteManagedNode,
+  LIFECYCLE_ERROR_STATUS,
+} from "../services/node-lifecycle.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const adminExtendedRoutes = new Hono<{ Variables: AppVariables }>();
@@ -256,9 +259,6 @@ adminExtendedRoutes.post("/users", async (c) => {
           auto_renew: Boolean(body.auto_renew),
           status: status ?? "active",
           parent_id: parentId ?? undefined,
-          // SEC-02：新建用户同样只落 api_key 的 sha256 哈希，明文列留空（一次性明文
-          // 仅由用户侧的 settings 轮换端点返回，管理端创建不返回凭据）。
-          api_key_hash: hashKey(newApiKey()),
         } as Prisma.UserUncheckedCreateInput,
       });
       await createPersonalWorkspace(tx, user);
@@ -396,6 +396,69 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     return bad(c, `该用户仍有 ${tunnelCount} 条隧道，请先删除隧道`, 409);
   }
 
+  // 普通 Tunnel 不是唯一会在 Node 上留下 runtime 的对象：作为 federation host
+  // 时，远端腿只记录 federation_lease.node_id，根本没有本地 Tunnel 行。
+  // 删除 Node 会级联 NodePortLease，却不会改写 FederationLease（历史刻意无 FK），
+  // 因此必须先证明这些个人节点没有仍需 teardown/还端口的远端资源。
+  const personalWorkspace = await db.workspace.findUnique({
+    where: { personal_user_id: id },
+    select: { id: true },
+  });
+  const ownedNodes = await db.node.findMany({
+    where: { node_group: { user_id: id } },
+    select: { id: true },
+  });
+  const ownedNodeIds = ownedNodes.map((node) => node.id);
+  if (ownedNodeIds.length > 0) {
+    const [federatedRuntimeCount, activePortLeaseCount] = await Promise.all([
+      db.federationLease.count({
+        where: {
+          node_id: { in: ownedNodeIds },
+          OR: [
+            { state: { in: ["reserved", "active", "releasing", "failed"] } },
+            {
+              state: { in: ["revoked", "expired", "released"] },
+              last_error_code: { not: null },
+            },
+          ],
+        },
+      }),
+      db.nodePortLease.count({
+        where: { node_id: { in: ownedNodeIds }, status: "active" },
+      }),
+    ]);
+    if (federatedRuntimeCount > 0) {
+      return bad(
+        c,
+        `该用户节点仍承载 ${federatedRuntimeCount} 条未完成清理的联邦租约，请先 release/revoke 并完成 runtime 清理`,
+        409,
+      );
+    }
+    if (activePortLeaseCount > 0) {
+      return bad(
+        c,
+        `该用户节点仍有 ${activePortLeaseCount} 条活动端口租约，请先完成租约回收`,
+        409,
+      );
+    }
+  }
+
+  if (personalWorkspace) {
+    const federationGrantCount = await db.federationGrant.count({
+      where: {
+        workspace_id: personalWorkspace.id,
+        status: { in: ["active", "suspended"] },
+      },
+    });
+    if (federationGrantCount > 0) {
+      return bad(
+        c,
+        `该用户个人空间仍有 ${federationGrantCount} 条未终止的联邦授权，请先撤销 grant`,
+        409,
+      );
+    }
+  }
+
   //：旧 collectAffectedNodeGroups*（为 legacy 配置推送计算受影响节点组）
 
   await db.$transaction(async (tx) => {
@@ -412,8 +475,9 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     }
     await tx.ticket.deleteMany({ where: { user_id: id } });
 
-    // 基础设施：隧道链 / 流量 / DNS / 节点 / 节点组 / 套餐绑定
-    await tx.tunnelTraffic.deleteMany({ where: { tunnel: { user_id: id } } });
+    // 基础设施：隧道链 / DNS / 节点 / 节点组 / 套餐绑定。
+    // tunnel_traffic is an immutable accounting ledger and deliberately survives
+    // deletion of its live Tunnel/User/Workspace objects. It has no live FK.
     await tx.tunnelChain.deleteMany({ where: { tunnel: { user_id: id } } });
     await tx.tunnel.deleteMany({ where: { user_id: id } });
     await tx.inNodeGroupDNS.deleteMany({ where: { in_node_group: { user_id: id } } });
@@ -439,7 +503,8 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     await tx.user.delete({ where: { id } });
   });
 
-  //：用户删除后由 reconciler 拉齐 apply 命令，无需 legacy 推送。
+  // 所有 runtime / lease / federation grant 都在事务前被要求收口；到这里
+  // 删除的是纯账本/身份数据，不再依赖“删完 desired 再让 reconciler 猜着清 runtime”。
   return one(c, { ok: true });
 });
 
@@ -611,10 +676,23 @@ adminExtendedRoutes.delete("/nodes/:id", async (c) => {
   const id = readId(c);
   if (id === null) return bad(c, "非法的节点 ID");
 
-  const node = await db.node.findUnique({ where: { id } });
-  if (!node) return bad(c, "节点不存在", 404);
-
-  await db.node.delete({ where: { id } });
+  // Compatibility endpoint delegates to the lifecycle deletion state machine.
+  // Direct Prisma delete bypasses retiring + impact gates and can erase a node
+  // while a middle-hop/Federation runtime still owns it.
+  const result = await deleteManagedNode(id);
+  if (!result.ok) {
+    const status = LIFECYCLE_ERROR_STATUS[result.code] ?? 409;
+    return c.json(
+      {
+        error: result.message,
+        message: result.message,
+        code: result.code,
+        ...(result.condition ? { condition: result.condition } : {}),
+        ...(result.dependencies ? { dependencies: result.dependencies } : {}),
+      },
+      status,
+    );
+  }
   return one(c, { ok: true });
 });
 

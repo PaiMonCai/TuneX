@@ -53,9 +53,6 @@ const PRE_MIGRATIONS = [
 
 const CI_ENV = {
   AUTH_SECRET: "ci-only-auth-secret-must-not-be-used-in-production", // secret-scan:allow
-  LICENSE_SECRET: "ci-only-license-secret-must-not-be-used-in-production", // secret-scan:allow
-  TUNEX_CONFIG_KEY: "Y2ktb25seS1jb25maWcta2V5LW11c3Qtbm90LXByb2Q=", // secret-scan:allow
-  TUNEX_LICENSE_KEY: "Y2ktb25seS1zdWNlbnNlLWtleS1tdXN0LW5vdC1wcm8=", // secret-scan:allow
 };
 
 function prismaCli() {

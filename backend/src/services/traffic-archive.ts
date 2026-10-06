@@ -31,12 +31,13 @@
  * 唯一索引则 Crash-safe：要么磁盘上多一份（幂等丢弃），要么缓冲还在（下轮重试）。
  *
  * ── 归属（TEN-02）──
- * 缓冲键带 `ws:<workspace_id>:` 前缀，`tunnel_traffic` 经 `tunnel.workspace_id`
- * 关联。归档时**不信任**缓冲键里的 scope 段做归属——隧道与 workspace 的对应
- * 关系以 MySQL 为准（一次 `findMany` 批量解析），只归档 tunnel_id 真实存在
- * 且归属明确的记录；解析不到归属的一律丢弃并计数（见 {@link flushTrafficBuffer}）。
+ * 缓冲键带 `ws:<workspace_id>:` 前缀。写入缓冲之前，上报入口已用 MySQL
+ * 授权后的 tunnel 集合筛掉跨租户 id，因此这个 scope 是**采集时固化的租户事实**。
+ * 归档时 Tunnel 仍存在 ⇒ MySQL 必须与 key scope 一致；Tunnel 已在归档前被删除
+ * ⇒ 用 key scope 作为历史归属，把最后一批已授权流量落账。两者都没有时才丢弃。
  */
 import type { Prisma } from "@prisma/client";
+import { billingPeriodKey } from "./billing-time.ts";
 import {
   trafficBufferPrefix,
   trafficBufferKey,
@@ -150,6 +151,8 @@ export interface TrafficDbLike {
 /** 入库行（date 归一为 UTC 午夜 Date，与既有查询 `date` 日界口径一致）。 */
 export interface TrafficInsertRow {
   tunnel_id: number;
+  /** Immutable tenant attribution copied from the authoritative Tunnel row. */
+  workspace_id: number;
   traffic: number;
   traffic_cost: number;
   date: Date;
@@ -162,7 +165,7 @@ export interface TrafficArchiveDeps {
   readBuffer(key: string): Promise<string[] | null>;
   /** 删除已归档的缓冲 hash。 */
   clearBuffer(key: string): Promise<void>;
-  /** 解析 tunnel_id → workspace_id；缺失返回 null（视为未知隧道）。 */
+  /** 解析当前 live tunnel_id → workspace_id；缺失可能表示已删除。 */
   resolveTunnelWorkspace(ids: number[]): Promise<Map<number, number | null>>;
   /** 批量入库；返回成功条数。 */
   insertTraffic(rows: TrafficInsertRow[]): Promise<number>;
@@ -251,12 +254,35 @@ export async function flushTrafficBuffer(deps: TrafficArchiveDeps): Promise<Traf
       const rows: TrafficInsertRow[] = [];
       for (const rec of records) {
         result.records++;
-        const workspaceId = workspaceOf.get(rec.tunnel_id) ?? null;
+        const liveWorkspaceId = workspaceOf.get(rec.tunnel_id) ?? null;
+        const bufferedWorkspaceId = parsed.scope > 0 ? parsed.scope : null;
+
+        // If the resource still exists, the current authoritative owner MUST match
+        // the scope captured when this traffic was accepted. A mismatch is a
+        // cross-tenant/inconsistent fact and is never archived under either side.
+        if (
+          liveWorkspaceId !== null &&
+          bufferedWorkspaceId !== null &&
+          liveWorkspaceId !== bufferedWorkspaceId
+        ) {
+          result.skipped++;
+          log("[traffic] workspace scope mismatch", {
+            tunnel_id: rec.tunnel_id,
+            live_workspace_id: liveWorkspaceId,
+            buffered_workspace_id: bufferedWorkspaceId,
+          });
+          continue;
+        }
+
+        // Deleted between collection and archive: the already-authorized buffer
+        // scope is the only surviving immutable attribution. Global/unknown scope
+        // is never enough to invent a tenant.
+        const workspaceId = liveWorkspaceId ?? bufferedWorkspaceId;
         if (workspaceId === null) {
-          // 隧道已删 / 归属不明 → 丢弃。写不进去的数据进任何桶都是错的。
           result.skipped++;
           continue;
         }
+
         // 归档锁：在写库之前抢，把「崩溃 → 下一轮重试」压到 TTL 内一次。
         const locked = await deps.acquireArchiveLock(rec.tunnel_id, rec.date, TRAFFIC_ARCHIVE_LOCK_TTL_S);
         if (!locked) {
@@ -266,6 +292,7 @@ export async function flushTrafficBuffer(deps: TrafficArchiveDeps): Promise<Traf
         }
         rows.push({
           tunnel_id: rec.tunnel_id,
+          workspace_id: workspaceId,
           traffic: rec.traffic,
           traffic_cost: rec.traffic_cost,
           date: trafficDate(rec.date),
@@ -378,16 +405,11 @@ export { trafficBufferPrefix, trafficBufferKey, parseBufferKey as parseTrafficBu
 /* ================================================================== */
 
 /**
- * 本地计量日界键 `YYYY-MM-DD`（与 tunnel_traffic.date 的日界口径一致）。
- *
- * 用本地分量拼字符串，**不能** `toISOString().slice(0,10)`：
- * UTC+8 下本地午夜 = 前一天 16:00Z，那会把日界整体回退一天。
+ * Canonical billing-day key. It must not depend on the worker/container TZ:
+ * billing windows, archived labels and quota accounting all use Asia/Shanghai.
  */
 export function trafficDayKey(now: Date = new Date()): string {
-  const d = new Date(now.getTime());
-  d.setHours(0, 0, 0, 0);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return billingPeriodKey(now, "day");
 }
 
 /** 一条 agent 上报的隧道流量增量。 */

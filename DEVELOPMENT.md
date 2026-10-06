@@ -2998,13 +2998,19 @@ Pull Request
 main
   Source CI
       ↓
+  Build release candidates once
+    Unified image + Agent image
+    run-scoped candidate tags + immutable digests
+      ↓
   Full Integration / release qualification
+    exact candidate digests
     V3 baseline
     V4 rollout + F1/F2/F3/F4/F5
     V5 G0 / G1A / G1B / G4 / G5
-    unified image smoke
       ↓
-    Release
+  Release
+    promote the same qualified digests to <git-sha> + latest
+    no rebuild
 ~~~
 
 历史 Gate **没有删除**，只是从开发内循环移到 main 的 release qualification。新增 Gate 应按失败面放进合适层：快速且高价值的协议/核心回归可进 PR；重型、多 Panel、破坏性场景放 main / release。不得靠删除断言、skip 或改弱判据换取绿色。
@@ -3137,7 +3143,7 @@ G4 25/0 · G5 206/0 · G6 72/0 · G7 33/0
    Diagnostics / Federation 的信息架构与操作层级；
 3. **WP18 收口**：把 Forward 拒绝/恢复事实通知正式接到既有 worker reconcile 节拍，不新增第二个 cron；
 4. **WP19 收口**：补延迟历史 Web 图表与必要的产品展示，Looking Glass 继续默认关闭；
-5. **发布一致性**：演进到 Build once → test candidate artifact → promote same digest；
+5. **发布一致性**：保持 Build once → test exact candidate digest → promote same digest；Release 禁止重新构建；
 6. **Production Beta 演练**：干净机器安装 → 建 Node → 装 Agent → 建 Forward → 流量 →
    upgrade → backup → rollback → restore；
 7. **安全评审**：Federation、Looking Glass、Webhook/Telegram、支付回调、Agent enrollment、RBAC。

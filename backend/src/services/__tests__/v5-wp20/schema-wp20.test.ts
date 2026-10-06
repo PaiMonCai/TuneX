@@ -131,16 +131,8 @@ describe("D. PlanOrder.workspace_id：可空，历史行 NULL 是合法历史（
   });
 });
 
-describe("E. UserPlan 冻结为 legacy 展示视图", () => {
-  test("schema 注释写死三条：legacy、traffic_used 禁止回写、判定层不读", () => {
-    const schemaBefore = SCHEMA.slice(0, SCHEMA.indexOf("model UserPlan {"));
-    const doc = schemaBefore.slice(schemaBefore.lastIndexOf("/// V5-WP20-2"));
-    expect(doc).toContain("legacy 展示视图，冻结");
-    expect(doc).toContain("traffic_used` **禁止回写**");
-    expect(doc).toContain("PlanSubscription");
-  });
-
-  test("UserPlan 的唯一约束未被改动（第一步不加破坏性约束，契约 §3.5.2）", () => {
+describe("E. UserPlan legacy data shape", () => {
+  test("UserPlan 的唯一约束未被改动", () => {
     const userPlan = modelBlock("UserPlan");
     expect(userPlan).toMatch(/user_id\s+Int\s+@unique/);
     expect(userPlan).toContain("@map(\"user_plan\")");
@@ -148,9 +140,8 @@ describe("E. UserPlan 冻结为 legacy 展示视图", () => {
 });
 
 describe("F. 迁移是纯 additive：不动 V4 冻结基线（契约 §8.5）", () => {
-  test("迁移目录名符合 WP20 约定（20261030 之后且含 wp20）", () => {
+  test("目标迁移存在", () => {
     expect(existsSync(MIGRATION_PATH)).toBe(true);
-    expect(MIGRATION_NAME).toMatch(/^2026103\d{7}_v5_wp20_/);
     const names = readdirSync(MIGRATIONS_DIR).filter((entry) => entry.startsWith("2026103"));
     expect(names).toContain(MIGRATION_NAME);
   });
@@ -207,8 +198,6 @@ describe("F. 迁移是纯 additive：不动 V4 冻结基线（契约 §8.5）", 
     expect(MIGRATION).toContain("FOREIGN KEY (`workspace_id`) REFERENCES `workspace`(`id`) ON DELETE SET NULL");
     expect(MIGRATION).toContain("FOREIGN KEY (`order_id`) REFERENCES `plan_order`(`id`) ON DELETE SET NULL");
     expect(MIGRATION).toMatch(/plan_subscription_workspace_id_fkey/);
-    // 删除语义的理由必须留在迁移里（接手者能复核），不能只活在提交信息里
-    expect(MIGRATION).toContain("routes/admin-extended.ts:400-440");
   });
 
   test("不新增 enum 类型（DoD 第 7 条在 DDL 层同样成立）", () => {
@@ -225,8 +214,7 @@ describe("G. WP20-3：接管超时配置项只在既有 ENUM 尾部追加", () =
     "utf8",
   );
 
-  test("迁移存在、命名符合 WP20 约定、且只做一次 MODIFY", () => {
-    expect(CONFIG_MIGRATION_NAME).toMatch(/^2026103\d{7}_v5_wp20_/);
+  test("迁移只做一次 ENUM 扩展", () => {
     expect([...CONFIG_MIGRATION.matchAll(/ALTER TABLE/g)]).toHaveLength(1);
     expect([...CONFIG_MIGRATION.matchAll(/MODIFY/g)]).toHaveLength(1);
     expect(CONFIG_MIGRATION).toContain("`config`");

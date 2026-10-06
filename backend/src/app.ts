@@ -53,17 +53,42 @@ import { routeProfilesRoutes } from "./routes/route-profiles.ts";
 // Federation separates signed panel-to-panel machine endpoints from Admin Console APIs.
 import { federationRoutes } from "./routes/federation.ts";
 import { adminFederationRoutes } from "./routes/admin-federation.ts";
+import { ensureFederationWiring } from "./services/federation/lease.ts";
+
+export const APP_ROUTE_MOUNTS = [
+  "/api/auth",
+  "/api/internal",
+  "/api/pay",
+  "/api/dashboard",
+  "/api/me",
+  "/api/tunnels",
+  "/api/forwards",
+  "/api/ddns",
+  "/api/workspaces",
+  "/api/plans",
+  "/api/topups",
+  "/api/payments",
+  "/api/tickets",
+  "/api/settings",
+  "/api/node-groups",
+  "/api/nodes",
+  "/api/route-profiles",
+  "/api/announcements",
+  "/api/federation/v1",
+  "/api",
+  "/api/admin",
+  "/api/admin/federation",
+  "/api/looking-glass",
+] as const;
 
 export function createApp() {
   const app = new Hono<{ Variables: AppVariables }>();
 
-  // Federation stop/revocation hooks must also exist in the Panel process, not only the worker.
-  try {
-    // Start process-level federation wiring during app construction; the operation is idempotent.
-    void import("./services/federation/lease.ts").then((m) => m.ensureFederationWiring());
-  } catch (e) {
-    console.error("[app] federation wiring failed:", e instanceof Error ? e.message : e);
-  }
+  // Federation routes are already loaded synchronously, so their teardown/revoke
+  // hooks must be wired synchronously too. Otherwise the first request can arrive
+  // in the microtask window before dynamic import completion and revoke authority
+  // without immediately stopping its runtime.
+  ensureFederationWiring();
 
   // ① 请求 IP 提取 + 结构化访问日志
   app.use("*", async (c, next) => {

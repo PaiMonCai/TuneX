@@ -49,6 +49,11 @@ function requireUser(c: Ctx): NonNullable<AppVariables["user"]> {
   return user;
 }
 
+function positiveId(raw: string): number | null {
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
 adminFederationRoutes.get("/status", async (c) => {
   const enabled = await isFederationEnabled();
   const identity = await getPanelIdentity();
@@ -167,7 +172,11 @@ adminFederationRoutes.post("/peers/handshake", async (c) => {
 });
 
 adminFederationRoutes.post("/peers/:id/ping", async (c) => {
-  const peer = await db.federationPeer.findUnique({ where: { id: Number(c.req.param("id")) } });
+  const peerId = positiveId(c.req.param("id"));
+  if (peerId === null) {
+    return c.json(federationErrorBody("message_malformed", "peer id 非法"), 400 as never);
+  }
+  const peer = await db.federationPeer.findUnique({ where: { id: peerId } });
   if (!peer) return c.json(federationErrorBody("peer_unknown", "未知的 peer"), 404 as never);
   const res = await callPeer({
     peer: { peer_panel_id: peer.peer_panel_id, endpoint_url: peer.endpoint_url },
@@ -184,7 +193,11 @@ adminFederationRoutes.post("/peers/:id/ping", async (c) => {
 });
 
 adminFederationRoutes.post("/peers/:id/rotate", async (c) => {
-  const peer = await db.federationPeer.findUnique({ where: { id: Number(c.req.param("id")) } });
+  const peerId = positiveId(c.req.param("id"));
+  if (peerId === null) {
+    return c.json(federationErrorBody("message_malformed", "peer id 非法"), 400 as never);
+  }
+  const peer = await db.federationPeer.findUnique({ where: { id: peerId } });
   if (!peer) return c.json(federationErrorBody("peer_unknown", "未知的 peer"), 404 as never);
   const result = await rotatePanelKey({ peers: [peer.peer_panel_id] });
   if (!result.ok) {
@@ -199,7 +212,11 @@ adminFederationRoutes.post("/peers/:id/rotate", async (c) => {
 
 adminFederationRoutes.delete("/peers/:id", async (c) => {
   const user = requireUser(c);
-  const peer = await db.federationPeer.findUnique({ where: { id: Number(c.req.param("id")) } });
+  const peerId = positiveId(c.req.param("id"));
+  if (peerId === null) {
+    return c.json(federationErrorBody("message_malformed", "peer id 非法"), 400 as never);
+  }
+  const peer = await db.federationPeer.findUnique({ where: { id: peerId } });
   if (!peer) return c.json(federationErrorBody("peer_unknown", "未知的 peer"), 404 as never);
   try {
     const result = await revokePeer(peer.peer_panel_id);

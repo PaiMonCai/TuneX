@@ -355,6 +355,7 @@ function parseAssignments(raw: unknown): { ok: true; rows: AssignmentInput[] } |
   if (raw === undefined || raw === null) return { ok: true, rows: [] };
   if (!Array.isArray(raw)) return routeProfileError("invalid_input", "assignments 必须是数组");
   const rows: AssignmentInput[] = [];
+  const seen = new Set<string>();
   for (let i = 0; i < raw.length; i += 1) {
     const item = raw[i];
     if (!isPlainObject(item)) return routeProfileError("invalid_input", `assignments[${i}] 必须是对象`);
@@ -368,9 +369,18 @@ function parseAssignments(raw: unknown): { ok: true; rows: AssignmentInput[] } |
     if (item.active !== undefined && typeof item.active !== "boolean") {
       return routeProfileError("invalid_input", `assignments[${i}].active 必须是布尔值`);
     }
+    const targetId = item.target_id as number;
+    const key = `${targetType}:${targetId}`;
+    if (seen.has(key)) {
+      return routeProfileError(
+        "invalid_input",
+        `assignments[${i}] 与前面的 ${targetType}:${targetId} 重复`,
+      );
+    }
+    seen.add(key);
     rows.push({
       target_type: targetType,
-      target_id: item.target_id as number,
+      target_id: targetId,
       active: item.active === undefined ? true : (item.active as boolean),
     });
   }
@@ -389,7 +399,7 @@ function normalizeDescription(raw: unknown): string | null | undefined {
   if (raw === null) return null;
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
-  return trimmed === "" ? null : trimmed.slice(0, 500);
+  return trimmed === "" ? null : trimmed;
 }
 
 /* ================================================================== */
@@ -621,6 +631,13 @@ export async function createRouteProfile(
   if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
     return fail(routeProfileError("invalid_input", "enabled 必须是布尔值"));
   }
+  if (
+    input.description !== undefined &&
+    input.description !== null &&
+    (typeof input.description !== "string" || input.description.trim().length > 500)
+  ) {
+    return fail(routeProfileError("invalid_input", "description 必须是最多 500 个字符的字符串或 null"));
+  }
 
   const parsedTemplate = parseRouteProfileTemplate(input.template);
   if (!parsedTemplate.ok) {
@@ -746,6 +763,13 @@ export async function patchRouteProfile(
   }
   if (patch.enabled !== undefined && typeof patch.enabled !== "boolean") {
     return fail(routeProfileError("invalid_input", "enabled 必须是布尔值"));
+  }
+  if (
+    patch.description !== undefined &&
+    patch.description !== null &&
+    (typeof patch.description !== "string" || patch.description.trim().length > 500)
+  ) {
+    return fail(routeProfileError("invalid_input", "description 必须是最多 500 个字符的字符串或 null"));
   }
   const description = normalizeDescription(patch.description);
   const assignments = parseAssignments(patch.assignments);
@@ -1222,9 +1246,9 @@ export interface RouteProfileApplyResult {
  *   3. 实际生效必须经过既有 `patchForward`（新 revision + rollout），本函数不写
  *      runtime、不发命令、不碰 lease。
  *
- * 写入顺位：先把「来源模板指针」写到 tunnel 行，再调用既有编辑路径 ——
- * 这样 `createForwardRevision` 在同一个事实基础上把 provenance 冻进快照；
- * 编辑失败则把指针恢复原值（补偿），不留半套状态。
+ * 来源模板指针与放置事实由既有 `patchForward` 的同一 desired-config 事务
+ * 一起写入；snapshot 同时冻结 provenance。禁止“先写指针、失败再补偿”的双写法，
+ * 因为并发 apply 会让补偿覆盖另一位写者已经成功提交的来源事实。
  */
 export async function applyRouteProfile(
   input: ApplyRouteProfileInput,
@@ -1365,35 +1389,11 @@ export async function applyRouteProfile(
       continue;
     }
 
-    // 指针先写：这样既有编辑路径创建 revision 时，「来源模板」已是确定事实。
-    const previousPointer = {
-      route_profile_id: forward.route_profile_id,
-      route_profile_version: forward.route_profile_version,
-    };
-    try {
-      await db.tunnel.update({
-        where: { id: forwardId },
-        data: {
-          route_profile_id: input.profileId,
-          route_profile_version: loaded.data.version,
-        },
-      });
-    } catch {
-      outcomes.push({
-        forward_id: forwardId,
-        name: forward.name,
-        status: "failed",
-        error: {
-          code: "db_unavailable",
-          message: "写入来源模板指针失败，请稍后重试",
-          error_layer: "data_plane",
-          retryable: true,
-          next_action: "稍后重试",
-        },
-      });
-      continue;
-    }
-
+    // Route Profile provenance travels through the SAME desired-config transaction
+    // as the placement change. Do not pre-write the pointer and later compensate:
+    // two concurrent applies can interleave those writes and let the loser erase
+    // the winner's provenance. The observed revision is always forwarded as the
+    // optimistic token, even when the caller omitted expected_revisions.
     const patch: ForwardPatchInput = {
       mode: compiled.tunnel_mode,
       // `plan`（而不是 placement）取值：plan 已经过 `buildRoutePlan` 的合法性校验，
@@ -1401,19 +1401,16 @@ export async function applyRouteProfile(
       ingress_node_id: compiled.plan.ingress_node_id,
       egress_node_id: compiled.tunnel_mode === "relay" ? compiled.plan.egress_node_id : null,
       middle_node_id: compiled.plan.middle_node_id,
+      expected_revision: gate ?? Number(forward.config_revision ?? 0),
     };
-    const patched = await patchForward(forwardId, input.workspaceId, patch, input.audit?.actorId ?? undefined);
+    const patched = await patchForward(
+      forwardId,
+      input.workspaceId,
+      patch,
+      input.audit?.actorId ?? undefined,
+      { routeProfile: { id: input.profileId, version: loaded.data.version } },
+    );
     if (!patched.ok) {
-      // 补偿：恢复指针，避免「指针说来自模板、但放置事实没变」的半套状态。
-      await db.tunnel
-        .update({
-          where: { id: forwardId },
-          data: {
-            route_profile_id: previousPointer.route_profile_id,
-            route_profile_version: previousPointer.route_profile_version,
-          },
-        })
-        .catch(() => undefined);
       outcomes.push({
         forward_id: forwardId,
         name: forward.name,
@@ -1425,7 +1422,7 @@ export async function applyRouteProfile(
           retryable: patched.code === "revision_conflict",
           next_action:
             patched.code === "revision_conflict"
-              ? "等待该 Forward 正在进行的更新结束后重试"
+              ? "读取最新 revision 后重新解析并 apply"
               : "检查该 Forward 的配置（模式/目标）是否与模板解析结果相容",
         },
       });

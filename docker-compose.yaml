@@ -56,6 +56,9 @@ services:
     <<: *tunex-app
     container_name: tunex-db-migrate
     env_file: [.env]
+    # Unified image defaults to USER bun. Migration is the only role that needs
+    # root so the seed can write /host/.admin-credentials into the deployment bind mount.
+    user: "0:0"
     environment:
       ADMIN_CREDENTIALS_PATH: /host/.admin-credentials
     command: ["sh", "-c", "bunx prisma migrate deploy && bun prisma/seed.ts"]

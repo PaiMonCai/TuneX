@@ -25,7 +25,7 @@ import {
 } from "../../billing-time.ts";
 import { composeEffectivePolicy, trafficWindowStart, type PolicyRecord } from "../../capability-policy.ts";
 import { dayKeyOf, fillDays } from "../../traffic.ts";
-import { trafficDate } from "../../traffic-archive.ts";
+import { trafficDate, trafficDayKey } from "../../traffic-archive.ts";
 import { sumFederatedUnattributedTraffic, type FederatedUsageClient } from "../../policy-service.ts";
 
 /** 覆盖日界、月界、跨年、闰年、以及「UTC 日 ≠ 上海日」的临界点。 */
@@ -78,6 +78,13 @@ describe("B. 图表日键 = 归档日标签（读入口径与写入口径逐字�
     for (const instant of GRID) {
       const at = new Date(instant);
       expect({ instant, key: dayKeyOf(at) }).toEqual({ instant, key: billingPeriodKey(at, "day") });
+    }
+  });
+
+  test("归档写入口 trafficDayKey 同样使用固定计费时区，不依赖进程 TZ", () => {
+    for (const instant of GRID) {
+      const at = new Date(instant);
+      expect({ instant, key: trafficDayKey(at) }).toEqual({ instant, key: billingPeriodKey(at, "day") });
     }
   });
 
@@ -303,5 +310,52 @@ describe("D. 守卫：不再有第二套日界实现 / 已用流量不再读 leg
     expect(code).toContain("sumFederatedUnattributedTraffic(workspaceId)");
     // 缺口不得并进 total_traffic
     expect(code).not.toMatch(/total_traffic:\s*[^,\n]*federated/);
+  });
+
+  test("删除 Forward 不得删除或脱租户历史流量：归档行自带 immutable workspace attribution", () => {
+    const schema = readFileSync(
+      new URL("../../../../prisma/schema.prisma", import.meta.url),
+      "utf8",
+    );
+    const model = /model TunnelTraffic \{[\s\S]*?\n\}/.exec(schema)?.[0] ?? "";
+    expect(model).toContain("workspace_id Int");
+    expect(model).not.toContain("@relation(");
+
+    const migration = readFileSync(
+      new URL(
+        "../../../../prisma/migrations/20261037000000_traffic_ledger_survives_forward_delete/migration.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    expect(migration).toContain("SET tt.`workspace_id` = t.`workspace_id`");
+    expect(migration).toContain("DROP FOREIGN KEY `tunnel_traffic_tunnel_id_fkey`");
+
+    const archive = STRIP(read("services/traffic-archive.ts"));
+    expect(archive).toContain("workspace_id: workspaceId");
+
+    const policy = STRIP(read("services/policy-service.ts"));
+    expect(policy).toContain("TunnelTrafficWhereInput = { workspace_id: workspaceId }");
+    expect(policy).not.toMatch(/TunnelTrafficWhereInput\s*=\s*\{\s*tunnel:/);
+
+    const traffic = STRIP(read("services/traffic.ts"));
+    expect(traffic).toContain("workspace_id: workspaceId");
+
+    const dashboard = STRIP(read("routes/dashboard.ts"));
+    expect(dashboard).toContain("workspace_id: workspace.id");
+
+    const tunnelApi = STRIP(read("services/tunnel-api.ts"));
+    expect(tunnelApi).not.toMatch(/tunnelTraffic[^\n]*deleteMany/);
+  });
+
+  test("Forward 流量视图也必须读 canonical ledger / billing-time，不得回退 legacy live 列或进程时区", () => {
+    const code = STRIP(read("services/forward-service.ts"));
+    expect(code).toContain("db.tunnelTraffic.aggregate");
+    expect(code).toContain("where: { workspace_id: workspaceId }");
+    expect(code).toContain("billingDayKeyStamp(now)");
+    expect(code).toContain("fillDays(windowDays, now)");
+    expect(code).not.toContain("db.tunnel.aggregate({");
+    expect(code).not.toContain("since.setHours(");
+    expect(code).not.toContain("date.setHours(");
   });
 });

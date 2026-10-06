@@ -920,6 +920,32 @@ describe("正常路径：五阶段推进到 done", () => {
   // resume 路径（worker 崩溃后补跑）也走同一个 markTunnelApplied：崩溃前的
   // rollout 行没有 applied_revision 可继承，续跑完成后必须补齐，否则
   // 「重启一次就永久落后」。
+  it("Tunnel 成功记账失败时 rollout 不得先进入 done", async () => {
+    const { f, deps } = directEnv();
+    const original = deps.db.tunnel.updateMany;
+    deps.db.tunnel.updateMany = async (args: unknown) => {
+      const data = (args as { data?: Record<string, unknown> }).data ?? {};
+      if (data.apply_status === "active" && data.applied_revision === 7) {
+        throw new Error("simulated tunnel ledger failure");
+      }
+      return original(args);
+    };
+
+    await expect(
+      registerRollout(
+        {
+          tunnelId: 1,
+          impact: impact({ listen_port_change: true, listener_replacement: true }),
+          revision: 7,
+          baseRevision: 6,
+        },
+        deps,
+      ),
+    ).rejects.toThrow(/simulated tunnel ledger failure/);
+
+    expect(f.rollouts[0]!.phase).not.toBe("done");
+  });
+
   it("resume 到 done 时同样补写 applied_revision", async () => {
     const at = new Date("2026-09-26T04:05:00.000Z");
     const { f, orch } = directEnv();
@@ -985,6 +1011,73 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     expect(failDeps.db).toBeTruthy();
     // 撤掉已经 ACK 的 egress（这里第一次就失败，没有 ACK 的 egress）。
     expect(failOrch.calls.removeTunnel.length).toBe(0);
+  });
+
+  it("PREPARE 复用本隧道已有 active lease 时，失败清理不得释放旧 ownership", async () => {
+    const relay = modeSwitchEnv();
+    const existingLeaseId = relay.f.addLease({
+      node_id: 21,
+      port: 31000,
+      lease_type: "egress",
+      tunnel_id: 1,
+      status: "active",
+      expires_at: null,
+    });
+    const failOrch = fakeOrchestrator({ failOn: { dispatchEgress: true } });
+    const failDeps: RolloutDeps = {
+      db: relay.f.db,
+      runtimeUse: async () => null,
+      orchestrator: failOrch,
+    };
+
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ mode_change: true, egress_node_change: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      failDeps,
+    );
+
+    expect(res.ok).toBe(false);
+    expect(relay.f.rollouts[0]!.phase).toBe("failed");
+    expect(relay.f.leases.find((lease) => lease.id === existingLeaseId)?.status).toBe("active");
+  });
+
+  it("CUTOVER 清理无法确认 runtime 已撤时保留新端口租约，避免双绑", async () => {
+    const { f } = modeSwitchEnv();
+    const desired = f.snapshots.find((s) => Number(s.revision) === 7)!;
+    desired.egress_port = null;
+    f.tunnels[0]!.egress_port = null;
+
+    const failOrch = fakeOrchestrator({
+      failOn: { dispatchIngress: true, removeTunnel: true },
+    });
+    const deps: RolloutDeps = {
+      db: f.db,
+      runtimeUse: async () => null,
+      orchestrator: failOrch,
+      sleep: async () => {},
+    };
+
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ mode_change: true, egress_node_change: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      deps,
+    );
+
+    expect(res.ok).toBe(false);
+    const preparedLease = f.leases.find(
+      (lease) => lease.node_id === 21 && lease.tunnel_id === 1,
+    );
+    expect(preparedLease).toBeTruthy();
+    expect(preparedLease?.status).toBe("active");
+    expect(f.rollouts[0]!.phase).toBe("degraded");
   });
 
   it("CUTOVER 失败 ⇒ compensating → 补偿撤新 runtime + 重放基线", async () => {

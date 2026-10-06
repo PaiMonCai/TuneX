@@ -22,7 +22,6 @@ import { after, test } from "node:test";
 import assert from "node:assert/strict";
 
 process.env.AUTH_SECRET ||= "wp18-only-not-a-real-session-secret-32-bytes";
-process.env.LICENSE_SECRET ||= "wp18-only-not-a-real-license-secret-32-bytes";
 
 const { app } = await import("../src/app.ts");
 const { db } = await import("../src/db.ts");

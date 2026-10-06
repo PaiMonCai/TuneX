@@ -997,72 +997,94 @@ async function cascadeRevokeLeases(
     const hopRole = (HOP_ROLES as readonly string[]).includes(lease.hop_role)
       ? (lease.hop_role as HopRole)
       : "egress";
+
+    // Revocation is an authority fact, not the result of teardown. Fence the
+    // lease FIRST so concurrent apply/renew sees revoked and cannot recreate or
+    // extend the runtime while we are stopping it. CAS loss means another
+    // generation/state already won; in that case we must NOT touch its runtime.
+    const fenced = (await d.db.federationLease.updateMany({
+      where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
+      data: {
+        state: "revoked",
+        released_at: now,
+        last_error_code: PEER_REVOKE_PENDING_CODE,
+        last_error: "revocation committed; runtime teardown pending",
+      },
+    })) as { count: number };
+    if (fenced.count === 0) {
+      raced++;
+      continue;
+    }
+    revoked++;
+
     let stopped = false;
     let stopError: string | null = null;
     if (d.teardown === null) {
       stopError = "teardown hook is not wired; service may still be running (reconcile must retry)";
     } else {
-      const res = await d.teardown({
-        lease_ref: lease.lease_ref,
-        peer_panel_id: lease.peer_panel_id,
-        intent_id: lease.intent_id,
-        node_id: lease.node_id,
-        listen_port: lease.listen_port,
-        hop_role: hopRole,
-        lease_epoch: lease.lease_epoch,
-        reason: "revoked",
-      });
+      const res = await Promise.resolve()
+        .then(() =>
+          d.teardown!({
+            lease_ref: lease.lease_ref,
+            peer_panel_id: lease.peer_panel_id,
+            intent_id: lease.intent_id,
+            node_id: lease.node_id,
+            listen_port: lease.listen_port,
+            hop_role: hopRole,
+            lease_epoch: lease.lease_epoch,
+            reason: "revoked",
+          }),
+        )
+        .catch((e: unknown) => ({
+          ok: false as const,
+          message: e instanceof Error ? e.message : String(e),
+        }));
       stopped = res.ok;
       if (!res.ok) stopError = res.message ?? "teardown failed";
     }
 
-    const data: Record<string, unknown> = {
-      state: "revoked",
-      released_at: now,
-      last_error_code: stopped ? null : "internal_error",
-      last_error: stopped ? null : stopError,
-    };
-
-    // epoch + 旧状态一起做 CAS：并发释放/续约赢了我们就不覆盖它（它已经是更新的世代）。
-    const updated = (await d.db.federationLease.updateMany({
-      where: { id: lease.id, lease_epoch: lease.lease_epoch, state: lease.state },
-      data,
-    })) as { count: number };
-    if (updated.count === 0) {
-      raced++;
+    if (!stopped) {
+      teardownFailed++;
+      if (lease.node_id !== null && lease.listen_port !== null) portsPending++;
+      await d.db.federationLease.updateMany({
+        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
+        data: {
+          last_error_code: "internal_error",
+          last_error: stopError,
+        },
+      });
       continue;
     }
-    revoked++;
-    if (stopped) teardownOk++;
-    else teardownFailed++;
+    teardownOk++;
 
-    // 先停服、后还端口（§3.3）。停服没成功就不还——见本函数头注释。
-    if (lease.node_id !== null && lease.listen_port !== null && !stopped) {
-      // 停服没成功却在库里"还了端口"会让下一个分配者撞上一个仍在 listen 的 socket。
-      portsPending++;
-    }
-    if (stopped && lease.node_id !== null && lease.listen_port !== null) {
+    // Runtime is confirmed down. Only now may its port ownership be returned.
+    if (lease.node_id !== null && lease.listen_port !== null) {
       if (d.releasePort === null) {
         portsPending++;
         await d.db.federationLease.updateMany({
-          where: { id: lease.id, lease_epoch: lease.lease_epoch },
+          where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
           data: {
             last_error_code: PORT_RELEASE_PENDING_CODE,
             last_error: "port release hook is not wired; port lease will be reclaimed by portPool reconcile",
           },
         });
       } else {
-        // 钩子**抛**也必须被接住：它是在级联中途调用的，一次抛异常会让"撤销做了一半且没有记录"。
-        // 任何异常都退化成"停服成功、端口待还"这个已有状态（扫尾只补还端口，不再拆 runtime）。
         const rel = await Promise.resolve()
           .then(() => d.releasePort!({ node_id: lease.node_id!, port: lease.listen_port! }))
-          .catch((e: unknown) => ({ ok: false as const, message: e instanceof Error ? e.message : String(e) }));
-        if (rel.ok) portsReleased++;
-        else {
-          portsPending++;
-          // 停服已成功、只剩端口：用**显式标记**记着，扫尾据此只重试还端口而不是再拆一次 runtime。
+          .catch((e: unknown) => ({
+            ok: false as const,
+            message: e instanceof Error ? e.message : String(e),
+          }));
+        if (rel.ok) {
+          portsReleased++;
           await d.db.federationLease.updateMany({
-            where: { id: lease.id, lease_epoch: lease.lease_epoch },
+            where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
+            data: { last_error_code: null, last_error: null },
+          });
+        } else {
+          portsPending++;
+          await d.db.federationLease.updateMany({
+            where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
             data: {
               last_error_code: PORT_RELEASE_PENDING_CODE,
               last_error: rel.message ?? "port release failed",
@@ -1070,6 +1092,11 @@ async function cascadeRevokeLeases(
           });
         }
       }
+    } else {
+      await d.db.federationLease.updateMany({
+        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "revoked" },
+        data: { last_error_code: null, last_error: null },
+      });
     }
   }
 

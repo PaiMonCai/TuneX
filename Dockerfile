@@ -69,6 +69,11 @@ ENV NODE_ENV=production \
 WORKDIR /app/backend
 EXPOSE 3000 3001
 
+# Long-lived application roles are unprivileged by default. The one-shot
+# db-migrate service explicitly opts into uid 0 in Compose only because it also
+# writes the first-run credential file into the bind-mounted deployment folder.
+USER bun
+
 # Default role is the API. Compose overrides command/working_dir for worker,
 # db-migrate and web while reusing this exact image digest.
 CMD ["bun", "src/index.ts"]

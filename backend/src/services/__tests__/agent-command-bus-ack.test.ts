@@ -98,6 +98,18 @@ describe("WP11B ACK binding", () => {
     expect(JSON.parse(raw!).applied_revision).toBe(5);
   });
 
+  test("hop_local_addr survives ACK storage and delivery", async () => {
+    await pendingFor(harness.store, "cmd-hop", 5);
+    await storeAgentCommandAck(
+      SCOPE,
+      NODE,
+      { command_id: "cmd-hop", ok: true, applied_revision: 5, hop_local_addr: "172.31.20.10:53121" },
+      harness.store,
+    );
+    const ack = await waitAgentCommandAck(SCOPE, NODE, "cmd-hop", 1_000, harness.store);
+    expect(ack.hop_local_addr).toBe("172.31.20.10:53121");
+  });
+
   test("an applied revision ahead of the issued revision is refused", async () => {
     await pendingFor(harness.store, "cmd-3", 4);
     await expect(
@@ -154,6 +166,25 @@ describe("WP11B ACK binding", () => {
     await expect(
       storeAgentCommandAck(SCOPE, NODE, { command_id: "cmd-7", ok: true, applied_revision: 2 }, harness.store),
     ).rejects.toThrow(/unknown or expired/);
+  });
+
+  test("a corrupt stored ACK is reported as ack_invalid, not as a timeout", async () => {
+    await pendingFor(harness.store, "cmd-corrupt", 2);
+    await harness.store.set(
+      `ws:${SCOPE}:agent:command:${NODE}:ack:cmd-corrupt`,
+      "{not json",
+      120,
+    );
+
+    try {
+      await waitAgentCommandAck(SCOPE, NODE, "cmd-corrupt", 1_000, harness.store);
+      throw new Error("expected corrupt ACK to be rejected");
+    } catch (error) {
+      expect((error as { code?: string }).code).toBe("ack_invalid");
+    }
+
+    expect(harness.values.has(`ws:${SCOPE}:agent:command:${NODE}:ack:cmd-corrupt`)).toBe(false);
+    expect(harness.values.has(`ws:${SCOPE}:agent:command:${NODE}:pending:cmd-corrupt`)).toBe(false);
   });
 
   test("a timeout clears the pending record so a late ACK cannot be accepted", async () => {

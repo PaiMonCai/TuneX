@@ -18,7 +18,6 @@ process.env.DATABASE_URL =
   process.env.DATABASE_URL ?? "mysql://root:verify-only@127.0.0.1:3306/tunex_verify";
 process.env.REDIS_URL = process.env.REDIS_URL ?? "redis://127.0.0.1:6379";
 process.env.AUTH_SECRET = process.env.AUTH_SECRET ?? "federation-test-auth-secret";
-process.env.LICENSE_SECRET = process.env.LICENSE_SECRET ?? "federation-test-license-secret";
 process.env.PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED ?? "false";
 
 const enabled = process.env.TUNEX_DB_TEST === "1";
@@ -102,6 +101,8 @@ async function signedPost(path, body, keys, panelId, overrides = {}) {
     identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
     privateJwk: keys.private_jwk,
     body: bodyStr,
+    method: "POST",
+    path,
     messageId: overrides.messageId ?? crypto.randomUUID(),
     nowMs: overrides.nowMs,
     ttlSeconds: overrides.ttlSeconds,
@@ -237,6 +238,8 @@ maybe("WP14 federation: 篡改 / 时钟偏移 / 未知 peer 都被拒", async ()
     identity: { panel_id: peer.panelId, key_id: peer.keys.key_id, public_jwk: peer.keys.public_jwk },
     privateJwk: peer.keys.private_jwk,
     body: bodyStr,
+    method: "POST",
+    path: "/api/federation/v1/ping",
     messageId: crypto.randomUUID(),
   });
   const tampered = await req("/api/federation/v1/ping", {
@@ -259,6 +262,32 @@ maybe("WP14 federation: 篡改 / 时钟偏移 / 未知 peer 都被拒", async ()
   const unknown = await signedPost("/api/federation/v1/ping", {}, stranger, `${TEST_PEER_PREFIX}${crypto.randomUUID()}`);
   assert.equal(unknown.res.status, 403);
   assert.equal((await unknown.res.json()).code, "peer_unknown");
+});
+
+maybe("WP14 federation: 签名绑定 method/path，不能把已签请求搬到另一条路由", async () => {
+  await resetFederationTables();
+  await ensureIdentityForTest();
+  await setFederationEnabled(true);
+  const peer = await makePeer();
+
+  const bodyStr = JSON.stringify({});
+  const headers = await buildSignatureHeaders({
+    identity: { panel_id: peer.panelId, key_id: peer.keys.key_id, public_jwk: peer.keys.public_jwk },
+    privateJwk: peer.keys.private_jwk,
+    body: bodyStr,
+    method: "POST",
+    path: "/api/federation/v1/ping",
+    messageId: crypto.randomUUID(),
+  });
+  const moved = await req("/api/federation/v1/trust/revoke", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: bodyStr,
+  });
+  assert.equal(moved.status, 401);
+  assert.equal((await moved.json()).code, "signature_invalid");
+  const row = await db.federationPeer.findUnique({ where: { peer_panel_id: peer.panelId } });
+  assert.equal(row.status, "trusted", "搬运签名不得触发另一条路由的副作用");
 });
 
 maybe("WP14 federation: 密钥轮转先通知后生效，旧钥匙在宽限期内仍可验签", async () => {

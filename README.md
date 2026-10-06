@@ -120,7 +120,7 @@ G6   DDNS / placement            72/0
 G7   subscription billing        33/0
 ```
 
-PR 走 Source CI + Fast Integration；`main` 在 Source CI 后执行完整 Integration、统一镜像验证，再进入 Release。
+PR 走 Source CI + Fast Integration；`main` 在 Source CI 后只构建一次 Unified/Agent 候选镜像，完整 Integration 直接按候选 digest 验证，Release 只提升同一 digest，不重新构建。
 历史 Gate、冻结不变量与证据索引见 [DEVELOPMENT.md](DEVELOPMENT.md)。
 
 ## 文档

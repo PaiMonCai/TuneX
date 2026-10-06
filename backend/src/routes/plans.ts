@@ -157,22 +157,63 @@ plansRoutes.post("/purchase", async (c) => {
   // 顺序即契约：扣款、订单、订阅、发放必须**同事务** —— 授权同步失败要回滚，
   // 不得「扣了钱却不留权」。缓存失效（`invalidatePolicyCache`）放在**提交之后**。
   const result = await db.$transaction(async (tx) => {
+    // 锁住商品（以及优惠券）后重新读取价格/库存/限次。路由前面的检查只是快速反馈，
+    // 不能作为并发下的钱路径真相。
+    await tx.$queryRaw`SELECT id FROM plan WHERE id = ${plan.id} FOR UPDATE`;
+    const freshPlan = await tx.plan.findUniqueOrThrow({ where: { id: plan.id } });
+    if (freshPlan.status !== "active") throw new HTTPException(400, { message: "该套餐已下架" });
+    if (freshPlan.stock !== null && freshPlan.stock <= 0) {
+      throw new HTTPException(400, { message: "库存不足" });
+    }
+
+    let chargedTotal = freshPlan.price + (freshPlan.setup_fee ?? 0);
+    if (couponId !== null) {
+      await tx.$queryRaw`SELECT id FROM plan_coupon WHERE id = ${couponId} FOR UPDATE`;
+      const freshCoupon = await tx.planCoupon.findUnique({ where: { id: couponId } });
+      const now = new Date();
+      if (!freshCoupon) throw new HTTPException(400, { message: "优惠码无效" });
+      if (freshCoupon.valid_start && freshCoupon.valid_start > now) throw new HTTPException(400, { message: "优惠码尚未生效" });
+      if (freshCoupon.valid_end && freshCoupon.valid_end < now) throw new HTTPException(400, { message: "优惠码已过期" });
+      if (freshCoupon.valid_cycle && freshCoupon.valid_cycle !== freshPlan.billing_cycle) {
+        throw new HTTPException(400, { message: "优惠码不适用于该套餐周期" });
+      }
+      const [usedTotal, usedByMe] = await Promise.all([
+        tx.planOrder.count({ where: { coupon_id: couponId } }),
+        tx.planOrder.count({ where: { coupon_id: couponId, user_id: user.id } }),
+      ]);
+      if (freshCoupon.max_use !== null && usedTotal >= freshCoupon.max_use) {
+        throw new HTTPException(400, { message: "优惠码使用次数已达上限" });
+      }
+      if (freshCoupon.max_use_per_user !== null && usedByMe >= freshCoupon.max_use_per_user) {
+        throw new HTTPException(400, { message: "您已使用过该优惠码" });
+      }
+      chargedTotal =
+        freshCoupon.type === "percentage"
+          ? chargedTotal * (1 - freshCoupon.value / 100)
+          : chargedTotal - freshCoupon.value;
+      chargedTotal = Number(Math.max(0, chargedTotal).toFixed(2));
+    }
+
     // ① 扣余额（条件更新，防并发超扣）
     const debited = await tx.user.updateMany({
-      where: { id: user.id, balance: { gte: total } },
-      data: { balance: { decrement: total } },
+      where: { id: user.id, balance: { gte: chargedTotal } },
+      data: { balance: { decrement: chargedTotal } },
     });
     if (debited.count !== 1) throw new HTTPException(400, { message: "余额不足，请先充值" });
 
     const afterUser = await tx.user.findUniqueOrThrow({ where: { id: user.id }, select: { balance: true } });
 
     await tx.balanceLog.create({
-      data: { user_id: user.id, balance: afterUser.balance, amount: -total, type: "plan" },
+      data: { user_id: user.id, balance: afterUser.balance, amount: -chargedTotal, type: "plan" },
     });
 
     // ② 库存递减
-    if (plan.stock !== null) {
-      await tx.plan.update({ where: { id: plan.id }, data: { stock: { decrement: 1 } } });
+    if (freshPlan.stock !== null) {
+      const stocked = await tx.plan.updateMany({
+        where: { id: freshPlan.id, stock: { gt: 0 } },
+        data: { stock: { decrement: 1 } },
+      });
+      if (stocked.count !== 1) throw new HTTPException(400, { message: "库存不足" });
     }
 
     // ③ 订单（`workspace_id` 表达「这笔钱买给哪个租户」，R5：历史行 NULL 不猜）
@@ -180,8 +221,8 @@ plansRoutes.post("/purchase", async (c) => {
       data: {
         user_id: user.id,
         workspace_id: workspace.id,
-        plan_id: plan.id,
-        price: total,
+        plan_id: freshPlan.id,
+        price: chargedTotal,
         balance: afterUser.balance,
         coupon_id: couponId,
       },
@@ -193,18 +234,18 @@ plansRoutes.post("/purchase", async (c) => {
       workspace_id: workspace.id,
       payer_user_id: user.id,
       plan: {
-        id: plan.id,
-        name: plan.name,
-        billing_cycle: plan.billing_cycle,
-        price: plan.price,
-        policy_id: plan.policy_id,
-        traffic_bytes: planTrafficBytes(plan.traffic),
-        max_tunnels: plan.max_tunnels,
+        id: freshPlan.id,
+        name: freshPlan.name,
+        billing_cycle: freshPlan.billing_cycle,
+        price: freshPlan.price,
+        policy_id: freshPlan.policy_id,
+        traffic_bytes: planTrafficBytes(freshPlan.traffic),
+        max_tunnels: freshPlan.max_tunnels,
       },
       order_id: order.id,
     });
 
-    return { order, purchase, balance: afterUser.balance };
+    return { order, purchase, balance: afterUser.balance, price: chargedTotal, planId: freshPlan.id };
   });
 
   // 事实已提交 ⇒ 现在才失效缓存（若在事务内失效，别人可能读到尚未提交的旧发放）。
@@ -214,8 +255,8 @@ plansRoutes.post("/purchase", async (c) => {
     data: {
       ok: true,
       order_id: result.order.id,
-      plan_id: plan.id,
-      price: total,
+      plan_id: result.planId,
+      price: result.price,
       balance: result.balance,
       subscription: {
         id: result.purchase.subscription_id,

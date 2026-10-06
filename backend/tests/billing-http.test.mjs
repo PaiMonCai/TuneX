@@ -5,9 +5,6 @@ import assert from "node:assert/strict";
 process.env.DATABASE_URL = "mysql://root:test@127.0.0.1:3306/tunex_test";
 process.env.REDIS_URL = "redis://127.0.0.1:6379";
 process.env.AUTH_SECRET = "test-only-not-a-real-session-secret-32-bytes";
-process.env.LICENSE_SECRET = "test-only-not-a-real-license-secret-32-bytes";
-process.env.TUNEX_CONFIG_KEY = Buffer.alloc(32, 5).toString("base64url");
-process.env.TUNEX_LICENSE_KEY = Buffer.alloc(32, 6).toString("base64url");
 process.env.PAYMENTS_ENABLED = "false";
 
 const { app } = await import("../src/app.ts");

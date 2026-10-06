@@ -26,7 +26,6 @@
  */
 import { db } from "../db.ts";
 import {
-  SCHEDULER_ERROR_CODES,
   createRelayTunnel,
   reapplyDirectTunnel,
   reapplyRelayTunnel,
@@ -34,8 +33,12 @@ import {
   type CreateRelayTunnelResult,
 } from "./scheduler.ts";
 import type { Orchestrator } from "./orchestrator.ts";
-import { getEffectivePolicy } from "./policy-service.ts";
-import { checkTunnelCreation, type EffectivePolicy } from "./capability-policy.ts";
+import { getEffectivePolicy, withWorkspaceQuotaLock } from "./policy-service.ts";
+import {
+  checkTunnelCreation,
+  trafficWindowStart,
+  type EffectivePolicy,
+} from "./capability-policy.ts";
 import { releaseLease } from "./portPool.ts";
 import { checkForwardRuntimeUse, type RuntimeUseDenied, type RuntimeUseResource } from "./forward-capability.ts";
 import { normalizeForwardProtocol } from "./forward-contract.ts";
@@ -191,13 +194,13 @@ export interface TunnelApiDb {
     update(args: unknown): Promise<unknown>;
     delete(args: unknown): Promise<unknown>;
   };
+  tunnelTraffic: {
+    aggregate(args: unknown): Promise<unknown>;
+  };
   node: {
     findUnique(args: unknown): Promise<unknown>;
   };
   tunnelChain?: {
-    deleteMany(args: unknown): Promise<unknown>;
-  };
-  tunnelTraffic?: {
     deleteMany(args: unknown): Promise<unknown>;
   };
   nodeGroup: {
@@ -239,8 +242,18 @@ export interface TunnelApiDeps {
   orchestrator?: Orchestrator | null;
   /** 策略读取（默认 {@link getEffectivePolicy}，noCache）。 */
   loadPolicy?: (workspaceId: number) => Promise<EffectivePolicy>;
+  /**
+   * Creation quota critical section. Production locks the workspace row and
+   * re-reads policy in the same transaction; tests inject an in-memory adapter.
+   */
+  quotaLock?: <T>(
+    workspaceId: number,
+    fn: (tx: TunnelApiDb, policy: EffectivePolicy) => Promise<T>,
+  ) => Promise<T>;
   /** Existing runtime use, not new-resource quota. Tests may inject this gate. */
   runtimeUse?: (workspaceId: number, resource: RuntimeUseResource) => Promise<RuntimeUseDenied | null>;
+  /** Release every active NodePortLease only after runtime teardown is confirmed. */
+  releasePortLeases?: (tunnelId: number) => Promise<boolean>;
   /** 覆盖「现在」（测试注入固定时间）。 */
   now?: () => Date;
 }
@@ -252,12 +265,22 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
   applyReapply: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<CreateRelayTunnelResult>;
   applyDirect: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<ApplyDirectResult>;
   runtimeUse: NonNullable<TunnelApiDeps["runtimeUse"]>;
+  quotaLock: NonNullable<TunnelApiDeps["quotaLock"]>;
+  releasePortLeases: NonNullable<TunnelApiDeps["releasePortLeases"]>;
   now: () => Date;
 } {
   return {
     db: over?.db ?? (db as unknown as TunnelApiDb),
     loadPolicy: over?.loadPolicy ?? ((workspaceId: number) => getEffectivePolicy(workspaceId, { noCache: true })),
     runtimeUse: over?.runtimeUse ?? ((workspaceId, resource) => checkForwardRuntimeUse(workspaceId, resource)),
+    releasePortLeases:
+      over?.releasePortLeases ?? ((tunnelId) => releaseLease({ tunnelId })),
+    quotaLock:
+      over?.quotaLock ??
+      ((workspaceId, fn) =>
+        withWorkspaceQuotaLock(workspaceId, (tx, policy) =>
+          fn(tx as unknown as TunnelApiDb, policy),
+        )),
     applyCreate:
       over?.applyCreate ?? (createRelayTunnel as unknown as (i: unknown, o: Orchestrator) => Promise<CreateRelayTunnelResult>),
     applyReapply:
@@ -266,6 +289,25 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
       over?.applyDirect ?? (reapplyDirectTunnel as unknown as (t: number, o: Orchestrator, d?: unknown) => Promise<ApplyDirectResult>),
     now: over?.now ?? (() => new Date()),
   };
+}
+
+async function creationUsage(
+  tx: TunnelApiDb,
+  workspaceId: number,
+  policy: EffectivePolicy,
+  now: Date,
+): Promise<{ tunnelCount: number; trafficUsed: number }> {
+  const since = trafficWindowStart(policy.limits.traffic_period, now);
+  const where: Record<string, unknown> = { workspace_id: workspaceId };
+  if (since) where.date = { gte: since };
+  const [tunnelCount, traffic] = await Promise.all([
+    tx.tunnel.count({ where: { workspace_id: workspaceId } }),
+    tx.tunnelTraffic.aggregate({ where, _sum: { traffic: true } }),
+  ]);
+  const trafficUsed = Number(
+    (traffic as { _sum?: { traffic?: number | null } } | null)?._sum?.traffic ?? 0,
+  );
+  return { tunnelCount: Number(tunnelCount), trafficUsed };
 }
 
 /** 把一行 unknown 收窄成行类型。 */
@@ -399,7 +441,7 @@ export function desiredAfterAction(action: TunnelAction): {
     case "resume":
       return { desired_status: "active", apply_status: "pending", clear_error: true };
     case "suspend":
-      return { desired_status: "inactive", apply_status: "suspended", clear_error: false };
+      return { desired_status: "inactive", apply_status: "applying", clear_error: false };
     case "delete":
       return { desired_status: "inactive", clear_error: false };
   }
@@ -554,57 +596,52 @@ export async function createTunnel(
     const inGroup = asRow<NodeGroupRow>(await pdb.nodeGroup.findUnique({ where: { id: input.inNodeGroupId } }));
     if (!inGroup) return err("not_found", "入口节点组不存在");
 
-    const pending = asRow<TunnelRow>(
-      await pdb.tunnel.create({
-        data: {
-          name,
-          tunnel_type: protocol,
-          forward_protocol: protocol,
-          listen_ip: "0.0.0.0",
-          listen_port: input.listenPort ?? null,
-          listen_protocol: [protocol],
-          status: "active",
-          forward_addresses: forward,
-          load_balance_type: "round",
-          ip_type: "ipv4",
-          in_node_group_id: input.inNodeGroupId,
-          out_node_group_id: null,
-          user_id: input.userId,
-          workspace_id: input.workspaceId,
-          tunnel_mode: "direct",
-          desired_status: "inactive",
-          apply_status: "pending",
-          config_revision: 0,
-          applied_revision: null,
-          remote_host: remoteHost,
-          remote_port: remotePort,
-        },
-      }),
-    );
-    if (!pending) return err("db_unavailable", "创建失败");
+    const reserved = await deps.quotaLock(input.workspaceId, async (tx, policy) => {
+      const usage = await creationUsage(tx, input.workspaceId, policy, deps.now());
+      const decision = checkTunnelCreation(policy, {
+        ...usage,
+        protocol,
+        inGroupOwned: inGroup.workspace_id === input.workspaceId,
+        inGroupId: inGroup.id,
+        outGroupId: null,
+        outGroupOwned: true,
+      });
+      if (!decision.allowed) return { kind: "denied", decision } as const;
 
-    const policy = await deps.loadPolicy(input.workspaceId);
-    const decision = checkTunnelCreation(policy, {
-      tunnelCount: 0,
-      trafficUsed: 0,
-      protocol: protocol,
-      inGroupOwned: inGroup.workspace_id === input.workspaceId,
-      inGroupId: inGroup.id,
-      outGroupId: null,
-      outGroupOwned: true,
+      const pending = asRow<TunnelRow>(
+        await tx.tunnel.create({
+          data: {
+            name,
+            tunnel_type: protocol,
+            forward_protocol: protocol,
+            listen_ip: "0.0.0.0",
+            listen_port: input.listenPort ?? null,
+            listen_protocol: [protocol],
+            status: "active",
+            forward_addresses: forward,
+            load_balance_type: "round",
+            ip_type: "ipv4",
+            in_node_group_id: input.inNodeGroupId,
+            out_node_group_id: null,
+            user_id: input.userId,
+            workspace_id: input.workspaceId,
+            tunnel_mode: "direct",
+            desired_status: "inactive",
+            apply_status: "pending",
+            config_revision: 0,
+            applied_revision: null,
+            remote_host: remoteHost,
+            remote_port: remotePort,
+          },
+        }),
+      );
+      return { kind: "pending", pending } as const;
     });
-    if (!decision.allowed) {
-      await pdb.tunnel.update({
-        where: { id: pending.id },
-        data: {
-          apply_status: "error",
-          desired_status: "inactive",
-          apply_error_code: SCHEDULER_ERROR_CODES.policy_denied,
-          apply_error: `[${SCHEDULER_ERROR_CODES.policy_denied}] ${decision.message ?? "策略拒绝"}`,
-        },
-      }).catch(() => {});
-      return err("policy_denied", decision.message ?? "策略拒绝");
+    if (reserved.kind === "denied") {
+      return err("policy_denied", reserved.decision.message ?? "策略拒绝");
     }
+    const pending = reserved.pending;
+    if (!pending) return err("db_unavailable", "创建失败");
 
     const orchestrator = over?.orchestrator ?? null;
     if (!orchestrator) return { ok: true, tunnelId: pending.id, mode: "direct", revision: 0 };
@@ -636,32 +673,50 @@ export async function createTunnel(
   );
   if (!outGroup) return err("not_found", "出口节点组不存在");
 
-  const pending = asRow<TunnelRow>(
-    await pdb.tunnel.create({
-      data: {
-        name,
-        tunnel_type: protocol,
-        forward_protocol: protocol,
-        listen_ip: "0.0.0.0",
-        listen_port: input.listenPort ?? null,
-        listen_protocol: [protocol],
-        status: "active",
-        forward_addresses: [],
-        load_balance_type: "round",
-        ip_type: "ipv4",
-        in_node_group_id: input.inNodeGroupId,
-        out_node_group_id: input.outNodeGroupId,
-        user_id: input.userId,
-        workspace_id: input.workspaceId,
-        tunnel_mode: "relay",
-        desired_status: "inactive",
-        apply_status: "pending",
-        config_revision: 0,
-        applied_revision: null,
-        egress_pool_id: input.egressPoolId ?? null,
-      },
-    }),
-  );
+  const reserved = await deps.quotaLock(input.workspaceId, async (tx, policy) => {
+    const usage = await creationUsage(tx, input.workspaceId, policy, deps.now());
+    const decision = checkTunnelCreation(policy, {
+      ...usage,
+      protocol,
+      inGroupOwned: inGroup.workspace_id === input.workspaceId,
+      inGroupId: inGroup.id,
+      outGroupId: outGroup.id,
+      outGroupOwned: outGroup.workspace_id === input.workspaceId,
+    });
+    if (!decision.allowed) return { kind: "denied", decision } as const;
+
+    const pending = asRow<TunnelRow>(
+      await tx.tunnel.create({
+        data: {
+          name,
+          tunnel_type: protocol,
+          forward_protocol: protocol,
+          listen_ip: "0.0.0.0",
+          listen_port: input.listenPort ?? null,
+          listen_protocol: [protocol],
+          status: "active",
+          forward_addresses: [],
+          load_balance_type: "round",
+          ip_type: "ipv4",
+          in_node_group_id: input.inNodeGroupId,
+          out_node_group_id: input.outNodeGroupId,
+          user_id: input.userId,
+          workspace_id: input.workspaceId,
+          tunnel_mode: "relay",
+          desired_status: "inactive",
+          apply_status: "pending",
+          config_revision: 0,
+          applied_revision: null,
+          egress_pool_id: input.egressPoolId ?? null,
+        },
+      }),
+    );
+    return { kind: "pending", pending } as const;
+  });
+  if (reserved.kind === "denied") {
+    return err("policy_denied", reserved.decision.message ?? "策略拒绝");
+  }
+  const pending = reserved.pending;
   if (!pending) return err("db_unavailable", "创建失败");
 
   const orchestrator = over?.orchestrator ?? null;
@@ -670,31 +725,6 @@ export async function createTunnel(
     // 调用方拿到的是「未下发」而不是「已 active」。reconciler 有 sink
     // 之后会按同 revision 补发（§7.12 fill_missing_runtime）。
     return { ok: true, tunnelId: pending.id, mode: "relay", revision: 0 };
-  }
-
-  const policy = await deps.loadPolicy(input.workspaceId);
-  const decision = checkTunnelCreation(policy, {
-    tunnelCount: 0,
-    trafficUsed: 0,
-    protocol: protocol,
-    inGroupOwned: inGroup.workspace_id === input.workspaceId,
-    inGroupId: inGroup.id,
-    outGroupId: outGroup.id,
-    outGroupOwned: outGroup.workspace_id === input.workspaceId,
-  });
-  if (!decision.allowed) {
-    await pdb.tunnel
-      .update({
-        where: { id: pending.id },
-        data: {
-          apply_status: "error",
-          desired_status: "inactive",
-          apply_error_code: SCHEDULER_ERROR_CODES.policy_denied,
-          apply_error: `[${SCHEDULER_ERROR_CODES.policy_denied}] ${decision.message ?? "策略拒绝"}`,
-        },
-      })
-      .catch(() => {});
-    return err("policy_denied", decision.message ?? "策略拒绝");
   }
 
   const result = over?.applyCreate
@@ -805,45 +835,119 @@ export async function runTunnelAction(
         }))
       : null;
 
+    // Delete is irreversible at the control-plane layer. Never delete the row
+    // (or release its ports) while a runtime may still be listening: that would
+    // turn an Agent teardown failure into an orphan runtime + reusable port.
+    const expectedRuntimeNodes =
+      tunnel.ingress_node_id != null ||
+      (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null) ||
+      tunnel.middle_node_id != null;
+    if (!orchestrator && expectedRuntimeNodes) {
+      return err(
+        "apply_failed",
+        "运行时撤除通道不可用，拒绝删除以避免遗留孤儿 runtime",
+        { apply_error_code: "runtime_teardown_unavailable" },
+      );
+    }
+    if (tunnel.ingress_node_id != null && !ingressNode) {
+      return err("apply_failed", "入口节点记录缺失，无法确认 runtime 已撤除", {
+        apply_error_code: "runtime_teardown_unconfirmed",
+      });
+    }
+    if (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null && !egressNode) {
+      return err("apply_failed", "出口节点记录缺失，无法确认 runtime 已撤除", {
+        apply_error_code: "runtime_teardown_unconfirmed",
+      });
+    }
+    if (tunnel.middle_node_id != null && !middleNode) {
+      return err("apply_failed", "中间跳节点记录缺失，无法确认 runtime 已撤除", {
+        apply_error_code: "runtime_teardown_unconfirmed",
+      });
+    }
+
     if (orchestrator) {
-      // 逆序拆除（先近后远）：中间跳 → 出口 → 入口。
-      if (tunnel.tunnel_mode === "relay" && middleNode) {
-        await orchestrator.removeTunnel({
-          tunnelId,
-          node: middleNode as never,
-          direction: "egress",
-          revision,
-          reason: "tunnel deleted (transit)",
-        }).catch(() => {});
-      }
-      if (tunnel.tunnel_mode === "relay" && egressNode) {
-        await orchestrator.removeTunnel({
-          tunnelId,
-          node: egressNode as never,
-          direction: "egress",
-          revision,
-          reason: "tunnel deleted",
-        }).catch(() => {});
-      }
+      // Stop accepting new traffic first, then dismantle downstream legs:
+      // ingress → transit → egress. Even if one leg fails, continue attempting
+      // the rest to minimize residual runtime surface; any uncertainty keeps the
+      // durable Tunnel + lease for retry/reconcile.
+      const teardownErrors: string[] = [];
+      const remove = async (
+        label: string,
+        input: Parameters<NonNullable<TunnelApiDeps["orchestrator"]>["removeTunnel"]>[0],
+      ) => {
+        try {
+          const result = await orchestrator.removeTunnel(input);
+          if (!result.ok) teardownErrors.push(`${label}: ${result.error}`);
+        } catch (error) {
+          teardownErrors.push(
+            `${label}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      };
+
       if (ingressNode) {
-        await orchestrator.removeTunnel({
+        await remove("ingress", {
           tunnelId,
           node: ingressNode as never,
           direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
           revision,
           reason: "tunnel deleted",
-        }).catch(() => {});
+        });
+      }
+      if (tunnel.tunnel_mode === "relay" && middleNode) {
+        await remove("transit", {
+          tunnelId,
+          node: middleNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel deleted (transit)",
+        });
+      }
+      if (tunnel.tunnel_mode === "relay" && egressNode) {
+        await remove("egress", {
+          tunnelId,
+          node: egressNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel deleted",
+        });
+      }
+
+      if (teardownErrors.length > 0) {
+        return err(
+          "apply_failed",
+          `runtime 撤除未确认完成，Tunnel 与端口租约已保留：${teardownErrors.join("; ")}`,
+          { apply_error_code: "runtime_teardown_failed" },
+        );
       }
     }
 
-    await releaseLease({ tunnelId }).catch(() => {});
-    // Child rows are legacy relational data with restrictive FKs. Runtime must
-    // be withdrawn first, then children can be removed before the Tunnel row.
-    await pdb.tunnelChain?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
-    await pdb.tunnelTraffic?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
-    await pdb.tunnel.delete({ where: { id: tunnel.id } }).catch((e: unknown) => {
-      throw toTunnelApiError(e, "删除失败");
-    });
+    // Runtime is confirmed down, but keep the durable Tunnel until port
+    // ownership is also durably released. NodePortLease uses ON DELETE SET NULL:
+    // deleting first would turn a failed release into an orphan active lease.
+    try {
+      await deps.releasePortLeases(tunnelId);
+    } catch (error) {
+      return err(
+        "db_unavailable",
+        "runtime 已撤除，但端口租约释放失败；Tunnel 已保留以便重试：" +
+          (error instanceof Error ? error.message : String(error)),
+      );
+    }
+
+    // Runtime-owned relational rows may be removed, but traffic is an immutable
+    // accounting ledger and deliberately survives this delete.
+    try {
+      if (pdb.tunnelChain) {
+        await pdb.tunnelChain.deleteMany({ where: { tunnel_id: tunnel.id } });
+      }
+      await pdb.tunnel.delete({ where: { id: tunnel.id } });
+    } catch (error) {
+      return toTunnelApiError(
+        error,
+        "runtime 已撤除，但删除 Tunnel 账本失败；请重试",
+      );
+    }
     return { ok: true, tunnelId: tunnel.id, action, revision: 0 };
   }
 
@@ -866,65 +970,120 @@ export async function runTunnelAction(
     const revision = (tunnel.config_revision ?? 0) + 1;
     await pdb.tunnel.update({
       where: { id: tunnel.id },
-      data: { config_revision: revision, desired_status: "inactive", apply_status: "suspended" },
+      data: {
+        config_revision: revision,
+        desired_status: "inactive",
+        apply_status: "applying",
+        apply_error_code: null,
+        apply_error: null,
+      },
     });
 
-    if (orchestrator) {
-      const ingressNode = tunnel.ingress_node_id
-        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
-            where: { id: tunnel.ingress_node_id },
-            select: { id: true, node_id: true, connect_ip: true, role: true },
-          }))
-        : null;
-      const egressNode = tunnel.egress_node_id
-        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
-            where: { id: tunnel.egress_node_id },
-            select: { id: true, node_id: true, connect_ip: true, role: true },
-          }))
-        : null;
-      // V5.4：挂起同样要撤中间跳 —— 与删除同理，漏掉就是一条永久占端口的孤儿 runtime。
-      // "撤掉一条腿"的每条路径都必须同时知道所有腿：删除 ↔ 创建、挂起 ↔ 恢复、
-      // rollout 补偿 ↔ rollout 下发。
-      const middleNode = tunnel.middle_node_id
-        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
-            where: { id: tunnel.middle_node_id },
-            select: { id: true, node_id: true, connect_ip: true, role: true },
-          }))
-        : null;
+    const ingressNode = tunnel.ingress_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.ingress_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
+    const egressNode = tunnel.egress_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.egress_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
+    const middleNode = tunnel.middle_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.middle_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
 
-      if (tunnel.tunnel_mode === "relay" && middleNode) {
-        const stoppedTransit = await orchestrator.removeTunnel({
-          tunnelId,
-          node: middleNode as never,
-          direction: "egress",
-          revision,
-          reason: "tunnel suspended (transit)",
-        });
-        if (!stoppedTransit.ok) {
-          return err("apply_failed", stoppedTransit.error, { apply_error_code: stoppedTransit.error_code });
+    const expectedRuntime =
+      tunnel.ingress_node_id != null ||
+      (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null) ||
+      tunnel.middle_node_id != null;
+    const teardownErrors: string[] = [];
+
+    if (!orchestrator && expectedRuntime) {
+      teardownErrors.push("运行时撤除通道不可用");
+    } else if (orchestrator) {
+      // Stop accepting new traffic first, then dismantle downstream legs.
+      // Creation is far→near; suspension is the reverse near→far.
+      const remove = async (
+        label: string,
+        input: Parameters<NonNullable<TunnelApiDeps["orchestrator"]>["removeTunnel"]>[0],
+      ) => {
+        try {
+          const result = await orchestrator.removeTunnel(input);
+          if (!result.ok) teardownErrors.push(`${label}: ${result.error}`);
+        } catch (error) {
+          teardownErrors.push(
+            `${label}: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
-      }
-      if (tunnel.tunnel_mode === "relay" && egressNode) {
-        const stopped = await orchestrator.removeTunnel({
-          tunnelId,
-          node: egressNode as never,
-          direction: "egress",
-          revision,
-          reason: "tunnel suspended",
-        });
-        if (!stopped.ok) return err("apply_failed", stopped.error, { apply_error_code: stopped.error_code });
-      }
-      if (ingressNode) {
-        const stopped = await orchestrator.removeTunnel({
+      };
+
+      if (tunnel.ingress_node_id != null && !ingressNode) {
+        teardownErrors.push("入口节点记录缺失");
+      } else if (ingressNode) {
+        await remove("ingress", {
           tunnelId,
           node: ingressNode as never,
           direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
           revision,
           reason: "tunnel suspended",
         });
-        if (!stopped.ok) return err("apply_failed", stopped.error, { apply_error_code: stopped.error_code });
+      }
+
+      if (tunnel.middle_node_id != null && !middleNode) {
+        teardownErrors.push("中间跳节点记录缺失");
+      } else if (tunnel.tunnel_mode === "relay" && middleNode) {
+        await remove("transit", {
+          tunnelId,
+          node: middleNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel suspended (transit)",
+        });
+      }
+
+      if (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null && !egressNode) {
+        teardownErrors.push("出口节点记录缺失");
+      } else if (tunnel.tunnel_mode === "relay" && egressNode) {
+        await remove("egress", {
+          tunnelId,
+          node: egressNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel suspended",
+        });
       }
     }
+
+    if (teardownErrors.length > 0) {
+      const message = `runtime 撤除未确认完成：${teardownErrors.join("; ")}`;
+      await pdb.tunnel.update({
+        where: { id: tunnel.id },
+        data: {
+          desired_status: "inactive",
+          apply_status: "error",
+          apply_error_code: "runtime_teardown_failed",
+          apply_error: message.slice(0, 500),
+        },
+      });
+      return err("apply_failed", message, { apply_error_code: "runtime_teardown_failed" });
+    }
+
+    await pdb.tunnel.update({
+      where: { id: tunnel.id },
+      data: {
+        desired_status: "inactive",
+        apply_status: "suspended",
+        status: "inactive",
+        apply_error_code: null,
+        apply_error: null,
+      },
+    });
 
     const afterSuspend = asRow<TunnelRow>(
       await pdb.tunnel.findFirst({ where: { id: tunnel.id, workspace_id: workspaceId } }),
@@ -958,6 +1117,10 @@ export async function runTunnelAction(
   if (!result.ok) {
     return err("apply_failed", result.error, { apply_error_code: result.error_code });
   }
+  await pdb.tunnel.update({
+    where: { id: tunnel.id },
+    data: { status: "active" },
+  });
   const after = asRow<TunnelRow>(
     await pdb.tunnel.findFirst({ where: { id: tunnel.id, workspace_id: workspaceId } }),
   );

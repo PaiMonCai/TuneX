@@ -46,6 +46,7 @@ import {
   validateRelayTopology,
   type EgressPoolRow,
   type NodeGroupRow,
+  type TunnelApiDb,
   type TunnelApiDeps,
   type TunnelApiNodeRow,
   type TunnelRow,
@@ -75,6 +76,7 @@ const orchestratorCalls: {
 }[] = [];
 /** 假 Agent 是否接受下一次下发。 */
 let agentHealthy = true;
+let archivedTraffic = 0;
 
 let nextTunnelId = 100;
 
@@ -85,6 +87,7 @@ function resetState(): void {
   pools.length = 0;
   orchestratorCalls.length = 0;
   agentHealthy = true;
+  archivedTraffic = 0;
   nextTunnelId = 100;
 }
 
@@ -148,7 +151,7 @@ function seedTunnel(over: Partial<TunnelRow> = {}): TunnelRow {
 /* 内存 DB 替身                                                         */
 /* ------------------------------------------------------------------ */
 
-function makeDb(): TunnelApiDeps["db"] {
+function makeDb(): TunnelApiDb {
   return {
     tunnel: {
       async findUnique({ where }: { where: Record<string, unknown> }) {
@@ -260,6 +263,16 @@ function makeDb(): TunnelApiDeps["db"] {
         return {};
       },
     },
+    tunnelTraffic: {
+      async aggregate() {
+        return { _sum: { traffic: archivedTraffic } };
+      },
+    },
+    tunnelChain: {
+      async deleteMany() {
+        return { count: 0 };
+      },
+    },
     node: {
       async findUnique({ where }: { where: Record<string, unknown> }) {
         if (where.id !== undefined) return nodes.find((n) => n.id === where.id) ?? null;
@@ -356,10 +369,16 @@ const fakeOrchestrator = {
 };
 
 function deps(over: TunnelApiDeps = {}): TunnelApiDeps {
+  const fakeDb = over.db ?? makeDb();
+  const loadPolicy = over.loadPolicy ?? (async () => allowAllPolicy());
+  const quotaLock: NonNullable<TunnelApiDeps["quotaLock"]> = async (workspaceId, fn) =>
+    fn(fakeDb, await loadPolicy(workspaceId));
   return {
-    db: makeDb(),
-    loadPolicy: async () => allowAllPolicy(),
+    db: fakeDb,
+    loadPolicy,
+    quotaLock,
     runtimeUse: async () => null,
+    releasePortLeases: async () => true,
     orchestrator: fakeOrchestrator as never,
     applyDirect: successDirect(),
     now: () => new Date("2026-09-25T12:00:00.000Z"),
@@ -542,7 +561,7 @@ describe("A. 纯校验", () => {
   test("A5. 动作 → desired 映射：retry/resume 推回 active 并清错误", () => {
     expect(desiredAfterAction("retry")).toEqual({ desired_status: "active", apply_status: "pending", clear_error: true });
     expect(desiredAfterAction("resume")).toEqual({ desired_status: "active", apply_status: "pending", clear_error: true });
-    expect(desiredAfterAction("suspend")).toEqual({ desired_status: "inactive", apply_status: "suspended", clear_error: false });
+    expect(desiredAfterAction("suspend")).toEqual({ desired_status: "inactive", apply_status: "applying", clear_error: false });
     expect(desiredAfterAction("delete")).toEqual({ desired_status: "inactive", clear_error: false });
   });
 
@@ -688,6 +707,60 @@ describe("B. CRUD", () => {
     };
     expect((await createTunnel({ ...base, name: "" }, deps())).ok).toBe(false);
     expect((await createTunnel({ ...base, name: "x".repeat(61) }, deps())).ok).toBe(false);
+  });
+
+  test("B5b. max_tunnels 已满 ⇒ 准入在 create 前拒绝，不留下 error Tunnel", async () => {
+    seedTunnel({ id: 50, workspace_id: 7 });
+    const before = tunnels.size;
+    const limited = allowAllPolicy();
+    limited.limits.max_tunnels = 1;
+
+    const result = await createTunnel(
+      {
+        name: "over-limit",
+        mode: "direct",
+        userId: 1,
+        workspaceId: 7,
+        personalWorkspaceId: 7,
+        inNodeGroupId: 10,
+        outNodeGroupId: null,
+        forwardAddresses: ["192.168.1.10:5000"],
+        tunnelType: "tcp",
+      },
+      deps({ loadPolicy: async () => limited }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("policy_denied");
+    expect(tunnels.size).toBe(before);
+    expect([...tunnels.values()].some((t) => t.name === "over-limit")).toBe(false);
+  });
+
+  test("B5c. 当前计量周期流量已耗尽 ⇒ create 前拒绝，历史用量不能被忽略为 0", async () => {
+    archivedTraffic = 100;
+    const before = tunnels.size;
+    const limited = allowAllPolicy();
+    limited.limits.traffic_limit = 100;
+    limited.limits.traffic_period = "total";
+
+    const result = await createTunnel(
+      {
+        name: "traffic-exhausted",
+        mode: "relay",
+        userId: 1,
+        workspaceId: 7,
+        personalWorkspaceId: 7,
+        inNodeGroupId: 10,
+        outNodeGroupId: 20,
+        tunnelType: "tcp",
+      },
+      deps({ loadPolicy: async () => limited, applyCreate: successCreate() }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("policy_denied");
+    expect(tunnels.size).toBe(before);
+    expect(orchestratorCalls).toHaveLength(0);
   });
 
   test("B6. 读：列表按 workspace 隔离 + 状态/模式过滤", async () => {
@@ -863,6 +936,58 @@ describe("C. 运行操作统一走 orchestrator", () => {
     expect(removes.map((c) => c.direction).sort()).toEqual(["egress", "ingress"]);
   });
 
+  test("C4b. suspend：撤除任一腿失败时不得声称 suspended，且继续尝试其它腿", async () => {
+    const t = seedTunnel({ id: 2031, apply_status: "active", desired_status: "active" });
+    const failingOrchestrator = {
+      removeTunnel: async (input: {
+        tunnelId: number;
+        revision: number;
+        direction?: "direct" | "ingress" | "egress";
+        node?: { id?: number };
+      }) => {
+        orchestratorCalls.push({
+          kind: "remove",
+          tunnelId: input.tunnelId,
+          revision: input.revision,
+          direction: input.direction,
+          nodeId: input.node?.id,
+        });
+        if (input.direction === "ingress") {
+          return { ok: false as const, error_code: "agent_unreachable", error: "ingress offline" };
+        }
+        return { ok: true as const, result: { commandId: "cmd-rm", revision: input.revision, ack: {} } };
+      },
+    };
+
+    const r = await runTunnelAction(
+      t.id,
+      "suspend",
+      7,
+      deps({ orchestrator: failingOrchestrator as never }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.apply_error_code).toBe("runtime_teardown_failed");
+    expect(t.desired_status).toBe("inactive");
+    expect(t.apply_status).toBe("error");
+    expect(t.apply_error).toContain("ingress offline");
+    // ingress fails first, but egress is still attempted so the residual surface is minimized.
+    expect(orchestratorCalls.filter((c) => c.kind === "remove").map((c) => c.direction))
+      .toEqual(["ingress", "egress"]);
+  });
+
+  test("C4c. suspend：没有 orchestrator 时 fail-closed，不把 desired-only 写入伪装成已挂起", async () => {
+    const t = seedTunnel({ id: 2032, apply_status: "active", desired_status: "active" });
+    const r = await runTunnelAction(t.id, "suspend", 7, deps({ orchestrator: null }));
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.apply_error_code).toBe("runtime_teardown_failed");
+    expect(t.desired_status).toBe("inactive");
+    expect(t.apply_status).toBe("error");
+  });
+
   test("C5. suspend 幂等：已 suspended → 409", async () => {
     seedTunnel({ id: 204, apply_status: "suspended" });
     const r = await runTunnelAction(204, "suspend", 7, deps());
@@ -878,17 +1003,115 @@ describe("C. 运行操作统一走 orchestrator", () => {
     expect(r.ok).toBe(true);
     expect(tunnels.has(205)).toBe(false);
     const removes = orchestratorCalls.filter((c) => c.kind === "remove");
-    // 入口 + 出口两端都要撤（单撤一端会留下一个继续收流量的 listener）。
+    // 入口 + 出口两端都要撤；同时必须先停入口接新流量，再拆下游。
     expect(removes).toHaveLength(2);
+    expect(removes.map((c) => c.direction)).toEqual(["ingress", "egress"]);
     // 补偿 revision = config_revision + 1（同值会被 Agent 判 stale 撤不掉）。
     for (const rm of removes) expect(rm.revision).toBe(8);
   });
 
-  test("C7. delete：编排器不可用也允许删（补偿失败不阻断显式用户动作）", async () => {
+  test("C6b. delete：任一 runtime 撤除失败时继续尝试其它腿，但不删行", async () => {
+    seedTunnel({ id: 2051, config_revision: 7, egress_node_id: 2, in_node_group_id: 10 });
+    const failingOrchestrator = {
+      removeTunnel: async (input: {
+        tunnelId: number;
+        revision: number;
+        direction?: "direct" | "ingress" | "egress";
+        node?: { id?: number };
+      }) => {
+        orchestratorCalls.push({
+          kind: "remove",
+          tunnelId: input.tunnelId,
+          revision: input.revision,
+          direction: input.direction,
+          nodeId: input.node?.id,
+        });
+        if (input.direction === "egress") {
+          return { ok: false as const, error_code: "agent_unreachable", error: "egress offline" };
+        }
+        return { ok: true as const, result: { commandId: "cmd-rm", revision: input.revision, ack: {} } };
+      },
+    };
+
+    const r = await runTunnelAction(
+      2051,
+      "delete",
+      7,
+      deps({ orchestrator: failingOrchestrator as never }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("apply_failed");
+    expect(r.apply_error_code).toBe("runtime_teardown_failed");
+    expect(tunnels.has(2051)).toBe(true);
+    // Egress failed, but ingress teardown was still attempted to reduce orphaned runtime surface.
+    expect(orchestratorCalls.filter((c) => c.kind === "remove")).toHaveLength(2);
+  });
+
+  test("C6c. delete：runtime 已撤但端口 lease 释放写库失败 ⇒ 保留 Tunnel，不能制造 active 孤儿 lease", async () => {
+    seedTunnel({ id: 2052, config_revision: 7, egress_node_id: 2, in_node_group_id: 10 });
+
+    const r = await runTunnelAction(
+      2052,
+      "delete",
+      7,
+      deps({
+        releasePortLeases: async () => {
+          throw new Error("lease db unavailable");
+        },
+      }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("db_unavailable");
+    expect(r.message).toContain("端口租约释放失败");
+    expect(r.message).toContain("lease db unavailable");
+    expect(tunnels.has(2052)).toBe(true);
+    expect(orchestratorCalls.filter((c) => c.kind === "remove").map((c) => c.direction))
+      .toEqual(["ingress", "egress"]);
+  });
+
+  test("C6d. delete：runtime/lease 都收口后，子表清理 DB 失败也不得回成功或删 Tunnel", async () => {
+    const t = seedTunnel({ id: 2053, config_revision: 7, egress_node_id: 2, in_node_group_id: 10 });
+    const fakeDb = makeDb();
+    fakeDb.tunnelChain = {
+      async deleteMany() {
+        throw new Error("chain db unavailable");
+      },
+    };
+    let releases = 0;
+
+    const r = await runTunnelAction(
+      t.id,
+      "delete",
+      7,
+      deps({
+        db: fakeDb,
+        releasePortLeases: async () => {
+          releases++;
+          return true;
+        },
+      }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("db_unavailable");
+    expect(r.message).toContain("删除 Tunnel 账本失败");
+    expect(releases).toBe(1);
+    expect(tunnels.has(t.id)).toBe(true);
+  });
+
+  test("C7. delete：编排器不可用时 fail-closed，保留行避免孤儿 runtime", async () => {
     seedTunnel({ id: 206 });
     const r = await runTunnelAction(206, "delete", 7, deps({ orchestrator: null }));
-    expect(r.ok).toBe(true);
-    expect(tunnels.has(206)).toBe(false);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("apply_failed");
+    expect(r.apply_error_code).toBe("runtime_teardown_unavailable");
+    expect(tunnels.has(206)).toBe(true);
   });
 
   test("C8. delete：越权 workspace → 404，行还在", async () => {
@@ -1008,6 +1231,17 @@ describe("E. 结构约束", () => {
     // 也不得 import socket 侧（legacy config-pusher 的领地）
     expect(src.includes("config-pusher")).toBe(false);
     expect(src.includes("pushNodeConfig")).toBe(false);
+    // 历史流量是计费账本，不属于 Tunnel 的生命周期子表。
+    expect(src).not.toMatch(/tunnelTraffic[^\n]*deleteMany/);
+  });
+
+  test("E1b. 创建额度不得使用硬编码 0，且必须经过 workspace quota critical section", async () => {
+    const code = await Bun.file(new URL("../tunnel-api.ts", import.meta.url).pathname).text();
+    expect(code).toContain("deps.quotaLock(input.workspaceId");
+    expect(code).toContain("tx.tunnel.count");
+    expect(code).toContain("tx.tunnelTraffic.aggregate");
+    expect(code).not.toContain("tunnelCount: 0");
+    expect(code).not.toContain("trafficUsed: 0");
   });
 
   test("E2. 服务层唯一的下发出口是 scheduler 的两个编排入口", async () => {

@@ -150,7 +150,28 @@ const worker = new Worker(
           }
           return { evaluated: r.evaluated, moved: r.moved, held: r.held, dns_gated: r.dns_gated.length };
         };
-        // Federation closure runs after local reconciliation so local repair is attempted first.
+        const r = await executeReconcile(deps);
+        const summary = {
+          scanned: r.scanned,
+          findings: r.findings.length,
+          resent: r.resent,
+          failed: r.failed,
+          no_transport: r.noTransport,
+          leases: r.leases,
+        };
+        if (r.findings.length > 0 || r.failed > 0) {
+          console.log("[worker] cron_reconcile_v3:", JSON.stringify(summary));
+          // Print actionable finding details, not only aggregate counts.
+          for (const f of r.findings) {
+            if (f.severity === "error" || f.code === "resend_skipped") {
+              console.log(
+                "[worker] reconcile finding:",
+                JSON.stringify({ code: f.code, tunnel_id: f.tunnel_id, node_id: f.node_id, detail: f.detail }),
+              );
+            }
+          }
+        }
+        // Federation closure runs only after local reconciliation so local repair gets first chance.
         let federationSummary: Record<string, number> | null = null;
         try {
           const { runFederationReconcile } = await import("./services/federation/lease.ts");
@@ -175,27 +196,7 @@ const worker = new Worker(
           console.error("[worker] federation reconcile failed:", e instanceof Error ? e.message : e);
         }
 
-        const r = await executeReconcile(deps);
-        const summary = {
-          scanned: r.scanned,
-          findings: r.findings.length,
-          resent: r.resent,
-          failed: r.failed,
-          no_transport: r.noTransport,
-          leases: r.leases,
-        };
-        if (r.findings.length > 0 || r.failed > 0) {
-          console.log("[worker] cron_reconcile_v3:", JSON.stringify(summary));
-          // Print actionable finding details, not only aggregate counts.
-          for (const f of r.findings) {
-            if (f.severity === "error" || f.code === "resend_skipped") {
-              console.log(
-                "[worker] reconcile finding:",
-                JSON.stringify({ code: f.code, tunnel_id: f.tunnel_id, node_id: f.node_id, detail: f.detail }),
-              );
-            }
-          }
-        }
+
         return { ...summary, federation: federationSummary };
       }
       case "cron_settle_billing": {
@@ -239,7 +240,7 @@ const worker = new Worker(
         return summary;
       }
       default:
-        return { note: "cron handler not yet implemented", ms: Date.now() - started };
+        throw new Error(`unknown cron job: ${job.name}`);
     }
   },
   { connection, concurrency: 5 },
@@ -264,15 +265,23 @@ async function main() {
     console.log("[worker] DISABLE_WORKER=true, exiting");
     process.exit(0);
   }
-  // 等待依赖就绪
+  // Wait for dependencies, but never advertise a ready worker when they stayed unavailable.
+  let dependenciesReady = false;
+  let lastDependencyError: unknown = null;
   for (let i = 0; i < 30; i++) {
     try {
       await db.$queryRaw`SELECT 1`;
       await connection.ping();
+      dependenciesReady = true;
       break;
-    } catch {
+    } catch (error) {
+      lastDependencyError = error;
       await new Promise((r) => setTimeout(r, 2000));
     }
+  }
+  if (!dependenciesReady) {
+    const detail = lastDependencyError instanceof Error ? lastDependencyError.message : String(lastDependencyError ?? "unknown error");
+    throw new Error(`worker dependencies unavailable after startup grace period: ${detail}`);
   }
   // Federation teardown/revocation/port hooks must be wired before the first federation tick.
   try {

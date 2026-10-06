@@ -281,6 +281,41 @@ function validateApplyTunnel(payload: Record<string, unknown>): string | null {
   return validateTargets(tunnel.targets);
 }
 
+function validateHopLocalAddr(value: unknown): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || value.trim() === "") {
+    return "payload.hop_local_addr 必须是非空字符串";
+  }
+  if (value !== value.trim()) return "payload.hop_local_addr 不应含首尾空白";
+  if (value.length > MAX_ADDRESS_LEN + 8) return "payload.hop_local_addr 过长";
+
+  let host = "";
+  let portText = "";
+  if (value.startsWith("[")) {
+    const close = value.indexOf("]");
+    if (close <= 1 || value[close + 1] !== ":") {
+      return "payload.hop_local_addr 必须是 [IPv6]:port";
+    }
+    host = value.slice(1, close);
+    portText = value.slice(close + 2);
+  } else {
+    const colon = value.lastIndexOf(":");
+    if (colon <= 0) return "payload.hop_local_addr 必须是 host:port";
+    host = value.slice(0, colon);
+    portText = value.slice(colon + 1);
+  }
+
+  if (host.trim() === "" || /[\s\r\n\x00]/.test(host)) {
+    return "payload.hop_local_addr 的 host 非法";
+  }
+  if (!/^\d+$/.test(portText)) return "payload.hop_local_addr 的 port 必须是整数";
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return "payload.hop_local_addr 的 port 超出范围 [1, 65535]";
+  }
+  return null;
+}
+
 function validateReasonField(payload: Record<string, unknown>): string | null {
   if (payload.reason === undefined) return null;
   if (typeof payload.reason !== "string") return "payload.reason 必须是字符串";
@@ -352,6 +387,8 @@ export function validatePayload(action: CommandAction, payload: unknown): string
       if (payload.state !== undefined && payload.state !== null && !isPlainObject(payload.state)) {
         return "payload.state 必须是对象或 null";
       }
+      const hopLocalAddrError = validateHopLocalAddr(payload.hop_local_addr);
+      if (hopLocalAddrError) return hopLocalAddrError;
       // status 为 applied/duplicate 时必须带回非负 applied_revision；否则必须带错误码。
       const status = payload.status as AckStatus;
       if ((status === "applied" || status === "duplicate") && payload.applied_revision === null) {

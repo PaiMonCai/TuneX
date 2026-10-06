@@ -616,7 +616,6 @@ model Tunnel {
   workspace_id               Int
   workspace                  Workspace      @relation(fields: [workspace_id], references: [id])
 
-  tunnel_traffic TunnelTraffic[]
   tunnel_chains  TunnelChain[]
 
   // ── v3 增量字段（WP1，expand-and-contract：全部可空，见迁移 20260926040000）──
@@ -1404,13 +1403,18 @@ model TopupActivity {
 
 model TunnelTraffic {
   id           Int      @id @default(autoincrement())
+  /// Immutable source identity. Deliberately no FK: traffic is a historical
+  /// accounting fact and must survive deletion of the runtime/product object.
   tunnel_id    Int
-  tunnel       Tunnel   @relation(fields: [tunnel_id], references: [id])
+  /// Immutable tenant attribution captured at archive time. Quota/accounting
+  /// queries must use this column rather than joining the live Tunnel row.
+  workspace_id Int
   traffic      Float
   traffic_cost Float
   date         DateTime
 
   @@index([date])
+  @@index([workspace_id, date])
   @@unique([tunnel_id, date])
   @@map("tunnel_traffic")
 }

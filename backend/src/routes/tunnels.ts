@@ -36,7 +36,7 @@ import {
 } from "../services/policy-service.ts";
 import { billingDayKeyStamp } from "../services/billing-time.ts";
 //：图表键与 dashboard 共用同一实现（`fillDays`），不再各写一份本地零点逻辑。
-import { fillDays } from "../services/traffic.ts";
+import { dayKeyOf, fillDays } from "../services/traffic.ts";
 import { checkTunnelCreation } from "../services/capability-policy.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
@@ -370,14 +370,18 @@ tunnelsRoutes.get("/:id/traffic", async (c) => {
   const since = new Date(billingDayKeyStamp(now).getTime() - (days - 1) * 86_400_000);
 
   const rows = await db.tunnelTraffic.findMany({
-    where: { tunnel_id: tunnel.id, date: { gte: since } },
+    where: {
+      tunnel_id: tunnel.id,
+      workspace_id: selectedWorkspace(c).id,
+      date: { gte: since },
+    },
     orderBy: { date: "asc" },
   });
 
   // 按 YYYY-MM-DD 聚合（同一天可能多条）
   const byDate = new Map<string, { traffic: number; traffic_cost: number }>();
   for (const r of rows) {
-    const key = r.date.toISOString().slice(0, 10);
+    const key = dayKeyOf(r.date);
     const acc = byDate.get(key) ?? { traffic: 0, traffic_cost: 0 };
     acc.traffic += r.traffic;
     acc.traffic_cost += r.traffic_cost;
@@ -535,12 +539,6 @@ tunnelsRoutes.post("/:id/toggle", async (c) => {
   });
   if (!result.ok) return apiError(c, result);
 
-  // Legacy status remains a display/filter compatibility column only.
-  await db.tunnel.update({
-    where: { id },
-    data: { status: action === "suspend" ? "inactive" : "active" },
-  }).catch(() => {});
-
   const state = await getTunnelStateApi(id, workspace.id, { db: db as never });
   return ok(c, state.ok ? state.tunnel : result.tunnel ?? { id, action });
 });
@@ -554,20 +552,27 @@ tunnelsRoutes.post("/:id/reset-traffic", async (c) => {
   const id = Number(c.req.param("id"));
   if (!Number.isInteger(id)) return c.json({ error: "非法的隧道 ID" }, 400);
 
-  const tunnel = await db.tunnel.findFirst({ where: { id, workspace_id: selectedWorkspace(c).id } });
-  if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
-  if (!canWorkspaceResourceAction(selectedWorkspace(c), "update", "forward", tunnel.user_id === user.id))
-    return c.json({ error: "无权操作该团队隧道", code: "forbidden", error_layer: "rbac" }, 403);
-
-  const updated = await db.tunnel.update({
-    where: { id: tunnel.id },
-    data: { traffic: 0, traffic_cost: 0 },
-    include: {
-      in_node_group: { select: { id: true, name: true, node_type: true } },
-      out_node_group: { select: { id: true, name: true, node_type: true } },
-    },
+  const workspace = selectedWorkspace(c);
+  const tunnel = await db.tunnel.findFirst({
+    where: { id, workspace_id: workspace.id },
+    select: { id: true, user_id: true },
   });
-  return ok(c, tunnelView(updated as unknown as Record<string, unknown>));
+  if (!tunnel) return c.json({ error: "隧道不存在" }, 404);
+  if (!canWorkspaceResourceAction(workspace, "update", "forward", tunnel.user_id === user.id)) {
+    return c.json({ error: "无权操作该隧道", code: "forbidden" }, 403);
+  }
+
+  // Historical usage is an immutable accounting ledger. The old endpoint only
+  // zeroed legacy Tunnel.traffic columns (which no longer have a writer), so it
+  // returned success while quota/dashboard data stayed unchanged. Keep the route
+  // as an explicit compatibility refusal rather than a fake mutation.
+  return c.json(
+    {
+      error: "历史流量属于计量账本，不能通过隧道操作重置",
+      code: "traffic_ledger_immutable",
+    },
+    409,
+  );
 });
 
 /* ------------------------------------------------------------------ */

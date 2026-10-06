@@ -1,4 +1,3 @@
-import { redis, RedisKeys } from "../redis.ts";
 import { env } from "../env.ts";
 
 export type LicenseType = "personal" | "business";
@@ -10,44 +9,34 @@ export interface LicenseInfo {
 }
 
 /**
- * License 服务
- * 原版从远程 LICENSE_URL 拉取并缓存 Redis；本实现用 env + Redis 覆盖模拟，
- * 保留 getLicense / isBusinessLicense / businessLicenseRequired 的语义。
+ * Instance-level license projection.
  *
- * TEN-02：license 是**实例级**配置（不随租户变化），键走平台段
- * `ws:global:license`——经 {@link scopedKey} 显式生成，而不是裸名 `license`。
+ * TuneX no longer has the legacy remote-license verification path. LICENSE_TYPE,
+ * LICENSE_EXPIRED_AT and SITE_URL are process configuration, so Redis must not
+ * become a second source of truth: caching them across restarts/config changes can
+ * expose stale admin state indefinitely.
  */
 class LicenseService {
   async getLicense(): Promise<LicenseInfo | null> {
-    try {
-      const cached = await redis.get(RedisKeys.license);
-      if (cached) return JSON.parse(cached) as LicenseInfo;
-    } catch {
-      /* Redis 不可用时回落到 env */
-    }
-
     if (env.licenseType === "none") return null;
 
-    const license: LicenseInfo = {
-      type: (env.licenseType as LicenseType) ?? "business",
-      expired_at: env.licenseExpiredAt,
+    // Unknown values are configuration errors, not an implicit business grant.
+    if (env.licenseType !== "personal" && env.licenseType !== "business") {
+      return null;
+    }
+
+    return {
+      type: env.licenseType,
+      expired_at: Number.isFinite(env.licenseExpiredAt) ? env.licenseExpiredAt : 0,
       site_url: env.siteUrl,
     };
-    try {
-      await redis.set(RedisKeys.license, JSON.stringify(license));
-    } catch {
-      /* 忽略缓存写失败 */
-    }
-    return license;
   }
 
-  /**
-   * 原版语义：无 license 视为 business（放行），个人授权视为非商业。
-   * 注意与 businessLicenseRequired 的判定方向相反。
-   */
-  async isBusinessLicense(): Promise<boolean> {
+  async hasBusinessLicense(now: Date = new Date()): Promise<boolean> {
     const license = await this.getLicense();
-    return !license || license.type === "business";
+    if (license?.type !== "business") return false;
+    // 0 means no expiry. Positive values are Unix seconds, matching the legacy contract.
+    return license.expired_at <= 0 || license.expired_at > Math.floor(now.getTime() / 1000);
   }
 }
 

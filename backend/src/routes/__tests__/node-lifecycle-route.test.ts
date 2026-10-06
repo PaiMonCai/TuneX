@@ -315,9 +315,11 @@ describe("GET /api/admin/node/:id/impact", () => {
     expect(body.data.impact).toEqual({
       ingress_forward_count: 0,
       egress_forward_count: 0,
+      middle_forward_count: 0,
       binding_count: 0,
       active_port_lease_count: 0,
       egress_pool_count: 0,
+      federated_lease_count: 0,
       blockers: [],
     });
     expect(body.data.role_check.ok).toBe(true);

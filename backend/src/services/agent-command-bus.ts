@@ -634,8 +634,27 @@ export async function waitAgentCommandAck(
     if (raw) {
       await store.del(key);
       await clearPendingCommand(scope, nodeId, commandId, store);
-      const ack = JSON.parse(raw) as AgentCommandAck;
-      return ack;
+      let ack: unknown;
+      try {
+        ack = JSON.parse(raw);
+      } catch {
+        throw new AgentTransportError(
+          RELAY_DISPATCH_ERROR_CODES.ack_invalid,
+          `Agent ACK 不是合法 JSON（node=${nodeId}, command=${commandId}）`,
+        );
+      }
+      if (
+        !ack ||
+        typeof ack !== "object" ||
+        (ack as { command_id?: unknown }).command_id !== commandId ||
+        typeof (ack as { ok?: unknown }).ok !== "boolean"
+      ) {
+        throw new AgentTransportError(
+          RELAY_DISPATCH_ERROR_CODES.ack_invalid,
+          `Agent ACK 结构非法（node=${nodeId}, command=${commandId}）`,
+        );
+      }
+      return ack as AgentCommandAck;
     }
     await new Promise((resolve) => setTimeout(resolve, ACK_POLL_MS));
   }
@@ -797,6 +816,17 @@ export class OutboundAgentTransport implements AgentTransport {
  * pending/ACK ledger decides whether an answer is really this node's answer.
  * A diagnostic that bypassed those would be a second, weaker command path.
  */
+function waitFailure(error: unknown): { ok: false; error_code: string; error: string } {
+  if (error instanceof AgentTransportError) {
+    return { ok: false, error_code: error.code, error: error.message };
+  }
+  return {
+    ok: false,
+    error_code: "ack_timeout",
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
 export async function issueAgentDiagnose(
   input: {
     /** Only the id is needed: a probe needs no connect_ip and never dials from here. */
@@ -855,7 +885,7 @@ export async function issueAgentDiagnose(
   try {
     ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, input.timeoutMs ?? 20_000, store);
   } catch (error) {
-    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+    return waitFailure(error);
   }
   if (!ack.ok) {
     return { ok: false, error_code: ack.error_code ?? "diagnose_failed", error: ack.error ?? "节点拒绝执行诊断" };
@@ -909,7 +939,7 @@ export async function issueAgentDiagnostics(
   try {
     ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, timeoutMs, store);
   } catch (error) {
-    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+    return waitFailure(error);
   }
   if (!ack.ok) {
     return { ok: false, error_code: ack.error_code ?? "diagnostics_failed", error: ack.error ?? "节点拒绝自检" };
@@ -1011,7 +1041,7 @@ export async function issueAgentLookingGlass(
   try {
     ack = await waitAgentCommandAck(scope, input.nodeId, envelope.command_id, ackWaitMs, store);
   } catch (error) {
-    return { ok: false, error_code: "ack_timeout", error: (error as Error).message };
+    return waitFailure(error);
   }
   if (!ack.ok) {
     return { ok: false, error_code: ack.error_code ?? "looking_glass_failed", error: ack.error ?? "节点拒绝执行 Looking Glass" };

@@ -141,7 +141,6 @@ fi
 
 # --- 3. 校验 + 解密 ----------------------------------------------------------
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tunex-restore.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
 
 verify_and_decrypt() {
   local enc="$1" out="$2" sum
@@ -219,7 +218,7 @@ grep -q "Dump completed on" "$MYSQL_SQL" || die "解密产物不是有效 dump"
 # refuse to restart anything on a differently-named stack (e.g. the e2e topology,
 # where the API service is called "panel").
 WRITER_SERVICES="${WRITER_SERVICES:-backend worker web}"
-WRITERS_STOPPED=0
+STOPPED_WRITER_SERVICES=()
 stop_writers() {
   local ws=()
   for w in $WRITER_SERVICES; do
@@ -228,14 +227,13 @@ stop_writers() {
   [[ ${#ws[@]} -gt 0 ]] || return 0
   log "  停止写入方: ${ws[*]}"
   "${COMPOSE[@]}" stop "${ws[@]}" >/dev/null
-  WRITERS_STOPPED=1
+  STOPPED_WRITER_SERVICES=("${ws[@]}")
 }
 resume_writers() {
-  [[ $WRITERS_STOPPED -eq 1 ]] || return 0
-  log "  恢复写入方: $WRITER_SERVICES"
-  # shellcheck disable=SC2086  # 有意分词：这是一个服务名列表
-  "${COMPOSE[@]}" start $WRITER_SERVICES >/dev/null 2>&1 || warn "写入方重启失败，请手动 docker compose up -d"
-  WRITERS_STOPPED=0
+  [[ ${#STOPPED_WRITER_SERVICES[@]} -gt 0 ]] || return 0
+  log "  恢复本次实际停止的写入方: ${STOPPED_WRITER_SERVICES[*]}"
+  "${COMPOSE[@]}" start "${STOPPED_WRITER_SERVICES[@]}" >/dev/null 2>&1     || warn "写入方重启失败，请手动 docker compose up -d ${STOPPED_WRITER_SERVICES[*]}"
+  STOPPED_WRITER_SERVICES=()
 }
 
 # Redis is stopped while its volume is replaced; this guarantees it comes back.
@@ -247,7 +245,14 @@ resume_services() {
   fi
   resume_writers
 }
-trap 'resume_services' EXIT
+
+cleanup_restore() {
+  # EXIT cleanup must do both jobs. A later trap must never shadow deletion of
+  # decrypted SQL/RDB/config material from the temporary directory.
+  resume_services
+  rm -rf -- "$WORK"
+}
+trap cleanup_restore EXIT
 
 if [[ $DO_MYSQL -eq 1 ]]; then
   log "[2/4] MySQL 恢复 → $MYSQL_DATABASE"

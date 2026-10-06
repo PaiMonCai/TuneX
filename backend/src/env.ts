@@ -2,11 +2,10 @@
  * 环境变量集中读取。
  *
  * Security: secrets have no built-in default. Deployments must supply
- * AUTH_SECRET and LICENSE_SECRET. Missing secrets fail fast instead of
- * silently using a shared value.
+ * AUTH_SECRET. Missing secrets fail fast instead of silently using a shared value.
  *
- * WP15：TUNEX_CONFIG_KEY / TUNEX_LICENSE_KEY 不再读取也不再校验——它们只为
- * legacy agent 的 Fernet config 下发与 license 签名存在，随 Socket.IO 层删除。
+ * Legacy TUNEX_CONFIG_KEY / TUNEX_LICENSE_KEY / LICENSE_SECRET inputs are no longer
+ * runtime dependencies; the old Socket.IO/Fernet/license-signing paths were removed.
  */
 
 function requireSecret(name: string): string {
@@ -47,16 +46,28 @@ export const env = {
   databaseUrl: requireSecret("DATABASE_URL"),
   redisUrl: process.env.REDIS_URL ?? "redis://redis:6379",
 
-  authSecret: requireSecret("AUTH_SECRET"),
+  authSecret: (() => {
+    const value = requireSecret("AUTH_SECRET");
+    if ((process.env.NODE_ENV ?? "development") === "production" && value.length < 32) {
+      throw new Error("AUTH_SECRET must be at least 32 characters in production");
+    }
+    return value;
+  })(),
   jwtIssuer: process.env.JWT_ISSUER ?? "tunex",
   /** Cookie `access` 的 JWT 有效期：12h（与原版会话对齐） */
   jwtTtlSeconds: Number(process.env.JWT_TTL_SECONDS ?? 12 * 60 * 60),
 
   cookieName: process.env.COOKIE_NAME ?? "access",
   /** secure 开关：明文 HTTP 本地栈置 false，TLS 环境必须 true */
-  cookieSecure: (process.env.COOKIE_SECURE ?? "false") === "true",
+  cookieSecure:
+    (process.env.COOKIE_SECURE ??
+      ((process.env.NODE_ENV ?? "development") === "production" ? "true" : "false")) === "true",
 
-  allowRegisterFallback: (process.env.ALLOW_REGISTER_FALLBACK ?? "true") === "true",
+  // Invitation-only beta must fail closed in production when the variable is omitted.
+  // Development keeps the convenient historical default.
+  allowRegisterFallback:
+    (process.env.ALLOW_REGISTER_FALLBACK ??
+      ((process.env.NODE_ENV ?? "development") === "production" ? "false" : "true")) === "true",
 
   /** TEN-03 邮件服务（SMTP）。全部未配置 → 邮件内容落日志（开发环境可用）。 */
   mail: {
@@ -73,9 +84,11 @@ export const env = {
   /** 重新发送验证邮件的间隔：60s（限流中间件之外的应用层节流）。 */
   resendVerificationIntervalSeconds: Number(process.env.RESEND_VERIFICATION_INTERVAL ?? 60),
 
-  licenseType: process.env.LICENSE_TYPE ?? "business",
+  // Production must never gain Business capabilities merely because LICENSE_TYPE was omitted.
+  licenseType:
+    process.env.LICENSE_TYPE ??
+    ((process.env.NODE_ENV ?? "development") === "production" ? "none" : "business"),
   licenseExpiredAt: Number(process.env.LICENSE_EXPIRED_AT ?? 0),
-  licenseSecret: requireSecret("LICENSE_SECRET"),
 
   disableWorker: (process.env.DISABLE_WORKER ?? "false") === "true",
   /** Optional billing integration; off by default, independent of RBAC. */

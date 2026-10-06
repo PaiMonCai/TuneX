@@ -114,6 +114,8 @@ export async function callPeer<T = unknown>(input: CallPeerInput): Promise<Feder
       identity,
       privateJwk,
       body: bodyStr,
+      method: input.method,
+      path: input.path,
       messageId,
       nowMs: input.nowMs,
       ttlSeconds: Math.max(30, Math.ceil(timeoutMs / 1000) * (retries + 1) + 30),

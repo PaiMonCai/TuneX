@@ -99,6 +99,12 @@ const tunnelRows: Array<{
 const bindingRows: Array<{ id: number; ingress_node_id: number; egress_node_id: number }> = [];
 const leaseRows: Array<{ id: number; node_id: number; port: number; status: string }> = [];
 const poolRows: Array<{ id: number; node_id: number }> = [];
+const federationLeaseRows: Array<{
+  id: number;
+  node_id: number | null;
+  state: string;
+  last_error_code: string | null;
+}> = [];
 
 /**
  * 心跳偏移（毫秒）：替身节点默认 `last_seen_at` 取「**播种这一刻**」往前
@@ -256,6 +262,11 @@ export const dbStub = {
       if (where?.egress_node_id !== undefined) {
         return tunnelRows.filter((t) => t.egress_node_id === where.egress_node_id).length;
       }
+      if (where?.middle_node_id !== undefined) {
+        return tunnelRows.filter(
+          (t) => (t as typeof t & { middle_node_id?: number | null }).middle_node_id === where.middle_node_id,
+        ).length;
+      }
       return tunnelRows.length;
     },
     /** V4-WP6：health 需要 Forward 的 desired 面（含 OR ingress/egress）。 */
@@ -319,6 +330,17 @@ export const dbStub = {
     },
   },
 
+  federationLease: {
+    async count({ where }: { where: Record<string, unknown> }) {
+      const nodeId = where.node_id as number;
+      return federationLeaseRows.filter((row) => {
+        if (row.node_id !== nodeId) return false;
+        if (["reserved", "active", "releasing", "failed"].includes(row.state)) return true;
+        return ["revoked", "expired", "released"].includes(row.state) && row.last_error_code !== null;
+      }).length;
+    },
+  },
+
   // 未显式覆盖的模型：空壳（其他测试文件解析到这里时不会崩）。
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 } as unknown as Record<string, any>;
@@ -341,6 +363,7 @@ export function resetLifecycleStub(): void {
   bindingRows.length = 0;
   leaseRows.length = 0;
   poolRows.length = 0;
+  federationLeaseRows.length = 0;
 }
 
 export const stubState = {
@@ -355,5 +378,17 @@ export const stubState = {
   pushBinding: pushStubBinding,
   pushLease: pushStubLease,
   pushPool: pushStubPool,
+  pushFederationLease: (row: {
+    node_id: number | null;
+    state: string;
+    last_error_code?: string | null;
+  }) => {
+    federationLeaseRows.push({
+      id: federationLeaseRows.length + 1,
+      node_id: row.node_id,
+      state: row.state,
+      last_error_code: row.last_error_code ?? null,
+    });
+  },
   nodeCount: () => nodes.size,
 };

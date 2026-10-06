@@ -16,7 +16,29 @@ try {
   assert.equal(tunnel.workspace_id, a.id);
   assert.equal(group.user_id, 701);
   assert.equal(tunnel.user_id, 701);
-  console.log("Workspace upgrade retained two distinct users and correctly backfilled their assets.");
+
+  const traffic = await db.tunnelTraffic.findFirstOrThrow({
+    where: { tunnel_id: 901 },
+  });
+  assert.equal(traffic.workspace_id, a.id);
+  assert.equal(traffic.traffic, 4096);
+
+  const fkRows = await db.$queryRawUnsafe(
+    "SELECT COUNT(*) AS c FROM information_schema.KEY_COLUMN_USAGE " +
+      "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tunnel_traffic' " +
+      "AND COLUMN_NAME = 'tunnel_id' AND REFERENCED_TABLE_NAME = 'tunnel'",
+  );
+  assert.equal(Number(fkRows[0]?.c ?? -1), 0, "traffic ledger must no longer depend on live Tunnel FK");
+
+  await db.tunnel.delete({ where: { id: 901 } });
+  const afterDelete = await db.tunnelTraffic.findFirstOrThrow({
+    where: { tunnel_id: 901, workspace_id: a.id },
+  });
+  assert.equal(afterDelete.traffic, 4096);
+
+  console.log(
+    "Workspace upgrade retained two distinct users, backfilled traffic ownership, and preserved ledger history after Tunnel deletion.",
+  );
 } finally {
   await db.$disconnect();
 }

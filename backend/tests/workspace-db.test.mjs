@@ -6,7 +6,6 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   test("workspace MySQL integration (requires TUNEX_DB_TEST=1)", { skip: true }, () => {});
 } else {
   process.env.AUTH_SECRET ??= "test-only-auth-secret-must-not-be-used-in-production";
-  process.env.LICENSE_SECRET ??= "test-only-license-secret-must-not-be-used-in-production";
   process.env.PAYMENTS_ENABLED = "false";
   process.env.ALLOW_REGISTER_FALLBACK = "true";
   const { app } = await import("../src/app.ts");
@@ -159,7 +158,15 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       assert.equal((await db.tunnel.findUniqueOrThrow({ where: { id: tunnelId } })).ingress_node_id, teamIngress.node.id);
 
       const today = billingDayKeyStamp(new Date());
-      await db.tunnelTraffic.create({ data: { tunnel_id: tunnelId, traffic: 8192, traffic_cost: 0, date: today } });
+      await db.tunnelTraffic.create({
+        data: {
+          tunnel_id: tunnelId,
+          workspace_id: teamId,
+          traffic: 8192,
+          traffic_cost: 0,
+          date: today,
+        },
+      });
 
       const personalGroup = await request("/api/node-groups", "POST", a.cookie, { name: "Personal ingress", node_type: "in" });
       assert.equal(personalGroup.status, 201);
@@ -232,7 +239,7 @@ if (process.env.TUNEX_DB_TEST !== "1") {
       assert.ok((await db.auditEvent.count({ where: { workspace_id: teamId } })) >= 3);
     } finally {
       if (teamId) {
-        await db.tunnelTraffic.deleteMany({ where: { tunnel: { workspace_id: teamId } } });
+        await db.tunnelTraffic.deleteMany({ where: { workspace_id: teamId } });
         await db.tunnel.deleteMany({ where: { workspace_id: teamId } });
         await db.node.deleteMany({ where: { node_group: { workspace_id: teamId } } });
         await db.nodeGroup.deleteMany({ where: { workspace_id: teamId } });

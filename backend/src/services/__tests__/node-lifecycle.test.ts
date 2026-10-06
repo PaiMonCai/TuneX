@@ -80,10 +80,21 @@ const {
 /* ------------------------------------------------------------------ */
 
 let nodes = new Map<number, LifecycleNodeRow>();
-let tunnelRows: Array<{ id: number; ingress_node_id: number | null; egress_node_id: number | null }> = [];
+let tunnelRows: Array<{
+  id: number;
+  ingress_node_id: number | null;
+  egress_node_id: number | null;
+  middle_node_id?: number | null;
+}> = [];
 let bindingRows: Array<{ id: number; ingress_node_id: number; egress_node_id: number }> = [];
 let leaseRows: Array<{ id: number; node_id: number; port: number; status: string }> = [];
 let poolRows: Array<{ id: number; node_id: number }> = [];
+let federationLeaseRows: Array<{
+  id: number;
+  node_id: number | null;
+  state: string;
+  last_error_code: string | null;
+}> = [];
 
 function resetState(): void {
   nodes = new Map();
@@ -91,6 +102,7 @@ function resetState(): void {
   bindingRows = [];
   leaseRows = [];
   poolRows = [];
+  federationLeaseRows = [];
 }
 
 function prismaNotFound(): Error {
@@ -175,6 +187,11 @@ function makeDb(): LifecycleDb {
         if (where?.egress_node_id !== undefined) {
           return tunnelRows.filter((t) => t.egress_node_id === where.egress_node_id).length;
         }
+        if (where?.middle_node_id !== undefined) {
+          return tunnelRows.filter(
+            (t) => (t as typeof t & { middle_node_id?: number | null }).middle_node_id === where.middle_node_id,
+          ).length;
+        }
         return tunnelRows.length;
       },
       async findMany() {
@@ -208,6 +225,17 @@ function makeDb(): LifecycleDb {
     egressPool: {
       async count({ where }: { where: Record<string, unknown> }) {
         return poolRows.filter((p) => p.node_id === where.node_id).length;
+      },
+    },
+
+    federationLease: {
+      async count({ where }: { where: Record<string, unknown> }) {
+        const nodeId = where.node_id as number;
+        return federationLeaseRows.filter((row) => {
+          if (row.node_id !== nodeId) return false;
+          if (["reserved", "active", "releasing", "failed"].includes(row.state)) return true;
+          return ["revoked", "expired", "released"].includes(row.state) && row.last_error_code !== null;
+        }).length;
       },
     },
   };
@@ -467,6 +495,14 @@ describe("deleteGates — 六道闸门（§13.4.3 永不级联删除 Forward）"
     if (!r.ok) expect(r.condition).toBe("node_still_used_as_egress");
   });
 
+  test("仍作为 middle hop ⇒ node_still_used_as_middle", () => {
+    const r = deleteGates({
+      lifecycle: "retiring",
+      impact: { ...emptyImpact(), middle_forward_count: 1 },
+    });
+    if (!r.ok) expect(r.condition).toBe("node_still_used_as_middle");
+  });
+
   test("入口优先于出口（先报更根本的问题）", () => {
     const r = deleteGates({
       lifecycle: "retiring",
@@ -475,8 +511,13 @@ describe("deleteGates — 六道闸门（§13.4.3 永不级联删除 Forward）"
     if (!r.ok) expect(r.condition).toBe("node_still_used_as_ingress");
   });
 
-  test("binding / active 租约 / 出口池任一不为空 → dependency_blocked", () => {
-    for (const key of ["binding_count", "active_port_lease_count", "egress_pool_count"] as const) {
+  test("binding / active 租约 / 出口池 / 联邦租约任一不为空 → dependency_blocked", () => {
+    for (const key of [
+      "binding_count",
+      "active_port_lease_count",
+      "egress_pool_count",
+      "federated_lease_count",
+    ] as const) {
       const r = deleteGates({ lifecycle: "retiring", impact: { ...emptyImpact(), [key]: 3 } });
       expect(r.ok).toBe(false);
       if (!r.ok) {
@@ -600,14 +641,14 @@ describe("checkRoleChange — §13.4.3 impact check", () => {
 /* ================================================================== */
 
 describe("getNodeImpact", () => {
-  test("五类计数各取各的维度（tunnel 两侧 / binding 两侧 / active 租约 / 池）", async () => {
+  test("七类依赖各取各的维度（tunnel 三跳 / binding / active 端口 / 池 / federation lease）", async () => {
     const node = seedNode();
     // findUnique 只返回第一行，因此这里必须只有这一个节点。
     tunnelRows = [
       { id: 1, ingress_node_id: node.id, egress_node_id: null },
       { id: 2, ingress_node_id: node.id, egress_node_id: 999 },
       { id: 3, ingress_node_id: 999, egress_node_id: node.id },
-      { id: 4, ingress_node_id: 999, egress_node_id: 999 },
+      { id: 4, ingress_node_id: 999, egress_node_id: 999, middle_node_id: node.id },
     ];
     bindingRows = [
       { id: 1, ingress_node_id: node.id, egress_node_id: 999 },
@@ -619,15 +660,23 @@ describe("getNodeImpact", () => {
       { id: 3, node_id: 999, port: 10003, status: "active" },
     ];
     poolRows = [{ id: 1, node_id: node.id }, { id: 2, node_id: 999 }];
+    federationLeaseRows = [
+      { id: 1, node_id: node.id, state: "active", last_error_code: null },
+      { id: 2, node_id: node.id, state: "released", last_error_code: null },
+      { id: 3, node_id: node.id, state: "expired", last_error_code: "port_release_failed" },
+      { id: 4, node_id: 999, state: "active", last_error_code: null },
+    ];
 
     const r = await getNodeImpact(node.id, deps());
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.impact.ingress_forward_count).toBe(2);
     expect(r.impact.egress_forward_count).toBe(1);
+    expect(r.impact.middle_forward_count).toBe(1);
     expect(r.impact.binding_count).toBe(1); // 只算涉及它的
     expect(r.impact.active_port_lease_count).toBe(1); // released 不算
     expect(r.impact.egress_pool_count).toBe(1);
+    expect(r.impact.federated_lease_count).toBe(2); // active + terminal cleanup pending
     expect(r.impact.blockers).toEqual([]);
   });
 
@@ -799,6 +848,10 @@ describe("deleteNode", () => {
       () => (bindingRows = [{ id: 1, ingress_node_id: 1, egress_node_id: 2 }]),
       () => (leaseRows = [{ id: 1, node_id: 1, port: 10001, status: "active" }]),
       () => (poolRows = [{ id: 1, node_id: 1 }]),
+      () =>
+        (federationLeaseRows = [
+          { id: 1, node_id: 1, state: "active", last_error_code: null },
+        ]),
     ]) {
       resetState();
       const node = seedNode({ lifecycle: "retiring" });

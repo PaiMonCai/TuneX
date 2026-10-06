@@ -18,7 +18,6 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   test("federation lease MySQL integration (requires TUNEX_DB_TEST=1)", { skip: true }, () => {});
 } else {
   process.env.AUTH_SECRET ??= "test-only-auth-secret-must-not-be-used-in-production";
-  process.env.LICENSE_SECRET ??= "test-only-license-secret-must-not-be-used-in-production";
   process.env.PAYMENTS_ENABLED = "false";
 
   const { randomUUID: uuid } = await import("node:crypto");
@@ -566,6 +565,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path: input.path,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local${input.path}`, {
@@ -739,6 +740,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path: `/api/federation/v1/leases/${ref}/apply`,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local/api/federation/v1/leases/${ref}/apply`, {
@@ -838,6 +841,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path: `/api/federation/v1/leases/${ref}/renew`,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local/api/federation/v1/leases/${ref}/renew`, {
@@ -924,6 +929,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local${path}`, {

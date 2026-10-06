@@ -360,16 +360,43 @@ describe("flushTrafficBuffer 幂等性", () => {
 /* ================================================================== */
 
 describe("flushTrafficBuffer 归属校验", () => {
-  test("隧道已删（解析不到 workspace）→ skipped，不入库", async () => {
+  test("隧道在采集后、归档前被删 ⇒ 使用已授权 buffer scope 落最后一批历史流量", async () => {
     const redis = new FakeRedis();
-    const db = new FakeDb(); // 没有任何 tunnel
+    const db = new FakeDb(); // live Tunnel 已不存在
     seedBuffer(redis, 5, 999, "2026-09-24", "4096");
+
+    const r = await flushTrafficBuffer(makeDeps(redis, db));
+    expect(r.records).toBe(1);
+    expect(r.skipped).toBe(0);
+    expect(r.inserted).toBe(1);
+    expect(db.rows[0]).toMatchObject({
+      tunnel_id: 999,
+      workspace_id: 5,
+      traffic: 4096,
+    });
+  });
+
+  test("live Tunnel 与 buffer scope 不一致 ⇒ fail-closed 跳过，不把流量记到任一租户", async () => {
+    const redis = new FakeRedis();
+    const db = new FakeDb();
+    db.tunnels.set(11, 6);
+    seedBuffer(redis, 5, 11, "2026-09-24", "4096");
 
     const r = await flushTrafficBuffer(makeDeps(redis, db));
     expect(r.records).toBe(1);
     expect(r.skipped).toBe(1);
     expect(r.inserted).toBe(0);
     expect(db.rows).toHaveLength(0);
+  });
+
+  test("Tunnel 已删且 buffer 是 global scope ⇒ 没有租户事实，仍然跳过", async () => {
+    const redis = new FakeRedis();
+    const db = new FakeDb();
+    seedBuffer(redis, 0, 999, "2026-09-24", "4096");
+
+    const r = await flushTrafficBuffer(makeDeps(redis, db));
+    expect(r.skipped).toBe(1);
+    expect(r.inserted).toBe(0);
   });
 
   test("非本模块形态的键不删别人的数据（scanned 但不 keys、不动）", async () => {
@@ -419,15 +446,15 @@ describe("flushTrafficBuffer 归属校验", () => {
     expect(rows[1]).toMatchObject({ tunnel_id: 21, traffic: 2048 });
   });
 
-  test("workspace_id 为 null 的隧道行：按未知处理跳过", async () => {
+  test("live 归属缺失时，非 global buffer scope 是采集时历史归属", async () => {
     const redis = new FakeRedis();
     const db = new FakeDb();
-    // findMany 不返回该行 → resolveTunnelWorkspace 给 null
     seedBuffer(redis, 5, 31, "2026-09-24", "999");
 
     const r = await flushTrafficBuffer(makeDeps(redis, db));
-    expect(r.skipped).toBe(1);
-    expect(db.rows).toHaveLength(0);
+    expect(r.skipped).toBe(0);
+    expect(r.inserted).toBe(1);
+    expect(db.rows[0]?.workspace_id).toBe(5);
   });
 });
 
@@ -516,9 +543,10 @@ describe("accumulateTraffic", () => {
 });
 
 describe("trafficDayKey", () => {
-  test("本地零点日界", () => {
-    const d = new Date(2026, 8, 24, 23, 30, 0); // 2026-09-24 23:30 local
-    expect(trafficDayKey(d)).toBe("2026-09-24");
+  test("固定计费时区日界，不依赖进程 TZ", () => {
+    // 上海 00:00 = 前一日 16:00Z；归档 field 与计费窗口必须使用同一日历。
+    expect(trafficDayKey(new Date("2026-09-24T15:59:59.999Z"))).toBe("2026-09-24");
+    expect(trafficDayKey(new Date("2026-09-24T16:00:00.000Z"))).toBe("2026-09-25");
   });
 });
 
@@ -528,7 +556,7 @@ describe("trafficDayKey", () => {
 
 const { aggregateTrafficRows, fillDays, getWorkspaceTrafficSummary, dayKeyOf } = trafficService;
 
-/** 构造聚合行（date 会按本地零点归一，与 archive 写库口径一致）。 */
+/** 构造聚合行（date 会按 UTC 零点归一，与 archive 写库口径一致）。 */
 function aggRow(
   tunnelId: number,
   dateKey: string,

@@ -74,9 +74,10 @@ dashboardRoutes.get("/traffic", async (c) => {
   const since = startOfToday();
   since.setDate(since.getDate() - (days - 1));
 
-  // Only count tunnels in the selected, authorized workspace.
+  // Scope by immutable traffic-ledger attribution, not by a live Tunnel join.
+  // Deleted Forwards remain part of historical usage for this workspace.
   const rows = await db.tunnelTraffic.findMany({
-    where: { date: { gte: since }, tunnel: { workspace_id: workspace.id } },
+    where: { date: { gte: since }, workspace_id: workspace.id },
     orderBy: { date: "asc" },
   });
 
@@ -135,11 +136,11 @@ dashboardRoutes.get("/stats", async (c) => {
       },
     }) : [],
     forwardsVisible ? db.tunnelTraffic.aggregate({
-      where: { date: { gte: todayStart }, tunnel: { workspace_id: workspace.id } },
+      where: { date: { gte: todayStart }, workspace_id: workspace.id },
       _sum: { traffic: true },
     }) : { _sum: { traffic: 0 } },
     forwardsVisible ? db.tunnelTraffic.aggregate({
-      where: { date: { gte: monthStart }, tunnel: { workspace_id: workspace.id } },
+      where: { date: { gte: monthStart }, workspace_id: workspace.id },
       _sum: { traffic: true },
     }) : { _sum: { traffic: 0 } },
     // 生效策略：决定「已用流量」的**窗口口径**（与额度判定、workspaces/:id/traffic 同源）。

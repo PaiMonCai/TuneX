@@ -140,12 +140,24 @@ func TestDatagramRelayCarriesClientDatagramToHopAndBack(t *testing.T) {
 		t.Fatalf("client received %q, want T:hello", reply)
 	}
 
-	stats := r.Stats()
+	// Delivery and the stats increment happen in the same relay goroutine, but
+	// the client can observe the UDP reply immediately after WriteToUDP returns,
+	// before that goroutine executes the following atomic counter increment.
+	// Wait for the observable fact instead of racing the scheduler.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var stats DatagramStats
+	for {
+		stats = r.Stats()
+		if stats.PacketsIn == 1 && stats.PacketsOut == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("packet facts did not converge after delivered reply: %+v", stats)
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if stats.Mappings != 1 || stats.MappingsCreated != 1 {
 		t.Fatalf("mapping facts = %+v, want 1 live / 1 created", stats)
-	}
-	if stats.PacketsIn != 1 || stats.PacketsOut != 1 {
-		t.Fatalf("packet facts = %+v, want 1 in / 1 out", stats)
 	}
 	if stats.Drops != 0 {
 		t.Fatalf("drops = %d, want 0 on the happy path", stats.Drops)

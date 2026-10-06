@@ -121,4 +121,22 @@ describe("V5.3 WP9: renewal follows liveness, not the reported tunnnels", () => 
     expect(src).toContain("renewOwnedLeasesUnsafe");
     expect(src).toContain("return [];");
   });
+
+  test("heartbeat only renews and returns leases that are still live", async () => {
+    const src = await Bun.file(new URL("../node-state.ts", import.meta.url)).text();
+    const start = src.indexOf("async function renewOwnedLeasesUnsafe");
+    const end = src.indexOf("/**：一次续约后回给 Agent", start);
+    const body = src.slice(start, end);
+
+    // update 与 response 查询都必须带 live fence。少任意一个，显式 release
+    // （expires_at=now）都可能被下一次心跳复活或重新发回 Agent。
+    expect(body.match(/lease_expires_at:\s*\{\s*gt:\s*now\s*\}/g)?.length).toBe(2);
+  });
+
+  test("expired ownership cannot be renewed in-place with the old epoch", async () => {
+    const src = await Bun.file(new URL("../placement-lease.ts", import.meta.url)).text();
+    expect(src).toContain("current.owner_node_id === input.nodeId && !isLeaseExpired(current, input.now)");
+    expect(src).toContain("epoch: current.epoch + 1");
+    expect(src).toContain("lease_expires_at: current.lease_expires_at");
+  });
 });

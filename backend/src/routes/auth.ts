@@ -17,10 +17,9 @@ import {
   signAccessToken,
   serializeCookie,
   verifyAccessToken,
-  isUUID,
-  newApiKey,
+  isUUID
 } from "../auth.ts";
-import { hashKey, resolveUserByKey } from "../services/user-keys.ts";
+import { resolveUserByKey } from "../services/user-keys.ts";
 import { systemConfig } from "../services/config.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import { licenseService } from "../services/license.ts";
@@ -103,9 +102,8 @@ authRoutes.post("/register", async (c) => {
 
   const user = await db.$transaction(async (tx) => {
     const created = await tx.user.create({
-      // SEC-02：注册即只落 api_key 的 sha256 哈希，明文字段留空（一次性明文仅由
-      // settings 轮换端点返回）。hashKey(newApiKey()) 保持 UUID v4 明文通道语义。
-      data: { email, super_admin: superAdmin, parent_id: parentId, api_key_hash: hashKey(newApiKey()) },
+      // API key is minted only by the explicit one-time rotation endpoint.
+      data: { email, super_admin: superAdmin, parent_id: parentId },
     });
     await tx.userCredential.create({
       data: { user_id: created.id, password: passwordHash },
@@ -213,8 +211,7 @@ export async function authenticateRequest(c: Context) {
   const auth = c.req.header("authorization") ?? "";
   const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
   if (bearer && isUUID(bearer)) {
-    const license = await licenseService.getLicense();
-    if (license && license.type !== "business") return null;
+    if (!(await licenseService.hasBusinessLicense())) return null;
     // SEC-02：凭据哈希化查询（旧明文行惰性迁移），语义与直查 api_key 等价。
     const u = await resolveUserByKey("api_key", bearer);
     if (u && u.status !== "inactive") return u;
@@ -398,10 +395,8 @@ authRoutes.post("/reset-password", async (c) => {
     });
   });
 
-  // 旧会话下线：删掉 sub→id 映射后，authRequired 的缓存命中分支失效，回落直接查库；
-  // 已签发 JWT 仍凭 exp 自然过期（最长 12h），这是无 session 表设计下的现实取舍，
-  // 换密这一动作本身已经把「继续持有旧 cookie」的攻击面压到最低（攻击者已知新密码
-  // 者也已获得同等访问权）。
+  // 清掉身份缓存。当前 JWT 是无状态凭据，没有 session/version 表，
+  // 因此已签发 cookie 仍会按 exp 自然过期；不要把删除这个缓存描述成会话撤销。
   try {
     await redis.del(RedisKeys.userSub(String(consumed.userId)));
   } catch {

@@ -2,8 +2,8 @@
  * 支付网关工厂 + 注册表
  * 依据: pay-channel-analysis-report.md §0 getPay()（源码确认）
  *
- * 原版行为：switch(payment.method) 分发，**default 回落 EPay**。
- * 保留该回落语义（兼容 method 字段异常的历史数据），但显式记录告警。
+ * 支付方式必须显式命中已注册网关。未知 method fail-closed，避免错误配置
+ * 被当成另一种支付方式执行或验签。
  *
  * 扩展点：`registerGateway(method, factory)` 可注入自定义实现（测试/新网关），
  * 不改动本文件即可扩展。
@@ -61,16 +61,15 @@ export function getPaymentGateway(
   const method = String(payment.method ?? "").toLowerCase();
   const factory = registry.get(method);
 
-  // 原版 default → EPay 回落
   if (!factory) {
-    console.warn(`[payment] unknown method "${payment.method}", falling back to epay`);
+    throw new PaymentMethodError(`不支持的支付方式: ${payment.method}`);
   }
 
   const gatewayPayment: GatewayPayment = {
     id: payment.id,
     name: payment.name,
     url: payment.url,
-    method: (factory ? method : "epay") as GatewayPayment["method"],
+    method: method as GatewayPayment["method"],
     type: payment.type ?? null,
     fixed_fee: payment.fixed_fee ?? null,
     percent_fee: payment.percent_fee ?? null,
@@ -78,8 +77,7 @@ export function getPaymentGateway(
     notify_url: opts.notifyUrl ?? buildNotifyUrl(payment.id, opts.siteUrl),
   };
 
-  const resolved = factory ?? registry.get("epay")!;
-  return resolved(gatewayPayment, opts.http);
+  return factory(gatewayPayment, opts.http);
 }
 
 /** 校验支付方式可用性（供路由层使用） */

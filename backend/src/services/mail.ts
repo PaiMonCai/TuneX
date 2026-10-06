@@ -119,8 +119,19 @@ class SmtpClient {
         this.buffer = lines.slice(1).join("\r\n");
         continue;
       }
-      if (m[2] === "-") return; // 多行应答，等后续行
-      const reply: SmtpReply = { code: Number(m[1]), text: lines.slice(0, -1).join("\n") };
+      if (m[2] === "-") {
+        // SMTP multiline reply: the final line repeats the same code followed by a space.
+        // A complete multiline response may already be present in this chunk, so do not
+        // blindly return just because the first line has "-".
+        const code = m[1];
+        const end = lines.findIndex((line, index) => index > 0 && line.startsWith(`${code} `));
+        if (end < 0) return;
+        const reply: SmtpReply = { code: Number(code), text: lines.slice(0, end + 1).join("\n") };
+        this.buffer = lines.slice(end + 1).join("\r\n");
+        this.deliver(reply);
+        continue;
+      }
+      const reply: SmtpReply = { code: Number(m[1]), text: first };
       this.buffer = lines.slice(1).join("\r\n");
       this.deliver(reply);
     }

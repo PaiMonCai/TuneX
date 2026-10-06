@@ -32,10 +32,15 @@
  *
  * ── 残差风险（明确写出来，不藏）──
  *
- * 第 4 步成功、第 5 步失败时，新节点持有归属但还没服务，旧节点已被栅栏挡住 ⇒ 服务中断，
- * 直到 rollout 被续跑（既有机制：`registerRollout` 写的 rollout 行 + worker 的
- * `resumeRollouts()`）。这是刻意的取舍，不是遗漏：**不允许**为了"恢复服务"把归属改回去
+ * 第 4 步成功、第 5 步若 **desired 已提交但 rollout 失败**，新节点持有归属但还没服务，
+ * 旧节点已被栅栏挡住 ⇒ 服务中断，直到 rollout 被续跑（既有机制：
+ * `registerRollout` 写的 rollout 行 + worker 的 `resumeRollouts()`）。
+ * 这是刻意的取舍，不是遗漏：**不允许**为了"恢复服务"把归属改回去
  * （epoch 永不回退，§8 一），也不允许放宽两阶段交接。
+ *
+ * 第 5 步若在 **desired 尚未提交**时被拒（例如 expected_revision 冲突），则相反：
+ * 本次刚认领的 candidate lease 必须立即显式释放；否则 candidate 心跳会持续续约一个
+ * 根本没有对应 desired runtime 的归属，短暂中断会变成永久漂移。
  *
  * ── 为什么不自己下发 ──
  *
@@ -91,6 +96,8 @@ export const FAILOVER_EXECUTOR_REASONS = [
   "claim_rejected",
   /** 认领回来的 epoch ≠ expected + 1：读与认领之间有人抢先迁移。 */
   "claim_epoch_unexpected",
+  /** 认领成功但后续变更被拒时，释放刚认领的 lease 失败：状态不确定，必须收敛。 */
+  "claim_cleanup_failed",
   /** 既有变更路径因并发编辑冲突而拒绝（用户正在编辑同一条 Forward）。 */
   "placement_move_conflict",
   /** 既有变更路径拒绝（VALIDATE 不放行 / 校验失败 / 节点不可用）。 */
@@ -113,6 +120,7 @@ const FAILOVER_EXECUTOR_REASON_TEXT: Record<FailoverExecutorReason, string> = {
   old_lease_still_live: "旧租约尚未过期：等待两阶段交接条件成立",
   claim_rejected: "认领归属被拒绝",
   claim_epoch_unexpected: "认领返回的 epoch 不是预期的新世代（有人抢先迁移）",
+  claim_cleanup_failed: "变更未提交，但刚认领的租约无法安全释放：归属状态需要收敛",
   placement_move_conflict: "该转发正在被并发编辑：本次迁移中止",
   placement_move_rejected: "既有变更路径拒绝了本次归属变更",
   placement_move_failed: "归属变更已提交，但下发失败（等待续跑）",
@@ -241,6 +249,16 @@ export interface FailoverExecutorDeps {
     revision: number;
     now: Date;
   }) => Promise<LeaseClaimResult>;
+  /**
+   * 释放刚刚由本执行器认领、但后续 desired 变更被拒的 lease。
+   * 只在 claim.changed_owner=true 且 move=rejected 时调用；failed 表示 desired
+   * 可能已提交，不能释放。
+   */
+  releaseLease: (input: {
+    tunnelId: number;
+    nodeId: number;
+    now: Date;
+  }) => Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" | "lost_race" }>;
   /** 提交归属变更（既有 rollout 路径）。 */
   applyPlacementMove: ApplyPlacementMove;
   /** 注入的时刻；缺省 = `new Date()`（唯一允许读时钟的地方）。 */
@@ -364,6 +382,7 @@ function outcomeFor(reason: FailoverExecutorReason): FailoverOutcome {
       return "hold";
     case "old_lease_still_live":
       return "waiting";
+    case "claim_cleanup_failed":
     case "placement_move_failed":
       return "failed";
     case "moved":
@@ -596,18 +615,83 @@ export async function executeFailoverForTunnel(
     };
   }
 
-  const leaseAfter = (await deps.loadLease(tunnelId).catch(() => null)) ?? claim.lease;
+  let leaseAfter = (await deps.loadLease(tunnelId).catch(() => null)) ?? claim.lease;
 
   if (move.kind === "rejected") {
     const conflict = move.code === "revision_conflict";
-    const reason: FailoverExecutorReason = conflict ? "placement_move_conflict" : "placement_move_rejected";
-    const detail = `${move.code ?? "rejected"}: ${move.message ?? ""}`.trim();
+    const rejectedReason: FailoverExecutorReason =
+      conflict ? "placement_move_conflict" : "placement_move_rejected";
+    const rejectedDetail = `${move.code ?? "rejected"}: ${move.message ?? ""}`.trim();
+
+    // The Forward change did NOT commit, so a lease that this attempt just moved
+    // must not remain on the candidate. Otherwise node heartbeats can keep
+    // renewing an owner that has no matching desired runtime indefinitely.
+    if (claim.changed_owner) {
+      let cleanup:
+        | { ok: true }
+        | { ok: false; reason: "not_owner" | "not_found" | "lost_race" };
+      try {
+        cleanup = await deps.releaseLease({
+          tunnelId,
+          nodeId: migration.to_node_id,
+          now,
+        });
+      } catch (error) {
+        const reason: FailoverExecutorReason = "claim_cleanup_failed";
+        const detail =
+          `${rejectedDetail}; lease release threw: ${error instanceof Error ? error.message : String(error)}`;
+        log({
+          level: "error",
+          event: "failed",
+          tunnel_id: tunnelId,
+          reason,
+          detail,
+          from_node_id: migration.from_node_id,
+          to_node_id: migration.to_node_id,
+          epoch: claim.epoch,
+        });
+        return {
+          ...decisionResult,
+          lease_before: leaseBefore,
+          lease_after: leaseAfter,
+          move,
+          outcome: "failed",
+          reason,
+          detail,
+        };
+      }
+      if (!cleanup.ok) {
+        const reason: FailoverExecutorReason = "claim_cleanup_failed";
+        const detail = `${rejectedDetail}; lease release rejected: ${cleanup.reason}`;
+        log({
+          level: "error",
+          event: "failed",
+          tunnel_id: tunnelId,
+          reason,
+          detail,
+          from_node_id: migration.from_node_id,
+          to_node_id: migration.to_node_id,
+          epoch: claim.epoch,
+        });
+        return {
+          ...decisionResult,
+          lease_before: leaseBefore,
+          lease_after: leaseAfter,
+          move,
+          outcome: "failed",
+          reason,
+          detail,
+        };
+      }
+      leaseAfter = { ...claim.lease, lease_expires_at: now };
+    }
+
     log({
       level: "warn",
       event: "abort",
       tunnel_id: tunnelId,
-      reason,
-      detail,
+      reason: rejectedReason,
+      detail: rejectedDetail,
       from_node_id: migration.from_node_id,
       to_node_id: migration.to_node_id,
       epoch: claim.epoch,
@@ -618,8 +702,8 @@ export async function executeFailoverForTunnel(
       lease_after: leaseAfter,
       move,
       outcome: "aborted",
-      reason,
-      detail,
+      reason: rejectedReason,
+      detail: rejectedDetail,
     };
   }
 
@@ -716,7 +800,8 @@ export interface FailoverFactsReaderOptions {
   readonly loadLease?: (tunnelId: number) => Promise<PlacementLeaseRow | null>;
   /**
    * 可用端口数（默认 = `portPool.availablePorts`，真库）。
-   * 不抛：读不到按 0 处理（fail-closed —— 没有可靠端口事实就不迁移）。
+   * 读取失败必须向上冒泡：0 是一个真实的容量事实，不能拿它伪装 IO 故障。
+   * 上层会把整次事实读取折成 db_unavailable，从而不做自动迁移。
    */
   readonly portAvailability?: (nodeId: number) => Promise<number>;
   /**
@@ -809,28 +894,41 @@ export async function readFailoverDecisionFacts(
     // 否则策略会"从节点 0 迁移"，那是一个凭空捏造的归属事实。
     return { ok: false, code: "no_placement", detail: `tunnel ${tunnelId} 没有入口归属` };
   }
-  const destinations = await options.destinations({
-    tunnel_id: tunnelId,
-    workspace_id: workspaceId,
-    owner_node_id: ownerNodeId ?? null,
-  });
-  const policy = await options.policy({ tunnel_id: tunnelId, workspace_id: workspaceId });
-
-  const ownerFacts = await readNodeFacts(options.db, ownerNodeId, now);
-
-  const observations = await readObservations(options, tunnelId, tunnel, now);
-  const candidate = await readDestination(options, destinations.candidate_node_id, now);
-  const preferredId = destinations.preferred_node_id;
+  let destinations: FailoverDestinations;
+  let policy: FailoverPolicyFacts;
+  let ownerFacts: { reachable: boolean; last_seen_at: Date | null };
+  let observations: FailoverInput["target_observations"];
+  let candidate: FailoverCandidateFacts | null;
+  let preferredId: number | null;
   let failback: FailbackFacts | null = null;
-  if (preferredId !== null && preferredId !== ownerNodeId) {
-    const preferred = await readDestination(options, preferredId, now);
-    if (preferred !== null) {
-      const checks = (await options.failbackHealthyChecks?.(tunnelId)) ?? 0;
-      failback = { candidate: preferred, healthy_checks: checks };
-    }
-  }
+  let migrated: { at: Date | string | number | null; kind: MigrationKind | null } | null;
 
-  const migrated = await readLastMigration(options, tunnelId);
+  try {
+    destinations = await options.destinations({
+      tunnel_id: tunnelId,
+      workspace_id: workspaceId,
+      owner_node_id: ownerNodeId ?? null,
+    });
+    policy = await options.policy({ tunnel_id: tunnelId, workspace_id: workspaceId });
+    ownerFacts = await readNodeFacts(options.db, ownerNodeId, now);
+    observations = await readObservations(options, tunnelId, tunnel, now);
+    candidate = await readDestination(options, destinations.candidate_node_id, now);
+    preferredId = destinations.preferred_node_id;
+    if (preferredId !== null && preferredId !== ownerNodeId) {
+      const preferred = await readDestination(options, preferredId, now);
+      if (preferred !== null) {
+        const checks = (await options.failbackHealthyChecks?.(tunnelId)) ?? 0;
+        failback = { candidate: preferred, healthy_checks: checks };
+      }
+    }
+    migrated = await readLastMigration(options, tunnelId);
+  } catch (e) {
+    return {
+      ok: false,
+      code: "db_unavailable",
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
 
   return {
     ok: true,
@@ -866,17 +964,15 @@ async function readNodeFacts(
   now: Date,
 ): Promise<{ reachable: boolean; last_seen_at: Date | null }> {
   const row = record(
-    await db.node
-      .findUnique({
-        where: { id: nodeId },
-        select: {
-          status: true,
-          last_seen_at: true,
-          node_credential_hash: true,
-          credential_revoked: true,
-        },
-      })
-      .catch(() => null),
+    await db.node.findUnique({
+      where: { id: nodeId },
+      select: {
+        status: true,
+        last_seen_at: true,
+        node_credential_hash: true,
+        credential_revoked: true,
+      },
+    }),
   );
   if (!row) return { reachable: false, last_seen_at: null };
   const lastSeen = row.last_seen_at instanceof Date ? row.last_seen_at : null;
@@ -911,9 +1007,10 @@ async function readObservations(
   const poolId = asNodeId(tunnel.egress_pool_id);
   if (poolId !== null && options.db.egressPool) {
     const pool = record(
-      await options.db.egressPool
-        .findUnique({ where: { id: poolId }, select: { targets: { select: { host: true, port: true } } } })
-        .catch(() => null),
+      await options.db.egressPool.findUnique({
+        where: { id: poolId },
+        select: { targets: { select: { host: true, port: true } } },
+      }),
     );
     const targets = Array.isArray(pool?.targets) ? (pool!.targets as unknown[]) : [];
     for (const entry of targets) {
@@ -924,25 +1021,20 @@ async function readObservations(
   }
   if (keys.length === 0) return { observers: [] };
 
-  let rows: unknown[];
-  try {
-    rows = (await options.db.targetObservation.findMany({
-      where: { target_key: { in: keys } },
-      select: {
-        node_id: true,
-        target_key: true,
-        reachable: true,
-        latency_ms: true,
-        consecutive_success: true,
-        consecutive_failure: true,
-        success_rate: true,
-        observed_at: true,
-        observation_source: true,
-      },
-    })) as unknown[];
-  } catch {
-    return { observers: [] };
-  }
+  const rows = (await options.db.targetObservation.findMany({
+    where: { target_key: { in: keys } },
+    select: {
+      node_id: true,
+      target_key: true,
+      reachable: true,
+      latency_ms: true,
+      consecutive_success: true,
+      consecutive_failure: true,
+      success_rate: true,
+      observed_at: true,
+      observation_source: true,
+    },
+  })) as unknown[];
 
   const observers: FailoverObservedTarget[] = [];
   for (const entry of rows) {
@@ -991,11 +1083,8 @@ async function readDestination(
   if (nodeId === null) return null;
   const { reachable } = await readNodeFacts(options.db, nodeId, now);
   const count = options.portAvailability
-    ? await options.portAvailability(nodeId).catch(() => 0)
-    : await (await import("./portPool.ts"))
-        .availablePorts(nodeId)
-        .then((ports) => ports.length)
-        .catch(() => 0);
+    ? await options.portAvailability(nodeId)
+    : (await (await import("./portPool.ts")).availablePorts(nodeId)).length;
   return { node_id: nodeId, reachable, port_available: count > 0, port_available_count: count };
 }
 
@@ -1006,13 +1095,11 @@ async function readLastMigration(
 ): Promise<{ at: Date | string | number | null; kind: MigrationKind | null } | null> {
   if (options.lastMigration) return options.lastMigration(tunnelId);
   const row = record(
-    await options.db.forwardRollout
-      .findFirst({
-        where: { tunnel_id: tunnelId, strategy: "node_migration" },
-        orderBy: { id: "desc" },
-        select: { created_at: true },
-      })
-      .catch(() => null),
+    await options.db.forwardRollout.findFirst({
+      where: { tunnel_id: tunnelId, strategy: "node_migration" },
+      orderBy: { id: "desc" },
+      select: { created_at: true },
+    }),
   );
   if (!row) return null;
   const createdAt = row.created_at;
@@ -1045,6 +1132,7 @@ export function defaultFailoverExecutorDeps(options: DefaultFailoverExecutorOpti
     readDecisionFacts: (input) => readFailoverDecisionFacts(input, readerOptions),
     loadLease: async (tunnelId) => (await import("./placement-lease.ts")).loadLease(tunnelId),
     claimLease: async (input) => (await import("./placement-lease.ts")).claimLease(input),
+    releaseLease: async (input) => (await import("./placement-lease.ts")).releaseLease(input),
     applyPlacementMove: async (request) => {
       // 迁移只走既有变更路径（forward-service.patchForward → registerRollout →
       // 五阶段 rollout 的 node_migration 计划）。本模块不构造第二套下发序列。

@@ -39,7 +39,7 @@ export function federationAuth(): MiddlewareHandler {
 
     // 先克隆再读：读掉原始流会让 handler 拿到空 body。
     const rawBody = await c.req.raw.clone().text();
-    const verified = await verifyInboundRequest({ headers: c.req.raw.headers, rawBody, path });
+    const verified = await verifyInboundRequest({ headers: c.req.raw.headers, rawBody, path, method: c.req.method });
     if (!verified.ok) {
       return c.json(
         federationErrorBody(verified.code, verified.message, verified.peer_panel_id, verified.messageId ?? undefined),

@@ -295,6 +295,35 @@ describe("A. 五份事实的对比（§7.12 对比清单）", () => {
     expect(isNodeUnreachable(node({ last_seen_at: fresh, reported_at: fresh }), NOW)).toBe(false);
   });
 
+  test("last_seen 落后但 state report 新鲜时仍视为在线", () => {
+    const stale = new Date(NOW.getTime() - DEFAULT_NODE_STALE_AFTER_MS - 1);
+    const freshReport = new Date(NOW.getTime() - 1_000);
+    expect(
+      isNodeUnreachable(
+        node({ last_seen_at: stale, reported_at: freshReport }),
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  test("RELAY 折叠节点也使用最新活动时间，不因旧 last_seen 压掉自动修复", async () => {
+    const stale = new Date(NOW.getTime() - DEFAULT_NODE_STALE_AFTER_MS - 1);
+    const freshReport = new Date(NOW.getTime() - 1_000);
+    const rec = recordingSink();
+    const out = await executeReconcile(
+      depsFrom(
+        [tunnel({ applied_revision: 5 })],
+        [agent({ revision: 5 })],
+        [node({ last_seen_at: stale, reported_at: freshReport })],
+        { sink: rec.sink },
+      ),
+    );
+
+    expect(out.findings.some((x) => x.code === "node_unreachable")).toBe(false);
+    expect(out.resent).toBe(1);
+    expect(rec.calls).toEqual([{ tunnel_id: 1, revision: 7 }]);
+  });
+
   test("从未心跳（last_seen/reported 皆 null）→ 视为不可达", () => {
     expect(isNodeUnreachable(node({ last_seen_at: null, reported_at: null }), NOW)).toBe(true);
   });
@@ -576,6 +605,29 @@ describe("F. 多隧道合并与统计", () => {
     const codes = out.findings.filter((f: Finding) => f.severity === "error").map((f: Finding) => f.code);
     expect(codes).toContain("error_state");
     expect(codes).toContain("node_unreachable");
+  });
+
+  test("子系统失败必须进入 failed + structured finding，而不是只打一条日志", async () => {
+    const out = await executeReconcile(
+      depsFrom([tunnel()], [agent()], [node()], {
+        reconcileLeases: async () => {
+          throw new Error("lease db down");
+        },
+        federatedForwardHealth: async () => {
+          throw new Error("federation db down");
+        },
+        failoverSweep: async () => {
+          throw new Error("failover db down");
+        },
+      }),
+    );
+
+    expect(out.failed).toBe(3);
+    const subsystemFindings = out.findings.filter((f) => f.code === "subsystem_failed");
+    expect(subsystemFindings).toHaveLength(3);
+    expect(subsystemFindings.map((f) => f.detail).join("\n")).toContain("lease db down");
+    expect(subsystemFindings.map((f) => f.detail).join("\n")).toContain("federation db down");
+    expect(subsystemFindings.map((f) => f.detail).join("\n")).toContain("failover db down");
   });
 
   test("租约回收抛错不阻断整轮（error finding，隧道级结果照常）", async () => {

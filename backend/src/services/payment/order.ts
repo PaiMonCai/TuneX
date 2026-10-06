@@ -313,26 +313,31 @@ export class TopupOrderService {
         );
       }
 
-      // ④ 入账：余额 increment + 订单置 success + 流水
+      // ④ 先原子 claim 订单状态，再改余额。仅凭事务内先读后写不足以防住
+      // 两个并发回调同时读到 pending 后重复入账；条件更新把状态迁移变成 CAS。
       const totalAmount = order.price + order.bonus;
-
-      const updatedUser = await tx.user.update({
-        where: { id: order.user_id },
-        data: { balance: { increment: totalAmount } },
-        select: { balance: true },
-      });
-
-      const updated = await tx.topupOrder.updateMany({
-        where: { id: order.id },
+      const claimed = await tx.topupOrder.updateMany({
+        where: { id: order.id, status: order.status },
         data: {
           status: "success",
           balance: { increment: totalAmount },
           ...(notify.trade_id ? { trade_id: notify.trade_id } : {}),
         },
       });
-      if (updated.count !== 1) {
+      if (claimed.count !== 1) {
+        const current = await tx.topupOrder.findUnique({ where: { id: order.id }, select: { status: true } });
+        if (current?.status === "success") {
+          this.logger.warn(`concurrent duplicate callback ignored: ${notify.order_id}`);
+          return { credited: false, order_id: notify.order_id };
+        }
         throw new OrderStateError(`订单更新失败（并发冲突）: ${notify.order_id}`);
       }
+
+      const updatedUser = await tx.user.update({
+        where: { id: order.user_id },
+        data: { balance: { increment: totalAmount } },
+        select: { balance: true },
+      });
 
       await tx.balanceLog.create({
         data: {
@@ -416,15 +421,16 @@ export class TopupOrderService {
     }
 
     const totalAmount = order.price + order.bonus;
-    await db.$transaction(async (tx) => {
+    const credited = await db.$transaction(async (tx) => {
+      const claimed = await tx.topupOrder.updateMany({
+        where: { id: order.id, status: order.status },
+        data: { status: "success", balance: { increment: totalAmount } },
+      });
+      if (claimed.count !== 1) return false;
       const updatedUser = await tx.user.update({
         where: { id: order.user_id },
         data: { balance: { increment: totalAmount } },
         select: { balance: true },
-      });
-      await tx.topupOrder.update({
-        where: { id: order.id },
-        data: { status: "success", balance: { increment: totalAmount } },
       });
       await tx.balanceLog.create({
         data: {
@@ -443,7 +449,9 @@ export class TopupOrderService {
           bonus: order.bonus,
         });
       }
+      return true;
     });
+    if (!credited) return false;
     await this.scheduler.cancel?.(order.id);
     return true;
   }

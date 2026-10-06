@@ -199,7 +199,13 @@ export interface Drift {
 
 /** finding：记录但不自动执行（或已自动执行）的事实。 */
 export interface Finding {
-  code: DriftKind | "orphan_lease_released" | "retry_deferred" | "resend_skipped" | "lease_owner_unconfirmed";
+  code:
+    | DriftKind
+    | "orphan_lease_released"
+    | "retry_deferred"
+    | "resend_skipped"
+    | "lease_owner_unconfirmed"
+    | "subsystem_failed";
   severity: Severity;
   detail: string;
   tunnel_id?: number;
@@ -278,6 +284,14 @@ export function isModeMismatch(t: DesiredTunnel, agent: AgentTunnelState | null)
  * `node !== null && !isNodeUnreachable(...)` 必须一致的原因——两边答案不同
  * 就会出现「判定说该重发、执行层又不发」的漂移。
  */
+function latestNodeActivityMs(node: NodeOnlineInput): number | null {
+  const candidates = [node.last_seen_at, node.reported_at]
+    .filter((value): value is Date => value != null)
+    .map((value) => new Date(value).getTime())
+    .filter(Number.isFinite);
+  return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
 export function isNodeUnreachable(
   node: NodeOnlineInput | null | undefined,
   now: Date,
@@ -285,9 +299,12 @@ export function isNodeUnreachable(
 ): boolean {
   if (!node) return true;
   if (node.status === "inactive") return true;
-  const seen = node.last_seen_at ?? node.reported_at ?? null;
-  if (!seen) return true; // 从未有心跳/上报 —— 不删资源，但也不自动下发
-  return now.getTime() - new Date(seen).getTime() > staleAfterMs;
+  // Both timestamps are panel-side facts. last_seen_at is refreshed fail-soft
+  // after a state report, so it may lag behind a fresh reported_at when that
+  // secondary update fails. Reachability must use the freshest known fact.
+  const seenMs = latestNodeActivityMs(node);
+  if (seenMs === null) return true; // 从未有心跳/上报 —— 不删资源，但也不自动下发
+  return now.getTime() - seenMs > staleAfterMs;
 }
 
 /** 上一次 apply 是否以 error 收尾。 */
@@ -900,8 +917,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     // 同一 node_id 多行时取「更新鲜」的那份（last_seen_at / reported_at 取大）。
     if (!prev) nodeById.set(n.node_id, n);
     else {
-      const ts = (x: NodeOnlineInput) =>
-        Math.max(x.last_seen_at ? new Date(x.last_seen_at).getTime() : 0, x.reported_at ? new Date(x.reported_at).getTime() : 0);
+      const ts = (x: NodeOnlineInput) => latestNodeActivityMs(x) ?? 0;
       nodeById.set(n.node_id, ts(n) > ts(prev) ? n : prev);
     }
   }
@@ -1000,7 +1016,16 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         log("[reconciler] federated forward health", { ...federatedHealth });
       }
     } catch (e) {
-      log("federated forward health failed", { detail: e instanceof Error ? e.message : String(e) });
+      const detail = e instanceof Error ? e.message : String(e);
+      failed++;
+      findings.push({
+        code: "subsystem_failed",
+        severity: "error",
+        detail: `联邦 Forward 健康收口失败：${detail}`,
+        auto_action: null,
+        suppressed: [],
+      });
+      log("federated forward health failed", { detail });
     }
   }
 
@@ -1021,8 +1046,9 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         });
       }
     } catch (e) {
+      failed++;
       findings.push({
-        code: "resend_skipped",
+        code: "subsystem_failed",
         severity: "error",
         detail: `租约回收失败：${(e as Error)?.message ?? String(e)}`,
         auto_action: null,
@@ -1053,9 +1079,18 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         log("failover sweep", { moved: failoverSummary.moved, evaluated: failoverSummary.evaluated });
       }
     } catch (e) {
-      // 迁移评估失败绝不阻断本轮 reconcile：下一轮会自然重试，且失败本身已由
-      // 执行器的结构化结果记账（这里只保证不影响其它动作）。
-      log("failover sweep failed", { detail: e instanceof Error ? e.message : String(e) });
+      // 迁移评估失败绝不阻断本轮 reconcile，但也不能只写一条日志然后让
+      // summary.failed 继续显示 0；worker/告警层需要知道这一拍并未完整收敛。
+      const detail = e instanceof Error ? e.message : String(e);
+      failed++;
+      findings.push({
+        code: "subsystem_failed",
+        severity: "error",
+        detail: `failover 评估失败：${detail}`,
+        auto_action: null,
+        suppressed: [],
+      });
+      log("failover sweep failed", { detail });
     }
   }
 
@@ -1199,11 +1234,7 @@ function pickNode(
     ? "inactive"
     : "active";
 
-  const seen = (n: NodeOnlineInput): number | null => {
-    const d = n.last_seen_at ?? n.reported_at ?? null;
-    return d ? new Date(d).getTime() : null;
-  };
-  const seenValues = boundNodes.map(seen);
+  const seenValues = boundNodes.map(latestNodeActivityMs);
   const oldest =
     seenValues.some((v) => v == null)
       ? null

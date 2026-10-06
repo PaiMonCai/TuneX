@@ -539,10 +539,10 @@ function parseAgentAck(
   if (raw === null || raw === undefined) return { ok: true };
   if (typeof raw !== "object") return { ok: false, error: `非对象响应体: ${String(raw)}` };
   const r = raw as Record<string, unknown>;
-  // 没有 ok 字段时按「老 agent」处理：不矫情，乐观放行（revision 仍会在
-  // 下一步由 validator 兜底校验）。
-  if (r.ok === undefined) return { ok: true };
-  if (r.ok === false || r.ok === 0 || r.ok === "") {
+  // Production semantics are fail-closed: an object response must explicitly
+  // acknowledge success. Treating a missing/odd `ok` field as success can turn
+  // an error-shaped legacy payload into an applied command.
+  if (r.ok !== true) {
     const err = r.error ?? r.message ?? r.reason;
     const code =
       typeof err === "string" && /revision mismatch|revision_mismatch/i.test(err)
@@ -551,10 +551,21 @@ function parseAgentAck(
     return {
       ok: false,
       error_code: typeof r.error_code === "string" ? r.error_code : code,
-      error: typeof err === "string" ? err : err === undefined ? undefined : String(err),
+      error:
+        typeof err === "string"
+          ? err
+          : err === undefined
+            ? `Agent response must contain {ok:true}; received ok=${String(r.ok)}`
+            : String(err),
     };
   }
   const rev = r.applied_revision ?? r.revision;
+  if (
+    rev !== undefined &&
+    (typeof rev !== "number" || !Number.isSafeInteger(rev) || rev < 0)
+  ) {
+    return { ok: false, error: `invalid applied_revision: ${String(rev)}` };
+  }
   return {
     ok: true,
     applied_revision: typeof rev === "number" ? rev : undefined,
@@ -860,7 +871,7 @@ export class Orchestrator {
     tunnelId: number;
     nodeId: number;
     now?: Date;
-  }): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" }> {
+  }): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" | "lost_race" }> {
     return releasePlacementLease({
       tunnelId: input.tunnelId,
       nodeId: input.nodeId,
@@ -1373,11 +1384,13 @@ export class Orchestrator {
         },
       });
     } catch (e) {
-      const code =
-        e instanceof AgentTransportError ? e.code : RELAY_DISPATCH_ERROR_CODES.agent_unreachable;
+      // Transport already succeeded above. A failure here means the returned ACK
+      // cannot be represented by the frozen control protocol, so classify it as
+      // an invalid ACK rather than a network reachability failure.
+      const code = RELAY_DISPATCH_ERROR_CODES.ack_invalid;
       const msg = e instanceof Error ? e.message : String(e);
-      // transport 失败 = 命令没到/没成。回一条 failed ack 让 validator 记账：
-      // 失败不推进 applied_revision，同 revision 重试仍会真的重发。
+      // Record a failed ACK locally so the revision does not advance and the same
+      // revision can be retried after the peer is fixed.
       await this.validator
         .handle(
           createCommand({

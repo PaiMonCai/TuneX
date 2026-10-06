@@ -186,8 +186,24 @@ func TestSingleHopSetUpstreamUnreachableTargetKeepsListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSingleHop: %v", err)
 	}
-	if err := fwd.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+	// freePort necessarily closes its probe listener before SingleHop can bind.
+	// On a busy CI host the kernel may hand that just-freed ephemeral port to
+	// another socket in the tiny gap. Retry with a fresh ephemeral port instead
+	// of turning an allocator race into a data-plane failure.
+	for attempt := 0; ; attempt++ {
+		err = fwd.Start()
+		if err == nil {
+			break
+		}
+		if attempt >= 4 || !strings.Contains(strings.ToLower(err.Error()), "address already in use") {
+			t.Fatalf("Start: %v", err)
+		}
+		_ = fwd.Stop()
+		port = freePort(t)
+		fwd, err = NewSingleHop(singleHopCfg(t, port, live))
+		if err != nil {
+			t.Fatalf("NewSingleHop retry: %v", err)
+		}
 	}
 	defer func() { _ = fwd.Stop() }()
 
