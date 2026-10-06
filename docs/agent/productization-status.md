@@ -1051,6 +1051,23 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 
 ⇒ 这三条正好覆盖评审 §11 给出的**闭合三选一**（worker 那一拍日志落盘 / 库身份 / 不清理重跑），因此 **`#10` 要件 ① 有望从"部分支撑"改判"支撑"**——但**尚未经评审复核**，故本节只记录事实、**不改判定**。
 
+## 3.48 Round 51：用户新规则生效（**决策先复用 ForwardX 逻辑**）+ 第一批待决项的裁决
+
+**用户新指令**："继续，上限提到 100；任何决策优先复用 ForwardX 的逻辑；有问题先看它怎么处理，然后复用；没有的向我报告。"
+**Lead 的口径确认**：与 Round 46 的"**不要复刻**"兼容——**复用它的逻辑/方案，代码按本项目适配，不逐字复制**。goal 上限已提到 **100** 并重新 arm（revision 7）。
+
+### 第一批待决项的裁决（四条，全部先查 ForwardX）
+| 待决项 | ForwardX 的处理方式（证据） | 裁决 |
+|---|---|---|
+| **A1 按转发自定义成员次序**（此前因"要改 schema"被规则挡住） | `drizzle/schema.ts:441` **`forward_group_members` 专用表**：`groupId/memberType/hostId/tunnelId/connectHost/**priority**/isEnabled`（+ 每成员健康列）；另有 `:465` 事件表 | **复用其表结构逻辑 ⇒ schema 变更获批准**（`task-43`）。**但不搬健康列**（会是我们的第二份真相） |
+| **A2 "保存≠投递"是否落 `not_configured` 行** | 全仓**没有投递账本**、没有 `not_configured` 概念（未配置就跳过） | **它没有对应处理 ⇒ 报告**（我倾向保持我们现状：账本 + 零行；改契约属另立切片） |
+| **A3 traceroute/traceroute6 不可用** | `lookingGlassAgentTasks.ts:3` 的 7 方法 + agent 直接跑命令返回 `output/exitCode/timedOut`（**假定宿主有能力**）⇒ 它**没有"不可用方法"概念** | **复用其能力、实现适配我们的无特权模型**：`apk add iputils` 提供 **`tracepath`**，Lead 已在生产 caps 实测 **无特权真的出跳**（`172.17.0.1 → 10.1.32.1`；v6 如实 `send failed`）⇒ `task-42`：方法集 3 → **5**，`unavailable_methods` 只留 `mtr/mtr6` |
+| **A4 CSRF 方法不对称** | ForwardX = `sameSite:"lax"` + tRPC，**全仓无 CSRF token** | 复用其逻辑 = **一套统一机制**。核实：我们的 `checkCsrf` **本就是统一的**（`core.ts:96` 对所有 mutating 方法都带 `X-CSRF-Token`）；web-ddns 观测到的"DELETE 要 Origin"只影响**脚本客户端**（浏览器必带 Origin）⇒ **记为文档注意事项，不改安全中间件** |
+
+### 派发
+- **`task-42`**（`backend-truth`）：`task-40` 的剩余项（面板消费节点方法能力 → `method_unavailable_on_node`、**Web 侧消费 `caps.methods`/`unavailable_methods`**、走 agent 代码路径的真机 traceroute 证据）+ 用 `tracepath` 实现 traceroute/traceroute6（**不放开 CAP_NET_RAW**）。
+- **`task-43`**（`ha-ui`）：`forward_ingress_member` 表 + 按转发自定义入口成员次序（**schema 变更已批准**），含"无行时行为与今天逐字一致"的断言、`priority[0]` 与 `preferred_ingress_node_id` 由同一写入路径维护、UI 拖动排序但保留全部诚实纪律。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
