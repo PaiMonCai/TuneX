@@ -4,7 +4,7 @@
  * 三件事：
  *   A. `forwardProductStatus()` 的组合表（apply_status × revision 关系）；
  *   B. `applyErrorAction()` 的**键集与后端一致**（直接读
- *      `backend/src/services/scheduler.ts` 源码做集合断言），且 `retryable`
+ *      `backend/src/services/scheduler-contract.ts` 契约源码做集合断言），且 `retryable`
  *      分流与后端 `RETRYABLE` 一致；
  *   C. 静态守卫：产品状态只有一处实现（`lib/forward-status.ts`），列表页 /
  *      详情页 / Dashboard **不得**再自己判 `applied < desired`，也**不得**把
@@ -96,7 +96,7 @@ describe("A. forwardProductStatus 组合表", () => {
 });
 
 describe("B. 错误码表与后端 SCHEDULER_ERROR_CODES 一致", () => {
-  const scheduler = readBackend("services/scheduler.ts");
+  const scheduler = readBackend("services/scheduler-contract.ts");
 
   function backendCodes(): string[] {
     const start = scheduler.indexOf("export const SCHEDULER_ERROR_CODES");

@@ -170,7 +170,7 @@ describe("C. 列表字段名与后端响应映射一致", () => {
 });
 
 describe("E. api.admin.federation.* 路径与后端一一对应", () => {
-  const apiSrc = readFileSync(resolve(REPO_ROOT, "web/src/lib/api.ts"), "utf8");
+  const apiSrc = readFileSync(resolve(REPO_ROOT, "web/src/lib/api/admin.ts"), "utf8");
   const fedBlock = apiSrc.slice(apiSrc.indexOf("federation: {"), apiSrc.indexOf("  },\n};", apiSrc.indexOf("federation: {")));
 
   test("每条后端管理端路由都能在 api 层找到（路径参数写成 ${…}）", () => {

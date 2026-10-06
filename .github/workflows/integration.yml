@@ -6,6 +6,7 @@ on:
       - "backend/**"
       - "agent/**"
       - "shared/**"
+      - "scripts/integration/**"
       - "scripts/v3-e2e/**"
       - "Dockerfile"
       - "agent/Dockerfile"
@@ -37,11 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Start PR topology
-        run: bash scripts/v3-e2e/setup.sh
+        run: bash scripts/integration/setup.sh
       # One current protocol suite owns the PR end-to-end signal. Historical
       # V4/V5 milestone gates remain available as diagnostics, never automatic.
       - name: Current protocol regression
-        run: python3 scripts/v3-e2e/v5-g1b.py
+        run: python3 scripts/integration/current-protocol.py
       - name: Upload PR integration evidence
         if: failure()
         uses: actions/upload-artifact@v7
@@ -52,7 +53,7 @@ jobs:
           retention-days: 14
       - name: Teardown PR integration topology
         if: always()
-        run: DELETE_IMAGES=1 bash scripts/v3-e2e/teardown.sh
+        run: DELETE_IMAGES=1 bash scripts/integration/teardown.sh
 
   # Build the exact release candidates once. They are pushed under a run-scoped
   # candidate tag so a retry of the same commit cannot replace the artefact that
@@ -188,25 +189,25 @@ jobs:
           docker pull "$WP14_AGENT_IMAGE"
 
       - name: Start candidate topology
-        run: bash scripts/v3-e2e/setup.sh
+        run: bash scripts/integration/setup.sh
 
       - name: Qualify current protocol surface
-        run: python3 scripts/v3-e2e/v5-g1b.py
+        run: python3 scripts/integration/current-protocol.py
 
       - name: Qualify multi-hop
-        run: python3 scripts/v3-e2e/v5-g4.py
+        run: python3 scripts/integration/multi-hop.py
 
       - name: Bootstrap federation peer
         env:
           API: http://127.0.0.1:18180
           FED_PANEL_B_HOST_PORT: "18181"
-        run: python3 scripts/v3-e2e/bootstrap-federation.py
+        run: python3 scripts/integration/bootstrap-federation.py
 
       - name: Qualify federation
         env:
           API: http://127.0.0.1:18180
           FED_PANEL_B_HOST_PORT: "18181"
-        run: python3 scripts/v3-e2e/v5-g5.py
+        run: python3 scripts/integration/federation.py
 
       - name: Upload qualification evidence
         if: always()
@@ -219,4 +220,4 @@ jobs:
 
       - name: Teardown qualification topology
         if: always()
-        run: DELETE_IMAGES=0 bash scripts/v3-e2e/teardown.sh
+        run: DELETE_IMAGES=0 bash scripts/integration/teardown.sh

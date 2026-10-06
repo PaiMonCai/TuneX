@@ -732,7 +732,7 @@ describe("D. 词条与接线", () => {
   test("接线：池面板引用了健康块；api 用的是后端的真实路径（单数 node）", () => {
     const panel = WEB("components/admin/node-egress-pools-panel.tsx");
     expect(panel).toContain("<PoolTargetHealth pool={pool} />");
-    const api = WEB("lib/api.ts");
+    const api = WEB("lib/api/admin.ts");
     expect(api).toContain("poolTargetHealth: (poolId: ID, cookie?: string)");
     expect(api).toContain("/admin/node/pools/${poolId}/health");
     expect(api).not.toContain("/admin/nodes/${poolId}/health");

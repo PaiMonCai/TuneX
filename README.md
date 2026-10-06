@@ -7,8 +7,7 @@
 
 ## 当前状态
 
-TuneX 已进入 **V1 产品化 / Production Beta 准备阶段**。V5 主线与 WP17–WP21 已合入 `main`；
-基线提交 `8d0ac83` 已通过 Source CI、完整 Integration、Unified Image 与 Release。
+TuneX 已进入 **V1 产品化 / Production Beta** 阶段。当前 `main` 是唯一工程基线；不要从 V3/V4/V5/WP 文档或旧提交推断当前能力，当前事实以代码、迁移、当前文档和 CI/Integration 结果为准。
 
 当前主要能力：
 
@@ -20,7 +19,7 @@ TuneX 已进入 **V1 产品化 / Production Beta 准备阶段**。V5 主线与 W
 - DDNS、公告、Email / Webhook / Telegram 通知渠道；
 - 延迟历史、链路拓扑、默认关闭的 Looking Glass；
 - Federation 的身份、信任、授权、远端租约、用量与产品级 remote egress；
-- 一键安装、备份/恢复/回滚、真实多 Agent Integration 与发布流水线。
+- 一键安装、备份/恢复/回滚、真实多 Agent Integration 与 build-once release 流水线。
 
 当前明确保持关闭的边界：QUIC、UDP 分片重组 / packets 计费 / hop AEAD/MAC / 跨面板 UDP、
 remote transit、跨面板 3+ hop / arbitrary graph、跨面板自动 failover、TLS remote egress 与多 Panel
@@ -65,7 +64,7 @@ Web / Backend ───── MySQL / Redis / Worker
                             Target
 ```
 
-Agent 只主动连接 Panel，不要求公网开放 Agent 管理端口。
+Agent 只主动连接 Panel，不要求公网开放 Agent 管理端口。更完整的当前架构见 [docs/architecture.md](docs/architecture.md)。
 
 ## 快速开始
 
@@ -96,37 +95,26 @@ curl http://localhost:8787/healthz
 
 推荐在管理界面创建 Node，再使用 Panel 生成的一键安装命令部署 Agent。
 
-本地验证：
-
 ```bash
 cd agent
 go test ./...
 go build ./...
 ```
 
-## 验证
+## 验证与发布
 
-当前冻结基线的主要 Gate：
+PR 走 Source CI + Fast Integration；`main` 通过 Source CI 后构建一次 Unified/Agent 候选镜像，
+完整 Integration 按候选 digest 验证，Release 只提升同一 digest，不重新构建。
 
-```text
-G0   contract compatibility     137/0
-G1A  TLS / WebSocket             73/0
-G1B  UDP DIRECT / RELAY          77/0
-G2   target intelligence         23/0
-G3   resilience / HA             50/0
-G4   multi-hop                   25/0
-G5   federation                 206/0
-G6   DDNS / placement            72/0
-G7   subscription billing        33/0
-```
+- [docs/testing.md](docs/testing.md)：当前测试层级、命令和 Gate；
+- [docs/release.md](docs/release.md)：当前 build-once / qualify / promote 发布流程；
+- [docs/production-deploy.md](docs/production-deploy.md)：生产部署、升级、备份、恢复与回滚。
 
-PR 走 Source CI + Fast Integration；`main` 在 Source CI 后只构建一次 Unified/Agent 候选镜像，完整 Integration 直接按候选 digest 验证，Release 只提升同一 digest，不重新构建。
-历史 Gate、冻结不变量与证据索引见 [DEVELOPMENT.md](DEVELOPMENT.md)。
+## 工程文档
 
-## 文档
-
-- [DEVELOPMENT.md](DEVELOPMENT.md)：冻结架构、Gate、不变量与 V1 产品化下一步；
-- [docs/production-deploy.md](docs/production-deploy.md)：生产部署、升级、备份、恢复与回滚；
-- [docs/release-notes-v4.md](docs/release-notes-v4.md)：V4 冻结兼容基线；
-- [docs/release-record-v4.5.md](docs/release-record-v4.5.md)：V4.5 历史发布记录；
-- [docs/tunex-devmap-v3.md](docs/tunex-devmap-v3.md)：历史架构与迁移背景。
+- [DEVELOPMENT.md](DEVELOPMENT.md)：当前开发入口；
+- [docs/architecture.md](docs/architecture.md)：当前架构与事实边界；
+- [docs/engineering.md](docs/engineering.md)：工程规则与变更纪律；
+- [docs/testing.md](docs/testing.md)：测试与验证；
+- [docs/release.md](docs/release.md)：发布流水线；
+- [docs/history/README.md](docs/history/README.md)：V3/V4/V5/WP 历史材料索引。

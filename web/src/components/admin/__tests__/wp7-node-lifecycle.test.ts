@@ -461,7 +461,7 @@ describe("WP7 接线", () => {
   const install = read("node-install-waiting.tsx");
   const detail = read("node-detail-manager.tsx");
   const nodes = read("nodes-manager.tsx");
-  const api = readFileSync(new URL("../../../lib/api.ts", import.meta.url), "utf8");
+  const api = readFileSync(new URL("../../../lib/api/admin.ts", import.meta.url), "utf8");
 
   test("api.ts 暴露四个生命周期端点", () => {
     expect(api).toContain("/admin/node/${id}/lifecycle");

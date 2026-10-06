@@ -35,7 +35,7 @@ const SERVICE_SRC = readFileSync(resolve(REPO_ROOT, "backend/src/services/route-
 const COMPILER_SRC = readFileSync(resolve(REPO_ROOT, "backend/src/services/route-profile-compiler.ts"), "utf8");
 /** 跳数上限的**唯一定义处**（compiler 只是 import 它）。 */
 const FORWARD_ROUTE_SRC = readFileSync(resolve(REPO_ROOT, "backend/src/services/forward-route.ts"), "utf8");
-const API_SRC = readFileSync(resolve(REPO_ROOT, "web/src/lib/api.ts"), "utf8");
+const API_SRC = readFileSync(resolve(REPO_ROOT, "web/src/lib/api/routeProfiles.ts"), "utf8");
 
 let state: MockRouteProfileState;
 /** 作用域 = 演示用户（id 1）的个人 workspace（mock 里是 id 1，种子的 4 条模板都在这里）。 */
@@ -379,7 +379,7 @@ describe("D. 行为契约（版本传播 / 只读 / 显式 apply / 可见性）"
 });
 
 describe("E. api.routeProfiles.* 路径与后端一一对应", () => {
-  const block = API_SRC.slice(API_SRC.indexOf("routeProfiles: {"), API_SRC.indexOf("  admin: {", API_SRC.indexOf("routeProfiles: {")));
+  const block = API_SRC;
 
   test("每条后端路由都能在 api 层找到", () => {
     const declared = [...ROUTES_SRC.matchAll(/routeProfilesRoutes\.(get|post|patch)\("([^"]+)"/g)].map((m) => m[2]);
