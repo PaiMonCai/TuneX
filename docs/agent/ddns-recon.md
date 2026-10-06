@@ -31,7 +31,35 @@ GET /api/forwards/1/dns → 200 { "data": {
 
 D4 已补三个读投影字段（`auto_resolve` / `attempt_count` / `next_attempt_at`，`DnsBindingState` 与 GET select 同步扩展，69 pass / 0 fail）——**上面这段样本来自 D4 之前的镜像，所以看不到它们**；切片开发时须以重建后的后端为准。
 
-## 2. 必须在 UI 里如实呈现的两条语义陷阱（首发不得提供）
+## 2. D4 已交付的最终读投影契约（Web 必须按此对齐）
+
+`GET/POST/DELETE /api/forwards/:id/dns` → `200 { data: DnsBindingState }`（404 `not_found`；403；400 `invalid_input`）
+
+```
+state: "unbound"|"pending"|"synced"|"synced_unverified"|"error"
+domain / record_type("A"|"AAAA"|"CNAME") / mode("multi_entry"|"single_active") / provider_id: number|null
+expected_values: string[]     confirmed_values: string[]
+synced_at: ISO|null           verified: boolean          last_error: string|null (≤120，已脱敏)
+auto_resolve: boolean                       ← NEW（列缺失/NULL/非 true → false）
+attempt_count: number|null                  ← NEW（state==="unbound" → null；否则 ≥0 整数）
+next_attempt_at: ISO-8601 UTC|null          ← NEW（无待重试失败 → null；**绝不用 0/空串顶替**）
+```
+
+**判定规则（含一条重要修正）**：
+- 「会重试」⇔ `auto_resolve === true && next_attempt_at !== null`。**只看 `next_attempt_at` 会读错**；"不会自动重试"必须同时看 `auto_resolve`。
+- 只有 `state === "synced"` 才可写"已切换"；`synced_unverified` = "已写入，尚未确认"；绑定成功只返回 `pending`（`verified:false`、`synced_at:null`、`confirmed_values:[]`），任何路径都不会返回 `synced`。
+- `state === "unbound"` 时**忽略其余字段**；未绑定行的 `expected_values` 仍可能是"当前 owner 地址"（既有行为）⇒ **不能当"已绑定"的证据**。
+- 三个新列的唯一写入方：`dns_auto_resolve` ← `ddns-binding` bind/unbind（unbind 写 false）；`dns_attempt_count` / `dns_next_attempt_at` ← `ddns-executor` 失败/成功分支（bind/unbind **不动**）。退避阶梯 5s/15s/60s/300s/900s；**不可重试错误写 `null`**。GET 纯读（测试断言 1 次 `findFirst`、0 次 `update`）。
+- Provider 侧：`GET /api/ddns/providers` 已暴露 `has_credential`，**永不含**封存 `config`。
+
+**"为什么没同步"的诚实三支（G4，D4 建议暂不新增端点）**：
+(a) `auto_resolve=true && provider_id=null` ⇒ 执行器第一分支 noop、永不写入 ⇒ 诚实说法是"不会写入 / 需要选择服务商"（现有字段足够）；
+(b) provider 行不存在或 `config` 未封存 ⇒ 用"选中的 `provider_id` 不在可见列表 / `has_credential=false`"表达；
+(c) `dns_path_unready` ⇒ 只有 `synced_at`/`verified`/`state` 是可见事实：`synced_at===null || state∈{pending,synced_unverified}` ⇒ "尚未确认写入"；`synced_at` 存在但偏旧 ⇒ **不表态**（阈值与探测结果是 worker 事实，前端自算就是被明令禁止的"前端自己算"）。
+
+**权限注意（既有接线，未放宽）**：`DELETE /api/forwards/:id/dns` 中间件预筛用 `forward:delete`、处理器再要 `forward:update` ⇒ 自定义角色需同时持有两把权限才能解绑（D4 已用测试钉住）。与"写 = forward:update"的注释不一致，属既有行为，需产品裁决。
+
+## 3. 必须在 UI 里如实呈现的两条语义陷阱（首发不得提供）
 
 - `multi_entry` 今天**只写 owner 单地址**（`ddns-successor.ts:243-261`）⇒ 不得把它当 HA/容灾卖点，否则会把客户端静默指向不服务的机器。
 - `CNAME` 会被执行器**写成一个 IP 值**（`ddns-executor.ts:309/415`）⇒ 首发不提供 CNAME 入口。
