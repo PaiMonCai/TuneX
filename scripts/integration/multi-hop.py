@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load_harness():
-    spec = importlib.util.spec_from_file_location("v5_g1a_harness", HERE / "protocol-suite.py")
+    spec = importlib.util.spec_from_file_location("integration_protocol_harness", HERE / "protocol-suite.py")
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         raise SystemExit("cannot load scripts/integration/protocol-suite.py as the harness module")
     module = importlib.util.module_from_spec(spec)
@@ -32,9 +32,10 @@ OUT = HERE / "evidence"
 OUT.mkdir(exist_ok=True)
 RESULT = OUT / "multi-hop-result.txt"
 
-ING = int(os.environ.get("MULTI_INGRESS", "3"))
-MID = int(os.environ.get("MULTI_MIDDLE", "5"))
-EGR = int(os.environ.get("MULTI_EGRESS", "4"))
+STATE = json.loads((HERE / "state.json").read_text(encoding="utf-8"))
+ING = int(os.environ.get("MULTI_INGRESS", STATE["nodes"]["ingress"]["id"]))
+MID = int(os.environ.get("MULTI_MIDDLE", STATE["nodes"]["ingress_secondary"]["id"]))
+EGR = int(os.environ.get("MULTI_EGRESS", STATE["nodes"]["egress"]["id"]))
 TARGET_PORT = int(os.environ.get("MULTI_TARGET_PORT", "3030"))
 OVERALL_SECONDS = int(os.environ.get("MULTI_OVERALL_SECONDS", "2400"))
 SERVE_TIMEOUT = int(os.environ.get("MULTI_SERVE_TIMEOUT", "240"))
@@ -332,7 +333,7 @@ def main():
             f"setup={'executed' if ready else 'incomplete'}\n"
             f"elapsed_seconds: {int(time.monotonic() - START)}\n"
             + "\n".join(H.RESULTS)
-            + f"\nV5-MULTI TOTAL PASS={H.PASS} FAIL={H.FAIL}\n",
+            + f"\ncurrent-MULTI TOTAL PASS={H.PASS} FAIL={H.FAIL}\n",
             encoding="utf-8",
         )
         H.release_lock()
