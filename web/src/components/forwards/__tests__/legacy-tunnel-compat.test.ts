@@ -172,7 +172,11 @@ describe("WP13 出口池候选（用户侧）", () => {
       "GET",
       "/egress-pools",
     );
-    expect(body.length).toBe(2);
+    // 3 = sg-out-01 的 sg-relay-pool（多目标）+ sg-out-02 的 default + jp-out-01 的
+    // jp-relay-pool（R2-C 补齐的**单目标 active 池**夹具：让延迟卡片的 ok 态在 mock
+    // 模式可达）。jp-out-01 本来就是 role=egress 的节点，而用户侧只列「出口能力节点上
+    // 的 active 池」，所以这条池出现是正确行为，不是回归。
+    expect(body.length).toBe(3);
     for (const p of body) {
       expect(p.node_label).toBeString();
       expect(p.targets.length).toBeGreaterThan(0);

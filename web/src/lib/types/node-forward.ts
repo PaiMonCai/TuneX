@@ -170,6 +170,16 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
    */
   tls_cert_path?: string;
   tls_key_path?: string;
+  /**
+   * 三跳（多跳）的中间跳（`backend/src/routes/forwards.ts:154` 的
+   * `middle_node_id: z.number().int().positive().nullable().optional()`）；省略 = 两段。
+   *
+   * 创建时服务端会校验**两段**邻接绑定（入口→中间、中间→出口）都存在，缺任何一段即
+   * 409 `binding_required`（`backend/src/services/forward-service.ts:764-783`）。
+   * 注意：`PortForward`（forwardView）**不含**中间跳 —— 列表/详情读数看不到它，
+   * 只有 `GET /forwards/:id/topology` 会给 `ingress_to_middle` / `middle_to_egress` 两段。
+   */
+  middle_node_id?: ID | null;
 }
 
 /**

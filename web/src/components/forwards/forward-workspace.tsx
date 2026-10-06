@@ -22,6 +22,7 @@ import { ForwardSummaryCards } from "@/components/forwards/forward-summary-cards
 import { ForwardToolbar } from "@/components/forwards/forward-toolbar";
 import { ForwardEmptyState } from "@/components/forwards/forward-empty-state";
 import { copiedForwardCreateDraft, emptyForwardCreateDraft } from "@/components/forwards/forward-create-model";
+import { multihopCreateFieldsFor, multihopFailureInfo } from "@/components/forwards/forward-multihop-model";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -233,6 +234,13 @@ export function ForwardWorkspace() {
   // "把取不到说成没有"。所以它们只用来把结论降级成"事实取不到"，不改变任何动作可用性。
   const [bindingsUnavailable, setBindingsUnavailable] = useState(false);
   const [referenceLoaded, setReferenceLoaded] = useState(false);
+  /**
+   * 绑定事实是否"不可信"（读取失败 / 还没读到 / 没有读权限）。
+   *
+   * 抽成一个值：同一个判据既要传给对话框（预览与中间跳都据此说"取不到"），
+   * 也要传给创建载荷的多跳判定 —— 两处各写一遍表达式必然漂移。
+   */
+  const bindingsFactsUnavailable = bindingsUnavailable || !referenceLoaded || !canReadNodes;
   async function loadReference() {
     const seq = ++referenceSeq.current;
     const scope = currentId;
@@ -479,6 +487,20 @@ export function ForwardWorkspace() {
         target_host: createDraft.targetHost.trim(),
         target_port: targetPortNum,
         egress_node_id: createDraft.mode === "relay" ? Number(createDraft.egressId) : null,
+        // 中间跳（三跳）：由同一个纯函数判定后生成 —— 不是 relay / 没选 / 选中的节点此刻
+        // 两段绑定不齐 / 事实取不到 ⇒ 一律**不发**这个键（不发一个必然 409 的字段，
+        // 也不在 DIRECT 上发它：后端对 DIRECT 的 middle_node_id 既不校验也不使用）。
+        ...multihopCreateFieldsFor({
+          mode: createDraft.mode,
+          ingressId: createDraft.ingressId,
+          egressId: createDraft.egressId,
+          middleNodeId: createDraft.middleNodeId ?? "",
+          canManageNodes,
+          workspaceId: currentId,
+          nodes: ingressNodes,
+          bindingsByIngress: bindingMapForDialog,
+          bindingsUnavailable: bindingsFactsUnavailable,
+        }),
         // 协议与（仅 tls 的）路径由同一个纯函数生成：非 tls 的请求里两个路径键
         // 结构上不存在，不存在「发出去再让 Agent 决定忽略」的字段。
         ...forwardProtocolFields(createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath),
@@ -489,7 +511,17 @@ export function ForwardWorkspace() {
       setPage(1);
       reloadList();
     } catch (err) {
-      toast.error(writeFailureText(err, t("forward.createFailed")));
+      /**
+       * 创建失败：既有的 `writeFailureText` 处理准入（`condition`）与编排错误；**多跳**
+       * 特有的那一条（409 `binding_required`：两段邻接绑定不齐）此前没人映射，用户只看到
+       * 后端原句、没有下一步 —— 这里把多跳模块给出的下一步接上。
+       *
+       * 只在多跳那一条码上追加（`multihopFailureInfo` 返回 `next === null` 时不加）：
+       * 其余错误码仍走既有唯一映射，不产生第二套判定。
+       */
+      const multihop = multihopFailureInfo(locale, err);
+      const next = multihop.code === "binding_required" && multihop.next ? ` ${multihop.next}` : "";
+      toast.error(`${writeFailureText(err, t("forward.createFailed"))}${next}`);
     } finally {
       setBusy(false);
     }
@@ -727,7 +759,10 @@ export function ForwardWorkspace() {
         availableEgressNodes={availableEgressNodes}
         // 事实取不到（读失败 / 还没读到 / 没读权限）时，预览必须说"取不到"，
         // 而不是"没有可用出口"；动作块保留（读取失败不代表绑定动作无效）。
-        bindingsUnavailable={bindingsUnavailable || !referenceLoaded || !canReadNodes}
+        bindingsUnavailable={bindingsFactsUnavailable}
+        // 中间跳判定要**第二段**（中间 → 出口），它挂在中间跳自己这个来源上：
+        // 只给"当前入口的绑定"不够，所以这里把按来源分组的整份事实一起交给对话框。
+        bindingsByIngress={bindingMapForDialog}
         workspaceId={currentId}
         canManageNodes={canManageNodes}
         bindingBusy={bindingBusy}

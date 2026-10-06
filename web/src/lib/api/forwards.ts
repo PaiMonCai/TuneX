@@ -259,9 +259,123 @@ export function summarizeForwardLedger(
   };
 }
 
+/* ================================================================== */
+/* 延迟历史（D6 只读端点）Web 侧契约                                     */
+/* ================================================================== */
+
+/**
+ * 「有没有数据」的四种形状 —— **稳定字符串，界面必须按它分支，而不是按 `series.length`**。
+ *
+ * 为什么不能按长度分支：`ok` 的序列里每个点都可能是 `latency_ms: null`（那次观测失败），
+ * 而 `no_samples` / `no_observer` / `ambiguous_target` 都返回空数组 —— 只看长度就会把
+ * 「这个窗口没有观测」「按构造不可能有观测」「拒绝猜目标」三种完全不同的真相，
+ * 一起渲染成「没有数据」。
+ *   · `ok`               —— 有真观测点（点内仍可能是 `null`）；
+ *   · `no_samples`       —— 观测维度成立，但窗口内一行都没有（**数据缺口**，不是 0ms）；
+ *   · `no_observer`      —— 按构造不可能有观测（DIRECT / 联邦出口 / 无池 / 无 active 目标 / 归属冲突）；
+ *   · `ambiguous_target` —— 出口池有多个目标：一次只答一条会藏起其余目标的抖动 ⇒ 拒绝猜。
+ */
+export type ForwardLatencyStatus = "ok" | "no_samples" | "no_observer" | "ambiguous_target";
+
+/** `no_observer` / `ambiguous_target` 的稳定原因码（界面按它给一句人话，不猜原因）。 */
+export type ForwardLatencyReason =
+  | "direct_not_observed"
+  | "federated_egress"
+  | "no_egress_pool"
+  | "no_active_target"
+  | "dimension_conflict"
+  | "multiple_targets";
+
+export type LatencyGranularity = "sample" | "hour";
+
+/** 服务端裁剪后的真实窗口（半开区间 `[from, to)`）。界面**照实回显**，不自己算窗口。 */
+export interface ForwardLatencyWindow {
+  from: string;
+  to: string;
+  hours: number;
+}
+
+/**
+ * 服务端推导的观测维度：**观测方节点 + 目标身份**。
+ *
+ * 这条线回答的是「某个节点的观测器看某个目标」，**不是**「这条转发」——界面必须把
+ * 维度说出来，否则用户会把一条出口节点的探测曲线当成整条转发的端到端延迟。
+ * 这两个值**只能**由服务端从已授权转发推导：`target_latency_sample` 没有 workspace 列，
+ * 让客户端指定 `target_key` 就是一个跨租户探针，所以 Web 侧**不提供**这两个参数。
+ */
+export interface ForwardLatencyDimension {
+  observer_node_id: number;
+  target_key: string;
+}
+
+export interface ForwardLatencyPoint {
+  /** 横轴：`sample` = 观测时刻；`hour` = 桶起点（UTC 整点）。ISO 串。 */
+  at: string;
+  /** 那次测得的延迟；**`null` = 那次没有测得（失败/超时）**，绝不是 0。 */
+  latency_ms: number | null;
+  samples: number;
+  successes: number;
+  failures: number;
+  latency_min_ms: number | null;
+  latency_max_ms: number | null;
+  observation_source: string;
+}
+
+/** `GET /api/forwards/:id/latency` 的响应体（200）。 */
+export interface ForwardLatencyResponse {
+  forward_id: number;
+  mode: "direct" | "relay";
+  granularity: LatencyGranularity;
+  window: ForwardLatencyWindow;
+  /** 没有可观测维度时为 `null`（此时 `status` 一定不是 `ok`/`no_samples`）。 */
+  dimension: ForwardLatencyDimension | null;
+  status: ForwardLatencyStatus;
+  reason: ForwardLatencyReason | null;
+  /** 仅 `ambiguous_target` 给出：池里有几个候选目标（只有数量，没有清单）。 */
+  candidate_targets?: number;
+  series: ForwardLatencyPoint[];
+  /** 命中点数上限被截断：**必须**显式呈现，否则截断过的线会被当成完整曲线。 */
+  truncated: boolean;
+}
+
+/**
+ * 各粒度的窗口硬上限（小时）。**只用于给界面提供合法的预设选项**：
+ * 真相永远在服务端——超限时服务端返回 400 `window_too_long`（带 `data.max_hours`），
+ * 界面照原样转述，不自己重算窗口、也不静默改小。
+ */
+export const LATENCY_WINDOW_MAX_HOURS: Record<LatencyGranularity, number> = {
+  sample: 24,
+  hour: 720,
+};
+
+/**
+ * 轮询下限 = 观测节拍（节点每 30s 观测/上报一次）。
+ *
+ * 比节拍更快只会重复读同一份档案：既不可能多出信息，又白耗面板与 DB。
+ * 界面用 {@link LATENCY_POLL_MS} 做自动刷新间隔，并对同一时刻的在途请求去重。
+ */
+export const LATENCY_POLL_MS = 30_000;
+
+/**
+ * 读延迟历史（只读、零副作用）。
+ *
+ * 参数只有 `granularity` 与窗口（`hours`，或 `from`+`to`）——**故意没有**任何
+ * `node_id` / `target_key` / `observation_source` 字段：维度是服务端事实，
+ * 客户端参数会被忽略（那是跨租户安全边界，不是一个可以试的选项）。
+ */
 export const forwardsApi = {
     summary: (cookie?: string) =>
       get<ForwardSummary>("/forwards/summary", undefined, cookie),
+    /**
+     * 延迟历史窗口的三种形态（与后端 `parseLatencyWindow` 一一对应）：
+     *   · `{ hours }` —— 最近 N 小时；`{ from, to }` —— 显式区间（二者互斥）。
+     * 窗口的最终裁剪以**响应里的 `window`** 为准。
+     */
+    latency: (
+      id: ID,
+      query: { granularity: LatencyGranularity; hours?: number; from?: string; to?: string },
+      cookie?: string,
+    ) => get<ForwardLatencyResponse>(`/forwards/${id}/latency`, query, cookie),
     /**
      * 列表支持服务端分页、排序和过滤。
      *
