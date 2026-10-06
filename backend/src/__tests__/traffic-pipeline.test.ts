@@ -516,9 +516,10 @@ describe("accumulateTraffic", () => {
 });
 
 describe("trafficDayKey", () => {
-  test("UTC 日界（与归档 date 列口径一致）", () => {
-    expect(trafficDayKey(new Date("2026-09-24T23:30:00.000Z"))).toBe("2026-09-24");
-    expect(trafficDayKey(new Date("2026-09-25T00:00:00.000Z"))).toBe("2026-09-25");
+  test("固定计费时区日界，不依赖进程 TZ", () => {
+    // 上海 00:00 = 前一日 16:00Z；归档 field 与计费窗口必须使用同一日历。
+    expect(trafficDayKey(new Date("2026-09-24T15:59:59.999Z"))).toBe("2026-09-24");
+    expect(trafficDayKey(new Date("2026-09-24T16:00:00.000Z"))).toBe("2026-09-25");
   });
 });
 
