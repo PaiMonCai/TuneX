@@ -986,6 +986,123 @@ describe("WP15 lease: release stops first, frees the port second, and is idempot
     }
   });
 
+  test("terminal authorization does not lie about unfinished runtime/port cleanup", async () => {
+    const revoked = makeLeaseDb({
+      leases: [
+        leaseRow({
+          state: "revoked",
+          last_error_code: "internal_error",
+          last_error: "teardown pending",
+        }),
+      ],
+    });
+    const revokedOutcome = await releaseRemoteLease(
+      { intent_id: "intent-1", revision: 9 },
+      { ...hooks(revoked.calls), db: revoked.db },
+    );
+    expect(revokedOutcome.ok).toBe(true);
+    if (revokedOutcome.ok) {
+      expect(revokedOutcome.stopped).toBe(false);
+      expect(revokedOutcome.port_released).toBe(false);
+    }
+
+    const portPending = makeLeaseDb({
+      leases: [
+        leaseRow({
+          state: "released",
+          last_error_code: PORT_RELEASE_PENDING_CODE,
+          last_error: "port pending",
+        }),
+      ],
+    });
+    const pendingOutcome = await releaseRemoteLease(
+      { intent_id: "intent-1", revision: 9 },
+      { ...hooks(portPending.calls), db: portPending.db },
+    );
+    expect(pendingOutcome.ok).toBe(true);
+    if (pendingOutcome.ok) {
+      expect(pendingOutcome.stopped).toBe(true);
+      expect(pendingOutcome.port_released).toBe(false);
+    }
+  });
+
+  test("replayed successful release returns current cleanup facts instead of hard-coded true/true", async () => {
+    const made = makeLeaseDb({
+      leases: [
+        leaseRow({
+          state: "released",
+          last_error_code: PORT_RELEASE_PENDING_CODE,
+          last_error: "port pending",
+        }),
+      ],
+      intents: [
+        {
+          id: 1,
+          intent_id: "intent-1",
+          peer_panel_id: "panel-a",
+          revision: 9,
+          action: "release",
+          status: "ok",
+          lease_id: 11,
+          error_code: null,
+          created_at: NOW,
+        },
+      ],
+    });
+    const outcome = await releaseRemoteLease(
+      { intent_id: "intent-1", revision: 9 },
+      { ...hooks(made.calls), db: made.db },
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.replayed).toBe(true);
+      expect(outcome.stopped).toBe(true);
+      expect(outcome.port_released).toBe(false);
+    }
+  });
+
+  test("release catches teardown hook throws and leaves a retryable failed lease", async () => {
+    const made = makeLeaseDb({ leases: [leaseRow({ state: "active" })] });
+    const outcome = await releaseRemoteLease(
+      { intent_id: "intent-1", revision: 7 },
+      {
+        ...hooks(made.calls),
+        db: made.db,
+        teardown: () => {
+          throw new Error("teardown transport exploded");
+        },
+      },
+    );
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.message).toContain("teardown transport exploded");
+    expect(made.leases[0]!.state).toBe("failed");
+    expect(made.calls.releasePort).toHaveLength(0);
+  });
+
+  test("release catches port hook throws after teardown and records port-only cleanup", async () => {
+    const made = makeLeaseDb({ leases: [leaseRow({ state: "active" })] });
+    const outcome = await releaseRemoteLease(
+      { intent_id: "intent-1", revision: 7 },
+      {
+        ...hooks(made.calls),
+        db: made.db,
+        releasePort: () => {
+          throw new Error("port pool unavailable");
+        },
+      },
+    );
+
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.stopped).toBe(true);
+      expect(outcome.port_released).toBe(false);
+    }
+    expect(made.leases[0]!.state).toBe("released");
+    expect(made.leases[0]!.last_error_code).toBe(PORT_RELEASE_PENDING_CODE);
+    expect(String(made.leases[0]!.last_error)).toContain("port pool unavailable");
+  });
+
   test("an unknown lease is reported as lease_not_found, not as a successful release", async () => {
     const { db, calls } = makeLeaseDb();
     const outcome = await releaseRemoteLease({ intent_id: "nope", revision: 1 }, { ...hooks(calls), db });
@@ -1044,6 +1161,51 @@ describe("WP15 lease: expiry tears down, frees the port and reports its own numb
     const retry = await expireLeases({ now: NOW, deps: { ...hooks(calls, { teardown: () => ({ ok: true }) }), db } });
     expect(retry.expired).toBe(1);
     expect(leases[0].state).toBe("expired");
+  });
+
+  test("expiry catches teardown hook throws and continues with a durable failed row", async () => {
+    const made = makeLeaseDb({
+      leases: [leaseRow({ state: "active", expires_at: NOW })],
+    });
+    const result = await expireLeases({
+      now: NOW,
+      deps: {
+        ...hooks(made.calls),
+        db: made.db,
+        teardown: () => {
+          throw new Error("agent teardown threw");
+        },
+      },
+    });
+
+    expect(result.teardown_failed).toBe(1);
+    expect(result.expired).toBe(0);
+    expect(made.leases[0]!.state).toBe("failed");
+    expect(String(made.leases[0]!.last_error)).toContain("agent teardown threw");
+    expect(made.calls.releasePort).toHaveLength(0);
+  });
+
+  test("expiry catches port hook throws, still closes service state, and leaves port pending", async () => {
+    const made = makeLeaseDb({
+      leases: [leaseRow({ state: "active", expires_at: NOW })],
+    });
+    const result = await expireLeases({
+      now: NOW,
+      deps: {
+        ...hooks(made.calls),
+        db: made.db,
+        releasePort: () => {
+          throw new Error("port release threw");
+        },
+      },
+    });
+
+    expect(result.expired).toBe(1);
+    expect(result.tore_down).toBe(1);
+    expect(result.ports_pending).toBe(1);
+    expect(made.leases[0]!.state).toBe("expired");
+    expect(made.leases[0]!.last_error_code).toBe(PORT_RELEASE_PENDING_CODE);
+    expect(String(made.leases[0]!.last_error)).toContain("port release threw");
   });
 
   test("a lost CAS is counted as skipped instead of being forced through", async () => {
@@ -1668,6 +1830,73 @@ describe("WP15 lease: revoked-but-not-yet-stopped leases are swept, port include
     const again = await sweepRevokedLeaseCleanup({ peer_panel_id: "panel-a", now: NOW, deps });
     expect(again.evaluated).toBe(0);
     expect(calls.teardown).toHaveLength(1);
+  });
+
+  test("sweep catches teardown hook throws instead of aborting the worker tick", async () => {
+    const made = makeLeaseDb({
+      leases: [
+        leaseRow({
+          state: "revoked",
+          last_error_code: "peer_revoked",
+        }),
+      ],
+    });
+    const result = await sweepRevokedLeaseCleanup({
+      peer_panel_id: "panel-a",
+      now: NOW,
+      deps: {
+        ...hooks(made.calls),
+        db: made.db,
+        teardown: () => {
+          throw new Error("teardown hook threw");
+        },
+      },
+    });
+
+    expect(result.teardown_failed).toBe(1);
+    expect(made.leases[0]!.state).toBe("revoked");
+    expect(made.leases[0]!.last_error_code).toBe("internal_error");
+    expect(String(made.leases[0]!.last_error)).toContain("teardown hook threw");
+  });
+
+  test("sweep catches one port hook throw and still processes later cleanup candidates", async () => {
+    const made = makeLeaseDb({
+      leases: [
+        leaseRow({
+          id: 11,
+          lease_ref: "lease-1",
+          state: "released",
+          last_error_code: PORT_RELEASE_PENDING_CODE,
+        }),
+        leaseRow({
+          id: 12,
+          lease_ref: "lease-2",
+          intent_id: "intent-2",
+          state: "released",
+          last_error_code: PORT_RELEASE_PENDING_CODE,
+        }),
+      ],
+    });
+    let calls = 0;
+    const result = await sweepRevokedLeaseCleanup({
+      now: NOW,
+      deps: {
+        ...hooks(made.calls),
+        db: made.db,
+        releasePort: () => {
+          calls++;
+          if (calls === 1) throw new Error("first port hook threw");
+          return { ok: true };
+        },
+      },
+    });
+
+    expect(result.evaluated).toBe(2);
+    expect(result.ports_pending).toBe(1);
+    expect(result.ports_released).toBe(1);
+    expect(made.leases[0]!.last_error_code).toBe(PORT_RELEASE_PENDING_CODE);
+    expect(String(made.leases[0]!.last_error)).toContain("first port hook threw");
+    expect(made.leases[1]!.last_error_code).toBeNull();
   });
 
   test("a failing teardown keeps the lease as a candidate for the next tick", async () => {
