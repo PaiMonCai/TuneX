@@ -1139,13 +1139,33 @@ export async function patchForward(
           suspended,
         },
         { db: db as never, orchestrator: orchestrator as never },
-      ).catch(() => null)
+      ).catch((cause) => ({
+        ok: false as const,
+        status: "failed" as const,
+        rolloutId: -1,
+        phase: "failed" as const,
+        error_code: "rollout_register_failed",
+        error: cause instanceof Error ? cause.message : String(cause),
+      }))
     : null;
 
-  // orchestrator 未接线（relay-wiring 失败）⇒ 跳过本轮执行，不回错误。
-  // 保存本身已成功（snapshot + revision 已落库，§4.1 铁律不破），worker 下一轮
-  // `resumeRollouts()` 会补上——与 「orchestrator 缺失就跳过 reapply」同口径。
-  // 注意：此分支**不会**创建 rollout 行，因此不需要回 502/409。
+  // orchestrator 未接线时没有执行器能登记 rollout。desired/revision 虽已保存，
+  // 但不能声称 worker 会自动恢复一个根本不存在的账本；明确标记为可见错误。
+  if (!orchestrator) {
+    await db.tunnel.updateMany({
+      where: { id: current.id, workspace_id: workspaceId, config_revision: revision },
+      data: {
+        apply_status: "error",
+        apply_error_code: "orchestrator_unavailable",
+        apply_error: "控制面编排器未就绪，目标配置已保存但尚未登记 rollout",
+      },
+    });
+    const failed = await loadForwardRow(current.id, workspaceId);
+    return error(503, "apply_failed", "控制面编排器未就绪，目标配置已保存但尚未应用", {
+      apply_error_code: "orchestrator_unavailable",
+      data: failed ? forwardView(failed) : { id: current.id, revision },
+    });
+  }
   if (runtime && runtime.status === "conflict") {
     // 同期已有未完成 rollout（§13.3.5 抢占闸门）⇒ 409，前端刷新后重试。
     // 必须先于通用 !ok 判断，否则 conflict 会被错误折叠成 502 apply_failed。
