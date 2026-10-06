@@ -311,4 +311,40 @@ describe("D. 守卫：不再有第二套日界实现 / 已用流量不再读 leg
     // 缺口不得并进 total_traffic
     expect(code).not.toMatch(/total_traffic:\s*[^,\n]*federated/);
   });
+
+  test("删除 Forward 不得删除或脱租户历史流量：归档行自带 immutable workspace attribution", () => {
+    const schema = readFileSync(
+      new URL("../../../../prisma/schema.prisma", import.meta.url),
+      "utf8",
+    );
+    const model = /model TunnelTraffic \{[\s\S]*?\n\}/.exec(schema)?.[0] ?? "";
+    expect(model).toContain("workspace_id Int");
+    expect(model).not.toContain("@relation(");
+
+    const migration = readFileSync(
+      new URL(
+        "../../../../prisma/migrations/20261037000000_traffic_ledger_survives_forward_delete/migration.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    expect(migration).toContain("SET tt.`workspace_id` = t.`workspace_id`");
+    expect(migration).toContain("DROP FOREIGN KEY `tunnel_traffic_tunnel_id_fkey`");
+
+    const archive = STRIP(read("services/traffic-archive.ts"));
+    expect(archive).toContain("workspace_id: workspaceId");
+
+    const policy = STRIP(read("services/policy-service.ts"));
+    expect(policy).toContain("TunnelTrafficWhereInput = { workspace_id: workspaceId }");
+    expect(policy).not.toMatch(/TunnelTrafficWhereInput\s*=\s*\{\s*tunnel:/);
+
+    const traffic = STRIP(read("services/traffic.ts"));
+    expect(traffic).toContain("workspace_id: workspaceId");
+
+    const dashboard = STRIP(read("routes/dashboard.ts"));
+    expect(dashboard).toContain("workspace_id: workspace.id");
+
+    const tunnelApi = STRIP(read("services/tunnel-api.ts"));
+    expect(tunnelApi).not.toMatch(/tunnelTraffic[^\n]*deleteMany/);
+  });
 });
