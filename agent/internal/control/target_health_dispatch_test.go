@@ -8,7 +8,7 @@ import (
 	"github.com/tunex/agent/internal/manager"
 )
 
-// V5.2-WP7: the `target_health` array travels in the SAME dispatch payload as
+// The `target_health` array travels in the same dispatch payload as
 // `targets`, so the command path must install both. These tests assert the fact
 // end-to-end at the seam the panel actually uses — a config applied through
 // `execute` — rather than at the manager API the config is passed to.

@@ -11,7 +11,7 @@ import (
 	"github.com/tunex/agent/internal/manager"
 )
 
-// V5.2-WP7: the local hot-update surface (PATCH /node/targets) carries the same
+// Target-health updates: the local hot-update surface (PATCH /node/targets) carries the same
 // parallel `target_health` array as the control-plane dispatch. If it did not,
 // an operator editing a pool here would silently switch the breaker off while
 // the panel's own dispatch would have kept it running — two apply surfaces with
@@ -61,7 +61,7 @@ func TestAdminTargetsPatchCarriesTargetHealth(t *testing.T) {
 		t.Fatalf("breaker states = %+v, want the unhealthy target open", states)
 	}
 
-	// The same endpoint without a health array is the pre-WP7 payload and must
+	// The same endpoint without a health array must
 	// leave no mechanism behind.
 	code = patchTargets(t, srv, map[string]any{
 		"tunnel_id": "eg",

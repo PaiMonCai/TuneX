@@ -230,12 +230,12 @@ func (t Target) usable() bool { return strings.TrimSpace(t.Host) != "" && validP
 func (t Target) Key() string { return TargetKey(t.Host, t.Port) }
 
 // TargetKey is the ONE identity two facts about the same upstream are joined
-// on (V5.2-WP7's parallel arrays, §7.3).
+// on when applying a parallel target-health array.
 //
 // It is deliberately not Addr(): the panel's target identity normalises a host
 // before publishing it (`targetKeyOf` in node-state.ts trims, lower-cases and
 // strips the square brackets of an IPv6 literal), and Addr() must NOT do that —
-// it is the string handed to the dialer and to the WP5 ledger, where changing
+// it is the string handed to the dialer and target-health ledger, where changing
 // the spelling of a target would break both. A health array whose host came
 // back lower-cased must still meet its target, or the breaker would silently
 // never open for any target the panel re-spelled, which is exactly the kind of
@@ -259,7 +259,7 @@ func TargetKey(host string, port int) string {
 	return net.JoinHostPort(h, strconv.Itoa(port))
 }
 
-// TargetHealthState is one of the five conclusions the panel's WP6 synthesis can
+// TargetHealthState is one of the five conclusions the panel's health synthesis can
 // report for a target (DEVELOPMENT.md §7.3 "线形状（加法）").
 //
 // The agent does not decide what "healthy" means. These five values arrive on
@@ -272,7 +272,7 @@ type TargetHealthState string
 const (
 	// TargetHealthUnknown means "no evidence": never observed, the observation
 	// is stale, or unreadable. It is not a synonym for healthy, and not proof
-	// of failure either — WP7 ranks it after `degraded` and before `unhealthy`.
+	// of failure either — routing ranks it after `degraded` and before `unhealthy`.
 	TargetHealthUnknown TargetHealthState = "unknown"
 	// TargetHealthHealthy is the panel's positive conclusion.
 	TargetHealthHealthy TargetHealthState = "healthy"
@@ -346,13 +346,13 @@ func (h TargetHealth) StateValue() TargetHealthState {
 // this node. JSON tags are the panel contract (snake_case) so a decoded payload
 // can be handed straight to a Forwarder.
 //
-// Revision is the WP6 monotonic revision of the resource. 0 means "this source
+// Revision is the monotonic revision of the resource. 0 means "this source
 // does not track revisions" and always applies; the manager enforces the rest
 // (newer applies, equal is a no-op, older is rejected as stale).
 //
 // ListenHost and Revision are additive fields on top of the frozen MVP shape:
 // ListenHost lets the operator pin the ingress interface, Revision carries the
-// WP6 revision the command layer needs. Neither changes the MVP semantics.
+// monotonic revision the command layer needs. Neither changes the MVP semantics.
 type TunnelConfig struct {
 	ID          string     `json:"id"`
 	Mode        TunnelMode `json:"mode"`
@@ -362,7 +362,7 @@ type TunnelConfig struct {
 	RemotePort  int        `json:"remote_port"`
 	NextHop     string     `json:"next_hop"`
 	// HopPeer is the paired ingress node's ADDRESS for a datagram EGRESS
-	// (V5.1b WP5-B2, contract §9.1).
+	// for datagram relay traffic.
 	//
 	// It exists because the hop is UDP: TCP gets "the peer really is the peer"
 	// from the handshake, UDP does not, so the exit has to be told who may feed
@@ -385,11 +385,11 @@ type TunnelConfig struct {
 	Revision   int64           `json:"revision"`
 	ListenHost string          `json:"listen_host,omitempty"`
 	// TargetHealth is the panel's per-target health, parallel to Targets
-	// (V5.2-WP7, §7.3): the same identities in the same order, carrying a
+	// the same identities in the same order, carrying a
 	// different kind of fact.
 	//
 	// Absent (an older panel, or a health read that failed) means "no health
-	// signal": the agent must then behave exactly as it did before WP7 — no
+	// signal": the Agent then uses ordinary target selection — no
 	// breaker, no reordering. That is why this field is additive and optional
 	// rather than something the agent fills in from local observation.
 	//
@@ -404,7 +404,7 @@ type TunnelConfig struct {
 	TLSCertPath string `json:"tls_cert_path,omitempty"`
 	TLSKeyPath  string `json:"tls_key_path,omitempty"`
 
-	// ── V5.3 WP9 ownership facts (DEVELOPMENT.md §8) ──
+	// ── ownership and lease facts ──
 	//
 	// These two are the panel's statement that THIS node is the recorded owner
 	// of the tunnel, and for how long: OwnershipEpoch is the generation it is
@@ -413,7 +413,7 @@ type TunnelConfig struct {
 	//
 	// They are OPTIONAL and their ABSENCE is meaningful: a config without them
 	// is an older panel that sent no ownership information at all, and the node
-	// must then behave exactly as it did before WP9 — no fencing, no lease
+	// must then behave as an unfenced assignment — no fencing, no lease
 	// clock. Treating absent as epoch 0 would refuse every activation on such a
 	// panel, which is why ownership.EpochFromConfig keys on presence-by-value:
 	// epochs are >= 1 by contract (placement-lease.ts starts at 1 and 0 means
@@ -556,18 +556,10 @@ func (c TunnelConfig) UpstreamAddr() string {
 // (stream) transports: one accepted connection maps to one upstream
 // connection, and the runtime can drain work that is already in flight.
 //
-// V5-WP2 made the name explicit. It was called `Forwarder` and documented as
-// "the contract every tunnel mode implements", which quietly claimed that a
-// future datagram runtime would have to implement `Drain(time.Duration)` and
-// `SetUpstream(string)` too. Both are stream-only notions: there are no
-// "in-flight connections" to drain in a datagram runtime, and "the upstream
-// address" is a per-connection fact for TCP but not for UDP. Keeping one name
-// for both would have forced the UDP work (V5.1b) into either empty methods or
-// a second, silently-divergent interface.
-//
-// So: every method below is a property of the stream lifecycle, not of
-// "a tunnel". A datagram runtime (V5.1b) will get its own contract; the
-// manager keeps owning desired state, revision and ports for both.
+// Every method below is a property of the stream lifecycle, not of a generic
+// tunnel. Datagram runtimes deliberately use a separate contract because drain
+// and single-upstream hot swap are stream-specific concepts; the manager owns
+// desired state, revision, and ports for both transport families.
 type StreamRuntime interface {
 	// Start binds the tunnel's listen port and starts forwarding. Starting an
 	// already running forwarder returns ErrAlreadyStarted.
@@ -609,13 +601,8 @@ type StreamRuntime interface {
 	Drain(timeout time.Duration) error
 }
 
-// Forwarder is the V4-WP4 name for StreamRuntime, kept as an alias so the
-// frozen data plane and its tests do not churn.
-//
-// Read it as "the stream runtime this node runs today", never as "the contract
-// every future protocol must satisfy": V5-WP2 split the concept precisely
-// because that reading would have made UDP/QUIC awkward or dishonest. New code
-// should prefer StreamRuntime.
+// Forwarder is a compatibility alias for StreamRuntime. New code should prefer
+// StreamRuntime so transport-specific contracts remain explicit.
 type Forwarder = StreamRuntime
 
 // Runtime is the transport-agnostic handle manager.TunnelManager keeps for one
@@ -697,7 +684,7 @@ type DatagramStats struct {
 // DatagramRuntime is the data-plane contract for a datagram (packet) transport.
 //
 // The method set is the datagram translation of the stream contract, frozen in
-// docs/v5-1b-datagram-contract-draft.md §4. Two stream methods are deliberately
+// The datagram runtime contract deliberately omits two stream-only methods.
 // absent: `Drain` (a datagram has no in-flight connection to finish; its
 // replacement is DrainMappings, which keeps the socket OPEN because the return
 // path shares it — §4.3) and `SetUpstream` ("the upstream" is not a per-client
@@ -745,7 +732,7 @@ type DatagramRuntime interface {
 var ErrUpstreamNotSwappable = errors.New("forwarder: upstream is not swappable")
 
 // DialFunc dials one address. Its shape is net.Dialer.DialContext, so a dialer
-// that does more than Go's (V5.3-WP8's target resolver: TTL cache, stale
+// that does more than Go's resolver (TTL cache, stale
 // fallback, observable facts) can be injected without the data plane knowing
 // anything about DNS.
 type DialFunc func(ctx context.Context, network, address string) (net.Conn, error)
@@ -760,7 +747,7 @@ type TargetSelector interface {
 
 // TargetReporter is the OPTIONAL other half of a TargetSelector: the egress
 // forwarder tells the selector how the dial it just asked for turned out
-// (V5.2-WP7 half-open probing).
+// for health-aware half-open probing.
 //
 // It is a separate interface rather than a second method on TargetSelector so
 // every existing selector still satisfies the narrow contract. A selector that

@@ -1,12 +1,7 @@
 // Package restore pulls the node's ACTIVE tunnels from the panel at startup so
-// a restarted agent re-binds its ports (devmap §5.5 "节点重启 → 启动时拉取
-// ACTIVE 隧道列表；RELAY 模式的出口节点需同时拉取 EgressTarget").
-//
-// WP4 defines this as an interface, not a client: the panel's Prisma model
-// (Tunnel/EgressTarget) lands in WP1, and the agent must not hard-code fields
-// that may still change. main injects an implementation over the existing
-// Socket.IO transport or a plain HTTP GET; until then any no-op implementation
-// keeps the agent startable.
+// a restarted Agent re-binds its data-plane ports. The package depends on a
+// transport-neutral Source interface rather than panel persistence models, so
+// restore stays isolated from Prisma and transport details.
 //
 // The restore result is deliberately idempotent: applying the very snapshot
 // twice must not churn listeners, which is why it goes through
@@ -30,10 +25,10 @@ var ErrNoPanel = errors.New("restore: no panel source configured")
 
 // Snapshot is what the panel knows about this node. It is intentionally
 // transport-agnostic (a decoded HTTP body or a Socket.IO ack both fit) and
-// decoupled from the Prisma models: WP1 may rename columns without touching
-// the agent as long as this shape holds.
+// decoupled from Prisma models so persistence changes do not leak into the Agent
+// as long as this wire shape remains stable.
 type Snapshot struct {
-	// Version lets the agent detect a panel that predates the v3 contract.
+	// Version lets the Agent detect an older snapshot contract.
 	Version string `json:"version,omitempty"`
 	// Tunnels are the node's ACTIVE tunnels (any mode).
 	Tunnels []forwarder.TunnelConfig `json:"tunnels"`
@@ -48,7 +43,7 @@ type Source interface {
 }
 
 // NopSource is a Source that always reports "nothing to restore". It is what
-// the agent runs with before the WP1 contract lands, and what tests use.
+// tests and deliberately disconnected runtimes can use when no panel source exists.
 type NopSource struct{}
 
 // FetchSnapshot implements Source.
@@ -102,17 +97,16 @@ func Apply(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.
 			// An EGRESS tunnel's pool must exist before the forwarder is
 			// built (the balancer is a constructor argument).
 			//
-			// V5.2-WP7: the snapshot carries health alongside the targets, so a
-			// restored node keeps its circuit breaker instead of silently reverting
-			// to pre-WP7 behaviour until the next command arrives.
+			// The snapshot carries health alongside targets so a restored node keeps
+			// its circuit breaker instead of silently dropping health-aware routing
+			// until the next command arrives.
 			//
 			// What is NOT cached is health as PERSISTED state: the local last-known-good
 			// cache never stores it (it is a live observation, not configuration), and a
 			// restored pool with no health in the snapshot simply has no signal. The
-			// distinction matters — V5-G2 caught the first version of this, which
-			// installed targets only and therefore turned the breaker off on every
-			// restart, showing up as connections still splitting 50/50 onto a target the
-			// panel had called unhealthy.
+			// distinction matters: installing targets without their health would turn the
+			// breaker off after every restart and could send traffic back to a target the
+			// panel has already marked unhealthy.
 			if _, ok := egress.Targets(cfg.ID); !ok {
 				strategy, ok := manager.ParseStrategy(string(cfg.LBStrategy))
 				if !ok {

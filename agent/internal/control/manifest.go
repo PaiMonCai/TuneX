@@ -8,16 +8,10 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// V5-WP1 capability-negotiation v2.
-//
-// V4-WP11B (see protocol.go) told the panel which *actions* this agent
-// implements. That is not enough once the product gains a second protocol: the
-// panel also has to know whether this binary can carry that protocol, on which
-// transport contract, and which runtime behaviours (hot reload, bounded drain,
-// LKG restore) it actually performs.
-//
-// The rules are the same as WP11B's, and they matter more here because a wrong
-// answer dispatches real traffic somewhere the operator did not intend:
+// Capability negotiation tells the panel both which *actions* this Agent
+// implements and which protocols, transports, runtime behaviours, and diagnostics
+// this binary can actually serve. A wrong answer can dispatch real traffic to an
+// incapable node, so the manifest is derived only from implementation facts:
 //
 //   - the manifest is derived from facts the binary can prove (the protocol
 //     table the parser itself consults, the actions the execute() switch really
@@ -32,8 +26,8 @@ import (
 
 // ManifestSchemaVersion is the schema version of the v2 capability manifest.
 // Bump it only together with a frozen wire contract: the panel treats a version
-// it does not implement as "manifest unreadable" (falls back to the V4
-// baseline), so a bump silently disables v2 admission until the panel ships.
+// it does not implement as "manifest unreadable" and falls back to the
+// action-only baseline, so a bump must ship with matching panel support.
 const ManifestSchemaVersion = 2
 
 // RuntimeFeature names a runtime behaviour this agent implements.
@@ -41,10 +35,10 @@ type RuntimeFeature string
 
 const (
 	// RuntimeHotReload: a running tunnel's upstream can be swapped without
-	// rebuilding the listener (forwarder.Forwarder.SetUpstream).
+	// rebuilding the listener (forwarder.StreamRuntime.SetUpstream).
 	RuntimeHotReload RuntimeFeature = "hot_reload"
 	// RuntimeGracefulDrain: bounded graceful shutdown — stop accepting, drain
-	// in-flight connections, then converge (forwarder.Forwarder.Drain).
+	// in-flight connections, then converge (forwarder.StreamRuntime.Drain).
 	RuntimeGracefulDrain RuntimeFeature = "graceful_drain"
 	// RuntimeLKGRestore: restore the last known good applied config while the
 	// panel is unreachable (internal/restore).
@@ -210,7 +204,7 @@ func DiagnosticsFromActions(actions []string) []DiagnosticFeature {
 	return out
 }
 
-// DefaultManifest builds the manifest for a runtime with the full V5-WP0/WP1
+// DefaultManifest builds the manifest for a runtime with the full current
 // supervisor wired up (hot reload, bounded drain, LKG cache, both diagnostics).
 //
 // It is a convenience for tests and for the wiring path that constructs every

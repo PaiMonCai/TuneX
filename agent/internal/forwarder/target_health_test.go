@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// V5.2-WP7: the two facts this package owns on the agent side — the parallel
+// Target-health routing owns two Agent-side facts — the parallel
 // `target_health` array on the wire, and the dial outcome the egress forwarder
 // owes a selector that is running a circuit breaker. Both are additive, so the
 // assertions are about what did NOT change as much as about what did.
@@ -77,7 +77,7 @@ func TestEgressForwarderReportsSuccessfulDial(t *testing.T) {
 
 	port := freePort(t)
 	f, err := NewEgress(TunnelConfig{
-		ID: "wp7-ok", Mode: ModeEgress, EgressPort: port, Protocol: "tcp", ListenHost: "127.0.0.1",
+		ID: "health-ok", Mode: ModeEgress, EgressPort: port, Protocol: "tcp", ListenHost: "127.0.0.1",
 	}, sel)
 	if err != nil {
 		t.Fatalf("NewEgress: %v", err)
@@ -93,7 +93,7 @@ func TestEgressForwarderReportsSuccessfulDial(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	if _, err := conn.Write([]byte("wp7")); err != nil {
+	if _, err := conn.Write([]byte("health")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	buf := make([]byte, 3)
@@ -119,7 +119,7 @@ func TestEgressForwarderReportsFailedDial(t *testing.T) {
 
 	port := freePort(t)
 	f, err := NewEgress(TunnelConfig{
-		ID: "wp7-fail", Mode: ModeEgress, EgressPort: port, Protocol: "tcp", ListenHost: "127.0.0.1",
+		ID: "health-fail", Mode: ModeEgress, EgressPort: port, Protocol: "tcp", ListenHost: "127.0.0.1",
 	}, sel)
 	if err != nil {
 		t.Fatalf("NewEgress: %v", err)
@@ -152,7 +152,7 @@ func TestEgressForwarderReportsNothingWhenNothingWasDialed(t *testing.T) {
 	sel := &reportingSelector{}
 	port := freePort(t)
 	f, err := NewEgress(TunnelConfig{
-		ID: "wp7-empty", Mode: ModeEgress, EgressPort: port, Protocol: "tcp", ListenHost: "127.0.0.1",
+		ID: "health-empty", Mode: ModeEgress, EgressPort: port, Protocol: "tcp", ListenHost: "127.0.0.1",
 	}, sel)
 	if err != nil {
 		t.Fatalf("NewEgress: %v", err)
@@ -258,7 +258,7 @@ func TestParseTargetHealthStateFoldsUnknown(t *testing.T) {
 // The join between the two parallel arrays must not depend on which side
 // normalised the host first: the panel publishes its own identity (lower-cased,
 // brackets and root dots stripped), while Target.Addr() is the spelling handed
-// to the dialer and the WP5 ledger and must stay exactly as configured.
+// to the dialer and health ledger and must stay exactly as configured.
 func TestTargetKeyJoinsTheTwoSpellingsOfOneHost(t *testing.T) {
 	cases := []struct {
 		targetHost string
