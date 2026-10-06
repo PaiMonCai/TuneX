@@ -898,6 +898,45 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 ### 一处**在途**门禁红（非回归，待落定）
 第 47 轮预备门禁时 backend 报 `src/routes/forwards.ts(734,27): error TS2304: Cannot find name 'preferenceOptions'` + 2 条测试失败——该文件同时是 `task-38`（HA 转发组）与 `task-39`（带宽序列）的写入范围 ⇒ 判定为**在途中途态**。web 侧同时刻 `tsc` 0 错 + 1325 pass / 0 fail + `next build` 成功。**结论以落定后重跑为准。**
 
+## 3.41 Round 48：Panel 重建 + 浏览器验收（发现**构建坏在中间态**）+ 两项前置判定
+
+### Panel 已重建（清掉 `notify-center` 的收尾项）
+`rebuild-panel.sh final48-0439` → healthz 200；真机确认新投影生效：
+`GET /api/notifications/deliveries` → **200**；`GET /api/admin/system/config` → **18 条，其中 3 条带 `read_only`**（task-33 的已废弃键只读投影已上线）。
+
+### 浏览器验收（重建后）——**一处必须记录的失败**
+| 面 | 结果 |
+|---|---|
+| DNS 前门 | `bind → pending → **synced**`，清理后 `providersLeft=0`、`unbound` |
+| `/settings` | **18** 个通知相关 testid（偏好矩阵 3 渠道 × 6 类别）✓ |
+| `/nodes`（选中入口） | **25** 个相关 testid（升级卡片 + Looking Glass 面板）✓ |
+| `/admin/notification-channels` | 8 个命中 ✓ |
+| `apiErrors` | **[]** ✓ |
+| **`/forwards/1` 与 `/forwards/2`** | **相关 testid = 0** ⇒ 直接取页面 HTML 得 `id="__next_error__"`：**整页错误**，不是"卡片没渲染" |
+
+**根因**：第 47 轮我跑 `npm run build` 时，`web/src/lib/api/forwards.ts` / `forward-ha-card.tsx` / `lib/api/forward-ha.ts` **正被 `task-38/39` 修改** ⇒ **构建到了中间态**。教训（新增纪律）：**验收用的构建必须与"树可冻结"同时确认**——现在起"构建 + 验收"只在收到 owner 的"可冻结"确认后执行，且构建前先跑一次 `tsc` + 定向测试。
+
+**另一处脚本瑕疵（记录，不是产品问题）**：验收脚本里的 `deliveriesCard` 探针用 `testid 含 deliver` 匹配，命中了 **偏好矩阵**的格子（`notification-delivery-email-node`）而非**账本卡片**，所以它报的是"节点 尚未接线 未静音"。下一轮修正探针（按 `notification-deliveries-` 前缀精确匹配）后再取账本卡的证据。
+
+### `backend-truth` 的 `task-40` 开工前判定（**推翻了我们代码里的一条注释**）
+它在**生产 caps**（`--cap-drop ALL --cap-add NET_BIND_SERVICE`）下实测：
+```
+CapEff 0000000000000400（无 CAP_NET_RAW）；ping_group_range = 0 2147483647
+ping -c1 1.1.1.1        → 成功（1.983ms）
+ping -c1 3.5.140.1      → 100% packet loss（干净的超时形状）
+ping6 -c1 2606:4700::1111 → Network unreachable
+traceroute -m2 1.1.1.1  → socket(AF_INET,3,1): Operation not permitted   ← raw socket 被拒
+mtr                     → MISSING（镜像无该二进制）
+```
+⇒ **`ping`/`ping6` 可行**（busybox ping 走**非特权 ICMP**）；**`traceroute`/`mtr` 不可行**（前者需 CAP_NET_RAW，后者无二进制）。这**推翻了** `looking-glass.ts:55-60` 与 `agent/internal/diag/looking-glass.go:35-36` 里"不做 ICMP（需要 CAP_NET_RAW）"的注释。
+**Lead 拍板**：① 方法矩阵 = `["tcp_connect","ping","ping6"]` + `unavailable_methods:[{method,reason}]`；② **不加** `tls_handshake`（用户要的是与 ForwardX 同量级，不是发明新方法）；③ `ping6` 语义 = "可用性看二进制+内核权限，**网络事实由结果表达**（`unreachable` ≠ 方法未实现）"；④ **那条过期注释必须改成实测结论**。
+
+### `web-forward` 的 `task-39` 口径判定（有价值，且诚实收窄）
+用现有 `tunnel_traffic` **可派生**：日均吞吐序列 + **缺口 ≠ 0**。**不可派生**（因此**不做、不改 schema**）：① 上行/下行分开（我们的账本只有一列 `traffic`，ForwardX 有 `bytesIn/bytesOut`）② 小时桶/峰值（账本是 `@@unique([tunnel_id,date])` 日行）③ 连接数。新端点 `GET /api/forwards/:id/throughput`（复用同一账本与既有 `dayKeyOf/fillDays`，**不改** `/traffic` 既有契约），服务端下发 window/granularity/unit/归档节拍/覆盖度。
+
+### 当前树状态（收口待办）
+`web` `tsc` 0 错，但 `bun test src/components/forwards src/mocks` 有 **2 条失败**（`ha-ui` 领地：`mock：GET /forwards/:id/ha …缺省策略即关；候选…none`）⇒ **在途**。已要求两位 owner 收敛到"可冻结"并回确认；我在此之后才重建 + 重跑验收。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
