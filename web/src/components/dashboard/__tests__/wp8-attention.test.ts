@@ -315,10 +315,12 @@ describe("D. 静态守卫", () => {
   });
 
   test("节点页消费后端三层字段（lifecycle / connection / accepts_new_business）", () => {
-    const types = readWeb("lib/types.ts");
-    for (const field of ["connection?", "accepts_new_business?", "admission_rejection?", "lifecycle?"]) {
-      expect(types).toContain(field);
+    const nodeTypes = readWeb("lib/types/node-forward.ts");
+    const baseTypes = readWeb("lib/types/base.ts");
+    for (const field of ["connection?", "accepts_new_business?", "admission_rejection?"]) {
+      expect(nodeTypes).toContain(field);
     }
+    expect(baseTypes).toContain("lifecycle?");
     const nodes = readWeb("components/nodes/node-workspace.tsx");
     expect(nodes).toContain("userNodeStatus(");
     // 老的 `node.online ? 在线 : 离线` 单层写法必须消失（否则「维护中」会被说成「离线」）。

@@ -463,7 +463,8 @@ describe("WP6 接线", () => {
   const manager = read("node-health-manager.tsx");
   const detail = read("node-detail-manager.tsx");
   const nodes = read("nodes-manager.tsx");
-  const api = readFileSync(new URL("../../../lib/api.ts", import.meta.url), "utf8");
+  const api = readFileSync(new URL("../../../lib/api/admin.ts", import.meta.url), "utf8");
+  const apiCore = readFileSync(new URL("../../../lib/api/core.ts", import.meta.url), "utf8");
 
   test("api.ts 暴露两个端点，fleet 用 unwrap:false 取带 summary 的信封", () => {
     expect(api).toContain("/admin/node/${id}/health");
@@ -526,7 +527,7 @@ describe("WP6 接线", () => {
     // 合并时就得人工介入。这个断言把「我们只往末尾加、不动别人段落」固定下来：
     // 只要新代码仍集中在下面的锚点附近，合并就是干净的。
     expect(api.indexOf('"/admin/node/health"')).toBeGreaterThan(api.indexOf("nodeState:"));
-    expect(api.indexOf("unwrap?: boolean")).toBeGreaterThan(api.indexOf("workspaceId?: number"));
+    expect(apiCore.indexOf("unwrap?: boolean")).toBeGreaterThan(apiCore.indexOf("workspaceId?: number"));
     // 归一化后，事实投影留在 runtime，HTTP 路由只负责调用它。
     // 这比依赖同一大文件中的源码先后顺序更稳定。
     const runtime = readFileSync(new URL("../../../mocks/runtime.ts", import.meta.url), "utf8");
