@@ -155,6 +155,8 @@ describe("B. 错误码表与后端 SCHEDULER_ERROR_CODES 一致", () => {
 
 describe("C. 静态守卫：产品状态只有一处实现", () => {
   const workspace = stripComments(readWeb("components/forwards/forward-workspace.tsx"));
+  const table = stripComments(readWeb("components/forwards/forward-table.tsx"));
+  const listSurface = workspace + "\n" + table;
   const detail = stripComments(readWeb("components/forwards/forward-detail.tsx"));
 
   /**
@@ -169,38 +171,38 @@ describe("C. 静态守卫：产品状态只有一处实现", () => {
   }
 
   test("列表页与详情页都复用 forwardProductStatus（不自己算 revision 关系）", () => {
-    expect(workspace).toContain("forwardProductStatus(");
+    expect(listSurface).toContain("forwardProductStatus(");
     expect(detail).toContain("forwardProductStatus(");
     // 任何「applied_revision 与 config_revision 相互比较」的形态都算复刻判定。
     // 用 `[^\n]*` 覆盖 `(a ?? 0) < (b ?? 0)` 这种绕开的写法。
     const comparison =
       /applied_revision[^\n]*[<>][^\n]*config_revision|config_revision[^\n]*[<>][^\n]*applied_revision/;
-    for (const [name, src] of [["workspace", workspace], ["detail", detail]] as const) {
+    for (const [name, src] of [["list", listSurface], ["detail", detail]] as const) {
       expect(`${name}:${comparison.test(src)}`).toBe(`${name}:false`);
     }
   });
 
   test("列表页不再把 apply_status 原始枚举渲染成用户可见文本", () => {
     // 两处都是 WP8 修掉的形态：Badge 里插值 apply_status / 回落 "pending"。
-    expect(workspace).not.toMatch(/apply_status\s*\?\?\s*"pending"/);
-    expect(workspace).not.toMatch(/\{\s*forward\.apply_status\s*\}/);
+    expect(listSurface).not.toMatch(/apply_status\s*\?\?\s*"pending"/);
+    expect(listSurface).not.toMatch(/\{\s*forward\.apply_status\s*\}/);
     expect(detail).not.toMatch(/apply_status\s*\?\?\s*"pending"/);
     // 产品状态词条确实被用上了（否则上面两条可能因为「什么都没渲染」而通过）。
-    expect(workspace).toContain("forward.product.");
+    expect(listSurface).toContain("forward.product.");
     expect(detail).toContain("forward.product.");
   });
 
   test("列表页与详情页都消费「错误 → 下一步动作」（含 409 condition）", () => {
-    expect(workspace).toContain("applyErrorAction");
+    expect(listSurface).toContain("applyErrorAction");
     expect(detail).toContain("applyErrorAction");
     // V4-WP8 §13.5：写失败（不只是「读到的 apply_error」）也必须按码给下一步。
     // `forwardErrorActions` 是消费 409 `data.condition` 的那一处 —— 若哪天有人把它
     // 从某条写路径上摘掉，用户就又会看到笼统的「操作失败」。
-    for (const [name, src] of [["workspace", workspace], ["detail", detail]] as const) {
+    for (const [name, src] of [["list", listSurface], ["detail", detail]] as const) {
       expect(`${name}:${src.includes("forwardErrorActions(")}`).toBe(`${name}:true`);
     }
     // 两边的回落都必须保留后端原文（原文是排障材料，不能只留一句动作）。
-    expect(workspace).toContain("info.message");
+    expect(listSurface).toContain("info.message");
     expect(detail).toContain("info.message");
   });
 
@@ -243,7 +245,7 @@ describe("C. 静态守卫：产品状态只有一处实现", () => {
 
   test("列表页不出现 raw revision / desired internals", () => {
     for (const key of ["applied_revision", "config_revision", "desired_status", "desired_revision_id"]) {
-      expect(workspace).not.toContain(key);
+      expect(listSurface).not.toContain(key);
     }
   });
 });
