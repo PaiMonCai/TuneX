@@ -60,6 +60,8 @@ const BACKEND = (relative: string) =>
   readFileSync(new URL(`../../../../../backend/${relative}`, import.meta.url), "utf8");
 
 const WORKSPACE = WEB("components/forwards/forward-workspace.tsx");
+const CREATE_DIALOG = WEB("components/forwards/forward-create-dialog.tsx");
+const TABLE = WEB("components/forwards/forward-table.tsx");
 const EDIT_DIALOG = WEB("components/forwards/forward-edit-dialog.tsx");
 const PROTOCOL_BADGE = WEB("components/forwards/forward-protocol-badge.tsx");
 
@@ -118,10 +120,10 @@ describe("A. 协议白名单：前端镜像后端契约，不多不少", () => {
 
   test("创建表单的协议下拉**由常量渲染**，不是手抄的选项列表", () => {
     // 选项来自 FORWARD_PROTOCOLS（后端加协议时前端只需更新常量，不会漏一个下拉项）
-    expect(WORKSPACE).toContain("{FORWARD_PROTOCOLS.map((value) => (");
-    expect(WORKSPACE).toContain('data-testid="forward-protocol-select"');
+    expect(CREATE_DIALOG).toContain("{FORWARD_PROTOCOLS.map((value) => (");
+    expect(CREATE_DIALOG).toContain('data-testid="forward-protocol-select"');
     // 没有手抄的选项值（udp 也必须是常量渲染出来的，不能是硬编码的一项）
-    expect(WORKSPACE).not.toMatch(/<SelectItem value="(tcp|tls|ws|udp|quic|wss|mtls|mwss|mtcp|tunex)"/);
+    expect(CREATE_DIALOG).not.toMatch(/<SelectItem value="(tcp|tls|ws|udp|quic|wss|mtls|mwss|mtcp|tunex)"/);
   });
 
   test("isForwardProtocol / forwarded protocol fact 的判定与后端同一口径", () => {
@@ -533,7 +535,7 @@ describe("D. 渲染：tls / ws / 历史值都照事实，不存在 unknown 兜�
   });
 
   test("三处渲染共用同一枚徽标（列表 / 详情 / Dashboard 不允许各写一套 switch）", () => {
-    expect(WORKSPACE).toContain("<ForwardProtocolBadge forward={forward} />");
+    expect(TABLE).toContain("<ForwardProtocolBadge forward={forward} />");
     expect(WEB("components/forwards/forward-detail.tsx")).toContain(
       "<ForwardProtocolBadge forward={forward} />",
     );
