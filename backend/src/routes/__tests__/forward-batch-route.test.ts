@@ -68,7 +68,15 @@ mock.module(`${ROOT}services/forward-service.ts`, () => ({
   },
 }));
 
+// **替身必须语义完整**（task-28）：`mock.module` 是**进程级**注册表、先加载者生效，
+// 一个只给几个导出的 `workspace.ts` 替身会泄漏给同进程的其它测试文件，让它们在**加载
+// 阶段**抛 `Export named '…' not found`（`route-mount-coverage.test.ts` 就因此被
+// `createPersonalWorkspace` 打红，且单独跑是绿的）。所以取"**真实模块 + 只覆盖本用例要
+// 改的导出**"形态：先 import 真实现，再 spread 它。守卫见
+// `services/__tests__/mock-isolation-guard.test.ts`。
+const realWorkspace = await import(`${ROOT}services/workspace.ts`);
 mock.module(`${ROOT}services/workspace.ts`, () => ({
+  ...realWorkspace,
   canWorkspaceResourceAction: (access: { role: string }) => access.role === "owner",
   resolveWorkspaceAccess: async () => ({
     id: 77,

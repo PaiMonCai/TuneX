@@ -180,8 +180,17 @@ const MODULE_DB = new URL("../../db.ts", import.meta.url).pathname;
 const MODULE_ENV = new URL("../../env.ts", import.meta.url).pathname;
 
 mock.module(MODULE_DB, () => ({ db: dbStub }));
+
+// **替身必须语义完整**：`mock.module` 是进程级注册表、先加载者生效，一个只给三个键的
+// `env` 替身会泄漏给同进程的其它测试文件（现场 2 的同型缺陷）。所以取"真实 env + 覆盖
+// 本用例要钉的字段"形态 —— 真实模块在 `bun test` 下可 import（`bunfig.toml` 的 preload
+// 给了 DATABASE_URL/AUTH_SECRET 基线），替身因此天然覆盖全部段（含 `mail`）。
+// 守卫见 `services/__tests__/mock-isolation-guard.test.ts`。
+const realEnv = await import(MODULE_ENV);
 mock.module(MODULE_ENV, () => ({
+  ...realEnv,
   env: {
+    ...realEnv.env,
     siteUrl: "https://tunex.example",
     emailVerifyTtlSeconds: 24 * 60 * 60,
     resendVerificationIntervalSeconds: 60,
