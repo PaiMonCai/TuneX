@@ -102,7 +102,7 @@ export function TopupBody() {
                 ))}
               </SelectContent>
             </Select>
-            {paymentsFailed && <p className="text-xs text-[var(--destructive)]">{t("common.loadFailed")}</p>}
+            {paymentsFailed && <p className="text-xs text-[var(--destructive)]">{t("topup.methodsLoadFailed")}</p>}
           </div>
           <Button onClick={submit} disabled={loading}>
             {t("topup.submit")}
