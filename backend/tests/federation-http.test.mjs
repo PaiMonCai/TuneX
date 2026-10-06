@@ -102,6 +102,8 @@ async function signedPost(path, body, keys, panelId, overrides = {}) {
     identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
     privateJwk: keys.private_jwk,
     body: bodyStr,
+    method: "POST",
+    path,
     messageId: overrides.messageId ?? crypto.randomUUID(),
     nowMs: overrides.nowMs,
     ttlSeconds: overrides.ttlSeconds,
@@ -237,6 +239,8 @@ maybe("WP14 federation: 篡改 / 时钟偏移 / 未知 peer 都被拒", async ()
     identity: { panel_id: peer.panelId, key_id: peer.keys.key_id, public_jwk: peer.keys.public_jwk },
     privateJwk: peer.keys.private_jwk,
     body: bodyStr,
+    method: "POST",
+    path: "/api/federation/v1/ping",
     messageId: crypto.randomUUID(),
   });
   const tampered = await req("/api/federation/v1/ping", {
