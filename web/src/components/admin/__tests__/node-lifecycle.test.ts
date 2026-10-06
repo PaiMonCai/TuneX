@@ -164,7 +164,7 @@ describe("WP7 lifecycle 端点契约", () => {
 
   test("PATCH 备注语义：缺省=不动、空串=清空、可只改备注不改生命周期", async () => {
     await call("PATCH", `/admin/node/${DEMO}/lifecycle`, undefined, { lifecycle: "maintenance", note: "原有备注" });
-    expect((await call<Node>("GET", `/admin/nodes/${DEMO}`)).body.lifecycle_note).toBe("原有备注");
+    expect((await call<{ node: Node }>("GET", `/admin/node/${DEMO}/detail`)).body.node.lifecycle_note).toBe("原有备注");
 
     // 1) 只改生命周期（无 note 键）→ 备注保留
     const kept = await call<NodeLifecycleChangeResult>("PATCH", `/admin/node/${DEMO}/lifecycle`, undefined, {

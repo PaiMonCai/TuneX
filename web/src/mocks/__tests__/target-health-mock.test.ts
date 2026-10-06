@@ -101,7 +101,7 @@ describe("mock：健康端点的形状与真实 contract 一致", () => {
     expect(body.observers).toEqual([6, 9]);
 
     // 往池里加一个没有夹具的目标：它只能是 unknown + no_observation
-    const created = await call<EgressTarget>("POST", "admin/nodes/6/pools/2/targets", {
+    const created = await call<EgressTarget>("POST", "admin/node/pools/2/targets", {
       host: "10.30.0.99",
       port: 8080,
     });
@@ -122,7 +122,7 @@ describe("mock：健康端点的形状与真实 contract 一致", () => {
   });
 
   test("删掉一个目标后它就不再出现在健康视图里（视图不保留幽灵行）", async () => {
-    const removed = await call("DELETE", "admin/nodes/6/pools/2/targets/2");
+    const removed = await call("DELETE", "admin/node/targets/2");
     expect(removed.status).toBe(200);
     const { body } = await health();
     expect(body.targets.map((row) => row.target)).toEqual(["10.30.0.11:8080"]);
@@ -192,11 +192,11 @@ describe("mock：夹具自洽（避免演示数据替后端撒谎）", () => {
   });
 
   test("池的形状仍是 EgressPool（健康视图不夹带任何写路径/新字段）", async () => {
-    const pools = await call<EgressPool[]>("GET", "admin/nodes/6/pools");
+    const pools = await call<{ data: EgressPool[] }>("GET", "admin/node/6/pools");
     expect(pools.status).toBe(200);
-    expect(Array.isArray(pools.body[0]?.targets)).toBe(true);
+    expect(Array.isArray(pools.body.data[0]?.targets)).toBe(true);
     // 健康视图是只读投影：它不改动期望目标（weight/status 与拿到的一致）
     const { body } = await health();
-    expect(body.targets.length).toBe(pools.body[0]?.targets?.length ?? -1);
+    expect(body.targets.length).toBe(pools.body.data[0]?.targets?.length ?? -1);
   });
 });

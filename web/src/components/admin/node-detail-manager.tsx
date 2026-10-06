@@ -117,7 +117,9 @@ export function NodeDetailManager({ nodeId, initial, runtime }: NodeDetailManage
         lb_strategy: form.lb_strategy === "" ? null : (form.lb_strategy as LBStrategy),
         status: form.status,
       });
-      setDetail((prev) => ({ ...prev, ...updated, pools: prev.pools, state: prev.state }));
+      // 合并写回：`pools` 来自详情聚合（PATCH 不返回它）；运行态**不在这里**，
+      // 它由独立端点/loader 提供（`NodeDetail` 已无 `state` 字段）。
+      setDetail((prev) => ({ ...prev, ...updated, pools: prev.pools }));
       toast.success(t("admin.updateSuccess", { name: updated.node_id }));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t("admin.saveFailed"));

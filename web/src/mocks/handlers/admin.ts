@@ -311,19 +311,6 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
       if (id !== null) {
         const node = db.nodes.find((n) => n.id === id);
         if (!node) return notFound("节点不存在");
-        if (method === "GET" && seg[3] === undefined) {
-          // GET /admin/nodes/:id —— WP12 详情页聚合契约（NodeDetail）：
-          // 基础字段（含凭据派生字段） + 出口池 + 最近一条状态上报。
-          // 后端 WP10 未合并前 mock 直接按这个形状返回，前端零改动切换真实 API。
-          return ok({
-            ...node,
-            pools: (db.egressPools.get(node.id) ?? []).map((p) => ({
-              ...p,
-              targets: db.egressTargets.get(p.id) ?? [],
-            })),
-            state: db.nodeStates.get(node.id) ?? null,
-          });
-        }
         if ((method === "PUT" || method === "PATCH") && seg[3] === undefined) {
           const parsed = readNodePayload(db, asRecord(req.body), true, id);
           if (isResponse(parsed)) return parsed;
@@ -338,13 +325,96 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
           db.egressPools.delete(node.id);
           return ok({ ok: true, id: node.id });
         }
-        // ----- WP12 出口池：/admin/nodes/:id/pools[/:poolId[/targets[/:targetId]]] -----
-        if (seg[3] === "pools") return handleEgressPools(db, node, method, seg.slice(4), req);
-        // 注意：**没有** /admin/nodes/:id/state（复数）分支。
-        // 真实后端只有单数 `nodeAdminRoutes.get("/node/:id/state")`；
-        // mock 曾经实现复数路径，于是本地/mock 永远看不到线上的 404 —— 那种「mock 骗人」
-        // 比缺实现更坏。运行态在下面与其它单数 `/admin/node/...` 端点一起分发。
+        // WP12 出口池（节点作用域的那两条）：GET|POST /admin/node/:id/pools
+        // 池与目标都是全局寻址，只有"在某个节点下新建池"与"列该节点的池"需要 node，
+        // 所以只有列表/新建在这里分发，其余在下面按单数全局路径分发。
+        if (seg[3] === "pools") return handleEgressPools(db, node, method, [], req);
+        // 注意：**没有** /admin/nodes/:id/pools 与 /admin/nodes/:id/state（复数）分支。
+        // 真实后端的 pool/target 全族只有**单数**路径（`node-admin.ts:143/173/192/211/258/291/308`），
+        // 运行态只有 `/node/:id/state`。mock 曾经实现复数路径，于是本地/mock 永远看不到
+        // 线上的 404 —— 那种「mock 骗人」比缺实现更坏。两者都在下面与其它单数端点一起分发。
       }
+    }
+
+    // ----- WP12 出口池 / 出口目标：真实单数路径 -----
+    /*
+     * 路径与真实后端逐字一致（`node-admin.ts`）：
+     *   GET|POST  /admin/node/:id/pools
+     *   PATCH|DELETE /admin/node/pools/:poolId
+     *   POST      /admin/node/pools/:poolId/targets
+     *   PATCH|DELETE /admin/node/targets/:targetId
+     *
+     * 池与目标是**全局寻址**（路径里没有 node），而 `handleEgressPools` 是按节点作用域
+     * 实现的，因此这里先由 poolId / targetId 反查归属节点——和上面的目标健康分支
+     * 用的是同一套反查方式，避免为 mock 另造一套寻址。
+     */
+    // ----- WP12 详情聚合：GET /admin/node/:id/detail（真实单数路径）-----
+    /*
+     * 与 `backend/src/routes/node-admin.ts:101` 的 `get("/node/:id/detail")` 逐字同形：
+     * 嵌套 `{node, role, credential, pools, pool_count, tunnel_count}`。
+     * 运行态**不在这里**（已拆成 `/node/:id/state`，见下面同一分发区）。
+     */
+    if (seg[1] === "node" && method === "GET" && seg[3] === "detail") {
+      const id = parseId(seg[2]);
+      if (id === null) return badRequest("非法节点 ID");
+      const node = db.nodes.find((n) => n.id === id);
+      if (!node) return notFound("节点不存在");
+      const pools = db.egressPools.get(node.id) ?? [];
+      return ok({
+        node,
+        role: node.role ?? null,
+        credential: {
+          has_credential: node.has_credential === true,
+          revoked: node.credential_revoked === true,
+          rotated_at: node.credential_rotated_at ?? null,
+          last_rejected_at: node.credential_last_rejected_at ?? null,
+        },
+        pools: pools.map((x) => ({ ...x, targets: db.egressTargets.get(x.id) ?? [] })),
+        pool_count: pools.length,
+        tunnel_count: (db.tunnels ?? []).filter((x) => x.ingress_node_id === node.id).length,
+      });
+    }
+
+    // ----- WP12 列池 / 建池：GET|POST /admin/node/:id/pools（节点作用域的两条）-----
+    /*
+     * 只有这两条需要 node（"列这个节点的池"与"在这个节点下建池"）；其余池/目标操作
+     * 是在下面按全局单数路径分发的（`/node/pools/:poolId`、`/node/targets/:targetId`）。
+     */
+    if (seg[1] === "node" && seg[3] === "pools" && method !== undefined) {
+      const id = parseId(seg[2]);
+      if (id !== null) {
+        const node = db.nodes.find((n) => n.id === id);
+        if (!node) return notFound("节点不存在");
+        return handleEgressPools(db, node, method, [], req);
+      }
+    }
+
+    // 注意：**只接管池本身与它的 targets 子路径**，`/node/pools/:poolId/health`
+    // 由下面专门的分支处理（早先这一条没有限定尾段，把 health 也吞成了 404）。
+    if (seg[1] === "node" && seg[2] === "pools" && (seg[4] === undefined || seg[4] === "targets")) {
+      const poolId = parseId(seg[3]);
+      if (poolId === null) return badRequest("非法池 ID");
+      const owner = [...db.egressPools.entries()].find(([, pools]) => pools.some((p) => p.id === poolId));
+      if (!owner) return notFound("池不存在");
+      const [ownerId] = owner;
+      const node = db.nodes.find((n) => n.id === ownerId);
+      if (!node) return notFound("节点不存在");
+      const tail = seg.slice(4); // [] | ["targets"]
+      return handleEgressPools(db, node, method, [String(poolId), ...tail], req);
+    }
+    if (seg[1] === "node" && seg[2] === "targets") {
+      const targetId = parseId(seg[3]);
+      if (targetId === null) return badRequest("非法目标 ID");
+      const owner = [...db.egressTargets.entries()].find(([, targets]) =>
+        targets.some((t) => t.id === targetId),
+      );
+      if (!owner) return notFound("目标不存在");
+      const [poolId] = owner;
+      const poolOwner = [...db.egressPools.entries()].find(([, pools]) => pools.some((p) => p.id === poolId));
+      if (!poolOwner) return notFound("池不存在");
+      const node = db.nodes.find((n) => n.id === poolOwner[0]);
+      if (!node) return notFound("节点不存在");
+      return handleEgressPools(db, node, method, [String(poolId), "targets", String(targetId)], req);
     }
 
     // ----- V5.2 §7：出口池目标健康 —— GET /admin/node/pools/:poolId/health -----

@@ -16,6 +16,19 @@
 import { test, expect, describe, beforeEach } from "bun:test";
 import { handleMock } from "@/mocks/handler";
 import { getStore, resetStore } from "@/mocks/state";
+
+/**
+ * 真实 `/admin/node/:id/detail` 的**嵌套**信封（与后端逐字同形）。
+ *
+ * 之前这里用的是扁平 `NodeDetail` + 复数 `/admin/nodes/:id`，而那个路径在生产是 404
+ * （后端只有 `nodeAdminRoutes.get("/node/:id/detail")`）。断言改成真实形状后，
+ * mock 与真实后端不一致才会立刻显形。
+ */
+interface AdminNodeDetailEnvelope {
+  node: Record<string, unknown>;
+  role?: string | null;
+  pools: EgressPool[];
+}
 import type {
   EgressPool,
   EgressTarget,
@@ -68,23 +81,26 @@ describe("WP12 节点角色 / 端口区间", () => {
 
 describe("WP12 详情聚合契约", () => {
   test("GET /admin/nodes/:id = NodeDetail（pools + state）", async () => {
-    const res = await call<NodeDetail>("GET", "/admin/nodes/1");
+    const res = await call<AdminNodeDetailEnvelope>("GET", "/admin/node/1/detail");
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body.pools)).toBe(true);
-    expect(res.body.state === null || typeof res.body.state === "object").toBe(true);
+    // 运行态**不在**聚合里：真实后端已把它拆成 `/admin/node/:id/state`。
+    // 这里断言它确实不出现 —— 留一个可空的 `state` 会被读成「没有上报」。
+    expect("state" in res.body).toBe(false);
   });
 
   test("详情绝不下发凭据哈希（服务端契约红线）", async () => {
-    const res = await call<Record<string, unknown>>("GET", "/admin/nodes/4");
-    expect(res.body.node_credential_hash).toBeUndefined();
-    expect(res.body.credential_hash).toBeUndefined();
-    // 只允许三个派生态
-    expect(typeof res.body.has_credential).toBe("boolean");
-    expect(typeof res.body.credential_revoked).toBe("boolean");
+    const res = await call<AdminNodeDetailEnvelope>("GET", "/admin/node/4/detail");
+    const node = res.body.node as Record<string, unknown>;
+    expect(node.node_credential_hash).toBeUndefined();
+    expect(node.credential_hash).toBeUndefined();
+    // 只允许派生态；凭据材料（明文/哈希）一律不下发
+    expect(typeof node.has_credential).toBe("boolean");
+    expect(typeof node.credential_revoked).toBe("boolean");
   });
 
   test("节点不存在 → 404", async () => {
-    expect((await call("GET", "/admin/nodes/999")).status).toBe(404);
+    expect((await call("GET", "/admin/node/999/detail")).status).toBe(404);
   });
 });
 
@@ -106,10 +122,15 @@ describe("WP12 凭据 lifecycle", () => {
 
   test("详情在签发后翻转 has_credential，仍不下发明文", async () => {
     await call("POST", "/admin/node/1/credential", {});
-    const d = await call<NodeDetail>("GET", "/admin/nodes/1");
-    expect(d.body.has_credential).toBe(true);
-    expect(d.body.credential_revoked).toBe(false);
-    expect((d.body as unknown as { credential?: string }).credential).toBeUndefined();
+    const d = await call<AdminNodeDetailEnvelope>("GET", "/admin/node/1/detail");
+    expect((d.body.node as { has_credential?: boolean }).has_credential).toBe(true);
+    expect((d.body.node as { credential_revoked?: boolean }).credential_revoked).toBe(false);
+    // 真实后端 `/detail` 里有一个 `credential` **状态对象**（has_credential/revoked/rotated_at…），
+    // 它不是凭据材料；这里断言的是"绝不下发明文与哈希"，而不是"字段不存在"。
+    const cred = (d.body as unknown as { credential?: Record<string, unknown> }).credential;
+    expect(typeof cred).toBe("object");
+    expect(cred?.credential).toBeUndefined();
+    expect(cred?.node_credential_hash).toBeUndefined();
   });
 
   test("轮转：rotated_at 而非 issued_at，且明文每次都不同（旧 token 即时失效）", async () => {
@@ -127,9 +148,9 @@ describe("WP12 凭据 lifecycle", () => {
     expect(revoke.node_key).toBe(getStore().nodes[0].node_id);
     expect((revoke as unknown as { credential?: string }).credential).toBeUndefined();
 
-    const d = await call<NodeDetail>("GET", "/admin/nodes/1");
-    expect(d.body.credential_revoked).toBe(true);
-    expect(d.body.has_credential).toBe(true); // 哈希保留 → 面板显示「已撤销」而不是「未签发」
+    const d = await call<AdminNodeDetailEnvelope>("GET", "/admin/node/1/detail");
+    expect((d.body.node as { credential_revoked?: boolean }).credential_revoked).toBe(true);
+    expect((d.body.node as { has_credential?: boolean }).has_credential).toBe(true); // 哈希保留 → 面板显示「已撤销」而不是「未签发」
   });
 
   test("重复吊销被拒（幂等守卫）", async () => {
@@ -144,14 +165,14 @@ describe("WP12 凭据 lifecycle", () => {
     const again = await call<NodeCredentialIssued>("POST", "/admin/node/1/credential", {});
     expect(again.status).toBe(200);
     expect(typeof again.body.credential).toBe("string");
-    const d = await call<NodeDetail>("GET", "/admin/nodes/1");
-    expect(d.body.credential_revoked).toBe(false);
+    const d = await call<AdminNodeDetailEnvelope>("GET", "/admin/node/1/detail");
+    expect((d.body.node as { credential_revoked?: boolean }).credential_revoked).toBe(false);
   });
 
   test("删节点会清掉凭据与池（级联与后端 onDelete 一致）", async () => {
     await call("POST", "/admin/node/1/pools", { name: "HK-OUT", lb_strategy: "round" });
     expect((await call("DELETE", "/admin/nodes/1", {})).status).toBe(200);
-    expect((await call("GET", "/admin/nodes/1", {})).status).toBe(404);
+    expect((await call("GET", "/admin/node/1/detail", {})).status).toBe(404);
     expect(getStore().egressPools.has(1)).toBe(false);
     expect(getStore().nodeCredentials.has(1)).toBe(false);
   });
@@ -165,7 +186,7 @@ describe("WP12 出口池 / 出口目标 CRUD", () => {
   const NODE = 4;
 
   test("建池：默认策略可空（回落 node.lb_strategy）", async () => {
-    const res = await call<EgressPool>("POST", `/admin/nodes/${NODE}/pools`, { name: "HK-OUT" });
+    const res = await call<EgressPool>("POST", `/admin/node/${NODE}/pools`, { name: "HK-OUT" });
     expect(res.status).toBe(200);
     expect(res.body.name).toBe("HK-OUT");
     expect(res.body.lb_strategy ?? null).toBeNull();
@@ -173,46 +194,46 @@ describe("WP12 出口池 / 出口目标 CRUD", () => {
   });
 
   test("建池：空名被拒", async () => {
-    expect((await call("POST", `/admin/nodes/${NODE}/pools`, { name: "" })).status).toBeGreaterThanOrEqual(400);
+    expect((await call("POST", `/admin/node/${NODE}/pools`, { name: "" })).status).toBeGreaterThanOrEqual(400);
   });
 
   test("池策略校验 round | rand", async () => {
-    const ok = await call<EgressPool>("POST", `/admin/nodes/${NODE}/pools`, { name: "A", lb_strategy: "rand" });
+    const ok = await call<EgressPool>("POST", `/admin/node/${NODE}/pools`, { name: "A", lb_strategy: "rand" });
     expect(ok.body.lb_strategy).toBe("rand");
-    expect((await call("POST", `/admin/nodes/${NODE}/pools`, { name: "B", lb_strategy: "cheapest" })).status).toBeGreaterThanOrEqual(400);
+    expect((await call("POST", `/admin/node/${NODE}/pools`, { name: "B", lb_strategy: "cheapest" })).status).toBeGreaterThanOrEqual(400);
   });
 
   test("目标：host/port 分列；重复 host:port 被拒；端口范围校验", async () => {
-    const pool = (await call<EgressPool>("POST", `/admin/nodes/${NODE}/pools`, { name: "A" })).body;
-    const t = (await call<EgressTarget>("POST", `/admin/nodes/${NODE}/pools/${pool.id}/targets`, { host: "10.0.0.5", port: 8080, weight: 2 })).body;
+    const pool = (await call<EgressPool>("POST", `/admin/node/${NODE}/pools`, { name: "A" })).body;
+    const t = (await call<EgressTarget>("POST", `/admin/node/pools/${pool.id}/targets`, { host: "10.0.0.5", port: 8080, weight: 2 })).body;
     expect([t.host, t.port, t.weight]).toEqual(["10.0.0.5", 8080, 2]);
     expect(t.order_by).toBe(0); // 首个目标默认 0，后续按索引递增
 
-    expect((await call("POST", `/admin/nodes/${NODE}/pools/${pool.id}/targets`, { host: "10.0.0.5", port: 8080 })).status).toBeGreaterThanOrEqual(400);
-    expect((await call("POST", `/admin/nodes/${NODE}/pools/${pool.id}/targets`, { host: "10.0.0.6", port: 70000 })).status).toBeGreaterThanOrEqual(400);
-    expect((await call("POST", `/admin/nodes/${NODE}/pools/${pool.id}/targets`, { host: "", port: 80 })).status).toBeGreaterThanOrEqual(400);
+    expect((await call("POST", `/admin/node/pools/${pool.id}/targets`, { host: "10.0.0.5", port: 8080 })).status).toBeGreaterThanOrEqual(400);
+    expect((await call("POST", `/admin/node/pools/${pool.id}/targets`, { host: "10.0.0.6", port: 70000 })).status).toBeGreaterThanOrEqual(400);
+    expect((await call("POST", `/admin/node/pools/${pool.id}/targets`, { host: "", port: 80 })).status).toBeGreaterThanOrEqual(400);
   });
 
   test("目标：PATCH 局部更新 + DELETE 后 404", async () => {
-    const pool = (await call<EgressPool>("POST", `/admin/nodes/${NODE}/pools`, { name: "A" })).body;
-    const t = (await call<EgressTarget>("POST", `/admin/nodes/${NODE}/pools/${pool.id}/targets`, { host: "10.0.0.5", port: 8080 })).body;
-    const patched = (await call<EgressTarget>("PATCH", `/admin/nodes/${NODE}/pools/${pool.id}/targets/${t.id}`, { weight: 3, status: "inactive", remark: "备用" })).body;
+    const pool = (await call<EgressPool>("POST", `/admin/node/${NODE}/pools`, { name: "A" })).body;
+    const t = (await call<EgressTarget>("POST", `/admin/node/pools/${pool.id}/targets`, { host: "10.0.0.5", port: 8080 })).body;
+    const patched = (await call<EgressTarget>("PATCH", `/admin/node/targets/${t.id}`, { weight: 3, status: "inactive", remark: "备用" })).body;
     expect([patched.weight, patched.status, patched.remark]).toEqual([3, "inactive", "备用"]);
 
-    expect((await call("DELETE", `/admin/nodes/${NODE}/pools/${pool.id}/targets/${t.id}`, {})).body).toEqual({ ok: true, id: t.id });
-    expect((await call("PATCH", `/admin/nodes/${NODE}/pools/${pool.id}/targets/${t.id}`, { weight: 1 })).status).toBe(404);
+    expect((await call("DELETE", `/admin/node/targets/${t.id}`, {})).body).toEqual({ ok: true, id: t.id });
+    expect((await call("PATCH", `/admin/node/targets/${t.id}`, { weight: 1 })).status).toBe(404);
   });
 
   test("详情把池 + 目标一起带回（一个请求渲染整个 pools 区块）", async () => {
-    await call<EgressPool>("POST", `/admin/nodes/${NODE}/pools`, { name: "HK-OUT", lb_strategy: "round" });
-    const detail = (await call<NodeDetail>("GET", `/admin/nodes/${NODE}`)).body;
+    await call<EgressPool>("POST", `/admin/node/${NODE}/pools`, { name: "HK-OUT", lb_strategy: "round" });
+    const detail = (await call<AdminNodeDetailEnvelope>("GET", `/admin/node/${NODE}/detail`)).body;
     expect(detail.pools.length).toBeGreaterThan(0);
     for (const p of detail.pools) expect(Array.isArray(p.targets)).toBe(true);
   });
 
   test("未知池 / 目标 → 404（不静默建新行）", async () => {
-    expect((await call("GET", `/admin/nodes/${NODE}/pools/999`)).status).toBe(404);
-    expect((await call("DELETE", `/admin/nodes/${NODE}/pools/999`, {})).status).toBe(404);
+    expect((await call("GET", `/admin/node/pools/999`)).status).toBe(404);
+    expect((await call("DELETE", `/admin/node/pools/999`, {})).status).toBe(404);
   });
 
   /*
