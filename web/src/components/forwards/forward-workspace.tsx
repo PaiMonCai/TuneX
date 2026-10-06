@@ -34,6 +34,7 @@ import {
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
 import { ForwardListControls } from "@/components/forwards/forward-list-controls";
 import { ForwardTable } from "@/components/forwards/forward-table";
+import { ForwardCreateDialog } from "@/components/forwards/forward-create-dialog";
 import { copiedForwardCreateDraft, emptyForwardCreateDraft } from "@/components/forwards/forward-create-model";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
@@ -177,10 +178,10 @@ export function ForwardWorkspace() {
     for (const [key, value] of Object.entries(bindings)) out[String(key)] = value;
     return out;
   }, [bindings]);
-  const selectedBindings = ingressId ? bindings[Number(ingressId)] ?? [] : [];
+  const selectedBindings = createDraft.ingressId ? bindings[Number(createDraft.ingressId)] ?? [] : [];
   const availableEgressNodes = useMemo(() => {
-    if (!ingressId) return [];
-    const ingress = Number(ingressId);
+    if (!createDraft.ingressId) return [];
+    const ingress = Number(createDraft.ingressId);
     const bound = new Set(
       (bindings[ingress] ?? []).map((binding) => Number(binding.egress_node_id)),
     );
@@ -190,7 +191,7 @@ export function ForwardWorkspace() {
         Number(node.id) !== ingress &&
         !bound.has(Number(node.id)),
     );
-  }, [nodes, bindings, ingressId]);
+  }, [nodes, bindings, createDraft.ingressId]);
 
   const pageCount = forwardPageCount(total, pageSize);
   const hasFilters =
@@ -898,239 +899,23 @@ export function ForwardWorkspace() {
         </div>
       )}
 
-      <Dialog open={createOpen && canCreate} onOpenChange={setCreateOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
-            </DialogTitle>
-            <DialogDescription>
-              {createMode === "relay" ? t("forward.relayDesc") : t("forward.directDesc")}
-            </DialogDescription>
-          </DialogHeader>
-
-          {ingressNodes.length === 0 ? (
-            <div className="rounded-md border border-[var(--border)] p-4 text-sm text-[var(--muted-foreground)]">
-              {t("forward.noIngress")}
-            </div>
-          ) : (
-            <div className="flex flex-col gap-4">
-              <Field label={t("common.name")}>
-                <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="web-hk" />
-              </Field>
-
-              {/*
-                协议选项逐一来自契约白名单（`FORWARD_PROTOCOLS`），
-                没有第四个值、也没有 `wss` —— §6.1 把「分帧（ws）」与「传输安全（tls）」
-                分成两个维度，`wss` 这种合并名正是 WP0 拆掉的东西。
-              */}
-              <Field label={t("forward.protocol")} hint={forwardProtocolNote(locale, protocol)}>
-                <Select
-                  value={protocol}
-                  onValueChange={(value) => {
-                    const next = value as ForwardProtocol;
-                    setProtocol(next);
-                    // 离开 tls 时清空路径：否则「协议=tcp + 残留的证书路径」会被
-                    // 后端 400（非 tls 不得携带路径）。与 mode→direct 清空出口同一
-                    // 处理方式：切换后不让上一个形态的输入留在表单里。
-                    if (next !== "tls") {
-                      setTlsCertPath("");
-                      setTlsKeyPath("");
-                    }
-                  }}
-                >
-                  <SelectTrigger data-testid="forward-protocol-select">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {FORWARD_PROTOCOLS.map((value) => (
-                      <SelectItem key={value} value={value} data-testid={`forward-protocol-${value}`}>
-                        {forwardProtocolLabel(value)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              {/*
-                tls 才出现的两个必填字段。节点本地绝对路径 —— 面板只把路径写进
-                期望配置，证书与私钥文件本身始终留在节点上（§6.1：证书归运维）。
-                两个都填齐之前提交按钮是禁用的（见 DialogFooter 的 disabled）。
-              */}
-              {protocol === "tls" ? (
-                <>
-                  <Field
-                    label={t("forward.tlsCertPath")}
-                    hint={t("forward.tlsPathsHint")}
-                    error={protocolErrors.tls_cert_path ? t(protocolErrors.tls_cert_path) : undefined}
-                  >
-                    <Input
-                      value={tlsCertPath}
-                      maxLength={FORWARD_TLS_PATH_MAX}
-                      placeholder="/etc/tunex/tls/front.crt"
-                      data-testid="forward-tls-cert-path"
-                      // 必填语义给到无障碍树（表单没有原生 submit，按钮闸门在 Footer）
-                      required
-                      aria-invalid={protocolErrors.tls_cert_path ? true : undefined}
-                      onChange={(event) => setTlsCertPath(event.target.value)}
-                    />
-                  </Field>
-                  <Field
-                    label={t("forward.tlsKeyPath")}
-                    error={protocolErrors.tls_key_path ? t(protocolErrors.tls_key_path) : undefined}
-                  >
-                    <Input
-                      value={tlsKeyPath}
-                      maxLength={FORWARD_TLS_PATH_MAX}
-                      placeholder="/etc/tunex/tls/front.key"
-                      data-testid="forward-tls-key-path"
-                      required
-                      aria-invalid={protocolErrors.tls_key_path ? true : undefined}
-                      onChange={(event) => setTlsKeyPath(event.target.value)}
-                    />
-                  </Field>
-                </>
-              ) : null}
-
-              <Field label={t("forward.ingressNode")}>
-                <Select
-                  value={ingressId}
-                  onValueChange={(value) => {
-                    setIngressId(value);
-                    setEgressId("");
-                    setBindEgressId("");
-                  }}
-                >
-                  <SelectTrigger><SelectValue placeholder={t("forward.chooseIngress")} /></SelectTrigger>
-                  <SelectContent>
-                    {ingressNodes.map((node) => (
-                      <SelectItem key={String(node.id)} value={String(node.id)}>
-                        {node.node_id} · {node.connect_ip ?? t("node.waiting")}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              {createMode === "relay" ? (
-                <Field label={t("forward.egressNode")}>
-                  <div className="flex flex-col gap-3">
-                    {selectedBindings.length > 0 ? (
-                      <Select value={egressId} onValueChange={setEgressId}>
-                        <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
-                        <SelectContent>
-                          {selectedBindings.map((binding) => (
-                            <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
-                              {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
-                              {/*
-                               * V4-WP9 §13.6「Binding usage」：使用量是后端响应投影
-                               * （`used_by_forward_count`），前端不重算；选出出口时就能
-                               * 看到它已经被多少条中继占用，而不是解绑时被 409 告知。
-                               */}
-                              {hasBindingUsage(binding)
-                                ? ` · ${L("forward.bindingUsageUsed", {
-                                    count: bindingUsageView(binding).used_by_forward_count,
-                                  })}`
-                                : ""}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
-                        <div>{t("forward.noBoundEgress")}</div>
-                        <div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div>
-                      </div>
-                    )}
-
-                    {canManageNodes && availableEgressNodes.length > 0 ? (
-                      <div className="rounded-md border border-[var(--border)] p-3">
-                        <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">
-                          {selectedBindings.length > 0
-                            ? t("forward.bindAnotherEgress")
-                            : t("forward.bindInline")}
-                        </div>
-                        <div className="flex flex-col gap-2 sm:flex-row">
-                          <Select value={bindEgressId} onValueChange={setBindEgressId}>
-                            <SelectTrigger className="min-w-0 flex-1">
-                              <SelectValue placeholder={t("forward.chooseUnboundEgress")} />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {availableEgressNodes.map((node) => (
-                                <SelectItem key={String(node.id)} value={String(node.id)}>
-                                  {node.node_id} · {node.connect_ip ?? t("node.waiting")}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            onClick={() => void bindSelectedEgress()}
-                            disabled={bindingBusy || !bindEgressId}
-                          >
-                            {t("forward.bindAndUse")}
-                          </Button>
-                        </div>
-                      </div>
-                    ) : selectedBindings.length === 0 ? (
-                      <div className="text-xs text-[var(--muted-foreground)]">
-                        {t("forward.noAvailableEgress")}{" "}
-                        <Link href="/nodes" className="underline underline-offset-2">
-                          {t("common.nodes")}
-                        </Link>
-                      </div>
-                    ) : null}
-                  </div>
-                </Field>
-              ) : null}
-
-              {/*
-               * 空值 = 自动分配。提示与占位符都走 `forward-copy.ts` 的纯逻辑，
-               * 保证「空」永远被渲染成文字而不是一个看起来像真值的端口号。
-               */}
-              <Field label={t("forward.listenPort")} hint={L(listenPortHintKey(listenPort))}>
-                <Input
-                  inputMode="numeric"
-                  value={listenPort}
-                  onChange={(event) => setListenPort(event.target.value)}
-                  placeholder={L(listenPortPlaceholderKey(listenPort))}
-                  data-testid="forward-listen-port"
-                />
-              </Field>
-              <Field label={t("forward.targetHost")}>
-                <Input value={targetHost} onChange={(event) => setTargetHost(event.target.value)} placeholder="example.com" />
-              </Field>
-              <Field label={t("forward.targetPort")}>
-                <Input
-                  inputMode="numeric"
-                  value={targetPort}
-                  onChange={(event) => setTargetPort(event.target.value)}
-                  placeholder="443"
-                />
-              </Field>
-
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setCreateOpen(false)}>{t("common.cancel")}</Button>
-            <Button
-              onClick={() => void createForward()}
-              disabled={
-                busy ||
-                ingressNodes.length === 0 ||
-                // V5-WP5-A1：tls 的两个路径没填齐 → 提交按钮点不动
-                // （「tls 但没有证书」不是一种可提交的状态）。
-                !protocolReady ||
-                (createMode === "relay" && (!egressId || selectedBindings.length === 0))
-              }
-            >
-              {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ForwardCreateDialog
+        open={createOpen && canCreate}
+        draft={createDraft}
+        ingressNodes={ingressNodes}
+        selectedBindings={selectedBindings}
+        availableEgressNodes={availableEgressNodes}
+        canManageNodes={canManageNodes}
+        bindingBusy={bindingBusy}
+        busy={busy}
+        locale={locale}
+        t={t}
+        text={L}
+        onOpenChange={setCreateOpen}
+        onDraftChange={setCreateDraft}
+        onBindEgress={() => void bindSelectedEgress()}
+        onCreate={() => void createForward()}
+      />
 
       <Dialog open={createdForward !== null} onOpenChange={(open) => !open && setCreatedForward(null)}>
         <DialogContent>
@@ -1173,26 +958,3 @@ export function ForwardWorkspace() {
   );
 }
 
-function Field({
-  label,
-  hint,
-  error,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  /** 形态预检错误（已本地化文本）。与 hint 并列显示：错误说「怎么改」。 */
-  error?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Label>{label}</Label>
-      {children}
-      {error ? (
-        <p className="text-xs text-[var(--destructive)]">{error}</p>
-      ) : null}
-      {hint ? <p className="text-xs text-[var(--muted-foreground)]">{hint}</p> : null}
-    </div>
-  );
-}
