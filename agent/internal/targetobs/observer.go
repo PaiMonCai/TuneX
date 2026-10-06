@@ -1,6 +1,6 @@
 // Package targetobs is the Agent-side target observer:
 // the component that turns "this node is supposed to serve these targets" into
-// the frozen fact set the panel reads (DEVELOPMENT.md §7, 冻结结论 rows 1-9).
+// the stable fact set the panel reads.
 //
 // What it is, and what it deliberately is NOT:
 //
