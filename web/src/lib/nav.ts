@@ -147,6 +147,15 @@ export const userConsoleNav: NavGroup[] = [
     items: [
       { href: "/settings", labelKey: "common.settings", iconKey: "settings" },
       { href: "/settings/workspace", labelKey: "common.workspace", iconKey: "workspace" },
+      // DDNS 切片的设置页入口：词条暂放在 `lib/ddns-i18n.ts`（与 node-*-i18n 同一约定），
+      // 词典尚未收录，故带 labelZh/labelEn 回退，避免渲染成键名本身。
+      {
+        href: "/settings/dns",
+        labelKey: "ddns.providersTitle",
+        labelZh: "DNS 服务商",
+        labelEn: "DNS providers",
+        iconKey: "tunnels",
+      },
     ],
   },
 ];

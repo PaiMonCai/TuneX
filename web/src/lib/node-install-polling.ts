@@ -13,6 +13,9 @@
  *    的响应既不回调、也不清理新轮次的状态、更不续轮。
  * 4. **停止/故障都不谎报成功**：`stop("timeout")` 只结束自动等待；取数失败继续
  *    等下一轮。两者都保留命令与手动重试。
+ * 4b. **消费者异常不是取数失败**：`onView` 抛错只走 `onViewError`，不影响这一帧的
+ *    闭环判定，也不改变轮询语义（否则一次 online 会被前端 bug 吃掉，界面永远不进
+ *    成功态，还一路轮询到 30 分钟）。
  * 5. **截止时间独立于取数**：`start()` 时挂一个 `maxMs` 的 deadline 定时器。
  *    取数永远挂起（半开连接）时窗口照样到期——旧实现只在 tick 开头判窗口，
  *    而 tick 只在上一轮结算后才排期，于是「挂起 = 永远不会超时」。
@@ -72,6 +75,13 @@ export interface NodeInstallPollingOptions<TView extends NodeInstallView> {
   onStop?: (reason: InstallPollStopReason) => void;
   /** 取数失败：**不停轮询**，由调用方展示「暂时取不到」并等下一轮自愈。 */
   onError?: (error: unknown) => void;
+  /**
+   * `onView` 自身抛出的异常（消费者 bug）。
+   *
+   * 与 `onError` **分开**是必须的：回调异常不是数据源故障，不能报成「暂时取不到」，
+   * 更不能吃掉这一帧的闭环判定。没有传就丢弃（该库无 DOM/日志设施，不在这里打日志）。
+   */
+  onViewError?: (error: unknown) => void;
   intervalMs?: number;
   maxMs?: number;
   now?: () => number;
@@ -191,24 +201,37 @@ export class NodeInstallPoller<TView extends NodeInstallView> {
     // 同一轮次最多一个在途请求；正常路径下一轮只在结算后才排期。
     if (this.inFlightGeneration === generation) return;
     this.inFlightGeneration = generation;
+    let view: TView;
     try {
-      const view = await this.options.loadView(this.options.nodeId);
-      // 只有「自己那一轮」才清理在途标记：旧轮次的响应不得清掉新轮次的请求状态。
-      if (this.inFlightGeneration === generation) this.inFlightGeneration = null;
-      if (!this.active || generation !== this.generation) return;
-      this.options.onView(view);
-      if (installViewReachedClosure(view)) {
-        this.stop("closure");
-        return;
-      }
-      this.scheduleTick(generation);
+      view = await this.options.loadView(this.options.nodeId);
     } catch (error) {
+      // 只有**数据源**的失败才是"取数失败"。
       if (this.inFlightGeneration === generation) this.inFlightGeneration = null;
       if (!this.active || generation !== this.generation) return;
       this.options.onError?.(error);
       // 取数失败不停：节点刚上线时后端可能瞬时不可用，静默跳过这一轮
       // 比中断等待更符合用户预期；界面只提示「暂时取不到」。
       this.scheduleTick(generation);
+      return;
     }
+    // 只有「自己那一轮」才清理在途标记：旧轮次的响应不得清掉新轮次的请求状态。
+    if (this.inFlightGeneration === generation) this.inFlightGeneration = null;
+    if (!this.active || generation !== this.generation) return;
+
+    // 消费者回调**不在**取数的 try 里：`onView` 是界面代码，它抛错是前端 bug，
+    // 不是数据源故障。放进同一个 catch 会有两个真实后果：
+    //   ① 这一帧明明是 online，闭环判定却被跳过 —— 界面永远不进成功态；
+    //   ② 一直轮询到 30 分钟 deadline，并把前端 bug 报成「暂时取不到」。
+    // 所以回调异常只交给 `onViewError`，绝不改变闭环判定与轮询语义。
+    try {
+      this.options.onView(view);
+    } catch (error) {
+      this.options.onViewError?.(error);
+    }
+    if (installViewReachedClosure(view)) {
+      this.stop("closure");
+      return;
+    }
+    this.scheduleTick(generation);
   }
 }

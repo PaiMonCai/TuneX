@@ -528,3 +528,153 @@ describe("安装等待轮询：停止后丢弃晚到响应", () => {
     expect(poller.isActive).toBe(true);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* ⑧ 消费者回调（onView）抛错 ≠ 取数失败                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 这两个异常必须分开（受控复现的旧行为）：`onView` 在 `connection === "online"`
+ * 那一帧抛错时，旧实现把它当成"本轮取数失败" —— 于是
+ *   ① 闭环判定被跳过：界面永远不进成功态；
+ *   ② 一直轮询到 30 分钟 deadline，并把**前端 bug** 报成「暂时取不到」。
+ * 现在：回调异常只走 `onViewError`，闭环判定与轮询语义都不受影响。
+ */
+describe("消费者回调抛错：不改变闭环判定与轮询语义", () => {
+  test("online 那一帧 onView 抛错 → 仍然 stop('closure')，且这次 online 没有被丢掉", async () => {
+    const timers = new FakeTimers();
+    const views: NodeInstallView[] = [];
+    const stops: InstallPollStopReason[] = [];
+    const errors: unknown[] = [];
+    const viewErrors: unknown[] = [];
+    let calls = 0;
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: async () => {
+        calls += 1;
+        return { connection: "online" };
+      },
+      onView: (view) => {
+        views.push(view);
+        throw new Error("consumer boom");
+      },
+      onViewError: (error) => viewErrors.push(error),
+      onStop: (reason) => stops.push(reason),
+      onError: (error) => errors.push(error),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.start();
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    await flush();
+
+    expect(stops).toEqual(["closure"]);
+    expect(poller.isActive).toBe(false);
+    // 那一帧 online 被消费者看到了（异常发生在它之后），没有被吞掉。
+    expect(views).toEqual([{ connection: "online" }]);
+    expect(viewErrors).toHaveLength(1);
+    // 关键断言：这不是"取数失败"，所以错误没有被报成「暂时取不到」。
+    expect(errors).toEqual([]);
+    // 也没有继续轮询到 30 分钟：定时器全清、不再取数。
+    expect(timers.pendingTasks).toBe(0);
+    await timers.advance(INSTALL_POLL_MAX_MS);
+    expect(calls).toBe(1);
+  });
+
+  test("非闭环帧 onView 抛错 → 照常续轮（异常不改变轮询语义），但仍不冒充取数失败", async () => {
+    const timers = new FakeTimers();
+    const stops: InstallPollStopReason[] = [];
+    const errors: unknown[] = [];
+    const viewErrors: unknown[] = [];
+    let calls = 0;
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: async () => {
+        calls += 1;
+        return calls === 1 ? { connection: "waiting" } : { connection: "online" };
+      },
+      onView: () => {
+        throw new Error("consumer boom");
+      },
+      onViewError: (error) => viewErrors.push(error),
+      onStop: (reason) => stops.push(reason),
+      onError: (error) => errors.push(error),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.start();
+    await timers.advance(INSTALL_POLL_INTERVAL_MS); // 第 1 轮：waiting + 回调抛错
+    expect(calls).toBe(1);
+    expect(errors).toEqual([]); // 回调异常不是取数失败
+    expect(stops).toEqual([]);
+    expect(poller.isActive).toBe(true);
+
+    // 回调抛错不影响排期：下一轮照常发生，并在 online 时闭环。
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    await flush();
+    expect(calls).toBe(2);
+    expect(stops).toEqual(["closure"]);
+    expect(viewErrors).toHaveLength(2);
+    expect(errors).toEqual([]);
+  });
+
+  test("取数失败仍然走 onError（与回调异常分开），onView 不被调用", async () => {
+    const timers = new FakeTimers();
+    const stops: InstallPollStopReason[] = [];
+    const errors: unknown[] = [];
+    const viewErrors: unknown[] = [];
+    const views: NodeInstallView[] = [];
+    let calls = 0;
+    const sourceError = new Error("loadView down");
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: async () => {
+        calls += 1;
+        if (calls === 1) throw sourceError;
+        return { connection: "online" };
+      },
+      onView: (view) => views.push(view),
+      onViewError: (error) => viewErrors.push(error),
+      onStop: (reason) => stops.push(reason),
+      onError: (error) => errors.push(error),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.start();
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    expect(errors).toEqual([sourceError]);
+    expect(viewErrors).toEqual([]);
+
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    await flush();
+    expect(stops).toEqual(["closure"]);
+    expect(views).toEqual([{ connection: "online" }]);
+    expect(viewErrors).toEqual([]);
+  });
+
+  test("没有注入 onViewError 时，回调异常被丢弃但闭环判定照旧（不静默改语义）", async () => {
+    const timers = new FakeTimers();
+    const stops: InstallPollStopReason[] = [];
+    const errors: unknown[] = [];
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: async () => ({ connection: "online" }),
+      onView: () => {
+        throw new Error("consumer boom");
+      },
+      onStop: (reason) => stops.push(reason),
+      onError: (error) => errors.push(error),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.start();
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    await flush();
+    expect(stops).toEqual(["closure"]);
+    expect(errors).toEqual([]);
+  });
+});

@@ -333,7 +333,8 @@ export async function handleWorkspacesMock(ctx: rt.MockAuthedRouteContext): Prom
   // 与后端 `routes/me.ts` 同形：作用域由请求里的 workspace（`scopeId`）决定，
   // 权限/额度/entitlement 全部来自该工作空间的有效策略，跨空间不串。
   if (seg[0] === "me" && seg[1] === "capabilities" && method === "GET") {
-    return ok(mockCapabilitiesReport(db, scopeId));
+    // 与后端逐字同形：`c.json({ data: report })`。
+    return ok({ data: mockCapabilitiesReport(db, scopeId) });
   }
 
   // ---------- dashboard ----------

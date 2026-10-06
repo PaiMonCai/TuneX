@@ -49,7 +49,6 @@ import {
   readLatencySeries,
 } from "../services/latency-history.ts";
 import type { LatencyGranularity } from "../services/latency-history.ts";
-import { targetKeyOf } from "../services/node-state.ts";
 import { parseForwardBatchRequest } from "../services/forward-batch.ts";
 import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
 import {
@@ -693,6 +692,25 @@ type DimensionResolution =
   | { ok: false; status: "ambiguous_target"; reason: ForwardLatencyReason; candidate_targets: number };
 
 /**
+ * 目标身份归一化**只有一份实现**（`node-state.ts:targetKeyOf`，档案的写入方用的就是它）。
+ *
+ * 为什么这里是**惰性** import 而不是文件顶部的静态 import：`node-state.ts` 的导入图在
+ * **模块加载期**就 `new Redis(..., { lazyConnect: false })`（`src/redis.ts:16`），于是任何
+ * 只为"多挂一条读端点"而 import 它的进程都会多出一个永不排空的 Redis 连接。这不是理论：
+ * 本文件的静态 import 版本让 `workspace-rbac.test.ts` 的 WP10 子进程（只挂
+ * forwards/nodes/tunnels/workspaces 四个路由、靠事件循环自然排空退出）从 0.2s 变成
+ * bun 的 5s 测试超时。生产进程不受影响（`app.ts` 早就通过 `routes/public.ts` 加载了同一模块，
+ * 这里是缓存命中），所以这条惰性化**不新增任何副作用**，只是不给窄进程平白加一个连接。
+ */
+let canonicalTargetKeyOf: ((host: string, port: number) => string | null) | null = null;
+async function targetKeyOfCanonical(host: string, port: number): Promise<string | null> {
+  if (canonicalTargetKeyOf === null) {
+    canonicalTargetKeyOf = (await import("../services/node-state.ts")).targetKeyOf;
+  }
+  return canonicalTargetKeyOf(host, port);
+}
+
+/**
  * 从**已授权**的 Forward 推导观测维度 `(observer_node_id, target_key)`。
  *
  * ── 维度是服务端事实，不是客户端参数 ──
@@ -742,9 +760,9 @@ async function resolveForwardLatencyDimension(row: ForwardLatencyRow): Promise<D
   }
   const keys: string[] = [];
   for (const target of pool.targets) {
-    // 身份归一化只有一份实现（`node-state.ts:targetKeyOf`）：自己拼 `host:port` 会让
-    // 档案里真实存在的目标在界面上变成"没有证据"。
-    const key = targetKeyOf(target.host, target.port);
+    // 身份归一化只有一份实现（`node-state.ts:targetKeyOf`，见上面的惰性加载说明）：
+    // 自己拼 `host:port` 会让档案里真实存在的目标在界面上变成"没有证据"。
+    const key = await targetKeyOfCanonical(target.host, target.port);
     if (key !== null && !keys.includes(key)) keys.push(key);
   }
   if (keys.length === 0) return { ok: false, status: "no_observer", reason: "no_active_target" };

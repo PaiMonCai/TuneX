@@ -139,8 +139,15 @@ export async function handleCatalogMock(ctx: rt.MockAuthedRouteContext): Promise
       const body = asRecord(req.body);
       const nodeKey = reqStr(body.node_id);
       if (!nodeKey) return badRequest("node_id / connect_ip / role 不合法");
-      if (db.nodes.some((node) => node.node_id === nodeKey)) {
-        return fail(409, "节点 ID 已存在", "NODE_EXISTS");
+
+      // 同名语义与真实后端对齐（E2 复核 F6）：**同组同名是 201 重签**，不是 409。
+      // 真实后端 `routes/node-groups.ts` 在这条路径上只做 identity/enrollment 重签
+      // （行不变、id 不变、role/range/connect_ip 一律不动），旧命令被新的一次性
+      // enrollment 取代 —— 这恰恰是用户最需要理解的安全语义，mock 不能演示成报错。
+      // 只有**别的节点组**已占用这个 node_id 才是 409（后端那里也没有 code）。
+      const existing = db.nodes.find((node) => node.node_id === nodeKey);
+      if (existing && existing.node_group_id !== group.id) {
+        return { status: 409, body: { error: "node_id 已被其它节点组占用" } };
       }
 
       const roleRaw = reqStr(body.role);
@@ -153,12 +160,14 @@ export async function handleCatalogMock(ctx: rt.MockAuthedRouteContext): Promise
       const range = group.port_range?.split("-").map(Number) ?? [];
       const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
       const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
+      // 与后端一致：端口区间只约束**新建行**；重签一个已存在的节点不看组区间。
       if (
-        portMin === null ||
-        portMax === null ||
-        portMin < 1 ||
-        portMax > 65535 ||
-        portMin > portMax
+        !existing &&
+        (portMin === null ||
+          portMax === null ||
+          portMin < 1 ||
+          portMax > 65535 ||
+          portMin > portMax)
       ) {
         return failFlat(409, "节点组未配置可用于 v3 的连续端口范围", "PORT_RANGE_REQUIRED");
       }
@@ -192,12 +201,22 @@ export async function handleCatalogMock(ctx: rt.MockAuthedRouteContext): Promise
         credential_rotated_at: null,
         credential_last_rejected_at: null,
       };
-      db.nodes.push(created);
-      const projected = mockUserNode(db, created);
-      return ok({
-        node: projected,
-        enrollment: mockEnrollment(projected),
-      });
+      // 同组同名 → 复用同一行（id 不变）；新名字 → 新建一行。两条路径都返回
+      // **新签发的一次性 enrollment**，与真实后端 `createNodeEnrollment` 一致。
+      const target = existing ?? created;
+      if (!existing) db.nodes.push(created);
+      const projected = mockUserNode(db, target);
+      // 201（真实后端 provision 恒为 201）+ `{ node, enrollment }`。
+      //
+      // 形状约定：`handleMock` 的 body 是**剥掉一层 `data` 之后**的视图（与
+      // `GET /nodes` 同口径：真实后端 `{ data: [...] }`，mock 直接给数组）。真实后端
+      // provision 的原始报文是 `{ data: { node, enrollment } }`，`api` 层的 `post()`
+      // 会剥掉那层 `data` 得到 `ProvisionNodeResult = { node, enrollment }` —— 这里
+      // 给的就是**同一个**客户端可见形状，创建与重签两条路径完全一致。
+      return {
+        status: 201,
+        body: { node: projected, enrollment: mockEnrollment(projected) },
+      };
     }
 
     return notFound(`Mock route not found: ${method} /${clean}`);

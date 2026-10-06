@@ -5,6 +5,9 @@
  * "生成了字符串"，而是"脚本里的每一步顺序、身份复用与失败路径都不能被写错"。
  */
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkUpgradePrecondition,
   renderNodeUpgradeScript,
@@ -137,11 +140,13 @@ describe("identity check on the real Agent image: executable, and never a false 
   test("sources the credential from the mounted agent.env inside the container", () => {
     const block = identitySection(render().script);
     const exec = block.indexOf("docker exec");
-    const sourced = block.indexOf(". /run/tunex-agent/agent.env");
+    const sourced = block.indexOf('. "$ENV_FILE"');
     const used = block.indexOf("TUNEX_NODE_CREDENTIAL");
     expect(exec).toBeGreaterThan(-1);
     expect(sourced).toBeGreaterThan(exec);
     expect(used).toBeGreaterThan(sourced);
+    // 容器内的默认路径仍然是节点上的标准位置：`docker exec` 显式把它作为 $3 传进去。
+    expect(block).toContain('sh "$PANEL" "$CHECK_TIMEOUT" /run/tunex-agent/agent.env');
   });
 
   test("does not assume curl: probes curl, then falls back to busybox wget", () => {
@@ -152,6 +157,21 @@ describe("identity check on the real Agent image: executable, and never a false 
     // wget carries the same header and its status line is parsed, not guessed.
     expect(block).toContain('--header "Authorization: Bearer $TUNEX_NODE_CREDENTIAL"');
     expect(block).toContain('grep -oE "HTTP/[0-9.]+ [0-9]{3}"');
+  });
+
+  test("wget takes the FIRST status line, never the last one (busybox follows redirects)", () => {
+    // busybox wget 1.37 没有 `--max-redirect`，无法禁止跟随重定向；`-S` 会把每一跳的
+    // 状态行都打出来。取最后一行的话，"302 → /login(200)" 会被读成 200 并打印"通过"。
+    const block = identitySection(render().script);
+    expect(block).toContain('grep -oE "HTTP/[0-9.]+ [0-9]{3}" "$HDR" | head -n 1');
+    expect(block).not.toContain("tail -n 1 | grep -oE");
+  });
+
+  test("a 200 without a Panel-shaped JSON body is 未校验, not 通过", () => {
+    const block = identitySection(render().script);
+    expect(block).toContain("unverified:not_panel_json");
+    expect(block).toContain('grep -qE "\\"data\\"[[:space:]]*:" "$BODY"');
+    expect(block).toContain("REASON=\"Panel 回了 HTTP 200，但响应体不是 Panel 的 JSON");
   });
 
   test("only an explicit HTTP 200 counts as verified", () => {
@@ -185,6 +205,7 @@ describe("identity check on the real Agent image: executable, and never a false 
       "unverified:no_credential",
       "unverified:no_http_tool",
       "unverified:no_response",
+      "unverified:not_panel_json",
     ]) {
       expect(block).toContain(reason);
     }
@@ -211,6 +232,188 @@ describe("identity check on the real Agent image: executable, and never a false 
     }).script;
     expect(script).toContain('CHECK_TIMEOUT="5"');
   });
+});
+
+/* ================================================================== */
+/* 身份校验：把**渲染出来的那段探针**用真实 sh 跑一遍                       */
+/* ================================================================== */
+
+/**
+ * 从操作者会执行的脚本里取出容器内的探针文本（`docker exec … sh -c '<这段>'`）。
+ *
+ * 刻意不去 import 一个"探针生成函数"再跑它：那样测的是"我以为脚本里写了什么"，
+ * 这里测的是"脚本里**确实**写了什么"。探针体内不含单引号，所以这个截取是安全的，
+ * 取不到就直接抛（避免静默地测了个空）。
+ */
+function probeBody(script: string): string {
+  const match = script.match(/docker exec "\$CONTAINER" sh -c '([\s\S]*?)' sh /);
+  if (!match) throw new Error("rendered upgrade script is missing the in-container identity probe");
+  return match[1]!;
+}
+
+type PanelMode = "ok" | "redirect" | "html200" | "json200" | "badjson200" | "500" | "401" | "404";
+
+/**
+ * 假 Panel：只回一种形状。`redirect` 复现真实缺陷（302 → /login(200)），其余是
+ * "200 但响应体不是 Panel JSON" 的几种外壳（门户页 / catch-all / 别的 JSON）。
+ */
+function startFakePanel(mode: PanelMode) {
+  return Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (path === "/login") return new Response("<html>login page</html>", { headers: { "content-type": "text/html" } });
+      switch (mode) {
+        case "ok":
+          return Response.json({ data: { snapshot: null } });
+        case "redirect":
+          return new Response("<html>login</html>", {
+            status: 302,
+            headers: { location: "/login", "content-type": "text/html" },
+          });
+        case "html200":
+          return new Response("<html><body>panel portal</body></html>", { headers: { "content-type": "text/html" } });
+        case "json200":
+          return Response.json({ foo: "bar" });
+        case "badjson200":
+          return new Response("{oops", { headers: { "content-type": "application/json" } });
+        default:
+          return new Response("{}", { status: Number(mode), headers: { "content-type": "application/json" } });
+      }
+    },
+  });
+}
+
+/** 只暴露探针真正用到的那几个工具（外加 curl/wget 之一），用来逼出两条分支。 */
+function restrictedPath(dir: string, tools: string[]): string {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  for (const tool of tools) {
+    const found = ["/usr/bin", "/bin", "/usr/local/bin"]
+      .map((base) => join(base, tool))
+      .find((candidate) => existsSync(candidate));
+    if (!found) throw new Error(`test host is missing '${tool}'`);
+    symlinkSync(found, join(bin, tool));
+  }
+  return bin;
+}
+
+const SH = ["/bin/sh", "/usr/bin/sh"].find((candidate) => existsSync(candidate)) ?? "sh";
+
+/** 一次探针运行的完整环境：独立临时目录 + agent.env + 受控 PATH。 */
+function probeSandbox(tools: string[]) {
+  const dir = mkdtempSync(join(tmpdir(), "tunex-upgrade-probe-"));
+  const envFile = join(dir, "agent.env");
+  writeFileSync(envFile, "TUNEX_NODE_CREDENTIAL=probe-test-credential\n");
+  return { dir, envFile, bin: restrictedPath(dir, tools) };
+}
+
+/**
+ * 用真实 sh 跑一段探针；走 curl 还是 wget 由 PATH 里放了哪个工具决定。
+ *
+ * 必须是**异步** spawn：假 Panel 就跑在同一个进程里（`Bun.serve`），同步 spawn 会把
+ * 事件循环堵死，服务端永远回不了响应（实测 curl 28 超时、0 字节）。
+ */
+async function runProbe(body: string, base: string, bin: string, envFile: string): Promise<string> {
+  const proc = Bun.spawn([SH, "-c", body, "sh", base, "5", envFile], {
+    env: { PATH: bin },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return out.trim();
+}
+
+/** 跑一条命令并拿回 stdout/stderr（同样是异步，理由见 `runProbe`）。 */
+async function runCommand(argv: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const code = await proc.exited;
+  return { stdout, stderr, code };
+}
+
+const EXPECTED: Record<PanelMode, string> = {
+  ok: "http:200",
+  redirect: "http:302",
+  html200: "unverified:not_panel_json",
+  json200: "unverified:not_panel_json",
+  badjson200: "unverified:not_panel_json",
+  "500": "http:500",
+  "401": "http:401",
+  "404": "http:404",
+};
+
+describe("identity probe behaviour: a 302 or a non-Panel 200 is never 通过", () => {
+  const body = probeBody(render().script);
+
+  test("curl 与 wget 两条分支对同一个响应给同一结论（含 302 与各种假 200）", async () => {
+    const curlBox = probeSandbox(["curl", "grep", "head", "mktemp", "rm"]);
+    const wgetBox = probeSandbox(["wget", "grep", "head", "mktemp", "rm"]);
+    try {
+      for (const mode of Object.keys(EXPECTED) as PanelMode[]) {
+        const panel = startFakePanel(mode);
+        try {
+          const base = `http://127.0.0.1:${panel.port}`;
+          const viaCurl = await runProbe(body, base, curlBox.bin, curlBox.envFile);
+          const viaWget = await runProbe(body, base, wgetBox.bin, wgetBox.envFile);
+          expect(`${mode}: curl=${viaCurl}`).toBe(`${mode}: curl=${EXPECTED[mode]}`);
+          expect(`${mode}: wget=${viaWget}`).toBe(`${mode}: wget=${EXPECTED[mode]}`);
+          // 两条分支必须给出**同一个**结论：这正是 F1 里被破坏的性质。
+          expect(viaCurl).toBe(viaWget);
+        } finally {
+          panel.stop(true);
+        }
+      }
+    } finally {
+      rmSync(curlBox.dir, { recursive: true, force: true });
+      rmSync(wgetBox.dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("302 → /login(200) 的证据链：wget 真的跟随重定向，最后一跳是 200（旧的 tail -n 1 读到的就是它）", async () => {
+    const box = probeSandbox(["wget", "grep", "head", "mktemp", "rm"]);
+    const panel = startFakePanel("redirect");
+    try {
+      const base = `http://127.0.0.1:${panel.port}`;
+      const raw = await runCommand([
+        join(box.bin, "wget"),
+        "-S",
+        "-O",
+        "/dev/null",
+        "-T",
+        "5",
+        "--header",
+        "Authorization: Bearer probe-test-credential",
+        `${base}/api/internal/node/snapshot`,
+      ]);
+      const hops = raw.stderr.match(/HTTP\/[0-9.]+ [0-9]{3}/g) ?? [];
+      expect(hops.length).toBeGreaterThan(1); // 真的跟随了重定向（不是单跳）
+      expect(hops[0]).toContain("302");
+      expect(hops[hops.length - 1]).toContain("200"); // 旧实现的 `tail -n 1` 读到的就是它
+      // 而脚本的结论来自第一跳，所以是 未校验，不是"通过"。
+      expect(await runProbe(body, base, box.bin, box.envFile)).toBe("http:302");
+    } finally {
+      panel.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("容器里既没有 curl 也没有 wget 时是 未校验（不是通过）", async () => {
+    const box = probeSandbox(["grep", "head", "mktemp", "rm"]);
+    const panel = startFakePanel("ok");
+    try {
+      const base = `http://127.0.0.1:${panel.port}`;
+      expect(await runProbe(body, base, box.bin, box.envFile)).toBe("unverified:no_http_tool");
+    } finally {
+      panel.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("rollback anchor", () => {

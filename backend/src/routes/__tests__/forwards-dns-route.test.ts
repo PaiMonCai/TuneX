@@ -32,6 +32,11 @@
  *   ⑦ `POST/GET/DELETE /:id/dns` **没有**被 `/:id/:action` catch-all 吃掉（回归保护）；
  *   ⑧ 三个新读投影字段的真实取值（有退避 / 无退避 / 开关关着 / 解绑后作废）；
  *   ⑨ `GET` 零副作用（不写库）。
+ *
+ * 场景分**两个**子进程（权限/作用域一类、响应契约/回归一类），每个场景是一个 `group(...)`：
+ * 组内断言计数必须**恰好**等于写死的数字 —— 既证明这组真的跑到了，也挡住"整组被跳过/被注释掉"
+ * 这类静默失效（只断言"通过"的话，一个空场景也是绿的）。之所以压到两个而不是六个：子进程启动
+ * 有真实成本，而全量套件里还有别的进程级用例（workspace-rbac 的 30s 预算）对负载敏感。
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -159,19 +164,33 @@ async function status(res, want) { expect(res.status).toBe(want); checks = check
 async function body(res) { return await res.json(); }
 const VALID_BIND = { domain: "Edge.Example.com.", record_type: "A", mode: "single_active", provider_id: 5, auto_resolve: true };
 const VIEW_KEYS = ["state","domain","record_type","mode","provider_id","expected_values","confirmed_values","synced_at","verified","last_error","auto_resolve","attempt_count","next_attempt_at"].sort();
+
+/*
+ * 分组执行器：一组内的断言计数必须**恰好**等于写死的数字。
+ * 静默失效（断言被删掉/被跳过/提前 return）会让"绿的"变成一个空场景，所以组内计数相等是第二条护栏。
+ */
+async function group(name, expectChecks, fn) {
+  checks = 0;
+  await fn();
+  if (checks !== expectChecks) {
+    throw new Error("GROUP " + name + ": expected " + expectChecks + " checks, got " + checks);
+  }
+  console.log("GROUP " + name + "=" + checks);
+}
 `;
 
 /* ------------------------------------------------------------------ */
 /* 子进程执行器                                                        */
 /* ------------------------------------------------------------------ */
 
+/** 起一个干净的模块注册表，跑一段场景；子进程非 0 退出即失败（错误原文带上子进程行号）。 */
 function runScenario(scenario: string): string {
   const result = spawnSync(
     process.execPath,
     [
       "-e",
       PRELUDE + scenario +
-        "\nconsole.log('DNS ROUTE CHECKS:', checks);\n/* 真实 redis 客户端会拖住事件循环：显式退出，否则 spawnSync 只能等超时。 */\nprocess.exit(0);\n",
+        "\n/* 真实 redis 客户端会拖住事件循环：显式退出，否则 spawnSync 只能等超时。 */\nprocess.exit(0);\n",
     ],
     {
       cwd: root,
@@ -182,31 +201,30 @@ function runScenario(scenario: string): string {
   );
   expect(result.error).toBeUndefined();
   if (result.status !== 0) throw new Error(result.stdout + "\n" + result.stderr);
-  expect(result.stdout).toContain("DNS ROUTE CHECKS:");
   return result.stdout;
 }
 
-/**
- * 每组场景都要求检查计数**恰好**等于写死的数字。
- *
- * 两条护栏互补：子进程里 `expect` 失败会**抛出**（进程非 0 ⇒ `runScenario` 抛，错误原文带上子进程的
- * 行号与期望值），而计数相等能挡住"某条断言被注释掉 / 被条件跳过 / 提前 return"这一类静默失效
- * ——只断言"通过"的话，一个空场景也是绿的。
- */
-function runExactly(scenario: string, expectedChecks: number): string {
+/** 把若干场景拼成一个子进程；每个场景是一个 `group(...)`，结束后打印 `GROUP <名字>=<计数>`。 */
+function groupBlock(label: string, checks: number, body: string): string {
+  // 场景正文会被塞进模板串：正文里出现反引号会**提前终止**它（本次真的踩过），这里显式挡住。
+  if (body.includes("`")) throw new Error(`scenario ${label}: body must not contain backticks`);
+  return `await group(${JSON.stringify(label)}, ${checks}, async () => {\n${body}\n});\n`;
+}
+
+function runGroups(groups: Array<{ label: string; checks: number; body: string }>): void {
+  const scenario = groups.map((g) => groupBlock(g.label, g.checks, g.body)).join("\n");
   const stdout = runScenario(scenario);
-  const matched = /DNS ROUTE CHECKS: (\d+)/.exec(stdout);
-  expect(Number(matched?.[1] ?? 0)).toBe(expectedChecks);
-  return stdout;
+  for (const g of groups) {
+    // 精确计数：既证明这组跑到了，也挡住"整组被跳过"。
+    expect(stdout).toContain(`GROUP ${g.label}=${g.checks}`);
+  }
 }
 
 /* ------------------------------------------------------------------ */
-/* ① 权限接线 + creator 守卫（真实权限内核）                             */
+/* 六个场景的正文（每个场景 = 一个子进程内的 group(...)，缩进刻意保持扁平）  */
 /* ------------------------------------------------------------------ */
 
-test("权限接线：读=forward:read；POST=forward:update；viewer 只读；被拒不改库", async () => {
-  runExactly(`
-reset();
+const PB1 = `reset();
 /* owner：三件事都做得了。 */
 await status(await req(DNS, "GET"), 200);
 await status(await req(DNS, "POST", VALID_BIND), 200);
@@ -245,13 +263,9 @@ await status(await req(DNS, "DELETE"), 403);
 /* 两把权限都给才解得开（中间件要 delete，处理器要 update）。 */
 reset();
 asRole("viewer", { "forward:read": true, "forward:update": true, "forward:delete": true });
-await status(await req(DNS, "DELETE"), 200);
-`, 11);
-}, 30_000);
+await status(await req(DNS, "DELETE"), 200);`;
 
-test("creator 守卫：基础 member 只能改自己创建的转发；读是工作空间级的", async () => {
-  runExactly(`
-/* 读：member 能看到本 workspace 里别人的转发（读不受 creator 限制）。 */
+const PB2 = `/* 读：member 能看到本 workspace 里别人的转发（读不受 creator 限制）。 */
 reset();
 asRole("member");
 seed({ user_id: 99 });
@@ -272,17 +286,9 @@ asRole("member");
 seed({ user_id: 1 });
 await status(await req(DNS, "POST", VALID_BIND), 200);
 expect(updateCalls.length).toBe(1);
-await status(await req(DNS, "DELETE"), 200);
-`, 4);
-}, 30_000);
+await status(await req(DNS, "DELETE"), 200);`;
 
-/* ------------------------------------------------------------------ */
-/* ② 作用域：跨 Workspace 一律 404，不泄露存在性                          */
-/* ------------------------------------------------------------------ */
-
-test("作用域：跨 Workspace 与「不存在」逐字同形；workspace 本身也要有成员资格", async () => {
-  runExactly(`
-/* GET：owner 下，行在别的 workspace 与行不存在必须给出同一个响应体。 */
+const PB3 = `/* GET：owner 下，行在别的 workspace 与行不存在必须给出同一个响应体。 */
 reset();
 tunnel = null;
 const missingGetBody = await body(await status(await req(DNS, "GET"), 404));
@@ -312,17 +318,9 @@ expect(updateCalls.length).toBe(0);
 reset();
 requestWorkspace = WS + 6;
 await status(await req(DNS, "GET"), 404);
-expect(findFirstCalls.length).toBe(0);
-`, 6);
-}, 30_000);
+expect(findFirstCalls.length).toBe(0);`;
 
-/* ------------------------------------------------------------------ */
-/* ③④⑥ 平台级 provider / 绑定响应契约 / 载荷封闭                         */
-/* ------------------------------------------------------------------ */
-
-test("平台级 provider 的 403 语义不变；绑定成功只能是 pending 且不含凭据", async () => {
-  runExactly(`
-/* 非平台管理员用平台级 provider（workspace_id NULL）⇒ 403。 */
+const PB4 = `/* 非平台管理员用平台级 provider（workspace_id NULL）⇒ 403。 */
 reset();
 provider = { id: 5, workspace_id: null, config: SEALED };
 const forbiddenBody = await body(await status(await req(DNS, "POST", VALID_BIND), 403));
@@ -381,6 +379,17 @@ const off = await body(await status(await req(DNS, "POST", noSwitch), 200));
 expect(off.data.auto_resolve).toBe(false);
 expect(updateCalls[0].data.dns_auto_resolve).toBe(false);
 
+/* provider_id 可以为空：绑定照样成功，但执行器的第一个分支就 noop（dns_provider_id === null），
+   而闸门只把 dns_provider_unconfigured 写进 worker 日志 —— 界面唯一诚实的说法是"不会写入"。
+   投影必须如实给出 provider_id=null + auto_resolve=true，而不是让人以为"即将同步"。 */
+reset();
+const noProvider = await body(await status(await req(DNS, "POST", { domain: "edge.example.com", record_type: "A", mode: "single_active", auto_resolve: true }), 200));
+expect(noProvider.data.provider_id).toBeNull();
+expect(noProvider.data.auto_resolve).toBe(true);
+expect(noProvider.data.state).toBe("pending");
+expect(noProvider.data.attempt_count).toBe(0);
+expect(noProvider.data.next_attempt_at).toBeNull();
+
 /* 载荷封闭：未知字段 / 枚举 / 布尔形状一律 400，且不碰数据库。 */
 reset();
 const unknownField = await status(await req(DNS, "POST", Object.assign({}, VALID_BIND, { ttl: 300 })), 400);
@@ -389,17 +398,9 @@ await status(await req(DNS, "POST", Object.assign({}, VALID_BIND, { record_type:
 await status(await req(DNS, "POST", Object.assign({}, VALID_BIND, { mode: "whatever" })), 400);
 await status(await req(DNS, "POST", Object.assign({}, VALID_BIND, { auto_resolve: "yes" })), 400);
 expect(updateCalls.length).toBe(0);
-expect(findFirstCalls.length).toBe(0);
-`, 8);
-}, 30_000);
+expect(findFirstCalls.length).toBe(0);`;
 
-/* ------------------------------------------------------------------ */
-/* ⑤⑨ GET 形状 / 零副作用                                              */
-/* ------------------------------------------------------------------ */
-
-test("未绑定与已绑定的 GET 形状可区分；GET 是纯读", async () => {
-  runExactly(`
-/* 未绑定。 */
+const PB5 = `/* 未绑定。 */
 reset();
 const unbound = await body(await status(await req(DNS, "GET"), 200));
 expect(unbound.data.state).toBe("unbound");
@@ -443,17 +444,9 @@ expect(noIp.data.state).toBe("pending");
 /* 非法 id 在权限之后被拒（400），不读库。 */
 reset();
 await status(await req("/api/forwards/abc/dns", "GET"), 400);
-expect(findFirstCalls.length).toBe(0);
-`, 4);
-}, 30_000);
+expect(findFirstCalls.length).toBe(0);`;
 
-/* ------------------------------------------------------------------ */
-/* ⑦⑧ 路由顺序回归 + 新字段真实取值                                      */
-/* ------------------------------------------------------------------ */
-
-test("回归保护：DNS 子路由没被 /:id/:action 吃掉；三个新字段的真实取值", async () => {
-  runExactly(`
-/* ⑦ POST /:id/dns 真的落到 DNS 处理器（而不是 400「不支持的端口转发动作」）。 */
+const PB6 = `/* ⑦ POST /:id/dns 真的落到 DNS 处理器（而不是 400「不支持的端口转发动作」）。 */
 reset();
 const post = await body(await status(await req(DNS, "POST", VALID_BIND), 200));
 expect(post.data.state).toBe("pending");
@@ -514,6 +507,28 @@ const unbound = await body(await status(await req(DNS, "DELETE"), 200));
 expect(unbound.data.state).toBe("unbound");
 expect(unbound.data.auto_resolve).toBe(false);
 expect(unbound.data.attempt_count).toBeNull();
-expect(unbound.data.next_attempt_at).toBeNull();
-`, 9);
+expect(unbound.data.next_attempt_at).toBeNull();`;
+
+/* ------------------------------------------------------------------ */
+/* 六个场景分两个子进程：权限/作用域一类，响应契约/回归一类                  */
+/* ------------------------------------------------------------------ */
+
+const GROUPS_PERMISSION = [
+  { label: "权限接线", checks: 11, body: PB1 },
+  { label: "creator守卫", checks: 4, body: PB2 },
+  { label: "作用域", checks: 6, body: PB3 },
+];
+
+const GROUPS_CONTRACT = [
+  { label: "平台provider与绑定契约", checks: 9, body: PB4 },
+  { label: "GET形状与纯读", checks: 4, body: PB5 },
+  { label: "路由顺序与读投影", checks: 9, body: PB6 },
+];
+
+test("① 权限接线与作用域（真实 Hono 路由 + 真实权限内核）", () => {
+  runGroups(GROUPS_PERMISSION);
+}, 30_000);
+
+test("② 响应契约 / 路由顺序回归 / 读投影字段（真实 Hono 路由）", () => {
+  runGroups(GROUPS_CONTRACT);
 }, 30_000);

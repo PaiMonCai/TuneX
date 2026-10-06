@@ -114,6 +114,151 @@ import type { EffectiveWorkspacePermissions, WorkspaceCustomRole, WorkspaceCusto
 
 import { request, get, post, put, patch, del, applyMockSessionCookie, clearMockSessionCookie } from "./core";
 
+/* ================================================================== */
+/* Forward 链路（topology）Web 侧契约                                    */
+/* ================================================================== */
+
+/**
+ * 一条 runtime 的协议诊断读取视图（后端 `TunnelProtocolDiag` 的同形投影）。
+ *
+ * **三态不可合并**（这是本视图最容易读错的地方）：
+ *   · `diag === null` —— 这次上报里**没有**协议诊断块（tcp 隧道本来就没有，
+ *     旧 Agent 也不上报）：没有证据；
+ *   · `facts` 为空对象 —— 报了诊断块，但这次一个标量事实都没有；
+ *   · `facts: { drops: 0 }` —— 报了，而且真的没有丢包。
+ * 把第一种渲染成「没丢包 / 一切正常」是本视图最严重的误读方式。
+ *
+ * `facts` 的键集由 Agent 拥有且**开放**：未知键照原样进视图，读取方不得自建白名单。
+ */
+export interface TopologyDiagFact {
+  protocol: string | null;
+  facts: Record<string, number | string | boolean>;
+  /** 后端视图做过有界化（键数上限 / 长字符串截断）；true 时 `facts` 不是原始块全量。 */
+  truncated: boolean;
+}
+
+/** 一跳的一端：某节点上的某条 runtime 的事实。 */
+export interface TopologyEndpointFact {
+  node_id: number;
+  node_key: string;
+  runtime_id: string;
+  /**
+   * 该 runtime 是否出现在该节点**最近一次上报**里。
+   *
+   * `false` 有两种成因、且都**不是**「已停机 / 不健康」的结论：
+   *   · 该节点从未上报过（看 `observed_at === null` / 该端的 `revision === null`）；
+   *   · 该节点报过，但最近一次上报里没有这条 runtime（面板抢先、节点还没跑起来）。
+   */
+  running: boolean;
+  /** 上报里那条 runtime 的 revision；没有上报时为 `null`（未知，不是 0）。 */
+  revision: number | null;
+  diag: TopologyDiagFact | null;
+}
+
+/** 一段节点间链路。段名沿用后端 `NodeFactsSegment` 的词表，Web 不另造名字。 */
+export interface ForwardTopologySegment {
+  segment: "ingress_to_egress" | "ingress_to_middle" | "middle_to_egress";
+  from: TopologyEndpointFact;
+  to: TopologyEndpointFact;
+  /** 配置里的下一跳地址（**仅展示**：它指向业务监听端口，本视图不拨它）。 */
+  hop: { host: string; port: number } | null;
+  /** 两端都应收敛到的 desired revision。 */
+  expected_revision: number | null;
+}
+
+/**
+ * `GET /api/forwards/:id/topology` 的响应体（只读投影）。
+ *
+ * 三条已被真实响应证实的读法：
+ *  1. `mode === "direct"` 时 `segments` **一定是空数组**，这是 DIRECT 的设计结论
+ *     （入口直接到目标，没有节点间跳），**不是缺数据**，也不该画成空态/错误；
+ *  2. `observed_at` 是「参与节点中**最新**一条上报的时刻」，`null` = 没有任何节点上报过。
+ *     它回答「这份视图有多新鲜」，**不是**链路检查时刻，也不代表链路通或不通；
+ *  3. `stale_segments` 是「节点有过上报、但最近一次上报里缺至少一端 runtime」的段数，
+ *     让「面板说在跑、节点自己没说」变成一个可断言的数字。
+ */
+export interface ForwardTopology {
+  forward_id: number;
+  mode: "direct" | "relay";
+  segments: ForwardTopologySegment[];
+  observed_at: string | null;
+  stale_segments: number;
+}
+
+/* ================================================================== */
+/* 流量口径（F11：详情页累计流量必须与归档账本同源）                      */
+/* ================================================================== */
+
+/** 归档账本 `tunnel_traffic` 的写入节奏：每 10 分钟一次（后端 cron 的 `star/10` 表达式）。 */
+export const LEDGER_ARCHIVE_INTERVAL_MINUTES = 10;
+/** 账本日界时区（后端 `billingDayKeyStamp` 用的是 Asia/Shanghai 日界）。 */
+export const LEDGER_TIME_ZONE = "Asia/Shanghai";
+
+/** 某个时刻在账本日界时区里的日键（`YYYY-MM-DD`）。 */
+export function ledgerDayKey(at: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: LEDGER_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(at);
+  const pick = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((p) => p.type === type)?.value ?? "";
+  return `${pick("year")}-${pick("month")}-${pick("day")}`;
+}
+
+/**
+ * 归档账本窗口的汇总（详情页「累计流量」的唯一算法，取代已无写入者的
+ * `PortForward.traffic` 死列 —— F11）。
+ *
+ * `GET /forwards/:id/traffic` 返回的是**补零后的稠密窗口**（后端 `fillDays`），
+ * 所以 Web 侧无法区分「这一天没有账本行」与「这一天有行但为 0」。因此：
+ *   · `has_data` 的口径是**窗口内有没有任何非零流量**，不是「有没有行」；
+ *   · `has_data === false` 时，UI 必须说「无数据」，**不得**渲染成 `0 B`
+ *     （`0 B` 是一个测量结果，而我们只知道自己没有记录）。
+ * 这是本视图刻意保留的一处不可知，不能靠猜补上。
+ */
+export interface ForwardLedgerSummary {
+  days: number;
+  /** 窗口首日（账本日键）；窗口为空时 `null`。 */
+  from: string | null;
+  /** 窗口末日（账本日键）；窗口为空时 `null`。 */
+  to: string | null;
+  total_bytes: number;
+  total_cost: number;
+  has_data: boolean;
+  /** 窗口是否包含「今天」（= 最后一个不完整日，归档最多滞后 10 分钟）。 */
+  includes_today: boolean;
+}
+
+export function summarizeForwardLedger(
+  points: readonly TrafficPoint[],
+  options?: { now?: Date },
+): ForwardLedgerSummary {
+  let totalBytes = 0;
+  let totalCost = 0;
+  let hasData = false;
+  for (const point of points) {
+    const bytes = Number(point.traffic ?? 0);
+    const cost = Number(point.traffic_cost ?? 0);
+    if (Number.isFinite(bytes)) totalBytes += bytes;
+    if (Number.isFinite(cost)) totalCost += cost;
+    if ((Number.isFinite(bytes) && bytes > 0) || (Number.isFinite(cost) && cost > 0)) {
+      hasData = true;
+    }
+  }
+  const today = ledgerDayKey(options?.now ?? new Date());
+  return {
+    days: points.length,
+    from: points[0]?.date ?? null,
+    to: points[points.length - 1]?.date ?? null,
+    total_bytes: totalBytes,
+    total_cost: totalCost,
+    has_data: hasData,
+    includes_today: points.some((point) => point.date === today),
+  };
+}
+
 export const forwardsApi = {
     summary: (cookie?: string) =>
       get<ForwardSummary>("/forwards/summary", undefined, cookie),
@@ -143,6 +288,15 @@ export const forwardsApi = {
       get<PortForward>(`/forwards/${id}`, undefined, cookie),
     traffic: (id: ID, days = 14, cookie?: string) =>
       get<TrafficPoint[]>(`/forwards/${id}/traffic`, { days }, cookie),
+    /**
+     * 只读链路投影：计划（期望状态）里的节点间段 + 两端**最近一次上报**的运行时事实。
+     *
+     * 不发命令、不做主动探测。失败语义由调用方负责呈现：
+     * `not_found`(404) 与「计划不成立」(409，如 RELAY 缺出口端口，带后端 `code` + 原文)
+     * 都必须**原样**显示，且**不重试** —— 重试不会让缺失的期望状态出现。
+     */
+    topology: (id: ID, cookie?: string) =>
+      get<ForwardTopology>(`/forwards/${id}/topology`, undefined, cookie),
     create: (input: ForwardCreateInput, cookie?: string) =>
       post<PortForward>("/forwards", input, cookie),
     update: (id: ID, input: ForwardPatchInput, cookie?: string) =>

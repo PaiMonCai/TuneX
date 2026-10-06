@@ -216,7 +216,7 @@ interface Harness {
 }
 
 function harness(over: Partial<FirstRunLoaderDeps> = {}): Harness {
-  const scope = { workspaceId: 1, epoch: 1 };
+  const scope: { workspaceId: number | null; epoch: number } = { workspaceId: 1, epoch: 1 };
   const fence = createPermissionRequestFence();
   const deps: FirstRunLoaderDeps = {
     fetchCounts: async () => ({ groups: 0, nodes: 0, forwards: 0 }),

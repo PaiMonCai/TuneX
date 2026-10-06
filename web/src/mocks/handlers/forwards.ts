@@ -38,6 +38,7 @@ import type {
   WorkspaceTrafficSummary,
 } from "@/lib/types";
 import type { ForwardPatchInput } from "@/lib/types";
+import type { TopologyDiagFact } from "@/lib/api/forwards";
 import type { TargetHealthTargetView, TargetPoolHealth } from "@/lib/target-health";
 import type { MockNodeBinding, MockWorkspaceInvite } from "../state";
 import type { ForwardProtocol } from "@/lib/forward-protocol";
@@ -45,6 +46,64 @@ import * as rt from "../runtime";
 import type { MockRequest, MockResponse, Store, MockForwardBatchAction, MockForwardBatchItemResult } from "../runtime";
 
 const { TLS_PATH_ERROR_MESSAGES, SESSION_COOKIE, GB, sessionCookieValue, CYCLE_DAYS, COUPONS, ADMIN_RESOURCES, ADMIN_RESOURCE_KEYS, sanitizePermissions, TOPUP_AUTO_SETTLE_MS, nowIso, ok, fail, badRequest, notFound, failFlat, isLoggedIn, userFromCookie, paginate, MOCK_FORWARD_SORT_FIELDS, sortMockForwards, filterByKeyword, filterByStatus, nextId, asRecord, reqStr, numOrNull, reqNum, required, pick, parseList, isResponse, parseId, groupRef, withGroupStats, tunnelTrafficSeries, creditBalance, settleTopup, autoSettleTopups, payUrlFor, topupOrderNo, dashboardStats, adminStats, readPlanPayload, readNodeGroupPayload, readNodePayload, mockPoolTargetHealth, noEvidenceTargetView, handleEgressPools, nextPoolId, nextTargetId, APPLY_STATUSES, TUNNEL_MODES, FORWARD_BATCH_ACTIONS, FORWARD_BATCH_MAX_IDS, applyStatusOf, hasV3Columns, completeOrchestration, poolOfNode, poolRef, tunnelRuntimeAction, MOCK_ATTENTION_MAX_ITEMS, mockAttention, mockUserNode, mockBindingUsage, mockBindingView, healthWorld, impactWorld, mockIngressNode, parseMockTarget, mockForwardView, mockEnrollment, seed, poolTargetKey, getStore, resetStore, handleFederationMock, handleRouteProfileMock, mockFleetHealth, mockNodeHealth, mockResolveNode, MOCK_LIFECYCLES, MOCK_LIFECYCLE_NOTE_MAX, mockAllowedTransitions, mockCanTransition, mockDeleteGates, mockImpact, mockLifecycleChange, mockLifecycleOf, mockLifecycleView, mockRoleCheck, mockUserNodeStatus, applyMockForwardPatch, previewMockForwardUpdate, applyErrorIsRetryable, DEFAULT_FORWARD_PROTOCOL, forwardProtocolFact, forwardProtocolSupported, isForwardProtocol, tlsPathFieldErrors, mockEffectivePermissions, mockBasePermissions, mockGrantSubset, validMockRolePermissions } = rt;
+
+/**
+ * 拓扑 mock 的一跳一端：与后端 `forward-topology.ts:endpoint()` **同一读法**。
+ *
+ * 关键点是「找不到」不补默认值：该端没有出现在节点最近一次上报里 ⇒
+ * `running: false` + `revision: null` + `diag: null`，这**不是**「不健康」，
+ * 而是「节点这次没说」。mock 在这里造一个漂亮的事实，等于让开发期永远看不到
+ * 真实环境里最重要的一条不确定性。
+ */
+function mockTopologyEndpoint(
+  db: Store,
+  nodeId: ID | null,
+  runtimeId: string,
+  nodeKey: string | null,
+): {
+  node_id: number;
+  node_key: string;
+  runtime_id: string;
+  running: boolean;
+  revision: number | null;
+  diag: TopologyDiagFact | null;
+} {
+  const id = nodeId ?? 0;
+  const key = nodeKey ?? String(id);
+  const report = nodeId === null ? null : db.nodeStates.get(nodeId) ?? null;
+  const tunnels = report?.tunnels ?? null;
+  if (!Array.isArray(tunnels)) {
+    return { node_id: id, node_key: key, runtime_id: runtimeId, running: false, revision: null, diag: null };
+  }
+  const entry = tunnels.find((row) => row.id === runtimeId) ?? null;
+  return {
+    node_id: id,
+    node_key: key,
+    runtime_id: runtimeId,
+    running: entry !== null,
+    revision: typeof entry?.revision === "number" ? entry.revision : null,
+    diag: mockTopologyDiag(entry),
+  };
+}
+
+/**
+ * mock 上报里的 `diag` → 读取视图（镜像后端 `normalizeTunnelDiag` 的三态）：
+ * 非对象 → `null`（没有证据）；对象 → 只收标量键，未知键原样保留。
+ * 种子里没有 `diag` 块，所以默认就是 `null` —— 这正是真实 tcp 转发的形态。
+ */
+function mockTopologyDiag(entry: unknown): TopologyDiagFact | null {
+  const raw = (entry as { diag?: unknown } | null | undefined)?.diag;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const protocol = typeof record.protocol === "string" ? record.protocol : null;
+  const facts: Record<string, number | string | boolean> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (key === "protocol") continue;
+    if (typeof value === "number" && Number.isFinite(value)) facts[key] = value;
+    else if (typeof value === "string" || typeof value === "boolean") facts[key] = value;
+  }
+  return { protocol, facts, truncated: false };
+}
 
 export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promise<rt.MockResponse | null> {
   const { method, clean, seg, q, db, user, req, scopeId } = ctx;
@@ -418,6 +477,74 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
       if (method === "GET" && seg[2] === "traffic") {
         const days = Math.max(1, Math.min(90, Number(q?.days ?? 14) || 14));
         return ok(tunnelTrafficSeries(tunnel.id, tunnel.traffic, days));
+      }
+      /**
+       * GET /api/forwards/:id/topology（mock）。
+       *
+       * 与后端 `services/forward-topology.ts` **同一套推导**，而不是另编一份演示数据：
+       *   · DIRECT：`segments` 一定是空数组 + `observed_at: null` + `stale_segments: 0`
+       *     （DIRECT 没有节点间段，这是设计结论 —— mock 若在这里塞一段假链路，
+       *     开发期就再也看不到真实形态）；
+       *   · RELAY：一段 `ingress_to_egress`，两端 runtime id 用后端同一个命名约定
+       *     （`tunex-<id>-relay` / `tunex-<id>-egress`），`running`/`revision` 从 mock 的
+       *     节点状态上报（`db.nodeStates`）里找，找不到就是 `false`/`null` —— 与后端的
+       *     「没有上报 ≠ 不健康」同一个读法，绝不在这里补一个"看起来在跑"的默认值。
+       */
+      if (method === "GET" && seg[2] === "topology") {
+        const view = mockForwardView(db, tunnel);
+        if (view.mode === "direct") {
+          return ok({
+            forward_id: id,
+            mode: "direct",
+            segments: [],
+            observed_at: null,
+            stale_segments: 0,
+          });
+        }
+        const ingressNode = db.nodes.find((node) => node.id === view.ingress_node_id) ?? null;
+        const egressNode = db.nodes.find((node) => node.id === view.egress_node_id) ?? null;
+        const segment = {
+          segment: "ingress_to_egress" as const,
+          from: mockTopologyEndpoint(
+            db,
+            view.ingress_node_id,
+            `tunex-${id}-relay`,
+            ingressNode?.node_id ?? null,
+          ),
+          to: mockTopologyEndpoint(
+            db,
+            view.egress_node_id,
+            `tunex-${id}-egress`,
+            egressNode?.node_id ?? null,
+          ),
+          // 下一跳 = 出口节点的内部地址 + 该转发的出口端口（后端 `forward.egress_connect_ip`
+          // / `egress_port` 同源）。缺任一项就是 `null`：展示用的地址宁可没有，不可编。
+          hop:
+            egressNode?.connect_ip && tunnel.egress_port
+              ? { host: egressNode.connect_ip, port: tunnel.egress_port }
+              : null,
+          expected_revision: view.config_revision ?? null,
+        };
+        const reports = [view.ingress_node_id, view.egress_node_id]
+          .map((nodeId) => (nodeId == null ? null : db.nodeStates.get(nodeId) ?? null))
+          .filter((row): row is NonNullable<typeof row> => row !== null);
+        const observedAt =
+          reports
+            .map((row) => row.reported_at)
+            .filter((value): value is string => typeof value === "string" && value !== "")
+            .sort()
+            .at(-1) ?? null;
+        // 与后端同一口径：只有「该节点有过上报、但最近一次上报里没有这一端」才算 stale。
+        const stale =
+          (db.nodeStates.has(view.ingress_node_id ?? -1) && !segment.from.running ? 1 : 0) +
+          (db.nodeStates.has(view.egress_node_id ?? -1) && !segment.to.running ? 1 : 0);
+        return ok({
+          forward_id: id,
+          mode: "relay",
+          segments: [segment],
+          observed_at: observedAt,
+          stale_segments: stale,
+        });
       }
       if (method === "GET" && seg[2] === undefined) {
         return ok(mockForwardView(db, tunnel));

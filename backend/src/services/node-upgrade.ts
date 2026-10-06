@@ -31,6 +31,24 @@
  *    凭据必须在容器内重新 source agent.env 之后再使用。
  * 2. 标准镜像里**没有 curl**，只有 busybox 自带的 wget。两个都要探测；两个都没有
  *    （或超时、或没配地址）时，结论只能是"未校验"，绝不能显示成通过。
+ *
+ * ── "通过"的判据是「200 + Panel 的 JSON 响应体」，不是「某个状态码」 ──
+ *
+ * 只看状态码是**可以被骗过**的：busybox wget 默认跟随重定向，且 `-S` 会打印每一跳
+ * 的状态行，`tail -n 1` 取到的是**最后一跳**。于是"302 → /login(200)"这种形状
+ * （SPA 兜底路由 / 反代 catch-all / 门户登录页）会被读成 200 并打印"身份校验通过"，
+ * 而凭据从未被任何东西校验过；同一个场景下 curl 分支（无 `-L`）给的是 302。所以：
+ *
+ * 1. 两条分支取**同一份证据**：curl 用 `-w %{http_code}`（不跟随重定向），wget 取
+ *    `-S` 输出里的**第一个**状态行（busybox 1.37 的 wget 没有 `--max-redirect`，
+ *    无法从命令行禁止跟随，只能不采信后续跳）。
+ * 2. 状态码 200 之后还必须**响应体像 Panel 的 JSON**（对象 + `data` 键）。这样
+ *    "200 但其实是 HTML"（门户页 / catch-all）也不会被算成通过。
+ * 3. 两条分支的分类逻辑**共用同一段 `case`**，不允许各自给结论。
+ *
+ * 残留（已知、未消除）：busybox wget 仍会真的发出那一跳重定向请求，并在同一主机
+ * 的跳转上继续带 `Authorization`（实测 `/login` 收到 `auth_len=32`）。要彻底消除
+ * 需要在节点镜像里提供 curl（不跟随重定向）或换成自己发 HTTP 的探针。
  */
 
 import { redactText } from "./redaction.ts";
@@ -289,52 +307,79 @@ if ! docker inspect --format '{{.State.Running}}' "$CONTAINER" | grep -q true; t
   die "新版本启动后退出，已回退"
 fi
 
-# 身份校验只承认一种"通过"：Panel 明确回 HTTP 200。其余一切情况（超时、拿不到
-# 状态码、容器里没有 HTTP 工具、没有可用的 Panel 地址、其它状态码）都标成"未校验"，
+# 身份校验只承认一种"通过"：Panel 回 HTTP 200，**并且响应体是 Panel 的 JSON**
+# （'{"data": ...}'）。其余一切情况（超时、拿不到状态码、容器里没有 HTTP 工具、
+# 没有可用的 Panel 地址、其它状态码、200 但不是 Panel JSON、重定向）都标成"未校验"，
 # 并在最后一行再次说出来 —— 操作者不能从"升级完成"里读出虚假的安全感。
+#
+# 为什么不能只看状态码（已复现）：busybox wget 默认跟随重定向，'-S' 会把每一跳的
+# 状态行都打出来。取最后一行的话，"302 → /login(200)" 会被读成 200 —— 一个未经
+# 鉴权的登录页就足以让脚本打印"身份校验通过"，而 curl 分支（不跟随重定向）给的是
+# 302。现在两条分支取同一份证据、共用同一段判定。
 #
 # 两个真实约束（已在标准 Alpine Agent 镜像上复现，别再退回旧写法）：
 #   · docker exec 看到的是容器 Config.Env，不是 entrypoint 现场 source 的
 #     agent.env；凭据必须在容器内重新 source 后再用，绝不能指望 exec 的环境变量。
-#   · 镜像里没有 curl，只有 busybox 的 wget；两者都探测。
+#   · 镜像里没有 curl，只有 busybox 的 wget；两者都探测。busybox wget 没有
+#     '--max-redirect'，无法从命令行禁止跟随重定向，因此改为**只采信第一个状态行**。
 VERIFIED="no"
 REASON="尚未执行身份校验"
 PROBE="$(docker exec "$CONTAINER" sh -c '
+  # $3 = agent.env 路径（默认节点上的标准位置）。带出来只是为了让测试能在本机用
+  # 真实 sh 跑**同一段**探针，不改变节点上的行为。
+  ENV_FILE="$3"
+  [ -n "$ENV_FILE" ] || ENV_FILE="/run/tunex-agent/agent.env"
   # 先判可读再 source：source 是 POSIX 特殊内建，文件缺失时非交互 shell 会直接退出，
   # 连 "|| ..." 都不会执行（已在 busybox ash 上复现），所以不能靠它兜底。
-  [ -r /run/tunex-agent/agent.env ] || { printf "unverified:env_unreadable\\n"; exit 0; }
+  [ -r "$ENV_FILE" ] || { printf "unverified:env_unreadable\\n"; exit 0; }
   set -a
-  . /run/tunex-agent/agent.env
+  . "$ENV_FILE"
   set +a
   [ -n "\${TUNEX_NODE_CREDENTIAL:-}" ] || { printf "unverified:no_credential\\n"; exit 0; }
   BASE="$1"
   [ -n "$BASE" ] || BASE="\${TUNEX_PANEL_HTTP_URL:-}"
   [ -n "$BASE" ] || { printf "unverified:no_panel_url\\n"; exit 0; }
   URL="\${BASE%/}/api/internal/node/snapshot"
+  BODY="$(mktemp 2>/dev/null || printf "/tmp/.tunex-identity-probe.$$")"
+  HDR="$(mktemp 2>/dev/null || printf "/tmp/.tunex-identity-probe-hdr.$$")"
+  CODE=""
   if command -v curl >/dev/null 2>&1; then
-    CODE="$(curl -s -o /dev/null -w "%{http_code}" --max-time "$2" -H "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>/dev/null || true)"
+    # curl 默认不跟随重定向（这里不写 -L）：302 就是 302。
+    CODE="$(curl -sS --max-time "$2" -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>/dev/null || true)"
   elif command -v wget >/dev/null 2>&1; then
-    OUT="$(wget -S -O /dev/null -T "$2" --header "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>&1 || true)"
-    CODE="$(printf "%s\\n" "$OUT" | grep -oE "HTTP/[0-9.]+ [0-9]{3}" | tail -n 1 | grep -oE "[0-9]{3}$")"
+    # 只取第一个状态行（head -n 1）：302 后面的 200 不属于这次校验的结论。
+    wget -S -O "$BODY" -T "$2" --header "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>"$HDR" || true
+    CODE="$(grep -oE "HTTP/[0-9.]+ [0-9]{3}" "$HDR" | head -n 1 | grep -oE "[0-9]{3}$")"
   else
     printf "unverified:no_http_tool\\n"; exit 0
   fi
+  # 两条分支共用同一段判定，保证"同一个响应 → 同一个结论"。
   case "$CODE" in
     ""|000) printf "unverified:no_response\\n" ;;
+    200)
+      # 200 还不够：响应体必须像 Panel 的 JSON（对象 + data 键）。
+      if [ -s "$BODY" ] && grep -qE "^[[:space:]]*\\{" "$BODY" && grep -qE "\\"data\\"[[:space:]]*:" "$BODY" && grep -qE "\\}[[:space:]]*$" "$BODY"; then
+        printf "http:200\\n"
+      else
+        printf "unverified:not_panel_json\\n"
+      fi ;;
     *) printf "http:%s\\n" "$CODE" ;;
   esac
-' sh "$PANEL" "$CHECK_TIMEOUT" 2>/dev/null || true)"
+  rm -f "$BODY" "$HDR" 2>/dev/null || true
+' sh "$PANEL" "$CHECK_TIMEOUT" /run/tunex-agent/agent.env 2>/dev/null || true)"
 
 case "$PROBE" in
   http:200)
     VERIFIED="yes"
-    log "身份校验通过（HTTP 200）：同一个 node_id/agent_id 已重新连上 Panel" ;;
+    log "身份校验通过（HTTP 200 + Panel JSON）：同一个 node_id/agent_id 已重新连上 Panel" ;;
   http:401|http:403)
     log "身份校验失败（HTTP \${PROBE#http:}）"
     restore_previous
     die "新进程认证失败，已回退" ;;
   http:*)
     REASON="Panel 返回 HTTP \${PROBE#http:}（既不是 200，也不是 401/403）" ;;
+  unverified:not_panel_json)
+    REASON="Panel 回了 HTTP 200，但响应体不是 Panel 的 JSON（不是带 data 键的对象）——可能是门户页/兜底路由/重定向后的登录页，不能当成身份校验通过" ;;
   unverified:no_panel_url)
     REASON="没有可用的 Panel 地址（未配置 TUNEX_PUBLIC_PANEL_URL，节点 agent.env 里也没有 TUNEX_PANEL_HTTP_URL）" ;;
   unverified:env_unreadable)

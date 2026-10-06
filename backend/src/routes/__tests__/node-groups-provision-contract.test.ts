@@ -111,11 +111,61 @@ for (const [label, range] of badRanges) {
 // 兜底 500 绝不能再被这条路径命中。
 console.log('no-range -> 409 PORT_RANGE_REQUIRED, zero side effects');
 
+// --------------------- 1b. 顺序：能力拒绝优先于"区间未配置"（E2 复核 F3）
+// 一个**没有任何生效策略**的空间里给无区间组加节点：真因是"策略未授予"（用户下一步
+// 是找管理员开通），不是"区间没配"。旧顺序先判区间，于是返回 409 PORT_RANGE_REQUIRED，
+// 文案还让他"新建带端口范围的节点组" —— 而那个空间 POST /api/node-groups 只会 403
+// custom_group_not_allowed，是一条死路（真实 HTTP 两侧现象已由 E2 复核记录）。
+group.port_range = null;
+policy.deny_scope = true;
+policy.deny_reason = 'no_active_policy';
+let res;
+let body;
+const beforeDenied = { creates, enrolls, audits };
+res = await post({ node_id: 'no-policy-no-range' });
+body = await res.json();
+expect(res.status).toBe(403);
+expect(body.code).toBe('no_active_policy');
+expect(body.code).not.toBe('PORT_RANGE_REQUIRED');
+expect(creates).toBe(beforeDenied.creates);
+expect(enrolls).toBe(beforeDenied.enrolls);
+expect(audits).toBe(beforeDenied.audits);
+policy.deny_scope = false;
+console.log('no active policy + no range -> 403 no_active_policy (capability denial first)');
+
+// 对照：策略允许（额度没满）但区间仍缺失 → 依然是 409 PORT_RANGE_REQUIRED（没被吞掉）。
+res = await post({ node_id: 'allowed-no-range' });
+body = await res.json();
+expect(res.status).toBe(409);
+expect(body.code).toBe('PORT_RANGE_REQUIRED');
+console.log('policy allowed + no range -> still 409 PORT_RANGE_REQUIRED');
+
+// 1c. 但"去自建一个带区间的组"这条建议只在**真的能自建**时才允许出现：
+// 该空间不能自建节点组时，409 文案必须指向管理员，而不是把用户送去撞 403。
+policy.entitlements = { allow_custom_in_group: false, allow_custom_out_group: false };
+res = await post({ node_id: 'cannot-self-serve' });
+body = await res.json();
+expect(res.status).toBe(409);
+expect(body.code).toBe('PORT_RANGE_REQUIRED');
+expect(body.error).toContain('端口范围');
+expect(body.error).toContain('不允许你自建节点组');
+expect(body.error).not.toContain('请新建带端口范围的节点组');
+console.log('cannot self-create group -> 409 without the dead-end advice');
+
+// 1d. 能自建时保留原来的建议（这条建议本身没错，只是不能无条件给）。
+policy.entitlements = { allow_custom_in_group: true, allow_custom_out_group: true };
+res = await post({ node_id: 'can-self-serve' });
+body = await res.json();
+expect(res.status).toBe(409);
+expect(body.code).toBe('PORT_RANGE_REQUIRED');
+expect(body.error).toContain('请新建带端口范围的节点组');
+console.log('can self-create group -> 409 keeps the actionable advice');
+
 // ------------------------------------------------------- 2. 合法区间 -> 201
 group.port_range = '31000-31999';
-let res = await post({ node_id: 'ok-node' });
+res = await post({ node_id: 'ok-node' });
 expect(res.status).toBe(201);
-let body = await res.json();
+body = await res.json();
 expect(body.data.node.node_id).toBe('ok-node');
 expect(body.data.node.node_group_id).toBe(10);
 expect(body.data.node.role).toBe('ingress');
@@ -196,6 +246,12 @@ test("node provision contract: missing/invalid group port_range is 409 PORT_RANG
   });
   if (result.status !== 0) throw new Error(`${result.stdout}\n${result.stderr}`);
   expect(result.stdout).toContain("no-range -> 409 PORT_RANGE_REQUIRED, zero side effects");
+  expect(result.stdout).toContain(
+    "no active policy + no range -> 403 no_active_policy (capability denial first)",
+  );
+  expect(result.stdout).toContain("policy allowed + no range -> still 409 PORT_RANGE_REQUIRED");
+  expect(result.stdout).toContain("cannot self-create group -> 409 without the dead-end advice");
+  expect(result.stdout).toContain("can self-create group -> 409 keeps the actionable advice");
   expect(result.stdout).toContain("valid range -> 201 with node + enrollment");
   expect(result.stdout).toContain("same node_id -> 201 idempotent reuse (re-signed, no new row)");
   expect(result.stdout).toContain("quota exhausted -> 403 node_limit");

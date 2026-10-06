@@ -51,6 +51,7 @@ import { handleTunnelsMock } from "./handlers/tunnels";
 import { handleCatalogMock } from "./handlers/catalog";
 import { handleCommerceMock } from "./handlers/commerce";
 import { handleSettingsMock } from "./handlers/settings";
+import { handleDdnsMock } from "./handlers/ddns";
 import { handleRouteProfilesMock } from "./handlers/route-profiles";
 import { handleAdminMock } from "./handlers/admin";
 
@@ -273,6 +274,14 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   }
   {
     const result = await handleNodesMock(ctx);
+    if (result) return result;
+  }
+  // DDNS 必须排在 `handleForwardsMock` **之前**：后者把整个 `/forwards/*` 命名空间认领了，
+  // 未识别的子路径直接在它内部返回 404（`handlers/forwards.ts:592`），所以放在它之后
+  // 永远轮不到这里。两个路径都很精确（`/ddns/providers*`、`/forwards/:id/dns`），
+  // 不会抢走既有分支；`/forwards/**` 的 forward 族 RBAC 闸门在上面已经查过。
+  {
+    const result = await handleDdnsMock(ctx);
     if (result) return result;
   }
   {

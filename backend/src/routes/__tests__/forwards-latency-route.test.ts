@@ -3,794 +3,609 @@
  *
  * 为什么必须有这个文件：`services/latency-history.ts` 的读函数有测试，但它**没有任何读
  * 路由**（R3-B 的结论：`readLatencySeries` 无 consumer）。最近一次同类事故是 DNS 前门：
- * `POST /api/forwards/:id/dns` 被注册在 `post("/:id/:action")` catch-all **之后**，
+ * `POST /api/forwards/:id/dns` 曾被注册在 `post("/:id/:action")` catch-all **之后**，
  * 于是真实 API 上绑定直接 400「不支持的端口转发动作」，而当时 38 条服务层断言全绿。
  * 所以这里挂**真实** `forwardsRoutes`，用 `app.request()` 真的打。
  *
- * 覆盖：
- *   ① 权限接线：读 = `forward:read`；被拒时请求到不了处理器（没有读库、没有读档案）；
- *   ② 作用域：跨 Workspace ⇒ 404，与「真不存在」逐字同形（不泄露存在性）；
- *   ③ 窗口参数：非法 ⇒ 明确 400 + 稳定 code；超上限 ⇒ 400 而不是静默截短；
- *   ④ `raw_window_expired`（409）与「没有数据」（200 `no_samples`）**必须可区分**；
- *   ⑤ DIRECT / 无观测维度 ⇒ 明确的「无数据」，**不是** 0 值序列，也不去猜一个 target 来查；
- *   ⑥ 成功形状：直接透传 `readLatencySeries` 的点（`null` 仍是 `null`），并冻结键集；
- *   ⑦ `GET /:id/latency` 没被任何参数化 catch-all 吃掉，且 catch-all 仍可达；
- *   ⑧ GET 零副作用（不写库、不写档案），幂等。
+ * ── 为什么整段跑在**子进程**里（沿用 `workspace-rbac.test.ts` / `forwards-dns-route.test.ts`
+ * 的同一模式）──
+ * 本文件要钉的是"真实 `forwards.ts` + 真实权限内核"的行为，而 `mock.module` 是**进程级**
+ * 注册表：同进程里别的测试文件（`forward-route-topology.test.ts` / `ddns-provider-route.test.ts`）
+ * 若替换过 `workspace.ts`，本文件会解析到**别人的替身**。这不是猜想：本文件第一版是进程内
+ * mock，单跑 39/39 绿，`bun test src` 全量里却红 2 条 —— 全量时 `resolveWorkspaceAccess`
+ * 被解析成了另一个文件的"永远 owner"替身（于是"无 forward:read"拿到了 200），连"被拒"那条
+ * 拿到的都是别人替身抛出的**非 JSON** 错误体。换成干净注册表后，这里断言的是产品权限内核
+ * 本身（自定义角色替换语义、viewer/member、跨 Workspace 404），不是替身的语义。
  *
- * ── 替身设计（沿用仓内既有路由测试的模式）──
- * `mock.module` 是**进程级**注册表，替换的是**整个模块**：所以三个替身都用
- * `{ ...real, 只覆盖要控制的那一个导出 }` 的**透传**写法（见
- * `forward-route-topology.test.ts` 里那次误判记录的教训）。特别是 `latency-history.ts`：
- * **只**换 `defaultLatencyHistoryDeps`，`readLatencySeries` 保持**真实现**——于是本文件
- * 测的是"真读函数 + 真路由 + 替身 DB/时钟"，而不是"两个替身互相对答案"。
+ * 替身面只有 `db.ts`（数据面）：转发行、出口池、`system_config`、以及档案的两张表。
+ * **不**替身 `latency-history.ts` —— `readLatencySeries` 与 `defaultLatencyHistoryDeps` 都是
+ * 真实现，于是本文件测的是"真路由 + 真读函数 + 真权限内核 + 替身数据库"，而不是替身互相对答案。
+ *
+ * 覆盖（四个场景各在一个 `group` 里，组内 status 断言计数必须**恰好**等于写死的数字：既证明
+ * 这组真的跑到，也挡住"整组被跳过/被注释掉"这类静默失效）：
+ *   ① 权限与作用域：无 `forward:read` 被拒（真内核）、viewer/member 既有语义、跨 Workspace 404
+ *      与"真不存在"逐字同形、非法 id 400；
+ *   ② 窗口钳制：非法输入 400 + 稳定 code、超上限 400 而不是静默截短、`to` 在将来被钳制、
+ *      `raw_window_expired`（409）与"没有数据"（200 `no_samples`）可区分；
+ *   ③ 观测维度与序列：DIRECT / 远端出口 / 无池 / 无目标 / 归属冲突 ⇒ 明确"无数据"而不是 0 值
+ *      序列（且不猜一个 target 去查）、多目标 ⇒ 拒绝猜、成功形状逐字透传（`null` 仍是 `null`）、
+ *      截断显式标注、键集冻结且不含内部材料；
+ *   ④ 路由可达性与零副作用：子路由没被 catch-all 吃掉、GET 只碰只读面、幂等。
  */
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+
+/** backend/src/（子进程的 import 前缀与 cwd 都与既有子进程用例保持一致）。 */
+const root = new URL("../..", import.meta.url).pathname;
+
+/* ------------------------------------------------------------------ */
+/* 子进程前置：数据面替身 + 真实路由 + 真实权限内核                        */
+/* ------------------------------------------------------------------ */
+
+const PRELUDE = String.raw`
+import { mock, expect } from "bun:test";
 import { Hono } from "hono";
-import type { HourlyBucket, LatencyHistoryDeps, RawSamplePoint } from "../../services/latency-history.ts";
+const root = process.env.TUNEX_LATENCY_ROOT;
 
-/* ------------------------------------------------------------------ */
-/* 常量与替身数据                                                       */
-/* ------------------------------------------------------------------ */
-
-const WORKSPACE_ID = 3;
+const WS = 3;
 const FORWARD_ID = 11;
 const EGRESS_NODE_ID = 7;
 const POOL_ID = 21;
 const TARGET_HOST = "10.0.0.5";
 const TARGET_PORT = 8080;
-const TARGET_KEY = `${TARGET_HOST}:${TARGET_PORT}`;
-/** 挂在行上、但**没有**任何 select 请求的内部材料：只为了证明"没被 select 就绝不出现"可断言。 */
-const SEALED_MATERIAL = "v1.SEALED-forward-internal-material-must-never-appear";
+const TARGET_KEY = TARGET_HOST + ":" + TARGET_PORT;
+/* 挂在行上、但**没有**任何 select 请求的内部材料：只为了证明"没被 select 就绝不出现"可断言。 */
+const SEALED = "v1.SEALED-forward-internal-material-must-never-appear";
 
-/* ------------------------------------------------------------------ */
-/* ① db 替身                                                           */
-/* ------------------------------------------------------------------ */
+/* ── 可变状态（每个场景开头 reset()） ── */
+let role = "owner", roleId = null, permissions = null, active = true;
+let requestWorkspace = WS;
+let tunnel = null, pool = null;
+let rawRetention = null, bucketRetention = null;
+let rawRows = [], bucketRows = [];
+const dbCalls = [];
+const findFirstWheres = [];
+const rawSampleQueries = [];
+const hourBucketQueries = [];
+const writes = [];
 
-interface TunnelRow {
-  id: number;
-  workspace_id: number;
-  category: string;
-  user_id: number;
-  name: string;
-  tunnel_mode: string | null;
-  egress_node_id: number | null;
-  egress_pool_id: number | null;
-  federated_egress_peer: string | null;
-  /** 内部材料（本端点若 select 了它，下面的"逐字不出现"断言会红）。 */
-  internal_material: string;
+function baseTunnel(over) {
+  return Object.assign({
+    id: FORWARD_ID, workspace_id: WS, category: "port_forward", user_id: 1, name: "relay-a",
+    tunnel_mode: "relay", egress_node_id: EGRESS_NODE_ID, egress_pool_id: POOL_ID,
+    federated_egress_peer: null, internal_material: SEALED,
+  }, over || {});
+}
+function basePool(over) {
+  return Object.assign({
+    id: POOL_ID, node_id: EGRESS_NODE_ID,
+    targets: [{ id: 1, host: TARGET_HOST, port: TARGET_PORT, status: "active", order_by: 1000 }],
+  }, over || {});
+}
+function seedTunnel(over) { tunnel = over === null ? null : baseTunnel(over); }
+function seedPool(over) { pool = basePool(over); }
+/* 基础角色 / 自定义角色（自定义角色是**替换**语义，不会回落到基础角色）。 */
+function asRole(base, perms) {
+  role = base;
+  roleId = perms === undefined ? null : 44;
+  permissions = perms === undefined ? null : perms;
+}
+function reset() {
+  role = "owner"; roleId = null; permissions = null; active = true; requestWorkspace = WS;
+  seedTunnel({}); seedPool({}); rawRetention = null; bucketRetention = null;
+  rawRows = []; bucketRows = [];
+  dbCalls.length = 0; findFirstWheres.length = 0;
+  rawSampleQueries.length = 0; hourBucketQueries.length = 0; writes.length = 0;
 }
 
-interface PoolTargetRow {
-  id: number;
-  host: string;
-  port: number;
-  status: string;
-  order_by: number;
+/* 与 Prisma 一致：undefined 的 where 键不构成条件；等值 / {gte, lt} 范围。 */
+function matches(row, where) {
+  return Object.keys(where).every(function (key) {
+    const want = where[key];
+    if (want === undefined) return true;
+    if (want !== null && typeof want === "object" && !(want instanceof Date)) {
+      const have = row[key];
+      if (Object.prototype.hasOwnProperty.call(want, "gte") && !(have >= want.gte)) return false;
+      if (Object.prototype.hasOwnProperty.call(want, "lt") && !(have < want.lt)) return false;
+      return true;
+    }
+    return row[key] === want;
+  });
 }
-
-interface PoolRow {
-  id: number;
-  node_id: number;
-  targets: PoolTargetRow[];
-}
-
-let tunnel: TunnelRow | null = null;
-let pool: PoolRow | null = null;
-
-/** 路由对 DB 的每一次调用（模型 + 方法 + where），用来证"零副作用 / 没多查"。 */
-const dbCalls: string[] = [];
-const findFirstWheres: Array<Record<string, unknown>> = [];
-
-/** 与 Prisma 一致的口径：`undefined` 的 where 键不构成条件，其余按等值匹配。 */
-function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
-  return Object.entries(where).every(([key, value]) => value === undefined || row[key] === value);
-}
-
-/** 按 `select` 投影（`true` = 该列）。没被 select 的键不会出现在返回值里。 */
-function project(row: Record<string, unknown>, select: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(select)) {
-    if (value === true) out[key] = row[key] ?? null;
-  }
+/* 按 select 投影（true = 该列）：没被 select 的键不会出现在返回值里。 */
+function project(row, select) {
+  const out = {};
+  Object.keys(select).forEach(function (key) {
+    if (select[key] === true) out[key] = row[key] === undefined ? null : row[key];
+  });
   return out;
 }
-
-/** 写操作一律抛错：本端点是纯读，"写了一次"必须是硬失败而不是一条静默断言。 */
-function forbiddenWrite(model: string, op: string): never {
-  dbCalls.push(`${model}.${op}(WRITE)`);
-  throw new Error(`读端点不得调用 db.${model}.${op}`);
+function orderedTake(rows, orderBy, take) {
+  const key = Object.keys(orderBy)[0];
+  const desc = orderBy[key] === "desc";
+  const sorted = rows.slice().sort(function (a, b) {
+    const cmp = a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0;
+    return desc ? -cmp : cmp;
+  });
+  return take === undefined ? sorted : sorted.slice(0, take);
+}
+/* 写操作：读端点碰任何一次都必须**炸**（不是一条静默断言）。 */
+function forbid(name) {
+  return async function () { writes.push(name); throw new Error("读端点不得调用 " + name); };
+}
+function findManyOf(getRows, model, queries) {
+  return async function (args) {
+    dbCalls.push(model + ".findMany");
+    if (queries) queries.push(args);
+    const rows = getRows().filter(function (row) { return matches(row, args.where); });
+    const ordered = orderedTake(rows, args.orderBy, args.take);
+    return args.select ? ordered.map(function (r) { return project(r, args.select); }) : ordered;
+  };
 }
 
-const dbStub = {
+mock.module(root + "db.ts", () => ({ db: {
+  workspace: { findUnique: async () => ({ id: 1 }) },
+  workspaceMember: { findUnique: async (args) => {
+    const w = args.where.workspace_id_user_id;
+    if (!active || w.workspace_id !== requestWorkspace || w.user_id !== 1) return null;
+    return {
+      id: 70, workspace_id: requestWorkspace, user_id: 1, role: role, active: true, role_id: roleId,
+      custom_role: roleId === null || permissions === null
+        ? null
+        : { id: roleId, workspace_id: requestWorkspace, permissions: permissions },
+      workspace: { id: requestWorkspace, kind: "personal" },
+    };
+  } },
   tunnel: {
-    findFirst: async (args: { where: Record<string, unknown>; select: Record<string, unknown> }) => {
+    findFirst: async (args) => {
       dbCalls.push("tunnel.findFirst");
       findFirstWheres.push(args.where);
-      if (!tunnel || !matches(tunnel as unknown as Record<string, unknown>, args.where)) return null;
-      return project(tunnel as unknown as Record<string, unknown>, args.select);
+      if (!tunnel || !matches(tunnel, args.where)) return null;
+      return project(tunnel, args.select);
     },
-    update: async () => forbiddenWrite("tunnel", "update"),
-    create: async () => forbiddenWrite("tunnel", "create"),
-    delete: async () => forbiddenWrite("tunnel", "delete"),
-    updateMany: async () => forbiddenWrite("tunnel", "updateMany"),
-    deleteMany: async () => forbiddenWrite("tunnel", "deleteMany"),
+    update: forbid("tunnel.update"), create: forbid("tunnel.create"), delete: forbid("tunnel.delete"),
+    updateMany: forbid("tunnel.updateMany"), deleteMany: forbid("tunnel.deleteMany"),
   },
   egressPool: {
-    findUnique: async (args: {
-      where: { id: number };
-      select: {
-        id: true;
-        node_id: true;
-        targets: { where: Record<string, unknown>; select: Record<string, unknown> };
-      };
-    }) => {
+    findUnique: async (args) => {
       dbCalls.push("egressPool.findUnique");
       if (!pool || pool.id !== args.where.id) return null;
       const spec = args.select.targets;
-      const targets = pool.targets
-        .filter((t) => matches(t as unknown as Record<string, unknown>, spec.where))
-        .sort((a, b) => a.order_by - b.order_by || a.id - b.id)
-        .map((t) => project(t as unknown as Record<string, unknown>, spec.select));
-      return { id: pool.id, node_id: pool.node_id, targets };
+      const targets = orderedTake(
+        pool.targets.filter(function (t) { return matches(t, spec.where); }),
+        spec.orderBy,
+        undefined,
+      ).map(function (t) { return project(t, spec.select); });
+      return { id: pool.id, node_id: pool.node_id, targets: targets };
     },
-    update: async () => forbiddenWrite("egressPool", "update"),
-    delete: async () => forbiddenWrite("egressPool", "delete"),
+    update: forbid("egressPool.update"), delete: forbid("egressPool.delete"),
   },
-  $transaction: async () => forbiddenWrite("$", "transaction"),
-};
-
-// 真实 db 模块（用于未知模型的透传）必须在替换注册之前取到。
-const realDbModule = await import("../../db.ts");
-mock.module("../../db.ts", () => ({
-  db: new Proxy(dbStub as unknown as Record<string, unknown>, {
-    get: (target, prop) => {
-      if (typeof prop === "string" && prop in target) return target[prop];
-      const value = (realDbModule.db as unknown as Record<string | symbol, unknown>)[prop];
-      return typeof value === "function" ? value.bind(realDbModule.db) : value;
-    },
-  }),
-}));
-
-/* ------------------------------------------------------------------ */
-/* ② 档案依赖替身（`readLatencySeries` 保持真实现）                       */
-/* ------------------------------------------------------------------ */
-
-const LATENCY_MODULE = "../../services/latency-history.ts";
-const realLatency = await import(LATENCY_MODULE);
-
-let rawSamples: RawSamplePoint[] = [];
-let hourBuckets: HourlyBucket[] = [];
-/** `LATENCY_RAW_RETENTION_HOURS` 的配置值（null = 未配置 ⇒ 默认 24h）。 */
-let rawRetentionHours: string | null = "24";
-const depsCalls: string[] = [];
-const rawQueries: Array<Record<string, unknown>> = [];
-const bucketQueries: Array<Record<string, unknown>> = [];
-
-function deps(): LatencyHistoryDeps {
-  const write = (name: string) => async () => {
-    depsCalls.push(`${name}(WRITE)`);
-    throw new Error(`读端点不得调用档案的 ${name}`);
-  };
-  return {
-    readConfig: async (name: string) => {
-      // 两个保留期键分开读（`resolveRetention`）：把键名记下来，"读了几次什么"是可断言的。
-      depsCalls.push(`readConfig:${name}`);
-      return name === realLatency.LATENCY_RETENTION_CONFIG_KEYS.raw_hours ? rawRetentionHours : null;
-    },
-    insertSamples: write("insertSamples"),
-    aggregateSamples: write("aggregateSamples"),
-    aggregateReachable: write("aggregateReachable"),
-    insertBucketIfAbsent: write("insertBucketIfAbsent"),
-    deleteSamplesBefore: write("deleteSamplesBefore"),
-    deleteBucketsBefore: write("deleteBucketsBefore"),
-    readRawSamples: async (query) => {
-      depsCalls.push("readRawSamples");
-      rawQueries.push(query as unknown as Record<string, unknown>);
-      return rawSamples;
-    },
-    readHourBuckets: async (query) => {
-      depsCalls.push("readHourBuckets");
-      bucketQueries.push(query as unknown as Record<string, unknown>);
-      return hourBuckets;
-    },
-  } as unknown as LatencyHistoryDeps;
-}
-
-mock.module(LATENCY_MODULE, () => ({ ...realLatency, defaultLatencyHistoryDeps: () => deps() }));
-
-/* ------------------------------------------------------------------ */
-/* ③ workspace 替身（只换中间件那一跳，权限内核保持真实现）               */
-/* ------------------------------------------------------------------ */
-
-interface Access {
-  id: number;
-  role: "owner" | "admin" | "member" | "viewer";
-  personalWorkspaceId: number;
-  kind: "personal" | "team";
-  customRoleId: number | null;
-  customPermissions?: unknown;
-}
-
-function ownerAccess(): Access {
-  return {
-    id: WORKSPACE_ID,
-    role: "owner",
-    personalWorkspaceId: WORKSPACE_ID,
-    kind: "personal",
-    customRoleId: null,
-  };
-}
-
-let currentAccess: Access = ownerAccess();
-let deny = false;
-const accesses: Array<{ action: string; resource: string }> = [];
-
-const realWorkspace = await import("../../services/workspace.ts");
-mock.module("../../services/workspace.ts", () => ({
-  ...realWorkspace,
-  resolveWorkspaceAccess: async (_c: unknown, action: string, resource: string) => {
-    accesses.push({ action, resource });
-    if (deny) throw realWorkspace.workspacePermissionDenied();
-    // 真权限内核 + 真预筛口径（与中间件一致）：自定义角色缺少 forward:read 要在这一层被拒。
-    const creatorPrefilter = false;
-    if (!realWorkspace.canWorkspaceResourceAction(currentAccess, action as never, resource as never, creatorPrefilter)) {
-      throw realWorkspace.workspacePermissionDenied();
-    }
-    return currentAccess;
+  systemConfig: { findUnique: async (args) => {
+    dbCalls.push("systemConfig.findUnique");
+    const value = args.where.name === "LATENCY_RAW_RETENTION_HOURS" ? rawRetention
+      : args.where.name === "LATENCY_BUCKET_RETENTION_DAYS" ? bucketRetention
+        : null;
+    return value === null || value === undefined ? null : { value: value };
+  } },
+  targetLatencySample: {
+    findMany: findManyOf(function () { return rawRows; }, "targetLatencySample", rawSampleQueries),
+    createMany: forbid("targetLatencySample.createMany"),
+    deleteMany: forbid("targetLatencySample.deleteMany"),
+    groupBy: forbid("targetLatencySample.groupBy"),
   },
-}));
+  targetLatencyHourly: {
+    findMany: findManyOf(function () { return bucketRows; }, "targetLatencyHourly", hourBucketQueries),
+    create: forbid("targetLatencyHourly.create"),
+    deleteMany: forbid("targetLatencyHourly.deleteMany"),
+    groupBy: forbid("targetLatencyHourly.groupBy"),
+  },
+} }));
 
-/* ------------------------------------------------------------------ */
-/* 被测路由                                                            */
-/* ------------------------------------------------------------------ */
-
-const { forwardsRoutes } = await import("../forwards.ts");
-
-const app = new Hono<{ Variables: Record<string, unknown> }>();
-app.use("*", async (c, next) => {
-  c.set("user", { id: 1, super_admin: false });
-  await next();
-});
+const { forwardsRoutes } = await import(root + "routes/forwards.ts");
+const app = new Hono();
+app.use("*", async (c, next) => { c.set("user", { id: 1, super_admin: false }); await next(); });
 app.route("/api/forwards", forwardsRoutes);
 
-interface Body {
-  data?: Record<string, unknown> & {
-    series?: Array<Record<string, unknown>>;
-    window?: { from: string; to: string; hours: number };
-    dimension?: { observer_node_id: number; target_key: string } | null;
-    status?: string;
-    reason?: string | null;
-    truncated?: boolean;
-  };
-  error?: string;
-  code?: string;
-  error_layer?: string;
+const PATH = "/api/forwards/" + FORWARD_ID + "/latency";
+function headers() { return { "x-workspace-id": String(requestWorkspace) }; }
+function req(query) { return app.request(PATH + (query || ""), { headers: headers() }); }
+function reqWith(path, method) { return app.request(path, { method: method, headers: headers() }); }
+function sampleRow(over) {
+  return Object.assign({
+    node_id: EGRESS_NODE_ID, target_key: TARGET_KEY,
+    observed_at: new Date("2026-10-06T08:00:00.000Z"),
+    reachable: true, latency_ms: 42.5, observation_source: "node-7/tcp_connect",
+  }, over || {});
+}
+function bucketRow(over) {
+  return Object.assign({
+    node_id: EGRESS_NODE_ID, target_key: TARGET_KEY,
+    hour_start: new Date("2026-10-06T08:00:00.000Z"), observation_source: "node-7/tcp_connect",
+    sample_count: 120, success_count: 118, failure_count: 2,
+    latency_samples: 118, latency_sum_ms: 4956, latency_min_ms: 12.1, latency_max_ms: 88.4,
+    last_observed_at: new Date("2026-10-06T08:59:30.000Z"),
+  }, over || {});
+}
+function recentWindow(granularity, fromHours, toHours) {
+  const now = Date.now();
+  return "?granularity=" + granularity
+    + "&from=" + encodeURIComponent(new Date(now - fromHours * 3600000).toISOString())
+    + "&to=" + encodeURIComponent(new Date(now - toHours * 3600000).toISOString());
 }
 
-async function json(res: Response): Promise<Body> {
-  return (await res.json()) as Body;
-}
-
-function get(query = ""): Promise<Response> {
-  return app.request(`http://localhost/api/forwards/${FORWARD_ID}/latency${query}`);
-}
-
-function seedTunnel(over: Partial<TunnelRow> = {}): TunnelRow {
-  tunnel = {
-    id: FORWARD_ID,
-    workspace_id: WORKSPACE_ID,
-    category: "port_forward",
-    user_id: 1,
-    name: "relay-a",
-    tunnel_mode: "relay",
-    egress_node_id: EGRESS_NODE_ID,
-    egress_pool_id: POOL_ID,
-    federated_egress_peer: null,
-    internal_material: SEALED_MATERIAL,
-    ...over,
-  };
-  return tunnel;
-}
-
-function seedPool(over: Partial<PoolRow> = {}): PoolRow {
-  pool = {
-    id: POOL_ID,
-    node_id: EGRESS_NODE_ID,
-    targets: [{ id: 1, host: TARGET_HOST, port: TARGET_PORT, status: "active", order_by: 1000 }],
-    ...over,
-  };
-  return pool;
-}
-
-function samplePoint(over: Partial<RawSamplePoint> = {}): RawSamplePoint {
-  return {
-    observed_at: new Date("2026-10-06T22:00:00.000Z"),
-    reachable: true,
-    latency_ms: 42.5,
-    observation_source: "node-7/tcp_connect",
-    ...over,
-  };
-}
-
-function hourBucket(over: Partial<HourlyBucket> = {}): HourlyBucket {
-  return {
-    node_id: EGRESS_NODE_ID,
-    target_key: TARGET_KEY,
-    hour_start: new Date("2026-10-06T22:00:00.000Z"),
-    observation_source: "node-7/tcp_connect",
-    sample_count: 120,
-    success_count: 118,
-    failure_count: 2,
-    latency_samples: 118,
-    latency_sum_ms: 4956,
-    latency_min_ms: 12.1,
-    latency_max_ms: 88.4,
-    last_observed_at: new Date("2026-10-06T22:59:30.000Z"),
-    ...over,
-  };
-}
-
-beforeEach(() => {
-  dbCalls.length = 0;
-  findFirstWheres.length = 0;
-  depsCalls.length = 0;
-  rawQueries.length = 0;
-  bucketQueries.length = 0;
-  accesses.length = 0;
-  deny = false;
-  currentAccess = ownerAccess();
-  rawSamples = [];
-  hourBuckets = [];
-  rawRetentionHours = "24";
-  seedTunnel();
-  seedPool();
-});
-
-/** 冻结的成功响应键集（Web 切片对齐用；多一个少一个都算契约变更）。 */
-const DATA_KEYS = [
-  "dimension",
-  "forward_id",
-  "granularity",
-  "mode",
-  "reason",
-  "series",
-  "status",
-  "truncated",
-  "window",
-].sort();
-
-const POINT_KEYS = [
-  "at",
-  "failures",
-  "latency_max_ms",
-  "latency_min_ms",
-  "latency_ms",
-  "observation_source",
-  "samples",
-  "successes",
-].sort();
-
-/* ------------------------------------------------------------------ */
-/* ① 权限接线                                                          */
-/* ------------------------------------------------------------------ */
-
-describe("D6: /api/forwards/:id/latency 的权限接线", () => {
-  test("中间件被拒 ⇒ 403 rbac，且请求到不了处理器（没读库、没读档案）", async () => {
-    deny = true;
-    const res = await get("?granularity=hour&hours=6");
-    expect(res.status).toBe(403);
-    const body = await json(res);
-    expect(body.code).toBe("permission_denied");
-    expect(body.error_layer).toBe("rbac");
-    expect(dbCalls).toEqual([]);
-    expect(depsCalls).toEqual([]);
-    // 中间件分类：GET 走 read。
-    expect(accesses).toEqual([{ action: "read", resource: "forward" }]);
-  });
-
-  test("自定义角色缺少 forward:read ⇒ 403（真权限内核判定，不是替身放行）", async () => {
-    currentAccess = {
-      ...ownerAccess(),
-      role: "member",
-      customRoleId: 9,
-      customPermissions: { "node:read": true },
-    };
-    const res = await get("?granularity=hour&hours=6");
-    expect(res.status).toBe(403);
-    expect((await json(res)).code).toBe("permission_denied");
-    expect(depsCalls).toEqual([]);
-  });
-
-  test("自定义角色有 forward:read ⇒ 放行（同一内核的正对照）", async () => {
-    currentAccess = {
-      ...ownerAccess(),
-      role: "member",
-      customRoleId: 9,
-      customPermissions: { "forward:read": true },
-    };
-    const res = await get("?granularity=hour&hours=6");
-    expect(res.status).toBe(200);
-  });
-
-  test("viewer 能读（读端点不放宽也不收紧既有角色语义）", async () => {
-    currentAccess = { ...ownerAccess(), role: "viewer" };
-    expect((await get("?granularity=hour&hours=6")).status).toBe(200);
-  });
-
-  test("base member 读他人转发仍是既有语义（read 不被 creator 守卫拦）", async () => {
-    currentAccess = { ...ownerAccess(), role: "member" };
-    seedTunnel({ user_id: 99 });
-    // 既有内核：base member 的 read 直接放行（本任务不改动该语义，只如实记录）。
-    expect((await get("?granularity=hour&hours=6")).status).toBe(200);
-  });
-});
-
-/* ------------------------------------------------------------------ */
-/* ② 作用域：跨 Workspace 与不存在不可区分                               */
-/* ------------------------------------------------------------------ */
-
-describe("D6: 跨 Workspace 一律 404，不泄露存在性", () => {
-  test("跨 Workspace 与「真不存在」逐字同形，且都不读档案", async () => {
-    tunnel = null;
-    const missing = await get("?granularity=hour&hours=6");
-    const missingBody = await json(missing);
-
-    seedTunnel({ workspace_id: WORKSPACE_ID + 6 });
-    const foreign = await get("?granularity=hour&hours=6");
-    const foreignBody = await json(foreign);
-
-    expect(missing.status).toBe(404);
-    expect(foreign.status).toBe(404);
-    expect(foreignBody).toEqual(missingBody);
-    expect(foreignBody.code).toBe("not_found");
-    // 每一次查询都带 workspace 作用域（否则就是一个跨租户读）。
-    expect(findFirstWheres).toEqual([
-      { id: FORWARD_ID, workspace_id: WORKSPACE_ID, category: "port_forward" },
-      { id: FORWARD_ID, workspace_id: WORKSPACE_ID, category: "port_forward" },
-    ]);
-    expect(depsCalls).toEqual([]);
-  });
-
-  test("非法 id ⇒ 400 invalid_input（在权限与读库之前）", async () => {
-    const res = await app.request("http://localhost/api/forwards/abc/latency?granularity=hour&hours=6");
-    expect(res.status).toBe(400);
-    expect((await json(res)).code).toBe("invalid_input");
-    expect(dbCalls).toEqual([]);
-  });
-});
-
-/* ------------------------------------------------------------------ */
-/* ③ 窗口参数：非法 ⇒ 400 + 稳定 code；超上限 ⇒ 拒绝而不是静默截短        */
-/* ------------------------------------------------------------------ */
-
-describe("D6: 时间窗口由服务端钳制", () => {
-  const bad: Array<[string, string, string]> = [
-    ["缺 granularity", "", "invalid_granularity"],
-    ["granularity 不认识", "?granularity=minute&hours=6", "invalid_granularity"],
-    ["三种窗口参数都没给", "?granularity=sample", "missing_window"],
-    ["hours 与 from/to 同时给（自相矛盾）", "?granularity=sample&hours=6&from=2026-10-06T00:00:00Z&to=2026-10-06T01:00:00Z", "invalid_window"],
-    ["from/to 不成对", "?granularity=sample&from=2026-10-06T00:00:00Z", "invalid_window"],
-    ["hours 不是数字", "?granularity=sample&hours=abc", "invalid_window"],
-    ["hours = 0", "?granularity=sample&hours=0", "invalid_window"],
-    ["hours 不是整数", "?granularity=sample&hours=6.5", "invalid_window"],
-    ["from/to 不可解析", "?granularity=hour&from=not-a-time&to=2026-10-06T01:00:00Z", "invalid_window"],
-    ["from >= to", "?granularity=hour&from=2026-10-06T02:00:00Z&to=2026-10-06T01:00:00Z", "invalid_window"],
-    ["窗口全落在将来", "?granularity=hour&from=2099-01-01T00:00:00Z&to=2099-01-02T00:00:00Z", "invalid_window"],
-  ];
-
-  for (const [name, query, code] of bad) {
-    test(`${name} ⇒ 400 ${code}，且不读档案`, async () => {
-      const res = await get(query);
-      expect(res.status, name).toBe(400);
-      expect((await json(res)).code, name).toBe(code);
-      expect(depsCalls, name).toEqual([]);
-    });
+/* 分组执行器：组内 status 断言计数必须**恰好**等于写死的数字（第二条护栏，见文件头）。 */
+let checks = 0;
+async function status(res, want) { expect(res.status).toBe(want); checks = checks + 1; return res; }
+async function group(name, expectChecks, fn) {
+  checks = 0;
+  await fn();
+  if (checks !== expectChecks) {
+    throw new Error("GROUP " + name + ": expected " + expectChecks + " status checks, got " + checks);
   }
+  console.log("GROUP " + name + "=" + checks);
+}
+const DATA_KEYS = ["dimension","forward_id","granularity","mode","reason","series","status","truncated","window"].sort();
+const POINT_KEYS = ["at","failures","latency_max_ms","latency_min_ms","latency_ms","observation_source","samples","successes"].sort();
+`;
 
-  test("窗口超过该粒度上限 ⇒ 400 window_too_long（带 max_hours，不静默截短）", async () => {
-    const sampleRes = await get("?granularity=sample&hours=48");
-    expect(sampleRes.status).toBe(400);
-    const sampleBody = await json(sampleRes);
-    expect(sampleBody.code).toBe("window_too_long");
-    expect((sampleBody.data as { max_hours?: number })?.max_hours).toBe(24);
+/* ------------------------------------------------------------------ */
+/* 子进程执行器                                                        */
+/* ------------------------------------------------------------------ */
 
-    const hourRes = await get("?granularity=hour&hours=721");
-    expect(hourRes.status).toBe(400);
-    const hourBody = await json(hourRes);
-    expect(hourBody.code).toBe("window_too_long");
-    expect((hourBody.data as { max_hours?: number })?.max_hours).toBe(720);
-    expect(depsCalls).toEqual([]);
+/** 起一个干净的模块注册表跑一段场景；子进程非 0 退出即失败（错误原文带上子进程行号）。 */
+function runScenario(scenario: string): string {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      PRELUDE + scenario +
+        "\n/* 真实 redis 客户端会拖住事件循环：显式退出，否则 spawnSync 只能等超时。 */\nprocess.exit(0);\n",
+    ],
+    {
+      cwd: root,
+      env: { ...process.env, TUNEX_LATENCY_ROOT: root },
+      encoding: "utf8",
+      timeout: 60_000,
+    },
+  );
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  if (result.error) throw new Error(`子进程启动失败：${result.error.message}\n${output}`);
+  if (result.status !== 0) throw new Error(`子进程退出码 ${result.status}\n${output}`);
+  return output;
+}
+
+/* ------------------------------------------------------------------ */
+/* ① 权限与作用域                                                      */
+/* ------------------------------------------------------------------ */
+
+const SCENARIO_PERMISSIONS = String.raw`
+await group("permissions-and-scope", 7, async () => {
+  /* 自定义角色**没有** forward:read ⇒ 中间件就拒（真权限内核，不是替身放行）。 */
+  reset();
+  asRole("member", { "node:read": true });
+  let res = await status(await req("?granularity=hour&hours=6"), 403);
+  let body = await res.json();
+  expect(body.code).toBe("permission_denied");
+  expect(body.error_layer).toBe("rbac");
+  /* 被拒时请求到不了处理器：没读库、没读档案、没写任何东西。 */
+  expect(dbCalls).toEqual([]);
+  expect(writes).toEqual([]);
+
+  /* 正对照：同一自定义角色加上 forward:read ⇒ 放行。 */
+  asRole("member", { "forward:read": true });
+  await status(await req("?granularity=hour&hours=6"), 200);
+
+  /* viewer 能读：读端点不放宽也不收紧既有角色语义。 */
+  asRole("viewer");
+  await status(await req("?granularity=hour&hours=6"), 200);
+
+  /* base member 读他人转发：既有内核 read 直接放行（本任务不改动该语义，只如实记录）。 */
+  asRole("member");
+  seedTunnel({ user_id: 99 });
+  await status(await req("?granularity=hour&hours=6"), 200);
+
+  /* 跨 Workspace 与"真不存在"必须逐字同形（否则响应体成了存在性探针）。 */
+  asRole("owner");
+  seedTunnel(null);
+  dbCalls.length = 0; findFirstWheres.length = 0;
+  const missing = await status(await req("?granularity=hour&hours=6"), 404);
+  const missingBody = await missing.json();
+  seedTunnel({ workspace_id: WS + 6 });
+  const foreign = await status(await req("?granularity=hour&hours=6"), 404);
+  const foreignBody = await foreign.json();
+  expect(foreignBody).toEqual(missingBody);
+  expect(foreignBody.code).toBe("not_found");
+  expect(findFirstWheres.length).toBe(2);
+  findFirstWheres.forEach(function (where) {
+    expect(where.id).toBe(FORWARD_ID);
+    expect(where.workspace_id).toBe(WS);
+    expect(where.category).toBe("port_forward");
   });
+  /* 404 也不读档案（连池都不查：作用域先定，再谈数据）。 */
+  expect(dbCalls.filter(function (c) { return c.indexOf("targetLatency") === 0; }).length).toBe(0);
+  expect(dbCalls.filter(function (c) { return c === "egressPool.findUnique"; }).length).toBe(0);
 
-  test("to 在将来 ⇒ 钳制到 now（不多给也不少给），from 仍是原值", async () => {
-    const before = Date.now();
-    const from = new Date(before - 3 * 3_600_000).toISOString();
-    const to = new Date(before + 5 * 3_600_000).toISOString();
-    rawSamples = [];
-    const res = await get(`?granularity=sample&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
-    expect(res.status).toBe(200);
-    const data = (await json(res)).data!;
-    expect(data.window!.from).toBe(from);
-    expect(Date.parse(data.window!.to)).toBeLessThanOrEqual(Date.now());
-    expect(data.window!.hours).toBeGreaterThan(2.9);
-    expect(data.window!.hours).toBeLessThan(3.1);
-    // 传给读函数的窗口与响应里那个**是同一个**（不让下游再算一次）。
-    expect((rawQueries[0]!.from as Date).toISOString()).toBe(data.window!.from);
-    expect((rawQueries[0]!.to as Date).toISOString()).toBe(data.window!.to);
-  });
+  /* 非法 id ⇒ 400，在权限与读库之前。 */
+  seedTunnel(null);
+  dbCalls.length = 0;
+  await status(await reqWith("/api/forwards/abc/latency?granularity=hour", "GET"), 400);
+  expect(dbCalls).toEqual([]);
 });
+`;
 
 /* ------------------------------------------------------------------ */
-/* ④ raw_window_expired 与「没有数据」可区分                             */
+/* ② 窗口钳制与保留期                                                   */
 /* ------------------------------------------------------------------ */
 
-describe("D6: 「窗口太旧」与「没有数据」必须能分开", () => {
-  test("原始保留期 2h：sample 粒度读 6h ⇒ 409 raw_window_expired（不是 200 空序列）", async () => {
-    rawRetentionHours = "2";
-    const res = await get("?granularity=sample&hours=6");
-    expect(res.status).toBe(409);
-    const body = await json(res);
-    expect(body.code).toBe("raw_window_expired");
-    expect(body.error_layer).toBe("retention");
-    // 「太旧」在**查数据之前**就被拒了：没有任何 readRawSamples。
-    expect(depsCalls).toEqual([
-      "readConfig:LATENCY_RAW_RETENTION_HOURS",
-      "readConfig:LATENCY_BUCKET_RETENTION_DAYS",
-    ]);
-  });
+const SCENARIO_WINDOW = String.raw`
+await group("window-clamping", 17, async () => {
+  /* 形态非法 / 缺参数 ⇒ 400 + 稳定 code，且一次都不读档案。 */
+  reset();
+  const bad = [
+    ["", "invalid_granularity"],
+    ["?granularity=minute&hours=6", "invalid_granularity"],
+    ["?granularity=sample", "missing_window"],
+    ["?granularity=sample&hours=6&from=2026-10-06T00:00:00Z&to=2026-10-06T01:00:00Z", "invalid_window"],
+    ["?granularity=sample&from=2026-10-06T00:00:00Z", "invalid_window"],
+    ["?granularity=sample&hours=abc", "invalid_window"],
+    ["?granularity=sample&hours=0", "invalid_window"],
+    ["?granularity=sample&hours=6.5", "invalid_window"],
+    ["?granularity=hour&from=not-a-time&to=2026-10-06T01:00:00Z", "invalid_window"],
+    ["?granularity=hour&from=2026-10-06T02:00:00Z&to=2026-10-06T01:00:00Z", "invalid_window"],
+    ["?granularity=hour&from=2099-01-01T00:00:00Z&to=2099-01-02T00:00:00Z", "invalid_window"],
+  ];
+  for (let i = 0; i < bad.length; i = i + 1) {
+    const res = await status(await req(bad[i][0]), 400);
+    const body = await res.json();
+    expect(body.code).toBe(bad[i][1]);
+  }
+  /* 超过该粒度上限 ⇒ 400 window_too_long（带 max_hours，**不静默截短**）。 */
+  const longSample = await status(await req("?granularity=sample&hours=48"), 400);
+  const longSampleBody = await longSample.json();
+  expect(longSampleBody.code).toBe("window_too_long");
+  expect(longSampleBody.data.max_hours).toBe(24);
+  const longHour = await status(await req("?granularity=hour&hours=721"), 400);
+  const longHourBody = await longHour.json();
+  expect(longHourBody.code).toBe("window_too_long");
+  expect(longHourBody.data.max_hours).toBe(720);
+  /* 参数在被拒之前没有碰过档案面。 */
+  expect(dbCalls.filter(function (c) { return c.indexOf("targetLatency") === 0; }).length).toBe(0);
+  expect(dbCalls.filter(function (c) { return c === "systemConfig.findUnique"; }).length).toBe(0);
 
-  test("同一窗口换成 hour 粒度 ⇒ 200（小时桶覆盖 30d），形状是 no_samples 而不是错误", async () => {
-    rawRetentionHours = "2";
-    hourBuckets = [];
-    const res = await get("?granularity=hour&hours=6");
-    expect(res.status).toBe(200);
-    const data = (await json(res)).data!;
-    expect(data.status).toBe("no_samples");
-    expect(data.series).toEqual([]);
-    expect(data.dimension).toEqual({ observer_node_id: EGRESS_NODE_ID, target_key: TARGET_KEY });
-  });
+  /* to 在将来 ⇒ 钳制到 now（不多给也不少给），from 保持原值。 */
+  reset();
+  const now = Date.now();
+  const from = new Date(now - 3 * 3600000).toISOString();
+  const to = new Date(now + 5 * 3600000).toISOString();
+  const clamped = await status(
+    await req("?granularity=sample&from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to)),
+    200,
+  );
+  const clampedData = (await clamped.json()).data;
+  expect(clampedData.window.from).toBe(from);
+  expect(Date.parse(clampedData.window.to)).toBeLessThanOrEqual(Date.now());
+  expect(clampedData.window.hours).toBeGreaterThan(2.9);
+  expect(clampedData.window.hours).toBeLessThan(3.1);
+  expect(clampedData.status).toBe("no_samples");
+  /* 传给读函数的窗口与响应里那个**是同一个**（不让下游再算一次）。 */
+  expect(rawSampleQueries[0].where.observed_at.gte.toISOString()).toBe(clampedData.window.from);
+  expect(rawSampleQueries[0].where.observed_at.lt.toISOString()).toBe(clampedData.window.to);
 
-  test("sample 粒度窗口落在保留期内 ⇒ 不是 409（「太旧」与「空」不同码）", async () => {
-    rawRetentionHours = "2";
-    const res = await get("?granularity=sample&hours=1");
-    expect(res.status).toBe(200);
-    expect((await json(res)).data!.status).toBe("no_samples");
-  });
+  /* 原始保留期被配成 2h：sample 粒度读 6h ⇒ 409（**在查数据之前**就拒）。 */
+  reset();
+  rawRetention = "2";
+  const expired = await status(await req("?granularity=sample&hours=6"), 409);
+  const expiredBody = await expired.json();
+  expect(expiredBody.code).toBe("raw_window_expired");
+  expect(expiredBody.error_layer).toBe("retention");
+  expect(dbCalls.filter(function (c) { return c === "systemConfig.findUnique"; }).length).toBe(2);
+  expect(dbCalls.filter(function (c) { return c.indexOf("targetLatency") === 0; }).length).toBe(0);
+
+  /* 同一窗口换成 hour 粒度 ⇒ 200 + no_samples：与上面的 409 明确可区分。 */
+  const hourRes = await status(await req("?granularity=hour&hours=6"), 200);
+  expect((await hourRes.json()).data.status).toBe("no_samples");
+
+  /* sample 粒度窗口落在保留期内 ⇒ 200（「太旧」与「空」不是同一个码）。 */
+  await status(await req("?granularity=sample&hours=1"), 200);
 });
+`;
 
 /* ------------------------------------------------------------------ */
-/* ⑤ DIRECT / 无观测维度 ⇒ 明确的「无数据」                              */
+/* ③ 观测维度、序列形状                                                 */
 /* ------------------------------------------------------------------ */
 
-describe("D6: 没有观测维度时如实说「没有数据」", () => {
-  test("DIRECT 转发 ⇒ 200 no_observer/direct_not_observed，series 为空且**不去查档案**", async () => {
-    seedTunnel({ tunnel_mode: "direct", egress_node_id: null, egress_pool_id: null });
-    const res = await get("?granularity=hour&hours=6");
-    expect(res.status).toBe(200);
-    const data = (await json(res)).data!;
-    expect(data.status).toBe("no_observer");
-    expect(data.reason).toBe("direct_not_observed");
-    expect(data.dimension).toBeNull();
-    expect(data.series).toEqual([]);
-    expect(data.truncated).toBe(false);
-    // DIRECT 的目标由入口节点直拨、观测器只看出口池：拿 target_host 硬造一个 key 去查
-    // 就是猜。这里证明它**没有**查档案，也没有编一个 0 值序列。
-    expect(depsCalls).toEqual([]);
-    expect(JSON.stringify(data)).not.toContain("latency_ms");
-  });
+const SCENARIO_DIMENSION = String.raw`
+await group("dimension-and-series", 9, async () => {
+  /* DIRECT：目标由入口节点直拨、观测器只看出口池 ⇒ 按构造没有观测者。 */
+  reset();
+  seedTunnel({ tunnel_mode: "direct", egress_node_id: null, egress_pool_id: null });
+  let res = await status(await req("?granularity=hour&hours=6"), 200);
+  let data = (await res.json()).data;
+  expect(data.status).toBe("no_observer");
+  expect(data.reason).toBe("direct_not_observed");
+  expect(data.dimension).toBeNull();
+  expect(data.series).toEqual([]);
+  expect(data.truncated).toBe(false);
+  /* 不去猜一个 target 来查：DIRECT 只读了转发行；响应里连 latency 字段都没有。 */
+  expect(dbCalls).toEqual(["tunnel.findFirst"]);
+  expect(JSON.stringify(data).indexOf("latency_ms")).toBe(-1);
 
-  test("RELAY 但没有出口池 ⇒ no_observer/no_egress_pool", async () => {
-    seedTunnel({ egress_pool_id: null });
-    const data = (await json(await get("?granularity=hour&hours=6"))).data!;
-    expect(data.status).toBe("no_observer");
-    expect(data.reason).toBe("no_egress_pool");
-    expect(depsCalls).toEqual([]);
-  });
+  /* RELAY 但没有出口池。 */
+  reset();
+  seedTunnel({ egress_pool_id: null });
+  res = await status(await req("?granularity=hour&hours=6"), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("no_observer");
+  expect(data.reason).toBe("no_egress_pool");
+  expect(dbCalls).toEqual(["tunnel.findFirst"]);
 
-  test("出口腿在 peer panel ⇒ no_observer/federated_egress（本 panel 只说「我这边没有」）", async () => {
-    seedTunnel({ federated_egress_peer: "peer-2", egress_node_id: null, egress_pool_id: null });
-    const data = (await json(await get("?granularity=hour&hours=6"))).data!;
-    expect(data.status).toBe("no_observer");
-    expect(data.reason).toBe("federated_egress");
-    expect(depsCalls).toEqual([]);
-  });
+  /* 出口腿在 peer panel：观测落在**那边**的档案里。 */
+  reset();
+  seedTunnel({ federated_egress_peer: "peer-2", egress_node_id: null, egress_pool_id: null });
+  res = await status(await req("?granularity=hour&hours=6"), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("no_observer");
+  expect(data.reason).toBe("federated_egress");
+  expect(dbCalls).toEqual(["tunnel.findFirst"]);
 
-  test("池的主人 ≠ 转发出口节点 ⇒ no_observer/dimension_conflict（不挑一个信）", async () => {
-    seedPool({ node_id: EGRESS_NODE_ID + 5 });
-    const data = (await json(await get("?granularity=hour&hours=6"))).data!;
-    expect(data.status).toBe("no_observer");
-    expect(data.reason).toBe("dimension_conflict");
-    expect(depsCalls).toEqual([]);
-  });
+  /* 池的主人 ≠ 转发出口节点：归属对不上，不挑一个信。 */
+  reset();
+  seedPool({ node_id: EGRESS_NODE_ID + 5 });
+  res = await status(await req("?granularity=hour&hours=6"), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("no_observer");
+  expect(data.reason).toBe("dimension_conflict");
+  expect(dbCalls.filter(function (c) { return c.indexOf("targetLatency") === 0; }).length).toBe(0);
 
-  test("池里没有 active 目标 ⇒ no_observer/no_active_target（停用目标不算观测维度）", async () => {
-    seedPool({
-      targets: [
-        { id: 1, host: TARGET_HOST, port: TARGET_PORT, status: "inactive", order_by: 1000 },
-      ],
-    });
-    const data = (await json(await get("?granularity=hour&hours=6"))).data!;
-    expect(data.status).toBe("no_observer");
-    expect(data.reason).toBe("no_active_target");
-    expect(depsCalls).toEqual([]);
-  });
+  /* 池里只有停用目标 ⇒ 没有观测维度。 */
+  reset();
+  seedPool({ targets: [{ id: 1, host: TARGET_HOST, port: TARGET_PORT, status: "inactive", order_by: 1000 }] });
+  res = await status(await req("?granularity=hour&hours=6"), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("no_observer");
+  expect(data.reason).toBe("no_active_target");
+  expect(dbCalls.filter(function (c) { return c.indexOf("targetLatency") === 0; }).length).toBe(0);
 
-  test("池里多个 active 目标 ⇒ ambiguous_target + 只报数量（拒绝藏起其余目标的抖动）", async () => {
-    seedPool({
-      targets: [
-        { id: 1, host: TARGET_HOST, port: TARGET_PORT, status: "active", order_by: 1000 },
-        { id: 2, host: "10.0.0.9", port: 9090, status: "active", order_by: 1010 },
-        { id: 3, host: "10.0.0.9", port: 9090, status: "inactive", order_by: 1020 },
-      ],
-    });
-    const res = await get("?granularity=hour&hours=6");
-    expect(res.status).toBe(200);
-    const data = (await json(res)).data!;
-    expect(data.status).toBe("ambiguous_target");
-    expect(data.reason).toBe("multiple_targets");
-    expect(data.candidate_targets).toBe(2);
-    expect(data.series).toEqual([]);
-    expect(depsCalls).toEqual([]);
-  });
+  /* 多个 active 目标 ⇒ 拒绝猜（只报数量，不列 host:port 清单）。 */
+  reset();
+  seedPool({ targets: [
+    { id: 1, host: TARGET_HOST, port: TARGET_PORT, status: "active", order_by: 1000 },
+    { id: 2, host: "10.0.0.9", port: 9090, status: "active", order_by: 1010 },
+    { id: 3, host: "10.0.0.9", port: 9090, status: "inactive", order_by: 1020 },
+  ] });
+  res = await status(await req("?granularity=hour&hours=6"), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("ambiguous_target");
+  expect(data.reason).toBe("multiple_targets");
+  expect(data.candidate_targets).toBe(2);
+  expect(data.series).toEqual([]);
+  expect(dbCalls.filter(function (c) { return c.indexOf("targetLatency") === 0; }).length).toBe(0);
+
+  /* 成功形状（sample）：点逐字透传，不可达样本的 latency_ms 保持 null（绝不补 0）。 */
+  reset();
+  rawRows = [
+    sampleRow({ observed_at: new Date("2026-10-06T01:00:00.000Z"), latency_ms: 42.5 }),
+    sampleRow({ observed_at: new Date("2026-10-06T01:00:30.000Z"), reachable: false, latency_ms: null }),
+  ];
+  /* 显式窗口（00:00–03:00Z）：样本就在窗口里，且两位小数/顺序都可逐字断言。 */
+  const fixedWindow = "?granularity=sample"
+    + "&from=" + encodeURIComponent("2026-10-06T00:00:00.000Z")
+    + "&to=" + encodeURIComponent("2026-10-06T03:00:00.000Z");
+  res = await status(await req(fixedWindow), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("ok");
+  expect(data.truncated).toBe(false);
+  expect(data.dimension).toEqual({ observer_node_id: EGRESS_NODE_ID, target_key: TARGET_KEY });
+  expect(data.series).toEqual([
+    { at: "2026-10-06T01:00:00.000Z", latency_ms: 42.5, samples: 1, successes: 1, failures: 0,
+      latency_min_ms: 42.5, latency_max_ms: 42.5, observation_source: "node-7/tcp_connect" },
+    { at: "2026-10-06T01:00:30.000Z", latency_ms: null, samples: 1, successes: 0, failures: 1,
+      latency_min_ms: null, latency_max_ms: null, observation_source: "node-7/tcp_connect" },
+  ]);
+  /* 维度是**服务端推导**的：查档案用的是 (出口节点, 池目标)，不是入口节点、也不是客户端参数。 */
+  expect(rawSampleQueries[0].where.node_id).toBe(EGRESS_NODE_ID);
+  expect(rawSampleQueries[0].where.target_key).toBe(TARGET_KEY);
+  expect(rawSampleQueries[0].where.observation_source).toBe(undefined);
+  expect(rawSampleQueries[0].take).toBe(2001);
+
+  /* hour 粒度：一个样本都没测到的小时桶 ⇒ latency_ms null（不是 0）。 */
+  reset();
+  bucketRows = [bucketRow({ hour_start: new Date(Date.now() - 4 * 3600000),
+    sample_count: 6, success_count: 0, failure_count: 6,
+    latency_samples: 0, latency_sum_ms: 0, latency_min_ms: null, latency_max_ms: null })];
+  res = await status(await req("?granularity=hour&hours=6"), 200);
+  data = (await res.json()).data;
+  expect(data.status).toBe("ok");
+  expect(data.series.length).toBe(1);
+  expect(data.series[0].latency_ms).toBeNull();
+  expect(data.series[0].failures).toBe(6);
+  /* hour 粒度不查原始样本表（分层保留期各自为政）。 */
+  expect(dbCalls.filter(function (c) { return c === "targetLatencySample.findMany"; }).length).toBe(0);
+
+  /* 命中点数上限 ⇒ truncated=true 且点数就是上限（显式标注，不假装完整）。 */
+  reset();
+  rawRows = [];
+  /* 2001 行 × 30s ≈ 16.7h，全部落在 [now-20h, now) 里（留出时钟漂移余量）。 */
+  const spanStart = Date.now() - 19 * 3600000;
+  for (let i = 0; i < 2001; i = i + 1) {
+    rawRows.push(sampleRow({ observed_at: new Date(spanStart + i * 30000) }));
+  }
+  res = await status(await req("?granularity=sample&hours=20"), 200);
+  data = (await res.json()).data;
+  expect(data.truncated).toBe(true);
+  expect(data.series.length).toBe(2000);
+
+  /* 键集冻结 + 内部材料逐字不出现。 */
+  expect(tunnel.internal_material).toBe(SEALED);
+  const rawText = JSON.stringify(data);
+  expect(rawText.indexOf("SEALED")).toBe(-1);
+  expect(rawText.indexOf("internal_material")).toBe(-1);
+  expect(Object.keys(data).sort()).toEqual(DATA_KEYS);
+  expect(Object.keys(data.series[0]).sort()).toEqual(POINT_KEYS);
 });
+`;
 
 /* ------------------------------------------------------------------ */
-/* ⑥ 成功形状：直接透传读函数的点                                        */
+/* ④ 路由可达性与零副作用                                               */
 /* ------------------------------------------------------------------ */
 
-describe("D6: 成功响应直接透传档案的点", () => {
-  test("sample 粒度：不可达样本的 latency_ms 保持 null（绝不补 0），顺序不变", async () => {
-    const first = samplePoint({ observed_at: new Date("2026-10-06T21:00:00.000Z"), latency_ms: 42.5 });
-    const second = samplePoint({
-      observed_at: new Date("2026-10-06T21:00:30.000Z"),
-      reachable: false,
-      latency_ms: null,
-    });
-    rawSamples = [first, second];
-    const res = await get("?granularity=sample&hours=6");
-    expect(res.status).toBe(200);
-    const data = (await json(res)).data!;
-    expect(data.status).toBe("ok");
-    expect(data.truncated).toBe(false);
-    expect(data.dimension).toEqual({ observer_node_id: EGRESS_NODE_ID, target_key: TARGET_KEY });
-    expect(data.series).toEqual([
-      {
-        at: "2026-10-06T21:00:00.000Z",
-        latency_ms: 42.5,
-        samples: 1,
-        successes: 1,
-        failures: 0,
-        latency_min_ms: 42.5,
-        latency_max_ms: 42.5,
-        observation_source: "node-7/tcp_connect",
-      },
-      {
-        at: "2026-10-06T21:00:30.000Z",
-        latency_ms: null,
-        samples: 1,
-        successes: 0,
-        failures: 1,
-        latency_min_ms: null,
-        latency_max_ms: null,
-        observation_source: "node-7/tcp_connect",
-      },
-    ]);
-    // 维度是**服务端推导**的：查询维度必须是 (出口节点, 池目标)，不是入口节点。
-    expect(rawQueries[0]!.node_id).toBe(EGRESS_NODE_ID);
-    expect(rawQueries[0]!.target_key).toBe(TARGET_KEY);
-    expect(rawQueries[0]!.observation_source).toBeNull();
-  });
+const SCENARIO_ROUTING = String.raw`
+await group("reachability-and-zero-side-effects", 5, async () => {
+  /* 子路由真的落到延迟处理器（不是转发详情、也不是被 catch-all 吃掉）。 */
+  reset();
+  rawRows = [sampleRow({ observed_at: new Date() })];
+  const res = await status(await req("?granularity=sample&hours=6"), 200);
+  const data = (await res.json()).data;
+  expect("status" in data).toBe(true);
+  expect("window" in data).toBe(true);
+  expect("name" in data).toBe(false);
+  expect("target_host" in data).toBe(false);
+  /* 零副作用：只碰这两张业务表 + 档案的只读面；任何写操作都会让替身抛错（→ 500）。 */
+  expect(dbCalls).toEqual([
+    "tunnel.findFirst", "egressPool.findUnique",
+    "systemConfig.findUnique", "systemConfig.findUnique",
+    "targetLatencySample.findMany",
+  ]);
+  expect(writes).toEqual([]);
 
-  test("hour 粒度：一个样本都没测到的小时桶 ⇒ latency_ms null（不是 0）", async () => {
-    hourBuckets = [
-      hourBucket({
-        sample_count: 6,
-        success_count: 0,
-        failure_count: 6,
-        latency_samples: 0,
-        latency_sum_ms: 0,
-        latency_min_ms: null,
-        latency_max_ms: null,
-      }),
-    ];
-    const data = (await json(await get("?granularity=hour&hours=6"))).data!;
-    expect(data.status).toBe("ok");
-    expect(data.series!.length).toBe(1);
-    expect(data.series![0]!.latency_ms).toBeNull();
-    expect(data.series![0]!.failures).toBe(6);
-  });
+  /* 该路径不是通配：未知子路径仍然 404。 */
+  await status(await reqWith("/api/forwards/11/latency-typo?granularity=hour", "GET"), 404);
 
-  test("命中点数上限 ⇒ truncated=true 且点数就是上限（显式标注，不假装完整）", async () => {
-    rawSamples = Array.from({ length: realLatency.MAX_SERIES_POINTS + 1 }, (_, i) =>
-      samplePoint({ observed_at: new Date(1_700_000_000_000 + i * 30_000) }),
-    );
-    const data = (await json(await get("?granularity=sample&hours=6"))).data!;
-    expect(data.truncated).toBe(true);
-    expect(data.series!.length).toBe(realLatency.MAX_SERIES_POINTS);
-    // 读函数只多取一条用于判"被截断"，不会把整个窗口拉进内存。
-    expect(rawQueries[0]!.limit).toBe(realLatency.MAX_SERIES_POINTS + 1);
-  });
+  /* 对照组：:id/:action catch-all 仍然存在且可达（未知动作 ⇒ 400）。 */
+  const catchAll = await status(await reqWith("/api/forwards/11/not-an-action", "POST"), 400);
+  expect((await catchAll.json()).error).toBe("不支持的端口转发动作");
 
-  test("响应键集冻结，且不含任何内部材料", async () => {
-    expect(tunnel!.internal_material).toBe(SEALED_MATERIAL);
-    rawSamples = [samplePoint()];
-    const res = await get("?granularity=sample&hours=6");
-    const raw = await res.clone().text();
-    expect(raw).not.toContain("SEALED");
-    expect(raw).not.toContain("internal_material");
-    const body = await json(res);
-    expect(Object.keys(body.data!).sort()).toEqual(DATA_KEYS);
-    expect(Object.keys(body.data!.series![0]!).sort()).toEqual(POINT_KEYS);
-  });
+  /* 幂等：同一窗口读两次结论一致（显式 from/to，不受"现在"漂移影响）。 */
+  reset();
+  rawRows = [sampleRow({ observed_at: new Date("2026-10-06T01:00:00.000Z") })];
+  const fixed = "?granularity=sample"
+    + "&from=" + encodeURIComponent("2026-10-06T00:00:00.000Z")
+    + "&to=" + encodeURIComponent("2026-10-06T03:00:00.000Z");
+  const before = dbCalls.length;
+  const first = await status(await req(fixed), 200);
+  const firstBody = await first.json();
+  const second = await status(await req(fixed), 200);
+  expect(await second.json()).toEqual(firstBody);
+  expect(dbCalls.length - before).toBe(10);
 });
+`;
 
 /* ------------------------------------------------------------------ */
-/* ⑦ catch-all 没吃掉子路由                                             */
+/* 测试入口（四个场景各在一个干净注册表的子进程里）                        */
 /* ------------------------------------------------------------------ */
 
-describe("D6: 子路由没被参数化 catch-all 吃掉", () => {
-  test("GET /:id/latency 落到延迟处理器（有 status/window，不是转发详情）", async () => {
-    const data = (await json(await get("?granularity=hour&hours=6"))).data!;
-    expect("status" in data).toBe(true);
-    expect("window" in data).toBe(true);
-    expect("name" in data).toBe(false);
-    expect("target_host" in data).toBe(false);
-  });
+test("D6 权限与作用域：真实路由 + 真实权限内核（干净注册表子进程）", () => {
+  expect(runScenario(SCENARIO_PERMISSIONS)).toContain("GROUP permissions-and-scope=7");
+}, 30_000);
 
-  test("该路径不是通配：未知子路径仍然是 404", async () => {
-    const res = await app.request(`http://localhost/api/forwards/${FORWARD_ID}/latency-typo?granularity=hour`);
-    expect(res.status).toBe(404);
-  });
+test("D6 窗口由服务端钳制：非法 400、超上限 400、raw_window_expired 与 no_samples 可区分", () => {
+  expect(runScenario(SCENARIO_WINDOW)).toContain("GROUP window-clamping=17");
+}, 30_000);
 
-  test("对照组：catch-all 仍然存在且可达（未知 action ⇒ 400）", async () => {
-    const res = await app.request(`http://localhost/api/forwards/${FORWARD_ID}/not-an-action`, {
-      method: "POST",
-    });
-    expect(res.status).toBe(400);
-    expect((await json(res)).error).toBe("不支持的端口转发动作");
-  });
-});
+test("D6 观测维度：无观测 ⇒ 明确「无数据」而不是 0 值序列，成功形状逐字透传", () => {
+  expect(runScenario(SCENARIO_DIMENSION)).toContain("GROUP dimension-and-series=9");
+}, 30_000);
 
-/* ------------------------------------------------------------------ */
-/* ⑧ 零副作用                                                          */
-/* ------------------------------------------------------------------ */
-
-describe("D6: GET 是纯读", () => {
-  test("一次成功读只碰两次库（转发行 + 出口池），且不写任何东西", async () => {
-    rawSamples = [samplePoint()];
-    const res = await get("?granularity=sample&hours=6");
-    expect(res.status).toBe(200);
-    // 写操作会让替身抛错（→ 500）；这里同时逐项核对调用面。
-    expect(dbCalls).toEqual(["tunnel.findFirst", "egressPool.findUnique"]);
-    expect(depsCalls).toEqual([
-      "readConfig:LATENCY_RAW_RETENTION_HOURS",
-      "readConfig:LATENCY_BUCKET_RETENTION_DAYS",
-      "readRawSamples",
-    ]);
-  });
-
-  test("幂等：同一窗口读两次结论一致（显式 from/to，不受「现在」漂移影响）", async () => {
-    rawSamples = [samplePoint()];
-    // 显式窗口：`hours` 形态的窗口以"请求那一刻"为右界，两次调用必然不同（那是时钟事实，
-    // 不是幂等性缺陷）；这里要证明的是**同样的输入给出同样的输出**。
-    const query =
-      "?granularity=sample" +
-      `&from=${encodeURIComponent("2026-10-06T00:00:00.000Z")}` +
-      `&to=${encodeURIComponent("2026-10-06T03:00:00.000Z")}`;
-    const first = (await json(await get(query))).data!;
-    const second = (await json(await get(query))).data!;
-    expect(second).toEqual(first);
-    expect(dbCalls).toEqual([
-      "tunnel.findFirst",
-      "egressPool.findUnique",
-      "tunnel.findFirst",
-      "egressPool.findUnique",
-    ]);
-  });
-
-  test("无观测维度时不多查库（DIRECT 只读转发行）", async () => {
-    seedTunnel({ tunnel_mode: "direct", egress_node_id: null, egress_pool_id: null });
-    expect((await get("?granularity=hour&hours=6")).status).toBe(200);
-    expect(dbCalls).toEqual(["tunnel.findFirst"]);
-  });
-});
+test("D6 路由可达性与零副作用：子路由没被 catch-all 吃掉、GET 只碰只读面", () => {
+  expect(runScenario(SCENARIO_ROUTING)).toContain("GROUP reachability-and-zero-side-effects=5");
+}, 30_000);

@@ -6,6 +6,7 @@ import { workspacesApi } from "./api/workspaces";
 import { authApi } from "./api/auth";
 import { settingsApi } from "./api/settings";
 import { dashboardApi } from "./api/dashboard";
+import { ddnsApi } from "./api/ddns";
 import { announcementsApi } from "./api/announcements";
 import { forwardsApi } from "./api/forwards";
 import { nodesApi } from "./api/nodes";
@@ -21,6 +22,7 @@ export const api = {
   auth: authApi,
   settings: settingsApi,
   dashboard: dashboardApi,
+  ddns: ddnsApi,
   announcements: announcementsApi,
   forwards: forwardsApi,
   nodes: nodesApi,
