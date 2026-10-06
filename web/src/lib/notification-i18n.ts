@@ -177,7 +177,7 @@ const zh: NotificationText = {
   channelExtraNote: {
     email: "邮件渠道是否可用取决于平台侧的 SMTP 配置。",
     telegram:
-      "Telegram 是否真的能送达，取决于你在个人资料里填写的 tg_id（该字段是自由填写、**未经校验**）以及平台是否开启 Telegram 渠道；本页不会因为你填了 tg_id 就认为你「已绑定」。",
+      "Telegram 是否真的能送达，取决于你在个人资料里填写的 tg_id（该字段是自由填写、**未经校验**）以及平台是否开启 Telegram 渠道；本页不会因为你填了 tg_id 就把它当作已验证的绑定。",
     webhook: "后端有意未把 webhook 接入投递注册表（今天没有消费者）。",
   },
   categoryLabel: {
@@ -259,7 +259,7 @@ const en: NotificationText = {
   channelExtraNote: {
     email: "Whether the email channel works depends on the SMTP configuration on the platform side.",
     telegram:
-      "Whether Telegram really delivers depends on the tg_id in your profile (a free-form, unverified field) and on whether the platform enabled the Telegram channel; filling in tg_id does not make this page treat you as “bound”.",
+      "Whether Telegram really delivers depends on the tg_id in your profile (a free-form, unverified field) and on whether the platform enabled the Telegram channel; filling in tg_id does not make this page treat it as a verified binding.",
     webhook: "The backend deliberately keeps webhook out of the delivery registry (it has no consumer today).",
   },
   categoryLabel: {

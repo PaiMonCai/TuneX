@@ -273,7 +273,16 @@ export function ForwardWorkspace() {
       if (bindingsFailed) toast.error(t("forward.bindingsLoadFailed"));
       setBindings(map);
       setBindingsUnavailable(bindingsFailed);
-    }).catch((err) => { if (current()) toast.error(err instanceof Error ? err.message : t("forward.loadFailed")); }) : Promise.resolve();
+    }).catch((err) => {
+      // **整张节点表取不到**（网络失败 / 权限刚被撤）也必须算"事实取不到"：
+      // 否则 `setBindingsUnavailable` 不执行、而 `setReferenceLoaded(true)` 仍执行，
+      // 弹窗就会把空 map 当权威渲染「当前没有其它可绑定的出口节点」——
+      // 与"单条 bindings 失败"那条路径是同一个谎（R5-B 的 P2-6）。
+      if (current()) {
+        setBindingsUnavailable(true);
+        toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
+      }
+    }) : Promise.resolve();
     await Promise.all([summaryTask, nodesTask]);
     if (current()) setReferenceLoaded(true);
   }

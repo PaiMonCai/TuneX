@@ -29,7 +29,7 @@ import { AlertTriangle, RefreshCw, ShieldAlert, Undo2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useI18nOptional } from "@/components/providers";
-import { get } from "@/lib/api/core";
+import { request } from "@/lib/api/core";
 import {
   adminPersonaOf,
   type AdminPersonaReading,
@@ -204,7 +204,9 @@ function useAdminPersona(scope: ErrorScope): AdminPersonaReading {
     let alive = true;
     void (async () => {
       try {
-        const payload = await get<unknown>("/auth/permissions", undefined, undefined);
+        // `noRedirect`：这是一次**只影响文案**的后台读数，不能因为 401 就把用户从
+        // 错误页导航去 /login（错误页上的副作用必须为零，否则会掩盖原始错误）。
+        const payload = await request<unknown>("/auth/permissions", { noRedirect: true });
         if (alive) setPersona(adminPersonaOf(payload));
       } catch {
         // 取不到就保持 unknown：错误面不因为一次读数失败改变口径。

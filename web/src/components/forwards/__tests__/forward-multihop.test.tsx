@@ -616,7 +616,7 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
     expect(topology.body.segments.map((row) => row.segment)).toEqual(["ingress_to_middle", "middle_to_egress"]);
   });
 
-  test("缺一段 ⇒ 409 BINDING_REQUIRED（与后端同判据），且**没有**建出转发", async () => {
+  test("缺一段 ⇒ 409 binding_required（与后端同判据、同码风格），且**没有**建出转发", async () => {
     const before = getStore().tunnels.length;
     const res = await call<{ code: string; message: string }>("POST", "forwards", {
       body: {
@@ -630,7 +630,7 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
       },
     });
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe("BINDING_REQUIRED");
+    expect(res.body.code).toBe("binding_required");
     expect(res.body.message).toContain("入口→中间");
     expect(getStore().tunnels.length).toBe(before);
   });
@@ -642,6 +642,39 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
     expect(created.status).toBe(200);
     const topology = await call<{ segments: { segment: string }[] }>("GET", `forwards/${created.body.id}/topology`);
     expect(topology.body.segments.map((row) => row.segment)).toEqual(["ingress_to_egress"]);
+  });
+
+  test("错误码大小写与真机一致：单跳缺绑定与三跳缺段都输出小写 binding_required", async () => {
+    /*
+     * 真机逐字（scratch Panel 实测）：`{"error":"该出口尚未绑定到当前入口节点","code":"binding_required"}`
+     * 与三跳的 `{"error":"三跳路由要求入口→中间、中间→出口两段都已绑定","code":"binding_required"}`。
+     * mock 过去对单跳输出大写 `BINDING_REQUIRED`（同一份 mock 的编辑路径却用小写）——
+     * 这里把"码风格与真机一致"钉成行为断言，同时保证读取方两种都认。
+     */
+    const single = await call<{ code: string }>("POST", "forwards", {
+      body: { mode: "relay", name: "单跳缺绑定", ingress_node_id: 1, egress_node_id: 5, target_host: "example.com", target_port: 443 },
+    });
+    expect(single.status).toBe(409);
+    expect(single.body.code).toBe("binding_required");
+
+    const multi = await call<{ code: string }>("POST", "forwards", {
+      body: {
+        mode: "relay",
+        name: "三跳缺段",
+        ingress_node_id: 1,
+        egress_node_id: 4,
+        middle_node_id: 5,
+        target_host: "example.com",
+        target_port: 443,
+      },
+    });
+    expect(multi.status).toBe(409);
+    expect(multi.body.code).toBe("binding_required");
+
+    // 过渡期两种大小写都能被界面读懂（历史 mock/网关可能仍回大写）。
+    expect(multihopFailureInfo("zh", { status: 409, message: "x", data: { code: "BINDING_REQUIRED" } }).code).toBe(
+      "binding_required",
+    );
   });
 
   test("DIRECT 带上 middle_node_id：mock 与真后端同样不校验（已知缺口，UI 结构上不发送）", async () => {

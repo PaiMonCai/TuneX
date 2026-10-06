@@ -172,11 +172,15 @@ describe("WP13 出口池候选（用户侧）", () => {
       "GET",
       "/egress-pools",
     );
-    // 3 = sg-out-01 的 sg-relay-pool（多目标）+ sg-out-02 的 default + jp-out-01 的
-    // jp-relay-pool（R2-C 补齐的**单目标 active 池**夹具：让延迟卡片的 ok 态在 mock
-    // 模式可达）。jp-out-01 本来就是 role=egress 的节点，而用户侧只列「出口能力节点上
-    // 的 active 池」，所以这条池出现是正确行为，不是回归。
-    expect(body.length).toBe(3);
+    // 刻意**不钉总条数**：池夹具会随产品切片增删（R2-C 就新增了 jp-out-01 的单目标池
+    // 让延迟卡片的 ok 态在 mock 模式可达），钉数量的断言会让「加夹具」变成打红别人。
+    // 这里钉的是语义：既有种子池必须都在、每条都带真实 node_label 与 active 目标、
+    // 且没有重复条目。
+    const byId = new Map(body.map((p) => [p.id, p]));
+    expect(byId.size).toBe(body.length);
+    expect([...byId.keys()]).toEqual(expect.arrayContaining([1, 2]));
+    expect(byId.get(2)!.name).toBe("sg-relay-pool");
+    expect(byId.get(2)!.node_label).toContain("sg-out-01");
     for (const p of body) {
       expect(p.node_label).toBeString();
       expect(p.targets.length).toBeGreaterThan(0);

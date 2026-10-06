@@ -407,7 +407,13 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
             binding.ingress_node_id === ingress.id &&
             binding.egress_node_id === egress!.id,
         );
-        if (!bound) return fail(409, "该出口尚未绑定到当前入口节点", "BINDING_REQUIRED");
+        /*
+         * 错误码**大小写以真机为准**：后端是 `error(409, "binding_required", …)`
+         * （`forward-service.ts:788`），本文件过去输出的大写 `BINDING_REQUIRED` 是历史分叉
+         * —— 同一份 mock 的编辑路径（`mocks/forward-edit.ts`）一直用的是小写，两边还不一致。
+         * 现在统一成小写；读取方在过渡期**两种都认**（`multihopFailureInfo` 大小写不敏感）。
+         */
+        if (!bound) return fail(409, "该出口尚未绑定到当前入口节点", "binding_required");
       } else if (egressId !== null) {
         return badRequest("DIRECT 转发不能指定出口节点");
       }
@@ -433,7 +439,7 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
           (binding) => binding.ingress_node_id === middleId && binding.egress_node_id === egress?.id,
         );
         if (!inbound || !outbound) {
-          return fail(409, "三跳路由要求入口→中间、中间→出口两段都已绑定", "BINDING_REQUIRED");
+          return fail(409, "三跳路由要求入口→中间、中间→出口两段都已绑定", "binding_required");
         }
       }
 

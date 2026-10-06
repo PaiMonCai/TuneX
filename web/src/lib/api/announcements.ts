@@ -192,8 +192,9 @@ function unwrapEnvelope(raw: unknown): unknown {
   return raw;
 }
 
-/** 辨认 `{ mutes, channels, categories }`。三样缺一（或类型不对）就是"读不出来"，不是"空"。 */
-function readPreferencesPayload(raw: unknown): NotificationPreferencesPayload {
+/** 辨认 `{ mutes, channels, categories }`。三样缺一（或类型不对）就是"读不出来"，不是"空"。
+ *  导出只为让它可被测试直接驱动（两种信封形状 / 畸形载荷），不是给别处复用的入口。 */
+export function readPreferencesPayload(raw: unknown): NotificationPreferencesPayload {
   const payload = unwrapEnvelope(raw);
   const row = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
   const mutes = row?.mutes;

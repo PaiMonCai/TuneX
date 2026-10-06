@@ -116,6 +116,17 @@ export function sameMuteSet(a: readonly MutePair[], b: readonly MutePair[]): boo
   return a.every((mute) => keys.has(muteKey(mute)));
 }
 
+/**
+ * 读取 PUT 的**回显清单**（服务端已落库的真相）。
+ * `null` = 响应里没有可辨认的清单（防御）⇒ 调用方保留本地意图，而不是把"没回显"当成"清空了"。
+ */
+export function readSaveEcho(echoed: unknown): MutePair[] | null {
+  if (!echoed || typeof echoed !== "object") return null;
+  const raw = (echoed as { mutes?: unknown }).mutes;
+  if (!Array.isArray(raw)) return null;
+  return normalizeMutes(raw);
+}
+
 /* ================================================================== */
 /* 视图与状态（三态 + 400/503 分开）                                     */
 /* ================================================================== */
@@ -181,7 +192,13 @@ export function classifySaveFailure(err: unknown, fallbackMessage: string): Pref
   const code = errorCodeOf(err);
   const message = err instanceof Error && err.message !== "" ? err.message : fallbackMessage;
   if (err instanceof ApiError && err.status === 400) return { kind: "rejected", code, message };
-  return { kind: "unavailable", code: err instanceof ApiError ? `http_${err.status}` : "network_error", message };
+  // 非 400 一律"这次没写成"：优先保留服务端给的具体码（`storage_error`），
+  // 没有码时退回 HTTP 状态/网络错误 —— 不编一个更具体的理由。
+  return {
+    kind: "unavailable",
+    code: code ?? (err instanceof ApiError ? `http_${err.status}` : "network_error"),
+    message,
+  };
 }
 
 /* ================================================================== */
@@ -206,6 +223,15 @@ export interface PreferencesController {
   load(): Promise<void>;
   save(): Promise<void>;
   setMuted(channel: string, category: string, muted: boolean): void;
+  /**
+   * 页面上下文变化（切换工作空间）：
+   *  ① 作废在途请求（晚到回执一律丢弃，不画到新上下文里）；
+   *  ② 偏好是 **user 级**的 ⇒ **不重取**（已就绪的数据跨空间依然有效）；
+   *  ③ 但别把用户卡住：若正停在 `loading`（从没读到过），重启一次装载；
+   *     若正停在 `saving`，回到可操作状态（写入可能已落库，界面如实显示"还有未保存的更改"，
+   *     用户可再存一次 —— PUT 是全量替换，重复提交是幂等的）。
+   */
+  onContextChanged(): void;
   snapshot(): PreferencesSnapshot;
   dispose(): void;
 }
@@ -286,12 +312,11 @@ export function createPreferencesController(options: PreferencesControllerOption
       emit();
       const payload = sortMutes(draft);
       try {
-        const echoed = await options.savePreferences(payload);
+        const stored = readSaveEcho(await options.savePreferences(payload));
         if (!options.fence.current(ticket)) return;
-        // 服务端回显的是**已落库**的清单（PUT 全量替换）。以它为准；
-        // 万一响应没有可用清单（防御），保留本地草稿，但状态仍是"已保存"（HTTP 200 就是写了）。
-        const echoedMutes = normalizeMutes((echoed as { mutes?: unknown } | null)?.mutes);
-        persisted = echoedMutes.length === 0 && payload.length > 0 ? [...payload] : echoedMutes;
+        // 服务端回显的是**已落库**的清单（PUT 全量替换）⇒ 以它为准；
+        // 没有可辨认的回显（防御路径）时保留本地意图，绝不把"缺回显"读成"清单被清空"。
+        persisted = stored ?? [...payload];
         draft = [...persisted];
         unrepresentable = draft.filter(
           (mute) => !channels.includes(mute.channel_kind) || !categories.includes(mute.category),
@@ -317,6 +342,19 @@ export function createPreferencesController(options: PreferencesControllerOption
 
     snapshot(): PreferencesSnapshot {
       return { view, save, dirty: dirty() };
+    },
+
+    onContextChanged(): void {
+      if (disposed) return;
+      const wasLoading = view.kind === "loading";
+      const wasSaving = save.kind === "saving";
+      options.fence.next();
+      if (wasSaving) save = { kind: "idle" };
+      if (wasLoading) {
+        void this.load();
+        return;
+      }
+      emit();
     },
 
     dispose(): void {
@@ -552,7 +590,7 @@ export function NotificationPreferences() {
     }
     if (contextRef.current === currentId) return;
     contextRef.current = currentId;
-    fenceRef.current.next();
+    controllerRef.current?.onContextChanged();
   }, [currentId]);
 
   return (

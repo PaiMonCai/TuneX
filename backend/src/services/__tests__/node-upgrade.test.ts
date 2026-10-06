@@ -496,7 +496,7 @@ describe("identity probe behaviour: a 302 or a non-Panel 200 is never 通过", (
       rmSync(box.dir, { recursive: true, force: true });
     }
   }, 30_000);
-}
+
   test("没有 jq 的镜像：退回形状匹配，如实报成 http:200:grep（并暴露它放过了什么）", async () => {
     const body = probeBody(render().script);
     const withJq = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"]);
