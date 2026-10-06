@@ -145,7 +145,7 @@ func TestDatagramRelayCarriesClientDatagramToHopAndBack(t *testing.T) {
 	// before that goroutine executes the following atomic counter increment.
 	// Wait for the observable fact instead of racing the scheduler.
 	deadline := time.Now().Add(500 * time.Millisecond)
-	var stats DatagramRelayStats
+	var stats DatagramStats
 	for {
 		stats = r.Stats()
 		if stats.PacketsIn == 1 && stats.PacketsOut == 1 {
