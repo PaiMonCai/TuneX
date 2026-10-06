@@ -46,7 +46,13 @@ export const env = {
   databaseUrl: requireSecret("DATABASE_URL"),
   redisUrl: process.env.REDIS_URL ?? "redis://redis:6379",
 
-  authSecret: requireSecret("AUTH_SECRET"),
+  authSecret: (() => {
+    const value = requireSecret("AUTH_SECRET");
+    if ((process.env.NODE_ENV ?? "development") === "production" && value.length < 32) {
+      throw new Error("AUTH_SECRET must be at least 32 characters in production");
+    }
+    return value;
+  })(),
   jwtIssuer: process.env.JWT_ISSUER ?? "tunex",
   /** Cookie `access` 的 JWT 有效期：12h（与原版会话对齐） */
   jwtTtlSeconds: Number(process.env.JWT_TTL_SECONDS ?? 12 * 60 * 60),
