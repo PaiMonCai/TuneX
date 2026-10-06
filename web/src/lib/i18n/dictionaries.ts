@@ -907,7 +907,7 @@ export const zh = {
   },
 };
 
-export type LooseDictT> = {
+export type LooseDict<T> = {
   [K in keyof T]: T[K] extends string ? string : T[K] extends object ? LooseDict<T[K]> : T[K];
 };
 
