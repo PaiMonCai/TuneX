@@ -1,0 +1,132 @@
+import type {
+  DiagnoseReport,
+  NodeDiagnosticsReport,
+  NodeUpgradeCommand,
+  AdminDashboardStats,
+  AdminListInput,
+  AdminResourceMeta,
+  AdminRole,
+  AdminRoleInput,
+  AdminUserInput,
+  AttentionPayload,
+  AuditLog,
+  AuditLogQuery,
+  AuthSession,
+  BalanceLog,
+  DashboardStats,
+  EgressPool,
+  EgressPoolInput,
+  EgressTarget,
+  EgressTargetInput,
+  FederationDisableResult,
+  FederationEnableResult,
+  FederationGrant,
+  FederationGrantActionResult,
+  FederationGrantCreateResult,
+  FederationGrantInput,
+  FederationHandshakeInput,
+  FederationHandshakeResult,
+  FederationInvitation,
+  FederationInviteInput,
+  FederationKeyRotateResult,
+  FederationLease,
+  FederationPeer,
+  FederationPeerRevokeResult,
+  FederationPeerRotateResult,
+  FederationPingResult,
+  FederationPlacement,
+  FederationStatus,
+  FederationUsageRecord,
+  ID,
+  LicenseInfo,
+  ListQuery,
+  LBStrategy,
+  Node,
+  NodeCredentialIssued,
+  NodeCredentialRevoked,
+  NodeEnrollmentIssued,
+  NodeBinding,
+  NodeDetail,
+  NodeGroup,
+  NodeGroupInput,
+  NodeHealthList,
+  NodeHealthSummary,
+  NodeHealthValue,
+  NodeHealthView,
+  NodeImpactResult,
+  NodeInput,
+  NodeLifecycleChangeResult,
+  NodeLifecycleValue,
+  NodeLifecycleView,
+  NodeRole,
+  NodeStateReport,
+  ConsumableRouteProfileList,
+  Paginated,
+  PasswordChangeInput,
+  RouteProfileApplyInput,
+  RouteProfileApplyResult,
+  RouteProfileCreateInput,
+  RouteProfileDetail,
+  RouteProfileImpact,
+  RouteProfilePatchInput,
+  RouteProfilePublishInput,
+  RouteProfilePublishResult,
+  RouteProfileVersionBody,
+  RouteProfileVersionEntry,
+  RouteProfileView,
+  PortForward,
+  ForwardCreateInput,
+  ForwardPatchInput,
+  ForwardPreviewResult,
+  ForwardListQuery,
+  ForwardBatchInput,
+  ForwardBatchResult,
+  ForwardSummary,
+  ProvisionNodeResult,
+  Payment,
+  Plan,
+  PlanInput,
+  PlanOrder,
+  ProfileUpdateInput,
+  SystemConfigItem,
+  Ticket,
+  TopupOrder,
+  TrafficPoint,
+  Tunnel,
+  TunnelUpdateInput,
+  User,
+  UserNode,
+  Workspace,
+  WorkspaceAcceptInviteResult,
+  WorkspaceCreateInput,
+  WorkspaceInvite,
+  WorkspaceInviteInput,
+  WorkspaceMember,
+  WorkspaceTrafficSummary,
+} from "../types";
+import { normalizeHealthSummary } from "../node-health";
+// 公告类型单独维护在 announcements.ts。
+import type { Announcement } from "../announcements";
+// 目标健康状态与理由码在 target-health.ts 维护。
+import type { TargetPoolHealth } from "../target-health";
+import { shouldRedirectToLogin } from "../workspace-permissions";
+import type { EffectiveWorkspacePermissions, WorkspaceCustomRole, WorkspaceCustomRoleInput, WorkspaceMemberRoleInput } from "../workspace-permissions";
+
+import { request, get, post, put, patch, del, applyMockSessionCookie, clearMockSessionCookie } from "./core";
+
+export const ticketsApi = {
+    list: (query?: ListQuery, cookie?: string) => get<Paginated<Ticket>>("/tickets", query, cookie),
+    create: (input: { title: string; content: string }, cookie?: string) =>
+      post<Ticket>("/tickets", input, cookie),
+  },
+  // 管理端
+  /**
+   * V5-WP13.5B Route Profile（线路模板）—— **不走 `/api/admin/*`**。
+   *
+   * 后端刻意复用 workspace 域 RBAC（`resolveWorkspaceAccess` 的 `node` 资源族，
+   * 与 node-groups 同口径）、读写闸门 read/manage；Admin 与 User 只是**同一套资源
+   * 的两个 UX 面**（§9.4.1：前端 guard 只做 UX）。因此这里用普通路径。
+   *
+   * 失败形状：`{ error, code, error_layer, retryable, next_action }`（注意人读原因是
+   * `error` 而非 `message`）；`ApiError.data` 就是它，页面用 next_action 直接展示「下一步」。
+   */
