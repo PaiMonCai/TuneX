@@ -436,7 +436,8 @@ export function validatePayload(action: CommandAction, payload: unknown): string
       // 由 services/looking-glass.ts 在下发前判、Agent 侧再判一次。
       const extra = unknownKeys(payload, [...ACTION_PAYLOAD_KEYS.looking_glass]);
       if (extra.length > 0) return `payload 含未定义字段: ${extra.join(", ")}`;
-      const methods = ["tcp_connect"];
+      // 与 `services/looking-glass.ts` 的 LOOKING_GLASS_METHODS 同源（含 ICMP echo）。
+      const methods = ["tcp_connect", "ping", "ping6"];
       if (typeof payload.method !== "string" || !methods.includes(payload.method)) {
         return `payload.method 必须是 ${methods.join("/")}`;
       }

@@ -30,6 +30,7 @@ import {
   LOOKING_GLASS_MAX_REQUESTED_TARGETS,
   LOOKING_GLASS_MAX_TIMEOUT_MS,
   LOOKING_GLASS_METHODS,
+  LOOKING_GLASS_UNAVAILABLE_METHODS,
   defaultLookingGlassDeps,
   runLookingGlass,
   type LookingGlassDeps,
@@ -94,6 +95,14 @@ export function createLookingGlassRoutes(options: LookingGlassRouteOptions = {})
           default_timeout_ms: LOOKING_GLASS_DEFAULT_TIMEOUT_MS,
           max_timeout_ms: LOOKING_GLASS_MAX_TIMEOUT_MS,
           methods: [...LOOKING_GLASS_METHODS],
+          /**
+           * 本版本**不提供**的方法与原因（task-40）。
+           *
+           * 为什么显式回给前端：ForwardX 的方法集里有 traceroute/mtr，运维会照着找；
+           * 不说清"为什么没有"就会被读成"这个产品没有诊断能力"，而真相是在我们的权限
+           * 模型下做不到（raw socket 需要 CAP_NET_RAW，生产 install 用 --cap-drop ALL）。
+           */
+          unavailable_methods: LOOKING_GLASS_UNAVAILABLE_METHODS.map((entry) => ({ ...entry })),
         },
         targets: "public-only（私网/回环/链路本地/多播/保留段一律拒绝）",
         caveats: LOOKING_GLASS_CAVEATS,

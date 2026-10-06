@@ -1,3 +1,5 @@
+// 行为参照：ForwardX（AGPL-3.0-only）——Looking Glass 方法集与结果语义；代码为本项目改写，未复制其实现。
+
 /**
  * Looking Glass（面板侧安全边界 + 有界编排）。
  *
@@ -53,14 +55,50 @@ import { admitAction } from "./runtime-admission.ts";
 export const LOOKING_GLASS_ACTION = "looking_glass";
 
 /**
- * 方法闭集。v1 只有一个成员，而且是**刻意**的：
+ * 方法闭集（task-40 从 1 种扩到 3 种）。成员是**我们真的能执行**的方法：
  *  · `tcp_connect` —— 无特权、无 shell、无载荷，和既有 diag 探针同一原语；
- *  · 不做 ICMP/traceroute（需要 `CAP_NET_RAW`，与 §1.9「静态非特权二进制」冲突）；
+ *  · `ping` / `ping6` —— ICMP echo。**旧注释里"ICMP 需要 CAP_NET_RAW"只对了一半**，
+ *    2026-10-07 在生产 caps（`--cap-drop ALL --cap-add NET_BIND_SERVICE`，CapEff=0x400）
+ *    下实测：内核允许非特权 ICMP 时（`net.ipv4.ping_group_range=0 2147483647`），
+ *    busybox `ping` 走 SOCK_DGRAM/ICMP **成功**收到真实回包（1.1.1.1，avg 1.983 ms）；
+ *    需要 CAP_NET_RAW 的是 **raw socket**，也就是 `traceroute`（实测 EPERM）。
+ *    agent 侧因此不自己开 socket，而是在固定候选绝对路径上调用镜像自带的 ping 二进制。
+ *  · **不做** `traceroute`/`traceroute6`/`mtr`/`mtr6` —— 见 {@link LOOKING_GLASS_UNAVAILABLE_METHODS}，
+ *    如实标"不可用"并给原因，而不是假装支持；
  *  · 不做 UDP（没有可靠回包来源，做了就是编造事实，D6/§4.0 O3）；
  *  · 不做 HTTP（见文件头：重定向/降级/凭据是另一份威胁模型的活）。
  * 未知方法**拒绝**而不是"忽略后当 TCP 处理"（危险方向：静默降级）。
  */
-export const LOOKING_GLASS_METHODS = ["tcp_connect"] as const;
+export const LOOKING_GLASS_METHODS = ["tcp_connect", "ping", "ping6"] as const;
+
+/**
+ * 本版本**明确不提供**的方法，以及原因。
+ *
+ * 为什么要有一个显式列表而不是"干脆不提"：ForwardX 的方法集里有它们（traceroute/
+ * traceroute6/mtr/mtr6），运维会照着找。不说清"为什么没有"就会被读成"这个产品没有
+ * 诊断能力"，而真相是**在我们的权限模型下做不到**：
+ *
+ *   · `traceroute`/`traceroute6` —— 需要 **raw socket**（CAP_NET_RAW）。生产安装脚本
+ *     给 agent 的是 `--cap-drop ALL --cap-add NET_BIND_SERVICE`，实测
+ *     `socket(AF_INET,3,1): Operation not permitted`。放宽它等于给每个节点开一个
+ *     原始包能力，与"静态非特权二进制"的取向冲突，本版本不做。
+ *   · `mtr`/`mtr6` —— 镜像里**没有这个二进制**，且同样依赖 raw socket。
+ *
+ * 这份列表同时是 UI 的文案来源：面板据此显示"该方法是本版本不提供的，原因是 X"，
+ * 而不是让用户以为"按钮坏了"。
+ */
+export const LOOKING_GLASS_UNAVAILABLE_METHODS = [
+  {
+    method: "traceroute",
+    reason: "需要 raw socket（CAP_NET_RAW）；生产安装用 --cap-drop ALL --cap-add NET_BIND_SERVICE，实测 socket 被拒（EPERM）",
+  },
+  {
+    method: "traceroute6",
+    reason: "同 traceroute：raw socket 需要 CAP_NET_RAW，生产 caps 下不可用",
+  },
+  { method: "mtr", reason: "镜像里没有 mtr 二进制，且依赖 raw socket（CAP_NET_RAW）" },
+  { method: "mtr6", reason: "同 mtr：无二进制 + 依赖 raw socket" },
+] as const;
 export type LookingGlassMethod = (typeof LOOKING_GLASS_METHODS)[number];
 export const LOOKING_GLASS_DEFAULT_METHOD: LookingGlassMethod = "tcp_connect";
 
@@ -126,9 +164,13 @@ export const LOOKING_GLASS_CODES = {
  * `null ≠ 0`、`不可比的不并排`（D12）同样适用：这里只给事实与边界。
  */
 export const LOOKING_GLASS_CAVEATS: readonly string[] = [
-  "这是从该节点发出的 TCP 连接测试（tcp_connect）：连上只证明 L3/L4 可达，不证明对端业务可用。",
+  "这是从该节点发出的主动探测（tcp_connect / ping / ping6）：连上或收到回包只证明 L3/L4 可达，不证明对端业务可用。",
   "域名由面板解析、节点只拨固定地址：因此它不能回答「节点侧 DNS 能否解析该域名」。",
-  "不含 UDP/ICMP：datagram 没有可靠探测来源，本版本不产生该事实。",
+  "ping/ping6 由节点在容器内调用镜像自带的 ping 二进制（非特权 ICMP），**依赖节点内核允许非特权 ICMP**；" +
+    "ping6 还需要节点自身有 IPv6 出网路径 —— 没有时结果是 unreachable，那不是方法未实现。",
+  "不含 traceroute / mtr：它们需要 raw socket（CAP_NET_RAW），而生产安装用 --cap-drop ALL --cap-add NET_BIND_SERVICE（实测 EPERM；mtr 连二进制都没有）。",
+  "不含 UDP：datagram 没有可靠探测来源，本版本不产生该事实。",
+  "不含 HTTP：重定向/降级/凭据是另一份威胁模型，本版本不做。",
   "结果不含任何数据面载荷与凭据；每次发起与拒绝都会写审计。",
 ];
 

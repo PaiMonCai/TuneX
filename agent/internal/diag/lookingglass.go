@@ -1,3 +1,5 @@
+// 行为参照：ForwardX（AGPL-3.0-only）——Looking Glass 方法集与结果语义；代码为本项目改写，未复制其实现。
+
 package diag
 
 import (

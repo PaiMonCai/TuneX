@@ -757,7 +757,12 @@ describe("WP19-D 控制协议线形", () => {
 
   test("payload 校验：方法闭集 / 目标必填非空 / 上限 / 只接受字面地址", () => {
     expect(validatePayload("looking_glass", { method: "tcp_connect", targets: [] })).toMatch(/非空/);
-    expect(validatePayload("looking_glass", { method: "ping", targets: [{ address: "1.1.1.1", port: 1 }] })).toMatch(/method/);
+    // 闭集纪律不变：**未知**方法必须被拒（这里用 ForwardX 有、我们明确不提供的
+    // traceroute —— 它在 caps.unavailable_methods 里有原因，不是"漏了"）。
+    expect(validatePayload("looking_glass", { method: "traceroute", targets: [{ address: "1.1.1.1", port: 1 }] })).toMatch(/method/);
+    // task-40 扩进来的两种 ICMP 方法必须**通过**线形校验（否则面板发不出去）。
+    expect(validatePayload("looking_glass", { method: "ping", targets: [{ address: "1.1.1.1", port: 1 }] })).toBeNull();
+    expect(validatePayload("looking_glass", { method: "ping6", targets: [{ address: "2606:4700:4700::1111", port: 1 }] })).toBeNull();
     expect(validatePayload("looking_glass", { method: "tcp_connect", targets: [] })).toBeTruthy();
     expect(
       validatePayload("looking_glass", { method: "tcp_connect", targets: [{ address: "example.com", port: 443 }] }),
@@ -806,7 +811,7 @@ describe("WP19-D 控制协议线形", () => {
     expect(tooMany.ok).toBe(false);
     if (!tooMany.ok) expect(tooMany.code).toBe(LOOKING_GLASS_CODES.tooManyTargets);
 
-    const badMethod = await run({ method: "ping" }, h);
+    const badMethod = await run({ method: "traceroute" }, h);
     expect(badMethod.ok).toBe(false);
     if (!badMethod.ok) expect(badMethod.code).toBe(LOOKING_GLASS_CODES.methodNotSupported);
 
@@ -823,6 +828,14 @@ describe("WP19-D 控制协议线形", () => {
 
     // 所有拒绝都发生在发包之前。
     expect(h.issues).toEqual([]);
+  });
+
+  test("task-40：ICMP 方法进闭集后，编排层真的把它**送下去**（不是认识但拒绝）", async () => {
+    // 单独一个 harness：上面那条测试要断言"拒绝都发生在发包之前"，而这里**会**发包。
+    // 家族匹配与目标策略由 agent 侧再判一次（那边有"先全校验再发第一个包"的纪律）。
+    const h = harness();
+    const icmp = await run({ method: "ping" }, h);
+    expect(icmp.ok).toBe(true);
   });
 
   test("等 ACK 的总预算 = per-attempt × 地址数 + 余量，封顶 20s", () => {
