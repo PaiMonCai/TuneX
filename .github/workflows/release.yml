@@ -1,14 +1,11 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows: ["Integration"]
-    types: [completed]
-    branches: [main]
+  workflow_dispatch:
 
-# Never let an older successful main qualification overwrite :latest after a
-# newer one. At most one promotion runs at a time; intermediate pending releases
-# may be superseded by the newest main commit.
+# Releases are explicit. Normal development is guarded only by the lightweight
+# CI workflow; no Integration or release-qualification workflow sits on the
+# merge path.
 concurrency:
   group: release-main
   cancel-in-progress: false
@@ -22,10 +19,12 @@ env:
   AGENT_IMAGE_NAMESPACE: ghcr.io/paimoncai/tunex-agent
 
 jobs:
-  promote:
-    if: github.event.workflow_run.conclusion == 'success'
+  publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -33,56 +32,62 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve the exact qualified candidate digests
-        id: candidate
-        env:
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          INTEGRATION_RUN_ID: ${{ github.event.workflow_run.id }}
+      - name: Build and publish Panel
+        id: panel
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAMESPACE }}:${{ github.sha }}
+            ${{ env.IMAGE_NAMESPACE }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          build-args: |
+            NEXT_PUBLIC_API_BASE=
+            NEXT_PUBLIC_API_MOCK=0
+            NEXT_PUBLIC_PAYMENTS_ENABLED=false
+          cache-from: type=gha,scope=tunex-unified
+          cache-to: type=gha,mode=max,scope=tunex-unified
+
+      - name: Build and publish Agent
+        id: agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./agent/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.AGENT_IMAGE_NAMESPACE }}:${{ github.sha }}
+            ${{ env.AGENT_IMAGE_NAMESPACE }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=tunex-agent
+          cache-to: type=gha,mode=max,scope=tunex-agent
+
+      - name: Smoke published images
         run: |
           set -euo pipefail
+          PANEL="${IMAGE_NAMESPACE}@${{ steps.panel.outputs.digest }}"
+          AGENT="${AGENT_IMAGE_NAMESPACE}@${{ steps.agent.outputs.digest }}"
 
-          PANEL_CANDIDATE="${IMAGE_NAMESPACE}:candidate-${INTEGRATION_RUN_ID}"
-          AGENT_CANDIDATE="${AGENT_IMAGE_NAMESPACE}:candidate-${INTEGRATION_RUN_ID}"
+          docker run --rm --entrypoint sh "$PANEL" -c '
+            set -eu
+            bun --version
+            node --version
+            test "$(id -u)" -ne 0
+            test -f /app/backend/src/index.ts
+            test -f /app/backend/prisma/schema.prisma
+            test -f /app/web/server.js
+          '
+          docker run --rm --entrypoint /usr/local/bin/tunex-agent "$AGENT" --help >/dev/null
 
-          PANEL_DIGEST="$(docker buildx imagetools inspect "$PANEL_CANDIDATE" | awk '/^Digest:/ {print $2; exit}')"
-          AGENT_DIGEST="$(docker buildx imagetools inspect "$AGENT_CANDIDATE" | awk '/^Digest:/ {print $2; exit}')"
-
-          test -n "$PANEL_DIGEST"
-          test -n "$AGENT_DIGEST"
-
-          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          echo "panel_digest=$PANEL_DIGEST" >> "$GITHUB_OUTPUT"
-          echo "agent_digest=$AGENT_DIGEST" >> "$GITHUB_OUTPUT"
-
-      - name: Promote qualified digests without rebuilding
-        env:
-          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
-          PANEL_DIGEST: ${{ steps.candidate.outputs.panel_digest }}
-          AGENT_DIGEST: ${{ steps.candidate.outputs.agent_digest }}
+      - name: Report published digests
         run: |
-          set -euo pipefail
-
-          docker buildx imagetools create             --tag "${IMAGE_NAMESPACE}:${SOURCE_SHA}"             --tag "${IMAGE_NAMESPACE}:latest"             "${IMAGE_NAMESPACE}@${PANEL_DIGEST}"
-
-          docker buildx imagetools create             --tag "${AGENT_IMAGE_NAMESPACE}:${SOURCE_SHA}"             --tag "${AGENT_IMAGE_NAMESPACE}:latest"             "${AGENT_IMAGE_NAMESPACE}@${AGENT_DIGEST}"
-
-      - name: Verify promoted tags are the qualified digests
-        env:
-          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
-          PANEL_DIGEST: ${{ steps.candidate.outputs.panel_digest }}
-          AGENT_DIGEST: ${{ steps.candidate.outputs.agent_digest }}
-        run: |
-          set -euo pipefail
-
-          digest_of() {
-            docker buildx imagetools inspect "$1" | awk '/^Digest:/ {print $2; exit}'
-          }
-
-          test "$(digest_of "${IMAGE_NAMESPACE}:${SOURCE_SHA}")" = "$PANEL_DIGEST"
-          test "$(digest_of "${IMAGE_NAMESPACE}:latest")" = "$PANEL_DIGEST"
-          test "$(digest_of "${AGENT_IMAGE_NAMESPACE}:${SOURCE_SHA}")" = "$AGENT_DIGEST"
-          test "$(digest_of "${AGENT_IMAGE_NAMESPACE}:latest")" = "$AGENT_DIGEST"
-
-          echo "Promoted exact qualified digests:"
-          echo "  panel ${IMAGE_NAMESPACE}@${PANEL_DIGEST}"
-          echo "  agent ${AGENT_IMAGE_NAMESPACE}@${AGENT_DIGEST}"
+          echo "panel=${IMAGE_NAMESPACE}@${{ steps.panel.outputs.digest }}"
+          echo "agent=${AGENT_IMAGE_NAMESPACE}@${{ steps.agent.outputs.digest }}"
