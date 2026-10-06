@@ -1852,35 +1852,17 @@ export async function compensateRollout(
 
   // ③ 分流。
   if (errors.length === 0) {
-    await transitionRollout(
-      rolloutId,
-      "compensating",
-      "failed",
-      {
-        compensated: true,
-        compensation_error: null,
-        last_error_code: "cutover_failed_compensated",
-        updated_at: (deps.now?.() ?? new Date()).toISOString(),
-      },
-      { db: deps.db },
-    );
     // ── 补偿成功后的记账（V5.3：回滚是**新世代**）──
     //
-    // 内容已经回到基线，而它挂在一个新的版本号上，所以台账必须**一起前进** 三列写成同一个
-    // rollbackRevision，`apply_status` 回到 `active`（回滚后的状态是"正在按要求运行"，
-    // 而不是"更新失败"）。§3.4 的"desired 不回退"没有被违反 —— desired 前进到了一个内容等于
-    // 基线的新世代；用户看到的是"已回滚到上一版本的内容"，而不是一个名不副实的版本号。
-    //
-    // 这也是下一轮 rollout 的基线从哪来的依据：新世代的快照在 ② 里已经写好，所以按
-    // applied_revision 找基线永远能找到一份与实际运行内容一致的行。
-    await deps.db.tunnel
-      .updateMany({
+    // Terminal rollout state is only allowed after the Tunnel ledger converged.
+    // Otherwise a failed DB write would leave phase=failed forever while the
+    // durable runtime projection still describes the pre-compensation state.
+    try {
+      const updated = (await deps.db.tunnel.updateMany({
         where: { id: row.tunnel_id },
         data:
           rollbackRevision === null
             ? {
-                // 没有基线可回（首次部署失败）：撤干净即正确，desired 保持目标版本、
-                // 状态归 error，让 UI 如实显示"这次更新没成功，现在没有 runtime"。
                 apply_status: "error",
                 apply_error_code: "cutover_failed_compensated",
                 apply_error: `rollout ${rolloutId} 补偿完成：没有旧 runtime 可回（首次部署失败）`,
@@ -1894,8 +1876,38 @@ export async function compensateRollout(
                   `rollout ${rolloutId} 已回滚：内容 = revision ${row.base_revision ?? "none"}，` +
                   `新世代 = ${rollbackRevision}（回滚产生新世代，而不是原地重放旧版本号）`,
               },
-      })
-      .catch(() => {});
+      })) as { count?: number };
+      if (updated.count === 0) throw new Error(`tunnel ${row.tunnel_id} rollback ledger row not found`);
+    } catch (error) {
+      const detail = `rollback ledger 写入失败：${error instanceof Error ? error.message : String(error)}`;
+      await transitionRollout(
+        rolloutId,
+        "compensating",
+        "degraded",
+        {
+          compensated: false,
+          compensation_error: detail.slice(0, 2000),
+          last_error_code: "compensation_failed",
+          updated_at: (deps.now?.() ?? new Date()).toISOString(),
+        },
+        { db: deps.db },
+      );
+      return { ok: false, error: detail };
+    }
+
+    const moved = await transitionRollout(
+      rolloutId,
+      "compensating",
+      "failed",
+      {
+        compensated: true,
+        compensation_error: null,
+        last_error_code: "cutover_failed_compensated",
+        updated_at: (deps.now?.() ?? new Date()).toISOString(),
+      },
+      { db: deps.db },
+    );
+    if (!moved) return { ok: false, error: "compensation terminal transition lost CAS ownership" };
     return { ok: true };
   }
 
@@ -2324,33 +2336,46 @@ async function executeRolloutOwned(
       if (phase === "prepare") {
         // 释放本轮自己创建的资源 + 撤已 ACK 的 egress；applied_revision 不动、
         // 旧 runtime 继续（CUTOVER 尚未发生，撤自己就够了）。
-        await releasePrepared(ctx, deps, db);
-        await transitionRollout(
+        const cleanup = await releasePrepared(ctx, deps, db);
+        const cleanupError = cleanup.ok ? null : cleanup.error;
+        const error = cleanupError ? `${outcome.error}；${cleanupError}` : outcome.error;
+        const terminalPhase = cleanup.ok ? "failed" : "degraded";
+        const code = cleanup.ok ? outcome.error_code : "compensation_failed";
+
+        // Tunnel 记账必须先成功，才允许 rollout 进入终态。否则终态会让 resume
+        // 永远不再捞这条记录，而 Tunnel 仍停在旧状态。
+        await markTunnelFailed(row.tunnel_id, code, error, db);
+        const moved = await transitionRollout(
           rolloutId,
           phase,
-          "failed",
+          terminalPhase,
           {
-            last_error_code: outcome.error_code,
-            last_error: `${outcome.error}`.slice(0, 2000),
+            last_error_code: code,
+            last_error: error.slice(0, 2000),
+            ...(cleanupError ? { compensation_error: cleanupError.slice(0, 2000) } : {}),
             notes: ctx.notes,
             updated_at: (deps.now?.() ?? new Date()).toISOString(),
           },
           { db },
         );
-        await markTunnelFailed(row.tunnel_id, outcome.error_code, outcome.error, db);
+        if (!moved) {
+          const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
+          return concurrentTakeoverResult(rolloutId, fresh, completed.size);
+        }
         return {
           ok: false,
           rolloutId,
-          phase: "failed",
-          error_code: outcome.error_code,
-          error: outcome.error,
+          phase: terminalPhase,
+          error_code: code,
+          error,
           completed: completed.size,
         };
       }
 
       if (phase === "cutover") {
         // 入口已经可能切过去了 ⇒ 必须补偿（§3.4）。
-        await releasePrepared(ctx, deps, db);
+        // releasePrepared fail-closed：runtime 未确认撤除时不会释放端口租约。
+        const preparedCleanup = await releasePrepared(ctx, deps, db);
         const moved = await transitionRollout(
           rolloutId,
           phase,
@@ -2367,15 +2392,19 @@ async function executeRolloutOwned(
           return concurrentTakeoverResult(rolloutId, fresh, completed.size);
         }
         const comp = await compensateRollout(rolloutId, deps);
+        const cleanupError = preparedCleanup.ok ? null : preparedCleanup.error;
+        const errorParts = [outcome.error, cleanupError, comp.error].filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        );
         return {
           // **补偿成功也是失败** `comp.ok=true` 只说明「回退到旧版本成功」，
-          // 本次 desired revision 没有生效。报 ok:true 会让 patchForward 认为
-          // 新配置已在跑，从而把「更新失败，上一版本仍运行」显示成成功。
+          // 本次 desired revision 没有生效。任何 PREPARE 清理泄漏都保持 degraded，
+          // 因为端口租约仍被刻意保留，等待 reconcile 安全回收。
           ok: false,
           rolloutId,
-          phase: comp.ok ? "failed" : "degraded",
-          error_code: outcome.error_code,
-          error: outcome.error,
+          phase: comp.ok && preparedCleanup.ok ? "failed" : "degraded",
+          error_code: cleanupError ? "compensation_failed" : outcome.error_code,
+          error: errorParts.join("；"),
           completed: completed.size,
           compensated: true,
         };
@@ -2407,6 +2436,10 @@ async function executeRolloutOwned(
   // drain 就崩了，恢复时 drain/cleanup 都已完成），此时 `status` 仍是循环
   // 进入时的值。写死 "cleanup" 会让这次过渡静默失败 ⇒ rollout 行永远停在
   // 中间态，`resumeRollouts` 下一轮又会把它捞起来重放。
+  // Durable Tunnel bookkeeping is part of the rollout, not a best-effort epilogue.
+  // Write it BEFORE the terminal phase: if this fails the rollout remains resumable
+  // and the next executor can retry only the ledger convergence.
+  await markTunnelApplied(row.tunnel_id, row.revision, ctx, db, deps.now);
   const finished = await transitionRollout(
     rolloutId,
     [...ACTIVE_ROLLOUT_PHASES],
@@ -2418,7 +2451,6 @@ async function executeRolloutOwned(
     const fresh = (await db.forwardRollout.findUnique({ where: { id: rolloutId } })) as RolloutRowView | null;
     return concurrentTakeoverResult(rolloutId, fresh, completed.size);
   }
-  await markTunnelApplied(row.tunnel_id, row.revision, ctx, db, deps.now);
   return { ok: true, rolloutId, phase: "done", completed: completed.size };
 }
 
@@ -2455,36 +2487,69 @@ async function releasePrepared(
   ctx: RolloutExecContext,
   deps: RolloutDeps,
   db: RolloutDb,
-): Promise<void> {
-  // 逆序释放：后创建的先撤（egress 先于 ingress 创建 ⇒ 先撤 ingress？不——
-  // 这里只撤 lease 与 egress runtime，顺序是「先撤 egress runtime 再放 lease」，
-  // 与 CLEANUP 同口径，避免端口释放后 listener 还在的双绑窗口）。
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Runtime teardown is the safety barrier before a port lease may be released.
+  // If teardown is uncertain, retaining the lease is a safe leak; releasing it
+  // would allow another runtime to acquire a port that may still be listening.
+  const teardownErrors: string[] = [];
   const egressApplies = ctx.prepared.filter((p) => p.kind === "egress_apply");
   for (const p of egressApplies) {
     if (p.node_id == null) continue;
-    await deps.orchestrator
-      .removeTunnel({
+    try {
+      const removed = await deps.orchestrator.removeTunnel({
         tunnelId: ctx.tunnelId,
         node: nodeFor(deps.orchestrator, p.node_id),
         direction: "egress",
         revision: ctx.revision + 1,
         reason: `rollout ${ctx.rolloutId} prepare-failed cleanup`,
-      })
-      .catch(() => {});
-  }
-  for (const p of ctx.prepared) {
-    if (p.kind !== "lease" || typeof p.handle !== "number") continue;
-    await releaseLease({ leaseId: p.handle }, { db: db as never }).catch(() => {});
+      });
+      if (!removed.ok) teardownErrors.push(`egress node ${p.node_id}: ${removed.error}`);
+    } catch (error) {
+      teardownErrors.push(
+        `egress node ${p.node_id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   // ──：远端腿不在 `prepared` 里 ──
-  //
-  // 它的句柄（peer / lease_ref）在 `federation_placement` 的镜像行上 —— 这正是那行
-  // 存在的理由之一。释放用**本次 revision 的 intent 键**，与建立时完全一致。
-  // 失败不阻塞（PREPARE 失败的清理是尽力而为），但下一拍对账仍会按同一 intent 收敛。
-  if (federatedEgressPeerOf(ctx.desired) !== null) {
-    await releaseRemoteEgressStep(ctx, deps, ctx.revision).catch(() => undefined);
+  const peer = federatedEgressPeerOf(ctx.desired);
+  if (peer !== null) {
+    try {
+      const released = await releaseRemoteEgressStep(ctx, deps, ctx.revision);
+      if (released && typeof released === "object" && "ok" in released && released.ok === false) {
+        teardownErrors.push(
+          `remote egress ${peer}: ${"message" in released ? String(released.message ?? "release failed") : "release failed"}`,
+        );
+      }
+    } catch (error) {
+      teardownErrors.push(
+        `remote egress ${peer}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
+
+  if (teardownErrors.length > 0) {
+    return {
+      ok: false,
+      error: `runtime teardown 未确认完成，保留端口租约等待 reconcile：${teardownErrors.join("; ")}`,
+    };
+  }
+
+  const leaseErrors: string[] = [];
+  for (const p of ctx.prepared) {
+    if (p.kind !== "lease" || typeof p.handle !== "number") continue;
+    try {
+      const released = await releaseLease({ leaseId: p.handle }, { db: db as never });
+      if (!released) leaseErrors.push(`lease ${p.handle}: not active or not found`);
+    } catch (error) {
+      leaseErrors.push(
+        `lease ${p.handle}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return leaseErrors.length === 0
+    ? { ok: true }
+    : { ok: false, error: `端口租约释放未完全收敛：${leaseErrors.join("; ")}` };
 }
 
 /** PREPARE 失败：tunnel 行记 error，applied_revision 不动（§13.3.5）。 */
@@ -2494,16 +2559,17 @@ async function markTunnelFailed(
   message: string,
   db: RolloutDb,
 ): Promise<void> {
-  await db.tunnel
-    .updateMany({
-      where: { id: tunnelId },
-      data: {
-        apply_status: "error",
-        apply_error_code: code,
-        apply_error: `[${code}] ${message}`.slice(0, 2000),
-      },
-    })
-    .catch(() => {});
+  const updated = (await db.tunnel.updateMany({
+    where: { id: tunnelId },
+    data: {
+      apply_status: "error",
+      apply_error_code: code,
+      apply_error: `[${code}] ${message}`.slice(0, 2000),
+    },
+  })) as { count?: number };
+  if (updated.count === 0) {
+    throw new Error(`tunnel ${tunnelId} failure ledger row not found`);
+  }
 }
 
 /**
@@ -2543,23 +2609,24 @@ async function markTunnelApplied(
       ? (egressApplied?.port ?? egressLease?.port ?? ctx.desired.egress_port ?? null)
       : null;
 
-  await db.tunnel
-    .updateMany({
-      where: { id: tunnelId },
-      data: {
-        apply_status: "active",
-        desired_status: "active",
-        apply_error_code: null,
-        apply_error: null,
-        config_revision: revision,
-        applied_revision: revision,
-        listen_port: concreteListenPort,
-        egress_port: concreteEgressPort,
-        egress_pool_id: ctx.desired.mode === "relay" ? ctx.desired.egress_pool_id : null,
-        last_applied_at: (now?.() ?? new Date()).toISOString(),
-      },
-    })
-    .catch(() => {});
+  const updated = (await db.tunnel.updateMany({
+    where: { id: tunnelId },
+    data: {
+      apply_status: "active",
+      desired_status: "active",
+      apply_error_code: null,
+      apply_error: null,
+      config_revision: revision,
+      applied_revision: revision,
+      listen_port: concreteListenPort,
+      egress_port: concreteEgressPort,
+      egress_pool_id: ctx.desired.mode === "relay" ? ctx.desired.egress_pool_id : null,
+      last_applied_at: (now?.() ?? new Date()).toISOString(),
+    },
+  })) as { count?: number };
+  if (updated.count === 0) {
+    throw new Error(`tunnel ${tunnelId} success ledger row not found`);
+  }
 }
 
 /* ================================================================== */
