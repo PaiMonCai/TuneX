@@ -14,22 +14,10 @@ import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import {
   forwardAccessAddress,
   forwardCopyDraft,
-  listenPortHintKey,
-  listenPortPlaceholderKey,
 } from "@/components/forwards/forward-copy";
 import {
-  bindingUsageView,
-  hasBindingUsage,
-} from "@/components/forwards/forward-binding-usage";
-import {
-  DEFAULT_FORWARD_PROTOCOL,
-  FORWARD_PROTOCOLS,
-  FORWARD_TLS_PATH_MAX,
   forwardProtocolFields,
-  forwardProtocolLabel,
-  forwardProtocolNote,
   tlsPathFieldErrors,
-  type ForwardProtocol,
 } from "@/lib/forward-protocol";
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
 import { ForwardListControls } from "@/components/forwards/forward-list-controls";
@@ -47,8 +35,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input, Label } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   forwardErrorActions,
   forwardErrorInfo,
@@ -895,7 +881,7 @@ export function ForwardWorkspace() {
             onEdit={setEditTarget}
             onCopy={copyForward}
             onDelete={(forward) => void removeForward(forward)}
-          />>
+          />
         </div>
       )}
 
