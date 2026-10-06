@@ -1000,6 +1000,18 @@ mtr                     → MISSING（镜像无该二进制）
 ### 终轮的环境与纪律提醒（它给的，值得记）
 scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0439` → `final49-0502`）⇒ **凡是"调度器每 30s 真的在跑"这类依赖运行中容器的证据，必须在下次重建前 `docker logs > /tmp/…` 落盘**，否则会消失（`task-36` 的 SMTP transcript 就是这样丢的，`task-41` 已按此教训落盘保留）。
 
+## 3.45 回合 50 的反转：R6 §10.3 的"库出处"疑点被反证为 **MySQL 8 统计缓存**造成的读数偏差
+
+**owner（`notify-center`）不撤回，给出三条独立反证**：
+1. **缓存复现 → 刷新 → 对齐**：按 `information_schema.TABLES.AUTO_INCREMENT` 默认读到的正是评审看到的 `channel 15 / delivery 22 / tunnel 11 / workspace 9 / workspace_member 9`；`SET SESSION information_schema_stats_expiry=0`（或 `ANALYZE TABLE`）后**同一查询**给出真实计数器 `channel 15 / delivery 24 / tunnel 13 / workspace 11 / workspace_member 11`。
+2. **逐一对齐**：真实计数器 ⇒ 已分配最大 id — `workspace 11→10`（t41 写 ws 9/10 ✔）、`workspace_member 11→10` ✔、`tunnel 13→12`（tunnel 11/12 ✔）、`notification_delivery 24→23`（**id 22 `sent` / 23 `transport_error`** ✔）、`notification_channel 15→14`（t36 建的 12/13/14，t41 未建渠道 ✔）。
+3. **网络别名闭环**：`docker inspect tunex-it-mysql` → `tunex_it_ctrl: aliases=[tunex-it-mysql mysql]`，该网络**只有这一台**叫 `mysql`；其 worker DSN `mysql://***@mysql:3306/tunex` 即解析到它，读账本用的也是 `docker exec tunex-it-mysql … tunex` ⇒ 同一 host:port:db；且"它读到并删除的行"只有活库能解释（清理后计数器正好落在 13/24）。
+
+**技术教训（有价值，长期有效）**：**MySQL 8 的 `information_schema.TABLES.AUTO_INCREMENT`（含 `SHOW TABLE STATUS`）默认有 86400 秒统计缓存** ⇒ 用它做**算术推断**（"计数器没动 ⇒ 没写这个库"）前必须 `SET SESSION information_schema_stats_expiry=0` 或 `ANALYZE TABLE`，否则读到的是**旧快照**。评审的算术逻辑没错，错在读数时点被缓存钉住。
+**owner 同时承认的疏漏**：上一轮没打印 `SELECT @@hostname, @@port, DATABASE(), @@server_uuid`；它主动提出可再跑一次**不清理账本行**的最小实验把该四元组打出来。
+
+**已交回评审做终判**（三选一：支撑 / 部分支撑 / 维持不支撑），并请它独立核实那条 MySQL 缓存事实、把它写成通用教训，以及**明确写出"#10 翻转要件 ① 现在的状态"**。**终判可能落在自动轮次之后**——若如此，goal 仍按"未达成"保持 active，并把"等终判"写进下一轮的第一件事。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
