@@ -307,3 +307,67 @@ Lead 已把 §5 最短路径的第 ① 条建为 `task-36`（交 `notify-center`
 1. **依赖"运行中容器"的证据必须在容器存活期内落盘**：scratch 的 panel/worker 在 04:40 被重建，旧化身（`n4-0314`）的日志随之消失 —— 我 04:33 读到的"≥15 拍"因此成了**唯一**还存在的调度器证据。建议关键日志在重建前 `docker logs > /tmp/<task>/…`。
 2. **收件端记录应落成文件**：`t36-smtp` 的 `MESSAGE-BEGIN … commands=…` 输出本该是一份可带走的 transcript（一行重定向即可），但容器 `rm` 之后它只存在于实施方会话里 ⇒ 复核只能到"脚本会打印什么"，到不了"它打印了什么"。
 
+---
+
+## 10. `task-41` 补齐证据的独立复核结论（2026-10-07 05:03–05:15 +08）
+
+### 10.0 钉点
+
+| 项目 | 值 |
+|---|---|
+| 复核时间 | 2026-10-07 05:03–05:15 +08 |
+| HEAD（复核基线） | `65dd865f6eefd46ef74e0dcc24cab53168497a2a`（05:02:17 `feat(backend): HA 成员投影 + throughput 只读端点（不含仍在途的 LG 方法表）`） |
+| 被复核证据 | `/tmp/t41-smtp.log`（1645 B，**已保留**，副本在 `/tmp/tunex-harvest-integration-20261006/t41-smtp.log`）、`/tmp/t41-facts.mjs`、`/tmp/t41-created{,2}.json`、`/tmp/t41-ws.txt`、Lead 转述的 worker 日志与账本行 |
+| 拓扑变化 | scratch 的 panel/worker 在 **~05:02:40 又重启一次**（复核开始时 `Up 46s/52s`）；`t41-*`、`t36-*` 容器均已不存在；`tunex-it-mysql` / `tunex-it-redis` 未重启（Up 4h） |
+| 我的只读手段 | 读文件（transcript/脚本/json）；`tunex-it-mysql` 只读 SELECT（含 `information_schema`/`SHOW DATABASES`）；`tunex-it-redis` 只读 `DBSIZE`/`KEYS`；HEAD 读码核对报文格式；`docker ps -a` |
+
+### 10.1 逐条判据（相对 §9 的变化）
+
+| # | 判据 | 本次结论 | 相对上轮 | 依据 / 缺什么 |
+|---|---|---|---|---|
+| 1 | **收件端真有记录** | **支撑** | ↑（上轮：部分支撑） | `/tmp/t41-smtp.log` 是**落盘的机器记录**：`LISTENING 20:55:12` → `CONNECT from 172.33.0.46:44290`（21:00:23）→ `GREETING 220` → `EHLO/AUTH/MAIL FROM/RCPT TO/DATA` → `MESSAGE-BEGIN…MESSAGE-END`（`To: tunex-it-e2e@tunex.local`、`Subject: [TuneX][error] forward_apply_error`、正文含原因码/严重度/资源 `tunnel 11（t41-forward-…）`/来源/发生时间 `2026-10-06T21:00:18.133Z`/诊断码 `port_in_use` + 结尾一句）→ `COMMANDS EHLO AUTH MAIL RCPT DATA` → `QUIT` → `CLOSE`。**且报文体与 HEAD 渲染器逐字一致**（`notification-delivery.ts:183` 主题格式、`:190-191` 原因码/严重度、`:198` 诊断码、`:201` 结尾句），凭据没有出现在任何一行（`AUTH` 只回 `334`/`235`）。**残余**：我无法重放；该文件由实施方保留（其真实性靠"格式/时间戳/邮箱/事实工件互锁"支撑，不是靠自述） |
+| 2 | **因果链经 worker 节拍** | **部分支撑** | ↑（上轮：不支撑） | **支撑的一半（我自己核的）**：① `/tmp/t41-facts.mjs` **只做插入**（`create`/`observe`/`counts` 三个分支，**没有任何投递函数调用**）⇒ 这次不是 in-process 投递；② **等拍时间签名**：事实建于 `21:00:18.250`，SMTP 首连在 `21:00:23`（差 ~5 s）；失败案例事实建于 `21:01:10.369`，三连击在 `21:01:23`（差 ~13 s）——两次都符合"等下一拍"，而**不符合**"脚本内立刻投递"（那会是亚秒级）。③ 镜像内 `worker.ts:242/250/254` 的接线我在 §9 已用临时容器核过。**缺**：worker 自己的那一行日志（`registered 8 cron schedulers` 与 `[worker] cron_notification_facts: {…"built":1…}`）**没有落盘**——我在 /tmp 有界搜索过，没有任何 worker 日志文件；因此"那一拍由 BullMQ 调度器触发"仍缺**可直接复核**的载体 |
+| 3 | **事实是真实事实** | **部分支撑** | =（不变） | 真实 schema 的真实行；候选集口径一致（`notification-facts-trigger.ts:559-566`）。**仍是操作者 SQL 直插**（它自列），且其库不可复核（见 §10.3）。`/tmp/t41-created{,2}.json` 至少把"插入时间 + 脚本不投递"这条说明**落成了文件**，比上轮好 |
+| 4 | **收件人来自用户自己** | **支撑** | =（不变） | transcript 的 `RCPT TO:<tunex-it-e2e@tunex.local>` + 正文 `To:` 头；配合我此前核过的 `user 2` 邮箱与 `state.json` 一致（`notification-facts-trigger.ts:464-495` 取成员自己的资料行） |
+| 5 | **失败路径端到端** | **支撑（收件端）/ 部分支撑（账本侧）** | ↑ | **收件端侧是硬证据**：失败案例三次 `CONNECT … GREETING 554` 后**直接 CLOSE、零命令**（transcript 原文）——这与 `mail.ts:170` 的"问候语不是 220 就一条命令都不发"逐字对应；三次连接与 `NOTIFICATION_MAX_ATTEMPTS=3`（`notification-delivery.ts:451/676`）一致。**账本侧**（`id=23 status=failed failure_reason=transport_error attempts=3`）仍不可复核（§10.3） |
+| 6 | **"保存 ≠ 会被投递"** | **不支撑（与简报第 3 条不符）** | =（不变） | 与 task-36 相同：实际是**零账本行**，根因成立且我独立复核过（事实路径只拿到 `isConfigured` 过滤后的渠道 ⇒ `notification-delivery.ts:616` 的 `not_configured` 落账分支不可达）。**缺**：改投递契约，或在渠道页明说"未启用的渠道不会留账" |
+| 7 | **清理对照可复现** | **部分支撑** | ↓（上轮：支撑） | live 侧我核到：`t41-*` slug 残留 **0**、`notification_channel`/`notification_delivery` 均 0 行、Redis `db9 DBSIZE=0`、无 `t41-*` 容器。**但它报的 before/after 与账本行都不在可复核的库里**（§10.3）⇒ 这条从"支撑"降为"部分支撑" |
+| 8 | **任何绕过都写成发现** | **支撑** | =（不变） | ① SQL 直插事实 ② Redis 用 db9（含代价） ③ 同窗口另 7 条 job ④ 未查 `node.status` —— 四条都写成发现 |
+
+### 10.2 我这一轮**新核到的**（可复核）
+
+1. transcript 与 HEAD 渲染器**逐字一致**（主题、原因码、严重度、诊断码、结尾句），且 `DATA` 段没有任何凭据。
+2. **554 分支的 fail-closed 有收件端证据**（三次 554 ⇒ 零命令），与 `mail.ts` 的判定同源。
+3. `/tmp/t41-facts.mjs` **确实不投递**（对比 task-36 的脚本，那次是 in-process 调用）——这是"经调度器"这一条**实质性的**方法改进。
+4. Redis `db9 DBSIZE=0`、`db9` 无 `*notification*` 键、`db0 DBSIZE=2717`（scratch 自身负载）——与它"刻意用 db9 以免抢队列"的说法一致，且清理到位。
+
+### 10.3 一个**新的具体疑点**：这次投递发生在**哪个 MySQL**？（必须澄清）
+
+事实（我自己读的）：
+
+- 活的 scratch MySQL 是 `tunex-it-mysql`（`tunex_it_ctrl` 上唯一别名 `mysql`；`audit_log` 最新写入距我查询仅 7 s，**证明它是活的、没有被停**）。
+- 它的 AUTO_INCREMENT **在 t41 前后完全没有动**：`workspace=9`、`tunnel=11`、`notification_delivery=22`、`notification_channel=15`（我 04:33 测过同一组值，05:05 再测仍相同）；`SHOW DATABASES` 只有 `tunex`，**没有克隆 schema**；`slug LIKE 't41-%'` = 0。
+- 而 t41 引用的 id 是 `workspace 9/10`、`tunnel 11/12`、`notification_delivery 22/23` ⇒ 这要求那个库的"下一个 id"正好是 **9 / 11 / 22**。
+
+⇒ 结论只有两种解释：**(a) 它跑的是一个"活库的克隆"**（mysqldump 会把 AUTO_INCREMENT 一起写进 CREATE TABLE，所以克隆的 next-id 恰好等于活库当时的值 —— 这完美解释 9/11/22，也解释它报的 4/4/3 基线）；**(b) 它跑了活库，之后有人把活库从 t41 之前的 dump 还原过**（这会让其它表的 AI 也回到同组值，同样自洽）。**我无法从外部区分 (a)/(b)**，但两种情形下**它引用的账本行都不再可复核**。
+
+**两轮 id 的对照（说明差别，不夸大）**：活库 `workspace` AI=9 ⇒ id 5–8 在活库里被消费过，而 task-36 的 `present.mjs` 用的正是 ws **7/8**（与它报的 6/6/5→4/4/3 相容）⇒ **t36 的 id 与活库相容**（因此我倾向它写的是活库，但这只是相容性推断，不是证明）。而 task-41 的 `created.json` 说自己建了 ws **9/10**、tunnel **11/12**、ledger **22/23**：若也写活库，`workspace` AI 应变成 **11**、`tunnel` 变 **13**、`notification_delivery` 变 **24**；实测三者仍是 **9 / 11 / 22** ⇒ **task-41 的账本行与这两个 workspace 不在活库里**（这一点是确定的，与 (a)/(b) 之争无关）。这也说明"写同一个 MySQL"这句（转述）**不成立**，应修正为"克隆库（或等价的一次性库）"。
+
+> 这不是"造假"的暗示：**在不碰共享活库的前提下做实验是更好的卫生**。问题只有一个——那样一来，**账本行与清理对照就没有第二方能复核的载体**。要闭合它，任选其一：
+> ① 说清库的出处（容器名 + 怎么产生：dump 还原？），并**把 dump 时间一并给出**；
+> ② 或者下一轮直接**在活库上做**（写完立刻贴出宿主侧 `SELECT`、清理后我再抽查 AI），像 task-36 那样；
+> ③ 或者把账本行的**宿主侧读取输出落盘**（`docker exec … > /tmp/t41-ledger.txt`），与 transcript 同等对待。
+
+### 10.4 对 §9.1 第 7 条判据的**更正**（不改 §9 正文）
+
+§9.1 我判"清理对照 = 支撑"，其中一条依据是"`notification_delivery` AUTO_INCREMENT=22 佐证它引用的行确实存在过"。**按 §10.3 的新事实，这条推断要收窄**：活库的 AI 只能证明"这个库里历史上被消费过这些 id"，**不能**证明**是它引用的那些行**。因此 §9.1 #7 的正确判定应是**部分支撑**（live 侧无残留可核，但对照是在我无法访问的库上做的）。其余 §9 结论不受影响。
+
+### 10.5 总判：翻转要件 ① 仍为 **部分支撑**（明显前进，但不足以抬到"支撑"）
+
+- **前进的部分（实质性）**：① 收件端 transcript **落盘且与 HEAD 渲染器逐字一致**；② 554 分支拿到**收件端**的 fail-closed 证据；③ 事实建立脚本**确实不投递**，两次"事实→连接"延迟都是**等拍签名**（~5 s / ~13 s）；④ 绕过项全部写成发现。
+- **仍缺的三件小事（缺一即不能算"支撑"）**：
+  1. **worker 自身日志落盘**（`docker logs t41-worker | grep -E "cron_notification_facts|registered" > /tmp/t41-worker.log`）——这是把"经调度器"从**推断**变成**直接证据**的唯一一步；
+  2. **库的出处**（§10.3 的 ①②③ 任选）；
+  3. **#6 的契约**（改投递契约，或渠道页明说"未启用的渠道不留账"）——这条不是"证据"问题，是产品契约问题。
+- **因此 #10 的判定不变：未达成**。要件 ① 从"部分支撑"到"支撑"只差上面第 1、2 件（第 3 件属独立小切片）；第 ② 条（日常宽度差距：带宽序列 / 版本落后可判定）与第 ③ 条（LG 方法集）仍按 §5 的最短路径另算。
+

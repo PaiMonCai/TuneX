@@ -48,9 +48,23 @@ Go / TS / TSX 用 `//`，`.md` 用 HTML 注释或引用行；Dockerfile 用 `#`�
 
 > 规则：**一行一个 TuneX 文件**。状态：`在用` / `已回退` / `部分`。
 
-| TuneX 文件 | ForwardX 源文件 | 复用范围 | 许可 | 状态 |
-|---|---|---|---|---|
-| （待各切片回填） | | | AGPL-3.0-only | |
+> **用途已变为"参照溯源"**（Round 46 口径变更后：参照行为、代码本项目改写、**未复制实现**）。
+> 下表登记"哪个文件参照了它的什么行为"。**没有一处是逐字复制**；若将来出现复制，必须在此单独标注并写明许可后果。
+
+| TuneX 文件 | ForwardX 源（行为参照） | 参照范围 | 状态 |
+|---|---|---|---|
+| `backend/src/services/preferred-ingress.ts` | `server/routers/forwardGroups.ts`、`docs/guide/groups.md` | 仅行为：成员次序即优先级、失效后切下一台、回切语义 | 在用 |
+| `backend/src/routes/forwards.ts`（`/:id/ha` 段） | 同上 | 只读投影形状（成员/优先级/回切进度） | 在用 |
+| `web/src/components/forwards/forward-ha-card.tsx` | `client/src/pages/ForwardGroups.tsx`、`docs/guide/groups.md` | 仅 UX 结构：成员列表 + 优先级 + 恢复后切回 + 「在线≠可用」 | 在用 |
+| `backend/src/routes/forwards.ts`（`/:id/throughput`） | `server/routers/rules.traffic.ts`、`server/repositories/metricsRepository.ts`（`traffic_stats`/`traffic_stat_buckets`）、`client/src/pages/Rules.tsx` 的 `trafficRangeLabel` | 带标签时间窗 + 分桶 + 单位标注的产品逻辑；口径改写到我们的账本与既有 helper | 在用 |
+| `web/src/components/forwards/forward-bandwidth.tsx` | 同上 | 仅 UX：窗口预设 + 柱图 + 缺口留空 + 归档节拍标注 | 在用 |
+| `web/src/lib/api/forwards.ts`（throughput 部分） | 同上 | 响应形状层面的端口概念 | 在用 |
+| `agent/internal/diag/lookingglass.go` | `server/lookingGlassAgentTasks.ts`、`server/routers/lookingGlass.ts` | 仅行为：方法集（ping/ping6 的存在与参数形状）、目标校验语义、超时与输出解析口径；**Go 改写** | 在用（部分：traceroute/mtr 明确不提供） |
+| `backend/src/services/looking-glass.ts` | 同上 | 仅行为：方法闭集与"不可用方法 + 原因"的呈现口径 | 在用 |
+| `web/src/components/nodes/looking-glass-panel.tsx` | `client/src/pages/LookingGlass.tsx` | 仅 UX：方法选择 + 结果呈现分态 | 在用（未消费 `unavailable_methods`，见未完成清单） |
+| `docs/production-deploy.md`（部署段） | 无（原文写作，未参照其文档） | — | 自研 |
+| `backend/src/routes/notification-*.ts`、`web/src/components/settings/notification-*.tsx`、`web/src/components/admin/notification-channels-manager.tsx` | 通知面**未参照其实现**（专项自己的 N1–N5 设计；用户偏好矩阵、投递账本可见性等 TuneX 独有） | — | 自研 |
+| `backend/src/services/mail.ts`、`backend/src/services/seed-scope.ts`、`scripts/ops/install.sh`、`.env.production.example`、`release.yml` | 无（这些是 TuneX 自己的缺陷修复与发布链路） | — | 自研 |
 
 ## 4. 需要保护的边界（复用不等于放弃判断）
 
