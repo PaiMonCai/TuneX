@@ -444,6 +444,33 @@ Lead 负责：task-3 挂载集成（已完成三块卡片）、task-4 收尾、�
 - `forward-detail.tsx` 是 **Lead 独占挂载点**；所有卡片任务都要求"自包含、不碰它"。
 - `lib/i18n/dictionaries.ts` 暂无人改，仍建议各切片用独立 `*-i18n.ts` 模块。
 
+## 3.18 DDNS 写入路径修复：**已在验收环境验证通过**（里程碑）
+
+`task-8`（`backend-truth`）交付：worker 新增独立节拍 **`cron_ddns_sync`（30s）**，遍历 `dns_auto_resolve=true 且 dns_provider_id 非空` 的转发，调用**同一个** `runDdnsSuccessor`/`syncForwardDns`；**不改** `auto_failover` 缺省、**不用** `dnsPathReadiness` 当闸门（那个闸门对新绑定是鸡生蛋）、**没动** `failover-loop.ts` 一行。
+
+**委托方自证（隔离栈）**：策略两开关都关（= 生产缺省）时仍写出；值集未变零外呼；失败退避（`attempt_count=1`、`next_attempt_at=+5s`）且**不覆盖已确认值**；自愈；11 条测试反向变异 9 条变红；后端 `bun test src` **2859 pass / 0 fail**。
+
+**Lead 在验收拓扑上的独立复核（关键）**：重建后端镜像 → 重启 Panel/Worker → 确认 `[worker] registered 7 cron schedulers: …,cron_ddns_sync,…` 且该 job 每 30s 运行 → 用假 DNS 服务（`endpoint` 覆盖，契约允许）走真实链路：
+
+```
+bind forward2 → pending（expected_values=["172.33.10.20"]，来自入口节点 connect_ip）
+t+5s → state=synced  verified=true  confirmed=["172.33.10.20"]  attempt=0  next=null
+假 DNS 日志：POST {"domain":"e2e-ddns.example.com","type":"A","values":["172.33.10.20"],"ttl":300}
+            + GET（读回确认）
+```
+
+⇒ **在 `FAILOVER_POLICY={"auto_failover":false,"auto_failback":false}`（生产缺省）下，"绑定域名 + 开自动同步"现在真的会写并读回确认**——退出条件 #5 的阻塞点已消除并实测。验证后已还原现场（解绑 + 删除 provider + 删除临时容器）。
+
+## 3.19 Round 25：两路只读审查已派发 + 两处授权
+
+| 任务 | 形态 | 内容 |
+|---|---|---|
+| **R5-A** | 一次性子代理（只读） | **ForwardX 产品对齐审查**：退出条件 10 条逐条判定、"能力有路径不通"清单（要求给**自己复核过**的证据，并区分"已复核"与"仅文档"）、刻意不同项的理由是否仍成立、距 #10 的差距排序 Top3 |
+| **R5-B** | 一次性子代理（只读） | **已完成切片的缺陷检修**（敌意复核）：客户端路径/形状 vs 后端声明、mock 是否在撒谎、`catch → null/[]` 是否让界面给出错误结论、异步竞态与晚到响应、敏感信息泄漏面、测试是否在钉错误契约、缺省配置下功能是否真会触发、i18n 与措辞；每条要求**自己的证据**，允许反驳文档与既有结论 |
+
+**授权**：`ha-ui`（task-16）最小 3 行接入 `web/src/mocks/handler.ts`（`handleForwardsMock` 把 `/forwards/*` 整个命名空间认领了，新 mock 模块必须排在它**之前**才可达；该文件当前无其他写者）——已补进 task-16 的 writeScopes。
+**催办**：`ha-ui` 已回复（在读码/规划后继续，Phase A 设计已认可）；`upgrade-ux` 无产出且 inactive，已要求回报卡点，并提醒它在升级流程里同样要检查"默认配置下是否永不触发"这类缺陷形态。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
