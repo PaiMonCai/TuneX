@@ -43,10 +43,10 @@ const (
 // Two families of spellings are accepted, because both are live on the wire:
 //
 //   - the long, upper-case enum names (ROUND_ROBIN / RANDOM /
-//     WEIGHTED_ROUND_ROBIN) — the devmap §3 form, and what the v3 TunnelConfig
+//     WEIGHTED_ROUND_ROBIN) — the devmap §3 form, and what TunnelConfig
 //     JSON carries;
 //   - the short, lower-case EgressPool names (round / rand / weighted_round) —
-//     the Prisma `LBStrategy` enum from WP1 and the legacy gost selector names
+//     the Prisma `LBStrategy` enum and the legacy gost selector names
 //     (control-protocol.ts LOAD_BALANCE_TYPES), which the panel passes through
 //     verbatim.
 //
@@ -94,9 +94,9 @@ type LoadBalancer struct {
 	weighted []weightSlot
 	cursor   uint64 // round-robin position, atomic to dodge the hot lock
 
-	// V5.2-WP7 state. health is nil until a payload carries a `target_health`
+	// Health-aware state. health is nil until a payload carries a `target_health`
 	// array: nil is the structural form of "no health signal", and Select takes
-	// the pre-WP7 path verbatim while it is nil. bounds are the breaker's
+	// the ordinary no-health path verbatim while it is nil. bounds are the breaker's
 	// injectable bounds/clock (the zero value is the frozen default).
 	//
 	// forcedPicks counts the connections served while no target was admissible
@@ -133,7 +133,7 @@ const maxSlotsPerTarget = 1024
 // slotCount is how many "connection turns" one target occupies under a
 // strategy: exactly the expansion `canonical` applies. Keeping it a function of
 // the strategy and the weight — rather than a second table — is what lets the
-// WP7 rank picker reproduce the strategy's distribution inside a rank without
+// health-rank picker reproduce the strategy's distribution inside a rank without
 // the two ever drifting apart.
 //
 // ROUND_ROBIN and RANDOM get one slot per target regardless of weight (round
@@ -201,8 +201,8 @@ func canonical(in []forwarder.Target, strategy Strategy) (clean, slots []forward
 // It satisfies forwarder.TargetSelector; a zero Target's Addr() is "" and the
 // caller treats that as "no upstream".
 //
-// With no health signal the body is the pre-WP7 strategy, unchanged. With one,
-// the same strategy is applied inside the best admissible WP7 rank
+// With no health signal the ordinary strategy is unchanged. With one,
+// the same strategy is applied inside the best admissible health rank
 // (internal/manager/health.go): health reorders, it never replaces the policy.
 func (l *LoadBalancer) Select() forwarder.Target {
 	l.mu.RLock()
@@ -237,7 +237,7 @@ func (l *LoadBalancer) Select() forwarder.Target {
 //
 // A plain target update carries no `target_health`, so it clears the health
 // view: the caller is saying what the pool should BE without saying anything
-// about how the panel judges it, and the pre-WP7 behaviour (no breaker, no
+// about how the panel judges it, and the no-health behaviour (no breaker, no
 // reordering) is the honest reading of that. Use UpdateTargetsAndHealth for a
 // dispatch payload that carries both arrays.
 func (l *LoadBalancer) UpdateTargets(strategy Strategy, targets []forwarder.Target) {

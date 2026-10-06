@@ -70,7 +70,7 @@ func (m *TunnelManager) ShuttingDown() bool {
 // so a later drain phase can report totals without counting them twice.
 //
 // This is phase 1 of a node shutdown and it is separated from the drain on
-// purpose (WP11A): "when does new TCP start failing?" must not depend on how long
+// purpose: "when does new TCP start failing?" must not depend on how long
 // draining the existing connections takes. The registry and the live connections
 // are left intact, so a final state report can still describe what the node had.
 func (m *TunnelManager) CloseListeners() []string {
@@ -114,7 +114,7 @@ func (m *TunnelManager) CloseListeners() []string {
 // shutdown prefers the explicit order in v3runtime so the closing report can be
 // produced while the runtime facts still exist.
 //
-// It differs from StopAll in the two ways WP11A requires:
+// It differs from StopAll in two deliberate ways:
 //
 //   - listeners are CLOSED (Stop also closes, but only after a per-tunnel 3s
 //     drain, so a second listener could still accept long after the first);
@@ -189,7 +189,7 @@ func (m *TunnelManager) ShutdownAll(timeout time.Duration) ShutdownReport {
 	return report
 }
 
-// shutdownOne closes one runtime either through the WP11A primitive or, for a
+// shutdownOne closes one runtime either through the graceful-shutdown primitive or, for a
 // runtime that predates it, through Stop (which still ends the listener).
 //
 // The in-flight fallback asks for the transport's own measure: a datagram runtime

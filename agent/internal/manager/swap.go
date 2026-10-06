@@ -15,11 +15,11 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// WP2 — hot reload primitives on the manager layer (DEVELOPMENT.md §13.3.4 /
+// Hot-reload primitives on the manager layer (
 // §13.3.5).
 //
 // TunnelManager.Apply answers "make this tunnel run". This file answers the
-// three questions a rollout (WP3) asks about an ALREADY RUNNING tunnel:
+// three questions a rollout asks about an ALREADY RUNNING tunnel:
 //
 //	1. what kind of change is this?      PlanForwardSwap (pure)
 //	2. can the upstream move alone?      HotSwapUpstream
@@ -52,7 +52,7 @@ const (
 	SwapRecreate SwapStrategy = "recreate"
 )
 
-// SwapPlan is the machine-readable answer a rollout orchestrator (WP3) turns
+// SwapPlan is the machine-readable answer a rollout orchestrator turns
 // into VALIDATE→PREPARE→CUTOVER→DRAIN→CLEANUP steps.
 type SwapPlan struct {
 	// Strategy is the rollout class of this change.
@@ -149,7 +149,7 @@ func PlanForwardSwap(old, new_ forwarder.TunnelConfig) SwapPlan {
 // It deliberately does NOT go through the revision gate: an upstream swap has
 // no listener swap and no cutover, so there is nothing to make idempotent
 // beyond "the forwarder now dials this". A rollout that wants a revision
-// gate around it wraps this call, it does not get one for free — the WP2/WP3
+// gate around it wraps this call, it does not get one for free — the hot-reload/rollout
 // contract keeps the two concerns separable.
 //
 // Errors, all leaving the tunnel exactly as it was:
@@ -243,7 +243,7 @@ func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.R
 }
 
 func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
-	// V5.3 WP9: same gate as applyInner, for the same reason. This is the entry
+	// Use the same ownership gate as applyInner, for the same reason. This is the entry
 	// the control plane actually uses for a listener change, so a fence that only
 	// covered Apply would be a fence production never passes through.
 	if err := m.admitOwnership(cfg); err != nil {

@@ -1,4 +1,4 @@
-// Package manager owns the v3 tunnel lifecycle: what runs, on which ports, at
+// Package manager owns the tunnel lifecycle: what runs, on which ports, at
 // which revision.
 //
 // TunnelManager is the map[id]Forwarder registry plus the revision rules
@@ -7,11 +7,11 @@
 // (swappable) load balancers the egress forwarders use. LoadBalancer itself
 // lives here too (devmap §7.2 "manager/lb.go").
 //
-// Ports: the v3 design notes that a BOTH node runs ingress and egress tunnels in
+// Ports: a BOTH node runs ingress and egress tunnels in
 // one process and the two pools can overlap numerically, so a single shared
 // usedPorts guard owns every port this manager binds (skill note: agent-side
 // TunnelManager and EgressManager must share one usedPorts map). This guard is
-// the only port ownership in the process since WP15 removed the old engine's
+// the only port ownership in the process after the duplicate data-plane engine was removed; the old engine's
 // private usedPorts map.
 package manager
 
@@ -27,7 +27,7 @@ import (
 	"github.com/tunex/agent/internal/logx"
 )
 
-// Revision rules (WP6 §hard rules, enforced by the manager so the command layer
+// Revision rules (enforced by the manager so the command layer
 // stays transport-specific):
 //
 //	cfg.Revision >  current -> apply
@@ -49,7 +49,7 @@ var ErrTunnelNotFound = fmt.Errorf("manager: tunnel not found")
 // entry is one running tunnel: the config it was built from plus its runtime.
 //
 // The runtime is forwarder.Runtime (start/stop/running), NOT forwarder.Forwarder:
-// since V5.1b there is more than one transport contract behind a tunnel, and a
+// there is more than one transport contract behind a tunnel, and a
 // datagram runtime must not be forced to implement stream-only methods
 // (SetUpstream/Drain) to sit in this registry — forwarder.StreamRuntime's own
 // doc comment and the datagram contract §4.1 both forbid that. Everything
@@ -85,12 +85,12 @@ type TunnelManager struct {
 	// does not pin one. Empty means all interfaces.
 	listenHost string
 
-	// targetDial is the dialer EGRESS pools dial their targets with (V5.3-WP8).
-	// nil keeps Go's own dialer, i.e. the pre-WP8 behaviour, which is also what
+	// targetDial is the dialer EGRESS pools use for target resolution.
+	// nil keeps Go's own dialer, which is also what
 	// every existing test and a build without the resolver wired gets.
 	targetDial forwarder.DialFunc
 
-	// closing is the WP11A shutdown latch: once set, Apply refuses new work so a
+	// closing is the shutdown latch: once set, Apply refuses new work so a
 	// config arriving mid-teardown cannot rebind a port that was just closed.
 	closing bool
 	// shutdownMu guards the running shutdown tallies (written from one
@@ -101,14 +101,14 @@ type TunnelManager struct {
 
 	// mutationHook is notified — outside every lock — after a mutation actually
 	// changed the running registry. It exists so the durable last-known-good
-	// cache (WP11A/A3) is refreshed by an event rather than only by a periodic
+	// cache is refreshed by an event rather than only by a periodic
 	// sample: "ACK durable success but cache the previous state" is exactly the
 	// window this closes. One hook here covers the control loop, the local admin
 	// API and startup restore, which is why it lives in the manager rather than
 	// in each caller.
 	mutationHook func()
 
-	// ownership is the V5.3 WP9 activation gate (ownership.Guard): the epoch
+	// ownership is the activation gate (ownership.Guard): the epoch
 	// fence plus the lease clock. It runs on BOTH activation entries, before any
 	// lock or listener, so every path that can start serving a tunnel — the
 	// control dispatch, the reconnect snapshot, startup restore and the local
@@ -117,7 +117,7 @@ type TunnelManager struct {
 	ownership OwnershipGuard
 }
 
-// OwnershipGuard is the V5.3 WP9 gate an activation must pass before anything is
+// OwnershipGuard is the fencing gate an activation must pass before anything is
 // bound. It is an interface (not ownership.Guard) so the manager keeps knowing
 // nothing about epochs and leases: it asks one question and reports the answer.
 //
@@ -139,7 +139,7 @@ func (m *TunnelManager) SetOwnershipGuard(g OwnershipGuard) {
 	m.mu.Unlock()
 }
 
-// AdmitActivation runs the V5.3 WP9 activation gate WITHOUT applying anything.
+// AdmitActivation runs the fencing gate WITHOUT applying anything.
 //
 // The manager already gates its own apply entries (so no caller can bypass it);
 // this exported form exists for a caller that mutates something else first. The
@@ -272,7 +272,7 @@ func (m *TunnelManager) New(cfg forwarder.TunnelConfig) (forwarder.Runtime, erro
 }
 
 // DiagnosticsByTunnel returns the protocol-specific facts of every running tunnel
-// that has any (V5-WP5-A3).
+// that exposes any protocol diagnostics.
 //
 // A tunnel whose protocol has nothing to report is simply absent from the map,
 // not present with zeroed counters: the panel must be able to say "this protocol
@@ -336,7 +336,7 @@ func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Runtime, er
 // comparison on the outside of the lock: the hook must never run while m.mu is
 // held, because it re-reads the registry.
 func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
-	// V5.3 WP9: the ownership gate runs before the lock and before anything can
+	// The ownership gate runs before the lock and before anything can
 	// bind, so a refused activation is never half-applied.
 	if err := m.admitOwnership(cfg); err != nil {
 		return nil, err
@@ -352,7 +352,7 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// WP11A: refuse work once shutdown has begun. Checked before the revision
+	// Refuse work once shutdown has begun. Checked before the revision
 	// gate so a config cannot "win" by carrying a newer revision.
 	if m.closing {
 		return nil, ErrNodeShuttingDown
@@ -373,13 +373,13 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 
 // buildLocked builds the data-plane runtime. Caller must hold m.mu.
 //
-// V5-WP2: construction goes through the forwarder's runtime factory, which
+// Construction goes through the forwarder's runtime factory, which
 // resolves protocol + transport FIRST and fails closed for anything this binary
 // has not opened. The manager keeps owning desired state, revisions, the port
 // guard and the single registry; only the "which runtime class" question moved
 // into the factory, and it is asked before anything can bind.
 //
-// Since V5.1b the factory answers for BOTH transports (forwarder.BuildRuntime):
+// The factory answers for both stream and datagram transports (forwarder.BuildRuntime):
 // the manager does not branch on the protocol, so opening a datagram protocol
 // cannot silently land in the stream builder — or the other way round.
 //
@@ -389,7 +389,7 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	return forwarder.BuildRuntime(cfg, forwarder.BuildDeps{
 		StreamBuildDeps: forwarder.StreamBuildDeps{
-			// V5.3-WP8: the target resolver's dialer, when the runtime wired one.
+			// Use the target resolver's dialer when the runtime wired one.
 			Dial: m.targetDial,
 			SelectorFor: func(tunnelID string) (forwarder.TargetSelector, error) {
 				if m.egress == nil {
@@ -413,7 +413,7 @@ func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Runti
 		// of them in the control plane's way.
 		//
 		// What a datagram runtime DOES need from its owner is the same pool the
-		// stream egress reads (V5.1b WP5-B2): the destination of a datagram exit is
+		// stream egress reads; for datagram relay traffic: the destination of a datagram exit is
 		// never on the wire, so the selector is the only thing that can name one.
 		// Until this was wired, an EGRESS datagram config reached the factory with
 		// nothing to resolve and had to be refused there.
@@ -430,7 +430,7 @@ func (m *TunnelManager) buildLocked(cfg forwarder.TunnelConfig) (forwarder.Runti
 }
 
 // egressObserver builds the target-failure observer for one egress tunnel.
-// It logs every failed dial (the WP5 "target fail 可观测" requirement) so a
+// It logs every failed dial for target-health observability so a
 // broken target is visible in the agent log the moment it breaks, while the
 // per-target ledger stays the machine-readable source of truth.
 func egressObserver(tunnelID string) forwarder.TargetObserver {
@@ -649,7 +649,7 @@ func (m *TunnelManager) Remove(id string) error {
 
 // RemoveIf removes a tunnel only while cond still holds for its live config.
 //
-// It exists for the V5.3 WP9 lease clock: the ownership guard observes "this
+// It exists for the ownership lease clock: the ownership guard observes "this
 // tunnel's authorisation has lapsed", but between that observation and the stop
 // a renewal may have arrived. Evaluating cond under the manager's lock turns
 // check-then-act into check-and-act, so a tunnel that was just renewed is not
@@ -784,7 +784,7 @@ func (m *TunnelManager) DatagramStats(id string) (forwarder.DatagramStats, bool)
 
 // MaxRevision returns the newest config revision among the running tunnels
 // (0 when none or when the source does not track revisions). It is what the
-// WP7 state report sends as reported_revision so the panel can tell
+// The state report sends as reported_revision so the panel can tell
 // "this node is behind" (revision < tunnel.config_revision) from "no data".
 func (m *TunnelManager) MaxRevision() int64 {
 	m.mu.RLock()

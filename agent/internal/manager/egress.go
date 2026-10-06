@@ -17,7 +17,7 @@ var ErrPoolNotFound = errors.New("manager: no egress target pool for tunnel")
 // listeners (devmap §5.3): SwapTargets mutates the pool, and the next connection
 // of the already-running forwarder picks the new target.
 //
-// ledger is the optional per-target health view the WP5 "target fail 可观测"
+// ledger is the optional per-target health view used for target-failure observability
 // requirement asks for. The running EgressForwarder owns the counters (it is
 // the thing that dials targets), so the pool keeps only a reference: whoever
 // builds the forwarder hands the reference back with SetLedger, and TargetStats
@@ -81,7 +81,7 @@ func (p *Pool) SwapTargetsAndHealth(strategy Strategy, targets []forwarder.Targe
 
 // SetHealth installs the panel's health facts for this pool without touching
 // the desired targets. nil/empty means "no health signal" and switches the
-// WP7 mechanism off for the pool.
+// health-aware selection off for the pool.
 func (p *Pool) SetHealth(health []forwarder.TargetHealth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -91,7 +91,7 @@ func (p *Pool) SetHealth(health []forwarder.TargetHealth) {
 // ReportDial implements forwarder.TargetReporter: the running egress forwarder
 // hands back the outcome of the dial it just made, which is the only evidence
 // that can resolve a half-open probe. A pool without health facts has no
-// breaker, so the outcome is dropped (the WP5 ledger still records it).
+// breaker, so the outcome is dropped (the target-health ledger still records it).
 func (p *Pool) ReportDial(t forwarder.Target, ok bool) {
 	p.mu.RLock()
 	balancer := p.balancer
@@ -165,7 +165,7 @@ type PoolSnapshot struct {
 	TunnelID string   `json:"tunnel_id"`
 	Strategy string   `json:"strategy"`
 	Targets  []string `json:"targets"`
-	// ForcedPicks is the WP7 "nothing was admissible, so the least-bad target
+	// ForcedPicks counts cases where nothing was admissible, so the least-bad target
 	// was served anyway" count (§7.3 requires that trade to be recorded). A
 	// non-zero value is not an error — refusing to pick anything is the worse
 	// failure — but it is the number an operator wants when a pool looks slow.
@@ -278,7 +278,7 @@ func (e *EgressManager) Targets(tunnelID string) ([]forwarder.Target, bool) {
 // ordered by tunnel id and then by the pool's own order, so two cycles over an
 // unchanged desired state enumerate identically.
 //
-// It exists as the ONE accessor the V5.2-WP5 target observer enumerates from
+// It is the single accessor the target observer enumerates from
 // (internal/targetobs): "observe only the targets of this node's desired state"
 // (§7 row 2) is enforced by making this the only window the observer has. It
 // reports desired state only — never observation results, never a peer's
@@ -299,7 +299,7 @@ func (e *EgressManager) DesiredTargets() []forwarder.Target {
 }
 
 // TargetStats returns the per-target failure/throughput ledger of one tunnel
-// (the WP5 "target fail 可观测" surface). It reports what the node's own
+// (the target-failure observability surface). It reports what the node's own
 // forwarder observed — dial successes/failures and relayed bytes — so a silent
 // or broken target is visible without a probe from the panel.
 //
@@ -376,7 +376,7 @@ func (e *EgressManager) Snapshot() map[string]PoolSnapshot {
 	return out
 }
 
-// BreakerStates returns the WP7 breaker view of one tunnel's pool, ordered by
+// BreakerStates returns the health-aware breaker view of one tunnel's pool, ordered by
 // target. It is empty for an unknown tunnel and for a tunnel whose pool has
 // never received health — "no data" is the honest answer in both cases.
 func (e *EgressManager) BreakerStates(tunnelID string) []BreakerState {
