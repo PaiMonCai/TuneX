@@ -956,6 +956,40 @@ mtr                     → MISSING（镜像无该二进制）
 - `agent`：`go build` **红**（`task-40` 在途）；
 - ⇒ **树不可冻结**，因此**不构建、不验收**（这正是上一轮"构建到中间态导致 Forward 详情页 `__next_error__`"的教训）。
 
+## 3.43 **收口评估（Round 49）**：退出条件终版对账 + 已改写/未改写清单
+
+### A. 退出条件终版对账（基线 = R5-A §1 → R6 复核 → 本周期后续交付）
+| # | 判定 | 依据（可复核） | 仍缺 |
+|---|---|---|---|
+| **1** 快速部署 | **基本达成** | 两轮演练：第一轮照文档**走不通**（缺 `LICENSE_SECRET` ⇒ `db-migrate` exit 1；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；第二轮（修文档 + **本地构建镜像**）**文档路径已通**：`up -d` **235s**、迁移/种子/管理员凭据/8 cron/建组+provision 201 全绿；`SEED_DEMO_DATA=false` 被正确尊重（0/0/0） | **`Agent enroll → online` 仍未验**（两次都是我方执行错：裸 `-e` 而非安装器 env 文件；把一次性 `--enroll-token` 当长期凭据塞进 `TUNEX_NODE_CREDENTIAL`）；公网 TLS/反代、备份/恢复/回滚未验 |
+| **2** Web 完成第一台 Node | **达成** | 浏览器端到端（闩锁 → 真 Agent → **5s online** → CTA）；本周期门禁重跑仍绿 | — |
+| **3** Direct/Relay/Multi-hop | **基本达成** | Direct/Relay 早已交付；多跳接线（模型/选择器/请求字段/两段绑定前置/预览改「四步三段」） | **真实三跳未跑通**（scratch 4 台节点无一 `role=both`） |
+| **4** Forward 状态与链路 | **达成** | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 本周期最终浏览器验收：`/forwards/1|2` 渲染 43/16 个相关 testid、禁用词零命中 | 带宽序列仅到"日均吞吐"；上下行/小时桶/连接数**不可派生**（账本只有一列 `traffic`） |
+| **5** DDNS 可从 UI 用 | **达成** | 写入闸门真解耦；真机 `pending → synced` + 读回确认 + 浏览器「已切换」；缺省态真话已补 | 仅 2 家 provider；`multi_entry` 首发未开放 |
+| **6** Notification 可从 UI 配置 | **基本达成** | 端点 + admin UI + 用户偏好 + **事实类投递节拍**（真机三拍）+ **失败可见性**（脱敏/跨空间隔离/平台行不下发）+ **P1 邮件缺陷修复**（真机 A/B）+ **端到端投递**（`task-36/41`：真账本 `sent` + 落盘 SMTP transcript + **调度器那一拍**） | **真实公网 MTA / Telegram 真投递未验**；`degraded=true` 真机未触发；③"保存≠投递"契约差异（未启用渠道不进投递层 ⇒ 零账本行）**未改**；**R6 §10 质疑"投递库的出处"未澄清** |
+| **7** Agent upgrade 完整流程 | **基本达成** | 只读 `upgrade-state`（**实际上报版本** + 前置逐字同源）+ 卡片挂载（旧内联入口退役）+ 版本基线语义修复 + **镜像 stamp 版本**（两版实测上报不同 version） | **真实节点完整升级未跑**；`version_drift:behind` **真机未出现**（需发布方注入 tag + 节点升级 + 配基线） |
+| **8** 常见故障诊断入口 | **达成** | 诊断面板 + 支持包 + 转发错误→下一步；Looking Glass 已消费并挂载、开关真机验证、真实发起 API 层验证；**ICMP 实测修正**（ping 可用、traceroute/mtr 如实不可用） | LG **Web 侧未消费 `unavailable_methods`**；`method_unavailable_on_node` 未实现；**走 agent 代码路径的真机 ping 证据未跑** |
+| **9** 不需理解 Lease/Revision/Fencing | **达成** | 用户域零命中；`Revision` 仅在默认折叠的技术详情块内；routes 页假承诺已删 | — |
+| **10** 核心日常体验不再明显落后 | **未达成**（R6 终局判定） | 三条落后理由复核：**② HA 已消除**（真机 `/ha` 全 200，期望/事实/候选/备选四层分开）、**③ 诊断部分消除**（入口消除；**方法集仍 1 vs 7**，本周期扩到 3）、**① 通知部分消除**（链路真在，但"从未端到端投递过"的观测性缺口刚刚才被 `task-41` 部分填上） | **翻转门槛**（R6 给的）：① 至少一次真实端到端投递（含失败态）——`task-41` 已补齐评审点的两条缺口，但评审 §10 又发现**投递库出处存疑** ⇒ 仍判"部分支撑"；② 至少一条日常宽度差距——`task-26/37` 已让"版本落后"不再结构性不可能，但**真机未出现**；③（可选）LG 方法集已从 1 扩到 3 |
+
+### B. 已改写 / 未改写清单（按用户 Round 46 口径：**参照行为、代码本项目改写、未复刻**）
+- **已参照并改写（9 个文件，台账 `docs/agent/forwardx-code-reuse.md`）**：多入口成员/优先级/回切（HA 后端投影 + 卡片）、带宽吞吐序列（`/:id/throughput` + 卡片）、Looking Glass 方法集（agent `ping`/`ping6` + 面板方法闭集与不可用方法呈现）、LG 面板 UX。
+- **明列"未改写"**：ForwardX 的"按转发自定义成员次序（拖动排序）"——需 schema 变更，**按规则停下报告**（`ha` 投影里 `member_priority.custom_order_supported=false`，UI 明说"尚未提供"）；`failoverSeconds`/`recoverSeconds` 两个秒级旋钮**刻意不引入**（会造第二套时窗真相）；上下行/小时桶/连接数**不可派生**（需改 schema）。
+- **全部为自研**：通知面（N1–N5）、`mail.ts` 的 SMTP 问候语修复、`seed-scope.ts`、installer/release 链路、部署文档、`formatBytes` 修复。
+
+### C. 未完成与未验证（诚实清单，不带含糊）
+1. `Agent enroll → online`（两次执行错，归因明确；需按安装器 env 文件 + `--enroll-token` 交换重做）。
+2. 真实三跳（需临时把一台节点改成 `role=both` + 建两段绑定）。
+3. 真实节点完整升级 + `version_drift:behind` 真机出现。
+4. 真实公网 MTA / Telegram 真投递；`degraded=true` 真机触发。
+5. LG：面板消费 `method_unavailable_on_node`、Web 侧 `unavailable_methods` 呈现、走 agent 代码路径的真机 ping 证据、agent 镜像重建后 `capabilities` 出现 `looking_glass:ping`。
+6. `task-41` 的**投递库出处**（R6 §10 质疑，已交回 owner 澄清/撤回）。
+7. 交付级发布流程（CI 未真实运行）；公网 TLS/反代、备份/恢复/回滚、云主机资源限制。
+8. 带宽：上下行/小时桶/连接数（不可派生）；DDNS provider 面仅 2 家。
+
+### D. 目标状态判断
+**退出条件未全部满足**（#1 缺 online 复验、#3/#6/#7 各有明确缺口、**#10 未达成**）⇒ **goal 保持 active**，不标记完成。上表 A 的"仍缺"列即**下一条切片的输入**；若用户希望继续，最短路径仍是 R6 给的翻转门槛两条（① 投递库出处澄清 + ② 一条日常宽度差距在真机出现）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
