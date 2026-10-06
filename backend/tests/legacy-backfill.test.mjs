@@ -7,24 +7,24 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * WP2 — Legacy Backfill / Upgrade（DEVELOPMENT.md §7.5，§7.2 Track A）
+ * Legacy Backfill / Upgrade
  *
  * 目标：证明**现有数据库升级不破坏 DIRECT**。
  *
  * 三条防线，每条一个独立数据库（避免跨用例的顺序耦合）：
  *
- *  ① empty DB：legacy 基线 + 全部 v3 迁移全部 apply；空库无残留。
- *  ② legacy fixture：把 **pre-v3 基线**（只到 `20260926000000`）跑起来 → 灌
- *     纯存量数据 → 升级到 v3（WP1 + WP2 迁移）→ 追加 post-v3 引用。
+ *  ① empty DB：legacy 基线 + 当前 schema-contract 与 backfill 迁移全部 apply；空库无残留。
+ *  ② legacy fixture：把 **旧 schema 基线**（只到 `20260926000000`）跑起来 → 灌
+ *     纯存量数据 → 升级到当前 schema（schema-contract + backfill 迁移）→ 追加 post-schema 引用。
  *     断言 §7.5 的全部「不变」要求：tunnel 数量 / listen_port /
  *     forward_addresses / workspace-user-policy 关系全部原样，同时新列被
  *     确定性回填；混挂组与无隧道组的 Node.role 保持 NULL（绝不 'both'）。
- *  ③ v3 upgrade fixture（幂等）：在**已回填**的库上重复执行同一条迁移，
+ *  ③ upgrade fixture（幂等）：在**已回填**的库上重复执行同一条迁移，
  *     断言数值 / 计数不变，且显式声明过的值永不被回改。
  *
  * 旧 Agent 的 legacy config 兼容路径另有一组断言：驱动**真实的**
  * `buildInNodeConfig` / `normalizeForwardAddresses`，证明配置下发用的仍是
- * `forward_addresses` 与 `listen_port`，而不是 WP1/WP2 加的新列——所以存量
+ * `forward_addresses` 与 `listen_port`，而不是 后续迁移新增的列——所以存量
  * Agent 拿到的配置不变。
  *
  * 环境变量：
@@ -41,15 +41,15 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND_ROOT = path.resolve(HERE, "..");
 const MIGRATIONS_ROOT = path.join(BACKEND_ROOT, "prisma", "migrations");
 
-/** WP2 迁移目录名（对应 prisma/migrations 下的目录）。 */
-const WP2_MIGRATION = "20260926120000_v3_legacy_backfill";
+/** Backfill migration directory name (must match prisma/migrations). */
+const BACKFILL_MIGRATION = "20260926120000_v3_legacy_backfill";
 
 /** 与 CI 的 backend job 完全一致的 env（见 .github/workflows/ci.yml）。 */
 const CI_ENV = {
   AUTH_SECRET: "ci-only-auth-secret-must-not-be-used-in-production", // secret-scan:allow
 };
 
-/** WP1 之前的所有迁移（"legacy 基线"）。顺序 = 目录名的时间序。 */
+/** Schema-contract 之前的迁移（legacy baseline）。顺序 = 目录名的时间序。 */
 const LEGACY_MIGRATIONS = [
   "20260923170000_init",
   "20260924100000_node_group_grant",
@@ -63,12 +63,12 @@ const LEGACY_MIGRATIONS = [
   "20260926000000_workspace_custom_role",
 ];
 
-/** v3 迁移：WP1 schema 契约 + 本包的回填。 */
-const V3_MIGRATIONS = ["20260926040000_v3_schema_contract", WP2_MIGRATION];
+/** Upgrade migrations: schema contract + legacy backfill. */
+const UPGRADE_MIGRATIONS = ["20260926040000_v3_schema_contract", BACKFILL_MIGRATION];
 
 const LEGACY_ROWS = path.join(HERE, "fixtures", "legacy-backfill-rows.sql");
 const POST_SCHEMA_ROWS = path.join(HERE, "fixtures", "legacy-backfill-post-schema.sql");
-const WP2_SQL = path.join(MIGRATIONS_ROOT, WP2_MIGRATION, "migration.sql");
+const BACKFILL_SQL = path.join(MIGRATIONS_ROOT, BACKFILL_MIGRATION, "migration.sql");
 
 function prismaCli() {
   const explicit = process.env.PRISMA_CLI;
@@ -89,7 +89,7 @@ function prismaCli() {
  * 传入的 `DATABASE_URL`。每个 describe 各建一个库，互不污染。
  */
 function migrateDeploy(url, migrations) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tunex-wp2-mig-"));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tunex-backfill-mig-"));
   fs.copyFileSync(path.join(MIGRATIONS_ROOT, "..", "schema.prisma"), path.join(tmp, "schema.prisma"));
   fs.mkdirSync(path.join(tmp, "migrations"));
   for (const m of migrations) {
@@ -119,7 +119,7 @@ function executeSqlFile(url, file) {
 
 /** 用 `prisma db execute` 跑一段 SQL 字符串。 */
 function executeSql(url, sql) {
-  const f = path.join(os.tmpdir(), `tunex-wp2-exec-${process.pid}-${Date.now()}.sql`);
+  const f = path.join(os.tmpdir(), `tunex-backfill-exec-${process.pid}-${Date.now()}.sql`);
   fs.writeFileSync(f, sql);
   try {
     executeSqlFile(url, f);
@@ -131,7 +131,7 @@ function executeSql(url, sql) {
 /** 建一个匿名库：连 server（不带库名）→ CREATE DATABASE → 返回可用 URL + 库名。 */
 function freshDb(label) {
   const src = new URL(process.env.DATABASE_URL ?? "mysql://root:@127.0.0.1:3306/tunex_ci");
-  const name = `tunex_wp2_${label}_${Date.now().toString(36)}`;
+  const name = `tunex_backfill_${label}_${Date.now().toString(36)}`;
   const url = new URL(src);
   url.pathname = `/${name}`;
   const serverUrl = new URL(src);
@@ -180,14 +180,14 @@ if (!DB_TEST) {
       handle = freshDb("empty");
       db = new PrismaClient({ datasources: { db: { url: handle.url } } });
       migrateDeploy(handle.url, LEGACY_MIGRATIONS);
-      migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...V3_MIGRATIONS]);
+      migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...UPGRADE_MIGRATIONS]);
     });
     after(async () => {
       await db?.$disconnect();
       dropIfPossible(handle);
     });
 
-    test("legacy baseline then the full v3 chain all apply on an empty MySQL database", async () => {
+    test("legacy baseline then the full upgrade chain all apply on an empty MySQL database", async () => {
       // `_prisma_migrations` 不是 Prisma model（上方的 delegate 列表里没有它），
       // 用 raw query 按 started_at 顺序核对：每一条都必须 finished_at 非空。
       const applied = await db.$queryRawUnsafe(
@@ -195,13 +195,13 @@ if (!DB_TEST) {
       );
       assert.deepEqual(
         applied.map((m) => m.migration_name),
-        [...LEGACY_MIGRATIONS, ...V3_MIGRATIONS],
+        [...LEGACY_MIGRATIONS, ...UPGRADE_MIGRATIONS],
         "every migration recorded, in order",
       );
       for (const m of applied) assert.ok(m.finished_at !== null, `migration ${m.migration_name} finished`);
     });
 
-    test("nothing to backfill, but the v3 columns exist", async () => {
+    test("nothing to backfill, but the upgraded columns exist", async () => {
       assert.equal(await count(db, "SELECT COUNT(*) AS n FROM tunnel"), 0);
       assert.equal(await count(db, "SELECT COUNT(*) AS n FROM node"), 0);
       assert.equal(await count(db, "SELECT COUNT(*) AS n FROM node_group"), 0);
@@ -211,24 +211,24 @@ if (!DB_TEST) {
   });
 
   /* ================================================================ */
-  /* ② legacy fixture → v3                                              */
+  /* ② legacy fixture → current schema                                  */
   /* ================================================================ */
-  describe("② legacy database upgraded to v3 (DIRECT must survive)", () => {
+  describe("② legacy database upgraded to current schema (DIRECT must survive)", () => {
     let db, handle;
 
     before(async () => {
       handle = freshDb("legacy");
       db = new PrismaClient({ datasources: { db: { url: handle.url } } });
-      // 1. pre-v3 基线
+      // 1. 旧 schema 基线
       migrateDeploy(handle.url, LEGACY_MIGRATIONS);
       // 2. 灌纯存量数据（只写 legacy 列）
       executeSqlFile(handle.url, LEGACY_ROWS);
-      // 3. 升级到 v3（WP1 + WP2 的迁移）
-      migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...V3_MIGRATIONS]);
-      // 4. 追加 v3 列已存在才能构造的引用（混挂组 / 半条 v3 行 / 无隧道组）
+      // 3. apply schema-contract and backfill migrations
+      migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...UPGRADE_MIGRATIONS]);
+      // 4. append rows that require the upgraded columns (mixed group / partial upgraded row / group without tunnels)
       executeSqlFile(handle.url, POST_SCHEMA_ROWS);
-      // 5. 再跑一次 WP2 迁移：证明迁移之后新增的行也被同一条迁移覆盖
-      executeSqlFile(handle.url, WP2_SQL);
+      // 5. re-run the backfill migration to cover rows inserted after the upgrade
+      executeSqlFile(handle.url, BACKFILL_SQL);
     });
 
     after(async () => {
@@ -240,8 +240,8 @@ if (!DB_TEST) {
 
     test("tunnel count / listen_port / forward_addresses / in-out group refs all survive", async () => {
       const rows = await q("SELECT id, listen_port, forward_addresses, user_id, workspace_id, in_node_group_id, out_node_group_id FROM tunnel ORDER BY id");
-      // 7 条 legacy 隧道 + 3 条 post-v3 隧道
-      assert.equal(rows.length, 10, "all tunnels still exist (7 legacy + 3 post-v3)");
+      // 7 条 legacy 隧道 + 3 条 post-schema 隧道
+      assert.equal(rows.length, 10, "all tunnels still exist (7 legacy + 3 post-schema)");
       const expected = [
         { id: 901, port: 19001, forward: ["127.0.0.1:8080"], user: 701, ws: 701 },
         { id: 902, port: 19002, forward: [{ address: "192.168.1.10:80", weight: 2 }], user: 701, ws: 701 },
@@ -324,12 +324,12 @@ if (!DB_TEST) {
       const modes = await q("SELECT id, tunnel_mode, egress_node_id, egress_pool_id FROM tunnel ORDER BY id");
       for (const m of modes) {
         if (n(m.id) === 908) {
-          assert.equal(m.tunnel_mode, null, "half-written v3 row keeps an egress pointer → WP8 finishes it");
+          assert.equal(m.tunnel_mode, null, "partial upgraded row keeps an egress pointer for the later relay backfill");
           continue;
         }
         assert.equal(m.tunnel_mode, "direct", `tunnel ${n(m.id)} → direct`);
       }
-      assert.equal(await count(db, "SELECT COUNT(*) AS n FROM tunnel WHERE tunnel_mode IS NULL"), 1, "only the half-written v3 row stays NULL");
+      assert.equal(await count(db, "SELECT COUNT(*) AS n FROM tunnel WHERE tunnel_mode IS NULL"), 1, "only the partial upgraded row stays NULL");
       assert.equal(await count(db, "SELECT COUNT(*) AS n FROM tunnel WHERE tunnel_mode = 'direct'"), 9);
     });
 
@@ -357,7 +357,7 @@ if (!DB_TEST) {
         assert.equal(byId.get(id).remote_host, null, `tunnel ${id} unparseable → NULL`);
         assert.equal(byId.get(id).remote_port, null, `tunnel ${id} unparseable → NULL (never 0)`);
       }
-      // 带 egress 指针的半条 v3 行：RELAY 目标在 EgressTarget 上，本列留 NULL
+      // 带 egress 指针的部分升级行：RELAY 目标在 EgressTarget 上，本列留 NULL
       assert.equal(byId.get(908).remote_host, null);
       assert.equal(byId.get(908).remote_port, null);
       // 整库没有 0 端口
@@ -399,10 +399,10 @@ if (!DB_TEST) {
     before(async () => {
       handle = freshDb("idem");
       db = new PrismaClient({ datasources: { db: { url: handle.url } } });
-      migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...V3_MIGRATIONS]);
+      migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...UPGRADE_MIGRATIONS]);
       executeSqlFile(handle.url, LEGACY_ROWS);
       executeSqlFile(handle.url, POST_SCHEMA_ROWS);
-      executeSqlFile(handle.url, WP2_SQL);
+      executeSqlFile(handle.url, BACKFILL_SQL);
     });
 
     after(async () => {
@@ -416,9 +416,9 @@ if (!DB_TEST) {
     test("re-running the backfill changes nothing", async () => {
       const beforeT = await snap();
       const beforeN = await snapNodes();
-      executeSqlFile(handle.url, WP2_SQL);
-      executeSqlFile(handle.url, WP2_SQL);
-      executeSqlFile(handle.url, WP2_SQL);
+      executeSqlFile(handle.url, BACKFILL_SQL);
+      executeSqlFile(handle.url, BACKFILL_SQL);
+      executeSqlFile(handle.url, BACKFILL_SQL);
       assert.equal(await snap(), beforeT, "tunnel_mode / remote_host / remote_port are stable");
       assert.equal(await snapNodes(), beforeN, "Node.role is stable");
     });
@@ -427,7 +427,7 @@ if (!DB_TEST) {
       // 管理员显式动作：把 906 标成 relay 并清空 remote_*；把 904 的节点标成 both。
       executeSql(handle.url, "UPDATE tunnel SET tunnel_mode = 'relay', remote_host = NULL, remote_port = NULL WHERE id = 906;");
       executeSql(handle.url, "UPDATE node SET role = 'both' WHERE id = 904;");
-      executeSqlFile(handle.url, WP2_SQL);
+      executeSqlFile(handle.url, BACKFILL_SQL);
       const t = await db.$queryRawUnsafe("SELECT tunnel_mode, remote_host, remote_port FROM tunnel WHERE id = 906");
       assert.equal(t[0].tunnel_mode, "relay", "explicit relay is never downgraded to direct");
       assert.equal(t[0].remote_host, null, "explicitly-cleared remote_host stays NULL");
@@ -435,7 +435,7 @@ if (!DB_TEST) {
       const r = await db.$queryRawUnsafe("SELECT role FROM node WHERE id = 904");
       assert.equal(r[0].role, "both", "explicit role (incl. both) is never overwritten");
       // 再跑一次仍然不动
-      executeSqlFile(handle.url, WP2_SQL);
+      executeSqlFile(handle.url, BACKFILL_SQL);
       assert.equal((await db.$queryRawUnsafe("SELECT tunnel_mode FROM tunnel WHERE id = 906"))[0].tunnel_mode, "relay");
       assert.equal((await db.$queryRawUnsafe("SELECT role FROM node WHERE id = 904"))[0].role, "both");
       // 同一份数据里的其它行依旧正确
