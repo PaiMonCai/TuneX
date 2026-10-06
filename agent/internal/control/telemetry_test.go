@@ -20,7 +20,7 @@ type observer struct{ seen []int64 }
 func (o *observer) Observe(rev int64) { o.seen = append(o.seen, rev) }
 
 /*
-V4-WP6 §13.4.4 — the control loop is the writer of the telemetry facts.
+The control loop is the writer of the telemetry facts.
 
 These tests pin the *contract* between the transport and the reporter-owned
 ledger: a failed command leaves a message with the structured error code and the

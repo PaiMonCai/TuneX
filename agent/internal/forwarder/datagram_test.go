@@ -12,9 +12,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// V5.1b WP5-B1 — UDP DIRECT datagram runtime.
+// UDP DIRECT datagram runtime.
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md. These are REAL-network tests
+// These are real-network tests of the datagram runtime contract
 // (the project's rule for data-plane capability: a mock cannot prove a data
 // plane). Every test drives a real UDP client through the runtime's listener to a
 // real UDP echo target, because the properties that matter here — one mapping per
@@ -680,7 +680,7 @@ func TestDatagramMappingKeyIsNormalisedAndTargetFree(t *testing.T) {
 
 // Every udp role is now open, and each one names the field it cannot work without.
 //
-// WP5-B2 (contract §9.1, frozen 2026-10-05) froze the hop as "datagram end to end"
+// The relay contract keeps the hop "datagram end to end"
 // and lands both halves in the same WP. Validate is where the two new fields show
 // up, because a datagram has no handshake to imply them:
 //

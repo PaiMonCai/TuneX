@@ -12,7 +12,7 @@ import (
 )
 
 // The reconnect hook is what makes an agent that booted during a panel outage
-// reconcile once the panel answers again (WP11A/A4). Two situations must trigger
+// reconcile once the panel answers again. Two situations must trigger
 // it, and a healthy boot must not:
 //
 //	· this process watched the panel go away and come back;
