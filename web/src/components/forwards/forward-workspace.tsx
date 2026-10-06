@@ -7,8 +7,6 @@ import {
   ArrowLeftRight,
   ArrowUp,
   ArrowUpDown,
-  ChevronLeft,
-  ChevronRight,
   Copy,
   Loader2,
   MoreHorizontal,
@@ -43,6 +41,7 @@ import {
 } from "@/lib/forward-protocol";
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
 import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
+import { ForwardListControls } from "@/components/forwards/forward-list-controls";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -943,92 +942,30 @@ export function ForwardWorkspace() {
         </div>
       ) : (
         <div className="flex flex-col gap-3">
-          <div
-            className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] p-3"
-            data-testid="forward-list-controls"
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-[var(--muted-foreground)]">{t("fields.orderBy")}</span>
-              <Select
-                value={sort}
-                onValueChange={(value) => {
-                  setSort(value as ForwardSortKey);
-                  setPage(1);
-                }}
-              >
-                <SelectTrigger className="h-9 w-36" data-testid="forward-sort-select">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="order_by">{t("fields.orderBy")}</SelectItem>
-                  <SelectItem value="name">{t("common.name")}</SelectItem>
-                  <SelectItem value="mode">{t("forward.mode")}</SelectItem>
-                  <SelectItem value="listen_port">{t("forward.listenPort")}</SelectItem>
-                  <SelectItem value="status">{t("common.status")}</SelectItem>
-                  <SelectItem value="created_at">{t("common.createdAt")}</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button
-                size="sm"
-                variant="outline"
-                data-testid="forward-sort-order"
-                aria-label={order === "asc" ? L("forward.sortAsc") : L("forward.sortDesc")}
-                onClick={() => {
-                  setOrder(order === "asc" ? "desc" : "asc");
-                  setPage(1);
-                }}
-              >
-                {order === "asc" ? <ArrowUp className="size-4" /> : <ArrowDown className="size-4" />}
-              </Button>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-[var(--muted-foreground)]" data-testid="forward-total">
-                {t("common.total")} {total} {t("common.items")}
-              </span>
-              <span className="text-xs text-[var(--muted-foreground)]">{L("forward.pageSize")}</span>
-              <Select
-                value={String(pageSize)}
-                onValueChange={(value) => {
-                  setPageSize(Number(value));
-                  setPage(1);
-                }}
-              >
-                <SelectTrigger className="h-9 w-24" data-testid="forward-page-size">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {FORWARD_PAGE_SIZE_OPTIONS.map((size) => (
-                    <SelectItem key={size} value={String(size)}>
-                      {size}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                size="icon"
-                variant="outline"
-                data-testid="forward-page-prev"
-                aria-label={L("forward.pagePrev")}
-                disabled={loading || page <= 1}
-                onClick={() => setPage((current) => Math.max(1, current - 1))}
-              >
-                <ChevronLeft className="size-4" />
-              </Button>
-              <span className="text-xs text-[var(--muted-foreground)]" data-testid="forward-page-info">
-                {L("forward.pageInfo", { page, pages: pageCount })}
-              </span>
-              <Button
-                size="icon"
-                variant="outline"
-                data-testid="forward-page-next"
-                aria-label={L("forward.pageNext")}
-                disabled={loading || page >= pageCount}
-                onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
-              >
-                <ChevronRight className="size-4" />
-              </Button>
-            </div>
-          </div>
+          <ForwardListControls
+            loading={loading}
+            total={total}
+            page={page}
+            pageCount={pageCount}
+            pageSize={pageSize}
+            sort={sort}
+            order={order}
+            t={t}
+            text={L}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+            onSortChange={(nextSort) => {
+              setSort(nextSort);
+              setPage(1);
+            }}
+            onOrderChange={(nextOrder) => {
+              setOrder(nextOrder);
+              setPage(1);
+            }}
+          />
 
           <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)]">
             <Table>
