@@ -32,10 +32,6 @@ class LicenseService {
     };
   }
 
-  async isBusinessLicense(): Promise<boolean> {
-    const license = await this.getLicense();
-    return license?.type === "business";
-  }
 }
 
 export const licenseService = new LicenseService();
