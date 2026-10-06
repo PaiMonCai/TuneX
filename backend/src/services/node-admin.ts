@@ -1313,9 +1313,6 @@ export async function replaceTargets(
   inject?: NodeAdminDeps,
 ): Promise<{ ok: true; targets: EgressTargetRow[] } | NodeAdminError> {
   const { db: pd } = await deps(inject);
-
-  const pool = asRow<EgressPoolRow>(await pd.egressPool.findUnique({ where: { id: poolId } }));
-  if (!pool) return err("not_found", "出口池不存在");
   if (!Array.isArray(inputs)) return err("invalid_input", "目标列表必须是数组");
 
   type Desired = {
@@ -1328,6 +1325,9 @@ export async function replaceTargets(
     status: EgressStatusValue;
   };
   const desired: Desired[] = [];
+  const desiredIds = new Set<number>();
+  const desiredEndpoints = new Set<string>();
+
   for (const raw of inputs) {
     if (!raw || typeof raw !== "object") return err("invalid_input", "目标条目必须是对象");
     const rec = raw as Record<string, unknown>;
@@ -1335,12 +1335,22 @@ export async function replaceTargets(
     if (id !== undefined && (!Number.isInteger(id) || id <= 0)) {
       return err("invalid_input", "目标 id 不合法");
     }
+    if (id !== undefined) {
+      if (desiredIds.has(id)) return err("invalid_input", `目标 id ${id} 重复`);
+      desiredIds.add(id);
+    }
+
     // 整批替换是**全量**语义：每条都必须自带地址与端口（没有「沿用旧值」）。
     const parsed = parseTargetInput({ ...rec, port: rec.port, weight: rec.weight });
     if (!parsed.ok) return err("invalid_input", parsed.message);
     if (parsed.value.host === undefined || parsed.value.port === undefined) {
       return err("invalid_input", "目标必须同时提供地址与端口");
     }
+    const endpoint = `${parsed.value.host}:${parsed.value.port}`;
+    if (desiredEndpoints.has(endpoint)) {
+      return err("invalid_input", `目标集包含重复地址 ${endpoint}`);
+    }
+    desiredEndpoints.add(endpoint);
     desired.push({
       id,
       host: parsed.value.host,
@@ -1356,21 +1366,36 @@ export async function replaceTargets(
   if (!poolHasViableTarget(desired)) {
     return err("invalid_state", "目标集必须至少包含一个 active 且 weight>0 的目标");
   }
-  // 池自身停用时整批 active 目标无意义。
-  if (pool.status !== "active" && desired.some((d) => d.status === "active")) {
-    return err("invalid_state", "出口池已停用，不能提交 active 目标");
-  }
 
-  const existing = asRows<EgressTargetRow>(
-    await pd.egressTarget.findMany({ where: { pool_id: poolId }, orderBy: { id: "asc" } }),
-  );
-  const keepIds: number[] = [];
-  const result: EgressTargetRow[] = [];
-  try {
+  const applyReplacement = async (
+    tx: NodeAdminDb,
+  ): Promise<{ ok: true; targets: EgressTargetRow[] } | NodeAdminError> => {
+    const pool = asRow<EgressPoolRow>(await tx.egressPool.findUnique({ where: { id: poolId } }));
+    if (!pool) return err("not_found", "出口池不存在");
+    // 池自身停用时整批 active 目标无意义。
+    if (pool.status !== "active" && desired.some((d) => d.status === "active")) {
+      return err("invalid_state", "出口池已停用，不能提交 active 目标");
+    }
+
+    const existing = asRows<EgressTargetRow>(
+      await tx.egressTarget.findMany({ where: { pool_id: poolId }, orderBy: { id: "asc" } }),
+    );
+    const existingIds = new Set(existing.map((row) => row.id));
+
+    // target id is scoped by pool. Prisma's update({where:{id}}) alone would
+    // happily mutate a target owned by another pool.
+    for (const d of desired) {
+      if (d.id !== undefined && !existingIds.has(d.id)) {
+        return err("not_found", `目标 ${d.id} 不存在或不属于该池`);
+      }
+    }
+
+    const keepIds: number[] = [];
+    const result: EgressTargetRow[] = [];
     for (const d of desired) {
       if (d.id === undefined) {
         const created = asRow<EgressTargetRow>(
-          await pd.egressTarget.create({
+          await tx.egressTarget.create({
             data: {
               pool_id: poolId,
               host: d.host,
@@ -1386,7 +1411,7 @@ export async function replaceTargets(
         keepIds.push(created.id);
       } else {
         const updated = asRow<EgressTargetRow>(
-          await pd.egressTarget.update({
+          await tx.egressTarget.update({
             where: { id: d.id },
             data: {
               host: d.host,
@@ -1403,15 +1428,23 @@ export async function replaceTargets(
         keepIds.push(updated.id);
       }
     }
-    // 删除载荷里没出现的旧行。
+
+    // 删除载荷里没出现的旧行。只有 P2025 能解释成“并发方已经替我们删掉”；
+    // 连接/事务/权限等其它错误必须冒泡，使整个生产事务回滚。
     for (const row of existing) {
-      if (!keepIds.includes(row.id)) {
-        await pd.egressTarget.delete({ where: { id: row.id } }).catch(() => {
-          /* 已被并发删除：目标即消失，视为成功 */
-        });
+      if (keepIds.includes(row.id)) continue;
+      try {
+        await tx.egressTarget.delete({ where: { id: row.id } });
+      } catch (error) {
+        if ((error as { code?: string })?.code !== "P2025") throw error;
       }
     }
     return { ok: true, targets: result };
+  };
+
+  try {
+    const begin = pd.$transaction?.bind(pd);
+    return begin ? await begin((tx) => applyReplacement(tx)) : await applyReplacement(pd);
   } catch (e) {
     if ((e as { code?: string })?.code === "P2002") {
       return err("conflict", "同一池内已存在相同地址与端口的目标");
