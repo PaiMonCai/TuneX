@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           docker cp scripts/integration/federation-sign.ts tunex-it-panel:/tmp/federation-sign.ts
-          material="$(docker exec -w /app tunex-it-panel bun /tmp/federation-sign.ts \
+          material="$(docker exec -e TUNEX_SRC_DIR=/app/src -w /app tunex-it-panel bun /tmp/federation-sign.ts \
             --url http://panel:3000 \
             --method POST \
             --path /api/federation/v1/leases \
