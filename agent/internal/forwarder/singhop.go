@@ -7,7 +7,7 @@
 // share this file: the only thing that distinguishes them is where
 // UpstreamAddr() points, and that is resolved from the validated config below.
 // The listener/forward plumbing is therefore identical, which is the whole
-// point of §7.16 DoD "同一套 v3 runtime 同时承载 DIRECT 与 RELAY".
+// same runtime carries both DIRECT and RELAY traffic.
 //
 // An EGRESS tunnel is NOT a one-hop tunnel and keeps its own implementation
 // (egress.go): it load-balances over a target pool instead of dialing a single

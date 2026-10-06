@@ -1,5 +1,5 @@
 // Package diag implements the bounded, side-channel probes behind the
-// `diagnose_tunnel` control action (V4-WP11C).
+// `diagnose_tunnel` control action.
 //
 // What it is for: answering "which segment of this forward is not working?"
 // without the operator having to guess. The panel supplies the probe list from

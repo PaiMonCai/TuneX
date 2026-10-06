@@ -193,7 +193,7 @@ func (c *measuredConn) Close() error {
 //
 // The selector is the hot-update seam. Replacing targets through
 // manager.EgressManager changes what the balancer returns without touching this
-// listener, so existing connections are never interrupted (devmap §5.3).
+// listener, so existing connections are never interrupted.
 type EgressForwarder struct {
 	pipeTracker
 	sel    TargetSelector
@@ -308,7 +308,7 @@ func (f *EgressForwarder) Running() bool { return f.pipeTracker.running() }
 
 // SetUpstream always returns ErrUpstreamNotSwappable: an EGRESS tunnel's
 // upstream is a whole pool owned by manager.EgressManager, and the hot path
-// that retargets it is Pool.SwapTargets (devmap §5.3 "Target snapshot hot
+// that retargets it is Pool.SwapTargets (target snapshot hot
 // update"). Accepting an address here would silently drop the balancer and
 // turn every new connection onto one target the pool never chose.
 func (f *EgressForwarder) SetUpstream(addr string) error {

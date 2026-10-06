@@ -1,6 +1,6 @@
 // WebSocket front for the stream runtime.
 //
-// Contract (DEVELOPMENT.md §6.1): WS wraps **client-facing** traffic. A WS client
+// WS wraps **client-facing** traffic. A WS client
 // connects to the ingress listener, the frames' payloads are unwrapped into the
 // byte stream that is forwarded to the target, and the inter-node hop is
 // unchanged. So this file is a **connection adapter**, not a runtime: it takes an

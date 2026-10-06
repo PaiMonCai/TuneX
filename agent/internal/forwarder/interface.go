@@ -62,7 +62,7 @@ const (
 	ProtocolTCP ForwardProtocol = "tcp"
 	// ProtocolTLS is the same stream lifecycle with a TLS-terminated
 	// client-facing listener. See the semantics contract in
-	// DEVELOPMENT.md §6.1: TLS stops at the INGRESS listener; the inter-node hop
+	// TLS stops at the INGRESS listener; the inter-node hop
 	// stays plain TCP.
 	ProtocolTLS ForwardProtocol = "tls"
 	// ProtocolWS is the stream lifecycle with a WebSocket front: the client's
@@ -75,7 +75,7 @@ const (
 	// connection to map to an upstream and no connection drain. The released
 	// product supports UDP DIRECT and single-hop RELAY; multi-hop and cross-panel
 	// UDP remain fail-closed. Full semantics live in
-	// docs/v5-1b-datagram-contract-draft.md.
+	// the datagram runtime contract.
 	ProtocolUDP ForwardProtocol = "udp"
 )
 
@@ -126,7 +126,7 @@ var protocolRuntimes = []protocolRuntime{
 func ParseForwardProtocol(s string) (ForwardProtocol, error) {
 	name := strings.ToLower(strings.TrimSpace(s))
 	if name == "" {
-		// An omitted protocol is the V4 client shape and means TCP.
+		// An omitted protocol is the compatibility payload shape and means TCP.
 		return ProtocolTCP, nil
 	}
 	for _, rt := range protocolRuntimes {
@@ -260,7 +260,7 @@ func TargetKey(host string, port int) string {
 }
 
 // TargetHealthState is one of the five conclusions the panel's health synthesis can
-// report for a target (DEVELOPMENT.md §7.3 "线形状（加法）").
+// report for a target.
 //
 // The agent does not decide what "healthy" means. These five values arrive on
 // the wire, and this side only folds them onto the frozen vocabulary — the
@@ -473,8 +473,8 @@ func (c *TunnelConfig) Validate() error {
 	if protocol == ProtocolWS && mode == ModeEgress {
 		return errors.New("forwarder: ws terminates at the client-facing listener; an EGRESS tunnel cannot be ws")
 	}
-	// UDP is a client-facing datagram front. V5.1b opens DIRECT (WP5-B1) and BOTH
-	// halves of RELAY (WP5-B2, contract §9.1 — the hop is datagram end to end):
+	// UDP is a client-facing datagram front. It supports DIRECT and both
+	// halves of RELAY; the inter-node hop remains datagram end to end:
 	//
 	//   - EGRESS: allowed, and `hop_peer` is REQUIRED. The hop is UDP, so unlike
 	//     TCP there is no handshake to tell this exit who the peer is; without the

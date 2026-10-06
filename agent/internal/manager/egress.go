@@ -14,7 +14,7 @@ var ErrPoolNotFound = errors.New("manager: no egress target pool for tunnel")
 
 // Pool is one tunnel's egress target pool: the strategy plus the balancer the
 // forwarder reads. The balancer is what makes hot updates invisible to live
-// listeners (devmap §5.3): SwapTargets mutates the pool, and the next connection
+// listeners: SwapTargets mutates the pool, and the next connection
 // of the already-running forwarder picks the new target.
 //
 // ledger is the optional per-target health view used for target-failure observability
