@@ -2435,17 +2435,32 @@ async function applyFederatedRelayTunnel(
   // 每次创建/重试都会 bump revision，而 intent_id = fw-<tunnelId>-<revision> ⇒ 在
   // host 侧那是一条**新**租约。不先收掉旧的，每次重试都会在对面的面板上留下一条
   // 继续监听的孤儿 runtime + 一个被占的端口（G4 的同族泄漏，且本机看不见）。
-  const stale = await releaseStaleFederatedEgressForTunnel(tunnelId, revision, {
-    sender: deps.federatedSender,
-    now: deps.now,
-  }).catch(() => null);
-  if (stale && stale.failed.length > 0) {
-    steps.push({
-      step: "apply_egress",
-      ok: true,
-      detail: `上一代远端腿释放未确认：${stale.failed.map((f) => `${f.intent_id}(${f.code})`).join(", ")}`,
-      meta: { stale_release_failed: stale.failed.length },
+  let stale: Awaited<ReturnType<typeof releaseStaleFederatedEgressForTunnel>>;
+  try {
+    stale = await releaseStaleFederatedEgressForTunnel(tunnelId, revision, {
+      sender: deps.federatedSender,
+      now: deps.now,
     });
+  } catch (error) {
+    await teardown("stale remote egress lookup failed");
+    return fail(
+      "apply_egress",
+      SCHEDULER_ERROR_CODES.compensation_failed,
+      `无法确认上一代远端腿是否已释放：${error instanceof Error ? error.message : String(error)}`,
+      { revision, meta: { stale_release_lookup_failed: true } },
+    );
+  }
+  if (stale.failed.length > 0) {
+    // Creating the new generation now would knowingly permit two remote
+    // runtimes/ports for the same Forward. Keep desired visible as failed and
+    // retry cleanup later; do not delegate this revision yet.
+    await teardown("stale remote egress release unconfirmed");
+    return fail(
+      "apply_egress",
+      SCHEDULER_ERROR_CODES.compensation_failed,
+      `上一代远端腿释放未确认：${stale.failed.map((f) => `${f.intent_id}(${f.code})`).join(", ")}`,
+      { revision, meta: { stale_release_failed: stale.failed.length } },
+    );
   }
   const delegated = await delegateFederatedEgress(    {
       tunnelId,
