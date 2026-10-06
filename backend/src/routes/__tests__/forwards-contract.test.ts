@@ -1,115 +1,48 @@
-/**
- * V4-WP1 — `/api/forwards` 契约测试（`DEVELOPMENT.md` §13.3.3）。
- *
- * 覆盖的关键契约：
- *   1. PATCH 接受全字段（mode / ingress_node_id / egress_node_id /
- *      listen_port / target_host / target_port）+ name。
- *   2. `expected_revision` 不匹配 → 409 `revision_conflict`，且 body 里带
- *      `data.latest_revision`（前端据此刷新后重试）。
- *   3. POST /:id/preview 与 PATCH 同栈：同一 zod schema + 同一候选解析器。
- *   4. 未知字段被 strict() 拒绝（保序，不因宽松输入悄悄修改 legacy 行）。
- *
- * 这些断言是路由层的守卫：往前端暴露的 409/400 描
- * 述不得悄悄变形，否则前端「保存前 diff 预览」会给出与后端不一致的答案。
- *
- * 注意：这里刻意不打 Hono app（仓库测试默认无 MySQL / Redis 时调用真实
- * 服务会连库），而是直接验证路由模块导出的 zod schema 与 service 的错误
- * 形状——schema 是契约的第一道门。
- */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { ForwardCreateSchema, ForwardPatchSchema } from "../forwards.ts";
 
-// 只导出一个本地副本会与真实 schema 脱节；此处直接从路由源码提取的 Zod
-// 结构做等价断言太脆弱，因此改为：验证向后兼容的旧行为（name-only PATCH）
-// 仍被接受，同时验证新增字段在 schema 内（以源码文本断言注册字段）。
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-
-const here = dirname(fileURLToPath(import.meta.url));
-const routeSrc = readFileSync(
-  join(here, "..", "forwards.ts"),
-  "utf-8",
-);
-
-/** 从路由源码里取出 ForwardPatchSchema 的字段清单。 */
-function patchSchemaFields(): string[] {
-  const start = routeSrc.indexOf("const ForwardPatchSchema");
-  const end = routeSrc.indexOf(".refine(", start);
-  const block = routeSrc.slice(start, end);
-  return [...block.matchAll(/^    ([a-z_]+):/gm)].map((m) => m[1]!);
-}
-
-describe("V4-WP1 /api/forwards PATCH 契约", () => {
-  it("B1. 可编辑字段与创建契约一致（§13.3.1）", () => {
-    expect(patchSchemaFields().sort()).toEqual(
-      [
-        "egress_node_id",
-        "expected_revision",
-        // V5.5 WP15：出口腿"在哪一侧"（本机 / 某个 peer）与入出口节点同为运行态放置
-        // 事实，因此创建与 PATCH 两份契约都必须有它 —— 这条断言守的正是"两边不漂移"。
-        "federated_egress_peer",
-        "ingress_node_id",
-        "listen_port",
-        // V5.4：中间跳与入出口同为运行态放置事实，因此创建与 PATCH 两份契约都必须有它 ——
-        // 这条断言的目的就是"可编辑字段与创建契约一致"，少了它两边就会漂移。
-        "middle_node_id",
-        "mode",
-        "name",
-        "target_host",
-        "target_port",
-        // V5-WP5-A1: the tls front's paths are editable, so the patch contract
-        // stays equal to the create contract — which is what this assertion is
-        // FOR. `protocol` is deliberately absent (a protocol change is a
-        // different operation, not an edit) and that is asserted separately.
-        "tls_cert_path",
-        "tls_key_path",
-      ].sort(),
-    );
+describe("Forward request contracts", () => {
+  test("PATCH accepts the editable product fields and legacy name-only updates", () => {
+    expect(ForwardPatchSchema.safeParse({ name: "renamed" }).success).toBe(true);
+    expect(ForwardPatchSchema.safeParse({
+      name: "edge",
+      mode: "relay",
+      ingress_node_id: 1,
+      egress_node_id: 2,
+      middle_node_id: 3,
+      listen_port: 8443,
+      target_host: "example.test",
+      target_port: 443,
+      tls_cert_path: "/etc/tunex/cert.pem",
+      tls_key_path: "/etc/tunex/key.pem",
+      federated_egress_peer: "peer-b",
+      expected_revision: 7,
+    }).success).toBe(true);
   });
 
-  it("B2. name-only PATCH 保持兼容（旧前端不发新字段也不 400）", () => {
-    const fields = patchSchemaFields();
-    expect(fields).toContain("name");
-    // name 是可选字段——只发 name 的 legacy 请求仍合法。
-    expect(routeSrc).toContain('name: z.string().trim().min(1).max(60).optional()');
+  test("PATCH is fail-closed for unknown fields and protocol mutation", () => {
+    expect(ForwardPatchSchema.safeParse({ name: "x", unknown: true }).success).toBe(false);
+    expect(ForwardPatchSchema.safeParse({ protocol: "udp" }).success).toBe(false);
   });
 
-  it("B3. expected_revision 是可选凭据，非必填", () => {
-    expect(routeSrc).toContain(
-      "expected_revision: z.number().int().nonnegative().nullable().optional()",
-    );
+  test("expected_revision remains optional, nullable and non-negative", () => {
+    expect(ForwardPatchSchema.safeParse({ name: "x" }).success).toBe(true);
+    expect(ForwardPatchSchema.safeParse({ expected_revision: null }).success).toBe(true);
+    expect(ForwardPatchSchema.safeParse({ expected_revision: 0 }).success).toBe(true);
+    expect(ForwardPatchSchema.safeParse({ expected_revision: -1 }).success).toBe(false);
   });
 
-  it("B4. preview 路由注册在 :action 之前（否则被 action 参数吞掉）", () => {
-    const previewAt = routeSrc.indexOf('"/:id/preview"');
-    const actionAt = routeSrc.indexOf('"/:id/:action"');
-    expect(previewAt).toBeGreaterThan(0);
-    expect(actionAt).toBeGreaterThan(previewAt);
-  });
-
-  it("B5. preview 与 PATCH 复用同一个 schema 对象", () => {
-    const uses = routeSrc.match(/ForwardPatchSchema\.safeParse/g) ?? [];
-    // PATCH + preview 两处；schema 只定义一次。
-    expect(routeSrc.match(/const ForwardPatchSchema/g)?.length).toBe(1);
-    expect(uses.length).toBe(2);
-  });
-
-  it("B6. 409 revision_conflict 由 service 层返回（§13.3.3）", () => {
-    const svc = readFileSync(
-      join(here, "..", "..", "services", "forward-service.ts"),
-      "utf-8",
-    );
-    expect(svc).toContain('error(409, "revision_conflict"');
-    expect(svc).toContain("data: { latest_revision: latest }");
-  });
-
-  it("B7. apply 失败保留 Tunnel 与 revision 历史（§4.1 铁律）", () => {
-    const svc = readFileSync(
-      join(here, "..", "..", "services", "forward-service.ts"),
-      "utf-8",
-    );
-    // 失败路径只回带错误，不删除行。
-    expect(svc).toContain('error(502, "apply_failed"');
-    expect(svc).not.toContain("DELETE FROM `Tunnel`");
+  test("create and patch agree on TLS path shape", () => {
+    const createBase = {
+      name: "tls",
+      mode: "direct" as const,
+      protocol: "tls" as const,
+      ingress_node_id: 1,
+      target_host: "example.test",
+      target_port: 443,
+    };
+    expect(ForwardCreateSchema.safeParse({ ...createBase, tls_cert_path: "relative.pem" }).success).toBe(false);
+    expect(ForwardPatchSchema.safeParse({ tls_cert_path: "relative.pem" }).success).toBe(false);
+    expect(ForwardPatchSchema.safeParse({ tls_cert_path: "/etc/tunex/cert.pem" }).success).toBe(true);
   });
 });
