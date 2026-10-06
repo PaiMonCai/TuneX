@@ -669,6 +669,24 @@ before_fix: {"sent":false,"reason":"smtp_error"} [mail] 发送失败：SMTP EHLO
 - web：`tsc` 0 错 + 全量 **1267 pass / 0 fail**（已提交 `ef4f073`）
 - backend：`tsc` 0 错；全量 **2901 pass / 4 fail**，4 条红**全部**是上述替身泄漏（单独跑绿）⇒ 等 `task-28` 与 `notify-center` 两半落地后应回 0
 
+## 3.29 Round 33：**真机浏览器验收（新构建）全通过** —— 四块新卡片 + DNS synced 态 + 通知偏好
+
+方法：`npm run build`（当前树）→ **重启 Web 指向新构建**（此前 41000 的进程握的是旧构建，正是它造成过 chunk 500）→ 起假 DNS provider → 脚本建 provider + 绑定 → 等 synced → 遍历 6 个页面 → 自动还原现场。
+
+**结果**：
+| 面 | 真实渲染证据（testid 摘录） |
+|---|---|
+| `/forwards/2` RELAY | 链路（`forward-topology-*`、`diag-none`、`observed-at`）+ **DNS 前门 `forward-dns-card`（真实 `synced`）** + **延迟 `forward-latency-ok`**（真实现可达态）+ **高可用 `forward-ha-policy-off` / `forward-ha-candidate-none` / `forward-ha-options`** ⇒ **四块同屏** |
+| `/forwards/1` DIRECT | `forward-topology-direct` + 延迟 `forward-latency-no-observer` + `forward-latency-reason`（按构造没有观测维度，不是"没有数据"）+ HA 卡 |
+| `/nodes`（选中入口） | **升级卡片**：`upgrade-running-version` / `upgrade-freshness` / `upgrade-configured-version`（与上报版本分开）/ `upgrade-target-image` / `upgrade-expected-version` / `upgrade-drift` / `upgrade-precondition` / `upgrade-aftermath`；**Looking Glass**：`looking-glass-panel` / `admin-override` / `caps` / `method` / `scope` / `write-warning`（发起是写操作）/ `max-targets` / `timeout` / `run` / `idle` / `caveats` |
+| `/settings` | 通知偏好矩阵 `notification-channel-{email,webhook,telegram}` |
+| 全局 | **`apiErrors` 为空**、**禁用词（正常/健康/可达）每页零命中** |
+| DNS 闭环 | `bind → pending` → `after wait: **synced**` → 清理后 `providersLeft=0`、`forward2DnsState=unbound` |
+
+`/admin/notification-channels` 尚无 testid 命中——与 `task-20`（admin 渠道 UI）在途一致，**不记为缺陷**。
+
+**未覆盖（留给最终验收）**：Looking Glass 的**真实发起**（本轮只看渲染，未点 run——真实发包有副作用）；通知偏好的**点击往返**（已由 `notify-center` 在隔离副本上验过）；升级的**真实执行**（刻意不做）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
