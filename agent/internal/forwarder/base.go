@@ -102,14 +102,14 @@ type pipeTracker struct {
 	// wait for them; a shutdown that runs out of deadline must be able to close
 	// them, which is impossible from a counter alone.
 	live map[net.Conn]struct{}
-	// diag is this tunnel's protocol diagnostics (V5-WP5-A3). nil for a plain TCP
+	// diag is this tunnel's protocol diagnostics. nil for a plain TCP
 	// tunnel: a protocol with nothing protocol-specific to report does not pretend
 	// to have counters that are all zero.
 	diag *diagRecorder
 	// wrapConn adapts a freshly accepted connection to the tunnel's front
 	// protocol. nil means "the raw connection" (plain TCP).
 	//
-	// V5-WP5-A1/A2: this is the ONLY seam a TLS- or WebSocket-fronted tunnel
+	// This is the only seam a TLS- or WebSocket-fronted tunnel
 	// needs, and both use the same one. Everything that makes a stream tunnel a
 	// stream tunnel — accept loop, per-connection pipe, drain, stats, the port
 	// guard, hot reload — is reused untouched, so "TLS/WS is a stream runtime" is
