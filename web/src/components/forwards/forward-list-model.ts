@@ -12,7 +12,7 @@ import type { ForwardListQuery } from "@/lib/types";
  */
 export const FORWARD_BATCH_MAX_IDS = 50;
 
-type ForwardModeFilter = "all" | "direct" | "relay";
+export type ForwardModeFilter = "all" | "direct" | "relay";
 /**
  * 状态筛选的取值 == 后端 `apply_status` 白名单。
  *
@@ -22,7 +22,7 @@ type ForwardModeFilter = "all" | "direct" | "relay";
  * 口径发 `apply_status=pending`，applying 的行会**静默消失**。因此这里把两者拆成
  * 独立选项，用户仍能分别看到，不会出现「筛选后少了一半数据」。
  */
-type ForwardStatusFilter = "all" | "active" | "error" | "suspended" | "pending" | "applying";
+export type ForwardStatusFilter = "all" | "active" | "error" | "suspended" | "pending" | "applying";
 
 /** 服务端排序键（后端 forward-list-query.ts 白名单的超集子集，见 SORT_OPTIONS）。 */
 export type ForwardSortKey =
