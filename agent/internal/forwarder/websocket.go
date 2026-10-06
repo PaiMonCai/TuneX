@@ -1,4 +1,4 @@
-// WebSocket front for the stream runtime (V5-WP5-A2).
+// WebSocket front for the stream runtime.
 //
 // Contract (DEVELOPMENT.md §6.1): WS wraps **client-facing** traffic. A WS client
 // connects to the ingress listener, the frames' payloads are unwrapped into the

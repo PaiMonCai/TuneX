@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// V5-WP2 runtime factory.
+// Runtime factory.
 //
 // The agent builds data-plane runtimes in exactly one place (manager.buildLocked
 // used to switch on the tunnel *mode* alone). That was correct while TCP was the
@@ -30,7 +30,7 @@ import (
 // StreamBuildDeps carries what a stream builder may need from its owner.
 //
 // It is a struct rather than positional arguments so a future builder (TLS/WSS
-// in V5.1a, which reuse the stream lifecycle) can take the same shape without
+// which reuse the stream lifecycle) can take the same shape without
 // changing the registry signature.
 type StreamBuildDeps struct {
 	// SelectorFor resolves the egress pool for a tunnel id. Only the EGRESS
@@ -38,7 +38,7 @@ type StreamBuildDeps struct {
 	SelectorFor func(tunnelID string) (TargetSelector, error)
 	// Observer receives per-target dial failures (EGRESS only). Nil is a no-op.
 	Observer TargetObserver
-	// Dial overrides the EGRESS upstream dialer (V5.3-WP8: the runtime injects a
+	// Dial overrides the EGRESS upstream dialer (the runtime may inject a
 	// resolver-backed one so target names get a TTL cache and a stale fallback).
 	// Nil keeps Go's own dialer.
 	Dial DialFunc
@@ -71,7 +71,7 @@ type RuntimeTarget struct {
 // ResolveRuntimeTarget answers "which runtime class carries this config" and
 // fails closed for anything not compiled into this binary.
 //
-// An empty Protocol is the V4 client shape and means TCP (see
+// An empty Protocol is the compatibility payload shape and means TCP (see
 // ParseForwardProtocol), so an old panel keeps working unchanged. An explicit
 // protocol with no runtime is refused here — before any listener exists.
 func ResolveRuntimeTarget(cfg TunnelConfig) (RuntimeTarget, error) {
@@ -213,10 +213,10 @@ var datagramBuilders = map[ForwardProtocol]DatagramBuilder{
 //
 // Roles are not interchangeable and the builder does not pretend otherwise:
 //
-//   - DIRECT: client datagrams to a local target (WP5-B1, gated by V5-G1B 76/0);
-//   - EGRESS: hop packets from the paired ingress to a pooled target (WP5-B2);
+//   - DIRECT: client datagrams to a local target;
+//   - EGRESS: hop packets from the paired ingress to a pooled target;
 //   - RELAY: the ingress half of that hop — client mappings carried to the exit
-//     over one shared socket, demultiplexed by the hop header (WP5-B2).
+//     over one shared socket, demultiplexed by the hop header.
 //
 // The idle timeout and mapping ceiling are package defaults on every role: the
 // contract freezes one value for DIRECT and RELAY so the two cannot drift (§9.2).
@@ -335,7 +335,7 @@ func buildWSStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, error
 
 // buildTLSStream constructs the TLS-fronted stream runtime.
 //
-// Ordering is the contract (§6.1 + WP2's "unknown protocol fails before a
+// Ordering is part of the runtime contract: "unknown protocol fails before a
 // listener exists"):
 //  1. the config has already been validated (paths present, mode applicable);
 //  2. the certificate and key are LOADED here — a missing file, a mismatched
@@ -353,13 +353,13 @@ func buildTLSStream(cfg TunnelConfig, deps StreamBuildDeps) (StreamRuntime, erro
 	// The certificate is loaded through a reloader rather than once: rotation is
 	// an operator replacing a file, and a hot-reloadable tunnel never rebuilds
 	// its listener, so a one-shot load would keep serving the old certificate
-	// forever (V5-G1A.6). The initial load still happens here, so a bad pair
+	// forever. The initial load still happens here, so a bad pair
 	// fails before anything binds.
 	diag := &diagRecorder{protocol: ProtocolTLS}
 	reloader, err := newCertReloader(
 		strings.TrimSpace(cfg.TLSCertPath), strings.TrimSpace(cfg.TLSKeyPath),
 		func(err error) {
-			// V5-WP5-A3: a failed rotation is both logged and REPORTED, because the
+			// A failed rotation is both logged and reported, because the
 			// tunnel keeps serving the last good certificate and would otherwise
 			// look perfectly healthy.
 			diag.noteCertReloadError(err)

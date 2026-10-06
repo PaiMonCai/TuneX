@@ -76,7 +76,7 @@ type QueuedCommand struct {
 	// synthetic TunnelConfig: a probe is not a tunnel, and pretending otherwise
 	// would let a malformed probe look like a config apply.
 	Probe *diag.Request `json:"probe,omitempty"`
-	// LookingGlass carries a V5-WP19-D request: user-originated, panel-resolved,
+	// LookingGlass carries a user-originated, panel-resolved diagnostic request,
 	// and pinned to **public literal addresses only**.
 	//
 	// A third sibling field for the same reason as `Probe`, plus one more that is
@@ -112,7 +112,7 @@ type ackPayload struct {
 	// Facts carries the node-level self report (collect_diagnostics).
 	Facts *selfinfo.Facts `json:"facts,omitempty"`
 	// HopLocalAddr answers "where does this node's datagram hop come from" for a
-	// RELAY leg (V5.1b WP5-B2): `ip:port` of the socket this node carries client
+	// RELAY leg: `ip:port` of the socket this node carries client
 	// mappings through.
 	//
 	// It rides on the ACK because the panel needs it SYNCHRONOUSLY: the exit leg is
@@ -142,7 +142,7 @@ type Client struct {
 }
 
 // MarkStartupFromCache tells the loop that the startup restore came from the
-// local last-known-good cache (WP11A). It must be called before Run.
+// local last-known-good cache. It must be called before Run.
 func (c *Client) MarkStartupFromCache() {
 	c.startupFromCache = true
 }
@@ -349,7 +349,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 			cfg.Revision = cmd.Envelope.Revision
 		}
 
-		// V5.3 WP9: the ownership gate runs BEFORE anything is staged. A refusal
+		// The ownership gate runs before anything is staged. A refusal
 		// must not leave a trace — staging an EGRESS pool first would briefly
 		// apply a fenced activation's targets to a running pool before the
 		// refusal landed. The manager gates again when it applies; this call is
@@ -499,7 +499,7 @@ func ackCodeFor(err error) string {
 // runs.
 //
 // The plan is advisory about HOW to apply, never about WHETHER: the revision
-// gate and every port conflict stay inside the manager, so a bad plan cannot
+// activation gate and every port conflict stay inside the manager, so a bad plan cannot
 // make a command succeed or fail differently than the manager decides.
 //
 // The returned handle is the transport-agnostic runtime (forwarder.Runtime): a

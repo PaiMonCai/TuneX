@@ -7,17 +7,17 @@ import (
 	"sync"
 )
 
-// Certificate loading for a TLS front (V5-WP5-A1, hardened after V5-G1A.6).
+// Certificate loading for a TLS front.
 //
 // The first implementation loaded the certificate once, when the listener was
 // built. That satisfies "the node serves the certificate it was told to serve"
 // only until the operator rotates it: replacing the file changed nothing,
 // because the panel's hot-reload path classifies a target change as an upstream
 // swap and therefore never rebuilds the listener — so no code path ever re-read
-// the file. Gate V5-G1A.6 caught exactly that ("new connections are served the
+// the file. A regression here would mean "new connections are served the
 // NEW certificate" failed while every other reload check passed).
 //
-// Rotation semantics that follow from the contract and from V4 durability:
+// Rotation semantics that follow from the current durability contract:
 //
 //   - replacing the files is picked up by the NEXT handshake, with no config
 //     revision and no listener rebuild (certificates are node-local files owned
@@ -37,7 +37,7 @@ type certReloader struct {
 	// report is called when a reload is attempted and fails. Nil is silent;
 	// production passes a logger so the failure is observable.
 	report func(error)
-	// onLoad is called with every successfully loaded pair (V5-WP5-A3), so the
+	// onLoad is called with every successfully loaded pair, so the
 	// diagnostics can report the certificate's subject, expiry and rotation count
 	// without reading the file a second time.
 	onLoad func(cert *tls.Certificate, rotated bool)
@@ -76,7 +76,7 @@ func stampOf(certPath, keyPath string) (fileStamp, error) {
 }
 
 // newCertReloader loads the pair once, so a bad certificate configuration fails
-// at BUILD time — before any listener exists (the ordering V5-G1A.3 checks).
+// at build time — before any listener exists.
 func newCertReloader(
 	certPath, keyPath string,
 	report func(error),

@@ -2,7 +2,7 @@
 // the user-facing remote_host:remote_port) and RELAY (upstream is the egress
 // node at next_hop).
 //
-// WP15 removed the second data-plane implementation that used to carry DIRECT
+// The duplicate data-plane implementation that used to carry DIRECT was removed
 // (the engine package plus the old DIRECT forwarder). Both one-hop modes now
 // share this file: the only thing that distinguishes them is where
 // UpstreamAddr() points, and that is resolved from the validated config below.
@@ -13,7 +13,7 @@
 // (egress.go): it load-balances over a target pool instead of dialing a single
 // upstream address.
 //
-// WP2 adds the hot-reload seam here: SetUpstream swaps where NEW connections
+// The hot-reload seam lives here: SetUpstream swaps where NEW connections
 // dial without touching the listener, which is exactly the §13.3.4 "Target
 // Host / Port" row (old TCP connections continue, new ones take the new
 // target). The DIRECT/RELAY distinction survives the swap because both simply
@@ -47,7 +47,7 @@ func NewSingleHop(cfg TunnelConfig) (*SingleHopForwarder, error) {
 	return &SingleHopForwarder{pipeTracker{cfg: cfg, up: upstream{addr: cfg.UpstreamAddr()}}}, nil
 }
 
-// NewSingleHopTLS is NewSingleHop with a TLS-terminated listener (V5-WP5-A1).
+// NewSingleHopTLS is NewSingleHop with a TLS-terminated listener.
 //
 // Only the listener differs: the accept loop, the per-connection pipe, drain,
 // stats, the port guard and hot reload are the same code path, because TLS is a

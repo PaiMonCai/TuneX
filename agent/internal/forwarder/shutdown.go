@@ -26,10 +26,10 @@ type ShutdownResult struct {
 	RemainingConns int
 }
 
-// Shutdowner is the WP11A shutdown primitive. It is deliberately separate from
+// Shutdowner is the graceful-shutdown primitive. It is deliberately separate from
 // Forwarder: Drain keeps the listener bound (rollout needs the port to stay
 // reserved), while a shutdown must close it so the port stops accepting new
-// connections. Implementing it optionally keeps the frozen WP4 contract intact.
+// connections. Implementing it optionally keeps the base runtime contract small.
 type Shutdowner interface {
 	// Shutdown closes the listener first, then waits for in-flight connections
 	// up to timeout, then force-closes whatever is left. It never returns
@@ -40,7 +40,7 @@ type Shutdowner interface {
 // CloseListener closes only the listener: new TCP connections are refused from
 // that instant, while the connections already being proxied keep working.
 //
-// It exists because a shutdown has two phases with different urgency (WP11A):
+// It exists because graceful shutdown has two phases with different urgency:
 // stopping the node accepting new work must not wait for anything, but draining
 // what is already connected is bounded work that happens afterwards. Doing both
 // in one call made "when do new connections start failing?" depend on how long
