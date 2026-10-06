@@ -527,10 +527,12 @@ describe("WP6 接线", () => {
     // 只要新代码仍集中在下面的锚点附近，合并就是干净的。
     expect(api.indexOf('"/admin/node/health"')).toBeGreaterThan(api.indexOf("nodeState:"));
     expect(api.indexOf("unwrap?: boolean")).toBeGreaterThan(api.indexOf("workspaceId?: number"));
-    // WP6 的 mock 路由挂在 WP12 凭据块之前，与 WP9 的绑定用量投影（在
-    // mockIngressNode 附近 / handleMock 内）分处不同函数，互不覆盖。
+    // 归一化后，事实投影留在 runtime，HTTP 路由只负责调用它。
+    // 这比依赖同一大文件中的源码先后顺序更稳定。
     const runtime = readFileSync(new URL("../../../mocks/runtime.ts", import.meta.url), "utf8");
-    expect(runtime).toContain("healthWorld");
-    expect(runtime.indexOf("healthWorld(db)")).toBeGreaterThan(runtime.indexOf("function mockIngressNode"));
+    const adminHandler = readFileSync(new URL("../../../mocks/handlers/admin.ts", import.meta.url), "utf8");
+    expect(runtime).toContain("function healthWorld");
+    expect(runtime).toContain("function mockIngressNode");
+    expect(adminHandler).toContain("healthWorld(db)");
   });
 });

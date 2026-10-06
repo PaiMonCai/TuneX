@@ -227,8 +227,8 @@ describe("C. mock /dashboard/attention 与后端同形", () => {
     const runtime = readWeb("mocks/runtime.ts");
     expect(runtime).toContain("applyErrorIsRetryable(");
     // 曾经出现过的形态：mock 自己再写一份「哪些码可重试」。
-    expect(handler).not.toMatch(/mockForwardRetryable/);
-    expect(handler).not.toMatch(/RETRYABLE\s*=\s*new Set/);
+    expect(runtime).not.toMatch(/mockForwardRetryable/);
+    expect(runtime).not.toMatch(/RETRYABLE\s*=\s*new Set/);
 
     // 且结论确实按既有表给出（demo 数据里有错误行时才有；没有则本断言不成立的对象为空）。
     const { body } = await call<AttentionPayload>("GET", "/dashboard/attention");
@@ -249,7 +249,7 @@ describe("C. mock /dashboard/attention 与后端同形", () => {
     expect(mockConst?.[1]).toBe(backendMax?.[1]);
 
     // legacy 的 remote_port_forward 不进待办（后端 where category: "port_forward"）。
-    expect(readWeb("mocks/handler.ts")).toContain('tunnel.category !== "port_forward"');
+    expect(readWeb("mocks/runtime.ts")).toContain('tunnel.category !== "port_forward"');
     expect(backend).toContain('category: "port_forward"');
   });
 
