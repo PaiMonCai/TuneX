@@ -41,8 +41,7 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
-import { hashPassword, newApiKey } from "../auth.ts";
-import { hashKey } from "../services/user-keys.ts";
+import { hashPassword } from "../auth.ts";
 import { createPersonalWorkspace } from "../services/workspace.ts";
 import { listBindablePolicies, resolvePlanPolicyBinding } from "../services/plan-subscription.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
@@ -256,9 +255,6 @@ adminExtendedRoutes.post("/users", async (c) => {
           auto_renew: Boolean(body.auto_renew),
           status: status ?? "active",
           parent_id: parentId ?? undefined,
-          // SEC-02：新建用户同样只落 api_key 的 sha256 哈希，明文列留空（一次性明文
-          // 仅由用户侧的 settings 轮换端点返回，管理端创建不返回凭据）。
-          api_key_hash: hashKey(newApiKey()),
         } as Prisma.UserUncheckedCreateInput,
       });
       await createPersonalWorkspace(tx, user);
