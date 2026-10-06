@@ -773,14 +773,14 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 |---|---|---|---|---|---|
 | **1** | 新用户可快速部署 | **达成** | **三轮证据叠加**：①（`task-31`）照文档**走不通**（缺 `LICENSE_SECRET` ⇒ `db-migrate` exit 1；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；②（`task-34`，修文档 + **本地构建镜像**）**文档路径已通**（迁移/种子/管理员凭据/8 cron/建组 201 + provision 201；`up -d` 235s）；③ **（Round 52，Lead 一手）`Agent enroll → online` 通过**：建组 201 → provision 201 → `enrollment` 一次性 token（TTL 600s）→ **`POST /api/internal/node/enroll` 兑换出 43 字符 credential（200）** → 起 agent ⇒ 面板判 **`status: active` + `connection: online`**（首个 5s 轮询即在线）；**同 token 重放 = 401**；清理后节点数回 4、额度回 4、8 个 `tunex-it-*` 完好 | **达成** | ① **字面一键命令**（`curl … install.sh | sudo sh -s -- --panel … --enroll-token …`）**仍需真实节点主机**（sudo/docker），沙箱不可执行 ⇒ 我复现的是**同一条链路的每一步**（含关键兑换），不是那行命令本身；② 生成的命令里面板地址是 `127.0.0.1:18180`（**节点不可达**）⇒ 实测印证 `task-34` 已补的 `SITE_URL` 前置条件；③ 公网 TLS/反代、备份/恢复/回滚、云主机资源限额未验 |
 | **2** | 可从 Web 指引完成第一台 Node | 达成 | 浏览器端到端：闩锁 → 真 Agent → **5s 内 online** → CTA `/forwards?ingress_node_id=`；round 33 门禁重跑仍绿 | **达成** | — |
-| **3** | 直观创建 Direct/Relay/Multi-hop | 基本达成（多跳在途） | Direct/Relay 早已交付；**多跳已接线**（`forward-multihop-model/select` + `middle_node_id` 入请求 + 两段绑定前置 + 预览改「四步三段」）；**真实三跳未跑通**（scratch 4 台节点无一 `role=both`） | **基本达成** | 真实三跳创建 + 真机 topology 两段 + `apply_transit` 端到端（需临时改一台节点角色） |
+| **3** | 直观创建 Direct / Relay / Multi-hop | **达成** | Direct/Relay 早已交付；多跳接线（模型/选择器/请求字段/两段绑定前置/预览四步三段）；**Round 53 Lead 一手在真机跑通三跳**：建 `role=both` 节点 → 两段绑定（`POST /api/nodes/1/bindings`、`POST /api/nodes/12/bindings` 各 201）→ `POST /api/forwards {mode:"relay", ingress:1, middle:12, egress:2, listen_port:21502}` **201 且 `apply=active`**；`GET /forwards/17/topology` 正确给出**两段**（`ingress_to_middle` 1→12、`middle_to_egress` 12→2，含 `runtime_id`/`running`/`expected_revision`） | **达成** | 沿途查出并已记录一条**真缺口**：`connect_ip` **只在 provision 时可写、无任何更新端点**、面板也不从上报学地址 ⇒ 未填地址的节点**永远**不能当 RELAY 跳（`invariant_violated`）——见 §3.52；另：数据面是否真能过包未验（无真实客户端/服务端） |
 | **4** | Forward 状态与链路清晰可见 | 基本达成 | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 浏览器验收 43/41 个相关 testid、禁用词零命中 | **达成** | 带宽/吞吐时间序列（后端无该数据源） |
 | **5** | DDNS 可从 UI 使用 | 基本达成 | 写入闸门真解耦（`cron_ddns_sync`）；**真机 `pending → synced` + 读回确认 + 浏览器「已切换」**；缺口补齐：`auto_resolve=false` 缺省态现在**明说"不会跟随、要你自己维护"**（`dec70f4`） | **达成** | 只支持 2 种 provider（cloudflare/huawei）；多入口 `multi_entry` 首发未开放 |
 | **6** | Notification 可从 UI 配置 | **未达成** | **四块都到位**：渠道配置端点（task-10）+ **admin 渠道 UI**（task-20，独立目录）+ 用户偏好矩阵（task-12）+ **事实类投递节拍**（task-11，真机三拍：真 email 送达 / 被投递层静默期拦住 / 恢复配对）+ **投递失败可见性**（task-13，真机脱敏与跨空间隔离）+ SMTP 问候语 P1 已修 | **基本达成** | **真实外部投递**未验证（SMTP 只验明文会话、未对真实公网 MTA；telegram 从未真发到 api.telegram.org）；`degraded=true` 真机触发；`secret_state=unreadable` 真机 |
 | **7** | Agent upgrade 有完整用户流程 | 基本达成（完整流程在途） | 只读投影 `GET /api/nodes/:id/upgrade-state`（用**实际上报版本**而非配置列，前置与 `checkUpgradePrecondition` 逐字同源）+ **卡片已挂载**（与"生成命令"同一入口，旧内联块已退役）+ 版本基线语义已审计（`install.sh` 写 sha 导致永不触发 → task-26） | **基本达成** | **真实节点完整升级未跑**（刻意不动那 4 台）；`version_drift=behind` 真机未出现 |
 | **8** | 常见故障有诊断入口 | 基本达成 | 诊断面板 + 支持包 + 转发错误→下一步；**Looking Glass 已消费并挂载**（五态 + `admin_override` 按观察者 + 写操作警告 + caveats），开关真机验证（含普通成员可进）、真实发起在 API 层验证（200 报告 / 409 单飞 / 审计计数） | **达成** | 后端只 1 种方法 `tcp_connect`（相对 ForwardX 的 8 种）；`refused`/`invalid_target` 等结果态无真机样本 |
 | **9** | 不需理解 Lease/Revision/Fencing | 达成 | 用户域零命中（唯一命中在管理端联邦页）；`Revision` 只在默认折叠的技术详情块内；routes 页假承诺已删 | **达成** | — |
-| **10** | 核心日常体验不再明显落后 ForwardX | **未达成** | 三条落后理由**被独立评审（R6）复核**：② HA"无产品面" → **已消除**（真机 `/ha` 全 200，期望/事实/候选/备选四层字段分开，"缺省即关"在真库+HTTP+文案三处一致）；③ 诊断"Web 侧不存在" → **部分消除**（有消费者 + 已挂载 + `enabled:false` 非 403 + 取不到/没开两分支；**但方法集仍 1 vs 7**）；① 通知 → **部分消除（未证实）**：链路在（`cron_notification_facts` 真机 ≥15 拍 + 真 handler + UI 已挂载），**但真库 `notification_delivery` 0 行 / `notification_channel` 0 行 / SMTP 凭据全空 / attention 0 事实 ⇒ 从未端到端投递过任何一条** | **未达成**（性质已从"通路不存在"降级为"**未证实 + 覆盖面**"） | **翻转门槛（评审给的）**：① **至少一次真实端到端投递**（含失败态）→ `task-36`；② **至少一条日常宽度差距**（带宽序列 或 让默认部署能给出"落后/无法判定"）→ 后者已在 `task-26`；③（可选）LG 补 1–2 种方法。**另有 4 项宽度差距**：无带宽/吞吐序列、DDNS 仅 2 家、诊断方法集 1 vs 7、默认部署永不提示版本落后；+1 项一次性部署差距（首启无向导） |
+| **10** | 核心日常体验不再明显落后 ForwardX | **未达成**（但**距"基本达成"只差要件 ② 一条**） | 三条落后理由复核：② HA **已消除**、③ 诊断**部分消除**（方法集 1→3 已部署；`task-42` 正在推到 5）、① 通知 **部分消除**→**R6 §12 已改判要件① = 支撑**（评审自我复核库身份 `@@server_uuid` 逐字相同 + `SHOW CREATE TABLE` 绕开统计缓存读出真计数器 `workspace 12/tunnel 14/delivery 25`，与其引用 id 一对一吻合；八条判据 6 支撑 / 1 部分支撑（SQL 直插事实）/ 1 不支撑（契约）） | **未达成** | **评审给的三级门槛**：未达成 = ①未支撑 或 ①支撑但②未闭合（**当前**）；**基本达成 = ①支撑 + ②闭合**（一条日常宽度差距真机可验证闭合，如 `task-26`/`task-37`）；达成 = 上述 + 覆盖面再收一条（LG ≥5、DDNS ≥4）。⇒ 下一目标明确：**闭合要件②**（我计划用 enroll 流程 + stamp 镜像做 `version_drift:behind` 真机首现）。另有评审 §12.4 的**判决实验**（`task-45`）在办 |
 
 **本对账的诚实边界**：
 - 第 10 条我**故意不自行判"达成"**——它是整体判断，应由一次独立评审（同 R5-A 的方法：钉 SHA、只写自己复核过的、把"在途"排除）给出，而不是由实施方自述。
@@ -970,7 +970,7 @@ mtr                     → MISSING（镜像无该二进制）
 | **7** Agent upgrade 完整流程 | **基本达成** | 只读 `upgrade-state`（**实际上报版本** + 前置逐字同源）+ 卡片挂载（旧内联入口退役）+ 版本基线语义修复 + **镜像 stamp 版本**（两版实测上报不同 version） | **真实节点完整升级未跑**；`version_drift:behind` **真机未出现**（需发布方注入 tag + 节点升级 + 配基线） |
 | **8** 常见故障诊断入口 | **达成** | 诊断面板 + 支持包 + 转发错误→下一步；Looking Glass 已消费并挂载、开关真机验证、真实发起 API 层验证；**ICMP 实测修正**（ping 可用、traceroute/mtr 如实不可用） | LG **Web 侧未消费 `unavailable_methods`**；`method_unavailable_on_node` 未实现；**走 agent 代码路径的真机 ping 证据未跑** |
 | **9** 不需理解 Lease/Revision/Fencing | **达成** | 用户域零命中；`Revision` 仅在默认折叠的技术详情块内；routes 页假承诺已删 | — |
-| **10** 核心日常体验不再明显落后 | **未达成**（R6 终局判定，Round 50 复核后维持） | 三条落后理由复核：**② HA 已消除**（真机 `/ha` 全 200，期望/事实/候选/备选四层分开）、**③ 诊断部分消除**（入口消除；方法集 **1 → 3**，实测 `caps.methods=["tcp_connect","ping","ping6"]` 已上线，差距**收窄为 3 vs 7**）、**① 通知部分消除**（链路真在；`task-36/41` 补了落盘 transcript + 调度器那一拍，但 R6 §10 用 **AUTO_INCREMENT 算术**证明"投递库 = 观察库"**不成立** ⇒ 仍判"**部分支撑**"） | **翻转门槛**（R6）：① 一次真实端到端投递——**只差"库的出处"**（评审给了三条可核口径：容器 DSN 落盘快照 / 直接在活库跑——AI 只增不减，跑过后 `workspace/tunnel/delivery` 会永久留下 11/13/24 / 账本行落盘）；② 一条日常宽度差距在**真机**出现（`version_drift:behind` 仍需发布方注入 tag + 节点升级 + 配基线）；③ LG 3 vs 7（已完成部分） |
+| **10** 核心日常体验不再明显落后 | **未达成**（距基本达成只差要件②） | R6 §12：**要件① 改判"支撑"**（worker stdout 落盘 + 评审自核库身份与真计数器）；②③ 两条同前 | 下一目标 = **闭合要件②**（一条日常宽度差距真机可验证闭合）；`task-45` 判决实验在办 |
 
 ### B. 已改写 / 未改写清单（按用户 Round 46 口径：**参照行为、代码本项目改写、未复刻**）
 - **已参照并改写（9 个文件，台账 `docs/agent/forwardx-code-reuse.md`）**：多入口成员/优先级/回切（HA 后端投影 + 卡片）、带宽吞吐序列（`/:id/throughput` + 卡片）、Looking Glass 方法集（agent `ping`/`ping6` + 面板方法闭集与不可用方法呈现）、LG 面板 UX。
@@ -1123,6 +1123,33 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 
 ### 诚实边界
 我复现的是**同一条链路的每一步**（含关键兑换），**不是**那行字面一键命令本身（需真实节点主机的 sudo/docker，沙箱不可执行）。⇒ #1 判**达成**的依据是"文档路径已通 + 首台节点 online 一手复现"；**字面一键命令的真实主机验证**仍列未验证。
+
+## 3.52 Round 53（Lead 一手）：**真实三跳跑通**（退出条件 #3 达成）+ 一条真缺口
+
+### 我怎么做到的（完整链路）
+1. provision 一台 **`role=both`** 中间节点（`POST /api/node-groups/:id/nodes {node_id, role:"both"}`）+ 用**已验证的 enroll→online 流程**让它上线（面板判 `role: both / status: active / connection: online`）；
+2. **两段绑定**：`POST /api/nodes/1/bindings {egress_node_id:12}` 与 `POST /api/nodes/12/bindings {egress_node_id:2}` 各 **201**（角色校验：入口须 `ingress|both`、出口须 `egress|both`）；
+3. `POST /api/forwards {mode:"relay", ingress_node_id:1, middle_node_id:12, egress_node_id:2, listen_port:21502, target_host:"1.1.1.1", target_port:443}` ⇒ **201 且 `apply_status=active`**；
+4. `GET /api/forwards/17/topology` ⇒ 正确给出**两段**：`ingress_to_middle`（1→12）、`middle_to_egress`（12→2），含 `runtime_id`/`running`/`expected_revision`。
+
+### 沿途的真实发现（两条）
+1. **`binding_required` 是三跳的真实前置**（不是文档缺漏）：第一次创建被 **409**"三跳路由要求入口→中间、中间→出口两段都已绑定"挡下——**fail-closed 正确**。
+2. **★ 真缺口：`connect_ip` 没有更新路径**。证据链：`node.connect_ip` 只在 **provision 时**可写（带 `connect_ip` 新建节点 12 ⇒ 写入成功 `172.33.10.27`）；对**已存在**节点再 provision 时该字段**被忽略**（返回 `connect_ip: null`）；全仓**没有**节点更新端点（`nodesRoutes` 无 patch/put），reconciler/state 也**不从上报里学地址**。后果：**provision 时没填地址的节点永远不能当 RELAY 跳**（创建报 `502 invariant_violated: RELAY plan needs a <host>:<port> next_hop`）。
+   **按用户规则对照 ForwardX**：它把"可拨号地址"放在**成员级** —— `drizzle/schema.ts:441` 的 `forward_group_members.connectHost`（成员自带连接地址）。⇒ **它的逻辑是"地址在成员/绑定层可设可改"**，而不是"只在节点创建那一刻定死"。**这正是应当复用的形态**（下一步切片：允许在绑定/成员层或节点更新端点设置可拨号地址，并让面板能从上报里学地址）。
+
+### 环境还原
+删两个测试 agent 容器 + 4 条涉及测试节点的绑定 + 节点 11/12 的全部子行 + 节点与组 ⇒ **本空间节点数 4、额度 4、转发总数 4、`tunex-it-*` 8 个完好**。
+
+## 3.53 R6 终局评审 §12：**要件① 改判"支撑"** + 一条反观察 + #10 三级门槛
+
+**要件 ① = 支撑（升级）**：评审按它 §11.4 **预先写死**的条件（"worker stdout / BullMQ 记录 / 不清理重跑，任一件到手即改判"）执行——本次到手 worker stdout 落盘，它**不留后门**地改判。八条判据：**6 支撑**、1 部分支撑（事实为 SQL 直插）、1 不支撑（③ 契约与简报不符，属产品契约而非证据问题）。
+**它自核的三件硬核**：① 库身份 `f9fb790dcc1e / 3306 / f4343e5e-… / 8.4.11` 与 owner 两份读数逐字相同；② **绕开统计缓存**（`SHOW CREATE TABLE`）读出真计数器 `workspace 12 / member 12 / tunnel 14 / delivery 25 / channel 15` ⇒ 恰为"本轮分配过 ws 11、tunnel 13、delivery 24"，与其引用 id **一对一吻合**；③ "那一拍不可伪造"——`[worker] cron_notification_facts:` 前缀只由 `worker.ts:242-254` 打印、`ok (…since enqueue)` 来自 `:313` 的 completed 事件，账本 `created_at` 在同拍窗口内（早于完成日志 85ms）、transcript 同秒同源。
+
+**⚠️ 一条它无法解释的反观察（§12.4）**：活库 scratch worker（镜像 `final49-0502`，**三个关键文件 md5 与 HEAD 逐字相同**）在事实窗口内**有一拍落在窗口却没有建出该事实**（beats `21:11:05.4 / **21:11:35.5** / 21:12:05.5` vs 事实存在 `21:11:31.893 → 21:11:58.6`；其全日志 `considered|built|delivered` 命中 0）。已排除代码版本、零提交、时钟、别名/DSN、候选查询与判定。它不动摇①的判定，但提出真实问题。
+⇒ **判决实验已派**（`task-45`，`notify-center`）：**让事实在库里停留 ≥90 秒**，看**活库 worker** 是否任一拍打印 `built:1`；**始终不打印 ⇒ 新缺陷（部署 worker 对同库事实不可见）⇒ 评审会重新打开要件①**。两种结局都已写死。
+
+**#10 三级门槛（评审定义，我采纳）**：**未达成** = ①未支撑 或 ①支撑但②未闭合（**当前**）→ **基本达成** = ①支撑 **+ ②闭合**（一条日常宽度差距**真机可验证闭合**）→ **达成** = 上述 + 覆盖面再收一条（LG 3→≥5 / DDNS 2→≥4）。
+⇒ **下一目标明确：闭合要件②**。我计划用**已验证的 enroll→online 流程** + `task-37` 的 **stamp 镜像**，让 `version_drift: behind` 在**真机首次出现**（"默认部署永不提示版本落后"这条日常宽度差距当场闭合）。
 
 ## 4. Capability Map
 
