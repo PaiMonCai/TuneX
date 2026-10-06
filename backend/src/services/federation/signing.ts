@@ -27,6 +27,8 @@ export const HDR = {
   issuedAt: "x-tunex-issued-at",
   expiresAt: "x-tunex-expires-at",
   signature: "x-tunex-signature",
+  method: "x-tunex-method",
+  path: "x-tunex-path",
 } as const;
 
 /** 时钟偏移容忍：60s（契约 §2.3）。超过就拒，且错误码是 clock_skew（可重试）。 */
@@ -123,6 +125,8 @@ export interface SignatureInput {
   privateJwk: JWK;
   /** 原始请求体（无 body 时传空字符串 —— 空串也要签，否则空 body 请求可被替换）。 */
   body: string;
+  method: string;
+  path: string;
   messageId: string;
   nowMs?: number;
   ttlSeconds?: number;
@@ -135,7 +139,10 @@ export interface SignatureInput {
 export async function buildSignatureHeaders(input: SignatureInput): Promise<Record<string, string>> {
   const nowSec = Math.floor((input.nowMs ?? Date.now()) / 1000);
   const ttl = Math.min(Math.max(input.ttlSeconds ?? DEFAULT_MESSAGE_TTL_SECONDS, 1), MAX_MESSAGE_TTL_SECONDS);
-  const jws = await new CompactSign(new TextEncoder().encode(input.body))
+  const method = input.method.toUpperCase();
+  const path = input.path.startsWith("/") ? input.path : `/${input.path}`;
+  const signedPayload = JSON.stringify([method, path, input.body]);
+  const jws = await new CompactSign(new TextEncoder().encode(signedPayload))
     .setProtectedHeader({ alg: "EdDSA", kid: input.identity.key_id })
     .sign(input.privateJwk);
   return {
@@ -145,6 +152,8 @@ export async function buildSignatureHeaders(input: SignatureInput): Promise<Reco
     [HDR.issuedAt]: String(nowSec),
     [HDR.expiresAt]: String(nowSec + ttl),
     [HDR.signature]: jws,
+    [HDR.method]: method,
+    [HDR.path]: path,
   };
 }
 
@@ -179,7 +188,8 @@ function headerOf(headers: Headers | Record<string, string | undefined>, name: s
 export async function verifyInboundRequest(input: {
   headers: Headers | Record<string, string | undefined>;
   rawBody: string;
-  path?: string;
+  path: string;
+  method: string;
   nowMs?: number;
 }): Promise<InboundVerification> {
   const { headers, rawBody } = input;
@@ -189,8 +199,10 @@ export async function verifyInboundRequest(input: {
   const issuedAtRaw = headerOf(headers, HDR.issuedAt);
   const expiresAtRaw = headerOf(headers, HDR.expiresAt);
   const signature = headerOf(headers, HDR.signature);
+  const signedMethod = headerOf(headers, HDR.method);
+  const signedPath = headerOf(headers, HDR.path);
 
-  if (!peerPanelId || !keyId || !messageId || !issuedAtRaw || !expiresAtRaw || !signature) {
+  if (!peerPanelId || !keyId || !messageId || !issuedAtRaw || !expiresAtRaw || !signature || !signedMethod || !signedPath) {
     return fail("message_malformed", "缺少联邦签名头", peerPanelId, messageId);
   }
   if (peerPanelId.length > 64 || keyId.length > 64 || messageId.length > 96) {
@@ -224,8 +236,14 @@ export async function verifyInboundRequest(input: {
     if (result.protectedHeader.kid && result.protectedHeader.kid !== keyId) {
       return fail("signature_invalid", "签名 kid 与头部不一致", peerPanelId, messageId);
     }
-    if (payload !== rawBody) {
-      return fail("signature_invalid", "签名载荷与请求体不一致", peerPanelId, messageId);
+    const actualMethod = input.method.toUpperCase();
+    const actualPath = input.path.startsWith("/") ? input.path : `/${input.path}`;
+    if (signedMethod.toUpperCase() !== actualMethod || signedPath !== actualPath) {
+      return fail("signature_invalid", "签名 method/path 与实际请求不一致", peerPanelId, messageId);
+    }
+    const expectedPayload = JSON.stringify([actualMethod, actualPath, rawBody]);
+    if (payload !== expectedPayload) {
+      return fail("signature_invalid", "签名载荷与请求不一致", peerPanelId, messageId);
     }
   } catch {
     return fail("signature_invalid", "签名校验失败", peerPanelId, messageId);
