@@ -2421,15 +2421,81 @@ async function applyFederatedRelayTunnel(
   /** 本次委托拿到的远端租约（撤它的时候要用同一个键）。 */
   let remoteLeaseRef: string | null = null;
 
-  /** 撤掉本次已发出去的东西（本地接入口租约 + 远端腿），逆序。 */
-  const teardown = async (_reason: string): Promise<void> => {
-    if (remoteLeaseRef !== null) {
-      await releaseFederatedEgress(
-        { tunnelId, revision, peer_panel_id: peerPanelId, lease_ref: remoteLeaseRef },
-        { sender: deps.federatedSender, now: deps.now },
-      ).catch(() => undefined);
+  /**
+   * Fail-closed teardown for the federated reapply path.
+   *
+   * The local ingress may be an OLD runtime that was still serving when this
+   * retry started. Releasing its NodePortLease without first confirming the
+   * listener is gone lets the allocator hand a live port to another Forward.
+   * Stop the near side first, then release its lease; remote cleanup is tracked
+   * independently but any uncertainty is returned to the caller.
+   */
+  const teardown = async (reason: string): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const errors: string[] = [];
+    let ingressRemoved = false;
+    try {
+      const removed = await orchestrator.removeTunnel({
+        tunnelId,
+        node: ingressPick.node,
+        direction: "ingress",
+        revision: revision + 1,
+        reason,
+      });
+      if (removed.ok) ingressRemoved = true;
+      else errors.push(`ingress runtime: ${removed.error}`);
+    } catch (error) {
+      errors.push(
+        `ingress runtime: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+
+    if (ingressRemoved) {
+      try {
+        await releaseLease({ tunnelId }, deps.portPoolDeps);
+      } catch (error) {
+        errors.push(
+          `local port lease: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    if (remoteLeaseRef !== null) {
+      try {
+        const released = await releaseFederatedEgress(
+          { tunnelId, revision, peer_panel_id: peerPanelId, lease_ref: remoteLeaseRef },
+          { sender: deps.federatedSender, now: deps.now },
+        );
+        if (!released.ok) {
+          errors.push(
+            `remote egress: ${released.code ?? "internal_error"} ${released.message ?? ""}`.trim(),
+          );
+        }
+      } catch (error) {
+        errors.push(
+          `remote egress: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    return errors.length === 0
+      ? { ok: true }
+      : { ok: false, error: errors.join("; ") };
+  };
+
+  const failAfterTeardown = async (
+    step: SchedulerStep,
+    originalCode: SchedulerErrorCode,
+    detail: string,
+    reason: string,
+    ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
+  ): Promise<CreateRelayFailure> => {
+    const cleanup = await teardown(reason);
+    return fail(
+      step,
+      cleanup.ok ? originalCode : SCHEDULER_ERROR_CODES.compensation_failed,
+      cleanup.ok ? detail : `${detail}；补偿未确认：${cleanup.error}`,
+      ctx,
+    );
   };
 
   // ── ⑤ 远端出口腿：先把**上一代**的腿收掉，再委托这一代 ──
@@ -2444,23 +2510,23 @@ async function applyFederatedRelayTunnel(
       now: deps.now,
     });
   } catch (error) {
-    await teardown("stale remote egress lookup failed");
-    return fail(
+    return failAfterTeardown(
       "apply_egress",
       SCHEDULER_ERROR_CODES.compensation_failed,
       `无法确认上一代远端腿是否已释放：${error instanceof Error ? error.message : String(error)}`,
+      "stale remote egress lookup failed",
       { revision, meta: { stale_release_lookup_failed: true } },
     );
   }
   if (stale.failed.length > 0) {
     // Creating the new generation now would knowingly permit two remote
-    // runtimes/ports for the same Forward. Keep desired visible as failed and
-    // retry cleanup later; do not delegate this revision yet.
-    await teardown("stale remote egress release unconfirmed");
-    return fail(
+    // runtimes/ports for the same Forward. Stop the local ingress and keep the
+    // failure durable; do not delegate this revision yet.
+    return failAfterTeardown(
       "apply_egress",
       SCHEDULER_ERROR_CODES.compensation_failed,
       `上一代远端腿释放未确认：${stale.failed.map((f) => `${f.intent_id}(${f.code})`).join(", ")}`,
+      "stale remote egress release unconfirmed",
       { revision, meta: { stale_release_failed: stale.failed.length } },
     );
   }
@@ -2478,12 +2544,17 @@ async function applyFederatedRelayTunnel(
     { sender: deps.federatedSender, now: deps.now },
   );
   if (!delegated.ok) {
-    await teardown("remote egress delegation failed");
-    return fail(
+    // A failed delegate may still have created a remote lease before the failure
+    // became known. Carry that ref into teardown so we make one more idempotent
+    // release attempt instead of relying on the delegate's best effort alone.
+    remoteLeaseRef = delegated.lease_ref;
+    return failAfterTeardown(
       "apply_egress",
-      delegated.code === "peer_unreachable" ? SCHEDULER_ERROR_CODES.egress_ack_failed : SCHEDULER_ERROR_CODES.egress_apply_rejected,
-      `远端出口腿（peer=${peerPanelId}）建立失败：${delegated.message}` +
-        (delegated.lease_ref ? `；远端租约 ${delegated.compensated ? "已释放" : "释放未确认"}` : ""),
+      delegated.code === "peer_unreachable"
+        ? SCHEDULER_ERROR_CODES.egress_ack_failed
+        : SCHEDULER_ERROR_CODES.egress_apply_rejected,
+      `远端出口腿（peer=${peerPanelId}）建立失败：${delegated.message}`,
+      "remote egress delegation failed",
       { revision, meta: { federation_code: delegated.code, lease_ref: delegated.lease_ref } },
     );
   }
@@ -2498,11 +2569,11 @@ async function applyFederatedRelayTunnel(
 
   // ── ⑥ 入口：next_hop 只能是 host 返回的地址（**不猜 IP**）──
   if (delegated.next_hop === null) {
-    await teardown("remote egress has no addressable host");
-    return fail(
+    return failAfterTeardown(
       "apply_ingress",
       SCHEDULER_ERROR_CODES.invariant_violated,
       `远端出口 ${peerPanelId} 未返回可寻址的 node_address，拒绝用猜测的地址启动入口`,
+      "remote egress has no addressable host",
       { revision },
     );
   }
@@ -2516,11 +2587,16 @@ async function applyFederatedRelayTunnel(
     ...tlsPathsFor(row, protocol),
   });
   if (!ingressDispatch.ok) {
-    await teardown("ingress apply failed");
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
-      revision,
-      meta: { command_id: ingressDispatch.commandId ?? null },
-    });
+    return failAfterTeardown(
+      "apply_ingress",
+      mapDispatchCode("ingress", ingressDispatch),
+      ingressDispatch.error,
+      "ingress apply failed",
+      {
+        revision,
+        meta: { command_id: ingressDispatch.commandId ?? null },
+      },
+    );
   }
   steps.push({ step: "apply_ingress", ok: true, meta: { command_id: ingressDispatch.result.commandId, revision } });
   steps.push({ step: "ingress_ack", ok: true, meta: { applied_revision: ingressDispatch.result.revision } });
