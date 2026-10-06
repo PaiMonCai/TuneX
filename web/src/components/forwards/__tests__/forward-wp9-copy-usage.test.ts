@@ -116,9 +116,6 @@ describe("V4-WP9 复制 Forward — 走真实 create 契约", () => {
     expect(name.endsWith(suffix)).toBe(true);
   });
 
-);
-
-);
 });
 
 describe("V4-WP9 auto-port — 空值给明确提示，不给假端口号", () => {
