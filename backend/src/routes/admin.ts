@@ -5,6 +5,7 @@
  * 具体资源路径需与 permissions.ts 的 apiPrefixes 对齐，否则 fail-closed 403。
  */
 import { Hono } from "hono";
+import { SystemConfigName } from "@prisma/client";
 import { db } from "../db.ts";
 import { systemConfig } from "../services/config.ts";
 import { licenseService } from "../services/license.ts";
@@ -195,16 +196,31 @@ adminRoutes.post("/node/:id/credential/revoke", async (c) => {
 /* ------------------------------------------------------------------ *
  * settings — /api/admin/system/config* → key: settings
  * ------------------------------------------------------------------ */
-adminRoutes.get("/system/config", async (c) =>
-  c.json({ data: await systemConfig.listAll() }),
-);
+const SECRET_CONFIG_NAMES = new Set<string>(["SMTP_PASS", "RESEND_API_KEY", "CHATWOOT_TOKEN"]);
+const CONFIG_NAMES = new Set<string>(Object.values(SystemConfigName));
+
+adminRoutes.get("/system/config", async (c) => {
+  const rows = await systemConfig.listAll();
+  return c.json({
+    data: rows.map((row) =>
+      SECRET_CONFIG_NAMES.has(row.name)
+        ? { ...row, value: "", secret_configured: row.value.length > 0 }
+        : row,
+    ),
+  });
+});
 
 adminRoutes.put("/system/config/:name", async (c) => {
   const name = c.req.param("name");
+  if (!CONFIG_NAMES.has(name)) return c.json({ error: "未知配置项" }, 400);
   const body = await c.req.json().catch(() => ({}));
   if (typeof body?.value !== "string") return c.json({ error: "value 必须为字符串" }, 400);
   await systemConfig.setConfig(name, body.value);
-  return c.json({ data: { name, value: body.value } });
+  return c.json({
+    data: SECRET_CONFIG_NAMES.has(name)
+      ? { name, value: "", secret_configured: body.value.length > 0 }
+      : { name, value: body.value },
+  });
 });
 
 /* ------------------------------------------------------------------ *
