@@ -749,6 +749,22 @@ GET /api/notifications/deliveries → 200
 - `routes/__tests__/forward-list-route.test.ts`（无人在写）⇒ 一句话给 `backend-truth`：做 task-29 时顺手 5 分钟可收，否则单独立单，**不污染主切片**。
 - `services/__tests__/notifications/deliveries.test.ts` ⇒ 交回 `notify-center`（其领地；同样 1 hunk 或改用"模板字符串 + 子进程"隔离形态）。
 
+## 3.33 Round 37：退出条件 #1 的部署演练切片 + 一条同类的真话缺口
+
+### 派出 `task-31`：**照文档做一次全新部署演练**（退出条件 #1 的实质）
+现状：`README:25` 的快速部署段（`cp .env.example .env` → `docker compose up -d --build` → `/healthz` + Web `:9091`）+ `docs/production-deploy.md` + `scripts/ops/install.sh --dry-run/--check` **从未被真正跑过一次**。而文档本身就是产品的一部分——"照着做能成功"才是这条退出条件的实质。
+要求：**完全隔离**（独立 project/端口/卷，基线 `docker ps` 前后对照、绝不碰 `tunex-it-*` 与用户容器）+ **只按文档做**（遇任何要"猜"的地方都计为发现，不许凭经验绕过）+ 走通证据链（**迁移与管理员账号怎么产生**、worker cron 是否真起、**真实 Agent enroll 并 online**）+ **真实墙钟耗时**与"30 分钟"对比 + **文档缺陷清单**（`文件:行` + 现象 + 建议）+ 如实列出无法验证的部分。
+
+### Lead 修掉一条 R5-A 点出的真话缺口（`dec70f4`）
+DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样"，**没说"关着就不会跟随、要你自己维护"** ⇒ 用户很容易以为"绑定了域名就会跟着入口走"，而记录其实只在绑定那一刻写一次。
+修复：新增 `autoResolveOffHint`（zh/en，含可执行下一步：解绑后在绑定表单勾上自动同步），**仅在关闭时渲染**（开启时不出现，避免变成"开着也警告"）；断言两条方向都有。
+（**自我记录一次同类失误**：我在写这段 zh 文案时又用了 Markdown `**粗体**`，会原样显示星号——与之前 routes 页那次同一个错误，已立刻改掉。教训：**用户可见字符串里不得出现 Markdown 标记**。）
+
+### 门禁状态（轮内快照）
+- web：`tsc` 0 错 + **1312 pass / 0 fail**（67 文件，含 N4 新测试）
+- backend：`tsc` 0 错；全量 2927 条里 **2 条失败 = `backend-truth` 正在做的 task-29 中途态**（`agent/internal/identityprobe/` 等），不是回归
+- N4 真机验证（`notify-center`）：脱敏（完整地址逐字不出现、`***@example.com` + `target_masked` + `targets_count`）、**跨空间隔离**、**平台行不下发**、`error` 二次脱敏（`RCPT TO:<***> returned 550`）、三种 404 逐字同形、`?status=exploded` → 400 fail-closed、`degraded` 与 `failed` **正交**、零残留
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
