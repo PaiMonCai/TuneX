@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeftRight,
-  Loader2,
   Plus,
   Route,
 } from "lucide-react";
@@ -23,6 +22,8 @@ import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
 import { ForwardListControls } from "@/components/forwards/forward-list-controls";
 import { ForwardTable } from "@/components/forwards/forward-table";
 import { ForwardCreateDialog } from "@/components/forwards/forward-create-dialog";
+import { ForwardBatchBar } from "@/components/forwards/forward-batch-bar";
+import { ForwardSummaryCards } from "@/components/forwards/forward-summary-cards";
 import { copiedForwardCreateDraft, emptyForwardCreateDraft } from "@/components/forwards/forward-create-model";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
@@ -39,7 +40,6 @@ import {
   forwardErrorActions,
   forwardErrorInfo,
 } from "@/lib/forward-status";
-import { formatBytes } from "@/lib/utils";
 import type {
   ForwardBatchAction,
   ForwardSummary,
@@ -698,40 +698,7 @@ export function ForwardWorkspace() {
         </div>
       </div>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTotal")}</div>
-            <div className="mt-1 text-2xl font-semibold">{summary?.total ?? (loading ? "—" : 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
-              {t("forward.direct")} {summary?.direct ?? 0} · {t("forward.relay")} {summary?.relay ?? 0}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorActive")}</div>
-            <div className="mt-1 text-2xl font-semibold">{summary?.active ?? (loading ? "—" : 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
-              {t("forward.statusPending")} {summary?.pending ?? 0} · {t("forward.statusSuspended")} {summary?.suspended ?? 0}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttention")}</div>
-            <div className="mt-1 text-2xl font-semibold">{summary?.error ?? (loading ? "—" : 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttentionHint")}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTraffic")}</div>
-            <div className="mt-1 text-2xl font-semibold">{formatBytes(summary?.traffic ?? 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorTrafficHint")}</div>
-          </CardContent>
-        </Card>
-      </div>
+      <ForwardSummaryCards summary={summary} loading={loading} t={t} />
 
       {error ? (
         <div
@@ -746,63 +713,14 @@ export function ForwardWorkspace() {
         </div>
       ) : null}
 
-      {/*
-        V4-WP9 §13.6 批量操作栏：仅在选中 ≥1 条时出现，避免占用常态空间。
-        只提供可逆动作（重试 / 暂停 / 恢复）——批量删除被有意排除，
-        理由见 reports/v4-wp9-plan.md §3（不可逆 + 部分成功无法解释）。
-      */}
-      {selectedIds.size > 0 ? (
-        <div
-          className="flex flex-wrap items-center gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--muted)]/40 p-3"
-          data-testid="forward-batch-bar"
-        >
-          <span className="text-sm font-medium" data-testid="forward-batch-count">
-            {L("forward.batchSelected", { count: selectedIds.size })}
-          </span>
-          <Button
-            size="sm"
-            variant="outline"
-            data-testid="forward-batch-retry"
-            disabled={batchBusy}
-            onClick={() => void runBatch("retry")}
-          >
-            {batchBusy ? <Loader2 className="size-4 animate-spin" /> : null}
-            {L("forward.batchRetry")}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            data-testid="forward-batch-suspend"
-            disabled={batchBusy}
-            onClick={() => void runBatch("suspend")}
-          >
-            {L("forward.batchSuspend")}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            data-testid="forward-batch-resume"
-            disabled={batchBusy}
-            onClick={() => void runBatch("resume")}
-          >
-            {L("forward.batchResume")}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            data-testid="forward-batch-clear"
-            disabled={batchBusy}
-            onClick={clearSelection}
-          >
-            {L("forward.batchClear")}
-          </Button>
-          {batchError ? (
-            <span className="text-xs text-[var(--destructive)]" role="alert" data-testid="forward-batch-error">
-              {batchError}
-            </span>
-          ) : null}
-        </div>
-      ) : null}
+      <ForwardBatchBar
+        count={selectedIds.size}
+        busy={batchBusy}
+        error={batchError}
+        text={L}
+        onRun={(action) => void runBatch(action)}
+        onClear={clearSelection}
+      />
 
       {/* 出错时不能落到「还没建转发」的空态：那会把一次加载失败讲成「你没有数据」 */}
       {!loading && !error && total === 0 && !hasFilters ? (
