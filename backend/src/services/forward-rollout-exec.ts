@@ -90,6 +90,12 @@ export interface PreparedResource {
   port: number | null;
   /** `releaseLease` 用的租约主键；binding 用 binding pair。 */
   handle: number | { ingress_node_id: number; egress_node_id: number } | null;
+  /**
+   * false = 这条 lease 在本轮开始前就已由同一 tunnel 持有，仅作为端口事实复用；
+   * PREPARE 失败时绝不能释放它，否则会把仍服务旧版本的 durable ownership 一起拆掉。
+   * 缺省/true = 本轮 acquire/revive 的资源，失败清理应回收。
+   */
+  owned_by_rollout?: boolean;
 }
 
 /** 一个 step 的执行结果。 */
@@ -837,10 +843,44 @@ async function runStep(
         (declareFederated && step.direction === "ingress"
           ? await existingIngressPort(deps, ctx.tunnelId)
           : null);
+      const leaseType = step.direction === "egress" ? "egress" : "ingress";
+      // `AcquirePortResult.reused` 同时覆盖“已有 active lease”与“revive released row”，
+      // 但失败补偿只应保留前者。先拍一张 active ownership 快照，才能区分这两种语义。
+      let preexistingActiveLeaseId: number | null = null;
+      if (preferredPort != null) {
+        const before = (await deps.db.nodePortLease.findMany({
+          where: {
+            node_id: nodeId,
+            port: preferredPort,
+            tunnel_id: ctx.tunnelId,
+            lease_type: leaseType,
+            status: "active",
+          },
+          select: { id: true, node_id: true, port: true, tunnel_id: true, lease_type: true, status: true },
+        })) as Array<{
+          id: number;
+          node_id?: number;
+          port?: number;
+          tunnel_id?: number | null;
+          lease_type?: string;
+          status?: string;
+        }>;
+        const held = before.find(
+          (row) =>
+            row.id > 0 &&
+            (row.node_id === undefined || row.node_id === nodeId) &&
+            (row.port === undefined || row.port === preferredPort) &&
+            (row.tunnel_id === undefined || row.tunnel_id === ctx.tunnelId) &&
+            (row.lease_type === undefined || row.lease_type === leaseType) &&
+            (row.status === undefined || row.status === "active"),
+        );
+        preexistingActiveLeaseId = held?.id ?? null;
+      }
+
       const outcome: AcquirePortOutcome = await acquirePort(
         {
           nodeId,
-          leaseType: step.direction === "egress" ? "egress" : "ingress",
+          leaseType,
           preferredPort,
           tunnelId: ctx.tunnelId,
           // 同上：本隧道自己的腿占着的端口不算冲突（幂等编辑/重试/还原端口都必须能过）。
@@ -859,6 +899,7 @@ async function runStep(
           node_id: nodeId,
           port: outcome.result.port,
           handle: outcome.result.leaseId,
+          owned_by_rollout: preexistingActiveLeaseId !== outcome.result.leaseId,
         },
       };
     }
@@ -2538,9 +2579,11 @@ async function releasePrepared(
   const leaseErrors: string[] = [];
   for (const p of ctx.prepared) {
     if (p.kind !== "lease" || typeof p.handle !== "number") continue;
+    if (p.owned_by_rollout === false) continue;
     try {
-      const released = await releaseLease({ leaseId: p.handle }, { db: db as never });
-      if (!released) leaseErrors.push(`lease ${p.handle}: not active or not found`);
+      // false = 已经被并发清理/回收；portPool 明确定义为幂等成功语义，不应
+      // 因“没有 active 行可改”把整个 rollout 升级成 degraded。
+      await releaseLease({ leaseId: p.handle }, { db: db as never });
     } catch (error) {
       leaseErrors.push(
         `lease ${p.handle}: ${error instanceof Error ? error.message : String(error)}`,
