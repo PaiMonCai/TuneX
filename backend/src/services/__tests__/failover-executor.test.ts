@@ -28,6 +28,7 @@ import {
   type DecisionFacts,
   type FailoverExecutorDeps,
   type FailoverExecutorEvent,
+  type FailoverFactsReaderOptions,
   type PlacementMoveRequest,
   type PlacementMoveResult,
 } from "../failover-executor.ts";
@@ -688,7 +689,10 @@ function fakeDb(state: FakeDbState) {
   };
 }
 
-function readerOptions(state: FakeDbState, overrides: Record<string, unknown> = {}) {
+function readerOptions(
+  state: FakeDbState,
+  overrides: Partial<FailoverFactsReaderOptions> = {},
+): FailoverFactsReaderOptions {
   return {
     db: fakeDb(state),
     loadLease: async () => state.lease,
@@ -696,7 +700,7 @@ function readerOptions(state: FakeDbState, overrides: Record<string, unknown> = 
     destinations: () => ({ candidate_node_id: CANDIDATE, preferred_node_id: OWNER }),
     portAvailability: async () => 4,
     ...overrides,
-  } as never;
+  };
 }
 
 function baseState(overrides: Partial<FakeDbState> = {}): FakeDbState {
