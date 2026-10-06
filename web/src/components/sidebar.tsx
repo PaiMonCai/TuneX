@@ -202,7 +202,9 @@ export function Sidebar({
         className="fixed left-3 top-2.5 z-40 lg:hidden"
         aria-expanded={open}
         aria-controls="app-sidebar-mobile"
-        aria-label="menu"
+        // 图标按钮没有可见文字：这个可访问名称就是它的全部语义，必须跟随语言
+        // （旧实现写死英文 "menu"，中文界面下屏幕阅读器读英文）。
+        aria-label={t("common.menu")}
         onClick={() => setOpen((v) => !v)}
       >
         {open ? <X className="size-5" /> : <Menu className="size-5" />}
@@ -238,15 +240,29 @@ export function Sidebar({
             {renderNav("sidebar-nav-mobile")}
             {footer}
           </div>
-          <button
-            type="button"
-            aria-label="close"
-            tabIndex={-1}
-            className="flex-1 bg-black/40 backdrop-blur-[1px]"
-            onClick={() => setOpen(false)}
-          />
+          <SidebarBackdrop onClose={() => setOpen(false)} />
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * 移动端抽屉的遮罩层按钮（点击关闭抽屉）。
+ *
+ * 单独导出有两个原因：它**没有可见文字**，其 `aria-label` 就是它的全部语义，必须
+ * 跟随语言（旧实现写死英文 "close"）；而抽屉本身只在 `open` 时才渲染，静态渲染拿不到
+ * 它，抽出来才能在不依赖浏览器的情况下断言这条行为。
+ */
+export function SidebarBackdrop({ onClose }: { onClose: () => void }) {
+  const { t } = useI18n();
+  return (
+    <button
+      type="button"
+      aria-label={t("common.closeMenu")}
+      tabIndex={-1}
+      className="flex-1 bg-black/40 backdrop-blur-[1px]"
+      onClick={onClose}
+    />
   );
 }

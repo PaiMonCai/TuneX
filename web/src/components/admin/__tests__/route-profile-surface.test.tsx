@@ -52,6 +52,7 @@ import {
   UNKNOWN_ERROR_NEXT_ACTION,
 } from "@/components/admin/route-profiles/route-profile-status";
 import { ApiError } from "@/lib/api";
+import { zh } from "@/lib/i18n/dictionaries";
 import { ROUTE_PROFILE_ERROR_CODES, type RouteProfileTemplate } from "@/lib/types";
 import { expectedConsolePageFile, visibleNavGroups, visibleNavItems } from "@/lib/nav";
 
@@ -196,8 +197,11 @@ describe("C. ordered transit 顺序可见且可操作", () => {
     expect(html).toContain('data-testid="route-profile-editor-transit"');
     expect(html).toContain('data-testid="route-profile-editor-transit-row"');
     expect(html).toContain('data-order="0"');
-    expect(html).toContain('aria-label="move up"');
-    expect(html).toContain('aria-label="move down"');
+    // 图标按钮的可访问名称来自词典（中文界面读中文），不再是写死的英文 "move up"。
+    expect(html).toContain(`aria-label="${zh.admin.routeProfiles.moveUp}"`);
+    expect(html).toContain(`aria-label="${zh.admin.routeProfiles.moveDown}"`);
+    expect(html).not.toContain('aria-label="move up"');
+    expect(html).not.toContain('aria-label="move down"');
     expect(html).toContain('data-testid="route-profile-editor-preview-chain"');
   });
 

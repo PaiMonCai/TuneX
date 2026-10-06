@@ -241,6 +241,19 @@ export function businessRejectionCode(lifecycle: string | null | undefined): Lif
  * 为什么 revoked 归 offline 而不是 waiting：revoke 是**主动**断开机器身份，
  * 节点确实已不在服务；waiting 的语义是「还没装好」，给 revoked 用会让运维
  * 以为还在等安装。
+ *
+ * ── `status` 这一维的写入契约（两个方向都必须存在）──
+ * 本函数把 `status` 当作 Connection 层的闸门列，因此它必须**可恢复**：
+ *   · 反方向（`active → inactive`）：`socket/offline-detector.ts` 的上报过期
+ *     清扫 / 会话结束；
+ *   · 正方向（`inactive → active`）：`services/node-state.ts` 的
+ *     `submitStateReport()` —— 一次通过凭据认证的上报就是「这个 Agent 活着」
+ *     的事实，它与 `last_seen_at` 在同一条 updateMany 里写回 `active`。
+ * 缺了正方向就会形成单向闩锁：任何一次超过
+ * {@link CONNECTION_ONLINE_WINDOW_MS} 的上报中断（新建节点在 Agent 首次上报
+ * 前必然出现）之后，即使上报一直新鲜，这里也永远返回 `offline`。HTTP 轮询型
+ * Agent（无 socket 会话、无 Redis 心跳、无断开标记）没有别的恢复路径。
+ * 两个方向共用同一个窗口常量，`status` 与 `last_seen_at` 因此不会互相矛盾。
  */
 export function deriveConnection(input: {
   status?: string | null;

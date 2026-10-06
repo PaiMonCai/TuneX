@@ -28,6 +28,12 @@ interface NodeRow {
   credential_rotated_at: Date | null;
   credential_last_rejected_at: Date | null;
   node_group: { workspace_id: number | null; is_shared: boolean | null };
+  // ── Connection 层（§13.4.1）的三列事实 ──
+  // schema 默认：`status` = active、`last_seen_at` = NULL（从未上报）、
+  // `lifecycle` = active。E1 的连接真相测试要用它们把「上报 → online」钉住。
+  status: "active" | "inactive";
+  last_seen_at: Date | null;
+  lifecycle: string;
 }
 
 interface StateRow {
@@ -66,6 +72,9 @@ function seedNode(over: Partial<NodeRow> = {}): NodeRow {
     credential_rotated_at: null,
     credential_last_rejected_at: null,
     node_group: { workspace_id: 42, is_shared: false },
+    status: "active",
+    last_seen_at: null,
+    lifecycle: "active",
     ...over,
   };
   nodes.push(row);
@@ -214,6 +223,10 @@ mock.module(new URL("../../redis.ts", import.meta.url).pathname, () => redisMock
 // 复用 user-keys 测试的初始化顺序：db/redis 替身注册完，再 import 被测模块。
 const cred = await import("../node-credential.ts");
 const state = await import("../node-state.ts");
+// 连接态投影是纯函数（不碰 db/redis），静态 import 即可：E1 的断言要覆盖
+// 「上报写库 → 用户侧 GET /api/nodes 的同一条判定链」。
+const { projectUserNode } = await import("../node-view.ts");
+const { CONNECTION_ONLINE_WINDOW_MS } = await import("../node-lifecycle.ts");
 
 // 把 console 也钉住：断言「token 不写日志」需要能看见被测模块的任何 console 调用。
 // 注意：mock.module("console", …) 是进程级副作用，会污染同一进程内后续加载的
@@ -833,6 +846,159 @@ describe("submitStateReport", () => {
     const r = await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("blocked");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* E1 连接真相：新鲜上报 ⇒ online（HTTP-only，无 socket 会话 / 无心跳） */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 与 `socket/offline-detector.ts` 的 `markStaleInactive` **同形**的内存替身：
+ * 只翻 `status === "active"` 且（`last_seen_at < cutoff` 或 `last_seen_at IS NULL`）的行。
+ *
+ * 真实 SQL 谓词（含 `last_seen_at IS NULL` 的三值逻辑）由真库驱动的验证覆盖；
+ * 这里要钉的是**两个方向的分工** —— 清扫只负责 `active → inactive`，
+ * 恢复**必须**来自上报本身（HTTP-only Agent 没有别的恢复路径）。
+ */
+function sweepStaleReports(cutoff: Date): number {
+  let flipped = 0;
+  for (const row of nodes) {
+    if (row.status !== "active") continue;
+    if (row.last_seen_at !== null && row.last_seen_at.getTime() >= cutoff.getTime()) continue;
+    row.status = "inactive";
+    flipped++;
+  }
+  return flipped;
+}
+
+/** 行事实 → 用户侧投影（`GET /api/nodes` 用的同一条判定链：node-view → deriveConnection）。 */
+function viewOf(row: NodeRow) {
+  return projectUserNode({
+    status: row.status,
+    last_seen_at: row.last_seen_at,
+    has_credential: Boolean(row.node_credential_hash),
+    credential_revoked: row.credential_revoked,
+    lifecycle: row.lifecycle,
+  });
+}
+
+describe("E1 连接真相：上报即在线（HTTP-only，无 socket 会话 / 无 Redis 心跳）", () => {
+  const staleCutoff = () => new Date(Date.now() - CONNECTION_ONLINE_WINDOW_MS);
+
+  test("新建节点（status=active、从未上报）会被过期清扫翻成 inactive —— 闩锁的起点", () => {
+    const node = seedNode();
+    // schema 默认：status=active、last_seen_at=NULL（Agent 还没装好）。
+    expect(node.status).toBe("active");
+    expect(node.last_seen_at).toBeNull();
+    // 只要这个「还没上报」的窗口超过 90s（安装必然如此），清扫就把它翻掉。
+    expect(sweepStaleReports(staleCutoff())).toBe(1);
+    expect(node.status).toBe("inactive");
+  });
+
+  test("新鲜上报把 status 收敛回 active，并与 last_seen_at 写成同一份事实", async () => {
+    const node = seedNode({ status: "inactive" }); // 已被清扫闩死在 inactive
+    const key = await cred.issueNodeCredential(node.id);
+
+    const before = Date.now();
+    const r = await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
+    expect(r.ok).toBe(true);
+
+    expect(node.status).toBe("active");
+    expect(node.last_seen_at).not.toBeNull();
+    expect(node.last_seen_at!.getTime()).toBeGreaterThanOrEqual(before);
+    expect(Date.now() - node.last_seen_at!.getTime()).toBeLessThan(5_000);
+
+    // 「这个节点活着」必须是一次写入落地的事实：不能出现
+    // 「时间戳新了、状态还是 inactive」的中间态（否则判定看状态、展示看时间会分叉）。
+    const heartbeatWrites = writes.filter(
+      (w) => w.model === "node" && w.op === "updateMany" && "last_seen_at" in w.data,
+    );
+    expect(heartbeatWrites).toHaveLength(1);
+    expect(heartbeatWrites[0]!.data.status).toBe("active");
+
+    // 用户侧投影因此是 online（GET /api/nodes 的同一条判定链）。
+    expect(viewOf(node).connection).toBe("online");
+    expect(viewOf(node).online).toBe(true);
+  });
+
+  test("上报停止超过窗口 → 清扫翻 inactive → offline", async () => {
+    const node = seedNode({ status: "inactive" });
+    const key = await cred.issueNodeCredential(node.id);
+    await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
+    expect(viewOf(node).connection).toBe("online");
+
+    // 行里的 last_seen_at 停在上报那一刻（真实过期在库里就是这个形状）。
+    node.last_seen_at = new Date(Date.now() - CONNECTION_ONLINE_WINDOW_MS - 1_000);
+    expect(sweepStaleReports(staleCutoff())).toBe(1);
+    expect(node.status).toBe("inactive");
+    expect(viewOf(node).connection).toBe("offline");
+    expect(viewOf(node).online).toBe(false);
+  });
+
+  test("翻转后能恢复：离线闩锁被下一次新鲜上报打开（本缺陷的核心回归）", async () => {
+    const node = seedNode();
+    const key = await cred.issueNodeCredential(node.id);
+
+    // 1) 首次上报 → online
+    await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
+    expect(viewOf(node).connection).toBe("online");
+
+    // 2) 上报中断（Agent/面板重启、网络抖动）→ 清扫翻 inactive → offline
+    node.last_seen_at = new Date(Date.now() - CONNECTION_ONLINE_WINDOW_MS - 5_000);
+    expect(sweepStaleReports(staleCutoff())).toBe(1);
+    expect(node.status).toBe("inactive");
+    expect(viewOf(node).connection).toBe("offline");
+
+    // 3) 上报恢复（HTTP-only：没有 socket 会话、没有心跳 key 能替它翻回来）
+    const r = await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
+    expect(r.ok).toBe(true);
+    expect(node.status).toBe("active");
+    expect(viewOf(node).connection).toBe("online");
+
+    // 4) 再次停止上报 → 再次 offline（方向对称，不是一次性特判）
+    node.last_seen_at = new Date(Date.now() - CONNECTION_ONLINE_WINDOW_MS - 5_000);
+    expect(sweepStaleReports(staleCutoff())).toBe(1);
+    expect(viewOf(node).connection).toBe("offline");
+  });
+
+  test("已撤销凭据的上报到不了写点：status 不会被「假装在线」", async () => {
+    const node = seedNode({ status: "inactive" });
+    const key = await cred.issueNodeCredential(node.id);
+    await cred.revokeNodeCredential(node.id);
+
+    const r = await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.status).toBe(401);
+
+    expect(node.status).toBe("inactive");
+    expect(node.last_seen_at).toBeNull();
+    expect(viewOf(node).connection).toBe("offline");
+  });
+
+  test("从未签发凭据的节点：即使 status=active、心跳新鲜也仍是 waiting", () => {
+    const node = seedNode();
+    node.last_seen_at = new Date();
+    const view = viewOf(node);
+    expect(view.connection).toBe("waiting");
+    expect(view.online).toBe(false);
+  });
+
+  test("lifecycle 维护/停用/退役与连接正交：新鲜上报仍 online，但不接受新业务，且写入不碰 lifecycle", async () => {
+    for (const lifecycle of ["maintenance", "disabled", "retiring"] as const) {
+      const node = seedNode({ status: "inactive", lifecycle });
+      const key = await cred.issueNodeCredential(node.id);
+      const r = await state.submitStateReport(bearer(key.plaintext), VALID_REPORT);
+      expect(r.ok).toBe(true);
+
+      const view = viewOf(node);
+      expect(view.connection).toBe("online");
+      expect(view.online).toBe(true);
+      expect(view.accepts_new_business).toBe(false);
+      expect(view.admission_rejection).not.toBeNull();
+      // 上报只写 Connection 层事实，绝不改写 Lifecycle 层（两层正交，§13.4.1）。
+      expect(node.lifecycle).toBe(lifecycle);
+    }
   });
 });
 

@@ -42,6 +42,14 @@ import {
   type ForwardAction,
   type ForwardServiceResult,
 } from "../services/forward-service.ts";
+import {
+  DEFAULT_BUCKET_RETENTION_DAYS,
+  DEFAULT_RAW_RETENTION_HOURS,
+  defaultLatencyHistoryDeps,
+  readLatencySeries,
+} from "../services/latency-history.ts";
+import type { LatencyGranularity } from "../services/latency-history.ts";
+import { targetKeyOf } from "../services/node-state.ts";
 import { parseForwardBatchRequest } from "../services/forward-batch.ts";
 import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
 import {
@@ -442,7 +450,17 @@ function sendDdns<T>(c: Ctx, result: DdnsResult<T>, successStatus: 200 | 201 = 2
   return c.json({ data: result.value }, successStatus);
 }
 
-/** 读一条转发的 DNS 前门状态（含推导出的期望值集，见 `dnsBindingState`）。 */
+/**
+ * 读一条转发的 DNS 前门状态（含推导出的期望值集，见 `dnsBindingState`）。
+ *
+ * **零副作用**：只有这一条 `findFirst`（`authorizeForward` 的 creator 查询只在非全权角色上
+ * 发生），不写库、不外呼。
+ *
+ * select 里三个 V5-WP17.3 读投影列（`dns_auto_resolve` / `dns_attempt_count` /
+ * `dns_next_attempt_at`）是给 Web 的**服务端真相**：前门开关与退避进度禁止前端自己算
+ * （执行器判的就是这三列，前端重算必然与之漂移）。它们都是非敏感的标量——**凭据**（provider
+ * 的 `config` 封存串）与封存材料一律不进这个 select，本路由任何时候都拿不到明文/密文。
+ */
 forwardsRoutes.get("/:id/dns", async (c) => {
   const id = idParam(c, "id");
   if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
@@ -459,6 +477,9 @@ forwardsRoutes.get("/:id/dns", async (c) => {
       dns_synced_at: true,
       dns_verified: true,
       dns_last_error: true,
+      dns_auto_resolve: true,
+      dns_attempt_count: true,
+      dns_next_attempt_at: true,
       ingress_node: { select: { connect_ip: true } },
     },
   })) as
@@ -537,6 +558,329 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
     return c.json({ error: result.error, code: result.code, error_layer: "failover" }, status);
   }
   return c.json({ data: result.value });
+});
+
+/* ================================================================== */
+/* D6 —— 延迟历史读端点（**只读**；注册在任何 `/:id/:参数` catch-all 之前）  */
+/* ================================================================== */
+//
+// 为什么必须在这个位置：文件后段有一个 `post("/:id/:action")` catch-all。GET 目前没有
+// 同形状的 catch-all（`get("/:id")` 只匹配一段），但"以后加一个 `get("/:id/:action")`
+// 就把这条读端点吃掉"是同一类事故（DNS 前门的实测教训见上）。规则统一：**literal
+// 子路由一律放在参数化 catch-all 之前**，并由 `forwards-latency-route.test.ts` 在行为上证明。
+//
+// 数据面：**直接消费** `services/latency-history.ts:readLatencySeries` 的返回。这里
+// 不另写查询、不做插值、不把 `null` 补成 0 —— 「没测到」和「0ms」是两个事实。
+
+/** 窗口上界（小时）：与档案的两层保留期**同源**（`latency-history.ts` 的常量），不另抄数字。 */
+export const LATENCY_WINDOW_MAX_HOURS: Record<LatencyGranularity, number> = {
+  /** 原始样本层：档案只保留 24h，要更久的历史必须读小时桶。 */
+  sample: DEFAULT_RAW_RETENTION_HOURS,
+  /** 小时桶层：保留 30d。 */
+  hour: DEFAULT_BUCKET_RETENTION_DAYS * 24,
+};
+
+/**
+ * 「有没有数据」的四种形状（稳定字符串，Web **必须**按它分支）。
+ *
+ *   · `ok`               —— 有真观测点（每个点仍可能 `latency_ms: null` = 那次不可达）；
+ *   · `no_samples`       —— 观测维度成立，但这个窗口里**一行都没有**（数据缺口：别渲染成 0）；
+ *   · `no_observer`      —— 按构造就不可能有观测（DIRECT / 远端出口 / 无池 / 无目标 / 归属冲突）；
+ *   · `ambiguous_target` —— 出口池有多个目标，一次回答一个序列会藏起其余目标的抖动 ⇒ 拒绝猜。
+ */
+export type ForwardLatencyStatus = "ok" | "no_samples" | "no_observer" | "ambiguous_target";
+
+/** `no_observer` / `ambiguous_target` 的稳定原因码。 */
+export type ForwardLatencyReason =
+  | "direct_not_observed"
+  | "federated_egress"
+  | "no_egress_pool"
+  | "no_active_target"
+  | "dimension_conflict"
+  | "multiple_targets";
+
+const HOUR_MS = 3_600_000;
+
+function parseGranularity(value: string | undefined): LatencyGranularity | null {
+  // 只认服务层自己的词表（`sample` / `hour`）。加别名就是造第二份词汇表。
+  return value === "sample" || value === "hour" ? value : null;
+}
+
+interface LatencyWindow {
+  from: Date;
+  to: Date;
+  hours: number;
+}
+
+type LatencyWindowParse =
+  | { ok: true; window: LatencyWindow }
+  | { ok: false; code: string; message: string; data?: Record<string, unknown> };
+
+/**
+ * 服务端**自己**钳制时间窗口（客户端不能拉一个无上限的区间）。
+ *
+ * 三条口径：
+ *   1. `hours`（[now-Nh, now)）与 `from`+`to` 互斥——两种都给就自相矛盾，**拒绝**而不是
+ *      替客户端选一种（选错就是静默换了横轴）；
+ *   2. 窗口长度**超过该粒度的保留期** ⇒ 400 `window_too_long`（**不静默截短**：
+ *      客户端要 7 天却拿到 24 小时且不知情，就是一条骗人的横轴）；
+ *   3. `to` 在将来 ⇒ 钳制到 `now`（未来不可能有观测，钳制既不多给也不少给）。
+ */
+function parseLatencyWindow(
+  params: { hours?: string; from?: string; to?: string },
+  granularity: LatencyGranularity,
+  now: Date,
+): LatencyWindowParse {
+  const max = LATENCY_WINDOW_MAX_HOURS[granularity];
+  const tooLong = (): LatencyWindowParse => ({
+    ok: false,
+    code: "window_too_long",
+    message: `${granularity} 粒度最多读 ${max} 小时窗口（服务端硬上限）`,
+    data: { max_hours: max, granularity },
+  });
+  const hasHours = params.hours !== undefined;
+  const hasFrom = params.from !== undefined;
+  const hasTo = params.to !== undefined;
+  if (!hasHours && !hasFrom && !hasTo) {
+    return { ok: false, code: "missing_window", message: "缺少时间窗口：给 hours，或同时给 from 与 to" };
+  }
+  if (hasHours && (hasFrom || hasTo)) {
+    return { ok: false, code: "invalid_window", message: "hours 与 from/to 互斥，只能给一种" };
+  }
+  if (hasHours) {
+    const n = Number(params.hours);
+    if (!Number.isInteger(n) || n < 1) {
+      return { ok: false, code: "invalid_window", message: "hours 必须是 ≥1 的整数" };
+    }
+    if (n > max) return tooLong();
+    return {
+      ok: true,
+      window: { from: new Date(now.getTime() - n * HOUR_MS), to: new Date(now.getTime()), hours: n },
+    };
+  }
+  if (!hasFrom || !hasTo) {
+    return { ok: false, code: "invalid_window", message: "from 与 to 必须成对给出" };
+  }
+  const from = new Date(params.from as string);
+  const to = new Date(params.to as string);
+  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+    return { ok: false, code: "invalid_window", message: "from/to 必须是可解析的时间（ISO 8601）" };
+  }
+  const clampedTo = to.getTime() > now.getTime() ? new Date(now.getTime()) : to;
+  if (from.getTime() >= clampedTo.getTime()) {
+    return {
+      ok: false,
+      code: "invalid_window",
+      message: "窗口是半开区间 [from, to)，必须 from < to（窗口不能全落在将来）",
+    };
+  }
+  const spanHours = (clampedTo.getTime() - from.getTime()) / HOUR_MS;
+  if (spanHours > max) return tooLong();
+  return { ok: true, window: { from, to: clampedTo, hours: Math.round(spanHours * 1000) / 1000 } };
+}
+
+/** 本端点用到的 Tunnel 列（只读投影；凭据/内部材料一律不在 select 里）。 */
+interface ForwardLatencyRow {
+  tunnel_mode: string | null;
+  egress_node_id: number | null;
+  egress_pool_id: number | null;
+  federated_egress_peer: string | null;
+}
+
+type DimensionResolution =
+  | { ok: true; observer_node_id: number; target_key: string }
+  | { ok: false; status: "no_observer"; reason: ForwardLatencyReason }
+  | { ok: false; status: "ambiguous_target"; reason: ForwardLatencyReason; candidate_targets: number };
+
+/**
+ * 从**已授权**的 Forward 推导观测维度 `(observer_node_id, target_key)`。
+ *
+ * ── 维度是服务端事实，不是客户端参数 ──
+ * 这两个值**绝不**从 query 取：`target_latency_sample` 只按 (node_id, target_key) 存，
+ * 没有 workspace 列。让客户端指定 target_key 就等于让任何 Workspace 的用户读别的租户
+ * 的 `host:port` 延迟历史（一个现成的跨租户探针）。所以维度只能从这条已授权的转发推。
+ *
+ * ── 口径（与写入方对齐，不是猜）──
+ *   · 观测方 = **出口节点**：样本由节点的 state report 携带
+ *     (`node-state.ts:archiveObservationSamples` ← `syncTargetObservations`)，而 Agent 的
+ *     观测器只枚举"本节点服务的**出口池**目标"（`agent/internal/targetobs/observer.go`
+ *     + `internal/manager/egress.go:DesiredTargets`）。
+ *   · 目标 = 该出口池**active** 目标，按 `order_by`/`id` 升序 —— 与生成 targets 快照的
+ *     唯一实现 `forward-revision.ts:927-933` 同一口径。
+ *   · 入口节点维度**不存在**：DIRECT 由入口节点自己的 forwarder 直拨目标，但观测器不看
+ *     DIRECT 的 `targets`（`orchestrator.dispatchDirect` 下发的是空 targets），所以那半边
+ *     从来没有任何样本 —— 如实报 `no_observer`，不拿 0 顶替、不假装"一切正常"。
+ */
+async function resolveForwardLatencyDimension(row: ForwardLatencyRow): Promise<DimensionResolution> {
+  if (row.tunnel_mode !== "relay") {
+    return { ok: false, status: "no_observer", reason: "direct_not_observed" };
+  }
+  if (row.federated_egress_peer !== null) {
+    // 出口腿在 peer panel：观测由**那边的**节点上报、落在**那边的**档案里。
+    // 本 panel 只能说"我这边没有"，不能说"目标没抖动"。
+    return { ok: false, status: "no_observer", reason: "federated_egress" };
+  }
+  if (row.egress_pool_id === null || row.egress_node_id === null) {
+    return { ok: false, status: "no_observer", reason: "no_egress_pool" };
+  }
+  const pool = await db.egressPool.findUnique({
+    where: { id: row.egress_pool_id },
+    select: {
+      id: true,
+      node_id: true,
+      targets: {
+        where: { status: "active" },
+        orderBy: [{ order_by: "asc" }, { id: "asc" }],
+        select: { host: true, port: true },
+      },
+    },
+  });
+  if (!pool) return { ok: false, status: "no_observer", reason: "no_egress_pool" };
+  if (pool.node_id !== row.egress_node_id) {
+    // 池的主人 ≠ 这条转发的出口节点：下发事实与归属对不上，**不挑一个信**。
+    return { ok: false, status: "no_observer", reason: "dimension_conflict" };
+  }
+  const keys: string[] = [];
+  for (const target of pool.targets) {
+    // 身份归一化只有一份实现（`node-state.ts:targetKeyOf`）：自己拼 `host:port` 会让
+    // 档案里真实存在的目标在界面上变成"没有证据"。
+    const key = targetKeyOf(target.host, target.port);
+    if (key !== null && !keys.includes(key)) keys.push(key);
+  }
+  if (keys.length === 0) return { ok: false, status: "no_observer", reason: "no_active_target" };
+  if (keys.length > 1) {
+    // `readLatencySeries` 一次只回答一个 target_key；挑第一个 = 把其余目标的抖动藏起来。
+    // 只报数量（不列 host:port 清单，也不造一个客户端可选 target 的第二入口）。
+    return { ok: false, status: "ambiguous_target", reason: "multiple_targets", candidate_targets: keys.length };
+  }
+  return { ok: true, observer_node_id: row.egress_node_id, target_key: keys[0] as string };
+}
+
+/**
+ * `GET /api/forwards/:id/latency` —— 延迟历史（**只读**，零副作用）。
+ *
+ * 权限：`forward:read`（与 topology/diagnose 同一条：它不改 desired、不加 revision、
+ * 不发命令、不产生业务流量）。作用域：所有查询都带 `workspace_id`，跨 Workspace 与
+ * "真的不存在"返回**逐字同形**的 404（不泄露存在性）。
+ *
+ * 错误码（稳定）：
+ *   · 400 `invalid_input`         —— id 不是正整数；
+ *   · 400 `invalid_granularity`   —— granularity 缺失/不是 sample|hour；
+ *   · 400 `missing_window`        —— 三种窗口参数一个都没给；
+ *   · 400 `invalid_window`        —— 形态非法（hours 非正整数 / from-to 不成对 / 不可解析 / from≥to）；
+ *   · 400 `window_too_long`       —— 窗口超过该粒度上限（带 `data.max_hours`）；
+ *   · 404 `not_found`             —— 转发不存在或不属于当前 Workspace；
+ *   · 409 `raw_window_expired`    —— `granularity=sample` 且窗口下界早于原始样本保留期：
+ *     **这是"档案里已经没有那段时间"**，与"那段时间没有观测"（200 `no_samples`）是两件事，
+ *     调用方必须能分开（这正是 `readLatencySeries` 拒绝而不是返回空数组的理由）。
+ */
+forwardsRoutes.get("/:id/latency", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "read");
+  if (denied) return denied;
+  const ws = workspace(c);
+
+  // 先定作用域再解析参数：不存在/跨 Workspace 一律 404，且响应体与参数怎么给无关。
+  const row = (await db.tunnel.findFirst({
+    where: { id, workspace_id: ws.id, category: "port_forward" },
+    select: {
+      tunnel_mode: true,
+      egress_node_id: true,
+      egress_pool_id: true,
+      federated_egress_peer: true,
+    },
+  })) as ForwardLatencyRow | null;
+  if (!row) {
+    return c.json({ error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+  }
+
+  const granularity = parseGranularity(c.req.query("granularity"));
+  if (granularity === null) {
+    return c.json(
+      { error: "granularity 必须是 sample 或 hour", code: "invalid_granularity", error_layer: "input" },
+      400,
+    );
+  }
+  const now = new Date();
+  const parsed = parseLatencyWindow(
+    { hours: c.req.query("hours"), from: c.req.query("from"), to: c.req.query("to") },
+    granularity,
+    now,
+  );
+  if (!parsed.ok) {
+    return c.json(
+      { error: parsed.message, code: parsed.code, error_layer: "input", data: parsed.data },
+      400,
+    );
+  }
+  const { window } = parsed;
+  const mode = row.tunnel_mode === "relay" ? "relay" : "direct";
+  const windowView = { from: window.from.toISOString(), to: window.to.toISOString(), hours: window.hours };
+
+  const dimension = await resolveForwardLatencyDimension(row);
+  if (!dimension.ok) {
+    // 200 + 明确的 status：**这不是空的序列**，是"没有可观测维度/无法归属"。
+    // 用 200 是因为请求本身完全合法；用 `status` 区分则是因为空数组会被读成"当时一切正常"。
+    return c.json({
+      data: {
+        forward_id: id,
+        mode,
+        granularity,
+        window: windowView,
+        dimension: null,
+        status: dimension.status,
+        reason: dimension.reason,
+        ...(dimension.status === "ambiguous_target"
+          ? { candidate_targets: dimension.candidate_targets }
+          : {}),
+        series: [],
+        truncated: false,
+      },
+    });
+  }
+
+  const series = await readLatencySeries(
+    defaultLatencyHistoryDeps(),
+    {
+      node_id: dimension.observer_node_id,
+      target_key: dimension.target_key,
+      from: window.from,
+      to: window.to,
+      granularity,
+    },
+    now,
+  );
+  if (!series.ok) {
+    // `bad_window` 是防御性的（上面的解析已挡住），仍如实映射，不吞成 200 空序列。
+    if (series.reason === "bad_window") {
+      return c.json({ error: "时间窗口不合法", code: "invalid_window", error_layer: "input" }, 400);
+    }
+    return c.json(
+      {
+        error: "该窗口的原始样本已按保留期清理（原始层只覆盖最近 24 小时）；改用 granularity=hour 或把窗口前移",
+        code: "raw_window_expired",
+        error_layer: "retention",
+      },
+      409,
+    );
+  }
+
+  return c.json({
+    data: {
+      forward_id: id,
+      mode,
+      granularity: series.granularity,
+      window: windowView,
+      // 维度照实回显：调用方必须知道这条线是"哪个节点看哪个目标"，而不是"这条转发"。
+      dimension: { observer_node_id: dimension.observer_node_id, target_key: dimension.target_key },
+      status: series.points.length === 0 ? "no_samples" : "ok",
+      reason: null,
+      series: series.points,
+      // 命中 `MAX_SERIES_POINTS` 被截断时显式标注——不许把截断过的线当成完整曲线。
+      truncated: series.truncated,
+    },
+  });
 });
 
 /**

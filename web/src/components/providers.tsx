@@ -51,6 +51,17 @@ export function useI18n(): I18nContextValue {
   return ctx;
 }
 
+/**
+ * 安全读取当前 i18n 上下文：没有 `<I18nProvider>` 时返回 `null`，**不抛错**。
+ *
+ * 给「可能在 Provider 之外被渲染」的共享 primitive 用（如 `ui/dialog` 的关闭按钮）：
+ * 它们属于任何页面都可能直接用的展示层，不应该因为一次隔离渲染（单测、错误回退）
+ * 就让整棵子树抛异常。真实页面始终由根布局的 `AppProviders` 包住。
+ */
+export function useI18nOptional(): I18nContextValue | null {
+  return useContext(I18nContext);
+}
+
 export function AppProviders({ locale, dict, children }: { locale: Locale; dict: Dictionary; children: React.ReactNode }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>

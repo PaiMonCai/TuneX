@@ -22,6 +22,15 @@
  *
  * 身份校验用的是节点上**已有**的 agent.env，在容器内读取、只打印 HTTP 状态码：
  * 凭据既不进脚本、也不进日志、也不回到 Panel。
+ *
+ * ── 身份校验的两个真实约束（已在标准 Alpine Agent 镜像上复现） ──
+ *
+ * 1. `docker exec` 拿到的是容器的 Config.Env，**不是** PID 1 的运行时环境。安装
+ *    脚本只把 agent.env 挂进容器、由 entrypoint 现场 source，`docker run` 没有
+ *    `-e TUNEX_NODE_CREDENTIAL`，所以 exec 里 `$TUNEX_NODE_CREDENTIAL` 是空的。
+ *    凭据必须在容器内重新 source agent.env 之后再使用。
+ * 2. 标准镜像里**没有 curl**，只有 busybox 自带的 wget。两个都要探测；两个都没有
+ *    （或超时、或没配地址）时，结论只能是"未校验"，绝不能显示成通过。
  */
 
 import { redactText } from "./redaction.ts";
@@ -164,8 +173,15 @@ export interface RenderUpgradeOptions {
   containerName?: string;
   /** 容器的 stop-timeout（秒）。默认与安装脚本一致。 */
   stopTimeoutS?: number;
-  /** 身份校验用的 Panel 地址；缺省则跳过在线校验（脚本会明确说出来）。 */
+  /**
+   * 身份校验用的 Panel 地址（面板对外可达地址，见 TUNEX_PUBLIC_PANEL_URL）。
+   *
+   * 缺省时脚本会回落到节点 agent.env 里记录的 `TUNEX_PANEL_HTTP_URL`（安装脚本
+   * 写进去的那个）；两者都取不到时，脚本把结论明确标成"未校验"，而不是当成通过。
+   */
   panelURL?: string | null;
+  /** 身份校验的有界等待（秒）。超时即"未校验"，不让脚本无限卡住。 */
+  checkTimeoutS?: number;
 }
 
 /**
@@ -181,6 +197,7 @@ export function renderNodeUpgradeScript(
 ): RenderedUpgrade {
   const container = safeToken(options.containerName?.trim() || facts.container_name?.trim() || "tunex-agent", 64) || "tunex-agent";
   const stopTimeout = options.stopTimeoutS ?? 15;
+  const checkTimeout = options.checkTimeoutS ?? 15;
   const panel = safeToken((options.panelURL ?? "").replace(/\/+$/, ""), 255);
   const rollbackHint =
     `docker stop -t ${stopTimeout} ${container} && docker rm -f ${container}，再用旧镜像重新运行安装脚本`;
@@ -198,6 +215,7 @@ set -eu
 CONTAINER="${container}"
 TARGET_IMAGE="${image}"
 STOP_TIMEOUT="${stopTimeout}"
+CHECK_TIMEOUT="${checkTimeout}"
 PANEL="${panel}"
 
 log() { printf 'tunex-upgrade: %s\\n' "$*"; }
@@ -271,19 +289,74 @@ if ! docker inspect --format '{{.State.Running}}' "$CONTAINER" | grep -q true; t
   die "新版本启动后退出，已回退"
 fi
 
-if [ -n "$PANEL" ]; then
-  # 只打印 HTTP 状态码：凭据在容器内读取，绝不回显、绝不外传。
-  CODE="$(docker exec "$CONTAINER" sh -c 'curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$0/api/internal/node/snapshot"' "$PANEL" 2>/dev/null || true)"
+# 身份校验只承认一种"通过"：Panel 明确回 HTTP 200。其余一切情况（超时、拿不到
+# 状态码、容器里没有 HTTP 工具、没有可用的 Panel 地址、其它状态码）都标成"未校验"，
+# 并在最后一行再次说出来 —— 操作者不能从"升级完成"里读出虚假的安全感。
+#
+# 两个真实约束（已在标准 Alpine Agent 镜像上复现，别再退回旧写法）：
+#   · docker exec 看到的是容器 Config.Env，不是 entrypoint 现场 source 的
+#     agent.env；凭据必须在容器内重新 source 后再用，绝不能指望 exec 的环境变量。
+#   · 镜像里没有 curl，只有 busybox 的 wget；两者都探测。
+VERIFIED="no"
+REASON="尚未执行身份校验"
+PROBE="$(docker exec "$CONTAINER" sh -c '
+  # 先判可读再 source：source 是 POSIX 特殊内建，文件缺失时非交互 shell 会直接退出，
+  # 连 "|| ..." 都不会执行（已在 busybox ash 上复现），所以不能靠它兜底。
+  [ -r /run/tunex-agent/agent.env ] || { printf "unverified:env_unreadable\\n"; exit 0; }
+  set -a
+  . /run/tunex-agent/agent.env
+  set +a
+  [ -n "\${TUNEX_NODE_CREDENTIAL:-}" ] || { printf "unverified:no_credential\\n"; exit 0; }
+  BASE="$1"
+  [ -n "$BASE" ] || BASE="\${TUNEX_PANEL_HTTP_URL:-}"
+  [ -n "$BASE" ] || { printf "unverified:no_panel_url\\n"; exit 0; }
+  URL="\${BASE%/}/api/internal/node/snapshot"
+  if command -v curl >/dev/null 2>&1; then
+    CODE="$(curl -s -o /dev/null -w "%{http_code}" --max-time "$2" -H "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    OUT="$(wget -S -O /dev/null -T "$2" --header "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>&1 || true)"
+    CODE="$(printf "%s\\n" "$OUT" | grep -oE "HTTP/[0-9.]+ [0-9]{3}" | tail -n 1 | grep -oE "[0-9]{3}$")"
+  else
+    printf "unverified:no_http_tool\\n"; exit 0
+  fi
   case "$CODE" in
-    200) log "身份校验通过（HTTP 200）：同一个 node_id/agent_id 已重新连上 Panel" ;;
-    401|403) log "身份校验失败（HTTP $CODE）"; restore_previous; die "新进程认证失败，已回退" ;;
-    *) log "未能完成身份校验（HTTP $\{CODE:-none}）；容器在运行，请稍后在 Panel 查看状态" ;;
+    ""|000) printf "unverified:no_response\\n" ;;
+    *) printf "http:%s\\n" "$CODE" ;;
   esac
+' sh "$PANEL" "$CHECK_TIMEOUT" 2>/dev/null || true)"
+
+case "$PROBE" in
+  http:200)
+    VERIFIED="yes"
+    log "身份校验通过（HTTP 200）：同一个 node_id/agent_id 已重新连上 Panel" ;;
+  http:401|http:403)
+    log "身份校验失败（HTTP \${PROBE#http:}）"
+    restore_previous
+    die "新进程认证失败，已回退" ;;
+  http:*)
+    REASON="Panel 返回 HTTP \${PROBE#http:}（既不是 200，也不是 401/403）" ;;
+  unverified:no_panel_url)
+    REASON="没有可用的 Panel 地址（未配置 TUNEX_PUBLIC_PANEL_URL，节点 agent.env 里也没有 TUNEX_PANEL_HTTP_URL）" ;;
+  unverified:env_unreadable)
+    REASON="容器内读不到 /run/tunex-agent/agent.env" ;;
+  unverified:no_credential)
+    REASON="容器内 agent.env 里没有凭据" ;;
+  unverified:no_http_tool)
+    REASON="新容器里既没有 curl 也没有 wget，无法在容器内发起认证请求" ;;
+  unverified:no_response)
+    REASON="认证请求在 \${CHECK_TIMEOUT} 秒内没有拿到 HTTP 响应（超时或网络不可达）" ;;
+  *)
+    REASON="完全没有取到可判定的结论（docker exec 可能失败）" ;;
+esac
+
+if [ "$VERIFIED" = "yes" ]; then
+  log "升级完成：当前运行 $TARGET_IMAGE，节点身份与 Forward 关系未变（身份校验：通过）"
 else
-  log "未提供 Panel 地址，跳过身份校验；请在 Panel 确认节点重新上报"
+  log "身份校验：未校验 —— $REASON"
+  log "升级完成：当前运行 $TARGET_IMAGE，节点身份与 Forward 关系未变"
+  log "提醒：本次升级没有通过身份校验，不要当成已校验通过；请在 Panel 确认该节点重新上报后再放回业务"
 fi
 
-log "升级完成：当前运行 $TARGET_IMAGE，节点身份与 Forward 关系未变"
 log "如需手工回退：先 docker stop -t $STOP_TIMEOUT $CONTAINER，再用 $PREVIOUS_IMAGE 重新运行安装脚本"
 `;
 

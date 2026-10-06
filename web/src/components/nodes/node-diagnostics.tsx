@@ -19,6 +19,8 @@
 
 import { useState } from "react";
 import { api } from "@/lib/api";
+import { useI18nOptional } from "@/components/providers";
+import { getDictionary } from "@/lib/i18n";
 import type { ID, NodeDiagnosticsReport, NodeUpgradeCommand } from "@/lib/types";
 
 const REACHABILITY_TEXT: Record<NodeDiagnosticsReport["reachability"], string> = {
@@ -78,6 +80,11 @@ export function NodeDiagnostics({
   const [upgrade, setUpgrade] = useState<NodeUpgradeCommand | null>(null);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
   const [upgradeBusy, setUpgradeBusy] = useState(false);
+
+  // 图标/占位符不构成可访问名称：这个输入框以前写死中文「目标镜像」，英文界面下
+  // 屏幕阅读器会读中文。现在跟随语言，且在没有 Provider 时回落到默认词典（永不为空）。
+  const i18n = useI18nOptional();
+  const upgradeImageLabel = i18n?.t("node.upgradeImageLabel") ?? getDictionary("zh").node.upgradeImageLabel;
 
   async function runDiagnostics() {
     setBusy(true);
@@ -241,7 +248,7 @@ export function NodeDiagnostics({
         </p>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <input
-            aria-label="目标镜像"
+            aria-label={upgradeImageLabel}
             placeholder="ghcr.io/tunex/agent:1.4.0"
             value={image}
             onChange={(e) => setImage(e.target.value)}

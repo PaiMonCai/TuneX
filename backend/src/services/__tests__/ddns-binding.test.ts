@@ -190,6 +190,68 @@ describe("V5-WP17.2: dns_state 投影（D2/F7 —— 只有 synced 才能说「�
 });
 
 /* ------------------------------------------------------------------ */
+/* ②b V5-WP17.3 读投影：开关与退避（G2/G3）                            */
+/* ------------------------------------------------------------------ */
+
+describe("V5-WP17.3: auto_resolve / attempt_count / next_attempt_at 的读投影", () => {
+  const bound = { dns_domain: "edge.example.com", dns_record_type: "A", dns_mode: "multi_entry" };
+
+  test("auto_resolve 取列本身；列缺失/非 true 一律 false（fail-closed，缺字段不代表开启）", () => {
+    expect(dnsBindingState({ ...bound, dns_auto_resolve: true }).auto_resolve).toBe(true);
+    expect(dnsBindingState({ ...bound, dns_auto_resolve: false }).auto_resolve).toBe(false);
+    expect(dnsBindingState({ ...bound }).auto_resolve).toBe(false);
+    expect(dnsBindingState({ ...bound, dns_auto_resolve: null }).auto_resolve).toBe(false);
+    expect(dnsBindingState({ ...bound, dns_auto_resolve: "true" }).auto_resolve).toBe(false);
+  });
+
+  test("已绑定：退避两列照实透出（计数 + ISO 时刻）", () => {
+    const at = new Date("2026-10-07T00:10:00.000Z");
+    const state = dnsBindingState({
+      ...bound,
+      dns_auto_resolve: true,
+      dns_last_error: "provider 限流",
+      dns_attempt_count: 3,
+      dns_next_attempt_at: at,
+    });
+    expect(state.state).toBe("error");
+    expect(state.attempt_count).toBe(3);
+    expect(state.next_attempt_at).toBe(at.toISOString());
+  });
+
+  test("无待重试的失败：next_attempt_at 是**真正的 null**（不是 0 / 空串）", () => {
+    const state = dnsBindingState({ ...bound, dns_attempt_count: 1, dns_next_attempt_at: null });
+    expect(state.next_attempt_at).toBeNull();
+    expect(state.attempt_count).toBe(1);
+    // 未取到列（老行/投影不完整）同样是 null，而不是"1970"或空串这类会被 UI 当时刻解析的值。
+    expect(dnsBindingState({ ...bound }).next_attempt_at).toBeNull();
+    // 列的类型是 Date，但运行期（老行、手工写库、JSON 往返）可能是坏值 —— 投影同样 fail-closed。
+    expect(
+      dnsBindingState({ ...bound, dns_next_attempt_at: "not-a-date" as unknown as Date }).next_attempt_at,
+    ).toBeNull();
+  });
+
+  test("未绑定（解绑不清这两列）：历史退避一律投影成 null，计数也不冒领", () => {
+    const state = dnsBindingState({
+      dns_domain: null,
+      dns_auto_resolve: true,
+      dns_attempt_count: 4,
+      dns_next_attempt_at: new Date("2026-10-07T00:10:00.000Z"),
+    });
+    expect(state.state).toBe("unbound");
+    expect(state.attempt_count).toBeNull();
+    expect(state.next_attempt_at).toBeNull();
+    // 开关本身仍照实（未绑定时真实路径上是 false：解绑会把它置回 false）。
+    expect(state.auto_resolve).toBe(true);
+  });
+
+  test("计数只认非负整数：负数/浮点/字符串不冒领成\"已重试 N 次\"", () => {
+    for (const bad of [-1, 1.5, "3", null, undefined]) {
+      expect(dnsBindingState({ ...bound, dns_attempt_count: bad }).attempt_count, String(bad)).toBe(0);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* ③ 凭据封存：域分离                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -327,6 +389,49 @@ describe("V5-WP17.2: bindForwardDns 的前置条件与作用域", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.code).toBe(DDNS_ERROR_CODES.ddns_not_found);
   });
+
+  test("V5-WP17.3：绑定响应带开关与退避投影，且三列都在 update 的 select 里", async () => {
+    const deps = stubDeps();
+    const result = await bindForwardDns(deps, { ...bindInput, autoResolve: true });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.auto_resolve).toBe(true);
+    expect(result.value.attempt_count).toBe(0);
+    expect(result.value.next_attempt_at).toBeNull();
+    const call = deps.updates[0] as { data: Record<string, unknown>; select: Record<string, unknown> };
+    expect(call.data.dns_auto_resolve).toBe(true);
+    // select 缺列 ⇒ 响应永远显示 false / 0（Web 绑完就会读到错的值）。
+    expect(call.select.dns_auto_resolve).toBe(true);
+    expect(call.select.dns_attempt_count).toBe(true);
+    expect(call.select.dns_next_attempt_at).toBe(true);
+  });
+
+  test("V5-WP17.3：绑回前门**不**清退避两列（执行器的真实行为），投影照实透出", async () => {
+    // bind 的 update 只作废确认态，不碰 attempt_count / next_attempt_at —— 于是改绑一个域名后，
+    // 若上一轮失败的退避窗口还没过，执行器仍会等到 next_attempt_at 才写。这是现状（本任务只读投影，
+    // 不改执行器语义），所以界面必须按这三列说真话，而不是假设"绑了就会立刻同步"。
+    const at = new Date("2026-10-07T00:10:00.000Z");
+    const deps = stubDeps({
+      updated: {
+        dns_domain: "edge.example.com",
+        dns_record_type: "A",
+        dns_mode: "multi_entry",
+        dns_provider_id: 3,
+        dns_confirmed_values: [],
+        dns_synced_at: null,
+        dns_verified: false,
+        dns_last_error: null,
+        dns_attempt_count: 2,
+        dns_next_attempt_at: at,
+      },
+    });
+    const result = await bindForwardDns(deps, { ...bindInput, autoResolve: true });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.state).toBe("pending");
+    expect(result.value.attempt_count).toBe(2);
+    expect(result.value.next_attempt_at).toBe(at.toISOString());
+  });
 });
 
 describe("V5-WP17.2: unbindForwardDns（幂等收敛）", () => {
@@ -350,6 +455,39 @@ describe("V5-WP17.2: unbindForwardDns（幂等收敛）", () => {
     expect(data.dns_domain).toBeNull();
     expect(data.dns_provider_id).toBeNull();
     expect(result.ok && result.value.state).toBe("unbound");
+  });
+
+  test("V5-WP17.3：解绑响应把开关归 false、退避投影成 null（即使列上还留着历史值）", async () => {
+    const at = new Date("2026-10-07T00:10:00.000Z");
+    const deps = stubDeps({
+      tunnel: { id: 11, dns_domain: "edge.example.com" },
+      updated: {
+        dns_domain: null,
+        dns_record_type: null,
+        dns_mode: null,
+        dns_provider_id: null,
+        dns_confirmed_values: [],
+        dns_synced_at: null,
+        dns_verified: false,
+        dns_last_error: null,
+        // 解绑**不**清这两列（列还在行上），但读投影必须作废它们：未绑定行上的历史退避
+        // 不对应任何可执行的重试。
+        dns_attempt_count: 4,
+        dns_next_attempt_at: at,
+      },
+    });
+    const result = await unbindForwardDns(deps, { workspaceId: WORKSPACE, userId: 1, tunnelId: 11 });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.state).toBe("unbound");
+    expect(result.value.auto_resolve).toBe(false);
+    expect(result.value.attempt_count).toBeNull();
+    expect(result.value.next_attempt_at).toBeNull();
+    const call = deps.updates[0] as { data: Record<string, unknown>; select: Record<string, unknown> };
+    expect(call.data.dns_auto_resolve).toBe(false);
+    expect(call.select.dns_auto_resolve).toBe(true);
+    expect(call.select.dns_attempt_count).toBe(true);
+    expect(call.select.dns_next_attempt_at).toBe(true);
   });
 
   test("本来就没绑也算成功（幂等），但状态是 unbound 而不是错误", async () => {

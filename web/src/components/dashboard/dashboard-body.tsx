@@ -11,6 +11,7 @@ import { serverT } from "@/lib/server-i18n";
 import { formatBytes, formatDate, formatMoney } from "@/lib/utils";
 import { loadDashboardTraffic, TRAFFIC_TREND_DAYS } from "@/components/dashboard/dashboard-traffic";
 import { AttentionPanel } from "@/components/dashboard/attention-panel";
+import { FirstRunPanel } from "@/components/dashboard/first-run-panel";
 import { PlanExpiryNotice } from "@/components/dashboard/plan-expiry-notice";
 import { AnnouncementBanner } from "@/components/announcements/announcement-banner";
 import { normalizeAnnouncements, type Announcement } from "@/lib/announcements";
@@ -88,6 +89,15 @@ export async function DashboardBody() {
           testId="stat-nodes"
         />
       </div>
+
+      {/*
+        R2 First-run：新装的 Workspace 在 Dashboard 上必须能读到「下一步是什么」。
+        它排在 attention 之前 —— attention 回答的是「已接入的资源有没有异常」，
+        对一台都还没接进来的新用户它是空的；先给「怎么开始」，再给「有没有事」。
+        事实全部来自既有只读端点（组 / 节点 / 转发 + 能力投影），没有新后端、
+        没有 setup 状态，取不到就显示「无法确认」+ 重试。
+      */}
+      <FirstRunPanel />
 
       {/*
         V4-WP8 §13.7 Wave 4：异常 / 离线 / 等待安装的入口要**优先**出现，

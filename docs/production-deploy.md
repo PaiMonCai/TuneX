@@ -116,6 +116,8 @@ openssl rand -base64 32 | tr '+/' '-_'   # → AUTH_SECRET
 
 可选的**主动出站能力默认全部关闭**：`LOOKING_GLASS_ENABLED=false`、`TUNEX_NOTIFICATION_WEBHOOK_ENABLED=false`、`TUNEX_NOTIFICATION_TELEGRAM_ENABLED=false`。其中 Looking Glass 只做有界 TCP connect 公网探测；开启前应确认审计与目标网络策略符合部署要求。Webhook/Telegram 的目标与凭据配置见 `.env.production.example` 及管理端配置。
 
+可选但**建议显式设置**：`TUNEX_PUBLIC_PANEL_URL`（面板对外可达地址，供节点 Agent 升级脚本做身份校验；不配则回落到节点自己记录的地址，取不到时升级脚本会明确打印"未校验"）。见 §3.1。
+
 `ALLOW_REGISTER_FALLBACK=false`（邀请制 Beta）+ `PAYMENTS_ENABLED=false` 是
 PLAN.md 的既定默认，**不要**在生产环境打开以"图方便"。
 
@@ -321,6 +323,36 @@ scripts/ops/alert.sh
 `db-migrate` 的 `restart: "no"` + `service_completed_successfully` 依赖意味着
 **每次 `up -d` 都会重跑 `migrate deploy`（幂等）+ seed（upsert，不重置已存在
 账号）**。提示：seed 不覆盖已存在的用户，也不会重置管理员口令。
+
+### 3.1 节点 Agent 升级与身份校验（`TUNEX_PUBLIC_PANEL_URL`）
+
+上面的升级**不包含**节点 Agent。节点上的 Agent 由面板生成的命令升级：
+`POST /api/nodes/:id/upgrade-command` 渲染一段脚本，操作者在节点上执行。脚本在
+拉取新镜像、优雅排空、用同一份宿主身份重建容器之后，会做一次**身份校验**：在容器内
+用它已有的长期凭据请求 `<面板地址>/api/internal/node/snapshot`，确认新进程仍然是
+同一个 `node_id` / `agent_id`。凭据只留在节点容器内，脚本只打印 HTTP 状态码。
+
+面板地址的取用顺序：
+
+1. 后端环境变量 `TUNEX_PUBLIC_PANEL_URL`（写在部署根目录的 `.env`，见
+   `.env.production.example`）。必须是**从节点**能访问到的地址；通常就是 `SITE_URL`，
+   节点走内网入口时填内网地址。`SITE_URL` 不会自动被这条校验复用。
+2. 该变量留空时，回落到节点 `agent.env` 里记录的 `TUNEX_PANEL_HTTP_URL`（标准安装脚本
+   写入，等于安装时的 `SITE_URL`）。
+
+结论的三种可能，注意后两种**都不等于升级失败**：
+
+| 脚本输出 | 含义 |
+|---|---|
+| `身份校验通过（HTTP 200）` / 结尾 `（身份校验：通过）` | 面板确认同一个节点已重新连上 |
+| `身份校验失败（HTTP 401/403）` | 凭据不再被接受：脚本自动回退到旧镜像并以非零码退出 |
+| `身份校验：未校验 —— <原因>` | 没校验成功：没配地址、超时/网络不可达、镜像里既没有 curl 也没有 wget、其它状态码等。容器照常运行，但**操作者必须在面板确认该节点重新上报后才能放回业务** |
+
+历史上这段校验在标准 Agent 镜像上**不可能通过**（Alpine 里没有 `curl`；且
+`docker exec` 看不到 entrypoint 现场 source 的 `agent.env`，凭据为空）。现在改为：在容器内
+source `agent.env` 取凭据、优先用 `curl`、没有就用 busybox 自带的 `wget`，并且**只把
+HTTP 200 当成通过**，其余一律明确打印"未校验"。如果你看到"未校验"，先按原因排查
+（最常见的是没配 `TUNEX_PUBLIC_PANEL_URL`、或节点访问不到面板地址）。
 
 ---
 

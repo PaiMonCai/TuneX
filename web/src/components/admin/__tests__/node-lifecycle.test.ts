@@ -537,11 +537,17 @@ describe("WP7 接线", () => {
     expect(src).not.toMatch(/Date\.now\(\)\s*-\s*\w*report/i);
   });
 
-  test("等待闭环不依赖「本地是否存着命令」：关掉对话框也继续等", () => {
+  test("自动等待由服务端阶段驱动：unknown + 有命令也观察，且关掉对话框继续等", () => {
     const src = flat(install);
-    // 自动开始只看 autoStart + 阶段（phase），不看 enrollment / 对话框开合
+    // 自动开始只看 autoStart + 阶段：awaiting_install，或 unknown 且手里有一条命令
+    // （production provision 的窄响应没有 connection，轮询正是把 unknown 变成已知的
+    // 唯一手段；但必须真有命令，且不得合成 waiting/online 事实）。
     expect(src).toContain('if (!autoStart || closed) return;');
-    expect(src).toContain('if (phase !== "awaiting_install") return;');
+    expect(src).toContain('if (phase !== "awaiting_install" && !(phase === "unknown" && hasCommand)) return;');
+    // 每个作用域只自动开始一次：用户手动停止后 effect 重跑不得让等待自己复活。
+    expect(src).toContain("if (autoStartConsumedRef.current) return;");
+    // 阶段徽章始终来自服务端投影，不因自动等待而改写。
+    expect(src).toContain("const phase = installPhase(view);");
     // 轮询的守卫里不得再出现 open（关掉对话框就停 = 又回到「复制完没有下文」）
     expect(src).toContain("if (!waiting || closed) return;");
     expect(src).not.toContain("if (!waiting || closed || !open) return;");

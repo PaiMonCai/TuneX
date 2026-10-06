@@ -22,6 +22,16 @@ const facts: NodeUpgradeFacts = {
 const render = (over: Partial<NodeUpgradeFacts> = {}, image = "ghcr.io/tunex/agent:1.4.0") =>
   renderNodeUpgradeScript({ ...facts, ...over }, image, { panelURL: "https://panel.example.com" });
 
+/**
+ * 身份校验段：从它的策略注释一直到最后一行。测试只关心"操作者会看到什么结论"，
+ * 所以按这个段的真实边界切，而不是按某个实现细节的字符串。
+ */
+const identitySection = (script: string) => {
+  const start = script.indexOf("# 身份校验只承认一种");
+  expect(start).toBeGreaterThan(-1);
+  return script.slice(start);
+};
+
 describe("ordering: never take the node down for a pull that may fail", () => {
   test("the image is pulled before the agent is stopped", () => {
     const { script } = render();
@@ -98,12 +108,108 @@ describe("identity: the new container is the SAME node", () => {
     expect(script).toContain("%{http_code}");
     // The credential is read inside the container, never echoed by the script.
     expect(script).not.toMatch(/echo[^\n]*TUNEX_NODE_CREDENTIAL/);
+    expect(script).not.toMatch(/printf[^\n]*TUNEX_NODE_CREDENTIAL/);
   });
 
   test("a failed identity check rolls back instead of leaving a broken node", () => {
-    const { script } = render();
-    const identityBlock = script.slice(script.indexOf('if [ -n "$PANEL" ]'), script.indexOf("log \"升级完成"));
-    expect(identityBlock).toContain("restore_previous");
+    const block = identitySection(render().script);
+    // Rollback is reserved for an explicit authentication failure: exactly one
+    // restore_previous call, and it lives in the 401/403 branch.
+    expect(block.match(/restore_previous/g)).toHaveLength(1);
+    const before = block.slice(0, block.indexOf("restore_previous"));
+    const label = before.indexOf("http:401|http:403)");
+    expect(label).toBeGreaterThan(-1);
+    const branchBody = before.slice(label + "http:401|http:403)".length);
+    expect(branchBody).toContain("身份校验失败（HTTP");
+    for (const other of ["http:200)", "http:*)", "unverified:no_response)"]) {
+      expect(branchBody).not.toContain(other);
+    }
+  });
+});
+
+describe("identity check on the real Agent image: executable, and never a false 'verified'", () => {
+  // The standard Alpine runtime has no curl, and `docker exec` sees the container's
+  // Config.Env (not the entrypoint's sourced agent.env), so the previous in-container
+  // curl check could never pass on a real node. These tests pin the two facts that
+  // make it work instead: read the credential from the mounted env file, and use a
+  // tool the image actually ships.
+
+  test("sources the credential from the mounted agent.env inside the container", () => {
+    const block = identitySection(render().script);
+    const exec = block.indexOf("docker exec");
+    const sourced = block.indexOf(". /run/tunex-agent/agent.env");
+    const used = block.indexOf("TUNEX_NODE_CREDENTIAL");
+    expect(exec).toBeGreaterThan(-1);
+    expect(sourced).toBeGreaterThan(exec);
+    expect(used).toBeGreaterThan(sourced);
+  });
+
+  test("does not assume curl: probes curl, then falls back to busybox wget", () => {
+    const block = identitySection(render().script);
+    expect(block).toContain("command -v curl");
+    expect(block).toContain("command -v wget");
+    expect(block.indexOf("command -v wget")).toBeGreaterThan(block.indexOf("command -v curl"));
+    // wget carries the same header and its status line is parsed, not guessed.
+    expect(block).toContain('--header "Authorization: Bearer $TUNEX_NODE_CREDENTIAL"');
+    expect(block).toContain('grep -oE "HTTP/[0-9.]+ [0-9]{3}"');
+  });
+
+  test("only an explicit HTTP 200 counts as verified", () => {
+    const block = identitySection(render().script);
+    expect(block.match(/VERIFIED="yes"/g)).toHaveLength(1);
+    expect(block.slice(0, block.indexOf('VERIFIED="yes"'))).toMatch(/http:200\)\s*$/);
+    // "verified" is claimed in exactly one operator-facing line, and it is the
+    // one that the 200 branch prints.
+    expect(render().script.match(/身份校验：通过/g)).toHaveLength(1);
+  });
+
+  test("a missing panel URL is reported as 未校验, with the config gap named", () => {
+    const block = identitySection(renderNodeUpgradeScript(facts, "ghcr.io/tunex/agent:1.4.0", { panelURL: null }).script);
+    expect(block).toContain("unverified:no_panel_url");
+    expect(block).toContain("未配置 TUNEX_PUBLIC_PANEL_URL");
+    expect(block).toContain("身份校验：未校验");
+    // The old silent skip is gone.
+    expect(block).not.toContain("跳过身份校验");
+  });
+
+  test("falls back to the panel address the node recorded in agent.env", () => {
+    const block = identitySection(render().script);
+    expect(block).toContain('BASE="${TUNEX_PANEL_HTTP_URL:-}"');
+  });
+
+  test("every unverifiable outcome has its own explicit reason", () => {
+    const block = identitySection(render().script);
+    for (const reason of [
+      "unverified:no_panel_url",
+      "unverified:env_unreadable",
+      "unverified:no_credential",
+      "unverified:no_http_tool",
+      "unverified:no_response",
+    ]) {
+      expect(block).toContain(reason);
+    }
+    // Non-200 status codes and a dead `docker exec` are also 未校验, never a pass.
+    expect(block).toContain("http:*)");
+    expect(block).toContain("REASON=\"完全没有取到可判定的结论（docker exec 可能失败）\"");
+    expect(block).toContain("身份校验：未校验 —— $REASON");
+    expect(block).toContain("本次升级没有通过身份校验");
+  });
+
+  test("the check is time-bounded so a hung request cannot stall the upgrade", () => {
+    const block = identitySection(render().script);
+    expect(render().script).toContain('CHECK_TIMEOUT="15"');
+    expect(block).toContain('sh "$PANEL" "$CHECK_TIMEOUT"');
+    expect(block).toContain('--max-time "$2"');
+    expect(block).toContain('-T "$2"');
+    expect(block).toContain("unverified:no_response");
+  });
+
+  test("the timeout is configurable", () => {
+    const script = renderNodeUpgradeScript(facts, "ghcr.io/tunex/agent:1.4.0", {
+      panelURL: "https://panel.example.com",
+      checkTimeoutS: 5,
+    }).script;
+    expect(script).toContain('CHECK_TIMEOUT="5"');
   });
 });
 
@@ -123,7 +229,7 @@ describe("rollback anchor", () => {
 
   test("a container that exits immediately is rolled back", () => {
     const { script } = render();
-    const startBlock = script.slice(script.indexOf("sleep 3"), script.indexOf('if [ -n "$PANEL" ]'));
+    const startBlock = script.slice(script.indexOf("sleep 3"), script.indexOf("# 身份校验只承认一种"));
     expect(startBlock).toContain("restore_previous");
   });
 });

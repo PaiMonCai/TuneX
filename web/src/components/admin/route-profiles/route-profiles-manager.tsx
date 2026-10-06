@@ -52,8 +52,19 @@ import type {
   RouteProfileView,
   RouteSelector,
 } from "@/lib/types";
+import { getDictionary } from "@/lib/i18n";
 
 const t = (locale: Locale, zh: string, en: string) => (locale === "en" ? en : zh);
+
+/**
+ * 图标按钮 / 结构化输入的可访问名称。
+ *
+ * 它们以前是写死的英文字面量（"move up" / "node_id" / "strategy" …）：图标按钮没有
+ * 可见文字，这个 `aria-label` 就是它的全部语义，写死等于语言切换后读错。
+ * 这里改走词典（本组件已显式接收 `locale`，故按该语言取词，不依赖 Provider，
+ * 静态渲染也不会抛错）；偏技术标识的字段（节点 ID / 策略）保留语义但给人话。
+ */
+const a11y = (locale: Locale) => getDictionary(locale).admin.routeProfiles;
 
 type Action = { pending: string | null; error: RouteProfileErrorInfo | null; notice: string | null };
 
@@ -98,6 +109,7 @@ function SelectorEditor({
   testId: string;
 }) {
   const kind = value?.kind ?? "null";
+  const labels = a11y(locale);
   return (
     <div className="flex flex-col gap-1.5" data-testid={testId}>
       <Label>{label}</Label>
@@ -123,7 +135,7 @@ function SelectorEditor({
         </select>
         {value?.kind === "fixed_node" && (
           <Input
-            aria-label="node_id"
+            aria-label={labels.fixedNode}
             data-testid={`${testId}-node`}
             className="w-24"
             value={String(value.node_id)}
@@ -133,14 +145,14 @@ function SelectorEditor({
         {value?.kind === "node_group" && (
           <>
             <Input
-              aria-label="node_group_id"
+              aria-label={labels.nodeGroup}
               data-testid={`${testId}-group`}
               className="w-24"
               value={String(value.node_group_id)}
               onChange={(e) => onChange({ kind: "node_group", node_group_id: Number(e.target.value) || 0, strategy: value.strategy })}
             />
             <Input
-              aria-label="strategy"
+              aria-label={labels.strategy}
               data-testid={`${testId}-strategy`}
               className="w-32"
               value={value.strategy}
@@ -181,6 +193,7 @@ export function RouteProfileTemplateEditor({
   const [capabilitiesText, setCapabilitiesText] = useState((initial.required_capabilities ?? []).join(", "));
   const [policyText, setPolicyText] = useState({ ingress: "{}", egress: "{}" });
   const [policyError, setPolicyError] = useState<string | null>(null);
+  const labels = a11y(locale);
 
   const emit = useCallback(
     (next: RouteProfileTemplate) => {
@@ -253,7 +266,7 @@ export function RouteProfileTemplateEditor({
                   {index + 1}
                 </Badge>
                 <Input
-                  aria-label="transit node id"
+                  aria-label={labels.transitNode}
                   className="w-24"
                   value={String(hop.node_id)}
                   onChange={(e) => {
@@ -264,20 +277,20 @@ export function RouteProfileTemplateEditor({
                 />
                 <span className="font-mono text-xs text-[var(--muted-foreground)]">{selectorLabel(hop)}</span>
                 <div className="ml-auto flex items-center gap-1">
-                  <Button type="button" variant="ghost" size="icon" aria-label="move up" disabled={index === 0} onClick={() => emit(moveTransit(template, index, -1))}>
+                  <Button type="button" variant="ghost" size="icon" aria-label={labels.moveUp} disabled={index === 0} onClick={() => emit(moveTransit(template, index, -1))}>
                     <ArrowUp className="size-3.5" />
                   </Button>
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon"
-                    aria-label="move down"
+                    aria-label={labels.moveDown}
                     disabled={index === template.transit.length - 1}
                     onClick={() => emit(moveTransit(template, index, 1))}
                   >
                     <ArrowDown className="size-3.5" />
                   </Button>
-                  <Button type="button" variant="ghost" size="icon" aria-label="remove transit" onClick={() => emit(removeTransit(template, index))}>
+                  <Button type="button" variant="ghost" size="icon" aria-label={labels.removeTransit} onClick={() => emit(removeTransit(template, index))}>
                     <Trash2 className="size-3.5" />
                   </Button>
                 </div>

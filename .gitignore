@@ -42,3 +42,6 @@ backend/tests/v3-e2e/__pycache__/
 scripts/perf/.bin/
 scripts/perf/results/
 scripts/perf/__pycache__/
+
+# ForwardX 参考副本：只读研究用，永不进入提交
+Forwardx(参考项目，不进入git提交）/

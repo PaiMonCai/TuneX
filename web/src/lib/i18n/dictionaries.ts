@@ -44,6 +44,12 @@ export const zh = {
     edit: "编辑",
     delete: "删除",
     cancel: "取消",
+    /** 对话框右上角关闭按钮的屏幕阅读器文案（图标按钮本身没有可见文字）。 */
+    close: "关闭",
+    /** 移动端抽屉入口按钮（图标按钮）的可访问名称。 */
+    menu: "菜单",
+    /** 移动端抽屉遮罩层按钮的可访问名称（= 关闭抽屉）。 */
+    closeMenu: "关闭菜单",
     confirm: "确定",
     save: "保存",
     actions: "操作",
@@ -211,6 +217,8 @@ export const zh = {
     nodesOnline: "在线节点",
     trafficTrend: "流量趋势（近 14 天）",
     trafficTrendDesc: "当前工作空间近 {days} 天流量",
+    /** 流量趋势图容器的可访问名称（recharts 画布对屏幕阅读器不可见）。 */
+    trafficChartLabel: "流量趋势图",
     tunnelRanking: "转发流量排行",
     totalTraffic: "总流量",
     trafficPeriod: "计量周期",
@@ -232,8 +240,6 @@ export const zh = {
     createHint: "先在面板创建节点，再复制安装命令到 Linux 节点执行。",
     install: "一键安装",
     reinstall: "重新生成安装命令",
-    installTitle: "节点安装命令",
-    installHint: "命令中的注册令牌 10 分钟内有效且只能使用一次；长期节点凭据不会显示在这里。",
     waiting: "等待安装",
     registered: "已注册",
     bindEgress: "绑定出口",
@@ -259,16 +265,116 @@ export const zh = {
     forwardCreated: "端口转发已创建",
     bindSuccess: "出口节点已绑定",
     unbindSuccess: "出口绑定已解除",
-    copySuccess: "安装命令已复制",
     loadFailed: "加载节点失败",
     groupsLoadFailed: "加载节点组失败，请稍后重试",
     bindingsLoadFailed: "加载出口绑定失败",
     createRequired: "请填写节点 ID 并选择节点组",
     createFailed: "创建节点失败",
     installerFailed: "生成安装命令失败",
-    copyFailed: "复制失败，请手动复制",
     bindFailed: "绑定出口失败",
     unbindFailed: "解除绑定失败",
+    nodeIdLabel: "节点 ID",
+    nodeGroupLabel: "节点组",
+    chooseNodeGroup: "请选择节点组",
+    summary: "共 {nodes} 个节点 · {ingress} 个入口",
+    groupsLoading: "正在加载节点组…",
+    groupsEmptyTitle: "还没有可用的节点组",
+    groupsEmptyHint:
+      "节点必须归属一个节点组。默认策略允许工作空间自建入口组，你可以在本页直接创建：填一个组名与端口范围即可，随后就能添加节点。出口组需要策略授予 allow_custom_out_group，本页暂不开放。",
+    groupsFailedTitle: "节点组加载失败",
+    groupsFailedHint: "暂时无法创建节点；请重试加载节点组。",
+    groupsRetry: "重新加载节点组",
+    /* ---- R2：自助建组（用户域 POST /api/node-groups）---- */
+    createGroupCta: "创建入口节点组",
+    groupCreateTitle: "创建入口节点组",
+    groupCreateHint:
+      "入口节点组是第一条转发的前置：节点归属节点组，组里的端口范围决定组内节点能监听哪些端口。",
+    groupCreateNameLabel: "节点组名称",
+    groupCreateNamePlaceholder: "例如：香港-入口",
+    groupCreateNameRequired: "请填写节点组名称。",
+    groupCreateNameTooLong: "节点组名称最多 60 个字符。",
+    groupCreatePortLabel: "端口范围（必填）",
+    groupCreatePortHint: "格式 20000-20100；两端都必须落在 1..65535，且起始不得大于结束。",
+    groupCreatePortRequired: "请填写端口范围；没有合法连续端口范围的节点组之后无法添加节点。",
+    groupCreatePortFormat: "端口范围格式不正确，请使用「起始-结束」，例如 20000-20100。",
+    groupCreatePortBounds: "端口必须落在 1..65535 之间。",
+    groupCreatePortOrder: "起始端口不能大于结束端口。",
+    groupCreateDirectionIngress:
+      "方向：入口。本切片只开放入口组；出口组需要策略授予 allow_custom_out_group。",
+    groupCreateSubmit: "创建节点组",
+    groupCreating: "创建中…",
+    groupCreateSuccess: "节点组已创建，可以继续添加节点了",
+    groupCreateFailed: "创建节点组失败",
+    groupErrorNextPolicy:
+      "当前策略没有授予这个工作空间自建入口组的能力（不是你的输入错误，也不是额度问题）；请联系工作空间管理员为该空间开通该能力，或提供一个可用的入口节点组。",
+    groupErrorNextNodeLimit:
+      "节点额度已用尽；请先在节点管理里释放额度，或由管理员调整套餐 / 策略后再试。",
+    groupErrorNextPortRange:
+      "该节点组没有可用的连续端口范围；请新建一个带合法端口范围的入口节点组，或联系管理员为该组配置端口范围。",
+    groupErrorNextNodeIdConflict: "该节点 ID 已被其它节点组占用；请换一个节点 ID。",
+    groupErrorNextRoleConflict:
+      "已存在同名但角色不同的节点；请先在节点管理里显式修改它的角色，然后重试。",
+    listFailedSummary: "节点列表加载失败",
+    listFailedHint: "节点列表暂时加载失败，因此这里不能显示你的节点；这不代表没有节点，也不会影响节点本身的运行。",
+    listRetry: "重新加载节点",
+    listUnavailableHint:
+      "暂时取不到这个节点的连接与凭据事实，所以下面不会显示「在线 / 已安装」之类的结论；安装命令仍然有效。",
+    readonlyEmptyTitle: "当前工作空间还没有节点",
+    readonlyEmptyHint:
+      "你的工作空间权限里只有 node:read（可以查看节点），没有 node:manage，因此不能添加或重装节点。请联系有 node:manage 权限的成员或工作空间管理员来添加节点；添加完成后刷新本页即可看到。",
+    createBlockedPermission: "你没有 node:manage 权限，无法创建节点。",
+    createBlockedGroupsLoading: "正在加载节点组，加载完成后即可创建节点。",
+    createBlockedGroupsFailed: "节点组加载失败，请先重新加载节点组。",
+    createBlockedGroupsEmpty: "还没有可用的节点组；节点必须归属一个节点组。",
+    createBlockedNodeId: "请填写节点 ID（机器名）。",
+    createBlockedDuplicate:
+      "该名称已被当前工作空间里的节点使用：同名 node_id 会被后端当作「复用并重签」，请改用上方列表里的既有节点（一键安装 / 重新生成安装命令）。",
+    createBlockedListUnavailable: "节点列表暂时取不到，无法确认是否重名，请先重新加载节点后重试。",
+    createBlockedGroupId: "请选择节点组。",
+    createDuplicateWarning:
+      "该名称与当前工作空间里已有的节点「{nodeId}」重名：后端会把它当成同一台节点并重签安装命令（旧命令立即作废、消费时替换长期凭据）。请改用已有节点的一键安装 / 重新生成入口。",
+    createDuplicateBlocked:
+      "「{nodeId}」与当前工作空间里已有节点同名，已阻止创建；请改用该节点卡片上的安装 / 重新生成入口。",
+    createConfirmTitle: "确认创建节点",
+    createConfirmNode: "即将创建的节点 ID：{nodeId}",
+    createConfirmReprovision:
+      "后端对已存在的同名 node_id 不会报错，而是复用该节点并重新签发安装命令：上一条尚未使用的命令会立即作废；新命令被节点消费时，会替换该节点原有凭据并改用长期凭据，原 Agent 将失去凭据。不要为同一个 node_id 并发创建。",
+    createConfirmDuplicate:
+      "注意：当前工作空间已存在同名节点「{nodeId}」，这次创建会重签它的安装命令，而不是新建一台。",
+    createConfirmApply: "确认创建",
+    onboardingTitle: "节点接入",
+    onboardingHint:
+      "命令中的注册令牌 10 分钟内有效、只能使用一次。关闭命令对话框不会停止等待：节点上线后这里会自动更新。",
+    onboardingFactsPending: "正在从当前工作空间读取这个节点的连接事实…",
+    createFirstForward: "创建第一条转发",
+    onboardingNodeMissing: "该节点已不在当前工作空间的节点列表里（可能已被删除）；请刷新页面后再试。",
+    reinstallConfirmNew:
+      "重新生成安装命令会立即作废上一条尚未使用的命令（旧命令 10 分钟内失效，且只能用一次）。确定继续？",
+    reinstallConfirmRegistered:
+      "该节点已注册：重新生成会立即作废上一条安装命令，并且新命令被节点消费时会替换现有的长期凭据（旧 Agent 将失去凭据）。确定继续？",
+    reinstallConfirmUnknown:
+      "目前拿不到该节点是否已注册的事实（节点列表暂时取不到）：重新生成会立即作废上一条尚未使用的安装命令；并且如果该节点已经安装过，新命令被消费时会替换它现有的长期凭据（旧 Agent 将失去凭据）。确定继续？",
+    reinstallConfirmCredential:
+      "该节点目前持有凭据：新命令被消费时会替换现有长期凭据，原 Agent 将失去凭据。",
+    reinstallConfirmOffline:
+      "该节点已安装但当前离线：重新生成命令不会修复网络连接，只有确定要重装 Agent 时才需要新命令。",
+    ctaBlockedEgress:
+      "这是出口节点：转发入口要在入口节点上创建。请选择入口节点（若需经它出口，先做入口-出口绑定），或到转发管理里选择入口节点。",
+    ctaBlockedUndeclaredRole:
+      "该节点还没有声明角色；未声明角色的节点不参与入口调度。请管理员设置入口（ingress）或入口+出口（both）后再创建转发。",
+    ctaBlockedPermission: "你的工作空间权限里没有 forward:create，无法创建转发；请联系工作空间管理员调整权限。",
+    ctaBlockedAwaitingInstall:
+      "还没有收到该节点的连接：安装命令执行成功后这里会自动更新，届时即可创建第一条转发。",
+    ctaBlockedOffline: "该节点已安装但当前未连接：这是连接问题，不是安装问题；恢复连接后即可创建转发。",
+    ctaBlockedUnknownConnection: "面板还没有该节点的连接事实，暂时无法确认是否在线；请稍后刷新再看。",
+    ctaBlockedNotAccepting:
+      "该节点当前不接受新业务（准入未通过）；请按节点卡片上的准入原因先处理生命周期或依赖，然后再创建转发。",
+    ctaBlockedUnknownAdmission: "面板还没有返回该节点的准入结论，暂时无法确认它能否接新业务；请稍后刷新再看。",
+    ctaBlockedListUnavailable:
+      "节点列表暂时取不到，因此无法确认该节点是否还在、在线与否；这不代表节点有问题。请重试读取事实后再决定下一步。",
+    /** 升级命令里「目标镜像」输入框的可访问名称（图标/占位符不构成可访问名称）。 */
+    upgradeImageLabel: "目标镜像（容器镜像地址）",
+    scopeChanged: "工作空间或权限已变化，旧的节点响应与安装命令已丢弃。",
   },
   forward: {
     title: "转发管理",
@@ -659,6 +765,19 @@ export const zh = {
     backToSite: "返回前台",
     management: "运营管理",
     overview: "系统概览",
+    /* ---- 管理端图表容器的可访问名称（图标/画布对屏幕阅读器不可见）---- */
+    revenueChartLabel: "收入趋势图",
+    tunnelTypeChartLabel: "转发类型分布图",
+    /* ---- Route Profile 编辑器里图标按钮 / 结构化输入的可访问名称 ---- */
+    routeProfiles: {
+      moveUp: "上移",
+      moveDown: "下移",
+      removeTransit: "删除中转节点",
+      transitNode: "中转节点 ID",
+      fixedNode: "固定节点 ID",
+      nodeGroup: "节点组 ID",
+      strategy: "负载策略",
+    },
     userCount: "用户总数",
     tunnelCount: "转发总数",
     nodeCount: "节点总数",
@@ -905,6 +1024,47 @@ export const zh = {
       failed: "操作失败",
     },
   },
+  /* ---- R2 First-run：由既有事实派生的「下一步」（不落库、不写 localStorage）---- */
+  firstRun: {
+    title: "下一步",
+    loading: "正在确认接入进度…",
+    /** 取不到事实（请求失败 / 权限不足）：明说「无法确认」，绝不说「一切正常」。 */
+    degradedTitle: "暂时无法确认接入进度",
+    degradedHint:
+      "读取判断所需的资源时失败，所以这里不会给出下一步，也不代表已经完成。请重试。",
+    degradedPermissionHint:
+      "当前账户没有读取这些资源的权限，因此无法判断接入进度；这不代表已经完成，请联系工作空间管理员。",
+    unknownTitle: "缺少判断下一步所需的事实",
+    unknownHint:
+      "缺少判断下一步所需的事实（取不到，或响应形状不认识）；这不代表已经完成。请重试。",
+    quotaLine: "额度：节点 {nodesUsed} / {nodesMax} · 转发 {tunnelsUsed} / {tunnelsMax}",
+    createGroupTitle: "创建入口节点组",
+    createGroupHint:
+      "第一条转发需要一个入口节点组：节点归属节点组，组里的端口范围决定节点能监听哪些端口。",
+    createGroupAction: "创建入口节点组",
+    needOperatorTitle: "这一步需要有人帮你完成",
+    needOperatorHintPermission:
+      "你的工作空间权限里没有 node:manage，无法自己创建入口节点组或添加节点；请联系有 node:manage 权限的成员或工作空间管理员完成这一步。",
+    needOperatorHintPolicy:
+      "当前工作空间的有效策略没有授予自建入口组的能力（allow_custom_in_group = 否）；请联系工作空间管理员为该空间开通，或提供一个可用的入口节点组。",
+    addNodeTitle: "添加第一台节点",
+    addNodeHint:
+      "入口节点组已经就绪；创建节点后把安装命令复制到目标机器执行，节点上线后即可创建第一条转发。",
+    addNodeAction: "去添加节点",
+    addNodeHintPermission:
+      "入口节点组已经就绪，但你的权限里没有 node:manage，无法自己创建节点；请联系有该权限的成员添加节点。",
+    createForwardTitle: "创建第一条转发",
+    createForwardHint:
+      "节点已经在列表里；到转发管理里选择入口节点、填写目标地址，即可创建第一条转发。",
+    createForwardAction: "去创建转发",
+    createForwardHintPermission:
+      "节点已经就绪，但你的权限里没有 forward:create，无法自己创建转发；请联系有该权限的成员创建第一条转发。",
+    /** 只读账户的「去哪里看」链接文案（没有可执行动作时用）。 */
+    viewNodes: "查看节点",
+    viewForwards: "查看转发",
+    doneTitle: "接入已完成",
+    doneHint: "已经存在转发，首启引导不再显示。",
+  },
 };
 
 export type LooseDict<T> = {
@@ -951,6 +1111,12 @@ export const en: Dict = {
     edit: "Edit",
     delete: "Delete",
     cancel: "Cancel",
+    /** Screen-reader label for the dialog's icon-only close button. */
+    close: "Close",
+    /** Accessible name for the mobile drawer toggle (icon-only button). */
+    menu: "Menu",
+    /** Accessible name for the mobile drawer backdrop button (= close the drawer). */
+    closeMenu: "Close menu",
     confirm: "Confirm",
     save: "Save",
     actions: "Actions",
@@ -1117,6 +1283,8 @@ export const en: Dict = {
     nodesOnline: "Nodes online",
     trafficTrend: "Traffic (last 14 days)",
     trafficTrendDesc: "Traffic of this workspace, last {days} days",
+    /** Accessible name for the traffic chart container (the recharts canvas is invisible to screen readers). */
+    trafficChartLabel: "Traffic trend chart",
     tunnelRanking: "Traffic by forward",
     totalTraffic: "Total traffic",
     trafficPeriod: "Period",
@@ -1138,8 +1306,6 @@ export const en: Dict = {
     createHint: "Create a node in the panel, then run the generated command on the Linux host.",
     install: "One-click install",
     reinstall: "Regenerate installer",
-    installTitle: "Node install command",
-    installHint: "The enrollment token is valid for 10 minutes and can be used once. The long-lived node credential is never shown here.",
     waiting: "Waiting for install",
     registered: "Registered",
     bindEgress: "Bind egress",
@@ -1165,16 +1331,126 @@ export const en: Dict = {
     forwardCreated: "Port forward created",
     bindSuccess: "Egress node bound",
     unbindSuccess: "Egress binding removed",
-    copySuccess: "Install command copied",
     loadFailed: "Failed to load nodes",
     groupsLoadFailed: "Failed to load node groups. Please try again later.",
     bindingsLoadFailed: "Failed to load egress bindings",
     createRequired: "Enter a node ID and choose a node group",
     createFailed: "Failed to create node",
     installerFailed: "Failed to generate install command",
-    copyFailed: "Copy failed. Please copy the command manually.",
     bindFailed: "Failed to bind egress",
     unbindFailed: "Failed to remove egress binding",
+    nodeIdLabel: "Node ID",
+    nodeGroupLabel: "Node group",
+    chooseNodeGroup: "Select a node group",
+    summary: "{nodes} nodes · {ingress} ingress",
+    groupsLoading: "Loading node groups…",
+    groupsEmptyTitle: "No node group available yet",
+    groupsEmptyHint:
+      "Every node must belong to a node group. The default policy lets a workspace create its own ingress group — you can do it right here: pick a name and a port range, then add nodes. Egress groups require the allow_custom_out_group entitlement and are not offered on this page.",
+    groupsFailedTitle: "Failed to load node groups",
+    groupsFailedHint: "Nodes cannot be created right now; retry loading the node groups.",
+    groupsRetry: "Reload node groups",
+    /* ---- R2: self-service group creation (user-domain POST /api/node-groups) ---- */
+    createGroupCta: "Create ingress node group",
+    groupCreateTitle: "Create ingress node group",
+    groupCreateHint:
+      "An ingress node group is the prerequisite for the first forward: nodes belong to a group, and the group's port range decides which listen ports its nodes can use.",
+    groupCreateNameLabel: "Node group name",
+    groupCreateNamePlaceholder: "e.g. Hong Kong ingress",
+    groupCreateNameRequired: "Enter a node group name.",
+    groupCreateNameTooLong: "A node group name is at most 60 characters.",
+    groupCreatePortLabel: "Port range (required)",
+    groupCreatePortHint: "Format 20000-20100; both ends must be within 1..65535 and the start must not exceed the end.",
+    groupCreatePortRequired:
+      "Enter a port range; a node group without a valid contiguous range cannot accept nodes later.",
+    groupCreatePortFormat: "Invalid port range. Use start-end, for example 20000-20100.",
+    groupCreatePortBounds: "Ports must be within 1..65535.",
+    groupCreatePortOrder: "The start port cannot be greater than the end port.",
+    groupCreateDirectionIngress:
+      "Direction: ingress. Only ingress groups are offered here; egress groups require the allow_custom_out_group entitlement.",
+    groupCreateSubmit: "Create node group",
+    groupCreating: "Creating…",
+    groupCreateSuccess: "Node group created — you can add a node now",
+    groupCreateFailed: "Failed to create the node group",
+    groupErrorNextPolicy:
+      "The current policy does not grant this workspace the ability to create ingress groups (this is neither an input error nor a quota problem). Ask your workspace administrator to grant it, or to provide a usable ingress node group.",
+    groupErrorNextNodeLimit:
+      "The node quota is exhausted. Free up nodes first, or ask an administrator to adjust the plan/policy, then retry.",
+    groupErrorNextPortRange:
+      "That node group has no usable contiguous port range. Create a new ingress group with a valid port range, or ask an administrator to configure one for that group.",
+    groupErrorNextNodeIdConflict: "This node ID is already used by another node group; use a different node ID.",
+    groupErrorNextRoleConflict:
+      "A node with the same name but a different role already exists. Change its role explicitly in Node Management first, then retry.",
+    listFailedSummary: "Failed to load the node list",
+    listFailedHint:
+      "The node list could not be loaded, so your nodes cannot be shown here. This does not mean you have no nodes, and it does not affect the nodes themselves.",
+    listRetry: "Reload nodes",
+    listUnavailableHint:
+      "This node's connection and credential facts are temporarily unavailable, so no online/installed conclusion is shown below; the install command stays valid.",
+    readonlyEmptyTitle: "This workspace has no nodes yet",
+    readonlyEmptyHint:
+      "Your workspace permissions include node:read (view nodes) but not node:manage, so you cannot add or reinstall nodes. Ask a member with node:manage or your workspace administrator to add one, then reload this page.",
+    createBlockedPermission: "You do not have node:manage, so you cannot create nodes.",
+    createBlockedGroupsLoading: "Node groups are still loading; you can create a node once they are loaded.",
+    createBlockedGroupsFailed: "Loading node groups failed; reload the node groups first.",
+    createBlockedGroupsEmpty:
+      "No node group is available yet; every node must belong to a node group.",
+    createBlockedNodeId: "Enter a node ID (host name).",
+    createBlockedDuplicate:
+      "This name is already used by a node in the current workspace: the backend treats a matching node_id as reuse-and-reissue. Use the existing node above (One-click install / Regenerate install command) instead.",
+    createBlockedListUnavailable:
+      "The node list is unavailable, so a duplicate name cannot be ruled out. Reload the nodes first.",
+    createBlockedGroupId: "Select a node group.",
+    createDuplicateWarning:
+      "The name matches the existing node \"{nodeId}\" in this workspace: the backend treats it as the same node and reissues its install command (the old unused command is invalidated immediately, and the long-lived credential is replaced when the new command is consumed). Use that node's One-click install / Regenerate install command instead.",
+    createDuplicateBlocked:
+      "\"{nodeId}\" already exists in this workspace, so creation was blocked. Use the install / regenerate entry on that node's card instead.",
+    createConfirmTitle: "Confirm node creation",
+    createConfirmNode: "Node ID to create: {nodeId}",
+    createConfirmReprovision:
+      "For an existing node_id the backend does not fail: it reuses that node and issues a new install command. Any previous unused command is invalidated immediately; when the node consumes the new command, its existing credential is replaced by a long-lived one and the old Agent loses its credential. Do not create the same node_id concurrently.",
+    createConfirmDuplicate:
+      "Note: the current workspace already has a node named \"{nodeId}\". This submission reissues its install command instead of creating a new machine.",
+    createConfirmApply: "Create node",
+    onboardingTitle: "Node onboarding",
+    onboardingHint:
+      "The enrollment token is valid for 10 minutes and can be used once. Closing the command dialog does not stop waiting: this panel updates once the node connects.",
+    onboardingFactsPending: "Reading this node's connection facts from the current workspace…",
+    createFirstForward: "Create the first forward",
+    onboardingNodeMissing:
+      "This node is no longer in the current workspace's node list (it may have been deleted). Refresh the page and try again.",
+    reinstallConfirmNew:
+      "Regenerating the install command immediately invalidates the previous unused command (the old command expires within 10 minutes and works only once). Continue?",
+    reinstallConfirmRegistered:
+      "This node has already registered: regenerating immediately invalidates the previous install command, and when the new command is consumed it replaces the existing long-lived credential (the old Agent loses its credential). Continue?",
+    reinstallConfirmUnknown:
+      "Whether this node has already registered is currently unknown (the node list is unavailable). Regenerating immediately invalidates the previous unused install command, and if the node has already been installed, consuming the new command replaces its long-lived credential (the old Agent loses its credential). Continue?",
+    reinstallConfirmCredential:
+      "This node currently holds a credential: consuming the new command replaces it and the old Agent loses its credential.",
+    reinstallConfirmOffline:
+      "This node is installed but currently offline: regenerating does not fix the network, so a new command is only needed if you really intend to reinstall the Agent.",
+    ctaBlockedEgress:
+      "This is an egress node: forwards are created on ingress nodes. Pick an ingress node (bind it to this egress node first if traffic should leave through it) or choose an ingress node in Forward Management.",
+    ctaBlockedUndeclaredRole:
+      "This node has no declared role yet, and undeclared nodes are not scheduled as ingress. Ask an administrator to set ingress or ingress + egress (both) before creating a forward.",
+    ctaBlockedPermission:
+      "Your workspace role does not include forward:create, so you cannot create forwards. Ask your workspace administrator to adjust your permissions.",
+    ctaBlockedAwaitingInstall:
+      "No connection from this node yet: this panel updates once the install command succeeds, and then you can create the first forward.",
+    ctaBlockedOffline:
+      "This node is installed but not connected right now: that is a connectivity issue, not an install issue. You can create forwards once it reconnects.",
+    ctaBlockedUnknownConnection:
+      "The panel has no connection fact for this node yet, so it cannot confirm whether it is online. Refresh again in a moment.",
+    ctaBlockedNotAccepting:
+      "This node is not accepting new business right now (admission not passed). Resolve the reason shown on the node card (lifecycle or dependencies) before creating forwards.",
+    ctaBlockedUnknownAdmission:
+      "The panel has not returned an admission verdict for this node, so it cannot confirm whether it accepts new business. Refresh again in a moment.",
+    ctaBlockedListUnavailable:
+      "The node list is temporarily unavailable, so it cannot confirm whether this node still exists or is online; this does not mean the node is broken. Retry reading the facts before deciding the next step.",
+    /** Accessible name for the "target image" input in the upgrade-command form. */
+    upgradeImageLabel: "Target image (container image reference)",
+    scopeChanged:
+      "The workspace or your permissions changed, so the previous node response and install command were discarded.",
   },
   forward: {
     title: "Forward Management",
@@ -1565,6 +1841,19 @@ export const en: Dict = {
     backToSite: "Back to site",
     management: "Operations",
     overview: "System overview",
+    /* ---- Accessible names for admin chart containers (canvas/icon-only surfaces) ---- */
+    revenueChartLabel: "Revenue trend chart",
+    tunnelTypeChartLabel: "Forward type distribution chart",
+    /* ---- Accessible names for Route Profile editor icon buttons and structured inputs ---- */
+    routeProfiles: {
+      moveUp: "Move up",
+      moveDown: "Move down",
+      removeTransit: "Remove transit hop",
+      transitNode: "Transit node ID",
+      fixedNode: "Fixed node ID",
+      nodeGroup: "Node group ID",
+      strategy: "Load balancing strategy",
+    },
     userCount: "Users",
     tunnelCount: "Forwards",
     nodeCount: "Nodes",
@@ -1803,6 +2092,45 @@ export const en: Dict = {
       revokedBadge: "Revoked",
       failed: "Action failed",
     },
+  },
+  firstRun: {
+    title: "Next step",
+    loading: "Checking your setup…",
+    degradedTitle: "Can't confirm your setup right now",
+    degradedHint:
+      "Reading the resources needed to decide the next step failed, so no next step is shown — this does not mean setup is complete. Please retry.",
+    degradedPermissionHint:
+      "Your account cannot read those resources, so your setup progress cannot be determined. This does not mean setup is complete; ask your workspace administrator.",
+    unknownTitle: "Some setup facts are missing",
+    unknownHint:
+      "Some facts needed to decide the next step are missing (unavailable, or an unrecognized response shape); this does not mean setup is complete. Please retry.",
+    quotaLine: "Quota: nodes {nodesUsed} / {nodesMax} · forwards {tunnelsUsed} / {tunnelsMax}",
+    createGroupTitle: "Create your ingress node group",
+    createGroupHint:
+      "The first forward needs an ingress node group: nodes belong to a group, and its port range decides which listen ports they can use.",
+    createGroupAction: "Create ingress node group",
+    needOperatorTitle: "Someone has to do this step for you",
+    needOperatorHintPermission:
+      "Your workspace permissions do not include node:manage, so you cannot create an ingress node group or add nodes yourself. Ask a member with node:manage, or your workspace administrator.",
+    needOperatorHintPolicy:
+      "The current policy for this workspace does not grant self-service ingress groups (allow_custom_in_group = no). Ask your workspace administrator to grant it, or to provide a usable ingress node group.",
+    addNodeTitle: "Add your first node",
+    addNodeHint:
+      "The ingress node group is ready. Create a node and run the install command on the target host; once it connects you can create the first forward.",
+    addNodeAction: "Add a node",
+    addNodeHintPermission:
+      "The ingress node group is ready, but your permissions do not include node:manage, so you cannot create nodes yourself. Ask a member with that permission to add one.",
+    createForwardTitle: "Create your first forward",
+    createForwardHint:
+      "Nodes are available. Open Forward Management, pick the ingress node and enter the target to create your first forward.",
+    createForwardAction: "Create a forward",
+    createForwardHintPermission:
+      "Nodes are ready, but your permissions do not include forward:create, so you cannot create forwards yourself. Ask a member with that permission.",
+    /** "Where to look" link copy for read-only accounts (no executable action). */
+    viewNodes: "View nodes",
+    viewForwards: "View forwards",
+    doneTitle: "Setup complete",
+    doneHint: "A forward already exists, so first-run guidance is not shown.",
   },
 };
 

@@ -1,6 +1,8 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { useI18nOptional } from "@/components/providers";
+import { getDictionary } from "@/lib/i18n";
 import type { TrafficPoint } from "@/lib/types";
 
 /**
@@ -19,8 +21,13 @@ const TrafficArea = dynamic(() => import("@/components/charts/traffic-area"), {
 });
 
 export function TrafficChart({ data }: { data: TrafficPoint[] }) {
+  // recharts 的画布对屏幕阅读器不可见，这个 `aria-label` 就是图表唯一的可访问名称：
+  // 它必须跟随当前语言（旧实现写死英文 "traffic trend"，中文界面下读出来是英文）。
+  // 用 optional hook + 词典回落，保证在 Provider 之外渲染时也不会抛错、且名称非空。
+  const i18n = useI18nOptional();
+  const label = i18n?.t("dashboard.trafficChartLabel") ?? getDictionary("zh").dashboard.trafficChartLabel;
   return (
-    <div className="h-64 w-full" data-testid="traffic-chart" role="img" aria-label="traffic trend">
+    <div className="h-64 w-full" data-testid="traffic-chart" role="img" aria-label={label}>
       <TrafficArea data={data} />
     </div>
   );
