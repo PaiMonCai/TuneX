@@ -21,8 +21,7 @@
  */
 import { db } from "../src/db.ts";
 import { createPersonalWorkspace, ensurePersonalWorkspace } from "../src/services/workspace.ts";
-import { hashPassword, generatePassword, newApiKey, verifyPassword } from "../src/auth.ts";
-import { hashKey } from "../src/services/user-keys.ts";
+import { hashPassword, generatePassword } from "../src/auth.ts";
 import { writeFileSync, chmodSync } from "node:fs";
 import {
   NodeType,
@@ -56,7 +55,8 @@ const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
   NOTICE_POPUP_INTERVAL_HOURS: "24",
   SITE_NAME: "TuneX",
   SITE_DESCRIPTION: "TuneX 隧道转发服务",
-  ALLOW_REGISTER: "true",
+  // Fresh production installs are invitation-only unless an operator explicitly changes config.
+  ALLOW_REGISTER: (process.env.NODE_ENV ?? "development") === "production" ? "false" : "true",
   LOGO_URL: "",
   HIDE_NODE_STATUS: "false",
   AUTO_UPDATE_AGENT: "false",
@@ -89,6 +89,9 @@ const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
 };
 
 const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? "admin@tunex.local";
+const SEED_DEMO_DATA =
+  process.env.SEED_DEMO_DATA === "true" ||
+  (process.env.SEED_DEMO_DATA === undefined && (process.env.NODE_ENV ?? "development") !== "production");
 const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? generatePassword(24);
 const CREDENTIALS_PATH =
   process.env.ADMIN_CREDENTIALS_PATH ?? "/host/.admin-credentials";
@@ -224,10 +227,6 @@ async function seedSuperAdmin(): Promise<{
       data: {
         email: ADMIN_EMAIL,
         super_admin: true,
-        // SEC-02：种子账号同样只落 api_key 的 sha256 哈希（不落明文）。
-        // 明文只会出现在 seed 写出的凭据文件里，DB 无明文。
-        api_key: null,
-        api_key_hash: hashKey(newApiKey()),
       },
     });
     await tx.userCredential.create({
@@ -239,9 +238,7 @@ async function seedSuperAdmin(): Promise<{
 
   writeCredentials(user.email, ADMIN_PASSWORD);
   if (anySuperAdmin) {
-    console.warn(
-      `[seed] 注意：库中已存在其他 super_admin，本次新建账号 ${user.email} 也是 super_admin`,
-    );
+    console.warn(`[seed] explicit SEED_ADMIN_EMAIL created an additional super_admin: ${user.email}`);
   }
   return { id: user.id, email: user.email, created: true, passwordSet: true };
 }
@@ -372,17 +369,21 @@ async function main() {
     `[seed] super_admin: email=${admin.email} created=${admin.created} password_set=${admin.passwordSet}`,
   );
 
-  const planIds = await seedPlans();
-  console.log(`[seed] plans: ${[...planIds.keys()].join(", ")}`);
+  if (SEED_DEMO_DATA) {
+    const planIds = await seedPlans();
+    console.log(`[seed] plans: ${[...planIds.keys()].join(", ")}`);
 
-  const nodeGroupIds = await seedNodeGroups(admin.id);
-  console.log(`[seed] node_groups: ${[...nodeGroupIds.keys()].join(", ")}`);
+    const nodeGroupIds = await seedNodeGroups(admin.id);
+    console.log(`[seed] node_groups: ${[...nodeGroupIds.keys()].join(", ")}`);
 
-  const nodeCount = await seedNodes(nodeGroupIds);
-  console.log(`[seed] nodes: ${nodeCount}`);
+    const nodeCount = await seedNodes(nodeGroupIds);
+    console.log(`[seed] nodes: ${nodeCount}`);
 
-  const linkCount = await seedPlanNodeGroups(planIds, nodeGroupIds);
-  console.log(`[seed] plan_node_group links created: ${linkCount}`);
+    const linkCount = await seedPlanNodeGroups(planIds, nodeGroupIds);
+    console.log(`[seed] plan_node_group links created: ${linkCount}`);
+  } else {
+    console.log("[seed] demo plans/nodes skipped (SEED_DEMO_DATA=false)");
+  }
 
   const counts = {
     user: await db.user.count(),
