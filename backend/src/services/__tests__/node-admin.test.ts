@@ -1390,6 +1390,80 @@ describe("replaceTargets（整批替换，面板「保存池」）", () => {
     expect(targets).toHaveLength(0);
   });
 
+  test("载荷里的 id 必须属于当前池，不能跨池修改别人的 target", async () => {
+    const node = seedEgressNode();
+    const a = await createEgressPool(node.id, { name: "a" }, deps());
+    const b = await createEgressPool(node.id, { name: "b" }, deps());
+    if (!a.ok || !b.ok) throw new Error("expected pools");
+    const foreign = await createTarget(b.pool.id, { host: "10.0.0.50", port: 80 }, deps());
+    if (!foreign.ok) throw new Error("expected foreign target");
+
+    const r = await replaceTargets(
+      a.pool.id,
+      [{ id: foreign.target.id, host: "10.0.0.99", port: 443 }],
+      deps(),
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("not_found");
+    expect(targets.find((x) => x.id === foreign.target.id)).toMatchObject({
+      pool_id: b.pool.id,
+      host: "10.0.0.50",
+      port: 80,
+    });
+  });
+
+  test("删除旧目标时只有 P2025 可视为并发幂等，其它 DB 错误必须让整批失败", async () => {
+    const node = seedEgressNode();
+    const created = await createEgressPool(node.id, { name: "asia" }, deps());
+    if (!created.ok) throw new Error("expected pool");
+    const old = await createTarget(created.pool.id, { host: "10.0.0.9", port: 80 }, deps());
+    if (!old.ok) throw new Error("expected target");
+
+    const db = makeDb();
+    db.egressTarget.delete = async () => {
+      throw new Error("database connection lost");
+    };
+    const r = await replaceTargets(
+      created.pool.id,
+      [{ host: "10.0.0.10", port: 443 }],
+      { db, now: () => NOW },
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe("db_unavailable");
+  });
+
+  test("重复 id / 重复 endpoint 在任何写入前直接拒绝", async () => {
+    const node = seedEgressNode();
+    const created = await createEgressPool(node.id, { name: "asia" }, deps());
+    if (!created.ok) throw new Error("expected pool");
+    const keep = await createTarget(created.pool.id, { host: "10.0.0.9", port: 80 }, deps());
+    if (!keep.ok) throw new Error("expected target");
+    const before = targets.map((x) => ({ ...x }));
+
+    const duplicateId = await replaceTargets(
+      created.pool.id,
+      [
+        { id: keep.target.id, host: "10.0.0.9", port: 80 },
+        { id: keep.target.id, host: "10.0.0.10", port: 443 },
+      ],
+      deps(),
+    );
+    expect(duplicateId.ok).toBe(false);
+
+    const duplicateEndpoint = await replaceTargets(
+      created.pool.id,
+      [
+        { id: keep.target.id, host: "10.0.0.9", port: 80 },
+        { host: "10.0.0.9", port: 80 },
+      ],
+      deps(),
+    );
+    expect(duplicateEndpoint.ok).toBe(false);
+    expect(targets).toEqual(before);
+  });
+
   test("池不存在 → 404；非数组 → 400", async () => {
     expect((await replaceTargets(999, [], deps())).ok).toBe(false);
     const node = seedEgressNode();
