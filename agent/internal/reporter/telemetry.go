@@ -1,6 +1,6 @@
-// Package reporter — telemetry primitives (V4-WP6 Agent Telemetry).
+// Package reporter — Agent telemetry primitives.
 //
-// This file holds the *facts* side of the WP6 state report: host identity,
+// This file holds the *facts* side of the state report: host identity,
 // lightweight host resources, runtime counts and the apply/runtime error ledger.
 // The wire shape (StatePayload) and the POST loop stay in heartbeat.go; keeping
 // the two apart is what makes both testable without a network or a wall clock.
@@ -9,7 +9,7 @@
 //
 //   - The panel computes Health. The agent only reports raw facts, so nothing
 //     here produces "healthy/warning" — it produces numbers.
-//   - "V4 第一阶段不把 Agent 做成完整 Prometheus exporter": one cheap sample
+//   - keep sampling cheap: one sample
 //     per heartbeat (one Sysinfo + one Statfs + one /proc read), no collection
 //     loop, no per-metric history.
 //   - Every sampler is optional. A missing or failing source reports *nothing*
@@ -84,7 +84,7 @@ type HostSampler interface {
 	Sample() HostStats
 }
 
-// RuntimeCounts is the WP6 "DIRECT / RELAY ingress / Egress runtime 数量"
+// RuntimeCounts is the DIRECT / RELAY ingress / Egress runtime count set
 // summary. The panel compares it against its own desired runtime set without
 // having to classify the tunnel list itself.
 type RuntimeCounts struct {
@@ -186,7 +186,7 @@ func (l *Ledger) Snapshot() ErrorStats {
 }
 
 // LastError returns the newest failure message ("" when none). It makes the
-// ledger satisfy the legacy ErrorLister contract, so a caller can wire it as
+// ledger satisfies the compatibility ErrorLister contract, so a caller can wire it as
 // the report's `last_error` source and get the message plus the counters from
 // one object.
 func (l *Ledger) LastError() string { return l.Snapshot().LastMessage }

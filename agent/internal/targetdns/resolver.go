@@ -1,4 +1,4 @@
-// Package targetdns is the agent side of V5.3 WP8 (DNS dynamic targets,
+// Package targetdns implements Agent-side dynamic target DNS (
 // DEVELOPMENT.md §8.1 "DNS 是输入/观测，不是第二个 desired 真相源").
 //
 // The panel never resolves and never caches a resolution: the agent is the side
@@ -113,7 +113,7 @@ type LookupResult struct {
 type LookupFunc func(ctx context.Context, host string) (LookupResult, error)
 
 // StdlibLookup is the production resolver: the platform resolver, exactly as
-// before V5.3.
+// without the resolver.
 //
 // It reports no TTL because it cannot: net.Resolver exposes no record TTL, and
 // reading one would mean hand-rolling a DNS client — which would silently drop

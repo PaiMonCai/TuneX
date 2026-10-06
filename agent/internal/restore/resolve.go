@@ -19,7 +19,7 @@ const (
 )
 
 // FetchAuthoritative resolves the desired state for a startup restore, applying
-// the WP11A fallback policy:
+// the restore fallback policy:
 //
 //   - panel answers → that answer is authoritative, cache untouched;
 //   - panel is UNREACHABLE → fall back to the local last-known-good cache;
@@ -132,7 +132,7 @@ func RefreshCache(cache LKG, agentID string, tunnels *manager.TunnelManager, ver
 // Reconcile makes the running runtime match an AUTHORITATIVE snapshot: any
 // listener the snapshot does not mention is removed.
 //
-// Why this exists (WP11A/A4): the panel is the only authority on which forwards
+// Why this exists: the panel is the only authority on which forwards
 // exist. When a node restored from its local cache during an outage and the
 // panel later comes back with a forward already deleted, suspended or moved
 // away, nothing else on the agent side would ever take that listener down —
@@ -163,7 +163,7 @@ func Reconcile(ctx context.Context, tunnels *manager.TunnelManager, egress *mana
 		}
 		removed = append(removed, id)
 	}
-	// V5.4：**出口侧的 runtime 也必须按同一份权威集合裁剪。**
+	// 出口侧的 runtime 也必须按同一份权威集合裁剪。
 	//
 	// 上面那个循环只看得见 `TunnelManager` 里的 runtime，而在**纯出口节点**上那个集合是**空的** ——
 	// 出口 runtime 活在 `EgressManager` 的池表里。实测后果：一条 Forward 在节点离线期间被删除，

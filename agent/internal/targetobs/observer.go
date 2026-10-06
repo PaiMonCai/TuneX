@@ -1,4 +1,4 @@
-// Package targetobs is the V5.2-WP5 (Target Observation) agent-side observer:
+// Package targetobs is the Agent-side target observer:
 // the component that turns "this node is supposed to serve these targets" into
 // the frozen fact set the panel reads (DEVELOPMENT.md §7, 冻结结论 rows 1-9).
 //
@@ -18,7 +18,7 @@
 //     bandwidth accounting — the same rule internal/diag follows, and the
 //     reason the egress node does the probing rather than the ingress node.
 //   - Observation is a FACT, never desired state (rows 4/5). Nothing here writes
-//     to the manager, deletes a target, or feeds routing: WP7 decides what to do
+//     to the manager, deletes a target, or feeds routing: health-aware routing decides what to do
 //     with these facts, and one failed probe must never change a decision
 //     (§7 "禁止 single timeout → automatic failover").
 //
@@ -294,7 +294,7 @@ type Observation struct {
 	// missing latency and a zero latency are different facts.
 	LatencyMS *int64 `json:"latency_ms"`
 
-	// ConsecutiveSuccess/Failure count since the last flip. WP6's hysteresis
+	// ConsecutiveSuccess/Failure count since the last flip. the panel's health-synthesis hysteresis
 	// reads these (N consecutive failures to go unhealthy, M to come back), so
 	// they are raw counts, never smoothed.
 	ConsecutiveSuccess int `json:"consecutive_success"`
