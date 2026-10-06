@@ -408,8 +408,9 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     }
     await tx.ticket.deleteMany({ where: { user_id: id } });
 
-    // 基础设施：隧道链 / 流量 / DNS / 节点 / 节点组 / 套餐绑定
-    await tx.tunnelTraffic.deleteMany({ where: { tunnel: { user_id: id } } });
+    // 基础设施：隧道链 / DNS / 节点 / 节点组 / 套餐绑定。
+    // tunnel_traffic is an immutable accounting ledger and deliberately survives
+    // deletion of its live Tunnel/User/Workspace objects. It has no live FK.
     await tx.tunnelChain.deleteMany({ where: { tunnel: { user_id: id } } });
     await tx.tunnel.deleteMany({ where: { user_id: id } });
     await tx.inNodeGroupDNS.deleteMany({ where: { in_node_group: { user_id: id } } });
