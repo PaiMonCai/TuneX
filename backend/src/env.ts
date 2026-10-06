@@ -53,7 +53,9 @@ export const env = {
 
   cookieName: process.env.COOKIE_NAME ?? "access",
   /** secure 开关：明文 HTTP 本地栈置 false，TLS 环境必须 true */
-  cookieSecure: (process.env.COOKIE_SECURE ?? "false") === "true",
+  cookieSecure:
+    (process.env.COOKIE_SECURE ??
+      ((process.env.NODE_ENV ?? "development") === "production" ? "true" : "false")) === "true",
 
   // Invitation-only beta must fail closed in production when the variable is omitted.
   // Development keeps the convenient historical default.
