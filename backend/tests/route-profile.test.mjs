@@ -20,7 +20,7 @@
  *
  * 环境变量：
  *   TUNEX_DB_TEST=1   本文件才真正执行（未设置时整文件 skip）
- *   DATABASE_URL / REDIS_URL / AUTH_SECRET / LICENSE_SECRET 指向测试实例
+ *   DATABASE_URL / REDIS_URL / AUTH_SECRET 指向测试实例
  */
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
@@ -32,7 +32,6 @@ if (!DB_TEST) {
   test("route profile HTTP/DB integration (requires TUNEX_DB_TEST=1)", { skip: true }, () => {});
 } else {
   process.env.AUTH_SECRET ??= "test-only-auth-secret-must-not-be-used-in-production";
-  process.env.LICENSE_SECRET ??= "test-only-license-secret-must-not-be-used-in-production";
   process.env.PAYMENTS_ENABLED = "false";
   process.env.ALLOW_REGISTER_FALLBACK = "true";
 
