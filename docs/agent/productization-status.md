@@ -480,6 +480,23 @@ t+5s → state=synced  verified=true  confirmed=["172.33.10.20"]  attempt=0  nex
 
 这两条再次印证本专项的方法论：**先问"默认配置下它会不会触发"，再谈 UI**。
 
+## 3.21 task-10（通知渠道配置端点）完成：真机 + 真库证据
+
+交付：`backend/src/routes/notification-channels.ts`（+ 23 条行为测试）、`permissions.ts` 登记 `notification_channels` 资源键、`app.ts` 挂载一行；**未动** worker/投递逻辑/schema/迁移/web。
+
+证据（`notify-center` 用**临时**容器 + 真实 MySQL/Redis，唯一容器名，用完已删；未碰 `tunex-it-*`）：
+- 未认证 GET → 401；超管 200；`/api/admin/meta/resources` 真实返回含该资源键；
+- `PUT telegram {enabled,secret}` → 200，`value:""`、`secret_configured:true`、`secret_state:"sealed"`；**响应与 GET 都逐字不含明文、不含 `secret_enc`**；
+- 真实库落库形态：`scope_kind=platform, workspace_id=NULL, secret_enc` 前缀 `v1.`；`LIKE '%<明文>%'` = **0 行**（明文不在库）；
+- 非法形状 14 例全部 400 且**零写调用/零行变化**；`enabled=false` 与"未配置"可分；
+- **`delivery_kinds` 是现场调用既有构造函数算出来的** ⇒ "保存成功 ≠ 会被投递"是**投影**而不是文案；webhook 保存后会带 warning「不在注册表里」；
+- 最终真实库 `notification_channel` 回到 **0 行**（环境恢复原状）。
+- 后端 `bun run typecheck` 0 错、`bun test src` **2863 pass / 0 fail（128 文件）**。
+
+**它如实标注的边界**（不得越界宣称）：admin **UI 尚不存在**（故"可从 UI 配置"仍不成立）；真实拓扑上没跑过真实投递（`enabled` 集合在 scratch 上恒空，需 task-11 接线）；非超管真机路径未跑（只跑了受控真实中间件 + 真实超管）；`secret_state:"unreadable"` 只在受控测试构造；多行 telegram 真机路径未构造。
+
+**后续**：新建 `task-20`（admin 渠道配置 UI，已派给 `notify-center`）；`task-11`（worker 注册通知 job）**已解锁**（task-8 早已 completed），并已提醒对方这一点。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
