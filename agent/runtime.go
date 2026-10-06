@@ -21,8 +21,8 @@ import (
 	"github.com/tunex/agent/internal/targetobs"
 )
 
-// v3Runtime bundles the Agent components so main can start and stop them as one unit.
-type v3Runtime struct {
+// agentRuntime owns the process-level Agent components so startup and shutdown share one lifecycle.
+type agentRuntime struct {
 	cfg     *agentconfig.Config
 	tunnels *manager.TunnelManager
 	egress  *manager.EgressManager
@@ -60,18 +60,11 @@ type v3Runtime struct {
 	restoredFromCache bool
 }
 
-// startV3Runtime builds the v3 components and brings them up in the documented
-// order.
+// startRuntime wires the production Agent components and starts them in dependency order.
 //
-// The role decides which components start:
-//
-//	INGRESS: tunnel manager + admin API + restore + heartbeat
-//	EGRESS:  egress manager  + admin API + restore + heartbeat
-//	BOTH:    everything, with ONE shared port guard
-//
-// "BOTH" is the default because a freshly provisioned node has no role yet and
-// the v3 tunnel managers must be ready for the first apply.
-func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
+// The role controls which data-plane responsibilities are active. BOTH is the
+// default so a newly provisioned node can accept its first assignment.
+func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 	// startedAt is sampled once here: uptime must measure the agent process, not
 	// the moment the reporter happened to build a payload.
 	startedAt := time.Now()
@@ -83,13 +76,13 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 	egress := manager.NewEgressManager()
 	tunnels := manager.NewTunnelManager(egress, cfg.ListenIP)
 
-	rt := &v3Runtime{cfg: cfg, tunnels: tunnels, egress: egress}
+	rt := &agentRuntime{cfg: cfg, tunnels: tunnels, egress: egress}
 	rt.cache = restore.LKG{Path: cfg.LKGPath()}
 	if cfg.AgentAdminPort == 0 && cfg.PanelHTTPURL == "" {
 		// Nothing to bring up: no admin plane and nothing to report to. The
 		// node still accepts no apply commands, so say so loudly instead of
 		// silently running an empty process.
-		logx.Warn("v3 runtime idle: no AGENT_ADMIN_PORT and no PANEL_HTTP_URL; this node cannot receive tunnels")
+		logx.Warn("agent runtime idle: no AGENT_ADMIN_PORT and no PANEL_HTTP_URL; this node cannot receive tunnels")
 	}
 
 	// One error ledger and one revision tracker are shared by the
@@ -186,10 +179,10 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		// A failed restore must not stop the node: it still serves /health and
 		// can accept apply commands. Logged loudly because it usually means a
 		// panel outage right after a restart.
-		logx.Error("v3 restore failed", "err", err.Error())
+		logx.Error("restore failed", "err", err.Error())
 	} else {
 		rt.restoredFromCache = source == restore.SourceLKG
-		logx.Info("v3 restore done", "tunnels", tunnels.Len(), "role", role, "source", source)
+		logx.Info("restore done", "tunnels", tunnels.Len(), "role", role, "source", source)
 	}
 
 	// 2. Admin API.
@@ -208,30 +201,30 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 				NodeID:     cfg.NodeID,
 				Version:    version,
 				Role:       role,
-				// V5.3 WP9: the fencing counters/state are part of the node's
+				// ownership: the fencing counters/state are part of the node's
 				// health surface, so an operator can see refusals and lapsed
 				// leases without opening the agent log.
 				Ownership: ownerGuard,
 				TargetDNS: resolver,
 			}, tunnels, egress, nil)
 			if err != nil {
-				logx.Error("v3 admin api disabled", "err", err.Error())
+				logx.Error("admin api disabled", "err", err.Error())
 			} else if err := srv.Start(); err != nil {
-				logx.Error("v3 admin api start failed", "addr", srv.ListenAddr(), "err", err.Error())
+				logx.Error("admin api start failed", "addr", srv.ListenAddr(), "err", err.Error())
 			} else {
 				rt.api = srv
-				logx.Info("v3 admin api listening", "addr", srv.ListenAddr(), "role", role)
+				logx.Info("admin api listening", "addr", srv.ListenAddr(), "role", role)
 			}
 		}
 	}
 
-	// observations is the V5-WP5 observation source for the state report. It
+	// observations is the current-current observation source for the state report. It
 	// stays a nil interface when the observer is not running, so the report
 	// omits `target_observations` rather than claiming "no targets failed".
 	var observations reporter.TargetObservationLister
 
 	// The lease clock runs for the whole process: it is the fail-safe half of
-	// WP9 ("lease expired means STOP"), and it reads the running registry each
+	// the ownership lease policy, and it reads the running registry each
 	// tick rather than trusting a timer armed by whichever path applied a
 	// tunnel. Cancelled with the process context like everything else.
 	go ownerGuard.Run(ctx)
@@ -245,14 +238,14 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			Credential: cfg.NodeCredential,
 			Errors:     ledger,
 			Revisions:  revisions,
-			// WP11A/A4: when the panel becomes reachable again, re-fetch the
+			// reconnect reconciliation: when the panel becomes reachable again, re-fetch the
 			// authoritative desired state and drop anything it no longer lists.
 			// A node that restored from its cache would otherwise keep running a
 			// forward the panel has already deleted or suspended.
 			Reconnected: func(rctx context.Context) {
 				reconcileWithPanel(rctx, cfg, tunnels, egress, rt.cache)
 			},
-			// WP11C: answer a Node-level diagnostic with this process's own
+			// node diagnostics: answer a Node-level diagnostic with this process's own
 			// bounded facts. Wired here because the runtime owns the tunnel
 			// manager, the LKG path and the start time.
 			DescribeSelf: func() selfinfo.Facts {
@@ -272,16 +265,16 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		}
 		go func() {
 			if err := rt.control.Run(ctx); err != nil {
-				logx.Debug("v3 control loop stopped", "err", err.Error())
+				logx.Debug("control loop stopped", "err", err.Error())
 			}
 		}()
-		logx.Info("v3 outbound control scheduled", "url", cfg.PanelHTTPURL)
+		logx.Info("outbound control scheduled", "url", cfg.PanelHTTPURL)
 	}
 
 	// 4. Heartbeat reporter. Disabled (nil) when no panel URL is configured;
 	// Run's ErrNoPanelURL path is handled by the goroutine below.
 	//
-	// V5.2-WP5 target observation starts just before it, so the very first state
+	// target observation target observation starts just before it, so the very first state
 	// report can already carry facts instead of an empty key.
 	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
 		// The observer probes ONLY the targets of the egress pools this node
@@ -317,33 +310,33 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 			Credential: cfg.NodeCredential,
 		},
 			reporter.WithTunnels(tunnels),
-			// V5-WP5-A3: the per-tunnel protocol diagnostics ride the state report.
+			// protocol diagnostics: the per-tunnel protocol diagnostics ride the state report.
 			// The manager is the source because it owns the running registry — the
 			// counters live in the runtime that observed the events; the panel only
 			// ever displays them.
 			reporter.WithDiagnostics(tunnels),
-			// V5.2-WP5: the target observer's facts (empty when it was not
+			// target observation: the target observer's facts (empty when it was not
 			// started above, which keeps the wire key absent).
 			reporter.WithTargetObservations(observations),
-			// V5.3-WP9: the panel hands the renewed ownership deadlines back in
+			// ownership: the panel hands the renewed ownership deadlines back in
 			// the answer to this very report. Dropping that answer is what makes
 			// a healthy node stop every tunnel one TTL after its last config.
 			reporter.WithLeases(leaseSink{ownerGuard}),
 			reporter.WithEgress(egressAdapter{egress}),
 			reporter.WithPorts(tunnels),
 			reporter.WithRevision(tunnels),
-			// V4-WP6 (§13.4.4): host facts, resource sample, error ledger and
+			// host/resource/error reporting: host facts, resource sample, error ledger and
 			// the newest-seen revision ride the existing state report.
 			reporter.WithHost(reporter.NewSystemSampler("")),
 			reporter.WithLedger(ledger),
 			reporter.WithLastError(ledger),
 			reporter.WithRevisionState(revisions),
 			reporter.WithStartedAt(startedAt),
-			// WP11B: advertise the control-contract version and the actions this
+			// control negotiation: advertise the control-contract version and the actions this
 			// binary really implements, so the panel can refuse to send an action
 			// an older node would only answer with `unsupported_action`.
 			reporter.WithProtocol(control.ProtocolVersion, control.Capabilities()),
-			// V5-WP1: advertise the protocol/transport/runtime facts this process
+			// capability manifest: advertise the protocol/transport/runtime facts this process
 			// actually wired up. The facts are computed from what was constructed
 			// above — the LKG cache only claims lkg_restore when the store was
 			// really enabled, and the protocol list comes from the data plane's
@@ -352,10 +345,10 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 		)
 		go func() {
 			if err := rt.heart.Run(ctx); err != nil {
-				logx.Debug("v3 heartbeat stopped", "err", err.Error())
+				logx.Debug("heartbeat stopped", "err", err.Error())
 			}
 		}()
-		logx.Info("v3 heartbeat scheduled", "url", cfg.PanelHTTPURL, "interval", reporter.Interval.String())
+		logx.Info("heartbeat scheduled", "url", cfg.PanelHTTPURL, "interval", reporter.Interval.String())
 	}
 
 	rt.startedAt = time.Now()
@@ -404,7 +397,7 @@ func startV3Runtime(ctx context.Context, cfg *agentconfig.Config) *v3Runtime {
 // snapshot, plus the restore path). Without a shared mutex an older snapshot can
 // be renamed into place *after* a newer one, which silently rolls the "last known
 // good" state backwards — the one direction this cache must never move.
-func (rt *v3Runtime) writeCache(version string) {
+func (rt *agentRuntime) writeCache(version string) {
 	rt.cacheMu.Lock()
 	defer rt.cacheMu.Unlock()
 	restore.RefreshCache(rt.cache, rt.cfg.AgentID, rt.tunnels, version)
@@ -415,14 +408,14 @@ func (rt *v3Runtime) writeCache(version string) {
 //
 // Why it takes a fact instead of being a package-level constant: the manifest is
 // a claim about what this binary does. hot_reload and graceful_drain come from
-// the data plane the runtime always builds (forwarder.Forwarder.SetUpstream /
+// the data plane the runtime always builds (forwarder.StreamRuntime.SetUpstream /
 // Drain), but lkg_restore is only true when the local cache is enabled for this
 // deployment. Advertising it unconditionally would tell the panel a node can
 // survive a panel outage when it cannot.
 //
 // A build error here is a programming error (an unknown name was passed in), so
 // the manifest is omitted rather than guessed: no manifest means the panel falls
-// back to V4 baseline admission, which is safe, whereas a wrong manifest is not.
+// back to baseline admission, which is safe, whereas a wrong manifest is not.
 func runtimeManifest(lkgEnabled bool) *reporter.CapabilityManifest {
 	runtimeFeatures := []control.RuntimeFeature{control.RuntimeHotReload, control.RuntimeGracefulDrain}
 	if lkgEnabled {
@@ -459,210 +452,3 @@ const lkgRefreshInterval = 5 * time.Second
 // comes back and prunes runtime the panel no longer lists. A failed or
 // non-authoritative fetch is a no-op: pruning on a guess would take down work
 // the panel still wants.
-func reconcileWithPanel(ctx context.Context, cfg *agentconfig.Config, tunnels *manager.TunnelManager, egress *manager.EgressManager, cache restore.LKG) {
-	if cfg.PanelHTTPURL == "" || cfg.NodeCredential == "" {
-		return
-	}
-	rctx, cancel := context.WithTimeout(ctx, restore.FetchTimeout)
-	defer cancel()
-	src := restore.HTTPSource{PanelURL: cfg.PanelHTTPURL, Credential: cfg.NodeCredential}
-	snap, source, err := restore.FetchAuthoritative(rctx, src, cache, cfg.AgentID)
-	if err != nil {
-		logx.Debug("reconnect reconcile skipped: desired state unavailable", "err", err.Error())
-		return
-	}
-	// Only a panel answer authorises pruning; a cache fallback must never be
-	// used as the authority to delete runtime.
-	if snap == nil || source != restore.SourcePanel {
-		return
-	}
-	restore.Reconcile(rctx, tunnels, egress, snap)
-}
-
-// ShutdownTimeout bounds the whole teardown: listeners close immediately, then
-// in-flight connections get this long, then anything left is force-closed.
-const ShutdownTimeout = 10 * time.Second
-
-// FinalReportTimeout bounds the closing state report. It is short on purpose:
-// the point is to leave a trace, not to hold up a container stop.
-const FinalReportTimeout = 3 * time.Second
-
-// Shutdown tears the runtime down in a fixed order:
-//
-//  1. refuse new applies (manager.BeginShutdown) — a command arriving mid-teardown
-//     must not be able to rebind a port;
-//  2. CLOSE EVERY LISTENER, synchronously — from this instant a new TCP
-//     connection is refused. Nothing that can block (cache fsync, state report)
-//     may happen before this line: the node's contract with its clients is "stop
-//     accepting new work now", and it must not depend on how long anything else
-//     takes;
-//  3. take one last cache snapshot and send a final bounded state report; both are
-//     bounded and both happen while the finished runtime facts still exist (the
-//     listener is closed, the connections are still tracked, the registry is
-//     intact) so the panel receives facts rather than a guess;
-//  4. drain in-flight connections until ONE absolute deadline, force-closing
-//     whatever survives it. Both ends of every proxied pair are closed, so a peer
-//     that never speaks again cannot hold a handler past the deadline;
-//  5. stop the reporter and the admin plane, and wait for the cache writer.
-//
-// The total is bounded by ShutdownTimeout: the deadline for the drain is derived
-// from the moment the teardown started, not from "now" after the report.
-//
-// It is safe to call on a runtime whose admin API never started, and safe to
-// call twice.
-func (rt *v3Runtime) Shutdown() {
-	if rt == nil || !rt.started {
-		return
-	}
-	rt.started = false
-	startedAt := time.Now()
-	if rt.cacheTick != nil {
-		rt.cacheTick.Stop()
-	}
-
-	// Step 1 + 2: refuse new work, then stop accepting new connections. Both are
-	// synchronous and immediate on purpose — this is the part of a shutdown the
-	// outside world can observe.
-	rt.tunnels.BeginShutdown()
-	closed := rt.tunnels.CloseListeners()
-	logx.Info("shutdown: listeners closed", "listeners", len(closed))
-
-	// The registry and the live connections are still intact here, so the closing
-	// report describes the node's real state.
-	reportCtx, cancelReport := context.WithTimeout(context.Background(), FinalReportTimeout)
-	rt.writeCache(version)
-	if rt.heart != nil {
-		if err := rt.heart.ReportOnce(reportCtx); err != nil {
-			logx.Debug("final state report failed", "err", err.Error())
-		}
-	}
-	cancelReport()
-
-	// Step 4: one absolute deadline for the whole teardown, so the cache write and
-	// the report above cannot eat the window meant for draining.
-	remaining := ShutdownTimeout - time.Since(startedAt)
-	if remaining < 0 {
-		remaining = 0
-	}
-	report := rt.tunnels.ShutdownAll(remaining)
-	// Datagram mappings are reported separately because they are dropped, not
-	// waited out: a UDP mapping ends by idle expiry or by its socket closing
-	// (§2.3③ of the datagram contract), so a datagram tunnel that was relaying
-	// would otherwise contribute "0 forced, 0 remaining" to this line.
-	if report.RemainingConns > 0 || report.ForcedConns > 0 || report.ForcedMappings > 0 {
-		logx.Warn("shutdown closed work past the deadline",
-			"forced", report.ForcedConns,
-			"forced_mappings", report.ForcedMappings,
-			"remaining", report.RemainingConns)
-	}
-
-	if rt.heart != nil {
-		rt.heart.Stop()
-	}
-	if rt.api != nil {
-		if err := rt.api.Stop(); err != nil {
-			logx.Debug("v3 admin api stop error", "err", err.Error())
-		}
-	}
-	// The cache writer exits with the process context, but a shutdown triggered
-	// without cancelling it must not leave a goroutine writing into a torn-down
-	// runtime.
-	rt.cacheWrites.Wait()
-	rt.egress = nil
-}
-
-// restoreTunnels applies the node's desired state and reports whether it came
-// from the Panel or the last-known-good cache. EGRESS state restores its target
-// pool before the forwarder is built. writeMu shares the cache lock with the
-// writer loop and Shutdown so restore cannot race a refresh into the same file.
-func restoreTunnels(ctx context.Context, tunnels *manager.TunnelManager, egress *manager.EgressManager, role string, cfg *agentconfig.Config, cache restore.LKG, writeMu *sync.Mutex) (string, error) {
-	if role == agentconfig.RoleIngress {
-		// An ingress node has no egress pools of its own; a nil EgressManager
-		// would make restore.Apply skip EGRESS tunnels instead of half-starting
-		// them (they belong on the egress node).
-		egress = nil
-	}
-	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	// A Panel outage falls back to the local last-known-good cache; an
-	// auth/identity/malformed answer does not (see restore.FetchAuthoritative).
-	snap, source, err := restore.FetchAuthoritative(rctx, source(cfg), cache, cfg.AgentID)
-	if err != nil {
-		return "", err
-	}
-	if snap == nil {
-		return source, nil
-	}
-	writeMu.Lock()
-	failed, err := restore.ApplyAndCache(rctx, tunnels, egress, snap, cache, cfg.AgentID)
-	writeMu.Unlock()
-	if err != nil {
-		return source, err
-	}
-	if len(failed) > 0 {
-		logx.Warn("v3 restore partially applied", "failed", fmt.Sprint(failed), "source", source)
-	}
-	// A cache-sourced restore is by definition not authoritative, so it must not
-	// prune anything. A panel-sourced one is: a tunnel the panel no longer lists
-	// (deleted/suspended while this node was down) must not keep running.
-	if source == restore.SourcePanel {
-		if removed := restore.Reconcile(rctx, tunnels, egress, snap); len(removed) > 0 {
-			logx.Info("v3 restore pruned runtime absent from desired state", "ids", fmt.Sprint(removed))
-		}
-	}
-	return source, nil
-}
-
-// source returns the canonical desired-state restore source. It uses the same
-// outbound per-node credential as the command loop and never needs an inbound
-// Agent management port.
-func source(cfg *agentconfig.Config) restore.Source {
-	if cfg == nil || cfg.PanelHTTPURL == "" || cfg.NodeCredential == "" {
-		return restore.NopSource{}
-	}
-	return restore.HTTPSource{PanelURL: cfg.PanelHTTPURL, Credential: cfg.NodeCredential}
-}
-
-// leaseSink adapts the ownership guard to the reporter's lease interface.
-//
-// The conversion lives here, like egressAdapter, so the reporter stays free of
-// the enforcement package: it carries the wire facts, it does not decide what
-// they mean.
-type leaseSink struct{ guard *ownership.Guard }
-
-func (s leaseSink) ObserveLeases(leases []reporter.LeaseRenewal, at time.Time) {
-	if s.guard == nil || len(leases) == 0 {
-		return
-	}
-	converted := make([]ownership.Renewal, 0, len(leases))
-	for _, l := range leases {
-		converted = append(converted, ownership.Renewal{
-			TunnelRef: l.TunnelRef,
-			Epoch:     l.Epoch,
-			ExpiresAt: l.ExpiresAt,
-			Revision:  l.Revision,
-		})
-	}
-	if applied, missed := s.guard.ObserveRenewals(converted, at); missed > 0 {
-		// Not an error: a lease for a tunnel this node does not run is a
-		// legitimate panel answer. It is a fact worth a line, because a climbing
-		// count means the placement and this node's identity disagree.
-		logx.Debug("ownership: some renewals matched no running tunnel",
-			"applied", applied, "unmatched", missed)
-	}
-}
-
-// egressAdapter maps manager.EgressManager.Snapshot's PoolSnapshot onto the
-// reporter's EgressPool view so the heartbeat JSON shape stays decoupled from
-// the manager package.
-type egressAdapter struct{ e *manager.EgressManager }
-
-func (a egressAdapter) Snapshot() map[string]reporter.EgressPool {
-	in := a.e.Snapshot()
-	out := make(map[string]reporter.EgressPool, len(in))
-	for id, p := range in {
-		out[id] = reporter.EgressPool{Strategy: p.Strategy, Targets: p.Targets}
-	}
-	return out
-}

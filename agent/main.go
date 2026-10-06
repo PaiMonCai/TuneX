@@ -24,8 +24,7 @@ import (
 )
 
 // version is stamped at build time with -ldflags "-X main.version=..".
-// The default mirrors the original agent so servers that log/gate on the
-// reported version see a familiar value.
+// The default is a fallback for local builds; release builds may stamp it with ldflags.
 var version = "0.13.22"
 
 func main() {
@@ -38,7 +37,7 @@ func main() {
 //
 //  1. managers (TunnelManager + EgressManager; one shared port guard)
 //  2. restore: pull the node's ACTIVE tunnels so ports are re-bound after a
-//     restart (devmap §5.5).
+//     restart using the authoritative desired-state restore path.
 //  3. admin API (:9090) — the mutation surface
 //  4. heartbeat / state report (every 30s)
 //
@@ -63,7 +62,7 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	rt := startV3Runtime(ctx, cfg)
+	rt := startRuntime(ctx, cfg)
 	if rt != nil {
 		defer rt.Shutdown()
 	}

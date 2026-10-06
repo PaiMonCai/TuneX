@@ -276,7 +276,7 @@ func applyDefaults(cfg *Config, file string) error {
 }
 
 func printUsage(w io.Writer, version string) {
-	fmt.Fprintf(w, `TuneX agent — node side of the TuneX control plane (v3 runtime).
+	fmt.Fprintf(w, `TuneX agent — node-side data plane for the TuneX control plane.
 
 Usage:
   tunex-agent [flags]

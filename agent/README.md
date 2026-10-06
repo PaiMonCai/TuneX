@@ -165,7 +165,10 @@ never be logged.
 | Path | Purpose |
 | --- | --- |
 | `main.go` | process lifecycle and signal handling |
-| `v3runtime.go` | wires the production runtime together |
+| `runtime.go` | process-level runtime wiring and capability setup |
+| `runtime_restore.go` | desired-state restore and reconnect reconciliation |
+| `runtime_shutdown.go` | bounded graceful shutdown |
+| `runtime_adapters.go` | narrow adapters between runtime subsystems |
 | `internal/agentconfig` | flags, env and flat YAML configuration |
 | `internal/control` | outbound command polling, dispatch and ACK |
 | `internal/reporter` | heartbeat, state, telemetry and capability reporting |
@@ -190,4 +193,4 @@ never be logged.
 - Keep secrets, node credentials and private key material out of logs and support
   bundles.
 - New protocols remain fail-closed until their runtime, capability advertisement,
-  control contract and regression Gate are delivered together.
+  control contract and regression verification are delivered together.
