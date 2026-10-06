@@ -455,9 +455,6 @@ describe("C. payload：tls 带路径，tcp/ws 结构上带不了", () => {
     expect(FORWARD_PROTOCOLS as readonly string[]).toContain(draft.protocol);
   });
 
-);
-
-);
 });
 
 describe("D. 渲染：tls / ws / 历史值都照事实，不存在 unknown 兜底", () => {
@@ -512,9 +509,6 @@ describe("D. 渲染：tls / ws / 历史值都照事实，不存在 unknown 兜�
     expect(html).not.toContain("forward-protocol-unsupported");
   });
 
-);
-
-);
 
   test("编辑器里协议只读（后端 patch 仍不接受 protocol），并给出原因", () => {
     expect(EDIT_DIALOG).toContain('data-testid="forward-edit-protocol"');
