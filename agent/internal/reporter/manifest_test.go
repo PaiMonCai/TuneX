@@ -7,10 +7,10 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// V5-WP1: the state report carries the additive v2 capability manifest.
+// The state report carries the additive v2 capability manifest.
 //
-// The distinction that matters is the same one as WP11B's: "absent" means the
-// agent never described itself (the panel falls back to the V4 baseline), while
+// The distinction that matters is: "absent" means the
+// Agent never described itself (the panel falls back to the action-only baseline), while
 // an empty list means "I implement nothing" (the panel fails closed). Sending a
 // zero-valued manifest for an unconfigured reporter would erase that difference.
 
@@ -111,7 +111,7 @@ func TestWithManifestCopiesLists(t *testing.T) {
 	}
 }
 
-// V5-WP5-A3: per-tunnel protocol diagnostics ride the state report.
+// Per-tunnel protocol diagnostics ride the state report.
 //
 // Two properties matter: the config shape stays byte-compatible for an older
 // panel (the config is embedded), and "this protocol has no facts" stays

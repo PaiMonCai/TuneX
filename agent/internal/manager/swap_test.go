@@ -12,8 +12,8 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// WP2 — manager-layer hot reload primitives: the swap decision, the
-// listener-safe replacement, and drain (DEVELOPMENT.md §13.3.4 / §13.3.5).
+// Manager-layer hot-reload primitives: the swap decision, the
+// listener-safe replacement, and drain.
 //
 // Everything here uses real loopback sockets. The claim under test is about
 // observable behaviour ("this port stopped accepting", "this connection kept
@@ -102,7 +102,7 @@ func servedLabel(t *testing.T, addr string) string {
 }
 
 // ---------------------------------------------------------------------------
-// PlanForwardSwap — the WP3 plan input, asserted row by row against §13.3.4
+// PlanForwardSwap — the rollout plan input, asserted by change category
 // ---------------------------------------------------------------------------
 
 func TestPlanForwardSwapDecisionTable(t *testing.T) {
@@ -1006,7 +1006,7 @@ func TestDrainTunnelStopsAcceptingButKeepsThePort(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The §13.3.4 "RELAY Egress" row: the capability already existed; WP2 anchors
+// RELAY Egress target swap: the capability already exists; this test anchors
 // it to the contract with an explicit "old connections survive" assertion.
 // ---------------------------------------------------------------------------
 

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// V4-WP11B: the state report carries the control-protocol negotiation facts.
+// The state report carries the control-protocol negotiation facts.
 // The distinction that matters is "absent" vs "empty": the panel decides whether
 // it may send a non-baseline action from it, so an unconfigured agent must omit
 // the fields rather than report zero values.

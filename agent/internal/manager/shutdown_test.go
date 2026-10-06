@@ -10,7 +10,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// WP11A manager-level shutdown: refuse new applies, then close every listener
+// Manager-level shutdown: refuse new applies, then close every listener
 // under one shared deadline.
 
 func liveTarget(t *testing.T) (int, func()) {
@@ -139,7 +139,7 @@ func newUnstartedForwarder(t *testing.T, upstream int) forwarder.Forwarder {
 	return fwd
 }
 
-// ── v4 audit: the production apply path and the two-phase ordering ──────────
+// ── production apply path and two-phase ordering regression ─────────────────
 
 // ReplaceListener is the entry the control plane actually uses for a listener
 // change, so the shutdown latch must cover it too — not just Apply.

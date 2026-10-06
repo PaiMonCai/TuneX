@@ -8,7 +8,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// V5.3-WP9: the activation gate is installed on the manager, so EVERY path that
+// The activation gate is installed on the manager, so every path that
 // can start serving a tunnel is fenced by one implementation — the control
 // dispatch, the reconnect snapshot, startup restore and the local admin plane.
 // These tests pin the two properties that make that claim true: a refusal

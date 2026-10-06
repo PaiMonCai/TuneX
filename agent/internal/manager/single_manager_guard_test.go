@@ -8,14 +8,14 @@ import (
 	"testing"
 )
 
-// V5-WP2 "D. Manager 不复制" guard.
+// Single-manager guard.
 //
 // The runtime abstraction is only worth having if it stays an abstraction. The
 // failure mode it is meant to prevent is concrete and easy to fall into: the
-// first datagram protocol (V5.1b UDP) arrives, someone adds a UDPManager beside
+// a datagram protocol arrives, someone adds a UDPManager beside
 // TunnelManager because "UDP is different", and from then on there are two
 // revision ledgers, two port owners and two reconcile paths — which is exactly
-// what V4's frozen baseline forbids (§1.1: no second DIRECT engine, no second
+// what the architecture forbids: no second DIRECT engine, no second
 // RELAY engine, no second port ownership, no second desired-state truth).
 //
 // This is a source-level guard on purpose. A type-level assertion cannot see a
