@@ -44,4 +44,14 @@ COPY --chmod=0755 agent/docker-entrypoint.sh /usr/local/bin/tunex-agent-entrypoi
 # 老镜像（二进制不认识该标志）仍由渲染脚本里的 curl/wget 兜底路径服务，且文案会
 # 如实标注"这是兜底路径"。
 
+# `iputils` 只为 `tracepath` 引入（Looking Glass 的 traceroute/traceroute6）。
+#
+# 为什么不装/不用 busybox `traceroute`：它需要 **raw socket（CAP_NET_RAW）**，而生产安装
+# 给 agent 的是 `--cap-drop ALL --cap-add NET_BIND_SERVICE`，实测 EPERM；
+# `tracepath`（iputils）用**非特权** UDP 探测 + ICMP 超时回包，同 caps 下实测真的出跳：
+#   `tracepath -n -m 3 1.1.1.1` → 1: 172.17.0.1 / 2: 10.1.32.1 / 3: 103.185.248.1
+# 目标家族没有出网路径时它给 `send failed` —— 那是**诚实的网络事实**，不是方法不可用。
+# `mtr` 仍然不提供（该发行包没有它，且默认需要 raw socket）。
+RUN apk add --no-cache iputils
+
 ENTRYPOINT ["/usr/local/bin/tunex-agent-entrypoint"]

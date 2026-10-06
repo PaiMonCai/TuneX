@@ -81,6 +81,12 @@ export interface ForwardHaOptionNode {
   takeover_rejection: string | null;
   /** 平台当前的接管次序（1 起）；不能接管时为 `null`。顺序来源见 `member_priority`。 */
   failover_rank: number | null;
+  /** 它是否出现在**用户保存过**的次序里（`false` = 只是组内成员，排在已保存成员之后）。 */
+  in_saved_order: boolean;
+  /** 在已保存次序里的声明顺位（1 起，含被停用的行）；没保存过为 `null`。 */
+  member_rank: number | null;
+  /** 用户在这次次序里**显式停用**了它（不再被选来接管，但仍显示在列表里）。 */
+  is_disabled: boolean;
 }
 
 /** 「恢复后切回」的真值与进度（阈值来自后端 `failover-thresholds.ts` 的单一数值来源）。 */
@@ -116,12 +122,55 @@ export interface ForwardHaProjection {
   ingress_members:
     | { status: "ok"; nodes: ForwardHaOptionNode[] }
     | { status: "unavailable"; nodes: [] };
-  /** 成员顺序的来源与能力：当前是平台固定规则，按转发自定义顺序**不支持**。 */
+  /** 成员顺序的来源与能力。 */
   member_priority: {
-    source: "platform_rule_node_id_asc";
+    /**
+     * `forward_member_table` = 这条转发**存过**自定义次序；
+     * `platform_rule_node_id_asc` = 没存过**或**读不到（用 `order_readable` 区分）。
+     */
+    source: "forward_member_table" | "platform_rule_node_id_asc";
+    /** 平台支持按转发自定义次序（本任务起为 true）。 */
     custom_order_supported: boolean;
+    /**
+     * 这次**有没有读到**保存的次序。`false` 时界面必须说"读不到"，**不得**渲染成
+     * "用户没有排序"（那是两件不同的事：一个是这次失败，一个是从来没保存过）。
+     */
+    order_readable: boolean;
   };
   failback: ForwardHaFailback;
+}
+
+/** 一次「保存入口成员次序」的输入项：数组顺序 = 优先级（客户端不传 priority）。 */
+export interface IngressMemberInput {
+  node_id: number;
+  is_enabled?: boolean;
+}
+
+/** 写入后的服务端真值回显（`priority` = 数组下标）。 */
+export interface IngressMemberWriteResult {
+  tunnel_id: number;
+  members: Array<{ node_id: number; priority: number; is_enabled: boolean }>;
+  /** 与 `priority[0]`（第一台**启用**的成员）同一条写入路径维护的回切目标。 */
+  preferred_ingress_node_id: number | null;
+}
+
+/**
+ * `PUT /api/forwards/:id/ingress-members`（**全量替换**；`forward:update` + creator guard）。
+ *
+ * `members: []` = 清除自定义次序（回到平台默认次序）。写入不 bump revision、不触发 rollout；
+ * 服务端在同一次事务里把 `preferred_ingress_node_id` 同步成第一台启用的成员。
+ */
+export function setForwardIngressMembers(
+  forwardId: ID,
+  members: readonly IngressMemberInput[],
+): Promise<IngressMemberWriteResult> {
+  return put<IngressMemberWriteResult>(`/forwards/${forwardId}/ingress-members`, {
+    members: members.map((member) =>
+      member.is_enabled === undefined
+        ? { node_id: member.node_id }
+        : { node_id: member.node_id, is_enabled: member.is_enabled },
+    ),
+  });
 }
 
 /** `PUT /forwards/:id/preferred-ingress` 的成功形状。 */

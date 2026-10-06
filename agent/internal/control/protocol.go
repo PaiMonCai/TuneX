@@ -71,7 +71,7 @@ func Capabilities() []string {
 	// 而"能不能真的执行"是**运行环境事实**（镜像里有没有 ping 二进制、内核允不允许
 	// 非特权 ICMP）。只把真的能执行的上报出去 —— 面板据此算它的 `caps.methods`，
 	// 于是"服务端支持而 agent 没实现"在结构上不可能出现。
-	for _, availability := range lookingGlassICMPAvailability() {
+	for _, availability := range lookingGlassMethodAvailability() {
 		if availability.Reason == "" {
 			out = append(out, ActionLookingGlass+":"+availability.Method)
 		}
@@ -80,8 +80,8 @@ func Capabilities() []string {
 	return out
 }
 
-// lookingGlassICMPAvailability 只探测一次（文件存在性 + 内核权限位，零发包）。
-var lookingGlassICMPAvailability = sync.OnceValue(diag.DetectICMP)
+// lookingGlassMethodAvailability 只探测一次（文件存在性 + 内核权限位，零发包）。
+var lookingGlassMethodAvailability = sync.OnceValue(diag.DetectLookingGlassMethods)
 
 // Implements reports whether this agent implements action. It exists so the
 // command loop can answer a command the panel should not have sent with the same

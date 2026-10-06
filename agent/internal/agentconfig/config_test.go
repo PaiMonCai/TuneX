@@ -1,12 +1,14 @@
 package agentconfig
 
 import (
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The retired data-plane flags must stay rejected. A regression
@@ -252,6 +254,116 @@ func TestEnvIntKnobsAreApplied(t *testing.T) {
 		}
 		if cfg.AgentAdminPort != 9292 {
 			t.Fatalf("expected the flag value 9292, got %d", cfg.AgentAdminPort)
+		}
+	})
+}
+
+// ── 面板迁移回退（task-44）的配置面真值表 ─────────────────────────────────
+//
+// 判据只有一条：**两个键齐备才启用**（备用地址 + 迁移 id）。只填一个 = 配置写坏了，
+// 必须返回错误让调用方记日志/呈现，而不是"当作没配"（那会让运维以为配好了其实不会切）。
+func TestPanelMigration_TruthTable(t *testing.T) {
+	t.Run("三个键都空 ⇒ 未配置（正常缺省，不是故障）", func(t *testing.T) {
+		cfg := Config{PanelHTTPURL: "http://panel:3000"}
+		got, err := cfg.PanelMigration()
+		if got != nil {
+			t.Fatalf("expected nil migration, got %+v", got)
+		}
+		if !errors.Is(err, ErrPanelMigrationNotConfigured) {
+			t.Fatalf("expected ErrPanelMigrationNotConfigured, got %v", err)
+		}
+	})
+
+	t.Run("只填备用地址 ⇒ 报「不完整」而不是静默忽略", func(t *testing.T) {
+		cfg := Config{PanelHTTPURL: "http://panel:3000", PanelFallbackURL: "http://panel-b:3000"}
+		if _, err := cfg.PanelMigration(); !errors.Is(err, ErrPanelMigrationIncomplete) {
+			t.Fatalf("expected ErrPanelMigrationIncomplete, got %v", err)
+		}
+	})
+
+	t.Run("只填迁移 id ⇒ 同样报「不完整」", func(t *testing.T) {
+		cfg := Config{PanelHTTPURL: "http://panel:3000", PanelMigrationID: "mig-1"}
+		if _, err := cfg.PanelMigration(); !errors.Is(err, ErrPanelMigrationIncomplete) {
+			t.Fatalf("expected ErrPanelMigrationIncomplete, got %v", err)
+		}
+	})
+
+	t.Run("两个键齐备 + RFC3339 起始时间 ⇒ 启用并解析", func(t *testing.T) {
+		cfg := Config{
+			PanelHTTPURL:            "http://panel:3000/",
+			PanelFallbackURL:        "http://panel-b:3000/",
+			PanelMigrationID:        "mig-1",
+			PanelMigrationStartedAt: "2026-10-07T00:00:00Z",
+		}
+		got, err := cfg.PanelMigration()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.FallbackURL != "http://panel-b:3000" || got.PrimaryURL != "http://panel:3000" {
+			t.Fatalf("trailing slashes must be trimmed: %+v", got)
+		}
+		if !got.StartedAtKnown || !got.StartedAt.Equal(time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC)) {
+			t.Fatalf("started_at not parsed: %+v", got)
+		}
+	})
+
+	t.Run("起始时间也接受 unix 秒（脚本/测试友好）", func(t *testing.T) {
+		cfg := Config{
+			PanelHTTPURL:            "http://panel:3000",
+			PanelFallbackURL:        "http://panel-b:3000",
+			PanelMigrationID:        "mig-1",
+			PanelMigrationStartedAt: "1759795200",
+		}
+		got, err := cfg.PanelMigration()
+		if err != nil || !got.StartedAtKnown || got.StartedAt.Unix() != 1759795200 {
+			t.Fatalf("unix seconds not parsed: %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("起始时间缺失 ⇒ 仍启用，但 StartedAtKnown=false（只能用失败阈值判据）", func(t *testing.T) {
+		cfg := Config{PanelHTTPURL: "http://panel:3000", PanelFallbackURL: "http://panel-b:3000", PanelMigrationID: "mig-1"}
+		got, err := cfg.PanelMigration()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.StartedAtKnown {
+			t.Fatalf("StartedAtKnown must be false without a value: %+v", got)
+		}
+	})
+
+	t.Run("备用地址不是 http(s) ⇒ 拒绝（不猜）", func(t *testing.T) {
+		for _, bad := range []string{"panel-b:3000", "ftp://panel-b:3000", "://nope", "http://"} {
+			cfg := Config{PanelHTTPURL: "http://panel:3000", PanelFallbackURL: bad, PanelMigrationID: "mig-1"}
+			if _, err := cfg.PanelMigration(); !errors.Is(err, ErrPanelMigrationBadURL) {
+				t.Fatalf("%q: expected ErrPanelMigrationBadURL, got %v", bad, err)
+			}
+		}
+	})
+
+	t.Run("起始时间不是可解析的时间 ⇒ 拒绝", func(t *testing.T) {
+		cfg := Config{
+			PanelHTTPURL: "http://panel:3000", PanelFallbackURL: "http://panel-b:3000",
+			PanelMigrationID: "mig-1", PanelMigrationStartedAt: "yesterday",
+		}
+		if _, err := cfg.PanelMigration(); !errors.Is(err, ErrPanelMigrationBadStartedAt) {
+			t.Fatalf("expected ErrPanelMigrationBadStartedAt, got %v", err)
+		}
+	})
+
+	t.Run("env 里的三个键能被读到（安装器写 agent.env 的形状）", func(t *testing.T) {
+		t.Setenv("TUNEX_PANEL_FALLBACK_URL", "http://panel-b:3000")
+		t.Setenv("TUNEX_PANEL_MIGRATION_ID", "mig-env")
+		t.Setenv("TUNEX_PANEL_MIGRATION_STARTED_AT", "2026-10-07T01:02:03Z")
+		cfg, err := Parse([]string{"--panel-http-url", "http://panel:3000"}, "test")
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		got, err := cfg.PanelMigration()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.MigrationID != "mig-env" || got.FallbackURL != "http://panel-b:3000" {
+			t.Fatalf("env values not applied: %+v", got)
 		}
 	})
 }

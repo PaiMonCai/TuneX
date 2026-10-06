@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -303,9 +304,31 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		logx.Info("target observation scheduled",
 			"node_id", cfg.NodeID, "interval", observer.Interval().String())
 	}
+	// 面板迁移回退（task-44）：把 agent.env 里的回退三元组解析出来交给上报侧。
+	// 解析纪律与配置面一致：**只填一个 = 配置写坏了**，这时必须记 ERROR 并**保持不切**
+	// （退回"没有回退能力"），而不是猜一个地址去切 —— 猜错会把节点从可用面板上带走。
+	panels := reporter.PanelMigration{}
+	if migration, merr := cfg.PanelMigration(); merr == nil {
+		panels = reporter.PanelMigration{
+			PrimaryURL:     migration.PrimaryURL,
+			FallbackURL:    migration.FallbackURL,
+			MigrationID:    migration.MigrationID,
+			StartedAt:      migration.StartedAt,
+			StartedAtKnown: migration.StartedAtKnown,
+		}
+		logx.Info("panel migration fallback enabled",
+			"node_id", cfg.NodeID,
+			"migration_id", migration.MigrationID,
+			"fallback_url", migration.FallbackURL,
+			"started_at_known", migration.StartedAtKnown)
+	} else if !errors.Is(merr, agentconfig.ErrPanelMigrationNotConfigured) {
+		logx.Error("panel migration fallback config is invalid; the agent will NOT switch panels",
+			"node_id", cfg.NodeID, "error", merr.Error())
+	}
 	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
+			Panels:     panels,
 			AgentID:    cfg.AgentID,
 			NodeID:     cfg.NodeID,
 			Version:    version,

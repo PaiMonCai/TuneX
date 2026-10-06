@@ -22,11 +22,20 @@ import {
 } from "../services/ddns-binding.ts";
 import type { DdnsDb, DdnsDeps, DdnsResult, DnsBindingRow } from "../services/ddns-binding.ts";
 import {
+  INGRESS_MEMBER_ERROR_CODES,
   PREFERRED_INGRESS_ERROR_CODES,
   buildIngressMemberViews,
+  readIngressMemberIntent,
+  setIngressMembers,
   setPreferredIngressNode,
 } from "../services/preferred-ingress.ts";
-import type { IngressMemberView, PreferredIngressDb } from "../services/preferred-ingress.ts";
+import type {
+  IngressMemberIntentDb,
+  IngressMemberIntentRow,
+  IngressMemberView,
+  IngressMemberWriteDb,
+  PreferredIngressDb,
+} from "../services/preferred-ingress.ts";
 import {
   pickFailoverDestination,
   readFailoverPolicy,
@@ -706,6 +715,70 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
 });
 
 /* ================================================================== */
+/* task-43 —— 入口成员次序（PUT /:id/ingress-members）                   */
+/* ================================================================== */
+//
+// 行为参照：ForwardX（AGPL-3.0-only）——多入口/转发组的成员表（`priority` + `isEnabled`，
+// 顺序即优先级、恢复的高优先级成员要能压过当前活跃的低优先级成员）；**代码为本项目改写，
+// 未复制其实现**。
+//
+// 为什么要有它：成员集合是既有真相（这条转发的入口节点组），但**次序是"按这条转发"的意图**
+// —— 同一台节点可以在 A 转发里排第 1、在 B 转发里排第 3。所以次序落在按转发的行上
+// （`forward_ingress_member`），而不是节点列（那会让共用该组的其它转发一起变形）。
+//
+// 语义（与既有 `PUT /:id/preferred-ingress` 同一套纪律）：
+//   · **数组顺序 = 优先级**（`priority = 数组下标`）：客户端不传 `priority`，因此不存在
+//     "priority 冲突"这件事；重复的 `node_id` 直接拒绝（不静默去重）；
+//   · **全量替换**：本次数组就是完整次序；`members: []` = 清除自定义次序（回到平台默认次序）；
+//   · **同一条写入路径维护回切目标**：`preferred_ingress_node_id` = 第一台**启用**的成员，
+//     与成员表在同一次事务里写 ⇒ 不会出现"表说首选是 A、列说首选是 B"的两份真相；
+//   · 不 bump revision、不触发 rollout（次序是调度意图，不是运行态字段）；
+//   · 权限：`forward:update` + creator guard（与偏好设置同一道门）。
+//
+// 顺序纪律：literal 子路由仍必须在参数化 catch-all 之前（与 `/ha`、`/preferred-ingress` 同）。
+const IngressMembersSchema = z
+  .object({
+    members: z
+      .array(
+        z
+          .object({
+            node_id: z.number().int().positive(),
+            is_enabled: z.boolean().optional(),
+          })
+          .strict(),
+      )
+      .max(64),
+  })
+  .strict();
+
+forwardsRoutes.put("/:id/ingress-members", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const parsed = IngressMembersSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: parsed.error.issues[0]?.message ?? "members 不合法", code: "invalid_input" }, 400);
+  }
+  const denied = await authorizeForward(c, id, "update");
+  if (denied) return denied;
+  const result = await setIngressMembers(
+    { db: db as unknown as IngressMemberWriteDb },
+    { workspaceId: workspace(c).id, tunnelId: id, members: parsed.data.members },
+  );
+  if (!result.ok) {
+    const status =
+      result.code === INGRESS_MEMBER_ERROR_CODES.member_forward_not_found
+        ? 404
+        : result.code === INGRESS_MEMBER_ERROR_CODES.member_node_not_found
+          ? 404
+          : result.code === INGRESS_MEMBER_ERROR_CODES.member_unavailable
+            ? 503
+            : 400;
+    return c.json({ error: result.error, code: result.code, error_layer: "failover" }, status);
+  }
+  return c.json({ data: result.value });
+});
+
+/* ================================================================== */
 /* task-16 / task-38 —— 高可用只读投影（GET /:id/ha）                    */
 /* ================================================================== */
 //
@@ -850,6 +923,15 @@ forwardsRoutes.get("/:id/ha", async (c) => {
   // 入口成员视图（有序）：只列**这条转发的入口节点组**内的节点（与用户节点列表同一可见域），
   // 顺序与「此刻能不能接管」都由 `preferred-ingress.ts` 的纯函数按既有判定算出来。
   let ingressMembers: IngressMemberView[] | null = null;
+  // task-43：用户保存过的成员次序（意图）。读不到返回 `null` ⇒ 回退到既有规则（`node_id` 升序）。
+  let memberIntent: readonly IngressMemberIntentRow[] | null = null;
+  let intentReadable = true;
+  try {
+    memberIntent = await readIngressMemberIntent(db as unknown as IngressMemberIntentDb, tunnel.id);
+    intentReadable = memberIntent !== null;
+  } catch {
+    intentReadable = false;
+  }
   try {
     const rows = (await db.node.findMany({
       where: {
@@ -863,6 +945,7 @@ forwardsRoutes.get("/:id/ha", async (c) => {
       activeIngressId: tunnel.ingress_node_id,
       preferredId: tunnel.preferred_ingress_node_id,
       now: new Date(),
+      intent: memberIntent,
     });
   } catch {
     ingressMembers = null;
@@ -907,10 +990,19 @@ forwardsRoutes.get("/:id/ha", async (c) => {
       ingress_members: ingressMembers === null
         ? { status: "unavailable" as const, nodes: [] as const }
         : { status: "ok" as const, nodes: ingressMembers },
-      /** 平台为"按转发自定义成员顺序"提供的支持（当前为 false：需要一份按转发的存储）。 */
+      /**
+       * 成员次序的来源与能力。
+       *   · `forward_member_table`   —— 这条转发**存过**自定义次序（表内有行），界面按它排列；
+       *   · `platform_rule_node_id_asc` —— 没存过**或**读不到 ⇒ 与迁移前逐位一致
+       *     （合格候选按 `node_id` 升序）。两种情况在这里合并成一个来源，但
+       *     `order_readable` 会把"读不到"单独说清楚（不许把"读不到"当成"用户没排序"）。
+       */
       member_priority: {
-        source: "platform_rule_node_id_asc" as const,
-        custom_order_supported: false,
+        source: (memberIntent !== null && memberIntent.length > 0
+          ? "forward_member_table"
+          : "platform_rule_node_id_asc") as "forward_member_table" | "platform_rule_node_id_asc",
+        custom_order_supported: true,
+        order_readable: intentReadable,
       },
       /** 「恢复后切回」的真值与进度（阈值来自 `failover-thresholds.ts`，此处不写字面量）。 */
       failback,

@@ -73,6 +73,18 @@ type StatePayload struct {
 	Revision int64  `json:"reported_revision,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
 
+	// ── 面板迁移回退（task-44）──────────────────────────────────────────────
+	//
+	// **每一次**上报都要带"我现在在跟谁说"这三件事，否则面板会以为节点还在主地址上
+	// （那正是本任务明令禁止的状态）。三个键都是**加法**字段：老面板忽略未知键
+	// （validateStateReport 对未知键宽容），老 agent 直接不发。
+	//
+	// FallbackActive 没有 omitempty：它必须是显式的 false，而不是"没这个键"——
+	// "不在回退态"和"这个 agent 根本不知道回退这件事"要能分辨。
+	PanelURLInUse       string `json:"panel_url_in_use,omitempty"`
+	PanelMigrationID    string `json:"panel_migration_id,omitempty"`
+	PanelFallbackActive bool   `json:"panel_fallback_active"`
+
 	// Telemetry facts are additive and optional.
 	//
 	// All of it is optional and additive: an older panel ignores the unknown
@@ -353,6 +365,11 @@ type Reporter struct {
 
 	mu   sync.Mutex
 	stop chan struct{}
+
+	// 面板迁移回退的切换状态（task-44）。单独一把锁：StatePayload 可能被别的
+	// goroutine 读（自检/调试），不能让"当前在用哪个地址"出现数据竞争。
+	routeMu    sync.Mutex
+	routeState PanelRouteState
 }
 
 // Config configures the reporter.
@@ -368,6 +385,10 @@ type Config struct {
 	// /api/internal/heartbeat POST was never implemented by the Panel, and has
 	// been removed rather than reimplemented).
 	Credential string
+
+	// Panels 是面板迁移回退配置（task-44）。零值（备用地址与迁移 id 都空）= 未启用：
+	// 切换器只累计失败、永不改地址，上报体里也不带迁移字段。
+	Panels PanelMigration
 
 	tunnels  TunnelLister
 	egress   EgressLister
@@ -523,6 +544,14 @@ func (r *Reporter) StatePayload() StatePayload {
 		Version: r.cfg.Version,
 		Role:    r.cfg.Role,
 	}
+	// 面板迁移回退（task-44）：把"当前生效地址 + 迁移 id + 是否回退态"带上。
+	// 未配置回退时不写迁移字段（保持与老 agent 的载荷逐字一致），但仍带上当前生效
+	// 地址 —— 它本来就是事实，且让面板能区分"节点在跟主地址说话"与"在跟备用地址"。
+	p.PanelURLInUse = r.activePanelURL()
+	if migration := r.cfg.Panels; migration.Enabled() {
+		p.PanelMigrationID = migration.MigrationID
+		p.PanelFallbackActive = r.PanelRoute().InFallback()
+	}
 	// Only advertise negotiation facts when configured. Leaving both fields out keeps
 	// "never told the panel" distinguishable from "supports nothing".
 	if r.cfg.controlPortocolVersion > 0 {
@@ -624,12 +653,74 @@ func (r *Reporter) fillTelemetry(p *StatePayload) {
 
 // StateEndpoint returns the full state-report URL, or "" when credential-less.
 // A node without a credential cannot send an authenticated state report.
+//
+// 地址来自**切换器**（task-44）：主地址连续失败到阈值后，这里返回备用地址。任何时刻
+// 都只有一个"生效地址"，不存在"已经在回退态却还在往主地址打"的状态。
 func (r *Reporter) StateEndpoint() string {
-	base := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
+	base := r.activePanelURL()
 	if base == "" || strings.TrimSpace(r.cfg.Credential) == "" {
 		return ""
 	}
 	return base + StatePath
+}
+
+// activePanelURL 返回当前生效的面板基址（切换器判定的结果）。
+func (r *Reporter) activePanelURL() string {
+	r.routeMu.Lock()
+	state := r.ensureRouteLocked()
+	r.routeMu.Unlock()
+	primary := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
+	migration := r.cfg.Panels
+	if migration.PrimaryURL == "" {
+		migration.PrimaryURL = primary
+	}
+	return state.ActiveURL(migration)
+}
+
+// ensureRouteLocked 惰性初始化路由状态（主地址）。调用方必须持有 routeMu。
+func (r *Reporter) ensureRouteLocked() PanelRouteState {
+	if r.routeState.Active == "" {
+		r.routeState = ReadyPanelRoute()
+	}
+	return r.routeState
+}
+
+// notePanelAttempt 把一次出站结果喂给切换器，并在真的切换时**留下日志**（切换是运维
+// 事实，不能只在内存里发生）。
+func (r *Reporter) notePanelAttempt(outcome PanelOutcome, now time.Time) {
+	migration := r.cfg.Panels
+	if migration.PrimaryURL == "" {
+		migration.PrimaryURL = strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
+	}
+	r.routeMu.Lock()
+	state := r.ensureRouteLocked()
+	next, decision := DecidePanelRoute(state, migration, PanelRouteSignals{Now: now, Outcome: outcome})
+	r.routeState = next
+	r.routeMu.Unlock()
+
+	if decision.Switched {
+		logx.Warn("panel migration: switching to the fallback panel",
+			"node_id", r.cfg.NodeID,
+			"migration_id", migration.MigrationID,
+			"fallback_url", migration.FallbackURL,
+			"reason", decision.Reason,
+			"consecutive_failures", next.ConsecutiveFailures)
+		return
+	}
+	if decision.FallbackFailing {
+		logx.Warn("panel migration: the fallback panel is unreachable too",
+			"node_id", r.cfg.NodeID,
+			"migration_id", migration.MigrationID,
+			"fallback_url", migration.FallbackURL,
+			"consecutive_failures", next.ConsecutiveFailures)
+	}
+}
+
+// PanelRoute 暴露当前路由状态（本地自检/调试用；纯读）。
+func (r *Reporter) PanelRoute() PanelRouteState {
+	r.routeMu.Lock()
+	defer r.routeMu.Unlock()
+	return r.ensureRouteLocked()
 }
 
 // sortedPorts turns the manager's port set into a deterministic slice so the
@@ -707,9 +798,17 @@ func (r *Reporter) sendState(ctx context.Context) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	endpoint := r.StateEndpoint()
+	answer, err := r.cfg.post(ctx, endpoint, body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
+	// 面板迁移回退（task-44）：把这一拍的结果喂给切换器。**必须在 post 之后立刻做**，
+	// 而且成功/失败都要记：任一次成功清零（参照实现语义），连续失败到阈值才切。
+	if err != nil {
+		r.notePanelAttempt(PanelOutcomeFailure, r.cfg.now())
+	} else {
+		r.notePanelAttempt(PanelOutcomeSuccess, r.cfg.now())
+	}
 	if isCredentialRejected(err) {
 		logx.Warn("state report rejected: node credential is invalid or revoked",
 			"node_id", r.cfg.NodeID)

@@ -99,7 +99,15 @@ function harness(overrides: Partial<LookingGlassDeps> = {}, opts: { resolveTo?: 
     async capabilityFacts() {
       return {
         protocolVersion: 2,
-        capabilities: ["apply_tunnel", "looking_glass"],
+        // task-42：方法级能力标注与动作一起上报（agent 只为**真能执行**的方法标注）。
+        capabilities: [
+          "apply_tunnel",
+          "looking_glass",
+          "looking_glass:ping",
+          "looking_glass:ping6",
+          "looking_glass:traceroute",
+          "looking_glass:traceroute6",
+        ],
         capabilitiesMalformed: false,
         manifest: null,
         manifestMalformed: false,
@@ -811,7 +819,10 @@ describe("WP19-D 控制协议线形", () => {
     expect(tooMany.ok).toBe(false);
     if (!tooMany.ok) expect(tooMany.code).toBe(LOOKING_GLASS_CODES.tooManyTargets);
 
-    const badMethod = await run({ method: "traceroute" }, h);
+    // 未知/本版本不提供的方法：`mtr` 正是 `LOOKING_GLASS_UNAVAILABLE_METHODS` 里的那个
+    // （镜像无二进制 + 默认需 raw socket）——用它钉"闭集之外必须拒"。
+    // （`traceroute` 自 task-42 起**在闭集内**，正向验证见下面那条独立测试。）
+    const badMethod = await run({ method: "mtr" }, h);
     expect(badMethod.ok).toBe(false);
     if (!badMethod.ok) expect(badMethod.code).toBe(LOOKING_GLASS_CODES.methodNotSupported);
 
@@ -836,6 +847,30 @@ describe("WP19-D 控制协议线形", () => {
     const h = harness();
     const icmp = await run({ method: "ping" }, h);
     expect(icmp.ok).toBe(true);
+  });
+
+  test("task-42：面板支持但该节点没上报方法能力 ⇒ 直接拒，且一条指令都不下发", async () => {
+    const h = harness({
+      async capabilityFacts() {
+        return {
+          protocolVersion: 2,
+          // 只上报动作本身，**没有**方法级标注 ⇒ 该节点做不到 ping/traceroute。
+          capabilities: ["apply_tunnel", "looking_glass"],
+          capabilitiesMalformed: false,
+          manifest: null,
+          manifestMalformed: false,
+        };
+      },
+    });
+    const r = await run({ method: "traceroute" }, h);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.code).toBe(LOOKING_GLASS_CODES.methodUnavailableOnNode);
+    // 关键：连"尝试下发"都没有 —— 不发注定失败的指令。
+    expect(h.issues).toEqual([]);
+
+    // 反向：`tcp_connect` 不需要方法级标注（它由动作本身表达），同一条事实下仍可下发。
+    const tcp = await run({ method: "tcp_connect" }, h);
+    expect(tcp.ok).toBe(true);
   });
 
   test("等 ACK 的总预算 = per-attempt × 地址数 + 余量，封顶 20s", () => {

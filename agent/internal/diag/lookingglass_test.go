@@ -545,3 +545,161 @@ func TestICMPRejectsWholeRequestBeforeExecuting(t *testing.T) {
 		}
 	})
 }
+
+/* ================================================================== */
+/* traceroute（tracepath，无特权）                                       */
+/* ================================================================== */
+
+// realTracepathSample 是生产 caps 容器里的真实输出（`tracepath -n -m 3 1.1.1.1`）。
+const realTracepathSample = ` 1?: [LOCALHOST]                      pmtu 1500
+ 1:  172.17.0.1                                            0.335ms 
+ 1:  172.17.0.1                                            0.057ms 
+ 2:  172.17.0.1                                            0.038ms pmtu 1450
+ 2:  10.1.32.1                                             0.250ms 
+ 3:  103.185.248.1                                         2.131ms asymm  4 
+`
+
+func TestParseTracepathGroupsByTTL(t *testing.T) {
+	hops := parseTracepath(realTracepathSample)
+	if len(hops[1]) != 2 || len(hops[2]) != 2 || len(hops[3]) != 1 {
+		t.Fatalf("hops = %v", hops)
+	}
+	first := tracepathHop(1, hops[1])
+	if first.Address != "172.17.0.1" || first.RTTMS != 0 {
+		t.Fatalf("hop1 = %+v（取第一行，含地址）", first)
+	}
+	second := tracepathHop(2, hops[2])
+	if second.Address != "172.17.0.1" || second.Note == "" {
+		t.Fatalf("hop2 = %+v（应带 pmtu 备注）", second)
+	}
+	third := tracepathHop(3, hops[3])
+	if third.Address != "103.185.248.1" || third.RTTMS != 2 {
+		t.Fatalf("hop3 = %+v", third)
+	}
+}
+
+func TestTracepathHopWithoutAddressKeepsTheReason(t *testing.T) {
+	hops := parseTracepath(" 1:  send failed\n")
+	hop := tracepathHop(1, hops[1])
+	if hop.Address != "" || hop.Note != "send failed" {
+		t.Fatalf("hop = %+v", hop)
+	}
+}
+
+func withFakeTracepath(t *testing.T, hops map[int][]string, raw string, err error, binary string) *int {
+	t.Helper()
+	calls := 0
+	original := runTracepath
+	runTracepath = func(context.Context, string, string, int, time.Duration) (map[int][]string, string, error) {
+		calls++
+		return hops, raw, err
+	}
+	t.Cleanup(func() { runTracepath = original })
+	if binary != "" {
+		originalCandidates := tracepathBinaryCandidates
+		tracepathBinaryCandidates = []string{binary}
+		t.Cleanup(func() { tracepathBinaryCandidates = originalCandidates })
+	}
+	return &calls
+}
+
+func TestTracerouteDispatch(t *testing.T) {
+	binary := fakePingBinary(t)
+
+	t.Run("到达目标 ⇒ reachable + 逐跳结果", func(t *testing.T) {
+		// 目标出现在**预算允许的跳数内**（5s 预算 ⇒ 3 跳；`MaxTimeoutMS` 是 5000 的硬上限，
+		// 传更大也会被夹到 5000）。
+		// 目标就是在第 3 跳回话的那台（取"该 TTL 的第一条有地址的行"，所以这里给干净的样本）。
+		withFakeTracepath(t, parseTracepath(" 1:  172.17.0.1  0.300ms\n 2:  10.1.32.1  0.200ms\n 3:  1.1.1.1  3.000ms\n"), "", nil, binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:    LookingGlassMethodTraceroute,
+			TimeoutMS: 5000,
+			Targets:   []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].Status != StatusReachable || len(results[0].Hops) != 3 {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("有跳但没到目标 ⇒ timeout（如实说没到达，不说不可达）", func(t *testing.T) {
+		withFakeTracepath(t, parseTracepath(realTracepathSample), "", nil, binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodTraceroute,
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results[0].Status != StatusTimeout || !strings.Contains(results[0].Detail, "未在") {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("send failed（无 v6 路径）⇒ error 且原因可读", func(t *testing.T) {
+		withFakeTracepath(t, parseTracepath(" 1:  send failed\n     Resume: pmtu 128000\n"), " 1:  send failed\n", errors.New("exit status 1"), binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodTraceroute6,
+			Targets: []LookingGlassTarget{{Address: "2606:4700:4700::1111"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results[0].Status != StatusError || !strings.Contains(results[0].Detail, "send failed") {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("家族不匹配 / 私网 ⇒ 整请求拒绝且 0 次执行", func(t *testing.T) {
+		calls := withFakeTracepath(t, map[int][]string{}, "", nil, binary)
+		for _, target := range []string{"2606:4700:4700::1111", "10.0.0.1"} {
+			if _, err := LookingGlass(context.Background(), LookingGlassRequest{
+				Method:  LookingGlassMethodTraceroute,
+				Targets: []LookingGlassTarget{{Address: target}},
+			}, nil); err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+				t.Fatalf("target %s: err = %v", target, err)
+			}
+		}
+		if *calls != 0 {
+			t.Fatalf("exec calls = %d, want 0", *calls)
+		}
+	})
+
+	t.Run("镜像里没有 tracepath ⇒ 拒绝而不是假装跑过", func(t *testing.T) {
+		originalCandidates := tracepathBinaryCandidates
+		tracepathBinaryCandidates = []string{"/nonexistent/tracepath"}
+		t.Cleanup(func() { tracepathBinaryCandidates = originalCandidates })
+		_, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodTraceroute,
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+			t.Fatalf("err = %v, want ErrLookingGlassRejected", err)
+		}
+	})
+}
+
+func TestDetectLookingGlassMethodsShapes(t *testing.T) {
+	byMethod := map[string]MethodAvailability{}
+	for _, availability := range DetectLookingGlassMethods() {
+		byMethod[availability.Method] = availability
+	}
+	for _, method := range SupportedLookingGlassMethods() {
+		availability, ok := byMethod[method]
+		if !ok {
+			t.Fatalf("方法 %q 没有可用性条目（面板据此算 caps.methods）", method)
+		}
+		// "可用"必须给出二进制路径；"不可用"必须给出原因。二者不可同时为空/同时非空。
+		if (availability.Reason == "") == (availability.Binary == "" && method != LookingGlassMethodTCPConnect) {
+			t.Fatalf("方法 %q 的可用性自相矛盾: %+v", method, availability)
+		}
+	}
+	// mtr/mtr6 不在闭集里（镜像无二进制 + 需要 raw socket）⇒ 永远不会被标注为可用。
+	for _, forbidden := range []string{"mtr", "mtr6"} {
+		if _, ok := byMethod[forbidden]; ok {
+			t.Fatalf("%q 不该出现在可用性枚举里", forbidden)
+		}
+	}
+}

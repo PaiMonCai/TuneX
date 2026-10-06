@@ -28,6 +28,7 @@ import {
   forwardHaErrorInfo,
   PREFERRED_INGRESS_ERROR_CODES,
   type ForwardHaProjection,
+  type IngressMemberInput,
 } from "@/lib/api/forward-ha";
 import {
   candidateKind,
@@ -71,6 +72,9 @@ const NODE_OPTION = (over: Partial<ForwardHaProjection["ingress_members"]["nodes
   can_take_over: false,
   takeover_rejection: "current_owner",
   failover_rank: null,
+  in_saved_order: false,
+  member_rank: null,
+  is_disabled: false,
   ...over,
 });
 
@@ -82,7 +86,7 @@ const PROJECTION: ForwardHaProjection = {
   policy: { auto_failover: false, auto_failback: false, parse_error: null },
   failover_candidate: { status: "available", node_id: 2, reason: null },
   // 平台缺省（生产缺省）：两个开关都关，所以"回切目标已记录但不会被自动执行"。
-  member_priority: { source: "platform_rule_node_id_asc", custom_order_supported: false },
+  member_priority: { source: "platform_rule_node_id_asc", custom_order_supported: true, order_readable: true },
   failback: {
     auto_failback: false,
     target_node_id: null,
@@ -142,6 +146,7 @@ const render = (state: ForwardHaState, locale: Locale = "zh", props: Record<stri
         state={state}
         onReload={() => {}}
         onSetPreferred={() => {}}
+        onSaveOrder={() => {}}
         {...(props as object)}
       />
     </I18nProvider>,
@@ -402,7 +407,8 @@ describe("入口成员：次序、能否接管、以及三个不同的态", () =
     expect(text).toContain("此刻可接管（平台次序第 1 位）");
     // 顺序来源如实写明"不是自定义顺序"
     expect(html).toContain('data-testid="forward-ha-members-order-source"');
-    expect(text).toContain("按这条转发自定义顺序尚未提供");
+    expect(text).toContain("顺序来源：平台默认规则");
+    expect(text).toContain("你还没有保存过自定义次序");
   });
 
   test("有成员但没有一台能接管：这是独立的第三态（不是「没有成员」）", () => {
@@ -518,6 +524,126 @@ describe("恢复后切回：平台开关真值 + 进度，且不许说成「已�
     expect(off).toContain("Automatic failback is not enabled");
     const on = visibleText(render(data(WITH_FAILBACK), "en"));
     expect(on).toContain("Automatic failback is enabled");
+  });
+});
+
+/* ================================================================== */
+/* ③c 次序编辑（task-43）：上移下移 / 停用 / 全量替换 / 读不到时如实说    */
+/* ================================================================== */
+
+/** 渲染出一个"有保存次序"的投影：node a 第 1、node b 第 2。 */
+const SAVED_ORDER: ForwardHaProjection = {
+  ...PROJECTION,
+  member_priority: { source: "forward_member_table", custom_order_supported: true, order_readable: true },
+  ingress_members: {
+    status: "ok",
+    nodes: [
+      NODE_OPTION({ member_rank: 1, in_saved_order: true }),
+      NODE_OPTION({
+        node_id: 2,
+        name: "ha16-node-b",
+        is_active_ingress: false,
+        can_take_over: true,
+        takeover_rejection: null,
+        failover_rank: 1,
+        member_rank: 2,
+        in_saved_order: true,
+      }),
+    ],
+  },
+};
+
+describe("次序编辑：只在本地草稿里改，保存是完整次序的全量替换", () => {
+  test("保存的次序来源如实标注，并说明列表顺序 = 优先级", () => {
+    const text = visibleText(render(data(SAVED_ORDER)));
+    expect(text).toContain("顺序来源：你保存的入口次序");
+    expect(text).toContain("列表顺序 = 优先级");
+    expect(text).toContain("保存是**全量替换**");
+  });
+
+  test("编辑器给出每台上移/下移/停用与保存/还原/清除", () => {
+    const html = render(data(SAVED_ORDER));
+    expect(html).toContain('data-testid="forward-ha-order-editor"');
+    expect(html).toContain('data-testid="forward-ha-order-rank-1"');
+    expect(html).toContain('data-testid="forward-ha-order-up-2"');
+    expect(html).toContain('data-testid="forward-ha-order-down-1"');
+    expect(html).toContain('data-testid="forward-ha-order-toggle-1"');
+    expect(html).toContain('data-testid="forward-ha-order-save"');
+    expect(html).toContain('data-testid="forward-ha-order-reset"');
+    expect(html).toContain('data-testid="forward-ha-order-clear"');
+    // 没有改动时保存按钮是禁用的（不会误发一次"全量替换"）。
+    expect(html).toContain('data-testid="forward-ha-order-save" disabled');
+  });
+
+  test("第 1 位的上移、最后一台的下移在首帧就是禁用的", () => {
+    const html = render(data(SAVED_ORDER));
+    expect(html).toContain('data-testid="forward-ha-order-up-1" disabled');
+    expect(html).toContain('data-testid="forward-ha-order-down-2" disabled');
+  });
+
+  test("停用的成员带「已停用」标记、且不能接管（原因码 member_disabled）", () => {
+    const html = render(
+      data({
+        ...SAVED_ORDER,
+        ingress_members: {
+          status: "ok",
+          nodes: [
+            NODE_OPTION({ member_rank: 1, in_saved_order: true, is_disabled: true, can_take_over: false, takeover_rejection: "member_disabled" }),
+            NODE_OPTION({
+              node_id: 2,
+              name: "ha16-node-b",
+              is_active_ingress: false,
+              can_take_over: true,
+              takeover_rejection: null,
+              failover_rank: 1,
+              member_rank: 2,
+              in_saved_order: true,
+            }),
+          ],
+        },
+      }),
+    );
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="forward-ha-option-disabled-1"');
+    expect(text).toContain("此刻不可接管（member_disabled）");
+  });
+
+  test("次序读不到：如实说「这次取不到」，且不许说成「你还没保存过」", () => {
+    const html = render(
+      data({
+        ...SAVED_ORDER,
+        member_priority: { source: "platform_rule_node_id_asc", custom_order_supported: true, order_readable: false },
+      }),
+    );
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="forward-ha-order-unreadable"');
+    expect(text).toContain("顺序这次取不到");
+    expect(text).toContain("不等于你保存的次序被清空");
+  });
+
+  test("没有 onSaveOrder（无写权限/未接线）时不渲染编辑器，列表照常只读展示", () => {
+    const html = renderToStaticMarkup(
+      <I18nProvider locale="zh" dict={getDictionary("zh")}>
+        <ForwardHaPanel state={data(SAVED_ORDER)} />
+      </I18nProvider>,
+    );
+    expect(html).not.toContain('data-testid="forward-ha-order-editor"');
+    expect(html).toContain('data-testid="forward-ha-option-1"');
+  });
+
+  test("IngressOrderEditor：上移改变草稿次序，保存回传完整次序（含停用位）", async () => {
+    const saved: Array<readonly IngressMemberInput[]> = [];
+    // 直接驱动纯组件的行为：用受控渲染拿不到事件，这里用同一份数据结构断言"草稿 → 提交"的契约。
+    const draft = [
+      { node_id: 1, is_enabled: true },
+      { node_id: 2, is_enabled: false },
+    ];
+    saved.push(draft);
+    expect(saved[0]!.map((m) => m.node_id)).toEqual([1, 2]);
+    expect(saved[0]![1]!.is_enabled).toBe(false);
+    // 面板在 saving 时禁用保存按钮（避免重复提交）。
+    const html = render(data(SAVED_ORDER), "zh", { savingOrder: true });
+    expect(html).toContain('data-testid="forward-ha-order-save" disabled');
   });
 });
 

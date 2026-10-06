@@ -22,7 +22,17 @@ const { asRecord, fail, numOrNull, ok, parseId, reqStr } = rt;
 
 /* 与后端 `services/looking-glass.ts` 逐字一致的上限与开关名 */
 const ENABLED_ENV = "LOOKING_GLASS_ENABLED";
-const METHOD = "tcp_connect";
+// task-42：方法闭集扩到 5 种（tcp_connect + ICMP echo + 无特权路径跟踪）。
+const METHODS = ["tcp_connect", "ping", "ping6", "traceroute", "traceroute6"];
+/** 本版本**明确不提供**的方法 + 原因（与后端 `LOOKING_GLASS_UNAVAILABLE_METHODS` 同源）。 */
+const UNAVAILABLE_METHODS = [
+  {
+    method: "mtr",
+    reason:
+      "镜像里没有 mtr 二进制；且 mtr 默认需要 raw socket（CAP_NET_RAW），生产 caps 下不可用 —— 所以我们不做它，而不是假装支持",
+  },
+  { method: "mtr6", reason: "同 mtr：无二进制 + 依赖 raw socket（CAP_NET_RAW）" },
+];
 const MAX_TARGETS = 4;
 const MAX_PINNED_ADDRESSES = 4;
 const DEFAULT_TIMEOUT_MS = 3000;
@@ -30,9 +40,13 @@ const MAX_TIMEOUT_MS = 5000;
 
 /** 后端 `LOOKING_GLASS_CAVEATS` 的**原文**（mock 与服务端同源：这些是要照实回给界面的口径声明）。 */
 const CAVEATS = [
-  "这是从该节点发出的 TCP 连接测试（tcp_connect）：连上只证明 L3/L4 可达，不证明对端业务可用。",
+  "这是从该节点发出的主动探测（tcp_connect / ping / ping6）：连上或收到回包只证明 L3/L4 可达，不证明对端业务可用。",
   "域名由面板解析、节点只拨固定地址：因此它不能回答「节点侧 DNS 能否解析该域名」。",
-  "不含 UDP/ICMP：datagram 没有可靠探测来源，本版本不产生该事实。",
+  "ping/ping6 由节点在容器内调用镜像自带的 ping 二进制（非特权 ICMP），依赖节点内核允许非特权 ICMP；ping6 还需要节点自身有 IPv6 出网路径 —— 没有时结果是 unreachable，那不是方法未实现。",
+  "traceroute / traceroute6 由节点调用 iputils 的 tracepath 实现（非特权：UDP 探测 + ICMP 超时回包），因此没有放开 CAP_NET_RAW；目标家族没有出网路径时它是 send failed，属真实网络事实。",
+  "不含 mtr / mtr6：镜像里没有该二进制，且它默认需要 raw socket（CAP_NET_RAW）—— 生产安装用 --cap-drop ALL --cap-add NET_BIND_SERVICE。（busybox 的 traceroute 同样因 raw socket 被拒，我们用它之外的无特权路径。）",
+  "不含 UDP：datagram 没有可靠探测来源，本版本不产生该事实。",
+  "不含 HTTP：重定向/降级/凭据是另一份威胁模型，本版本不做。",
   "结果不含任何数据面载荷与凭据；每次发起与拒绝都会写审计。",
 ];
 
@@ -115,13 +129,14 @@ export async function handleLookingGlassMock(ctx: rt.MockAuthedRouteContext): Pr
       enabled: false,
       switch_env: ENABLED_ENV,
       platform_admin_override: user.super_admin === true,
-      method: METHOD,
+      method: METHODS[0],
       caps: {
         max_targets: MAX_TARGETS,
         max_pinned_addresses: MAX_PINNED_ADDRESSES,
         default_timeout_ms: DEFAULT_TIMEOUT_MS,
         max_timeout_ms: MAX_TIMEOUT_MS,
-        methods: [METHOD],
+        methods: [...METHODS],
+        unavailable_methods: UNAVAILABLE_METHODS.map((entry) => ({ ...entry })),
       },
       targets: "public-only（私网/回环/链路本地/多播/保留段一律拒绝）",
       caveats: CAVEATS,
@@ -168,8 +183,8 @@ export async function handleLookingGlassMock(ctx: rt.MockAuthedRouteContext): Pr
     const body = asRecord(req.body);
     // ③ 方法：只支持 tcp_connect（未知方法拒绝，不降级）。
     const requestedMethod = reqStr(body.method);
-    if (requestedMethod !== "" && requestedMethod !== METHOD) {
-      return invalid(`本版本只支持方法 ${METHOD}（未知方法拒绝，不降级）`, "method_not_supported");
+    if (requestedMethod !== "" && !METHODS.includes(requestedMethod)) {
+      return invalid(`本版本不提供方法 ${requestedMethod}（未知方法拒绝，不降级）`, "method_not_supported");
     }
     // ④ 超时范围。
     const rawTimeout = body.timeout_ms;

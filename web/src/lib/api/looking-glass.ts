@@ -29,6 +29,8 @@ export interface LookingGlassCaps {
   default_timeout_ms: number;
   max_timeout_ms: number;
   methods: string[];
+  /** 本版本明确不提供的方法 + 原因（`LOOKING_GLASS_UNAVAILABLE_METHODS` 的服务端回显）。 */
+  unavailable_methods: Array<{ method: string; reason: string }>;
 }
 
 export interface LookingGlassStatus {
@@ -126,6 +128,8 @@ export const LOOKING_GLASS_CODES = {
   targetUnresolved: "target_unresolved",
   resolverInvalid: "resolver_returned_invalid_address",
   methodNotSupported: "method_not_supported",
+  /** 面板支持该方法，但该节点没有上报执行能力（task-42）。 */
+  methodUnavailableOnNode: "method_unavailable_on_node",
   timeoutOutOfRange: "timeout_out_of_range",
   auditUnavailable: "audit_unavailable",
   agentFailed: "agent_failed",
@@ -258,6 +262,18 @@ export function lookingGlassStatusFromPayload(payload: unknown): LookingGlassRea
         default_timeout_ms: defaultTimeout,
         max_timeout_ms: maxTimeout,
         methods: Array.isArray(caps.methods) ? caps.methods.filter((item): item is string => typeof item === "string") : [],
+        // task-42：本版本**不提供**的方法与原因（服务端给，前端**列出并说明**，不假装支持
+        // 也不静默隐藏 —— 静默隐藏会让运维以为"这产品没有 traceroute"）。
+        unavailable_methods: Array.isArray(caps.unavailable_methods)
+          ? caps.unavailable_methods
+              .map((item) => {
+                const row = asRecord(item);
+                const method = nonEmptyString(row?.method);
+                const reason = nonEmptyString(row?.reason);
+                return method && reason ? { method, reason } : null;
+              })
+              .filter((item): item is { method: string; reason: string } => item !== null)
+          : [],
       },
       targets: typeof row.targets === "string" ? row.targets : "",
       caveats,

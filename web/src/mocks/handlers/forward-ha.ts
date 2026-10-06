@@ -39,9 +39,26 @@ const FAILBACK_HEALTHY_CHECKS = 3;
 /** preferred ingress：mock 侧的内存态（key = forward id）。 */
 const preferredByForward = new Map<number, number | null>();
 
+/**
+ * task-43：入口成员次序（意图）的内存态，key = forward id。
+ *
+ * mock 里没有数据库，所以用一个 Map 顶替 `forward_ingress_member` 表；**只有意图**
+ * （node_id + is_enabled），与真实表一致 —— 不存任何连接/健康事实。
+ */
+const memberOrderByForward = new Map<number, Array<{ node_id: number; is_enabled: boolean }>>();
+/** 读序失败开关（测试用：证明"读不到次序 ⇒ 回退平台默认次序"）。 */
+let orderUnreadable = false;
+
 /** 测试用：清空 mock 的偏好态（`resetStore()` 不会碰本模块的 Map）。 */
 export function resetForwardHaMock(): void {
   preferredByForward.clear();
+  memberOrderByForward.clear();
+  orderUnreadable = false;
+}
+
+/** 测试用：模拟次序读不到（真实环境的对应物是成员表查询失败）。 */
+export function setForwardHaOrderUnreadable(value: boolean): void {
+  orderUnreadable = value;
 }
 
 function roleAcceptsIngress(role: string | null): boolean {
@@ -103,46 +120,89 @@ function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
     return null;
   }
 
-  let rank = 0;
-  const nodes = db.nodes
+  const intent = memberOrderByForward.get(forwardId) ?? [];
+  const intentRank = new Map<number, number>();
+  const intentOrder = new Map<number, number>();
+  const intentDisabled = new Set<number>();
+  let enabledRank = 0;
+  intent.forEach((row, index) => {
+    intentRank.set(row.node_id, index + 1);
+    if (row.is_enabled) {
+      intentOrder.set(row.node_id, enabledRank);
+      enabledRank += 1;
+    } else {
+      intentDisabled.add(row.node_id);
+    }
+  });
+  const orderRank = (nodeId: number): number | null => intentOrder.get(nodeId) ?? null;
+
+  const nodes: Array<ReturnType<typeof shapeMember>> = [];
+  function shapeMember(node: ReturnType<typeof mockUserNode>) {
+    const isDisabled = intentDisabled.has(node.id);
+    const rejection = isDisabled
+      ? "member_disabled"
+      : takeoverRejection({
+          id: node.id,
+          role: node.role ?? null,
+          connection: node.connection ?? "offline",
+          accepts_new_business: node.accepts_new_business === true,
+          admission_rejection: node.admission_rejection ?? null,
+          credential_revoked: node.credential_revoked === true,
+        });
+    const canTakeOver = rejection === null;
+    return {
+      node_id: node.id,
+      name: node.node_id,
+      role: node.role ?? null,
+      node_group_id: node.node_group_id,
+      is_active_ingress: node.id === activeIngress,
+      is_preferred: node.id === preferred,
+      is_failback_target: preferred !== null && node.id === preferred && preferred !== activeIngress,
+      can_be_preferred: roleAcceptsIngress(node.role ?? null),
+      preference_rejection: roleAcceptsIngress(node.role ?? null)
+        ? null
+        : node.role == null
+          ? "role_undeclared"
+          : "role_mismatch",
+      connection: node.connection ?? "offline",
+      lifecycle: node.lifecycle ?? "active",
+      accepts_new_business: node.accepts_new_business === true,
+      admission_rejection: node.admission_rejection ?? null,
+      can_take_over: canTakeOver,
+      takeover_rejection: rejection,
+      failover_rank: null as number | null,
+      in_saved_order: intentRank.has(node.id),
+      member_rank: intentRank.get(node.id) ?? null,
+      is_disabled: isDisabled,
+    };
+  }
+
+  db.nodes
     .filter((node) => node.node_group_id === tunnel.in_node_group_id)
     .map((node) => mockUserNode(db, node))
-    .sort((a, b) => a.id - b.id)
-    .map((node) => {
-      const rejection = takeoverRejection({
-        id: node.id,
-        role: node.role ?? null,
-        connection: node.connection ?? "offline",
-        accepts_new_business: node.accepts_new_business === true,
-        admission_rejection: node.admission_rejection ?? null,
-        credential_revoked: node.credential_revoked === true,
-      });
-      const canTakeOver = rejection === null;
-      if (canTakeOver) rank += 1;
-      return {
-        node_id: node.id,
-        name: node.node_id,
-        role: node.role ?? null,
-        node_group_id: node.node_group_id,
-        is_active_ingress: node.id === activeIngress,
-        is_preferred: node.id === preferred,
-        is_failback_target: preferred !== null && node.id === preferred && preferred !== activeIngress,
-        // 写入路径规则：同组（已按组过滤）+ role ∈ {ingress,both}
-        can_be_preferred: roleAcceptsIngress(node.role ?? null),
-        preference_rejection: roleAcceptsIngress(node.role ?? null)
-          ? null
-          : node.role == null
-            ? "role_undeclared"
-            : "role_mismatch",
-        // 以下三项是**并列事实**（连接 / 准入 / 生命周期），不是"能不能当首选"的判据。
-        connection: node.connection ?? "offline",
-        lifecycle: node.lifecycle ?? "active",
-        accepts_new_business: node.accepts_new_business === true,
-        admission_rejection: node.admission_rejection ?? null,
-        can_take_over: canTakeOver,
-        takeover_rejection: rejection,
-        failover_rank: canTakeOver ? rank : null,
-      };
+    .sort((a, b) => {
+      const ra = intentRank.get(a.id) ?? null;
+      const rb = intentRank.get(b.id) ?? null;
+      if (ra !== null && rb !== null) return ra - rb;
+      if (ra !== null) return -1;
+      if (rb !== null) return 1;
+      return a.id - b.id;
+    })
+    .forEach((node) => nodes.push(shapeMember(node)));
+
+  // 接管次序：只对能接管的成员按"意图次序优先、其余按 node id 升序"编号（与后端同一规则）。
+  nodes
+    .filter((node) => node.can_take_over)
+    .sort((a, b) => {
+      const ra = orderRank(a.node_id);
+      const rb = orderRank(b.node_id);
+      if (ra !== null && rb !== null) return ra - rb;
+      if (ra !== null) return -1;
+      if (rb !== null) return 1;
+      return a.node_id - b.node_id;
+    })
+    .forEach((node, index) => {
+      node.failover_rank = index + 1;
     });
 
   // 候选：与后端 `pickFailoverDestination` 同一口径（非现任 + 准入 + 角色 + 此刻在线），
@@ -161,7 +221,11 @@ function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
       reason: null,
     },
     ingress_members: { status: "ok", nodes },
-    member_priority: { source: "platform_rule_node_id_asc", custom_order_supported: false },
+    member_priority: {
+      source: !orderUnreadable && intent.length > 0 ? "forward_member_table" : "platform_rule_node_id_asc",
+      custom_order_supported: true,
+      order_readable: !orderUnreadable,
+    },
     failback: {
       auto_failback: policy.auto_failback,
       target_node_id: preferred !== null && preferred !== activeIngress ? preferred : null,
@@ -203,6 +267,45 @@ export async function handleForwardHaMock(ctx: rt.MockAuthedRouteContext): Promi
   const id = parseId(seg[1]);
   if (seg[2] === "ha" && method === "GET" && id !== null) {
     return projectionOf(db, id);
+  }
+  if (seg[2] === "ingress-members" && method === "PUT" && id !== null) {
+    const tunnel = db.tunnels.find((row) => row.id === id);
+    if (!tunnel) return notFound("转发不存在");
+    const body = rt.asRecord(ctx.req.body);
+    const raw = body.members;
+    if (!Array.isArray(raw)) return fail(400, "members 不合法", "invalid_input");
+    const parsed: Array<{ node_id: number; is_enabled: boolean }> = [];
+    for (const item of raw as unknown[]) {
+      const row = rt.asRecord(item);
+      const nodeId = row.node_id;
+      if (typeof nodeId !== "number" || !Number.isInteger(nodeId) || nodeId <= 0) {
+        return fail(400, "node_id 不合法", "invalid_input");
+      }
+      if (parsed.some((m) => m.node_id === nodeId)) {
+        return fail(400, `成员次序里出现重复的节点 #${nodeId}`, "member_duplicated");
+      }
+      parsed.push({ node_id: nodeId, is_enabled: row.is_enabled !== false });
+    }
+    for (const member of parsed) {
+      const node = db.nodes.find((row) => row.id === member.node_id);
+      if (!node) return fail(404, `节点 #${member.node_id} 不存在`, "member_node_not_found");
+      if (node.node_group_id !== tunnel.in_node_group_id) {
+        return fail(400, `节点 #${member.node_id} 不在该转发的入口节点组里`, "member_node_group_mismatch");
+      }
+      if (!roleAcceptsIngress(mockUserNode(db, node).role ?? null)) {
+        return fail(400, `节点 #${member.node_id} 的角色不能作为入口（需要 ingress 或 both）`, "member_role_mismatch");
+      }
+    }
+    if (parsed.length === 0) memberOrderByForward.delete(id);
+    else memberOrderByForward.set(id, parsed);
+    // 与成员表**同一条写入路径**维护回切目标（第一台启用的成员）。
+    const preferred = parsed.find((member) => member.is_enabled)?.node_id ?? null;
+    preferredByForward.set(id, preferred);
+    return ok({
+      tunnel_id: id,
+      members: parsed.map((member, index) => ({ ...member, priority: index })),
+      preferred_ingress_node_id: preferred,
+    });
   }
   if (seg[2] === "preferred-ingress" && method === "PUT" && id !== null) {
     const body = rt.asRecord(ctx.req.body);

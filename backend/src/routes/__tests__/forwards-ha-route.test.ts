@@ -50,13 +50,20 @@ const GROUP = 1;
 // 现任入口 / 合格候选 / 离线 / 角色不符 / 未声明角色 / 维护中 / 别的组
 const N_ACTIVE = 51, N_CANDIDATE = 52, N_OFFLINE = 53;
 const N_EGRESS = 54, N_NOROLE = 55, N_MAINTENANCE = 56, N_FOREIGN_GROUP = 57, N_REVOKED = 58;
+/** 同 workspace、但**不是**这条转发的入口组（组 3）的节点。 */
+const N_OTHER_GROUP = 59;
+/** 另一台**在线**的合格入口（用来证明次序真的会改变"下一台是谁"）。 */
+const N_EXTRA = 60;
 
 let role = "owner", roleId = null, permissions = null, active = true;
 let requestWorkspace = WS;
 let tunnel = null;
 let failoverQueryThrows = false;
 let optionsQueryThrows = false;
-const nodeGroups = { 1: WS, 2: WS + 6 };
+/** task-43：入口成员次序（意图行）+ 读失败开关。 */
+let intentRows = [];
+let intentReadThrows = false;
+const nodeGroups = { 1: WS, 2: WS + 6, 3: WS };
 const configRows = new Map();
 const dbCalls = [];
 const findFirstWheres = [];
@@ -78,6 +85,8 @@ function seedNodes() {
     nodeRow({ id: N_MAINTENANCE, role: "ingress", lifecycle: "maintenance" }),
     nodeRow({ id: N_FOREIGN_GROUP, role: "ingress", node_group_id: 2 }),
     nodeRow({ id: N_REVOKED, role: "ingress", credential_revoked: true }),
+    nodeRow({ id: N_OTHER_GROUP, role: "ingress", node_group_id: 3 }),
+    nodeRow({ id: N_EXTRA, role: "ingress" }),
   ];
 }
 function nodeRow(over) {
@@ -99,6 +108,7 @@ function reset() {
   role = "owner"; roleId = null; permissions = null; active = true; requestWorkspace = WS;
   tunnel = baseTunnel({});
   failoverQueryThrows = false; optionsQueryThrows = false;
+  intentRows = []; intentReadThrows = false;
   configRows.clear();
   dbCalls.length = 0; findFirstWheres.length = 0; writes.length = 0; updated.length = 0;
   seedNodes();
@@ -146,7 +156,7 @@ function forbid(name) {
 }
 const FAILOVER_SELECT_MARK = "node_group_id";
 
-mock.module(root + "db.ts", () => ({ db: {
+const dbMock = {
   workspace: { findUnique: async () => ({ id: WS }) },
   workspaceMember: { findUnique: async (args) => {
     const w = args.where.workspace_id_user_id;
@@ -215,8 +225,34 @@ mock.module(root + "db.ts", () => ({ db: {
       return { name: args.where.name, value: value };
     },
   },
-} }));
+  /* task-43：入口成员次序（意图表） */
+  forwardIngressMember: {
+    findMany: async (args) => {
+      dbCalls.push("forwardIngressMember.findMany");
+      if (intentReadThrows) throw new Error("intent read failed");
+      const rows = intentRows.filter(function (row) { return matches(row, args.where); });
+      const ordered = orderedTake(rows, Array.isArray(args.orderBy) ? args.orderBy[0] : args.orderBy, args.take);
+      return args.select ? ordered.map(function (r) { return project(r, args.select); }) : ordered;
+    },
+    deleteMany: async (args) => {
+      writes.push("forwardIngressMember.deleteMany");
+      intentRows = intentRows.filter(function (row) { return row.tunnel_id !== args.where.tunnel_id; });
+      return { count: 0 };
+    },
+    createMany: async (args) => {
+      writes.push("forwardIngressMember.createMany");
+      args.data.forEach(function (row) { intentRows.push(Object.assign({}, row)); });
+      return { count: args.data.length };
+    },
+  },
+};
+// Prisma 的交互式事务：替身里直接在同一份内存数据上跑回调（与真实 $transaction(fn) 同形）。
+dbMock.$transaction = async (fn) => fn(dbMock);
 
+mock.module(root + "db.ts", () => ({ db: dbMock }));
+
+const NOW = Date.now();
+const { pickFailoverDestination } = await import(root + "services/failover-loop.ts");
 const { forwardsRoutes } = await import(root + "routes/forwards.ts");
 const { systemConfig } = await import(root + "services/config.ts");
 const app = new Hono();
@@ -250,10 +286,10 @@ async function group(name, expectChecks, fn) {
 }
 const DATA_KEYS = ["active_ingress_node_id","failback","failover_candidate","forward_id","ingress_members","member_priority","policy","preferred_ingress_node_id"].sort();
 const FAILBACK_KEYS = ["auto_failback","preferred_ingress_node_id","progress","target_node_id"].sort();
-const PRIORITY_KEYS = ["custom_order_supported","source"].sort();
+const PRIORITY_KEYS = ["custom_order_supported","order_readable","source"].sort();
 const POLICY_KEYS = ["auto_failback","auto_failover","parse_error"].sort();
 const CANDIDATE_KEYS = ["node_id","reason","status"].sort();
-const OPTION_KEYS = ["accepts_new_business","admission_rejection","can_be_preferred","can_take_over","connection","failover_rank","is_active_ingress","is_failback_target","is_preferred","lifecycle","name","node_group_id","node_id","preference_rejection","role","takeover_rejection"].sort();
+const OPTION_KEYS = ["accepts_new_business","admission_rejection","can_be_preferred","can_take_over","connection","failover_rank","in_saved_order","is_active_ingress","is_disabled","is_failback_target","is_preferred","lifecycle","member_rank","name","node_group_id","node_id","preference_rejection","role","takeover_rejection"].sort();
 `;
 
 /* ------------------------------------------------------------------ */
@@ -359,14 +395,19 @@ await group("projection-truth", 8, async () => {
   /* 入口成员：只列这条转发的入口组，键集冻结，且**不含凭据材料**。 */
   expect(data.ingress_members.status).toBe("ok");
   const ids = data.ingress_members.nodes.map(function (n) { return n.node_id; });
-  expect(ids).toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE, N_REVOKED]);
+  expect(ids).toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE, N_REVOKED, N_EXTRA]);
   data.ingress_members.nodes.forEach(function (n) {
     expect(Object.keys(n).sort()).toEqual(OPTION_KEYS);
   });
 
   /* task-38：顺序是**平台规则**（合格候选按 node id 升序），且契约明说不可自定义。 */
   expect(Object.keys(data.member_priority).sort()).toEqual(PRIORITY_KEYS);
-  expect(data.member_priority).toEqual({ source: "platform_rule_node_id_asc", custom_order_supported: false });
+  /* 无行 ⇒ 与迁移前逐位一致：次序来源是平台规则，且"可自定义"能力已经存在。 */
+  expect(data.member_priority).toEqual({
+    source: "platform_rule_node_id_asc",
+    custom_order_supported: true,
+    order_readable: true,
+  });
 
   /* 「能不能接管」与「能不能当首选」是两个不同答案，逐台分开断言（含第一个不满足的条件码）。 */
   expect(nodeOf(data, N_ACTIVE).can_take_over).toBe(false);
@@ -441,7 +482,7 @@ await group("projection-truth", 8, async () => {
   reset();
   await systemConfig.setConfig("FAILOVER_POLICY", "");
   /* 现任是组内唯一合格的入口：另一个在线的候选不存在 ⇒ none（不是 unavailable）。 */
-  nodes = nodes.filter(function (n) { return n.id !== N_CANDIDATE; });
+  nodes = nodes.filter(function (n) { return n.id !== N_CANDIDATE && n.id !== N_EXTRA; });
   data = await ha();
   expect(data.failover_candidate).toEqual({ status: "none", node_id: null, reason: null });
   /* 同一事实的细粒度：成员还在（非空），但没有一台能接管（rank 全 null）。 */
@@ -449,7 +490,12 @@ await group("projection-truth", 8, async () => {
   expect(data.ingress_members.nodes.every(function (n) { return n.can_take_over === false; })).toBe(true);
   expect(data.ingress_members.nodes.every(function (n) { return n.failover_rank === null; })).toBe(true);
   /* 只有"在线"这一个维度的差异就能翻状态：把唯一候选取回但让它离线 ⇒ 仍是 none。 */
-  nodes = nodes.filter(function (n) { return n.id !== N_CANDIDATE; }).concat([nodeRow({ id: N_CANDIDATE, role: "ingress", last_seen_at: STALE })]);
+  nodes = nodes
+    .filter(function (n) { return n.id !== N_CANDIDATE && n.id !== N_EXTRA; })
+    .concat([
+      nodeRow({ id: N_CANDIDATE, role: "ingress", last_seen_at: STALE }),
+      nodeRow({ id: N_EXTRA, role: "ingress", last_seen_at: STALE }),
+    ]);
   data = await ha();
   expect(data.failover_candidate.status).toBe("none");
 
@@ -532,6 +578,170 @@ await group("write-then-read", 7, async () => {
 `;
 
 /* ------------------------------------------------------------------ */
+/* ④ 成员次序（task-43）：全量替换 / 拒绝分支 / 与首选同源              */
+/* ------------------------------------------------------------------ */
+
+const SCENARIO_MEMBERS = String.raw`
+await group("ingress-member-order", 16, async () => {
+  reset();
+  asRole("owner");
+  const ORDER_PATH = "/api/forwards/" + FORWARD_ID + "/ingress-members";
+
+  /* 无行时：与迁移前逐位一致（按 node id 升序），候选仍是 id 最小的合格者。 */
+  let data = await ha();
+  expect(data.ingress_members.nodes.map(function (n) { return n.node_id; }))
+    .toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE, N_REVOKED, N_EXTRA]);
+  expect(data.failover_candidate.node_id).toBe(N_CANDIDATE);
+  expect(data.member_priority.source).toBe("platform_rule_node_id_asc");
+
+  /* 保存次序：把**离线**的 N_OFFLINE 放到第 1 位、在线候选 N_CANDIDATE 放第 2 位。 */
+  let res = await status(await reqPath(ORDER_PATH, "PUT", {
+    members: [{ node_id: N_OFFLINE }, { node_id: N_CANDIDATE }, { node_id: N_MAINTENANCE, is_enabled: false }],
+  }), 200);
+  let body = await res.json();
+  // priority = 数组下标；回切目标 = 第一台**启用**的成员（与成员表同一次写入）。
+  expect(body.data).toEqual({
+    tunnel_id: FORWARD_ID,
+    members: [
+      { node_id: N_OFFLINE, priority: 0, is_enabled: true },
+      { node_id: N_CANDIDATE, priority: 1, is_enabled: true },
+      { node_id: N_MAINTENANCE, priority: 2, is_enabled: false },
+    ],
+    preferred_ingress_node_id: N_OFFLINE,
+  });
+  expect(updated[updated.length - 1]).toEqual({ preferred_ingress_node_id: N_OFFLINE, failback_healthy_checks: 0 });
+
+  /* 读回：次序 = 表内次序优先，其余组内成员按 id 升序排在后面；来源变成表。 */
+  data = await ha();
+  expect(data.member_priority).toEqual({
+    source: "forward_member_table",
+    custom_order_supported: true,
+    order_readable: true,
+  });
+  expect(data.ingress_members.nodes.map(function (n) { return n.node_id; }))
+    .toEqual([N_OFFLINE, N_CANDIDATE, N_MAINTENANCE, N_ACTIVE, N_EGRESS, N_NOROLE, N_REVOKED, N_EXTRA]);
+  expect(nodeOf(data, N_OFFLINE).member_rank).toBe(1);
+  expect(nodeOf(data, N_OFFLINE).in_saved_order).toBe(true);
+  expect(nodeOf(data, N_EGRESS).in_saved_order).toBe(false);
+  expect(nodeOf(data, N_EGRESS).member_rank).toBe(null);
+
+  /* 顺序真的改变了"下一台是谁"：N_OFFLINE 不合格（离线）⇒ 跳过它选 N_CANDIDATE（表内第 2 位）。 */
+  expect(data.failover_candidate.status).toBe("available");
+  expect(data.failover_candidate.node_id).toBe(N_CANDIDATE);
+  expect(nodeOf(data, N_CANDIDATE).failover_rank).toBe(1);
+
+  /* 被停用的成员不参与接管，但仍在列表里、带自己的原因码。 */
+  expect(nodeOf(data, N_MAINTENANCE).is_disabled).toBe(true);
+  expect(nodeOf(data, N_MAINTENANCE).can_take_over).toBe(false);
+  expect(nodeOf(data, N_MAINTENANCE).takeover_rejection).toBe("member_disabled");
+
+  /* 把在线的 N_ACTIVE（现任）与 N_CANDIDATE 一起排：现任仍不能接管（current_owner）。 */
+  await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: N_CANDIDATE }, { node_id: N_ACTIVE }] }), 200);
+  data = await ha();
+  expect(data.failover_candidate.node_id).toBe(N_CANDIDATE);
+  expect(nodeOf(data, N_ACTIVE).takeover_rejection).toBe("current_owner");
+  expect(data.preferred_ingress_node_id).toBe(N_CANDIDATE);
+
+  /* 清除自定义次序（空数组）⇒ 回到平台规则 + 回切目标清空。 */
+  const cleared = await status(await reqPath(ORDER_PATH, "PUT", { members: [] }), 200);
+  expect((await cleared.json()).data).toEqual({
+    tunnel_id: FORWARD_ID,
+    members: [],
+    preferred_ingress_node_id: null,
+  });
+  data = await ha();
+  expect(data.member_priority.source).toBe("platform_rule_node_id_asc");
+  expect(data.preferred_ingress_node_id).toBe(null);
+  expect(data.ingress_members.nodes.map(function (n) { return n.node_id; }))
+    .toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE, N_REVOKED, N_EXTRA]);
+
+  /* 拒绝分支：重复 node_id / 非本空间（不存在）节点 / 非入口组节点 / 角色不符 / 形状非法。 */
+  const dup = await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: N_CANDIDATE }, { node_id: N_CANDIDATE }] }), 400);
+  expect((await dup.json()).code).toBe("member_duplicated");
+
+  const missing = await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: 999999 }] }), 404);
+  expect((await missing.json()).code).toBe("member_node_not_found");
+
+  /* 跨 workspace 的节点与"真不存在"**逐字同形**（否则响应体成了跨租户存在性探针）。 */
+  const foreignWs = await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: N_FOREIGN_GROUP }] }), 404);
+  expect((await foreignWs.json()).code).toBe("member_node_not_found");
+
+  /* 同 workspace、不同入口组 ⇒ 组不符（400）。 */
+  const otherGroup = await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: N_OTHER_GROUP }] }), 400);
+  expect((await otherGroup.json()).code).toBe("member_node_group_mismatch");
+
+  const badRole = await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: N_EGRESS }] }), 400);
+  expect((await badRole.json()).code).toBe("member_role_mismatch");
+
+  const badShape = await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: "1" }] }), 400);
+  expect((await badShape.json()).code).toBe("invalid_input");
+
+  /* 被拒绝的写入**一个字都不许落库**（次序与首选都必须保持上一步的状态）。 */
+  expect(intentRows.length).toBe(0);
+  expect(tunnel.preferred_ingress_node_id).toBe(null);
+
+  /* 读序失败 ⇒ 回退到平台规则（不是"用户没排序"，也不是让请求失败）。 */
+  await status(await reqPath(ORDER_PATH, "PUT", { members: [{ node_id: N_OFFLINE }, { node_id: N_CANDIDATE }] }), 200);
+  intentReadThrows = true;
+  data = await ha();
+  expect(data.member_priority.source).toBe("platform_rule_node_id_asc");
+  expect(data.member_priority.order_readable).toBe(false);
+  expect(data.ingress_members.nodes.map(function (n) { return n.node_id; }))
+    .toEqual([N_ACTIVE, N_CANDIDATE, N_OFFLINE, N_EGRESS, N_NOROLE, N_MAINTENANCE, N_REVOKED, N_EXTRA]);
+  expect(data.failover_candidate.node_id).toBe(N_CANDIDATE);
+  intentReadThrows = false;
+  data = await ha();
+  expect(data.member_priority.source).toBe("forward_member_table");
+
+  /* ── 直调 failover 的候选选择（同一份次序，独立于路由） ── */
+  reset();
+  const pick = () => pickFailoverDestination(
+    { tunnel_id: FORWARD_ID, workspace_id: WS, owner_node_id: N_ACTIVE, now: new Date(NOW) },
+    dbMock,
+  );
+
+  // 无行 ⇒ 与迁移前逐位一致：合格候选里 node id 最小的那台。
+  intentRows = [];
+  expect((await pick()).candidate_node_id).toBe(N_CANDIDATE);
+
+  // 有行 ⇒ 按用户次序：把 N_EXTRA(60) 排在 N_CANDIDATE(52) 前面 ⇒ 选中 60。
+  intentRows = [
+    { tunnel_id: FORWARD_ID, node_id: N_EXTRA, priority: 0, is_enabled: true },
+    { tunnel_id: FORWARD_ID, node_id: N_CANDIDATE, priority: 1, is_enabled: true },
+  ];
+  expect((await pick()).candidate_node_id).toBe(N_EXTRA);
+
+  // 调换次序 ⇒ 回到 52（同两份行，只有 priority 变）。
+  intentRows = [
+    { tunnel_id: FORWARD_ID, node_id: N_CANDIDATE, priority: 0, is_enabled: true },
+    { tunnel_id: FORWARD_ID, node_id: N_EXTRA, priority: 1, is_enabled: true },
+  ];
+  expect((await pick()).candidate_node_id).toBe(N_CANDIDATE);
+
+  // 显式停用的成员不参与接管（即使它排第一）。
+  intentRows = [
+    { tunnel_id: FORWARD_ID, node_id: N_EXTRA, priority: 0, is_enabled: false },
+    { tunnel_id: FORWARD_ID, node_id: N_CANDIDATE, priority: 1, is_enabled: true },
+  ];
+  expect((await pick()).candidate_node_id).toBe(N_CANDIDATE);
+
+  // 读序失败 ⇒ 回退到今天的次序（52），**不是**让这一拍不迁移。
+  intentReadThrows = true;
+  const fallback = await pick();
+  expect(fallback.candidate_node_id).toBe(N_CANDIDATE);
+  expect(fallback.preferred_node_id).toBe(null);
+  intentReadThrows = false;
+
+  // 表内成员之外的组内节点仍作为**尾部候选**参与（不会被排除）。
+  intentRows = [{ tunnel_id: FORWARD_ID, node_id: N_EXTRA, priority: 0, is_enabled: true }];
+  expect((await pick()).candidate_node_id).toBe(N_EXTRA);
+  // 若 N_EXTRA 不在线 ⇒ 尾部候选里的 52 顶上（次序不会把不合格的机器变成候选）。
+  nodes = nodes.map(function (n) { return n.id === N_EXTRA ? nodeRow({ id: N_EXTRA, role: "ingress", last_seen_at: STALE }) : n; });
+  expect((await pick()).candidate_node_id).toBe(N_CANDIDATE);
+});
+`;
+
+/* ------------------------------------------------------------------ */
 /* 入口                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -548,4 +758,9 @@ test("GET /api/forwards/:id/ha（投影真值：期望 vs 事实、策略、候�
 test("GET /api/forwards/:id/ha（写入路径未改动 + 读后写 + 顺序纪律）", () => {
   const output = runScenario(SCENARIO_WRITE);
   expect(output).toContain("GROUP write-then-read=7");
+});
+
+test("PUT /api/forwards/:id/ingress-members（全量替换 + 拒绝分支 + 读序失败回退）", () => {
+  const output = runScenario(SCENARIO_MEMBERS);
+  expect(output).toContain("GROUP ingress-member-order=16");
 });

@@ -36,19 +36,21 @@
  *  不碰 `lib/i18n/dictionaries.ts`，避免与并行切片争抢同一个字典文件。
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18nOptional } from "@/components/providers";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import {
   FORWARD_HA_POLL_MS,
   forwardHaErrorInfo,
   getForwardHa,
+  setForwardIngressMembers,
   setForwardPreferredIngress,
   type ForwardHaCandidate,
   type ForwardHaErrorInfo,
   type ForwardHaOptionNode,
   type ForwardHaPolicy,
   type ForwardHaProjection,
+  type IngressMemberInput,
 } from "@/lib/api/forward-ha";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import type { Locale } from "@/lib/i18n";
@@ -98,7 +100,20 @@ export interface HaCopy {
   membersUnavailable: string;
   membersEmpty: string;
   membersNoTakeover: string;
-  orderSource: (customOrderSupported: boolean) => string;
+  orderSource: (source: ForwardHaProjection["member_priority"]["source"], orderReadable: boolean) => string;
+  orderEditorTitle: string;
+  orderHint: string;
+  moveUp: string;
+  moveDown: string;
+  orderSave: string;
+  orderSaving: string;
+  orderClear: string;
+  orderReset: string;
+  disableMember: string;
+  enableMember: string;
+  memberDisabled: string;
+  orderUnreadable: string;
+  orderSaved: string;
   optionIsFailbackTarget: string;
   canTakeOver: (rank: number | null) => string;
   cannotTakeOver: (reason: string) => string;
@@ -184,10 +199,26 @@ const ZH: HaCopy = {
     "这个入口节点组里没有任何成员 —— 这不是「没有可用候选」，而是组里确实一台都没有。",
   membersNoTakeover:
     "有成员，但此刻没有一台能接管：每台下面写了它自己的原因（离线 / 维护中 / 角色不符 / 凭据被吊销）。",
-  orderSource: (customOrderSupported) =>
-    customOrderSupported
-      ? "顺序：按这条转发的自定义成员顺序。"
-      : "顺序来源：平台规则（合格的候选按节点 id 升序），按这条转发自定义顺序尚未提供。",
+  orderSource: (source, orderReadable) =>
+    !orderReadable
+      ? "顺序这次取不到：下面按平台默认规则（合格候选按节点 id 升序）显示 —— 这不等于你保存的次序被清空。"
+      : source === "forward_member_table"
+        ? "顺序来源：你保存的入口次序（列表顺序 = 优先级）。"
+        : "顺序来源：平台默认规则（合格候选按节点 id 升序）；你还没有保存过自定义次序。",
+  orderEditorTitle: "调整入口次序",
+  orderHint:
+    "列表顺序 = 优先级：平台按这个次序挑下一台接管的入口，不合格（离线 / 维护中 / 停用）的会被跳过。保存是**全量替换**，不重启转发、不触发下发。",
+  moveUp: "上移",
+  moveDown: "下移",
+  orderSave: "保存次序",
+  orderSaving: "保存中…",
+  orderClear: "清除自定义次序",
+  orderReset: "还原",
+  disableMember: "停用",
+  enableMember: "启用",
+  memberDisabled: "已停用",
+  orderUnreadable: "次序取不到：编辑器按当前展示的顺序初始化，保存会覆盖服务端已存的次序。",
+  orderSaved: "已保存的次序（第 1 位是回切目标）",
   optionIsFailbackTarget: "回切目标",
   canTakeOver: (rank) =>
     rank === null ? "此刻可接管" : `此刻可接管（平台次序第 ${rank} 位）`,
@@ -287,10 +318,26 @@ const EN: HaCopy = {
     "This ingress node group holds no member at all — that is not \"no eligible candidate\"; it is an empty group.",
   membersNoTakeover:
     "There are members, but none can take over right now: each one lists its own reason (offline / maintenance / wrong role / revoked credential).",
-  orderSource: (customOrderSupported) =>
-    customOrderSupported
-      ? "Order: this forward's custom member order."
-      : "Order source: platform rule (eligible candidates by ascending node id); a per-forward custom order is not available yet.",
+  orderSource: (source, orderReadable) =>
+    !orderReadable
+      ? "The order could not be read this time: what follows uses the platform default (eligible candidates by ascending node id) — this does not mean your saved order was cleared."
+      : source === "forward_member_table"
+        ? "Order source: your saved ingress order (list order = priority)."
+        : "Order source: platform default (eligible candidates by ascending node id); you have not saved a custom order yet.",
+  orderEditorTitle: "Adjust ingress order",
+  orderHint:
+    "List order = priority: the platform picks the next ingress to take over in this order, skipping ineligible ones (offline / maintenance / disabled). Saving is a full replacement; it does not restart the forward or trigger a rollout.",
+  moveUp: "Move up",
+  moveDown: "Move down",
+  orderSave: "Save order",
+  orderSaving: "Saving…",
+  orderClear: "Clear custom order",
+  orderReset: "Reset",
+  disableMember: "Disable",
+  enableMember: "Enable",
+  memberDisabled: "disabled",
+  orderUnreadable: "The order was unreadable: the editor starts from what is displayed, and saving will overwrite the stored order.",
+  orderSaved: "Saved order (position 1 is the failback target)",
   optionIsFailbackTarget: "failback target",
   canTakeOver: (rank) => (rank === null ? "can take over now" : `can take over now (takeover position ${rank})`),
   cannotTakeOver: (reason) => `cannot take over now (${reason})`,
@@ -466,6 +513,149 @@ function acceptsText(copy: HaCopy, node: Pick<ForwardHaOptionNode, "accepts_new_
   return node.accepts_new_business ? copy.acceptsYes : copy.acceptsNo(node.admission_rejection);
 }
 
+/**
+ * 次序编辑器（task-43）。
+ *
+ * 行为参照：ForwardX（AGPL-3.0-only）——多入口/转发组的成员排序（拖动/上移下移，顺序即优先级，
+ * 含每成员启用开关）；**代码为本项目改写，未复制其实现**。
+ *
+ * 三条纪律：
+ *   1. 草稿只在本地：**没有保存之前不改服务端**（保存是"全量替换"，一次 PUT）；
+ *   2. 保存的是**完整次序**（数组顺序 = 优先级），停用状态也一起提交；
+ *   3. 只是 UI 的排序意图，**不预告**平台会不会迁移 —— 迁移仍由策略在每一拍判。
+ */
+export function IngressOrderEditor({
+  nodes,
+  busy,
+  saving,
+  onSave,
+  onClear,
+}: {
+  nodes: readonly ForwardHaOptionNode[];
+  busy?: boolean;
+  saving?: boolean;
+  onSave?: (members: readonly IngressMemberInput[]) => void;
+  onClear?: () => void;
+}) {
+  const copy = useCopy();
+  const serverOrder = useMemo(() => nodes.map((node) => node.node_id), [nodes]);
+  const serverDisabled = useMemo(
+    () => nodes.filter((node) => node.is_disabled).map((node) => node.node_id),
+    [nodes],
+  );
+  const [order, setOrder] = useState<number[]>(serverOrder);
+  const [disabled, setDisabled] = useState<number[]>(serverDisabled);
+  const byId = useMemo(() => new Map(nodes.map((node) => [node.node_id, node])), [nodes]);
+  const dirty =
+    order.join(",") !== serverOrder.join(",") || disabled.join(",") !== serverDisabled.join(",");
+
+  const move = (index: number, delta: number) => {
+    const next = [...order];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    const [item] = next.splice(index, 1);
+    next.splice(target, 0, item!);
+    setOrder(next);
+  };
+  const toggle = (nodeId: number) => {
+    setDisabled((prev) =>
+      prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId],
+    );
+  };
+
+  return (
+    <div data-testid="forward-ha-order-editor" className="mt-3 rounded border border-dashed border-[var(--border)] p-2">
+      <h5 className="text-xs font-medium">{copy.orderEditorTitle}</h5>
+      <p className="mt-1 text-xs text-[var(--muted-foreground)]">{copy.orderHint}</p>
+      <ol className="mt-2 space-y-1">
+        {order.map((nodeId, index) => {
+          const node = byId.get(nodeId);
+          const isOff = disabled.includes(nodeId);
+          return (
+            <li key={nodeId} className="flex flex-wrap items-center gap-2 text-xs" data-testid={`forward-ha-order-row-${nodeId}`}>
+              <span
+                className="inline-block min-w-5 rounded border border-[var(--border)] px-1 text-center"
+                data-testid={`forward-ha-order-rank-${nodeId}`}
+              >
+                {index + 1}
+              </span>
+              <span>{node?.name ?? `#${nodeId}`}</span>
+              <button
+                type="button"
+                data-testid={`forward-ha-order-up-${nodeId}`}
+                onClick={() => move(index, -1)}
+                disabled={index === 0 || busy}
+                className="rounded border border-[var(--border)] px-1 disabled:opacity-40"
+              >
+                {copy.moveUp}
+              </button>
+              <button
+                type="button"
+                data-testid={`forward-ha-order-down-${nodeId}`}
+                onClick={() => move(index, 1)}
+                disabled={index === order.length - 1 || busy}
+                className="rounded border border-[var(--border)] px-1 disabled:opacity-40"
+              >
+                {copy.moveDown}
+              </button>
+              <button
+                type="button"
+                data-testid={`forward-ha-order-toggle-${nodeId}`}
+                aria-pressed={isOff}
+                onClick={() => toggle(nodeId)}
+                disabled={busy}
+                className="rounded border border-[var(--border)] px-1 disabled:opacity-40"
+              >
+                {isOff ? copy.enableMember : copy.disableMember}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-testid="forward-ha-order-save"
+          disabled={busy || saving || !dirty || !onSave}
+          onClick={() =>
+            onSave?.(
+              order.map((nodeId) =>
+                disabled.includes(nodeId)
+                  ? { node_id: nodeId, is_enabled: false }
+                  : { node_id: nodeId },
+              ),
+            )
+          }
+          className="rounded border border-[var(--border)] px-2 py-0.5 text-xs disabled:opacity-50"
+        >
+          {saving ? copy.orderSaving : copy.orderSave}
+        </button>
+        <button
+          type="button"
+          data-testid="forward-ha-order-reset"
+          disabled={busy || saving || !dirty}
+          onClick={() => {
+            setOrder(serverOrder);
+            setDisabled(serverDisabled);
+          }}
+          className="rounded border border-[var(--border)] px-2 py-0.5 text-xs disabled:opacity-50"
+        >
+          {copy.orderReset}
+        </button>
+        <button
+          type="button"
+          data-testid="forward-ha-order-clear"
+          disabled={busy || saving || !onClear}
+          onClick={() => onClear?.()}
+          className="rounded border border-[var(--border)] px-2 py-0.5 text-xs disabled:opacity-50"
+        >
+          {copy.orderClear}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export interface ForwardHaPanelProps {
   state: ForwardHaState;
   /** 设置首选入口（`null` = 清除）。 */
@@ -475,6 +665,11 @@ export interface ForwardHaPanelProps {
   /** 正在写入的节点（`null` = 清除中；`undefined` = 没有写入在途）。 */
   pendingNodeId?: number | null | undefined;
   writeError?: ForwardHaErrorInfo | null;
+  /** task-43：保存入口次序（**全量替换**，数组顺序 = 优先级）。 */
+  onSaveOrder?: (members: readonly IngressMemberInput[]) => void;
+  /** task-43：清除自定义次序（回到平台默认次序）。 */
+  onClearOrder?: () => void;
+  savingOrder?: boolean;
 }
 
 export function ForwardHaPanel({
@@ -484,6 +679,9 @@ export function ForwardHaPanel({
   busy,
   pendingNodeId,
   writeError,
+  onSaveOrder,
+  onClearOrder,
+  savingOrder,
 }: ForwardHaPanelProps) {
   const copy = useCopy();
   const projection = state.status === "data" ? state.projection : null;
@@ -661,8 +859,13 @@ export function ForwardHaPanel({
             {members?.status === "ok" && members.nodes.length > 0 ? (
               <>
                 <p className="mt-1 text-xs text-[var(--muted-foreground)]" data-testid="forward-ha-members-order-source">
-                  {copy.orderSource(projection.member_priority.custom_order_supported)}
+                  {copy.orderSource(projection.member_priority.source, projection.member_priority.order_readable)}
                 </p>
+                {projection.member_priority.order_readable === false ? (
+                  <p role="alert" data-testid="forward-ha-order-unreadable" className="mt-1 text-xs">
+                    {copy.orderUnreadable}
+                  </p>
+                ) : null}
                 {!hasTakeover(members.nodes) ? (
                   <p data-testid="forward-ha-members-no-takeover" className="mt-1 text-sm">
                     {copy.membersNoTakeover}
@@ -698,6 +901,11 @@ export function ForwardHaPanel({
                           {node.is_preferred ? (
                             <span className="ml-2 text-xs" data-testid={`forward-ha-option-preferred-${node.node_id}`}>
                               {copy.optionIsPreferred}
+                            </span>
+                          ) : null}
+                          {node.is_disabled ? (
+                            <span className="ml-2 text-xs" data-testid={`forward-ha-option-disabled-${node.node_id}`}>
+                              {copy.memberDisabled}
                             </span>
                           ) : null}
                         </div>
@@ -739,6 +947,16 @@ export function ForwardHaPanel({
                   ))}
                 </ol>
               </>
+            ) : null}
+            {members?.status === "ok" && members.nodes.length > 0 && onSaveOrder ? (
+              <IngressOrderEditor
+                key={members.nodes.map((node) => `${node.node_id}:${node.is_disabled ? 0 : 1}`).join(",")}
+                nodes={members.nodes}
+                busy={Boolean(busy)}
+                saving={Boolean(savingOrder)}
+                onSave={onSaveOrder}
+                onClear={onClearOrder}
+              />
             ) : null}
             <div className="mt-2">
               <button
@@ -806,11 +1024,14 @@ export function ForwardHaCard({
   forwardId,
   read,
   write,
+  writeMembers,
   pollMs = FORWARD_HA_POLL_MS,
 }: {
   forwardId: ID;
   read?: (forwardId: ID) => Promise<ForwardHaProjection>;
   write?: (forwardId: ID, nodeId: number | null) => Promise<unknown>;
+  /** task-43：保存入口次序（**全量替换**）。测试注入缝隙；生产用 API 模块的同名函数。 */
+  writeMembers?: (forwardId: ID, members: readonly IngressMemberInput[]) => Promise<unknown>;
   pollMs?: number;
 }) {
   const { currentId, can, permissionsLoading } = useWorkspace();
@@ -820,6 +1041,7 @@ export function ForwardHaCard({
   const [busy, setBusy] = useState(false);
   const [pendingNodeId, setPendingNodeId] = useState<number | null | undefined>(undefined);
   const [writeError, setWriteError] = useState<ForwardHaErrorInfo | null>(null);
+  const [savingOrder, setSavingOrder] = useState(false);
   const guardRef = useRef<HaScopeGuard | null>(null);
   if (guardRef.current === null) guardRef.current = createHaScopeGuard();
   const guard = guardRef.current;
@@ -900,14 +1122,44 @@ export function ForwardHaCard({
     [canWrite, forwardId, guard, run, write],
   );
 
+  /** task-43：保存完整次序（全量替换）。成功/失败都**回读服务端真值**，不做乐观赋值。 */
+  const saveOrder = useCallback(
+    (members: readonly IngressMemberInput[]) => {
+      if (!canWrite) {
+        setWriteError({ code: "permission_denied", message: PERMISSION_DENIED, layer: "rbac" });
+        return;
+      }
+      const token = guard.claim();
+      setSavingOrder(true);
+      setWriteError(null);
+      const send = writeMembers ?? setForwardIngressMembers;
+      void send(forwardId, members)
+        .then(() => {
+          if (!guard.isCurrent(token)) return;
+          run({ keepState: true });
+        })
+        .catch((error: unknown) => {
+          if (!guard.isCurrent(token)) return;
+          setWriteError(forwardHaErrorInfo(error));
+        })
+        .finally(() => {
+          if (guard.isCurrent(token)) setSavingOrder(false);
+        });
+    },
+    [canWrite, forwardId, guard, run, writeMembers],
+  );
+
   return (
     <ForwardHaPanel
       state={state}
       busy={busy}
       pendingNodeId={pendingNodeId}
       writeError={writeError}
+      savingOrder={savingOrder}
       onReload={() => run({ keepState: true })}
       onSetPreferred={setPreferred}
+      onSaveOrder={saveOrder}
+      onClearOrder={() => saveOrder([])}
     />
   );
 }

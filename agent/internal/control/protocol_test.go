@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"github.com/tunex/agent/internal/diag"
+	"slices"
 	"strings"
 	"testing"
 
@@ -52,7 +54,16 @@ func advertisedDispatches(t *testing.T, action string, cmd *QueuedCommand) bool 
 }
 
 func TestAdvertisedCapabilitiesMatchExecute(t *testing.T) {
+	// `Capabilities()` 里有两类条目，语义不同：
+	//   · 动作（advertisedActions）—— 面板可以下发它，Agent 必须能执行；
+	//   · 方法级标注（`looking_glass:<method>`）—— 同**一个动作内部**的方法维，
+	//     它回答的是"这个节点能不能真的执行该方法"（镜像有没有二进制、内核允不允许
+	//     非特权 ICMP），面板据此算 caps.methods。它不是一个动作，因此不在这里断言
+	//     "execute 认识它"，而在下面单独钉住它的形状与闭集。
 	for _, action := range Capabilities() {
+		if isMethodAnnotation(action) {
+			continue
+		}
 		cmd := &QueuedCommand{Envelope: Envelope{
 			CommandID:  "cmd-" + action,
 			ResourceID: "tunex-1-direct",
@@ -66,6 +77,45 @@ func TestAdvertisedCapabilitiesMatchExecute(t *testing.T) {
 		}
 		if !advertisedDispatches(t, action, cmd) {
 			t.Fatalf("action %q is advertised but execute answers unsupported_action", action)
+		}
+	}
+}
+
+// isMethodAnnotation 识别 `looking_glass:<method>` 形态的方法级标注。
+func isMethodAnnotation(capability string) bool {
+	return len(capability) > len(ActionLookingGlass)+1 && capability[:len(ActionLookingGlass)+1] == ActionLookingGlass+":"
+}
+
+// TestMethodAnnotationsAreHonest 钉住方法级标注的**诚实性**：只标注本二进制真的实现的
+// 方法，且当且仅当本节点真的能执行时（不可用时不标注 —— 这就是"不假装支持"的机制）。
+func TestMethodAnnotationsAreHonest(t *testing.T) {
+	annotations := map[string]bool{}
+	for _, capability := range Capabilities() {
+		if !isMethodAnnotation(capability) {
+			continue
+		}
+		method := capability[len(ActionLookingGlass)+1:]
+		annotations[method] = true
+		if !slices.Contains(diag.SupportedLookingGlassMethods(), method) {
+			t.Fatalf("标注了本二进制没实现的方法 %q", method)
+		}
+	}
+	// mtr/mtr6 永不标注（镜像无二进制 + 需要 raw socket）。
+	for _, forbidden := range []string{"mtr", "mtr6"} {
+		if annotations[forbidden] {
+			t.Fatalf("%q 不该被标注：本节点无法执行它", forbidden)
+		}
+	}
+	// 标注集合必须与"逐节点可用性枚举"逐条对齐（可用者标注、不可用者不标注）。
+	for _, availability := range diag.DetectLookingGlassMethods() {
+		want := availability.Reason == ""
+		got := annotations[availability.Method]
+		if availability.Method == diag.LookingGlassMethodTCPConnect {
+			// tcp_connect 是动作本身（`looking_glass`），不需要方法级标注。
+			continue
+		}
+		if got != want {
+			t.Fatalf("方法 %q 标注=%v，但本节点可用性=%v（%s）", availability.Method, got, want, availability.Reason)
 		}
 	}
 }

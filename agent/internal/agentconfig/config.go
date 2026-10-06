@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"github.com/tunex/agent/internal/identityprobe"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the resolved agent configuration.
@@ -62,10 +64,112 @@ type Config struct {
 	// desired-state cache that lets a restart during a panel outage come
 	// back with its listeners instead of empty. Empty disables the cache.
 	StateDir string
+
+	// ── 面板迁移回退（task-44）──────────────────────────────────────────────
+	//
+	// 面板换地址（换域名/换机房/迁 IP）时 Agent 不必重新接入：主地址连续失败到阈值
+	// （或距迁移起始时间超过期限、且已有失败证据）就切到备用地址，并在**每一次**上报里
+	// 如实带上「当前生效地址 + 迁移 id + 是否在回退态」。
+	//
+	// **两个键齐备才算启用**（备用地址 + 迁移 id）——与参照实现的"齐备才写、否则三个
+	// 一起删"同一语义：只填一个说明配置写坏了，必须报出来，不能猜。
+	// `PanelMigrationStartedAt` 可选；缺失时只能用"连续失败"这一条判据（面板侧仍会
+	// 下发它，便于审计"这次迁移从什么时候开始"）。
+	//
+	// 三个都空 = 本能力未配置，也是**缺省部署**的状态：行为与以前完全一致。
+	PanelFallbackURL        string
+	PanelMigrationID        string
+	PanelMigrationStartedAt string
 }
 
 // DefaultStateDir is where the container mounts the agent's writable state.
 const DefaultStateDir = "/var/lib/tunex-agent"
+
+/* ================================================================== */
+/* 面板迁移回退（task-44）                                             */
+/* ================================================================== */
+
+// PanelMigrationFallback 是**已经校验过**的回退配置（启用时才有意义）。
+//
+// 行为参照声明：本组类型与判据参照 ForwardX（AGPL-3.0）的 agent 配置
+// `migrationFallbackPanelUrl` / `panelMigrationId` / `panelMigrationStartedAt`
+// 三个键的语义（**齐备才生效**）。TuneX 侧是独立实现：这里只做**配置面**的解析与
+// 校验，切换判据在 `internal/reporter` 的纯函数里，口径按本项目契约重写。
+type PanelMigrationFallback struct {
+	// PrimaryURL 是主面板地址（当前 agent.env 的 TUNEX_PANEL_HTTP_URL）。
+	PrimaryURL string
+	// FallbackURL 是备用面板地址（已去掉尾部斜杠）。
+	FallbackURL string
+	// MigrationID 是这次面板迁移的标识（面板侧生成；用于审计与"同一迁移不重复处理"）。
+	MigrationID string
+	// StartedAt 是迁移起始时刻；StartedAtKnown=false 表示面板没下发，只能用失败阈值判据。
+	StartedAt      time.Time
+	StartedAtKnown bool
+}
+
+// 面板迁移配置面的三种坏形状（都必须**报出来**，不能静默忽略）。
+var (
+	// ErrPanelMigrationNotConfigured：三个键都空 = 本能力未配置（正常缺省）。
+	ErrPanelMigrationNotConfigured = errors.New("agentconfig: panel migration fallback is not configured")
+	// ErrPanelMigrationIncomplete：只填了一部分（必须"齐备才启用"）。
+	ErrPanelMigrationIncomplete = errors.New("agentconfig: panel migration fallback needs BOTH TUNEX_PANEL_FALLBACK_URL and TUNEX_PANEL_MIGRATION_ID")
+	// ErrPanelMigrationBadURL：备用地址不是合法的 http(s) 绝对地址。
+	ErrPanelMigrationBadURL = errors.New("agentconfig: TUNEX_PANEL_FALLBACK_URL must be an absolute http(s) URL")
+	// ErrPanelMigrationBadStartedAt：起始时间给了但不是可解析的时间。
+	ErrPanelMigrationBadStartedAt = errors.New("agentconfig: TUNEX_PANEL_MIGRATION_STARTED_AT must be RFC3339 (or unix seconds)")
+)
+
+// PanelMigration 解析回退三元组。
+//
+// 返回 nil error 才表示**启用**（此时 fallback 可用）。三个键都空 ⇒
+// ErrPanelMigrationNotConfigured（正常缺省，调用方不应当把它当故障）；
+// 其它 error 都是**配置写坏了**，调用方必须如实记录/呈现，而不是退回"当作没配"。
+//
+// 为什么要"齐备才启用"：面板侧下发时是"两个键齐备才写、否则三个一起删"（可撤销的
+// 回退态）。agent 侧如果对"只填了备用地址"睁一只眼，就会出现"以为配好了其实不会切"
+// 或者"切到一个没被授权的地址"两种都不该有的状态。
+func (c Config) PanelMigration() (*PanelMigrationFallback, error) {
+	primary := strings.TrimRight(strings.TrimSpace(c.PanelHTTPURL), "/")
+	fallback := strings.TrimRight(strings.TrimSpace(c.PanelFallbackURL), "/")
+	migrationID := strings.TrimSpace(c.PanelMigrationID)
+	startedRaw := strings.TrimSpace(c.PanelMigrationStartedAt)
+
+	if fallback == "" && migrationID == "" && startedRaw == "" {
+		return nil, ErrPanelMigrationNotConfigured
+	}
+	if fallback == "" || migrationID == "" {
+		return nil, ErrPanelMigrationIncomplete
+	}
+	u, err := url.Parse(fallback)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, ErrPanelMigrationBadURL
+	}
+	out := &PanelMigrationFallback{
+		PrimaryURL:  primary,
+		FallbackURL: fallback,
+		MigrationID: migrationID,
+	}
+	if startedRaw != "" {
+		at, err := parseMigrationStartedAt(startedRaw)
+		if err != nil {
+			return nil, ErrPanelMigrationBadStartedAt
+		}
+		out.StartedAt = at
+		out.StartedAtKnown = true
+	}
+	return out, nil
+}
+
+// parseMigrationStartedAt 接受 RFC3339（面板侧下发的形状）与 unix 秒（方便脚本/测试）。
+func parseMigrationStartedAt(raw string) (time.Time, error) {
+	if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if ts <= 0 {
+			return time.Time{}, fmt.Errorf("non-positive unix timestamp")
+		}
+		return time.Unix(ts, 0).UTC(), nil
+	}
+	return time.Parse(time.RFC3339, raw)
+}
 
 // LKGPath is the last-known-good cache file inside StateDir.
 func (c *Config) LKGPath() string {
@@ -180,6 +284,10 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.StringVar(&cfg.Role, "role", cfg.Role, "Node role: INGRESS, EGRESS or BOTH")
 	fs.StringVar(&cfg.Role, "R", cfg.Role, "Node role (shorthand)")
 	fs.StringVar(&cfg.PanelHTTPURL, "panel-http-url", cfg.PanelHTTPURL, "Panel HTTP base URL for control and reporting, e.g. http://panel:3000")
+	// 面板迁移回退（task-44）：主地址不可达时切到备用地址（两个键齐备才启用）。
+	fs.StringVar(&cfg.PanelFallbackURL, "panel-fallback-url", cfg.PanelFallbackURL, "Fallback Panel base URL used when the primary Panel is unreachable (needs --panel-migration-id too)")
+	fs.StringVar(&cfg.PanelMigrationID, "panel-migration-id", cfg.PanelMigrationID, "Identifier of the Panel migration this fallback belongs to")
+	fs.StringVar(&cfg.PanelMigrationStartedAt, "panel-migration-started-at", cfg.PanelMigrationStartedAt, "When the Panel migration started (RFC3339 or unix seconds; optional)")
 	fs.StringVar(&cfg.AgentAdminToken, "agent-admin-token", cfg.AgentAdminToken, "Bearer token for the local admin API on AGENT_ADMIN_PORT")
 	fs.IntVar(&cfg.AgentAdminPort, "agent-admin-port", cfg.AgentAdminPort, "Local admin API port; 0 disables it")
 	fs.StringVar(&cfg.IngressRange, "ingress-range", cfg.IngressRange, "Port range the ingress tunnels may bind, e.g. 10000-30000")
@@ -293,6 +401,11 @@ func applyDefaults(cfg *Config, file string) error {
 	envStr("LISTEN_IP", &cfg.ListenIP)
 	envStr("ROLE", &cfg.Role)
 	envStr("PANEL_HTTP_URL", &cfg.PanelHTTPURL)
+	// 面板迁移回退（task-44）：由安装器写进 agent.env。**两个键齐备才启用**，
+	// 解析纪律见 Config.PanelMigration（只填一个 = 配置写坏了，必须报出来）。
+	envStr("PANEL_FALLBACK_URL", &cfg.PanelFallbackURL)
+	envStr("PANEL_MIGRATION_ID", &cfg.PanelMigrationID)
+	envStr("PANEL_MIGRATION_STARTED_AT", &cfg.PanelMigrationStartedAt)
 	envStr("AGENT_ADMIN_TOKEN", &cfg.AgentAdminToken)
 	envStr("NODE_CREDENTIAL", &cfg.NodeCredential)
 	envStr("INGRESS_RANGE", &cfg.IngressRange)
@@ -327,6 +440,10 @@ Flags:
 Runtime:
       --role string               Node role: INGRESS, EGRESS or BOTH (default BOTH)
       --panel-http-url string     Panel HTTP base URL for command polling and state reporting
+      --panel-fallback-url string Fallback Panel URL used when the primary Panel is unreachable
+                                  (needs --panel-migration-id as well; both empty = feature off)
+      --panel-migration-id string Identifier of the Panel migration the fallback belongs to
+      --panel-migration-started-at string  When the migration started (RFC3339 / unix seconds; optional)
       --agent-admin-token string  Bearer token for the local admin API
       --agent-admin-port int      Local admin API port; 0 disables (default 9090)
       --ingress-range string      Port range ingress tunnels may bind, e.g. 10000-30000

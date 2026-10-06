@@ -53,15 +53,30 @@ const REAL_STATUS = {
     max_pinned_addresses: 4,
     default_timeout_ms: 3000,
     max_timeout_ms: 5000,
-    methods: ["tcp_connect"],
+    // task-42：闭集扩到 5 种（tcp_connect + ICMP echo + 无特权路径跟踪）。
+    methods: ["tcp_connect", "ping", "ping6", "traceroute", "traceroute6"],
+    // 本版本明确不提供的方法 + 原因（服务端回显，前端**列出并说明**）。
+    unavailable_methods: [
+      {
+        method: "mtr",
+        reason:
+          "镜像里没有 mtr 二进制；且 mtr 默认需要 raw socket（CAP_NET_RAW），生产 caps 下不可用 —— 所以我们不做它，而不是假装支持",
+      },
+      { method: "mtr6", reason: "同 mtr：无二进制 + 依赖 raw socket（CAP_NET_RAW）" },
+    ],
   },
   targets: "public-only（私网/回环/链路本地/多播/保留段一律拒绝）",
   caveats: [
-    "这是从该节点发出的 TCP 连接测试（tcp_connect）：连上只证明 L3/L4 可达，不证明对端业务可用。",
+    "这是从该节点发出的主动探测（tcp_connect / ping / ping6）：连上或收到回包只证明 L3/L4 可达，不证明对端业务可用。",
     "域名由面板解析、节点只拨固定地址：因此它不能回答「节点侧 DNS 能否解析该域名」。",
-    "不含 UDP/ICMP：datagram 没有可靠探测来源，本版本不产生该事实。",
+    "ping/ping6 由节点在容器内调用镜像自带的 ping 二进制（非特权 ICMP），依赖节点内核允许非特权 ICMP；ping6 还需要节点自身有 IPv6 出网路径 —— 没有时结果是 unreachable，那不是方法未实现。",
+    "traceroute / traceroute6 由节点调用 iputils 的 tracepath 实现（非特权：UDP 探测 + ICMP 超时回包），因此没有放开 CAP_NET_RAW；目标家族没有出网路径时它是 send failed，属真实网络事实。",
+    "不含 mtr / mtr6：镜像里没有该二进制，且它默认需要 raw socket（CAP_NET_RAW）—— 生产安装用 --cap-drop ALL --cap-add NET_BIND_SERVICE。（busybox 的 traceroute 同样因 raw socket 被拒，我们用它之外的无特权路径。）",
+    "不含 UDP：datagram 没有可靠探测来源，本版本不产生该事实。",
+    "不含 HTTP：重定向/降级/凭据是另一份威胁模型，本版本不做。",
     "结果不含任何数据面载荷与凭据；每次发起与拒绝都会写审计。",
   ],
+
 };
 
 const REAL_REPORT = {
@@ -123,7 +138,7 @@ describe("形状读取：读不出来 ≠ 没开启", () => {
     expect(parsed.value.platform_admin_override).toBe(true);
     expect(parsed.value.method).toBe("tcp_connect");
     expect(parsed.value.caps).toEqual(REAL_STATUS.caps);
-    expect(parsed.value.caveats).toHaveLength(4);
+    expect(parsed.value.caveats).toHaveLength(8);
   });
 
   test("enabled 缺失/非布尔 ⇒ 整份判不可读（**不许**当成 false=未开启）", () => {
@@ -269,14 +284,21 @@ describe("能力边界读 caps，不硬编码", () => {
     expect(drifted).toContain("新增的第五条口径声明");
   });
 
-  test("本地结论覆盖 4 条服务端结论（连上≠业务可用 / 面板解析 / 无 UDP-ICMP / 无载荷且写审计）", () => {
+  test("本地结论覆盖每一条服务端结论（方法集变了，口径也必须跟着变）", () => {
     const copy = lookingGlassCopy("zh");
-    expect(copy.caveats).toHaveLength(4);
+    // 条数必须与 `LOOKING_GLASS_CAVEATS` 一致：不一致时面板会把服务端原文也列出来（漂移可见），
+    // 而"本地文案悄悄落后于服务端"正是这个功能最容易骗人的地方。
+    expect(copy.caveats).toHaveLength(8);
     expect(copy.caveats[0]).toContain("L3/L4");
     expect(copy.caveats[1]).toContain("面板解析");
-    expect(copy.caveats[2]).toContain("UDP/ICMP");
-    expect(copy.caveats[3]).toContain("审计");
-    expect(lookingGlassCopy("en").caveats).toHaveLength(4);
+    // task-42：加了 ICMP 与路径跟踪之后，"不含 UDP/ICMP" 就是错话 —— 现在要分别说清它们。
+    expect(copy.caveats[2]).toContain("ICMP");
+    expect(copy.caveats[3]).toContain("tracepath");
+    expect(copy.caveats[4]).toContain("mtr");
+    expect(copy.caveats[5]).toContain("UDP");
+    expect(copy.caveats[6]).toContain("HTTP");
+    expect(copy.caveats[7]).toContain("审计");
+    expect(lookingGlassCopy("en").caveats).toHaveLength(8);
   });
 });
 

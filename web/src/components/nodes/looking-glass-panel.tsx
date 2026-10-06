@@ -15,7 +15,8 @@
  *     而 `platform_admin_override:true` 表示"你作为平台管理员仍可例外发起"——例外要写明是例外。
  *  2. **取不到状态 ≠ 没开启**：状态读取失败/载荷读不出来走**独立分支**（含"取不到"与重试），
  *     绝不落进"未开启"，也绝不渲染成"暂无数据"。
- *  3. **能力边界来自服务端**：只支持 `tcp_connect`；目标条数/超时上下限全部读 `caps`
+ *  3. **能力边界来自服务端**：可用方法读 `caps.methods`（task-42 起 5 种，含 ICMP/path trace），
+ *     目标条数/超时上下限全部读 `caps`；本版本不提供的方法由 `caps.unavailable_methods` **列出并给出原因**
  *     （界面**不硬编码** 4 / 3000 / 5000）；服务端 `caveats` 的**结论**用本面板的 zh/en 文案表达，
  *     数量与本地结论条数不一致时，把服务端原始声明也列出来（漂移要看得见，而不是被藏起来）。
  *  4. **发起是写操作**：按钮上方固定写明"该节点会向目标发起真实 TCP 连接并写审计"；
@@ -75,6 +76,8 @@ export interface LookingGlassCopy {
   scopeLine: string;
   caveatsTitle: string;
   caveats: readonly string[];
+  /** task-42：本版本不提供的方法的通用原因（服务端原因只有中文原文，en 用这一句）。 */
+  unavailableMethodReason: string;
   rawCaveatsTitle: string;
   targetHost: string;
   targetPort: string;
@@ -127,13 +130,21 @@ const ZH: LookingGlassCopy = {
   permissionNext: "需要 node:read（以及该能力本身已开启）；请联系工作空间管理员。",
   capsLine: (maxTargets, defaultTimeout, maxTimeout) =>
     `服务端上限：单次最多 ${maxTargets} 个目标；单次超时 ${defaultTimeout}ms（缺省）…${maxTimeout}ms（硬上限）。`,
-  methodLine: (method) => `本版本只支持方法 ${method}（未知方法被拒绝，不降级）。`,
+  methodLine: (method) => `可用方法来自服务端：${method}（未知方法被拒绝，不降级）。`,
   scopeLine: "只允许公网单播目标：私网 / 回环 / 链路本地 / 多播 / 保留段一律在发包前拒绝。",
   caveatsTitle: "口径声明（决定这些结果能证明什么）",
+  /** task-42：本版本不提供的方法的**通用**原因（具体原因是服务端的中文原文，只在 zh 显示）。 */
+  unavailableMethodReason: "本版本不提供该方法（原因见口径声明；服务端原文为中文）",
+  // task-42：口径必须跟着方法集一起变 —— 加了 ICMP 与路径跟踪之后，"不含 UDP/ICMP"
+  // 就是错话。条数与服务端 `LOOKING_GLASS_CAVEATS` 一致（不一致时面板会把服务端原文也列出来）。
   caveats: [
-    "连上只证明这一跳的 L3/L4 通，不证明对端业务可用。",
+    "这是从该节点发出的主动探测：连上或收到回包只证明这一跳的 L3/L4 通，不证明对端业务可用。",
     "域名由面板解析、节点只拨固定地址：因此它回答不了「节点侧 DNS 能否解析这个域名」。",
-    "不含 UDP/ICMP：本版本不产生 datagram 的事实。",
+    "ICMP echo（ping/ping6）由节点调用镜像自带的 ping 二进制，依赖节点内核允许非特权 ICMP；ping6 还需要节点自己有 IPv6 出网路径。",
+    "路径跟踪（traceroute/traceroute6）由节点调用 iputils 的 tracepath（非特权：UDP 探测 + ICMP 超时回包），没有放开 raw socket 权限。",
+    "不含 mtr/mtr6：镜像里没有该二进制，且它默认需要 raw socket（生产节点不给这个权限）。",
+    "不含 UDP 事实：datagram 没有可靠探测来源，本版本不产生它的事实（路径跟踪只是用 UDP 作探测手段）。",
+    "不含 HTTP：重定向/降级/凭据是另一份威胁模型，本版本不做。",
     "结果不含任何数据面载荷与凭据，只有地址、端口、状态与耗时；每一次发起与拒绝都会写审计。",
   ],
   rawCaveatsTitle: "服务端原始声明（未翻译；条数与本地结论不一致时列出）",
@@ -196,13 +207,19 @@ const EN: LookingGlassCopy = {
   permissionNext: "node:read is required (and the capability must be enabled); ask a workspace admin.",
   capsLine: (maxTargets, defaultTimeout, maxTimeout) =>
     `Server limits: at most ${maxTargets} target(s) per run; per-attempt timeout ${defaultTimeout}ms (default)…${maxTimeout}ms (hard cap).`,
-  methodLine: (method) => `This version supports ${method} only (unknown methods are refused, not downgraded).`,
+  methodLine: (method) => `Methods come from the server: ${method} (unknown methods are refused, not downgraded).`,
   scopeLine: "Public unicast targets only: private / loopback / link-local / multicast / reserved ranges are refused before any packet.",
   caveatsTitle: "What these results can and cannot prove",
+  unavailableMethodReason: "not provided by this version (see the caveats below)",
+  // Mirror of the zh list above, one line per server caveat (counts must match).
   caveats: [
-    "A completed handshake proves this hop's L3/L4 only — not that the peer's service works.",
+    "This is an active probe from the node: a completed handshake or a reply proves this hop's L3/L4 only — not that the peer's service works.",
     "The panel resolves names and the node dials fixed addresses: so this cannot answer “can the node resolve that name”.",
-    "No UDP/ICMP: this version produces no datagram facts.",
+    "ICMP echo (ping/ping6) runs the image's own ping binary and needs the node kernel to allow unprivileged ICMP; ping6 additionally needs the node to have an IPv6 egress path.",
+    "Path tracing (traceroute/traceroute6) runs iputils tracepath (unprivileged: UDP probes + ICMP time-exceeded), so no raw-socket capability is granted.",
+    "No mtr/mtr6: the image has no such binary and it needs raw sockets by default (production nodes do not get that capability).",
+    "No UDP facts: datagrams give no reliable probe source, so this version produces none (path tracing only uses UDP as its probe mechanism).",
+    "No HTTP: redirects, downgrades and credentials are a different threat model.",
     "Results carry no data-plane payload and no credentials — only address, port, status and elapsed time; every run and refusal is audited.",
   ],
   rawCaveatsTitle: "Server's raw statement (untranslated; shown when its count differs from the local conclusions)",
@@ -289,7 +306,14 @@ export function refusalReasonText(locale: Locale, code: string | null): string |
     ],
     [LOOKING_GLASS_CODES.targetUnresolved]: ["域名没有解析到任何地址", "the name resolved to nothing"],
     [LOOKING_GLASS_CODES.resolverInvalid]: ["解析器返回了非字符串地址", "the resolver returned a non-string address"],
-    [LOOKING_GLASS_CODES.methodNotSupported]: ["本版本只支持 tcp_connect", "this version supports tcp_connect only"],
+    [LOOKING_GLASS_CODES.methodNotSupported]: [
+      "该方法本版本不提供（见下方不可用方法列表）",
+      "this method is not provided by this version (see the unavailable list)",
+    ],
+    [LOOKING_GLASS_CODES.methodUnavailableOnNode]: [
+      "该节点没有上报这个方法的执行能力：换一个方法，或确认节点镜像/内核权限",
+      "this node did not advertise this method: pick another method, or check the node image/kernel capability",
+    ],
     [LOOKING_GLASS_CODES.timeoutOutOfRange]: [
       "超时超出服务端允许范围（1…硬上限，整数毫秒）",
       "the timeout is outside the server range (1…hard cap, whole milliseconds)",
@@ -517,7 +541,20 @@ export function LookingGlassPanelBody(props: LookingGlassPanelProps) {
         {/* 能力边界：全部读服务端 caps。 */}
         <div className="text-xs text-[var(--muted-foreground)]">
           <p data-testid="looking-glass-caps">{copy.capsLine(maxTargets, defaultTimeout, maxTimeout)}</p>
-          <p data-testid="looking-glass-method">{copy.methodLine(status?.method ?? "tcp_connect")}</p>
+          <p data-testid="looking-glass-method">{copy.methodLine((status?.caps.methods ?? ["tcp_connect"]).join(" / "))}</p>
+          {/* task-42：本版本**不提供**的方法要列出来并说明原因 —— 静默隐藏会被读成
+              "这产品没有 traceroute/mtr"，而真相是我们的权限模型做不到。 */}
+          {(status?.caps.unavailable_methods ?? []).length > 0 ? (
+            <ul className="mt-1 space-y-0.5" data-testid="looking-glass-unavailable-methods">
+              {(status?.caps.unavailable_methods ?? []).map((entry) => (
+                <li key={entry.method}>
+                  <span className="font-mono">{entry.method}</span>
+                  {/* 服务端原因只有中文原文；en 模式用本地化通用原因，避免 en 界面混入中文。 */}
+                  ：{locale === "zh" ? entry.reason : copy.unavailableMethodReason}
+                </li>
+              ))}
+            </ul>
+          ) : null}
           <p data-testid="looking-glass-scope">{copy.scopeLine}</p>
         </div>
 
