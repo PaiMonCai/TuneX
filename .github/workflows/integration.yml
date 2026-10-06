@@ -11,6 +11,8 @@ on:
       - "agent/Dockerfile"
       - "docker-compose*.yaml"
       - ".env.production.example"
+      - ".github/workflows/integration.yml"
+      - ".github/workflows/release.yml"
   workflow_run:
     workflows: ["CI"]
     types: [completed]
@@ -33,7 +35,7 @@ jobs:
   pr-integration:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Start PR topology
@@ -42,6 +44,8 @@ jobs:
       # Diagnostic-only checks stay outside the automatic release path.
       - name: Current protocol regression
         run: python3 scripts/integration/current-protocol.py
+      - name: Multi-hop regression
+        run: python3 scripts/integration/multi-hop.py
       - name: Upload PR integration evidence
         if: failure()
         uses: actions/upload-artifact@v7
@@ -160,7 +164,7 @@ jobs:
     if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
     needs: [candidate-images]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: read
@@ -189,22 +193,50 @@ jobs:
         run: bash scripts/integration/setup.sh
 
       - name: Qualify current protocol surface
+        id: current_protocol
+        continue-on-error: true
         run: python3 scripts/integration/current-protocol.py
 
       - name: Qualify multi-hop
+        id: multi_hop
+        continue-on-error: true
         run: python3 scripts/integration/multi-hop.py
 
       - name: Bootstrap federation peer
+        id: federation_bootstrap
+        continue-on-error: true
         env:
           API: http://127.0.0.1:18180
           FED_PANEL_B_HOST_PORT: "18181"
         run: python3 scripts/integration/bootstrap-federation.py
 
       - name: Qualify federation
+        id: federation
+        continue-on-error: true
         env:
           API: http://127.0.0.1:18180
           FED_PANEL_B_HOST_PORT: "18181"
         run: python3 scripts/integration/federation.py
+
+      - name: Require every qualification surface to pass
+        if: always()
+        env:
+          CURRENT_PROTOCOL: ${{ steps.current_protocol.outcome }}
+          MULTI_HOP: ${{ steps.multi_hop.outcome }}
+          FEDERATION_BOOTSTRAP: ${{ steps.federation_bootstrap.outcome }}
+          FEDERATION: ${{ steps.federation.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for item in \
+            "current-protocol=$CURRENT_PROTOCOL" \
+            "multi-hop=$MULTI_HOP" \
+            "federation-bootstrap=$FEDERATION_BOOTSTRAP" \
+            "federation=$FEDERATION"; do
+            echo "$item"
+            [[ "${item#*=}" == "success" ]] || failed=1
+          done
+          exit "$failed"
 
       - name: Upload qualification evidence
         if: always()

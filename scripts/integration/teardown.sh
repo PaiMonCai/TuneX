@@ -5,7 +5,7 @@
 #   · 容器 tunex-it-*（panel / mysql / redis / db-migrate / 两个 agent / 两个 target）
 #   · 网络 tunex_it_ctrl / tunex_it_ingress_data / tunex_it_egress_data
 #   · 数据卷 tunex_it_mysql_data
-#   · 运行期产物：state.json / .env.integration / .passwords.env / evidence/ / agent.Dockerfile.e2e
+#   · 运行期产物：state.json / .env.integration / .passwords.env / evidence/ / .agent.env
 #
 # 保留（版本库内交付物）：docker-compose.yaml / setup.sh / verify.sh /
 # bootstrap.py / fixtures/ / README.md
@@ -29,6 +29,10 @@ export TUNEX_IT_INGRESS_CREDENTIAL=${TUNEX_IT_INGRESS_CREDENTIAL:-UNPROVISIONED}
 export TUNEX_IT_EGRESS_CREDENTIAL=${TUNEX_IT_EGRESS_CREDENTIAL:-UNPROVISIONED}
 export TUNEX_IT_INGRESS_AGENT_ID=${TUNEX_IT_INGRESS_AGENT_ID:-UNPROVISIONED}
 export TUNEX_IT_EGRESS_AGENT_ID=${TUNEX_IT_EGRESS_AGENT_ID:-UNPROVISIONED}
+export TUNEX_IT_INGRESS_B_CREDENTIAL=${TUNEX_IT_INGRESS_B_CREDENTIAL:-UNPROVISIONED}
+export TUNEX_IT_EGRESS_B_CREDENTIAL=${TUNEX_IT_EGRESS_B_CREDENTIAL:-UNPROVISIONED}
+export TUNEX_IT_INGRESS_B_AGENT_ID=${TUNEX_IT_INGRESS_B_AGENT_ID:-UNPROVISIONED}
+export TUNEX_IT_EGRESS_B_AGENT_ID=${TUNEX_IT_EGRESS_B_AGENT_ID:-UNPROVISIONED}
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 
@@ -52,9 +56,9 @@ done
 
 say "清理运行期产物（保留脚本、fixtures、bootstrap.py、文档）"
 rm -f "$HERE/state.json" "$HERE/.env.integration" "$HERE/.passwords.env" \
-      "$HERE/agent.Dockerfile.e2e"
+      "$HERE/.agent.env"
 rm -rf "$HERE/evidence"
-echo "  已删除: state.json .env.integration .passwords.env agent.Dockerfile.e2e evidence/"
+echo "  已删除: state.json .env.integration .passwords.env .agent.env evidence/"
 # bootstrap.py 是版本库内交付物（setup.sh 调用），刻意不删。
 
 if [[ "${DELETE_IMAGES:-}" == "1" ]]; then

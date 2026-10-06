@@ -565,7 +565,8 @@ def ensure_agent_b(node: dict) -> None:
     # 先 create（不启动）→ 接上数据网 → 再 start：Agent 在启动时就会 bind 数据面监听，
     # 数据网接口必须先存在，否则"第一次 bind 失败"会被读成产品问题。
     docker(["create", "--name", AGENT_B, "--restart", "unless-stopped",
-            "--network", NET, "--network-alias", "agent-b1", image, *args])
+            "--network", NET, "--network-alias", "agent-b1",
+            "-v", f"{HERE / '.agent.env'}:/run/tunex-agent/agent.env:ro", image, *args])
     docker(["network", "connect", "--ip", B_NODE_LISTEN_IP, DATA_NET, AGENT_B])
     docker(["start", AGENT_B])
     step(f"已启动 {AGENT_B}（ctrl + {DATA_NET} {B_NODE_LISTEN_IP}）")

@@ -251,15 +251,18 @@ type relayTopology struct {
 func newRelayTopology(t *testing.T, strategy Strategy, targets ...forwarder.Target) *relayTopology {
 	t.Helper()
 	em := NewEgressManager()
-	egressPort := freePort(t)
 	em.SetPool("eg", strategy, targets)
 	tm := NewTunnelManager(em, "127.0.0.1")
-	ingressPort := freePort(t)
+
+	// Bind egress before selecting ingress. Two consecutive freePort calls leave
+	// both numbers unreserved and the kernel may return the same port twice.
+	egressPort := freePort(t)
 	if _, err := tm.Apply(forwarder.TunnelConfig{
 		ID: "eg", Mode: forwarder.ModeEgress, EgressPort: egressPort, Protocol: "tcp",
 	}); err != nil {
 		t.Fatalf("apply egress: %v", err)
 	}
+	ingressPort := freePort(t)
 	if _, err := tm.Apply(forwarder.TunnelConfig{
 		ID: "ing", Mode: forwarder.ModeRelay, IngressPort: ingressPort,
 		NextHop: addrFor(egressPort), Protocol: "tcp",
