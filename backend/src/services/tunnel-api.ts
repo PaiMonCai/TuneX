@@ -26,7 +26,6 @@
  */
 import { db } from "../db.ts";
 import {
-  SCHEDULER_ERROR_CODES,
   createRelayTunnel,
   reapplyDirectTunnel,
   reapplyRelayTunnel,
