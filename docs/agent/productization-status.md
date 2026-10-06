@@ -771,7 +771,7 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 
 | # | 条件 | R5-A 当时 | 现在的事实（证据） | 现在的判定 | 仍缺什么（诚实列出） |
 |---|---|---|---|---|---|
-| **1** | 新用户可快速部署 | 基本达成 | **两轮演练**：第一轮（`task-31`）照文档走不通（缺 `LICENSE_SECRET` ⇒ `up -d` 失败；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；**第二轮（`task-34`，修复 + 本地构建镜像）文档路径已通**——`db-migrate Exited(0)`、迁移/种子/管理员凭据（`.admin-credentials`）/8 个 cron/建带区间组 201 + provision 201 全绿，`up -d` **172s**、到"节点已创建 + 命令已生成"约 **8 分钟**；并证明第一轮两个阻断点**只在发布镜像侧**成立（本地构建下 `SEED_DEMO_DATA=false` 被正确尊重：`demo plans/nodes skipped`、计数 0/0/0） | **基本达成（文档路径已通）** | ① **`Agent enroll → online` 仍未验证**（第二轮是我方执行错误：裸 `-e` 而非安装器写的 env 文件、正则用了 `--token` 而真机是 `--enroll-token`）⇒ 已授权重跑；② **新发现文档缺口**：`SITE_URL` 只绑 `127.0.0.1` 时一键命令的 `--panel` 地址**节点侧不可达** ⇒ 已授权补写前置条件；③ 公网 TLS/反代、备份/恢复/回滚、云主机资源限额未验证；④ 占位值不在启动期 fail-closed、CSRF 方法不对称待处置 |
+| **1** | 新用户可快速部署 | **达成** | **三轮证据叠加**：①（`task-31`）照文档**走不通**（缺 `LICENSE_SECRET` ⇒ `db-migrate` exit 1；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；②（`task-34`，修文档 + **本地构建镜像**）**文档路径已通**（迁移/种子/管理员凭据/8 cron/建组 201 + provision 201；`up -d` 235s）；③ **（Round 52，Lead 一手）`Agent enroll → online` 通过**：建组 201 → provision 201 → `enrollment` 一次性 token（TTL 600s）→ **`POST /api/internal/node/enroll` 兑换出 43 字符 credential（200）** → 起 agent ⇒ 面板判 **`status: active` + `connection: online`**（首个 5s 轮询即在线）；**同 token 重放 = 401**；清理后节点数回 4、额度回 4、8 个 `tunex-it-*` 完好 | **达成** | ① **字面一键命令**（`curl … install.sh | sudo sh -s -- --panel … --enroll-token …`）**仍需真实节点主机**（sudo/docker），沙箱不可执行 ⇒ 我复现的是**同一条链路的每一步**（含关键兑换），不是那行命令本身；② 生成的命令里面板地址是 `127.0.0.1:18180`（**节点不可达**）⇒ 实测印证 `task-34` 已补的 `SITE_URL` 前置条件；③ 公网 TLS/反代、备份/恢复/回滚、云主机资源限额未验 |
 | **2** | 可从 Web 指引完成第一台 Node | 达成 | 浏览器端到端：闩锁 → 真 Agent → **5s 内 online** → CTA `/forwards?ingress_node_id=`；round 33 门禁重跑仍绿 | **达成** | — |
 | **3** | 直观创建 Direct/Relay/Multi-hop | 基本达成（多跳在途） | Direct/Relay 早已交付；**多跳已接线**（`forward-multihop-model/select` + `middle_node_id` 入请求 + 两段绑定前置 + 预览改「四步三段」）；**真实三跳未跑通**（scratch 4 台节点无一 `role=both`） | **基本达成** | 真实三跳创建 + 真机 topology 两段 + `apply_transit` 端到端（需临时改一台节点角色） |
 | **4** | Forward 状态与链路清晰可见 | 基本达成 | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 浏览器验收 43/41 个相关 testid、禁用词零命中 | **达成** | 带宽/吞吐时间序列（后端无该数据源） |
@@ -961,7 +961,7 @@ mtr                     → MISSING（镜像无该二进制）
 ### A. 退出条件终版对账（基线 = R5-A §1 → R6 复核 → 本周期后续交付）
 | # | 判定 | 依据（可复核） | 仍缺 |
 |---|---|---|---|
-| **1** 快速部署 | **基本达成** | 两轮演练：第一轮照文档**走不通**（缺 `LICENSE_SECRET` ⇒ `db-migrate` exit 1；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；第二轮（修文档 + **本地构建镜像**）**文档路径已通**：`up -d` **235s**、迁移/种子/管理员凭据/8 cron/建组+provision 201 全绿；`SEED_DEMO_DATA=false` 被正确尊重（0/0/0） | **`Agent enroll → online` 仍未验**（两次都是我方执行错：裸 `-e` 而非安装器 env 文件；把一次性 `--enroll-token` 当长期凭据塞进 `TUNEX_NODE_CREDENTIAL`）；公网 TLS/反代、备份/恢复/回滚未验 |
+| **1** 快速部署 | **达成** | **三轮证据叠加**：①（`task-31`）照文档**走不通**（缺 `LICENSE_SECRET` ⇒ `db-migrate` exit 1；钉版本 `manifest unknown` 后静默回退陈旧 `:latest`）；②（`task-34`，修文档 + **本地构建镜像**）**文档路径已通**（迁移/种子/管理员凭据/8 cron/建组 201 + provision 201；`up -d` 235s）；③ **（Round 52，Lead 一手）`Agent enroll → online` 通过**：建组 201 → provision 201 → `enrollment` 一次性 token（TTL 600s）→ **`POST /api/internal/node/enroll` 兑换出 43 字符 credential（200）** → 起 agent ⇒ 面板判 **`status: active` + `connection: online`**（首个 5s 轮询即在线）；**同 token 重放 = 401**；清理后节点数回 4、额度回 4、8 个 `tunex-it-*` 完好 | ① **字面一键命令**（`curl … install.sh | sudo sh -s -- --panel … --enroll-token …`）**仍需真实节点主机**（sudo/docker），沙箱不可执行 ⇒ 我复现的是**同一条链路的每一步**（含关键兑换），不是那行命令本身；② 生成的命令里面板地址是 `127.0.0.1:18180`（**节点不可达**）⇒ 实测印证 `task-34` 已补的 `SITE_URL` 前置条件；③ 公网 TLS/反代、备份/恢复/回滚、云主机资源限额未验 |
 | **2** Web 完成第一台 Node | **达成** | 浏览器端到端（闩锁 → 真 Agent → **5s online** → CTA）；本周期门禁重跑仍绿 | — |
 | **3** Direct/Relay/Multi-hop | **基本达成** | Direct/Relay 早已交付；多跳接线（模型/选择器/请求字段/两段绑定前置/预览改「四步三段」） | **真实三跳未跑通**（scratch 4 台节点无一 `role=both`） |
 | **4** Forward 状态与链路 | **达成** | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 本周期最终浏览器验收：`/forwards/1|2` 渲染 43/16 个相关 testid、禁用词零命中 | 带宽序列仅到"日均吞吐"；上下行/小时桶/连接数**不可派生**（账本只有一列 `traffic`） |
@@ -1096,6 +1096,33 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 
 ### C. 方法论沉淀（新规则下的标准动作）
 遇到待决项时按三步走：① 读 ForwardX 的对应实现（给 `文件:行`）；② 有则**复用其逻辑**并适配本项目（**不逐字复制**）；③ 无则**向用户报告**。本轮四项待决（A1 成员表 / A2 投递留行 / A3 traceroute / A4 CSRF）+ 本轮的接入面复核，全部走完这三步并留痕。
+
+## 3.51 Round 52（Lead 一手）：**`Agent enroll → online` 复现成功** ⇒ 退出条件 #1 的最后硬判据达成
+
+### 为什么前两次失败（根因）= 跳过了"兑换"这一步
+- agent 二进制里**没有任何 enroll 处理**（`grep -ri enroll agent/**/*.go` = 0 命中）；
+- 面板接入链路是三段：`POST /api/nodes/:id/enrollment` 发**一次性 token**（`NODE_ENROLLMENT_TTL_SECONDS=600`）→ **`POST /api/internal/node/enroll`**（头 `Authorization: Enrollment <token>`）**原子消费并铸出长期 credential**（`node-enrollment.ts:139-211`）→ agent 用 credential 认证；
+- **`install.sh` 自己不兑换**（注释明说"不碰 Agent 节点生命周期"）⇒ **不做兑换、把 token 当凭据**，面板如实拒绝（web-ddns 第二次看到的 `node credential is invalid or revoked` **正是正确行为**）。
+
+### Lead 一手复现的完整证据链
+| 步 | 命令/观测 | 结果 |
+|---|---|---|
+| 0 | 额度受限（`capability_policy.max_nodes=4`，已有 4 台） | provision **403 `node_limit`** ⇒ 临时提到 8（**原值备份 `/tmp/l52-policy-backup.txt`，事后改回 4**） |
+| 1 | `POST /api/node-groups {name,node_type:"in",port_range:"30200-30299"}` | **201**，group id=8 |
+| 2 | `POST /api/node-groups/8/nodes {node_id:"L52-ENROLL-NODE",role:"ingress"}` | **201**，node id=10，`agent_id=155189b8-…` |
+| 3 | `POST /api/nodes/10/enrollment` | **201**，一次性 token（TTL 至 `21:39:20`）+ `install_command` |
+| 4 | **`POST /api/internal/node/enroll`**（`Authorization: Enrollment <token>`） | **200**，`credential` 43 字符，`agent_id` 与节点一致 |
+| 5 | `docker run`（真实 agent 镜像 + 该 credential + `--panel-http-url http://panel:3000`） | 日志 `restore done tunnels=0 role=INGRESS source=panel` + `heartbeat scheduled … interval=30s` |
+| 6 | `GET /api/nodes`（真实 HTTP） | **`{"id":10,"node_id":"L52-ENROLL-NODE","status":"active","connection":"online","role":"ingress"}`** |
+| 7 | 同 token **重放** | **401**（原子消费不可重放）⇒ 与"一次性 token 交换哈希凭据"的模型一致 |
+| 8 | 清理 | 删容器 + 删节点 10 的 8 张子表行 + 删 group 8 ⇒ 节点数 **4**、额度 **4**、`tunex-it-*` **8 个完好** |
+
+### 顺带印证
+1. 生成的 `install_command` 里面板地址是 **`127.0.0.1:18180`（节点不可达）** ⇒ **实测印证** `task-34` 已补的 `SITE_URL`/反代前置条件。
+2. `version: "unknown"`：该 agent 镜像**早于 task-37 的版本 stamp** ⇒ 与"`behind` 需发布方注入 tag + 节点升级"一致。
+
+### 诚实边界
+我复现的是**同一条链路的每一步**（含关键兑换），**不是**那行字面一键命令本身（需真实节点主机的 sudo/docker，沙箱不可执行）。⇒ #1 判**达成**的依据是"文档路径已通 + 首台节点 online 一手复现"；**字面一键命令的真实主机验证**仍列未验证。
 
 ## 4. Capability Map
 
