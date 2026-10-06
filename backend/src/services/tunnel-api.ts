@@ -805,37 +805,94 @@ export async function runTunnelAction(
         }))
       : null;
 
+    // Delete is irreversible at the control-plane layer. Never delete the row
+    // (or release its ports) while a runtime may still be listening: that would
+    // turn an Agent teardown failure into an orphan runtime + reusable port.
+    const expectedRuntimeNodes =
+      tunnel.ingress_node_id != null ||
+      (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null) ||
+      tunnel.middle_node_id != null;
+    if (!orchestrator && expectedRuntimeNodes) {
+      return err(
+        "apply_failed",
+        "运行时撤除通道不可用，拒绝删除以避免遗留孤儿 runtime",
+        { apply_error_code: "runtime_teardown_unavailable" },
+      );
+    }
+    if (tunnel.ingress_node_id != null && !ingressNode) {
+      return err("apply_failed", "入口节点记录缺失，无法确认 runtime 已撤除", {
+        apply_error_code: "runtime_teardown_unconfirmed",
+      });
+    }
+    if (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null && !egressNode) {
+      return err("apply_failed", "出口节点记录缺失，无法确认 runtime 已撤除", {
+        apply_error_code: "runtime_teardown_unconfirmed",
+      });
+    }
+    if (tunnel.middle_node_id != null && !middleNode) {
+      return err("apply_failed", "中间跳节点记录缺失，无法确认 runtime 已撤除", {
+        apply_error_code: "runtime_teardown_unconfirmed",
+      });
+    }
+
     if (orchestrator) {
-      // 逆序拆除（先近后远）：中间跳 → 出口 → 入口。
+      // 逆序拆除（先近后远）：中间跳 → 出口 → 入口。即使一条腿失败也继续尝试
+      // 其它腿，但只要有任何一条未确认撤除，就保留 Tunnel + lease 供后续重试。
+      const teardownErrors: string[] = [];
+      const remove = async (
+        label: string,
+        input: Parameters<NonNullable<TunnelApiDeps["orchestrator"]>["removeTunnel"]>[0],
+      ) => {
+        try {
+          const result = await orchestrator.removeTunnel(input);
+          if (!result.ok) teardownErrors.push(`${label}: ${result.error}`);
+        } catch (error) {
+          teardownErrors.push(
+            `${label}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      };
+
       if (tunnel.tunnel_mode === "relay" && middleNode) {
-        await orchestrator.removeTunnel({
+        await remove("transit", {
           tunnelId,
           node: middleNode as never,
           direction: "egress",
           revision,
           reason: "tunnel deleted (transit)",
-        }).catch(() => {});
+        });
       }
       if (tunnel.tunnel_mode === "relay" && egressNode) {
-        await orchestrator.removeTunnel({
+        await remove("egress", {
           tunnelId,
           node: egressNode as never,
           direction: "egress",
           revision,
           reason: "tunnel deleted",
-        }).catch(() => {});
+        });
       }
       if (ingressNode) {
-        await orchestrator.removeTunnel({
+        await remove("ingress", {
           tunnelId,
           node: ingressNode as never,
           direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
           revision,
           reason: "tunnel deleted",
-        }).catch(() => {});
+        });
+      }
+
+      if (teardownErrors.length > 0) {
+        return err(
+          "apply_failed",
+          `runtime 撤除未确认完成，Tunnel 与端口租约已保留：${teardownErrors.join("; ")}`,
+          { apply_error_code: "runtime_teardown_failed" },
+        );
       }
     }
 
+    // Runtime is now confirmed down. A lease-release failure is a safe leak (the
+    // allocator remains conservative), so it must not resurrect an already
+    // withdrawn runtime; dangling leases remain recoverable by lease reconcile.
     await releaseLease({ tunnelId }).catch(() => {});
     // Child rows are legacy relational data with restrictive FKs. Runtime must
     // be withdrawn first, then children can be removed before the Tunnel row.
