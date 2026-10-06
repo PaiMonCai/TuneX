@@ -571,7 +571,7 @@ def read_echo(sock: socket.socket, want: int) -> int:
 
 
 # ======================================================================
-# TLS 前端（V5.1a）
+# TLS 前端
 # ======================================================================
 #
 # §6.1：TLS 在**入口 listener** 终止（Go crypto/tls，标准库），握手之后的明文
@@ -681,7 +681,7 @@ def open_tls_session(host: str, port: int, timeout: float = 60.0) -> socket.sock
 
 
 # ======================================================================
-# WebSocket 前端（V5.1a，RFC 6455，只用标准库）
+# WebSocket 前端（RFC 6455，只用标准库）
 # ======================================================================
 #
 # §6.1：ws 是**客户端流量**的分帧协议。客户端把 payload 装进 masked 帧，Agent
@@ -691,7 +691,7 @@ def open_tls_session(host: str, port: int, timeout: float = 60.0) -> socket.sock
 #
 # 为什么手写不装依赖：与采集器本身的约束一致（"可重复" = 在干净机器上可重复），
 # 而且服务端那份实现本身就是手写的（agent/internal/forwarder/websocket.go）。
-# 审计轨迹：scripts/v3-e2e/v5-g1a.py 的 ws_probe()。
+# 协议回归使用相同的 RFC 6455 握手与帧校验语义。
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_OP_CONTINUATION = 0x0
@@ -1366,7 +1366,7 @@ def measure_restart_convergence(binary: Path, root: Path, factory: Callable[[Pat
       耐久性路径）。
 
     两者必须分开测：合成一个数字就看不出"面板回来时能收敛"和"面板不在时还能不能
-    自己站起来"哪一条退化了 —— 而这恰好是 V4 durability 的两个不同承诺。
+    自己站起来"哪一条退化了 —— 而这恰好是 durability 的两个不同承诺。
 
     计时从**进程创建**开始，而不是等 admin API 起来之后再计时：启动顺序是
     管理器 → restore → admin API，等 admin 就等于等 restore 已经做完，测到的会是
@@ -1547,7 +1547,7 @@ def run(args: argparse.Namespace) -> dict:
     profile = dict(PROFILES[args.profile])
     result: dict = {
         "schema_version": SCHEMA_VERSION,
-        "kind": "v5-tcp-baseline",
+        "kind": "stream-baseline",
         "profile": args.profile,
         "workload": profile,
         "environment": environment(binary),
@@ -1589,8 +1589,8 @@ def run(args: argparse.Namespace) -> dict:
 def write_outputs(result: dict, out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    json_path = out_dir / f"v5-tcp-baseline-{stamp}.json"
-    csv_path = out_dir / f"v5-tcp-baseline-{stamp}.csv"
+    json_path = out_dir / f"stream-baseline-{stamp}.json"
+    csv_path = out_dir / f"stream-baseline-{stamp}.csv"
     json_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
     rows = list(flatten_metrics(result))
@@ -1614,7 +1614,7 @@ def flatten_metrics(result: dict) -> Iterable[tuple[str, str, object]]:
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TuneX V5 performance baseline (tcp/tls/ws)")
+    parser = argparse.ArgumentParser(description="TuneX stream performance baseline (tcp/tls/ws)")
     parser.add_argument("--agent-binary", default="agent/tunex-agent",
                         help="path to the built tunex-agent binary")
     parser.add_argument("--out", default="scripts/perf/results",
@@ -1622,7 +1622,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--profile", choices=sorted(PROFILES), default="quick")
     parser.add_argument("--scenarios", nargs="+", choices=["direct", "relay", "tls", "ws"],
                         default=["direct", "relay"],
-                        help="direct/relay are TCP; tls and ws are the V5.1a fronts "
+                        help="direct/relay are TCP; tls and ws are stream fronts "
                              "(tls needs openssl)")
     parser.add_argument("--json", action="store_true", help="also print the JSON artifact to stdout")
     return parser.parse_args(argv)

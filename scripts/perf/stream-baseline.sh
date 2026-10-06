@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# TuneX V5-WP3 —— 性能基线入口（TCP: DIRECT / RELAY；V5.1a: TLS / WS）。
+# TuneX stream 性能基线入口（TCP DIRECT / RELAY；TLS / WebSocket）。
 #
-#   bash scripts/perf/v5-tcp-baseline.sh                       # 默认 direct+relay（TCP）
-#   bash scripts/perf/v5-tcp-baseline.sh --profile full         # 发布前人工对比用
-#   bash scripts/perf/v5-tcp-baseline.sh --scenarios direct
-#   bash scripts/perf/v5-tcp-baseline.sh --scenarios tls        # 需要 openssl（现场生成自签证书）
-#   bash scripts/perf/v5-tcp-baseline.sh --scenarios direct relay tls ws
+#   bash scripts/perf/stream-baseline.sh                       # 默认 direct+relay（TCP）
+#   bash scripts/perf/stream-baseline.sh --profile full         # 发布前人工对比用
+#   bash scripts/perf/stream-baseline.sh --scenarios direct
+#   bash scripts/perf/stream-baseline.sh --scenarios tls        # 需要 openssl（现场生成自签证书）
+#   bash scripts/perf/stream-baseline.sh --scenarios direct relay tls ws
 #
 # 这个脚本只做三件事：构建 Agent、检查依赖、调用 Python 采集器。**它不做判定**：
 # 性能基线不是 CI 门槛（§5.4「不要一开始用脆弱绝对阈值阻断 CI」），共享 Runner
@@ -32,4 +32,4 @@ echo "==> building agent binary ($BIN)"
 (cd "$REPO_ROOT/agent" && go build -o "$BIN" .)
 
 echo "==> running baseline"
-exec python3 "$REPO_ROOT/scripts/perf/v5-tcp-baseline.py" --agent-binary "$BIN" "$@"
+exec python3 "$REPO_ROOT/scripts/perf/stream-baseline.py" --agent-binary "$BIN" "$@"

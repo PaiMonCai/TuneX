@@ -21,8 +21,8 @@
     "python": "3.11.2",
     "timestamp_utc": "2026-10-03T12:34:23Z"
   },
-  "kind": "v5-tcp-baseline",
-  "note": "V5-G0 \u4e4b\u524d\u7684 TCP \u53c2\u7167\u951a\u70b9\uff1a\u67d0\u53f0\u673a\u5668\u4e0a\u4e00\u6b21\u771f\u5b9e\u8fd0\u884c\u7684\u5b8c\u6574\u7ed3\u679c\uff0c\u7528\u4e8e**\u76f8\u5bf9**\u6bd4\u8f83\uff08\u540c\u673a\u3001\u540c profile \u7684\u4e2d\u4f4d\u6570\uff09\uff0c\u4e0d\u662f\u5408\u683c\u7ebf\u3002\u91cd\u8dd1\u65b9\u5f0f\u89c1 scripts/perf/README.md\u3002\u91c7\u96c6\u65f6\u5de5\u4f5c\u6811\u542b\u5c1a\u672a\u63d0\u4ea4\u7684 WP3 \u91c7\u96c6\u5668\u6539\u52a8\uff08git_dirty=true\uff09\uff0c\u88ab\u6d4b Agent \u4e8c\u8fdb\u5236\u7531 `go build` \u4ece\u5f53\u65f6\u7684 agent \u6e90\u7801\u6784\u5efa\uff08git_rev \u5373\u8be5\u63d0\u4ea4\uff09\u3002",
+  "kind": "stream-baseline",
+  "note": "TCP stream 性能参照锚点：一次真实运行结果，仅用于同机、同 profile 的相对比较，不是合格线。重跑方式见 scripts/perf/README.md。",
   "profile": "quick",
   "scenarios": {
     "direct": {

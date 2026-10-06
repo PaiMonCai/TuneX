@@ -1,26 +1,24 @@
-# V5 性能基线（WP3）：TCP / TLS / WS
+# Stream 性能基线：TCP / TLS / WS
 
-> 冻结 V4/V5-G0 的 TCP 性能参照，避免"功能通过、性能退化"长期不可见
-> （`DEVELOPMENT.md` §5.4）。V5.1a 给入口增加了两个前端协议，所以这里按同一条
-> 流水线补上 `tls` 与 `ws` 两个场景（§5.4「每个协议各有自己的场景」）。
+> 为 TCP / TLS / WebSocket stream 数据面保留可重复、可机器读取的性能参照，避免“功能通过、性能退化”长期不可见。
 
 ## 怎么跑
 
 ```bash
 # 快速档（默认，几分钟内跑完）：日常改完代码自查。默认只跑 TCP 的 direct + relay
-bash scripts/perf/v5-tcp-baseline.sh
+bash scripts/perf/stream-baseline.sh
 
 # 接近真实链路量级：发布前人工对比
-bash scripts/perf/v5-tcp-baseline.sh --profile full
+bash scripts/perf/stream-baseline.sh --profile full
 
 # 只跑一个拓扑 / 只跑新增的前端协议
-bash scripts/perf/v5-tcp-baseline.sh --scenarios direct
-bash scripts/perf/v5-tcp-baseline.sh --scenarios tls
-bash scripts/perf/v5-tcp-baseline.sh --scenarios ws
-bash scripts/perf/v5-tcp-baseline.sh --scenarios direct relay tls ws
+bash scripts/perf/stream-baseline.sh --scenarios direct
+bash scripts/perf/stream-baseline.sh --scenarios tls
+bash scripts/perf/stream-baseline.sh --scenarios ws
+bash scripts/perf/stream-baseline.sh --scenarios direct relay tls ws
 
 # 采集器自检（纯函数，不需要 go / 端口；TLS 场景才需要 openssl）
-python3 scripts/perf/test_v5_tcp_baseline.py
+python3 scripts/perf/test_stream_baseline.py
 ```
 
 `tls` 场景需要机器上有 `openssl`（现场生成一对临时自签证书，见下文）。缺
@@ -46,7 +44,7 @@ python3 scripts/perf/test_v5_tcp_baseline.py
 | `<agent>_cpu_seconds_used` | 本轮负载消耗的 CPU（两次读数之差） |
 | `ws_echo_integrity` | WS 场景的前置校验：逐字节比对一次 64 KiB 往返，通过才写 `true` |
 
-`<topo>` 就是场景名：`direct` / `relay` 是 TCP，`tls` 与 `ws` 是 V5.1a 的前端协议，
+`<topo>` 就是场景名：`direct` / `relay` 是 TCP，`tls` 与 `ws` 是 stream 前端协议，
 `relay` 会额外出现 `ingress_*` 与 `egress_*` 两组仪表。每个数值都带
 `median / p95 / min / max / mean / count`。**看中位数和 p95**，`min`/`max` 在共享
 机器上只能说明当时有没有别的东西在抢 CPU。
@@ -67,7 +65,7 @@ python3 scripts/perf/test_v5_tcp_baseline.py
 
 `tls` / `ws` 只测吞吐、建连、并发与仪表。热重载、重启收敛（panel/LKG）、有界
 排空是**三种协议共用的 stream 运行时路径**，只在 `direct` 上测一次；`ws` 的
-握手与分帧实现另由 Gate V5-G1A 的负例覆盖（非 WS 客户端、垃圾字节、明文 HTTP）。
+握手与分帧实现另由协议回归负例覆盖（非 WS 客户端、垃圾字节、明文 HTTP）。
 
 ## 拓扑是真的
 
@@ -107,7 +105,7 @@ TLS 场景的证书同样是一次性的：`openssl` 在临时工作区里现场
 3. **`--profile full` 才适合看 CPU。** `/proc/<pid>/stat` 的 CPU 分辨率是一个调度
    tick（通常 10 ms）；quick 档负载下增量可能不足一个 tick，产物会给出
    `cpu_resolution_note` 明确说明"读数为 0 表示低于分辨率，而不是没测到"。
-4. **`graceful_drain_held_ms` 接近 10s 是预期结果**，不是退化：那是 V4 的有界排空
+4. **`graceful_drain_held_ms` 接近 10s 是预期结果**，不是退化：那是当前有界排空
    上限。`graceful_drain_idle_ms`（几十毫秒）才是进程收尾开销。
 5. **`restart_lkg_ms` 的 `*_sources` 字段必须显示 `["lkg"]`。** 它是"面板不可达时
    走的是本地快照"这条证据本身；如果显示 `panel`，说明面板没有被真正断开，那次
@@ -143,8 +141,7 @@ TLS 场景的证书同样是一次性的：`openssl` 在临时工作区里现场
   要求同机对比，也是为了不让它变成跨机器比较）；
 - **已覆盖**：`tcp`（direct / relay 两个场景）、`tls`、`ws`。三种协议共用同一个
   stream 运行时，所以入口之外的路径（热重载 / 重启收敛 / 排空）只在 direct 上测；
-- **未覆盖**：`udp`（V5.1b，datagram 生命周期，与 stream 不同，需要自己的场景与
-  自己的指标口径——尤其不能沿用"建连/握手"这类 stream 概念）、`QUIC`（V5.1c），
+- **未覆盖**：`udp`（datagram 生命周期与 stream 不同，需要自己的场景与\n  指标口径——尤其不能沿用“建连/握手”这类 stream 概念）、`QUIC`，
   以及 `wss`（§6.1 明确它不是新的 protocol 值，而是待定的产品决策）；
 - `tls` 场景依赖 `openssl` 生成证书。没有 `openssl` 时该场景**明确失败**（连带
   `direct relay` 之外的场景选择一起失败），不静默跳过。

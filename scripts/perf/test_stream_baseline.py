@@ -7,7 +7,7 @@
 可离线断言的部分（RFC 6455 的 accept 值、帧编解码、握手响应校验、场景注册表）。
 唯一的例外是 `WSClientLoopbackTest`：它用一个 20 行的本地回显服务端验证
 WSClient 的读侧缓冲（握手响应与首个数据帧同段到达时不能吞帧）。真实拓扑的
-采集仍然由 `v5-tcp-baseline.py` 自己跑 —— 把易波动的端到端测量塞进单测，只会
+采集仍然由 `stream-baseline.py` 自己跑 —— 把易波动的端到端测量塞进单测，只会
 得到一条随机器负载变红的测试。
 """
 
@@ -24,14 +24,14 @@ import threading
 import unittest
 from pathlib import Path
 
-MODULE_PATH = Path(__file__).with_name("v5-tcp-baseline.py")
-spec = importlib.util.spec_from_file_location("v5_tcp_baseline", MODULE_PATH)
+MODULE_PATH = Path(__file__).with_name("stream-baseline.py")
+spec = importlib.util.spec_from_file_location("stream_baseline", MODULE_PATH)
 baseline = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 # dataclasses resolves annotations through sys.modules[cls.__module__], so the
 # module must be registered before exec_module — otherwise every @dataclass in
 # the harness fails with a confusing AttributeError.
-sys.modules["v5_tcp_baseline"] = baseline
+sys.modules["stream_baseline"] = baseline
 spec.loader.exec_module(baseline)
 
 
