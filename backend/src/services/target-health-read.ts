@@ -1,5 +1,5 @@
 /**
- * V5.2 WP5 + WP6 的**读路径**：把「用户要什么」（desired targets）与「我们看到了什么」
+ * 目标健康**读路径**：把「用户要什么」（desired targets）与「我们看到了什么」
  * （target_observation 投影）在一个地方合并，然后交给纯合成模块得出结论。
  *
  * 这一层存在的理由，和 `dispatchFactsFromRow` 存在的理由是同一条：**两类事实的合并

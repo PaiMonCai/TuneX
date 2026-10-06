@@ -1,5 +1,5 @@
 /**
- * V4-WP5 — Node 托管生命周期（`DEVELOPMENT.md` §13.4）
+ * Node 托管生命周期（节点状态模型）
  *
  * ── 三层状态里的 Lifecycle 层 ──
  * §13.4.1 把 Node 状态拆成 Connection（事实，由上报/凭据推导）、Lifecycle

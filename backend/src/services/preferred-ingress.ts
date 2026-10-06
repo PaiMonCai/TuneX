@@ -1,5 +1,5 @@
 /**
- * V5-WP17.1（契约 D4 收口）—— **首选入口节点**的写入路径。
+ * **首选入口节点**的写入路径。
  *
  * 为什么它必须存在：`failover-policy` 早就支持 `failback` 路径，但 `pickFailoverDestination`
  * 恒返回 `preferred_node_id = null` ⇒ **自动回切今天永不发生**。这是"写了功能但没有任何写入

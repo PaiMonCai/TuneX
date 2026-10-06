@@ -1,5 +1,5 @@
 /**
- * WP11 — Tunnel RELAY API 服务层（`DEVELOPMENT.md` §7.13）。
+ * Tunnel RELAY API 服务层。
  *
  * ── 本层的职责边界（§7.13「所有运行操作统一走 orchestrator」）──
  *
