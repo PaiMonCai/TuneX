@@ -100,7 +100,24 @@ const fakeDb = () => {
         const a = args as { where: { id: number } };
         return leases.find((l) => l.id === a.where.id) ?? null;
       },
-      findMany: async () => leases.filter((l) => l.status === "active"),
+      findMany: async (args?: unknown) => {
+        const a = (args ?? {}) as {
+          where?: Record<string, unknown>;
+          select?: Record<string, boolean>;
+        };
+        const where = a.where ?? {};
+        const rows = leases.filter((lease) =>
+          Object.entries(where).every(([key, value]) => value === undefined || lease[key] === value),
+        );
+        if (!a.select) return rows.map((lease) => ({ ...lease }));
+        return rows.map((lease) => {
+          const selected: Record<string, unknown> = {};
+          for (const [key, enabled] of Object.entries(a.select)) {
+            if (enabled) selected[key] = lease[key];
+          }
+          return selected;
+        });
+      },
       update: async (args: unknown) => {
         const a = args as { where: { id: number }; data: Record<string, unknown> };
         const row = leases.find((l) => l.id === a.where.id);
