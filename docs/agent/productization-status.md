@@ -628,6 +628,8 @@ web 干净检出 `build` 未跑；web/后端**测试刻意未跑**（工作树�
 
 ### Lead 处置：P3-8（凭据哈希下发）已修
 `GET /api/admin/node` 原为 `findMany()` 全字段 ⇒ 把 `node_credential_hash`（长期凭据的 sha256）下发到客户端。已改为 **select 白名单**（凭据状态由 `credential_*` 列表达，列表所需字段一个不少）。
+
+**这条修复的分量比"小卫生"更重**：仓里**已经有一条测试把"绝不下发 `node_credential_hash`"写成服务端契约红线**（`web/src/components/admin/__tests__/node-management.test.ts:95` 断言 `toBeUndefined()`，文件头注释也点名它是红线）——也就是说**真实后端一直在违反自己文档化的契约**，而 mock 侧反而是被钉住的。前端与 mock 对该字段零引用（grep 只有那两条断言）⇒ 移除无消费方风险。干净检出 backend tsc = 0 错。
 **顺带发现并复现一个既存的顺序敏感缺陷**（与本改动无关）：`routes/__tests__/ddns-provider-route.test.ts` 在进程内注册了只含 `resolveWorkspaceAccess` 的 `workspace.ts` 替身（缺 `createPersonalWorkspace`）⇒ 同进程后跑的 `route-mount-coverage.test.ts` 报 `Export named 'createPersonalWorkspace' not found`。**只跑这两个文件即可复现**（5 pass / 1 fail / 1 error）；全量跑因顺序不同反而绿 ⇒ 属"替身必须语义完整"的同型问题，待小切片修。
 
 ## 4. Capability Map
