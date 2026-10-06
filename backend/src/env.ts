@@ -78,7 +78,10 @@ export const env = {
   /** 重新发送验证邮件的间隔：60s（限流中间件之外的应用层节流）。 */
   resendVerificationIntervalSeconds: Number(process.env.RESEND_VERIFICATION_INTERVAL ?? 60),
 
-  licenseType: process.env.LICENSE_TYPE ?? "business",
+  // Production must never gain Business capabilities merely because LICENSE_TYPE was omitted.
+  licenseType:
+    process.env.LICENSE_TYPE ??
+    ((process.env.NODE_ENV ?? "development") === "production" ? "none" : "business"),
   licenseExpiredAt: Number(process.env.LICENSE_EXPIRED_AT ?? 0),
 
   disableWorker: (process.env.DISABLE_WORKER ?? "false") === "true",
