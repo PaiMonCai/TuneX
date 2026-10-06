@@ -18,6 +18,14 @@ permissions:
   contents: read
 
 jobs:
+  workflow-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - name: Enforce TuneX CI / Integration / Release contract
+        run: bun scripts/ci/workflow-contract.mjs
+
   secret-scan:
     runs-on: ubuntu-latest
     steps:
