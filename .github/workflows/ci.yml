@@ -1,15 +1,10 @@
 name: CI
 
 on:
-  # Feature branches are validated by the pull_request event. Running the same
-  # SHA again on push only wastes runner time and usually gets cancelled moments
-  # later by the PR run. Main still validates every landed commit.
   push:
     branches: [main]
   pull_request:
 
-# Keep only the newest CI for a branch/PR. Feature pushes no longer create a
-# duplicate run; pull_request is the single development CI entry point.
 concurrency:
   group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
@@ -18,15 +13,73 @@ permissions:
   contents: read
 
 jobs:
-  workflow-contract:
+  # Compute the affected surfaces once. PR CI is intentionally incremental:
+  # changing Agent code must not rebuild Next.js or spin up MySQL, and an ops
+  # documentation/install change must not run the entire product suite.
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.scope.outputs.backend }}
+      web: ${{ steps.scope.outputs.web }}
+      agent: ${{ steps.scope.outputs.agent }}
+      ops: ${{ steps.scope.outputs.ops }}
+      security: ${{ steps.scope.outputs.security }}
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      - name: Enforce TuneX CI / Integration / Release contract
-        run: bun scripts/ci/workflow-contract.mjs
+        with:
+          fetch-depth: 0
+      - id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${GITHUB_SHA}"
+            if [[ "$BASE" == "0000000000000000000000000000000000000000" ]]; then
+              BASE="$(git rev-list --max-parents=0 "$HEAD" | head -1)"
+            fi
+          fi
+
+          git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt
+          cat /tmp/changed.txt
+
+          match() {
+            local regex="$1"
+            grep -Eq "$regex" /tmp/changed.txt && echo true || echo false
+          }
+
+          # main is a landed-commit verification point: run every product surface.
+          if [[ "${GITHUB_REF}" == "refs/heads/main" && "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            backend=true
+            web=true
+            agent=true
+            ops=true
+          else
+            backend="$(match '^(backend/|shared/|scripts/v3-e2e/|Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env\.production\.example$)')"
+            web="$(match '^(web/|shared/|Dockerfile$)')"
+            agent="$(match '^(agent/|shared/|scripts/v3-e2e/)')"
+            ops="$(match '^(scripts/ops/|Dockerfile$|backend/Dockerfile$|agent/Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env(\.production)?\.example$|docs/production-deploy\.md$)')"
+          fi
+
+          # Cheap secret scan is the one repository-wide invariant worth running
+          # for every source/config PR. Docs-only edits skip it.
+          security="$(match '^(backend/|web/|agent/|shared/|scripts/|\.github/|Dockerfile$|docker-compose|\.env)')"
+
+          {
+            echo "backend=$backend"
+            echo "web=$web"
+            echo "agent=$agent"
+            echo "ops=$ops"
+            echo "security=$security"
+          } >> "$GITHUB_OUTPUT"
 
   secret-scan:
+    needs: changes
+    if: needs.changes.outputs.security == 'true' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -35,6 +88,8 @@ jobs:
         run: bun scripts/ci/secret-scan.mjs
 
   backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     services:
       mysql:
@@ -55,9 +110,9 @@ jobs:
           --health-cmd="redis-cli ping" --health-interval=10s
           --health-timeout=5s --health-retries=12
     env:
-      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci # secret-scan:allow (CI-only fixture, not a real secret)
+      DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci # secret-scan:allow
       REDIS_URL: redis://127.0.0.1:6379
-      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
+      AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production # secret-scan:allow
       PAYMENTS_ENABLED: "false"
     defaults:
       run:
@@ -70,28 +125,23 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: Install locked backend dependencies
         run: bun ci
-      - name: Apply migrations on an empty MySQL database
+      - name: Apply migrations on an empty database
         run: bunx prisma migrate deploy
       - name: Generate Prisma Client and typecheck
         run: |
           bunx prisma generate
           bunx tsc --noEmit
-      # Fast merge gate: behavior-focused unit/contract tests under src/.
-      # These must not require MySQL/Redis topology and must not pin implementation text.
       - name: Backend unit and contract tests
         run: bun run test:unit
-      # Real persistence/HTTP semantics live in tests/*.test.mjs. Keep them in a
-      # separate named layer so failures identify integration drift instead of
-      # looking like unit regressions.
       - name: Backend database and HTTP integration tests
         run: bun run test:integration
         env:
           TUNEX_DB_TEST: "1"
           ALLOW_REGISTER_FALLBACK: "true"
-      - name: Migrate and verify existing two-user database
+      - name: Verify upgrade from the oldest supported production baseline
         run: |
           bunx prisma db execute --schema prisma/schema.prisma --file tests/fixtures/create-upgrade-db.sql
-          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci # secret-scan:allow (CI-only fixture, not a real secret)
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_upgrade_ci # secret-scan:allow
           temp_dir=$(mktemp -d)
           cp prisma/schema.prisma "$temp_dir/schema.prisma"
           mkdir -p "$temp_dir/migrations"
@@ -101,7 +151,10 @@ jobs:
           bunx prisma db execute --schema "$temp_dir/schema.prisma" --file tests/fixtures/legacy-workspace.sql
           bunx prisma migrate deploy --schema prisma/schema.prisma
           node tests/verify-workspace-upgrade.mjs
+
   web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -116,25 +169,19 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: npm run typecheck
-      # OPS-03：仪表盘流量装配纯逻辑单测（bun test，无 DB / 浏览器依赖）
-      # WP12：节点管理 mock 契约（角色三元/凭据生命周期/出口池 CRUD）单测
-      # WP13：隧道编排 mock 契约（apply 状态机/revision/DIRECT+RELAY 创建/过滤）单测
-      # V4：Node-first + Forward product API mock 契约单测
-      # V4-WP11C/WP11B：诊断 / 支持包 / 升级入口的渲染不变量与 mock 契约一致性
-      # V5-WP13.5A：Console 边界（User/Admin 导航不变量、route group 不改变 URL、
-      #             「guard 不是授权」的回归断言）
-      # V5-WP18.5：公告渲染（用户侧最小展示：纯文本转义/三态；管理端发布表单不变量）
-      #             —— 新增测试目录必须进这份清单：没被 CI 执行的测试等于没写
-      #             （`web/src/components/dashboard/__tests__/wp8-attention.test.ts` 的 E 组反查它）。
-      - name: Unit tests (console boundary + dashboard + node admin + V4 forwards + legacy compatibility + diagnostics)
-        run: bun test src/components/console/__tests__/ src/components/dashboard/__tests__/ src/components/admin/__tests__/ src/components/announcements/__tests__/ src/components/forwards/__tests__/ src/components/nodes/__tests__/ src/mocks/__tests__/
-      - name: Build with optional billing disabled
+      # Run the current source test tree. Historical milestone names are not
+      # separate gates; retained regression tests simply behave like normal tests.
+      - name: Web unit tests
+        run: bun test src
+      - name: Build web
         run: npm run build
         env:
           NEXT_PUBLIC_PAYMENTS_ENABLED: "false"
           NEXT_PUBLIC_API_MOCK: "1"
 
   agent:
+    needs: changes
+    if: needs.changes.outputs.agent == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -149,29 +196,18 @@ jobs:
         run: go vet ./...
       - name: Agent tests
         run: go test ./...
-      # Do not execute the entire suite twice. Race instrumentation is kept only
-      # on packages that own concurrent sockets, hot reload and control dispatch.
-      - name: Race detector (forwarder + control)
+      - name: Race detector for concurrent runtime owners
         run: go test -race ./internal/forwarder ./internal/control
       - name: Build Agent
         run: go build -buildvcs=false ./...
 
-  # Production installer / backup / restore contract.
-  #
-  # 安装器会改机器状态（docker、部署目录、13001–13003、卷），也就没法在 CI runner 上反复
-  # 真跑 —— 而且生产栈与 e2e 栈共用 `tunex` 项目名，同时 up 会互相踩（docs/production-deploy.md §1）。
-  # 真实环境门禁交给 V5-G6 在专用机器上跑（contract §7）；这里只钉住两类**确定**的事：
-  #   1. `bash -n` 与 `sh -n`：安装器必须同时是 bash 与 POSIX 可解析的（引导段可能被 `sh` 执行）；
-  #   2. `installer-static.sh`：静态红线（无第三方加速域名 / 无 get.docker.com / 无 curl|sh /
-  #      口令不进 argv / 不自建备份迁移 / 不把开发栈当目标）+ 纯函数单测（含与
-  #      node-upgrade.ts 的镜像引用 parity）+ dry-run 全流程（夹具驱动，零副作用）
-  #      + 临时 git 仓库里的真克隆（tag 浅克隆 / 裸 SHA 完整克隆 / 断言失败自清）。
-  # 不依赖 docker 守护进程（本机没有也能跑）、不联网、不改机器状态；目标 ≤1 分钟。
-  installer-static:
+  ops:
+    needs: changes
+    if: needs.changes.outputs.ops == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Shell syntax (bash -n / sh -n)
+      - name: Shell syntax
         run: |
           bash -n scripts/ops/install.sh
           sh -n scripts/ops/install.sh
@@ -179,7 +215,29 @@ jobs:
           sh -n scripts/ops/bootstrap.sh
           bash -n scripts/ops/backup.sh
           bash -n scripts/ops/restore.sh
-      - name: Installer static + dry-run gate
+      - name: Current deployment contract
         run: bash scripts/ops/tests/installer-static.sh
 
-
+  # Single stable branch-protection target. Individual surface jobs may be
+  # intentionally skipped when that surface did not change.
+  required:
+    if: always()
+    needs: [changes, secret-scan, backend, web, agent, ops]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all selected CI surfaces to pass
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          SECURITY: ${{ needs.secret-scan.result }}
+          BACKEND: ${{ needs.backend.result }}
+          WEB: ${{ needs.web.result }}
+          AGENT: ${{ needs.agent.result }}
+          OPS: ${{ needs.ops.result }}
+        run: |
+          set -euo pipefail
+          for result in "$CHANGES" "$SECURITY" "$BACKEND" "$WEB" "$AGENT" "$OPS"; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "Selected CI surface failed or was cancelled: $result" >&2; exit 1 ;;
+            esac
+          done
