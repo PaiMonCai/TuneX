@@ -835,55 +835,67 @@ describe("默认读路径（离线假 db）", () => {
 
   test("节点/观测/冷却/端口事实任一读取失败 ⇒ db_unavailable，不伪装成离线或无冷却", async () => {
     const state = baseState();
+    const base = readerOptions(state);
 
-    const cases: Array<{
-      label: string;
-      mutate: (options: ReturnType<typeof readerOptions>) => void;
-    }> = [
+    const cases = [
       {
         label: "node",
-        mutate: (options) => {
-          options.db.node = {
-            findUnique: async () => {
-              throw new Error("node db down");
+        options: {
+          ...base,
+          db: {
+            ...base.db,
+            node: {
+              findUnique: async () => {
+                throw new Error("node db down");
+              },
             },
-          };
+          },
         },
       },
       {
         label: "observation",
-        mutate: (options) => {
-          options.db.targetObservation = {
-            findMany: async () => {
-              throw new Error("observation db down");
+        options: {
+          ...base,
+          db: {
+            ...base.db,
+            targetObservation: {
+              findMany: async () => {
+                throw new Error("observation db down");
+              },
             },
-          };
+          },
         },
       },
       {
         label: "cooldown",
-        mutate: (options) => {
-          options.db.forwardRollout = {
-            findFirst: async () => {
-              throw new Error("rollout db down");
+        options: {
+          ...base,
+          db: {
+            ...base.db,
+            forwardRollout: {
+              findFirst: async () => {
+                throw new Error("rollout db down");
+              },
             },
-          };
+          },
         },
       },
       {
         label: "port",
-        mutate: (options) => {
-          options.portAvailability = async () => {
+        options: {
+          ...base,
+          portAvailability: async () => {
             throw new Error("port pool down");
-          };
+          },
         },
       },
     ];
 
     for (const item of cases) {
-      const options = readerOptions(state);
-      item.mutate(options);
-      const read = await readFailoverDecisionFacts({ tunnelId: TUNNEL, now: NOW }, options);
+      const read = await readFailoverDecisionFacts(
+        { tunnelId: TUNNEL, now: NOW },
+        item.options,
+      );
       expect(read.ok, item.label).toBe(false);
       if (!read.ok) {
         expect(read.code).toBe("db_unavailable");
