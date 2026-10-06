@@ -632,6 +632,43 @@ web 干净检出 `build` 未跑；web/后端**测试刻意未跑**（工作树�
 **这条修复的分量比"小卫生"更重**：仓里**已经有一条测试把"绝不下发 `node_credential_hash`"写成服务端契约红线**（`web/src/components/admin/__tests__/node-management.test.ts:95` 断言 `toBeUndefined()`，文件头注释也点名它是红线）——也就是说**真实后端一直在违反自己文档化的契约**，而 mock 侧反而是被钉住的。前端与 mock 对该字段零引用（grep 只有那两条断言）⇒ 移除无消费方风险。干净检出 backend tsc = 0 错。
 **顺带发现并复现一个既存的顺序敏感缺陷**（与本改动无关）：`routes/__tests__/ddns-provider-route.test.ts` 在进程内注册了只含 `resolveWorkspaceAccess` 的 `workspace.ts` 替身（缺 `createPersonalWorkspace`）⇒ 同进程后跑的 `route-mount-coverage.test.ts` 报 `Export named 'createPersonalWorkspace' not found`。**只跑这两个文件即可复现**（5 pass / 1 fail / 1 error）；全量跑因顺序不同反而绿 ⇒ 属"替身必须语义完整"的同型问题，待小切片修。
 
+## 3.28 Round 32：task-11 真机 worker 验证 + P1 邮件修复 + 一类"替身泄漏"缺陷
+
+### task-11 的最后一里已关（Lead 验收环境实测）
+用当前后端源码重建 Panel/Worker 后，**真实 worker 进程**打印：
+```
+[worker] registered 8 cron schedulers: cron_save_traffic,cron_delete_tunnel_traffic,cron_latency_history,
+         cron_check_node_offline,cron_reconcile_v3,cron_ddns_sync,cron_settle_billing,cron_notification_facts
+[worker] cron_notification_facts ok (105ms since enqueue) → 30s 后再次 ok
+```
+⇒ "整条 worker 循环里它每 30s 真的被 BullMQ 调度"这条**不再只是源码锚点**（`notify-center` 自列的未验证项已关闭）。
+
+### P1 已修：`sendMail` 不读 SMTP 220 问候语（`fc90ec5`）
+真机前后对照（同一个会发 `220 … ready` 的假 SMTP、同一封邮件）：
+```
+after_fix : {"sent":true}                       假 SMTP 完整收到 Subject/To/正文
+before_fix: {"sent":false,"reason":"smtp_error"} [mail] 发送失败：SMTP EHLO 返回 220：220 n3-fake-smtp ready
+```
+修复：`connect()` 末尾 `readGreeting()`（**非 220 就抛错，一条命令都不发**）+ 顺带修 `readReply()` 的监听器泄漏（成功路径不摘 `once("error")` → 真机 `MaxListenersExceededWarning`）+ `SmtpClient` 导出与可注入 `replyTimeoutMs`（仅供测试）。4 条真实会话测试（有问候语/多行问候语/554 ⇒ 零命令/服务器不说话 ⇒ 超时）。
+**未验证**：真实公网 MTA 的 465 隐式 TLS / 587 STARTTLS 两条分支没有实测，只验了明文 `SMTP_SECURE=false`。
+
+### 一类缺陷：**进程级模块替身泄漏**（两个现场，同一不变量）
+不变量：`mock.module` 是**进程级注册表、先加载者生效**（仓里 `node-health-service.ts:76-77` 已文档化），因此**替身必须语义完整**，否则泄漏到同进程的其它测试文件。
+| 现场 | 症状 | 复现 |
+|---|---|---|
+| `workspace.ts` 替身缺 `createPersonalWorkspace` | `route-mount-coverage.test.ts` 报 `Export named … not found` | 只跑那两个文件：5 pass / 1 fail / 1 error（全量因顺序不同反而绿） |
+| `env.ts` 替身缺 `mail`（`redis-scope` / `traffic-pipeline` / `policy-concurrency` / `csrf`） | 全量跑时 `env.mail === undefined` ⇒ `isMailConfigured()` 抛 `TypeError` ⇒ `mail-smtp-session.test.ts` **4 条全红**（**单独跑 4/4 绿**） | `cd backend && bun test src` |
+
+**处置**：`task-28` 扩到覆盖两个现场（替身语义完整 + **防复发守卫**：断言"env 替身键集 ⊇ 真实 env 键集"，或断言"缺段 env 下 `isMailConfigured()` 返回 `false` 而非抛错"），交 `backend-truth`；`mail.ts` 的健壮化（缺段应返回"未配置"而不是崩）归 `notify-center`（他持有该文件）。
+
+### 另一处由我造成并已修的 HEAD 级失败
+我退役 `node-diagnostics` 内联升级块时**只改了 a11y 测试、漏了 `diagnostics-ui.test.tsx:206`** 对同一句文案的断言 ⇒ HEAD 上 1 条红（`web-forward` 独立发现并报回）。已改为断言新卡片的文案对象。
+**教训（值得记）**：我补 import 时只 `grep` 到注释里出现的文件名就以为"已 import"，实际没有——**验证 import 是否存在必须查 import 语句本身**，不能靠文件名出现次数。
+
+### 当前门禁状态
+- web：`tsc` 0 错 + 全量 **1267 pass / 0 fail**（已提交 `ef4f073`）
+- backend：`tsc` 0 错；全量 **2901 pass / 4 fail**，4 条红**全部**是上述替身泄漏（单独跑绿）⇒ 等 `task-28` 与 `notify-center` 两半落地后应回 0
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
