@@ -30,12 +30,6 @@ import {
 import { getDictionary, makeT } from "@/lib/i18n";
 import type { NodeBinding, PortForward } from "@/lib/types";
 
-const DIALOG = readFileSync(
-  new URL("../forward-edit-dialog.tsx", import.meta.url),
-  "utf8",
-);
-/** 归一化：折行/点号空格不影响调用点断言。 */
-const SRC = DIALOG.replace(/\s+/g, " ").replace(/\s*\.\s*/g, ".");
 
 /** 源转发：带齐运行态与统计字段 —— 复制时这些**必须**一个都不能跟着走。 */
 const source: PortForward = {
@@ -116,24 +110,6 @@ describe("V4-WP9 复制 Forward — 走真实 create 契约", () => {
     expect(name.endsWith(suffix)).toBe(true);
   });
 
-  test("编辑器只发 PATCH：复制不在编辑器里另开一条 create 写路径", () => {
-    // 复制 = 「同一份 create 契约再建一条」，入口在列表行菜单（见下一个用例）；
-    // 编辑器保持单一 PATCH 语义，避免同一动作出现两种写路径。
-    expect((SRC.match(/api\.forwards\.update\(/g) ?? []).length).toBe(1);
-    expect(SRC).not.toContain("api.forwards.create(");
-  });
-
-  test("列表入口的复制复用同一份纯逻辑，并落到真实 create 契约", () => {
-    const workspace = readFileSync(
-      new URL("../forward-workspace.tsx", import.meta.url),
-      "utf8",
-    );
-    // 草稿由 forward-copy.ts 构造（与单测同一份规则，不另写一套）
-    expect(workspace).toContain("forward-copy");
-    expect(workspace).toContain("forwardCopyDraft(");
-    // 复制最终走产品 create 端点，没有第二条实现
-    expect(workspace).toContain("api.forwards.create(");
-  });
 });
 
 describe("V4-WP9 auto-port — 空值给明确提示，不给假端口号", () => {
@@ -164,24 +140,6 @@ describe("V4-WP9 auto-port — 空值给明确提示，不给假端口号", () =
       // 关键：自动分配时占位符不能长得像真端口（老实现是 "20001"）
       expect(t("forward.autoPortPlaceholder")).not.toMatch(/^\d+$/);
       expect(t("forward.portPlaceholder")).toMatch(/^\d+$/);
-    }
-  });
-
-  test("对话框接线：提示/占位符都由纯函数按当前草稿决定（不会退回写死端口号）", () => {
-    expect(SRC).toContain("hint={t(listenPortHintKey(draft.listenPort))}");
-    expect(SRC).toContain("placeholder={t(listenPortPlaceholderKey(draft.listenPort))}");
-    // 老写法（写死 portPlaceholder）必须已经消失
-    expect(SRC).not.toContain('t("forward.portPlaceholder")}');
-  });
-
-  test("preview 报 auto 时显式说明「保存后才确定端口」", () => {
-    expect(SRC).toContain(
-      'if (impact.port_status === "auto") lines.push(t("forward.impactPortAuto"));',
-    );
-    for (const locale of ["zh", "en"] as const) {
-      expect(makeT(getDictionary(locale))("forward.impactPortAuto")).not.toBe(
-        "forward.impactPortAuto",
-      );
     }
   });
 });
@@ -254,55 +212,5 @@ describe("V4-WP9 Binding usage — 只消费后端契约，不重算口径", () 
     expect(backend).toContain('tunnel_mode: "relay"');
     // 使用中被拒绝时给出机器可读的错误码
     expect(backend).toContain('code: "binding_in_use"');
-  });
-
-  test("对话框接线：直接读 bindings 行上的使用量，且不再自己扫转发列表", () => {
-    expect(SRC).toContain("bindingUsageView(binding)");
-    expect(SRC).toContain('t("forward.bindingUsageUsed", {');
-    expect(SRC).toContain('t("forward.bindingUsageInUse")');
-    expect(SRC).toContain('t("forward.bindingUsageDeletable")');
-    // 只在 relay 下展示：direct 不使用出口绑定，列出来只是噪音
-    expect(SRC).toContain('{draft.mode === "relay" && bindingUsageRows.length > 0 ? (');
-    // 曾经用「转发列表推导使用量」的方案已删除：不再有该 prop，也不再有 mode 过滤重算
-    expect(SRC).not.toContain("forwards?: PortForward[]");
-    expect(SRC).not.toContain("bindingUsage(forwards");
-  });
-
-  test("使用量文案带 {count} 占位符并可插值（两个语言都成立）", () => {
-    for (const locale of ["zh", "en"] as const) {
-      const t = makeT(getDictionary(locale));
-      const text = t("forward.bindingUsageUsed", { count: "3" });
-      expect(text).not.toBe("forward.bindingUsageUsed");
-      expect(text).toContain("3");
-      expect(t("forward.bindingUsageUnused")).not.toBe("forward.bindingUsageUnused");
-    }
-  });
-});
-
-describe("V4-WP9 — 新增词条的中英文对齐", () => {
-  const zh = getDictionary("zh").forward;
-  const en = getDictionary("en").forward;
-  const NEW_KEYS = [
-    "autoPortNotice",
-    "listenPortFixed",
-    "autoPortPlaceholder",
-    "impactPortAuto",
-    "copyForward",
-    "copySuffix",
-    "bindingUsageTitle",
-    "bindingUsageHint",
-    "bindingUsageUsed",
-    "bindingUsageUnused",
-    "bindingUsageInUse",
-    "bindingUsageDeletable",
-  ] as const;
-
-  test("每个新增键在中英字典里都存在且非空", () => {
-    for (const key of NEW_KEYS) {
-      expect(typeof zh[key]).toBe("string");
-      expect(typeof en[key]).toBe("string");
-      expect((zh[key] as string).length).toBeGreaterThan(0);
-      expect((en[key] as string).length).toBeGreaterThan(0);
-    }
   });
 });

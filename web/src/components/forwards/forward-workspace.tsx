@@ -1,22 +1,6 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  ArrowDown,
-  ArrowLeftRight,
-  ArrowUp,
-  ArrowUpDown,
-  ChevronLeft,
-  ChevronRight,
-  Copy,
-  Loader2,
-  MoreHorizontal,
-  Pencil,
-  Plus,
-  Route,
-  Trash2,
-} from "lucide-react";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
@@ -24,25 +8,20 @@ import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import {
   forwardAccessAddress,
   forwardCopyDraft,
-  listenPortHintKey,
-  listenPortPlaceholderKey,
 } from "@/components/forwards/forward-copy";
 import {
-  bindingUsageView,
-  hasBindingUsage,
-} from "@/components/forwards/forward-binding-usage";
-import {
-  DEFAULT_FORWARD_PROTOCOL,
-  FORWARD_PROTOCOLS,
-  FORWARD_TLS_PATH_MAX,
   forwardProtocolFields,
-  forwardProtocolLabel,
-  forwardProtocolNote,
   tlsPathFieldErrors,
-  type ForwardProtocol,
 } from "@/lib/forward-protocol";
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
-import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
+import { ForwardListControls } from "@/components/forwards/forward-list-controls";
+import { ForwardTable } from "@/components/forwards/forward-table";
+import { ForwardCreateDialog } from "@/components/forwards/forward-create-dialog";
+import { ForwardBatchBar } from "@/components/forwards/forward-batch-bar";
+import { ForwardSummaryCards } from "@/components/forwards/forward-summary-cards";
+import { ForwardToolbar } from "@/components/forwards/forward-toolbar";
+import { ForwardEmptyState } from "@/components/forwards/forward-empty-state";
+import { copiedForwardCreateDraft, emptyForwardCreateDraft } from "@/components/forwards/forward-create-model";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -55,254 +34,47 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Input, Label } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { interpolate } from "@/lib/i18n";
-import type { Locale } from "@/lib/i18n";
-import {
-  applyErrorAction,
   forwardErrorActions,
   forwardErrorInfo,
-  forwardProductBadgeVariant,
-  forwardProductStatus,
 } from "@/lib/forward-status";
-import { formatBytes, formatDateTime } from "@/lib/utils";
 import type {
   ForwardBatchAction,
-  ForwardListQuery,
   ForwardSummary,
   NodeBinding,
   PortForward,
   UserNode,
 } from "@/lib/types";
 
-/**
- * 批量动作的条数上限。
- *
- * 与 `backend/src/services/forward-batch.ts` 的 `FORWARD_BATCH_MAX_IDS` 保持一致：
- * 前端先拦一次是为了让用户在点击时就得到「请分批执行」，而不是发一次注定 400 的
- * 请求。真正的强约束仍在后端（前端校验只是体验优化，不是安全边界），所以这里
- * 刻意不引入运行时共享——它只是一份镜像，且由测试钉住两侧取值。
- */
-export const FORWARD_BATCH_MAX_IDS = 50;
-
-type ForwardModeFilter = "all" | "direct" | "relay";
-/**
- * 状态筛选的取值 == 后端 `apply_status` 白名单。
- *
- * 注意与 WP9 之前的行为差异：老 UI 的「待应用」是**前端**把 pending 与 applying
- * 合并显示的（`forward.apply_status !== "pending" && !== "applying"` 这种过滤）。
- * 服务端过滤是单值精确匹配（`parseForwardListStatus`），没有 OR 形态；若仍按老
- * 口径发 `apply_status=pending`，applying 的行会**静默消失**。因此这里把两者拆成
- * 独立选项，用户仍能分别看到，不会出现「筛选后少了一半数据」。
- */
-type ForwardStatusFilter = "all" | "active" | "error" | "suspended" | "pending" | "applying";
-
-/** 服务端排序键（后端 forward-list-query.ts 白名单的超集子集，见 SORT_OPTIONS）。 */
-export type ForwardSortKey =
-  | "order_by"
-  | "name"
-  | "status"
-  | "mode"
-  | "listen_port"
-  | "traffic"
-  | "created_at"
-  | "updated_at";
-
-export type ForwardSortOrder = "asc" | "desc";
-
-/** 每页条数：与后端 `MAX_FORWARD_PAGE_SIZE = 200` 上限一致地取常用档位。 */
-export const FORWARD_PAGE_SIZE_OPTIONS = [20, 50, 100] as const;
-export const FORWARD_DEFAULT_PAGE_SIZE = FORWARD_PAGE_SIZE_OPTIONS[0];
-
-/**
- * 默认排序：与后端 `DEFAULT_FORWARD_SORT = order_by / asc` 一致。
- *
- * 分页改造的目标是「让大列表好用」，不是「换掉用户已经熟悉的默认视图」，
- * 因此默认键必须与后端默认完全一致——否则首屏顺序会与老版本不符。
- */
-export const FORWARD_DEFAULT_SORT: ForwardSortKey = "order_by";
-export const FORWARD_DEFAULT_ORDER: ForwardSortOrder = "asc";
-
-/**
- * 「时间/流量」类列默认倒序（新的在前、大的在前）；其余默认正序。
- *
- * 这是**仅用于切换列时**的初值：同一列再点一次只是翻转方向，不会重置成默认键，
- * 否则用户无法表达「按名称倒序」这样的组合。
- */
-const DESC_FIRST_SORTS: readonly ForwardSortKey[] = ["created_at", "updated_at", "traffic"];
-
-/**
- * 表头点击 → 下一次排序状态。纯函数，测试直接打它。
- *
- * 不变量：
- *   · 点同一列 → 只翻转方向；
- *   · 点另一列 → 换键 + 该键的默认方向（时间/流量倒序，其余正序）。
- */
-export function forwardNextSort(
-  current: { sort: ForwardSortKey; order: ForwardSortOrder },
-  key: ForwardSortKey,
-): { sort: ForwardSortKey; order: ForwardSortOrder } {
-  if (current.sort === key) {
-    return { sort: key, order: current.order === "asc" ? "desc" : "asc" };
-  }
-  return { sort: key, order: DESC_FIRST_SORTS.includes(key) ? "desc" : "asc" };
-}
-
-/**
- * 总页数：向上取整，**永不返回 0**。
- *
- * 0 页会让 UI 出现「第 1 / 0 页」，并且把「下一页」的禁用条件算错。
- * 与后端 `forwardPageCount` 同口径。
- */
-export function forwardPageCount(total: number, pageSize: number): number {
-  const size = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : FORWARD_DEFAULT_PAGE_SIZE;
-  if (!Number.isFinite(total) || total <= 0) return 1;
-  return Math.max(1, Math.ceil(total / size));
-}
-
-/**
- * 页码夹取：删除最后一页的最后一行后，`page` 可能已经越界。
- *
- * 越界时停在越界页的后果是「空列表 + 一个不可能命中的页码」，用户只能自己点回
- * 上一页；这里把页码夹回最后一页，由调用方触发一次重取。
- */
-export function clampForwardPage(page: number, total: number, pageSize: number): number {
-  const pages = forwardPageCount(total, pageSize);
-  const wanted = Number.isFinite(page) && page >= 1 ? Math.floor(page) : 1;
-  return Math.min(Math.max(1, wanted), pages);
-}
-
-/** 列表控件的全部状态（筛选 + 分页 + 排序）。 */
-export interface ForwardListState {
-  page: number;
-  pageSize: number;
-  sort: ForwardSortKey;
-  order: ForwardSortOrder;
-  mode: ForwardModeFilter;
-  status: ForwardStatusFilter;
-  ingress: string;
-  egress: string;
-  keyword: string;
-}
-
-/**
- * UI 状态 → 请求参数。
- *
- * 两条硬约束：
- *   1. `page` / `page_size` / `sort` / `order` **始终发送**（哪怕等于默认值）。
- *      后端按「参数是否出现」决定响应形态（`forwardListShape`）：不发送就会拿到
- *      裸数组，而调用方按分页读 → `data` 为 undefined。显式发送也比隐式默认更抗
- *      「后端换默认值」这类静默漂移。
- *   2. `all` / 空关键字**不发送**，而不是发 `""` 或 `"all"`。后端对未知值会回落成
- *      「不过滤」，发过去只是噪声；关键字更必须先 trim（`"  "` 不该触发一次带
- *      `keyword=%20%20` 的查询）。
- */
-export function forwardListQuery(state: ForwardListState): ForwardListQuery {
-  const query: ForwardListQuery = {
-    page: Number.isFinite(state.page) && state.page >= 1 ? Math.floor(state.page) : 1,
-    page_size: state.pageSize,
-    sort: state.sort,
-    order: state.order,
-  };
-  if (state.mode !== "all") query.mode = state.mode;
-  if (state.status !== "all") query.apply_status = state.status;
-  if (state.ingress !== "all") query.ingress_node_id = Number(state.ingress);
-  if (state.egress !== "all") query.egress_node_id = Number(state.egress);
-  const keyword = state.keyword.trim();
-  if (keyword) query.keyword = keyword;
-  return query;
-}
-
-/**
- * 分页控件文案。
- *
- * 本文件不改 `i18n.ts`（该文件由并行切片持有，同文件并发编辑会互相覆盖），
- * 所以采用「先查字典、缺词条再回落」：`translate()` 在词条缺失时会把 key 原样
- * 返回，据此可以判定是否回落 —— 界面永远不会出现 `forward.pagePrev` 这种原始 key，
- * 而词条一旦补进字典，这里自动切换成正式文案，不需要再改本组件。
- */
-const FORWARD_LIST_TEXT = {
-  zh: {
-    "forward.pagePrev": "上一页",
-    "forward.pageNext": "下一页",
-    "forward.pageSize": "每页",
-    "forward.pageInfo": "第 {page} / {pages} 页",
-    "forward.allEgress": "全部出口节点",
-    "forward.sortAsc": "升序",
-    "forward.sortDesc": "降序",
-    "forward.copyForward": "复制转发",
-    "forward.copySuffix": "（副本）",
-    "forward.bindingUsageUsed": "被 {count} 条转发使用",
-    "forward.autoPortNotice": "未填写监听端口 = 由系统自动分配；实际端口在保存后确定。",
-    "forward.autoPortPlaceholder": "自动分配",
-    "forward.listenPortFixed": "指定端口必须落在该入口节点的可用端口区间内，保存后立即生效。",
-    "forward.portPlaceholder": "20001",
-    // ── V4-WP9 批量操作（可逆动作；批量删除被有意排除，见 reports/v4-wp9-plan.md §3）──
-    "forward.selectAll": "全选本页",
-    "forward.selectRow": "选择该转发",
-    "forward.batchSelected": "已选 {count} 条",
-    "forward.batchRetry": "批量重试",
-    "forward.batchSuspend": "批量暂停",
-    "forward.batchResume": "批量恢复",
-    "forward.batchClear": "取消选择",
-    "forward.batchResult": "成功 {succeeded} 条，失败 {failed} 条",
-    "forward.batchLimit": "一次最多处理 {max} 条，请分批执行",
-    "forward.batchPartial": "有 {failed} 条未成功，可单独重试",
-    "forward.batchFailed": "批量操作失败",
-  },
-  en: {
-    "forward.pagePrev": "Previous page",
-    "forward.pageNext": "Next page",
-    "forward.pageSize": "Per page",
-    "forward.pageInfo": "Page {page} of {pages}",
-    "forward.allEgress": "All egress nodes",
-    "forward.sortAsc": "Ascending",
-    "forward.sortDesc": "Descending",
-    "forward.copyForward": "Duplicate forward",
-    "forward.copySuffix": " (copy)",
-    "forward.bindingUsageUsed": "Used by {count} forward(s)",
-    "forward.autoPortNotice":
-      "No listen port = the system assigns one automatically; the real port is fixed only after saving.",
-    "forward.autoPortPlaceholder": "Automatic",
-    "forward.listenPortFixed":
-      "A fixed port must fall inside this ingress node's available port range and applies immediately.",
-    "forward.portPlaceholder": "20001",
-    // ── V4-WP9 batch actions (reversible only; bulk delete is deliberately
-    //    excluded — see reports/v4-wp9-plan.md §3) ──
-    "forward.selectAll": "Select this page",
-    "forward.selectRow": "Select this forward",
-    "forward.batchSelected": "{count} selected",
-    "forward.batchRetry": "Retry selected",
-    "forward.batchSuspend": "Suspend selected",
-    "forward.batchResume": "Resume selected",
-    "forward.batchClear": "Clear selection",
-    "forward.batchResult": "{succeeded} succeeded, {failed} failed",
-    "forward.batchLimit": "At most {max} at a time — please run it in batches",
-    "forward.batchPartial": "{failed} could not be applied; retry them individually",
-    "forward.batchFailed": "Batch action failed",
-  },
-} as const;
-
-export type ForwardListTextKey = keyof (typeof FORWARD_LIST_TEXT)["zh"];
-
-/** 词条优先、回落兜底（见 {@link FORWARD_LIST_TEXT}）。 */
-export function forwardListText(
-  t: (key: string, params?: Record<string, string | number>) => string,
-  locale: Locale,
-  key: ForwardListTextKey,
-  params?: Record<string, string | number>,
-): string {
-  const translated = t(key, params);
-  if (translated !== key) return translated;
-  return interpolate(FORWARD_LIST_TEXT[locale][key], params);
-}
+export {
+  FORWARD_BATCH_MAX_IDS,
+  FORWARD_DEFAULT_ORDER,
+  FORWARD_DEFAULT_PAGE_SIZE,
+  FORWARD_DEFAULT_SORT,
+  FORWARD_PAGE_SIZE_OPTIONS,
+  clampForwardPage,
+  forwardListQuery,
+  forwardListText,
+  forwardNextSort,
+  forwardPageCount,
+} from "@/components/forwards/forward-list-model";
+import {
+  FORWARD_BATCH_MAX_IDS,
+  FORWARD_DEFAULT_ORDER,
+  FORWARD_DEFAULT_PAGE_SIZE,
+  FORWARD_DEFAULT_SORT,
+  FORWARD_PAGE_SIZE_OPTIONS,
+  clampForwardPage,
+  forwardListQuery,
+  forwardListText,
+  forwardNextSort,
+  forwardPageCount,
+  type ForwardListState,
+  type ForwardListTextKey,
+  type ForwardModeFilter,
+  type ForwardStatusFilter,
+  type ForwardSortKey,
+  type ForwardSortOrder,
+} from "@/components/forwards/forward-list-model";
 
 function isIngress(node: UserNode) {
   return node.role === "ingress" || node.role === "both";
@@ -327,44 +99,6 @@ const EMPTY_FORWARD: PortForward = {
   target_port: null,
   created_at: "",
 } as PortForward;
-
-/** 可点表头（后端 sort 白名单里本表真实展示的列）。 */
-function SortableHead({
-  label,
-  sortKey,
-  sort,
-  order,
-  onSort,
-}: {
-  label: string;
-  sortKey: ForwardSortKey;
-  sort: ForwardSortKey;
-  order: ForwardSortOrder;
-  onSort: (key: ForwardSortKey) => void;
-}) {
-  const active = sort === sortKey;
-  return (
-    <TableHead aria-sort={active ? (order === "asc" ? "ascending" : "descending") : "none"}>
-      <button
-        type="button"
-        className="inline-flex items-center gap-1 text-left hover:underline"
-        onClick={() => onSort(sortKey)}
-        data-testid={`forward-sort-${sortKey}`}
-      >
-        {label}
-        {active ? (
-          order === "asc" ? (
-            <ArrowUp className="size-3" />
-          ) : (
-            <ArrowDown className="size-3" />
-          )
-        ) : (
-          <ArrowUpDown className="size-3 opacity-40" />
-        )}
-      </button>
-    </TableHead>
-  );
-}
 
 export function ForwardWorkspace() {
   const { t, locale } = useI18n();
@@ -395,23 +129,7 @@ export function ForwardWorkspace() {
   const [reloadToken, setReloadToken] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
-  const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
-  const [name, setName] = useState("");
-  /**
-   * V5-WP5-A1：创建表单的协议选择。取值只能是契约白名单里的值
-   * （`lib/forward-protocol.ts` 的 `FORWARD_PROTOCOLS`），下拉里没有第四个值、
-   * 也没有 `wss`（§6.1：`wss` 不是一个协议名）。
-   */
-  const [protocol, setProtocol] = useState<ForwardProtocol>(DEFAULT_FORWARD_PROTOCOL);
-  /** tls 入口的证书/私钥路径（节点本地绝对路径；面板只发路径，不发密钥内容）。 */
-  const [tlsCertPath, setTlsCertPath] = useState("");
-  const [tlsKeyPath, setTlsKeyPath] = useState("");
-  const [ingressId, setIngressId] = useState("");
-  const [egressId, setEgressId] = useState("");
-  const [listenPort, setListenPort] = useState("");
-  const [targetHost, setTargetHost] = useState("");
-  const [targetPort, setTargetPort] = useState("");
-  const [bindEgressId, setBindEgressId] = useState("");
+  const [createDraft, setCreateDraft] = useState(() => emptyForwardCreateDraft("direct"));
   const [bindingBusy, setBindingBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<number | null>(null);
@@ -446,10 +164,10 @@ export function ForwardWorkspace() {
     for (const [key, value] of Object.entries(bindings)) out[String(key)] = value;
     return out;
   }, [bindings]);
-  const selectedBindings = ingressId ? bindings[Number(ingressId)] ?? [] : [];
+  const selectedBindings = createDraft.ingressId ? bindings[Number(createDraft.ingressId)] ?? [] : [];
   const availableEgressNodes = useMemo(() => {
-    if (!ingressId) return [];
-    const ingress = Number(ingressId);
+    if (!createDraft.ingressId) return [];
+    const ingress = Number(createDraft.ingressId);
     const bound = new Set(
       (bindings[ingress] ?? []).map((binding) => Number(binding.egress_node_id)),
     );
@@ -459,7 +177,7 @@ export function ForwardWorkspace() {
         Number(node.id) !== ingress &&
         !bound.has(Number(node.id)),
     );
-  }, [nodes, bindings, ingressId]);
+  }, [nodes, bindings, createDraft.ingressId]);
 
   const pageCount = forwardPageCount(total, pageSize);
   const hasFilters =
@@ -645,22 +363,10 @@ export function ForwardWorkspace() {
 
   function openCreate(mode: "direct" | "relay") {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const filteredIngress =
-      ingressFilter !== "all"
-        ? ingressNodes.find((node) => String(node.id) === ingressFilter)
-        : undefined;
-    const firstIngress = filteredIngress ?? ingressNodes[0];
-    setCreateMode(mode);
-    setName("");
-    setProtocol(DEFAULT_FORWARD_PROTOCOL);
-    setTlsCertPath("");
-    setTlsKeyPath("");
-    setIngressId(firstIngress ? String(firstIngress.id) : "");
-    setEgressId("");
-    setListenPort("");
-    setTargetHost("");
-    setTargetPort("");
-    setBindEgressId("");
+    const filteredIngress = ingressFilter !== "all"
+      ? ingressNodes.find((node) => String(node.id) === ingressFilter)
+      : undefined;
+    setCreateDraft(emptyForwardCreateDraft(mode, filteredIngress ?? ingressNodes[0]));
     setCreateOpen(true);
   }
 
@@ -678,25 +384,14 @@ export function ForwardWorkspace() {
    */
   function copyForward(forward: PortForward) {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const draft = forwardCopyDraft(forward, L("forward.copySuffix"));
-    setCreateMode(draft.mode);
-    setName(draft.name);
-    setProtocol(draft.protocol);
-    setTlsCertPath(draft.tlsCertPath);
-    setTlsKeyPath(draft.tlsKeyPath);
-    setIngressId(draft.ingressId);
-    setEgressId(draft.egressId);
-    setListenPort(draft.listenPort);
-    setTargetHost(draft.targetHost);
-    setTargetPort(draft.targetPort);
-    setBindEgressId("");
+    setCreateDraft(copiedForwardCreateDraft(forward, L("forward.copySuffix")));
     setCreateOpen(true);
   }
 
   async function bindSelectedEgress() {
     if (!canManageNodes) { toast.error(PERMISSION_DENIED); return; }
-    const ingress = Number(ingressId);
-    const egress = Number(bindEgressId);
+    const ingress = Number(createDraft.ingressId);
+    const egress = Number(createDraft.bindEgressId);
     if (!Number.isInteger(ingress) || !Number.isInteger(egress)) return;
 
     setBindingBusy(true);
@@ -711,8 +406,7 @@ export function ForwardWorkspace() {
           : [...existing, binding];
         return { ...current, [ingress]: next };
       });
-      setEgressId(String(binding.egress_node_id));
-      setBindEgressId("");
+      setCreateDraft((draft) => ({ ...draft, egressId: String(binding.egress_node_id), bindEgressId: "" }));
       toast.success(t("node.bindSuccess"));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("forward.bindFailed"));
@@ -730,16 +424,16 @@ export function ForwardWorkspace() {
    * 协议会清空路径输入）。
    */
   const protocolErrors = useMemo(
-    () => tlsPathFieldErrors(protocol, tlsCertPath, tlsKeyPath),
-    [protocol, tlsCertPath, tlsKeyPath],
+    () => tlsPathFieldErrors(createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath),
+    [createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath],
   );
   const protocolReady = Object.keys(protocolErrors).length === 0;
   async function createForward() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const ingress = Number(ingressId);
-    const targetPortNum = Number(targetPort);
-    const listenPortNum = listenPort ? Number(listenPort) : null;
-    if (!name.trim() || !Number.isInteger(ingress) || !targetHost.trim() || !targetPort) {
+    const ingress = Number(createDraft.ingressId);
+    const targetPortNum = Number(createDraft.targetPort);
+    const listenPortNum = createDraft.listenPort ? Number(createDraft.listenPort) : null;
+    if (!createDraft.name.trim() || !Number.isInteger(ingress) || !createDraft.targetHost.trim() || !createDraft.targetPort) {
       toast.error(t("forward.createFailed"));
       return;
     }
@@ -752,7 +446,7 @@ export function ForwardWorkspace() {
       toast.error(t("forward.createFailed"));
       return;
     }
-    if (createMode === "relay" && !egressId) {
+    if (createDraft.mode === "relay" && !createDraft.egressId) {
       toast.error(t("forward.chooseEgress"));
       return;
     }
@@ -767,16 +461,16 @@ export function ForwardWorkspace() {
     setBusy(true);
     try {
       const created = await api.forwards.create({
-        mode: createMode,
+        mode: createDraft.mode,
         ingress_node_id: ingress,
-        name: name.trim(),
+        name: createDraft.name.trim(),
         listen_port: listenPortNum,
-        target_host: targetHost.trim(),
+        target_host: createDraft.targetHost.trim(),
         target_port: targetPortNum,
-        egress_node_id: createMode === "relay" ? Number(egressId) : null,
+        egress_node_id: createDraft.mode === "relay" ? Number(createDraft.egressId) : null,
         // 协议与（仅 tls 的）路径由同一个纯函数生成：非 tls 的请求里两个路径键
         // 结构上不存在，不存在「发出去再让 Agent 决定忽略」的字段。
-        ...forwardProtocolFields(protocol, tlsCertPath, tlsKeyPath),
+        ...forwardProtocolFields(createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath),
       });
       setCreatedForward(created);
       setCreateOpen(false);
@@ -922,122 +616,19 @@ export function ForwardWorkspace() {
   return (
     <div className="flex flex-col gap-5">
       {!can("forward:update") && <p className="text-sm text-[var(--muted-foreground)]">只读：当前有效权限不允许修改转发。</p>}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            size="sm"
-            variant={modeFilter === "all" ? "default" : "outline"}
-            onClick={() => changeFilter(setModeFilter, "all")}
-          >
-            {t("forward.all")}
-          </Button>
-          <Button
-            size="sm"
-            variant={modeFilter === "direct" ? "default" : "outline"}
-            onClick={() => changeFilter(setModeFilter, "direct")}
-          >
-            {t("forward.direct")}
-          </Button>
-          <Button
-            size="sm"
-            variant={modeFilter === "relay" ? "default" : "outline"}
-            onClick={() => changeFilter(setModeFilter, "relay")}
-          >
-            {t("forward.relay")}
-          </Button>
-          <Input
-            className="h-9 w-64"
-            value={keywordInput}
-            onChange={(event) => setKeywordInput(event.target.value)}
-            placeholder={t("forward.searchPlaceholder")}
-            data-testid="forward-keyword"
-          />
-          <Select value={statusFilter} onValueChange={(value) => changeFilter(setStatusFilter, value as ForwardStatusFilter)}>
-            <SelectTrigger className="h-9 w-40">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("forward.statusAll")}</SelectItem>
-              <SelectItem value="active">{t("forward.statusActive")}</SelectItem>
-              <SelectItem value="pending">{t("forward.statusPending")}</SelectItem>
-              <SelectItem value="applying">{t("tunnel.v3ApplyApplying")}</SelectItem>
-              <SelectItem value="suspended">{t("forward.statusSuspended")}</SelectItem>
-              <SelectItem value="error">{t("forward.statusError")}</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={ingressFilter} onValueChange={(value) => changeFilter(setIngressFilter, value)}>
-            <SelectTrigger className="h-9 w-48">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("forward.allIngress")}</SelectItem>
-              {ingressNodes.map((node) => (
-                <SelectItem key={String(node.id)} value={String(node.id)}>
-                  {node.node_id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={egressFilter} onValueChange={(value) => changeFilter(setEgressFilter, value)}>
-            <SelectTrigger className="h-9 w-48" data-testid="forward-egress-filter">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{L("forward.allEgress")}</SelectItem>
-              {egressNodes.map((node) => (
-                <SelectItem key={String(node.id)} value={String(node.id)}>
-                  {node.node_id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button disabled={!canCreate} variant="outline" onClick={() => openCreate("direct")}>
-            <Plus className="size-4" />
-            {t("forward.createDirect")}
-          </Button>
-          <Button disabled={!canCreate} onClick={() => openCreate("relay")}>
-            <Route className="size-4" />
-            {t("forward.createRelay")}
-          </Button>
-        </div>
-      </div>
+      <ForwardToolbar
+        mode={modeFilter} status={statusFilter} ingress={ingressFilter} egress={egressFilter}
+        keyword={keywordInput} ingressNodes={ingressNodes} egressNodes={egressNodes} canCreate={canCreate}
+        t={t} text={L}
+        onMode={(value) => changeFilter(setModeFilter, value)}
+        onStatus={(value) => changeFilter(setStatusFilter, value)}
+        onIngress={(value) => changeFilter(setIngressFilter, value)}
+        onEgress={(value) => changeFilter(setEgressFilter, value)}
+        onKeyword={setKeywordInput}
+        onCreate={openCreate}
+      />
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTotal")}</div>
-            <div className="mt-1 text-2xl font-semibold">{summary?.total ?? (loading ? "—" : 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
-              {t("forward.direct")} {summary?.direct ?? 0} · {t("forward.relay")} {summary?.relay ?? 0}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorActive")}</div>
-            <div className="mt-1 text-2xl font-semibold">{summary?.active ?? (loading ? "—" : 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">
-              {t("forward.statusPending")} {summary?.pending ?? 0} · {t("forward.statusSuspended")} {summary?.suspended ?? 0}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttention")}</div>
-            <div className="mt-1 text-2xl font-semibold">{summary?.error ?? (loading ? "—" : 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttentionHint")}</div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTraffic")}</div>
-            <div className="mt-1 text-2xl font-semibold">{formatBytes(summary?.traffic ?? 0)}</div>
-            <div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorTrafficHint")}</div>
-          </CardContent>
-        </Card>
-      </div>
+      <ForwardSummaryCards summary={summary} loading={loading} t={t} />
 
       {error ? (
         <div
@@ -1052,608 +643,88 @@ export function ForwardWorkspace() {
         </div>
       ) : null}
 
-      {/*
-        V4-WP9 §13.6 批量操作栏：仅在选中 ≥1 条时出现，避免占用常态空间。
-        只提供可逆动作（重试 / 暂停 / 恢复）——批量删除被有意排除，
-        理由见 reports/v4-wp9-plan.md §3（不可逆 + 部分成功无法解释）。
-      */}
-      {selectedIds.size > 0 ? (
-        <div
-          className="flex flex-wrap items-center gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--muted)]/40 p-3"
-          data-testid="forward-batch-bar"
-        >
-          <span className="text-sm font-medium" data-testid="forward-batch-count">
-            {L("forward.batchSelected", { count: selectedIds.size })}
-          </span>
-          <Button
-            size="sm"
-            variant="outline"
-            data-testid="forward-batch-retry"
-            disabled={batchBusy}
-            onClick={() => void runBatch("retry")}
-          >
-            {batchBusy ? <Loader2 className="size-4 animate-spin" /> : null}
-            {L("forward.batchRetry")}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            data-testid="forward-batch-suspend"
-            disabled={batchBusy}
-            onClick={() => void runBatch("suspend")}
-          >
-            {L("forward.batchSuspend")}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            data-testid="forward-batch-resume"
-            disabled={batchBusy}
-            onClick={() => void runBatch("resume")}
-          >
-            {L("forward.batchResume")}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            data-testid="forward-batch-clear"
-            disabled={batchBusy}
-            onClick={clearSelection}
-          >
-            {L("forward.batchClear")}
-          </Button>
-          {batchError ? (
-            <span className="text-xs text-[var(--destructive)]" role="alert" data-testid="forward-batch-error">
-              {batchError}
-            </span>
-          ) : null}
-        </div>
-      ) : null}
+      <ForwardBatchBar
+        count={selectedIds.size}
+        busy={batchBusy}
+        error={batchError}
+        text={L}
+        onRun={(action) => void runBatch(action)}
+        onClear={clearSelection}
+      />
 
       {/* 出错时不能落到「还没建转发」的空态：那会把一次加载失败讲成「你没有数据」 */}
       {!loading && !error && total === 0 && !hasFilters ? (
-        <div className="grid gap-4 md:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <ArrowLeftRight className="size-5" />
-                {t("forward.createDirect")}
-              </CardTitle>
-              <CardDescription>{t("forward.directDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Button disabled={!canCreate} onClick={() => openCreate("direct")}>{t("forward.createDirect")}</Button>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Route className="size-5" />
-                {t("forward.createRelay")}
-              </CardTitle>
-              <CardDescription>{t("forward.relayDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Button disabled={!canCreate} onClick={() => openCreate("relay")}>{t("forward.createRelay")}</Button>
-            </CardContent>
-          </Card>
-        </div>
+        <ForwardEmptyState canCreate={canCreate} t={t} onCreate={openCreate} />
       ) : (
         <div className="flex flex-col gap-3">
-          <div
-            className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] p-3"
-            data-testid="forward-list-controls"
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-[var(--muted-foreground)]">{t("fields.orderBy")}</span>
-              <Select
-                value={sort}
-                onValueChange={(value) => {
-                  setSort(value as ForwardSortKey);
-                  setPage(1);
-                }}
-              >
-                <SelectTrigger className="h-9 w-36" data-testid="forward-sort-select">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="order_by">{t("fields.orderBy")}</SelectItem>
-                  <SelectItem value="name">{t("common.name")}</SelectItem>
-                  <SelectItem value="mode">{t("forward.mode")}</SelectItem>
-                  <SelectItem value="listen_port">{t("forward.listenPort")}</SelectItem>
-                  <SelectItem value="status">{t("common.status")}</SelectItem>
-                  <SelectItem value="created_at">{t("common.createdAt")}</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button
-                size="sm"
-                variant="outline"
-                data-testid="forward-sort-order"
-                aria-label={order === "asc" ? L("forward.sortAsc") : L("forward.sortDesc")}
-                onClick={() => {
-                  setOrder(order === "asc" ? "desc" : "asc");
-                  setPage(1);
-                }}
-              >
-                {order === "asc" ? <ArrowUp className="size-4" /> : <ArrowDown className="size-4" />}
-              </Button>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs text-[var(--muted-foreground)]" data-testid="forward-total">
-                {t("common.total")} {total} {t("common.items")}
-              </span>
-              <span className="text-xs text-[var(--muted-foreground)]">{L("forward.pageSize")}</span>
-              <Select
-                value={String(pageSize)}
-                onValueChange={(value) => {
-                  setPageSize(Number(value));
-                  setPage(1);
-                }}
-              >
-                <SelectTrigger className="h-9 w-24" data-testid="forward-page-size">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {FORWARD_PAGE_SIZE_OPTIONS.map((size) => (
-                    <SelectItem key={size} value={String(size)}>
-                      {size}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                size="icon"
-                variant="outline"
-                data-testid="forward-page-prev"
-                aria-label={L("forward.pagePrev")}
-                disabled={loading || page <= 1}
-                onClick={() => setPage((current) => Math.max(1, current - 1))}
-              >
-                <ChevronLeft className="size-4" />
-              </Button>
-              <span className="text-xs text-[var(--muted-foreground)]" data-testid="forward-page-info">
-                {L("forward.pageInfo", { page, pages: pageCount })}
-              </span>
-              <Button
-                size="icon"
-                variant="outline"
-                data-testid="forward-page-next"
-                aria-label={L("forward.pageNext")}
-                disabled={loading || page >= pageCount}
-                onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
-              >
-                <ChevronRight className="size-4" />
-              </Button>
-            </div>
-          </div>
+          <ForwardListControls
+            loading={loading}
+            total={total}
+            page={page}
+            pageCount={pageCount}
+            pageSize={pageSize}
+            sort={sort}
+            order={order}
+            t={t}
+            text={L}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+            onSortChange={(nextSort) => {
+              setSort(nextSort);
+              setPage(1);
+            }}
+            onOrderChange={(nextOrder) => {
+              setOrder(nextOrder);
+              setPage(1);
+            }}
+          />
 
-          <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)]">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-10">
-                    <input
-                      type="checkbox"
-                      className="size-4 cursor-pointer"
-                      data-testid="forward-select-all"
-                      aria-label={L("forward.selectAll")}
-                      disabled={!can("forward:update") || pageIds.length === 0}
-                      checked={allPageSelected}
-                      onChange={(event) => toggleSelectAllOnPage(event.target.checked)}
-                    />
-                  </TableHead>
-                  <SortableHead
-                    label={t("common.name")}
-                    sortKey="name"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <SortableHead
-                    label={t("forward.mode")}
-                    sortKey="mode"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  {/* V5-WP5-A1：协议列。与「模式」是两个维度，不共用一格。 */}
-                  <TableHead>{t("forward.protocol")}</TableHead>
-                  <TableHead>{t("forward.ingressNode")}</TableHead>
-                  <TableHead>{t("forward.egressNode")}</TableHead>
-                  <SortableHead
-                    label={t("forward.listenPort")}
-                    sortKey="listen_port"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <TableHead>{t("forward.accessAddress")}</TableHead>
-                  <TableHead>{t("forward.target")}</TableHead>
-                  <SortableHead
-                    label={t("common.status")}
-                    sortKey="status"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <SortableHead
-                    label={t("common.createdAt")}
-                    sortKey="created_at"
-                    sort={sort}
-                    order={order}
-                    onSort={toggleSort}
-                  />
-                  <TableHead className="w-12" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {loading ? (
-                  <TableRow>
-                    <TableCell colSpan={12} className="h-24 text-center text-[var(--muted-foreground)]">
-                      {t("common.loading")}
-                    </TableCell>
-                  </TableRow>
-                ) : forwards.length === 0 ? (
-                  <TableEmpty colSpan={12} text={t("common.noData")} />
-                ) : (
-                  forwards.map((forward) => (
-                    <TableRow key={String(forward.id)}>
-                      <TableCell>
-                        <input
-                          type="checkbox"
-                          className="size-4 cursor-pointer"
-                          data-testid={`forward-select-${forward.id}`}
-                          aria-label={L("forward.selectRow")}
-                          disabled={!canForward(forward, "update")}
-                          checked={selectedIds.has(Number(forward.id))}
-                          onChange={(event) =>
-                            toggleSelected(Number(forward.id), event.target.checked)
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="font-medium">
-                        <Link href={"/forwards/" + forward.id} className="hover:underline">
-                          {forward.name}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>
-                          {forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        {/* 共用徽标：`tls` / `ws` / 历史 `wss` 都照实渲染，无 unknown 兜底。 */}
-                        <ForwardProtocolBadge forward={forward} />
-                      </TableCell>
-                      <TableCell>{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
-                      <TableCell>{forward.egress_node?.node_id ?? "—"}</TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {forwardAccessAddress(forward) ?? t("forward.addressPending")}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {forward.target_host ?? "—"}{forward.target_port ? ":" + forward.target_port : ""}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-col gap-1">
-                          {(() => {
-                            // V4-WP8 §13.7：产品状态取代 raw apply_status 枚举
-                            //（唯一实现见 lib/forward-status.ts）。
-                            const product = forwardProductStatus(forward);
-                            return (
-                              <Badge
-                                variant={forwardProductBadgeVariant(product.state)}
-                                data-testid={`forward-status-${forward.id}`}
-                              >
-                                {t(`forward.product.${product.state}`)}
-                              </Badge>
-                            );
-                          })()}
-                          {forward.apply_error ? (
-                            /* V4-WP8 §13.5：先给「下一步」，原文仍保留（排障用）。 */
-                            <span className="max-w-52 text-xs text-[var(--destructive)]">
-                              {applyErrorAction(locale, forward.apply_error_code) ? (
-                                <span className="block">
-                                  {applyErrorAction(locale, forward.apply_error_code)}
-                                </span>
-                              ) : null}
-                              <span className="block truncate font-mono opacity-70">
-                                {forward.apply_error}
-                              </span>
-                            </span>
-                          ) : null}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-xs text-[var(--muted-foreground)]">
-                        {formatDateTime(forward.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button variant="ghost" size="icon" disabled={actionBusy === Number(forward.id)}>
-                              <MoreHorizontal className="size-4" />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            {canForward(forward, "update") && forward.apply_status === "error" ? (
-                              <DropdownMenuItem onClick={() => void runAction(forward, "retry")}>
-                                {t("forward.retry")}
-                              </DropdownMenuItem>
-                            ) : null}
-                            {canForward(forward, "update") && forward.apply_status === "active" ? (
-                              <DropdownMenuItem onClick={() => void runAction(forward, "suspend")}>
-                                {t("forward.suspend")}
-                              </DropdownMenuItem>
-                            ) : null}
-                            {canForward(forward, "update") && forward.apply_status === "suspended" ? (
-                              <DropdownMenuItem onClick={() => void runAction(forward, "resume")}>
-                                {t("forward.resume")}
-                              </DropdownMenuItem>
-                            ) : null}
-                            <DropdownMenuItem disabled={!canForward(forward, "update")} onClick={() => setEditTarget(forward)}>
-                              <Pencil className="size-4" />
-                              {t("forward.editForward")}
-                            </DropdownMenuItem>
-                            {/* V4-WP9 §13.6：复制 = 同一份 create 契约再建一条（端口自动分配）。 */}
-                            <DropdownMenuItem
-                              disabled={!canCreate}
-                               data-testid={`forward-copy-${forward.id}`}
-                              onClick={() => copyForward(forward)}
-                            >
-                              <Copy className="size-4" />
-                              {L("forward.copyForward")}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem disabled={!canForward(forward, "delete")} className="text-[var(--destructive)]" onClick={() => void removeForward(forward)}>
-                              <Trash2 className="size-4" />
-                              {t("common.delete")}
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </div>
+          <ForwardTable
+            forwards={forwards}
+            loading={loading}
+            sort={sort}
+            order={order}
+            selectedIds={selectedIds}
+            allPageSelected={allPageSelected}
+            canUpdateAny={can("forward:update")}
+            canCreate={canCreate}
+            actionBusy={actionBusy}
+            locale={locale}
+            t={t}
+            text={L}
+            canUpdate={(forward) => canForward(forward, "update")}
+            canDelete={(forward) => canForward(forward, "delete")}
+            onSort={toggleSort}
+            onSelectAll={toggleSelectAllOnPage}
+            onSelect={toggleSelected}
+            onAction={(forward, action) => void runAction(forward, action)}
+            onEdit={setEditTarget}
+            onCopy={copyForward}
+            onDelete={(forward) => void removeForward(forward)}
+          />
         </div>
       )}
 
-      <Dialog open={createOpen && canCreate} onOpenChange={setCreateOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
-            </DialogTitle>
-            <DialogDescription>
-              {createMode === "relay" ? t("forward.relayDesc") : t("forward.directDesc")}
-            </DialogDescription>
-          </DialogHeader>
-
-          {ingressNodes.length === 0 ? (
-            <div className="rounded-md border border-[var(--border)] p-4 text-sm text-[var(--muted-foreground)]">
-              {t("forward.noIngress")}
-            </div>
-          ) : (
-            <div className="flex flex-col gap-4">
-              <Field label={t("common.name")}>
-                <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="web-hk" />
-              </Field>
-
-              {/*
-                协议选项逐一来自契约白名单（`FORWARD_PROTOCOLS`），
-                没有第四个值、也没有 `wss` —— §6.1 把「分帧（ws）」与「传输安全（tls）」
-                分成两个维度，`wss` 这种合并名正是 WP0 拆掉的东西。
-              */}
-              <Field label={t("forward.protocol")} hint={forwardProtocolNote(locale, protocol)}>
-                <Select
-                  value={protocol}
-                  onValueChange={(value) => {
-                    const next = value as ForwardProtocol;
-                    setProtocol(next);
-                    // 离开 tls 时清空路径：否则「协议=tcp + 残留的证书路径」会被
-                    // 后端 400（非 tls 不得携带路径）。与 mode→direct 清空出口同一
-                    // 处理方式：切换后不让上一个形态的输入留在表单里。
-                    if (next !== "tls") {
-                      setTlsCertPath("");
-                      setTlsKeyPath("");
-                    }
-                  }}
-                >
-                  <SelectTrigger data-testid="forward-protocol-select">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {FORWARD_PROTOCOLS.map((value) => (
-                      <SelectItem key={value} value={value} data-testid={`forward-protocol-${value}`}>
-                        {forwardProtocolLabel(value)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              {/*
-                tls 才出现的两个必填字段。节点本地绝对路径 —— 面板只把路径写进
-                期望配置，证书与私钥文件本身始终留在节点上（§6.1：证书归运维）。
-                两个都填齐之前提交按钮是禁用的（见 DialogFooter 的 disabled）。
-              */}
-              {protocol === "tls" ? (
-                <>
-                  <Field
-                    label={t("forward.tlsCertPath")}
-                    hint={t("forward.tlsPathsHint")}
-                    error={protocolErrors.tls_cert_path ? t(protocolErrors.tls_cert_path) : undefined}
-                  >
-                    <Input
-                      value={tlsCertPath}
-                      maxLength={FORWARD_TLS_PATH_MAX}
-                      placeholder="/etc/tunex/tls/front.crt"
-                      data-testid="forward-tls-cert-path"
-                      // 必填语义给到无障碍树（表单没有原生 submit，按钮闸门在 Footer）
-                      required
-                      aria-invalid={protocolErrors.tls_cert_path ? true : undefined}
-                      onChange={(event) => setTlsCertPath(event.target.value)}
-                    />
-                  </Field>
-                  <Field
-                    label={t("forward.tlsKeyPath")}
-                    error={protocolErrors.tls_key_path ? t(protocolErrors.tls_key_path) : undefined}
-                  >
-                    <Input
-                      value={tlsKeyPath}
-                      maxLength={FORWARD_TLS_PATH_MAX}
-                      placeholder="/etc/tunex/tls/front.key"
-                      data-testid="forward-tls-key-path"
-                      required
-                      aria-invalid={protocolErrors.tls_key_path ? true : undefined}
-                      onChange={(event) => setTlsKeyPath(event.target.value)}
-                    />
-                  </Field>
-                </>
-              ) : null}
-
-              <Field label={t("forward.ingressNode")}>
-                <Select
-                  value={ingressId}
-                  onValueChange={(value) => {
-                    setIngressId(value);
-                    setEgressId("");
-                    setBindEgressId("");
-                  }}
-                >
-                  <SelectTrigger><SelectValue placeholder={t("forward.chooseIngress")} /></SelectTrigger>
-                  <SelectContent>
-                    {ingressNodes.map((node) => (
-                      <SelectItem key={String(node.id)} value={String(node.id)}>
-                        {node.node_id} · {node.connect_ip ?? t("node.waiting")}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              {createMode === "relay" ? (
-                <Field label={t("forward.egressNode")}>
-                  <div className="flex flex-col gap-3">
-                    {selectedBindings.length > 0 ? (
-                      <Select value={egressId} onValueChange={setEgressId}>
-                        <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
-                        <SelectContent>
-                          {selectedBindings.map((binding) => (
-                            <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
-                              {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
-                              {/*
-                               * V4-WP9 §13.6「Binding usage」：使用量是后端响应投影
-                               * （`used_by_forward_count`），前端不重算；选出出口时就能
-                               * 看到它已经被多少条中继占用，而不是解绑时被 409 告知。
-                               */}
-                              {hasBindingUsage(binding)
-                                ? ` · ${L("forward.bindingUsageUsed", {
-                                    count: bindingUsageView(binding).used_by_forward_count,
-                                  })}`
-                                : ""}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
-                        <div>{t("forward.noBoundEgress")}</div>
-                        <div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div>
-                      </div>
-                    )}
-
-                    {canManageNodes && availableEgressNodes.length > 0 ? (
-                      <div className="rounded-md border border-[var(--border)] p-3">
-                        <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">
-                          {selectedBindings.length > 0
-                            ? t("forward.bindAnotherEgress")
-                            : t("forward.bindInline")}
-                        </div>
-                        <div className="flex flex-col gap-2 sm:flex-row">
-                          <Select value={bindEgressId} onValueChange={setBindEgressId}>
-                            <SelectTrigger className="min-w-0 flex-1">
-                              <SelectValue placeholder={t("forward.chooseUnboundEgress")} />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {availableEgressNodes.map((node) => (
-                                <SelectItem key={String(node.id)} value={String(node.id)}>
-                                  {node.node_id} · {node.connect_ip ?? t("node.waiting")}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            onClick={() => void bindSelectedEgress()}
-                            disabled={bindingBusy || !bindEgressId}
-                          >
-                            {t("forward.bindAndUse")}
-                          </Button>
-                        </div>
-                      </div>
-                    ) : selectedBindings.length === 0 ? (
-                      <div className="text-xs text-[var(--muted-foreground)]">
-                        {t("forward.noAvailableEgress")}{" "}
-                        <Link href="/nodes" className="underline underline-offset-2">
-                          {t("common.nodes")}
-                        </Link>
-                      </div>
-                    ) : null}
-                  </div>
-                </Field>
-              ) : null}
-
-              {/*
-               * 空值 = 自动分配。提示与占位符都走 `forward-copy.ts` 的纯逻辑，
-               * 保证「空」永远被渲染成文字而不是一个看起来像真值的端口号。
-               */}
-              <Field label={t("forward.listenPort")} hint={L(listenPortHintKey(listenPort))}>
-                <Input
-                  inputMode="numeric"
-                  value={listenPort}
-                  onChange={(event) => setListenPort(event.target.value)}
-                  placeholder={L(listenPortPlaceholderKey(listenPort))}
-                  data-testid="forward-listen-port"
-                />
-              </Field>
-              <Field label={t("forward.targetHost")}>
-                <Input value={targetHost} onChange={(event) => setTargetHost(event.target.value)} placeholder="example.com" />
-              </Field>
-              <Field label={t("forward.targetPort")}>
-                <Input
-                  inputMode="numeric"
-                  value={targetPort}
-                  onChange={(event) => setTargetPort(event.target.value)}
-                  placeholder="443"
-                />
-              </Field>
-
-            </div>
-          )}
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setCreateOpen(false)}>{t("common.cancel")}</Button>
-            <Button
-              onClick={() => void createForward()}
-              disabled={
-                busy ||
-                ingressNodes.length === 0 ||
-                // V5-WP5-A1：tls 的两个路径没填齐 → 提交按钮点不动
-                // （「tls 但没有证书」不是一种可提交的状态）。
-                !protocolReady ||
-                (createMode === "relay" && (!egressId || selectedBindings.length === 0))
-              }
-            >
-              {createMode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ForwardCreateDialog
+        open={createOpen && canCreate}
+        draft={createDraft}
+        ingressNodes={ingressNodes}
+        selectedBindings={selectedBindings}
+        availableEgressNodes={availableEgressNodes}
+        canManageNodes={canManageNodes}
+        bindingBusy={bindingBusy}
+        busy={busy}
+        locale={locale}
+        t={t}
+        text={L}
+        onOpenChange={setCreateOpen}
+        onDraftChange={setCreateDraft}
+        onBindEgress={() => void bindSelectedEgress()}
+        onCreate={() => void createForward()}
+      />
 
       <Dialog open={createdForward !== null} onOpenChange={(open) => !open && setCreatedForward(null)}>
         <DialogContent>
@@ -1696,26 +767,3 @@ export function ForwardWorkspace() {
   );
 }
 
-function Field({
-  label,
-  hint,
-  error,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  /** 形态预检错误（已本地化文本）。与 hint 并列显示：错误说「怎么改」。 */
-  error?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <Label>{label}</Label>
-      {children}
-      {error ? (
-        <p className="text-xs text-[var(--destructive)]">{error}</p>
-      ) : null}
-      {hint ? <p className="text-xs text-[var(--muted-foreground)]">{hint}</p> : null}
-    </div>
-  );
-}
