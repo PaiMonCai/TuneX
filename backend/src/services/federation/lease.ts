@@ -465,6 +465,7 @@ export interface LeaseDb {
     findUnique(args: unknown): Promise<unknown>;
     create(args: unknown): Promise<unknown>;
     update(args: unknown): Promise<unknown>;
+    updateMany(args: unknown): Promise<{ count: number }>;
   };
   /** apply / teardown 需要节点的编排投影（id / node_id / connect_ip / role）。 */
   node: {
@@ -721,14 +722,27 @@ export async function claimLeaseIntent(
     return { kind: "in_flight", row: existing };
   }
 
+  // CAS 接管：普通 update 会让两个并发请求都成功把同一行写成 pending，
+  // 从而都拿到 claimed 并重复执行。把“我刚刚读到的状态 + created_at”一起放进
+  // updateMany 的 where；赢家同时把 created_at 刷到本次认领时刻，既能区分 stale
+  // pending，也会重新开始 in-flight TTL。只有真正改到 1 行的请求才拥有执行权。
   try {
-    await d.federationIntent.update({
-      where: { intent_id_revision_action: key },
-      data: { status: INTENT_STATUS.pending, error_code: null },
+    const takeover = await d.federationIntent.updateMany({
+      where: {
+        id: existing.id,
+        status: existing.status,
+        created_at: existing.created_at,
+      },
+      data: {
+        status: INTENT_STATUS.pending,
+        error_code: null,
+        created_at: input.now,
+      },
     });
-    return { kind: "claimed" };
+    if (takeover.count === 1) return { kind: "claimed" };
+    return { kind: "in_flight", row: existing };
   } catch {
-    // 接管失败（别人抢先）→ 让调用方稍后重投，仍然不重复执行。
+    // 接管失败（别人抢先 / DB 瞬时失败）→ 让调用方稍后重投，仍然不重复执行。
     return { kind: "in_flight", row: existing };
   }
 }
