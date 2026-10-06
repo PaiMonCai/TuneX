@@ -29,7 +29,7 @@ func pickLoop(l *LoadBalancer, n int) map[string]int {
 }
 
 // pickLoopParallel hammers Select from many goroutines. Under -race it is the
-// guard against a data race on the cursor / slot tables (WP5 also requires the
+// guard against a data race on the cursor / slot tables (the data plane also requires the
 // egress path to stay race-free, and Select is on the hot path).
 func pickLoopParallel(b *testing.B, l *LoadBalancer, goroutines int) {
 	b.Helper()

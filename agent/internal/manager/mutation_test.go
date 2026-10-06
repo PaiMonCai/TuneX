@@ -7,7 +7,7 @@ import (
 )
 
 // The mutation hook is what lets the durable last-known-good cache follow an
-// applied change instead of a periodic sample (WP11A/A3). Two properties matter:
+// applied change instead of a periodic sample. Two properties matter:
 // it fires when the running registry really changed, and it stays silent for an
 // idempotent apply — a repeat of the same revision must not look like new work.
 

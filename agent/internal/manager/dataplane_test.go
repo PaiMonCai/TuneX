@@ -34,7 +34,7 @@ func addrFor(port int) string { return fmt.Sprintf("127.0.0.1:%d", port) }
 
 // echoServer echoes everything back. It is the stand-in for a real target: a
 // connection through the relay proves the data plane, which no mock can
-// (DEVELOPMENT.md §9 "WP5 起的数据平面能力必须增加真实网络测试").
+// These are real-network data-plane tests.
 func echoServer(t *testing.T) (addr string, stop func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -235,7 +235,7 @@ func ids(list []forwarder.TunnelConfig) []string {
 // the real RELAY data plane: ingress relay -> egress pool -> target
 // ---------------------------------------------------------------------------
 
-// relayTopology wires the v3 RELAY chain the way a real node pair does:
+// relayTopology wires the RELAY chain the way a real node pair does:
 //
 //	client -> RelayForwarder(ingress) -> EgressForwarder -> target
 //
@@ -303,7 +303,7 @@ func TestRelayChainLargeTrafficBothDirections(t *testing.T) {
 	})
 
 	// 4 MiB each way: many 32 KiB relay-loop iterations in both directions
-	// through both hops. This is the WP5 "双向大流量" case.
+	// through both hops. This is the bidirectional large-transfer case.
 	bulkRoundTrip(t, tp.ingress, 4<<20)
 
 	want := int64(2 * 4 << 20)
@@ -334,7 +334,7 @@ func TestRelayChainHotUpdateSwitchesTarget(t *testing.T) {
 	}
 
 	// The hot update changes what the NEXT connection gets, without
-	// touching either listener (devmap §5.3).
+	// touching either listener.
 	if err := tp.em.UpdateTargets("eg", WeightedRoundRobin, []forwarder.Target{
 		{Host: "127.0.0.1", Port: bPort, Weight: 1},
 	}); err != nil {
@@ -521,7 +521,7 @@ func TestDisconnectCleanupReleasesRelayPair(t *testing.T) {
 	}
 
 	// Disconnect from the client side. The relay must notice and release the
-	// relayed pair rather than pinning goroutines forever (WP5 DoD).
+	// relayed pair rather than pinning goroutines forever.
 	conn.Close()
 	if !waitFor(t, "relay pair released", 10*time.Second, func() bool {
 		return tp.tm.LiveConns("ing") == 0 && tp.tm.LiveConns("eg") == 0

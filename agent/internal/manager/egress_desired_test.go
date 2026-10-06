@@ -6,7 +6,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// V5.2-WP5: DesiredTargets is the ONLY accessor the target observer enumerates
+// DesiredTargets is the only accessor the target observer enumerates
 // from, so "observe only the targets of this node's desired state" is a property
 // of the manager, not of the observer's good behaviour. These tests pin the two
 // facts the observer depends on: every served pool is covered, and the result is

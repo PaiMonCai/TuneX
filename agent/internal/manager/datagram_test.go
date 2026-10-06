@@ -11,7 +11,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// V5.1b WP5-B1 — UDP DIRECT through the ONE TunnelManager.
+// UDP DIRECT through the single TunnelManager.
 //
 // These tests exist for the same reason single_manager_guard_test.go does: the
 // datagram runtime must be owned by the existing registry, revision ledger, port
@@ -228,7 +228,7 @@ func TestUDPRefusedOnRelayAndEgressLeavesNoPortReserved(t *testing.T) {
 	tm := NewTunnelManager(NewEgressManager(), "127.0.0.1")
 	defer tm.StopAll()
 
-	// WP5-B2 opened both datagram roles, so "refused because the role is closed" is
+	// Both datagram relay roles are supported, so "refused because the role is closed" is
 	// no longer the trigger. What is still refused is a config that cannot work: the
 	// hop has no handshake to imply its fields, so a missing one is a hard error.
 	// The invariant this test guards is unchanged — a REFUSED apply must leave no
@@ -257,7 +257,7 @@ func TestUDPRefusedOnRelayAndEgressLeavesNoPortReserved(t *testing.T) {
 		t.Fatalf("a refused apply must not reserve a port, got %v", ports)
 	}
 
-	// The positive direction, which is what WP5-B2 added: supplying the field the hop
+	// Positive direction: supplying the field the hop
 	// needs makes the same role apply — and then it DOES hold its port.
 	relayOK := relayBare.Clone()
 	relayOK.NextHop = "127.0.0.1:3040"
