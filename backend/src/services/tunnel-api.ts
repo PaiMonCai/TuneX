@@ -252,6 +252,8 @@ export interface TunnelApiDeps {
   ) => Promise<T>;
   /** Existing runtime use, not new-resource quota. Tests may inject this gate. */
   runtimeUse?: (workspaceId: number, resource: RuntimeUseResource) => Promise<RuntimeUseDenied | null>;
+  /** Release every active NodePortLease only after runtime teardown is confirmed. */
+  releasePortLeases?: (tunnelId: number) => Promise<boolean>;
   /** 覆盖「现在」（测试注入固定时间）。 */
   now?: () => Date;
 }
@@ -264,12 +266,15 @@ function resolveDeps(over: TunnelApiDeps | undefined): {
   applyDirect: (tunnelId: number, orchestrator: Orchestrator, deps?: unknown) => Promise<ApplyDirectResult>;
   runtimeUse: NonNullable<TunnelApiDeps["runtimeUse"]>;
   quotaLock: NonNullable<TunnelApiDeps["quotaLock"]>;
+  releasePortLeases: NonNullable<TunnelApiDeps["releasePortLeases"]>;
   now: () => Date;
 } {
   return {
     db: over?.db ?? (db as unknown as TunnelApiDb),
     loadPolicy: over?.loadPolicy ?? ((workspaceId: number) => getEffectivePolicy(workspaceId, { noCache: true })),
     runtimeUse: over?.runtimeUse ?? ((workspaceId, resource) => checkForwardRuntimeUse(workspaceId, resource)),
+    releasePortLeases:
+      over?.releasePortLeases ?? ((tunnelId) => releaseLease({ tunnelId })),
     quotaLock:
       over?.quotaLock ??
       ((workspaceId, fn) =>
@@ -917,17 +922,32 @@ export async function runTunnelAction(
       }
     }
 
-    // Runtime is now confirmed down. A lease-release failure is a safe leak (the
-    // allocator remains conservative), so it must not resurrect an already
-    // withdrawn runtime; dangling leases remain recoverable by lease reconcile.
-    await releaseLease({ tunnelId }).catch(() => {});
+    // Runtime is confirmed down, but keep the durable Tunnel until port
+    // ownership is also durably released. NodePortLease uses ON DELETE SET NULL:
+    // deleting first would turn a failed release into an orphan active lease.
+    try {
+      await deps.releasePortLeases(tunnelId);
+    } catch (error) {
+      return err(
+        "db_unavailable",
+        "runtime 已撤除，但端口租约释放失败；Tunnel 已保留以便重试：" +
+          (error instanceof Error ? error.message : String(error)),
+      );
+    }
+
     // Runtime-owned relational rows may be removed, but traffic is an immutable
-    // accounting ledger. tunnel_traffic deliberately has no Tunnel FK and survives
-    // this delete with its archived workspace_id attribution intact.
-    await pdb.tunnelChain?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
-    await pdb.tunnel.delete({ where: { id: tunnel.id } }).catch((e: unknown) => {
-      throw toTunnelApiError(e, "删除失败");
-    });
+    // accounting ledger and deliberately survives this delete.
+    try {
+      if (pdb.tunnelChain) {
+        await pdb.tunnelChain.deleteMany({ where: { tunnel_id: tunnel.id } });
+      }
+      await pdb.tunnel.delete({ where: { id: tunnel.id } });
+    } catch (error) {
+      return toTunnelApiError(
+        error,
+        "runtime 已撤除，但删除 Tunnel 账本失败；请重试",
+      );
+    }
     return { ok: true, tunnelId: tunnel.id, action, revision: 0 };
   }
 
