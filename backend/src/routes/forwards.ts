@@ -128,7 +128,7 @@ function send<T>(
   return c.json({ data: result.data }, successStatus);
 }
 
-const ForwardCreateSchema = z
+export const ForwardCreateSchema = z
   .object({
     name: z.string().trim().min(1).max(60),
     mode: z.enum(["direct", "relay"]),
@@ -162,7 +162,7 @@ const ForwardCreateSchema = z
  * `expected_revision` 是可选的乐观并发凭据，不是筛选条件——缺失说明客户端是
  * 首次请求或有意跳过并发检查；存在但不匹配 → 409（见 patchForward 内闸门）。
  */
-const ForwardPatchSchema = z
+export const ForwardPatchSchema = z
   .object({
     name: z.string().trim().min(1).max(60).optional(),
     mode: z.enum(["direct", "relay"]).optional(),
