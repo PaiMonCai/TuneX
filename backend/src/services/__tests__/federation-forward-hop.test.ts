@@ -30,6 +30,7 @@ import {
   federatedLegVisibleError,
   reconcileFederatedForwardHealth,
   releaseFederatedEgress,
+  releaseStaleFederatedEgressForTunnel,
   validateFederatedEgressDeclaration,
   type ForwardHopDb,
   type ForwardHopSendOutcome,
@@ -792,6 +793,51 @@ describe("G. 释放：移除声明 / 改回本机出口 / 删除 Forward 共用�
     expect(released.message).toContain("本地镜像记账失败");
   });
 
+  it("G9. stale cleanup 的 placement 读取失败必须抛出，不能伪装 evaluated=0", async () => {
+    const made = fakeDb();
+    made.db.federationPlacement.findMany = async () => {
+      throw new Error("stale placement db unavailable");
+    };
+
+    await expect(
+      releaseStaleFederatedEgressForTunnel(42, 6, deps(made.db, fakeSender(() => OK).sender)),
+    ).rejects.toThrow("stale placement db unavailable");
+  });
+
+  it("G10. stale cleanup 会检查全部非终态代，不用 take=20 截断后继续创建新一代", async () => {
+    const made = fakeDb();
+    for (let revision = 1; revision <= 25; revision++) {
+      made.placements.push(placementRow({ desired_revision: revision, state: "active" }));
+      made.placements.at(-1)!.intent_id = `fw-42-${revision}`;
+      made.placements.at(-1)!.lease_ref = `lease-${revision}`;
+    }
+    const { sender, calls } = fakeSender(() => OK);
+
+    const result = await releaseStaleFederatedEgressForTunnel(
+      42,
+      25,
+      deps(made.db, sender),
+    );
+
+    expect(result.evaluated).toBe(25);
+    expect(result.released).toBe(24);
+    expect(result.failed).toEqual([]);
+    expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(24);
+  });
+
+  it("G11. scheduler source treats stale cleanup as a hard precondition, never log-and-continue", async () => {
+    const scheduler = await Bun.file(new URL("../scheduler.ts", import.meta.url).pathname).text();
+    const start = scheduler.indexOf("let stale: Awaited<ReturnType<typeof releaseStaleFederatedEgressForTunnel>>");
+    const end = scheduler.indexOf("const delegated = await delegateFederatedEgress", start);
+    const block = scheduler.slice(start, end);
+
+    expect(block).toContain("stale_release_lookup_failed");
+    expect(block).toContain("SCHEDULER_ERROR_CODES.compensation_failed");
+    expect(block).toContain("if (stale.failed.length > 0)");
+    expect(block).toContain("return fail(");
+    expect(block).not.toContain("ok: true");
+  });
+
   it("G6. 行在但从未建成远端腿（reserve 就失败）⇒ 释放不得把 degraded 抹成 expired", async () => {
     // 这条守的是"可解释性"：reserve 失败留下的 degraded(unreachable) 是下一步动作的
     // 依据（等对账/等网络恢复）；把它写成 expired 会让它看起来像"这件事已经结束"。
@@ -1079,6 +1125,76 @@ describe("H. 恢复必须重建整条腿（F1：只重建了远端半条腿）",
     expect(summary.recovery_triggered).toBe(0);
     expect(summary.recovery_failed).toBe(0);
     expect(summary.skipped).toBe(1);
+  });
+
+  it("H19. placement ledger 读取失败必须抛给 Reconciler，不能返回全 0 假成功", async () => {
+    const made = fakeDb({ tunnels: [federatedTunnel()] });
+    made.db.federationPlacement.findMany = async () => {
+      throw new Error("health placement db unavailable");
+    };
+
+    await expect(
+      reconcileFederatedForwardHealth({}, { db: made.db, now: () => new Date() }),
+    ).rejects.toThrow("health placement db unavailable");
+  });
+
+  it("H20. 可见状态写库失败必须抛出，marked_unhealthy 不能假增", async () => {
+    const made = fakeDb({ tunnels: [federatedTunnel()] });
+    made.placements.push(placementRow({ state: "degraded" }));
+    made.db.tunnel!.updateMany = async () => {
+      throw new Error("tunnel status write failed");
+    };
+
+    await expect(
+      reconcileFederatedForwardHealth({}, { db: made.db, now: () => new Date() }),
+    ).rejects.toThrow("tunnel status write failed");
+    expect(made.tunnels[0]!.apply_status).toBe("active");
+  });
+
+  it("H21. CAS 丢失表示并发状态已变化：跳过，不声称 marked_unhealthy", async () => {
+    const made = fakeDb({ tunnels: [federatedTunnel()] });
+    made.placements.push(placementRow({ state: "degraded" }));
+    made.db.tunnel!.updateMany = async () => ({ count: 0 });
+
+    const summary = await reconcileFederatedForwardHealth(
+      {},
+      { db: made.db, now: () => new Date() },
+    );
+
+    expect(summary.marked_unhealthy).toBe(0);
+    expect(summary.skipped).toBe(1);
+    expect(made.tunnels[0]!.apply_status).toBe("active");
+  });
+
+  it("H22. rollout ledger 读取失败时不触发第二次恢复", async () => {
+    const made = fakeDb({
+      tunnels: [
+        federatedTunnel({
+          apply_status: "error",
+          apply_error_code: FEDERATED_LEG_ERROR_CODES.degraded,
+        }),
+      ],
+    });
+    made.placements.push(placementRow({ state: "active" }));
+    made.db.forwardRollout!.findMany = async () => {
+      throw new Error("rollout ledger unavailable");
+    };
+    let restarts = 0;
+
+    await expect(
+      reconcileFederatedForwardHealth(
+        {},
+        {
+          db: made.db,
+          now: () => new Date(),
+          restartRollout: async () => {
+            restarts++;
+            return { ok: true };
+          },
+        },
+      ),
+    ).rejects.toThrow("rollout ledger unavailable");
+    expect(restarts).toBe(0);
   });
 
   it("H16. 读取器可选：没有 tunnel 端口时安全返回（不抛）", async () => {
