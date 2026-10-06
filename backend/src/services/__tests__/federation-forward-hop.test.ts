@@ -568,6 +568,22 @@ describe("D. 委托一条远端出口腿（契约 §3.2 两阶段）", () => {
     expect(calls).toHaveLength(0);
     expect(placements).toHaveLength(0);
   });
+
+  it("D5. 同 revision 的 placement 已终态 ⇒ 不复活 intent、不重新 reserve", async () => {
+    const made = fakeDb();
+    made.placements.push(placementRow({ state: "expired" }));
+    const { sender, calls } = fakeSender(() => reserveBody());
+
+    const outcome = await delegateFederatedEgress(REQUEST, deps(made.db, sender));
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("lease_expired");
+      expect(outcome.message).toContain("终态 expired");
+    }
+    expect(calls).toHaveLength(0);
+    expect(made.placements[0]!.state).toBe("expired");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -673,6 +689,94 @@ describe("E. 补偿：apply 失败必须立刻释放远端腿（契约 §3.3）"
     if (outcome.ok) {
       expect(outcome.next_hop).toBeNull();
       expect(outcome.node_address).toBeNull();
+    }
+  });
+
+  it("E6. reserve 已成功但本地 lease 镜像写失败 ⇒ 立即 DELETE 远端租约", async () => {
+    const made = fakeDb();
+    made.db.federationPlacement.updateMany = async () => {
+      throw new Error("ledger write unavailable");
+    };
+    const { sender, calls } = fakeSender((call) => {
+      if (call.method === "DELETE") return OK;
+      return reserveBody();
+    });
+
+    const outcome = await delegateFederatedEgress(REQUEST, deps(made.db, sender));
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("internal_error");
+      expect(outcome.compensated).toBe(true);
+      expect(outcome.lease_ref).toBe("lease-1");
+      expect(outcome.message).toContain("本地 lease 镜像写入失败");
+      expect(outcome.message).toContain("本地恢复账本缺失");
+    }
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "POST /api/federation/v1/leases",
+      "DELETE /api/federation/v1/leases/lease-1",
+    ]);
+  });
+
+  it("E7. apply 成功但 active 镜像写失败 ⇒ 补偿远端腿，不留下无法追踪的 active runtime", async () => {
+    const made = fakeDb();
+    const originalUpdate = made.db.federationPlacement.updateMany.bind(
+      made.db.federationPlacement,
+    );
+    let writes = 0;
+    made.db.federationPlacement.updateMany = async (args: unknown) => {
+      writes++;
+      if (writes === 2) throw new Error("active mirror unavailable");
+      return originalUpdate(args);
+    };
+    const { sender, calls } = fakeSender((call) => {
+      if (call.method === "DELETE") return OK;
+      if (call.path.endsWith("/apply")) return applyBody(5);
+      return reserveBody();
+    });
+
+    const outcome = await delegateFederatedEgress(REQUEST, deps(made.db, sender));
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("internal_error");
+      expect(outcome.compensated).toBe(true);
+      expect(outcome.message).toContain("本地 active 镜像写入失败");
+    }
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "POST /api/federation/v1/leases",
+      "POST /api/federation/v1/leases/lease-1/apply",
+      "DELETE /api/federation/v1/leases/lease-1",
+    ]);
+    expect(made.placements[0]).toMatchObject({
+      lease_ref: "lease-1",
+      state: "degraded",
+      last_error_code: "internal_error",
+    });
+  });
+
+  it("E8. 主失败可见但 failure mirror 也失败 ⇒ 返回中明确暴露恢复账本缺失", async () => {
+    const made = fakeDb();
+    made.db.federationPlacement.updateMany = async () => {
+      throw new Error("mirror db down");
+    };
+    const { sender } = fakeSender(() => ({
+      ok: false,
+      code: "peer_unreachable",
+      status: 0,
+      message: "peer timeout",
+      retryable: true,
+      messageId: "m-fail",
+    }));
+
+    const outcome = await delegateFederatedEgress(REQUEST, deps(made.db, sender));
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("peer_unreachable");
+      expect(outcome.message).toContain("peer timeout");
+      expect(outcome.message).toContain("本地恢复账本缺失");
+      expect(outcome.message).toContain("mirror db down");
     }
   });
 });
