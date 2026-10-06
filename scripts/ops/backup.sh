@@ -12,7 +12,7 @@
 #   · 一致性：mysqldump 使用 --single-transaction（InnoDB MVCC），不锁表、不阻塞租户。
 #   · 二进制日志：compose 用 --skip-log-bin，dump 即恢复到导出时刻的完整状态。
 #   · 完整性：每次备份生成 SHA256 校验和 + manifest JSON，恢复前强制校验。
-#   · 加密：备份文件使用 openssl AES-256-GCM 加密（口令来自 BACKUP_PASSPHRASE 或
+#   · 加密：备份文件使用 OpenSSL AES-256-CBC + PBKDF2 加密（口令来自 BACKUP_PASSPHRASE 或
 #     operator 交互输入），落盘 filename.enc + filename.enc.sha256。
 #   · 保留策略：每日保留 N 份（默认 14），超出按时间淘汰；本地 + 可选异地 rsync。
 #
@@ -195,7 +195,6 @@ cp "$PROJECT_ROOT/scripts/ops/backup.sh" "$CFG_DIR/" 2>/dev/null || true
   # WP11D: the unified image drives backend/worker/web; the retired per-service
   # variables are no longer recorded as if they described this deployment.
   echo "tunex_image=$(docker image inspect "${TUNEX_IMAGE:-ghcr.io/paimoncai/tunex:latest}" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo unknown)"
-  echo "web_image=$(docker image inspect "${TUNEX_WEB_IMAGE:-ghcr.io/paimoncai/tunex-web:latest}" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo unknown)"
   echo "mysql_rows=$MYSQL_ROWS"
   echo "redis_keys=$REDIS_KEYS"
 } > "$CFG_DIR/VERSION"
