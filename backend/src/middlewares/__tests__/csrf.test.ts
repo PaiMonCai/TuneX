@@ -13,10 +13,17 @@ import type { AppVariables } from "../auth.ts";
  * 外加 Hono 接线层（真实 header → 403 响应体）。
  */
 
-// env.ts 会 requireSecret 三个密钥，测试环境必须先 mock 掉它（与 mail-tokens /
-// config-generator-ports 同一模式）。路径必须与 csrf.ts 内解析到的同一文件。
+// 路径必须与 csrf.ts 内解析到的同一文件。
 const MODULE_ENV = new URL("../../env.ts", import.meta.url).pathname;
-mock.module(MODULE_ENV, () => ({ env: { cookieName: "access" } }));
+// **替身必须语义完整**（2026-10-07）：`mock.module` 是**进程级**注册表，先加载者生效，
+// 一个缺段的 env 替身会泄漏给同进程的其它测试文件 —— 例如缺 `mail` 时
+// `services/mail.ts:isMailConfigured()` 会读 `env.mail.host` 并抛 TypeError，把别人的
+// 真实会话测试打红（且单独跑是绿的，极难归因）。
+// 所以这里改成"**真实 env + 只覆盖本用例要钉的字段**"：真实模块在 `bun test` 下可 import
+// （`bunfig.toml` 的 preload 已给 DATABASE_URL / AUTH_SECRET 基线），替身因此天然覆盖
+// 全部段，包括 `mail`。守卫见 `services/__tests__/mock-isolation-guard.test.ts`。
+const realEnv = await import(MODULE_ENV);
+mock.module(MODULE_ENV, () => ({ ...realEnv, env: { ...realEnv.env, cookieName: "access" } }));
 
 const { checkCsrf, isCsrfExempt, createCsrfMiddleware, CSRF_EXEMPT_PATTERNS } =
   await import("../csrf.ts");

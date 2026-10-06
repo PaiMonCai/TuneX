@@ -1,5 +1,14 @@
 /**
- * SMTP 会话的**真实**行为测试：起一个真 TCP 假服务器，跑真实 `SmtpClient`／`sendMail()`。
+ * SMTP 会话的**真实**行为测试：起一个真 TCP 假服务器，跑真实 `SmtpClient`。
+ *
+ * ── 为什么这里**只**驱动 `SmtpClient`（不调 `sendMail()`、不设 `SMTP_*`）──
+ * `mock.module()` 是**进程级**注册表（先加载者生效）：别的测试文件如果注册了一个不含 `mail`
+ * 键的 `env.ts` 部分替身，任何"类内读 `env`"的代码在全量跑里就会炸，而单独跑却是绿的
+ * （本仓已为这类"替身泄漏"付过学费）。所以：
+ *   · 生产配置由 `sendMail()` 从 `env.mail` 取出后**作为构造入参**交给客户端；
+ *   · 本文件只验"给一份配置就能跑完一次真实会话"，与 env 完全解耦；
+ *   · `sendMail()` 这一层的真实证据由 task-14 的**真机 A/B 探针**给出
+ *     （同一个会发问候语的假 SMTP：修复前 `smtp_error`，修复后 `sent:true`，正文到达）。
  *
  * ── 为什么以前没发现这个缺陷 ──
  * 仓里从来没有跑过真实的 SMTP 会话（既有测试都走 `setMailTransportForTest()` 注入替身），
@@ -130,17 +139,22 @@ function startFakeSmtp(initial: Mode): FakeSmtp {
 }
 
 const fake = startFakeSmtp("greeting");
-// `env.ts` 在 import 期快照 SMTP_* ⇒ 必须在 import `mail.ts` **之前**设好。
-process.env.SMTP_HOST = "127.0.0.1";
-process.env.SMTP_PORT = String(fake.port);
-process.env.SMTP_USER = "sender@example.com";
-process.env.SMTP_PASS = "s3cret";
-process.env.SMTP_FROM = "sender@example.com";
-process.env.SMTP_SECURE = "false";
 
-const { sendMail, SmtpClient } = await import("../mail.ts");
+const { SmtpClient } = await import("../mail.ts");
 
 const MESSAGE = { to: "ops@example.com", subject: "[TuneX] test", text: "line one\nline two" };
+const CONFIG = { user: "sender@example.com", pass: "s3cret", from: "sender@example.com", secure: false };
+
+/** 用**显式配置**跑一次真实会话（零 env 依赖）。 */
+async function sendOnce(options: { replyTimeoutMs?: number } = {}): Promise<void> {
+  const client = new SmtpClient("127.0.0.1", fake.port, { ...CONFIG, ...options });
+  try {
+    await client.connect();
+    await client.send(MESSAGE);
+  } finally {
+    client.close();
+  }
+}
 
 function resetRecordings(): void {
   fake.commands.length = 0;
@@ -148,11 +162,10 @@ function resetRecordings(): void {
 }
 
 describe("SMTP 真实会话：问候语必须先被读掉", () => {
-  test("有 220 问候语 ⇒ sendMail 成功，且命令顺序正确（修复前这里必然失败）", async () => {
+  test("有 220 问候语 ⇒ 会话走完，且命令顺序正确（修复前这里必然失败）", async () => {
     fake.setMode("greeting");
     resetRecordings();
-    const result = await sendMail(MESSAGE);
-    expect(result).toEqual({ sent: true });
+    await sendOnce();
     // AUTH 之后的两行（base64 用户名/口令）由状态机消费，不作为命令记录 ——
     // 它们出现过与否由"这一封真的发出去了"证明。
     expect(fake.commands.map((line) => line.split(" ")[0])).toEqual([
@@ -176,17 +189,22 @@ describe("SMTP 真实会话：问候语必须先被读掉", () => {
   test("多行问候语（220-… 后接 220 …）同样被正确读掉", async () => {
     fake.setMode("multiline");
     resetRecordings();
-    const result = await sendMail(MESSAGE);
-    expect(result).toEqual({ sent: true });
+    await sendOnce();
     expect(fake.messages).toHaveLength(1);
     expect(fake.commands[0]).toBe("EHLO tunex.local");
   });
 
-  test("问候语不是 220（554）⇒ 失败，且**一条命令都不发**（fail-closed）", async () => {
+  test("问候语不是 220（554）⇒ 抛错，且**一条命令都不发**（fail-closed）", async () => {
     fake.setMode("bad");
     resetRecordings();
-    const result = await sendMail(MESSAGE);
-    expect(result).toEqual({ sent: false, reason: "smtp_error" });
+    let message = "";
+    try {
+      await sendOnce();
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("SMTP 问候语异常");
+    expect(message).toContain("554");
     expect(fake.commands).toEqual([]);
     expect(fake.messages).toEqual([]);
   });
@@ -194,14 +212,11 @@ describe("SMTP 真实会话：问候语必须先被读掉", () => {
   test("服务器完全不说话 ⇒ 读取超时 = 失败（不假装成功、也不发命令）", async () => {
     fake.setMode("silent");
     resetRecordings();
-    const client = new SmtpClient("127.0.0.1", fake.port, { replyTimeoutMs: 150 });
     let message = "";
     try {
-      await client.connect();
+      await sendOnce({ replyTimeoutMs: 150 });
     } catch (err) {
       message = err instanceof Error ? err.message : String(err);
-    } finally {
-      client.close();
     }
     expect(message).toContain("SMTP 应答超时");
     expect(fake.commands).toEqual([]);

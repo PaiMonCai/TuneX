@@ -54,14 +54,27 @@ export interface MailResult {
   log?: string;
 }
 
+/**
+ * 安全读取 `env.mail` 段。
+ *
+ * **读不到就是"没配置"**（一个可解释的结论），不是 `TypeError`：`env` 段可能因为替换、
+ * 半初始化、或测试里的模块替身而整体缺失，让发信路径直接崩掉（而不是给出"未配置 → 降级为日志"）
+ * 是不可接受的 —— 邮件是旁路，旁路崩掉还会把主链路拖下水。
+ */
+function mailSection(): Partial<typeof env.mail> {
+  const section = (env as { mail?: typeof env.mail } | null | undefined)?.mail;
+  return section && typeof section === "object" ? section : {};
+}
+
 /** host/port/user/pass/from 五项齐备才算「已配置」。 */
 export function isMailConfigured(): boolean {
-  return Boolean(env.mail.host && env.mail.port && env.mail.user && env.mail.pass && env.mail.from);
+  const mail = mailSection();
+  return Boolean(mail.host && mail.port && mail.user && mail.pass && mail.from);
 }
 
 /** 脱敏后的发件账号（日志安全）。 */
 function maskedUser(): string {
-  const u = env.mail.user;
+  const u = mailSection().user ?? "";
   const at = u.indexOf("@");
   if (at <= 0) return "***";
   return `${u.slice(0, 1)}***${u.slice(at)}`;
@@ -70,6 +83,17 @@ function maskedUser(): string {
 interface SmtpReply {
   code: number;
   text: string;
+}
+
+/** 一次会话需要的全部配置。**由调用方给出**（生产 = `sendMail()` 从 `env.mail` 取）。 */
+export interface SmtpClientOptions {
+  readonly user: string;
+  readonly pass: string;
+  readonly from: string;
+  /** STARTTLS / 隐式 TLS 开关（生产：`env.mail.secure`）。 */
+  readonly secure?: boolean;
+  /** 单条应答的等待上限（默认 15s）。可注入**只为测试**：验证"服务器不说话 ⇒ 失败而不是假装成功"这条路径时不应该真的等 15 秒。 */
+  readonly replyTimeoutMs?: number;
 }
 
 /**
@@ -85,19 +109,28 @@ export class SmtpClient {
   private pending: SmtpReply[] = [];
   private waiter: ((reply: SmtpReply) => void) | null = null;
 
+  /**
+   * ── 为什么配置是**构造入参**而不是类内读 `env` ──
+   * ① 依赖方向正确：只有 `sendMail()` 知道"配置从哪来"（今天是 env，N-F1 之后可能是 DB）；
+   *    客户端只管"用这份配置跑一次会话"。
+   * ② 它让真实会话**可以被测试驱动而不依赖全局 env**：`mock.module("env.ts", …)` 是**进程级**
+   *    注册表（先加载者生效），任何别的测试文件注册一个不含 `mail` 的部分替身，就会让
+   *    "类内读 env"的实现在全量跑里炸（本仓已经有过同类现场）。
+   */
   constructor(
     private readonly host: string,
     private readonly port: number,
-    /**
-     * 单条应答的等待上限（默认 15s）。可注入**只为测试**：验证"服务器不说话 ⇒ 失败而不是
-     * 假装成功"这条路径时不应该真的等 15 秒。
-     */
-    private readonly options: { replyTimeoutMs?: number } = {},
+    private readonly options: SmtpClientOptions,
   ) {}
+
+  /** 隐式 TLS（465 + secure）与 STARTTLS（secure 非 465）的判定只看**本实例**的配置。 */
+  private get implicitTls(): boolean {
+    return this.options.secure === true && this.port === 465;
+  }
 
   async connect(): Promise<void> {
     // 465（implicit TLS）与显式配置 secure 的端口先建 TLS；其余明文 + 后续 STARTTLS。
-    if (env.mail.secure && env.mail.port === 465) {
+    if (this.implicitTls) {
       this.socket = tls.connect({ host: this.host, port: this.port, servername: this.host });
     } else {
       this.socket = net.connect({ host: this.host, port: this.port });
@@ -106,7 +139,7 @@ export class SmtpClient {
       const s = this.socket!;
       const onError = (e: Error) => reject(new Error(`SMTP 连接失败：${e.message}`));
       s.once("error", onError);
-      s.once(env.mail.port === 465 && env.mail.secure ? "secureConnect" : "connect", () => {
+      s.once(this.implicitTls ? "secureConnect" : "connect", () => {
         s.removeListener("error", onError);
         resolve();
       });
@@ -218,20 +251,20 @@ export class SmtpClient {
 
   async send(message: MailMessage): Promise<void> {
     await this.command("EHLO tunex.local", [250]);
-    if (!(env.mail.secure && this.port === 465)) {
-      if (env.mail.secure) await this.command("STARTTLS", [220]);
+    if (!this.implicitTls) {
+      if (this.options.secure === true) await this.command("STARTTLS", [220]);
       // STARTTLS 之后需要在新 socket 上重新 EHLO；本实现里 secure=true 且非 465 端口
       // 即代表 STARTTLS，下面是升级逻辑。
-      if (env.mail.secure && this.port !== 465) {
+      if (this.options.secure === true && this.port !== 465) {
         await this.upgrade();
         await this.command("EHLO tunex.local", [250]);
       }
     }
     await this.command("AUTH LOGIN", [334]);
-    await this.command(Buffer.from(env.mail.user, "utf8").toString("base64"), [334]);
-    await this.command(Buffer.from(env.mail.pass, "utf8").toString("base64"), [235]);
+    await this.command(Buffer.from(this.options.user, "utf8").toString("base64"), [334]);
+    await this.command(Buffer.from(this.options.pass, "utf8").toString("base64"), [235]);
 
-    const from = env.mail.from;
+    const from = this.options.from;
     await this.command(`MAIL FROM:<${from}>`, [250]);
     await this.command(`RCPT TO:<${message.to}>`, [250, 251]);
 
@@ -308,7 +341,13 @@ export async function sendMail(message: MailMessage): Promise<MailResult> {
     return { sent: false, reason: "smtp_not_configured", log };
   }
 
-  const client = new SmtpClient(env.mail.host, env.mail.port);
+  // 生产路径：配置从 `env.mail` 来（N-F1 若要改成"DB 优先"，改的就是这一处）。
+  const client = new SmtpClient(env.mail.host, env.mail.port, {
+    user: env.mail.user,
+    pass: env.mail.pass,
+    from: env.mail.from,
+    secure: env.mail.secure,
+  });
   try {
     await client.connect();
     await client.send(message);

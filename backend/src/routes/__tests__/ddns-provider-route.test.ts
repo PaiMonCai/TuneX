@@ -45,14 +45,28 @@ const realWorkspace = await import(WORKSPACE_MODULE);
 const calls: Array<{ action: string; resource: string }> = [];
 let deny = false;
 
-mock.module(WORKSPACE_MODULE, () => ({
-  ...realWorkspace,
-  resolveWorkspaceAccess: async (_c: unknown, action: string, resource: string) => {
-    calls.push({ action, resource });
-    if (deny) throw new HTTPException(403, { message: "工作空间角色无权操作" });
-    return { id: 7, role: "owner" as const, customPermissions: null };
-  },
-}));
+/**
+ * 交给 `mock.module` 的替身构造器。
+ *
+ * 抽成具名函数是为了能被下面的"防复发"断言**直接调用检查** —— 因为 Bun 的语义是：
+ * `mock.module` 只对**之后首次 import 该模块的文件**生效；本文件已经 import 过真实现，
+ * 所以从本文件里再怎么 `await import(...)` 拿到的都是**真实现**，看不到自己的替身
+ * （实测：同 specifier 与绝对路径 specifier 都返回真实现）。受害方永远是**另一个文件**，
+ * 这正是这个缺陷只在特定跑法下出现、且失败输出不带 `(fail)` 前缀的原因。
+ * 所以能钉住的就是"我们交给注册表的那个对象"。
+ */
+function buildWorkspaceMock(): Record<string, unknown> {
+  return {
+    ...realWorkspace,
+    resolveWorkspaceAccess: async (_c: unknown, action: string, resource: string) => {
+      calls.push({ action, resource });
+      if (deny) throw new HTTPException(403, { message: "工作空间角色无权操作" });
+      return { id: 7, role: "owner" as const, customPermissions: null };
+    },
+  };
+}
+
+mock.module(WORKSPACE_MODULE, buildWorkspaceMock);
 
 const { ddnsRoutes } = await import("../ddns.ts");
 
@@ -131,23 +145,35 @@ describe("V5-WP17.2: DNS provider 路由的权限接线", () => {
 /* ================================================================== */
 
 describe("替身语义完整（同进程其它测试依赖这一点）", () => {
-  test("mock 的导出集合包含真实模块的**每一个**运行时导出", async () => {
+  test("替身的导出集合 ⊇ 真实模块的**每一个**运行时导出", () => {
     // 这条守卫的存在理由：`mock.module` 是进程级替换，替身缺一个导出就会让**另一个
     // 文件**在加载阶段 SyntaxError `Export named 'X' not found`，而那种失败的输出
     // 没有 `(fail)` 前缀、只在特定跑法下出现 —— 极难归因（本文件 2026-10-07 就踩过）。
-    const mocked = (await import(WORKSPACE_MODULE)) as Record<string, unknown>;
-    const missing = Object.keys(realWorkspace).filter((name) => !(name in mocked));
+    //
+    // 断言对象是**交给注册表的那个对象**（`buildWorkspaceMock()`），不是 `await import()`：
+    // Bun 只对"之后首次 import 的文件"生效，本文件已经 import 过真实现，因此从本文件里
+    // 拿不到自己的替身（见 `buildWorkspaceMock` 的注释）。
+    const mock = buildWorkspaceMock();
+    const missing = Object.keys(realWorkspace).filter((name) => !(name in mock));
     expect(missing).toEqual([]);
-    // 反方向不要求相等：替身**允许**多给（今天就是多给了 `...realWorkspace` 之外的覆盖），
-    // 但少给一个都不行。用 `⊇` 而不是 `===`，正是为了让这条断言只表达纪律本身。
     expect(Object.keys(realWorkspace).length).toBeGreaterThan(0);
+    // 允许多给（今天就是"透传 + 覆盖一个"），但少给一个都不行 ⇒ 断言用 ⊇ 而不是 ===。
   });
 
-  test("替身确实换掉了那一个导出（否则上面的等式可能只是在自欺）", async () => {
-    const mocked = (await import(WORKSPACE_MODULE)) as Record<string, unknown>;
-    expect(mocked.resolveWorkspaceAccess).not.toBe(realWorkspace.resolveWorkspaceAccess);
-    // 其余导出必须是**真实现本体**（透传），不是重新包装的等价物。
-    expect(mocked.createPersonalWorkspace).toBe(realWorkspace.createPersonalWorkspace);
-    expect(mocked.resolveWorkspaceMembership).toBe(realWorkspace.resolveWorkspaceMembership);
+  test("替身确实换掉了那一个导出，其余仍是真实现本体（不是重新包装）", () => {
+    const mock = buildWorkspaceMock();
+    expect(mock.resolveWorkspaceAccess).not.toBe(realWorkspace.resolveWorkspaceAccess);
+    expect(mock.createPersonalWorkspace).toBe(realWorkspace.createPersonalWorkspace);
+    expect(mock.resolveWorkspaceMembership).toBe(realWorkspace.resolveWorkspaceMembership);
+  });
+
+  test("回归反例：手写的部分替身会被上面两条挡住", () => {
+    // 把 2026-10-07 之前的写法（只有 resolveWorkspaceAccess 的字面量）当作输入，
+    // 证明守卫**真的会红** —— 而不是一条恒真断言。
+    const partial: Record<string, unknown> = { resolveWorkspaceAccess: async () => ({}) };
+    const missing = Object.keys(realWorkspace).filter((name) => !(name in partial));
+    expect(missing).toContain("createPersonalWorkspace");
+    expect(missing).toContain("resolveWorkspaceMembership");
+    expect(missing.length).toBeGreaterThan(0);
   });
 });
