@@ -219,7 +219,7 @@ describe("E. 静态守卫：管理端与前端都必须真的有这个入口", (
     new URL("../../../../../web/src/components/admin/plans-manager.tsx", import.meta.url),
     "utf8",
   );
-  const WEB_API = readFileSync(new URL("../../../../../web/src/lib/api.ts", import.meta.url), "utf8");
+  const WEB_API = readFileSync(new URL("../../../../../web/src/lib/api/admin.ts", import.meta.url), "utf8");
 
   test("套餐 CRUD 的创建与更新都解析 `body.policy_id`（POST 与 PATCH 各一次）", () => {
     const hits = [...ADMIN_SOURCE.matchAll(/resolvePlanPolicyBinding\(tx, body\.policy_id\)/g)];
