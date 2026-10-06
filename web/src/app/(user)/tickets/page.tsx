@@ -1,7 +1,6 @@
 import { AppShell } from "@/components/app-shell";
 import { Suspense } from "react";
 import { TicketsBody } from "@/components/tickets/tickets-body";
-import { requireSession } from "@/components/app-shell";
 
 export default function TicketsPage() {
   return (
