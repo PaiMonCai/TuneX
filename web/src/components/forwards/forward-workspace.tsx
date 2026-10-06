@@ -34,6 +34,7 @@ import {
 import { ForwardEditDialog } from "@/components/forwards/forward-edit-dialog";
 import { ForwardListControls } from "@/components/forwards/forward-list-controls";
 import { ForwardTable } from "@/components/forwards/forward-table";
+import { copiedForwardCreateDraft, emptyForwardCreateDraft } from "@/components/forwards/forward-create-model";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -141,23 +142,7 @@ export function ForwardWorkspace() {
   const [reloadToken, setReloadToken] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
-  const [createMode, setCreateMode] = useState<"direct" | "relay">("direct");
-  const [name, setName] = useState("");
-  /**
-   * V5-WP5-A1：创建表单的协议选择。取值只能是契约白名单里的值
-   * （`lib/forward-protocol.ts` 的 `FORWARD_PROTOCOLS`），下拉里没有第四个值、
-   * 也没有 `wss`（§6.1：`wss` 不是一个协议名）。
-   */
-  const [protocol, setProtocol] = useState<ForwardProtocol>(DEFAULT_FORWARD_PROTOCOL);
-  /** tls 入口的证书/私钥路径（节点本地绝对路径；面板只发路径，不发密钥内容）。 */
-  const [tlsCertPath, setTlsCertPath] = useState("");
-  const [tlsKeyPath, setTlsKeyPath] = useState("");
-  const [ingressId, setIngressId] = useState("");
-  const [egressId, setEgressId] = useState("");
-  const [listenPort, setListenPort] = useState("");
-  const [targetHost, setTargetHost] = useState("");
-  const [targetPort, setTargetPort] = useState("");
-  const [bindEgressId, setBindEgressId] = useState("");
+  const [createDraft, setCreateDraft] = useState(() => emptyForwardCreateDraft("direct"));
   const [bindingBusy, setBindingBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<number | null>(null);
@@ -391,22 +376,10 @@ export function ForwardWorkspace() {
 
   function openCreate(mode: "direct" | "relay") {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const filteredIngress =
-      ingressFilter !== "all"
-        ? ingressNodes.find((node) => String(node.id) === ingressFilter)
-        : undefined;
-    const firstIngress = filteredIngress ?? ingressNodes[0];
-    setCreateMode(mode);
-    setName("");
-    setProtocol(DEFAULT_FORWARD_PROTOCOL);
-    setTlsCertPath("");
-    setTlsKeyPath("");
-    setIngressId(firstIngress ? String(firstIngress.id) : "");
-    setEgressId("");
-    setListenPort("");
-    setTargetHost("");
-    setTargetPort("");
-    setBindEgressId("");
+    const filteredIngress = ingressFilter !== "all"
+      ? ingressNodes.find((node) => String(node.id) === ingressFilter)
+      : undefined;
+    setCreateDraft(emptyForwardCreateDraft(mode, filteredIngress ?? ingressNodes[0]));
     setCreateOpen(true);
   }
 
@@ -424,25 +397,14 @@ export function ForwardWorkspace() {
    */
   function copyForward(forward: PortForward) {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const draft = forwardCopyDraft(forward, L("forward.copySuffix"));
-    setCreateMode(draft.mode);
-    setName(draft.name);
-    setProtocol(draft.protocol);
-    setTlsCertPath(draft.tlsCertPath);
-    setTlsKeyPath(draft.tlsKeyPath);
-    setIngressId(draft.ingressId);
-    setEgressId(draft.egressId);
-    setListenPort(draft.listenPort);
-    setTargetHost(draft.targetHost);
-    setTargetPort(draft.targetPort);
-    setBindEgressId("");
+    setCreateDraft(copiedForwardCreateDraft(forward, L("forward.copySuffix")));
     setCreateOpen(true);
   }
 
   async function bindSelectedEgress() {
     if (!canManageNodes) { toast.error(PERMISSION_DENIED); return; }
-    const ingress = Number(ingressId);
-    const egress = Number(bindEgressId);
+    const ingress = Number(createDraft.ingressId);
+    const egress = Number(createDraft.bindEgressId);
     if (!Number.isInteger(ingress) || !Number.isInteger(egress)) return;
 
     setBindingBusy(true);
@@ -457,8 +419,7 @@ export function ForwardWorkspace() {
           : [...existing, binding];
         return { ...current, [ingress]: next };
       });
-      setEgressId(String(binding.egress_node_id));
-      setBindEgressId("");
+      setCreateDraft((draft) => ({ ...draft, egressId: String(binding.egress_node_id), bindEgressId: "" }));
       toast.success(t("node.bindSuccess"));
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("forward.bindFailed"));
@@ -476,16 +437,16 @@ export function ForwardWorkspace() {
    * 协议会清空路径输入）。
    */
   const protocolErrors = useMemo(
-    () => tlsPathFieldErrors(protocol, tlsCertPath, tlsKeyPath),
-    [protocol, tlsCertPath, tlsKeyPath],
+    () => tlsPathFieldErrors(createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath),
+    [createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath],
   );
   const protocolReady = Object.keys(protocolErrors).length === 0;
   async function createForward() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const ingress = Number(ingressId);
-    const targetPortNum = Number(targetPort);
-    const listenPortNum = listenPort ? Number(listenPort) : null;
-    if (!name.trim() || !Number.isInteger(ingress) || !targetHost.trim() || !targetPort) {
+    const ingress = Number(createDraft.ingressId);
+    const targetPortNum = Number(createDraft.targetPort);
+    const listenPortNum = createDraft.listenPort ? Number(createDraft.listenPort) : null;
+    if (!createDraft.name.trim() || !Number.isInteger(ingress) || !createDraft.targetHost.trim() || !createDraft.targetPort) {
       toast.error(t("forward.createFailed"));
       return;
     }
@@ -498,7 +459,7 @@ export function ForwardWorkspace() {
       toast.error(t("forward.createFailed"));
       return;
     }
-    if (createMode === "relay" && !egressId) {
+    if (createDraft.mode === "relay" && !createDraft.egressId) {
       toast.error(t("forward.chooseEgress"));
       return;
     }
@@ -513,16 +474,16 @@ export function ForwardWorkspace() {
     setBusy(true);
     try {
       const created = await api.forwards.create({
-        mode: createMode,
+        mode: createDraft.mode,
         ingress_node_id: ingress,
-        name: name.trim(),
+        name: createDraft.name.trim(),
         listen_port: listenPortNum,
-        target_host: targetHost.trim(),
+        target_host: createDraft.targetHost.trim(),
         target_port: targetPortNum,
-        egress_node_id: createMode === "relay" ? Number(egressId) : null,
+        egress_node_id: createDraft.mode === "relay" ? Number(createDraft.egressId) : null,
         // 协议与（仅 tls 的）路径由同一个纯函数生成：非 tls 的请求里两个路径键
         // 结构上不存在，不存在「发出去再让 Agent 决定忽略」的字段。
-        ...forwardProtocolFields(protocol, tlsCertPath, tlsKeyPath),
+        ...forwardProtocolFields(createDraft.protocol, createDraft.tlsCertPath, createDraft.tlsKeyPath),
       });
       setCreatedForward(created);
       setCreateOpen(false);
