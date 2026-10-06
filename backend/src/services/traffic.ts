@@ -21,8 +21,8 @@
  *      调用方显式传 `period` 时优先。
  *
  * ── 归属（TEN-02）──
- * 所有查询经 `tunnel: { workspace_id }` 过滤（relation filter），不接受调用方
- * 传入的 tunnel_id 列表做过滤；跨租户的数据物理上不会进入结果集。
+ * 所有查询直接按归档行的不可变 `workspace_id` 过滤；不依赖 live Tunnel
+ * 关系，因此删除 Forward 不会让历史用量脱离租户，也不会形成“删 Forward 重置额度”的旁路。
  *
  * ── 纯函数与副作用分离 ──
  * `aggregateTrafficRows` / `fillDays` 为纯函数（喂行即得聚合），
@@ -272,13 +272,15 @@ export async function getWorkspaceTrafficSummary(
   const effectiveSince = windowStart && windowStart > trendStart ? windowStart : trendStart;
 
   const where: Prisma.TunnelTrafficWhereInput = {
-    tunnel: { workspace_id: workspaceId },
+    // Immutable ledger attribution: deleting the live Forward must not erase or
+    // de-scope already archived usage.
+    workspace_id: workspaceId,
     date: { gte: effectiveSince },
   };
   // 联邦远端腿用量：不计入额度，但**必须可观测**（契约 §3.3.5）。
   // 计算只有一处实现（policy-service#sumFederatedUnattributedTraffic），这里只是把它带出来。
 
-  const rows = await db.tunnelTraffic.findMany({
+  const ledgerRows = await db.tunnelTraffic.findMany({
     where,
     orderBy: { date: "asc" },
     select: {
@@ -286,19 +288,33 @@ export async function getWorkspaceTrafficSummary(
       traffic: true,
       traffic_cost: true,
       date: true,
-      tunnel: {
+    },
+  });
+
+  // Metadata is a live enrichment only. The accounting row is already scoped by
+  // workspace_id, so a deleted Forward remains billable/auditable and simply
+  // renders with empty live metadata.
+  const tunnelIds = [...new Set(ledgerRows.map((row) => row.tunnel_id))];
+  const liveTunnels = tunnelIds.length === 0
+    ? []
+    : await db.tunnel.findMany({
+        where: { id: { in: tunnelIds }, workspace_id: workspaceId },
         select: {
+          id: true,
           name: true,
           forward_protocol: true,
           tunnel_type: true,
           in_node_group_id: true,
           in_node_group: { select: { name: true } },
         },
-      },
-    },
-  });
+      });
+  const metadata = new Map(liveTunnels.map((row) => [row.id, row]));
+  const rows: TrafficAggRow[] = ledgerRows.map((row) => ({
+    ...row,
+    tunnel: metadata.get(row.tunnel_id) ?? null,
+  }));
 
-  const agg = aggregateTrafficRows(rows as unknown as TrafficAggRow[], { days, now });
+  const agg = aggregateTrafficRows(rows, { days, now });
   // 联邦远端腿用量：**独立字段**，不加进 total_traffic（契约 §3.3.5 / O5：
   // 不合并两本账，只让缺口可观测）。读失败不该让整张用量视图塌掉 —— 它只是缺口提示。
   let federated: number | null = null;
