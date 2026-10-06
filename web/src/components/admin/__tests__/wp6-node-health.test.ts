@@ -529,8 +529,8 @@ describe("WP6 接线", () => {
     expect(api.indexOf("unwrap?: boolean")).toBeGreaterThan(api.indexOf("workspaceId?: number"));
     // WP6 的 mock 路由挂在 WP12 凭据块之前，与 WP9 的绑定用量投影（在
     // mockIngressNode 附近 / handleMock 内）分处不同函数，互不覆盖。
-    const handler = readFileSync(new URL("../../../mocks/handler.ts", import.meta.url), "utf8");
-    expect(handler).toContain("healthWorld");
-    expect(handler.indexOf("healthWorld(db)")).toBeGreaterThan(handler.indexOf("function mockIngressNode"));
+    const runtime = readFileSync(new URL("../../../mocks/runtime.ts", import.meta.url), "utf8");
+    expect(runtime).toContain("healthWorld");
+    expect(runtime.indexOf("healthWorld(db)")).toBeGreaterThan(runtime.indexOf("function mockIngressNode"));
   });
 });

@@ -224,8 +224,8 @@ describe("C. mock /dashboard/attention 与后端同形", () => {
   });
 
   test("可重试结论只有一处来源：mock 调 applyErrorIsRetryable，不自己抄表", async () => {
-    const handler = readWeb("mocks/handler.ts");
-    expect(handler).toContain("applyErrorIsRetryable(");
+    const runtime = readWeb("mocks/runtime.ts");
+    expect(runtime).toContain("applyErrorIsRetryable(");
     // 曾经出现过的形态：mock 自己再写一份「哪些码可重试」。
     expect(handler).not.toMatch(/mockForwardRetryable/);
     expect(handler).not.toMatch(/RETRYABLE\s*=\s*new Set/);
@@ -245,7 +245,7 @@ describe("C. mock /dashboard/attention 与后端同形", () => {
     const backend = readBackend("services/attention.ts");
     const backendMax = /ATTENTION_MAX_ITEMS\s*=\s*(\d+)/.exec(backend);
     expect(backendMax).not.toBe(null);
-    const mockConst = /MOCK_ATTENTION_MAX_ITEMS\s*=\s*(\d+)/.exec(readWeb("mocks/handler.ts"));
+    const mockConst = /MOCK_ATTENTION_MAX_ITEMS\s*=\s*(\d+)/.exec(readWeb("mocks/runtime.ts"));
     expect(mockConst?.[1]).toBe(backendMax?.[1]);
 
     // legacy 的 remote_port_forward 不进待办（后端 where category: "port_forward"）。
