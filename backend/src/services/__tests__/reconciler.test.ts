@@ -578,6 +578,29 @@ describe("F. 多隧道合并与统计", () => {
     expect(codes).toContain("node_unreachable");
   });
 
+  test("子系统失败必须进入 failed + structured finding，而不是只打一条日志", async () => {
+    const out = await executeReconcile(
+      depsFrom([tunnel()], [agent()], [node()], {
+        reconcileLeases: async () => {
+          throw new Error("lease db down");
+        },
+        federatedForwardHealth: async () => {
+          throw new Error("federation db down");
+        },
+        failoverSweep: async () => {
+          throw new Error("failover db down");
+        },
+      }),
+    );
+
+    expect(out.failed).toBe(3);
+    const subsystemFindings = out.findings.filter((f) => f.code === "subsystem_failed");
+    expect(subsystemFindings).toHaveLength(3);
+    expect(subsystemFindings.map((f) => f.detail).join("\n")).toContain("lease db down");
+    expect(subsystemFindings.map((f) => f.detail).join("\n")).toContain("federation db down");
+    expect(subsystemFindings.map((f) => f.detail).join("\n")).toContain("failover db down");
+  });
+
   test("租约回收抛错不阻断整轮（error finding，隧道级结果照常）", async () => {
     const rec = recordingSink();
     const out = await executeReconcile(
