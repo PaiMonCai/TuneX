@@ -10,11 +10,11 @@ import (
 	"github.com/tunex/agent/internal/targetobs"
 )
 
-// V5.2-WP5: the observation facts ride the EXISTING state report as a new
+// Observation facts ride the existing state report as a new
 // top-level key. The two things worth guarding are that the key is additive
 // (an older panel keeps seeing everything it saw before, and an older agent
 // simply omits the key) and that `observation_age` never appears on the wire —
-// age is derived by the panel at read time (DEVELOPMENT.md §7 row 7), so a
+// age is derived by the panel at read time, so a
 // stored one would be wrong from the moment it was written.
 
 type staticObservations []targetobs.Observation

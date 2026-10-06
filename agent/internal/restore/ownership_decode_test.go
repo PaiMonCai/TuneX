@@ -12,9 +12,9 @@ import (
 	"github.com/tunex/agent/internal/manager"
 )
 
-// V5.3 WP9 — the snapshot decoder must know the ownership facts.
+// The snapshot decoder must know the ownership facts.
 //
-// This is the fourth time in V5 that a fact travels on two delivery paths and
+// A fact travels on two delivery paths and
 // only one of them learns about it (protocol, tls cert paths, target health, now
 // ownership). The symptom here is the worst of the four: an agent that rebuilds
 // its runtime from a snapshot WITHOUT the epoch resets its "highest seen" to
@@ -58,7 +58,7 @@ func TestSnapshotDecoderKnowsTheOwnershipFacts(t *testing.T) {
 func TestSnapshotDecoderWithoutOwnershipFactsStaysUntracked(t *testing.T) {
 	// An older panel: the fields are simply absent, and nothing may be invented
 	// (epoch 0 + no deadline == "no ownership information", which is what makes
-	// the agent behave exactly as it did before V5.3).
+	// the Agent behave as an unfenced assignment).
 	const body = `{"data":{"snapshot":{"version":"tunex-v3","tunnels":[
 		{"id":"tunex-7-direct","mode":"DIRECT","ingress_port":19001,"remote_host":"10.0.0.2","remote_port":80,
 		 "protocol":"tcp","revision":1}
@@ -120,7 +120,7 @@ type refusingGuard struct{ err error }
 func (g refusingGuard) Admit(forwarder.TunnelConfig) error { return g.err }
 
 func TestRestorePathIsOwnershipGated(t *testing.T) {
-	// V5-G2's lesson, applied to WP9: a fact with two delivery paths where only
+	// Regression rule: a fact with two delivery paths where only
 	// one of them is checked is a fact that is wrong half the time. The restore
 	// path applies configs straight into the manager, so the gate has to live
 	// where BOTH paths pass — this test pins that it does.
