@@ -10,7 +10,7 @@
  */
 import { Hono } from "hono";
 import { db } from "../db.ts";
-import { redis, RedisKeys, observerBufferKey, OBSERVER_BUFFER_MAX, trafficBufferKey } from "../redis.ts";
+import { redis, observerBufferKey, OBSERVER_BUFFER_MAX } from "../redis.ts";
 import { systemConfig } from "../services/config.ts";
 import { resolveUserByKey } from "../services/user-keys.ts";
 import { decideTrafficReport, accumulateTraffic } from "../services/traffic-archive.ts";
@@ -196,18 +196,3 @@ publicRoutes.get("/license", async (c) => {
   return c.json({ data: (await licenseService.getLicense()) ?? { type: "none" } });
 });
 
-/** POST /api/pay/:id/callback —— 支付网关回调（免认证，原文缓冲） */
-publicRoutes.post("/pay/:id/callback", async (c) => {
-  const id = c.req.param("id");
-  const raw = await c.req.text();
-  try {
-    // TEN-02：回调缓冲是全局审计留痕（按网关 id），走平台段 `ws:global:pay:callback:<id>`。
-    await redis.rpush(
-      RedisKeys.payCallback(id),
-      JSON.stringify({ at: Date.now(), raw }),
-    );
-  } catch {
-    /* ignore */
-  }
-  return c.text("success");
-});
