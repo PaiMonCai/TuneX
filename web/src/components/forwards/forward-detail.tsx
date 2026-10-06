@@ -11,6 +11,7 @@ import { ForwardEditDialog, RunningVsDesiredBadge } from "@/components/forwards/
 import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
 import { ForwardLedgerTotal, ForwardTopologyCard } from "@/components/forwards/forward-topology";
 import { ForwardDnsCard } from "@/components/forwards/forward-dns-card";
+import { ForwardLatencyCard } from "@/components/forwards/forward-latency";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
@@ -289,6 +290,13 @@ export function ForwardDetail({
             只有 `state === "synced"` 才会那样说。 */}
         <div className="lg:col-span-2">
           <ForwardDnsCard forwardId={forward.id} />
+        </div>
+
+        {/* 延迟历史（自包含组件，只吃 forwardId）。四态由服务端的 `status` 决定：
+            有观测 / 窗口内没观测（数据缺口）/ 按构造没有观测维度 / 多目标拒绝猜；
+            `latency_ms: null` 是"那次不可达"，折线断开而**不补零**。 */}
+        <div className="lg:col-span-2">
+          <ForwardLatencyCard forwardId={forward.id} />
         </div>
 
         <Card>
