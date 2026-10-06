@@ -714,19 +714,29 @@ export async function renewOwnedLeases(nodeId: number, now: Date): Promise<Lease
 
 async function renewOwnedLeasesUnsafe(nodeId: number, now: Date): Promise<LeaseFact[]> {
   const extended = new Date(now.getTime() + LEASE_TTL_SECONDS * 1000);
+
+  // Heartbeat renewal is allowed only for a lease that is STILL live at this
+  // exact panel-side timestamp. Expiry/release is a fencing boundary: reviving
+  // that row from a later state report would resurrect an old generation after
+  // another owner is already eligible to claim it.
   const result = await db.placementLease.updateMany({
-    where: { owner_node_id: nodeId },
+    where: {
+      owner_node_id: nodeId,
+      lease_expires_at: { gt: now },
+    },
     data: { lease_expires_at: extended },
   });
   if (result.count === 0) return [];
-  // The refreshed facts are RETURNED, not just written to the row.
-  //
-  // V5.3 的关键一环：Agent 侧按契约"到期即停"，而续约只发生在库里 —— 如果不把这些事实
-  // 送回给 Agent，每个隧道都会在下发后一个 TTL（30s）到期时**自己把自己停掉**，在健康节点
-  // 上制造一次全量中断。这是本阶段实现者发现并上报的真实集成缺口。
+
+  // Return only facts that are live after the renewal. This repeats the boundary
+  // intentionally: a row that was not renewed must never hitchhike in the response
+  // and convince the Agent that an expired generation is authoritative again.
   return db.placementLease
     .findMany({
-      where: { owner_node_id: nodeId },
+      where: {
+        owner_node_id: nodeId,
+        lease_expires_at: { gt: now },
+      },
       select: { tunnel_id: true, epoch: true, lease_expires_at: true, revision: true },
     })
     .then((rows) => rows.map((r) => ({
