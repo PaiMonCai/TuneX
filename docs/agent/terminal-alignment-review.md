@@ -377,3 +377,68 @@ Lead 已把 §5 最短路径的第 ① 条建为 `task-36`（交 `notify-center`
   - **纪律说明**：这是**复核基线（`65dd865`）之后**的提交，我**不**把它算进 §3/§5 既有结论，也不改那两节；上面这条只记录"我此刻自己核到的事实"，供收口时引用。是否算作 §5 最短路径第 ③ 条的进展，由 Lead 定。
 - **提醒**：scratch 的 panel/worker 在本周期内已被重建两次（`n4-0314` → `final48-0439` → `final49-0502`）。凡依赖"运行中容器的日志"的证据（例如"调度器真的每 30s 跑"），**必须在下次重建前落盘**，否则同样会消失（§9.4 的教训在 40 分钟内已经重演过一次）。
 
+---
+
+## 11. 最终复核：`task-41` 库出处澄清 —— **我的 §10.3 疑点被反证，予以撤回**（2026-10-07 05:10–05:20 +08）
+
+### 11.0 钉点与我自己跑的验证
+
+| 项目 | 值 |
+|---|---|
+| 时间 / HEAD | 2026-10-07 05:10–05:20 +08，HEAD `cd1cb8b23be50fc335efe225141d44c681085199`（05:10:48） |
+| 我的验证命令（全部只读） | ① `SELECT @@information_schema_stats_expiry` ② `information_schema.TABLES` 读 AUTO_INCREMENT（默认会话）③ `SHOW CREATE TABLE tunex.{workspace,notification_delivery,tunnel}`（**数据字典路径，不经过该统计缓存**）④ `docker inspect tunex-it-mysql` 网络别名 ⑤ `docker inspect tunex-it-worker` 的 env |
+
+### 11.1 结论：**我错了，owner 的反证成立**（§10.3 / §10.4 撤回）
+
+我自己核到的真值（`information_schema.TABLES`，默认会话，此刻）：
+
+```
+notification_channel 15 | notification_delivery 24 | tunnel 13 | workspace 11 | workspace_member 11
+```
+
+并用**不经过该统计缓存**的路径独立复核：`SHOW CREATE TABLE tunex.workspace` → `AUTO_INCREMENT=11`、`notification_delivery` → `24`、`tunnel` → `13`。默认 `@@information_schema_stats_expiry = 86400`（86400 秒）。
+
+⇒ 与 owner 的说明**逐项吻合**：`workspace 11→10`（它建 ws 9/10）、`tunnel 13→12`（tunnel 11/12）、`notification_delivery 24→23`（**id 22 sent / 23 failed**）、`workspace_member 11→10`。**t41 的账本行确实写进了活库并已被它清理，只留下被抬高的计数器。**
+
+**我 §10.3 的推断错在哪（如实记录）**：我在 04:33 与 05:05 两次读到同一组值 `9/11/22/15`，并把它当成"t41 前后未变"的证据。真实情况是：**`information_schema.TABLES.AUTO_INCREMENT`（含 `SHOW TABLE STATUS`）默认走 86400 秒统计缓存**，我两次读到的是**同一份缓存快照**，因此"两次相同"根本不能证明"期间没有写入" —— 这正是"用被缓存的读数做时间差推断"的经典失效。owner 给出的 ②（刷新后对齐）与 ③（`mysql` 别名在该网络上唯一指向 `tunex-it-mysql`，与它 worker 的 DSN 同一 host:port:db）我均已复现/复核：
+
+- 别名闭环我自己核到：`docker inspect tunex-it-mysql` → `tunex_it_ctrl aliases=[tunex-it-mysql mysql]` ✔（该网络上只有它叫 `mysql`）；
+- 另一条我自己找到的佐证：**活库的 scratch worker 根本没有 SMTP 配置**（`docker inspect tunex-it-worker` 的 env 里没有 `SMTP_*`，此前它的日志也打过 `[mail] SMTP 未配置`）⇒ 那封邮件**不可能**是 scratch worker 发的，只能是**带 SMTP 配置的 t41-worker** 发的 —— 与 transcript 里 `CONNECT from 172.33.0.46`（scratch 网络上的另一个容器）一致。
+
+**因此**：§10.3（"这次投递发生在哪个 MySQL"的疑点）与 §10.4（对 §9.1 #7 的降级更正）**撤回**；§9.1 #7 与 §10.1 #7 恢复为 **支撑**（"行确实存在过"现在有**真实**计数器 24/13/11 佐证）。
+
+### 11.2 通用教训（我这次踩到的，值得长期留着）
+
+> **用 `AUTO_INCREMENT` 做"何时发生了什么"的算术推断之前，必须先绕开 MySQL 8 的统计缓存。**
+> `information_schema.TABLES.AUTO_INCREMENT` 与 `SHOW TABLE STATUS` 默认受 `information_schema_stats_expiry`（默认 **86400 秒**）约束，读到的是**缓存快照**，不会随 INSERT 实时更新；`SHOW CREATE TABLE`（数据字典）或先 `SET SESSION information_schema_stats_expiry=0`（或 `ANALYZE TABLE`）才给真值。
+> 推论：**两次相同 ≠ 期间没变**——用缓存读数比较"前后"是最容易得出的**假阴性**。审计脚本应默认 `SET SESSION information_schema_stats_expiry=0`，或干脆用 `SHOW CREATE TABLE`。
+> 诚实边界：我**没有**（也无法在不写库的前提下）在事后复现"同一查询给出陈旧值"的那一刻；本节结论由三项可复核事实支撑——`@@…expiry=86400`、我 04:33/05:05 两次相同读数、以及数据字典路径给出的 24/13/11。
+
+### 11.3 八条判据的**最终**结论（相对 §10.1）
+
+| # | 判据 | 最终结论 | 相对 §10.1 | 说明 / 缺什么 |
+|---|---|---|---|---|
+| 1 | 收件端真有记录 | **支撑** | = | transcript 落盘 + 与 HEAD 渲染器逐字一致（主题/原因码/严重度/诊断码/结尾句） |
+| 2 | 因果链经 worker 节拍 | **部分支撑** | = | 见 §11.4：只剩"调度器那一拍"的直接载体这一条 |
+| 3 | 事实是真实事实 | **部分支撑** | = | 真实表行、候选集口径一致；**仍是 SQL 直插**（它自列），非真实下发失败 |
+| 4 | 收件人来自用户自己 | **支撑** | = | `RCPT TO` / 正文 `To` + 我核过的 `user 2` 邮箱 |
+| 5 | 失败路径端到端 | **支撑（收件端）/ 部分支撑（账本内容未亲读）** | ↑ | 三次 `554` ⇒ 零命令（收件端硬证据）+ 与 `NOTIFICATION_MAX_ATTEMPTS=3` 一致；账本行内容仍是它的引述（已被清理） |
+| 6 | "保存 ≠ 会被投递" | **不支撑（与简报第 3 条不符）** | = | 实际零账本行；根因（`isConfigured` 过滤 ⇒ `not_configured` 不可达）已复核。**这是产品契约问题，不是证据问题** |
+| 7 | 清理对照可复现 | **支撑**（从 §10.1 的"部分支撑"恢复） | ↑↑ | 真实计数器 24/13/11 + live 无 `t41-*` 残留 + `notification_channel`/`notification_delivery` 0 行 + Redis db9 `DBSIZE=0` + 无容器残留 |
+| 8 | 绕过写成发现 | **支撑** | = | SQL 直插 / Redis db9 / 同窗口 7 条 job / 未查 `node.status` 都写了 |
+
+### 11.4 **#10 翻转要件 ① 的最终状态：部分支撑**（唯一残余 = 一条可直接取证的载体）
+
+- **已闭合**：收件端 transcript ✔；报文与代码逐字一致 ✔；`554` fail-closed ✔；事实脚本不投递 ✔；**投递库出处 ✔（本轮由 owner 反证 + 我复现）**；账本行曾经存在 ✔（真实计数器）；清理无残留 ✔；绕过即发现 ✔。
+- **唯一残余**：**"那一拍由调度器触发"缺一个可直接复核的载体**。两次"事实→SMTP"延迟（~5 s、~13 s）都落在 30 s 节拍边界上、且事实脚本本身不投递，**强推断**是调度器所为；但"有人在节拍边界手工调了一次"在证据上仍未被排除。按 §8 预先写死的标准，这属于 **部分支撑**，不是支撑。
+- **三条一行即可闭合的路子（任一件到手，我立即改判"支撑"，不必再讨论）**：
+  1. **保存 worker stdout**：`docker logs t41-worker 2>&1 | grep -E "registered|cron_notification_facts" > /tmp/t41-worker.log`（含 `[worker] cron_notification_facts: {…"built":1…}` 那一行）；
+  2. **BullMQ 记录**：它的 worker 用 `redis://…/9` + 队列 `tunex-cron`（`worker.ts:50`），**不要 flush db9**，把 `redis-cli -n 9 --scan --pattern 'bull:tunex-cron*'` + 相关 `HGETALL` 导出 —— job 的 `processedOn`/`finishedOn` 就是"调度器真的派发过"的机器记录（比日志更硬）；本次 db9 已被清零，这条证据随之消失；
+  3. **不清理重跑一次**（它自己提的方案）：保留账本行 + 打印 `SELECT @@hostname, @@port, DATABASE(), @@server_uuid`，我当场读行内容与库身份。
+  > 顺带说明：**这三条都比我此前要求的"克隆出处"便宜**——因为库出处这条已经不成立了（它用的就是活库），现在缺的只是"谁按下了按钮"。
+- **§6 那份契约不符**（保存 ≠ 投递 ⇒ 零账本行）仍按独立小切片处理，不阻塞要件 ① 的证据判定，但会影响"通知这条**产品上**是否算追平"。
+
+### 11.5 #10 终局判定（不变）
+
+**#10 = 未达成。** 依据：要件 ① 仍为**部分支撑**（只差 §11.4 那一条载体）；要件 ②（一条日常宽度差距）在 `task-26` 在办，未验证；要件 ③（LG 方法集）虽已从 1 扩到 3 并在部署上（§10.6），仍距 ForwardX 的 7 种一个量级。§1–§6 的三条落后理由复核结论不变：**② 已消除 / ③ 部分消除 / ① 部分消除**。
+

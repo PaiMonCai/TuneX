@@ -1012,6 +1012,25 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 
 **已交回评审做终判**（三选一：支撑 / 部分支撑 / 维持不支撑），并请它独立核实那条 MySQL 缓存事实、把它写成通用教训，以及**明确写出"#10 翻转要件 ① 现在的状态"**。**终判可能落在自动轮次之后**——若如此，goal 仍按"未达成"保持 active，并把"等终判"写进下一轮的第一件事。
 
+## 3.46 最终复核（R6 §11）：评审**撤回** §10.3/§10.4，并留下一条通用教训
+
+### 撤回与恢复
+评审自己核了两条路径后**认可 owner 的反证**并**撤回** §10.3（库出处疑点）与 §10.4（把 §9.1 #7 降级的更正）：
+- `SELECT @@information_schema_stats_expiry` = **86400**（默认统计缓存）；
+- **不经过该缓存**的 `SHOW CREATE TABLE tunex.workspace / notification_delivery / tunnel` → `AUTO_INCREMENT = 11 / 24 / 13`，与 owner 的读数**逐项吻合**（`24→23` ⇒ id 22 sent / 23 failed；`13→12` ⇒ tunnel 11/12；`11→10` ⇒ ws 9/10；`channel 15` 是 t36 的 12/13/14）。
+⇒ **t41 的账本行确实写进活库、已被清理，只留下抬高的计数器**；**§9.1 #7 与 §10.1 #7 恢复"支撑"**。
+**它自找的旁证**：活库 scratch worker 的 env 里**没有 `SMTP_*`**（它此前也打过 `[mail] SMTP 未配置`）⇒ 那封邮件**不可能**由它发出，只能来自带 SMTP 配置的 `t41-worker`，与 transcript 的 `CONNECT from 172.33.0.46` 自洽；`mysql` 别名在该网络唯一指向 `tunex-it-mysql` 它也复核了。
+
+### 通用教训（写进 §11.2，长期有效）
+**用 `AUTO_INCREMENT` 做"何时发生过什么"的算术推断前，必须绕开 MySQL 8 的 86400 秒统计缓存**（`SET SESSION information_schema_stats_expiry=0` 或 `SHOW CREATE TABLE`）；**"两次读到相同值"在缓存下不能证明期间没有写入**——评审的误判正是一个**假阴性**（04:33 与 05:05 两次读到同一快照）。
+
+### 要件 ① 的最终状态：**部分支撑**（唯一残余收窄到**一条**）
+八条判据：**支撑 5**（收件端 / 收件人 / 清理对照 / 绕过写成发现 / #7 恢复）、**部分支撑 1**（"那一拍由调度器触发"缺可直接复核的载体；两次延迟 ~5s/~13s 落在 30s 节拍边界且事实脚本确不投递 ⇒ **强推断**是调度器，但未能排除"有人在节拍边界手工调一次"）、**部分支撑 1**（事实为 SQL 直插）、**不支撑 1**（③"保存≠投递"属**契约**与简报不符，非证据问题）。
+**闭合只需三者之一（已预承诺，手到即改判"支撑"）**：① `docker logs t41-worker … | grep -E "registered|cron_notification_facts"` 落盘（要 `{"considered":…,"built":1,…}` 那行）；② **BullMQ 机器记录**（`redis-cli -n 9` 的 `bull:tunex-cron*` 的 `processedOn/finishedOn`——**比日志更硬**，但 db9 已清零 ⇒ 该证据本次已消失）；③ **不清理重跑一次**并打印 `@@hostname/@@port/DATABASE()/@@server_uuid`。
+
+### #10 终局判定：**未达成（不变）**
+要件①部分支撑（只差上一条载体）、要件②在 `task-26` 未验证、要件③ LG 1→3 已部署但距 7 仍一个量级；R6 §1–§6 的三条落后理由复核不变：**② 已消除 / ③ 部分消除 / ① 部分消除**。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
