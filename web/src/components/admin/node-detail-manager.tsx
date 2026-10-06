@@ -21,6 +21,7 @@ import { api, API_MOCK } from "@/lib/api";
 import { useI18n } from "@/components/providers";
 import { LB_STRATEGIES, NODE_ROLES, STATUS_OPTIONS } from "@/lib/constants";
 import { formatBytes, formatDateTime, strOf, toNumOrNull } from "@/lib/utils";
+import type { NodeRuntimeState } from "@/lib/node-runtime-state";
 import type { ID, LBStrategy, Node, NodeDetail, NodeRole, Status } from "@/lib/types";
 
 function roleBadgeVariant(role: NodeRole | null | undefined): "success" | "default" | "muted" {
@@ -61,6 +62,15 @@ function toRoleForm(n: Node): RoleForm {
 export interface NodeDetailManagerProps {
   nodeId: ID;
   initial: NodeDetail;
+  /**
+   * 运行态读数（三态）。由服务端 loader（`loadNodeState`）取好后穿过 props 传进来。
+   *
+   * **不要**从详情聚合里找运行态：`GET /api/admin/node/:id/detail` **不提供**
+   * `state`（`NodeDetail` 类型里也已移除该字段），运行态是独立端点
+   * `/api/admin/node/:id/state`。聚合里的 `state` 分不出「取不到」与「没有上报」，
+   * 而这正是本切片之前「界面把 404 显示成没有上报」的缺陷形态。
+   */
+  runtime: NodeRuntimeState;
 }
 
 /**
@@ -71,7 +81,7 @@ export interface NodeDetailManagerProps {
  * 契约（mock）。**「未声明角色」不允许被静默填默认值**——表单提交时空值原样
  * 发送 null，与 schema 的「存量行不改/不猜」一致。
  */
-export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
+export function NodeDetailManager({ nodeId, initial, runtime }: NodeDetailManagerProps) {
   const { t, locale } = useI18n();
   const [detail, setDetail] = useState<NodeDetail>(initial);
   const [form, setForm] = useState<RoleForm>(() => toRoleForm(initial));
@@ -119,6 +129,14 @@ export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
   const node = detail;
   const role = node.role ?? null;
   const router = useRouter();
+
+  /**
+   * 运行态「取不到」时的重试入口：`router.refresh()` 重跑服务端 loader，
+   * 新结果从 props 进来（不新增第二条取数路径，也不把失败吞掉）。
+   */
+  const retryRuntime = useCallback(() => {
+    router.refresh();
+  }, [router]);
 
   /**
    * V4-WP7：把角色/端口区间的**待提交**值交给 lifecycle 管理组件做影响检查。
@@ -313,7 +331,7 @@ export function NodeDetailManager({ nodeId, initial }: NodeDetailManagerProps) {
         onDeleted={() => router.push("/admin/nodes")}
       />
 
-      <NodeRuntimePanel nodeId={nodeId} report={detail.state} />
+      <NodeRuntimePanel nodeId={nodeId} state={runtime} onRetry={retryRuntime} />
     </div>
   );
 }

@@ -10,6 +10,8 @@ export const zh = {
   common: {
     siteName: "TuneX",
     tagline: "内网穿透与端口转发控制台",
+    /** 通用「加载失败」兜底：页面级取数失败时用它，绝不渲染成裸 key。 */
+    loadFailed: "加载失败，请稍后重试",
     dashboard: "仪表盘",
     nodes: "节点管理",
     forwards: "转发管理",
@@ -1077,6 +1079,8 @@ export const en: Dict = {
   common: {
     siteName: "TuneX",
     tagline: "Tunneling & port-forwarding console",
+    /** Generic load-failure fallback: never render a bare key on a page-level fetch failure. */
+    loadFailed: "Failed to load. Please try again.",
     dashboard: "Dashboard",
     nodes: "Nodes",
     forwards: "Forwards",

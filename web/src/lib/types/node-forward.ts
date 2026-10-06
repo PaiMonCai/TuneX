@@ -432,9 +432,18 @@ export interface NodeRuntimeTunnel {
   targets?: string[];
 }
 
-/** 节点详情（列表行 + 凭据状态派生 + 出口池 + 运行态） */
+/**
+ * 节点详情（界面模型：节点行 + 服务端派生 role + 出口池）。
+ *
+ * 由 `projectNodeDetail`（`lib/api/admin.ts`）从后端聚合
+ * `GET /api/admin/node/:id/detail` 的**嵌套**形状投影而来。
+ *
+ * **没有 `state` 字段**：运行态已拆成独立端点 `GET /api/admin/node/:id/state`，
+ * 由 `loadNodeState` 取成三态（`reported` / `never_reported` / `unavailable`）。
+ * 这里若保留一个可空的 `state`，消费方会把它读成"该节点没有上报"，而实际上
+ * 是"这个端点不再提供运行态"——即被本专项明令禁止的"把取不到说成没有"。
+ */
 export interface NodeDetail extends Node {
   pools: EgressPool[];
-  state: NodeStateReport | null;
 }
 

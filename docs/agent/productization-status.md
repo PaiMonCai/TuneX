@@ -304,6 +304,24 @@ I1：轮询 single-flight / 独立 deadline（`loadView` 永久挂起也超时�
 3 名持久队友（均可 `send_message` 中途纠偏、可观测状态）：`web-ddns`（task-1 DDNS Web）、`web-forward`（task-2 Forward 链路 + F11 换源）、`backend-truth`（task-5 E2 缺陷修复）。
 Lead 负责：`task-3`（把两块自包含组件挂进 `forward-detail.tsx` 的**独占写点** + 最终门禁/浏览器验收）、`task-4`（管理端 API 契约对齐，已有真机证据）、`task-6`（F5 心跳死端点）与最终提交。
 
+## 3.11 task-4 进展（Lead 自己在做）：管理员节点路径族的**真实**边界
+
+**不要**把"复数一律是错的"当作规则——真机实测（scratch Panel + 管理会话）：
+
+| 路径 | 真机 | 判定 |
+|---|---|---|
+| `GET /api/admin/node/:id/detail` | **200** | 正确（`node-admin.ts:101`） |
+| `GET /api/admin/nodes/:id` | **404** | ✗ web `nodeDetail` 曾走这里 → **已改单数** |
+| `PATCH`/`DELETE /api/admin/nodes/:id` | 由 `admin-extended.ts:672/675` 提供（200 家族） | ✓ web 的 `updateNode`/`removeNode` **本来就对**，**不得**改成单数 |
+| `GET /api/admin/nodes`（列表） | 200 | ✓ |
+| `GET /api/admin/nodes/:id/pools` | **404** | ✗ 已改 `/node/:id/pools` |
+| `PATCH /api/admin/node/pools/:poolId`、`DELETE /node/pools/:poolId`、`POST /node/pools/:poolId/targets`、`PATCH|DELETE /node/targets/:targetId` | 单数由 `node-admin.ts:192/211/258/291/308` 提供 | ✗ 已改 |
+| `GET /api/admin/node/:id/lifecycle`、`/node/:id/impact`、`/node/:id/state`、`/node/:id/health`、`/node/pools/:poolId/health` | 200 | ✓ 本来就对 |
+
+已完成的代码改动：`nodeDetail` 改单数 + **线上嵌套形状 → 界面扁平模型的显式投影**（新增 `projectNodeDetail`，并从中**移除** `state` 字段——该端点已不提供运行态，留着会被读成"没有上报"）；pools 列表解**两层信封** `{data:{data,total}}`；pool/target 方法签名与新路径一致（`node-egress-pools-panel.tsx` 4 处调用点同步更新）；补齐**缺失**的 `common.loadFailed`（zh/en）——它有两个消费方，其中一个在**用户域**（`topup-body.tsx`），此前一直渲染裸 key。
+
+待做：mock 对齐（删复数扁平 `GET /admin/nodes/:id`，改单数嵌套 + 单数 pools/targets）、路径↔后端声明的对照测试、真机复核。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
