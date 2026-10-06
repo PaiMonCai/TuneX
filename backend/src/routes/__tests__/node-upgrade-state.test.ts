@@ -171,7 +171,7 @@ await group("reachability-and-contract", 3, async () => {
   ]);
   /* 面板迁移回退（task-44）：这是**面板级**配置投影，且必须自曝"节点运行态未持久化"，
      不许用"配置了回退"冒充"节点正在回退"。 */
-  expect(data.panel_migration.source).toBe("config:PANEL_MIGRATION");
+  expect(data.panel_migration.source).toBe("env:TUNEX_PANEL_MIGRATION_FALLBACK_URL");
   expect(data.panel_migration.node_reported_state_persisted).toBe(false);
   expect(typeof data.panel_migration.configured).toBe("boolean");
   expect(Object.keys(data.node).sort()).toEqual(["agent_id","id","lifecycle","node_key","role"]);

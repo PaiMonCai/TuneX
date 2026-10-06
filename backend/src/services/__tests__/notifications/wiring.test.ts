@@ -20,6 +20,7 @@ import { readFileSync } from "node:fs";
 import {
   FACT_NOTIFICATION_CHANNEL_KINDS,
   createFactTargetResolver,
+  shouldWarnNoChannels,
   createForwardDenialDeps,
   factNotificationChannels,
   runForwardDenialNotifications,
@@ -532,6 +533,80 @@ describe("N3 幂等与渠道范围", () => {
     expect(summary.built).toBe(0);
     expect(harnessed.ledger.rows).toHaveLength(0);
   });
+
+  /* ── task-47：零渠道 ≠ 零事实（这条路径必须能被回答） ── */
+  test("零渠道但**有事实**：summary 必须把 `facts_derived` 与 `built` 分开，并打一行明确告警", async () => {
+    const harnessed = harness({
+      tunnels: [{ id: 42, workspace_id: 10, name: "office-web", apply_status: "error", updated_at: T0 }],
+      // **两条待办**：一条是 E 类事实（error），一条不是（pending）⇒ `considered:2` 但 `facts_derived:1`。
+      // 这个差值就是"告警必须按 facts_derived 计数、不能按 considered"的可测形式。
+      itemsByWorkspace: { 10: [denialItem(), denialItem({ id: 43, name: "other", reason_code: "forward_pending_apply", severity: "info" })] },
+      channels: [],
+      audience: async () => ({ ok: true, recipients: [MEMBER] }),
+    });
+    const summary = await runForwardDenialNotifications(harnessed.deps);
+
+    // ① 拆分：看到了 1 条**事实**（considered 是 2 条待办），一个渠道都没打开 ⇒ 投出 0 条。
+    //    （反向变异：把拆分改回单一计数 ⇒ `facts_derived` 不存在/等于 considered ⇒ 立刻红。）
+    expect(summary).toMatchObject({
+      considered: 2,
+      facts_derived: 1,
+      recovered_derived: 0,
+      channels_open: 0,
+      built: 0,
+      recovered: 0,
+      delivered: false,
+    });
+    // ② 告警必须**说清"看到了几条 + 为什么没投"**，而不是一句泛化的失败。
+    const warning = harnessed.warns.find((w) => w.includes("没有任何已配置渠道"));
+    expect(warning).toBeTruthy();
+    expect(warning).toContain("派生 1 条事实");
+    expect(warning).toContain("不投递");
+    // ③ 账本仍然零行：零渠道下没有 (事实 × 渠道) 这一格，不伪造投递记录（理由见报告）。
+    expect(harnessed.ledger.rows).toHaveLength(0);
+  });
+
+  test("有渠道时行为**不变**（回归）：facts_derived === built，且没有零渠道告警", async () => {
+    const email = emailChannel();
+    const harnessed = harness({
+      tunnels: [{ id: 42, workspace_id: 10, name: "office-web", apply_status: "error", updated_at: T0 }],
+      itemsByWorkspace: { 10: [denialItem()] },
+      channels: [email.channel],
+      audience: async () => ({ ok: true, recipients: [MEMBER] }),
+    });
+    const summary = await runForwardDenialNotifications(harnessed.deps);
+    expect(summary).toMatchObject({ considered: 1, facts_derived: 1, channels_open: 1, built: 1, delivered: true });
+    expect(harnessed.warns.filter((w) => w.includes("没有任何已配置渠道"))).toHaveLength(0);
+    expect(email.sent).toEqual(["ops@example.com"]);
+  });
+
+  test("零渠道且**零事实**：不打告警（空闲不等于异常），但 summary 仍然两个数都在", async () => {
+    const harnessed = harness({ tunnels: [], itemsByWorkspace: {}, channels: [] });
+    const summary = await runForwardDenialNotifications(harnessed.deps);
+    expect(summary).toMatchObject({ considered: 0, facts_derived: 0, channels_open: 0, built: 0, delivered: false });
+    expect(harnessed.warns.filter((w) => w.includes("没有任何已配置渠道"))).toHaveLength(0);
+  });
+
+  test("**反噪**：告警条件是 `facts_derived>0 && 零渠道`，**不是** `considered>0`", () => {
+    // 真实安装里 `considered` 长期 >0（只要库里有一条 error 转发或任一待办）；
+    // 按 `considered>0` 告警 = 每 30 秒一行的永久刷屏（评审实测：清理后仍是 considered:1）。
+    // 这里直接钉住判定本身（纯函数），并说明为什么它必须只看 `facts_derived`。
+    expect(shouldWarnNoChannels({ facts_derived: 1, channels_open: 0 })).toBe(true);
+    expect(shouldWarnNoChannels({ facts_derived: 0, channels_open: 0 })).toBe(false);
+    expect(shouldWarnNoChannels({ facts_derived: 3, channels_open: 1 })).toBe(false);
+  });
+
+  test("恢复事实同样分开计数：零渠道时 recovered_derived 也要报出来", async () => {
+    const harnessed = harness({
+      tunnels: [{ id: 42, workspace_id: 10, name: "office-web", apply_status: "active", updated_at: T0 }],
+      openDenials: [{ source_id: "42", channel_kind: "email" }],
+      itemsByWorkspace: { 10: [] },
+      channels: [],
+    });
+    const summary = await runForwardDenialNotifications(harnessed.deps);
+    expect(summary).toMatchObject({ facts_derived: 1, recovered_derived: 1, built: 0, recovered: 0, delivered: false });
+    expect(harnessed.warns.some((w) => w.includes("恢复 1 条"))).toBe(true);
+  });
 });
 
 /* ================================================================== */
@@ -549,6 +624,10 @@ describe("N3 worker 接线", () => {
     expect(source).toContain("defaultForwardDenialDeps");
     // 这条节拍必须是**自己的** case，不能搭别的扫描的车（否则缺省配置下又会永不触发）。
     expect(source).toContain('"./services/notification-facts-trigger.ts"');
+    // task-47 的修法收窄：打印条件**故意不含** `facts_derived` —— 否则只要库里有一条
+    // 长期 error 的转发，summary 就会每 30 秒打一行（永久噪音）。"有事实但零渠道"这件事
+    // 由触发器自己的告警行承载（见下一条反噪测试）。
+    expect(source).not.toContain("r.facts_derived > 0");
   });
 });
 

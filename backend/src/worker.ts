@@ -248,8 +248,12 @@ const worker = new Worker(
         );
         try {
           const r = await runForwardDenialNotifications(defaultForwardDenialDeps());
-          // 空闲时保持静默（没有事实、没有渠道打开时不刷屏）；但有事实/有拒绝/有跳过必须留痕，
-          // 否则"通知发不出去"这件事在运维视角里不存在。
+          // ── 打印条件**故意**不包含 `facts_derived`（task-47 的修法收窄）──
+          // "有事实但零渠道"这件事由**触发器自己**的那行告警承载（`[notification-facts] …没有任何已配置渠道…`，
+          // 条件 `facts_derived>0 && channels===0`）。如果把 `facts_derived>0` 也加到这里，
+          // 那么**只要库里有一条长期 error 的转发**（真实运维里很常见），这条 summary 就会
+          // 每 30 秒打一行 —— 那是永久噪音，本专项明令禁止用噪音稀释"失败可见"。
+          // 静默 = "这一拍没有需要人看的事"；有需要人看的事时，由告警行说话。
           if (r.delivered || r.built > 0 || r.rejected > 0 || r.skipped > 0) {
             console.log("[worker] cron_notification_facts:", JSON.stringify(r));
           }

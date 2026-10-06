@@ -227,6 +227,49 @@ Agent 镜像的构建参数 `AGENT_VERSION` 决定该镜像**上报给面板的 
   基线用安装器写：`scripts/ops/install.sh install --version <git-sha> --agent-version 0.14.0`
   （`--version` 是镜像锚，**不会**被写进基线；传 git sha 当基线会被直接拒绝）。
 
+#### 面板迁移回退（面板换地址时，节点不必重新接入）
+
+面板换域名 / 换机房 / 迁 IP 时，节点上的 Agent 可以**跟随过去**：配置里多一个"回退三元组"，
+主地址不可达时自动切到备用地址，并在**每一次**状态上报里如实带上"当前生效地址 + 迁移 id +
+是否在回退态"（这一处以前完全没有，`migrationFallback` / `panelMigration` 全仓零命中）。
+
+配置（面板侧，**部署环境变量**；与 `TUNEX_PUBLIC_PANEL_URL` / `TUNEX_AGENT_LATEST_VERSION` 同层）：
+
+```bash
+TUNEX_PANEL_MIGRATION_FALLBACK_URL=https://panel-b.example.com   # 备用面板地址
+TUNEX_PANEL_MIGRATION_ID=mig-2026-10-07                          # 迁移标识（面板侧生成）
+TUNEX_PANEL_MIGRATION_STARTED_AT=2026-10-07T00:00:00Z            # 可选：RFC3339 或 unix 秒
+```
+
+- **`..._FALLBACK_URL` 与 `..._MIGRATION_ID` 必须齐备**才算启用（只填一个 ⇒ 用户域读投影
+  `GET /api/nodes/:id/upgrade-state` 的 `panel_migration.problem` 以 `incomplete` 开头；
+  Agent 侧**拒绝**该配置并保持"不切"，绝不猜一个地址）；`STARTED_AT` 可选，缺它就只剩
+  "连续失败"这一条判据。
+- 放在**环境变量**而不是 `config` 表的原因很实际：那张表的 `name` 是 **DB ENUM**
+  （`SystemConfigName`），加一个键就要一次 schema 迁移；而本切片不动 schema。改这三个值的
+  权限=能动面板部署的人（面板本身在迁移，这是运维动作，不是租户操作）。
+- 下发到节点的方式是写进节点主机的 `agent.env`（三个键）：
+
+  ```text
+  TUNEX_PANEL_HTTP_URL=https://panel.example.com          # 主地址（既有）
+  TUNEX_PANEL_FALLBACK_URL=https://panel-b.example.com    # 备用地址（新增）
+  TUNEX_PANEL_MIGRATION_ID=mig-2026-10-07                 # 迁移标识（新增）
+  TUNEX_PANEL_MIGRATION_STARTED_AT=2026-10-07T00:00:00Z   # 迁移起始（可选，新增）
+  ```
+
+- **切换判据**（Agent 侧；`agent/internal/reporter/panel_migration.go` 的纯函数，真值表有测试）：
+  - 状态上报**连续失败 2 次**（可配）⇒ 切备用；或**距 `started_at` 超过 3 分钟且已有至少一次
+    失败** ⇒ 切备用。第二个判据**不单独成立**：一次已经完成的迁移若单独触发期限，会把所有
+    健康节点在 3 分钟后集体切走。
+  - **任一次成功即清零**连续失败计数。
+  - **已建立长连接/事件流期间不切**（TuneX 的 Agent 只主动出站，当前恒无长连接；该输入保留）。
+  - **切到备用后不自动切回**：切回只由配置面完成（重新下发 `agent.env` 后重启，或换一个
+    `MIGRATION_ID`）。面板抖动时来回切会造成上报空档。
+  - 备用地址也失败 ⇒ 日志明写"备用面板也不可达"，**不假装在线**，也不做第二次切换。
+- **如实上报**：每次上报都带 `panel_url_in_use` / `panel_migration_id` / `panel_fallback_active`，
+  面板因此不会"以为节点还在主地址上"。
+- 缺省（三项都不写）行为**与以前完全一致**：不计数、不切换、不上报迁移字段。
+
 ### 2.4 启动（默认：宿主机反代直连）
 
 ```bash

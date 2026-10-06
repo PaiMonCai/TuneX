@@ -12,13 +12,39 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
-  PANEL_MIGRATION_CONFIG_KEY,
+  PANEL_MIGRATION_ENV_KEYS,
   panelMigrationView,
   parsePanelMigration,
+  readPanelMigrationFromEnv,
   renderPanelMigrationEnv,
 } from "../node-install.ts";
 
 const GOOD = { id: "mig-2026-10-07", fallback_url: "https://panel-b.example.com/", started_at: "2026-10-07T00:00:00Z" };
+
+describe("readPanelMigrationFromEnv：面板侧的唯一入口（部署环境变量）", () => {
+  test("三个变量齐备 ⇒ 启用；只给一个 ⇒ incomplete；都没有 ⇒ 未配置", () => {
+    const full = readPanelMigrationFromEnv((k) =>
+      k === PANEL_MIGRATION_ENV_KEYS.fallbackUrl
+        ? "https://panel-b.example.com"
+        : k === PANEL_MIGRATION_ENV_KEYS.migrationId
+          ? "mig-env"
+          : k === PANEL_MIGRATION_ENV_KEYS.startedAt
+            ? "2026-10-07T00:00:00Z"
+            : undefined,
+    );
+    expect(full.ok).toBe(true);
+
+    const partial = readPanelMigrationFromEnv((k) =>
+      k === PANEL_MIGRATION_ENV_KEYS.fallbackUrl ? "https://panel-b.example.com" : undefined,
+    );
+    expect(partial.ok).toBe(false);
+    if (!partial.ok) expect(partial.reason).toBe("incomplete");
+
+    const none = readPanelMigrationFromEnv(() => undefined);
+    expect(none.ok).toBe(false);
+    if (!none.ok) expect(none.reason).toBe("not_configured");
+  });
+});
 
 describe("parsePanelMigration：三态（未配置 / 已配置 / 配置坏了）", () => {
   test("未配置：null / 空串 / 空对象 / 全空白 ⇒ not_configured（不是故障）", () => {
@@ -122,7 +148,7 @@ describe("panelMigrationView：读投影必须自曝边界", () => {
     expect(view.fallback_url).toBe("https://panel-b.example.com");
     expect(view.problem).toBeNull();
     expect(view.node_reported_state_persisted).toBe(false);
-    expect(view.source).toBe(`config:${PANEL_MIGRATION_CONFIG_KEY}`);
+    expect(view.source).toBe(`env:${PANEL_MIGRATION_ENV_KEYS.fallbackUrl}`);
   });
 
   test("未配置 ⇒ configured=false 且 problem=null（缺省不是问题）", () => {

@@ -130,10 +130,42 @@ export interface DeliveryBacklogDeps {
   ) => Promise<unknown>;
   /** 本安装真正打开的渠道。缺省由调用方给出 —— 一个都没打开时**不投递**、零账本行。 */
   readonly channels: () => readonly NotificationChannel[];
+  /**
+   * 告警出口（默认 `console.warn`）。**为什么需要它**：`considered>0 && 零渠道` 这条路径
+   * 既没有账本行、也（在修好之前）没有任何日志 —— 运维问"通知为什么没发"时，
+   * "这台安装到底看到了什么"必须**有地方能回答**。测试通过注入把它变成可断言的事实。
+   */
+  readonly onWarn?: (message: string, err?: unknown) => void;
+}
+
+/**
+ * "有事实但零渠道"的**告警判定**（纯函数，刻意单独导出）。
+ *
+ * 条件是 `facts_derived > 0 && channels_open === 0`，**不是** `considered > 0`：
+ * `considered` 在真实安装里长期 >0（只要库里有一条 error 的转发、或任一工作空间有待办），
+ * 按它告警就等于把静默换成**每 30 秒一行的永久刷屏**——本专项明令禁止用噪音稀释失败可见性。
+ * 单独成函数是为了让这条判定可以被直接断言（而不是藏在 `if` 里只能靠读码确认）。
+ */
+export function shouldWarnNoChannels(input: { facts_derived: number; channels_open: number }): boolean {
+  return input.facts_derived > 0 && input.channels_open === 0;
 }
 
 export interface ForwardDenialRunSummary {
+  /** 本拍**看到的**待办条目数（attention 派生结果，与"有没有渠道"无关）。 */
   readonly considered: number;
+  /**
+   * 本拍**派生出来的事实数**（渠道过滤**之前**）。
+   *
+   * 与 `built` 分开是刻意的：`built/delivered` 描述"投出去了多少"，
+   * `facts_derived` 描述"这台安装看到了多少"。把两者合成一个数，就会让
+   * **"零渠道"看起来像"零事实"** —— 那是两个完全不同、且运维必须能分辨的状态。
+   */
+  readonly facts_derived: number;
+  /** 派生出的**恢复**事实数（渠道过滤之前）。 */
+  readonly recovered_derived: number;
+  /** 本安装这一拍真正打开的渠道数（0 = 有事实也不投递，零账本行）。 */
+  readonly channels_open: number;
+  /** 真正交给投递层的事实数（零渠道时为 0）。 */
   readonly built: number;
   /** 取了来源行但被派生层拒绝（scope/字段不合法）—— 同样要可见，不能静默丢。 */
   readonly rejected: number;
@@ -201,15 +233,33 @@ export async function runForwardDenialNotifications(
   }
 
   const channels = deps.channels();
-  if (facts.length === 0 || channels.length === 0) {
+  const warn = deps.onWarn ?? ((message: string, err?: unknown) => console.warn(`[notification-facts] ${message}`, err ?? ""));
+  // 派生结果先记下来：下面的两个 return 分支都带上它（"看到多少"与"投出多少"是两个问题）。
+  const derived = facts.length;
+  const derivedRecovered = recovery.seeds.length;
+  const skippedTotal = skipped.length + recovery.skipped.length;
+
+  if (derived === 0 || channels.length === 0) {
     // 没有事实、或**一个渠道都没打开**：不投递、不产生账本行（避免用 `not_configured`
-    // 把"失败可见"稀释成噪音）。
+    // 把"失败可见"稀释成噪音）。**但"零渠道"绝不等于"零事实"**，所以：
+    //   · summary 里 `facts_derived` 仍然如实上报（与 `built` 分开）；
+    //   · 并且打一行**明确告警** —— 否则运维无法区分"这台安装什么都没看到"与
+    //     "看到了事实但没有可用渠道"（这两者的下一步动作完全不同）。
+    if (shouldWarnNoChannels({ facts_derived: derived, channels_open: channels.length })) {
+      warn(
+        `本拍派生 ${derived} 条事实（其中恢复 ${derivedRecovered} 条），但当前**没有任何已配置渠道** ⇒ 不投递、也不留账本行。` +
+          "请检查渠道配置（管理端「通知渠道」）与各渠道的部署开关。",
+      );
+    }
     return {
       considered: source.items.length,
+      facts_derived: derived,
+      recovered_derived: derivedRecovered,
+      channels_open: channels.length,
       built: 0,
       recovered: 0,
       rejected,
-      skipped: skipped.length + recovery.skipped.length,
+      skipped: skippedTotal,
       delivered: false,
     };
   }
@@ -217,10 +267,13 @@ export async function runForwardDenialNotifications(
   await deps.deliver(facts, channels);
   return {
     considered: source.items.length,
-    built: facts.length,
-    recovered: recovery.seeds.length,
+    facts_derived: derived,
+    recovered_derived: derivedRecovered,
+    channels_open: channels.length,
+    built: derived,
+    recovered: derivedRecovered,
     rejected,
-    skipped: skipped.length + recovery.skipped.length,
+    skipped: skippedTotal,
     delivered: true,
   };
 }
@@ -551,6 +604,9 @@ export function createForwardDenialDeps(deps: ForwardDenialWiringDeps): Delivery
   let tickChannels: readonly NotificationChannel[] = [];
 
   return {
+    // 告警通道**同一个** `warn`：装配层的加载告警与编排层的"零渠道"告警走同一条出口
+    // （不新开第二条日志面 —— 那只会让"这台安装看到了什么"散在多个地方）。
+    ...(deps.warn ? { onWarn: deps.warn } : {}),
     load: async () => {
       const openDenials = await deps.loadOpenDenials();
       const openForwardIds = uniqPositiveInts(openDenials.map((row) => Number(row.source_id)));

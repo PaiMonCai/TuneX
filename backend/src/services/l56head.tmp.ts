@@ -407,7 +407,7 @@ PROBE="$(docker exec "$CONTAINER" sh -c '
   SHAPE=""
   if [ -s "$BODY" ]; then
     if command -v jq >/dev/null 2>&1; then
-      if jq -e '\\''type=="object" and (.data|type=="object")'\\'' "$BODY" >/dev/null 2>&1; then
+      if jq -e 'type=="object" and (.data|type=="object")' "$BODY" >/dev/null 2>&1; then
         SHAPE="jq"
       fi
     elif grep -qE "^[[:space:]]*\\{" "$BODY" && grep -qE "\\"data\\"[[:space:]]*:" "$BODY" && grep -qE "\\}[[:space:]]*$" "$BODY"; then

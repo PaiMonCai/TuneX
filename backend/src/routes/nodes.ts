@@ -33,6 +33,11 @@ import {
   unbindBlockedMessage,
 } from "../services/binding-usage.ts";
 import { projectUserNode } from "../services/node-view.ts";
+import {
+  normalizeConnectIpPatch,
+  updateNodeConnectIp,
+  type NodeAddressDb,
+} from "../services/node-address.ts";
 import { collectSupportBundle, defaultSupportBundleDeps } from "../services/support-bundle.ts";
 import { checkUpgradePrecondition, renderNodeUpgradeScript, validateAgentImageRef } from "../services/node-upgrade.ts";
 import {
@@ -44,7 +49,7 @@ import {
 // （那就是第二套「是否落后」的判定，专项明令禁止）。
 import { isVersionOlder } from "../services/node-health.ts";
 import { env } from "../env.ts";
-import { PANEL_MIGRATION_CONFIG_KEY, panelMigrationView, parsePanelMigration } from "../services/node-install.ts";
+import { panelMigrationView, readPanelMigrationFromEnv } from "../services/node-install.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -73,8 +78,15 @@ nodesRoutes.use("*", async (c, next) => {
     action = "manage";
     resource = "node";
   } else if (method === "PATCH") {
-    // 修改节点安全字段（当前只有 connect_ip）：与其它资源一样按 update 授权。
-    action = "update";
+    /**
+     * 修改节点安全字段（当前只有 `connect_ip`）⇒ `node:manage`。
+     *
+     * 这里**必须**是 `manage` 而不是 `update`：`services/workspace.ts:requiredPermission`
+     * 对 `resource === "node"` 只认 `read` / `manage` 两种动作，`update` 会映射成 **null**
+     * ⇒ `canWorkspaceResourceAction` 直接 false（连 owner 也过不去）。真机 PATCH 实测就是
+     * `403 permission_denied`，与本文件里 bindings / enrollment 的既有口径（manage）也不一致。
+     */
+    action = "manage";
     resource = "node";
   }
 
@@ -227,114 +239,27 @@ nodesRoutes.get("/", async (c) => {
  * 不动 `node_id`（身份）、不动 `agent_id`、不写审计之外的任何状态；响应是与 `/api/nodes`
  * 同一份投影（`nodeView`），调用方不需要第二套形状。
  */
-const NodeConnectIpPatch = z.object({
-  connect_ip: z.union([z.string(), z.null()]),
-});
-
-/** 合法主机：IPv4 / IPv6（**不带方括号**）/ RFC1123 主机名。 */
-function isDialableHost(value: string): boolean {
-  if (isIP(value) !== 0) return !value.startsWith("[") && !value.endsWith("]");
-  // 主机名：标签 1..63、总长 ≤253、不允许下划线（DNS 记录与 TLS SNI 都不接受它）
-  return /^(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(value);
-}
-
 nodesRoutes.patch("/:id", async (c) => {
   const ws = workspace(c);
   const nodeId = idParam(c, "id");
   if (nodeId === null) return c.json({ error: "节点 ID 不合法", code: "invalid_input" }, 400);
 
   const raw = await c.req.json().catch(() => null);
-  const parsed = NodeConnectIpPatch.safeParse(raw);
-  if (!parsed.success) {
+  const parsed = normalizeConnectIpPatch(raw);
+  if (!parsed.ok) return c.json({ error: parsed.message, code: parsed.code }, parsed.status);
+
+  const result = await updateNodeConnectIp(db as unknown as NodeAddressDb, {
+    nodeId,
+    workspaceId: ws.id,
+    value: parsed.value,
+  });
+  if (!result.ok) {
     return c.json(
-      {
-        error: "本端点只接受 connect_ip（字符串或 null）；其它字段请走各自的入口（角色/区间/生命周期/凭据）。",
-        code: "invalid_connect_ip",
-      },
-      400,
+      { error: result.message, code: result.code, ...(result.data ? { data: result.data } : {}) },
+      result.status,
     );
   }
-  // 未知字段一律拒绝：静默忽略会让调用方以为改成功了。
-  const extraKeys = Object.keys(raw as Record<string, unknown>).filter((key) => key !== "connect_ip");
-  if (extraKeys.length > 0) {
-    return c.json(
-      {
-        error: `本端点只接受 connect_ip，收到不支持的字段：${extraKeys.join(", ")}`,
-        code: "invalid_connect_ip",
-      },
-      400,
-    );
-  }
-
-  const node = await loadWorkspaceNode(nodeId, ws.id);
-  if (!node) return c.json({ error: "节点不存在", code: "not_found" }, 404);
-
-  const rawValue = parsed.data.connect_ip;
-  let nextValue: string | null;
-  if (rawValue === null) {
-    nextValue = null;
-  } else {
-    const trimmed = rawValue.trim();
-    if (trimmed === "") {
-      return c.json(
-        {
-          error: "connect_ip 不能是空白串：要清空地址请显式传 null。",
-          code: "invalid_connect_ip",
-        },
-        400,
-      );
-    }
-    // 一处 `connect_ip` 可以是逗号分隔的候选列表（`firstConnectIp` 取第一个），
-    // 因此逐项校验，而不是只验整串。
-    const parts = trimmed.split(",").map((part) => part.trim()).filter(Boolean);
-    if (parts.length === 0 || parts.some((part) => !isDialableHost(part))) {
-      return c.json(
-        {
-          error: "connect_ip 必须是可拨号的主机地址：IPv4 / IPv6（不带方括号）/ 主机名；多个候选用逗号分隔。",
-          code: "invalid_connect_ip",
-        },
-        400,
-      );
-    }
-    nextValue = parts.join(",");
-  }
-
-  if (nextValue === null) {
-    /**
-     * 清空地址要**先确认没人依赖它**：RELAY / 三跳的每一跳都要有一个可拨号地址，
-     * 把地址抹掉会让那些转发在下一次下发时失败。这里 fail-closed 并把依赖列出来，
-     * 让用户知道该先改什么（而不是让他自己发现"昨天还好的转发今天全红了"）。
-     */
-    const dependents = await db.tunnel.findMany({
-      where: {
-        workspace_id: ws.id,
-        tunnel_mode: "relay",
-        OR: [{ egress_node_id: nodeId }, { middle_node_id: nodeId }],
-      },
-      select: { id: true, name: true },
-      orderBy: { id: "asc" },
-      take: 10,
-    });
-    if (dependents.length > 0) {
-      return c.json(
-        {
-          error: `该节点当前是这些转发的跳，清空 connect_ip 会让它们无法下发：${dependents
-            .map((row) => `#${row.id} ${row.name}`)
-            .join("、")}。请先改掉这些转发或换成另一台节点。`,
-          code: "connect_ip_in_use",
-          data: { forwards: dependents },
-        },
-        409,
-      );
-    }
-  }
-
-  await db.node.update({ where: { id: nodeId }, data: { connect_ip: nextValue } });
-  // 回读一次再投影：响应形状与 `GET /api/nodes` 完全一致（调用方不需要第二套形状）；
-  // 回读也顺带证明"写进去了"，而不是把请求体的意图回显成事实。
-  const updated = await loadWorkspaceNode(nodeId, ws.id);
-  if (!updated) return c.json({ error: "节点不存在", code: "not_found" }, 404);
-  return c.json({ data: nodeView(updated) });
+  return c.json({ data: nodeView(result.node as never) });
 });
 
 /** Re-generate a short-lived one-click installer for an existing node. */
@@ -519,9 +444,9 @@ nodesRoutes.get("/:ingressId/upgrade-state", async (c) => {
         : { ok: false, code: precondition.code ?? null, message: precondition.message ?? null },
       offline_after_seconds: NODE_OFFLINE_AFTER_SECONDS,
       /**
-       * 面板迁移回退（task-44）：**面板侧配置了什么**。
+       * 面板迁移回退（task-44）：**面板侧配置了什么**（部署环境变量）。
        *
-       * ⚠️ 这是**面板级**配置（`config` 表的 PANEL_MIGRATION），不是这台节点的运行态：
+       * ⚠️ 这是**面板级**配置，不是这台节点的运行态：
        * "agent 现在到底在跟哪个地址说话"由 agent 上报（`panel_url_in_use` /
        * `panel_migration_id` / `panel_fallback_active`），而**面板侧还没有持久化它的列**
        * （需要一次 schema 迁移，不在本切片范围）⇒ 这里如实标注 `node_reported_state_persisted: false`，
@@ -534,200 +459,24 @@ nodesRoutes.get("/:ingressId/upgrade-state", async (c) => {
 });
 
 /**
- * 读面板级迁移配置。
+ * 读面板级迁移配置（部署环境变量：TUNEX_PANEL_MIGRATION_*）。
  *
- * **"确实没配置"与"读不到"必须分开**：前者是部署方的决定（`not_configured`，`problem=null`），
+ * **"确实没配置"与"读不到"必须分开**：前者是部署方的选择（`not_configured`，`problem=null`），
  * 后者是这次取数的降级（`unreadable`，`problem` 非空、可重试）。把两者都渲染成"未配置"
  * 就是"取不到 ⇒ 显示成没事"，正是本专项反复禁掉的那类展示错误。
  */
 async function loadPanelMigration() {
   try {
-    const row = await db.systemConfig.findUnique({ where: { name: PANEL_MIGRATION_CONFIG_KEY as never } });
-    return parsePanelMigration(row?.value ?? null);
+    return readPanelMigrationFromEnv();
   } catch (error) {
     return {
       ok: false as const,
       reason: "unreadable" as const,
-      detail: error instanceof Error ? error.message : "读取 PANEL_MIGRATION 失败",
+      detail: error instanceof Error ? error.message : "读取面板迁移配置失败",
     };
   }
 }
 
-/**
- *  —— `GET /api/nodes/:id/support-bundle`
- *
- * 一次排障快照。两条纪律：
- *   1. **白名单采集 + 确定性脱敏**（services/support-bundle.ts），凭据哈希永不入内；
- *   2. **按调用者权限裁剪段落**——只有 node:read 的身份不会拿到转发明细或审计记录，
- *      并且产物里会写明"为什么没有"。node 读出权限本身不隐含 forward/audit 读权限。
- *
- * 只读：不产生 Agent 命令、不移动 revision。
- */
-nodesRoutes.get("/:ingressId/support-bundle", async (c) => {
-  const ws = workspace(c);
-  const nodeId = idParam(c, "ingressId");
-  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
-  const sections = {
-    forwards: canWorkspaceResourceAction(ws, "read", "forward"),
-    audit: canWorkspaceResourceAction(ws, "read", "audit"),
-  };
-  const result = await collectSupportBundle(nodeId, ws.id, defaultSupportBundleDeps(), sections);
-  if (!result.ok) {
-    return c.json({ error: result.message, code: result.code, error_layer: result.error_layer }, result.status);
-  }
-  return c.json({ data: result.bundle });
-});
-
-/* ------------------------------------------------------------------ */
-/* Ingress <-> Egress bindings                                        */
-/* ------------------------------------------------------------------ */
-
-nodesRoutes.get("/:ingressId/bindings", async (c) => {
-  const ws = workspace(c);
-  const ingressId = idParam(c, "ingressId");
-  if (ingressId === null) return c.json({ error: "入口节点 ID 不合法" }, 400);
-  const ingress = await loadWorkspaceNode(ingressId, ws.id);
-  if (!ingress) return c.json({ error: "入口节点不存在" }, 404);
-  if (ingress.role !== "ingress" && ingress.role !== "both") {
-    return c.json({ error: "该节点不具备入口能力" }, 409);
-  }
-
-  const rows = await db.nodeBinding.findMany({
-    where: {
-      ingress_node_id: ingressId,
-      egress_node: { node_group: { workspace_id: ws.id } },
-    },
-    orderBy: { id: "asc" },
-    include: {
-      egress_node: { select: nodeSelect },
-    },
-  });
-
-  //  §13.6「Binding usage」：一次 groupBy 拿到全部出口的使用量，
-  // 而不是每个绑定查一次（N+1 在绑定量上来后是列表页的主要延迟来源）。
-  const usageVisible = canWorkspaceResourceAction(ws, "read", "forward");
-  const usage = bindingUsageMap(
-    usageVisible ? await db.tunnel.groupBy({
-      by: ["ingress_node_id", "egress_node_id"],
-      where: {
-        workspace_id: ws.id,
-        category: "port_forward",
-        tunnel_mode: "relay",
-        ingress_node_id: ingressId,
-        egress_node_id: { not: null },
-      },
-      _count: { _all: true },
-    }).then((groups) =>
-      groups.map((group) => ({
-        ingress_node_id: group.ingress_node_id,
-        egress_node_id: group.egress_node_id,
-        count: group._count._all,
-      })),
-    ) : [],
-  );
-
-  return c.json({
-    data: rows.map((row) => ({
-      id: row.id,
-      ingress_node_id: row.ingress_node_id,
-      egress_node_id: row.egress_node_id,
-      egress_node: nodeView(row.egress_node),
-      created_at: row.created_at,
-      // 使用量是响应投影（不新增列）：用户在解绑前就能看到影响面。
-      usage_visible: usageVisible,
-      ...(usageVisible ? lookupBindingUsage(usage, row.ingress_node_id, row.egress_node_id) : { used_by_forward_count: null, unbind_blocked: null, usage: null }),
-    })),
-  });
-});
-
-const BindingInput = z.object({
-  egress_node_id: z.number().int().positive(),
-});
-
-nodesRoutes.post("/:ingressId/bindings", async (c) => {
-  const ws = workspace(c);
-  const ingressId = idParam(c, "ingressId");
-  if (ingressId === null) return c.json({ error: "入口节点 ID 不合法" }, 400);
-  const parsed = BindingInput.safeParse(await c.req.json().catch(() => null));
-  if (!parsed.success) return c.json({ error: "出口节点 ID 不合法" }, 400);
-
-  const [ingress, egress] = await Promise.all([
-    loadWorkspaceNode(ingressId, ws.id),
-    loadWorkspaceNode(parsed.data.egress_node_id, ws.id),
-  ]);
-  if (!ingress) return c.json({ error: "入口节点不存在" }, 404);
-  if (!egress) return c.json({ error: "出口节点不存在" }, 404);
-  if (ingress.id === egress.id) return c.json({ error: "入口和出口不能是同一节点" }, 409);
-  if (ingress.role !== "ingress" && ingress.role !== "both") {
-    return c.json({ error: "入口节点角色必须是 ingress 或 both" }, 409);
-  }
-  if (egress.role !== "egress" && egress.role !== "both") {
-    return c.json({ error: "出口节点角色必须是 egress 或 both" }, 409);
-  }
-
-  const created = await db.nodeBinding.upsert({
-    where: {
-      ingress_node_id_egress_node_id: {
-        ingress_node_id: ingress.id,
-        egress_node_id: egress.id,
-      },
-    },
-    update: {},
-    create: { ingress_node_id: ingress.id, egress_node_id: egress.id },
-  });
-  return c.json({
-    data: {
-      ...created,
-      egress_node: nodeView(egress),
-      //  §13.6：新建绑定必然 0 使用量；仍显式返回，让前端的绑定行
-      // 处理逻辑不需要区分「刚创建」与「列表返回」两种形状。
-      ...bindingUsage(0),
-    },
-  }, 201);
-});
-
-nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
-  const ws = workspace(c);
-  const ingressId = idParam(c, "ingressId");
-  const egressId = idParam(c, "egressId");
-  if (ingressId === null || egressId === null) return c.json({ error: "节点 ID 不合法" }, 400);
-
-  const [ingress, egress] = await Promise.all([
-    loadWorkspaceNode(ingressId, ws.id),
-    loadWorkspaceNode(egressId, ws.id),
-  ]);
-  if (!ingress || !egress) return c.json({ error: "节点不存在" }, 404);
-
-  const used = await db.tunnel.count({
-    where: {
-      workspace_id: ws.id,
-      ingress_node_id: ingressId,
-      egress_node_id: egressId,
-      tunnel_mode: "relay",
-    },
-  });
-  if (used > 0) {
-    //  §13.6：409 文案由 `binding-usage.ts` 单点提供，与列表响应里的
-    // `used_by_forward_count` / `unbind_blocked` 用同一份判定；并回传使用量，
-    // 让前端在错误分支也能刷新按钮状态（而不是只弹一句话）。
-    return c.json(
-      {
-        error: canWorkspaceResourceAction(ws, "read", "forward") ? unbindBlockedMessage(used) : "该绑定仍存在业务依赖，请由有转发权限的成员处理后再解绑",
-        code: "binding_in_use",
-        error_layer: "runtime_admission",
-        ...(canWorkspaceResourceAction(ws, "read", "forward") ? bindingUsage(used) : {}),
-      },
-      409,
-    );
-  }
-
-  await db.nodeBinding.deleteMany({
-    where: { ingress_node_id: ingressId, egress_node_id: egressId },
-  });
-  return c.json({ data: { ok: true } });
-});
-
-/* ------------------------------------------------------------------ */
 /* PortForward compatibility API                                      */
 /* ------------------------------------------------------------------ */
 /**

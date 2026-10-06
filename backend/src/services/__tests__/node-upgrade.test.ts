@@ -32,7 +32,12 @@ const render = (over: Partial<NodeUpgradeFacts> = {}, image = "ghcr.io/tunex/age
 const identitySection = (script: string) => {
   const start = script.indexOf("# 身份校验只承认一种");
   expect(start).toBeGreaterThan(-1);
-  return script.slice(start);
+  // ⚠️ 这里拿到的是**渲染文本**：探针块位于外层 shell 的单引号串里
+  // （`PROBE="$(docker exec … sh -c '…')"`），所以块内的单引号在渲染文本里被写成
+  // `'\''`（闭合-转义-重开）。**容器里真正执行的是解转义后的内层脚本**，因此这里必须
+  // 把该转义还原——否则测的是外层文本，而不是被测对象。
+  // （L56 修复"内层单引号提前终结外层引号 ⇒ 脚本语法非法"之后，这一点才暴露出来。）
+  return script.slice(start).replace(/'\\''/g, "'");
 };
 
 describe("ordering: never take the node down for a pull that may fail", () => {
@@ -323,10 +328,21 @@ describe("identity check on the real Agent image: executable, and never a false 
  * 这里测的是"脚本里**确实**写了什么"。探针体内不含单引号，所以这个截取是安全的，
  * 取不到就直接抛（避免静默地测了个空）。
  */
+/**
+ * 把渲染文本里的"内层脚本"还原成**容器里真正执行的那份**。
+ *
+ * 探针块位于外层 shell 的单引号串里（`PROBE="$(docker exec … sh -c '…')"`），因此块内出现的
+ * 单引号在**渲染文本**里必须写成 `'\''`（闭合-转义-重开）。直接拿渲染文本当脚本跑，测的是
+ * 外层文本而不是被测对象 —— 修复"内层单引号提前终结外层引号 ⇒ 脚本语法非法"（L56 实测：
+ * `bash -n` / `dash -n` 双双 rc=2、任何节点都无法升级）之后，这一点才暴露：未还原时内层脚本
+ * 里会留下 `'\''` 四个字符，`sh` 解析到 `(.data|…)` 的 `(` 直接语法错，探针用例全部拿到空串。
+ */
+const unescapeInnerBlock = (raw: string) => raw.replace(/'\\''/g, "'");
+
 function probeBody(script: string): string {
   const match = script.match(/docker exec "\$CONTAINER" sh -c '([\s\S]*?)' sh /);
   if (!match) throw new Error("rendered upgrade script is missing the in-container identity probe");
-  return match[1]!;
+  return unescapeInnerBlock(match[1]!);
 }
 
 type PanelMode =
@@ -838,4 +854,54 @@ describe("身份探针的首选路径与兜底路径", () => {
       rmSync(box.dir, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+/**
+ * 回归：**渲染出来的脚本必须能被 POSIX shell 解析**。
+ *
+ * 为什么单独立一条：本文件里其它用例都是**字符串断言**（"脚本里有这一步/这句话"），
+ * 而"引号不配平"这种错误会让断言全绿、脚本却 `sh` 直接拒跑。真实缺陷（L56 实测）：
+ * 探针块本身用**单引号**包裹（`docker exec … sh -c '…'`），块内又出现
+ * `jq -e 'type=="object"…'` ⇒ 内层单引号**提前终结**外层引号，`(.data|…)` 的 `(` 暴露成
+ * 未加引号的 token ⇒ `bash -n` / `dash -n` 双双 rc=2、**任何节点都无法升级**，而且现场
+ * 是在"已经停掉旧容器"之后才炸，节点会停在无 agent 的状态。
+ *
+ * 所以：**先跑 `sh -n`，再断言里面有它该有的东西**。字节数门槛是为了防止
+ * "渲染函数返回空串 ⇒ 对空文件做语法检查 ⇒ 假绿"（这个假阳性我自己踩过一次）。
+ */
+describe("升级脚本必须是合法 POSIX sh（render → sh -n）", () => {
+  const facts = {
+    node_key: "REG-SYNTAX-NODE",
+    container_name: "tunex-agent",
+    current_image: "tunex-harvest-agent:cafaaba",
+  } as never;
+
+  test("渲染结果非空，且 bash/dash 的 -n 都通过（含引号不配平回归）", () => {
+    const rendered = renderNodeUpgradeScript(facts, "registry.example.com/tunex-agent:0.15.0", {
+      panelURL: "http://panel.example.com",
+      containerName: "tunex-agent",
+    });
+    const script = rendered.script;
+
+    // 1) 非空门槛（防止对空文件做语法检查得到假绿）
+    expect(script.length).toBeGreaterThan(500);
+
+    // 2) 真正跑语法检查（两条解释器都跑：脚本声明 #!/bin/sh，而 Ubuntu 的 sh 是 dash）
+    const dir = mkdtempSync(join(tmpdir(), "tunex-upgrade-syntax-"));
+    const file = join(dir, "upgrade.sh");
+    writeFileSync(file, script, { mode: 0o644 });
+    try {
+      for (const shell of ["sh", "bash", "dash"]) {
+        const proc = Bun.spawnSync([shell, "-n", file], { stdout: "pipe", stderr: "pipe" });
+        const stderr = new TextDecoder().decode(proc.stderr);
+        expect(`${shell} rc=${proc.exitCode} ${stderr.trim()}`).toBe(`${shell} rc=0 `);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    // 3) 内层单引号必须被正确转义（写成 `'\''`），否则上面的 -n 就会红；
+    //    这里把"该转义"这件事钉成显式断言，失败信息更可读。
+    expect(script).toContain(String.raw`'\''type=="object" and (.data|type=="object")'\''`);
+  }, 20_000);
 });

@@ -67,6 +67,11 @@ import {
   // 可拨号地址的唯一判据（`connect_ip` 可能是逗号分隔的候选列表，取第一个非空项）。
   firstConnectIp,
 } from "./forward-contract.ts";
+import {
+  hopAddressMissingMessage,
+  missingHopAddresses,
+  type HopAddressCandidate,
+} from "./node-address.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import { billingDayKeyStamp } from "./billing-time.ts";
 import { dayKeyOf, fillDays } from "./traffic.ts";
@@ -808,24 +813,22 @@ export async function createForward(
      * last_error 与主机指标，没有自我地址线索），而 `connect_ip` 是**运维声明的可拨号身份**
      * （NAT/公网入口无法从容器内部观测得到）。因此这里只做"缺就说清"，不猜。
      */
-    const hopNodes: Array<{ id: number; name: string; position: "中间跳" | "出口跳"; connectIp: string | null }> = [];
+    const hopNodes: HopAddressCandidate[] = [];
     if (middleId != null) {
       const middle = await loadWorkspaceNode(middleId, workspaceId);
       if (!middle) return error(404, "not_found", "中间跳节点不存在");
       hopNodes.push({ id: middle.id, name: middle.node_id, position: "中间跳", connectIp: middle.connect_ip });
     }
     hopNodes.push({ id: egress.id, name: egress.node_id, position: "出口跳", connectIp: egress.connect_ip });
-    const addresslessHops = hopNodes.filter((hop) => firstConnectIp(hop.connectIp) === null);
+    // 判据与文案都来自 `services/node-address.ts`：PATCH 入口与创建入口必须用同一份，
+    // 否则会出现"补得进去但创建仍然拒绝"（或反之）的漂移。
+    const addresslessHops = missingHopAddresses(hopNodes);
     if (addresslessHops.length > 0) {
-      const detail = addresslessHops
-        .map((hop) => `${hop.position}「${hop.name}」(#${hop.id})`)
-        .join("、");
-      return error(
-        409,
-        "hop_address_missing",
-        `${detail} 缺少可拨号地址（node.connect_ip）：RELAY/三跳的每一跳都要有一个可拨号地址，上一跳才拨得进来。请到「节点」页为该节点补上连接地址（PATCH /api/nodes/:id 的 connect_ip 字段）后重试。`,
-        { data: { nodes: addresslessHops.map((hop) => ({ id: hop.id, name: hop.name, position: hop.position })) } },
-      );
+      return error(409, "hop_address_missing", hopAddressMissingMessage(addresslessHops), {
+        data: {
+          nodes: addresslessHops.map((hop) => ({ id: hop.id, name: hop.name, position: hop.position })),
+        },
+      });
     }
   }
 
