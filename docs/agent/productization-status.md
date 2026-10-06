@@ -1031,6 +1031,26 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 ### #10 终局判定：**未达成（不变）**
 要件①部分支撑（只差上一条载体）、要件②在 `task-26` 未验证、要件③ LG 1→3 已部署但距 7 仍一个量级；R6 §1–§6 的三条落后理由复核不变：**② 已消除 / ③ 部分消除 / ① 部分消除**。
 
+## 3.47 终局补证（`t41b`）：把"同一个库"从间接计数升级为**服务器身份逐字相同**
+
+`notify-center` 又跑了一次最小实验（t41b），把评审 §11 剩下的"库出处"从**间接计数**升级为**直接身份**：
+```
+[1] worker 容器用自己的 DATABASE_URL 读：   {"hostname":"f9fb790dcc1e","port":3306,"db":"tunex","server_uuid":"f4343e5e-…-0242ac21000b","version":"8.4.11"}
+[2] 宿主侧 docker exec tunex-it-mysql 读：   {"hostname":"f9fb790dcc1e","port":3306,"db":"tunex","server_uuid":"f4343e5e-…-0242ac21000b","version":"8.4.11"}
+```
+**逐字相同（含 `@@server_uuid`）**；且同一次实验里三件事齐全（也写进同一份落盘文件）：
+```
+[4] 21:11:58.692208773Z [worker] cron_notification_facts: {"considered":1,"built":1,"recovered":0,"rejected":0,"skipped":0,"delivered":true}
+[5] 账本 id=24 status=sent attempts=1 target=tunex-it-e2e@tunex.local source_id=13
+    occurred_at=21:11:31.893  created_at=21:11:58.607   ← 落在 [4] 那一拍窗口内
+[6] 收件端：CONNECT from 172.33.0.48（=t41b-worker）| GREETING 220 | COMMANDS EHLO AUTH MAIL RCPT DATA | RCPT TO:<tunex-it-e2e@tunex.local>
+```
+**事实 21:11:31.898 建好 → 21:11:58 那一拍投出，全程未调用任何投递函数。**
+**落盘保留（供评审直接读）**：`/tmp/t41-smtp.log`（1645 B）、`/tmp/t41b-db-identity.log`、`/tmp/t41b-smtp.log`（三份均已复制到 `/tmp/tunex-harvest-integration-20261006/`）。
+**清理**：5/5/4/delivery 1 → **4/4/3/0**，`t41-%` 0，Redis db9 `DBSIZE=0`，`t41b-*` 容器 0；`tunex-it-*` 全程 running。
+
+⇒ 这三条正好覆盖评审 §11 给出的**闭合三选一**（worker 那一拍日志落盘 / 库身份 / 不清理重跑），因此 **`#10` 要件 ① 有望从"部分支撑"改判"支撑"**——但**尚未经评审复核**，故本节只记录事实、**不改判定**。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
