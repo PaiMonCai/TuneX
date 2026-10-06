@@ -127,14 +127,4 @@ export const dashboardApi = {
      */
     attention: (cookie?: string) =>
       get<AttentionPayload>("/dashboard/attention", undefined, cookie),
-  },
-  /**
-   * 用户侧公告。
-   *
-   * 只有两个方法：读列表、标记已读。**没有**免打扰偏好的读写 —— 契约 §9.5 明确本期
-   * 不做通知中心前端（渠道偏好矩阵 UI），后端那两个端点由后端契约测试覆盖；
-   * 没有 UI 的客户端方法就是死代码。
-   *
-   * 可见性（platform ∪ 本 workspace、未撤回）与"我是否已读"都由后端算好，
-   * 前端不重判（`lib/announcements.ts` 只做形状校验与展示排序）。
-   */
+};

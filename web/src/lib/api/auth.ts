@@ -162,5 +162,4 @@ export const authApi = {
     /** 用邮件 token 设置新密码。 */
     resetPassword: async (token: string, password: string) =>
       post<{ ok: boolean }>("/auth/reset-password", { token, password }),
-  },
-  // 个人设置
+};

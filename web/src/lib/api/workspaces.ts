@@ -150,5 +150,4 @@ export const workspacesApi = {
       cookie?: string,
     ) =>
       get<WorkspaceTrafficSummary>(`/workspaces/${id}/traffic`, params as ListQuery, cookie),
-  },
-  // 认证
+};

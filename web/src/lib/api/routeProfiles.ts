@@ -140,4 +140,3 @@ export const routeProfilesApi = {
     available: (cookie?: string) =>
       get<ConsumableRouteProfileList>("/route-profiles/available", undefined, cookie),
 };
-

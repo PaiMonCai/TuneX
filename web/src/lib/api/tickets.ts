@@ -118,15 +118,4 @@ export const ticketsApi = {
     list: (query?: ListQuery, cookie?: string) => get<Paginated<Ticket>>("/tickets", query, cookie),
     create: (input: { title: string; content: string }, cookie?: string) =>
       post<Ticket>("/tickets", input, cookie),
-  },
-  // 管理端
-  /**
-   * V5-WP13.5B Route Profile（线路模板）—— **不走 `/api/admin/*`**。
-   *
-   * 后端刻意复用 workspace 域 RBAC（`resolveWorkspaceAccess` 的 `node` 资源族，
-   * 与 node-groups 同口径）、读写闸门 read/manage；Admin 与 User 只是**同一套资源
-   * 的两个 UX 面**（§9.4.1：前端 guard 只做 UX）。因此这里用普通路径。
-   *
-   * 失败形状：`{ error, code, error_layer, retryable, next_action }`（注意人读原因是
-   * `error` 而非 `message`）；`ApiError.data` 就是它，页面用 next_action 直接展示「下一步」。
-   */
+};

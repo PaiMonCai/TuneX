@@ -123,5 +123,4 @@ export const settingsApi = {
       post<{ ok: boolean; api_key: string; user: User }>("/settings/api-key", {}, cookie),
     regenerateSubscriptionKey: (cookie?: string) =>
       post<{ ok: boolean; subscription_key: string; user: User }>("/settings/subscription-key", {}, cookie),
-  },
-  // 用户端
+};

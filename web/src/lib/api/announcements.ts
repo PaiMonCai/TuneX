@@ -122,5 +122,4 @@ export const announcementsApi = {
         {},
         cookie,
       ),
-  },
-  // 用户产品面统一使用 /forwards；/api/tunnels 仅保留后端兼容。
+};

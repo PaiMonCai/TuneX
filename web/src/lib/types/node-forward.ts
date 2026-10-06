@@ -1,4 +1,5 @@
 /** Domain types extracted from the legacy flat types.ts facade. */
+import type { ForwardProtocolFact } from "../forward-protocol";
 import type { ID, Status, LBStrategy, Node, TunnelApplyStatus, TunnelDesiredStatus, Tunnel } from "./base";
 import type { ListQuery } from "./attention";
 import type { NodeConnectionValue, NodeRuntimeCounts, NodeHostMetrics } from "./node-health";

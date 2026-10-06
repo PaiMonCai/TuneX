@@ -6,7 +6,6 @@ import type { NodeLifecycleValue } from "./node-health";
  * 与 backend/prisma/schema.prisma 对齐的前端类型定义。
  * 命名保持 Prisma 原样（snake_case），避免与后端 JSON 字段不一致。
  */
-import type { ForwardProtocolFact } from "./forward-protocol";
 
 export type ID = number;
 
