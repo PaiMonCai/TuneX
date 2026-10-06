@@ -109,10 +109,11 @@ const fakeDb = () => {
         const rows = leases.filter((lease) =>
           Object.entries(where).every(([key, value]) => value === undefined || lease[key] === value),
         );
-        if (!a.select) return rows.map((lease) => ({ ...lease }));
+        const select = a.select;
+        if (!select) return rows.map((lease) => ({ ...lease }));
         return rows.map((lease) => {
           const selected: Record<string, unknown> = {};
-          for (const [key, enabled] of Object.entries(a.select)) {
+          for (const [key, enabled] of Object.entries(select)) {
             if (enabled) selected[key] = lease[key];
           }
           return selected;
