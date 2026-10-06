@@ -42,4 +42,35 @@ describe("command ACK hop endpoint contract", () => {
     expect(ack.status).toBe("applied");
     expect(ack.hop_local_addr).toBe("172.31.20.10:53121");
   });
+
+  test("malformed hop_local_addr is rejected at the control-protocol boundary", () => {
+    const validator = new ControlValidator();
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+
+    for (const hopLocalAddr of [
+      "172.31.20.10",
+      "172.31.20.10:0",
+      "172.31.20.10:70000",
+      "[2001:db8::1]",
+      " 172.31.20.10:53121",
+    ]) {
+      const result = validator.validate({
+        command_id: `ack-${hopLocalAddr}`.slice(0, 64),
+        resource: "tunnel",
+        resource_id: "tunex-42-relay",
+        revision: 7,
+        action: "command_ack",
+        expires_at: expiresAt,
+        payload: {
+          acked_command_id: "cmd-hop-endpoint",
+          status: "applied",
+          applied_revision: 7,
+          hop_local_addr: hopLocalAddr,
+        },
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error_code).toBe("payload_invalid");
+    }
+  });
+
 });
