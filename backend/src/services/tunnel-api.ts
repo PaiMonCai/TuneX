@@ -197,9 +197,6 @@ export interface TunnelApiDb {
   tunnelChain?: {
     deleteMany(args: unknown): Promise<unknown>;
   };
-  tunnelTraffic?: {
-    deleteMany(args: unknown): Promise<unknown>;
-  };
   nodeGroup: {
     findUnique(args: unknown): Promise<unknown>;
   };
@@ -836,8 +833,10 @@ export async function runTunnelAction(
     }
 
     if (orchestrator) {
-      // 逆序拆除（先近后远）：中间跳 → 出口 → 入口。即使一条腿失败也继续尝试
-      // 其它腿，但只要有任何一条未确认撤除，就保留 Tunnel + lease 供后续重试。
+      // Stop accepting new traffic first, then dismantle downstream legs:
+      // ingress → transit → egress. Even if one leg fails, continue attempting
+      // the rest to minimize residual runtime surface; any uncertainty keeps the
+      // durable Tunnel + lease for retry/reconcile.
       const teardownErrors: string[] = [];
       const remove = async (
         label: string,
@@ -853,6 +852,15 @@ export async function runTunnelAction(
         }
       };
 
+      if (ingressNode) {
+        await remove("ingress", {
+          tunnelId,
+          node: ingressNode as never,
+          direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
+          revision,
+          reason: "tunnel deleted",
+        });
+      }
       if (tunnel.tunnel_mode === "relay" && middleNode) {
         await remove("transit", {
           tunnelId,
@@ -871,15 +879,6 @@ export async function runTunnelAction(
           reason: "tunnel deleted",
         });
       }
-      if (ingressNode) {
-        await remove("ingress", {
-          tunnelId,
-          node: ingressNode as never,
-          direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
-          revision,
-          reason: "tunnel deleted",
-        });
-      }
 
       if (teardownErrors.length > 0) {
         return err(
@@ -894,10 +893,10 @@ export async function runTunnelAction(
     // allocator remains conservative), so it must not resurrect an already
     // withdrawn runtime; dangling leases remain recoverable by lease reconcile.
     await releaseLease({ tunnelId }).catch(() => {});
-    // Child rows are legacy relational data with restrictive FKs. Runtime must
-    // be withdrawn first, then children can be removed before the Tunnel row.
+    // Runtime-owned relational rows may be removed, but traffic is an immutable
+    // accounting ledger. tunnel_traffic deliberately has no Tunnel FK and survives
+    // this delete with its archived workspace_id attribution intact.
     await pdb.tunnelChain?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
-    await pdb.tunnelTraffic?.deleteMany({ where: { tunnel_id: tunnel.id } }).catch(() => {});
     await pdb.tunnel.delete({ where: { id: tunnel.id } }).catch((e: unknown) => {
       throw toTunnelApiError(e, "删除失败");
     });
