@@ -7,6 +7,7 @@ import type { UserNode } from "@/lib/types";
 import type { ForwardModeFilter,ForwardStatusFilter } from "@/components/forwards/forward-list-model";
 import type { ForwardListTextKey } from "@/components/forwards/forward-list-model";
 type Translate=(key:string,params?:Record<string,string|number>)=>string;
+type ListText = (key: ForwardListTextKey, params?: Record<string, string | number>) => string;
 export function ForwardToolbar({mode,status,ingress,egress,keyword,ingressNodes,egressNodes,canCreate,t,text,onMode,onStatus,onIngress,onEgress,onKeyword,onCreate}:{mode:ForwardModeFilter;status:ForwardStatusFilter;ingress:string;egress:string;keyword:string;ingressNodes:UserNode[];egressNodes:UserNode[];canCreate:boolean;t:Translate;text: ListText;onMode:(v:ForwardModeFilter)=>void;onStatus:(v:ForwardStatusFilter)=>void;onIngress:(v:string)=>void;onEgress:(v:string)=>void;onKeyword:(v:string)=>void;onCreate:(mode:"direct"|"relay")=>void}){return <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex flex-wrap items-center gap-2">
  {(["all","direct","relay"] as const).map(v=><Button key={v} size="sm" variant={mode===v?"default":"outline"} onClick={()=>onMode(v)}>{t(v==="all"?"forward.all":`forward.${v}`)}</Button>)}
  <Input className="h-9 w-64" value={keyword} onChange={e=>onKeyword(e.target.value)} placeholder={t("forward.searchPlaceholder")} data-testid="forward-keyword"/>
