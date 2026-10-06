@@ -207,6 +207,26 @@ sed -i "s#^TUNEX_AGENT_IMAGE=.*#TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:
 
 Panel 主机若拉 private GHCR 包可先 `docker login ghcr.io`。但 **Agent 镜像必须允许节点匿名拉取**，否则控制台生成的一键安装命令无法做到无额外 registry 登录；使用 GHCR 时应将 `tunex-agent` package 设为 public，或把 `TUNEX_AGENT_IMAGE` 指向节点可访问的公开镜像仓库。
 
+#### Agent 版本（`AGENT_VERSION`）—— 决定"是否落后"能不能被判出来
+
+Agent 镜像的构建参数 `AGENT_VERSION` 决定该镜像**上报给面板的 Agent 版本**（`agent/main.go` 的
+`version` 变量 → 状态上报体 `"version"` → `node_state_report.version`）。面板判定"节点 Agent 是否落后"
+就是拿**这个上报值**去比 `TUNEX_AGENT_LATEST_VERSION`（`backend/src/services/node-health.ts:isVersionOlder`）。
+
+- **发布镜像**：CI（`.github/workflows/release.yml`）用 git tag 注入（tag `v0.14.0` ⇒ 上报 `0.14.0`，前导
+  `v` 在构建时去掉），并在发布前做**版本门**：二进制报出的版本必须等于 tag，否则发布失败。
+- **本地构建**必须显式给，否则只会上报 `unknown`（面板对 `unknown` 只显示「无法判定」——
+  那是"没有版本信息"，**不是**"已是最新"）：
+
+  ```bash
+  docker build -f agent/Dockerfile --build-arg AGENT_VERSION=v0.14.0 \
+    -t ghcr.io/paimoncai/tunex-agent:v0.14.0 .
+  ```
+
+- **两侧同口径**才比得出来：上报版本与基线都要是**版本号**（首段是数字，如 `0.14.0`）。
+  基线用安装器写：`scripts/ops/install.sh install --version <git-sha> --agent-version 0.14.0`
+  （`--version` 是镜像锚，**不会**被写进基线；传 git sha 当基线会被直接拒绝）。
+
 ### 2.4 启动（默认：宿主机反代直连）
 
 ```bash

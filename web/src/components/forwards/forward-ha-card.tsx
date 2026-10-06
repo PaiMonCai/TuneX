@@ -1,5 +1,8 @@
 "use client";
 
+// 行为参照：ForwardX（AGPL-3.0-only）——多入口/转发组（成员顺序即优先级、当前入口失效后切到
+// 下一个可用成员、"恢复后切回"开关、以及"在线 ≠ 可用"的成员状态口径）；代码为本项目改写，
+// 未复制其实现。参照溯源：docs/agent/forwardx-code-reuse.md。
 /**
  * Forward 详情 · 高可用（多入口 / 首选入口）自包含卡片。
  *
@@ -90,9 +93,21 @@ export interface HaCopy {
   candidateNoneHint: string;
   candidateUnavailable: (reason: string) => string;
   candidateUnavailableCaveat: string;
-  optionsUnavailable: string;
-  chooseTitle: string;
-  chooseHint: string;
+  membersTitle: string;
+  membersHint: string;
+  membersUnavailable: string;
+  membersEmpty: string;
+  membersNoTakeover: string;
+  orderSource: (customOrderSupported: boolean) => string;
+  optionIsFailbackTarget: string;
+  canTakeOver: (rank: number | null) => string;
+  cannotTakeOver: (reason: string) => string;
+  failbackTitle: string;
+  failbackOn: string;
+  failbackOff: string;
+  failbackNoTarget: string;
+  failbackProgress: (healthy: number, required: number, met: boolean) => string;
+  failbackCaveat: string;
   optionFacts: (connection: string, acceptsNewBusiness: string, lifecycle: string) => string;
   optionIsActive: string;
   optionIsPreferred: string;
@@ -160,10 +175,33 @@ const ZH: HaCopy = {
     `候选入口这次没有读到（reason: ${reason}）。`,
   candidateUnavailableCaveat:
     "「没有读到」不等于「没有候选」：它既不能说明有机器能接管，也不能说明没有。刷新一次再判断。",
-  optionsUnavailable: "首选入口的备选集合这次没有读到：不能在此挑选，也不代表组内没有别的节点。",
-  chooseTitle: "设置 / 清除首选入口",
-  chooseHint:
-    "可以选组内任何 role 为 ingress / both 的节点（包括此刻离线或维护中的机器：偏好表达的是「它回来后优先归它」）。写入不重启转发、不触发下发。",
+  membersTitle: "入口成员与优先级",
+  membersHint:
+    "成员集合就是这条转发的入口节点组。次序是平台当前的接管次序（不是可以随意拖动的自定义顺序）。每台成员下面分开写三件事：连接（事实）、新业务准入（结论）、以及此刻能不能接管（failover 判定）。",
+  membersUnavailable:
+    "这次没有读到成员列表：不能据此判断有哪些入口，也不代表这个入口组里没有成员。",
+  membersEmpty:
+    "这个入口节点组里没有任何成员 —— 这不是「没有可用候选」，而是组里确实一台都没有。",
+  membersNoTakeover:
+    "有成员，但此刻没有一台能接管：每台下面写了它自己的原因（离线 / 维护中 / 角色不符 / 凭据被吊销）。",
+  orderSource: (customOrderSupported) =>
+    customOrderSupported
+      ? "顺序：按这条转发的自定义成员顺序。"
+      : "顺序来源：平台规则（合格的候选按节点 id 升序），按这条转发自定义顺序尚未提供。",
+  optionIsFailbackTarget: "回切目标",
+  canTakeOver: (rank) =>
+    rank === null ? "此刻可接管" : `此刻可接管（平台次序第 ${rank} 位）`,
+  cannotTakeOver: (reason) => `此刻不可接管（${reason}）`,
+  failbackTitle: "恢复后切回（恢复观察）",
+  failbackOn:
+    "平台已启用自动回切（auto_failback）：首选入口恢复、并满足恢复观察后，平台会尝试把它切回来。",
+  failbackOff:
+    "平台未启用自动回切（auto_failback=false）：即使首选入口恢复，平台也不会自动切回 —— 首选只是被记录下来的期望。",
+  failbackNoTarget: "还没有首选入口 ⇒ 回切没有目标。",
+  failbackProgress: (healthy, required, met) =>
+    `首选入口连续健康 ${healthy}/${required} 次（${met ? "已满足" : "未满足"}平台阈值）。`,
+  failbackCaveat:
+    "恢复观察与迁移冷却由平台策略判定：本卡片只回显计数与阈值，不预告迁移什么时候发生。",
   optionFacts: (connection, acceptsNewBusiness, lifecycle) =>
     `连接：${connection} · 新业务：${acceptsNewBusiness} · 生命周期：${lifecycle}`,
   optionIsActive: "当前归属",
@@ -240,10 +278,32 @@ const EN: HaCopy = {
   candidateUnavailable: (reason) => `The candidate was not readable this time (reason: ${reason}).`,
   candidateUnavailableCaveat:
     "\"Not readable\" is not \"no candidate\": it neither shows that a machine could take over nor that none could. Reload and judge again.",
-  optionsUnavailable: "The set of possible preferred ingresses was not readable: you cannot pick one here, and it does not mean the group holds no other node.",
-  chooseTitle: "Set / clear the preferred ingress",
-  chooseHint:
-    "You may pick any node in the group whose role is ingress or both (including machines that are offline or in maintenance right now: the preference means \"prefer it once it is back\"). Writing it does not restart the forward and does not trigger a rollout.",
+  membersTitle: "Ingress members and priority",
+  membersHint:
+    "The member set is this forward's ingress node group. The order is the platform's current takeover order (not a freely draggable custom order). Each member lists three separate things: connection (fact), new-business admission (conclusion), and whether it can take over right now (the failover judgement).",
+  membersUnavailable:
+    "The member list was not readable this time: you cannot tell which ingresses exist from this, and it does not mean the group has no member.",
+  membersEmpty:
+    "This ingress node group holds no member at all — that is not \"no eligible candidate\"; it is an empty group.",
+  membersNoTakeover:
+    "There are members, but none can take over right now: each one lists its own reason (offline / maintenance / wrong role / revoked credential).",
+  orderSource: (customOrderSupported) =>
+    customOrderSupported
+      ? "Order: this forward's custom member order."
+      : "Order source: platform rule (eligible candidates by ascending node id); a per-forward custom order is not available yet.",
+  optionIsFailbackTarget: "failback target",
+  canTakeOver: (rank) => (rank === null ? "can take over now" : `can take over now (takeover position ${rank})`),
+  cannotTakeOver: (reason) => `cannot take over now (${reason})`,
+  failbackTitle: "Switch back after recovery (recovery observation)",
+  failbackOn:
+    "Automatic failback is enabled (auto_failback): once the preferred ingress recovers and passes the recovery observation, the platform will try to switch back to it.",
+  failbackOff:
+    "Automatic failback is not enabled (auto_failback=false): even if the preferred ingress recovers, the platform will not switch back automatically — the preference is only a recorded expectation.",
+  failbackNoTarget: "No preferred ingress yet ⇒ failback has no target.",
+  failbackProgress: (healthy, required, met) =>
+    `Preferred ingress has been consecutively healthy ${healthy}/${required} times (${met ? "meets" : "below"} the platform threshold).`,
+  failbackCaveat:
+    "Recovery observation and migration cooldown are decided by the platform policy: this card only mirrors the counter and threshold, and does not predict when a migration happens.",
   optionFacts: (connection, acceptsNewBusiness, lifecycle) =>
     `Connection: ${connection} · New business: ${acceptsNewBusiness} · Lifecycle: ${lifecycle}`,
   optionIsActive: "current owner",
@@ -360,8 +420,8 @@ export function optionOf(
   nodeId: number | null,
 ): ForwardHaOptionNode | null {
   if (nodeId === null) return null;
-  if (projection.preference_options.status !== "ok") return null;
-  return projection.preference_options.nodes.find((node) => node.node_id === nodeId) ?? null;
+  if (projection.ingress_members.status !== "ok") return null;
+  return projection.ingress_members.nodes.find((node) => node.node_id === nodeId) ?? null;
 }
 
 /** 策略是否至少打开了一个开关（`false` 一律是「未启用」，不做任何乐观解释）。 */
@@ -374,10 +434,20 @@ export function candidateKind(candidate: ForwardHaCandidate): ForwardHaCandidate
   return candidate.status;
 }
 
-/** 备选集合里可以设为首选的节点（按 id 升序）。 */
+/**
+ * 入口成员（**有序**：与后端 `ingress_members` 顺序一致 = 平台当前的接管次序）。
+ *
+ * 刻意**不重新排序**：顺序是服务端事实（`failover_rank` 就是它），前端照抄才不会出现
+ * "界面上的第 1 名"与"平台会切到的那台"不是一个东西。
+ */
 export function preferredCandidates(projection: ForwardHaProjection): ForwardHaOptionNode[] {
-  if (projection.preference_options.status !== "ok") return [];
-  return [...projection.preference_options.nodes].sort((a, b) => a.node_id - b.node_id);
+  if (projection.ingress_members.status !== "ok") return [];
+  return [...projection.ingress_members.nodes];
+}
+
+/** 组内是否至少有一台**此刻能接管**的成员（与"没有成员"是两件事）。 */
+export function hasTakeover(nodes: readonly ForwardHaOptionNode[]): boolean {
+  return nodes.some((node) => node.can_take_over);
 }
 
 /* ================================================================== */
@@ -421,7 +491,7 @@ export function ForwardHaPanel({
   const candidate = projection?.failover_candidate ?? null;
   const preferredNode = projection ? optionOf(projection, projection.preferred_ingress_node_id) : null;
   const activeNode = projection ? optionOf(projection, projection.active_ingress_node_id) : null;
-  const options = projection ? projection.preference_options : null;
+  const members = projection ? projection.ingress_members : null;
 
   return (
     <section data-testid="forward-ha" className="rounded-lg border border-[var(--border)] p-4">
@@ -574,69 +644,101 @@ export function ForwardHaPanel({
             ) : null}
           </div>
 
-          {/* ⑤ 首选入口的备选集合（写入路径规则 + 并列事实） */}
-          <div data-testid="forward-ha-options">
-            <h4 className="text-sm font-medium">{copy.chooseTitle}</h4>
-            <p className="mt-1 text-xs text-[var(--muted-foreground)]">{copy.chooseHint}</p>
-            {options?.status === "unavailable" ? (
-              <p role="alert" data-testid="forward-ha-options-unavailable" className="mt-2 text-sm">
-                {copy.optionsUnavailable}
+          {/* ⑤ 入口成员与优先级（有序；行为参照 ForwardX 的"成员即优先级"） */}
+          <div data-testid="forward-ha-members">
+            <h4 className="text-sm font-medium">{copy.membersTitle}</h4>
+            <p className="mt-1 text-xs text-[var(--muted-foreground)]">{copy.membersHint}</p>
+            {members?.status === "unavailable" ? (
+              <p role="alert" data-testid="forward-ha-members-unavailable" className="mt-2 text-sm">
+                {copy.membersUnavailable}
               </p>
             ) : null}
-            {options?.status === "ok" ? (
-              <ul className="mt-2 space-y-2">
-                {preferredCandidates(projection).map((node) => (
-                  <li
-                    key={node.node_id}
-                    data-testid={`forward-ha-option-${node.node_id}`}
-                    className="rounded border border-[var(--border)] p-2"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="text-sm">
-                        <span className="font-medium">{node.name}</span>
-                        <span className="ml-1 text-xs text-[var(--muted-foreground)]">#{node.node_id}</span>
-                        {node.is_active_ingress ? (
-                          <span className="ml-2 text-xs" data-testid={`forward-ha-option-active-${node.node_id}`}>
-                            {copy.optionIsActive}
-                          </span>
-                        ) : null}
-                        {node.is_preferred ? (
-                          <span className="ml-2 text-xs" data-testid={`forward-ha-option-preferred-${node.node_id}`}>
-                            {copy.optionIsPreferred}
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {node.can_be_preferred ? (
-                          <button
-                            type="button"
-                            data-testid={`forward-ha-set-${node.node_id}`}
-                            disabled={busy || node.is_preferred || !onSetPreferred}
-                            onClick={() => onSetPreferred?.(node.node_id)}
-                            className="rounded border border-[var(--border)] px-2 py-0.5 text-xs disabled:opacity-50"
+            {members?.status === "ok" && members.nodes.length === 0 ? (
+              <p data-testid="forward-ha-members-empty" className="mt-2 text-sm">
+                {copy.membersEmpty}
+              </p>
+            ) : null}
+            {members?.status === "ok" && members.nodes.length > 0 ? (
+              <>
+                <p className="mt-1 text-xs text-[var(--muted-foreground)]" data-testid="forward-ha-members-order-source">
+                  {copy.orderSource(projection.member_priority.custom_order_supported)}
+                </p>
+                {!hasTakeover(members.nodes) ? (
+                  <p data-testid="forward-ha-members-no-takeover" className="mt-1 text-sm">
+                    {copy.membersNoTakeover}
+                  </p>
+                ) : null}
+                <ol className="mt-2 space-y-2">
+                  {members.nodes.map((node) => (
+                    <li
+                      key={node.node_id}
+                      data-testid={`forward-ha-option-${node.node_id}`}
+                      className="rounded border border-[var(--border)] p-2"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-sm">
+                          <span
+                            className="mr-2 inline-block min-w-5 rounded border border-[var(--border)] px-1 text-center text-xs"
+                            data-testid={`forward-ha-rank-${node.node_id}`}
                           >
-                            {pendingNodeId === node.node_id ? copy.setting : copy.setPreferred}
-                          </button>
-                        ) : (
-                          <span className="text-xs" data-testid={`forward-ha-option-rejected-${node.node_id}`}>
-                            {copy.optionCannot(node.preference_rejection ?? "unknown")}
+                            {node.failover_rank ?? "—"}
                           </span>
-                        )}
+                          <span className="font-medium">{node.name}</span>
+                          <span className="ml-1 text-xs text-[var(--muted-foreground)]">#{node.node_id}</span>
+                          {node.is_active_ingress ? (
+                            <span className="ml-2 text-xs" data-testid={`forward-ha-option-active-${node.node_id}`}>
+                              {copy.optionIsActive}
+                            </span>
+                          ) : null}
+                          {node.is_failback_target ? (
+                            <span className="ml-2 text-xs" data-testid={`forward-ha-option-failback-${node.node_id}`}>
+                              {copy.optionIsFailbackTarget}
+                            </span>
+                          ) : null}
+                          {node.is_preferred ? (
+                            <span className="ml-2 text-xs" data-testid={`forward-ha-option-preferred-${node.node_id}`}>
+                              {copy.optionIsPreferred}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {node.can_be_preferred ? (
+                            <button
+                              type="button"
+                              data-testid={`forward-ha-set-${node.node_id}`}
+                              disabled={busy || node.is_preferred || !onSetPreferred}
+                              onClick={() => onSetPreferred?.(node.node_id)}
+                              className="rounded border border-[var(--border)] px-2 py-0.5 text-xs disabled:opacity-50"
+                            >
+                              {pendingNodeId === node.node_id ? copy.setting : copy.setPreferred}
+                            </button>
+                          ) : (
+                            <span className="text-xs" data-testid={`forward-ha-option-rejected-${node.node_id}`}>
+                              {copy.optionCannot(node.preference_rejection ?? "unknown")}
+                            </span>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                    <p className="mt-1 text-xs text-[var(--muted-foreground)]">
-                      {copy.roleLabel}: {node.role ?? "—"} ·{" "}
-                      <span data-testid={`forward-ha-option-facts-${node.node_id}`}>
-                        {copy.optionFacts(
-                          connectionText(copy, node.connection),
-                          acceptsText(copy, node),
-                          lifecycleText(copy, node.lifecycle),
-                        )}
-                      </span>
-                    </p>
-                  </li>
-                ))}
-              </ul>
+                      <p className="mt-1 text-xs text-[var(--muted-foreground)]">
+                        {copy.roleLabel}: {node.role ?? "—"} ·{" "}
+                        <span data-testid={`forward-ha-option-facts-${node.node_id}`}>
+                          {copy.optionFacts(
+                            connectionText(copy, node.connection),
+                            acceptsText(copy, node),
+                            lifecycleText(copy, node.lifecycle),
+                          )}
+                        </span>
+                      </p>
+                      {/* 「能不能接管」是**另一个**问题（failover 判定），单独一行说，不与上一条混。 */}
+                      <p className="mt-1 text-xs" data-testid={`forward-ha-option-takeover-${node.node_id}`}>
+                        {node.can_take_over
+                          ? copy.canTakeOver(node.failover_rank)
+                          : copy.cannotTakeOver(node.takeover_rejection ?? "unknown")}
+                      </p>
+                    </li>
+                  ))}
+                </ol>
+              </>
             ) : null}
             <div className="mt-2">
               <button
@@ -649,6 +751,30 @@ export function ForwardHaPanel({
                 {pendingNodeId === null ? copy.clearing : copy.clearPreferred}
               </button>
             </div>
+          </div>
+
+          {/* ⑥ 恢复后切回（平台真值 + 回切进度；期望已有，但能不能切回由平台开关决定） */}
+          <div data-testid="forward-ha-failback">
+            <h4 className="text-sm font-medium">{copy.failbackTitle}</h4>
+            <p className="mt-1 text-sm" data-testid="forward-ha-failback-switch">
+              {projection.failback.auto_failback ? copy.failbackOn : copy.failbackOff}
+            </p>
+            {projection.failback.preferred_ingress_node_id === null ? (
+              <p className="mt-1 text-xs text-[var(--muted-foreground)]" data-testid="forward-ha-failback-no-target">
+                {copy.failbackNoTarget}
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-[var(--muted-foreground)]" data-testid="forward-ha-failback-progress">
+                {copy.failbackProgress(
+                  projection.failback.progress.healthy_checks,
+                  projection.failback.progress.required_checks,
+                  projection.failback.progress.met,
+                )}
+              </p>
+            )}
+            <p className="mt-1 text-xs text-[var(--muted-foreground)]" data-testid="forward-ha-failback-caveat">
+              {copy.failbackCaveat}
+            </p>
           </div>
 
           {writeError ? (

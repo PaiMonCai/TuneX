@@ -48,7 +48,10 @@ export interface ForwardHaCandidate {
   reason: string | null;
 }
 
-/** 首选入口备选集合里的一个节点：身份 + 并列事实 + 写入路径规则的结果。 */
+/**
+ * 入口成员（行为参照 ForwardX 转发组的"成员即优先级"）：身份 + 并列事实 + 三个**不同**的
+ * 判定结果 —— 能不能当首选（写入路径规则）/ 此刻能不能接管（failover 判定）/ 平台给的接管次序。
+ */
 export interface ForwardHaOptionNode {
   node_id: number;
   name: string;
@@ -70,6 +73,30 @@ export interface ForwardHaOptionNode {
   accepts_new_business: boolean;
   /** `accepts_new_business=false` 时的原因码。 */
   admission_rejection: string | null;
+  /** 它此刻是不是平台的**回切目标**（偏好 ≠ 现任时才成立，与 failover 同口径）。 */
+  is_failback_target: boolean;
+  /** 此刻能不能接管这条转发（非现任 + 准入 + 角色 + 凭据 + 在线，与 failover 同一份判定）。 */
+  can_take_over: boolean;
+  /** `can_take_over=false` 时的**第一个**不满足条件的原因码。 */
+  takeover_rejection: string | null;
+  /** 平台当前的接管次序（1 起）；不能接管时为 `null`。顺序来源见 `member_priority`。 */
+  failover_rank: number | null;
+}
+
+/** 「恢复后切回」的真值与进度（阈值来自后端 `failover-thresholds.ts` 的单一数值来源）。 */
+export interface ForwardHaFailback {
+  /** 平台开关真值（与 `policy.auto_failback` 同源；这里重复一次是为了让"回切"可独立消费）。 */
+  auto_failback: boolean;
+  /** 偏好 ≠ 现任时，平台此刻会把它当回切目标；否则 `null`。 */
+  target_node_id: number | null;
+  preferred_ingress_node_id: number | null;
+  progress: {
+    /** `tunnel.failback_healthy_checks`：首选节点连续判定健康的次数（跨节拍的事实）。 */
+    healthy_checks: number;
+    /** 策略要求的连续次数。 */
+    required_checks: number;
+    met: boolean;
+  };
 }
 
 export interface ForwardHaProjection {
@@ -80,9 +107,21 @@ export interface ForwardHaProjection {
   active_ingress_node_id: number | null;
   policy: ForwardHaPolicy;
   failover_candidate: ForwardHaCandidate;
-  preference_options:
+  /**
+   * 入口成员的**有序**视图。三个必须分得开的态：
+   *   · `status: "unavailable"` ⇒ 这次**读不到**成员列表（不是"没有成员"）；
+   *   · `status: "ok"` + `nodes: []` ⇒ 组里**确实没有成员**；
+   *   · `nodes` 非空但没有任何 `can_take_over` ⇒ 有成员，但此刻**没有能接管的**。
+   */
+  ingress_members:
     | { status: "ok"; nodes: ForwardHaOptionNode[] }
     | { status: "unavailable"; nodes: [] };
+  /** 成员顺序的来源与能力：当前是平台固定规则，按转发自定义顺序**不支持**。 */
+  member_priority: {
+    source: "platform_rule_node_id_asc";
+    custom_order_supported: boolean;
+  };
+  failback: ForwardHaFailback;
 }
 
 /** `PUT /forwards/:id/preferred-ingress` 的成功形状。 */

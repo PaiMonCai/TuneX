@@ -126,6 +126,9 @@ function middleHopsOf(db: Store): Map<number, number> {
   return rows;
 }
 
+/** 账本日界（与真机 `BILLING_TIME_ZONE` 同值；mock 不 import 后端模块）。 */
+const LEDGER_TZ = "Asia/Shanghai";
+
 export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promise<rt.MockResponse | null> {
   const { method, clean, seg, q, db, user, req, scopeId } = ctx;
   if (seg[0] === "forwards") {
@@ -531,6 +534,57 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
       if (method === "GET" && seg[2] === "traffic") {
         const days = Math.max(1, Math.min(90, Number(q?.days ?? 14) || 14));
         return ok(tunnelTrafficSeries(tunnel.id, tunnel.traffic, days));
+      }
+      /**
+       * GET /api/forwards/:id/throughput（mock）。
+       *
+       * 与真机**同形**：窗口/粒度/单位/归档节拍/覆盖度全部由"服务端"（这里就是 mock）给出，
+       * 客户端只回显。与 `traffic` 的**关键差别**是保留缺口：
+       *   · `bytes: null` = 那天**没有归档行**（缺口）；
+       *   · `bytes: 0` = 有归档行、测到的就是 0。
+       * mock 的夹具刻意**两种都有**（每 5 天留 1 天空洞 + 若干真 0），否则开发期永远
+       * 看不到"缺口 ≠ 0"这条纪律在界面上的样子 —— 这类"mock 掩盖真实形态"本专项已踩过多次。
+       * 日键沿用 `tunnelTrafficSeries`（与 mock 的 `/traffic` 同一条横轴），最后一天 = 今天，
+       * 因此它 `complete: false`（速率分母只算已过时间）。
+       */
+      if (method === "GET" && seg[2] === "throughput") {
+        const days = Math.max(1, Math.min(90, Number(q?.days ?? 14) || 14));
+        const points = tunnelTrafficSeries(tunnel.id, tunnel.traffic, days);
+        const todayKey = points[points.length - 1]?.date ?? null;
+        // 今天已过的秒数（mock 的时钟固定为 seed.now，因此结果确定、可断言）。
+        const elapsedTodaySeconds = Math.max(
+          1,
+          Math.floor((seed.now.getTime() - new Date(`${todayKey}T00:00:00+08:00`).getTime()) / 1000),
+        );
+        const series = points.map((point, index) => {
+          const isGap = index % 5 === 3; // 确定性缺口夹具
+          const bytes = isGap ? null : point.traffic;
+          const complete = point.date !== todayKey;
+          const seconds = complete ? 86_400 : elapsedTodaySeconds;
+          return {
+            date: point.date,
+            bytes,
+            rate_bps:
+              bytes === null ? null : Math.round((bytes / seconds) * 1000) / 1000,
+            complete,
+          };
+        });
+        const daysWithData = series.filter((point) => point.bytes !== null).length;
+        const totalBytes = series.reduce((sum, point) => sum + (point.bytes ?? 0), 0);
+        return ok({
+          forward_id: id,
+          granularity: "day",
+          unit: "bytes_per_second",
+          window: { from: series[0]?.date ?? null, to: todayKey, days, time_zone: LEDGER_TZ },
+          series,
+          summary: {
+            total_bytes: totalBytes,
+            avg_rate_bps_over_window: Math.round((totalBytes / (days * 86_400)) * 1000) / 1000,
+            coverage: { days_with_data: daysWithData, days_missing: series.length - daysWithData },
+          },
+          archive: { interval_minutes: 10, today_key: todayKey, today_incomplete: true },
+          limits: { max_days: 90 },
+        });
       }
       /**
        * GET /api/forwards/:id/topology（mock）。

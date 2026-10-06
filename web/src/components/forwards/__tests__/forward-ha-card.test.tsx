@@ -54,19 +54,23 @@ import type { MockAuthedRouteContext, MockResponse } from "@/mocks/runtime";
 /* 真实形状的样本（取自隔离环境里的真实响应，逐字）                        */
 /* ================================================================== */
 
-const NODE_OPTION = (over: Partial<ForwardHaProjection["preference_options"]["nodes"][number]>) => ({
+const NODE_OPTION = (over: Partial<ForwardHaProjection["ingress_members"]["nodes"][number]>) => ({
   node_id: 1,
   name: "ha16-node-a",
   role: "ingress",
   node_group_id: 1,
   is_active_ingress: true,
   is_preferred: false,
+  is_failback_target: false,
   can_be_preferred: true,
   preference_rejection: null,
   connection: "online",
   lifecycle: "active",
   accepts_new_business: true,
   admission_rejection: null,
+  can_take_over: false,
+  takeover_rejection: "current_owner",
+  failover_rank: null,
   ...over,
 });
 
@@ -77,11 +81,54 @@ const PROJECTION: ForwardHaProjection = {
   active_ingress_node_id: 1,
   policy: { auto_failover: false, auto_failback: false, parse_error: null },
   failover_candidate: { status: "available", node_id: 2, reason: null },
-  preference_options: {
+  // 平台缺省（生产缺省）：两个开关都关，所以"回切目标已记录但不会被自动执行"。
+  member_priority: { source: "platform_rule_node_id_asc", custom_order_supported: false },
+  failback: {
+    auto_failback: false,
+    target_node_id: null,
+    preferred_ingress_node_id: null,
+    progress: { healthy_checks: 0, required_checks: 3, met: false },
+  },
+  ingress_members: {
     status: "ok",
     nodes: [
       NODE_OPTION({}),
-      NODE_OPTION({ node_id: 2, name: "ha16-node-b", is_active_ingress: false }),
+      NODE_OPTION({
+        node_id: 2,
+        name: "ha16-node-b",
+        is_active_ingress: false,
+        can_take_over: true,
+        takeover_rejection: null,
+        failover_rank: 1,
+      }),
+    ],
+  },
+};
+
+/** 有偏好且平台开了自动回切：回切目标是 node b，进度 2/3。 */
+const WITH_FAILBACK: ForwardHaProjection = {
+  ...PROJECTION,
+  preferred_ingress_node_id: 2,
+  failback: {
+    auto_failback: true,
+    target_node_id: 2,
+    preferred_ingress_node_id: 2,
+    progress: { healthy_checks: 2, required_checks: 3, met: false },
+  },
+  ingress_members: {
+    status: "ok",
+    nodes: [
+      NODE_OPTION({}),
+      NODE_OPTION({
+        node_id: 2,
+        name: "ha16-node-b",
+        is_active_ingress: false,
+        is_preferred: true,
+        is_failback_target: true,
+        can_take_over: true,
+        takeover_rejection: null,
+        failover_rank: 1,
+      }),
     ],
   },
 };
@@ -195,7 +242,7 @@ describe("期望（首选入口）与事实（当前归属 / 连接 / 准入）�
       data({
         ...PROJECTION,
         preferred_ingress_node_id: 2,
-        preference_options: {
+        ingress_members: {
           status: "ok",
           nodes: [
             NODE_OPTION({}),
@@ -218,7 +265,7 @@ describe("期望（首选入口）与事实（当前归属 / 连接 / 准入）�
         active_ingress_node_id: null,
         policy: { auto_failover: false, auto_failback: false, parse_error: null },
         failover_candidate: { status: "none", node_id: null, reason: null },
-        preference_options: {
+        ingress_members: {
           status: "ok",
           nodes: [
             NODE_OPTION({
@@ -248,7 +295,7 @@ describe("期望（首选入口）与事实（当前归属 / 连接 / 准入）�
     const html = render(
       data({
         ...PROJECTION,
-        preference_options: {
+        ingress_members: {
           status: "ok",
           nodes: [NODE_OPTION({ role: "egress", can_be_preferred: false, preference_rejection: "role_mismatch" })],
         },
@@ -264,7 +311,7 @@ describe("期望（首选入口）与事实（当前归属 / 连接 / 准入）�
     expect(optionOf(PROJECTION, 2)?.name).toBe("ha16-node-b");
     expect(optionOf(PROJECTION, 99)).toBeNull();
     expect(optionOf(PROJECTION, null)).toBeNull();
-    expect(preferredCandidates({ ...PROJECTION, preference_options: { status: "unavailable", nodes: [] } })).toEqual([]);
+    expect(preferredCandidates({ ...PROJECTION, ingress_members: { status: "unavailable", nodes: [] } })).toEqual([]);
   });
 });
 
@@ -317,23 +364,160 @@ describe("候选三态各有独立呈现：available / none / unavailable", () =
     expect(text).not.toContain("现在没有可接管的候选入口");
   });
 
-  test("备选集合读不到：它自己是一个降级态，且不影响候选事实的呈现", () => {
+  test("成员列表读不到：它自己是一个降级态，且不影响候选事实的呈现", () => {
     const html = render(
       data({
         ...PROJECTION,
-        preference_options: { status: "unavailable", nodes: [] },
+        ingress_members: { status: "unavailable", nodes: [] },
       }),
     );
     const text = visibleText(html);
-    expect(html).toContain('data-testid="forward-ha-options-unavailable"');
-    expect(text).toContain("不代表组内没有别的节点");
+    expect(html).toContain('data-testid="forward-ha-members-unavailable"');
+    expect(text).toContain("也不代表这个入口组里没有成员");
     expect(html).toContain('data-testid="forward-ha-candidate-available"');
+    // 「读不到」不许退化成「没有成员」。
+    expect(html).not.toContain('data-testid="forward-ha-members-empty"');
   });
 
   test("candidateKind 逐字透传服务端状态（不在这里做任何映射/归一）", () => {
     expect(candidateKind({ status: "available", node_id: 2, reason: null })).toBe("available");
     expect(candidateKind({ status: "none", node_id: null, reason: null })).toBe("none");
     expect(candidateKind({ status: "unavailable", node_id: null, reason: "x" })).toBe("unavailable");
+  });
+});
+
+/* ================================================================== */
+/* ③b 入口成员与优先级 / 恢复后切回（task-38，行为参照 ForwardX）        */
+/* ================================================================== */
+
+describe("入口成员：次序、能否接管、以及三个不同的态", () => {
+  test("成员按平台次序展示名次，并区分「能不能当首选」与「此刻能不能接管」", () => {
+    const html = render(data(PROJECTION));
+    const text = visibleText(html);
+    // 现任：名次为 —（它不是接管者），但它是可被替换的首选目标
+    expect(html).toContain('data-testid="forward-ha-rank-1"');
+    expect(html).toContain('data-testid="forward-ha-rank-2"');
+    expect(html).toContain('data-testid="forward-ha-option-takeover-1"');
+    expect(text).toContain("此刻不可接管（current_owner）");
+    expect(text).toContain("此刻可接管（平台次序第 1 位）");
+    // 顺序来源如实写明"不是自定义顺序"
+    expect(html).toContain('data-testid="forward-ha-members-order-source"');
+    expect(text).toContain("按这条转发自定义顺序尚未提供");
+  });
+
+  test("有成员但没有一台能接管：这是独立的第三态（不是「没有成员」）", () => {
+    const html = render(
+      data({
+        ...PROJECTION,
+        failover_candidate: { status: "none", node_id: null, reason: null },
+        ingress_members: {
+          status: "ok",
+          nodes: [
+            NODE_OPTION({ can_take_over: false, takeover_rejection: "node_not_online" }),
+            NODE_OPTION({
+              node_id: 2,
+              name: "ha16-node-b",
+              is_active_ingress: false,
+              connection: "offline",
+              can_take_over: false,
+              takeover_rejection: "node_not_online",
+            }),
+          ],
+        },
+      }),
+    );
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="forward-ha-members-no-takeover"');
+    expect(text).toContain("有成员，但此刻没有一台能接管");
+    expect(html).not.toContain('data-testid="forward-ha-members-empty"');
+    expect(html).not.toContain('data-testid="forward-ha-members-unavailable"');
+  });
+
+  test("组里确实没有成员：与「读不到」「没有合格候选」都不同", () => {
+    const html = render(
+      data({
+        ...PROJECTION,
+        failover_candidate: { status: "none", node_id: null, reason: null },
+        ingress_members: { status: "ok", nodes: [] },
+      }),
+    );
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="forward-ha-members-empty"');
+    expect(text).toContain("这个入口节点组里没有任何成员");
+    expect(html).not.toContain('data-testid="forward-ha-members-unavailable"');
+    expect(html).not.toContain('data-testid="forward-ha-members-no-takeover"');
+  });
+
+  test("成员的非入口角色仍可被识别为「不可当首选」（与接管判定分开）", () => {
+    const html = render(
+      data({
+        ...PROJECTION,
+        ingress_members: {
+          status: "ok",
+          nodes: [
+            NODE_OPTION({
+              role: "egress",
+              can_be_preferred: false,
+              preference_rejection: "role_mismatch",
+              can_take_over: false,
+              takeover_rejection: "role_mismatch",
+            }),
+          ],
+        },
+      }),
+    );
+    const text = visibleText(html);
+    expect(text).toContain("不可设为首选（role_mismatch）");
+    expect(text).toContain("此刻不可接管（role_mismatch）");
+  });
+});
+
+describe("恢复后切回：平台开关真值 + 进度，且不许说成「已保护」", () => {
+  test("平台未启用自动回切：明确说「不会被自动切回」，即使首选已记录", () => {
+    const html = render(
+      data({
+        ...PROJECTION,
+        preferred_ingress_node_id: 2,
+        failback: {
+          auto_failback: false,
+          target_node_id: 2,
+          preferred_ingress_node_id: 2,
+          progress: { healthy_checks: 1, required_checks: 3, met: false },
+        },
+      }),
+    );
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="forward-ha-failback-switch"');
+    expect(text).toContain("平台未启用自动回切");
+    expect(text).toContain("首选只是被记录下来的期望");
+    expect(text).toContain("连续健康 1/3 次");
+    expect(text).toContain("未满足");
+    expectNoPromiseWords(text);
+  });
+
+  test("平台已启用自动回切：说清「会尝试切回」，并回显进度与阈值", () => {
+    const html = render(data(WITH_FAILBACK));
+    const text = visibleText(html);
+    expect(text).toContain("平台已启用自动回切");
+    expect(text).toContain("连续健康 2/3 次");
+    expect(text).toContain("本卡片只回显计数与阈值，不预告迁移什么时候发生");
+    expect(html).toContain('data-testid="forward-ha-option-failback-2"');
+    expectNoPromiseWords(text);
+  });
+
+  test("没有首选入口 ⇒ 回切没有目标（不是「进度为 0」）", () => {
+    const html = render(data(PROJECTION));
+    const text = visibleText(html);
+    expect(html).toContain('data-testid="forward-ha-failback-no-target"');
+    expect(text).toContain("回切没有目标");
+    expect(html).not.toContain('data-testid="forward-ha-failback-progress"');
+  });
+
+  test("en 文案同样区分「已启用/未启用回切」", () => {
+    const off = visibleText(render(data(PROJECTION), "en"));
+    expect(off).toContain("Automatic failback is not enabled");
+    const on = visibleText(render(data(WITH_FAILBACK), "en"));
+    expect(on).toContain("Automatic failback is enabled");
   });
 });
 
@@ -495,16 +679,18 @@ describe("mock：GET /forwards/:id/ha 与 PUT /forwards/:id/preferred-ingress", 
     const body = res.body as ForwardHaProjection;
     expect(Object.keys(body).sort()).toEqual([
       "active_ingress_node_id",
+      "failback",
       "failover_candidate",
       "forward_id",
+      "ingress_members",
+      "member_priority",
       "policy",
-      "preference_options",
       "preferred_ingress_node_id",
     ]);
     expect(body.policy).toEqual({ auto_failover: false, auto_failback: false, parse_error: null });
     expect(body.preferred_ingress_node_id).toBeNull();
     expect(body.failover_candidate).toEqual({ status: "none", node_id: null, reason: null });
-    const options = body.preference_options as { status: "ok"; nodes: ForwardHaProjection["preference_options"]["nodes"] };
+    const options = body.ingress_members as { status: "ok"; nodes: ForwardHaProjection["ingress_members"]["nodes"] };
     expect(options.status).toBe("ok");
     // 种子行：role=ingress（组方向兜底）⇒ 能设为首选；但还没上报 ⇒ 事实是 waiting
     for (const node of options.nodes) {

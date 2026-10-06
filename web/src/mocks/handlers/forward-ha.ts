@@ -29,6 +29,13 @@ import * as rt from "@/mocks/runtime";
 import type { MockResponse } from "@/mocks/runtime";
 import { fail, mockIngressNode, mockUserNode, notFound, ok, parseId } from "@/mocks/runtime";
 
+/**
+ * 「恢复后切回」要连续健康多少次才能回切：与后端 `services/failover-thresholds.ts` 的
+ * `FAILOVER_THRESHOLDS.FAILBACK_HEALTHY_CHECKS` **同一个语义**（mock 里重复一个数字是为了
+ * 让开发期看到的进度分母与生产一致；它不是第二条策略真相 —— 生产读的是后端那份）。
+ */
+const FAILBACK_HEALTHY_CHECKS = 3;
+
 /** preferred ingress：mock 侧的内存态（key = forward id）。 */
 const preferredByForward = new Map<number, number | null>();
 
@@ -75,52 +82,100 @@ function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
   const preferred = preferredByForward.has(forwardId)
     ? preferredByForward.get(forwardId) ?? null
     : null;
+  /**
+   * 接管判定的 mock 镜像（**同一个词表**：与 `services/ingress-candidate.ts` 的
+   * `candidateRejection` 顺序一致：现任 → 准入 → 角色 → 凭据 → 在线）。
+   * 它只用于开发期演示，`available`/`none` 与真实后端同一口径；措辞纪律由卡片层守。
+   */
+  function takeoverRejection(node: {
+    id: number;
+    role: string | null;
+    connection: string;
+    accepts_new_business: boolean;
+    admission_rejection: string | null;
+    credential_revoked: boolean;
+  }): string | null {
+    if (activeIngress !== null && node.id === activeIngress) return "current_owner";
+    if (!node.accepts_new_business) return node.admission_rejection ?? "node_not_admitted";
+    if (!roleAcceptsIngress(node.role ?? null)) return node.role == null ? "role_undeclared" : "role_mismatch";
+    if (node.credential_revoked) return "node_credential_revoked";
+    if (node.connection !== "online") return "node_not_online";
+    return null;
+  }
+
+  let rank = 0;
   const nodes = db.nodes
     .filter((node) => node.node_group_id === tunnel.in_node_group_id)
     .map((node) => mockUserNode(db, node))
     .sort((a, b) => a.id - b.id)
-    .map((node) => ({
-      node_id: node.id,
-      name: node.node_id,
-      role: node.role ?? null,
-      node_group_id: node.node_group_id,
-      is_active_ingress: node.id === activeIngress,
-      is_preferred: node.id === preferred,
-      // 写入路径规则：同组（已按组过滤）+ role ∈ {ingress,both}
-      can_be_preferred: roleAcceptsIngress(node.role ?? null),
-      preference_rejection: roleAcceptsIngress(node.role ?? null)
-        ? null
-        : node.role == null
-          ? "role_undeclared"
-          : "role_mismatch",
-      // 以下三项是**并列事实**（连接 / 准入 / 生命周期），不是"能不能当首选"的判据。
-      connection: node.connection,
-      lifecycle: node.lifecycle,
-      accepts_new_business: node.accepts_new_business,
-      admission_rejection: node.admission_rejection ?? null,
-    }));
+    .map((node) => {
+      const rejection = takeoverRejection({
+        id: node.id,
+        role: node.role ?? null,
+        connection: node.connection ?? "offline",
+        accepts_new_business: node.accepts_new_business === true,
+        admission_rejection: node.admission_rejection ?? null,
+        credential_revoked: node.credential_revoked === true,
+      });
+      const canTakeOver = rejection === null;
+      if (canTakeOver) rank += 1;
+      return {
+        node_id: node.id,
+        name: node.node_id,
+        role: node.role ?? null,
+        node_group_id: node.node_group_id,
+        is_active_ingress: node.id === activeIngress,
+        is_preferred: node.id === preferred,
+        is_failback_target: preferred !== null && node.id === preferred && preferred !== activeIngress,
+        // 写入路径规则：同组（已按组过滤）+ role ∈ {ingress,both}
+        can_be_preferred: roleAcceptsIngress(node.role ?? null),
+        preference_rejection: roleAcceptsIngress(node.role ?? null)
+          ? null
+          : node.role == null
+            ? "role_undeclared"
+            : "role_mismatch",
+        // 以下三项是**并列事实**（连接 / 准入 / 生命周期），不是"能不能当首选"的判据。
+        connection: node.connection ?? "offline",
+        lifecycle: node.lifecycle ?? "active",
+        accepts_new_business: node.accepts_new_business === true,
+        admission_rejection: node.admission_rejection ?? null,
+        can_take_over: canTakeOver,
+        takeover_rejection: rejection,
+        failover_rank: canTakeOver ? rank : null,
+      };
+    });
 
   // 候选：与后端 `pickFailoverDestination` 同一口径（非现任 + 准入 + 角色 + 此刻在线），
-  // 取 id 最小的一台。
-  const candidate = nodes.find(
-    (node) =>
-      node.node_id !== activeIngress &&
-      roleAcceptsIngress(node.role ?? null) &&
-      node.connection === "online" &&
-      node.accepts_new_business === true,
-  );
+  // 取 id 最小的一台 —— 也就是 `failover_rank === 1` 的那台。
+  const candidate = nodes.find((node) => node.failover_rank === 1);
+  const policy = readPolicy(db);
 
   return ok({
     forward_id: tunnel.id,
     preferred_ingress_node_id: preferred,
     active_ingress_node_id: activeIngress,
-    policy: readPolicy(db),
+    policy,
     failover_candidate: {
       status: candidate ? "available" : "none",
       node_id: candidate ? candidate.node_id : null,
       reason: null,
     },
-    preference_options: { status: "ok", nodes },
+    ingress_members: { status: "ok", nodes },
+    member_priority: { source: "platform_rule_node_id_asc", custom_order_supported: false },
+    failback: {
+      auto_failback: policy.auto_failback,
+      target_node_id: preferred !== null && preferred !== activeIngress ? preferred : null,
+      preferred_ingress_node_id: preferred,
+      progress: {
+        // Web 侧的 `Tunnel` 类型没有 `failback_healthy_checks`（真实库里是 tunnel 的列）；
+        // mock 用一个可选读数，缺省 0 —— 与生产"没有计数即 0"的语义一致。
+        healthy_checks: Number((tunnel as { failback_healthy_checks?: number }).failback_healthy_checks ?? 0),
+        required_checks: FAILBACK_HEALTHY_CHECKS,
+        met:
+          Number((tunnel as { failback_healthy_checks?: number }).failback_healthy_checks ?? 0) >=
+          FAILBACK_HEALTHY_CHECKS,
+      },
+    },
   });
 }
 

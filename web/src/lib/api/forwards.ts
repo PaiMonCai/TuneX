@@ -363,6 +363,63 @@ export const LATENCY_POLL_MS = 30_000;
  * `node_id` / `target_key` / `observation_source` 字段：维度是服务端事实，
  * 客户端参数会被忽略（那是跨租户安全边界，不是一个可以试的选项）。
  */
+
+/* ================================================================== */
+/* 吞吐序列（日均）Web 侧契约                                            */
+/* ================================================================== */
+
+/**
+ * 吞吐序列的一个点（**服务端派生**，前端不自算窗口/不补零）。
+ *
+ * 行为参照：ForwardX（AGPL-3.0-only）——流量面「带标签的时间窗 + 分桶 + 单位标注」的产品逻辑；
+ * 代码为本项目改写（我们自己的 `tunnel_traffic` 账本口径），未复制其实现。
+ *
+ * 两个"空"必须分开（与延迟卡片同一条纪律）：
+ *   · `bytes === null` / `rate_bps === null` —— 该日**没有归档行**（缺口）；
+ *   · `bytes === 0` —— 有归档行、测到的就是零。
+ * 把前者渲染成 0 会把"没数据"说成"当时没有流量"。
+ */
+export interface ForwardThroughputPoint {
+  /** 账本日键（`YYYY-MM-DD`，Asia/Shanghai 日界）。 */
+  date: string;
+  /** 该日归档字节数；`null` = 没有归档行（缺口），**不是** 0。 */
+  bytes: number | null;
+  /** 日均速率（bytes/s）；缺口与 `bytes` 同步为 `null`。 */
+  rate_bps: number | null;
+  /** `false` = 不完整日（今天）：它速率的分母只算已过时间，不得与完整日直接比较。 */
+  complete: boolean;
+}
+
+/** `GET /api/forwards/:id/throughput` 的响应体。 */
+export interface ForwardThroughputResponse {
+  forward_id: number;
+  /** 聚合粒度：账本只有日行分辨率 ⇒ 恒为 `day`（不假装有小时桶）。 */
+  granularity: "day";
+  /** 点值单位（图表与表格共用）。 */
+  unit: "bytes_per_second";
+  window: {
+    from: string | null;
+    to: string | null;
+    days: number;
+    time_zone: string;
+  };
+  series: ForwardThroughputPoint[];
+  summary: {
+    total_bytes: number;
+    /** 整窗平均（分母 = 整窗秒数）；与"只按有数据的天算"不是一回事。 */
+    avg_rate_bps_over_window: number;
+    coverage: { days_with_data: number; days_missing: number };
+  };
+  archive: {
+    /** 归档节拍（分钟）：账本按日累计，最新一天最多滞后一个节拍。 */
+    interval_minutes: number;
+    today_key: string;
+    /** 今天永远是不完整日。 */
+    today_incomplete: boolean;
+  };
+  limits: { max_days: number };
+}
+
 export const forwardsApi = {
     summary: (cookie?: string) =>
       get<ForwardSummary>("/forwards/summary", undefined, cookie),
@@ -371,6 +428,15 @@ export const forwardsApi = {
      *   · `{ hours }` —— 最近 N 小时；`{ from, to }` —— 显式区间（二者互斥）。
      * 窗口的最终裁剪以**响应里的 `window`** 为准。
      */
+    /**
+     * 日均吞吐序列（只读）。
+     *
+     * 与 `traffic()` 的区别是**这个端点保留缺口**：`bytes: null` = 那天没有归档行，
+     * 而 `traffic()` 会把缺的日子补成 0（它服务的是详情页那条连续横轴的柱状图）。
+     * 窗口与聚合口径全部由服务端给出（`window` / `granularity` / `unit` / `archive`）。
+     */
+    throughput: (id: ID, days = 14, cookie?: string) =>
+      get<ForwardThroughputResponse>(`/forwards/${id}/throughput`, { days }, cookie),
     latency: (
       id: ID,
       query: { granularity: LatencyGranularity; hours?: number; from?: string; to?: string },
