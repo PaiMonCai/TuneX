@@ -1,5 +1,5 @@
 /**
- * V5-WP6 — 目标健康合成（纯函数：无 IO、无 DB、无环境时钟）。
+ * 目标健康合成（纯函数：无 IO、无 DB、无环境时钟）。
  *
  * 固定链（§7 开头）是 `Observation → Health Synthesis → Decision`，本模块只做**中间
  * 那一段**：把已经读出来的观测事实，合成成 operator 与 Decision 层都能用的**结论**。
