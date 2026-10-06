@@ -53,12 +53,14 @@ const EPOCH = 4;
 interface Harness {
   deps: FailoverExecutorDeps;
   claims: Array<{ tunnelId: number; nodeId: number; revision: number; now: Date }>;
+  releases: Array<{ tunnelId: number; nodeId: number; now: Date }>;
   moves: PlacementMoveRequest[];
   events: FailoverExecutorEvent[];
   lease: PlacementLeaseRow | null;
   /** 让替身在一次运行内改变租约（模拟并发迁移）。 */
   setLease(next: PlacementLeaseRow | null): void;
   claimResult?: LeaseClaimResult | "throw";
+  releaseResult?: { ok: true } | { ok: false; reason: "not_owner" | "not_found" | "lost_race" } | "throw";
   moveResult?: PlacementMoveResult;
   loadLeaseCalls: number;
 }
@@ -97,6 +99,7 @@ function harness(overrides: {
   const h: Harness = {
     deps: {} as FailoverExecutorDeps,
     claims: [],
+    releases: [],
     moves: [],
     events: [],
     lease: overrides.lease === undefined ? leaseRow() : overrides.lease,
@@ -149,6 +152,18 @@ function harness(overrides: {
       h.lease = moved;
       return { ok: true, lease: moved, epoch: moved.epoch, changed_owner: true };
     },
+    releaseLease: async (input) => {
+      h.releases.push(input);
+      if (h.releaseResult === "throw") throw new Error("lease release down");
+      if (h.releaseResult !== undefined) return h.releaseResult;
+      const current = h.lease;
+      if (!current) return { ok: false as const, reason: "not_found" as const };
+      if (current.owner_node_id !== input.nodeId) {
+        return { ok: false as const, reason: "not_owner" as const };
+      }
+      h.lease = { ...current, lease_expires_at: input.now };
+      return { ok: true as const };
+    },
     applyPlacementMove: async (request) => {
       h.moves.push(request);
       return h.moveResult as PlacementMoveResult;
@@ -165,6 +180,7 @@ describe("执行器契约形状", () => {
   test("结果码齐全，且每个码都有非空说明", () => {
     expect(FAILOVER_EXECUTOR_REASONS).toContain("epoch_mismatch");
     expect(FAILOVER_EXECUTOR_REASONS).toContain("old_lease_still_live");
+    expect(FAILOVER_EXECUTOR_REASONS).toContain("claim_cleanup_failed");
     expect(FAILOVER_EXECUTOR_REASONS).toContain("placement_move_conflict");
     expect(FAILOVER_EXECUTOR_REASONS).toContain("moved");
     for (const reason of FAILOVER_EXECUTOR_REASONS) {
@@ -411,20 +427,40 @@ describe("事实读不到 ⇒ 中止（不揣测）", () => {
 /* ================================================================== */
 
 describe("既有变更路径的结果：三态分明", () => {
-  test("并发编辑冲突（409）⇒ aborted(placement_move_conflict)", async () => {
+  test("并发编辑冲突（409）⇒ 释放本次刚认领的 candidate lease 后 aborted", async () => {
     const h = harness();
     h.moveResult = { ok: false, kind: "rejected", code: "revision_conflict", message: "该转发已被他人修改", revision: null, apply_status: null };
     const result = await executeFailoverForTunnel(TUNNEL, h.deps);
     expect(result.outcome).toBe("aborted");
     expect(result.reason).toBe("placement_move_conflict");
+    expect(h.releases).toEqual([{ tunnelId: TUNNEL, nodeId: CANDIDATE, now: NOW }]);
+    expect(result.lease_after?.lease_expires_at).toEqual(NOW);
+    expect(h.lease?.lease_expires_at).toEqual(NOW);
   });
 
-  test("VALIDATE / 校验拒绝 ⇒ aborted(placement_move_rejected)", async () => {
+  test("VALIDATE / 校验拒绝 ⇒ 释放刚认领 lease 后 aborted(placement_move_rejected)", async () => {
     const h = harness();
     h.moveResult = { ok: false, kind: "rejected", code: "node_unavailable", message: "入口节点不存在", revision: null, apply_status: null };
     const result = await executeFailoverForTunnel(TUNNEL, h.deps);
     expect(result.reason).toBe("placement_move_rejected");
     expect(result.detail).toContain("node_unavailable");
+    expect(h.releases).toHaveLength(1);
+    expect(h.lease?.lease_expires_at).toEqual(NOW);
+  });
+
+  test("变更被拒但 lease cleanup 失败 ⇒ failed(claim_cleanup_failed)，不伪装成安全 aborted", async () => {
+    const h = harness();
+    h.moveResult = { ok: false, kind: "rejected", code: "revision_conflict", message: "stale", revision: null, apply_status: null };
+    h.releaseResult = { ok: false, reason: "lost_race" };
+
+    const result = await executeFailoverForTunnel(TUNNEL, h.deps);
+
+    expect(result.outcome).toBe("failed");
+    expect(result.reason).toBe("claim_cleanup_failed");
+    expect(result.detail).toContain("lost_race");
+    expect(h.events.map((e) => e.event)).toEqual(["decision", "claim", "failed"]);
+    expect(h.lease?.owner_node_id).toBe(CANDIDATE);
+    expect(h.lease!.lease_expires_at.getTime()).toBeGreaterThan(NOW.getTime());
   });
 
   test("下发失败 ⇒ failed(placement_move_failed)：归属已认领，等 rollout 续跑", async () => {
@@ -433,7 +469,8 @@ describe("既有变更路径的结果：三态分明", () => {
     const result = await executeFailoverForTunnel(TUNNEL, h.deps);
     expect(result.outcome).toBe("failed");
     expect(result.reason).toBe("placement_move_failed");
-    expect(result.lease_after?.owner_node_id).toBe(CANDIDATE); // 认领已生效
+    expect(result.lease_after?.owner_node_id).toBe(CANDIDATE); // desired 已提交时归属必须保留给新 owner
+    expect(h.releases).toEqual([]);
     expect(h.events.map((e) => e.event)).toEqual(["decision", "claim", "failed"]);
   });
 
