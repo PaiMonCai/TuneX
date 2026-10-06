@@ -26,10 +26,16 @@ export function TopupBody() {
   const [payments, setPayments] = useState<{ id: number; name: string; method: string }[]>([]);
   const [history, setHistory] = useState<Paginated<TopupOrder> | null>(null);
   const [loading, setLoading] = useState(false);
+  const [paymentsFailed, setPaymentsFailed] = useState(false);
+  const [historyFailed, setHistoryFailed] = useState(false);
 
   useEffect(() => {
-    api.topups.payments().then(setPayments).catch(() => {});
-    api.topups.list({ page: 1, page_size: 10 }).then(setHistory).catch(() => {});
+    api.topups.payments()
+      .then(setPayments)
+      .catch(() => setPaymentsFailed(true));
+    api.topups.list({ page: 1, page_size: 10 })
+      .then(setHistory)
+      .catch(() => setHistoryFailed(true));
   }, []);
 
   async function submit() {
@@ -86,7 +92,7 @@ export function TopupBody() {
             <Label>{t("topup.payMethod")}</Label>
             <Select value={paymentId} onValueChange={setPaymentId}>
               <SelectTrigger>
-                <SelectValue placeholder="选择支付方式" />
+                <SelectValue placeholder={t("topup.payMethod")} />
               </SelectTrigger>
               <SelectContent>
                 {payments.map((p) => (
@@ -96,6 +102,7 @@ export function TopupBody() {
                 ))}
               </SelectContent>
             </Select>
+            {paymentsFailed && <p className="text-xs text-[var(--destructive)]">{t("topup.methodsLoadFailed")}</p>}
           </div>
           <Button onClick={submit} disabled={loading}>
             {t("topup.submit")}
@@ -108,6 +115,7 @@ export function TopupBody() {
           <CardTitle>{t("topup.history")}</CardTitle>
         </CardHeader>
         <CardContent>
+          {historyFailed && <p className="mb-3 text-sm text-[var(--destructive)]">{t("common.loadFailed")}</p>}
           <Table>
             <TableHeader>
               <TableRow>

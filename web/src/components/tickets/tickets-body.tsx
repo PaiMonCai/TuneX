@@ -36,24 +36,24 @@ export function TicketsBody() {
   }
 
   useEffect(() => {
-    load().catch((e) => toast.error(e instanceof Error ? e.message : "加载失败"));
+    load().catch((e) => toast.error(e instanceof Error ? e.message : t("common.ticketLoadFailed")));
   }, []);
 
   async function submit() {
     if (!title.trim() || !content.trim()) {
-      toast.error("请填写标题与内容");
+      toast.error(t("common.ticketRequired"));
       return;
     }
     setPending(true);
     try {
       await api.tickets.create({ title: title.trim(), content: content.trim() });
-      toast.success("工单已提交");
+      toast.success(t("common.ticketCreated"));
       setTitle("");
       setContent("");
       setOpen(false);
       await load();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "提交失败");
+      toast.error(e instanceof Error ? e.message : t("common.ticketCreateFailed"));
     } finally {
       setPending(false);
     }
@@ -64,20 +64,20 @@ export function TicketsBody() {
       <div className="flex justify-end">
         <Button size="sm" onClick={() => setOpen(true)}>
           <Plus className="size-4" />
-          新建工单
+          {t("common.ticketNew")}
         </Button>
       </div>
       <Card>
         <CardHeader className="pb-2">
-          <CardTitle>工单列表</CardTitle>
+          <CardTitle>{t("common.ticketsList")}</CardTitle>
         </CardHeader>
         <CardContent>
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>标题</TableHead>
-                <TableHead>状态</TableHead>
-                <TableHead>创建时间</TableHead>
+                <TableHead>{t("common.ticketTitle")}</TableHead>
+                <TableHead>{t("common.status")}</TableHead>
+                <TableHead>{t("common.createdAt")}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -85,11 +85,11 @@ export function TicketsBody() {
                 <TableEmpty colSpan={3} text={t("common.noData")} />
               ) : (
                 data.data.map((tk) => (
-                  <TableRow key={tk.id} className="cursor-pointer" onClick={() => {}}>
+                  <TableRow key={tk.id}>
                     <TableCell className="font-medium">{tk.title}</TableCell>
                     <TableCell>
                       <Badge variant={tk.status === "open" ? "default" : "muted"}>
-                        {tk.status === "open" ? "待处理" : "已关闭"}
+                        {tk.status === "open" ? t("common.ticketOpen") : t("common.ticketClosed")}
                       </Badge>
                     </TableCell>
                     <TableCell className="text-xs text-[var(--muted-foreground)]">{formatDateTime(tk.created_at)}</TableCell>
@@ -104,25 +104,25 @@ export function TicketsBody() {
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>新建工单</DialogTitle>
-            <DialogDescription>请描述您遇到的问题，我们会尽快回复。</DialogDescription>
+            <DialogTitle>{t("common.ticketNew")}</DialogTitle>
+            <DialogDescription>{t("common.ticketDescription")}</DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-1.5">
-              <Label>标题</Label>
+              <Label>{t("common.ticketTitle")}</Label>
               <Input value={title} onChange={(e) => setTitle(e.target.value)} />
             </div>
             <div className="flex flex-col gap-1.5">
-              <Label>内容</Label>
+              <Label>{t("common.ticketContent")}</Label>
               <Textarea value={content} onChange={(e) => setContent(e.target.value)} rows={5} />
             </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>
-              取消
+              {t("common.cancel")}
             </Button>
             <Button onClick={submit} disabled={pending}>
-              提交
+              {t("common.ticketSubmit")}
             </Button>
           </DialogFooter>
         </DialogContent>
