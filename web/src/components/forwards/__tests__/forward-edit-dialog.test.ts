@@ -307,12 +307,10 @@ describe("V4 forward edit UX — 影响面/复制 UX 契约", () => {
   });
 
   test("列表页也能进入编辑器（§13.3.1 不要求先进详情）", () => {
-    const workspace = readFileSync(
-      new URL("../forward-workspace.tsx", import.meta.url),
-      "utf8",
-    );
+    const workspace = readFileSync(new URL("../forward-workspace.tsx", import.meta.url), "utf8");
+    const table = readFileSync(new URL("../forward-table.tsx", import.meta.url), "utf8");
     expect(workspace).toContain("ForwardEditDialog");
-    expect(workspace).toContain("setEditTarget(forward)");
+    expect(table).toContain("onEdit(forward)");
     // 保存后按 id 回填列表行，避免整页刷新打断筛选
     expect(workspace).toMatch(/rows\.map\(\(row\) => \(Number\(row\.id\) === Number\(updated\.id\) \? updated : row\)\)/);
   });
