@@ -239,7 +239,7 @@ const worker = new Worker(
         return summary;
       }
       default:
-        return { note: "cron handler not yet implemented", ms: Date.now() - started };
+        throw new Error(`unknown cron job: ${job.name}`);
     }
   },
   { connection, concurrency: 5 },
@@ -264,15 +264,23 @@ async function main() {
     console.log("[worker] DISABLE_WORKER=true, exiting");
     process.exit(0);
   }
-  // 等待依赖就绪
+  // Wait for dependencies, but never advertise a ready worker when they stayed unavailable.
+  let dependenciesReady = false;
+  let lastDependencyError: unknown = null;
   for (let i = 0; i < 30; i++) {
     try {
       await db.$queryRaw`SELECT 1`;
       await connection.ping();
+      dependenciesReady = true;
       break;
-    } catch {
+    } catch (error) {
+      lastDependencyError = error;
       await new Promise((r) => setTimeout(r, 2000));
     }
+  }
+  if (!dependenciesReady) {
+    const detail = lastDependencyError instanceof Error ? lastDependencyError.message : String(lastDependencyError ?? "unknown error");
+    throw new Error(`worker dependencies unavailable after startup grace period: ${detail}`);
   }
   // Federation teardown/revocation/port hooks must be wired before the first federation tick.
   try {
