@@ -38,7 +38,7 @@ redis.on("error", (e) => {
  *                          内容属于某个 workspace。
  *   ws:global:...          平台共享数据。值只描述「平台侧/账户侧」的东西：
  *                          node_group.token 防爆破键（token 全局唯一）、
- *                          license 快照（实例级配置）、支付回调留痕、
+ *                          支付回调留痕、
  *                          JWT sub 映射（一个用户可属多个 workspace）、
  *                          冒充票据（token 全局唯一）、节点凭据防爆破键
  *                          （身份解析前发生，此时还不知道租户归属）。
@@ -73,9 +73,6 @@ export {
  */
 export const RedisKeys = {
   /* ---- 平台共享（ws:global） ---- */
-
-  /** License 快照（实例级配置，不随租户变化）。 */
-  license: scopedKey(GLOBAL_SCOPE, "license"),
 
   /** 观测回传缓冲键（按 workspace 分段，见 {@link observerBufferKey}）。 */
   observerBuffer: (scope?: number | null) => observerBufferKey(scope),
