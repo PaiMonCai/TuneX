@@ -386,6 +386,24 @@ B) Onboarding 端到端（重跑，验证最终构建）：
 
 判断原则（本专项实践总结）：**只读预研/独立复核 → 一次性子代理**（便宜、上下文隔离、无写入冲突）；**多步实现、需要中途纠偏、与既有切片相邻文件 → 持久队友**（可 `send_message` 指挥、可观测状态、共享任务板带写入范围与依赖）。
 
+## 3.15 Round 20 收口与派发
+
+### 已完成（本轮）
+| 任务 | 结论与证据 |
+|---|---|
+| **task-6 / F5**（`backend-truth`） | **定性为 Agent 侧遗留死代码**，不是后端能力被移除：`git log --all -S "/api/internal/heartbeat" -- backend/` = 0 提交；真机 Panel 近 10 分钟 **80 条 404**（同窗口混着真 404，实证"掩盖"）。已在 Agent 侧删除（`Run` 只发 state report，闸门改为"无凭据就什么都不发"——比旧行为更严）；受控 recording panel 对照：旧镜像 heartbeat ×1 → 新镜像 **×0** 且 state 照常；`go build/vet/test` 全绿（13 包）+ 反向变异验证。**裁决**：**不**给该幽灵端点补路由（会把从未存在的端点写进路由表并需要自己的鉴权故事）；`scripts/perf/stream-baseline.py:275` 的历史路径列入清理项 |
+| **task-7 / 延迟卡片**（`web-forward`） | 35 pass；真机对比：真实序列 97 点里 **77 个 `latency_ms:null`** → 折线切成多段、**不补零不插值**；**409 `raw_window_expired` 与 200 `no_samples` 实测是两种东西**；**实测确认服务端忽略客户端传的 `node_id`/`target_key`**（安全边界成立）；`no_samples` 是时间性的（同一窗口先空后有桶） |
+| **task-3 第三块挂载**（Lead） | 延迟卡片已挂进 Forward 详情（`2715313`）；`tsc` 0 错 + forwards 套件 **294 pass / 0 fail** |
+
+### 本轮新发现（均属"后端有能力、产品路径不通"）
+1. **DDNS 在默认部署下永远不会写**（阻塞退出条件 #5）：`failover-loop.ts:220` 两开关都关即 `evaluated:0` 直接返回；`FAILOVER_POLICY` **缺省即关**（真机取证 `{"auto_failover":false,"auto_failback":false}`）；实测绑定 + `auto_resolve=true` 后等 150s，假 DNS 服务**零写入**、worker 无 ddns 日志 → `task-8`（`backend-truth` 正在做）。
+2. **多跳后端已完整实现且准入已开、Web 零接线**（退出条件 #3 的机会）：`middle_node_id` 已在 create/patch schema、有邻接两段绑定校验、`multiHopImplemented: true`、调度器分配中继端口；Web 全仓 grep `middle_node_id` **命中 0**。隐藏契约：中间跳必须 `role ∈ {ingress, both}`（待裁决）→ `task-9`（纯 Web 线路预览）先做，多跳接线另开。
+3. **通知中心缺的是后端接线**（退出条件 #6）：见 `docs/agent/notification-recon.md`（已持久化）→ `task-10`（渠道配置端点）/`task-12`（用户偏好 EXPOSE）/`task-11`（worker 接线，**blocked_by task-10 与 task-8**，因为都要改 `worker.ts`）。
+
+### 团队（4 名队友）
+`web-ddns`（task-1 完成）、`web-forward`（task-2/7 完成，正在 task-9）、`backend-truth`（task-5/6 完成，正在 task-8）、**`notify-center`（新，负责通知 epic：task-10 → task-12 → task-11）**。
+Lead 负责：task-3 挂载集成（已完成三块卡片）、task-4 收尾、最终门禁与真实浏览器验收、统一提交。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
