@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/tunex/agent/internal/identityprobe"
 	"io"
 	"os"
 	"path/filepath"
@@ -34,6 +35,28 @@ type Config struct {
 
 	ShowVersion bool
 	ConfigFile  string
+
+	// ── 身份探针（升级脚本在容器内调用的隐藏模式）────────────────────────────
+	//
+	// `--identity-probe` 只做一件事：用节点自己的凭据问一次 Panel，打印**一行**
+	// 结论然后退出 —— 绝不启动运行时。它是升级脚本身份校验的首选路径，因为
+	// Go stdlib 可以做到 shell 探针做不到的两件事：**永不跟随重定向**（凭据不会随
+	// 3xx 被重发到别的 host）与**真 JSON 解析**（`{"data": oops}` 不会被当成 Panel）。
+	//
+	// 用**布尔开关**而不是子命令是刻意的：老镜像的二进制会把位置参数当成"多余参数"
+	// 而**照常启动运行时**（`flag.Parse` 遇到位置参数就停下，剩下的进 `fs.Args()`，
+	// 而 run() 不检查它）—— 在已经在跑 Agent 的容器里再起一个进程是危险的。
+	// 未知**标志**则被 `flag` 包直接拒绝（usage + 退出码 2），所以探测是安全的。
+	IdentityProbe bool
+	// ProbeURL 是 Panel 基址（缺省回落到 agent.env 里的 TUNEX_PANEL_HTTP_URL）。
+	ProbeURL string
+	// ProbeTimeoutS 是整次探针的上限秒数。
+	ProbeTimeoutS int
+	// ProbeEnvFile 是读凭据的 agent.env 路径。
+	//
+	// **没有** `--probe-credential`：凭据只能从文件读 —— 从命令行传会进 `ps`、shell
+	// 历史与容器 inspect 输出，而这条探针的设计前提就是"凭据不出容器、不进日志"。
+	ProbeEnvFile string
 
 	// StateDir holds agent-local durable state, including the last-known-good
 	// desired-state cache that lets a restart during a panel outage come
@@ -167,12 +190,23 @@ func Parse(args []string, version string) (*Config, error) {
 	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "Directory for durable agent state (last-known-good desired cache); empty disables it")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "version for TuneX agent")
 	fs.BoolVar(&cfg.ShowVersion, "v", false, "version for TuneX agent (shorthand)")
+	// Identity probe (see Config.IdentityProbe). Deliberately flags, not a subcommand:
+	// an older binary rejects an unknown FLAG safely, but would treat a positional
+	// argument as "extra args" and start the runtime anyway.
+	fs.BoolVar(&cfg.IdentityProbe, "identity-probe", false, "Run the in-container identity probe, print one verdict line and exit (used by the upgrade script)")
+	fs.StringVar(&cfg.ProbeURL, "probe-url", "", "Panel base URL for --identity-probe (falls back to TUNEX_PANEL_HTTP_URL in the env file)")
+	fs.IntVar(&cfg.ProbeTimeoutS, "probe-timeout", int(identityprobe.DefaultTimeout.Seconds()), "Seconds to wait for the --identity-probe request")
+	fs.StringVar(&cfg.ProbeEnvFile, "probe-env-file", identityprobe.DefaultEnvFile, "agent.env path read by --identity-probe")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 
 	if cfg.ShowVersion {
+		return cfg, nil
+	}
+	// 探针模式：只跑一次探针就返回，调用方（main）打印结论并退出。
+	if cfg.IdentityProbe {
 		return cfg, nil
 	}
 

@@ -176,15 +176,20 @@ describe("identity check on the real Agent image: executable, and never a false 
     expect(curlLine).toContain('"Authorization: Bearer $TUNEX_NODE_CREDENTIAL"');
   });
 
-  test("标准 Agent 镜像的 runtime 阶段装了 curl 与 jq（否则探针会退化到跟跳转的 wget / 形状匹配）", () => {
+  test("标准 Agent 镜像不装 curl/jq：身份校验由 agent 二进制自带的探针完成", () => {
     // 这条不变量是"凭据不被 3xx 带出容器"的**前提**：busybox wget 无法禁止跟随重定向，
     // 所以唯一的办法是让镜像里有 curl。删掉这一行会让生产镜像悄悄退回 wget 分支 ——
     // 结论仍然正确（未校验），但凭据会被重发到跳转目标。
     const dockerfile = readFileSync(new URL("../../../../agent/Dockerfile", import.meta.url), "utf8");
     const runtimeStage = dockerfile.slice(dockerfile.lastIndexOf("FROM alpine"));
-    expect(runtimeStage).toContain("apk add --no-cache curl jq");
-    // 只装在 runtime 阶段：build 阶段是 golang 镜像，跟节点运行时无关。
-    expect(dockerfile.slice(0, dockerfile.lastIndexOf("FROM alpine"))).not.toContain("apk add --no-cache curl");
+    // task-29 收口：探针由二进制自己做（Go stdlib：永不跟随重定向 + 真解析），
+    // 因此 runtime 阶段**不再**需要 curl/jq —— 那两件工具曾经让镜像 +6.1MB，
+    // 而且 "curl / wget / 无 jq" 三条路径的结论必须一致本身就是缺陷源。
+    expect(runtimeStage).not.toContain("apk add --no-cache curl");
+    expect(runtimeStage).not.toContain("apk add --no-cache jq");
+    // 但必须说清身份校验走的哪条路（否则下一个人会以为是漏装）。
+    expect(runtimeStage).toContain("identity-probe");
+    expect(runtimeStage).toContain("ErrUseLastResponse");
   });
 
   test("wget takes the FIRST status line, never the last one (busybox follows redirects)", () => {
@@ -193,6 +198,32 @@ describe("identity check on the real Agent image: executable, and never a false 
     const block = identitySection(render().script);
     expect(block).toContain('grep -oE "HTTP/[0-9.]+ [0-9]{3}" "$HDR" | head -n 1');
     expect(block).not.toContain("tail -n 1 | grep -oE");
+  });
+
+  test("首选路径是 agent 内置探针，shell 探针只在它不可用时兜底（顺序即纪律）", () => {
+    const block = identitySection(render().script);
+    // 首选：agent 二进制 + 它自己的旗标（不是子命令 —— 位置参数会被老二进制当成
+    // "多余参数"而照常启动运行时）。
+    for (const needle of [
+      "--identity-probe",
+      '--probe-url "$1"',
+      '--probe-timeout "$2"',
+      '--probe-env-file "$3"',
+      "command -v tunex-agent",
+      "/usr/local/bin/tunex-agent",
+    ]) {
+      expect(block).toContain(needle);
+    }
+    // 只接受词表里的结论：老二进制吐的是 usage 文本（stdout），必须被当成"没有结论"。
+    expect(block).toContain('http:*) printf "%s');
+    expect(block).toContain('unverified:*) printf "%s');
+    expect((block.match(/\"\$OUT\"; exit 0 ;;/g) ?? []).length).toBe(2);
+    // 顺序：内置探针必须在 curl/wget 兜底**之前**。
+    expect(block.indexOf("--identity-probe")).toBeLessThan(block.indexOf("command -v curl"));
+    // 三种判定手段在操作者文案里必须可分（agent 首选 / jq 兜底 / grep 形状匹配）。
+    expect(block).toContain("agent 内置探针，不跟随重定向");
+    expect(block).toContain("**兜底路径** jq");
+    expect(block).toContain("**形状匹配**");
   });
 
   test("a 200 without a real Panel JSON body is 未校验, not 通过", () => {
@@ -214,10 +245,10 @@ describe("identity check on the real Agent image: executable, and never a false 
     // 通过那一行有**两个**分支：真解析 / 形状匹配 + 一条"没有 jq"的提醒。
     expect(block).toContain("Panel JSON 真解析");
     expect(block).toContain("Panel JSON **形状匹配**");
-    expect(block).toContain("本节点镜像里没有 jq，响应体只做了形状匹配、没有真解析");
-    // 操作者可见的"身份校验通过"**只**出现在这两条 log 里（真解析 / 形状匹配），
-    // 不允许别处冒出第三个"通过"口径（注释里提到这个词不算）。
-    expect(script.match(/log "身份校验通过/g)).toHaveLength(2);
+    expect(block).toContain("本节点镜像既没有内置探针、也没有 jq，响应体只做了形状匹配、没有真解析");
+    // 操作者可见的"身份校验通过"只出现在**三种判定手段**各一条 log 里
+    // （agent 内置探针 / jq 兜底 / grep 形状匹配），不允许别处冒出第四个"通过"口径。
+    expect(script.match(/log "身份校验通过/g)).toHaveLength(3);
   });
 
   test("only an explicit HTTP 200 counts as verified", () => {
@@ -317,10 +348,12 @@ type PanelMode =
  * "200 但响应体不是 Panel JSON" 的几种外壳（门户页 / catch-all / 别的 JSON）。
  */
 function startFakePanel(mode: PanelMode) {
-  return Bun.serve({
+  const counter = { seen: 0 };
+  const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     fetch(req) {
+      counter.seen += 1;
       const path = new URL(req.url).pathname;
       if (path === "/login") return new Response("<html>login page</html>", { headers: { "content-type": "text/html" } });
       switch (mode) {
@@ -348,6 +381,9 @@ function startFakePanel(mode: PanelMode) {
       }
     },
   });
+  // 请求计数：用来证明"内置探针给了结论之后，兜底路径没有再打一次请求"。
+  Object.defineProperty(server, "seenCount", { get: () => counter.seen });
+  return server as typeof server & { readonly seenCount: number };
 }
 
 /** 只暴露探针真正用到的那几个工具（外加 curl/wget 之一），用来逼出两条分支。 */
@@ -366,12 +402,21 @@ function restrictedPath(dir: string, tools: string[]): string {
 
 const SH = ["/bin/sh", "/usr/bin/sh"].find((candidate) => existsSync(candidate)) ?? "sh";
 
-/** 一次探针运行的完整环境：独立临时目录 + agent.env + 受控 PATH。 */
-function probeSandbox(tools: string[]) {
+/**
+ * 一次探针运行的完整环境：独立临时目录 + agent.env + 受控 PATH。
+ *
+ * `agentProbe` 非空时，在 PATH 里放一个**假的 `tunex-agent`**（内容就是给它的 shell 正文），
+ * 用来分别模拟"新版镜像有内置探针""老镜像的二进制不认识该标志"两种形态。
+ */
+function probeSandbox(tools: string[], agentProbe?: string) {
   const dir = mkdtempSync(join(tmpdir(), "tunex-upgrade-probe-"));
   const envFile = join(dir, "agent.env");
   writeFileSync(envFile, "TUNEX_NODE_CREDENTIAL=probe-test-credential\n");
-  return { dir, envFile, bin: restrictedPath(dir, tools) };
+  const bin = restrictedPath(dir, tools);
+  if (agentProbe !== undefined) {
+    writeFileSync(join(bin, "tunex-agent"), `#!/bin/sh\n${agentProbe}\n`, { mode: 0o755 });
+  }
+  return { dir, envFile, bin };
 }
 
 /**
@@ -714,6 +759,82 @@ describe("凭据外发：302 跳向另一台 host", () => {
     } finally {
       panel.server.stop(true);
       target.server.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/* ------------------------------------------------------------------ */
+/* 首选路径：agent 内置探针（task-29）                                    */
+/* ------------------------------------------------------------------ */
+
+describe("身份探针的首选路径与兜底路径", () => {
+  const body = probeBody(render().script);
+
+  test("镜像里有内置探针 ⇒ 用它，并把四个参数原样交出去", async () => {
+    const box = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"], 'echo "$@" >> "$AGENT_ARGS_FILE"; echo "http:200:agent"');
+    const panel = startFakePanel("ok");
+    try {
+      const base = `http://127.0.0.1:${panel.port}`;
+      // 假二进制把收到的参数写到文件里：这样断言的是**真实传参**，不是脚本文本。
+      const argsFile = join(box.dir, "agent-args.txt");
+      const proc = Bun.spawn([SH, "-c", body, "sh", base, "5", box.envFile], {
+        env: { PATH: box.bin, AGENT_ARGS_FILE: argsFile },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const out = (await new Response(proc.stdout).text()).trim();
+      await proc.exited;
+      expect(out).toBe("http:200:agent");
+      const args = readFileSync(argsFile, "utf8").trim().split(" ");
+      expect(args).toContain("--identity-probe");
+      expect(args).toContain("--probe-url");
+      expect(args).toContain(base);
+      expect(args).toContain("--probe-timeout");
+      expect(args).toContain("5");
+      expect(args).toContain("--probe-env-file");
+      expect(args).toContain(box.envFile);
+      // 内置探针已经给了结论 ⇒ 兜底路径不该再发一次请求（面板只被**探针**打过一次，
+      // 而这次探针是假的、没打请求 ⇒ 面板应当**零请求**）。
+      expect(panel.seenCount).toBe(0);
+    } finally {
+      panel.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("内置探针判未校验 ⇒ 原样透传，绝不去兜底路径碰运气", async () => {
+    const box = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"], 'echo "unverified:not_panel_json"');
+    const panel = startFakePanel("ok");
+    try {
+      expect(await runProbe(body, `http://127.0.0.1:${panel.port}`, box.bin, box.envFile)).toBe("unverified:not_panel_json");
+      expect(panel.seenCount).toBe(0);
+    } finally {
+      panel.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("老镜像的二进制不认识该标志（吐 usage、退出 2）⇒ 落到 shell 兜底路径", async () => {
+    const box = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"], 'echo "Usage: tunex-agent [flags]"; exit 2');
+    const panel = startFakePanel("ok");
+    try {
+      // 兜底路径会真的用 curl 打一次 ⇒ 结论是 `http:200:jq`（而不是把 usage 当结论）。
+      expect(await runProbe(body, `http://127.0.0.1:${panel.port}`, box.bin, box.envFile)).toBe("http:200:jq");
+      expect(panel.seenCount).toBe(1);
+    } finally {
+      panel.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("没有内置探针 ⇒ 兜底路径（curl/jq），结论带 :jq 标记", async () => {
+    const box = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"]);
+    const panel = startFakePanel("ok");
+    try {
+      expect(await runProbe(body, `http://127.0.0.1:${panel.port}`, box.bin, box.envFile)).toBe("http:200:jq");
+    } finally {
+      panel.stop(true);
       rmSync(box.dir, { recursive: true, force: true });
     }
   }, 30_000);

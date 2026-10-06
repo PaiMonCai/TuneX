@@ -25,7 +25,13 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
   return Object.entries(where).every(([key, value]) => row[key] === value);
 }
 
+// 替身必须**语义完整**：`mock.module` 是进程级注册表，部分字面量会在"两文件共享一个进程"的
+// 跑法下泄漏（症状是别的文件加载期 `Export named 'X' not found`，且**不带** (fail) 前缀）。
+// 所以先取真实模块再 spread，只覆盖本用例要换掉的两个函数。
+import * as realWorkspace from "../../../services/workspace.ts";
+
 mock.module("../../../services/workspace.ts", () => ({
+  ...realWorkspace,
   resolveWorkspaceMembership: async () => ({ id: currentWorkspace, role: "member" as const }),
   resolveWorkspaceAccess: async () => ({ id: currentWorkspace, role: "member" as const }),
 }));

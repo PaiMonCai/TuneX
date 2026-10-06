@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tunex/agent/internal/agentconfig"
+	"github.com/tunex/agent/internal/identityprobe"
 	"github.com/tunex/agent/internal/logx"
 )
 
@@ -54,6 +55,24 @@ func run(args []string) int {
 
 	if cfg.ShowVersion {
 		fmt.Printf("TuneX agent version %s\n", version)
+		return 0
+	}
+
+	// ── 身份探针（升级脚本在容器内调用）──────────────────────────────────────
+	//
+	// 只打印**一行**结论（词表见 internal/identityprobe），然后退出 0。它不启动
+	// 运行时、不读控制面、不写任何状态：升级脚本要回答的只是"这个容器里的凭据还能
+	// 让 Panel 认出这台节点吗"。
+	//
+	// 为什么不做成子命令：老镜像的二进制会把位置参数当"多余参数"照常启动运行时
+	// （在已经跑着 Agent 的容器里再起一个进程是危险的），而未知**标志**会被 flag 包
+	// 安全拒绝 ⇒ 脚本据此回落到老的 curl/wget 路径。
+	if cfg.IdentityProbe {
+		fmt.Println(identityprobe.Run(identityprobe.Options{
+			BaseURL: cfg.ProbeURL,
+			Timeout: time.Duration(cfg.ProbeTimeoutS) * time.Second,
+			EnvFile: cfg.ProbeEnvFile,
+		}))
 		return 0
 	}
 

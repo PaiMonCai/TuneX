@@ -8,6 +8,7 @@ import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle, Separ
 import { Input } from "@/components/ui/input";
 import { Field, ToggleRow } from "@/components/ui/form";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
+import { NotificationDeliveries } from "@/components/settings/notification-deliveries";
 import { NotificationPreferences } from "@/components/settings/notification-preferences";
 import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
@@ -330,6 +331,11 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
           `GET/PUT /api/announcements/preferences`。组件自带三态与错误分档，
           这里只负责把它放进设置页 —— 不传任何作用域参数（它不是空间设置）。 */}
       <NotificationPreferences />
+
+      {/* 投递记录（切片 N4）：让"某条通知投递失败了"第一次**可见**。
+          数据是**严格本工作空间**的只读投影（服务端按 membership 过滤，平台行结构上取不到）；
+          空列表的措辞由组件负责说清"没有记录 ≠ 没有失败"。 */}
+      <NotificationDeliveries />
 
       <Card>
         <CardHeader>

@@ -213,19 +213,70 @@ adminRoutes.post("/node/:id/credential/revoke", async (c) => {
 const SECRET_CONFIG_NAMES = new Set<string>(["SMTP_PASS", "RESEND_API_KEY", "CHATWOOT_TOKEN"]);
 const CONFIG_NAMES = new Set<string>(Object.values(SystemConfigName));
 
+/**
+ * **部署级配置键**（N-F1）：这些键的真值来自**进程环境变量**，`config` 表里的行**没有任何读者**。
+ *
+ * ── 为什么必须显式拒绝，而不是"接受后忽略" ──
+ * 之前 `SMTP_*` 可以写、`PUT` 还回 200：运维在管理端点一下"保存"，界面显示成功，于是合理相信
+ * "邮件配好了"，而 `services/mail.ts` 只读 `env.ts` 的 `mail` 段（`process.env.SMTP_*`）——
+ * 那个表单在**主动骗人**。让一封验证邮件永远发不出去，比"页面少一个输入框"严重得多。
+ *
+ * 所以：**不列、不写、写明理由**（错误消息里给具体变量名与部署文档入口）。
+ * 历史行（如果库里曾经写过）**留在原地不删**（删是破坏性动作），只是从此不再被当作可配置项。
+ *
+ * 为什么现在不做"让邮件读 DB 配置"：`isConfigured()` 是**同步契约**，而 panel 与 worker 是
+ * 两个进程、都在发信（验证/重置在 panel，公告/事实通知在 worker）。要让 DB 配置真正生效，
+ * 需要"同步快照 + 跨进程失效"（Redis 发布订阅）**外加** SMTP_PASS 的封存治理 —— 那是一个
+ * 独立切片，不是一个缺陷修复。见 `docs/production-deploy.md` 的邮件配置段。
+ */
+const DEPLOYMENT_LEVEL_CONFIG_NAMES = new Set<string>([
+  "SMTP_HOST",
+  "SMTP_PORT",
+  "SMTP_SECURE",
+  "SMTP_USER",
+  "SMTP_PASS",
+  "SMTP_FROM",
+]);
+
+/** 拒绝写入时给出的具体变量名（给人抄，而不是一个泛化的 400）。 */
+const DEPLOYMENT_LEVEL_ENV_NAMES: readonly string[] = [
+  "SMTP_HOST",
+  "SMTP_PORT",
+  "SMTP_USER",
+  "SMTP_PASS",
+  "SMTP_FROM",
+  "SMTP_SECURE",
+];
+
 adminRoutes.get("/system/config", async (c) => {
   const rows = await systemConfig.listAll();
   return c.json({
-    data: rows.map((row) =>
-      SECRET_CONFIG_NAMES.has(row.name)
-        ? { ...row, value: "", secret_configured: row.value.length > 0 }
-        : row,
-    ),
+    data: rows
+      // 部署级键不列（见上）：它们在这里既写不了、也不生效，列出来只会让人以为能配。
+      .filter((row) => !DEPLOYMENT_LEVEL_CONFIG_NAMES.has(row.name))
+      .map((row) =>
+        SECRET_CONFIG_NAMES.has(row.name)
+          ? { ...row, value: "", secret_configured: row.value.length > 0 }
+          : row,
+      ),
   });
 });
 
 adminRoutes.put("/system/config/:name", async (c) => {
   const name = c.req.param("name");
+  if (DEPLOYMENT_LEVEL_CONFIG_NAMES.has(name)) {
+    // 明确拒绝（不是"接受后忽略"）：这个响应本身就要能告诉脚本/运维"该去哪儿改"。
+    return c.json(
+      {
+        error:
+          "SMTP_* 是部署级配置：邮件发送读取的是进程环境变量（env.ts 的 mail 段），管理端不接受写入。" +
+          `请在部署环境里设置 ${DEPLOYMENT_LEVEL_ENV_NAMES.join(" / ")}（见 docs/production-deploy.md 的邮件配置段）。`,
+        code: "deployment_level_config",
+        env_names: DEPLOYMENT_LEVEL_ENV_NAMES,
+      },
+      400,
+    );
+  }
   if (!CONFIG_NAMES.has(name)) return c.json({ error: "未知配置项" }, 400);
   const body = await c.req.json().catch(() => ({}));
   if (typeof body?.value !== "string") return c.json({ error: "value 必须为字符串" }, 400);
