@@ -833,6 +833,65 @@ describe("默认读路径（离线假 db）", () => {
     if (!broken.ok) expect(broken.code).toBe("db_unavailable");
   });
 
+  test("节点/观测/冷却/端口事实任一读取失败 ⇒ db_unavailable，不伪装成离线或无冷却", async () => {
+    const state = baseState();
+
+    const cases: Array<{
+      label: string;
+      mutate: (options: ReturnType<typeof readerOptions>) => void;
+    }> = [
+      {
+        label: "node",
+        mutate: (options) => {
+          options.db.node = {
+            findUnique: async () => {
+              throw new Error("node db down");
+            },
+          };
+        },
+      },
+      {
+        label: "observation",
+        mutate: (options) => {
+          options.db.targetObservation = {
+            findMany: async () => {
+              throw new Error("observation db down");
+            },
+          };
+        },
+      },
+      {
+        label: "cooldown",
+        mutate: (options) => {
+          options.db.forwardRollout = {
+            findFirst: async () => {
+              throw new Error("rollout db down");
+            },
+          };
+        },
+      },
+      {
+        label: "port",
+        mutate: (options) => {
+          options.portAvailability = async () => {
+            throw new Error("port pool down");
+          };
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const options = readerOptions(state);
+      item.mutate(options);
+      const read = await readFailoverDecisionFacts({ tunnelId: TUNNEL, now: NOW }, options);
+      expect(read.ok, item.label).toBe(false);
+      if (!read.ok) {
+        expect(read.code).toBe("db_unavailable");
+        expect(read.detail).toContain("down");
+      }
+    }
+  });
+
   test("冷却：读 rollout 台账里最近一条 node_migration", async () => {
     const state = baseState({ migrationRollout: { created_at: new Date(NOW_MS - 60_000) } });
     const read = await readFailoverDecisionFacts({ tunnelId: TUNNEL, now: NOW }, readerOptions(state));
