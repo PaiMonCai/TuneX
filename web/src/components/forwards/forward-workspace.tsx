@@ -2,9 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowLeftRight,
-  Plus,
-  Route,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
@@ -24,6 +21,8 @@ import { ForwardTable } from "@/components/forwards/forward-table";
 import { ForwardCreateDialog } from "@/components/forwards/forward-create-dialog";
 import { ForwardBatchBar } from "@/components/forwards/forward-batch-bar";
 import { ForwardSummaryCards } from "@/components/forwards/forward-summary-cards";
+import { ForwardToolbar } from "@/components/forwards/forward-toolbar";
+import { ForwardEmptyState } from "@/components/forwards/forward-empty-state";
 import { copiedForwardCreateDraft, emptyForwardCreateDraft } from "@/components/forwards/forward-create-model";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
@@ -616,87 +615,17 @@ export function ForwardWorkspace() {
   return (
     <div className="flex flex-col gap-5">
       {!can("forward:update") && <p className="text-sm text-[var(--muted-foreground)]">只读：当前有效权限不允许修改转发。</p>}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            size="sm"
-            variant={modeFilter === "all" ? "default" : "outline"}
-            onClick={() => changeFilter(setModeFilter, "all")}
-          >
-            {t("forward.all")}
-          </Button>
-          <Button
-            size="sm"
-            variant={modeFilter === "direct" ? "default" : "outline"}
-            onClick={() => changeFilter(setModeFilter, "direct")}
-          >
-            {t("forward.direct")}
-          </Button>
-          <Button
-            size="sm"
-            variant={modeFilter === "relay" ? "default" : "outline"}
-            onClick={() => changeFilter(setModeFilter, "relay")}
-          >
-            {t("forward.relay")}
-          </Button>
-          <Input
-            className="h-9 w-64"
-            value={keywordInput}
-            onChange={(event) => setKeywordInput(event.target.value)}
-            placeholder={t("forward.searchPlaceholder")}
-            data-testid="forward-keyword"
-          />
-          <Select value={statusFilter} onValueChange={(value) => changeFilter(setStatusFilter, value as ForwardStatusFilter)}>
-            <SelectTrigger className="h-9 w-40">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("forward.statusAll")}</SelectItem>
-              <SelectItem value="active">{t("forward.statusActive")}</SelectItem>
-              <SelectItem value="pending">{t("forward.statusPending")}</SelectItem>
-              <SelectItem value="applying">{t("tunnel.v3ApplyApplying")}</SelectItem>
-              <SelectItem value="suspended">{t("forward.statusSuspended")}</SelectItem>
-              <SelectItem value="error">{t("forward.statusError")}</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={ingressFilter} onValueChange={(value) => changeFilter(setIngressFilter, value)}>
-            <SelectTrigger className="h-9 w-48">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{t("forward.allIngress")}</SelectItem>
-              {ingressNodes.map((node) => (
-                <SelectItem key={String(node.id)} value={String(node.id)}>
-                  {node.node_id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select value={egressFilter} onValueChange={(value) => changeFilter(setEgressFilter, value)}>
-            <SelectTrigger className="h-9 w-48" data-testid="forward-egress-filter">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">{L("forward.allEgress")}</SelectItem>
-              {egressNodes.map((node) => (
-                <SelectItem key={String(node.id)} value={String(node.id)}>
-                  {node.node_id}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button disabled={!canCreate} variant="outline" onClick={() => openCreate("direct")}>
-            <Plus className="size-4" />
-            {t("forward.createDirect")}
-          </Button>
-          <Button disabled={!canCreate} onClick={() => openCreate("relay")}>
-            <Route className="size-4" />
-            {t("forward.createRelay")}
-          </Button>
-        </div>
-      </div>
+      <ForwardToolbar
+        mode={modeFilter} status={statusFilter} ingress={ingressFilter} egress={egressFilter}
+        keyword={keywordInput} ingressNodes={ingressNodes} egressNodes={egressNodes} canCreate={canCreate}
+        t={t} text={L}
+        onMode={(value) => changeFilter(setModeFilter, value)}
+        onStatus={(value) => changeFilter(setStatusFilter, value)}
+        onIngress={(value) => changeFilter(setIngressFilter, value)}
+        onEgress={(value) => changeFilter(setEgressFilter, value)}
+        onKeyword={setKeywordInput}
+        onCreate={openCreate}
+      />
 
       <ForwardSummaryCards summary={summary} loading={loading} t={t} />
 
@@ -724,32 +653,7 @@ export function ForwardWorkspace() {
 
       {/* 出错时不能落到「还没建转发」的空态：那会把一次加载失败讲成「你没有数据」 */}
       {!loading && !error && total === 0 && !hasFilters ? (
-        <div className="grid gap-4 md:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <ArrowLeftRight className="size-5" />
-                {t("forward.createDirect")}
-              </CardTitle>
-              <CardDescription>{t("forward.directDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Button disabled={!canCreate} onClick={() => openCreate("direct")}>{t("forward.createDirect")}</Button>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Route className="size-5" />
-                {t("forward.createRelay")}
-              </CardTitle>
-              <CardDescription>{t("forward.relayDesc")}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Button disabled={!canCreate} onClick={() => openCreate("relay")}>{t("forward.createRelay")}</Button>
-            </CardContent>
-          </Card>
-        </div>
+        <ForwardEmptyState canCreate={canCreate} t={t} onCreate={openCreate} />
       ) : (
         <div className="flex flex-col gap-3">
           <ForwardListControls
