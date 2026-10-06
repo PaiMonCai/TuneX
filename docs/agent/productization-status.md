@@ -322,6 +322,18 @@ Lead 负责：`task-3`（把两块自包含组件挂进 `forward-detail.tsx` 的
 
 待做：mock 对齐（删复数扁平 `GET /admin/nodes/:id`，改单数嵌套 + 单数 pools/targets）、路径↔后端声明的对照测试、真机复核。
 
+### task-4 进展（Lead，2026-10-07）
+
+已提交：`465959b`（详情走真实单数路径 + 显式投影 + 出口池单数路径 + 补 `common.loadFailed`）、`e1f0828`（mock 与真实同形 + 修 5 处固化旧契约的测试）。
+
+mock 与真实后端对齐时发现两处**结构性差异**（都属于"mock 撒谎"）：
+1. **池列表信封**：mock 返回扁平数组，真实后端是 `{data:{data,total}}` ⇒ 客户端按信封读取会永远显示空池；已让 mock 返回同形信封。
+2. **targetId 是全局的还是按池的**：真实后端按 targetId **全局寻址**（`/node/targets/:targetId`），而 mock 的 `nextTargetId` 是**按池**分配 ⇒ 每个池都有 id=1，按真实路径操作会命中**别的池的同号目标**（实测：DELETE 返回 ok，但被删的是种子池里的同号目标，PATCH 那个"已删"目标仍 200）。已改为全局唯一。
+
+顺带修掉我自己引入的一处遮蔽：新增的 `/node/pools/:poolId` 分支把 `/node/pools/:id/health` 也吞了（→ 404「接口不存在」），已限定尾段。
+
+定向测试现状（`src/mocks/__tests__ src/components/admin/__tests__ src/components/forwards src/components/nodes`）：**696 pass / 3 fail → 修完 1 条后剩 2 条**，两条都与 provision 相关：`POST /node-groups/:id/nodes` 在**合跑**时返回 201 但 body 无 `node`（**单跑通过**），已带精确证据交回拥有 `mocks/handlers/catalog.ts` 的 `backend-truth`（合跑/单跑差异属跨文件共享 mock state，需他们按真实形状定位并补可复现的行为测试）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
