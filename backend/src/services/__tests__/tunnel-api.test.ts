@@ -46,6 +46,7 @@ import {
   validateRelayTopology,
   type EgressPoolRow,
   type NodeGroupRow,
+  type TunnelApiDb,
   type TunnelApiDeps,
   type TunnelApiNodeRow,
   type TunnelRow,
@@ -75,6 +76,7 @@ const orchestratorCalls: {
 }[] = [];
 /** 假 Agent 是否接受下一次下发。 */
 let agentHealthy = true;
+let archivedTraffic = 0;
 
 let nextTunnelId = 100;
 
@@ -85,6 +87,7 @@ function resetState(): void {
   pools.length = 0;
   orchestratorCalls.length = 0;
   agentHealthy = true;
+  archivedTraffic = 0;
   nextTunnelId = 100;
 }
 
@@ -148,7 +151,7 @@ function seedTunnel(over: Partial<TunnelRow> = {}): TunnelRow {
 /* 内存 DB 替身                                                         */
 /* ------------------------------------------------------------------ */
 
-function makeDb(): TunnelApiDeps["db"] {
+function makeDb(): TunnelApiDb {
   return {
     tunnel: {
       async findUnique({ where }: { where: Record<string, unknown> }) {
@@ -260,6 +263,11 @@ function makeDb(): TunnelApiDeps["db"] {
         return {};
       },
     },
+    tunnelTraffic: {
+      async aggregate() {
+        return { _sum: { traffic: archivedTraffic } };
+      },
+    },
     node: {
       async findUnique({ where }: { where: Record<string, unknown> }) {
         if (where.id !== undefined) return nodes.find((n) => n.id === where.id) ?? null;
@@ -356,9 +364,14 @@ const fakeOrchestrator = {
 };
 
 function deps(over: TunnelApiDeps = {}): TunnelApiDeps {
+  const fakeDb = over.db ?? makeDb();
+  const loadPolicy = over.loadPolicy ?? (async () => allowAllPolicy());
+  const quotaLock: NonNullable<TunnelApiDeps["quotaLock"]> = async (workspaceId, fn) =>
+    fn(fakeDb, await loadPolicy(workspaceId));
   return {
-    db: makeDb(),
-    loadPolicy: async () => allowAllPolicy(),
+    db: fakeDb,
+    loadPolicy,
+    quotaLock,
     runtimeUse: async () => null,
     orchestrator: fakeOrchestrator as never,
     applyDirect: successDirect(),
@@ -688,6 +701,60 @@ describe("B. CRUD", () => {
     };
     expect((await createTunnel({ ...base, name: "" }, deps())).ok).toBe(false);
     expect((await createTunnel({ ...base, name: "x".repeat(61) }, deps())).ok).toBe(false);
+  });
+
+  test("B5b. max_tunnels 已满 ⇒ 准入在 create 前拒绝，不留下 error Tunnel", async () => {
+    seedTunnel({ id: 50, workspace_id: 7 });
+    const before = tunnels.size;
+    const limited = allowAllPolicy();
+    limited.limits.max_tunnels = 1;
+
+    const result = await createTunnel(
+      {
+        name: "over-limit",
+        mode: "direct",
+        userId: 1,
+        workspaceId: 7,
+        personalWorkspaceId: 7,
+        inNodeGroupId: 10,
+        outNodeGroupId: null,
+        forwardAddresses: ["192.168.1.10:5000"],
+        tunnelType: "tcp",
+      },
+      deps({ loadPolicy: async () => limited }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("policy_denied");
+    expect(tunnels.size).toBe(before);
+    expect([...tunnels.values()].some((t) => t.name === "over-limit")).toBe(false);
+  });
+
+  test("B5c. 当前计量周期流量已耗尽 ⇒ create 前拒绝，历史用量不能被忽略为 0", async () => {
+    archivedTraffic = 100;
+    const before = tunnels.size;
+    const limited = allowAllPolicy();
+    limited.limits.traffic_limit = 100;
+    limited.limits.traffic_period = "total";
+
+    const result = await createTunnel(
+      {
+        name: "traffic-exhausted",
+        mode: "relay",
+        userId: 1,
+        workspaceId: 7,
+        personalWorkspaceId: 7,
+        inNodeGroupId: 10,
+        outNodeGroupId: 20,
+        tunnelType: "tcp",
+      },
+      deps({ loadPolicy: async () => limited, applyCreate: successCreate() }),
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("policy_denied");
+    expect(tunnels.size).toBe(before);
+    expect(orchestratorCalls).toHaveLength(0);
   });
 
   test("B6. 读：列表按 workspace 隔离 + 状态/模式过滤", async () => {
@@ -1105,6 +1172,15 @@ describe("E. 结构约束", () => {
     expect(src.includes("pushNodeConfig")).toBe(false);
     // 历史流量是计费账本，不属于 Tunnel 的生命周期子表。
     expect(src).not.toMatch(/tunnelTraffic[^\n]*deleteMany/);
+  });
+
+  test("E1b. 创建额度不得使用硬编码 0，且必须经过 workspace quota critical section", async () => {
+    const code = await Bun.file(new URL("../tunnel-api.ts", import.meta.url).pathname).text();
+    expect(code).toContain("deps.quotaLock(input.workspaceId");
+    expect(code).toContain("tx.tunnel.count");
+    expect(code).toContain("tx.tunnelTraffic.aggregate");
+    expect(code).not.toContain("tunnelCount: 0");
+    expect(code).not.toContain("trafficUsed: 0");
   });
 
   test("E2. 服务层唯一的下发出口是 scheduler 的两个编排入口", async () => {
