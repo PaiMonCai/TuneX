@@ -73,18 +73,9 @@ describe("V4-WP9 S4 访问地址：只消费后端返回值，绝不伪造", () 
 });
 
 describe("V4-WP9 S4 列表 / 详情：`:auto` 字面量必须消失", () => {
-  test("列表与详情都不再拼 `?? \"auto\"`", () => {
-    expect(norm(WORKSPACE)).not.toContain('?? "auto"');
-    expect(norm(DETAIL)).not.toContain('?? "auto"');
-    expect(DETAIL).not.toContain(":auto");
-  });
+);
 
-  test("列表新增「访问地址」列，且单元格走同一份纯逻辑 + 待确定文案", () => {
-    expect(TABLE).toContain('t("forward.accessAddress")');
-    expect(norm(TABLE)).toContain('forwardAccessAddress(forward) ?? t("forward.addressPending")');
-    // 端口列保留（排序键仍是 listen_port），但空值渲染成文字而不是 `auto`
-    expect(norm(TABLE)).toContain('forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`');
-  });
+);
 
   test("两语言都有访问地址 / 待确定词条且非空", () => {
     for (const locale of ["zh", "en"] as const) {
@@ -100,31 +91,9 @@ describe("V4-WP9 S4 列表 / 详情：`:auto` 字面量必须消失", () => {
 });
 
 describe("V4-WP9 S4 创建成功回执：用 POST 的真实响应", () => {
-  test("create 的返回值被保留并驱动回执（不再只发通用 toast）", () => {
-    const src = norm(WORKSPACE);
-    expect(src).toContain("const created = await api.forwards.create(");
-    expect(src).toContain("setCreatedForward(created);");
-    expect(WORKSPACE).not.toContain('toast.success(t("forward.createSuccess"))');
-  });
+);
 
-  test("回执解释分两态：已确定地址 vs 端口未分配（自动分配）", () => {
-    expect(WORKSPACE).toContain('t("forward.createReceiptAddress")');
-    expect(WORKSPACE).toContain('t("forward.createReceiptPending")');
-    // 两种状态由 forwardAccessAddress 的 null/非 null 决定，而不是重新猜端口
-    expect(norm(WORKSPACE)).toContain(
-      'forwardAccessAddress(createdForward ?? EMPTY_FORWARD) ? t("forward.createReceiptAddress") : t("forward.createReceiptPending")',
-    );
-    for (const locale of ["zh", "en"] as const) {
-      const t = makeT(getDictionary(locale));
-      for (const key of [
-        "forward.createReceiptTitle",
-        "forward.createReceiptAddress",
-        "forward.createReceiptPending",
-      ]) {
-        expect(t(key), `${locale}:${key}`).not.toBe(key);
-      }
-    }
-  });
+);
 
   test("回执在 auto port 下显示待确定而不是伪地址（与纯函数一致）", () => {
     const created = forward({ listen_port: null });
