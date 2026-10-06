@@ -15,9 +15,6 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   test("email verification + password reset integration (requires TUNEX_DB_TEST=1)", { skip: true }, () => {});
 } else {
   process.env.AUTH_SECRET ??= "test-only-auth-secret-must-not-be-used-in-production";
-  process.env.LICENSE_SECRET ??= "test-only-license-secret-must-not-be-used-in-production";
-  process.env.TUNEX_CONFIG_KEY ??= Buffer.alloc(32, 5).toString("base64url");
-  process.env.TUNEX_LICENSE_KEY ??= Buffer.alloc(32, 6).toString("base64url");
   process.env.PAYMENTS_ENABLED = "false";
   process.env.ALLOW_REGISTER_FALLBACK = "true";
   // 与其它集成用例一致：邮件降级为日志（不连 SMTP），token 从 DB 哈希反查不可行，
