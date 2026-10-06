@@ -765,6 +765,28 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 - backend：`tsc` 0 错；全量 2927 条里 **2 条失败 = `backend-truth` 正在做的 task-29 中途态**（`agent/internal/identityprobe/` 等），不是回归
 - N4 真机验证（`notify-center`）：脱敏（完整地址逐字不出现、`***@example.com` + `target_masked` + `targets_count`）、**跨空间隔离**、**平台行不下发**、`error` 二次脱敏（`RCPT TO:<***> returned 550`）、三种 404 逐字同形、`?status=exploded` → 400 fail-closed、`degraded` 与 `failed` **正交**、零残留
 
+## 3.34 退出条件逐条对账（**Round 38 更新版**，基准 = R5-A 的 §1 判定表 + 其后的全部交付）
+
+口径：以 R5-A 在 `docs/agent/forwardx-alignment-review.md` §1 的判定为**基线**，逐条写"当时的判定 → 现在的事实 → 现在的判定 → 仍缺什么"。**不把在途或未端到端验证的东西算作达成。**
+
+| # | 条件 | R5-A 当时 | 现在的事实（证据） | 现在的判定 | 仍缺什么（诚实列出） |
+|---|---|---|---|---|---|
+| **1** | 新用户可快速部署 | 基本达成 | `README:25` 四步 + `.env.example` + `production-deploy.md`；**但从未真跑过** ⇒ 已派 `task-31`（照文档全新部署演练 + 文档缺陷清单 + 真实耗时 + 真实 Agent 上线） | **待 `task-31` 结论** | 演练结果；公网 TLS/反代路径（演练环境无公网域名） |
+| **2** | 可从 Web 指引完成第一台 Node | 达成 | 浏览器端到端：闩锁 → 真 Agent → **5s 内 online** → CTA `/forwards?ingress_node_id=`；round 33 门禁重跑仍绿 | **达成** | — |
+| **3** | 直观创建 Direct/Relay/Multi-hop | 基本达成（多跳在途） | Direct/Relay 早已交付；**多跳已接线**（`forward-multihop-model/select` + `middle_node_id` 入请求 + 两段绑定前置 + 预览改「四步三段」）；**真实三跳未跑通**（scratch 4 台节点无一 `role=both`） | **基本达成** | 真实三跳创建 + 真机 topology 两段 + `apply_transit` 端到端（需临时改一台节点角色） |
+| **4** | Forward 状态与链路清晰可见 | 基本达成 | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 浏览器验收 43/41 个相关 testid、禁用词零命中 | **达成** | 带宽/吞吐时间序列（后端无该数据源） |
+| **5** | DDNS 可从 UI 使用 | 基本达成 | 写入闸门真解耦（`cron_ddns_sync`）；**真机 `pending → synced` + 读回确认 + 浏览器「已切换」**；缺口补齐：`auto_resolve=false` 缺省态现在**明说"不会跟随、要你自己维护"**（`dec70f4`） | **达成** | 只支持 2 种 provider（cloudflare/huawei）；多入口 `multi_entry` 首发未开放 |
+| **6** | Notification 可从 UI 配置 | **未达成** | **四块都到位**：渠道配置端点（task-10）+ **admin 渠道 UI**（task-20，独立目录）+ 用户偏好矩阵（task-12）+ **事实类投递节拍**（task-11，真机三拍：真 email 送达 / 被投递层静默期拦住 / 恢复配对）+ **投递失败可见性**（task-13，真机脱敏与跨空间隔离）+ SMTP 问候语 P1 已修 | **基本达成** | **真实外部投递**未验证（SMTP 只验明文会话、未对真实公网 MTA；telegram 从未真发到 api.telegram.org）；`degraded=true` 真机触发；`secret_state=unreadable` 真机 |
+| **7** | Agent upgrade 有完整用户流程 | 基本达成（完整流程在途） | 只读投影 `GET /api/nodes/:id/upgrade-state`（用**实际上报版本**而非配置列，前置与 `checkUpgradePrecondition` 逐字同源）+ **卡片已挂载**（与"生成命令"同一入口，旧内联块已退役）+ 版本基线语义已审计（`install.sh` 写 sha 导致永不触发 → task-26） | **基本达成** | **真实节点完整升级未跑**（刻意不动那 4 台）；`version_drift=behind` 真机未出现 |
+| **8** | 常见故障有诊断入口 | 基本达成 | 诊断面板 + 支持包 + 转发错误→下一步；**Looking Glass 已消费并挂载**（五态 + `admin_override` 按观察者 + 写操作警告 + caveats），开关真机验证（含普通成员可进）、真实发起在 API 层验证（200 报告 / 409 单飞 / 审计计数） | **达成** | 后端只 1 种方法 `tcp_connect`（相对 ForwardX 的 8 种）；`refused`/`invalid_target` 等结果态无真机样本 |
+| **9** | 不需理解 Lease/Revision/Fencing | 达成 | 用户域零命中（唯一命中在管理端联邦页）；`Revision` 只在默认折叠的技术详情块内；routes 页假承诺已删 | **达成** | — |
+| **10** | 核心日常体验不再明显落后 ForwardX | **未达成** | R5-A 判"未达成"的三条**落后理由已逐条被消除或改写**：① 通知"配好也没有任何东西会被投递" → **已有端到端投递链**（真机送达 + 账本 + 失败可见）；② HA/多入口"无产品面" → **已有用户侧只读投影 + 卡片**（`GET /forwards/:id/ha`，期望/事实/候选三态，真机与 failover 权威判定逐字段一致）；③ 诊断"Web 侧不存在" → **已挂载并真机验证** | **需一次终局评审**（不在本轮自评里下结论） | 三条仍属"**未在真实外部环境端到端**"（公网邮件/Telegram、真实三跳、真实升级）；带宽序列缺失；provider 面窄于 ForwardX |
+
+**本对账的诚实边界**：
+- 第 10 条我**故意不自行判"达成"**——它是整体判断，应由一次独立评审（同 R5-A 的方法：钉 SHA、只写自己复核过的、把"在途"排除）给出，而不是由实施方自述。
+- "达成"一律指：**有可复核证据的端到端或真机证据**；凡"只有单测/契约测试"的都不写成达成（例如 #3 的多跳接线、#7 的升级卡片）。
+- 表中所有"仍缺什么"都不是免责声明，而是**下一条切片的输入**。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
