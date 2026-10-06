@@ -930,8 +930,9 @@ describe("C. 运行操作统一走 orchestrator", () => {
     expect(r.ok).toBe(true);
     expect(tunnels.has(205)).toBe(false);
     const removes = orchestratorCalls.filter((c) => c.kind === "remove");
-    // 入口 + 出口两端都要撤（单撤一端会留下一个继续收流量的 listener）。
+    // 入口 + 出口两端都要撤；同时必须先停入口接新流量，再拆下游。
     expect(removes).toHaveLength(2);
+    expect(removes.map((c) => c.direction)).toEqual(["ingress", "egress"]);
     // 补偿 revision = config_revision + 1（同值会被 Agent 判 stale 撤不掉）。
     for (const rm of removes) expect(rm.revision).toBe(8);
   });
@@ -1102,6 +1103,8 @@ describe("E. 结构约束", () => {
     // 也不得 import socket 侧（legacy config-pusher 的领地）
     expect(src.includes("config-pusher")).toBe(false);
     expect(src.includes("pushNodeConfig")).toBe(false);
+    // 历史流量是计费账本，不属于 Tunnel 的生命周期子表。
+    expect(src).not.toMatch(/tunnelTraffic[^\n]*deleteMany/);
   });
 
   test("E2. 服务层唯一的下发出口是 scheduler 的两个编排入口", async () => {
