@@ -542,7 +542,7 @@ describe("A. 纯校验", () => {
   test("A5. 动作 → desired 映射：retry/resume 推回 active 并清错误", () => {
     expect(desiredAfterAction("retry")).toEqual({ desired_status: "active", apply_status: "pending", clear_error: true });
     expect(desiredAfterAction("resume")).toEqual({ desired_status: "active", apply_status: "pending", clear_error: true });
-    expect(desiredAfterAction("suspend")).toEqual({ desired_status: "inactive", apply_status: "suspended", clear_error: false });
+    expect(desiredAfterAction("suspend")).toEqual({ desired_status: "inactive", apply_status: "applying", clear_error: false });
     expect(desiredAfterAction("delete")).toEqual({ desired_status: "inactive", clear_error: false });
   });
 
@@ -861,6 +861,58 @@ describe("C. 运行操作统一走 orchestrator", () => {
     const removes = orchestratorCalls.filter((c) => c.kind === "remove");
     expect(removes).toHaveLength(2);
     expect(removes.map((c) => c.direction).sort()).toEqual(["egress", "ingress"]);
+  });
+
+  test("C4b. suspend：撤除任一腿失败时不得声称 suspended，且继续尝试其它腿", async () => {
+    const t = seedTunnel({ id: 2031, apply_status: "active", desired_status: "active" });
+    const failingOrchestrator = {
+      removeTunnel: async (input: {
+        tunnelId: number;
+        revision: number;
+        direction?: "direct" | "ingress" | "egress";
+        node?: { id?: number };
+      }) => {
+        orchestratorCalls.push({
+          kind: "remove",
+          tunnelId: input.tunnelId,
+          revision: input.revision,
+          direction: input.direction,
+          nodeId: input.node?.id,
+        });
+        if (input.direction === "ingress") {
+          return { ok: false as const, error_code: "agent_unreachable", error: "ingress offline" };
+        }
+        return { ok: true as const, result: { commandId: "cmd-rm", revision: input.revision, ack: {} } };
+      },
+    };
+
+    const r = await runTunnelAction(
+      t.id,
+      "suspend",
+      7,
+      deps({ orchestrator: failingOrchestrator as never }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.apply_error_code).toBe("runtime_teardown_failed");
+    expect(t.desired_status).toBe("inactive");
+    expect(t.apply_status).toBe("error");
+    expect(t.apply_error).toContain("ingress offline");
+    // ingress fails first, but egress is still attempted so the residual surface is minimized.
+    expect(orchestratorCalls.filter((c) => c.kind === "remove").map((c) => c.direction))
+      .toEqual(["ingress", "egress"]);
+  });
+
+  test("C4c. suspend：没有 orchestrator 时 fail-closed，不把 desired-only 写入伪装成已挂起", async () => {
+    const t = seedTunnel({ id: 2032, apply_status: "active", desired_status: "active" });
+    const r = await runTunnelAction(t.id, "suspend", 7, deps({ orchestrator: null }));
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.apply_error_code).toBe("runtime_teardown_failed");
+    expect(t.desired_status).toBe("inactive");
+    expect(t.apply_status).toBe("error");
   });
 
   test("C5. suspend 幂等：已 suspended → 409", async () => {
