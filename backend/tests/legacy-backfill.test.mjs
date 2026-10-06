@@ -67,7 +67,7 @@ const LEGACY_MIGRATIONS = [
 const V3_MIGRATIONS = ["20260926040000_v3_schema_contract", WP2_MIGRATION];
 
 const LEGACY_ROWS = path.join(HERE, "fixtures", "legacy-backfill-rows.sql");
-const POST_V3_ROWS = path.join(HERE, "fixtures", "legacy-backfill-post-v3.sql");
+const POST_SCHEMA_ROWS = path.join(HERE, "fixtures", "legacy-backfill-post-schema.sql");
 const WP2_SQL = path.join(MIGRATIONS_ROOT, WP2_MIGRATION, "migration.sql");
 
 function prismaCli() {
@@ -226,7 +226,7 @@ if (!DB_TEST) {
       // 3. 升级到 v3（WP1 + WP2 的迁移）
       migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...V3_MIGRATIONS]);
       // 4. 追加 v3 列已存在才能构造的引用（混挂组 / 半条 v3 行 / 无隧道组）
-      executeSqlFile(handle.url, POST_V3_ROWS);
+      executeSqlFile(handle.url, POST_SCHEMA_ROWS);
       // 5. 再跑一次 WP2 迁移：证明迁移之后新增的行也被同一条迁移覆盖
       executeSqlFile(handle.url, WP2_SQL);
     });
@@ -401,7 +401,7 @@ if (!DB_TEST) {
       db = new PrismaClient({ datasources: { db: { url: handle.url } } });
       migrateDeploy(handle.url, [...LEGACY_MIGRATIONS, ...V3_MIGRATIONS]);
       executeSqlFile(handle.url, LEGACY_ROWS);
-      executeSqlFile(handle.url, POST_V3_ROWS);
+      executeSqlFile(handle.url, POST_SCHEMA_ROWS);
       executeSqlFile(handle.url, WP2_SQL);
     });
 
