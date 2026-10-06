@@ -497,6 +497,35 @@ t+5s → state=synced  verified=true  confirmed=["172.33.10.20"]  attempt=0  nex
 
 **后续**：新建 `task-20`（admin 渠道配置 UI，已派给 `notify-center`）；`task-11`（worker 注册通知 job）**已解锁**（task-8 早已 completed），并已提醒对方这一点。
 
+## 3.22 task-15（F1 凭据外发）完成：跨 host A/B 证据
+
+`backend-truth` 交付：`agent/Dockerfile` runtime 阶段装 **curl**（+5.19MB / +34.6%，真实数字），探针**优先 curl 且不写 `-L`**（curl 分支另加 `--max-redirs 0` 防呆），wget 仅兜底且仍要求"首个状态行 + 响应体像 Panel JSON"。
+
+**证据（两个不同 IP 的独立 server 记录，谁收到就是谁收到）**：
+```
+[修复前] 旧镜像（只有 busybox wget）
+  panel(原 host)     收到 auth_present=true auth_len=38
+  target(跳转目标)   收到 auth_present=true auth_len=38   ← 凭据出了容器；探针结论 http:302（结论对，凭据已外发）
+[修复后] 新镜像（runtime 有 curl 8.14.1）
+  panel(原 host)     收到 auth_present=true auth_len=38
+  target(跳转目标)   收到 []                              ← 零请求；结论仍是 http:302（未校验，不谎报）
+```
+正例未回归（真 Panel + 真凭据 200、错凭据 401、无凭据 `unverified:no_credential`）；`node-upgrade.test.ts` **42 pass**；backend `bun test src` **2868 pass / 0 fail**；反向变异（把 curl 分支改成 `-L`）**3 条变红**。
+
+**它如实列出的残留**：① 没有 curl 的镜像（老/自定义镜像）仍走 wget 兜底 ⇒ 3xx 仍会外发凭据（彻底消除只能靠镜像带 curl，或把探针换成自己发 HTTP 的实现）；② 响应体判定仍是结构性 grep（`{"data": <非 JSON>}` 会被判通过）→ 已建 **`task-21`**（装 jq 做真解析）。
+另建 **`task-22`**（F2 审计：多个 90s 字面量是否应当同源——**先判定，允许结论是"本来就该不同"**）。
+
+## 3.23 干跑最终验收脚本（Lead）：真实 synced 态首次在浏览器可见
+
+在**含 task-8 的镜像**上跑了一遍完整浏览器遍历（脚本 `acceptance-final.mjs`：建 provider → 绑定 → 等 synced → 遍历 6 个页面 → 自动清理）：
+
+- `bind → pending`，随后 **`dnsAfterWait = synced`**；
+- `/forwards/2` 浏览器渲染出 **「已切换」+「服务端已读回确认：解析记录就是这里的期望地址」+ 已确认地址 172.33.10.20 + 确认时间 + 失败次数 0 + 不会自动重试 + 自动同步已开启**；
+- 禁用词（正常/健康/可达）在该页**零命中**；`apiErrors` 全页**为空**；
+- 清理后 `providersLeft=0`、`forward2DnsState=unbound`（环境恢复原状）。
+
+**一处观察（非缺陷，但值得记）**：`/admin/notification-channels` 在页面尚未实现时被 `app/(admin)/admin/[segment]/page.tsx` 的 `normalize()` **静默回落成节点管理页**（渲染出 37 个 testid 且该页文本含「健康」）。这正好印证我给 `task-20` 写下的警示：admin 新页**必须建独立目录**，否则用户访问一个不存在的地址会看到另一个页面（而且没有任何提示）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
