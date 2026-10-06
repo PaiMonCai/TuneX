@@ -716,7 +716,8 @@ export interface FailoverFactsReaderOptions {
   readonly loadLease?: (tunnelId: number) => Promise<PlacementLeaseRow | null>;
   /**
    * 可用端口数（默认 = `portPool.availablePorts`，真库）。
-   * 不抛：读不到按 0 处理（fail-closed —— 没有可靠端口事实就不迁移）。
+   * 读取失败必须向上冒泡：0 是一个真实的容量事实，不能拿它伪装 IO 故障。
+   * 上层会把整次事实读取折成 db_unavailable，从而不做自动迁移。
    */
   readonly portAvailability?: (nodeId: number) => Promise<number>;
   /**
@@ -809,28 +810,41 @@ export async function readFailoverDecisionFacts(
     // 否则策略会"从节点 0 迁移"，那是一个凭空捏造的归属事实。
     return { ok: false, code: "no_placement", detail: `tunnel ${tunnelId} 没有入口归属` };
   }
-  const destinations = await options.destinations({
-    tunnel_id: tunnelId,
-    workspace_id: workspaceId,
-    owner_node_id: ownerNodeId ?? null,
-  });
-  const policy = await options.policy({ tunnel_id: tunnelId, workspace_id: workspaceId });
-
-  const ownerFacts = await readNodeFacts(options.db, ownerNodeId, now);
-
-  const observations = await readObservations(options, tunnelId, tunnel, now);
-  const candidate = await readDestination(options, destinations.candidate_node_id, now);
-  const preferredId = destinations.preferred_node_id;
+  let destinations: FailoverDestinations;
+  let policy: FailoverPolicyFacts;
+  let ownerFacts: { reachable: boolean; last_seen_at: Date | null };
+  let observations: FailoverInput["target_observations"];
+  let candidate: FailoverCandidateFacts | null;
+  let preferredId: number | null;
   let failback: FailbackFacts | null = null;
-  if (preferredId !== null && preferredId !== ownerNodeId) {
-    const preferred = await readDestination(options, preferredId, now);
-    if (preferred !== null) {
-      const checks = (await options.failbackHealthyChecks?.(tunnelId)) ?? 0;
-      failback = { candidate: preferred, healthy_checks: checks };
-    }
-  }
+  let migrated: { at: Date | string | number | null; kind: MigrationKind | null } | null;
 
-  const migrated = await readLastMigration(options, tunnelId);
+  try {
+    destinations = await options.destinations({
+      tunnel_id: tunnelId,
+      workspace_id: workspaceId,
+      owner_node_id: ownerNodeId ?? null,
+    });
+    policy = await options.policy({ tunnel_id: tunnelId, workspace_id: workspaceId });
+    ownerFacts = await readNodeFacts(options.db, ownerNodeId, now);
+    observations = await readObservations(options, tunnelId, tunnel, now);
+    candidate = await readDestination(options, destinations.candidate_node_id, now);
+    preferredId = destinations.preferred_node_id;
+    if (preferredId !== null && preferredId !== ownerNodeId) {
+      const preferred = await readDestination(options, preferredId, now);
+      if (preferred !== null) {
+        const checks = (await options.failbackHealthyChecks?.(tunnelId)) ?? 0;
+        failback = { candidate: preferred, healthy_checks: checks };
+      }
+    }
+    migrated = await readLastMigration(options, tunnelId);
+  } catch (e) {
+    return {
+      ok: false,
+      code: "db_unavailable",
+      detail: e instanceof Error ? e.message : String(e),
+    };
+  }
 
   return {
     ok: true,
@@ -866,17 +880,15 @@ async function readNodeFacts(
   now: Date,
 ): Promise<{ reachable: boolean; last_seen_at: Date | null }> {
   const row = record(
-    await db.node
-      .findUnique({
-        where: { id: nodeId },
-        select: {
-          status: true,
-          last_seen_at: true,
-          node_credential_hash: true,
-          credential_revoked: true,
-        },
-      })
-      .catch(() => null),
+    await db.node.findUnique({
+      where: { id: nodeId },
+      select: {
+        status: true,
+        last_seen_at: true,
+        node_credential_hash: true,
+        credential_revoked: true,
+      },
+    }),
   );
   if (!row) return { reachable: false, last_seen_at: null };
   const lastSeen = row.last_seen_at instanceof Date ? row.last_seen_at : null;
@@ -911,9 +923,10 @@ async function readObservations(
   const poolId = asNodeId(tunnel.egress_pool_id);
   if (poolId !== null && options.db.egressPool) {
     const pool = record(
-      await options.db.egressPool
-        .findUnique({ where: { id: poolId }, select: { targets: { select: { host: true, port: true } } } })
-        .catch(() => null),
+      await options.db.egressPool.findUnique({
+        where: { id: poolId },
+        select: { targets: { select: { host: true, port: true } } },
+      }),
     );
     const targets = Array.isArray(pool?.targets) ? (pool!.targets as unknown[]) : [];
     for (const entry of targets) {
@@ -924,25 +937,20 @@ async function readObservations(
   }
   if (keys.length === 0) return { observers: [] };
 
-  let rows: unknown[];
-  try {
-    rows = (await options.db.targetObservation.findMany({
-      where: { target_key: { in: keys } },
-      select: {
-        node_id: true,
-        target_key: true,
-        reachable: true,
-        latency_ms: true,
-        consecutive_success: true,
-        consecutive_failure: true,
-        success_rate: true,
-        observed_at: true,
-        observation_source: true,
-      },
-    })) as unknown[];
-  } catch {
-    return { observers: [] };
-  }
+  const rows = (await options.db.targetObservation.findMany({
+    where: { target_key: { in: keys } },
+    select: {
+      node_id: true,
+      target_key: true,
+      reachable: true,
+      latency_ms: true,
+      consecutive_success: true,
+      consecutive_failure: true,
+      success_rate: true,
+      observed_at: true,
+      observation_source: true,
+    },
+  })) as unknown[];
 
   const observers: FailoverObservedTarget[] = [];
   for (const entry of rows) {
@@ -991,11 +999,8 @@ async function readDestination(
   if (nodeId === null) return null;
   const { reachable } = await readNodeFacts(options.db, nodeId, now);
   const count = options.portAvailability
-    ? await options.portAvailability(nodeId).catch(() => 0)
-    : await (await import("./portPool.ts"))
-        .availablePorts(nodeId)
-        .then((ports) => ports.length)
-        .catch(() => 0);
+    ? await options.portAvailability(nodeId)
+    : (await (await import("./portPool.ts")).availablePorts(nodeId)).length;
   return { node_id: nodeId, reachable, port_available: count > 0, port_available_count: count };
 }
 
@@ -1006,13 +1011,11 @@ async function readLastMigration(
 ): Promise<{ at: Date | string | number | null; kind: MigrationKind | null } | null> {
   if (options.lastMigration) return options.lastMigration(tunnelId);
   const row = record(
-    await options.db.forwardRollout
-      .findFirst({
-        where: { tunnel_id: tunnelId, strategy: "node_migration" },
-        orderBy: { id: "desc" },
-        select: { created_at: true },
-      })
-      .catch(() => null),
+    await options.db.forwardRollout.findFirst({
+      where: { tunnel_id: tunnelId, strategy: "node_migration" },
+      orderBy: { id: "desc" },
+      select: { created_at: true },
+    }),
   );
   if (!row) return null;
   const createdAt = row.created_at;
