@@ -30,12 +30,6 @@ import {
 import { getDictionary, makeT } from "@/lib/i18n";
 import type { NodeBinding, PortForward } from "@/lib/types";
 
-const DIALOG = readFileSync(
-  new URL("../forward-edit-dialog.tsx", import.meta.url),
-  "utf8",
-);
-/** 归一化：折行/点号空格不影响调用点断言。 */
-const SRC = DIALOG.replace(/\s+/g, " ").replace(/\s*\.\s*/g, ".");
 
 /** 源转发：带齐运行态与统计字段 —— 复制时这些**必须**一个都不能跟着走。 */
 const source: PortForward = {
