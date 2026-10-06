@@ -840,15 +840,19 @@ describe("B. 失败补偿", () => {
     expect(t.last_applied_at).toBeNull();
   });
 
-  test("B3. 入口失败 → 已 ACK 的 Egress 被补偿撤下（先撤出口）", async () => {
+  test("B3. 入口下发失败是未知结果 ⇒ 近到远同时撤入口与出口", async () => {
     fakeAgent.failNext = { kind: "relay", mode: "reject" };
     const result = await scheduler.createRelayTunnel(input(), orch, deps);
     expect(result.ok).toBe(false);
     const removes = fakeAgent.applies.filter((a) => a.kind === "remove");
-    expect(removes.length).toBe(1);
-    // 撤的是出口节点上那条（role=egress）。
-    expect(removes[0]!.nodeId).toBe(2);
-    expect(removes[0]!.config?.tunnelId).toBe("tunex-" + result.tunnelId + "-egress");
+    expect(removes).toHaveLength(2);
+    // 即使调用方收到 reject/timeout，也不能证明入口 listener 没创建。
+    // 补偿固定 near→far，先阻止新流量进入，再拆出口。
+    expect(removes.map((r) => r.nodeId)).toEqual([1, 2]);
+    expect(removes.map((r) => r.config?.tunnelId)).toEqual([
+      "tunex-" + result.tunnelId + "-relay",
+      "tunex-" + result.tunnelId + "-egress",
+    ]);
   });
 
   test("B4. 入口失败 → 两个端口租约都被释放（不会等到 reconcile TTL）", async () => {
@@ -865,14 +869,16 @@ describe("B. 失败补偿", () => {
     expect(released.map((l) => l.lease_type).sort()).toEqual(["egress", "ingress"]);
   });
 
-  test("B5. 出口失败 → 两个端口租约也被释放（两侧都还没 listener）", async () => {
+  test("B5. 出口下发失败是未知结果 ⇒ 先确认 remove，再释放两个端口租约", async () => {
     fakeAgent.failNext = { kind: "egress", mode: "reject" };
     const result = await scheduler.createRelayTunnel(input(), orch, deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.failedStep).toBe("apply_egress");
-    // 出口都没成，没有任何 remove（没什么可撤的）。
-    expect(fakeAgent.applies.filter((a) => a.kind === "remove")).toEqual([]);
+    const removes = fakeAgent.applies.filter((a) => a.kind === "remove");
+    expect(removes).toHaveLength(1);
+    expect(removes[0]!.nodeId).toBe(2);
+    expect(removes[0]!.config?.tunnelId).toBe("tunex-" + result.tunnelId + "-egress");
     const active = leases.filter((l) => l.status === "active" && l.tunnel_id === result.tunnelId);
     expect(active).toEqual([]);
   });
@@ -943,6 +949,12 @@ describe("B. 失败补偿", () => {
     if (result.ok) return;
     expect(result.failedStep).toBe("acquire_ports");
     expect(fakeAgent.applies).toEqual([]);
+  });
+
+  test("B11b. fail helper 必须 await persistFailure，禁止 fire-and-forget 终态", async () => {
+    const code = await Bun.file(new URL("../scheduler.ts", import.meta.url).pathname).text();
+    expect(code).not.toContain("void persistFailure(");
+    expect(code).not.toContain("persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch");
   });
 
   test("B12. auth/quota 失败 → Tunnel 都还没建（tunnelId=-1，零副作用）", async () => {
