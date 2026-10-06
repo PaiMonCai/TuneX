@@ -12,6 +12,7 @@ import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-bad
 import { ForwardLedgerTotal, ForwardTopologyCard } from "@/components/forwards/forward-topology";
 import { ForwardDnsCard } from "@/components/forwards/forward-dns-card";
 import { ForwardLatencyCard } from "@/components/forwards/forward-latency";
+import { ForwardHaCard } from "@/components/forwards/forward-ha-card";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
@@ -297,6 +298,13 @@ export function ForwardDetail({
             `latency_ms: null` 是"那次不可达"，折线断开而**不补零**。 */}
         <div className="lg:col-span-2">
           <ForwardLatencyCard forwardId={forward.id} />
+        </div>
+
+        {/* 高可用（task-16 交付的自包含卡片）：只读服务端 `/forwards/:id/ha` 投影。
+            「首选入口」是**期望**、`connection`/`accepts_new_business` 是**事实**，
+            两者在卡片里分开说；平台策略缺省即关时显示"未启用自动迁移"，不写成"已保护"。 */}
+        <div className="lg:col-span-2">
+          <ForwardHaCard forwardId={forward.id} />
         </div>
 
         <Card>

@@ -8,6 +8,7 @@
 /* 依赖（全部可注入）                                                  */
 /* ================================================================== */
 
+import { CONNECTION_ONLINE_WINDOW_MS } from "./node-lifecycle.ts";
 import { db } from "../db.ts";
 import { decideNodeAuth } from "./node-credential.ts";
 import { acquirePort, releaseLease } from "./portPool.ts";
@@ -286,11 +287,15 @@ export function isOnline(node: SchedulableNode, now: Date, timeoutMs: number): b
 }
 
 /**
- * 心跳超时窗口。与 legacy offline-detector 的既有口径保持一致（Redis 侧
- * 90s 防抖翻转 `node.status`），这里只做**兜底判定**：节点已被判 inactive
- * 时无需重复判断，仍在 active 但心跳过期时视为不可调度。
+ * 心跳超时窗口。**与连接投影同源**（`node-lifecycle.CONNECTION_ONLINE_WINDOW_MS`），
+ * 不在这里另写一个 90_000：`isOnline()` 与 `deriveConnection()` 回答的是同一个问题
+ * （`status=active` 且最近一次上报在窗口内），两边数值分叉就会出现"面板说在线、
+ * 调度说不可调度"——而调度会据此**把新业务放到别处**，比一句显示错误贵得多。
+ *
+ * 名字保留是因为它描述的是**调度侧的兜底角色**：节点已被判 inactive 时无需重复判断，
+ * 仍在 active 但心跳过期时视为不可调度。
  */
-export const HEARTBEAT_TIMEOUT_MS = 90_000;
+export const HEARTBEAT_TIMEOUT_MS = CONNECTION_ONLINE_WINDOW_MS;
 
 /**
  * 在候选组内挑一个可用的方向节点。

@@ -16,7 +16,7 @@
  *  3. **发起是写操作**：`POST` 会让**那个节点**向目标发起 TCP 连接并写审计。
  *     因此"没发起"与"发起了但没拿到结果"必须是两个状态（见 `lookingGlassFailureKind`）。
  */
-import { get, post, request } from "./core";
+import { get, request } from "./core";
 
 /* ================================================================== */
 /* 形状（服务端逐字）                                                    */
@@ -374,8 +374,5 @@ export const lookingGlassApi = {
   },
 };
 
-// `post` 目前不需要（POST 走 request 是为了显式带 workspaceId）；保留导入会让 lint 抱怨，
-// 因此这里显式引用一次以免误删：本模块的写路径就是 request(..., { method: "POST" })。
-void post;
-
+/** 供展示层与测试复用（与 DDNS 模块同一写法：形状判定只有这一份）。 */
 export { asRecord as lookingGlassAsRecord };

@@ -7,6 +7,8 @@ import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { nodeGroupApiErrorInfo } from "@/lib/api/nodeGroups";
 import { NodeDiagnostics } from "@/components/nodes/node-diagnostics";
+import { NodeUpgradeCard } from "@/components/nodes/node-upgrade-card";
+import { LookingGlassPanel } from "@/components/nodes/looking-glass-panel";
 import { NodeGroupCreateDialog } from "@/components/nodes/node-group-create-dialog";
 import {
   NodeCreationConfirm,
@@ -946,6 +948,17 @@ export function NodeWorkspace() {
       {selectedIngress ? (
         <NodeDiagnostics nodeId={selectedIngress.id} nodeKey={selectedIngress.node_id} />
       ) : null}
+
+      {/* 升级（task-17 交付的自包含卡片）：比 node-diagnostics 里那段内联"生成升级命令"
+          多了三件关键事实——**实际上报版本**（不是配置字段）、**服务端前置原文**、
+          以及"生成脚本 ≠ 已升级"的执行后可见性。旧内联块已退役，避免两个升级入口
+          （退役见 node-diagnostics.tsx 的注释）。 */}
+      {selectedIngress ? <NodeUpgradeCard nodeId={selectedIngress.id} /> : null}
+
+      {/* Looking Glass（task-25 交付）：后端/Agent/控制协议早已完整、Web 一直零消费者。
+          五态由服务端 `enabled` 与角色决定；**发起是写操作**（真的拨一次 TCP + 写审计），
+          因此"未开启 / 无权限 / 未发起 / 发起了但没结果"必须分开说。 */}
+      {selectedIngress ? <LookingGlassPanel nodeId={selectedIngress.id} /> : null}
 
       <Dialog open={bindOpen && canManage} onOpenChange={setBindOpen}>
         <DialogContent>

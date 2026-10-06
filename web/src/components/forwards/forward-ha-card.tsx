@@ -136,7 +136,7 @@ const ZH: HaCopy = {
   policyOnCaveat:
     "一次迁移会带来短暂中断；是否发生、什么时候发生，取决于每一拍的候选、健康连续次数与冷却判定 —— 本卡片不做预告。",
   policyParseError: (detail) =>
-    `平台策略配置无法解析（${detail}）：平台按「未启用」处理（fail-closed）。这是"配置坏了"，不是"运维没开"，下一步是修配置。`,
+    `平台策略配置无法解析（${detail}）：平台按「未启用」处理（fail-closed）。这是「配置坏了」，不是「运维没开」，下一步是修配置。`,
   policyReadOnly: "策略是只读的：本卡片不提供开关，避免界面与运维配置成为两份真相。",
   expectationTitle: "首选入口（期望）",
   expectationSet: (name, nodeId) => `已设置：${name}（#${nodeId}）`,

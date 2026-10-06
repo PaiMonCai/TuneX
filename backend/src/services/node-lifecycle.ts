@@ -56,13 +56,44 @@ export type NodeConnectionValue = (typeof NODE_CONNECTIONS)[number];
 export const LIFECYCLE_NOTE_MAX = 255;
 
 /**
- * 上报陈旧阈值（毫秒）。
+ * Agent 的上报节拍（毫秒）。
  *
- * 判定的**唯一**使用点是下面的 `deriveConnection`；任何其它模块（含路由层）
- * 出现同样数值即为复制判据 —— `services/__tests__/node-view.test.ts` 有静态
- * 守卫钉住这一点。
+ * 契约事实：`agent/internal/reporter/heartbeat.go` 的 `Interval = 30s`（state report
+ * 与心跳同拍）。这不是某个模块的实现细节，而是**所有"这个 Agent 还活着吗"窗口的
+ * 物理基准**：连续 N 个周期没有消息 ⇒ 该事实不再可信。把它写成一个数，是为了让
+ * "90s"这个数只有一处来历（3 × 上报周期），而不是让每个消费者各自写 90_000。
  */
-export const CONNECTION_ONLINE_WINDOW_MS = 90_000;
+export const REPORT_PERIOD_MS = 30_000;
+
+/**
+ * 上报陈旧阈值（毫秒）——**「这台节点还活着吗」这一族判定的唯一数字来源**。
+ *
+ * ── 谁在"这一族"（阈值必须同源，否则同一块面板上会出现两个事实）──
+ *   · 本模块的 {@link deriveConnection}：UI / 用户域看到的 online/offline 投影；
+ *   · `scheduler-support.isOnline()`：调度准入的兜底可达性（`HEARTBEAT_TIMEOUT_MS`）；
+ *   · `reconciler.isNodeUnreachable()`：自动下发/迁移前的可达性闸门
+ *     （`DEFAULT_NODE_STALE_AFTER_MS`）。
+ * 三者问的是**同一个问题**（`status=active` 且最近一次上报在窗口内）。它们各自的
+ * **谓词可以更保守**（reconciler 对 `null` / `status=inactive` 直接判不可达），但
+ * **阈值必须同源**：数值分叉就会出现"面板显示在线、协调器判定不可达"。
+ * 路由/投影层仍然**不得**自己写这个数（`services/__tests__/node-view.test.ts`
+ * 与 `attention.test.ts` 的静态守卫钉住这一点）。
+ *
+ * ── 谁不在这一族（数值相同，但对象/后果不同，**不得**互相绑定）──
+ *   · `target-health-thresholds.STALE_AFTER_MS`：**观测**（target_observation）的
+ *     新鲜度 —— 对象是"一条探测结果"，不是节点；
+ *   · `node-health.errorRecentMs`：**错误事件**算不算"最近"（展示口径）；
+ *   · `federation/forward-hop.FEDERATED_INGRESS_REPORT_FRESH_MS`：**联邦 ingress
+ *     上报**的新鲜度（跨租户事实）；
+ *   · `placement-lease.LEASE_TTL_SECONDS`：**归属租约**的 TTL（"多久算丢归属"，
+ *     不是"多久算离线"）；
+ *   · `forward-rollout-runtime-confirm.ROLLOUT_EXECUTOR_LEASE_MS`：执行阶段的**预算**，
+ *     与上报周期无关（90s 是巧合）。
+ * 它们今天都是 90_000 只是因为**同一个物理节拍**（3 × 30s），不是同一个概念。
+ * 数值相等由 `services/__tests__/freshness-windows.test.ts` 显式钉住：改它们必须
+ * 是一次有意识的选择，而不是连带漂移。
+ */
+export const CONNECTION_ONLINE_WINDOW_MS = 3 * REPORT_PERIOD_MS;
 
 /* ================================================================== */
 /* 错误模型                                                           */

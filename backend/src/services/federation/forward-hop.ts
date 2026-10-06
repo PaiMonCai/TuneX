@@ -1339,7 +1339,14 @@ export interface FederatedForwardHealthDeps extends ForwardHopDeps {
   ingressRuntimePresent?: (tunnelId: number, ingressNodeId: number) => Promise<boolean | null>;
 }
 
-/** Agent state report 周期 30s；比这个年龄更旧的报告不再作为"腿丢了"的依据。 */
+/**
+ * Agent state report 周期 30s；比这个年龄更旧的报告不再作为"腿丢了"的依据。
+ *
+ * 3 × 上报周期（与 `node-lifecycle.CONNECTION_ONLINE_WINDOW_MS` 同一物理基准），
+ * 但对象是**联邦侧收到的 ingress 上报**，与"这台节点还活着吗"是两个判定。
+ * 数值相等由 `services/__tests__/freshness-windows.test.ts` 钉住：改一处必须
+ * 显式决定另一处，而不是连带漂移。
+ */
 export const FEDERATED_INGRESS_REPORT_FRESH_MS = 90_000;
 
 interface FederatedTunnelRow {

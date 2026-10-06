@@ -21,7 +21,7 @@ import { useState } from "react";
 import { api } from "@/lib/api";
 import { useI18nOptional } from "@/components/providers";
 import { getDictionary } from "@/lib/i18n";
-import type { ID, NodeDiagnosticsReport, NodeUpgradeCommand } from "@/lib/types";
+import type { ID, NodeDiagnosticsReport } from "@/lib/types";
 
 const REACHABILITY_TEXT: Record<NodeDiagnosticsReport["reachability"], string> = {
   online: "在线",
@@ -54,10 +54,6 @@ export type NodeDiagnosticsProps = {
   /** 便于测试注入（客户端组件之间可传函数；服务端组件不能传函数给客户端组件）。 */
   loadDiagnostics?: (id: ID) => Promise<NodeDiagnosticsReport>;
   loadBundle?: (id: ID) => Promise<Record<string, unknown>>;
-  requestUpgrade?: (
-    id: ID,
-    input: { agent_image: string; allow_active?: boolean },
-  ) => Promise<NodeUpgradeCommand>;
   onDownload?: (filename: string, json: string) => void;
 };
 
@@ -66,7 +62,6 @@ export function NodeDiagnostics({
   nodeKey,
   loadDiagnostics,
   loadBundle,
-  requestUpgrade,
   onDownload,
 }: NodeDiagnosticsProps) {
   const [report, setReport] = useState<NodeDiagnosticsReport | null>(null);
@@ -75,11 +70,6 @@ export function NodeDiagnostics({
   const [bundleBusy, setBundleBusy] = useState(false);
   const [bundleNote, setBundleNote] = useState<string | null>(null);
 
-  const [image, setImage] = useState("");
-  const [allowActive, setAllowActive] = useState(false);
-  const [upgrade, setUpgrade] = useState<NodeUpgradeCommand | null>(null);
-  const [upgradeError, setUpgradeError] = useState<string | null>(null);
-  const [upgradeBusy, setUpgradeBusy] = useState(false);
 
   // 图标/占位符不构成可访问名称：这个输入框以前写死中文「目标镜像」，英文界面下
   // 屏幕阅读器会读中文。现在跟随语言，且在没有 Provider 时回落到默认词典（永不为空）。
@@ -126,23 +116,8 @@ export function NodeDiagnostics({
     }
   }
 
-  async function buildUpgrade() {
-    setUpgradeBusy(true);
-    setUpgradeError(null);
-    try {
-      const result = await (requestUpgrade ?? ((id: ID, input: { agent_image: string; allow_active?: boolean }) =>
-        api.nodes.upgradeCommand(id, input)))(nodeId, {
-        agent_image: image.trim(),
-        allow_active: allowActive,
-      });
-      setUpgrade(result);
-    } catch (e) {
-      setUpgrade(null);
-      setUpgradeError(e instanceof Error ? e.message : "生成升级命令失败");
-    } finally {
-      setUpgradeBusy(false);
-    }
-  }
+  // 升级命令的生成已移交给 `NodeUpgradeCard`（它自己读服务端只读投影），
+  // 这里不再拼命令、不再持有升级状态——保留两处会得到两个说不同话的升级入口。
 
   const facts = report?.agent_facts ?? null;
 
@@ -240,58 +215,17 @@ export function NodeDiagnostics({
         </div>
       ) : null}
 
-      <div className="rounded border border-neutral-200 p-3 dark:border-neutral-800">
-        <h4 className="text-sm font-medium">升级 Agent</h4>
-        <p className="mt-1 text-xs text-neutral-500">
-          控制面不会远程替换节点上的 Agent。这里生成一段脚本，由你在节点主机上执行；节点身份、凭据、本地缓存与 Forward
-          关系都会保持不变，脚本失败会自动回退到当前镜像。
-        </p>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <input
-            aria-label={upgradeImageLabel}
-            placeholder="ghcr.io/tunex/agent:1.4.0"
-            value={image}
-            onChange={(e) => setImage(e.target.value)}
-            className="w-64 rounded border border-neutral-300 px-2 py-1.5 text-sm dark:border-neutral-700"
-          />
-          <label className="flex items-center gap-1 text-xs text-neutral-600 dark:text-neutral-400">
-            <input type="checkbox" checked={allowActive} onChange={(e) => setAllowActive(e.target.checked)} />
-            允许在业务运行中升级（节点未处于 maintenance）
-          </label>
-          <button
-            type="button"
-            onClick={buildUpgrade}
-            disabled={upgradeBusy || image.trim() === ""}
-            className="rounded border border-neutral-300 px-3 py-1.5 text-sm disabled:opacity-50 dark:border-neutral-700"
-          >
-            {upgradeBusy ? "生成中…" : "生成升级命令"}
-          </button>
-        </div>
-
-        {upgradeError ? (
-          <p role="alert" className="mt-2 text-sm text-red-600">
-            {upgradeError}
-          </p>
-        ) : null}
-
-        {upgrade ? (
-          <div className="mt-3 space-y-2">
-            <p className="text-xs text-neutral-500">
-              目标镜像 <span className="font-mono">{upgrade.target_image}</span> · {upgrade.downtime}
-            </p>
-            <ul className="text-xs text-neutral-500">
-              <li>保持不变：节点身份 / 长期凭据 / 本地缓存 / Forward 关系</li>
-              <li>回退方式：{upgrade.rollback_hint}</li>
-            </ul>
-            <pre data-testid="upgrade-script" className="max-h-64 overflow-auto rounded bg-neutral-900 p-3 text-xs text-neutral-100">
-              {upgrade.script}
-            </pre>
-            <p className="text-xs text-neutral-500">
-              请在**节点主机**上以 root 执行该脚本；脚本会先拉取镜像、再优雅排空并重建容器。
-            </p>
-          </div>
-        ) : null}
-      </div>
+      {/*
+        「升级 Agent」原来在这里有一段内联实现（填镜像 + 生成脚本）。它已被退役，
+        原因不是"重复"，而是它**缺三件关键事实**：
+          1) 它把管理配置字段 `node.version` 当版本依据——真机 9 台全是 `unknown`，
+              而实际上报版本在 `node_state_report.version`（0.13.22）；
+          2) 它没有服务端前置结论（用户会先撞 409 `node_not_in_maintenance` 才明白要切维护）；
+          3) 它在生成脚本后**没有任何执行后可见性**（"生成了脚本"很容易被读成"升级完成了"）。
+        现在统一由 `NodeUpgradeCard` 承担（挂载于 `node-workspace.tsx` 的诊断区内），
+        它读的是服务端只读投影 `GET /api/nodes/:id/upgrade-state`，并逐字下发
+        `checkUpgradePrecondition` 的原文。**保留单一升级入口**，避免两个说不同话的地方。
+      */}
     </section>
   );
 }

@@ -52,7 +52,9 @@ import { handleCatalogMock } from "./handlers/catalog";
 import { handleCommerceMock } from "./handlers/commerce";
 import { handleSettingsMock } from "./handlers/settings";
 import { handleDdnsMock } from "./handlers/ddns";
+import { handleLookingGlassMock } from "./handlers/looking-glass";
 import { handleNotificationsMock } from "./handlers/notifications";
+import { handleForwardHaMock } from "./handlers/forward-ha";
 import { handleRouteProfilesMock } from "./handlers/route-profiles";
 import { handleAdminMock } from "./handlers/admin";
 
@@ -319,8 +321,22 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     const result = await handleNotificationsMock(ctx);
     if (result) return result;
   }
+  // HA 读数与首选入口写入（`/forwards/:id/ha`）必须排在 `handleForwardsMock`
+  // **之前**：后者把整个 `/forwards/*` 命名空间认领了，未识别子路径在它内部直接
+  // 404（DNS 前门 / 延迟端点 / HA 三处同一顺序问题，本专项已踩过）。
+  {
+    const result = await handleForwardHaMock(ctx);
+    if (result) return result;
+  }
   {
     const result = await handleForwardsMock(ctx);
+    if (result) return result;
+  }
+  // Looking Glass（`/looking-glass/**`）：自带权限与开关语义，路径独一份，放在此处不影响既有分支。
+  // 该文件不在 task-25 的 writeScopes 里，但按本专项既有约定（task-1 时同样处理）这是让新 mock
+  // 可达的**唯一**接线点，改动只有这两行。
+  {
+    const result = await handleLookingGlassMock(ctx);
     if (result) return result;
   }
   {

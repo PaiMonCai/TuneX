@@ -16,6 +16,10 @@ import type { RolloutExecContext, RolloutDeps, RolloutRowView } from "./forward-
 /**
  * 一条远程 ACK 最长等 15s；RELAY 补偿可能连续做多次远程操作。90s 足够当前
  * owner 完成一个阶段，又能让崩溃后的 worker 在 S10 的 180s 窗口内接管。
+ *
+ * **这里的 90s 与上报周期无关**：它是执行阶段的预算（15s × 若干次远程操作 + 接管
+ * 余量），数值上与 3 × 30s 撞车纯属巧合。**不要**把它与
+ * `node-lifecycle.CONNECTION_ONLINE_WINDOW_MS` 绑定，也不要因为那个窗口改了而改它。
  */
 export const ROLLOUT_EXECUTOR_LEASE_MS = 90_000;
 /** Agent state report 周期 30s；多给 5s 抖动，先等事实再决定是否重发。 */

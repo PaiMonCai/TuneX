@@ -39,6 +39,7 @@ import { Sidebar, SidebarBackdrop } from "@/components/sidebar";
 import { TrafficChart } from "@/components/traffic-chart";
 import { RevenueAreaChart, TunnelTypePieChart } from "@/components/admin/admin-charts";
 import { RouteProfileTemplateEditor } from "@/components/admin/route-profiles/route-profiles-manager";
+import { NodeUpgradeCard, nodeUpgradeCopy } from "@/components/nodes/node-upgrade-card";
 import { NodeDiagnostics } from "@/components/nodes/node-diagnostics";
 import { visibleNavGroups } from "@/lib/nav";
 import { en, zh, type Dict } from "@/lib/i18n/dictionaries";
@@ -199,24 +200,29 @@ describe("C. route-profiles-manager：7 处字面量全部改走词典", () => {
 });
 
 /* ================================================================== */
-/* D. 节点诊断：升级命令里的「目标镜像」输入框                            */
+/* D. 升级入口：镜像输入框的可访问名称（原在 node-diagnostics 内联块）      */
 /* ================================================================== */
 
-describe("D. node-diagnostics：写死中文的 aria-label 已改走词典", () => {
-  test("英文界面读英文（旧实现是写死的中文「目标镜像」）", () => {
-    const html = withLocale(<NodeDiagnostics nodeId={3} nodeKey="hk-in-01" />, "en");
-    expect(ariaLabels(html)).toContain(en.node.upgradeImageLabel);
-    expect(ariaLabels(html)).not.toContain("目标镜像");
+// 内联升级块已退役（它把管理配置字段 node.version 当版本依据、没有服务端前置、
+// 生成脚本后也没有执行后可见性）。升级入口统一由 `NodeUpgradeCard` 承担，
+// 它的文案是**文件内** zh/en 两份，因此这条断言必须跟着走，否则"英文界面别出现
+// 写死中文"这条回归就没人守了。
+describe("D. NodeUpgradeCard：镜像/目标的可访问名称跟随语言（不得写死中文）", () => {
+  const CJK = /[\u4e00-\u9fff]/;
+
+  test("英文：非空、且不含任何 CJK（旧实现是写死的中文「目标镜像」）", () => {
+    const label = nodeUpgradeCopy("en").imageLabel;
+    expect(label.trim().length).toBeGreaterThan(0);
+    expect(label).not.toBe(nodeUpgradeCopy("zh").imageLabel);
+    expect(CJK.test(label)).toBe(false);
+    expect(label).not.toContain("目标镜像");
   });
 
-  test("中文界面读中文；没有 Provider 时回落默认语言且非空", () => {
-    const html = withLocale(<NodeDiagnostics nodeId={3} nodeKey="hk-in-01" />, "zh");
-    expect(ariaLabels(html)).toContain(zh.node.upgradeImageLabel);
-
-    const bare = renderToStaticMarkup(<NodeDiagnostics nodeId={3} nodeKey="hk-in-01" />);
-    const labels = ariaLabels(bare);
-    expect(labels).toContain(zh.node.upgradeImageLabel);
-    expect(labels.every((label) => label.trim().length > 0)).toBe(true);
+  test("中文：读中文；没有 locale 时回落到非空默认", () => {
+    expect(nodeUpgradeCopy("zh").imageLabel).toBe("目标镜像");
+    const fallback = nodeUpgradeCopy(undefined).imageLabel;
+    expect(fallback.trim().length).toBeGreaterThan(0);
+    expect(CJK.test(fallback)).toBe(true);
   });
 });
 

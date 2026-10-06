@@ -27,7 +27,7 @@
  */
 import * as rt from "@/mocks/runtime";
 import type { MockResponse } from "@/mocks/runtime";
-import { fail, mockUserNode, notFound, ok, parseId } from "@/mocks/runtime";
+import { fail, mockIngressNode, mockUserNode, notFound, ok, parseId } from "@/mocks/runtime";
 
 /** preferred ingress：mock 侧的内存态（key = forward id）。 */
 const preferredByForward = new Map<number, number | null>();
@@ -68,7 +68,10 @@ function readPolicy(db: rt.Store): {
 function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
   const tunnel = db.tunnels.find((row) => row.id === forwardId);
   if (!tunnel) return notFound("转发不存在");
-  const activeIngress = tunnel.ingress_node_id ?? null;
+  // 现任入口：mock 与它自己的转发视图**同一处解析**（`mockIngressNode`）。
+  // 真实后端读 `tunnel.ingress_node_id` 列；mock 种子行里这一列常常为空，共用同一个
+  // 解析函数才不会出现"HA 卡片说没有归属、详情页同时显示着一台入口"这种自相矛盾。
+  const activeIngress = mockIngressNode(db, tunnel)?.id ?? tunnel.ingress_node_id ?? null;
   const preferred = preferredByForward.has(forwardId)
     ? preferredByForward.get(forwardId) ?? null
     : null;
