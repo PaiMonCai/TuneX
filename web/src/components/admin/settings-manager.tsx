@@ -52,6 +52,45 @@ const SMTP_ENV_NAMES = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMT
  */
 const DEPLOYMENT_LEVEL_KEYS = new Set<string>(SMTP_ENV_NAMES);
 
+/**
+ * **未接线配置键**（task-33 的穷举审计结论）：既没有生产读者、也不是部署级 env 提供的。
+ * 后端已经拒绝写它们、也不再下发（见 `routes/admin.ts` 的 `UNWIRED_CONFIG_NAMES` 注释里的逐键证据）；
+ * 这里**再滤一遍**并把清单显示给运维——页面必须能回答"我以前配过的那几个键去哪了"。
+ */
+const UNWIRED_KEYS = [
+  "EMAIL_PROVIDER",
+  "RESEND_API_KEY",
+  "RESEND_FROM",
+  "CHATWOOT_BASE_URL",
+  "CHATWOOT_TOKEN",
+  "REFERRAL_COMMISSION_RATE",
+  "REFERRAL_FIRST_ONLY",
+  "REFERRAL_MODE",
+  "MIN_WITHDRAW_AMOUNT",
+  "WITHDRAW_METHODS",
+  "LIMIT_SCOPE",
+  "AUTO_UPDATE_AGENT",
+  "OBSERVER_PERIOD",
+] as const;
+const UNWIRED_KEY_SET = new Set<string>(UNWIRED_KEYS);
+
+const UNWIRED_NOTICE: Record<"zh" | "en", { title: string; body: string }> = {
+  zh: {
+    title: "以下配置键当前没有任何生产读者",
+    body:
+      "后端全文检索确认：这些键既没有被服务/路由读取，也不是部署级环境变量提供的（也就是说：写进去不会有任何效果）。" +
+      "因此管理端**不接受**写入，也不再把它们列为可配置项；历史行仍留在库里（不改写、不删除）。" +
+      "等对应能力接线后，按它需要的形态（DB 配置或环境变量）再开放：",
+  },
+  en: {
+    title: "These configuration keys currently have no production reader",
+    body:
+      "A full-tree search confirms these keys are read by no service/route and are not supplied by deployment environment variables (writing them has no effect). " +
+      "This console therefore refuses writes and no longer lists them as configurable; legacy rows stay in the database (not rewritten, not deleted). " +
+      "Once the corresponding capability is wired, expose them in the shape it needs (DB config or environment variable):",
+  },
+};
+
 const SMTP_NOTICE: Record<"zh" | "en", { title: string; body: string; history: string }> = {
   zh: {
     title: "SMTP（邮件）属于部署级配置",
@@ -74,6 +113,7 @@ const SMTP_NOTICE: Record<"zh" | "en", { title: string; body: string; history: s
 export function AdminSettingsManager({ initialData }: { initialData: SystemConfigItem[] }) {
   const { t, locale } = useI18n();
   const notice = SMTP_NOTICE[locale === "en" ? "en" : "zh"];
+  const unwired = UNWIRED_NOTICE[locale === "en" ? "en" : "zh"];
   const [rows, setRows] = useState(initialData);
   const [draft, setDraft] = useState<Record<string, string>>(
     () => Object.fromEntries(initialData.map((c) => [c.name, c.value])),
@@ -90,6 +130,7 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
     const map = new Map<string, SystemConfigItem[]>();
     for (const c of rows) {
       if (DEPLOYMENT_LEVEL_KEYS.has(c.name)) continue;
+      if (UNWIRED_KEY_SET.has(c.name)) continue;
       if (kw && !c.name.includes(kw)) continue;
       const g = groupOf(c.name);
       const arr = map.get(g) ?? [];
@@ -150,6 +191,18 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
         </CardContent>
       </Card>
 
+      <Card data-testid="unwired-config-note">
+        <CardHeader className="pb-2">
+          <CardTitle>{unwired.title}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-1">
+          <p className="field-hint">{unwired.body}</p>
+          <p className="field-hint font-mono text-xs" data-testid="unwired-config-keys">
+            {UNWIRED_KEYS.join("、")}
+          </p>
+        </CardContent>
+      </Card>
+
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Input
@@ -201,11 +254,24 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
                                 : "未配置"}
                           </Badge>
                         )}
-                        {changed && <Badge variant="default">{t("common.save")}</Badge>}
+                        {c.read_only && (
+                          <Badge variant="outline" data-testid={`config-readonly-badge-${c.name}`}>
+                            {locale === "en" ? "Read-only (deprecated)" : "只读（已废弃）"}
+                          </Badge>
+                        )}
+                        {!c.read_only && changed && <Badge variant="default">{t("common.save")}</Badge>}
                       </span>
                     </div>
                     <div className="flex items-start gap-2">
-                      {secret ? (
+                      {c.read_only ? (
+                        // 只读行（当前只有已废弃的 NOTICE*）：值可见、**不给**任何可编辑控件。
+                        <code
+                          className="min-w-0 flex-1 overflow-x-auto rounded-md border border-dashed border-[var(--input)] bg-[var(--muted)] px-3 py-2 font-mono text-xs text-[var(--muted-foreground)]"
+                          data-testid={`config-readonly-${c.name}`}
+                        >
+                          {c.value === "" ? "—" : c.value}
+                        </code>
+                      ) : secret ? (
                         // 只写不读：输入框是非受控的（值不进 state），成功保存后立刻清空。
                         <Input
                           ref={(el) => {
@@ -241,17 +307,20 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
                           data-testid={`config-${c.name}`}
                         />
                       )}
-                      <Button
-                        size="sm"
-                        variant={changed ? "default" : "outline"}
-                        disabled={!changed || saving === c.name}
-                        onClick={() => save(c.name)}
-                        className={cn("shrink-0", !changed && "opacity-60")}
-                        data-testid={`config-save-${c.name}`}
-                      >
-                        {saving === c.name ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
-                        {t("common.save")}
-                      </Button>
+                      {/* 只读行**不渲染**保存控件（不是 disabled/hidden：页面上不该存在一个按不动的按钮）。 */}
+                      {!c.read_only && (
+                        <Button
+                          size="sm"
+                          variant={changed ? "default" : "outline"}
+                          disabled={!changed || saving === c.name}
+                          onClick={() => save(c.name)}
+                          className={cn("shrink-0", !changed && "opacity-60")}
+                          data-testid={`config-save-${c.name}`}
+                        >
+                          {saving === c.name ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                          {t("common.save")}
+                        </Button>
+                      )}
                     </div>
                   </div>
                 );

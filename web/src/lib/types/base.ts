@@ -155,6 +155,13 @@ export interface SystemConfigItem {
    * N-F3：此前类型里没有它 ⇒ 界面**无法**显示"已配置"，用户只看到一个空输入框、无从判断现状。
    */
   secret_configured?: boolean;
+  /**
+   * `true` = 这个键**只读**：后端不再接受写入（当前只有已废弃的 `NOTICE*` 三个键）。
+   * 它仍然出现在列表里，是为了让旧值**可见**（审计/迁移）；界面不得渲染可编辑控件。
+   */
+  read_only?: boolean;
+  /** 只读的原因（目前只有 `deprecated`：公告真相已迁到 `announcement` 表）。 */
+  read_only_reason?: "deprecated";
   created_at: string;
   updated_at: string;
 }

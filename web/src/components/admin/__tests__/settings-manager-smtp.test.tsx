@@ -51,9 +51,13 @@ function elementText(source: string, testid: string): string {
 
 const BASE_ROWS = [
   item({ id: 1, name: "SITE_NAME", value: "TuneX" }),
+  // 未接线键（task-33）：后端已不下发；即使被下发，本页也**不得**渲染成可编辑项。
   item({ id: 2, name: "RESEND_API_KEY", value: "", secret_configured: true }),
   item({ id: 3, name: "CHATWOOT_TOKEN", value: "", secret_configured: false }),
 ];
+
+/** 一个**假想的、有读者的**凭据键：用来验"凭据只写不读"的渲染机制本身（当前真实键都已不属于此类）。 */
+const FUTURE_SECRET = item({ id: 7, name: "FUTURE_SECRET_KEY", value: "", secret_configured: true });
 
 describe("N-F1 页面：说清 SMTP 为什么不在管理端", () => {
   test("部署级说明卡存在，且给出具体变量名、文档入口与「历史行会被忽略」", () => {
@@ -90,27 +94,87 @@ describe("N-F1 页面：说清 SMTP 为什么不在管理端", () => {
   });
 });
 
-describe("N-F3 凭据只写不读：显示「已配置/未配置」，输入框不回填", () => {
-  test("secret_configured=true → 已配置；false → 未配置（两者可分）", () => {
+describe("task-33 未接线键：页面指路 + 纵深防御", () => {
+  test("说明卡列出全部未接线键，并说清「写进去不会有任何效果」", () => {
     const page = html(BASE_ROWS);
-    expect(elementText(page, "config-secret-state-RESEND_API_KEY")).toContain("已配置");
-    expect(elementText(page, "config-secret-state-CHATWOOT_TOKEN")).toContain("未配置");
-    // 已配置的行**不得**把值渲染出来（后端只回空串）
-    expect(tagOf(page, "config-RESEND_API_KEY")).not.toContain("value=");
-    expect(tagOf(page, "config-RESEND_API_KEY")).toContain('type="password"');
+    expect(page).toContain('data-testid="unwired-config-note"');
+    const keys = elementText(page, "unwired-config-keys");
+    for (const key of [
+      "EMAIL_PROVIDER",
+      "RESEND_API_KEY",
+      "RESEND_FROM",
+      "CHATWOOT_BASE_URL",
+      "CHATWOOT_TOKEN",
+      "REFERRAL_COMMISSION_RATE",
+      "REFERRAL_FIRST_ONLY",
+      "REFERRAL_MODE",
+      "MIN_WITHDRAW_AMOUNT",
+      "WITHDRAW_METHODS",
+      "LIMIT_SCOPE",
+      "AUTO_UPDATE_AGENT",
+      "OBSERVER_PERIOD",
+    ]) {
+      expect(keys).toContain(key);
+    }
+    expect(page).toContain("不接受");
   });
 
-  test("非凭据项仍然照旧：可编辑输入框带当前值", () => {
+  test("即使被下发也不渲染成可编辑项（纵深防御），并且不给保存按钮", () => {
+    const page = html(BASE_ROWS);
+    expect(page).not.toContain('data-testid="config-RESEND_API_KEY"');
+    expect(page).not.toContain('data-testid="config-CHATWOOT_TOKEN"');
+    expect(page).not.toContain('data-testid="config-save-RESEND_API_KEY"');
+    expect(page).not.toContain('data-testid="config-save-CHATWOOT_TOKEN"');
+  });
+
+  test("合法键照旧可编辑（回归）", () => {
+    const page = html(BASE_ROWS);
+    expect(tagOf(page, "config-SITE_NAME")).toContain('value="TuneX"');
+    expect(page).toContain('data-testid="config-save-SITE_NAME"');
+  });
+});
+
+describe("N-F3 凭据只写不读：显示「已配置/未配置」，输入框不回填", () => {
+  test("有读者的凭据键：secret_configured=true → 已配置；false → 未配置（两者可分）", () => {
+    const page = html([FUTURE_SECRET, item({ id: 8, name: "FUTURE_SECRET_KEY_2", value: "", secret_configured: false })]);
+    expect(elementText(page, "config-secret-state-FUTURE_SECRET_KEY")).toContain("已配置");
+    expect(elementText(page, "config-secret-state-FUTURE_SECRET_KEY_2")).toContain("未配置");
+    // 已配置的行**不得**把值渲染出来（后端只回空串）
+    expect(tagOf(page, "config-FUTURE_SECRET_KEY")).not.toContain("value=");
+    expect(tagOf(page, "config-FUTURE_SECRET_KEY")).toContain('type="password"');
+  });
+
+  test("凭据项的输入框是**非受控**且不预填（只写不读的可执行形式）", () => {
+    const page = html([FUTURE_SECRET]);
+    const tag = tagOf(page, "config-FUTURE_SECRET_KEY");
+    expect(tag).toContain('type="password"');
+    expect(tag).not.toContain("value=");
+    expect(page).toContain("写入新值（不回显）");
+  });
+
+  test("非凭据项仍然照旧：可编辑输入框带当前值，且没有凭据徽章", () => {
     const page = html(BASE_ROWS);
     expect(tagOf(page, "config-SITE_NAME")).toContain('value="TuneX"');
     expect(page).not.toContain('data-testid="config-secret-state-SITE_NAME"');
   });
+});
 
-  test("凭据项的输入框是**非受控**且不预填（只写不读的可执行形式）", () => {
-    const page = html([item({ id: 1, name: "CHATWOOT_TOKEN", value: "", secret_configured: true })]);
-    const tag = tagOf(page, "config-CHATWOOT_TOKEN");
-    expect(tag).toContain('type="password"');
-    expect(tag).not.toContain("value=");
-    expect(page).toContain("写入新值（不回显）");
+describe("task-33 已废弃键：只读列出（旧值可见）+ 不给保存控件", () => {
+  const DEPRECATED = [item({ id: 20, name: "NOTICE", value: "旧公告正文", read_only: true, read_only_reason: "deprecated" })];
+
+  test("值可见、带只读徽章，且**不渲染**保存按钮", () => {
+    const page = html(DEPRECATED);
+    expect(page).toContain('data-testid="config-readonly-NOTICE"');
+    expect(page).toContain("旧公告正文");
+    expect(elementText(page, "config-readonly-badge-NOTICE")).toContain("只读");
+    expect(page).not.toContain('data-testid="config-save-NOTICE"');
+    // 也不该渲染成可编辑输入框
+    expect(page).not.toContain('data-testid="config-NOTICE"');
+  });
+
+  test("英文分支：只读徽章与说明都是英文", () => {
+    const page = html(DEPRECATED, "en");
+    expect(elementText(page, "config-readonly-badge-NOTICE")).toContain("Read-only");
+    expect(page).toContain("no production reader");
   });
 });

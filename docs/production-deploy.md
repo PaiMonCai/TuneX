@@ -34,13 +34,29 @@
 | `docker-compose.yaml`（开发栈） | `container_name: tunex-*`（:14 起各处）、卷 `name: tunex-mysql-data` / `tunex-redis-data` / `tunex-caddy-*`（:162-170）、网络 `name: tunex`（:172-175） |
 | `docker-compose.prod.yaml` | `container_name: tunex-*`；容器名写死，卷是 `-prod` 后缀（不与开发栈撞） |
 
-后果（**在同机部署第二套之前务必阅读**）：
+后果（**在同机部署第二套之前务必阅读**）—— 注意两类问题的性质**不同**：
 
-- 直接 `up` 开发栈会**复用**本机已有的 `tunex-mysql-data` / `tunex-redis-data` / 网络 `tunex`
-  —— 你得到的不是一次全新部署，而是接着别人的旧库跑（迁移/种子都不会重新发生）；
-- 反过来 `docker compose down -v` 会**删掉这些卷**（即"别人的数据"），而且没有任何确认；
-- 想真正隔离，只能**改文件里的这些名字**（或在生产路径上只改容器名——卷已带 `-prod`），
-  没有"只加一个 `-p` 参数"的用法。
+**(1) 数据污染风险只存在于开发栈。** `docker-compose.yaml` 的卷名是**全局固定**的
+（`tunex-mysql-data` / `tunex-redis-data` / 网络 `tunex`，不带 project 前缀）：
+
+- 直接 `up` 开发栈会**复用**本机已有的这些卷 —— 你得到的不是一次全新部署，而是接着
+  别人的旧库跑（迁移/种子都不会重新发生）；
+- `docker compose down -v` 会**删掉这些卷**（即"别人的数据"），而且没有任何确认。
+
+**(2) 生产栈的卷是项目内隔离的**（`tunex-mysql-data-prod` / `tunex-redis-data-prod`，
+实测：按 `-p <项目名>` 起第二套时，容器带 `com.docker.compose.project` 标签、只写自己的
+`*-prod` 卷，**不会**写既有开发卷）。也就是说**生产路径不会污染别人的数据**。
+
+**(3) 两套栈都硬编码了 `container_name:`** ⇒ 容器名**没有 project 前缀**，`docker ps` 里
+看起来像全局唯一容器。同机跑多套时这是**辨识/误删风险**（不是数据污染风险）：
+
+```bash
+# 看某套栈的真实归属，而不是靠名字猜：
+docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' tunex-backend
+```
+
+结论：开发栈**不要**与任何已有部署共机（除非改掉那些卷名/网络名）；生产栈可以靠 `-p` 共存，
+但请按上面的 label 确认归属后再执行 `rm`/`down`。
 
 **新装请先确认这些名字不存在**：
 
@@ -342,6 +358,23 @@ sudo cat /opt/TuneX/.admin-credentials      # 首次登录用；改完密码请�
 #    前置 B：确认节点额度没被示例数据占满（个人/免费空间默认 1 节点）。
 #            `SEED_DEMO_DATA=false` 时种子不插演示节点；若你的空间里已有演示节点，请先删除。
 #    然后在管理界面：创建 Node → 复制它的一键安装命令 → 在节点主机上执行 → 回到列表确认 online。
+```
+
+> ⚠️ **一键安装命令里的面板地址必须"从节点可达"**。命令形如
+> `curl -fsSL '<SITE_URL>/api/internal/node/install.sh' | sudo sh -s -- --panel '<SITE_URL>' --enroll-token …`：
+> 其中的 `<SITE_URL>` **就是节点要访问的地址**。因此：
+>
+> - **节点与面板不同机时**，必须先把面板配成节点可达的地址（反向代理域名，或节点能解析到的内网地址），
+>   再生成命令；`SITE_URL=http://127.0.0.1:13003` 这种只绑 loopback 的写法，命令**只在本机成立**，
+>   换一台机器执行会在第一步 `curl` 就失败（而失败信息是 curl 的连接错误，不会提示"地址配置错了"）。
+> - `SITE_URL` 的两种正确形态：
+>   ```text
+>   https://tunex.example.com        # 有域名 + 反代（推荐）
+>   http://10.0.0.5:13003            # 节点走内网直达 web 端口（仅当该网卡/端口对节点可达）
+>   ```
+> - 改完 `SITE_URL` 后要重新生成一键命令（命令是渲染时拼好的，不会自己更新）。
+
+```bash
 
 # 可选 Caddy profile 启用时再检查：
 # curl -fsS http://127.0.0.1:13000/healthz

@@ -173,6 +173,55 @@ describe("运行版本来自上报，不与配置字段混淆", () => {
     expect(markup).toContain("ghcr.io/paimoncai/tunex-agent:latest");
     expect(markup).toContain("未声明");
     expect(markup).toContain('data-state="unknown"');
+    // 「未声明」不该被渲染成"配置有问题"那条（两者是两件事）。
+    expect(markup).not.toContain('data-testid="upgrade-baseline-uncomparable"');
+    expect(markup).toContain('data-state="unset"');
+    expectNoForbidden(markup);
+  });
+
+  test("基线配了但不可比较（旧版安装器写 git sha）⇒ 单独说明，不折算成落后 / 最新", () => {
+    const SHA = "0123456789abcdef0123456789abcdef01234567";
+    const markup = render({
+      state: {
+        status: "ready",
+        data: upgradeState({
+          target: {
+            image: "ghcr.io/paimoncai/tunex-agent:latest",
+            image_source: "builtin_default",
+            expected_version: SHA,
+            version_drift: "unknown",
+          },
+        }),
+        error: null,
+      },
+    });
+    expect(markup).toContain('data-testid="upgrade-baseline-uncomparable"');
+    expect(markup).toContain("不可比较");
+    expect(markup).toContain("--agent-version");
+    expect(markup).toContain(SHA); // 原值透传：面板不吞掉配置值
+    expect(markup).not.toContain("未声明 ——");
+    expectNoForbidden(markup);
+  });
+
+  test("基线可比较且落后 ⇒ 显示落后，且不出现不可比较那段", () => {
+    const markup = render({
+      state: {
+        status: "ready",
+        data: upgradeState({
+          target: {
+            image: "ghcr.io/paimoncai/tunex-agent:0.14.0",
+            image_source: "env:TUNEX_AGENT_IMAGE",
+            expected_version: "0.14.0",
+            version_drift: "behind",
+          },
+        }),
+        error: null,
+      },
+    });
+    expect(markup).toContain('data-testid="upgrade-drift"');
+    expect(markup).toContain('data-state="behind"');
+    expect(markup).not.toContain('data-testid="upgrade-baseline-uncomparable"');
+    expectNoForbidden(markup);
   });
 });
 

@@ -186,6 +186,10 @@ curl/wget 路径，并在给操作者的文案里标注"这是兜底路径"。
 凭据**只能**从 `agent.env` 读：没有 `--probe-credential`，因为它会进 `ps`、shell 历史与
 `docker inspect` 输出。
 
+**兜底路径什么时候可以删**：当"在网的所有节点镜像都带这个探针"成为可验证的事实时 ——
+即发布流程能保证镜像由当前 HEAD 构建、且升级流程会先确认目标镜像里 `--identity-probe`
+存在。在那之前保留兜底（它至少给出诚实结论），风险由脚本里那两行提醒承担。
+
 ## Repository layout
 
 | Path | Purpose |

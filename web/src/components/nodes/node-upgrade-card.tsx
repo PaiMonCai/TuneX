@@ -88,6 +88,8 @@ export interface UpgradeCopy {
   imageSourceDefault: string;
   expectedVersion: string;
   expectedVersionNone: string;
+  /** 配置了基线，但它与上报版本**不可比较**（旧版安装器写的是 git sha）。 */
+  expectedVersionUncomparable: string;
   drift: Record<UpgradeVersionDrift, string>;
   driftMeaning: Record<UpgradeVersionDrift, string>;
   lastError: string;
@@ -160,6 +162,8 @@ const ZH: UpgradeCopy = {
   imageSourceDefault: "面板内置默认值（部署方未配置 TUNEX_AGENT_IMAGE）",
   expectedVersion: "部署方声明的版本基线",
   expectedVersionNone: "未声明 —— 面板因此不判定版本落后",
+  expectedVersionUncomparable:
+    "这个值与节点上报的版本号**不可比较**（面板只会显示「无法判定」：既不会说落后，也不会说已是最新）。它多半是旧版安装器写进来的镜像 git sha；请改成与 Agent 上报版本同口径的版本号（安装器：install.sh --agent-version <x.y.z>）。",
   drift: { behind: "上报版本落后于该基线", not_behind: "上报版本不落后于该基线", unknown: "无法判定" },
   driftMeaning: {
     behind: "比较由服务端完成（与版本落后判定同一个函数）。落后 ≠ 故障，只是建议升级。",
@@ -253,6 +257,8 @@ const EN: UpgradeCopy = {
   imageSourceDefault: "panel built-in default (TUNEX_AGENT_IMAGE unset)",
   expectedVersion: "Version baseline declared by the deployment",
   expectedVersionNone: "not declared — the panel therefore never judges version drift",
+  expectedVersionUncomparable:
+    "This value cannot be compared with the version the node reports (the panel only shows \"cannot be determined\": it neither says behind nor up to date). It is usually an image git sha written by an older installer; set it to a version number in the same namespace as the reported version (installer: install.sh --agent-version <x.y.z>).",
   drift: { behind: "Reported version is behind that baseline", not_behind: "Reported version is not behind that baseline", unknown: "cannot be determined" },
   driftMeaning: {
     behind: "The comparison is done server-side (same function as health synthesis). Behind is not a fault; it is an upgrade suggestion.",
@@ -535,13 +541,27 @@ export function NodeUpgradeDataView(props: NodeUpgradeViewProps) {
           </p>
           <p className="mt-1 text-xs">
             {copy.expectedVersion}：
-            <span data-testid="upgrade-expected-version" className="font-mono">
+            <span
+              data-testid="upgrade-expected-version"
+              data-state={data.target.expected_version === null ? "unset" : "set"}
+              className="font-mono"
+            >
               {data.target.expected_version ?? copy.expectedVersionNone}
             </span>
           </p>
           <p data-testid="upgrade-drift" data-state={data.target.version_drift} className="mt-1 text-xs font-medium">
             {copy.drift[data.target.version_drift]}
           </p>
+          {/* 「未声明」与「声明了但不可比较」是两件事，不能都写成"未知"：前者是部署方的选择，
+              后者是配置缺陷（旧版安装器写 git sha），下一步也不同。 */}
+          {data.target.expected_version !== null && data.target.version_drift === "unknown" ? (
+            <p
+              data-testid="upgrade-baseline-uncomparable"
+              className="mt-1 text-xs text-amber-700 dark:text-amber-500"
+            >
+              {copy.expectedVersionUncomparable}
+            </p>
+          ) : null}
           <p className="mt-1 text-xs text-neutral-500">{copy.driftMeaning[data.target.version_drift]}</p>
         </div>
       </div>

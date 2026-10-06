@@ -64,10 +64,13 @@ curl http://localhost:8787/healthz
 http://localhost:9091
 ```
 
-> ⚠️ **同机只能跑一套**：`docker-compose.yaml` 把容器名/卷名/网络名**写死**为
-> `tunex-*` / `tunex-mysql-data` / 网络 `tunex`，因此 `-p <project>` **不能**隔离。
-> 若本机已存在这些卷，`up` 会**复用**旧库（不是全新部署），而 `down -v` 会**删除**它们。
-> 部署第二套前请先 `docker volume ls | grep tunex` 确认，并改成不同的名字
+> ⚠️ **这个开发栈不要与已有部署共机**：`docker-compose.yaml` 把卷名/网络名**写死**为
+> `tunex-mysql-data` / `tunex-redis-data` / 网络 `tunex`（不带 project 前缀），所以
+> `-p <project>` **不能**隔离数据：`up` 会**复用**本机已有的旧库（不是全新部署），
+> `down -v` 会**删除**它们。部署第二套前先 `docker volume ls | grep tunex` 确认并改名。
+> 生产路径（`docker-compose.prod.yaml`）的卷是隔离的（`*-prod` 后缀）；两套栈都硬编码了
+> `container_name:` ⇒ 容器名没有项目前缀，多套共存时请按
+> `docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' <容器>` 确认归属
 > （细节见[生产部署文档 §1.1](docs/production-deploy.md)）。
 
 生产环境请使用 [生产部署文档](docs/production-deploy.md) 和 `docker-compose.prod.yaml`。已有 Nginx、宝塔或 1Panel 时，可由宿主机现有反向代理负责 TLS；没有宿主机反代时可使用项目提供的 standalone Caddy 部署方式。

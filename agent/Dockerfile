@@ -3,11 +3,26 @@
 FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS build
 ARG TARGETOS
 ARG TARGETARCH
+# ── Agent 版本：构建时注入（task-37）─────────────────────────────────────────
+# 面板判定"节点 Agent 是否落后"比的是 **Agent 上报的 version**（`agent/main.go` 的
+# `version` 变量 → 状态上报体 → `node_state_report.version`）与部署方配置的
+# `TUNEX_AGENT_LATEST_VERSION`（`backend/src/services/node-health.ts:isVersionOlder`）。
+# 本 Dockerfile 以前**没有**注入它 ⇒ 所有镜像都上报源码常量 `0.13.22`（实测），
+# 于是"落后判定"在真实部署里永远不会触发 —— 又一条"能力有、永不触发"。
+#
+# 口径：必须与上报值同口径（首段是数字，如 `0.14.0`）。用 git tag 时把前导 `v` 去掉
+# （见下面 `${AGENT_VERSION#v}`），这样 `--agent-version v0.14.0` 与上报值可直接比较。
+# 默认 `unknown` = **没有版本信息**，不是某个具体版本：面板对 `unknown` 只给「无法判定」，
+# 所以"没 stamp"既不会被读成"最新"，也不会被读成"落后"。发布构建请显式传：
+#   docker build -f agent/Dockerfile --build-arg AGENT_VERSION=v0.14.0 -t ghcr.io/paimoncai/tunex-agent:v0.14.0 .
+ARG AGENT_VERSION=unknown
 WORKDIR /src
 COPY agent/go.mod ./
 COPY agent ./
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -buildvcs=false -ldflags="-s -w" -o /out/tunex-agent .
+RUN set -eu; \
+    case "$AGENT_VERSION" in "") echo "AGENT_VERSION 不能为空：省略时请用默认值 unknown，发布时传真实版本号" >&2; exit 1 ;; esac; \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -buildvcs=false -ldflags="-s -w -X main.version=${AGENT_VERSION#v}" -o /out/tunex-agent .
 
 FROM alpine:3.22
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt

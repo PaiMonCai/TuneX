@@ -24,9 +24,19 @@ import (
 	"github.com/tunex/agent/internal/logx"
 )
 
-// version is stamped at build time with -ldflags "-X main.version=..".
-// The default is a fallback for local builds; release builds may stamp it with ldflags.
-var version = "0.13.22"
+// version is stamped at build time with -ldflags "-X main.version=..":
+// `agent/Dockerfile` 的 `ARG AGENT_VERSION`（默认 unknown）会以
+// `-ldflags "-X main.version=${AGENT_VERSION#v}"` 注入。
+//
+// 默认值刻意是 `unknown`，**不是**某个具体版本号（task-37 之前是 `0.13.22`）：
+// 面板拿它去和 `TUNEX_AGENT_LATEST_VERSION` 比较（`isVersionOlder`），而该函数对
+// `unknown` 只给「无法判定」。所以：
+//   · 没 stamp 版本 ⇒ 面板如实显示"无法判定"，既不说落后、也不说最新；
+//   · 若默认值是个像 `0.13.22` 的常量，**所有**镜像都会上报同一个假版本
+//     （实测：那正是"落后判定永不触发"的原因，见 docs/agent 的 task-37 记录）。
+//
+// 本地 `go build`（不带 ldflags）同样得到 `unknown` —— 这是事实：这个二进制没有版本身份。
+var version = "unknown"
 
 func main() {
 	os.Exit(run(os.Args[1:]))

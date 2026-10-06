@@ -14,6 +14,10 @@
  *  ② `GET /api/admin/system/config` → **不再列出** SMTP_* 键（历史行仍在库里）；
  *  ③ 其它配置项的读写路径**不受影响**（回归保护）。
  *
+ * task-33 把审计扩到**全部配置键**：本文件同时钉住"未接线键"（没有任何生产读者）与"已废弃键"
+ * （NOTICE*：真相已迁到 announcement 表）的处置 —— 同样"写入被拒 + 零落库 + GET 不再列为可配置"，
+ * 并断言历史行**原样在位**（忽略 ≠ 删除）。
+ *
  * 位置说明：task-14 的 writeScopes 里没有列出新的后端测试文件，这里放在
  * `src/services/__tests__/notifications/`（本切片与通知 email 渠道同域，且该目录由 notify-center
  * 持有），避免动别人的测试文件。
@@ -143,10 +147,13 @@ describe("N-F1 读取：不再把 SMTP_* 列为可配置项（历史行仍在库
     expect(names).toContain("SITE_NAME");
     expect(names).not.toContain("SMTP_HOST");
     expect(names).not.toContain("SMTP_PASS");
-    // 非 SMTP 的凭据键保留原有语义：值恒空 + secret_configured
-    const resend = rows.find((r) => r.name === "RESEND_API_KEY") as unknown as { value: string; secret_configured: boolean };
-    expect(resend.value).toBe("");
-    expect(resend.secret_configured).toBe(true);
+    // task-33 之后，**凭据类键一个都不在列表里了**：`SECRET_CONFIG_NAMES` 的三个键分别属于
+    // "部署级"（SMTP_PASS）与"未接线"（RESEND_API_KEY / CHATWOOT_TOKEN）⇒ 都被过滤。
+    // 掩码分支（`value:""` + `secret_configured`）因此对**当前这批键**不可达；它仍然留着，
+    // 供将来"有读者的凭据键"使用 —— 这一点如实写在这里，不让测试假装它还在生效。
+    expect(names).not.toContain("RESEND_API_KEY");
+    expect(names).not.toContain("CHATWOOT_TOKEN");
+    expect(names).not.toContain("SMTP_PASS");
   });
 
   test("历史行被**忽略**而不是被删除（库里仍然有那两行）", async () => {
@@ -159,5 +166,86 @@ describe("N-F1 读取：不再把 SMTP_* 列为可配置项（历史行仍在库
     expect(store.map((r) => r.name)).toContain("SMTP_HOST");
     expect(store.map((r) => r.name)).toContain("SMTP_PASS");
     expect(store.find((r) => r.name === "SMTP_PASS")!.value).toBe("legacy-secret");
+  });
+});
+
+/* ================================================================== */
+/* task-33：未接线键与已废弃键（穷举审计的处置）                          */
+/* ================================================================== */
+
+/** 审计结论：这些键在 backend/src、web/src、agent/ 三处全文检索都**没有消费点**。 */
+const UNWIRED_KEYS = [
+  "EMAIL_PROVIDER",
+  "RESEND_API_KEY",
+  "RESEND_FROM",
+  "CHATWOOT_BASE_URL",
+  "CHATWOOT_TOKEN",
+  "REFERRAL_COMMISSION_RATE",
+  "REFERRAL_FIRST_ONLY",
+  "REFERRAL_MODE",
+  "MIN_WITHDRAW_AMOUNT",
+  "WITHDRAW_METHODS",
+  "LIMIT_SCOPE",
+  "AUTO_UPDATE_AGENT",
+  "OBSERVER_PERIOD",
+] as const;
+
+const DEPRECATED_KEYS = ["NOTICE", "NOTICE_POPUP", "NOTICE_POPUP_INTERVAL_HOURS"] as const;
+
+describe("task-33 未接线键：写入被明确拒绝且零落库", () => {
+  test("每个未接线键：PUT → 400 config_not_wired，且**一次写调用都没有**", async () => {
+    for (const name of UNWIRED_KEYS) {
+      const res = await app.request(`/api/admin/system/config/${name}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value: "x" }),
+      });
+      expect({ name, status: res.status }).toEqual({ name, status: 400 });
+      const body = (await res.json()) as { code: string; error: string };
+      expect({ name, code: body.code }).toEqual({ name, code: "config_not_wired" });
+      // 理由必须说清"没有生产读者/尚未接线"，而不是一个泛化的 400
+      expect(body.error).toContain("生产读者");
+      expect(body.error).toContain("不会生效");
+    }
+    expect(writes).toEqual([]);
+  });
+
+  test("GET 不再把未接线键列为可配置项；历史行仍在库里（忽略 ≠ 删除）", async () => {
+    store.push(row("CHATWOOT_TOKEN", "legacy-chatwoot"), row("RESEND_API_KEY", "re_legacy"), row("EMAIL_PROVIDER", "resend"));
+    const rows = ((await (await app.request("/api/admin/system/config")).json()) as { data: ConfigRow[] }).data;
+    const names = rows.map((r) => r.name);
+    for (const key of UNWIRED_KEYS) expect(names).not.toContain(key);
+    expect(names).toContain("SITE_NAME");
+    // 历史行原样在位
+    expect(store.find((r) => r.name === "CHATWOOT_TOKEN")!.value).toBe("legacy-chatwoot");
+    expect(store.find((r) => r.name === "EMAIL_PROVIDER")!.value).toBe("resend");
+  });
+});
+
+describe("task-33 已废弃键：只读列出（旧值可见）+ 写入被拒", () => {
+  test("每个已废弃键：PUT → 400 config_deprecated，理由指向 announcement 表", async () => {
+    for (const name of DEPRECATED_KEYS) {
+      const res = await app.request(`/api/admin/system/config/${name}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value: "x" }),
+      });
+      expect({ name, status: res.status }).toEqual({ name, status: 400 });
+      const body = (await res.json()) as { code: string; error: string };
+      expect({ name, code: body.code }).toEqual({ name, code: "config_deprecated" });
+      expect(body.error).toContain("announcement");
+    }
+    expect(writes).toEqual([]);
+  });
+
+  test("GET 仍列出它们（旧值可见）但带 read_only 标记；值本身不被清空", async () => {
+    store.push(row("NOTICE", "旧公告正文"));
+    const rows = ((await (await app.request("/api/admin/system/config")).json()) as { data: Array<ConfigRow & { read_only?: boolean; read_only_reason?: string }> }).data;
+    const notice = rows.find((r) => r.name === "NOTICE")!;
+    expect(notice.read_only).toBe(true);
+    expect(notice.read_only_reason).toBe("deprecated");
+    expect(notice.value).toBe("旧公告正文");
+    // 其它未废弃的键**不带** read_only（不能顺手把整页变只读）
+    expect(rows.find((r) => r.name === "SITE_NAME")!.read_only).toBeUndefined();
   });
 });

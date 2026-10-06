@@ -76,6 +76,23 @@ function reset() {
   calls.length = 0; writes.length = 0;
 }
 
+/* redis 替身：本端点是**纯 DB 读**，不碰 redis；替身只为把子进程从"真实 ioredis 连接重试"
+ * 里解放出来（否则每次 spawn 要等连接超时，整套门禁被拖慢十几秒，日志也会被 ECONNREFUSED 刷屏）。
+ * 键构造器用 Proxy 兜住：任何 RedisKeys.x() 都返回一个字符串键，不必在这里复刻键命名规则。 */
+mock.module(root + "redis.ts", () => ({
+  redis: new Proxy({ status: "ready" }, {
+    get: function (target, prop) {
+      if (prop in target) return target[prop];
+      return async function () { return null; };
+    },
+  }),
+  RedisKeys: new Proxy({}, { get: function () { return function () { return "k"; }; } }),
+  scopedKey: function (key) { return String(key); },
+  observerBufferKey: function (key) { return String(key); },
+  OBSERVER_BUFFER_MAX: 500,
+  redisPing: async function () { return true; },
+}));
+
 mock.module(root + "db.ts", () => ({ db: {
   node: {
     findFirst: async function (args) {
@@ -207,6 +224,33 @@ await group("reported-version-is-not-configured-version", 3, async () => {
 `;
 
 /* ------------------------------------------------------------------ */
+/* ②b 版本基线：不可比较的配置**不折算**（task-26 的真机形态）              */
+/* ------------------------------------------------------------------ */
+
+const SCENARIO_BASELINE = String.raw`
+await group("baseline-is-not-coerced", 1, async () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  reset();
+  seedReport({ version: "0.13.22" });
+  const data = (await (await status(await req("/1/upgrade-state"), 200)).json()).data;
+
+  if (env.agentLatestVersion === SHA) {
+    /* 旧版安装器把它写成 git sha：原值透传（不吞），drift 只能是 unknown ——
+       既不是 behind，也不是"已是最新"。 */
+    expect(data.target.expected_version).toBe(SHA);
+    expect(data.target.version_drift).toBe("unknown");
+  } else if (env.agentLatestVersion === "0.14.0") {
+    /* 真正可比较的基线：落后判定正常出现（这才是修复后的那条路）。 */
+    expect(data.target.expected_version).toBe("0.14.0");
+    expect(data.target.version_drift).toBe("behind");
+  } else {
+    /* 不是"跳过"：子进程没收到期望配置就直接失败，避免这条用例被静默绕过。 */
+    throw new Error("子进程未收到期望的基线形态：" + JSON.stringify(env.agentLatestVersion));
+  }
+});
+`;
+
+/* ------------------------------------------------------------------ */
 /* ③ 前置结论与 POST 同源                                               */
 /* ------------------------------------------------------------------ */
 
@@ -268,7 +312,7 @@ await group("read-only-and-scope-first", 2, async () => {
 /* 子进程执行器                                                        */
 /* ------------------------------------------------------------------ */
 
-function runScenario(scenario: string): string {
+function runScenario(scenario: string, baseline = ""): string {
   const result = spawnSync(
     process.execPath,
     [
@@ -281,8 +325,9 @@ function runScenario(scenario: string): string {
       env: {
         ...process.env,
         TUNEX_UPGRADE_ROOT: root,
-        // 默认部署形状：基线未声明（本专项确认的"升级建议永不出现"的那个配置）。
-        TUNEX_AGENT_LATEST_VERSION: "",
+        // 缺省：基线未声明（本专项确认的"升级建议永不出现"的那个配置）。
+        // 传第 2 个参数可模拟其它部署形态（旧版安装器写的 git sha / 真正的版本号）。
+        TUNEX_AGENT_LATEST_VERSION: baseline,
       },
       encoding: "utf8",
       timeout: 60_000,
@@ -293,6 +338,15 @@ function runScenario(scenario: string): string {
   if (result.status !== 0) throw new Error(`子进程退出码 ${result.status}\n${output}`);
   return output;
 }
+
+const BASELINE_SHA = "0123456789abcdef0123456789abcdef01234567";
+
+test("版本基线：不可比较的配置不折算成 behind / 已是最新", () => {
+  const shaOutput = runScenario(SCENARIO_BASELINE, BASELINE_SHA);
+  expect(shaOutput).toContain("GROUP baseline-is-not-coerced=1");
+  const comparableOutput = runScenario(SCENARIO_BASELINE, "0.14.0");
+  expect(comparableOutput).toContain("GROUP baseline-is-not-coerced=1");
+}, 60_000);
 
 test("升级读投影：契约、上报真相、同源前置、只读", () => {
   const output = [
@@ -305,7 +359,7 @@ test("升级读投影：契约、上报真相、同源前置、只读", () => {
   expect(output).toContain("GROUP reported-version-is-not-configured-version=3");
   expect(output).toContain("GROUP precondition-is-the-same-truth=4");
   expect(output).toContain("GROUP read-only-and-scope-first=2");
-});
+}, 120_000);
 
 /**
  * 顺序回归（静态面）：本端点必须注册为**字面量子路径**，不能落到任何参数化的
