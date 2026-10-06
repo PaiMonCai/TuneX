@@ -115,39 +115,55 @@ export async function claimLease(input: {
     return { ok: true, lease: created, epoch: created.epoch, changed_owner: true };
   }
 
-  if (current.owner_node_id === input.nodeId) {
-    // Renewal. Same epoch on purpose: renewal is not a new generation, and bumping it
-    // would make every heartbeat look like an ownership change to the agent's
-    // stale-epoch guard.
-    const renewed = await db.placementLease.update({
-      where: { tunnel_id: input.tunnelId },
-      data: { lease_expires_at: expiresAt, revision: input.revision },
-      select: {
-        tunnel_id: true,
-        owner_node_id: true,
-        epoch: true,
-        lease_expires_at: true,
-        revision: true,
+  if (current.owner_node_id === input.nodeId && !isLeaseExpired(current, input.now)) {
+    // Live-owner renewal is a CAS against the exact lease generation and expiry
+    // we observed. Without the expiry predicate, a concurrent explicit release
+    // can be overwritten by this renewal and the released owner is resurrected.
+    const renewed = await db.placementLease.updateMany({
+      where: {
+        tunnel_id: input.tunnelId,
+        owner_node_id: input.nodeId,
+        epoch: current.epoch,
+        lease_expires_at: current.lease_expires_at,
+      },
+      data: {
+        lease_expires_at: expiresAt,
+        revision: Math.max(current.revision, input.revision),
       },
     });
-    return { ok: true, lease: renewed, epoch: renewed.epoch, changed_owner: false };
+    if (renewed.count === 0) {
+      const fresh = await loadLease(input.tunnelId);
+      if (
+        fresh !== null &&
+        fresh.owner_node_id === input.nodeId &&
+        fresh.epoch === current.epoch &&
+        !isLeaseExpired(fresh, input.now)
+      ) {
+        // Another renewal from the same owner won the race. The resulting fact is
+        // equivalent for this caller, so converge on it instead of inventing a failure.
+        return { ok: true, lease: fresh, epoch: fresh.epoch, changed_owner: false };
+      }
+      return { ok: false, reason: "lost_race", current: fresh ?? undefined };
+    }
+    const after = await loadLease(input.tunnelId);
+    if (after === null) return { ok: false, reason: "not_found" };
+    return { ok: true, lease: after, epoch: after.epoch, changed_owner: false };
   }
 
-  // Ownership move: only AFTER the old lease has expired (two-phase handover).
+  // A live lease owned by someone else cannot move yet.
   if (!isLeaseExpired(current, input.now)) {
     return { ok: false, reason: "not_expired", current };
   }
 
-  // The move is a real COMPARE-AND-SWAP, not a read-then-write.
-  //
-  // 读后写在这里会出真事故：两个候选节点同时看到"租约已过期"，于是各自把 epoch 从 N 写成
-  // N+1 —— 两行都自称 epoch N+1、两个主人。CAS 把"我看到的那个世代"变成写入前提，输的一方
-  // 得到 lost_race 而不是一次成功的迁移。
+  // Expiry is a fencing boundary even when the same physical node comes back.
+  // Re-acquisition must advance epoch; silently extending an expired row would
+  // let a stale runtime from the old generation become authoritative again.
   const moved = await db.placementLease.updateMany({
     where: {
       tunnel_id: input.tunnelId,
       epoch: current.epoch,
       owner_node_id: current.owner_node_id,
+      lease_expires_at: current.lease_expires_at,
     },
     data: {
       owner_node_id: input.nodeId,
@@ -157,14 +173,30 @@ export async function claimLease(input: {
     },
   });
   if (moved.count === 0) {
-    // Someone else moved first. Report it as a race, not as success — the caller must
-    // re-read and decide again rather than assume it holds ownership.
     const fresh = await loadLease(input.tunnelId);
+    if (
+      fresh !== null &&
+      fresh.owner_node_id === input.nodeId &&
+      fresh.epoch > current.epoch &&
+      !isLeaseExpired(fresh, input.now)
+    ) {
+      return {
+        ok: true,
+        lease: fresh,
+        epoch: fresh.epoch,
+        changed_owner: current.owner_node_id !== input.nodeId,
+      };
+    }
     return { ok: false, reason: "lost_race", current: fresh ?? undefined };
   }
   const after = await loadLease(input.tunnelId);
   if (after === null) return { ok: false, reason: "not_found" };
-  return { ok: true, lease: after, epoch: after.epoch, changed_owner: true };
+  return {
+    ok: true,
+    lease: after,
+    epoch: after.epoch,
+    changed_owner: current.owner_node_id !== input.nodeId,
+  };
 }
 
 /**
