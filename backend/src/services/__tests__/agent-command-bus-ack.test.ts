@@ -168,6 +168,25 @@ describe("WP11B ACK binding", () => {
     ).rejects.toThrow(/unknown or expired/);
   });
 
+  test("a corrupt stored ACK is reported as ack_invalid, not as a timeout", async () => {
+    await pendingFor(harness.store, "cmd-corrupt", 2);
+    await harness.store.set(
+      `ws:${SCOPE}:agent:command:${NODE}:ack:cmd-corrupt`,
+      "{not json",
+      120,
+    );
+
+    try {
+      await waitAgentCommandAck(SCOPE, NODE, "cmd-corrupt", 1_000, harness.store);
+      throw new Error("expected corrupt ACK to be rejected");
+    } catch (error) {
+      expect((error as { code?: string }).code).toBe("ack_invalid");
+    }
+
+    expect(harness.values.has(`ws:${SCOPE}:agent:command:${NODE}:ack:cmd-corrupt`)).toBe(false);
+    expect(harness.values.has(`ws:${SCOPE}:agent:command:${NODE}:pending:cmd-corrupt`)).toBe(false);
+  });
+
   test("a timeout clears the pending record so a late ACK cannot be accepted", async () => {
     await pendingFor(harness.store, "cmd-8", 2);
     await expect(waitAgentCommandAck(SCOPE, NODE, "cmd-8", 150, harness.store)).rejects.toThrow();
