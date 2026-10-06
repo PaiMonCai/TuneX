@@ -35,6 +35,15 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
   { name: "cron_ddns_sync", everyMs: 30_000, desc: "DDNS 同步：写 dns_auto_resolve 的转发（与 failover 策略无关，幂等 + 退避）" },
   // Settlement is intentionally offset from the hourly latency rollup/archive windows.
   { name: "cron_settle_billing", pattern: "45 * * * *", desc: "订阅周期结算：占位 → 执行 → 终态，崩溃接管（幂等）" },
+  // 事实类通知（拒绝 / 恢复）。在此之前 `runForwardDenialNotifications()` **没有生产调用者** ——
+  // 通知的派生、账本、静默期、渠道都写完了，却没有任何节拍去调用它，于是"转发下发被拒"这件事
+  // 永远发不出去（只有公告那条路径真的会投递）。
+  //
+  // 节拍取 30s（与 `cron_reconcile_v3`/`cron_ddns_sync` 同拍）：事实的来源 `tunnel.apply_status`
+  // 由对账/下发路径写，取同一节拍意味着最坏滞后约一拍；更快只是空转，更慢会让"刚坏掉"的通知迟到。
+  // **幂等完全交给投递层**（账本唯一索引 + 每渠道 Redis 静默期）：所以这里每拍无条件调用，
+  // **job 内部不做任何去抖/冷却**（那会成为第二套抑制判据，本专项明令禁止）。
+  { name: "cron_notification_facts", everyMs: 30_000, desc: "事实类通知：转发拒绝/恢复 → 已打开的「给人」渠道（幂等交给投递层）" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
@@ -229,6 +238,29 @@ const worker = new Worker(
           console.log("[worker] cron_ddns_sync:", JSON.stringify(summary));
         }
         return summary;
+      }
+      case "cron_notification_facts": {
+        // 事实类通知（N3）：把 attention 里 E 类事实（转发下发被拒）与"已恢复"配对后交给投递层。
+        // 本 handler **不做任何判定**：不筛事实之外的条目、不去抖、不改写账本 ——
+        // 幂等由投递层保证（账本唯一索引 + 每渠道 Redis 静默期），所以每拍无条件调用是安全的。
+        const { runForwardDenialNotifications, defaultForwardDenialDeps } = await import(
+          "./services/notification-facts-trigger.ts"
+        );
+        try {
+          const r = await runForwardDenialNotifications(defaultForwardDenialDeps());
+          // 空闲时保持静默（没有事实、没有渠道打开时不刷屏）；但有事实/有拒绝/有跳过必须留痕，
+          // 否则"通知发不出去"这件事在运维视角里不存在。
+          if (r.delivered || r.built > 0 || r.rejected > 0 || r.skipped > 0) {
+            console.log("[worker] cron_notification_facts:", JSON.stringify(r));
+          }
+          return r;
+        } catch (e) {
+          // 通知是旁路：一次失败不该让整轮扫描成为"崩溃"，但必须可见（worker.on("failed") 之外
+          // 再留一行，因为这里吞掉了异常以返回可读的 summary）。
+          const detail = e instanceof Error ? e.message : String(e);
+          console.error("[worker] cron_notification_facts failed:", detail);
+          return { error: detail };
+        }
       }
       case "cron_settle_billing": {
         // Settlement claims a unique (subscription, period) row before execution. Stale pending

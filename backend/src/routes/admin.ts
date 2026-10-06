@@ -101,7 +101,21 @@ adminRoutes.get("/node/group", async (c) => {
  * nodes — /api/admin/node* → key: nodes
  * ------------------------------------------------------------------ */
 adminRoutes.get("/node", async (c) => {
-  const rows = await db.node.findMany({ orderBy: { id: "desc" } });
+  // **必须用 select 白名单**，不能 `findMany()` 全字段下发：
+  // `node_credential_hash` 是节点长期凭据的 sha256 摘要，它没有理由进入 SSR payload /
+  // 浏览器内存。凭据状态由 `credential_*` 那几列表达（是否签发/是否吊销/轮换时间），
+  // 列表页需要的信息一个不少。R5-B 复核在真机响应里实测到过这个字段（P3-8）。
+  const rows = await db.node.findMany({
+    orderBy: { id: "desc" },
+    select: {
+      id: true, node_id: true, agent_id: true, weight: true, status: true, role: true,
+      connect_ip: true, version: true, backup: true, order_by: true, custom_line: true,
+      dns_status: true, created_at: true, updated_at: true, node_group_id: true,
+      last_seen_at: true, port_range_min: true, port_range_max: true, lb_strategy: true,
+      credential_rotated_at: true, credential_revoked: true, credential_last_rejected_at: true,
+      lifecycle: true, lifecycle_updated_at: true, lifecycle_note: true,
+    },
+  });
   return c.json({ data: rows, total: rows.length });
 });
 

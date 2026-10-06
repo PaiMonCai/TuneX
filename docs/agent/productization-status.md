@@ -372,6 +372,7 @@ B) Onboarding 端到端（重跑，验证最终构建）：
 | 升级完整流程 | 仅验证了探针在真实镜像下对真/假端点的行为，**未在真实节点跑完整 pull→stop→run→校验** | 未验证 |
 | 延迟端点 Web 消费 | D6 已交付只读端点（含四态与截断语义），Web 侧尚未消费 | 新切片 |
 | mock 与真实剩余分叉 | 已存在节点 + 显式不同 `role` → 真实 409（mock 不判）；带 `targets` 的重装 → 真实 409（mock 忽略） | 记录在案 |
+| mock 与真实剩余分叉（P2-5，task-27 已修一半） | **节点额度门控**：真机 `POST /api/node-groups/:id/nodes` 在 `max_nodes` 用尽时 403 `node_limit`（顺序：能力/额度 → 端口区间），旧 mock **完全没有这道门**、无限 201；现已按同序补上（403 `{error,code}` + 拒绝后不建行，`node-provision-mock-parity.test.ts` 10 pass 钉住）。**残留**：mock 的计数口径是"**本空间自建组**里的行"（`nodeGroupWorkspace`），种子组是跨作用域演示数据、不在该表里 ⇒ 演示态那 7 行不计入任何空间；真机上每个组都有归属，同样状态下会 403。要复现"额度耗尽"请在测试/演示里显式设置 `capabilityPolicies`（parity 测试即如此） | 残留记录在案 |
 
 ## 3.14 Round 19 派发（补齐退出条件 #3 / #6 / #7 的缺口）
 
@@ -604,6 +605,30 @@ web 干净检出 `build` 未跑；web/后端**测试刻意未跑**（工作树�
 **门禁快照（第 31 轮，非门禁——指纹在运行期间变化）**：后端 **2897 pass / 0 fail**；web 有 2 条失败 + tsc 报错，**全部来自 `task-27` 的中途态**（`node-runtime-panel.tsx`），等其落地后重跑。
 
 **已交付但尚未挂载/验证的点（如实）**：`enabled:true` 的 Looking Glass 真机路径未验证（scratch 开关关闭，需改验收环境）；真实三跳创建未跑通（scratch 无 `role=both` 节点）；升级完整流程未在真实节点执行（刻意不升级那 4 台）。
+
+## 3.27 Round 31–32：通知接线完成 + 一条 P1 既存缺陷 + Looking Glass 开关路径已验证
+
+### task-11（N3 通知节拍）完成 —— 真实 MySQL + 真实 Redis 三拍证据
+`cron_notification_facts`（30s，与 reconcile/ddns 同拍）→ `runForwardDenialNotifications(defaultForwardDenialDeps())`。真机三拍：
+| 拍 | 结果 |
+|---|---|
+| 1（隧道 `apply_status='error'`） | `{considered:1,built:1,recovered:0,rejected:0,skipped:0,delivered:true}`；**真实 email 送达**（假 SMTP 收到 `[TuneX][error] forward_apply_error`）；账本真实落行 `status='sent'`、`attempts=1` |
+| 2（同一事实立刻再来） | 账本仍 **1 行**、没有第二封 ⇒ 拦住它的是**投递层**（Redis `…cooldown:forward:5:forward_apply_error:email`），**不是 job 里去抖**（job 内零去抖，有源码守卫测试） |
+| 3（改回 active） | `recovered:1` → 恢复事实配对 + 新账本行（severity `info`） |
+清理后库计数回到探测前基线；19 条新接线用例（真实 `runForwardDenialNotifications` + 真实 `deliverNotificationFacts`，仅换账本/静默期/渠道替身）；后端全量 **2898 pass / 0 fail**。
+**webhook 明确不纳入事实类首发**（免打扰语义属"给人"的渠道；webhook 没有"哪条事实送哪个端点"的订阅概念）→ 另立切片。
+**node 事实仍不被选中**：判定为"有意的范围限制 + 敞着的门"，要接需**四件事一起定**（哪些节点理由码值得打扰人、来源行映射、账本 open-denial 查询扩展、reason 白名单）；**不得只删那行 `continue`**（既有测试正是在防"通知范围悄悄变大"）。
+
+### 🔴 新发现 P1（既存，已并入 task-14 并升级为第一优先）：`sendMail` 不读 SMTP 220 问候语
+`services/mail.ts` 的 `SmtpClient.connect()` 从不读连接后的问候语，直接发 `EHLO` ⇒ **任何符合 RFC 5321 的真实 MTA 都会失败**（假 SMTP 发问候语→`transport_error`；去掉问候语→立刻成功，同一份代码）。影响：凡配了 `SMTP_*` 的部署，**邮箱验证 / 密码重置 / 公告邮件 / 通知 email 渠道全部发不出去**；而仓里**没有任何测试跑过真实 `SmtpClient` 会话**，所以长期未被发现。要求含"起一个会发问候语的假 SMTP 断言成功"的行为测试 + 修复前后真实会话对照。
+
+### Looking Glass 开关路径：已验证（`enabled:true`）
+`web-ddns` 用**派生唯一容器**（同镜像 + 仅覆盖 `LOOKING_GLASS_ENABLED=1`，不发布宿主端口）在真实环境验证：`status` → `enabled:true`；**非平台管理员也进得来**且 `platform_admin_override:false`（该字段是**按观察者**算的——这条此前从未观察过）；真实发起走的是**开关路径而非管理员例外**（`entry:{enabled:true, admin_override:false}`）；`refused` 之外的**结果状态拿到真机样本**（`reachable`/`timeout`（`i/o timeout`）/`error`（IPv6 `network is unreachable`））；域名目标实测 `pinned_by_host` 4 条字面地址（= `max_pinned_addresses`）⇒ 印证"面板解析、节点只拨字面地址"的设计结论；并发 → 409 `looking_glass_busy`；审计真实计数 `issued=6/completed=6/refused=9`。
+**仍无样本**：`refused`（本拓扑出网路径不返回 RST）、`dns_error`（结构上不可达）、`invalid_target`/`unsupported`/`upgrade_required`（需更老/更怪的 Agent）。
+
+### Lead 处置：P3-8（凭据哈希下发）已修
+`GET /api/admin/node` 原为 `findMany()` 全字段 ⇒ 把 `node_credential_hash`（长期凭据的 sha256）下发到客户端。已改为 **select 白名单**（凭据状态由 `credential_*` 列表达，列表所需字段一个不少）。
+**顺带发现并复现一个既存的顺序敏感缺陷**（与本改动无关）：`routes/__tests__/ddns-provider-route.test.ts` 在进程内注册了只含 `resolveWorkspaceAccess` 的 `workspace.ts` 替身（缺 `createPersonalWorkspace`）⇒ 同进程后跑的 `route-mount-coverage.test.ts` 报 `Export named 'createPersonalWorkspace' not found`。**只跑这两个文件即可复现**（5 pass / 1 fail / 1 error）；全量跑因顺序不同反而绿 ⇒ 属"替身必须语义完整"的同型问题，待小切片修。
 
 ## 4. Capability Map
 
