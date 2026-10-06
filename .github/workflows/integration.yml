@@ -11,6 +11,8 @@ on:
       - "agent/Dockerfile"
       - "docker-compose*.yaml"
       - ".env.production.example"
+      - ".github/workflows/integration.yml"
+      - ".github/workflows/release.yml"
   workflow_run:
     workflows: ["CI"]
     types: [completed]
@@ -33,7 +35,7 @@ jobs:
   pr-integration:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Start PR topology
