@@ -214,7 +214,7 @@ export async function authenticateRequest(c: Context) {
   const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
   if (bearer && isUUID(bearer)) {
     const license = await licenseService.getLicense();
-    if (license && license.type !== "business") return null;
+    if (license?.type !== "business") return null;
     // SEC-02：凭据哈希化查询（旧明文行惰性迁移），语义与直查 api_key 等价。
     const u = await resolveUserByKey("api_key", bearer);
     if (u && u.status !== "inactive") return u;
