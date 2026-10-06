@@ -285,7 +285,9 @@ export async function sumWorkspaceTraffic(
   client: DbLike = db,
 ): Promise<number> {
   const since = trafficStart(period, now);
-  const where: Prisma.TunnelTrafficWhereInput = { tunnel: { workspace_id: workspaceId } };
+  // Usage attribution is frozen into the archive row. Joining the live Tunnel
+  // would let deleting a Forward remove/de-scope historical quota usage.
+  const where: Prisma.TunnelTrafficWhereInput = { workspace_id: workspaceId };
   if (since) where.date = { gte: since };
   const agg = await client.tunnelTraffic.aggregate({ where, _sum: { traffic: true } });
   return agg._sum.traffic ?? 0;
