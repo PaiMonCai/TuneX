@@ -248,7 +248,7 @@ func TestAbsentOwnershipFactsMeanNoFenceAndNoClock(t *testing.T) {
 	}
 
 	// An older panel: no epoch, no lease. This must behave exactly as it did
-	// before V5.3 — no refusal (even though a fence exists) and no deadline.
+	// without ownership facts — no refusal (even though a fence exists) and no deadline.
 	bare := forwarder.TunnelConfig{ID: "tunex-1-relay", Mode: forwarder.ModeRelay, IngressPort: 19000, NextHop: "10.0.0.1:443", Protocol: forwarder.ProtocolTCP, Revision: 9}
 	if err := g.Admit(bare); err != nil {
 		t.Fatalf("a config without ownership facts must not be fenced: %v", err)

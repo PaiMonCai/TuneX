@@ -9,9 +9,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// V5.1b WP5-B2 — datagram hop framing.
+// Datagram hop framing.
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md §9.1 (frozen 2026-10-05).
+// These tests pin the datagram relay wire framing.
 //
 // These cover the two parts of the relay hop that are pure logic: the wire
 // framing and the mapping identity allocator. Everything else about the hop

@@ -9,16 +9,14 @@
 //	GET    /debug/runtime      process runtime gauges (goroutines / RSS / CPU)
 //
 // Mutating routes require a bearer token; by default the server binds to
-// loopback (127.0.0.1:9090 — the v3 deployment layout's admin port, separate
-// from the data-plane range). /debug/runtime is authenticated too: it exposes
+// loopback (127.0.0.1:9090 — the local admin port, separate from the
+// data-plane range). /debug/runtime is authenticated too: it exposes
 // process internals, and "it is only a gauge" is not a reason to make the
 // management plane's auth story inconsistent.
 //
-// WP4 scope ends here: the routes call TunnelManager/EgressManager and report
-// state. The final panel orchestration (WP6 command/revision/ACK contract and
-// its outbound transport) is deliberately not wired in, and no Prisma model is
-// referenced — the node state shape is a plain struct the later WP6 layer can
-// serialise.
+// The routes call TunnelManager/EgressManager and report node state. Panel
+// orchestration and outbound command transport stay outside this local HTTP
+// surface, and the package does not depend on Prisma models.
 //
 // Standard-library only, so the agent keeps building fully offline.
 package api
@@ -43,8 +41,8 @@ import (
 	"github.com/tunex/agent/internal/targetdns"
 )
 
-// DefaultPort is the admin port from the v3 deployment layout (agent port 9090,
-// internal reporting port 9191).
+// DefaultPort is the local Agent admin port. It remains separate from data-plane
+// listener ranges and internal reporting surfaces.
 const DefaultPort = 9090
 
 // DefaultHost keeps the admin plane off the public interface unless an operator
@@ -73,12 +71,12 @@ type Options struct {
 	Version    string // reported by /health
 	Role       string // reported by /health
 
-	// Ownership is the V5.3-WP9 fencing view: the durable epoch fence plus the
-	// lease clock's counters. nil omits the section entirely (an older build, or
+	// Ownership is the fencing view: the durable epoch fence plus the lease clock's
+	// counters. nil omits the section entirely (an older build, or
 	// a test), which is why the field is optional rather than a required source.
 	Ownership OwnershipFacts
 
-	// TargetDNS is the V5.3-WP8 resolution view: what each target name currently
+	// TargetDNS is the current resolution view: what each target name currently
 	// resolves to, how old that answer is, and why the last lookup failed. It is
 	// the "report the fact" half of NXDOMAIN handling — the node keeps serving
 	// from its last good addresses, and this is where an operator can see that it
@@ -108,11 +106,10 @@ type NodeState struct {
 	Tunnels   []forwarder.TunnelConfig        `json:"tunnels"`
 	UsedPorts []int                           `json:"used_ports"`
 	Egress    map[string]manager.PoolSnapshot `json:"egress_pools,omitempty"`
-	// TargetDNS is the V5.3-WP8 resolution fact set, additive and optional.
+	// TargetDNS is the resolution fact set, additive and optional.
 	TargetDNS []targetdns.Fact `json:"target_dns,omitempty"`
-	// Ownership is the V5.3-WP9 fencing fact set. It is ADDITIVE and optional:
-	// a node without a guard simply has no key, and every pre-V5.3 reader keeps
-	// working. It exists because a refused activation must be a fact somebody
+	// Ownership is the fencing fact set. It is additive and optional: a node
+	// without a guard simply has no key, so older readers can ignore the field. It exists because a refused activation must be a fact somebody
 	// can read — the ACK tells the panel, the ledger carries it in the report,
 	// and this is the surface that says WHY without opening the agent log.
 	Ownership *ownership.Facts `json:"ownership,omitempty"`
@@ -171,11 +168,11 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// RuntimeStats is the /debug/runtime payload (V5-WP3).
+// RuntimeStats is the /debug/runtime payload.
 //
 // Why the agent exposes these rather than letting a benchmark shell out to
 // /proc: **goroutine count is not in /proc**. It is an in-process number, and
-// the whole point of the V5 performance baseline is to notice "functionality
+// the point of the runtime performance baseline is to notice "functionality
 // passes but the runtime leaks goroutines". Reading Threads from
 // /proc/<pid>/status would silently measure OS threads instead and look like a
 // pass forever.
@@ -322,7 +319,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 }
 
 // applyRequest accepts both the nested TunnelConfig shape and a flat payload
-// carrying "revision" next to the tunnel fields (the WP6 command envelope).
+// carrying "revision" next to the tunnel fields (the command envelope).
 type applyRequest struct {
 	forwarder.TunnelConfig
 	Revision int64 `json:"revision"`
@@ -344,7 +341,7 @@ func (s *Server) handleApplyTunnel(w http.ResponseWriter, r *http.Request) {
 		cfg.Revision = req.Revision
 	}
 
-	// Route by the hot-reload plan (WP2, DEVELOPMENT.md §13.3.4): a command
+	// Route by the hot-reload plan: a command
 	// that moves the listener must not drop live connections, and a command
 	// that only moves the upstream must not rebuild the forwarder at all.
 	// ReplaceListener makes both decisions inside the manager, against the
@@ -387,10 +384,10 @@ func (s *Server) handleRemoveTunnel(w http.ResponseWriter, r *http.Request) {
 
 // targetsRequest is the PATCH /node/targets body.
 //
-// TargetHealth is the V5.2-WP7 parallel array (§7.3): the same predicate the
+// TargetHealth is the parallel health array: the same predicate the
 // control-plane dispatch carries, so the local hot-update surface cannot apply
 // the desired targets while silently discarding the health that came with them.
-// Absent means "no health signal" and restores the pre-WP7 behaviour.
+// Absent means "no health signal" and keeps ordinary target selection.
 type targetsRequest struct {
 	TunnelID     string                   `json:"tunnel_id"`
 	Strategy     manager.Strategy         `json:"strategy"`

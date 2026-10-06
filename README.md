@@ -7,7 +7,7 @@
 
 ## 当前状态
 
-TuneX 已进入 **V1 产品化 / Production Beta** 阶段。当前 `main` 是唯一工程基线；不要从 V3/V4/V5/WP 文档或旧提交推断当前能力，当前事实以代码、迁移、当前文档和 CI/Integration 结果为准。
+TuneX 已进入 **V1 产品化 / Production Beta** 阶段。当前 `main` 是唯一工程基线；当前事实以代码、迁移、当前文档和 CI/Integration 结果为准。
 
 当前主要能力：
 
@@ -106,7 +106,7 @@ go build ./...
 PR 走 Source CI + Fast Integration；`main` 通过 Source CI 后构建一次 Unified/Agent 候选镜像，
 完整 Integration 按候选 digest 验证，Release 只提升同一 digest，不重新构建。
 
-- [docs/testing.md](docs/testing.md)：当前测试层级、命令和 Gate；
+- [docs/testing.md](docs/testing.md)：当前测试层级、命令和 Integration 验证；
 - [docs/release.md](docs/release.md)：当前 build-once / qualify / promote 发布流程；
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署、升级、备份、恢复与回滚。
 
@@ -117,4 +117,3 @@ PR 走 Source CI + Fast Integration；`main` 通过 Source CI 后构建一次 Un
 - [docs/engineering.md](docs/engineering.md)：工程规则与变更纪律；
 - [docs/testing.md](docs/testing.md)：测试与验证；
 - [docs/release.md](docs/release.md)：发布流水线；
-- [docs/history/README.md](docs/history/README.md)：V3/V4/V5/WP 历史材料索引。

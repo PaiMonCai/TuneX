@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// The WP11A shutdown primitive differs from Drain in exactly two ways, and both
+// The graceful-shutdown primitive differs from Drain in exactly two ways, and both
 // are asserted here: the listener is CLOSED (so a new connection is refused
 // instead of queued), and a connection that outlives the deadline is force
 // closed instead of being waited on indefinitely.

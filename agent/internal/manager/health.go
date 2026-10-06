@@ -1,15 +1,15 @@
-// V5.2-WP7 — health-aware egress selection: the agent-side MECHANISM that sits
-// on top of the panel's health model (DEVELOPMENT.md §7.3, "V5-WP7 冻结机制").
+// Health-aware egress selection is the Agent-side mechanism that sits
+// on top of the panel's health model.
 //
 // What this file is, and what it deliberately is NOT:
 //
-//   - The HEALTH MODEL lives on the panel (WP5 observation → WP6 synthesis,
+//   - The health model lives on the panel (target observation → health synthesis,
 //     five states, thresholds, hysteresis, staleness). The agent receives those
 //     conclusions as the parallel `target_health` array and never invents a
 //     second definition of "healthy" (§7.3: "状态模型只有一个"). Nothing here
 //     computes a state; it only reads one.
 //   - What lives here is a three-state circuit breaker per (pool, target) plus
-//     the WP7 preference order. It changes WHICH target the existing strategy
+//     the routing preference order. It changes WHICH target the existing strategy
 //     hands out. It never changes the strategy, never rewrites the desired
 //     target list, never deletes a target and never persists anything —
 //     desired state and this table never touch.
@@ -20,7 +20,7 @@
 //
 // Everything is bounded, and every bound says WHY at its constant: an unbounded
 // cooldown is "remove the target forever" arrived at by arithmetic, and the
-// pre-WP7 §7.3 rule forbids exactly that.
+// no-health behavior forbids exactly that.
 package manager
 
 import (
@@ -75,17 +75,17 @@ const (
 	BreakerHalfOpenProbeTimeout = 30 * time.Second
 )
 
-// healthRank maps the panel's five states onto the WP7 preference order
+// healthRank maps the panel's five states onto the routing preference order
 // `healthy > recovering > degraded > unknown > unhealthy`; lower is better.
 //
-// This is deliberately NOT WP6's severity order (`unknown < healthy <
-// recovering < degraded < unhealthy`). WP6 uses severity to merge several
+// This is deliberately NOT the synthesis severity order (`unknown < healthy <
+// recovering < degraded < unhealthy`). Health synthesis uses severity to merge several
 // observers' conclusions, where a real bad conclusion must outrank "no
-// evidence". WP7 is choosing where to send the NEXT connection, and there "no
+// evidence". Routing is choosing where to send the NEXT connection, and there "no
 // evidence" is worse than "recovering" but better than "the panel just told us
 // it is broken" — §7.3 spells that out ("unknown 排在 degraded 之后、unhealthy
 // 之前 —— 没有证据不等于好，但也不等于已证实故障"). Both orders are correct for
-// their own question, so the WP7 mapping lives here, in one place, instead of
+// their own question, so the routing mapping lives here, in one place, instead of
 // being re-derived at each use.
 func healthRank(s forwarder.TargetHealthState) int {
 	switch s {
@@ -303,7 +303,7 @@ func (h *healthTable) install(facts []forwarder.TargetHealth) {
 		// successful probe), and letting the panel's label close it would make
 		// the breaker a second, quieter health model instead of a mechanism.
 		//
-		// The wire's `evidence` field is NOT consulted. Under WP6's contract
+		// The wire's `evidence` field is NOT consulted. Under the health-synthesis contract
 		// evidence=false implies state=unknown ("false ⇒ 结论必然是 unknown"),
 		// so it cannot say anything the state has not already said, and reading
 		// it as a second gate would add a rule the frozen mechanics do not have.
@@ -314,7 +314,7 @@ func (h *healthTable) install(facts []forwarder.TargetHealth) {
 	h.entries = next
 }
 
-// admit returns the target's WP7 preference rank and whether the breaker lets
+// admit returns the target's routing preference rank and whether the breaker lets
 // it through right now. A target the payload did not mention is `unknown` with
 // a closed breaker: absence of evidence is not evidence of failure.
 func (h *healthTable) admit(t forwarder.Target, now time.Time) (rank int, ok bool) {
@@ -470,7 +470,7 @@ func (l *LoadBalancer) SetBreakerBounds(bounds BreakerBounds) {
 // nil/empty means "this payload carried no health signal" (an older panel, a
 // failed health read): the mechanism is switched OFF and its state dropped
 // rather than left to rot, so the pool then behaves exactly as it did before
-// WP7 — no breaker, no reordering. Keeping a breaker the panel no longer
+// No health signal means no breaker and no reordering. Keeping a breaker the panel no longer
 // describes would mean the agent holding a health conclusion nobody is
 // asserting any more.
 //
@@ -506,7 +506,7 @@ func (l *LoadBalancer) reportDial(t forwarder.Target, ok bool) {
 	h.report(t, ok, now)
 }
 
-// selectPlain is the pre-WP7 selection: the strategy over the whole pool,
+// selectPlain is the ordinary selection used without health signals: the strategy over the whole pool,
 // untouched by health. It is kept verbatim so "no target_health ⇒ behave
 // exactly as today" is a property of the code, not of a careful review.
 func (l *LoadBalancer) selectPlain() forwarder.Target {
@@ -546,7 +546,7 @@ func (l *LoadBalancer) selectPlain() forwarder.Target {
 	}
 }
 
-// selectHealthAware is the WP7 reordering. It returns the chosen target and
+// selectHealthAware is the health-aware reordering. It returns the chosen target and
 // whether this call ENTERED an "nothing is admissible" episode (the caller logs
 // that outside the locks).
 //
@@ -638,7 +638,7 @@ func (l *LoadBalancer) pickRankLocked(h *healthTable, rank int, eligibleOnly boo
 	case weighted:
 		// The cursor arithmetic mirrors selectPlain's weighted branch exactly
 		// (including the fact that it starts one slot in), so a health array
-		// that says nothing reproduces the pre-WP7 sequence instead of merely
+		// that says nothing reproduces the ordinary no-health sequence instead of merely
 		// the same distribution.
 		idx := atomic.AddUint64(&l.cursor, 1)
 		want = int(idx % uint64(total))

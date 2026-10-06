@@ -37,7 +37,7 @@ const (
 //
 // One second is deliberately much shorter than the panel's 30s lease TTL: this
 // is a fencing action, not housekeeping, and "possibly another owner" is the
-// thing V5.3 exists to prevent. The cost is one locked list of the running
+// split-brain activation this package exists to prevent. The cost is one locked list of the running
 // registry per second (no syscalls, no network) — and the benefit is that no
 // apply/remove/restore path has to remember to re-arm a timer. The sweep READS
 // the truth each tick, which is the same reason the LKG cache has a ticker.
@@ -289,7 +289,7 @@ func (g *Guard) Admit(cfg forwarder.TunnelConfig) error {
 	rawExpiry := strings.TrimSpace(cfg.LeaseExpiresAt)
 
 	// No ownership statement at all: an older panel. Behave exactly as before
-	// V5.3 — no fence decision, no clock, no tracking.
+	// No ownership facts means no fence decision, no lease clock, and no tracking.
 	if epoch <= 0 && rawExpiry == "" {
 		return nil
 	}

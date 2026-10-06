@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// V5.3-WP9: the panel extends the placement lease when a node reports that it
+// The panel extends the placement lease when a node reports that it
 // still serves a tunnel, and hands the refreshed deadline BACK in the answer to
 // that very report. If the agent ignores the answer, every tunnel stops one TTL
 // after its last config — a self-inflicted outage on a healthy node. These tests

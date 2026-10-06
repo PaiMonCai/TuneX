@@ -59,9 +59,9 @@ jobs:
             agent=true
             ops=true
           else
-            backend="$(match '^(backend/|shared/|scripts/v3-e2e/|Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env\.production\.example$)')"
+            backend="$(match '^(backend/|shared/|scripts/integration/|Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env\.production\.example$)')"
             web="$(match '^(web/|shared/|Dockerfile$)')"
-            agent="$(match '^(agent/|shared/|scripts/v3-e2e/)')"
+            agent="$(match '^(agent/|shared/|scripts/integration/)')"
             ops="$(match '^(scripts/ops/|Dockerfile$|backend/Dockerfile$|agent/Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env(\.production)?\.example$|docs/production-deploy\.md$)')"
           fi
 

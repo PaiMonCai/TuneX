@@ -14,7 +14,7 @@ import (
 // empty; the connection is dropped instead of dangling.
 var errNoTarget = errors.New("forwarder: egress target pool is empty")
 
-// TargetStats is one target's observable health (WP5 DoD "target fail 可观测").
+// TargetStats is one target's observable health.
 // It answers the two questions an operator actually asks: has this target ever
 // worked (DialOK > 0), and is it broken *now* (DialFailed climbing with a
 // recent LastErrAt). Bytes shows whether a working target also gets traffic,
@@ -193,13 +193,13 @@ func (c *measuredConn) Close() error {
 //
 // The selector is the hot-update seam. Replacing targets through
 // manager.EgressManager changes what the balancer returns without touching this
-// listener, so existing connections are never interrupted (devmap §5.3).
+// listener, so existing connections are never interrupted.
 type EgressForwarder struct {
 	pipeTracker
 	sel    TargetSelector
 	health *targetHealth
 	// dial is the upstream dialer. The default is Go's own, with the stream
-	// dial timeout — i.e. exactly what this forwarder did before V5.3-WP8. The
+	// dial timeout — i.e. the default behavior when no resolver is injected. The
 	// runtime injects a resolver-backed dialer so target names are resolved with
 	// a TTL cache and a stale fallback instead of once per connection.
 	dial DialFunc
@@ -207,10 +207,10 @@ type EgressForwarder struct {
 
 // EgressOptions are the injections an egress forwarder accepts.
 type EgressOptions struct {
-	// Observer is notified when a target fails to dial (WP5). Nil is a no-op.
+	// Observer is notified when a target fails to dial. Nil is a no-op.
 	Observer TargetObserver
 	// Dial overrides the upstream dialer. Nil = a net.Dialer with the stream
-	// dial timeout, which is the pre-WP8 behaviour.
+	// dial timeout, which is the default resolver behaviour.
 	Dial DialFunc
 }
 
@@ -221,7 +221,7 @@ func NewEgress(cfg TunnelConfig, sel TargetSelector) (*EgressForwarder, error) {
 }
 
 // NewEgressWithHealth is NewEgress plus an observer notified whenever a target
-// fails to dial (the WP5 "target fail 可观测" requirement). obs may be nil.
+// fails to dial for target-health observability. obs may be nil.
 //
 // The ledger is kept either way, so TargetStats() is usable on every egress
 // forwarder: a silent target is visible even when nobody wired a logger.
@@ -242,7 +242,7 @@ func NewEgressWithOptions(cfg TunnelConfig, sel TargetSelector, opts EgressOptio
 	}
 	dial := opts.Dial
 	if dial == nil {
-		// The timeout is the same one the pre-V5.3 code used through
+		// The timeout is the same one the default dial path uses through
 		// net.DialTimeout, so an uninjected runtime dials exactly as before.
 		dialer := &net.Dialer{Timeout: dialTimeout}
 		dial = dialer.DialContext
@@ -275,12 +275,12 @@ func (f *EgressForwarder) Start() error {
 		raw, err := dial(dialCtx, "tcp", addr)
 		cancel()
 		health.recordDial(t, time.Since(start), err)
-		// V5.2-WP7: hand the outcome back to the selector when it asks for it.
+		// Hand the outcome back to the health-aware selector when it asks for it.
 		// The selector may be running a circuit breaker, and a half-open probe
 		// can only be resolved by a real connection result — there is no other
 		// honest source. A selector without this capability is simply never
 		// told, which is why the assertion is optional and the call sits after
-		// the ledger (WP5's record is unconditional; WP7's feedback is not).
+		// the ledger (recording is unconditional; selector feedback is optional).
 		if reporter, ok := sel.(TargetReporter); ok {
 			reporter.ReportDial(t, err == nil)
 		}
@@ -308,7 +308,7 @@ func (f *EgressForwarder) Running() bool { return f.pipeTracker.running() }
 
 // SetUpstream always returns ErrUpstreamNotSwappable: an EGRESS tunnel's
 // upstream is a whole pool owned by manager.EgressManager, and the hot path
-// that retargets it is Pool.SwapTargets (devmap §5.3 "Target snapshot hot
+// that retargets it is Pool.SwapTargets (target snapshot hot
 // update"). Accepting an address here would silently drop the balancer and
 // turn every new connection onto one target the pool never chose.
 func (f *EgressForwarder) SetUpstream(addr string) error {

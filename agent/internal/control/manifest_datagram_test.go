@@ -6,7 +6,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// V5.1b WP5-B1 — the capability manifest is DERIVED, never hand-written.
+// The capability manifest is derived from implemented datagram support, never hand-written.
 //
 // Opening the datagram runtime in the forwarder's protocol table is therefore the
 // whole change on this side: nobody edits a protocol list here, and that is the

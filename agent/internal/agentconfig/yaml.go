@@ -39,7 +39,7 @@ func applyYAML(cfg *Config, text string) {
 		if val == "" {
 			continue
 		}
-		// A trailing "- item" list block belongs to a previous key; the v3
+		// A trailing "- item" list block belongs to a previous key; the current
 		// config is flat with no list values, so these lines carry nothing.
 		if strings.HasPrefix(strings.TrimSpace(line), "- ") {
 			continue

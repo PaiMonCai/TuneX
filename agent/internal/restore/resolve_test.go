@@ -296,7 +296,7 @@ func TestReconcileRemovesOnlyAbsentRuntime(t *testing.T) {
 	}
 }
 
-// An empty running registry is written as a tombstone (v4 audit fix).
+// An empty running registry is written as a tombstone.
 //
 // The old expectation here ("nothing running means nothing to cache") was the bug:
 // after removing the last forward the cache kept describing it, and a panel outage
@@ -467,11 +467,11 @@ func TestConcurrentCacheWritesStayValid(t *testing.T) {
 	}
 }
 
-// V5.2 WP7 —— 快照里的健康必须被安装，否则**每次 Agent 重启都会关掉熔断器**。
+// 快照里的健康必须被安装，否则**每次 Agent 重启都会关掉熔断器**。
 //
-// V5-G2 抓到过这个：恢复路径只装了 targets，于是重启后的节点把连接继续五五开送到
+// 回归场景：恢复路径如果只装 targets，重启后的节点会继续把连接五五开送到
 // 面板判定为 unhealthy 的目标上。这不是"少个字段"，是同一个事实有两条入口、只补了
-// 一条 —— V5.1 里协议、证书路径各踩过一次。
+// 一条；协议、证书路径同样必须在两条恢复入口保持一致。
 func TestRestoreInstallsHealthFromTheSnapshot(t *testing.T) {
 	// 这条断言在 manager 侧已经由 SetPoolAndHealth 的用例覆盖；这里守的是**调用方
 	// 必须走那条路**：一旦 restore 退回 SetPool，重启就会静默丢掉健康信号。
@@ -488,9 +488,9 @@ func TestRestoreInstallsHealthFromTheSnapshot(t *testing.T) {
 	}
 }
 
-// V5.2 WP7 —— 快照解码器必须认识 `target_health`。
+// 快照解码器必须认识 `target_health`。
 //
-// 这是 V5 里第三次"新事实有两条入口、只补了一条"（先是协议，然后证书路径，现在是健康）。
+// 新事实有两条入口时必须同时补齐（协议、证书路径、健康都遵循这一规则）。
 // 解码器丢掉这个字段的症状特别隐蔽：Agent 每次重启都从快照重建 runtime，健康静默消失，
 // 熔断器失效，而客户端连接只是"有时候失败"——看起来像网络抖动，不像配置问题。
 func TestSnapshotDecoderKnowsTargetHealth(t *testing.T) {
@@ -512,7 +512,7 @@ func TestSnapshotDecoderKnowsTargetHealth(t *testing.T) {
 	}
 }
 
-// V5.4 —— 裁剪必须同时覆盖**出口侧**的 runtime。
+// 裁剪必须同时覆盖**出口侧**的 runtime。
 //
 // 实测缺陷：`Reconcile` 只遍历 `TunnelManager.IDs()`，而在纯出口节点上那个集合是空的
 // （出口 runtime 活在 `EgressManager` 的池表里）⇒ 一条在节点离线期间被删除的 Forward，

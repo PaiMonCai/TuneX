@@ -1,5 +1,5 @@
 // Package selfinfo collects the Agent's own bounded, credential-free facts
-// (V4-WP11C: the Agent half of Node diagnose and Support Bundle).
+// (the Agent half of Node diagnostics and Support Bundle collection).
 //
 // Why this exists as a separate package rather than "the panel already has the
 // state report": a state report is a *summary the agent chose to publish*, and it

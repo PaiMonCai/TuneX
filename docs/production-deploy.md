@@ -40,7 +40,7 @@ scripts/ops/alert.sh
 
 > **默认路径是这一节。** 下面 `2.1`–`2.5` 是**手动 fallback**：只在安装器前置不满足、或需要逐步审计时走。
 > 手动步骤的内容不在这里复制 —— 语义权威仍是本节的 §2.1–§2.5 与
-> `docs/v5-wp21-installer-and-docs-site-contract.md`（FROZEN-1…FROZEN-7 是安装器的唯一语义来源）。
+> 安装器行为以本手册与 `scripts/ops/install.sh` 的当前实现为准；两者必须同步更新。
 
 ```bash
 # 0) 前置：root、git、Docker Engine ≥ 24 + Compose v2。

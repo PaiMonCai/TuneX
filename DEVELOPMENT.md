@@ -1,6 +1,6 @@
 # TuneX 开发入口
 
-> 本文件只描述**当前怎么开发 TuneX**。V3/V4/V5/WP 的路线、交付记录、Gate 结果和旧契约已经归档到 [docs/history/](docs/history/)；它们用于解释历史兼容性，不再充当当前路线图。
+> 本文件只描述**当前怎么开发 TuneX**。当前代码、迁移、工程文档和 CI/Integration 是唯一工程真相。
 
 ## 当前目标
 
@@ -20,7 +20,6 @@ TuneX 当前阶段是 **V1 / Production Beta 产品化与维护性收口**。默
 - [docs/testing.md](docs/testing.md)：本地测试、Source CI、Integration；
 - [docs/release.md](docs/release.md)：候选镜像、完整验证、Release；
 - [docs/production-deploy.md](docs/production-deploy.md)：生产部署与运维；
-- [docs/history/README.md](docs/history/README.md)：旧 V3/V4/V5/WP 契约与证据。
 
 ## 开工前固定检查
 
@@ -33,7 +32,7 @@ TuneX 当前阶段是 **V1 / Production Beta 产品化与维护性收口**。默
 
 ## 代码组织方向
 
-长期按 domain 而不是历史 WP 划分。新代码不要再使用 `v4-`、`v5-`、`wp*` 作为产品模块名。
+长期按产品 domain 划分。新代码、测试和脚本使用领域职责命名，不使用阶段编号或里程碑标签作为模块名。
 历史测试和 migration 可保留原名；当前代码与当前文档应使用产品领域命名。
 
 ## 合并纪律
@@ -42,5 +41,3 @@ TuneX 当前阶段是 **V1 / Production Beta 产品化与维护性收口**。默
 - 结构重构与语义变化尽量分开；
 - CI 绿色不代表运行时安全，涉及真实拓扑的变化必须看 Integration；
 - `main` 是唯一基线，不在长期 feature branch 上继续堆叠下一轮工作。
-
-历史完整开发手册快照保存在 [docs/history/development-v4-v5.md](docs/history/development-v4-v5.md)。

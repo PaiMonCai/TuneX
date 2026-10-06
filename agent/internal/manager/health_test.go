@@ -92,7 +92,7 @@ func addrOf(t forwarder.Target) string { return t.Addr() }
 // the frozen preference order
 // ---------------------------------------------------------------------------
 
-// The WP7 order is a different question from WP6's severity order, and both are
+// The routing preference order is a different question from synthesis severity, and both are
 // load-bearing. This pins the mapping the agent uses to CHOOSE, not the panel's
 // order for merging observers' conclusions.
 func TestHealthRankIsTheFrozenWP7PreferenceOrder(t *testing.T) {
@@ -567,7 +567,7 @@ func TestForcedPicksAreObservableInThePoolSnapshot(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // A dispatch without `target_health` (an older panel) must behave exactly as it
-// did before WP7: no breaker, no reordering, no record — the same picks, in the
+// does without health input: no breaker, no reordering, no record — the same picks, in the
 // same order, as a balancer that has never heard of health.
 func TestNoHealthSignalBehavesExactlyAsBeforeTheMechanism(t *testing.T) {
 	for _, strategy := range []Strategy{RoundRobin, WeightedRoundRobin} {
@@ -585,7 +585,7 @@ func TestNoHealthSignalBehavesExactlyAsBeforeTheMechanism(t *testing.T) {
 				want := addrOf(plain.Select())
 				got := addrOf(pool.Select())
 				if got != want {
-					t.Fatalf("pick %d = %q, want %q (identical to the pre-WP7 balancer)", i, got, want)
+					t.Fatalf("pick %d = %q, want %q (identical to the no-health balancer)", i, got, want)
 				}
 				pool.ReportDial(targets[i%len(targets)], false)
 			}
@@ -730,11 +730,11 @@ func TestHealthIsScopedToThePoolThatReceivedIt(t *testing.T) {
 // the strongest assertion: telemetry never rewrites desired
 // ---------------------------------------------------------------------------
 
-// The whole WP7 mechanism runs — unhealthy, cooldown, probes, failures, the
+// The whole health-aware mechanism runs — unhealthy, cooldown, probes, failures, the
 // all-open fallback, payloads with extra and missing entries, garbage states —
 // and the desired target list must come out byte-identical. That is what
 // "telemetry never rewrites desired" means in practice, and it is asserted on
-// the exact accessor the WP5 observer enumerates from.
+// the exact accessor the target observer enumerates from.
 func TestHealthNeverRewritesDesiredTargets(t *testing.T) {
 	clk := newFakeClock()
 	em := NewEgressManager()
@@ -839,7 +839,7 @@ func TestHealthNeverRewritesDesiredTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(beforeDesired, afterDesired) {
-		t.Fatalf("the WP7 mechanism rewrote desired state:\n before %s\n after  %s", beforeDesired, afterDesired)
+		t.Fatalf("the health-aware mechanism rewrote desired state:\n before %s\n after  %s", beforeDesired, afterDesired)
 	}
 	afterPool, err := json.Marshal(p.Targets())
 	if err != nil {

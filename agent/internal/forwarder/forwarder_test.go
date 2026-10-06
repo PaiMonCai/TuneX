@@ -259,7 +259,7 @@ func TestTunnelConfigValidateModes(t *testing.T) {
 		c.IngressPort = 30000
 		c.RemoteHost = "10.0.0.1"
 		c.RemotePort = 443
-		// V5.1b made "udp" a supported protocol, so it can no longer stand in for
+		// "udp" is a supported protocol, so it can no longer stand in for
 		// "a protocol this binary does not implement". The assertion is unchanged
 		// — an unimplemented protocol must not silently run over TCP.
 		c.Protocol = "quic"
@@ -276,7 +276,7 @@ func TestTunnelConfigValidateModes(t *testing.T) {
 		c.RemotePort = 3040
 		c.Protocol = "udp"
 		if err := c.Validate(); err != nil {
-			t.Fatalf("udp DIRECT must validate since V5.1b: %v", err)
+			t.Fatalf("udp DIRECT must validate: %v", err)
 		}
 	})
 
@@ -310,7 +310,7 @@ func TestTunnelModeAndStrategyParsing(t *testing.T) {
 		}
 	}
 	if _, err := ParseLBStrategy("least_conn"); err == nil {
-		t.Fatal("WP4 ships round/rand only; unknown strategies must be reported")
+		t.Fatal("only round/rand are supported; unknown strategies must be reported")
 	}
 }
 
@@ -890,7 +890,7 @@ func TestSingleHopRelayForwardsToNextHop(t *testing.T) {
 	}
 }
 
-// TestSingleHopForwarderRejectsEgressConfig pins the one boundary WP15 left:
+// TestSingleHopForwarderRejectsEgressConfig pins the stream-runtime boundary:
 // the one-hop implementation covers DIRECT and RELAY, and must refuse an
 // EGRESS config (that mode has its own forwarder and its own semantics).
 func TestSingleHopForwarderRejectsEgressConfig(t *testing.T) {
@@ -908,7 +908,7 @@ func TestSingleHopForwarderRejectsEgressConfig(t *testing.T) {
 	}
 }
 
-// TestDirectAndRelayShareOneImplementation is the WP15 DoD "同一套 v3 runtime
+// TestDirectAndRelayShareOneImplementation verifies that one stream runtime
 // 同时承载 DIRECT 与 RELAY" at the forwarder level: both modes build the same
 // type, so there is no second implementation to keep in sync (or to fall back
 // to). The distinction is only where UpstreamAddr() points.
@@ -1170,7 +1170,7 @@ func TestPipeTrackerDrainsOnStop(t *testing.T) {
 	}
 }
 
-// V4-WP11B regression: a tunnel with no targets of its own (every RELAY ingress
+// Regression: a tunnel with no targets of its own (every RELAY ingress
 // tunnel) must not serialize `targets` as JSON null. The panel tolerates the
 // absent key, but it rejected the null — which silently killed the state report
 // (and with it telemetry/health) for exactly those nodes.

@@ -1,6 +1,6 @@
-// Datagram relay ingress runtime — V5.1b WP5-B2 (UDP RELAY, ingress side).
+// Datagram relay ingress runtime — UDP RELAY ingress side.
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md §9.1 (frozen 2026-10-05) and
+// The datagram relay contract defines the hop framing and ingress semantics;
 // §12. This is the half that carries CLIENT mappings across the hop:
 //
 //	client ══UDP══> ingress listener (this file) ──[hop header + payload]──> egress
@@ -545,7 +545,7 @@ func (r *DatagramRelay) LiveMappings() int {
 // compiled guard: the relay must satisfy the datagram runtime contract.
 var _ DatagramRuntime = (*DatagramRelay)(nil)
 
-// compiled guard (V5-WP5-A3): the manager collects per-tunnel facts by asking for
+// compiled diagnostics guard: the manager collects per-tunnel facts by asking for
 // this interface, so a runtime that does not implement it reports NOTHING — the
 // tunnel looks healthy and invisible at the same time. The DIRECT runtime has had
 // this assertion since B1; the relay half gets it with its facts.
@@ -553,7 +553,7 @@ var _ Diagnostician = (*DatagramRelay)(nil)
 
 // ProtocolDiagnostics reports this tunnel's frozen datagram facts (§6.1).
 //
-// The names are a WIRE contract (V5-G1B reads them, the panel stores the object
+// The names are a wire contract (the panel stores the object
 // as-is), so they are not free to be renamed — and there is deliberately no
 // connection count: a datagram front counts mappings.
 func (r *DatagramRelay) ProtocolDiagnostics() (ProtocolDiagnostics, bool) {

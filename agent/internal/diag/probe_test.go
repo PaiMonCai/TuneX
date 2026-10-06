@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// The probe is the only privileged surface WP11C adds, so its bounds and its
+// The probe is a privileged diagnostic surface, so its bounds and its
 // vocabulary are what the tests pin: caps are enforced, every failure shape has
 // a distinct machine-readable status, and a single unreachable endpoint is a
 // result rather than an error.

@@ -51,11 +51,11 @@ PR 根据变更 surface 运行 Backend、Web、Agent、Ops 与 secret scan。当
 `main` 除 Source CI 外还负责：
 
 - 历史数据库升级回放；
-- 必要 race / compatibility Gate；
+- 必要 race / compatibility 验证；
 - 构建 Unified / Agent 候选镜像；
 - 按不可变 digest 运行完整 Integration；
 - 生成 Release 所需资格证据。
 
-## 历史 Gate
+## Integration 入口
 
-V3/V4/V5 Gate 名称属于历史追溯标识。当前 workflow 只调用 `scripts/integration/` 的稳定入口；这些入口可委托给 `scripts/v3-e2e/` 中保留原名的 compatibility assets。当前/历史映射见 [`scripts/integration/README.md`](../scripts/integration/README.md)，历史背景见 [history/README.md](history/README.md)。
+当前自动化拓扑验证统一从 `scripts/integration/` 进入。该目录是唯一受支持的 Integration 脚本入口；workflow、文档与人工排障都不依赖阶段编号或旧里程碑脚本名。

@@ -1,6 +1,6 @@
-// Datagram (UDP) ingress runtime — V5.1b WP5-B1, DIRECT only.
+// Datagram (UDP) ingress runtime — DIRECT mode.
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md (§1-§4, §6, §8). Read that
+// The datagram contract defines mapping identity, bounds, and shutdown semantics. Read that
 // document before changing anything here; the short version is:
 //
 //	client ══ UDP ══> ingress socket ── mapping(client addr) ──> target (UDP)
@@ -17,7 +17,7 @@
 // forcing a datagram through it would require inventing connections that do not
 // exist. What is shared is everything the manager owns — one registry, one
 // revision ledger, one port guard — plus the A3 diagnostics channel and the
-// WP11A shutdown primitives, which this type implements honestly (see
+// graceful-shutdown primitives, which this type implements honestly (see
 // CloseListener and Shutdown).
 package forwarder
 
@@ -123,7 +123,7 @@ type datagramMapping struct {
 
 // DatagramForwarder is the datagram runtime for one DIRECT tunnel.
 //
-// It implements DatagramRuntime, Diagnostician (V5-WP5-A3), Shutdowner and
+// It implements DatagramRuntime, Diagnostician, Shutdowner and
 // ListenerCloser, but NOT StreamRuntime: Drain and SetUpstream are stream-only
 // notions and are deliberately absent, so no caller can mistake this for a
 // runtime whose connections could be drained (§4.1).
@@ -131,7 +131,7 @@ type DatagramForwarder struct {
 	cfg  TunnelConfig
 	opts DatagramOptions
 
-	// diag is this tunnel's protocol diagnostics (V5-WP5-A3). It is the single
+	// diag is this tunnel's protocol diagnostics. It is the single
 	// ledger behind both Stats() and the state report's diag object.
 	diag *diagRecorder
 
@@ -435,7 +435,7 @@ func (d *DatagramForwarder) Shutdown(timeout time.Duration) ShutdownResult {
 	return result
 }
 
-// ProtocolDiagnostics implements Diagnostician (V5-WP5-A3) for a datagram front.
+// ProtocolDiagnostics implements Diagnostician for a datagram front.
 //
 // Two facts are filled here rather than by the recorder, because neither is a
 // counter: the live mapping count lives in the runtime's locked table, and the

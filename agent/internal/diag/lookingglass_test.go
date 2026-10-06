@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// V5-WP19-D Agent 侧边界测试。
+// Agent 侧 Looking Glass 边界测试。
 //
 // 这里钉的不是"探测能不能成功"，而是**它能不能被用来扫内网**：
 //   · 同一张地址向量表（与面板侧 `d-looking-glass.test.ts` 逐条对应）；
@@ -21,7 +21,7 @@ import (
 
 // lookingGlassVectors 是"地址 → 允许/拒绝"的共享向量表。
 //
-// 与 TypeScript 侧的同一张表逐条对应（`v5-wp19/d-looking-glass.test.ts`）。
+// 与控制面同一组地址安全边界逐条对应。
 // 只断言 allow/deny 这一位：两侧用不同的解析器（Go `netip` vs TS 自己的解析器），
 // 断言"拒绝理由文案"会把两边绑死，而**安全性质**只需要这一位一致。
 var lookingGlassVectors = []struct {

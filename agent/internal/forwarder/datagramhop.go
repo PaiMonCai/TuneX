@@ -1,7 +1,7 @@
-// Datagram hop framing — V5.1b WP5-B2 (UDP RELAY).
+// Datagram hop framing for UDP RELAY.
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md §9.1 (frozen 2026-10-05) and
-// §12 (WP5-B2 spec). Read §9.1 before changing anything here. The shape it
+// The relay wire contract defines this framing;
+// read the framing contract before changing anything here. The shape it
 // freezes, and the reasons each field exists:
 //
 //	client ══UDP══> ingress ──[16-byte hop header + payload]──> egress ──> target
@@ -67,7 +67,7 @@ const (
 	// comment for the DIRECT path).
 	//
 	// It covers EDNS0 (1232) and the common case; QUIC-sized payloads need the
-	// fragmentation work that contract §9.1 defers to WP5-B3.
+	// fragmentation work that the current contract deliberately defers.
 	datagramHopMaxPayload = datagramHopMTU - datagramHopHeaderSize
 
 	// datagramHopVersion is the framing version. A version this binary does not

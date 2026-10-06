@@ -107,7 +107,7 @@ type StatePayload struct {
 	/// Newest failure time, unix seconds (0 = never).
 	LastErrorAt int64 `json:"last_error_at,omitempty"`
 
-	// ── V4-WP11B control-protocol negotiation ──────────────────────────
+	// ── control-protocol negotiation ────────────────────────────────────
 	//
 	// Both are omitted when unset: the panel must be able to tell "this agent
 	// implements X" from "this agent never told me", and a zero-value int would
@@ -116,12 +116,12 @@ type StatePayload struct {
 	ControlProtocolVersion int `json:"control_protocol_version,omitempty"`
 	/// Actions this agent actually implements (empty = not configured).
 	Capabilities []string `json:"capabilities,omitempty"`
-	/// V5-WP1 protocol/transport/runtime facts, additive to Capabilities. The
+	// Protocol/transport/runtime facts, additive to Capabilities. The
 	/// panel needs it to distinguish "this node can carry this protocol" from
 	/// "this node never told me", without changing the array above.
 	CapabilityManifest *CapabilityManifest `json:"capability_manifest,omitempty"`
 
-	// ── V5.2-WP5 target observation (DEVELOPMENT.md §7) ─────────────────
+	// ── target observation ───────────────────────────────────────────────
 	//
 	// The observation facts of the targets THIS node serves, one entry per
 	// (node, target). They ride the existing state report as a new top-level
@@ -135,7 +135,7 @@ type StatePayload struct {
 	TargetObservations []targetobs.Observation `json:"target_observations,omitempty"`
 }
 
-// CapabilityManifest is the v2 capability fact set on the wire (V5-WP1).
+// CapabilityManifest is the v2 capability fact set on the wire.
 //
 // It deliberately mirrors control.Manifest structurally instead of importing
 // it: the reporter must stay free of control-plane packages, and the wire shape
@@ -151,12 +151,12 @@ type CapabilityManifest struct {
 
 // ReportedTunnel is one running tunnel as it travels on the state report: the
 // configuration it was applied with, plus the protocol-specific diagnostics of
-// the runtime that is actually serving it (V5-WP5-A3).
+// the runtime that is actually serving it.
 //
 // The config is EMBEDDED, so the JSON is byte-for-byte what it was before this
 // field existed — an older panel reads exactly the shape it always did, and the
 // diagnostics are simply absent. That is the same additive rule every other
-// control-protocol change in V5 followed.
+// later control-protocol changes followed.
 type ReportedTunnel struct {
 	forwarder.TunnelConfig
 	// Diag is present only when the tunnel's protocol HAS protocol-specific
@@ -172,7 +172,7 @@ type DiagnosticsLister interface {
 	DiagnosticsByTunnel() map[string]forwarder.ProtocolDiagnostics
 }
 
-// TargetObservationLister reports the V5.2-WP5 observation facts of the targets
+// TargetObservationLister reports observation facts of the targets
 // this node serves.
 //
 // It is an interface for the same decoupling reason as DiagnosticsLister: the
@@ -256,7 +256,7 @@ type (
 )
 
 // WithProtocol advertises the control-contract version and the actions this
-// agent implements (WP11B). It is an option like the telemetry sources: the
+// Agent implements. It is an option like the telemetry sources: the
 // reporter stays decoupled from the control package.
 func WithProtocol(version int, capabilities []string) Option {
 	return func(c *Config) {
@@ -266,14 +266,14 @@ func WithProtocol(version int, capabilities []string) Option {
 }
 
 // WithDiagnostics attaches the source of per-tunnel protocol diagnostics
-// (V5-WP5-A3). Omitted = the report carries no diagnostics at all, which is what
+// Omitted = the report carries no diagnostics at all, which is what
 // an agent without any protocol front should send.
 func WithDiagnostics(lister DiagnosticsLister) Option {
 	return func(c *Config) { c.diagnostics = lister }
 }
 
 // LeaseSink receives the ownership facts a state report's answer carries
-// (V5.3-WP9). Implemented by the ownership guard; declared here so the reporter
+// Implemented by the ownership guard; declared here so the reporter
 // never imports the enforcement side.
 //
 // ObserveLeases is called on the reporting goroutine and must not block: the
@@ -283,12 +283,12 @@ type LeaseSink interface {
 }
 
 // WithLeases attaches the lease sink that consumes the state report's answer.
-// Omitted = the answer's `leases` are ignored, which is the pre-V5.3 behaviour.
+// Omitted = the answer's `leases` are ignored, which is the unfenced behaviour.
 func WithLeases(sink LeaseSink) Option {
 	return func(c *Config) { c.leases = sink }
 }
 
-// WithTargetObservations attaches the V5.2-WP5 target observer. Omitted = the
+// WithTargetObservations attaches the target observer. Omitted = the
 // report carries no `target_observations` key, which the panel reads as
 // "unknown", exactly like an older agent.
 //
@@ -328,11 +328,11 @@ func configsOf(tunnels []ReportedTunnel) []forwarder.TunnelConfig {
 	return out
 }
 
-// WithManifest advertises the V5-WP1 capability manifest (protocols,
+// WithManifest advertises the capability manifest (protocols,
 // transports, runtime features, diagnostics).
 //
 // A nil manifest is stored as "not configured" and the field stays off the wire
-// — which the panel reads as the V4 baseline, not as "supports nothing". Passing
+// — which the panel reads as the action-only baseline, not as "supports nothing". Passing
 // an empty manifest is different and meaningful: it says this agent implements
 // nothing beyond the protocol-frozen baseline, and the panel will fail closed.
 func WithManifest(manifest *CapabilityManifest) Option {
@@ -376,24 +376,24 @@ type Config struct {
 	revision RevisionLister
 	lastErr  ErrorLister
 
-	// WP11B: control-protocol negotiation facts, injected by the runtime so the
+	// Control-protocol negotiation facts, injected by the runtime so the
 	// reporter does not have to import the control package.
 	controlPortocolVersion int
 	capabilities           []string
-	// V5-WP1: the additive v2 manifest. nil = this build does not advertise one,
+	// The additive v2 manifest. nil = this build does not advertise one,
 	// and the wire field is omitted rather than sent empty.
 	capabilityManifest *CapabilityManifest
 
-	// V5-WP5-A3: per-tunnel protocol diagnostics. nil = this agent reports none.
+	// Per-tunnel protocol diagnostics. nil = this agent reports none.
 	diagnostics DiagnosticsLister
 
-	// V5.2-WP5: the target observer's facts. nil = this agent does not observe
+	// Target observer facts. nil = this agent does not observe
 	// targets (or has nothing to observe), and `target_observations` stays off
 	// the wire rather than being sent as an empty array that would read as
 	// "no problems found".
 	targetObs TargetObservationLister
 
-	// V5.3-WP9: the ownership facts the panel returns in the state report's
+	// Ownership facts the panel returns in the state report's
 	// answer. nil = this node tracks no leases (nothing to renew, nothing to
 	// expire) — which is also how it behaves with an older panel.
 	leases LeaseSink
@@ -461,29 +461,29 @@ func WithPost(fn func(ctx context.Context, url string, body []byte, headers map[
 
 // WithPostResponse replaces the HTTP transport with the shape that can also read
 // what the panel answered. The state report's response carries the ownership
-// leases this node may keep serving under (V5.3 WP9), so discarding bodies is
+// leases this node may keep serving under, so discarding bodies is
 // no longer equivalent to ignoring them.
 func WithPostResponse(fn func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error)) Option {
 	return func(c *Config) { c.post = fn }
 }
 
-// WithPorts sets the used-port source for the WP7 state report.
+// WithPorts sets the used-port source for the state report.
 func WithPorts(p PortLister) Option { return func(c *Config) { c.ports = p } }
 
-// WithRevision sets the applied-revision source for the WP7 state report.
+// WithRevision sets the applied-revision source for the state report.
 func WithRevision(rev RevisionLister) Option { return func(c *Config) { c.revision = rev } }
 
-// WithLastError sets the error source for the WP7 state report.
+// WithLastError sets the error source for the state report.
 func WithLastError(e ErrorLister) Option { return func(c *Config) { c.lastErr = e } }
 
 // WithClock replaces the clock (tests).
 func WithNow(now func() time.Time) Option { return func(c *Config) { c.now = now } }
 
-// WithHost sets the host identity/resource sampler (V4-WP6).
+// WithHost sets the host identity/resource sampler.
 func WithHost(h HostSampler) Option { return func(c *Config) { c.host = h } }
 
 // WithLedger shares the apply/runtime error ledger with the reporter, so the
-// control loop's failures show up in the state report (V4-WP6 §13.4.4
+// control loop's failures show up in the state report (
 // "最近 runtime/apply error").
 func WithLedger(l *Ledger) Option { return func(c *Config) { c.ledger = l } }
 
@@ -540,7 +540,7 @@ func (r *Reporter) Payload() Payload {
 	return p
 }
 
-// StatePayload builds the WP7 state-report body. It is the heartbeat superset:
+// StatePayload builds the state-report body. It is the heartbeat superset:
 // same tunnel/pool data plus the ports actually bound, the newest applied
 // revision and the last error string. Version/Role come from config, not from
 // the payload — the panel pins them to the credential's node (the agent never
@@ -551,7 +551,7 @@ func (r *Reporter) StatePayload() StatePayload {
 		Version: r.cfg.Version,
 		Role:    r.cfg.Role,
 	}
-	// WP11B: only advertise when configured. Leaving both fields out keeps
+	// Only advertise negotiation facts when configured. Leaving both fields out keeps
 	// "never told the panel" distinguishable from "supports nothing".
 	if r.cfg.controlPortocolVersion > 0 {
 		p.ControlProtocolVersion = r.cfg.controlPortocolVersion
@@ -586,7 +586,7 @@ func (r *Reporter) StatePayload() StatePayload {
 	if r.cfg.lastErr != nil {
 		p.LastErr = r.cfg.lastErr.LastError()
 	}
-	// V5.2-WP5: the observer's facts are pulled, never pushed. Reading them
+	// The observer's facts are pulled, never pushed. Reading them
 	// cannot fail and cannot block on a probe (the observer's state is an
 	// in-memory snapshot), so a broken target, a slow target or a broken
 	// observer can never keep the report — or the node — from being sent.
@@ -614,7 +614,7 @@ func copyObservations(in []targetobs.Observation) []targetobs.Observation {
 //
 // Note the ordering discipline for errors: the *ledger* wins over the legacy
 // single-string source when both are wired, because the ledger also carries the
-// count and the failure time. `lastErr` (WP7 shape) stays as the fallback so an
+// count and the failure time. `lastErr` stays as the fallback so an
 // agent that only has that source keeps reporting a message.
 func (r *Reporter) fillTelemetry(p *StatePayload) {
 	if r.cfg.host != nil {
@@ -643,7 +643,7 @@ func (r *Reporter) fillTelemetry(p *StatePayload) {
 		// the newest message *and* the counters, while the legacy lastErr source
 		// is a single string with no notion of when it happened. An empty ledger
 		// leaves the legacy message in place (a node whose only error source is
-		// WP7's LastErrorLister still reports it).
+		// the fallback LastErrorLister still reports it).
 		if st.LastMessage != "" {
 			p.LastErr = st.LastMessage
 		}
@@ -733,7 +733,7 @@ func (r *Reporter) send(ctx context.Context) {
 	_, _ = r.cfg.post(ctx, r.Endpoint(), body, nil)
 }
 
-// sendState posts one WP7 state report (best effort, same reasoning as send).
+// sendState posts one state report (best effort, same reasoning as send).
 //
 // Rejected credentials (401) are the one failure worth mentioning to the
 // operator: the node is alive and healthy but can no longer identify itself,
@@ -766,7 +766,7 @@ func (r *Reporter) sendState(ctx context.Context) {
 // an empty list and an unparseable body all mean "the panel told us nothing
 // about ownership", which is exactly how an older panel behaves.
 //
-// This is the renewal channel V5.3 WP9 depends on (see WithLeases): the panel
+// This is the placement-lease renewal channel (see WithLeases): the panel
 // extends the lease row when a node reports it still serves a tunnel, and the
 // refreshed deadline must come BACK, or a healthy node stops every tunnel one
 // TTL after its last config.
@@ -845,7 +845,7 @@ var errRejected = errors.New("reporter: credential rejected")
 func isCredentialRejected(err error) bool { return errors.Is(err, errRejected) }
 
 // ReportOnce sends one state report synchronously and reports whether it was
-// accepted. It exists for shutdown (WP11A): the last thing a node says should be
+// accepted. It exists for graceful shutdown: the last thing a node says should be
 // what it actually did while closing listeners, and Run's ticker cannot be
 // relied on once the process is on its way out.
 //

@@ -1,6 +1,6 @@
-// Datagram egress runtime — V5.1b WP5-B2 (UDP RELAY, exit side).
+// Datagram egress runtime — UDP RELAY exit side.
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md §9.1 (frozen 2026-10-05) and
+// The datagram relay contract defines the hop framing and exit semantics;
 // §12. The exit half of a datagram relay:
 //
 //	ingress ──[16-byte hop header + payload]──> egress listener (this file) ──> target

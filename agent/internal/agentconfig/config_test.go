@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// The legacy flags were removed with the legacy data plane. A WP15 regression
+// The retired data-plane flags must stay rejected. A regression
 // would silently reintroduce them, so pin their absence: parsing a legacy flag
 // must fail rather than be ignored.
 func TestParseRejectsRemovedLegacyFlags(t *testing.T) {
@@ -24,7 +24,7 @@ func TestParseRejectsRemovedLegacyFlags(t *testing.T) {
 	for _, args := range legacy {
 		_, err := Parse(args, "test")
 		if err == nil {
-			t.Errorf("Parse(%v) = nil error, want flag unknown (flag was removed in WP15)", args)
+			t.Errorf("Parse(%v) = nil error, want retired flag to remain unknown", args)
 		}
 	}
 }
@@ -142,7 +142,7 @@ node-credential: cred
 	}
 }
 
-// A pre-WP15 config file must still load: its legacy keys are ignored, not fatal.
+// An older config file must still load: retired keys are ignored, not fatal.
 func TestApplyYAMLIgnoresLegacyKeys(t *testing.T) {
 	cfg := &Config{}
 	applyYAML(cfg, `
@@ -155,7 +155,7 @@ pprof-port: 6060
 node-id: after-legacy
 `)
 	if cfg.NodeID != "after-legacy" {
-		t.Errorf("v3 key after legacy noise = %q", cfg.NodeID)
+		t.Errorf("node id after retired-key noise = %q", cfg.NodeID)
 	}
 }
 

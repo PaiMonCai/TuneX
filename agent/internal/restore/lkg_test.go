@@ -152,7 +152,7 @@ func TestLKGRefusesSymlink(t *testing.T) {
 // An empty runtime must never overwrite an existing cache: an empty node is
 // usually a transient, and the cache is the only copy of the truth left.
 // Empty and nil are different answers, and the difference is the fix for the
-// resurrection bug (v4 audit):
+// resurrection regression:
 //
 //	· an EMPTY snapshot means "this node runs nothing" and MUST be written, or the
 //	  cache keeps advertising the forward the user just removed;

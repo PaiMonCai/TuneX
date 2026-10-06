@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Protocol-specific diagnostics (V5-WP5-A3).
+// Protocol-specific diagnostics.
 //
 // TCP has nothing protocol-specific to say about a healthy tunnel: bytes moved,
 // or they did not. TLS and WebSocket do, and the two facts an operator actually
@@ -63,7 +63,7 @@ type ProtocolDiagnostics struct {
 
 	// ── udp (datagram) only ──
 	//
-	// The names below are FROZEN as a wire contract (V5-G1B reads them, and the
+	// The names below are frozen as a wire contract (the
 	// panel stores the diag object as-is), so they are not free to be renamed:
 	//
 	//   mappings             live mappings right now
@@ -99,7 +99,7 @@ type ProtocolDiagnostics struct {
 	BytesOut           int64 `json:"bytes_out,omitempty"`
 
 	// HopLocalAddr is the RELAY ingress's own endpoint on the hop: `ip:port` of the
-	// socket it carries client mappings through (V5.1b WP5-B2).
+	// socket it carries client mappings through for datagram relay traffic.
 	//
 	// It exists because that address must be LEARNED, not dictated. The exit attests
 	// the paired ingress by address, and "the ingress node's address" is ambiguous the

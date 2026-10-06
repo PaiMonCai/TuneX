@@ -19,7 +19,7 @@ PR 必须通过适用的 Source CI；影响真实运行面的 PR 还必须通过
 
 ## Merge 后
 
-`main` 运行完整 Source CI，并执行 landed-main qualification。历史升级与较重的兼容 Gate 可以放在这一层，而不是拖慢所有 PR。
+`main` 运行完整 Source CI，并执行 landed-main qualification。历史数据库升级回放与较重的兼容验证可以放在这一层，而不是拖慢所有 PR。
 
 ## Promotion
 

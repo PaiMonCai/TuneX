@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// V5-WP5-A2 WebSocket front tests.
+// WebSocket front tests.
 //
 // The claim: a WS client's frame payloads become the tunnel's byte stream, and
 // everything else about the stream lifecycle is unchanged. So the tests cover

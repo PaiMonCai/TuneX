@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// V5-WP5-A3 protocol diagnostics tests.
+// Protocol diagnostics tests.
 //
 // The claim these must make good on: a protocol front reports FACTS about itself,
 // and those facts are (a) accurate, (b) bounded and safe to ship to the panel,

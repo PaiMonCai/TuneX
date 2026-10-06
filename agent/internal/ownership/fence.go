@@ -1,5 +1,5 @@
-// Package ownership is the agent half of V5.3 WP9 (multi-ingress HA / fencing,
-// DEVELOPMENT.md §8 "V5.3 冻结契约" 一、归属与租约).
+// Package ownership implements the Agent side of multi-ingress ownership,
+// fencing, and placement leases.
 //
 // It owns exactly two mechanisms, and nothing else:
 //
@@ -20,7 +20,7 @@
 //   - it never rewrites desired state. The epoch and the lease are panel facts
 //     *about* a tunnel, never a second version of what the tunnel is;
 //   - it never guesses an absent field. A config without ownership facts is an
-//     older panel and behaves exactly as it did before V5.3 (no refusal, no
+//     older panel and behaves as an unfenced assignment (no refusal, no
 //     tracking, no clock) — see forwarder.TunnelConfig's field comment;
 //   - it never stops a tunnel for any reason other than a lease the panel
 //     itself set and then stopped renewing.

@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// V5-WP5-A1 TLS stream runtime tests.
+// TLS stream runtime tests.
 //
 // The claim these tests have to make good on is "TLS is a stream runtime": the
 // listener is TLS, and EVERYTHING else — accept loop, per-connection pipe, port
@@ -336,7 +336,7 @@ func TestTLSDrainStopsAcceptingNewConnections(t *testing.T) {
 	}
 }
 
-// V5-G1A.6 — certificate rotation.
+// Certificate rotation regression.
 //
 // The first implementation read the certificate once, at listener build. That is
 // only correct until the operator rotates: a hot-reloadable tunnel never rebuilds

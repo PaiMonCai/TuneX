@@ -8,9 +8,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// V5.1b WP5-B2 — datagram EGRESS (the exit half of a UDP relay).
+// Datagram EGRESS (the exit half of a UDP relay).
 //
-// Contract: docs/v5-1b-datagram-contract-draft.md §9.1 (frozen 2026-10-05).
+// These tests pin the datagram relay exit contract.
 //
 // These are REAL-network tests for the same reason the DIRECT ones are: the
 // properties that matter here — "only the paired ingress may feed this exit",
