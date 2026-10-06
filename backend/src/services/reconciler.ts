@@ -199,7 +199,13 @@ export interface Drift {
 
 /** finding：记录但不自动执行（或已自动执行）的事实。 */
 export interface Finding {
-  code: DriftKind | "orphan_lease_released" | "retry_deferred" | "resend_skipped" | "lease_owner_unconfirmed";
+  code:
+    | DriftKind
+    | "orphan_lease_released"
+    | "retry_deferred"
+    | "resend_skipped"
+    | "lease_owner_unconfirmed"
+    | "subsystem_failed";
   severity: Severity;
   detail: string;
   tunnel_id?: number;
@@ -1000,7 +1006,16 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         log("[reconciler] federated forward health", { ...federatedHealth });
       }
     } catch (e) {
-      log("federated forward health failed", { detail: e instanceof Error ? e.message : String(e) });
+      const detail = e instanceof Error ? e.message : String(e);
+      failed++;
+      findings.push({
+        code: "subsystem_failed",
+        severity: "error",
+        detail: `联邦 Forward 健康收口失败：${detail}`,
+        auto_action: null,
+        suppressed: [],
+      });
+      log("federated forward health failed", { detail });
     }
   }
 
@@ -1021,8 +1036,9 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         });
       }
     } catch (e) {
+      failed++;
       findings.push({
-        code: "resend_skipped",
+        code: "subsystem_failed",
         severity: "error",
         detail: `租约回收失败：${(e as Error)?.message ?? String(e)}`,
         auto_action: null,
@@ -1053,9 +1069,18 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
         log("failover sweep", { moved: failoverSummary.moved, evaluated: failoverSummary.evaluated });
       }
     } catch (e) {
-      // 迁移评估失败绝不阻断本轮 reconcile：下一轮会自然重试，且失败本身已由
-      // 执行器的结构化结果记账（这里只保证不影响其它动作）。
-      log("failover sweep failed", { detail: e instanceof Error ? e.message : String(e) });
+      // 迁移评估失败绝不阻断本轮 reconcile，但也不能只写一条日志然后让
+      // summary.failed 继续显示 0；worker/告警层需要知道这一拍并未完整收敛。
+      const detail = e instanceof Error ? e.message : String(e);
+      failed++;
+      findings.push({
+        code: "subsystem_failed",
+        severity: "error",
+        detail: `failover 评估失败：${detail}`,
+        auto_action: null,
+        suppressed: [],
+      });
+      log("failover sweep failed", { detail });
     }
   }
 
