@@ -22,9 +22,23 @@
 #   scripts/ops/install.sh --check   install --version <git-sha>       # 只做前置检查（真实探测，零副作用）
 #
 # 选项：--allow-floating（配合 --version latest）、--standalone、--agent-image <ref>、
+#       --agent-version <x.y.z>（写 TUNEX_AGENT_LATEST_VERSION，见下）、
 #       --purge-data、--yes、--reuse-env（install 专用：仅在 .env 校验通过且 TUNEX_IMAGE 与请求版本
 #       一致时，允许复用"上次半途失败留下的 .env"）、--dry-run、--check、
 #       --no-docker（仅与 --dry-run/--check 合用）
+#
+# Agent 版本基线（TUNEX_AGENT_LATEST_VERSION）的写入语义 —— 三种取值不是一回事：
+#   · `--version` 是**镜像锚**（40 位 git sha 或镜像引用），它**不是** Agent 版本号。
+#     安装器**绝不**把 `--version` 的值写进该键：`--version` 与"节点上跑的 Agent 版本"
+#     之间没有任何可推导关系（发布的 Agent 镜像是否 stamp 版本由发布方决定）。
+#   · 只有显式 `--agent-version <x.y.z>` 才写入；不给就**不写**该键
+#     = 部署方「未声明」基线 = 面板不判定落后（这与"已是最新"是两件事，UI 也分开措辞）。
+#   · 形态 fail-closed：首段必须是数字（`0.14.0` / `v1.5.0` / `0.14.0-rc1` 可；
+#     git sha / `latest` / `unknown` 直接拒绝，退出码 2）。理由不是洁癖——
+#     `backend/src/services/node-health.ts:isVersionOlder` 对后几种取值只能返回 `null`
+#     （=「无法判定」），写进去等于让"落后判定"**永不触发**（面板永远只显示"无法判定"）。
+#     判定要拿 Agent **上报的** version 去比（`agent/main.go` 的 `version`，
+#     `node-health-service.ts` → `node-health.ts:synthesiseHealth`），所以两侧必须同口径。
 #
 # 退出码：2 用法/参数；3 非 root；4 平台或 Docker/Compose 不满足；5 缺必需命令/文件；
 #         6 同机 tunex 项目冲突；7 .env 校验不通过；8 已有部署（幂等拒绝，不再产生第二套副作用）；
@@ -69,6 +83,11 @@ TX_MIN_COMPOSE_STANDALONE="2.24.4"
 # 与 backend/src/services/node-upgrade.ts 的 IMAGE_REF_RE 同形（DoD 16 的派生副本；
 # 语义权威在 TS 侧，自检里的 parity 用例会把两者的结论逐条比对）。
 TX_IMAGE_REF_RE='^[A-Za-z0-9][A-Za-z0-9._-]*(:[0-9]{1,5})?(/[A-Za-z0-9][A-Za-z0-9._-]*)*(:[A-Za-z0-9][A-Za-z0-9._-]*)?(@sha256:[a-f0-9]{64})?$'
+
+# Agent **版本号**形态：与 backend/src/services/node-health.ts 的 `isVersionOlder` /
+# `parseVersionParts` 同口径（去前导 v、按 [.-+] 切段、**首段必须是数字**、`unknown` 与空不算）。
+# 语义权威在 TS 侧；这里的副本只用来**在写 .env 之前**挡住"不可比较的基线"这类取值。
+TX_AGENT_VERSION_RE='^[vV]?[0-9]+([.+-][A-Za-z0-9]+)*$'
 TX_ENV_REQUIRED_KEYS="AUTH_SECRET LICENSE_SECRET TUNEX_CONFIG_KEY TUNEX_LICENSE_KEY MYSQL_ROOT_PASSWORD DATABASE_URL SITE_URL TUNEX_IMAGE TUNEX_AGENT_IMAGE"
 TX_ENV_GENERATED_KEYS="AUTH_SECRET LICENSE_SECRET TUNEX_CONFIG_KEY TUNEX_LICENSE_KEY MYSQL_ROOT_PASSWORD"
 TX_ENV_PLACEHOLDER_RE='(change-me|changeme|replace-with)'
@@ -77,6 +96,7 @@ TX_ENV_PLACEHOLDER_RE='(change-me|changeme|replace-with)'
 TX_ACTION=""
 TX_VERSION=""
 TX_AGENT_IMAGE_OPT=""
+TX_AGENT_VERSION_OPT=""
 TX_ALLOW_FLOATING=0
 TX_STANDALONE=0
 TX_PURGE_DATA=0
@@ -151,6 +171,20 @@ tx_image_ref_valid() { # <ref> → 0 合法 / 1 非法（与 node-upgrade.ts val
 }
 
 tx_git_sha_valid() { printf '%s' "${1:-}" | grep -Eq '^[0-9a-f]{40}$'; }
+
+# Agent 版本基线是否**可比较**（= 面板能不能拿它去比上报版本）。
+# 与 TS 侧 isVersionOlder/parseVersionParts 同口径：去前导 v/V、按 [.-+] 切段、首段必须是数字；
+# `unknown`（大小写不敏感）、空、含空白、git sha、`latest` 一律**不可比较**。
+tx_agent_version_valid() { # <version> → 0 可比较 / 1 不可比较
+  local v="${1:-}"
+  [ -n "$v" ] || return 1
+  case "$v" in *[[:space:]]*) return 1 ;; esac
+  case "$v" in
+    [uU][nN][kK][nN][oO][wW][nN]) return 1 ;;
+  esac
+  printf '%s' "$v" | grep -Eq "$TX_AGENT_VERSION_RE" || return 1
+  return 0
+}
 
 # 幂等三态：容器数 > 0 → same/different；无容器但 .env 在 → partial；都没有 → none
 tx_classify_deploy_state() { # <has_env 0|1> <env_image> <container_count> <requested_image>
@@ -512,8 +546,10 @@ tx_env_generate() {
   [ -f "$TX_ENV_TEMPLATE" ] || tx_fail "$TX_E_ENV" "模板不存在：$TX_ENV_TEMPLATE"
   if [ "$TX_DRY_RUN" -eq 1 ]; then
     printf '[dry-run] %s\n' "$(tx_quote_cmd cp "$TX_ENV_TEMPLATE" "$TX_ENV_FILE")"
-    printf '[dry-run] 随机生成（值不回显）：%s；写入 TUNEX_IMAGE=%s / TUNEX_AGENT_IMAGE=%s；chmod 600 %s\n' \
-      "$TX_ENV_GENERATED_KEYS" "$TX_PANEL_IMAGE" "${TX_AGENT_IMAGE_RESOLVED:-<保持原值>}" "$TX_ENV_FILE"
+    printf '[dry-run] 随机生成（值不回显）：%s；写入 TUNEX_IMAGE=%s / TUNEX_AGENT_IMAGE=%s%s；chmod 600 %s\n' \
+      "$TX_ENV_GENERATED_KEYS" "$TX_PANEL_IMAGE" "${TX_AGENT_IMAGE_RESOLVED:-<保持原值>}" \
+      "${TX_AGENT_LATEST_VERSION_VALUE:+ / TUNEX_AGENT_LATEST_VERSION=$TX_AGENT_LATEST_VERSION_VALUE}" \
+      "$TX_ENV_FILE"
     return 0
   fi
   ( umask 077; cp "$TX_ENV_TEMPLATE" "$TX_ENV_FILE" )
@@ -642,13 +678,48 @@ tx_resolve_images() {
         *)
           tx_git_sha_valid "$v" || tx_fail "$TX_E_USAGE" \
             "--version 需要 40 位 git sha 或合法镜像引用：$v"
-          TX_PANEL_IMAGE="$TX_IMAGE_REPO:$v"; TX_AGENT_IMAGE_RESOLVED="$TX_AGENT_IMAGE_REPO:$v"; TX_AGENT_LATEST_VERSION_VALUE="$v" ;;
+          # 注意：**不**把 sha 写进 TUNEX_AGENT_LATEST_VERSION（见文件头"Agent 版本基线"）。
+          # sha 与 Agent 上报的 version 不可比较，写进去只会让"落后判定"永不触发。
+          TX_PANEL_IMAGE="$TX_IMAGE_REPO:$v"; TX_AGENT_IMAGE_RESOLVED="$TX_AGENT_IMAGE_REPO:$v" ;;
       esac ;;
   esac
   if [ -n "$TX_AGENT_IMAGE_OPT" ]; then
     tx_image_ref_valid "$TX_AGENT_IMAGE_OPT" || tx_fail "$TX_E_USAGE" "--agent-image 不是合法镜像引用：$TX_AGENT_IMAGE_OPT"
     TX_AGENT_IMAGE_RESOLVED="$(tx_image_ref_trim "$TX_AGENT_IMAGE_OPT")"
   fi
+  tx_resolve_agent_baseline
+}
+
+# Agent 版本基线（TUNEX_AGENT_LATEST_VERSION）：**只有调用者知道**"最新 Agent 是哪个版本"
+# （仓库里没有权威版本常量；发布的 Agent 镜像是否被 stamp 版本由发布方决定），所以只能显式传。
+# 三种结果，互不冒充：
+#   · 给了合法版本号 ⇒ 写入该键（面板可以判定"落后"）；
+#   · 没给             ⇒ **不写**（= 未声明 = 面板不判定落后，并打印 WARN 说明怎么启用）；
+#   · 给了不可比较的值 ⇒ 退出码 2（宁可当场报错，也不要静默写一个永远读不出结论的死值）。
+tx_resolve_agent_baseline() {
+  TX_AGENT_LATEST_VERSION_VALUE=""
+  if [ -n "$TX_AGENT_VERSION_OPT" ]; then
+    tx_agent_version_valid "$TX_AGENT_VERSION_OPT" || tx_fail "$TX_E_USAGE" \
+      "--agent-version 不是可比较的 Agent 版本号：$TX_AGENT_VERSION_OPT
+  取值必须与 Agent **上报的** version 同口径（首段是数字，例如 0.14.0；v1.5.0 / 0.14.0-rc1 也可以）。
+  git sha / latest / unknown 会被面板读成「无法判定」（isVersionOlder 返回 null），因此这里直接拒绝；
+  若你确实想按镜像锚记版本，请另外用 --agent-version 传 Agent 的版本号。"
+    TX_AGENT_LATEST_VERSION_VALUE="$TX_AGENT_VERSION_OPT"
+    tx_log "Agent 版本基线：TUNEX_AGENT_LATEST_VERSION=$TX_AGENT_VERSION_OPT（面板据此判定「节点 Agent 是否落后」）"
+  else
+    tx_warn "未提供 --agent-version：不写 TUNEX_AGENT_LATEST_VERSION ⇒ 面板**不判定** Agent 版本落后（这是「未声明」，不是「已是最新」）。要启用请加 --agent-version <x.y.z>（与 Agent 上报的 version 同口径）。"
+  fi
+}
+
+# 既有 .env 里可能留着**不可比较**的基线（旧版安装器把 git sha 写了进去）。本函数只**报告**
+# 不擅自改写用户配置：升级时带 --agent-version 即会覆盖该键，或由操作者手工改成版本号。
+tx_warn_legacy_agent_baseline() {
+  [ -f "$TX_ENV_FILE" ] || return 0
+  local cur=""
+  cur="$(tx_env_get "$TX_ENV_FILE" TUNEX_AGENT_LATEST_VERSION)"
+  [ -n "$cur" ] || return 0
+  tx_agent_version_valid "$cur" && return 0
+  tx_warn "$TX_ENV_FILE 里的 TUNEX_AGENT_LATEST_VERSION=$cur 不是可比较的 Agent 版本号（旧版安装器写的是镜像 git sha）：面板只会显示「无法判定」，**不会**给出落后判定。修法：重跑时加 --agent-version <x.y.z>（会覆盖该键），或手工把它改成版本号。"
 }
 
 # .env 里当前声明的面板镜像（没有 .env 时为空）。
@@ -714,6 +785,7 @@ tx_action_install() {
   fi
   if [ "$reuse_env" -eq 1 ]; then
     tx_log "复用既有 .env：$TX_ENV_FILE（不覆盖、不重写任何键）"
+    tx_warn_legacy_agent_baseline
   else
     tx_log "探测：本机没有 tunex 生产栈（无 .env、无项目容器）→ 继续"
     # 走到这里状态一定是 none：`.env` 存在的那三种情况（same/different/partial）都在上面被拒绝了，
@@ -746,11 +818,12 @@ tx_action_upgrade() {
     tx_fail "$TX_E_STATE" "upgrade 拒绝：没有可升级的运行中部署（状态=$state）。首次部署请用 sudo $TX_SELF install --version <sha>"
   fi
   tx_log "当前 TUNEX_IMAGE=${TX_ENV_IMAGE_VALUE:-未设置} → 目标 $TX_PANEL_IMAGE"
+  tx_warn_legacy_agent_baseline
   tx_log "[1/6] 先拉取目标镜像（先 pull、后变更：拉不到就到此为止，镜像与数据都没动）"
   tx_pull "$TX_PANEL_IMAGE" || tx_fail "$TX_E_RUNTIME" "docker pull 失败：$TX_PANEL_IMAGE（未改动 .env，镜像与数据保持原状）"
   tx_log "[2/6] 备份前置（调用既有 scripts/ops/backup.sh；失败即拒绝升级，不留无保护窗口）"
   tx_backup_required || tx_fail "$TX_E_RUNTIME" "备份失败 —— upgrade 已拒绝，未切换任何镜像"
-  tx_log "[3/6] 写 .env（仅 TUNEX_IMAGE / TUNEX_AGENT_IMAGE / TUNEX_AGENT_LATEST_VERSION）"
+  tx_log "[3/6] 写 .env（TUNEX_IMAGE / TUNEX_AGENT_IMAGE，以及仅在给了 --agent-version 时的 TUNEX_AGENT_LATEST_VERSION）"
   if [ "$TX_DRY_RUN" -eq 1 ]; then
     printf '[dry-run] 备份 %s → %s 后改写 TUNEX_IMAGE=%s\n' "$TX_ENV_FILE" "$TX_OPS_DIR/.env.before-installer-upgrade" "$TX_PANEL_IMAGE"
   else
@@ -862,6 +935,19 @@ tx_action_status() {
     tx_prepare_compose_args
     printf '[installer] TUNEX_IMAGE: %s\n' "$(tx_env_get "$TX_ENV_FILE" TUNEX_IMAGE)"
     printf '[installer] TUNEX_AGENT_IMAGE: %s\n' "$(tx_env_get "$TX_ENV_FILE" TUNEX_AGENT_IMAGE)"
+    # 版本基线：只读打印 + 形态不对时**当场说清楚**（status 是运维的只读入口，
+    # 「无法判定」与「配置值不可比较」必须能在这里分辨，而不是只体现在健康理由里）。
+    local baseline="" baseline_state=""
+    baseline="$(tx_env_get "$TX_ENV_FILE" TUNEX_AGENT_LATEST_VERSION)"
+    if [ -z "$baseline" ]; then
+      baseline_state="未声明（面板不判定 Agent 版本落后；这与「已是最新」不是同一件事）"
+    elif tx_agent_version_valid "$baseline"; then
+      baseline_state="可比较（面板可据此判定落后）"
+    else
+      baseline_state="**不可比较**（不是版本号：面板只能显示「无法判定」，永远不会给落后判定）"
+    fi
+    printf '[installer] Agent 版本基线: %s —— %s\n' "${baseline:-<空>}" "$baseline_state"
+    tx_warn_legacy_agent_baseline
   else
     printf '[installer] .env 校验  : 不存在（本机还没有安装过）\n'
   fi
@@ -949,6 +1035,7 @@ tx_main() {
         TX_ACTION="$1"; shift ;;
       --version)      TX_VERSION="${2:?--version 需要参数}"; shift 2 ;;
       --agent-image)  TX_AGENT_IMAGE_OPT="${2:?--agent-image 需要参数}"; shift 2 ;;
+      --agent-version) TX_AGENT_VERSION_OPT="${2:?--agent-version 需要参数}"; shift 2 ;;
       --allow-floating) TX_ALLOW_FLOATING=1; shift ;;
       --standalone)   TX_STANDALONE=1; shift ;;
       --purge-data)   TX_PURGE_DATA=1; shift ;;

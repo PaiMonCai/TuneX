@@ -222,8 +222,8 @@ describe("identity check on the real Agent image: executable, and never a false 
     expect(block.indexOf("--identity-probe")).toBeLessThan(block.indexOf("command -v curl"));
     // 三种判定手段在操作者文案里必须可分（agent 首选 / jq 兜底 / grep 形状匹配）。
     expect(block).toContain("agent 内置探针，不跟随重定向");
-    expect(block).toContain("**兜底路径** jq");
-    expect(block).toContain("**形状匹配**");
+    expect(block).toContain("兜底路径 jq");
+    expect(block).toContain("形状匹配");
   });
 
   test("a 200 without a real Panel JSON body is 未校验, not 通过", () => {
@@ -244,7 +244,7 @@ describe("identity check on the real Agent image: executable, and never a false 
     const block = identitySection(script);
     // 通过那一行有**两个**分支：真解析 / 形状匹配 + 一条"没有 jq"的提醒。
     expect(block).toContain("Panel JSON 真解析");
-    expect(block).toContain("Panel JSON **形状匹配**");
+    expect(block).toContain("Panel JSON 形状匹配");
     expect(block).toContain("本节点镜像既没有内置探针、也没有 jq，响应体只做了形状匹配、没有真解析");
     // 操作者可见的"身份校验通过"只出现在**三种判定手段**各一条 log 里
     // （agent 内置探针 / jq 兜底 / grep 形状匹配），不允许别处冒出第四个"通过"口径。

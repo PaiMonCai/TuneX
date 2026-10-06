@@ -687,6 +687,58 @@ LAST_OUT="$(bash "$BOOTSTRAP" --repo "$REPO" --version latest --dir "$TMP/dest-l
 expect_rc 2 "版本 latest → 用法错误"
 
 # =============================================================================
+group "F. Agent 版本基线（TUNEX_AGENT_LATEST_VERSION）的写入语义"
+# =============================================================================
+# 背景（task-26）：旧版安装器把 `--version` 的 **git sha** 写进这个键，而面板是拿它去和
+# Agent **上报的 version** 比较（`isVersionOlder`，首段必须是数字）⇒ 比较只能是 `null`
+# = 「无法判定」 ⇒ `agent_version_behind` 与用户域 `version_drift` **永不触发**。
+# 因此这里钉三件事：① 形态判定与 TS 同口径；② sha 不再进这个键；③ 不可比较的取值 fail-closed。
+
+# F1 形态纯函数（可比较 = 首段是数字；unknown / sha / latest / 分支名一律不可比较）
+for f_case in "0.14.0:0" "v1.5.0:0" "0.14.0-rc1:0" "1.2:0" "unknown:1" "UNKNOWN:1" "latest:1" "$SHA_FAKE:1" "main:1" ":1" "0 .14:1" "0.13.22:0"; do
+  f_val="${f_case%:*}"; f_want="${f_case##*:}"; f_got=1
+  tx_agent_version_valid "$f_val" && f_got=0
+  if [ "$f_got" != "$f_want" ]; then
+    bad "版本基线形态：'$f_val' 期望可比较=$((1 - f_want)) 实际 $f_got"
+  elif [ "$f_got" = "0" ]; then
+    ok "版本基线形态：'$f_val' → 可比较"
+  else
+    ok "版本基线形态：'$f_val' → 不可比较（只会「无法判定」）"
+  fi
+done
+
+# F2 只给 --version（sha）⇒ **不**写该键，并明确说明怎么启用（未声明 ≠ 已是最新）
+run_install "$FX_NONE" "$SB" install --dry-run --version "$SHA_FAKE"
+expect_rc 0 "F2 install --dry-run（只给 --version）"
+hasnt "TUNEX_AGENT_LATEST_VERSION=$SHA_FAKE" "F2 --version 的 git sha 不再被写进 Agent 版本基线"
+has "不写 TUNEX_AGENT_LATEST_VERSION" "F2 明确告知：不给 --agent-version 就不写该键"
+
+# F3 显式 --agent-version 才写入（这就是"最新可用 Agent 版本"的唯一来源）
+run_install "$FX_NONE" "$SB" install --dry-run --version "$SHA_FAKE" --agent-version "0.14.0"
+expect_rc 0 "F3 install --dry-run（--agent-version 0.14.0）"
+has "TUNEX_AGENT_LATEST_VERSION=0.14.0" "F3 显式 --agent-version 写进 .env 计划"
+
+# F4 不可比较的 --agent-version：fail-closed（写进去等于让落后判定永不触发）
+run_install "$FX_NONE" "$SB" install --dry-run --version "$SHA_FAKE" --agent-version "$SHA_FAKE"
+expect_rc 2 "F4 --agent-version 传 git sha → 用法错误（exit=2）"
+has "不是可比较的 Agent 版本号" "F4 拒绝理由点名形态问题"
+
+# F5 既有 .env 里留着旧 sha：**报告**不擅自改写；status 把「不可比较」与「未声明」分开打印
+SB_BASE="$TMP/sandbox-baseline"; mk_sandbox "$SB_BASE"
+cp "$ENV_GOOD" "$SB_BASE/.env"; chmod 600 "$SB_BASE/.env"
+printf 'TUNEX_AGENT_LATEST_VERSION=%s\n' "$SHA_FAKE" >> "$SB_BASE/.env"
+ENV_BASE_BEFORE="$(cat "$SB_BASE/.env")"
+FX_BASE="$(mkfix baseline project_container_count=6 project_working_dirs="$SB_BASE" backup_manifest_count=3 image_digest='sha256:new')"
+run_install "$FX_BASE" "$SB_BASE" upgrade --dry-run --version "$SHA_FAKE"
+expect_rc 0 "F5 upgrade --dry-run（.env 里留着旧 sha）"
+has "不是可比较的 Agent 版本号" "F5 旧 sha 被点名报告（不静默、不当成落后/最新）"
+if [ "$(cat "$SB_BASE/.env")" = "$ENV_BASE_BEFORE" ]; then ok "F5 安装器不擅自改写既有 .env"; else bad "F5 安装器改写了既有 .env"; fi
+run_install "$FX_BASE" "$SB_BASE" status --dry-run
+expect_rc 0 "F5 status --dry-run"
+has "不可比较" "F5 status 把「不可比较」与「未声明」分开打印"
+has "Agent 版本基线" "F5 status 打印版本基线事实"
+
+# =============================================================================
 printf '\n=========================================\n'
 printf 'installer-static: 通过 %s 项，失败 %s 项\n' "$PASS" "$FAIL"
 printf '=========================================\n'

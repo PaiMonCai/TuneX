@@ -83,12 +83,11 @@ const TARGETS = [
  * 它们只是"我在自己的 scope 内改不了"：
  *   · `services/__tests__/notifications/deliveries.test.ts` —— **notify-center 在写**
  *     （task-11 的 scope 包含 `services/__tests__/notifications`），不动它以免冲突；
- *   · `routes/__tests__/forward-list-route.test.ts` —— 不在 task-30 声明的三个文件里。
+ *   （`routes/__tests__/forward-list-route.test.ts` 已在 task-29 里顺手收掉，故不在此列。）
  * 新出现的部分替身**仍然会红**（豁免只按精确路径匹配，不会因为名单存在而放宽规则）。
  */
 const ALLOWED_PARTIAL_WORKSPACE_MOCKS = new Set<string>([
   "services/__tests__/notifications/deliveries.test.ts",
-  "routes/__tests__/forward-list-route.test.ts",
 ]);
 
 /** 递归收集 src/ 下的测试文件（跳过依赖与构建产物）。 */

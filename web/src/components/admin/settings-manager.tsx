@@ -45,6 +45,13 @@ const GROUP_ORDER = ["站点", "公告（已废弃）", "邮件", "推广", "提
  */
 const SMTP_ENV_NAMES = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM", "SMTP_SECURE"] as const;
 
+/**
+ * 纵深防御：后端已经不再下发这些键（N-F1），这里**再滤一遍**。
+ * 理由：页面上写着"历史的 SMTP_* 行会被忽略"，如果哪天后端（或 mock）把它们又发下来，
+ * 界面就会渲染成一个可编辑、可"保存成功"的表单 —— 那句话立刻变成谎。
+ */
+const DEPLOYMENT_LEVEL_KEYS = new Set<string>(SMTP_ENV_NAMES);
+
 const SMTP_NOTICE: Record<"zh" | "en", { title: string; body: string; history: string }> = {
   zh: {
     title: "SMTP（邮件）属于部署级配置",
@@ -82,6 +89,7 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
     const kw = keyword.trim().toUpperCase();
     const map = new Map<string, SystemConfigItem[]>();
     for (const c of rows) {
+      if (DEPLOYMENT_LEVEL_KEYS.has(c.name)) continue;
       if (kw && !c.name.includes(kw)) continue;
       const g = groupOf(c.name);
       const arr = map.get(g) ?? [];

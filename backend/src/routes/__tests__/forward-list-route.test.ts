@@ -88,8 +88,17 @@ mock.module(`${ROOT}services/forward-service.ts`, () => ({
   }),
 }));
 
-/** workspace 替身：路由的 `workspace(c)` 依赖它写入的变量。 */
+/**
+ * workspace 替身：路由的 `workspace(c)` 依赖它写入的变量。
+ *
+ * **替身必须语义完整**（task-29 顺手收掉）：`mock.module` 是进程级注册表、先加载者生效，
+ * 只给两个导出的替身会泄漏给同进程的其它测试文件，让它们在加载阶段抛
+ * `Export named '…' not found`。所以取"真实模块 + 只覆盖本用例要改的导出"形态；守卫见
+ * `services/__tests__/mock-isolation-guard.test.ts`。
+ */
+const realWorkspace = await import(`${ROOT}services/workspace.ts`);
 mock.module(`${ROOT}services/workspace.ts`, () => ({
+  ...realWorkspace,
   canWorkspaceResourceAction: (access: { role: string }) => access.role === "owner",
   resolveWorkspaceAccess: async () => ({
     id: 11,

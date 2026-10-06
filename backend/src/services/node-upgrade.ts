@@ -437,11 +437,11 @@ case "$PROBE" in
         # 首选路径：agent 内置探针（Go stdlib，永不跟随重定向 + 真解析）。
         log "身份校验通过（HTTP 200 + Panel JSON 真解析；agent 内置探针，不跟随重定向）：同一个 node_id/agent_id 已重新连上 Panel" ;;
       jq)
-        log "身份校验通过（HTTP 200 + Panel JSON 真解析；**兜底路径** jq）：同一个 node_id/agent_id 已重新连上 Panel"
+        log "身份校验通过（HTTP 200 + Panel JSON 真解析；兜底路径 jq）：同一个 node_id/agent_id 已重新连上 Panel"
         log "提醒：本节点镜像里的 agent 二进制没有内置探针，这次走的是 shell 兜底路径（curl + jq）" ;;
       *)
         # **不能**把它说成解析过：本镜像没有内置探针、也没有 jq，只做了形状匹配（对象 + data 键）。
-        log "身份校验通过（HTTP 200 + Panel JSON **形状匹配**）：同一个 node_id/agent_id 已重新连上 Panel"
+        log "身份校验通过（HTTP 200 + Panel JSON 形状匹配）：同一个 node_id/agent_id 已重新连上 Panel"
         log "提醒：本节点镜像既没有内置探针、也没有 jq，响应体只做了形状匹配、没有真解析"
         log "提醒：这条兜底路径无法禁止 busybox wget 跟随重定向 —— 建议把节点镜像换成当前版本（agent 自带探针，零额外依赖）" ;;
     esac ;;

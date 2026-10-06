@@ -26,6 +26,11 @@ TuneX 由 Panel 与 Agent 组成。Panel 提供 Web 管理、策略编排和状�
 
 需要 Docker 与 Docker Compose v2。
 
+> **先选路径**：本节是**本机试用 / 开发栈**（本地构建镜像、端口 8787/9091）。
+> **长期运行或对外提供服务，请直接用[生产部署文档](docs/production-deploy.md)的 §2**
+> （`docker-compose.prod.yaml` + `.env.production.example` + 预构建镜像、端口 13001-13003）。
+> 本节不覆盖生产所需的 TLS 反代、备份与升级流程。
+
 ```bash
 git clone https://github.com/PaiMonCai/TuneX.git
 cd TuneX
@@ -37,6 +42,14 @@ cp .env.example .env
 ```bash
 docker compose up -d --build
 ```
+
+启动时这三件事会**自动发生**（不需要手工执行命令）：
+
+- **数据库迁移**：`db-migrate` 容器运行 `bunx prisma migrate deploy && bun prisma/seed.ts`，
+  **退出码 0 才算成功**；它失败时 `up -d` 会直接报错，后端/前端不会起来；
+- **管理员账号**：种子按 `.env` 的 `SEED_ADMIN_EMAIL` 创建；未设 `SEED_ADMIN_PASSWORD`
+  时会随机生成并写到**项目根**的 `.admin-credentials`（`邮箱:口令`）。首次登录后请改密码并删除该文件；
+- **Worker cron**：`worker` 容器会打印 `registered N cron schedulers`，用于离线检测/对账/结算等节律。
 
 检查运行状态：
 
@@ -50,6 +63,12 @@ curl http://localhost:8787/healthz
 ```text
 http://localhost:9091
 ```
+
+> ⚠️ **同机只能跑一套**：`docker-compose.yaml` 把容器名/卷名/网络名**写死**为
+> `tunex-*` / `tunex-mysql-data` / 网络 `tunex`，因此 `-p <project>` **不能**隔离。
+> 若本机已存在这些卷，`up` 会**复用**旧库（不是全新部署），而 `down -v` 会**删除**它们。
+> 部署第二套前请先 `docker volume ls | grep tunex` 确认，并改成不同的名字
+> （细节见[生产部署文档 §1.1](docs/production-deploy.md)）。
 
 生产环境请使用 [生产部署文档](docs/production-deploy.md) 和 `docker-compose.prod.yaml`。已有 Nginx、宝塔或 1Panel 时，可由宿主机现有反向代理负责 TLS；没有宿主机反代时可使用项目提供的 standalone Caddy 部署方式。
 

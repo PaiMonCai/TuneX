@@ -11,6 +11,7 @@ import {
   parseRuntimeCounts,
   parseReportedRuntimes,
   parseUsedPorts,
+  isVersionOlder,
   type DesiredRuntime,
   type HealthInput,
   type HealthResult,
@@ -62,6 +63,35 @@ function loadDefaultDb(): Promise<NodeHealthDb> {
   return defaultDbPromise;
 }
 
+/**
+ * 部署方配置的 Agent 版本基线（`TUNEX_AGENT_LATEST_VERSION`）的**语义分类**（纯函数）。
+ *
+ * 三种取值在本专项里必须分开，因为它们会导出三种不同的用户可见结论：
+ *   · `unset`        —— 未声明：**不判**版本落后（`agent_version_behind` 与
+ *                       `agent_version_unknown` 都不出现）。这是"没意见"，不是"已是最新"。
+ *   · `comparable`   —— 可以与 Agent **上报的** version 比较 ⇒ 面板能给出"落后"。
+ *   · `uncomparable` —— 配置了，但**不在**版本号口径里（git sha / `latest` / `unknown` / 空值以外
+ *                       的非法形态）⇒ 比较只能是 `null` =「无法判定」，**永远**不会有"落后"。
+ *                       这是安装器缺陷的形态（旧版把镜像 git sha 写了进来），不是节点的状态。
+ *
+ * 判定**复用** `isVersionOlder` 自己（能和自己比较 ⇒ 两侧都可解析），因此这里不存在第二份
+ * 版本解析规则；`null` 的含义也只是"无法比较"，绝不被折算成 behind / not-behind。
+ */
+export type AgentBaseline =
+  | { kind: "unset" }
+  | { kind: "comparable"; value: string }
+  | { kind: "uncomparable"; value: string };
+
+export function classifyAgentBaseline(value: unknown): AgentBaseline {
+  if (typeof value !== "string") return { kind: "unset" };
+  const v = value.trim();
+  if (v === "") return { kind: "unset" };
+  return isVersionOlder(v, v) === null ? { kind: "uncomparable", value: v } : { kind: "comparable", value: v };
+}
+
+/** 不可比较的配置只警告**一次**（同一进程内重复调用 getNodeHealth 不该刷爆日志）。 */
+let warnedUncomparableBaseline: string | null = null;
+
 async function deps(over: NodeHealthDeps | undefined): Promise<{
   db: NodeHealthDb;
   now: () => Date;
@@ -79,7 +109,19 @@ async function deps(over: NodeHealthDeps | undefined): Promise<{
   // `env.agentLatestVersion.length` 会在这种进程里抛
   // `TypeError: undefined is not an object`，把 health 路由测试全部打挂
   //（实测 18 失败）。缺键 = 部署方未配置 = 不判版本，与空串同义。
-  const configuredVersion = typeof env.agentLatestVersion === "string" ? env.agentLatestVersion.trim() : "";
+  const configured = classifyAgentBaseline(env.agentLatestVersion);
+  if (configured.kind === "uncomparable" && warnedUncomparableBaseline !== configured.value) {
+    // 不静默、也不折算：把原始值透传给合成层（于是用户看到的是「无法判定」这一条 info 理由），
+    // 同时把**配置问题**与**修法**留在日志里 —— 否则这个值永远是个"看起来配了、其实没用"的死值。
+    warnedUncomparableBaseline = configured.value;
+    console.warn(
+      `[node-health] TUNEX_AGENT_LATEST_VERSION=${configured.value} 不是可比较的 Agent 版本号` +
+        `（首段必须是数字，例如 0.14.0；git sha / latest / unknown 都属于这种取值）。` +
+        `因此面板只能显示「无法判定」，**不会**给出落后判定（也不代表已是最新）。` +
+        `请把它改设为最新 Agent 镜像对应的版本号（安装器：install.sh --agent-version <x.y.z>）。`,
+    );
+  }
+  const configuredVersion = configured.kind === "unset" ? "" : configured.value;
   const expectedAgentVersion =
     over?.expectedAgentVersion ?? (configuredVersion.length > 0 ? configuredVersion : null);
   if (over?.db) return { db: over.db, now, expectedAgentVersion };

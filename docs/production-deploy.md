@@ -24,6 +24,32 @@
 `up`：`docker compose -p tunex` 是 `scripts/ops/*.sh` 的固定视角，端口/容器名
 （`tunex-mysql`、`tunex-backend`…）会互相抢占。同机共存请把其中一套改名或分机部署。
 
+### 1.1 名字是**写死**的：`-p` 不能隔离（实测）
+
+两个 compose 文件都把资源名写死了，`docker compose -p <另一个名字>` **只改默认前缀，
+改不动显式名字**：
+
+| 文件 | 写死的东西 |
+|---|---|
+| `docker-compose.yaml`（开发栈） | `container_name: tunex-*`（:14 起各处）、卷 `name: tunex-mysql-data` / `tunex-redis-data` / `tunex-caddy-*`（:162-170）、网络 `name: tunex`（:172-175） |
+| `docker-compose.prod.yaml` | `container_name: tunex-*`；容器名写死，卷是 `-prod` 后缀（不与开发栈撞） |
+
+后果（**在同机部署第二套之前务必阅读**）：
+
+- 直接 `up` 开发栈会**复用**本机已有的 `tunex-mysql-data` / `tunex-redis-data` / 网络 `tunex`
+  —— 你得到的不是一次全新部署，而是接着别人的旧库跑（迁移/种子都不会重新发生）；
+- 反过来 `docker compose down -v` 会**删掉这些卷**（即"别人的数据"），而且没有任何确认；
+- 想真正隔离，只能**改文件里的这些名字**（或在生产路径上只改容器名——卷已带 `-prod`），
+  没有"只加一个 `-p` 参数"的用法。
+
+**新装请先确认这些名字不存在**：
+
+```bash
+docker ps -a --format '{{.Names}}' | grep -E '^tunex-' || echo "无同名容器"
+docker volume ls --format '{{.Name}}' | grep -E '^tunex-(mysql|redis|caddy)' || echo "无同名卷"
+docker network ls --format '{{.Name}}' | grep -x tunex || echo "无同名网络"
+```
+
 **所有 ops 脚本默认读 `docker-compose.yaml`**。对生产栈执行时必须显式给
 `COMPOSE_FILE`：
 
@@ -97,6 +123,7 @@ chmod 600 .env
 
 # 每套部署独立生成（示例输出为随机值，直接粘贴到 .env）
 openssl rand -base64 32 | tr '+/' '-_'   # → AUTH_SECRET
+openssl rand -base64 32 | tr '+/' '-_'   # → LICENSE_SECRET（见下表）
 ```
 
 必改项（有默认占位值的都不算改完）：
@@ -109,12 +136,20 @@ openssl rand -base64 32 | tr '+/' '-_'   # → AUTH_SECRET
 | `ACME_EMAIL` | 仅 standalone 模式必需；Caddy ACME 账号邮箱 |
 | `MYSQL_ROOT_PASSWORD` | 必须同时改 `DATABASE_URL` 里的口令（两边一致） |
 | `AUTH_SECRET` | ≥32 随机字节，禁止跨环境复用 |
+| `LICENSE_SECRET` | ≥32 随机字节；许可/授权签名密钥。**已发布的 Panel 镜像把它列为必填** —— 缺失时 `db-migrate` 退出码 1、`up -d` 整体失败（实测：`LICENSE_SECRET is required and has no default`）。当前源码已不再读取它，但请一并生成：镜像与源码版本不一致时，这一项就是"能不能启动"的分界。 |
 | `TUNEX_IMAGE` | 统一 Panel 应用镜像，钉到具体 git sha（见下） |
 | `TUNEX_AGENT_IMAGE` | 节点一键安装使用的多架构 Agent 镜像；生产建议与 Panel 使用同一 git sha |
 | `SMTP_*` | 公网服务必须配，否则验证/重置邮件只进日志 |
 | `BACKUP_PASSPHRASE` | cron 回滚前备份必需，否则备份脚本交互读取失败并终止回滚 |
 
-可选的**主动出站能力默认全部关闭**：`LOOKING_GLASS_ENABLED=false`、`TUNEX_NOTIFICATION_WEBHOOK_ENABLED=false`、`TUNEX_NOTIFICATION_TELEGRAM_ENABLED=false`。其中 Looking Glass 只做有界 TCP connect 公网探测；开启前应确认审计与目标网络策略符合部署要求。Webhook/Telegram 的目标与凭据配置见 `.env.production.example` 及管理端配置。
+可选的**主动出站能力默认全部关闭**：`LOOKING_GLASS_ENABLED=false`、`TUNEX_NOTIFICATION_WEBHOOK_ENABLED=false`、`TUNEX_NOTIFICATION_TELEGRAM_ENABLED=false`。其中 Looking Glass 只做有界 TCP connect 公网探测；开启前应确认审计与目标网络策略符合部署要求。
+
+**通知渠道的凭据与目标在管理端配置**：`/admin/notification-channels`（Admin Console → 运维 → 通知渠道），需要资源键 `notification_channels`（未登记前缀 fail-closed：只有超管可用；登记后按读/写分级授权）。
+
+- **Telegram**：写入 bot token。**只写不读** —— 保存后服务端只回"已配置 / 未配置"与 `secret_state`（`unset` / `sealed` / `unreadable`），**不回显密文，也不回显明文**；密文用通知专用的 HKDF 域（`tunex-notification-v1`）封装，与联邦 / DDNS 的密钥域分离。
+- **Webhook**：写入接收方 URL（**URL 本身就是凭据**）。页面只显示服务端脱敏后的 `origin/***摘要`；同一 URL 再次提交是"更新"，新 URL 是"新增"（表没有唯一索引，同一渠道多行是**真实状态**，页面按行展示并给出告警）。
+- **配凭据与开部署开关是两件事**：上面三个开关默认关闭 ⇒ 渠道不参与投递（投递账本会留一条 `not_configured`，不是静默丢弃）。配置页同时显示**服务端推导**的投递状态（注册表支持 / 本安装已开启 / 公告实际会用的渠道）与告警，所以**"保存成功"≠"会被投递"**。用户的推送偏好（免打扰）在 `/settings` 的「通知偏好」，是**用户级、跨工作空间**的；投递失败记录在 `/settings` 的「投递记录」（严格本工作空间作用域，平台行不下发租户）。
+- **email 渠道的凭据不在管理端**：它读取部署级 `SMTP_*` 环境变量（见上表）。`/admin/settings` **不再提供** SMTP 写入项 —— 写进数据库不会生效，因此后端会明确拒绝这类写入（`code: deployment_level_config`），页面上也写清了应当设置哪些环境变量。
 
 可选但**建议显式设置**：`TUNEX_PUBLIC_PANEL_URL`（面板对外可达地址，供节点 Agent 升级脚本做身份校验；不配则回落到节点自己记录的地址，取不到时升级脚本会明确打印"未校验"）。见 §3.1。
 
@@ -134,9 +169,25 @@ Panel 镜像仍由 Compose 以独立容器运行各角色。生产同时钉住�
 
 ```bash
 SHA=$(git rev-parse HEAD)
+
+# 先**验证**这个 sha 的镜像真的发布了，再写进 .env —— 不要静默回退 :latest。
+# 未发布的 sha 直接钉进 .env，会在 `docker compose pull` 时报 `manifest unknown`，
+# 而"悄悄改用 :latest"更糟：它可能与当前源码**不是同一个版本**
+# （实测：`:latest` 早于 D3 的 409 修复，且不认 `SEED_DEMO_DATA=false`）。
+docker manifest inspect ghcr.io/paimoncai/tunex:$SHA >/dev/null 2>&1 || {
+  echo "❌ ghcr.io/paimoncai/tunex:$SHA 未发布（CI 还没为这个 commit 出镜像）。二选一："
+  echo "   ① 本地构建（源码部署）：docker build -t tunex-local:$SHA . && \"
+  echo "        sed -i \"s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=tunex-local:$SHA#\" .env"
+  echo "   ② 改用**已发布**的 tag：docker manifest inspect ghcr.io/paimoncai/tunex:<tag> 确认后再钉。"
+  exit 1
+}
+
 sed -i "s#^TUNEX_IMAGE=.*#TUNEX_IMAGE=ghcr.io/paimoncai/tunex:$SHA#" .env
 sed -i "s#^TUNEX_AGENT_IMAGE=.*#TUNEX_AGENT_IMAGE=ghcr.io/paimoncai/tunex-agent:$SHA#" .env
 ```
+
+> **本地构建**（`TUNEX_IMAGE=tunex-local:$SHA`）时，Agent 镜像也请用本地可用的那一份
+> （`TUNEX_AGENT_IMAGE=tunex-agent-local:$SHA`），否则节点一键安装命令会去拉一个不存在的 tag。
 
 Panel 主机若拉 private GHCR 包可先 `docker login ghcr.io`。但 **Agent 镜像必须允许节点匿名拉取**，否则控制台生成的一键安装命令无法做到无额外 registry 登录；使用 GHCR 时应将 `tunex-agent` package 设为 public，或把 `TUNEX_AGENT_IMAGE` 指向节点可访问的公开镜像仓库。
 
@@ -277,6 +328,20 @@ curl -fsS http://127.0.0.1:13001/healthz
 curl -fsSI http://127.0.0.1:13003/
 docker port tunex-backend                   # 期望仅 127.0.0.1:13001/13002
 docker port tunex-web                       # 期望仅 127.0.0.1:13003
+
+# 3) 迁移与管理员账号（都在 `db-migrate` 里发生，退出码 0 才算成功）
+docker compose -f "$COMPOSE_FILE" logs db-migrate | tail -20
+#   · 迁移：容器执行 `bunx prisma migrate deploy && bun prisma/seed.ts`
+#   · 管理员：种子创建 SEED_ADMIN_EMAIL 那个账号；未设 SEED_ADMIN_PASSWORD 时随机生成，
+#     并把 `邮箱:口令` 写到**部署目录**的 `.admin-credentials`（`ADMIN_CREDENTIALS_PATH`）。
+sudo cat /opt/TuneX/.admin-credentials      # 首次登录用；改完密码请删除此文件
+
+# 4) 第一台真实节点（"部署成功"的硬判据：节点 **online**，不是容器起来了）
+#    前置 A：目标节点组必须有端口区间（`node_group.port_range`，如 `30000-30099`）。
+#            没有区间时 provision 会被拒（409 `PORT_RANGE_REQUIRED`）；缺失的区间要先补。
+#    前置 B：确认节点额度没被示例数据占满（个人/免费空间默认 1 节点）。
+#            `SEED_DEMO_DATA=false` 时种子不插演示节点；若你的空间里已有演示节点，请先删除。
+#    然后在管理界面：创建 Node → 复制它的一键安装命令 → 在节点主机上执行 → 回到列表确认 online。
 
 # 可选 Caddy profile 启用时再检查：
 # curl -fsS http://127.0.0.1:13000/healthz

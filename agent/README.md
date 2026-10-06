@@ -164,6 +164,28 @@ that every Agent supports every feature.
 The per-node credential is required for the production command/state path and must
 never be logged.
 
+### 身份探针（升级脚本专用，不是用户模式）
+
+`tunex-agent --identity-probe --probe-url <panel> --probe-timeout <sec> [--probe-env-file <path>]`
+打印**一行**结论后退出，用于升级脚本在重建容器后确认"这台节点还能被 Panel 认出来"：
+
+```text
+http:200:agent       200 且响应体是 Panel 的 JSON
+http:<code>          其它状态码（例如 302 / 401 / 500）
+unverified:<reason>  env_unreadable | no_credential | no_panel_url | no_response | not_panel_json
+```
+
+它由 Go stdlib 实现，因此有两件 shell 探针做不到的**结构性**保证：`CheckRedirect`
+返回 `http.ErrUseLastResponse`（**永不跟随重定向** ⇒ 凭据不会被 3xx 重发到别的 host）、
+`encoding/json`（**真解析**，不是形状猜测）。这也是镜像里不再需要 curl/jq 的原因。
+
+用**标志**而不是子命令是刻意的：老镜像的二进制会把位置参数当成"多余参数"而**照常启动
+运行时**，而未知标志会被 `flag` 包安全拒绝（usage + 退出码 2）—— 脚本据此回落到老的
+curl/wget 路径，并在给操作者的文案里标注"这是兜底路径"。
+
+凭据**只能**从 `agent.env` 读：没有 `--probe-credential`，因为它会进 `ps`、shell 历史与
+`docker inspect` 输出。
+
 ## Repository layout
 
 | Path | Purpose |

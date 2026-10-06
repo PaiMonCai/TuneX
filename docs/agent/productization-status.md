@@ -771,7 +771,7 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 
 | # | 条件 | R5-A 当时 | 现在的事实（证据） | 现在的判定 | 仍缺什么（诚实列出） |
 |---|---|---|---|---|---|
-| **1** | 新用户可快速部署 | 基本达成 | `README:25` 四步 + `.env.example` + `production-deploy.md`；**但从未真跑过** ⇒ 已派 `task-31`（照文档全新部署演练 + 文档缺陷清单 + 真实耗时 + 真实 Agent 上线） | **待 `task-31` 结论** | 演练结果；公网 TLS/反代路径（演练环境无公网域名） |
+| **1** | 新用户可快速部署 | 基本达成 | **演练实测：照文档走不通**（`task-31`）——在"第一台 Agent online"之前就有两个未记载的阻断点：① 发布镜像要求 `LICENSE_SECRET` 而示例/文档都没有 ⇒ `db-migrate` exit 1、`up -d` 直接失败；② 按 `$(git rev-parse HEAD)` 钉镜像 ⇒ `manifest unknown`（静默回退 `:latest` 未记载且与源码不匹配）。另 8 条文档缺陷（README 与生产文档分叉、硬编码容器/卷/网络名导致无法隔离、CSRF 方法不对称、占位值不在启动期 fail-closed 等） | **未达成（今天）** | 修文档/环境模板（`task-34`）+ 修种子与 license 的产品缺陷（`task-35`）+ 用**本地构建镜像**重跑到 online；公网 TLS/反代路径仍无环境验证 |
 | **2** | 可从 Web 指引完成第一台 Node | 达成 | 浏览器端到端：闩锁 → 真 Agent → **5s 内 online** → CTA `/forwards?ingress_node_id=`；round 33 门禁重跑仍绿 | **达成** | — |
 | **3** | 直观创建 Direct/Relay/Multi-hop | 基本达成（多跳在途） | Direct/Relay 早已交付；**多跳已接线**（`forward-multihop-model/select` + `middle_node_id` 入请求 + 两段绑定前置 + 预览改「四步三段」）；**真实三跳未跑通**（scratch 4 台节点无一 `role=both`） | **基本达成** | 真实三跳创建 + 真机 topology 两段 + `apply_transit` 端到端（需临时改一台节点角色） |
 | **4** | Forward 状态与链路清晰可见 | 基本达成 | **四块卡片同屏**（链路/DNS/延迟/HA）+ 账本口径 + 浏览器验收 43/41 个相关 testid、禁用词零命中 | **达成** | 带宽/吞吐时间序列（后端无该数据源） |
@@ -786,6 +786,29 @@ DDNS 卡在 **`auto_resolve=false`（缺省）** 时只写了"开启后会怎样
 - 第 10 条我**故意不自行判"达成"**——它是整体判断，应由一次独立评审（同 R5-A 的方法：钉 SHA、只写自己复核过的、把"在途"排除）给出，而不是由实施方自述。
 - "达成"一律指：**有可复核证据的端到端或真机证据**；凡"只有单测/契约测试"的都不写成达成（例如 #3 的多跳接线、#7 的升级卡片）。
 - 表中所有"仍缺什么"都不是免责声明，而是**下一条切片的输入**。
+
+## 3.35 Round 41–42：**部署演练结论（#1 未达成）** + F1 收口交付 + 配置键审计派发
+
+### `task-31` 演练结论：**照文档部署走不通**（本专项最有价值的一次交付）
+在 `/tmp` 克隆副本按 `production-deploy.md` 生产路径演练（`-p tunex-rehearsal-webddns`、唯一端口 23101-23103、全新 `*-prod` 卷、不发布公网端口；**清理后基线逐行 0 差异**）。**两个未记载的阻断点**（在"第一台 Agent online"之前）：
+1. **`db-migrate` exit 1 ⇒ `up -d` 失败**：发布镜像要求 `LICENSE_SECRET`，而 `.env.production.example` 与 §2.2 必改项表**都没有它**；
+2. **镜像钉版本不可行**：按 `$(git rev-parse HEAD)` 钉 ⇒ `manifest unknown`；当前"静默回退 `:latest`"**未记载且与源码不匹配**（`:latest` 早于 D3 修复 ⇒ provision 报 500 而非 409 `PORT_RANGE_REQUIRED`；且不认 `SEED_DEMO_DATA=false` ⇒ 演示数据占满 1 台上限 ⇒ **加不了第一台真实节点**，403 `node_limit`）。
+**耗时**：到失败点约 20 分钟（含 258s `pull`），**未能评判"30 分钟"口径**（路更早就断了）。
+**10 条文档缺陷**（每条 `文件:行` + 现象 + 建议）已记入报告：缺 `LICENSE_SECRET`、钉版本不可行、README 与生产文档分叉且不提管理员/迁移、`docker-compose.yaml:14,164-174` 硬编码容器/卷/网络名导致**无法隔离且会复用已有数据**、首启额度被演示数据占满、CSRF 方法不对称（`DELETE` 无 `Origin` 直接 403）、占位值不在启动期 fail-closed、镜像 license 缺省 `business`（fail-open，仓库已是 `none`）、缺"可用节点组"路径、`.env.example:31-33` 的承诺被违背。
+**副作用已披露并恢复**：`docker compose pull` 移动了本机共享的 `mysql:8.4.11` 标签，已还原原映射并删除拉入镜像。
+
+**处置**：`task-34`（修文档与环境模板 + **用本地构建镜像**重跑到 online，把"发布镜像陈旧"与"文档错误"分开）→ `web-ddns`；`task-35`（`SEED_DEMO_DATA=false` 不生效 + license 缺省 fail-open，**仓库侧与镜像侧分开陈述**）→ `backend-truth`。
+
+### `task-29`（F1 收口）交付
+- **跨 host A/B**：新镜像（内置探针）跳转目标收到 **`[]`**；`cafaaba`（busybox wget 兜底）收到 `auth_present=true auth_len=38` ⇒ 旧路径确实外发凭据（已如实标注为兜底风险）。
+- **响应体矩阵**：新路径 `http:200:agent`；其余 5 种（含 `{"data": oops}` / `{"data":42}`）全 `unverified:not_panel_json`——**旧 grep 路径会放过前两种**。
+- **镜像体积**：15,003,286 → 21,114,130（curl+jq）→ **15,007,382（+4,096 / +0.03%）**（去掉 curl/jq，探针进二进制）。
+- **反向变异**：把 `CheckRedirect` 改成跟随 ⇒ "目标零请求"那条**变红**。
+- **一处对我方案的偏离（已采纳）**：用**标志**而非子命令——老二进制会把位置参数当"多余参数"**照常启动运行时**（危险），未知标志则被 `flag` 包安全拒绝（rc=2）；且**不提供 `--probe-credential`**（凭据只从 `agent.env` 读，不进 `ps`/`docker inspect`）。
+- **裁决**：兜底路径**保留**（老镜像客观存在，诚实结论优于无法校验），但要求把"未来废掉它的前提条件"写进 `agent/README.md`。
+
+### `task-33`（配置键审计）
+`notify-center` 在 task-14 中**主动更正自己**（此前"库里没有 SMTP 行"是 `SELECT … | head -20` 截断导致的误判；真机复查有 5 行历史行，实现**忽略但不删除**、五行原样在位）。同类键 `RESEND_API_KEY`/`RESEND_FROM`/`EMAIL_PROVIDER` 也被发现"无生产读者" ⇒ **不"顺手修三个"，改为穷举审计**（以 `SECRET_CONFIG_NAMES` ∪ 真实 `GET /api/system/config` 键集为输入，逐键回答"有没有生产读者"，并**区分 DB 配置 vs env**）。
 
 ## 4. Capability Map
 
