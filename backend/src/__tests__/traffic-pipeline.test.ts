@@ -516,9 +516,9 @@ describe("accumulateTraffic", () => {
 });
 
 describe("trafficDayKey", () => {
-  test("本地零点日界", () => {
-    const d = new Date(2026, 8, 24, 23, 30, 0); // 2026-09-24 23:30 local
-    expect(trafficDayKey(d)).toBe("2026-09-24");
+  test("UTC 日界（与归档 date 列口径一致）", () => {
+    expect(trafficDayKey(new Date("2026-09-24T23:30:00.000Z"))).toBe("2026-09-24");
+    expect(trafficDayKey(new Date("2026-09-25T00:00:00.000Z"))).toBe("2026-09-25");
   });
 });
 
@@ -528,7 +528,7 @@ describe("trafficDayKey", () => {
 
 const { aggregateTrafficRows, fillDays, getWorkspaceTrafficSummary, dayKeyOf } = trafficService;
 
-/** 构造聚合行（date 会按本地零点归一，与 archive 写库口径一致）。 */
+/** 构造聚合行（date 会按 UTC 零点归一，与 archive 写库口径一致）。 */
 function aggRow(
   tunnelId: number,
   dateKey: string,
