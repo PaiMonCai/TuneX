@@ -1043,16 +1043,18 @@ export async function releaseStaleFederatedEgressForTunnel(
   deps?: ForwardHopDeps,
 ): Promise<ReleaseStaleFederatedEgressResult> {
   const d = resolveDeps(deps);
-  const rows = (await d.db.federationPlacement
-    .findMany({
-      where: {
-        tunnel_id: tunnelId,
-        hop_role: FEDERATED_EGRESS_HOP_ROLE,
-        state: { in: ["pending", "active", "degraded", "failed"] },
-      },
-      take: 20,
-    })
-    .catch(() => [])) as Array<{ peer_panel_id: string; intent_id: string; desired_revision: number }>;
+  // This is a cleanup precondition for creating the next remote generation.
+  // A DB read failure is NOT equivalent to "there are no stale legs": doing so
+  // would allow a new lease to be created while an old remote runtime may still
+  // be listening. Query every non-terminal row for this one Forward and surface
+  // storage errors to the caller.
+  const rows = (await d.db.federationPlacement.findMany({
+    where: {
+      tunnel_id: tunnelId,
+      hop_role: FEDERATED_EGRESS_HOP_ROLE,
+      state: { in: ["pending", "active", "degraded", "failed"] },
+    },
+  })) as Array<{ peer_panel_id: string; intent_id: string; desired_revision: number }>;
 
   const result: ReleaseStaleFederatedEgressResult = { evaluated: rows.length, released: 0, failed: [] };
   for (const row of rows) {
@@ -1260,11 +1262,13 @@ async function rolloutInFlight(db: ForwardHopDb, tunnelId: number): Promise<bool
   const reader = (db as unknown as { forwardRollout?: { findMany?: (args: unknown) => Promise<unknown> } })
     .forwardRollout?.findMany;
   if (typeof reader !== "function") return false;
+  // Unknown is unsafe here: if the ledger cannot be read, treating it as
+  // "no rollout" can start a second recovery against the same Forward.
   const rows = (await reader({
     where: { tunnel_id: tunnelId, phase: { in: [...ACTIVE_ROLLOUT_PHASES] } },
     take: 1,
     select: { id: true },
-  }).catch(() => [])) as Array<{ id: number }>;
+  })) as Array<{ id: number }>;
   return rows.length > 0;
 }
 
@@ -1332,12 +1336,12 @@ export async function reconcileFederatedForwardHealth(
   };
   if (!d.db.tunnel) return summary;
 
-  const rows = (await d.db.federationPlacement
-    .findMany({
-      where: { hop_role: FEDERATED_EGRESS_HOP_ROLE, tunnel_id: { not: null } },
-      take: limit,
-    })
-    .catch(() => [])) as Array<{ tunnel_id: number | null; desired_revision: number; state: string }>;
+  // A failed placement-ledger read must bubble to Reconciler, which records a
+  // subsystem_failed finding. Returning [] would falsely report a clean sweep.
+  const rows = (await d.db.federationPlacement.findMany({
+    where: { hop_role: FEDERATED_EGRESS_HOP_ROLE, tunnel_id: { not: null } },
+    take: limit,
+  })) as Array<{ tunnel_id: number | null; desired_revision: number; state: string }>;
 
   // 一条 Forward 可能有**多代** placement 行（每次改版都是一条新 intent）。
   // 只有"当代"那一行（desired_revision 最大）能代表它现在的远端腿状态；旧一代的
@@ -1363,21 +1367,19 @@ export async function reconcileFederatedForwardHealth(
     ((tunnelId: number, nodeId: number) => defaultIngressRuntimePresent(d.db, tunnelId, nodeId, now));
 
   for (const [tunnelId, placement] of latest) {
-    const tunnel = (await d.db.tunnel
-      .findUnique({
-        where: { id: tunnelId },
-        select: {
-          id: true,
-          apply_status: true,
-          apply_error_code: true,
-          desired_status: true,
-          config_revision: true,
-          applied_revision: true,
-          ingress_node_id: true,
-          federated_egress_peer: true,
-        },
-      })
-      .catch(() => null)) as FederatedTunnelRow | null | undefined;
+    const tunnel = (await d.db.tunnel.findUnique({
+      where: { id: tunnelId },
+      select: {
+        id: true,
+        apply_status: true,
+        apply_error_code: true,
+        desired_status: true,
+        config_revision: true,
+        applied_revision: true,
+        ingress_node_id: true,
+        federated_egress_peer: true,
+      },
+    })) as FederatedTunnelRow | null | undefined;
     if (!tunnel) {
       summary.skipped++;
       continue;
@@ -1408,13 +1410,27 @@ export async function reconcileFederatedForwardHealth(
         summary.skipped++;
         continue;
       }
-      await d.db.tunnel
-        .updateMany?.({
-          where: { id: tunnelId },
-          // 只写可见状态与原因；desired / revision 一个字节都不动（V4 铁律）。
-          data: { apply_status: "error", apply_error_code: unhealthy.code, apply_error: unhealthy.message },
-        })
-        ?.catch(() => undefined);
+      const writer = d.db.tunnel.updateMany;
+      if (typeof writer !== "function") {
+        throw new Error("federation health requires tunnel.updateMany");
+      }
+      const updated = (await writer({
+        // CAS against the visible/revision facts we evaluated. A concurrent user
+        // edit or rollout must win rather than have its fresh status overwritten
+        // by a health decision based on the previous row.
+        where: {
+          id: tunnelId,
+          config_revision: tunnel.config_revision,
+          apply_status: tunnel.apply_status,
+          apply_error_code: tunnel.apply_error_code,
+        },
+        // 只写可见状态与原因；desired / revision 一个字节都不动（V4 铁律）。
+        data: { apply_status: "error", apply_error_code: unhealthy.code, apply_error: unhealthy.message },
+      })) as { count?: number };
+      if (Number(updated?.count ?? 0) !== 1) {
+        summary.skipped++;
+        continue;
+      }
       summary.marked_unhealthy++;
       continue;
     }
