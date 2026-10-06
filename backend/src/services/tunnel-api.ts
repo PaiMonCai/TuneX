@@ -601,7 +601,7 @@ export async function createTunnel(
         outGroupId: null,
         outGroupOwned: true,
       });
-      if (!decision.allowed) return { denied: decision } as const;
+      if (!decision.allowed) return { kind: "denied", decision } as const;
 
       const pending = asRow<TunnelRow>(
         await tx.tunnel.create({
@@ -630,10 +630,10 @@ export async function createTunnel(
           },
         }),
       );
-      return { pending } as const;
+      return { kind: "pending", pending } as const;
     });
-    if ("denied" in reserved) {
-      return err("policy_denied", reserved.denied.message ?? "策略拒绝");
+    if (reserved.kind === "denied") {
+      return err("policy_denied", reserved.decision.message ?? "策略拒绝");
     }
     const pending = reserved.pending;
     if (!pending) return err("db_unavailable", "创建失败");
@@ -678,7 +678,7 @@ export async function createTunnel(
       outGroupId: outGroup.id,
       outGroupOwned: outGroup.workspace_id === input.workspaceId,
     });
-    if (!decision.allowed) return { denied: decision } as const;
+    if (!decision.allowed) return { kind: "denied", decision } as const;
 
     const pending = asRow<TunnelRow>(
       await tx.tunnel.create({
@@ -706,10 +706,10 @@ export async function createTunnel(
         },
       }),
     );
-    return { pending } as const;
+    return { kind: "pending", pending } as const;
   });
-  if ("denied" in reserved) {
-    return err("policy_denied", reserved.denied.message ?? "策略拒绝");
+  if (reserved.kind === "denied") {
+    return err("policy_denied", reserved.decision.message ?? "策略拒绝");
   }
   const pending = reserved.pending;
   if (!pending) return err("db_unavailable", "创建失败");
