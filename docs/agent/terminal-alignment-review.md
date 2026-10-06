@@ -19,6 +19,20 @@
 
 **证据类别**（本评审实际用到的）：① 干净检出读码（给 `文件:行`）；② 干净检出上跑只读命令（`tsc --noEmit`、`bun test` 指定文件）；③ 只读 HTTP 打 `127.0.0.1:18180`；**外加**④ 只读 SQL / `docker logs`（真机事实）。**本评审没有使用浏览器**（无截图、无 DOM 取证），凡是"页面渲染成什么样"的结论都只到「组件行为 + 已挂载」这一层。
 
+### 0.1 审计期间 HEAD 被推进（按纪律重新取 SHA 并标注）
+
+| 时刻 | HEAD | 说明 |
+|---|---|---|
+| 03:34（评审开始） | `2037d057342d3887e327ece4d0ff4b884759f520` | 本报告 §1–§3 的代码引用以它为准（干净检出 `/tmp/r6-misc-truth-2037d05`） |
+| 03:52（复核时发现已推进） | `57d252080ce395cfd7e5897e7d7aafa241c8564e` | 03:51:53 `feat(harvest): F1 收口（探针内建，零依赖增长）+ SMTP 配置真话化 + 部署演练结论` |
+
+`57d2520` 相对 `2037d05` 改了 17 个文件；**与本评审三条对象有关的文件一个都没变**（`worker.ts`、`notification-facts-trigger.ts`、`routes/forwards.ts`、`routes/looking-glass.ts`、`forward-ha-card.tsx`、通知三件 UI 均不在 diff 内）⇒ §1–§3 的结论**沿用**。受影响的**旁项**按新 HEAD 重核：`node-health-service.ts`（+44，Agent 版本基线语义分类）、`settings-manager.tsx`（+8）与 `admin.ts:326`（SMTP 真话化，见 §1.7）。第二次干净检出：`/tmp/r6-misc-truth-57d2520`。
+
+### 0.2 真机证据的版本边界（必须和结论一起读）
+
+- scratch Panel/Worker 跑的是镜像 `tunex-harvest-backend:n4-0314`，**不是** HEAD 构建。§1/§2/§3 里"只读 HTTP / 真库"的结论，严格说是**该镜像**的行为；我判断"它与 HEAD 一致"的依据是端点返回形状与 HEAD 代码逐字段吻合（`/ha` 的 `preference_rejection`/`accepts_new_business`、`/looking-glass/status` 的 `platform_admin_override` 等）。
+- 反例（证明镜像确实可能落后于 HEAD）：`GET /api/admin/system/config` 在该镜像上**仍列出** `SMTP_PORT/SECURE/USER/PASS/FROM`，而 HEAD 的 `settings-manager.tsx:42-62` 与 `admin.ts:326` 已经**不再列、且拒写**它们。⇒ **不要把真机 HTTP 当成"HEAD 的验收"**，它只是"某次构建的真机行为"。
+
 ## 1. 落后理由 ①：通知「配好也没有任何东西会被投递」
 
 **复核结论：部分消除（接线已真，端到端投递未证实）。**
@@ -27,7 +41,7 @@
 
 - `backend/src/worker.ts:46`：`CRON_JOBS` 里有 `{ name: "cron_notification_facts", everyMs: 30_000, ... }`。
 - `backend/src/worker.ts:242-266`：`case "cron_notification_facts"` 动态 `import` 真实服务并调用 `runForwardDenialNotifications(defaultForwardDenialDeps())`；异常被 `console.error("[worker] cron_notification_facts failed:", ...)` 留痕而不是静默吞掉。
-- `backend/src/services/notification-facts-trigger.ts:640-668`：生产依赖是**真**依赖——`collectAttention(...)` 取事实、`loadPlatformChannelConfig(db)` 读渠道、`enabledNotificationChannels(...)` 过部署级闸门、`createPrismaLedgerStore()` 写账本；配置读取失败时**不**谎称"这台安装没配渠道"，而是回落 + `warn(...)`（`:650-657`）。
+- `backend/src/services/notification-facts-trigger.ts:622-668`（`defaultForwardDenialDeps()`；`loadChannels` 在 `:645-658`，`deliverFacts` 在 `:659-667`）：生产依赖是**真**依赖——`collectAttention(...)` 取事实、`loadPlatformChannelConfig(db)` 读渠道、`enabledNotificationChannels(...)` 过部署级闸门、`createPrismaLedgerStore()` 写账本；配置读取失败时**不**谎称"这台安装没配渠道"，而是回落 + `warn(...)`（`notification-facts-trigger.ts:655-658`；抛错分支另有 `:592`）。
 - **真机日志**（`docker logs tunex-it-worker`，`--since 12h`）：`[worker] cron_notification_facts ok (29xxx ms since enqueue)` 以 ~30s 一拍持续出现（同一窗口 ≥15 拍，与 `cron_reconcile_v3` / `cron_ddns_sync` 同频）。对照：另一个 worker 容器（镜像 `ghcr.io/paimoncai/tunex:latest`，非本 HEAD 构建）**没有**这条节拍——说明这条节拍来自 HEAD 代码，不是"旧镜像里本来就有的东西"。
 
 ### 1.2 渠道配置：**UI 与端点都已到位**（只读 HTTP + 读码）
@@ -74,4 +88,158 @@ Panel access log 里 `2026-10-06T19:16:25Z`（= 03:16 +08）有 `GET /api/notifi
 2. **Telegram 真投递**：无 bot token、`notification_channel` 零行 ⇒ 从未真的调用过 Bot API；
 3. **"配好一个渠道 → 产生一条真实事实 → 账本出现 sent 行"** 的完整链：需要①有拒绝事实 ②有可用渠道 ③三者在真机上串起来——本次拓扑三者一个都不具备。
 
+### 1.7 HEAD 推进后的新增事实：email 渠道**不再能从 UI 配置**（task-14 选了方案 (b)）
+
+在 `57d2520` 上核到（读码 + **我自己跑**的定点测试）：
+
+- `web/src/components/admin/settings-manager.tsx:42-62`：SMTP 归入**部署级**配置，页面给通知（"邮件发送读取的是部署环境的变量，因此管理端不提供 SMTP 写入项（写进这里也不会生效）"），历史 `SMTP_*` 行**被忽略、不删**。
+- `backend/src/routes/admin.ts:326`：`PUT /api/admin/system/config/SMTP_*` → **400 `deployment_level_config`**（明确拒绝，不是静默无效）。
+- `backend/src/services/mail.ts` 仍是"只读 env"（本次未变）⇒ 语义一致：**邮件只能由部署环境配置**。
+- 我自己在干净检出（`/tmp/r6-misc-truth-57d2520`；`DATABASE_URL`/`AUTH_SECRET` 用一次性假值、存储走受控替身、Redis 指向死端口）跑：
+  `bun test backend/src/services/__tests__/notifications/smtp-deployment-config.test.ts` → **5 pass / 0 fail**（PUT 全拒 + GET 不再列出 + 历史行仍在 + 其它键回归）。
+- **对判定意味着什么**：这是**又一处"界面不再骗人"**的改进（对应 R5-A 的 N-F1：写进 UI 却没读者）。但它**没有**让邮件渠道变得"可用"——只是把"配了没用"改成"如实说不能在这里配"。所以通知这条的结论不变：**接线已真、端到端未证**；email 的端到端要成立，还额外需要部署环境真的给上 SMTP 凭据。
+
+## 2. 落后理由 ②：高可用 / 多入口「无产品面」
+
+**复核结论：已消除（读投影 + 挂载 + 三态可分，均有真机 HTTP 佐证）；但「多入口分组」这一层仍然是刻意不做的取舍。**
+
+### 2.1 端点真的存在，且真的返回真事（只读 HTTP）
+
+`GET /api/forwards/{1,2,3}/ha` → **200**（对 Integration Primary 工作区里 3 条转发逐一实测），逐字形状：
+
+```json
+{"forward_id":1,"preferred_ingress_node_id":null,"active_ingress_node_id":1,
+ "policy":{"auto_failover":false,"auto_failback":false,"parse_error":null},
+ "failover_candidate":{"status":"none","node_id":null,"reason":null},
+ "preference_options":{"status":"ok","nodes":[{"node_id":1,"name":"Integration-IN-A-NODE","role":"ingress",
+   "node_group_id":1,"is_active_ingress":true,"is_preferred":false,"can_be_preferred":true,
+   "preference_rejection":null,"connection":"online","lifecycle":"active",
+   "accepts_new_business":true,"admission_rejection":null}]}}
+```
+
+- 路由声明：`backend/src/routes/forwards.ts:641`（`forwardsRoutes.get("/:id/ha")`），鉴权走 `authorizeForward(c, id, "read")`（`:644`）⇒ 工作空间作用域，不是新的越权面。
+- **期望 / 事实 / 候选三层在同一个载荷里就是分开的字段**：`preferred_ingress_node_id`（期望）vs `active_ingress_node_id`（事实）vs `failover_candidate`（平台此刻的候选判定）。
+- 每个备选节点同时带**期望侧**（`is_preferred` / `can_be_preferred` / `preference_rejection`）与**事实侧**（`connection` / `lifecycle` / `accepts_new_business` / `admission_rejection`），事实侧复用 `projectUserNode`（`:722-731`），不是前端另算。
+
+### 2.2 三态可分（读码，且与真机返回值对齐）
+
+`backend/src/routes/forwards.ts:664-684`：
+- `failover_candidate.status` = `none`（真的没有候选）/ `available` / `unavailable`（**查候选时抛异常**，`reason:"candidate_query_failed"`，且**不回显 SQL 细节**）。代码注释即写「「读不到」≠「没有候选」」。
+- `preference_options.status` = `ok` / `unavailable`（`:736`），`unavailable` 时 `nodes: []` 但**不**能被读成"这个组里没有节点"。
+- 真机实测拿到 `none` + `ok`；`available` / `unavailable` 两态我**没有**在真机上制造出来（需要改库或断依赖，超出只读纪律）⇒ 只算代码 + 组件测试级证据。
+
+### 2.3 策略缺省即关被如实呈现（读码 + 真库 + 只读 HTTP 三处一致）
+
+- 真库：`config.FAILOVER_POLICY = {"auto_failover":false,"auto_failback":false}`（只读 SELECT）。
+- 只读 HTTP：`policy.auto_failover=false / auto_failback=false`（上面 JSON）。
+- 读码：卡片对 `false` 只有一种呈现——`forward-ha-card.tsx:129-131`「平台未启用自动迁移：这条转发不会因为入口故障而自动改归属」+「这是本部署当前的策略真值（`FAILOVER_POLICY` 缺省即关），不是这条转发的问题，也不是「暂时」的状态」；判定函数 `policyEnabled()`（`:368-369`）只认 `=== true`，**没有任何乐观解释**；坏 JSON → `policy.parse_error` 单独一态，文案明说这是「配置坏了」而不是「运维没开」（`:138-139`）；卡片**刻意不提供策略开关**（`:140`「策略是只读的……避免界面与运维配置成为两份真相」）。
+- 真机面板上这条转发的策略由**同一个读者**读出：`readFailoverPolicy()`（`forwards.ts:657`；候选判定 `pickFailoverDestination` 在 `:662-674`），与 failover 循环同一实现 —— 不存在"UI 一套、worker 一套"。
+
+### 2.4 挂载与写路径
+
+- 挂载：`web/src/components/forwards/forward-detail.tsx:306-308` `<ForwardHaCard forwardId={forward.id} />`（无条件渲染，不藏在 relay/direct 分支后）。
+- 「首选入口」的写端点存在：`forwards.ts:548`（`PUT /:id/preferred-ingress`）。**我没有执行它**（写操作，超出只读纪律）⇒ 写路径只有代码级证据，卡片里"期望"的措辞纪律（`:227`「偏好只是期望……设置它不会立即改变归属」）我按读码接受。
+- 干净检出定向测试（含该卡片）：`bun test .../forward-ha-card.test.tsx` 在内 146 pass / 0 fail（与 §1.3 同一次运行）。
+
+### 2.5 仍然落后的那一层（不等于本条未消除，但要写清楚）
+
+ForwardX 的 `ForwardGroup` 是**多入口分组**产品面（5 种模式、4 种 failover 策略、成员 priority、分组删除影响预览、链路自测）。TuneX 本轮给的是**单条转发视角的只读 HA 事实 + 一个期望（首选入口）**。也就是说：R5-A 说的"无产品面"（用户看不到任何 HA 事实）**已经消除**；"多入口分组管理"**没有**做，而且按专项记录它是**刻意不做**的取舍（后端无 ForwardGroup 概念，不为了对齐而新造）。
+
+## 3. 落后理由 ③：诊断「Web 侧不存在」
+
+**复核结论：已消除（有 Web 消费者、有挂载、状态可分、`enabled:false` 与「取不到」在服务端与客户端两侧都分得开）。**
+
+### 3.1 有消费者、有挂载（读码）
+
+- 服务端：`backend/src/routes/looking-glass.ts:80`（`GET /status`）、`:112`（`POST /nodes/:id/tests`）；挂载 `backend/src/app.ts:207`（`/api/looking-glass`），并在 `:83` 的挂载表里登记。
+- Web 消费者（R5-A 当时 grep 为 0）：`web/src/lib/api/looking-glass.ts`、`web/src/components/nodes/looking-glass-panel.tsx`。
+- 挂载点：`web/src/components/nodes/node-workspace.tsx:961` —— `{selectedIngress ? <LookingGlassPanel nodeId={selectedIngress.id} /> : null}`（用户域 `/nodes`，选中入口节点后出现；**不是**管理端专属）。
+
+### 3.2 `enabled:false` 与「取不到」可分（两侧都分）
+
+- 服务端（读码 + 真机）：`routes/looking-glass.ts:72-79` 注释与实现明确——**`enabled:false` 不返回 403**：「UI 需要能回答"为什么没有这个入口"，而一个会 403 的状态端点会让前端把"未启用"显示成"出错了"」。真机实测：`GET /api/looking-glass/status` → **200**
+  `{"data":{"enabled":false,"switch_env":"LOOKING_GLASS_ENABLED","platform_admin_override":true,"method":"tcp_connect","caps":{...,"methods":["tcp_connect"]},"targets":"public-only（私网/回环/链路本地/多播/保留段一律拒绝）","caveats":[...4 条...]}}`
+- 客户端（读码）：`looking-glass-panel.tsx:342-364` 的相位机 `loading / unavailable / permission_denied / disabled / admin_override / ready`，其中 `if (!readable) return "unavailable"`（取不到）与 `if (status.enabled) return "ready"` / `platform_admin_override ? "admin_override" : "disabled"`（读到了、但没开）是**两个分支**；`:752-757` 的注释把这条纪律写明：「取不到（不可读）与没开启（可读的 `enabled:false`）互不冒充；权限不足是第三种」。
+- 文案也分：`:118-121` `disabled` =「平台未开启这项诊断」+ 说出开关名 + 找谁开；`:185` `unavailable` =「取不到……这不等于"平台没开"，也不等于"节点坏了"」。
+- 真机在这个拓扑上会走 `admin_override` 分支（`platform_admin_override:true`），即"没开但平台管理员仍可用"，这与服务端字段语义一致（`:88-89`）。
+
+### 3.3 状态与失败语义（读码 + 组件测试）
+
+- 结果行是闭集外的"未知"分支（`resultStatusText`，注释「闭集之外的状态走"未知"分支，绝不显示成某一种成功」）；拒绝都带 `code` + `error_layer` 且发生在**发包之前**（`routes/looking-glass.ts:104-148`）。
+- caveats 是**服务端下发**的诚实边界（不是前端编的）：真机返回值含「连上只证明 L3/L4 可达，不证明对端业务可用」「域名由面板解析、节点只拨固定地址：因此它不能回答「节点侧 DNS 能否解析该域名」」「不含 UDP/ICMP」「不含任何数据面载荷与凭据；每次发起与拒绝都会写审计」。
+
+### 3.4 明确没有复核到的部分
+
+- **没有跑过一次真实的 Looking Glass 测试**（`POST /nodes/:id/tests` 是 POST，虽然不改业务状态，但它会写审计并驱动 agent 发包；本次只读纪律下我不执行）⇒ "点一下真的能出结果"这一点，只有代码 + 该面板的组件测试支撑，以及 `state` 里 `platform_admin_override:true` 的可达性前提。
+- 与 ForwardX 相比，方法集仍是 **1 种**（`tcp_connect`，`services/looking-glass.ts` 的 `LOOKING_GLASS_METHODS`，与真机 `caps.methods` 一致）vs 对方 **7 种**（我**自己**在参考副本 `server/lookingGlassAgentTasks.ts:3` 与 `server/routers/lookingGlass.ts:23` 读到 `ping/ping6/traceroute/traceroute6/mtr/mtr6/tcp`；R5-A 写的是 8 种含 iperf3，这一点我**没有**核到）。**R5-A 的落后理由里"Web 侧不存在"已消除，但"方法集落后一个量级"没有变。**
+
 ---
+
+## 4. 对齐矩阵：受影响的行的"当时 → 现在"
+
+> ForwardX 侧描述沿用 R5-A 的只读观察（**我另标**了我自己复核到的部分）；TuneX 侧一律是本评审自己的证据。未列出的行 = 本次**未重新审计**，沿用 R5-A 判定（不作为本报告结论）。
+
+| 能力 | 当时（R5-A） | 现在（本评审，HEAD `57d2520`） | 判定变化 |
+|---|---|---|---|
+| **通知** | **落后**：渠道端点已提交但 admin UI 缺失；事实类**零调用者**；worker **零通知节拍** ⇒"配好也没有任何东西会被投递" | 三条都已经在了：`cron_notification_facts` 注册且在真机每 30s 一拍（日志 ≥15 拍）；渠道配置独立页 + 导航项 + 三态 UI；用户偏好与**投递账本读投影**都挂了（`settings-body.tsx:333/338`）。**但**：真库 `notification_delivery` **0 行**、`notification_channel` **0 行**、SMTP 无凭据、工作区无拒绝事实 ⇒ **端到端投递从未发生**；email 渠道 HEAD 起**只能部署级配置**（§1.7） | **落后 ⇒ 部分消除**（接线消除、端到端未证） |
+| **高可用 / 多入口** | **落后**：无 ForwardGroup 概念；HA 只是 `SystemConfig` 里一个 JSON；用户看不到"为什么没切" | 用户侧有了**只读投影** `GET /api/forwards/:id/ha`（真机 3 条转发 200）+ 挂在 Forward 详情的卡片（`forward-detail.tsx:306-308`）；策略/期望/事实/候选/备选**四层字段分开**；三态 `none/available/unavailable` 与 `preference_options ok/unavailable` 可分（`forwards.ts:668-674` / `:736`）；"缺省即关"三处一致（真库 / HTTP / 文案）；**多入口分组**（ForwardX 的 5 模式 / 4 策略）仍**不做**（后端无该概念，属刻意取舍） | **落后 ⇒ 已消除（"无产品面"）**，余留"分组管理"是取舍而非缺失 |
+| **诊断** | **落后**：Web 侧对 `/api/looking-glass/*` **零消费**，后端只 1 方法 | 有消费者（`lib/api/looking-glass.ts`）且**已挂载**（`node-workspace.tsx:961`，用户域选中入口节点即出现）；`enabled:false`（200，非 403）与"取不到"在服务端与客户端两侧都分开（相位机 6 值，`panel:342-364/752-757`）；五态 testid 与文案独立。**方法集仍是 1 vs 7**（我自核的上界） | **落后 ⇒ 部分消除**（入口消除、方法集仍落后一个量级） |
+| **Forward 创建（多跳）** | **落后**：`middle_node_id` 在 web 全仓 0 命中 | 已接线：`forward-create-dialog.tsx:12` 引入 `ForwardMultihopSection`，`:157-171` 仅 relay 渲染、缺前置即禁提交；模型 `forward-multihop-model.ts` 与后端两段绑定判据同源。**我没有**在真机上创建过多跳转发（需写操作） | **落后 ⇒ 已接线（代码级）**；"5 跳 + chain/failover 中继模式"仍落后 |
+| **升级** | **落后**：`TUNEX_AGENT_LATEST_VERSION` 缺省空 ⇒ 永不判落后；用户域无实报版本投影 | `GET /api/nodes/:id/upgrade-state` 已提交（`nodes.ts:305`）+ Web 客户端（`lib/api/node-upgrade.ts:76`）；`node-health-service.ts` 把基线**分类**成 `unset/comparable/uncomparable`（unset 仍=不判版本，但不再静默）。**缺省空 ⇒ 默认部署仍不提示"落后"** 这一点没变 | **部分消除**（可判定性/真话性改善，默认部署仍不提示） |
+| **首启引导（面板自身）** | **落后**（矩阵混合行的后半） | 未变：`web/src/app/` 下没有 Setup 向导（只有 `(admin)/(auth)/(user)/page.tsx`） | 仍落后（本次只做"存在性"核对） |
+
+**未受影响/未重审**：Agent 接入、DDNS、可观测（带宽行）、权限多租户、治理 —— 前两项我做了"存在性"核对（DDNS 仍 `cloudflare/huawei` 两种；用户域仍无带宽/主机资源序列），判定沿用 R5-A。
+
+---
+
+## 5. 退出条件 #10 的终局判定
+
+### 判定：**未达成**（但性质已改变：从"通路不存在"降级为"未证实 + 覆盖面"）
+
+**一句话可复核理由**：R5-A 的三条落后理由里 ②③（HA 无产品面、诊断 Web 侧不存在）**已被我用真机证据消除**，①（通知）**只消除了"没有生产调用者/没有渠道 UI"**——真库 `notification_delivery` **0 行**、`notification_channel` **0 行**、SMTP 无凭据、工作区无拒绝事实，**通知从未端到端投递过任何一条**；同时"核心日常体验"一侧仍有 4 项**未动的日常可见差距**（用户域无带宽/吞吐序列、DDNS 仅 2 家、诊断方法集 1 vs 7、默认部署永不提示版本落后）与 1 项一次性部署差距（面板首启无 Web 向导）⇒ 不能判"不再明显落后"。
+
+**为什么不是"基本达成"**：判"基本达成"意味着"剩余差距不改变结论"。我不同意这一点，理由是通知那条**只有设计证据、没有任何一次真实投递**——而它恰恰是 R5-A 列的**第 1 号差距**；把"从未发生过"算作"不再明显落后"，与本次专项"不把未证实写成通过"的纪律冲突。
+
+### 最短路径（1–3 件事，做完即可翻转）
+
+1. **通知的一次真实端到端投递（第一优先，也是唯一"达标即翻转"的一件）**：在生产形态上跑通 `真实拒绝事实 → 打开的渠道 → 账本出现 sent 行 → 收件端确实收到`。走 email 需要先定部署级 SMTP 的交付形态（HEAD 已明确不在 UI 配置，那就必须在**部署文档 + 安装器**里给出可用的配置与一次测试发信）；走 Telegram 则需要一个可用 bot token。**并顺便演示至少一种失败态**（`rejected_target` / `secret_unreadable`）以证明"失败可见"不是空跑。
+2. **补一条用户日常可见的宽度差距**（择一即可）：**用户域带宽/吞吐时间序列**（`host_metrics` 解析已在，缺用户投影）——这是 ForwardX 日常项里最直的一处；或**让默认部署能给出"版本落后/无法判定"**（现在 `unset` = 永不提示）。
+3. （若要求与 ForwardX 诊断同量级）Looking Glass 补 1–2 种方法（ping / traceroute 或 mtr），把 1 vs 7 缩到同一量级。
+
+### 关于退出条件 #1 现在"未达成"（task-31 部署演练结论）—— 我的裁定
+
+**#1 不影响 #10 的判定方向，但我不把它计入 #10 的证据。** 理由：`#10` 问的是**运行期日常体验**是否明显落后于 ForwardX，`#1` 问的是**能不能按文档把面板部署起来**——两者是不同阶段的门槛，把它们互相折算会让两个条件都失去分辨率（这正是"一个条件救另一个"的典型失效模式）。我据此：①**没有**把 task-31 的结论写进 §1–§3 的任何证据；②仍然独立判 #10 未达成（理由见上）；③但要说明一句**判断口径上的连带影响**：#1 未达成意味着"整体产品化距可宣称不落后还有距离"，所以**我不会因为三条理由里两条被消除，就把 #10 抬成"基本达成"来给出一个更好看的结论**——门槛应当是"至少一次真实端到端投递 + 至少一条日常宽度差距被补齐"。若 Lead 认为 #1 的修复（task-34/35）完成后应重新评估 #10，我同意**重评**，但那时的翻转依据仍应是 §5 的最短路径，而不是 #1 的状态本身。
+
+---
+
+## 6. 未复核 / 未验证清单（必须与结论一起读）
+
+### 6.1 我没有做的验证
+
+1. **没有浏览器**：全程没有打开页面、没有截图、没有 DOM 取证。所有"页面会显示成 X"的结论都只是「组件行为（渲染测试/读码）+ 已挂载（读码）」。
+2. **没有执行任何写操作**：`PUT /api/forwards/:id/preferred-ingress`、`POST /api/looking-glass/nodes/:id/tests`、渠道 PUT/DELETE、免打扰 PUT、`notification-channel` 配置——全部只读核对（代码 + 只读 GET）；因此"设置首选入口真的能写成"、"LG 点一下真的能出结果"只有代码级证据。
+3. **`failover_candidate=available` / `preference_options=unavailable` 两态没在真机造出来**（需要改库或断依赖）。
+4. **多跳创建路径没有真机跑通**（需写操作），只有"已接线 + 提交参数"的代码证据。
+5. **没有跑全量 `bun test` / `next build`**（本评审是只读审计，不是回归门禁）。跑过的是：干净检出 `tsc --noEmit`（web，exit 0、零诊断）、web 5 个定向组件测试（146 pass/0 fail）、backend SMTP 真话化测试（5 pass/0 fail）。
+6. **`n4-0314` 镜像与 HEAD 的等价性没有证明**（§0.2 给了反例）；真机结论按镜像口径读。
+7. **§1.5 那条 `deliveries/5 → 200`（03:16）→ 现在 404/整表 0 行**：我**没有**找到原因（未追查验收脚本是否清理过账本，也没有在库里找到历史行）。它没有被用作任何结论。
+
+### 6.2 从文档看到、但我**没有**复核的
+
+| 内容 | 来源 | 状态 |
+|---|---|---|
+| ForwardX 的 `Setup.tsx`（面板首启向导 748 行）、`HostMonitor.tsx` 带宽/CPU 图表、`ForwardGroup` 5 模式 / 4 策略 / priority / 删除影响预览 / 链路自测、SMTP 页的"测试请求" | R5-A §2/§5 | **未复核**（我没有打开这些文件） |
+| ForwardX 支持 8 种 Looking Glass 方法（含 iperf3） | R5-A §1 #8 | **部分复核**：我自核到 **7 种**（见 §3.4），iperf3 未核到 |
+| ForwardX DDNS ≥6 provider | R5-A §2 | **部分复核**：我自核到 `disabled/cloudflare/webhook/huaweicloud/aliyun/tencentcloud`（5 家 + disabled），与"≥6"一致 |
+| `status §3.34` 的对账表 | 被评审对象 | **按纪律未作为证据**（只用来定位需要复核的对象） |
+| task-31 的部署演练结论（缺 `LICENSE_SECRET` 阻断启动、钉版本静默回退陈旧镜像） | Lead 转述 | **未复核**（属 #1 的证据面，我按 §5 的裁定把它排除在 #10 的证据之外） |
+| Lead 的验收截图 `accept-*.png` 与 `acceptance-final.json` | `/tmp/tunex-harvest-integration-20261006/` | **未作为证据**（实施方产物）；只在 §1.5 里作为"这条历史痕迹可能来自验收动作"的**排除性**线索提及 |
+
+---
+
+## 7. 本次评审的自我边界
+
+- 本评审**没有能力**回答"用户实际用起来爽不爽"——那需要真实用户/浏览器时长；我回答的是"宣称与已核实事实之间的差"。
+- 我**没有**、也不应该替实施方决定"要不要做多入口分组/带宽序列"这类产品取舍；§5 的最短路径只列"能翻转判定"的最小项。
+- 报告里所有"已消除"都**限定在它自己的那句落后理由的语义内**（例如诊断的"Web 侧不存在"已消除 ≠ 诊断能力已追平 ForwardX）。
+
