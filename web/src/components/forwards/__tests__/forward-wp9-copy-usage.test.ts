@@ -142,6 +142,7 @@ describe("V4-WP9 auto-port — 空值给明确提示，不给假端口号", () =
       expect(t("forward.portPlaceholder")).toMatch(/^\d+$/);
     }
   });
+});
 
 describe("V4-WP9 Binding usage — 只消费后端契约，不重算口径", () => {
   function bindingRow(overrides: Partial<Record<string, unknown>> = {}): NodeBinding {
@@ -212,4 +213,4 @@ describe("V4-WP9 Binding usage — 只消费后端契约，不重算口径", () 
     // 使用中被拒绝时给出机器可读的错误码
     expect(backend).toContain('code: "binding_in_use"');
   });
-
+});
