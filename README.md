@@ -1,72 +1,28 @@
 # TuneX
 
-> 多租户网络转发平台：通过线路（Route Profile）与转发（Forward）组织 TCP / TLS / WebSocket / UDP 数据面。
+> 多租户网络转发平台，通过线路（Route Profile）与转发（Forward）统一管理 TCP、TLS、WebSocket 与 UDP 数据面。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
 [![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
-## 当前状态
+## 项目介绍
 
-TuneX 已进入 **V1 产品化 / Production Beta** 阶段。当前 `main` 是唯一工程基线；当前事实以代码、迁移、当前文档和 CI/Integration 结果为准。
+TuneX 由 Panel 与 Agent 组成。Panel 提供 Web 管理、策略编排和状态管理；Agent 部署在网络节点上，主动连接 Panel 并执行实际的数据转发。
 
-当前主要能力：
+主要能力：
 
-- TCP / TLS / WebSocket / UDP；TCP/TLS/WS 支持 DIRECT / RELAY，UDP 支持 DIRECT / 单跳 RELAY；
-- 2-hop / 3-hop 路径、HA、fencing、自动 failover / failback；
-- Node enrollment、NodeGroup、Route Profile、Forward revision / hot reload / reconcile；
-- Node lifecycle、health、telemetry、诊断、Support Bundle 与 Agent 升级命令；
-- Workspace RBAC、自定义角色、套餐/订单/支付、订阅周期与流量结算；
-- DDNS、公告、Email / Webhook / Telegram 通知渠道；
-- 延迟历史、链路拓扑、默认关闭的 Looking Glass；
-- Federation 的身份、信任、授权、远端租约、用量与产品级 remote egress；
-- 一键安装、备份/恢复/回滚、真实多 Agent Integration 与 build-once release 流水线。
+- TCP / TLS / WebSocket / UDP 转发；
+- DIRECT / RELAY 与多跳路径；
+- Node enrollment、NodeGroup、Route Profile 与 Forward；
+- revision、hot reload、reconcile、HA、fencing、自动 failover / failback；
+- 节点健康、遥测、诊断、Support Bundle 与 Agent 升级；
+- Workspace RBAC、套餐、订阅、订单、支付与流量结算；
+- DDNS、公告、Email / Webhook / Telegram 通知；
+- Federation 身份、信任、授权、远端租约、用量与 remote egress。
 
-当前明确保持关闭的边界：QUIC、UDP 分片重组 / packets 计费 / hop AEAD/MAC / 跨面板 UDP、
-remote transit、跨面板 3+ hop / arbitrary graph、跨面板自动 failover、TLS remote egress 与多 Panel
-信任传递闭包。未开放能力均保持 fail-closed。
+普通用户主要通过 **线路（Route Profile）→ 转发（Forward）** 使用 TuneX；Node、NodeGroup、容量、健康和 Federation 等基础设施能力由管理员维护。
 
-## 产品模型
-
-普通用户主要面对：
-
-```text
-线路（Route Profile）
-        ↓
-转发（Forward）
-        ↓
-流量 / 套餐 / 支持
-```
-
-管理员负责 Node、NodeGroup、Route Profile、容量/健康、诊断与 Federation 等基础设施能力。
-`Tunnel` 保留为兼容与内部 desired/runtime 对象，不再作为新的用户产品入口。
-
-## 架构
-
-```text
-Browser
-   │
-   ▼
-Web / Backend ───── MySQL / Redis / Worker
-   │
-   ├─ Route Profile / Forward / Policy
-   │
-   └─ desired → revision → ACK → applied → reconcile
-                              │
-                              ▼
-                            Agent
-                              │
-             ┌────────────────┼────────────────┐
-             ▼                ▼                ▼
-          DIRECT           RELAY          Multi-hop
-             │                │                │
-             └────────────────┴────────────────┘
-                              ▼
-                            Target
-```
-
-Agent 只主动连接 Panel，不要求公网开放 Agent 管理端口。更完整的当前架构见 [docs/architecture.md](docs/architecture.md)。
-
-## 快速开始
+## 快速部署
 
 需要 Docker 与 Docker Compose v2。
 
@@ -74,46 +30,65 @@ Agent 只主动连接 Panel，不要求公网开放 Agent 管理端口。更完�
 git clone https://github.com/PaiMonCai/TuneX.git
 cd TuneX
 cp .env.example .env
-# 修改 .env 中的数据库密码与安全密钥
+```
+
+修改 `.env` 中的数据库密码、安全密钥和站点配置后启动：
+
+```bash
 docker compose up -d --build
 ```
 
-检查服务：
+检查运行状态：
 
 ```bash
 docker compose ps
 curl http://localhost:8787/healthz
 ```
 
-默认本地入口为 `http://localhost:9091`。
+默认本地 Web 入口：
 
-生产部署请使用 [docs/production-deploy.md](docs/production-deploy.md) 与
-`docker-compose.prod.yaml`。已有 Nginx / 宝塔 / 1Panel 时可直接负责 TLS；
-无宿主机反代时可使用 standalone Caddy overlay。
-
-## Agent
-
-推荐在管理界面创建 Node，再使用 Panel 生成的一键安装命令部署 Agent。
-
-```bash
-cd agent
-go test ./...
-go build ./...
+```text
+http://localhost:9091
 ```
 
-## 验证与发布
+生产环境请使用 [生产部署文档](docs/production-deploy.md) 和 `docker-compose.prod.yaml`。已有 Nginx、宝塔或 1Panel 时，可由宿主机现有反向代理负责 TLS；没有宿主机反代时可使用项目提供的 standalone Caddy 部署方式。
 
-PR 走 Source CI + Fast Integration；`main` 通过 Source CI 后构建一次 Unified/Agent 候选镜像，
-完整 Integration 按候选 digest 验证，Release 只提升同一 digest，不重新构建。
+## 部署 Agent
 
-- [docs/testing.md](docs/testing.md)：当前测试层级、命令和 Integration 验证；
-- [docs/release.md](docs/release.md)：当前 build-once / qualify / promote 发布流程；
-- [docs/production-deploy.md](docs/production-deploy.md)：生产部署、升级、备份、恢复与回滚。
+推荐先在 TuneX 管理界面创建 Node，再使用 Panel 为该节点生成的一键安装命令部署 Agent。Agent 主动连接 Panel，正常部署不需要向公网开放 Agent 管理端口。
 
-## 工程文档
+具体安装、配置、升级和故障处理以 [生产部署文档](docs/production-deploy.md) 为准。
 
-- [DEVELOPMENT.md](DEVELOPMENT.md)：当前开发入口；
-- [docs/architecture.md](docs/architecture.md)：当前架构与事实边界；
-- [docs/engineering.md](docs/engineering.md)：工程规则与变更纪律；
-- [docs/testing.md](docs/testing.md)：测试与验证；
-- [docs/release.md](docs/release.md)：发布流水线；
+## 更新与升级
+
+升级前建议先备份数据库、配置和必要的持久化数据。
+
+使用源码部署时：
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+生产环境升级应遵循 [生产部署文档](docs/production-deploy.md) 中的升级、数据库迁移、备份、恢复与回滚流程，不建议跳过迁移或直接替换持久化数据。
+
+Agent 应通过 TuneX 提供的节点升级流程或当前生产部署文档规定的方式升级，避免手工替换二进制造成版本与配置不一致。
+
+## 运行验证
+
+部署或升级后至少确认：
+
+```bash
+docker compose ps
+curl http://localhost:8787/healthz
+```
+
+随后在管理界面确认 Node 在线，并验证至少一条实际 Forward 可以正常建立和传输流量。
+
+## 文档
+
+- [生产部署、升级、备份与恢复](docs/production-deploy.md)
+- [架构说明](docs/architecture.md)
+- [开发者入口](DEVELOPMENT.md)
+- [测试与验证](docs/testing.md)
+- [发布流程](docs/release.md)
