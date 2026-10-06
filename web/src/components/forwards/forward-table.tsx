@@ -14,7 +14,9 @@ import type { Locale } from "@/lib/i18n";
 import type { PortForward } from "@/lib/types";
 import type { ForwardSortKey, ForwardSortOrder } from "@/components/forwards/forward-list-model";
 
+import type { ForwardListTextKey } from "@/components/forwards/forward-list-model";
 type Translate = (key: string, params?: Record<string, string | number>) => string;
+type ListText = (key: ForwardListTextKey, params?: Record<string, string | number>) => string;
 type ForwardAction = "retry" | "suspend" | "resume";
 
 function SortableHead({ label, sortKey, sort, order, onSort }: {
@@ -37,7 +39,7 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
   actionBusy, locale, t, text, canUpdate, canDelete, onSort, onSelectAll, onSelect, onAction, onEdit, onCopy, onDelete }: {
   forwards: PortForward[]; loading: boolean; sort: ForwardSortKey; order: ForwardSortOrder; selectedIds: Set<number>;
   allPageSelected: boolean; canUpdateAny: boolean; canCreate: boolean; actionBusy: number | null; locale: Locale;
-  t: Translate; text: Translate; canUpdate: (forward: PortForward) => boolean; canDelete: (forward: PortForward) => boolean;
+  t: Translate; text: ListText; canUpdate: (forward: PortForward) => boolean; canDelete: (forward: PortForward) => boolean;
   onSort: (key: ForwardSortKey) => void; onSelectAll: (checked: boolean) => void; onSelect: (id: number, checked: boolean) => void;
   onAction: (forward: PortForward, action: ForwardAction) => void; onEdit: (forward: PortForward) => void;
   onCopy: (forward: PortForward) => void; onDelete: (forward: PortForward) => void;
