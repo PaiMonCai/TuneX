@@ -2447,16 +2447,23 @@ export async function sweepRevokedLeaseCleanup(
       if (d.teardown === null) {
         note = "teardown hook is not wired";
       } else {
-        const res = await d.teardown({
-          lease_ref: lease.lease_ref,
-          peer_panel_id: lease.peer_panel_id,
-          intent_id: lease.intent_id,
-          node_id: lease.node_id,
-          listen_port: lease.listen_port,
-          hop_role: hopRole,
-          lease_epoch: lease.lease_epoch,
-          reason: "revoked",
-        });
+        const res = await Promise.resolve()
+          .then(() =>
+            d.teardown!({
+              lease_ref: lease.lease_ref,
+              peer_panel_id: lease.peer_panel_id,
+              intent_id: lease.intent_id,
+              node_id: lease.node_id,
+              listen_port: lease.listen_port,
+              hop_role: hopRole,
+              lease_epoch: lease.lease_epoch,
+              reason: "revoked",
+            }),
+          )
+          .catch((error: unknown) => ({
+            ok: false as const,
+            message: error instanceof Error ? error.message : String(error),
+          }));
         stopped = res.ok;
         if (!res.ok) note = res.message ?? "teardown failed";
       }
@@ -2474,7 +2481,17 @@ export async function sweepRevokedLeaseCleanup(
     let portReleased = true;
     let note: string | null = null;
     if (hasPort) {
-      const rel = await d.releasePort({ node_id: lease.node_id as number, port: lease.listen_port as number });
+      const rel = await Promise.resolve()
+        .then(() =>
+          d.releasePort({
+            node_id: lease.node_id as number,
+            port: lease.listen_port as number,
+          }),
+        )
+        .catch((error: unknown) => ({
+          ok: false as const,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       portReleased = rel.ok;
       if (rel.ok) result.ports_released++;
       else {
@@ -2608,16 +2625,23 @@ export async function expireLeases(
     if (d.teardown === null) {
       stopMessage = "teardown hook is not wired";
     } else {
-      const res = await d.teardown({
-        lease_ref: lease.lease_ref,
-        peer_panel_id: lease.peer_panel_id,
-        intent_id: lease.intent_id,
-        node_id: lease.node_id,
-        listen_port: lease.listen_port,
-        hop_role: hopRole,
-        lease_epoch: lease.lease_epoch,
-        reason: "expired",
-      });
+      const res = await Promise.resolve()
+        .then(() =>
+          d.teardown!({
+            lease_ref: lease.lease_ref,
+            peer_panel_id: lease.peer_panel_id,
+            intent_id: lease.intent_id,
+            node_id: lease.node_id,
+            listen_port: lease.listen_port,
+            hop_role: hopRole,
+            lease_epoch: lease.lease_epoch,
+            reason: "expired",
+          }),
+        )
+        .catch((error: unknown) => ({
+          ok: false as const,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       stopped = res.ok;
       if (!res.ok) stopMessage = res.message ?? "teardown failed";
     }
@@ -2626,7 +2650,7 @@ export async function expireLeases(
       result.teardown_failed++;
       if (lease.node_id !== null && lease.listen_port !== null) result.ports_pending++;
       await d.db.federationLease.updateMany({
-        where: { id: lease.id, lease_epoch: lease.lease_epoch },
+        where: { id: lease.id, lease_epoch: lease.lease_epoch, state: "releasing" },
         data: { state: "failed", last_error_code: "internal_error", last_error: stopMessage },
       });
       continue;
@@ -2637,7 +2661,17 @@ export async function expireLeases(
     let portReleased = true;
     let portMessage: string | null = null;
     if (lease.node_id !== null && lease.listen_port !== null) {
-      const rel = await d.releasePort({ node_id: lease.node_id, port: lease.listen_port });
+      const rel = await Promise.resolve()
+        .then(() =>
+          d.releasePort({
+            node_id: lease.node_id as number,
+            port: lease.listen_port as number,
+          }),
+        )
+        .catch((error: unknown) => ({
+          ok: false as const,
+          message: error instanceof Error ? error.message : String(error),
+        }));
       portReleased = rel.ok;
       if (!rel.ok) {
         portMessage = rel.message ?? "port release failed";
