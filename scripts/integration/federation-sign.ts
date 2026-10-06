@@ -38,7 +38,9 @@ if (body.length > 0) {
   }
 }
 
-// The unified production image keeps backend sources under /app/backend/src.\n// TUNEX_SRC_DIR remains available for local/alternate image layouts.\nconst srcDir = (process.env.TUNEX_SRC_DIR ?? "/app/backend/src").replace(/\\/+$/, "");
+// The unified production image keeps backend sources under /app/backend/src.
+// TUNEX_SRC_DIR remains available for local/alternate image layouts.
+const srcDir = (process.env.TUNEX_SRC_DIR ?? "/app/backend/src").replace(/\/+$/, "");
 const { loadSigningKey } = await import(`${srcDir}/services/federation/identity.ts`);
 const { buildSignatureHeaders } = await import(`${srcDir}/services/federation/signing.ts`);
 
