@@ -1,8 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-} from "lucide-react";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
@@ -71,6 +69,9 @@ import {
   forwardNextSort,
   forwardPageCount,
   type ForwardListState,
+  type ForwardListTextKey,
+  type ForwardModeFilter,
+  type ForwardStatusFilter,
   type ForwardSortKey,
   type ForwardSortOrder,
 } from "@/components/forwards/forward-list-model";
