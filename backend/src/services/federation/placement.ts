@@ -432,7 +432,13 @@ export async function recordPlacementResult(
     data.last_error = input.message ?? null;
   }
 
-  await d.db.federationPlacement.updateMany({ where: { id: existing.id }, data });
+  const updated = (await d.db.federationPlacement.updateMany({
+    where: { id: existing.id },
+    data,
+  })) as { count?: number };
+  if (Number(updated?.count ?? 0) !== 1) {
+    throw new Error("placement result update matched no row");
+  }
 }
 
 /* ================================================================== */
