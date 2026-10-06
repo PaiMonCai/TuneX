@@ -101,7 +101,7 @@ export function NodeWorkspace() {
         return ingressRows[0] ? Number(ingressRows[0].id) : null;
       });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("node.bindingsLoadFailed"));
+      toast.error(err instanceof Error ? err.message : t("node.loadFailed"));
     } finally {
       if (ticket === nodeSeq.current) setLoading(false);
     }
@@ -119,7 +119,7 @@ export function NodeWorkspace() {
       const rows = await api.nodes.bindings(id);
       if (ticket === bindingSeq.current && scope === getActiveWorkspace()) setBindings(rows);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("common.noData"));
+      toast.error(err instanceof Error ? err.message : t("node.bindingsLoadFailed"));
     }
   }
 
