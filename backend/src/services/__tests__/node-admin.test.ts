@@ -822,6 +822,37 @@ describe("updateNodeRole", () => {
     expect(created[0].lb_strategy).toBe("round");
   });
 
+  test("获得 egress 角色后 default 池创建失败 ⇒ 整个事务回滚角色变更", async () => {
+    const node = seedNode({ role: "ingress" });
+    const d = deps();
+    const pd = d.db as NodeAdminDb;
+    const originalCreate = pd.egressPool.create;
+    pd.egressPool.create = async () => {
+      throw new Error("pool db unavailable");
+    };
+
+    const originalTx = pd.$transaction!;
+    pd.$transaction = async <T>(fn: (tx: NodeAdminDb) => Promise<T>): Promise<T> => {
+      const beforeNode = { ...nodes.get(node.id)! };
+      const beforePools = pools.map((p) => ({ ...p }));
+      try {
+        return await originalTx(fn);
+      } catch (error) {
+        nodes.set(node.id, beforeNode);
+        pools.splice(0, pools.length, ...beforePools);
+        throw error;
+      }
+    };
+
+    const result = await updateNodeRole(node.id, { role: "egress" }, d);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("db_unavailable");
+    expect(nodes.get(node.id)?.role).toBe("ingress");
+    expect(pools.filter((p) => p.node_id === node.id)).toHaveLength(0);
+
+    pd.egressPool.create = originalCreate;
+  });
+
   test("同角色重复调用不会重复建池（幂等）", async () => {
     const node = seedNode({ role: "ingress" });
     await updateNodeRole(node.id, { role: "egress" }, deps());
