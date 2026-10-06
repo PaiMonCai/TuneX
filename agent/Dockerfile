@@ -24,8 +24,15 @@ COPY --chmod=0755 agent/docker-entrypoint.sh /usr/local/bin/tunex-agent-entrypoi
 # 主机。curl 不加 `-L` 时根本不跟随重定向，凭据只会发给我们真正想校验的那个地址。
 #
 # 兜底仍然保留 wget（老节点镜像 / 自定义镜像可能没有 curl），但那条路径下结论只会是
-# "未校验"：它取**第一个**状态行并且要求响应体像 Panel 的 JSON，所以既不会被跳转后的
+# "未校验"：它取**第一个**状态行并且要求响应体是 Panel 的 JSON，所以既不会被跳转后的
 # 200 骗过，也不会假装通过。
-RUN apk add --no-cache curl
+#
+# jq 是**同一段落的后半句**：`curl` 解决了"凭据只发给谁"，jq 解决"响应体到底是 JSON 还是
+# 长得像 JSON 的字符串"。没有 jq 时探针只能做形状匹配（对象起始 + `"data":` 键 + 对象
+# 收尾），那种判定会把 `{"data": oops`（"data" 键存在但不是合法 JSON）也算成 Panel 的
+# 响应 —— 于是"200 + 像 Panel JSON"里的"像"字不够硬。装了 jq 就是**真解析**：不是合法
+# JSON、或顶层不是对象、或 `data` 不是对象，一律"未校验"。老镜像没有 jq 时会退回形状
+# 匹配，并且**把这件事告诉操作者**（不会假装做过解析）。
+RUN apk add --no-cache curl jq
 
 ENTRYPOINT ["/usr/local/bin/tunex-agent-entrypoint"]

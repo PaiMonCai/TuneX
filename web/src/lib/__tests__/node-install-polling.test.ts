@@ -678,3 +678,96 @@ describe("消费者回调抛错：不改变闭环判定与轮询语义", () => {
     expect(errors).toEqual([]);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* ⑧ dispose 的事件语义（E2 的 F8：从未 start() 的 dispose 不回调 onStop）  */
+/* ------------------------------------------------------------------ */
+
+describe("安装等待轮询：dispose 的事件语义", () => {
+  /**
+   * 这条**钉住有意行为**（不是「忘了修」）：`onStop` 表示「一次等待被终止」，
+   * 从未开始过的等待没有状态变化可报告。发一个 "disposed" 会让消费方以为刚结束
+   * 了一次等待 —— 现网唯一的消费者（`admin/node-install-waiting.tsx`）就明确
+   * 忽略 "disposed"，正是因为它只代表「收拾现场」。
+   */
+  test("从未 start() 的 dispose()：不回调 onStop、不排期、之后不可 start", async () => {
+    const timers = new FakeTimers();
+    const stops: InstallPollStopReason[] = [];
+    const views: NodeInstallView[] = [];
+    let calls = 0;
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: async () => {
+        calls += 1;
+        return { connection: "online" };
+      },
+      onView: (view) => views.push(view),
+      onStop: (reason) => stops.push(reason),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.dispose();
+    expect(stops).toEqual([]);
+    expect(poller.isActive).toBe(false);
+    expect(timers.pendingTasks).toBe(0);
+    expect(poller.start()).toBe(false);
+
+    await timers.advance(INSTALL_POLL_INTERVAL_MS * 3);
+    expect(calls).toBe(0);
+    expect(views).toEqual([]);
+    expect(stops).toEqual([]);
+  });
+
+  test("dispose() 幂等：重复调用只产生一个事件，定时器清零", async () => {
+    const first = deferred<NodeInstallView>();
+    const timers = new FakeTimers();
+    const stops: InstallPollStopReason[] = [];
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: () => first.promise,
+      onView: () => undefined,
+      onStop: (reason) => stops.push(reason),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.start();
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    poller.dispose();
+    poller.dispose();
+    poller.dispose();
+    expect(stops).toEqual(["disposed"]);
+    expect(timers.pendingTasks).toBe(0);
+
+    first.resolve({ connection: "online" });
+    await flush();
+    expect(stops).toEqual(["disposed"]);
+  });
+
+  /**
+   * 与上一条互补：等待**已经**因为闭环而结束时，dispose 是纯收拾动作 ——
+   * 不能让同一个「结束」事实被报成两个不同原因（closure + disposed）。
+   */
+  test("闭环之后 dispose()：不产生第二个 onStop（结束事实只报一次）", async () => {
+    const timers = new FakeTimers();
+    const stops: InstallPollStopReason[] = [];
+    const poller = new NodeInstallPoller<NodeInstallView>({
+      nodeId: 1,
+      loadView: async () => ({ connection: "online" }),
+      onView: () => undefined,
+      onStop: (reason) => stops.push(reason),
+      now: () => timers.now,
+      timers: timers.api,
+    });
+
+    poller.start();
+    await timers.advance(INSTALL_POLL_INTERVAL_MS);
+    await flush();
+    expect(stops).toEqual(["closure"]);
+
+    poller.dispose();
+    expect(stops).toEqual(["closure"]);
+    expect(timers.pendingTasks).toBe(0);
+  });
+});

@@ -29,8 +29,11 @@
  *    脚本只把 agent.env 挂进容器、由 entrypoint 现场 source，`docker run` 没有
  *    `-e TUNEX_NODE_CREDENTIAL`，所以 exec 里 `$TUNEX_NODE_CREDENTIAL` 是空的。
  *    凭据必须在容器内重新 source agent.env 之后再使用。
- * 2. 标准镜像里**没有 curl**，只有 busybox 自带的 wget。两个都要探测；两个都没有
- *    （或超时、或没配地址）时，结论只能是"未校验"，绝不能显示成通过。
+ * 2. 老镜像里**没有 curl**，只有 busybox 自带的 wget。两个都探测（curl 优先）；两个都
+ *    没有（或超时、或没配地址）时，结论只能是"未校验"，绝不能显示成通过。
+ *    标准镜像自 v5.3 起在 runtime 阶段 `apk add curl jq`（见 `agent/Dockerfile`），
+ *    于是"不跟随重定向"与"真解析响应体"两件事都有工具可用；wget/grep 只服务没有
+ *    curl/jq 的老/自定义镜像。
  *
  * ── "通过"的判据是「200 + Panel 的 JSON 响应体」，不是「某个状态码」 ──
  *
@@ -39,16 +42,30 @@
  * （SPA 兜底路由 / 反代 catch-all / 门户登录页）会被读成 200 并打印"身份校验通过"，
  * 而凭据从未被任何东西校验过；同一个场景下 curl 分支（无 `-L`）给的是 302。所以：
  *
- * 1. 两条分支取**同一份证据**：curl 用 `-w %{http_code}`（不跟随重定向），wget 取
+ * 1. 两条分支取**同一份证据**：curl 用 `-w %{http_code}`（不跟随重定向；另外显式
+ *    `--max-redirs 0`，即使将来有人手滑加上 `-L` 也会直接失败而不是跟随），wget 取
  *    `-S` 输出里的**第一个**状态行（busybox 1.37 的 wget 没有 `--max-redirect`，
  *    无法从命令行禁止跟随，只能不采信后续跳）。
- * 2. 状态码 200 之后还必须**响应体像 Panel 的 JSON**（对象 + `data` 键）。这样
- *    "200 但其实是 HTML"（门户页 / catch-all）也不会被算成通过。
+ * 2. 状态码 200 之后还必须**响应体真是 Panel 的 JSON**：有 `jq` 就**真解析**
+ *    （`type=="object" and (.data|type=="object")`），没有 `jq` 只能退回**形状匹配**
+ *    （对象起始 + `"data":` 键 + 对象收尾）。形状匹配会把 `{"data": oops`（有键、不是
+ *    合法 JSON）误判成 Panel 响应 —— 所以那种情况下探针返回 `http:200:grep`，脚本
+ *    **明确告诉操作者"这是形状匹配、不是解析"**，而不是含糊地说"像 Panel 的 JSON"。
  * 3. 两条分支的分类逻辑**共用同一段 `case`**，不允许各自给结论。
  *
- * 残留（已知、未消除）：busybox wget 仍会真的发出那一跳重定向请求，并在同一主机
- * 的跳转上继续带 `Authorization`（实测 `/login` 收到 `auth_len=32`）。要彻底消除
- * 需要在节点镜像里提供 curl（不跟随重定向）或换成自己发 HTTP 的探针。
+ * 残留（jq 之后仍**故意**不做的部分）：真解析只断言"顶层是对象 **且** `data` 是对象"，
+ * **不校验 `data` 的内部结构**（例如 `snapshot` 键）。再往前一步的代价不是一行 jq，而是
+ * 把 Panel 的载荷 schema 复制进节点脚本事：Panel 侧一次加字段/改形状就会变成全网的
+ * "未校验"，而这条探针要回答的问题只是"这个地址还认我这台节点吗"。所以停在顶层形状，
+ * 并把边界写在这里。
+ *
+ * ── 凭据外发（与"假通过"是两件事）──
+ *
+ * 结论正确 ≠ 凭据没出去：wget 会在跟随跳转时**把 `Authorization` 重发到跳转目标**
+ * （实测另一台 host 收到 `auth_len=32`）。这是这条探针最贵的失败模式 —— 节点长期凭据
+ * 落到第三方主机上。标准镜像现在带 curl（不跟随 ⇒ 凭据只发给原地址）；残留只存在于
+ * **没有 curl 的镜像**，那种情况下脚本仍然不会说谎（结论是"未校验"），但升级前应确认
+ * 节点镜像里有 curl。
  */
 
 import { redactText } from "./redaction.ts";
@@ -344,8 +361,10 @@ PROBE="$(docker exec "$CONTAINER" sh -c '
   HDR="$(mktemp 2>/dev/null || printf "/tmp/.tunex-identity-probe-hdr.$$")"
   CODE=""
   if command -v curl >/dev/null 2>&1; then
-    # curl 默认不跟随重定向（这里不写 -L）：302 就是 302。
-    CODE="$(curl -sS --max-time "$2" -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>/dev/null || true)"
+    # 不写 -L：curl 就不跟随重定向，凭据只发给 URL 里的那个地址（这是"凭据不被 3xx
+    # 带出容器"的那一条）。--max-redirs 0 是防呆：将来有人手滑加上 -L 时，curl 会
+    # 直接报错而不是把 Bearer 重发到跳转目标。
+    CODE="$(curl -sS --max-redirs 0 --max-time "$2" -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>/dev/null || true)"
   elif command -v wget >/dev/null 2>&1; then
     # 只取第一个状态行（head -n 1）：302 后面的 200 不属于这次校验的结论。
     wget -S -O "$BODY" -T "$2" --header "Authorization: Bearer $TUNEX_NODE_CREDENTIAL" "$URL" 2>"$HDR" || true
@@ -353,13 +372,26 @@ PROBE="$(docker exec "$CONTAINER" sh -c '
   else
     printf "unverified:no_http_tool\\n"; exit 0
   fi
+  # ── 200 还不够：响应体必须**真的是** Panel 的 JSON ──
+  #
+  # 有 jq 就真解析；没有 jq（老镜像）只能做**形状匹配**，这时把"我用的是形状匹配"
+  # 报出去（'http:200:grep'），绝不把猜测说成解析。
+  SHAPE=""
+  if [ -s "$BODY" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      if jq -e 'type=="object" and (.data|type=="object")' "$BODY" >/dev/null 2>&1; then
+        SHAPE="jq"
+      fi
+    elif grep -qE "^[[:space:]]*\\{" "$BODY" && grep -qE "\\"data\\"[[:space:]]*:" "$BODY" && grep -qE "\\}[[:space:]]*$" "$BODY"; then
+      SHAPE="grep"
+    fi
+  fi
   # 两条分支共用同一段判定，保证"同一个响应 → 同一个结论"。
   case "$CODE" in
     ""|000) printf "unverified:no_response\\n" ;;
     200)
-      # 200 还不够：响应体必须像 Panel 的 JSON（对象 + data 键）。
-      if [ -s "$BODY" ] && grep -qE "^[[:space:]]*\\{" "$BODY" && grep -qE "\\"data\\"[[:space:]]*:" "$BODY" && grep -qE "\\}[[:space:]]*$" "$BODY"; then
-        printf "http:200\\n"
+      if [ -n "$SHAPE" ]; then
+        printf "http:200:%s\\n" "$SHAPE"
       else
         printf "unverified:not_panel_json\\n"
       fi ;;
@@ -368,10 +400,18 @@ PROBE="$(docker exec "$CONTAINER" sh -c '
   rm -f "$BODY" "$HDR" 2>/dev/null || true
 ' sh "$PANEL" "$CHECK_TIMEOUT" /run/tunex-agent/agent.env 2>/dev/null || true)"
 
+# 唯一一条通往"通过"的路：200 + 响应体真的是 Panel 的 JSON（或老镜像上退化的形状匹配）。
 case "$PROBE" in
-  http:200)
+  http:200:*)
     VERIFIED="yes"
-    log "身份校验通过（HTTP 200 + Panel JSON）：同一个 node_id/agent_id 已重新连上 Panel" ;;
+    case "\${PROBE#http:200:}" in
+      jq)
+        log "身份校验通过（HTTP 200 + Panel JSON 真解析）：同一个 node_id/agent_id 已重新连上 Panel" ;;
+      *)
+        # **不能**把它说成解析过：本镜像没有 jq，只做了形状匹配（对象 + data 键）。
+        log "身份校验通过（HTTP 200 + Panel JSON **形状匹配**）：同一个 node_id/agent_id 已重新连上 Panel"
+        log "提醒：本节点镜像里没有 jq，响应体只做了形状匹配、没有真解析；建议把节点镜像换成带 jq 的版本" ;;
+    esac ;;
   http:401|http:403)
     log "身份校验失败（HTTP \${PROBE#http:}）"
     restore_previous

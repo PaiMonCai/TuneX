@@ -8,6 +8,7 @@ import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle, Separ
 import { Input } from "@/components/ui/input";
 import { Field, ToggleRow } from "@/components/ui/form";
 import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
+import { NotificationPreferences } from "@/components/settings/notification-preferences";
 import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
 import { formatDateTime } from "@/lib/utils";
@@ -324,6 +325,11 @@ export function SettingsBody({ user: initialUser }: { user: User }) {
           </div>
         </CardContent>
       </Card>
+
+      {/* 通知偏好：**用户级**（跨工作空间）的免打扰矩阵，暴露既有的
+          `GET/PUT /api/announcements/preferences`。组件自带三态与错误分档，
+          这里只负责把它放进设置页 —— 不传任何作用域参数（它不是空间设置）。 */}
+      <NotificationPreferences />
 
       <Card>
         <CardHeader>

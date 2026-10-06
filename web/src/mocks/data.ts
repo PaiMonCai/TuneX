@@ -517,8 +517,16 @@ export const mockTunnels: Tunnel[] = [
     tunnel_mode: "relay",
     egress_node_id: 4,
     egress_port: 31011,
-    egress_pool_id: null,
-    egress_pool: null,
+    /*
+     * 出口池是**显式**的（与真实后端同形：`forward-service.ts` 给每条 relay 行都写
+     * `egress_pool_id`）。这条指向 jp-relay-pool：池里只有**一个 active 目标**，
+     * 因此它是 mock 里唯一能打出延迟卡片 `ok` 态的转发
+     * （`ambiguous_target` 是「池里有多个目标」，`no_egress_pool` 是「归属池都没有」——
+     * 两者都不是「没有观测」）。池目标的 host/port 与下面 legacy 的
+     * `forward_addresses[0]` 一致，避免这次补齐顺带改掉这条转发展示的目标。
+     */
+    egress_pool_id: 3,
+    egress_pool: { id: 3, name: "jp-relay-pool", lb_strategy: "round", status: "active" },
     remote_host: null,
     remote_port: null,
     desired_status: "active",
@@ -758,6 +766,47 @@ export const mockEgressPools: { node_id: number; pool: EgressPool; targets: Egre
         status: "active",
         created_at: iso(daysAgo(30)),
         updated_at: iso(daysAgo(30)),
+      },
+    ],
+  },
+  {
+    /*
+     * jp-out-01（role=egress）：**单目标 active 池**。
+     *
+     * 为什么需要这一条夹具：转发延迟那条曲线只有在「池恰好收敛到 1 个 active 目标」
+     * 时才可能有 `ok`（多目标 = `ambiguous_target`，没有池 = `no_egress_pool`）。
+     * 修这条之前，mock 里每个池要么有 2 个 active 目标（sg-relay-pool），要么没有池，
+     * 于是开发/联调期**永远打不出** `ok` 态 —— 而真实集成拓扑上 `ok` 是存在的
+     * （见 `components/forwards/__tests__/forward-latency.test.tsx` 里的真实样本）。
+     * 这里只补「池 → 目标」这一层真实事实，不引入后端不会产生的维度：
+     * pool/target 两张表的形状与 `prisma/schema.prisma` 一致，目标归属由
+     * `Tunnel.egress_pool_id` 显式指向（真实后端每行都写这一列）。
+     *
+     * 目标与 `mockTunnels` 里那条 relay 转发的 legacy `forward_addresses[0]`
+     * 取同一 host/port，避免补齐夹具顺带改掉这条转发原本展示的目标。
+     */
+    node_id: 4,
+    pool: {
+      id: 3,
+      node_id: 4,
+      name: "jp-relay-pool",
+      lb_strategy: "round",
+      status: "active",
+      created_at: iso(daysAgo(20)),
+      updated_at: iso(daysAgo(2)),
+    },
+    targets: [
+      {
+        id: 4,
+        pool_id: 3,
+        host: "10.0.0.21",
+        port: 22,
+        weight: 1,
+        order_by: 0,
+        remark: "开发机 SSH（唯一 active 目标）",
+        status: "active",
+        created_at: iso(daysAgo(20)),
+        updated_at: iso(daysAgo(2)),
       },
     ],
   },

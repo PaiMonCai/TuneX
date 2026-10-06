@@ -16,6 +16,7 @@ export function Topbar({
   subtitle,
   console: consoleId,
   adminMode,
+  showAdminEntry = true,
 }: {
   title: string;
   subtitle?: string;
@@ -23,6 +24,14 @@ export function Topbar({
   console?: ConsoleId;
   /** @deprecated 用 `console`；保留以兼容既有 `AppShell(adminMode)` 调用 */
   adminMode?: boolean;
+  /**
+   * 用户控制台里「管理后台」入口是否可见。
+   *
+   * 由 `UserShell` 按**真实权限读数**决定（`canEnterAdminConsole(readAdminPersona())`）；
+   * 缺省 `true` 是刻意的 fail-open：读数取不到（`unknown`）时宁可多显示一个入口
+   * （点进去有受控错误面），也不凭一次失败隐藏合法管理员入口。
+   */
+  showAdminEntry?: boolean;
 }) {
   const { t } = useI18n();
   const variant: ConsoleId = consoleId ?? (adminMode ? "admin" : "user");
@@ -70,12 +79,14 @@ export function Topbar({
             </Link>
           </Button>
         ) : (
-          <Button variant="outline" size="sm" asChild>
-            <Link href="/admin">
-              <LayoutGrid className="size-4" />
-              <span className="hidden sm:inline">{t("common.admin")}</span>
-            </Link>
-          </Button>
+          showAdminEntry && (
+            <Button variant="outline" size="sm" asChild data-testid="topbar-admin-entry">
+              <Link href="/admin">
+                <LayoutGrid className="size-4" />
+                <span className="hidden sm:inline">{t("common.admin")}</span>
+              </Link>
+            </Button>
+          )
         )}
         {process.env.NEXT_PUBLIC_API_MOCK === "1" && (
           <Badge variant="outline" className="hidden md:inline-flex" data-testid="mock-badge">

@@ -5,7 +5,7 @@
  * "生成了字符串"，而是"脚本里的每一步顺序、身份复用与失败路径都不能被写错"。
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -159,6 +159,34 @@ describe("identity check on the real Agent image: executable, and never a false 
     expect(block).toContain('grep -oE "HTTP/[0-9.]+ [0-9]{3}"');
   });
 
+  test("curl 分支不跟随重定向（凭据只发给原地址），且带 --max-time", () => {
+    const block = identitySection(render().script);
+    const curlCall = block.slice(block.indexOf("command -v curl"), block.indexOf("elif command -v wget"));
+    // 只看**真正执行的那一行**（注释里会出现 "-L" 这个词，别拿它当证据）。
+    const curlLine = curlCall.split("\n").find((line) => line.includes('CODE="$(curl')) ?? "";
+    expect(curlLine).toContain("curl -sS");
+    // 不写 -L/--location：curl 就不会跟随 3xx，Authorization 只会发给我们真正要
+    // 校验的那个地址（凭据不被跳转带出容器的那一条）。
+    expect(curlLine).not.toMatch(/(^|\s)-L(\s|$)/);
+    expect(curlLine).not.toContain("--location");
+    // 防呆：万一有人加了 -L，--max-redirs 0 会让 curl 失败而不是跟随。
+    expect(curlLine).toContain("--max-redirs 0");
+    expect(curlLine).toContain('--max-time "$2"');
+    // 凭据确实在这一条请求上（否则校验没有意义）。
+    expect(curlLine).toContain('"Authorization: Bearer $TUNEX_NODE_CREDENTIAL"');
+  });
+
+  test("标准 Agent 镜像的 runtime 阶段装了 curl 与 jq（否则探针会退化到跟跳转的 wget / 形状匹配）", () => {
+    // 这条不变量是"凭据不被 3xx 带出容器"的**前提**：busybox wget 无法禁止跟随重定向，
+    // 所以唯一的办法是让镜像里有 curl。删掉这一行会让生产镜像悄悄退回 wget 分支 ——
+    // 结论仍然正确（未校验），但凭据会被重发到跳转目标。
+    const dockerfile = readFileSync(new URL("../../../../agent/Dockerfile", import.meta.url), "utf8");
+    const runtimeStage = dockerfile.slice(dockerfile.lastIndexOf("FROM alpine"));
+    expect(runtimeStage).toContain("apk add --no-cache curl jq");
+    // 只装在 runtime 阶段：build 阶段是 golang 镜像，跟节点运行时无关。
+    expect(dockerfile.slice(0, dockerfile.lastIndexOf("FROM alpine"))).not.toContain("apk add --no-cache curl");
+  });
+
   test("wget takes the FIRST status line, never the last one (busybox follows redirects)", () => {
     // busybox wget 1.37 没有 `--max-redirect`，无法禁止跟随重定向；`-S` 会把每一跳的
     // 状态行都打出来。取最后一行的话，"302 → /login(200)" 会被读成 200 并打印"通过"。
@@ -167,17 +195,36 @@ describe("identity check on the real Agent image: executable, and never a false 
     expect(block).not.toContain("tail -n 1 | grep -oE");
   });
 
-  test("a 200 without a Panel-shaped JSON body is 未校验, not 通过", () => {
+  test("a 200 without a real Panel JSON body is 未校验, not 通过", () => {
     const block = identitySection(render().script);
     expect(block).toContain("unverified:not_panel_json");
+    // 真解析（镜像里有 jq 时走这条）。
+    expect(block).toContain(`jq -e 'type=="object" and (.data|type=="object")' "$BODY"`);
+    // 形状匹配只作为**没有 jq** 的兜底，且必须被标注成形状匹配而不是解析。
     expect(block).toContain('grep -qE "\\"data\\"[[:space:]]*:" "$BODY"');
+    expect(block).toContain('SHAPE="jq"');
+    expect(block).toContain('SHAPE="grep"');
+    expect(block).toContain('printf "http:200:%s\\n" "$SHAPE"');
     expect(block).toContain("REASON=\"Panel 回了 HTTP 200，但响应体不是 Panel 的 JSON");
+  });
+
+  test("判定手段随镜像能力如实区分：jq=真解析，grep=形状匹配（且明说不是解析）", () => {
+    const script = render().script;
+    const block = identitySection(script);
+    // 通过那一行有**两个**分支：真解析 / 形状匹配 + 一条"没有 jq"的提醒。
+    expect(block).toContain("Panel JSON 真解析");
+    expect(block).toContain("Panel JSON **形状匹配**");
+    expect(block).toContain("本节点镜像里没有 jq，响应体只做了形状匹配、没有真解析");
+    // 操作者可见的"身份校验通过"**只**出现在这两条 log 里（真解析 / 形状匹配），
+    // 不允许别处冒出第三个"通过"口径（注释里提到这个词不算）。
+    expect(script.match(/log "身份校验通过/g)).toHaveLength(2);
   });
 
   test("only an explicit HTTP 200 counts as verified", () => {
     const block = identitySection(render().script);
     expect(block.match(/VERIFIED="yes"/g)).toHaveLength(1);
-    expect(block.slice(0, block.indexOf('VERIFIED="yes"'))).toMatch(/http:200\)\s*$/);
+    // 通往"通过"的 case 臂仍然只以 http:200 开头（后缀只区分判定手段：jq / grep）。
+    expect(block.slice(0, block.indexOf('VERIFIED="yes"'))).toMatch(/http:200:\*\)\s*$/);
     // "verified" is claimed in exactly one operator-facing line, and it is the
     // one that the 200 branch prints.
     expect(render().script.match(/身份校验：通过/g)).toHaveLength(1);
@@ -251,7 +298,19 @@ function probeBody(script: string): string {
   return match[1]!;
 }
 
-type PanelMode = "ok" | "redirect" | "html200" | "json200" | "badjson200" | "500" | "401" | "404";
+type PanelMode =
+  | "ok"
+  | "redirect"
+  | "html200"
+  | "json200"
+  | "badjson200"
+  // "有 data 键、外层形状也对，但不是合法 JSON" —— 形状匹配会放它过去，真解析不会。
+  | "datafakejson200"
+  // 合法 JSON、但 data 不是对象（`{"data":42}`）—— `has("data")` 会放过它。
+  | "datanum200"
+  | "500"
+  | "401"
+  | "404";
 
 /**
  * 假 Panel：只回一种形状。`redirect` 复现真实缺陷（302 → /login(200)），其余是
@@ -278,6 +337,12 @@ function startFakePanel(mode: PanelMode) {
           return Response.json({ foo: "bar" });
         case "badjson200":
           return new Response("{oops", { headers: { "content-type": "application/json" } });
+        case "datafakejson200":
+          // 外层形状齐全（`{` 开头、有 "data":、`}` 收尾）但**不是合法 JSON**：
+          // 这正是三条 grep 的形状匹配会误判成"Panel 的响应"的那一类。
+          return new Response('{"data": oops}', { headers: { "content-type": "application/json" } });
+        case "datanum200":
+          return new Response('{"data":42}', { headers: { "content-type": "application/json" } });
         default:
           return new Response("{}", { status: Number(mode), headers: { "content-type": "application/json" } });
       }
@@ -343,17 +408,29 @@ const EXPECTED: Record<PanelMode, string> = {
   html200: "unverified:not_panel_json",
   json200: "unverified:not_panel_json",
   badjson200: "unverified:not_panel_json",
+  // 有 data 键 + 外层形状对、但不是合法 JSON；`{"data":42}` 是合法 JSON 但 data 不是对象。
+  // 两者都必须"未校验"——形状匹配（没有 jq 的镜像）会放它们过去，这就是要真解析的理由。
+  datafakejson200: "unverified:not_panel_json",
+  datanum200: "unverified:not_panel_json",
   "500": "http:500",
   "401": "http:401",
   "404": "http:404",
 };
 
+/**
+ * 把探针输出归一成**结论**：`http:200:jq` 与 `http:200:grep` 都是"通过"，
+ * 后缀只说明用的是真解析还是形状匹配（镜像里有没有 jq）。
+ */
+function verdict(token: string): string {
+  return token.startsWith("http:200:") ? "http:200" : token;
+}
+
 describe("identity probe behaviour: a 302 or a non-Panel 200 is never 通过", () => {
   const body = probeBody(render().script);
 
   test("curl 与 wget 两条分支对同一个响应给同一结论（含 302 与各种假 200）", async () => {
-    const curlBox = probeSandbox(["curl", "grep", "head", "mktemp", "rm"]);
-    const wgetBox = probeSandbox(["wget", "grep", "head", "mktemp", "rm"]);
+    const curlBox = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"]);
+    const wgetBox = probeSandbox(["wget", "grep", "head", "mktemp", "rm", "jq"]);
     try {
       for (const mode of Object.keys(EXPECTED) as PanelMode[]) {
         const panel = startFakePanel(mode);
@@ -361,10 +438,15 @@ describe("identity probe behaviour: a 302 or a non-Panel 200 is never 通过", (
           const base = `http://127.0.0.1:${panel.port}`;
           const viaCurl = await runProbe(body, base, curlBox.bin, curlBox.envFile);
           const viaWget = await runProbe(body, base, wgetBox.bin, wgetBox.envFile);
-          expect(`${mode}: curl=${viaCurl}`).toBe(`${mode}: curl=${EXPECTED[mode]}`);
-          expect(`${mode}: wget=${viaWget}`).toBe(`${mode}: wget=${EXPECTED[mode]}`);
-          // 两条分支必须给出**同一个**结论：这正是 F1 里被破坏的性质。
+          expect(`${mode}: curl=${verdict(viaCurl)}`).toBe(`${mode}: curl=${EXPECTED[mode]}`);
+          expect(`${mode}: wget=${verdict(viaWget)}`).toBe(`${mode}: wget=${EXPECTED[mode]}`);
+          // 两条分支必须给出**同一个**结论，且后缀（判定手段）也一致：这两个 sandbox
+          // 都放了 jq，所以两条分支都走**真解析**。
           expect(viaCurl).toBe(viaWget);
+          if (mode === "ok") {
+            expect(viaCurl).toBe("http:200:jq");
+            expect(viaWget).toBe("http:200:jq");
+          }
         } finally {
           panel.stop(true);
         }
@@ -412,6 +494,32 @@ describe("identity probe behaviour: a 302 or a non-Panel 200 is never 通过", (
     } finally {
       panel.stop(true);
       rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+}
+  test("没有 jq 的镜像：退回形状匹配，如实报成 http:200:grep（并暴露它放过了什么）", async () => {
+    const body = probeBody(render().script);
+    const withJq = probeSandbox(["curl", "grep", "head", "mktemp", "rm", "jq"]);
+    const noJq = probeSandbox(["curl", "grep", "head", "mktemp", "rm"]); // 老镜像：没有 jq
+    const okPanel = startFakePanel("ok");
+    const fakeJsonPanel = startFakePanel("datafakejson200");
+    try {
+      // 正例：两条路都能判"通过"，但**判定手段必须如实区分**。
+      const okBase = `http://127.0.0.1:${okPanel.port}`;
+      expect(await runProbe(body, okBase, withJq.bin, withJq.envFile)).toBe("http:200:jq");
+      expect(await runProbe(body, okBase, noJq.bin, noJq.envFile)).toBe("http:200:grep");
+      // 残留：`{"data": oops}`（有 data 键、外层形状对，但不是合法 JSON）
+      //   · 有 jq ⇒ 真解析发现它不是 JSON ⇒ 未校验；
+      //   · 没有 jq ⇒ 形状匹配**放过**它，只报成"通过（形状匹配）"。
+      // 这条断言就是"为什么必须装 jq"的证据，也把兜底的边界钉在明面上。
+      const fakeBase = `http://127.0.0.1:${fakeJsonPanel.port}`;
+      expect(await runProbe(body, fakeBase, withJq.bin, withJq.envFile)).toBe("unverified:not_panel_json");
+      expect(await runProbe(body, fakeBase, noJq.bin, noJq.envFile)).toBe("http:200:grep");
+    } finally {
+      okPanel.stop(true);
+      fakeJsonPanel.stop(true);
+      rmSync(withJq.dir, { recursive: true, force: true });
+      rmSync(noJq.dir, { recursive: true, force: true });
     }
   }, 30_000);
 });
@@ -532,4 +640,81 @@ describe("preconditions encode the maintenance-before-upgrade rule", () => {
     expect(result.ok).toBe(false);
     expect(result.code).toBe("node_has_no_agent_id");
   });
+});
+
+/* ================================================================== */
+/* 凭据外发：3xx 指向**另一台 host** 时，凭据不得被重发                     */
+/* ================================================================== */
+
+interface SeenProbeRequest {
+  path: string;
+  auth: string | null;
+}
+
+/**
+ * 记录型端点：可以扮演"原 Panel"或"跳转目标"。
+ *
+ * 区分"发到原 host 的 302"与"发到跳转目标的请求"靠的是**两个不同的 host 地址**
+ * （`127.0.0.1` vs `127.0.0.2`，各自一个 server、各自一份记录），而不是靠路径或
+ * 时间推断 —— 两边记录到什么，就是网络上真实发生过什么。
+ */
+function startRecordingEndpoint(hostname: string, respond?: () => Response) {
+  const seen: SeenProbeRequest[] = [];
+  const server = Bun.serve({
+    hostname,
+    port: 0,
+    fetch(req) {
+      seen.push({ path: new URL(req.url).pathname, auth: req.headers.get("authorization") });
+      return respond ? respond() : Response.json({ data: { snapshot: null } });
+    },
+  });
+  return { server, seen, url: `http://${hostname}:${server.port}` };
+}
+
+describe("凭据外发：302 跳向另一台 host", () => {
+  const body = probeBody(render().script);
+
+  test("curl 分支（标准镜像）：凭据只发给原地址，跳转目标一个请求都收不到", async () => {
+    const box = probeSandbox(["curl", "grep", "head", "mktemp", "rm"]);
+    const target = startRecordingEndpoint("127.0.0.2");
+    const panel = startRecordingEndpoint(
+      "127.0.0.1",
+      () => new Response("<html>moved</html>", { status: 302, headers: { location: `${target.url}/api/internal/node/snapshot` } }),
+    );
+    try {
+      const answer = await runProbe(body, panel.url, box.bin, box.envFile);
+      expect(answer).toBe("http:302"); // 结论：未校验（不谎报）
+      // 原地址确实收到了带凭据的请求（否则这条校验没有意义）。
+      expect(panel.seen).toHaveLength(1);
+      expect(panel.seen[0]!.auth).toBe("Bearer probe-test-credential");
+      // ★ 关键断言：跳转目标收到了**零**请求 —— 凭据没有出容器。
+      expect(target.seen).toEqual([]);
+    } finally {
+      panel.server.stop(true);
+      target.server.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("wget 兜底（没有 curl 的镜像）：结论正确，但凭据确实被重发到了另一台 host", async () => {
+    // 这条用例**故意钉住残留**：busybox wget 无法禁止跟随重定向，`--header` 会随跳转发出去。
+    // 它不是"应该发生"的行为，而是"必须装 curl"的证据 —— 如果哪天有人删掉 Dockerfile 里的
+    // curl，生产镜像就会退回到这个形状（结论仍然正确，凭据却外发了）。
+    const box = probeSandbox(["wget", "grep", "head", "mktemp", "rm"]);
+    const target = startRecordingEndpoint("127.0.0.2");
+    const panel = startRecordingEndpoint(
+      "127.0.0.1",
+      () => new Response("<html>moved</html>", { status: 302, headers: { location: `${target.url}/api/internal/node/snapshot` } }),
+    );
+    try {
+      const answer = await runProbe(body, panel.url, box.bin, box.envFile);
+      expect(answer).toBe("http:302"); // 结论仍然正确
+      expect(target.seen.length).toBeGreaterThan(0); // 但请求真的到了另一台 host
+      expect(target.seen[0]!.auth).toBe("Bearer probe-test-credential"); // 而且带着长期凭据
+    } finally {
+      panel.server.stop(true);
+      target.server.stop(true);
+      rmSync(box.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

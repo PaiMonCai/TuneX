@@ -20,6 +20,9 @@
  *    取数永远挂起（半开连接）时窗口照样到期——旧实现只在 tick 开头判窗口，
  *    而 tick 只在上一轮结算后才排期，于是「挂起 = 永远不会超时」。
  * 6. **stop 后可以真的重开**：新一轮重置 inFlight 标记与计时，并重新挂 deadline。
+ * 7. **`onStop` 只在「有等待被终止」时触发**：`stop()` 幂等（重复调用、以及等待已终止
+ *    之后的 `dispose()` 都不再回调），而**从未 `start()`** 的 `dispose()` 也不回调 ——
+ *    见 `dispose()` 的说明：没有开始过的等待，没有「等待结束」这件事可报告。
  *
  * ── 不能保证的事（诚实边界）──
  * 外部 `loadView` 返回的 Promise 没有 `AbortSignal`：`stop()` / `dispose()` 只是
@@ -139,8 +142,23 @@ export class NodeInstallPoller<TView extends NodeInstallView> {
     this.options.onStop?.(reason);
   }
 
-  /** 组件卸载 / 节点或作用域切换：停止、丢弃在途响应，且此后不可再 start。 */
+  /**
+   * 组件卸载 / 节点或作用域切换：停止、丢弃在途响应，且此后不可再 start。
+   *
+   * **何时会回调 `onStop("disposed")`（有意行为，不是遗漏）**：
+   *
+   * - 正在进行中的等待（`start()` 过且尚未终止）→ 回调一次，然后此实例永久失效；
+   * - 从未 `start()` 过 → **不回调**。`onStop` 的语义是「一次等待被终止了」；
+   *   没有开始过的等待没有状态变化可报告，发一个「已停止」事件反而会让消费方以为
+   *   自己刚结束了一次等待（界面切成「已停止等待」）。这与 `stop()` 在非活动状态
+   *   静默返回是同一条口径：**不虚构没有发生的状态迁移**。
+   * - 已经终止（闭环 / 超时 / 显式 stop）之后再 `dispose()` → 同样不回调第二个事件
+   *   （`stop()` 幂等），避免同一个结束事实被报两次。
+   *
+   * 幂等：重复 `dispose()` 只有第一次生效。
+   */
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true;
     this.stop("disposed");
   }

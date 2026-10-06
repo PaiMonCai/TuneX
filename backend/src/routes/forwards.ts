@@ -26,6 +26,12 @@ import {
   setPreferredIngressNode,
 } from "../services/preferred-ingress.ts";
 import type { PreferredIngressDb } from "../services/preferred-ingress.ts";
+import { roleAcceptsPosition } from "../services/ingress-candidate.ts";
+import { projectUserNode } from "../services/node-view.ts";
+import {
+  pickFailoverDestination,
+  readFailoverPolicy,
+} from "../services/failover-loop.ts";
 import { defaultDiagnoseDeps, diagnoseForward } from "../services/agent-diagnose.ts";
 import {
   createForward,
@@ -557,6 +563,196 @@ forwardsRoutes.put("/:id/preferred-ingress", async (c) => {
     return c.json({ error: result.error, code: result.code, error_layer: "failover" }, status);
   }
   return c.json({ data: result.value });
+});
+
+/* ================================================================== */
+/* task-16 —— 高可用只读投影（GET /:id/ha）                             */
+/* ================================================================== */
+//
+// 为什么要有这条**只读**端点：`FAILOVER_POLICY`、`tunnel.preferred_ingress_node_id`、
+// `pickFailoverDestination` 全都已经在后端存在（策略、存储、执行器、候选判定），而用户域
+// **一个字节都读不到**（Web 全仓 grep 命中 0）。于是"平台会不会替我迁移"这件事在产品上
+// 完全不可见。这里只做投影：**不新增表/列/迁移，不改 failover 执行语义**。
+//
+// ── 这份响应里必须分开的四类事实（混在一起就会说错话）──
+//
+//   ① `preferred_ingress_node_id` = **期望**（调度意图；NULL = 没有偏好）。它**不代表**这台机器
+//      在线、能接业务、或者面板指挥得动 —— 写入路径刻意允许把当前离线/维护中的节点设为首选
+//      （`preferred-ingress.ts`），真正的门槛由策略在每一拍判；
+//   ② `active_ingress_node_id` = **事实**（现在归谁，`tunnel.ingress_node_id`）；
+//   ③ `policy` = 平台策略真值（**只读**）。缺省即关：`readFailoverPolicy` 与 failover 循环
+//      读的是**同一个函数**，所以"两个开关都 false ⇒ 平台不会自动迁移"是**生效事实**，
+//      不是对配置文件的猜测。坏 JSON 会被它当成两个都关（fail-closed），但那是"配置坏了"
+//      而不是"运维没开" ⇒ `parse_error` 必须如实带出来，两者下一步动作不同；
+//   ④ `failover_candidate` = 与 failover 循环**同一份判定**（`pickFailoverDestination`：非现任
+//      + 准入 + 角色 + **此刻在线**）。三态必须可分：`available` / `none`（确实没有合格候选）
+//      / `unavailable`（这次读不到）—— 把"读不到"渲染成"没有高可用"是本专项反复吃过亏的形态。
+//
+// `preference_options`（首选入口的备选集合）的 `can_be_preferred` **只用写入路径自己检查的
+// 两条规则**（同入口组 + `role ∈ {ingress,both}`，与 `preferred-ingress.ts` 同源），而
+// `connection` / `accepts_new_business` 是**这张卡旁边的事实**，不是能不能当首选的判据 ——
+// 拿 `candidateRejection()`（那还要求生命周期与在线）来算"能不能设为首选"会让 UI 说得比
+// 写入路径更严，于是用户看到"不能设"却 PUT 成功。两个问题两份答案，各自同源。
+//
+// 顺序纪律：**literal 子路由一律注册在参数化 catch-all 之前**（本文件 `post("/:id/:action")`
+// 在文件末段）。DNS 前门与延迟端点都在这条规则上踩过，所以这里同样前置，并由
+// `forwards-ha-route.test.ts` 在行为上证明它没被吃掉。
+
+/** 首选入口备选节点的 select：**不**含任何连接 IP / 凭据明文。 */
+const HA_NODE_SELECT = {
+  id: true,
+  node_id: true,
+  role: true,
+  status: true,
+  last_seen_at: true,
+  node_group_id: true,
+  lifecycle: true,
+  // 只用于派生 `has_credential` 布尔（`projectUserNode` 的入参），**绝不进响应体**。
+  node_credential_hash: true,
+  credential_revoked: true,
+} as const;
+
+interface HaNodeRow {
+  id: number;
+  node_id: string;
+  role: string | null;
+  status: string;
+  last_seen_at: Date | null;
+  node_group_id: number;
+  lifecycle?: string | null;
+  node_credential_hash?: string | null;
+  credential_revoked?: boolean;
+}
+
+interface HaTunnelRow {
+  id: number;
+  in_node_group_id: number;
+  ingress_node_id: number | null;
+  preferred_ingress_node_id: number | null;
+}
+
+interface HaFailoverCandidate {
+  status: "available" | "none" | "unavailable";
+  node_id: number | null;
+  /** 仅 `unavailable` 时给出稳定原因码；其余为 null。 */
+  reason: string | null;
+}
+
+forwardsRoutes.get("/:id/ha", async (c) => {
+  const id = idParam(c, "id");
+  if (id === null) return c.json({ error: "ID 不合法", code: "invalid_input" }, 400);
+  const denied = await authorizeForward(c, id, "read");
+  if (denied) return denied;
+  const ws = workspace(c);
+
+  const tunnel = (await db.tunnel.findFirst({
+    where: { id, workspace_id: ws.id, category: "port_forward" },
+    select: { id: true, in_node_group_id: true, ingress_node_id: true, preferred_ingress_node_id: true },
+  })) as HaTunnelRow | null;
+  if (!tunnel) {
+    return c.json({ error: "端口转发不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+  }
+
+  // ③ 策略：与 failover 循环同一个读者（缺省即关；坏 JSON 也按关处理并报 parse_error）。
+  const policy = await readFailoverPolicy();
+
+  // ④ 候选入口：与 failover 循环**同一份判定**。
+  let failoverCandidate: HaFailoverCandidate;
+  try {
+    const destinations = await pickFailoverDestination({
+      tunnel_id: tunnel.id,
+      workspace_id: ws.id,
+      owner_node_id: tunnel.ingress_node_id,
+      now: new Date(),
+    });
+    failoverCandidate =
+      destinations.candidate_node_id === null
+        ? { status: "none", node_id: null, reason: null }
+        : { status: "available", node_id: destinations.candidate_node_id, reason: null };
+  } catch {
+    // 「读不到」≠「没有候选」。这里刻意**不**把异常消息回显（可能是内部 SQL 细节）。
+    failoverCandidate = { status: "unavailable", node_id: null, reason: "candidate_query_failed" };
+  }
+
+  // 首选入口的备选集合：只列**这条转发的入口节点组**内的节点（与用户节点列表同一可见域）。
+  let preferenceOptions:
+    | {
+        status: "ok";
+        nodes: Array<{
+          node_id: number;
+          name: string;
+          role: string | null;
+          node_group_id: number;
+          is_active_ingress: boolean;
+          is_preferred: boolean;
+          can_be_preferred: boolean;
+          preference_rejection: string | null;
+          connection: string;
+          lifecycle: string;
+          accepts_new_business: boolean;
+          admission_rejection: string | null;
+        }>;
+      }
+    | { status: "unavailable"; nodes: [] };
+  try {
+    const rows = (await db.node.findMany({
+      where: {
+        node_group_id: tunnel.in_node_group_id,
+        node_group: { workspace_id: ws.id },
+      },
+      select: HA_NODE_SELECT,
+      orderBy: { id: "asc" },
+    })) as unknown as HaNodeRow[];
+    preferenceOptions = {
+      status: "ok",
+      nodes: rows.map((node) => {
+        const role = node.role ?? null;
+        const canBePreferred = roleAcceptsPosition(role, "ingress");
+        const facts = projectUserNode({
+          status: node.status,
+          last_seen_at: node.last_seen_at,
+          has_credential: Boolean(node.node_credential_hash),
+          credential_revoked: node.credential_revoked,
+          lifecycle: node.lifecycle,
+        });
+        return {
+          node_id: node.id,
+          name: node.node_id,
+          role,
+          node_group_id: node.node_group_id,
+          is_active_ingress: node.id === tunnel.ingress_node_id,
+          is_preferred: node.id === tunnel.preferred_ingress_node_id,
+          can_be_preferred: canBePreferred,
+          // 词表与 `ingress-candidate.ts` 的 `role_undeclared` / `role_mismatch` 同一套。
+          preference_rejection: canBePreferred ? null : role === null ? "role_undeclared" : "role_mismatch",
+          connection: facts.connection,
+          lifecycle: facts.lifecycle,
+          accepts_new_business: facts.accepts_new_business,
+          admission_rejection: facts.admission_rejection,
+        };
+      }),
+    };
+  } catch {
+    preferenceOptions = { status: "unavailable", nodes: [] };
+  }
+
+  return c.json({
+    data: {
+      forward_id: tunnel.id,
+      // 期望（调度意图）
+      preferred_ingress_node_id: tunnel.preferred_ingress_node_id,
+      // 事实（现在归谁）
+      active_ingress_node_id: tunnel.ingress_node_id,
+      policy: {
+        auto_failover: policy.auto_failover === true,
+        auto_failback: policy.auto_failback === true,
+        /** 配置存在但无法解析时的信息（**不是**"运维没开"）；正常为 null。 */
+        parse_error: policy.parse_error ?? null,
+      },
+      failover_candidate: failoverCandidate,
+      preference_options: preferenceOptions,
+    },
+  });
 });
 
 /* ================================================================== */

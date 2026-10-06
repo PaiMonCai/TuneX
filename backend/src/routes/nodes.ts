@@ -34,7 +34,15 @@ import {
 import { projectUserNode } from "../services/node-view.ts";
 import { collectSupportBundle, defaultSupportBundleDeps } from "../services/support-bundle.ts";
 import { checkUpgradePrecondition, renderNodeUpgradeScript, validateAgentImageRef } from "../services/node-upgrade.ts";
-import { collectNodeDiagnostics, defaultNodeDiagnosticsDeps } from "../services/node-diagnostics.ts";
+import {
+  NODE_OFFLINE_AFTER_SECONDS,
+  collectNodeDiagnostics,
+  defaultNodeDiagnosticsDeps,
+} from "../services/node-diagnostics.ts";
+// 版本比较**复用** WP6 健康合成里的同一个纯函数，不为升级卡片另写一套 semver 口径
+// （那就是第二套「是否落后」的判定，专项明令禁止）。
+import { isVersionOlder } from "../services/node-health.ts";
+import { env } from "../env.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -267,6 +275,104 @@ nodesRoutes.post("/:ingressId/upgrade-command", async (c) => {
       target_image: image.image,
       allow_active: allowActive,
       ...rendered,
+    },
+  });
+});
+
+/**
+ * R1-A —— `GET /api/nodes/:id/upgrade-state`
+ *
+ * 升级卡片的**只读**事实来源。为什么必须由服务端提供（而不是前端把几个字段凑出来）：
+ *
+ *  1. **用户域此前没有任何「实际上报版本」的读投影。** `node.version` 是**管理员配置
+ *     字段**（schema 默认 `unknown`；真机取证：9 台节点的 `node.version` 全是 `unknown`，
+ *     而 `node_state_report.version` 是 `0.13.22`）。前端拿 `node.version` 当"当前运行
+ *     版本"就是把配置当事实 —— R1-A 已确认这是必须避免的展示错误。上报版本只存在于
+ *     `node_state_report`，此前只有管理端 `/api/admin/node/:id/state` 能读到。
+ *  2. **前置结论必须与 `POST /:id/upgrade-command` 同源。** 这里直接调用同一个
+ *     `checkUpgradePrecondition`，并把它的 `code` / `message` **原样**下发；前端不另写
+ *     一套"先切维护再升级"的规则（否则两处会在改规则时静默分叉）。
+ *  3. **判定窗口由服务端下发。** `offline_after_seconds` 与 `report_freshness` 用的是
+ *     diagnostics 同一个常量 `NODE_OFFLINE_AFTER_SECONDS`；F2 的教训是同一事实的多份
+ *     字面量迟早分叉，所以前端不许自己编窗口。
+ *  4. **是否落后同样复用既有判定**（`isVersionOlder`，WP6 用它给 `agent_version_behind`）。
+ *     基线（`TUNEX_AGENT_LATEST_VERSION`）未配置时如实给 `unknown` —— 不伪造落后，也不
+ *     伪造"已是最新"。
+ *
+ * 权限：`node:read`（本文件 middleware 的 GET 默认映射）。**只读**：不生成脚本、不下发
+ * 命令、不改任何运行态。能读 ≠ 能升级：生成脚本仍是 `node:manage`（POST upgrade-command）。
+ */
+nodesRoutes.get("/:ingressId/upgrade-state", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "ingressId");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+
+  const node = await loadWorkspaceNode(nodeId, ws.id);
+  if (!node) return c.json({ error: "节点不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+
+  const report = await db.nodeStateReport.findUnique({
+    where: { node_id: node.id },
+    select: { version: true, role: true, reported_at: true, last_error: true },
+  });
+
+  const reportedAt = report?.reported_at ?? null;
+  const ageSeconds = reportedAt ? Math.max(0, Math.round((Date.now() - reportedAt.getTime()) / 1000)) : null;
+  // 「面板还在收到上报」是一个**连接事实**，与"升级是否成功"无关：这里只回答前者。
+  const reportFreshness: "fresh" | "stale" | "unknown" =
+    ageSeconds === null ? "unknown" : ageSeconds > NODE_OFFLINE_AFTER_SECONDS ? "stale" : "fresh";
+
+  const facts = {
+    node_key: node.node_id,
+    agent_id: node.agent_id ?? "",
+    role: node.role ?? null,
+    lifecycle: node.lifecycle ?? null,
+  };
+  // allow_active **不传**：读投影展示的是"默认路径能不能直接升级"这一事实；
+  // 带业务升级是调用者在 POST 时的显式决定，不能在只读投影里替他做掉。
+  const precondition = checkUpgradePrecondition(facts);
+
+  const reportedVersion = report?.version ?? null;
+  const expectedVersion = env.agentLatestVersion.trim() === "" ? null : env.agentLatestVersion.trim();
+  const older = isVersionOlder(reportedVersion, expectedVersion);
+
+  return c.json({
+    data: {
+      node: {
+        id: node.id,
+        node_key: node.node_id,
+        agent_id: node.agent_id,
+        role: node.role ?? null,
+        lifecycle: node.lifecycle ?? null,
+      },
+      reported: report
+        ? {
+            version: reportedVersion,
+            role: report.role ?? null,
+            reported_at: reportedAt ? reportedAt.toISOString() : null,
+            age_seconds: ageSeconds,
+            last_error: report.last_error ?? null,
+          }
+        : null,
+      report_freshness: reportFreshness,
+      /**
+       * ⚠️ 管理员配置字段（schema `Node.version`），**不是**实际上报版本。
+       * 只有需要对照"配置与实报是否一致"时才展示，且必须显式标注。
+       */
+      configured_version: node.version,
+      target: {
+        /** 部署方发给节点的镜像（`TUNEX_AGENT_IMAGE`）；升级脚本的默认目标。 */
+        image: env.agentImage,
+        image_source: process.env.TUNEX_AGENT_IMAGE?.trim() ? "env:TUNEX_AGENT_IMAGE" : "builtin_default",
+        /** 部署方声明的版本基线；`null` = 未配置 = 面板**不判定**落后。 */
+        expected_version: expectedVersion,
+        /** behind | not_behind | unknown（unknown = 基线未配置或版本号无法比较）。 */
+        version_drift: older === null ? "unknown" : older ? "behind" : "not_behind",
+      },
+      precondition: precondition.ok
+        ? { ok: true, code: null, message: null }
+        : { ok: false, code: precondition.code ?? null, message: precondition.message ?? null },
+      offline_after_seconds: NODE_OFFLINE_AFTER_SECONDS,
+      generated_at: new Date().toISOString(),
     },
   });
 });

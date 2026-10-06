@@ -77,6 +77,32 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       const withPlan = { ...u, user_plan: db.userPlans.find((p) => p.user_id === u.id) ?? null };
       return ok(seg[1] === "me" ? withPlan : { user: withPlan });
     }
+    /**
+     * GET /auth/permissions —— 与真实后端同形：`{ super_admin, roles }`。
+     *
+     * mock 的后台准入模型**本身就是** super_admin 优先（见 handlers/admin.ts 的
+     * `if (!user.super_admin) return fail(403, "需要管理员权限")`），所以这里如实投影：
+     * 演示账号（super_admin）持有 super_admin 角色，其余账号 roles 为空。
+     * **不**编造一个「有委派角色但 mock 的 /admin/* 一律 403」的假委派管理员 ——
+     * 那会让 mock 自己前后矛盾。委派视角由 `admin-persona` 的单元测试覆盖。
+     */
+    if (seg[1] === "permissions" && method === "GET") {
+      if (!logged) return fail(401, "Unauthorized");
+      const u = userFromCookie(db, req.cookie);
+      const isSuper = u.super_admin === true;
+      // 外层 `{ data }` 与真实后端 `c.json({ data: {...} })` 一致（api 层会解包，
+      // 两种写法客户端都能用；这里选择与真实响应逐层同形）。
+      return ok({
+        data: {
+          super_admin: isSuper,
+          roles: isSuper
+            ? db.adminRoles
+                .filter((role) => role.name === "super_admin")
+                .map((role) => ({ id: role.id, name: role.name, permissions: role.permissions }))
+            : [],
+        },
+      });
+    }
     if (seg[1] === "login" && method === "POST") {
       const body = asRecord(req.body);
       const email = reqStr(body.email).toLowerCase();
