@@ -226,11 +226,20 @@ export function ForwardWorkspace() {
   }
 
   const referenceSeq = useRef(0);
+  /** 绑定事实是否"取不到"（读取失败 / 还没读到 / 没有读权限）。 */
+  //
+  // 这三种情况在界面上**都不是**"没有可用出口"：把空 map 当权威会让创建对话框
+  // 给出错误结论（"这台入口没有已绑定的出口"），而这正是本专项反复修的
+  // "把取不到说成没有"。所以它们只用来把结论降级成"事实取不到"，不改变任何动作可用性。
+  const [bindingsUnavailable, setBindingsUnavailable] = useState(false);
+  const [referenceLoaded, setReferenceLoaded] = useState(false);
   async function loadReference() {
     const seq = ++referenceSeq.current;
     const scope = currentId;
     const current = () => seq === referenceSeq.current && getActiveWorkspace() === scope;
     setNodes([]); setBindings({}); setSummary(null);
+    setReferenceLoaded(false);
+    setBindingsUnavailable(false);
     // Independent permissions and partial loads: denied nodes must not erase Forward summary.
     const summaryTask = canRead ? api.forwards.summary().then((value) => {
       if (current()) setSummary(value);
@@ -255,8 +264,10 @@ export function ForwardWorkspace() {
       }
       if (bindingsFailed) toast.error(t("forward.bindingsLoadFailed"));
       setBindings(map);
+      setBindingsUnavailable(bindingsFailed);
     }).catch((err) => { if (current()) toast.error(err instanceof Error ? err.message : t("forward.loadFailed")); }) : Promise.resolve();
     await Promise.all([summaryTask, nodesTask]);
+    if (current()) setReferenceLoaded(true);
   }
 
   /** 写操作后刷新汇总：列表与卡片是两套口径（卡片是 workspace 全量）。 */
@@ -714,6 +725,10 @@ export function ForwardWorkspace() {
         ingressNodes={ingressNodes}
         selectedBindings={selectedBindings}
         availableEgressNodes={availableEgressNodes}
+        // 事实取不到（读失败 / 还没读到 / 没读权限）时，预览必须说"取不到"，
+        // 而不是"没有可用出口"；动作块保留（读取失败不代表绑定动作无效）。
+        bindingsUnavailable={bindingsUnavailable || !referenceLoaded || !canReadNodes}
+        workspaceId={currentId}
         canManageNodes={canManageNodes}
         bindingBusy={bindingBusy}
         busy={busy}
