@@ -1068,6 +1068,18 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 - **`task-42`**（`backend-truth`）：`task-40` 的剩余项（面板消费节点方法能力 → `method_unavailable_on_node`、**Web 侧消费 `caps.methods`/`unavailable_methods`**、走 agent 代码路径的真机 traceroute 证据）+ 用 `tracepath` 实现 traceroute/traceroute6（**不放开 CAP_NET_RAW**）。
 - **`task-43`**（`ha-ui`）：`forward_ingress_member` 表 + 按转发自定义入口成员次序（**schema 变更已批准**），含"无行时行为与今天逐字一致"的断言、`priority[0]` 与 `preferred_ingress_node_id` 由同一写入路径维护、UI 拖动排序但保留全部诚实纪律。
 
+## 3.49 Round 51 续：`task-43` 的接线点裁决（**"界面说的 ≠ 平台做的"防线**）
+
+`ha-ui` 提出了一个**要害问题**并主动停下等裁决：排序要真正生效，必须落到 **`backend/src/services/failover-loop.ts:pickFailoverDestination`**（它现在显式 `sort((a,b) => a.node_id - b.node_id)`），而该文件**不在** task-43 的 writeScopes 里；若只改投影/UI，就会出现**"界面按自定义次序排、平台仍按 id 挑"**——正是本专项一路在打的形态。
+
+**Lead 裁决：批准扩范围**（`task-43` revision 3 加入 `failover-loop.ts` 与 `failover-candidates.test.ts`），因为**宁可扩范围也不留这个缝**；同时写死三条约束：
+1. **只改候选排序**：循环结构、DNS 就绪闸门、epoch/lease/fencing 语义、日志事件**一律不动**；报告里用 `git diff` 逐块证明"只改了排序与取次序的读路径"。
+2. **次序读取并入既有 facts 注入面**，**不新增每拍每隧道的库查询**；若确需新增读取点，必须说明代价。
+3. **读序失败必须回退到今天的次序（`node_id` asc）**，**不得**让迁移判定失败或延后——理由是**次序是偏好、且 failover 是安全路径**：把"读序失败"变成"这一拍不迁移"，会让一个**可修复的读错误冻结整个自动迁移**。契约里如实写明该回退（"次序读不到时按节点 id 升序"）。
+   ⇒ 测试三条钉死：**读序抛错 ⇒ 与今天逐位一致**、**无行 ⇒ 与今天逐位一致**、**有行 ⇒ 按表次序挑**。
+
+**方法论沉淀**：这是一次"**所有者主动报告越界点 + Lead 放权并补语义约束**"的正面样本——比"偷偷改一个不在范围里的安全路径"或"只改界面让报告好看"都好。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
