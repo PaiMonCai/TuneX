@@ -535,12 +535,6 @@ tunnelsRoutes.post("/:id/toggle", async (c) => {
   });
   if (!result.ok) return apiError(c, result);
 
-  // Legacy status remains a display/filter compatibility column only.
-  await db.tunnel.update({
-    where: { id },
-    data: { status: action === "suspend" ? "inactive" : "active" },
-  }).catch(() => {});
-
   const state = await getTunnelStateApi(id, workspace.id, { db: db as never });
   return ok(c, state.ok ? state.tunnel : result.tunnel ?? { id, action });
 });
