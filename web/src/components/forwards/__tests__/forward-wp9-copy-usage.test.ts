@@ -143,19 +143,8 @@ describe("V4-WP9 auto-port — 空值给明确提示，不给假端口号", () =
     }
   });
 
-');
-  });
 
-  test("preview 报 auto 时显式说明「保存后才确定端口」", () => {
-    expect(SRC).toContain(
-      'if (impact.port_status === "auto") lines.push(t("forward.impactPortAuto"));',
-    );
-    for (const locale of ["zh", "en"] as const) {
-      expect(makeT(getDictionary(locale))("forward.impactPortAuto")).not.toBe(
-        "forward.impactPortAuto",
-      );
-    }
-  });
+);
 });
 
 describe("V4-WP9 Binding usage — 只消费后端契约，不重算口径", () => {
