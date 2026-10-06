@@ -29,6 +29,7 @@ import { HTTPException } from "hono/http-exception";
 import { db } from "../db.ts";
 import { hashPassword, verifyPassword } from "../auth.ts";
 import { rotateKey } from "../services/user-keys.ts";
+import { licenseService } from "../services/license.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 
 export const settingsRoutes = new Hono<{ Variables: AppVariables }>();
@@ -147,6 +148,10 @@ settingsRoutes.post("/password", async (c) => {
 
 async function regenerateApiKey(c: Context<{ Variables: AppVariables }>) {
   const user = requireUser(c);
+  const license = await licenseService.getLicense();
+  if (license?.type !== "business") {
+    return c.json({ error: "API Key 仅 Business License 可用", code: "business_license_required" }, 403);
+  }
   // SEC-02：轮换 = 新 UUID 覆盖 api_key_hash、清空 legacy 明文列。旧凭据立即失效
   // （哈希被覆盖，明文列为空）；新明文只在本响应体里出现一次，不再落库。
   const { plaintext } = await rotateKey("api_key", user.id);
