@@ -149,6 +149,7 @@ function makeLeaseDb(fx: { leases?: Row[]; intents?: Row[]; nodes?: Row[]; grant
     leaseUpdateMany: [] as Row[],
     intentCreate: [] as Row[],
     intentUpdate: [] as Row[],
+    intentUpdateMany: [] as Row[],
   };
 
   function matchLease(l: Row, w: Row): boolean {
@@ -249,6 +250,22 @@ function makeLeaseDb(fx: { leases?: Row[]; intents?: Row[]; nodes?: Row[]; grant
         calls.intentUpdate.push(args.data);
         Object.assign(row, args.data);
         return { ...row };
+      },
+      async updateMany(args: any) {
+        calls.intentUpdateMany.push(args);
+        const w = args.where ?? {};
+        let count = 0;
+        for (const row of intents) {
+          if (w.id !== undefined && row.id !== w.id) continue;
+          if (w.status !== undefined && row.status !== w.status) continue;
+          if (
+            w.created_at !== undefined &&
+            new Date(row.created_at).getTime() !== new Date(w.created_at).getTime()
+          ) continue;
+          Object.assign(row, args.data);
+          count++;
+        }
+        return { count };
       },
     },
   };
@@ -649,6 +666,79 @@ describe("WP15 lease: the idempotency key is claimed in the database, not checke
     const stale = new Date(NOW.getTime() + LEASE_INTENT_PENDING_TTL_MS + 1);
     const abandoned = await claimLeaseIntent(db, { ...arg, now: stale });
     expect(abandoned.kind).toBe("claimed");
+  });
+
+  test("stale pending takeover is CAS-owned by exactly one caller and refreshes the claim TTL", async () => {
+    const staleCreatedAt = new Date(NOW.getTime() - LEASE_INTENT_PENDING_TTL_MS - 1);
+    const made = makeLeaseDb({
+      intents: [
+        {
+          id: 1,
+          intent_id: "intent-1",
+          peer_panel_id: "panel-a",
+          revision: 7,
+          action: "create",
+          status: "pending",
+          lease_id: null,
+          error_code: null,
+          created_at: staleCreatedAt,
+        },
+      ],
+    });
+    const arg = {
+      intent_id: "intent-1",
+      peer_panel_id: "panel-a",
+      revision: 7,
+      action: "create" as const,
+      now: NOW,
+    };
+
+    // Two requests can both have read the same stale row. Simulate the second CAS
+    // with that same stale snapshot after the first one has already refreshed it.
+    const first = await claimLeaseIntent(made.db, arg);
+    expect(first.kind).toBe("claimed");
+    expect(made.intents[0].created_at.getTime()).toBe(NOW.getTime());
+
+    const staleCas = await made.db.federationIntent.updateMany({
+      where: { id: 1, status: "pending", created_at: staleCreatedAt },
+      data: { status: "pending", error_code: null, created_at: NOW },
+    });
+    expect(staleCas.count).toBe(0);
+
+    const second = await claimLeaseIntent(made.db, arg);
+    expect(second.kind).toBe("in_flight");
+  });
+
+  test("failed-intent takeover changes failed -> pending atomically", async () => {
+    const made = makeLeaseDb({
+      intents: [
+        {
+          id: 1,
+          intent_id: "intent-1",
+          peer_panel_id: "panel-a",
+          revision: 7,
+          action: "create",
+          status: "failed",
+          lease_id: null,
+          error_code: "internal_error",
+          created_at: new Date(NOW.getTime() - 1_000),
+        },
+      ],
+    });
+
+    const result = await claimLeaseIntent(made.db, {
+      intent_id: "intent-1",
+      peer_panel_id: "panel-a",
+      revision: 7,
+      action: "create",
+      now: NOW,
+    });
+
+    expect(result.kind).toBe("claimed");
+    expect(made.intents[0].status).toBe("pending");
+    expect(made.intents[0].error_code).toBeNull();
+    expect(made.intents[0].created_at.getTime()).toBe(NOW.getTime());
+    expect(made.calls.intentUpdateMany).toHaveLength(1);
   });
 
   test("a different intent / revision / action is a different key", async () => {
