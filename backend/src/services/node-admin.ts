@@ -1,7 +1,7 @@
 /**
- * WP10 — Admin Node / Egress API 服务层
+ * Admin Node / Egress API 服务层
  *
- * 依据 `DEVELOPMENT.md` §7.13「WP10 / WP11 — API Track」。WP10 的范围：
+ * 本服务层的范围：
  *   · Node role（能力声明）管理；
  *   · credential list/get（**只查状态，绝不下发明文或哈希**——issue/rotate/revoke
  *     在 WP7 已交付，见 services/node-credential.ts）；
