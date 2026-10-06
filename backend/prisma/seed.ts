@@ -56,7 +56,12 @@ const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
   SITE_NAME: "TuneX",
   SITE_DESCRIPTION: "TuneX 隧道转发服务",
   // Fresh production installs are invitation-only unless an operator explicitly changes config.
-  ALLOW_REGISTER:\n    process.env.ALLOW_REGISTER_FALLBACK === "true"\n      ? "true"\n      : (process.env.NODE_ENV ?? "development") === "production"\n        ? "false"\n        : "true",
+  ALLOW_REGISTER:
+    process.env.ALLOW_REGISTER_FALLBACK === "true"
+      ? "true"
+      : (process.env.NODE_ENV ?? "development") === "production"
+        ? "false"
+        : "true",
   LOGO_URL: "",
   HIDE_NODE_STATUS: "false",
   AUTO_UPDATE_AGENT: "false",
