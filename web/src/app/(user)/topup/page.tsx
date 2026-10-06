@@ -1,7 +1,6 @@
 import { AppShell } from "@/components/app-shell";
 import { Suspense } from "react";
 import { TopupBody } from "@/components/topup/topup-body";
-import { requireSession } from "@/components/app-shell";
 
 export default function TopupPage() {
   return (
