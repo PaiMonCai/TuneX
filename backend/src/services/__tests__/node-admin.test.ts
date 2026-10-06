@@ -486,6 +486,12 @@ function makeDb(): NodeAdminDb {
         return rows;
       },
     },
+    /** No federation leases in this unit fixture unless a test opts into them. */
+    federationLease: {
+      async count() {
+        return 0;
+      },
+    },
   };
 
   /**

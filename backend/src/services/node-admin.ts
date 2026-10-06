@@ -235,6 +235,10 @@ export interface NodeAdminDb {
     count(args: unknown): Promise<unknown>;
     findMany(args: unknown): Promise<unknown>;
   };
+  /** Federation impact is part of the same role-change admission check. */
+  federationLease: {
+    count(args: unknown): Promise<unknown>;
+  };
   /**
    * 事务接缝（prisma 的 `$transaction` 满足之）。
    *

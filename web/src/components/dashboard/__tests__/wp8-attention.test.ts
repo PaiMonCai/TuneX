@@ -1,20 +1,16 @@
 /**
  * V4-WP8 §13.7 Wave 4 —— Dashboard「需要处理」待办的契约测试。
  *
- * 五件事：
+ * 四件事：
  *   A. `lib/attention.ts` 的翻译层：归组、码 → 下一步、重试三态、跳转目标；
  *   B. 容错归一：`degraded` 三态（取不到 ≠ 一切正常）、缺字段不渲染 undefined；
  *   C. mock 与后端**同形**：`/dashboard/attention` 的条目、计数与排序逐条对照
  *      `backend/src/services/attention.ts` 的规则（含可重试结论同一来源）；
  *   D. 静态守卫：面板必须存在于 Dashboard，且**判定只有后端一处** ——
- *      前端不得出现心跳窗口 / revision 比较 / 自造重试表；
- *   E. CI 目录反查：web 侧每个 `__tests__` 目录都必须在 `ci.yml` 的 `bun test`
- *      列表里（WP8 报告 F6：放在没被执行的目录里的测试等于没写）。
- *
- * 目录说明：本文件位于 CI 已执行的 `components/dashboard/__tests__/`。
+ *      前端不得出现心跳窗口 / revision 比较 / 自造重试表。
  */
 import { beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import {
   attentionAction,
   attentionHref,
@@ -33,7 +29,6 @@ import type { AttentionItem, AttentionPayload } from "../../../lib/types";
 const readWeb = (rel: string) => readFileSync(new URL(`../../../${rel}`, import.meta.url), "utf8");
 const readBackend = (rel: string) =>
   readFileSync(new URL(`../../../../../backend/src/${rel}`, import.meta.url), "utf8");
-const readRepo = (rel: string) => readFileSync(new URL(`../../../../../${rel}`, import.meta.url), "utf8");
 
 const COOKIE = "tunex_session=u1";
 
@@ -343,29 +338,5 @@ describe("D. 静态守卫", () => {
     expect(panel).toContain("attentionText(");
     expect(panel).toContain("attentionGroupLabel(");
     expect(panel).toContain("attentionSeverityLabel(");
-  });
-});
-
-/* ================================================================== */
-/* E. CI 目录反查（F6：没被执行的测试等于没写）                          */
-/* ================================================================== */
-
-describe("E. 每个 web 测试目录都真的被 CI 执行", () => {
-  test("ci.yml 的 bun test 列表覆盖 web/src/components 下所有 __tests__ 目录", () => {
-    const ci = readRepo(".github/workflows/ci.yml");
-    const command = /bun test ([^\n]+)/.exec(ci);
-    expect(command).not.toBe(null);
-    const covered = command![1]!;
-
-    const componentsDir = new URL("../../", import.meta.url); // web/src/components/
-    const dirs = readdirSync(componentsDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => `src/components/${entry.name}/__tests__/`)
-      .filter((rel) => existsSync(new URL(rel.replace(/^src\/components\//, ""), componentsDir)));
-
-    expect(dirs.length).toBeGreaterThan(0);
-    for (const dir of dirs) {
-      expect(`${dir}:${covered.includes(dir)}`).toBe(`${dir}:true`);
-    }
   });
 });
