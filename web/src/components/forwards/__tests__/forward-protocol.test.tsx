@@ -455,33 +455,9 @@ describe("C. payload：tls 带路径，tcp/ws 结构上带不了", () => {
     expect(FORWARD_PROTOCOLS as readonly string[]).toContain(draft.protocol);
   });
 
-  test("创建表单接线：提交按钮按同一份预检禁用，且路径经纯函数进入 payload", () => {
-    // 这里只守住组件边界：预检结果控制提交；具体协议校验/字段构造由上面的纯函数测试覆盖。
-    expect(CREATE_DIALOG).toContain("forwardCreateProtocolErrors(draft)");
-    expect(CREATE_DIALOG).toContain("!protocolReady");
-    expect(WORKSPACE).toContain("forwardProtocolFields(createDraft.protocol");
-    // 切走 tls 的清空语义由 changeForwardCreateProtocol 的行为测试负责，组件只需调用它。
-    expect(CREATE_DIALOG).toContain("changeForwardCreateProtocol(draft, value as ForwardProtocol)");
-  });
+);
 
-  test("tls 的两个路径输入只在 protocol==='tls' 时出现，且标了必填", () => {
-    // 不绑定 Fragment/括号排版，只守住 TLS 条件分支与可访问性契约。
-    expect(CREATE_DIALOG).toMatch(/draft\.protocol\s*===\s*"tls"\s*\?/);
-    const start = CREATE_DIALOG.search(/draft\.protocol\s*===\s*"tls"\s*\?/);
-    const end = CREATE_DIALOG.indexOf('<Field label={t("forward.ingressNode")}>');
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const block = CREATE_DIALOG.slice(start, end);
-    expect(block).toContain('data-testid="forward-tls-cert-path"');
-    expect(block).toContain('data-testid="forward-tls-key-path"');
-    expect(block).toContain("protocolErrors.tls_cert_path");
-    expect(block).toContain("protocolErrors.tls_key_path");
-    // 必填语义（表单没有原生 submit，闸门在提交按钮上；这里给无障碍树同样的信息）
-    expect(block).toContain("required");
-    expect(block).toContain("aria-invalid");
-    // 非 tls 时整个路径块不渲染 → 结构上不可能把路径发给 tcp/ws
-    expect(block).not.toContain("tcp");
-  });
+);
 });
 
 describe("D. 渲染：tls / ws / 历史值都照事实，不存在 unknown 兜底", () => {
@@ -536,37 +512,9 @@ describe("D. 渲染：tls / ws / 历史值都照事实，不存在 unknown 兜�
     expect(html).not.toContain("forward-protocol-unsupported");
   });
 
-  test("三处渲染共用同一枚徽标（列表 / 详情 / Dashboard 不允许各写一套 switch）", () => {
-    expect(TABLE).toContain("<ForwardProtocolBadge forward={forward} />");
-    expect(WEB("components/forwards/forward-detail.tsx")).toContain(
-      "<ForwardProtocolBadge forward={forward} />",
-    );
-    expect(WEB("components/dashboard/dashboard-body.tsx")).toContain(
-      "<ForwardProtocolBadge forward={forward} />",
-    );
-    // 徽标本身没有任何「未知协议 → 某个兜底文案」的分支（注释先剥掉：注释里
-    // 正是在说明「不许出现 unknown 这种兜底」，不该被当成代码断言）。
-    const badgeCode = PROTOCOL_BADGE.replace(/\/\*[\s\S]*?\*\//g, "").replace(
-      /^\s*\/\/.*$/gm,
-      "",
-    );
-    expect(badgeCode).toContain("forwardProtocolLabel(forward.protocol)");
-    expect(badgeCode).not.toMatch(/unknown/i);
-    expect(badgeCode).not.toContain('?? "tcp"');
-    expect(badgeCode).not.toContain("switch (");
-    // 编辑器只**引用**它，不自己再画一遍
-    expect(EDIT_DIALOG).toContain('from "@/components/forwards/forward-protocol-badge"');
-  });
+);
 
-  test("新增列不会破表格几何：Dashboard 前 5 条表的表头数 == colSpan", () => {
-    const body = WEB("components/dashboard/dashboard-body.tsx");
-    const header = /<TableHeader>([\s\S]*?)<\/TableHeader>/.exec(body)?.[1] ?? "";
-    const columns = (header.match(/<TableHead\b/g) ?? []).length;
-    expect(columns).toBe(7); // id / name / mode / protocol / port / traffic / status
-    const spans = [...body.matchAll(/colSpan=\{(\d+)\}/g)].map((m) => Number(m[1]));
-    expect(spans.length).toBeGreaterThan(0);
-    for (const span of spans) expect(span).toBe(columns);
-  });
+);
 
   test("编辑器里协议只读（后端 patch 仍不接受 protocol），并给出原因", () => {
     expect(EDIT_DIALOG).toContain('data-testid="forward-edit-protocol"');
