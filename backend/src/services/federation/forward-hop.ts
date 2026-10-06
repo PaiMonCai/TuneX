@@ -875,28 +875,44 @@ export async function releaseFederatedEgress(
   const d = resolveDeps(deps);
   const intentId = federatedEgressIntentId(request.tunnelId, request.revision);
 
-  // 先找镜像行：它同时给出 peer 与 lease_ref（前者我们可能不知道，后者只有 host 知道）。
-  const placement = (await d.db.federationPlacement
-    .findUnique({
-      where: {
-        peer_panel_id_intent_id: {
-          peer_panel_id: request.peer_panel_id ?? "",
-          intent_id: intentId,
-        },
-      },
-    })
-    .catch(() => null)) as { peer_panel_id: string; lease_ref: string | null; state: string } | null;
-
-  let row = placement;
-  if (!row) {
-    const rows = (await d.db.federationPlacement
-      .findMany({ where: { tunnel_id: request.tunnelId, intent_id: intentId }, take: 1 })
-      .catch(() => [])) as Array<{ peer_panel_id: string; lease_ref: string | null; state: string }>;
-    row = rows.length > 0 ? rows[0]! : null;
+  // If the caller already holds both remote identifiers (e.g. immediate
+  // compensation after reserve/apply), release must not depend on the local DB.
+  // Otherwise the placement ledger is required to discover the missing fact,
+  // and a DB read failure is NOT equivalent to "no remote resource exists".
+  let row: { peer_panel_id: string; lease_ref: string | null; state: string } | null = null;
+  if (request.peer_panel_id == null || request.lease_ref == null) {
+    try {
+      if (request.peer_panel_id != null) {
+        row = (await d.db.federationPlacement.findUnique({
+          where: {
+            peer_panel_id_intent_id: {
+              peer_panel_id: request.peer_panel_id,
+              intent_id: intentId,
+            },
+          },
+        })) as { peer_panel_id: string; lease_ref: string | null; state: string } | null;
+      }
+      if (!row) {
+        const rows = (await d.db.federationPlacement.findMany({
+          where: { tunnel_id: request.tunnelId, intent_id: intentId },
+          take: 1,
+        })) as Array<{ peer_panel_id: string; lease_ref: string | null; state: string }>;
+        row = rows.length > 0 ? rows[0]! : null;
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        released: false,
+        code: "internal_error",
+        message: `读取远端出口镜像失败，无法确认是否存在待释放资源：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
   }
 
-  const peerPanelId = row?.peer_panel_id ?? request.peer_panel_id ?? null;
-  const leaseRef = row?.lease_ref ?? request.lease_ref ?? null;
+  const peerPanelId = request.peer_panel_id ?? row?.peer_panel_id ?? null;
+  const leaseRef = request.lease_ref ?? row?.lease_ref ?? null;
 
   // 没有镜像行也没有 lease_ref：没有可释放的远端资源（从未建成）。
   if (peerPanelId === null) return { ok: true, released: true };
@@ -910,13 +926,31 @@ export async function releaseFederatedEgress(
   const resolved = await resolvePeer(peerPanelId, d);
   if (!resolved.ok) {
     // peer 已经被撤销：host 侧会因信任撤销而自行停服（契约 §2.4），我们只能如实标注。
-    await markPlacementExpired(d, peerPanelId, intentId, resolved.code);
+    try {
+      await markPlacementExpired(d, peerPanelId, intentId, resolved.code);
+    } catch (error) {
+      return {
+        ok: false,
+        released: false,
+        code: "internal_error",
+        message: `远端信任已失效，且本地镜像记账失败：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     return { ok: resolved.code === "peer_unknown" || resolved.code === "peer_revoked", released: false, code: resolved.code, message: resolved.message };
   }
 
   const released = await releaseRemoteLease(d, resolved.peer, leaseRef, intentId, request.revision);
   if (released.ok) {
-    await markPlacementExpired(d, peerPanelId, intentId);
+    try {
+      await markPlacementExpired(d, peerPanelId, intentId);
+    } catch (error) {
+      return {
+        ok: false,
+        released: true,
+        code: "internal_error",
+        message: `远端出口已释放，但本地镜像记账失败：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
     return { ok: true, released: true };
   }
   // 失败要留下事实：镜像行记 degraded + 真实错误码，下一拍/下一轮仍按同一 intent 重试。
@@ -933,9 +967,9 @@ async function markPlacementExpired(
   intentId: string,
   code?: FederationErrorCode,
 ): Promise<void> {
-  const existing = (await d.db.federationPlacement
-    .findUnique({ where: { peer_panel_id_intent_id: { peer_panel_id: peerPanelId, intent_id: intentId } } })
-    .catch(() => null)) as { forward_ref: string; desired_revision: number } | null;
+  const existing = (await d.db.federationPlacement.findUnique({
+    where: { peer_panel_id_intent_id: { peer_panel_id: peerPanelId, intent_id: intentId } },
+  })) as { forward_ref: string; desired_revision: number } | null;
   if (!existing) return;
   await upsertPlacement(
     {
@@ -947,12 +981,12 @@ async function markPlacementExpired(
       state: "expired",
     },
     { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
+  );
   if (code) {
     await recordPlacementResult(
       { peer_panel_id: peerPanelId, intent_id: intentId, ok: false, code, message: null },
       { db: d.db as never, sender: d.sender as never, now: d.now },
-    ).catch(() => undefined);
+    );
   }
 }
 
