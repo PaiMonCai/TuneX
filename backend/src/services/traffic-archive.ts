@@ -151,6 +151,8 @@ export interface TrafficDbLike {
 /** 入库行（date 归一为 UTC 午夜 Date，与既有查询 `date` 日界口径一致）。 */
 export interface TrafficInsertRow {
   tunnel_id: number;
+  /** Immutable tenant attribution copied from the authoritative Tunnel row. */
+  workspace_id: number;
   traffic: number;
   traffic_cost: number;
   date: Date;
@@ -267,6 +269,7 @@ export async function flushTrafficBuffer(deps: TrafficArchiveDeps): Promise<Traf
         }
         rows.push({
           tunnel_id: rec.tunnel_id,
+          workspace_id: workspaceId,
           traffic: rec.traffic,
           traffic_cost: rec.traffic_cost,
           date: trafficDate(rec.date),
