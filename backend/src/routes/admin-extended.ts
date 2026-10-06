@@ -392,6 +392,69 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     return bad(c, `该用户仍有 ${tunnelCount} 条隧道，请先删除隧道`, 409);
   }
 
+  // 普通 Tunnel 不是唯一会在 Node 上留下 runtime 的对象：作为 federation host
+  // 时，远端腿只记录 federation_lease.node_id，根本没有本地 Tunnel 行。
+  // 删除 Node 会级联 NodePortLease，却不会改写 FederationLease（历史刻意无 FK），
+  // 因此必须先证明这些个人节点没有仍需 teardown/还端口的远端资源。
+  const personalWorkspace = await db.workspace.findUnique({
+    where: { personal_user_id: id },
+    select: { id: true },
+  });
+  const ownedNodes = await db.node.findMany({
+    where: { node_group: { user_id: id } },
+    select: { id: true },
+  });
+  const ownedNodeIds = ownedNodes.map((node) => node.id);
+  if (ownedNodeIds.length > 0) {
+    const [federatedRuntimeCount, activePortLeaseCount] = await Promise.all([
+      db.federationLease.count({
+        where: {
+          node_id: { in: ownedNodeIds },
+          OR: [
+            { state: { in: ["reserved", "active", "releasing", "failed"] } },
+            {
+              state: { in: ["revoked", "expired", "released"] },
+              last_error_code: { not: null },
+            },
+          ],
+        },
+      }),
+      db.nodePortLease.count({
+        where: { node_id: { in: ownedNodeIds }, status: "active" },
+      }),
+    ]);
+    if (federatedRuntimeCount > 0) {
+      return bad(
+        c,
+        `该用户节点仍承载 ${federatedRuntimeCount} 条未完成清理的联邦租约，请先 release/revoke 并完成 runtime 清理`,
+        409,
+      );
+    }
+    if (activePortLeaseCount > 0) {
+      return bad(
+        c,
+        `该用户节点仍有 ${activePortLeaseCount} 条活动端口租约，请先完成租约回收`,
+        409,
+      );
+    }
+  }
+
+  if (personalWorkspace) {
+    const federationGrantCount = await db.federationGrant.count({
+      where: {
+        workspace_id: personalWorkspace.id,
+        status: { in: ["active", "suspended"] },
+      },
+    });
+    if (federationGrantCount > 0) {
+      return bad(
+        c,
+        `该用户个人空间仍有 ${federationGrantCount} 条未终止的联邦授权，请先撤销 grant`,
+        409,
+      );
+    }
+  }
+
   //：旧 collectAffectedNodeGroups*（为 legacy 配置推送计算受影响节点组）
 
   await db.$transaction(async (tx) => {
@@ -436,7 +499,8 @@ adminExtendedRoutes.delete("/users/:id", async (c) => {
     await tx.user.delete({ where: { id } });
   });
 
-  //：用户删除后由 reconciler 拉齐 apply 命令，无需 legacy 推送。
+  // 所有 runtime / lease / federation grant 都在事务前被要求收口；到这里
+  // 删除的是纯账本/身份数据，不再依赖“删完 desired 再让 reconciler 猜着清 runtime”。
   return one(c, { ok: true });
 });
 
