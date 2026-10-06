@@ -20,7 +20,6 @@ if (process.env.TUNEX_DB_TEST !== "1") {
   test("federation forward-hop MySQL integration (requires TUNEX_DB_TEST=1)", { skip: true }, () => {});
 } else {
   process.env.AUTH_SECRET ??= "test-only-auth-secret-must-not-be-used-in-production";
-  process.env.LICENSE_SECRET ??= "test-only-license-secret-must-not-be-used-in-production";
   process.env.PAYMENTS_ENABLED = "false";
 
   const { randomUUID } = await import("node:crypto");
