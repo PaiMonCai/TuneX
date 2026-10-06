@@ -284,6 +284,14 @@ export function isModeMismatch(t: DesiredTunnel, agent: AgentTunnelState | null)
  * `node !== null && !isNodeUnreachable(...)` 必须一致的原因——两边答案不同
  * 就会出现「判定说该重发、执行层又不发」的漂移。
  */
+function latestNodeActivityMs(node: NodeOnlineInput): number | null {
+  const candidates = [node.last_seen_at, node.reported_at]
+    .filter((value): value is Date => value != null)
+    .map((value) => new Date(value).getTime())
+    .filter(Number.isFinite);
+  return candidates.length > 0 ? Math.max(...candidates) : null;
+}
+
 export function isNodeUnreachable(
   node: NodeOnlineInput | null | undefined,
   now: Date,
@@ -291,9 +299,12 @@ export function isNodeUnreachable(
 ): boolean {
   if (!node) return true;
   if (node.status === "inactive") return true;
-  const seen = node.last_seen_at ?? node.reported_at ?? null;
-  if (!seen) return true; // 从未有心跳/上报 —— 不删资源，但也不自动下发
-  return now.getTime() - new Date(seen).getTime() > staleAfterMs;
+  // Both timestamps are panel-side facts. last_seen_at is refreshed fail-soft
+  // after a state report, so it may lag behind a fresh reported_at when that
+  // secondary update fails. Reachability must use the freshest known fact.
+  const seenMs = latestNodeActivityMs(node);
+  if (seenMs === null) return true; // 从未有心跳/上报 —— 不删资源，但也不自动下发
+  return now.getTime() - seenMs > staleAfterMs;
 }
 
 /** 上一次 apply 是否以 error 收尾。 */
@@ -906,8 +917,7 @@ export async function executeReconcile(deps: ReconcileDeps): Promise<ReconcileOu
     // 同一 node_id 多行时取「更新鲜」的那份（last_seen_at / reported_at 取大）。
     if (!prev) nodeById.set(n.node_id, n);
     else {
-      const ts = (x: NodeOnlineInput) =>
-        Math.max(x.last_seen_at ? new Date(x.last_seen_at).getTime() : 0, x.reported_at ? new Date(x.reported_at).getTime() : 0);
+      const ts = (x: NodeOnlineInput) => latestNodeActivityMs(x) ?? 0;
       nodeById.set(n.node_id, ts(n) > ts(prev) ? n : prev);
     }
   }
@@ -1224,11 +1234,7 @@ function pickNode(
     ? "inactive"
     : "active";
 
-  const seen = (n: NodeOnlineInput): number | null => {
-    const d = n.last_seen_at ?? n.reported_at ?? null;
-    return d ? new Date(d).getTime() : null;
-  };
-  const seenValues = boundNodes.map(seen);
+  const seenValues = boundNodes.map(latestNodeActivityMs);
   const oldest =
     seenValues.some((v) => v == null)
       ? null
