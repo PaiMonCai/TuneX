@@ -199,6 +199,3 @@ describe("V4 forward edit UX — running-vs-desired 状态折叠", () => {
     expect(state.applied).toBeNull();
   });
 });
-
-describe("V4 forward edit UX — 影响面/复制 UX 契约", () => {
-});
