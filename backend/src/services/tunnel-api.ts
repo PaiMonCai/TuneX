@@ -399,7 +399,7 @@ export function desiredAfterAction(action: TunnelAction): {
     case "resume":
       return { desired_status: "active", apply_status: "pending", clear_error: true };
     case "suspend":
-      return { desired_status: "inactive", apply_status: "suspended", clear_error: false };
+      return { desired_status: "inactive", apply_status: "applying", clear_error: false };
     case "delete":
       return { desired_status: "inactive", clear_error: false };
   }
@@ -923,65 +923,120 @@ export async function runTunnelAction(
     const revision = (tunnel.config_revision ?? 0) + 1;
     await pdb.tunnel.update({
       where: { id: tunnel.id },
-      data: { config_revision: revision, desired_status: "inactive", apply_status: "suspended" },
+      data: {
+        config_revision: revision,
+        desired_status: "inactive",
+        apply_status: "applying",
+        apply_error_code: null,
+        apply_error: null,
+      },
     });
 
-    if (orchestrator) {
-      const ingressNode = tunnel.ingress_node_id
-        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
-            where: { id: tunnel.ingress_node_id },
-            select: { id: true, node_id: true, connect_ip: true, role: true },
-          }))
-        : null;
-      const egressNode = tunnel.egress_node_id
-        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
-            where: { id: tunnel.egress_node_id },
-            select: { id: true, node_id: true, connect_ip: true, role: true },
-          }))
-        : null;
-      // V5.4：挂起同样要撤中间跳 —— 与删除同理，漏掉就是一条永久占端口的孤儿 runtime。
-      // "撤掉一条腿"的每条路径都必须同时知道所有腿：删除 ↔ 创建、挂起 ↔ 恢复、
-      // rollout 补偿 ↔ rollout 下发。
-      const middleNode = tunnel.middle_node_id
-        ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
-            where: { id: tunnel.middle_node_id },
-            select: { id: true, node_id: true, connect_ip: true, role: true },
-          }))
-        : null;
+    const ingressNode = tunnel.ingress_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.ingress_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
+    const egressNode = tunnel.egress_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.egress_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
+    const middleNode = tunnel.middle_node_id
+      ? asRow<TunnelApiNodeRow>(await pdb.node.findUnique({
+          where: { id: tunnel.middle_node_id },
+          select: { id: true, node_id: true, connect_ip: true, role: true },
+        }))
+      : null;
 
-      if (tunnel.tunnel_mode === "relay" && middleNode) {
-        const stoppedTransit = await orchestrator.removeTunnel({
-          tunnelId,
-          node: middleNode as never,
-          direction: "egress",
-          revision,
-          reason: "tunnel suspended (transit)",
-        });
-        if (!stoppedTransit.ok) {
-          return err("apply_failed", stoppedTransit.error, { apply_error_code: stoppedTransit.error_code });
+    const expectedRuntime =
+      tunnel.ingress_node_id != null ||
+      (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null) ||
+      tunnel.middle_node_id != null;
+    const teardownErrors: string[] = [];
+
+    if (!orchestrator && expectedRuntime) {
+      teardownErrors.push("运行时撤除通道不可用");
+    } else if (orchestrator) {
+      // Stop accepting new traffic first, then dismantle downstream legs.
+      // Creation is far→near; suspension is the reverse near→far.
+      const remove = async (
+        label: string,
+        input: Parameters<NonNullable<TunnelApiDeps["orchestrator"]>["removeTunnel"]>[0],
+      ) => {
+        try {
+          const result = await orchestrator.removeTunnel(input);
+          if (!result.ok) teardownErrors.push(`${label}: ${result.error}`);
+        } catch (error) {
+          teardownErrors.push(
+            `${label}: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
-      }
-      if (tunnel.tunnel_mode === "relay" && egressNode) {
-        const stopped = await orchestrator.removeTunnel({
-          tunnelId,
-          node: egressNode as never,
-          direction: "egress",
-          revision,
-          reason: "tunnel suspended",
-        });
-        if (!stopped.ok) return err("apply_failed", stopped.error, { apply_error_code: stopped.error_code });
-      }
-      if (ingressNode) {
-        const stopped = await orchestrator.removeTunnel({
+      };
+
+      if (tunnel.ingress_node_id != null && !ingressNode) {
+        teardownErrors.push("入口节点记录缺失");
+      } else if (ingressNode) {
+        await remove("ingress", {
           tunnelId,
           node: ingressNode as never,
           direction: tunnel.tunnel_mode === "direct" ? "direct" : "ingress",
           revision,
           reason: "tunnel suspended",
         });
-        if (!stopped.ok) return err("apply_failed", stopped.error, { apply_error_code: stopped.error_code });
+      }
+
+      if (tunnel.middle_node_id != null && !middleNode) {
+        teardownErrors.push("中间跳节点记录缺失");
+      } else if (tunnel.tunnel_mode === "relay" && middleNode) {
+        await remove("transit", {
+          tunnelId,
+          node: middleNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel suspended (transit)",
+        });
+      }
+
+      if (tunnel.tunnel_mode === "relay" && tunnel.egress_node_id != null && !egressNode) {
+        teardownErrors.push("出口节点记录缺失");
+      } else if (tunnel.tunnel_mode === "relay" && egressNode) {
+        await remove("egress", {
+          tunnelId,
+          node: egressNode as never,
+          direction: "egress",
+          revision,
+          reason: "tunnel suspended",
+        });
       }
     }
+
+    if (teardownErrors.length > 0) {
+      const message = `runtime 撤除未确认完成：${teardownErrors.join("; ")}`;
+      await pdb.tunnel.update({
+        where: { id: tunnel.id },
+        data: {
+          desired_status: "inactive",
+          apply_status: "error",
+          apply_error_code: "runtime_teardown_failed",
+          apply_error: message.slice(0, 500),
+        },
+      });
+      return err("apply_failed", message, { apply_error_code: "runtime_teardown_failed" });
+    }
+
+    await pdb.tunnel.update({
+      where: { id: tunnel.id },
+      data: {
+        desired_status: "inactive",
+        apply_status: "suspended",
+        status: "inactive",
+        apply_error_code: null,
+        apply_error: null,
+      },
+    });
 
     const afterSuspend = asRow<TunnelRow>(
       await pdb.tunnel.findFirst({ where: { id: tunnel.id, workspace_id: workspaceId } }),
@@ -1015,6 +1070,10 @@ export async function runTunnelAction(
   if (!result.ok) {
     return err("apply_failed", result.error, { apply_error_code: result.error_code });
   }
+  await pdb.tunnel.update({
+    where: { id: tunnel.id },
+    data: { status: "active" },
+  });
   const after = asRow<TunnelRow>(
     await pdb.tunnel.findFirst({ where: { id: tunnel.id, workspace_id: workspaceId } }),
   );
