@@ -884,11 +884,53 @@ describe("C. 运行操作统一走 orchestrator", () => {
     for (const rm of removes) expect(rm.revision).toBe(8);
   });
 
-  test("C7. delete：编排器不可用也允许删（补偿失败不阻断显式用户动作）", async () => {
+  test("C6b. delete：任一 runtime 撤除失败时继续尝试其它腿，但不删行", async () => {
+    seedTunnel({ id: 2051, config_revision: 7, egress_node_id: 2, in_node_group_id: 10 });
+    const failingOrchestrator = {
+      removeTunnel: async (input: {
+        tunnelId: number;
+        revision: number;
+        direction?: "direct" | "ingress" | "egress";
+        node?: { id?: number };
+      }) => {
+        orchestratorCalls.push({
+          kind: "remove",
+          tunnelId: input.tunnelId,
+          revision: input.revision,
+          direction: input.direction,
+          nodeId: input.node?.id,
+        });
+        if (input.direction === "egress") {
+          return { ok: false as const, error_code: "agent_unreachable", error: "egress offline" };
+        }
+        return { ok: true as const, result: { commandId: "cmd-rm", revision: input.revision, ack: {} } };
+      },
+    };
+
+    const r = await runTunnelAction(
+      2051,
+      "delete",
+      7,
+      deps({ orchestrator: failingOrchestrator as never }),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("apply_failed");
+    expect(r.apply_error_code).toBe("runtime_teardown_failed");
+    expect(tunnels.has(2051)).toBe(true);
+    // Egress failed, but ingress teardown was still attempted to reduce orphaned runtime surface.
+    expect(orchestratorCalls.filter((c) => c.kind === "remove")).toHaveLength(2);
+  });
+
+  test("C7. delete：编排器不可用时 fail-closed，保留行避免孤儿 runtime", async () => {
     seedTunnel({ id: 206 });
     const r = await runTunnelAction(206, "delete", 7, deps({ orchestrator: null }));
-    expect(r.ok).toBe(true);
-    expect(tunnels.has(206)).toBe(false);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("apply_failed");
+    expect(r.apply_error_code).toBe("runtime_teardown_unavailable");
+    expect(tunnels.has(206)).toBe(true);
   });
 
   test("C8. delete：越权 workspace → 404，行还在", async () => {
