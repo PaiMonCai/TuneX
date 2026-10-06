@@ -73,9 +73,6 @@ describe("V4-WP9 S4 访问地址：只消费后端返回值，绝不伪造", () 
 });
 
 describe("V4-WP9 S4 列表 / 详情：`:auto` 字面量必须消失", () => {
-);
-
-);
 
   test("两语言都有访问地址 / 待确定词条且非空", () => {
     for (const locale of ["zh", "en"] as const) {
@@ -91,9 +88,6 @@ describe("V4-WP9 S4 列表 / 详情：`:auto` 字面量必须消失", () => {
 });
 
 describe("V4-WP9 S4 创建成功回执：用 POST 的真实响应", () => {
-);
-
-);
 
   test("回执在 auto port 下显示待确定而不是伪地址（与纯函数一致）", () => {
     const created = forward({ listen_port: null });
