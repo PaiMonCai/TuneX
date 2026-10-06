@@ -9,6 +9,7 @@
  * Tunnel remains the internal runtime/desired-state record. These routes project
  * it as a PortForward and never ask the user to choose a tunnel mode directly.
  */
+import { isIP } from "node:net";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -43,6 +44,7 @@ import {
 // （那就是第二套「是否落后」的判定，专项明令禁止）。
 import { isVersionOlder } from "../services/node-health.ts";
 import { env } from "../env.ts";
+import { PANEL_MIGRATION_CONFIG_KEY, panelMigrationView, parsePanelMigration } from "../services/node-install.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -69,6 +71,10 @@ nodesRoutes.use("*", async (c, next) => {
     else action = "update";
   } else if (path.endsWith("/enrollment") && method === "POST") {
     action = "manage";
+    resource = "node";
+  } else if (method === "PATCH") {
+    // 修改节点安全字段（当前只有 connect_ip）：与其它资源一样按 update 授权。
+    action = "update";
     resource = "node";
   }
 
@@ -189,6 +195,146 @@ nodesRoutes.get("/", async (c) => {
     select: nodeSelect,
   });
   return c.json({ data: raw.map((node) => nodeView(node)) });
+});
+
+// 行为参照：ForwardX（AGPL-3.0-only）——「成员自带连接地址（`connectHost`）」这一产品逻辑：
+// 可拨号地址**不是**在创建那一刻定死的，而是事后可以设置与修改的。
+// 代码为本项目改写（改在**节点**这一层，不引入成员级第二份地址），未复制其实现。
+// 参照溯源：docs/agent/forwardx-code-reuse.md
+/**
+ * `PATCH /api/nodes/:id` —— 修改节点的**安全字段**（当前只有 `connect_ip`）。
+ *
+ * ── 为什么需要它 ──
+ * `connect_ip` 曾经**只在 provision 时可写**：对已存在的节点再 provision，该字段被忽略
+ * （`routes/node-groups.ts` 的重签分支只重发 enrollment，不动任何配置）。于是
+ * 「建的时候没填地址」的节点**永远不能当 RELAY / 三跳的一跳** —— 下发时以
+ * `502 apply_failed / invariant_violated: RELAY plan needs a <host>:<port> next_hop` 结束，
+ * 而那句错误既没说是哪台机器，也没说该怎么办。
+ *
+ * ── 边界（为什么只开放这一个字段）──
+ * 这里**不是**通用节点编辑器：role / 端口区间 / 生命周期 / 凭据都有各自的既有入口与判定
+ * （`node-groups.ts`、`node-lifecycle.ts`、`node-credential*`），从这条路径改它们会绕过那些
+ * 判定。因此本端点只认 `connect_ip`，其余字段一律 400（fail-closed，而不是"忽略未知字段"）。
+ *
+ * ── 拒绝分支（都有行为测试）──
+ *   · `id` 非法 / 节点不属于当前 Workspace → 400 / 404（与同文件其余端点同形）；
+ *   · 请求体缺 `connect_ip`、类型不对、空白串 → 400 `invalid_connect_ip`；
+ *   · 地址形状不合法（含空白、方括号、非法 IP、非法主机名）→ 400 `invalid_connect_ip`；
+ *   · 清空（`null`）而**仍有 RELAY/三跳依赖这台节点当跳** → 409 `connect_ip_in_use`
+ *     （列出依赖它的转发，让用户先改/删那些转发 —— 否则下次下发必然失败）；
+ *   · 权限：workspace `node:manage`（沿用本文件 `*` middleware 的映射，见下方新增的 PATCH 分支）。
+ *
+ * 不动 `node_id`（身份）、不动 `agent_id`、不写审计之外的任何状态；响应是与 `/api/nodes`
+ * 同一份投影（`nodeView`），调用方不需要第二套形状。
+ */
+const NodeConnectIpPatch = z.object({
+  connect_ip: z.union([z.string(), z.null()]),
+});
+
+/** 合法主机：IPv4 / IPv6（**不带方括号**）/ RFC1123 主机名。 */
+function isDialableHost(value: string): boolean {
+  if (isIP(value) !== 0) return !value.startsWith("[") && !value.endsWith("]");
+  // 主机名：标签 1..63、总长 ≤253、不允许下划线（DNS 记录与 TLS SNI 都不接受它）
+  return /^(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(value);
+}
+
+nodesRoutes.patch("/:id", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "id");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法", code: "invalid_input" }, 400);
+
+  const raw = await c.req.json().catch(() => null);
+  const parsed = NodeConnectIpPatch.safeParse(raw);
+  if (!parsed.success) {
+    return c.json(
+      {
+        error: "本端点只接受 connect_ip（字符串或 null）；其它字段请走各自的入口（角色/区间/生命周期/凭据）。",
+        code: "invalid_connect_ip",
+      },
+      400,
+    );
+  }
+  // 未知字段一律拒绝：静默忽略会让调用方以为改成功了。
+  const extraKeys = Object.keys(raw as Record<string, unknown>).filter((key) => key !== "connect_ip");
+  if (extraKeys.length > 0) {
+    return c.json(
+      {
+        error: `本端点只接受 connect_ip，收到不支持的字段：${extraKeys.join(", ")}`,
+        code: "invalid_connect_ip",
+      },
+      400,
+    );
+  }
+
+  const node = await loadWorkspaceNode(nodeId, ws.id);
+  if (!node) return c.json({ error: "节点不存在", code: "not_found" }, 404);
+
+  const rawValue = parsed.data.connect_ip;
+  let nextValue: string | null;
+  if (rawValue === null) {
+    nextValue = null;
+  } else {
+    const trimmed = rawValue.trim();
+    if (trimmed === "") {
+      return c.json(
+        {
+          error: "connect_ip 不能是空白串：要清空地址请显式传 null。",
+          code: "invalid_connect_ip",
+        },
+        400,
+      );
+    }
+    // 一处 `connect_ip` 可以是逗号分隔的候选列表（`firstConnectIp` 取第一个），
+    // 因此逐项校验，而不是只验整串。
+    const parts = trimmed.split(",").map((part) => part.trim()).filter(Boolean);
+    if (parts.length === 0 || parts.some((part) => !isDialableHost(part))) {
+      return c.json(
+        {
+          error: "connect_ip 必须是可拨号的主机地址：IPv4 / IPv6（不带方括号）/ 主机名；多个候选用逗号分隔。",
+          code: "invalid_connect_ip",
+        },
+        400,
+      );
+    }
+    nextValue = parts.join(",");
+  }
+
+  if (nextValue === null) {
+    /**
+     * 清空地址要**先确认没人依赖它**：RELAY / 三跳的每一跳都要有一个可拨号地址，
+     * 把地址抹掉会让那些转发在下一次下发时失败。这里 fail-closed 并把依赖列出来，
+     * 让用户知道该先改什么（而不是让他自己发现"昨天还好的转发今天全红了"）。
+     */
+    const dependents = await db.tunnel.findMany({
+      where: {
+        workspace_id: ws.id,
+        tunnel_mode: "relay",
+        OR: [{ egress_node_id: nodeId }, { middle_node_id: nodeId }],
+      },
+      select: { id: true, name: true },
+      orderBy: { id: "asc" },
+      take: 10,
+    });
+    if (dependents.length > 0) {
+      return c.json(
+        {
+          error: `该节点当前是这些转发的跳，清空 connect_ip 会让它们无法下发：${dependents
+            .map((row) => `#${row.id} ${row.name}`)
+            .join("、")}。请先改掉这些转发或换成另一台节点。`,
+          code: "connect_ip_in_use",
+          data: { forwards: dependents },
+        },
+        409,
+      );
+    }
+  }
+
+  await db.node.update({ where: { id: nodeId }, data: { connect_ip: nextValue } });
+  // 回读一次再投影：响应形状与 `GET /api/nodes` 完全一致（调用方不需要第二套形状）；
+  // 回读也顺带证明"写进去了"，而不是把请求体的意图回显成事实。
+  const updated = await loadWorkspaceNode(nodeId, ws.id);
+  if (!updated) return c.json({ error: "节点不存在", code: "not_found" }, 404);
+  return c.json({ data: nodeView(updated) });
 });
 
 /** Re-generate a short-lived one-click installer for an existing node. */
@@ -372,10 +518,40 @@ nodesRoutes.get("/:ingressId/upgrade-state", async (c) => {
         ? { ok: true, code: null, message: null }
         : { ok: false, code: precondition.code ?? null, message: precondition.message ?? null },
       offline_after_seconds: NODE_OFFLINE_AFTER_SECONDS,
+      /**
+       * 面板迁移回退（task-44）：**面板侧配置了什么**。
+       *
+       * ⚠️ 这是**面板级**配置（`config` 表的 PANEL_MIGRATION），不是这台节点的运行态：
+       * "agent 现在到底在跟哪个地址说话"由 agent 上报（`panel_url_in_use` /
+       * `panel_migration_id` / `panel_fallback_active`），而**面板侧还没有持久化它的列**
+       * （需要一次 schema 迁移，不在本切片范围）⇒ 这里如实标注 `node_reported_state_persisted: false`，
+       * 绝不用"配置了回退"冒充"节点正在回退"。
+       */
+      panel_migration: panelMigrationView(await loadPanelMigration()),
       generated_at: new Date().toISOString(),
     },
   });
 });
+
+/**
+ * 读面板级迁移配置。
+ *
+ * **"确实没配置"与"读不到"必须分开**：前者是部署方的决定（`not_configured`，`problem=null`），
+ * 后者是这次取数的降级（`unreadable`，`problem` 非空、可重试）。把两者都渲染成"未配置"
+ * 就是"取不到 ⇒ 显示成没事"，正是本专项反复禁掉的那类展示错误。
+ */
+async function loadPanelMigration() {
+  try {
+    const row = await db.systemConfig.findUnique({ where: { name: PANEL_MIGRATION_CONFIG_KEY as never } });
+    return parsePanelMigration(row?.value ?? null);
+  } catch (error) {
+    return {
+      ok: false as const,
+      reason: "unreadable" as const,
+      detail: error instanceof Error ? error.message : "读取 PANEL_MIGRATION 失败",
+    };
+  }
+}
 
 /**
  *  —— `GET /api/nodes/:id/support-bundle`

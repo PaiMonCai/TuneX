@@ -970,7 +970,7 @@ mtr                     → MISSING（镜像无该二进制）
 | **7** Agent upgrade 完整流程 | **基本达成** | 只读 `upgrade-state`（**实际上报版本** + 前置逐字同源）+ 卡片挂载（旧内联入口退役）+ 版本基线语义修复 + **镜像 stamp 版本**（两版实测上报不同 version） | **真实节点完整升级未跑**；`version_drift:behind` **真机未出现**（需发布方注入 tag + 节点升级 + 配基线） |
 | **8** 常见故障诊断入口 | **达成** | 诊断面板 + 支持包 + 转发错误→下一步；Looking Glass 已消费并挂载、开关真机验证、真实发起 API 层验证；**ICMP 实测修正**（ping 可用、traceroute/mtr 如实不可用） | LG **Web 侧未消费 `unavailable_methods`**；`method_unavailable_on_node` 未实现；**走 agent 代码路径的真机 ping 证据未跑** |
 | **9** 不需理解 Lease/Revision/Fencing | **达成** | 用户域零命中；`Revision` 仅在默认折叠的技术详情块内；routes 页假承诺已删 | — |
-| **10** 核心日常体验不再明显落后 | **未达成**（距基本达成只差要件②） | R6 §12：**要件① 改判"支撑"**（worker stdout 落盘 + 评审自核库身份与真计数器）；②③ 两条同前 | 下一目标 = **闭合要件②**（一条日常宽度差距真机可验证闭合）；`task-45` 判决实验在办 |
+| **10** 核心日常体验不再明显落后 | **基本达成**（R6 §13 改判） | 要件① = **支撑**（§12.3 四方互锁）；要件② = **闭合**（评审自核三点：面板 env 里基线 0 次出现 / `unknown` 分支真机实测 / `behind` 分支代码判据一致，且**不存在第三个"假装已最新"的分支**） | **"达成"只差覆盖面一条**（评审原话）：① 把 LG 5 方法落到运行镜像 + 面板 HTTP 侧证据 ⇒ **本轮已完成**（`/status` caps=5 + 真实运行审计行 200/409）；② 或 DDNS 2→≥4。另：`task-45` 若判"部署 worker 对同库事实不可见"，要件①按预承诺**重新打开** |
 
 ### B. 已改写 / 未改写清单（按用户 Round 46 口径：**参照行为、代码本项目改写、未复刻**）
 - **已参照并改写（9 个文件，台账 `docs/agent/forwardx-code-reuse.md`）**：多入口成员/优先级/回切（HA 后端投影 + 卡片）、带宽吞吐序列（`/:id/throughput` + 卡片）、Looking Glass 方法集（agent `ping`/`ping6` + 面板方法闭集与不可用方法呈现）、LG 面板 UX。
@@ -1188,7 +1188,45 @@ compose 里的基线已移除、panel/worker 已重启（`TUNEX_AGENT_LATEST_VER
 - **门禁**：Go 13 包 0 FAIL；backend `tsc` 0 + **2969 pass / 0 fail**；web `tsc` 0 + **1354 pass / 0 fail**。
 - **未完成（明列）**：① 面板 HTTP 侧真机 `/api/looking-glass/status` 响应与**审计行**未取证（只验了 agent 侧）；② **Web 不渲染 `hops`**（后端已下发逐跳，UI 只显示 status/detail）；③ `MaxTimeoutMS` 仍 5000 ⇒ 路径跟踪最多 3 跳（放宽属 caps 语义变更，未擅自动）。
 
-## 4. Capability Map
+## 3.56 Round 55：**面板 HTTP 侧 LG 证据**（"达成"所需的那一件）+ 一个**结构性缺陷防护** + #10 改判
+
+### A. `task-42` 欠的"面板 HTTP 侧证据"——本轮补齐
+重建面板到 **`final55b-0551`**（含 task-42 的 5 方法 + 节点级能力拒绝）后，真机：
+```
+GET /api/looking-glass/status → 200
+  caps.methods = ["tcp_connect","ping","ping6","traceroute","traceroute6"]      ← ★ 5 种（原 3）
+  caps.unavailable_methods = [{mtr:"镜像里没有 mtr 二进制；且 mtr 默认需要 raw socket（CAP_NET_RAW），
+                               生产 caps 下不可用 —— 所以我们不做它，而不是假装支持"}, {mtr6: 同}]
+  enabled=false, platform_admin_override=true
+
+POST /api/looking-glass/nodes/1/tests  method=traceroute  → 409 method_unavailable_on_node
+  "该节点没有上报方法 traceroute 的执行能力（未上报 looking_glass:traceroute）：不向做不到的节点下发
+   注定失败的指令。可能原因：节点镜像里没有对应二进制，或内核不允许非特权 ICMP。"
+POST /api/looking-glass/nodes/1/tests  method=tcp_connect → 200（真实报告：requested/pinned/entry.enabled=false,admin_override=true）
+```
+**审计行（真机库 `audit_log`）**：
+```
+6525  POST /api/looking-glass/nodes/:id/tests  200  2026-10-06 21:56:06.169   ← 真实发起
+6523  POST /api/looking-glass/nodes/:id/tests  409  2026-10-06 21:56:05.075   ← 节点级拒绝
+（LG 审计共 24 行；评审 §13 读到的是 20 行，本轮 +4 均为本次运行的 400/409/200）
+```
+⇒ 评审 §13 说的"**代码到位、部署未到位**"现在**两边都到位**：运行中的面板确实回 5 种方法、且**发起与拒绝都留审计**。**"达成"只差覆盖面这一条的判定**（已请评审独立复核 `/status` 与 `audit_log`）。
+
+### B. 一个**结构性缺陷**：新建文件 0600 让面板起不来（第 4 次同类）
+重建面板时**直接起不来**：`bun error: EACCES reading "/app/src/services/node-install.ts"` —— 容器内以 `bun` 用户运行，而宿主机上新建的源文件是 **0600**（`node-install.ts` 与 `node-install.test.ts`，另有 task-44 的 `panel_migration.go`/`_test.go`）。全仓扫描发现 **4 个** 0600 源文件，已全部修正为 644。
+**为什么这次不"提醒一句了事"**：这类问题已咬 4 次（迁移文件 0600、新源文件 0600…），靠"记得 chmod"不可靠。已在 `backend/Dockerfile` 加**结构性防护**：
+```
+COPY src ./src
+# 镜像内以 bun 用户运行，而宿主新建源文件可能是 0600 ⇒ 镜像里兜底放宽读权限，
+# 让"主机文件模式"在结构上不可能再把容器打挂。
+RUN chmod -R a+rX /app/src /app/prisma
+```
+⇒ 从此**即使有人提交 0600 文件，面板也不会再起不来**（防护在镜像里，不依赖任何人的记性）。这条同时值得作为**所有镜像的一般做法**（agent 镜像同理）。
+
+### C. 一条**看起来像缺陷、实为旧镜像噪声**的观察（记录以免后人误判）
+`audit_log` 里高频出现 **`POST /api/internal/heartbeat` → 404**。查证：**HEAD 里不存在该路由**（`internal-node.ts`/`app.ts` 均无），且 agent 代码注释明确写着"`/api/internal/heartbeat` **Panel 从未实现**、已移除"。⇒ 404 来自**旧镜像 `cafaaba`**（它仍打这条路径），**不是当前缺陷**；它反而印证了"节点需要升级"这件事的真实性（旧 agent 会持续产生 404 噪声）。
+
+## 4. Capability Map## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
 

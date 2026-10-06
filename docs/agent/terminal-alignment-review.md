@@ -509,3 +509,51 @@ notification_channel 15 | notification_delivery 24 | tunnel 13 | workspace 11 | 
 2. **容器重建前落盘**（`docker logs > /tmp/…`）——owner 已采纳，本轮 t41/t41b 的 transcript 与 worker 日志都有副本，这直接让两条缺口闭合。
 3. **核对"两个进程看的是同一份数据"时，`@@server_uuid` 不是充分条件**（物理复制的实例会共享它）。本次能定案靠的是**我自己的读数 + 持久计数器**；建议以后这类核对固定加上"由第三方（我）复跑一次身份查询"这一步。
 
+---
+
+## 13. 要件 ② 复核与 **#10 改判「基本达成」**（2026-10-07 05:47–06:00 +08）
+
+### 13.0 钉点与我的只读复核
+
+| 项目 | 值 |
+|---|---|
+| HEAD（复核基线） | `a33ed6217cd509cc3f6479a99f418e61f5f3bea9`（05:46:49 `docs(agent): 要件② 闭合——version_drift:behind 真机首现 + 反向验证…；task-42 交付（方法集 3→5…）`） |
+| 我跑的只读检查 | ① `docker inspect tunex-it-panel` 的 env（基线是否还在）② 真机 HTTP `GET /api/nodes/1/upgrade-state`（当前配置下的真实投影）③ 真机 HTTP `GET /api/looking-glass/status`（**部署上**的方法集）④ `backend/src/routes/nodes.ts` 的判据与映射 ⑤ `tunex-it-mysql` 的 `audit_log`（LG 审计行）⑥ panel access log |
+
+### 13.1 要件 ②：**闭合**（"版本落后可判定"这条日常差距）
+
+- **配置状态我核到了**：`docker inspect tunex-it-panel` 的 env 里 `TUNEX_AGENT_LATEST_VERSION` **出现 0 次** ⇒ 基线确实已移除（与它的反向验证同一状态）。
+- **"无法判定"分支：我自己实测**（真机 HTTP，`GET /api/nodes/1/upgrade-state` → 200）：节点自报 `reported.version = "0.13.22"`，而 `target = { expected_version: **null**, version_drift: **"unknown"** }` ⇒ **基线未声明时如实说"无法判定"，没有说成"已最新"** —— 这正是我在 §5/§11 列的差距里那句"**默认部署永不提示版本落后**"的另一半（诚实兜底）。
+- **"落后"分支：代码判据一致**（`backend/src/routes/nodes.ts:335-337` `expectedVersion = env.agentLatestVersion.trim() === "" ? null : …`；`:371` `version_drift: older === null ? "unknown" : older ? "behind" : "not_behind"`）。以它给的 `0.14.0` 对 `0.13.22` ⇒ `isVersionOlder` 为真 ⇒ `behind`，与它 [1] 的真机响应吻合。
+  - **诚实边界**：`behind` 那一次我**没有复现**（复现需要带 env 重启面板，超出只读纪律）；我复核的是"同一条判据在未声明分支下的真机输出"+"映射代码"+"它的落盘/转述"。按我 §8 的标准这属于**部分支撑→支撑**的边缘，我判**支撑**的理由是：这条差距的本质是"**要么给出落后、要么如实说无法判定**"，而这两个分支现在**各有真机/代码证据**，且**不存在第三个"假装已最新"的分支**（代码里 `null → "unknown"` 是唯一映射）。
+- **反向验证的语义我认可**：移除基线 ⇒ 回到 `unknown`（不是 `not_behind`）——**因果是基线造成的**，且没有把"未声明"说成"已最新"。
+
+### 13.2 覆盖面（LG 3→5）：**代码到位，部署未到位**（我自己核的）
+
+| 检查 | 我读到的 |
+|---|---|
+| HEAD 代码 | `backend/src/services/looking-glass.ts:72` = `["tcp_connect","ping","ping6","traceroute","traceroute6"]`（**5 种**）✔ |
+| **运行中的面板** | 真机 HTTP `GET /api/looking-glass/status` → `caps.methods = ["tcp_connect","ping","ping6"]`（**3 种**）——面板镜像仍是 `tunex-harvest-backend:final49-0502`（05:02 构建，早于 task-42 的提交） |
+| 面板 HTTP 运行证据 | `audit_log` 里 `POST /api/looking-glass/nodes/:id/tests` 共 20 行，**最新一行是 18:35:34Z**（远早于本轮）；`docker logs tunex-it-panel` 近 60 分钟里只有**我自己**的 `GET /api/looking-glass/status`，**没有任何 POST** ⇒ task-42 的真机跑法**没有经过面板 HTTP 路由**（与 Lead 自述"还缺面板 HTTP 侧 /status 与审计行"一致，我独立确认了这一点） |
+
+⇒ 这一条**代码已完成**，但**在部署上没有闭环**：用户今天在这台面板上仍只看到 3 种方法。按我 §12.5 的三级门槛，"覆盖面再收一条"要求的是**真机可验证**，所以它**还不能**把判定推到"达成"。
+
+### 13.3 **#10 终局判定（本次改判）：基本达成**
+
+> **#10 = 基本达成（TuneX 的核心日常体验不再明显落后于 ForwardX）。**
+> 可复核理由：**要件 ① = 支撑**（§12.3：事实→调度器那一拍→账本行→收件端 SMTP，四方互锁，库身份与持久计数器由我复核）；**要件 ② = 闭合**（§13.1：真机 `unknown` 由我实测、`behind` 判据与映射经代码核对，且不存在"假装已最新"的分支）。三条原落后理由的复核结论仍为 **② 已消除 / ③ 部分消除 / ① 部分消除（现已升级为支撑）**。
+
+**距"达成"只差一件**（覆盖面条，任一条真机闭环即可）：
+1. **把 task-42 的 LG 5 方法落到运行中的面板镜像**，并给出**面板 HTTP 侧**的两个证据：`GET /api/looking-glass/status` 的 `caps.methods` 含 `traceroute/traceroute6`，以及一次真实 LG 运行的 **`audit_log` 行**（这两项我都能自己复核，不需要额外自述）；
+2. 或者另一条覆盖面：DDNS 厂商 2 → ≥4（含一个国内云或 webhook）。
+
+**一个写死的保留条件**：§12.4 的反观察仍在等 `task-45` 的判决实验。**若 `task-45` 判定"部署中的 worker 对同库事实存在可见性缺陷"**，则要件 ① 的"支撑"**重新打开**，#10 回退到"未达成"，直到该缺陷被修好并复现"活库 worker 自己打出 `built:1`"。除此之外，本次判定不再有未闭合项。
+
+### 13.4 三级门槛的当前落点（照 §12.5）
+
+| 判定 | 条件 | 当前 |
+|---|---|---|
+| 未达成 | ① 未支撑，或 ① 支撑但 ② 未闭合 | 已越过 |
+| **基本达成（不再明显落后）** | ① 支撑 **+** ② 闭合 | ✅ **本次判定** |
+| 达成 | 上述 **+** 覆盖面至少再收一条（真机闭环） | ✗ 差 §13.3 那一件 |
+

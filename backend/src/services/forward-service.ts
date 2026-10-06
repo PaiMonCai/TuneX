@@ -64,6 +64,8 @@ import {
   type ForwardProtocol,
   tlsPathsForProtocol,
   legacyTunnelTypeColumn,
+  // 可拨号地址的唯一判据（`connect_ip` 可能是逗号分隔的候选列表，取第一个非空项）。
+  firstConnectIp,
 } from "./forward-contract.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import { billingDayKeyStamp } from "./billing-time.ts";
@@ -787,6 +789,43 @@ export async function createForward(
       if (!binding) {
         return error(409, "binding_required", "该出口尚未绑定到当前入口节点");
       }
+    }
+
+    /**
+     * 每一跳都必须有**可拨号地址**（`connect_ip`）——在下发前就说清，而不是让用户拿到
+     * `502 apply_failed / invariant_violated`。
+     *
+     * 背景：RELAY 的入口腿要拨下一跳的 `host:port`（`upstream.next_hop`），地址的唯一来源是
+     * 那一跳节点的 `connect_ip`。没有地址时计划自检失败，最终以 `invariant_violated` 结束 ——
+     * 那条文案既没说是哪台机器，也没说该怎么办。这里把判定提前到创建路径，给出**可操作**的
+     * 错误码与文案（哪台节点 / 缺什么 / 去哪补）。
+     *
+     * 为什么放在绑定校验之后：绑定缺失是"还差一步绑定"（更靠前的先决条件），
+     * 地址缺失是"绑好了也拨不通"，顺序与用户修复顺序一致。
+     *
+     * 为什么**不**从上报里学地址：节点上报里没有任何"我自己可以被拨的地址"字段
+     * （`node_state_report` 只有版本/角色/revision/tunnels/used_ports/egress_pools/
+     * last_error 与主机指标，没有自我地址线索），而 `connect_ip` 是**运维声明的可拨号身份**
+     * （NAT/公网入口无法从容器内部观测得到）。因此这里只做"缺就说清"，不猜。
+     */
+    const hopNodes: Array<{ id: number; name: string; position: "中间跳" | "出口跳"; connectIp: string | null }> = [];
+    if (middleId != null) {
+      const middle = await loadWorkspaceNode(middleId, workspaceId);
+      if (!middle) return error(404, "not_found", "中间跳节点不存在");
+      hopNodes.push({ id: middle.id, name: middle.node_id, position: "中间跳", connectIp: middle.connect_ip });
+    }
+    hopNodes.push({ id: egress.id, name: egress.node_id, position: "出口跳", connectIp: egress.connect_ip });
+    const addresslessHops = hopNodes.filter((hop) => firstConnectIp(hop.connectIp) === null);
+    if (addresslessHops.length > 0) {
+      const detail = addresslessHops
+        .map((hop) => `${hop.position}「${hop.name}」(#${hop.id})`)
+        .join("、");
+      return error(
+        409,
+        "hop_address_missing",
+        `${detail} 缺少可拨号地址（node.connect_ip）：RELAY/三跳的每一跳都要有一个可拨号地址，上一跳才拨得进来。请到「节点」页为该节点补上连接地址（PATCH /api/nodes/:id 的 connect_ip 字段）后重试。`,
+        { data: { nodes: addresslessHops.map((hop) => ({ id: hop.id, name: hop.name, position: hop.position })) } },
+      );
     }
   }
 
