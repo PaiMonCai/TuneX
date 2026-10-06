@@ -75,6 +75,7 @@ mock.module(root + "services/scheduler.ts", () => ({ reapplyDirectTunnel: async 
 mock.module(root + "services/traffic.ts", () => ({
   getWorkspaceTrafficSummary: async () => ({ total: 0 }),
   fillDays: () => [],
+  dayKeyOf: (d) => d.toISOString().slice(0, 10),
 }));
 function mutation(id, ws) {
   const row = scoped(id, ws);
