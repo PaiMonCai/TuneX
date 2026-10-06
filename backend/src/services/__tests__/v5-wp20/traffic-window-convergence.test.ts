@@ -347,4 +347,15 @@ describe("D. 守卫：不再有第二套日界实现 / 已用流量不再读 leg
     const tunnelApi = STRIP(read("services/tunnel-api.ts"));
     expect(tunnelApi).not.toMatch(/tunnelTraffic[^\n]*deleteMany/);
   });
+
+  test("Forward 流量视图也必须读 canonical ledger / billing-time，不得回退 legacy live 列或进程时区", () => {
+    const code = STRIP(read("services/forward-service.ts"));
+    expect(code).toContain("db.tunnelTraffic.aggregate");
+    expect(code).toContain("where: { workspace_id: workspaceId }");
+    expect(code).toContain("billingDayKeyStamp(now)");
+    expect(code).toContain("fillDays(windowDays, now)");
+    expect(code).not.toContain("db.tunnel.aggregate({");
+    expect(code).not.toContain("since.setHours(");
+    expect(code).not.toContain("date.setHours(");
+  });
 });
