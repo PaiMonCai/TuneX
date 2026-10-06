@@ -1013,6 +1013,38 @@ describe("失败分流（§13.3.5 第三张表）", () => {
     expect(failOrch.calls.removeTunnel.length).toBe(0);
   });
 
+  it("PREPARE 复用本隧道已有 active lease 时，失败清理不得释放旧 ownership", async () => {
+    const relay = modeSwitchEnv();
+    const existingLeaseId = relay.f.addLease({
+      node_id: 21,
+      port: 31000,
+      lease_type: "egress",
+      tunnel_id: 1,
+      status: "active",
+      expires_at: null,
+    });
+    const failOrch = fakeOrchestrator({ failOn: { dispatchEgress: true } });
+    const failDeps: RolloutDeps = {
+      db: relay.f.db,
+      runtimeUse: async () => null,
+      orchestrator: failOrch,
+    };
+
+    const res = await registerRollout(
+      {
+        tunnelId: 1,
+        impact: impact({ mode_change: true, egress_node_change: true }),
+        revision: 7,
+        baseRevision: 6,
+      },
+      failDeps,
+    );
+
+    expect(res.ok).toBe(false);
+    expect(relay.f.rollouts[0]!.phase).toBe("failed");
+    expect(relay.f.leases.find((lease) => lease.id === existingLeaseId)?.status).toBe("active");
+  });
+
   it("CUTOVER 清理无法确认 runtime 已撤时保留新端口租约，避免双绑", async () => {
     const { f } = modeSwitchEnv();
     const desired = f.snapshots.find((s) => Number(s.revision) === 7)!;
