@@ -871,7 +871,7 @@ export class Orchestrator {
     tunnelId: number;
     nodeId: number;
     now?: Date;
-  }): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" }> {
+  }): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" | "lost_race" }> {
     return releasePlacementLease({
       tunnelId: input.tunnelId,
       nodeId: input.nodeId,
