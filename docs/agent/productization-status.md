@@ -1080,6 +1080,23 @@ scratch 的 panel/worker 本周期被重建**两次**（`n4-0314` → `final48-0
 
 **方法论沉淀**：这是一次"**所有者主动报告越界点 + Lead 放权并补语义约束**"的正面样本——比"偷偷改一个不在范围里的安全路径"或"只改界面让报告好看"都好。
 
+## 3.50 Round 52：按新规则复核「未接线配置键」与「Agent 接入面」——三处差异
+
+### A. 13 个"未接线配置键"逐一对到 ForwardX（结论：我们的处置是对的）
+对 `AUTO_UPDATE_AGENT / OBSERVER_PERIOD / LIMIT_SCOPE / WITHDRAW_METHODS / MIN_WITHDRAW_AMOUNT / REFERRAL_MODE / REFERRAL_COMMISSION_RATE / CHATWOOT* / EMAIL_PROVIDER` 在 ForwardX **全仓零命中**（仅 `RESEND` 在 `server/agentHeartbeatRoute.ts` 有命中）。
+⇒ 它们**不是"我们还没移植的功能"**，而是两边都没有的概念 ⇒ **我们 task-33 的处置（明确拒绝写入 + 页面指路 + 忽略历史行）正确地符合"它没有对应处理"这一分支**，无需改判。
+
+### B. Agent 接入面逐项对照（三处差异，一处是真缺口）
+| 对照项 | ForwardX 做法（证据） | TuneX 现状 | 处置 |
+|---|---|---|---|
+| 子命令 `install/upgrade/uninstall` | 有（`agentInstallScripts.ts:30-32`） | **已有**（`scripts/ops/install.sh:425-434/1060-1062`） | **已对齐，无需动作** |
+| **凭据模型** | **长期 token 放命令行**：`bash -s -- install YOUR_TOKEN` → 写进 `config.json`（`:138`，`chmod 600`） | **一次性 enrollment**（`node-enrollment.ts`：`token` + `expires_at` → 交换出 `credential`，**只存哈希**） | **保留我们的**：它的做法会把长期凭据暴露在 `ps`/shell 历史/面板访问日志里 ⇒ **向用户报告**（按规则，它是"有处理方式但我们判断更差"的情形） |
+| **面板迁移回退** | `migrationFallbackPanelUrl` + `panelMigrationId` + `panelMigrationStartedAt`（`:138`）⇒ 面板换地址时 agent 跟随 | **全仓零命中** | **真缺口 ⇒ 复用其逻辑**（`task-44`，派 `web-ddns`） |
+| init 系统 | systemd/OpenRC/SysV（**宿主机服务**） | 0 命中（**容器**） | 设计差异，无需动作 |
+
+### C. 方法论沉淀（新规则下的标准动作）
+遇到待决项时按三步走：① 读 ForwardX 的对应实现（给 `文件:行`）；② 有则**复用其逻辑**并适配本项目（**不逐字复制**）；③ 无则**向用户报告**。本轮四项待决（A1 成员表 / A2 投递留行 / A3 traceroute / A4 CSRF）+ 本轮的接入面复核，全部走完这三步并留痕。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
