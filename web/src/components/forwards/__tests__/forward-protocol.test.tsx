@@ -456,16 +456,16 @@ describe("C. payload：tls 带路径，tcp/ws 结构上带不了", () => {
   });
 
   test("创建表单接线：提交按钮按同一份预检禁用，且路径经纯函数进入 payload", () => {
-    expect(WORKSPACE).toContain("tlsPathFieldErrors(protocol, tlsCertPath, tlsKeyPath)");
-    expect(WORKSPACE).toContain("!protocolReady");
-    expect(WORKSPACE).toContain("...forwardProtocolFields(protocol, tlsCertPath, tlsKeyPath),");
+    expect(CREATE_DIALOG).toContain("tlsPathFieldErrors(draft.protocol, draft.tlsCertPath, draft.tlsKeyPath)");
+    expect(CREATE_DIALOG).toContain("!protocolReady");
+    expect(WEB("components/forwards/forward-create-model.ts")).toContain("...forwardProtocolFields(draft.protocol, draft.tlsCertPath, draft.tlsKeyPath),");
     // 切走 tls 必须清空路径（否则残留路径会被后端 400）
-    expect(WORKSPACE).toContain('setTlsCertPath("")');
-    expect(WORKSPACE).toContain('setTlsKeyPath("")');
+    expect(CREATE_DIALOG).toContain("forwardCreateProtocolDraft(draft, value)");
+    expect(WEB("components/forwards/forward-create-model.ts")).toContain('tlsKeyPath: ""');
   });
 
   test("tls 的两个路径输入只在 protocol==='tls' 时出现，且标了必填", () => {
-    expect(WORKSPACE).toContain('{protocol === "tls" ? (');
+    expect(CREATE_DIALOG).toContain('{draft.protocol === "tls" ? (');
     const block = WORKSPACE.slice(
       WORKSPACE.indexOf('{protocol === "tls" ? ('),
       WORKSPACE.indexOf('<Field label={t("forward.ingressNode")}'),
