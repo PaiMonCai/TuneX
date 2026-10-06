@@ -721,6 +721,34 @@ before_fix: {"sent":false,"reason":"smtp_error"} [mail] 发送失败：SMTP EHLO
 ### 机制发现（值得记住）
 `mock.module` 只对**之后首次 import 该模块的文件**生效 ⇒ **本文件永远看不到自己的替身**（同 specifier 与绝对路径两种形态实测都返回真实现）⇒ 受害方永远是**另一个文件**，这正是"替身泄漏"只在特定跑法下红的原因（`backend-truth` 实测并写进注释）。
 
+## 3.32 Round 36：N4 端点挂载 + 替身收尾 + 守卫被当被测对象打磨
+
+### Lead 挂载（共享文件单写）
+`app.route("/api/notifications", notificationDeliveryRoutes)` **特意排在 `app.route("/api", publicRoutes)` 之前**（宽路由；本专项已在 DNS 前门 / 延迟端点 / HA 三处踩过同类顺序问题，注释写明理由）。Panel 重建为 `n4-0314` 后真机探针：
+```
+GET /api/notifications/deliveries → 200
+{"data":{"scope_kind":"workspace","workspace_id":3,"truncated":false,"limit":50,
+         "summary":{"total":0,"sent":0,"failed":0,…}}}
+（/api/notifications 与 /api/notifications/summary → 404，正确：只挂了交付的 router，未臆造路径）
+```
+**后端门禁**：`tsc` 0 错 + **2927 pass / 0 fail**（135 文件）。
+
+### task-30：替身泄漏收尾（含一次自我更正）
+| 文件 | 处置 |
+|---|---|
+| `forward-route-topology.test.ts` | 改 spread ⇒ 与 `route-mount-coverage` 合跑 6 pass / 0 fail |
+| `forward-batch-route.test.ts` | 改 spread ⇒ 合跑 13 pass / 0 fail |
+| `me-capabilities-route.test.ts` | **回退**：它不是"碰巧安全"，而是**按设计**安全（scenario 放在模板字符串里交给**子进程**执行，替身注册不到本进程） |
+
+**守卫本身被当成被测对象打磨**（这是本轮最有价值的产出）：扩展到**两个受监控模块**（`env.ts` + `services/workspace.ts`），并修掉四处边界——① 注释里的 `mock.module()/env.ts` 造成**假阳性**（先剥注释）；② 窗口里任意 `...` 造成**假阴性**（收紧为"紧跟返回对象 `{` 之后的 spread"）；③ **别名解析丢失路径前缀**导致漏检（改为按文件名匹配）；④ 支持**具名工厂**（对象字面量在函数体里 ⇒ 到定义处取窗口）。`env.ts` 侧**零豁免**。
+
+### 机制（已固化的精确表述，解释这类缺陷为何长期潜伏）
+> `mock.module` 只对**该进程里之后首次 import 这个模块的文件**生效。注册替身的文件若**先** import 过真实现，之后无论用**原 specifier** 还是**绝对路径 specifier** 再 import，拿到的都是真实现 ⇒ **本文件永远观察不到自己的替身**。受害方**永远是另一个文件**：它才是本进程里第一个真正 import 该模块的人，却拿到残缺命名空间，于是失败发生在**加载期**（`SyntaxError: Export named 'X' not found`）、往往**不带 `(fail)` 前缀**，且只在"两个文件恰好共享一个进程"的跑法下出现（bun 会把测试文件分派到不同 worker ⇒ 全量绿、双文件红）。⇒ 守卫只能针对"交给注册表的那个对象"，不能靠"import 回来看一眼"。
+
+### 守卫新挖出的 2 处（已分派）
+- `routes/__tests__/forward-list-route.test.ts`（无人在写）⇒ 一句话给 `backend-truth`：做 task-29 时顺手 5 分钟可收，否则单独立单，**不污染主切片**。
+- `services/__tests__/notifications/deliveries.test.ts` ⇒ 交回 `notify-center`（其领地；同样 1 hunk 或改用"模板字符串 + 子进程"隔离形态）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
