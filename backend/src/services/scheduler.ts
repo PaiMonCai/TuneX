@@ -863,6 +863,51 @@ async function persistSuccess(
   });
 }
 
+
+type CompensationRemoval = Parameters<Orchestrator["removeTunnel"]>[0];
+
+/**
+ * Fail-closed compensation: runtime removal is the safety barrier before a
+ * NodePortLease may be released. If any runtime cannot be confirmed removed,
+ * keep every lease owned by the tunnel so the allocator cannot hand a possibly
+ * still-listening port to another runtime. Reconcile can retry cleanup later.
+ */
+async function compensateRuntimesThenRelease(input: {
+  tunnelId: number;
+  orchestrator: Orchestrator;
+  removals: readonly CompensationRemoval[];
+  portPoolDeps: SchedulerDeps["portPoolDeps"];
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const failures: string[] = [];
+  for (const removal of input.removals) {
+    try {
+      const result = await input.orchestrator.removeTunnel(removal);
+      if (!result.ok) failures.push(`${removal.direction ?? "runtime"}: ${result.error}`);
+    } catch (error) {
+      failures.push(
+        `${removal.direction ?? "runtime"}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  if (failures.length > 0) {
+    return {
+      ok: false,
+      error: `runtime teardown 未确认完成，保留端口租约等待 reconcile：${failures.join("; ")}`,
+    };
+  }
+
+  try {
+    await releaseLease({ tunnelId: input.tunnelId }, input.portPoolDeps);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `runtime 已撤除，但端口租约释放失败：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /* ================================================================== */
 /* 主入口                                                              */
 /* ================================================================== */
@@ -949,16 +994,20 @@ async function correctDatagramHopPeerAfterIngressAck(args: {
     // 纠正失败 ⇒ 出口此刻对**错的**地址取证（数据面不通），而两条腿的 revision 已不一致。
     // 按既有口径补偿到"两侧都没有 runtime"，并把这次编排报成失败——不做半成功。
     const reason = "hop peer correction failed";
-    await args.orchestrator
-      .removeTunnel({ tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason })
-      .catch(() => {});
-    await args.orchestrator
-      .removeTunnel({ tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason })
-      .catch(() => {});
-    await releaseLease({ tunnelId: args.tunnelId }, args.deps.portPoolDeps).catch(() => {});
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId: args.tunnelId,
+      orchestrator: args.orchestrator,
+      // Reverse of activation order: near side first, then far side.
+      removals: [
+        { tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason },
+        { tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason },
+      ],
+      portPoolDeps: args.deps.portPoolDeps,
+    });
     let error = "unknown";
     if (!egress.ok) error = egress.error;
     else if (ingress !== null && !ingress.ok) error = ingress.error;
+    if (!compensation.ok) error += `；${compensation.error}`;
     return { ok: false, revision: correctedRevision, error: `datagram 跳取证的纠正下发失败：${error}`, hopPeer: learned };
   }
   // 「两条腿共用同一个 config_revision」是不变量（§3.2）：纠正把两者一起抬到新 revision。
@@ -1435,14 +1484,19 @@ export async function createRelayTunnel(
     // "两条编排里只有一条认识中间跳"的记录。这里保留它原来的内联拆除，不做半套改动：
     // 把中间跳支持搬过来需要与 `reapplyRelayTunnel` 同等的一套（端口分配 + 中转腿 + 逆序拆除），
     // 而那属于"先确认它是否可达"之后的事。
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const compensationDetail = compensation.ok ? "" : `；${compensation.error}`;
     return fail(
       "apply_ingress",
       SCHEDULER_ERROR_CODES.invariant_violated,
-      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      `RuntimePlan 自检未通过：${planViolations.join("; ")}${compensationDetail}`,
       { tunnelId, revision, meta: { runtime_plan_violations: planViolations } },
     );
   }
@@ -1459,11 +1513,18 @@ export async function createRelayTunnel(
   });
   if (!ingressDispatch.ok) {
     /* 补偿：Egress 已经 ACK，必须先撤掉（否则它继续占着出口端口收流量）。 */
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals: [
+        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" },
+      ],
+      portPoolDeps: deps.portPoolDeps,
+    });
+    const detail = compensation.ok
+      ? ingressDispatch.error
+      : `${ingressDispatch.error}；${compensation.error}`;
+    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), detail, {
       tunnelId,
       revision,
       meta: { command_id: ingressDispatch.commandId ?? null },
@@ -2006,16 +2067,31 @@ export async function reapplyRelayTunnel(
    * 一个失败分支漏撤一条腿 = 一次永久性资源泄漏，而泄漏只在**下一次**创建时才显形。
    * 所以它必须是一处、且必须逆序（正向先远后近 ⇒ 拆除先近后远）。
    */
-  const teardownDispatched = async (reason: string): Promise<void> => {
+  const teardownDispatched = async (reason: string): Promise<string | null> => {
+    const removals: CompensationRemoval[] = [];
     if (transitNode != null) {
-      await orchestrator
-        .removeTunnel({ tunnelId, node: transitNode, direction: "egress", revision: revision + 1, reason: `${reason} (transit)` })
-        .catch(() => {});
+      removals.push({
+        tunnelId,
+        node: transitNode,
+        direction: "egress",
+        revision: revision + 1,
+        reason: `${reason} (transit)`,
+      });
     }
-    await orchestrator
-      .removeTunnel({ tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason })
-      .catch(() => {});
-    await releaseLease({ tunnelId }, deps.portPoolDeps).catch(() => {});
+    removals.push({
+      tunnelId,
+      node: egressPick.node,
+      direction: "egress",
+      revision: revision + 1,
+      reason,
+    });
+    const compensation = await compensateRuntimesThenRelease({
+      tunnelId,
+      orchestrator,
+      removals,
+      portPoolDeps: deps.portPoolDeps,
+    });
+    return compensation.ok ? null : compensation.error;
   };
 
   // ── V5.4：中间跳（若有）──
@@ -2034,8 +2110,9 @@ export async function reapplyRelayTunnel(
       | SchedulableNode
       | null;
     if (!middleNode) {
-      await teardownDispatched("middle node missing");
-      return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, `中间跳节点 ${middleNodeId} 不存在`, {
+      const compensationError = await teardownDispatched("middle node missing");
+      const detail = `中间跳节点 ${middleNodeId} 不存在${compensationError ? `；${compensationError}` : ""}`;
+      return fail("apply_transit", SCHEDULER_ERROR_CODES.invariant_violated, detail, {
         revision,
       });
     }
@@ -2053,8 +2130,9 @@ export async function reapplyRelayTunnel(
       protocol: reapplyProtocol,
     });
     if (!transit.ok) {
-      await teardownDispatched("transit apply failed");
-      return fail("apply_transit", mapDispatchCode("egress", transit), transit.error, { revision });
+      const compensationError = await teardownDispatched("transit apply failed");
+      const detail = compensationError ? `${transit.error}；${compensationError}` : transit.error;
+      return fail("apply_transit", mapDispatchCode("egress", transit), detail, { revision });
     }
     transitHost = transit.host;
     transitNode = {
@@ -2089,11 +2167,12 @@ export async function reapplyRelayTunnel(
   });
   const planViolations = forwardRuntimePlanViolations(plan);
   if (planViolations.length > 0) {
-    await teardownDispatched("runtime plan invalid");
+    const compensationError = await teardownDispatched("runtime plan invalid");
+    const detail = `RuntimePlan 自检未通过：${planViolations.join("; ")}${compensationError ? `；${compensationError}` : ""}`;
     return fail(
       "apply_ingress",
       SCHEDULER_ERROR_CODES.invariant_violated,
-      `RuntimePlan 自检未通过：${planViolations.join("; ")}`,
+      detail,
       { revision, meta: { runtime_plan_violations: planViolations } },
     );
   }
@@ -2109,8 +2188,9 @@ export async function reapplyRelayTunnel(
     ...tlsPathsFor(row, plan.protocol.name),
   });
   if (!ingressDispatch.ok) {
-    await teardownDispatched("ingress apply failed");
-    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), ingressDispatch.error, {
+    const compensationError = await teardownDispatched("ingress apply failed");
+    const detail = compensationError ? `${ingressDispatch.error}；${compensationError}` : ingressDispatch.error;
+    return fail("apply_ingress", mapDispatchCode("ingress", ingressDispatch), detail, {
       revision,
       meta: { command_id: ingressDispatch.commandId ?? null },
     });
@@ -2139,7 +2219,9 @@ export async function reapplyRelayTunnel(
     deps,
   });
   if (!ingressAckHop.ok) {
-    await teardownDispatched("hop peer correction failed");
+    // correctDatagramHopPeerAfterIngressAck already performed fail-closed
+    // compensation at correctedRevision + 1. Repeating teardown here would use
+    // this closure's older revision and can itself be rejected as stale.
     // 注意：reapply 的 `fail()` 只收 `{ revision, meta }`（tunnelId 是它的第一个参数所隐含的），
     // 与 create 的那份签名不同 —— 照抄 create 的调用形状会被 tsc 拦住。
     return fail("apply_ingress", SCHEDULER_ERROR_CODES.invariant_violated, ingressAckHop.error, {
