@@ -565,6 +565,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path: input.path,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local${input.path}`, {
@@ -738,6 +740,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path: `/api/federation/v1/leases/${ref}/apply`,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local/api/federation/v1/leases/${ref}/apply`, {
@@ -837,6 +841,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path: `/api/federation/v1/leases/${ref}/renew`,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local/api/federation/v1/leases/${ref}/renew`, {
@@ -923,6 +929,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         identity: { panel_id: panelId, key_id: keys.key_id, public_jwk: keys.public_jwk },
         privateJwk: keys.private_jwk,
         body: bodyStr,
+        method: "POST",
+        path,
         messageId: uuid(),
       });
       const res = await app.request(`http://panel.local${path}`, {
