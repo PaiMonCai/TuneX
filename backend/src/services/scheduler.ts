@@ -1024,17 +1024,19 @@ export async function createRelayTunnel(
   const now = deps.now();
   const steps: StepRecord[] = [];
 
-  const fail = (
+  const fail = async (
     step: SchedulerStep,
     code: SchedulerErrorCode,
     detail: string,
     ctx: { tunnelId?: number; revision?: number | null; meta?: Record<string, unknown> },
-  ): CreateRelayFailure => {
+  ): Promise<CreateRelayFailure> => {
     steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
     if (ctx.tunnelId !== undefined) {
-      // 保留 Tunnel（§7.11）：只写 error，不删行。写库失败不能吞——
-      // 否则调会方拿到失败却看不到 DB 里的原因，Retry 时状态还是 pending。
-      void persistFailure(store, ctx.tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+      // The response may only claim a durable failure after the ledger write
+      // completes. If the DB write itself fails, propagate that storage error:
+      // returning a neat apply error while the row is still pending/applying is
+      // a false terminal state and makes Retry/reconcile reason from stale facts.
+      await persistFailure(store, ctx.tunnelId, { code, detail, revision: ctx.revision });
     }
     return {
       ok: false,
@@ -1692,14 +1694,14 @@ export async function reapplyRelayTunnel(
   const now = deps.now();
   const steps: StepRecord[] = [];
 
-  const fail = (
+  const fail = async (
     step: SchedulerStep,
     code: SchedulerErrorCode,
     detail: string,
     ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
-  ): CreateRelayFailure => {
+  ): Promise<CreateRelayFailure> => {
     steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
-    void persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+    await persistFailure(store, tunnelId, { code, detail, revision: ctx.revision });
     return {
       ok: false,
       tunnelId,
@@ -2273,14 +2275,14 @@ async function applyFederatedRelayTunnel(
   const now = deps.now();
   const steps: StepRecord[] = [];
 
-  const fail = (
+  const fail = async (
     step: SchedulerStep,
     code: SchedulerErrorCode,
     detail: string,
     ctx: { revision?: number | null; meta?: Record<string, unknown> } = {},
-  ): CreateRelayFailure => {
+  ): Promise<CreateRelayFailure> => {
     steps.push({ step, ok: false, error_code: code, detail, meta: ctx.meta });
-    void persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch(() => {});
+    await persistFailure(store, tunnelId, { code, detail, revision: ctx.revision });
     return { ok: false, tunnelId, steps, failedStep: step, error_code: code, error: errorText(code, detail), retryable: isRetryable(code) };
   };
 
