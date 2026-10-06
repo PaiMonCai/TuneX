@@ -209,13 +209,27 @@ export async function releaseLease(input: {
   tunnelId: number;
   nodeId: number;
   now: Date;
-}): Promise<{ ok: true } | { ok: false; reason: "not_owner" | "not_found" }> {
+}): Promise<
+  { ok: true } |
+  { ok: false; reason: "not_owner" | "not_found" | "lost_race" }
+> {
   const current = await loadLease(input.tunnelId);
   if (current === null) return { ok: false, reason: "not_found" };
   if (current.owner_node_id !== input.nodeId) return { ok: false, reason: "not_owner" };
-  await db.placementLease.update({
-    where: { tunnel_id: input.tunnelId },
+
+  // Release is a fencing write too. A read-then-update by tunnel_id alone can
+  // expire a *newer* generation if ownership/renewal changes between these two
+  // statements. Match the exact generation + expiry fact we observed.
+  const released = await db.placementLease.updateMany({
+    where: {
+      tunnel_id: input.tunnelId,
+      owner_node_id: input.nodeId,
+      epoch: current.epoch,
+      lease_expires_at: current.lease_expires_at,
+    },
     data: { lease_expires_at: input.now, revision: current.revision },
   });
-  return { ok: true };
+  return released.count === 1
+    ? { ok: true }
+    : { ok: false, reason: "lost_race" };
 }
