@@ -1,5 +1,5 @@
 /**
- * V5-WP20-4 —— 「一次已付费的套餐交易如何落库」的**唯一**实现。
+ * 「一次已付费的套餐交易如何落库」的**唯一**实现。
  *
  * 契约：`docs/v5-wp20-subscription-billing-runtime-contract.md` §3.5.2（套餐归属是 workspace，
  * `UserPlan` 冻结为 legacy 双写）、§3.5.3（自动续费默认关闭）、§3.5.4（`PlanOrder.workspace_id`）、
