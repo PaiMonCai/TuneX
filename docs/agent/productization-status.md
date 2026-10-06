@@ -471,6 +471,15 @@ t+5s → state=synced  verified=true  confirmed=["172.33.10.20"]  attempt=0  nex
 **授权**：`ha-ui`（task-16）最小 3 行接入 `web/src/mocks/handler.ts`（`handleForwardsMock` 把 `/forwards/*` 整个命名空间认领了，新 mock 模块必须排在它**之前**才可达；该文件当前无其他写者）——已补进 task-16 的 writeScopes。
 **催办**：`ha-ui` 已回复（在读码/规划后继续，Phase A 设计已认可）；`upgrade-ux` 无产出且 inactive，已要求回报卡点，并提醒它在升级流程里同样要检查"默认配置下是否永不触发"这类缺陷形态。
 
+## 3.20 又两例"能力有、路径不通"（队友只读取证，已记）
+
+| 发现 | 证据 | 处理 |
+|---|---|---|
+| **`agentLatestVersion` 缺省为空 ⇒ 面板永不判 Agent 版本落后** | `upgrade-ux` 在真机只读确认：`env.agentLatestVersion`（`TUNEX_AGENT_LATEST_VERSION`）缺省空，`node-health-service.ts:72-82` 据此**不判定落后** ⇒ 默认部署下"升级建议"永不出现 | **不伪造**"是否落后"（如实显示"部署方未声明版本基线，面板无法判定"）；同时把它变成**可发现**的配置 → 已把 `.env.production.example` 加进 task-17 范围（照 D2 给 `TUNEX_PUBLIC_PANEL_URL` 的写法）。`docs/production-deploy.md` 由 task-14 占用，避免双写 |
+| **用户域没有任何"实际上报版本"投影** | 同一队友真机取证：`node.version`（管理配置字段）**9 台全 `unknown`**，而 `node_state_report.version` 是 `0.13.22`（节点 1–5/7–9；节点 6 无 state_report 行）⇒ `GET /api/nodes` 的 `version` 就是配置字段，不能当实报版本 | task-17 加最小只读端点 `GET /api/nodes/:id/upgrade-state`（`node:read`），前置结论**直接调用** `checkUpgradePrecondition`，并下发 `NODE_OFFLINE_AFTER_SECONDS`（不让前端编窗口）；**要求补顺序回归测试**（防被 catch-all 吃掉——本专项已踩两次） |
+
+这两条再次印证本专项的方法论：**先问"默认配置下它会不会触发"，再谈 UI**。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
