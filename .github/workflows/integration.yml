@@ -159,9 +159,9 @@ jobs:
       contents: read
       packages: read
     env:
-      TUNEX_BACKEND_IMAGE: ${{ env.IMAGE_NAMESPACE }}@${{ needs.candidate-images.outputs.panel_digest }}
-      WP14_AGENT_IMAGE: ${{ env.AGENT_IMAGE_NAMESPACE }}@${{ needs.candidate-images.outputs.agent_digest }}
-      FED_PANEL_B_AGENT_IMAGE: ${{ env.AGENT_IMAGE_NAMESPACE }}@${{ needs.candidate-images.outputs.agent_digest }}
+      TUNEX_BACKEND_IMAGE: ghcr.io/paimoncai/tunex@${{ needs.candidate-images.outputs.panel_digest }}
+      WP14_AGENT_IMAGE: ghcr.io/paimoncai/tunex-agent@${{ needs.candidate-images.outputs.agent_digest }}
+      FED_PANEL_B_AGENT_IMAGE: ghcr.io/paimoncai/tunex-agent@${{ needs.candidate-images.outputs.agent_digest }}
       FED_SKIP_BUILD: "1"
     steps:
       - uses: actions/checkout@v7
