@@ -404,6 +404,22 @@ B) Onboarding 端到端（重跑，验证最终构建）：
 `web-ddns`（task-1 完成）、`web-forward`（task-2/7 完成，正在 task-9）、`backend-truth`（task-5/6 完成，正在 task-8）、**`notify-center`（新，负责通知 epic：task-10 → task-12 → task-11）**。
 Lead 负责：task-3 挂载集成（已完成三块卡片）、task-4 收尾、最终门禁与真实浏览器验收、统一提交。
 
+## 3.16 Round 21：三条裁决 + 通知 epic 队列补齐
+
+### Lead 裁决（记录理由，避免反复）
+| 事项 | 裁决 | 理由 |
+|---|---|---|
+| F5 幽灵心跳端点 | **不给后端补路由**（该端点从未存在过） | 补一个不写状态的弃用路由会把"从未存在的端点"写进路由表，并需要它自己的鉴权/限流故事；正确做法是 Agent 侧删除（已做）+ 旧镜像走既有升级路径 |
+| 多跳（`middle_node_id`）隐藏契约 | **显式要求中间跳节点 `role ∈ {ingress, both}` 并在 UI 讲清**，本轮**不放宽**绑定 API | 绑定 API 要求**来源**节点是 ingress/both 是模型语义（第二段绑定的来源就是中间跳）；为多跳放宽会让"中间跳"变成第二套编排入口。因此多跳接线前要先有 truthful 的前置说明（`task-9` 的线路预览正好提供这个位置） |
+| `scripts/perf/stream-baseline.py` 里的历史路径 | **已清理**（假面板只认真实存在的端点） | 继续把死路径算作"可接受路径"会让性能基线的 404 计数与真实部署不一致——正是"假面板替真后端撒谎"那一类 |
+
+### 通知 epic 队列补齐（板上）
+`task-10`（N2 渠道配置端点，进行中）→ `task-12`（N1 用户偏好 EXPOSE）→ `task-11`（N3 worker 接线，**blocked_by task-10 + task-8**，因为都要改 `worker.ts`）→ `task-13`（N4 投递失败可见性，**blocked_by task-10**，同一权限族）→ `task-14`（N5：SMTP 的 UI 配置不生效 + 文档谎 + `secret_configured` 类型缺口）。
+已把完整队列与"禁止自行放宽契约"的要求一并发给 `notify-center`。
+
+### 在途
+`web-forward`（task-9 线路预览）、`backend-truth`（task-8 DDNS 写入路径解耦）、`notify-center`（task-10 渠道配置端点）。Lead 负责集成、门禁与提交。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
