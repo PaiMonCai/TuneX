@@ -147,7 +147,11 @@ check_present 'start[[:space:]]+"\$\{STOPPED_WRITER_SERVICES\[@\]\}"' "$RESTORE"
 check_present 'trap[[:space:]]+cleanup_restore[[:space:]]+EXIT' "$RESTORE" "restore: EXIT trap 使用组合 cleanup"
 check_present 'rm[[:space:]]+-rf[[:space:]]+--[[:space:]]+"\$WORK"' "$RESTORE" "restore: EXIT cleanup 删除解密临时目录"
 check_absent 'web_image=' "$BACKUP" "backup: VERSION 不记录已退役的独立 web 镜像"
-check_present '^USER[[:space:]]+bun
+check_present '^USER[[:space:]]+bun$' "$ROOT_DOCKERFILE" "unified image: 长期运行角色默认非 root"
+check_present 'user:[[:space:]]+"0:0"' "$PROD_COMPOSE" "prod compose: db-migrate 显式提权"
+check_present 'user:[[:space:]]+"0:0"' "$DEV_COMPOSE" "dev compose: db-migrate 显式提权"
+
+# =============================================================================
 group "C. 纯函数单测"
 # =============================================================================
 # shellcheck disable=SC1090
