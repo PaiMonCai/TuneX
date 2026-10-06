@@ -601,7 +601,11 @@ type StreamRuntime interface {
 	Drain(timeout time.Duration) error
 }
 
-// Forwarder keeps the established stream API name for callers that depend on it.\n// It is exactly the stream runtime contract; datagram runtimes use DatagramRuntime.\ntype Forwarder = StreamRuntime\n\n// Runtime is the transport-agnostic handle manager.TunnelManager keeps for one
+// Forwarder keeps the established stream API name for callers that depend on it.
+// It is exactly the stream runtime contract; datagram runtimes use DatagramRuntime.
+type Forwarder = StreamRuntime
+
+// Runtime is the transport-agnostic handle manager.TunnelManager keeps for one
 // tunnel: whatever carries the payload, "a tunnel this node runs" means "a
 // listener that can be bound, released and asked whether it is bound".
 //
