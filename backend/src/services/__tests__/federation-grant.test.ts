@@ -597,6 +597,116 @@ describe("WP15 grant: revoke is irreversible, cascades teardown, and never lies 
     expect(calls.leaseUpdateMany.length).toBeGreaterThan(0);
   });
 
+  test("revocation fence is durable BEFORE teardown hook runs", async () => {
+    const { db, leases } = makeGrantDb({
+      peer: { id: 9, peer_panel_id: "panel-a", status: "trusted" },
+      grants: [grantRow()],
+      leases: [leaseRow({ id: 11, state: "active" })],
+    });
+    const statesSeenInsideTeardown: string[] = [];
+
+    const outcome = await revokeGrant(
+      { grantRef: "grant-1", now: NOW },
+      {
+        db,
+        audit: silentAudit,
+        teardown: () => {
+          statesSeenInsideTeardown.push(leases[0]!.state);
+          return { ok: true };
+        },
+        releasePort: () => ({ ok: true }),
+      },
+    );
+
+    expect(outcome.ok).toBe(true);
+    expect(statesSeenInsideTeardown).toEqual(["revoked"]);
+    expect(leases[0]!.state).toBe("revoked");
+  });
+
+  test("lease revoke CAS loss must NOT teardown the concurrent winner runtime", async () => {
+    const made = makeGrantDb({
+      peer: { id: 9, peer_panel_id: "panel-a", status: "trusted" },
+      grants: [grantRow()],
+      leases: [leaseRow({ id: 11, state: "active" })],
+    });
+    const originalUpdateMany = made.db.federationLease.updateMany.bind(
+      made.db.federationLease,
+    );
+    const racedDb = {
+      ...made.db,
+      federationLease: {
+        ...made.db.federationLease,
+        updateMany: async (args: unknown) => {
+          const parsed = args as {
+            where?: { state?: string };
+            data?: { state?: string };
+          };
+          if (
+            parsed.where?.state === "active" &&
+            parsed.data?.state === "revoked"
+          ) {
+            return { count: 0 };
+          }
+          return originalUpdateMany(args);
+        },
+      },
+    } as GrantDb;
+    let teardownCalls = 0;
+
+    const outcome = await revokeGrant(
+      { grantRef: "grant-1", now: NOW },
+      {
+        db: racedDb,
+        audit: silentAudit,
+        teardown: () => {
+          teardownCalls++;
+          return { ok: true };
+        },
+        releasePort: () => ({ ok: true }),
+      },
+    );
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.raced).toBe(1);
+    expect(outcome.leases_revoked).toBe(0);
+    expect(teardownCalls).toBe(0);
+    expect(made.leases[0]!.state).toBe("active");
+  });
+
+  test("teardown hook throw leaves a durable revoked cleanup candidate instead of aborting cascade", async () => {
+    const { db, leases } = makeGrantDb({
+      peer: { id: 9, peer_panel_id: "panel-a", status: "trusted" },
+      grants: [grantRow()],
+      leases: [leaseRow({ id: 11, state: "active" })],
+    });
+    let portCalls = 0;
+
+    const outcome = await revokeGrant(
+      { grantRef: "grant-1", now: NOW },
+      {
+        db,
+        audit: silentAudit,
+        teardown: () => {
+          throw new Error("agent transport exploded");
+        },
+        releasePort: () => {
+          portCalls++;
+          return { ok: true };
+        },
+      },
+    );
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.teardown_failed).toBe(1);
+    expect(outcome.ports_pending).toBe(1);
+    expect(portCalls).toBe(0);
+    expect(leases[0]!.state).toBe("revoked");
+    expect(leases[0]!.last_error_code).toBe("internal_error");
+    expect(String(leases[0]!.last_error)).toContain("agent transport exploded");
+  });
+
   test("when teardown fails the lease is still revoked (fail-closed) and the port is NOT released", async () => {
     const { db, leases } = makeGrantDb({
       peer: { id: 9, peer_panel_id: "panel-a", status: "trusted" },
