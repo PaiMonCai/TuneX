@@ -575,6 +575,16 @@ describe("G. applied baseline snapshot", () => {
     expect(f.snapshots).toHaveLength(0);
     expect(f.tunnel.desired_revision_id).toBeNull();
   });
+
+  test("G3. baseline 冻结已有 Route Profile provenance，不制造历史断层", async () => {
+    const f = baselineClient({ route_profile_id: 77, route_profile_version: 4 });
+    const res = await ensureForwardBaselineRevision(501, 42, f.client as never);
+    expect(res?.created).toBe(true);
+    expect(f.snapshots[0]!.data).toMatchObject({
+      route_profile_id: 77,
+      route_profile_version: 4,
+    });
+  });
 });
 
 /* ------------------------------------------------------------------ */
