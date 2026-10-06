@@ -810,7 +810,10 @@ async function applyNodeRoleChange(
         defaultPoolCreated = true;
       } catch (e) {
         if ((e as { code?: string })?.code !== "P2002") {
-          return toAdminError(e, "创建默认出口池失败");
+          // Returning an error object from a Prisma transaction COMMITs the
+          // earlier node.update. Throw so the transaction rolls the role change
+          // back together with the failed default-pool creation.
+          throw e;
         }
       }
     }
