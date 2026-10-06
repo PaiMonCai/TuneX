@@ -14,22 +14,10 @@
  *      但 `tunnel.*` 命名空间（兼容/管理面）不动。
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
 import { getDictionary, makeT } from "@/lib/i18n";
 import type { PortForward } from "@/lib/types";
 
-const WORKSPACE = readFileSync(
-  new URL("../forward-workspace.tsx", import.meta.url),
-  "utf8",
-);
-const TABLE = readFileSync(new URL("../forward-table.tsx", import.meta.url), "utf8");
-const DETAIL = readFileSync(
-  new URL("../forward-detail.tsx", import.meta.url),
-  "utf8",
-);
-/** 折行与点号空格不影响调用点断言。 */
-const norm = (src: string) => src.replace(/\s+/g, " ").replace(/\s*\.\s*/g, ".");
 
 const forward = (overrides: Partial<PortForward> = {}) =>
   ({
