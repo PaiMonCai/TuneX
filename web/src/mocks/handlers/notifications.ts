@@ -22,7 +22,7 @@
 import * as rt from "../runtime";
 import type { MockResponse, Store } from "../runtime";
 
-const { failFlat, isLoggedIn, notFound, reqStr } = rt;
+const { failFlat, isLoggedIn, notFound } = rt;
 
 /** 闭集 = 服务端的词表（与真机实测输出逐字一致）。 */
 export const MOCK_NOTIFICATION_CHANNELS = ["email", "webhook", "telegram"] as const;
@@ -136,13 +136,4 @@ export async function handleNotificationsMock(ctx: rt.MockAuthedRouteContext): P
   }
 
   return notFound(`Mock route not found: ${method} /${seg.join("/")}`);
-}
-
-/** 供测试断言：mock 与真实后端一样把偏好按用户分片（换用户互不影响）。 */
-export function mockMutesFor(db: Store, userId: number, cookie: string): MuteRow[] {
-  const state = STORES.get(db);
-  if (!state) return [];
-  void cookie;
-  void reqStr;
-  return mutesOf(state, userId);
 }

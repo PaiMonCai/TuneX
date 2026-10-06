@@ -52,6 +52,7 @@ import { handleCatalogMock } from "./handlers/catalog";
 import { handleCommerceMock } from "./handlers/commerce";
 import { handleSettingsMock } from "./handlers/settings";
 import { handleDdnsMock } from "./handlers/ddns";
+import { handleNotificationsMock } from "./handlers/notifications";
 import { handleRouteProfilesMock } from "./handlers/route-profiles";
 import { handleAdminMock } from "./handlers/admin";
 
@@ -308,6 +309,14 @@ export async function handleMock(method: string, path: string, req: MockRequest)
   // 不会抢走既有分支；`/forwards/**` 的 forward 族 RBAC 闸门在上面已经查过。
   {
     const result = await handleDdnsMock(ctx);
+    if (result) return result;
+  }
+  // 通知偏好（`/announcements/preferences`）也必须排在 `handleForwardsMock` **之前**：
+  // 它虽然不落在 `/forwards/*` 命名空间里，但顺序规则统一放这里，避免以后有人把
+  // "命名空间认领型" handler 加到前面时把它挤到 404 之后（本专项已在 DNS 前门、
+  // 延迟端点、HA 三处踩过同类顺序问题）。
+  {
+    const result = await handleNotificationsMock(ctx);
     if (result) return result;
   }
   {
