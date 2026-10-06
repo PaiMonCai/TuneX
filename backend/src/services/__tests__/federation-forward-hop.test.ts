@@ -942,6 +942,41 @@ describe("G. 释放：移除声明 / 改回本机出口 / 删除 Forward 共用�
     expect(block).not.toContain("ok: true");
   });
 
+  it("G12. 远端 DELETE 失败且本地恢复账本也写失败 ⇒ 两层失败都必须可见", async () => {
+    const made = fakeDb();
+    made.placements.push(placementRow({ state: "active" }));
+    made.db.federationPlacement.updateMany = async () => {
+      throw new Error("release ledger unavailable");
+    };
+    const { sender, calls } = fakeSender((call) => {
+      if (call.method === "DELETE") {
+        return {
+          ok: false,
+          code: "peer_unreachable",
+          status: 0,
+          message: "delete timeout",
+          retryable: true,
+          messageId: "m-delete-fail",
+        };
+      }
+      return OK;
+    });
+
+    const result = await releaseFederatedEgress(
+      { tunnelId: 42, revision: 5 },
+      deps(made.db, sender),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.released).toBe(false);
+    expect(result.code).toBe("internal_error");
+    expect(result.message).toContain("peer_unreachable");
+    expect(result.message).toContain("delete timeout");
+    expect(result.message).toContain("本地恢复账本写入失败");
+    expect(result.message).toContain("release ledger unavailable");
+    expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
+  });
+
   it("G6. 行在但从未建成远端腿（reserve 就失败）⇒ 释放不得把 degraded 抹成 expired", async () => {
     // 这条守的是"可解释性"：reserve 失败留下的 degraded(unreachable) 是下一步动作的
     // 依据（等对账/等网络恢复）；把它写成 expired 会让它看起来像"这件事已经结束"。
