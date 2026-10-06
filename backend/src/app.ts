@@ -54,6 +54,32 @@ import { routeProfilesRoutes } from "./routes/route-profiles.ts";
 import { federationRoutes } from "./routes/federation.ts";
 import { adminFederationRoutes } from "./routes/admin-federation.ts";
 
+export const APP_ROUTE_MOUNTS = [
+  "/api/auth",
+  "/api/internal",
+  "/api/pay",
+  "/api/dashboard",
+  "/api/me",
+  "/api/tunnels",
+  "/api/forwards",
+  "/api/ddns",
+  "/api/workspaces",
+  "/api/plans",
+  "/api/topups",
+  "/api/payments",
+  "/api/tickets",
+  "/api/settings",
+  "/api/node-groups",
+  "/api/nodes",
+  "/api/route-profiles",
+  "/api/announcements",
+  "/api/federation/v1",
+  "/api",
+  "/api/admin",
+  "/api/admin/federation",
+  "/api/looking-glass",
+] as const;
+
 export function createApp() {
   const app = new Hono<{ Variables: AppVariables }>();
 
