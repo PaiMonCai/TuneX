@@ -52,6 +52,8 @@ const headers = await buildSignatureHeaders({
   identity,
   privateJwk,
   body,
+  method,
+  path,
   messageId: messageId ?? crypto.randomUUID(),
   nowMs: Date.now() + issuedOffset * 1000,
   ttlSeconds: Number.isFinite(ttl) ? ttl : 60,
