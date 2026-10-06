@@ -162,6 +162,133 @@ export async function runDdnsSuccessor(
 }
 
 /* ================================================================== */
+/* 独立同步节拍（不经过 failover 策略）                                  */
+/* ================================================================== */
+
+/** 候选集合的读面：只要能从库里列出"开了自动同步的转发"。 */
+export interface DdnsSyncSweepDb {
+  readonly tunnel: { findMany: (args: unknown) => Promise<unknown[]> };
+}
+
+export interface DdnsSyncSweepOptions {
+  /** 只同步这些 tunnel（测试与小范围试跑用）。缺省 = 库里所有候选。 */
+  readonly tunnelIds?: readonly number[];
+  readonly db?: DdnsSyncSweepDb;
+  /** 单条转发的同步动作。缺省 = 生产后继 `defaultDdnsSuccessor`。 */
+  readonly sync?: (tunnelId: number) => Promise<{ outcome: string; action?: string }>;
+  readonly log?: (event: { level: "info" | "warn" | "error"; message: string; detail?: unknown }) => void;
+}
+
+export interface DdnsSyncSweepResult {
+  readonly evaluated: number;
+  /** 真的写了、并且读回确认（`synced`）。 */
+  readonly synced: number;
+  /** 写成功但**没读回**（provider 不支持读回，或读回与期望不一致）—— 禁止显示成"已确认"。 */
+  readonly unverified: number;
+  /** 没有要写的东西：值集未变 / 退避窗口内 / 未开自动解析。**零外呼**。 */
+  readonly noop: number;
+  /** 迁移已发出但新入口还没 `applied` ⇒ 这一拍不写，下一拍再看。 */
+  readonly waiting: number;
+  /** 没绑定/没开自动解析（后继报 not_applicable）。 */
+  readonly not_applicable: number;
+  /** 执行器报出的失败（已按退避排下一次），例如 provider 写入失败、地址不可用。 */
+  readonly failed: number;
+  /** 后继本身**抛出**的异常（一条坏数据不能拖垮整轮扫描）。 */
+  readonly errors: number;
+  readonly outcomes: readonly { readonly tunnel_id: number; readonly outcome: string; readonly action?: string }[];
+}
+
+/**
+ * 一次 DDNS 同步扫描：**为纯 DNS 能力提供自己的节拍**。
+ *
+ * ── 为什么必须与 failover 策略解耦 ──
+ *
+ * 写入路径以前只挂在 failover 扫描的末尾，而那个扫描在 `auto_failover`/`auto_failback`
+ * **都关**时整轮直接返回（`failover-loop.ts` 的 fail-closed 首行），而这两个开关的缺省值
+ * 就是关（§8：自动迁移必须是显式 policy，那是对的）。于是"绑定域名 + 开自动同步"这个
+ * **纯 DNS** 的产品能力，被一个与它无关的安全闸门顺带关掉了：默认部署下永远不写。
+ *
+ * 这条节拍**不读、也不改** failover 策略（它连那个模块都不 import）：只遍历"开了自动
+ * 同步且绑定了 provider"的转发，调用与"迁移之后"**同一个** `runDdnsSuccessor`。
+ * "该不该写"的判据仍然只有一处 —— 执行器自己的（`auto_resolve` / 期望值集 / 退避 /
+ * 值集差）。这里不新增任何第二套判定，也不引入第二个"DNS 已切换"的定义。
+ *
+ * ── 与 failover 的后继调用重复吗 ──
+ *
+ * 会重复**检查**，不会重复**写**：`syncForwardDns` 在值集未变时零外呼，所以策略打开时
+ * 两条路径各看一眼是免费的。并发下也安全，理由有三条（都不需要新机制）：
+ *   1. BullMQ worker 默认 concurrency = 1 ⇒ 同一个进程里两条节拍**串行**，不会同时进入；
+ *   2. 就算多副本并发，两边算出的期望值集是**同一个**（同一份 `desiredValues`），重复写
+ *      的内容相同 ⇒ 值集收敛到同一个结果，不会抖动；
+ *   3. 唯一的代价是"多一次外呼"，而不会出现两个不同的值集 —— 权威事实
+ *      （`dns_confirmed_values` / `dns_verified` / `dns_synced_at`）仍然只有
+ *      `syncForwardDns` 一处写。下一拍也会按读回结果自愈。
+ *
+ * 逐条而不是并发：与 failover 扫描同一条纪律 —— 一次外呼的延迟不该被放大成一批同时写。
+ */
+export async function runDdnsSyncSweep(options: DdnsSyncSweepOptions = {}): Promise<DdnsSyncSweepResult> {
+  const logFn = options.log ?? ((e) => console.log(`[ddns] ${e.level} ${e.message}`, e.detail ?? ""));
+  const sync = options.sync ?? defaultDdnsSuccessor;
+
+  let tunnelIds: number[];
+  if (options.tunnelIds) {
+    tunnelIds = [...options.tunnelIds];
+  } else {
+    // 延迟 import `db`：本模块的安全核心要能在没有 DATABASE_URL 的进程里被 import。
+    const database = options.db ?? ((await import("../db.ts")).db as unknown as DdnsSyncSweepDb);
+    const rows = (await database.tunnel.findMany({
+      where: { dns_auto_resolve: true, dns_provider_id: { not: null } },
+      select: { id: true },
+      orderBy: { id: "asc" },
+    })) as Array<{ id: number }>;
+    tunnelIds = rows.map((row) => row.id);
+  }
+
+  const outcomes: Array<{ tunnel_id: number; outcome: string; action?: string }> = [];
+  let synced = 0;
+  let unverified = 0;
+  let noop = 0;
+  let waiting = 0;
+  let notApplicable = 0;
+  let failed = 0;
+  let errors = 0;
+
+  for (const tunnelId of tunnelIds) {
+    try {
+      const result = await sync(tunnelId);
+      outcomes.push({ tunnel_id: tunnelId, outcome: result.outcome, ...(result.action ? { action: result.action } : {}) });
+      if (result.outcome === "synced") {
+        // `outcome === "synced"` 只说明"后继跑完了"，**真正写没写**在执行器的 action 里：
+        // noop/suggested/backoff 都是"什么都没写"，把它们计成 synced 会让日志撒谎。
+        const action = result.action ?? "synced";
+        if (action === "synced") synced += 1;
+        else if (action === "synced_unverified") unverified += 1;
+        else if (action === "error" || action === "unavailable") failed += 1;
+        else noop += 1;
+        logFn({ level: "info", message: "ddns sync", detail: { tunnel_id: tunnelId, action } });
+      } else if (result.outcome === "waiting_for_rollout") {
+        waiting += 1;
+      } else {
+        notApplicable += 1;
+      }
+    } catch (e) {
+      // 一条转发的失败**不能**拖垮整轮扫描：DNS 有自己的退避与重试节拍，而"因为第 3 条
+      // 抛错就再也不看第 4 条"会让故障扩散成静默的全量停摆（与 failover 循环同一条纪律）。
+      errors += 1;
+      // 抛错的那一条也要出现在 outcomes 里：否则"扫描了几条、哪条坏了"只能靠日志猜。
+      outcomes.push({ tunnel_id: tunnelId, outcome: "error" });
+      logFn({
+        level: "warn",
+        message: "ddns sync failed",
+        detail: { tunnel_id: tunnelId, error: (e as Error)?.message ?? String(e) },
+      });
+    }
+  }
+
+  return { evaluated: tunnelIds.length, synced, unverified, noop, waiting, not_applicable: notApplicable, failed, errors, outcomes };
+}
+
+/* ================================================================== */
 /* 生产接线                                                            */
 /* ================================================================== */
 
@@ -207,11 +334,23 @@ export async function defaultDnsGate(tunnelId: number): Promise<DdnsPathReadines
   );
 }
 
+/**
+ * 把后继结果拍平成同步扫描要的 `{ outcome, action }`。
+ *
+ * 返回的 `action`（`synced` vs `synced_unverified` vs `noop`/`backoff`/`error`…）是必要的：
+ * `outcome` 只说明"后继跑完了"，而"到底写没写、读回来没有"在 action 里 —— 只有 outcome
+ * 会把"写了但没读回"和"确认过"显示成同一件事，也会把 noop 算成一次写。
+ *
+ * 生产与测试**共用这一处**，避免"测试里的拍平逻辑"和"生产里的"各写一遍然后慢慢分叉。
+ */
+export function successorSummary(result: DdnsSuccessorOutcome): { outcome: string; action?: string } {
+  return { outcome: result.outcome, ...(result.outcome === "synced" ? { action: result.sync.action } : {}) };
+}
+
 /** 后继的生产实现（薄委托：真正的逻辑在 `runDdnsSuccessor`）。 */
-export async function defaultDdnsSuccessor(tunnelId: number): Promise<{ outcome: string }> {
+export async function defaultDdnsSuccessor(tunnelId: number): Promise<{ outcome: string; action?: string }> {
   const { db } = await import("../db.ts");
-  const result = await runDdnsSuccessor(productionSuccessorDeps(db as unknown as DdnsSuccessorDeps["db"]), { tunnelId });
-  return { outcome: result.outcome };
+  return successorSummary(await runDdnsSuccessor(productionSuccessorDeps(db as unknown as DdnsSuccessorDeps["db"]), { tunnelId }));
 }
 
 /**

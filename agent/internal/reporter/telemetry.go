@@ -10,7 +10,7 @@
 //   - The panel computes Health. The agent only reports raw facts, so nothing
 //     here produces "healthy/warning" — it produces numbers.
 //   - keep sampling cheap: one sample
-//     per heartbeat (one Sysinfo + one Statfs + one /proc read), no collection
+//     per report (one Sysinfo + one Statfs + one /proc read), no collection
 //     loop, no per-metric history.
 //   - Every sampler is optional. A missing or failing source reports *nothing*
 //     for that field instead of a zero that would read as "0 bytes of memory"
@@ -73,7 +73,7 @@ type HostStats struct {
 	ProcessValid bool   `json:"-"`
 }
 
-// HostSampler provides host identity and one resource sample per heartbeat.
+// HostSampler provides host identity and one resource sample per report.
 //
 // It is an interface (not a struct) so unit tests can inject a fake and so the
 // production implementation can stay platform-specific (Sysinfo/Statfs are not

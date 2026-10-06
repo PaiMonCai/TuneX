@@ -1,6 +1,14 @@
-// Package reporter implements the Agent's outbound heartbeat and authenticated
-// state report. The Agent reports raw runtime facts; the Panel derives health and
-// product status from them. Reporting never requires Panel-to-Agent connectivity.
+// Package reporter implements the Agent's outbound state report. The Agent reports
+// raw runtime facts; the Panel derives health and product status from them.
+// Reporting never requires Panel-to-Agent connectivity.
+//
+// There is exactly ONE outbound report channel: the authenticated POST to
+// StatePath. An earlier build also sent an unauthenticated "heartbeat" to
+// /api/internal/heartbeat, but the Panel never implemented that route (it does not
+// exist, and never existed, in `backend/src/routes/internal-node.ts`): every beat
+// answered 404 and the response was discarded. It is deleted rather than
+// reimplemented — an unauthenticated liveness POST would be a second definition of
+// "alive", and liveness is derived from this authenticated report alone.
 //
 // The post function is injected so unit tests never touch the network.
 package reporter
@@ -23,18 +31,16 @@ import (
 	"github.com/tunex/agent/internal/targetobs"
 )
 
-// Interval is the heartbeat cadence.
+// Interval is the state-report cadence.
 const Interval = 30 * time.Second
 
-// ClientTimeout bounds a single heartbeat POST: a hung panel endpoint must not
-// pile up goroutines or delay the next beat by more than one interval.
+// ClientTimeout bounds a single state-report POST: a hung panel endpoint must not
+// pile up goroutines or delay the next report by more than one interval.
 const ClientTimeout = 10 * time.Second
 
-// HeartbeatPath is the panel endpoint the agent posts to.
-const HeartbeatPath = "/api/internal/heartbeat"
-
-// StatePath is the authenticated node-state endpoint. Telemetry extends this
-// same report instead of creating a second node-monitoring truth.
+// StatePath is the authenticated node-state endpoint — the Agent's ONE channel to
+// the Panel. Telemetry, ownership-lease renewal and the closing report all ride
+// this report instead of creating a second node-monitoring truth.
 const StatePath = "/api/internal/node/state"
 
 // CredentialHeader carries the per-node credential (services/node-credential.ts).
@@ -42,29 +48,20 @@ const StatePath = "/api/internal/node/state"
 // the header value never appears in any log line (logx calls never touch it).
 const CredentialHeader = "Authorization"
 
-// ErrNoPanelURL is returned by Run when no panel URL is configured. A node may
-// legitimately run without reporting, so this is a startup decision, not a
-// runtime failure.
-var ErrNoPanelURL = errors.New("reporter: panel url is not configured")
+// ErrNoPanelURL is returned by Run when there is nothing to report to: the panel
+// URL is unset, or the node carries no credential. The authenticated state report
+// is the only channel, so without it a "running" reporter would send nothing at
+// all. A node may legitimately run without reporting, so this is a startup
+// decision, not a runtime failure.
+var ErrNoPanelURL = errors.New("reporter: panel url or node credential is not configured")
 
 // ErrAlreadyRunning is returned by Run when a previous Run is still active.
 var ErrAlreadyRunning = errors.New("reporter: already running")
 
-// Payload is the heartbeat body. Field names match the panel's Node model so
-// the backend can deserialise it directly.
-type Payload struct {
-	AgentID     string                `json:"agent_id,omitempty"`
-	NodeID      string                `json:"node_id"`
-	Version     string                `json:"version"`
-	Role        string                `json:"role"`
-	Timestamp   int64                 `json:"timestamp"`
-	Tunnels     []ReportedTunnel      `json:"tunnels,omitempty"`
-	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
-}
-
-// StatePayload is the authenticated state-report body. It is the heartbeat
-// superset the Panel uses to derive current node/runtime facts without dialing
-// the Agent. Shape is owned by services/node-state.ts.
+// StatePayload is the state-report body — the Panel uses it to derive current
+// node/runtime facts without dialing the Agent. Shape is owned by
+// services/node-state.ts. Field names match the panel's Node model so the backend
+// can deserialise them directly.
 type StatePayload struct {
 	AgentID     string                `json:"agent_id,omitempty"`
 	Version     string                `json:"version,omitempty"`
@@ -350,7 +347,7 @@ func WithManifest(manifest *CapabilityManifest) Option {
 	}
 }
 
-// Reporter periodically reports the node's heartbeat.
+// Reporter periodically sends the node's authenticated state report.
 type Reporter struct {
 	cfg Config
 
@@ -366,8 +363,10 @@ type Config struct {
 	Version  string
 	Role     string
 
-	// Credential authenticates state reporting. Empty disables the authenticated
-	// state report; the unauthenticated heartbeat remains best-effort compatibility.
+	// Credential authenticates the state report. Empty disables reporting
+	// entirely: there is no unauthenticated fallback channel (the old
+	// /api/internal/heartbeat POST was never implemented by the Panel, and has
+	// been removed rather than reimplemented).
 	Credential string
 
 	tunnels  TunnelLister
@@ -446,7 +445,8 @@ func WithTunnels(t TunnelLister) Option { return func(c *Config) { c.tunnels = t
 func WithEgress(e EgressLister) Option { return func(c *Config) { c.egress = e } }
 
 // WithPost replaces the HTTP transport (tests). The headers map carries the
-// credential for the state report; the legacy heartbeat sends nil headers.
+// credential for the state report; every request the reporter makes is that one
+// authenticated report (there is no second, credential-less channel).
 //
 // It is the error-only shape, so a test that does not care about the panel's
 // answer keeps working unchanged; the body it discards is what
@@ -513,38 +513,10 @@ func New(cfg Config, opts ...Option) *Reporter {
 	return &Reporter{cfg: cfg}
 }
 
-// Endpoint returns the full heartbeat URL, or "" when reporting is disabled.
-func (r *Reporter) Endpoint() string {
-	base := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
-	if base == "" {
-		return ""
-	}
-	return base + HeartbeatPath
-}
-
-// Payload builds the current heartbeat body.
-func (r *Reporter) Payload() Payload {
-	p := Payload{
-		AgentID:   r.cfg.AgentID,
-		NodeID:    r.cfg.NodeID,
-		Version:   r.cfg.Version,
-		Role:      r.cfg.Role,
-		Timestamp: r.cfg.now().Unix(),
-	}
-	if r.cfg.tunnels != nil {
-		p.Tunnels = r.reportedTunnels()
-	}
-	if r.cfg.egress != nil {
-		p.EgressPools = r.cfg.egress.Snapshot()
-	}
-	return p
-}
-
-// StatePayload builds the state-report body. It is the heartbeat superset:
-// same tunnel/pool data plus the ports actually bound, the newest applied
-// revision and the last error string. Version/Role come from config, not from
-// the payload — the panel pins them to the credential's node (the agent never
-// gets to say "I am node X").
+// StatePayload builds the state-report body: tunnel/pool data plus the ports
+// actually bound, the newest applied revision and the last error string.
+// Version/Role come from config, not from the payload — the panel pins them to
+// the credential's node (the agent never gets to say "I am node X").
 func (r *Reporter) StatePayload() StatePayload {
 	p := StatePayload{
 		AgentID: r.cfg.AgentID,
@@ -674,15 +646,16 @@ func sortedPorts(in map[int]bool) []int {
 	return out
 }
 
-// Run blocks, sending a heartbeat every Interval until ctx is cancelled or Stop
-// is called. The first beat goes out immediately so the Panel sees the node
-// promptly after restart.
+// Run blocks, sending one state report every Interval until ctx is cancelled or
+// Stop is called. The first report goes out immediately so the Panel sees the
+// node promptly after restart.
 //
-// A failed beat is dropped and retried on the next tick; reporting never makes
-// the agent exit. Returns ErrNoPanelURL immediately when reporting is off, and
-// ErrAlreadyRunning if Run is called twice.
+// A failed report is dropped and retried on the next tick; reporting never makes
+// the agent exit. Returns ErrNoPanelURL immediately when there is nothing to
+// report to (no panel URL or no credential), and ErrAlreadyRunning if Run is
+// called twice.
 func (r *Reporter) Run(ctx context.Context) error {
-	if r.Endpoint() == "" {
+	if r.StateEndpoint() == "" {
 		return ErrNoPanelURL
 	}
 	r.mu.Lock()
@@ -703,7 +676,6 @@ func (r *Reporter) Run(ctx context.Context) error {
 	t := time.NewTicker(Interval)
 	defer t.Stop()
 
-	r.send(ctx)
 	r.sendState(ctx)
 	for {
 		select {
@@ -712,28 +684,14 @@ func (r *Reporter) Run(ctx context.Context) error {
 		case <-stop:
 			return nil
 		case <-t.C:
-			r.send(ctx)
 			r.sendState(ctx)
 		}
 	}
 }
 
-// send posts one heartbeat, best effort: a transport failure is intentionally
-// swallowed here (the agent's own logging happens inside the post hook) because
-// a flaky panel must never cascade into the node's data plane.
-func (r *Reporter) send(ctx context.Context) {
-	body, err := json.Marshal(r.Payload())
-	if err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
-	defer cancel()
-	// The legacy heartbeat has no response contract: whatever comes back is
-	// ignored, exactly as before.
-	_, _ = r.cfg.post(ctx, r.Endpoint(), body, nil)
-}
-
-// sendState posts one state report (best effort, same reasoning as send).
+// sendState posts one state report, best effort: a transport failure is
+// intentionally swallowed here (the agent's own logging happens inside the post
+// hook) because a flaky panel must never cascade into the node's data plane.
 //
 // Rejected credentials (401) are the one failure worth mentioning to the
 // operator: the node is alive and healthy but can no longer identify itself,
@@ -888,8 +846,8 @@ func (r *Reporter) Stop() {
 // errRejected so sendState can tell "my credential is no good" (operator must
 // act) from "the panel is flaky" (nothing to do).
 //
-// headers is nil for the legacy heartbeat and carries Authorization for the
-// state report; the credential value is never included in the error text.
+// headers carries Authorization for the state report; the credential value is
+// never included in the error text.
 func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -901,14 +859,14 @@ func httpPost(ctx context.Context, url string, body []byte, headers map[string]s
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("heartbeat post %s: %w", url, err)
+		return nil, fmt.Errorf("state report post %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return nil, fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
 		}
-		return nil, fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("state report post %s: status %d", url, resp.StatusCode)
 	}
 	// Bounded read: the answer carries lease facts, not a document. A panel that
 	// streams megabytes at the agent must not be able to grow its heap.

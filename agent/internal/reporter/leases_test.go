@@ -112,22 +112,10 @@ func TestBadLeaseEntriesAreSkippedNotFatal(t *testing.T) {
 	}
 }
 
-func TestLegacyHeartbeatDoesNotTouchTheLeaseSink(t *testing.T) {
-	sink := &recordingLeaseSink{}
-	// The legacy heartbeat's answer has no lease contract; only the state report
-	// carries ownership facts.
-	r := New(
-		Config{PanelURL: "http://panel.invalid", NodeID: "n1"},
-		WithLeases(sink),
-		WithPostResponse(func(context.Context, string, []byte, map[string]string) ([]byte, error) {
-			return []byte(`{"data":{"leases":[{"tunnel_id":1,"epoch":1,"lease_expires_at":"2026-10-04T05:00:30.000Z"}]}}`), nil
-		}),
-	)
-	r.send(context.Background())
-	if len(sink.calls) != 0 {
-		t.Fatalf("the legacy heartbeat fed the lease sink: %+v", sink.calls)
-	}
-}
+// TestLegacyHeartbeatDoesNotTouchTheLeaseSink 已随 F5（task-6）删除：legacy heartbeat
+// 本身（未鉴权的 POST /api/internal/heartbeat）被移除了 —— Panel 从未实现该路由，
+// 每一跳都是 404 且响应被丢弃。删除后的契约（"只有经过认证的 state report 存在，
+// 且它必须带凭据"）由 `no_legacy_heartbeat_test.go` 用真实 HTTP 钉住。
 
 func TestErrorOnlyPostHookStillWorks(t *testing.T) {
 	// Existing tests (and any embedder) use the error-only shape; it must keep

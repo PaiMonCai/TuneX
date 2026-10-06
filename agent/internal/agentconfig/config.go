@@ -292,7 +292,7 @@ Flags:
 
 Runtime:
       --role string               Node role: INGRESS, EGRESS or BOTH (default BOTH)
-      --panel-http-url string     Panel HTTP base URL for heartbeat/state reporting
+      --panel-http-url string     Panel HTTP base URL for command polling and state reporting
       --agent-admin-token string  Bearer token for the local admin API
       --agent-admin-port int      Local admin API port; 0 disables (default 9090)
       --ingress-range string      Port range ingress tunnels may bind, e.g. 10000-30000

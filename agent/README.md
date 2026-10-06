@@ -8,14 +8,14 @@ The production control path is **outbound-only from Agent to Panel**:
 ```text
 Panel
   ▲
-  │  heartbeat / state report / command poll / ACK
+  │  state report / command poll / ACK
   │  HTTP(S), authenticated with the per-node credential
   │
 Agent
   ├─ TunnelManager      ingress listeners
   ├─ EgressManager      relay / target-side runtimes
   ├─ Control client     polls revisioned commands
-  ├─ Reporter           heartbeat, state and capability facts
+  ├─ Reporter           state, telemetry and capability facts
   ├─ Restore / LKG      restart recovery during Panel outages
   ├─ Ownership guard    epoch fencing + lease expiry
   ├─ Target DNS/health  resolution and observations
@@ -126,7 +126,7 @@ The runtime starts in this order:
    last-known-good snapshot when the Panel is unavailable;
 4. start the optional loopback admin API;
 5. start the outbound command poll / ACK loop;
-6. start target observation and heartbeat/state reporting.
+6. start target observation and state reporting.
 
 When a node booted from the local cache and the Panel becomes reachable again, the
 Agent re-fetches authoritative desired state and removes local runtimes the Panel
@@ -145,12 +145,16 @@ GET  /api/internal/node/commands
 POST /api/internal/node/ack
 ```
 
-and reports to:
+and reports to exactly one endpoint:
 
 ```text
-POST /api/internal/heartbeat
 POST /api/internal/node/state
 ```
+
+(An earlier build also POSTed an unauthenticated `/api/internal/heartbeat`; the Panel
+never implemented that route, so every beat answered 404 and the response was
+discarded. It has been deleted — liveness is derived from the authenticated state
+report alone, and there is no second definition of "alive".)
 
 The state report carries the control protocol version, supported command actions and
 a capability manifest derived from the runtime actually compiled and wired into the
@@ -171,7 +175,7 @@ never be logged.
 | `runtime_adapters.go` | narrow adapters between runtime subsystems |
 | `internal/agentconfig` | flags, env and flat YAML configuration |
 | `internal/control` | outbound command polling, dispatch and ACK |
-| `internal/reporter` | heartbeat, state, telemetry and capability reporting |
+| `internal/reporter` | state report, telemetry and capability reporting |
 | `internal/manager` | tunnel/egress runtime ownership and hot updates |
 | `internal/forwarder` | TCP/TLS/WebSocket/UDP data-plane implementations |
 | `internal/restore` | desired-state restore and last-known-good cache |

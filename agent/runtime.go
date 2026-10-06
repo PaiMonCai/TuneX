@@ -271,7 +271,10 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		logx.Info("outbound control scheduled", "url", cfg.PanelHTTPURL)
 	}
 
-	// 4. Heartbeat reporter. Disabled (nil) when no panel URL is configured;
+	// 4. State reporter. Disabled (nil) when there is nothing to report to: no
+	// panel URL, or no node credential — the authenticated state report is the
+	// Agent's only channel to the Panel (the old unauthenticated
+	// /api/internal/heartbeat POST was never implemented by the Panel and is gone).
 	// Run's ErrNoPanelURL path is handled by the goroutine below.
 	//
 	// target observation target observation starts just before it, so the very first state
@@ -300,7 +303,7 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		logx.Info("target observation scheduled",
 			"node_id", cfg.NodeID, "interval", observer.Interval().String())
 	}
-	if cfg.PanelHTTPURL != "" {
+	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
 			AgentID:    cfg.AgentID,
@@ -345,10 +348,10 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		)
 		go func() {
 			if err := rt.heart.Run(ctx); err != nil {
-				logx.Debug("heartbeat stopped", "err", err.Error())
+				logx.Debug("state report stopped", "err", err.Error())
 			}
 		}()
-		logx.Info("heartbeat scheduled", "url", cfg.PanelHTTPURL, "interval", reporter.Interval.String())
+		logx.Info("state report scheduled", "url", cfg.PanelHTTPURL, "interval", reporter.Interval.String())
 	}
 
 	rt.startedAt = time.Now()

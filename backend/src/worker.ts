@@ -29,6 +29,10 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
   { name: "cron_latency_history", pattern: "15 * * * *", desc: "观测档案：小时桶聚合 + 过期清理（原始 24h / 桶 30d，幂等）" },
   { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
   { name: "cron_reconcile_v3", everyMs: 30_000, desc: "v3 desired/runtime/lease 同 revision 对账修复" },
+  // DDNS 的写入**不**搭 failover 策略的车：那个扫描在 auto_failover/auto_failback 都关时
+  // 整轮直接返回，而"缺省即关"是刻意的（§8）。于是"绑定域名 + 开自动同步"这个纯 DNS 能力
+  // 在默认部署下永远不会写。这条节拍只遍历开了自动同步的转发，判定仍在执行器一处。
+  { name: "cron_ddns_sync", everyMs: 30_000, desc: "DDNS 同步：写 dns_auto_resolve 的转发（与 failover 策略无关，幂等 + 退避）" },
   // Settlement is intentionally offset from the hourly latency rollup/archive windows.
   { name: "cron_settle_billing", pattern: "45 * * * *", desc: "订阅周期结算：占位 → 执行 → 终态，崩溃接管（幂等）" },
 ];
@@ -198,6 +202,33 @@ const worker = new Worker(
 
 
         return { ...summary, federation: federationSummary };
+      }
+      case "cron_ddns_sync": {
+        // 独立于 failover 策略的 DNS 写入节拍（见 CRON_JOBS 里的注释）。幂等性来自执行器：
+        // 值集没变时零外呼、失败走有界退避、读回决定 verified。这里只负责"每拍看一眼"。
+        const { runDdnsSyncSweep } = await import("./services/ddns-successor.ts");
+        const r = await runDdnsSyncSweep({
+          log: (e) => {
+            const line = `[worker] ddns: ${e.message} ${e.detail ? JSON.stringify(e.detail) : ""}`;
+            if (e.level === "warn") console.warn(line);
+            else console.log(line);
+          },
+        });
+        const summary = {
+          evaluated: r.evaluated,
+          synced: r.synced,
+          unverified: r.unverified,
+          noop: r.noop,
+          waiting: r.waiting,
+          not_applicable: r.not_applicable,
+          failed: r.failed,
+          errors: r.errors,
+        };
+        // 空闲时（没有开启自动同步的转发）保持静默，但有动作/有错必须留痕。
+        if (r.synced > 0 || r.unverified > 0 || r.failed > 0 || r.errors > 0) {
+          console.log("[worker] cron_ddns_sync:", JSON.stringify(summary));
+        }
+        return summary;
       }
       case "cron_settle_billing": {
         // Settlement claims a unique (subscription, period) row before execution. Stale pending

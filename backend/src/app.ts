@@ -42,6 +42,7 @@ import { ddnsRoutes } from "./routes/ddns.ts";
 // User/workspace announcements and the Admin announcement surface share the same backend truth.
 import { announcementRoutes } from "./routes/announcements.ts";
 import { announcementAdminRoutes } from "./routes/announcements-admin.ts";
+import { notificationChannelRoutes } from "./routes/notification-channels.ts";
 import { plansRoutes } from "./routes/plans.ts";
 import { topupsRoutes } from "./routes/topups.ts";
 import { paymentsRoutes } from "./routes/topups.ts";
@@ -201,6 +202,9 @@ export function createApp() {
   app.route("/api/looking-glass", lookingGlassRoutes);
   // Platform announcement management uses the admin permission guard above.
   app.route("/api/admin", announcementAdminRoutes);
+  // N2: platform notification channel config (telegram/webhook). Secret values are write-only
+  // and never echoed; this router inherits the admin guards (registered `notification_channels` key).
+  app.route("/api/admin", notificationChannelRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 

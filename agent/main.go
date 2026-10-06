@@ -2,8 +2,8 @@
 //
 // There is one production runtime: TunnelManager / EgressManager own the
 // listeners and forwarding state, while the Agent initiates every production
-// control-plane interaction with the Panel (command polling, ACK, heartbeat and
-// state reporting). The optional local admin API binds to loopback and is not
+// control-plane interaction with the Panel (command polling, ACK and the
+// authenticated state report). The optional local admin API binds to loopback and is not
 // required for Panel-to-Agent orchestration.
 //
 // Only the Go standard library is used, so the module builds fully offline.
@@ -39,7 +39,7 @@ func main() {
 //  2. restore: pull the node's ACTIVE tunnels so ports are re-bound after a
 //     restart using the authoritative desired-state restore path.
 //  3. admin API (:9090) — the mutation surface
-//  4. heartbeat / state report (every 30s)
+//  4. authenticated state report (every 30s)
 //
 // Shutdown is the reverse: reporter, admin API, managers.
 func run(args []string) int {
