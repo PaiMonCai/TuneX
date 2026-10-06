@@ -102,11 +102,16 @@ settingsRoutes.patch("/profile", async (c) => {
       const dup = await db.user.findUnique({ where: { email } });
       if (dup && dup.id !== user.id) return c.json({ error: "该邮箱已被占用" }, 400);
       data.email = email;
+      // Verification belongs to the address, not the account forever.
+      data.email_verified_at = null;
     }
   }
   if ("note" in body) data.note = pickStr(body.note);
   if ("tg_id" in body) data.tg_id = pickStr(body.tg_id);
-  if ("auto_renew" in body) data.auto_renew = Boolean(body.auto_renew);
+  if ("auto_renew" in body) {
+    if (typeof body.auto_renew !== "boolean") return c.json({ error: "auto_renew 必须为布尔值" }, 400);
+    data.auto_renew = body.auto_renew;
+  }
 
   const updated =
     Object.keys(data).length > 0
