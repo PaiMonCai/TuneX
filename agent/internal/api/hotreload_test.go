@@ -14,9 +14,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// WP2 — the admin API is the second apply surface, and it must honour the
+// The admin API is the second apply surface, and it must honour the
 // same §13.3.4 edit semantics the panel's apply_tunnel command gets
-// (DEVELOPMENT.md §13.3.4 / §13.3.5). Both surfaces route through the same
+// hot-reload and drain semantics. Both surfaces route through the same
 // manager entry point (TunnelManager.ReplaceListener), so these tests assert
 // the observables that distinguish a hot swap from a rebuild: the listener
 // does not move, the held connection keeps relaying, and the running config

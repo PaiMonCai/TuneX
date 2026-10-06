@@ -7,7 +7,7 @@ import (
 	"github.com/tunex/agent/internal/forwarder"
 )
 
-// V5-WP1 capability manifest tests.
+// Capability manifest tests.
 //
 // The whole point of the manifest is that it is a *claim* the panel will act on:
 // a wrong entry makes the panel dispatch a protocol this binary cannot carry, or
@@ -135,7 +135,7 @@ func TestBuildManifestRejectsUnknownNames(t *testing.T) {
 	}{
 		{
 			name: "unknown protocol",
-			// V5.1b opened udp, so it is no longer a name that must be rejected;
+			// udp is supported, so it is no longer a name that must be rejected;
 			// this case is about an UNKNOWN name, which stays an error.
 			facts: ImplementationFacts{
 				Protocols:  []string{"quic"},

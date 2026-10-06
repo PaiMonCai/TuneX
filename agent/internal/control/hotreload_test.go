@@ -12,8 +12,8 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// WP2 — the command path must honour the panel's edit semantics
-// (DEVELOPMENT.md §13.3.4), not just the manager primitives in isolation.
+// The command path must honour the panel's edit semantics
+// instead of testing manager primitives in isolation.
 //
 // A panel that moves a listen port sends ONE apply_tunnel command with a new
 // revision. The agent must not drop the live connections while it does so,

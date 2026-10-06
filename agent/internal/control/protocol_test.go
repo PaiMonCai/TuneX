@@ -115,7 +115,7 @@ func TestProtocolVersionIsPositive(t *testing.T) {
 	}
 }
 
-// Envelope/payload mismatches are refused before anything is applied (WP11B).
+// Envelope/payload mismatches are refused before anything is applied.
 func TestExecuteRejectsEnvelopePayloadMismatch(t *testing.T) {
 	base := func() *QueuedCommand {
 		cfg := configStub

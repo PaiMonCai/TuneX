@@ -10,7 +10,7 @@ import (
 	"github.com/tunex/agent/internal/manager"
 )
 
-// V5-WP3: /debug/runtime exists so the TCP performance baseline can record
+// /debug/runtime exists so the TCP performance baseline can record
 // goroutine count, which /proc cannot provide (it only has OS threads). These
 // tests pin the two properties that matter for a measurement endpoint: it is
 // authenticated like the rest of the management plane, and its numbers are real
