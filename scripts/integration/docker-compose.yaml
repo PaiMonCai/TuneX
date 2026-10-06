@@ -160,6 +160,7 @@ services:
       - --debug
     volumes:
       - ingress_agent_state:/var/lib/tunex-agent
+      - ./.agent.env:/run/tunex-agent/agent.env:ro
     networks:
       tunex-it-ctrl:
         ipv4_address: 172.31.0.20
@@ -198,6 +199,7 @@ services:
       - --debug
     volumes:
       - egress_agent_state:/var/lib/tunex-agent
+      - ./.agent.env:/run/tunex-agent/agent.env:ro
     networks:
       tunex-it-ctrl:
         ipv4_address: 172.31.0.30
@@ -234,6 +236,7 @@ services:
       - --debug
     volumes:
       - ingress_agent_b_state:/var/lib/tunex-agent
+      - ./.agent.env:/run/tunex-agent/agent.env:ro
     networks:
       tunex-it-ctrl:
         ipv4_address: 172.31.0.21
@@ -271,6 +274,7 @@ services:
       - --debug
     volumes:
       - egress_agent_b_state:/var/lib/tunex-agent
+      - ./.agent.env:/run/tunex-agent/agent.env:ro
     networks:
       tunex-it-ctrl:
         ipv4_address: 172.31.0.31

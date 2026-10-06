@@ -8,6 +8,7 @@ COMPOSE="$HERE/docker-compose.yaml"
 ENVF="$HERE/.env.integration"
 PASSF="$HERE/.passwords.env"
 STATE="$HERE/state.json"
+AGENT_ENV="$HERE/.agent.env"
 API=${API:-http://127.0.0.1:18180}
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
@@ -58,17 +59,6 @@ else
 fi
 
 # ---------------------------------------------------------------- images
-AGENT_DOCKERFILE="$HERE/agent.Dockerfile.e2e"
-cat >"$AGENT_DOCKERFILE" <<'DOCKERFILE'
-FROM golang:1.22-alpine AS build
-WORKDIR /src
-COPY . .
-RUN CGO_ENABLED=0 go build -o /out/tunex-agent .
-FROM busybox:1.36
-COPY --from=build /out/tunex-agent /usr/local/bin/tunex-agent
-ENTRYPOINT ["/usr/local/bin/tunex-agent"]
-DOCKERFILE
-
 if [[ -z "${TUNEX_BACKEND_IMAGE:-}" ]]; then
   say "从当前 checkout 构建 Backend"
   docker build -t tunex-it-backend:ci "$REPO/backend"
@@ -76,7 +66,7 @@ if [[ -z "${TUNEX_BACKEND_IMAGE:-}" ]]; then
 fi
 if [[ -z "${TUNEX_IT_AGENT_IMAGE:-}" ]]; then
   say "从当前 checkout 构建 Agent"
-  docker build -t tunex-it-agent:ci -f "$AGENT_DOCKERFILE" "$REPO/agent"
+  docker build -t tunex-it-agent:ci -f "$REPO/agent/Dockerfile" "$REPO"
   export TUNEX_IT_AGENT_IMAGE=tunex-it-agent:ci
 fi
 echo "images: backend=$TUNEX_BACKEND_IMAGE agent=$TUNEX_IT_AGENT_IMAGE"
@@ -156,6 +146,14 @@ TUNEX_IT_INGRESS_B_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$S
 TUNEX_IT_EGRESS_B_CREDENTIAL=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress_secondary']['credential'])")
 TUNEX_IT_INGRESS_B_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['ingress_secondary']['agent_id'])")
 TUNEX_IT_EGRESS_B_AGENT_ID=$(python3 -c "import json;print(json.load(open('$STATE'))['nodes']['egress_secondary']['agent_id'])")
+
+say "写入 Agent entrypoint 环境文件"
+umask 077
+cat >"$AGENT_ENV" <<'EOF'
+# Integration keeps runtime configuration in CLI arguments.
+# This file exists so source-built and candidate images exercise the production entrypoint.
+EOF
+chmod 600 "$AGENT_ENV"
 
 say "启动四个 Agents（仅主动出站；admin port=0）"
 docker compose -f "$COMPOSE" --env-file "$ENVF" up -d --force-recreate ingress-agent egress-agent ingress-agent-b egress-agent-b
