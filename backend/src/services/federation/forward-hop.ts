@@ -56,6 +56,7 @@ import { isFederationEnabled } from "./identity.ts";
 // `forward-rollout.ts` 是纯计划模块（无 IO），引它不会把 Prisma 拖进来。
 import { ACTIVE_ROLLOUT_PHASES } from "../forward-rollout.ts";
 import {
+  isTerminalPlacementState,
   recordPlacementResult,
   upsertPlacement,
   type FederationPeerRef,
@@ -543,8 +544,21 @@ export async function delegateFederatedEgress(
     // 连 peer 都没解析出来 ⇒ 没有任何远端副作用；但**仍然留下可解释的镜像行**，
     // 否则"这条 Forward 声明了远端出口却没接上"在库里看不到（§4.3 的教训：
     // 决策不留痕的机制与从未运行过的机制无法区分）。
-    await mirrorFailure(d, { peer: peerPanelId, forwardRef, intentId, tunnelId: request.tunnelId, revision: request.revision, code: resolved.code, message: resolved.message });
-    return failure(resolved.code, resolved.message, { peer: peerPanelId, intentId, leaseRef: null, compensated: true });
+    const failureMirror = await mirrorFailure(d, {
+      peer: peerPanelId,
+      forwardRef,
+      intentId,
+      tunnelId: request.tunnelId,
+      revision: request.revision,
+      code: resolved.code,
+      message: resolved.message,
+    });
+    return failure(resolved.code, withMirrorFailure(resolved.message, failureMirror), {
+      peer: peerPanelId,
+      intentId,
+      leaseRef: null,
+      compensated: true,
+    });
   }
   const peer = resolved.peer;
 
@@ -569,6 +583,18 @@ export async function delegateFederatedEgress(
       compensated: true,
     });
   }
+  if (isTerminalPlacementState(mirrored.placement.state)) {
+    return failure(
+      mirrored.placement.state === "revoked" ? "lease_revoked" : "lease_expired",
+      `intent ${intentId} 已处于终态 ${mirrored.placement.state}，拒绝用同一 revision 重新创建远端腿`,
+      {
+        peer: peerPanelId,
+        intentId,
+        leaseRef: mirrored.placement.lease_ref,
+        compensated: true,
+      },
+    );
+  }
 
   /* ---------------- 阶段 1：host 侧预留 ---------------- */
   const reserved = await d.sender({
@@ -589,7 +615,7 @@ export async function delegateFederatedEgress(
     retries: 1,
   });
   if (!reserved.ok) {
-    await mirrorFailure(d, {
+    const failureMirror = await mirrorFailure(d, {
       peer: peer.peer_panel_id,
       forwardRef,
       intentId,
@@ -598,22 +624,28 @@ export async function delegateFederatedEgress(
       code: reserved.code,
       message: reserved.message,
     });
-    return failure(reserved.code, reserved.message, { peer: peer.peer_panel_id, intentId, leaseRef: null, compensated: true });
+    return failure(reserved.code, withMirrorFailure(reserved.message, failureMirror), {
+      peer: peer.peer_panel_id,
+      intentId,
+      leaseRef: null,
+      compensated: true,
+    });
   }
   const parsed = parseReserveResponse(reserved.body);
   if (!parsed.ok) {
     // 响应形状不认识 ⇒ 远端可能已经建了腿。**不猜**，标记 degraded 让对账重发同一 intent
     // （同键重投递在 host 侧返回首次结果，不会产生第二条腿）。
-    await mirrorFailure(d, {
+    const originalMessage = `reserve 响应无法解析：${parsed.message}`;
+    const failureMirror = await mirrorFailure(d, {
       peer: peer.peer_panel_id,
       forwardRef,
       intentId,
       tunnelId: request.tunnelId,
       revision: request.revision,
       code: "message_malformed",
-      message: `reserve 响应无法解析：${parsed.message}`,
+      message: originalMessage,
     });
-    return failure("message_malformed", `reserve 响应无法解析：${parsed.message}`, {
+    return failure("message_malformed", withMirrorFailure(originalMessage, failureMirror), {
       peer: peer.peer_panel_id,
       intentId,
       leaseRef: null,
@@ -622,21 +654,50 @@ export async function delegateFederatedEgress(
   }
   const lease = parsed.value;
 
-  await recordPlacementResult(
-    {
-      peer_panel_id: peer.peer_panel_id,
-      intent_id: intentId,
-      ok: true,
-      lease_ref: lease.lease_ref,
-      lease_epoch: lease.lease_epoch,
-      peer_node_ref: lease.node_ref,
-      peer_port: lease.port,
-      expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
-      remote_state: lease.state ?? "reserved",
-      applied_revision: lease.applied_revision,
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  );
+  try {
+    await recordPlacementResult(
+      {
+        peer_panel_id: peer.peer_panel_id,
+        intent_id: intentId,
+        ok: true,
+        lease_ref: lease.lease_ref,
+        lease_epoch: lease.lease_epoch,
+        peer_node_ref: lease.node_ref,
+        peer_port: lease.port,
+        expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
+        remote_state: lease.state ?? "reserved",
+        applied_revision: lease.applied_revision,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+  } catch (error) {
+    const ledgerMessage =
+      `远端 reserve 已成功，但本地 lease 镜像写入失败：${error instanceof Error ? error.message : String(error)}`;
+    const compensation = await releaseRemoteLease(
+      d,
+      peer,
+      lease.lease_ref,
+      intentId,
+      request.revision,
+    );
+    const failureMirror = await mirrorFailure(d, {
+      peer: peer.peer_panel_id,
+      forwardRef,
+      intentId,
+      tunnelId: request.tunnelId,
+      revision: request.revision,
+      code: "internal_error",
+      message: ledgerMessage,
+      leaseRef: lease.lease_ref,
+    });
+    return failure("internal_error", withMirrorFailure(ledgerMessage, failureMirror), {
+      peer: peer.peer_panel_id,
+      intentId,
+      leaseRef: lease.lease_ref,
+      compensated: compensation.ok,
+      compensationError: compensation.ok ? undefined : compensation.message,
+    });
+  }
 
   /* ---------------- 阶段 2：host 侧应用 ---------------- */
   // 远端已把本 revision 应用过（重放/重试）⇒ 不再重复下发，但仍要把 next_hop 交给调用方。
@@ -663,7 +724,7 @@ export async function delegateFederatedEgress(
 
     if (!applied.ok) {
       const compensation = await releaseRemoteLease(d, peer, lease.lease_ref, intentId, request.revision);
-      await mirrorFailure(d, {
+      const failureMirror = await mirrorFailure(d, {
         peer: peer.peer_panel_id,
         forwardRef,
         intentId,
@@ -673,7 +734,7 @@ export async function delegateFederatedEgress(
         message: applied.message,
         leaseRef: lease.lease_ref,
       });
-      return failure(applied.code, applied.message, {
+      return failure(applied.code, withMirrorFailure(applied.message, failureMirror), {
         peer: peer.peer_panel_id,
         intentId,
         leaseRef: lease.lease_ref,
@@ -687,17 +748,18 @@ export async function delegateFederatedEgress(
       // apply 的**响应**坏了，但命令很可能已经生效。按 §4.2「结果未知不当作失败」处理：
       // 保留租约与镜像（degraded），让对账按同一 (intent_id, revision) 重发；
       // 释放它才是错的 —— 那会把一条可能正在服务的链路拆掉。
-      await mirrorFailure(d, {
+      const originalMessage = `apply 响应无法解析：${applyParsed.message}`;
+      const failureMirror = await mirrorFailure(d, {
         peer: peer.peer_panel_id,
         forwardRef,
         intentId,
         tunnelId: request.tunnelId,
         revision: request.revision,
         code: "message_malformed",
-        message: `apply 响应无法解析：${applyParsed.message}`,
+        message: originalMessage,
         leaseRef: lease.lease_ref,
       });
-      return failure("message_malformed", `apply 响应无法解析：${applyParsed.message}`, {
+      return failure("message_malformed", withMirrorFailure(originalMessage, failureMirror), {
         peer: peer.peer_panel_id,
         intentId,
         leaseRef: lease.lease_ref,
@@ -709,21 +771,50 @@ export async function delegateFederatedEgress(
     port = applyParsed.port ?? port;
   }
 
-  await recordPlacementResult(
-    {
-      peer_panel_id: peer.peer_panel_id,
-      intent_id: intentId,
-      ok: true,
-      lease_ref: lease.lease_ref,
-      lease_epoch: lease.lease_epoch,
-      remote_state: "active",
-      applied_revision: appliedRevision,
-      peer_node_ref: lease.node_ref,
-      peer_port: port,
-      expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  );
+  try {
+    await recordPlacementResult(
+      {
+        peer_panel_id: peer.peer_panel_id,
+        intent_id: intentId,
+        ok: true,
+        lease_ref: lease.lease_ref,
+        lease_epoch: lease.lease_epoch,
+        remote_state: "active",
+        applied_revision: appliedRevision,
+        peer_node_ref: lease.node_ref,
+        peer_port: port,
+        expires_at: lease.expires_at ? new Date(lease.expires_at) : null,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+  } catch (error) {
+    const ledgerMessage =
+      `远端 apply 已成功，但本地 active 镜像写入失败：${error instanceof Error ? error.message : String(error)}`;
+    const compensation = await releaseRemoteLease(
+      d,
+      peer,
+      lease.lease_ref,
+      intentId,
+      request.revision,
+    );
+    const failureMirror = await mirrorFailure(d, {
+      peer: peer.peer_panel_id,
+      forwardRef,
+      intentId,
+      tunnelId: request.tunnelId,
+      revision: request.revision,
+      code: "internal_error",
+      message: ledgerMessage,
+      leaseRef: lease.lease_ref,
+    });
+    return failure("internal_error", withMirrorFailure(ledgerMessage, failureMirror), {
+      peer: peer.peer_panel_id,
+      intentId,
+      leaseRef: lease.lease_ref,
+      compensated: compensation.ok,
+      compensationError: compensation.ok ? undefined : compensation.message,
+    });
+  }
 
   return {
     ok: true,
@@ -756,30 +847,45 @@ async function mirrorFailure(
     message: string;
     leaseRef?: string | null;
   },
-): Promise<void> {
-  await upsertPlacement(
-    {
-      peer_panel_id: input.peer,
-      forward_ref: input.forwardRef,
-      intent_id: input.intentId,
-      hop_role: FEDERATED_EGRESS_HOP_ROLE,
-      desired_revision: input.revision,
-      tunnel_id: input.tunnelId,
-      ...(input.leaseRef === undefined ? {} : { lease_ref: input.leaseRef }),
-      state: "pending",
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
-  await recordPlacementResult(
-    {
-      peer_panel_id: input.peer,
-      intent_id: input.intentId,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const mirrored = await upsertPlacement(
+      {
+        peer_panel_id: input.peer,
+        forward_ref: input.forwardRef,
+        intent_id: input.intentId,
+        hop_role: FEDERATED_EGRESS_HOP_ROLE,
+        desired_revision: input.revision,
+        tunnel_id: input.tunnelId,
+        ...(input.leaseRef === undefined ? {} : { lease_ref: input.leaseRef }),
+        state: "pending",
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+    if (!mirrored.ok) {
+      return { ok: false, message: `写入 failure placement 失败：${mirrored.message}` };
+    }
+    await recordPlacementResult(
+      {
+        peer_panel_id: input.peer,
+        intent_id: input.intentId,
+        ok: false,
+        code: input.code,
+        message: input.message,
+      },
+      { db: d.db as never, sender: d.sender as never, now: d.now },
+    );
+    return { ok: true };
+  } catch (error) {
+    return {
       ok: false,
-      code: input.code,
-      message: input.message,
-    },
-    { db: d.db as never, sender: d.sender as never, now: d.now },
-  ).catch(() => undefined);
+      message: `写入 failure placement 异常：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function withMirrorFailure(message: string, mirrored: { ok: true } | { ok: false; message: string }): string {
+  return mirrored.ok ? message : `${message}；本地恢复账本缺失：${mirrored.message}`;
 }
 
 /* ================================================================== */
