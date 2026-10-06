@@ -75,14 +75,25 @@ interface SmtpReply {
 /**
  * 最小的 SMTP 客户端（隐式 TLS 465 / STARTTLS 587 / 明文）。
  * 内部用 socket + 行缓冲实现「读一条完整应答」，不做并发管线化——事务邮件一对一发，够用且更易读。
+ *
+ * **导出只为让测试能驱动真实会话**（含"没有问候语时怎么办"这种必须用短超时才能验的路径）；
+ * 生产路径只用 `sendMail()`。
  */
-class SmtpClient {
+export class SmtpClient {
   private socket: net.Socket | tls.TLSSocket | null = null;
   private buffer = "";
   private pending: SmtpReply[] = [];
   private waiter: ((reply: SmtpReply) => void) | null = null;
 
-  constructor(private readonly host: string, private readonly port: number) {}
+  constructor(
+    private readonly host: string,
+    private readonly port: number,
+    /**
+     * 单条应答的等待上限（默认 15s）。可注入**只为测试**：验证"服务器不说话 ⇒ 失败而不是
+     * 假装成功"这条路径时不应该真的等 15 秒。
+     */
+    private readonly options: { replyTimeoutMs?: number } = {},
+  ) {}
 
   async connect(): Promise<void> {
     // 465（implicit TLS）与显式配置 secure 的端口先建 TLS；其余明文 + 后续 STARTTLS。
@@ -104,6 +115,27 @@ class SmtpClient {
     this.socket.on("error", () => {
       /* 应答读取期错误由 readReply 的 socket error 或超时兜底 */
     });
+    await this.readGreeting();
+  }
+
+  /**
+   * 读掉**服务器问候语**（RFC 5321 §4.2 的 `220`）。
+   *
+   * ── 为什么必须显式读这一条（这是一个真实事故）──
+   * 之前的实现在 `connect()` 之后直接发 `EHLO`，从不读问候语。问候语会被 `onData` 解析成
+   * 一条应答放进 `pending`，于是**第一条命令**读到的就是那条 `220` ⇒ `EHLO` 判定为
+   * "返回 220" ⇒ 每一次投递都以 `smtp_error` 失败（真机复现：假 SMTP 一发 `220 … ready`
+   * 就失败，**只去掉问候语**立刻成功）。这不是竞态：Node 流会把监听器挂上之前到达的数据
+   * 缓冲下来，所以凡是按 RFC 说话的 SMTP 服务器都会踩到。
+   *
+   * 问候语不是 220（例如 `554 go away`，或服务器根本不是 SMTP）⇒ 抛错，**一条命令都不发**：
+   * 邮件是旁路，但"静默地把失败当成功"不是旁路，那是谎。
+   */
+  private async readGreeting(): Promise<void> {
+    const greeting = await this.readReply();
+    if (greeting.code !== 220) {
+      throw new Error(`SMTP 问候语异常（期望 220，实际 ${greeting.code}）：${greeting.text}`);
+    }
   }
 
   private onData(chunk: Buffer): void {
@@ -154,15 +186,19 @@ class SmtpClient {
       const timer = setTimeout(() => {
         this.waiter = null;
         reject(new Error("SMTP 应答超时"));
-      }, 15_000);
-      this.waiter = (reply) => {
-        clearTimeout(timer);
-        resolve(reply);
-      };
-      this.socket?.once("error", (e: Error) => {
+      }, this.options.replyTimeoutMs ?? 15_000);
+      const onError = (e: Error): void => {
         clearTimeout(timer);
         reject(new Error(`SMTP socket 错误：${e.message}`));
-      });
+      };
+      // 成功路径也要摘掉这个监听器：`readReply` 每条命令调用一次，`once` 只在**出错**时自动摘除，
+      // 于是长会话里监听器会一路累积（真实会话测试里直接打出了 MaxListenersExceededWarning）。
+      this.waiter = (reply) => {
+        clearTimeout(timer);
+        this.socket?.removeListener("error", onError);
+        resolve(reply);
+      };
+      this.socket?.once("error", onError);
     });
   }
 
