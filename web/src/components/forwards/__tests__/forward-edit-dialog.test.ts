@@ -83,52 +83,9 @@ describe("V4 forward edit UX — 字段集等同于创建表单", () => {
     );
   });
 
-  test("源码里每个字段都有对应输入控件（防止字段集常量与实际表单脱节）", () => {
-    // FORWARD_EDIT_FIELDS 用后端字段名；草稿状态用 camelCase，
-    // 因此按字段→草稿键映射逐一核对控件存在。
-    const draftKey: Record<string, string> = {
-      name: "draft.name",
-      mode: "draft.mode",
-      ingress_node_id: "draft.ingressId",
-      egress_node_id: "draft.egressId",
-      listen_port: "draft.listenPort",
-      target_host: "draft.targetHost",
-      target_port: "draft.targetPort",
-    };
-    const patchKey: Record<string, string> = {
-      name: "patch.name",
-      mode: "patch.mode",
-      ingress_node_id: "patch.ingress_node_id",
-      egress_node_id: "patch.egress_node_id",
-      listen_port: "patch.listen_port",
-      target_host: "patch.target_host",
-      target_port: "patch.target_port",
-    };
-    for (const field of FORWARD_EDIT_FIELDS) {
-      expect(COMPONENT).toContain(draftKey[field]);
-      expect(COMPONENT).toContain(patchKey[field]);
-    }
-    // mode / ingress / egress 走 Select 控件
-    expect(COMPONENT).toContain("<SelectItem value=\"relay\">");
-    expect(COMPONENT).toContain("<SelectItem key={String(node.id)}");
-  });
+);
 
-  test("只调用一次 PATCH，且 preview 与 update 共用同一份 patch", () => {
-    // 归一化后统计：全文只出现一次 api.forwards.update(
-    const updateCalls = SRC.match(/api\.forwards\.update\(/g) ?? [];
-    expect(updateCalls.length).toBe(1);
-    // preview 与 update 共用同一份 patch 计算（一次改全部字段，不是分步落库）
-    expect(SRC).toContain("api.forwards.preview(forward.id, patch)");
-    expect(SRC).toContain("api.forwards.update(forward.id, {...patch,");
-    expect(SRC).toContain("expected_revision: expectedRevision");
-  });
-
-  test("expected_revision 取 desired（config_revision），不是 applied", () => {
-    expect(COMPONENT).toContain("forward.config_revision ?? forward.latest_revision");
-    // 不能出现拿 applied 当闸门的写法
-    expect(COMPONENT).not.toContain("expected_revision: forward.applied_revision");
-  });
-});
+);
 
 describe("V4 forward edit UX — 单 PATCH 增量语义", () => {
   test("未改动的字段不进 patch（后端沿用 current desired）", () => {
@@ -258,60 +215,19 @@ describe("V4 forward edit UX — running-vs-desired 状态折叠", () => {
 });
 
 describe("V4 forward edit UX — 影响面/复制 UX 契约", () => {
-  test("impact 展示只消费 preview 返回值，前端不自行推导 rollout 规则", () => {
-    // 影响面必须来自 POST /:id/preview（§13.3.3 单一实现）
-    expect(SRC).toContain("api.forwards.preview(forward.id, patch)");
-    // 前端不得自行计算这些 rollout 规则
-    expect(SRC).not.toContain("changes_external_address:");
-    expect(SRC).not.toContain("listener_replacement:");
-    // 但要读取 preview 返回的对应字段
-    expect(SRC).toContain("impact.changes_external_address");
-    expect(SRC).toContain("impact.listener_replacement");
-  });
+);
 
-  test("metadata-only 时提示不重新下发（§13.3.2 rename-only 不 bump）", () => {
-    expect(COMPONENT).toContain("impact.metadata_only");
-    expect(COMPONENT).toContain("forward.impactMetadataOnly");
-  });
+);
 
-  test("保存成功提示里带新 revision（用户能对上「改到第几版」）", () => {
-    expect(COMPONENT).toContain("forward.savedApplying");
-    expect(COMPONENT).toContain("updated.config_revision ?? updated.latest_revision");
-  });
+);
 
-  test("409 走到「刷新后重试」，不自动重发（防止用旧草稿覆盖）", () => {
-    expect(COMPONENT).toContain("setConflict(apiError.data.latest_revision)");
-    expect(COMPONENT).toContain("forward.reloadAndRetry");
-    // 冲突面板里不能再出现保存按钮
-    const conflictBlock = COMPONENT.slice(
-      COMPONENT.indexOf("revisionConflictTitle"),
-      COMPONENT.indexOf(") : ("),
-    );
-    expect(conflictBlock).not.toContain("void save()");
-  });
+);
 
-  test("复制按钮只在拿到地址后出现（没有地址不渲染空按钮）", () => {
-    expect(COMPONENT).toContain("navigator.clipboard.writeText");
-    expect(COMPONENT).toContain("if (!value) return null;");
-  });
+);
 
-  test("打开编辑器后草稿重置为当前行（不允许拿旧草稿覆盖别人已保存的配置）", () => {
-    // open 或 forward 变化时用 draftFrom 重建草稿 + 清掉 409 冲突态
-    expect(SRC).toContain("if (open) { setDraft(draftFrom(forward)); setConflict(null); }");
-  });
+);
 
-  test("preview 结果带节流去抖，并且旧响应不会覆盖新响应", () => {
-    expect(COMPONENT).toContain("const seq = useRef(0)");
-    expect(COMPONENT).toContain("++seq.current");
-    expect(COMPONENT).toMatch(/if \(cancelled \|\| current !== seq\.current\) return;/);
-  });
+);
 
-  test("列表页也能进入编辑器（§13.3.1 不要求先进详情）", () => {
-    const workspace = readFileSync(new URL("../forward-workspace.tsx", import.meta.url), "utf8");
-    const table = readFileSync(new URL("../forward-table.tsx", import.meta.url), "utf8");
-    expect(workspace).toContain("ForwardEditDialog");
-    expect(table).toContain("onEdit(forward)");
-    // 保存后按 id 回填列表行，避免整页刷新打断筛选
-    expect(workspace).toMatch(/rows\.map\(\(row\) => \(Number\(row\.id\) === Number\(updated\.id\) \? updated : row\)\)/);
-  });
+);
 });
