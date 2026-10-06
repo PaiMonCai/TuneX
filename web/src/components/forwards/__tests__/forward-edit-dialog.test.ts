@@ -12,7 +12,6 @@
  *     必须来自 config_revision（desired 指针），不能来自 applied_revision。
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import {
   FORWARD_EDIT_FIELDS,
   draftFormErrors,
@@ -22,16 +21,6 @@ import {
 import { getDictionary, makeT } from "@/lib/i18n";
 import type { PortForward } from "@/lib/types";
 
-const COMPONENT = readFileSync(
-  new URL("../forward-edit-dialog.tsx", import.meta.url),
-  "utf8",
-);
-
-/**
- * 归一化源码：折叠空白 + 去掉点号周围的空格，让调用点断言不受 prettier
- * 折行影响（`api.forwards\n  .preview(...)` → `api.forwards.preview(...)`）。
- */
-const SRC = COMPONENT.replace(/\s+/g, " ").replace(/\s*\.\s*/g, ".");
 
 /** mock 种子：/forwards/1 是 DIRECT active，revision 4 / applied 4。 */
 const base: PortForward = {
