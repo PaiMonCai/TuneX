@@ -266,6 +266,44 @@ E1 的剩余风险（如实记录，未修）：心跳写入仍 fail-soft（DB �
 
 把 `forward-detail.tsx` 单独抽成集成任务的用意：DDNS 切片与链路切片都想改它，这正是先前并行双写产生冲突的同型问题；现在两个组件任务都被要求**不碰**该文件，冲突点在任务板层面被消解。
 
+## 3.8 E2 独立复核结论（本轮最重要的质量输入）
+
+被复核的 9 个文件 sha256 全程未变；E2 重跑门禁：backend `bun test src` **2820 pass / 0 fail**、`tsc` 0；web `bun test src` **783 pass / 0 fail**、`tsc` 0。
+
+### 被推翻 / 需要纠正的声明（记录下来，避免继续传播）
+
+| 编号 | 结论 | 影响 |
+|---|---|---|
+| **F1 (P1)** | D2 的「身份校验通过」**可被一个未鉴权的 200 骗过**：`node-upgrade.ts:314-321` 的 wget 分支取**最后一个**状态码，而 wget 默认跟随重定向 ⇒ 假面板 `302 → /login(200)` 就得到 `VERIFIED=yes`（curl 分支无 `-L` 则给 302→"未校验"，两分支语义相反） | 我此前"不可能在没有 HTTP 200 时说通过"的结论**只在我测过的场景成立**（真 Panel 200 + 无地址），重定向场景没测 → 已派 `task-5` 修（禁跟随重定向 **且** 要求响应体像 Panel JSON） |
+| **F2** | 「90s 窗口只有一处定义」**全局不成立**：`reconciler.ts:53`、`target-health-thresholds.ts:113`、`scheduler-support.ts:293` 各自写字面量，web 侧另 3 处；只有一处测试断言了其中一对 | E1 自身"两个写入方向共用同一常量"**成立**，但§3.2 那句话不应被读成"全局单一真相" |
+| **F3 (P2)** | D3 的 `rangeConflict`（`node-groups.ts:287-292`）在 `checkNodeCreation` 之前返回 ⇒ 无策略空间里给无区间组加节点得 409「请新建带区间的组」，而同空间建组是 403 —— **把用户指向死路** | 已派 `task-5`：能力拒绝应优先于可修复状态 |
+
+### 已确认成立（可计入验收证据）
+
+E1：①未认证写回 `active` **不成立**（全仓写点枚举 + 真实 HTTP：无/错凭据 401、admin 路由未认证 401、普通用户 403，status 全程不变）②撤销/封禁 401 且不写 status ③只写 `last_seen_at`+`status` 两列，lifecycle/port_range/role/lease 计数不变 ④并发抖动未复现（40 轮上报×清扫 inconsistent=0/flap=0，89.998s 边界不翻）；真实 MySQL/Redis 11 项全绿。
+D2：②当前版本**不发空 Bearer**（无/空凭据时根本不发请求），并实测证实旧写法在 `docker exec` 下确实是空变量（`auth_len=7`）；③四类场景（无 curl/wget、agent.env 缺失、不可达/超时、非 200）全部落"未校验"；④只有 401/403 回滚；⑤busybox ash 实测 `. /nope` 直接退出 rc=2，`[ -r ]` 守卫有效。
+D3：零副作用成立；既有 `groupConflict/roleConflict/runtimeEdit/400` 仍按序生效。
+I1：轮询 single-flight / 独立 deadline（`loadView` 永久挂起也超时）/ dispose 不复活 / stop→start 不死锁 成立；unknown 不渲染成已连接（真实组件 SSR × 9 档）；D1「一个称呼」同源成立。**观察项 F4**：`onView` 在 try 内，消费者抛错被当成取数失败并**跳过闭环判定** → 已派 `task-5`。
+敏感信息：localStorage/sessionStorage/URL/console/SSR payload/mock 日志 —— **静态成立，运行时未验证**。
+
+### 未验证（不得写成通过）
+
+真实浏览器里驱动整条用户路径（E2 的 harness 只完成静态挂载）；组件层 `catch/finally` 的运行时丢弃；真实 30s 节奏下的长时抖动；web `build`（E2 未跑）。
+
+### 新增缺陷任务
+
+`task-5`（F1 身份校验可被未鉴权 200 骗过 + F3 能力拒绝被遮蔽 + F4 轮询吞异常 + F6 mock 同名语义，已派 `backend-truth`）、`task-6`（F5 Agent 心跳 `/api/internal/heartbeat` 后端无路由、每 30s 404，待派）。
+
+## 3.9 环境事件与验证夹具（必须记录）
+
+1. **容器名冲突导致环境中断**：另一个代理自建一次性 scratch 栈时用了与我同一套 `tunex-it-*` 容器名，其清理动作删除了我的 `tunex-it-mysql` 与 `tunex-it-redis`（panel/worker/4 台 Agent 存活，API 表面 200 但登录阻塞）。数据卷 `tunex_it_mysql_data` 存活 → 用同一 compose `up -d mysql redis` 恢复，**数据完好**（3 用户 / 8 节点 / 7 组 / 3 转发）。**规则**：任何一次性 scratch 栈必须使用唯一容器名与网络名（或直接复用 Lead 的 scratch 栈），禁止覆盖既有 `tunex-it-*` 名。
+2. **管理端真机验证夹具**：为在真实后端上验证管理端（否则只能读码断言），在 scratch 库给测试用户 `tunex-it-e2e@tunex.local` 置 `super_admin=1`（**仅限该一次性测试库**，与仓库 `setup.sh` 抬高团队额度同类）。借此取得真机证据：`/api/admin/node/1/detail` → **200**、`/api/admin/nodes/1`（web 现用复数）→ **404**、`/api/admin/node/1/pools` → 200、`/api/admin/nodes/1/pools`（web 复数）→ **404** → 见 `task-4`。
+
+## 3.10 团队形态（生效中）
+
+3 名持久队友（均可 `send_message` 中途纠偏、可观测状态）：`web-ddns`（task-1 DDNS Web）、`web-forward`（task-2 Forward 链路 + F11 换源）、`backend-truth`（task-5 E2 缺陷修复）。
+Lead 负责：`task-3`（把两块自包含组件挂进 `forward-detail.tsx` 的**独占写点** + 最终门禁/浏览器验收）、`task-4`（管理端 API 契约对齐，已有真机证据）、`task-6`（F5 心跳死端点）与最终提交。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
