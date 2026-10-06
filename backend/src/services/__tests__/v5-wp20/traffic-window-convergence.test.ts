@@ -25,7 +25,7 @@ import {
 } from "../../billing-time.ts";
 import { composeEffectivePolicy, trafficWindowStart, type PolicyRecord } from "../../capability-policy.ts";
 import { dayKeyOf, fillDays } from "../../traffic.ts";
-import { trafficDate } from "../../traffic-archive.ts";
+import { trafficDate, trafficDayKey } from "../../traffic-archive.ts";
 import { sumFederatedUnattributedTraffic, type FederatedUsageClient } from "../../policy-service.ts";
 
 /** 覆盖日界、月界、跨年、闰年、以及「UTC 日 ≠ 上海日」的临界点。 */
@@ -78,6 +78,13 @@ describe("B. 图表日键 = 归档日标签（读入口径与写入口径逐字�
     for (const instant of GRID) {
       const at = new Date(instant);
       expect({ instant, key: dayKeyOf(at) }).toEqual({ instant, key: billingPeriodKey(at, "day") });
+    }
+  });
+
+  test("归档写入口 trafficDayKey 同样使用固定计费时区，不依赖进程 TZ", () => {
+    for (const instant of GRID) {
+      const at = new Date(instant);
+      expect({ instant, key: trafficDayKey(at) }).toEqual({ instant, key: billingPeriodKey(at, "day") });
     }
   });
 
