@@ -1,8 +1,8 @@
 /**
- * V5-WP13.5B —— Route Profile 编译器（**纯函数**）。
+ * Route Profile 编译器（**纯函数**）。
  *
  * 契约：`docs/v5-wp13-5b-route-profile-contract.md`（FROZEN），
- * 上游定义：`DEVELOPMENT.md` §9.4.2–§9.4.6。
+ * 上游定义：Route Profile 运行契约。
  *
  * 本模块只做一件事：把「模板 selector」解析成「具体节点事实」，然后**原样交给**
  * `services/forward-route.ts` 的 `buildRoutePlan` / `admitRoute` / `routeSteps`。
@@ -13,7 +13,7 @@
  *   · 不在运行期重抽随机候选 —— 随机只在编译这一刻抽一次，结果立刻被冻结进
  *     ForwardRevision 快照（§9.4.3：运行时必须用确定的具体节点事实）。
  *
- * 纯函数的第二个理由是可测：`DEVELOPMENT.md` §3.6 要求 selector 解析（fixed node /
+ * 纯函数的第二个理由是可测：Route Profile 测试契约 要求 selector 解析（fixed node /
  * node group / 缺候选 / 多候选策略边界）、transit 顺序、非法组合 fail-closed 都能
  * 离线断言，不需要 MySQL / Redis / Agent。
  */
