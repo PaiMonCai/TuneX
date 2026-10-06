@@ -50,11 +50,6 @@ jobs:
       DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_ci # secret-scan:allow (CI-only fixture, not a real secret)
       REDIS_URL: redis://127.0.0.1:6379
       AUTH_SECRET: ci-only-auth-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
-      LICENSE_SECRET: ci-only-license-secret-must-not-be-used-in-production # secret-scan:allow (CI-only fixture, not a real secret)
-      # Per-install Fernet keys: src/env.ts fails fast at startup unless both are
-      # present and valid 32-byte base64url keys. CI-only values, never deployed.
-      TUNEX_CONFIG_KEY: Y2ktb25seS1jb25maWcta2V5LW11c3Qtbm90LXByb2Q= # secret-scan:allow (CI-only fixture, not a real secret)
-      TUNEX_LICENSE_KEY: Y2ktb25seS1saWNlbnNlLWtleS1tdXN0LW5vdC1wcm8= # secret-scan:allow (CI-only fixture, not a real secret)
       PAYMENTS_ENABLED: "false"
     defaults:
       run:
@@ -73,12 +68,15 @@ jobs:
         run: |
           bunx prisma generate
           bunx tsc --noEmit
-      # Run every TypeScript unit suite under src/. package.json has a distinct
-      # test:unit entry so adding a new v3 service test cannot silently miss CI.
-      - name: Backend unit tests (all src suites)
+      # Fast merge gate: behavior-focused unit/contract tests under src/.
+      # These must not require MySQL/Redis topology and must not pin implementation text.
+      - name: Backend unit and contract tests
         run: bun run test:unit
-      - name: Authorization and payment HTTP tests
-        run: bun run test
+      # Real persistence/HTTP semantics live in tests/*.test.mjs. Keep them in a
+      # separate named layer so failures identify integration drift instead of
+      # looking like unit regressions.
+      - name: Backend database and HTTP integration tests
+        run: bun run test:integration
         env:
           TUNEX_DB_TEST: "1"
           ALLOW_REGISTER_FALLBACK: "true"
