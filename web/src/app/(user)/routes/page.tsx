@@ -93,8 +93,8 @@ async function AvailableRoutesBody({ locale }: { locale: Locale }) {
             </p>
             <p className="mt-2 text-xs" data-testid="route-next-step">
               {zh
-                ? "下一步：在创建转发时选择合适的线路。目前还不支持从线路直接创建转发，如需调整请联系管理员。"
-                : "Next: pick a route when creating a forward. Creating a forward from a route is not supported yet; contact your admin to adjust."}
+                ? "线路由管理员编排，并作用在已经存在的转发上；创建转发时不需要（也无法）选择线路。某一转发需要换线路时请联系管理员。"
+                : "Routes are orchestrated by an admin and applied to forwards that already exist — you neither need nor can pick a route while creating a forward. Ask your admin if a forward should move to a different route."}
             </p>
           </CardContent>
         </Card>

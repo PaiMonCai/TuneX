@@ -420,6 +420,30 @@ Lead 负责：task-3 挂载集成（已完成三块卡片）、task-4 收尾、�
 ### 在途
 `web-forward`（task-9 线路预览）、`backend-truth`（task-8 DDNS 写入路径解耦）、`notify-center`（task-10 渠道配置端点）。Lead 负责集成、门禁与提交。
 
+## 3.17 Round 24：并行铺开（用户要求加速）
+
+### 团队（7 名持久队友 + Lead）
+| 队友 | 在飞 | 队列 |
+|---|---|---|
+| `web-ddns` | — | `task-19` 多跳接线（**blocked_by task-9**，等待期做只读准备） |
+| `web-forward` | `task-9` 线路预览 | — |
+| `backend-truth` | `task-8` DDNS 写入路径解耦 | `task-15` F1 残留（凭据可被 3xx 带出容器） |
+| `notify-center` | `task-10` 渠道配置端点 | `task-12` 用户偏好 → `task-11`（blocked_by task-8）→ `task-13`（blocked_by task-10）→ `task-14` |
+| **`ha-ui`**（新） | **`task-16`** 高可用/多入口读投影 + 自包含卡片 | — |
+| **`upgrade-ux`**（新） | **`task-17`** Agent 升级的用户侧完整流程 | — |
+| **`misc-truth`**（新） | **`task-18`** persona 路由 + 受控错误页 + admin 403≠空 + 概念残留 + 两处小缺陷 | — |
+| Lead | 集成挂载（task-3 三块卡片已完成）、门禁、真实浏览器验收、统一提交 | `task-4` 已 complete |
+
+### 本轮的两个上游动作
+1. **`task-15` 建单并实证**：镜像内 busybox wget v1.37 **不支持 `--max-redirect`**（`wget --help` 只有 `-cqS/--spider/-O/-o/--header/-U`）⇒ 面板返回 3xx 指向别的主机时，探针会**把节点长期凭据重发过去**。E2 修掉的是"假通过"，这一条是**凭据外发**，性质不同 → 指派 `backend-truth`。
+2. **routes 页文案的自相矛盾**（R4-B 的 G3）：原文案先说"下一步：在创建转发时选择合适的线路"、又说"目前还不支持从线路直接创建转发"——**第一句承诺了契约上不存在的操作**。已改为一句真话（"线路由管理员编排并作用于**已经存在**的转发；创建转发时不需要也无法选择线路"），并把钉住旧文案的源码断言改为断言真话。`tsc` 0 错、该套件 28 pass / 0 fail。
+
+### 并行时的写点纪律（已写进各任务描述）
+- `lib/api/forwards.ts` / `mocks/handlers/forwards.ts` 由 `task-9` 独占 ⇒ `task-16` 用**独立模块** `lib/api/forward-ha.ts`；`task-17` 用 `lib/api/node-upgrade.ts`；`task-19` **blocked_by task-9**。
+- `worker.ts` 由 `task-8` 与 `task-11` 共享 ⇒ `task-11` blocked_by task-8。
+- `forward-detail.tsx` 是 **Lead 独占挂载点**；所有卡片任务都要求"自包含、不碰它"。
+- `lib/i18n/dictionaries.ts` 暂无人改，仍建议各切片用独立 `*-i18n.ts` 模块。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
