@@ -44,11 +44,20 @@ jobs:
         run: |
           set -euo pipefail
           docker cp scripts/integration/federation-sign.ts tunex-it-panel:/tmp/federation-sign.ts
+          docker exec -w /app tunex-it-panel bun -e \
+            'const { ensurePanelIdentity } = await import("./src/services/federation/identity.ts"); await ensurePanelIdentity();'
+          set +e
           material="$(docker exec -e TUNEX_SRC_DIR=/app/src -w /app tunex-it-panel bun /tmp/federation-sign.ts \
             --url http://panel:3000 \
             --method POST \
             --path /api/federation/v1/leases \
-            --body '{}')"
+            --body '{}' 2>&1)"
+          rc=$?
+          set -e
+          if [[ "$rc" -ne 0 ]]; then
+            printf '%s\n' "$material"
+            exit "$rc"
+          fi
           MATERIAL="$material" python3 - <<'PY'
           import json
           import os
