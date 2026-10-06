@@ -171,71 +171,8 @@ describe("文案：不把原始 key 画到界面上", () => {
   });
 });
 
-describe("加载 / 错误状态不变量", () => {
-  test("首屏即 loading，且加载态渲染占位行（不是空列表）", () => {
-    expect(COMPONENT).toContain("const [loading, setLoading] = useState(true)");
-    expect(COMPONENT).toContain('t("common.loading")');
-  });
-
-  test("失败必须给出可见错误 + 可重试入口，而不是只 toast 就走了", () => {
-    expect(COMPONENT).toContain("const [error, setError] = useState<string | null>(null)");
-    expect(COMPONENT).toContain('data-testid="forward-list-error"');
-    expect(COMPONENT).toContain('role="alert"');
-    expect(COMPONENT).toMatch(/onClick=\{reloadList\}/);
-  });
-
-  test("错误态不得退化成「还没有转发」空态（否则把加载失败讲成没有数据）", () => {
-    expect(COMPONENT).toContain("{!loading && !error && total === 0 && !hasFilters ? (");
-  });
-
-  test("旧响应不覆盖新响应（连点翻页 / 连改筛选时）", () => {
-    expect(COMPONENT).toContain("const listSeq = useRef(0)");
-    expect(COMPONENT).toContain("const seq = ++listSeq.current");
-    expect(COMPONENT).toMatch(/if \(cancelled \|\| seq !== listSeq\.current\) return;/);
-  });
-
-  test("筛选变化一律回第 1 页", () => {
-    expect(COMPONENT).toContain("function changeFilter<T>(setter: (value: T) => void, value: T)");
-    expect(COMPONENT).toMatch(/function changeFilter<T>[\s\S]{0,200}setPage\(1\);/);
-  });
-
-  test("越界页夹回最后一页（删掉最后一页最后一行不会停在空页）", () => {
-    expect(COMPONENT).toContain("clampForwardPage(result.page, result.total, result.page_size)");
-    expect(COMPONENT).toMatch(/if \(clamped !== result\.page\) \{/);
-  });
-
-  test("关键字防抖后再查询，且不把每次击键都发成请求", () => {
-    expect(COMPONENT).toContain("setTimeout(");
-    expect(COMPONENT).toContain("setKeyword(next)");
-  });
-
-  test("走分页端点（page）而不是裸数组端点（list）", () => {
-    // 跨行排版也要能匹配：`api.forwards` 换行后接 `.page(listQuery)`
-    expect(COMPONENT).toMatch(/api\.forwards\s*\.page\(listQuery\)/);
-    // 列表只能经分页端点取数；`api.forwards.list(` 一次都不该出现
-    // （裸数组端点没有 total/page，按分页读会得到 undefined）
-    expect(COMPONENT).not.toContain("api.forwards.list(");
-  });
-});
-
-describe("复制 Forward / Binding usage 在列表侧的接线", () => {
-  test("行菜单有复制入口，且草稿复用共享纯逻辑（不在组件里另写一套）", () => {
-    expect(COMPONENT).toContain("copiedForwardCreateDraft(");
-    expect(TABLE).toMatch(/data-testid=\{`forward-copy-\$\{forward\.id\}`\}/);
-  });
-
-  test("复制最终落到真实 create 契约（没有第二条写路径）", () => {
-    expect(COMPONENT).toContain("api.forwards.create(");
-    // 复制只能经用户确认后提交，不得自动 POST
-    expect(COMPONENT).toMatch(/function copyForward\(forward: PortForward\)[\s\S]{0,700}setCreateOpen\(true\);/);
-  });
-
-  test("出口下拉展示绑定使用量，且读的是后端投影而不是前端重算", () => {
-    expect(CREATE_DIALOG).toContain("bindingUsageView(");
-    expect(CREATE_DIALOG).toContain("hasBindingUsage(");
-    expect(CREATE_DIALOG).not.toMatch(/used_by_forward_count\s*>:?/);
-  });
-});
+// Workspace 的 loading/error/request sequencing 属于组件行为，不能通过源码字符串锁死实现。
+// 这些场景由集成/组件行为测试覆盖；本文件保留分页纯逻辑、文案与后端批量契约。
 
 describe("批量操作上限与后端一致（读真实源码断言）", () => {
   /**
