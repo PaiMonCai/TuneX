@@ -25,11 +25,13 @@ describe("Forward request contracts", () => {
     expect(ForwardPatchSchema.safeParse({ protocol: "udp" }).success).toBe(false);
   });
 
-  test("expected_revision remains optional, nullable and non-negative", () => {
+  test("expected_revision remains optional, nullable and non-negative when paired with an edit", () => {
     expect(ForwardPatchSchema.safeParse({ name: "x" }).success).toBe(true);
-    expect(ForwardPatchSchema.safeParse({ expected_revision: null }).success).toBe(true);
-    expect(ForwardPatchSchema.safeParse({ expected_revision: 0 }).success).toBe(true);
-    expect(ForwardPatchSchema.safeParse({ expected_revision: -1 }).success).toBe(false);
+    expect(ForwardPatchSchema.safeParse({ name: "x", expected_revision: null }).success).toBe(true);
+    expect(ForwardPatchSchema.safeParse({ name: "x", expected_revision: 0 }).success).toBe(true);
+    expect(ForwardPatchSchema.safeParse({ name: "x", expected_revision: -1 }).success).toBe(false);
+    // A concurrency token by itself is not a mutation.
+    expect(ForwardPatchSchema.safeParse({ expected_revision: 1 }).success).toBe(false);
   });
 
   test("create and patch agree on TLS path shape", () => {
