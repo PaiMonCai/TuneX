@@ -1255,6 +1255,26 @@ RUN chmod -R a+rX /app/src /app/prisma
 - **可行做法**（本次采用）：配置走**命名卷**，用 `docker create` + `docker cp` 把 env 文件写进卷（`docker cp` 走 API，不经文件系统视图）。
 - 这也解释了 `web-ddns` 早前报的那条"沙箱看不到宿主 `/tmp` 直接路径"——他当时判为"沙箱 artifact"，**判对了**。
 
+## 3.58 Round 57：#6 的"真实公网端点"取证 —— Telegram 已验，**SMTP 撞出一条 P1**
+
+### 已达成的部分（真实外部端点，无需凭据）
+| 项 | 真实结果 |
+|---|---|
+| **Telegram 出站** | 假 token 打真实 `api.telegram.org` ⇒ **HTTP 401** + 真实响应体 `{"ok":false,"error_code":401,"description":"Unauthorized: invalid token specified"}` ⇒ **请求真的到达真实端点、失败如实**（不是伪造 sent） |
+| **网络与 Node 原语** | `openssl s_client -connect smtp.gmail.com:587 -starttls smtp` 与 `:465` 均 `CONNECTION ESTABLISHED / TLSv1.3 / Verification: OK`；裸 `net.connect` 立刻收到 `220 …` 与 `250-…` |
+
+### ★ 撞出的 **P1**：`SmtpClient` 对**真实 MTA** 全部超时 ⇒ `task-48`
+- **现象**：`new SmtpClient("smtp.gmail.com", 587, {…, secure:false}).send(…)` ⇒ 15s 后 `SMTP 应答超时`；**587 明文 / 587 STARTTLS / 465 隐式 TLS 三种全部超时**。
+- **本地可复现**：只要假 SMTP 的 **EHLO 应答是多行**（`250-fake\r\n250-SIZE …\r\n250 AUTH LOGIN PLAIN\r\n`，与 Gmail/Postfix/Exchange 同形）即超时 ⇒ **现有测试没拦住，正是因为测试里的假 SMTP 只回单行应答**。
+- **插桩得到的最强线索**：问候语**读到了** → 客户端**发出 `EHLO tunex.local`** → **对端 `on("data")` 一次都没触发** ⇒ 15s 超时。怀疑 `write()` 的 `this.socket?.write(...)`：**socket 为空时被可选链静默吞掉**（不发也不报错）。
+- **顺带排除/待确认**：本沙箱**无 IPv6 出网**（`curl -6`=000），而 `dns.lookup("smtp.gmail.com",{all:true})` **同时返回 A 与 AAAA**；TCP 连接本身是秒连（29ms）⇒ v6 不是**连接**层的因，但**是否影响后续读取仍需排除**。
+- **为何这条特别重要**：`task-36/41/45` 的端到端投递证据**全部来自自建假 SMTP**（只回单行）。若这是真缺陷，则"**邮件在真实世界发不出去**"——与上一处 P1（不读 220 问候语）同族，**都是假服务器没能模拟真实 MTA 的行为**。已派 `task-48`（`backend-truth`），要求：定根因 → 修 → **补"多行 EHLO/续行"会话测试（反向变异要红）** → **真机验证到"TLS 握手成功 + AUTH 被真实拒绝并如实失败"**。
+
+### 环境事实（本轮新增，写进状态文件以免重复踩）
+**docker daemon 的文件系统视图 ≠ 本沙箱视图**：宿主 `/tmp/…/agent.env` 是 regular file，而容器内同一路径是 **directory**；连 `alpine` 助手容器也看不到我的 `/tmp`。
+- **可行做法**：配置走**命名卷** + `docker create` / `docker cp` 写入（`docker cp` 走 API，不经文件系统视图）。
+- **更正**：Round 56 我判断"另一个 DSH 会话把 `/etc/tunex-agent/agent.env` 写回去了"——**归因错误**；真因是 daemon 看到的是**它自己那边的**同名路径。这也解释并印证了 `web-ddns` 早前那条"沙箱看不到宿主 `/tmp`"（他判对了）。
+
 ## 4. Capability Map## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。
