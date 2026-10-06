@@ -13,12 +13,63 @@ import {
   type NodeRuntimeText,
   type NodeRuntimeUnavailableReason,
 } from "@/lib/node-runtime-state";
+import type { Locale } from "@/lib/i18n";
 import type { NodeStateReport } from "@/lib/types";
 
 function formatPorts(ports: number[] | null | undefined): string {
   if (!ports || ports.length === 0) return "-";
   const sorted = [...ports].sort((a, b) => a - b);
   return sorted.join(", ");
+}
+
+/**
+ * 本面板新增事实行的文案（面板侧角色 / 角色一致性 / 快照新鲜度）。
+ *
+ * 为什么在组件内而不是 `lib/i18n/dictionaries.ts`：本任务的写入范围**不含**字典
+ * （那是多人共写的单一对象字面量，并发改它必然冲突）。词条按**事实**建表，漏一个
+ * 状态是编译错误；集成时可整体搬进字典，不需要改这里的结构。
+ *
+ * 话术纪律：`stale` 只说"这一格事实多久没更新"，**不出现**"离线 / 异常 / 正常"——
+ * 一台在线但 5 分钟没上报的节点会同时是 `online: true` + `stale: true`。
+ */
+interface RuntimeFactsText {
+  panelRole: string;
+  roleAgreement: string;
+  roleAgreed: string;
+  roleMismatch: string;
+  roleUnknown: string;
+  freshness: string;
+  age: (seconds: number) => string;
+  ageUnknown: string;
+  staleNote: string;
+}
+
+const RUNTIME_FACTS_ZH: RuntimeFactsText = {
+  panelRole: "面板侧角色",
+  roleAgreement: "角色一致性",
+  roleAgreed: "两侧一致（role_mismatch: false）",
+  roleMismatch: "不一致（role_mismatch: true）：以面板侧角色为准",
+  roleUnknown: "无法判定：有一侧没有角色值（不是「不一致」）",
+  freshness: "快照新鲜度",
+  age: (seconds) => `快照年龄 ${seconds} 秒`,
+  ageUnknown: "没有快照（从未上报）",
+  staleNote: "stale: true —— 这一格事实超过 5 分钟没更新；它不代表节点离线",
+};
+
+const RUNTIME_FACTS_EN: RuntimeFactsText = {
+  panelRole: "Panel-side role",
+  roleAgreement: "Role agreement",
+  roleAgreed: "Both sides agree (role_mismatch: false)",
+  roleMismatch: "Disagreement (role_mismatch: true): the panel-side role wins",
+  roleUnknown: "Cannot decide: one side has no role value (not the same as \"disagreement\")",
+  freshness: "Snapshot freshness",
+  age: (seconds) => `Snapshot age ${seconds}s`,
+  ageUnknown: "No snapshot (never reported)",
+  staleNote: "stale: true — this fact has not been updated for over 5 minutes; it does not mean the node is offline",
+};
+
+function runtimeFactsText(locale: Locale): RuntimeFactsText {
+  return locale === "en" ? RUNTIME_FACTS_EN : RUNTIME_FACTS_ZH;
 }
 
 function formatEgressPools(report: NodeStateReport): string {
@@ -78,7 +129,8 @@ export function NodeRuntimeUnavailable({
 
 /** 有上报时的原始快照表（隧道 / 出口池 / 上报时刻）。 */
 function NodeRuntimeReport({ report }: { report: NodeStateReport }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const copy = runtimeFactsText(locale);
   return (
     <div className="flex flex-col gap-4" data-testid="runtime-report">
       <Table>
@@ -87,9 +139,51 @@ function NodeRuntimeReport({ report }: { report: NodeStateReport }) {
             <TableCell className="w-40 text-[var(--muted-foreground)]">{t("admin.runtimeVersion")}</TableCell>
             <TableCell className="font-mono text-xs">{report.version ?? "-"}</TableCell>
           </TableRow>
+          {/*
+            「Agent 自报角色」这一行必须读 `reported_role`；`role` 是**面板侧**认定
+            （`node.role`），两者连大小写都可能不同（真机：`role: "ingress"` /
+            `reported_role: "INGRESS"`）。这里曾经渲染 `report.role` 却挂着
+            「Agent 自报角色」的标签 —— 生产是错的，而 mock 曾把落库行（两字段同值）
+            直接回显，所以本地永远看不出来。
+          */}
           <TableRow>
-            <TableCell className="text-[var(--muted-foreground)]">{t("admin.runtimeReportedRole")}</TableCell>
-            <TableCell className="font-mono text-xs">{report.role ?? "-"}</TableCell>
+            <TableCell className="w-40 text-[var(--muted-foreground)]">{t("admin.runtimeReportedRole")}</TableCell>
+            <TableCell className="font-mono text-xs" data-testid="runtime-reported-role">
+              {report.reported_role ?? "-"}
+            </TableCell>
+          </TableRow>
+          <TableRow>
+            <TableCell className="w-40 text-[var(--muted-foreground)]">{copy.panelRole}</TableCell>
+            <TableCell className="font-mono text-xs" data-testid="runtime-panel-role">
+              {report.role ?? "-"}
+            </TableCell>
+          </TableRow>
+          {/*
+            角色一致性：后端特意给出的 `role_mismatch`（两侧都非空才判、大小写归一比较）。
+            三态分开说：确实不一致 / 两侧一致 / 无法判定（有一侧没值）——
+            把第三种说成前两种都是编结论。
+          */}
+          <TableRow>
+            <TableCell className="w-40 text-[var(--muted-foreground)]">{copy.roleAgreement}</TableCell>
+            <TableCell className="text-xs" data-testid="runtime-role-agreement">
+              {report.role_mismatch === true
+                ? copy.roleMismatch
+                : !report.role || !report.reported_role
+                  ? copy.roleUnknown
+                  : copy.roleAgreed}
+            </TableCell>
+          </TableRow>
+          {/*
+            快照新鲜度：`age_seconds` / `stale` 回答"这一格事实有多旧"，
+            **不是**在线/离线判定（在线看 `online` / connection）。
+            因此这里只出现"多久没更新"，不出现"离线/异常/正常"这类结论。
+          */}
+          <TableRow>
+            <TableCell className="w-40 text-[var(--muted-foreground)]">{copy.freshness}</TableCell>
+            <TableCell className="text-xs" data-testid="runtime-freshness">
+              {typeof report.age_seconds === "number" ? copy.age(report.age_seconds) : copy.ageUnknown}
+              {report.stale === true ? <span data-testid="runtime-stale"> · {copy.staleNote}</span> : null}
+            </TableCell>
           </TableRow>
           <TableRow>
             <TableCell className="text-[var(--muted-foreground)]">{t("admin.runtimeRevision")}</TableCell>

@@ -46,6 +46,44 @@ import type { MockRequest, MockResponse, Store, MockForwardBatchAction, MockForw
 
 const { TLS_PATH_ERROR_MESSAGES, SESSION_COOKIE, GB, sessionCookieValue, CYCLE_DAYS, COUPONS, ADMIN_RESOURCES, ADMIN_RESOURCE_KEYS, sanitizePermissions, TOPUP_AUTO_SETTLE_MS, nowIso, ok, fail, badRequest, notFound, failFlat, isLoggedIn, userFromCookie, paginate, MOCK_FORWARD_SORT_FIELDS, sortMockForwards, filterByKeyword, filterByStatus, nextId, asRecord, reqStr, numOrNull, reqNum, required, pick, parseList, isResponse, parseId, groupRef, withGroupStats, tunnelTrafficSeries, creditBalance, settleTopup, autoSettleTopups, payUrlFor, topupOrderNo, dashboardStats, adminStats, readPlanPayload, readNodeGroupPayload, readNodePayload, mockPoolTargetHealth, noEvidenceTargetView, handleEgressPools, nextPoolId, nextTargetId, APPLY_STATUSES, TUNNEL_MODES, FORWARD_BATCH_ACTIONS, FORWARD_BATCH_MAX_IDS, applyStatusOf, hasV3Columns, completeOrchestration, poolOfNode, poolRef, tunnelRuntimeAction, MOCK_ATTENTION_MAX_ITEMS, mockAttention, mockUserNode, mockBindingUsage, mockBindingView, healthWorld, impactWorld, mockIngressNode, parseMockTarget, mockForwardView, mockEnrollment, seed, poolTargetKey, getStore, resetStore, handleFederationMock, handleRouteProfileMock, mockFleetHealth, mockNodeHealth, mockResolveNode, MOCK_LIFECYCLES, MOCK_LIFECYCLE_NOTE_MAX, mockAllowedTransitions, mockCanTransition, mockDeleteGates, mockImpact, mockLifecycleChange, mockLifecycleOf, mockLifecycleView, mockRoleCheck, mockUserNodeStatus, applyMockForwardPatch, previewMockForwardUpdate, applyErrorIsRetryable, DEFAULT_FORWARD_PROTOCOL, forwardProtocolFact, forwardProtocolSupported, isForwardProtocol, tlsPathFieldErrors, mockEffectivePermissions, mockBasePermissions, mockGrantSubset, validMockRolePermissions } = rt;
 
+/**
+ * 节点创建的能力/额度门控（镜像真机 `services/capability-policy.ts:checkNodeCreation`）。
+ *
+ * ── 为什么 mock 必须有它 ──
+ * 旧 mock 的 provision 分支没有这道门：真机在 `max_nodes=1 / used=7` 下返回
+ * `403 {code:"node_limit"}`，mock 却连发 5 次 201（used 一路涨到 12）——
+ * "额度耗尽"这条最该在本地看到的失败路径，在 mock 里**永远看不到**。
+ *
+ * ── 计数口径 ──
+ * 真机：`node.count({ where: { node_group: { workspace_id } } })`，即"**这个空间自己的组**里的行"。
+ * mock 的对应物是 `nodeGroupWorkspace`（组 → 归属空间）：**种子组不在表里**
+ * （它们是跨作用域演示数据，见 `capabilities.ts:mockGroupVisibleInScope`），
+ * 所以演示种子那 7 行不计入任何空间的用量 —— 这条差异是 mock 的既有约定，
+ * 已记入 `docs/agent/productization-status.md` 的"mock 与真实剩余分叉"表。
+ *
+ * ── 拒绝形状 ──
+ * 真机 `routes/node-groups.ts`：`403 { error: <describeDeny 文案>, code: <reason> }`。
+ * `no_active_policy`（空间没有任何生效策略）同样 fail-closed 拒绝，绝不默认放行。
+ */
+function mockCheckNodeCreation(
+  db: Store,
+  scopeId: number | undefined,
+): { allowed: true } | { allowed: false; code: string; message: string } {
+  const policy = mockCapabilityPolicyFor(db, scopeId);
+  if (policy === undefined) {
+    return { allowed: false, code: "no_active_policy", message: "工作空间没有任何生效的能力策略" };
+  }
+  const nodeCount = db.nodes.filter(
+    (node) => db.nodeGroupWorkspace.get(node.node_group_id) === scopeId,
+  ).length;
+  const max = policy.max_nodes;
+  if (max !== null && nodeCount >= max) {
+    // 与后端 `describeDeny("node_limit")` 同文案
+    return { allowed: false, code: "node_limit", message: `已达节点数量上限（${max} 个）` };
+  }
+  return { allowed: true };
+}
+
 export async function handleCatalogMock(ctx: rt.MockAuthedRouteContext): Promise<rt.MockResponse | null> {
   const { method, clean, seg, q, db, user, req, scopeId } = ctx;
   if (seg[0] === "node-groups") {
@@ -160,7 +198,26 @@ export async function handleCatalogMock(ctx: rt.MockAuthedRouteContext): Promise
       const range = group.port_range?.split("-").map(Number) ?? [];
       const portMin = range.length === 2 && Number.isInteger(range[0]) ? range[0]! : null;
       const portMax = range.length === 2 && Number.isInteger(range[1]) ? range[1]! : null;
-      // 与后端一致：端口区间只约束**新建行**；重签一个已存在的节点不看组区间。
+      /**
+       * 能力/额度门控 —— **必须在端口区间之前**（与真机同序）。
+       *
+       * 真机 `routes/node-groups.ts` 在锁内的顺序是：组归属/角色冲突 → **`checkNodeCreation`**
+       * → 端口区间，并且注释里写明理由：能力拒绝是**改不了的事实**（去找管理员），
+       * 区间未配置是**可修复的状态**；先报区间会把用户指向一条死路（那个空间可能连自建组
+       * 都不允许）。这里照抄这个顺序，否则 mock 又会把两种拒绝的先后关系演示反。
+       *
+       * 旧实现**完全没有**这道门（R5-B 实测：真机 `max_nodes=1 used=7` ⇒ 403
+       * `node_limit`，mock 连发 5 次 201、used 一路涨到 12）—— 也就是说"额度耗尽"
+       * 这条最该在本地看到的失败路径，在 mock 里永远看不到。
+       *
+       * 只约束**新建行**：重签（同组同名）不动用量，真机也不看额度（`if (!existing)`）。
+       */
+      if (!existing) {
+        const decision = mockCheckNodeCreation(db, scopeId);
+        // 与真机同形：403 `{ error, code }`（`failFlat` 额外带上 `message`，
+        // 客户端 `ApiError` 取文案时两条路都能走）。
+        if (!decision.allowed) return failFlat(403, decision.message, decision.code);
+      }
       if (
         !existing &&
         (portMin === null ||

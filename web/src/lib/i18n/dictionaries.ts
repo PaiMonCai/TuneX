@@ -90,6 +90,11 @@ export const zh = {
     description: "描述",
     permissions: "权限",
     readOnly: "只读",
+    // `common.price` / `common.bonus`：充值记录表的两列表头。
+    // 这两个键此前**从缺** ⇒ `translate()` 原样返回键名，界面直接画出 `common.price`。
+    // 措辞与 `fields.price`（金额）/`fields.bonus`（赠送金额）保持一致，避免同一列两种叫法。
+    price: "金额",
+    bonus: "赠送金额",
     done: "完成",
     workspace: "工作空间",
   },
@@ -1159,6 +1164,9 @@ export const en: Dict = {
     description: "Description",
     permissions: "Permissions",
     readOnly: "Read-only",
+    // Same two keys as the zh side: the topup history table headers.
+    price: "Amount",
+    bonus: "Bonus amount",
     done: "Done",
     workspace: "Workspaces",
   },

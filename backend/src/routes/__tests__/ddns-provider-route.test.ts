@@ -13,15 +13,40 @@
  *
  * 替身注入与 `node-health-route.test.ts` 同一模式：`mock.module` 必须在被测路由 import
  * **之前**注册。
+ *
+ * ── 2026-10-07 修正：替身必须**语义完整**（透传真实模块的全部运行时导出）──
+ *
+ * `mock.module` 是**进程级**注册表，替换的是**整个** `workspace.ts`。本文件原先只给了
+ * 一个 `resolveWorkspaceAccess`，于是同一进程里后跑的测试在**加载阶段**就炸：
+ *
+ *   SyntaxError: Export named 'createPersonalWorkspace' not found in module '…/services/workspace.ts'
+ *
+ * 复现（只跑这两个文件，无需其它）：
+ *   bun test src/routes/__tests__/ddns-provider-route.test.ts \
+ *            src/routes/__tests__/route-mount-coverage.test.ts --timeout 10000
+ *   → 5 pass / 1 fail / 1 error（`route-mount-coverage` 经 `app.ts` 间接需要
+ *     `createPersonalWorkspace`；全量跑因文件被分派到不同 worker 而侥幸绿 ⇒ 顺序敏感）。
+ *
+ * 修法与 `forward-route-topology.test.ts` 同一取向：**先 import 真实现，再只覆盖要
+ * 替身的那一个导出**（`{ ...real, resolveWorkspaceAccess: spy }`）。替身本身是必要的：
+ * 真实现要连库，而本文件要钉的是"路由中间件把哪一对 (action, resource) 交给权限内核" ——
+ * 那是**调用参数**，不是真实现的返回值，只有 spy 看得见。但替身的**面**必须完整。
  */
 import { test, expect, describe, beforeEach, mock } from "bun:test";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 
+const WORKSPACE_MODULE = "../../services/workspace.ts";
+
+// 先拿真实现（后面透传它）：`mock.module` 替换整个模块，凡是别人也 import 的导出都必须
+// 保留 —— 否则失败会发生在**别的文件**的加载阶段，排查成本极高。
+const realWorkspace = await import(WORKSPACE_MODULE);
+
 const calls: Array<{ action: string; resource: string }> = [];
 let deny = false;
 
-mock.module("../../services/workspace.ts", () => ({
+mock.module(WORKSPACE_MODULE, () => ({
+  ...realWorkspace,
   resolveWorkspaceAccess: async (_c: unknown, action: string, resource: string) => {
     calls.push({ action, resource });
     if (deny) throw new HTTPException(403, { message: "工作空间角色无权操作" });
@@ -98,5 +123,31 @@ describe("V5-WP17.2: DNS provider 路由的权限接线", () => {
     const bad = await app.request(`${url}/abc`, { method: "DELETE" });
     expect(bad.status).toBe(400);
     expect(calls).toEqual([{ action: "manage", resource: "settings" }]);
+  });
+});
+
+/* ================================================================== */
+/* 防复发：替身的导出面必须 ⊇ 真实模块                                    */
+/* ================================================================== */
+
+describe("替身语义完整（同进程其它测试依赖这一点）", () => {
+  test("mock 的导出集合包含真实模块的**每一个**运行时导出", async () => {
+    // 这条守卫的存在理由：`mock.module` 是进程级替换，替身缺一个导出就会让**另一个
+    // 文件**在加载阶段 SyntaxError `Export named 'X' not found`，而那种失败的输出
+    // 没有 `(fail)` 前缀、只在特定跑法下出现 —— 极难归因（本文件 2026-10-07 就踩过）。
+    const mocked = (await import(WORKSPACE_MODULE)) as Record<string, unknown>;
+    const missing = Object.keys(realWorkspace).filter((name) => !(name in mocked));
+    expect(missing).toEqual([]);
+    // 反方向不要求相等：替身**允许**多给（今天就是多给了 `...realWorkspace` 之外的覆盖），
+    // 但少给一个都不行。用 `⊇` 而不是 `===`，正是为了让这条断言只表达纪律本身。
+    expect(Object.keys(realWorkspace).length).toBeGreaterThan(0);
+  });
+
+  test("替身确实换掉了那一个导出（否则上面的等式可能只是在自欺）", async () => {
+    const mocked = (await import(WORKSPACE_MODULE)) as Record<string, unknown>;
+    expect(mocked.resolveWorkspaceAccess).not.toBe(realWorkspace.resolveWorkspaceAccess);
+    // 其余导出必须是**真实现本体**（透传），不是重新包装的等价物。
+    expect(mocked.createPersonalWorkspace).toBe(realWorkspace.createPersonalWorkspace);
+    expect(mocked.resolveWorkspaceMembership).toBe(realWorkspace.resolveWorkspaceMembership);
   });
 });

@@ -105,6 +105,10 @@ describe("mock 的同名语义 = 真实后端：同组同名是 201 重签", () 
   });
 
   test("端口区间只约束新建行：无区间的组里重签已存在的节点仍是 201", async () => {
+    // 先把额度放宽：本用例要隔离"区间只约束新建行"这一条规则。
+    // 不放宽的话，第二次**新建**会先撞上额度门（403 node_limit）——那是 P2-5 之后
+    // 正确的新行为（真机同序），不是这条规则失效。
+    setPolicy(10);
     const groupId = await createGroup("先有区间再取消", "35000-35999");
     const created = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "range-then-none" });
     expect(created.status).toBe(201);
@@ -120,5 +124,95 @@ describe("mock 的同名语义 = 真实后端：同组同名是 201 重签", () 
     const fresh = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "range-none-new" });
     expect(fresh.status).toBe(409);
     expect((fresh.body as { code?: string }).code).toBe("PORT_RANGE_REQUIRED");
+  });
+});
+
+/* ================================================================== */
+/* P2-5：节点额度门控（真机 403 `node_limit`，旧 mock 无限 201）            */
+/* ================================================================== */
+
+/** 改当前空间的有效策略（额度）；`undefined` 传 null 表示"不限"。 */
+function setPolicy(maxNodes: number | null) {
+  getStore().capabilityPolicies.set(PERSONAL_WS, {
+    allow_custom_in_group: true,
+    allow_custom_out_group: false,
+    max_nodes: maxNodes,
+    max_tunnels: 10,
+  });
+}
+
+describe("P2-5：mock 的 provision 与真机同序（能力/额度 → 区间）", () => {
+  test("额度耗尽 → 403 {code:\"node_limit\"}，且**不再创建行**", async () => {
+    const groupId = await createGroup("额度组", "36000-36999");
+    // 真机实测形态：`max_nodes=1 used=7` ⇒ 403 node_limit（旧 mock 会一直 201）。
+    setPolicy(1);
+    const first = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "quota-1" });
+    expect(first.status).toBe(201);
+    const rowsAfterFirst = getStore().nodes.length;
+
+    const second = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "quota-2" });
+    expect(second.status).toBe(403);
+    const body = second.body as { error?: string; code?: string };
+    expect(body.code).toBe("node_limit");
+    expect(typeof body.error).toBe("string");
+    // 错误体与真机同形：`{ error, code }`（`failFlat` 额外带 message，客户端两条路都能取）
+    expect(body.error).toContain("节点数量上限");
+    // 关键：被拒之后行数**一个都不许涨**（旧 mock 会连发 5 次 201、used 一路涨）
+    expect(getStore().nodes.length).toBe(rowsAfterFirst);
+    expect(getStore().nodes.some((node) => node.node_id === "quota-2")).toBe(false);
+  });
+
+  test("额度为 0 → 第一个新建就被拒（403），重签已存在的行不受额度影响", async () => {
+    const groupId = await createGroup("零额度组", "37000-37999");
+    const created = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "zero-1" });
+    expect(created.status).toBe(201);
+    setPolicy(0);
+
+    // 新建 → 403（`0 >= 0`）
+    const fresh = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "zero-2" });
+    expect(fresh.status).toBe(403);
+    expect((fresh.body as { code?: string }).code).toBe("node_limit");
+
+    // 重签已存在的行：真机 `if (!existing)` 才判额度 ⇒ 这里必须仍是 201
+    const resign = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "zero-1" });
+    expect(resign.status).toBe(201);
+  });
+
+  test("额度未耗尽 → 201（不是「一律 403」，否则就是另一种撒谎）", async () => {
+    const groupId = await createGroup("够用组", "38000-38999");
+    setPolicy(5);
+    const ok = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "room-1" });
+    expect(ok.status).toBe(201);
+  });
+
+  test("空间没有生效策略 → 403 no_active_policy（fail-closed，不默认放行）", async () => {
+    const groupId = await createGroup("无策略组", "39000-39999");
+    getStore().capabilityPolicies.delete(PERSONAL_WS);
+    const res = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "no-policy-1" });
+    expect(res.status).toBe(403);
+    expect((res.body as { code?: string }).code).toBe("no_active_policy");
+  });
+
+  test("顺序与真机一致：额度拒绝**先于**端口区间拒绝（避免把用户指向死路）", async () => {
+    // 一个没有端口区间的组 + 额度为 0：真机先判能力/额度 ⇒ 403 node_limit（不是 409）
+    const groupId = await createGroup("无区间且额度满");
+    setPolicy(0);
+    const res = await call("POST", `node-groups/${groupId}/nodes`, { node_id: "order-1" });
+    expect(res.status).toBe(403);
+    expect((res.body as { code?: string }).code).toBe("node_limit");
+  });
+
+  test("演示种子的共享组不计入额度（mock 的已知残留差异，见分叉表）", async () => {
+    // 种子组不在 `nodeGroupWorkspace` 里（跨作用域演示数据）⇒ 只统计"本空间自建组"里的行。
+    // 真机上每个组都有归属，因此那 7 行会被计入 —— 这条差异写进了
+    // `docs/agent/productization-status.md` 的"mock 与真实剩余分叉"表。
+    const sharedGroupId = 1; // 香港入口组（种子）
+    setPolicy(1);
+    const before = getStore().nodes.filter((node) => node.node_group_id === sharedGroupId).length;
+    const res = await call("POST", `node-groups/${sharedGroupId}/nodes`, {
+      node_id: "shared-seed-node",
+    });
+    expect(res.status).toBe(201);
+    expect(getStore().nodes.filter((node) => node.node_group_id === sharedGroupId).length).toBe(before + 1);
   });
 });

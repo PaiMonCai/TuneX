@@ -103,3 +103,130 @@ describe("mock：有上报 = 落库快照；没有上报 = 200 空态视图", ()
     expect(nodeRuntimeStateFromPayload(silent.body).status).toBe("never_reported");
   });
 });
+
+/* ================================================================== */
+/* 键集恒等（P1-3）：**两个分支都**必须恰好是 NodeStateView 的 19 键      */
+/* ================================================================== */
+
+/**
+ * `NodeStateView` 的键集（逐字抄自 `backend/src/services/node-admin-state.ts:11-35`）。
+ *
+ * 为什么钉**键集相等**而不是"包含某些键"：这条缺陷的原始形态正是"公共子集断言"——
+ * 旧测试只检查两个分支**都有**的那些键，于是"有上报分支少了 10 个视图键、多了 10 个
+ * 落库键"这件事在测试里完全看不见。键集相等才让 mock 的形状**真的**等于真机的形状。
+ */
+const NODE_STATE_VIEW_KEYS = [
+  "age_seconds",
+  "capabilities",
+  "control_protocol_version",
+  "egress_pools",
+  "last_error",
+  "last_seen_at",
+  "node_id",
+  "node_key",
+  "online",
+  "reported_at",
+  "reported_revision",
+  "reported_role",
+  "role",
+  "role_mismatch",
+  "stale",
+  "status",
+  "tunnels",
+  "used_ports",
+  "version",
+] as const;
+
+describe("P1-3：state 端点的**两个分支**键集恒等于 NodeStateView（19 键）", () => {
+  test("有上报（node 6）与从未上报（node 1）都是 19 键，且没有 undefined 值", async () => {
+    for (const nodeId of [REPORTED_NODE, SILENT_NODE]) {
+      const { status, body } = await call<Record<string, unknown>>("GET", `admin/node/${nodeId}/state`);
+      expect(status).toBe(200);
+      // 键集**顺序无关、数量相等**：多一个落库键少一个视图键都算失败
+      expect(Object.keys(body).sort()).toEqual([...NODE_STATE_VIEW_KEYS]);
+      // 键存在但值是 `undefined` 等于"这一格没投影"：JSON 会把它整个丢掉
+      const undefinedKeys = Object.keys(body).filter((key) => body[key] === undefined);
+      expect(undefinedKeys).toEqual([]);
+    }
+  });
+
+  test("落库行独有的列**不得**出现（known_revision/hostname/host_metrics/… 端点不返回）", async () => {
+    const { body } = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    for (const rowOnly of [
+      "known_revision",
+      "agent_started_at",
+      "hostname",
+      "os",
+      "arch",
+      "runtime_counts",
+      "host_metrics",
+      "error_count",
+      "last_error_at",
+      "updated_at",
+    ]) {
+      expect(Object.keys(body)).not.toContain(rowOnly);
+    }
+  });
+
+  test("role（面板侧）与 reported_role（Agent 自报）是两个字段，不得并成一个", async () => {
+    const { body } = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    // 种子：node.role="both"，上报行 role="both"（两值相等，但字段必须各自存在）
+    expect(body.role).toBe("both");
+    expect(body.reported_role).toBe("both");
+    expect(typeof body.role_mismatch).toBe("boolean");
+  });
+
+  test("角色不一致：改一侧的值后 role_mismatch 变 true（大小写归一后比较）", async () => {
+    const store = resetStore();
+    const node = store.nodes.find((row) => row.id === REPORTED_NODE)!;
+    const report = store.nodeStates.get(REPORTED_NODE)!;
+    // Agent 自报 egress、面板认定 both ⇒ 不一致
+    report.role = "EGRESS";
+    const mismatch = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(mismatch.body.role_mismatch).toBe(true);
+    expect(mismatch.body.reported_role).toBe("EGRESS");
+    expect(mismatch.body.role).toBe("both");
+    // 只差大小写 ⇒ 不算不一致（与后端 `isRoleMismatch` 同口径）
+    report.role = "BOTH";
+    const same = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(same.body.role_mismatch).toBe(false);
+    // 一侧为空 ⇒ 不判不一致（"无法判定"不是"不一致"）
+    report.role = null;
+    const oneSided = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(oneSided.body.role_mismatch).toBe(false);
+    expect(node.role).toBe("both");
+  });
+
+  test("age_seconds 与 stale 由 reported_at 推出，且 stale 与 online 互不替代", async () => {
+    const store = resetStore();
+    const report = store.nodeStates.get(REPORTED_NODE)!;
+    // 新鲜快照（10 秒前）⇒ age≈10、stale=false
+    report.reported_at = new Date(Date.now() - 10_000).toISOString();
+    const fresh = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(fresh.body.age_seconds).toBeGreaterThanOrEqual(9);
+    expect(fresh.body.age_seconds).toBeLessThanOrEqual(12);
+    expect(fresh.body.stale).toBe(false);
+    // 陈旧快照（超过后端阈值 300 秒）⇒ stale=true，但 online 仍由 node.status 决定
+    report.reported_at = new Date(Date.now() - 400_000).toISOString();
+    const stale = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(stale.body.stale).toBe(true);
+    expect(stale.body.online).toBe(true);
+    // 无快照 ⇒ age=null、stale=true（"没有新鲜证据"），而 online 与它无关
+    report.reported_at = null as unknown as string;
+    const noSnapshot = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(noSnapshot.body.age_seconds).toBeNull();
+    expect(noSnapshot.body.stale).toBe(true);
+    expect(noSnapshot.body.online).toBe(true);
+  });
+
+  test("capabilities：未上报保持 null，上报数组则原样透传（null ≠ []）", async () => {
+    const store = resetStore();
+    const report = store.nodeStates.get(REPORTED_NODE)! as Record<string, unknown>;
+    report.capabilities = ["restart", "upgrade"];
+    const withCaps = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(withCaps.body.capabilities).toEqual(["restart", "upgrade"]);
+    report.capabilities = null;
+    const noCaps = await call<Record<string, unknown>>("GET", `admin/node/${REPORTED_NODE}/state`);
+    expect(noCaps.body.capabilities).toBeNull();
+  });
+});

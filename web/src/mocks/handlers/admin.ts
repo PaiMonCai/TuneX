@@ -36,6 +36,7 @@ import type {
   WorkspaceMember,
   WorkspaceRole,
   WorkspaceTrafficSummary,
+  NodeStateReport,
 } from "@/lib/types";
 import type { TargetHealthTargetView, TargetPoolHealth } from "@/lib/target-health";
 import type { MockNodeBinding, MockWorkspaceInvite } from "../state";
@@ -449,18 +450,28 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
     /*
      * 唯一真相是 `backend/src/routes/node-admin.ts` 的
      * `nodeAdminRoutes.get("/node/:id/state")` + `services/node-admin-state.ts`
-     * 的 `NodeStateView`：
+     * 的 `NodeStateView`（**19 键**）：
      *   · 节点存在 → **一律 200**：从未上报是 `reported_at: null` 的空态视图
      *     （`tunnels: []` / `used_ports: []` / `egress_pools: {}` / `stale: true`），
      *     既不是 404，也不是 `null` 载荷 —— 「没有上报」与「取不到」必须可分；
      *   · 节点不存在 → 404（`resolveNodeId` 失败）。
      * 响应是**解包后**的载荷（mock 模式下 api.ts 不再剥 `{ data }` 信封）。
+     *
+     * ── 有上报的分支**也必须走投影**（这条曾经是错的）──
+     * 旧实现直接 `ok(report ?? mockEmptyNodeState(node))`：从未上报时是 19 键的视图，
+     * 有上报时却把**落库行**原样回显 —— 缺 10 个视图键（`node_key` / `reported_role` /
+     * `role_mismatch` / `online` / `status` / `last_seen_at` / `age_seconds` / `stale` /
+     * `control_protocol_version` / `capabilities`）、多 10 个落库键
+     * （`known_revision` / `error_count` / `hostname` / `host_metrics` / …）。
+     * 后果不只是形状不齐：落库行的 `role` 是 **Agent 自报值**，而视图的 `role` 是
+     * **面板侧**值 —— 于是前端把 `role` 渲染在「Agent 自报角色」下，在 mock 里碰巧是对的，
+     * 到生产就变成谎话（真机 `role: "ingress"` / `reported_role: "INGRESS"`）。
+     * 现在两个分支共用 {@link mockNodeStateView}，键集恒等于 `NodeStateView`。
      */
     if (seg[1] === "node" && method === "GET" && seg[3] === "state") {
       const node = mockResolveNode(db.nodes, seg[2]);
       if (!node) return notFound("节点不存在");
-      const report = db.nodeStates.get(node.id);
-      return ok(report ?? mockEmptyNodeState(node));
+      return ok(mockNodeStateView(node, db.nodeStates.get(node.id) ?? null));
     }
 
     // ----- V4-WP6 §13.4.4 健康：单数 /admin/node/health 与前缀 /admin/node/:id/health -----
@@ -861,35 +872,59 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
   return null;
 }
 
+/** 真实后端的陈旧阈值（`node-admin-core.ts:NODE_STATE_STALE_SECONDS`），不另抄数字之外的口径。 */
+const MOCK_NODE_STATE_STALE_SECONDS = 300;
+
+/** `isRoleMismatch` 同口径：两侧都非空才判，大小写归一后比较。 */
+function mockRoleMismatch(reportedRole: string | null | undefined, nodeRole: string | null | undefined): boolean {
+  if (!reportedRole || !nodeRole) return false;
+  return reportedRole.trim().toLowerCase() !== nodeRole.trim().toLowerCase();
+}
+
 /**
- * 从未上报的**空态视图**（形状 = 真实后端 `NodeStateView`，字段逐个对齐
- * `backend/src/services/node-admin-state.ts` 的 `getNodeState`）。
+ * 落库行（或没有行）→ **`NodeStateView`（恒 19 键）**。
  *
- * 为什么不是 `null`：客户端把「载荷为 null」判成**响应形状不认识 = 取不到**
- * （见 `lib/node-runtime-state.ts`），而「从未上报」是 200 的契约事实。
- * 两者混成同一个值，界面就又会把「接口坏了」显示成「节点还没上报」。
+ * 两个分支（有上报 / 从未上报）**都必须**走这里：这是"mock 与真机同形"的唯一实现点。
+ * 字段逐个对齐 `backend/src/services/node-admin-state.ts` 的 `getNodeState`
+ * （见该文件 11-35 行的 `NodeStateView` 定义），并且：
+ *   · 缺的字段给 `null` / `[]` / `{}`（**不是 `undefined`**：`JSON.stringify` 会把它丢掉，
+ *     客户端 `Object.keys` 也就看不到这一格，于是"字段缺失"与"值为空"又混在一起）；
+ *   · 落库行独有的列（`known_revision` / `hostname` / `host_metrics` / `error_count` / …）
+ *     一律**不投影**：真实端点不返回它们，mock 也不许返回（这正是 P1-3 的修复点）；
+ *   · `role` 取**面板侧** `node.role`，Agent 自报值放 `reported_role`。旧实现把落库行
+ *     原样回显，两个语义被并成一个字段，前端读错也看不出来（P2-4）。
  */
-function mockEmptyNodeState(node: Node) {
+function mockNodeStateView(node: Node, report: NodeStateReport | null | undefined) {
+  const reportedAt = report?.reported_at ?? null;
+  const ageSeconds =
+    reportedAt === null
+      ? null
+      : Math.max(0, Math.round((Date.now() - new Date(reportedAt).getTime()) / 1000));
+  const stale =
+    ageSeconds === null ? true : ageSeconds > MOCK_NODE_STATE_STALE_SECONDS;
   return {
     node_id: node.id,
     node_key: node.node_id,
+    // 面板侧认定（`node.role`）—— 不是 Agent 自报值
     role: node.role ?? null,
-    reported_role: null,
-    role_mismatch: false,
+    // Agent 自报值（落库行 `role`）
+    reported_role: report?.role ?? null,
+    role_mismatch: report ? mockRoleMismatch(report.role, node.role) : false,
     online: node.status === "active",
     status: node.status,
     last_seen_at: node.last_seen_at ?? null,
-    reported_at: null,
-    age_seconds: null,
+    reported_at: reportedAt,
+    age_seconds: ageSeconds,
     // 无快照 = 无新鲜证据（后端 `snapshot ? isStaleState(...) : true` 同一口径）
-    stale: true,
-    version: null,
-    reported_revision: null,
-    tunnels: [],
-    used_ports: [],
-    egress_pools: {},
-    last_error: null,
-    control_protocol_version: null,
-    capabilities: null,
+    stale,
+    version: report?.version ?? null,
+    reported_revision: report?.reported_revision ?? null,
+    tunnels: report?.tunnels ?? [],
+    used_ports: report?.used_ports ?? [],
+    egress_pools: report?.egress_pools ?? {},
+    last_error: report?.last_error ?? null,
+    control_protocol_version: report?.control_protocol_version ?? null,
+    // Agent 未上报 ⇒ `null`（**不是** `[]`：两者在下发判定里含义不同）
+    capabilities: Array.isArray(report?.capabilities) ? report.capabilities : null,
   };
 }
