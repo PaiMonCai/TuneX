@@ -937,6 +937,25 @@ mtr                     → MISSING（镜像无该二进制）
 ### 当前树状态（收口待办）
 `web` `tsc` 0 错，但 `bun test src/components/forwards src/mocks` 有 **2 条失败**（`ha-ui` 领地：`mock：GET /forwards/:id/ha …缺省策略即关；候选…none`）⇒ **在途**。已要求两位 owner 收敛到"可冻结"并回确认；我在此之后才重建 + 重跑验收。
 
+## 3.42 Round 48 续：`task-37` 交付（installer 死代码 + Agent 版本 stamp）+ 在途编译红
+
+### `task-37` 两条交付
+**A) `installer-static.sh` 死代码**：live 段 `:746 exit 0`，其后 `:747-1291` 是前段完整副本（**同源证明**：C 组 diff 0 行、D 组 0 行、E 组 2 行且其中 1 行为边界注释 ⇒ **被删段无任何独有断言**）。**删除前后均为 241 pass / 0 fail**；结构自检：各组 `group "A./B./…/F."` **各 1 次**、全文只剩 **1 个 `exit 0`**、末尾唯一汇总块；`bash -n`/`sh -n` 通过；文件 1291 → **746 行**。
+⇒ **CI 覆盖缺口已修**：`ci.yml:225` 跑整个文件，此前实际只执行前 ~694 行，现在整份都跑到。
+
+**B) Agent 镜像 stamp 版本**：`ARG AGENT_VERSION=unknown`（**默认 unknown = 没有版本信息**，面板只给"无法判定"；**显式空值构建失败 rc=1**；前导 `v` 在构建时去掉）。
+- **两版实测**：`--version` → `0.14.0` / `0.15.1`；未传 build-arg → `unknown`；**上报到 Panel 的 `version` 随镜像真实变化**（真起 agent + 假 Panel 逐字捕获 `POST /api/internal/node/state` 体：`"version":"0.14.0"` / `"0.15.1"`）。
+- **与 task-26 衔接**：`isVersionOlder("0.14.0","0.15.1") === true` ⇒ `agent_version_behind` 与 `version_drift:"behind"` **不再结构性不可能**。**剩余前提（均需部署方动作）**：发布方注入 tag / 节点升级到带版本镜像 / `.env` 配基线。
+- **越界（Lead 追认）**：改了 `.github/workflows/release.yml` 两处（Agent 构建传 `build-args: AGENT_VERSION=${{ github.ref_name }}`；发布门断言二进制版本 == `${GITHUB_REF_NAME#v}`）。**理由成立**：不改它，CI 发布的镜像永远报 `unknown`。已用真实 YAML 解析验证；**CI 未真实运行**（如实列未验证）。
+
+### 一处**在途编译红**（归属已纠正）
+当前工作树 `go build ./...` 红：`agent/internal/control/protocol.go:79: undefined: sync/diag` —— 来自 **`task-40`（`backend-truth`）** 的在途编辑（`upgrade-ux` 报成 `ha-ui`，已纠正）。已要求该 owner：**在途可以，但要能编译**；做不完就优先保住"可编译 + 如实标不可用"。
+
+### 收口前的树状态（Round 48 末）
+- `web`：`tsc` 0 错，但 **2 条测试失败**（`ha-ui` 领地的 `mock：GET /forwards/:id/ha …候选 none`）；
+- `agent`：`go build` **红**（`task-40` 在途）；
+- ⇒ **树不可冻结**，因此**不构建、不验收**（这正是上一轮"构建到中间态导致 Forward 详情页 `__next_error__`"的教训）。
+
 ## 4. Capability Map
 
 完整调查、Leader 校正、详细 Capability Map 与验收契约见 [onboarding-recon.md](./onboarding-recon.md)。

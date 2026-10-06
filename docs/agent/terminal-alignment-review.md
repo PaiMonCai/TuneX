@@ -265,3 +265,45 @@ Lead 已把 §5 最短路径的第 ① 条建为 `task-36`（交 `notify-center`
 
 复核时我会**重新钉 SHA 与时间戳**（届时 HEAD 很可能又推进），结论按"支撑 / 部分支撑 / 不支撑 + 缺什么"写回本文件的新小节，**不改写 §1–§6 已成立的结论**（那些建立在 `2037d05`/`57d2520` 上）。
 
+---
+
+## 9. `task-36` 证据的独立复核结论（2026-10-07 04:30–04:50 +08）
+
+### 9.0 钉点（本次复核）
+
+| 项目 | 值 |
+|---|---|
+| 复核开始 | 2026-10-07 04:30 +08 |
+| HEAD（复核基线） | `8a4ba98183bb71891ecb488244c237137bdce816`（04:30:39 `docs(agent): task-36 端到端投递证据落库（含与预期不同的零账本行发现）+ 在途门禁红标注`） |
+| 被复核证据 | `docs/agent/productization-status.md` §3.40 + `/tmp/t36-{setup-tick,present,unreadable}.mjs`、`/tmp/t36-smtp.py`（脚本本体）+ 我自己的只读库/镜像/日志检查 |
+| **复核期间的拓扑变化** | scratch 的 panel/worker 在 **20:40:30–20:40:47Z（= 04:40 +08）被重建**，镜像由 `n4-0314` 换成 `final48-0439`。⇒ **t36 实验期（20:13–20:21Z）那个 worker 化身（`n4-0314`，19:15Z 启动）的日志已经不可得**；我 04:33 读到的"≥15 拍"是在重建**之前**取的，属"当时观测"（已记在 §1.1） |
+| 只读手段 | `git archive` 读码；对 `tunex-it-mysql` 的只读 SELECT；`docker logs -t`；两个**唯一名 `--rm` 临时容器**只读读取镜像内 `/app/src/worker.ts`（用完自动删除，未动任何拓扑） |
+
+### 9.1 逐条判据
+
+| # | 判据 | 结论 | 依据 / 缺什么 |
+|---|---|---|---|
+| 1 | **收件端真有记录** | **部分支撑** | 支撑：`/tmp/t36-smtp.py` 确实是**会先发 220 问候语**的 RFC 5321 形态服务器，且在 `DATA` 结束后打印 `MESSAGE-BEGIN` + 完整报文 + `commands=…`（2526 端口先发 `554`）；账本/渠道计数与它引用的 id 区间自洽（见 #7）。**缺**：`t36-smtp` 容器已删，**原始终端记录没有任何落盘副本**（我在 /tmp 做过有界搜索：只有脚本，无 transcript 文件）⇒ 我能核到"它会打印什么"，但**无法独立核对它实际打印了什么** |
+| 2 | **因果链是"经 worker 节拍"** | **不支撑** | ① 它自己的实验脚本 `/tmp/t36-setup-tick.mjs` **直接 `import { runForwardDenialNotifications, defaultForwardDenialDeps }` 并在进程内调用**（它 §⑤ 也如实写了"未经 BullMQ 调度器"）⇒ 调度→job→handler 这一段**没有被这次实验覆盖**；② 我另行核到调度器那一半**是**接线的：临时容器读 `n4-0314`（实验期镜像）与 `final48-0439`（现在）的 `/app/src/worker.ts`，都有 `case "cron_notification_facts"`（:242）→ `runForwardDenialNotifications(defaultForwardDenialDeps())`（:250）→ 非空摘要 `console.log`（:254）。**缺**：一次**由调度器产生**的投递（例如让临时事实至少跨一拍，并贴出 `[worker] cron_notification_facts: {…,"built":1…}` 那一行）；或至少给出 t36-a/b/c 的 `DATABASE_URL`/`REDIS_URL`，证明"投递那个库 = 我观测的那个库" |
+| 3 | **事实是真实事实** | **部分支撑** | 支撑：事实载体是**真实 schema 的真实行**（`tunnel.apply_status='error'`、`category='port_forward'`），且与代码候选集口径一致：`createForwardDenialDeps` 的候选查询就是 `category='port_forward' AND (apply_status='error' OR id IN 未闭合拒绝)`（`notification-facts-trigger.ts:559-566`）。**缺**：它是**操作者 SQL 直接 INSERT** 的行，不是真实下发失败产生的；账本行的 `source_kind/source_id/reason_code` 与来源行的对应关系**已随清理消失**，我无法复核 |
+| 4 | **收件人来自用户自己** | **支撑** | 代码：`resolveTargets` 取 `recipient.email` / `recipient.tg_id`，受众来自 `workspaceAnnouncementAudience(db, workspace_id)`（`notification-facts-trigger.ts:464-474`、`:479-495`）⇒ 目标来自**成员自己的资料行**，不是猜的。独立锚点：我读 `tunex-it-mysql` → `user.id=2` 的 email = **`tunex-it-e2e@tunex.local`**，与它记录的 `To/target` 逐字相同，也与 `state.json` 的登录用户一致 |
+| 5 | **失败路径同样端到端** | **部分支撑** | 支撑（机制）：三条码的路径我都能在代码里核到——`transport_error`（mail 的 `smtp_error` → delivery.ts:265）、`rejected_target`（`validateConfig` 过滤后无合法目标 → `recordRejection`）、`not_configured`（delivery.ts:616）；"554 问候语 ⇒ 一条命令都不发"与 `mail.ts` 的问候语判定一致。**缺**：账本行与那份 `summary{total:6,sent:3,failed:3,…}` 响应**都已随清理消失**，我没有可复核的运行时载体（无快照/录屏）；而读投影的**契约与呈现纪律**我在 §1.3 已独立验证过（脱敏、闭集 400、五态、`empty ≠ 没有失败`） |
+| 6 | **"保存 ≠ 会被投递"** | **不支撑（与简报第 3 条不符）——但已如实报告** | 它报的实际行为是**零账本行**，我独立复核该根因**成立**：事实路径只把 `enabledNotificationChannels(...)`（已被 `isConfigured` 过滤）交给投递层（`notification-facts-trigger.ts:645-658`），而 `not_configured` 的落账分支在 `notification-delivery.ts:607-618` ⇒ 对事实路径**不可达**（只在该拍内配置变坏时可达）。**后果**：账本层分不出"渠道保存了但没启用"与"什么都没发生"；用户可见层靠 UI 文案补（`notification-deliveries.tsx:93-95` 等，§1.3 已核）。**缺**：要么按它的建议改投递契约（保存但未生效也留一行），要么在渠道页明说"未启用的渠道不会留账" |
+| 7 | **清理对照可复现** | **支撑** | 我自己现取（只读 SELECT，04:33）：`workspace 4 / workspace_member 4 / tunnel 3 / notification_channel 0 / notification_delivery 0 / user.tg_id 非空 0 / slug LIKE 'n36-%' 0` —— 与它报的 after 数字**逐项一致**。独立佐证（AUTO_INCREMENT，现有 0 行的表仍留有"曾经存在"的痕迹）：`notification_delivery=22`（它引用的成功行 id=8 落在其中）、`notification_channel=15`（它引用的渠道 id **12/13/14 正好是 15 之前的三行**）、`workspace=9`（它引用临时 ws 7/8）、`workspace_member=9`、`tunnel=11`（它报 tunnel 8→3） |
+| 8 | **任何绕过都写成发现** | **支撑** | §③（零账本行的裁定）与"未经 BullMQ 调度器"都写成了发现，没有把绕过包装成达成 —— 这也正是我判 #2 不支撑的依据 |
+
+### 9.2 对 #10 翻转要件 ① 的总判：**部分支撑**
+
+- **被支撑的一半**：`渠道启用 → 投递层 → 真实 SMTP 会话（含 fail-closed 的 554 形态）→ 账本行 → 用户可见投影` 这条**投递机制**，有脚本 + 计数 + 代码 + 我自己的库/镜像检查共同支撑（#1/#3/#4/#5 的"机制"部分）。
+- **不被支撑的一半**：**调度器那一拍**（#2）与**收件端原始记录**（#1）—— 前者被实验设计刻意绕过，后者随容器删除灭失。
+- **#10 判定不变**：仍是**未达成**。但本条的性质进一步收窄：从"从未投递过"变成"**有投递机制的实验证据（部分）、缺调度器与收件端原始记录**"。
+
+### 9.3 对 §1 的**口径更新**（不改结论、不改 §1 正文）
+
+§1.4/§1.6 写的是"**通知从未端到端投递过任何一条**"——那是**基于我自己观测范围内**（真库 0 行 / 0 渠道 / SMTP 空 / 0 事实）的判断。`task-36` 之后，正确的读法是：**"在本评审自己的观测范围内没有；task-36 提供的是一次部分支撑的实验记录（§9），其中收件端原始记录与调度器环节仍缺"**。§1 的结论（通知只算部分消除、不足以翻转 #10）不变，因为翻转门槛要求的正是这两条缺口。
+
+### 9.4 两条**流程教训**（给专项，不是给某个人）
+
+1. **依赖"运行中容器"的证据必须在容器存活期内落盘**：scratch 的 panel/worker 在 04:40 被重建，旧化身（`n4-0314`）的日志随之消失 —— 我 04:33 读到的"≥15 拍"因此成了**唯一**还存在的调度器证据。建议关键日志在重建前 `docker logs > /tmp/<task>/…`。
+2. **收件端记录应落成文件**：`t36-smtp` 的 `MESSAGE-BEGIN … commands=…` 输出本该是一份可带走的 transcript（一行重定向即可），但容器 `rm` 之后它只存在于实施方会话里 ⇒ 复核只能到"脚本会打印什么"，到不了"它打印了什么"。
+
