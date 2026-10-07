@@ -778,6 +778,8 @@ export const zh = {
     resourceCount: "资源总数",
     backToSite: "返回前台",
     management: "运营管理",
+    forwardReadonlySubtitle: "全局查看转发运行情况；创建和修改转发请进入对应工作空间的转发页",
+    forwardReadonlyHint: "这里是管理员只读总览，不承担业务编辑。需要创建、修改或调整路径时，请返回前台并进入对应工作空间的「转发管理」。",
     overview: "系统概览",
     /* ---- 管理端图表容器的可访问名称（图标/画布对屏幕阅读器不可见）---- */
     revenueChartLabel: "收入趋势图",
@@ -1865,6 +1867,8 @@ export const en: Dict = {
     resourceCount: "Resources",
     backToSite: "Back to site",
     management: "Operations",
+    forwardReadonlySubtitle: "Global view of forward runtime; create and edit forwards from the relevant workspace",
+    forwardReadonlyHint: "This is an admin read-only overview, not the business editor. To create, edit, or change a path, return to the user console and open Forward Management in the relevant workspace.",
     overview: "System overview",
     /* ---- Accessible names for admin chart containers (canvas/icon-only surfaces) ---- */
     revenueChartLabel: "Revenue trend chart",
