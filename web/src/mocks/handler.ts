@@ -51,6 +51,10 @@ import { handleTunnelsMock } from "./handlers/tunnels";
 import { handleCatalogMock } from "./handlers/catalog";
 import { handleCommerceMock } from "./handlers/commerce";
 import { handleSettingsMock } from "./handlers/settings";
+import { handleDdnsMock } from "./handlers/ddns";
+import { handleLookingGlassMock } from "./handlers/looking-glass";
+import { handleNotificationsMock } from "./handlers/notifications";
+import { handleForwardHaMock } from "./handlers/forward-ha";
 import { handleRouteProfilesMock } from "./handlers/route-profiles";
 import { handleAdminMock } from "./handlers/admin";
 
@@ -75,6 +79,32 @@ export async function handleMock(method: string, path: string, req: MockRequest)
       const u = userFromCookie(db, req.cookie);
       const withPlan = { ...u, user_plan: db.userPlans.find((p) => p.user_id === u.id) ?? null };
       return ok(seg[1] === "me" ? withPlan : { user: withPlan });
+    }
+    /**
+     * GET /auth/permissions —— 与真实后端同形：`{ super_admin, roles }`。
+     *
+     * mock 的后台准入模型**本身就是** super_admin 优先（见 handlers/admin.ts 的
+     * `if (!user.super_admin) return fail(403, "需要管理员权限")`），所以这里如实投影：
+     * 演示账号（super_admin）持有 super_admin 角色，其余账号 roles 为空。
+     * **不**编造一个「有委派角色但 mock 的 /admin/* 一律 403」的假委派管理员 ——
+     * 那会让 mock 自己前后矛盾。委派视角由 `admin-persona` 的单元测试覆盖。
+     */
+    if (seg[1] === "permissions" && method === "GET") {
+      if (!logged) return fail(401, "Unauthorized");
+      const u = userFromCookie(db, req.cookie);
+      const isSuper = u.super_admin === true;
+      // 外层 `{ data }` 与真实后端 `c.json({ data: {...} })` 一致（api 层会解包，
+      // 两种写法客户端都能用；这里选择与真实响应逐层同形）。
+      return ok({
+        data: {
+          super_admin: isSuper,
+          roles: isSuper
+            ? db.adminRoles
+                .filter((role) => role.name === "super_admin")
+                .map((role) => ({ id: role.id, name: role.name, permissions: role.permissions }))
+            : [],
+        },
+      });
     }
     if (seg[1] === "login" && method === "POST") {
       const body = asRecord(req.body);
@@ -275,8 +305,38 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     const result = await handleNodesMock(ctx);
     if (result) return result;
   }
+  // DDNS 必须排在 `handleForwardsMock` **之前**：后者把整个 `/forwards/*` 命名空间认领了，
+  // 未识别的子路径直接在它内部返回 404（`handlers/forwards.ts:592`），所以放在它之后
+  // 永远轮不到这里。两个路径都很精确（`/ddns/providers*`、`/forwards/:id/dns`），
+  // 不会抢走既有分支；`/forwards/**` 的 forward 族 RBAC 闸门在上面已经查过。
+  {
+    const result = await handleDdnsMock(ctx);
+    if (result) return result;
+  }
+  // 通知偏好（`/announcements/preferences`）也必须排在 `handleForwardsMock` **之前**：
+  // 它虽然不落在 `/forwards/*` 命名空间里，但顺序规则统一放这里，避免以后有人把
+  // "命名空间认领型" handler 加到前面时把它挤到 404 之后（本专项已在 DNS 前门、
+  // 延迟端点、HA 三处踩过同类顺序问题）。
+  {
+    const result = await handleNotificationsMock(ctx);
+    if (result) return result;
+  }
+  // HA 读数与首选入口写入（`/forwards/:id/ha`）必须排在 `handleForwardsMock`
+  // **之前**：后者把整个 `/forwards/*` 命名空间认领了，未识别子路径在它内部直接
+  // 404（DNS 前门 / 延迟端点 / HA 三处同一顺序问题，本专项已踩过）。
+  {
+    const result = await handleForwardHaMock(ctx);
+    if (result) return result;
+  }
   {
     const result = await handleForwardsMock(ctx);
+    if (result) return result;
+  }
+  // Looking Glass（`/looking-glass/**`）：自带权限与开关语义，路径独一份，放在此处不影响既有分支。
+  // 该文件不在 task-25 的 writeScopes 里，但按本专项既有约定（task-1 时同样处理）这是让新 mock
+  // 可达的**唯一**接线点，改动只有这两行。
+  {
+    const result = await handleLookingGlassMock(ctx);
     if (result) return result;
   }
   {

@@ -145,7 +145,23 @@ export interface WorkspaceAcceptInviteResult {
 export interface SystemConfigItem {
   id: ID;
   name: string;
+  /**
+   * 配置值。**凭据类键恒为空串**（后端只回"配没配"，不回明文）：
+   * 例如 `RESEND_API_KEY` / `CHATWOOT_TOKEN`（历史上的 `SMTP_PASS` 也是这一类）。
+   */
   value: string;
+  /**
+   * 仅凭据类键存在：`true` = 服务端已存了一个非空值（**只写不读**，因此只能靠这个字段显示状态）。
+   * N-F3：此前类型里没有它 ⇒ 界面**无法**显示"已配置"，用户只看到一个空输入框、无从判断现状。
+   */
+  secret_configured?: boolean;
+  /**
+   * `true` = 这个键**只读**：后端不再接受写入（当前只有已废弃的 `NOTICE*` 三个键）。
+   * 它仍然出现在列表里，是为了让旧值**可见**（审计/迁移）；界面不得渲染可编辑控件。
+   */
+  read_only?: boolean;
+  /** 只读的原因（目前只有 `deprecated`：公告真相已迁到 `announcement` 表）。 */
+  read_only_reason?: "deprecated";
   created_at: string;
   updated_at: string;
 }

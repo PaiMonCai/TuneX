@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import { notFound } from "next/navigation";
 import { AppShell } from "@/components/app-shell";
 import { ADMIN_SEGMENTS, AdminResourceList, type AdminSegment } from "@/components/admin/admin-resource-list";
 import { AdminReadonlyLoader } from "@/components/admin/admin-readonly-loader";
@@ -32,13 +33,21 @@ export function generateStaticParams() {
   return ADMIN_SEGMENTS.map((segment) => ({ segment }));
 }
 
-function normalize(segment: string): AdminSegment {
-  return (ADMIN_SEGMENTS as readonly string[]).includes(segment) ? (segment as AdminSegment) : "nodes";
+/**
+ * 未知 segment → 404（原来是**静默**回落到 `nodes`）。
+ *
+ * 静默回落会让 URL 与内容互相矛盾：`/admin/whatever` 的地址栏写着 whatever，
+ * 页面却是节点列表 —— 这正是本专项要收口的那类谎（用户以为自己在看某个后台页面）。
+ * 未登记的段现在走受控 `not-found`，不再冒充任何真实页面。
+ */
+function normalize(segment: string): AdminSegment | null {
+  return (ADMIN_SEGMENTS as readonly string[]).includes(segment) ? (segment as AdminSegment) : null;
 }
 
 export default async function AdminResourcePage({ params }: { params: Promise<{ segment: string }> }) {
   const { segment } = await params;
   const seg = normalize(segment);
+  if (seg === null) notFound();
   const { t } = await serverT();
 
   return (

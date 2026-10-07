@@ -85,6 +85,29 @@ export interface NodeLifecycleText {
   installCopied: string;
   installClose: string;
   installPollStop: string;
+  /** 命令有效期前缀（后面接服务端 `expires_at` 的格式化时间）。 */
+  installExpiresLabel: string;
+  /** 命令已过期（**只对真正等待安装的节点**显示，不能把 online/已装离线标成失败）。 */
+  installExpiredHint: string;
+  /** 取数失败：可恢复的提示，不得暗示成功或已连接。 */
+  installPollError: string;
+  /** 等待超时（30 分钟）：命令仍在，可继续等或重签。 */
+  installTimeoutHint: string;
+  /** 用户手动停止等待：状态不再自动更新，仍可重新开始。 */
+  installBannerStoppedHint: string;
+  /** 节点已在线时对本地命令的诚实提示：连接状态无法证明这条命令被消费过。 */
+  installOnlineCommandNotice: string;
+  /** 显式重新生成入口。 */
+  installRegenerate: string;
+  installRegenerateTitle: string;
+  /** 旧命令里尚未使用的令牌立即失效。 */
+  installRegenerateInvalidate: string;
+  /** 已有凭据的节点：重装会在消费时轮换长期凭据、替换原 Agent。 */
+  installRegenerateCredential: string;
+  /** 已安装但离线：重签不修网络（避免把「重装」当修网手段）。 */
+  installRegenerateOfflineHint: string;
+  installRegenerateCancel: string;
+  installRegenerateApply: string;
 
   conditionTitle: string;
   conditionAction: string;
@@ -174,6 +197,20 @@ const zh: NodeLifecycleText = {
   installCopied: "安装命令已复制",
   installClose: "关闭",
   installPollStop: "停止等待",
+  installExpiresLabel: "有效期至",
+  installExpiredHint: "该安装命令已过期：命令里的注册令牌已失效，请点「重新生成命令」后再执行。",
+  installPollError: "暂时取不到节点状态，正在继续重试…（已生成的安装命令不受影响）",
+  installTimeoutHint: "已等待超过 30 分钟。安装命令仍保留在这里：请先在机器上确认命令是否执行、网络是否可达，或重新生成命令。",
+  installBannerStoppedHint: "已停止等待：节点状态不会再自动更新。可以重新开始等待，或重新生成安装命令。",
+  installOnlineCommandNotice:
+    "节点已在线，但这里的注册令牌是一次性的，且连接状态无法证明它就是被这台机器用掉的那条。如果机器不是用这条命令装好的，令牌可能仍未使用——请勿拿到别处重复执行；确实要重装 Agent 时请显式「重新生成命令」。",
+  installRegenerate: "重新生成命令",
+  installRegenerateTitle: "重新生成安装命令",
+  installRegenerateInvalidate: "重新生成后，旧命令里尚未使用的注册令牌会立即失效；已经复制过旧命令的机器需要改用新命令。",
+  installRegenerateCredential: "该节点已有凭据：新命令在目标机器上被消费时会轮换长期凭据，原 Agent 身份会被替换。",
+  installRegenerateOfflineHint: "重新生成命令不会修复离线：凭据已存在，这是连接问题。只有确实要重装 Agent 时才需要新命令。",
+  installRegenerateCancel: "取消",
+  installRegenerateApply: "重新生成",
 
   conditionTitle: "原因",
   conditionAction: "下一步",
@@ -263,6 +300,26 @@ const en: NodeLifecycleText = {
   installCopied: "Install command copied",
   installClose: "Close",
   installPollStop: "Stop waiting",
+  installExpiresLabel: "Valid until",
+  installExpiredHint:
+    "This install command has expired: its enrollment token no longer works. Choose “Regenerate command” and run the new one.",
+  installPollError: "Cannot read the node state right now; still retrying… (the generated command is unaffected)",
+  installTimeoutHint:
+    "Waited over 30 minutes. The command is still here: check on the host whether it ran and whether the network is reachable, or regenerate the command.",
+  installBannerStoppedHint:
+    "Waiting stopped: the node state is no longer updated automatically. You can start waiting again, or regenerate the install command.",
+  installOnlineCommandNotice:
+    "The node is online, but the enrollment token here is one-time and the connection state cannot prove it was the one this host consumed. If the host was not installed with this command, the token may still be unused — do not run it elsewhere; regenerate the command explicitly when you really intend to reinstall the agent.",
+  installRegenerate: "Regenerate command",
+  installRegenerateTitle: "Regenerate install command",
+  installRegenerateInvalidate:
+    "Regenerating invalidates the unused enrollment token in the old command immediately; a host that copied the old command must use the new one.",
+  installRegenerateCredential:
+    "This node already has a credential: when the new command is consumed on the target host it rotates the long-term credential and replaces the original agent identity.",
+  installRegenerateOfflineHint:
+    "Regenerating will not fix the offline state: a credential already exists, so this is a connectivity problem. Only regenerate when you really intend to reinstall the agent.",
+  installRegenerateCancel: "Cancel",
+  installRegenerateApply: "Regenerate",
 
   conditionTitle: "Reason",
   conditionAction: "Next step",

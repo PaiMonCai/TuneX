@@ -41,6 +41,7 @@ import type { TargetHealthTargetView, TargetPoolHealth } from "@/lib/target-heal
 import type { MockNodeBinding, MockWorkspaceInvite } from "../state";
 import type { ForwardProtocol } from "@/lib/forward-protocol";
 import * as rt from "../runtime";
+import { mockCapabilitiesReport } from "../capabilities";
 import type { MockRequest, MockResponse, Store, MockForwardBatchAction, MockForwardBatchItemResult } from "../runtime";
 
 const { TLS_PATH_ERROR_MESSAGES, SESSION_COOKIE, GB, sessionCookieValue, CYCLE_DAYS, COUPONS, ADMIN_RESOURCES, ADMIN_RESOURCE_KEYS, sanitizePermissions, TOPUP_AUTO_SETTLE_MS, nowIso, ok, fail, badRequest, notFound, failFlat, isLoggedIn, userFromCookie, paginate, MOCK_FORWARD_SORT_FIELDS, sortMockForwards, filterByKeyword, filterByStatus, nextId, asRecord, reqStr, numOrNull, reqNum, required, pick, parseList, isResponse, parseId, groupRef, withGroupStats, tunnelTrafficSeries, creditBalance, settleTopup, autoSettleTopups, payUrlFor, topupOrderNo, dashboardStats, adminStats, readPlanPayload, readNodeGroupPayload, readNodePayload, mockPoolTargetHealth, noEvidenceTargetView, handleEgressPools, nextPoolId, nextTargetId, APPLY_STATUSES, TUNNEL_MODES, FORWARD_BATCH_ACTIONS, FORWARD_BATCH_MAX_IDS, applyStatusOf, hasV3Columns, completeOrchestration, poolOfNode, poolRef, tunnelRuntimeAction, MOCK_ATTENTION_MAX_ITEMS, mockAttention, mockUserNode, mockBindingUsage, mockBindingView, healthWorld, impactWorld, mockIngressNode, parseMockTarget, mockForwardView, mockEnrollment, seed, poolTargetKey, getStore, resetStore, handleFederationMock, handleRouteProfileMock, mockFleetHealth, mockNodeHealth, mockResolveNode, MOCK_LIFECYCLES, MOCK_LIFECYCLE_NOTE_MAX, mockAllowedTransitions, mockCanTransition, mockDeleteGates, mockImpact, mockLifecycleChange, mockLifecycleOf, mockLifecycleView, mockRoleCheck, mockUserNodeStatus, applyMockForwardPatch, previewMockForwardUpdate, applyErrorIsRetryable, DEFAULT_FORWARD_PROTOCOL, forwardProtocolFact, forwardProtocolSupported, isForwardProtocol, tlsPathFieldErrors, mockEffectivePermissions, mockBasePermissions, mockGrantSubset, validMockRolePermissions } = rt;
@@ -326,6 +327,14 @@ export async function handleWorkspacesMock(ctx: rt.MockAuthedRouteContext): Prom
         });
       }
     }
+  }
+
+  // ---------- me（R2 首启：当前工作空间的有效能力 / 额度 / 用量）----------
+  // 与后端 `routes/me.ts` 同形：作用域由请求里的 workspace（`scopeId`）决定，
+  // 权限/额度/entitlement 全部来自该工作空间的有效策略，跨空间不串。
+  if (seg[0] === "me" && seg[1] === "capabilities" && method === "GET") {
+    // 与后端逐字同形：`c.json({ data: report })`。
+    return ok({ data: mockCapabilitiesReport(db, scopeId) });
   }
 
   // ---------- dashboard ----------

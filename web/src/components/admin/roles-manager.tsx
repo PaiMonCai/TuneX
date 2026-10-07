@@ -178,7 +178,7 @@ export function AdminRolesManager({
               <TableHead>ID</TableHead>
               <TableHead>{t("admin.roleName")}</TableHead>
               <TableHead>{t("admin.roleDesc")}</TableHead>
-              <TableHead>{t("admin.permissions")}</TableHead>
+              <TableHead>{t("common.permissions")}</TableHead>
               <TableHead>{t("admin.roleUsers")}</TableHead>
               <TableHead>{t("common.updatedAt")}</TableHead>
               <TableHead className="text-right">{t("common.actions")}</TableHead>
@@ -244,7 +244,7 @@ export function AdminRolesManager({
         <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between gap-2">
             <div>
-              <div className="text-sm font-medium">{t("admin.permissions")}</div>
+              <div className="text-sm font-medium">{t("common.permissions")}</div>
               <p className="field-hint">{t("admin.permGroupHint")}</p>
             </div>
             <div className="flex items-center gap-2">

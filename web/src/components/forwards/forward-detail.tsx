@@ -9,6 +9,10 @@ import { ConfirmDeleteDialog } from "@/components/admin/admin-ui";
 import { ForwardDiagnose } from "@/components/forwards/forward-diagnose";
 import { ForwardEditDialog, RunningVsDesiredBadge } from "@/components/forwards/forward-edit-dialog";
 import { ForwardProtocolBadge } from "@/components/forwards/forward-protocol-badge";
+import { ForwardLedgerTotal, ForwardTopologyCard } from "@/components/forwards/forward-topology";
+import { ForwardDnsCard } from "@/components/forwards/forward-dns-card";
+import { ForwardLatencyCard } from "@/components/forwards/forward-latency";
+import { ForwardHaCard } from "@/components/forwards/forward-ha-card";
 import { useI18n } from "@/components/providers";
 import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
@@ -31,7 +35,7 @@ import {
   forwardProductStatus,
 } from "@/lib/forward-status";
 import type { NodeBinding, PortForward, TrafficPoint, UserNode } from "@/lib/types";
-import { formatBytes, formatDateTime } from "@/lib/utils";
+import { formatDateTime } from "@/lib/utils";
 
 export function ForwardDetail({
   forward: initialForward,
@@ -259,9 +263,10 @@ export function ForwardDetail({
           <CardContent>
             <div className="mb-2 flex items-center justify-between">
               <span className="section-title">{t("forward.trafficTrend")}</span>
-              <span className="text-xs text-[var(--muted-foreground)]">
-                {t("forward.totalTraffic")}: {formatBytes(forward.traffic)}
-              </span>
+              {/* 累计流量改用**归档账本**（与图表同源），不再读详情接口里那条
+                  已无写入者的 legacy `forward.traffic` 列（F11：同屏两个口径，
+                  数字永远是 0 B）。窗口/归档延迟由组件如实标注。 */}
+              <ForwardLedgerTotal points={traffic} />
             </div>
             {traffic.length > 0 ? (
               <TrafficChart data={traffic} />
@@ -272,6 +277,35 @@ export function ForwardDetail({
             )}
           </CardContent>
         </Card>
+
+        {/* 链路（自包含组件，自带四态：loading / denied / 取不到 / ok）。
+            它一次回答"这条转发经过哪些节点、每一端是否在跑、revision 对不对"，
+            并且**只**消费服务端 `GET /api/forwards/:id/topology` 的投影——
+            前端不自己判在线、不把"取不到"说成"正常"。 */}
+        <div className="lg:col-span-2">
+          <ForwardTopologyCard forwardId={forward.id} />
+        </div>
+
+        {/* DNS 前门（自包含组件，只吃 forwardId：权限、取数、绑定/解绑、五态与
+            退避全部在组件内部，按服务端投影渲染）。它**不**推断"已切换"：
+            只有 `state === "synced"` 才会那样说。 */}
+        <div className="lg:col-span-2">
+          <ForwardDnsCard forwardId={forward.id} />
+        </div>
+
+        {/* 延迟历史（自包含组件，只吃 forwardId）。四态由服务端的 `status` 决定：
+            有观测 / 窗口内没观测（数据缺口）/ 按构造没有观测维度 / 多目标拒绝猜；
+            `latency_ms: null` 是"那次不可达"，折线断开而**不补零**。 */}
+        <div className="lg:col-span-2">
+          <ForwardLatencyCard forwardId={forward.id} />
+        </div>
+
+        {/* 高可用（task-16 交付的自包含卡片）：只读服务端 `/forwards/:id/ha` 投影。
+            「首选入口」是**期望**、`connection`/`accepts_new_business` 是**事实**，
+            两者在卡片里分开说；平台策略缺省即关时显示"未启用自动迁移"，不写成"已保护"。 */}
+        <div className="lg:col-span-2">
+          <ForwardHaCard forwardId={forward.id} />
+        </div>
 
         <Card>
           <CardHeader>

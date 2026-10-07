@@ -1,6 +1,14 @@
-// Package reporter implements the Agent's outbound heartbeat and authenticated
-// state report. The Agent reports raw runtime facts; the Panel derives health and
-// product status from them. Reporting never requires Panel-to-Agent connectivity.
+// Package reporter implements the Agent's outbound state report. The Agent reports
+// raw runtime facts; the Panel derives health and product status from them.
+// Reporting never requires Panel-to-Agent connectivity.
+//
+// There is exactly ONE outbound report channel: the authenticated POST to
+// StatePath. An earlier build also sent an unauthenticated "heartbeat" to
+// /api/internal/heartbeat, but the Panel never implemented that route (it does not
+// exist, and never existed, in `backend/src/routes/internal-node.ts`): every beat
+// answered 404 and the response was discarded. It is deleted rather than
+// reimplemented — an unauthenticated liveness POST would be a second definition of
+// "alive", and liveness is derived from this authenticated report alone.
 //
 // The post function is injected so unit tests never touch the network.
 package reporter
@@ -20,21 +28,20 @@ import (
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/panelroute"
 	"github.com/tunex/agent/internal/targetobs"
 )
 
-// Interval is the heartbeat cadence.
+// Interval is the state-report cadence.
 const Interval = 30 * time.Second
 
-// ClientTimeout bounds a single heartbeat POST: a hung panel endpoint must not
-// pile up goroutines or delay the next beat by more than one interval.
+// ClientTimeout bounds a single state-report POST: a hung panel endpoint must not
+// pile up goroutines or delay the next report by more than one interval.
 const ClientTimeout = 10 * time.Second
 
-// HeartbeatPath is the panel endpoint the agent posts to.
-const HeartbeatPath = "/api/internal/heartbeat"
-
-// StatePath is the authenticated node-state endpoint. Telemetry extends this
-// same report instead of creating a second node-monitoring truth.
+// StatePath is the authenticated node-state endpoint — the Agent's ONE channel to
+// the Panel. Telemetry, ownership-lease renewal and the closing report all ride
+// this report instead of creating a second node-monitoring truth.
 const StatePath = "/api/internal/node/state"
 
 // CredentialHeader carries the per-node credential (services/node-credential.ts).
@@ -42,29 +49,20 @@ const StatePath = "/api/internal/node/state"
 // the header value never appears in any log line (logx calls never touch it).
 const CredentialHeader = "Authorization"
 
-// ErrNoPanelURL is returned by Run when no panel URL is configured. A node may
-// legitimately run without reporting, so this is a startup decision, not a
-// runtime failure.
-var ErrNoPanelURL = errors.New("reporter: panel url is not configured")
+// ErrNoPanelURL is returned by Run when there is nothing to report to: the panel
+// URL is unset, or the node carries no credential. The authenticated state report
+// is the only channel, so without it a "running" reporter would send nothing at
+// all. A node may legitimately run without reporting, so this is a startup
+// decision, not a runtime failure.
+var ErrNoPanelURL = errors.New("reporter: panel url or node credential is not configured")
 
 // ErrAlreadyRunning is returned by Run when a previous Run is still active.
 var ErrAlreadyRunning = errors.New("reporter: already running")
 
-// Payload is the heartbeat body. Field names match the panel's Node model so
-// the backend can deserialise it directly.
-type Payload struct {
-	AgentID     string                `json:"agent_id,omitempty"`
-	NodeID      string                `json:"node_id"`
-	Version     string                `json:"version"`
-	Role        string                `json:"role"`
-	Timestamp   int64                 `json:"timestamp"`
-	Tunnels     []ReportedTunnel      `json:"tunnels,omitempty"`
-	EgressPools map[string]EgressPool `json:"egress_pools,omitempty"`
-}
-
-// StatePayload is the authenticated state-report body. It is the heartbeat
-// superset the Panel uses to derive current node/runtime facts without dialing
-// the Agent. Shape is owned by services/node-state.ts.
+// StatePayload is the state-report body — the Panel uses it to derive current
+// node/runtime facts without dialing the Agent. Shape is owned by
+// services/node-state.ts. Field names match the panel's Node model so the backend
+// can deserialise them directly.
 type StatePayload struct {
 	AgentID     string                `json:"agent_id,omitempty"`
 	Version     string                `json:"version,omitempty"`
@@ -75,6 +73,18 @@ type StatePayload struct {
 	// Revision is the newest config revision the agent has applied (0 = none).
 	Revision int64  `json:"reported_revision,omitempty"`
 	LastErr  string `json:"last_error,omitempty"`
+
+	// ── 面板迁移回退（task-44）──────────────────────────────────────────────
+	//
+	// **每一次**上报都要带"我现在在跟谁说"这三件事，否则面板会以为节点还在主地址上
+	// （那正是本任务明令禁止的状态）。三个键都是**加法**字段：老面板忽略未知键
+	// （validateStateReport 对未知键宽容），老 agent 直接不发。
+	//
+	// FallbackActive 没有 omitempty：它必须是显式的 false，而不是"没这个键"——
+	// "不在回退态"和"这个 agent 根本不知道回退这件事"要能分辨。
+	PanelURLInUse       string `json:"panel_url_in_use,omitempty"`
+	PanelMigrationID    string `json:"panel_migration_id,omitempty"`
+	PanelFallbackActive bool   `json:"panel_fallback_active"`
 
 	// Telemetry facts are additive and optional.
 	//
@@ -350,7 +360,7 @@ func WithManifest(manifest *CapabilityManifest) Option {
 	}
 }
 
-// Reporter periodically reports the node's heartbeat.
+// Reporter periodically sends the node's authenticated state report.
 type Reporter struct {
 	cfg Config
 
@@ -366,9 +376,27 @@ type Config struct {
 	Version  string
 	Role     string
 
-	// Credential authenticates state reporting. Empty disables the authenticated
-	// state report; the unauthenticated heartbeat remains best-effort compatibility.
+	// Credential authenticates the state report. Empty disables reporting
+	// entirely: there is no unauthenticated fallback channel (the old
+	// /api/internal/heartbeat POST was never implemented by the Panel, and has
+	// been removed rather than reimplemented).
 	Credential string
+
+	// Panels 是面板迁移回退配置（task-44）。零值（备用地址与迁移 id 都空）= 未启用：
+	// 切换器只累计失败、永不改地址，上报体里也不带迁移字段。
+	//
+	// 注意：当 Router 已注入时，**Router 自己的配置才是权威**（它是全进程共用的那一份）；
+	// Panels 只在 Router 未注入时用来构造 reporter 的私有切换器。
+	Panels panelroute.PanelMigration
+
+	// Router 是**进程级共享**的面板地址切换器（task-45）。生产路径由 runtime 在
+	// 构造 reporter / control 之前创建并同时注入两边，因此状态上报、命令拉取、ACK、
+	// 重连 desired fetch/reconcile 共用同一个"当前生效地址"，而不是每个模块各拿一份
+	// cfg.PanelURL 自己判定。
+	//
+	// nil = 未注入（单测 / 独立使用）：New 会用 PanelURL + Panels 建一个**私有**
+	// 切换器。上报行为与从前一致，但别的组件看不到这次切换 —— 生产必须注入。
+	Router *panelroute.Router
 
 	tunnels  TunnelLister
 	egress   EgressLister
@@ -446,7 +474,8 @@ func WithTunnels(t TunnelLister) Option { return func(c *Config) { c.tunnels = t
 func WithEgress(e EgressLister) Option { return func(c *Config) { c.egress = e } }
 
 // WithPost replaces the HTTP transport (tests). The headers map carries the
-// credential for the state report; the legacy heartbeat sends nil headers.
+// credential for the state report; every request the reporter makes is that one
+// authenticated report (there is no second, credential-less channel).
 //
 // It is the error-only shape, so a test that does not care about the panel's
 // answer keeps working unchanged; the body it discards is what
@@ -500,6 +529,10 @@ func WithStartedAt(t time.Time) Option { return func(c *Config) { c.startedAt = 
 func (r *Reporter) StartedAt() time.Time { return r.cfg.startedAt }
 
 // New builds a reporter with options applied after cfg.
+//
+// 面板地址切换器在这里兜底：调用方没注入共享 Router 时建一个私有的（同样的判据，
+// 同样的规则），这样零配置/单测路径的行为与从前逐字一致。生产路径必须注入 runtime
+// 创建的那个，否则上报会在一份私有状态里切换，而命令拉取仍盯着主地址。
 func New(cfg Config, opts ...Option) *Reporter {
 	for _, o := range opts {
 		o(&cfg)
@@ -510,46 +543,40 @@ func New(cfg Config, opts ...Option) *Reporter {
 	if cfg.now == nil {
 		cfg.now = time.Now
 	}
+	if cfg.Router == nil {
+		cfg.Router = panelroute.New(panelroute.Config{
+			PrimaryURL: cfg.PanelURL,
+			Migration:  cfg.Panels,
+			NodeID:     cfg.NodeID,
+		})
+	}
 	return &Reporter{cfg: cfg}
 }
 
-// Endpoint returns the full heartbeat URL, or "" when reporting is disabled.
-func (r *Reporter) Endpoint() string {
-	base := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
-	if base == "" {
-		return ""
-	}
-	return base + HeartbeatPath
-}
-
-// Payload builds the current heartbeat body.
-func (r *Reporter) Payload() Payload {
-	p := Payload{
-		AgentID:   r.cfg.AgentID,
-		NodeID:    r.cfg.NodeID,
-		Version:   r.cfg.Version,
-		Role:      r.cfg.Role,
-		Timestamp: r.cfg.now().Unix(),
-	}
-	if r.cfg.tunnels != nil {
-		p.Tunnels = r.reportedTunnels()
-	}
-	if r.cfg.egress != nil {
-		p.EgressPools = r.cfg.egress.Snapshot()
-	}
-	return p
-}
-
-// StatePayload builds the state-report body. It is the heartbeat superset:
-// same tunnel/pool data plus the ports actually bound, the newest applied
-// revision and the last error string. Version/Role come from config, not from
-// the payload — the panel pins them to the credential's node (the agent never
-// gets to say "I am node X").
+// StatePayload builds the state-report body: tunnel/pool data plus the ports
+// actually bound, the newest applied revision and the last error string.
+// Version/Role come from config, not from the payload — the panel pins them to
+// the credential's node (the agent never gets to say "I am node X").
 func (r *Reporter) StatePayload() StatePayload {
+	routeState, migration := r.panelRouteSnapshot()
+	return r.statePayloadFor(routeState, migration)
+}
+
+func (r *Reporter) statePayloadFor(routeState panelroute.PanelRouteState, migration panelroute.PanelMigration) StatePayload {
 	p := StatePayload{
 		AgentID: r.cfg.AgentID,
 		Version: r.cfg.Version,
 		Role:    r.cfg.Role,
+	}
+	// 面板迁移回退（task-44/45）：把"当前生效地址 + 迁移 id + 是否回退态"带上。
+	// 未配置回退时不写迁移字段（保持与老 agent 的载荷逐字一致），但仍带上当前生效
+	// 地址 —— 它本来就是事实，且让面板能区分"节点在跟主地址说话"与"在跟备用地址"。
+	//
+	// 三个路由字段共用调用方的快照；发送时的目的地址也从同一快照派生。
+	p.PanelURLInUse = routeState.ActiveURL(migration)
+	if migration.Enabled() {
+		p.PanelMigrationID = migration.MigrationID
+		p.PanelFallbackActive = routeState.InFallback()
 	}
 	// Only advertise negotiation facts when configured. Leaving both fields out keeps
 	// "never told the panel" distinguishable from "supports nothing".
@@ -650,14 +677,50 @@ func (r *Reporter) fillTelemetry(p *StatePayload) {
 	}
 }
 
+// stateRequest binds the destination and payload to one route snapshot. A switch
+// while telemetry is collected cannot change this in-flight report's destination;
+// the next report observes the new route. No router lock is held during collection.
+func (r *Reporter) stateRequest() (string, StatePayload) {
+	if r == nil || strings.TrimSpace(r.cfg.Credential) == "" {
+		return "", StatePayload{}
+	}
+	routeState, migration := r.panelRouteSnapshot()
+	base := routeState.ActiveURL(migration)
+	if base == "" {
+		return "", StatePayload{}
+	}
+	return base + StatePath, r.statePayloadFor(routeState, migration)
+}
+
 // StateEndpoint returns the full state-report URL, or "" when credential-less.
 // A node without a credential cannot send an authenticated state report.
+//
+// 地址来自**共享切换器**（task-44/45）：主地址连续失败到阈值后，这里返回备用地址。
+// 任何时刻都只有一个"生效地址"，不存在"已经在回退态却还在往主地址打"的状态；而且
+// 这份状态与命令拉取 / ACK / desired fetch 是**同一个** Router（见 Config.Router）。
 func (r *Reporter) StateEndpoint() string {
-	base := strings.TrimRight(strings.TrimSpace(r.cfg.PanelURL), "/")
+	base := r.activePanelURL()
 	if base == "" || strings.TrimSpace(r.cfg.Credential) == "" {
 		return ""
 	}
 	return base + StatePath
+}
+
+// activePanelURL 返回当前生效的面板基址（共享切换器判定的结果，每次调用都重新取）。
+func (r *Reporter) activePanelURL() string {
+	if r == nil || r.cfg.Router == nil {
+		return ""
+	}
+	return r.cfg.Router.ActiveURL()
+}
+
+// notePanelAttempt 把一次出站结果喂给共享切换器。判定与日志都在 panelroute.Router
+// 里（只有一处），这里只负责"这条出站真的发生过"这一事实。
+func (r *Reporter) notePanelAttempt(outcome panelroute.PanelOutcome, now time.Time) {
+	if r == nil || r.cfg.Router == nil {
+		return
+	}
+	r.cfg.Router.NoteOutcome(outcome, now)
 }
 
 // sortedPorts turns the manager's port set into a deterministic slice so the
@@ -674,15 +737,16 @@ func sortedPorts(in map[int]bool) []int {
 	return out
 }
 
-// Run blocks, sending a heartbeat every Interval until ctx is cancelled or Stop
-// is called. The first beat goes out immediately so the Panel sees the node
-// promptly after restart.
+// Run blocks, sending one state report every Interval until ctx is cancelled or
+// Stop is called. The first report goes out immediately so the Panel sees the
+// node promptly after restart.
 //
-// A failed beat is dropped and retried on the next tick; reporting never makes
-// the agent exit. Returns ErrNoPanelURL immediately when reporting is off, and
-// ErrAlreadyRunning if Run is called twice.
+// A failed report is dropped and retried on the next tick; reporting never makes
+// the agent exit. Returns ErrNoPanelURL immediately when there is nothing to
+// report to (no panel URL or no credential), and ErrAlreadyRunning if Run is
+// called twice.
 func (r *Reporter) Run(ctx context.Context) error {
-	if r.Endpoint() == "" {
+	if r.StateEndpoint() == "" {
 		return ErrNoPanelURL
 	}
 	r.mu.Lock()
@@ -703,7 +767,6 @@ func (r *Reporter) Run(ctx context.Context) error {
 	t := time.NewTicker(Interval)
 	defer t.Stop()
 
-	r.send(ctx)
 	r.sendState(ctx)
 	for {
 		select {
@@ -712,46 +775,41 @@ func (r *Reporter) Run(ctx context.Context) error {
 		case <-stop:
 			return nil
 		case <-t.C:
-			r.send(ctx)
 			r.sendState(ctx)
 		}
 	}
 }
 
-// send posts one heartbeat, best effort: a transport failure is intentionally
-// swallowed here (the agent's own logging happens inside the post hook) because
-// a flaky panel must never cascade into the node's data plane.
-func (r *Reporter) send(ctx context.Context) {
-	body, err := json.Marshal(r.Payload())
-	if err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
-	defer cancel()
-	// The legacy heartbeat has no response contract: whatever comes back is
-	// ignored, exactly as before.
-	_, _ = r.cfg.post(ctx, r.Endpoint(), body, nil)
-}
-
-// sendState posts one state report (best effort, same reasoning as send).
+// sendState posts one state report, best effort: a transport failure is
+// intentionally swallowed here (the agent's own logging happens inside the post
+// hook) because a flaky panel must never cascade into the node's data plane.
 //
 // Rejected credentials (401) are the one failure worth mentioning to the
 // operator: the node is alive and healthy but can no longer identify itself,
 // which is a provisioning problem they must fix. Transport failures stay
 // swallowed — a flaky panel must never cascade into the data plane.
 func (r *Reporter) sendState(ctx context.Context) {
-	if r.StateEndpoint() == "" {
+	endpoint, payload := r.stateRequest()
+	if endpoint == "" {
 		return
 	}
-	body, err := json.Marshal(r.StatePayload())
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	answer, err := r.cfg.post(ctx, endpoint, body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
+	// 面板迁移回退（task-44/45）：把这一拍的结果喂给**共享**切换器。**必须在 post 之后
+	// 立刻做**，而且成功/失败都要记：任一次成功清零（参照实现语义），连续失败到阈值才切。
+	// 切换一旦发生，命令拉取/ACK/desired 也会通过同一个 Router 立刻看到新地址。
+	if err != nil {
+		r.notePanelAttempt(panelroute.PanelOutcomeFailure, r.cfg.now())
+	} else {
+		r.notePanelAttempt(panelroute.PanelOutcomeSuccess, r.cfg.now())
+	}
 	if isCredentialRejected(err) {
 		logx.Warn("state report rejected: node credential is invalid or revoked",
 			"node_id", r.cfg.NodeID)
@@ -849,28 +907,36 @@ func isCredentialRejected(err error) bool { return errors.Is(err, errRejected) }
 // what it actually did while closing listeners, and Run's ticker cannot be
 // relied on once the process is on its way out.
 //
+// 这一拍的结果同样喂给共享切换器（task-45）：关闭时的这一次出站与运行期一样是
+// "这个地址通不通"的证据，不喂会让关闭路径与运行期用两套计数。切换在**下一次**取
+// 地址时生效（本次已经把要打的地址取走了）。
+//
 // ctx bounds the attempt; the caller passes a context with its own deadline
 // because the process-wide context is already cancelled during shutdown.
 func (r *Reporter) ReportOnce(ctx context.Context) error {
-	if r == nil || r.StateEndpoint() == "" {
+	endpoint, payload := r.stateRequest()
+	if endpoint == "" {
 		return nil
 	}
-	body, err := json.Marshal(r.StatePayload())
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, ClientTimeout)
 	defer cancel()
-	answer, err := r.cfg.post(ctx, r.StateEndpoint(), body, map[string]string{
+	answer, err := r.cfg.post(ctx, endpoint, body, map[string]string{
 		CredentialHeader: "Bearer " + strings.TrimSpace(r.cfg.Credential),
 	})
-	if err == nil {
-		// The closing report renews the leases as much as any other one: a node
-		// that is draining still owns what it serves, and its last statement
-		// should not be the one that skips the answer.
-		r.deliverLeases(answer)
+	if err != nil {
+		r.notePanelAttempt(panelroute.PanelOutcomeFailure, r.cfg.now())
+		return err
 	}
-	return err
+	r.notePanelAttempt(panelroute.PanelOutcomeSuccess, r.cfg.now())
+	// The closing report renews the leases as much as any other one: a node
+	// that is draining still owns what it serves, and its last statement
+	// should not be the one that skips the answer.
+	r.deliverLeases(answer)
+	return nil
 }
 
 // Stop makes a running Run return. Safe before/after Run and more than once.
@@ -888,8 +954,8 @@ func (r *Reporter) Stop() {
 // errRejected so sendState can tell "my credential is no good" (operator must
 // act) from "the panel is flaky" (nothing to do).
 //
-// headers is nil for the legacy heartbeat and carries Authorization for the
-// state report; the credential value is never included in the error text.
+// headers carries Authorization for the state report; the credential value is
+// never included in the error text.
 func httpPost(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -901,14 +967,14 @@ func httpPost(ctx context.Context, url string, body []byte, headers map[string]s
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("heartbeat post %s: %w", url, err)
+		return nil, fmt.Errorf("state report post %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return nil, fmt.Errorf("%w: status %d", errRejected, resp.StatusCode)
 		}
-		return nil, fmt.Errorf("heartbeat post %s: status %d", url, resp.StatusCode)
+		return nil, fmt.Errorf("state report post %s: status %d", url, resp.StatusCode)
 	}
 	// Bounded read: the answer carries lease facts, not a document. A panel that
 	// streams megabytes at the agent must not be able to grow its heap.

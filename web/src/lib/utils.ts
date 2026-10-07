@@ -10,7 +10,11 @@ export function formatBytes(bytes: number | null | undefined, digits = 2): strin
   const n = Number(bytes ?? 0);
   if (!Number.isFinite(n) || n <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1);
+  // `0 < n < 1` 时 `Math.floor(log(n)/log(1024))` 会算出 **-1** ⇒ `units[-1] === undefined`
+  // ⇒ 渲染成 `327.68 undefined`。吞吐速率天然落在亚字节区间（十几 KB/天 ÷ 86400 ≈ 0.3 B/s），
+  // 所以这不是理论边界：`web-forward` 在 task-39 里实测踩到、只能在卡片内自行规避。
+  // 下标必须钳到 **[0, units.length-1]**。
+  const i = Math.min(Math.max(Math.floor(Math.log(n) / Math.log(1024)), 0), units.length - 1);
   return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : digits)} ${units[i]}`;
 }
 

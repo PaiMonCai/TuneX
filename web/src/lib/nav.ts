@@ -147,6 +147,15 @@ export const userConsoleNav: NavGroup[] = [
     items: [
       { href: "/settings", labelKey: "common.settings", iconKey: "settings" },
       { href: "/settings/workspace", labelKey: "common.workspace", iconKey: "workspace" },
+      // DDNS 切片的设置页入口：词条暂放在 `lib/ddns-i18n.ts`（与 node-*-i18n 同一约定），
+      // 词典尚未收录，故带 labelZh/labelEn 回退，避免渲染成键名本身。
+      {
+        href: "/settings/dns",
+        labelKey: "ddns.providersTitle",
+        labelZh: "DNS 服务商",
+        labelEn: "DNS providers",
+        iconKey: "tunnels",
+      },
     ],
   },
 ];
@@ -243,6 +252,16 @@ export const adminConsoleNav: NavGroup[] = [
     items: [
       { href: "/admin/tickets", labelKey: "admin.tickets", iconKey: "adminTickets" },
       { href: "/admin/announcements", labelKey: "admin.announcements", iconKey: "announcements" },
+      // 平台级通知渠道配置（切片 N2-UI）。词典里还没有 `admin.notificationChannels` ⇒ 用
+      // labelZh/labelEn 回退（与 admin.capacity / admin.routeProfiles 同一取向：新页文案先就地，
+      // 不在共享词典上收口）。权限真相在后端 RBAC（资源键 `notification_channels`）。
+      {
+        href: "/admin/notification-channels",
+        labelKey: "admin.notificationChannels",
+        labelZh: "通知渠道",
+        labelEn: "Notification channels",
+        iconKey: "announcements",
+      },
       { href: "/admin/audit-logs", labelKey: "admin.auditLogs", iconKey: "license" },
       {
         href: "/admin/alerts",

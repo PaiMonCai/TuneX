@@ -805,7 +805,7 @@ export function noEvidenceTargetView(target: string): TargetHealthTargetView {
 
 // ------------------------------------------------- WP12 出口池 / 目标（mock）
 
-/** 出口池 CRUD + 嵌套目标 CRUD：/admin/nodes/:id/pools[...]（node 解析后喂进来） */
+/** 出口池 CRUD + 嵌套目标 CRUD：真实单数路径 /admin/node/:id/pools 与 /admin/node/pools/:poolId[...]（node 解析后喂进来） */
 export function handleEgressPools(
   db: Store,
   node: Node,
@@ -818,7 +818,13 @@ export function handleEgressPools(
   // /pools 列表路由
   if (rest.length === 0) {
     if (method === "GET") {
-      return ok(pools.map((p) => ({ ...p, targets: db.egressTargets.get(p.id) ?? [] })));
+      // 与真实后端同一信封：`{ data: { data, total } }`
+      // （`node-admin.ts:143` 的 `get("/node/:id/pools")` → `db.nodeGroup` 风格的
+      //  `{data:{data,total}}`）。客户端 `api.admin.pools` 解一层拿到 `{data,total}`，
+      // 再取 `.data`；mock 这里必须给出**内层的 `{data,total}`**，否则解完是数组，
+      // 客户端按信封读取会得到空列表——「mock 与真实不同形」正是本文件被反复修的原因。
+      const rows = pools.map((p) => ({ ...p, targets: db.egressTargets.get(p.id) ?? [] }));
+      return ok({ data: rows, total: rows.length });
     }
     if (method === "POST") {
       const body = asRecord(req.body);
@@ -899,7 +905,8 @@ export function handleEgressPools(
         if (weight !== null && weight < 0) return badRequest("权重不合法");
         if (targets.some((t) => t.host === host && t.port === port)) return badRequest("同一地址端口已存在");
         const target: EgressTarget = {
-          id: nextTargetId(targets),
+          // 全局唯一（真实后端按 targetId 全局寻址，见 `nextTargetId` 的说明）
+          id: nextTargetId(targets, [...db.egressTargets.values()]),
           pool_id: pool.id,
           host,
           port,
@@ -963,8 +970,28 @@ export function nextPoolId(pools: EgressPool[]): ID {
   return pools.reduce((m, p) => Math.max(m, p.id), 0) + 1;
 }
 
-export function nextTargetId(targets: EgressTarget[]): ID {
-  return targets.reduce((m, x) => Math.max(m, x.id), 0) + 1;
+/**
+ * 新出口目标 ID —— **全局唯一**，与真实后端的寻址方式一致。
+ *
+ * 真实后端的目标是全局地址：`PATCH|DELETE /api/admin/node/targets/:targetId`
+ * （`node-admin.ts:291/308`）里没有 pool，只有 targetId。所以 targetId 必须在
+ * **所有池**之间唯一，否则"按 id 找目标"会命中另一个池里的同号目标。
+ *
+ * 曾经这里按**单个池**分配（`max(本池) + 1`），于是每个池都有 id=1：mock 一旦
+ * 按真实路径寻址，就会删/改到别的池的目标（实测：DELETE 返回 ok，但被删的是
+ * 种子池里的同号目标，PATCH 那个"已删"目标仍然 200）。id 空间与真实契约不符
+ * 属于 mock 撒谎的一种，故改为全局。
+ *
+ * 入参仍是"当前池的目标"（调用点已持有），这里再叠加**所有池**的最大值——
+ * 纯函数、不改调用方语义。
+ */
+export function nextTargetId(targets: EgressTarget[], allPools?: EgressTarget[][]): ID {
+  const poolMax = targets.reduce((m, x) => Math.max(m, x.id), 0);
+  const globalMax = (allPools ?? []).reduce(
+    (m, list) => list.reduce((mm, x) => Math.max(mm, x.id), m),
+    poolMax,
+  );
+  return globalMax + 1;
 }
 
 /* ------------------------------------------------------------------ *

@@ -1,3 +1,5 @@
+// 行为参照：ForwardX（AGPL-3.0-only）——Looking Glass 方法集与结果语义；代码为本项目改写，未复制其实现。
+
 /**
  * Looking Glass（面板侧安全边界 + 有界编排）。
  *
@@ -53,14 +55,45 @@ import { admitAction } from "./runtime-admission.ts";
 export const LOOKING_GLASS_ACTION = "looking_glass";
 
 /**
- * 方法闭集。v1 只有一个成员，而且是**刻意**的：
+ * 方法闭集（task-40 从 1 种扩到 3 种）。成员是**我们真的能执行**的方法：
  *  · `tcp_connect` —— 无特权、无 shell、无载荷，和既有 diag 探针同一原语；
- *  · 不做 ICMP/traceroute（需要 `CAP_NET_RAW`，与 §1.9「静态非特权二进制」冲突）；
+ *  · `ping` / `ping6` —— ICMP echo。**旧注释里"ICMP 需要 CAP_NET_RAW"只对了一半**，
+ *    2026-10-07 在生产 caps（`--cap-drop ALL --cap-add NET_BIND_SERVICE`，CapEff=0x400）
+ *    下实测：内核允许非特权 ICMP 时（`net.ipv4.ping_group_range=0 2147483647`），
+ *    busybox `ping` 走 SOCK_DGRAM/ICMP **成功**收到真实回包（1.1.1.1，avg 1.983 ms）；
+ *    需要 CAP_NET_RAW 的是 **raw socket**，也就是 `traceroute`（实测 EPERM）。
+ *    agent 侧因此不自己开 socket，而是在固定候选绝对路径上调用镜像自带的 ping 二进制。
+ *  · **不做** `traceroute`/`traceroute6`/`mtr`/`mtr6` —— 见 {@link LOOKING_GLASS_UNAVAILABLE_METHODS}，
+ *    如实标"不可用"并给原因，而不是假装支持；
  *  · 不做 UDP（没有可靠回包来源，做了就是编造事实，D6/§4.0 O3）；
  *  · 不做 HTTP（见文件头：重定向/降级/凭据是另一份威胁模型的活）。
  * 未知方法**拒绝**而不是"忽略后当 TCP 处理"（危险方向：静默降级）。
  */
-export const LOOKING_GLASS_METHODS = ["tcp_connect"] as const;
+export const LOOKING_GLASS_METHODS = ["tcp_connect", "ping", "ping6", "traceroute", "traceroute6"] as const;
+
+/**
+ * 本版本**明确不提供**的方法，以及原因。
+ *
+ * 为什么要有一个显式列表而不是"干脆不提"：ForwardX 的方法集里有它们（traceroute/
+ * traceroute6/mtr/mtr6），运维会照着找。不说清"为什么没有"就会被读成"这个产品没有
+ * 诊断能力"，而真相是**在我们的权限模型下做不到**：
+ *
+ *   · `traceroute`/`traceroute6` —— 需要 **raw socket**（CAP_NET_RAW）。生产安装脚本
+ *     给 agent 的是 `--cap-drop ALL --cap-add NET_BIND_SERVICE`，实测
+ *     `socket(AF_INET,3,1): Operation not permitted`。放宽它等于给每个节点开一个
+ *     原始包能力，与"静态非特权二进制"的取向冲突，本版本不做。
+ *   · `mtr`/`mtr6` —— 镜像里**没有这个二进制**，且同样依赖 raw socket。
+ *
+ * 这份列表同时是 UI 的文案来源：面板据此显示"该方法是本版本不提供的，原因是 X"，
+ * 而不是让用户以为"按钮坏了"。
+ */
+export const LOOKING_GLASS_UNAVAILABLE_METHODS = [
+  {
+    method: "mtr",
+    reason: "镜像里没有 mtr 二进制；且 mtr 默认需要 raw socket（CAP_NET_RAW），生产 caps 下不可用 —— 所以我们不做它，而不是假装支持",
+  },
+  { method: "mtr6", reason: "同 mtr：无二进制 + 依赖 raw socket（CAP_NET_RAW）" },
+] as const;
 export type LookingGlassMethod = (typeof LOOKING_GLASS_METHODS)[number];
 export const LOOKING_GLASS_DEFAULT_METHOD: LookingGlassMethod = "tcp_connect";
 
@@ -88,6 +121,72 @@ export const LOOKING_GLASS_MAX_HOST_CHARS = 253;
 /** 单条 detail 的字符上界（与 Agent 侧 `diag.MaxDetailChars` 一致）。 */
 export const LOOKING_GLASS_DETAIL_MAX_CHARS = 160;
 
+/**
+ * 一次路径跟踪最多几跳。与 Agent 侧 `diag.MaxLookingGlassHops` 同值：
+ * 两侧硬上限必须一致，否则合法结果会被面板判成非法。
+ */
+export const LOOKING_GLASS_MAX_HOPS = 8;
+
+/** 逐跳结果的**面板侧视图**（逐字段重建，节点塞不进别的东西）。 */
+export interface LookingGlassHopView {
+  ttl: number;
+  address: string;
+  rtt_ms?: number;
+  note?: string;
+}
+
+/**
+ * 投影节点上报的 `hops`。
+ *
+ * 纪律与结果本身一致：
+ *   · **地址必须是字面 IP** —— 节点做反向解析（把跳数写成域名）说明"节点不做名称解析"
+ *     这条边界被绕过，整份结果拒绝；
+ *   · 跳数有硬上限（超限拒绝而不是截断：截断后的路径会被读成"路径就到这里"）；
+ *   · 备注走与 detail 同一套 redact + 长度上界。
+ */
+function projectLookingGlassHops(
+  value: unknown,
+): { ok: true; value: LookingGlassHopView[] } | { ok: false; message: string } {
+  if (value === undefined || value === null) return { ok: true, value: [] };
+  if (!Array.isArray(value)) return { ok: false, message: "hops 必须是数组" };
+  if (value.length > LOOKING_GLASS_MAX_HOPS) {
+    return { ok: false, message: `hops 超过上限 ${LOOKING_GLASS_MAX_HOPS}` };
+  }
+  const out: LookingGlassHopView[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { ok: false, message: "hop 必须是对象" };
+    }
+    const row = raw as Record<string, unknown>;
+    const ttl = row.ttl;
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > LOOKING_GLASS_MAX_HOPS) {
+      return { ok: false, message: "hop.ttl 非法" };
+    }
+    const address = typeof row.address === "string" ? row.address.trim() : "";
+    // 复用既有的**严格字面地址判定**（`classifyRequestedHost` 的 literal 分支只认规范写法；
+    // 十进制/八进制/短形式都进不了）。刻意**不** import `node:net`：面板是控制面、不得拨号，
+    // 这条由 `d-looking-glass.test.ts` 的源码级守卫钉着（唯一出站是 DNS）。
+    if (address !== "" && classifyRequestedHost(address).kind !== "literal") {
+      return { ok: false, message: `hop.address 必须是字面 IP（节点不得做名称解析）：${address}` };
+    }
+    const rtt =
+      typeof row.rtt_ms === "number" && Number.isFinite(row.rtt_ms) && row.rtt_ms >= 0
+        ? Math.trunc(row.rtt_ms)
+        : undefined;
+    const note =
+      typeof row.note === "string" && row.note !== ""
+        ? String(redact(row.note.slice(0, LOOKING_GLASS_DETAIL_MAX_CHARS)))
+        : undefined;
+    out.push({
+      ttl,
+      address,
+      ...(rtt === undefined ? {} : { rtt_ms: rtt }),
+      ...(note === undefined ? {} : { note }),
+    });
+  }
+  return { ok: true, value: out };
+}
+
 /** 结果状态闭集（与 Go `diag.Status` 逐字一致）。 */
 export const LOOKING_GLASS_STATUSES = [
   "reachable",
@@ -114,6 +213,8 @@ export const LOOKING_GLASS_CODES = {
   targetUnresolved: "target_unresolved",
   resolverInvalid: "resolver_returned_invalid_address",
   methodNotSupported: "method_not_supported",
+  /** 面板支持该方法，但**这个节点**没有上报执行能力（task-42）。 */
+  methodUnavailableOnNode: "method_unavailable_on_node",
   timeoutOutOfRange: "timeout_out_of_range",
   auditUnavailable: "audit_unavailable",
   agentFailed: "agent_failed",
@@ -126,9 +227,15 @@ export const LOOKING_GLASS_CODES = {
  * `null ≠ 0`、`不可比的不并排`（D12）同样适用：这里只给事实与边界。
  */
 export const LOOKING_GLASS_CAVEATS: readonly string[] = [
-  "这是从该节点发出的 TCP 连接测试（tcp_connect）：连上只证明 L3/L4 可达，不证明对端业务可用。",
+  "这是从该节点发出的主动探测（tcp_connect / ping / ping6）：连上或收到回包只证明 L3/L4 可达，不证明对端业务可用。",
   "域名由面板解析、节点只拨固定地址：因此它不能回答「节点侧 DNS 能否解析该域名」。",
-  "不含 UDP/ICMP：datagram 没有可靠探测来源，本版本不产生该事实。",
+  "ping/ping6 由节点在容器内调用镜像自带的 ping 二进制（非特权 ICMP），依赖节点内核允许非特权 ICMP；" +
+    "ping6 还需要节点自身有 IPv6 出网路径 —— 没有时结果是 unreachable，那不是方法未实现。",
+  "traceroute / traceroute6 由节点调用 iputils 的 tracepath 实现（非特权：UDP 探测 + ICMP 超时回包），" +
+    "因此没有放开 CAP_NET_RAW；目标家族没有出网路径时它是 send failed，属真实网络事实。",
+  "不含 mtr / mtr6：镜像里没有该二进制，且它默认需要 raw socket（CAP_NET_RAW）—— 生产安装用 --cap-drop ALL --cap-add NET_BIND_SERVICE。" + "（busybox 的 traceroute 同样因 raw socket 被拒，我们用它之外的无特权路径。）",
+  "不含 UDP：datagram 没有可靠探测来源，本版本不产生该事实。",
+  "不含 HTTP：重定向/降级/凭据是另一份威胁模型，本版本不做。",
   "结果不含任何数据面载荷与凭据；每次发起与拒绝都会写审计。",
 ];
 
@@ -858,12 +965,19 @@ export function normalizeLookingGlassResults(
       ? String(redact(row.detail.slice(0, LOOKING_GLASS_DETAIL_MAX_CHARS)))
       : undefined;
     const target = wanted.get(key)!;
+    // 逐跳结果（只有 traceroute/traceroute6 会有）：仍然**逐字段重建**，节点不能往面板
+    // 产物里塞东西；地址必须是字面 IP（节点不做名称解析），跳数有硬上限。
+    const hops = projectLookingGlassHops(row.hops);
+    if (!hops.ok) {
+      return { ok: false, code: LOOKING_GLASS_CODES.invalidResult, message: hops.message };
+    }
     results.push({
       address: target.address,
       port: target.port,
       status: row.status,
       elapsed_ms: Math.trunc(row.elapsed_ms),
       ...(detail === undefined ? {} : { detail }),
+      ...(hops.value.length === 0 ? {} : { hops: hops.value }),
     });
   }
   for (const key of wanted.keys()) {
@@ -1061,6 +1175,12 @@ export async function runLookingGlass(
     );
   }
 
+  // 方法级能力协商（task-42）：面板闭集里的"服务端支持"**不等于**"这个节点做得到"。
+  // agent 会为真能执行的方法上报 `looking_glass:<method>`（镜像里有二进制 + 内核允许
+  // 非特权 ICMP 时才上报）；没上报就直接拒，**不发一条注定失败的指令**。
+  // `tcp_connect` 不在此列：它由动作本身 `looking_glass` 表达（无需方法级标注）。
+  const requestedMethod = input.method ?? LOOKING_GLASS_DEFAULT_METHOD;
+
   const plan = await planLookingGlassTargets(input.targets, { resolve: deps.resolve });
   if (!plan.ok) {
     return refuse(400, plan.code, plan.message, "runtime_admission", node.node_key, requestedForAudit);
@@ -1091,6 +1211,22 @@ export async function runLookingGlass(
     const decision = admitAction({ nodeId: node.id, role: "ingress", facts }, LOOKING_GLASS_ACTION);
     if (!decision.ok) {
       return refuse(409, decision.reason, decision.detail, "runtime_admission", node.node_key, pinnedForAudit);
+    }
+
+    if (requestedMethod !== LOOKING_GLASS_DEFAULT_METHOD) {
+      const advertised = new Set(facts && !facts.capabilitiesMalformed ? (facts.capabilities ?? []) : []);
+      const annotation = `${LOOKING_GLASS_ACTION}:${requestedMethod}`;
+      if (!advertised.has(annotation)) {
+        return refuse(
+          409,
+          LOOKING_GLASS_CODES.methodUnavailableOnNode,
+          `该节点没有上报方法 ${requestedMethod} 的执行能力（未上报 ${annotation}）：` +
+            `不向做不到的节点下发注定失败的指令。可能原因：节点镜像里没有对应二进制，或内核不允许非特权 ICMP。`,
+          "runtime_admission",
+          node.node_key,
+          pinnedForAudit,
+        );
+      }
     }
 
     const issuedAudit: LookingGlassAuditRow = {

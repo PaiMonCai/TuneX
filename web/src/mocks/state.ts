@@ -104,9 +104,47 @@ export interface MockStore {
    * 形状与错误码镜像见 `./route-profiles.ts`。
    */
   routeProfiles: MockRouteProfileState;
+  /**
+   * R2 首启：每个工作空间的**有效能力策略**（mock 投影，对齐后端
+   * `services/capability-policy` 的有效策略子集）。缺省（不在 Map 里）= 没有任何
+   * 有效策略 → `deny_scope`（fail-closed），与真实后端「无有效发放即拒绝一切」一致。
+   */
+  capabilityPolicies: Map<ID, MockCapabilityPolicy>;
+  /**
+   * R2：`POST /node-groups` 创建的组的**归属工作空间**（组 id → workspace id）。
+   *
+   * 种子组不在 Map 里：它们是跨作用域的演示数据（mock 的既有约定），而用户自己建的组
+   * 必须只出现在它被创建的那个工作空间里 —— 这才是 Workspace 隔离在 mock 里的可验证面。
+   */
+  nodeGroupWorkspace: Map<ID, ID>;
   /** 单例创建时间，便于调试 */
   boot_at: string;
 }
+
+/**
+ * R2 mock 有效能力策略（对齐后端默认免费策略的量级：个人 1 节点 / 2 转发，
+ * 团队 2 节点 / 10 转发；入口组默认允许自建，出口组默认不允许）。
+ */
+export interface MockCapabilityPolicy {
+  allow_custom_in_group: boolean;
+  allow_custom_out_group: boolean;
+  max_nodes: number | null;
+  max_tunnels: number | null;
+}
+
+export const MOCK_PERSONAL_CAPABILITY_POLICY: MockCapabilityPolicy = {
+  allow_custom_in_group: true,
+  allow_custom_out_group: false,
+  max_nodes: 1,
+  max_tunnels: 2,
+};
+
+export const MOCK_TEAM_CAPABILITY_POLICY: MockCapabilityPolicy = {
+  allow_custom_in_group: true,
+  allow_custom_out_group: true,
+  max_nodes: 2,
+  max_tunnels: 10,
+};
 
 /** V4-WP7 mock 生命周期行（对齐 schema 的 lifecycle/lifecycle_note/lifecycle_updated_at）。 */
 export interface MockNodeLifecycle {
@@ -314,6 +352,16 @@ function build(): MockStore {
     // V5.5：联邦状态每次 build 都重建（resetStore() 回到同一份种子）
     federation: buildMockFederation(),
     routeProfiles: buildMockRouteProfiles(),
+    // R2：每个已存在的空间都拿到一份有效策略（个人/团队同后端默认免费策略的量级）；
+    // 之后新建的空间/未登记的空间不在 Map 里 = 无有效策略（deny_scope）。
+    capabilityPolicies: new Map(
+      workspaces.map((w) => [
+        w.id,
+        { ...(w.kind === "team" ? MOCK_TEAM_CAPABILITY_POLICY : MOCK_PERSONAL_CAPABILITY_POLICY) },
+      ]),
+    ),
+    // R2：POST /node-groups 创建的组的归属（种子组不在里面 = 所有作用域可见的演示数据）
+    nodeGroupWorkspace: new Map<ID, ID>(),
     boot_at: new Date().toISOString(),
   };
 }

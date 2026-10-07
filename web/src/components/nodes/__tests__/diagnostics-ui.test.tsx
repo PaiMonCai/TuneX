@@ -16,6 +16,7 @@ import {
   segmentTone,
 } from "@/components/forwards/forward-diagnose";
 import { NodeDiagnostics, cacheStateText, humanUptime } from "@/components/nodes/node-diagnostics";
+import { nodeUpgradeCopy } from "@/components/nodes/node-upgrade-card";
 import type { DiagnoseReport, DiagnoseSegment, NodeDiagnosticsReport, NodeSelfFacts } from "@/lib/types";
 
 const segment = (over: Partial<DiagnoseSegment> = {}): DiagnoseSegment => ({
@@ -200,12 +201,22 @@ describe("node diagnostics readings", () => {
     expect(cacheStateText({ ...base, configured: false, cache_present: false, cache_valid: false })).toContain("未配置");
   });
 
-  test("the idle panel describes the upgrade contract before anything is generated", () => {
+  test("the idle panel describes what it can actually do", () => {
     const html = renderToStaticMarkup(<NodeDiagnostics nodeId={3} nodeKey="hk-in-01" />);
     expect(html).toContain("节点诊断");
-    expect(html).toContain("控制面不会远程替换节点上的 Agent");
     expect(html).toContain("下载 Support Bundle");
-    expect(html).toContain("保持不变");
+  });
+
+  // 「升级 Agent」原来由 NodeDiagnostics 内联渲染，那句"控制面不会远程替换节点上的 Agent"
+  // 也在这里断言。该内联块已退役（它把管理配置字段当版本依据、没有服务端前置、生成脚本后
+  // 没有执行后可见性），升级入口统一由 `NodeUpgradeCard` 承担 ⇒ 断言跟着搬到新卡片。
+  // 卡片是取数组件（SSR 需要 WorkspaceProvider），因此这里断言它的**文案对象**，
+  // 渲染层行为由 `node-upgrade-card.test.tsx` 覆盖。
+  test("the upgrade entry still states the operator contract (moved to NodeUpgradeCard)", () => {
+    const zh = nodeUpgradeCopy("zh");
+    const all = Object.values(zh).filter((v) => typeof v === "string").join(" ");
+    expect(all).toContain("控制面不会远程替换节点上的 Agent");
+    expect(all).toContain("保持不变");
   });
 });
 

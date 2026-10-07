@@ -272,7 +272,11 @@ class FakePanel:
                 length = int(self.headers.get("Content-Length") or 0)
                 if length:
                     self.rfile.read(length)
-                if self.path in ("/api/internal/node/state", "/api/internal/heartbeat"):
+                # 只认**真实存在**的端点：`/api/internal/heartbeat` 是 Agent 侧的历史死代码
+                # （后端从来没有这个路由，真机计数 80 条/10 分钟），已在 Agent 侧删除。
+                # 这里若继续把它算作"可接受路径"，就会让基线记录的 404 计数与真实部署不一致——
+                # 而且正是"假面板替真后端撒谎"的那一类。
+                if self.path == "/api/internal/node/state":
                     panel.state_posts.append(self.path)
                     self._json(200, {"ok": True})
                     return

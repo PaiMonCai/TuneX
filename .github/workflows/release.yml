@@ -71,6 +71,12 @@ jobs:
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          # Agent **版本**必须真的 stamped（task-37）：镜像上报的 version 就是面板判定
+          # "节点 Agent 是否落后"的被比较值。不传的话 agent 只会上报 `unknown`，
+          # 落后判定在真实部署里永远不会触发（本专项已实测过一次）。
+          # 口径 = git tag（`v0.14.0`）；agent/Dockerfile 会去掉前导 v ⇒ 上报 `0.14.0`。
+          build-args: |
+            AGENT_VERSION=${{ github.ref_name }}
           cache-from: type=gha,scope=tunex-agent
           cache-to: type=gha,mode=max,scope=tunex-agent
 
@@ -90,6 +96,17 @@ jobs:
             test -f /app/web/server.js
           '
           docker run --rm --entrypoint /usr/local/bin/tunex-agent "$AGENT" --help >/dev/null
+
+          # 版本 stamped 的**发布门**：tag `v0.14.0` ⇒ 二进制必须报 `0.14.0`。
+          # 少了这一条，"忘了传 AGENT_VERSION" 会静默发布一个 `unknown` 的 Agent 镜像，
+          # 而落后判定又会变回"永不触发"（task-37 的根因）。
+          want_version="${GITHUB_REF_NAME#v}"
+          got_version="$(docker run --rm --entrypoint /usr/local/bin/tunex-agent "$AGENT" --version | awk '{print $NF}')"
+          echo "agent version: want=$want_version got=$got_version"
+          test "$got_version" = "$want_version" || {
+            echo "❌ Agent 镜像没有 stamped 版本（上报 $got_version，期望 $want_version）：检查 agent/Dockerfile 的 AGENT_VERSION 构建参数" >&2
+            exit 1
+          }
 
       - name: Report published images
         run: |

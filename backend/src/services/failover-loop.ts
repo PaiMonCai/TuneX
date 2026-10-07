@@ -12,6 +12,13 @@ import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
 import { systemConfig } from "./config.ts";
 import { candidateRejection, type CandidateFacts } from "./ingress-candidate.ts";
+// task-43：按转发的**入口成员次序**（意图）。次序读不到时回退到既有规则（`node_id` 升序），
+// 读取器自己吞掉异常并返回 `null` —— 见 `readIngressMemberIntent` 的注释。
+import {
+  ingressOrderIndexOf,
+  readIngressMemberIntent,
+  type IngressMemberIntentRow,
+} from "./preferred-ingress.ts";
 // V5-WP17.4：闸门与后继。**静态** import 是安全的：这两个模块都不在 import 期读 env
 //（`ddns-successor` 里的 `db` 是延迟 import），所以本模块仍然可以在没有 DATABASE_URL 的
 // 进程里被 import 与断言。
@@ -69,6 +76,11 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
  * `preferred_node_id = null` ⇒ 自动回切永远不可能发生。现在偏好从列里读，并且**即使它今天不合格
  * 也照原样报出** —— 判定留给策略（`failback_healthy_checks` 那条条件），这样运维看到的原因是
  * "首选节点不可达 / 端口不可用 / 连续健康次数不够"，而不是一句无信息量的"没有回切"。
+ *
+ * **唯一的例外**：在本次成员次序里被**显式停用**的成员（`forward_ingress_member.is_enabled=false`）
+ * 不能当回切目标 —— 停用的意图就是"不让它接管"，而 `candidates` 已经按同一份 `IngressOrderIndex`
+ * 排除了它。两边不一致的症状是：候选永远选不到它，回切却每拍都指向它（P1 缺陷现场）。
+ * 次序**读不到**时按"没有次序"处理，既有语义逐位不变。
  */
 /**
  * 候选查询的依赖缝隙。
@@ -82,6 +94,13 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
 export interface FailoverCandidateDb {
   tunnel: { findUnique: (args: Prisma.TunnelFindUniqueArgs) => Promise<unknown> };
   node: { findMany: (args: Prisma.NodeFindManyArgs) => Promise<unknown[]> };
+  /**
+   * task-43：入口成员次序（意图）的读面。**可选** —— 老替身没有它时按"读不到次序"处理
+   * （回退到 `node_id` 升序），这样既有测试与既有部署都不会因为多了一个读面而变形。
+   */
+  forwardIngressMember?: {
+    findMany: (args: Prisma.ForwardIngressMemberFindManyArgs) => Promise<unknown>;
+  };
 }
 
 export async function pickFailoverDestination(
@@ -96,6 +115,11 @@ export async function pickFailoverDestination(
   // 值得注入的理由很具体：候选过滤的规则是这条 WP 的核心，而"哪台机器算合格"必须在
   // **没有数据库**的进程里就能断言。
   candidateDb: FailoverCandidateDb = db as unknown as FailoverCandidateDb,
+  /**
+   * task-43：次序来源。`undefined` = 本函数自己读一次（直调方）；扫描器会传**整批读到的**
+   * 结果（每拍一次查询，而不是每条隧道一次）。`null` = 读不到 ⇒ 回退今天的行为。
+   */
+  options?: { order?: readonly IngressMemberIntentRow[] | null },
 ): Promise<FailoverDestinations> {
   const tunnel = (await candidateDb.tunnel.findUnique({
     where: { id: ctx.tunnel_id },
@@ -130,6 +154,18 @@ export async function pickFailoverDestination(
     has_credential: Boolean(row.node_credential_hash),
   }));
 
+  // task-43 —— 次序（意图）。只有"哪台先被挑中"受影响；合格性判定一行不改。
+  const intent =
+    options?.order !== undefined
+      ? options.order
+      : candidateDb.forwardIngressMember
+        ? await readIngressMemberIntent(
+            candidateDb as unknown as { forwardIngressMember: NonNullable<FailoverCandidateDb["forwardIngressMember"]> },
+            ctx.tunnel_id,
+          )
+        : null;
+  const order = ingressOrderIndexOf(intent ?? null);
+
   const eligible = rows.filter(
     (node) =>
       candidateRejection(node, "ingress", {
@@ -137,20 +173,38 @@ export async function pickFailoverDestination(
         ...(ctx.now ? { now: ctx.now } : {}),
       }) === null,
   );
+  // 次序上显式停用的成员不参与接管（"这次我不让它接管"是一条意图，不是事实）。
+  const candidates = eligible.filter((node) => !order.isDisabled(node.node_id));
 
   // 偏好等于现任 ⇒ 没有"回切"可言（回切的定义就是离开现任）。报 null 而不是原样透出，
   // 否则每一拍都会有一条"回切条件不满足"的噪音，而它描述的是一件本就不需要发生的事。
+  //
+  // task-47：**显式停用的成员不参与回切**，与上面的 `candidates` 用同一份 `order.isDisabled`
+  // —— 停用是"这次不让它接管"的意图，它既不该被选为候选，也不该成为回切目标。只读不到次序
+  // （`intent === null`）时 `isDisabled` 恒 false ⇒ 既有语义（离线/维护中的偏好照原样报出）
+  // 逐位不变：一次可修复的读错误不该凭空禁用所有节点。
+  const preferredRaw = tunnel.preferred_ingress_node_id;
   const preferredId =
-    tunnel.preferred_ingress_node_id !== null && tunnel.preferred_ingress_node_id !== ctx.owner_node_id
-      ? tunnel.preferred_ingress_node_id
+    preferredRaw !== null && preferredRaw !== ctx.owner_node_id && !order.isDisabled(preferredRaw)
+      ? preferredRaw
       : null;
 
-  // 候选按 id 升序取第一个合格者：没有偏好时不做"更聪明"的排序 —— 排序是产品决定，
-  // 没有地方表达它时就不该由实现者挑一个当默认。
+  // 候选选择：**次序优先，其次 node_id 升序**（task-43 引入按转发的成员次序）。
+  // 没有保存过次序时，这一条恰好退化成"按 id 升序取第一个合格者"= 迁移前的行为。
   //
   // 排序**显式写在函数里**而不是依赖查询的 `orderBy`：那是"选哪一台"这条行为的一部分，
   // 交给调用方的查询去保证，等于让它成为一条隐式契约（替身按别的顺序返回就会静默改掉选择）。
-  const first = [...eligible].sort((a, b) => a.node_id - b.node_id)[0];
+  // 排序（task-43 起）：**有用户次序就按用户次序**（0 起升序），其余候选排在后面并按
+  // `node_id` 升序 —— 无次序（`hasIntent === false`）时这一行退化成"全按 node_id 升序"，
+  // 也就是迁移前的逐位一致行为（有测试钉住）。
+  const first = [...candidates].sort((a, b) => {
+    const ra = order.orderRankOf(a.node_id);
+    const rb = order.orderRankOf(b.node_id);
+    if (ra !== null && rb !== null) return ra - rb;
+    if (ra !== null) return -1;
+    if (rb !== null) return 1;
+    return a.node_id - b.node_id;
+  })[0];
   return { candidate_node_id: first?.node_id ?? null, preferred_node_id: preferredId };
 }
 
@@ -227,13 +281,44 @@ export async function runFailoverSweep(options: FailoverSweepOptions = {}): Prom
         await db.placementLease.findMany({ select: { tunnel_id: true }, orderBy: { tunnel_id: "asc" } })
       ).map((l) => l.tunnel_id);
 
+  // task-43：**每拍一次**读完整批次序（不是每条隧道一次）。读不到就整批按"无次序"处理，
+  // 回退到既有规则 —— 次序是偏好，不该让一次读错误冻结自动迁移。
+  const memberDb = options.db ?? (db as unknown as FailoverExecutorDb);
+  const intentRows = await (async (): Promise<IngressMemberIntentRow[] | null> => {
+    try {
+      const rows = (await (memberDb as unknown as {
+        forwardIngressMember: {
+          findMany: (args: Prisma.ForwardIngressMemberFindManyArgs) => Promise<unknown>;
+        };
+      }).forwardIngressMember.findMany({
+        where: { tunnel_id: { in: tunnelIds } },
+        select: { tunnel_id: true, node_id: true, priority: true, is_enabled: true },
+        orderBy: [{ priority: "asc" }, { node_id: "asc" }],
+      })) as Array<{ tunnel_id: number; node_id: number; priority: number; is_enabled: boolean }>;
+      return rows.map((row) => ({ ...row, is_enabled: row.is_enabled === true }));
+    } catch {
+      return null;
+    }
+  })();
+  const intentByTunnel = new Map<number, IngressMemberIntentRow[]>();
+  for (const row of intentRows ?? []) {
+    const list = intentByTunnel.get((row as unknown as { tunnel_id: number }).tunnel_id) ?? [];
+    list.push(row as IngressMemberIntentRow);
+    intentByTunnel.set((row as unknown as { tunnel_id: number }).tunnel_id, list);
+  }
+  const intentForTunnel = (tunnelId: number): readonly IngressMemberIntentRow[] | null =>
+    intentRows === null ? null : (intentByTunnel.get(tunnelId) ?? []);
+
   const deps: FailoverExecutorDeps = {
     readDecisionFacts: (input) =>
       readFailoverDecisionFacts(input, {
         db: options.db ?? (db as unknown as FailoverExecutorDb),
         policy: () => policy,
         // `now` 在这里是**函数**（扫描级时钟），候选判定要的是**时刻**。
-    destinations: (ctx) => pickFailoverDestination({ ...ctx, now: now() }),
+    destinations: (ctx) =>
+      pickFailoverDestination({ ...ctx, now: now() }, memberDb as unknown as FailoverCandidateDb, {
+        order: intentForTunnel(ctx.tunnel_id),
+      }),
     // V5-WP17.1（契约 D4）：回切的"连续健康次数"必须**有一处真的在累计**，否则它恒为 0，
     // `FAILBACK_HEALTHY_CHECKS` 那条条件永远不满足 —— 偏好照样存了，回切照样不会发生。
     failbackHealthyChecks: async (tunnelId) => {

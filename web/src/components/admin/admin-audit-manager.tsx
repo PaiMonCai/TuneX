@@ -123,7 +123,7 @@ export function AdminAuditManager({ initialData }: { initialData: Paginated<Audi
             ))}
           </SelectContent>
         </Select>
-        <Badge variant="outline">{t("admin.readOnly")}</Badge>
+        <Badge variant="outline">{t("common.readOnly")}</Badge>
       </div>
 
       <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)]">

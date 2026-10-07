@@ -59,7 +59,6 @@ import type {
   NodeLifecycleValue,
   NodeLifecycleView,
   NodeRole,
-  NodeStateReport,
   ConsumableRouteProfileList,
   Paginated,
   PasswordChangeInput,
@@ -105,6 +104,8 @@ import type {
   WorkspaceTrafficSummary,
 } from "../types";
 import { normalizeHealthSummary } from "../node-health";
+// 运行态读数（状态端点）的线上形状：三态判定在 node-runtime-state.ts。
+import type { NodeStatePayload } from "../node-runtime-state";
 // 公告类型单独维护在 announcements.ts。
 import type { Announcement } from "../announcements";
 // 目标健康状态与理由码在 target-health.ts 维护。
@@ -113,6 +114,47 @@ import { shouldRedirectToLogin } from "../workspace-permissions";
 import type { EffectiveWorkspacePermissions, WorkspaceCustomRole, WorkspaceCustomRoleInput, WorkspaceMemberRoleInput } from "../workspace-permissions";
 
 import { request, get, post, put, patch, del, applyMockSessionCookie, clearMockSessionCookie } from "./core";
+
+/**
+ * `/api/admin/node/:id/detail` 的**线上形状**（后端 `NodeDetail` 聚合，嵌套）。
+ *
+ * 只声明界面会用到的部分：`node` 是节点行本身（可能带若干界面不展示的列，
+ * 结构上按 `Node` 处理）、`role` 是服务端派生值（`null` = 尚未声明角色）、
+ * `pools` 是该节点的出口池数组、另外两个是计数。
+ *
+ * `credential` 字段**刻意不取**：它是凭据元数据视图，界面对凭据的展示
+ * （是否已签发 / 轮换时间 / 是否被撤销）在 `node` 行自身就有显式列，
+ * 取整个 `credential` 只会把凭据材料带进前端状态。
+ */
+interface AdminNodeDetailPayload {
+  node?: Node | null;
+  role?: NodeRole | null;
+  pools?: EgressPool[] | null;
+  pool_count?: number;
+  tunnel_count?: number;
+}
+
+/**
+ * 线上嵌套形状 → 界面扁平模型（`NodeDetail extends Node`）。
+ *
+ * 投影规则只有三条，且都不发明事实：
+ *   1. `node` 的字段原样铺开；`node` 缺失时按空对象处理（调用方据 `id` 判空）；
+ *   2. `role` 优先取顶层（服务端派生），缺失才回落到节点行自己的 `role`；
+ *      `null` 是**真实取值**（尚未声明角色），不允许被填成默认角色；
+ *   3. `pools` 非数组一律归 `[]`（后端保证是数组；这里只防坏载荷）。
+ *
+ * **不返回 `state`**：运行态由 `/admin/node/:id/state` 单独提供，聚合里没有它。
+ * 若这里补一个 `state: null`，消费方会把它读成"该节点没有上报"——那正是本切片
+ * 之前被禁的"把取不到说成没有"。
+ */
+export function projectNodeDetail(payload: AdminNodeDetailPayload | null | undefined): NodeDetail {
+  const node = (payload?.node ?? {}) as Node;
+  return {
+    ...node,
+    role: payload?.role ?? node.role ?? null,
+    pools: Array.isArray(payload?.pools) ? payload.pools : [],
+  };
+}
 
 export const adminApi = {
     stats: (cookie?: string) => get<AdminDashboardStats>("/admin/stats", undefined, cookie),
@@ -161,32 +203,76 @@ export const adminApi = {
     revokeNodeCredential: (id: ID, cookie?: string) =>
       post<NodeCredentialRevoked>(`/admin/node/${id}/credential/revoke`, {}, cookie),
     /**
-     * 节点详情：列表字段 + 出口池 + 运行态快照。
+     * 节点详情聚合（基础信息 + 服务端派生的 role + 凭据状态 + 出口池 + 计数）。
+     *
+     * 路径是后端的**真实**路径 `/admin/node/:id/detail`（单数 `node`，见
+     * `backend/src/routes/node-admin.ts` 的 `nodeAdminRoutes.get("/node/:id/detail")`）。
+     * 复数 `/admin/nodes/:id` 在真实后端**不存在** → 生产必然 404，详情页第一个请求
+     * 就会失败（mock 实现了复数路径把它盖住，是本文件被反复踩的同一族缺陷）。
+     *
+     * 线上形状是**嵌套**的 `{node, role, credential, pools, pool_count, tunnel_count}`，
+     * 而界面用的是扁平模型（`NodeDetail extends Node`），因此这里做一次**投影**而不是
+     * 让每个消费方各自解析：`node` 的字段原样铺开，`role` 优先取顶层（服务端派生值，
+     * 可能是 `null` = 尚未声明），`pools` 只取数组。
+     *
+     * **`state` 不在这个端点里**：运行态已拆成独立端点 `/admin/node/:id/state`，由
+     * `loadNodeState` 单独取（它能区分"取不到"与"没有上报"，聚合里的 `state` 不能）。
+     * 所以这里**不**给出 `state`，避免消费方把它读成"没有上报"。
      */
-    nodeDetail: (id: ID, cookie?: string) => get<NodeDetail>(`/admin/nodes/${id}`, undefined, cookie),
+    nodeDetail: async (id: ID, cookie?: string): Promise<NodeDetail> => {
+      const payload = await get<AdminNodeDetailPayload>(
+        `/admin/node/${id}/detail`,
+        undefined,
+        cookie,
+      );
+      return projectNodeDetail(payload);
+    },
     /**
      * 出口池 / 出口目标 CRUD。
+     *
+     * 路径全部是后端的真实单数路径（`/node/...`）：池与目标都是**全局寻址**
+     * （`/node/pools/:poolId`、`/node/targets/:targetId`），只有"在某个节点下新建池"
+     * 才需要 nodeId。复数 `/admin/nodes/...` 在真实后端不存在。
+     *
+     * 列表沿用后端的两层信封 `{data:{data,total}}`，这里解到最后一层返回数组，
+     * 让调用方（`NodeEgressPoolsPanel`）拿到它声明的 `EgressPool[]`。
      *
      * 不变式由后端保证、前端必须如实展示的两条：
      *   1. 池内至少一个 active 且 weight>0 的目标（删到空 = 拒绝，属于服务层
      *      而非 DB 约束）；
      *   2. 目标修改只更新快照，不重建 ingress listener（热更新）。
      */
-    pools: (nodeId: ID, cookie?: string) => get<EgressPool[]>(`/admin/nodes/${nodeId}/pools`, undefined, cookie),
+    pools: async (nodeId: ID, cookie?: string): Promise<EgressPool[]> => {
+      const page = await get<{ data?: EgressPool[] }>(`/admin/node/${nodeId}/pools`, undefined, cookie);
+      return Array.isArray(page?.data) ? page.data : [];
+    },
     createPool: (nodeId: ID, input: EgressPoolInput, cookie?: string) =>
-      post<EgressPool>(`/admin/nodes/${nodeId}/pools`, input, cookie),
-    updatePool: (nodeId: ID, poolId: ID, input: Partial<EgressPoolInput>, cookie?: string) =>
-      patch<EgressPool>(`/admin/nodes/${nodeId}/pools/${poolId}`, input, cookie),
-    removePool: (nodeId: ID, poolId: ID, cookie?: string) =>
-      del<{ ok: boolean }>(`/admin/nodes/${nodeId}/pools/${poolId}`, cookie),
-    createTarget: (nodeId: ID, poolId: ID, input: EgressTargetInput, cookie?: string) =>
-      post<EgressTarget>(`/admin/nodes/${nodeId}/pools/${poolId}/targets`, input, cookie),
-    updateTarget: (nodeId: ID, poolId: ID, targetId: ID, input: Partial<EgressTargetInput>, cookie?: string) =>
-      patch<EgressTarget>(`/admin/nodes/${nodeId}/pools/${poolId}/targets/${targetId}`, input, cookie),
-    removeTarget: (nodeId: ID, poolId: ID, targetId: ID, cookie?: string) =>
-      del<{ ok: boolean }>(`/admin/nodes/${nodeId}/pools/${poolId}/targets/${targetId}`, cookie),
-    /** 运行态诊断（WP7 上报 → NodeStateReport；无上报时 404/空） */
-    nodeState: (id: ID, cookie?: string) => get<NodeStateReport>(`/admin/nodes/${id}/state`, undefined, cookie),
+      post<EgressPool>(`/admin/node/${nodeId}/pools`, input, cookie),
+    updatePool: (poolId: ID, input: Partial<EgressPoolInput>, cookie?: string) =>
+      patch<EgressPool>(`/admin/node/pools/${poolId}`, input, cookie),
+    removePool: (poolId: ID, cookie?: string) =>
+      del<{ ok: boolean }>(`/admin/node/pools/${poolId}`, cookie),
+    createTarget: (poolId: ID, input: EgressTargetInput, cookie?: string) =>
+      post<EgressTarget>(`/admin/node/pools/${poolId}/targets`, input, cookie),
+    updateTarget: (targetId: ID, input: Partial<EgressTargetInput>, cookie?: string) =>
+      patch<EgressTarget>(`/admin/node/targets/${targetId}`, input, cookie),
+    removeTarget: (targetId: ID, cookie?: string) =>
+      del<{ ok: boolean }>(`/admin/node/targets/${targetId}`, cookie),
+    /**
+     * 运行态诊断（WP7 上报 → NodeStateView）。
+     *
+     * 路径是后端的**真实**路径 `/admin/node/:id/state`（单数 `node`，与
+     * `backend/src/routes/node-admin.ts` 的 `nodeAdminRoutes.get("/node/:id/state")`
+     * 逐字一致）。复数 `/admin/nodes/:id/state` 在真实后端**不存在** → 生产必然 404，
+     * 曾经是「界面把 404 显示成没有上报」的根因（mock 实现了复数路径把它盖住）。
+     *
+     * 契约（真实后端）：节点存在时**一律 200** —— 从未上报是 `reported_at: null`
+     * 的空态视图，不是 404、也不是 `null` 载荷；只有节点不存在才是 404。
+     * 因此这里返回可空 `reported_at` 的线上形状，由 `nodeRuntimeStateFromPayload`
+     * 区分「无上报」与「取不到（形状不认识）」。
+     */
+    nodeState: (id: ID, cookie?: string) =>
+      get<NodeStatePayload | null>(`/admin/node/${id}/state`, undefined, cookie),
     /**
      * V4-WP6 §13.4.4：节点健康视图（后端 `routes/node-health.ts`）。
      *

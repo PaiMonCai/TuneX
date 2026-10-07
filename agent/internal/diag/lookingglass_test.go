@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Agent 侧 Looking Glass 边界测试。
@@ -281,10 +282,10 @@ func TestLookingGlassCapsAndMethodClosedSet(t *testing.T) {
 		t.Fatalf("超过上限应返回 ErrTooManyTargets，得到 %v", err)
 	}
 	if err := call(LookingGlassRequest{
-		Method:  "ping",
+		Method:  "mtr",
 		Targets: []LookingGlassTarget{{Address: "93.184.216.34", Port: 80}},
 	}); !errors.Is(err, ErrLookingGlassRejected) {
-		t.Fatalf("未知方法必须拒绝（不降级），得到 %v", err)
+		t.Fatalf("闭集外方法必须拒绝（不降级），得到 %v", err)
 	}
 	if err := call(LookingGlassRequest{
 		Method:  LookingGlassMethodTCPConnect,
@@ -349,4 +350,362 @@ func mustRead(t *testing.T, name string) []byte {
 		t.Fatalf("读不到 %s: %v", name, err)
 	}
 	return data
+}
+
+/* ================================================================== */
+/* ICMP（ping / ping6）：可用性判定、输出解析、派发边界                  */
+/* ================================================================== */
+
+func TestICMPUnprivilegedDecision(t *testing.T) {
+	withRaw := "Name:\ttunex-agent\nCapEff:\t00000000a80425fb\n"
+	withoutRaw := "Name:\ttunex-agent\nCapEff:\t0000000000000400\n"
+	cases := []struct {
+		name   string
+		status string
+		range_ string
+		gid    int
+		want   bool
+	}{
+		{"有 CAP_NET_RAW（默认 docker caps）⇒ 允许", withRaw, "1\t0", 0, true},
+		{"无 CAP_NET_RAW 但 ping_group_range 覆盖 gid ⇒ 允许（实测的生产形态）", withoutRaw, "0\t2147483647", 0, true},
+		{"无 CAP_NET_RAW 且范围不含 gid ⇒ 拒绝", withoutRaw, "1000\t2000", 0, false},
+		{"无权限位且范围形状坏 ⇒ 拒绝（fail-closed）", withoutRaw, "not-a-range", 0, false},
+		{"读不到 CapEff ⇒ 只看范围", "", "0\t2147483647", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := icmpAllowedUnprivileged(tc.status, tc.range_, tc.gid); got != tc.want {
+				t.Fatalf("allowed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseICMPReply(t *testing.T) {
+	cases := []struct {
+		name    string
+		output  string
+		wantRTT int64
+		wantOK  bool
+	}{
+		{"busybox 单行", "64 bytes from 1.1.1.1: seq=0 ttl=42 time=1.983 ms", 2, true},
+		{"busybox 统计行", "round-trip min/avg/max = 1.983/1.983/1.983 ms", 2, true},
+		{"iputils", "64 bytes from 1.1.1.1: icmp_seq=1 ttl=57 time=1.98 ms", 2, true},
+		{"iputils <1ms（收到了回包，只是小于 1ms）", "64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time<1 ms", 1, true},
+		{"全部丢包", "1 packets transmitted, 0 packets received, 100% packet loss", 0, false},
+		{"不可达", "ping: sendto: Network unreachable", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rtt, ok := parseICMPReply(tc.output)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (%q)", ok, tc.wantOK, tc.output)
+			}
+			if ok && rtt != tc.wantRTT {
+				t.Fatalf("rtt = %d, want %d", rtt, tc.wantRTT)
+			}
+		})
+	}
+}
+
+// withFakeICMP 把生产执行器换成受控替身，并记录被调用了几次。
+func withFakeICMP(t *testing.T, replied bool, rtt int64, raw string, err error, binary string) *int {
+	t.Helper()
+	calls := 0
+	original := runICMP
+	runICMP = func(context.Context, string, string, time.Duration) (bool, int64, string, error) {
+		calls++
+		return replied, rtt, raw, err
+	}
+	t.Cleanup(func() { runICMP = original })
+	if binary != "" {
+		originalCandidates := pingBinaryCandidates
+		pingBinaryCandidates = map[string][]string{
+			LookingGlassMethodPing:  {binary},
+			LookingGlassMethodPing6: {binary},
+		}
+		t.Cleanup(func() { pingBinaryCandidates = originalCandidates })
+	}
+	return &calls
+}
+
+// fakePingBinary 建一个可执行的假 ping（内容无关，因为我们注入了 runICMP）。
+func fakePingBinary(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ping")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestICMPDispatchMapsRepliesToStatuses(t *testing.T) {
+	binary := fakePingBinary(t)
+
+	t.Run("收到回包 ⇒ reachable + 往返毫秒", func(t *testing.T) {
+		calls := withFakeICMP(t, true, 12, "time=12.3 ms", nil, binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodPing,
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].Status != StatusReachable || results[0].ElapsedMS != 12 {
+			t.Fatalf("results = %+v", results)
+		}
+		if *calls != 1 {
+			t.Fatalf("exec calls = %d, want 1", *calls)
+		}
+	})
+
+	t.Run("100% 丢包 ⇒ timeout（不是 reachable）", func(t *testing.T) {
+		withFakeICMP(t, false, 0, "1 packets transmitted, 0 packets received, 100% packet loss", nil, binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodPing,
+			Targets: []LookingGlassTarget{{Address: "3.5.140.1"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].Status != StatusTimeout {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("不可达 ⇒ error 且带最后一行原因", func(t *testing.T) {
+		withFakeICMP(t, false, 0, "PING x\nping: sendto: Network unreachable\n", errors.New("exit status 2"), binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodPing6,
+			Targets: []LookingGlassTarget{{Address: "2606:4700:4700::1111"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].Status != StatusError || results[0].Detail != "ping: sendto: Network unreachable" {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+}
+
+func TestICMPRejectsWholeRequestBeforeExecuting(t *testing.T) {
+	binary := fakePingBinary(t)
+
+	t.Run("家族不匹配（ping + v6 地址）⇒ 0 次执行", func(t *testing.T) {
+		calls := withFakeICMP(t, true, 1, "time=1 ms", nil, binary)
+		_, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodPing,
+			Targets: []LookingGlassTarget{{Address: "2606:4700:4700::1111"}},
+		}, nil)
+		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+			t.Fatalf("err = %v, want ErrLookingGlassRejected", err)
+		}
+		if *calls != 0 {
+			t.Fatalf("exec calls = %d, want 0", *calls)
+		}
+	})
+
+	t.Run("混入私网目标 ⇒ 整请求拒绝、0 次执行", func(t *testing.T) {
+		calls := withFakeICMP(t, true, 1, "time=1 ms", nil, binary)
+		_, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method: LookingGlassMethodPing,
+			Targets: []LookingGlassTarget{
+				{Address: "1.1.1.1"},
+				{Address: "10.0.0.1"},
+			},
+		}, nil)
+		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+			t.Fatalf("err = %v, want ErrLookingGlassRejected", err)
+		}
+		if *calls != 0 {
+			t.Fatalf("exec calls = %d, want 0（半个结果会被读成「这条路径没问题」）", *calls)
+		}
+	})
+
+	t.Run("镜像里没有该方法的二进制 ⇒ 拒绝而不是假装跑过", func(t *testing.T) {
+		originalCandidates := pingBinaryCandidates
+		pingBinaryCandidates = map[string][]string{LookingGlassMethodPing: {"/nonexistent/ping"}}
+		t.Cleanup(func() { pingBinaryCandidates = originalCandidates })
+		_, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodPing,
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+			t.Fatalf("err = %v, want ErrLookingGlassRejected", err)
+		}
+	})
+
+	t.Run("闭集外方法仍然拒绝（不静默降级成 TCP）", func(t *testing.T) {
+		_, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  "mtr",
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1", Port: 443}},
+		}, nil)
+		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+			t.Fatalf("err = %v, want ErrLookingGlassRejected", err)
+		}
+	})
+}
+
+/* ================================================================== */
+/* traceroute（tracepath，无特权）                                       */
+/* ================================================================== */
+
+// realTracepathSample 是生产 caps 容器里的真实输出（`tracepath -n -m 3 1.1.1.1`）。
+const realTracepathSample = ` 1?: [LOCALHOST]                      pmtu 1500
+ 1:  172.17.0.1                                            0.335ms 
+ 1:  172.17.0.1                                            0.057ms 
+ 2:  172.17.0.1                                            0.038ms pmtu 1450
+ 2:  10.1.32.1                                             0.250ms 
+ 3:  103.185.248.1                                         2.131ms asymm  4 
+`
+
+func TestParseTracepathGroupsByTTL(t *testing.T) {
+	hops := parseTracepath(realTracepathSample)
+	if len(hops[1]) != 2 || len(hops[2]) != 2 || len(hops[3]) != 1 {
+		t.Fatalf("hops = %v", hops)
+	}
+	first := tracepathHop(1, hops[1])
+	if first.Address != "172.17.0.1" || first.RTTMS != 0 {
+		t.Fatalf("hop1 = %+v（取第一行，含地址）", first)
+	}
+	second := tracepathHop(2, hops[2])
+	if second.Address != "172.17.0.1" || second.Note == "" {
+		t.Fatalf("hop2 = %+v（应带 pmtu 备注）", second)
+	}
+	third := tracepathHop(3, hops[3])
+	if third.Address != "103.185.248.1" || third.RTTMS != 2 {
+		t.Fatalf("hop3 = %+v", third)
+	}
+}
+
+func TestTracepathHopWithoutAddressKeepsTheReason(t *testing.T) {
+	hops := parseTracepath(" 1:  send failed\n")
+	hop := tracepathHop(1, hops[1])
+	if hop.Address != "" || hop.Note != "send failed" {
+		t.Fatalf("hop = %+v", hop)
+	}
+}
+
+func withFakeTracepath(t *testing.T, hops map[int][]string, raw string, err error, binary string) *int {
+	t.Helper()
+	calls := 0
+	original := runTracepath
+	runTracepath = func(context.Context, string, string, int, time.Duration) (map[int][]string, string, error) {
+		calls++
+		return hops, raw, err
+	}
+	t.Cleanup(func() { runTracepath = original })
+	if binary != "" {
+		originalCandidates := tracepathBinaryCandidates
+		tracepathBinaryCandidates = []string{binary}
+		t.Cleanup(func() { tracepathBinaryCandidates = originalCandidates })
+	}
+	return &calls
+}
+
+func TestTracerouteDispatch(t *testing.T) {
+	binary := fakePingBinary(t)
+
+	t.Run("到达目标 ⇒ reachable + 逐跳结果", func(t *testing.T) {
+		// 目标出现在**预算允许的跳数内**（5s 预算 ⇒ 3 跳；`MaxTimeoutMS` 是 5000 的硬上限，
+		// 传更大也会被夹到 5000）。
+		// 目标就是在第 3 跳回话的那台（取"该 TTL 的第一条有地址的行"，所以这里给干净的样本）。
+		withFakeTracepath(t, parseTracepath(" 1:  172.17.0.1  0.300ms\n 2:  10.1.32.1  0.200ms\n 3:  1.1.1.1  3.000ms\n"), "", nil, binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:    LookingGlassMethodTraceroute,
+			TimeoutMS: 5000,
+			Targets:   []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].Status != StatusReachable || len(results[0].Hops) != 3 {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("有跳但没到目标 ⇒ timeout（如实说没到达，不说不可达）", func(t *testing.T) {
+		withFakeTracepath(t, parseTracepath(realTracepathSample), "", nil, binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodTraceroute,
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results[0].Status != StatusTimeout || !strings.Contains(results[0].Detail, "未在") {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("send failed（无 v6 路径）⇒ error 且原因可读", func(t *testing.T) {
+		withFakeTracepath(t, parseTracepath(" 1:  send failed\n     Resume: pmtu 128000\n"), " 1:  send failed\n", errors.New("exit status 1"), binary)
+		results, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodTraceroute6,
+			Targets: []LookingGlassTarget{{Address: "2606:4700:4700::1111"}},
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results[0].Status != StatusError || !strings.Contains(results[0].Detail, "send failed") {
+			t.Fatalf("results = %+v", results)
+		}
+	})
+
+	t.Run("家族不匹配 / 私网 ⇒ 整请求拒绝且 0 次执行", func(t *testing.T) {
+		calls := withFakeTracepath(t, map[int][]string{}, "", nil, binary)
+		for _, target := range []string{"2606:4700:4700::1111", "10.0.0.1"} {
+			if _, err := LookingGlass(context.Background(), LookingGlassRequest{
+				Method:  LookingGlassMethodTraceroute,
+				Targets: []LookingGlassTarget{{Address: target}},
+			}, nil); err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+				t.Fatalf("target %s: err = %v", target, err)
+			}
+		}
+		if *calls != 0 {
+			t.Fatalf("exec calls = %d, want 0", *calls)
+		}
+	})
+
+	t.Run("镜像里没有 tracepath ⇒ 拒绝而不是假装跑过", func(t *testing.T) {
+		originalCandidates := tracepathBinaryCandidates
+		tracepathBinaryCandidates = []string{"/nonexistent/tracepath"}
+		t.Cleanup(func() { tracepathBinaryCandidates = originalCandidates })
+		_, err := LookingGlass(context.Background(), LookingGlassRequest{
+			Method:  LookingGlassMethodTraceroute,
+			Targets: []LookingGlassTarget{{Address: "1.1.1.1"}},
+		}, nil)
+		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
+			t.Fatalf("err = %v, want ErrLookingGlassRejected", err)
+		}
+	})
+}
+
+func TestDetectLookingGlassMethodsShapes(t *testing.T) {
+	byMethod := map[string]MethodAvailability{}
+	for _, availability := range DetectLookingGlassMethods() {
+		byMethod[availability.Method] = availability
+	}
+	for _, method := range SupportedLookingGlassMethods() {
+		availability, ok := byMethod[method]
+		if !ok {
+			t.Fatalf("方法 %q 没有可用性条目（面板据此算 caps.methods）", method)
+		}
+		// tcp_connect 不依赖外部二进制；其他方法在"可用"时必须给出实际二进制。
+		// "二进制存在但当前节点权限/内核能力不足"是合法的不可用状态，此时
+		// Binary 与 Reason 会同时存在，不能把它误判成矛盾。
+		if method == LookingGlassMethodTCPConnect {
+			if availability.Binary != "" || availability.Reason != "" {
+				t.Fatalf("tcp_connect 应恒可用且不依赖外部二进制: %+v", availability)
+			}
+		} else if availability.Reason == "" && availability.Binary == "" {
+			t.Fatalf("可用方法 %q 必须给出实际二进制路径: %+v", method, availability)
+		}
+	}
+	// mtr/mtr6 不在闭集里（镜像无二进制 + 需要 raw socket）⇒ 永远不会被标注为可用。
+	for _, forbidden := range []string{"mtr", "mtr6"} {
+		if _, ok := byMethod[forbidden]; ok {
+			t.Fatalf("%q 不该出现在可用性枚举里", forbidden)
+		}
+	}
 }

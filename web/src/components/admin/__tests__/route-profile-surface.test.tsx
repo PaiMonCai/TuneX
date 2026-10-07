@@ -52,6 +52,7 @@ import {
   UNKNOWN_ERROR_NEXT_ACTION,
 } from "@/components/admin/route-profiles/route-profile-status";
 import { ApiError } from "@/lib/api";
+import { zh } from "@/lib/i18n/dictionaries";
 import { ROUTE_PROFILE_ERROR_CODES, type RouteProfileTemplate } from "@/lib/types";
 import { expectedConsolePageFile, visibleNavGroups, visibleNavItems } from "@/lib/nav";
 
@@ -196,8 +197,11 @@ describe("C. ordered transit 顺序可见且可操作", () => {
     expect(html).toContain('data-testid="route-profile-editor-transit"');
     expect(html).toContain('data-testid="route-profile-editor-transit-row"');
     expect(html).toContain('data-order="0"');
-    expect(html).toContain('aria-label="move up"');
-    expect(html).toContain('aria-label="move down"');
+    // 图标按钮的可访问名称来自词典（中文界面读中文），不再是写死的英文 "move up"。
+    expect(html).toContain(`aria-label="${zh.admin.routeProfiles.moveUp}"`);
+    expect(html).toContain(`aria-label="${zh.admin.routeProfiles.moveDown}"`);
+    expect(html).not.toContain('aria-label="move up"');
+    expect(html).not.toContain('aria-label="move down"');
     expect(html).toContain('data-testid="route-profile-editor-preview-chain"');
   });
 
@@ -366,9 +370,12 @@ describe("F. User Console：/routes 内部概念零出现", () => {
     for (const word of ["transit", "selector", "epoch", "revision", "lease", "INTERNAL", "ASSIGNED", "PUBLIC"]) {
       expect({ word, hits: src.split(word).length - 1 }).toEqual({ word, hits: 0 });
     }
-    // 明确写出「下一步」，而不是造一个创建按钮
+    // 明确写出**真实**的下一步，而不是造一个创建按钮、也不是自相矛盾的两句话。
+    // （旧断言钉的是「下一步：在创建转发时选择合适的线路…目前还不支持从线路直接创建转发」——
+    //   第一句承诺了契约上不存在的操作，第二句又自我否认。现在文案只讲一件事：线路作用于**已存在**的转发。）
     expect(src).toContain("route-next-step");
-    expect(src).toContain("目前还不支持");
+    expect(src).toContain("创建转发时不需要");
+    expect(src).not.toContain("在创建转发时选择合适的线路");
     // 显式收窄：只把 name/description/selectable 放进渲染树（整对象会把 template/version 一起下发）
     expect(src).toContain("page.data.map((route) => ({");
     expect(src).toContain("route.selectable");

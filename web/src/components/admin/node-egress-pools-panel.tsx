@@ -102,7 +102,7 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
     setBusy(true);
     try {
       if (poolDialog?.mode === "edit" && poolDialog.pool) {
-        await api.admin.updatePool(nodeId, poolDialog.pool.id, poolForm);
+        await api.admin.updatePool(poolDialog.pool.id, poolForm);
         toast.success(t("admin.updateSuccess", { name: poolForm.name }));
       } else {
         await api.admin.createPool(nodeId, poolForm);
@@ -120,7 +120,7 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
   async function removePool(pool: EgressPool) {
     setBusy(true);
     try {
-      await api.admin.removePool(nodeId, pool.id);
+      await api.admin.removePool(pool.id);
       toast.success(t("admin.deleteSuccess", { name: pool.name }));
       refresh();
     } catch (e) {
@@ -139,10 +139,10 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
     setBusy(true);
     try {
       if (targetDialog?.mode === "edit" && targetDialog.target) {
-        await api.admin.updateTarget(nodeId, targetDialog.poolId, targetDialog.target.id, targetForm);
+        await api.admin.updateTarget(targetDialog.target.id, targetForm);
         toast.success(t("admin.updateSuccess", { name: `${host}:${targetForm.port}` }));
       } else if (targetDialog) {
-        await api.admin.createTarget(nodeId, targetDialog.poolId, targetForm);
+        await api.admin.createTarget(targetDialog.poolId, targetForm);
         toast.success(t("admin.createSuccess", { name: `${host}:${targetForm.port}` }));
       }
       setTargetDialog(null);
@@ -154,7 +154,7 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
     }
   }
 
-  async function removeTarget(poolId: ID, target: EgressTarget, pool: EgressPool) {
+  async function removeTarget(target: EgressTarget, pool: EgressPool) {
     // 客户端预检 schema 注释里的不变式：池内至少一个 active 且 weight>0 的目标。
     // 后端同样会拒，但提前拦能少一次无效请求 + 给得出解释的提示。
     const usable = (pool.targets ?? []).filter((x) => x.status === "active" && Number(x.weight ?? 0) > 0);
@@ -164,7 +164,7 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
     }
     setBusy(true);
     try {
-      await api.admin.removeTarget(nodeId, poolId, target.id);
+      await api.admin.removeTarget(target.id);
       toast.success(t("admin.deleteSuccess", { name: `${target.host}:${target.port}` }));
       refresh();
     } catch (e) {
@@ -289,7 +289,7 @@ export function NodeEgressPoolsPanel({ nodeId, nodeRole, pools, onChanged }: Nod
                                 size="sm"
                                 variant="ghost"
                                 className="text-[var(--destructive)]"
-                                onClick={() => removeTarget(pool.id, target, pool)}
+                                onClick={() => removeTarget(target, pool)}
                                 disabled={busy}
                                 aria-label={t("admin.targetDelete")}
                               >

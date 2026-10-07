@@ -62,6 +62,17 @@ export const ADMIN_RESOURCES: AdminResource[] = [
   // 用独立的资源键而不是挂到 "nodes" 上：联邦是跨安装的安全边界，
   // 「能看节点」与「能建立跨面板信任」不该是同一种授权。
   { key: "federation", label: "联邦", group: "联邦", url: "/admin/federation", business: false, apiPrefixes: ["/admin/federation"] },
+  // 专项切片 N2（退出条件 #6）：**平台级**通知渠道配置（telegram bot token / webhook 端点）。
+  //
+  // 为什么单独一个资源键、而不是复用 `settings` 或 `announcements`：这里的写操作会把**出站凭据**
+  // 落进 `notification_channel.secret_enc`（封装后的 bot token）与 webhook URL（URL 本身就是凭据）。
+  // "能改站点名字"（settings）或"能以平台名义发公告"（announcements）都不该顺带等于
+  // "能配置平台往哪儿发、用谁的凭据发"。
+  // 登记这一步本身就是纪律的可执行形式：**未登记前缀 = 只有超管**（`adminPermissionGuard` 的
+  // fail-closed 分支，见 permissions.ts 的 `resolveAdminRoute`），登记之后被授权的管理员角色才能用它。
+  // 测试 `src/routes/__tests__/notification-channels.test.ts` 用**真实中间件**断言了这一变化：
+  // 持该键 read 只能 GET、write 才能 PUT/DELETE，别的资源键仍然被挡在 403。
+  { key: "notification_channels", label: "通知渠道配置", group: "系统", url: "/admin/notification-channels", business: false, apiPrefixes: ["/admin/notification-channels"] },
 ];
 
 export const ADMIN_RESOURCE_KEYS: string[] = ADMIN_RESOURCES.map((r) => r.key);

@@ -170,6 +170,16 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
    */
   tls_cert_path?: string;
   tls_key_path?: string;
+  /**
+   * 三跳（多跳）的中间跳（`backend/src/routes/forwards.ts:154` 的
+   * `middle_node_id: z.number().int().positive().nullable().optional()`）；省略 = 两段。
+   *
+   * 创建时服务端会校验**两段**邻接绑定（入口→中间、中间→出口）都存在，缺任何一段即
+   * 409 `binding_required`（`backend/src/services/forward-service.ts:764-783`）。
+   * 注意：`PortForward`（forwardView）**不含**中间跳 —— 列表/详情读数看不到它，
+   * 只有 `GET /forwards/:id/topology` 会给 `ingress_to_middle` / `middle_to_egress` 两段。
+   */
+  middle_node_id?: ID | null;
 }
 
 /**
@@ -371,12 +381,33 @@ export interface EgressTargetInput {
  *
  * 口径：`reported_at` 是面板收到上报的时刻（DB 侧时钟，非 Agent 时钟），
  * 离线判定用它而不是 Agent 自述时间，避免被节点时钟漂移骗到。
+ *
+ * ── 这个类型描述的是**落库行**，而 `GET /api/admin/node/:id/state` 返回的是
+ *    `NodeStateView`（19 键，`backend/src/services/node-admin-state.ts:11-35`）──
+ *
+ * 两者**不是**同一个形状，而且差别不是措辞问题：
+ *   · 状态端点**不会**返回 `known_revision` / `agent_started_at` / `hostname` /
+ *     `os` / `arch` / `runtime_counts` / `host_metrics` / `error_count` /
+ *     `last_error_at` / `updated_at`（这些是落库列；健康/遥测切片走别的端点读）；
+ *   · 状态端点**会**返回 `node_key` / `reported_role` / `role_mismatch` / `online` /
+ *     `status` / `last_seen_at` / `age_seconds` / `stale` /
+ *     `control_protocol_version` / `capabilities`（下面这些"视图侧字段"）。
+ * 因此视图侧字段刻意声明为**可选**：落库行投影（健康切片）没有它们，状态端点载荷有。
+ * 缺省 = 这份载荷不是状态端点给的，**不是**「该字段为 0 / 空」。
  */
 export interface NodeStateReport {
   node_id: ID;
   /** Agent 版本号（面板据此提示节点升级） */
   version: string | null;
-  /** Agent 自报角色，与 node.role 不一致时以 node.role 为准 */
+  /**
+   * **面板侧**角色（`node.role`，面板自己的认定）。
+   *
+   * 这行注释曾经写成「Agent 自报角色，与 node.role 不一致时以 node.role 为准」——那是
+   * **反的**，会把两件事混成一个字段：状态端点里的 `role` 来自 `node.role`，Agent 自报值在
+   * {@link NodeStateReport.reported_role}。真实面板上两者连大小写都不同
+   * （`role: "ingress"` / `reported_role: "INGRESS"`）；把它们当同一个值渲染，在 mock 里
+   * 看不出来（mock 曾把落库行直接回显，两个字段同值），到生产就变成一句谎话。
+   */
   role: string | null;
   /** Agent 已知的最新 revision；与 Tunnel.config_revision 对比判断是否落后 */
   reported_revision: number | null;
@@ -390,7 +421,42 @@ export interface NodeStateReport {
   last_error: string | null;
   reported_at: string;
   updated_at: string;
-  // ── V4-WP6 §13.4.4 扩展列（迁移 20260928000000）──
+  // ── 视图侧字段（`NodeStateView` 有、落库行没有；可选性见文件头说明）──
+  /** 节点名（`node.node_id`），状态视图用它标识节点。 */
+  node_key?: string;
+  /** **Agent 自报**角色（`node_state_report.role`）；`null` = 这次上报没带角色。 */
+  reported_role?: string | null;
+  /**
+   * 面板侧角色与 Agent 自报角色是否不一致（后端 `isRoleMismatch`：两侧都非空才判，
+   * 且**大小写归一**后比较）。
+   *
+   * `false` 有歧义（两侧一致 / 有一侧没值），所以界面必须同时看 `role` 与
+   * `reported_role` 才说得清；只有 `true` 才是"确实不一致"。
+   */
+  role_mismatch?: boolean;
+  /** 面板侧在线判定（`node.status === "active"`）——与 `stale` 是两件不同的事。 */
+  online?: boolean;
+  status?: string;
+  last_seen_at?: string | null;
+  /**
+   * 上报快照的年龄（秒）。`null` = 没有快照（从未上报）。
+   *
+   * 它回答的是"这一格事实有多旧"，**不是**"节点在线/离线"。
+   */
+  age_seconds?: number | null;
+  /**
+   * 快照是否陈旧（后端阈值 `NODE_STATE_STALE_SECONDS = 300`）。
+   *
+   * **不得**渲染成"离线"或"异常"：一台在线但超过 5 分钟没上报的节点
+   * `online: true` 与 `stale: true` 同时成立；反过来从未上报时后端恒给 `true`
+   * （无快照 = 无新鲜证据），那更不是"离线"。
+   */
+  stale?: boolean;
+  /** Agent 自述的控制协议版本；`null` = 未上报（按基线动作处理）。 */
+  control_protocol_version?: number | null;
+  /** Agent 自述已实现的动作清单；`null` = 未上报（**不得**当成空数组）。 */
+  capabilities?: string[] | null;
+  // ── V4-WP6 §13.4.4 扩展列（迁移 20260928000000，**落库行**）──
   //
   // 全部可空且**没有默认值**：NULL = 「Agent 还没报过这件事」，不是 0。
   // 面板必须按「未知」处理（例如旧 Agent 不报内存时不能显示「内存 0%」）。
@@ -432,9 +498,18 @@ export interface NodeRuntimeTunnel {
   targets?: string[];
 }
 
-/** 节点详情（列表行 + 凭据状态派生 + 出口池 + 运行态） */
+/**
+ * 节点详情（界面模型：节点行 + 服务端派生 role + 出口池）。
+ *
+ * 由 `projectNodeDetail`（`lib/api/admin.ts`）从后端聚合
+ * `GET /api/admin/node/:id/detail` 的**嵌套**形状投影而来。
+ *
+ * **没有 `state` 字段**：运行态已拆成独立端点 `GET /api/admin/node/:id/state`，
+ * 由 `loadNodeState` 取成三态（`reported` / `never_reported` / `unavailable`）。
+ * 这里若保留一个可空的 `state`，消费方会把它读成"该节点没有上报"，而实际上
+ * 是"这个端点不再提供运行态"——即被本专项明令禁止的"把取不到说成没有"。
+ */
 export interface NodeDetail extends Node {
   pools: EgressPool[];
-  state: NodeStateReport | null;
 }
 

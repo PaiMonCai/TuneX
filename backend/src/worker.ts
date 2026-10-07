@@ -29,8 +29,21 @@ export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number
   { name: "cron_latency_history", pattern: "15 * * * *", desc: "观测档案：小时桶聚合 + 过期清理（原始 24h / 桶 30d，幂等）" },
   { name: "cron_check_node_offline", everyMs: 10_000, desc: "离线检测：dc:* 防抖到点置 inactive" },
   { name: "cron_reconcile_v3", everyMs: 30_000, desc: "v3 desired/runtime/lease 同 revision 对账修复" },
+  // DDNS 的写入**不**搭 failover 策略的车：那个扫描在 auto_failover/auto_failback 都关时
+  // 整轮直接返回，而"缺省即关"是刻意的（§8）。于是"绑定域名 + 开自动同步"这个纯 DNS 能力
+  // 在默认部署下永远不会写。这条节拍只遍历开了自动同步的转发，判定仍在执行器一处。
+  { name: "cron_ddns_sync", everyMs: 30_000, desc: "DDNS 同步：写 dns_auto_resolve 的转发（与 failover 策略无关，幂等 + 退避）" },
   // Settlement is intentionally offset from the hourly latency rollup/archive windows.
   { name: "cron_settle_billing", pattern: "45 * * * *", desc: "订阅周期结算：占位 → 执行 → 终态，崩溃接管（幂等）" },
+  // 事实类通知（拒绝 / 恢复）。在此之前 `runForwardDenialNotifications()` **没有生产调用者** ——
+  // 通知的派生、账本、静默期、渠道都写完了，却没有任何节拍去调用它，于是"转发下发被拒"这件事
+  // 永远发不出去（只有公告那条路径真的会投递）。
+  //
+  // 节拍取 30s（与 `cron_reconcile_v3`/`cron_ddns_sync` 同拍）：事实的来源 `tunnel.apply_status`
+  // 由对账/下发路径写，取同一节拍意味着最坏滞后约一拍；更快只是空转，更慢会让"刚坏掉"的通知迟到。
+  // **幂等完全交给投递层**（账本唯一索引 + 每渠道 Redis 静默期）：所以这里每拍无条件调用，
+  // **job 内部不做任何去抖/冷却**（那会成为第二套抑制判据，本专项明令禁止）。
+  { name: "cron_notification_facts", everyMs: 30_000, desc: "事实类通知：转发拒绝/恢复 → 已打开的「给人」渠道（幂等交给投递层）" },
 ];
 
 const connection = new IORedis(env.redisUrl, { maxRetriesPerRequest: null });
@@ -198,6 +211,60 @@ const worker = new Worker(
 
 
         return { ...summary, federation: federationSummary };
+      }
+      case "cron_ddns_sync": {
+        // 独立于 failover 策略的 DNS 写入节拍（见 CRON_JOBS 里的注释）。幂等性来自执行器：
+        // 值集没变时零外呼、失败走有界退避、读回决定 verified。这里只负责"每拍看一眼"。
+        const { runDdnsSyncSweep } = await import("./services/ddns-successor.ts");
+        const r = await runDdnsSyncSweep({
+          log: (e) => {
+            const line = `[worker] ddns: ${e.message} ${e.detail ? JSON.stringify(e.detail) : ""}`;
+            if (e.level === "warn") console.warn(line);
+            else console.log(line);
+          },
+        });
+        const summary = {
+          evaluated: r.evaluated,
+          synced: r.synced,
+          unverified: r.unverified,
+          noop: r.noop,
+          waiting: r.waiting,
+          not_applicable: r.not_applicable,
+          failed: r.failed,
+          errors: r.errors,
+        };
+        // 空闲时（没有开启自动同步的转发）保持静默，但有动作/有错必须留痕。
+        if (r.synced > 0 || r.unverified > 0 || r.failed > 0 || r.errors > 0) {
+          console.log("[worker] cron_ddns_sync:", JSON.stringify(summary));
+        }
+        return summary;
+      }
+      case "cron_notification_facts": {
+        // 事实类通知（N3）：把 attention 里 E 类事实（转发下发被拒）与"已恢复"配对后交给投递层。
+        // 本 handler **不做任何判定**：不筛事实之外的条目、不去抖、不改写账本 ——
+        // 幂等由投递层保证（账本唯一索引 + 每渠道 Redis 静默期），所以每拍无条件调用是安全的。
+        const { runForwardDenialNotifications, defaultForwardDenialDeps } = await import(
+          "./services/notification-facts-trigger.ts"
+        );
+        try {
+          const r = await runForwardDenialNotifications(defaultForwardDenialDeps());
+          // ── 打印条件**故意**不包含 `facts_derived`（task-47 的修法收窄）──
+          // "有事实但零渠道"这件事由**触发器自己**的那行告警承载（`[notification-facts] …没有任何已配置渠道…`，
+          // 条件 `facts_derived>0 && channels===0`）。如果把 `facts_derived>0` 也加到这里，
+          // 那么**只要库里有一条长期 error 的转发**（真实运维里很常见），这条 summary 就会
+          // 每 30 秒打一行 —— 那是永久噪音，本专项明令禁止用噪音稀释"失败可见"。
+          // 静默 = "这一拍没有需要人看的事"；有需要人看的事时，由告警行说话。
+          if (r.delivered || r.built > 0 || r.rejected > 0 || r.skipped > 0) {
+            console.log("[worker] cron_notification_facts:", JSON.stringify(r));
+          }
+          return r;
+        } catch (e) {
+          // 通知是旁路：一次失败不该让整轮扫描成为"崩溃"，但必须可见（worker.on("failed") 之外
+          // 再留一行，因为这里吞掉了异常以返回可读的 summary）。
+          const detail = e instanceof Error ? e.message : String(e);
+          console.error("[worker] cron_notification_facts failed:", detail);
+          return { error: detail };
+        }
       }
       case "cron_settle_billing": {
         // Settlement claims a unique (subscription, period) row before execution. Stale pending

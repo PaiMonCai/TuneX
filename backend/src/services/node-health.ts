@@ -44,7 +44,8 @@ export const HEALTH_THRESHOLDS: HealthThresholds = {
   /**
    * 「持续错误」窗口：最近错误发生在这个窗口内即视为仍在出错。
    *
-   * 与心跳周期（30s）和 stale 窗口（90s）同源：如果节点按心跳节奏上报，
+   * 与心跳周期（30s）和 stale 窗口（90s）同源（同一个物理节拍，见
+   * `node-lifecycle.REPORT_PERIOD_MS`）：如果节点按心跳节奏上报，
    * 窗口内出现过错误说明它**现在**还在失败；超出窗口说明失败已经过去至少
    * 几个上报周期，属于历史。
    */

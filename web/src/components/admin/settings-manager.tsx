@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Loader2, Save, Search } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -38,19 +38,99 @@ const TEXTAREA_KEYS = ["NOTICE", "WITHDRAW_METHODS"];
 
 const GROUP_ORDER = ["站点", "公告（已废弃）", "邮件", "推广", "提现", "客服", "运营", "隧道", "其他"];
 
+/**
+ * N-F1：SMTP **不在这个页面**配置（后端 `config` 表里的 `SMTP_*` 行没有任何读者，
+ * `services/mail.ts` 只读 `env.ts` 的 `mail` 段）。静默移除会让运维找不到地方配，所以这里
+ * 明确写清"为什么不在这里"、给出**具体变量名**、指向部署文档，并说明历史行会被忽略。
+ */
+const SMTP_ENV_NAMES = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM", "SMTP_SECURE"] as const;
+
+/**
+ * 纵深防御：后端已经不再下发这些键（N-F1），这里**再滤一遍**。
+ * 理由：页面上写着"历史的 SMTP_* 行会被忽略"，如果哪天后端（或 mock）把它们又发下来，
+ * 界面就会渲染成一个可编辑、可"保存成功"的表单 —— 那句话立刻变成谎。
+ */
+const DEPLOYMENT_LEVEL_KEYS = new Set<string>(SMTP_ENV_NAMES);
+
+/**
+ * **未接线配置键**（task-33 的穷举审计结论）：既没有生产读者、也不是部署级 env 提供的。
+ * 后端已经拒绝写它们、也不再下发（见 `routes/admin.ts` 的 `UNWIRED_CONFIG_NAMES` 注释里的逐键证据）；
+ * 这里**再滤一遍**并把清单显示给运维——页面必须能回答"我以前配过的那几个键去哪了"。
+ */
+const UNWIRED_KEYS = [
+  "EMAIL_PROVIDER",
+  "RESEND_API_KEY",
+  "RESEND_FROM",
+  "CHATWOOT_BASE_URL",
+  "CHATWOOT_TOKEN",
+  "REFERRAL_COMMISSION_RATE",
+  "REFERRAL_FIRST_ONLY",
+  "REFERRAL_MODE",
+  "MIN_WITHDRAW_AMOUNT",
+  "WITHDRAW_METHODS",
+  "LIMIT_SCOPE",
+  "AUTO_UPDATE_AGENT",
+  "OBSERVER_PERIOD",
+] as const;
+const UNWIRED_KEY_SET = new Set<string>(UNWIRED_KEYS);
+
+const UNWIRED_NOTICE: Record<"zh" | "en", { title: string; body: string }> = {
+  zh: {
+    title: "以下配置键当前没有任何生产读者",
+    body:
+      "后端全文检索确认：这些键既没有被服务/路由读取，也不是部署级环境变量提供的（也就是说：写进去不会有任何效果）。" +
+      "因此管理端**不接受**写入，也不再把它们列为可配置项；历史行仍留在库里（不改写、不删除）。" +
+      "等对应能力接线后，按它需要的形态（DB 配置或环境变量）再开放：",
+  },
+  en: {
+    title: "These configuration keys currently have no production reader",
+    body:
+      "A full-tree search confirms these keys are read by no service/route and are not supplied by deployment environment variables (writing them has no effect). " +
+      "This console therefore refuses writes and no longer lists them as configurable; legacy rows stay in the database (not rewritten, not deleted). " +
+      "Once the corresponding capability is wired, expose them in the shape it needs (DB config or environment variable):",
+  },
+};
+
+const SMTP_NOTICE: Record<"zh" | "en", { title: string; body: string; history: string }> = {
+  zh: {
+    title: "SMTP（邮件）属于部署级配置",
+    body:
+      "邮件发送读取的是部署环境的变量，因此管理端**不提供** SMTP 写入项（写进这里也不会生效）。请在部署环境设置：" +
+      SMTP_ENV_NAMES.join(" / ") +
+      "，详见 docs/production-deploy.md 的邮件配置段。",
+    history: "若数据库里还留着历史的 SMTP_* 行：本页与后端都会**忽略**它们（不改写、也不删除）。",
+  },
+  en: {
+    title: "SMTP (email) is deployment-level configuration",
+    body:
+      "Email delivery reads deployment environment variables, so this console does not offer SMTP fields (values written here would not take effect). Set them in the deployment environment: " +
+      SMTP_ENV_NAMES.join(" / ") +
+      ", see the mail section of docs/production-deploy.md.",
+    history: "If legacy SMTP_* rows still exist in the database, both this page and the backend ignore them (they are not rewritten or deleted).",
+  },
+};
+
 export function AdminSettingsManager({ initialData }: { initialData: SystemConfigItem[] }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const notice = SMTP_NOTICE[locale === "en" ? "en" : "zh"];
+  const unwired = UNWIRED_NOTICE[locale === "en" ? "en" : "zh"];
   const [rows, setRows] = useState(initialData);
   const [draft, setDraft] = useState<Record<string, string>>(
     () => Object.fromEntries(initialData.map((c) => [c.name, c.value])),
   );
   const [saving, setSaving] = useState<string | null>(null);
   const [keyword, setKeyword] = useState("");
+  // 凭据类键**非受控**：值只存在于输入框里，不进 React state、不在成功后被保留。
+  const secretRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  // 非受控输入需要一次状态变化才会重绘（"有改动"徽章/保存按钮的可用态）：这里只计数，不存值。
+  const [, bumpSecretDraft] = useState(0);
 
   const grouped = useMemo(() => {
     const kw = keyword.trim().toUpperCase();
     const map = new Map<string, SystemConfigItem[]>();
     for (const c of rows) {
+      if (DEPLOYMENT_LEVEL_KEYS.has(c.name)) continue;
+      if (UNWIRED_KEY_SET.has(c.name)) continue;
       if (kw && !c.name.includes(kw)) continue;
       const g = groupOf(c.name);
       const arr = map.get(g) ?? [];
@@ -60,14 +140,31 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
     return GROUP_ORDER.filter((g) => map.has(g)).map((g) => [g, map.get(g)!] as const);
   }, [rows, keyword]);
 
-  const dirty = (name: string) => draft[name] !== rows.find((r) => r.name === name)?.value;
+  const dirty = (row: SystemConfigItem) =>
+    isSecret(row)
+      ? (secretRefs.current[row.name]?.value ?? "") !== ""
+      : (draft[row.name] ?? "") !== row.value;
+
+  /** 凭据类键（后端回 `secret_configured`）：值只写不读，界面只显示"配没配"。 */
+  const isSecret = (row: SystemConfigItem) => row.secret_configured !== undefined;
+  const pendingValue = (row: SystemConfigItem): string =>
+    isSecret(row) ? (secretRefs.current[row.name]?.value ?? "") : (draft[row.name] ?? "");
 
   async function save(name: string) {
-    const value = draft[name] ?? "";
+    const secret = isSecret(rows.find((r) => r.name === name) ?? ({ name } as SystemConfigItem));
+    const value = secret ? (secretRefs.current[name]?.value ?? "") : (draft[name] ?? "");
     setSaving(name);
     try {
       await api.admin.setSystemConfig(name, value);
-      setRows((prev) => prev.map((r) => (r.name === name ? { ...r, value, updated_at: new Date().toISOString() } : r)));
+      if (secret) {
+        // 只写不读：保存成功后立刻从输入框抹掉，并只把"已配置"这个事实记进状态。
+        if (secretRefs.current[name]) secretRefs.current[name]!.value = "";
+        setRows((prev) =>
+          prev.map((r) => (r.name === name ? { ...r, value: "", secret_configured: value.length > 0, updated_at: new Date().toISOString() } : r)),
+        );
+      } else {
+        setRows((prev) => prev.map((r) => (r.name === name ? { ...r, value, updated_at: new Date().toISOString() } : r)));
+      }
       toast.success(t("admin.configSaveSuccess"));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t("admin.saveFailed"));
@@ -82,6 +179,30 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
 
   return (
     <div className="flex flex-col gap-5" data-testid="admin-settings">
+      <Card data-testid="smtp-deployment-note">
+        <CardHeader className="pb-2">
+          <CardTitle>{notice.title}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-1">
+          <p className="field-hint">{notice.body}</p>
+          <p className="field-hint" data-testid="smtp-deployment-history">
+            {notice.history}
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card data-testid="unwired-config-note">
+        <CardHeader className="pb-2">
+          <CardTitle>{unwired.title}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-1">
+          <p className="field-hint">{unwired.body}</p>
+          <p className="field-hint font-mono text-xs" data-testid="unwired-config-keys">
+            {UNWIRED_KEYS.join("、")}
+          </p>
+        </CardContent>
+      </Card>
+
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Input
@@ -112,15 +233,57 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
             <CardContent className="flex flex-col gap-4">
               {items.map((c) => {
                 const value = draft[c.name] ?? "";
-                const changed = dirty(c.name);
+                const changed = dirty(c);
+                const secret = isSecret(c);
                 return (
                   <div key={c.name} className="flex flex-col gap-1.5">
                     <div className="flex items-center justify-between gap-2">
                       <label className="font-mono text-xs font-medium text-[var(--muted-foreground)]">{c.name}</label>
-                      {changed && <Badge variant="default">{t("common.save")}</Badge>}
+                      <span className="flex items-center gap-2">
+                        {secret && (
+                          <Badge
+                            variant={c.secret_configured ? "success" : "muted"}
+                            data-testid={`config-secret-state-${c.name}`}
+                          >
+                            {c.secret_configured
+                              ? locale === "en"
+                                ? "Configured"
+                                : "已配置"
+                              : locale === "en"
+                                ? "Not configured"
+                                : "未配置"}
+                          </Badge>
+                        )}
+                        {c.read_only && (
+                          <Badge variant="outline" data-testid={`config-readonly-badge-${c.name}`}>
+                            {locale === "en" ? "Read-only (deprecated)" : "只读（已废弃）"}
+                          </Badge>
+                        )}
+                        {!c.read_only && changed && <Badge variant="default">{t("common.save")}</Badge>}
+                      </span>
                     </div>
                     <div className="flex items-start gap-2">
-                      {isBoolValue(c.value) ? (
+                      {c.read_only ? (
+                        // 只读行（当前只有已废弃的 NOTICE*）：值可见、**不给**任何可编辑控件。
+                        <code
+                          className="min-w-0 flex-1 overflow-x-auto rounded-md border border-dashed border-[var(--input)] bg-[var(--muted)] px-3 py-2 font-mono text-xs text-[var(--muted-foreground)]"
+                          data-testid={`config-readonly-${c.name}`}
+                        >
+                          {c.value === "" ? "—" : c.value}
+                        </code>
+                      ) : secret ? (
+                        // 只写不读：输入框是非受控的（值不进 state），成功保存后立刻清空。
+                        <Input
+                          ref={(el) => {
+                            secretRefs.current[c.name] = el;
+                          }}
+                          type="password"
+                          autoComplete="off"
+                          placeholder={locale === "en" ? "Write a new value (never echoed)" : "写入新值（不回显）"}
+                          onChange={() => bumpSecretDraft((n) => n + 1)}
+                          data-testid={`config-${c.name}`}
+                        />
+                      ) : isBoolValue(c.value) ? (
                         <select
                           value={value}
                           onChange={(e) => setValue(c.name, e.target.value)}
@@ -144,17 +307,20 @@ export function AdminSettingsManager({ initialData }: { initialData: SystemConfi
                           data-testid={`config-${c.name}`}
                         />
                       )}
-                      <Button
-                        size="sm"
-                        variant={changed ? "default" : "outline"}
-                        disabled={!changed || saving === c.name}
-                        onClick={() => save(c.name)}
-                        className={cn("shrink-0", !changed && "opacity-60")}
-                        data-testid={`config-save-${c.name}`}
-                      >
-                        {saving === c.name ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
-                        {t("common.save")}
-                      </Button>
+                      {/* 只读行**不渲染**保存控件（不是 disabled/hidden：页面上不该存在一个按不动的按钮）。 */}
+                      {!c.read_only && (
+                        <Button
+                          size="sm"
+                          variant={changed ? "default" : "outline"}
+                          disabled={!changed || saving === c.name}
+                          onClick={() => save(c.name)}
+                          className={cn("shrink-0", !changed && "opacity-60")}
+                          data-testid={`config-save-${c.name}`}
+                        >
+                          {saving === c.name ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+                          {t("common.save")}
+                        </Button>
+                      )}
                     </div>
                   </div>
                 );

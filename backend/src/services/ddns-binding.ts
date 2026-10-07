@@ -120,6 +120,16 @@ export interface DnsBindingRow {
   dns_synced_at?: Date | null;
   dns_verified?: unknown;
   dns_last_error?: unknown;
+  /**
+   * V5-WP17.3 读投影：F5.3 的自动同步开关（`bindForwardDns` 写入、`unbindForwardDns`
+   * 重置为 false）。列是 `NOT NULL DEFAULT false`，这里按**未取到即 false** 处理
+   * （fail-closed：缺字段不代表"开启"）。
+   */
+  dns_auto_resolve?: unknown;
+  /** V5-WP17.3 退避：连续失败计数（执行器成功写入时清零）。 */
+  dns_attempt_count?: unknown;
+  /** V5-WP17.3 退避：下一次允许尝试的最早时刻（NULL = 没有待重试的失败）。 */
+  dns_next_attempt_at?: Date | null;
 }
 
 /**
@@ -154,6 +164,31 @@ export interface DnsBindingState {
   synced_at: string | null;
   verified: boolean;
   last_error: string | null;
+  /**
+   * V5-WP17.3 读投影（G2）：F5.3 的"自动同步"开关的**服务端真相**。
+   *
+   * 前端**不得**自己推断这个值（例如"绑了 provider 就等于开了自动解析"）：执行器判的是
+   * 这一列（`ddns-executor.ts`：`dns_auto_resolve !== true` ⇒ 只回报建议值集、零外呼），
+   * 而 `false` 时"界面说会自动切换"就是一句谎。未绑定/列缺失一律 `false`。
+   */
+  auto_resolve: boolean;
+  /**
+   * V5-WP17.3 读投影（G3）：执行器的连续失败计数。
+   *
+   * `null`（**不是 0**）= 该计数此刻不对应任何可执行的重试：这条 Forward 还没绑定前门，
+   * 执行器在读绑定后的第一个分支就 `noop` 返回，根本走不到退避判定。未绑定行上的历史计数
+   * 只可能来自更早的一次绑定，把它透出去会让界面显示"已重试 N 次"而没有任何东西在重试。
+   */
+  attempt_count: number | null;
+  /**
+   * V5-WP17.3 读投影（G3）：下一次允许尝试的**最早**时刻（ISO-8601 UTC）。
+   *
+   * `null` = 没有待重试的失败 —— 这正是界面要用来区分"将于 X 重试"与"不会自动重试"的那个
+   * `null`（`ddns-executor.ts`：可重试错误写 `now + nextAttemptDelayMs(attempt)`，不可重试错误
+   * 写 `null`，成功写入清零）。**不允许**用 `0` / 空串顶替。
+   * 完整判据：会重试 ⇔ `auto_resolve === true && next_attempt_at !== null`（且此列非 null）。
+   */
+  next_attempt_at: string | null;
 }
 
 function stringList(input: unknown): string[] {
@@ -175,6 +210,19 @@ export function dnsBindingState(
   expected: readonly string[] = [],
 ): DnsBindingState {
   const state = dnsStateFor(row);
+  // 退避两列只在**绑定存在**时有意义：`dns_domain` 为空 ⇒ 执行器的第一个分支
+  // （`!row.dns_domain || …`）就以 `noop` 返回，永远不会走到这里的两列；解绑也**不清**
+  // 这两列（见 unbindForwardDns）。所以未绑定行的历史值必须投影成 `null`，否则界面会把
+  // 一条早已不存在的重试说成"将于 X 重试"。
+  const bound = state !== "unbound";
+  const attempts =
+    typeof row.dns_attempt_count === "number" && Number.isInteger(row.dns_attempt_count) && row.dns_attempt_count > 0
+      ? row.dns_attempt_count
+      : 0;
+  const nextAttemptAt =
+    row.dns_next_attempt_at instanceof Date && !Number.isNaN(row.dns_next_attempt_at.getTime())
+      ? row.dns_next_attempt_at.toISOString()
+      : null;
   return {
     state,
     domain: typeof row.dns_domain === "string" && row.dns_domain.trim() !== "" ? row.dns_domain.trim() : null,
@@ -188,6 +236,9 @@ export function dnsBindingState(
     synced_at: row.dns_synced_at instanceof Date ? row.dns_synced_at.toISOString() : null,
     verified: row.dns_verified === true,
     last_error: typeof row.dns_last_error === "string" && row.dns_last_error.trim() !== "" ? row.dns_last_error.trim() : null,
+    auto_resolve: row.dns_auto_resolve === true,
+    attempt_count: bound ? attempts : null,
+    next_attempt_at: bound ? nextAttemptAt : null,
   };
 }
 
@@ -448,6 +499,12 @@ export async function bindForwardDns(deps: DdnsDeps, input: DnsBindingRequest): 
       dns_synced_at: true,
       dns_verified: true,
       dns_last_error: true,
+      // 读投影（G2/G3）要与 GET 同形：绑定响应就是 Web 绑定后立刻要用的那份状态。
+      // 注意这两列**不**在这次 update 里重置 ⇒ 绑回一个改过域名的前门时，若上一轮失败
+      // 还在退避窗口内，执行器（真实行为）仍会等到 `next_attempt_at` 才写 —— 投影照实说。
+      dns_auto_resolve: true,
+      dns_attempt_count: true,
+      dns_next_attempt_at: true,
     },
   })) as DnsBindingRow;
 
@@ -496,6 +553,11 @@ export async function unbindForwardDns(
       dns_synced_at: true,
       dns_verified: true,
       dns_last_error: true,
+      // `dns_auto_resolve` 上面已置回 false；退避两列解绑时**不清**（列还在行上），
+      // 但投影在未绑定时一律给 `null`（见 dnsBindingState）——读模型不把历史退避当事实。
+      dns_auto_resolve: true,
+      dns_attempt_count: true,
+      dns_next_attempt_at: true,
     },
   })) as DnsBindingRow;
 

@@ -104,7 +104,13 @@ export const TARGET_HEALTH_THRESHOLDS: TargetHealthThresholds = Object.freeze({
   /** §7 结论 8 冻结的算式：STALE_AFTER = 3 × 上报周期。 */
   STALE_AFTER_MULTIPLIER: 3,
   /**
-   * 保护「面板重启后把旧观测当新鲜」（§7 结论 8/9）：90s = 3 × 30s。一次丢包
+   * 保护「面板重启后把旧观测当新鲜」（§7 结论 8/9）：90s = 3 × 30s。
+   *
+   * **与连接窗口数值相同、概念不同**（见 `node-lifecycle.REPORT_PERIOD_MS` 的清单）：
+   * 这里的对象是**一条探测结果**（`target_observation`），不是"节点还活着吗"。
+   * 今天相等是因为观测节拍 = 上报节拍 = 30s，不是同一个判定；**不得**把本常量与
+   * `CONNECTION_ONLINE_WINDOW_MS` 互相绑定（那会让"改一个窗口"顺带改掉另一个概念的
+   * 语义）。数值相等由 `services/__tests__/freshness-windows.test.ts` 显式钉住。
    * 或一个周期抖动不会让全部证据过期；连续三个周期没有新证据，就必须按
    * 「没有证据」处理，而不是继续沿用最后一次结果。数值与 V4 节点 stale 窗口
    * （`reconciler.DEFAULT_NODE_STALE_AFTER_MS = 90_000`）一致，避免同一面板上

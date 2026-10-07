@@ -21,6 +21,7 @@
  */
 import { db } from "../src/db.ts";
 import { createPersonalWorkspace, ensurePersonalWorkspace } from "../src/services/workspace.ts";
+import { shouldSeedDemoData, describeSeedDemoDecision } from "../src/services/seed-scope.ts";
 import { hashPassword, generatePassword } from "../src/auth.ts";
 import { writeFileSync, chmodSync } from "node:fs";
 import {
@@ -94,9 +95,10 @@ const DEFAULT_CONFIG: Record<SystemConfigName, string> = {
 };
 
 const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? "admin@tunex.local";
-const SEED_DEMO_DATA =
-  process.env.SEED_DEMO_DATA === "true" ||
-  (process.env.SEED_DEMO_DATA === undefined && (process.env.NODE_ENV ?? "development") !== "production");
+// 判定搬到 `src/services/seed-scope.ts`（纯函数）：脚本本身没法被测试 import，而这条判定
+// 是"生产首启可用性"的核心 —— 演示节点会占用新空间那 1 台免费节点额度，把管理员挡在
+// 403 node_limit 外面。行为测试与守卫见 `services/__tests__/seed-production-safety.test.ts`。
+const SEED_DEMO_DATA = shouldSeedDemoData(process.env);
 const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? generatePassword(24);
 const CREDENTIALS_PATH =
   process.env.ADMIN_CREDENTIALS_PATH ?? "/host/.admin-credentials";
@@ -387,7 +389,7 @@ async function main() {
     const linkCount = await seedPlanNodeGroups(planIds, nodeGroupIds);
     console.log(`[seed] plan_node_group links created: ${linkCount}`);
   } else {
-    console.log("[seed] demo plans/nodes skipped (SEED_DEMO_DATA=false)");
+    console.log(`[seed] demo plans/nodes skipped (${describeSeedDemoDecision(process.env)})`);
   }
 
   const counts = {

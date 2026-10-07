@@ -56,13 +56,44 @@ export type NodeConnectionValue = (typeof NODE_CONNECTIONS)[number];
 export const LIFECYCLE_NOTE_MAX = 255;
 
 /**
- * 上报陈旧阈值（毫秒）。
+ * Agent 的上报节拍（毫秒）。
  *
- * 判定的**唯一**使用点是下面的 `deriveConnection`；任何其它模块（含路由层）
- * 出现同样数值即为复制判据 —— `services/__tests__/node-view.test.ts` 有静态
- * 守卫钉住这一点。
+ * 契约事实：`agent/internal/reporter/heartbeat.go` 的 `Interval = 30s`（state report
+ * 与心跳同拍）。这不是某个模块的实现细节，而是**所有"这个 Agent 还活着吗"窗口的
+ * 物理基准**：连续 N 个周期没有消息 ⇒ 该事实不再可信。把它写成一个数，是为了让
+ * "90s"这个数只有一处来历（3 × 上报周期），而不是让每个消费者各自写 90_000。
  */
-export const CONNECTION_ONLINE_WINDOW_MS = 90_000;
+export const REPORT_PERIOD_MS = 30_000;
+
+/**
+ * 上报陈旧阈值（毫秒）——**「这台节点还活着吗」这一族判定的唯一数字来源**。
+ *
+ * ── 谁在"这一族"（阈值必须同源，否则同一块面板上会出现两个事实）──
+ *   · 本模块的 {@link deriveConnection}：UI / 用户域看到的 online/offline 投影；
+ *   · `scheduler-support.isOnline()`：调度准入的兜底可达性（`HEARTBEAT_TIMEOUT_MS`）；
+ *   · `reconciler.isNodeUnreachable()`：自动下发/迁移前的可达性闸门
+ *     （`DEFAULT_NODE_STALE_AFTER_MS`）。
+ * 三者问的是**同一个问题**（`status=active` 且最近一次上报在窗口内）。它们各自的
+ * **谓词可以更保守**（reconciler 对 `null` / `status=inactive` 直接判不可达），但
+ * **阈值必须同源**：数值分叉就会出现"面板显示在线、协调器判定不可达"。
+ * 路由/投影层仍然**不得**自己写这个数（`services/__tests__/node-view.test.ts`
+ * 与 `attention.test.ts` 的静态守卫钉住这一点）。
+ *
+ * ── 谁不在这一族（数值相同，但对象/后果不同，**不得**互相绑定）──
+ *   · `target-health-thresholds.STALE_AFTER_MS`：**观测**（target_observation）的
+ *     新鲜度 —— 对象是"一条探测结果"，不是节点；
+ *   · `node-health.errorRecentMs`：**错误事件**算不算"最近"（展示口径）；
+ *   · `federation/forward-hop.FEDERATED_INGRESS_REPORT_FRESH_MS`：**联邦 ingress
+ *     上报**的新鲜度（跨租户事实）；
+ *   · `placement-lease.LEASE_TTL_SECONDS`：**归属租约**的 TTL（"多久算丢归属"，
+ *     不是"多久算离线"）；
+ *   · `forward-rollout-runtime-confirm.ROLLOUT_EXECUTOR_LEASE_MS`：执行阶段的**预算**，
+ *     与上报周期无关（90s 是巧合）。
+ * 它们今天都是 90_000 只是因为**同一个物理节拍**（3 × 30s），不是同一个概念。
+ * 数值相等由 `services/__tests__/freshness-windows.test.ts` 显式钉住：改它们必须
+ * 是一次有意识的选择，而不是连带漂移。
+ */
+export const CONNECTION_ONLINE_WINDOW_MS = 3 * REPORT_PERIOD_MS;
 
 /* ================================================================== */
 /* 错误模型                                                           */
@@ -241,6 +272,19 @@ export function businessRejectionCode(lifecycle: string | null | undefined): Lif
  * 为什么 revoked 归 offline 而不是 waiting：revoke 是**主动**断开机器身份，
  * 节点确实已不在服务；waiting 的语义是「还没装好」，给 revoked 用会让运维
  * 以为还在等安装。
+ *
+ * ── `status` 这一维的写入契约（两个方向都必须存在）──
+ * 本函数把 `status` 当作 Connection 层的闸门列，因此它必须**可恢复**：
+ *   · 反方向（`active → inactive`）：`socket/offline-detector.ts` 的上报过期
+ *     清扫 / 会话结束；
+ *   · 正方向（`inactive → active`）：`services/node-state.ts` 的
+ *     `submitStateReport()` —— 一次通过凭据认证的上报就是「这个 Agent 活着」
+ *     的事实，它与 `last_seen_at` 在同一条 updateMany 里写回 `active`。
+ * 缺了正方向就会形成单向闩锁：任何一次超过
+ * {@link CONNECTION_ONLINE_WINDOW_MS} 的上报中断（新建节点在 Agent 首次上报
+ * 前必然出现）之后，即使上报一直新鲜，这里也永远返回 `offline`。HTTP 轮询型
+ * Agent（无 socket 会话、无 Redis 心跳、无断开标记）没有别的恢复路径。
+ * 两个方向共用同一个窗口常量，`status` 与 `last_seen_at` 因此不会互相矛盾。
  */
 export function deriveConnection(input: {
   status?: string | null;

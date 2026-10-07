@@ -1,6 +1,14 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { useI18nOptional } from "@/components/providers";
+import { getDictionary } from "@/lib/i18n";
+
+/** 图表可访问名称跟随语言；没有 Provider 时回落到产品默认语言词典（名称永不为空）。 */
+function useChartLabel(key: "revenueChartLabel" | "tunnelTypeChartLabel"): string {
+  const i18n = useI18nOptional();
+  return i18n?.t(`admin.${key}`) ?? getDictionary("zh").admin[key];
+}
 
 /**
  * 管理后台图表入口（客户端组件）。
@@ -21,16 +29,18 @@ const TunnelTypePie = dynamic(() => import("@/components/charts/admin-tunnel-pie
 });
 
 export function RevenueAreaChart({ data }: { data: { date: string; amount: number }[] }) {
+  const label = useChartLabel("revenueChartLabel");
   return (
-    <div className="h-64 w-full" data-testid="revenue-chart" role="img" aria-label="revenue trend">
+    <div className="h-64 w-full" data-testid="revenue-chart" role="img" aria-label={label}>
       <RevenueArea data={data} />
     </div>
   );
 }
 
 export function TunnelTypePieChart({ data }: { data: { type: string; count: number }[] }) {
+  const label = useChartLabel("tunnelTypeChartLabel");
   return (
-    <div className="h-64 w-full" data-testid="tunnel-types-chart" role="img" aria-label="tunnel type distribution">
+    <div className="h-64 w-full" data-testid="tunnel-types-chart" role="img" aria-label={label}>
       <TunnelTypePie data={data} />
     </div>
   );

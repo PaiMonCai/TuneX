@@ -57,9 +57,18 @@ export default async function LandingPage() {
                 {t.landing.ctaPrimary} <ArrowRight className="size-4" />
               </Link>
             </Button>
+            {/*
+              * 次 CTA：付费关闭时它**不能**再说「隧道 / /tunnels」——
+              * `/tunnels` 已经 redirect 到 `/forwards`，用户域的文案也早已统一成
+              * Forward（见 `lib/nav.ts` 的 userConsoleNav 与 `landing.subtitle`）。
+              * 这里改成产品里真实存在的概念与真实路由，不保留一个进入即跳走的旧词。
+              */}
             <Button size="lg" variant="outline" asChild>
-              <Link href={process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? "/plans" : "/tunnels"}>
-                {process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? t.landing.ctaSecondary : t.common.tunnels}
+              <Link
+                href={process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? "/plans" : "/forwards"}
+                data-testid="landing-cta-secondary"
+              >
+                {process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? t.landing.ctaSecondary : t.common.forwards}
               </Link>
             </Button>
           </div>

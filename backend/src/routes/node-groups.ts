@@ -1,8 +1,10 @@
 /**
- * 节点组路由（用户侧，只读）—— 前端 api.nodeGroups.*
+ * 节点组路由（用户侧）。
  *
  * 端点（挂载于 /api/node-groups）：
- *   GET /          可用节点组列表（含 node_count / online_node_count 统计）
+ *   GET  /              可用节点组列表（含 node_count / online_node_count 统计）
+ *   POST /              自建节点组（`node:manage` + entitlement，token 只回显一次）
+ *   POST /:id/nodes     在自有节点组内 provision 一个 Agent 身份，返回一次性 enrollment
  *
  * 挂载方式（由 app.ts 的收尾子代理执行，本模块不修改 app.ts）：
  *   import { nodeGroupsRoutes } from "./routes/node-groups.ts";
@@ -13,6 +15,12 @@
  * 前端拿到即为 Paginated<NodeGroup>（用于创建隧道时的入口/出口节点组下拉）。
  *
  * 可见范围：仅自有或显式授权节点组；不通过套餐隐式授权。
+ *
+ * 稳定的拒绝码（web 侧可按 `code` 分支）：
+ *   custom_group_not_allowed (403)           当前策略未授予自建该类节点组的能力
+ *   node_limit (403)                         节点额度耗尽
+ *   PORT_RANGE_REQUIRED (409)                节点组没有可用的连续端口范围，无法 provision
+ *   runtime_edit_requires_impact_check (409) 重装不得顺带改运行配置
  */
 import { Hono } from "hono";
 import { z } from "zod";
@@ -189,11 +197,29 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
         where: { node_group: { workspace_id: workspace.id } },
       });
       if (!existing) {
-        if (portMin === null || portMax === null || portMin < 1 || portMax > 65535 || portMin > portMax) {
-          return { rangeConflict: true } as const;
-        }
+        // 顺序是有意的（E2 复核 F3）：**能力/额度判定在端口区间之前**。
+        //
+        // 反例：一个没有任何生效策略的空间（真因是"策略未授予"，下一步是找管理员）
+        // 里，给一个没有区间的节点组加节点。先判区间会拿到 409 PORT_RANGE_REQUIRED，
+        // 而旧文案让用户"新建带端口范围的节点组" —— 那个空间 `POST /api/node-groups`
+        // 只会 403 `custom_group_not_allowed`，是一条死路。能力拒绝是**改不了的事实**，
+        // 区间未配置是**可修复的状态**，所以前者优先。
         const decision = checkNodeCreation(policy, nodeCount);
         if (!decision.allowed) return { denied: decision } as const;
+        if (portMin === null || portMax === null || portMin < 1 || portMax > 65535 || portMin > portMax) {
+          // 区间确实要修，但"去自建一个带区间的组"只在这个空间**真的能自建**时才成立
+          // （自建能力由 entitlements 决定，与节点额度是两件事）。不能自建时不能提这条
+          // 建议，否则又是一条死路。码保持 PORT_RANGE_REQUIRED，响应形状保持扁平两键。
+          const canSelfServeGroup =
+            group.node_type === "in"
+              ? policy.entitlements?.allow_custom_in_group === true
+              : policy.entitlements?.allow_custom_out_group === true;
+          return {
+            rangeConflict: canSelfServeGroup
+              ? "节点组未配置端口范围，无法添加节点；请新建带端口范围的节点组，或联系管理员为该节点组配置端口范围"
+              : "节点组未配置端口范围，无法添加节点；当前策略也不允许你自建节点组，请联系管理员为该节点组配置端口范围",
+          } as const;
+        }
       }
 
       const select = {
@@ -272,6 +298,17 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
     if ("runtimeEdit" in reserved) {
       return c.json({ error: "重装不会修改现有运行配置，请使用出口池管理接口", code: "runtime_edit_requires_impact_check", error_layer: "runtime_admission" }, 409);
     }
+    // 节点组没有可用的连续端口范围时不能 provision：`node.port_range_min/max` 是
+    // per-node 端口所有权域，未配置必须拒绝，既不回落到节点组以外的区间，也不猜一个。
+    // 这是**调用方可修复的状态冲突**（改节点组），不是服务器故障 —— 因此给出与
+    // web mock 同一个 409 + `PORT_RANGE_REQUIRED`，而不是落到兜底 500。
+    // 文案按"这个空间能不能自建组"分叉：不能自建时不给死路建议（见锁内的顺序注释）。
+    if ("rangeConflict" in reserved) {
+      return c.json({
+        error: reserved.rangeConflict,
+        code: "PORT_RANGE_REQUIRED",
+      }, 409);
+    }
     const denied = "denied" in reserved ? reserved.denied : null;
     if (denied) {
       return c.json({
@@ -281,6 +318,8 @@ nodeGroupsRoutes.post("/:id/nodes", async (c) => {
     }
 
     if (!("node" in reserved) || !reserved.node) {
+      // 锁内已知的每种拒绝状态都在上面各自返回 4xx；走到这里说明状态集合与分支
+      // 再次分叉（例如新增了未处理的返回形状），是服务端不变量问题而非用户输入。
       return c.json({ error: "创建节点失败" }, 500);
     }
     const enrollment = await createNodeEnrollment(reserved.node.id);

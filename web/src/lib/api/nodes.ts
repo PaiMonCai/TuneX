@@ -118,6 +118,17 @@ export const nodesApi = {
     list: (cookie?: string) => get<UserNode[]>("/nodes", undefined, cookie),
     enrollment: (id: ID, cookie?: string) =>
       post<NodeEnrollmentIssued>(`/nodes/${id}/enrollment`, {}, cookie),
+    /**
+     * 设置节点的**可拨号地址**（`connect_ip`）——RELAY/三跳的每一跳都必须有它。
+     *
+     * 为什么单独一个方法：`connect_ip` 过去**只在 provision 时可写**，建的时候没填的节点
+     * 永远当不了跳（下发会以 `invariant_violated` 结束）。这个入口只改这一个字段：
+     * 角色/端口区间/生命周期/凭据各有自己的入口，塞进同一条路径会绕过它们各自的判定。
+     *
+     * `null` = 显式清空（服务端在有 RELAY/三跳依赖它时会 409 `connect_ip_in_use` 并列出依赖）。
+     */
+    updateConnectIp: (id: ID, connect_ip: string | null, cookie?: string) =>
+      patch<UserNode>(`/nodes/${id}`, { connect_ip }, cookie),
     bindings: (ingressId: ID, cookie?: string) =>
       get<NodeBinding[]>(`/nodes/${ingressId}/bindings`, undefined, cookie),
     bindEgress: (ingressId: ID, egress_node_id: ID, cookie?: string) =>

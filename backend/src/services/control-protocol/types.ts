@@ -139,8 +139,11 @@ export interface LookingGlassTargetPayload {
 }
 
 export interface LookingGlassPayload {
-  /** 方法闭集（v1 只有 `tcp_connect`）；未知方法拒绝而不是降级。 */
-  method: "tcp_connect";
+  /**
+   * 方法闭集（task-40：`tcp_connect` + ICMP echo 两种）；未知方法拒绝而不是降级。
+   * 与 `services/looking-glass.ts` 的 `LOOKING_GLASS_METHODS` 必须逐字一致。
+   */
+  method: "tcp_connect" | "ping" | "ping6";
   /** 面板钉死的公网目标（上限见 `looking-glass.ts` 常量表）。 */
   targets: LookingGlassTargetPayload[];
   /** 单次尝试超时（毫秒）；Agent 侧还有自己的硬上限。 */

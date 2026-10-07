@@ -36,6 +36,7 @@ import type {
   WorkspaceMember,
   WorkspaceRole,
   WorkspaceTrafficSummary,
+  NodeStateReport,
 } from "@/lib/types";
 import type { TargetHealthTargetView, TargetPoolHealth } from "@/lib/target-health";
 import type { MockNodeBinding, MockWorkspaceInvite } from "../state";
@@ -311,19 +312,6 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
       if (id !== null) {
         const node = db.nodes.find((n) => n.id === id);
         if (!node) return notFound("节点不存在");
-        if (method === "GET" && seg[3] === undefined) {
-          // GET /admin/nodes/:id —— WP12 详情页聚合契约（NodeDetail）：
-          // 基础字段（含凭据派生字段） + 出口池 + 最近一条状态上报。
-          // 后端 WP10 未合并前 mock 直接按这个形状返回，前端零改动切换真实 API。
-          return ok({
-            ...node,
-            pools: (db.egressPools.get(node.id) ?? []).map((p) => ({
-              ...p,
-              targets: db.egressTargets.get(p.id) ?? [],
-            })),
-            state: db.nodeStates.get(node.id) ?? null,
-          });
-        }
         if ((method === "PUT" || method === "PATCH") && seg[3] === undefined) {
           const parsed = readNodePayload(db, asRecord(req.body), true, id);
           if (isResponse(parsed)) return parsed;
@@ -338,13 +326,96 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
           db.egressPools.delete(node.id);
           return ok({ ok: true, id: node.id });
         }
-        // ----- WP12 出口池：/admin/nodes/:id/pools[/:poolId[/targets[/:targetId]]] -----
-        if (seg[3] === "pools") return handleEgressPools(db, node, method, seg.slice(4), req);
-        // ----- WP12 运行态：/admin/nodes/:id/state -----
-        if (seg[3] === "state" && method === "GET") {
-          return ok(db.nodeStates.get(node.id) ?? null);
-        }
+        // WP12 出口池（节点作用域的那两条）：GET|POST /admin/node/:id/pools
+        // 池与目标都是全局寻址，只有"在某个节点下新建池"与"列该节点的池"需要 node，
+        // 所以只有列表/新建在这里分发，其余在下面按单数全局路径分发。
+        if (seg[3] === "pools") return handleEgressPools(db, node, method, [], req);
+        // 注意：**没有** /admin/nodes/:id/pools 与 /admin/nodes/:id/state（复数）分支。
+        // 真实后端的 pool/target 全族只有**单数**路径（`node-admin.ts:143/173/192/211/258/291/308`），
+        // 运行态只有 `/node/:id/state`。mock 曾经实现复数路径，于是本地/mock 永远看不到
+        // 线上的 404 —— 那种「mock 骗人」比缺实现更坏。两者都在下面与其它单数端点一起分发。
       }
+    }
+
+    // ----- WP12 出口池 / 出口目标：真实单数路径 -----
+    /*
+     * 路径与真实后端逐字一致（`node-admin.ts`）：
+     *   GET|POST  /admin/node/:id/pools
+     *   PATCH|DELETE /admin/node/pools/:poolId
+     *   POST      /admin/node/pools/:poolId/targets
+     *   PATCH|DELETE /admin/node/targets/:targetId
+     *
+     * 池与目标是**全局寻址**（路径里没有 node），而 `handleEgressPools` 是按节点作用域
+     * 实现的，因此这里先由 poolId / targetId 反查归属节点——和上面的目标健康分支
+     * 用的是同一套反查方式，避免为 mock 另造一套寻址。
+     */
+    // ----- WP12 详情聚合：GET /admin/node/:id/detail（真实单数路径）-----
+    /*
+     * 与 `backend/src/routes/node-admin.ts:101` 的 `get("/node/:id/detail")` 逐字同形：
+     * 嵌套 `{node, role, credential, pools, pool_count, tunnel_count}`。
+     * 运行态**不在这里**（已拆成 `/node/:id/state`，见下面同一分发区）。
+     */
+    if (seg[1] === "node" && method === "GET" && seg[3] === "detail") {
+      const id = parseId(seg[2]);
+      if (id === null) return badRequest("非法节点 ID");
+      const node = db.nodes.find((n) => n.id === id);
+      if (!node) return notFound("节点不存在");
+      const pools = db.egressPools.get(node.id) ?? [];
+      return ok({
+        node,
+        role: node.role ?? null,
+        credential: {
+          has_credential: node.has_credential === true,
+          revoked: node.credential_revoked === true,
+          rotated_at: node.credential_rotated_at ?? null,
+          last_rejected_at: node.credential_last_rejected_at ?? null,
+        },
+        pools: pools.map((x) => ({ ...x, targets: db.egressTargets.get(x.id) ?? [] })),
+        pool_count: pools.length,
+        tunnel_count: (db.tunnels ?? []).filter((x) => x.ingress_node_id === node.id).length,
+      });
+    }
+
+    // ----- WP12 列池 / 建池：GET|POST /admin/node/:id/pools（节点作用域的两条）-----
+    /*
+     * 只有这两条需要 node（"列这个节点的池"与"在这个节点下建池"）；其余池/目标操作
+     * 是在下面按全局单数路径分发的（`/node/pools/:poolId`、`/node/targets/:targetId`）。
+     */
+    if (seg[1] === "node" && seg[3] === "pools" && method !== undefined) {
+      const id = parseId(seg[2]);
+      if (id !== null) {
+        const node = db.nodes.find((n) => n.id === id);
+        if (!node) return notFound("节点不存在");
+        return handleEgressPools(db, node, method, [], req);
+      }
+    }
+
+    // 注意：**只接管池本身与它的 targets 子路径**，`/node/pools/:poolId/health`
+    // 由下面专门的分支处理（早先这一条没有限定尾段，把 health 也吞成了 404）。
+    if (seg[1] === "node" && seg[2] === "pools" && (seg[4] === undefined || seg[4] === "targets")) {
+      const poolId = parseId(seg[3]);
+      if (poolId === null) return badRequest("非法池 ID");
+      const owner = [...db.egressPools.entries()].find(([, pools]) => pools.some((p) => p.id === poolId));
+      if (!owner) return notFound("池不存在");
+      const [ownerId] = owner;
+      const node = db.nodes.find((n) => n.id === ownerId);
+      if (!node) return notFound("节点不存在");
+      const tail = seg.slice(4); // [] | ["targets"]
+      return handleEgressPools(db, node, method, [String(poolId), ...tail], req);
+    }
+    if (seg[1] === "node" && seg[2] === "targets") {
+      const targetId = parseId(seg[3]);
+      if (targetId === null) return badRequest("非法目标 ID");
+      const owner = [...db.egressTargets.entries()].find(([, targets]) =>
+        targets.some((t) => t.id === targetId),
+      );
+      if (!owner) return notFound("目标不存在");
+      const [poolId] = owner;
+      const poolOwner = [...db.egressPools.entries()].find(([, pools]) => pools.some((p) => p.id === poolId));
+      if (!poolOwner) return notFound("池不存在");
+      const node = db.nodes.find((n) => n.id === poolOwner[0]);
+      if (!node) return notFound("节点不存在");
+      return handleEgressPools(db, node, method, [String(poolId), "targets", String(targetId)], req);
     }
 
     // ----- V5.2 §7：出口池目标健康 —— GET /admin/node/pools/:poolId/health -----
@@ -373,6 +444,34 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
       const now = Date.now();
       const outcome = mockPoolTargetHealth(targets, seed.mockTargetHealthFixtures, now);
       return ok(outcome);
+    }
+
+    // ----- WP7/WP12 运行态：GET /admin/node/:id/state（单数，与真实后端同路同形）-----
+    /*
+     * 唯一真相是 `backend/src/routes/node-admin.ts` 的
+     * `nodeAdminRoutes.get("/node/:id/state")` + `services/node-admin-state.ts`
+     * 的 `NodeStateView`（**19 键**）：
+     *   · 节点存在 → **一律 200**：从未上报是 `reported_at: null` 的空态视图
+     *     （`tunnels: []` / `used_ports: []` / `egress_pools: {}` / `stale: true`），
+     *     既不是 404，也不是 `null` 载荷 —— 「没有上报」与「取不到」必须可分；
+     *   · 节点不存在 → 404（`resolveNodeId` 失败）。
+     * 响应是**解包后**的载荷（mock 模式下 api.ts 不再剥 `{ data }` 信封）。
+     *
+     * ── 有上报的分支**也必须走投影**（这条曾经是错的）──
+     * 旧实现直接 `ok(report ?? mockEmptyNodeState(node))`：从未上报时是 19 键的视图，
+     * 有上报时却把**落库行**原样回显 —— 缺 10 个视图键（`node_key` / `reported_role` /
+     * `role_mismatch` / `online` / `status` / `last_seen_at` / `age_seconds` / `stale` /
+     * `control_protocol_version` / `capabilities`）、多 10 个落库键
+     * （`known_revision` / `error_count` / `hostname` / `host_metrics` / …）。
+     * 后果不只是形状不齐：落库行的 `role` 是 **Agent 自报值**，而视图的 `role` 是
+     * **面板侧**值 —— 于是前端把 `role` 渲染在「Agent 自报角色」下，在 mock 里碰巧是对的，
+     * 到生产就变成谎话（真机 `role: "ingress"` / `reported_role: "INGRESS"`）。
+     * 现在两个分支共用 {@link mockNodeStateView}，键集恒等于 `NodeStateView`。
+     */
+    if (seg[1] === "node" && method === "GET" && seg[3] === "state") {
+      const node = mockResolveNode(db.nodes, seg[2]);
+      if (!node) return notFound("节点不存在");
+      return ok(mockNodeStateView(node, db.nodeStates.get(node.id) ?? null));
     }
 
     // ----- V4-WP6 §13.4.4 健康：单数 /admin/node/health 与前缀 /admin/node/:id/health -----
@@ -771,4 +870,61 @@ export async function handleAdminMock(ctx: rt.MockAuthedRouteContext): Promise<r
     return notFound(`Mock route not found: ${method} /${clean}`);
   }
   return null;
+}
+
+/** 真实后端的陈旧阈值（`node-admin-core.ts:NODE_STATE_STALE_SECONDS`），不另抄数字之外的口径。 */
+const MOCK_NODE_STATE_STALE_SECONDS = 300;
+
+/** `isRoleMismatch` 同口径：两侧都非空才判，大小写归一后比较。 */
+function mockRoleMismatch(reportedRole: string | null | undefined, nodeRole: string | null | undefined): boolean {
+  if (!reportedRole || !nodeRole) return false;
+  return reportedRole.trim().toLowerCase() !== nodeRole.trim().toLowerCase();
+}
+
+/**
+ * 落库行（或没有行）→ **`NodeStateView`（恒 19 键）**。
+ *
+ * 两个分支（有上报 / 从未上报）**都必须**走这里：这是"mock 与真机同形"的唯一实现点。
+ * 字段逐个对齐 `backend/src/services/node-admin-state.ts` 的 `getNodeState`
+ * （见该文件 11-35 行的 `NodeStateView` 定义），并且：
+ *   · 缺的字段给 `null` / `[]` / `{}`（**不是 `undefined`**：`JSON.stringify` 会把它丢掉，
+ *     客户端 `Object.keys` 也就看不到这一格，于是"字段缺失"与"值为空"又混在一起）；
+ *   · 落库行独有的列（`known_revision` / `hostname` / `host_metrics` / `error_count` / …）
+ *     一律**不投影**：真实端点不返回它们，mock 也不许返回（这正是 P1-3 的修复点）；
+ *   · `role` 取**面板侧** `node.role`，Agent 自报值放 `reported_role`。旧实现把落库行
+ *     原样回显，两个语义被并成一个字段，前端读错也看不出来（P2-4）。
+ */
+function mockNodeStateView(node: Node, report: NodeStateReport | null | undefined) {
+  const reportedAt = report?.reported_at ?? null;
+  const ageSeconds =
+    reportedAt === null
+      ? null
+      : Math.max(0, Math.round((Date.now() - new Date(reportedAt).getTime()) / 1000));
+  const stale =
+    ageSeconds === null ? true : ageSeconds > MOCK_NODE_STATE_STALE_SECONDS;
+  return {
+    node_id: node.id,
+    node_key: node.node_id,
+    // 面板侧认定（`node.role`）—— 不是 Agent 自报值
+    role: node.role ?? null,
+    // Agent 自报值（落库行 `role`）
+    reported_role: report?.role ?? null,
+    role_mismatch: report ? mockRoleMismatch(report.role, node.role) : false,
+    online: node.status === "active",
+    status: node.status,
+    last_seen_at: node.last_seen_at ?? null,
+    reported_at: reportedAt,
+    age_seconds: ageSeconds,
+    // 无快照 = 无新鲜证据（后端 `snapshot ? isStaleState(...) : true` 同一口径）
+    stale,
+    version: report?.version ?? null,
+    reported_revision: report?.reported_revision ?? null,
+    tunnels: report?.tunnels ?? [],
+    used_ports: report?.used_ports ?? [],
+    egress_pools: report?.egress_pools ?? {},
+    last_error: report?.last_error ?? null,
+    control_protocol_version: report?.control_protocol_version ?? null,
+    // Agent 未上报 ⇒ `null`（**不是** `[]`：两者在下发判定里含义不同）
+    capabilities: Array.isArray(report?.capabilities) ? report.capabilities : null,
+  };
 }

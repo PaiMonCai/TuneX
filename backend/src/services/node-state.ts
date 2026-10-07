@@ -988,11 +988,42 @@ export async function submitStateReport(
     await archiveObservationSamples(auth.node_id, report.target_observations);
   }
 
-  // 顺带刷新 node.last_seen_at：面板展示与离线判定都读它（ 列， 首次写入）。
+  // ── 心跳写入：刷新 node.last_seen_at **并**把 node.status 收敛回 active ──
+  //
+  // 一次通过凭据认证 + 载荷校验的上报，本身就是「这台 Agent 现在活着」的事实，
+  // 因此它同时是 Connection 层（§13.4.1）两个输入的唯一写入者：
+  //   · `last_seen_at` —— 新鲜度；`deriveConnection()` 用它判 90s 窗口；
+  //   · `status`       —— 连接闸门；`deriveConnection()` 要求它是 `active`。
+  //
+  // 为什么必须在这里写回 `active`（而不仅是刷新时间戳）：全仓对 `node.status`
+  // 只有「翻成 inactive」的写点（`socket/offline-detector.ts` 的上报过期清扫
+  // `markStaleInactive` 与会话结束 `markInactive`），**没有任何恢复写点**。于是
+  // 任何一次长于 `CONNECTION_ONLINE_WINDOW_MS` 的上报中断都会把 `status` 永久钉在
+  // `inactive`，而 `deriveConnection()` 又硬要求 `status === "active"` ⇒ 一条此后
+  // 每 30s 都在新鲜上报的节点（HTTP-only，没有 socket 会话参与）会永远被判定为
+  // `offline`：「等待安装 → 在线 → 成功下一步」的用户闭环因此不可达。这个中断不是
+  // 异常路径而是必然路径 —— 节点行创建（`status` 默认 active、`last_seen_at` 为
+  // NULL）到 Agent 首次上报之间必然 > 90s 的可疑窗口，清扫会把每一台新节点先翻成
+  // inactive。
+  //
+  // 为什么放在上报点而不是 offline-detector 的第二遍扫描：恢复不需要第二个判定者，
+  // 也不需要第二个阈值 —— 上报的这一次写入就是权威事实，探测器只负责反方向
+  // （停止上报 ⇒ inactive）。两个方向因此共用 `CONNECTION_ONLINE_WINDOW_MS` 这一个
+  // 窗口常量，不会出现「库里说 A、判定说 B」的第二套真相。
+  //
+  // 安全语义不变：写点位于 `authenticateNode` 与载荷校验**之后**，被撤销 / 被封禁 /
+  // 凭据不匹配的 Agent 根本到不了这里（401 提前返回）；本写入不碰 lifecycle、
+  // 不碰 lease/fencing/portPool，也不延长任何窗口。
+  //
+  // 与 `last_seen_at` 放在同一条 updateMany 里：两者是同一份「这个节点活着」的事实，
+  // 分两次写会留下「时间戳新了但状态还是 inactive」的中间态。
   await db.node
-    .updateMany({ where: { id: auth.node_id }, data: { last_seen_at: reportedAt } })
+    .updateMany({
+      where: { id: auth.node_id },
+      data: { last_seen_at: reportedAt, status: "active" },
+    })
     .catch(() => {
-      /* 心跳刷新失败不影响上报结论 */
+      /* 心跳刷新失败不影响上报结论；下一次上报会重试（fail-soft，与既有口径一致） */
     });
 
   // : the renewed ownership facts travel back in the report's own response —

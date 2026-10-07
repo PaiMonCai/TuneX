@@ -425,6 +425,8 @@ model Node {
   node_group_id Int
   /// V5-WP17.1：以它为首选入口的 Forward（见 Tunnel.preferred_ingress_node_id）。
   preferred_ingress_tunnels Tunnel[] @relation("preferred_ingress_node")
+  /// task-43：把这台节点**列进入口成员次序**的 Forward（意图行）。
+  ingress_member_intents ForwardIngressMember[]
   node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
 
   // ── v3 增量字段（WP1，全部可空 → expand-and-contract，见迁移 20260926040000）──
@@ -617,6 +619,8 @@ model Tunnel {
   workspace                  Workspace      @relation(fields: [workspace_id], references: [id])
 
   tunnel_chains  TunnelChain[]
+  /// task-43：**按 Forward 自定义的入口成员次序**（意图，不是事实）。
+  ingress_member_intents ForwardIngressMember[]
 
   // ── v3 增量字段（WP1，expand-and-contract：全部可空，见迁移 20260926040000）──
   //
@@ -980,6 +984,46 @@ model TunnelChain {
   node_group    NodeGroup @relation(fields: [node_group_id], references: [id])
 
   @@map("tunnel_chain")
+}
+
+/// task-43 —— **按 Forward 自定义的入口成员次序**。
+///
+/// 行为参照：ForwardX（AGPL-3.0-only）——多入口/转发组的成员表（`forward_group_members`：
+/// 成员 + `priority` + `isEnabled`）；代码为本项目改写，未复制其实现。
+///
+/// ── 为什么需要它（而不是把次序塞进节点列）──
+/// 次序是**按这条转发**的意图：同一台节点可以在 A 转发里排第 1、在 B 转发里排第 3。
+/// 节点组是多条转发**共享**的资源，把次序写进 `Node.order_by` 会让共用该组的其它转发
+/// 一起变形，且编辑权限被迫提到 `node:manage`。所以次序必须落在"按转发"的行上。
+///
+/// ── 这张表**只有意图**，没有事实 ──
+/// 刻意**不**带任何健康/延迟/失败时刻列（ForwardX 的成员表有 `healthStatus` 等）：连接、
+/// 准入、探测结果的事实来源是节点上报与既有投影（`deriveConnection` / `nodeAdmission` /
+/// 观测档案），在这张表里再存一份就是**第二份真相**，两边一旦漂移就会出现"界面说它健康、
+/// 平台却切走了"。
+///
+/// ── 兼容性（expand-only，不回填）──
+/// **没有行 = 今天的行为**（合格候选按 `node_id` 升序）。因此本表上线不需要回填任何数据，
+/// 也不会改变任何既有转发的迁移结果；只有用户显式保存过一次次序之后，表里才有行。
+///
+/// 级联：Forward 被删或节点被删时，意图行随之消失（它描述的是"这两者之间的关系"，
+/// 关系的一端不存在了，行就没有意义）。**没有任何账本语义**，所以级联删除是安全的。
+model ForwardIngressMember {
+  id         Int      @id @default(autoincrement())
+  tunnel_id  Int
+  tunnel     Tunnel   @relation(fields: [tunnel_id], references: [id], onDelete: Cascade)
+  node_id    Int
+  node       Node     @relation(fields: [node_id], references: [id], onDelete: Cascade)
+  /// 0 起升序 = 优先级；同一 tunnel 内唯一（由写入路径按数组下标归一化后全量替换）。
+  priority   Int
+  /// false = 这次次序里**显式停用**该成员（它仍是组内合法入口，但不再被选来接管）。
+  is_enabled Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@unique([tunnel_id, node_id])
+  @@index([tunnel_id, priority])
+  @@map("forward_ingress_member")
 }
 
 /// v3 出口目标池（WP1，DEVELOPMENT.md §2.2）。

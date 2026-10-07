@@ -9,6 +9,7 @@
  * Tunnel remains the internal runtime/desired-state record. These routes project
  * it as a PortForward and never ask the user to choose a tunnel mode directly.
  */
+import { isIP } from "node:net";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -32,9 +33,23 @@ import {
   unbindBlockedMessage,
 } from "../services/binding-usage.ts";
 import { projectUserNode } from "../services/node-view.ts";
+import {
+  normalizeConnectIpPatch,
+  updateNodeConnectIp,
+  type NodeAddressDb,
+} from "../services/node-address.ts";
 import { collectSupportBundle, defaultSupportBundleDeps } from "../services/support-bundle.ts";
 import { checkUpgradePrecondition, renderNodeUpgradeScript, validateAgentImageRef } from "../services/node-upgrade.ts";
-import { collectNodeDiagnostics, defaultNodeDiagnosticsDeps } from "../services/node-diagnostics.ts";
+import {
+  NODE_OFFLINE_AFTER_SECONDS,
+  collectNodeDiagnostics,
+  defaultNodeDiagnosticsDeps,
+} from "../services/node-diagnostics.ts";
+// 版本比较**复用** WP6 健康合成里的同一个纯函数，不为升级卡片另写一套 semver 口径
+// （那就是第二套「是否落后」的判定，专项明令禁止）。
+import { isVersionOlder } from "../services/node-health.ts";
+import { env } from "../env.ts";
+import { panelMigrationView, readPanelMigrationFromEnv } from "../services/node-install.ts";
 
 export const nodesRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -60,6 +75,17 @@ nodesRoutes.use("*", async (c, next) => {
     else if (method === "GET") action = "read";
     else action = "update";
   } else if (path.endsWith("/enrollment") && method === "POST") {
+    action = "manage";
+    resource = "node";
+  } else if (method === "PATCH") {
+    /**
+     * 修改节点安全字段（当前只有 `connect_ip`）⇒ `node:manage`。
+     *
+     * 这里**必须**是 `manage` 而不是 `update`：`services/workspace.ts:requiredPermission`
+     * 对 `resource === "node"` 只认 `read` / `manage` 两种动作，`update` 会映射成 **null**
+     * ⇒ `canWorkspaceResourceAction` 直接 false（连 owner 也过不去）。真机 PATCH 实测就是
+     * `403 permission_denied`，与本文件里 bindings / enrollment 的既有口径（manage）也不一致。
+     */
     action = "manage";
     resource = "node";
   }
@@ -181,6 +207,59 @@ nodesRoutes.get("/", async (c) => {
     select: nodeSelect,
   });
   return c.json({ data: raw.map((node) => nodeView(node)) });
+});
+
+// 行为参照：ForwardX（AGPL-3.0-only）——「成员自带连接地址（`connectHost`）」这一产品逻辑：
+// 可拨号地址**不是**在创建那一刻定死的，而是事后可以设置与修改的。
+// 代码为本项目改写（改在**节点**这一层，不引入成员级第二份地址），未复制其实现。
+// 参照溯源：docs/agent/forwardx-code-reuse.md
+/**
+ * `PATCH /api/nodes/:id` —— 修改节点的**安全字段**（当前只有 `connect_ip`）。
+ *
+ * ── 为什么需要它 ──
+ * `connect_ip` 曾经**只在 provision 时可写**：对已存在的节点再 provision，该字段被忽略
+ * （`routes/node-groups.ts` 的重签分支只重发 enrollment，不动任何配置）。于是
+ * 「建的时候没填地址」的节点**永远不能当 RELAY / 三跳的一跳** —— 下发时以
+ * `502 apply_failed / invariant_violated: RELAY plan needs a <host>:<port> next_hop` 结束，
+ * 而那句错误既没说是哪台机器，也没说该怎么办。
+ *
+ * ── 边界（为什么只开放这一个字段）──
+ * 这里**不是**通用节点编辑器：role / 端口区间 / 生命周期 / 凭据都有各自的既有入口与判定
+ * （`node-groups.ts`、`node-lifecycle.ts`、`node-credential*`），从这条路径改它们会绕过那些
+ * 判定。因此本端点只认 `connect_ip`，其余字段一律 400（fail-closed，而不是"忽略未知字段"）。
+ *
+ * ── 拒绝分支（都有行为测试）──
+ *   · `id` 非法 / 节点不属于当前 Workspace → 400 / 404（与同文件其余端点同形）；
+ *   · 请求体缺 `connect_ip`、类型不对、空白串 → 400 `invalid_connect_ip`；
+ *   · 地址形状不合法（含空白、方括号、非法 IP、非法主机名）→ 400 `invalid_connect_ip`；
+ *   · 清空（`null`）而**仍有 RELAY/三跳依赖这台节点当跳** → 409 `connect_ip_in_use`
+ *     （列出依赖它的转发，让用户先改/删那些转发 —— 否则下次下发必然失败）；
+ *   · 权限：workspace `node:manage`（沿用本文件 `*` middleware 的映射，见下方新增的 PATCH 分支）。
+ *
+ * 不动 `node_id`（身份）、不动 `agent_id`、不写审计之外的任何状态；响应是与 `/api/nodes`
+ * 同一份投影（`nodeView`），调用方不需要第二套形状。
+ */
+nodesRoutes.patch("/:id", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "id");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法", code: "invalid_input" }, 400);
+
+  const raw = await c.req.json().catch(() => null);
+  const parsed = normalizeConnectIpPatch(raw);
+  if (!parsed.ok) return c.json({ error: parsed.message, code: parsed.code }, parsed.status);
+
+  const result = await updateNodeConnectIp(db as unknown as NodeAddressDb, {
+    nodeId,
+    workspaceId: ws.id,
+    value: parsed.value,
+  });
+  if (!result.ok) {
+    return c.json(
+      { error: result.message, code: result.code, ...(result.data ? { data: result.data } : {}) },
+      result.status,
+    );
+  }
+  return c.json({ data: nodeView(result.node as never) });
 });
 
 /** Re-generate a short-lived one-click installer for an existing node. */
@@ -444,6 +523,133 @@ nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
   });
   return c.json({ data: { ok: true } });
 });
+
+/**
+ * R1-A —— `GET /api/nodes/:id/upgrade-state`
+ *
+ * 升级卡片的**只读**事实来源。为什么必须由服务端提供（而不是前端把几个字段凑出来）：
+ *
+ *  1. **用户域此前没有任何「实际上报版本」的读投影。** `node.version` 是**管理员配置
+ *     字段**（schema 默认 `unknown`；真机取证：9 台节点的 `node.version` 全是 `unknown`，
+ *     而 `node_state_report.version` 是 `0.13.22`）。前端拿 `node.version` 当"当前运行
+ *     版本"就是把配置当事实 —— R1-A 已确认这是必须避免的展示错误。上报版本只存在于
+ *     `node_state_report`，此前只有管理端 `/api/admin/node/:id/state` 能读到。
+ *  2. **前置结论必须与 `POST /:id/upgrade-command` 同源。** 这里直接调用同一个
+ *     `checkUpgradePrecondition`，并把它的 `code` / `message` **原样**下发；前端不另写
+ *     一套"先切维护再升级"的规则（否则两处会在改规则时静默分叉）。
+ *  3. **判定窗口由服务端下发。** `offline_after_seconds` 与 `report_freshness` 用的是
+ *     diagnostics 同一个常量 `NODE_OFFLINE_AFTER_SECONDS`；F2 的教训是同一事实的多份
+ *     字面量迟早分叉，所以前端不许自己编窗口。
+ *  4. **是否落后同样复用既有判定**（`isVersionOlder`，WP6 用它给 `agent_version_behind`）。
+ *     基线（`TUNEX_AGENT_LATEST_VERSION`）未配置时如实给 `unknown` —— 不伪造落后，也不
+ *     伪造"已是最新"。
+ *
+ * 权限：`node:read`（本文件 middleware 的 GET 默认映射）。**只读**：不生成脚本、不下发
+ * 命令、不改任何运行态。能读 ≠ 能升级：生成脚本仍是 `node:manage`（POST upgrade-command）。
+ */
+nodesRoutes.get("/:ingressId/upgrade-state", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "ingressId");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+
+  const node = await loadWorkspaceNode(nodeId, ws.id);
+  if (!node) return c.json({ error: "节点不存在", code: "not_found", error_layer: "resource_scope" }, 404);
+
+  const report = await db.nodeStateReport.findUnique({
+    where: { node_id: node.id },
+    select: { version: true, role: true, reported_at: true, last_error: true },
+  });
+
+  const reportedAt = report?.reported_at ?? null;
+  const ageSeconds = reportedAt ? Math.max(0, Math.round((Date.now() - reportedAt.getTime()) / 1000)) : null;
+  // 「面板还在收到上报」是一个**连接事实**，与"升级是否成功"无关：这里只回答前者。
+  const reportFreshness: "fresh" | "stale" | "unknown" =
+    ageSeconds === null ? "unknown" : ageSeconds > NODE_OFFLINE_AFTER_SECONDS ? "stale" : "fresh";
+
+  const facts = {
+    node_key: node.node_id,
+    agent_id: node.agent_id ?? "",
+    role: node.role ?? null,
+    lifecycle: node.lifecycle ?? null,
+  };
+  // allow_active **不传**：读投影展示的是"默认路径能不能直接升级"这一事实；
+  // 带业务升级是调用者在 POST 时的显式决定，不能在只读投影里替他做掉。
+  const precondition = checkUpgradePrecondition(facts);
+
+  const reportedVersion = report?.version ?? null;
+  const expectedVersion = env.agentLatestVersion.trim() === "" ? null : env.agentLatestVersion.trim();
+  const older = isVersionOlder(reportedVersion, expectedVersion);
+
+  return c.json({
+    data: {
+      node: {
+        id: node.id,
+        node_key: node.node_id,
+        agent_id: node.agent_id,
+        role: node.role ?? null,
+        lifecycle: node.lifecycle ?? null,
+      },
+      reported: report
+        ? {
+            version: reportedVersion,
+            role: report.role ?? null,
+            reported_at: reportedAt ? reportedAt.toISOString() : null,
+            age_seconds: ageSeconds,
+            last_error: report.last_error ?? null,
+          }
+        : null,
+      report_freshness: reportFreshness,
+      /**
+       * ⚠️ 管理员配置字段（schema `Node.version`），**不是**实际上报版本。
+       * 只有需要对照"配置与实报是否一致"时才展示，且必须显式标注。
+       */
+      configured_version: node.version,
+      target: {
+        /** 部署方发给节点的镜像（`TUNEX_AGENT_IMAGE`）；升级脚本的默认目标。 */
+        image: env.agentImage,
+        image_source: process.env.TUNEX_AGENT_IMAGE?.trim() ? "env:TUNEX_AGENT_IMAGE" : "builtin_default",
+        /** 部署方声明的版本基线；`null` = 未配置 = 面板**不判定**落后。 */
+        expected_version: expectedVersion,
+        /** behind | not_behind | unknown（unknown = 基线未配置或版本号无法比较）。 */
+        version_drift: older === null ? "unknown" : older ? "behind" : "not_behind",
+      },
+      precondition: precondition.ok
+        ? { ok: true, code: null, message: null }
+        : { ok: false, code: precondition.code ?? null, message: precondition.message ?? null },
+      offline_after_seconds: NODE_OFFLINE_AFTER_SECONDS,
+      /**
+       * 面板迁移回退（task-44）：**面板侧配置了什么**（部署环境变量）。
+       *
+       * ⚠️ 这是**面板级**配置，不是这台节点的运行态：
+       * "agent 现在到底在跟哪个地址说话"由 agent 上报（`panel_url_in_use` /
+       * `panel_migration_id` / `panel_fallback_active`），而**面板侧还没有持久化它的列**
+       * （需要一次 schema 迁移，不在本切片范围）⇒ 这里如实标注 `node_reported_state_persisted: false`，
+       * 绝不用"配置了回退"冒充"节点正在回退"。
+       */
+      panel_migration: panelMigrationView(await loadPanelMigration()),
+      generated_at: new Date().toISOString(),
+    },
+  });
+});
+
+/**
+ * 读面板级迁移配置（部署环境变量：TUNEX_PANEL_MIGRATION_*）。
+ *
+ * **"确实没配置"与"读不到"必须分开**：前者是部署方的选择（`not_configured`，`problem=null`），
+ * 后者是这次取数的降级（`unreadable`，`problem` 非空、可重试）。把两者都渲染成"未配置"
+ * 就是"取不到 ⇒ 显示成没事"，正是本专项反复禁掉的那类展示错误。
+ */
+async function loadPanelMigration() {
+  try {
+    return readPanelMigrationFromEnv();
+  } catch (error) {
+    return {
+      ok: false as const,
+      reason: "unreadable" as const,
+      detail: error instanceof Error ? error.message : "读取面板迁移配置失败",
+    };
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* PortForward compatibility API                                      */

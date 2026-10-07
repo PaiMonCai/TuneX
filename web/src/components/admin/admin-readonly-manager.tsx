@@ -158,7 +158,7 @@ export function AdminReadonlyManager({
             {segment === "tickets" && <SelectItem value="closed">closed</SelectItem>}
           </SelectContent>
         </Select>
-        <Badge variant="outline">{t("admin.readOnly")}</Badge>
+        <Badge variant="outline">{t("common.readOnly")}</Badge>
       </div>
 
       <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)]">

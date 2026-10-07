@@ -42,6 +42,8 @@ import { ddnsRoutes } from "./routes/ddns.ts";
 // User/workspace announcements and the Admin announcement surface share the same backend truth.
 import { announcementRoutes } from "./routes/announcements.ts";
 import { announcementAdminRoutes } from "./routes/announcements-admin.ts";
+import { notificationDeliveryRoutes } from "./routes/notification-deliveries.ts";
+import { notificationChannelRoutes } from "./routes/notification-channels.ts";
 import { plansRoutes } from "./routes/plans.ts";
 import { topupsRoutes } from "./routes/topups.ts";
 import { paymentsRoutes } from "./routes/topups.ts";
@@ -183,6 +185,10 @@ export function createApp() {
   app.route("/api/route-profiles", routeProfilesRoutes);
   // User/workspace announcement routes; platform management is mounted under /api/admin below.
   app.route("/api/announcements", announcementRoutes);
+  // 投递失败可见性（task-13/N4）：只读的投递账本投影。
+  // **它必须排在 `app.route("/api", publicRoutes)` 之前**——后者是宽路由，
+  // 本专项已在 DNS 前门 / 延迟端点 / HA 三处踩过同类顺序问题。
+  app.route("/api/notifications", notificationDeliveryRoutes);
   // Signed federation M2M endpoints are mounted before the broad public router.
   app.route("/api/federation/v1", federationRoutes);
   app.route("/api", publicRoutes);
@@ -201,6 +207,9 @@ export function createApp() {
   app.route("/api/looking-glass", lookingGlassRoutes);
   // Platform announcement management uses the admin permission guard above.
   app.route("/api/admin", announcementAdminRoutes);
+  // N2: platform notification channel config (telegram/webhook). Secret values are write-only
+  // and never echoed; this router inherits the admin guards (registered `notification_channels` key).
+  app.route("/api/admin", notificationChannelRoutes);
 
   app.get("/", (c) => c.json({ service: "tunex-backend", site_url: env.siteUrl }));
 

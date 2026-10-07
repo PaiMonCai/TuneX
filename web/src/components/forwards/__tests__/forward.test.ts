@@ -65,7 +65,7 @@ describe("V4 node-first contract", () => {
       node_id: "v4-test-ingress",
       role: "ingress",
     });
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201); // 真实后端 provision 返回 201（mock 已对齐；旧断言停在 200）
     expect(result.body.node.node_id).toBe("v4-test-ingress");
     expect(result.body.node.role).toBe("ingress");
     expect(result.body.enrollment.agent_id).toBe(result.body.node.agent_id);

@@ -91,6 +91,24 @@ type Result struct {
 	ElapsedMS  int64  `json:"elapsed_ms"`
 	ResolvedIP string `json:"resolved_ip,omitempty"`
 	Detail     string `json:"detail,omitempty"`
+	/**
+	 * Hops 是逐跳结果（目前只有 traceroute/traceroute6 会填）。
+	 *
+	 * 为什么是结构化数组而不是把整个 tracepath 输出塞进 Detail：面板侧对 `detail` 有
+	 * 160 字符上界（那是给"一句话原因"用的），而一次跟踪有若干跳；把跳数压进一句
+	 * 话会丢事实，也会让前端只能做字符串处理。
+	 *
+	 * 地址一律是**字面 IP**（tracepath 用 `-n` 跑，节点不做任何反向解析）。
+	 */
+	Hops []Hop `json:"hops,omitempty"`
+}
+
+// Hop 是 traceroute 的一跳。
+type Hop struct {
+	TTL     int    `json:"ttl"`
+	Address string `json:"address,omitempty"`
+	RTTMS   int64  `json:"rtt_ms,omitempty"`
+	Note    string `json:"note,omitempty"`
 }
 
 // DialFunc is the injectable dialer (tests substitute a fake; production uses
