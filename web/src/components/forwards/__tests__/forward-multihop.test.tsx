@@ -263,7 +263,7 @@ describe("载荷 fail-closed（唯一的生成点）", () => {
     expect(multihopCreateFields("relay", "6", model({ middleNodeId: "6" }))).toEqual({ middle_node_id: 6 });
   });
 
-  test("DIRECT 一律不发（后端对 DIRECT 既不校验也不使用它）", () => {
+  test("DIRECT 一律不发（后端同样显式拒绝 DIRECT + middle 的无效组合）", () => {
     expect(multihopCreateFields("direct", "6", model({ mode: "direct" }))).toEqual({});
   });
 
