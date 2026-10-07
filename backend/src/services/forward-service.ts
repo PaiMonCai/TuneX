@@ -984,7 +984,7 @@ export async function createForward(
   if ("conflict" in reserved) {
     return error(409, "port_conflict", "该入口端口已被占用");
   }
-  if ("pathSetupDenied" in reserved) {
+  if ("pathSetupDenied" in reserved && reserved.pathSetupDenied) {
     const missing = reserved.pathSetupDenied.missing;
     return error(
       403,
