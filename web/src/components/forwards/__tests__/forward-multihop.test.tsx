@@ -387,7 +387,7 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
   test("事实取不到 ⇒ 独立 testid + 明说「不等于没有可用节点」", () => {
     const html = section({ model: model({ facts: null }) });
     expect(html).toContain('data-testid="forward-multihop-facts-unavailable"');
-    expect(html).toContain("取不到绑定事实");
+    expect(html).toContain("节点关系暂时取不到");
     expect(html).toContain("不等于「没有可用节点」");
     expect(html).not.toContain('data-testid="forward-multihop-none"');
     expect(html).not.toContain('data-testid="forward-multihop-select"');
@@ -406,15 +406,15 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
       model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } } }),
     });
     expect(missing).toContain('data-testid="forward-multihop-excluded-6"');
-    expect(missing).toContain("缺少「入口 → 该节点」这条绑定");
+    expect(missing).toContain("入口 → 该节点 这一段关系尚未准备好");
   });
 
   test("缺段且能补 ⇒ 给「去绑定」；缺段但不能补 ⇒ 只说角色原因，不给死路", () => {
     const bothMissingInbound = section({
       model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } } }),
     });
-    expect(bothMissingInbound).toContain("绑定并使用");
-    expect(bothMissingInbound).not.toContain("角色不能作为第一段的出口");
+    expect(bothMissingInbound).toContain("启用并使用");
+    expect(bothMissingInbound).not.toContain("角色不能接在入口之后");
 
     // 缺第二段且角色是 egress（不能当第二段的源）⇒ 只说角色原因，不给"去绑定"。
     const legacy = node({ id: 9, node_id: "legacy-01", role: "egress", connect_ip: "10.0.0.91" });
@@ -424,15 +424,15 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
         facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 9, legacy)], "9": [] } },
       }),
     });
-    expect(roleBlocked).toContain("角色不能作为第二段的入口");
-    expect(roleBlocked).not.toContain("第二段只能在节点页建");
+    expect(roleBlocked).toContain("角色不能继续转到下一跳");
+    expect(roleBlocked).not.toContain("第二段需要到节点页配置");
   });
 
   test("第二段缺失 ⇒ 指向节点页（它只能在节点页以中间跳为源创建）", () => {
     const html = section({
       model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } } }),
     });
-    expect(html).toContain("第二段只能在节点页建");
+    expect(html).toContain("第二段需要到节点页配置");
     expect(html).toContain('href="/nodes"');
   });
 
@@ -446,11 +446,12 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
     expect(blocked).not.toContain('data-testid="forward-multihop-three-segments"');
   });
 
-  test("不假装列表/详情能看到中间跳", () => {
+  test("只承诺详情页展示完整节点链，列表只给摘要", () => {
     const html = section();
     expect(html).toContain('data-testid="forward-multihop-visibility"');
-    expect(html).toContain("链路");
-    expect(html).toContain("列表与详情读数不显示中间跳");
+    expect(html).toContain("路径");
+    expect(html).toContain("完整节点链");
+    expect(html).toContain("列表页只展示路径摘要");
   });
 
   test("全部状态里都不出现「正常 / 健康 / 可达」", () => {
