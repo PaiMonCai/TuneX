@@ -17,6 +17,20 @@ const owner: LinkPlacementOwnership = {
 const statistics: ReportedTrafficStatus = { rotation_supported: true, producer_count: 2, sample_count: 500,
   rule_count: 250, spool_bytes: 123456, last_ack_at: "2026-10-07T08:00:00.123456789+08:00", state: "backlogged" };
 
+test("target health is a bounded closed egress fact and never a readiness claim", () => {
+  const target = { forward_id: 101, states: ["unhealthy", "unknown"], selected_tcp: 1, selected_udp: null,
+    last_checked_at: "2026-10-08T12:00:00Z", reason: "target_failed" };
+  expect(parseLinkPlacements([{ ...fact, target_status: [target] }]).ok).toBe(true);
+  for (const patch of [{ forward_id: 0 }, { states: [] }, { states: Array(11).fill("healthy") },
+    { states: ["online"] }, { selected_tcp: 2 }, { selected_udp: -1 }, { reason: "credential" },
+    { last_checked_at: null }, { last_checked_at: "2029-02-30T00:00:00Z" }, { target_host: "never-visible" }]) {
+    expect(parseLinkPlacements([{ ...fact, target_status: [{ ...target, ...patch }] }]).ok).toBe(false);
+  }
+  expect(parseLinkPlacements([{ ...fact, role: "ingress", target_status: [target] }]).ok).toBe(false);
+  expect(parseLinkPlacements([{ ...fact, target_status: [target, target] }]).ok).toBe(false);
+  expect(parseLinkPlacements([{ ...fact, target_status: [{ ...target, states: ["unknown", "unknown"], last_checked_at: null }] }]).ok).toBe(true);
+});
+
 describe("optional traffic capacity is a closed bounded snapshot", () => {
   const parse = (traffic_status: unknown) => parseLinkPlacements([{ ...fact, traffic_status }]);
   test("old reports omit capacity; all states, real zeros and inclusive upper bounds are preserved", () => {

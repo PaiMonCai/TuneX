@@ -76,7 +76,7 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
     } else { failed = linkErrorInfo(resources.reason); setList(null); }
     if (selectedResult.status === "fulfilled") setDetail(selectedResult.value);
     else { failed ??= linkErrorInfo(selectedResult.reason); setDetail(null); }
-    setReadError(failed); setLoading(false);
+    setReadError(failed); setNow(Date.now()); setLoading(false);
     if (failed?.disabled) setBlocked(true);
     return failed === null;
   }, [workspaceId, selected]);

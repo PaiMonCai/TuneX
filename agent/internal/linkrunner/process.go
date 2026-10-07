@@ -47,6 +47,8 @@ type child struct {
 	currentDigest, pendingDigest, ackDigest, ackKind string
 	ackSequence                                      uint64
 	ackChanged                                       chan struct{}
+	targetCounts                                     map[string]map[int64]int
+	targetFacts                                      map[int64]targetFact
 }
 
 // Write deliberately drops arbitrary FXP output. Even malformed/oversized lines
@@ -75,6 +77,9 @@ func (p *child) Write(data []byte) (int, error) {
 }
 
 func (p *child) readLineLocked(line string) {
+	if p.managed && p.readTargetLineLocked(line) {
+		return
+	}
 	if p.managed {
 		if match := managedLog.FindStringSubmatch(line); match != nil {
 			digest := match[2]
@@ -178,6 +183,7 @@ func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, e
 		traffic = options[0]
 	}
 	args := []string{"-config", filepath.Clean(path)}
+	p.setTargetConfig(cfg)
 	if traffic.producer != "" {
 		args = append(args, "-managed-traffic", traffic.path, "-managed-traffic-producer", traffic.producer)
 		p.trafficProducer = traffic.producer
@@ -186,6 +192,9 @@ func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, e
 			p.rotationPath = traffic.rotationPath
 			args = append(args, "-managed-traffic-rotation-v1", traffic.rotationPath)
 		}
+	}
+	if traffic.targetsEnabled {
+		args = append(args, "-managed-targets-v1")
 	}
 	p.cmd = exec.Command(binaryPath, args...)
 	p.cmd.Stdout = p

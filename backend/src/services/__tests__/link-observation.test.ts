@@ -1,11 +1,28 @@
 import { describe, expect, test } from "bun:test";
 import { linkObservation } from "../link-observation.ts";
-import type { ReportedTrafficStatus } from "../node-state-report.ts";
+import type { ReportedTrafficStatus, ReportedTargetStatus } from "../node-state-report.ts";
 const now = new Date("2030-01-01T00:00:00Z");
-const expected = { runtime_id: "tunex-link-7-p12-egress", node_id: 12, role: "egress", generation: 8, config_digest: "51".repeat(32) };
+const expected = { runtime_id: "tunex-link-7-p12-egress", node_id: 12, role: "egress", generation: 8, config_digest: "51".repeat(32),
+  target_counts: new Map([[101, 2]]) };
 const fact = { id: expected.runtime_id, node_id: 12, workspace_id: 3, link_id: 7, role: "egress",
   generation: 8, observed_generation: 8, config_digest: expected.config_digest, desired_config_digest: expected.config_digest,
   state: "ready", ready: true, lease_expires_at: "2030-01-01T00:01:00Z", runtime_ids: [], ports: [] };
+test("target health follows current running digest, generation, report and lease", () => {
+  const target: ReportedTargetStatus = { forward_id: 101, states: ["unhealthy", "healthy"], selected_tcp: 1, selected_udp: 1,
+    last_checked_at: now.toISOString(), reason: "target_failed" };
+  const observe = (patch = {}, reported_at = now) => linkObservation(expected, 3, 7,
+    { reported_at, link_placements: [{ ...fact, target_status: [target], ...patch }] }, now);
+  expect(observe().target_status).toEqual([target]);
+  expect(observe().ready).toBe(true); // Listener readiness is independent of target health.
+  for (const patch of [{ ready: false, state: "failed" }, { config_digest: "52".repeat(32) },
+    { observed_generation: 7 }, { desired_config_digest: "53".repeat(32) }, { lease_expires_at: now.toISOString() }]) {
+    expect(observe(patch)).not.toHaveProperty("target_status");
+  }
+  expect(observe({}, new Date(now.getTime() - 60001))).not.toHaveProperty("target_status");
+  expect(observe({ target_status: [{ ...target, last_checked_at: new Date(now.getTime() - 60001).toISOString() }] }).target_status).toEqual([]);
+  expect(observe({ target_status: [{ ...target, forward_id: 102 }] }).target_status).toEqual([]);
+  expect(observe({ target_status: [{ ...target, states: ["healthy"], selected_tcp: 0, selected_udp: 0 }] }).target_status).toEqual([]);
+});
 test("ACK history never becomes a live Link observation; exact fresh leased facts do", () => {
   expect(linkObservation(expected, 3, 7, null, now).ready).toBeNull();
   expect(linkObservation(expected, 3, 7, { reported_at: now, link_placements: undefined }, now).ready).toBeNull();

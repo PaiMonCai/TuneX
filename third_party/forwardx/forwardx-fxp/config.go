@@ -10,13 +10,17 @@ import (
 	"strings"
 )
 
-func readConfig(path string) (config, error) {
+func readConfig(path string, targetsEnabled ...bool) (config, error) {
 	var cfg config
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, err
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
+		return cfg, err
+	}
+	enableManagedTargets(&cfg, len(targetsEnabled) > 0 && targetsEnabled[0])
+	if err := validateManagedTargets(cfg); err != nil {
 		return cfg, err
 	}
 	return normalizeConfig(cfg), nil
@@ -78,6 +82,9 @@ func normalizeExitStrategy(value string) string {
 }
 
 func validateConfig(cfg config) error {
+	if err := validateManagedTargets(cfg); err != nil {
+		return err
+	}
 	if err := validateBindingPolicy(cfg); err != nil {
 		return err
 	}

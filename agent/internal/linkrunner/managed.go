@@ -27,7 +27,7 @@ func managedCompatible(oldRaw, nextRaw json.RawMessage) bool {
 		return false
 	}
 	if a["role"] == "exit" {
-		for _, k := range []string{"allowedBindings", "udpTargets"} {
+		for _, k := range []string{"allowedBindings", "udpTargets", "targetSets"} {
 			delete(a, k)
 			delete(b, k)
 		}
@@ -108,6 +108,12 @@ func (p *child) commitReload(digest string) {
 	p.mu.Lock()
 	p.currentDigest = digest
 	p.pendingDigest = ""
+	for prior := range p.targetCounts {
+		if prior != digest {
+			delete(p.targetCounts, prior)
+		}
+	}
+	p.pruneTargetFactsLocked()
 	p.mu.Unlock()
 }
 
@@ -142,6 +148,7 @@ func (m *Manager) reloadLocked(r record, cfg Config, deadline time.Time, p *chil
 			reloadErr = ErrConfigTampered
 		}
 	} else {
+		p.setTargetConfig(cfg)
 		after := p.expectReload(cfg.ConfigDigest)
 		if err := atomicPrivateWrite(p.path, cfg.RunnerConfig); err != nil {
 			reloadErr = err

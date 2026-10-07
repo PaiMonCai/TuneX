@@ -49,3 +49,15 @@ budgets remain alive. Repeated controls never reset cumulative data. The Agent
 persists authorized preparation before control, verifies both durable snapshots,
 and reclaims sealed totals only after exact authenticated storage acknowledgement.
 Legacy invocations retain snapshot v1 and receive no rotation control argument.
+
+F2 adds negotiated `-managed-targets-v1`. The executable probe
+`-managed-target-capabilities` returns `{"managed_targets":1}`. Versioned ordered
+business target sets reuse the upstream endpoint selector for fallback/RR/random
+and require complete rule/protocol authorization. Bounded auxiliary TCP probes
+use explicit failure/recovery windows; UDP silence is not a failure signal.
+New TCP connections select at the exit; a UDP mapping retains its target until
+confirmed failure. Retargeting keeps replay/AEAD sequence state and rejects late
+old-socket responses. Existing TCP is not migrated. Unchanged sibling rules keep
+their sockets and health state during target policy reloads. Digest-bound status
+logs contain only indexes/states/times, never target addresses or credentials.
+The public FXP feature flag and support matrix remain unchanged.

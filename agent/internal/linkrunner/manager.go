@@ -17,17 +17,18 @@ import (
 // so a slow startup for one placement cannot extend another placement's lease.
 // A state directory must have exactly one Manager owner.
 type Manager struct {
-	opMu                   sync.Mutex
-	mu                     sync.Mutex
-	binaryPath, runtimeDir string
-	cache                  *privateCache
-	records                map[string]record
-	running                map[string]*child
-	closed                 bool
-	cacheErr               error
-	external               externalReservations
-	traffic                *trafficStore
-	lifecycleStarted       bool
+	opMu                           sync.Mutex
+	mu                             sync.Mutex
+	binaryPath, runtimeDir         string
+	cache                          *privateCache
+	records                        map[string]record
+	running                        map[string]*child
+	closed                         bool
+	cacheErr                       error
+	external                       externalReservations
+	traffic                        *trafficStore
+	lifecycleStarted               bool
+	targetSupport, targetProbeDone bool
 }
 
 // New loads durable fences but does not start children. Corrupt/foreign caches
@@ -103,6 +104,14 @@ func (m *Manager) apply(input Config) (out Observation, resultErr error) {
 	deadline, expected, err := validateConfig(&cfg)
 	if err != nil {
 		return m.observeLocked(input.ID), err
+	}
+	if usesTargetSets(cfg.RunnerConfig) {
+		if !m.targetProbeDone {
+			m.targetSupport, m.targetProbeDone = probeTargetSets(m.binaryPath), true
+		}
+		if !m.targetSupport {
+			return m.observeLocked(cfg.ID), ErrTargetCapability
+		}
 	}
 	if m.cache.nodeDBID != 0 && cfg.NodeID != m.cache.nodeDBID {
 		return m.observeLocked(cfg.ID), ErrIdentityMismatch
@@ -558,6 +567,9 @@ func (m *Manager) observeLocked(id string) Observation {
 			o.PID = p.cmd.Process.Pid
 			if r.Config != nil {
 				o.ObservedGeneration = r.Config.Generation
+				if r.Role == "egress" {
+					o.TargetStatus = p.targetStatusLocked(r.Config.ConfigDigest)
+				}
 			}
 		}
 		p.mu.Unlock()

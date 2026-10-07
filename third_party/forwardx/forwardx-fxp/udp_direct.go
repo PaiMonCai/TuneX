@@ -138,6 +138,14 @@ type udpDirectExitSession struct {
 	dataOpener    *fxpUDPCodec
 	returnSealer  *fxpUDPCodec
 	remove        func(*udpDirectExitSession)
+	// The wire session survives replacement of its target socket. Replay windows,
+	// fragment admission and return nonces must never reset during failover.
+	managedPool *managedTargetPool
+	targetIndex int
+	targetMu    sync.Mutex
+	targetWake  chan struct{}
+	wireDataMu  sync.Mutex
+	wireOwner   *managedExitState
 }
 
 type udpDirectRelaySession struct {
@@ -730,7 +738,7 @@ func serveExitUDPDirect(conn *net.UDPConn, cfg config) error {
 				}
 				sessionsMu.Lock()
 				current := sessions[key] == session
-				conflict := current && (session.targetIP != target.TargetIP || session.targetPort != target.TargetPort)
+				conflict := current && session.managedPool == nil && (session.targetIP != target.TargetIP || session.targetPort != target.TargetPort)
 				if current && !conflict {
 					session.touch()
 				}
@@ -742,7 +750,7 @@ func serveExitUDPDirect(conn *net.UDPConn, cfg config) error {
 					fxpUDPDropLog.Printf("exit udp direct rejected session target conflict tunnel=%d rule=%d peer=%s session=%d", cfg.TunnelID, packet.ruleID, peerAddr, packet.sessionID)
 					return
 				}
-				payload, ok := session.dataFragments.accept(packet, &session.dataReplay)
+				payload, ok := session.acceptExitData(packet)
 				if ok {
 					session.forwardToTarget(payload)
 				}
@@ -764,18 +772,48 @@ func serveExitUDPDirect(conn *net.UDPConn, cfg config) error {
 			continue
 		}
 		if session == nil {
-			created, err := newUDPDirectExitSession(conn, peerAddr, cfg, packet.ruleID, packet.sessionID, target.TargetIP, target.TargetPort, queueBudgetForRule(packet.ruleID), removeSession)
+			var pool *managedTargetPool
+			index := -1
+			var selected *net.UDPConn
+			if managed != nil {
+				pool = managed.policy.Load().pools[packet.ruleID]
+				if pool != nil {
+					if !targetSetHas(pool.set, "udp") {
+						continue
+					}
+					socket, chosen, dialErr := managed.dialTarget(pool, "udp")
+					if dialErr != nil {
+						continue
+					}
+					selected, index = socket.(*net.UDPConn), chosen
+					target.TargetIP, target.TargetPort = pool.set.Targets[index].Host, pool.set.Targets[index].Port
+				}
+			}
+			created, err := newUDPDirectExitSession(conn, peerAddr, cfg, packet.ruleID, packet.sessionID, target.TargetIP, target.TargetPort, queueBudgetForRule(packet.ruleID), removeSession, selected)
 			if err != nil {
-				log.Printf("exit udp direct session create failed tunnel=%d rule=%d peer=%s target=%s:%d: %v", cfg.TunnelID, packet.ruleID, peerAddr, target.TargetIP, target.TargetPort, err)
+				if pool == nil {
+					log.Printf("exit udp direct session create failed tunnel=%d rule=%d peer=%s target=%s:%d: %v", cfg.TunnelID, packet.ruleID, peerAddr, target.TargetIP, target.TargetPort, err)
+				}
 				continue
 			}
+			created.managedPool, created.targetIndex = pool, index
 			var closeCreated *udpDirectExitSession
 			// Serialize admission with policy replacement. An obsolete target can
 			// never be inserted after the update's close/ACK boundary.
 			if managed != nil {
 				managed.mu.RLock()
-				current, ok := managed.policy.Load().targets[created.ruleID]
-				if !ok || current.TargetIP != created.targetIP || current.TargetPort != created.targetPort {
+				currentPolicy := managed.policy.Load()
+				current, ok := currentPolicy.targets[created.ruleID]
+				valid := ok && current.TargetIP == created.targetIP && current.TargetPort == created.targetPort && currentPolicy.pools[created.ruleID] == nil
+				if pool != nil {
+					valid = currentPolicy.pools[created.ruleID] == pool && pool.available(index)
+				}
+				if !valid {
+					managed.mu.RUnlock()
+					created.close()
+					continue
+				}
+				if cfg.managedTargetsV1 && !managed.attachUDPWire(created, time.Now()) {
 					managed.mu.RUnlock()
 					created.close()
 					continue
@@ -822,7 +860,7 @@ func serveExitUDPDirect(conn *net.UDPConn, cfg config) error {
 				session.start(&workerWG)
 			}
 		}
-		payload, ok := session.dataFragments.accept(packet, &session.dataReplay)
+		payload, ok := session.acceptExitData(packet)
 		if !ok {
 			continue
 		}
@@ -830,7 +868,17 @@ func serveExitUDPDirect(conn *net.UDPConn, cfg config) error {
 	}
 }
 
-func newUDPDirectExitSession(conn *net.UDPConn, peerAddr *net.UDPAddr, cfg config, ruleID int, sessionID uint64, targetIP string, targetPort int, queueBudget *fxpUDPQueueRuleBudget, remove func(*udpDirectExitSession)) (*udpDirectExitSession, error) {
+func newUDPDirectExitSession(conn *net.UDPConn, peerAddr *net.UDPAddr, cfg config, ruleID int, sessionID uint64, targetIP string, targetPort int, queueBudget *fxpUDPQueueRuleBudget, remove func(*udpDirectExitSession), selected ...*net.UDPConn) (*udpDirectExitSession, error) {
+	var target *net.UDPConn
+	if len(selected) > 0 {
+		target = selected[0]
+	}
+	created := false
+	defer func() {
+		if !created && target != nil {
+			_ = target.Close()
+		}
+	}()
 	dataOpener, err := newFXPUDPCodec(cfg.Key, fxpUDPPacket{
 		packetType: fxpUDPTypeData,
 		tunnelID:   cfg.TunnelID,
@@ -849,13 +897,15 @@ func newUDPDirectExitSession(conn *net.UDPConn, peerAddr *net.UDPAddr, cfg confi
 	if err != nil {
 		return nil, err
 	}
-	targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, strconv.Itoa(targetPort)))
-	if err != nil {
-		return nil, err
-	}
-	target, err := net.DialUDP("udp", nil, targetAddr)
-	if err != nil {
-		return nil, err
+	if target == nil {
+		targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(targetIP, strconv.Itoa(targetPort)))
+		if err != nil {
+			return nil, err
+		}
+		target, err = net.DialUDP("udp", nil, targetAddr)
+		if err != nil {
+			return nil, err
+		}
 	}
 	tuneUDPConn(target, "exit target", fxpUDPSessionBufferBytes)
 	sendSeed, err := allocateFXPUDPSequenceSeed()
@@ -878,10 +928,12 @@ func newUDPDirectExitSession(conn *net.UDPConn, peerAddr *net.UDPAddr, cfg confi
 		dataOpener:   dataOpener,
 		returnSealer: returnSealer,
 		remove:       remove,
+		targetWake:   make(chan struct{}, 1),
 	}
 	session.sendSequence.Store(sendSeed)
 	session.dataFragments.bindBudget(queueBudget)
 	session.touch()
+	created = true
 	return session, nil
 }
 
@@ -892,7 +944,9 @@ func (s *udpDirectExitSession) touch() {
 func (s *udpDirectExitSession) start(workerWG *sync.WaitGroup) {
 	startFXPUDPSessionWorker(workerWG, s.writeTargetLoop)
 	startFXPUDPSessionWorker(workerWG, s.readTargetLoop)
-	fxpVerbosef("exit udp direct session routed tunnel=%d rule=%d peer=%s target=%s:%d session=%d", s.cfg.TunnelID, s.ruleID, s.peerAddr, s.targetIP, s.targetPort, s.sessionID)
+	if s.managedPool == nil {
+		fxpVerbosef("exit udp direct session routed tunnel=%d rule=%d peer=%s target=%s:%d session=%d", s.cfg.TunnelID, s.ruleID, s.peerAddr, s.targetIP, s.targetPort, s.sessionID)
+	}
 }
 
 func (s *udpDirectExitSession) forwardToTarget(payload []byte) {
@@ -924,7 +978,15 @@ func (s *udpDirectExitSession) writeTargetLoop() {
 }
 
 func (s *udpDirectExitSession) writeTarget(payload []byte) {
-	if _, err := s.target.Write(payload); err != nil {
+	if s.managedPool != nil {
+		s.writeManagedTarget(payload)
+		return
+	}
+	target, _ := s.targetSnapshot()
+	if target == nil {
+		return
+	}
+	if _, err := target.Write(payload); err != nil {
 		log.Printf("exit udp direct target write failed tunnel=%d rule=%d peer=%s target=%s:%d: %v", s.cfg.TunnelID, s.ruleID, s.peerAddr, s.targetIP, s.targetPort, err)
 		s.close()
 		return
@@ -937,9 +999,30 @@ func (s *udpDirectExitSession) readTargetLoop() {
 	buf := getFXPByteBuffer(fxpUDPMaxDatagramPayload)
 	defer putFXPByteBuffer(buf)
 	for {
-		_ = s.target.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, err := s.target.Read(buf)
+		target, index := s.targetSnapshot()
+		if target == nil {
+			select {
+			case <-s.done:
+				return
+			case <-s.targetWake:
+				continue
+			}
+		}
+		_ = target.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := target.Read(buf)
 		if err != nil {
+			if s.managedPool != nil {
+				select {
+				case <-s.done:
+					return
+				default:
+				}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				s.clearManagedSocket(target, false)
+				continue
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				select {
 				case <-s.done:
@@ -955,6 +1038,10 @@ func (s *udpDirectExitSession) readTargetLoop() {
 			return
 		}
 		if n <= 0 {
+			continue
+		}
+		if s.managedPool != nil || s.wireOwner != nil {
+			s.returnManagedPayload(target, index, buf[:n])
 			continue
 		}
 		s.touch()
@@ -983,17 +1070,27 @@ func (s *udpDirectExitSession) readTargetLoop() {
 
 func (s *udpDirectExitSession) close() {
 	s.closeOnce.Do(func() {
+		s.wireDataMu.Lock()
 		if managed := managedExitFor(s.cfg); managed != nil {
 			managed.udp.Delete(s)
 		}
-		observeFXPUDPSequence(&s.sendSequence)
 		close(s.done)
 		s.send.close()
 		s.dataFragments.close()
+		s.targetMu.Lock()
+		if s.target != nil {
+			_ = s.target.Close()
+		}
+		s.target = nil
+		observeFXPUDPSequence(&s.sendSequence)
+		if s.wireOwner != nil {
+			s.wireOwner.rememberUDPWire(s, time.Now())
+		}
+		s.targetMu.Unlock()
+		s.wireDataMu.Unlock()
 		if s.remove != nil {
 			s.remove(s)
 		}
-		_ = s.target.Close()
 	})
 }
 

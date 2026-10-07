@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -43,28 +44,55 @@ func managedExitFor(c config) *managedExitState {
 type managedPolicy struct {
 	cfg     config
 	targets map[int]udpTarget
+	pools   map[int]*managedTargetPool
+	probes  []managedProbeJob
 }
 type managedExitState struct {
-	mu      sync.RWMutex
-	policy  atomic.Pointer[managedPolicy]
-	clients sync.Map // net.Conn -> ruleID
-	udp     sync.Map // *udpDirectExitSession -> ruleID
+	mu           sync.RWMutex
+	policy       atomic.Pointer[managedPolicy]
+	clients      sync.Map // net.Conn -> ruleID
+	udp          sync.Map // *udpDirectExitSession -> ruleID
+	udpCarriers  sync.Map // net.Conn -> managedUDPBinding (legacy framed UDP)
+	digest       string
+	targetCtx    context.Context
+	targetCancel context.CancelFunc
+	targetDone   chan struct{}
+	wireMu       sync.Mutex
+	wires        map[managedUDPWireKey]*managedUDPWireState
 }
 
 func policyFor(cfg config) *managedPolicy {
-	p := &managedPolicy{cfg: cfg, targets: make(map[int]udpTarget)}
+	p := &managedPolicy{cfg: cfg, targets: make(map[int]udpTarget), pools: make(map[int]*managedTargetPool)}
 	for _, target := range cfg.UDPTargets {
 		p.targets[target.RuleID] = target
+	}
+	for _, set := range cfg.TargetSets {
+		p.pools[set.RuleID] = newManagedTargetPool(set)
+		if targetSetHas(set, "udp") {
+			p.targets[set.RuleID] = udpTarget{RuleID: set.RuleID, TargetIP: set.Targets[0].Host, TargetPort: set.Targets[0].Port}
+		}
 	}
 	return p
 }
 
-func (s *managedExitState) apply(cfg config) {
+func (s *managedExitState) apply(cfg config, digests ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.policy.Load()
 	next := policyFor(cfg)
 	changed := make(map[int]bool)
+	for rule, pool := range old.pools {
+		if managedPoolsEqual(pool, next.pools[rule]) {
+			next.pools[rule] = pool
+		} else {
+			changed[rule] = true
+		}
+	}
+	for rule := range next.pools {
+		if old.pools[rule] == nil {
+			changed[rule] = true
+		}
+	}
 	for _, binding := range old.cfg.AllowedBindings {
 		if !authorizedTarget(cfg, binding.RuleID, binding.Protocol, binding.TargetIP, binding.TargetPort) {
 			changed[binding.RuleID] = true
@@ -76,7 +104,11 @@ func (s *managedExitState) apply(cfg config) {
 			changed[rule] = true
 		}
 	}
+	next.buildProbes()
 	s.policy.Store(next)
+	if len(digests) > 0 {
+		s.digest = digests[0]
+	}
 	s.clients.Range(func(key, value any) bool {
 		if changed[value.(int)] {
 			_ = key.(net.Conn).Close()
@@ -210,7 +242,7 @@ func managedEnabled(path string) bool {
 	return json.Unmarshal(data, &flags) == nil && flags.ManagedReload
 }
 
-func readManagedConfig(path string) (config, string, error) {
+func readManagedConfig(path string, targetsEnabled ...bool) (config, string, error) {
 	var cfg config
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > managedMaxConfigBytes || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
@@ -239,6 +271,10 @@ func readManagedConfig(path string) (config, string, error) {
 		ManagedReload bool `json:"managedReload"`
 	}
 	if json.Unmarshal(data, &flags) != nil || !flags.ManagedReload || json.Unmarshal(data, &cfg) != nil {
+		return cfg, digest, errors.New("invalid managed config")
+	}
+	enableManagedTargets(&cfg, len(targetsEnabled) > 0 && targetsEnabled[0])
+	if validateManagedTargets(cfg) != nil {
 		return cfg, digest, errors.New("invalid managed config")
 	}
 	// Legacy normalization drops malformed UDP targets. Managed updates must
@@ -295,6 +331,7 @@ func immutableManagedConfig(cfg config) config {
 	cfg.Entries = nil
 	cfg.AllowedBindings = nil
 	cfg.UDPTargets = nil
+	cfg.TargetSets = nil
 	return cfg
 }
 func entryTransportEqual(a, b config) bool {
@@ -308,12 +345,12 @@ func sameEntry(a, b config) bool {
 	return bytes.Equal(x, y)
 }
 
-func (m *managedRuntime) apply(cfg config) (string, error) {
+func (m *managedRuntime) apply(cfg config, digests ...string) (string, error) {
 	if !reflect.DeepEqual(immutableManagedConfig(m.cfg), immutableManagedConfig(cfg)) {
 		return "immutable", nil
 	}
 	if m.exit != nil {
-		m.exit.apply(cfg)
+		m.exit.apply(cfg, digests...)
 		m.cfg = cfg
 		return "", nil
 	}
@@ -411,8 +448,8 @@ func (m *managedRuntime) apply(cfg config) (string, error) {
 	return "", nil
 }
 
-func runManaged(done <-chan struct{}, path string) error {
-	cfg, digest, err := readManagedConfig(path)
+func runManaged(done <-chan struct{}, path string, targetsEnabled ...bool) error {
+	cfg, digest, err := readManagedConfig(path, targetsEnabled...)
 	if err != nil {
 		return err
 	}
@@ -434,13 +471,17 @@ func runManaged(done <-chan struct{}, path string) error {
 			_ = e.close()
 		}
 		if m.exit != nil {
+			m.exit.stopTargets()
 			m.exit.clients.Range(func(k, v any) bool { _ = k.(net.Conn).Close(); return true })
 			m.exit.udp.Range(func(k, v any) bool { k.(*udpDirectExitSession).close(); return true })
 		}
 	}()
 	if cfg.Role == "exit" {
-		m.exit = &managedExitState{}
-		m.exit.policy.Store(policyFor(cfg))
+		m.exit = &managedExitState{digest: digest}
+		policy := policyFor(cfg)
+		policy.buildProbes()
+		m.exit.policy.Store(policy)
+		m.exit.targetCtx, m.exit.targetCancel = context.WithCancel(context.Background())
 		managedExits.Store(exitIdentity(cfg), m.exit)
 		defer managedExits.Delete(exitIdentity(cfg))
 		bound := make(chan struct{})
@@ -452,6 +493,7 @@ func runManaged(done <-chan struct{}, path string) error {
 		case <-m.failed:
 			return errors.New("managed exit bind failed")
 		}
+		m.exit.startTargets(runDone)
 	} else {
 		for _, entry := range cfg.Entries {
 			e, err := prepareManagedEntry(entry)
@@ -469,6 +511,9 @@ func runManaged(done <-chan struct{}, path string) error {
 		}
 	}
 	log.Printf("managed applied sha256=%s", digest)
+	if m.exit != nil {
+		m.exit.emitTargets()
+	}
 	lastSeen := digest
 	ticker := time.NewTicker(managedPollInterval)
 	defer ticker.Stop()
@@ -486,7 +531,7 @@ func runManaged(done <-chan struct{}, path string) error {
 			}
 			return errors.New("managed runtime stopped")
 		case <-ticker.C:
-			next, nextDigest, readErr := readManagedConfig(path)
+			next, nextDigest, readErr := readManagedConfig(path, targetsEnabled...)
 			if nextDigest == lastSeen {
 				continue
 			}
@@ -502,7 +547,7 @@ func runManaged(done <-chan struct{}, path string) error {
 				log.Printf("managed applied sha256=%s", nextDigest)
 				continue
 			}
-			code, applyErr := m.apply(next)
+			code, applyErr := m.apply(next, nextDigest)
 			if applyErr != nil {
 				return applyErr
 			}
@@ -512,6 +557,9 @@ func runManaged(done <-chan struct{}, path string) error {
 			}
 			m.digest = nextDigest
 			log.Printf("managed applied sha256=%s", nextDigest)
+			if m.exit != nil {
+				m.exit.emitTargets()
+			}
 		}
 	}
 }

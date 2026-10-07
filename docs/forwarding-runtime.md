@@ -13,7 +13,7 @@
 | 路径 | 当前支持 | 边界 |
 | --- | --- | --- |
 | 原生普通 Forward | TCP、UDP；TCP 客户端 TLS/WS 前端；DIRECT/RELAY | 普通 both 未开放。客户端 TLS/WS 不表示节点间 hop 已加密，legacy native hop 仅按私网/可信网络边界使用。 |
-| 托管共享 FXP | 固定双节点、加密 TCP/UDP/both、规则复用 | 实验开关默认关闭，公共矩阵 planned；每绑定一个目标，尚无共享安全多跳/多出口。 |
+| 托管共享 FXP | 固定双节点、加密 TCP/UDP/both、规则复用、每规则有序多目标 | 实验开关默认关闭，公共矩阵 planned；多目标需要双方实际能力，尚无共享安全多跳/多出口。 |
 | 原生目标池 | fallback、RR/random/weighted 选择及健康恢复 | 仅适用已有出口池路径，DIRECT 业务 API 仍为单目标；不能推广到 FXP。 |
 | IP_HASH | 选择器和可信来源注入测试已有 | RELAY/EGRESS 生产来源链未完成，能力门禁关闭。 |
 
@@ -50,6 +50,20 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 规则请求值 0 表示未另设规则上限，仍受 Workspace 天花板约束；Workspace 0 额度禁止转发。现有控制面额度检查与租约不等于多节点严格共享的带宽/连接预算池，也存在统计上报及租约生效窗口。
 
 部署 ACK 是历史确认。当前运行事实必须匹配节点身份、代次、摘要、租约和报告新鲜度：缺观测为 unknown、过期为 stale、入口零规则为 passive；只有有效 ready=true 才表示 runtime Ready。Ready 不自动证明目标服务可达，统计接收时间也不证明正在运行。
+
+## FXP 多目标与健康窗口
+
+规则可选 `target_set` v1：1–10 个有序且不重复的 `{host, port}`、`fallback/round_robin/random`、10–3600 秒的失败/恢复窗口，以及 `probe:tcp|none`。原有 `target_host/target_port` 必须等于首项，只是兼容投影。未提供目标集的旧规则保持单目标；已有目标集编辑若被旧客户端省略，明确拒绝。退回单目标需提交只有一项的完整目标集修订。API、ForwardRevision 和 LinkDeployment 都保存完整目标及顺序。每个 runner 配置仍限 1 MiB，编译在持久化前检查字节预算；500 规则×10 目标是结构上限，不保证最长地址组合全部装入一个连接。
+
+两节点都需通过真实 `-managed-target-capabilities` 探测并报告 `forward.targets.fxp.v1`；新建、更新及私有恢复均拒绝不支持的 runner。出口只从配置授权的 rule/protocol/完整目标集选择，Hello 不提供任意目标授权。复用 ForwardX FXP 的出口选择器及规则目标窗口语义，新增业务目标池适配；这不表示 ForwardX 原来的载体出口池本身就是业务目标集。
+
+TCP 在新连接时选择，当前拨号失败可尝试其他合资格目标，不等待失败窗口；窗口决定何时停止优先尝试该目标。成功打断连续失败，恢复窗口期间暂不重新接纳。`none` 下新连接可以每目标最多每 5 秒发起一次半开试拨；试拨成功仅建立恢复证据，窗口完成前不承载业务 payload，全故障后的目标仍有恢复路径。已建立 TCP 不自动迁移。RR/random 按新连接或新 UDP 映射选择，不逐包选择。未知目标仍可尝试；全不可用不发送到未授权地址。
+
+`probe:tcp` 明确探测每个目标的同 host/port TCP 监听，包括 UDP-only 规则；这是辅助 TCP 证据，不能证明 UDP 应用健康。纯 UDP 服务没有该辅助监听时使用 `none`，无响应保持未知，不因超时直接宣布故障。真实 UDP 回包能提供成功证据；无主动探测时没有自动发现静默停机的承诺。
+
+UDP 来源映射固定目标。已确认失败时关闭受影响目标 socket，后续数据报选择其他合资格目标；保留原 FXP 会话、防重放窗口与返回加密序号，防止重建后 nonce 重用。旧 socket 的迟到回包不能穿过新映射。目标恢复不主动迁移仍健康的现有映射。目标集/策略修订则明确关闭受影响规则的旧 TCP/UDP，未变化 B 的监听、socket、预算与健康窗口保持。关闭的 UDP 会话保留有界、进程内的 rule/session 加密与重放历史到 10 分钟；同身份不能同时从另一 peer 建立映射。历史满时拒绝新身份，不提前驱逐有效防重放记录。这不是跨进程永久重放保护；重启沿用 FXP 原有随机会话与序号分配边界。
+
+探测有固定工作池、超时和有界队列，500×10 目标不会创建无界 goroutine。目标状态独立于 listener Ready：unknown/healthy/suspect/recovering/unhealthy，选中索引表示最近一次连接/映射的选择，不代表所有现存会话。只有当前授权 digest、已部署规则/目标数量、节点/Workspace、代次、有效租约和新鲜报告全部吻合时才显示；缺观测保持未知。子程序仅输出脱敏索引和时间，Agent 不透传原始日志、地址或密钥。
 
 <a id="traffic"></a>
 

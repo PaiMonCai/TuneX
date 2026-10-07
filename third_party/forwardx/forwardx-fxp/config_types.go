@@ -36,26 +36,29 @@ type config struct {
 	TargetIP                 string              `json:"targetIp"`
 	TargetPort               int                 `json:"targetPort"`
 	UDPTargets               []udpTarget         `json:"udpTargets,omitempty"`
-	Key                      string              `json:"key"`
-	LimitIn                  int64               `json:"limitIn"`
-	LimitOut                 int64               `json:"limitOut"`
-	MaxConnections           int                 `json:"maxConnections"`
-	MaxIPs                   int                 `json:"maxIPs"`
-	AccessScope              string              `json:"accessScope"`
-	BlockHTTP                bool                `json:"blockHttp"`
-	BlockSocks               bool                `json:"blockSocks"`
-	BlockTLS                 bool                `json:"blockTls"`
-	ProxyProtocolReceive     bool                `json:"proxyProtocolReceive"`
-	ProxyProtocolSend        bool                `json:"proxyProtocolSend"`
-	ProxyProtocolExitReceive bool                `json:"proxyProtocolExitReceive"`
-	ProxyProtocolExitSend    bool                `json:"proxyProtocolExitSend"`
-	ProxyProtocolVersion     int                 `json:"proxyProtocolVersion"`
-	TCPFastOpen              bool                `json:"tcpFastOpen"`
-	PanelURL                 string              `json:"panelUrl"`
-	Token                    string              `json:"token"`
-	RelayExitHost            string              `json:"relayExitHost,omitempty"`
-	RelayExitPort            int                 `json:"relayExitPort,omitempty"`
-	UDPRelayExitPort         int                 `json:"udpRelayExitPort,omitempty"`
-	RelayKey                 string              `json:"relayKey,omitempty"`
-	DNSGeneration            int                 `json:"dnsGeneration,omitempty"`
+	TargetSet                *managedTargetSet   `json:"targetSet,omitempty"`
+	TargetSets               []managedTargetSet  `json:"targetSets,omitempty"`
+	managedTargetsV1         bool
+	Key                      string `json:"key"`
+	LimitIn                  int64  `json:"limitIn"`
+	LimitOut                 int64  `json:"limitOut"`
+	MaxConnections           int    `json:"maxConnections"`
+	MaxIPs                   int    `json:"maxIPs"`
+	AccessScope              string `json:"accessScope"`
+	BlockHTTP                bool   `json:"blockHttp"`
+	BlockSocks               bool   `json:"blockSocks"`
+	BlockTLS                 bool   `json:"blockTls"`
+	ProxyProtocolReceive     bool   `json:"proxyProtocolReceive"`
+	ProxyProtocolSend        bool   `json:"proxyProtocolSend"`
+	ProxyProtocolExitReceive bool   `json:"proxyProtocolExitReceive"`
+	ProxyProtocolExitSend    bool   `json:"proxyProtocolExitSend"`
+	ProxyProtocolVersion     int    `json:"proxyProtocolVersion"`
+	TCPFastOpen              bool   `json:"tcpFastOpen"`
+	PanelURL                 string `json:"panelUrl"`
+	Token                    string `json:"token"`
+	RelayExitHost            string `json:"relayExitHost,omitempty"`
+	RelayExitPort            int    `json:"relayExitPort,omitempty"`
+	UDPRelayExitPort         int    `json:"udpRelayExitPort,omitempty"`
+	RelayKey                 string `json:"relayKey,omitempty"`
+	DNSGeneration            int    `json:"dnsGeneration,omitempty"`
 }

@@ -28,7 +28,7 @@ func validateBindingPolicy(cfg config) error {
 		if b.RuleID <= 0 || strings.TrimSpace(b.TargetIP) == "" || b.TargetPort <= 0 || b.TargetPort > 65535 || (b.Protocol != "tcp" && b.Protocol != "udp") {
 			return errors.New("invalid authorized binding")
 		}
-		key := fmt.Sprintf("%d/%s", b.RuleID, b.Protocol)
+		key := fmt.Sprintf("%d/%s/%s/%d", b.RuleID, b.Protocol, strings.ToLower(strings.TrimSpace(b.TargetIP)), b.TargetPort)
 		if seen[key] {
 			return errors.New("duplicate authorized binding")
 		}
@@ -61,14 +61,24 @@ func authorizeHello(cfg config, hello *helloFrame) error {
 	if hello.TunnelID != cfg.TunnelID || (hello.Network != "tcp" && hello.Network != "udp") {
 		return errors.New("unauthorized carrier or protocol")
 	}
+	set := managedSetFor(cfg, hello.RuleID)
+	if set != nil && (hello.TargetIP == "" || hello.TargetPort <= 0) {
+		return errors.New("unauthorized binding target")
+	}
+	if set != nil && !targetSetHas(*set, hello.Network) {
+		return errors.New("unauthorized binding protocol")
+	}
 	for _, b := range cfg.AllowedBindings {
 		if b.RuleID != hello.RuleID || b.Protocol != hello.Network {
 			continue
 		}
 		if (hello.TargetIP != "" && !strings.EqualFold(strings.TrimSpace(hello.TargetIP), strings.TrimSpace(b.TargetIP))) || (hello.TargetPort != 0 && hello.TargetPort != b.TargetPort) {
-			return errors.New("unauthorized binding target")
+			continue
 		}
 		hello.TargetIP, hello.TargetPort = b.TargetIP, b.TargetPort
+		if set != nil {
+			hello.TargetIP, hello.TargetPort = set.Targets[0].Host, set.Targets[0].Port
+		}
 		// Trusted source forwarding is not enabled by a client-controlled hello.
 		hello.ProxyProtocolExitReceive = cfg.ProxyProtocolExitReceive
 		hello.ProxyProtocolExitSend = cfg.ProxyProtocolExitSend

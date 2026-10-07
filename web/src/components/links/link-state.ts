@@ -1,4 +1,4 @@
-import type { LinkBindingInput, LinkDetail, LinkForward, LinkPlacement } from "@/lib/links-types";
+import type { LinkBindingInput, LinkDetail, LinkForward, LinkPlacement, LinkTargetStatus } from "@/lib/links-types";
 import type { LinkErrorInfo } from "@/lib/links-api";
 import type { LinksCopy } from "./links-copy";
 
@@ -15,6 +15,10 @@ export function linkErrorMessage(error: LinkErrorInfo, copy: LinksCopy, reading 
   if (["protocol_change_requires_new_forward", "listen_scope_change_requires_new_forward"].includes(error.code ?? "")) return copy.protocolLocked;
   if (error.code === "link_config_requires_retirement") return copy.endpointRetire;
   if (error.code === "link_has_references") return copy.zeroRefs;
+  if (error.code === "agent_fxp_targets_capability_missing") return copy.targetsCapabilityMissing;
+  if (error.code === "agent_fxp_capability_missing") return copy.fxpCapabilityMissing;
+  if (error.code === "link_target_set_required") return copy.targetSetRequired;
+  if (error.code === "link_config_too_large") return copy.configTooLarge;
   return error.disabled ? copy.disabled : error.conflict ? copy.conflict : error.denied ? (reading ? copy.denied : copy.actionDenied)
     : reading ? copy.readFailed : copy.failed;
 }
@@ -52,11 +56,37 @@ export function placementAckState(link: LinkDetail, p: LinkPlacement): string {
   return p.status === "running" || p.status === "active" || p.status === "applied" ? "applied" : p.status;
 }
 export function bindingFromForward(forward: LinkForward): LinkBindingInput {
+  const targetSet = forward.target_set ? { ...forward.target_set, targets: forward.target_set.targets.map((target) => ({ ...target })) } : undefined;
   return { name: forward.name, protocol: forward.forward_protocol, listen_port: forward.listen_port,
     listen_host: forward.listen_ip === "127.0.0.1" || forward.listen_ip === "::1" ? forward.listen_ip : "" as const,
-    target_host: forward.remote_host, target_port: forward.remote_port,
+    target_host: targetSet?.targets[0].host ?? forward.remote_host, target_port: targetSet?.targets[0].port ?? forward.remote_port,
+    ...(targetSet ? { target_set: targetSet } : {}),
     bytes_per_second_in: forward.bytes_per_second_in ?? 0, bytes_per_second_out: forward.bytes_per_second_out ?? 0,
     max_connections: forward.max_connections ?? 0, max_connections_per_ip: forward.max_connections_per_ip ?? 0 };
+}
+
+/** Consume only the exit's current immutable-generation facts; never infer health from Ready or ACK. */
+export function forwardTargetStatus(link: LinkDetail, forward: LinkForward, now: number): LinkTargetStatus | null {
+  if (!forward.target_set || forward.config_revision !== forward.applied_revision
+    || ["retired", "retiring"].includes(link.status)) return null;
+  const deployment = link.deployment;
+  const expiry = Date.parse(deployment?.lease_expires_at ?? "");
+  if (!deployment || deployment.generation !== link.generation || !Number.isFinite(expiry) || expiry <= now) return null;
+  const exits = deployment.placements.filter((p) => p.role === "egress" && p.node_id === link.config?.egress_node_id);
+  if (exits.length !== 1) return null;
+  const exit = exits[0];
+  const observation = exit.observation;
+  // The backend projects target facts only for a Ready exit; health never grants Ready.
+  if (exit.generation !== link.generation || !observation || observation.observed_generation !== link.generation
+    || observation.state !== "ready" || observation.ready !== true) return null;
+  const status = observation.target_status?.find((status) => status.forward_id === forward.id);
+  if (!status || status.states.length !== forward.target_set.targets.length) return null;
+  if (status.last_checked_at === null) return status.states.every((state) => state === "unknown") ? status : null;
+  const checkedAt = Date.parse(status.last_checked_at);
+  // Match the backend's inclusive 60s age / +5s clock-skew bounds on every render,
+  // so cached health cannot persist until the longer runtime lease expires.
+  if (!Number.isFinite(checkedAt) || now - checkedAt > 60_000 || checkedAt - now > 5_000) return null;
+  return status;
 }
 
 /** Every read/mutation uses a ticket; switching workspace/permissions invalidates even late errors. */

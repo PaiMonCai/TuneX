@@ -25,6 +25,15 @@ const trafficStatus = z.object({
   last_ack_at: trafficAckAt.nullable(),
   state: z.enum(["idle", "collecting", "backlogged", "blocked"]),
 }).strict();
+const targetStatus = z.object({
+  forward_id: id,
+  states: z.array(z.enum(["unknown", "healthy", "suspect", "recovering", "unhealthy"])).min(1).max(10),
+  selected_tcp: z.number().int().min(0).max(9).nullable(),
+  selected_udp: z.number().int().min(0).max(9).nullable(),
+  last_checked_at: trafficAckAt.nullable(),
+  reason: z.enum(["initial", "selected", "target_failed", "target_recovered", "all_unavailable"]),
+}).strict().refine((s) => [s.selected_tcp, s.selected_udp].every((index) => index === null || index < s.states.length))
+  .refine((s) => s.last_checked_at !== null || s.states.every((state) => state === "unknown"));
 const port = z.object({
   protocol: z.enum(["tcp", "udp"]),
   host: z.string().max(255).refine((value) => !/[\s\u0000-\u001f]/.test(value)),
@@ -41,7 +50,10 @@ const placement = z.object({
   ports: z.array(port).max(1024),
   runtime_ids: z.array(runtimeID).max(4096),
   traffic_status: trafficStatus.optional(),
+  target_status: z.array(targetStatus).max(500).optional(),
 }).strict().refine((value) => value.observed_generation <= value.generation)
+  .refine((value) => value.target_status === undefined || (value.role === "egress" &&
+    new Set(value.target_status.map((s) => s.forward_id)).size === value.target_status.length))
   .refine((value) => !value.ready || (
     (value.state === "ready" || value.state === "rolled_back") && value.observed_generation > 0 &&
     value.config_digest !== "" && value.lease_expires_at !== ""
@@ -51,6 +63,7 @@ const placement = z.object({
 
 export type ReportedLinkPlacement = z.infer<typeof placement>;
 export type ReportedTrafficStatus = z.infer<typeof trafficStatus>;
+export type ReportedTargetStatus = z.infer<typeof targetStatus>;
 export type LinkReportRejection = "bad_link_placements" | "link_placement_node_mismatch" |
   "link_placement_workspace_mismatch" | "link_placement_not_owned";
 type ParsedLinkReport = { ok: true; placements: ReportedLinkPlacement[] | null } |

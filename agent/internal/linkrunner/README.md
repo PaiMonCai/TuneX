@@ -128,6 +128,30 @@ tamper acceptance). Vendored integration: managed_reload.go/test, main.go,
 binding_auth.go and udp_direct.go. Control integration: client.go, protocol.go,
 runtime.go, link_test.go, manifest.go/test and Agent runtime.go.
 
+## Versioned business target sets
+
+`TargetSetsSupported()` executes the secret-free, bounded two-second
+`-managed-target-capabilities` probe and accepts exactly `{"managed_targets":1}`.
+Only a constructed runtime with this support advertises `forward.targets.fxp.v1`.
+Supported children always receive `-managed-targets-v1`, allowing legacy-single
+bindings to be updated in place. Apply and Restore reject target sets when the
+executable lacks support; they never silently select the first destination.
+
+The compiler supplies an entry `targetSet` and exit `targetSets`, with complete
+rule/protocol/target authorization. Exit selection is per new TCP connection or
+UDP source mapping. Confirmed auxiliary TCP probe failure retargets only the
+affected UDP socket while retaining wire replay and encryption sequence state;
+recovery leaves existing healthy mappings pinned. `probe:none` never converts
+UDP silence into failure. A target policy edit closes the changed rule's sessions
+but preserves unchanged siblings and their selectors, budgets and sockets.
+
+Egress TargetStatus is a closed, bounded projection of indexes/states, latest
+selected TCP/UDP indexes, last check and reason. Child events must match the
+authorized committed/candidate digest and declared rule/target count. Events
+expire after 15 seconds; reports/checks use the control plane's fresh generation,
+digest, lease and 60-second gates. Removed rules are pruned on reload. Health
+does not grant or revoke listener Ready and arbitrary child output stays dropped.
+
 ## Durable ingress traffic collector
 
 F1 negotiates `-managed-traffic-capabilities` before starting children. Supported

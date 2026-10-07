@@ -15,6 +15,7 @@ import { resolveForwardPolicy } from "./forward-policy.ts";
 import { linkObservation } from "./link-observation.ts";
 import { normalizeBindScope } from "../integrations/forwardx/bind-scope.ts";
 import { checkAgentVersion } from "../integrations/forwardx/agent-version.ts";
+import { LinkTargetSetSchema, persistedLinkTargetSet, targetSetMatchesFirst } from "../integrations/forwardx/target-set.ts";
 
 const id = z.number().int().positive().max(2_147_483_647);
 const port = id.max(65_535);
@@ -29,11 +30,13 @@ export const LinkBindingSchema = z.object({
   listen_port: port, listen_host: z.enum(["", "127.0.0.1", "::1"]).default(""),
   target_host: z.string().trim().min(1).max(255).refine((h) => !/[\s/\x00]/.test(h)),
   target_port: port,
+  target_set: LinkTargetSetSchema.optional(),
   bytes_per_second_in: z.number().int().min(0).max(2_147_483_647).default(0),
   bytes_per_second_out: z.number().int().min(0).max(2_147_483_647).default(0),
   max_connections: z.number().int().min(0).max(1_000_000).default(0),
   max_connections_per_ip: z.number().int().min(0).max(1_000_000).default(0),
-}).strict();
+}).strict().refine((b) => !b.target_set || targetSetMatchesFirst(b.target_set, b.target_host, b.target_port),
+  "target_set_first_mismatch");
 export type LinkConfig = z.infer<typeof LinkConfigSchema>;
 export type LinkBindingInput = z.input<typeof LinkBindingSchema>;
 const LEASE_MS = 180_000;
@@ -112,11 +115,16 @@ export async function getLink(workspaceId: number, linkId: number) {
       remote_host: true, remote_port: true, desired_status: true, apply_status: true,
       config_revision: true, applied_revision: true, user_id: true,
       bytes_per_second_in: true, bytes_per_second_out: true, max_connections: true, max_connections_per_ip: true,
+      link_target_config: true,
     }, orderBy: { id: "asc" } }),
   ]);
   const reports = deployment ? await db.nodeStateReport.findMany({ where: {
     node_id: { in: deployment.placements.map((p) => p.node_id) } },
     select: { node_id: true, reported_at: true, link_placements: true } }) : [];
+  // Bind indexes to the immutable deployed pool, rather than a newer desired
+  // edit or an arbitrary rule supplied by the node report.
+  const targetCounts = new Map<number, number>(deployment ? DeploymentSnapshotSchema.parse(deployment.binding_snapshot)
+    .spec.bindings.filter((b) => b.target_set).map((b) => [b.forward_id, b.target_set!.targets.length]) : []);
   // Cumulative payload facts remain independent of runtime readiness. No
   // checkpoint means unknown, not an invented zero from the native reporter.
   const usage = forwards.length ? await db.linkTrafficCheckpoint.groupBy({
@@ -130,12 +138,13 @@ export async function getLink(workspaceId: number, linkId: number) {
       version: deployment.status === "active" && deployment.placements.every((p) => p.applied_generation === deployment.generation)
         ? deployment.version : null,
       lease_expires_at: deployment.lease_expires_at, placements: deployment.placements.map((p) => ({
-        ...p, observation: linkObservation(p, workspaceId, linkId,
+        ...p, observation: linkObservation({ ...p, target_counts: targetCounts }, workspaceId, linkId,
           reports.find((report) => report.node_id === p.node_id) ?? null),
       })) } : null,
     forwards: forwards.map((forward) => {
       const measured = usage.find((row) => row.forward_id === forward.id);
-      return { ...forward, traffic: measured ? {
+      const { link_target_config, ...publicForward } = forward;
+      return { ...publicForward, ...(link_target_config == null ? {} : { target_set: persistedLinkTargetSet(link_target_config) }), traffic: measured ? {
         bytes_in: (measured._sum.bytes_in ?? 0n).toString(),
         bytes_out: (measured._sum.bytes_out ?? 0n).toString(),
         connections: (measured._sum.connections ?? 0n).toString(),
@@ -197,16 +206,23 @@ async function preflightBinding(tx: Prisma.TransactionClient, workspaceId: numbe
   link: Awaited<ReturnType<typeof scopedLink>>, config: LinkConfig,
   nodes: Awaited<ReturnType<typeof endpoints>>, binding: z.output<typeof LinkBindingSchema>,
   forwardId: number, active = true) {
+  // Suspended edits also preserve executable policy. Do not persist a target
+  // set which these nodes can only ignore when the rule is resumed/restored.
+  if (binding.target_set && [nodes.inFact, nodes.outFact].some((node) => !node.capabilities.includes("forward.targets.fxp.v1")))
+    throw new LinkResourceError("agent_fxp_targets_capability_missing");
   const policy = await getEffectivePolicy(workspaceId, { client: tx, noCache: true });
   const rows = await tx.tunnel.findMany({ where: { workspace_id: workspaceId,
     link_resource_id: link.id, desired_status: "active" }, orderBy: { id: "asc" } });
   const bindings = rows.filter((r) => r.id !== forwardId).map((r) => ({ forward_id: r.id,
     protocol: r.forward_protocol as "tcp" | "udp" | "both", listen_port: r.listen_port!,
     listen_host: (r.listen_ip === "127.0.0.1" || r.listen_ip === "::1" ? r.listen_ip : "") as "" | "127.0.0.1" | "::1",
-    target_host: r.remote_host!, target_port: r.remote_port!, ...resolveForwardPolicy(r, policy.limits) }));
+    target_host: r.remote_host!, target_port: r.remote_port!,
+    ...(r.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(r.link_target_config) }),
+    ...resolveForwardPolicy(r, policy.limits) }));
   if (active) bindings.push({ forward_id: forwardId, protocol: binding.protocol,
     listen_port: binding.listen_port, listen_host: binding.listen_host,
     target_host: binding.target_host, target_port: binding.target_port,
+    ...(binding.target_set ? { target_set: binding.target_set } : {}),
     ...resolveForwardPolicy(binding, policy.limits) });
   let compiled;
   try { compiled = compileFxpLink({ link_id: link.id, workspace_id: workspaceId,
@@ -241,6 +257,7 @@ async function prepareDeployment(workspaceId: number, linkId: number, rotate: bo
     const bindings = rows.map((r) => ({ forward_id: r.id, protocol: r.forward_protocol as "tcp" | "udp" | "both",
       listen_port: r.listen_port!, listen_host: r.listen_ip === "127.0.0.1" || r.listen_ip === "::1" ? r.listen_ip : "" as const,
       target_host: r.remote_host!, target_port: r.remote_port!,
+      ...(r.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(r.link_target_config) }),
       ...resolveForwardPolicy(r, policy.limits) }));
     const lease = new Date(Date.now() + LEASE_MS);
     const input = FxpLinkInputSchema.parse({ link_id: linkId, workspace_id: workspaceId,
@@ -251,7 +268,10 @@ async function prepareDeployment(workspaceId: number, linkId: number, rotate: bo
     if (link.generation && !previous && !rotate) throw new LinkResourceError("link_credential_missing", 503);
     const secret = !rotate && previous
       ? unsealLinkTransportKey(previous.secret_enc, sealKey(), workspaceId, linkId, previous.generation) : newLinkTransportKey();
-    const placements = compileFxpLink(input, secret);
+    let placements;
+    try { placements = compileFxpLink(input, secret); }
+    catch (error) { throw new LinkResourceError(error instanceof Error && /^[a-z_]{1,64}$/.test(error.message)
+      ? error.message : "link_binding_invalid"); }
     if (!retiring) await reservePlacements(tx, [placements.egress, placements.ingress]);
     await tx.linkTransportCredential.create({ data: { link_id: linkId, generation,
       secret_enc: sealLinkTransportKey(secret, sealKey(), workspaceId, linkId, generation) } });
@@ -391,6 +411,8 @@ export async function updateLinkForward(workspaceId: number, linkId: number, for
     const row = await tx.tunnel.findFirst({ where: { id: forwardId, workspace_id: workspaceId, link_resource_id: linkId } });
     if (!row) throw new LinkResourceError("forward_not_found", 404);
     if (row.config_revision !== expectedRevision) throw new LinkResourceError("revision_conflict");
+    if (row.link_target_config != null && !binding.target_set)
+      throw new LinkResourceError("link_target_set_required");
     if (row.forward_protocol !== binding.protocol) throw new LinkResourceError("protocol_change_requires_new_forward");
     if (normalizeBindScope(row.listen_ip) !== normalizeBindScope(binding.listen_host))
       throw new LinkResourceError("listen_scope_change_requires_new_forward");
@@ -420,6 +442,7 @@ export async function actionLinkForward(workspaceId: number, linkId: number, for
       name: row.name, protocol: row.forward_protocol, listen_port: row.listen_port,
       listen_host: row.listen_ip === "127.0.0.1" || row.listen_ip === "::1" ? row.listen_ip : "",
       target_host: row.remote_host, target_port: row.remote_port,
+      ...(row.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(row.link_target_config) }),
       bytes_per_second_in: row.bytes_per_second_in ?? 0, bytes_per_second_out: row.bytes_per_second_out ?? 0,
       max_connections: row.max_connections ?? 0, max_connections_per_ip: row.max_connections_per_ip ?? 0,
     }), row.id);
@@ -429,6 +452,7 @@ export async function actionLinkForward(workspaceId: number, linkId: number, for
         candidate: { name: row.name, mode: "relay", protocol: row.forward_protocol,
           listen_port: row.listen_port, ingress_node_id: row.ingress_node_id!,
           egress_node_id: row.egress_node_id, target_host: row.remote_host!, target_port: row.remote_port!,
+          ...(row.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(row.link_target_config) }),
           link_resource_id: linkId, bytes_per_second_in: row.bytes_per_second_in,
           bytes_per_second_out: row.bytes_per_second_out, max_connections: row.max_connections,
           max_connections_per_ip: row.max_connections_per_ip } as ForwardCandidateConfig,
@@ -499,7 +523,9 @@ async function deploymentIsCurrent(link: Awaited<ReturnType<typeof scopedLink>>,
   }
   const bindings = rows.map((row) => ({ forward_id: row.id, protocol: row.forward_protocol,
     listen_port: row.listen_port, listen_host: row.listen_ip === "127.0.0.1" || row.listen_ip === "::1" ? row.listen_ip : "",
-    target_host: row.remote_host, target_port: row.remote_port, ...resolveForwardPolicy(row, policy.limits) }));
+    target_host: row.remote_host, target_port: row.remote_port,
+    ...(row.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(row.link_target_config) }),
+    ...resolveForwardPolicy(row, policy.limits) }));
   return latest.desired_version === deployment.version &&
     canonicalConfigDigest(bindings) === canonicalConfigDigest(snapshot.spec.bindings) &&
     canonicalConfigDigest(rows.map((row) => ({ id: row.id, revision: row.config_revision ?? 0 }))) ===

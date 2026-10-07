@@ -614,6 +614,8 @@ model Tunnel {
   max_connections_per_ip     Int?
   /// NULL keeps the existing native runtime owner. A link binding has one writer.
   link_resource_id           Int?
+  /// Versioned FXP binding target set. NULL preserves legacy single-target behavior.
+  link_target_config         Json?
   link_resource              LinkResource? @relation(fields: [link_resource_id], references: [id], onDelete: Restrict)
   traffic                    Float           @default(0)
   traffic_cost               Float           @default(0)
@@ -875,6 +877,8 @@ model ForwardRevision {
   max_connections_per_ip Int?
   /// Link provenance at this revision; immutable ID, intentionally no FK.
   link_resource_id Int?
+  /// Immutable versioned FXP target set; no mutable EgressPool dependency.
+  link_target_config Json?
   ingress_node_id Int
   egress_node_id  Int?
   /// V5.4：该 revision 的中间跳放置事实。NULL = 单跳。

@@ -1,10 +1,10 @@
 "use client";
 
-import { useId, useState, type FormEvent, type ReactNode } from "react";
+import { useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import type { UserNode } from "@/lib/types";
-import type { LinkBindingInput, LinkConfig, LinkCreateInput } from "@/lib/links-types";
+import { isLinkTargetHost, LINK_TARGET_LIMIT, projectLinkTargetSet, type LinkBindingInput, type LinkConfig, type LinkCreateInput, type LinkProtocol, type LinkTargetSet } from "@/lib/links-types";
 import type { LinksCopy } from "./links-copy";
 
 export const selectClass = "h-9 w-full rounded-md border border-[var(--input)] bg-[var(--card)] px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]";
@@ -24,13 +24,32 @@ export function parseLinkConfigForm(data: FormData): LinkConfig {
 }
 export function parseLinkBindingForm(data: FormData, fixedProtocol?: LinkBindingInput["protocol"]): LinkBindingInput {
   const name = String(data.get("name") ?? "").trim();
-  const target_host = String(data.get("target_host") ?? "").trim();
   const protocol = fixedProtocol ?? data.get("protocol");
   const listen_host = data.get("listen_host");
-  if (!name || name.length > 255 || !target_host || target_host.length > 255 || /[\s/\x00]/.test(target_host)
-    || !["tcp", "udp", "both"].includes(String(protocol)) || !["", "127.0.0.1", "::1"].includes(String(listen_host))) throw new Error("invalid_input");
+  if (!name || name.length > 255 || !["tcp", "udp", "both"].includes(String(protocol))
+    || !["", "127.0.0.1", "::1"].includes(String(listen_host))) throw new Error("invalid_input");
+  const enabled = data.get("target_set_enabled");
+  if (enabled !== null && enabled !== "1") throw new Error("invalid_input");
+  const hosts = data.getAll("target_host");
+  const ports = data.getAll("target_port");
+  if (!hosts.length || hosts.length > LINK_TARGET_LIMIT || hosts.length !== ports.length
+    || (enabled === null && hosts.length !== 1)) throw new Error("invalid_input");
+  const targets = hosts.map((host, index) => {
+    const port = ports[index];
+    if (typeof host !== "string" || typeof port !== "string" || !/^\d+$/.test(port)) throw new Error("invalid_input");
+    const trimmed = host.trim();
+    const value = Number(port);
+    if (!isLinkTargetHost(trimmed)
+      || !Number.isSafeInteger(value) || value < 1 || value > 65_535) throw new Error("invalid_input");
+    return { host: trimmed, port: value };
+  });
+  const targetSet = enabled === "1" ? projectLinkTargetSet({ version: 1, targets,
+    strategy: data.get("target_strategy"), probe: data.get("target_probe"),
+    failure_seconds: numeric(data, "target_failure_seconds", 10, 3600),
+    recover_seconds: numeric(data, "target_recover_seconds", 10, 3600) }) : undefined;
+  const { host: target_host, port: target_port } = targets[0];
   return { name, target_host, protocol: protocol as LinkBindingInput["protocol"], listen_host: listen_host as LinkBindingInput["listen_host"],
-    listen_port: numeric(data, "listen_port", 1, 65_535), target_port: numeric(data, "target_port", 1, 65_535),
+    target_port, ...(targetSet ? { target_set: targetSet } : {}), listen_port: numeric(data, "listen_port", 1, 65_535),
     bytes_per_second_in: numeric(data, "bytes_per_second_in", 0, 2_147_483_647),
     bytes_per_second_out: numeric(data, "bytes_per_second_out", 0, 2_147_483_647),
     max_connections: numeric(data, "max_connections", 0, 1_000_000),
@@ -92,16 +111,17 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
   onCancel: () => void; onSubmit: (binding: LinkBindingInput) => Promise<void>;
 }) {
   const prefix = useId();
-  const [invalid, setInvalid] = useState(false);
+  const [invalid, setInvalid] = useState<string | null>(null);
+  const [protocol, setProtocol] = useState<LinkProtocol>(initial?.protocol ?? "tcp");
   const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setInvalid(false);
+    event.preventDefault(); setInvalid(null);
     let binding: LinkBindingInput;
     try {
       const data = new FormData(event.currentTarget);
       if (initial) data.set("listen_host", initial.listen_host);
       binding = parseLinkBindingForm(data, initial?.protocol);
     }
-    catch { setInvalid(true); return; }
+    catch { setInvalid(new FormData(event.currentTarget).get("target_set_enabled") === "1" ? copy.targetsValidation : copy.validation); return; }
     await onSubmit(binding);
   };
   const num = (key: keyof LinkBindingInput, label: string, min: number, max: number, defaultValue?: number) =>
@@ -110,17 +130,16 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
     <fieldset disabled={busy} className="space-y-4">
       <Field id={`${prefix}-name`} label={copy.name}><Input id={`${prefix}-name`} name="name" required maxLength={255} defaultValue={initial?.name} /></Field>
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field id={`${prefix}-protocol`} label={copy.protocol}><select id={`${prefix}-protocol`} name="protocol" className={selectClass} defaultValue={initial?.protocol ?? "tcp"} disabled={!!initial}>
+        <Field id={`${prefix}-protocol`} label={copy.protocol}><select id={`${prefix}-protocol`} name="protocol" className={selectClass} value={protocol} onChange={(e) => setProtocol(e.target.value as LinkProtocol)} disabled={!!initial}>
           <option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option>
         </select></Field>
         {num("listen_port", copy.listenPort, 1, 65_535, initial?.listen_port)}
         <Field id={`${prefix}-scope`} label={copy.listenHost}><select id={`${prefix}-scope`} name="listen_host" className={selectClass} defaultValue={initial?.listen_host ?? ""} disabled={!!initial}>
           <option value="">{copy.wildcard}</option><option value="127.0.0.1">{copy.loopback4}</option><option value="::1">{copy.loopback6}</option>
         </select></Field>
-        <Field id={`${prefix}-target`} label={copy.targetHost}><Input id={`${prefix}-target`} name="target_host" maxLength={255} required defaultValue={initial?.target_host} /></Field>
-        {num("target_port", copy.targetPort, 1, 65_535, initial?.target_port)}
       </div>
       {initial && <p className="text-sm text-[var(--muted-foreground)]">{copy.protocolLocked}</p>}
+      <LinkTargetFields copy={copy} initial={initial} protocol={protocol} />
       <fieldset className="space-y-3 rounded-md border border-[var(--border)] p-3">
         <legend className="px-1 text-sm font-medium">{copy.limits}</legend>
         <p className="text-sm text-[var(--muted-foreground)]">{copy.limitHint}</p>
@@ -134,6 +153,78 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
       <p className="text-sm text-[var(--muted-foreground)]">{copy.updateHint}</p>
       <FormFooter copy={copy} busy={busy} onCancel={onCancel} />
     </fieldset>
-    {invalid && <p role="alert" className="text-sm text-[var(--destructive)]">{copy.validation}</p>}
+    {invalid && <p role="alert" className="text-sm text-[var(--destructive)]">{invalid}</p>}
   </form>;
+}
+
+function LinkTargetFields({ copy, initial, protocol }: { copy: LinksCopy; initial?: LinkBindingInput; protocol: LinkProtocol }) {
+  const prefix = useId();
+  const [enabled, setEnabled] = useState(!!initial?.target_set);
+  const [targets, setTargets] = useState(() => (initial?.target_set?.targets
+    ?? [{ host: initial?.target_host ?? "", port: initial?.target_port }]).map((target, id) => ({ id, host: target.host, port: String(target.port ?? "") })));
+  const nextId = useRef(LINK_TARGET_LIMIT);
+  // null follows protocol defaults; an explicit user choice or stored probe is preserved.
+  const [probe, setProbe] = useState<LinkTargetSet["probe"] | null>(initial?.target_set?.probe ?? null);
+  const selectedProbe = probe ?? (protocol === "udp" ? "none" : "tcp");
+  const move = (index: number, delta: number) => setTargets((rows) => {
+    const result = [...rows];
+    [result[index], result[index + delta]] = [result[index + delta], result[index]];
+    return result;
+  });
+  const update = (id: number, field: "host" | "port", value: string) => setTargets((rows) => rows.map((row) => row.id === id ? { ...row, [field]: value } : row));
+  return <fieldset className="space-y-3 rounded-md border border-[var(--border)] p-3">
+    <legend className="px-1 text-sm font-medium">{copy.targets}</legend>
+    <label htmlFor={`${prefix}-enabled`} className="flex items-center gap-2 text-sm">
+      <input id={`${prefix}-enabled`} name="target_set_enabled" type="checkbox" value="1" checked={enabled} disabled={!!initial?.target_set} onChange={(e) => setEnabled(e.target.checked)} />
+      {copy.targetsOptIn}
+    </label>
+    {initial?.target_set && <><input type="hidden" name="target_set_enabled" value="1" /><p className="text-sm text-[var(--muted-foreground)]">{copy.targetsKeepSetHint}</p></>}
+    <p id={`${prefix}-hint`} className="text-sm text-[var(--muted-foreground)]">{enabled ? copy.targetsHint : copy.targetsLegacyHint}</p>
+    <p className="text-sm text-[var(--muted-foreground)]">{copy.targetAddressHint}</p>
+    <ol className="space-y-3" aria-label={copy.targets}>
+      {(enabled ? targets : targets.slice(0, 1)).map((target, index) => <li key={target.id} data-target-index={index} className="space-y-2 rounded-md border border-[var(--border)] p-3">
+        <p className="text-sm font-medium">{copy.targetIndex} {index}{index === 0 ? ` · ${copy.targetFirst}` : ""}</p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field id={`${prefix}-${target.id}-host`} label={`${copy.targetHost} (${index})`}>
+            <Input id={`${prefix}-${target.id}-host`} name="target_host" maxLength={255} required value={target.host} onChange={(e) => update(target.id, "host", e.target.value)} aria-describedby={`${prefix}-hint`} />
+          </Field>
+          <Field id={`${prefix}-${target.id}-port`} label={`${copy.targetPort} (${index})`}>
+            <Input id={`${prefix}-${target.id}-port`} name="target_port" type="number" min={1} max={65_535} step={1} required value={target.port} onChange={(e) => update(target.id, "port", e.target.value)} />
+          </Field>
+        </div>
+        {enabled && <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" size="sm" aria-label={`${copy.moveTargetUp} (${index})`} disabled={index === 0} onClick={() => move(index, -1)}>{copy.moveTargetUp}</Button>
+          <Button type="button" variant="outline" size="sm" aria-label={`${copy.moveTargetDown} (${index})`} disabled={index === targets.length - 1} onClick={() => move(index, 1)}>{copy.moveTargetDown}</Button>
+          <Button type="button" variant="outline" size="sm" aria-label={`${copy.removeTarget} (${index})`} disabled={targets.length === 1} onClick={() => setTargets((rows) => rows.filter((row) => row.id !== target.id))}>{copy.removeTarget}</Button>
+        </div>}
+      </li>)}
+    </ol>
+    {enabled && <>
+      <Button type="button" variant="outline" disabled={targets.length >= LINK_TARGET_LIMIT} onClick={() => {
+        const id = nextId.current++;
+        setTargets((rows) => [...rows, { id, host: "", port: "" }]);
+      }}>{copy.addTarget} ({targets.length}/{LINK_TARGET_LIMIT})</Button>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field id={`${prefix}-strategy`} label={copy.targetStrategy}>
+          <select id={`${prefix}-strategy`} name="target_strategy" className={selectClass} defaultValue={initial?.target_set?.strategy ?? "fallback"}>
+            <option value="fallback">{copy.strategyFallback}</option><option value="round_robin">{copy.strategyRoundRobin}</option><option value="random">{copy.strategyRandom}</option>
+          </select>
+        </Field>
+        <Field id={`${prefix}-probe`} label={copy.targetProbe}>
+          <select id={`${prefix}-probe`} name="target_probe" className={selectClass} value={selectedProbe} onChange={(e) => setProbe(e.target.value as LinkTargetSet["probe"])} aria-describedby={`${prefix}-probe-hint`}>
+            <option value="tcp">{protocol === "udp" ? copy.probeTcpAuxiliary : copy.probeTcp}</option><option value="none">{copy.probeNone}</option>
+          </select>
+        </Field>
+        <Field id={`${prefix}-failure`} label={copy.targetFailureSeconds}>
+          <Input id={`${prefix}-failure`} name="target_failure_seconds" type="number" min={10} max={3600} step={1} required defaultValue={initial?.target_set?.failure_seconds ?? 30} />
+        </Field>
+        <Field id={`${prefix}-recover`} label={copy.targetRecoverSeconds}>
+          <Input id={`${prefix}-recover`} name="target_recover_seconds" type="number" min={10} max={3600} step={1} required defaultValue={initial?.target_set?.recover_seconds ?? 30} />
+        </Field>
+      </div>
+      <p className="text-sm text-[var(--muted-foreground)]">{copy.targetWindowsHint}</p>
+      <p id={`${prefix}-probe-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.targetProbeHint}</p>
+    </>}
+    {(protocol === "udp" || protocol === "both") && <p className="text-sm text-[var(--muted-foreground)]">{copy.udpProbeHint}</p>}
+  </fieldset>;
 }

@@ -24,6 +24,16 @@ These are backend `LinkTrafficCheckpoint` sums across all historical producers/d
 
 The receipt timestamp is separate from runtime readiness. At age **>= 60 seconds** the UI keeps the totals and explicitly says they are old, not current zero. A future receipt flags a local clock difference while retaining the historical totals. Neither fresh nor old traffic can substitute for a ready observation, and old traffic does not suppress a genuinely ready runtime.
 
+## F2 ordered targets
+
+New bindings default to legacy single-target mode. Opting in submits a complete optional `target_set` version 1: 1–10 ordered, distinct host/port pairs; `fallback`, `round_robin` or `random`; integer failure/recovery windows of 10–3600 seconds; and `tcp` or `none` probing. Hosts and ports are separate. Raw IPv6 is accepted; backslashes, brackets, invalid colon addresses and IPv6 zone IDs are rejected by the same browser-safe validator in form and response parsing. Duplicate pairs use case-insensitive host comparison, matching the public backend contract. Required `target_host`/`target_port` always come from the first item after edits, deletion or moves.
+
+`bindingFromForward` clones the full set into the captured revision editor. An existing set cannot be disabled: returning to one target means deleting other items and submitting a complete one-item set. Legacy responses with absent `target_set` retain their single `remote_host`/`remote_port` without automatic opt-in. `link_target_set_required` explains reloading the editor and submitting a complete set. `agent_fxp_targets_capability_missing` explains upgrading both entry and exit Agents/runtimes to support `forward.targets.fxp.v1`.
+
+Only the current exit placement can supply `observation.target_status`. The closed parser bounds arrays, validates states, reasons, indices and nullable ISO timestamps, and strips unknown fields. The UI requires a matching deployment/placement/observed generation, valid lease, applied rule revision and a Ready=true exit observation, matching the backend projection. On every render, the target check timestamp must be no older than 60 seconds (inclusive) and no more than 5 seconds ahead; cached facts expire without waiting for the longer lease or another HTTP read. A null timestamp retains only an all-unknown projection. Missing, stale, mismatched or backend-stripped observations display unknown health, time, reason and choices. Health is independent of Ready, ACK and traffic: all targets can be unhealthy while the exit remains Ready, and target health never restores a failed runtime's Ready. `probe: none` disables active checks but still displays valid fresh passive health observations from actual TCP dial results or UDP replies. Without response evidence, health remains unknown; UDP silence never establishes failure. TCP probing does not prove UDP availability.
+
+The detail shows every zero-based target index, health, shared observation time and reason. Selected indices describe the most recent TCP connection / UDP mapping choice, not all existing sessions. Existing warnings about interruption of shared sessions are retained. Re-reading updates the frontend clock immediately before displaying lease-dependent observations.
+
 ## Verification
 
 Optional ingress `observation.traffic_status` reports collection/backlog/blocked
@@ -35,7 +45,7 @@ From `web/`:
 
 ```powershell
 $env:NEXT_PUBLIC_API_MOCK = "0"
-bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/console/__tests__/console-boundary.test.ts
+bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/links/__tests__/links-targets.test.tsx src/components/console/__tests__/console-boundary.test.ts
 npm run typecheck -- --incremental false
 ```
 
@@ -52,5 +62,15 @@ Open `http://127.0.0.1:41973`. This loopback-only contract harness imports the a
 `statistics` can seed `idle`, `collecting`, `backlogged`, `blocked`, or `unknown`
 statistics on a failed ingress. This verifies that even a fresh accounting ACK
 does not turn a failed runtime into a ready one.
+
+F2 browser checks use the same isolated production-component fixture. In its browser console run:
+
+```js
+await (await import('/__test/f2-checks.js')).runF2BrowserChecks()
+```
+
+Start from a freshly loaded Chinese fixture with management permission. The runner resets disposable state and exercises real DOM inputs/clicks and production requests. `targetObservation` seeds `healthy`, `all_unavailable`, `stale`, `digest_mismatch`, `expired`, `missing`, `ingress_only`, `not_ready`, `probe_none` or `legacy`; `targetsCapabilityMissing` rejects multi-target writes. Fixtures validate first-item equality and reject omission of an existing set. See [F2 verification evidence](./__tests__/EVIDENCE.md#f2-多目标前端2026-10-08) for results and the changed-file list.
+
+Additional target freshness scenarios are `old_checked`, `future_checked` and `initial_unknown`. `probe_none_silent` supplies unknown state without response evidence; `probe_none` supplies healthy passive reply evidence with no active probing. The replay advances only the isolated page clock to test cached health expiry, including passive none health, without a minute-long wait; it restores the clock afterward.
 
 The backend feature defaults off. `fxp_links_not_enabled` is shown as a failed operation, with no success notification. Enabling the server feature and final real multi-node validation belong to the backend/runtime rollout.

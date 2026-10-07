@@ -146,16 +146,20 @@ jobs:
           bunx tsc --noEmit
       - name: Backend unit and contract tests
         run: bun run test:unit
-      - name: Prepare dedicated Link traffic test database
+      - name: Prepare dedicated Link traffic and target-set test databases
         run: |
           printf 'CREATE DATABASE IF NOT EXISTS tunex_link_traffic_test;\n' | bunx prisma db execute --schema prisma/schema.prisma --stdin
           export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_traffic_test # secret-scan:allow
+          bunx prisma migrate deploy
+          printf 'CREATE DATABASE IF NOT EXISTS tunex_link_target_sets_test;\n' | bunx prisma db execute --schema prisma/schema.prisma --stdin
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_target_sets_test # secret-scan:allow
           bunx prisma migrate deploy
       - name: Backend database and HTTP integration tests
         run: bun run test:integration
         env:
           TUNEX_DB_TEST: "1"
           TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_traffic_test # secret-scan:allow
+          TUNEX_LINK_TARGET_SETS_TEST_DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_target_sets_test # secret-scan:allow
           ALLOW_REGISTER_FALLBACK: "true"
       # Historical database upgrade replay is valuable release evidence, but it
       # is not a per-PR merge gate. Run it once after the commit lands on main.

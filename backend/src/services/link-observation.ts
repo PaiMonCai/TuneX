@@ -1,15 +1,16 @@
-import { parseLinkPlacements, type ReportedTrafficStatus } from "./node-state-report.ts";
+import { parseLinkPlacements, type ReportedTrafficStatus, type ReportedTargetStatus } from "./node-state-report.ts";
 
 interface LinkObservation {
   state: string;
   ready: boolean | null;
   observed_generation: number | null;
   traffic_status?: ReportedTrafficStatus;
+  target_status?: ReportedTargetStatus[];
 }
 
 export const LINK_OBSERVATION_FRESH_MS = 60_000;
 export function linkObservation(expected: { runtime_id: string; node_id: number; role: string;
-  generation: number; config_digest: string }, workspaceId: number, linkId: number,
+  generation: number; config_digest: string; target_counts?: ReadonlyMap<number, number> }, workspaceId: number, linkId: number,
   report: { reported_at: Date; link_placements: unknown } | null, now = new Date()): LinkObservation {
   const unknown = { state: "unknown", ready: null as boolean | null, observed_generation: null as number | null };
   if (!report) return unknown;
@@ -37,5 +38,10 @@ export function linkObservation(expected: { runtime_id: string; node_id: number;
   if (fact.state === "passive") return { ...observed, ...capacity, state: "passive" };
   if (fact.observed_generation !== expected.generation || fact.config_digest !== expected.config_digest)
     return { ...observed, ...capacity, state: "mismatch" };
-  return { ...observed, ...capacity, state: fact.ready ? "ready" : fact.state, ready: fact.ready };
+  const targets = fact.ready && fact.role === "egress" && fact.target_status ? { target_status: fact.target_status
+    .filter((s) => expected.target_counts?.get(s.forward_id) === s.states.length)
+    .filter((s) => s.last_checked_at === null || (now.getTime() - Date.parse(s.last_checked_at) >= -5000 &&
+      now.getTime() - Date.parse(s.last_checked_at) <= LINK_OBSERVATION_FRESH_MS))
+    .map((s) => ({ ...s, states: [...s.states] })) } : {};
+  return { ...observed, ...capacity, ...targets, state: fact.ready ? "ready" : fact.state, ready: fact.ready };
 }

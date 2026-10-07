@@ -6,6 +6,7 @@ import type { LinkDetail, LinkForward, LinkForwardAction, LinkPlacement } from "
 import type { LinksCopy } from "./links-copy";
 import { canEditLinkEndpoints, canRetireLink, linkStatusLabel, placementState, placementAckState } from "./link-state";
 import { LinkErrorDetails } from "./link-error-details";
+import { ForwardTargets } from "./link-target-details";
 
 export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, onEdit, onDeploy, onRotate,
   onRetire, onAdd, onEditForward, onAction, canCreateForward = canManage, canUpdateForward = () => canManage, canDeleteForward = () => canManage }: {
@@ -96,6 +97,7 @@ export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, on
               <Fact label={copy.connections} value={String(f.max_connections ?? 0)} />
               <Fact label={copy.perIp} value={String(f.max_connections_per_ip ?? 0)} />
             </dl>
+            <ForwardTargets link={link} forward={f} copy={copy} now={now} />
             <ForwardTraffic traffic={f.traffic} copy={copy} now={now} />
             {mutable && <div className="flex flex-wrap gap-2">
               {canUpdateForward(f) && <Button variant="outline" size="sm" disabled={busy} onClick={() => onEditForward(f)}>{copy.editForward}</Button>}

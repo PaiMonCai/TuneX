@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 
-test("Link lifecycle reserves before restore, fences late ACKs, preserves other bindings and retries retirement", () => {
+test("Link lifecycle persists complete F2 target sets, fences snapshot facts and preserves legacy bindings", () => {
   const modulePath = (relative: string) => JSON.stringify(fileURLToPath(new URL(relative, import.meta.url)));
   const scenario = `
     import { mock } from "bun:test";
@@ -12,6 +12,8 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
     const tables = {};
     let usageRows = [];
     let reportedVersion = "0.0.0-dev", legacyVersion = "unknown", fxpAdvertised = true;
+    const targetCapNodes = new Set([11,12]);
+    const jsonFields = new Set(["link_target_config","targets","binding_snapshot","config"]);
     const matches = (r,w={}) => Object.entries(w).every(([k,v]) => {
       if (v && typeof v === "object" && "in" in v) return v.in.includes(r[k]);
       if (v && typeof v === "object" && "not" in v) return r[k] !== v.not;
@@ -23,7 +25,9 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
       const expand = (r) => name === "deployment" ? { ...r, placements: tables.placement.filter(p=>p.deployment_id===r.id),
         link: tables.link.find(l=>l.id===r.link_id) } : name === "placement" ? { ...r,
         deployment: db.linkDeployment.expand(tables.deployment.find(d=>d.id===r.deployment_id)) } : r;
-      const patch = (r,data) => { for(const [k,v] of Object.entries(data)) r[k] = v && typeof v === "object" && "increment" in v ? (r[k]??0)+v.increment : v; };
+      const patch = (r,data) => { for(const [k,v] of Object.entries(data)) r[k] = k === "link_target_config" && v?.constructor?.name === "JsonNull"
+        ? null : v && typeof v === "object" && "increment" in v ? (r[k]??0)+v.increment
+        : jsonFields.has(k) && v != null ? structuredClone(v) : v; };
       const find = (where) => rows.find(r=>matches(r, Object.values(where??{}).some(v=>v&&typeof v==="object"&&("version" in v||"generation" in v)) ? Object.values(where)[0] : where));
       return { expand, rows,
         findFirst: async({where})=>find(where)??null,
@@ -31,7 +35,7 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
         findUniqueOrThrow: async({where})=> {const r=find(where); if(!r)throw Error("fixture_not_found"); return expand(r);},
         findMany: async(args={})=>rows.map(expand).filter(r=>matches(r,args.where)),
         count: async({where})=>rows.filter(r=>matches(r,where)).length,
-        create: async({data})=> {const r={ id:rows.length+1, config_revision:0, generation:0, desired_version:1, status:"draft", ...data }; delete r.placements; rows.push(r);
+        create: async({data})=> {const r={ id:rows.length+1, config_revision:0, generation:0, desired_version:1, status:"draft" }; patch(r,data); delete r.placements; rows.push(r);
           if(data.placements) for(const p of data.placements.create) await db.linkPlacement.create({data:{...p,deployment_id:r.id,applied_generation:null}});
           return expand(r); },
         update: async({where,data})=> {const r=find(where); if(!r)throw Error("fixture_not_found"); patch(r,data);return expand(r);},
@@ -56,8 +60,9 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
     let trafficUsed=0;
     mock.module(${modulePath("../policy-service.ts")},()=>({getEffectivePolicy:async()=>policy, countWorkspaceTunnels:async()=>tables.tunnel.length,
       sumWorkspaceTraffic:async()=>trafficUsed,withWorkspaceQuotaLock:async(_id,fn)=>fn(db,policy)}));
-    mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async()=>({capabilities:fxpAdvertised?["forward.link.fxp.v1"]:[]})}));
-    let blocked=false,failIngress=false,lateAck=false;
+    mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async(id)=>({capabilities:fxpAdvertised
+      ? ["forward.link.fxp.v1",...(targetCapNodes.has(id)?["forward.targets.fxp.v1"]:[])] : []})}));
+    let blocked=false,failIngress=false,lateAck=false,lateAckForwardId=null;
     const sent=[], acquired=[];
     mock.module(${modulePath("../portPool.ts")},()=>({
       acquirePort:async(input)=> {acquired.push(input);return blocked?{ok:false,code:"port_taken"}:{ok:true,result:{leaseId:acquired.length,port:input.preferredPort}};},
@@ -66,7 +71,8 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
     mock.module(${modulePath("../link-transport.ts")},()=>({sendLinkPlacement:async(config,remove)=>{
       sent.push({config,remove});
       if(failIngress&&config.role==="ingress")throw Error("link_apply_unconfirmed");
-      if(lateAck&&config.role==="ingress")tables.tunnel[0].config_revision++;
+      if(lateAck&&config.role==="ingress")
+        (lateAckForwardId==null?tables.tunnel[0]:tables.tunnel.find(r=>r.id===lateAckForwardId)).config_revision++;
     }}));
     const service=await import(${modulePath("../link-resource.ts")});
     const initial={name:"shared",config:{ingress_node_id:11,egress_node_id:12,carrier_port:25000}};
@@ -104,6 +110,150 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
     assert.equal(acquired.some(p=>p.protocol==="tcp"&&p.preferredPort===26000),true);
     assert.equal(acquired.some(p=>p.protocol==="udp"&&p.preferredPort===26000),true);
     assert.equal(acquired.every(p=>p.linkId===link.id&&p.tunnelId==null),true);
+
+    // The service uses the real revision writer; only storage, policy and ACK I/O are mocked.
+    const completeSet={version:1,targets:[{host:"127.0.0.1",port:27000},
+      {host:"backup.example",port:27001},{host:"::1",port:27002}],strategy:"fallback",
+      failure_seconds:10,recover_seconds:3600,probe:"tcp"};
+    const multi=(set,name="F2")=>({...rule(name,26002),target_set:structuredClone(set)});
+    const persisted=()=>structuredClone({tunnels:tables.tunnel,revisions:tables.revision,
+      deployments:tables.deployment,credentials:tables.credential,generation:tables.link[0].generation,
+      sent:sent.length,reserved:acquired.length});
+    for(const missing of [11,12]) {
+      targetCapNodes.delete(missing);
+      const before=persisted();
+      await assert.rejects(()=>service.createLinkForward(3,link.id,8,multi(completeSet)),
+        e=>e.code==="agent_fxp_targets_capability_missing");
+      assert.deepEqual(persisted(),before,"both endpoint capabilities are required before any durable write or reservation");
+      targetCapNodes.add(missing);
+    }
+    const c=await service.createLinkForward(3,link.id,8,multi(completeSet));
+    const current=()=>tables.tunnel.find(r=>r.id===c.id);
+    const snapshots=()=>tables.revision.filter(r=>r.tunnel_id===c.id);
+    const expectedTargets=set=>set.targets.map((target,order_by)=>({...target,weight:1,order_by}));
+    const assertSaved=(set,status="active")=>{
+      const row=current(),snapshot=snapshots().at(-1);
+      assert.deepEqual(row.link_target_config,set);
+      assert.deepEqual(snapshot.link_target_config,set);
+      assert.deepEqual(snapshot.targets,expectedTargets(set),"snapshot freezes every target in order");
+      assert.equal(snapshot.revision,row.config_revision);
+      assert.equal(row.desired_revision_id,snapshot.id);
+      assert.equal(row.desired_status,status);assert.equal(snapshot.desired_status,status);
+      assert.equal(row.remote_host,set.targets[0].host);assert.equal(row.remote_port,set.targets[0].port);
+      assert.equal(snapshot.target_host,set.targets[0].host);assert.equal(snapshot.target_port,set.targets[0].port);
+      assert.equal(row.egress_pool_id,null);assert.equal(snapshot.egress_pool_id,null);
+    };
+    const assertRuntime=(config,set)=>{
+      const runtime={version:1,ruleId:c.id,protocol:"both",targets:set.targets,strategy:set.strategy,
+        failureSeconds:set.failure_seconds,recoverSeconds:set.recover_seconds,probe:set.probe};
+      if(config.role==="ingress")assert.deepEqual(config.runner_config.entries.find(e=>e.ruleId===c.id).targetSet,runtime);
+      else {
+        assert.deepEqual(config.runner_config.targetSets.find(s=>s.ruleId===c.id),runtime);
+        assert.deepEqual(config.runner_config.allowedBindings.filter(s=>s.ruleId===c.id),
+          ["tcp","udp"].flatMap(protocol=>set.targets.map(t=>({ruleId:c.id,protocol,targetIp:t.host,targetPort:t.port}))));
+      }
+    };
+    const assertRestorable=async set=>{
+      const deployment=tables.deployment.at(-1),snapshot=structuredClone(deployment.binding_snapshot);
+      assert.deepEqual(snapshot.spec.bindings.find(r=>r.forward_id===c.id).target_set,set);
+      assert.deepEqual(snapshot.revisions,tables.tunnel.filter(r=>r.desired_status==="active")
+        .map(r=>({id:r.id,revision:r.config_revision})));
+      for(const id of [11,12]) {
+        const configs=await service.desiredNodeLinks(id);assert.equal(configs.length,1);
+        assertRuntime(configs[0],set);
+        assert.equal(configs[0].generation,deployment.generation);
+        assert.equal(configs[0].config_digest,tables.placement.find(p=>p.deployment_id===deployment.id&&p.node_id===id).config_digest);
+      }
+      assert.deepEqual(deployment.binding_snapshot,snapshot,"lease renewal never rewrites immutable target/revision facts");
+    };
+    assertSaved(completeSet);await assertRestorable(completeSet);
+    const publicLink=await service.getLink(3,link.id);
+    assert.deepEqual(publicLink.forwards.find(r=>r.id===c.id).target_set,completeSet);
+    assert.equal("link_target_config" in publicLink.forwards.find(r=>r.id===c.id),false);
+    const legacy=publicLink.forwards.find(r=>r.id===b.id);
+    assert.equal("target_set" in legacy,false);assert.equal("link_target_config" in legacy,false);
+    assert.equal(tables.tunnel.find(r=>r.id===b.id).link_target_config,null);
+    assert.equal(tables.revision.find(r=>r.tunnel_id===b.id).link_target_config,null);
+    assert.deepEqual(tables.revision.find(r=>r.tunnel_id===b.id).targets,
+      [{host:"127.0.0.1",port:27000,weight:1,order_by:1000}]);
+    const firstSnapshot=structuredClone(snapshots()[0]),firstDeployment=structuredClone(tables.deployment.at(-1).binding_snapshot);
+    const firstDeploymentId=tables.deployment.at(-1).id;
+    const oldDigests=sent.slice(-2).map(s=>s.config.config_digest);
+    const edited={...structuredClone(completeSet),strategy:"random",probe:"none"};
+    edited.targets[1].port=28001;
+    for(const missing of [11,12]) {
+      targetCapNodes.delete(missing);const before=persisted();
+      await assert.rejects(()=>service.updateLinkForward(3,link.id,c.id,8,current().config_revision,multi(edited)),
+        e=>e.code==="agent_fxp_targets_capability_missing");
+      await assert.rejects(()=>service.deployLink(3,link.id),e=>e.code==="agent_fxp_targets_capability_missing");
+      assert.deepEqual(persisted(),before);targetCapNodes.add(missing);
+    }
+    await service.updateLinkForward(3,link.id,c.id,8,current().config_revision,multi(edited));
+    assertSaved(edited);await assertRestorable(edited);
+    assert.deepEqual(snapshots()[0],firstSnapshot);
+    assert.deepEqual(tables.deployment.find(d=>d.id===firstDeploymentId).binding_snapshot,firstDeployment);
+    assert.ok(sent.slice(-2).every((s,i)=>s.config.config_digest!==oldDigests[i]),"backup-only edits change both config identities");
+    for(const [expected,body,code] of [[current().config_revision,rule("F2",26002),"link_target_set_required"],
+      [current().config_revision-1,multi(completeSet),"revision_conflict"]]) {
+      const before=persisted();
+      await assert.rejects(()=>service.updateLinkForward(3,link.id,c.id,8,expected,body),e=>e.code===code);
+      assert.deepEqual(persisted(),before,"omitted set and stale CAS cannot fall back to the first target");
+    }
+    await service.actionLinkForward(3,link.id,c.id,"suspend",8);assertSaved(edited,"inactive");
+    assert.equal(current().apply_status,"suspended");
+    assert.equal(tables.deployment.at(-1).binding_snapshot.spec.bindings.some(r=>r.forward_id===c.id),false);
+    assert.equal(sent.at(-2).config.runner_config.allowedBindings.some(r=>r.ruleId===c.id),false);
+    const suspendedSet={...structuredClone(edited),strategy:"round_robin",failure_seconds:3600,recover_seconds:10};
+    suspendedSet.targets=[suspendedSet.targets[0],suspendedSet.targets[2],suspendedSet.targets[1]];
+    targetCapNodes.delete(12);const beforeSuspended=persisted();
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,c.id,8,current().config_revision,multi(suspendedSet)),
+      e=>e.code==="agent_fxp_targets_capability_missing");
+    assert.deepEqual(persisted(),beforeSuspended);targetCapNodes.add(12);
+    await service.updateLinkForward(3,link.id,c.id,8,current().config_revision,multi(suspendedSet,"F2 suspended edit"));
+    assertSaved(suspendedSet,"inactive");
+    assert.equal(tables.deployment.at(-1).binding_snapshot.spec.bindings.some(r=>r.forward_id===c.id),false);
+    await service.actionLinkForward(3,link.id,c.id,"resume",8);assertSaved(suspendedSet);await assertRestorable(suspendedSet);
+
+    const recoveredSet={...structuredClone(suspendedSet),strategy:"fallback",probe:"tcp"};
+    recoveredSet.targets[2].host="recovered.example";
+    failIngress=true;
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,c.id,8,current().config_revision,multi(recoveredSet)),/link_apply_unconfirmed/);
+    failIngress=false;assertSaved(recoveredSet);await assertRestorable(recoveredSet);
+    const failedDeployment=tables.deployment.at(-1),failedFacts=structuredClone(failedDeployment.binding_snapshot);
+    const failedGeneration=failedDeployment.generation,failedRevision=current().config_revision;
+    assert.equal(failedDeployment.status,"degraded");
+    assert.equal((await service.reconcileLinks()).errors,0);
+    assert.equal(tables.link[0].generation,failedGeneration,"recovery hydrates the committed deployment");
+    assert.equal(current().applied_revision,failedRevision);assertSaved(recoveredSet);
+    assert.deepEqual(failedDeployment.binding_snapshot,failedFacts);
+    await assertRestorable(recoveredSet);
+    const retryRevisionCount=snapshots().length;
+    await service.actionLinkForward(3,link.id,c.id,"retry",8);
+    assert.equal(snapshots().length,retryRevisionCount);assertSaved(recoveredSet);await assertRestorable(recoveredSet);
+
+    lateAck=true;lateAckForwardId=c.id;
+    await service.deployLink(3,link.id);lateAck=false;lateAckForwardId=null;
+    const staleFacts=structuredClone(tables.deployment.at(-1).binding_snapshot),staleGeneration=tables.link[0].generation;
+    assert.ok(current().applied_revision<current().config_revision,"an ACK cannot apply a later Forward revision");
+    for(const id of [11,12])assert.equal((await service.desiredNodeLinks(id)).length,0,"same targets with stale revision facts cannot restore");
+    assert.equal((await service.reconcileLinks()).errors,0);
+    assert.equal(tables.link[0].generation,staleGeneration+1);
+    assert.deepEqual(tables.deployment.find(d=>d.generation===staleGeneration).binding_snapshot,staleFacts);
+    await assertRestorable(recoveredSet);
+
+    failIngress=true;
+    await assert.rejects(()=>service.actionLinkForward(3,link.id,c.id,"delete",8),/link_apply_unconfirmed/);
+    failIngress=false;assertSaved(recoveredSet,"inactive");
+    assert.equal(tables.deployment.at(-1).binding_snapshot.spec.bindings.some(r=>r.forward_id===c.id),false);
+    assert.equal(sent.at(-2).config.runner_config.allowedBindings.some(r=>r.ruleId===c.id),false);
+    assert.equal((await service.reconcileLinks()).errors,0);
+    await service.actionLinkForward(3,link.id,c.id,"delete",8);
+    assert.equal(current(),undefined);
+    assert.deepEqual(snapshots().at(-1).link_target_config,recoveredSet);
+    assert.deepEqual(snapshots().at(-1).targets,expectedTargets(recoveredSet));
+    assert.deepEqual(snapshots()[0],firstSnapshot);
+    assert.deepEqual((await service.getLink(3,link.id)).forwards.map(r=>r.id),[a.id,b.id]);
+
     const priorGeneration=tables.link[0].generation;
     await assert.rejects(()=>service.retireLink(3,link.id),/link_has_references/);
     assert.equal(tables.link[0].generation,priorGeneration);

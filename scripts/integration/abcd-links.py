@@ -52,6 +52,7 @@ class Echo:
         self.tcp.listen()
         self.tcp.settimeout(0.5)
         self.clients = set()
+        self.messages = set()
         self.stopped = threading.Event()
 
     def start(self):
@@ -79,6 +80,7 @@ class Echo:
                     continue
                 if not data:
                     return
+                self.messages.add(data)
                 client.sendall(data)
         except OSError:
             pass
@@ -116,6 +118,103 @@ def tcp_payload(client, payload):
             break
         got += chunk
     return got == payload
+
+
+def multi_target_case(base, fid, target, targets, keep_b_alive):
+    """Use real target sockets, heartbeat facts and API revisions, never patched health."""
+    primary, backup = targets[2:4]
+    policy = {"version": 1, "targets": [{"host": target, "port": 3044}, {"host": target, "port": 3045}],
+        "strategy": "fallback", "failure_seconds": 10, "recover_seconds": 10, "probe": "tcp"}
+
+    def edit():
+        detail = request("GET", base)
+        row = next(f for f in detail["forwards"] if f["id"] == fid)
+        request("PUT", base + f"/forwards/{fid}", {"expected_revision": row["config_revision"], "binding": {
+            "name": "C target pool", "protocol": "both", "listen_port": 21080, "listen_host": "",
+            "target_host": target, "target_port": 3044, "target_set": policy,
+            "max_connections": 0, "max_connections_per_ip": 0}})
+
+    def health():
+        detail = request("GET", base)
+        egress = next(p for p in detail["deployment"]["placements"] if p["role"] == "egress")
+        return next((s for s in egress.get("observation", {}).get("target_status", [])
+            if s["forward_id"] == fid), None)
+
+    def wait_states(states):
+        def predicate():
+            if not keep_b_alive():
+                raise RuntimeError("unchanged B lost its held TCP or UDP mapping during F2")
+            fact = health()
+            return fact if fact and fact["states"] == states else False
+        return H.wait_until(predicate, timeout=70, interval=2)
+
+    def choose(label):
+        payload = label.encode()
+        with tcp(21080) as client:
+            if not tcp_payload(client, payload):
+                raise RuntimeError("F2 TCP payload lost")
+        return [server.port for server in (primary, backup) if payload in server.messages]
+
+    edit()
+    H.check(next(f for f in request("GET", base)["forwards"] if f["id"] == fid)["target_set"] == policy,
+        "F2 complete ordered target policy round-trips through real API and immutable deployment")
+    H.check(bool(wait_states(["healthy", "healthy"])), "F2 auxiliary TCP probes report both real target listeners")
+    H.check(choose("F2-primary-TCP") == [3044], "F2 fallback selects the primary for a real new TCP connection")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as mapping:
+        H.check(udp_payload(mapping, 21080, b"F2-primary-UDP") and
+            b"F2-primary-UDP" in primary.udp.sources, "F2 real UDP mapping starts at the primary")
+        primary.stop()
+        H.check(bool(wait_states(["unhealthy", "healthy"])), "F2 primary outage is confirmed after the failure window")
+        H.check(choose("F2-backup-TCP") == [3045], "F2 new TCP connections fail over to the authorized backup")
+        H.check(udp_payload(mapping, 21080, b"F2-backup-UDP") and
+            b"F2-backup-UDP" in backup.udp.sources, "F2 same entry UDP session retargets after confirmed primary failure")
+        backup_source = backup.udp.sources.get(b"F2-backup-UDP")
+        primary = Echo(3044)
+        primary.start()
+        targets[2] = primary
+        H.check(bool(wait_states(["healthy", "healthy"])), "F2 primary is eligible only after the recovery window")
+        H.check(choose("F2-recovered-TCP") == [3044], "F2 new TCP uses the recovered primary")
+        H.check(udp_payload(mapping, 21080, b"F2-pinned-backup-UDP") and
+            backup.udp.sources.get(b"F2-pinned-backup-UDP") == backup_source,
+            "F2 recovered primary does not move an established healthy backup UDP socket")
+        primary.stop()
+        backup.stop()
+        H.check(bool(wait_states(["unhealthy", "unhealthy"])), "F2 all failed targets are visible independently of Ready")
+        unavailable = False
+        try:
+            with tcp(21080) as client:
+                unavailable = not tcp_payload(client, b"F2-all-failed")
+        except (OSError, socket.timeout):
+            unavailable = True
+        H.check(unavailable, "F2 all failed targets cannot deliver TCP payload")
+        egress = next(p for p in request("GET", base)["deployment"]["placements"] if p["role"] == "egress")
+        H.check(egress.get("observation", {}).get("ready") is True,
+            "F2 target failure does not falsify the carrier listener Ready fact")
+        primary, backup = Echo(3044), Echo(3045)
+        primary.start()
+        backup.start()
+        targets[2:4] = [primary, backup]
+        H.check(bool(wait_states(["healthy", "healthy"])), "F2 real listeners recover from all-unavailable")
+    policy["strategy"] = "round_robin"
+    edit()
+    picks = [choose(f"F2-round-robin-{i}") for i in range(8)]
+    H.check(picks == [[3044], [3045]] * 4, "F2 round-robin deterministically distributes real new TCP connections")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as mapping:
+        first = b"F2-RR-UDP-0"
+        H.check(udp_payload(mapping, 21080, first), "F2 round-robin creates a real UDP mapping")
+        chosen = next(server for server in (primary, backup) if first in server.udp.sources)
+        source = chosen.udp.sources[first]
+        H.check(all(udp_payload(mapping, 21080, f"F2-RR-UDP-{i}".encode()) and
+            chosen.udp.sources.get(f"F2-RR-UDP-{i}".encode()) == source for i in range(1, 6)),
+            "F2 round-robin keeps one UDP source pinned across packets")
+    policy["strategy"] = "random"
+    edit()
+    picks = [choose(f"F2-random-{i}") for i in range(24)]
+    H.check(all(len(pick) == 1 and pick[0] in (3044, 3045) for pick in picks),
+        "F2 random uses only declared targets for real TCP payloads")
+    policy["strategy"] = "fallback"
+    edit()
+    H.check(keep_b_alive(), "F2 all target policy changes preserve B's held TCP and original UDP socket")
 
 
 def udp_payload(client, port, payload):
@@ -218,7 +317,7 @@ def main():
                 "reported_at:{gt:new Date(Date.now()-60000)}},select:{node_id:true,version:true,capabilities:true}});"
                 "return facts.map(f=>({id:f.node_id,version_ok:checkAgentVersion(f.version,null)===null,"
                 "fxp:Array.isArray(f.capabilities)&&['forward.link.fxp.v1','apply_link','remove_link']"
-                ".every(c=>f.capabilities.includes(c))}));" % json.dumps(node_ids))
+                ".every(c=>f.capabilities.includes(c))&&f.capabilities.includes('forward.targets.fxp.v1')}));" % json.dumps(node_ids))
             return (isinstance(facts, list) and {f["id"] for f in facts} == set(node_ids)
                     and all(f["version_ok"] and f["fxp"] for f in facts))
         fxp_ready = H.wait_until(current_link_facts, timeout=60, interval=2)
@@ -229,7 +328,7 @@ def main():
         target = C.runner_egress_ip()
         if not target:
             raise RuntimeError("no address reachable by egress for the real echo target")
-        for port in (3042, 3043):
+        for port in (3042, 3043, 3044, 3045):
             server = Echo(port)
             server.start()
             targets.append(server)
@@ -349,6 +448,11 @@ def main():
         rules.append(c)
         with tcp(21080) as replacement:
             H.check(tcp_payload(replacement, b"C-exact-reuse"), "ABCD deleted A port carries a new rule payload")
+        def unchanged_b():
+            payload = b"F2-B-unchanged"
+            return (tcp_payload(held_b, payload) and udp_payload(udp_b, 21081, payload) and
+                targets[0].udp.sources.get(payload) == original_udp_source)
+        multi_target_case(base, c, target, targets, unchanged_b)
         before_restart = wait_traffic(link_id, [b, c])
         old_producers = {row["producer_id"] for row in before_restart if row["forward_id"] == b}
         old_b = [row for row in before_restart if row["forward_id"] == b]
@@ -363,6 +467,10 @@ def main():
                 return False
         restored_payload = bool(H.wait_until(restored, timeout=90, interval=2))
         H.check(restored_payload, "ABCD authoritative/private restoration recovers encrypted payload")
+        with tcp(21080) as client:
+            H.check(tcp_payload(client, b"F2-pool-after-agent-restart") and
+                b"F2-pool-after-agent-restart" in targets[2].messages,
+                "F2 Agent restart restores the full target policy and real primary payload")
         if not restored_payload:
             raise RuntimeError("restart payload prerequisite failed")
         after_restart = wait_traffic(link_id, [b], lambda rows:

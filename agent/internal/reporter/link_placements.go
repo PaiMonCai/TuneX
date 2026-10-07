@@ -10,21 +10,22 @@ import (
 // LinkPlacement is the closed, secret-free runtime fact sent to the panel.
 // It is deliberately separate from Observation, which also contains child logs.
 type LinkPlacement struct {
-	ID                  string              `json:"id"`
-	LinkID              int64               `json:"link_id"`
-	WorkspaceID         int64               `json:"workspace_id"`
-	NodeID              int64               `json:"node_id"`
-	Role                string              `json:"role"`
-	Generation          int64               `json:"generation"`
-	ObservedGeneration  int64               `json:"observed_generation"`
-	ConfigDigest        string              `json:"config_digest"`
-	DesiredConfigDigest string              `json:"desired_config_digest"`
-	Ready               bool                `json:"ready"`
-	State               string              `json:"state"`
-	LeaseExpiresAt      string              `json:"lease_expires_at"`
-	Ports               []LinkPlacementPort `json:"ports"`
-	RuntimeIDs          []string            `json:"runtime_ids"`
-	TrafficStatus       *LinkTrafficStatus  `json:"traffic_status,omitempty"`
+	ID                  string                    `json:"id"`
+	LinkID              int64                     `json:"link_id"`
+	WorkspaceID         int64                     `json:"workspace_id"`
+	NodeID              int64                     `json:"node_id"`
+	Role                string                    `json:"role"`
+	Generation          int64                     `json:"generation"`
+	ObservedGeneration  int64                     `json:"observed_generation"`
+	ConfigDigest        string                    `json:"config_digest"`
+	DesiredConfigDigest string                    `json:"desired_config_digest"`
+	Ready               bool                      `json:"ready"`
+	State               string                    `json:"state"`
+	LeaseExpiresAt      string                    `json:"lease_expires_at"`
+	Ports               []LinkPlacementPort       `json:"ports"`
+	RuntimeIDs          []string                  `json:"runtime_ids"`
+	TrafficStatus       *LinkTrafficStatus        `json:"traffic_status,omitempty"`
+	TargetStatus        []linkrunner.TargetStatus `json:"target_status,omitempty"`
 }
 
 // LinkTrafficStatus is a closed copy of the in-memory capacity observation.
@@ -103,6 +104,7 @@ func reportedLinkPlacements(in []linkrunner.Observation) *[]LinkPlacement {
 			Ready: o.Ready, State: o.State, LeaseExpiresAt: o.LeaseExpiresAt,
 			Ports: ports, RuntimeIDs: runtimeIDs,
 			TrafficStatus: reportedTrafficStatus(o.TrafficStatus),
+			TargetStatus:  reportedTargetStatus(o.Role, o.TargetStatus),
 		})
 	}
 	return &out

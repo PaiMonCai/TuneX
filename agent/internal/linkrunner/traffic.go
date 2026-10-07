@@ -40,6 +40,7 @@ type childTraffic struct {
 	enabled        bool
 	producer, path string
 	rotationPath   string
+	targetsEnabled bool
 }
 type trafficKey struct {
 	producer string
@@ -214,6 +215,15 @@ func (m *Manager) AckTraffic(samples []TrafficSample) error {
 
 func (m *Manager) startChildLocked(cfg Config, deadline time.Time, expected []listener) (*child, error) {
 	options := childTraffic{enabled: m.traffic != nil}
+	if !m.targetProbeDone {
+		m.targetSupport, m.targetProbeDone = probeTargetSets(m.binaryPath), true
+	}
+	options.targetsEnabled = m.targetSupport
+	// Restore must enforce the same capability gate as a new Apply. An older
+	// runner must never ignore a persisted target set and use its first member.
+	if usesTargetSets(cfg.RunnerConfig) && !options.targetsEnabled {
+		return nil, ErrTargetCapability
+	}
 	if options.enabled && cfg.Role == "ingress" {
 		if !managedConfig(cfg.RunnerConfig) {
 			return nil, ErrTraffic

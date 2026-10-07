@@ -4,15 +4,15 @@
 
 ## 已确认的候选证据
 
-以下结果对应源码 `095089edd7ba2343cacc82aec2707435ad9c3876` 的 [CI 37645154719](https://github.com/PaiMonCai/TuneX/actions/runs/37645154719)，该次 required 全绿。后续提交需要查看自己的检查；本文不是持续同步的 CI 状态页。
+以下结果对应 F1 源码 `4e50f20b8c3b16af512bcae942d42f3c08b1e578` 的 [CI 37658464950](https://github.com/PaiMonCai/TuneX/actions/runs/37658464950)，该次 required 全绿。F2 及后续提交查看 [PR 75 的候选检查](https://github.com/PaiMonCai/TuneX/pull/75/checks)；本文不是持续同步的 CI 状态页。
 
 | 范围 | 结果与边界 |
 | --- | --- |
-| Backend | 3169 pass / 0 fail，164 文件；空库迁移、Prisma 生成与类型检查通过。 |
-| MySQL/HTTP | 111 pass / 0 fail / 0 skipped；包含 20 轮 × 10 个并发新 producer 事务，逐轮校验账本；确定性旧快照交错最终精确入账 60 字节。 |
+| Backend | 3179 pass / 0 fail；空库迁移、Prisma 生成与类型检查通过。 |
+| MySQL/HTTP | 113 pass / 0 fail / 0 skipped；包含并发新 producer 事务和旧快照交错，逐轮校验精确账本。 |
 | Linux Agent 与 FXP | 全量测试、vet 和构建通过，使用真实 FXP 程序；PR 不据此宣称已执行仅 main push 才运行的 race 步骤。 |
-| Web | 1428 pass / 0 fail，76 文件；类型检查/构建通过。该构建使用 mock API，不证明生产 API 或真实浏览器完成。 |
-| Linux 核心集成 | Panel/Worker/MySQL/Redis/四 Agent，35 PASS / 0 FAIL；共享规则变化时保持未变化 B 的 TCP 会话和 UDP 目标 socket。artifact：abcd-core-result。 |
+| Web | 1441 pass / 0 fail；类型检查/构建通过。该构建使用 mock API，不证明生产 API 或真实浏览器完成。 |
+| Linux 核心集成 | Panel/Worker/MySQL/Redis/四 Agent，41 PASS / 0 FAIL；含真实统计段切换和回收，保持 B TCP 与原 UDP 目标 socket。artifact：abcd-core-result。 |
 | Ops / secrets | 对应门禁通过。 |
 
 Link 页面曾通过隔离浏览器 fixtures 验证；新流量 UI 有 parser/组件回归，但尚无该切片的真实后端浏览器全流程证据。细节见 [组件验证记录](../web/src/components/links/__tests__/EVIDENCE.md)。上述绿色 CI 没有自动开启 FXP 默认开关或公开支持矩阵。
@@ -34,7 +34,7 @@ bun run test:unit
 bun run test:integration
 ```
 
-数据库集成按 [CI 配置](../.github/workflows/ci.yml) 准备迁移，设置 `TUNEX_DB_TEST=1` 和独立的 `TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL`；确认测试实际执行且没有 skipped。只看退出码不能代替这个检查。
+数据库集成按 [CI 配置](../.github/workflows/ci.yml) 准备迁移，设置 `TUNEX_DB_TEST=1`、独立的 `TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL` 及 `TUNEX_LINK_TARGET_SETS_TEST_DATABASE_URL`；后者限定 loopback `*_link_target_sets_test` 库，覆盖完整快照、基线、CAS 和事务回滚。确认测试实际执行且没有 skipped；只看退出码不能代替这个检查。
 
 ```bash
 cd web
@@ -74,6 +74,8 @@ bash scripts/integration/abcd-core-gate.sh
 脚本启用 FXP、构建候选 backend/Agent、创建四节点测试拓扑，执行真实载体、TCP/UDP/both、限制、共享更新、授权、恢复、删除和运行事实检查。结果写入 `scripts/integration/evidence/abcd-links-result.txt`；脱敏诊断与对应镜像/SHA 一起保存。
 
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
+
+F2 同一 gate 新增真实目标 3044/3045：完整策略 API 往返、辅助 TCP 健康、主目标实际关闭、10 秒失败/恢复窗口、全故障、恢复后的新 TCP 与保持备用 UDP 映射、RR、random、固定 UDP 来源及 Agent 重启。每次等待继续使用 B 的原 TCP 和 UDP socket；不改数据库健康状态或伪造 Ready。窗口抖动、未知 UDP、nonce/replay 和未授权目标另由真实 runner 回归覆盖。Windows 本地不能代替该 Linux 门禁。
 
 原生回归和删除/精确端口复用：
 

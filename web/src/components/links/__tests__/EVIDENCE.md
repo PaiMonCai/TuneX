@@ -1,5 +1,37 @@
 # A 前端闭环验证记录
 
+## F2 多目标前端（2026-10-08）
+
+最终验证：**153 pass / 0 fail / 2469 assertions / 7 files**；`node node_modules/typescript/bin/tsc --noEmit --incremental false` 退出码 **0**；范围内 `git diff --check` 通过。新增 F2 文件包含 **25** 项契约/UI 测试，其中地址边界对照 `node:net.isIP`，显式排除 Go `net.ParseIP` 不接受的 zone ID。所有请求测试使用 fixtures。
+
+Chrome 独立 context `tunex-f2-none-contract` 加载 `http://127.0.0.1:41973` 的真实生产组件与请求层，通过可重放 `browser-targets-checks.js`：**44 / 44 checks**。覆盖默认 legacy opt-in、UDP none / both TCP 默认与显式辅助 TCP、添加至十项、排序保值、重复/反斜杠/带端口/括号/非法 IPv6 提交前拒绝、raw IPv6 保存、删除首项回写 first fields、已有集合完整 CAS 保存与单项集合、旧单目标编辑、A 变更保留 B 配置与修订、冲突后重开使用新 CAS、两端能力升级说明、中英切换及只读。
+
+出口场景覆盖 healthy、all_unavailable、stale、digest mismatch 后字段清除、租约过期、missing、仅入口观测、failed runtime 不投影健康、probe none、旧 last_checked_at、未来超前及 null 初始 unknown。健康和 Ready 分开；只接受符合 backend 的 Ready=true 出口健康投影，不用健康恢复 Ready。选中索引明确表示最近 TCP 连接 / UDP 映射，不代表所有 session 的当前目标。保留共享会话变更可能中断警告。重读后立即更新本机时间；每次渲染还检查观测时间的 <=60 秒及未来 <=5 秒边界，旧缓存不会保留到 180 秒租约到期。组件/parser 回归覆盖 59,999/60,000/60,001 ms、未来 4,999/5,000/5,001 ms、null 全 unknown 及 null 不能建立已知健康。浏览器只加速隔离页面时钟，验证缓存降为未知无需重新读取或实等一分钟，随后恢复时钟。浏览器 console 只有两条预期负例 HTTP 409（CAS 冲突、能力缺失），无 React/JavaScript 异常。
+
+`probe: none` 契约纠正：只关闭主动检查，不覆盖经过出口/Ready/freshness 门禁的 `status.states`。真实 TCP dial 结果或 UDP 回包仍可形成健康观测；silence 保持 unknown，不自动形成 failure。专项单测在中英文、TCP/UDP/both 下验证无回应 unknown，以及 fresh passive healthy/suspect/recovering/unhealthy 精确展示、过期降级和 Ready=false 不采用。实际浏览器验证 `probe_none_silent` 为未知、`probe_none` 的真实 UDP 回包 fixture 为健康，以及 passive none 的缓存健康仍按 60 秒门禁过期。双语控件改为“无主动探测 / No active probe”，说明真实业务响应可提供证据。此次未改变 parser 或 `forwardTargetStatus` 的 null/Ready/freshness 语义。
+
+验证命令（`web/`，本机缓存 Bun 1.4.2）：
+
+```powershell
+$env:NEXT_PUBLIC_API_MOCK = "0"
+bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/links/__tests__/links-targets.test.tsx src/components/console/__tests__/console-boundary.test.ts src/components/forwards/__tests__/workspace-permissions.test.ts src/components/forwards/__tests__/forward-batch-delete.test.tsx src/components/forwards/__tests__/forward-copy-usage.test.ts
+node node_modules/typescript/bin/tsc --noEmit --incremental false
+bun run src/components/links/__tests__/browser-server.ts
+```
+
+在新加载的中文 fixture 浏览器中运行 `await (await import('/__test/f2-checks.js')).runF2BrowserChecks()`。本次仅使用内存 HTTP fixtures；未连接真实数据库、Agent、真实转发服务或密钥，未部署、提交或推送。共享 workspace 中其他任务的 backend / Agent / runtime 文件未由本任务写入，`Forwardx/` 未修改。
+
+本任务修改文件（均在授权写范围内）：
+
+| 区域 | 文件 |
+| --- | --- |
+| 契约 | `web/src/lib/links-types.ts` |
+| 生产组件 | `link-forms.tsx`, `link-detail.tsx`, `link-target-details.tsx`（新增）, `link-state.ts`, `links-copy.ts`, `links-workspace.tsx` |
+| 测试与夹具 | `__tests__/links-targets.test.tsx`（新增）, `__tests__/links-fixtures.ts`, `__tests__/browser-server.ts`, `__tests__/browser-entry.tsx`, `__tests__/browser-targets-checks.js`（新增） |
+| 文档 | `README.md`, `__tests__/EVIDENCE.md` |
+
+除契约文件外，以上相对路径均位于 `web/src/components/links/`。
+
 日期：2026-10-07。分支：`feat/forward-core-abcd`。这里只记录本次前端及关联入口验证，不覆盖后端 / Agent / 多节点转发验收。
 
 ## 已接入的真实生产入口

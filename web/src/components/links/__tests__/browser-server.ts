@@ -1,7 +1,7 @@
 /** Browser-only contract fixture. No database, no Agent or production credentials. */
 import { resolve } from "node:path";
-import type { LinkBindingInput, LinkDetail } from "@/lib/links-types";
-import { link, statistics } from "./links-fixtures";
+import { projectLinkTargetSet, type LinkBindingInput, type LinkDetail } from "@/lib/links-types";
+import { link, statistics, targetLink } from "./links-fixtures";
 
 const bundle = await Bun.build({ entrypoints: [resolve(import.meta.dir, "browser-entry.tsx")], target: "browser",
   define: { "process.env.NEXT_PUBLIC_API_MOCK": '"0"', "process.env.SERVER_API_BASE": '""', "process.env.NODE_ENV": '"development"' } });
@@ -12,6 +12,7 @@ let enabled = true;
 let conflict = false;
 let partial = false;
 let delay = false;
+let targetsCapabilityMissing = false;
 const calls: { path: string; method: string; workspaceId: number; body: unknown }[] = [];
 const response = (data: unknown, status = 200) => Response.json({ data }, { status });
 const failure = (code: string, status = 409) => Response.json({ code, error: code }, { status });
@@ -22,13 +23,41 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
   const path = new URL(req.url).pathname;
   if (path === "/") return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   if (path === "/bundle.js") return new Response(js, { headers: { "Content-Type": "text/javascript" } });
+  if (path === "/__test/f2-checks.js") return new Response(Bun.file(resolve(import.meta.dir, "browser-targets-checks.js")), { headers: { "Content-Type": "text/javascript" } });
   if (path === "/favicon.ico") return new Response(null, { status: 204 });
   if (path === "/__test/state") return response({ links, calls });
   if (path === "/__test/scenario") {
-    const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean;
+    const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean; targetsCapabilityMissing?: boolean;
+      targetObservation?: "healthy" | "all_unavailable" | "stale" | "digest_mismatch" | "expired" | "missing" | "ingress_only" | "not_ready" | "probe_none" | "probe_none_silent" | "legacy" | "old_checked" | "future_checked" | "initial_unknown";
       statistics?: "idle" | "collecting" | "backlogged" | "blocked" | "unknown" };
     enabled = input.enabled ?? true; conflict = input.conflict ?? false; partial = input.partial ?? false; delay = input.delay ?? false;
+    targetsCapabilityMissing = input.targetsCapabilityMissing ?? false;
     if (input.reset) { links = []; calls.length = 0; }
+    if (input.targetObservation) {
+      if (!links.length) links.push(targetLink());
+      for (const row of links) {
+        const scenario = input.targetObservation;
+        if (scenario === "legacy") row.forwards.forEach((f) => { delete f.target_set; });
+        if (scenario === "probe_none" || scenario === "probe_none_silent") row.forwards.forEach((f) => { if (f.target_set) f.target_set.probe = "none"; });
+        const initialUnknown = scenario === "initial_unknown" || scenario === "probe_none_silent";
+        row.deployment!.lease_expires_at = new Date(Date.now() + (scenario === "expired" ? -60000 : 180000)).toISOString();
+        for (const placement of row.deployment!.placements) {
+          const own = scenario === "ingress_only" ? placement.role === "ingress" : placement.role === "egress";
+          const stripped = ["stale", "digest_mismatch", "missing", "legacy", "not_ready"].includes(scenario);
+          placement.observation = {
+            state: scenario === "stale" ? "stale" : scenario === "digest_mismatch" ? "mismatch" : scenario === "not_ready" ? "failed" : "ready",
+            ready: !["stale", "digest_mismatch", "not_ready"].includes(scenario), observed_generation: row.generation,
+            ...(own && !stripped ? { target_status: row.forwards.filter((f) => f.target_set).map((f) => ({
+              forward_id: f.id, states: f.target_set!.targets.map(() => scenario === "all_unavailable" ? "unhealthy" as const : initialUnknown ? "unknown" as const : "healthy" as const),
+              selected_tcp: f.forward_protocol === "udp" || initialUnknown ? null : 0,
+              selected_udp: f.forward_protocol === "tcp" || initialUnknown ? null : f.target_set!.targets.length - 1,
+              last_checked_at: initialUnknown ? null : new Date(Date.now() + (scenario === "old_checked" ? -61000 : scenario === "future_checked" ? 6000 : 0)).toISOString(),
+              reason: scenario === "all_unavailable" ? "all_unavailable" as const : initialUnknown ? "initial" as const : "selected" as const,
+            })) } : {}),
+          };
+        }
+      }
+    }
     if (input.statistics !== undefined) {
       if (!links.length) links.push(link());
       for (const row of links) for (const placement of row.deployment?.placements ?? []) {
@@ -39,7 +68,7 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
         };
       }
     }
-    return response({ enabled, conflict, partial, delay });
+    return response({ enabled, conflict, partial, delay, targetsCapabilityMissing });
   }
   const workspaceId = Number(req.headers.get("x-workspace-id"));
   if (![5, 6].includes(workspaceId)) return failure("permission_denied", 403);
@@ -83,10 +112,15 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
       } else {
         const input = body as { expected_revision: number; binding: LinkBindingInput };
         if (conflict || input.expected_revision !== f.config_revision) { conflict = false; f.config_revision++; return failure("revision_conflict"); }
+        if (f.target_set && !input.binding.target_set) return failure("link_target_set_required");
+        const invalid = validateBinding(input.binding); if (invalid) return invalid;
         Object.assign(f, project(input.binding), { config_revision: f.config_revision + 1 });
       }
-    } else row.forwards.push({ id: row.forwards.length + 1, ...project(body as LinkBindingInput), config_revision: 1,
-      applied_revision: null, desired_status: "active", apply_status: "pending" });
+    } else {
+      const invalid = validateBinding(body as LinkBindingInput); if (invalid) return invalid;
+      row.forwards.push({ id: row.forwards.length + 1, ...project(body as LinkBindingInput), config_revision: 1,
+        applied_revision: null, desired_status: "active", apply_status: "pending" });
+    }
     row.ref_count = row.forwards.length;
     if (partial) { partial = false; return failure("link_apply_unconfirmed"); }
   }
@@ -106,6 +140,17 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
 function project(binding: LinkBindingInput) {
   return { name: binding.name, forward_protocol: binding.protocol, listen_ip: binding.listen_host || "0.0.0.0", listen_port: binding.listen_port,
     remote_host: binding.target_host, remote_port: binding.target_port, bytes_per_second_in: binding.bytes_per_second_in,
+    ...(binding.target_set ? { target_set: projectLinkTargetSet(binding.target_set) } : {}),
     bytes_per_second_out: binding.bytes_per_second_out, max_connections: binding.max_connections, max_connections_per_ip: binding.max_connections_per_ip };
+}
+function validateBinding(binding: LinkBindingInput): Response | null {
+  if (binding.target_set) {
+    if (targetsCapabilityMissing) return failure("agent_fxp_targets_capability_missing");
+    try {
+      const set = projectLinkTargetSet(binding.target_set);
+      if (set.targets[0].host !== binding.target_host || set.targets[0].port !== binding.target_port) return failure("target_set_first_mismatch", 400);
+    } catch { return failure("invalid_target_set", 400); }
+  }
+  return null;
 }
 console.log("links browser contract fixture http://127.0.0.1:41973");

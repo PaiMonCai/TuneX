@@ -3,9 +3,23 @@ export type LinkProtocol = "tcp" | "udp" | "both";
 export type LinkForwardAction = "suspend" | "resume" | "retry" | "delete";
 export interface LinkConfig { ingress_node_id: number; egress_node_id: number; carrier_port: number }
 export interface LinkCreateInput { name: string; config: LinkConfig }
+export const LINK_TARGET_LIMIT = 10;
+export interface LinkTarget { host: string; port: number }
+export interface LinkTargetSet {
+  version: 1; targets: LinkTarget[]; strategy: "fallback" | "round_robin" | "random";
+  failure_seconds: number; recover_seconds: number; probe: "tcp" | "none";
+}
+export type LinkTargetHealth = "unknown" | "healthy" | "suspect" | "recovering" | "unhealthy";
+/** Exit observations for one immutable generation; selected indices are last chosen, not session destinations. */
+export interface LinkTargetStatus {
+  forward_id: number; states: LinkTargetHealth[]; selected_tcp: number | null; selected_udp: number | null;
+  last_checked_at: string | null;
+  reason: "initial" | "selected" | "target_failed" | "target_recovered" | "all_unavailable";
+}
 export interface LinkBindingInput {
   name: string; protocol: LinkProtocol; listen_port: number; listen_host: "" | "127.0.0.1" | "::1";
   target_host: string; target_port: number;
+  target_set?: LinkTargetSet;
   bytes_per_second_in: number; bytes_per_second_out: number;
   max_connections: number; max_connections_per_ip: number;
 }
@@ -26,6 +40,7 @@ export interface LinkTrafficStatus {
 export interface LinkObservation {
   state: string; ready: boolean | null; observed_generation: number | null;
   traffic_status?: LinkTrafficStatus | null;
+  target_status?: LinkTargetStatus[];
 }
 export interface LinkDeployment {
   generation: number; version?: number | null; status: string; lease_expires_at: string; placements: LinkPlacement[];
@@ -38,6 +53,7 @@ export interface LinkForward {
   user_id?: number | null;
   id: number; name: string; forward_protocol: LinkProtocol; listen_ip: string | null; listen_port: number;
   remote_host: string; remote_port: number; desired_status: string; apply_status: string;
+  target_set?: LinkTargetSet;
   config_revision: number; applied_revision: number | null;
   bytes_per_second_in: number | null; bytes_per_second_out: number | null;
   max_connections: number | null; max_connections_per_ip: number | null;
@@ -59,12 +75,68 @@ function number(value: unknown, min = 0): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min) throw new LinksPayloadError();
   return value;
 }
+function boundedNumber(value: unknown, min: number, max: number): number {
+  const result = number(value, min);
+  if (result > max) throw new LinksPayloadError();
+  return result;
+}
 function text(value: unknown): string {
   if (typeof value !== "string") throw new LinksPayloadError();
   return value;
 }
 const nullableNumber = (value: unknown) => value == null ? null : number(value);
 const nullableText = (value: unknown) => value == null ? null : text(value);
+/** Host and port are separate. The browser's IPv6 URL parser validates raw colon-containing IPs. */
+export function isLinkTargetHost(host: string): boolean {
+  if (!host || host.length > 255 || /[\s/\\\x00-\x1f\x7f\[\]]/.test(host)) return false;
+  if (!host.includes(":")) return true;
+  try { return new URL(`http://[${host}]/`).hostname.startsWith("["); }
+  catch { return false; }
+}
+/** Strict bounded parser and closed projection shared by response and form boundaries. */
+export function projectLinkTargetSet(value: unknown): LinkTargetSet {
+  const raw = object(value);
+  if (raw.version !== 1 || !["fallback", "round_robin", "random"].includes(text(raw.strategy))
+    || !["tcp", "none"].includes(text(raw.probe))) throw new LinksPayloadError();
+  const input = array(raw.targets);
+  if (!input.length || input.length > LINK_TARGET_LIMIT) throw new LinksPayloadError();
+  const seen = new Set<string>();
+  const targets = input.map((value): LinkTarget => {
+    const target = object(value);
+    const host = text(target.host);
+    if (!isLinkTargetHost(host)) throw new LinksPayloadError();
+    const port = boundedNumber(target.port, 1, 65_535);
+    const key = JSON.stringify([host.toLowerCase(), port]);
+    if (seen.has(key)) throw new LinksPayloadError();
+    seen.add(key);
+    return { host, port };
+  });
+  return { version: 1, targets, strategy: raw.strategy as LinkTargetSet["strategy"],
+    failure_seconds: boundedNumber(raw.failure_seconds, 10, 3600),
+    recover_seconds: boundedNumber(raw.recover_seconds, 10, 3600), probe: raw.probe as LinkTargetSet["probe"] };
+}
+function projectTargetStatus(value: unknown): LinkTargetStatus[] {
+  const rows = array(value);
+  if (rows.length > 500) throw new LinksPayloadError();
+  const seen = new Set<number>();
+  return rows.map((value): LinkTargetStatus => {
+    const raw = object(value);
+    const forward_id = boundedNumber(raw.forward_id, 1, 2_147_483_647);
+    if (seen.has(forward_id)) throw new LinksPayloadError();
+    seen.add(forward_id);
+    const input = array(raw.states);
+    if (!input.length || input.length > LINK_TARGET_LIMIT) throw new LinksPayloadError();
+    const states = input.map((value) => {
+      if (!["unknown", "healthy", "suspect", "recovering", "unhealthy"].includes(text(value))) throw new LinksPayloadError();
+      return value as LinkTargetHealth;
+    });
+    if (!["initial", "selected", "target_failed", "target_recovered", "all_unavailable"].includes(text(raw.reason))) throw new LinksPayloadError();
+    const selected = (value: unknown) => value === null ? null : boundedNumber(value, 0, states.length - 1);
+    return { forward_id, states, selected_tcp: selected(raw.selected_tcp), selected_udp: selected(raw.selected_udp),
+      last_checked_at: raw.last_checked_at === null ? null : trafficReceivedAt(raw.last_checked_at),
+      reason: raw.reason as LinkTargetStatus["reason"] };
+  });
+}
 function counter(value: unknown): string {
   const result = /^(?:0|[1-9][0-9]*)$/.exec(text(value));
   // Preserve the complete canonical decimal rather than a normalized number.
@@ -111,7 +183,8 @@ function projectObservation(value: unknown): LinkObservation | null {
   if (raw.ready !== null && typeof raw.ready !== "boolean") throw new LinksPayloadError();
   return { state: text(raw.state), ready: raw.ready,
     observed_generation: nullableNumber(raw.observed_generation),
-    ...(raw.traffic_status === undefined ? {} : { traffic_status: projectTrafficStatus(raw.traffic_status) }) };
+    ...(raw.traffic_status === undefined ? {} : { traffic_status: projectTrafficStatus(raw.traffic_status) }),
+    ...(raw.target_status === undefined ? {} : { target_status: projectTargetStatus(raw.target_status) }) };
 }
 function array(value: unknown): unknown[] {
   if (!Array.isArray(value)) throw new LinksPayloadError();
@@ -137,9 +210,13 @@ export function projectLinkDetail(value: unknown, workspaceId: number): LinkDeta
   const forwards = array(row.forwards).map((value): LinkForward => {
     const f = object(value);
     if (!["tcp", "udp", "both"].includes(text(f.forward_protocol))) throw new LinksPayloadError();
+    const targetSet = f.target_set === undefined ? undefined : projectLinkTargetSet(f.target_set);
+    if (targetSet && (targetSet.targets[0].host.toLowerCase() !== text(f.remote_host).trim().toLowerCase()
+      || targetSet.targets[0].port !== f.remote_port)) throw new LinksPayloadError();
     return { id: number(f.id, 1), user_id: nullableNumber(f.user_id), name: text(f.name), forward_protocol: f.forward_protocol as LinkProtocol,
       listen_ip: nullableText(f.listen_ip), listen_port: number(f.listen_port, 1),
       remote_host: text(f.remote_host), remote_port: number(f.remote_port, 1),
+      ...(targetSet ? { target_set: targetSet } : {}),
       desired_status: text(f.desired_status), apply_status: text(f.apply_status),
       config_revision: number(f.config_revision), applied_revision: nullableNumber(f.applied_revision),
       bytes_per_second_in: nullableNumber(f.bytes_per_second_in), bytes_per_second_out: nullableNumber(f.bytes_per_second_out),

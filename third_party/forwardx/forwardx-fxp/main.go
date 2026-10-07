@@ -514,7 +514,13 @@ func main() {
 	trafficProducer := flag.String("managed-traffic-producer", "", "managed process traffic epoch")
 	trafficRotation := flag.String("managed-traffic-rotation-v1", "", "private managed traffic rotation control")
 	trafficCapabilities := flag.Bool("managed-traffic-capabilities", false, "report managed traffic protocol capabilities")
+	targetsV1 := flag.Bool("managed-targets-v1", false, "enable managed target sets v1")
+	targetCapabilities := flag.Bool("managed-target-capabilities", false, "report managed target protocol capabilities")
 	flag.Parse()
+	if *targetCapabilities {
+		fmt.Println(`{"managed_targets":1}`)
+		return
+	}
 	if *trafficCapabilities {
 		fmt.Println(`{"managed_traffic_rotation":1}`)
 		return
@@ -522,12 +528,15 @@ func main() {
 	if *configPath == "" {
 		log.Fatal("missing -config")
 	}
-	cfg, err := readConfig(*configPath)
+	cfg, err := readConfig(*configPath, *targetsV1)
 	if err != nil {
 		log.Fatalf("read config: %v", err)
 	}
 	if err := validateConfig(cfg); err != nil {
 		log.Fatalf("invalid config: %v", err)
+	}
+	if len(cfg.TargetSets) > 0 && !managedEnabled(*configPath) {
+		log.Fatal("managed target sets require managed reload")
 	}
 	var traffic *managedTraffic
 	if *trafficPath != "" || *trafficProducer != "" {
@@ -581,7 +590,7 @@ func main() {
 	)
 	ctx := shutdownContext()
 	if managedEnabled(*configPath) {
-		err = runManaged(ctx.done, *configPath)
+		err = runManaged(ctx.done, *configPath, *targetsV1)
 	} else {
 		switch strings.ToLower(cfg.Role) {
 		case "entry":
@@ -1827,9 +1836,11 @@ func handleExitSessionWithStartup(conn net.Conn, cfg config, startupComplete fun
 		managed.mu.RLock()
 	}
 	authErr := authorizeHello(cfg, &hello)
+	var targetPool *managedTargetPool
 	if managed != nil {
 		if authErr == nil {
 			managed.clients.Store(conn, hello.RuleID)
+			targetPool = managed.policy.Load().pools[hello.RuleID]
 		}
 		managed.mu.RUnlock()
 		defer managed.clients.Delete(conn)
@@ -1854,52 +1865,111 @@ func handleExitSessionWithStartup(conn net.Conn, cfg config, startupComplete fun
 	}
 	switch strings.ToLower(hello.Network) {
 	case "udp":
+		if targetPool != nil {
+			target, index, err := managed.dialTarget(targetPool, "udp")
+			if err != nil {
+				return err
+			}
+			defer target.Close()
+			managed.mu.RLock()
+			if managed.policy.Load().pools[hello.RuleID] != targetPool || !targetPool.available(index) {
+				managed.mu.RUnlock()
+				return errors.New("managed target policy replaced")
+			}
+			managed.udpCarriers.Store(conn, managedUDPBinding{pool: targetPool, index: index})
+			managed.mu.RUnlock()
+			defer managed.udpCarriers.Delete(conn)
+			hello.TargetIP, hello.TargetPort = targetPool.set.Targets[index].Host, targetPool.set.Targets[index].Port
+			return handleExitUDP(sec, hello, target.(*net.UDPConn))
+		}
+		if managed != nil {
+			target, err := managed.dialLegacyTarget(hello)
+			if err != nil {
+				return err
+			}
+			defer target.Close()
+			return handleExitUDP(sec, hello, target.(*net.UDPConn))
+		}
 		return handleExitUDP(sec, hello)
 	default:
+		if targetPool != nil {
+			target, index, err := managed.dialTarget(targetPool, "tcp")
+			if err != nil {
+				return err
+			}
+			defer target.Close()
+			hello.TargetIP, hello.TargetPort = targetPool.set.Targets[index].Host, targetPool.set.Targets[index].Port
+			return handleExitTCP(sec, hello, target)
+		}
+		if managed != nil {
+			target, err := managed.dialLegacyTarget(hello)
+			if err != nil {
+				return err
+			}
+			defer target.Close()
+			return handleExitTCP(sec, hello, target)
+		}
 		return handleExitTCP(sec, hello)
 	}
 }
 
-func handleExitTCP(sec *secureConn, hello helloFrame) error {
-	target, err := dialTCP(hello.TargetIP, hello.TargetPort, 10*time.Second)
-	if err != nil {
-		return fmt.Errorf("dial target: %w", err)
+func handleExitTCP(sec *secureConn, hello helloFrame, selected ...net.Conn) error {
+	var target net.Conn
+	if len(selected) > 0 {
+		target = selected[0]
+	} else {
+		var err error
+		target, err = dialTCP(hello.TargetIP, hello.TargetPort, 10*time.Second)
+		if err != nil {
+			return fmt.Errorf("dial target: %w", err)
+		}
 	}
 	defer target.Close()
 	if hello.ProxyProtocolExitSend && hello.ProxySourceIP != "" && hello.ProxySourcePort > 0 {
-		fxpVerbosef(
-			"exit proxy protocol send tunnel=%d rule=%d source=%s:%d dest=%s:%d target=%s:%d",
-			hello.TunnelID,
-			hello.RuleID,
-			hello.ProxySourceIP,
-			hello.ProxySourcePort,
-			hello.ProxyDestIP,
-			hello.ProxyDestPort,
-			hello.TargetIP,
-			hello.TargetPort,
-		)
+		if len(selected) == 0 {
+			fxpVerbosef(
+				"exit proxy protocol send tunnel=%d rule=%d source=%s:%d dest=%s:%d target=%s:%d",
+				hello.TunnelID,
+				hello.RuleID,
+				hello.ProxySourceIP,
+				hello.ProxySourcePort,
+				hello.ProxyDestIP,
+				hello.ProxyDestPort,
+				hello.TargetIP,
+				hello.TargetPort,
+			)
+		}
 		if _, err := target.Write(formatProxyProtocol(hello)); err != nil {
 			return fmt.Errorf("write proxy protocol: %w", err)
 		}
-	} else if hello.ProxyProtocolExitSend {
+	} else if hello.ProxyProtocolExitSend && len(selected) == 0 {
 		fxpVerbosef("exit proxy protocol skipped tunnel=%d rule=%d target=%s:%d missingSource=%v", hello.TunnelID, hello.RuleID, hello.TargetIP, hello.TargetPort, hello.ProxySourceIP == "" || hello.ProxySourcePort <= 0)
 	}
-	fxpVerbosef("exit tcp routed tunnel=%d rule=%d peer=%s target=%s:%d", hello.TunnelID, hello.RuleID, sec.conn.RemoteAddr(), hello.TargetIP, hello.TargetPort)
+	if len(selected) == 0 {
+		fxpVerbosef("exit tcp routed tunnel=%d rule=%d peer=%s target=%s:%d", hello.TunnelID, hello.RuleID, sec.conn.RemoteAddr(), hello.TargetIP, hello.TargetPort)
+	}
 	return proxyPlainSecure(target, sec, nil, nil, nil)
 }
 
-func handleExitUDP(sec *secureConn, hello helloFrame) error {
-	targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(hello.TargetIP, strconv.Itoa(hello.TargetPort)))
-	if err != nil {
-		return err
-	}
-	target, err := net.DialUDP("udp", nil, targetAddr)
-	if err != nil {
-		return err
+func handleExitUDP(sec *secureConn, hello helloFrame, selected ...*net.UDPConn) error {
+	var target *net.UDPConn
+	if len(selected) > 0 {
+		target = selected[0]
+	} else {
+		targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(hello.TargetIP, strconv.Itoa(hello.TargetPort)))
+		if err != nil {
+			return err
+		}
+		target, err = net.DialUDP("udp", nil, targetAddr)
+		if err != nil {
+			return err
+		}
 	}
 	tuneUDPConn(target, "exit target", fxpUDPSessionBufferBytes)
 	defer target.Close()
-	fxpVerbosef("exit udp session routed tunnel=%d rule=%d peer=%s target=%s:%d", hello.TunnelID, hello.RuleID, sec.conn.RemoteAddr(), hello.TargetIP, hello.TargetPort)
+	if len(selected) == 0 {
+		fxpVerbosef("exit udp session routed tunnel=%d rule=%d peer=%s target=%s:%d", hello.TunnelID, hello.RuleID, sec.conn.RemoteAddr(), hello.TargetIP, hello.TargetPort)
+	}
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
 	touch := func() { lastActivity.Store(time.Now().UnixNano()) }
@@ -1950,7 +2020,7 @@ func handleExitUDP(sec *secureConn, hello helloFrame) error {
 			touch()
 		}
 	}()
-	err = <-errCh
+	err := <-errCh
 	_ = target.Close()
 	_ = sec.conn.Close()
 	if err != nil && !isClosedErr(err) {

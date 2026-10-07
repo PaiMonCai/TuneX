@@ -63,6 +63,7 @@ type Observation struct {
 	LastError           string         `json:"last_error,omitempty"`
 	Logs                []string       `json:"logs,omitempty"`
 	TrafficStatus       *TrafficStatus `json:"traffic_status,omitempty"`
+	TargetStatus        []TargetStatus `json:"target_status,omitempty"`
 }
 
 // Accounting receipt is independent of runtime readiness. Counts describe
@@ -79,6 +80,7 @@ type TrafficStatus struct {
 
 var (
 	ErrInvalidConfig      = errors.New("linkrunner: invalid config")
+	ErrTargetCapability   = errors.New("agent_fxp_targets_capability_missing")
 	ErrDigestMismatch     = errors.New("linkrunner: config digest mismatch")
 	ErrStaleGeneration    = errors.New("linkrunner: stale generation")
 	ErrGenerationConflict = errors.New("linkrunner: generation content conflict")

@@ -17,6 +17,7 @@ import {
 // 远端出口腿支持边界只有一处定义（`federation/forward-hop.ts`），
 // 校验与运行期必须用同一个集合 —— 各写一份就是"preview 放行、rollout 拒绝"的来源。
 import { FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS } from "./federation/forward-hop.ts";
+import { LinkTargetSetSchema, persistedLinkTargetSet, targetSetMatchesFirst, type LinkTargetSet } from "../integrations/forwardx/target-set.ts";
 
 /* ================================================================== */
 /* 契约类型                                                            */
@@ -28,6 +29,7 @@ export type ForwardDesiredStatus = "active" | "inactive";
 export interface ForwardCandidateConfig extends ForwardPolicyInput {
   /** Internal Link provenance; HTTP callers cannot forge this field. */
   link_resource_id?: number | null;
+  target_set?: LinkTargetSet | null;
   name: string;
   mode: ForwardMode;
   /** Persisted protocol fact; validation separately decides whether it is admitted. */
@@ -79,6 +81,7 @@ export interface ForwardRevisionUpdateInput extends ForwardCandidatePatch {
 /** 当前 desired config 所在的最小行投影（tunnel 行 + 可选 snapshot）。 */
 export interface ForwardRevisionRow extends ForwardPolicyInput {
   link_resource_id?: number | null;
+  link_target_config?: unknown;
   id: number;
   workspace_id: number;
   name: string;
@@ -244,6 +247,8 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
   return {
     ...forwardPolicyValues(row),
     link_resource_id: row.link_resource_id ?? null,
+    ...(row.link_resource_id != null && row.link_target_config != null
+      ? { target_set: persistedLinkTargetSet(row.link_target_config) } : {}),
     name: row.name,
     mode: row.tunnel_mode === "relay" ? "relay" : "direct",
     protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
@@ -280,6 +285,8 @@ export function mergeForwardCandidate(
   return {
     ...mergeForwardPolicy(base, patch),
     link_resource_id: patch.link_resource_id !== undefined ? patch.link_resource_id : base.link_resource_id,
+    ...(patch.target_set !== undefined || base.target_set !== undefined
+      ? { target_set: patch.target_set !== undefined ? patch.target_set : base.target_set } : {}),
     name: patch.name !== undefined ? patch.name : base.name,
     mode: patch.mode !== undefined ? patch.mode : base.mode,
     protocol: patch.protocol !== undefined ? patch.protocol : base.protocol,
@@ -316,6 +323,7 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
   return (
     sameForwardPolicy(base, candidate) &&
     (base.link_resource_id ?? null) === (candidate.link_resource_id ?? null) &&
+    JSON.stringify(base.target_set ?? null) === JSON.stringify(candidate.target_set ?? null) &&
     base.mode === candidate.mode &&
     persistedForwardProtocol(base.protocol) === persistedForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
@@ -916,6 +924,7 @@ export async function ensureForwardBaselineRevision(
         max_connections_per_ip: true,
         link_resource_id: true,
         ingress_node_id: true,
+        link_target_config: true,
         egress_node_id: true,
         middle_node_id: true,
         listen_ip: true,
@@ -959,7 +968,9 @@ export async function ensureForwardBaselineRevision(
               select: { host: true, port: true, weight: true, order_by: true },
             })
           : [];
-      const baselineTargets = row.link_resource_id != null && row.remote_host && row.remote_port
+      const baselineSet = row.link_resource_id != null ? persistedLinkTargetSet(row.link_target_config) : undefined;
+      const baselineTargets = baselineSet ? baselineSet.targets.map((target, index) => ({ ...target, weight: 1, order_by: index })) :
+        row.link_resource_id != null && row.remote_host && row.remote_port
         ? [{ host: row.remote_host, port: row.remote_port, weight: 1, order_by: 1000 }] : egressTargets;
       const targets =
         baselineTargets.length > 0
@@ -977,6 +988,7 @@ export async function ensureForwardBaselineRevision(
             protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
             ...forwardPolicyValues(row),
             link_resource_id: row.link_resource_id,
+            link_target_config: baselineSet ?? Prisma.JsonNull,
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
             middle_node_id: row.middle_node_id,
@@ -1050,6 +1062,7 @@ export async function createForwardRevision(
         max_connections_per_ip: true,
         link_resource_id: true,
         name: true,
+        link_target_config: true,
         tunnel_mode: true,
         tunnel_type: true,
         forward_protocol: true,
@@ -1102,6 +1115,13 @@ export async function createForwardRevision(
     // 目标作为这一版 revision 的运行态事实进 snapshot，apply 时随 grant 交给 host。
     const federatedPeer = normalizeFederatedEgressPeer(input.candidate.federated_egress_peer);
     const linkRelay = linkedId != null && input.candidate.mode === "relay";
+    const requestedTargetSet = input.candidate.target_set === undefined && linkRelay
+      ? persistedLinkTargetSet(row.link_target_config) : input.candidate.target_set;
+    const targetSet = requestedTargetSet == null ? undefined : LinkTargetSetSchema.parse(requestedTargetSet);
+    if (targetSet && (!linkRelay || !targetSetMatchesFirst(targetSet,
+      input.candidate.target_host ?? "", input.candidate.target_port ?? 0))) {
+      throw new ForwardRevisionError("invalid_input", "invalid_link_target_set");
+    }
     const federatedRelay = (federatedPeer !== null || linkRelay) && input.candidate.mode === "relay";
     const relayTargets =
       federatedRelay && (linkRelay || !input.egressTargets || input.egressTargets.length === 0)
@@ -1114,6 +1134,7 @@ export async function createForwardRevision(
     }
 
     const targets =
+      targetSet ? targetSet.targets.map((target, index) => ({ ...target, weight: 1, order_by: index })) :
       !linkRelay && input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
         ? (input.egressTargets as unknown as Prisma.InputJsonValue)
         : relayTargets && relayTargets.length > 0
@@ -1132,6 +1153,7 @@ export async function createForwardRevision(
           protocol,
           ...policy,
           link_resource_id: linkedId ?? null,
+          link_target_config: targetSet ?? Prisma.JsonNull,
           ingress_node_id: input.candidate.ingress_node_id,
           egress_node_id: input.candidate.egress_node_id,
           middle_node_id: input.candidate.middle_node_id ?? null,
@@ -1179,6 +1201,7 @@ export async function createForwardRevision(
       data: {
         // ── 兼容投影列：socket/config-generator 与旧 Agent 的唯一读取源 ──
         ...(linkedId != null ? { egress_pool_id: null } : {}),
+        ...(linkedId != null ? { link_target_config: targetSet ?? Prisma.JsonNull } : {}),
         name: input.candidate.name.trim(),
         tunnel_mode: input.candidate.mode,
         forward_protocol: protocol,
