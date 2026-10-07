@@ -74,7 +74,7 @@ Link 应用或删除成功后，Agent 在发送命令 ACK 前主动上报当前�
 - Linux 容器实际镜像构建、MySQL 迁移与数据库并发租约门禁。
 - Panel/Worker、多 Agent 的真实网络部署、共享更新保留原 TCP 会话和原 UDP 目标 socket、重启恢复与事实上报。
 
-本机无 Docker/可用 Linux 环境。CI 的 `core-integration` 执行 `scripts/integration/abcd-core-gate.sh`，进入统一 required 检查。候选 `777a94b` 与 `4b2c9d2` 均已在四 Agent、Panel/Worker、MySQL/Redis 的真实 Linux 拓扑通过 35 项验收；包含双协议转发、共享规则更新、同日增量、重复去重、历史保留及重启恢复。`4b2c9d2` 后端的 3169 项 unit/contract 与 111 项数据库/HTTP 集成也通过，Agent 存在一次启动 fixture 失败，正在修复。最终候选和统一门禁结果见统计记录。公共支持矩阵继续 planned；长期统计容量、可信来源与更多目标组合仍需独立发布验收。
+本机无 Docker/可用 Linux 环境。CI 的 `core-integration` 执行 `scripts/integration/abcd-core-gate.sh`，进入统一 required 检查。最终修复候选 `827d9d8` 的 [CI `37642785485`](https://github.com/PaiMonCai/TuneX/actions/runs/37642785485) 已全部通过，包括完整后端/前端/Agent、迁移与 TypeScript、统计并发压力/旧快照交错，以及四 Agent、Panel/Worker、MySQL/Redis 的真实 Linux 拓扑 **35 项 / 0 失败**。先前统计并发与 Agent fixture 失败及定位过程保留在统计记录中。公共支持矩阵继续 planned；长期统计容量、可信来源与更多目标组合仍需独立发布验收。
 
 ## 4. 测试环境启动
 

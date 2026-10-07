@@ -77,4 +77,22 @@ Agent 测试修复在 HTTP fetch 期间持续预留子进程端口；强制 bind
 
 本地修复后的统计事务/HTTP 15 项和后端 TypeScript 均通过。本机没有可用 MySQL，确定性交错和完整并发压力的结果必须由候选提交 CI 实证。
 
-下一优先级：完成修复候选的统一门禁 → 长期活动统计历史裁剪 → 可信客户端来源透传/IP_HASH 和 FXP 多目标主备。复杂拓扑、运营和支付不抢占这些核心验收。
+### 修复候选的最终验收
+
+修复已提交推送 `827d9d82a07680218104fb892c0427844fcd1108`。[CI `37642785485`](https://github.com/PaiMonCai/TuneX/actions/runs/37642785485) 的 backend、web、agent、core-integration、ops、secret-scan 和统一 required **全部通过**。
+
+| 验证范围 | 实际结果 |
+| --- | --- |
+| 完整后端 unit/contract、空库迁移、Prisma client 与 TypeScript | **3169 pass / 0 fail**（164 文件）；迁移、client 与类型检查通过 |
+| 完整数据库/HTTP 集成 | **111 pass / 0 fail / 0 skipped**；统计 gate 包含 20 轮 × 10 个并发事务，每轮重新创建 producer，逐轮校验水位与两条规则的真实日账本金额 |
+| 确定性旧快照交错 | 通过；先建立看不到统计行的 REPEATABLE READ 快照，再由另一个事务创建/提交，旧事务的锁内更新仍成功，最终精确入账 60 字节 |
+| Linux Agent 全量测试、vet、构建 | 通过；HTTP desired 端口竞争 fixture 修复和真实 FXP 测试包含在内 |
+| 前端全量测试、类型检查、production build | **1428 pass / 0 fail**（76 文件）；类型检查/build 通过。构建使用 CI mock API，不能据此宣称真实浏览器/生产接口验收完成 |
+| Linux 四 Agent + Panel/Worker + MySQL/Redis 核心验收 | **35 PASS / 0 FAIL**；已下载对应验收结果与脱敏诊断，artifact 为 `abcd-core-result` |
+| ops 与秘密扫描 | 通过 |
+
+该结果解决了本轮新统计写入的并发失败，不代表已经消除所有潜在数据库死锁；其他存储异常仍返回 503，由持久化 Agent 重投，未提交的数据不会被 ACK。无需扩大重试分类或放宽重复入账检查。
+
+开发与发布边界保持分离：保持实验开关默认关闭、公共组合 planned；长期活动历史回收、突发强杀窗口、跨节点总预算、可信来源和多目标组合仍是后续工作，不因本轮 CI 通过而自动开放。
+
+下一优先级：长期活动统计历史裁剪 → 可信客户端来源透传/IP_HASH → FXP 多目标主备。复杂拓扑、运营和支付不抢占这些核心验收。
