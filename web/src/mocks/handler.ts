@@ -284,7 +284,9 @@ export async function handleMock(method: string, path: string, req: MockRequest)
     const grants = mockEffectivePermissions(db, scopeMembership);
     const resource = seg[0] === "forwards" ? "forward" : "node";
     const action = method === "GET" ? "read" : resource === "node" ? "manage" :
-      method === "DELETE" ? "delete" : method === "POST" && seg[1] === undefined ? "create" : "update";
+      method === "DELETE" || (method === "POST" && seg[1] === "batch" && asRecord(req.body).action === "delete")
+        ? "delete"
+        : method === "POST" && seg[1] === undefined ? "create" : "update";
     if (!grants.permissions[`${resource}:${action}` as keyof typeof grants.permissions]) return fail(403, "工作空间角色无权操作", "permission_denied");
     if (resource === "forward" && method !== "GET" && parseId(seg[1]) !== null && grants.forward_mutations === "own") {
       const tunnel = db.tunnels.find((row) => row.id === parseId(seg[1]));

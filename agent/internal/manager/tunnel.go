@@ -61,9 +61,14 @@ type entry struct {
 
 // TunnelManager is the concurrency-safe registry of running tunnels.
 type TunnelManager struct {
-	mu       sync.RWMutex
-	tunnels  map[string]*entry
-	usedPort map[string]bool // "<socket namespace>:<port>" guard shared with EgressManager
+	mu      sync.RWMutex
+	tunnels map[string]*entry
+	// removedRevision is a versioned delete tombstone. Once a control-plane
+	// remove at revision N is acknowledged, an apply snapshot at revision <= N
+	// must not be able to resurrect that runtime merely because the live entry
+	// is no longer present in the registry.
+	removedRevision map[string]int64
+	usedPort        map[string]bool // "<socket namespace>:<port>" guard shared with EgressManager
 
 	// stoppingPorts 记录"Stop 已经发起、但监听还没真正关闭"的端口 —— 带**截止时间**的挂账。
 	//
@@ -205,11 +210,12 @@ func (m *TunnelManager) notifyIfChanged(before string) {
 // EGRESS tunnels are then rejected. listenHost may be empty.
 func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 	return &TunnelManager{
-		tunnels:       make(map[string]*entry),
-		usedPort:      make(map[string]bool),
-		stoppingPorts: make(map[string]stoppingNote),
-		egress:        egress,
-		listenHost:    listenHost,
+		tunnels:         make(map[string]*entry),
+		removedRevision: make(map[string]int64),
+		usedPort:        make(map[string]bool),
+		stoppingPorts:   make(map[string]stoppingNote),
+		egress:          egress,
+		listenHost:      listenHost,
 	}
 }
 
@@ -358,6 +364,11 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 		return nil, ErrNodeShuttingDown
 	}
 
+	if removed, ok := m.removedRevision[normalized.ID]; ok &&
+		normalized.Revision != revisionUnknown &&
+		normalized.Revision <= removed {
+		return nil, ErrStaleRevision
+	}
 	if cur, ok := m.tunnels[normalized.ID]; ok {
 		if isStale(normalized.Revision, cur.cfg.Revision) {
 			return nil, ErrStaleRevision
@@ -368,7 +379,11 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 			return cur.fwd, nil
 		}
 	}
-	return m.applyLocked(normalized)
+	fwd, err := m.applyLocked(normalized)
+	if err == nil {
+		delete(m.removedRevision, normalized.ID)
+	}
+	return fwd, err
 }
 
 // buildLocked builds the data-plane runtime. Caller must hold m.mu.
@@ -647,20 +662,25 @@ func (m *TunnelManager) Remove(id string) error {
 	return err
 }
 
+// RemoveAtRevision is the versioned control-plane remove. It records the
+// acknowledged remove revision even after the live entry is gone, preventing a
+// stale desired snapshot from rebuilding the listener after deletion.
+func (m *TunnelManager) RemoveAtRevision(id string, revision int64) error {
+	before := m.fingerprint()
+	removed, err := m.removeInnerIf(id, nil, revision)
+	if err == nil && removed {
+		m.notifyIfChanged(before)
+	}
+	return err
+}
+
 // RemoveIf removes a tunnel only while cond still holds for its live config.
 //
-// It exists for the ownership lease clock: the ownership guard observes "this
-// tunnel's authorisation has lapsed", but between that observation and the stop
-// a renewal may have arrived. Evaluating cond under the manager's lock turns
-// check-then-act into check-and-act, so a tunnel that was just renewed is not
-// killed by a decision made on a stale read.
-//
-// It returns whether the tunnel was actually removed. cond runs while the
-// manager's lock is held, so it must be pure and must never call back into the
-// manager (a nil cond always removes, which is exactly Remove).
+// Lease-clock removals are intentionally unversioned: they are local safety
+// decisions, not a control-plane revision statement.
 func (m *TunnelManager) RemoveIf(id string, cond func(forwarder.TunnelConfig) bool) (bool, error) {
 	before := m.fingerprint()
-	removed, err := m.removeInnerIf(id, cond)
+	removed, err := m.removeInnerIf(id, cond, revisionUnknown)
 	if err == nil && removed {
 		m.notifyIfChanged(before)
 	}
@@ -668,15 +688,23 @@ func (m *TunnelManager) RemoveIf(id string, cond func(forwarder.TunnelConfig) bo
 }
 
 func (m *TunnelManager) removeInner(id string) error {
-	_, err := m.removeInnerIf(id, nil)
+	_, err := m.removeInnerIf(id, nil, revisionUnknown)
 	return err
 }
 
-// removeInnerIf is the locked body of Remove/RemoveIf. Caller must not hold m.mu.
-func (m *TunnelManager) removeInnerIf(id string, cond func(forwarder.TunnelConfig) bool) (bool, error) {
+// removeInnerIf is the locked body of Remove/RemoveIf/RemoveAtRevision.
+// Caller must not hold m.mu.
+func (m *TunnelManager) removeInnerIf(
+	id string,
+	cond func(forwarder.TunnelConfig) bool,
+	revision int64,
+) (bool, error) {
 	m.mu.Lock()
 	e, ok := m.tunnels[id]
 	if !ok {
+		if revision != revisionUnknown && revision > m.removedRevision[id] {
+			m.removedRevision[id] = revision
+		}
 		m.mu.Unlock()
 		return false, nil
 	}
@@ -685,10 +713,19 @@ func (m *TunnelManager) removeInnerIf(id string, cond func(forwarder.TunnelConfi
 		m.mu.Unlock()
 		return false, nil
 	}
+	if revision != revisionUnknown &&
+		e.cfg.Revision != revisionUnknown &&
+		revision < e.cfg.Revision {
+		m.mu.Unlock()
+		return false, ErrStaleRevision
+	}
 	delete(m.tunnels, id)
+	if revision != revisionUnknown && revision > m.removedRevision[id] {
+		m.removedRevision[id] = revision
+	}
 	m.releasePortLocked(e.cfg)
-	// 按事实重建：Remove 的既有契约是"立即释放"（swap_test 明确钉住了这条语义 —— 排空不是移除，
-	// 移除就该把端口交出来），所以这里**不**登记 stopping；重建只是把任何漂移的键抹平。
+	// Remove means the listener is no longer part of desired local runtime.
+	// Rebuild the derived port guard immediately, exactly as the legacy path did.
 	m.rebuildPortGuardLocked()
 	m.mu.Unlock()
 

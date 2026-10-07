@@ -10,11 +10,12 @@
  *   2. 限流规则必须在 `api-global` 之前命中（否则 3/min 的上限形同虚设）。
  */
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { selectRule } from "../../middlewares/rate-limit.ts";
 import { GLOBAL_RATE_LIMIT_RULES } from "../../middlewares/rate-limit.ts";
 
-const ROOT = new URL("../..", import.meta.url).pathname; // → .../backend/src/
+const ROOT = fileURLToPath(new URL("../..", import.meta.url)); // → .../backend/src/
 
 interface BatchCall {
   ids: number[];
@@ -144,7 +145,7 @@ describe("V4-WP9 POST /api/forwards/batch", () => {
     expect(calls.batch[0]!.ids).toEqual([4, 6]);
   });
 
-  test("破坏性动作被拒（delete 不进批量白名单）", async () => {
+  test("删除未确认被拒（不得执行任何一条）", async () => {
     const res = await postBatch({ action: "delete", ids: [1, 2] });
     expect(res.status).toBe(400);
     expect(calls.batch.length).toBe(0);

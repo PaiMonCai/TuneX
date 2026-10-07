@@ -1018,10 +1018,10 @@ export const TUNNEL_MODES = ["direct", "relay"] as const;
  * V4-WP9 §13.6：批量动作白名单（mock 侧镜像）。
  *
  * 与后端 `services/forward-batch.ts` 的 `FORWARD_BATCH_ACTIONS` **必须一致**：
- * 不含 delete（不可逆动作不提供批量入口）。上限同理——mock 必须拒绝同样的
- * 请求，否则本地开发会通过、线上 400。
+ * delete 仅在显式确认 + 实验开关开启时可执行。上限同理——mock 必须拒绝同样的
+ * 请求，否则本地开发会通过、线上行为不同。
  */
-export const FORWARD_BATCH_ACTIONS = ["retry", "suspend", "resume"] as const;
+export const FORWARD_BATCH_ACTIONS = ["retry", "suspend", "resume", "delete"] as const;
 export const FORWARD_BATCH_MAX_IDS = 50;
 
 export type MockForwardBatchAction = (typeof FORWARD_BATCH_ACTIONS)[number];

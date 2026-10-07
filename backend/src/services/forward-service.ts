@@ -1701,16 +1701,11 @@ export async function runForwardAction(
 }
 
 /**
- *  §13.6：批量 retry / suspend / resume。
- *
- * 形态约束（与 `forward-batch.ts` 的决策文档一致）：
- *   · **顺序执行**，不并发：每个 action 都可能触发 rollout（下发 + 租约），
- *     并发对同一入口节点发起 N 个动作会让 apply 状态机互相踩踏；
- *   · **逐条结果** 一条失败不影响其它条，返回 `{ id, ok, code, message }`，
- *     部分失败对用户可见——这是「批量删除不做」的同一条理由的反面（删除的
- *     部分成功无法解释，retry/suspend 的部分成功可以）；
- *   · 工作空间作用域由 `runForwardAction` 内部检查（越权 id 得到 404，
- *     不泄漏其它工作空间的行是否存在）。
+ * Sequential per-resource actions; never bypass single-resource lifecycle.
+ * ForwardX deleteBatch processing semantics, adapted to TuneX rollout/fencing:
+ * scope before ownership, isolated failures and explicit per-item outcomes.
+ * Delete success means the single-delete service completed; it does not promise
+ * immediate confirmation from a disconnected federated peer.
  */
 export async function runForwardBatch(
   ids: number[],
@@ -1720,34 +1715,55 @@ export async function runForwardBatch(
 ): Promise<ForwardBatchPayload> {
   const results: ForwardBatchItemResult[] = [];
   for (const id of ids) {
-    // Scope before RBAC: a foreign ID remains 404, never an existence oracle.
-    if (authorize) {
-      const row = await loadForwardRow(id, workspaceId);
-      if (!row) {
-        results.push({ id, ok: false, apply_status: null, code: "not_found", message: "端口转发不存在" });
-        continue;
+    try {
+      // Scope before RBAC: a foreign ID remains 404, never an existence oracle.
+      if (authorize) {
+        const row = await loadForwardRow(id, workspaceId);
+        if (!row) {
+          results.push({ id, ok: false, apply_status: null, code: "not_found", error_layer: "resource_scope", message: "端口转发不存在" });
+          continue;
+        }
+        if (!authorize(row)) {
+          // Same code as the single-resource endpoint: a per-item RBAC refusal.
+          results.push({ id, ok: false, apply_status: null, code: "forbidden", error_layer: "rbac", message: "无权操作该端口转发" });
+          continue;
+        }
       }
-      if (!authorize(row)) {
-        // Same code as the single-resource endpoint: a per-item RBAC refusal.
-        results.push({ id, ok: false, apply_status: null, code: "forbidden", error_layer: "rbac", message: "无权操作该端口转发" });
-        continue;
+      // Reuse the single-delete lifecycle (rollout, local leases, dedicated pool,
+      // federated leg release), never bulk-delete desired rows directly.
+      const outcome = action === "delete"
+        ? await deleteForward(id, workspaceId)
+        : await runForwardAction(id, action, workspaceId);
+      if (outcome.ok) {
+        const deleteReceipt = action === "delete" && "reconciliation_pending" in outcome.data
+          ? outcome.data as ForwardDeleteReceipt
+          : null;
+        results.push({
+          id,
+          ok: true,
+          apply_status: "apply_status" in outcome.data ? outcome.data.apply_status ?? null : null,
+          ...(deleteReceipt ? {
+            reconciliation_pending: deleteReceipt.reconciliation_pending,
+            ...(deleteReceipt.warning_code ? { warning_code: deleteReceipt.warning_code } : {}),
+            ...(deleteReceipt.warning_message ? { warning_message: deleteReceipt.warning_message } : {}),
+          } : {}),
+        });
+      } else {
+        results.push({
+          id,
+          ok: false,
+          apply_status: null,
+          code: outcome.code,
+          message: outcome.message,
+          apply_error_code: outcome.apply_error_code,
+          error_layer: outcome.error_layer,
+        });
       }
-    }
-    const outcome = await runForwardAction(id, action, workspaceId);
-    if (outcome.ok) {
-      results.push({
-        id,
-        ok: true,
-        apply_status: outcome.data.apply_status ?? null,
-      });
-    } else {
-      results.push({
-        id,
-        ok: false,
-        apply_status: null,
-        code: outcome.code,
-        message: outcome.message,
-      });
+    } catch {
+      // Like ForwardX deleteBatch, a thrown error must not erase prior results
+      // or prevent later IDs from running. Do not return raw DB/transport errors.
+      console.error("[forward-batch] unexpected per-item failure", { id, action, workspaceId });
+      results.push({ id, ok: false, apply_status: null, code: "internal_error", message: "操作异常，请刷新核对该转发状态后重试" });
     }
   }
   return { action, ...forwardBatchSummary(results), results };
@@ -1759,10 +1775,17 @@ export type ForwardBatchPayload = {
   results: ForwardBatchItemResult[];
 };
 
+export interface ForwardDeleteReceipt {
+  ok: true;
+  reconciliation_pending: boolean;
+  warning_code?: "federation_release_pending" | "federation_release_unconfirmed";
+  warning_message?: string;
+}
+
 export async function deleteForward(
   id: number,
   workspaceId: number,
-): Promise<ForwardServiceResult<{ ok: true }>> {
+): Promise<ForwardServiceResult<ForwardDeleteReceipt>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
 
@@ -1800,13 +1823,41 @@ export async function deleteForward(
   // 顺序按契约 §3.3（先本地入口停 → 再远端释放）：这里本地已经删完。
   // 释放失败不把删除回滚成错误（用户视角的删除已经成功，且租约到期会自然停服），
   // 但必须留下响亮的一行，并让 placement 行停在 degraded 等对账/运维收尾。
-  const releases = await releaseStaleFederatedEgressForTunnel(id, -1).catch(() => null);
-  if (releases && releases.failed.length > 0) {
+  const releases = await releaseStaleFederatedEgressForTunnel(id, -1).catch((cause) => {
+    console.warn("[forward] 删除 Forward 后无法确认远端出口释放状态", {
+      tunnel_id: id,
+      error: cause instanceof Error ? cause.name : "unknown",
+    });
+    return null;
+  });
+
+  if (releases === null) {
+    return {
+      ok: true,
+      data: {
+        ok: true,
+        reconciliation_pending: true,
+        warning_code: "federation_release_unconfirmed",
+        warning_message: "本地转发已删除，但远端出口释放状态暂无法确认；系统将继续对账。",
+      },
+    };
+  }
+
+  if (releases.failed.length > 0) {
     console.warn(
       `[forward] 删除 Forward ${id} 后仍有远端出口腿未确认释放：` +
         releases.failed.map((f) => `${f.intent_id}(${f.code})`).join(", "),
     );
+    return {
+      ok: true,
+      data: {
+        ok: true,
+        reconciliation_pending: true,
+        warning_code: "federation_release_pending",
+        warning_message: "本地转发已删除，但部分远端出口尚未确认释放；系统将继续对账。",
+      },
+    };
   }
 
-  return { ok: true, data: { ok: true } };
+  return { ok: true, data: { ok: true, reconciliation_pending: false } };
 }

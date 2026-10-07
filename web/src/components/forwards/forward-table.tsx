@@ -36,10 +36,11 @@ function SortableHead({ label, sortKey, sort, order, onSort }: {
 }
 
 export function ForwardTable({ forwards, loading, sort, order, selectedIds, allPageSelected, canUpdateAny, canCreate,
-  actionBusy, locale, t, text, canUpdate, canDelete, onSort, onSelectAll, onSelect, onAction, onEdit, onCopy, onDelete }: {
+  actionBusy, locale, t, text, canUpdate, canDelete, canSelect, selectionBusy = false, onSort, onSelectAll, onSelect, onAction, onEdit, onCopy, onDelete }: {
   forwards: PortForward[]; loading: boolean; sort: ForwardSortKey; order: ForwardSortOrder; selectedIds: Set<number>;
   allPageSelected: boolean; canUpdateAny: boolean; canCreate: boolean; actionBusy: number | null; locale: Locale;
   t: Translate; text: ListText; canUpdate: (forward: PortForward) => boolean; canDelete: (forward: PortForward) => boolean;
+  canSelect?: (forward: PortForward) => boolean; selectionBusy?: boolean;
   onSort: (key: ForwardSortKey) => void; onSelectAll: (checked: boolean) => void; onSelect: (id: number, checked: boolean) => void;
   onAction: (forward: PortForward, action: ForwardAction) => void; onEdit: (forward: PortForward) => void;
   onCopy: (forward: PortForward) => void; onDelete: (forward: PortForward) => void;
@@ -67,7 +68,7 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
             const product = forwardProductStatus(forward);
             return <TableRow key={String(forward.id)}>
               <TableCell><input type="checkbox" className="size-4 cursor-pointer" data-testid={`forward-select-${forward.id}`}
-                aria-label={text("forward.selectRow")} disabled={!canUpdate(forward)} checked={selectedIds.has(Number(forward.id))}
+                aria-label={text("forward.selectRow")} disabled={selectionBusy || !(canSelect ? canSelect(forward) : canUpdate(forward))} checked={selectedIds.has(Number(forward.id))}
                 onChange={(event) => onSelect(Number(forward.id), event.target.checked)} /></TableCell>
               <TableCell className="font-medium"><Link href={"/forwards/" + forward.id} className="hover:underline">{forward.name}</Link></TableCell>
               <TableCell><Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>{forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}</Badge></TableCell>

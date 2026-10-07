@@ -190,7 +190,7 @@ describe("批量操作上限与后端一致（读真实源码断言）", () => {
     expect(FORWARD_BATCH_MAX_IDS).toBe(Number(m![1]));
   });
 
-  test("批量动作白名单与后端一致（不含 delete：不可逆动作不给批量入口）", () => {
+  test("批量动作白名单与后端一致（delete 由运行时开关 + 明确确认单独保护）", () => {
     const backend = readFileSync(
       new URL("../../../../../backend/src/services/forward-batch.ts", import.meta.url),
       "utf8",
@@ -198,9 +198,8 @@ describe("批量操作上限与后端一致（读真实源码断言）", () => {
     const m = backend.match(/export const FORWARD_BATCH_ACTIONS\s*=\s*\[([^\]]+)\]/);
     expect(m).not.toBeNull();
     const actions = m![1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
-    expect(actions).toEqual(["retry", "suspend", "resume"]);
-    expect(actions).not.toContain("delete");
-    // 组件只把这三个动作发给后端
-    for (const action of actions) expect(COMPONENT).toContain(`"${action}"`);
+    expect(actions).toEqual(["retry", "suspend", "resume", "delete"]);
+    // 可逆动作仍由列表批量工作流直接使用；delete 由 batch bar + 确认模型单独保护。
+    for (const action of ["retry", "suspend", "resume"]) expect(COMPONENT).toContain(`"${action}"`);
   });
 });

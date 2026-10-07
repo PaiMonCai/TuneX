@@ -18,6 +18,7 @@ import { ForwardListControls } from "@/components/forwards/forward-list-controls
 import { ForwardTable } from "@/components/forwards/forward-table";
 import { ForwardCreateDialog } from "@/components/forwards/forward-create-dialog";
 import { ForwardBatchBar } from "@/components/forwards/forward-batch-bar";
+import { prepareForwardBatchRequest, submitForwardBatch } from "@/components/forwards/forward-batch-model";
 import { ForwardSummaryCards } from "@/components/forwards/forward-summary-cards";
 import { ForwardToolbar } from "@/components/forwards/forward-toolbar";
 import { ForwardEmptyState } from "@/components/forwards/forward-empty-state";
@@ -144,6 +145,9 @@ export function ForwardWorkspace() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
+  const [batchDeleteEnabled, setBatchDeleteEnabled] = useState(false);
+  /** Prevent double-submit and discard late results after workspace/permission changes. */
+  const batchFlight = useRef<symbol | null>(null);
   // V4-WP4：列表行也能全字段编辑（§13.3.1），不需要先进详情。
   const [editTarget, setEditTarget] = useState<PortForward | null>(null);
   /**
@@ -239,6 +243,10 @@ export function ForwardWorkspace() {
     setNodes([]); setBindings({}); setSummary(null);
     setReferenceLoaded(false);
     setBindingsUnavailable(false);
+    setBatchDeleteEnabled(false);
+    const batchCapabilityTask = canRead ? api.forwards.batchCapabilities().then((value) => {
+      if (current()) setBatchDeleteEnabled(value.delete_enabled === true);
+    }).catch(() => {}) : Promise.resolve();
     // Independent permissions and partial loads: denied nodes must not erase Forward summary.
     const summaryTask = canRead ? api.forwards.summary().then((value) => {
       if (current()) setSummary(value);
@@ -274,7 +282,7 @@ export function ForwardWorkspace() {
         toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
       }
     }) : Promise.resolve();
-    await Promise.all([summaryTask, nodesTask]);
+    await Promise.all([summaryTask, nodesTask, batchCapabilityTask]);
     if (current()) setReferenceLoaded(true);
   }
 
@@ -306,6 +314,9 @@ export function ForwardWorkspace() {
   }, [currentId, permissions]);
 
   useEffect(() => {
+    batchFlight.current = null;
+    setBatchBusy(false);
+    setBatchError(null);
     setSelectedIds(new Set()); setEditTarget(null); setCreateOpen(false); setCreatedForward(null);
   }, [currentId, permissions]);
 
@@ -523,7 +534,8 @@ export function ForwardWorkspace() {
   /** 选中集的唯一修改点（不可变更新，避免 Set 被就地改写导致漏渲染）。 */
   function toggleSelected(id: number, checked: boolean) {
     const row = forwards.find((f) => Number(f.id) === id);
-    if (checked && (!row || !canForward(row, "update"))) return;
+    if (batchFlight.current) return;
+    if (checked && (!row || (!canForward(row, "update") && !(batchDeleteEnabled && canForward(row, "delete"))))) return;
     setSelectedIds((current) => {
       const next = new Set(current);
       if (checked) next.add(id);
@@ -537,7 +549,12 @@ export function ForwardWorkspace() {
     setBatchError(null);
   }
 
-  const pageIds = useMemo(() => forwards.filter((row) => canForward(row, "update")).map((row) => Number(row.id)), [forwards, permissions]);
+  const pageIds = useMemo(
+    () => forwards
+      .filter((row) => canForward(row, "update") || (batchDeleteEnabled && canForward(row, "delete")))
+      .map((row) => Number(row.id)),
+    [forwards, permissions, batchDeleteEnabled],
+  );
   const selectedOnPage = pageIds.filter((id) => selectedIds.has(id));
   const allPageSelected = pageIds.length > 0 && selectedOnPage.length === pageIds.length;
 
@@ -548,6 +565,7 @@ export function ForwardWorkspace() {
    * 一个「全选本页」把别的页清掉会让用户以为选中集被重置了。
    */
   function toggleSelectAllOnPage(checked: boolean) {
+    if (batchFlight.current) return;
     setSelectedIds((current) => {
       const next = new Set(current);
       for (const id of pageIds) {
@@ -566,52 +584,86 @@ export function ForwardWorkspace() {
    * （前端校验只是体验优化，不是安全边界）。
    */
   async function runBatch(action: ForwardBatchAction) {
+    if (batchFlight.current) return;
     const ids = [...selectedIds];
-    // Revalidate all selected resources before batching (including cross-page selections).
-    if (!can("forward:update")) { setBatchError(PERMISSION_DENIED); return; }
-    if (permissions?.forward_mutations === "own") {
-      const rows = await Promise.all(ids.map((id) => api.forwards.detail(id).catch(() => null)));
-      if (getActiveWorkspace() !== currentId || rows.some((row) => !row || !canForward(row, "update"))) {
-        setBatchError(PERMISSION_DENIED); return;
-      }
-    }
+    const mutation = action === "delete" ? "delete" : "update";
+    if (!can(`forward:${mutation}`)) { setBatchError(PERMISSION_DENIED); return; }
     if (ids.length === 0) return;
     if (ids.length > FORWARD_BATCH_MAX_IDS) {
       setBatchError(L("forward.batchLimit", { max: FORWARD_BATCH_MAX_IDS }));
       return;
     }
+    if (action === "delete" && !batchDeleteEnabled) {
+      setBatchError(L("forward.batchDeleteDisabled"));
+      return;
+    }
+
+    // Snapshot the selected IDs before confirmation so a later selection change
+    // cannot alter the destructive request the user approved.
+    const input = prepareForwardBatchRequest(action, ids, () =>
+      confirm(L("forward.batchDeleteConfirm", { count: ids.length, ids: ids.join(", ") })));
+    if (!input) return;
+
+    const flight = Symbol();
+    const scope = currentId;
+    const current = () => batchFlight.current === flight && getActiveWorkspace() === scope;
+    batchFlight.current = flight;
     setBatchBusy(true);
     setBatchError(null);
+
     try {
-      const result = await api.forwards.batch({ action, ids });
-      // 逐条结果 + 200：失败条数必须显式告诉用户，不能只看 promise 是否 reject。
-      if (result.failed > 0) {
-        toast.warning(
-          `${L("forward.batchResult", {
-            succeeded: result.succeeded,
-            failed: result.failed,
-          })} · ${L("forward.batchPartial", { failed: result.failed })}`,
-        );
-        // 只保留失败的项继续选中，方便用户直接改动作或逐条处理。
-        const failedIds = new Set(
-          result.results.filter((row) => !row.ok).map((row) => Number(row.id)),
-        );
-        setSelectedIds(failedIds);
+      const result = await submitForwardBatch(input, {
+        current,
+        deniedMessage: PERMISSION_DENIED,
+        verifyOwnership: permissions?.forward_mutations === "own" ? async (id, operation) => {
+          const row = await api.forwards.detail(id).catch(() => null);
+          return row !== null && canForward(row, operation);
+        } : undefined,
+        send: (request) => api.forwards.batch(request),
+      });
+      if (!result) return;
+
+      const failures = result.results.filter((row) => !row.ok);
+      const reconciliation = result.results.filter((row) => row.ok && row.reconciliation_pending);
+      if (failures.length > 0 || reconciliation.length > 0) {
+        const summary = L("forward.batchResult", {
+          succeeded: result.succeeded,
+          failed: result.failed,
+        });
+        const pendingSummary = reconciliation.length > 0
+          ? L("forward.batchReconcilePending", { count: reconciliation.length })
+          : null;
+        toast.warning([summary, pendingSummary].filter(Boolean).join(" · "));
+        setBatchError([
+          summary,
+          ...(pendingSummary ? [pendingSummary] : []),
+          ...failures.map((row) => L("forward.batchFailureDetail", {
+            id: row.id,
+            message: row.message || row.apply_error_code || row.code || L("forward.batchFailed"),
+          })),
+          ...reconciliation.map((row) => L("forward.batchFailureDetail", {
+            id: row.id,
+            message: row.warning_message || row.warning_code || L("forward.batchReconcilePending", { count: 1 }),
+          })),
+        ].join("\n"));
+        // Failed rows still exist and remain actionable. Reconciliation warnings
+        // belong to rows already deleted locally, so do not keep ghost selections.
+        setSelectedIds(new Set(failures.map((row) => Number(row.id))));
       } else {
-        toast.success(
-          L("forward.batchResult", { succeeded: result.succeeded, failed: 0 }),
-        );
+        toast.success(L("forward.batchResult", { succeeded: result.succeeded, failed: 0 }));
         clearSelection();
       }
       reloadList();
     } catch (err) {
-      // 批量失败同样是写失败：按 condition/apply_error_code 给下一步，
-      // 并在页内保留一条常驻提示（toast 会消失，而用户要照着做）。
+      if (!current()) return;
       const message = writeFailureText(err, L("forward.batchFailed"));
       setBatchError(message);
       toast.error(message);
     } finally {
-      setBatchBusy(false);
+      if (batchFlight.current === flight) {
+        batchFlight.current = null;
+        setBatchBusy(false);
+      }
     }
   }
 
@@ -620,8 +672,12 @@ export function ForwardWorkspace() {
     if (!confirm(t("forward.deleteConfirm").replace("{name}", forward.name))) return;
     setActionBusy(Number(forward.id));
     try {
-      await api.forwards.remove(forward.id);
-      toast.success(t("forward.deleteSuccess"));
+      const receipt = await api.forwards.remove(forward.id);
+      if (receipt.reconciliation_pending) {
+        toast.warning(receipt.warning_message || L("forward.batchReconcilePending", { count: 1 }));
+      } else {
+        toast.success(t("forward.deleteSuccess"));
+      }
       reloadList();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
@@ -669,6 +725,8 @@ export function ForwardWorkspace() {
         text={L}
         onRun={(action) => void runBatch(action)}
         onClear={clearSelection}
+        canUpdate={can("forward:update")}
+        canDelete={batchDeleteEnabled && can("forward:delete")}
       />
 
       {/* 出错时不能落到「还没建转发」的空态：那会把一次加载失败讲成「你没有数据」 */}
@@ -708,7 +766,7 @@ export function ForwardWorkspace() {
             order={order}
             selectedIds={selectedIds}
             allPageSelected={allPageSelected}
-            canUpdateAny={can("forward:update")}
+            canUpdateAny={!batchBusy && (can("forward:update") || (batchDeleteEnabled && can("forward:delete")))}
             canCreate={canCreate}
             actionBusy={actionBusy}
             locale={locale}
@@ -716,6 +774,8 @@ export function ForwardWorkspace() {
             text={L}
             canUpdate={(forward) => canForward(forward, "update")}
             canDelete={(forward) => canForward(forward, "delete")}
+            canSelect={(forward) => canForward(forward, "update") || (batchDeleteEnabled && canForward(forward, "delete"))}
+            selectionBusy={batchBusy}
             onSort={toggleSort}
             onSelectAll={toggleSelectAllOnPage}
             onSelect={toggleSelected}
