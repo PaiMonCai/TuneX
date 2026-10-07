@@ -401,13 +401,15 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
     expect(html).toContain("中间 → 出口");
   });
 
-  test("事实取不到 ⇒ 独立 testid + 明说「不等于没有可用节点」", () => {
-    const html = section({ model: model({ facts: null }) });
-    expect(html).toContain('data-testid="forward-multihop-facts-unavailable"');
-    expect(html).toContain("节点关系暂时取不到");
-    expect(html).toContain("不等于「没有可用节点」");
-    expect(html).not.toContain('data-testid="forward-multihop-none"');
-    expect(html).not.toContain('data-testid="forward-multihop-select"');
+  test("事实取不到：无节点管理权限才展示不可判断；有权限可交给服务端准备", () => {
+    const readonly = section({ model: model({ facts: null, canManageNodes: false }) });
+    expect(readonly).toContain('data-testid="forward-multihop-facts-unavailable"');
+    expect(readonly).toContain("节点关系暂时取不到");
+    expect(readonly).not.toContain('data-testid="forward-multihop-select"');
+
+    const manageable = section({ model: model({ facts: null }) });
+    expect(manageable).toContain('data-testid="forward-multihop-select"');
+    expect(manageable).toContain('data-testid="forward-multihop-option-6"');
   });
 
   test("ready：可选节点进下拉；不可选的**列出来并说明原因**", () => {
@@ -420,37 +422,65 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
     expect(html).toContain("它与出口节点是同一台");
 
     const missing = section({
-      model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } } }),
+      model: model({
+        middleNodeId: "6",
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } },
+      }),
+      value: "6",
     });
-    expect(missing).toContain('data-testid="forward-multihop-excluded-6"');
-    expect(missing).toContain("入口 → 该节点 这一段关系尚未准备好");
+    expect(missing).toContain('data-testid="forward-multihop-option-6"');
+    expect(missing).toContain('data-testid="forward-multihop-auto-setup"');
+    expect(missing).toContain("自动准备");
   });
 
-  test("缺段且能补 ⇒ 给「去绑定」；缺段但不能补 ⇒ 只说角色原因，不给死路", () => {
-    const bothMissingInbound = section({
-      model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } } }),
+  test("缺关系 + 有权限 ⇒ 自动准备；角色不满足 ⇒ 仍然明确阻断", () => {
+    const automatic = section({
+      model: model({
+        middleNodeId: "6",
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } },
+      }),
+      value: "6",
     });
-    expect(bothMissingInbound).toContain("启用并使用");
-    expect(bothMissingInbound).not.toContain("角色不能接在入口之后");
+    expect(automatic).toContain("自动准备");
+    expect(automatic).not.toContain("去节点页");
 
-    // 缺第二段且角色是 egress（不能当第二段的源）⇒ 只说角色原因，不给"去绑定"。
     const legacy = node({ id: 9, node_id: "legacy-01", role: "egress", connect_ip: "10.0.0.91" });
     const roleBlocked = section({
       model: model({
+        middleNodeId: "9",
         nodes: [INGRESS, MIDDLE, legacy],
         facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 9, legacy)], "9": [] } },
       }),
+      value: "9",
     });
-    expect(roleBlocked).toContain("角色不能继续转到下一跳");
-    expect(roleBlocked).not.toContain("第二段需要到节点页配置");
+    expect(roleBlocked).toContain('data-testid="forward-multihop-blocked"');
+    expect(roleBlocked).toContain("中间节点必须同时具备入口与出口能力");
   });
 
-  test("第二段缺失 ⇒ 指向节点页（它只能在节点页以中间跳为源创建）", () => {
-    const html = section({
-      model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } } }),
+  test("缺第二段：有权限自动准备；无权限明确提示找节点管理员", () => {
+    const automatic = section({
+      model: model({
+        middleNodeId: "6",
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } },
+      }),
+      value: "6",
     });
-    expect(html).toContain("第二段需要到节点页配置");
-    expect(html).toContain('href="/nodes"');
+    expect(automatic).toContain("自动准备");
+
+    const readonly = section({
+      model: model({
+        middleNodeId: "6",
+        canManageNodes: false,
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } },
+      }),
+      value: "6",
+    });
+    expect(readonly).toContain("节点管理权限");
+    expect(readonly).not.toContain('href="/nodes"');
   });
 
   test("选中可提交 ⇒ 明说这条路是四步三段；不可提交 ⇒ 独立告警 + 原因", () => {
