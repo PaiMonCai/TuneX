@@ -62,18 +62,18 @@ export interface ForwardPathCopy {
 }
 
 const ZH: ForwardPathCopy = {
-  title: "线路预览（计划）",
-  planNote: "下面是这条转发将要组装成的路径；事实来自你已选的内容与已载入的绑定关系。",
+  title: "路径预览",
+  planNote: "下面是这条转发将使用的路径；事实来自你选择的节点与当前已载入的节点关系。",
   noConnectivityCheck: "本预览未做连通性验证：它描述的是计划，不是这条线路此刻通不通。",
   directHeadline: "入口 → 目标（直连）",
   directDesignNote:
     "DIRECT 没有节点之间的跳：这是这条路径的设计结论，不是缺数据，也不代表少了什么配置。",
   relayHeadline: "入口 → 出口 → 目标",
   relayNote:
-    "RELAY 由入口节点接收连接、再由出口节点转发到目标；出口必须已绑定到这台入口。",
+    "自定义路径由入口节点接收连接，再经出口节点访问目标；所选出口必须已为这台入口启用。",
   relayThreeHeadline: "入口 → 中间 → 出口 → 目标",
   relayThreeNote:
-    "你选了中间跳：这条转发由三段组成（入口→中间、中间→出口、出口→目标）。服务端在创建时会校验这两段邻接绑定都已存在。",
+    "你选了中间节点：路径由入口 → 中间 → 出口 → 目标组成。创建时 TuneX 会校验相邻节点关系是否已经准备好。",
   ingressRole: "入口",
   middleRole: "中间",
   egressRole: "出口",
@@ -86,33 +86,33 @@ const ZH: ForwardPathCopy = {
     ingress_address_unreported: "入口节点还没有上报连接地址（它上线后会带上）。",
     egress_address_unreported: "出口节点还没有上报连接地址（它上线后会带上）。",
     egress_not_chosen: "还没有选择出口节点（RELAY 必需）。",
-    egress_not_bound: "所选出口尚未绑定到这台入口；下面的「绑定并使用」可以补齐。",
+    egress_not_bound: "所选出口尚未为这台入口启用；下面的「启用并使用」可以补齐。",
     target_host_missing: "还没有填目标地址。",
     target_port_missing: "还没有填目标端口。",
     bindings_unavailable:
-      "绑定事实取不到：无法判断这台入口绑了哪些出口。这不等于「没有可用出口」，请刷新后重试。",
+      "出口关系暂时取不到：无法判断这台入口目前可用哪些出口。这不等于「没有可用出口」，请刷新后重试。",
     middle_address_unreported: "中间跳节点还没有上报连接地址（它上线后会带上）。",
-    middle_segment_ingress_missing: "缺少「入口 → 中间」这条绑定，创建会被服务端拒绝（409 binding_required）。",
-    middle_segment_egress_missing: "缺少「中间 → 出口」这条绑定，创建会被服务端拒绝（409 binding_required）。",
+    middle_segment_ingress_missing: "入口 → 中间 的节点关系尚未准备好，当前无法创建这条路径。",
+    middle_segment_egress_missing: "中间 → 出口 的节点关系尚未准备好，当前无法创建这条路径。",
     middle_segments_unavailable:
-      "中间跳的两段绑定事实取不到：无法判断缺哪一段，这不等于「没有绑定」。请刷新后重试。",
+      "中间节点的两段关系暂时取不到：无法判断缺哪一段，请刷新后重试。",
   },
   middleVisibilityNote:
     "中间跳只会出现在该转发详情页的「链路」卡片（三段）里：列表与详情读数不显示它。",
-  bindingsBound: (count) => `已绑定 ${count} 台出口，可以从中选择。`,
-  bindingsNone: "这台入口没有已绑定的出口。",
-  bindingsNoneNext: "下一步：在下面选择一台出口并点「绑定并使用」。",
+  bindingsBound: (count) => `已有 ${count} 台可用出口，可以直接选择。`,
+  bindingsNone: "这台入口还没有可用出口。",
+  bindingsNoneNext: "下一步：在下面选择一台出口并点「启用并使用」。",
   bindingsNoneWithCandidates: (count) =>
-    `下一步：在下面从 ${count} 台候选出口里选一台，点「绑定并使用」。`,
+    `下一步：在下面从 ${count} 台候选出口里选一台，点「启用并使用」。`,
   bindingsUnavailable:
-    "绑定事实取不到：可能仍在读取，也可能读取失败。这不等于「没有可用出口」。",
+    "出口关系暂时取不到：可能仍在读取，也可能读取失败。这不等于「没有可用出口」。",
   bindingsUnavailableNext: "下一步：刷新页面（或稍候）再看一次；若仍取不到，请检查节点接口与权限。",
 };
 
 const EN: ForwardPathCopy = {
-  title: "Path preview (plan)",
+  title: "Path preview",
   planNote:
-    "Below is the path this forward is going to be assembled into; the facts come from what you have selected and from the already-loaded bindings.",
+    "Below is the path this forward will use; the facts come from your selected nodes and the currently loaded node relationships.",
   noConnectivityCheck:
     "This preview performs no connectivity check: it describes the plan, not whether the path currently works.",
   directHeadline: "Ingress → target (direct)",
@@ -120,10 +120,10 @@ const EN: ForwardPathCopy = {
     "A DIRECT forward has no hop between nodes: that is the design conclusion for this path, not missing data and not a missing setting.",
   relayHeadline: "Ingress → egress → target",
   relayNote:
-    "A RELAY forward accepts the connection on the ingress node and forwards it to the target from the egress node; the egress must be bound to this ingress.",
+    "A custom path accepts the connection on the ingress node and forwards it to the target from the egress node; that egress must be enabled for this ingress.",
   relayThreeHeadline: "Ingress → middle → egress → target",
   relayThreeNote:
-    "You chose a middle hop: this forward is assembled from three segments (ingress→middle, middle→egress, egress→target). The server validates that both adjacent bindings exist when creating it.",
+    "You chose a middle node: the path is ingress → middle → egress → target. TuneX validates that the adjacent node relationships are ready when creating it.",
   ingressRole: "Ingress",
   middleRole: "Middle",
   egressRole: "Egress",
@@ -136,26 +136,26 @@ const EN: ForwardPathCopy = {
     ingress_address_unreported: "The ingress node has not reported a connection address yet (it will once it comes up).",
     egress_address_unreported: "The egress node has not reported a connection address yet (it will once it comes up).",
     egress_not_chosen: "No egress node chosen yet (required for RELAY).",
-    egress_not_bound: "The chosen egress is not bound to this ingress yet; use \"bind and use\" below.",
+    egress_not_bound: "The chosen egress is not enabled for this ingress yet; use \"enable and use\" below.",
     target_host_missing: "Target host is still empty.",
     target_port_missing: "Target port is still empty.",
     bindings_unavailable:
-      "Binding facts unavailable: cannot tell which egress nodes this ingress is bound to. That is not the same as \"no egress available\"; reload and try again.",
+      "Egress relationship facts are unavailable: cannot tell which egress nodes are available to this ingress. That is not the same as \"no egress available\"; reload and try again.",
     middle_address_unreported: "The middle-hop node has not reported a connection address yet (it will once it comes up).",
-    middle_segment_ingress_missing: "The binding \"ingress → middle\" is missing; creating would be rejected by the server (409 binding_required).",
-    middle_segment_egress_missing: "The binding \"middle → egress\" is missing; creating would be rejected by the server (409 binding_required).",
+    middle_segment_ingress_missing: "The ingress → middle node relationship is not ready, so this path cannot be created yet.",
+    middle_segment_egress_missing: "The middle → egress node relationship is not ready, so this path cannot be created yet.",
     middle_segments_unavailable:
-      "The middle hop's two binding facts are unavailable: which segment is missing cannot be told, and that is not the same as \"not bound\". Reload and try again.",
+      "The middle node's two relationship facts are unavailable, so TuneX cannot tell which segment is missing. Reload and try again.",
   },
   middleVisibilityNote:
     "The middle hop only shows up on the forward detail page's \"path\" card (three segments): list and detail reads do not include it.",
-  bindingsBound: (count) => `${count} egress node(s) already bound and selectable.`,
-  bindingsNone: "This ingress has no bound egress node.",
-  bindingsNoneNext: "Next: pick an egress below and click \"bind and use\".",
+  bindingsBound: (count) => `${count} egress node(s) are available and selectable.`,
+  bindingsNone: "This ingress has no available egress yet.",
+  bindingsNoneNext: "Next: pick an egress below and click \"enable and use\".",
   bindingsNoneWithCandidates: (count) =>
-    `Next: pick one of the ${count} candidate egress nodes below and click "bind and use".`,
+    `Next: pick one of the ${count} candidate egress nodes below and click "enable and use".`,
   bindingsUnavailable:
-    "Binding facts unavailable: the read may still be running, or it may have failed. That is not the same as \"no egress available\".",
+    "Egress relationship facts are unavailable: the read may still be running, or it may have failed. That is not the same as \"no egress available\".",
   bindingsUnavailableNext:
     "Next: reload the page (or wait a moment). If it stays unavailable, check the nodes API and your permissions.",
 };

@@ -8,14 +8,14 @@ import type { ConsumableRouteProfileView } from "@/lib/types";
 import type { Locale } from "@/lib/i18n";
 
 /**
- * `/routes` —— 用户侧「可用线路」（V5-WP13.5B，User Console）。
+ * `/routes` —— 用户侧「可用路由策略」（V5-WP13.5B，User Console）。
  *
  * 这一页是**只读**的消费面（产品边界 §9.4.1）：
- *  - 只展示普通用户该看到的东西：线路名称、描述、能不能选、怎么用；
+ *  - 只展示普通用户该看到的东西：策略名称、描述、能不能用、怎么用；
  *  - **不出现** INTERNAL / version / selector / transit / revision / lease / profile_id /
  *    「模板」等内部概念 —— 后端 `/available` 返回的是管理面形状（含 version 与 template），
  *    前端在这里只取用户需要的字段，多余的字段**不渲染**（有渲染回归测试钉住）；
- *  - 不造假入口：后端目前没有「用线路创建 Forward」的 API，所以本页不提供创建按钮，
+ *  - 不造假入口：后端目前没有「创建 Forward 时直接选择路由策略」的 API，所以本页不提供创建按钮，
  *    而是明确写出下一步动作（由管理员编排 / 后续版本支持）。
  */
 async function AvailableRoutesBody({ locale }: { locale: Locale }) {
@@ -42,7 +42,7 @@ async function AvailableRoutesBody({ locale }: { locale: Locale }) {
     return (
       <Card data-testid="routes-error">
         <CardHeader>
-          <CardTitle>{zh ? "暂时无法读取可用线路" : "Cannot load available routes right now"}</CardTitle>
+          <CardTitle>{zh ? "暂时无法读取可用路由策略" : "Cannot load available routing policies right now"}</CardTitle>
           <CardDescription>
             {zh
               ? "这不是权限结论，只是这次读取失败。请稍后重试；若持续失败请联系管理员。"
@@ -57,11 +57,11 @@ async function AvailableRoutesBody({ locale }: { locale: Locale }) {
     return (
       <Card data-testid="routes-empty">
         <CardHeader>
-          <CardTitle>{zh ? "你目前没有可用线路" : "No routes available to you yet"}</CardTitle>
+          <CardTitle>{zh ? "你目前没有可用路由策略" : "No routing policies available to you yet"}</CardTitle>
           <CardDescription>
             {zh
-              ? "可用线路由管理员编排并对你开放。需要新线路时请联系管理员。"
-              : "Routes are authored by an administrator and granted to you. Ask your admin for a new route."}
+              ? "路由策略由管理员配置并对你开放。需要新的路径方案时请联系管理员。"
+              : "Routing policies are configured by an administrator and granted to you. Ask your admin for a new path policy."}
           </CardDescription>
         </CardHeader>
       </Card>
@@ -85,16 +85,16 @@ async function AvailableRoutesBody({ locale }: { locale: Locale }) {
             <p data-testid="route-availability-hint">
               {route.selectable
                 ? zh
-                  ? "这条线路现在可以用于你的转发业务。"
-                  : "This route can be used for your forwards right now."
+                  ? "这条路由策略现在可以用于你的转发业务。"
+                  : "This routing policy can be used for your forwards right now."
                 : zh
-                  ? "这条线路暂时不可用（未授权或已停用）。需要时请联系管理员。"
-                  : "Not available to you right now (not granted or turned off). Contact your admin."}
+                  ? "这条路由策略暂时不可用（未授权或已停用）。需要时请联系管理员。"
+                  : "This routing policy is not available to you right now (not granted or turned off). Contact your admin."}
             </p>
             <p className="mt-2 text-xs" data-testid="route-next-step">
               {zh
-                ? "线路由管理员编排，并作用在已经存在的转发上；创建转发时不需要（也无法）选择线路。某一转发需要换线路时请联系管理员。"
-                : "Routes are orchestrated by an admin and applied to forwards that already exist — you neither need nor can pick a route while creating a forward. Ask your admin if a forward should move to a different route."}
+                ? "路由策略由管理员配置，并作用在已经存在的转发上；目前创建转发时不需要（也无法）选择策略。某一转发需要调整路径时请联系管理员。"
+                : "Routing policies are configured by an admin and applied to forwards that already exist. In this version you neither need nor can pick one while creating a forward. Ask your admin if a forward needs a different path."}
             </p>
           </CardContent>
         </Card>
@@ -107,8 +107,8 @@ export default async function RoutesPage() {
   const { locale } = await shellI18n();
   return (
     <AppShell
-      title={localizedLabel(locale, "common.routes", "可用线路", "Available routes")}
-      subtitle={localizedLabel(locale, "routes.subtitle", "管理员为你开放的线路", "Routes your administrator made available")}
+      title={localizedLabel(locale, "common.routingPolicies", "可用路由策略", "Available routing policies")}
+      subtitle={localizedLabel(locale, "routes.subtitle", "管理员为你开放的路径选择策略", "Path-selection policies your administrator made available")}
     >
       <Suspense fallback={<div className="h-48 animate-pulse rounded-lg bg-[var(--muted)]" />}>
         <AvailableRoutesBody locale={locale} />

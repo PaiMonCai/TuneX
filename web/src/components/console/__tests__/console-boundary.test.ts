@@ -273,7 +273,7 @@ describe("User Console 导航边界", () => {
     expect(ids).toEqual(["overview", "forwards", "routes", "billing", "support", "settings"]);
   });
 
-  test("可用线路分组的两条入口都是真页面（/nodes 注册页 + /routes 可用线路）", () => {
+  test("网络分组的两条入口都是真页面（/nodes 节点 + /routes 可用路由策略）", () => {
     const routesGroup = userConsoleNav.find((g) => g.id === "routes")!;
     for (const href of ["/nodes", "/routes"]) {
       const item = routesGroup.items.find((i) => i.href === href)!;
@@ -377,12 +377,24 @@ describe("Admin Console 导航边界", () => {
     }
   });
 
-  test("Federation 与 Route Profiles 已落位；其余未落位的内部概念项仍是 planned 禁用项（不进可导航列表）", () => {
+  test("网络概念收口为转发 + 路由策略，不再并列暴露目标对象", () => {
+    const network = visibleNavGroups("admin", { paymentsEnabled: true }).find((g) => g.id === "network")!;
+    expect(network.items.map((i) => i.href)).toEqual(["/admin/tunnels", "/admin/route-profiles"]);
+    const zh = network.items.map((i) => navLabel("zh", i));
+    const en = network.items.map((i) => navLabel("en", i));
+    expect(zh).toEqual(["转发", "路由策略"]);
+    expect(en).toEqual(["Forwards", "Routing policies"]);
+    expect(network.items.some((i) => i.href === "/admin/targets")).toBe(false);
+  });
+
+  test("Federation 与路由策略已落位；其余未落位项仍是 planned 禁用项（不进可导航列表）", () => {
     const planned = declaredItems(adminConsoleNav).filter((i) => i.status === "planned");
     const plannedHrefs = planned.map((i) => i.href);
     // Federation 页面已落地，不允许再挂 planned。
     expect(plannedHrefs.some((h) => h.startsWith("/admin/federation"))).toBe(false);
-    // 尚未落位的目标入口保持禁用；已落位的 /admin/route-profiles 不得留在 planned。
+    // /admin/targets 已从一级导航移除：Target 是 Forward 的目标地址，不再作为并列产品对象。
+    expect(declaredItems(adminConsoleNav).map((i) => i.href)).not.toContain("/admin/targets");
+    // 已落位的 /admin/route-profiles 不得留在 planned。
     expect(plannedHrefs).not.toContain("/admin/route-profiles");
     expect(plannedHrefs).toContain("/admin/capacity");
     for (const href of plannedHrefs) {

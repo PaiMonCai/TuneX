@@ -480,7 +480,7 @@ export function RouteProfileImpactPanel({
         empty={
           t(
             locale,
-            "还没有 Forward 的来源指针指向该模板 —— 第一次 apply 之前这是正确答案（模板是意图，不是已铺开的范围）",
+            "还没有 Forward 使用这条路由策略 —— 第一次应用策略之前这是正确答案（策略只是规则，不会自动生成转发）",
             "No Forward references this profile yet — that is the correct answer before the first apply",
           )
         }
@@ -567,7 +567,7 @@ export function RouteProfileImpactPanel({
           </ul>
           {!result.dry_run && onApplied && (
             <p className="mt-1 text-[var(--muted-foreground)]">
-              {t(locale, "已触发来源模板写入；如需刷新列表请点上面的刷新。", "Source pointer written; refresh the list above if needed.")}
+              {t(locale, "已记录策略来源；如需刷新列表请点上面的刷新。", "Policy source recorded; refresh the list above if needed.")}
             </p>
           )}
         </div>
@@ -614,7 +614,7 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
           enabled: createForm.enabled,
           template: createTemplate,
         }),
-      () => t(locale, "模板已创建（v1）", "Profile created (v1)"),
+      () => t(locale, "路由策略已创建（v1）", "Routing policy created (v1)"),
     );
     if (created) {
       setCreateOpen(false);
@@ -691,7 +691,7 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
   return (
     <div className="flex flex-col gap-4" data-testid="route-profiles-manager">
       <div className="grid gap-4 sm:grid-cols-3">
-        <StatTile testId="rp-stat-total" label={t(locale, "线路模板", "Route profiles")} value={String(rows.length)} />
+        <StatTile testId="rp-stat-total" label={t(locale, "路由策略", "Routing policies")} value={String(rows.length)} />
         <StatTile
           testId="rp-stat-public"
           label={t(locale, "公开可选", "PUBLIC")}
@@ -708,11 +708,11 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
       <Card>
         <CardHeader className="flex-row items-start justify-between gap-3">
           <div>
-            <CardTitle>{t(locale, "线路模板（模板/意图，不含 runtime）", "Route profiles (templates, no runtime)")}</CardTitle>
+            <CardTitle>{t(locale, "路由策略", "Routing policies")}</CardTitle>
             <CardDescription>
               {t(
                 locale,
-                "改模板内容 = 发布新版本；改名称/描述/可见性/启用 = 原地改。Impact Analysis 只读，apply 才下发。",
+                "改路径规则 = 发布新版本；改名称/描述/可见性/启用 = 原地改。影响分析只读，只有应用策略才会改变转发路径。",
                 "Editing template content publishes a new version; name/description/visibility/enabled are in-place.",
               )}
             </CardDescription>
@@ -724,14 +724,14 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
             </Button>
             <Button variant="default" size="sm" data-testid="route-profile-create-open" disabled={pending !== null} onClick={() => setCreateOpen(true)}>
               <Plus className="size-3.5" />
-              {t(locale, "新建模板", "New profile")}
+              {t(locale, "新建路由策略", "New routing policy")}
             </Button>
           </div>
         </CardHeader>
         <CardContent>
           <RouteProfileTable
             rowCount={rows.length}
-            empty={t(locale, "还没有线路模板。", "No route profiles yet.")}
+            empty={t(locale, "还没有路由策略。", "No routing policies yet.")}
             columns={[
               { key: "name", label: t(locale, "名称", "Name") },
               { key: "visibility", label: t(locale, "可见性", "Visibility") },
@@ -819,9 +819,9 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="max-w-3xl">
           <DialogHeader>
-            <DialogTitle>{t(locale, "新建线路模板", "New route profile")}</DialogTitle>
+            <DialogTitle>{t(locale, "新建路由策略", "New routing policy")}</DialogTitle>
             <DialogDescription>
-              {t(locale, "创建即产生 v1；后续模板内容变更只能通过发布新版本。", "Creation produces v1; later content changes publish new versions.")}
+              {t(locale, "创建即产生 v1；后续路径规则变更通过发布新版本完成。", "Creation produces v1; later path-rule changes publish new versions.")}
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-3 sm:grid-cols-2">
@@ -908,7 +908,7 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
               </label>
             </div>
             <p className="text-[11px] text-[var(--muted-foreground)]">
-              {t(locale, "模板内容请用「发布新版本」修改。", "Use “New version” to change template content.")}
+              {t(locale, "路径规则请用「发布新版本」修改。", "Use “New version” to change path rules.")}
             </p>
           </div>
           {error && <RouteProfileErrorNotice error={error} locale={locale} />}
@@ -934,7 +934,7 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
             <DialogDescription>
               {t(
                 locale,
-                "模板内容变更走这里：发布后生成 vN+1，运行中的 Forward 一个字节都不变 —— 要让改动生效必须再显式 apply。",
+                "路径规则变更走这里：发布后生成 vN+1，运行中的 Forward 不会自动变化 —— 要让新策略生效必须再显式应用。",
                 "Content changes go through here: vN+1 is created and running Forwards are untouched until an explicit apply.",
               )}
             </DialogDescription>
@@ -990,7 +990,7 @@ export function RouteProfilesManager({ initial, locale }: { initial: RouteProfil
             <DialogDescription>
               {t(
                 locale,
-                "范围口径：来源指针指向该模板的 Forward（第一次 apply 之前为空是正确答案）。",
+                "范围口径：当前使用这条策略的 Forward（第一次应用之前为空是正确答案）。",
                 "Scope: forwards whose source pointer references this profile.",
               )}
             </DialogDescription>

@@ -51,7 +51,11 @@ export default async function AdminResourcePage({ params }: { params: Promise<{ 
   const { t } = await serverT();
 
   return (
-    <AppShell title={t(TITLE_KEYS[seg])} subtitle={t("admin.management")} adminMode>
+    <AppShell
+      title={t(TITLE_KEYS[seg])}
+      subtitle={seg === "tunnels" ? t("admin.forwardReadonlySubtitle") : t("admin.management")}
+      adminMode
+    >
       <Suspense fallback={<div className="h-96 animate-pulse rounded-lg bg-[var(--muted)]" />}>
         {READONLY_SEGMENTS.includes(seg as ReadonlySegment) ? (
           <AdminReadonlyLoader segment={seg as ReadonlySegment} />
