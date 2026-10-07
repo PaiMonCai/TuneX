@@ -304,15 +304,15 @@ export const zh = {
     groupsLoading: "正在加载节点池…",
     groupsEmptyTitle: "还没有可用的节点池",
     groupsEmptyHint:
-      "节点必须归属一个节点池。默认策略允许工作空间自建入口组，你可以在本页直接创建：填一个组名与端口范围即可，随后就能添加节点。出口组需要策略授予 allow_custom_out_group，本页暂不开放。",
+      "节点必须归属一个节点池。你可以在这里创建入口用途的节点池：填写名称和端口范围，然后把节点加入其中。其它用途是否可创建由工作空间策略决定。",
     groupsFailedTitle: "节点池加载失败",
     groupsFailedHint: "暂时无法创建节点；请重试加载节点池。",
     groupsRetry: "重新加载节点池",
     /* ---- R2：自助建组（用户域 POST /api/node-groups）---- */
-    createGroupCta: "创建入口节点池",
-    groupCreateTitle: "创建入口节点池",
+    createGroupCta: "创建节点池",
+    groupCreateTitle: "创建节点池",
     groupCreateHint:
-      "入口节点池是第一条转发的前置：节点归属节点池，组里的端口范围决定组内节点能监听哪些端口。",
+      "节点池是一组同用途节点的资源池。当前创建的是入口用途节点池；池里的端口范围决定池内节点可以监听哪些端口。",
     groupCreateNameLabel: "节点池名称",
     groupCreateNamePlaceholder: "例如：香港-入口",
     groupCreateNameRequired: "请填写节点池名称。",
@@ -324,17 +324,17 @@ export const zh = {
     groupCreatePortBounds: "端口必须落在 1..65535 之间。",
     groupCreatePortOrder: "起始端口不能大于结束端口。",
     groupCreateDirectionIngress:
-      "方向：入口。本切片只开放入口组；出口组需要策略授予 allow_custom_out_group。",
+      "用途：入口。这个池中的节点用于接收用户连接；其它用途是否可创建由工作空间策略决定。",
     groupCreateSubmit: "创建节点池",
     groupCreating: "创建中…",
     groupCreateSuccess: "节点池已创建，可以继续添加节点了",
     groupCreateFailed: "创建节点池失败",
     groupErrorNextPolicy:
-      "当前策略没有授予这个工作空间自建入口组的能力（不是你的输入错误，也不是额度问题）；请联系工作空间管理员为该空间开通该能力，或提供一个可用的入口节点池。",
+      "当前工作空间策略不允许自助创建入口用途节点池（不是你的输入错误，也不是额度问题）；请联系工作空间管理员开通，或提供一个可用节点池。",
     groupErrorNextNodeLimit:
       "节点额度已用尽；请先在节点管理里释放额度，或由管理员调整套餐 / 策略后再试。",
     groupErrorNextPortRange:
-      "该节点池没有可用的连续端口范围；请新建一个带合法端口范围的入口节点池，或联系管理员为该组配置端口范围。",
+      "该节点池没有可用的连续端口范围；请新建一个带合法端口范围的节点池，或联系管理员为该池配置端口范围。",
     groupErrorNextNodeIdConflict: "该节点 ID 已被其它节点池占用；请换一个节点 ID。",
     groupErrorNextRoleConflict:
       "已存在同名但角色不同的节点；请先在节点管理里显式修改它的角色，然后重试。",
@@ -987,7 +987,7 @@ export const zh = {
     weight: "权重",
     connectIp: "连接 IP",
     portRange: "端口范围",
-    nodeType: "节点类型",
+    nodeType: "节点池用途",
     nodeGroup: "节点池",
     loadBalanceType: "负载均衡",
     trafficRate: "流量倍率",
@@ -1078,7 +1078,7 @@ export const zh = {
     needOperatorHintPermission:
       "你的工作空间权限里没有 node:manage，无法自己创建入口节点池或添加节点；请联系有 node:manage 权限的成员或工作空间管理员完成这一步。",
     needOperatorHintPolicy:
-      "当前工作空间的有效策略没有授予自建入口组的能力（allow_custom_in_group = 否）；请联系工作空间管理员为该空间开通，或提供一个可用的入口节点池。",
+      "当前工作空间策略不允许自助创建入口用途节点池；请联系工作空间管理员开通，或提供一个可用节点池。",
     addNodeTitle: "添加第一台节点",
     addNodeHint:
       "入口节点池已经就绪；创建节点后把安装命令复制到目标机器执行，节点上线后即可创建第一条转发。",
@@ -1400,15 +1400,15 @@ export const en: Dict = {
     groupsLoading: "Loading node pools…",
     groupsEmptyTitle: "No node pool available yet",
     groupsEmptyHint:
-      "Every node must belong to a node pool. The default policy lets a workspace create its own ingress group — you can do it right here: pick a name and a port range, then add nodes. Egress groups require the allow_custom_out_group entitlement and are not offered on this page.",
+      "Every node belongs to a node pool. You can create an ingress-purpose pool here: give it a name and port range, then add nodes. Other pool purposes depend on workspace policy.",
     groupsFailedTitle: "Failed to load node pools",
     groupsFailedHint: "Nodes cannot be created right now; retry loading the node pools.",
     groupsRetry: "Reload node pools",
     /* ---- R2: self-service group creation (user-domain POST /api/node-groups) ---- */
-    createGroupCta: "Create ingress node pool",
-    groupCreateTitle: "Create ingress node pool",
+    createGroupCta: "Create node pool",
+    groupCreateTitle: "Create node pool",
     groupCreateHint:
-      "An ingress node pool is the prerequisite for the first forward: nodes belong to a group, and the group's port range decides which listen ports its nodes can use.",
+      "A node pool groups nodes with the same purpose. This flow creates an ingress-purpose pool; its port range decides which listen ports its nodes can use.",
     groupCreateNameLabel: "Node pool name",
     groupCreateNamePlaceholder: "e.g. Hong Kong ingress",
     groupCreateNameRequired: "Enter a node pool name.",
@@ -1421,17 +1421,17 @@ export const en: Dict = {
     groupCreatePortBounds: "Ports must be within 1..65535.",
     groupCreatePortOrder: "The start port cannot be greater than the end port.",
     groupCreateDirectionIngress:
-      "Direction: ingress. Only ingress groups are offered here; egress groups require the allow_custom_out_group entitlement.",
+      "Purpose: ingress. Nodes in this pool receive client connections; whether other purposes can be created depends on workspace policy.",
     groupCreateSubmit: "Create node pool",
     groupCreating: "Creating…",
     groupCreateSuccess: "Node pool created — you can add a node now",
     groupCreateFailed: "Failed to create the node pool",
     groupErrorNextPolicy:
-      "The current policy does not grant this workspace the ability to create ingress groups (this is neither an input error nor a quota problem). Ask your workspace administrator to grant it, or to provide a usable ingress node pool.",
+      "The current workspace policy does not allow self-service creation of ingress-purpose node pools. This is neither an input error nor a quota problem; ask an administrator to enable it or provide a usable pool.",
     groupErrorNextNodeLimit:
       "The node quota is exhausted. Free up nodes first, or ask an administrator to adjust the plan/policy, then retry.",
     groupErrorNextPortRange:
-      "That node pool has no usable contiguous port range. Create a new ingress group with a valid port range, or ask an administrator to configure one for that group.",
+      "That node pool has no usable contiguous port range. Create a pool with a valid port range or ask an administrator to configure one.",
     groupErrorNextNodeIdConflict: "This node ID is already used by another node pool; use a different node ID.",
     groupErrorNextRoleConflict:
       "A node with the same name but a different role already exists. Change its role explicitly in Node Management first, then retry.",
@@ -2088,7 +2088,7 @@ export const en: Dict = {
     weight: "Weight",
     connectIp: "Connect IP",
     portRange: "Port range",
-    nodeType: "Node type",
+    nodeType: "Node pool purpose",
     nodeGroup: "Node pool",
     loadBalanceType: "Load balance",
     trafficRate: "Traffic rate",
@@ -2175,7 +2175,7 @@ export const en: Dict = {
     needOperatorHintPermission:
       "Your workspace permissions do not include node:manage, so you cannot create an ingress node pool or add nodes yourself. Ask a member with node:manage, or your workspace administrator.",
     needOperatorHintPolicy:
-      "The current policy for this workspace does not grant self-service ingress groups (allow_custom_in_group = no). Ask your workspace administrator to grant it, or to provide a usable ingress node pool.",
+      "The current workspace policy does not allow self-service ingress-purpose node pools. Ask your workspace administrator to enable it or provide a usable pool.",
     addNodeTitle: "Add your first node",
     addNodeHint:
       "The ingress node pool is ready. Create a node and run the install command on the target host; once it connects you can create the first forward.",
