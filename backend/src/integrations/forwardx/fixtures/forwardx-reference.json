@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "reference": {
+    "product": "ForwardX",
+    "version": "2.3.281",
+    "commit": "cb0ef0bb156dc114e4344c887328018491fbd638",
+    "source_snapshot_in_git": false,
+    "upstream_executed": false,
+    "note": "The user-provided Forwardx/ checkout is intentionally not tracked in Git. These fixtures freeze the first adapter cases, but must not be labelled upstream-parity evidence until the pinned snapshot is licensed/reviewed and imported under third_party/forwardx/ or otherwise made available to CI."
+  },
+  "cases": [
+    {
+      "id": "legacy-tcp-native",
+      "input": { "legacy_protocol": "tcp" },
+      "expected": {
+        "business_protocol": "tcp",
+        "client_front": "plain",
+        "carrier": "native_private",
+        "driver": "native"
+      }
+    },
+    {
+      "id": "legacy-tls-is-client-front-not-hop-encryption",
+      "input": { "legacy_protocol": "tls" },
+      "expected": {
+        "business_protocol": "tcp",
+        "client_front": "tls",
+        "carrier": "native_private",
+        "driver": "native"
+      }
+    },
+    {
+      "id": "fxp-is-reserved-but-closed-before-poc",
+      "input": {
+        "business_protocol": "tcp",
+        "client_front": "plain",
+        "carrier": "fxp_v1",
+        "driver": "fxp"
+      },
+      "expected_admission": "capability_not_released"
+    },
+    {
+      "id": "both-is-reserved-but-closed-before-protocol-aware-leases",
+      "input": {
+        "business_protocol": "both",
+        "client_front": "plain",
+        "carrier": "native_private",
+        "driver": "native"
+      },
+      "expected_admission": "capability_not_released"
+    }
+  ]
+}
