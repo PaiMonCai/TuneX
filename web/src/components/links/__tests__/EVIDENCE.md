@@ -58,7 +58,7 @@ git diff --check -- src/components/forwards/forward-workspace.tsx src/components
 
 - 这是前端点击、契约和类型证据，不是实网 FXP / 多 Agent 转发通过证据。
 - 未执行生产部署、真实数据创建、Git 提交或推送，未修改 `Forwardx/` 参考目录。
-- 共享 runner 已完成独立本机实测：A 新增、改目标/限制、移动端口、删除时，原 B TCP 会话与 UDP 目标 socket 保留。详见 [ABCD 实施记录](../../../../../docs/plans/forwardx-core-2026-10-07/ABCD_IMPLEMENTATION.md)。这不是本浏览器夹具或 Linux 多节点 gate 的结果；当前产品文案继续保留变更可能中断的提示。
+- 共享 runner 已完成独立本机实测：A 新增、改目标/限制、移动端口、删除时，原 B TCP 会话与 UDP 目标 socket 保留。当前契约见 [转发运行边界](../../../../../docs/forwarding-runtime.md)，后续 Linux gate 证据见 [测试说明](../../../../../docs/testing.md)。本段记录的本机结果不是本浏览器夹具或 Linux gate 的结果；当前产品文案继续保留变更可能中断的提示。
 - 后端目前未返回 deployment 配置版本时显示“未知”，不会用期望版本替代已应用配置版本。
 - Agent 观测的 60 秒新鲜度、身份、digest 与租约校验由后端负责；前端只消费其闭合观测对象，定期重读。
 
@@ -74,7 +74,7 @@ git diff --check -- src/components/forwards/forward-workspace.tsx src/components
 
 只修改 `web/src/lib/links-types.ts`、本模块 `link-detail.tsx` / `links-copy.ts`、`links-api.test.ts` / `links-ui.test.tsx` / `links-fixtures.ts` 和可选 README / 本证据文件。没有修改后端、Agent、vendor、路由、支付或既有流量仪表盘，也没有 Git 提交。
 
-已读取新提供的 [FXP 流量实施契约](../../../../../docs/plans/forwardx-core-2026-10-07/LINK_TRAFFIC_IMPLEMENTATION.md)，并只读核对 `getLink` 按 Forward 聚合所有历史 producer/day 的公开投影。详情在原规则卡片内新增双向累计 payload 字节、累计已接纳连接数（含 UDP 映射）和独立的最近接收时间。计数直接显示精确 decimal string，不转为 `Number`；没有收到统计为“尚未收到统计”，真正零为 `0 B` / `0`。
+流量契约现统一维护在 [转发运行边界](../../../../../docs/forwarding-runtime.md#traffic)。本次只读核对 `getLink` 按 Forward 聚合所有历史 producer/day 的公开投影。详情在原规则卡片内新增双向累计 payload 字节、累计已接纳连接数（含 UDP 映射）和独立的最近接收时间。计数直接显示精确 decimal string，不转为 `Number`；没有收到统计为“尚未收到统计”，真正零为 `0 B` / `0`。
 
 新增 **17 个** parser/UI 用例：缺失与 null、真零、超过 `MAX_SAFE_INTEGER` / uint64 的历史累计、每个计数字段的非 canonical 输入、缺字段、无效/自动归一化日期、闰日/时区/未来时间、闭合投影脱敏、HTTP 成功但内容非法、双语渲染、每规则独立统计、59,999 / 60,000 毫秒边界、旧值保留、缺失或未知运行观测、停止/过期状态和真实 ready 与旧流量互不覆盖。至少 60 秒未更新明确说明“不表示当前流量为零”；未来接收时间提示时钟差异，不作为在线证明。
 

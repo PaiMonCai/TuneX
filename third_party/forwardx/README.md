@@ -33,8 +33,8 @@ channel and owns authenticated delivery and ledger acknowledgements. Snapshot
 size, sample count and counter values are bounded; persistence failures stop
 the process rather than silently discard accounting. Abrupt termination can
 still lose an unsampled/unpersisted window. This is not exact crash-safe
-financial metering. See the Link traffic implementation document for rollout,
-capacity and acceptance boundaries.
+financial metering. See the [current traffic contract](../../docs/forwarding-runtime.md#traffic)
+and [acceptance guide](../../docs/testing.md) for rollout and capacity boundaries.
 
 The default remains upstream-compatible for reference regression tests. This does
 not enable FXP in the public TuneX support matrix; managed lifecycle, provenance,
