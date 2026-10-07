@@ -402,49 +402,41 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
         const egressRaw = db.nodes.find((node) => node.id === egressId);
         if (!egressRaw) return notFound("出口节点不存在");
         egress = mockUserNode(db, egressRaw);
+        if (egress.id === ingress.id) return fail(409, "入口和出口不能是同一节点", "conflict");
         if (egress.role !== "egress" && egress.role !== "both") {
-          return badRequest("选择的节点不具备出口能力");
+          return fail(409, "选择的节点不具备出口能力", "conflict");
         }
-        const bound = db.nodeBindings.some(
-          (binding) =>
-            binding.ingress_node_id === ingress.id &&
-            binding.egress_node_id === egress!.id,
-        );
-        /*
-         * 错误码**大小写以真机为准**：后端是 `error(409, "binding_required", …)`
-         * （`forward-service.ts:788`），本文件过去输出的大写 `BINDING_REQUIRED` 是历史分叉
-         * —— 同一份 mock 的编辑路径（`mocks/forward-edit.ts`）一直用的是小写，两边还不一致。
-         * 现在统一成小写；读取方在过渡期**两种都认**（`multihopFailureInfo` 大小写不敏感）。
-         */
-        if (!bound) return fail(409, "该出口尚未绑定到当前入口节点", "binding_required");
       } else if (egressId !== null) {
         return badRequest("DIRECT 转发不能指定出口节点");
       }
 
-      /**
-       * V5.4 三跳：`middle_node_id` 的两段邻接许可。
-       *
-       * 与后端 `forward-service.ts:764-783` **同一判据**：三跳用的两条邻接是
-       * `(入口→中间)` 与 `(中间→出口)`，缺任何一段即 409 `binding_required`
-       * （`(入口→出口)` 那条**不被使用**）。mock 此前**完全忽略**这个字段 —— 那正是
-       * "mock 替后端撒谎"：本地 200、线上 409。
-       *
-       * DIRECT 上后端**不校验也不使用** `middle_node_id`（create 只在 `if (egress)` 里查两段，
-       * `forward-service.ts:761`），这是已知的后端缺口；mock 如实照做（不替它"修"），
-       * 而 Web 侧的载荷生成器对 DIRECT 一律**不发**这个键。
-       */
       const middleId = numOrNull(body.middle_node_id);
+      let middle: UserNode | null = null;
+      if (mode === "direct" && middleId !== null) {
+        return badRequest("DIRECT 转发不能指定中间节点");
+      }
       if (mode === "relay" && middleId !== null) {
-        const inbound = db.nodeBindings.some(
-          (binding) => binding.ingress_node_id === ingress.id && binding.egress_node_id === middleId,
-        );
-        const outbound = db.nodeBindings.some(
-          (binding) => binding.ingress_node_id === middleId && binding.egress_node_id === egress?.id,
-        );
-        if (!inbound || !outbound) {
-          return fail(409, "三跳路由要求入口→中间、中间→出口两段都已绑定", "binding_required");
+        if (!egress) return badRequest("中间节点只能用于本地出口的自定义路径");
+        const middleRaw = db.nodes.find((node) => node.id === middleId);
+        if (!middleRaw) return notFound("中间节点不存在");
+        middle = mockUserNode(db, middleRaw);
+        if (middle.id === ingress.id || middle.id === egress.id) {
+          return fail(409, "入口、中间、出口必须是三台不同节点", "conflict");
+        }
+        if (middle.role !== "both") {
+          return fail(409, "中间节点必须同时具备入口与出口能力", "conflict");
         }
       }
+
+      // Mock represents the normal owner/admin path: missing local adjacency is
+      // prepared by Forward creation instead of requiring a separate binding UI.
+      // Do not write yet — port/shape validation below must fail without side effects.
+      const pathPairs: Array<[number, number]> =
+        mode !== "relay" || !egress
+          ? []
+          : middle
+            ? [[Number(ingress.id), Number(middle.id)], [Number(middle.id), Number(egress.id)]]
+            : [[Number(ingress.id), Number(egress.id)]];
 
       const effectiveListenPort = listenPort ?? 20000 + nextId(db.tunnels);
       const conflict = db.tunnels.some((tunnel) => {
@@ -452,6 +444,22 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
         return rowIngress?.id === ingress.id && tunnel.listen_port === effectiveListenPort;
       });
       if (conflict) return fail(409, "该入口端口已被占用", "PORT_CONFLICT");
+
+      // All admission checks passed: prepare missing relations immediately before
+      // creating the Forward, mirroring the real service transaction.
+      for (const [fromNodeId, toNodeId] of pathPairs) {
+        const exists = db.nodeBindings.some(
+          (row) => Number(row.ingress_node_id) === fromNodeId && Number(row.egress_node_id) === toNodeId,
+        );
+        if (!exists) {
+          db.nodeBindings.push({
+            id: nextId(db.nodeBindings),
+            ingress_node_id: fromNodeId,
+            egress_node_id: toNodeId,
+            created_at: nowIso(),
+          });
+        }
+      }
 
       const newId = nextId(db.tunnels);
       const target =
