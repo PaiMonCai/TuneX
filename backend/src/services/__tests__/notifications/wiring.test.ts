@@ -299,6 +299,99 @@ describe("N3 load()：只扫可能有事实的 workspace，且失败不拖垮整
     expect(summary.built).toBe(2);
     expect(harnessed.channelLoads.count).toBe(1);
   });
+
+  test("读失败的 workspace 被**记录下来**（供编排层排除它的恢复候选）", async () => {
+    const harnessed = harness({
+      tunnels: [
+        { id: 1, workspace_id: 10, name: "a", apply_status: "error", updated_at: T0 },
+        { id: 2, workspace_id: 20, name: "b", apply_status: "error", updated_at: T0 },
+      ],
+      itemsByWorkspace: { 10: [], 20: [] },
+      collectThrows: { 10: new Error("db down") },
+    });
+    const source = await harnessed.deps.load();
+    expect(source.unreadableWorkspaceIds).toEqual([10]);
+    // 行快照仍然在：排除恢复候选靠它定位"这条拒绝属于哪个空间"，而**不是**去查 `apply_status`
+    // 另立第二套判据（状态列回答不了"这一拍我们读到了什么"）。
+    expect(source.rowOf(1)?.workspace_id).toBe(10);
+  });
+});
+
+/* ================================================================== */
+/* ⑦ 假恢复（task-47）：读失败的 workspace 不得产生恢复事实                */
+/* ================================================================== */
+//
+// 缺陷现场（P1）：`load()` 的循环对单个 workspace 的 `collectItems` 抛错只 `warn`，
+// `items` 里没有它的条目 ⇒ 编排层用 `source.items` 反推 `stillDenied` 时，该空间在账本里
+// **仍然开着**的历史拒绝会被当成"已经不在拒绝里"，于是生成一条 `forward_apply_recovered`
+// （假恢复：转发其实还在 error，只是这一拍没读到）。
+
+describe("N3 假恢复：读失败的 workspace 既不报故障、也不报恢复", () => {
+  test("历史拒绝 + 读取异常 + 另一个 workspace 成功：本拍不发恢复，下一拍读到了才发", async () => {
+    const email = emailChannel();
+    const throws: Record<number, Error> = { 10: new Error("db down") };
+    const over: Parameters<typeof harness>[0] = {
+      tunnels: [
+        { id: 1, workspace_id: 10, name: "still-denied", apply_status: "error", updated_at: T0 },
+        { id: 2, workspace_id: 20, name: "other-denied", apply_status: "error", updated_at: T0 },
+      ],
+      // 账本里两条"开着的拒绝"：1 在**读失败**的空间（它的状态未知），2 在读得到的空间。
+      openDenials: [
+        { source_id: "1", channel_kind: "email" },
+        { source_id: "2", channel_kind: "email" },
+      ],
+      itemsByWorkspace: { 20: [denialItem({ id: 2, name: "other-denied" })] },
+      collectThrows: throws,
+      channels: [email.channel],
+      audience: async () => ({ ok: true, recipients: [MEMBER] }),
+    };
+    const harnessed = harness(over);
+
+    const first = await runForwardDenialNotifications(harnessed.deps);
+    // ★ 核心断言：修复前这里是 1（把"没读到"渲染成"已经好了"）。
+    expect(first.recovered_derived).toBe(0);
+    expect(first.recovered).toBe(0);
+    expect(harnessed.ledger.rows.filter((row) => row.row.reason_code === "forward_apply_recovered")).toEqual([]);
+    // 跳过必须**可解释**：这条被推迟的恢复计进 `skipped`，并且失败空间有告警点名。
+    expect(first.skipped).toBeGreaterThanOrEqual(1);
+    expect(harnessed.warns.some((w) => w.includes("workspace 10"))).toBe(true);
+    // 成功空间继续：ws 20 的拒绝事实照常投递（一次失败没有把整轮变成"什么都没发生"）。
+    expect(
+      harnessed.ledger.rows.some((row) => row.row.source_id === "2" && row.row.reason_code === "forward_apply_error"),
+    ).toBe(true);
+
+    // 下一拍：读成功、且该转发确实不再被拒 ⇒ 恢复事实**这时才**说出口（不是丢失）。
+    delete throws[10];
+    const second = await runForwardDenialNotifications(harnessed.deps);
+    expect(second.recovered_derived).toBe(1);
+    expect(second.recovered).toBe(1);
+    expect(
+      harnessed.ledger.rows
+        .filter((row) => row.row.reason_code === "forward_apply_recovered")
+        .map((row) => row.row.source_id),
+    ).toEqual(["1"]);
+  });
+
+  test("读失败的空间里**仍在拒绝**的转发：下一拍读到后不报恢复（它还在拒绝）", async () => {
+    const throws: Record<number, Error> = { 10: new Error("db down") };
+    const harnessed = harness({
+      tunnels: [{ id: 1, workspace_id: 10, name: "still-denied", apply_status: "error", updated_at: T0 }],
+      openDenials: [{ source_id: "1", channel_kind: "email" }],
+      itemsByWorkspace: { 10: [denialItem({ id: 1, name: "still-denied" })] },
+      collectThrows: throws,
+      channels: [emailChannel().channel],
+      audience: async () => ({ ok: true, recipients: [MEMBER] }),
+    });
+
+    const first = await runForwardDenialNotifications(harnessed.deps);
+    expect(first.recovered_derived).toBe(0);
+
+    // 下一拍读到了，但它**仍在拒绝** ⇒ 依旧不发恢复（同一台转发不能被同时说成坏了和好了）。
+    delete throws[10];
+    const second = await runForwardDenialNotifications(harnessed.deps);
+    expect(second.recovered_derived).toBe(0);
+    expect(harnessed.ledger.rows.filter((row) => row.row.reason_code === "forward_apply_recovered")).toEqual([]);
+  });
 });
 
 /* ================================================================== */

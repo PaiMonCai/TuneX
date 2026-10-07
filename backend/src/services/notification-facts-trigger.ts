@@ -42,7 +42,12 @@ export const FORWARD_DENIAL_REASON = "forward_apply_error" as const;
 /** 被跳过的事实 + 原因（跳过必须**可解释**，否则等于静默丢弃）。 */
 export interface SkippedDenialFact {
   readonly forward_id: number;
-  readonly reason: "occurred_at_unavailable";
+  /**
+   * `occurred_at_unavailable` = 来源行取不到（转发已删除 / 快照里没有）。
+   * `workspace_unreadable` = 这个转发所属 workspace **本拍没读到**：故障与恢复**都不能说**，
+   * 留到下一拍重试（详情见 {@link DiscoveryBacklogSource.unreadableWorkspaceIds}）。
+   */
+  readonly reason: "occurred_at_unavailable" | "workspace_unreadable";
 }
 
 export interface SelectResult {
@@ -116,6 +121,20 @@ export interface DiscoveryBacklogSource {
   readonly openDenials: readonly OpenDenialEpisode[];
   /** 按转发 id 取来源行；缺行 = 该转发在扫描后已消失（不猜、跳过）。 */
   readonly rowOf: (forwardId: number) => ForwardDenialRow | null;
+  /**
+   * 本拍**读取失败**的 workspace（`collectItems` 抛错）。
+   *
+   * ── 为什么它是必填的（而不是"没读到就当没有"）──
+   * `items` 只包含**读成功**的空间的条目。若编排层只从 `items` 反推"谁还在拒绝"，一个读失败的
+   * 空间在那一拍就什么都看不见 —— 而"看不见"会被渲染成"已经好了"：账本里那条**仍然开着**的
+   * 拒绝会被配成一条 `forward_apply_recovered`（假恢复，P1 缺陷现场）。
+   *
+   * 所以：失败空间**既不产生故障事实、也不产生恢复事实**；它的转发留到下一拍重试。
+   * 这个集合必须**每拍重新计算**（`load()` 里现场累计）—— 读成功就自动恢复，不引入任何
+   * 跨拍的"坏空间"记忆，也**不**去查库里的 `apply_status` 另立第二套判据（状态列回答的是
+   * "期望 vs 实际"，回答不了"这一拍我们读到了什么"）。
+   */
+  readonly unreadableWorkspaceIds: readonly number[];
 }
 
 export interface DeliveryBacklogDeps {
@@ -151,7 +170,7 @@ export function shouldWarnNoChannels(input: { facts_derived: number; channels_op
 }
 
 export interface ForwardDenialRunSummary {
-  /** 本拍**看到的**待办条目数（attention 派生结果，与"有没有渠道"无关）。 */
+  /** 本拍**看到的**待办条目数（**读得到的** workspace 的 attention 派生结果，与"有没有渠道"无关）。 */
   readonly considered: number;
   /**
    * 本拍**派生出来的事实数**（渠道过滤**之前**）。
@@ -186,8 +205,25 @@ export async function runForwardDenialNotifications(
   deps: DeliveryBacklogDeps,
 ): Promise<ForwardDenialRunSummary> {
   const source = await deps.load();
+  // ── 本拍**读失败**的 workspace：故障与恢复**都不能说** ──
+  //
+  // `items` 只含读成功的空间。若直接从 `items` 反推"谁还在拒绝"，读失败的空间会被当成
+  // "已经不在拒绝里" ⇒ 账本里那条**仍然开着**的拒绝被配成 `forward_apply_recovered`（假恢复）。
+  // 所以两个方向一起排除：故障候选（items）与恢复候选（openDenials）都只认**读得到**的空间，
+  // 失败空间的转发留到下一拍（`load()` 每拍重新算这个集合，不记忆、不查库里的 status）。
+  const unreadable = new Set(source.unreadableWorkspaceIds);
+  const workspaceOf = (forwardId: number): number | null => source.rowOf(forwardId)?.workspace_id ?? null;
+  const fromUnreadableWorkspace = (forwardId: number): boolean => {
+    const workspaceId = workspaceOf(forwardId);
+    return workspaceId !== null && unreadable.has(workspaceId);
+  };
+  // 防御性显式化：当前 `load()` 的失败空间根本不会 push 任何条目，这一句是**无操作**；
+  // 它把"失败空间不产生事实"从"刚好没进去"变成代码里的契约（写两处排除，读代码不用推理）。
+  const items =
+    unreadable.size === 0 ? source.items : source.items.filter((item) => !fromUnreadableWorkspace(item.id));
+
   const { seeds, skipped } = selectForwardDenialFacts({
-    items: source.items,
+    items,
     occurredAtOf: (id) => source.rowOf(id)?.updated_at ?? null,
   });
 
@@ -209,12 +245,29 @@ export async function runForwardDenialNotifications(
 
   // 恢复：同一拍、同一批依赖、**同一次投递调用**（不建第二条投递路径）。
   const stillDenied = new Set(
-    source.items
+    items
       .filter((i) => i.kind === "forward" && i.reason_code === FORWARD_DENIAL_REASON)
       .map((i) => i.id),
   );
+  // 读失败的空间：它的"开着的拒绝"**不能**在这一拍被配成恢复（`items` 里没有它的条目，
+  // 不是因为好了，而是因为没读到）。排除而不是"当作仍在拒绝"：两种写法都不发恢复，
+  // 但排除能**如实**把它计进 `skipped`（可见），而不是让它在沉默中被当成拒绝。
+  // 按 forward 去重（一条拒绝可能横跨多个渠道 = 多行账本），与选择层的去重口径一致。
+  const recoveryInput: OpenDenialEpisode[] = [];
+  const deferred: SkippedDenialFact[] = [];
+  const deferredIds = new Set<number>();
+  for (const episode of source.openDenials) {
+    if (fromUnreadableWorkspace(episode.forward_id)) {
+      if (!deferredIds.has(episode.forward_id)) {
+        deferredIds.add(episode.forward_id);
+        deferred.push({ forward_id: episode.forward_id, reason: "workspace_unreadable" });
+      }
+      continue;
+    }
+    recoveryInput.push(episode);
+  }
   const recovery = selectForwardRecoveryFacts({
-    openDenials: source.openDenials,
+    openDenials: recoveryInput,
     stillDeniedIds: stillDenied,
     occurredAtOf: (id) => source.rowOf(id)?.updated_at ?? null,
   });
@@ -237,7 +290,8 @@ export async function runForwardDenialNotifications(
   // 派生结果先记下来：下面的两个 return 分支都带上它（"看到多少"与"投出多少"是两个问题）。
   const derived = facts.length;
   const derivedRecovered = recovery.seeds.length;
-  const skippedTotal = skipped.length + recovery.skipped.length;
+  // 读失败空间里"开着的拒绝"也计进 `skipped`：它这一拍**没有**被说成恢复（跳过必须可见）。
+  const skippedTotal = skipped.length + recovery.skipped.length + deferred.length;
 
   if (derived === 0 || channels.length === 0) {
     // 没有事实、或**一个渠道都没打开**：不投递、不产生账本行（避免用 `not_configured`
@@ -252,7 +306,7 @@ export async function runForwardDenialNotifications(
       );
     }
     return {
-      considered: source.items.length,
+      considered: items.length,
       facts_derived: derived,
       recovered_derived: derivedRecovered,
       channels_open: channels.length,
@@ -266,7 +320,7 @@ export async function runForwardDenialNotifications(
 
   await deps.deliver(facts, channels);
   return {
-    considered: source.items.length,
+    considered: items.length,
     facts_derived: derived,
     recovered_derived: derivedRecovered,
     channels_open: channels.length,
@@ -621,10 +675,16 @@ export function createForwardDenialDeps(deps: ForwardDenialWiringDeps): Delivery
       const workspaceIds = uniqPositiveInts(candidates.map((row) => Number(row.workspace_id)));
 
       const items: AttentionItem[] = [];
+      // 本拍**读失败**的 workspace：既不能产生故障事实（`items` 里没有它的条目），
+      // 也**不许**产生恢复事实（它的"开着的拒绝"因为看不到而不是好了）——所以必须记下来
+      // 交给编排层排除（见 `DiscoveryBacklogSource.unreadableWorkspaceIds`）。
+      // 每拍现场累计、不持久化：下一拍读成功就自然恢复，不存在"坏空间"记忆。
+      const unreadableWorkspaceIds: number[] = [];
       for (const workspaceId of workspaceIds) {
         try {
           items.push(...(await deps.collectItems(workspaceId)));
         } catch (err) {
+          unreadableWorkspaceIds.push(workspaceId);
           // 单个 workspace 取不到 ⇒ 本拍跳过它并留痕：不许把一次读取失败当成"这个空间没有事实"。
           warn(`workspace ${workspaceId} 的待办聚合失败，本拍跳过（下一拍重试）`, err);
         }
@@ -662,6 +722,9 @@ export function createForwardDenialDeps(deps: ForwardDenialWiringDeps): Delivery
           if (!row) return null;
           return { updated_at: new Date(row.updated_at), workspace_id: Number(row.workspace_id) };
         },
+        // 与 `items` 属于**同一拍**的快照：哪些空间这一拍没读到，决定了哪些"开着的拒绝"
+        // 不许在这一拍被配成恢复（二者必须同源，否则又会出现"两个时刻的世界"）。
+        unreadableWorkspaceIds: uniqPositiveInts(unreadableWorkspaceIds),
       };
     },
 

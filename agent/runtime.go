@@ -15,6 +15,7 @@ import (
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/ownership"
+	"github.com/tunex/agent/internal/panelroute"
 	"github.com/tunex/agent/internal/reporter"
 	"github.com/tunex/agent/internal/restore"
 	"github.com/tunex/agent/internal/selfinfo"
@@ -230,6 +231,45 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 	// tunnel. Cancelled with the process context like everything else.
 	go ownerGuard.Run(ctx)
 
+	// 面板迁移回退（task-44/45）：把 agent.env 里的回退三元组解析出来。
+	// 解析纪律与配置面一致：**只填一个 = 配置写坏了**，这时必须记 ERROR 并**保持不切**
+	// （退回"没有回退能力"），而不是猜一个地址去切 —— 猜错会把节点从可用面板上带走。
+	panels := panelroute.PanelMigration{}
+	if migration, merr := cfg.PanelMigration(); merr == nil {
+		panels = panelroute.PanelMigration{
+			PrimaryURL:     migration.PrimaryURL,
+			FallbackURL:    migration.FallbackURL,
+			MigrationID:    migration.MigrationID,
+			StartedAt:      migration.StartedAt,
+			StartedAtKnown: migration.StartedAtKnown,
+		}
+		logx.Info("panel migration fallback enabled",
+			"node_id", cfg.NodeID,
+			"migration_id", migration.MigrationID,
+			"fallback_url", migration.FallbackURL,
+			"started_at_known", migration.StartedAtKnown)
+	} else if !errors.Is(merr, agentconfig.ErrPanelMigrationNotConfigured) {
+		logx.Error("panel migration fallback config is invalid; the agent will NOT switch panels",
+			"node_id", cfg.NodeID, "error", merr.Error())
+	}
+
+	// 共享切换器必须在这里、也就是在**启动任何出站 goroutine 之前**建好：状态上报、
+	// 命令拉取、ACK、重连 desired fetch/reconcile 都要读同一个"当前生效地址"，谁都
+	// 不能各拿一份 cfg.PanelHTTPURL 自己判定（task-45 的 P1）。构造顺序很重要：
+	// control.New 的 Reconnected 闭包会捕获这个指针，但它是在**对账发生的那一刻**才
+	// 读地址，所以 reporter 还没 Run 也不影响；反过来若先起 control 而没有这个指针，
+	// 就会退回"命令永远打主地址"。
+	//
+	// 没有凭据就不建：那样两条出站链路都不会启动，节点本来也不与面板通话。
+	var panelRouter *panelroute.Router
+	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
+		panelRouter = panelroute.New(panelroute.Config{
+			PrimaryURL: cfg.PanelHTTPURL,
+			Migration:  panels,
+			NodeID:     cfg.NodeID,
+		})
+	}
+
 	// 3. Outbound control loop. The Agent polls the Panel with its per-node
 	// credential; the Panel never dials this process. This is the production
 	// control path for DIRECT/RELAY/EGRESS. The local admin API above is debug-only.
@@ -237,14 +277,20 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		rt.control = control.New(control.Config{
 			PanelURL:   cfg.PanelHTTPURL,
 			Credential: cfg.NodeCredential,
-			Errors:     ledger,
-			Revisions:  revisions,
+			// 面板地址：与状态上报共用同一个切换器。拉取与 ACK 每次请求都取当前
+			// 生效地址，切换后同一进程即时生效；拉取结果反过来喂同一个判定（不再
+			// 每模块复制一份切换规则）。
+			Router:    panelRouter,
+			Errors:    ledger,
+			Revisions: revisions,
 			// reconnect reconciliation: when the panel becomes reachable again, re-fetch the
 			// authoritative desired state and drop anything it no longer lists.
 			// A node that restored from its cache would otherwise keep running a
 			// forward the panel has already deleted or suspended.
 			Reconnected: func(rctx context.Context) {
-				reconcileWithPanel(rctx, cfg, tunnels, egress, rt.cache)
+				// desired fetch 同样走当前生效地址：上报恢复了 online 而对账仍打
+				// 主地址，正是 task-45 要修的那个"半恢复"。
+				reconcileWithPanel(rctx, cfg, panelRouter, tunnels, egress, rt.cache)
 			},
 			// node diagnostics: answer a Node-level diagnostic with this process's own
 			// bounded facts. Wired here because the runtime owns the tunnel
@@ -304,31 +350,13 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		logx.Info("target observation scheduled",
 			"node_id", cfg.NodeID, "interval", observer.Interval().String())
 	}
-	// 面板迁移回退（task-44）：把 agent.env 里的回退三元组解析出来交给上报侧。
-	// 解析纪律与配置面一致：**只填一个 = 配置写坏了**，这时必须记 ERROR 并**保持不切**
-	// （退回"没有回退能力"），而不是猜一个地址去切 —— 猜错会把节点从可用面板上带走。
-	panels := reporter.PanelMigration{}
-	if migration, merr := cfg.PanelMigration(); merr == nil {
-		panels = reporter.PanelMigration{
-			PrimaryURL:     migration.PrimaryURL,
-			FallbackURL:    migration.FallbackURL,
-			MigrationID:    migration.MigrationID,
-			StartedAt:      migration.StartedAt,
-			StartedAtKnown: migration.StartedAtKnown,
-		}
-		logx.Info("panel migration fallback enabled",
-			"node_id", cfg.NodeID,
-			"migration_id", migration.MigrationID,
-			"fallback_url", migration.FallbackURL,
-			"started_at_known", migration.StartedAtKnown)
-	} else if !errors.Is(merr, agentconfig.ErrPanelMigrationNotConfigured) {
-		logx.Error("panel migration fallback config is invalid; the agent will NOT switch panels",
-			"node_id", cfg.NodeID, "error", merr.Error())
-	}
+	// 面板迁移回退（task-44/45）：解析出来的三元组与**进程共享的**切换器一起交给
+	// 上报侧。切换判据只有一份（panelroute.Router），命令拉取/ACK/desired 用的是同一个。
 	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
 			Panels:     panels,
+			Router:     panelRouter,
 			AgentID:    cfg.AgentID,
 			NodeID:     cfg.NodeID,
 			Version:    version,

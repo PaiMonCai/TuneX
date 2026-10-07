@@ -311,6 +311,27 @@ describe("期望（首选入口）与事实（当前归属 / 连接 / 准入）�
     expect(visibleText(html)).toContain("不可设为首选（role_mismatch）");
   });
 
+  test("显式停用的成员不能设为首选，界面显示服务端拒绝原因", () => {
+    const html = render(
+      data({
+        ...PROJECTION,
+        ingress_members: {
+          status: "ok",
+          nodes: [NODE_OPTION({
+            is_disabled: true,
+            can_be_preferred: false,
+            preference_rejection: "member_disabled",
+            can_take_over: false,
+            takeover_rejection: "member_disabled",
+          })],
+        },
+      }),
+    );
+    expect(html).toContain('data-testid="forward-ha-option-rejected-1"');
+    expect(html).not.toContain('data-testid="forward-ha-set-1"');
+    expect(visibleText(html)).toContain("不可设为首选（member_disabled）");
+  });
+
   test("preferredCandidates / optionOf 是纯函数（按 id 升序、只管行内数据）", () => {
     expect(preferredCandidates(PROJECTION).map((n) => n.node_id)).toEqual([1, 2]);
     expect(optionOf(PROJECTION, 2)?.name).toBe("ha16-node-b");
@@ -859,6 +880,33 @@ describe("mock：GET /forwards/:id/ha 与 PUT /forwards/:id/preferred-ingress", 
     const cleared = await call("PUT", ["forwards", "1", "preferred-ingress"], { node_id: null });
     expect(cleared.body.preferred_ingress_node_id).toBeNull();
     expect((await call("GET", ["forwards", "1", "ha"])).body.preferred_ingress_node_id).toBeNull();
+  });
+
+  test("停用成员的 mock 拒绝首选写入；重新启用后可设置", async () => {
+    const saved = await call("PUT", ["forwards", "1", "ingress-members"], {
+      members: [{ node_id: 1 }, { node_id: 2, is_enabled: false }],
+    });
+    expect(saved.status).toBe(200);
+    const denied = await call("PUT", ["forwards", "1", "preferred-ingress"], { node_id: 2 });
+    expect(denied.status).toBe(400);
+    expect(denied.body.code).toBe(PREFERRED_INGRESS_ERROR_CODES.preferred_disabled);
+    const projection = (await call("GET", ["forwards", "1", "ha"])).body as ForwardHaProjection;
+    const disabled = projection.ingress_members.nodes.find((node) => node.node_id === 2)!;
+    expect(disabled.is_disabled).toBe(true);
+    expect(disabled.can_be_preferred).toBe(false);
+    expect(disabled.preference_rejection).toBe("member_disabled");
+    expect(disabled.is_failback_target).toBe(false);
+    expect(projection.preferred_ingress_node_id).toBe(1);
+    const cleared = await call("PUT", ["forwards", "1", "preferred-ingress"], { node_id: null });
+    expect(cleared.status).toBe(200);
+    await call("PUT", ["forwards", "1", "ingress-members"], { members: [{ node_id: 1 }, { node_id: 2 }] });
+    expect((await call("PUT", ["forwards", "1", "preferred-ingress"], { node_id: 2 })).status).toBe(200);
+  });
+
+  test("停用成员写入失败在中英文界面都有明确解释", () => {
+    const writeError = { code: PREFERRED_INGRESS_ERROR_CODES.preferred_disabled, message: "preferred disabled", layer: "failover" };
+    expect(visibleText(render(data(PROJECTION), "zh", { writeError }))).toContain("该成员已被停用，请先启用它再设为首选入口");
+    expect(visibleText(render(data(PROJECTION), "en", { writeError }))).toContain("This member is disabled. Enable it before setting it as the preferred ingress.");
   });
 
   test("PUT 拒绝码与后端同源：不存在 / 跨组 / 角色不符 / 形状非法", async () => {

@@ -18,6 +18,7 @@ import (
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/ownership"
+	"github.com/tunex/agent/internal/panelroute"
 	"github.com/tunex/agent/internal/selfinfo"
 )
 
@@ -43,6 +44,22 @@ type RevisionObserver interface {
 type Config struct {
 	PanelURL   string
 	Credential string
+
+	// Router, when set, is the process-wide panel-route switcher shared with the
+	// state reporter (task-45). pull/ack ask it for the CURRENT active base URL
+	// on every request — never a value captured at build time — so a fallback
+	// switch becomes effective in this same process without a restart.
+	//
+	// Every pull's outcome is fed back into it, so this loop's own reachability
+	// observations drive the same single decision the reporter drives. Threshold,
+	// deadline, success-resets and no-auto-switch-back are unchanged; the shared
+	// counter just means "consecutive failures to the panel", whichever control
+	// surface observed them. ACK is deliberately NOT fed: it follows a successful
+	// pull, and the next pull is the honest verdict on that address.
+	//
+	// nil = pinned to PanelURL (standalone use / tests without a configured
+	// fallback), which is exactly the pre-task-45 behaviour.
+	Router *panelroute.Router
 
 	// Optional telemetry sinks; nil disables recording.
 	Errors    ErrorRecorder
@@ -158,7 +175,37 @@ func New(cfg Config, tunnels *manager.TunnelManager, egress *manager.EgressManag
 }
 
 func (c *Client) enabled() bool {
-	return strings.TrimSpace(c.cfg.PanelURL) != "" && strings.TrimSpace(c.cfg.Credential) != ""
+	return c.baseURL() != "" && strings.TrimSpace(c.cfg.Credential) != ""
+}
+
+// baseURL resolves the panel base address for the next request.
+//
+// The switcher is consulted PER REQUEST rather than captured once, which is what
+// makes a fallback switch take effect on the very next pull/ACK in this process.
+// A nil/empty router falls back to the configured PanelURL, so an agent without
+// the migration fallback (or a standalone client) keeps the old behaviour
+// byte-for-byte.
+func (c *Client) baseURL() string {
+	if c.cfg.Router != nil {
+		if active := c.cfg.Router.ActiveURL(); active != "" {
+			return active
+		}
+	}
+	return strings.TrimRight(strings.TrimSpace(c.cfg.PanelURL), "/")
+}
+
+// notePanelAttempt feeds one pull's outcome to the shared switcher (no-op without
+// one). See Config.Router for why the pull is the control loop's reachability
+// signal and the ACK is not.
+func (c *Client) notePanelAttempt(err error) {
+	if c.cfg.Router == nil {
+		return
+	}
+	if err != nil {
+		c.cfg.Router.NoteOutcome(panelroute.PanelOutcomeFailure, time.Now())
+		return
+	}
+	c.cfg.Router.NoteOutcome(panelroute.PanelOutcomeSuccess, time.Now())
 }
 
 func (c *Client) Run(ctx context.Context) error {
@@ -170,6 +217,7 @@ func (c *Client) Run(ctx context.Context) error {
 			return err
 		}
 		cmd, err := c.pull(ctx)
+		c.notePanelAttempt(err)
 		if err != nil {
 			logx.Debug("control pull failed", "err", err.Error())
 			c.reachable = false
@@ -261,7 +309,7 @@ func (c *Client) recordError(code, resourceID, message string) {
 const maxReportedErrorBytes = 500
 
 func (c *Client) pull(ctx context.Context) (*QueuedCommand, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.cfg.PanelURL, "/")+commandsPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL()+commandsPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +608,7 @@ func (c *Client) ack(ctx context.Context, ack ackPayload) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.cfg.PanelURL, "/")+ackPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL()+ackPath, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

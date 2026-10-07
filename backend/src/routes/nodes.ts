@@ -351,6 +351,180 @@ nodesRoutes.post("/:ingressId/upgrade-command", async (c) => {
 });
 
 /**
+ *  —— `GET /api/nodes/:id/support-bundle`
+ *
+ * 一次排障快照。两条纪律：
+ *   1. **白名单采集 + 确定性脱敏**（services/support-bundle.ts），凭据哈希永不入内；
+ *   2. **按调用者权限裁剪段落**——只有 node:read 的身份不会拿到转发明细或审计记录，
+ *      并且产物里会写明"为什么没有"。node 读出权限本身不隐含 forward/audit 读权限。
+ *
+ * 只读：不产生 Agent 命令、不移动 revision。
+ */
+nodesRoutes.get("/:ingressId/support-bundle", async (c) => {
+  const ws = workspace(c);
+  const nodeId = idParam(c, "ingressId");
+  if (nodeId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+  const sections = {
+    forwards: canWorkspaceResourceAction(ws, "read", "forward"),
+    audit: canWorkspaceResourceAction(ws, "read", "audit"),
+  };
+  const result = await collectSupportBundle(nodeId, ws.id, defaultSupportBundleDeps(), sections);
+  if (!result.ok) {
+    return c.json({ error: result.message, code: result.code, error_layer: result.error_layer }, result.status);
+  }
+  return c.json({ data: result.bundle });
+});
+
+/* ------------------------------------------------------------------ */
+/* Ingress <-> Egress bindings                                        */
+/* ------------------------------------------------------------------ */
+
+nodesRoutes.get("/:ingressId/bindings", async (c) => {
+  const ws = workspace(c);
+  const ingressId = idParam(c, "ingressId");
+  if (ingressId === null) return c.json({ error: "入口节点 ID 不合法" }, 400);
+  const ingress = await loadWorkspaceNode(ingressId, ws.id);
+  if (!ingress) return c.json({ error: "入口节点不存在" }, 404);
+  if (ingress.role !== "ingress" && ingress.role !== "both") {
+    return c.json({ error: "该节点不具备入口能力" }, 409);
+  }
+
+  const rows = await db.nodeBinding.findMany({
+    where: {
+      ingress_node_id: ingressId,
+      egress_node: { node_group: { workspace_id: ws.id } },
+    },
+    orderBy: { id: "asc" },
+    include: {
+      egress_node: { select: nodeSelect },
+    },
+  });
+
+  //  §13.6「Binding usage」：一次 groupBy 拿到全部出口的使用量，
+  // 而不是每个绑定查一次（N+1 在绑定量上来后是列表页的主要延迟来源）。
+  const usageVisible = canWorkspaceResourceAction(ws, "read", "forward");
+  const usage = bindingUsageMap(
+    usageVisible ? await db.tunnel.groupBy({
+      by: ["ingress_node_id", "egress_node_id"],
+      where: {
+        workspace_id: ws.id,
+        category: "port_forward",
+        tunnel_mode: "relay",
+        ingress_node_id: ingressId,
+        egress_node_id: { not: null },
+      },
+      _count: { _all: true },
+    }).then((groups) =>
+      groups.map((group) => ({
+        ingress_node_id: group.ingress_node_id,
+        egress_node_id: group.egress_node_id,
+        count: group._count._all,
+      })),
+    ) : [],
+  );
+
+  return c.json({
+    data: rows.map((row) => ({
+      id: row.id,
+      ingress_node_id: row.ingress_node_id,
+      egress_node_id: row.egress_node_id,
+      egress_node: nodeView(row.egress_node),
+      created_at: row.created_at,
+      // 使用量是响应投影（不新增列）：用户在解绑前就能看到影响面。
+      usage_visible: usageVisible,
+      ...(usageVisible ? lookupBindingUsage(usage, row.ingress_node_id, row.egress_node_id) : { used_by_forward_count: null, unbind_blocked: null, usage: null }),
+    })),
+  });
+});
+
+const BindingInput = z.object({
+  egress_node_id: z.number().int().positive(),
+});
+
+nodesRoutes.post("/:ingressId/bindings", async (c) => {
+  const ws = workspace(c);
+  const ingressId = idParam(c, "ingressId");
+  if (ingressId === null) return c.json({ error: "入口节点 ID 不合法" }, 400);
+  const parsed = BindingInput.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "出口节点 ID 不合法" }, 400);
+
+  const [ingress, egress] = await Promise.all([
+    loadWorkspaceNode(ingressId, ws.id),
+    loadWorkspaceNode(parsed.data.egress_node_id, ws.id),
+  ]);
+  if (!ingress) return c.json({ error: "入口节点不存在" }, 404);
+  if (!egress) return c.json({ error: "出口节点不存在" }, 404);
+  if (ingress.id === egress.id) return c.json({ error: "入口和出口不能是同一节点" }, 409);
+  if (ingress.role !== "ingress" && ingress.role !== "both") {
+    return c.json({ error: "入口节点角色必须是 ingress 或 both" }, 409);
+  }
+  if (egress.role !== "egress" && egress.role !== "both") {
+    return c.json({ error: "出口节点角色必须是 egress 或 both" }, 409);
+  }
+
+  const created = await db.nodeBinding.upsert({
+    where: {
+      ingress_node_id_egress_node_id: {
+        ingress_node_id: ingress.id,
+        egress_node_id: egress.id,
+      },
+    },
+    update: {},
+    create: { ingress_node_id: ingress.id, egress_node_id: egress.id },
+  });
+  return c.json({
+    data: {
+      ...created,
+      egress_node: nodeView(egress),
+      //  §13.6：新建绑定必然 0 使用量；仍显式返回，让前端的绑定行
+      // 处理逻辑不需要区分「刚创建」与「列表返回」两种形状。
+      ...bindingUsage(0),
+    },
+  }, 201);
+});
+
+nodesRoutes.delete("/:ingressId/bindings/:egressId", async (c) => {
+  const ws = workspace(c);
+  const ingressId = idParam(c, "ingressId");
+  const egressId = idParam(c, "egressId");
+  if (ingressId === null || egressId === null) return c.json({ error: "节点 ID 不合法" }, 400);
+
+  const [ingress, egress] = await Promise.all([
+    loadWorkspaceNode(ingressId, ws.id),
+    loadWorkspaceNode(egressId, ws.id),
+  ]);
+  if (!ingress || !egress) return c.json({ error: "节点不存在" }, 404);
+
+  const used = await db.tunnel.count({
+    where: {
+      workspace_id: ws.id,
+      ingress_node_id: ingressId,
+      egress_node_id: egressId,
+      tunnel_mode: "relay",
+    },
+  });
+  if (used > 0) {
+    //  §13.6：409 文案由 `binding-usage.ts` 单点提供，与列表响应里的
+    // `used_by_forward_count` / `unbind_blocked` 用同一份判定；并回传使用量，
+    // 让前端在错误分支也能刷新按钮状态（而不是只弹一句话）。
+    return c.json(
+      {
+        error: canWorkspaceResourceAction(ws, "read", "forward") ? unbindBlockedMessage(used) : "该绑定仍存在业务依赖，请由有转发权限的成员处理后再解绑",
+        code: "binding_in_use",
+        error_layer: "runtime_admission",
+        ...(canWorkspaceResourceAction(ws, "read", "forward") ? bindingUsage(used) : {}),
+      },
+      409,
+    );
+  }
+
+  await db.nodeBinding.deleteMany({
+    where: { ingress_node_id: ingressId, egress_node_id: egressId },
+  });
+  return c.json({ data: { ok: true } });
+});
+
+/**
  * R1-A —— `GET /api/nodes/:id/upgrade-state`
  *
  * 升级卡片的**只读**事实来源。为什么必须由服务端提供（而不是前端把几个字段凑出来）：
@@ -477,6 +651,7 @@ async function loadPanelMigration() {
   }
 }
 
+/* ------------------------------------------------------------------ */
 /* PortForward compatibility API                                      */
 /* ------------------------------------------------------------------ */
 /**

@@ -27,7 +27,7 @@
  *
  * ── 写入口的边界 ──
  *
- *  `can_be_preferred` 只反映**写入路径自己检查的两条规则**（同入口组 + `role ∈ {ingress,both}`），
+ *  `can_be_preferred` 只反映**写入路径自己的规则**（同入口组 + `role ∈ {ingress,both}` + 未显式停用），
  *  所以一台 `connection=offline` 甚至 `lifecycle=maintenance` 的节点照样能被设为首选 ——
  *  界面上这些字段并列显示，绝不合成一句"可以接管"。真正的门槛（连续健康次数 + 冷却）
  *  由平台策略在后续节拍判，本卡片不重复判定、也不预告结果。
@@ -247,6 +247,7 @@ const ZH: HaCopy = {
     preferred_not_found: "节点或转发不存在（可能已被删除）。",
     preferred_node_group_mismatch: "首选节点必须属于这条转发的入口节点组。",
     preferred_role_mismatch: "该节点的角色不能作为入口（需要 ingress 或 both）。",
+    preferred_disabled: "该成员已被停用，请先启用它再设为首选入口。",
     preferred_unavailable: "平台暂时无法写入这个偏好，请稍后重试。",
     permission_denied: "当前工作空间角色没有修改这条转发的权限。",
   },
@@ -365,6 +366,7 @@ const EN: HaCopy = {
     preferred_not_found: "The node or forward does not exist (it may have been deleted).",
     preferred_node_group_mismatch: "The preferred node must belong to this forward's ingress node group.",
     preferred_role_mismatch: "That node's role cannot be an ingress (ingress or both required).",
+    preferred_disabled: "This member is disabled. Enable it before setting it as the preferred ingress.",
     preferred_unavailable: "The platform cannot write this preference right now; try again later.",
     permission_denied: "Your workspace role may not modify this forward.",
   },

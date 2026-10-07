@@ -21,8 +21,8 @@
  *      `unavailable` **不得**被渲染成"没有高可用"——那是把"我不知道"说成了结论。
  *
  * `preference_options.nodes[].connection` / `accepts_new_business` 是**并列的事实**
- * （连接 / 准入），`can_be_preferred` 才是"能不能设为首选"（只由写入路径的两条规则决定：
- * 同入口组 + `role ∈ {ingress, both}`）。四者不可互相替代：一台维护中的节点
+ * （连接 / 准入），`can_be_preferred` 才是"能不能设为首选"（由写入路径规则决定：
+ * 同入口组 + `role ∈ {ingress, both}` + 未在成员次序中显式停用）。四者不可互相替代：一台维护中的节点
  * `connection=online`、`accepts_new_business=false`、却仍然 `can_be_preferred=true`。
  */
 import { get, put } from "./core";
@@ -61,9 +61,9 @@ export interface ForwardHaOptionNode {
   is_active_ingress: boolean;
   /** 期望：它被设为首选。 */
   is_preferred: boolean;
-  /** 写入路径规则（同入口组 + role∈{ingress,both}）⇒ 能不能设为首选。 */
+  /** 写入路径规则（同入口组 + role∈{ingress,both} + 未显式停用）⇒ 能不能设为首选。 */
   can_be_preferred: boolean;
-  /** `can_be_preferred=false` 时的原因码（`role_undeclared` / `role_mismatch`）。 */
+  /** `can_be_preferred=false` 时的原因码（`role_undeclared` / `role_mismatch` / `member_disabled`）。 */
   preference_rejection: string | null;
   /** 事实：面板此刻能否与它通信（waiting | online | offline）。 */
   connection: string;
@@ -73,7 +73,7 @@ export interface ForwardHaOptionNode {
   accepts_new_business: boolean;
   /** `accepts_new_business=false` 时的原因码。 */
   admission_rejection: string | null;
-  /** 它此刻是不是平台的**回切目标**（偏好 ≠ 现任时才成立，与 failover 同口径）。 */
+  /** 它此刻是不是平台的**回切目标**（偏好 ≠ 现任且未显式停用，与 failover 同口径）。 */
   is_failback_target: boolean;
   /** 此刻能不能接管这条转发（非现任 + 准入 + 角色 + 凭据 + 在线，与 failover 同一份判定）。 */
   can_take_over: boolean;
@@ -93,7 +93,7 @@ export interface ForwardHaOptionNode {
 export interface ForwardHaFailback {
   /** 平台开关真值（与 `policy.auto_failback` 同源；这里重复一次是为了让"回切"可独立消费）。 */
   auto_failback: boolean;
-  /** 偏好 ≠ 现任时，平台此刻会把它当回切目标；否则 `null`。 */
+  /** 偏好 ≠ 现任且成员未显式停用时作为回切目标；否则 `null`。 */
   target_node_id: number | null;
   preferred_ingress_node_id: number | null;
   progress: {
@@ -230,5 +230,6 @@ export const PREFERRED_INGRESS_ERROR_CODES = {
   preferred_not_found: "preferred_not_found",
   preferred_node_group_mismatch: "preferred_node_group_mismatch",
   preferred_role_mismatch: "preferred_role_mismatch",
+  preferred_disabled: "preferred_disabled",
   preferred_unavailable: "preferred_unavailable",
 } as const;

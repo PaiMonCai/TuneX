@@ -65,7 +65,7 @@ import {
 } from "../services/latency-history.ts";
 import type { LatencyGranularity } from "../services/latency-history.ts";
 import { parseForwardBatchRequest } from "../services/forward-batch.ts";
-import { BILLING_TIME_ZONE, billingDayKeyStamp } from "../services/billing-time.ts";
+import { BILLING_TIME_ZONE, billingDayKeyStamp, billingDayStart } from "../services/billing-time.ts";
 import { dayKeyOf, fillDays } from "../services/traffic.ts";
 import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
 import {
@@ -372,9 +372,18 @@ forwardsRoutes.get("/:id/throughput", async (c) => {
   }
 
   // 今天的分母只算已过时间：拿不完整日与完整日比，会把正常波动读成业务下降。
+  //
+  // ⚠️ 分母的起点必须是**上海自然日的日首**（`billingDayStart`），**不是**
+  // `billingDayKeyStamp`。两者都叫"这一天"，但瞬时点不同：
+  //   · `billingDayStart(now)`    = 当日在上海的 00:00:00（= 前一日 16:00Z）；
+  //   · `billingDayKeyStamp(now)` = 当日**日标签的归档戳**（当日 00:00:00Z = 上海 08:00），
+  //     那是 `tunnel_traffic.date` 的**存储**约定，与自然日界无关（见 billing-time.ts 的说明）。
+  // 用归档戳做分母起点，在上海 08:00 之前差值**为负**（被 `Math.max(1, …)` 夹成 1 秒），
+  // 08:00 之后也只数到"当天已过的一部分"——于是同一份字节数据在上午被放大成几十倍的假速率。
+  // 存储口径（`todayKey` / `since` / 归档日键）保持 `billingDayKeyStamp` 不变：只改分母。
   const elapsedTodaySeconds = Math.max(
     1,
-    Math.floor((now.getTime() - billingDayKeyStamp(now).getTime()) / 1000),
+    Math.floor((now.getTime() - billingDayStart(now).getTime()) / 1000),
   );
 
   const keys = fillDays(days, now);
@@ -819,8 +828,8 @@ forwardsRoutes.put("/:id/ingress-members", async (c) => {
 //     `takeover_rejection` 说明第一个不满足的条件；这与 `failover_candidate: none` 是同一事实的
 //     两种粒度，UI 用细粒度的原因码解释"为什么切不过去"）。
 //
-// 「能不能当首选」（`can_be_preferred`）**只用写入路径自己检查的两条规则**（同入口组 +
-// `role ∈ {ingress,both}`，与 `preferred-ingress.ts` 同源）；`can_take_over` 才是 failover
+// 「能不能当首选」（`can_be_preferred`）**只用写入路径自己的规则**（同入口组 +
+// `role ∈ {ingress,both}` + 未在成员次序中显式停用，与 `preferred-ingress.ts` 同源）；`can_take_over` 才是 failover
 // 的判定（还要求生命周期与在线）。两者不同源、也不同答案：一台维护中的机器
 // `can_be_preferred=true` 但 `can_take_over=false`，UI 必须分开说。
 //

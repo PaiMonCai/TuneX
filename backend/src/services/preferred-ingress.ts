@@ -34,6 +34,14 @@ export const PREFERRED_INGRESS_ERROR_CODES = {
   preferred_node_group_mismatch: "preferred_node_group_mismatch",
   /** 目标节点角色不能当入口（`role` 为 egress/null）。 */
   preferred_role_mismatch: "preferred_role_mismatch",
+  /**
+   * 目标节点在这次成员次序里被**显式停用**（`forward_ingress_member.is_enabled = false`）。
+   *
+   * 与候选/failback 是同一条契约：停用是"这次不让它接管"的意图，停用的成员也不能当回切目标。
+   * 允许写下去只会存进一个**永远不会被执行**的偏好（读侧与 failover 又都把它排除），
+   * 而用户会以为自己设成功了 —— 所以写入路径直接拒绝，而不是静默接受。
+   */
+  preferred_disabled: "preferred_disabled",
   preferred_unavailable: "preferred_unavailable",
 } as const;
 
@@ -48,6 +56,17 @@ export type PreferredIngressErrorCode =
 export interface PreferredIngressDb {
   tunnel: { findFirst: (args: Prisma.TunnelFindFirstArgs) => Promise<unknown>; update: (args: Prisma.TunnelUpdateArgs) => Promise<unknown> };
   node: { findUnique: (args: Prisma.NodeFindUniqueArgs) => Promise<unknown> };
+  /**
+   * 入口成员次序（意图）的读面。**可选** —— 老替身与老调用方没有它时按"没有次序"处理，
+   * 于是既有语义（同组 + role 合格即可设为首选，离线/维护中也能设）原样保留。
+   *
+   * 为什么写入路径需要读它：`is_enabled=false` 的成员不参与接管（候选与 failback 都排除它），
+   * 所以把它设为首选是一个**永远不会生效**的写入。同一条契约必须在写侧也成立（见
+   * {@link PREFERRED_INGRESS_ERROR_CODES.preferred_disabled}）。
+   */
+  forwardIngressMember?: {
+    findMany: (args: Prisma.ForwardIngressMemberFindManyArgs) => Promise<unknown>;
+  };
 }
 
 export interface PreferredIngressDeps {
@@ -76,6 +95,10 @@ interface NodeRow extends CandidateFacts {
  * **允许把当前离线的节点设为首选**：偏好表达的是"这台机器回来后优先归它"，而不是"它此刻必须
  * 在线"。真正的健康门槛由策略在每一拍判定（`FAILBACK_HEALTHY_CHECKS` + 冷却），所以这里
  * 拦在线状态只会让运维在节点维护时无法预先表达意图。
+ *
+ * **唯一的例外是"这次次序里被显式停用"的成员**（`forward_ingress_member.is_enabled = false`）：
+ * 停用是"不让它接管"的意图，候选选择与 failback 目标都会排除它 ⇒ 写下去也永远不会生效。
+ * 次序**读不到**时按"没有次序"处理（不凭空禁用任何节点），与读侧的降级方向一致。
  */
 export async function setPreferredIngressNode(
   deps: PreferredIngressDeps,
@@ -120,6 +143,22 @@ export async function setPreferredIngressNode(
         code: PREFERRED_INGRESS_ERROR_CODES.preferred_role_mismatch,
         error: "该节点的角色不能作为入口（需要 ingress 或 both）",
       };
+    }
+    // 与候选/failback **同一份** `IngressOrderIndex`：显式停用的成员不能当回切目标。
+    // 次序读不到（`null`）⇒ 没有停用事实 ⇒ 保持既有语义（离线/维护中偏好仍可写），
+    // 一次可修复的读错误不该凭空把所有人的偏好变成非法。
+    if (deps.db.forwardIngressMember) {
+      const intent = await readIngressMemberIntent(
+        { forwardIngressMember: deps.db.forwardIngressMember },
+        tunnel.id,
+      );
+      if (ingressOrderIndexOf(intent).isDisabled(node.id)) {
+        return {
+          ok: false,
+          code: PREFERRED_INGRESS_ERROR_CODES.preferred_disabled,
+          error: "该节点在这次入口成员次序里已被停用：先启用它（或重排成员次序）再设为回切目标",
+        };
+      }
     }
   }
 
@@ -443,10 +482,13 @@ export interface IngressMemberView {
   is_active_ingress: boolean;
   /** 期望：它被设为首选入口。 */
   is_preferred: boolean;
-  /** 它此刻是平台的**回切目标**（偏好 ≠ 现任时才成立，与 failover 同口径）。 */
+  /** 它此刻是平台的**回切目标**（偏好 ≠ 现任、且它**没有**被这次次序停用，与 failover 同口径）。 */
   is_failback_target: boolean;
-  /** 写入路径规则（同入口组 + role∈{ingress,both}）⇒ 能不能设为首选。 */
+  /**
+   * 写入路径规则（同入口组 + `role∈{ingress,both}` + **未被本次次序显式停用**）⇒ 能不能设为首选。
+   */
   can_be_preferred: boolean;
+  /** `can_be_preferred=false` 时的原因码（`role_undeclared` / `role_mismatch` / `member_disabled`）。 */
   preference_rejection: string | null;
   /** 事实：连接（`deriveConnection`：waiting | online | offline）。 */
   connection: string;
@@ -546,10 +588,22 @@ export function buildIngressMemberViews(
       is_active_ingress: row.id === input.activeIngressId,
       is_preferred: row.id === input.preferredId,
       is_failback_target:
-        input.preferredId !== null && row.id === input.preferredId && input.preferredId !== input.activeIngressId,
-      can_be_preferred: roleOk,
-      // 词表与 `ingress-candidate.ts` 的 `role_undeclared` / `role_mismatch` 同一套。
-      preference_rejection: roleOk ? null : row.role == null ? "role_undeclared" : "role_mismatch",
+        input.preferredId !== null &&
+        row.id === input.preferredId &&
+        input.preferredId !== input.activeIngressId &&
+        // 与 `pickFailoverDestination` 一致：显式停用的成员**不会**被当作回切目标，
+        // 所以它也不能在界面上显示成"平台此刻会切回它"。
+        !isDisabled,
+      can_be_preferred: roleOk && !isDisabled,
+      // 词表与 `ingress-candidate.ts` 的 `role_undeclared` / `role_mismatch` 同一套；
+      // 停用复用接管侧的 `member_disabled`（同一个事实，不新造第二个词）。
+      preference_rejection: !roleOk
+        ? row.role == null
+          ? "role_undeclared"
+          : "role_mismatch"
+        : isDisabled
+          ? "member_disabled"
+          : null,
       connection: projected.connection,
       lifecycle: projected.lifecycle,
       accepts_new_business: projected.accepts_new_business,

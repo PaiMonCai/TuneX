@@ -1,7 +1,12 @@
-// 面板迁移回退的真值表（task-44）。
+// 面板迁移回退在 **Reporter 侧**的行为（task-44/45）。
 //
-// 这里钉的是**判据本身**（纯函数），不是像素：阈值、期限、清零、占用/失败时的
-// 状态迁移与"当前生效地址"，逐条断言。文件头的行为参照声明在 panel_migration.go。
+// 判据真值表已随实现搬到 internal/panelroute（那个包里逐条断言阈值/期限/清零/地址）。
+// 这里钉的是 reporter 与共享切换器的**接线**：
+//
+//	· 主地址连续失败 ⇒ 下一拍真的打到备用地址，载荷如实说明"在备用 + 哪个迁移"；
+//	· 未配置回退 ⇒ 失败多少次都不改地址，载荷不带迁移字段；
+//	· 注入的共享 Router 才是地址来源（reporter 不得自建一份私有状态，否则命令拉取
+//	  仍然盯着主地址 —— 那正是 task-45 修掉的 P1）。
 package reporter
 
 import (
@@ -10,12 +15,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tunex/agent/internal/panelroute"
 )
 
 var errTestPanelUnreachable = errors.New("test: panel unreachable")
 
-func testMigration(over func(*PanelMigration)) PanelMigration {
-	m := PanelMigration{
+func testMigration(over func(*panelroute.PanelMigration)) panelroute.PanelMigration {
+	m := panelroute.PanelMigration{
 		PrimaryURL:     "http://panel-primary:3000",
 		FallbackURL:    "http://panel-fallback:3000",
 		MigrationID:    "mig-2026-10-07",
@@ -29,155 +36,6 @@ func testMigration(over func(*PanelMigration)) PanelMigration {
 }
 
 func at(min int) time.Time { return time.Date(2026, 10, 7, 0, min, 0, 0, time.UTC) }
-
-func TestDecidePanelRoute_TruthTable(t *testing.T) {
-	cases := []struct {
-		name        string
-		migration   PanelMigration
-		state       PanelRouteState
-		signals     PanelRouteSignals
-		wantActive  PanelRoute
-		wantSwitch  bool
-		wantReason  string
-		wantFailing bool
-	}{
-		{
-			name:       "首次失败不足阈值 ⇒ 仍留在主地址（且计数 +1）",
-			migration:  testMigration(nil),
-			state:      ReadyPanelRoute(),
-			signals:    PanelRouteSignals{Now: at(0), Outcome: PanelOutcomeFailure},
-			wantActive: PanelRoutePrimary,
-		},
-		{
-			name:       "连续失败达阈值（2）⇒ 切备用，原因 failures",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 1},
-			signals:    PanelRouteSignals{Now: at(0), Outcome: PanelOutcomeFailure},
-			wantActive: PanelRouteFallback,
-			wantSwitch: true,
-			wantReason: "failures",
-		},
-		{
-			name:       "任一次成功清零 ⇒ 之后要重新连续失败两次才切",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 1},
-			signals:    PanelRouteSignals{Now: at(0), Outcome: PanelOutcomeSuccess},
-			wantActive: PanelRoutePrimary,
-		},
-		{
-			name:       "清零之后单次失败不再触发切换（阈值仍是 2）",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 0},
-			signals:    PanelRouteSignals{Now: at(0), Outcome: PanelOutcomeFailure},
-			wantActive: PanelRoutePrimary,
-		},
-		{
-			name:       "期限已过但**没有任何失败证据** ⇒ 不切（刻意偏离参照实现，见文件头）",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 0},
-			signals:    PanelRouteSignals{Now: at(10), Outcome: PanelOutcomeNone},
-			wantActive: PanelRoutePrimary,
-		},
-		{
-			name:       "期限已过 + 一次失败 ⇒ 切备用，原因 deadline",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 0},
-			signals:    PanelRouteSignals{Now: at(10), Outcome: PanelOutcomeFailure},
-			wantActive: PanelRouteFallback,
-			wantSwitch: true,
-			wantReason: "deadline",
-		},
-		{
-			name:       "期限未知（面板没下发 startedAt）⇒ 只用失败阈值",
-			migration:  testMigration(func(m *PanelMigration) { m.StartedAtKnown = false }),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 0},
-			signals:    PanelRouteSignals{Now: at(60), Outcome: PanelOutcomeFailure},
-			wantActive: PanelRoutePrimary,
-		},
-		{
-			name:       "长连接（事件流）存活期间不切、也不累加",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 1},
-			signals:    PanelRouteSignals{Now: at(10), Outcome: PanelOutcomeFailure, StreamAlive: true},
-			wantActive: PanelRoutePrimary,
-		},
-		{
-			name:        "备用地址上失败 ⇒ 如实标记 FallbackFailing（不假装在线，也不做第二次切换）",
-			migration:   testMigration(nil),
-			state:       PanelRouteState{Active: PanelRouteFallback, ConsecutiveFailures: 0},
-			signals:     PanelRouteSignals{Now: at(11), Outcome: PanelOutcomeFailure},
-			wantActive:  PanelRouteFallback,
-			wantFailing: true,
-		},
-		{
-			name:       "在备用地址上成功 ⇒ 留在备用（不自动切回；切回只由配置面完成）",
-			migration:  testMigration(nil),
-			state:      PanelRouteState{Active: PanelRouteFallback, ConsecutiveFailures: 3},
-			signals:    PanelRouteSignals{Now: at(12), Outcome: PanelOutcomeSuccess},
-			wantActive: PanelRouteFallback,
-		},
-		{
-			name:       "未配置回退 ⇒ 失败只累计，永不动地址（缺省部署行为不变）",
-			migration:  PanelMigration{PrimaryURL: "http://panel-primary:3000"},
-			state:      PanelRouteState{Active: PanelRoutePrimary, ConsecutiveFailures: 5},
-			signals:    PanelRouteSignals{Now: at(30), Outcome: PanelOutcomeFailure},
-			wantActive: PanelRoutePrimary,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			next, decision := DecidePanelRoute(tc.state, tc.migration, tc.signals)
-			if next.Active != tc.wantActive {
-				t.Fatalf("active = %q, want %q", next.Active, tc.wantActive)
-			}
-			if decision.Switched != tc.wantSwitch {
-				t.Fatalf("switched = %v, want %v", decision.Switched, tc.wantSwitch)
-			}
-			if decision.Reason != tc.wantReason {
-				t.Fatalf("reason = %q, want %q", decision.Reason, tc.wantReason)
-			}
-			if decision.FallbackFailing != tc.wantFailing {
-				t.Fatalf("fallbackFailing = %v, want %v", decision.FallbackFailing, tc.wantFailing)
-			}
-		})
-	}
-}
-
-func TestPanelRoute_ActiveURLFollowsState(t *testing.T) {
-	migration := testMigration(nil)
-	primary := ReadyPanelRoute()
-	if got := primary.ActiveURL(migration); got != "http://panel-primary:3000" {
-		t.Fatalf("primary url = %q", got)
-	}
-	if primary.InFallback() {
-		t.Fatal("fresh state must not be in fallback")
-	}
-	switched := PanelRouteState{Active: PanelRouteFallback}
-	if got := switched.ActiveURL(migration); got != "http://panel-fallback:3000" {
-		t.Fatalf("fallback url = %q", got)
-	}
-	if !switched.InFallback() {
-		t.Fatal("fallback state must report InFallback=true")
-	}
-	// 未配置回退时，回退态也不该把请求发到一个空地址。
-	off := PanelRouteState{Active: PanelRouteFallback}
-	if got := off.ActiveURL(migration); got != "http://panel-primary:3000" && !strings.Contains(got, "panel") {
-		t.Fatalf("unexpected url %q", got)
-	}
-}
-
-func TestPanelMigration_EnabledRequiresBothKeys(t *testing.T) {
-	if (PanelMigration{FallbackURL: "http://fb:3000"}).Enabled() {
-		t.Fatal("fallback url alone must not enable the feature")
-	}
-	if (PanelMigration{MigrationID: "m1"}).Enabled() {
-		t.Fatal("migration id alone must not enable the feature")
-	}
-	if !testMigration(nil).Enabled() {
-		t.Fatal("fallback url + migration id must enable the feature")
-	}
-}
 
 // 端到端的最小形态（在**同一进程内**跑真实 Reporter）：
 // 主地址连续失败 ⇒ 下一拍真的打到备用地址，且上报体带上"当前生效地址 + 迁移 id +
@@ -264,5 +122,69 @@ func TestReporter_WithoutMigrationNeverSwitches(t *testing.T) {
 	}
 	if payload.PanelURLInUse != "http://panel-primary:3000" {
 		t.Fatalf("panel_url_in_use = %q", payload.PanelURLInUse)
+	}
+}
+
+// task-45 的回归钉：注入的**共享** Router 才是地址来源。
+//
+// 两个方向都要成立，否则 P1 会以另一种形态回来：
+//
+//	· 别的出站面（命令拉取）先失败切到备用 ⇒ 上报必须立刻跟着打备用（不再自己判定）；
+//	· 上报自己失败到阈值 ⇒ 共享 Router 也进入回退态，命令拉取下一次就能看到。
+func TestReporter_UsesInjectedSharedRouter(t *testing.T) {
+	migration := testMigration(nil)
+	router := panelroute.New(panelroute.Config{
+		PrimaryURL: "http://panel-primary:3000",
+		Migration:  migration,
+		NodeID:     "node-1",
+	})
+
+	// 方向一：路由已被**别的模块**推进到备用（模拟命令拉取连续失败）。
+	router.NoteOutcome(panelroute.PanelOutcomeFailure, at(0))
+	router.NoteOutcome(panelroute.PanelOutcomeFailure, at(1))
+	if !router.InFallback() {
+		t.Fatal("precondition: the shared router should be in fallback")
+	}
+
+	var hits []string
+	r := New(Config{
+		PanelURL:   "http://panel-primary:3000",
+		AgentID:    "agent-1",
+		NodeID:     "node-1",
+		Credential: "cred",
+		Panels:     migration,
+		Router:     router,
+	}, WithNow(func() time.Time { return at(2) }))
+	WithPostResponse(func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
+		hits = append(hits, url)
+		return []byte(`{"data":{}}`), nil
+	})(&r.cfg)
+
+	r.sendState(context.Background())
+	if len(hits) != 1 || !strings.Contains(hits[0], "panel-fallback") {
+		t.Fatalf("the report must follow the shared active address, got %v", hits)
+	}
+	if got := r.StatePayload().PanelURLInUse; got != "http://panel-fallback:3000" {
+		t.Fatalf("panel_url_in_use = %q", got)
+	}
+
+	// 方向二：接线上报自己的失败，共享 Router 必须看到（不是私有副本）。
+	fresh := panelroute.New(panelroute.Config{PrimaryURL: "http://panel-primary:3000", Migration: migration})
+	r2 := New(Config{
+		PanelURL:   "http://panel-primary:3000",
+		Credential: "cred",
+		Panels:     migration,
+		Router:     fresh,
+	}, WithNow(func() time.Time { return at(3) }))
+	WithPostResponse(func(ctx context.Context, url string, body []byte, headers map[string]string) ([]byte, error) {
+		return nil, errTestPanelUnreachable
+	})(&r2.cfg)
+	r2.sendState(context.Background())
+	r2.sendState(context.Background())
+	if !fresh.InFallback() {
+		t.Fatal("the report's failures must reach the injected shared router")
+	}
+	if got := fresh.ActiveURL(); got != "http://panel-fallback:3000" {
+		t.Fatalf("shared router url = %q", got)
 	}
 }

@@ -23,7 +23,7 @@
  *      （真实库里是 `tunnel.preferred_ingress_node_id` 列；Web 侧的 `Tunnel` 类型没有这一列，
  *      本文件不为了 mock 去改 `lib/types.ts`）；`connection` / `accepts_new_business` 来自
  *      与用户节点列表**同一份**投影（`mockUserNode`），`can_be_preferred` 只用写入路径
- *      自己的两条规则（同组 + `role ∈ {ingress, both}`）。
+ *      自己的规则（同组 + `role ∈ {ingress, both}` + 未显式停用）。
  */
 import * as rt from "@/mocks/runtime";
 import type { MockResponse } from "@/mocks/runtime";
@@ -120,7 +120,8 @@ function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
     return null;
   }
 
-  const intent = memberOrderByForward.get(forwardId) ?? [];
+  // 次序读取失败时按无意图处理，与后端的 null 降级一致。
+  const intent = orderUnreadable ? [] : memberOrderByForward.get(forwardId) ?? [];
   const intentRank = new Map<number, number>();
   const intentOrder = new Map<number, number>();
   const intentDisabled = new Set<number>();
@@ -157,13 +158,15 @@ function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
       node_group_id: node.node_group_id,
       is_active_ingress: node.id === activeIngress,
       is_preferred: node.id === preferred,
-      is_failback_target: preferred !== null && node.id === preferred && preferred !== activeIngress,
-      can_be_preferred: roleAcceptsIngress(node.role ?? null),
-      preference_rejection: roleAcceptsIngress(node.role ?? null)
-        ? null
-        : node.role == null
+      is_failback_target: preferred !== null && node.id === preferred && preferred !== activeIngress && !isDisabled,
+      can_be_preferred: roleAcceptsIngress(node.role ?? null) && !isDisabled,
+      preference_rejection: !roleAcceptsIngress(node.role ?? null)
+        ? node.role == null
           ? "role_undeclared"
-          : "role_mismatch",
+          : "role_mismatch"
+        : isDisabled
+          ? "member_disabled"
+          : null,
       connection: node.connection ?? "offline",
       lifecycle: node.lifecycle ?? "active",
       accepts_new_business: node.accepts_new_business === true,
@@ -228,7 +231,7 @@ function projectionOf(db: rt.Store, forwardId: number): MockResponse | null {
     },
     failback: {
       auto_failback: policy.auto_failback,
-      target_node_id: preferred !== null && preferred !== activeIngress ? preferred : null,
+      target_node_id: preferred !== null && preferred !== activeIngress && !intentDisabled.has(preferred) ? preferred : null,
       preferred_ingress_node_id: preferred,
       progress: {
         // Web 侧的 `Tunnel` 类型没有 `failback_healthy_checks`（真实库里是 tunnel 的列）；
@@ -255,6 +258,9 @@ function setPreferred(db: rt.Store, forwardId: number, nodeId: number | null): M
     const view = mockUserNode(db, node);
     if (!roleAcceptsIngress(view.role ?? null)) {
       return fail(400, "该节点的角色不能作为入口（需要 ingress 或 both）", "preferred_role_mismatch");
+    }
+    if (!orderUnreadable && memberOrderByForward.get(forwardId)?.some((member) => member.node_id === nodeId && !member.is_enabled)) {
+      return fail(400, "该成员已被停用，请先启用它再设为首选入口", "preferred_disabled");
     }
   }
   preferredByForward.set(forwardId, nodeId);

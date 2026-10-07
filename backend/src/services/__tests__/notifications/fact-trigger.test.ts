@@ -109,6 +109,9 @@ describe("V5-WP18 触发器：编排", () => {
           // 默认没有未配对的拒绝 ⇒ 既有断言语义不变（"恢复"是新增的一路输入）。
           openDenials: over.openDenials ?? [],
           rowOf: (id: number) => (over.rows ?? new Map([[42, row()]])).get(id) ?? null,
+          // 默认全部 workspace 都读得到（task-47 起这个集合是必填的：读失败的空间
+          // 不允许产生恢复事实）。
+          unreadableWorkspaceIds: [],
         }),
         deliver: async (facts: readonly DeliverableNotification[], channels: readonly NotificationChannel[]) => {
           delivered.push({ facts, channels });
@@ -234,6 +237,7 @@ describe("V5-WP18 触发器：拒绝与恢复走**同一次投递**", () => {
           id === 42 || id === 77
             ? { updated_at: new Date("2026-10-05T02:00:00.000Z"), workspace_id: 7 }
             : null,
+        unreadableWorkspaceIds: [],
       }),
       deliver: async (facts) => {
         delivered.push({ facts });
@@ -255,6 +259,7 @@ describe("V5-WP18 触发器：拒绝与恢复走**同一次投递**", () => {
         items: [],
         openDenials: [{ forward_id: 77, name: "b" }],
         rowOf: () => ({ updated_at: new Date("2026-10-05T02:00:00.000Z"), workspace_id: 7 }),
+        unreadableWorkspaceIds: [],
       }),
       deliver: async (facts) => {
         delivered.push({ facts });

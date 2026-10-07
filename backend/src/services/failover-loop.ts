@@ -76,6 +76,11 @@ export async function readFailoverPolicy(): Promise<FailoverPolicyFacts & { pars
  * `preferred_node_id = null` ⇒ 自动回切永远不可能发生。现在偏好从列里读，并且**即使它今天不合格
  * 也照原样报出** —— 判定留给策略（`failback_healthy_checks` 那条条件），这样运维看到的原因是
  * "首选节点不可达 / 端口不可用 / 连续健康次数不够"，而不是一句无信息量的"没有回切"。
+ *
+ * **唯一的例外**：在本次成员次序里被**显式停用**的成员（`forward_ingress_member.is_enabled=false`）
+ * 不能当回切目标 —— 停用的意图就是"不让它接管"，而 `candidates` 已经按同一份 `IngressOrderIndex`
+ * 排除了它。两边不一致的症状是：候选永远选不到它，回切却每拍都指向它（P1 缺陷现场）。
+ * 次序**读不到**时按"没有次序"处理，既有语义逐位不变。
  */
 /**
  * 候选查询的依赖缝隙。
@@ -173,9 +178,15 @@ export async function pickFailoverDestination(
 
   // 偏好等于现任 ⇒ 没有"回切"可言（回切的定义就是离开现任）。报 null 而不是原样透出，
   // 否则每一拍都会有一条"回切条件不满足"的噪音，而它描述的是一件本就不需要发生的事。
+  //
+  // task-47：**显式停用的成员不参与回切**，与上面的 `candidates` 用同一份 `order.isDisabled`
+  // —— 停用是"这次不让它接管"的意图，它既不该被选为候选，也不该成为回切目标。只读不到次序
+  // （`intent === null`）时 `isDisabled` 恒 false ⇒ 既有语义（离线/维护中的偏好照原样报出）
+  // 逐位不变：一次可修复的读错误不该凭空禁用所有节点。
+  const preferredRaw = tunnel.preferred_ingress_node_id;
   const preferredId =
-    tunnel.preferred_ingress_node_id !== null && tunnel.preferred_ingress_node_id !== ctx.owner_node_id
-      ? tunnel.preferred_ingress_node_id
+    preferredRaw !== null && preferredRaw !== ctx.owner_node_id && !order.isDisabled(preferredRaw)
+      ? preferredRaw
       : null;
 
   // 候选选择：**次序优先，其次 node_id 升序**（task-43 引入按转发的成员次序）。

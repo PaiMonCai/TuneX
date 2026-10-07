@@ -14,6 +14,10 @@
  * ④ **首选入口（D4）**：偏好能真的被写下来（这是"写了功能但没有任何写入路径"的收口），
  *    且设置偏好会**重新计数**——否则旧偏好攒下的连续健康次数会被算到新节点头上，
  *    等于绕过 `FAILBACK_HEALTHY_CHECKS` 要防的事。
+ * ⑤ **显式停用的成员不参与回切**（task-47，P1 缺陷现场）：`is_enabled=false` 只过滤了
+ *    `candidate`，`preferred` 仍原样透出 ⇒ 停用成员照样被算成回切目标、`decideFailover`
+ *    给出 `action=failback, to_node_id=6`。三处（候选 / 首选 / 写路径与读投影）现在共用
+ *    同一份 `IngressOrderIndex`，且这条用例**跑完整决策链**断言行为，不做静态字符串匹配。
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -21,12 +25,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { candidateRejection, roleAcceptsPosition, type CandidateFacts } from "../ingress-candidate.ts";
 import { pickFailoverDestination } from "../failover-loop.ts";
+import { buildDecisionInput, readFailoverDecisionFacts } from "../failover-executor.ts";
+import { decideFailover } from "../failover-policy.ts";
 import {
+  buildIngressMemberViews,
   PREFERRED_INGRESS_ERROR_CODES,
   preferredIngressOf,
   setPreferredIngressNode,
 } from "../preferred-ingress.ts";
-import type { PreferredIngressDb } from "../preferred-ingress.ts";
+import type { IngressMemberIntentRow, IngressMemberRow, PreferredIngressDb } from "../preferred-ingress.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const NOW = new Date("2026-10-05T04:00:00Z");
@@ -286,5 +293,261 @@ describe("V5-WP17.1: 候选来源用同一份判定，并真的读偏好", () =>
     const db = stubCandidateDb([row({ id: 8 })], null);
     const picked = await pickFailoverDestination({ tunnel_id: 11, workspace_id: 7, owner_node_id: 5, now: NOW }, db);
     expect(picked.preferred_node_id).toBeNull();
+  });
+});
+
+/* ================================================================== */
+/* ⑤ task-47：显式停用的成员不得参与回切                                 */
+/* ================================================================== */
+//
+// ── 缺陷现场（P1）──
+// `forward_ingress_member.is_enabled=false` 只过滤了 `candidate`，`preferredId` 仍原样透出：
+// 节点 6 被显式停用后，回切决策照样给出 `action=failback, to_node_id=6`（同一拍候选却是 null）。
+// 三处必须用**同一份** `IngressOrderIndex`：候选选择、回切目标、写路径与读投影。
+//
+// 用例全部走**真实函数链**（`pickFailoverDestination` → `readFailoverDecisionFacts` →
+// `decideFailover`）：只有行为断言才挡得住"改回去"，静态字符串匹配挡不住。
+
+const GROUP = 2;
+const OWNER = 5;
+/** 列里残留的偏好：被显式停用的那一台。 */
+const DISABLED = 6;
+const ENABLED = 8;
+const TUNNEL = 11;
+
+/** 成员次序：`disableFirst` 决定节点 6（列里残留的偏好）是被显式停用还是启用。 */
+const intentRows = (disableFirst: boolean): IngressMemberIntentRow[] => [
+  { node_id: DISABLED, priority: 0, is_enabled: !disableFirst },
+  { node_id: ENABLED, priority: 1, is_enabled: true },
+];
+
+interface TestNodeRow extends IngressMemberRow {
+  node_credential_hash: string;
+  credential_revoked: boolean;
+  lifecycle: string;
+  status: string;
+}
+
+function nodeRow(id: number, over: Partial<TestNodeRow> = {}): TestNodeRow {
+  return {
+    id,
+    node_id: `node-${id}`,
+    role: "ingress",
+    lifecycle: "active",
+    status: "active",
+    last_seen_at: NOW,
+    node_group_id: GROUP,
+    node_credential_hash: "hash",
+    credential_revoked: false,
+    ...over,
+  };
+}
+
+/** 候选来源替身：与 `pickFailoverDestination` 的真实查询形状一致（含成员次序读面）。 */
+function memberDb(intent: readonly IngressMemberIntentRow[] | null, throwOnRead = false) {
+  return {
+    tunnel: {
+      findUnique: async () => ({ in_node_group_id: GROUP, preferred_ingress_node_id: DISABLED }),
+    },
+    node: { findMany: async () => [nodeRow(DISABLED), nodeRow(ENABLED)] },
+    forwardIngressMember: {
+      findMany: async () => {
+        if (throwOnRead) throw new Error("intent read failed");
+        return [...(intent ?? [])];
+      },
+    },
+  };
+}
+
+/** 生产决策链：候选/偏好 → 决策事实 → 纯策略（三处必须给出同一个答案）。 */
+async function decideThroughPolicy(intent: readonly IngressMemberIntentRow[] | null, throwOnRead = false) {
+  const read = await readFailoverDecisionFacts(
+    { tunnelId: TUNNEL, now: NOW },
+    {
+      db: {
+        tunnel: {
+          findUnique: async () => ({
+            id: TUNNEL,
+            workspace_id: 3,
+            tunnel_mode: "direct",
+            config_revision: 1,
+            ingress_node_id: OWNER,
+            egress_node_id: null,
+            egress_pool_id: null,
+            remote_host: "10.0.0.9",
+            remote_port: 443,
+          }),
+        },
+        node: { findUnique: async (args: unknown) => nodeRow((args as { where: { id: number } }).where.id) },
+        targetObservation: {
+          findMany: async () => [
+            {
+              node_id: OWNER,
+              target_key: "10.0.0.9:443",
+              reachable: true,
+              latency_ms: 10,
+              consecutive_success: 5,
+              consecutive_failure: 0,
+              success_rate: 1,
+              observed_at: new Date(NOW.getTime() - 1_000),
+              observation_source: `${OWNER}/tcp_connect`,
+            },
+          ],
+        },
+        forwardRollout: { findFirst: async () => null },
+      },
+      loadLease: async () => ({
+        tunnel_id: TUNNEL,
+        owner_node_id: OWNER,
+        epoch: 2,
+        lease_expires_at: new Date(NOW.getTime() + 60_000),
+        revision: 1,
+      }),
+      // 两个开关都开、连续健康次数也够、冷却已过、候选在线且端口可用 ——
+      // 唯一还能阻止回切的就是"首选成员被显式停用"这一条。正对照因此必须是 failback。
+      policy: () => ({ auto_failover: true, auto_failback: true }),
+      destinations: (ctx) =>
+        pickFailoverDestination({ ...ctx, now: NOW }, memberDb(intent, throwOnRead)),
+      portAvailability: async () => 4,
+      failbackHealthyChecks: async () => 3,
+    },
+  );
+  if (!read.ok) throw new Error(`决策事实读取失败: ${read.code}`);
+  return { facts: read.facts, decision: decideFailover(buildDecisionInput(read.facts, NOW)) };
+}
+
+function stubPreferredDbWithIntent(
+  intent: readonly IngressMemberIntentRow[] | null,
+  options: { throwOnRead?: boolean } = {},
+): PreferredIngressDb & { writes: Array<Record<string, unknown>> } {
+  const writes: Array<Record<string, unknown>> = [];
+  return {
+    writes,
+    tunnel: {
+      findFirst: async () => ({
+        id: TUNNEL,
+        in_node_group_id: GROUP,
+        ingress_node_id: OWNER,
+        preferred_ingress_node_id: null,
+      }),
+      update: async (args: unknown) => {
+        writes.push((args as { data: Record<string, unknown> }).data);
+        return {};
+      },
+    },
+    node: { findUnique: async (args: unknown) => nodeRow((args as { where: { id: number } }).where.id) },
+    forwardIngressMember: {
+      findMany: async () => {
+        if (options.throwOnRead) throw new Error("intent read failed");
+        return [...(intent ?? [])];
+      },
+    },
+  };
+}
+
+describe("task-47: 显式停用的成员不参与回切（候选 / 首选 / 决策三处同源）", () => {
+  test("停用的首选不再被报成回切目标，候选改选下一台启用的成员", async () => {
+    const picked = await pickFailoverDestination(
+      { tunnel_id: TUNNEL, workspace_id: 7, owner_node_id: OWNER, now: NOW },
+      memberDb(intentRows(true)),
+    );
+    // 修复前：preferred_node_id = 6（停用的那一台）；candidate 已经是 8。
+    expect(picked.preferred_node_id).toBeNull();
+    expect(picked.candidate_node_id).toBe(ENABLED);
+  });
+
+  test("扫描器注入的批次序（options.order）走同一份判定：停用 ⇒ preferred 为 null", async () => {
+    const picked = await pickFailoverDestination(
+      { tunnel_id: TUNNEL, workspace_id: 7, owner_node_id: OWNER, now: NOW },
+      memberDb(intentRows(true)),
+      { order: intentRows(true) },
+    );
+    expect(picked.preferred_node_id).toBeNull();
+    expect(picked.candidate_node_id).toBe(ENABLED);
+  });
+
+  test("次序**读不到**（抛错 ⇒ null）时既有语义逐位不变：偏好照原样报出，不凭空禁用", async () => {
+    const picked = await pickFailoverDestination(
+      { tunnel_id: TUNNEL, workspace_id: 7, owner_node_id: OWNER, now: NOW },
+      memberDb(null, true),
+    );
+    expect(picked.preferred_node_id).toBe(DISABLED);
+    expect(picked.candidate_node_id).toBe(DISABLED);
+  });
+
+  test("决策链：首选被显式停用 ⇒ **不发生回切**（修复前：action=failback, to_node_id=6）", async () => {
+    const { facts, decision } = await decideThroughPolicy(intentRows(true));
+    expect(facts.placement.preferred_node_id).toBeNull();
+    expect(facts.failback).toBeNull();
+    expect(decision.action).toBe("hold");
+    expect(decision.migration).toBeNull();
+    expect(decision.blockers.map((b) => b.reason)).toContain("owner_reachable");
+    // 停用只排除那一台，不是让整个组停摆：候选仍然上岗。
+    expect(facts.candidate?.node_id).toBe(ENABLED);
+  });
+
+  test("正对照：同一条链、只把 is_enabled 翻成 true ⇒ 回切照常发生（用例不是恒真）", async () => {
+    const { facts, decision } = await decideThroughPolicy(intentRows(false));
+    expect(facts.placement.preferred_node_id).toBe(DISABLED);
+    expect(facts.failback?.candidate.node_id).toBe(DISABLED);
+    expect(decision.action).toBe("failback");
+    expect(decision.migration?.to_node_id).toBe(DISABLED);
+  });
+
+  test("决策链：次序读不到（异常）⇒ 回切按既有语义照常发生（一次读错误不冻结/不禁用）", async () => {
+    const { decision } = await decideThroughPolicy(null, true);
+    expect(decision.action).toBe("failback");
+    expect(decision.migration?.to_node_id).toBe(DISABLED);
+  });
+
+  test("读投影与写路径同契约：停用成员 can_be_preferred=false + member_disabled，且不是回切目标", () => {
+    const views = buildIngressMemberViews([nodeRow(OWNER), nodeRow(DISABLED), nodeRow(ENABLED)], {
+      activeIngressId: OWNER,
+      // 列里残留的偏好（修复前可写进去、读侧又照实投影的那种状态）。
+      preferredId: DISABLED,
+      now: NOW,
+      intent: intentRows(true),
+    });
+    const disabled = views.find((view) => view.node_id === DISABLED)!;
+    expect(disabled.is_preferred).toBe(true);
+    expect(disabled.can_be_preferred).toBe(false);
+    expect(disabled.preference_rejection).toBe("member_disabled");
+    // 关键：写路径规则与回切目标投影都跟 `pickFailoverDestination` 同答案。
+    expect(disabled.is_failback_target).toBe(false);
+    expect(disabled.can_take_over).toBe(false);
+    expect(disabled.takeover_rejection).toBe("member_disabled");
+
+    const enabled = views.find((view) => view.node_id === ENABLED)!;
+    expect(enabled.can_be_preferred).toBe(true);
+    expect(enabled.preference_rejection).toBeNull();
+  });
+
+  test("写路径：被显式停用的节点拒绝设为首选，且一个字都不落库", async () => {
+    const db = stubPreferredDbWithIntent(intentRows(true));
+    const result = await setPreferredIngressNode({ db }, { workspaceId: 7, tunnelId: TUNNEL, nodeId: DISABLED });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe(PREFERRED_INGRESS_ERROR_CODES.preferred_disabled);
+    expect(db.writes).toEqual([]);
+  });
+
+  test("写路径：次序里明确启用的节点照常可写（停用只挡那一台）", async () => {
+    const db = stubPreferredDbWithIntent(intentRows(true));
+    const result = await setPreferredIngressNode({ db }, { workspaceId: 7, tunnelId: TUNNEL, nodeId: ENABLED });
+    expect(result.ok).toBe(true);
+    expect(db.writes[0]?.preferred_ingress_node_id).toBe(ENABLED);
+  });
+
+  test("写路径：次序里没有这台节点 / 次序读不到 ⇒ 不凭空禁用，既有语义（离线也可写）不变", async () => {
+    const notListed = stubPreferredDbWithIntent([{ node_id: ENABLED, priority: 0, is_enabled: true }]);
+    const listed = await setPreferredIngressNode({ db: notListed }, { workspaceId: 7, tunnelId: TUNNEL, nodeId: DISABLED });
+    expect(listed.ok).toBe(true);
+
+    const unreadable = stubPreferredDbWithIntent(null, { throwOnRead: true });
+    const offline = await setPreferredIngressNode(
+      { db: unreadable },
+      { workspaceId: 7, tunnelId: TUNNEL, nodeId: DISABLED },
+    );
+    expect(offline.ok).toBe(true);
+    expect(unreadable.writes[0]?.preferred_ingress_node_id).toBe(DISABLED);
   });
 });
