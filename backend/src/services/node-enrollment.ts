@@ -305,6 +305,106 @@ docker info >/dev/null 2>&1 || {
   exit 4
 }
 
+# Multi-instance host layout. agent_id is Panel-generated, stable and unique;
+# it is therefore the instance key for container name + host credential/state.
+case "$AGENT_ID" in
+  ""|*[!A-Za-z0-9._-]*)
+    echo "tunex install: agent_id contains unsupported characters" >&2
+    exit 2
+    ;;
+esac
+[ "${#AGENT_ID}" -le 64 ] || { echo "tunex install: agent_id is too long" >&2; exit 2; }
+
+CONTAINER="tunex-agent-$AGENT_ID"
+INSTANCE_ENV_DIR="/etc/tunex-agent/instances/$AGENT_ID"
+ENV_FILE="$INSTANCE_ENV_DIR/agent.env"
+INSTANCE_STATE_DIR="/var/lib/tunex-agent/instances/$AGENT_ID"
+LEGACY_CONTAINER="tunex-agent"
+LEGACY_ENV_FILE="/etc/tunex-agent/agent.env"
+LEGACY_STATE_DIR="/var/lib/tunex-agent"
+LEGACY_SELF=0
+
+read_env_value() {
+  # Do not source an old env file: it is host-owned state, not executable code.
+  sed -n "s/^$1=//p" "$2" 2>/dev/null | tail -n 1
+}
+
+ranges_overlap() {
+  # return 0 = overlap, 1 = no overlap/empty, 2 = malformed
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  A_MIN="$(printf '%s' "$1" | cut -d- -f1)"
+  A_MAX="$(printf '%s' "$1" | cut -d- -f2)"
+  B_MIN="$(printf '%s' "$2" | cut -d- -f1)"
+  B_MAX="$(printf '%s' "$2" | cut -d- -f2)"
+  case "$A_MIN:$A_MAX:$B_MIN:$B_MAX" in
+    *[!0-9:]*|*::*)
+      return 2
+      ;;
+  esac
+  [ "$A_MIN" -le "$A_MAX" ] && [ "$B_MIN" -le "$B_MAX" ] || return 2
+  [ "$A_MIN" -le "$B_MAX" ] && [ "$B_MIN" -le "$A_MAX" ]
+}
+
+check_instance_ranges() {
+  OTHER_NAME="$1"
+  OTHER_AGENT="$2"
+  OTHER_INGRESS="$3"
+  OTHER_EGRESS="$4"
+
+  [ "$OTHER_AGENT" = "$AGENT_ID" ] && return 0
+  for WANT in "$INGRESS_RANGE" "$EGRESS_RANGE"; do
+    [ -n "$WANT" ] || continue
+    for HAVE in "$OTHER_INGRESS" "$OTHER_EGRESS"; do
+      [ -n "$HAVE" ] || continue
+      if ranges_overlap "$WANT" "$HAVE"; then
+        echo "tunex install: port range $WANT overlaps existing TuneX Agent $OTHER_NAME ($OTHER_AGENT) range $HAVE" >&2
+        echo "tunex install: assign disjoint ingress/egress ranges before installing multiple Agents on one host" >&2
+        exit 6
+      else
+        RC="$?"
+        [ "$RC" -ne 2 ] || {
+          echo "tunex install: cannot validate existing Agent $OTHER_NAME port range $HAVE" >&2
+          exit 6
+        }
+      fi
+    done
+  done
+}
+
+# New-layout instances publish their identity + allocation ranges as Docker labels.
+# Include stopped containers too: a stopped Agent can be started later and must not
+# be allowed to collide with a newly installed sibling.
+for OTHER in $(docker ps -a --filter "label=io.tunex.agent=true" --format '{{.Names}}'); do
+  OTHER_AGENT="$(docker inspect --format '{{ index .Config.Labels "io.tunex.agent-id" }}' "$OTHER" 2>/dev/null || true)"
+  OTHER_INGRESS="$(docker inspect --format '{{ index .Config.Labels "io.tunex.ingress-range" }}' "$OTHER" 2>/dev/null || true)"
+  OTHER_EGRESS="$(docker inspect --format '{{ index .Config.Labels "io.tunex.egress-range" }}' "$OTHER" 2>/dev/null || true)"
+  check_instance_ranges "$OTHER" "$OTHER_AGENT" "$OTHER_INGRESS" "$OTHER_EGRESS"
+done
+
+# Backward compatibility: old TuneX used one global container/env/state path and
+# had no labels. If that legacy instance is THIS agent we migrate its two durable
+# state files and replace only it. If it belongs to ANOTHER agent, include its
+# ranges in the same collision check and never delete/overwrite it.
+if docker inspect "$LEGACY_CONTAINER" >/dev/null 2>&1 && [ -f "$LEGACY_ENV_FILE" ]; then
+  LEGACY_AGENT_ID="$(read_env_value TUNEX_AGENT_ID "$LEGACY_ENV_FILE")"
+  if [ "$LEGACY_AGENT_ID" = "$AGENT_ID" ]; then
+    LEGACY_SELF=1
+  elif [ -n "$LEGACY_AGENT_ID" ]; then
+    LEGACY_INGRESS="$(read_env_value TUNEX_INGRESS_RANGE "$LEGACY_ENV_FILE")"
+    LEGACY_EGRESS="$(read_env_value TUNEX_EGRESS_RANGE "$LEGACY_ENV_FILE")"
+    if [ -z "$LEGACY_INGRESS" ] && [ -z "$LEGACY_EGRESS" ]; then
+      echo "tunex install: legacy Agent $LEGACY_AGENT_ID is running but has no discoverable port ranges" >&2
+      echo "tunex install: reinstall/upgrade that legacy Agent first, then add another instance" >&2
+      exit 6
+    fi
+    check_instance_ranges "$LEGACY_CONTAINER" "$LEGACY_AGENT_ID" "$LEGACY_INGRESS" "$LEGACY_EGRESS"
+  else
+    echo "tunex install: legacy tunex-agent exists but its agent_id cannot be identified" >&2
+    echo "tunex install: refusing to install a second Agent until the legacy instance is repaired/reinstalled" >&2
+    exit 6
+  fi
+fi
+
 # Pull first so a registry/network error does not consume the one-time token.
 echo "TuneX: pulling Agent image $AGENT_IMAGE ..."
 docker pull "$AGENT_IMAGE"
@@ -315,12 +415,23 @@ CREDENTIAL="$(curl -fsS -X POST \
   "$PANEL/api/internal/node/enroll")"
 [ -n "$CREDENTIAL" ] || { echo "tunex install: enrollment returned an empty credential" >&2; exit 5; }
 
-install -d -m 0700 /etc/tunex-agent
-# WP11A: the Agent keeps its last-known-good desired state here so a restart
-# during a panel outage comes back with its listeners. The directory lives on the
-# host (not in the container layer) because the container is recreated on every
-# reinstall — a cache inside it would be lost exactly when it is needed.
-install -d -m 0700 /var/lib/tunex-agent
+install -d -m 0700 /etc/tunex-agent /etc/tunex-agent/instances "$INSTANCE_ENV_DIR"
+# Each Agent instance gets a different host state directory. Inside the container
+# the path remains /var/lib/tunex-agent, so the Agent binary itself stays
+# single-identity and needs no multi-tenant state model.
+install -d -m 0700 /var/lib/tunex-agent /var/lib/tunex-agent/instances "$INSTANCE_STATE_DIR"
+
+# One-time migration for an Agent installed before multi-instance support.
+# Copy only the two durable Agent files; never recursively copy the new
+# instances/ subtree into itself.
+if [ "$LEGACY_SELF" -eq 1 ]; then
+  for STATE_FILE in desired-lkg.json ownership-epoch.json; do
+    if [ -f "$LEGACY_STATE_DIR/$STATE_FILE" ] && [ ! -e "$INSTANCE_STATE_DIR/$STATE_FILE" ]; then
+      cp -p "$LEGACY_STATE_DIR/$STATE_FILE" "$INSTANCE_STATE_DIR/$STATE_FILE"
+    fi
+  done
+fi
+
 {
   printf '%s\n' "TUNEX_PANEL_HTTP_URL=$PANEL"
   printf '%s\n' "TUNEX_AGENT_ID=$AGENT_ID"
@@ -331,13 +442,18 @@ install -d -m 0700 /var/lib/tunex-agent
   printf '%s\n' "TUNEX_STATE_DIR=/var/lib/tunex-agent"
   [ -z "$INGRESS_RANGE" ] || printf '%s\n' "TUNEX_INGRESS_RANGE=$INGRESS_RANGE"
   [ -z "$EGRESS_RANGE" ] || printf '%s\n' "TUNEX_EGRESS_RANGE=$EGRESS_RANGE"
-} > /etc/tunex-agent/agent.env
-chmod 0600 /etc/tunex-agent/agent.env
+} > "$ENV_FILE"
+chmod 0600 "$ENV_FILE"
 
-docker rm -f tunex-agent >/dev/null 2>&1 || true
+# Reinstall replaces only this logical Agent. Never remove another TuneX
+# instance on the same host.
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+if [ "$LEGACY_SELF" -eq 1 ]; then
+  docker rm -f "$LEGACY_CONTAINER" >/dev/null 2>&1 || true
+fi
 
 docker run -d \
-  --name tunex-agent \
+  --name "$CONTAINER" \
   --restart unless-stopped \
   --network host \
   --security-opt no-new-privileges:true \
@@ -346,12 +462,17 @@ docker run -d \
   --stop-timeout 15 \
   --log-opt max-size=20m \
   --log-opt max-file=3 \
-  -v /etc/tunex-agent/agent.env:/run/tunex-agent/agent.env:ro \
-  -v /var/lib/tunex-agent:/var/lib/tunex-agent \
+  --label "io.tunex.agent=true" \
+  --label "io.tunex.agent-id=$AGENT_ID" \
+  --label "io.tunex.node-id=$NODE_ID" \
+  --label "io.tunex.ingress-range=$INGRESS_RANGE" \
+  --label "io.tunex.egress-range=$EGRESS_RANGE" \
+  -v "$ENV_FILE:/run/tunex-agent/agent.env:ro" \
+  -v "$INSTANCE_STATE_DIR:/var/lib/tunex-agent" \
   "$AGENT_IMAGE" >/dev/null
 
-echo "TuneX Agent deployed with Docker."
-echo "Check status: docker ps --filter name=tunex-agent"
-echo "View logs:   docker logs -f tunex-agent"
+echo "TuneX Agent deployed with Docker as $CONTAINER."
+echo "Check status: docker ps --filter name=$CONTAINER"
+echo "View logs:   docker logs -f $CONTAINER"
 `;
 }
