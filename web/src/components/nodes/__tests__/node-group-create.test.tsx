@@ -165,7 +165,11 @@ describe("B. 表单：方向固定入口、必填字段、就地校验", () => {
     expect(html).toContain('data-testid="node-group-create-port-range"');
     expect(html).toContain('data-testid="node-group-create-submit"');
     expect(html).toContain('data-testid="node-group-create-direction"');
+    expect(html).toContain(zh.node.groupCreateTitle);
+    expect(zh.node.groupCreateTitle).toBe("创建节点池");
     expect(html).toContain(zh.node.groupCreateDirectionIngress);
+    expect(zh.node.groupCreateDirectionIngress).toContain("用途：入口");
+    expect(zh.node.groupCreateDirectionIngress).not.toContain("allow_custom_out_group");
     expect(html).not.toContain('data-testid="node-group-create-quota"');
     // 没有可访问名称为空的输入：两个字段都有 label（htmlFor/id 关联）。
     expect(html).toContain('id="node-group-create-name"');
