@@ -1070,21 +1070,21 @@ export const zh = {
     unknownHint:
       "缺少判断下一步所需的事实（取不到，或响应形状不认识）；这不代表已经完成。请重试。",
     quotaLine: "额度：节点 {nodesUsed} / {nodesMax} · 转发 {tunnelsUsed} / {tunnelsMax}",
-    createGroupTitle: "创建入口节点池",
+    createGroupTitle: "创建节点池",
     createGroupHint:
-      "第一条转发需要一个入口节点池：节点归属节点池，组里的端口范围决定节点能监听哪些端口。",
-    createGroupAction: "创建入口节点池",
+      "第一条转发需要一个入口用途节点池：节点归属节点池，池里的端口范围决定节点能监听哪些端口。",
+    createGroupAction: "创建节点池",
     needOperatorTitle: "这一步需要有人帮你完成",
     needOperatorHintPermission:
-      "你的工作空间权限里没有 node:manage，无法自己创建入口节点池或添加节点；请联系有 node:manage 权限的成员或工作空间管理员完成这一步。",
+      "你没有节点管理权限，无法自己创建节点池或添加节点；请联系有节点管理权限的成员或工作空间管理员完成这一步。",
     needOperatorHintPolicy:
       "当前工作空间策略不允许自助创建入口用途节点池；请联系工作空间管理员开通，或提供一个可用节点池。",
     addNodeTitle: "添加第一台节点",
     addNodeHint:
-      "入口节点池已经就绪；创建节点后把安装命令复制到目标机器执行，节点上线后即可创建第一条转发。",
+      "入口用途节点池已经就绪；创建节点后把安装命令复制到目标机器执行，节点上线后即可创建第一条转发。",
     addNodeAction: "去添加节点",
     addNodeHintPermission:
-      "入口节点池已经就绪，但你的权限里没有 node:manage，无法自己创建节点；请联系有该权限的成员添加节点。",
+      "入口用途节点池已经就绪，但你没有节点管理权限，无法自己创建节点；请联系有该权限的成员添加节点。",
     createForwardTitle: "创建第一条转发",
     createForwardHint:
       "节点已经在列表里；到转发管理里选择入口节点、填写目标地址，即可创建第一条转发。",
@@ -2167,21 +2167,21 @@ export const en: Dict = {
     unknownHint:
       "Some facts needed to decide the next step are missing (unavailable, or an unrecognized response shape); this does not mean setup is complete. Please retry.",
     quotaLine: "Quota: nodes {nodesUsed} / {nodesMax} · forwards {tunnelsUsed} / {tunnelsMax}",
-    createGroupTitle: "Create your ingress node pool",
+    createGroupTitle: "Create your node pool",
     createGroupHint:
-      "The first forward needs an ingress node pool: nodes belong to a group, and its port range decides which listen ports they can use.",
-    createGroupAction: "Create ingress node pool",
+      "The first forward needs an ingress-purpose node pool: nodes belong to a pool, and its port range decides which listen ports they can use.",
+    createGroupAction: "Create node pool",
     needOperatorTitle: "Someone has to do this step for you",
     needOperatorHintPermission:
-      "Your workspace permissions do not include node:manage, so you cannot create an ingress node pool or add nodes yourself. Ask a member with node:manage, or your workspace administrator.",
+      "You do not have node-management permission, so you cannot create a node pool or add nodes yourself. Ask a member with node-management permission or your workspace administrator.",
     needOperatorHintPolicy:
       "The current workspace policy does not allow self-service ingress-purpose node pools. Ask your workspace administrator to enable it or provide a usable pool.",
     addNodeTitle: "Add your first node",
     addNodeHint:
-      "The ingress node pool is ready. Create a node and run the install command on the target host; once it connects you can create the first forward.",
+      "The ingress-purpose node pool is ready. Create a node and run the install command on the target host; once it connects you can create the first forward.",
     addNodeAction: "Add a node",
     addNodeHintPermission:
-      "The ingress node pool is ready, but your permissions do not include node:manage, so you cannot create nodes yourself. Ask a member with that permission to add one.",
+      "The ingress-purpose node pool is ready, but you do not have node-management permission. Ask a member with that permission to add a node.",
     createForwardTitle: "Create your first forward",
     createForwardHint:
       "Nodes are available. Open Forward Management, pick the ingress node and enter the target to create your first forward.",
