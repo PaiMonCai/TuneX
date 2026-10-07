@@ -6,5 +6,7 @@
   "federation_bootstrap": "scripts/integration/bootstrap-federation.py",
   "federation": "scripts/integration/federation.py",
   "teardown": "scripts/integration/teardown.sh",
-  "evidence": "scripts/integration/evidence"
-}
+  "evidence": "scripts/integration/evidence",
+  "a00_core_gate": "scripts/integration/a00-core-gate.sh",
+  "a00_delete_reuse": "scripts/integration/a00-delete-reuse.py"
+}\n
