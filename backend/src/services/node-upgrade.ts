@@ -110,7 +110,7 @@ export interface NodeUpgradeFacts {
   agent_id: string;
   role: string | null;
   lifecycle: string | null;
-  /** 安装脚本使用固定容器名，升级脚本据此定位并重建同一个容器。 */
+  /** 可选的自定义容器名；脚本仍会校验容器声明的 agent_id，禁止碰兄弟实例。 */
   container_name?: string;
 }
 
@@ -289,6 +289,21 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
   else
     die "找不到当前 Agent 实例容器 $CONTAINER（legacy tunex-agent 也不属于 agent_id=$AGENT_ID）"
   fi
+fi
+
+# A caller may provide container_name for a nonstandard deployment. Never trust
+# that name by itself: a multi-Agent host makes "wrong container, valid name" a
+# real possibility. New-layout containers prove identity via label. The sole
+# unlabeled exception is the old global tunex-agent, whose host env must match.
+CONTAINER_AGENT_ID="$(docker inspect --format '{{ index .Config.Labels "io.tunex.agent-id" }}' "$CONTAINER" 2>/dev/null || true)"
+if [ -n "$CONTAINER_AGENT_ID" ] && [ "$CONTAINER_AGENT_ID" != "<no value>" ]; then
+  [ "$CONTAINER_AGENT_ID" = "$AGENT_ID" ] || die "容器 $CONTAINER 属于另一个 Agent（$CONTAINER_AGENT_ID），拒绝升级"
+else
+  LEGACY_AGENT_ID=""
+  if [ "$CONTAINER" = "$LEGACY_CONTAINER" ] && [ -r "$LEGACY_ENV_FILE" ]; then
+    LEGACY_AGENT_ID="$(read_env_value TUNEX_AGENT_ID "$LEGACY_ENV_FILE")"
+  fi
+  [ "$LEGACY_AGENT_ID" = "$AGENT_ID" ] || die "容器 $CONTAINER 没有可验证的当前 agent_id 标签，拒绝升级"
 fi
 
 # ── 0. 回退锚点：先记下正在跑的镜像 ────────────────────────────────────────
