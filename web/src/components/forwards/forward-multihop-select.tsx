@@ -6,9 +6,9 @@
  * ── 它只做一件事 ──
  *
  * 把 {@link ForwardMultihopModel}（纯函数产物）画出来，让用户在**提交前**就看清：
- *   · 哪些节点能当中间跳（两段邻接绑定都已存在 —— 这正是服务端创建时会判的判据）；
- *   · 哪些**不能**、**为什么不能**，以及缺的那一段能不能补（补不了就绝不给"去绑定"的死路）；
- *   · 事实取不到时说"取不到"，**不**说"没有可用节点"。
+ *   · 哪些节点能当中间节点（角色/节点组合满足真实安全条件）；
+ *   · 缺少的相邻节点关系是否能在创建 Forward 时由服务端自动准备；
+ *   · 没有节点管理权限时，哪些路径只能复用已有关系而不能越权补建。
  *
  * ── 三条话术纪律（行为测试钉住）──
  *  1. **这是前置说明，不是连通性结论**：全文不出现「正常 / 健康 / 可达」，也不承诺这条路径此刻可用；
@@ -131,10 +131,9 @@ export function forwardMultihopCopy(locale: Locale): ForwardMultihopCopy {
 }
 
 /**
- * 候选一行的动作建议：缺的是哪一段、能不能补、怎么补。
+ * 候选一行的动作建议：缺的是哪一段，以及它能否由 Forward 创建流程自动准备。
  *
- * 两段的补法**不一样**：第一段以入口为源（对话框里 relay 的「绑定并使用」就能建），
- * 第二段以中间跳为源（只能在节点页建）——把它们都说成"去绑定"会让用户在第一段上白跑一趟。
+ * 关系创建仍受 node:manage 约束；这里不提供绕过权限的第二条写路径。
  */
 function candidateNextStep(candidate: MultihopCandidate): { text: "auto" | "permission" | "role" | null; segment: "inbound" | "outbound" | null } {
   const missing = multihopMissingSegment(candidate);
