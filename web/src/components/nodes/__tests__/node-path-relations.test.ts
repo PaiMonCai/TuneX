@@ -36,6 +36,17 @@ describe("node path relationship product surface", () => {
     expect(SRC).toContain('t("node.pathRelationInUseHint")');
   });
 
+  test("node roles are explained in path terms", () => {
+    expect(zh.node.ingressNodeRole).toBe("入口节点");
+    expect(zh.node.egressNodeRole).toBe("出口节点");
+    expect(zh.node.ingressRoleHint).toContain("接收用户连接");
+    expect(zh.node.egressRoleHint).toContain("最终目标");
+    expect(zh.node.bothRoleHint).toContain("中间节点");
+    expect(en.node.bothRoleHint).toContain("middle node");
+    expect(SRC).toContain('data-testid="node-role-hint"');
+    expect(SRC).toContain("roleHintKey(nodeRole)");
+  });
+
   test("product vocabulary changed without renaming backend API contracts", () => {
     // NodeBinding/bindEgress remain internal API terms. The product surface is
     // intentionally translated instead of changing the backend protocol.
