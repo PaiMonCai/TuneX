@@ -110,7 +110,7 @@ export interface NodeUpgradeFacts {
   agent_id: string;
   role: string | null;
   lifecycle: string | null;
-  /** 安装脚本使用固定容器名，升级脚本据此定位并重建同一个容器。 */
+  /** 可选的自定义容器名；脚本仍会校验容器声明的 agent_id，禁止碰兄弟实例。 */
   container_name?: string;
 }
 
@@ -230,12 +230,16 @@ export function renderNodeUpgradeScript(
   targetImage: string,
   options: RenderUpgradeOptions = {},
 ): RenderedUpgrade {
-  const container = safeToken(options.containerName?.trim() || facts.container_name?.trim() || "tunex-agent", 64) || "tunex-agent";
+  const agentId = safeToken(facts.agent_id?.trim() ?? "", 64);
+  const defaultContainer = agentId ? `tunex-agent-${agentId}` : "tunex-agent";
+  const container = safeToken(options.containerName?.trim() || facts.container_name?.trim() || defaultContainer, 96) || defaultContainer;
+  const envFile = agentId ? `/etc/tunex-agent/instances/${agentId}/agent.env` : "/etc/tunex-agent/agent.env";
+  const stateDir = agentId ? `/var/lib/tunex-agent/instances/${agentId}` : "/var/lib/tunex-agent";
   const stopTimeout = options.stopTimeoutS ?? 15;
   const checkTimeout = options.checkTimeoutS ?? 15;
   const panel = safeToken((options.panelURL ?? "").replace(/\/+$/, ""), 255);
   const rollbackHint =
-    `docker stop -t ${stopTimeout} ${container} && docker rm -f ${container}，再用旧镜像重新运行安装脚本`;
+    `docker stop -t ${stopTimeout} ${container} && docker rm -f ${container}，再用旧镜像重新运行该 Agent 实例`;
 
   const nodeKey = safeToken(facts.node_key, 64);
   const image = safeToken(targetImage, 255);
@@ -247,7 +251,13 @@ export function renderNodeUpgradeScript(
 # 因此不需要重新 enrollment，也不会产生新的节点身份。
 set -eu
 
+AGENT_ID="${agentId}"
 CONTAINER="${container}"
+ENV_FILE="${envFile}"
+STATE_DIR="${stateDir}"
+LEGACY_CONTAINER="tunex-agent"
+LEGACY_ENV_FILE="/etc/tunex-agent/agent.env"
+LEGACY_STATE_DIR="/var/lib/tunex-agent"
 TARGET_IMAGE="${image}"
 STOP_TIMEOUT="${stopTimeout}"
 CHECK_TIMEOUT="${checkTimeout}"
@@ -256,8 +266,45 @@ PANEL="${panel}"
 log() { printf 'tunex-upgrade: %s\\n' "$*"; }
 die() { printf 'tunex-upgrade: %s\\n' "$*" >&2; exit 1; }
 
+read_env_value() {
+  # Never source host state just to discover identity/metadata.
+  sed -n "s/^$1=//p" "$2" 2>/dev/null | tail -n 1
+}
+
 command -v docker >/dev/null 2>&1 || die "找不到 docker"
-docker inspect "$CONTAINER" >/dev/null 2>&1 || die "找不到容器 $CONTAINER（请确认节点用标准安装脚本部署）"
+
+# New installs use tunex-agent-<agent_id>. A pre-multi-instance node may still
+# use the legacy global container/path; accept that fallback only when its env
+# proves it belongs to THIS agent_id. Never guess from the name alone.
+if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+  LEGACY_AGENT_ID=""
+  if [ -r "$LEGACY_ENV_FILE" ]; then
+    LEGACY_AGENT_ID="$(read_env_value TUNEX_AGENT_ID "$LEGACY_ENV_FILE")"
+  fi
+  if [ "$LEGACY_AGENT_ID" = "$AGENT_ID" ] && docker inspect "$LEGACY_CONTAINER" >/dev/null 2>&1; then
+    log "检测到旧版单实例布局；本次升级只操作属于当前 agent_id 的 legacy 容器"
+    CONTAINER="$LEGACY_CONTAINER"
+    ENV_FILE="$LEGACY_ENV_FILE"
+    STATE_DIR="$LEGACY_STATE_DIR"
+  else
+    die "找不到当前 Agent 实例容器 $CONTAINER（legacy tunex-agent 也不属于 agent_id=$AGENT_ID）"
+  fi
+fi
+
+# A caller may provide container_name for a nonstandard deployment. Never trust
+# that name by itself: a multi-Agent host makes "wrong container, valid name" a
+# real possibility. New-layout containers prove identity via label. The sole
+# unlabeled exception is the old global tunex-agent, whose host env must match.
+CONTAINER_AGENT_ID="$(docker inspect --format '{{ index .Config.Labels "io.tunex.agent-id" }}' "$CONTAINER" 2>/dev/null || true)"
+if [ -n "$CONTAINER_AGENT_ID" ] && [ "$CONTAINER_AGENT_ID" != "<no value>" ]; then
+  [ "$CONTAINER_AGENT_ID" = "$AGENT_ID" ] || die "容器 $CONTAINER 属于另一个 Agent（$CONTAINER_AGENT_ID），拒绝升级"
+else
+  LEGACY_AGENT_ID=""
+  if [ "$CONTAINER" = "$LEGACY_CONTAINER" ] && [ -r "$LEGACY_ENV_FILE" ]; then
+    LEGACY_AGENT_ID="$(read_env_value TUNEX_AGENT_ID "$LEGACY_ENV_FILE")"
+  fi
+  [ "$LEGACY_AGENT_ID" = "$AGENT_ID" ] || die "容器 $CONTAINER 没有可验证的当前 agent_id 标签，拒绝升级"
+fi
 
 # ── 0. 回退锚点：先记下正在跑的镜像 ────────────────────────────────────────
 PREVIOUS_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER")"
@@ -276,12 +323,16 @@ if ! docker pull "$TARGET_IMAGE"; then
 fi
 
 # ── 2. 身份与状态文件必须先存在，否则重建会变成"新节点" ────────────────────
-[ -f /etc/tunex-agent/agent.env ] || die "缺少 /etc/tunex-agent/agent.env（长期凭据）；请改用安装脚本重新部署"
-[ -d /var/lib/tunex-agent ] || log "提示: 没有 /var/lib/tunex-agent，LKG 缓存为空（首次升级属正常）"
+[ -f "$ENV_FILE" ] || die "缺少 $ENV_FILE（当前 Agent 的长期凭据）；请改用安装脚本重新部署"
+[ -d "$STATE_DIR" ] || log "提示: 没有 $STATE_DIR，LKG 缓存为空（首次升级属正常）"
 
 run_agent() {
   IMAGE="$1"
-  # 与安装脚本同一组参数：同一容器名、同一宿主身份文件、同一 LKG 目录。
+  NODE_ID="$(read_env_value TUNEX_NODE_ID "$ENV_FILE")"
+  INGRESS_RANGE="$(read_env_value TUNEX_INGRESS_RANGE "$ENV_FILE")"
+  EGRESS_RANGE="$(read_env_value TUNEX_EGRESS_RANGE "$ENV_FILE")"
+  # Recreate only this logical Agent. Sibling TuneX Agent containers on the same
+  # host keep their own credentials, durable state and lifecycle.
   docker run -d \\
     --name "$CONTAINER" \\
     --restart unless-stopped \\
@@ -292,8 +343,13 @@ run_agent() {
     --stop-timeout "$STOP_TIMEOUT" \\
     --log-opt max-size=20m \\
     --log-opt max-file=3 \\
-    -v /etc/tunex-agent/agent.env:/run/tunex-agent/agent.env:ro \\
-    -v /var/lib/tunex-agent:/var/lib/tunex-agent \\
+    --label "io.tunex.agent=true" \\
+    --label "io.tunex.agent-id=$AGENT_ID" \\
+    --label "io.tunex.node-id=$NODE_ID" \\
+    --label "io.tunex.ingress-range=$INGRESS_RANGE" \\
+    --label "io.tunex.egress-range=$EGRESS_RANGE" \\
+    -v "$ENV_FILE:/run/tunex-agent/agent.env:ro" \\
+    -v "$STATE_DIR:/var/lib/tunex-agent" \\
     "$IMAGE" >/dev/null
 }
 

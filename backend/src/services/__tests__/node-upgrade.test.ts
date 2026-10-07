@@ -92,11 +92,43 @@ describe("drain: SIGTERM with the container's own stop timeout", () => {
 });
 
 describe("identity: the new container is the SAME node", () => {
-  test("reuses the host credential file and the LKG state directory", () => {
+  test("reuses only this agent_id's host credential file and LKG state directory", () => {
     const { script } = render();
-    expect(script).toContain("-v /etc/tunex-agent/agent.env:/run/tunex-agent/agent.env:ro");
-    expect(script).toContain("-v /var/lib/tunex-agent:/var/lib/tunex-agent");
+    expect(script).toContain('CONTAINER="tunex-agent-81879c3a-7bc5-4be7-84cf-e4ac2dc2849c"');
+    expect(script).toContain('ENV_FILE="/etc/tunex-agent/instances/81879c3a-7bc5-4be7-84cf-e4ac2dc2849c/agent.env"');
+    expect(script).toContain('STATE_DIR="/var/lib/tunex-agent/instances/81879c3a-7bc5-4be7-84cf-e4ac2dc2849c"');
+    expect(script).toContain('-v "$ENV_FILE:/run/tunex-agent/agent.env:ro"');
+    expect(script).toContain('-v "$STATE_DIR:/var/lib/tunex-agent"');
     expect(script).toContain('--name "$CONTAINER"');
+    expect(script).toContain('--label "io.tunex.agent-id=$AGENT_ID"');
+  });
+
+  test("legacy fallback is allowed only when legacy agent.env proves the same agent_id", () => {
+    const { script } = render();
+    const fallback = script.slice(script.indexOf("# New installs use tunex-agent-<agent_id>"), script.indexOf("# ── 0."));
+    expect(fallback).toContain('LEGACY_AGENT_ID="$(read_env_value TUNEX_AGENT_ID "$LEGACY_ENV_FILE")"');
+    expect(fallback).toContain('[ "$LEGACY_AGENT_ID" = "$AGENT_ID" ]');
+    expect(fallback).toContain('CONTAINER="$LEGACY_CONTAINER"');
+    expect(fallback).not.toContain('. "$LEGACY_ENV_FILE"');
+  });
+
+  test("upgrade recreation cannot delete a sibling Agent container", () => {
+    const { script } = render();
+    expect(script).toContain('docker rm -f "$CONTAINER"');
+    expect(script).not.toContain("docker rm -f tunex-agent >/dev/null");
+    expect(script).not.toContain("docker stop -t 15 tunex-agent");
+  });
+
+  test("a custom container name still has to prove it belongs to this agent_id", () => {
+    const { script } = renderNodeUpgradeScript(facts, "ghcr.io/tunex/agent:1.4.0", {
+      panelURL: "https://panel.example.com",
+      containerName: "custom-agent-container",
+    });
+    expect(script).toContain('CONTAINER="custom-agent-container"');
+    expect(script).toContain('CONTAINER_AGENT_ID="$(docker inspect --format');
+    expect(script).toContain('[ "$CONTAINER_AGENT_ID" = "$AGENT_ID" ] || die');
+    expect(script).toContain("属于另一个 Agent");
+    expect(script).toContain("没有可验证的当前 agent_id 标签");
   });
 
   test("no new enrollment happens, and the script says so", () => {
