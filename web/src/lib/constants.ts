@@ -61,6 +61,7 @@ export const NODE_ROLES: OptionMeta[] = [
 export const LB_STRATEGIES: OptionMeta[] = [
   { value: "round", zh: "轮询", en: "Round" },
   { value: "rand", zh: "随机", en: "Random" },
+  { value: "weighted_round", zh: "加权轮询", en: "Weighted round robin" },
 ];
 
 export const CATEGORY_OPTIONS: OptionMeta[] = [
