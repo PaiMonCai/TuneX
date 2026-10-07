@@ -200,7 +200,9 @@ export function AdminReadonlyManager({
         </Table>
       </div>
 
-      <p className="field-hint">{t("admin.readOnlyHint")}</p>
+      <p className="field-hint">
+        {segment === "tunnels" ? t("admin.forwardReadonlyHint") : t("admin.readOnlyHint")}
+      </p>
     </div>
   );
 }
