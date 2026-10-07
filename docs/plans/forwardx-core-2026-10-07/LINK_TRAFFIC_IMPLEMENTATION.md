@@ -79,7 +79,7 @@ Agent 测试修复在 HTTP fetch 期间持续预留子进程端口；强制 bind
 
 ### 修复候选的最终验收
 
-修复已提交推送 `827d9d82a07680218104fb892c0427844fcd1108`。[CI `37642785485`](https://github.com/PaiMonCai/TuneX/actions/runs/37642785485) 的 backend、web、agent、core-integration、ops、secret-scan 和统一 required **全部通过**。
+统计修复已提交推送 `827d9d82a07680218104fb892c0427844fcd1108`。[CI `37642785485`](https://github.com/PaiMonCai/TuneX/actions/runs/37642785485) 的 backend、web、agent、core-integration、ops、secret-scan 和统一 required **全部通过**。表中结果严格对应此源码提交；后续测试 fixture 修复及最新候选门禁见下文。
 
 | 验证范围 | 实际结果 |
 | --- | --- |
@@ -94,5 +94,11 @@ Agent 测试修复在 HTTP fetch 期间持续预留子进程端口；强制 bind
 该结果解决了本轮新统计写入的并发失败，不代表已经消除所有潜在数据库死锁；其他存储异常仍返回 503，由持久化 Agent 重投，未提交的数据不会被 ACK。无需扩大重试分类或放宽重复入账检查。
 
 开发与发布边界保持分离：保持实验开关默认关闭、公共组合 planned；长期活动历史回收、突发强杀窗口、跨节点总预算、可信来源和多目标组合仍是后续工作，不因本轮 CI 通过而自动开放。
+
+### 后续既有网络 fixture 收口
+
+只改记录的 `f449512` 触发 CI `37643734166`，统计数据库测试和 linkrunner 已通过，但既有 `TestWSPingIsAnsweredWithPong` 启动时报 wildcard 监听端口占用。修复 test helper `freePort`：按照实际默认 wildcard 范围探测，避免仅检查 `127.0.0.1` 时漏掉其他地址的同号占用。新增 Linux 负例同时证明 loopback-only 探测可成功、真实 WS wildcard 监听仍须拒绝 `127.0.0.2` 的占用且不能 Ready。Windows 对该重叠监听的行为不同，此负例限定 Linux；原 WS 正向握手、帧、ping/pong、错误拒绝与超时测试均保留。
+
+修复未调整业务代码、未增加通用启动重试或跳过 CI。最新候选的完整门禁可从 [PR #75 检查](https://github.com/PaiMonCai/TuneX/pull/75/checks) 核验；不能把此前某个提交的绿色状态替代当前候选的结果。
 
 下一优先级：长期活动统计历史裁剪 → 可信客户端来源透传/IP_HASH → FXP 多目标主备。复杂拓扑、运营和支付不抢占这些核心验收。

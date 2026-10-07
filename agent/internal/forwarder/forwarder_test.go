@@ -83,12 +83,13 @@ func (c *halfCloseConn) SetDeadline(time.Time) error      { return nil }
 func (c *halfCloseConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *halfCloseConn) SetWriteDeadline(time.Time) error { return nil }
 
-// freePort binds an ephemeral TCP port, closes it and returns the number. There
-// is an inherent TOCTOU race; every test re-checks failures and skips rather
-// than failing when the kernel reuses the number mid-test.
+// freePort probes the wildcard bind used by the default TunnelConfig. Probing
+// only 127.0.0.1 can return a port occupied on another loopback address, which
+// would then fail at the real wildcard listener. Releasing the probe still has
+// a TOCTOU window; startup errors remain test failures, never skips/retries.
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("reserve port: %v", err)
 	}
