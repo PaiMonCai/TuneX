@@ -1,10 +1,10 @@
 package forwarder
 
 import (
-	"strings"
 	"bytes"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -437,6 +437,16 @@ func TestDatagramRelayAndEgressReportProtocolDiagnostics(t *testing.T) {
 	}
 	if diag.Protocol != "udp" {
 		t.Fatalf("diag protocol = %q, want udp", diag.Protocol)
+	}
+	// UDP delivery can wake the client before the relay finishes recording its
+	// successful write. Wait for that observable completion, not a fixed sleep.
+	deadline := time.Now().Add(time.Second)
+	for diag.PacketsIn == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		diag, ok = d.(Diagnostician).ProtocolDiagnostics()
+		if !ok {
+			t.Fatal("the relay stopped reporting protocol diagnostics")
+		}
 	}
 	if diag.Mappings != 1 || diag.PacketsIn != 1 || diag.PacketsOut != 1 {
 		t.Fatalf("relay diag = %+v, want one live mapping and one packet each way", diag)

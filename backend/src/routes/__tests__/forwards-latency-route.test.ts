@@ -43,7 +43,9 @@ const root = new URL("../..", import.meta.url).pathname;
 /* ------------------------------------------------------------------ */
 
 const PRELUDE = String.raw`
-import { mock, expect } from "bun:test";
+import { mock, expect, setSystemTime } from "bun:test";
+/* 固定样本在 2026-10-06；冻结现在，避免样本随真实日期越过 24h 保留期。 */
+setSystemTime(new Date("2026-10-06T12:00:00.000Z"));
 import { Hono } from "hono";
 const root = process.env.TUNEX_LATENCY_ROOT;
 
