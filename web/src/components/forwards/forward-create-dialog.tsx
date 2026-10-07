@@ -108,64 +108,86 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
       </DialogHeader>
       {ingressNodes.length === 0 ? <div className="rounded-md border border-[var(--border)] p-4 text-sm text-[var(--muted-foreground)]">{t("forward.noIngress")}</div> :
       <div className="flex flex-col gap-4">
-        <Field label={t("common.name")}><Input value={draft.name} onChange={(e) => patch({ name: e.target.value })} placeholder="web-hk" /></Field>
-        <Field label={t("forward.protocol")} hint={forwardProtocolNote(locale, draft.protocol)}>
-          <Select value={draft.protocol} onValueChange={(value) => onDraftChange(changeForwardCreateProtocol(draft, value as ForwardProtocol))}>
-            <SelectTrigger data-testid="forward-protocol-select"><SelectValue /></SelectTrigger>
-            <SelectContent>{FORWARD_PROTOCOLS.map((value) => <SelectItem key={value} value={value} data-testid={`forward-protocol-${value}`}>{forwardProtocolLabel(value)}</SelectItem>)}</SelectContent>
-          </Select>
-        </Field>
-        {draft.protocol === "tls" ? <>
-          <Field label={t("forward.tlsCertPath")} hint={t("forward.tlsPathsHint")} error={protocolErrors.tls_cert_path ? t(protocolErrors.tls_cert_path) : undefined}>
-            <Input value={draft.tlsCertPath} maxLength={FORWARD_TLS_PATH_MAX} placeholder="/etc/tunex/tls/front.crt" data-testid="forward-tls-cert-path" required aria-invalid={protocolErrors.tls_cert_path ? true : undefined} onChange={(e) => patch({ tlsCertPath: e.target.value })} />
-          </Field>
-          <Field label={t("forward.tlsKeyPath")} error={protocolErrors.tls_key_path ? t(protocolErrors.tls_key_path) : undefined}>
-            <Input value={draft.tlsKeyPath} maxLength={FORWARD_TLS_PATH_MAX} placeholder="/etc/tunex/tls/front.key" data-testid="forward-tls-key-path" required aria-invalid={protocolErrors.tls_key_path ? true : undefined} onChange={(e) => patch({ tlsKeyPath: e.target.value })} />
-          </Field>
-        </> : null}
-        <Field label={t("forward.ingressNode")}>
-          <Select value={draft.ingressId} onValueChange={(value) => onDraftChange(changeForwardCreateIngress(draft, value))}>
-            <SelectTrigger><SelectValue placeholder={t("forward.chooseIngress")} /></SelectTrigger>
-            <SelectContent>{ingressNodes.map((node) => <SelectItem key={String(node.id)} value={String(node.id)}>{node.node_id} · {node.connect_ip ?? t("node.waiting")}</SelectItem>)}</SelectContent>
-          </Select>
-        </Field>
-        {draft.mode === "relay" ? <Field label={t("forward.egressNode")}><div className="flex flex-col gap-3">
-          {selectedBindings.length > 0 ? <Select value={draft.egressId} onValueChange={(egressId) => onDraftChange(changeForwardCreateEgress(draft, egressId))}>
-            <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
-            <SelectContent>{selectedBindings.map((binding) => <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
-              {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
-              {hasBindingUsage(binding) ? ` · ${text("forward.bindingUsageUsed", { count: bindingUsageView(binding).used_by_forward_count })}` : ""}
-            </SelectItem>)}</SelectContent>
-          </Select> : egressFactsUnknown ? (
-            /**
-             * 绑定事实**取不到**：独立 testid + 明确说"取不到"，并且**不再**画
-             * 「没有可用的出口节点」——那会把一次读取失败说成用户的配置缺失。
-             */
-            <div data-testid="forward-create-bindings-unavailable" className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
-              <div>{copy.bindingsUnavailable}</div>
-              <div className="mt-1 text-xs">{copy.bindingsUnavailableNext}</div>
+        <section data-testid="forward-create-basic" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
+          <div>
+            <div className="text-sm font-medium">{t("forward.basicInfo")}</div>
+            <div className="mt-0.5 text-xs text-[var(--muted-foreground)]">
+              {t("forward.pathMode")}: {draft.mode === "relay" ? t("forward.relay") : t("forward.direct")}
             </div>
-          ) : <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]"><div>{t("forward.noBoundEgress")}</div><div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div></div>}
-          {canManageNodes && availableEgressNodes.length > 0 ? <div className="rounded-md border border-[var(--border)] p-3">
-            <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">{selectedBindings.length > 0 ? t("forward.bindAnotherEgress") : t("forward.bindInline")}</div>
-            <div className="flex flex-col gap-2 sm:flex-row"><Select value={draft.bindEgressId} onValueChange={(bindEgressId) => patch({ bindEgressId })}>
-              <SelectTrigger className="min-w-0 flex-1"><SelectValue placeholder={t("forward.chooseUnboundEgress")} /></SelectTrigger>
-              <SelectContent>{availableEgressNodes.map((node) => <SelectItem key={String(node.id)} value={String(node.id)}>{node.node_id} · {node.connect_ip ?? t("node.waiting")}</SelectItem>)}</SelectContent>
-            </Select><Button type="button" variant="outline" onClick={onBindEgress} disabled={bindingBusy || !draft.bindEgressId}>{t("forward.bindAndUse")}</Button></div>
-          </div> : selectedBindings.length === 0 && !egressFactsUnknown ? <div className="text-xs text-[var(--muted-foreground)]">{t("forward.noAvailableEgress")}{" "}<Link href="/nodes" className="underline underline-offset-2">{t("common.nodes")}</Link></div> : null}
-        </div></Field> : null}
-        {/* 中间跳选择（只有 relay 才有意义；DIRECT 结构上不渲染）。 */}
-        <ForwardMultihopSection
-          model={multihopModel}
-          locale={locale}
-          value={draft.middleNodeId ?? ""}
-          onChange={(next) => patch({ middleNodeId: next })}
-        />
-        {/* 线路预览：只在有可选用入口时才有意义（没有入口节点时整块表单本来就不渲染）。 */}
-        <ForwardPathPreview model={pathPreview} locale={locale} />
-        <Field label={t("forward.listenPort")} hint={text(listenPortHintKey(draft.listenPort))}><Input inputMode="numeric" value={draft.listenPort} onChange={(e) => patch({ listenPort: e.target.value })} placeholder={text(listenPortPlaceholderKey(draft.listenPort))} data-testid="forward-listen-port" /></Field>
-        <Field label={t("forward.targetHost")}><Input value={draft.targetHost} onChange={(e) => patch({ targetHost: e.target.value })} placeholder="example.com" /></Field>
-        <Field label={t("forward.targetPort")}><Input inputMode="numeric" value={draft.targetPort} onChange={(e) => patch({ targetPort: e.target.value })} placeholder="443" /></Field>
+          </div>
+          <Field label={t("common.name")}><Input value={draft.name} onChange={(e) => patch({ name: e.target.value })} placeholder="web-hk" /></Field>
+          <Field label={t("forward.protocol")} hint={forwardProtocolNote(locale, draft.protocol)}>
+            <Select value={draft.protocol} onValueChange={(value) => onDraftChange(changeForwardCreateProtocol(draft, value as ForwardProtocol))}>
+              <SelectTrigger data-testid="forward-protocol-select"><SelectValue /></SelectTrigger>
+              <SelectContent>{FORWARD_PROTOCOLS.map((value) => <SelectItem key={value} value={value} data-testid={`forward-protocol-${value}`}>{forwardProtocolLabel(value)}</SelectItem>)}</SelectContent>
+            </Select>
+          </Field>
+          {draft.protocol === "tls" ? <>
+            <Field label={t("forward.tlsCertPath")} hint={t("forward.tlsPathsHint")} error={protocolErrors.tls_cert_path ? t(protocolErrors.tls_cert_path) : undefined}>
+              <Input value={draft.tlsCertPath} maxLength={FORWARD_TLS_PATH_MAX} placeholder="/etc/tunex/tls/front.crt" data-testid="forward-tls-cert-path" required aria-invalid={protocolErrors.tls_cert_path ? true : undefined} onChange={(e) => patch({ tlsCertPath: e.target.value })} />
+            </Field>
+            <Field label={t("forward.tlsKeyPath")} error={protocolErrors.tls_key_path ? t(protocolErrors.tls_key_path) : undefined}>
+              <Input value={draft.tlsKeyPath} maxLength={FORWARD_TLS_PATH_MAX} placeholder="/etc/tunex/tls/front.key" data-testid="forward-tls-key-path" required aria-invalid={protocolErrors.tls_key_path ? true : undefined} onChange={(e) => patch({ tlsKeyPath: e.target.value })} />
+            </Field>
+          </> : null}
+          <Field label={t("forward.listenPort")} hint={text(listenPortHintKey(draft.listenPort))}><Input inputMode="numeric" value={draft.listenPort} onChange={(e) => patch({ listenPort: e.target.value })} placeholder={text(listenPortPlaceholderKey(draft.listenPort))} data-testid="forward-listen-port" /></Field>
+        </section>
+
+        <section data-testid="forward-create-path" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
+          <div>
+            <div className="text-sm font-medium">{t("forward.networkPath")}</div>
+            <div className="mt-0.5 text-xs text-[var(--muted-foreground)]">
+              {draft.mode === "relay" ? t("forward.relayDesc") : t("forward.directDesc")}
+            </div>
+          </div>
+
+          <Field label={t("forward.ingressNode")}>
+            <Select value={draft.ingressId} onValueChange={(value) => onDraftChange(changeForwardCreateIngress(draft, value))}>
+              <SelectTrigger><SelectValue placeholder={t("forward.chooseIngress")} /></SelectTrigger>
+              <SelectContent>{ingressNodes.map((node) => <SelectItem key={String(node.id)} value={String(node.id)}>{node.node_id} · {node.connect_ip ?? t("node.waiting")}</SelectItem>)}</SelectContent>
+            </Select>
+          </Field>
+
+          {draft.mode === "relay" ? <Field label={t("forward.egressNode")}><div className="flex flex-col gap-3">
+            {selectedBindings.length > 0 ? <Select value={draft.egressId} onValueChange={(egressId) => onDraftChange(changeForwardCreateEgress(draft, egressId))}>
+              <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
+              <SelectContent>{selectedBindings.map((binding) => <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
+                {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
+                {hasBindingUsage(binding) ? ` · ${text("forward.bindingUsageUsed", { count: bindingUsageView(binding).used_by_forward_count })}` : ""}
+              </SelectItem>)}</SelectContent>
+            </Select> : egressFactsUnknown ? (
+              <div data-testid="forward-create-bindings-unavailable" className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
+                <div>{copy.bindingsUnavailable}</div>
+                <div className="mt-1 text-xs">{copy.bindingsUnavailableNext}</div>
+              </div>
+            ) : <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]"><div>{t("forward.noBoundEgress")}</div><div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div></div>}
+            {canManageNodes && availableEgressNodes.length > 0 ? <div className="rounded-md border border-[var(--border)] p-3">
+              <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">{selectedBindings.length > 0 ? t("forward.bindAnotherEgress") : t("forward.bindInline")}</div>
+              <div className="flex flex-col gap-2 sm:flex-row"><Select value={draft.bindEgressId} onValueChange={(bindEgressId) => patch({ bindEgressId })}>
+                <SelectTrigger className="min-w-0 flex-1"><SelectValue placeholder={t("forward.chooseUnboundEgress")} /></SelectTrigger>
+                <SelectContent>{availableEgressNodes.map((node) => <SelectItem key={String(node.id)} value={String(node.id)}>{node.node_id} · {node.connect_ip ?? t("node.waiting")}</SelectItem>)}</SelectContent>
+              </Select><Button type="button" variant="outline" onClick={onBindEgress} disabled={bindingBusy || !draft.bindEgressId}>{t("forward.bindAndUse")}</Button></div>
+            </div> : selectedBindings.length === 0 && !egressFactsUnknown ? <div className="text-xs text-[var(--muted-foreground)]">{t("forward.noAvailableEgress")}{" "}<Link href="/nodes" className="underline underline-offset-2">{t("common.nodes")}</Link></div> : null}
+          </div></Field> : null}
+
+          <ForwardMultihopSection
+            model={multihopModel}
+            locale={locale}
+            value={draft.middleNodeId ?? ""}
+            onChange={(next) => patch({ middleNodeId: next })}
+          />
+
+          <ForwardPathPreview model={pathPreview} locale={locale} />
+          <p className="text-xs text-[var(--muted-foreground)]" data-testid="forward-routing-policy-note">
+            {t("forward.routingPolicyNote")}
+          </p>
+        </section>
+
+        <section data-testid="forward-create-target" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
+          <div className="text-sm font-medium">{t("forward.targetSection")}</div>
+          <Field label={t("forward.targetHost")}><Input value={draft.targetHost} onChange={(e) => patch({ targetHost: e.target.value })} placeholder="example.com" /></Field>
+          <Field label={t("forward.targetPort")}><Input inputMode="numeric" value={draft.targetPort} onChange={(e) => patch({ targetPort: e.target.value })} placeholder="443" /></Field>
+        </section>
       </div>}
       <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
         <Button onClick={onCreate} disabled={busy || ingressNodes.length === 0 || !protocolReady || multihopBlocked || (draft.mode === "relay" && (!draft.egressId || selectedBindings.length === 0))}>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</Button>
