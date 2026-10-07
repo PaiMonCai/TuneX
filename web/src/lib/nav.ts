@@ -108,16 +108,16 @@ export const userConsoleNav: NavGroup[] = [
   {
     id: "routes",
     labelKey: "console.group.routes",
-    labelZh: "可用线路",
-    labelEn: "Routes",
+    labelZh: "网络",
+    labelEn: "Network",
     items: [
       { href: "/nodes", labelKey: "common.nodes", iconKey: "nodes" },
       {
-        /** 用户侧使用“可用线路”，不暴露 Route Profile 编排术语。 */
+        /** 用户侧只暴露可消费的路由策略，不展示 selector / transit 等编排术语。 */
         href: "/routes",
-        labelKey: "common.routes",
-        labelZh: "可用线路",
-        labelEn: "Routes",
+        labelKey: "common.routingPolicies",
+        labelZh: "可用路由策略",
+        labelEn: "Available routing policies",
         iconKey: "tunnels",
       },
     ],
@@ -201,18 +201,10 @@ export const adminConsoleNav: NavGroup[] = [
       { href: "/admin/tunnels", labelKey: "admin.tunnels", iconKey: "adminTunnels" },
       {
         href: "/admin/route-profiles",
-        labelKey: "admin.routeProfiles",
-        labelZh: "线路模板",
-        labelEn: "Route Profiles",
+        labelKey: "admin.routingPolicies",
+        labelZh: "路由策略",
+        labelEn: "Routing policies",
         iconKey: "tunnels",
-      },
-      {
-        href: "/admin/targets",
-        labelKey: "admin.targets",
-        labelZh: "目标与诊断",
-        labelEn: "Targets & Diagnostics",
-        iconKey: "adminTunnels",
-        status: "planned",
       },
     ],
   },
