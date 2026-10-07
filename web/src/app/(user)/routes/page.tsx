@@ -93,7 +93,7 @@ async function AvailableRoutesBody({ locale }: { locale: Locale }) {
             </p>
             <p className="mt-2 text-xs" data-testid="route-next-step">
               {zh
-                ? "路由策略由管理员配置，并作用在已经存在的转发上；当前版本创建转发时不需要（也无法）选择策略。某一转发需要调整路径时请联系管理员。"
+                ? "路由策略由管理员配置，并作用在已经存在的转发上；目前创建转发时不需要（也无法）选择策略。某一转发需要调整路径时请联系管理员。"
                 : "Routing policies are configured by an admin and applied to forwards that already exist. In this version you neither need nor can pick one while creating a forward. Ask your admin if a forward needs a different path."}
             </p>
           </CardContent>
