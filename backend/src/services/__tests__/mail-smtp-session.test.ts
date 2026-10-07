@@ -96,6 +96,7 @@ function startFakeSmtp(initial: Mode): FakeSmtp {
           switch (verb) {
             case "EHLO":
             case "HELO":
+              // 刻意返回真实 MTA 常见的 continuation 形态，防止回归成“只支持单行 250”。
               socket.write("250-fake-smtp\r\n250 AUTH LOGIN\r\n");
               break;
             case "AUTH":
