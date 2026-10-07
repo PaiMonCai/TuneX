@@ -627,6 +627,9 @@ export async function createRelayTunnel(
     egressPort: egressAlloc.port,
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    // Pool policy overrides the node default; NULL inherits the node. This is
+    // the same precedence startup restore uses in desiredTunnelConfigFor().
+    lbStrategy: typeof pool?.lb_strategy === "string" ? pool.lb_strategy : egressPick.node.lb_strategy,
     protocol,
     // V5.1b WP5-B2: a datagram exit must be told who may feed it. This is the
     // same `connect_ip` the ingress leg uses for its `next_hop` — one hop, one
@@ -1065,8 +1068,9 @@ export async function reapplyRelayTunnel(
 
   // 出口池：沿用行上的值；为空则取该出口节点的 default 池（§2.2）。
   let poolId = row.egress_pool_id === null ? null : Number(row.egress_pool_id);
+  let pool: Record<string, unknown> | null = null;
   if (poolId !== null) {
-    const pool = await store.egressPool.findUnique({ where: { id: poolId } });
+    pool = await store.egressPool.findUnique({ where: { id: poolId } });
     if (!pool || Number((pool as { node_id: number }).node_id) !== egressPick.node.id) {
       return fail(
         "bind_nodes",
@@ -1075,7 +1079,7 @@ export async function reapplyRelayTunnel(
       );
     }
   } else {
-    const pool = await store.egressPool.findFirst({
+    pool = await store.egressPool.findFirst({
       where: { node_id: egressPick.node.id, name: "default" },
     });
     if (pool) poolId = Number((pool as { id: number }).id);
@@ -1269,6 +1273,8 @@ export async function reapplyRelayTunnel(
     egressPort,
     poolId,
     targets: egressTargets as { host: string; port: number; weight?: number; order_by?: number }[],
+    // retry/resume must not reset a weighted/random pool to round-robin.
+    lbStrategy: typeof pool?.lb_strategy === "string" ? pool.lb_strategy : egressPick.node.lb_strategy,
     protocol: reapplyProtocol,
     // V5.1b WP5-B2: the SAME fact the create path passes (a datagram exit attests its
     // ingress, and the hop has no handshake to imply it). This site was missed on the

@@ -213,7 +213,7 @@ export interface SchedulableNode {
   /** 端口分配区间；NULL 由 portPool 判 `node_range_unset`。 */
   port_range_min: number | null;
   port_range_max: number | null;
-  lb_strategy: "round" | "rand" | null;
+  lb_strategy: "round" | "rand" | "weighted_round" | null;
   /** 节点状态（`Node.status`：active / inactive）。 */
   status: "active" | "inactive";
   /** 最近心跳（`Node.last_seen_at`，WP7 之后由 session/state report 更新）。 */

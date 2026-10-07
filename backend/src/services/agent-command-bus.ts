@@ -27,6 +27,7 @@ import {
   AgentTransportError,
   Orchestrator,
   RELAY_DISPATCH_ERROR_CODES,
+  normalizeLbStrategy,
   type AgentTransport,
   type AgentTunnelConfig,
   type OrchestratorNode,
@@ -1088,7 +1089,7 @@ export interface DesiredRowProjection {
   remote_host: string | null;
   remote_port: number | null;
   egress_port: number | null;
-  egress_node?: { connect_ip: string | null } | null;
+  egress_node?: { connect_ip: string | null; lb_strategy?: string | null } | null;
   middle_node?: { connect_ip: string | null } | null;
   /** V5.1b：datagram 出口的取证地址来自**入口**节点（优先用它的上报）。 */
   ingress_node?: {
@@ -1204,10 +1205,9 @@ export function desiredTunnelConfigFor(
 
   if (row.tunnel_mode === "relay" && row.egress_node_id === nodeId) {
     if (!row.egress_port) return { kind: "not_for_node" };
-    const strategy =
-      row.egress_pool?.lb_strategy === "rand" ? "RANDOM" :
-      row.egress_pool?.lb_strategy === "weighted_round" ? "WEIGHTED_ROUND_ROBIN" :
-      "ROUND_ROBIN";
+    // Match the live dispatch/reconcile path: a NULL pool policy inherits the
+    // node default. An Agent restart must not silently switch traffic to RR.
+    const strategy = normalizeLbStrategy(row.egress_pool?.lb_strategy ?? row.egress_node?.lb_strategy);
     const poolTargets = (row.egress_pool?.targets ?? []).map((x) => ({
       host: x.host,
       port: x.port,
@@ -1432,7 +1432,7 @@ export async function buildDesiredNodeSnapshot(
       OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }, { middle_node_id: nodeId }],
     },
     include: {
-      egress_node: { select: { id: true, connect_ip: true } },
+      egress_node: { select: { id: true, connect_ip: true, lb_strategy: true } },
       middle_node: { select: { id: true, connect_ip: true } },
       // V5.1b : a datagram exit is told which ingress may feed it, and the
       // ingress address is this node's. The command path reads it from the dispatch

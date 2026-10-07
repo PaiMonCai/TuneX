@@ -73,7 +73,7 @@ interface NodeRow {
   connect_ip: string | null;
   port_range_min: number | null;
   port_range_max: number | null;
-  lb_strategy: "round" | "rand" | null;
+  lb_strategy: "round" | "rand" | "weighted_round" | null;
   status: "active" | "inactive";
   last_seen_at: Date | null;
   node_group_id: number;
@@ -95,7 +95,7 @@ interface EgressPoolRow {
   id: number;
   node_id: number;
   name: string;
-  lb_strategy: "round" | "rand" | null;
+  lb_strategy: "round" | "rand" | "weighted_round" | null;
   status: "active" | "inactive";
 }
 
@@ -1901,5 +1901,44 @@ describe("H. V5-WP2 runtime plan", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result).not.toHaveProperty("runtimePlan");
+  });
+});
+
+
+describe("K. weighted_round policy survives every scheduler delivery path", () => {
+  test("K1. create inherits weighted_round from the egress node when the pool policy is NULL", async () => {
+    nodes[1]!.lb_strategy = "weighted_round";
+    pools[0]!.lb_strategy = null;
+
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
+
+    const egress = fakeAgent.applies.find((apply) => apply.kind === "egress");
+    expect(egress?.config?.lb_strategy).toBe("WEIGHTED_ROUND_ROBIN");
+    expect(egress?.config?.targets).toEqual([
+      expect.objectContaining({ host: "192.168.1.10", weight: 1 }),
+      expect.objectContaining({ host: "192.168.1.11", weight: 2 }),
+    ]);
+  });
+
+  test("K2. retry/reapply keeps the pool override instead of silently resetting to round robin", async () => {
+    nodes[1]!.lb_strategy = "rand";
+    pools[0]!.lb_strategy = "weighted_round";
+    const existing = seedTunnel({
+      listen_port: 20005,
+      egress_port: null,
+      desired_status: "active",
+      apply_status: "error",
+      config_revision: 4,
+      applied_revision: 3,
+    });
+    tunnels.push(existing);
+
+    const result = await scheduler.reapplyRelayTunnel(existing.id, orch, deps);
+    expect(result.ok).toBe(true);
+
+    const egress = fakeAgent.applies.find((apply) => apply.kind === "egress");
+    expect(egress?.config?.lb_strategy).toBe("WEIGHTED_ROUND_ROBIN");
+    expect(egress?.config?.revision).toBe(5);
   });
 });
