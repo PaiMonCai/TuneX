@@ -775,9 +775,10 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
       <NodeGroupPrerequisite state="empty" onRetry={() => undefined} onCreateGroup={() => undefined} />,
     );
     expect(html).toContain('data-testid="node-group-empty"');
-    // 文案说清「默认策略允许、可以在本页直接建」，而不是让人去等一个不需要的管理员。
-    expect(html).toContain("默认策略允许");
-    expect(html).toContain("本页");
+    // 文案说清「这里可以创建入口用途节点池」，而不是暴露 entitlement 名。
+    expect(html).toContain("入口用途");
+    expect(html).toContain("工作空间策略");
+    expect(html).not.toContain("allow_custom_");
     // 真的入口：按钮存在且可点（提交走用户域 API，entitlement 由后端裁决）。
     expect(html).toContain('data-testid="node-group-create-entry"');
     expect(html).toContain("创建节点池");
@@ -839,8 +840,9 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
     const html = renderPage({ canManage: false, can: (key) => key === "node:read" });
     expect(html).toContain('data-testid="node-readonly-empty-title"');
     expect(html).toContain('data-testid="node-readonly-empty-hint"');
-    expect(html).toContain("node:manage");
+    expect(html).toContain("节点管理权限");
     expect(html).toContain("工作空间管理员");
+    expect(html).not.toContain("node:manage");
     // 不给创建入口，也不显示前置条件。
     expect(isDisabled(buttonWith(html, "创建节点"))).toBe(true);
     expect(html).not.toContain('data-testid="node-group-empty"');
@@ -851,8 +853,10 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
     const html = render(<NodeReadonlyEmptyState />);
     expect(html).toContain('data-testid="node-readonly-empty-title"');
     expect(html).toContain('data-testid="node-readonly-empty-hint"');
-    expect(zh.node.readonlyEmptyHint).toContain("node:manage");
-    expect(en.node.readonlyEmptyHint).toContain("node:manage");
+    expect(zh.node.readonlyEmptyHint).toContain("节点管理权限");
+    expect(en.node.readonlyEmptyHint).toContain("node-management permission");
+    expect(zh.node.readonlyEmptyHint).not.toContain("node:manage");
+    expect(en.node.readonlyEmptyHint).not.toContain("node:manage");
     const enHtml = render(<NodeReadonlyEmptyState />, "en");
     expect(enHtml).toContain(en.node.readonlyEmptyTitle);
   });
