@@ -236,7 +236,11 @@ export class SmtpClient {
   }
 
   private write(line: string): void {
-    this.socket?.write(`${line}\r\n`);
+    const socket = this.socket;
+    if (!socket || socket.destroyed) {
+      throw new Error("SMTP 客户端尚未连接或连接已关闭");
+    }
+    socket.write(`${line}\r\n`);
   }
 
   /** 发命令并按预期码校验；不符即抛错（消息含服务端文本，便于排查）。 */
