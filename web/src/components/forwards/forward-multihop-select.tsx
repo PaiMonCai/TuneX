@@ -73,7 +73,7 @@ const ZH: ForwardMultihopCopy = {
   noMiddleOption: "不使用中间节点",
   threeSegments: "已选中间节点：路径是 入口 → 中间 → 出口 → 目标。",
   visibilityNote:
-    "创建后可在该转发详情页的「链路」卡片核验三段（段名 ingress_to_middle / middle_to_egress）；列表与详情读数不显示中间跳。",
+    "创建后可在该转发详情页的「路径」卡片查看完整节点链；列表页只展示路径摘要。",
   bindHint: "去节点页",
   bindInboundHint: "第一段可以在上面的出口区域里选择这台节点并「启用并使用」。",
   bindOutboundHint: "第二段需要到节点页配置：让这台节点可以继续转到所选出口。",
@@ -108,7 +108,7 @@ const EN: ForwardMultihopCopy = {
   noMiddleOption: "No middle node",
   threeSegments: "Middle node chosen: this forward's path is ingress → middle → egress → target.",
   visibilityNote:
-    "After creating it, the “path” card on the forward detail page shows all three segments (segment names ingress_to_middle / middle_to_egress); list and detail reads do not include the middle hop.",
+    "After creating it, the forward detail page's “path” card shows the complete node chain; the list only shows a path summary.",
   bindHint: "nodes page",
   bindInboundHint: "The first segment can be prepared above by choosing this node and clicking “enable and use”.",
   bindOutboundHint: "The second segment must be prepared on the nodes page so this node can continue to the selected egress.",
