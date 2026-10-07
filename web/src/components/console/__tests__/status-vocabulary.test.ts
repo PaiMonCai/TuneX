@@ -121,6 +121,23 @@ describe("Node → 用户可见状态", () => {
     expect(consoleStatusForNode({ connection: "offline" })).toBe("degraded");
   });
 
+  test("A00: desired 仍 active/可接新业务，但连接事实 stale/offline 时绝不画成 available", () => {
+    // accepts_new_business=true 是生命周期/期望层结论，不是“Agent 此刻在线”的证据。
+    // 真实 stale 心跳由后端 projectUserNode 投影为 connection=offline；Console 必须
+    // 服从这个事实层，不能因为 desired 仍 active 就把节点涂绿。
+    expect(consoleStatusForNode({
+      connection: "offline",
+      accepts_new_business: true,
+    })).toBe("degraded");
+  });
+
+  test("A00: 尚无连接事实时，即使 desired 允许业务也保持 desired/unknown，而非 available", () => {
+    expect(consoleStatusForNode({
+      connection: "waiting",
+      accepts_new_business: true,
+    })).toBe("desired");
+  });
+
   test("尚未连接/等待安装 → desired；缺数据 → desired", () => {
     expect(consoleStatusForNode({ connection: "waiting" })).toBe("desired");
     expect(consoleStatusForNode(null)).toBe("desired");
