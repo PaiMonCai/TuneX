@@ -16,11 +16,12 @@
  * 服务器，第一次 `EHLO` 都会读到那条 220**，判定失败 ⇒ 任何配置了 `SMTP_*` 的部署
  * 邮件全发不出去（验证、重置、公告、通知 email 渠道）。
  *
- * 本文件因此钉住四件事：
+ * 本文件因此钉住五件事：
  *  ① 有 `220` 问候语 ⇒ 投递成功，且命令顺序是 EHLO → AUTH → MAIL → RCPT → DATA → QUIT；
- *  ② 多行问候语（`220-…` / `220 …`）同样成功（真实服务器常这么发）；
- *  ③ 问候语不是 220（`554 go away`）⇒ 失败，**一条命令都不发**（fail-closed）；
- *  ④ 服务器完全不说话 ⇒ 读取超时 = 失败（用可注入的短超时验，不真等 15 秒）。
+ *  ② EHLO 的真实多行应答（`250-…` / `250 …`）能完整消费，不会卡在 continuation；
+ *  ③ 多行问候语（`220-…` / `220 …`）同样成功（真实服务器常这么发）；
+ *  ④ 问候语不是 220（`554 go away`）⇒ 失败，**一条命令都不发**（fail-closed）；
+ *  ⑤ 服务器完全不说话 ⇒ 读取超时 = 失败；未 connect 就 send 则立即 fail-fast。
  */
 import { describe, expect, test } from "bun:test";
 
@@ -161,8 +162,25 @@ function resetRecordings(): void {
   fake.messages.length = 0;
 }
 
+describe("SMTP 客户端连接状态", () => {
+  test("未 connect 就 send ⇒ 立即失败，不伪装成 15 秒应答超时", async () => {
+    const client = new SmtpClient("127.0.0.1", fake.port, CONFIG);
+    const started = Date.now();
+    let message = "";
+    try {
+      await client.send(MESSAGE);
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    } finally {
+      client.close();
+    }
+    expect(message).toContain("尚未连接");
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+});
+
 describe("SMTP 真实会话：问候语必须先被读掉", () => {
-  test("有 220 问候语 ⇒ 会话走完，且命令顺序正确（修复前这里必然失败）", async () => {
+  test("有 220 问候语 + 多行 EHLO ⇒ 会话走完，且命令顺序正确", async () => {
     fake.setMode("greeting");
     resetRecordings();
     await sendOnce();
