@@ -114,5 +114,31 @@ if (!enabled) {
     assert.equal((await send([restarted, restarted])).ok, true);
     const afterRestart = await client.tunnelTraffic.findUnique({ where: { tunnel_id_date: { tunnel_id: forwardIds[0], date } } });
     assert.equal(afterRestart.traffic, 570);
+
+    // Exercise creation contention repeatedly, not only the already-existing
+    // checkpoint path. A one-off green batch can conceal an InnoDB deadlock.
+    const rounds = 20;
+    for (let round = 0; round < rounds; round++) {
+      const freshProducers = [randomBytes(16).toString("hex"), randomBytes(16).toString("hex")];
+      const errorStart = storageErrors.length;
+      const concurrent = await Promise.all([9, 2, 8, 1, 9, 5, 3, 4, 7, 6].map((n) => {
+        const batch = forwardIds.flatMap((forward) => freshProducers.map((producer) => sample(n, forward, producer)));
+        return send(n % 2 ? batch.reverse() : batch);
+      }));
+      assert.ok(concurrent.every((result) => result.ok), "fresh producer contention should commit: "
+        + JSON.stringify({ round, accepted: concurrent.filter((result) => result.ok).length,
+          rejected: concurrent.filter((result) => !result.ok).map((result) => ({ status: result.status, reason: result.reason })),
+          storage_errors: storageErrors.slice(errorStart) }));
+      const freshRows = await client.linkTrafficCheckpoint.findMany({ where: {
+        node_id: nodeId, producer_id: { in: freshProducers },
+      } });
+      assert.equal(freshRows.length, 4);
+      for (const row of freshRows) assert.deepEqual([row.bytes_in, row.bytes_out, row.connections], [90n, 180n, 9n]);
+      for (const [index, forward] of forwardIds.entries()) {
+        const daily = await client.tunnelTraffic.findUnique({ where: { tunnel_id_date: { tunnel_id: forward, date } } });
+        const expected = (index === 0 ? 570 : 540) + (round + 1) * 540;
+        assert.deepEqual([daily.traffic, daily.traffic_cost], [expected, expected], "each producer's delta counted exactly once");
+      }
+    }
   });
 }
