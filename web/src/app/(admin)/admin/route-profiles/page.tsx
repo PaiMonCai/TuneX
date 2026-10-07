@@ -9,7 +9,7 @@ import { routeProfileErrorInfo } from "@/components/admin/route-profiles/route-p
 import type { RouteProfileView } from "@/lib/types";
 
 /**
- * `/admin/route-profiles` —— 线路模板编排（V5-WP13.5B，Admin Console → Network）。
+ * `/admin/route-profiles` —— 路由策略编排（V5-WP13.5B，Admin Console → Network）。
  *
  * §9.4.7：外壳先响应，列表在 `Suspense` 里取；取数失败（例如角色无 `node:read`）
  * **不抛**，而是把后端 code / 失败层 / next_action 渲染出来。
@@ -28,12 +28,12 @@ export default async function RouteProfilesPage() {
   const { locale } = await shellI18n();
   return (
     <AppShell
-      title={localizedLabel(locale, "admin.routeProfiles", "线路模板", "Route profiles")}
+      title={localizedLabel(locale, "admin.routingPolicies", "路由策略", "Routing policies")}
       subtitle={localizedLabel(
         locale,
-        "admin.routeProfilesSubtitle",
-        "可复用、可版本化的线路意图（不含 runtime 状态机）",
-        "Reusable, versioned routing intent (no runtime state machine)",
+        "admin.routingPoliciesSubtitle",
+        "可复用、可版本化的路径选择规则；转发是业务实例，策略只决定流量怎么走",
+        "Reusable, versioned path-selection rules; forwards are the service instances, policies decide how traffic moves",
       )}
       adminMode
      
