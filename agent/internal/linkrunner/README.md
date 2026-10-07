@@ -8,6 +8,9 @@ facts. This implementation does not change the public matrix or planned gate.
 ```go
 New(binaryPath, stateDir, agentID string) (*Manager, error)
 (*Manager).SetPortGuard(PortGuard) error
+(*Manager).EnableTraffic() error
+(*Manager).TrafficSamples() ([]TrafficSample, error)
+(*Manager).AckTraffic([]TrafficSample) error
 (*Manager).Apply(Config) (Observation, error)
 (*Manager).Remove(id string, generation int64) (Observation, error)
 (*Manager).Status() []Observation
@@ -120,3 +123,134 @@ durable cache boundaries), managed_real_test.go (persistent shared traffic and
 tamper acceptance). Vendored integration: managed_reload.go/test, main.go,
 binding_auth.go and udp_direct.go. Control integration: client.go, protocol.go,
 runtime.go, link_test.go, manifest.go/test and Agent runtime.go.
+
+## Durable ingress traffic collector
+
+Collection is **disabled by default**. Call `EnableTraffic()` immediately after
+`New`, before the first `Apply` or `Restore`. Late opt-in returns
+`ErrTrafficStarted`. Existing fake/legacy process invocations remain unchanged
+when disabled. Enabled non-passive ingress requires `managedReload:true`; an
+unsupported ingress cannot silently run without accounting. Egress and passive
+ingress never produce counters.
+Managed traffic is supported only on Linux and Windows; other GOOS builds have
+an explicit fail-closed opener and `EnableTraffic` rejects the unsupported platform.
+
+Each fresh ingress process gets a cryptographically random 32-lowercase-hex
+producer ID and only these additional CLI arguments:
+
+```text
+-managed-traffic <private-absolute-stateDir/traffic/producer.snapshot.json>
+-managed-traffic-producer <producer>
+```
+
+The destination is new, not pre-created by the Agent: FXP atomically creates its
+initial empty snapshot before starting listeners. `AUTH_SECRET` is always
+excluded from child environments; with collection enabled, `NODE_CREDENTIAL` is
+also excluded, including for egress. The child receives no panel credentials.
+
+`traffic/<producer>.manifest.json` is an AES-GCM sidecar using the existing
+machine-key cache AEAD. Authentication binds the Agent ID and filename producer.
+Its secret-free contents bind producer to placement ID, node, workspace, link
+and ingress role, and map each actual authorized entry-group `ruleId` to its
+**first-known generation/config digest for that process**. TCP and UDP of a
+`both` rule share one forward ID. New mappings are synced before publishing a
+managed candidate config; a rejected proposal can conservatively retain its
+mapping. Existing/removed/re-added rule mappings are never rebased or evicted.
+No runner JSON, transport key or network credential enters the traffic spool.
+
+FXP snapshots have exactly `version:1`, `producer_id`, and `samples`, containing
+`forward_id`, `date`, and decimal-string `bytes_in`, `bytes_out`, `connections`.
+Dates are FXP's Asia/Shanghai accounting dates; the collector does not re-bucket
+them. Totals are cumulative per process/rule/day across managed updates, not
+deltas. Counters and input+output totals must stay within `9007199254740991`.
+The exported `TrafficSample` wire fields are exactly:
+
+```text
+producer_id link_id workspace_id node_id forward_id generation config_digest
+date bytes_in bytes_out connections
+```
+
+`TrafficSamples()` scans the durable spool, including stopped processes, removed
+placements and prior Agent runs. Authenticated manifests are checked against
+retained placement identity and generation fences. Counter high-water marks are
+persisted before samples are returned; regression or loss of a previously seen
+rule/day is rejected, even after restart. Swapped producer snapshots/manifests,
+symlinks (including directory ancestors), path escapes, non-private POSIX files,
+unknown fields, duplicate JSON keys, malformed dates/counters and unreadable data
+fail closed. Atomic snapshots are read through pinned kernel no-follow handles,
+with bounded metadata/sharing retries, including Windows directory-enumeration
+and sharing/access races. A legitimate replacement between Lstat and open is
+not confused with a producer identity mismatch; both file modes/sizes and the
+actual snapshot producer identity are still validated.
+Windows uses `FILE_FLAG_OPEN_REPARSE_POINT` with read/write/delete sharing;
+Linux uses `O_NOFOLLOW`. The opened handle's regular-file type, private POSIX
+permissions and 1 MiB size limit are rechecked, and the handle closes before
+JSON decoding. Each transient metadata/open retry phase is limited to eight
+attempts with 5 ms sleeps. A disappearing writer `*.tmp` entry is tolerated,
+but a missing manifest/snapshot is never skipped (except authenticated ACK
+deletion recovery). Persistent sharing/access failures still return `ErrTraffic`
+and leave the spool untouched. Some Windows replacements can wait for an open
+reader to close; the existing atomic writer's bounded retry remains required.
+
+`AckTraffic` compares full metadata and all current persisted totals. It never
+removes an active producer, even when its snapshot is empty or its lease has
+expired but exit is unconfirmed. Only a stopped producer whose entire current
+snapshot is exactly covered by ACKs is reclaimed. Partial/stale ACKs retain data;
+repeated ACKs are idempotent. A durable exact-total deletion intent and ordered
+snapshot/manifest unlinks allow interrupted ACK cleanup to recover safely. A
+changed snapshot during that cleanup is an error, never permission to delete it.
+`AckTraffic(nil)` can reclaim stopped empty producers without a network request;
+it retains all active producers and all nonzero/unacknowledged samples.
+
+The runtime owns the sole 10-second delivery loop, HTTP authentication and the
+shared **current** panel URL callback. Send a whole producer (at most 2048
+samples) per request and pass only acknowledged samples to `AckTraffic`. Call
+`AckTraffic(nil)` after successful flushes, including empty flushes, to reclaim
+stopped zero-traffic producers. There is deliberately no second delivery loop,
+reporter integration or HTTP client in linkrunner.
+
+Limits: 1 MiB per manifest/snapshot, 2048 samples and historical rule mappings
+per producer, 128 retained producers, and at most 129 bounded writer `*.tmp`
+files (one per producer plus the Agent). All files are counted, giving a hard
+385 MiB spool-size bound. No unacknowledged producer or historical mapping is
+evicted to make room. Private directories are 0700 and files 0600; Windows
+service-account ACL provisioning is still required. Capacity, validation or
+uncertain persistence failures reject launch/update and stop traffic-enabled
+ingress children; data remains for explicit recovery. Missing snapshots are
+errors except during an already-authenticated ACK deletion. A failed launch
+before FXP initializes can leave a conservative manifest requiring operator
+inspection/recovery, rather than guessing that missing data was zero.
+
+Remove, lease expiry, process restart and `Close` preserve traffic files. `New`
+cleans only the separate `runtime/` plaintext-config directory. Keep `machine.key`,
+encrypted fences and `traffic/` together for recovery, and use one Manager owner.
+Authenticated checkpoints protect against snapshot regression and filename replay,
+not a malicious service-account owner replaying an entire machine-key/state backup.
+
+**Counter window limitations:** FXP samples active TCP/UDP counters every second
+and persists cumulative snapshots every second, so an abrupt Agent/FXP kill or
+power loss can lose the unpersisted sampling+flush window (nominally up to about
+two seconds; scheduler/storage delays can extend it). Previously persisted
+snapshots survive restart and use old producer IDs; the replacement always gets
+a new ID. Graceful FXP shutdown attempts a final sample/flush, but Agent `Close`
+and lease expiry have bounded stop timeouts and can force-kill a draining child;
+they cannot guarantee a final flush. A delivery failure loses no persisted data,
+but eventual durable accounting is not an exactly-once claim for unsampled bytes.
+
+Collector files: `traffic.go`, `traffic_store.go`, `traffic_file_linux.go`,
+`traffic_file_windows.go`, `traffic_file_unsupported.go` (no unsafe generic-open
+fallback), `platform_unsupported.go` (conservative native-build portability),
+lifecycle hooks in
+`manager.go`/`managed.go`/`process.go`, and `traffic_test.go`,
+`traffic_windows_test.go`, `traffic_real_test.go`.
+The optional real-binary acceptance checks known BOTH TCP+UDP payloads while TCP
+remains open, rule deletion, active ACK retention, final snapshots, Close/reopen,
+Restore and producer replacement:
+
+```powershell
+$env:GOARCH = 'amd64'
+$env:TUNEX_TEST_FXP_BINARY = '<absolute path to current FXP executable>'
+go test ./internal/linkrunner -run 'TestTraffic|TestRealFXPTraffic' -count=1
+```
+
+`TUNEX_TEST_FXP_TRAFFIC_BINARY` is also accepted for collector-only acceptance.

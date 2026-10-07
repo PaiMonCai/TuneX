@@ -6,14 +6,14 @@ import { linksCopy } from "../links-copy";
 import { bindingFromForward, canEditLinkEndpoints, canRetireLink, createLinksScopeFence, linkErrorMessage, linkLiveState, placementState, linkIdFromSelection } from "../link-state";
 import { LinkedForwardGuide, linkedForwardHref, isLinkManagedError } from "../linked-forward-guide";
 import { ApiError } from "@/lib/api/core";
-import { binding, forward, link } from "./links-fixtures";
-import type { LinkDetail } from "@/lib/links-types";
+import { binding, forward, link, traffic } from "./links-fixtures";
+import { projectLinkDetail, type LinkDetail } from "@/lib/links-types";
 import { localizedLabel, userConsoleNav } from "@/lib/nav";
 
 const copy = linksCopy("zh");
 const noop = () => {};
-function markup(data: LinkDetail, manage = true, now = Date.parse("2029-01-01T00:00:00Z")) {
-  return renderToStaticMarkup(<LinkDetailView link={data} copy={copy} canManage={manage} busy={false} now={now} nodeLabel={(id) => `Node ${id}`}
+function markup(data: LinkDetail, manage = true, now = Date.parse("2029-01-01T00:00:00Z"), labels = copy) {
+  return renderToStaticMarkup(<LinkDetailView link={data} copy={labels} canManage={manage} busy={false} now={now} nodeLabel={(id) => `Node ${id}`}
     onEdit={noop} onDeploy={noop} onRotate={noop} onRetire={noop} onAdd={noop} onEditForward={noop} onAction={noop} />);
 }
 function bindingData(over: Record<string, string> = {}) {
@@ -50,6 +50,102 @@ describe("links real form boundaries", () => {
     data.set("egress_node_id", "12"); data.set("carrier_port", ""); expect(() => parseLinkConfigForm(data)).toThrow();
     const html = renderToStaticMarkup(<LinkConfigForm copy={copy} nodes={[]} nodesError={true} busy={false} onCancel={noop} onSubmit={async () => {}} />);
     expect(html).toContain(copy.nodesFailed); expect(html).toMatch(/<fieldset[^>]*disabled/);
+  });
+});
+
+describe("historical forward traffic, not live readiness", () => {
+  const now = Date.parse("2029-01-01T00:00:00Z");
+  function fact(html: string, label: string) {
+    return html.split(`${label}</dt>`)[1]?.match(/^<dd[^>]*>([^<]*)<\/dd>/)?.[1];
+  }
+  test("missing and nullable traffic render not received in both languages", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      for (const value of [undefined, null]) {
+        const html = markup(projectLinkDetail(link({ forwards: [forward({ traffic: value })] }), 5), false, now, labels);
+        for (const label of [labels.trafficIn, labels.trafficOut, labels.trafficConnections, labels.trafficLastReceived]) {
+          expect(fact(html, label)).toBe(labels.trafficNotReceived);
+        }
+        expect(html).toContain(labels.trafficHint); expect(html).not.toContain("0 B");
+        expect(html).not.toContain(labels.trafficStale); expect(html).not.toContain(labels.statusRunning);
+      }
+    }
+  });
+  test("actual zero is 0 B and 0 admitted connections, not missing or a concurrency limit", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      const zero = traffic({ bytes_in: "0", bytes_out: "0", connections: "0" });
+      const html = markup(link({ forwards: [forward({ traffic: zero })] }), false, now, labels);
+      expect(fact(html, labels.trafficIn)).toBe("0 B"); expect(fact(html, labels.trafficOut)).toBe("0 B");
+      expect(fact(html, labels.trafficConnections)).toBe("0");
+      expect(fact(html, labels.trafficLastReceived)).toBe(zero.last_received_at);
+      expect(fact(html, labels.connections)).toBe("30");
+      expect(html).not.toContain(labels.trafficNotReceived); expect(html).not.toContain(labels.trafficStale);
+    }
+  });
+  test("directional bytes and connection counts above MAX_SAFE_INTEGER render exactly", () => {
+    const huge = traffic({ bytes_in: "18446744073709551617", bytes_out: "900719925474099312345678901234567890", connections: "9007199254740993" });
+    const html = markup(projectLinkDetail(link({ forwards: [forward({ traffic: huge })] }), 5), false);
+    expect(fact(html, copy.trafficIn)).toBe(`${huge.bytes_in} B`);
+    expect(fact(html, copy.trafficOut)).toBe(`${huge.bytes_out} B`);
+    expect(fact(html, copy.trafficConnections)).toBe(huge.connections);
+    expect(html).not.toMatch(/\d(?:\.\d+)?e\+\d/);
+    expect(html).toContain("sm:grid-cols-2"); expect(html).toContain("break-all");
+  });
+  test("fresh receipt does not turn missing runtime observations into running", () => {
+    const data = projectLinkDetail(link({ forwards: [forward({ traffic: traffic() })] }), 5);
+    expect(placementState(data, data.deployment!.placements[0], now)).toBe("unknown");
+    const html = markup(data);
+    expect(fact(html, copy.trafficLastReceived)).toBe(traffic().last_received_at);
+    expect(html).not.toContain(copy.statusRunning); expect(html).not.toContain(copy.trafficStale);
+    data.deployment!.placements[0].observation = { state: "unrecognized_runtime", ready: true, observed_generation: 4 };
+    expect(placementState(data, data.deployment!.placements[0], now)).toBe("unknown");
+    expect(markup(data)).not.toContain(copy.statusRunning);
+  });
+  test("at 60 seconds and later, old counters remain visible and are explicitly not current zero", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      const snapshot = traffic(); const data = link({ forwards: [forward({ traffic: snapshot })] });
+      expect(markup(data, false, now + 59_999, labels)).not.toContain(labels.trafficStale);
+      for (const age of [60_000, 60_001, 86_400_000]) {
+        const html = markup(data, false, now + age, labels);
+        expect(html).toContain(labels.trafficStale); expect(html).not.toContain(labels.statusRunning);
+        expect(fact(html, labels.trafficIn)).toBe("1024 B"); expect(fact(html, labels.trafficOut)).toBe("2048 B");
+        expect(fact(html, labels.trafficConnections)).toBe("7");
+        expect(fact(html, labels.trafficLastReceived)).toBe(snapshot.last_received_at);
+      }
+    }
+  });
+  test("old traffic neither overrides live readiness nor disappears on stopped or expired runtime", () => {
+    const data = link({ forwards: [forward({ traffic: traffic({ last_received_at: "2028-12-31T00:00:00Z" }) })] });
+    data.deployment!.placements[0].observation = { state: "ready", ready: true, observed_generation: 4 };
+    expect(markup(data)).toContain(copy.statusRunning); expect(markup(data)).toContain(copy.trafficStale);
+    for (const state of ["closed", "removed", "failed", "stale"]) {
+      data.deployment!.placements[0].observation = { state, ready: false, observed_generation: 4 };
+      const html = markup(data);
+      expect(html).not.toContain(copy.statusRunning); expect(fact(html, copy.trafficIn)).toBe("1024 B");
+      expect(html).toContain(copy.trafficStale);
+    }
+    const expired = markup(data, false, Date.parse("2031-01-01T00:00:00Z"));
+    expect(expired).toContain(copy.expired); expect(fact(expired, copy.trafficConnections)).toBe("7");
+  });
+  test("future receipt is flagged as clock difference, not fresh evidence of online traffic", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      const future = traffic({ last_received_at: "2029-01-01T00:00:01Z" });
+      const html = markup(projectLinkDetail(link({ forwards: [forward({ traffic: future })] }), 5), false, now, labels);
+      expect(html).toContain(renderToStaticMarkup(<>{labels.trafficFuture}</>)); expect(html).not.toContain(labels.trafficStale);
+      expect(html).not.toContain(labels.statusRunning); expect(fact(html, labels.trafficConnections)).toBe("7");
+      expect(fact(html, labels.trafficLastReceived)).toBe(future.last_received_at);
+    }
+  });
+  test("each rule owns its snapshot; unrelated raw runtime and secret fields never render", () => {
+    const data = projectLinkDetail({ ...link(), forwards: [
+      { ...forward(), traffic: null, runtime: { ready: true, process: "never-visible" } },
+      { ...forward({ id: 8, name: "Second rule" }), traffic: { ...traffic({ bytes_in: "0" }), key: "never-visible", config: "never-visible" } },
+    ] }, 5);
+    const html = markup(data, false);
+    const articles = html.match(/<article\b[^>]*>[\s\S]*?<\/article>/g)!;
+    expect(articles).toHaveLength(2);
+    expect(fact(articles[0], copy.trafficIn)).toBe(copy.trafficNotReceived);
+    expect(fact(articles[1], copy.trafficIn)).toBe("0 B"); expect(fact(articles[1], copy.trafficOut)).toBe("2048 B");
+    expect(html).not.toContain("never-visible"); expect(html).not.toContain(copy.statusRunning);
   });
 });
 describe("truthful deployment and references", () => {

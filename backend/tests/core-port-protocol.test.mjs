@@ -170,7 +170,10 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         outcomes.filter((outcome) => !outcome.ok).forEach(taken);
         const rows = await f.rows();
         assert.equal(rows.length, 1);
-        assert.equal(rows[0].protocol, protocols[0]);
+        const winner = outcomes.findIndex((outcome) => outcome.ok);
+        // Submission order does not determine the winner of real MySQL locks.
+        assert.equal(rows[0].protocol, protocols[winner]);
+        assert.equal(rows[0].tunnel_id, f.owners[winner].id);
       }
     });
 

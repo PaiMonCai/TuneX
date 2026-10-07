@@ -24,6 +24,18 @@ of its TCP streams and interrupts limiter waits. Carrier key/port changes remain
 explicit restarts. These modifications and new tests are indexed in
 `MODIFICATIONS.json`; original hashes in `UPSTREAM.json` remain unchanged.
 
+`-managed-traffic` and `-managed-traffic-producer` opt a managed entry group into
+private, atomic cumulative payload snapshots. TCP and UDP counters for one rule
+share a producer/rule/Shanghai-day identity. Existing FXP counter collection is
+reused with one-second sampling and a final normal-stop flush; exits do not
+produce a second report. The Agent supplies no panel or node credential to this
+channel and owns authenticated delivery and ledger acknowledgements. Snapshot
+size, sample count and counter values are bounded; persistence failures stop
+the process rather than silently discard accounting. Abrupt termination can
+still lose an unsampled/unpersisted window. This is not exact crash-safe
+financial metering. See the Link traffic implementation document for rollout,
+capacity and acceptance boundaries.
+
 The default remains upstream-compatible for reference regression tests. This does
 not enable FXP in the public TuneX support matrix; managed lifecycle, provenance,
 endpoint-version checks and network acceptance remain separate gates.

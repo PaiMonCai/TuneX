@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError, API_MOCK, setActiveWorkspace } from "@/lib/api/core";
 import { linksApi, linkErrorInfo } from "@/lib/links-api";
 import { projectLinkDetail, projectLinkList, LinksPayloadError } from "@/lib/links-types";
-import { binding, link } from "./links-fixtures";
+import { binding, forward, link, traffic } from "./links-fixtures";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; setActiveWorkspace(null); });
@@ -86,5 +86,63 @@ describe("real links API transport contract", () => {
     const projected = projectLinkDetail(raw, 5);
     expect(projected.status).toBe("degraded"); expect(projected.deployment!.status).toBe("policy_blocked");
     expect(projected.deployment!.placements[0].observation).toEqual({ state: "removed", ready: false, observed_generation: 4 });
+  });
+});
+
+describe("forward traffic closed projection", () => {
+  function project(value: unknown) {
+    return projectLinkDetail({ ...link(), forwards: [{ ...forward(), traffic: value }] }, 5).forwards[0].traffic;
+  }
+  test("optional or null traffic means not received, not a zero checkpoint", () => {
+    expect(projectLinkDetail(link(), 5).forwards[0].traffic).toBeNull();
+    expect(project(undefined)).toBeNull(); expect(project(null)).toBeNull();
+  });
+  test("real zero counters retain exact decimal strings", () => {
+    const zero = traffic({ bytes_in: "0", bytes_out: "0", connections: "0" });
+    expect(project(zero)).toEqual(zero);
+  });
+  test("historical sums above safe integers and uint64 remain exact", async () => {
+    const huge = traffic({ bytes_in: "18446744073709551617", bytes_out: "900719925474099312345678901234567890", connections: "9007199254740993" });
+    expect(project(huge)).toEqual(huge);
+    globalThis.fetch = (async () => Response.json({ data: link({ forwards: [forward({ traffic: huge })] }) })) as typeof fetch;
+    expect((await linksApi.detail(5, 3)).forwards[0].traffic).toEqual(huge);
+  });
+  test("traffic extra fields never enter UI state; unrelated runtime facts stay unknown", () => {
+    const safe = traffic();
+    const projected = projectLinkDetail({ ...link(), traffic: { key: "never-visible" },
+      forwards: [{ ...forward(), runtime: { state: "ready", ready: true, process: "never-visible" },
+        traffic: { ...safe, key: "never-visible", config: { key: "never-visible" }, raw_process: "never-visible", ready: true } }] }, 5);
+    expect(projected.forwards[0].traffic).toEqual(safe);
+    expect(projected.deployment!.placements[0].observation).toBeNull();
+    expect(JSON.stringify(projected)).not.toContain("never-visible");
+    expect(projected.forwards[0]).not.toHaveProperty("runtime");
+  });
+  test("present but incomplete or non-object traffic fails closed", () => {
+    for (const value of [false, 0, "unknown", [], {}, { bytes_in: "0", bytes_out: "0", connections: "0" }]) {
+      expect(() => project(value)).toThrow(LinksPayloadError);
+    }
+  });
+  test("every counter must be a canonical unsigned decimal string", () => {
+    const invalid = [undefined, null, 0, 1, 1n, true, {}, [], "", "00", "01", "-0", "-1", "+1", "1.0", "1e3", "0x10", "NaN", "Infinity", " 1", "1 ", "0\n", "1\r\n", "１"];
+    for (const field of ["bytes_in", "bytes_out", "connections"] as const) {
+      for (const value of invalid) expect(() => project({ ...traffic(), [field]: value })).toThrow(LinksPayloadError);
+    }
+  });
+  test("valid ISO instants including leap days, offsets and future receipts are preserved", () => {
+    for (const last_received_at of ["2028-02-29T23:59:59Z", "2029-01-01T08:00:00.123+08:00", "2029-01-01T00:00:00.1-05:30", "2099-01-01T00:00:00.000Z"]) {
+      expect(project(traffic({ last_received_at }))).toEqual(traffic({ last_received_at }));
+    }
+  });
+  test("invalid or normalized-overflow dates fail closed instead of looking like a receipt", () => {
+    for (const last_received_at of [undefined, null, 0, true, "", "invalid", "2029-01-01", "2029-01-01T00:00:00", "Jan 1 2029 UTC",
+      "2029-02-29T00:00:00Z", "2029-02-30T00:00:00Z", "2029-04-31T00:00:00+08:00", "2029-13-01T00:00:00Z", "2029-01-00T00:00:00Z",
+      "2029-01-01T24:00:00Z", "2029-01-01T00:60:00Z", "2029-01-01T00:00:60Z", "2029-01-01T00:00:00+24:00", "2029-01-01T00:00:00+08:60",
+      "2029-01-01T00:00:00Z\n", "2029-01-01T00:00:00Z "]) {
+      expect(() => project({ ...traffic(), last_received_at })).toThrow(LinksPayloadError);
+    }
+  });
+  test("malformed traffic in an HTTP success is still a rejected detail response", async () => {
+    globalThis.fetch = (async () => Response.json({ data: { ...link(), forwards: [{ ...forward(), traffic: { ...traffic(), connections: "-1" } }] } })) as typeof fetch;
+    await expect(linksApi.detail(5, 3)).rejects.toThrow(LinksPayloadError);
   });
 });

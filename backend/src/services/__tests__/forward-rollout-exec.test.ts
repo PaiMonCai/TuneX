@@ -22,6 +22,7 @@ import { describe, expect, it } from "bun:test";
 
 import type { ForwardImpact } from "../forward-revision.ts";
 import type { RolloutPlan, RolloutSnapshot } from "../forward-rollout.ts";
+import { acquirePort, type PortPoolDb } from "../portPool.ts";
 // `isRevisionBehind` 是 reconciler 的落后判定（applied < config）：rollout 落账
 // 是否让「编辑后」安静下来，必须用真实判定函数而不是在测试里重抄一遍条件。
 import { isRevisionBehind } from "../reconciler.ts";
@@ -68,7 +69,16 @@ const fakeDb = () => {
   const released: Array<{ leaseId?: number; tunnelId?: number }> = [];
   let seq = 1;
 
-  const db: RolloutDb = {
+  const db: RolloutDb & Pick<PortPoolDb, "$transaction"> = {
+    async $transaction(run, options) {
+      expect(options?.isolationLevel).toBe("Serializable");
+      return run({ ...db, $queryRawUnsafe: async (query, nodeId, port) => {
+        expect(query).toContain("FOR UPDATE");
+        expect(typeof nodeId).toBe("number");
+        expect(typeof port).toBe("number");
+        return [];
+      } });
+    },
     // portPool 的 acquirePort/releaseLease 需要 node + nodePortLease 表。
     node: {
       findUnique: async (args: unknown) => {
@@ -102,8 +112,9 @@ const fakeDb = () => {
     nodePortLease: {
       create: async (args: unknown) => {
         const a = args as { data: Record<string, unknown> };
-        leases.push({ id: leases.length + 1, status: "active", ...a.data });
-        return { id: leases.length };
+        const row = { id: leases.length + 1, status: "active", ...a.data };
+        leases.push(row);
+        return row;
       },
       findUnique: async (args: unknown) => {
         const a = args as { where: { id: number } };
@@ -310,7 +321,7 @@ const fakeDb = () => {
     addSnapshot: (s: Record<string, unknown>) => snapshots.push({ id: seq++, ...s }),
     addLease: (l: Record<string, unknown>) => {
       const id = leases.length + 1;
-      leases.push({ id, status: "active", ...l });
+      leases.push({ id, status: "active", protocol: "tcp", bind_scope: "*", link_id: null, ...l });
       return id;
     },
     addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, user_id: 1, workspace_id: 1, tunnel_type: "tcp", ...t }),
@@ -320,6 +331,22 @@ const fakeDb = () => {
 /* ------------------------------------------------------------------ */
 /* 假 orchestrator                                                      */
 /* ------------------------------------------------------------------ */
+
+it("rollout lease fixtures preserve full bindings across TCP retry and UDP allocation", async () => {
+  const f = fakeDb();
+  const deps = { db: f.db, redis: { set: async () => null, del: async () => 0, scan: async () => ["0", []] as [string, string[]] },
+    agentUsedPorts: async () => [] };
+  const input = { nodeId: 11, leaseType: "ingress" as const, preferredPort: 10001, tunnelId: 1, protocol: "tcp" };
+  const first = await acquirePort(input, deps);
+  expect(first.ok).toBe(true);
+  if (!first.ok) throw new Error(first.code);
+  expect(first.result).toMatchObject({ port: 10001, tunnelId: 1, protocol: "tcp", bindScope: "*" });
+  expect(f.leases[0]!.node_id).toBe(11);
+  const retry = await acquirePort(input, deps);
+  expect(retry).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, reused: true } });
+  expect(await acquirePort({ ...input, tunnelId: 2, protocol: "udp" }, deps)).toMatchObject({ ok: true });
+  expect(f.leases).toHaveLength(2);
+});
 
 interface FakeOrchestratorOpts {
   failOn?: {

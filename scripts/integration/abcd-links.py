@@ -10,6 +10,8 @@ import signal
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -122,6 +124,79 @@ def udp_payload(client, port, payload):
     return client.recvfrom(2048)[0] == payload
 
 
+def traffic_rows(link_id, forward_ids):
+    """Read actual committed collector samples, never construct usage fixtures."""
+    ids = ",".join(str(int(fid)) for fid in forward_ids)
+    fields = ["producer_id", "link_id", "workspace_id", "node_id", "forward_id",
+              "generation", "config_digest", "date", "bytes_in", "bytes_out", "connections"]
+    values = {"date": "DATE_FORMAT(date,'%Y-%m-%d')"}
+    values.update({key: f"CAST({key} AS CHAR)" for key in ("bytes_in", "bytes_out", "connections")})
+    projection = ",".join(f"'{key}',{values.get(key, key)}" for key in fields)
+    rows = H.mysql(f"SELECT JSON_OBJECT({projection}) FROM link_traffic_checkpoint "
+                   f"WHERE workspace_id={int(H.WS)} AND link_id={int(link_id)} "
+                   f"AND forward_id IN ({ids}) ORDER BY forward_id,producer_id,date;")
+    return [json.loads(row) for row in rows.splitlines() if row.strip()]
+
+
+def traffic_totals(rows):
+    return tuple(sum(int(row[key]) for row in rows) for key in ("bytes_in", "bytes_out"))
+
+
+def wait_traffic(link_id, forward_ids, predicate=None, keepalive=None):
+    rows = []
+    def committed():
+        nonlocal rows
+        if keepalive is not None and not keepalive():
+            return False
+        rows = traffic_rows(link_id, forward_ids)
+        return (set(forward_ids) <= {row["forward_id"] for row in rows}
+                and all(row["node_id"] == H.ING for row in rows)
+                and all(any(row["forward_id"] == fid and int(row["bytes_in"]) > 0
+                            and int(row["bytes_out"]) > 0 for row in rows) for fid in forward_ids)
+                and (predicate is None or predicate(rows)))
+    if not H.wait_until(committed, timeout=60, interval=2):
+        raise RuntimeError(f"traffic checkpoint deadline: link={link_id} forwards={forward_ids}")
+    H.check(all(row["workspace_id"] == H.WS and row["link_id"] == link_id
+                and row["node_id"] == H.ING for row in rows),
+            "ABCD traffic checkpoints are scoped to this workspace/Link and ingress only")
+    return rows
+
+
+def replay_traffic(link_id, forward_ids, samples):
+    """Replay a real checkpoint snapshot twice, byte-for-byte, via node auth.
+
+    Freeze the only producer so unrelated late flushes cannot mask double billing.
+    Pausing neither creates a runtime nor replaces any real DB/service code.
+    """
+    credential = json.loads((HERE / "state.json").read_text(encoding="utf-8"))["nodes"]["ingress"]["credential"]
+    body = json.dumps({"samples": samples}, separators=(",", ":")).encode()
+    H.docker(["pause", H.INGRESS_CONTAINER], timeout=15)
+    try:
+        before = traffic_rows(link_id, forward_ids)
+        ids = ",".join(str(int(fid)) for fid in forward_ids)
+        ledger_sql = (f"SELECT tunnel_id,date,traffic,traffic_cost FROM tunnel_traffic "
+                      f"WHERE workspace_id={int(H.WS)} AND tunnel_id IN ({ids}) ORDER BY tunnel_id,date;")
+        ledger = H.mysql(ledger_sql)
+        if not ledger.strip():
+            raise RuntimeError("committed payload is missing from the existing daily billing ledger")
+        H.check(bool(ledger.strip()), "ABCD committed payload also reaches the existing daily billing ledger")
+        for _ in range(2):
+            req = urllib.request.Request(H.API + "/api/internal/node/link-traffic", body, method="POST",
+                headers={"authorization": f"Bearer {credential}", "content-type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    accepted = json.loads(response.read())["data"]["accepted"]
+            except urllib.error.HTTPError as error:
+                # Never include the credential or raw service error in evidence.
+                raise RuntimeError(f"traffic replay HTTP status={error.code}") from None
+            if accepted != samples:
+                raise RuntimeError("traffic replay did not acknowledge the exact submitted snapshot")
+        H.check(traffic_rows(link_id, forward_ids) == before and H.mysql(ledger_sql) == ledger,
+                "ABCD identical processed snapshot replay does not double-count checkpoints or daily billing")
+    finally:
+        H.docker(["unpause", H.INGRESS_CONTAINER], timeout=15)
+
+
 def main():
     signal.signal(signal.SIGALRM, H.alarm)
     signal.setitimer(signal.ITIMER_REAL, 600)
@@ -132,6 +207,24 @@ def main():
     targets = []
     try:
         H.setup()
+        state = json.loads((HERE / "state.json").read_text(encoding="utf-8"))
+        node_ids = [int(node["id"]) for node in state["nodes"].values()]
+        if len(node_ids) != 4:
+            raise RuntimeError("ABCD requires four provisioned Agent identities")
+        def current_link_facts():
+            # Read the real heartbeat version, never patch legacy Node.version.
+            facts = H.db("const {checkAgentVersion}=await import('./src/integrations/forwardx/agent-version.ts');"
+                "const facts=await db.nodeStateReport.findMany({where:{node_id:{in:%s},"
+                "reported_at:{gt:new Date(Date.now()-60000)}},select:{node_id:true,version:true,capabilities:true}});"
+                "return facts.map(f=>({id:f.node_id,version_ok:checkAgentVersion(f.version,null)===null,"
+                "fxp:Array.isArray(f.capabilities)&&['forward.link.fxp.v1','apply_link','remove_link']"
+                ".every(c=>f.capabilities.includes(c))}));" % json.dumps(node_ids))
+            return (isinstance(facts, list) and {f["id"] for f in facts} == set(node_ids)
+                    and all(f["version_ok"] and f["fxp"] for f in facts))
+        fxp_ready = H.wait_until(current_link_facts, timeout=60, interval=2)
+        H.check(fxp_ready, "ABCD setup all four Agents have fresh reported versions and FXP/apply/remove advertisements")
+        if not fxp_ready:
+            raise RuntimeError("fresh FXP advertisement prerequisite failed; Link creation not attempted")
         H.mysql("UPDATE capability_policy SET tunnel_types=JSON_ARRAY('tcp','tls','ws','udp'),revision=revision+1;")
         target = C.runner_egress_ip()
         if not target:
@@ -160,7 +253,8 @@ def main():
         held_b = tcp(21081)
         udp_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sockets.extend((held_a, held_b, udp_b))
-        H.check(tcp_payload(held_a, b"encrypted-A") and tcp_payload(held_b, b"encrypted-B"),
+        stream_ok = tcp_payload(held_a, b"encrypted-A") and tcp_payload(held_b, b"encrypted-B")
+        H.check(stream_ok,
                 "ABCD shared exit forwards actual encrypted TCP payloads")
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
             client.settimeout(0.5)
@@ -170,8 +264,33 @@ def main():
             except socket.timeout:
                 blocked = True
         H.check(blocked, "ABCD TCP and UDP share one connection ceiling for A")
-        H.check(udp_payload(udp_b, 21081, b"encrypted-UDP-B"), "ABCD TCP and UDP use the same business port")
+        datagram_ok = udp_payload(udp_b, 21081, b"encrypted-UDP-B")
+        H.check(datagram_ok, "ABCD TCP and UDP use the same business port")
+        if not (stream_ok and datagram_ok):
+            raise RuntimeError("real TCP/UDP payload prerequisite failed; traffic assertions not run")
         original_udp_source = targets[0].udp.sources.get(b"encrypted-UDP-B")
+        def keep_b_alive():
+            return (tcp_payload(held_b, b"B-traffic-keepalive")
+                    and udp_payload(udp_b, 21081, b"B-traffic-keepalive"))
+        initial_traffic = wait_traffic(link_id, [a, b], keepalive=keep_b_alive)
+        H.check(all(int(row["connections"]) > 0 for row in initial_traffic),
+                "ABCD real TCP/UDP payload commits both byte directions and accepted connections")
+        replay_traffic(link_id, [a, b], initial_traffic)
+        old_a_samples = [row for row in initial_traffic if row["forward_id"] == a]
+        initial_b = [row for row in initial_traffic if row["forward_id"] == b]
+        before_bytes = traffic_totals(initial_b)
+        days = {row["date"] for row in initial_b}
+        later_payload = (tcp_payload(held_b, b"B-more-traffic-" * 256)
+                         and udp_payload(udp_b, 21081, b"B-more-UDP" * 32))
+        H.check(later_payload, "ABCD later real same-day traffic is delivered")
+        if not later_payload:
+            raise RuntimeError("later payload prerequisite failed")
+        later_traffic = wait_traffic(link_id, [b], lambda rows: all(
+            total > prior for total, prior in zip(traffic_totals([r for r in rows if r["date"] in days]), before_bytes)),
+            keepalive=keep_b_alive)
+        H.check(all(total > prior for total, prior in zip(
+            traffic_totals([r for r in later_traffic if r["date"] in days]), before_bytes)),
+            "ABCD later payload adds to both same-day cumulative directions, not a once-only sample")
         detail = request("GET", base)
         prior_generation = detail["generation"]
         conflict_status, _, _ = H.req("POST", base + "/forwards", binding("conflicting", 21081, 0))
@@ -191,6 +310,15 @@ def main():
                 "ABCD unchanged B keeps its actual UDP target socket through A edit")
         request("POST", base + f"/forwards/{a}/actions", {"action": "delete"})
         rules.remove(a)
+        retained_a = traffic_rows(link_id, [a])
+        retained = all(any(row["producer_id"] == old["producer_id"] and row["date"] == old["date"]
+                        and all(int(row[key]) >= int(old[key]) for key in ("bytes_in", "bytes_out", "connections"))
+                        for row in retained_a) for old in old_a_samples)
+        H.check(retained,
+                "ABCD deleting A retains its already-processed producer checkpoints")
+        if not retained:
+            raise RuntimeError("deleted Forward lost processed checkpoints; no replay can mask this failure")
+        replay_traffic(link_id, [a], old_a_samples)
         H.check(tcp_payload(held_b, b"B-after-A-delete") and udp_payload(udp_b, 21081, b"B-mapping-after-A-delete"),
                 "ABCD deleting A preserves B and the shared carrier")
         H.check(targets[0].udp.sources.get(b"B-mapping-after-A-delete") == original_udp_source,
@@ -201,6 +329,10 @@ def main():
         rules.append(c)
         with tcp(21080) as replacement:
             H.check(tcp_payload(replacement, b"C-exact-reuse"), "ABCD deleted A port carries a new rule payload")
+        before_restart = wait_traffic(link_id, [b, c])
+        old_producers = {row["producer_id"] for row in before_restart if row["forward_id"] == b}
+        old_b = [row for row in before_restart if row["forward_id"] == b]
+        prior_bytes = traffic_totals(old_b)
         for container in (H.INGRESS_CONTAINER, H.EGRESS_CONTAINER):
             H.docker(["restart", container], timeout=120)
         def restored():
@@ -209,7 +341,16 @@ def main():
                     return tcp_payload(client, b"B-restored")
             except OSError:
                 return False
-        H.check(bool(H.wait_until(restored, timeout=90, interval=2)), "ABCD authoritative/private restoration recovers encrypted payload")
+        restored_payload = bool(H.wait_until(restored, timeout=90, interval=2))
+        H.check(restored_payload, "ABCD authoritative/private restoration recovers encrypted payload")
+        if not restored_payload:
+            raise RuntimeError("restart payload prerequisite failed")
+        after_restart = wait_traffic(link_id, [b], lambda rows:
+            any(row["producer_id"] not in old_producers and int(row["bytes_in"]) > 0
+                and int(row["bytes_out"]) > 0 for row in rows)
+            and all(total > prior for total, prior in zip(traffic_totals(rows), prior_bytes)))
+        H.check(old_producers <= {row["producer_id"] for row in after_restart},
+                "ABCD restart creates a new producer epoch and increases totals without resetting old usage")
         H.check(bool(H.wait_until(lambda: all(p.get("observation", {}).get("state") in ("ready", "passive")
             for p in request("GET", base)["deployment"]["placements"]), timeout=60, interval=2)),
             "ABCD fresh generation/digest/lease runtime facts, not historical ACKs, confirm readiness")

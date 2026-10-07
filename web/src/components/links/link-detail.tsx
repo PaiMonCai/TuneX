@@ -95,6 +95,7 @@ export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, on
               <Fact label={copy.connections} value={String(f.max_connections ?? 0)} />
               <Fact label={copy.perIp} value={String(f.max_connections_per_ip ?? 0)} />
             </dl>
+            <ForwardTraffic traffic={f.traffic} copy={copy} now={now} />
             {mutable && <div className="flex flex-wrap gap-2">
               {canUpdateForward(f) && <Button variant="outline" size="sm" disabled={busy} onClick={() => onEditForward(f)}>{copy.editForward}</Button>}
               {canUpdateForward(f) && ["active", "inactive"].includes(f.desired_status) && <Button variant="outline" size="sm" disabled={busy} onClick={() => onAction(f, f.desired_status === "active" ? "suspend" : "resume")}>{f.desired_status === "active" ? copy.suspend : copy.resume}</Button>}
@@ -106,6 +107,23 @@ export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, on
       </CardContent>
     </Card>
   </div>;
+}
+function ForwardTraffic({ traffic, copy, now }: { traffic: LinkForward["traffic"]; copy: LinksCopy; now: number }) {
+  const received = Date.parse(traffic?.last_received_at ?? "");
+  const note = Number.isFinite(now) && Number.isFinite(received)
+    ? received > now ? copy.trafficFuture : now - received >= 60_000 ? copy.trafficStale : null : null;
+  return <section aria-label={copy.trafficTotals} className="space-y-2 border-t border-[var(--border)] pt-3 text-sm">
+    <h5 className="font-medium">{copy.trafficTotals}</h5>
+    <p className="text-[var(--muted-foreground)]">{copy.trafficHint}</p>
+    <dl className="grid gap-3 sm:grid-cols-2">
+      {/* Decimal display preserves exact aggregated bytes without a lossy Number conversion. */}
+      <Fact label={copy.trafficIn} value={traffic ? `${traffic.bytes_in} B` : copy.trafficNotReceived} />
+      <Fact label={copy.trafficOut} value={traffic ? `${traffic.bytes_out} B` : copy.trafficNotReceived} />
+      <Fact label={copy.trafficConnections} value={traffic ? traffic.connections : copy.trafficNotReceived} />
+      <Fact label={copy.trafficLastReceived} value={traffic ? traffic.last_received_at : copy.trafficNotReceived} />
+    </dl>
+    {note && <p className="text-[var(--muted-foreground)]">{note}</p>}
+  </section>;
 }
 function Fact({ label, value }: { label: string; value: string }) {
   return <div className="min-w-0"><dt className="text-[var(--muted-foreground)]">{label}</dt><dd className="mt-1 break-all">{value}</dd></div>;

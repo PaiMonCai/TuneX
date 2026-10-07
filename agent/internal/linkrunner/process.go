@@ -28,6 +28,7 @@ var managedLog = regexp.MustCompile(`^(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-
 type child struct {
 	cmd                                              *exec.Cmd
 	path                                             string
+	trafficProducer                                  string
 	done                                             chan struct{}
 	ready                                            chan struct{}
 	leaseChanged                                     chan struct{}
@@ -136,7 +137,7 @@ func (p *child) logLocked(line string) {
 	p.logs = append(p.logs, line)
 }
 
-func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, expected []listener) (*child, error) {
+func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, expected []listener, options ...childTraffic) (*child, error) {
 	if !time.Now().Before(deadline) {
 		return nil, ErrLeaseExpired
 	}
@@ -170,14 +171,23 @@ func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, e
 		p.expected[lane]++
 		p.remaining++
 	}
-	p.cmd = exec.Command(binaryPath, "-config", filepath.Clean(path))
+	var traffic childTraffic
+	if len(options) > 0 {
+		traffic = options[0]
+	}
+	args := []string{"-config", filepath.Clean(path)}
+	if traffic.producer != "" {
+		args = append(args, "-managed-traffic", traffic.path, "-managed-traffic-producer", traffic.producer)
+		p.trafficProducer = traffic.producer
+	}
+	p.cmd = exec.Command(binaryPath, args...)
 	p.cmd.Stdout = p
 	p.cmd.Stderr = p
 	p.cmd.WaitDelay = stopTimeout
 	// FXP needs no Agent auth secret. Cache encryption is wholly independent.
 	for _, env := range os.Environ() {
 		name, _, _ := strings.Cut(env, "=")
-		if !strings.EqualFold(name, "AUTH_SECRET") {
+		if !strings.EqualFold(name, "AUTH_SECRET") && !(traffic.enabled && strings.EqualFold(name, "NODE_CREDENTIAL")) {
 			p.cmd.Env = append(p.cmd.Env, env)
 		}
 	}

@@ -510,6 +510,8 @@ func main() {
 	configureFXPLogging()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	configPath := flag.String("config", "", "config file")
+	trafficPath := flag.String("managed-traffic", "", "private managed traffic snapshot")
+	trafficProducer := flag.String("managed-traffic-producer", "", "managed process traffic epoch")
 	flag.Parse()
 	if *configPath == "" {
 		log.Fatal("missing -config")
@@ -520,6 +522,18 @@ func main() {
 	}
 	if err := validateConfig(cfg); err != nil {
 		log.Fatalf("invalid config: %v", err)
+	}
+	var traffic *managedTraffic
+	if *trafficPath != "" || *trafficProducer != "" {
+		if cfg.Role != "entry-group" || !managedEnabled(*configPath) {
+			log.Fatal("managed traffic requires managed ingress")
+		}
+		traffic, err = newManagedTraffic(*trafficPath, *trafficProducer)
+		if err != nil {
+			log.Fatal("managed traffic initialization failed")
+		}
+		managedTrafficSink.Store(traffic)
+		traffic.run()
 	}
 	log.Printf(
 		"forwardx-fxp runtime version=%s role=%s tunnel=%d rule=%d listen=:%d udpListen=:%d protocol=%s exit=%s:%d udpExit=%d relayNext=%s:%d udpRelayNext=%d target=%s:%d proxyReceive=%v proxySend=%v proxyExitReceive=%v proxyExitSend=%v limits=maxConnections:%d,maxIPs:%d,limitIn:%d,limitOut:%d",
@@ -563,6 +577,9 @@ func main() {
 		default:
 			err = fmt.Errorf("unknown role %q", cfg.Role)
 		}
+	}
+	if traffic != nil && traffic.close() != nil {
+		log.Fatal("managed traffic final persistence failed")
 	}
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Fatal(err)

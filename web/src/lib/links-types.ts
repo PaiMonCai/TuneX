@@ -22,6 +22,10 @@ export interface LinkObservation { state: string; ready: boolean | null; observe
 export interface LinkDeployment {
   generation: number; version?: number | null; status: string; lease_expires_at: string; placements: LinkPlacement[];
 }
+/** Checkpoint sums over all historical producers/days, not rate or live concurrency. */
+export interface LinkTraffic {
+  bytes_in: string; bytes_out: string; connections: string; last_received_at: string;
+}
 export interface LinkForward {
   user_id?: number | null;
   id: number; name: string; forward_protocol: LinkProtocol; listen_ip: string | null; listen_port: number;
@@ -29,6 +33,7 @@ export interface LinkForward {
   config_revision: number; applied_revision: number | null;
   bytes_per_second_in: number | null; bytes_per_second_out: number | null;
   max_connections: number | null; max_connections_per_ip: number | null;
+  traffic?: LinkTraffic | null;
 }
 export interface LinkDetail extends LinkResource {
   config: LinkConfig | null; deployment: LinkDeployment | null; forwards: LinkForward[];
@@ -52,6 +57,29 @@ function text(value: unknown): string {
 }
 const nullableNumber = (value: unknown) => value == null ? null : number(value);
 const nullableText = (value: unknown) => value == null ? null : text(value);
+function counter(value: unknown): string {
+  const result = /^(?:0|[1-9][0-9]*)$/.exec(text(value));
+  // Preserve the complete canonical decimal rather than a normalized number.
+  if (!result || result[0] !== value) throw new LinksPayloadError();
+  return result[0];
+}
+function trafficReceivedAt(value: unknown): string {
+  const input = text(value);
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(input);
+  if (!match || match[0] !== input) throw new LinksPayloadError();
+  // Date.parse alone normalizes impossible dates (e.g. February 30 or 24:00).
+  // Validate the local calendar/time before applying a timezone offset.
+  const local = Date.parse(`${match[1]}Z`);
+  if (!Number.isFinite(local) || new Date(local).toISOString().slice(0, 19) !== match[1]
+    || !Number.isFinite(Date.parse(input))) throw new LinksPayloadError();
+  return input;
+}
+function projectTraffic(value: unknown): LinkTraffic | null {
+  if (value == null) return null;
+  const raw = object(value);
+  return { bytes_in: counter(raw.bytes_in), bytes_out: counter(raw.bytes_out),
+    connections: counter(raw.connections), last_received_at: trafficReceivedAt(raw.last_received_at) };
+}
 function projectObservation(value: unknown): LinkObservation | null {
   if (value == null) return null;
   const raw = object(value);
@@ -89,7 +117,8 @@ export function projectLinkDetail(value: unknown, workspaceId: number): LinkDeta
       desired_status: text(f.desired_status), apply_status: text(f.apply_status),
       config_revision: number(f.config_revision), applied_revision: nullableNumber(f.applied_revision),
       bytes_per_second_in: nullableNumber(f.bytes_per_second_in), bytes_per_second_out: nullableNumber(f.bytes_per_second_out),
-      max_connections: nullableNumber(f.max_connections), max_connections_per_ip: nullableNumber(f.max_connections_per_ip) };
+      max_connections: nullableNumber(f.max_connections), max_connections_per_ip: nullableNumber(f.max_connections_per_ip),
+      traffic: projectTraffic(f.traffic) };
   });
   return { ...resource, ref_count: resource.ref_count ?? forwards.length, forwards,
     config: config ? { ingress_node_id: number(config.ingress_node_id, 1),

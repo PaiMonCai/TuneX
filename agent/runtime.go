@@ -14,6 +14,7 @@ import (
 	"github.com/tunex/agent/internal/control"
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/linkrunner"
+	"github.com/tunex/agent/internal/linktraffic"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/ownership"
@@ -113,8 +114,16 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		logx.Error("managed FXP runtime disabled", "err", err.Error())
 		ledger.Record(err.Error())
 	} else {
-		rt.links = links
-		rt.linkFacts = facts
+		if links != nil {
+			if err := links.EnableTraffic(); err != nil {
+				_ = links.Close()
+				logx.Error("managed FXP runtime disabled: private traffic spool unavailable")
+				ledger.Record("managed FXP private traffic spool unavailable")
+			} else {
+				rt.links = links
+				rt.linkFacts = facts
+			}
+		}
 	}
 	// The native TunnelManager also enforces the shared runtime policy gate;
 	// its capability is independent of the optional FXP executable.
@@ -302,6 +311,26 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 			Migration:  panels,
 			NodeID:     cfg.NodeID,
 		})
+	}
+	if panelRouter != nil && rt.links != nil {
+		// Reporting shares the active panel route, but a private snapshot and
+		// ledger ACK are separate from desired/observed readiness. Failed POSTs
+		// leave cumulative samples durable for retry and do not reset counters.
+		client := linktraffic.Client{PanelURL: panelRouter.ActiveURL, Credential: cfg.NodeCredential}
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				if err := linktraffic.Flush(ctx, client, rt.links); err != nil && ctx.Err() == nil {
+					logx.Debug("managed FXP traffic report deferred; durable samples retained")
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 	}
 
 	// 3. Outbound control loop. The Agent polls the Panel with its per-node

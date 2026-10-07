@@ -10,6 +10,8 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
     process.env.TUNEX_LINK_SEAL_KEY = "53".repeat(32);
     mock.module(${modulePath("../federation/forward-hop.ts")},()=>({FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS:["tls"]}));
     const tables = {};
+    let usageRows = [];
+    let reportedVersion = "0.0.0-dev", legacyVersion = "unknown", fxpAdvertised = true;
     const matches = (r,w={}) => Object.entries(w).every(([k,v]) => {
       if (v && typeof v === "object" && "in" in v) return v.in.includes(r[k]);
       if (v && typeof v === "object" && "not" in v) return r[k] !== v.not;
@@ -42,8 +44,10 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
       linkDeployment:table("deployment"),linkPlacement:table("placement"),tunnel:table("tunnel"),
       nodePortLease:table("lease"),forwardRevision:table("revision"),
       nodeStateReport:{findMany:async()=>[]},
-      node:{ findMany:async({where})=>[11,12].filter(id=>where.id.in.includes(id)&&where.node_group.workspace_id===3).map(id=>({id,
-        lifecycle:"active",role:id===11?"ingress":"egress",node_group_id:id,connect_ip:"127.0.0.1",version:"0.0.0-dev",node_group:{workspace_id:3}})) },
+      linkTrafficCheckpoint:{groupBy:async({where})=>{assert.equal(where.workspace_id,3);assert.equal(where.link_id,1);return usageRows.filter(row=>where.forward_id.in.includes(row.forward_id));}},
+      node:{ findMany:async({where,include})=> {assert.equal(include.state_report.select.version,true);return [11,12].filter(id=>where.id.in.includes(id)&&where.node_group.workspace_id===3).map(id=>({id,
+        lifecycle:"active",role:id===11?"ingress":"egress",node_group_id:id,connect_ip:"127.0.0.1",version:legacyVersion,
+        state_report:reportedVersion===null?null:{version:reportedVersion},node_group:{workspace_id:3}}));} },
       $queryRaw:async()=>[], $transaction:async(fn)=>fn(db),
     };
     const policy={deny_scope:null,limits:{max_tunnels:100,traffic_limit:null,traffic_period:"month",bandwidth_limit:null,client_limit:null,ip_limit:null},
@@ -52,7 +56,7 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
     let trafficUsed=0;
     mock.module(${modulePath("../policy-service.ts")},()=>({getEffectivePolicy:async()=>policy, countWorkspaceTunnels:async()=>tables.tunnel.length,
       sumWorkspaceTraffic:async()=>trafficUsed,withWorkspaceQuotaLock:async(_id,fn)=>fn(db,policy)}));
-    mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async()=>({capabilities:["forward.link.fxp.v1"]})}));
+    mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async()=>({capabilities:fxpAdvertised?["forward.link.fxp.v1"]:[]})}));
     let blocked=false,failIngress=false,lateAck=false;
     const sent=[], acquired=[];
     mock.module(${modulePath("../portPool.ts")},()=>({
@@ -65,11 +69,30 @@ test("Link lifecycle reserves before restore, fences late ACKs, preserves other 
       if(lateAck&&config.role==="ingress")tables.tunnel[0].config_revision++;
     }}));
     const service=await import(${modulePath("../link-resource.ts")});
-    const link=await service.createLink(3,8,{name:"shared",config:{ingress_node_id:11,egress_node_id:12,carrier_port:25000}});
+    const initial={name:"shared",config:{ingress_node_id:11,egress_node_id:12,carrier_port:25000}};
+    legacyVersion="0.0.0-dev";
+    for (const current of [null,"unknown",""]) {
+      reportedVersion=current;
+      await assert.rejects(()=>service.createLink(3,8,initial),e=>e.code==="agent_version_unknown"&&e.status===409);
+      assert.equal(tables.link.length,0);
+    }
+    reportedVersion="not-semver";
+    await assert.rejects(()=>service.createLink(3,8,initial),e=>e.code==="agent_version_invalid"&&e.status===409);
+    reportedVersion="0.0.0-dev";fxpAdvertised=false;
+    await assert.rejects(()=>service.createLink(3,8,initial),e=>e.code==="agent_fxp_capability_missing"&&e.status===409);
+    assert.equal(tables.link.length,0);
+    legacyVersion="unknown";fxpAdvertised=true;
+    const link=await service.createLink(3,8,initial);
     await assert.rejects(()=>service.createLink(4,8,{name:"cross",config:{ingress_node_id:11,egress_node_id:12,carrier_port:25000}}),/link_node_not_found/);
     const rule=(name,listen_port)=>({name,protocol:"both",listen_port,listen_host:"127.0.0.1",target_host:"127.0.0.1",target_port:27000});
     const a=await service.createLinkForward(3,link.id,8,rule("A",26000));
     const b=await service.createLinkForward(3,link.id,8,rule("B",26001));
+    assert.equal((await service.getLink(3,link.id)).forwards[0].traffic,null);
+    usageRows=[{forward_id:a.id,_sum:{bytes_in:9007199254740993n,bytes_out:43n,connections:2n},_max:{updated_at:new Date("2026-10-07T12:00:00Z")}}];
+    const accounted=await service.getLink(3,link.id);
+    assert.deepEqual(accounted.forwards[0].traffic,{bytes_in:"9007199254740993",bytes_out:"43",connections:"2",last_received_at:"2026-10-07T12:00:00.000Z"});
+    assert.equal(accounted.forwards[1].traffic,null);
+    usageRows=[];
     const healthyGeneration=tables.link[0].generation;
     await assert.rejects(()=>service.createLinkForward(3,link.id,8,rule("conflict",26001)),/binding_listener_conflict/);
     assert.equal(tables.tunnel.length,2);assert.equal(tables.link[0].generation,healthyGeneration);

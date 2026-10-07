@@ -1,12 +1,31 @@
 import { beforeEach, expect, test } from "bun:test";
-import { policyFixture as state } from "./forward-policy-offline-preload.ts";
-import { OutboundAgentTransport, buildDesiredNodeSnapshot, desiredTunnelConfigFor, type CommandBusStore, type DesiredRowProjection } from "../agent-command-bus.ts";
-import { Orchestrator, type AgentTunnelConfig, type AgentTransport } from "../orchestrator.ts";
-import { loadForwardPolicyForDispatch } from "../relay-wiring.ts";
-import { FORWARD_POLICY_CAPABILITY } from "../forward-policy.ts";
-import { createCommand } from "../control-protocol/index.ts";
-import { getEffectivePolicy } from "../policy-service.ts";
+import { fileURLToPath } from "node:url";
 import type { AgentV2CapabilityFacts } from "../capability-manifest.ts";
+import type { CommandBusStore, DesiredRowProjection } from "../agent-command-bus.ts";
+import type { AgentTunnelConfig, AgentTransport } from "../orchestrator.ts";
+
+// Bun module mocks are process-wide. Run the complete original assertions in a
+// fresh process, with fixture mocks loaded before any production dependency.
+if (process.env.TUNEX_FORWARD_POLICY_ISOLATED !== "1") {
+  test("isolated forward-policy-dispatch regression suite", () => {
+    const child = Bun.spawnSync([process.execPath, "test", "--preload",
+      fileURLToPath(new URL("./forward-policy-offline-preload.ts", import.meta.url)),
+      fileURLToPath(import.meta.url), "--timeout", "10000"], {
+      env: { ...process.env, TUNEX_FORWARD_POLICY_ISOLATED: "1" },
+      stdout: "pipe", stderr: "pipe", timeout: 20000,
+    });
+    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
+    expect(child.exitCode, output).toBe(0);
+    expect(output).toMatch(/\b[1-9]\d* pass\b/);
+  });
+} else {
+const { policyFixture: state } = await import("./forward-policy-offline-preload.ts");
+const { OutboundAgentTransport, buildDesiredNodeSnapshot, desiredTunnelConfigFor } = await import("../agent-command-bus.ts");
+const { Orchestrator } = await import("../orchestrator.ts");
+const { loadForwardPolicyForDispatch } = await import("../relay-wiring.ts");
+const { FORWARD_POLICY_CAPABILITY } = await import("../forward-policy.ts");
+const { createCommand } = await import("../control-protocol/index.ts");
+const { getEffectivePolicy } = await import("../policy-service.ts");
 
 const node = { id: 11, node_id: "fixture", connect_ip: "127.0.0.1", role: "both" as const };
 const facts: AgentV2CapabilityFacts = { protocolVersion: 2, capabilities: ["apply_tunnel", FORWARD_POLICY_CAPABILITY],
@@ -129,3 +148,4 @@ test("only business ingress gets policy: relay ingress enforces, middle and exit
     targets: [{ host: "business.example", port: 8080 }] })).ok).toBe(true);
   expect(configs[1]!.max_connections).toBeUndefined();
 });
+}

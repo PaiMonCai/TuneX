@@ -53,6 +53,16 @@ var trafficDiagnostics = struct {
 }{last: make(map[string]time.Time)}
 
 func enqueueTraffic(cfg config, bytesIn, bytesOut uint64, connectionDeltas ...uint64) {
+	if sink := managedTrafficSink.Load(); sink != nil {
+		connections := uint64(0)
+		if len(connectionDeltas) > 0 {
+			connections = connectionDeltas[0]
+		}
+		if err := sink.record(cfg, bytesIn, bytesOut, connections, time.Now()); err != nil {
+			sink.failed()
+		}
+		return
+	}
 	panelURL := strings.TrimRight(strings.TrimSpace(cfg.PanelURL), "/")
 	token := strings.TrimSpace(cfg.Token)
 	connections := uint64(0)
@@ -401,7 +411,11 @@ func startTrafficReporter(cfg config, counter *trafficCounter) func() {
 		}
 	}
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		interval := 10 * time.Second
+		if managedTrafficSink.Load() != nil {
+			interval = managedTrafficInterval
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {

@@ -26,6 +26,8 @@ type Manager struct {
 	closed                 bool
 	cacheErr               error
 	external               externalReservations
+	traffic                *trafficStore
+	lifecycleStarted       bool
 }
 
 // New loads durable fences but does not start children. Corrupt/foreign caches
@@ -88,8 +90,14 @@ func (m *Manager) apply(input Config) (out Observation, resultErr error) {
 	if m.closed {
 		return Observation{}, ErrClosed
 	}
+	m.lifecycleStarted = true
 	if m.cacheErr != nil {
 		return m.observeLocked(input.ID), m.cacheErr
+	}
+	if m.traffic != nil {
+		if _, err := m.scanTrafficLocked(); err != nil {
+			return m.observeLocked(input.ID), m.trafficFailureLocked(err)
+		}
 	}
 	cfg := cloneConfig(input)
 	deadline, expected, err := validateConfig(&cfg)
@@ -222,7 +230,7 @@ func (m *Manager) apply(input Config) (out Observation, resultErr error) {
 		}
 		return m.observeLocked(cfg.ID), nil
 	}
-	p, startErr := startChild(m.binaryPath, m.runtimeDir, cfg, deadline, expected)
+	p, startErr := m.startChildLocked(cfg, deadline, expected)
 	if startErr == nil {
 		m.running[cfg.ID] = p
 		r.Config = &cfg
@@ -261,12 +269,15 @@ func (m *Manager) apply(input Config) (out Observation, resultErr error) {
 				r.State = "rolled_back"
 			} else {
 				var restored *child
-				restored, rollbackErr = startChild(m.binaryPath, m.runtimeDir, previous, oldDeadline, oldExpected)
+				restored, rollbackErr = m.startChildLocked(previous, oldDeadline, oldExpected)
 				if rollbackErr == nil {
 					m.running[cfg.ID] = restored
 					r.State = "rolled_back"
 				} else if restored != nil {
-					_ = restored.stop()
+					if stopErr := restored.stop(); stopErr != nil {
+						m.running[cfg.ID] = restored
+						rollbackErr = errors.Join(rollbackErr, stopErr)
+					}
 				}
 			}
 		}
@@ -342,8 +353,14 @@ func (m *Manager) Restore() ([]Observation, error) {
 	if m.closed {
 		return nil, ErrClosed
 	}
+	m.lifecycleStarted = true
 	if m.cacheErr != nil {
 		return m.statusLocked(), m.cacheErr
+	}
+	if m.traffic != nil {
+		if _, err := m.scanTrafficLocked(); err != nil {
+			return m.statusLocked(), m.trafficFailureLocked(err)
+		}
 	}
 	var failures []error
 	for _, id := range m.idsLocked() {
@@ -388,10 +405,13 @@ func (m *Manager) Restore() ([]Observation, error) {
 			failures = append(failures, err)
 			continue
 		}
-		p, err := startChild(m.binaryPath, m.runtimeDir, cfg, deadline, expected)
+		p, err := m.startChildLocked(cfg, deadline, expected)
 		if err != nil {
 			if p != nil {
-				_ = p.stop()
+				if stopErr := p.stop(); stopErr != nil {
+					m.running[id] = p
+					err = errors.Join(err, stopErr)
+				}
 			}
 			r.State = "failed"
 			r.LastError = err.Error()

@@ -1,6 +1,24 @@
 import { beforeEach, expect, test } from "bun:test";
-import { policyFixture as state } from "./forward-policy-offline-preload.ts";
-import { createForward, deleteForward, forwardView, patchForward, previewForwardUpdate, runForwardAction } from "../forward-service.ts";
+import { fileURLToPath } from "node:url";
+
+
+// Bun module mocks are process-wide. Run the complete original assertions in a
+// fresh process, with fixture mocks loaded before any production dependency.
+if (process.env.TUNEX_FORWARD_POLICY_ISOLATED !== "1") {
+  test("isolated forward-policy-boundary regression suite", () => {
+    const child = Bun.spawnSync([process.execPath, "test", "--preload",
+      fileURLToPath(new URL("./forward-policy-offline-preload.ts", import.meta.url)),
+      fileURLToPath(import.meta.url), "--timeout", "10000"], {
+      env: { ...process.env, TUNEX_FORWARD_POLICY_ISOLATED: "1" },
+      stdout: "pipe", stderr: "pipe", timeout: 20000,
+    });
+    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
+    expect(child.exitCode, output).toBe(0);
+    expect(output).toMatch(/\b[1-9]\d* pass\b/);
+  });
+} else {
+const { policyFixture: state } = await import("./forward-policy-offline-preload.ts");
+const { createForward, deleteForward, forwardView, patchForward, previewForwardUpdate, runForwardAction } = await import("../forward-service.ts");
 
 beforeEach(() => {
   state.rows = [{ id: 71, workspace_id: 7, link_resource_id: 5, name: "linked", tunnel_mode: "relay", forward_protocol: "both",
@@ -37,3 +55,4 @@ test("view preserves Link identity/relay target and only marks Link both support
     else process.env.TUNEX_FXP_LINKS_ENABLED = previous;
   }
 });
+}

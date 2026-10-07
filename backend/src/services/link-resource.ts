@@ -14,6 +14,7 @@ import { getEffectivePolicy } from "./policy-service.ts";
 import { resolveForwardPolicy } from "./forward-policy.ts";
 import { linkObservation } from "./link-observation.ts";
 import { normalizeBindScope } from "../integrations/forwardx/bind-scope.ts";
+import { checkAgentVersion } from "../integrations/forwardx/agent-version.ts";
 
 const id = z.number().int().positive().max(2_147_483_647);
 const port = id.max(65_535);
@@ -68,7 +69,8 @@ async function lockLink(tx: Prisma.TransactionClient, workspaceId: number, linkI
 }
 async function endpoints(workspaceId: number, config: LinkConfig) {
   const nodes = await db.node.findMany({ where: { id: { in: [config.ingress_node_id, config.egress_node_id] },
-    node_group: { workspace_id: workspaceId } }, include: { node_group: true } });
+    node_group: { workspace_id: workspaceId } }, include: { node_group: true,
+      state_report: { select: { version: true } } } });
   const ingress = nodes.find((n) => n.id === config.ingress_node_id);
   const egress = nodes.find((n) => n.id === config.egress_node_id);
   if (!ingress || !egress) throw new LinkResourceError("link_node_not_found", 404);
@@ -78,10 +80,18 @@ async function endpoints(workspaceId: number, config: LinkConfig) {
     if (node.lifecycle !== "active") throw new LinkResourceError("link_node_unavailable");
   }
   const [inFacts, outFacts] = await Promise.all([loadNodeCapabilityFacts(ingress.id), loadNodeCapabilityFacts(egress.id)]);
-  const fact = (node: typeof ingress, capabilities: string[] | null | undefined) => ({
-    id: node.id, workspace_id: workspaceId, connect_host: node.connect_ip ?? "",
-    version: node.version, capabilities: capabilities ?? [],
-  });
+  const fact = (node: typeof ingress, capabilities: string[] | null | undefined) => {
+    // Node.version is a historical display field (new rows default to unknown).
+    // Authenticated heartbeats write NodeStateReport.version, not Node.version.
+    // Never let the historical field admit a missing/unknown current report.
+    const version = node.state_report?.version ?? "";
+    const versionFailure = checkAgentVersion(version, null);
+    if (versionFailure) throw new LinkResourceError(versionFailure);
+    if (!capabilities?.includes("forward.link.fxp.v1"))
+      throw new LinkResourceError("agent_fxp_capability_missing");
+    return { id: node.id, workspace_id: workspaceId, connect_host: node.connect_ip ?? "",
+      version, capabilities };
+  };
   // The egress address must be explicitly configured; the ingress connect address
   // is not used for dialing but remains a declared endpoint identity.
   if (!egress.connect_ip) throw new LinkResourceError("hop_address_missing");
@@ -107,6 +117,14 @@ export async function getLink(workspaceId: number, linkId: number) {
   const reports = deployment ? await db.nodeStateReport.findMany({ where: {
     node_id: { in: deployment.placements.map((p) => p.node_id) } },
     select: { node_id: true, reported_at: true, link_placements: true } }) : [];
+  // Cumulative payload facts remain independent of runtime readiness. No
+  // checkpoint means unknown, not an invented zero from the native reporter.
+  const usage = forwards.length ? await db.linkTrafficCheckpoint.groupBy({
+    by: ["forward_id"],
+    where: { workspace_id: workspaceId, link_id: linkId, forward_id: { in: forwards.map((f) => f.id) } },
+    _sum: { bytes_in: true, bytes_out: true, connections: true },
+    _max: { updated_at: true },
+  }) : [];
   return { ...link, config: version?.config ?? null,
     deployment: deployment ? { generation: deployment.generation, status: deployment.status,
       version: deployment.status === "active" && deployment.placements.every((p) => p.applied_generation === deployment.generation)
@@ -115,7 +133,15 @@ export async function getLink(workspaceId: number, linkId: number) {
         ...p, observation: linkObservation(p, workspaceId, linkId,
           reports.find((report) => report.node_id === p.node_id) ?? null),
       })) } : null,
-    forwards };
+    forwards: forwards.map((forward) => {
+      const measured = usage.find((row) => row.forward_id === forward.id);
+      return { ...forward, traffic: measured ? {
+        bytes_in: (measured._sum.bytes_in ?? 0n).toString(),
+        bytes_out: (measured._sum.bytes_out ?? 0n).toString(),
+        connections: (measured._sum.connections ?? 0n).toString(),
+        last_received_at: measured._max.updated_at?.toISOString() ?? null,
+      } : null };
+    }) };
 }
 export async function createLink(workspaceId: number, actorId: number, raw: unknown) {
   assertLinkFeature();

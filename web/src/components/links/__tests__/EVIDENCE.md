@@ -69,3 +69,23 @@ git diff --check -- src/components/forwards/forward-workspace.tsx src/components
 新增测试覆盖：闭合 API 投影保留 `degraded + policy_blocked + removed`；过去 ACK 不替代 removed/expired 观测；恢复后的新部署不能使用旧版本 ready 事实；暂停 / 恢复产生的规则修订及已应用修订只显示服务端值。
 
 此次执行 links API/UI 与控制台边界三个文件：**59 pass / 0 fail / 1029 assertions**。随后 `web tsc --noEmit` 退出码 **0**。这是前端策略漂移展示证据，后端 reconcile 测试结果由后端工作流单独提供。
+
+## 每规则流量详情最小切片（2026-10-07）
+
+只修改 `web/src/lib/links-types.ts`、本模块 `link-detail.tsx` / `links-copy.ts`、`links-api.test.ts` / `links-ui.test.tsx` / `links-fixtures.ts` 和可选 README / 本证据文件。没有修改后端、Agent、vendor、路由、支付或既有流量仪表盘，也没有 Git 提交。
+
+已读取新提供的 [FXP 流量实施契约](../../../../../docs/plans/forwardx-core-2026-10-07/LINK_TRAFFIC_IMPLEMENTATION.md)，并只读核对 `getLink` 按 Forward 聚合所有历史 producer/day 的公开投影。详情在原规则卡片内新增双向累计 payload 字节、累计已接纳连接数（含 UDP 映射）和独立的最近接收时间。计数直接显示精确 decimal string，不转为 `Number`；没有收到统计为“尚未收到统计”，真正零为 `0 B` / `0`。
+
+新增 **17 个** parser/UI 用例：缺失与 null、真零、超过 `MAX_SAFE_INTEGER` / uint64 的历史累计、每个计数字段的非 canonical 输入、缺字段、无效/自动归一化日期、闰日/时区/未来时间、闭合投影脱敏、HTTP 成功但内容非法、双语渲染、每规则独立统计、59,999 / 60,000 毫秒边界、旧值保留、缺失或未知运行观测、停止/过期状态和真实 ready 与旧流量互不覆盖。至少 60 秒未更新明确说明“不表示当前流量为零”；未来接收时间提示时钟差异，不作为在线证明。
+
+最终执行（`web/`，本机缓存 Bun **1.4.2**）：
+
+```powershell
+$env:NEXT_PUBLIC_API_MOCK = "0"
+bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/console/__tests__/console-boundary.test.ts
+npm run typecheck -- --incremental false
+```
+
+结果：**76 pass / 0 fail / 1271 assertions / 3 files**；npm TypeScript 检查退出码 **0**。关闭 incremental 避免写入 scope 外的 `tsconfig.tsbuildinfo`。新增用例实施前为 **30 pass / 17 fail**，实施后全绿。
+
+本次没有运行新浏览器流程、生产部署或真实多节点/数据库验收；这些仍由主集成工作流验证。HTTP fixtures 与 React 静态渲染不是实网统计正确性证据。

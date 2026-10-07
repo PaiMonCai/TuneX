@@ -1198,6 +1198,32 @@ model LinkPlacement {
   @@map("link_placement")
 }
 
+/// Durable ingress-only cumulative usage. No live-object FKs: final samples and
+/// replay protection must survive Forward/Node deletion and Link retirement.
+model LinkTrafficCheckpoint {
+  id Int @id @default(autoincrement())
+  node_id Int
+  producer_id String @db.VarChar(32)
+  forward_id Int
+  /// Asia/Shanghai day label stored at UTC midnight, like TunnelTraffic.date.
+  date DateTime
+  /// Immutable attribution for this producer/Forward/day identity.
+  link_id Int
+  workspace_id Int
+  generation Int
+  config_digest String @db.VarChar(64)
+  bytes_in BigInt @default(0)
+  bytes_out BigInt @default(0)
+  connections BigInt @default(0)
+  /// Panel receipt of the last nonstale accepted sample, not Agent sample time/readiness.
+  updated_at DateTime @default(now()) @updatedAt
+
+  @@unique([node_id, producer_id, forward_id, date], map: "link_traffic_checkpoint_identity_key")
+  @@index([workspace_id, date])
+  @@index([workspace_id, link_id])
+  @@map("link_traffic_checkpoint")
+}
+
 model NodePortLease {
   id      Int  @id @default(autoincrement())
   node_id Int

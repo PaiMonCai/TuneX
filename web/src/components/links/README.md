@@ -16,16 +16,25 @@
 
 Saving or changing rules reapplies the carrier and may interrupt existing connections. This module makes no claim of lossless reload. The shared reload work requires separate measured acceptance before changing that copy.
 
+## Forward traffic snapshots
+
+Each detail `forward` may include `traffic: null | { bytes_in, bytes_out, connections, last_received_at }`. Missing/null means **not received**, never fabricated zero. A present object must contain canonical unsigned decimal strings (`0` or digits without leading zeroes) and a valid timezone-qualified ISO timestamp; malformed counters, partial snapshots and impossible calendar dates reject the detail response with the safe `invalid_link_response` code. The projection copies only these four fields, not keys, configurations, raw processes or unrelated runtime fields.
+
+These are backend `LinkTrafficCheckpoint` sums across all historical producers/days for the rule: client → target and target → client payload bytes, plus total admitted connections (including UDP mappings, not current concurrency). Exact decimal bytes with a `B` suffix and exact decimal connection counts avoid any `Number` conversion, including aggregates larger than `MAX_SAFE_INTEGER` or uint64. The existing bilingual rule-card grid is reused; no new route or traffic-dashboard data path is introduced. See the [traffic implementation contract](../../../../docs/plans/forwardx-core-2026-10-07/LINK_TRAFFIC_IMPLEMENTATION.md); the existing dashboard/allowance ledger remains unchanged.
+
+The receipt timestamp is separate from runtime readiness. At age **>= 60 seconds** the UI keeps the totals and explicitly says they are old, not current zero. A future receipt flags a local clock difference while retaining the historical totals. Neither fresh nor old traffic can substitute for a ready observation, and old traffic does not suppress a genuinely ready runtime.
+
 ## Verification
 
 From `web/`:
 
 ```powershell
+$env:NEXT_PUBLIC_API_MOCK = "0"
 bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/console/__tests__/console-boundary.test.ts
-node node_modules/typescript/bin/tsc --noEmit
+npm run typecheck -- --incremental false
 ```
 
-The Bun tests validate the production request contract (Workspace, credentials, CSRF, CAS and errors), closed response projections, form boundaries, references, lifecycle restrictions, runtime observations and navigation. The source of truth for Agent freshness/digest/identity remains the backend observation projection, rather than a second UI inference.
+The Bun tests validate the production request contract (Workspace, credentials, CSRF, CAS and errors), closed response projections, exact/nullable traffic snapshots, form boundaries, references, lifecycle restrictions, runtime observations and navigation. The source of truth for Agent freshness/digest/identity remains the backend observation projection, rather than a second UI inference.
 
 For isolated browser interactions:
 

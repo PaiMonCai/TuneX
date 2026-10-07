@@ -129,6 +129,13 @@ func (p *child) verifyFile(digest string) bool {
 func (m *Manager) reloadLocked(r record, cfg Config, deadline time.Time, p *child) (Observation, error) {
 	old := r.Config
 	r.UpdateMode = "managed_reload"
+	// Persist first-known rule metadata before FXP can observe a candidate.
+	// A rejected proposal may leave a conservative mapping, never a blind spot.
+	if err := m.extendTrafficLocked(p, cfg); err != nil {
+		r.State = "failed"
+		r.LastError = ErrTraffic.Error()
+		return m.observeLocked(cfg.ID), errors.Join(err, m.stopLocked(cfg.ID), m.saveRecordLocked(r))
+	}
 	var reloadErr error
 	if cfg.ConfigDigest == old.ConfigDigest {
 		if !p.verifyFile(cfg.ConfigDigest) {

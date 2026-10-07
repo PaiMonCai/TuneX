@@ -1039,9 +1039,14 @@ const BOUNDARIES: readonly Boundary[] = [
   },
 ];
 
+function includesAnchor(line: string, anchor: string): boolean {
+  // gofmt realigns the const block when a longer action name is added.
+  return line.replace(/\s+/g, " ").includes(anchor.replace(/\s+/g, " "));
+}
+
 function windowOf(file: string, anchor: string): string {
   const lines = readFileSync(join(ROOT, file), "utf8").split("\n");
-  const at = lines.findIndex((l) => l.includes(anchor));
+  const at = lines.findIndex((l) => includesAnchor(l, anchor));
   expect(at, `${file} 里找不到锚点：${anchor}`).toBeGreaterThanOrEqual(0);
   return lines.slice(at, at + WINDOW).join("\n");
 }
@@ -1059,9 +1064,16 @@ describe("WP19-D 源码级守卫：新动作要穿过每个逐字段重建处", 
   test("守卫不是空转：每个锚点唯一存在", () => {
     for (const boundary of BOUNDARIES) {
       const lines = readFileSync(join(ROOT, boundary.file), "utf8").split("\n");
-      const hits = lines.filter((l) => l.includes(boundary.anchor)).length;
+      const hits = lines.filter((l) => includesAnchor(l, boundary.anchor)).length;
       expect(hits, `${boundary.file} 里锚点「${boundary.anchor}」出现 ${hits} 次（应为 1）`).toBe(1);
     }
+  });
+
+  test("Go action anchors ignore alignment, not the action name or wire value", () => {
+    const anchor = 'ActionLookingGlass = "looking_glass"';
+    expect(includesAnchor('\tActionLookingGlass      = "looking_glass"', anchor)).toBe(true);
+    expect(includesAnchor('ActionApplyLink = "looking_glass"', anchor)).toBe(false);
+    expect(includesAnchor('ActionLookingGlass = "apply_link"', anchor)).toBe(false);
   });
 
   test("面板侧不得自己拨目标（SSRF 边界：面板是控制面，不是探测代理）", () => {
