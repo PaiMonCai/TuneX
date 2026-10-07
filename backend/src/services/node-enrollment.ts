@@ -313,7 +313,7 @@ case "$AGENT_ID" in
     exit 2
     ;;
 esac
-[ "${#AGENT_ID}" -le 64 ] || { echo "tunex install: agent_id is too long" >&2; exit 2; }
+[ "\${#AGENT_ID}" -le 64 ] || { echo "tunex install: agent_id is too long" >&2; exit 2; }
 
 CONTAINER="tunex-agent-$AGENT_ID"
 INSTANCE_ENV_DIR="/etc/tunex-agent/instances/$AGENT_ID"
