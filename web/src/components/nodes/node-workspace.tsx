@@ -59,10 +59,16 @@ import {
 } from "@/lib/node-onboarding";
 
 function roleLabel(role: NodeRole | null | undefined, t: (key: string) => string) {
-  if (role === "ingress") return t("node.ingress");
-  if (role === "egress") return t("node.egress");
-  if (role === "both") return t("node.both");
+  if (role === "ingress") return t("node.ingressNodeRole");
+  if (role === "egress") return t("node.egressNodeRole");
+  if (role === "both") return t("node.bothNodeRole");
   return "—";
+}
+
+function roleHintKey(role: NodeRole): string {
+  if (role === "ingress") return "node.ingressRoleHint";
+  if (role === "egress") return "node.egressRoleHint";
+  return "node.bothRoleHint";
 }
 
 function isIngress(node: UserNode) {
@@ -1120,11 +1126,14 @@ export function NodeCreateDialogBody({
           <Select value={nodeRole} onValueChange={(value) => onRoleChange(value as NodeRole)}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="ingress">{t("node.ingress")}</SelectItem>
-              <SelectItem value="egress">{t("node.egress")}</SelectItem>
-              <SelectItem value="both">{t("node.both")}</SelectItem>
+              <SelectItem value="ingress">{t("node.ingressNodeRole")}</SelectItem>
+              <SelectItem value="egress">{t("node.egressNodeRole")}</SelectItem>
+              <SelectItem value="both">{t("node.bothNodeRole")}</SelectItem>
             </SelectContent>
           </Select>
+          <p className="text-xs text-[var(--muted-foreground)]" data-testid="node-role-hint">
+            {t(roleHintKey(nodeRole))}
+          </p>
         </Field>
         <NodeGroupPrerequisite
           state={groupState}
