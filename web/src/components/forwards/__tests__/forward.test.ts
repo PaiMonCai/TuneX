@@ -96,20 +96,12 @@ describe("V4 forward product contract", () => {
     expect(detail.body.traffic).toBe(0);
   });
 
-  test("RELAY requires an explicit ingress->egress binding", async () => {
-    const denied = await call<PortForward>("POST", "/forwards", {
-      name: "relay-unbound",
-      mode: "relay",
-      ingress_node_id: 1,
-      egress_node_id: 7,
-      target_host: "example.internal",
-      target_port: 443,
-    });
-    expect(denied.status).toBe(409);
+  test("RELAY creation prepares a missing ingress→egress path relationship", async () => {
+    const before = await call<NodeBinding[]>("GET", "/nodes/1/bindings");
+    expect(before.body.some((row) => Number(row.egress_node_id) === 7)).toBe(false);
 
-    await call<NodeBinding>("POST", "/nodes/1/bindings", { egress_node_id: 7 });
     const created = await call<PortForward>("POST", "/forwards", {
-      name: "relay-bound",
+      name: "relay-auto-path",
       mode: "relay",
       ingress_node_id: 1,
       egress_node_id: 7,
@@ -121,6 +113,9 @@ describe("V4 forward product contract", () => {
     expect(Number(created.body.egress_node_id)).toBe(7);
     expect(created.body.target_host).toBe("example.internal");
     expect(created.body.target_port).toBe(443);
+
+    const after = await call<NodeBinding[]>("GET", "/nodes/1/bindings");
+    expect(after.body.some((row) => Number(row.egress_node_id) === 7)).toBe(true);
   });
 
   test("summary and apply-status filtering stay on the Forward API", async () => {
