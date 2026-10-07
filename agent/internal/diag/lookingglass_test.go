@@ -282,10 +282,10 @@ func TestLookingGlassCapsAndMethodClosedSet(t *testing.T) {
 		t.Fatalf("超过上限应返回 ErrTooManyTargets，得到 %v", err)
 	}
 	if err := call(LookingGlassRequest{
-		Method:  "ping",
+		Method:  "mtr",
 		Targets: []LookingGlassTarget{{Address: "93.184.216.34", Port: 80}},
 	}); !errors.Is(err, ErrLookingGlassRejected) {
-		t.Fatalf("未知方法必须拒绝（不降级），得到 %v", err)
+		t.Fatalf("闭集外方法必须拒绝（不降级），得到 %v", err)
 	}
 	if err := call(LookingGlassRequest{
 		Method:  LookingGlassMethodTCPConnect,
@@ -535,9 +535,9 @@ func TestICMPRejectsWholeRequestBeforeExecuting(t *testing.T) {
 		}
 	})
 
-	t.Run("未知方法仍然拒绝（不静默降级成 TCP）", func(t *testing.T) {
+	t.Run("闭集外方法仍然拒绝（不静默降级成 TCP）", func(t *testing.T) {
 		_, err := LookingGlass(context.Background(), LookingGlassRequest{
-			Method:  "traceroute",
+			Method:  "mtr",
 			Targets: []LookingGlassTarget{{Address: "1.1.1.1", Port: 443}},
 		}, nil)
 		if err == nil || !errors.Is(err, ErrLookingGlassRejected) {
@@ -691,9 +691,15 @@ func TestDetectLookingGlassMethodsShapes(t *testing.T) {
 		if !ok {
 			t.Fatalf("方法 %q 没有可用性条目（面板据此算 caps.methods）", method)
 		}
-		// "可用"必须给出二进制路径；"不可用"必须给出原因。二者不可同时为空/同时非空。
-		if (availability.Reason == "") == (availability.Binary == "" && method != LookingGlassMethodTCPConnect) {
-			t.Fatalf("方法 %q 的可用性自相矛盾: %+v", method, availability)
+		// tcp_connect 不依赖外部二进制；其他方法在"可用"时必须给出实际二进制。
+		// "二进制存在但当前节点权限/内核能力不足"是合法的不可用状态，此时
+		// Binary 与 Reason 会同时存在，不能把它误判成矛盾。
+		if method == LookingGlassMethodTCPConnect {
+			if availability.Binary != "" || availability.Reason != "" {
+				t.Fatalf("tcp_connect 应恒可用且不依赖外部二进制: %+v", availability)
+			}
+		} else if availability.Reason == "" && availability.Binary == "" {
+			t.Fatalf("可用方法 %q 必须给出实际二进制路径: %+v", method, availability)
 		}
 	}
 	// mtr/mtr6 不在闭集里（镜像无二进制 + 需要 raw socket）⇒ 永远不会被标注为可用。
