@@ -875,6 +875,18 @@ export async function createForward(
         if (conflict) return { conflict: true } as const;
       }
 
+      // Path setup is part of the same transaction as the Forward row. Existing
+      // relations are always reusable; missing ones are created only when the
+      // actor already has node-management permission.
+      const pathSetup = await ensureForwardPathRelations(
+        tx,
+        pathRelations,
+        options.canManageNodes === true,
+      );
+      if (!pathSetup.ok) {
+        return { pathSetupDenied: pathSetup } as const;
+      }
+
       const tunnel = await tx.tunnel.create({
         data: {
           name: input.name.trim(),
@@ -971,6 +983,24 @@ export async function createForward(
   }
   if ("conflict" in reserved) {
     return error(409, "port_conflict", "该入口端口已被占用");
+  }
+  if ("pathSetupDenied" in reserved) {
+    const missing = reserved.pathSetupDenied.missing;
+    return error(
+      403,
+      "path_setup_permission_required",
+      "所选路径需要建立节点关系，但当前角色没有节点管理权限",
+      {
+        error_layer: "rbac",
+        data: {
+          missing_relations: missing.map((relation) => ({
+            from_node_id: relation.from_node_id,
+            to_node_id: relation.to_node_id,
+            segment: relation.segment,
+          })),
+        },
+      },
+    );
   }
 
   const tunnelId =
