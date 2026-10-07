@@ -404,6 +404,8 @@ export interface MultihopFailureInfo {
 interface FailureCopy {
   bindingRequiredTitle: string;
   bindingRequiredNext: string;
+  pathPermissionTitle: string;
+  pathPermissionNext: string;
   conflictTitle: string;
   conflictNext: string;
   portConflictTitle: string;
@@ -417,9 +419,10 @@ interface FailureCopy {
 }
 
 const FAILURE_ZH: FailureCopy = {
-  bindingRequiredTitle: "两段邻接绑定不完整",
-  bindingRequiredNext:
-    "先补齐两段绑定：「入口 → 中间」与「中间 → 出口」各建一条，再回来提交（节点页的绑定，或下面 relay 的「绑定并使用」）。",
+  bindingRequiredTitle: "路径关系尚未准备好",
+  bindingRequiredNext: "刷新后重试；如果仍然失败，请检查节点路径关系与权限。",
+  pathPermissionTitle: "自动准备路径需要节点管理权限",
+  pathPermissionNext: "请选择已经准备好的路径，或联系有节点管理权限的成员完成创建。",
   conflictTitle: "节点角色或组合不被接受",
   conflictNext:
     "检查三台节点的角色：中间跳必须同时能当第一段的出口与第二段的入口（role = both），且入口/中间/出口不能是同一台。",
@@ -434,9 +437,10 @@ const FAILURE_ZH: FailureCopy = {
 };
 
 const FAILURE_EN: FailureCopy = {
-  bindingRequiredTitle: "Two adjacent bindings are not in place",
-  bindingRequiredNext:
-    "Create both bindings first — ingress → middle and middle → egress — then submit again (node page bindings, or the relay “bind and use” control below).",
+  bindingRequiredTitle: "Path relationships are not ready",
+  bindingRequiredNext: "Reload and retry. If it still fails, check the node path relationships and permissions.",
+  pathPermissionTitle: "Automatic path setup needs node-management permission",
+  pathPermissionNext: "Choose a path that is already prepared, or ask a member with node-management permission to create it.",
   conflictTitle: "Node roles or the chosen combination are not accepted",
   conflictNext:
     "Check the three nodes' roles: the middle hop must be able to act as the egress of segment one and the ingress of segment two (role = both), and ingress/middle/egress must not be the same node.",
@@ -472,6 +476,9 @@ export function multihopFailureInfo(locale: Locale, error: unknown): MultihopFai
 
   if (code === "binding_required") {
     return { code, message, title: copy.bindingRequiredTitle, next: copy.bindingRequiredNext, retryable: false };
+  }
+  if (code === "path_setup_permission_required") {
+    return { code, message, title: copy.pathPermissionTitle, next: copy.pathPermissionNext, retryable: false };
   }
   if (code === "conflict") {
     // admission 拒绝（maintenance/disabled/retiring/waiting_install…）也走 `conflict`，
