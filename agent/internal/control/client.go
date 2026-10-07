@@ -491,7 +491,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		rev := cmd.Envelope.Revision
 		ack.AppliedRevision = &rev
 	case ActionRemoveTunnel, ActionSuspendTunnel:
-		if err := c.tunnels.Remove(cmd.Envelope.ResourceID); err != nil {
+		if err := c.tunnels.RemoveAtRevision(cmd.Envelope.ResourceID, cmd.Envelope.Revision); err != nil {
 			ack.ErrorCode, ack.Error = "remove_failed", err.Error()
 			return ack
 		}

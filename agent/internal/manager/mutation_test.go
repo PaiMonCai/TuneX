@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/tunex/agent/internal/forwarder"
@@ -56,6 +57,70 @@ func TestMutationHookFiresOnlyOnRealChange(t *testing.T) {
 	}
 	if fired != 3 {
 		t.Fatalf("a no-op remove must not notify the hook, got %d", fired)
+	}
+}
+
+func TestRemoveRevisionTombstoneRejectsStaleResurrection(t *testing.T) {
+	up := freePort(t)
+	tm := NewTunnelManager(NewEgressManager(), "127.0.0.1")
+	id := "remove-fence"
+	base := directCfg(id, freePort(t), addrFor(up), 5)
+
+	if _, err := tm.Apply(base); err != nil {
+		t.Fatalf("apply rev5: %v", err)
+	}
+	if err := tm.RemoveAtRevision(id, 4); !errors.Is(err, ErrStaleRevision) {
+		t.Fatalf("stale remove rev4 = %v, want ErrStaleRevision", err)
+	}
+	if got, ok := tm.Get(id); !ok || got.Revision != 5 {
+		t.Fatalf("stale remove changed live runtime: got=%+v ok=%v", got, ok)
+	}
+
+	if err := tm.RemoveAtRevision(id, 6); err != nil {
+		t.Fatalf("remove rev6: %v", err)
+	}
+	if _, ok := tm.Get(id); ok {
+		t.Fatal("runtime still live after rev6 remove")
+	}
+
+	for _, rev := range []int64{5, 6} {
+		stale := base.Clone()
+		stale.Revision = rev
+		if _, err := tm.Apply(stale); !errors.Is(err, ErrStaleRevision) {
+			t.Fatalf("apply rev%d after remove rev6 = %v, want ErrStaleRevision", rev, err)
+		}
+		if _, err := tm.ReplaceListener(stale); !errors.Is(err, ErrStaleRevision) {
+			t.Fatalf("replace rev%d after remove rev6 = %v, want ErrStaleRevision", rev, err)
+		}
+	}
+
+	newer := base.Clone()
+	newer.Revision = 7
+	if _, err := tm.ReplaceListener(newer); err != nil {
+		t.Fatalf("newer replace rev7 should clear tombstone: %v", err)
+	}
+	if got, ok := tm.Get(id); !ok || got.Revision != 7 {
+		t.Fatalf("newer runtime not restored: got=%+v ok=%v", got, ok)
+	}
+}
+
+func TestRemoveUnknownRuntimeStillFencesOlderSnapshot(t *testing.T) {
+	up := freePort(t)
+	tm := NewTunnelManager(NewEgressManager(), "127.0.0.1")
+	id := "remove-absent"
+
+	if err := tm.RemoveAtRevision(id, 8); err != nil {
+		t.Fatalf("remove absent rev8: %v", err)
+	}
+	stale := directCfg(id, freePort(t), addrFor(up), 7)
+	if _, err := tm.Apply(stale); !errors.Is(err, ErrStaleRevision) {
+		t.Fatalf("stale apply after absent remove = %v, want ErrStaleRevision", err)
+	}
+
+	newer := stale.Clone()
+	newer.Revision = 9
+	if _, err := tm.Apply(newer); err != nil {
+		t.Fatalf("newer rev9 after tombstone: %v", err)
 	}
 }
 

@@ -16,20 +16,22 @@ import {
 } from "../forward-batch.ts";
 
 describe("V4-WP9 批量动作白名单", () => {
-  test("只含三个可逆动作，不含 delete", () => {
-    expect([...FORWARD_BATCH_ACTIONS]).toEqual(["retry", "suspend", "resume"]);
-    // 破坏性动作永不进入批量白名单
-    expect((FORWARD_BATCH_ACTIONS as readonly string[]).includes("delete")).toBe(false);
-  });
-
-  test("单条动作 → 批量动作：白名单是单条动作的子集（delete 不可能转换）", () => {
+  test("includes deletion but keeps single POST actions reversible", () => {
+    expect([...FORWARD_BATCH_ACTIONS]).toEqual(["retry", "suspend", "resume", "delete"]);
     expect(toForwardBatchAction("retry")).toBe("retry");
     expect(toForwardBatchAction("suspend")).toBe("suspend");
     expect(toForwardBatchAction("resume")).toBe("resume");
-    // `ForwardAction` 本身不含 delete，故这里只能从 `unknown` 侧证明：
-    // 破坏性动作无法通过 `isForwardBatchAction`。
-    expect(isForwardBatchAction("delete")).toBe(false);
-    expect((FORWARD_BATCH_ACTIONS as readonly string[]).includes("delete")).toBe(false);
+    expect(isForwardBatchAction("delete")).toBe(true);
+  });
+
+  test("delete requires a literal true confirmation; ID normalization still applies", () => {
+    for (const confirm_delete of [undefined, false, "true", 1, null]) {
+      expect("message" in parseForwardBatchRequest({ action: "delete", ids: [1], confirm_delete })).toBe(true);
+    }
+    expect(parseForwardBatchRequest({ action: "delete", ids: [3, 1, 3], confirm_delete: true }))
+      .toEqual({ action: "delete", ids: [3, 1], confirm_delete: true });
+    expect("message" in parseForwardBatchRequest({ action: "delete", ids: [Number.MAX_SAFE_INTEGER + 1], confirm_delete: true })).toBe(true);
+    expect("message" in parseForwardBatchRequest({ action: "delete", ids: Array.from({ length: 51 }, (_, i) => i + 1), confirm_delete: true })).toBe(true);
   });
 
   test("isForwardBatchAction 对非字符串/未知值都为 false", () => {
@@ -56,7 +58,7 @@ describe("V4-WP9 批量请求解析", () => {
   });
 
   test("动作不在白名单 → 明确报错（不回落成某个默认动作）", () => {
-    for (const action of ["delete", "remove", "", undefined, 1]) {
+    for (const action of ["remove", "", undefined, 1]) {
       const parsed = parseForwardBatchRequest({ action, ids: [1] });
       expect("message" in parsed).toBe(true);
     }

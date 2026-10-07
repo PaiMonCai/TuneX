@@ -81,6 +81,7 @@ import type {
   ForwardListQuery,
   ForwardBatchInput,
   ForwardBatchResult,
+  ForwardDeleteReceipt,
   ForwardSummary,
   ProvisionNodeResult,
   Payment,
@@ -460,6 +461,8 @@ export const forwardsApi = {
      * 逐条结果 + 200（部分失败不改整体状态码），因此调用方必须读
      * `succeeded` / `failed` 而不是只看 promise 是否 reject。
      */
+    batchCapabilities: (cookie?: string) =>
+      get<{ delete_enabled: boolean; stage: "experimental" }>("/forwards/batch/capabilities", undefined, cookie),
     batch: (
       input: ForwardBatchInput,
       cookie?: string,
@@ -495,7 +498,7 @@ export const forwardsApi = {
       cookie?: string,
     ) => post<PortForward>(`/forwards/${id}/${action}`, {}, cookie),
     remove: (id: ID, cookie?: string) =>
-      del<{ ok: true }>(`/forwards/${id}`, cookie),
+      del<ForwardDeleteReceipt>(`/forwards/${id}`, cookie),
     /**
      * Forward 诊断（只读）。
      *

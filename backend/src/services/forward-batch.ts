@@ -1,26 +1,19 @@
 /**
- *  §13.6「必要批量操作」——请求校验与逐条结果汇总的**纯函数**。
- *
- * 为什么批量只做 retry / suspend / resume：
- *   · 这三个动作只改 `desired_status`，**可逆**且**逐条幂等**（retry 是同 revision
- *     重放，不抬高 revision），重复点击不产生副作用；
- *   · 「批量删除」被有意排除：删除不可逆、每次删除都要走完整 rollout + 租约释放，
- *     批量语义下无法逐条确认影响面，且失败是部分成功（哪些没删掉会成为难解释的
- *     中间态）；§13.5 的权限矩阵（）尚未冻结，破坏性批量接口应先定义权限与
- *     资源作用域。用户路径：批量 suspend（可逆）→ 逐条删除。
- *   · 「批量改端口/改目标」被有意排除：端口唯一性与 listener replacement 是逐条
- *     判定（以「同入口节点已占用端口」为口径），批量应用需要先做全局端口分配，
- *     属于新特性而非交互补全（§13.7 Wave 4 明确「重点不是增加新协议」）。
+ * Batch request contract and per-item summaries.
+ * ForwardX reference: server/routers/rules.crud.ts deleteBatch at cb0ef0b.
+ * Reuse the processing sequence: deduplicate IDs, call the single-delete path,
+ * isolate failures, report every outcome. TuneX adds explicit confirmation and
+ * retains sequential rollout execution and its existing 50-resource limit.
  */
+import type { AuthorizationErrorLayer } from "./authorization-errors.ts";
 import type { ForwardAction } from "./forward-service.ts";
 
-/**
- * 批量动作白名单。
- *
- * 与单条 `POST /api/forwards/:id/:action` 的 `ACTIONS` 保持一致，但**不含 delete**：
- * 单条删除有逐条确认与明确的影响面，批量删除没有。
- */
-export const FORWARD_BATCH_ACTIONS = ["retry", "suspend", "resume"] as const;
+export const FORWARD_BATCH_ACTIONS = ["retry", "suspend", "resume", "delete"] as const;
+
+/** Experimental destructive action: opt in at runtime, never from a web build. */
+export function forwardBatchDeleteEnabled(): boolean {
+  return process.env.FORWARD_BATCH_DELETE_ENABLED === "true";
+}
 
 export type ForwardBatchAction = (typeof FORWARD_BATCH_ACTIONS)[number];
 
@@ -37,6 +30,7 @@ export const FORWARD_BATCH_MAX_IDS = 50;
 export interface ForwardBatchRequest {
   action: ForwardBatchAction;
   ids: number[];
+  confirm_delete?: true;
 }
 
 export interface ForwardBatchParseError {
@@ -73,12 +67,15 @@ export function parseForwardBatchRequest(
   if (!isForwardBatchAction(body.action)) {
     return { message: "不支持的批量动作" };
   }
+  if (body.action === "delete" && body.confirm_delete !== true) {
+    return { message: "批量删除必须显式确认（confirm_delete: true）" };
+  }
 
   if (!Array.isArray(body.ids)) {
     return { message: "ids 必须是数组" };
   }
   for (const raw of body.ids) {
-    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 1) {
       return { message: "ids 只能包含正整数" };
     }
   }
@@ -91,7 +88,9 @@ export function parseForwardBatchRequest(
     return { message: `一次最多处理 ${FORWARD_BATCH_MAX_IDS} 条` };
   }
 
-  return { action: body.action, ids };
+  return body.action === "delete"
+    ? { action: body.action, ids, confirm_delete: true }
+    : { action: body.action, ids };
 }
 
 export interface ForwardBatchItemResult {
@@ -105,8 +104,13 @@ export interface ForwardBatchItemResult {
    */
   code?: string;
   message?: string;
+  apply_error_code?: string;
+  /** Local desired/runtime deletion succeeded, but a remote federated leg is still being reconciled. */
+  reconciliation_pending?: boolean;
+  warning_code?: string;
+  warning_message?: string;
   /** §13.5 error layering; present on refusals that never reached the runtime. */
-  error_layer?: "rbac" | "resource_scope" | "capability" | "quota" | "runtime_admission";
+  error_layer?: AuthorizationErrorLayer;
 }
 
 export interface ForwardBatchSummary {
@@ -134,7 +138,7 @@ export function forwardBatchSummary(
 
 /**
  * 汇总文案用的失败原因分类：把逐条 `code` 归并成可读标签。
- * 只有 `not_found` 与 `conflict` 会出现在批量结果里（见 runForwardBatch）。
+ * Includes RBAC, scope, runtime conflicts and unexpected per-item failures.
  */
 export function forwardBatchFailureCodes(
   results: ForwardBatchItemResult[],
@@ -148,7 +152,7 @@ export function forwardBatchFailureCodes(
   return out;
 }
 
-/** 单条动作类型 → 批量动作类型（编译期保证批量白名单是单条白名单的子集）。 */
+/** Single reversible action → batch action; deletion has a separate endpoint. */
 export function toForwardBatchAction(action: ForwardAction): ForwardBatchAction | null {
   return isForwardBatchAction(action) ? action : null;
 }

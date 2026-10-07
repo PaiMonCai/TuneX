@@ -267,6 +267,11 @@ func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwar
 		return nil, err
 	}
 
+	if removed, ok := m.removedRevision[normalized.ID]; ok &&
+		normalized.Revision != revisionUnknown &&
+		normalized.Revision <= removed {
+		return nil, ErrStaleRevision
+	}
 	if cur, ok := m.tunnels[normalized.ID]; ok {
 		if isStale(normalized.Revision, cur.cfg.Revision) {
 			return nil, ErrStaleRevision
@@ -295,7 +300,11 @@ func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwar
 		return m.adoptIngressModeSiblingLocked(siblingID, sibling, normalized)
 	}
 
-	return m.applyRoutedLocked(normalized)
+	fwd, err := m.applyRoutedLocked(normalized)
+	if err == nil {
+		delete(m.removedRevision, normalized.ID)
+	}
+	return fwd, err
 }
 
 // ingressModeSiblingID maps the two control-plane resource IDs of one Forward.

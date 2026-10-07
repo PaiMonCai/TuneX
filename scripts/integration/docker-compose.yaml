@@ -36,6 +36,8 @@ services:
       SEED_DEMO_DATA: "false"
       RATE_LIMIT_ENABLED: "true"
       AUDIT_LOG_ENABLED: "true"
+      # Destructive batch Forward deletion is default-off; A00 gate opts in explicitly.
+      FORWARD_BATCH_DELETE_ENABLED: ${FORWARD_BATCH_DELETE_ENABLED:-false}
     networks:
       tunex-it-ctrl:
         ipv4_address: 172.31.0.10

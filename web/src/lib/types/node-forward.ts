@@ -303,13 +303,12 @@ export interface ForwardListQuery extends ListQuery {
   order?: "asc" | "desc";
 }
 
-/** 批量动作白名单：与后端 `FORWARD_BATCH_ACTIONS` 一致，不含 delete。 */
-export type ForwardBatchAction = "retry" | "suspend" | "resume";
+/** Batch action whitelist mirrors the backend; delete requires confirmation. */
+export type ForwardBatchAction = "retry" | "suspend" | "resume" | "delete";
 
-export interface ForwardBatchInput {
-  action: ForwardBatchAction;
-  ids: number[];
-}
+export type ForwardBatchInput =
+  | { action: Exclude<ForwardBatchAction, "delete">; ids: number[] }
+  | { action: "delete"; ids: number[]; confirm_delete: true };
 
 export interface ForwardBatchItemResult {
   id: ID;
@@ -317,6 +316,11 @@ export interface ForwardBatchItemResult {
   apply_status: string | null;
   code?: string;
   message?: string;
+  apply_error_code?: string;
+  reconciliation_pending?: boolean;
+  warning_code?: string;
+  warning_message?: string;
+  error_layer?: "authentication" | "rbac" | "resource_scope" | "capability" | "quota" | "runtime_admission";
 }
 
 /** 逐条结果 + 汇总计数。部分失败仍是 200，所以必须读 `failed`。 */
@@ -326,6 +330,13 @@ export interface ForwardBatchResult {
   succeeded: number;
   failed: number;
   results: ForwardBatchItemResult[];
+}
+
+export interface ForwardDeleteReceipt {
+  ok: true;
+  reconciliation_pending: boolean;
+  warning_code?: "federation_release_pending" | "federation_release_unconfirmed";
+  warning_message?: string;
 }
 
 export interface ProvisionNodeResult {

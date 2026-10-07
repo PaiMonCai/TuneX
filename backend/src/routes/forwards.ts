@@ -64,7 +64,7 @@ import {
   readLatencySeries,
 } from "../services/latency-history.ts";
 import type { LatencyGranularity } from "../services/latency-history.ts";
-import { parseForwardBatchRequest } from "../services/forward-batch.ts";
+import { forwardBatchDeleteEnabled, parseForwardBatchRequest } from "../services/forward-batch.ts";
 import { BILLING_TIME_ZONE, billingDayKeyStamp, billingDayStart } from "../services/billing-time.ts";
 import { dayKeyOf, fillDays } from "../services/traffic.ts";
 import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
@@ -86,6 +86,11 @@ forwardsRoutes.use("*", async (c, next) => {
   if (method === "DELETE") action = "delete";
   else if (method === "POST" && /\/api\/forwards\/?$/.test(path)) {
     action = "create";
+  } else if (method === "POST" && /\/batch\/?$/.test(path)) {
+    // Hono caches json(): this does not consume the handler's request body.
+    const parsed = parseForwardBatchRequest(await c.req.json().catch(() => null));
+    if ("message" in parsed) return c.json({ error: parsed.message, code: "invalid_input" }, 400);
+    action = parsed.action === "delete" ? "delete" : "update";
   } else if (method === "POST" && /\/diagnose\/?$/.test(path)) {
     // : the probe is read-only (no desired-state change, no revision
     // bump). Requiring forward:update would tell a read-only role "you may not
@@ -1364,15 +1369,16 @@ forwardsRoutes.get("/:id/latency", async (c) => {
 });
 
 /**
- *  §13.6：批量 retry / suspend / resume。
+ * Batch retry / suspend / resume / confirmed delete.
  *
- * 为什么是独立路径 `/batch` 而不是给 `POST /api/forwards/:id/:action` 加数组形态：
- * 单条与批量的**错误语义不同**——单条失败整请求失败（4xx/5xx），批量失败是
- * 逐条结果 + 200。把两种语义塞进一个端点会让客户端无法判断该看 `error` 还是
- * `results`。路由注册在 `/:id/:action` **之前**，否则 `:id` 会吃掉 "batch"。
- *
- * 限流：见 rate-limit.ts 的 `forward-batch` 规则（必须在 `api-global` 之前命中）。
+ * Delete is runtime-opt-in and keeps the existing single-delete lifecycle per
+ * resource. Results are isolated per id and the route stays sequential.
  */
+// Runtime discovery avoids a frontend build-time flag hiding an enabled API.
+forwardsRoutes.get("/batch/capabilities", (c) => c.json({
+  data: { delete_enabled: forwardBatchDeleteEnabled(), stage: "experimental" },
+}));
+
 forwardsRoutes.post("/batch", async (c) => {
   const parsed = parseForwardBatchRequest(
     await c.req.json().catch(() => null),
@@ -1380,12 +1386,18 @@ forwardsRoutes.post("/batch", async (c) => {
   if ("message" in parsed) {
     return c.json({ error: parsed.message, code: "invalid_input" }, 400);
   }
+  if (parsed.action === "delete" && !forwardBatchDeleteEnabled()) {
+    return c.json({ error: "批量删除尚未启用", code: "feature_disabled" }, 409);
+  }
   const payload = await runForwardBatch(
     parsed.ids,
     parsed.action,
     workspace(c).id,
     (row: { user_id: number }) => canWorkspaceResourceAction(
-      workspace(c), "update", "forward", row.user_id === user(c).id,
+      workspace(c),
+      parsed.action === "delete" ? "delete" : "update",
+      "forward",
+      row.user_id === user(c).id,
     ),
   );
   return c.json({ data: payload });

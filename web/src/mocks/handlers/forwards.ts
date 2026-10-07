@@ -133,6 +133,10 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
   const { method, clean, seg, q, db, user, req, scopeId } = ctx;
   if (seg[0] === "forwards") {
     const id = parseId(seg[1]);
+    if (method === "GET" && seg[1] === "batch" && seg[2] === "capabilities") {
+      return ok({ delete_enabled: process.env.NEXT_PUBLIC_MOCK_FORWARD_BATCH_DELETE_ENABLED === "true", stage: "experimental" });
+    }
+
 
     /**
      * V4-WP11C：POST /api/forwards/:id/diagnose（mock）。
@@ -269,24 +273,27 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
     }
 
     /**
-     * V4-WP9 §13.6：批量 retry / suspend / resume。
-     *
-     * 与后端同一契约：动作白名单（不含 delete）、ids 去重、单次上限 50、
-     * 逐条结果 + 200（部分失败不改整体状态码）。**必须**在单条 POST 分支之前
-     * 判定，否则 "batch" 会被当成 id 走进单条分支。
+     * Batch retry / suspend / resume / confirmed delete.
+     * Mirrors the real API: default-off destructive capability, explicit
+     * confirmation, safe integer IDs, per-item own-scope authorization and
+     * partial-success results.
      */
     if (method === "POST" && seg[1] === "batch") {
       const body = asRecord(req.body);
       const rawAction = reqStr(body.action);
-      if (
-        !(FORWARD_BATCH_ACTIONS as readonly string[]).includes(rawAction)
-      ) {
+      if (!(FORWARD_BATCH_ACTIONS as readonly string[]).includes(rawAction)) {
         return badRequest("不支持的批量动作");
       }
       const batchAction = rawAction as MockForwardBatchAction;
+      if (batchAction === "delete" && body.confirm_delete !== true) {
+        return badRequest("批量删除必须显式确认（confirm_delete: true）");
+      }
+      if (batchAction === "delete" && process.env.NEXT_PUBLIC_MOCK_FORWARD_BATCH_DELETE_ENABLED !== "true") {
+        return fail(409, "批量删除尚未启用", "feature_disabled");
+      }
       if (!Array.isArray(body.ids)) return badRequest("ids 必须是数组");
       for (const raw of body.ids) {
-        if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+        if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 1) {
           return badRequest("ids 只能包含正整数");
         }
       }
@@ -300,32 +307,36 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
       for (const batchId of batchIds) {
         const row = db.tunnels.find((tunnel) => tunnel.id === batchId);
         if (!row) {
-          results.push({
-            id: batchId,
-            ok: false,
-            apply_status: null,
-            code: "not_found",
-            message: "端口转发不存在",
-          });
+          results.push({ id: batchId, ok: false, apply_status: null, code: "not_found", message: "端口转发不存在" });
           continue;
         }
+        const membership = db.workspaceMembers.find((m) =>
+          m.workspace_id === scopeId && m.user_id === user.id && m.active
+        );
+        const grants = membership ? mockEffectivePermissions(db, membership) : null;
+        if (!grants || (grants.forward_mutations === "own" && row.user_id !== user.id)) {
+          results.push({ id: batchId, ok: false, apply_status: null, code: "forbidden", message: "无权操作该端口转发" });
+          continue;
+        }
+
+        if (batchAction === "delete") {
+          // Mock store has no Agent runtime; production still delegates each id
+          // to deleteForward(). Keep only the observable CRUD result here.
+          db.tunnels.splice(db.tunnels.indexOf(row), 1);
+          results.push({ id: batchId, ok: true, apply_status: null });
+          continue;
+        }
+
         const outcome = tunnelRuntimeAction(db, row, batchAction);
         if (outcome.status >= 400) {
           const bodyOf = outcome.body as { message?: string; code?: string };
           results.push({
-            id: batchId,
-            ok: false,
-            apply_status: mockForwardView(db, row).apply_status,
-            code: bodyOf.code ?? "invalid_state",
-            message: bodyOf.message ?? "动作被拒绝",
+            id: batchId, ok: false, apply_status: mockForwardView(db, row).apply_status,
+            code: bodyOf.code ?? "invalid_state", message: bodyOf.message ?? "动作被拒绝",
           });
           continue;
         }
-        results.push({
-          id: batchId,
-          ok: true,
-          apply_status: mockForwardView(db, row).apply_status,
-        });
+        results.push({ id: batchId, ok: true, apply_status: mockForwardView(db, row).apply_status });
       }
       const succeeded = results.filter((row) => row.ok).length;
       return ok({
