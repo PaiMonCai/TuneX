@@ -10,7 +10,7 @@ import { OptionSelect } from "@/components/ui/option-select";
 import { AdminToolbar, ConfirmDeleteDialog, FormDialog, RowActions, useForm } from "@/components/admin/admin-ui";
 import { api } from "@/lib/api";
 import { useI18n } from "@/components/providers";
-import { BYPASS_TYPE_OPTIONS, LOAD_BALANCE_TYPES, NODE_TYPE_OPTIONS, TUNNEL_TYPES } from "@/lib/constants";
+import { BYPASS_TYPE_OPTIONS, LOAD_BALANCE_TYPES, TUNNEL_TYPES } from "@/lib/constants";
 import { parseStringList, strOf, toNumOrNull } from "@/lib/utils";
 import type { NodeGroup, NodeGroupInput, Paginated } from "@/lib/types";
 
@@ -31,6 +31,11 @@ interface GroupForm {
   need_out_node_group: boolean;
   order_by: string;
 }
+
+const NODE_POOL_PURPOSE_OPTIONS = [
+  { value: "in", labelKey: "admin.nodePoolPurposeIngress", zh: "入口用途", en: "Ingress purpose" },
+  { value: "out", labelKey: "admin.nodePoolPurposeEgress", zh: "出口用途", en: "Egress purpose" },
+];
 
 const EMPTY: GroupForm = {
   name: "",
@@ -185,10 +190,9 @@ export function AdminNodeGroupsManager({ initialData }: { initialData: Paginated
             <TableRow>
               <TableHead>ID</TableHead>
               <TableHead>{t("common.name")}</TableHead>
-              <TableHead>{t("fields.token")}</TableHead>
-              <TableHead>{t("fields.nodeType")}</TableHead>
-              <TableHead>{t("fields.loadBalanceType")}</TableHead>
-              <TableHead>{t("fields.trafficRate")}</TableHead>
+              <TableHead>{t("admin.nodePoolPurpose")}</TableHead>
+              <TableHead>{t("admin.nodePoolNodes")}</TableHead>
+              <TableHead>{t("admin.nodePoolSchedule")}</TableHead>
               <TableHead>{t("fields.portRange")}</TableHead>
               <TableHead className="text-right">{t("common.actions")}</TableHead>
             </TableRow>
@@ -196,25 +200,29 @@ export function AdminNodeGroupsManager({ initialData }: { initialData: Paginated
           <TableBody>
             {loading && data.data.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={8} className="h-24 text-center text-[var(--muted-foreground)]">
+                <TableCell colSpan={7} className="h-24 text-center text-[var(--muted-foreground)]">
                   {t("common.loading")}
                 </TableCell>
               </TableRow>
             ) : data.data.length === 0 ? (
-              <TableEmpty colSpan={8} text={t("common.noData")} />
+              <TableEmpty colSpan={7} text={t("common.noData")} />
             ) : (
               data.data.map((g) => (
                 <TableRow key={g.id}>
                   <TableCell className="font-mono text-xs">{g.id}</TableCell>
                   <TableCell className="font-medium">{g.name}</TableCell>
-                  <TableCell className="font-mono text-xs text-[var(--muted-foreground)]">{g.token}</TableCell>
                   <TableCell>
                     <Badge variant="outline">
-                      {g.node_type === "in" ? t("fields.in") : t("fields.out")}
+                      {g.node_type === "in" ? t("admin.nodePoolPurposeIngress") : t("admin.nodePoolPurposeEgress")}
                     </Badge>
                   </TableCell>
+                  <TableCell className="text-xs">
+                    {t("admin.nodePoolNodeStats", {
+                      online: g.online_node_count ?? 0,
+                      total: g.node_count ?? 0,
+                    })}
+                  </TableCell>
                   <TableCell className="text-xs">{g.load_balance_type}</TableCell>
-                  <TableCell className="text-xs">{g.traffic_rate}</TableCell>
                   <TableCell className="font-mono text-xs">{g.port_range ?? "-"}</TableCell>
                   <TableCell>
                     <RowActions onEdit={() => openEdit(g)} onDelete={() => setDeleteTarget(g)} />
@@ -239,95 +247,118 @@ export function AdminNodeGroupsManager({ initialData }: { initialData: Paginated
         pending={pending}
         wide
       >
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label={t("common.name")}>
-            <Input value={form.name} onChange={(e) => set("name", e.target.value)} required data-testid="ng-name" />
-          </Field>
-          <Field label={t("fields.token")} hint={t("common.optional")}>
-            <Input
-              value={form.token}
-              onChange={(e) => set("token", e.target.value)}
-              placeholder="ng_in_hk_01"
-            />
-          </Field>
-          <Field label={t("fields.nodeType")}>
-            <OptionSelect
-              value={form.node_type}
-              onValueChange={(v) => set("node_type", v as NodeGroup["node_type"])}
-              options={NODE_TYPE_OPTIONS}
-              locale={locale}
-            />
-          </Field>
-          <Field label={t("fields.loadBalanceType")}>
-            <OptionSelect
-              value={form.load_balance_type}
-              onValueChange={(v) => set("load_balance_type", v as NodeGroup["load_balance_type"])}
-              options={lbOptions}
-              locale={locale}
-            />
-          </Field>
-          <Field label={t("fields.connectIp")} hint={t("common.optional")}>
-            <Input value={form.connect_ip} onChange={(e) => set("connect_ip", e.target.value)} placeholder="hk1.tunex.example" />
-          </Field>
-          <Field label={t("fields.portRange")} hint="20000-30000">
-            <Input value={form.port_range} onChange={(e) => set("port_range", e.target.value)} placeholder="20000-30000" />
-          </Field>
-          <Field label={t("fields.trafficRate")}>
-            <Input
-              type="number"
-              step="0.1"
-              min={0}
-              value={form.traffic_rate}
-              onChange={(e) => set("traffic_rate", e.target.value)}
-            />
-          </Field>
-          <Field label={t("fields.orderBy")}>
-            <Input type="number" value={form.order_by} onChange={(e) => set("order_by", e.target.value)} />
-          </Field>
-        </div>
+        <div className="flex flex-col gap-4">
+          <section className="rounded-md border border-[var(--border)] p-4" data-testid="node-pool-basic-settings">
+            <div className="mb-3 text-sm font-medium">{t("admin.nodePoolBasicSettings")}</div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label={t("common.name")}>
+                <Input value={form.name} onChange={(e) => set("name", e.target.value)} required data-testid="ng-name" />
+              </Field>
+              <Field label={t("admin.nodePoolPurpose")}>
+                <OptionSelect
+                  value={form.node_type}
+                  onValueChange={(v) => set("node_type", v as NodeGroup["node_type"])}
+                  options={NODE_POOL_PURPOSE_OPTIONS}
+                  locale={locale}
+                />
+              </Field>
+              <Field label={t("fields.portRange")} hint="20000-30000">
+                <Input value={form.port_range} onChange={(e) => set("port_range", e.target.value)} placeholder="20000-30000" />
+              </Field>
+              <Field label={t("admin.nodePoolSchedule")}>
+                <OptionSelect
+                  value={form.load_balance_type}
+                  onValueChange={(v) => set("load_balance_type", v as NodeGroup["load_balance_type"])}
+                  options={lbOptions}
+                  locale={locale}
+                />
+              </Field>
+            </div>
+          </section>
 
-        <Field label={t("common.type")} hint={TUNNEL_TYPES.join(" / ")}>
-          <Input
-            value={form.allow_tunnel_types}
-            onChange={(e) => set("allow_tunnel_types", e.target.value)}
-            placeholder="tcp, udp, tls"
-          />
-        </Field>
+          <details className="rounded-md border border-[var(--border)] p-4" data-testid="node-pool-advanced-settings">
+            <summary className="cursor-pointer text-sm font-medium">{t("admin.nodePoolAdvancedSettings")}</summary>
+            <p className="mt-2 text-xs text-[var(--muted-foreground)]">{t("admin.nodePoolAdvancedHint")}</p>
 
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Bypass" hint={BYPASS_TYPE_OPTIONS.map((o) => o.value).join(" / ")}>
-            <OptionSelect
-              value={form.bypass_type}
-              onValueChange={(v) => set("bypass_type", v as NodeGroup["bypass_type"])}
-              options={BYPASS_TYPE_OPTIONS}
-              locale={locale}
-            />
-          </Field>
-          <Field label="Bypass list" hint="80, 443, 8080">
-            <Input value={form.bypass_list} onChange={(e) => set("bypass_list", e.target.value)} />
-          </Field>
-        </div>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <Field label={t("fields.token")} hint={t("admin.nodePoolTokenHint")}>
+                <Input
+                  type="password"
+                  value={form.token}
+                  onChange={(e) => set("token", e.target.value)}
+                  placeholder={editing ? undefined : t("common.optional")}
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label={t("fields.connectIp")} hint={t("admin.nodePoolConnectIpHint")}>
+                <Input value={form.connect_ip} onChange={(e) => set("connect_ip", e.target.value)} placeholder="hk1.tunex.example" />
+              </Field>
+              <Field label={t("admin.nodePoolTrafficRate")} hint={t("admin.nodePoolTrafficRateHint")}>
+                <Input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  value={form.traffic_rate}
+                  onChange={(e) => set("traffic_rate", e.target.value)}
+                />
+              </Field>
+              <Field label={t("fields.orderBy")}>
+                <Input type="number" value={form.order_by} onChange={(e) => set("order_by", e.target.value)} />
+              </Field>
+            </div>
 
-        <Field label="Allow listen protocols" hint="tcp, udp">
-          <Input
-            value={form.allow_listen_protocols}
-            onChange={(e) => set("allow_listen_protocols", e.target.value)}
-            placeholder="tcp, udp"
-          />
-        </Field>
+            <div className="mt-4">
+              <Field label={t("admin.nodePoolAllowedTunnelTypes")} hint={TUNNEL_TYPES.join(" / ")}>
+                <Input
+                  value={form.allow_tunnel_types}
+                  onChange={(e) => set("allow_tunnel_types", e.target.value)}
+                  placeholder="tcp, udp, tls"
+                />
+              </Field>
+            </div>
 
-        <div className="grid gap-2 sm:grid-cols-2">
-          <ToggleRow
-            label="Allow listen protocol"
-            checked={form.allow_listen_protocol}
-            onCheckedChange={(v) => set("allow_listen_protocol", v)}
-          />
-          <ToggleRow label="Admission" checked={form.admission} onCheckedChange={(v) => set("admission", v)} />
-          <ToggleRow
-            label={t("tunnel.outNodeGroup")}
-            checked={form.need_out_node_group}
-            onCheckedChange={(v) => set("need_out_node_group", v)}
-          />
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <Field label={t("admin.nodePoolBypassMode")} hint={BYPASS_TYPE_OPTIONS.map((o) => o.value).join(" / ")}>
+                <OptionSelect
+                  value={form.bypass_type}
+                  onValueChange={(v) => set("bypass_type", v as NodeGroup["bypass_type"])}
+                  options={BYPASS_TYPE_OPTIONS}
+                  locale={locale}
+                />
+              </Field>
+              <Field label={t("admin.nodePoolBypassList")} hint="80, 443, 8080">
+                <Input value={form.bypass_list} onChange={(e) => set("bypass_list", e.target.value)} />
+              </Field>
+            </div>
+
+            <div className="mt-4">
+              <Field label={t("admin.nodePoolListenProtocols")} hint="tcp, udp">
+                <Input
+                  value={form.allow_listen_protocols}
+                  onChange={(e) => set("allow_listen_protocols", e.target.value)}
+                  placeholder="tcp, udp"
+                />
+              </Field>
+            </div>
+
+            <div className="mt-4 grid gap-2 sm:grid-cols-2">
+              <ToggleRow
+                label={t("admin.nodePoolLimitListenProtocols")}
+                checked={form.allow_listen_protocol}
+                onCheckedChange={(v) => set("allow_listen_protocol", v)}
+              />
+              <ToggleRow
+                label={t("admin.nodePoolAdmission")}
+                checked={form.admission}
+                onCheckedChange={(v) => set("admission", v)}
+              />
+              <ToggleRow
+                label={t("admin.nodePoolNeedOutPool")}
+                checked={form.need_out_node_group}
+                onCheckedChange={(v) => set("need_out_node_group", v)}
+              />
+            </div>
+          </details>
         </div>
       </FormDialog>
 
