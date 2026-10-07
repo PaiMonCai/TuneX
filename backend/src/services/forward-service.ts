@@ -72,6 +72,11 @@ import {
   missingHopAddresses,
   type HopAddressCandidate,
 } from "./node-address.ts";
+import {
+  ensureForwardPathRelations,
+  requiredForwardPathRelations,
+  type ForwardPathRelation,
+} from "./forward-path-setup.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import { billingDayKeyStamp } from "./billing-time.ts";
 import { dayKeyOf, fillDays } from "./traffic.ts";
@@ -99,8 +104,8 @@ export interface ForwardCreateInput {
   ingress_node_id: number;
   egress_node_id?: number | null;
   /**
-   * V5.4：三跳路由的中间跳（省略 = 单跳）。给了它就意味着入口 → 中间 → 出口，
-   * 且相邻两段都必须已有 NodeBinding（校验在创建/更新路径上统一做）。
+   * V5.4：三跳路由的中间跳（省略 = 单跳）。给了它就意味着入口 → 中间 → 出口。
+   * 创建 Forward 时缺失的本地路径关系可以在节点管理权限允许时原子补齐。
    */
   middle_node_id?: number | null;
   listen_port?: number | null;
@@ -114,6 +119,14 @@ export interface ForwardCreateInput {
    * `validateForwardCandidate` 的互斥判定）。
    */
   federated_egress_peer?: string | null;
+}
+
+export interface ForwardCreateOptions {
+  /**
+   * Missing local NodeBinding rows may be prepared as part of Forward creation
+   * only when the caller already has node-management permission.
+   */
+  canManageNodes?: boolean;
 }
 
 export interface ForwardListInput {
@@ -671,6 +684,7 @@ export async function createForward(
   userId: number,
   workspaceId: number,
   input: ForwardCreateInput,
+  options: ForwardCreateOptions = {},
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const protocol = normalizeForwardProtocol(input.protocol);
   if (protocol === null) {
