@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeftRight, Link2, Plus, RefreshCw, RotateCw, Server, Trash2 } from "lucide-react";
+import { ArrowLeftRight, ArrowRight, Plus, RefreshCw, RotateCw, Route, Server, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { nodeGroupApiErrorInfo } from "@/lib/api/nodeGroups";
 import { NodeDiagnostics } from "@/components/nodes/node-diagnostics";
 import { NodeUpgradeCard } from "@/components/nodes/node-upgrade-card";
 import { LookingGlassPanel } from "@/components/nodes/looking-glass-panel";
+import { bindingUsageView, hasBindingUsage } from "@/components/forwards/forward-binding-usage";
 import { NodeGroupCreateDialog } from "@/components/nodes/node-group-create-dialog";
 import {
   NodeCreationConfirm,
@@ -58,10 +59,16 @@ import {
 } from "@/lib/node-onboarding";
 
 function roleLabel(role: NodeRole | null | undefined, t: (key: string) => string) {
-  if (role === "ingress") return t("node.ingress");
-  if (role === "egress") return t("node.egress");
-  if (role === "both") return t("node.both");
+  if (role === "ingress") return t("node.ingressNodeRole");
+  if (role === "egress") return t("node.egressNodeRole");
+  if (role === "both") return t("node.bothNodeRole");
   return "—";
+}
+
+function roleHintKey(role: NodeRole): string {
+  if (role === "ingress") return "node.ingressRoleHint";
+  if (role === "egress") return "node.egressRoleHint";
+  return "node.bothRoleHint";
 }
 
 function isIngress(node: UserNode) {
@@ -832,35 +839,60 @@ export function NodeWorkspace() {
                   onClick={() => setBindOpen(true)}
                   title={canManage ? undefined : PERMISSION_DENIED}
                 >
-                  <Link2 className="size-3.5" />
+                  <Route className="size-3.5" />
                   {t("node.bindEgress")}
                 </Button>
               </div>
             </div>
           </CardHeader>
           <CardContent className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-            {bindings.map((binding) => (
-              <div
-                key={String(binding.id)}
-                className="flex items-center justify-between gap-2 rounded-md border border-[var(--border)] p-3"
-              >
-                <div>
-                  <div className="text-sm font-medium">{binding.egress_node.node_id}</div>
-                  <div className="text-xs text-[var(--muted-foreground)]">
-                    {binding.egress_node.connect_ip ?? t("node.waiting")}
-                  </div>
-                </div>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  onClick={() => void unbindEgress(Number(binding.egress_node_id))}
-                  disabled={busy}
-                  aria-label={t("common.delete")}
+            {bindings.map((binding) => {
+              const usage = bindingUsageView(binding);
+              return (
+                <div
+                  key={String(binding.id)}
+                  data-testid="node-path-relation"
+                  className="flex items-start justify-between gap-3 rounded-md border border-[var(--border)] p-3"
                 >
-                  <Trash2 className="size-4" />
-                </Button>
-              </div>
-            ))}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center gap-2 text-sm">
+                      <span className="truncate font-medium">{selectedIngress.node_id}</span>
+                      <ArrowRight className="size-3.5 shrink-0 text-[var(--muted-foreground)]" />
+                      <span className="truncate font-medium">{binding.egress_node.node_id}</span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-[var(--muted-foreground)]">
+                      <span>{t("node.pathSource")} → {t("node.nextHop")}</span>
+                      <span>·</span>
+                      <span>{binding.egress_node.connect_ip ?? t("node.waiting")}</span>
+                    </div>
+                    {hasBindingUsage(binding) ? (
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <Badge variant={usage.blocked ? "default" : "outline"}>
+                          {usage.blocked
+                            ? t("node.pathRelationUsed", { count: usage.used_by_forward_count })
+                            : t("node.pathRelationUnused")}
+                        </Badge>
+                        {usage.blocked ? (
+                          <span className="text-xs text-[var(--muted-foreground)]">
+                            {t("node.pathRelationInUseHint")}
+                          </span>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => void unbindEgress(Number(binding.egress_node_id))}
+                    disabled={busy || usage.blocked}
+                    aria-label={t("node.removePathRelation")}
+                    title={usage.blocked ? t("node.pathRelationInUseHint") : t("node.removePathRelation")}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </div>
+              );
+            })}
             {bindings.length === 0 ? (
               <p className="py-6 text-center text-sm text-[var(--muted-foreground)] md:col-span-2 xl:col-span-3">
                 {t("node.noBindings")}
@@ -964,10 +996,12 @@ export function NodeWorkspace() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t("node.bindEgress")}</DialogTitle>
-            <DialogDescription>{selectedIngress?.node_id ?? ""}</DialogDescription>
+            <DialogDescription>
+              {selectedIngress?.node_id ?? ""} · {t("node.pathRelationDialogHint")}
+            </DialogDescription>
           </DialogHeader>
           <Select value={bindEgressId} onValueChange={setBindEgressId}>
-            <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
+            <SelectTrigger><SelectValue placeholder={t("node.chooseNextHop")} /></SelectTrigger>
             <SelectContent>
               {availableEgress.map((node) => (
                 <SelectItem key={String(node.id)} value={String(node.id)}>
@@ -977,11 +1011,11 @@ export function NodeWorkspace() {
             </SelectContent>
           </Select>
           {availableEgress.length === 0 ? (
-            <p className="text-sm text-[var(--muted-foreground)]">{t("node.noBindings")}</p>
+            <p className="text-sm text-[var(--muted-foreground)]">{t("node.noMoreNextHops")}</p>
           ) : null}
           <DialogFooter>
             <Button variant="outline" onClick={() => setBindOpen(false)}>{t("common.cancel")}</Button>
-            <Button onClick={() => void bindEgress()} disabled={busy || !bindEgressId}>{t("common.confirm")}</Button>
+            <Button onClick={() => void bindEgress()} disabled={busy || !bindEgressId}>{t("node.addPathRelation")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1092,11 +1126,14 @@ export function NodeCreateDialogBody({
           <Select value={nodeRole} onValueChange={(value) => onRoleChange(value as NodeRole)}>
             <SelectTrigger><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="ingress">{t("node.ingress")}</SelectItem>
-              <SelectItem value="egress">{t("node.egress")}</SelectItem>
-              <SelectItem value="both">{t("node.both")}</SelectItem>
+              <SelectItem value="ingress">{t("node.ingressNodeRole")}</SelectItem>
+              <SelectItem value="egress">{t("node.egressNodeRole")}</SelectItem>
+              <SelectItem value="both">{t("node.bothNodeRole")}</SelectItem>
             </SelectContent>
           </Select>
+          <p className="text-xs text-[var(--muted-foreground)]" data-testid="node-role-hint">
+            {t(roleHintKey(nodeRole))}
+          </p>
         </Field>
         <NodeGroupPrerequisite
           state={groupState}

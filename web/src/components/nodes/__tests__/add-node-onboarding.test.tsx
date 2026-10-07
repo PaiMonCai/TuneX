@@ -775,12 +775,13 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
       <NodeGroupPrerequisite state="empty" onRetry={() => undefined} onCreateGroup={() => undefined} />,
     );
     expect(html).toContain('data-testid="node-group-empty"');
-    // 文案说清「默认策略允许、可以在本页直接建」，而不是让人去等一个不需要的管理员。
-    expect(html).toContain("默认策略允许");
-    expect(html).toContain("本页");
+    // 文案说清「这里可以创建入口用途节点池」，而不是暴露 entitlement 名。
+    expect(html).toContain("入口用途");
+    expect(html).toContain("工作空间策略");
+    expect(html).not.toContain("allow_custom_");
     // 真的入口：按钮存在且可点（提交走用户域 API，entitlement 由后端裁决）。
     expect(html).toContain('data-testid="node-group-create-entry"');
-    expect(html).toContain("创建入口节点组");
+    expect(html).toContain("创建节点池");
     // 空不是失败：给的是说明与动作，而不是重试噪音。
     expect(html).not.toContain('data-testid="node-groups-retry"');
     // 不伪造页面跳转：这里是原地打开最小表单的按钮，没有 <a> 链接。
@@ -796,8 +797,8 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
   test("加载失败：以 alert 呈现失败，并给可点击的重试（不是把按钮永久锁死）", () => {
     const html = render(<NodeGroupPrerequisite state="error" onRetry={() => undefined} />);
     expect(html).toContain('role="alert"');
-    expect(html).toContain("节点组加载失败");
-    expect(html).toContain("重新加载节点组");
+    expect(html).toContain("节点池加载失败");
+    expect(html).toContain("重新加载节点池");
   });
 
   test("就绪时什么都不渲染", () => {
@@ -825,7 +826,7 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
     // 可管理但组还没就绪：首帧给「正在加载节点组」，不闪「无组」。
     const managerHtml = renderPage();
     expect(managerHtml).toContain('data-testid="node-create-disabled-reason"');
-    expect(managerHtml).toContain("正在加载节点组");
+    expect(managerHtml).toContain("正在加载节点池");
   });
 
   test("persona：只读用户不会被前置条件打扰（也不被当成管理员）", () => {
@@ -839,8 +840,9 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
     const html = renderPage({ canManage: false, can: (key) => key === "node:read" });
     expect(html).toContain('data-testid="node-readonly-empty-title"');
     expect(html).toContain('data-testid="node-readonly-empty-hint"');
-    expect(html).toContain("node:manage");
+    expect(html).toContain("节点管理权限");
     expect(html).toContain("工作空间管理员");
+    expect(html).not.toContain("node:manage");
     // 不给创建入口，也不显示前置条件。
     expect(isDisabled(buttonWith(html, "创建节点"))).toBe(true);
     expect(html).not.toContain('data-testid="node-group-empty"');
@@ -851,8 +853,10 @@ describe("节点页：无组/只读/失败都先给真话，而不是让用户�
     const html = render(<NodeReadonlyEmptyState />);
     expect(html).toContain('data-testid="node-readonly-empty-title"');
     expect(html).toContain('data-testid="node-readonly-empty-hint"');
-    expect(zh.node.readonlyEmptyHint).toContain("node:manage");
-    expect(en.node.readonlyEmptyHint).toContain("node:manage");
+    expect(zh.node.readonlyEmptyHint).toContain("节点管理权限");
+    expect(en.node.readonlyEmptyHint).toContain("node-management permission");
+    expect(zh.node.readonlyEmptyHint).not.toContain("node:manage");
+    expect(en.node.readonlyEmptyHint).not.toContain("node:manage");
     const enHtml = render(<NodeReadonlyEmptyState />, "en");
     expect(enHtml).toContain(en.node.readonlyEmptyTitle);
   });

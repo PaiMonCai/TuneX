@@ -64,14 +64,14 @@ export async function AdminResourceList({ segment }: { segment: AdminSegment }) 
   }
 
   if (segment === "node-groups") {
-    const load = await loadAdminResource<Paginated<NodeGroup>>("节点组列表", api.admin.nodeGroups(q, cookie));
+    const load = await loadAdminResource<Paginated<NodeGroup>>("节点池列表", api.admin.nodeGroups(q, cookie));
     return load.ok ? <AdminNodeGroupsManager initialData={load.data} /> : unavailable(load.failure);
   }
 
   if (segment === "nodes") {
     const [nodes, groups] = await Promise.all([
       loadAdminResource<Paginated<Node>>("节点列表", api.admin.nodes(q, cookie)),
-      loadAdminResource<Paginated<NodeGroup>>("节点组列表（节点归属选择用）", api.admin.nodeGroups({ page: 1, page_size: 100 }, cookie)),
+      loadAdminResource<Paginated<NodeGroup>>("节点池列表（节点归属选择用）", api.admin.nodeGroups({ page: 1, page_size: 100 }, cookie)),
     ]);
     if (!nodes.ok) return unavailable(nodes.failure);
     if (!groups.ok) return unavailable(groups.failure);
