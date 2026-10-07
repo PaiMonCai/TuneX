@@ -193,15 +193,15 @@ describe("RELAY：入口 → 出口 → 目标", () => {
   });
 });
 
-describe("绑定三态：取不到 ≠ 没有可用出口", () => {
+describe("出口关系三态：取不到 ≠ 没有可用出口", () => {
   const noneModel = () => model({ mode: "relay", draft: { egressId: "" }, candidates: 3 });
   const unavailableModel = () => model({ mode: "relay", draft: { egressId: "" }, facts: null });
 
-  test("确实没有绑定 ⇒ 独立 testid + 下一步（含候选数量）", () => {
+  test("确实没有可用出口 ⇒ 独立 testid + 下一步（含候选数量）", () => {
     const html = render(noneModel());
     const text = visibleText(html);
     expect(html).toContain('data-testid="forward-path-bindings-none"');
-    expect(text).toContain("没有已绑定的出口");
+    expect(text).toContain("还没有可用出口");
     expect(text).toContain("3 台候选出口");
     expect(html).not.toContain('data-testid="forward-path-bindings-unavailable"');
   });
@@ -220,8 +220,8 @@ describe("绑定三态：取不到 ≠ 没有可用出口", () => {
      */
     const withoutNegation = text.replace(/这不等于「没有可用出口」/g, "").replace(/这不等于/g, "");
     expect(withoutNegation).not.toContain("没有可用出口");
-    // 也不许退化成"确实没有绑定"那句话（那是另一态）。
-    expect(text).not.toContain("没有已绑定的出口");
+    // 也不许退化成"确实没有可用出口"那句话（那是另一态）。
+    expect(text).not.toContain("还没有可用出口");
     expect(html).not.toContain('data-testid="forward-path-bindings-none"');
   });
 
@@ -231,7 +231,7 @@ describe("绑定三态：取不到 ≠ 没有可用出口", () => {
     expect(unavailableText).not.toBe(noneText);
   });
 
-  test("有绑定 ⇒ 第三态，也不出现「取不到」", () => {
+  test("有可用出口 ⇒ 第三态，也不出现「取不到」", () => {
     const html = render(
       model({
         mode: "relay",
@@ -242,7 +242,7 @@ describe("绑定三态：取不到 ≠ 没有可用出口", () => {
     );
     const text = visibleText(html);
     expect(html).toContain('data-testid="forward-path-bindings-bound"');
-    expect(text).toContain("已绑定");
+    expect(text).toContain("已有 1 台可用出口");
     expect(text).not.toContain("取不到");
   });
 
@@ -261,8 +261,8 @@ describe("绑定三态：取不到 ≠ 没有可用出口", () => {
     const text = visibleText(html);
     expect(html).toContain('data-testid="forward-path-bindings-unavailable"');
     expect(html).not.toContain('data-testid="forward-path-bindings-bound"');
-    // "有绑定"的那句话专属 bound 态；relayNote 里的"必须已绑定"是前置说明，不算。
-    expect(text).not.toContain("可以从中选择");
+    // “已有可用出口”只属于 bound 态；旧作用域事实不能把它渲染出来。
+    expect(text).not.toContain("可以直接选择");
   });
 });
 
