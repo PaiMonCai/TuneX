@@ -5,7 +5,7 @@ import { isIP } from "node:net";
 // consecutive failure/recovery windows. UDP silence is never a failed probe.
 const target = z.object({
   host: z.string().trim().min(1).max(255).refine((h) => !/[\s/\\\x00-\x1f\x7f\[\]]/.test(h)
-    && (!h.includes(":") || isIP(h) !== 0)),
+    && Buffer.byteLength(h, "utf8") <= 255 && (!h.includes(":") || (!h.includes("%") && isIP(h) !== 0))),
   port: z.number().int().min(1).max(65_535),
 }).strict();
 export const LinkTargetSetSchema = z.object({

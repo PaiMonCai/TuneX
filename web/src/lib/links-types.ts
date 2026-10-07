@@ -88,7 +88,7 @@ const nullableNumber = (value: unknown) => value == null ? null : number(value);
 const nullableText = (value: unknown) => value == null ? null : text(value);
 /** Host and port are separate. The browser's IPv6 URL parser validates raw colon-containing IPs. */
 export function isLinkTargetHost(host: string): boolean {
-  if (!host || host.length > 255 || /[\s/\\\x00-\x1f\x7f\[\]]/.test(host)) return false;
+  if (!host || new TextEncoder().encode(host).length > 255 || /[\s/\\\x00-\x1f\x7f\[\]]/.test(host)) return false;
   if (!host.includes(":")) return true;
   try { return new URL(`http://[${host}]/`).hostname.startsWith("["); }
   catch { return false; }

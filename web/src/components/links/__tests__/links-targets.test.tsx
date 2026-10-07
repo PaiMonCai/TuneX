@@ -78,7 +78,7 @@ describe("F2 target set closed bounded contract", () => {
     for (const probe of ["udp", "TCP", false, null]) expect(() => projectLinkTargetSet({ ...targetSet(), probe })).toThrow(LinksPayloadError);
   });
   test("addresses, ports, cardinality and case-insensitive duplicate pairs are checked", () => {
-    for (const host of ["", " ", " x", "a/b", "a b", "a\u0000b", "a\u0001b", "a".repeat(256)]) {
+    for (const host of ["", " ", " x", "a/b", "a b", "a\u0000b", "a\u0001b", "a".repeat(256), "中".repeat(86)]) {
       expect(() => projectLinkTargetSet(targetSet({ targets: [{ host, port: 80 }] }))).toThrow(LinksPayloadError);
     }
     for (const port of [0, 65536, 1.5, "80", null, true, Infinity]) {

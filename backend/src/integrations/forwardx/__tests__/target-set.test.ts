@@ -47,6 +47,8 @@ test("target sets reject duplicate, malformed, oversize, unknown strategy and un
     { targets: [{ host: "bad/host", port: 80 }] }, { targets: [{ host: "ok", port: 0 }] },
     { targets: [{ host: "host\\path", port: 80 }] }, { targets: [{ host: "host:80", port: 80 }] },
     { targets: [{ host: "[::1]", port: 80 }] },
+    { targets: [{ host: "中".repeat(86), port: 80 }] },
+    { targets: [{ host: "fe80::1%eth0", port: 80 }] },
     { failure_seconds: 9 }, { recover_seconds: 3601 }, { strategy: "ip_hash" }, { probe: "udp" }, { version: 2 }, { key: "unused" }]) {
     expect(LinkTargetSetSchema.safeParse({ ...targetSet, ...patch }).success).toBe(false);
   }

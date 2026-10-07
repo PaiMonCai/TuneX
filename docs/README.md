@@ -11,11 +11,13 @@
 
 ## 当前基线
 
-源码基线为 `095089edd7ba2343cacc82aec2707435ad9c3876`，位于 `feat/forward-core-abcd`；[PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 仍是草稿。已完成的 ABCD 与流量切片属于这个分支，不能据此判断已经进入正式发布或当前 `main`。
+开发位于 `feat/forward-core-abcd`；[PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 仍是草稿。F1 候选 `4e50f20` required 全绿；F2 起始候选 `f251951` 及后续修复查看 PR 检查。ABCD、流量和多目标切片属于该分支，不能据此判断已经正式发布或进入当前 `main`。
 
 共享 FXP 连接、TCP/UDP/both、运行限额、规则隔离热更新和持久流量接收已实现并通过候选提交 CI。FXP 开关仍默认关闭，公共支持矩阵仍为 planned；[测试说明](testing.md) 列出已验证与待验证范围。
 
-F1 当前已接入同进程统计分段与安全回收、持久准备恢复，以及页面统计积压/受阻观测。新候选的门禁与长期运行证据单独核验，先前基线绿色结果不替代 F1 验收。
+F1 已接入同进程统计分段与安全回收、持久准备恢复及页面观测，四节点候选验收 41 PASS / 0 FAIL；真实跨日/长期证据和数据库归档仍后续核验。
+
+F2 已接入每规则 1–10 个有序业务目标、主备/RR/random、故障/恢复窗口、可信的新鲜目标观测及完整编辑流程。辅助 TCP 探测不证明 UDP 应用健康；UDP 静默保持未知。无探测 TCP 仍有有界半开恢复。对应候选的多节点与数据库验收独立核验，不用 F1 绿色结果替代；实验开关及公开 planned 状态保持不变。接续开发为 F3 可信来源、PROXY 与 IP_HASH。
 
 ForwardX 对标基线为项目 2.3.281、提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。实际导入组件及来源说明见 [third_party/forwardx](../third_party/forwardx/README.md)。本地 `Forwardx/` 是参考源码，不是构建依赖，也不属于本次文档清理范围。
 
