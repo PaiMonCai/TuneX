@@ -39,6 +39,11 @@ type config struct {
 	TargetSet                *managedTargetSet   `json:"targetSet,omitempty"`
 	TargetSets               []managedTargetSet  `json:"targetSets,omitempty"`
 	managedTargetsV1         bool
+	ClientSource             *managedClientSource  `json:"clientSource,omitempty"`
+	ClientSources            []managedClientSource `json:"clientSources,omitempty"`
+	managedSourcesV1         bool
+	sourceGate               *connGate
+	sourceHandshake          chan struct{}
 	Key                      string `json:"key"`
 	LimitIn                  int64  `json:"limitIn"`
 	LimitOut                 int64  `json:"limitOut"`

@@ -34,6 +34,24 @@ Only the current exit placement can supply `observation.target_status`. The clos
 
 The detail shows every zero-based target index, health, shared observation time and reason. Selected indices describe the most recent TCP connection / UDP mapping choice, not all existing sessions. Existing warnings about interruption of shared sessions are retained. Re-reading updates the frontend clock immediately before displaying lease-dependent observations.
 
+## F3 TCP client source policy (frontend slice)
+
+Only shared FXP TCP bindings may opt in to optional `client_source`:
+
+```json
+{"version":1,"receive_proxy":false,"trusted_cidrs":[],"send_proxy":"off"}
+```
+
+The closed response projection keeps only these four fields, clones the trust list, and rejects malformed config, source config on UDP/both, or `ip_hash` without TCP plus an explicit source config. No observed/verified source identity, source health, runtime config or extra source facts enter UI state. The rule details explicitly show **declared desired policy**, socket versus trusted upstream PROXY source, and send off/v1/v2. This is neither observed health nor a claim that targets support PROXY.
+
+New legacy forms leave the field omitted until opt-in. Editing known config round-trips it in full; disabling the source policy submits the explicit all-off object above, never omits it. An explicit all-off config remains eligible for `ip_hash`: socket source is still passed internally when PROXY sending is off. Protocol/listen-scope revision fences remain unchanged on edit. On create, switching away from TCP with source policy or IP hash selected is blocked with a clear error; a new source policy cannot be deselected while IP hash needs it. UDP/both source controls and IP hash are disabled, without affecting their existing target/probe behavior.
+
+Trusted upstreams are at most 32 literal IPv4/IPv6 CIDRs. Mask host bits and canonicalize network text before sending; reject duplicate canonical networks (rather than silently deduplicating), /0, IPv4-mapped IPv6 (including hex spelling), DNS, zones, brackets and malformed prefixes. Receiving requires a nonempty list; receiving off submits an empty list. CIDR inputs are disabled when receiving is off, retaining their draft for re-enabling without sending it. Runtime receive policy requires an upstream socket inside the trust list and a valid PROXY v1/v2 header on every connection, an absolute 5-second deadline, v1 maximum 108 bytes and v2 maximum 536 total bytes. **These wire limits are described, not implemented or verified by this frontend.** Sending requires every destination service to support the selected PROXY version; this is not arbitrary/HTTP header injection or X-Forwarded-For.
+
+IP hash may remap new connections when pool membership or the healthy eligible target set changes; it is not guaranteed fixed session affinity. Target ordering, the first-item projection and existing health/Ready/ACK/traffic separation remain unchanged. Source policy has no live observation fields.
+
+Bilingual errors handle `link_client_source_required`, `agent_fxp_source_capability_missing`, `client_source_tcp_only` and `ip_hash_requires_client_source`, plus current compiler aliases `agent_fxp_client_source_capability_missing` and `link_client_source_tcp_only`. Capability copy requests upgrading both nodes for `forward.client-source.fxp.v1`; the frontend does not invent capability evidence or bypass the API gate. Safe reason codes remain collapsed; raw errors never render. The shared request layer, Workspace scope fence, cookie session, CSRF header and captured revision CAS are unchanged.
+
 ## Verification
 
 Optional ingress `observation.traffic_status` reports collection/backlog/blocked
@@ -45,7 +63,7 @@ From `web/`:
 
 ```powershell
 $env:NEXT_PUBLIC_API_MOCK = "0"
-bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/links/__tests__/links-targets.test.tsx src/components/console/__tests__/console-boundary.test.ts
+bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/links/__tests__/links-targets.test.tsx src/components/links/__tests__/links-client-source.test.tsx src/components/console/__tests__/console-boundary.test.ts
 npm run typecheck -- --incremental false
 ```
 
@@ -74,3 +92,11 @@ Start from a freshly loaded Chinese fixture with management permission. The runn
 Additional target freshness scenarios are `old_checked`, `future_checked` and `initial_unknown`. `probe_none_silent` supplies unknown state without response evidence; `probe_none` supplies healthy passive reply evidence with no active probing. The replay advances only the isolated page clock to test cached health expiry, including passive none health, without a minute-long wait; it restores the clock afterward.
 
 The backend feature defaults off. `fxp_links_not_enabled` is shown as a failed operation, with no success notification. Enabling the server feature and final real multi-node validation belong to the backend/runtime rollout.
+
+F3 browser checks reuse the loopback fixture. Reset disposable fixture state **before loading/reloading the page**, then start with the fresh Chinese management harness and run:
+
+```js
+await (await import('/__test/f3-checks.js')).runF3BrowserChecks()
+```
+
+`sourceError` on `/__test/scenario` can force any of the four public source-policy error codes. The replay covers create/edit, canonical trust failures, empty receive trust, v1/v2/off sending, IP-hash gating, blocked protocol changes, ordered first-target projection, explicit all-off edits, untouched legacy, safe errors, conflict/reopened CAS, read-only and late Workspace mutation fencing. This test-only fixture is not mounted on product routes and is not proof of real Agent/PROXY forwarding. See [F3 verification evidence](./__tests__/EVIDENCE.md#f3-tcp-client-source-frontend-2026-10-08).

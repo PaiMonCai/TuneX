@@ -1,5 +1,5 @@
 /**
- * Real F2 persistence gate. Requires an already migrated, dedicated loopback
+ * Real F2/F3 persistence gate. Requires an already migrated, dedicated loopback
  * *_link_target_sets_test database, TUNEX_DB_TEST=1 and the explicit URL below.
  * Never loads .env, falls back to ambient DATABASE_URL, or applies migrations.
  * Run with node --experimental-transform-types --test tests/link-target-sets.test.mjs.
@@ -49,6 +49,7 @@ if (!enabled) {
     await import("../src/services/forward-revision.ts");
   const { compileFxpLink } = await import("../src/integrations/forwardx/link-compiler.ts");
   const { persistedLinkTargetSet } = await import("../src/integrations/forwardx/target-set.ts");
+  const { persistedLinkClientSource } = await import("../src/integrations/forwardx/client-source.ts");
   const nonce = randomUUID();
   const completeSet = { version: 1,
     targets: [{ host: "primary.example", port: 443 },
@@ -70,7 +71,7 @@ if (!enabled) {
   function revisionInput(row, set, status = "active", expectedRevision = row.config_revision ?? 0) {
     return { tunnelId: row.id, link_resource_id: created.link.id, expectedRevision,
       desiredStatus: status, createdById: created.user.id, resolvedListenIp: row.listen_ip, egressPort: 25000,
-      candidate: { name: row.name, mode: "relay", protocol: "both", link_resource_id: created.link.id,
+      candidate: { name: row.name, mode: "relay", protocol: row.forward_protocol, link_resource_id: created.link.id,
         ingress_node_id: created.nodes[0], egress_node_id: created.nodes[1], listen_port: row.listen_port,
         target_host: row.remote_host, target_port: row.remote_port,
         ...(set === undefined ? {} : { target_set: structuredClone(set) }) } };
@@ -107,7 +108,7 @@ if (!enabled) {
     for (const fact of [row, snapshot]) {
       assert.equal(fact.link_resource_id, created.link.id);
       assert.equal(fact.ingress_node_id, created.nodes[0]);assert.equal(fact.egress_node_id, created.nodes[1]);
-      assert.equal(fact.egress_pool_id, null);assert.equal(fact.forward_protocol ?? fact.protocol, "both");
+      assert.equal(fact.egress_pool_id, null);assert.equal(fact.forward_protocol ?? fact.protocol, row.forward_protocol);
     }
     assert.deepEqual(row.forward_addresses, []);
     const desired = currentDesiredConfig(row);
@@ -117,18 +118,20 @@ if (!enabled) {
   }
   function recoverConfig(id, binding) {
     const endpoint = { workspace_id: created.workspace.id, connect_host: "127.0.0.1",
-      version: "0.0.0-dev", capabilities: ["forward.link.fxp.v1", "forward.targets.fxp.v1"] };
+      version: "0.0.0-dev", capabilities: ["forward.link.fxp.v1", "forward.targets.fxp.v1", "forward.client-source.fxp.v1"] };
     return compileFxpLink({ link_id: created.link.id, workspace_id: created.workspace.id, version: 1, generation: 1,
       ingress: { ...endpoint, id: created.nodes[0] }, egress: { ...endpoint, id: created.nodes[1] },
       carrier_port: 25000, lease_expires_at: "2037-01-01T00:00:00Z", bindings: [{ forward_id: id,
         protocol: binding.protocol, listen_port: binding.listen_port, listen_host: "127.0.0.1",
         target_host: binding.target_host, target_port: binding.target_port,
-        ...(binding.target_set === undefined ? {} : { target_set: binding.target_set }) }] }, "ab".repeat(32));
+        ...(binding.target_set === undefined ? {} : { target_set: binding.target_set }),
+        ...(binding.client_source === undefined ? {} : { client_source: binding.client_source }) }] }, "ab".repeat(32));
   }
   function snapshotBinding(snapshot) {
     return { protocol: snapshot.protocol, listen_port: snapshot.listen_port,
       target_host: snapshot.target_host, target_port: snapshot.target_port,
-      target_set: persistedLinkTargetSet(snapshot.link_target_config) };
+      target_set: persistedLinkTargetSet(snapshot.link_target_config),
+      client_source: persistedLinkClientSource(snapshot.link_source_config) };
   }
 
   test("real F2 revision transactions preserve immutable target sets, projections and recovery", { timeout: 60_000 }, async (t) => {
@@ -187,6 +190,92 @@ if (!enabled) {
       }
     });
 
+
+    await t.test("F3 TCP source canonicalization, immutable snapshots, explicit disable, CAS, rollback and reconnect", async () => {
+      const hashSet = { ...structuredClone(completeSet), strategy: "ip_hash" };
+      const rawSource = { version: 1, receive_proxy: true,
+        trusted_cidrs: ["192.0.2.129/24", "2001:0DB8:1234:5678::1/48"], send_proxy: "v2" };
+      const canonical = { ...rawSource, trusted_cidrs: ["192.0.2.0/24", "2001:db8:1234::/48"] };
+      const disabled = { version: 1, receive_proxy: false, trusted_cidrs: [], send_proxy: "off" };
+      const sourceInput = (row, source, status = "active", expectedRevision = row.config_revision) => {
+        const input = revisionInput(row, hashSet, status, expectedRevision);
+        if (source !== undefined) input.candidate.client_source = structuredClone(source);
+        return input;
+      };
+      const id = await client.$transaction(async (tx) => {
+        const row = await tx.tunnel.create({ data: tunnelData("source", { forward_protocol: "tcp" }) });
+        await createForwardRevision(sourceInput(row, rawSource), tx);
+        return row.id;
+      });
+      created.tunnels.push(id);
+      const sourceFacts = async (expected, status = "active", reader = client, forwardId = id) => {
+        const facts = await assertComplete(forwardId, hashSet, status, reader);
+        assert.deepEqual(facts.row.link_source_config, expected);
+        assert.deepEqual(facts.snapshot.link_source_config, expected);
+        assert.deepEqual(facts.desired.client_source, expected);
+        const compiled = recoverConfig(forwardId, facts.desired);
+        const restored = recoverConfig(forwardId, snapshotBinding(facts.snapshot));
+        assert.deepEqual(compiled, restored);
+        const runtime = { version: 1, receiveProxy: expected.receive_proxy,
+          trustedCIDRs: expected.trusted_cidrs, sendProxy: expected.send_proxy };
+        assert.deepEqual(compiled.ingress.runner_config.entries[0].clientSource, runtime);
+        assert.deepEqual(compiled.egress.runner_config.clientSources, [{ ...runtime, ruleId: forwardId }]);
+        assert.equal(compiled.egress.runner_config.allowedBindings.length, 10);
+        assert.equal(compiled.egress.runner_config.targetSets[0].strategy, "ip_hash");
+        return facts;
+      };
+      const initial = await sourceFacts(canonical);
+      const edit = async (source, status = "active", expectedRevision) => {
+        const row = await client.tunnel.findUniqueOrThrow({ where: { id } });
+        return client.$transaction(tx => createForwardRevision(sourceInput(row, source, status, expectedRevision), tx));
+      };
+      const beforeInvalid = await readFacts(id);
+      for (const invalid of [{...canonical,trusted_cidrs:["192.0.2.1/24","192.0.2.129/24"]},
+        {...canonical,trusted_cidrs:["::ffff:192.0.2.1/104"]}]) {
+        await assert.rejects(() => edit(invalid));
+        assert.deepEqual(await readFacts(id), beforeInvalid);
+      }
+      const changed = { ...canonical, send_proxy: "v1" };
+      await edit(changed); const edited = await sourceFacts(changed);
+      assert.deepEqual(edited.revisions[0], initial.snapshot);
+      assert.notEqual(recoverConfig(id, initial.desired).ingress.config_digest, recoverConfig(id, edited.desired).ingress.config_digest);
+      assert.notEqual(recoverConfig(id, initial.desired).egress.config_digest, recoverConfig(id, edited.desired).egress.config_digest);
+      await edit(undefined, "inactive");await sourceFacts(changed, "inactive");
+      await edit(disabled, "inactive");await sourceFacts(disabled, "inactive");
+      await edit(undefined);const resumed = await sourceFacts(disabled);
+      assert.deepEqual(resumed.revisions[0], initial.snapshot);
+
+      const before = await readFacts(id);
+      await assert.rejects(() => edit(rawSource, "active", 0), e => e.code === "revision_conflict");
+      assert.deepEqual(await readFacts(id), before);
+      await assert.rejects(() => client.$transaction(async tx => {
+        await createForwardRevision(sourceInput(before.row, rawSource), tx);
+        const pending = await sourceFacts(canonical, "active", tx);
+        assert.equal(pending.row.config_revision, before.row.config_revision + 1);
+        throw Error("client_source_transaction_rollback");
+      }), /client_source_transaction_rollback/);
+      assert.deepEqual(await readFacts(id), before);
+
+      const restarted = new PrismaClient(options);
+      try { await sourceFacts(disabled, "active", restarted); } finally { await restarted.$disconnect(); }
+
+      const baselineRow = await client.tunnel.create({ data: tunnelData("source-baseline", {
+        forward_protocol: "tcp", link_target_config: hashSet, link_source_config: canonical,
+        config_revision: 7, applied_revision: 7, desired_revision_id: null, apply_status: "active" }) });
+      created.tunnels.push(baselineRow.id);
+      const desiredBefore = currentDesiredConfig(baselineRow);
+      const baseline = await client.$transaction(tx => ensureForwardBaselineRevision(baselineRow.id, created.user.id, tx));
+      assert.equal(baseline.created, true);assert.equal(baseline.revision, 7);
+      const frozen = await sourceFacts(canonical, "active", client, baselineRow.id);
+      assert.deepEqual(frozen.desired, desiredBefore);
+      assert.equal(frozen.row.applied_revision, 7);assert.equal(frozen.row.config_revision, 7);
+      assert.deepEqual(await client.$transaction(tx => ensureForwardBaselineRevision(baselineRow.id, created.user.id, tx)),
+        { ...baseline, created: false });
+      await client.$transaction(tx => createForwardRevision(sourceInput(frozen.row, disabled), tx));
+      const next = await sourceFacts(disabled, "active", client, baselineRow.id);
+      assert.deepEqual(next.revisions[0], frozen.snapshot);assert.equal(next.row.config_revision, 8);
+    });
+
     await t.test("stale CAS and an aborted transaction leave neither partial config nor orphan snapshots", async () => {
       const id = await createForward("rollback", completeSet);
       const before = await readFacts(id);
@@ -230,11 +319,13 @@ if (!enabled) {
 
     await t.test("legacy SQL NULL and JSON null read as single-target and baseline/write keep compatibility columns", async () => {
       for (const [label, value] of [["sql-null", Prisma.DbNull], ["json-null", Prisma.JsonNull]]) {
-        const row = await client.tunnel.create({ data: tunnelData(label, { link_target_config: value,
+        const row = await client.tunnel.create({ data: tunnelData(label, { link_target_config: value, link_source_config: value,
           config_revision: 3, applied_revision: 3, apply_status: "active" }) });
         created.tunnels.push(row.id);
         assert.equal(persistedLinkTargetSet(row.link_target_config), undefined);
         assert.equal("target_set" in currentDesiredConfig(row), false);
+        assert.equal(persistedLinkClientSource(row.link_source_config), undefined);
+        assert.equal("client_source" in currentDesiredConfig(row), false);
         const baseline = await client.$transaction((tx) => ensureForwardBaselineRevision(row.id, created.user.id, tx));
         assert.equal(baseline.created, true);
         const legacy = await assertComplete(row.id, undefined);
@@ -247,6 +338,9 @@ if (!enabled) {
         assert.equal(config.egress.runner_config.targetSets, undefined);
         assert.equal(config.egress.runner_config.allowedBindings.length, 2);
         assert.equal(config.ingress.runner_config.entries[0].targetSet, undefined);
+        assert.equal(config.ingress.runner_config.entries[0].clientSource, undefined);
+        assert.equal(config.egress.runner_config.clientSources, undefined);
+        assert.equal(suspended.row.link_source_config, null);assert.equal(suspended.snapshot.link_source_config, null);
       }
     });
   });

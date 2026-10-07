@@ -19,6 +19,8 @@ import {
 import { FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS } from "./federation/forward-hop.ts";
 import { LinkTargetSetSchema, persistedLinkTargetSet, targetSetMatchesFirst, type LinkTargetSet } from "../integrations/forwardx/target-set.ts";
 
+import { LinkClientSourceSchema, persistedLinkClientSource, type LinkClientSource } from "../integrations/forwardx/client-source.ts";
+
 /* ================================================================== */
 /* 契约类型                                                            */
 /* ================================================================== */
@@ -30,6 +32,7 @@ export interface ForwardCandidateConfig extends ForwardPolicyInput {
   /** Internal Link provenance; HTTP callers cannot forge this field. */
   link_resource_id?: number | null;
   target_set?: LinkTargetSet | null;
+  client_source?: LinkClientSource;
   name: string;
   mode: ForwardMode;
   /** Persisted protocol fact; validation separately decides whether it is admitted. */
@@ -82,6 +85,7 @@ export interface ForwardRevisionUpdateInput extends ForwardCandidatePatch {
 export interface ForwardRevisionRow extends ForwardPolicyInput {
   link_resource_id?: number | null;
   link_target_config?: unknown;
+  link_source_config?: unknown;
   id: number;
   workspace_id: number;
   name: string;
@@ -249,6 +253,8 @@ export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateC
     link_resource_id: row.link_resource_id ?? null,
     ...(row.link_resource_id != null && row.link_target_config != null
       ? { target_set: persistedLinkTargetSet(row.link_target_config) } : {}),
+    ...(row.link_resource_id != null && row.link_source_config != null
+      ? { client_source: persistedLinkClientSource(row.link_source_config) } : {}),
     name: row.name,
     mode: row.tunnel_mode === "relay" ? "relay" : "direct",
     protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
@@ -287,6 +293,8 @@ export function mergeForwardCandidate(
     link_resource_id: patch.link_resource_id !== undefined ? patch.link_resource_id : base.link_resource_id,
     ...(patch.target_set !== undefined || base.target_set !== undefined
       ? { target_set: patch.target_set !== undefined ? patch.target_set : base.target_set } : {}),
+    ...(patch.client_source !== undefined || base.client_source !== undefined
+      ? { client_source: patch.client_source !== undefined ? patch.client_source : base.client_source } : {}),
     name: patch.name !== undefined ? patch.name : base.name,
     mode: patch.mode !== undefined ? patch.mode : base.mode,
     protocol: patch.protocol !== undefined ? patch.protocol : base.protocol,
@@ -324,6 +332,7 @@ export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: For
     sameForwardPolicy(base, candidate) &&
     (base.link_resource_id ?? null) === (candidate.link_resource_id ?? null) &&
     JSON.stringify(base.target_set ?? null) === JSON.stringify(candidate.target_set ?? null) &&
+    JSON.stringify(base.client_source ?? null) === JSON.stringify(candidate.client_source ?? null) &&
     base.mode === candidate.mode &&
     persistedForwardProtocol(base.protocol) === persistedForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
@@ -925,6 +934,7 @@ export async function ensureForwardBaselineRevision(
         link_resource_id: true,
         ingress_node_id: true,
         link_target_config: true,
+        link_source_config: true,
         egress_node_id: true,
         middle_node_id: true,
         listen_ip: true,
@@ -969,6 +979,11 @@ export async function ensureForwardBaselineRevision(
             })
           : [];
       const baselineSet = row.link_resource_id != null ? persistedLinkTargetSet(row.link_target_config) : undefined;
+      const baselineSource = row.link_resource_id != null ? persistedLinkClientSource(row.link_source_config) : undefined;
+      const baselineProtocol = persistedForwardProtocol(row.forward_protocol, row.tunnel_type);
+      if ((baselineSource || baselineSet?.strategy === "ip_hash") && baselineProtocol !== "tcp" ||
+          baselineSet?.strategy === "ip_hash" && !baselineSource)
+        throw new ForwardRevisionError("invalid_input", "invalid_link_client_source");
       const baselineTargets = baselineSet ? baselineSet.targets.map((target, index) => ({ ...target, weight: 1, order_by: index })) :
         row.link_resource_id != null && row.remote_host && row.remote_port
         ? [{ host: row.remote_host, port: row.remote_port, weight: 1, order_by: 1000 }] : egressTargets;
@@ -989,6 +1004,7 @@ export async function ensureForwardBaselineRevision(
             ...forwardPolicyValues(row),
             link_resource_id: row.link_resource_id,
             link_target_config: baselineSet ?? Prisma.JsonNull,
+            link_source_config: baselineSource ?? Prisma.JsonNull,
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
             middle_node_id: row.middle_node_id,
@@ -1063,6 +1079,7 @@ export async function createForwardRevision(
         link_resource_id: true,
         name: true,
         link_target_config: true,
+        link_source_config: true,
         tunnel_mode: true,
         tunnel_type: true,
         forward_protocol: true,
@@ -1122,6 +1139,12 @@ export async function createForwardRevision(
       input.candidate.target_host ?? "", input.candidate.target_port ?? 0))) {
       throw new ForwardRevisionError("invalid_input", "invalid_link_target_set");
     }
+    const requestedSource = input.candidate.client_source === undefined && linkRelay
+      ? persistedLinkClientSource(row.link_source_config) : input.candidate.client_source;
+    const clientSource = requestedSource === undefined ? undefined : LinkClientSourceSchema.parse(requestedSource);
+    if (clientSource && (!linkRelay || protocol !== "tcp") || targetSet?.strategy === "ip_hash" &&
+        (!linkRelay || protocol !== "tcp" || !clientSource))
+      throw new ForwardRevisionError("invalid_input", "invalid_link_client_source");
     const federatedRelay = (federatedPeer !== null || linkRelay) && input.candidate.mode === "relay";
     const relayTargets =
       federatedRelay && (linkRelay || !input.egressTargets || input.egressTargets.length === 0)
@@ -1154,6 +1177,7 @@ export async function createForwardRevision(
           ...policy,
           link_resource_id: linkedId ?? null,
           link_target_config: targetSet ?? Prisma.JsonNull,
+          link_source_config: clientSource ?? Prisma.JsonNull,
           ingress_node_id: input.candidate.ingress_node_id,
           egress_node_id: input.candidate.egress_node_id,
           middle_node_id: input.candidate.middle_node_id ?? null,
@@ -1201,7 +1225,7 @@ export async function createForwardRevision(
       data: {
         // ── 兼容投影列：socket/config-generator 与旧 Agent 的唯一读取源 ──
         ...(linkedId != null ? { egress_pool_id: null } : {}),
-        ...(linkedId != null ? { link_target_config: targetSet ?? Prisma.JsonNull } : {}),
+        ...(linkedId != null ? { link_target_config: targetSet ?? Prisma.JsonNull, link_source_config: clientSource ?? Prisma.JsonNull } : {}),
         name: input.candidate.name.trim(),
         tunnel_mode: input.candidate.mode,
         forward_protocol: protocol,

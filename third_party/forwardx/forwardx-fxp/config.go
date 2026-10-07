@@ -20,6 +20,10 @@ func readConfig(path string, targetsEnabled ...bool) (config, error) {
 		return cfg, err
 	}
 	enableManagedTargets(&cfg, len(targetsEnabled) > 0 && targetsEnabled[0])
+	enableManagedSources(&cfg, len(targetsEnabled) > 1 && targetsEnabled[1])
+	if err := validateManagedSources(cfg); err != nil {
+		return cfg, err
+	}
 	if err := validateManagedTargets(cfg); err != nil {
 		return cfg, err
 	}
@@ -82,6 +86,9 @@ func normalizeExitStrategy(value string) string {
 }
 
 func validateConfig(cfg config) error {
+	if err := validateManagedSources(cfg); err != nil {
+		return err
+	}
 	if err := validateManagedTargets(cfg); err != nil {
 		return err
 	}

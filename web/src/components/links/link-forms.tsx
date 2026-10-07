@@ -4,7 +4,7 @@ import { useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import type { UserNode } from "@/lib/types";
-import { isLinkTargetHost, LINK_TARGET_LIMIT, projectLinkTargetSet, type LinkBindingInput, type LinkConfig, type LinkCreateInput, type LinkProtocol, type LinkTargetSet } from "@/lib/links-types";
+import { isLinkTargetHost, LINK_TARGET_LIMIT, projectLinkClientSource, projectLinkTargetSet, type LinkClientSource, type LinkBindingInput, type LinkConfig, type LinkCreateInput, type LinkProtocol, type LinkTargetSet } from "@/lib/links-types";
 import type { LinksCopy } from "./links-copy";
 
 export const selectClass = "h-9 w-full rounded-md border border-[var(--input)] bg-[var(--card)] px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]";
@@ -28,7 +28,24 @@ export function parseLinkBindingForm(data: FormData, fixedProtocol?: LinkBinding
   const listen_host = data.get("listen_host");
   if (!name || name.length > 255 || !["tcp", "udp", "both"].includes(String(protocol))
     || !["", "127.0.0.1", "::1"].includes(String(listen_host))) throw new Error("invalid_input");
+  const sourceEnabled = data.get("client_source_enabled");
+  const sourcePresent = data.get("client_source_present");
+  if ((sourceEnabled !== null && sourceEnabled !== "1") || (sourcePresent !== null && sourcePresent !== "1")) throw new Error("invalid_client_source");
+  let clientSource: LinkClientSource | undefined;
+  if (sourceEnabled === "1" || sourcePresent === "1") {
+    if (protocol !== "tcp") throw new Error("client_source_tcp_only");
+    try {
+      const receive = data.get("receive_proxy");
+      const trusted = data.get("trusted_cidrs");
+      if (sourceEnabled === "1" && ((receive !== null && receive !== "1")
+        || (trusted !== null && typeof trusted !== "string") || (receive === "1" && trusted === null))) throw new Error("invalid_client_source");
+      clientSource = projectLinkClientSource(sourceEnabled === "1"
+        ? { version: 1, receive_proxy: receive === "1", trusted_cidrs: String(trusted ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean), send_proxy: data.get("send_proxy") }
+        : { version: 1, receive_proxy: false, trusted_cidrs: [], send_proxy: "off" });
+    } catch { throw new Error("invalid_client_source"); }
+  }
   const enabled = data.get("target_set_enabled");
+  if (enabled === "1" && data.get("target_strategy") === "ip_hash" && (protocol !== "tcp" || !clientSource)) throw new Error("ip_hash_requires_client_source");
   if (enabled !== null && enabled !== "1") throw new Error("invalid_input");
   const hosts = data.getAll("target_host");
   const ports = data.getAll("target_port");
@@ -49,7 +66,7 @@ export function parseLinkBindingForm(data: FormData, fixedProtocol?: LinkBinding
     recover_seconds: numeric(data, "target_recover_seconds", 10, 3600) }) : undefined;
   const { host: target_host, port: target_port } = targets[0];
   return { name, target_host, protocol: protocol as LinkBindingInput["protocol"], listen_host: listen_host as LinkBindingInput["listen_host"],
-    target_port, ...(targetSet ? { target_set: targetSet } : {}), listen_port: numeric(data, "listen_port", 1, 65_535),
+    target_port, ...(targetSet ? { target_set: targetSet } : {}), ...(clientSource ? { client_source: clientSource } : {}), listen_port: numeric(data, "listen_port", 1, 65_535),
     bytes_per_second_in: numeric(data, "bytes_per_second_in", 0, 2_147_483_647),
     bytes_per_second_out: numeric(data, "bytes_per_second_out", 0, 2_147_483_647),
     max_connections: numeric(data, "max_connections", 0, 1_000_000),
@@ -113,6 +130,18 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
   const prefix = useId();
   const [invalid, setInvalid] = useState<string | null>(null);
   const [protocol, setProtocol] = useState<LinkProtocol>(initial?.protocol ?? "tcp");
+  const [sourceEnabled, setSourceEnabled] = useState(!!initial?.client_source);
+  const [strategy, setStrategy] = useState<LinkTargetSet["strategy"]>(initial?.target_set?.strategy ?? "fallback");
+  // Existing configs remain explicit even when the user switches all source features off.
+  const sourceExplicit = sourceEnabled || !!initial?.client_source;
+  const changeProtocol = (next: LinkProtocol) => {
+    if (next !== "tcp" && (sourceExplicit || strategy === "ip_hash")) { setInvalid(copy.clientSourceTcpOnly); return; }
+    setInvalid(null); setProtocol(next);
+  };
+  const changeSource = (enabled: boolean) => {
+    if (!enabled && !initial?.client_source && strategy === "ip_hash") { setInvalid(copy.ipHashRequiresClientSource); return; }
+    setInvalid(null); setSourceEnabled(enabled);
+  };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setInvalid(null);
     let binding: LinkBindingInput;
@@ -121,7 +150,13 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
       if (initial) data.set("listen_host", initial.listen_host);
       binding = parseLinkBindingForm(data, initial?.protocol);
     }
-    catch { setInvalid(new FormData(event.currentTarget).get("target_set_enabled") === "1" ? copy.targetsValidation : copy.validation); return; }
+    catch (error) {
+      const sourceErrors: Record<string, string> = { invalid_client_source: copy.sourceValidation,
+        client_source_tcp_only: copy.clientSourceTcpOnly, ip_hash_requires_client_source: copy.ipHashRequiresClientSource };
+      setInvalid((error instanceof Error ? sourceErrors[error.message] : null)
+        ?? (new FormData(event.currentTarget).get("target_set_enabled") === "1" ? copy.targetsValidation : copy.validation));
+      return;
+    }
     await onSubmit(binding);
   };
   const num = (key: keyof LinkBindingInput, label: string, min: number, max: number, defaultValue?: number) =>
@@ -130,7 +165,7 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
     <fieldset disabled={busy} className="space-y-4">
       <Field id={`${prefix}-name`} label={copy.name}><Input id={`${prefix}-name`} name="name" required maxLength={255} defaultValue={initial?.name} /></Field>
       <div className="grid gap-4 sm:grid-cols-2">
-        <Field id={`${prefix}-protocol`} label={copy.protocol}><select id={`${prefix}-protocol`} name="protocol" className={selectClass} value={protocol} onChange={(e) => setProtocol(e.target.value as LinkProtocol)} disabled={!!initial}>
+        <Field id={`${prefix}-protocol`} label={copy.protocol}><select id={`${prefix}-protocol`} name="protocol" className={selectClass} value={protocol} onChange={(e) => changeProtocol(e.target.value as LinkProtocol)} disabled={!!initial}>
           <option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP + UDP</option>
         </select></Field>
         {num("listen_port", copy.listenPort, 1, 65_535, initial?.listen_port)}
@@ -139,7 +174,8 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
         </select></Field>
       </div>
       {initial && <p className="text-sm text-[var(--muted-foreground)]">{copy.protocolLocked}</p>}
-      <LinkTargetFields copy={copy} initial={initial} protocol={protocol} />
+      <LinkSourceFields copy={copy} initial={initial?.client_source} protocol={protocol} enabled={sourceEnabled} onChange={changeSource} />
+      <LinkTargetFields copy={copy} initial={initial} protocol={protocol} sourceExplicit={sourceExplicit} strategy={strategy} onStrategyChange={setStrategy} />
       <fieldset className="space-y-3 rounded-md border border-[var(--border)] p-3">
         <legend className="px-1 text-sm font-medium">{copy.limits}</legend>
         <p className="text-sm text-[var(--muted-foreground)]">{copy.limitHint}</p>
@@ -157,7 +193,47 @@ export function LinkBindingForm({ copy, initial, busy, onCancel, onSubmit }: {
   </form>;
 }
 
-function LinkTargetFields({ copy, initial, protocol }: { copy: LinksCopy; initial?: LinkBindingInput; protocol: LinkProtocol }) {
+function LinkSourceFields({ copy, initial, protocol, enabled, onChange }: {
+  copy: LinksCopy; initial?: LinkClientSource; protocol: LinkProtocol; enabled: boolean; onChange: (value: boolean) => void;
+}) {
+  const prefix = useId();
+  const [receive, setReceive] = useState(initial?.receive_proxy ?? false);
+  return <fieldset className="space-y-3 rounded-md border border-[var(--border)] p-3">
+    <legend className="px-1 text-sm font-medium">{copy.clientSourcePolicy}</legend>
+    {initial && <input type="hidden" name="client_source_present" value="1" />}
+    <label htmlFor={`${prefix}-enabled`} className="flex items-center gap-2 text-sm">
+      <input id={`${prefix}-enabled`} name="client_source_enabled" type="checkbox" value="1" checked={enabled} disabled={protocol !== "tcp"} onChange={(e) => onChange(e.target.checked)} />
+      {copy.clientSourceOptIn}
+    </label>
+    {protocol !== "tcp" && <p className="text-sm text-[var(--muted-foreground)]">{copy.clientSourceTcpOnly}</p>}
+    {initial && <p className="text-sm text-[var(--muted-foreground)]">{copy.sourceKeepHint}</p>}
+    {enabled && protocol === "tcp" && <>
+      <label htmlFor={`${prefix}-receive`} className="flex items-center gap-2 text-sm">
+        <input id={`${prefix}-receive`} name="receive_proxy" type="checkbox" value="1" checked={receive} onChange={(e) => setReceive(e.target.checked)} aria-describedby={`${prefix}-receive-hint`} />
+        {copy.receiveProxy}
+      </label>
+      <Field id={`${prefix}-trusted`} label={copy.trustedCidrs}>
+        <textarea id={`${prefix}-trusted`} name="trusted_cidrs" rows={3} required={receive} disabled={!receive} defaultValue={initial?.trusted_cidrs.join("\n") ?? ""}
+          className="min-h-24 w-full rounded-md border border-[var(--input)] bg-[var(--card)] px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]" aria-describedby={`${prefix}-trusted-hint`} />
+      </Field>
+      <p id={`${prefix}-trusted-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.sourceValidation}</p>
+      <p id={`${prefix}-receive-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.sourceReceiveHint}</p>
+      <Field id={`${prefix}-send`} label={copy.sendProxy}>
+        <select id={`${prefix}-send`} name="send_proxy" className={selectClass} defaultValue={initial?.send_proxy ?? "off"} aria-describedby={`${prefix}-send-hint`}>
+          <option value="off">{copy.sendProxyOff}</option><option value="v1">PROXY v1</option><option value="v2">PROXY v2</option>
+        </select>
+      </Field>
+      <p id={`${prefix}-send-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.sourceSendHint}</p>
+      <p className="text-sm text-[var(--muted-foreground)]">{copy.sourceSocketHint}</p>
+    </>}
+    <p className="text-sm text-[var(--muted-foreground)]">{copy.sourcePolicyHint}</p>
+  </fieldset>;
+}
+
+function LinkTargetFields({ copy, initial, protocol, sourceExplicit, strategy, onStrategyChange }: {
+  copy: LinksCopy; initial?: LinkBindingInput; protocol: LinkProtocol; sourceExplicit: boolean;
+  strategy: LinkTargetSet["strategy"]; onStrategyChange: (strategy: LinkTargetSet["strategy"]) => void;
+}) {
   const prefix = useId();
   const [enabled, setEnabled] = useState(!!initial?.target_set);
   const [targets, setTargets] = useState(() => (initial?.target_set?.targets
@@ -206,8 +282,9 @@ function LinkTargetFields({ copy, initial, protocol }: { copy: LinksCopy; initia
       }}>{copy.addTarget} ({targets.length}/{LINK_TARGET_LIMIT})</Button>
       <div className="grid gap-3 sm:grid-cols-2">
         <Field id={`${prefix}-strategy`} label={copy.targetStrategy}>
-          <select id={`${prefix}-strategy`} name="target_strategy" className={selectClass} defaultValue={initial?.target_set?.strategy ?? "fallback"}>
+          <select id={`${prefix}-strategy`} name="target_strategy" className={selectClass} value={strategy} onChange={(e) => onStrategyChange(e.target.value as LinkTargetSet["strategy"])} aria-describedby={`${prefix}-strategy-hint`}>
             <option value="fallback">{copy.strategyFallback}</option><option value="round_robin">{copy.strategyRoundRobin}</option><option value="random">{copy.strategyRandom}</option>
+            <option value="ip_hash" disabled={protocol !== "tcp" || !sourceExplicit}>{copy.strategyIpHash}</option>
           </select>
         </Field>
         <Field id={`${prefix}-probe`} label={copy.targetProbe}>
@@ -222,6 +299,8 @@ function LinkTargetFields({ copy, initial, protocol }: { copy: LinksCopy; initia
           <Input id={`${prefix}-recover`} name="target_recover_seconds" type="number" min={10} max={3600} step={1} required defaultValue={initial?.target_set?.recover_seconds ?? 30} />
         </Field>
       </div>
+      <p id={`${prefix}-strategy-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.ipHashHint}</p>
+      {strategy === "ip_hash" && <p className="text-sm text-[var(--muted-foreground)]">{copy.ipHashRemapHint}</p>}
       <p className="text-sm text-[var(--muted-foreground)]">{copy.targetWindowsHint}</p>
       <p id={`${prefix}-probe-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.targetProbeHint}</p>
     </>}

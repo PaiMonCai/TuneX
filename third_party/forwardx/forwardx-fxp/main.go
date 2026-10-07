@@ -31,6 +31,8 @@ import (
 )
 
 type helloFrame struct {
+	SourceVersion            int    `json:"sourceVersion,omitempty"`
+	SourcePolicy             string `json:"sourcePolicy,omitempty"`
 	Network                  string `json:"network"`
 	TargetIP                 string `json:"targetIp"`
 	TargetPort               int    `json:"targetPort"`
@@ -516,7 +518,13 @@ func main() {
 	trafficCapabilities := flag.Bool("managed-traffic-capabilities", false, "report managed traffic protocol capabilities")
 	targetsV1 := flag.Bool("managed-targets-v1", false, "enable managed target sets v1")
 	targetCapabilities := flag.Bool("managed-target-capabilities", false, "report managed target protocol capabilities")
+	sourcesV1 := flag.Bool("managed-source-v1", false, "enable managed client source v1")
+	sourceCapabilities := flag.Bool("managed-source-capabilities", false, "report managed client source capabilities")
 	flag.Parse()
+	if *sourceCapabilities {
+		fmt.Println(`{"managed_source":1}`)
+		return
+	}
 	if *targetCapabilities {
 		fmt.Println(`{"managed_targets":1}`)
 		return
@@ -528,7 +536,7 @@ func main() {
 	if *configPath == "" {
 		log.Fatal("missing -config")
 	}
-	cfg, err := readConfig(*configPath, *targetsV1)
+	cfg, err := readConfig(*configPath, *targetsV1, *sourcesV1)
 	if err != nil {
 		log.Fatalf("read config: %v", err)
 	}
@@ -590,7 +598,7 @@ func main() {
 	)
 	ctx := shutdownContext()
 	if managedEnabled(*configPath) {
-		err = runManaged(ctx.done, *configPath, *targetsV1)
+		err = runManaged(ctx.done, *configPath, *targetsV1, *sourcesV1)
 	} else {
 		switch strings.ToLower(cfg.Role) {
 		case "entry":
@@ -947,22 +955,43 @@ func runEntryGroup(done <-chan struct{}, cfg config) error {
 }
 
 func acceptEntryTCP(ln net.Listener, cfg config, gate *connGate, selector *exitEndpointSelector, inLimiter, outLimiter *limiter, sessionWG *sync.WaitGroup, tracked ...*managedClients) error {
+	if cfg.ClientSource != nil {
+		cfg.sourceGate = gate
+		gate = newConnGate(cfg.MaxConnections, 0) // Bound sockets, then admit effective sources.
+		if cfg.ClientSource.ReceiveProxy {
+			cfg.sourceHandshake = managedSourceHandshakes
+		}
+	}
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return err
 		}
 		enableTCPKeepAlive(client)
+		if cfg.sourceHandshake != nil {
+			select {
+			case cfg.sourceHandshake <- struct{}{}:
+			default:
+				_ = client.Close()
+				continue
+			}
+		}
 		var clients *managedClients
 		if len(tracked) > 0 {
 			clients = tracked[0]
 			if !clients.add(client) {
+				if cfg.sourceHandshake != nil {
+					<-cfg.sourceHandshake
+				}
 				_ = client.Close()
 				continue
 			}
 		}
 		release, ok, reason := gate.acquire(client.RemoteAddr())
 		if !ok {
+			if cfg.sourceHandshake != nil {
+				<-cfg.sourceHandshake
+			}
 			if clients != nil {
 				clients.remove(client)
 			}
@@ -989,6 +1018,26 @@ func handleEntryTCP(client net.Conn, cfg config, selector *exitEndpointSelector,
 	defer client.Close()
 	var first []byte
 	proxyInfo := proxyProtocolInfoFromConn(client)
+	if cfg.ClientSource != nil {
+		finishHandshake := func() {}
+		if cfg.sourceHandshake != nil {
+			finishHandshake = sync.OnceFunc(func() { <-cfg.sourceHandshake })
+			defer finishHandshake()
+		}
+		var sourceErr error
+		proxyInfo, sourceErr = readManagedSource(client, *cfg.ClientSource)
+		finishHandshake()
+		if sourceErr != nil {
+			return sourceErr
+		}
+		if cfg.sourceGate != nil {
+			release, ok, _ := cfg.sourceGate.acquire(&net.TCPAddr{IP: net.ParseIP(proxyInfo.SourceIP), Port: proxyInfo.SourcePort})
+			if !ok {
+				return errors.New("client source connection limit")
+			}
+			defer release()
+		}
+	}
 	initialTimeout := 150 * time.Millisecond
 	if cfg.ProxyProtocolReceive {
 		initialTimeout = 5 * time.Second
@@ -1027,10 +1076,16 @@ func handleEntryTCP(client net.Conn, cfg config, selector *exitEndpointSelector,
 			proxyInfo.DestPort,
 		)
 	}
-	if !cfg.ProxyProtocolSend {
+	if cfg.ClientSource == nil && !cfg.ProxyProtocolSend {
 		proxyInfo = proxyProtocolInfo{}
 	}
 	selectionKey := endpointSelectionSource(client.RemoteAddr().String())
+	sourceVersion, sourcePolicy := 0, ""
+	if cfg.ClientSource != nil {
+		selectionKey = proxyInfo.SourceIP
+		sourceVersion = 1
+		sourcePolicy = managedSourceDigest(*cfg.ClientSource)
+	}
 	exit, sec, endpoint, err := dialSelectedSecureTCP(selector, cfg, selectionKey)
 	if err != nil {
 		return fmt.Errorf("dial exit: %w", err)
@@ -1043,6 +1098,7 @@ func handleEntryTCP(client net.Conn, cfg config, selector *exitEndpointSelector,
 		defer tracked[0].remove(exit)
 	}
 	hello, _ := json.Marshal(helloFrame{
+		SourceVersion: sourceVersion, SourcePolicy: sourcePolicy,
 		Network:                  "tcp",
 		TargetIP:                 cfg.TargetIP,
 		TargetPort:               cfg.TargetPort,
@@ -1893,7 +1949,7 @@ func handleExitSessionWithStartup(conn net.Conn, cfg config, startupComplete fun
 		return handleExitUDP(sec, hello)
 	default:
 		if targetPool != nil {
-			target, index, err := managed.dialTarget(targetPool, "tcp")
+			target, index, err := managed.dialTarget(targetPool, "tcp", hello.SelectionKey)
 			if err != nil {
 				return err
 			}

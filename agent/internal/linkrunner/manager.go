@@ -29,6 +29,7 @@ type Manager struct {
 	traffic                        *trafficStore
 	lifecycleStarted               bool
 	targetSupport, targetProbeDone bool
+	sourceSupport, sourceProbeDone bool
 }
 
 // New loads durable fences but does not start children. Corrupt/foreign caches
@@ -104,6 +105,14 @@ func (m *Manager) apply(input Config) (out Observation, resultErr error) {
 	deadline, expected, err := validateConfig(&cfg)
 	if err != nil {
 		return m.observeLocked(input.ID), err
+	}
+	if usesClientSource(cfg.RunnerConfig) {
+		if !m.sourceProbeDone {
+			m.sourceSupport, m.sourceProbeDone = probeClientSource(m.binaryPath), true
+		}
+		if !m.sourceSupport {
+			return m.observeLocked(cfg.ID), ErrSourceCapability
+		}
 	}
 	if usesTargetSets(cfg.RunnerConfig) {
 		if !m.targetProbeDone {

@@ -1,5 +1,60 @@
 # A 前端闭环验证记录
 
+## F3 canonical trust uniqueness follow-up (2026-10-08)
+
+`projectLinkClientSource` now rejects duplicate **canonical** networks after masking/normalization; it does not silently deduplicate or reorder them. Regressions cover `127.0.0.1/8` + `127.0.0.2/8`, exact repeated networks, IPv4 /25 host-bit aliases, expanded/case-variant IPv6 /48, and IPv6 dotted-tail/hex aliases at /120. Duplicate rejection is checked at direct source projection, detail-response projection, form parsing, and the 32-item boundary. Distinct networks (including the same base with different prefix lengths) retain order and round-trip through normalization, repeated detail projection, edit cloning and form submission without mutating the original list. Bilingual validation and README explain canonical uniqueness.
+
+Verification from `web/`, cached Bun 1.4.2, `NEXT_PUBLIC_API_MOCK=0`:
+
+```powershell
+bun test src/components/links/__tests__/links-client-source.test.tsx
+node node_modules/typescript/bin/tsc --noEmit --incremental false
+```
+
+Result: **16 pass / 0 fail / 243 assertions**; TypeScript exit **0**, scoped `git diff --check` passed. The new duplicate regression first failed because both /8 hosts normalized to `127.0.0.0/8` without rejection; it passed after the parser fix. No browser or real-network checks were rerun for this follow-up.
+
+Follow-up edits only: `web/src/lib/links-types.ts`, `web/src/components/links/__tests__/links-client-source.test.tsx`, `web/src/components/links/links-copy.ts`, `web/src/components/links/README.md`, and this evidence file. No backend/Agent/vendor/Forwardx edits, commit, push or deploy.
+
+
+## F3 TCP client source frontend (2026-10-08)
+
+Scope: direct frontend edits under `web/**` only. No backend, Agent, vendor or `Forwardx/` edits by this task; concurrent changes elsewhere belong to other workflows. No commit, push, build/deploy or real data mutation.
+
+Final verification: **167 pass / 0 fail / 2688 assertions / 8 files** (including **14 new F3 tests**). `node node_modules/typescript/bin/tsc --noEmit --incremental false` exited **0**; scoped `git diff --check -- web` passed. Cached Bun **1.4.2** was used. Before implementation the new suite failed on missing source-contract exports.
+
+```powershell
+# From web/, with locally cached Bun on PATH
+$env:NEXT_PUBLIC_API_MOCK = "0"
+bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/links/__tests__/links-targets.test.tsx src/components/links/__tests__/links-client-source.test.tsx src/components/console/__tests__/console-boundary.test.ts src/components/forwards/__tests__/workspace-permissions.test.ts src/components/forwards/__tests__/forward-batch-delete.test.tsx src/components/forwards/__tests__/forward-copy-usage.test.ts
+node node_modules/typescript/bin/tsc --noEmit --incremental false
+```
+
+The F3 tests cover closed/strict source projection, canonical IPv4/IPv6 masking, mapped IPv6 and /0 rejection, 32/33 trust bounds, receive/list consistency, all send modes, absent legacy versus explicit all-off, full cloned edit roundtrip, TCP-only/IP-hash cross-field gates, first-target order/projection, bilingual safe errors and aliases, declared-only source detail, and session/CSRF/explicit Workspace/captured CAS requests. Unknown source facts are stripped even from a Ready observation; no source-health interface was added.
+
+An isolated named headless Chrome session loaded the real production `LinksWorkspace`, forms and shared request layer through `browser-server.ts` on `127.0.0.1:41973`. Final **F3 39/39 checks** passed via `browser-client-source-checks.js`: new opt-in, both/UDP disabled controls, TCP-plus-explicit-source IP hash, clear protocol/source deselection errors, required empty trust and five unsafe-trust cases rejected before HTTP, canonical create, reorder/delete-first projection, full edit/CAS, B-rule preservation, PROXY v1/v2/off, internal IP-hash source with sending off, known all-off preservation, untouched legacy, all four collapsed actionable API errors, CAS conflict/reopen, bilingual/read-only and late Workspace mutation fencing. Existing **F2 44/44 browser checks** also passed with no changes to the F2 replay or production Workspace fences.
+
+Both browser replays require resetting `/__test/scenario` before initializing the fresh page when a previous replay left a selected resource; resetting only after loading existing fixture rows can legitimately hit the current missing-resource read fence. Initial F2 reuse hit this fixture setup condition, then passed after reset-before-reload. The CLI evaluation used Windows-safe JavaScript quoting. Browser and fixture processes were stopped after verification.
+
+Source copy describes mandatory trusted-upstream PROXY v1/v2, **absolute 5 seconds**, **v1 <=108 bytes / v2 <=536 total bytes**, destination PROXY support, and source carried internally with send off. These are runtime contract statements only, not frontend packet-parser enforcement or measured network evidence. No observed verified identity, source health or live capability facts were created. IP-hash copy warns about new-connection remapping on pool membership/health changes, not fixed session affinity or HTTP header tricks.
+
+Changed paths:
+
+- `web/src/lib/links-types.ts`
+- `web/src/components/links/link-forms.tsx`
+- `web/src/components/links/link-state.ts`
+- `web/src/components/links/links-copy.ts`
+- `web/src/components/links/link-detail.tsx`
+- `web/src/components/links/link-target-details.tsx`
+- `web/src/components/links/link-client-source-details.tsx` (new)
+- `web/src/components/links/__tests__/links-client-source.test.tsx` (new)
+- `web/src/components/links/__tests__/browser-client-source-checks.js` (new)
+- `web/src/components/links/__tests__/browser-server.ts`
+- `web/src/components/links/README.md`
+- `web/src/components/links/__tests__/EVIDENCE.md`
+
+Limitations: fixtures/static React/production-component browser tests only; no full Next-route E2E, production deployment, real database, Agent, multi-node FXP/PROXY or live source verification. Backend/compiler/runtime enforcement and final integrated acceptance remain with the main workflow. No dependencies or package locks were changed.
+
+
 ## F2 多目标前端（2026-10-08）
 
 最终验证：**153 pass / 0 fail / 2469 assertions / 7 files**；`node node_modules/typescript/bin/tsc --noEmit --incremental false` 退出码 **0**；范围内 `git diff --check` 通过。新增 F2 文件包含 **25** 项契约/UI 测试，其中地址边界对照 `node:net.isIP`，显式排除 Go `net.ParseIP` 不接受的 zone ID。所有请求测试使用 fixtures。

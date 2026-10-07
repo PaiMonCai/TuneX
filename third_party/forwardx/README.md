@@ -61,3 +61,12 @@ old-socket responses. Existing TCP is not migrated. Unchanged sibling rules keep
 their sockets and health state during target policy reloads. Digest-bound status
 logs contain only indexes/states/times, never target addresses or credentials.
 The public FXP feature flag and support matrix remain unchanged.
+
+F3 adds `-managed-source-v1` and the bounded secret-free executable probe
+`-managed-source-capabilities` (`{"managed_source":1}`). Shared TCP source policies
+adapt the upstream PROXY parser/formatter and IP_HASH selector, adding trusted
+CIDRs, absolute bounded header reads, effective-source admission, authenticated
+rule/policy-bound source metadata and exit-owned send/version authority. Old
+policy attestations fail after reload; unchanged siblings stay intact. UDP/both
+source policies remain rejected. The ingress node/key is the attestation trust
+boundary; this is not protection against a malicious authorized ingress.

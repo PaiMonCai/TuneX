@@ -82,7 +82,7 @@ func (s *managedExitState) apply(cfg config, digests ...string) {
 	next := policyFor(cfg)
 	changed := make(map[int]bool)
 	for rule, pool := range old.pools {
-		if managedPoolsEqual(pool, next.pools[rule]) {
+		if managedPoolsEqual(pool, next.pools[rule]) && sourcePoliciesEqual(old.cfg, cfg, rule) {
 			next.pools[rule] = pool
 		} else {
 			changed[rule] = true
@@ -94,6 +94,9 @@ func (s *managedExitState) apply(cfg config, digests ...string) {
 		}
 	}
 	for _, binding := range old.cfg.AllowedBindings {
+		if !sourcePoliciesEqual(old.cfg, cfg, binding.RuleID) {
+			changed[binding.RuleID] = true
+		}
 		if !authorizedTarget(cfg, binding.RuleID, binding.Protocol, binding.TargetIP, binding.TargetPort) {
 			changed[binding.RuleID] = true
 		}
@@ -274,6 +277,10 @@ func readManagedConfig(path string, targetsEnabled ...bool) (config, string, err
 		return cfg, digest, errors.New("invalid managed config")
 	}
 	enableManagedTargets(&cfg, len(targetsEnabled) > 0 && targetsEnabled[0])
+	enableManagedSources(&cfg, len(targetsEnabled) > 1 && targetsEnabled[1])
+	if err := validateManagedSources(cfg); err != nil {
+		return cfg, digest, err
+	}
 	if validateManagedTargets(cfg) != nil {
 		return cfg, digest, errors.New("invalid managed config")
 	}
@@ -332,6 +339,7 @@ func immutableManagedConfig(cfg config) config {
 	cfg.AllowedBindings = nil
 	cfg.UDPTargets = nil
 	cfg.TargetSets = nil
+	cfg.ClientSources = nil
 	return cfg
 }
 func entryTransportEqual(a, b config) bool {

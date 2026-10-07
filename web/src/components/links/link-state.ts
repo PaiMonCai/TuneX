@@ -18,6 +18,11 @@ export function linkErrorMessage(error: LinkErrorInfo, copy: LinksCopy, reading 
   if (error.code === "agent_fxp_targets_capability_missing") return copy.targetsCapabilityMissing;
   if (error.code === "agent_fxp_capability_missing") return copy.fxpCapabilityMissing;
   if (error.code === "link_target_set_required") return copy.targetSetRequired;
+  if (error.code === "link_client_source_required") return copy.clientSourceRequired;
+  if (["agent_fxp_source_capability_missing", "agent_fxp_client_source_capability_missing"].includes(error.code)) return copy.sourceCapabilityMissing;
+  if (["client_source_tcp_only", "link_client_source_tcp_only"].includes(error.code)) return copy.clientSourceTcpOnly;
+  if (error.code === "ip_hash_requires_client_source") return copy.ipHashRequiresClientSource;
+  if (error.code === "invalid_client_source") return copy.sourceValidation;
   if (error.code === "link_config_too_large") return copy.configTooLarge;
   return error.disabled ? copy.disabled : error.conflict ? copy.conflict : error.denied ? (reading ? copy.denied : copy.actionDenied)
     : reading ? copy.readFailed : copy.failed;
@@ -57,10 +62,12 @@ export function placementAckState(link: LinkDetail, p: LinkPlacement): string {
 }
 export function bindingFromForward(forward: LinkForward): LinkBindingInput {
   const targetSet = forward.target_set ? { ...forward.target_set, targets: forward.target_set.targets.map((target) => ({ ...target })) } : undefined;
+  const clientSource = forward.client_source ? { ...forward.client_source, trusted_cidrs: [...forward.client_source.trusted_cidrs] } : undefined;
   return { name: forward.name, protocol: forward.forward_protocol, listen_port: forward.listen_port,
     listen_host: forward.listen_ip === "127.0.0.1" || forward.listen_ip === "::1" ? forward.listen_ip : "" as const,
     target_host: targetSet?.targets[0].host ?? forward.remote_host, target_port: targetSet?.targets[0].port ?? forward.remote_port,
     ...(targetSet ? { target_set: targetSet } : {}),
+    ...(clientSource ? { client_source: clientSource } : {}),
     bytes_per_second_in: forward.bytes_per_second_in ?? 0, bytes_per_second_out: forward.bytes_per_second_out ?? 0,
     max_connections: forward.max_connections ?? 0, max_connections_per_ip: forward.max_connections_per_ip ?? 0 };
 }

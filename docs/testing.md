@@ -4,7 +4,7 @@
 
 ## 已确认的候选证据
 
-以下结果对应 F1 源码 `4e50f20b8c3b16af512bcae942d42f3c08b1e578` 的 [CI 37658464950](https://github.com/PaiMonCai/TuneX/actions/runs/37658464950)，该次 required 全绿。F2 及后续提交查看 [PR 75 的候选检查](https://github.com/PaiMonCai/TuneX/pull/75/checks)；本文不是持续同步的 CI 状态页。
+以下表格对应 F1 源码 `4e50f20b8c3b16af512bcae942d42f3c08b1e578` 的 [CI 37658464950](https://github.com/PaiMonCai/TuneX/actions/runs/37658464950)，该次 required 全绿。F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/actions/runs/37697539412) 同样全绿：3186 后端单元/契约、118 数据库/HTTP（零跳过）、1466 前端、四节点 61 PASS / 0 FAIL。F3 及后续提交查看 [PR 75 的候选检查](https://github.com/PaiMonCai/TuneX/pull/75/checks)；本文不是持续同步的 CI 状态页。
 
 | 范围 | 结果与边界 |
 | --- | --- |
@@ -76,6 +76,8 @@ bash scripts/integration/abcd-core-gate.sh
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 
 F2 同一 gate 新增真实目标 3044/3045：完整策略 API 往返、辅助 TCP 健康、主目标实际关闭、10 秒失败/恢复窗口、全故障、恢复后的新 TCP 与保持备用 UDP 映射、RR、random、固定 UDP 来源及 Agent 重启。每次等待继续使用 B 的原 TCP 和 UDP socket；不改数据库健康状态或伪造 Ready。窗口抖动、未知 UDP、nonce/replay 和未授权目标另由真实 runner 回归覆盖。Windows 本地不能代替该 Linux 门禁。
+
+F3 同一 gate 增加 TCP 目标 3052/3053，真实解析 PROXY 并返回收到的来源、端口、版本和目标。验证 socket 来源、受信 v1/v2 接收并按配置发送、端口改变的 IP_HASH 稳定选择、原始来源并发、不受信头拒绝、旧客户端配置省略、UDP/both 组合拒绝、共享 B 会话和恢复完整来源策略。此 gate 不修改健康/来源事实。双栈、长/慢头、AEAD Hello 错版本/旧策略/越权目标和无来源哈希拒绝由 runner 的独立 socket/策略回归覆盖；不把源码或 fixtures 当真实 Panel 浏览器证据。
 
 原生回归和删除/精确端口复用：
 

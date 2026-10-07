@@ -124,6 +124,7 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 				rt.linkFacts = facts
 				rt.linkFacts.TrafficRotation = links.TrafficRotationSupported()
 				rt.linkFacts.FXPTargets = links.TargetSetsSupported()
+				rt.linkFacts.FXPSource = links.ClientSourceSupported()
 			}
 		}
 	}

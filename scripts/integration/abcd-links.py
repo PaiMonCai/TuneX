@@ -8,6 +8,7 @@ import importlib.util
 import json
 import signal
 import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -94,6 +95,61 @@ class Echo:
         self.udp.stop()
         for client in list(self.clients):
             client.close()
+
+
+class ProxyEcho(Echo):
+    """Actual target accepts PROXY headers and reports only socket test facts."""
+    def echo(self, client):
+        def exact(length):
+            data = b""
+            while len(data) < length:
+                chunk = client.recv(length - len(data))
+                if not chunk:
+                    raise OSError("incomplete PROXY target header")
+                data += chunk
+            return data
+        try:
+            client.settimeout(4)
+            first = exact(6)
+            if first == b"PROXY ":
+                header = first
+                while not header.endswith(b"\r\n"):
+                    if len(header) >= 108:
+                        raise OSError("oversize PROXY target header")
+                    header += exact(1)
+                parts = header.decode("ascii").split()
+                version, source, source_port = 1, parts[2], int(parts[4])
+            else:
+                header = first + exact(10)
+                if header[:12] != b"\r\n\r\n\x00\r\nQUIT\n" or header[12] != 0x21:
+                    raise OSError("unexpected PROXY target header")
+                length = struct.unpack("!H", header[14:16])[0]
+                if length > 520:
+                    raise OSError("oversize PROXY target payload")
+                body = exact(length)
+                if header[13] == 0x11:
+                    source, source_port = socket.inet_ntop(socket.AF_INET, body[:4]), struct.unpack("!H", body[8:10])[0]
+                elif header[13] == 0x21:
+                    source, source_port = socket.inet_ntop(socket.AF_INET6, body[:16]), struct.unpack("!H", body[32:34])[0]
+                else:
+                    raise OSError("unsupported PROXY target family")
+                version = 2
+            stream = client.makefile("rb")
+            with stream:
+                while not self.stopped.is_set():
+                    payload = stream.readline(256)
+                    if not payload:
+                        return
+                    if not payload.endswith(b"\n"):
+                        raise OSError("invalid target test payload")
+                    response = {"version": version, "source_ip": source, "source_port": source_port,
+                        "target": self.port, "payload": payload.decode("ascii").strip()}
+                    client.sendall(json.dumps(response).encode() + b"\n")
+        except (OSError, ValueError, IndexError, UnicodeError):
+            pass
+        finally:
+            client.close()
+            self.clients.discard(client)
 
 
 def request(method, path, body=None):
@@ -217,6 +273,116 @@ def multi_target_case(base, fid, target, targets, keep_b_alive):
     H.check(keep_b_alive(), "F2 all target policy changes preserve B's held TCP and original UDP socket")
 
 
+def client_source_case(base, target, targets, rules, keep_b_alive):
+    for port in (3052, 3053):
+        server = ProxyEcho(port)
+        server.start()
+        targets.append(server)
+    policy = {"version": 1, "targets": [{"host": target, "port": 3052}, {"host": target, "port": 3053}],
+        "strategy": "ip_hash", "failure_seconds": 10, "recover_seconds": 10, "probe": "none"}
+    source = {"version": 1, "receive_proxy": False, "trusted_cidrs": [], "send_proxy": "v1"}
+    binding = {"name": "D trusted TCP source", "protocol": "tcp", "listen_host": "", "listen_port": 21082,
+        "target_host": target, "target_port": 3052, "target_set": policy, "client_source": source,
+        "max_connections": 0, "max_connections_per_ip": 0}
+    fid = request("POST", base + "/forwards", binding)["id"]
+    rules.append(fid)
+
+    def row():
+        return next(f for f in request("GET", base)["forwards"] if f["id"] == fid)
+
+    def edit():
+        request("PUT", base + f"/forwards/{fid}", {"expected_revision": row()["config_revision"], "binding": binding})
+
+    def exchange(client, label):
+        client.sendall(label.encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = client.recv(1024)
+            if not chunk or len(data) > 2048:
+                raise OSError("source target did not return bounded facts")
+            data += chunk
+        return json.loads(data)
+
+    def proxy_header(ip, port, version):
+        if version == 1:
+            return f"PROXY TCP4 {ip} 192.0.2.10 {port} 443\r\n".encode()
+        return (b"\r\n\r\n\x00\r\nQUIT\n" + bytes([0x21, 0x11]) + struct.pack("!H", 12)
+            + socket.inet_aton(ip) + socket.inet_aton("192.0.2.10") + struct.pack("!HH", port, 443))
+
+    def connected(ip, port, version):
+        client = tcp(21082)
+        client.sendall(proxy_header(ip, port, version))
+        return client
+
+    with tcp(21082) as client:
+        socket_source, socket_port = client.getsockname()
+        fact = exchange(client, "socket-source")
+        H.check(fact["version"] == 1 and fact["source_ip"] == socket_source and fact["source_port"] == socket_port,
+            "F3 target receives actual ingress socket source via configured PROXY v1")
+    H.check(row()["client_source"] == source, "F3 complete source policy round-trips through the real API")
+    omitted = dict(binding)
+    del omitted["client_source"]
+    omitted["target_set"] = dict(policy, strategy="fallback")
+    status, _, _ = H.req("PUT", base + f"/forwards/{fid}", {"expected_revision": row()["config_revision"], "binding": omitted})
+    H.check(status == 409, "F3 old client cannot silently drop an existing source policy")
+    unsupported = dict(binding, protocol="both")
+    status, _, _ = H.req("PUT", base + f"/forwards/{fid}", {"expected_revision": row()["config_revision"], "binding": unsupported})
+    H.check(status == 400, "F3 unsupported UDP/both source combinations are rejected before deployment")
+    source.update(receive_proxy=True, trusted_cidrs=[socket_source + "/32"], send_proxy="v2")
+    edit()
+    chosen = {}
+    for ip in ("198.51.100.2", "198.51.100.3"):
+        picks = []
+        for i in range(4):
+            with connected(ip, 32001 + i, 1 if i % 2 else 2) as client:
+                fact = exchange(client, "source-hash")
+                if fact["version"] != 2 or fact["source_ip"] != ip or fact["source_port"] != 32001 + i:
+                    raise RuntimeError("configured v2 PROXY target source did not match attestation")
+                picks.append(fact["target"])
+        H.check(len(set(picks)) == 1, "F3 trusted client IP keeps the same target across source-port changes: " + ip)
+        chosen[ip] = picks[0]
+    H.check(len(set(chosen.values())) == 2, "F3 two trusted client addresses use different authorized IP_HASH targets")
+    binding["max_connections_per_ip"] = 1
+    edit()
+    a, b = connected("198.51.100.2", 32101, 1), connected("198.51.100.3", 32102, 2)
+    try:
+        exchange(a, "held-source-A")
+        exchange(b, "held-source-B")
+        H.check(True, "F3 separate client-source budgets admit two clients behind one trusted proxy")
+        denied = False
+        try:
+            with connected("198.51.100.2", 32103, 1) as extra:
+                exchange(extra, "denied-source")
+        except OSError:
+            denied = True
+        H.check(denied, "F3 original-source connection ceiling rejects a second same-IP client")
+    finally:
+        a.close()
+        b.close()
+    source["trusted_cidrs"] = ["192.0.2.0/24"]
+    edit()
+    denied = False
+    try:
+        with connected("198.51.100.2", 32001, 1) as client:
+            exchange(client, "untrusted-source")
+    except OSError:
+        denied = True
+    H.check(denied, "F3 non-trusted socket peer cannot inject an otherwise valid PROXY header")
+    source["trusted_cidrs"] = [socket_source + "/32"]
+    binding["max_connections_per_ip"] = 0
+    edit()
+    H.check(keep_b_alive(), "F3 source-policy revisions keep unrelated B's TCP and exact UDP target socket")
+
+    def restored_source():
+        try:
+            with connected("198.51.100.2", 32001, 2) as client:
+                fact = exchange(client, "source-after-restart")
+                return fact["version"] == 2 and fact["source_ip"] == "198.51.100.2" and fact["target"] == chosen["198.51.100.2"]
+        except OSError:
+            return False
+    return restored_source
+
+
 def udp_payload(client, port, payload):
     client.settimeout(4)
     client.sendto(payload, (H.INGRESS_DATA_IP, port))
@@ -317,7 +483,7 @@ def main():
                 "reported_at:{gt:new Date(Date.now()-60000)}},select:{node_id:true,version:true,capabilities:true}});"
                 "return facts.map(f=>({id:f.node_id,version_ok:checkAgentVersion(f.version,null)===null,"
                 "fxp:Array.isArray(f.capabilities)&&['forward.link.fxp.v1','apply_link','remove_link']"
-                ".every(c=>f.capabilities.includes(c))&&f.capabilities.includes('forward.targets.fxp.v1')}));" % json.dumps(node_ids))
+                ".every(c=>f.capabilities.includes(c))&&f.capabilities.includes('forward.targets.fxp.v1')&&f.capabilities.includes('forward.client-source.fxp.v1')}));" % json.dumps(node_ids))
             return (isinstance(facts, list) and {f["id"] for f in facts} == set(node_ids)
                     and all(f["version_ok"] and f["fxp"] for f in facts))
         fxp_ready = H.wait_until(current_link_facts, timeout=60, interval=2)
@@ -453,6 +619,7 @@ def main():
             return (tcp_payload(held_b, payload) and udp_payload(udp_b, 21081, payload) and
                 targets[0].udp.sources.get(payload) == original_udp_source)
         multi_target_case(base, c, target, targets, unchanged_b)
+        restored_source = client_source_case(base, target, targets, rules, unchanged_b)
         before_restart = wait_traffic(link_id, [b, c])
         old_producers = {row["producer_id"] for row in before_restart if row["forward_id"] == b}
         old_b = [row for row in before_restart if row["forward_id"] == b]
@@ -473,6 +640,8 @@ def main():
                 "F2 Agent restart restores the full target policy and real primary payload")
         if not restored_payload:
             raise RuntimeError("restart payload prerequisite failed")
+        H.check(bool(H.wait_until(restored_source, timeout=60, interval=2)),
+                "F3 Agent restart restores the full source policy and real IP_HASH/PROXY payload")
         after_restart = wait_traffic(link_id, [b], lambda rows:
             any(row["producer_id"] not in old_producers and int(row["bytes_in"]) > 0
                 and int(row["bytes_out"]) > 0 for row in rows)

@@ -616,6 +616,8 @@ model Tunnel {
   link_resource_id           Int?
   /// Versioned FXP binding target set. NULL preserves legacy single-target behavior.
   link_target_config         Json?
+  /// Versioned TCP client source config; NULL is exact legacy behavior.
+  link_source_config Json?
   link_resource              LinkResource? @relation(fields: [link_resource_id], references: [id], onDelete: Restrict)
   traffic                    Float           @default(0)
   traffic_cost               Float           @default(0)
@@ -879,6 +881,8 @@ model ForwardRevision {
   link_resource_id Int?
   /// Immutable versioned FXP target set; no mutable EgressPool dependency.
   link_target_config Json?
+  /// Versioned TCP client source config; NULL is exact legacy behavior.
+  link_source_config Json?
   ingress_node_id Int
   egress_node_id  Int?
   /// V5.4：该 revision 的中间跳放置事实。NULL = 单跳。

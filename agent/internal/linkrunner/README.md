@@ -312,3 +312,20 @@ go test ./internal/linkrunner -run 'TestTraffic|TestRealFXPTraffic' -count=1
 ```
 
 `TUNEX_TEST_FXP_TRAFFIC_BINARY` is also accepted for collector-only acceptance.
+
+## TCP client source (F3 first slice)
+
+`ClientSourceSupported()` uses the bounded secret-free two-second probe
+`-managed-source-capabilities`, accepting exactly `{"managed_source":1}`. Only
+a constructed Link runtime advertises `forward.client-source.fxp.v1`. Supported
+children always receive `-managed-source-v1`; Apply and Restore reject source
+configurations or IP_HASH against an older executable before starting listeners.
+
+Compiler-authorized entry `clientSource` and exit `clientSources` preserve the
+complete versioned policy. TCP socket or trusted-CIDR PROXY v1/v2 source is
+attested inside encrypted rule-bound Hello with the current policy digest. Exit
+configuration decides source selection/PROXY sending, not Hello toggles. Effective
+client admission follows validation; bounded header startup slots and absolute
+deadlines limit pending work. Source edits close changed sessions, not siblings.
+UDP/both source paths and native RELAY remain outside this first slice. No source
+health is inferred from configuration, target observations or historical ACKs.

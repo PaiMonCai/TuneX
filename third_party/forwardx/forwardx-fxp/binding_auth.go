@@ -82,7 +82,7 @@ func authorizeHello(cfg config, hello *helloFrame) error {
 		// Trusted source forwarding is not enabled by a client-controlled hello.
 		hello.ProxyProtocolExitReceive = cfg.ProxyProtocolExitReceive
 		hello.ProxyProtocolExitSend = cfg.ProxyProtocolExitSend
-		return nil
+		return authorizeManagedSource(cfg, hello)
 	}
 	return errors.New("unauthorized binding")
 }

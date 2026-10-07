@@ -61,7 +61,7 @@ Agent 先在 Panel 创建 Node，使用该节点生成的安装/enrollment 和 u
 
 `TUNEX_FXP_LINKS_ENABLED` 默认 false，公共支持矩阵仍 planned。正式开放条件由 [开发方案 F0/F1](DEVELOPMENT_PLAN.md) 和 [验收说明](testing.md) 控制。测试开启需要：
 
-1. 备份数据库、配置与节点私有状态；先执行当前完整迁移，包含 `20261101005000_link_traffic_checkpoints` 和 `20261101006000_link_target_sets`，部署兼容的 Panel/Worker 接收端。
+1. 备份数据库、配置与节点私有状态；先执行当前完整迁移，包含 `20261101005000_link_traffic_checkpoints`、`20261101006000_link_target_sets` 和 `20261101007000_link_client_sources`，部署兼容的 Panel/Worker 接收端。
 2. Panel 和 Worker 设置一致、独立生成的 32 字节/64 位 hex `TUNEX_LINK_SEAL_KEY`，并开启 FXP 实验开关；不使用 AUTH_SECRET 代替，不在运行中随意更换封存密钥。
 3. 升级兼容 Agent 与实际 FXP，开启同名开关。Agent state 目录持久且只允许服务账户访问；Linux 目录/文件模式 0700/0600，Windows 使用对应服务账户 ACL。
 4. 先在有限节点创建双节点 Link，验证零规则 passive、单条 TCP/UDP/both、限制、流量回执、共享 A/B 更新、失败补偿及删除端口复用；核对真实镜像与最小能力。
@@ -71,6 +71,8 @@ Agent 先在 Panel 创建 Node，使用该节点生成的安装/enrollment 和 u
 F1 Agent 只有探测到实际程序的统计分段能力才传递新协议参数并上报 `forward.traffic.rotation.v1`；旧 FXP 沿用有界 v1 模式。可在 Agent 服务环境设置 `TUNEX_FXP_TRAFFIC_EPOCH_SECONDS`（30–86400，默认 86400），较短段龄会增加数据库身份行及离线段数。产生 v2 manifest 后旧 Agent 会拒绝读取，回退必须排空或保留统计、核对兼容性，不能删除水位/私有文件绕过错误。
 
 F2 多目标绑定要求两端实际报告 `forward.targets.fxp.v1`；Agent 探测对应 runner 并显式启用参数，旧程序不能恢复多目标配置。升级后先用有限规则验证完整目标集、辅助 TCP 探测、主备切换及 B 长连接。回退到单目标需提交只有一项的完整目标集修订，并保留兼容 runner；不能降级程序后忽略配置字段、直接删 JSON 列或清缓存。目标集变更会关闭受影响规则的旧会话，选择/探测边界见运行说明。
+
+F3 来源绑定额外要求双方实际 `forward.client-source.fxp.v1`；先升级数据库/Panel/Worker，再升级 Agent/FXP。首版仅共享 TCP，受信 CIDR 应限实际代理；先在支持 PROXY 的测试目标核对 v1/v2、来源和限额，再启用业务规则。回退先创建显式关闭接收/发送的修订（IP_HASH 改为已有策略），仍保留来源配置及兼容 runner；旧程序不得忽略字段继续传输。不能直接删除来源列/缓存或把双向节点地址当客户端。
 
 `FORWARD_BATCH_DELETE_ENABLED` 也是独立默认关闭功能，开启前完成原生/远端适用范围的真实清理验收。支付开关与上述转发能力无关，当前不作为核心发布前置；不能因 FXP 验收通过就开启未审查的支付流程。
 

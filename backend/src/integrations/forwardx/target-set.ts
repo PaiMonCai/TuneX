@@ -11,7 +11,7 @@ const target = z.object({
 export const LinkTargetSetSchema = z.object({
   version: z.literal(1),
   targets: z.array(target).min(1).max(10),
-  strategy: z.enum(["fallback", "round_robin", "random"]),
+  strategy: z.enum(["fallback", "round_robin", "random", "ip_hash"]),
   failure_seconds: z.number().int().min(10).max(3600),
   recover_seconds: z.number().int().min(10).max(3600),
   probe: z.enum(["tcp", "none"]),

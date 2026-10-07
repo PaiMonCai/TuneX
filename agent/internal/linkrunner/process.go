@@ -193,6 +193,9 @@ func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, e
 			args = append(args, "-managed-traffic-rotation-v1", traffic.rotationPath)
 		}
 	}
+	if traffic.sourceEnabled {
+		args = append(args, "-managed-source-v1")
+	}
 	if traffic.targetsEnabled {
 		args = append(args, "-managed-targets-v1")
 	}

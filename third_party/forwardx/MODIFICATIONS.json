@@ -13,13 +13,15 @@
     "Strict private bounded no-follow rotation controls and a secret-free executable capability probe",
     "Negotiated ordered business target sets with exact per-rule/protocol authorization, fallback/RR/random and bounded failure/recovery observations",
     "Fixed UDP source mappings retarget sockets without resetting AEAD sequence or replay state; bounded closed-session wire history across policy reloads",
-    "Bounded auxiliary TCP probe workers, no-probe TCP half-open recovery, and secret-free digest-bound target status"
+    "Bounded auxiliary TCP probe workers, no-probe TCP half-open recovery, and secret-free digest-bound target status",
+    "Negotiated shared TCP client source policies reuse PROXY codecs/IP_HASH with canonical trusted CIDRs, bounded absolute header reads and authenticated rule/policy source attestations",
+    "Exit-owned PROXY send/version and canonical source selection; per-effective-source admission and changed-rule-only policy revocation, legacy/UDP source combinations fail closed"
   ],
   "files": [
     {
       "path": "forwardx-fxp/binding_auth.go",
       "original_sha256": null,
-      "modified_sha256": "42fe4451b511e9c336f72761ed5c4487a82e362ffdf8e82fe71e4b4ba09e0417",
+      "modified_sha256": "f4ca46f98a9b7b3c26bce8683f80c8825e64bcd95f59c409f047aa4ee82bae59",
       "change": "added"
     },
     {
@@ -31,25 +33,25 @@
     {
       "path": "forwardx-fxp/config.go",
       "original_sha256": "d637af32bc06f83995be8ff295e84cbc85c6bf5a0f33e3a2d5c27365480c40aa",
-      "modified_sha256": "21e83f2ba6f86dc74032802ad27785df46a54e6e2bec076d8704321ed7978f9a",
+      "modified_sha256": "99d584ca0a18a9a12d4e9fe7b7859e72690f1ed4baa1b83625be71aa2c0d0b0a",
       "change": "modified"
     },
     {
       "path": "forwardx-fxp/config_types.go",
       "original_sha256": "90c05ffae2ba96716b62405c1f6cf3f2231638cef3ca2a5f9271689d6754d310",
-      "modified_sha256": "48d43ceb848bee7b6675f54873e99c0f0823511c38fb7427e1a3be438ca5c447",
+      "modified_sha256": "9fd926f5108b25ec6159930d3c7d8b7ab7360173f207d47eeb373bd5fa85368d",
       "change": "modified"
     },
     {
       "path": "forwardx-fxp/main.go",
       "original_sha256": "f138489498e0a87fe58abe3c8780928998d441a08c56e21a41d427fbcbbc9411",
-      "modified_sha256": "db461a65e706c0b9ee3a479a941bd5f96b346d3d5e7ec0ef3a5193027829c15a",
+      "modified_sha256": "89a241b5a6ce1a40fc408598a805be5cfb44852a6baae3ccc80480a9cf7432fc",
       "change": "modified"
     },
     {
       "path": "forwardx-fxp/managed_reload.go",
       "original_sha256": null,
-      "modified_sha256": "3a1aecc54efe4ed37d48ef1b19d2056a3a3fd89e2db1bfb3c1b44eccb95afbc3",
+      "modified_sha256": "d6c0ba0c1d1c3fe66410214c9647ff90ae820c7ec2e02ec08f2fac81c855b42d",
       "change": "added"
     },
     {
@@ -59,9 +61,27 @@
       "change": "added"
     },
     {
+      "path": "forwardx-fxp/managed_sources.go",
+      "original_sha256": null,
+      "modified_sha256": "d1015182779fcd8e86c0fcc733ba574d24673cb72265db0859140033819a9a18",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_sources_integration_test.go",
+      "original_sha256": null,
+      "modified_sha256": "c7ed09fc997374e344b37c8c459e3c1d0e45c7b72fe81302edde46605129bab3",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_sources_test.go",
+      "original_sha256": null,
+      "modified_sha256": "d00f08b5de5fed7d44e7517da478510c39c750de9b9599991b9d6a2b2ab4cb43",
+      "change": "added"
+    },
+    {
       "path": "forwardx-fxp/managed_targets.go",
       "original_sha256": null,
-      "modified_sha256": "2dc4382d160fda21fc7e8ee7d25d666cb6ba50b247dd1134f16571665632d6c5",
+      "modified_sha256": "fc66d582626478b97c11d907be640103aaee08b51e6e54f7ca4528feaf189207",
       "change": "added"
     },
     {

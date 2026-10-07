@@ -1,6 +1,6 @@
 /** Browser-only contract fixture. No database, no Agent or production credentials. */
 import { resolve } from "node:path";
-import { projectLinkTargetSet, type LinkBindingInput, type LinkDetail } from "@/lib/links-types";
+import { projectLinkClientSource, projectLinkTargetSet, type LinkBindingInput, type LinkDetail } from "@/lib/links-types";
 import { link, statistics, targetLink } from "./links-fixtures";
 
 const bundle = await Bun.build({ entrypoints: [resolve(import.meta.dir, "browser-entry.tsx")], target: "browser",
@@ -13,6 +13,7 @@ let conflict = false;
 let partial = false;
 let delay = false;
 let targetsCapabilityMissing = false;
+let sourceError: string | null = null;
 const calls: { path: string; method: string; workspaceId: number; body: unknown }[] = [];
 const response = (data: unknown, status = 200) => Response.json({ data }, { status });
 const failure = (code: string, status = 409) => Response.json({ code, error: code }, { status });
@@ -24,14 +25,16 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
   if (path === "/") return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   if (path === "/bundle.js") return new Response(js, { headers: { "Content-Type": "text/javascript" } });
   if (path === "/__test/f2-checks.js") return new Response(Bun.file(resolve(import.meta.dir, "browser-targets-checks.js")), { headers: { "Content-Type": "text/javascript" } });
+  if (path === "/__test/f3-checks.js") return new Response(Bun.file(resolve(import.meta.dir, "browser-client-source-checks.js")), { headers: { "Content-Type": "text/javascript" } });
   if (path === "/favicon.ico") return new Response(null, { status: 204 });
   if (path === "/__test/state") return response({ links, calls });
   if (path === "/__test/scenario") {
-    const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean; targetsCapabilityMissing?: boolean;
+    const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean; targetsCapabilityMissing?: boolean; sourceError?: "link_client_source_required" | "agent_fxp_source_capability_missing" | "client_source_tcp_only" | "ip_hash_requires_client_source";
       targetObservation?: "healthy" | "all_unavailable" | "stale" | "digest_mismatch" | "expired" | "missing" | "ingress_only" | "not_ready" | "probe_none" | "probe_none_silent" | "legacy" | "old_checked" | "future_checked" | "initial_unknown";
       statistics?: "idle" | "collecting" | "backlogged" | "blocked" | "unknown" };
     enabled = input.enabled ?? true; conflict = input.conflict ?? false; partial = input.partial ?? false; delay = input.delay ?? false;
     targetsCapabilityMissing = input.targetsCapabilityMissing ?? false;
+    sourceError = input.sourceError ?? null;
     if (input.reset) { links = []; calls.length = 0; }
     if (input.targetObservation) {
       if (!links.length) links.push(targetLink());
@@ -112,6 +115,7 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
       } else {
         const input = body as { expected_revision: number; binding: LinkBindingInput };
         if (conflict || input.expected_revision !== f.config_revision) { conflict = false; f.config_revision++; return failure("revision_conflict"); }
+        if (f.client_source && !input.binding.client_source) return failure("link_client_source_required");
         if (f.target_set && !input.binding.target_set) return failure("link_target_set_required");
         const invalid = validateBinding(input.binding); if (invalid) return invalid;
         Object.assign(f, project(input.binding), { config_revision: f.config_revision + 1 });
@@ -141,9 +145,16 @@ function project(binding: LinkBindingInput) {
   return { name: binding.name, forward_protocol: binding.protocol, listen_ip: binding.listen_host || "0.0.0.0", listen_port: binding.listen_port,
     remote_host: binding.target_host, remote_port: binding.target_port, bytes_per_second_in: binding.bytes_per_second_in,
     ...(binding.target_set ? { target_set: projectLinkTargetSet(binding.target_set) } : {}),
+    ...(binding.client_source ? { client_source: projectLinkClientSource(binding.client_source) } : {}),
     bytes_per_second_out: binding.bytes_per_second_out, max_connections: binding.max_connections, max_connections_per_ip: binding.max_connections_per_ip };
 }
 function validateBinding(binding: LinkBindingInput): Response | null {
+  if (sourceError) return failure(sourceError);
+  if ((binding.client_source || binding.target_set?.strategy === "ip_hash") && binding.protocol !== "tcp") return failure("client_source_tcp_only", 400);
+  if (binding.target_set?.strategy === "ip_hash" && !binding.client_source) return failure("ip_hash_requires_client_source", 400);
+  if (binding.client_source) {
+    try { projectLinkClientSource(binding.client_source); } catch { return failure("invalid_client_source", 400); }
+  }
   if (binding.target_set) {
     if (targetsCapabilityMissing) return failure("agent_fxp_targets_capability_missing");
     try {

@@ -58,7 +58,7 @@ func targetEqual(host string, port int, target managedTarget) bool {
 
 func validManagedTargetSet(set managedTargetSet) bool {
 	if set.Version != 1 || set.RuleID <= 0 || (set.Protocol != "tcp" && set.Protocol != "udp" && set.Protocol != "both") ||
-		(set.Strategy != "fallback" && set.Strategy != "round_robin" && set.Strategy != "random") ||
+		(set.Strategy != "fallback" && set.Strategy != "round_robin" && set.Strategy != "random" && set.Strategy != "ip_hash") ||
 		set.FailureSeconds < 10 || set.FailureSeconds > 3600 || set.RecoverSeconds < 10 || set.RecoverSeconds > 3600 ||
 		(set.Probe != "tcp" && set.Probe != "none") || len(set.Targets) == 0 || len(set.Targets) > managedTargetMaxTargets {
 		return false
@@ -199,9 +199,17 @@ func (p *managedTargetPool) available(index int) bool {
 	return index >= 0 && index < len(p.health) && p.health[index].state != "unhealthy" && p.health[index].state != "recovering"
 }
 
-func (p *managedTargetPool) pick(protocol string, attempted map[int]bool) (managedTarget, int, bool) {
+func (p *managedTargetPool) pick(protocol string, attempted map[int]bool, source ...string) (managedTarget, int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.set.Strategy == "ip_hash" {
+		if protocol != "tcp" || len(source) == 0 {
+			return managedTarget{}, -1, false
+		}
+		if _, ok := sourceIP(source[0]); !ok {
+			return managedTarget{}, -1, false
+		}
+	}
 	excluded := make(map[int]bool, len(p.health))
 	now := time.Now()
 	for i, health := range p.health {
@@ -213,7 +221,7 @@ func (p *managedTargetPool) pick(protocol string, attempted map[int]bool) (manag
 			excluded[i] = false
 		}
 	}
-	endpoint, index, ok := p.selector.pick(excluded)
+	endpoint, index, ok := p.selector.pick(excluded, source...)
 	if !ok {
 		all := true
 		for _, health := range p.health {
@@ -337,7 +345,7 @@ func dialManagedTarget(ctx context.Context, network string, target managedTarget
 	return dialer.DialContext(ctx, network, net.JoinHostPort(target.Host, strconv.Itoa(target.Port)))
 }
 
-func (s *managedExitState) dialTarget(p *managedTargetPool, network string) (net.Conn, int, error) {
+func (s *managedExitState) dialTarget(p *managedTargetPool, network string, source ...string) (net.Conn, int, error) {
 	attempted := make(map[int]bool)
 	for len(attempted) < len(p.set.Targets) {
 		s.mu.RLock()
@@ -345,7 +353,7 @@ func (s *managedExitState) dialTarget(p *managedTargetPool, network string) (net
 			s.mu.RUnlock()
 			return nil, -1, errors.New("managed target policy replaced")
 		}
-		target, index, ok := p.pick(network, attempted)
+		target, index, ok := p.pick(network, attempted, source...)
 		if !ok {
 			s.mu.RUnlock()
 			break
@@ -378,6 +386,9 @@ func (s *managedExitState) dialLegacyTarget(hello helloFrame) (net.Conn, error) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	policy := s.policy.Load()
+	if err := authorizeManagedSource(policy.cfg, &hello); err != nil {
+		return nil, err
+	}
 	if policy.pools[hello.RuleID] != nil || (policy.cfg.RequireBindingAuth && !authorizedTarget(policy.cfg, hello.RuleID, hello.Network, hello.TargetIP, hello.TargetPort)) {
 		return nil, errors.New("managed target policy replaced")
 	}

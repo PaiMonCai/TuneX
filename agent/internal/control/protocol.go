@@ -54,6 +54,7 @@ const (
 	CapabilityRuntimePolicy   = "forward.policy.runtime.v1"
 	CapabilityTrafficRotation = "forward.traffic.rotation.v1"
 	CapabilityFXPTargets      = "forward.targets.fxp.v1"
+	CapabilityFXPSource       = "forward.client-source.fxp.v1"
 )
 
 // advertisedActions is the single source of truth for what this agent
@@ -70,7 +71,7 @@ var advertisedActions = []string{
 
 // Capabilities returns the actions this agent implements, sorted. The caller
 // gets a copy: a state report must not be able to mutate the agent's own list.
-type RuntimeFacts struct{ FXPLink, PolicyRuntime, TrafficRotation, FXPTargets bool }
+type RuntimeFacts struct{ FXPLink, PolicyRuntime, TrafficRotation, FXPTargets, FXPSource bool }
 
 func Capabilities(facts ...RuntimeFacts) []string {
 	out := make([]string, len(advertisedActions))
@@ -79,6 +80,9 @@ func Capabilities(facts ...RuntimeFacts) []string {
 		out = append(out, ActionApplyLink, ActionRemoveLink, CapabilityFXPLink)
 		if facts[0].TrafficRotation {
 			out = append(out, CapabilityTrafficRotation)
+		}
+		if facts[0].FXPSource {
+			out = append(out, CapabilityFXPSource)
 		}
 		if facts[0].FXPTargets {
 			out = append(out, CapabilityFXPTargets)

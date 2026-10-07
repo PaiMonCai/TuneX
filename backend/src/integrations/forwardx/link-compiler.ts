@@ -3,6 +3,7 @@ import { canonicalConfigDigest, linkRuntimeId } from "./core-contract.ts";
 import { checkAgentVersion } from "./agent-version.ts";
 import { bindScopesOverlap } from "./bind-scope.ts";
 import { LinkTargetSetSchema, targetSetMatchesFirst } from "./target-set.ts";
+import { LinkClientSourceSchema, validateLinkClientSourceBinding } from "./client-source.ts";
 
 const positive = z.number().int().positive().max(2_147_483_647);
 const port = positive.max(65_535);
@@ -33,12 +34,13 @@ export const FxpLinkInputSchema = z.object({
     target_host: z.string().trim().min(1).max(255).refine((host) => !/[\s/\x00]/.test(host), "invalid target host"),
     target_port: port,
     target_set: LinkTargetSetSchema.optional(),
+    client_source: LinkClientSourceSchema.optional(),
     bytes_per_second_in: rate,
     bytes_per_second_out: rate,
     max_connections: z.number().int().min(0).max(1_000_000).default(0),
     max_connections_per_ip: z.number().int().min(0).max(1_000_000).default(0),
   }).strict().refine((b) => !b.target_set || targetSetMatchesFirst(b.target_set, b.target_host, b.target_port),
-    "target_set_first_mismatch")).max(500),
+    "target_set_first_mismatch").superRefine(validateLinkClientSourceBinding)).max(500),
 }).strict();
 
 export type FxpLinkInput = z.input<typeof FxpLinkInputSchema>;
@@ -71,6 +73,9 @@ export function compileFxpLink(input: FxpLinkInput, transportKey: string): {
     if (!node.capabilities.includes("forward.link.fxp.v1")) throw new Error("agent_fxp_capability_missing");
     if (spec.bindings.some((b) => b.target_set) && !node.capabilities.includes("forward.targets.fxp.v1"))
       throw new Error("agent_fxp_targets_capability_missing");
+    if (spec.bindings.some((b) => b.client_source || b.target_set?.strategy === "ip_hash") &&
+        !node.capabilities.includes("forward.client-source.fxp.v1"))
+      throw new Error("agent_fxp_source_capability_missing");
   }
   const seenRules = new Set<number>();
   const occupied: Array<{ protocol: string; host: string; port: number }> = [];
@@ -78,6 +83,7 @@ export function compileFxpLink(input: FxpLinkInput, transportKey: string): {
   const allowedBindings: RunnerConfig[] = [];
   const udpTargets: RunnerConfig[] = [];
   const targetSets: RunnerConfig[] = [];
+  const clientSources: RunnerConfig[] = [];
   const ingressRuntimeIds: string[] = [];
   for (const binding of [...spec.bindings].sort((a, b) => a.forward_id - b.forward_id)) {
     if (seenRules.has(binding.forward_id)) throw new Error("duplicate_forward_binding");
@@ -89,13 +95,16 @@ export function compileFxpLink(input: FxpLinkInput, transportKey: string): {
       failureSeconds: binding.target_set.failure_seconds, recoverSeconds: binding.target_set.recover_seconds,
       probe: binding.target_set.probe } : undefined;
     if (targetSet) targetSets.push(targetSet);
+    const clientSource = binding.client_source ? { version: 1, receiveProxy: binding.client_source.receive_proxy,
+      trustedCIDRs: binding.client_source.trusted_cidrs, sendProxy: binding.client_source.send_proxy } : undefined;
+    if (clientSource) clientSources.push({ ...clientSource, ruleId: binding.forward_id });
     entries.push({ role: "entry", tunnelId: spec.link_id, ruleId: binding.forward_id,
       listenPort: binding.listen_port, udpListenPort: binding.listen_port, listenHost: binding.listen_host,
       protocol: binding.protocol, exitHost: spec.egress.connect_host, exitPort: spec.carrier_port,
       udpExitPort: spec.carrier_port, targetIp: binding.target_host, targetPort: binding.target_port,
       key: transportKey, limitIn: binding.bytes_per_second_in, limitOut: binding.bytes_per_second_out,
       maxConnections: binding.max_connections, maxIPs: binding.max_connections_per_ip,
-      ...(targetSet ? { targetSet } : {}) });
+      ...(targetSet ? { targetSet } : {}), ...(clientSource ? { clientSource } : {}) });
     const protocols = binding.protocol === "both" ? ["tcp", "udp"] as const : [binding.protocol];
     for (const protocol of protocols) {
       if (occupied.some((p) => p.protocol === protocol && p.port === binding.listen_port &&
@@ -117,7 +126,7 @@ export function compileFxpLink(input: FxpLinkInput, transportKey: string): {
   const exitConfig = { role: "exit", tunnelId: spec.link_id, listenPort: spec.carrier_port,
     udpListenPort: spec.carrier_port, protocol: "both", key: transportKey,
     managedReload: true, requireBindingAuth: true, allowedBindings, udpTargets,
-    ...(targetSets.length ? { targetSets } : {}) };
+    ...(targetSets.length ? { targetSets } : {}), ...(clientSources.length ? { clientSources } : {}) };
   // Agent and managed runner both enforce 1 MiB. Check before creating a
   // business revision, especially when long hosts multiply full authorization.
   for (const config of [entryConfig, exitConfig]) {

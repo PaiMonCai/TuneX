@@ -15,7 +15,7 @@
 | 原生普通 Forward | TCP、UDP；TCP 客户端 TLS/WS 前端；DIRECT/RELAY | 普通 both 未开放。客户端 TLS/WS 不表示节点间 hop 已加密，legacy native hop 仅按私网/可信网络边界使用。 |
 | 托管共享 FXP | 固定双节点、加密 TCP/UDP/both、规则复用、每规则有序多目标 | 实验开关默认关闭，公共矩阵 planned；多目标需要双方实际能力，尚无共享安全多跳/多出口。 |
 | 原生目标池 | fallback、RR/random/weighted 选择及健康恢复 | 仅适用已有出口池路径，DIRECT 业务 API 仍为单目标；不能推广到 FXP。 |
-| IP_HASH | 选择器和可信来源注入测试已有 | RELAY/EGRESS 生产来源链未完成，能力门禁关闭。 |
+| IP_HASH / PROXY | 共享 FXP TCP 来源切片已实现，候选验收中 | 须显式 `client_source` 及双方真实能力；UDP/both 拒绝。原生 RELAY 来源门禁不变。 |
 
 支持维度以 [core-contract.ts](../backend/src/integrations/forwardx/core-contract.ts) 为准；实验 Link 编译和节点准入见 [link-compiler.ts](../backend/src/integrations/forwardx/link-compiler.ts)。枚举中存在 GOST/WireGuard/更多驱动的名称不代表运行支持。
 
@@ -53,7 +53,7 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 ## FXP 多目标与健康窗口
 
-规则可选 `target_set` v1：1–10 个有序且不重复的 `{host, port}`、`fallback/round_robin/random`、10–3600 秒的失败/恢复窗口，以及 `probe:tcp|none`。原有 `target_host/target_port` 必须等于首项，只是兼容投影。未提供目标集的旧规则保持单目标；已有目标集编辑若被旧客户端省略，明确拒绝。退回单目标需提交只有一项的完整目标集修订。API、ForwardRevision 和 LinkDeployment 都保存完整目标及顺序。每个 runner 配置仍限 1 MiB，编译在持久化前检查字节预算；500 规则×10 目标是结构上限，不保证最长地址组合全部装入一个连接。
+规则可选 `target_set` v1：1–10 个有序且不重复的 `{host, port}`、`fallback/round_robin/random/ip_hash` (IP_HASH: TCP + `client_source`)、10–3600 秒的失败/恢复窗口，以及 `probe:tcp|none`。原有 `target_host/target_port` 必须等于首项，只是兼容投影。未提供目标集的旧规则保持单目标；已有目标集编辑若被旧客户端省略，明确拒绝。退回单目标需提交只有一项的完整目标集修订。API、ForwardRevision 和 LinkDeployment 都保存完整目标及顺序。每个 runner 配置仍限 1 MiB，编译在持久化前检查字节预算；500 规则×10 目标是结构上限，不保证最长地址组合全部装入一个连接。
 
 两节点都需通过真实 `-managed-target-capabilities` 探测并报告 `forward.targets.fxp.v1`；新建、更新及私有恢复均拒绝不支持的 runner。出口只从配置授权的 rule/protocol/完整目标集选择，Hello 不提供任意目标授权。复用 ForwardX FXP 的出口选择器及规则目标窗口语义，新增业务目标池适配；这不表示 ForwardX 原来的载体出口池本身就是业务目标集。
 
@@ -64,6 +64,17 @@ TCP 在新连接时选择，当前拨号失败可尝试其他合资格目标，�
 UDP 来源映射固定目标。已确认失败时关闭受影响目标 socket，后续数据报选择其他合资格目标；保留原 FXP 会话、防重放窗口与返回加密序号，防止重建后 nonce 重用。旧 socket 的迟到回包不能穿过新映射。目标恢复不主动迁移仍健康的现有映射。目标集/策略修订则明确关闭受影响规则的旧 TCP/UDP，未变化 B 的监听、socket、预算与健康窗口保持。关闭的 UDP 会话保留有界、进程内的 rule/session 加密与重放历史到 10 分钟；同身份不能同时从另一 peer 建立映射。历史满时拒绝新身份，不提前驱逐有效防重放记录。这不是跨进程永久重放保护；重启沿用 FXP 原有随机会话与序号分配边界。
 
 探测有固定工作池、超时和有界队列，500×10 目标不会创建无界 goroutine。目标状态独立于 listener Ready：unknown/healthy/suspect/recovering/unhealthy，选中索引表示最近一次连接/映射的选择，不代表所有现存会话。只有当前授权 digest、已部署规则/目标数量、节点/Workspace、代次、有效租约和新鲜报告全部吻合时才显示；缺观测保持未知。子程序仅输出脱敏索引和时间，Agent 不透传原始日志、地址或密钥。
+
+## FXP TCP 可信来源与 PROXY
+
+可选 `client_source` v1：`receive_proxy`、`trusted_cidrs`（最多 32 个 IPv4/IPv6 CIDR）、`send_proxy:off|v1|v2`。只支持业务 TCP；即使显式全关闭也保留来源配置与能力约束。旧规则不提供此字段时行为不变；已有配置被编辑客户端省略明确拒绝。关闭接收/发送需提交显式新修订，不能默默删字段。
+
+- 不接收 PROXY 时，来源取实际入口 socket，应用 payload 不被当作来源声明。接收时，只允许配置的受信 socket 网段，必须收到有效 TCP4/TCP6 PROXY v1/v2 头；不受信来源、UNKNOWN/LOCAL、缺失/损坏头和无效端口拒绝。CIDR 掩码规范化，拒绝 /0、zone、IPv4-mapped IPv6 CIDR 和规范化后重复项；只信任实际需要的上游代理，不信任整个公网。
+- 接收有最多 128 个在途头解析槽位、5 秒绝对截止时间，v1 最多 108 字节、v2 总计最多 536 字节；分片/慢头不会延长截止时间，也不会吞掉后续 payload。总 socket 并发先限，验证后再按有效原始 IP 准入，不能让上游用户共享代理节点的每 IP 预算。
+- 两端必须由实际 `-managed-source-capabilities` 探测报告 `forward.client-source.fxp.v1`，运行时显式 `-managed-source-v1`。认证加密 Hello 包含版本、当前来源策略摘要和规范来源端点，并与 carrier/rule/protocol/目标授权一起校验；旧来源策略声明在变更后拒绝。信任边界是已授权的入口节点，不承诺阻止掌握载体密钥的恶意节点谎报客户端。
+- 出口使用自己的绑定配置重建发送模式、版本和 IP_HASH 选择键，不采用 Hello 的任意选择键或发送开关，不修改 HTTP 头。目标服务必须支持 PROXY，否则开启发送会破坏握手。`off` 不给目标发送头，但内部来源仍可参与 IP_HASH。目标收到的是入口客户端/受信上游声明的端点，不是出口节点 IP。
+- IP_HASH 使用规范客户端 IP、不包含临时端口；相同健康成员集合和顺序下选择稳定，成员/顺序或合资格健康状态变化可能重新映射。不同 IP 允许哈希碰撞，不保证每个客户端独占目标；失败后可尝试其他授权目标，既有 TCP 不自动迁移。缺少有效来源时拒绝，不静默退成 RR。
+- 来源策略变更关闭受影响规则的旧会话，保持未变化 B 的 TCP/UDP 和预算。详情展示的是**配置策略**，不把 desired、ACK、Ready 或目标健康冒充实时来源验证。目前不扩展原生 RELAY 或 UDP/both 来源组合。
 
 <a id="traffic"></a>
 

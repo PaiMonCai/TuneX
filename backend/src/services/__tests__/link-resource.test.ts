@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+import { writeFileSync, unlinkSync } from "node:fs";
 
-test("Link lifecycle persists complete F2 target sets, fences snapshot facts and preserves legacy bindings", () => {
+test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores and fences snapshots", () => {
   const modulePath = (relative: string) => JSON.stringify(fileURLToPath(new URL(relative, import.meta.url)));
   const scenario = `
     import { mock } from "bun:test";
@@ -13,7 +15,8 @@ test("Link lifecycle persists complete F2 target sets, fences snapshot facts and
     let usageRows = [];
     let reportedVersion = "0.0.0-dev", legacyVersion = "unknown", fxpAdvertised = true;
     const targetCapNodes = new Set([11,12]);
-    const jsonFields = new Set(["link_target_config","targets","binding_snapshot","config"]);
+    const sourceCapNodes = new Set([11,12]);
+    const jsonFields = new Set(["link_target_config","link_source_config","targets","binding_snapshot","config"]);
     const matches = (r,w={}) => Object.entries(w).every(([k,v]) => {
       if (v && typeof v === "object" && "in" in v) return v.in.includes(r[k]);
       if (v && typeof v === "object" && "not" in v) return r[k] !== v.not;
@@ -21,11 +24,11 @@ test("Link lifecycle persists complete F2 target sets, fences snapshot facts and
       return r[k] === v;
     });
     const table = (name) => {
-      const rows = tables[name] = [];
+      const rows = tables[name] = []; let nextId = 1;
       const expand = (r) => name === "deployment" ? { ...r, placements: tables.placement.filter(p=>p.deployment_id===r.id),
         link: tables.link.find(l=>l.id===r.link_id) } : name === "placement" ? { ...r,
         deployment: db.linkDeployment.expand(tables.deployment.find(d=>d.id===r.deployment_id)) } : r;
-      const patch = (r,data) => { for(const [k,v] of Object.entries(data)) r[k] = k === "link_target_config" && v?.constructor?.name === "JsonNull"
+      const patch = (r,data) => { for(const [k,v] of Object.entries(data)) r[k] = ["link_target_config","link_source_config"].includes(k) && v?.constructor?.name === "JsonNull"
         ? null : v && typeof v === "object" && "increment" in v ? (r[k]??0)+v.increment
         : jsonFields.has(k) && v != null ? structuredClone(v) : v; };
       const find = (where) => rows.find(r=>matches(r, Object.values(where??{}).some(v=>v&&typeof v==="object"&&("version" in v||"generation" in v)) ? Object.values(where)[0] : where));
@@ -35,7 +38,7 @@ test("Link lifecycle persists complete F2 target sets, fences snapshot facts and
         findUniqueOrThrow: async({where})=> {const r=find(where); if(!r)throw Error("fixture_not_found"); return expand(r);},
         findMany: async(args={})=>rows.map(expand).filter(r=>matches(r,args.where)),
         count: async({where})=>rows.filter(r=>matches(r,where)).length,
-        create: async({data})=> {const r={ id:rows.length+1, config_revision:0, generation:0, desired_version:1, status:"draft" }; patch(r,data); delete r.placements; rows.push(r);
+        create: async({data})=> {const r={ id:nextId++, config_revision:0, generation:0, desired_version:1, status:"draft" }; patch(r,data); delete r.placements; rows.push(r);
           if(data.placements) for(const p of data.placements.create) await db.linkPlacement.create({data:{...p,deployment_id:r.id,applied_generation:null}});
           return expand(r); },
         update: async({where,data})=> {const r=find(where); if(!r)throw Error("fixture_not_found"); patch(r,data);return expand(r);},
@@ -61,7 +64,7 @@ test("Link lifecycle persists complete F2 target sets, fences snapshot facts and
     mock.module(${modulePath("../policy-service.ts")},()=>({getEffectivePolicy:async()=>policy, countWorkspaceTunnels:async()=>tables.tunnel.length,
       sumWorkspaceTraffic:async()=>trafficUsed,withWorkspaceQuotaLock:async(_id,fn)=>fn(db,policy)}));
     mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async(id)=>({capabilities:fxpAdvertised
-      ? ["forward.link.fxp.v1",...(targetCapNodes.has(id)?["forward.targets.fxp.v1"]:[])] : []})}));
+      ? ["forward.link.fxp.v1",...(targetCapNodes.has(id)?["forward.targets.fxp.v1"]:[]),...(sourceCapNodes.has(id)?["forward.client-source.fxp.v1"]:[])] : []})}));
     let blocked=false,failIngress=false,lateAck=false,lateAckForwardId=null;
     const sent=[], acquired=[];
     mock.module(${modulePath("../portPool.ts")},()=>({
@@ -254,6 +257,135 @@ test("Link lifecycle persists complete F2 target sets, fences snapshot facts and
     assert.deepEqual(snapshots()[0],firstSnapshot);
     assert.deepEqual((await service.getLink(3,link.id)).forwards.map(r=>r.id),[a.id,b.id]);
 
+
+    // F3 is shared FXP TCP only; source trust is immutable and capability-gated.
+    const rawSource={version:1,receive_proxy:true,trusted_cidrs:["192.0.2.129/24","2001:0DB8:1234::1/48"],send_proxy:"v2"};
+    const canonicalSource={...rawSource,trusted_cidrs:["192.0.2.0/24","2001:db8:1234::/48"]};
+    const disabledSource={version:1,receive_proxy:false,trusted_cidrs:[],send_proxy:"off"};
+    const hashSet={...structuredClone(completeSet),strategy:"ip_hash"};
+    const sourceBody=(source=rawSource,set=hashSet)=>({...rule("F3",26003),protocol:"tcp",target_set:set,client_source:source});
+    assert.deepEqual(service.LinkBindingSchema.parse(sourceBody()).client_source,canonicalSource);
+    for(const client_source of [null,{...rawSource,extra:true},{...rawSource,trusted_cidrs:["192.0.2.1/24","192.0.2.129/24"]},{...rawSource,trusted_cidrs:["::ffff:192.0.2.1/104"]}])
+      assert.equal(service.LinkBindingSchema.safeParse({...sourceBody(),client_source}).success,false);
+    for(const missing of [11,12]) {
+      sourceCapNodes.delete(missing);const before=persisted();
+      for(const body of [sourceBody(),sourceBody(disabledSource)]) {
+        await assert.rejects(()=>service.createLinkForward(3,link.id,8,body),e=>e.code==="agent_fxp_source_capability_missing");
+        assert.deepEqual(persisted(),before,"source admission precedes reservations and durable writes");
+      }
+      sourceCapNodes.add(missing);
+      targetCapNodes.delete(missing);
+      await assert.rejects(()=>service.createLinkForward(3,link.id,8,sourceBody()),e=>e.code==="agent_fxp_targets_capability_missing");
+      assert.deepEqual(persisted(),before);targetCapNodes.add(missing);
+    }
+    for(const protocol of ["udp","both"])for(const source of [rawSource,disabledSource]) {
+      const before=persisted();
+      await assert.rejects(()=>service.createLinkForward(3,link.id,8,{...sourceBody(source),protocol}));
+      assert.deepEqual(persisted(),before);
+    }
+    const d=await service.createLinkForward(3,link.id,8,sourceBody());
+    const sourceRow=()=>tables.tunnel.find(r=>r.id===d.id);
+    const sourceSnapshots=()=>tables.revision.filter(r=>r.tunnel_id===d.id);
+    const assertSource=(expected,status="active")=>{
+      const row=sourceRow(),snapshot=sourceSnapshots().at(-1);
+      assert.deepEqual(row.link_source_config,expected);assert.deepEqual(snapshot.link_source_config,expected);
+      assert.deepEqual(row.link_target_config,hashSet);assert.deepEqual(snapshot.targets,expectedTargets(hashSet));
+      assert.equal(row.desired_status,status);assert.equal(snapshot.desired_status,status);
+      assert.equal(row.config_revision,snapshot.revision);assert.equal(row.desired_revision_id,snapshot.id);
+    };
+    const assertSourceRestore=async expected=>{
+      const deployment=tables.deployment.at(-1),frozen=structuredClone(deployment.binding_snapshot);
+      assert.deepEqual(frozen.spec.bindings.find(b=>b.forward_id===d.id).client_source,expected);
+      for(const nodeId of [11,12]) {
+        const config=(await service.desiredNodeLinks(nodeId))[0];assert.ok(config);
+        const runtime={version:1,receiveProxy:expected.receive_proxy,trustedCIDRs:expected.trusted_cidrs,sendProxy:expected.send_proxy};
+        if(nodeId===11) {
+          const entry=config.runner_config.entries.find(b=>b.ruleId===d.id);
+          assert.deepEqual(entry.clientSource,runtime);assert.equal("ruleId" in entry.clientSource,false);
+        } else {
+          assert.deepEqual(config.runner_config.clientSources.find(b=>b.ruleId===d.id),{...runtime,ruleId:d.id});
+          assert.deepEqual(config.runner_config.allowedBindings.filter(b=>b.ruleId===d.id),
+            hashSet.targets.map(t=>({ruleId:d.id,protocol:"tcp",targetIp:t.host,targetPort:t.port})));
+        }
+      }
+      assert.deepEqual(deployment.binding_snapshot,frozen);
+    };
+    assertSource(canonicalSource);assert.equal(sourceRow().config_revision,1);
+    assert.deepEqual(sourceSnapshots()[0].link_source_config,canonicalSource);await assertSourceRestore(canonicalSource);
+    const publicSource=(await service.getLink(3,link.id)).forwards.find(b=>b.id===d.id);
+    assert.deepEqual(publicSource.client_source,canonicalSource);
+    assert.equal("link_source_config" in publicSource,false);
+    const legacySource=(await service.getLink(3,link.id)).forwards.find(f=>f.id===b.id);
+    assert.equal("link_source_config" in legacySource,false);assert.equal("client_source" in legacySource,false);
+    const firstSourceSnapshot=structuredClone(sourceSnapshots()[0]);
+    const firstSourceDeployment=structuredClone(tables.deployment.at(-1).binding_snapshot);
+    const firstSourceGeneration=tables.link[0].generation;
+    const omitted={...sourceBody(),target_set:{...hashSet,strategy:"fallback"}};delete omitted.client_source;
+    const beforeOmitted=persisted();
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,omitted),
+      e=>e.code==="link_client_source_required");assert.deepEqual(persisted(),beforeOmitted);
+    const omittedAll={...rule("old client",26003),protocol:"tcp"};
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,omittedAll),
+      e=>e.code==="link_client_source_required");assert.deepEqual(persisted(),beforeOmitted);
+    const omittedHash=sourceBody();delete omittedHash.client_source;
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,omittedHash),
+      e=>e.code==="link_client_source_required");assert.deepEqual(persisted(),beforeOmitted);
+    const beforeCAS=persisted();
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision-1,sourceBody()),
+      e=>e.code==="revision_conflict");assert.deepEqual(persisted(),beforeCAS);
+
+    // Both active and suspended edits preflight the merged config before writes.
+    const normalRows=tables.tunnel.length,normalStatus=sourceRow().desired_status;
+    const largeTargets={...structuredClone(hashSet),strategy:"fallback",targets:Array.from({length:10},(_,i)=>({host:"x".repeat(250),port:443+i}))};
+    tables.tunnel.push(...Array.from({length:350},(_,i)=>({...sourceRow(),id:10000+i,listen_port:30000+i,
+      remote_host:largeTargets.targets[0].host,remote_port:443,link_target_config:structuredClone(largeTargets)})));
+    for(const desired_status of ["active","inactive"]) {
+      sourceRow().desired_status=desired_status;const before=persisted();
+      await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,sourceBody()),
+        e=>e.code==="link_config_too_large");
+      assert.deepEqual(persisted(),before,"byte budget refusal precedes revisions, reservations and deployments");
+    }
+    tables.tunnel.splice(normalRows);sourceRow().desired_status=normalStatus;
+
+    await service.actionLinkForward(3,link.id,d.id,"suspend",8);assertSource(canonicalSource,"inactive");
+    for(const missing of [11,12]) {
+      sourceCapNodes.delete(missing);const before=persisted();
+      await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,sourceBody(disabledSource)),
+        e=>e.code==="agent_fxp_source_capability_missing");
+      await assert.rejects(()=>service.actionLinkForward(3,link.id,d.id,"resume",8),e=>e.code==="agent_fxp_source_capability_missing");
+      assert.deepEqual(persisted(),before);sourceCapNodes.add(missing);
+      targetCapNodes.delete(missing);
+      await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,sourceBody()),
+        e=>e.code==="agent_fxp_targets_capability_missing");
+      assert.deepEqual(persisted(),before);targetCapNodes.add(missing);
+    }
+    const editedSource={...canonicalSource,send_proxy:"v1"};
+    await service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,sourceBody(editedSource));
+    assertSource(editedSource,"inactive");
+    assert.equal(tables.deployment.at(-1).binding_snapshot.spec.bindings.some(b=>b.forward_id===d.id),false);
+    await service.actionLinkForward(3,link.id,d.id,"resume",8);assertSource(editedSource);await assertSourceRestore(editedSource);
+    failIngress=true;
+    await assert.rejects(()=>service.updateLinkForward(3,link.id,d.id,8,sourceRow().config_revision,sourceBody(disabledSource)),/link_apply_unconfirmed/);
+    failIngress=false;assertSource(disabledSource);
+    const failedSource=structuredClone(tables.deployment.at(-1).binding_snapshot),failedSourceGeneration=tables.link[0].generation;
+    assert.equal((await service.reconcileLinks()).errors,0);
+    assert.equal(tables.link[0].generation,failedSourceGeneration);assertSource(disabledSource);await assertSourceRestore(disabledSource);
+    assert.deepEqual(tables.deployment.at(-1).binding_snapshot,failedSource);
+    const sourceRevisionCount=sourceSnapshots().length;
+    await service.actionLinkForward(3,link.id,d.id,"retry",8);
+    assert.equal(sourceSnapshots().length,sourceRevisionCount);assertSource(disabledSource);await assertSourceRestore(disabledSource);
+    assert.deepEqual(sourceSnapshots()[0],firstSourceSnapshot);
+    assert.deepEqual(tables.deployment.find(b=>b.generation===firstSourceGeneration).binding_snapshot,firstSourceDeployment);
+    // Snapshot-era capabilities are not permanent attestations.
+    sourceCapNodes.delete(12);
+    assert.equal((await service.desiredNodeLinks(11)).length,0);
+    assert.equal((await service.reconcileLinks()).errors,1);
+    assert.equal(tables.deployment.at(-1).status,"policy_blocked");
+    sourceCapNodes.add(12);assert.equal((await service.reconcileLinks()).errors,0);
+    assertSource(disabledSource);await assertSourceRestore(disabledSource);
+    await service.actionLinkForward(3,link.id,d.id,"delete",8);
+    assert.equal(sourceRow(),undefined);assert.deepEqual(sourceSnapshots().at(-1).link_source_config,disabledSource);
+
     const priorGeneration=tables.link[0].generation;
     await assert.rejects(()=>service.retireLink(3,link.id),/link_has_references/);
     assert.equal(tables.link[0].generation,priorGeneration);
@@ -303,7 +435,14 @@ test("Link lifecycle persists complete F2 target sets, fences snapshot facts and
     await service.retireLink(3,link.id);assert.equal(tables.link[0].status,"retired");
     assert.equal(tables.credential.every(c=>!c.secret_enc.includes("51".repeat(32))),true);
   `;
-  const result = Bun.spawnSync([process.execPath, "--eval", scenario], { stdout: "pipe", stderr: "pipe" });
-  if (result.exitCode !== 0) throw new Error(result.stderr.toString());
-  expect(result.exitCode).toBe(0);
+  // Keep module mocks isolated without exceeding Windows command-line limits.
+  const fixture = fileURLToPath(new URL(".link-resource-" + randomUUID() + ".ts", import.meta.url));
+  writeFileSync(fixture, scenario, { flag: "wx" });
+  try {
+    const result = Bun.spawnSync([process.execPath, fixture], { stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+    expect(result.exitCode).toBe(0);
+  } finally {
+    unlinkSync(fixture);
+  }
 });

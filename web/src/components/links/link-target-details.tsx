@@ -8,7 +8,7 @@ export function ForwardTargets({ link, forward, copy, now }: { link: LinkDetail;
   const status = forwardTargetStatus(link, forward, now);
   const healthLabels: Record<LinkTargetHealth, string> = { unknown: copy.unknown, healthy: copy.healthHealthy,
     suspect: copy.healthSuspect, recovering: copy.healthRecovering, unhealthy: copy.healthUnhealthy };
-  const strategies = { fallback: copy.strategyFallback, round_robin: copy.strategyRoundRobin, random: copy.strategyRandom };
+  const strategies = { fallback: copy.strategyFallback, round_robin: copy.strategyRoundRobin, random: copy.strategyRandom, ip_hash: copy.strategyIpHash };
   const reasons: Record<LinkTargetStatus["reason"], string> = { initial: copy.reasonInitial, selected: copy.reasonSelected,
     target_failed: copy.reasonTargetFailed, target_recovered: copy.reasonTargetRecovered, all_unavailable: copy.reasonAllUnavailable };
   const chosen = (protocol: "tcp" | "udp") => forward.forward_protocol !== "both" && forward.forward_protocol !== protocol
@@ -37,6 +37,7 @@ export function ForwardTargets({ link, forward, copy, now }: { link: LinkDetail;
         </li>;
       })}
     </ol>
+    {set?.strategy === "ip_hash" && <p className="text-[var(--muted-foreground)]">{copy.ipHashRemapHint}</p>}
     <p className="text-[var(--muted-foreground)]">{copy.targetHealthHint}</p>
     {!status && <p className="text-[var(--muted-foreground)]">{copy.targetUnknownHint}</p>}
     {set?.probe === "none" && <p className="text-[var(--muted-foreground)]">{copy.targetProbeHint}</p>}

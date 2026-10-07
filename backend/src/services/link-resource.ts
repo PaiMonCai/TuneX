@@ -16,6 +16,7 @@ import { linkObservation } from "./link-observation.ts";
 import { normalizeBindScope } from "../integrations/forwardx/bind-scope.ts";
 import { checkAgentVersion } from "../integrations/forwardx/agent-version.ts";
 import { LinkTargetSetSchema, persistedLinkTargetSet, targetSetMatchesFirst } from "../integrations/forwardx/target-set.ts";
+import { LinkClientSourceSchema, persistedLinkClientSource, validateLinkClientSourceBinding } from "../integrations/forwardx/client-source.ts";
 
 const id = z.number().int().positive().max(2_147_483_647);
 const port = id.max(65_535);
@@ -31,12 +32,13 @@ export const LinkBindingSchema = z.object({
   target_host: z.string().trim().min(1).max(255).refine((h) => !/[\s/\x00]/.test(h)),
   target_port: port,
   target_set: LinkTargetSetSchema.optional(),
+  client_source: LinkClientSourceSchema.optional(),
   bytes_per_second_in: z.number().int().min(0).max(2_147_483_647).default(0),
   bytes_per_second_out: z.number().int().min(0).max(2_147_483_647).default(0),
   max_connections: z.number().int().min(0).max(1_000_000).default(0),
   max_connections_per_ip: z.number().int().min(0).max(1_000_000).default(0),
 }).strict().refine((b) => !b.target_set || targetSetMatchesFirst(b.target_set, b.target_host, b.target_port),
-  "target_set_first_mismatch");
+  "target_set_first_mismatch").superRefine(validateLinkClientSourceBinding);
 export type LinkConfig = z.infer<typeof LinkConfigSchema>;
 export type LinkBindingInput = z.input<typeof LinkBindingSchema>;
 const LEASE_MS = 180_000;
@@ -115,7 +117,7 @@ export async function getLink(workspaceId: number, linkId: number) {
       remote_host: true, remote_port: true, desired_status: true, apply_status: true,
       config_revision: true, applied_revision: true, user_id: true,
       bytes_per_second_in: true, bytes_per_second_out: true, max_connections: true, max_connections_per_ip: true,
-      link_target_config: true,
+      link_target_config: true, link_source_config: true,
     }, orderBy: { id: "asc" } }),
   ]);
   const reports = deployment ? await db.nodeStateReport.findMany({ where: {
@@ -143,8 +145,9 @@ export async function getLink(workspaceId: number, linkId: number) {
       })) } : null,
     forwards: forwards.map((forward) => {
       const measured = usage.find((row) => row.forward_id === forward.id);
-      const { link_target_config, ...publicForward } = forward;
-      return { ...publicForward, ...(link_target_config == null ? {} : { target_set: persistedLinkTargetSet(link_target_config) }), traffic: measured ? {
+      const { link_target_config, link_source_config, ...publicForward } = forward;
+      return { ...publicForward, ...(link_target_config == null ? {} : { target_set: persistedLinkTargetSet(link_target_config) }),
+        ...(link_source_config == null ? {} : { client_source: persistedLinkClientSource(link_source_config) }), traffic: measured ? {
         bytes_in: (measured._sum.bytes_in ?? 0n).toString(),
         bytes_out: (measured._sum.bytes_out ?? 0n).toString(),
         connections: (measured._sum.connections ?? 0n).toString(),
@@ -206,10 +209,8 @@ async function preflightBinding(tx: Prisma.TransactionClient, workspaceId: numbe
   link: Awaited<ReturnType<typeof scopedLink>>, config: LinkConfig,
   nodes: Awaited<ReturnType<typeof endpoints>>, binding: z.output<typeof LinkBindingSchema>,
   forwardId: number, active = true) {
-  // Suspended edits also preserve executable policy. Do not persist a target
-  // set which these nodes can only ignore when the rule is resumed/restored.
-  if (binding.target_set && [nodes.inFact, nodes.outFact].some((node) => !node.capabilities.includes("forward.targets.fxp.v1")))
-    throw new LinkResourceError("agent_fxp_targets_capability_missing");
+  // Compile suspended candidates too: capability checks, complete target/source
+  // authorization and the 1 MiB budget must precede every durable edit.
   const policy = await getEffectivePolicy(workspaceId, { client: tx, noCache: true });
   const rows = await tx.tunnel.findMany({ where: { workspace_id: workspaceId,
     link_resource_id: link.id, desired_status: "active" }, orderBy: { id: "asc" } });
@@ -218,11 +219,13 @@ async function preflightBinding(tx: Prisma.TransactionClient, workspaceId: numbe
     listen_host: (r.listen_ip === "127.0.0.1" || r.listen_ip === "::1" ? r.listen_ip : "") as "" | "127.0.0.1" | "::1",
     target_host: r.remote_host!, target_port: r.remote_port!,
     ...(r.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(r.link_target_config) }),
+    ...(r.link_source_config == null ? {} : { client_source: persistedLinkClientSource(r.link_source_config) }),
     ...resolveForwardPolicy(r, policy.limits) }));
-  if (active) bindings.push({ forward_id: forwardId, protocol: binding.protocol,
+  bindings.push({ forward_id: forwardId, protocol: binding.protocol,
     listen_port: binding.listen_port, listen_host: binding.listen_host,
     target_host: binding.target_host, target_port: binding.target_port,
     ...(binding.target_set ? { target_set: binding.target_set } : {}),
+    ...(binding.client_source ? { client_source: binding.client_source } : {}),
     ...resolveForwardPolicy(binding, policy.limits) });
   let compiled;
   try { compiled = compileFxpLink({ link_id: link.id, workspace_id: workspaceId,
@@ -230,6 +233,12 @@ async function preflightBinding(tx: Prisma.TransactionClient, workspaceId: numbe
     carrier_port: config.carrier_port, lease_expires_at: new Date(Date.now() + LEASE_MS).toISOString(), bindings }, "00".repeat(32)); }
   catch (error) { throw new LinkResourceError(error instanceof Error && /^[a-z_]{1,64}$/.test(error.message)
     ? error.message : "link_binding_invalid"); }
+  // A suspended edit must pass the same capability and byte budget preflight,
+  // but must not reserve or deploy its inactive listener.
+  if (!active) compiled = compileFxpLink({ link_id: link.id, workspace_id: workspaceId,
+    version: link.desired_version, generation: link.generation + 1, ingress: nodes.inFact, egress: nodes.outFact,
+    carrier_port: config.carrier_port, lease_expires_at: new Date(Date.now() + LEASE_MS).toISOString(),
+    bindings: bindings.filter((b) => b.forward_id !== forwardId) }, "00".repeat(32));
   await reservePlacements(tx, [compiled.egress, compiled.ingress]);
 }
 async function prepareDeployment(workspaceId: number, linkId: number, rotate: boolean, retiring = false) {
@@ -258,6 +267,7 @@ async function prepareDeployment(workspaceId: number, linkId: number, rotate: bo
       listen_port: r.listen_port!, listen_host: r.listen_ip === "127.0.0.1" || r.listen_ip === "::1" ? r.listen_ip : "" as const,
       target_host: r.remote_host!, target_port: r.remote_port!,
       ...(r.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(r.link_target_config) }),
+      ...(r.link_source_config == null ? {} : { client_source: persistedLinkClientSource(r.link_source_config) }),
       ...resolveForwardPolicy(r, policy.limits) }));
     const lease = new Date(Date.now() + LEASE_MS);
     const input = FxpLinkInputSchema.parse({ link_id: linkId, workspace_id: workspaceId,
@@ -400,7 +410,13 @@ export async function createLinkForward(workspaceId: number, linkId: number, act
 export async function updateLinkForward(workspaceId: number, linkId: number, forwardId: number,
   actorId: number, expectedRevision: number, raw: unknown) {
   assertLinkFeature();
-  const binding = LinkBindingSchema.parse(raw);
+  const parsed = LinkBindingSchema.safeParse(raw);
+  if (!parsed.success) {
+    if (parsed.error.issues.some((issue) => issue.message === "link_client_source_required"))
+      throw new LinkResourceError("link_client_source_required");
+    throw parsed.error;
+  }
+  const binding = parsed.data;
   const link = await scopedLink(workspaceId, linkId);
   const version = await db.linkVersion.findUniqueOrThrow({ where: { link_id_version: { link_id: linkId, version: link.desired_version } } });
   const config = LinkConfigSchema.parse(version.config);
@@ -411,6 +427,8 @@ export async function updateLinkForward(workspaceId: number, linkId: number, for
     const row = await tx.tunnel.findFirst({ where: { id: forwardId, workspace_id: workspaceId, link_resource_id: linkId } });
     if (!row) throw new LinkResourceError("forward_not_found", 404);
     if (row.config_revision !== expectedRevision) throw new LinkResourceError("revision_conflict");
+    if (row.link_source_config != null && !binding.client_source)
+      throw new LinkResourceError("link_client_source_required");
     if (row.link_target_config != null && !binding.target_set)
       throw new LinkResourceError("link_target_set_required");
     if (row.forward_protocol !== binding.protocol) throw new LinkResourceError("protocol_change_requires_new_forward");
@@ -443,6 +461,7 @@ export async function actionLinkForward(workspaceId: number, linkId: number, for
       listen_host: row.listen_ip === "127.0.0.1" || row.listen_ip === "::1" ? row.listen_ip : "",
       target_host: row.remote_host, target_port: row.remote_port,
       ...(row.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(row.link_target_config) }),
+    ...(row.link_source_config == null ? {} : { client_source: persistedLinkClientSource(row.link_source_config) }),
       bytes_per_second_in: row.bytes_per_second_in ?? 0, bytes_per_second_out: row.bytes_per_second_out ?? 0,
       max_connections: row.max_connections ?? 0, max_connections_per_ip: row.max_connections_per_ip ?? 0,
     }), row.id);
@@ -453,6 +472,7 @@ export async function actionLinkForward(workspaceId: number, linkId: number, for
           listen_port: row.listen_port, ingress_node_id: row.ingress_node_id!,
           egress_node_id: row.egress_node_id, target_host: row.remote_host!, target_port: row.remote_port!,
           ...(row.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(row.link_target_config) }),
+          ...(row.link_source_config == null ? {} : { client_source: persistedLinkClientSource(row.link_source_config) }),
           link_resource_id: linkId, bytes_per_second_in: row.bytes_per_second_in,
           bytes_per_second_out: row.bytes_per_second_out, max_connections: row.max_connections,
           max_connections_per_ip: row.max_connections_per_ip } as ForwardCandidateConfig,
@@ -505,10 +525,14 @@ async function deploymentIsCurrent(link: Awaited<ReturnType<typeof scopedLink>>,
     return false;
   const snapshot = DeploymentSnapshotSchema.parse(deployment.binding_snapshot);
   try {
-    await endpoints(link.workspace_id, { ingress_node_id: snapshot.spec.ingress.id,
+    const nodes = await endpoints(link.workspace_id, { ingress_node_id: snapshot.spec.ingress.id,
       egress_node_id: snapshot.spec.egress.id, carrier_port: snapshot.spec.carrier_port });
+    // A snapshot freezes config, not a permanent capability attestation.
+    compileFxpLink({ ...snapshot.spec, ingress: nodes.inFact, egress: nodes.outFact }, "00".repeat(32));
   } catch (error) {
     if (error instanceof LinkResourceError) throw new LinkResourceError(error.code, 403);
+    if (error instanceof Error && /^agent_fxp_[a-z_]+_capability_missing$/.test(error.message))
+      throw new LinkResourceError(error.message, 403);
     throw error;
   }
   const policy = await getEffectivePolicy(link.workspace_id, { noCache: true });
@@ -525,6 +549,7 @@ async function deploymentIsCurrent(link: Awaited<ReturnType<typeof scopedLink>>,
     listen_port: row.listen_port, listen_host: row.listen_ip === "127.0.0.1" || row.listen_ip === "::1" ? row.listen_ip : "",
     target_host: row.remote_host, target_port: row.remote_port,
     ...(row.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(row.link_target_config) }),
+      ...(row.link_source_config == null ? {} : { client_source: persistedLinkClientSource(row.link_source_config) }),
     ...resolveForwardPolicy(row, policy.limits) }));
   return latest.desired_version === deployment.version &&
     canonicalConfigDigest(bindings) === canonicalConfigDigest(snapshot.spec.bindings) &&
