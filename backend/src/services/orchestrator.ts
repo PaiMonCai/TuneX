@@ -1498,8 +1498,8 @@ export function normalizeLbStrategy(value: string | null | undefined): AgentTunn
       return "RANDOM";
     case "weighted_round":
     case "weighted_round_robin":
-      //  的 LoadBalancer 接受该串并退化为等权轮询（见 lb.go 注释）；
-      // v1.1 真正的平滑加权落地前，显式传它就是显式记录意图。
+      // Agent LoadBalancer executes target weights for this strategy.
+      // Keep the canonical wire spelling so live dispatch and startup restore agree.
       return "WEIGHTED_ROUND_ROBIN";
     default:
       return "ROUND_ROBIN";
