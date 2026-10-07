@@ -345,8 +345,8 @@ export const zh = {
       "暂时取不到这个节点的连接与凭据事实，所以下面不会显示「在线 / 已安装」之类的结论；安装命令仍然有效。",
     readonlyEmptyTitle: "当前工作空间还没有节点",
     readonlyEmptyHint:
-      "你的工作空间权限里只有 node:read（可以查看节点），没有 node:manage，因此不能添加或重装节点。请联系有 node:manage 权限的成员或工作空间管理员来添加节点；添加完成后刷新本页即可看到。",
-    createBlockedPermission: "你没有 node:manage 权限，无法创建节点。",
+      "你可以查看节点，但没有节点管理权限，因此不能添加或重装节点。请联系有节点管理权限的成员或工作空间管理员来添加；完成后刷新本页即可看到。",
+    createBlockedPermission: "你没有节点管理权限，无法创建节点。",
     createBlockedGroupsLoading: "正在加载节点池，加载完成后即可创建节点。",
     createBlockedGroupsFailed: "节点池加载失败，请先重新加载节点池。",
     createBlockedGroupsEmpty: "还没有可用的节点池；节点必须归属一个节点池。",
@@ -1443,8 +1443,8 @@ export const en: Dict = {
       "This node's connection and credential facts are temporarily unavailable, so no online/installed conclusion is shown below; the install command stays valid.",
     readonlyEmptyTitle: "This workspace has no nodes yet",
     readonlyEmptyHint:
-      "Your workspace permissions include node:read (view nodes) but not node:manage, so you cannot add or reinstall nodes. Ask a member with node:manage or your workspace administrator to add one, then reload this page.",
-    createBlockedPermission: "You do not have node:manage, so you cannot create nodes.",
+      "You can view nodes but do not have node-management permission, so you cannot add or reinstall nodes. Ask a member with node-management permission or your workspace administrator to add one, then reload this page.",
+    createBlockedPermission: "You do not have node-management permission, so you cannot create nodes.",
     createBlockedGroupsLoading: "Node pools are still loading; you can create a node once they are loaded.",
     createBlockedGroupsFailed: "Loading node pools failed; reload the node pools first.",
     createBlockedGroupsEmpty:
