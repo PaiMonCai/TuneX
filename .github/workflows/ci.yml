@@ -62,7 +62,7 @@ jobs:
             backend="$(match '^(backend/|shared/|Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env\.production\.example$)')"
             web="$(match '^(web/|shared/|Dockerfile$)')"
             agent="$(match '^(agent/|shared/)')"
-            ops="$(match '^(scripts/ops/|Dockerfile$|backend/Dockerfile$|agent/Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env(\.production)?\.example$|docs/production-deploy\.md$)')"
+            ops="$(match '^(scripts/(ops|integration)/|Dockerfile$|backend/Dockerfile$|agent/Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env(\.production)?\.example$|docs/production-deploy\.md$)')"
           fi
 
           # Cheap secret scan is the one repository-wide invariant worth running
@@ -221,6 +221,8 @@ jobs:
           sh -n scripts/ops/bootstrap.sh
           bash -n scripts/ops/backup.sh
           bash -n scripts/ops/restore.sh
+          bash -n scripts/integration/a00-core-gate.sh
+          python3 -m py_compile scripts/integration/a00-delete-reuse.py
       - name: Current deployment contract
         run: bash scripts/ops/tests/installer-static.sh
 
