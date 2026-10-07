@@ -17,7 +17,7 @@ if (!enabled) {
     || !/^\/[A-Za-z0-9_]+_link_traffic_test$/.test(url.pathname)) {
     throw new Error("Link traffic DB tests require a dedicated loopback *_link_traffic_test database");
   }
-  const { PrismaClient } = await import("@prisma/client");
+  const { Prisma, PrismaClient } = await import("@prisma/client");
   const { createPrismaLinkTrafficStore, submitLinkTraffic } = await import("../src/services/link-traffic.ts");
   const client = new PrismaClient({ datasources: { db: { url: url.href } }, log: [] });
   const realStore = createPrismaLinkTrafficStore(client);
@@ -140,5 +140,34 @@ if (!enabled) {
         assert.deepEqual([daily.traffic, daily.traffic_cost], [expected, expected], "each producer's delta counted exactly once");
       }
     }
+
+    // Deterministic stale-snapshot interleaving: authorization can establish a
+    // REPEATABLE READ snapshot before a concurrent reporter creates the rows.
+    // The current-row locks and native writes must still see that committed
+    // producer and daily fact. Retrying P2025 would hide the underlying bug.
+    const snapshotProducer = randomBytes(16).toString("hex");
+    const snapshotDate = new Date("2037-11-02T00:00:00Z");
+    const firstSnapshotSample = { ...sample(1, forwardIds[0], snapshotProducer), date: "2037-11-02" };
+    const nextSnapshotSample = { ...firstSnapshotSample, bytes_in: "20", bytes_out: "40", connections: "2" };
+    const snapshotResult = await client.$transaction(async (tx) => {
+      const unseen = () => tx.linkTrafficCheckpoint.findMany({ where: {
+        node_id: nodeId, producer_id: snapshotProducer, date: snapshotDate,
+      } });
+      assert.equal((await unseen()).length, 0);
+      assert.equal((await tx.tunnelTraffic.findMany({ where: { tunnel_id: forwardIds[0], date: snapshotDate } })).length, 0);
+      assert.equal((await send([firstSnapshotSample])).ok, true);
+      assert.equal((await unseen()).length, 0, "the consistent snapshot predates the committed producer");
+      const scopedStore = createPrismaLinkTrafficStore({ $transaction: (work) => work(tx) });
+      return submitLinkTraffic(nodeId, { samples: [nextSnapshotSample] }, { store: scopedStore });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 });
+    assert.deepEqual(snapshotResult, { ok: true, accepted: [nextSnapshotSample] });
+    const snapshotFact = await client.tunnelTraffic.findUnique({ where: {
+      tunnel_id_date: { tunnel_id: forwardIds[0], date: snapshotDate },
+    } });
+    assert.deepEqual([snapshotFact.traffic, snapshotFact.traffic_cost], [60, 60]);
+    const snapshotCheckpoint = await client.linkTrafficCheckpoint.findFirst({ where: {
+      node_id: nodeId, producer_id: snapshotProducer, date: snapshotDate,
+    } });
+    assert.deepEqual([snapshotCheckpoint.bytes_in, snapshotCheckpoint.bytes_out, snapshotCheckpoint.connections], [20n, 40n, 2n]);
   });
 }

@@ -336,7 +336,7 @@ test("body limit counts actual UTF-8/chunked bytes, permits exactly 1MiB, and re
   assert.equal(cancelled, true);
 });
 
-test("Prisma adapter uses native upserts before current-row locks and checks daily attribution even at zero delta", async () => {
+test("Prisma adapter keeps locked writes native and checks daily attribution even at zero delta", async () => {
   const trace: string[] = [];
   let dailyWorkspace = 3;
   let traffic = 0;
@@ -346,10 +346,23 @@ test("Prisma adapter uses native upserts before current-row locks and checks dai
     linkDeployment: { findUnique: async () => deployment() },
     async $executeRaw(query: Prisma.Sql) {
       trace.push(query.sql);
-      assert.match(query.sql, /INSERT INTO (link_traffic_checkpoint|tunnel_traffic)/);
-      assert.match(query.sql, /ON DUPLICATE KEY UPDATE id = id/);
-      assert.ok(query.values.includes(linkTrafficDate("2026-11-01")!.toISOString())
-        || query.values.some((value) => value instanceof Date && value.toISOString() === "2026-11-01T00:00:00.000Z"));
+      if (query.sql.includes("UPDATE link_traffic_checkpoint")) {
+        assert.match(query.sql, /updated_at = \?/);
+        assert.ok(query.values[3] instanceof Date);
+        assert.equal(query.values.at(-1), checkpoint.id);
+        [checkpoint.bytes_in, checkpoint.bytes_out, checkpoint.connections] = query.values.slice(0, 3) as bigint[];
+      } else if (query.sql.includes("UPDATE tunnel_traffic")) {
+        const [bytes, cost, dailyId] = query.values;
+        assert.equal(bytes, 300);
+        assert.equal(cost, bytes);
+        assert.equal(dailyId, 92);
+        traffic += Number(bytes);
+      } else {
+        assert.match(query.sql, /INSERT INTO (link_traffic_checkpoint|tunnel_traffic)/);
+        assert.match(query.sql, /ON DUPLICATE KEY UPDATE id = id/);
+        assert.ok(query.values.includes(linkTrafficDate("2026-11-01")!.toISOString())
+          || query.values.some((value) => value instanceof Date && value.toISOString() === "2026-11-01T00:00:00.000Z"));
+      }
       return 1;
     },
     async $queryRaw(query: Prisma.Sql) {
@@ -358,14 +371,10 @@ test("Prisma adapter uses native upserts before current-row locks and checks dai
       return query.sql.includes("FROM link_traffic_checkpoint") ? [{ ...checkpoint }]
         : [{ id: 92, workspace_id: dailyWorkspace, traffic, traffic_cost: traffic }];
     },
-    linkTrafficCheckpoint: { update: async ({ data }: { data: { bytes_in: bigint; bytes_out: bigint; connections: bigint } }) => {
-      Object.assign(checkpoint, data); trace.push("checkpoint:update");
-    } },
-    tunnelTraffic: { update: async ({ data }: { data: { traffic: { increment: number }; traffic_cost: { increment: number } } }) => {
-      assert.deepEqual(data, { traffic: { increment: 300 }, traffic_cost: { increment: 300 } });
-      traffic += data.traffic.increment;
-      trace.push("daily:update");
-    } },
+    // A consistent snapshot may not contain rows a different transaction has
+    // just inserted. These ORM paths must never be used after current-row locks.
+    linkTrafficCheckpoint: { update: async () => { throw new Error("snapshot checkpoint unavailable"); } },
+    tunnelTraffic: { update: async () => { throw new Error("snapshot daily fact unavailable"); } },
   };
   type AdapterTransaction = typeof tx;
   const client = { async $transaction<T>(work: (tx: AdapterTransaction) => Promise<T>) { return work(tx); } };
@@ -374,10 +383,10 @@ test("Prisma adapter uses native upserts before current-row locks and checks dai
   assert.equal(traffic, 300);
   assert.match(trace[0]!, /INSERT INTO link_traffic_checkpoint/);
   assert.match(trace[1]!, /FROM link_traffic_checkpoint/);
-  assert.equal(trace[2], "checkpoint:update");
+  assert.match(trace[2]!, /UPDATE link_traffic_checkpoint/);
   assert.match(trace[3]!, /INSERT INTO tunnel_traffic/);
   assert.match(trace[4]!, /FROM tunnel_traffic/);
-  assert.equal(trace[5], "daily:update");
+  assert.match(trace[5]!, /UPDATE tunnel_traffic/);
   dailyWorkspace = 9;
   assert.deepEqual(await send(store, [sample()]), { ok: false, status: 409, reason: "link_traffic_identity_conflict" });
   assert.equal(traffic, 300);

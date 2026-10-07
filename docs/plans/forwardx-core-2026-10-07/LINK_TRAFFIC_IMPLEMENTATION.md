@@ -65,4 +65,16 @@ Link 详情显示双向累计 payload 字节、累计已接纳连接/UDP 映射�
 
 整体 `required` 仍失败，原因是 backend 数据库集成的四项：三项旧 fixture 与协议/快照/能力广告新契约不匹配；一项新独立数据库并发统计事务未全部提交，尚需记录闭集 ORM/SQL 错误码并定位，不能把多 Agent 顺序统计通过当成并发账本通过。下一步不降低这些门禁或放开实验矩阵。
 
-下一优先级：修复并重跑首版失败门禁 → 完成统计链路的 Linux 验收与长期 spool 裁剪 → 可信客户端来源透传/IP_HASH 和 FXP 多目标主备。复杂拓扑、运营和支付不抢占这些核心验收。
+### 并发失败定位与修复
+
+`4b2c9d2` 的 CI `37640473624` 后端 3169 项 unit/contract、111 项数据库/HTTP 集成及真实多节点 35 项均通过，但 Agent 有一次 HTTP desired 启动 fixture 失败。后端一次通过不能证明之前的并发失败消失，因此 `de6ea84` 增加 20 轮新 producer 的创建竞争；CI `37641893432` 在首组 10 个事务中再次失败，6 个提交、4 个返回 503，闭集诊断全部为 `P2025`，没有把它当作死锁自动重试。
+
+原因判断：授权查询先建立 MySQL REPEATABLE READ 一致性快照；另一事务随后创建统计行。原生 `FOR UPDATE` 能看见已经提交的当前行，但随后 Prisma update 的读检查仍可能看不到新行。当前修复保留原生 upsert/行锁，并把水位和日事实更新也放在锁内原生 SQL；水位显式写入应用端 UTC receipt 时间，保持现有 `@updatedAt` 语义。原生当前读与一致性快照的区别参考 [MySQL 一致性读取](https://dev.mysql.com/doc/refman/8.4/en/innodb-consistent-read.html) 与 [锁定读取](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html)。具体 ORM 路径判断以实际数据库回归为准。
+
+数据库 gate 还新增确定性交错：事务 A 先确认 producer/新日事实不存在，事务 B 创建并提交，A 的一致性读取仍看不到它，随后在 A 内执行接收/锁定/更新；提交后必须精确入账 60 字节。保留 20 轮竞争、倒序/重复、历史归属与冲突回滚检查。没有放宽 ACK、额度、事务回滚或 required 门禁。
+
+Agent 测试修复在 HTTP fetch 期间持续预留子进程端口；强制 bind 冲突可复现无日志启动失败，并验证 Ready 必须为 false。历史 CI 未记录子进程 exit code，因此端口竞争是有复现支持的原因判断，不声称已从旧日志证明。定向 100 次、完整 linkrunner（含真实 FXP）及 vet 已通过；最终 Linux 候选仍需 CI。
+
+本地修复后的统计事务/HTTP 15 项和后端 TypeScript 均通过。本机没有可用 MySQL，确定性交错和完整并发压力的结果必须由候选提交 CI 实证。
+
+下一优先级：完成修复候选的统一门禁 → 长期活动统计历史裁剪 → 可信客户端来源透传/IP_HASH 和 FXP 多目标主备。复杂拓扑、运营和支付不抢占这些核心验收。

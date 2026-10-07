@@ -135,7 +135,16 @@ export function createPrismaLinkTrafficStore(client: Pick<PrismaClient, "$transa
         return rows[0]!;
       },
       async updateCheckpoint(checkpointId, totals) {
-        await tx.linkTrafficCheckpoint.update({ where: { id: checkpointId }, data: totals });
+        // Authorization created a REPEATABLE READ snapshot before another
+        // reporter could commit this row. FOR UPDATE sees the current row, but
+        // Prisma's read-before-update can still report P2025 from that older
+        // snapshot. Keep writes native too; the row is already locked above.
+        // Raw SQL must explicitly maintain Prisma's @updatedAt receipt stamp.
+        await tx.$executeRaw(Prisma.sql`
+          UPDATE link_traffic_checkpoint
+          SET bytes_in = ${totals.bytes_in}, bytes_out = ${totals.bytes_out},
+            connections = ${totals.connections}, updated_at = ${new Date()}
+          WHERE id = ${checkpointId}`);
       },
       async incrementDailyTraffic(forwardId, workspaceId, date, bytes) {
         await tx.$executeRaw(Prisma.sql`
@@ -154,9 +163,10 @@ export function createPrismaLinkTrafficStore(client: Pick<PrismaClient, "$transa
           && value >= 0 && value <= Number.MAX_SAFE_INTEGER - Number(bytes))) {
           throw new Error("daily_traffic_overflow");
         }
-        if (bytes !== 0n) await tx.tunnelTraffic.update({ where: { id: row.id }, data: {
-          traffic: { increment: Number(bytes) }, traffic_cost: { increment: Number(bytes) },
-        } });
+        if (bytes !== 0n) await tx.$executeRaw(Prisma.sql`
+          UPDATE tunnel_traffic
+          SET traffic = traffic + ${Number(bytes)}, traffic_cost = traffic_cost + ${Number(bytes)}
+          WHERE id = ${row.id}`);
       },
     }), { maxWait: 5000, timeout: 30_000 }),
   };

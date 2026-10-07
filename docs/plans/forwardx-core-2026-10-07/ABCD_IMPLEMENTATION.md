@@ -4,7 +4,7 @@
 
 这是功能比较后的实施记录。优先处理隧道转发，支付、套餐、插件和移动端继续后置。本文区分代码已实现、本地已验证与发布验收，不能用类型检查或 HTTP fixtures 替代真实多节点转发。
 
-首版已提交并推送为 `8b0abbc`，草稿 PR #75。随后开始 [FXP 每规则流量切片](./LINK_TRAFFIC_IMPLEMENTATION.md)；本文件的统计缺口是首版边界，不代表后续没有推进。首轮 PR CI 的 Agent/web/ops/秘密扫描通过，backend 与 core-integration 失败；完整发布验收仍未通过。
+首版已提交并推送为 `8b0abbc`，草稿 [PR #75](https://github.com/PaiMonCai/TuneX/pull/75)。随后提交 `777a94b` 完成 [FXP 每规则流量切片](./LINK_TRAFFIC_IMPLEMENTATION.md)，接入现有额度与历史流量表。首轮失败及后续修复保留在统计记录中；下面的本机验证表属于首版证据，不能代替后续候选提交的 CI 结果。
 
 ## 1. 本轮范围
 
@@ -74,7 +74,7 @@ Link 应用或删除成功后，Agent 在发送命令 ACK 前主动上报当前�
 - Linux 容器实际镜像构建、MySQL 迁移与数据库并发租约门禁。
 - Panel/Worker、多 Agent 的真实网络部署、共享更新保留原 TCP 会话和原 UDP 目标 socket、重启恢复与事实上报。
 
-本机无 Docker/可用 Linux 环境。CI 已增加 `core-integration`，执行 `scripts/integration/abcd-core-gate.sh`，进入统一 required 检查；该 CI 运行结果尚未取得。不能据此把 A/B 公共支持矩阵由 planned 改成可发布。
+本机无 Docker/可用 Linux 环境。CI 的 `core-integration` 执行 `scripts/integration/abcd-core-gate.sh`，进入统一 required 检查。候选 `777a94b` 与 `4b2c9d2` 均已在四 Agent、Panel/Worker、MySQL/Redis 的真实 Linux 拓扑通过 35 项验收；包含双协议转发、共享规则更新、同日增量、重复去重、历史保留及重启恢复。`4b2c9d2` 后端的 3169 项 unit/contract 与 111 项数据库/HTTP 集成也通过，Agent 存在一次启动 fixture 失败，正在修复。最终候选和统一门禁结果见统计记录。公共支持矩阵继续 planned；长期统计容量、可信来源与更多目标组合仍需独立发布验收。
 
 ## 4. 测试环境启动
 
@@ -88,6 +88,6 @@ Link 应用或删除成功后，Agent 在发送命令 ACK 前主动上报当前�
 
 ## 5. 保留的后续工作
 
-本轮不是 ForwardX 全量对齐。仍需独立切片：原生 both 的全路径支持、可信来源透传后的面板 IP_HASH、多目标 FXP 绑定、链/多入口/多出口、FXP 每规则流量与统计接入现有计量、多节点总预算分配、在线有引用密钥轮换、已部署端点迁移。不能用 native reporter 的空流量替代 FXP 业务流量；付费/严格流量额度开放前必须完成该统计闭环。
+本轮不是 ForwardX 全量对齐。FXP 每规则流量已通过独立累计快照、精确存储 ACK 与事务水位接入现有计量；仍需完成长期活动 producer 的已确认历史裁剪。其他独立切片包括：原生 both 的全路径支持、可信来源透传后的面板 IP_HASH、多目标 FXP 绑定、链/多入口/多出口、多节点总预算分配、在线有引用密钥轮换、已部署端点迁移。不能用 native reporter 的空流量替代 FXP 业务流量，也不能把当前采样、上报和额度检查称为无超额窗口的实时配额池。
 
 GOST/WireGuard 和系统转发驱动、DDNS、批量导入导出和复杂运维仍沿用后续方案，各自完成真实载体/接口验收后再开放。支付继续后置。

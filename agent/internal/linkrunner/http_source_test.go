@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -11,7 +12,15 @@ import (
 )
 
 func TestHTTPSourceDesiredAuthIdentityAndReconcile(t *testing.T) {
-	cfg := exitConfig(t, "from-panel", "tcp", freePort(t, "tcp"), 1)
+	// Keep the child port reserved while httptest allocates its listener and
+	// FetchSnapshot opens its client connection. A released ephemeral port can
+	// be reused by either socket before the helper starts, especially on Linux.
+	reservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reservation.Close()
+	cfg := exitConfig(t, "from-panel", "tcp", reservation.Addr().(*net.TCPAddr).Port, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/internal/node/desired" || r.Header.Get("Authorization") != "Bearer credential" {
 			t.Errorf("wrong path/auth: %s", r.URL.Path)
@@ -29,6 +38,9 @@ func TestHTTPSourceDesiredAuthIdentityAndReconcile(t *testing.T) {
 	}
 	dir := t.TempDir()
 	m := newTestManager(t, helperBinary(t), dir)
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
 	statuses, err := m.Reconcile(snap)
 	if err != nil || !statuses[0].Ready || m.NodeDBID() != 7 {
 		t.Fatalf("reconcile: %+v %v", statuses, err)
@@ -49,6 +61,44 @@ func TestHTTPSourceDesiredAuthIdentityAndReconcile(t *testing.T) {
 	r := newTestManager(t, helperBinary(t), dir)
 	if r.NodeDBID() != 7 {
 		t.Fatal("cached DB identity missing")
+	}
+}
+
+func TestHTTPSourceDesiredBindCollisionFailsClosed(t *testing.T) {
+	// Deterministically reproduce an occupied port between desired fetch and
+	// child startup. The helper exits with code 3 before emitting any readiness
+	// markers; this must remain an error, not trigger a launch retry.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	cfg := exitConfig(t, "from-panel", "tcp", occupied.Addr().(*net.TCPAddr).Port, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"snapshot": Snapshot{NodeDBID: 7, Links: []Config{cfg}}}})
+	}))
+	defer srv.Close()
+	snap, err := (HTTPSource{PanelURL: srv.URL, Credential: "credential", AgentID: "agent-one"}).FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestManager(t, helperBinary(t), t.TempDir())
+	canonical := cloneConfig(snap.Links[0])
+	deadline, expected, err := validateConfig(&canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := startChild(m.binaryPath, m.runtimeDir, canonical, deadline, expected)
+	if !errors.Is(err, ErrProcessExited) || p == nil {
+		t.Fatalf("occupied startup: child=%v error=%v", p != nil, err)
+	}
+	<-p.done
+	if p.exitCode != 3 || len(p.logs) != 0 {
+		t.Fatalf("bind failure signature: exit=%d logs=%v", p.exitCode, p.logs)
+	}
+	statuses, err := m.Reconcile(snap)
+	if !errors.Is(err, ErrProcessExited) || len(statuses) != 1 || statuses[0].Ready || statuses[0].State != "failed" || len(statuses[0].Logs) != 0 || m.NodeDBID() != 7 {
+		t.Fatalf("occupied desired must fail closed: %+v %v", statuses, err)
 	}
 }
 
