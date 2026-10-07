@@ -276,7 +276,9 @@ forwardsRoutes.post("/", async (c) => {
   const ws = workspace(c);
   return send(
     c,
-    await createForward(user(c).id, ws.id, parsed.data),
+    await createForward(user(c).id, ws.id, parsed.data, {
+      canManageNodes: canWorkspaceResourceAction(ws, "manage", "node"),
+    }),
     201,
   );
 });
