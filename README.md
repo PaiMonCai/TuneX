@@ -3,7 +3,6 @@
 > 多租户网络转发平台，通过线路（Route Profile）与转发（Forward）统一管理 TCP、TLS、WebSocket 与 UDP 数据面。
 
 [![CI](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/ci.yml)
-[![Integration](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml/badge.svg)](https://github.com/PaiMonCai/TuneX/actions/workflows/integration.yml)
 
 ## 项目介绍
 
