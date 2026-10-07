@@ -71,7 +71,7 @@ const ZH: ForwardMultihopCopy = {
     "节点关系暂时取不到：无法判断哪些节点能同时完成两段路径。这不等于「没有可用节点」，请刷新后重试。",
   factsUnavailableNext: "下一步：刷新页面（或稍候）再看一次；若仍取不到，请检查节点接口与权限。",
   noMiddleOption: "不使用中间节点",
-  threeSegments: "已选中间节点：路径是 入口 → 中间 → 出口 → 目标。",
+  threeSegments: "已选中间节点：路径是 入口 → 中间 → 出口 → 目标（三段）。",
   visibilityNote:
     "创建后可在该转发详情页的「路径」卡片查看完整节点链；列表页只展示路径摘要。",
   bindHint: "去节点页",
@@ -106,7 +106,7 @@ const EN: ForwardMultihopCopy = {
   factsUnavailableNext:
     "Next: reload the page (or wait a moment). If it stays unavailable, check the nodes API and your permissions.",
   noMiddleOption: "No middle node",
-  threeSegments: "Middle node chosen: this forward's path is ingress → middle → egress → target.",
+  threeSegments: "Middle node chosen: this forward's path is ingress → middle → egress → target (three segments).",
   visibilityNote:
     "After creating it, the forward detail page's “path” card shows the complete node chain; the list only shows a path summary.",
   bindHint: "nodes page",
