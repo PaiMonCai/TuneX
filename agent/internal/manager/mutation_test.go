@@ -96,6 +96,10 @@ func TestRemoveRevisionTombstoneRejectsStaleResurrection(t *testing.T) {
 
 	newer := base.Clone()
 	newer.Revision = 7
+	// The old listener drains asynchronously after Remove. Use a different
+	// physical port here so this test isolates revision fencing rather than the
+	// existing kernel-level drain/reuse timing contract.
+	newer.IngressPort = freePort(t)
 	if _, err := tm.ReplaceListener(newer); err != nil {
 		t.Fatalf("newer replace rev7 should clear tombstone: %v", err)
 	}
