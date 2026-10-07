@@ -176,6 +176,11 @@ export interface ForwardPathInput {
   /** 尚未绑定、可被绑定的出口节点数（调用方已算出的候选数）。 */
   bindableEgressCount?: number | null;
   /**
+   * 当前操作者是否允许在创建 Forward 的同一事务里自动准备缺失的节点关系。
+   * true 时，关系尚未存在或关系事实暂时不可读不再是创建阻断项；服务端仍会重新校验。
+   */
+  autoSetupAllowed?: boolean;
+  /**
    * 中间跳（三跳）事实；缺省/`null` = 这条转发不使用中间跳（输出与历史逐字一致）。
    * `nodeId` 为空串 = 没选中间跳。
    */
@@ -280,14 +285,16 @@ export function buildForwardPathPreview(input: ForwardPathInput): ForwardPathPre
   };
 
   push(egressStepGap);
-  if (egressId !== "" && bindingsStatus === "unavailable") {
-    // 事实取不到 ⇒ 不许判断"没绑定"，只报"取不到"。
-    push("bindings_unavailable");
-  } else if (egressId !== "" && !isEgressBound(facts, egressId)) {
-    push("egress_not_bound");
+  const autoSetupAllowed = input.autoSetupAllowed === true;
+  if (!autoSetupAllowed) {
+    if (egressId !== "" && bindingsStatus === "unavailable") {
+      // 没有自动准备权限时，事实取不到仍然是阻断：服务端无法替用户建立缺失关系。
+      push("bindings_unavailable");
+    } else if (egressId !== "" && !isEgressBound(facts, egressId)) {
+      push("egress_not_bound");
+    }
+    if (bindingsStatus === "unavailable") push("bindings_unavailable");
   }
-  // 即使已经选了出口，只要绑定事实取不到，也要说清楚（避免"看起来选好了"）。
-  if (bindingsStatus === "unavailable") push("bindings_unavailable");
 
   const middleId = (input.middle?.nodeId ?? "").trim();
   if (middleId === "") {
@@ -319,11 +326,13 @@ export function buildForwardPathPreview(input: ForwardPathInput): ForwardPathPre
   push(middleStep.gap);
   const inboundBound = input.middle?.inboundBound ?? null;
   const outboundBound = input.middle?.outboundBound ?? null;
-  if (inboundBound === null || outboundBound === null) {
-    push("middle_segments_unavailable");
-  } else {
-    if (!inboundBound) push("middle_segment_ingress_missing");
-    if (!outboundBound) push("middle_segment_egress_missing");
+  if (!autoSetupAllowed) {
+    if (inboundBound === null || outboundBound === null) {
+      push("middle_segments_unavailable");
+    } else {
+      if (!inboundBound) push("middle_segment_ingress_missing");
+      if (!outboundBound) push("middle_segment_egress_missing");
+    }
   }
 
   return {
