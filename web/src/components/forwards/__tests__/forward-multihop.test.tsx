@@ -664,23 +664,29 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
     expect(topology.body.segments.map((row) => row.segment)).toEqual(["ingress_to_middle", "middle_to_egress"]);
   });
 
-  test("缺一段 ⇒ 409 binding_required（与后端同判据、同码风格），且**没有**建出转发", async () => {
-    const before = getStore().tunnels.length;
-    const res = await call<{ code: string; message: string }>("POST", "forwards", {
+  test("三跳缺一段 ⇒ 创建时自动补齐关系并成功", async () => {
+    // 用合法的 role=both 中间节点 6，先人为移除第二段 6→4。
+    const store = getStore();
+    store.nodeBindings = store.nodeBindings.filter(
+      (row) => !(Number(row.ingress_node_id) === 6 && Number(row.egress_node_id) === 4),
+    );
+    expect(store.nodeBindings.some((row) => Number(row.ingress_node_id) === 6 && Number(row.egress_node_id) === 4)).toBe(false);
+
+    const res = await call<{ id: number }>("POST", "forwards", {
       body: {
         mode: "relay",
-        name: "缺段",
+        name: "自动补段",
         ingress_node_id: 1,
         egress_node_id: 4,
-        middle_node_id: 5,
+        middle_node_id: 6,
         target_host: "example.com",
         target_port: 443,
       },
     });
-    expect(res.status).toBe(409);
-    expect(res.body.code).toBe("binding_required");
-    expect(res.body.message).toContain("入口→中间");
-    expect(getStore().tunnels.length).toBe(before);
+    expect(res.status).toBe(200);
+    expect(getStore().nodeBindings.some(
+      (row) => Number(row.ingress_node_id) === 6 && Number(row.egress_node_id) === 4,
+    )).toBe(true);
   });
 
   test("不带 middle_node_id 的 relay 仍是两段（老路径零回归）", async () => {
@@ -692,47 +698,29 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
     expect(topology.body.segments.map((row) => row.segment)).toEqual(["ingress_to_egress"]);
   });
 
-  test("错误码大小写与真机一致：单跳缺绑定与三跳缺段都输出小写 binding_required", async () => {
-    /*
-     * 真机逐字（scratch Panel 实测）：`{"error":"该出口尚未绑定到当前入口节点","code":"binding_required"}`
-     * 与三跳的 `{"error":"三跳路由要求入口→中间、中间→出口两段都已绑定","code":"binding_required"}`。
-     * mock 过去对单跳输出大写 `BINDING_REQUIRED`（同一份 mock 的编辑路径却用小写）——
-     * 这里把"码风格与真机一致"钉成行为断言，同时保证读取方两种都认。
-     */
-    const single = await call<{ code: string }>("POST", "forwards", {
-      body: { mode: "relay", name: "单跳缺绑定", ingress_node_id: 1, egress_node_id: 5, target_host: "example.com", target_port: 443 },
+  test("缺失的单跳关系自动创建；历史 binding_required 大小写仍能被界面兼容读取", async () => {
+    const store = getStore();
+    store.nodeBindings = store.nodeBindings.filter(
+      (row) => !(Number(row.ingress_node_id) === 1 && Number(row.egress_node_id) === 4),
+    );
+    const single = await call<{ id: number }>("POST", "forwards", {
+      body: { mode: "relay", name: "单跳自动关系", ingress_node_id: 1, egress_node_id: 4, target_host: "example.com", target_port: 443 },
     });
-    expect(single.status).toBe(409);
-    expect(single.body.code).toBe("binding_required");
+    expect(single.status).toBe(200);
+    expect(getStore().nodeBindings.some(
+      (row) => Number(row.ingress_node_id) === 1 && Number(row.egress_node_id) === 4,
+    )).toBe(true);
 
-    const multi = await call<{ code: string }>("POST", "forwards", {
-      body: {
-        mode: "relay",
-        name: "三跳缺段",
-        ingress_node_id: 1,
-        egress_node_id: 4,
-        middle_node_id: 5,
-        target_host: "example.com",
-        target_port: 443,
-      },
-    });
-    expect(multi.status).toBe(409);
-    expect(multi.body.code).toBe("binding_required");
-
-    // 过渡期两种大小写都能被界面读懂（历史 mock/网关可能仍回大写）。
+    // 旧服务/网关若仍回这一历史码，展示层继续大小写不敏感，避免升级窗口丢提示。
     expect(multihopFailureInfo("zh", { status: 409, message: "x", data: { code: "BINDING_REQUIRED" } }).code).toBe(
       "binding_required",
     );
   });
 
-  test("DIRECT 带上 middle_node_id：mock 与真后端同样不校验（已知缺口，UI 结构上不发送）", async () => {
-    // 真后端 create 只在 `if (egress)` 里校验两段（forward-service.ts:761）⇒ DIRECT 不校验。
-    // 这条断言的作用是**把这个缺口钉在明处**，避免日后有人以为 mock 漏了校验。
-    const res = await call<{ id: number }>("POST", "forwards", {
+  test("DIRECT 带 middle_node_id ⇒ 400（服务端不再静默保存无效中间节点）", async () => {
+    const res = await call<{ code?: string; message?: string }>("POST", "forwards", {
       body: { mode: "direct", name: "direct+middle", ingress_node_id: 1, middle_node_id: 6, target_host: "example.com", target_port: 443 },
     });
-    expect(res.status).toBe(200);
-    const topology = await call<{ segments: unknown[] }>("GET", `forwards/${res.body.id}/topology`);
-    expect(topology.body.segments).toEqual([]); // DIRECT：段数 0 是设计结论
+    expect(res.status).toBe(400);
   });
 });
