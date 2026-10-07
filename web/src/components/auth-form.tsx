@@ -58,7 +58,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
         <CardDescription>{isLogin ? t("auth.loginSubtitle") : t("auth.registerSubtitle")}</CardDescription>
       </CardHeader>
       <CardContent>
-        <form onSubmit={onSubmit} className="flex flex-col gap-4" data-testid={`${mode}-form`}>
+        <form method="post" onSubmit={onSubmit} className="flex flex-col gap-4" data-testid={`${mode}-form`}>
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="email">{t("common.email")}</Label>
             <Input
