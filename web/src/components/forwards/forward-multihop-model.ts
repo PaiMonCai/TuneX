@@ -35,6 +35,7 @@ export type MultihopReasonCode =
   | "same_as_egress"
   | "facts_unavailable"
   | "unknown_node"
+  | "role_not_both"
   | "segment_ingress_to_middle_missing"
   | "segment_middle_to_egress_missing";
 
@@ -187,13 +188,19 @@ function classify(input: {
         ? "same_as_egress"
         : input.node === null
           ? "unknown_node"
-          : inboundBound === null || outboundBound === null
-            ? "facts_unavailable"
-            : inboundBound && outboundBound
-              ? null
-              : !inboundBound
-                ? "segment_ingress_to_middle_missing"
-                : "segment_middle_to_egress_missing";
+          : role !== "both"
+            ? "role_not_both"
+            : inboundBound === null || outboundBound === null
+              ? canManageNodes
+                ? null
+                : "facts_unavailable"
+              : inboundBound && outboundBound
+                ? null
+                : canManageNodes
+                  ? null
+                  : !inboundBound
+                    ? "segment_ingress_to_middle_missing"
+                    : "segment_middle_to_egress_missing";
   return { ...base, selectable: reason === null, reason };
 }
 
@@ -215,8 +222,8 @@ export function buildForwardMultihopModel(input: MultihopInput): ForwardMultihop
   const facts = factsUsable ? input.facts : null;
   const inboundBindings = bindingsOf(facts, input.ingressId.trim());
 
-  if (facts === null) {
-    // 连"入口到达了哪些节点"都取不到：不给任何候选结论，也**不**说"没有候选"。
+  if (facts === null && !input.canManageNodes) {
+    // 没有自动准备权限时，关系事实不可读就无法判断这条路径是否已经准备好。
     const selectedId = input.middleNodeId.trim();
     return {
       applicable: true,
@@ -227,9 +234,9 @@ export function buildForwardMultihopModel(input: MultihopInput): ForwardMultihop
         selectedId === ""
           ? null
           : classify({
-              node: null,
+              node: input.nodes.find((node) => String(node.id) === selectedId) ?? null,
               nodeId: selectedId,
-              role: null,
+              role: input.nodes.find((node) => String(node.id) === selectedId)?.role ?? null,
               inboundBound: null,
               outboundBound: null,
               ingressId: input.ingressId.trim(),
