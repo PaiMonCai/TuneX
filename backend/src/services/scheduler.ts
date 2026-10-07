@@ -72,6 +72,7 @@ import {
   type ForwardProtocol,
 } from "./forward-contract.ts";
 import { admitRuntimeFromStore, admissionFailureDetail, type AdmissionTarget, type CapabilityFactsLoader, type RuntimeAdmissionDenied } from "./runtime-admission.ts";
+import { admitSelectorFromStore, selectorAdmissionDetail } from "./selector-admission.ts";
 import { normalizeFederatedEgressPeer } from "./forward-revision.ts";
 import {
   checkFederatedEgressTopology,
@@ -470,6 +471,14 @@ export async function createRelayTunnel(
     });
   }
 
+  const selectorAdmission = await admitSelectorFromStore(egressPick.node.id, {
+    strategy: pool?.lb_strategy ?? egressPick.node.lb_strategy, mode: "EGRESS",
+  }, deps.loadCapabilityFacts);
+  if (!selectorAdmission.ok) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied,
+      selectorAdmissionDetail(selectorAdmission), { tunnelId });
+  }
+
   await store.tunnel.update({
     where: { id: tunnelId },
     data: {
@@ -489,24 +498,28 @@ export async function createRelayTunnel(
   const [inReserved, outReserved] = await Promise.all([
     store.tunnel.findMany({
       where: { in_node_group_id: input.inNodeGroupId },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
     }),
     store.tunnel.findMany({
       where: { out_node_group_id: input.outNodeGroupId },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
     }),
   ]);
   const ingressReserved = collectReservedPorts(
     (inReserved as { id: number; listen_port: number | null }[]).filter((t) => t.id !== tunnelId),
+    { protocol: protocol, bindScope: input.listenIp },
   );
   const egressReserved = collectReservedPorts(
     (outReserved as { id: number; listen_port: number | null }[]).filter((t) => t.id !== tunnelId),
+    { protocol: protocol, bindScope: "*" },
   );
 
   const ingressAlloc = await allocateTunnelPort(
     {
       nodeId: ingressPick.node.id,
       direction: "ingress",
+      protocol: protocol,
+      bindScope: input.listenIp,
       preferred: input.listenPort ?? null,
       tunnelId,
       reservedPorts: ingressReserved,
@@ -524,6 +537,8 @@ export async function createRelayTunnel(
     {
       nodeId: egressPick.node.id,
       direction: "egress",
+      protocol: protocol,
+      bindScope: "*",
       preferred: null, // 出口端口是节点间内部端口，永不接受用户指定
       tunnelId,
       reservedPorts: egressReserved,
@@ -963,6 +978,10 @@ export async function reapplyRelayTunnel(
       `隧道 ${tunnelId} 不存在（重推前必须已落库）`,
     );
   }
+  if (row.link_resource_id != null) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      `Forward ${tunnelId} is managed by a shared Link resource`);
+  }
   if (row.tunnel_mode !== "relay") {
     return fail(
       "bind_nodes",
@@ -1120,6 +1139,13 @@ export async function reapplyRelayTunnel(
       },
     });
   }
+  const selectorAdmission = await admitSelectorFromStore(egressPick.node.id, {
+    strategy: pool?.lb_strategy ?? egressPick.node.lb_strategy, mode: "EGRESS",
+  }, deps.loadCapabilityFacts);
+  if (!selectorAdmission.ok) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied,
+      selectorAdmissionDetail(selectorAdmission), {});
+  }
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: ingressPick.node, egress: egressPick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
   await store.tunnel.update({
@@ -1141,21 +1167,23 @@ export async function reapplyRelayTunnel(
     (
       await store.tunnel.findMany({
         where: { in_node_group_id: inNodeGroupId },
-        select: { id: true, listen_port: true },
+        select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
       })
     )
       .map((t) => t as { id: number; listen_port: number | null })
       .filter((t) => t.id !== tunnelId),
+    { protocol: reapplyProtocol, bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null },
   );
   const egressReserved = collectReservedPorts(
     (
       await store.tunnel.findMany({
         where: { out_node_group_id: outNodeGroupId },
-        select: { id: true, listen_port: true },
+        select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
       })
     )
       .map((t) => t as { id: number; listen_port: number | null })
       .filter((t) => t.id !== tunnelId),
+    { protocol: reapplyProtocol, bindScope: "*" },
   );
 
   // Even when the Tunnel row already contains a port, the durable
@@ -1169,6 +1197,8 @@ export async function reapplyRelayTunnel(
     {
       nodeId: ingressPick.node.id,
       direction: "ingress",
+      protocol: reapplyProtocol,
+      bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null,
       preferred: existingIngressPort,
       tunnelId,
       reservedPorts: ingressReserved,
@@ -1186,6 +1216,8 @@ export async function reapplyRelayTunnel(
     {
       nodeId: egressPick.node.id,
       direction: "egress",
+      protocol: reapplyProtocol,
+      bindScope: "*",
       preferred: existingEgressPort,
       tunnelId,
       reservedPorts: egressReserved,
@@ -1215,7 +1247,7 @@ export async function reapplyRelayTunnel(
   let transitNode: { id: number; node_id: string; connect_ip: string | null; role: "both" | "egress" | "ingress" | null } | null = null;
   if (middleNodeId != null) {
     const middleAlloc = await allocateTunnelPort(
-      { nodeId: middleNodeId, direction: "egress", preferred: null, tunnelId, reservedPorts: [] },
+      { nodeId: middleNodeId, direction: "egress", protocol: reapplyProtocol, bindScope: "*", preferred: null, tunnelId, reservedPorts: [] },
       deps.portPoolDeps,
     );
     if (!middleAlloc.ok) {
@@ -1659,17 +1691,20 @@ async function applyFederatedRelayTunnel(
     (
       await store.tunnel.findMany({
         where: { in_node_group_id: inNodeGroupId },
-        select: { id: true, listen_port: true },
+        select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
       })
     )
       .map((t) => t as { id: number; listen_port: number | null })
       .filter((t) => t.id !== tunnelId),
+    { protocol: protocol, bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null },
   );
   const existingIngressPort = row.listen_port === null ? null : Number(row.listen_port);
   const ingressAlloc = await allocateTunnelPort(
     {
       nodeId: ingressPick.node.id,
       direction: "ingress",
+      protocol: protocol,
+      bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null,
       preferred: existingIngressPort,
       tunnelId,
       reservedPorts: ingressReserved,
@@ -1937,6 +1972,10 @@ export async function reapplyDirectTunnel(
       retryable: false,
     };
   }
+  if (row.link_resource_id != null) {
+    return { ok: false, tunnelId, error_code: SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      error: `Forward ${tunnelId} is managed by a shared Link resource`, retryable: false };
+  }
   if (row.tunnel_mode !== "direct") {
     return {
       ok: false,
@@ -2057,15 +2096,18 @@ export async function reapplyDirectTunnel(
   const reserved = collectReservedPorts(
     (await store.tunnel.findMany({
       where: { in_node_group_id: inNodeGroupId },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
     }) as unknown as { id: number; listen_port: number | null }[])
       .filter((t) => t.id !== tunnelId),
+    { protocol: directProtocol, bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null },
   );
 
   let ingressPort = row.listen_port == null ? null : Number(row.listen_port);
   const alloc = await allocateTunnelPort({
     nodeId: pick.node.id,
     direction: "ingress",
+    protocol: directProtocol,
+    bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null,
     preferred: ingressPort,
     tunnelId,
     reservedPorts: reserved,

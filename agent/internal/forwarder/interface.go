@@ -381,9 +381,34 @@ type TunnelConfig struct {
 	Targets    []Target        `json:"targets,omitempty"`
 	LBStrategy LBStrategy      `json:"lb_strategy"`
 	Protocol   ForwardProtocol `json:"protocol"`
-	SpeedLimit int64           `json:"speed_limit"`
-	Revision   int64           `json:"revision"`
-	ListenHost string          `json:"listen_host,omitempty"`
+	// SpeedLimit is the legacy ceiling in payload bytes/second PER DIRECTION,
+	// shared by this runtime's clients. Zero is unlimited. A positive value is
+	// combined with each explicit directional limit by taking the lower ceiling.
+	SpeedLimit int64 `json:"speed_limit"`
+	// PolicyScope currently supports only "runtime" (empty means runtime):
+	// one listener/runtime owns one gate and two shared directional buckets.
+	// It does not pool capacity across nodes, transports, or tunnel IDs.
+	PolicyScope PolicyScope `json:"policy_scope,omitempty"`
+	// In means client -> target/hop; Out means target/hop -> client. These meter
+	// payload bytes, excluding TLS, WebSocket and datagram-hop framing.
+	BytesPerSecondIn  int64 `json:"bytes_per_second_in,omitempty"`
+	BytesPerSecondOut int64 `json:"bytes_per_second_out,omitempty"`
+	// RateBurstBytes is the capacity of EACH directional bucket. Zero selects
+	// 100ms of its rate, bounded to [1, 32768] bytes; buckets start full.
+	RateBurstBytes int64 `json:"rate_burst_bytes,omitempty"`
+	// Stream ceilings include pending handshakes/dials; UDP counts mappings.
+	// Source IP is the socket
+	// peer's normalized IP, never its port or a count of distinct IPs. At egress
+	// the socket peer is the previous hop, not the original end user.
+	MaxConnections      int64 `json:"max_connections,omitempty"`
+	MaxConnectionsPerIP int   `json:"max_connections_per_ip,omitempty"`
+	// UDP ceilings count client mappings, not TCP connections. The effective total
+	// is the lower of this ceiling and the runtime's MaxMappings safety ceiling.
+	// Zero adds no policy ceiling; the existing safety ceiling remains in force.
+	MaxMappings            int64  `json:"max_mappings,omitempty"`
+	MaxMappingsPerSourceIP int    `json:"max_mappings_per_source_ip,omitempty"`
+	Revision               int64  `json:"revision"`
+	ListenHost             string `json:"listen_host,omitempty"`
 	// TargetHealth is the panel's per-target health, parallel to Targets
 	// the same identities in the same order, carrying a
 	// different kind of fact.
@@ -456,6 +481,14 @@ func (c *TunnelConfig) Validate() error {
 		return err
 	}
 	c.Protocol = protocol
+	if err := c.validatePolicy(); err != nil {
+		return err
+	}
+	// The UDP exit has its own owner/runtime. Until it wires the shared policy
+	// helper, refuse policy there rather than acknowledging ineffective limits.
+	if protocol == ProtocolUDP && mode == ModeEgress && c.hasPolicy() {
+		return errors.New("forwarder: udp EGRESS policy is not wired; enforce limits at DIRECT/RELAY ingress")
+	}
 
 	// A TLS front is a client-facing listener. EGRESS listens for the ingress
 	// node, not for a client, and the hop is plain TCP by contract — so asking

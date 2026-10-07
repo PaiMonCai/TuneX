@@ -25,6 +25,8 @@
  *  - `command_ack`      把上面任一命令的 ACK 当作命令体在通道里回传（统一信封）。
  */
 export const COMMAND_ACTIONS = [
+  "apply_link",
+  "remove_link",
   "apply_tunnel",
   "remove_tunnel",
   "update_targets",
@@ -84,7 +86,7 @@ export const IP_TYPES = ["auto", "ipv4", "ipv6"] as const;
 export const TARGET_PROTOCOLS = ["tcp", "udp"] as const;
 
 /** 被指挥的资源种类。v3 RELAY 阶段只有 tunnel 可直接指挥；node/agent 预留给 /。 */
-export const COMMAND_RESOURCES = ["tunnel", "node", "node_group", "agent"] as const;
+export const COMMAND_RESOURCES = ["tunnel", "node", "node_group", "agent", "link"] as const;
 export type CommandResource = (typeof COMMAND_RESOURCES)[number];
 
 /**
@@ -157,6 +159,8 @@ export interface ActionSpec {
 }
 
 export const ACTION_SPECS: Readonly<Record<CommandAction, ActionSpec>> = {
+  apply_link: { mutating: true, resources: ["link"], minRevision: 1 },
+  remove_link: { mutating: true, resources: ["link"], minRevision: 1 },
   apply_tunnel: { mutating: true, resources: ["tunnel"], minRevision: 1 },
   remove_tunnel: { mutating: true, resources: ["tunnel"], minRevision: 1 },
   update_targets: { mutating: true, resources: ["tunnel"], minRevision: 1 },
@@ -173,6 +177,8 @@ export const ACTION_SPECS: Readonly<Record<CommandAction, ActionSpec>> = {
 
 /** 变更动作默认会把资源推到哪个状态（apply handler 可覆盖）。 */
 export const DEFAULT_APPLIED_STATUS: Readonly<Record<string, ResourceStatus>> = {
+  apply_link: "active",
+  remove_link: "removed",
   apply_tunnel: "active",
   update_targets: "active",
   suspend_tunnel: "suspended",
@@ -374,9 +380,21 @@ export type CommandAckEnvelope = CommandEnvelopeBase & { action: "command_ack"; 
 export type DiagnoseTunnelEnvelope = CommandEnvelopeBase & { action: "diagnose_tunnel"; payload: DiagnoseTunnelPayload };
 export type CollectDiagnosticsEnvelope = CommandEnvelopeBase & { action: "collect_diagnostics"; payload: CollectDiagnosticsPayload };
 export type LookingGlassEnvelope = CommandEnvelopeBase & { action: "looking_glass"; payload: LookingGlassPayload };
+/** Secret-free command metadata; the complete encrypted carrier config is a sibling. */
+export interface LinkCommandPayload {
+  link_id: number;
+  workspace_id: number;
+  node_id: number;
+  config_digest?: string;
+}
+export type LinkEnvelope = CommandEnvelopeBase & {
+  action: "apply_link" | "remove_link";
+  payload: LinkCommandPayload;
+};
 
 /** 判别联合：`switch (env.action)` 即可把 payload 收敛到具体类型。 */
 export type CommandEnvelope =
+  | LinkEnvelope
   | CollectDiagnosticsEnvelope
   | DiagnoseTunnelEnvelope
   | LookingGlassEnvelope

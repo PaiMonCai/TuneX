@@ -1,6 +1,8 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { ForwardPolicyFields } from "./forward-policy-fields";
+import { forwardPolicyDraftErrors } from "@/lib/forward-policy";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input, Label } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -47,7 +49,7 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
   bindingsByIngress?: Record<string, NodeBinding[]> | null;
 }) {
   const protocolErrors = forwardCreateProtocolErrors(draft);
-  const protocolReady = Object.keys(protocolErrors).length === 0;
+  const protocolReady = Object.keys(protocolErrors).length === 0 && Object.keys(forwardPolicyDraftErrors(draft)).length === 0;
   const patch = (value: Partial<ForwardCreateDraft>) => onDraftChange({ ...draft, ...value });
   const copy = forwardPathCopy(locale);
   const ingress = ingressNodes.find((node) => String(node.id) === draft.ingressId) ?? null;
@@ -187,6 +189,7 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
           <div className="text-sm font-medium">{t("forward.createTargetSection")}</div>
           <Field label={t("forward.targetHost")}><Input value={draft.targetHost} onChange={(e) => patch({ targetHost: e.target.value })} placeholder="example.com" /></Field>
           <Field label={t("forward.targetPort")}><Input inputMode="numeric" value={draft.targetPort} onChange={(e) => patch({ targetPort: e.target.value })} placeholder="443" /></Field>
+          <ForwardPolicyFields draft={draft} onChange={patch} locale={locale} />
         </section>
       </div>}
       <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>

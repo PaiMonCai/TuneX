@@ -138,6 +138,8 @@ function validateIntField(value: unknown, field: string, min: number, max: numbe
 }
 
 export const ACTION_PAYLOAD_KEYS = {
+  apply_link: new Set(["link_id", "workspace_id", "node_id", "config_digest"]),
+  remove_link: new Set(["link_id", "workspace_id", "node_id"]),
   apply_tunnel: new Set(["tunnel"]),
   remove_tunnel: new Set(["reason"]),
   update_targets: new Set(["targets"]),
@@ -345,6 +347,20 @@ export const LOOKING_GLASS_MAX_TIMEOUT_MS = 5000;
 export function validatePayload(action: CommandAction, payload: unknown): string | null {
   if (!isPlainObject(payload)) return "payload 必须是对象";
   switch (action) {
+    case "apply_link":
+    case "remove_link": {
+      const extra = unknownKeys(payload, [...ACTION_PAYLOAD_KEYS[action]]);
+      if (extra.length) return `payload 含未知字段：${extra.join(", ")}`;
+      for (const field of ["link_id", "workspace_id", "node_id"]) {
+        const error = validateIntField(payload[field], `payload.${field}`, 1, 2_147_483_647);
+        if (error) return error;
+      }
+      if (action === "apply_link" &&
+          (typeof payload.config_digest !== "string" || !/^[0-9a-f]{64}$/.test(payload.config_digest))) {
+        return "payload.config_digest 必须是 SHA256";
+      }
+      return null;
+    }
     case "apply_tunnel":
       return validateApplyTunnel(payload);
     case "update_targets": {

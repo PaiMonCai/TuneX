@@ -7,6 +7,7 @@
  */
 import { Prisma } from "@prisma/client";
 import { db } from "../db.ts";
+import { forwardPolicyErrors, forwardPolicyValues, mergeForwardPolicy, sameForwardPolicy, type ForwardPolicyInput } from "./forward-policy.ts";
 import {
   normalizeForwardProtocol,
   persistedForwardProtocol,
@@ -24,7 +25,9 @@ import { FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS } from "./federation/forward-hop
 export type ForwardDesiredStatus = "active" | "inactive";
 
 /** 业务字段全集（§13.3.1）：创建后可编辑的全部字段。 */
-export interface ForwardCandidateConfig {
+export interface ForwardCandidateConfig extends ForwardPolicyInput {
+  /** Internal Link provenance; HTTP callers cannot forge this field. */
+  link_resource_id?: number | null;
   name: string;
   mode: ForwardMode;
   /** Persisted protocol fact; validation separately decides whether it is admitted. */
@@ -74,7 +77,8 @@ export interface ForwardRevisionUpdateInput extends ForwardCandidatePatch {
 }
 
 /** 当前 desired config 所在的最小行投影（tunnel 行 + 可选 snapshot）。 */
-export interface ForwardRevisionRow {
+export interface ForwardRevisionRow extends ForwardPolicyInput {
+  link_resource_id?: number | null;
   id: number;
   workspace_id: number;
   name: string;
@@ -238,6 +242,8 @@ const RESERVED_PORTS = [22, 80, 443, 3306, 5432, 6379, 27017, 9090, 9191];
  */
 export function currentDesiredConfig(row: ForwardRevisionRow): ForwardCandidateConfig {
   return {
+    ...forwardPolicyValues(row),
+    link_resource_id: row.link_resource_id ?? null,
     name: row.name,
     mode: row.tunnel_mode === "relay" ? "relay" : "direct",
     protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
@@ -272,6 +278,8 @@ export function mergeForwardCandidate(
   patch: ForwardCandidatePatch,
 ): ForwardCandidateConfig {
   return {
+    ...mergeForwardPolicy(base, patch),
+    link_resource_id: patch.link_resource_id !== undefined ? patch.link_resource_id : base.link_resource_id,
     name: patch.name !== undefined ? patch.name : base.name,
     mode: patch.mode !== undefined ? patch.mode : base.mode,
     protocol: patch.protocol !== undefined ? patch.protocol : base.protocol,
@@ -306,6 +314,8 @@ export function normalizeFederatedEgressPeer(value: unknown): string | null {
 /** 是否纯 metadata 修改（当前只有 name）：§13.3.2 禁止为它触发 runtime 重建。 */
 export function isMetadataOnlyPatch(base: ForwardCandidateConfig, candidate: ForwardCandidateConfig): boolean {
   return (
+    sameForwardPolicy(base, candidate) &&
+    (base.link_resource_id ?? null) === (candidate.link_resource_id ?? null) &&
     base.mode === candidate.mode &&
     persistedForwardProtocol(base.protocol) === persistedForwardProtocol(candidate.protocol) &&
     base.ingress_node_id === candidate.ingress_node_id &&
@@ -377,6 +387,14 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
   const warnings: string[] = [];
   const reasons: string[] = [];
 
+  const policyErrors = forwardPolicyErrors(candidate);
+  errors.push(...policyErrors);
+  if (policyErrors.length) reasons.push("invalid_forward_policy");
+  const linked = candidate.link_resource_id != null && Number.isInteger(candidate.link_resource_id) && candidate.link_resource_id > 0;
+  if (candidate.link_resource_id != null && !linked) {
+    errors.push("Link resource ID 不合法"); reasons.push("invalid_link_resource");
+  }
+
   const name = normalizeForwardName(candidate.name);
   if (name === null) {
     errors.push("转发名称不能为空且不超过 60 字符");
@@ -389,7 +407,7 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
     return { ok: false, errors, warnings, reasons };
   }
 
-  if (normalizeForwardProtocol(candidate.protocol) === null) {
+  if (normalizeForwardProtocol(candidate.protocol) === null && !(candidate.protocol === "both" && linked)) {
     errors.push("当前版本不支持该转发协议");
     reasons.push("invalid_protocol");
     return { ok: false, errors, warnings, reasons };
@@ -705,7 +723,7 @@ export function computeForwardImpact(input: {
   // listener 是否需要重建：端口变化、入口节点迁移、模式切换。
   // target 热换**不重建** listener（§13.3.4：旧连接继续、新连接走新目标）。
   const listenerReplacement =
-    !metadataOnly && (listenPortChange || ingressNodeChange || modeChange);
+    !metadataOnly && (listenPortChange || ingressNodeChange || modeChange || !sameForwardPolicy(input.current, input.candidate));
 
   const changesExternalAddress = !metadataOnly && (listenPortChange || ingressNodeChange);
 
@@ -826,6 +844,10 @@ export function handleRevisionConflict(e: unknown, latestRevision: number | null
 /* ================================================================== */
 
 export interface CreateForwardRevisionInput {
+  /** Required explicitly for Link's business `both` protocol authorization. */
+  link_resource_id?: number | null;
+  /** Optional caller CAS token; the writer also CASes the row it read. */
+  expectedRevision?: number | null;
   tunnelId: number;
   /** 本次保存的**完整候选 config**（已是合并后的结果）。 */
   candidate: ForwardCandidateConfig;
@@ -888,6 +910,11 @@ export async function ensureForwardBaselineRevision(
         tunnel_mode: true,
         tunnel_type: true,
         forward_protocol: true,
+        bytes_per_second_in: true,
+        bytes_per_second_out: true,
+        max_connections: true,
+        max_connections_per_ip: true,
+        link_resource_id: true,
         ingress_node_id: true,
         egress_node_id: true,
         middle_node_id: true,
@@ -925,16 +952,18 @@ export async function ensureForwardBaselineRevision(
 
     if (!existing) {
       const egressTargets =
-        row.tunnel_mode === "relay" && row.egress_pool_id != null
+        row.tunnel_mode === "relay" && row.egress_pool_id != null && row.link_resource_id == null
           ? await tx.egressTarget.findMany({
               where: { pool_id: row.egress_pool_id, status: "active" },
               orderBy: [{ order_by: "asc" }, { id: "asc" }],
               select: { host: true, port: true, weight: true, order_by: true },
             })
           : [];
+      const baselineTargets = row.link_resource_id != null && row.remote_host && row.remote_port
+        ? [{ host: row.remote_host, port: row.remote_port, weight: 1, order_by: 1000 }] : egressTargets;
       const targets =
-        egressTargets.length > 0
-          ? (egressTargets as unknown as Prisma.InputJsonValue)
+        baselineTargets.length > 0
+          ? (baselineTargets as unknown as Prisma.InputJsonValue)
           : Prisma.JsonNull;
 
       try {
@@ -946,14 +975,16 @@ export async function ensureForwardBaselineRevision(
             desired_status: row.desired_status ?? "active",
             mode: row.tunnel_mode === "relay" ? "relay" : "direct",
             protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
+            ...forwardPolicyValues(row),
+            link_resource_id: row.link_resource_id,
             ingress_node_id: row.ingress_node_id ?? 0,
             egress_node_id: row.egress_node_id,
             middle_node_id: row.middle_node_id,
             listen_ip: row.listen_ip,
             listen_port: row.listen_port,
-            target_host: row.tunnel_mode === "direct" ? row.remote_host : null,
-            target_port: row.tunnel_mode === "direct" ? row.remote_port : null,
-            egress_pool_id: row.tunnel_mode === "relay" ? row.egress_pool_id : null,
+            target_host: row.tunnel_mode === "direct" || row.link_resource_id != null ? row.remote_host : null,
+            target_port: row.tunnel_mode === "direct" || row.link_resource_id != null ? row.remote_port : null,
+            egress_pool_id: row.tunnel_mode === "relay" && row.link_resource_id == null ? row.egress_pool_id : null,
             egress_port: row.tunnel_mode === "relay" ? row.egress_port : null,
             federated_egress_peer: normalizeFederatedEgressPeer(row.federated_egress_peer),
             targets,
@@ -1013,6 +1044,11 @@ export async function createForwardRevision(
       where: { id: input.tunnelId },
       select: {
         config_revision: true,
+        bytes_per_second_in: true,
+        bytes_per_second_out: true,
+        max_connections: true,
+        max_connections_per_ip: true,
+        link_resource_id: true,
         name: true,
         tunnel_mode: true,
         tunnel_type: true,
@@ -1034,6 +1070,17 @@ export async function createForwardRevision(
     });
     if (!row) throw new ForwardRevisionError("not_found", "端口转发不存在");
 
+    if (input.expectedRevision != null && input.expectedRevision !== (row.config_revision ?? 0)) {
+      throw new ForwardRevisionError("revision_conflict", "该转发已被他人修改，请刷新后重新确认", { latest_revision: row.config_revision ?? 0 });
+    }
+    const linkedId = input.candidate.link_resource_id === undefined ? row.link_resource_id : input.candidate.link_resource_id;
+    if (linkedId !== row.link_resource_id && (linkedId ?? null) !== (row.link_resource_id ?? null)) {
+      throw new ForwardRevisionError("invalid_input", "Link provenance must match the persisted Forward");
+    }
+    const linkedBoth = input.candidate.protocol === "both" && linkedId != null &&
+      linkedId === row.link_resource_id && input.link_resource_id === row.link_resource_id;
+    const policy = forwardPolicyValues({ ...row, ...mergeForwardPolicy(row, input.candidate) });
+
     const [maxSnapshot] = await tx.forwardRevision.findMany({
       where: { tunnel_id: input.tunnelId },
       orderBy: { revision: "desc" },
@@ -1045,7 +1092,7 @@ export async function createForwardRevision(
       maxSnapshotRevision: maxSnapshot?.revision ?? null,
     });
 
-    const protocol = normalizeForwardProtocol(input.candidate.protocol);
+    const protocol = linkedBoth ? "both" : normalizeForwardProtocol(input.candidate.protocol);
     if (protocol === null) {
       throw new ForwardRevisionError("invalid_input", "当前版本不支持该转发协议");
     }
@@ -1054,19 +1101,20 @@ export async function createForwardRevision(
     // 拨号去哪里"的关系，而那一跳不在这台面板上（契约 §1/§7：不复制远端资源）。
     // 目标作为这一版 revision 的运行态事实进 snapshot，apply 时随 grant 交给 host。
     const federatedPeer = normalizeFederatedEgressPeer(input.candidate.federated_egress_peer);
-    const federatedRelay = federatedPeer !== null && input.candidate.mode === "relay";
+    const linkRelay = linkedId != null && input.candidate.mode === "relay";
+    const federatedRelay = (federatedPeer !== null || linkRelay) && input.candidate.mode === "relay";
     const relayTargets =
-      federatedRelay && (!input.egressTargets || input.egressTargets.length === 0)
+      federatedRelay && (linkRelay || !input.egressTargets || input.egressTargets.length === 0)
         ? input.candidate.target_host && input.candidate.target_port != null
           ? [{ host: input.candidate.target_host, port: input.candidate.target_port, weight: 1, order_by: 1000 }]
           : []
         : null;
-    if (federatedRelay && (!input.egressTargets || input.egressTargets.length === 0) && relayTargets!.length === 0) {
+    if (federatedRelay && (linkRelay || !input.egressTargets || input.egressTargets.length === 0) && relayTargets!.length === 0) {
       throw new ForwardRevisionError("invalid_input", "远端出口腿必须至少有一个目标（host + port）");
     }
 
     const targets =
-      input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
+      !linkRelay && input.candidate.mode === "relay" && input.egressTargets && input.egressTargets.length > 0
         ? (input.egressTargets as unknown as Prisma.InputJsonValue)
         : relayTargets && relayTargets.length > 0
           ? (relayTargets as unknown as Prisma.InputJsonValue)
@@ -1082,6 +1130,8 @@ export async function createForwardRevision(
           desired_status: input.desiredStatus,
           mode: input.candidate.mode,
           protocol,
+          ...policy,
+          link_resource_id: linkedId ?? null,
           ingress_node_id: input.candidate.ingress_node_id,
           egress_node_id: input.candidate.egress_node_id,
           middle_node_id: input.candidate.middle_node_id ?? null,
@@ -1089,9 +1139,9 @@ export async function createForwardRevision(
           listen_port: input.candidate.listen_port,
           // 本机出口才存 target_host/port（DIRECT 的目标面在本机；RELAY 的目标在
           // targets 快照里）。远端出口腿的目标同样只在 targets 快照里。
-          target_host: input.candidate.mode === "direct" ? input.candidate.target_host : null,
-          target_port: input.candidate.mode === "direct" ? input.candidate.target_port : null,
-          egress_pool_id: input.egressPoolId ?? null,
+          target_host: input.candidate.mode === "direct" || linkedId != null ? input.candidate.target_host : null,
+          target_port: input.candidate.mode === "direct" || linkedId != null ? input.candidate.target_port : null,
+          egress_pool_id: linkedId != null ? null : input.egressPoolId ?? null,
           egress_port: input.egressPort ?? null,
           // 这一跳"在哪一侧"是本次 revision 的**不可变放置事实**。
           // 候选没提交（undefined）时沿用 tunnel 行的当前值 —— 与 route_profile
@@ -1124,13 +1174,15 @@ export async function createForwardRevision(
     const existingProtocol =
       (row.forward_addresses_protocol ?? Prisma.JsonNull) as Prisma.InputJsonValue;
 
-    await tx.tunnel.update({
-      where: { id: input.tunnelId },
+    const advanced = await tx.tunnel.updateMany({
+      where: { id: input.tunnelId, config_revision: row.config_revision },
       data: {
         // ── 兼容投影列：socket/config-generator 与旧 Agent 的唯一读取源 ──
+        ...(linkedId != null ? { egress_pool_id: null } : {}),
         name: input.candidate.name.trim(),
         tunnel_mode: input.candidate.mode,
         forward_protocol: protocol,
+        ...policy,
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,
         middle_node_id: input.candidate.middle_node_id ?? null,
@@ -1150,13 +1202,13 @@ export async function createForwardRevision(
         remote_host:
           input.candidate.mode === "direct"
             ? input.candidate.target_host
-            : federatedPeer !== null
+            : federatedPeer !== null || linkedId != null
               ? input.candidate.target_host
               : null,
         remote_port:
           input.candidate.mode === "direct"
             ? input.candidate.target_port
-            : federatedPeer !== null
+            : federatedPeer !== null || linkedId != null
               ? input.candidate.target_port
               : null,
         forward_addresses: directTarget
@@ -1178,6 +1230,9 @@ export async function createForwardRevision(
       },
     });
 
+    if (advanced.count !== 1) {
+      throw new ForwardRevisionError("revision_conflict", "并发修改冲突，revision 快照已回滚", { latest_revision: row.config_revision ?? 0 });
+    }
     return { revision, snapshotId, wroteSnapshot: true };
   };
 

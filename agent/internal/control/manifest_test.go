@@ -1,10 +1,12 @@
 package control
 
 import (
+	"slices"
 	"sort"
 	"testing"
 
 	"github.com/tunex/agent/internal/forwarder"
+	"github.com/tunex/agent/internal/manager"
 )
 
 // Capability manifest tests.
@@ -33,6 +35,22 @@ func TestAdvertisedProtocolsAreAcceptedByTheParser(t *testing.T) {
 		if string(got) != name {
 			t.Fatalf("protocol %q normalises to %q", name, got)
 		}
+	}
+}
+
+func TestProductionSelectorFactsRequireTrustedClientSource(t *testing.T) {
+	manifest, err := DefaultManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(manifest.Runtime, string(RuntimeSelectorFallback)) {
+		t.Fatal("production EGRESS fallback omitted")
+	}
+	if slices.Contains(manifest.Runtime, string(RuntimeSelectorIPHash)) {
+		t.Fatal("IP_HASH advertised without a production trusted client-source producer")
+	}
+	if got, ok := manager.ParseStrategy("IP_HASH"); !ok || got != manager.IPHash {
+		t.Fatal("trusted-injection IP_HASH wire parser lost")
 	}
 }
 
@@ -80,6 +98,14 @@ func TestAdvertisedRuntimeFeaturesHaveImplementations(t *testing.T) {
 		case RuntimeLKGRestore:
 			// Checked by the wiring, which only passes this fact when the LKG
 			// cache is enabled (see runtimeManifest in v3runtime.go).
+		case RuntimeSelectorFallback, RuntimeSelectorIPHash:
+			wire := string(manager.Fallback)
+			if RuntimeFeature(feature) == RuntimeSelectorIPHash {
+				wire = string(manager.IPHash)
+			}
+			if _, ok := manager.ParseStrategy(wire); !ok {
+				t.Fatalf("selector manifest advertises unparseable wire strategy %s", wire)
+			}
 		default:
 			t.Fatalf("runtime feature %q is advertised but has no known implementation", feature)
 		}

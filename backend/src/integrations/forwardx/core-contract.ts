@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { checkAgentVersion, type AgentVersionFailure } from "./agent-version.ts";
 
 /**
  * A01 — ForwardX integration boundary.
@@ -151,6 +152,16 @@ export const FORWARD_EXECUTION_MATRIX: readonly ExecutionMatrixEntry[] = [
     note: "A04 must make TCP/UDP leases and child runtimes protocol-aware before this can open.",
   },
   {
+    business_protocol: BUSINESS_BOTH,
+    client_front: "plain",
+    carrier: "fxp_v1",
+    driver: "fxp",
+    release: "planned",
+    required_agent_capabilities: ["forward.link.fxp.v1", "forward.protocol.both.v1"],
+    minimum_agent_version: null,
+    note: "Experimental managed entry shares TCP/UDP budgets; production multi-Agent and shared-update gates remain required.",
+  },
+  {
     business_protocol: BUSINESS_TCP,
     client_front: "plain",
     carrier: "fxp_v1",
@@ -241,7 +252,7 @@ export interface AgentCapabilitySnapshot {
 export type ExecutionAdmissionFailureCode =
   | "unsupported_combination"
   | "capability_not_released"
-  | "agent_version_unknown"
+  | AgentVersionFailure
   | "agent_capabilities_missing"
   | "agent_capability_missing";
 
@@ -296,12 +307,12 @@ export function admitExecutionSelection(
     };
   }
 
-  const version = agent.version?.trim() ?? "";
-  if (NEW_LINK_AGENT_POLICY.reject_unknown_agent_version && (version === "" || version === "unknown")) {
+  const versionFailure = checkAgentVersion(agent.version, entry.minimum_agent_version);
+  if (versionFailure) {
     return {
       ok: false,
-      code: "agent_version_unknown",
-      message: "新 LinkResource 要求 Agent 上报可识别版本；unknown 不能作为能力证据",
+      code: versionFailure,
+      message: "Agent 版本无法满足该连接的版本要求；请安装有明确版本和所需能力的 Agent",
       entry,
     };
   }

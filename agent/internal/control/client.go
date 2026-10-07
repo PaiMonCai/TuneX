@@ -15,6 +15,7 @@ import (
 
 	"github.com/tunex/agent/internal/diag"
 	"github.com/tunex/agent/internal/forwarder"
+	"github.com/tunex/agent/internal/linkrunner"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/ownership"
@@ -44,6 +45,14 @@ type RevisionObserver interface {
 type Config struct {
 	PanelURL   string
 	Credential string
+	// Links is wired only when the runtime feature flag, executable and private
+	// cache are available. Numeric node identity comes from desired metadata.
+	Links        *linkrunner.Manager
+	RuntimeFacts RuntimeFacts
+	// ReportLinkState publishes fresh runtime facts after a successful Link
+	// mutation and before its ACK. Failure leaves the successful runtime ACK
+	// intact; the panel retains conservative port facts until a later report.
+	ReportLinkState func(context.Context) error
 
 	// Router, when set, is the process-wide panel-route switcher shared with the
 	// state reporter (task-45). pull/ack ask it for the CURRENT active base URL
@@ -89,6 +98,7 @@ type Envelope struct {
 type QueuedCommand struct {
 	Envelope Envelope                `json:"envelope"`
 	Config   *forwarder.TunnelConfig `json:"config"`
+	Link     *linkrunner.Config      `json:"link,omitempty"`
 	// Probe carries a diagnose request. It is a separate field rather than a
 	// synthetic TunnelConfig: a probe is not a tunnel, and pretending otherwise
 	// would let a malformed probe look like a config apply.
@@ -138,7 +148,8 @@ type ackPayload struct {
 	// report would leave every new datagram relay dead for up to a reporting cycle,
 	// and the panel would have no way to tell "not serving yet" from "serving".
 	// `next_hop` travels the other way on the egress ACK for exactly the same reason.
-	HopLocalAddr string `json:"hop_local_addr,omitempty"`
+	HopLocalAddr    string                  `json:"hop_local_addr,omitempty"`
+	LinkObservation *linkrunner.Observation `json:"link_observation,omitempty"`
 }
 
 type Client struct {
@@ -171,7 +182,7 @@ func New(cfg Config, tunnels *manager.TunnelManager, egress *manager.EgressManag
 		// answer `unsupported_action` to a command it told the panel it supports.
 		logx.Warn("control: self-description is not wired; collect_diagnostics will be refused")
 	}
-	return &Client{cfg: cfg, tunnels: tunnels, egress: egress, http: &http.Client{Timeout: httpTimeout}}
+	return &Client{cfg: cfg, tunnels: tunnels, egress: egress, http: &http.Client{Timeout: httpTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 func (c *Client) enabled() bool {
@@ -379,7 +390,75 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		return ack
 	}
 	switch cmd.Envelope.Action {
+	case ActionApplyLink, ActionRemoveLink:
+		if c.cfg.Links == nil || !c.cfg.RuntimeFacts.FXPLink {
+			ack.ErrorCode, ack.Error = "unsupported_action", "managed FXP link is disabled"
+			return ack
+		}
+		if cmd.Config != nil || cmd.Probe != nil || cmd.LookingGlass != nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", "expected sibling link"
+			return ack
+		}
+		if cmd.Envelope.Action == ActionRemoveLink {
+			if cmd.Link != nil || cmd.Envelope.Revision <= 0 {
+				ack.ErrorCode, ack.Error = "invalid_payload", "remove_link requires a positive envelope revision and no config"
+				return ack
+			}
+			nodeDBID := c.cfg.Links.NodeDBID()
+			if nodeDBID == 0 {
+				ack.ErrorCode, ack.Error = "node_mismatch", "authenticated snapshot identity is unavailable"
+				return ack
+			}
+			for _, o := range c.cfg.Links.Status() {
+				if o.ID == resourceID && o.NodeID != 0 && (o.NodeID != nodeDBID || o.WorkspaceID <= 0) {
+					ack.ErrorCode, ack.Error = "identity_mismatch", "cached link placement identity mismatch"
+					return ack
+				}
+			}
+			o, err := c.cfg.Links.Remove(resourceID, cmd.Envelope.Revision)
+			ack.LinkObservation = &o
+			if err != nil {
+				ack.ErrorCode, ack.Error = linkAckCode(err), err.Error()
+				return ack
+			}
+			ack.OK = true
+			rev := cmd.Envelope.Revision
+			ack.AppliedRevision = &rev
+			c.reportLinkState(ctx)
+			return ack
+		}
+		if cmd.Link == nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", "missing sibling link"
+			return ack
+		}
+		cfg := cmd.Link
+		if cfg.ID != resourceID {
+			ack.ErrorCode, ack.Error = "resource_mismatch", "link id does not match resource_id"
+			return ack
+		}
+		if cfg.Generation <= 0 || cmd.Envelope.Revision != cfg.Generation {
+			ack.ErrorCode, ack.Error = "revision_mismatch", "link generation does not match revision"
+			return ack
+		}
+		if c.cfg.Links.NodeDBID() == 0 || cfg.NodeID != c.cfg.Links.NodeDBID() {
+			ack.ErrorCode, ack.Error = "node_mismatch", "link node does not match authenticated snapshot identity"
+			return ack
+		}
+		observed, err := c.cfg.Links.Apply(*cfg)
+		ack.LinkObservation = &observed
+		if err != nil {
+			ack.ErrorCode, ack.Error = linkAckCode(err), err.Error()
+			return ack
+		}
+		ack.OK = true
+		rev := cfg.Generation
+		ack.AppliedRevision = &rev
+		c.reportLinkState(ctx)
 	case ActionApplyTunnel:
+		if cmd.Link != nil {
+			ack.ErrorCode, ack.Error = "invalid_payload", "link is not a tunnel config"
+			return ack
+		}
 		if cmd.Config == nil {
 			ack.ErrorCode, ack.Error = "invalid_payload", "missing tunnel config"
 			return ack
@@ -509,6 +588,17 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.Error = "unsupported action: " + cmd.Envelope.Action
 	}
 	return ack
+}
+
+func (c *Client) reportLinkState(ctx context.Context) {
+	if c.cfg.ReportLinkState != nil {
+		if err := c.cfg.ReportLinkState(ctx); err != nil {
+			// The state reporter already observes reachability. Do not put raw
+			// transport errors into the command ACK or turn an applied change
+			// into a runtime failure because its telemetry channel is unavailable.
+			logx.Debug("managed link state report failed; awaiting periodic report")
+		}
+	}
 }
 
 // ackCodeFor maps an apply failure onto the ACK's error_code.

@@ -24,6 +24,7 @@ import { defaultSettlementDeps, settleDuePeriods } from "./services/subscription
 import { createRuntimeReconcileSink } from "./services/runtime-reconcile-sink.ts";
 
 export const CRON_JOBS: Array<{ name: string; pattern?: string; everyMs?: number; desc: string }> = [
+  { name: "cron_link_reconcile", everyMs: 30_000, desc: "共享 FXP 链路重试与租约续期" },
   { name: "cron_save_traffic", pattern: "*/10 * * * *", desc: "Redis → MySQL 流量同步（OPS-01/OPS-03，幂等）" },
   { name: "cron_delete_tunnel_traffic", pattern: "0 0 * * *", desc: "删除过期流量记录（OPS-03，按保留期，幂等）" },
   { name: "cron_latency_history", pattern: "15 * * * *", desc: "观测档案：小时桶聚合 + 过期清理（原始 24h / 桶 30d，幂等）" },
@@ -54,6 +55,10 @@ const worker = new Worker(
   async (job: Job) => {
     const started = Date.now();
     switch (job.name) {
+      case "cron_link_reconcile": {
+        const { reconcileLinks } = await import("./services/link-resource.ts");
+        return reconcileLinks();
+      }
       case "cron_save_traffic": {
         // Redis traffic buffer → MySQL archive. SETNX + unique key + consume/delete keep it idempotent.
         const r = await flushTrafficBuffer(defaultTrafficArchiveDeps());

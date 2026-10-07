@@ -9,6 +9,9 @@
 package manager
 
 import (
+	"hash/fnv"
+	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +28,10 @@ const (
 	RoundRobin Strategy = "ROUND_ROBIN"
 	// Random picks a uniformly weighted random target per connection.
 	Random Strategy = "RANDOM"
+	// Fallback selects the first target in the best admissible health rank.
+	Fallback Strategy = "FALLBACK"
+	// IPHash maps a trusted client IP onto the best admissible health rank.
+	IPHash Strategy = "IP_HASH"
 
 	// WeightedRoundRobin spreads connections over the pool proportionally
 	// to each target's weight: a target with weight 3 gets three times the
@@ -61,6 +68,10 @@ func ParseStrategy(s string) (Strategy, bool) {
 		return Random, true
 	case string(WeightedRoundRobin), string(WeightedRound), "WEIGHTED":
 		return WeightedRoundRobin, true
+	case string(Fallback):
+		return Fallback, true
+	case string(IPHash):
+		return IPHash, true
 	default:
 		return "", false
 	}
@@ -69,7 +80,7 @@ func ParseStrategy(s string) (Strategy, bool) {
 // String renders the strategy for logs, /health and the heartbeat payload.
 func (s Strategy) String() string {
 	switch s {
-	case RoundRobin, Random, WeightedRoundRobin:
+	case RoundRobin, Random, WeightedRoundRobin, Fallback, IPHash:
 		return string(s)
 	case "":
 		// A pool built before the first strategy arrived reports the
@@ -205,13 +216,32 @@ func canonical(in []forwarder.Target, strategy Strategy) (clean, slots []forward
 // the same strategy is applied inside the best admissible health rank
 // (internal/manager/health.go): health reorders, it never replaces the policy.
 func (l *LoadBalancer) Select() forwarder.Target {
+	return l.SelectForClient("")
+}
+
+// SelectForClient is the optional client-aware selector. source must identify
+// the real client, supplied by a caller that knows its trust boundary; a relay
+// peer is not a client identity. IP_HASH without a valid IP returns no target.
+// Ports, IPv6 spelling, zones and IPv4-mapped spelling do not affect the
+// hash. Existing connections and UDP mappings never call the selector again.
+func (l *LoadBalancer) SelectForClient(source string) forwarder.Target {
 	l.mu.RLock()
+	if l.strategy == IPHash && clientIP(source) == "" {
+		l.mu.RUnlock()
+		return forwarder.Target{}
+	}
 	h := l.health
 	var (
 		target  forwarder.Target
 		entered bool
 	)
-	if h == nil {
+	if l.strategy == Fallback || l.strategy == IPHash {
+		if h == nil {
+			target = l.pickAffinity(l.targets, source)
+		} else {
+			target, entered = l.selectAffinity(h, source)
+		}
+	} else if h == nil {
 		target = l.selectPlain()
 	} else {
 		target, entered = l.selectHealthAware(h)
@@ -228,6 +258,106 @@ func (l *LoadBalancer) Select() forwarder.Target {
 			"reason", "every target is open or waiting for a half-open probe result")
 	}
 	return target
+}
+
+// SelectForClient exposes the capability on the Pool actually injected into
+// forwarders, without extending forwarder.TargetSelector.
+func (p *Pool) SelectForClient(source string) forwarder.Target {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.balancer.SelectForClient(source)
+}
+
+// RequiresClientIP lets a runtime reject an unsupported source scope before
+// binding its listener. It also covers target-pool policy changes after startup.
+func (l *LoadBalancer) RequiresClientIP() bool {
+	return l.Strategy() == IPHash
+}
+
+func (p *Pool) RequiresClientIP() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.balancer.RequiresClientIP()
+}
+
+// clientIP accepts IP literals and socket endpoints, never hostnames or opaque
+// relay/mapping keys. Canonicalising before hashing makes affinity depend only
+// on the IP, not on the transport connection's ephemeral source port.
+func clientIP(source string) string {
+	host := strings.TrimSpace(source)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return ""
+	}
+	return ip.Unmap().WithZone("").String()
+}
+
+// pickAffinity applies only the new policies, preserving input order and
+// ignoring weights. The hash matches Forwardx's FNV-1a selection; candidate
+// membership/order changes can remap new connections, as with its selector.
+// l.mu must be held for reading.
+func (l *LoadBalancer) pickAffinity(targets []forwarder.Target, source string) forwarder.Target {
+	if len(targets) == 0 {
+		return forwarder.Target{}
+	}
+	if l.strategy == Fallback {
+		return targets[0]
+	}
+	if ip := clientIP(source); ip != "" {
+		hash := fnv.New64a()
+		_, _ = hash.Write([]byte(ip))
+		return targets[hash.Sum64()%uint64(len(targets))]
+	}
+	return forwarder.Target{}
+}
+
+// selectAffinity uses the existing health table's rank, admission and probe
+// accounting. It neither derives health from local dial failures nor closes a
+// breaker on a panel label: health.go remains the owner of those mechanics.
+// l.mu must be held for reading.
+func (l *LoadBalancer) selectAffinity(h *healthTable, source string) (forwarder.Target, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.bounds.now()
+	bestAdmissible, bestAny := -1, -1
+	admissible := make([]forwarder.Target, 0, len(l.targets))
+	any := make([]forwarder.Target, 0, len(l.targets))
+	for _, t := range l.targets {
+		rank, ok := h.admit(t, now)
+		if bestAny < 0 || rank < bestAny {
+			bestAny = rank
+			any = any[:0]
+		}
+		if rank == bestAny {
+			any = append(any, t)
+		}
+		if !ok {
+			continue
+		}
+		if bestAdmissible < 0 || rank < bestAdmissible {
+			bestAdmissible = rank
+			admissible = admissible[:0]
+		}
+		if rank == bestAdmissible {
+			admissible = append(admissible, t)
+		}
+	}
+	if bestAny < 0 {
+		return forwarder.Target{}, false
+	}
+	if bestAdmissible < 0 {
+		entered := !h.forcedLogged
+		h.forcedLogged = true
+		atomic.AddUint64(&l.forcedPicks, 1)
+		return l.pickAffinity(any, source), entered
+	}
+	h.forcedLogged = false
+	target := l.pickAffinity(admissible, source)
+	h.markProbe(target, now, true)
+	return target, false
 }
 
 // UpdateTargets atomically replaces the pool and the strategy. Already-open

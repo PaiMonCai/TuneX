@@ -42,7 +42,9 @@ const (
 	RuntimeGracefulDrain RuntimeFeature = "graceful_drain"
 	// RuntimeLKGRestore: restore the last known good applied config while the
 	// panel is unreachable (internal/restore).
-	RuntimeLKGRestore RuntimeFeature = "lkg_restore"
+	RuntimeLKGRestore       RuntimeFeature = "lkg_restore"
+	RuntimeSelectorFallback RuntimeFeature = "selector_fallback"
+	RuntimeSelectorIPHash   RuntimeFeature = "selector_ip_hash_client_ip"
 )
 
 // DiagnosticFeature names a diagnostic capability. This dimension is
@@ -159,7 +161,7 @@ func enumNames[T ~string](in []T) []string {
 
 func isKnownRuntimeFeature(name string) bool {
 	switch RuntimeFeature(name) {
-	case RuntimeHotReload, RuntimeGracefulDrain, RuntimeLKGRestore:
+	case RuntimeHotReload, RuntimeGracefulDrain, RuntimeLKGRestore, RuntimeSelectorFallback, RuntimeSelectorIPHash:
 		return true
 	default:
 		return false
@@ -215,7 +217,7 @@ func DefaultManifest() (Manifest, error) {
 	return BuildManifest(ImplementationFacts{
 		Protocols:   forwarder.ImplementedProtocols(),
 		Transports:  forwarder.ImplementedTransports(),
-		Runtime:     []RuntimeFeature{RuntimeHotReload, RuntimeGracefulDrain, RuntimeLKGRestore},
+		Runtime:     []RuntimeFeature{RuntimeHotReload, RuntimeGracefulDrain, RuntimeLKGRestore, RuntimeSelectorFallback},
 		Diagnostics: DiagnosticsFromActions(advertisedActions),
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/tunex/agent/internal/api"
 	"github.com/tunex/agent/internal/control"
 	"github.com/tunex/agent/internal/forwarder"
+	"github.com/tunex/agent/internal/linkrunner"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/manager"
 	"github.com/tunex/agent/internal/ownership"
@@ -60,6 +62,8 @@ type agentRuntime struct {
 	// control loop then reconciles as soon as the panel can answer, because this
 	// process never observed a failed pull of its own.
 	restoredFromCache bool
+	links             *linkrunner.Manager
+	linkFacts         control.RuntimeFacts
 }
 
 // startRuntime wires the production Agent components and starts them in dependency order.
@@ -99,6 +103,36 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 	ledger := reporter.NewLedger()
 	revisions := reporter.NewRevisionState()
 	rt.ledger = ledger
+	// Managed FXP shares the native manager's external slots and owns a separate
+	// encrypted cache; it must never enter restore.LKG's tunnel snapshot.
+	linkStateDir := cfg.StateDir
+	if linkStateDir == "" && cfg.LKGPath() != "" {
+		linkStateDir = filepath.Dir(cfg.LKGPath())
+	}
+	if links, facts, err := control.NewLinkRuntime(linkStateDir, cfg.AgentID, tunnels); err != nil {
+		logx.Error("managed FXP runtime disabled", "err", err.Error())
+		ledger.Record(err.Error())
+	} else {
+		rt.links = links
+		rt.linkFacts = facts
+	}
+	// The native TunnelManager also enforces the shared runtime policy gate;
+	// its capability is independent of the optional FXP executable.
+	rt.linkFacts.PolicyRuntime = true
+	if rt.links != nil {
+		fromCache, err := control.RestoreLinks(ctx, linkrunner.HTTPSource{PanelURL: cfg.PanelHTTPURL, Credential: cfg.NodeCredential, AgentID: cfg.AgentID}, rt.links)
+		rt.restoredFromCache = fromCache
+		if err != nil {
+			logx.Error("managed FXP restore failed", "err", err.Error())
+			ledger.Record(err.Error())
+		}
+		go func() {
+			<-ctx.Done()
+			if err := rt.links.Close(); err != nil {
+				logx.Error("managed FXP stop failed", "err", err.Error())
+			}
+		}()
+	}
 
 	// Install the epoch fence and lease clock BEFORE the first apply so restore
 	// is fenced exactly like every other activation path.
@@ -183,7 +217,7 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		// panel outage right after a restart.
 		logx.Error("restore failed", "err", err.Error())
 	} else {
-		rt.restoredFromCache = source == restore.SourceLKG
+		rt.restoredFromCache = rt.restoredFromCache || source == restore.SourceLKG
 		logx.Info("restore done", "tunnels", tunnels.Len(), "role", role, "source", source)
 	}
 
@@ -275,8 +309,13 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 	// control path for DIRECT/RELAY/EGRESS. The local admin API above is debug-only.
 	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
 		rt.control = control.New(control.Config{
-			PanelURL:   cfg.PanelHTTPURL,
-			Credential: cfg.NodeCredential,
+			PanelURL:     cfg.PanelHTTPURL,
+			Credential:   cfg.NodeCredential,
+			Links:        rt.links,
+			RuntimeFacts: rt.linkFacts,
+			ReportLinkState: func(rctx context.Context) error {
+				return rt.heart.ReportOnce(rctx)
+			},
 			// 面板地址：与状态上报共用同一个切换器。拉取与 ACK 每次请求都取当前
 			// 生效地址，切换后同一进程即时生效；拉取结果反过来喂同一个判定（不再
 			// 每模块复制一份切换规则）。
@@ -288,6 +327,13 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 			// A node that restored from its cache would otherwise keep running a
 			// forward the panel has already deleted or suspended.
 			Reconnected: func(rctx context.Context) {
+				if rt.links != nil {
+					_, err := control.RestoreLinks(rctx, linkrunner.HTTPSource{PanelURL: panelRouter.ActiveURL(), Credential: cfg.NodeCredential, AgentID: cfg.AgentID}, rt.links)
+					if err != nil {
+						logx.Error("managed FXP reconcile failed", "err", err.Error())
+						ledger.Record(err.Error())
+					}
+				}
 				// desired fetch 同样走当前生效地址：上报恢复了 online 而对账仍打
 				// 主地址，正是 task-45 要修的那个"半恢复"。
 				reconcileWithPanel(rctx, cfg, panelRouter, tunnels, egress, rt.cache)
@@ -310,12 +356,6 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 		if rt.restoredFromCache {
 			rt.control.MarkStartupFromCache()
 		}
-		go func() {
-			if err := rt.control.Run(ctx); err != nil {
-				logx.Debug("control loop stopped", "err", err.Error())
-			}
-		}()
-		logx.Info("outbound control scheduled", "url", cfg.PanelHTTPURL)
 	}
 
 	// 4. State reporter. Disabled (nil) when there is nothing to report to: no
@@ -353,6 +393,10 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 	// 面板迁移回退（task-44/45）：解析出来的三元组与**进程共享的**切换器一起交给
 	// 上报侧。切换判据只有一份（panelroute.Router），命令拉取/ACK/desired 用的是同一个。
 	if cfg.PanelHTTPURL != "" && cfg.NodeCredential != "" {
+		var linkPlacements func() []linkrunner.Observation
+		if rt.links != nil {
+			linkPlacements = rt.links.Status
+		}
 		rt.heart = reporter.New(reporter.Config{
 			PanelURL:   cfg.PanelHTTPURL,
 			Panels:     panels,
@@ -372,6 +416,7 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 			// target observation: the target observer's facts (empty when it was not
 			// started above, which keeps the wire key absent).
 			reporter.WithTargetObservations(observations),
+			reporter.WithLinkPlacements(linkPlacements),
 			// ownership: the panel hands the renewed ownership deadlines back in
 			// the answer to this very report. Dropping that answer is what makes
 			// a healthy node stop every tunnel one TTL after its last config.
@@ -389,7 +434,7 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 			// control negotiation: advertise the control-contract version and the actions this
 			// binary really implements, so the panel can refuse to send an action
 			// an older node would only answer with `unsupported_action`.
-			reporter.WithProtocol(control.ProtocolVersion, control.Capabilities()),
+			reporter.WithProtocol(control.ProtocolVersion, control.Capabilities(rt.linkFacts)),
 			// capability manifest: advertise the protocol/transport/runtime facts this process
 			// actually wired up. The facts are computed from what was constructed
 			// above — the LKG cache only claims lkg_restore when the store was
@@ -407,6 +452,17 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 
 	rt.startedAt = time.Now()
 	rt.started = true
+	// The control callback reads rt.heart. Start polling only after reporter
+	// construction so its first successful mutation can publish actual facts
+	// without racing the runtime's initialization.
+	if rt.control != nil {
+		go func() {
+			if err := rt.control.Run(ctx); err != nil {
+				logx.Debug("control loop stopped", "err", err.Error())
+			}
+		}()
+		logx.Info("outbound control scheduled", "url", cfg.PanelHTTPURL)
+	}
 	// Keep the local cache close to the running truth without hooking every
 	// mutation path. The manager registry is the running state by construction,
 	// so a periodic snapshot of it can never contain a config the node failed to
@@ -471,7 +527,7 @@ func (rt *agentRuntime) writeCache(version string) {
 // the manifest is omitted rather than guessed: no manifest means the panel falls
 // back to baseline admission, which is safe, whereas a wrong manifest is not.
 func runtimeManifest(lkgEnabled bool) *reporter.CapabilityManifest {
-	runtimeFeatures := []control.RuntimeFeature{control.RuntimeHotReload, control.RuntimeGracefulDrain}
+	runtimeFeatures := []control.RuntimeFeature{control.RuntimeHotReload, control.RuntimeGracefulDrain, control.RuntimeSelectorFallback}
 	if lkgEnabled {
 		runtimeFeatures = append(runtimeFeatures, control.RuntimeLKGRestore)
 	}

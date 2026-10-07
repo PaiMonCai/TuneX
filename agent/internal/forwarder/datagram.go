@@ -22,6 +22,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strconv"
@@ -119,6 +120,11 @@ type datagramMapping struct {
 	// lastActivity is the mapping's idle clock, refreshed on traffic in EITHER
 	// direction (§2.1). Nanoseconds since the epoch; read by the sweeper.
 	lastActivity atomic.Int64
+	// pending payload is live work even when its rate wait exceeds idle timeout.
+	pending atomic.Int32
+	ctx     context.Context
+	cancel  context.CancelFunc
+	release func()
 }
 
 // DatagramForwarder is the datagram runtime for one DIRECT tunnel.
@@ -128,8 +134,11 @@ type datagramMapping struct {
 // notions and are deliberately absent, so no caller can mistake this for a
 // runtime whose connections could be drained (§4.1).
 type DatagramForwarder struct {
-	cfg  TunnelConfig
-	opts DatagramOptions
+	cfg          TunnelConfig
+	opts         DatagramOptions
+	policy       *DataPlanePolicy
+	policyCtx    context.Context
+	policyCancel context.CancelFunc
 
 	// diag is this tunnel's protocol diagnostics. It is the single
 	// ledger behind both Stats() and the state report's diag object.
@@ -190,13 +199,21 @@ func NewDatagram(cfg TunnelConfig, opts DatagramOptions) (*DatagramForwarder, er
 	if opts.MaxMappings <= 0 {
 		opts.MaxMappings = defaultDatagramMaxMappings
 	}
+	policy, err := NewDataPlanePolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &DatagramForwarder{
-		cfg:       cfg,
-		opts:      opts,
-		diag:      &diagRecorder{protocol: ProtocolUDP},
-		mappings:  make(map[string]*datagramMapping),
-		target:    cfg.UpstreamAddr(),
-		sweepStop: make(chan struct{}),
+		cfg:          cfg,
+		opts:         opts,
+		diag:         &diagRecorder{protocol: ProtocolUDP},
+		mappings:     make(map[string]*datagramMapping),
+		target:       cfg.UpstreamAddr(),
+		sweepStop:    make(chan struct{}),
+		policy:       policy,
+		policyCtx:    ctx,
+		policyCancel: cancel,
 	}, nil
 }
 
@@ -262,6 +279,7 @@ func (d *DatagramForwarder) Stop() error {
 	d.conn = nil
 	mappings := d.detachMappingsLocked()
 	d.mu.Unlock()
+	d.policyCancel()
 
 	if conn != nil {
 		_ = conn.Close()
@@ -421,6 +439,7 @@ func (d *DatagramForwarder) Shutdown(timeout time.Duration) ShutdownResult {
 	d.conn = nil
 	mappings := d.detachMappingsLocked()
 	d.mu.Unlock()
+	d.policyCancel()
 
 	if conn != nil {
 		_ = conn.Close()
@@ -495,7 +514,13 @@ func (d *DatagramForwarder) handleDatagram(client *net.UDPAddr, payload []byte) 
 	if !ok {
 		return // the reason was counted where it was decided
 	}
+	m.pending.Add(1)
+	defer m.pending.Add(-1)
+	if err := d.policy.WaitIn(m.ctx, len(payload)); err != nil {
+		return
+	}
 	if _, err := m.conn.Write(payload); err != nil {
+		d.removeMapping(m)
 		if errors.Is(err, net.ErrClosed) {
 			// The mapping expired or was torn down between the lookup and this
 			// write. Normal race, already accounted for by whoever closed it.
@@ -530,6 +555,12 @@ func (d *DatagramForwarder) mappingFor(client *net.UDPAddr) (*datagramMapping, b
 		return nil, false
 	}
 	target := d.target
+	release, err := d.policy.Acquire(client)
+	if err != nil {
+		d.mu.Unlock()
+		d.diag.noteMappingRejected()
+		return nil, false
+	}
 	d.mu.Unlock()
 
 	// Dial outside the lock: the ingress loop is the only creator, so there is no
@@ -539,7 +570,15 @@ func (d *DatagramForwarder) mappingFor(client *net.UDPAddr) (*datagramMapping, b
 	// Dialing here is also what pins this mapping to `target`: the socket is
 	// connected to the address the runtime had when the mapping was created, so a
 	// later Retarget cannot move it.
-	conn, err := net.DialTimeout("udp", target, datagramDialTimeout)
+	ctx, cancel := context.WithCancel(d.policyCtx)
+	defer func() {
+		if err != nil {
+			cancel()
+			release()
+		}
+	}()
+	dialer := net.Dialer{Timeout: datagramDialTimeout}
+	conn, err := dialer.DialContext(ctx, "udp", target)
 	if err != nil {
 		// The target could not even be dialled (unresolvable name, no route).
 		// UDP gives no synchronous signal for an unreachable peer, so this is
@@ -548,7 +587,7 @@ func (d *DatagramForwarder) mappingFor(client *net.UDPAddr) (*datagramMapping, b
 		return nil, false
 	}
 
-	m := &datagramMapping{client: client, conn: conn}
+	m := &datagramMapping{client: client, conn: conn, ctx: ctx, cancel: cancel, release: release}
 	m.lastActivity.Store(time.Now().UnixNano())
 
 	d.mu.Lock()
@@ -558,14 +597,18 @@ func (d *DatagramForwarder) mappingFor(client *net.UDPAddr) (*datagramMapping, b
 	if d.stopped || !d.admitting {
 		d.mu.Unlock()
 		_ = conn.Close()
+		cancel()
+		release()
 		d.diag.noteUnknownSource()
 		return nil, false
 	}
 	d.mappings[key] = m
+	// Add before publishing outside the lock: Stop must not Wait a zero group
+	// concurrently with a late Add from an already admitted mapping.
+	d.mappingWG.Add(1)
 	d.mu.Unlock()
 
 	d.diag.noteMappingCreated()
-	d.mappingWG.Add(1)
 	go func() {
 		defer d.mappingWG.Done()
 		d.replyLoop(conn, m)
@@ -580,6 +623,7 @@ func (d *DatagramForwarder) mappingFor(client *net.UDPAddr) (*datagramMapping, b
 // belongs to. It exits when that socket is closed, which is exactly how a mapping
 // ends (§2.3).
 func (d *DatagramForwarder) replyLoop(conn net.Conn, m *datagramMapping) {
+	defer d.removeMapping(m)
 	listener := d.listenerSocket()
 	if listener == nil {
 		// The runtime was stopped between the mapping being created and this
@@ -592,10 +636,16 @@ func (d *DatagramForwarder) replyLoop(conn net.Conn, m *datagramMapping) {
 		if err != nil {
 			return
 		}
+		m.pending.Add(1)
+		if err := d.policy.WaitOut(m.ctx, n); err != nil {
+			m.pending.Add(-1)
+			return
+		}
 		// The reply leaves through the INGRESS socket, so the client sees it from
 		// the address it sent to. A zero-length reply is a legal datagram and is
 		// forwarded as such.
 		if _, err := listener.WriteToUDP(buf[:n], m.client); err != nil {
+			m.pending.Add(-1)
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
@@ -603,6 +653,7 @@ func (d *DatagramForwarder) replyLoop(conn net.Conn, m *datagramMapping) {
 			return
 		}
 		m.lastActivity.Store(time.Now().UnixNano())
+		m.pending.Add(-1)
 		d.diag.noteDatagramDeliveredToClient(n)
 	}
 }
@@ -640,7 +691,7 @@ func (d *DatagramForwarder) expireIdle() {
 	var expired []*datagramMapping
 	d.mu.Lock()
 	for key, m := range d.mappings {
-		if m.lastActivity.Load() <= cutoff {
+		if m.pending.Load() == 0 && m.lastActivity.Load() <= cutoff {
 			delete(d.mappings, key)
 			expired = append(expired, m)
 		}
@@ -682,10 +733,28 @@ func (d *DatagramForwarder) detachMappingsLocked() []*datagramMapping {
 // so this needs no "already closed" flag.
 func (d *DatagramForwarder) closeMappings(mappings []*datagramMapping) {
 	for _, m := range mappings {
+		if m.cancel != nil {
+			m.cancel()
+		}
+		if m.release != nil {
+			m.release()
+		}
 		if m.conn != nil {
 			_ = m.conn.Close()
 		}
 	}
+}
+
+// A failed socket is no longer a live mapping. Release immediately instead of
+// pinning policy capacity until the idle sweeper eventually notices.
+func (d *DatagramForwarder) removeMapping(m *datagramMapping) {
+	d.mu.Lock()
+	key := d.mappingKey(m.client)
+	if d.mappings[key] == m {
+		delete(d.mappings, key)
+	}
+	d.mu.Unlock()
+	d.closeMappings([]*datagramMapping{m})
 }
 
 // listenerSocket returns the bound ingress socket, or nil when there is none.

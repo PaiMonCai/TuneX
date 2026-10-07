@@ -26,6 +26,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -57,12 +58,20 @@ type datagramRelayMapping struct {
 	// lastActivity is the idle clock in unix nanoseconds, refreshed on traffic in
 	// EITHER direction.
 	lastActivity atomic.Int64
+	pending      atomic.Int32
+	ctx          context.Context
+	cancel       context.CancelFunc
+	release      func()
 }
 
 // DatagramRelay is the ingress-side datagram runtime (RELAY mode, udp protocol).
 type DatagramRelay struct {
-	cfg      TunnelConfig
-	identity *datagramHopIdentity
+	cfg          TunnelConfig
+	identity     *datagramHopIdentity
+	policy       *DataPlanePolicy
+	policyCtx    context.Context
+	policyCancel context.CancelFunc
+	loopWG       sync.WaitGroup
 
 	idleTimeout time.Duration
 	maxMappings int
@@ -134,14 +143,22 @@ func NewDatagramRelay(cfg TunnelConfig, opts DatagramRelayOptions) (*DatagramRel
 	if ceiling <= 0 {
 		ceiling = defaultDatagramMaxMappings
 	}
+	policy, err := NewDataPlanePolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &DatagramRelay{
-		cfg:         cfg,
-		identity:    identity,
-		idleTimeout: idle,
-		maxMappings: ceiling,
-		hopAddr:     hop,
-		byClient:    make(map[string]*datagramRelayMapping),
-		byID:        make(map[uint32]*datagramRelayMapping),
+		cfg:          cfg,
+		identity:     identity,
+		idleTimeout:  idle,
+		maxMappings:  ceiling,
+		hopAddr:      hop,
+		byClient:     make(map[string]*datagramRelayMapping),
+		byID:         make(map[uint32]*datagramRelayMapping),
+		policy:       policy,
+		policyCtx:    ctx,
+		policyCancel: cancel,
 	}, nil
 }
 
@@ -218,11 +235,12 @@ func (r *DatagramRelay) Start() error {
 		r.hopLocalAddr = local.String()
 	}
 	r.running = true
+	r.loopWG.Add(3)
 	r.mu.Unlock()
 
-	go r.clientLoop(listener)
-	go r.hopLoop(hop)
-	go r.sweepLoop()
+	go func() { defer r.loopWG.Done(); r.clientLoop(listener) }()
+	go func() { defer r.loopWG.Done(); r.hopLoop(hop) }()
+	go func() { defer r.loopWG.Done(); r.sweepLoop() }()
 	return nil
 }
 
@@ -234,9 +252,14 @@ func (r *DatagramRelay) Stop() error {
 		listener, hop := r.listener, r.hop
 		r.listener, r.hop = nil, nil
 		r.running = false
+		for _, m := range r.byID {
+			m.cancel()
+			m.release()
+		}
 		r.byClient = make(map[string]*datagramRelayMapping)
 		r.byID = make(map[uint32]*datagramRelayMapping)
 		r.mu.Unlock()
+		r.policyCancel()
 		if listener != nil {
 			_ = listener.Close()
 		}
@@ -247,6 +270,12 @@ func (r *DatagramRelay) Stop() error {
 		r.stopped = true
 		r.stopping = false
 		r.mu.Unlock()
+		done := make(chan struct{})
+		go func() { r.loopWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(drainTimeout):
+		}
 	})
 	return nil
 }
@@ -287,7 +316,13 @@ func (r *DatagramRelay) clientLoop(listener *net.UDPConn) {
 		if m == nil {
 			continue // dropped and counted inside
 		}
+		m.pending.Add(1)
+		if err := r.policy.WaitIn(m.ctx, n); err != nil {
+			m.pending.Add(-1)
+			continue
+		}
 		r.forwardToHop(m, buf[:n])
+		m.pending.Add(-1)
 	}
 }
 
@@ -297,12 +332,16 @@ func (r *DatagramRelay) mappingFor(client *net.UDPAddr) *datagramRelayMapping {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.stopping || r.stopped || r.hop == nil {
+	if r.stopped || r.hop == nil {
 		r.drop(&r.dropsSendError)
 		return nil
 	}
 	if m := r.byClient[key]; m != nil {
 		return m
+	}
+	if r.stopping {
+		r.drop(&r.dropsUnknownSource)
+		return nil
 	}
 	if len(r.byClient) >= r.maxMappings {
 		// Over the ceiling: dropped, never granted capacity by evicting a live
@@ -311,15 +350,23 @@ func (r *DatagramRelay) mappingFor(client *net.UDPAddr) *datagramRelayMapping {
 		r.mappingsRejected.Add(1)
 		return nil
 	}
+	release, err := r.policy.Acquire(client)
+	if err != nil {
+		r.drop(&r.dropsCeiling)
+		r.mappingsRejected.Add(1)
+		return nil
+	}
 	id, ok := r.identity.nextMappingID()
 	if !ok {
+		release()
 		// The id space is exhausted. Refusing is bounded and countable; wrapping
 		// would silently break "an id is never reused" and with it the return path.
 		r.drop(&r.dropsCeiling)
 		r.mappingsRejected.Add(1)
 		return nil
 	}
-	m := &datagramRelayMapping{id: id, client: client}
+	ctx, cancel := context.WithCancel(r.policyCtx)
+	m := &datagramRelayMapping{id: id, client: client, ctx: ctx, cancel: cancel, release: release}
 	m.lastActivity.Store(time.Now().UnixNano())
 	r.byClient[key] = m
 	r.byID[id] = m
@@ -346,6 +393,7 @@ func (r *DatagramRelay) forwardToHop(m *datagramRelayMapping, payload []byte) {
 	}
 	if _, err := hop.Write(wire); err != nil {
 		r.drop(&r.dropsSendError)
+		r.removeMapping(m)
 		return
 	}
 	m.lastActivity.Store(time.Now().UnixNano())
@@ -390,11 +438,19 @@ func (r *DatagramRelay) hopLoop(hop *net.UDPConn) {
 			r.drop(&r.dropsUnknownSource)
 			continue
 		}
+		m.pending.Add(1)
+		if err := r.policy.WaitOut(m.ctx, len(payload)); err != nil {
+			m.pending.Add(-1)
+			continue
+		}
 		if _, err := listener.WriteToUDP(payload, m.client); err != nil {
+			m.pending.Add(-1)
 			r.drop(&r.dropsSendError)
+			r.removeMapping(m)
 			continue
 		}
 		m.lastActivity.Store(time.Now().UnixNano())
+		m.pending.Add(-1)
 		r.packetsOut.Add(1)
 		r.bytesOut.Add(int64(len(payload)))
 		r.lastActivityAt.Store(time.Now().Unix())
@@ -411,11 +467,13 @@ func (r *DatagramRelay) sweepLoop() {
 	}
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
-	for range ticker.C {
-		if r.isShuttingDown() {
+	for {
+		select {
+		case <-r.policyCtx.Done():
 			return
+		case <-ticker.C:
+			r.sweep(time.Now())
 		}
-		r.sweep(time.Now())
 	}
 }
 
@@ -427,9 +485,11 @@ func (r *DatagramRelay) sweep(now time.Time) {
 		if last <= 0 {
 			continue
 		}
-		if now.Sub(time.Unix(0, last)) >= r.idleTimeout {
+		if m.pending.Load() == 0 && now.Sub(time.Unix(0, last)) >= r.idleTimeout {
 			delete(r.byID, id)
 			delete(r.byClient, normalizeClientAddr(m.client))
+			m.cancel()
+			m.release()
 			expired = append(expired, m)
 		}
 	}
@@ -440,7 +500,18 @@ func (r *DatagramRelay) sweep(now time.Time) {
 func (r *DatagramRelay) isShuttingDown() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.stopping || r.stopped || r.listener == nil
+	return r.stopped || r.listener == nil
+}
+
+func (r *DatagramRelay) removeMapping(m *datagramRelayMapping) {
+	r.mu.Lock()
+	if r.byID[m.id] == m {
+		delete(r.byID, m.id)
+		delete(r.byClient, normalizeClientAddr(m.client))
+	}
+	r.mu.Unlock()
+	m.cancel()
+	m.release()
 }
 
 // drop counts one drop under a reason-specific counter as well as the total.
@@ -506,6 +577,12 @@ func (r *DatagramRelay) DrainMappings(timeout time.Duration) error {
 	r.mu.Lock()
 	r.stopping = true
 	r.mu.Unlock()
+	if timeout <= 0 {
+		return nil
+	}
+	if timeout > drainCeiling {
+		timeout = drainCeiling
+	}
 
 	deadline := time.Now().Add(timeout)
 	for {

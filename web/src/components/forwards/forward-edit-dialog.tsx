@@ -18,6 +18,8 @@
  * `components/forwards/forward-protocol-badge.tsx`。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ForwardPolicyFields } from "./forward-policy-fields";
+import { FORWARD_POLICY_FIELDS, forwardPolicyDraft, forwardPolicyDraftErrors, forwardPolicyDraftPatch } from "@/lib/forward-policy";
 import { AlertTriangle, Copy, Info, Link2, Loader2, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
@@ -61,6 +63,7 @@ import type { ForwardPatchInput, NodeBinding, PortForward, UserNode } from "@/li
  * 任何字段从这里消失，`forward-edit-dialog.test.ts` 的字段集断言会失败。
  */
 export const FORWARD_EDIT_FIELDS = [
+  ...FORWARD_POLICY_FIELDS,
   "name",
   "mode",
   "ingress_node_id",
@@ -85,6 +88,7 @@ export type ForwardEditField = (typeof FORWARD_EDIT_FIELDS)[number];
 type Draft = ForwardDraft & { tlsCertPath: string; tlsKeyPath: string };
 
 const EMPTY_DRAFT: Draft = {
+  ...forwardPolicyDraft(),
   name: "",
   mode: "direct",
   ingressId: "",
@@ -98,6 +102,7 @@ const EMPTY_DRAFT: Draft = {
 
 function draftFrom(forward: PortForward): Draft {
   return {
+    ...forwardPolicyDraft(forward),
     name: forward.name ?? "",
     mode: forward.mode === "relay" ? "relay" : "direct",
     ingressId: forward.ingress_node_id ? String(forward.ingress_node_id) : "",
@@ -120,7 +125,7 @@ function draftFrom(forward: PortForward): Draft {
  * 「清空路径」是表单预检的失败，不是一次可提交的编辑）。
  */
 export function draftToPatch(forward: PortForward, draft: Draft): ForwardPatchInput {
-  const patch: ForwardPatchInput = {};
+  const patch: ForwardPatchInput = Object.keys(forwardPolicyDraftErrors(draft)).length ? {} : forwardPolicyDraftPatch(forward, draft);
   if (draft.name.trim() !== (forward.name ?? "")) patch.name = draft.name.trim();
   if (draft.mode !== (forward.mode === "relay" ? "relay" : "direct")) {
     patch.mode = draft.mode;
@@ -160,6 +165,7 @@ export function draftFormErrors(
   t: (key: string) => string,
 ): Partial<Record<ForwardEditField, string>> {
   const errors: Partial<Record<ForwardEditField, string>> = {};
+  Object.assign(errors, forwardPolicyDraftErrors(draft));
   if (!draft.name.trim()) errors.name = t("forward.saveFailed");
   if (!draft.ingressId) errors.ingress_node_id = t("forward.chooseIngress");
   const listen = draft.listenPort.trim();
@@ -595,6 +601,7 @@ export function ForwardEditDialog({
               规则与创建完全相同：只有 tls 能带、必须成对）。
               只在 tls 行出现：tcp/ws 携带路径是 400，udp 更没有 TLS 前端可言。
             */}
+            <ForwardPolicyFields draft={draft} onChange={(patch) => setDraft((d) => ({ ...d, ...patch }))} locale={locale} />
             {isTlsForward ? (
               <>
                 <Field

@@ -105,7 +105,11 @@ func TestDatagramEgressRoundTripEchoesHeaderAndReachesTarget(t *testing.T) {
 		t.Fatalf("reply payload = %q, want %q", payload, "T:hello")
 	}
 
-	stats := e.Stats()
+	var stats DatagramStats
+	waitFor(t, time.Second, func() bool {
+		stats = e.Stats()
+		return stats.PacketsOut == 1 && stats.BytesOut == int64(len("T:hello"))
+	}, "UDP egress reply metrics")
 	if stats.Mappings != 1 || stats.MappingsCreated != 1 {
 		t.Fatalf("mapping facts = %+v, want 1 live / 1 created", stats)
 	}

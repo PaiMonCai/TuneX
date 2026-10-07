@@ -91,7 +91,17 @@ export interface NodeBinding {
   unbind_blocked: boolean;
 }
 
-export interface PortForward {
+export interface ForwardPolicyInput {
+  /** bytes/sec, runtime client entrance; 0 unlimited subject to workspace ceilings. */
+  bytes_per_second_in?: number | null;
+  bytes_per_second_out?: number | null;
+  /** TCP connections / UDP active mappings; not distinct-IP counts. */
+  max_connections?: number | null;
+  max_connections_per_ip?: number | null;
+}
+
+export interface PortForward extends ForwardPolicyInput {
+  link_resource_id?: number | null;
   /** Missing/null creator is read-only in own mutation scope. */
   creator_user_id?: number | null;
   id: ID;
@@ -146,7 +156,7 @@ export interface PortForward {
   updated_at: string;
 }
 
-export interface PortForwardCreateInput {
+export interface PortForwardCreateInput extends ForwardPolicyInput {
   name: string;
   listen_port?: number | null;
   target_host: string;
@@ -194,7 +204,7 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
  * RELAY 形态全都变），§6.1 没有冻结这套语义，所以后端 schema 用「不接受该键」
  * 而不是猜一个行为。编辑器因此只读展示协议。
  */
-export interface ForwardPatchInput {
+export interface ForwardPatchInput extends ForwardPolicyInput {
   name?: string;
   mode?: "direct" | "relay";
   ingress_node_id?: ID;
@@ -214,7 +224,7 @@ export interface ForwardPatchInput {
 }
 
 /** preview 的候选 config 投影（与后端 ForwardCandidateConfig 同形）。 */
-export interface ForwardPreviewConfig {
+export interface ForwardPreviewConfig extends ForwardPolicyInput {
   name: string;
   mode: "direct" | "relay";
   /** 持久化协议事实（后端 ForwardCandidateConfig.protocol）。 */

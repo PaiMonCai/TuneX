@@ -38,6 +38,8 @@ services:
       AUDIT_LOG_ENABLED: "true"
       # Destructive batch Forward deletion is default-off; A00 gate opts in explicitly.
       FORWARD_BATCH_DELETE_ENABLED: ${FORWARD_BATCH_DELETE_ENABLED:-false}
+      TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
+      TUNEX_LINK_SEAL_KEY: ${TUNEX_LINK_SEAL_KEY:-}
     networks:
       tunex-it-ctrl:
         ipv4_address: 172.31.0.10
@@ -70,6 +72,8 @@ services:
       TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
       JWT_ISSUER: integration
       DISABLE_WORKER: "false"
+      TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
+      TUNEX_LINK_SEAL_KEY: ${TUNEX_LINK_SEAL_KEY:-}
     command: ["bun", "src/worker.ts"]
     depends_on:
       panel:
@@ -137,6 +141,8 @@ services:
         ipv4_address: 172.31.0.13
 
   ingress-agent:
+    environment:
+      TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-ingress-agent
     restart: unless-stopped
@@ -176,6 +182,8 @@ services:
         condition: service_healthy
 
   egress-agent:
+    environment:
+      TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-egress-agent
     restart: unless-stopped
@@ -213,6 +221,8 @@ services:
         condition: service_healthy
 
   ingress-agent-b:
+    environment:
+      TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-ingress-agent-b
     restart: unless-stopped
@@ -251,6 +261,8 @@ services:
         condition: service_healthy
 
   egress-agent-b:
+    environment:
+      TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-egress-agent-b
     restart: unless-stopped

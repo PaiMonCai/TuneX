@@ -9,6 +9,7 @@
 
 import { acquirePort, releaseLease } from "./portPool.ts";
 import type { AcquirePortOutcome } from "./portPool.ts";
+import { leaseProtocol, normalizeBindScope } from "../integrations/forwardx/bind-scope.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { ACTIVE_ROLLOUT_PHASES, planRollout, ROLLOUT_STAGE_SEQUENCE, rolloutStepKey } from "./forward-rollout.ts";
 import {
@@ -529,6 +530,8 @@ async function runStep(
           ? await existingIngressPort(deps, ctx.tunnelId)
           : null);
       const leaseType = step.direction === "egress" ? "egress" : "ingress";
+      const portProtocol = (await dispatchFactsFor(ctx.tunnelId, deps.db))?.protocol ?? null;
+      const portBindScope = step.direction === "ingress" ? ctx.desired.listen_ip : "*";
       // `AcquirePortResult.reused` 同时覆盖“已有 active lease”与“revive released row”，
       // 但失败补偿只应保留前者。先拍一张 active ownership 快照，才能区分这两种语义。
       let preexistingActiveLeaseId: number | null = null;
@@ -538,15 +541,21 @@ async function runStep(
             node_id: nodeId,
             port: preferredPort,
             tunnel_id: ctx.tunnelId,
+            link_id: null,
+            protocol: leaseProtocol(portProtocol),
+            bind_scope: normalizeBindScope(portBindScope),
             lease_type: leaseType,
             status: "active",
           },
-          select: { id: true, node_id: true, port: true, tunnel_id: true, lease_type: true, status: true },
+          select: { id: true, node_id: true, port: true, tunnel_id: true, link_id: true, protocol: true, bind_scope: true, lease_type: true, status: true },
         })) as Array<{
           id: number;
           node_id?: number;
           port?: number;
           tunnel_id?: number | null;
+          link_id?: number | null;
+          protocol?: string;
+          bind_scope?: string;
           lease_type?: string;
           status?: string;
         }>;
@@ -556,6 +565,9 @@ async function runStep(
             (row.node_id === undefined || row.node_id === nodeId) &&
             (row.port === undefined || row.port === preferredPort) &&
             (row.tunnel_id === undefined || row.tunnel_id === ctx.tunnelId) &&
+            row.link_id == null &&
+            (row.protocol === undefined || row.protocol === leaseProtocol(portProtocol)) &&
+            (row.bind_scope === undefined || normalizeBindScope(row.bind_scope) === normalizeBindScope(portBindScope)) &&
             (row.lease_type === undefined || row.lease_type === leaseType) &&
             (row.status === undefined || row.status === "active"),
         );
@@ -568,6 +580,10 @@ async function runStep(
           leaseType,
           preferredPort,
           tunnelId: ctx.tunnelId,
+          // Use the same actual protocol facts as dispatch. Missing facts are
+          // conservative unknown reservations, never a silent TCP fallback.
+          protocol: portProtocol,
+          bindScope: portBindScope,
           // 同上：本隧道自己的腿占着的端口不算冲突（幂等编辑/重试/还原端口都必须能过）。
           ownRuntimeIds: Orchestrator.localRuntimeIdsForTunnel(ctx.tunnelId),
         },

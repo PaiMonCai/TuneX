@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -13,6 +14,10 @@ import (
 // errNoTarget is returned by the egress pick function when the target pool is
 // empty; the connection is dropped instead of dangling.
 var errNoTarget = errors.New("forwarder: egress target pool is empty")
+
+// ErrClientIPRequired distinguishes an unsupported selector source scope from
+// an empty pool. The legacy relay hop cannot supply an original client IP.
+var ErrClientIPRequired = errors.New("forwarder: IP_HASH requires a trusted original client IP; legacy RELAY EGRESS does not carry one")
 
 // TargetStats is one target's observable health.
 // It answers the two questions an operator actually asks: has this target ever
@@ -202,7 +207,8 @@ type EgressForwarder struct {
 	// dial timeout — i.e. the default behavior when no resolver is injected. The
 	// runtime injects a resolver-backed dialer so target names are resolved with
 	// a TTL cache and a stale fallback instead of once per connection.
-	dial DialFunc
+	dial         DialFunc
+	clientSource func(net.Conn) string
 }
 
 // EgressOptions are the injections an egress forwarder accepts.
@@ -212,6 +218,12 @@ type EgressOptions struct {
 	// Dial overrides the upstream dialer. Nil = a net.Dialer with the stream
 	// dial timeout, which is the default resolver behaviour.
 	Dial DialFunc
+	// ClientSource supplies a trusted original client IP (or IP:port). Leave it
+	// nil for relay traffic: the legacy TCP hop carries no original source, and
+	// RemoteAddr identifies only the immediate peer. A listener known to accept
+	// clients directly may explicitly use their RemoteAddr here. This callback
+	// must not trust unauthenticated payloads or forwarded headers.
+	ClientSource func(net.Conn) string
 }
 
 // NewEgress builds an EGRESS forwarder (cfg.Mode must be ModeEgress). sel may
@@ -240,6 +252,9 @@ func NewEgressWithOptions(cfg TunnelConfig, sel TargetSelector, opts EgressOptio
 	if sel == nil {
 		return nil, errors.New("forwarder: EGRESS tunnel requires a target selector")
 	}
+	if selectorRequiresClientIP(sel, cfg) && opts.ClientSource == nil {
+		return nil, ErrClientIPRequired
+	}
 	dial := opts.Dial
 	if dial == nil {
 		// The timeout is the same one the default dial path uses through
@@ -248,10 +263,11 @@ func NewEgressWithOptions(cfg TunnelConfig, sel TargetSelector, opts EgressOptio
 		dial = dialer.DialContext
 	}
 	return &EgressForwarder{
-		pipeTracker: pipeTracker{cfg: cfg},
-		sel:         sel,
-		health:      newTargetHealth(opts.Observer),
-		dial:        dial,
+		pipeTracker:  pipeTracker{cfg: cfg},
+		sel:          sel,
+		health:       newTargetHealth(opts.Observer),
+		dial:         dial,
+		clientSource: opts.ClientSource,
 	}, nil
 }
 
@@ -259,8 +275,18 @@ func NewEgressWithOptions(cfg TunnelConfig, sel TargetSelector, opts EgressOptio
 // ErrAlreadyStarted when the forwarder is already running.
 func (f *EgressForwarder) Start() error {
 	sel, health, dial := f.sel, f.health, f.dial
-	return f.pipeTracker.start(func(net.Conn) (net.Conn, error) {
-		t := sel.Select()
+	if selectorRequiresClientIP(sel, f.cfg) && f.clientSource == nil {
+		return ErrClientIPRequired
+	}
+	return f.pipeTracker.start(func(client net.Conn) (net.Conn, error) {
+		source := ""
+		if f.clientSource != nil {
+			source = f.clientSource(client)
+		}
+		if selectorRequiresClientIP(sel, f.cfg) && source == "" {
+			return nil, ErrClientIPRequired
+		}
+		t := selectTargetForClient(sel, source)
 		addr := t.Addr()
 		if addr == "" {
 			// Pool is empty (not restored yet): drop instead of hanging.
@@ -292,6 +318,26 @@ func (f *EgressForwarder) Start() error {
 		// of the same forwarder are mid-flight on other targets.
 		return &measuredConn{Conn: raw, health: health, target: t}, nil
 	})
+}
+
+// selectTargetForClient keeps client awareness optional so legacy selectors
+// still work without changing the public TargetSelector interface. An empty
+// source deliberately means the original client IP is unavailable.
+func selectTargetForClient(sel TargetSelector, source string) Target {
+	if clientAware, ok := sel.(interface{ SelectForClient(string) Target }); ok {
+		return clientAware.SelectForClient(source)
+	}
+	return sel.Select()
+}
+
+func selectorRequiresClientIP(sel TargetSelector, cfg TunnelConfig) bool {
+	if strings.EqualFold(strings.TrimSpace(string(cfg.LBStrategy)), "IP_HASH") {
+		return true
+	}
+	if scoped, ok := sel.(interface{ RequiresClientIP() bool }); ok {
+		return scoped.RequiresClientIP()
+	}
+	return false
 }
 
 // Stop releases the egress port and drains live connections.

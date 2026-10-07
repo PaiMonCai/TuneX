@@ -81,6 +81,8 @@ export type DenyReason =
   | "policy_expired"
   | "tunnel_limit"
   | "traffic_exhausted"
+  | "bandwidth_limit"
+  | "client_limit"
   | "protocol_not_allowed"
   | "node_limit"
   | "member_limit"
@@ -98,6 +100,10 @@ export function describeDeny(reason: DenyReason, params: Record<string, unknown>
       return `已达隧道数量上限（${params.limit ?? "?"} 条）`;
     case "traffic_exhausted":
       return "已用流量达到策略额度上限";
+    case "bandwidth_limit":
+      return "当前策略禁止使用转发带宽";
+    case "client_limit":
+      return "当前策略禁止建立转发连接";
     case "protocol_not_allowed":
       return `当前策略不允许使用该协议（${params.protocol ?? "?"}）`;
     case "node_limit":
@@ -432,6 +438,8 @@ export function checkTunnelCreation(policy: EffectivePolicy, ctx: TunnelCreateCo
   if (trafficLimit !== null && ctx.trafficUsed >= trafficLimit) {
     return deny("traffic_exhausted", { limit: trafficLimit, used: ctx.trafficUsed });
   }
+  if (policy.limits.bandwidth_limit === 0) return deny("bandwidth_limit", { limit: 0 });
+  if (policy.limits.client_limit === 0) return deny("client_limit", { limit: 0 });
   return { allowed: true };
 }
 

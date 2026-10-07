@@ -12,6 +12,8 @@
 import { Prisma } from "@prisma/client";
 import type { TunnelType } from "@prisma/client";
 import { db } from "../db.ts";
+import { bindScopesOverlap, protocolsOverlap } from "../integrations/forwardx/bind-scope.ts";
+import { forwardPolicyErrors, forwardPolicyValues, resolveForwardPolicy, type ForwardPolicyInput } from "./forward-policy.ts";
 import {
   countWorkspaceTunnels,
   sumWorkspaceTraffic,
@@ -89,7 +91,7 @@ import {
 
 export type ForwardApplyStatus = "pending" | "applying" | "active" | "error" | "suspended";
 export type ForwardAction = Extract<TunnelAction, "retry" | "suspend" | "resume">;
-export interface ForwardCreateInput {
+export interface ForwardCreateInput extends ForwardPolicyInput {
   name: string;
   mode: ForwardMode;
   /** Omitted by compatibility clients => tcp; explicit unknown values fail closed. */
@@ -137,7 +139,7 @@ export interface ForwardListInput {
   keyword?: string;
 }
 
-export interface ForwardPatchInput {
+export interface ForwardPatchInput extends ForwardPolicyInput {
   name?: string;
   /**  §13.3.1：创建后可编辑的全部业务字段。 */
   mode?: ForwardMode;
@@ -286,6 +288,10 @@ function error(
   return { ok: false, status, code, message, error_layer: authorizationErrorLayer(code, extra?.data), ...extra };
 }
 
+function linkManagedForward(): ForwardServiceError {
+  return error(409, "link_managed_forward", "该转发由 Link 管理，请使用链接专用编辑/操作接口");
+}
+
 function targetAddress(host: string, port: number): string {
   return host.includes(":") && !host.startsWith("[")
     ? `[${host}]:${port}`
@@ -294,7 +300,7 @@ function targetAddress(host: string, port: number): string {
 
 export function forwardView(t: any) {
   const target =
-    t.tunnel_mode === "relay"
+    t.tunnel_mode === "relay" && t.link_resource_id == null
       ? t.egress_pool?.targets?.[0] ?? null
       : t.remote_host && t.remote_port
         ? { host: t.remote_host, port: t.remote_port, weight: 1 }
@@ -303,10 +309,14 @@ export function forwardView(t: any) {
   const protocol = persistedForwardProtocol(t.forward_protocol, t.tunnel_type);
   return {
     id: t.id,
+    link_resource_id: t.link_resource_id ?? null,
+    ...forwardPolicyValues(t),
     creator_user_id: t.user_id ?? null,
     name: t.name,
     protocol,
-    protocol_supported: normalizeForwardProtocol(protocol) !== null,
+    protocol_supported: t.link_resource_id != null
+      ? process.env.TUNEX_FXP_LINKS_ENABLED === "true" && ["tcp", "udp", "both"].includes(protocol)
+      : normalizeForwardProtocol(protocol) !== null,
     // : the paths are part of a tls Forward's configuration, so the view
     // carries them. Without them the detail page can say "TLS" but never which
     // certificate, and an operator cannot verify a path without reading the DB —
@@ -387,7 +397,7 @@ async function prepareRelayRevisionResources(
   // 目标仍要作为本版 revision 的运行态事实落到 snapshot（rollout 的 apply 会把它
   // 交给 host），所以这里直接返回目标集合并跳过本地池的增删。
   const federatedPeer = normalizeFederatedEgressPeer(candidate.federated_egress_peer);
-  if (federatedPeer !== null) {
+  if (federatedPeer !== null || candidate.link_resource_id != null) {
     const host = candidate.target_host ?? ctx.egressTargets?.[0]?.host ?? null;
     const port = candidate.target_port ?? ctx.egressTargets?.[0]?.port ?? null;
     if (host == null || port == null) {
@@ -686,6 +696,9 @@ export async function createForward(
   input: ForwardCreateInput,
   options: ForwardCreateOptions = {},
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
+  if ("link_resource_id" in input) return linkManagedForward();
+  const policyErrors = forwardPolicyErrors(input);
+  if (policyErrors.length) return error(400, "invalid_input", policyErrors[0]);
   const protocol = normalizeForwardProtocol(input.protocol);
   if (protocol === null) {
     return error(400, "invalid_input", "当前版本不支持该转发协议");
@@ -842,6 +855,8 @@ export async function createForward(
   const reserved = await withWorkspaceQuotaLock(
     workspaceId,
     async (tx, policy) => {
+      resolveForwardPolicy(input, policy.limits); // Validate ceilings; persist the user's request.
+      const requestedForwardPolicy = forwardPolicyValues(input);
       const [tunnelCount, trafficUsed, maxOrder] = await Promise.all([
         countWorkspaceTunnels(workspaceId, tx),
         sumWorkspaceTraffic(
@@ -865,14 +880,18 @@ export async function createForward(
       if (!decision.allowed) return { denied: decision } as const;
 
       if (input.listen_port != null) {
-        const conflict = await tx.tunnel.findFirst({
+        const holders = await tx.tunnel.findMany({
           where: {
             ingress_node_id: ingress.id,
             listen_port: input.listen_port,
           },
-          select: { id: true },
+          select: { id: true, forward_protocol: true, tunnel_type: true, listen_ip: true },
         });
-        if (conflict) return { conflict: true } as const;
+        // Creation binds a wildcard. Different socket protocols may share the
+        // number; unknown protocol/scope facts must still conservatively collide.
+        if (holders.some((holder) =>
+          protocolsOverlap(persistedForwardProtocol(holder.forward_protocol, holder.tunnel_type), protocol) &&
+          bindScopesOverlap(holder.listen_ip, "0.0.0.0"))) return { conflict: true } as const;
       }
 
       // Path setup is part of the same transaction as the Forward row. Existing
@@ -901,6 +920,7 @@ export async function createForward(
           // bug this line was written to fix (`ws` has no legacy enum value).
           ...(legacyTunnelTypeColumn(protocol) as { tunnel_type?: TunnelType }),
           forward_protocol: protocol,
+          ...requestedForwardPolicy,
           ...tlsPaths.columns,
           category: "port_forward",
           listen_ip: "0.0.0.0",
@@ -1060,6 +1080,7 @@ export async function patchForward(
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
+  if (current.link_resource_id != null || "link_resource_id" in patch) return linkManagedForward();
 
   // ──  §13.3.3：校验逻辑只有一个实现 ──
   // patchForward 与 previewForwardUpdate 都走 resolveForwardCandidate() → 同一个
@@ -1142,7 +1163,8 @@ export async function patchForward(
   // concrete per-node port and markTunnelApplied persists it after ACK.
   let revision: number;
   try {
-    const result = await db.$transaction(async (tx) => {
+    const result = await withWorkspaceQuotaLock(workspaceId, async (tx, policy) => {
+      resolveForwardPolicy(candidate, policy.limits); // Requests stay immutable; delivery intersects fresh limits.
       const resources = await prepareRelayRevisionResources(
         tx,
         current.id,
@@ -1154,6 +1176,7 @@ export async function patchForward(
         {
           tunnelId: current.id,
           candidate,
+          expectedRevision: patch.expected_revision ?? null,
           desiredStatus,
           createdById: ctx.userId,
           egressTargets: resources.targets,
@@ -1336,6 +1359,7 @@ export async function previewForwardUpdate(
 ): Promise<ForwardServiceResult<ForwardPreviewResult>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
+  if (current.link_resource_id != null || "link_resource_id" in patch) return linkManagedForward();
 
   const resolved = await resolveForwardCandidate(id, workspaceId, patch, userId);
   if (!resolved.ok) return resolved.error;
@@ -1424,6 +1448,7 @@ async function resolveForwardCandidate(
 ): Promise<{ ok: true; data: ResolvedCandidate } | { ok: false; error: ForwardServiceError }> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return { ok: false, error: error(404, "not_found", "端口转发不存在") };
+  if (current.link_resource_id != null || "link_resource_id" in patch) return { ok: false, error: linkManagedForward() };
 
   const row = current as unknown as ForwardRevisionRow;
   const base = currentDesiredConfig(row);
@@ -1682,6 +1707,7 @@ export async function runForwardAction(
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
+  if (current.link_resource_id != null) return linkManagedForward();
 
   const result = await runTunnelActionApi(id, action, workspaceId, {
     orchestrator: getOrchestrator(),
@@ -1788,6 +1814,7 @@ export async function deleteForward(
 ): Promise<ForwardServiceResult<ForwardDeleteReceipt>> {
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return error(404, "not_found", "端口转发不存在");
+  if (current.link_resource_id != null) return linkManagedForward();
 
   const dedicatedPoolId =
     current.tunnel_mode === "relay" &&

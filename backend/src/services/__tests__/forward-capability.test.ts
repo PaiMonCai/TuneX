@@ -25,6 +25,13 @@ describe("WP10 capability vs count quota", () => {
     expect(checkTunnelUse(policy(), { ...context, trafficUsed: 100 }).reason).toBe("traffic_exhausted");
     expect(checkTunnelUse(policy(), { ...context, protocol: "udp" }).reason).toBe("protocol_not_allowed");
   });
+  test("zero runtime resource ceilings reject new and existing use", () => {
+    for (const field of ["bandwidth_limit", "client_limit"] as const) {
+      const p = policy(); p.limits[field] = 0;
+      expect(checkTunnelCreation(p, { ...context, tunnelCount: 0 }).reason).toBe(field);
+      expect(checkTunnelUse(p, context).reason).toBe(field);
+    }
+  });
   test("capability list alone cannot authorize shared machine ownership", () => {
     expect(checkTunnelUse(policy(), { ...context, inGroupOwned: false }).reason).toBe("in_group_not_allowed");
   });

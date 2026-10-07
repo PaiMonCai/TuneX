@@ -24,9 +24,22 @@ RUN set -eu; \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -buildvcs=false -ldflags="-s -w -X main.version=${AGENT_VERSION#v}" -o /out/tunex-agent .
 
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS fxp-build
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src/fxp
+COPY third_party/forwardx/forwardx-fxp/go.mod third_party/forwardx/forwardx-fxp/go.sum ./
+RUN go mod download && go mod verify
+COPY third_party/forwardx/forwardx-fxp ./
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/tunex-fxp .
+
 FROM alpine:3.22
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/tunex-agent /usr/local/bin/tunex-agent
+COPY --from=fxp-build /out/tunex-fxp /usr/local/bin/tunex-fxp
+# Ship the exact modified source and license with the separate AGPL component.
+COPY third_party/forwardx /usr/share/tunex/forwardx-source
 COPY --chmod=0755 agent/docker-entrypoint.sh /usr/local/bin/tunex-agent-entrypoint
 
 # 身份校验**不需要**额外安装任何 HTTP 工具：agent 二进制自带探针

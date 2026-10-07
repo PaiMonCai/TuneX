@@ -76,6 +76,10 @@ func TestParseStrategyAliases(t *testing.T) {
 		"weighted_round_robin":  WeightedRoundRobin,
 		"WEIGHTED_ROUND_ROBIN":  WeightedRoundRobin,
 		" Weighted_Round_Robin": WeightedRoundRobin,
+		"fallback":              Fallback,
+		" FALLBACK ":            Fallback,
+		"ip_hash":               IPHash,
+		" IP_HASH ":             IPHash,
 	}
 	for in, want := range cases {
 		got, ok := ParseStrategy(in)
@@ -87,7 +91,7 @@ func TestParseStrategyAliases(t *testing.T) {
 			t.Errorf("ParseStrategy(%q) = %s, want %s", in, got, want)
 		}
 	}
-	for _, in := range []string{"", "least_conn", "ip_hash", "fifo", "ll", "lc", "round_robin_extra"} {
+	for _, in := range []string{"", "least_conn", "fifo", "ll", "lc", "round_robin_extra"} {
 		if got, ok := ParseStrategy(in); ok {
 			t.Errorf("ParseStrategy(%q) = %s, true; want an error", in, got)
 		}
@@ -95,6 +99,11 @@ func TestParseStrategyAliases(t *testing.T) {
 }
 
 func TestStrategyString(t *testing.T) {
+	for _, s := range []Strategy{Fallback, IPHash} {
+		if got := s.String(); got != string(s) {
+			t.Errorf("%s.String() = %q", s, got)
+		}
+	}
 	if got := RoundRobin.String(); got != "ROUND_ROBIN" {
 		t.Errorf("RoundRobin.String() = %q", got)
 	}
@@ -356,7 +365,7 @@ func TestSelectWeightedRoundRobinEmptyPool(t *testing.T) {
 }
 
 func TestSelectAllStrategiesEmptyPool(t *testing.T) {
-	for _, s := range []Strategy{RoundRobin, Random, WeightedRoundRobin} {
+	for _, s := range []Strategy{RoundRobin, Random, WeightedRoundRobin, Fallback, IPHash} {
 		l := New(s, nil)
 		if got := l.Select(); got.Addr() != "" {
 			t.Fatalf("%s on an empty pool returned %q", s, got.Addr())

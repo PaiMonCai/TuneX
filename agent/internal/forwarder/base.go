@@ -2,6 +2,7 @@
 package forwarder
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -124,7 +125,11 @@ type pipeTracker struct {
 	// connection (a failed handshake, a non-WS request). The connection is
 	// dropped and the listener keeps serving: a bad client must never take the
 	// tunnel down.
-	wrapConn func(net.Conn) (net.Conn, error)
+	wrapConn     func(net.Conn) (net.Conn, error)
+	policy       *DataPlanePolicy
+	policyCtx    context.Context
+	policyCancel context.CancelFunc
+	pending      map[net.Conn]struct{}
 }
 
 // errNotRunning is returned by internal helpers that require a bound listener.
@@ -150,6 +155,11 @@ func (t *pipeTracker) start(p pick) error {
 		t.mu.Unlock()
 		return ErrAlreadyStarted
 	}
+	policy, err := NewDataPlanePolicy(t.cfg)
+	if err != nil {
+		t.mu.Unlock()
+		return err
+	}
 	ln, err := net.Listen("tcp", t.cfg.ListenAddr())
 	if err != nil {
 		t.mu.Unlock()
@@ -157,6 +167,8 @@ func (t *pipeTracker) start(p pick) error {
 	}
 	t.ln = ln
 	t.started = true
+	t.policy = policy
+	t.policyCtx, t.policyCancel = context.WithCancel(context.Background())
 	t.up.arm()
 	t.mu.Unlock()
 
@@ -196,28 +208,62 @@ func (t *pipeTracker) acceptLoop(ln net.Listener, p pick) {
 			_ = conn.Close()
 			return
 		}
-		if t.wrapConn != nil {
-			// Wrap BEFORE the connection is counted: a connection the front
-			// protocol refuses is not a live tunnelled connection, and counting
-			// it would make a drain wait for a client that never negotiates.
-			wrapped, err := t.wrapConn(conn)
-			if err != nil {
-				_ = conn.Close()
-				continue
-			}
-			conn = wrapped
+		// Gate pending handshakes/dials and register the raw socket before the
+		// protocol adapter. A silent WS upgrade must not block Accept or Stop.
+		t.mu.Lock()
+		if t.stopped || t.draining || t.ln != ln {
+			t.mu.Unlock()
+			_ = conn.Close()
+			return
 		}
-		atomic.AddInt32(&t.conns, 1)
+		release, err := t.policy.Acquire(conn.RemoteAddr())
+		if err != nil {
+			t.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		ctx, cancel := context.WithCancel(t.policyCtx)
+		tracked := &policyConn{Conn: conn, cancel: cancel}
+		if t.live == nil {
+			t.live = make(map[net.Conn]struct{})
+		}
+		t.live[tracked] = struct{}{}
+		if t.pending == nil {
+			t.pending = make(map[net.Conn]struct{})
+		}
+		t.pending[tracked] = struct{}{}
 		t.inFlight.Add(1)
-		t.trackConn(conn)
-		go func() {
-			defer t.inFlight.Done()
-			defer atomic.AddInt32(&t.conns, -1)
-			defer t.untrackConn(conn)
-			defer conn.Close()
-			t.handleConn(conn, p)
-		}()
+		t.mu.Unlock()
+		go t.serveAccepted(ctx, tracked, release, p)
 	}
+}
+
+func (t *pipeTracker) serveAccepted(ctx context.Context, raw net.Conn, release func(), p pick) {
+	defer t.inFlight.Done()
+	defer release()
+	defer t.untrackConn(raw)
+	defer raw.Close()
+	defer func() { t.mu.Lock(); delete(t.pending, raw); t.mu.Unlock() }()
+	conn := raw
+	if t.wrapConn != nil {
+		wrapped, err := t.wrapConn(raw)
+		if err != nil {
+			return
+		}
+		conn = wrapped
+		defer conn.Close()
+	}
+	// Failed front handshakes occupy gate capacity but never inflate live
+	// tunnel metrics. Recheck teardown after the handshake.
+	t.mu.Lock()
+	if t.stopped || t.draining || ctx.Err() != nil {
+		t.mu.Unlock()
+		return
+	}
+	atomic.AddInt32(&t.conns, 1)
+	t.mu.Unlock()
+	defer atomic.AddInt32(&t.conns, -1)
+	t.handleConn(ctx, conn, raw, p)
 }
 
 // ProtocolDiagnostics reports this tunnel's protocol-specific facts, and whether
@@ -238,22 +284,53 @@ func (t *pipeTracker) isDraining() bool {
 	return t.draining
 }
 
-func (t *pipeTracker) handleConn(conn net.Conn, p pick) {
-	upstream, err := p(conn)
-	if err != nil {
-		// Unreachable target: drop the client immediately rather than
-		// leaving it hanging with no upstream.
+func (t *pipeTracker) handleConn(ctx context.Context, conn, raw net.Conn, p pick) {
+	// Existing pick adapters have bounded dials but no context argument. A
+	// cancelled session releases its gate now and closes any late dial result.
+	result := make(chan net.Conn)
+	go func() {
+		if ctx.Err() != nil {
+			return
+		}
+		up, err := p(conn)
+		if err != nil {
+			if up != nil {
+				_ = up.Close()
+			}
+			up = nil
+		}
+		select {
+		case result <- up:
+		case <-ctx.Done():
+			if up != nil {
+				_ = up.Close()
+			}
+		}
+	}()
+	var upstream net.Conn
+	select {
+	case upstream = <-result:
+		if upstream == nil {
+			return
+		}
+	case <-ctx.Done():
 		return
 	}
+	t.mu.Lock()
+	delete(t.pending, raw)
+	t.mu.Unlock()
 	// Register the upstream as well: a shutdown deadline must be able to end
 	// this pair, and closing only the client can leave the upstream copy blocked
 	// forever when the peer never sends again.
-	t.trackConn(upstream)
+	pipeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	trackedUpstream := &policyConn{Conn: upstream, cancel: cancel}
+	t.trackConn(trackedUpstream)
 	defer func() {
-		t.untrackConn(upstream)
-		_ = upstream.Close()
+		t.untrackConn(trackedUpstream)
+		_ = trackedUpstream.Close()
 	}()
-	PipeConns(conn, upstream, &t.bytes)
+	PipeConnsWithPolicy(pipeCtx, conn, upstream, t.policy, t.bytes.add)
 }
 
 // stop closes the listener and drains live connections. Safe before Start and
@@ -274,12 +351,36 @@ func (t *pipeTracker) stop() error {
 	t.stopped = true
 	t.up.markStale()
 	ln := t.ln
+	cancel := t.policyCancel
+	limited := t.cfg.SpeedLimit > 0 || t.cfg.BytesPerSecondIn > 0 || t.cfg.BytesPerSecondOut > 0
+	pending := make([]net.Conn, 0, len(t.pending))
+	for conn := range t.pending {
+		pending = append(pending, conn)
+	}
 	t.mu.Unlock()
 
 	if ln != nil {
 		_ = ln.Close()
 	}
+	if limited && cancel != nil {
+		cancel()
+	}
+	// Pending front handshakes do not yet have a pipe cancellation watcher.
+	for _, conn := range pending {
+		_ = conn.Close()
+	}
+	if limited {
+		t.forceCloseConns()
+	}
 	t.drain()
+	// LiveConns excludes failed/pending front handshakes. Also let those owners
+	// unwind and release their gates, with a fixed bound for broken adapters.
+	done := make(chan struct{})
+	go func() { t.inFlight.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+	}
 	return nil
 }
 

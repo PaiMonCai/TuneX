@@ -47,7 +47,11 @@ const (
 	// it is a separate action instead of a diagnose: it needs its own admission
 	// (public-only literals, enforced on both sides), its own caps and its own
 	// audit story. See internal/diag/lookingglass.go for the agent-side half.
-	ActionLookingGlass = "looking_glass"
+	ActionLookingGlass      = "looking_glass"
+	ActionApplyLink         = "apply_link"
+	ActionRemoveLink        = "remove_link"
+	CapabilityFXPLink       = "forward.link.fxp.v1"
+	CapabilityRuntimePolicy = "forward.policy.runtime.v1"
 )
 
 // advertisedActions is the single source of truth for what this agent
@@ -64,9 +68,17 @@ var advertisedActions = []string{
 
 // Capabilities returns the actions this agent implements, sorted. The caller
 // gets a copy: a state report must not be able to mutate the agent's own list.
-func Capabilities() []string {
+type RuntimeFacts struct{ FXPLink, PolicyRuntime bool }
+
+func Capabilities(facts ...RuntimeFacts) []string {
 	out := make([]string, len(advertisedActions))
 	copy(out, advertisedActions)
+	if len(facts) > 0 && facts[0].FXPLink {
+		out = append(out, ActionApplyLink, ActionRemoveLink, CapabilityFXPLink)
+	}
+	if len(facts) > 0 && (facts[0].FXPLink || facts[0].PolicyRuntime) {
+		out = append(out, CapabilityRuntimePolicy)
+	}
 	// 方法级能力：`looking_glass` 这个动作内部还有方法维（tcp_connect / ping / ping6），
 	// 而"能不能真的执行"是**运行环境事实**（镜像里有没有 ping 二进制、内核允不允许
 	// 非特权 ICMP）。只把真的能执行的上报出去 —— 面板据此算它的 `caps.methods`，
@@ -86,7 +98,10 @@ var lookingGlassMethodAvailability = sync.OnceValue(diag.DetectLookingGlassMetho
 // Implements reports whether this agent implements action. It exists so the
 // command loop can answer a command the panel should not have sent with the same
 // reason the panel would have used to refuse sending it.
-func Implements(action string) bool {
+func Implements(action string, facts ...RuntimeFacts) bool {
+	if len(facts) > 0 && facts[0].FXPLink && (action == ActionApplyLink || action == ActionRemoveLink) {
+		return true
+	}
 	for _, a := range advertisedActions {
 		if a == action {
 			return true

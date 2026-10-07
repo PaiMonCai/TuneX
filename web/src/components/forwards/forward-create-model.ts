@@ -1,8 +1,9 @@
 import { DEFAULT_FORWARD_PROTOCOL, tlsPathFieldErrors, type ForwardProtocol } from "@/lib/forward-protocol";
 import type { PortForward, UserNode } from "@/lib/types";
+import { forwardPolicyDraft, type ForwardPolicyDraft } from "@/lib/forward-policy";
 import { forwardCopyDraft } from "@/components/forwards/forward-copy";
 
-export interface ForwardCreateDraft {
+export interface ForwardCreateDraft extends ForwardPolicyDraft {
   mode: "direct" | "relay";
   name: string;
   protocol: ForwardProtocol;
@@ -27,6 +28,7 @@ export interface ForwardCreateDraft {
 
 export function emptyForwardCreateDraft(mode: "direct" | "relay", ingress?: UserNode): ForwardCreateDraft {
   return {
+    ...forwardPolicyDraft(),
     mode,
     name: "",
     protocol: DEFAULT_FORWARD_PROTOCOL,

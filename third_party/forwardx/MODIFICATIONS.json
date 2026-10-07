@@ -1,0 +1,61 @@
+{
+  "upstream_commit": "cb0ef0bb156dc114e4344c887328018491fbd638",
+  "modified_by": "TuneX core ABCD integration",
+  "date": "2026-10-07",
+  "summary": [
+    "Opt-in exact rule/protocol/target authorization",
+    "Private managed config reload with digest confirmation and unchanged sibling preservation",
+    "Both protocol lanes share limiters and admission",
+    "Managed rule shutdown closes both stream endpoints and cancels limiter waits"
+  ],
+  "files": [
+    {
+      "path": "forwardx-fxp/binding_auth.go",
+      "original_sha256": null,
+      "modified_sha256": "40d55de990f5b44142d41e9e8553f9a90a4315360691ae7ecad22f5fda4291b2",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/binding_auth_test.go",
+      "original_sha256": null,
+      "modified_sha256": "df8000ccdeab9ce0f0bef12fa1fca79b530d8cb8b356bfff1f2a6f280b275b6a",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/config.go",
+      "original_sha256": "d637af32bc06f83995be8ff295e84cbc85c6bf5a0f33e3a2d5c27365480c40aa",
+      "modified_sha256": "fbfd8eeaf04e5c20f8d40bb24278439c90df21c271c58ca5012bd765808c1821",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/config_types.go",
+      "original_sha256": "90c05ffae2ba96716b62405c1f6cf3f2231638cef3ca2a5f9271689d6754d310",
+      "modified_sha256": "ac017baa76ac39b1f98c0ba8641624b871e8a6bf592851f54866b49c084a1508",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/main.go",
+      "original_sha256": "f138489498e0a87fe58abe3c8780928998d441a08c56e21a41d427fbcbbc9411",
+      "modified_sha256": "302ef5979daaab5e498f0d10d31a8ccd1a5448eeaf7108a986b71199a40701e1",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/managed_reload.go",
+      "original_sha256": null,
+      "modified_sha256": "8cdb55f0f734b4fccce156c2bb82baea253ddfa1e18a686c5c12223fc5019b84",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_reload_test.go",
+      "original_sha256": null,
+      "modified_sha256": "ddd2fde2e218ee46faf6d0a8cee359026eae92aa2f54993f768b146f2ca22aaa",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/udp_direct.go",
+      "original_sha256": "3315b15f6794631ad4868f18ef3a52d696d69e5f3b989fee086550a5bc15a26d",
+      "modified_sha256": "4e4474acc82dcca17e2e1b4480a84f86c2fea58e6823f6deecd8180130a90417",
+      "change": "modified"
+    }
+  ]
+}

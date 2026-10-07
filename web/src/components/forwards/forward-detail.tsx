@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { LinkedForwardGuide, linkedForwardHref, linkedForwardText, isLinkManagedError } from "@/components/links/linked-forward-guide";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { ArrowLeft, Copy, Loader2, Pencil, Trash2 } from "lucide-react";
@@ -18,7 +19,7 @@ import { TrafficChart } from "@/components/traffic-chart";
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { InfoRow } from "@/components/ui/form";
-import { api } from "@/lib/api";
+import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
@@ -51,8 +52,8 @@ export function ForwardDetail({
   const [traffic, setTraffic] = useState(initialTraffic);
   const [resourceScope, setResourceScope] = useState<number | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const canUpdate = resourceScope === currentId && canForward(forward, "update");
-  const canDelete = resourceScope === currentId && canForward(forward, "delete");
+  const canUpdate = !linkedForwardHref(forward) && resourceScope === currentId && canForward(forward, "update");
+  const canDelete = !linkedForwardHref(forward) && resourceScope === currentId && canForward(forward, "delete");
   const [actionBusy, setActionBusy] = useState(false);
   /**
    * 「下一步做什么」提示：重试/暂停/恢复失败时**不替换页面内容**，只在按钮
@@ -114,6 +115,7 @@ export function ForwardDetail({
       await refreshTraffic();
       router.refresh();
     } catch (error) {
+      if (isLinkManagedError(error)) { await guideManagedForward(); return; }
       // V4-WP8 §13.5：失败必须给「下一步」，而且**先给动作再给原文**。
       //
       // 顺序是有意的：动作是用户现在能做的事；原文是排障材料（可能要念给管理员）。
@@ -129,8 +131,16 @@ export function ForwardDetail({
     }
   }
 
+  async function guideManagedForward() {
+    const scope = currentId;
+    const latest = await api.forwards.detail(forward.id).catch(() => null);
+    if (getActiveWorkspace() !== scope) return;
+    router.push(linkedForwardHref(latest ?? forward) ?? "/links");
+  }
+
   /** 与列表页同一口径：按 condition / apply_error_code 给下一步，再落后端原文。 */
   function writeFailureText(err: unknown, fallback: string): string {
+    if (isLinkManagedError(err)) return linkedForwardText(locale);
     const info = forwardErrorInfo(err);
     const actions = forwardErrorActions(locale, info);
     return [...actions, info.message || fallback].filter((part) => part !== "").join(" ");
@@ -146,6 +156,7 @@ export function ForwardDetail({
       router.push("/forwards");
       router.refresh();
     } catch (error) {
+      if (isLinkManagedError(error)) { await guideManagedForward(); setDeleting(false); return; }
       toast.error(writeFailureText(error, t("forward.deleteFailed")));
       setDeleting(false);
     }
@@ -199,6 +210,10 @@ export function ForwardDetail({
   if (!can("forward:read")) return <p role="alert">{PERMISSION_DENIED}</p>;
   if (loadError) return <p role="alert">{loadError}</p>;
   if (resourceScope !== currentId) return <p>{t("common.loading")}</p>;
+  if (linkedForwardHref(forward)) return <div className="space-y-4" data-testid="forward-detail">
+    <Button variant="ghost" size="sm" asChild><Link href="/forwards"><ArrowLeft className="size-4" />{t("forward.backToList")}</Link></Button>
+    <LinkedForwardGuide forward={forward} locale={locale} />
+  </div>;
   return (
     <div className="flex flex-col gap-5" data-testid="forward-detail">
       <div className="flex flex-wrap items-center justify-between gap-3">

@@ -44,6 +44,8 @@ enum LBStrategy {
   round
   rand
   weighted_round
+  fallback
+  ip_hash
 }
 
 /// V4 托管 Node 生命周期（DEVELOPMENT.md §13.4.1）。
@@ -604,6 +606,15 @@ model Tunnel {
   ip_limit                   Int?
   client_limit               Int?
   bandwidth_limit            Int?
+  /// Per Forward, bytes/second; 0 or NULL is unlimited, subject to policy ceilings.
+  bytes_per_second_in        Int?
+  bytes_per_second_out       Int?
+  max_connections            Int?
+  /// Concurrent connections (UDP mappings) from each source IP, not distinct IPs.
+  max_connections_per_ip     Int?
+  /// NULL keeps the existing native runtime owner. A link binding has one writer.
+  link_resource_id           Int?
+  link_resource              LinkResource? @relation(fields: [link_resource_id], references: [id], onDelete: Restrict)
   traffic                    Float           @default(0)
   traffic_cost               Float           @default(0)
   proxy_protocol             Boolean         @default(false)
@@ -855,6 +866,15 @@ model ForwardRevision {
   mode TunnelMode
   /// V5-WP0: protocol is part of the immutable runtime snapshot, orthogonal to mode.
   protocol String @default("tcp") @db.VarChar(16)
+
+  /// Immutable Forward data-plane policy. NULL = legacy unlimited, 0 = unlimited.
+  bytes_per_second_in Int?
+  bytes_per_second_out Int?
+  max_connections Int?
+  /// Concurrent connections/mappings per source IP, never distinct IP count.
+  max_connections_per_ip Int?
+  /// Link provenance at this revision; immutable ID, intentionally no FK.
+  link_resource_id Int?
   ingress_node_id Int
   egress_node_id  Int?
   /// V5.4：该 revision 的中间跳放置事实。NULL = 单跳。
@@ -1098,6 +1118,86 @@ model EgressTarget {
 /// 不设外键到 tunnel：租约必须先于隧道可撤销存在（预分配、补偿释放），
 /// 且隧道被删时租约应先释放而非级联——级联会让「释放」这件事静默发生，
 /// 无法在审计里区分「主动释放」与「随隧道消失」。
+/// Independently deployed secure carrier. Forward desired state remains in Tunnel/ForwardRevision.
+model LinkResource {
+  id Int @id @default(autoincrement())
+  workspace_id Int
+  name String @db.VarChar(255)
+  carrier String @default("fxp_v1") @db.VarChar(32)
+  status String @default("draft") @db.VarChar(24)
+  generation Int @default(0)
+  desired_version Int @default(1)
+  created_by Int
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  versions LinkVersion[]
+  deployments LinkDeployment[]
+  credentials LinkTransportCredential[]
+  forwards Tunnel[]
+  @@unique([workspace_id, name])
+  @@index([workspace_id, status])
+  @@map("link_resource")
+}
+
+model LinkVersion {
+  id Int @id @default(autoincrement())
+  link_id Int
+  link LinkResource @relation(fields: [link_id], references: [id], onDelete: Restrict)
+  version Int
+  /// Endpoints and carrier facts only; no transport secret or mutable rule targets.
+  config Json
+  config_digest String @db.VarChar(64)
+  created_at DateTime @default(now())
+  @@unique([link_id, version])
+  @@map("link_version")
+}
+
+model LinkTransportCredential {
+  id Int @id @default(autoincrement())
+  link_id Int
+  link LinkResource @relation(fields: [link_id], references: [id], onDelete: Restrict)
+  generation Int
+  secret_enc String @db.Text
+  created_at DateTime @default(now())
+  @@unique([link_id, generation])
+  @@map("link_transport_credential")
+}
+
+model LinkDeployment {
+  id Int @id @default(autoincrement())
+  link_id Int
+  link LinkResource @relation(fields: [link_id], references: [id], onDelete: Restrict)
+  generation Int
+  version Int
+  status String @default("pending") @db.VarChar(24)
+  /// Immutable merge of canonical Forward desired configurations, secret-free.
+  binding_snapshot Json
+  lease_expires_at DateTime
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  placements LinkPlacement[]
+  @@unique([link_id, generation])
+  @@map("link_deployment")
+}
+
+model LinkPlacement {
+  id Int @id @default(autoincrement())
+  deployment_id Int
+  deployment LinkDeployment @relation(fields: [deployment_id], references: [id], onDelete: Restrict)
+  node_id Int
+  role String @db.VarChar(16)
+  runtime_id String @db.VarChar(160)
+  generation Int
+  config_digest String @db.VarChar(64)
+  applied_generation Int?
+  status String @default("pending") @db.VarChar(24)
+  last_error_code String? @db.VarChar(64)
+  updated_at DateTime @updatedAt
+  @@unique([deployment_id, role])
+  @@index([node_id, status])
+  @@map("link_placement")
+}
+
 model NodePortLease {
   id      Int  @id @default(autoincrement())
   node_id Int
@@ -1106,7 +1206,13 @@ model NodePortLease {
   /// 无外键约束（见 model 注释）：隧道删除时租约应由编排器显式释放。
   tunnel_id  Int?
   tunnel    Tunnel? @relation(fields: [tunnel_id], references: [id], onDelete: SetNull)
-  /// 端口号；与 node_id 共同构成物理唯一性
+  /// Link-owned carrier listeners share this lease table with Forward listeners.
+  link_id Int?
+  /// Socket namespace: tcp (including tls/ws), udp, or conservative unknown.
+  protocol String @default("tcp") @db.VarChar(16)
+  /// Canonical concrete IP, or * for wildcard/unknown socket family.
+  bind_scope String @default("*") @db.VarChar(255)
+  /// Numeric port; overlapping scopes are checked under a node+port transaction lock.
   port       Int
   lease_type LeaseType
   /// active = 占用中；released = 已释放（保留行供对账，不物理删除）
@@ -1116,7 +1222,9 @@ model NodePortLease {
   expires_at DateTime?
   created_at DateTime  @default(now())
 
-  @@unique([node_id, port])
+  @@unique([node_id, protocol, bind_scope, port])
+  @@index([node_id, port])
+  @@index([link_id])
   @@index([tunnel_id])
   @@index([node_id, status])
   @@map("node_port_lease")
@@ -2044,6 +2152,8 @@ model NodeStateReport {
   tunnels         Json?
   /// 出口池快照 JSON：`{ "<tunnelId>": { "strategy", "targets": [ "host:port" ] } }`
   egress_pools    Json?
+  /// Closed secret-free Link placement observations; NULL = unsupported/unknown.
+  link_placements Json?
   /// 已占用端口列表（agent 侧 usedPorts）
   used_ports      Json?
   /// Agent 自述的最近错误（无则 null；不写凭据）

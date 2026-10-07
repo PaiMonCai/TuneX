@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/tunex/agent/internal/forwarder"
+	"github.com/tunex/agent/internal/linkrunner"
 	"github.com/tunex/agent/internal/logx"
 	"github.com/tunex/agent/internal/panelroute"
 	"github.com/tunex/agent/internal/targetobs"
@@ -143,6 +144,8 @@ type StatePayload struct {
 	// last_observed_at` and is derived by the panel when it reads (row 7). A
 	// stored age is already wrong by the time it is written.
 	TargetObservations []targetobs.Observation `json:"target_observations,omitempty"`
+	// Absent = unknown, including older builds; [] = a configured empty snapshot.
+	LinkPlacements *[]LinkPlacement `json:"link_placements,omitempty"`
 }
 
 // CapabilityManifest is the v2 capability fact set on the wire.
@@ -366,6 +369,9 @@ type Reporter struct {
 
 	mu   sync.Mutex
 	stop chan struct{}
+	// Serialize collection and delivery: an in-flight periodic report must
+	// finish before a mutation-triggered report captures the new port facts.
+	reportMu sync.Mutex
 }
 
 // Config configures the reporter.
@@ -419,7 +425,8 @@ type Config struct {
 	// targets (or has nothing to observe), and `target_observations` stays off
 	// the wire rather than being sent as an empty array that would read as
 	// "no problems found".
-	targetObs TargetObservationLister
+	targetObs      TargetObservationLister
+	linkPlacements func() []linkrunner.Observation
 
 	// Ownership facts the panel returns in the state report's
 	// answer. nil = this node tracks no leases (nothing to renew, nothing to
@@ -620,6 +627,9 @@ func (r *Reporter) statePayloadFor(routeState panelroute.PanelRouteState, migrat
 	if r.cfg.targetObs != nil {
 		p.TargetObservations = copyObservations(r.cfg.targetObs.TargetObservations())
 	}
+	if r.cfg.linkPlacements != nil {
+		p.LinkPlacements = reportedLinkPlacements(r.cfg.linkPlacements())
+	}
 	r.fillTelemetry(&p)
 	return p
 }
@@ -789,6 +799,8 @@ func (r *Reporter) Run(ctx context.Context) error {
 // which is a provisioning problem they must fix. Transport failures stay
 // swallowed — a flaky panel must never cascade into the data plane.
 func (r *Reporter) sendState(ctx context.Context) {
+	r.reportMu.Lock()
+	defer r.reportMu.Unlock()
 	endpoint, payload := r.stateRequest()
 	if endpoint == "" {
 		return
@@ -914,6 +926,11 @@ func isCredentialRejected(err error) bool { return errors.Is(err, errRejected) }
 // ctx bounds the attempt; the caller passes a context with its own deadline
 // because the process-wide context is already cancelled during shutdown.
 func (r *Reporter) ReportOnce(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.reportMu.Lock()
+	defer r.reportMu.Unlock()
 	endpoint, payload := r.stateRequest()
 	if endpoint == "" {
 		return nil

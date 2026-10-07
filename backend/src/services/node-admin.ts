@@ -7,6 +7,7 @@
 import { checkRoleChange, getNodeImpact, listActiveLeasePorts, type LifecycleDb } from "./node-lifecycle.ts";
 import { DEFAULT_POOL_NAME, err, toAdminError, deps, asRow, asRows, falsy, parseOk, parseFail, parseNodeRole, isValidTargetPort, parsePortRange, parseLbStrategy, parseEgressStatus, parseRequiredHost, parseOptionalHost, parsePoolName, parseTargetPort, parseWeight, parseOrderBy, parseRemark, hasEgressCapability, poolHasViableTarget, isRoleMismatch, stateAgeSeconds, isStaleState, credentialStateOf, jsonOr } from "./node-admin-core.ts";
 import type { NodeRoleValue, EgressStatusValue, NodeAdminError, NodeRow, StateReportRow, EgressPoolRow, EgressTargetRow, NodeAdminDb, NodeAdminDeps, ParseResult, NodeCredentialState } from "./node-admin-core.ts";
+import { guardEgressSelector } from "./node-admin-core.ts";
 
 export { NODE_ROLES, EGRESS_STATUSES, LB_STRATEGIES, DEFAULT_POOL_NAME, PORT_MIN, PORT_MAX, NODE_STATE_STALE_SECONDS, POOL_NAME_MAX, TARGET_HOST_MAX, ADMIN_ERROR_STATUS, toAdminError, parseNodeRole, isValidTargetPort, parsePortRange, parseLbStrategy, parseEgressStatus, parsePoolName, parseTargetHost, parseTargetPort, parseWeight, parseOrderBy, parseRemark, hasEgressCapability, poolHasViableTarget, isRoleMismatch, stateAgeSeconds, isStaleState, credentialStateOf } from "./node-admin-core.ts";
 export type { NodeRoleValue, EgressStatusValue, LbStrategyValue, NodeAdminErrorCode, NodeAdminError, NodeRow, StateReportRow, EgressPoolRow, EgressTargetRow, NodeAdminDb, NodeAdminDeps, ParseResult, NodeCredentialState } from "./node-admin-core.ts";
@@ -210,6 +211,10 @@ async function applyNodeRoleChange(
   const nextRole: NodeRoleValue | null = input.role !== undefined ? roleParsed.value : currentRole;
   const gainingEgress = hasEgressCapability(nextRole) && !hasEgressCapability(node.role);
   const losingEgress = !hasEgressCapability(nextRole) && hasEgressCapability(node.role);
+
+  const selectorDenied = await guardEgressSelector(pd, nodeId,
+    input.lbStrategy !== undefined ? lbParsed.value : node.lb_strategy);
+  if (selectorDenied) return selectorDenied;
 
   // 守卫 1：降级角色前必须先清池。
   if (losingEgress) {

@@ -13,6 +13,7 @@ import { db } from "../db.ts";
 import { decideNodeAuth } from "./node-credential.ts";
 import { acquirePort, releaseLease } from "./portPool.ts";
 import type { AcquirePortOutcome } from "./portPool.ts";
+import { bindScopesOverlap, protocolsOverlap } from "../integrations/forwardx/bind-scope.ts";
 import {
   countWorkspaceTunnels,
   getEffectivePolicy,
@@ -213,7 +214,7 @@ export interface SchedulableNode {
   /** 端口分配区间；NULL 由 portPool 判 `node_range_unset`。 */
   port_range_min: number | null;
   port_range_max: number | null;
-  lb_strategy: "round" | "rand" | "weighted_round" | null;
+  lb_strategy: import("./node-admin-core.ts").LbStrategyValue | null;
   /** 节点状态（`Node.status`：active / inactive）。 */
   status: "active" | "inactive";
   /** 最近心跳（`Node.last_seen_at`，WP7 之后由 session/state report 更新）。 */
@@ -346,9 +347,14 @@ export function pickNode(
  * `listen_port` **不写 `node_port_lease`**，那种撞号没有任何 DB 约束兜底，
  * 比 v3 内部撞号危险得多。因此 v3 分配前必须把这些端口灌进 `reservedPorts`。
  */
-export function collectReservedPorts(tunnels: readonly { listen_port: number | null }[]): number[] {
+export function collectReservedPorts(
+  tunnels: readonly { listen_port: number | null; listen_ip?: string | null; forward_protocol?: unknown; tunnel_type?: string }[],
+  binding?: { protocol: string; bindScope?: string | null },
+): number[] {
   const out = new Set<number>();
   for (const t of tunnels) {
+    if (binding && (!protocolsOverlap(persistedForwardProtocol(t.forward_protocol, t.tunnel_type), binding.protocol) ||
+      !bindScopesOverlap(t.listen_ip, binding.bindScope))) continue;
     if (typeof t.listen_port === "number" && Number.isInteger(t.listen_port) && t.listen_port > 0) {
       out.add(t.listen_port);
     }
@@ -428,6 +434,9 @@ export async function allocateTunnelPort(
     direction: "ingress" | "egress";
     preferred?: number | null;
     tunnelId?: number | null;
+    protocol?: string | null;
+    bindScope?: string | null;
+    linkId?: number | null;
     reservedPorts?: readonly number[];
   },
   inject?: SchedulerDeps["portPoolDeps"],
@@ -444,6 +453,9 @@ export async function allocateTunnelPort(
       leaseType: args.direction,
       preferredPort: args.preferred ?? null,
       tunnelId: args.tunnelId ?? null,
+      protocol: args.protocol,
+      bindScope: args.bindScope,
+      linkId: args.linkId ?? null,
       reservedPorts: args.reservedPorts ?? [],
       ownRuntimeIds,
       deps: inject,

@@ -61,6 +61,10 @@ describe("V4 forward edit UX — 字段集等同于创建表单", () => {
   test("编辑字段覆盖创建字段全集（§13.3.1 创建后可全编辑）", () => {
     expect([...FORWARD_EDIT_FIELDS].sort()).toEqual(
       [
+        "bytes_per_second_in",
+        "bytes_per_second_out",
+        "max_connections",
+        "max_connections_per_ip",
         "egress_node_id",
         "ingress_node_id",
         "listen_port",

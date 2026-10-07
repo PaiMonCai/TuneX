@@ -1,9 +1,10 @@
 /**
  * Node port lease allocator.
  *
- * The database unique key on `(node_id, port)` is the source of truth. Redis
- * locks only reduce concurrent write contention and never establish ownership.
- * Ingress and egress share the same physical namespace on a node, released rows
+ * One lease table owns socket protocol, bind scope and port. A node+port
+ * transaction range lock protects overlap checks; the unique key protects exact
+ * bindings. Redis locks reduce contention and never establish ownership.
+ * Ingress and egress share socket namespaces on a node, released rows
  * are revived so ports remain reusable, and callers must pass legacy/runtime
  * reservations that are not represented by a lease row.
  *
@@ -13,6 +14,8 @@
 import { db } from "../db.ts";
 import { redis, RedisKeys } from "../redis.ts";
 import { nodeScope } from "../tenant-scope.ts";
+import { bindScopesOverlap, leaseProtocol, normalizeBindScope, protocolsOverlap, type LeaseProtocol } from "../integrations/forwardx/bind-scope.ts";
+import { parseLinkPlacements } from "./node-state-report.ts";
 
 /* ================================================================== */
 /* 常量                                                                 */
@@ -76,7 +79,18 @@ export type LeaseDirection = "ingress" | "egress";
 export interface AgentPortHolder {
   port: number;
   runtime_id?: string | null;
+  protocol?: unknown;
+  bind_scope?: unknown;
+  /** Closed placement identity, rather than a business Tunnel runtime ID. */
+  link_id?: number;
+  node_id?: number;
+  lease_type?: LeaseDirection;
+  owner_ready?: boolean;
+  /** A numeric used_ports summary, never an explicit unowned socket claim. */
+  aggregate?: boolean;
 }
+
+export type PortReservation = number | AgentPortHolder;
 
 export interface AcquirePortInput {
   /** 节点主键（`Node.id`，即 `node_port_lease.node_id` 的外键值）。 */
@@ -91,12 +105,17 @@ export interface AcquirePortInput {
   preferredPort?: number | null;
   /** 占用方隧道；NULL = 预分配（`reconcile` 的回收对象之一）。 */
   tunnelId?: number | null;
+  /** Independent Link owner; never represented by a fabricated tunnel ID. */
+  linkId?: number | null;
+  /** Omitted acquisition protocol defaults to TCP; explicit unknown facts reserve both. */
+  protocol?: string | null;
+  bindScope?: string | null;
   /**
    * 该节点上已被占用的端口（调用方提供，通常是同节点存量 DIRECT 隧道的
    * `listen_port`）。这些端口不参与候选，DB 里也查不到它们——legacy 路径不写
    * 租约行（见文件头「legacy DIRECT 端口不可被抢占」）。
    */
-  reservedPorts?: Iterable<number | null | undefined>;
+  reservedPorts?: Iterable<PortReservation | null | undefined>;
   /**
    * 租约过期时间。NULL = 不自动过期（显式释放）。
    * 预分配未传时按 {@link PREALLOC_TTL_S} 兜底（见该常量注释）。
@@ -121,6 +140,9 @@ export interface AcquirePortResult {
   leaseId: number;
   leaseType: LeaseDirection;
   tunnelId: number | null;
+  linkId: number | null;
+  protocol: LeaseProtocol;
+  bindScope: string;
   /** 该端口**是否曾**被释放过（revive 路径 = true；全新 create = false）。 */
   reused: boolean;
 }
@@ -142,7 +164,8 @@ export type AcquireFailureCode =
   /** 端口已被占用（DB 唯一键、active 租约，或调用方 reservedPorts）。 */
   | "port_taken"
   /** 区间内所有端口都不可用（三重过滤后耗尽）。 */
-  | "no_available_port";
+  | "no_available_port"
+  | "unsupported_protocol";
 
 /** `acquirePort` 的返回值（不抛「端口被占」这类可预期失败）。 */
 export type AcquirePortOutcome =
@@ -220,15 +243,13 @@ export function portCandidates(
   return expandAvailablePorts(range);
 }
 
-/**
- * 任一端点上的「是否同一台物理机同一端口」判定。
- *
- * `lease_type` **不出现在任何判定里**：physical uniqueness 的语义就是
- * `(node_id, port)`，方向只是标签。写测试时不要期望「ingress 与 egress
- * 各自独立编号」——那正是 §7.6 要禁的 BOTH 双绑。
- */
-export function sameLeaseTarget(a: { node_id: number; port: number }, b: { node_id: number; port: number }): boolean {
-  return a.node_id === b.node_id && a.port === b.port;
+/** Same node and port conflict only when socket protocol and bind scope overlap. */
+export function sameLeaseTarget(
+  a: { node_id: number; port: number; protocol?: unknown; bind_scope?: unknown },
+  b: { node_id: number; port: number; protocol?: unknown; bind_scope?: unknown },
+): boolean {
+  return a.node_id === b.node_id && a.port === b.port &&
+    protocolsOverlap(a.protocol, b.protocol) && bindScopesOverlap(a.bind_scope, b.bind_scope);
 }
 
 /* ================================================================== */
@@ -243,7 +264,8 @@ export interface PortPoolRedis {
 }
 
 /** 本模块需要的 Prisma 最小接口（`db` 满足之；测试用内存替身）。 */
-export interface PortPoolDb {
+export interface PortPoolTransaction {
+  $queryRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
   node: {
     findUnique(args: unknown): Promise<unknown>;
   };
@@ -257,6 +279,10 @@ export interface PortPoolDb {
     update(args: unknown): Promise<unknown>;
     updateMany(args: unknown): Promise<unknown>;
   };
+}
+
+export interface PortPoolDb extends Omit<PortPoolTransaction, "$queryRawUnsafe"> {
+  $transaction<T>(fn: (tx: PortPoolTransaction) => Promise<T>, options?: { isolationLevel: "Serializable" }): Promise<T>;
 }
 
 export interface PortPoolDeps {
@@ -285,45 +311,73 @@ export interface PortPoolDeps {
 }
 
 /** 进程级默认依赖（路由/编排器直接用）。 */
-/**
- * 默认实现：读该节点最近一次上报里的 runtime 列表与 `used_ports`（Agent 的端口守卫视图）。
- *
- * 优先用 `tunnels`（能给出每个端口属于哪个 runtime，本隧道自己的端口要放行）；
- * `used_ports` 只有端口号、没有持有者，所以只在 `tunnels` 缺失时兜底使用 —— 那种情况下
- * 宁可少一层保护（不误伤可能的自复用），也不要制造假冲突。
- *
- * 失败一律回落到空集：读不到上报**不能**阻断分配（那会把"上报迟到"升级成"建不了隧道"）。
- */
+/** Keep native owner facts and unowned draining/external facts. Missing protocol reserves both. */
+interface AgentPortReport {
+  used_ports?: unknown;
+  tunnels?: unknown;
+  link_placements?: unknown;
+}
+
+export function agentPortHoldersFromReport(row: AgentPortReport | null): AgentPortHolder[] {
+  const out: AgentPortHolder[] = [];
+  if (Array.isArray(row?.tunnels)) {
+    for (const value of row.tunnels) {
+      if (value === null || typeof value !== "object") continue;
+      const rec = value as Record<string, unknown>;
+      const id = typeof rec.id === "string" ? rec.id : null;
+      const mode = typeof rec.mode === "string" ? rec.mode.toUpperCase() : "";
+      const keys = mode === "EGRESS" ? ["egress_port"] : mode === "DIRECT" || mode === "RELAY" ? ["ingress_port"] : ["ingress_port", "egress_port"];
+      for (const key of keys) {
+        const port = Number(rec[key]);
+        if (isValidPort(port)) out.push({ port, runtime_id: id, protocol: rec.protocol, bind_scope: rec.listen_host });
+      }
+    }
+  }
+  const links = parseLinkPlacements(row?.link_placements);
+  if (links.ok) {
+    for (const placement of links.placements ?? []) {
+      const ownerReady = placement.ready && (placement.state === "ready" || placement.state === "rolled_back") &&
+        Date.parse(placement.lease_expires_at) > Date.now();
+      for (const binding of placement.ports) {
+        out.push({ port: binding.port, protocol: binding.protocol, bind_scope: binding.host,
+          runtime_id: placement.id, link_id: placement.link_id, node_id: placement.node_id,
+          lease_type: placement.role, owner_ready: ownerReady });
+      }
+    }
+  }
+  const append = (value: unknown, protocol?: unknown) => {
+    if (value !== null && typeof value === "object") {
+      const rec = value as Record<string, unknown>;
+      const port = Number(rec.port);
+      if (isValidPort(port)) out.push({ port, runtime_id: typeof rec.runtime_id === "string" ? rec.runtime_id : null, protocol: rec.protocol ?? protocol, bind_scope: rec.bind_scope });
+    } else {
+      const port = Number(value);
+      if (isValidPort(port)) out.push({ port, runtime_id: null, protocol, aggregate: true });
+    }
+  };
+  if (Array.isArray(row?.used_ports)) {
+    for (const value of row.used_ports) append(value);
+  } else if (row?.used_ports && typeof row.used_ports === "object") {
+    for (const [protocol, values] of Object.entries(row.used_ports)) {
+      if (Array.isArray(values)) for (const value of values) append(value, protocol);
+      else if (values && typeof values === "object") {
+        for (const [port, held] of Object.entries(values)) if (held) append(port, protocol);
+      }
+    }
+  }
+  return out;
+}
+
 async function defaultAgentUsedPorts(nodeId: number): Promise<readonly AgentPortHolder[]> {
   try {
     const row = (await (db as unknown as {
       nodeStateReport: { findUnique(args: unknown): Promise<unknown> };
     }).nodeStateReport.findUnique({
       where: { node_id: nodeId },
-      select: { used_ports: true, tunnels: true },
-    })) as { used_ports?: unknown; tunnels?: unknown } | null;
+      select: { used_ports: true, tunnels: true, link_placements: true },
+    })) as AgentPortReport | null;
 
-    const out: AgentPortHolder[] = [];
-    const tunnels = row?.tunnels;
-    if (Array.isArray(tunnels)) {
-      for (const t of tunnels) {
-        if (t === null || typeof t !== "object") continue;
-        const rec = t as Record<string, unknown>;
-        const id = typeof rec.id === "string" ? rec.id : null;
-        for (const key of ["ingress_port", "egress_port"]) {
-          const n = Number(rec[key]);
-          if (Number.isInteger(n) && n > 0) out.push({ port: n, runtime_id: id });
-        }
-      }
-      if (out.length > 0) return out;
-    }
-    if (Array.isArray(row?.used_ports)) {
-      for (const v of row.used_ports) {
-        const n = typeof v === "number" ? v : Number(v);
-        if (Number.isInteger(n) && n > 0) out.push({ port: n, runtime_id: null });
-      }
-    }
-    return out;
+    return agentPortHoldersFromReport(row);
   } catch (e) {
     console.warn("[portPool] agent used_ports unavailable:", e instanceof Error ? e.message : e);
     return [];
@@ -453,7 +507,7 @@ async function resolveContext(
 /* acquire / release / holder                                          */
 /* ================================================================== */
 
-/** Prisma 唯一冲突错误判定（`UNIQUE(node_id, port)` 撞击 → 换下一个候选端口）。 */
+/** Exact-binding unique conflict; overlap safety comes from the node+port transaction lock. */
 export function isUniqueConflict(e: unknown): boolean {
   return (e as { code?: string } | null)?.code === "P2002";
 }
@@ -470,216 +524,157 @@ interface LeaseRow {
   port: number;
   lease_type: LeaseDirection;
   tunnel_id: number | null;
+  link_id: number | null;
+  protocol: string;
+  bind_scope: string;
   status: LeaseStatus;
   expires_at: Date | null;
 }
 
-/**
- * 申请端口租约。
- *
- * 每个候选端口依次尝试（见 {@link MAX_ATTEMPTS}）：
- *   1. 纯函数过滤：黑名单 / 节点区间 / reservedPorts（user-specified 与 auto
- *      共用同一套，`portCandidates` 之后的判定对两者一模一样）；
- *   2. Redis NX 抢占锁（拿不到 → 仍然尝试写 DB，靠唯一约束兜底）；
- *   3. **revive-or-create**：
- *        a. `updateMany({ node_id, port, status: 'released' })` 带守卫地认领
- *           一条已释放的行（端口回收再用的唯一途径，见文件头「released 行」）；
- *        b. 认领不到 → `create`；撞 P2002 = **真被占用**（正常路径）→ 下一个候选；
- *   4. 成功 → 放锁、返回。
- *
- * 第 3 步的顺序（先 revive 后 create）保证「端口从不因为保留 released 行而
- * 永久耗尽」，同时 DB 唯一约束仍是最终真相：并发的两个 acquire 要么一个 revive
- * 成功、另一个看到 0 行后走 create 撞 P2002，要么都 revive 失败、都走 create
- * 而只有一个成功。两条路都收敛到「恰好一个持有者」。
- */
+/** Return the durable owner and canonical binding from the single lease row. */
+function leaseResult(row: LeaseRow, reused: boolean): AcquirePortResult {
+  return {
+    port: row.port, leaseId: row.id, leaseType: row.lease_type,
+    tunnelId: row.tunnel_id ?? null, linkId: row.link_id ?? null,
+    protocol: leaseProtocol(row.protocol), bindScope: normalizeBindScope(row.bind_scope), reused,
+  };
+}
+
+function sameOwner(row: LeaseRow, input: AcquirePortInput): boolean {
+  if (row.lease_type !== input.leaseType) return false;
+  if (input.linkId != null) return row.link_id === input.linkId && row.tunnel_id == null;
+  return input.tunnelId != null && row.tunnel_id === input.tunnelId && row.link_id == null;
+}
+
+function bindingOverlaps(row: { protocol?: unknown; bind_scope?: unknown }, protocol: unknown, bindScope: string): boolean {
+  return protocolsOverlap(row.protocol, protocol) && bindScopesOverlap(row.bind_scope, bindScope);
+}
+
 export async function acquirePort(
   input: AcquirePortInput,
   inject?: PortPoolDeps,
 ): Promise<AcquirePortOutcome> {
+  // Native both is closed. FXP's two children acquire explicit TCP/UDP bindings.
+  if (typeof input.protocol === "string" && input.protocol.trim().toLowerCase() === "both") {
+    return { ok: false, code: "unsupported_protocol" };
+  }
+  if (input.linkId != null && input.tunnelId != null) throw new Error("port lease has exactly one business owner: linkId or tunnelId");
+  const protocol = input.protocol === undefined ? "tcp" : leaseProtocol(input.protocol);
+  const bindScope = normalizeBindScope(input.bindScope);
   const { db: pdb, redis: rdb, lockTtlS, agentUsedPorts } = deps(input.deps ?? inject);
   const context = await resolveContext(pdb, input.nodeId);
   if (!context.ok) return { ok: false, code: context.code };
   const { scope, range } = context.ctx;
-
-  // 调用方预留（legacy DIRECT 等 DB 里没有行的端口）。
-  const reserved = new Set<number>();
-  for (const p of input.reservedPorts ?? []) {
-    if (isValidPort(p)) reserved.add(p);
-  }
-
-  // DB 侧已占用的端口（一次批量查询，避免 N+1；只看 active，released 行不占位）。
-  // 同一 Tunnel 以同方向重入自己已经持有的 preferred port 是幂等续用，不是冲突。
-  // suspend 只停 runtime、不释放 durable lease，因此 resume 必须能原端口恢复。
-  const activeRows = (await pdb.nodePortLease.findMany({
-    where: { node_id: input.nodeId, status: LEASE_STATUS.active },
-    select: { id: true, port: true, tunnel_id: true, lease_type: true },
-  })) as Array<{ id: number; port: number; tunnel_id: number | null; lease_type: LeaseDirection }>;
-
-  const isPreferred = input.preferredPort !== undefined && input.preferredPort !== null;
-  if (isPreferred && input.tunnelId !== null && input.tunnelId !== undefined) {
-    const held = activeRows.find((row) => row.port === input.preferredPort);
-    if (held && held.tunnel_id === input.tunnelId && held.lease_type === input.leaseType) {
-      return {
-        ok: true,
-        result: {
-          port: held.port,
-          leaseId: held.id,
-          leaseType: held.lease_type,
-          tunnelId: held.tunnel_id,
-          reused: true,
-        },
-      };
-    }
-  }
-  for (const row of activeRows) reserved.add(row.port);
-  // Agent 自己报的占用端口同样算占用（见 PortPoolDeps.agentUsedPorts 的说明）：
-  // 面板的租约表可能比 Agent 的守卫更早释放（Remove 立即释放、监听稍后关闭），
-  // 也可能更晚（失败创建的残留）。两份事实取并集，Agent 才不会拒绝一次我们以为合法的分配。
-  //
-  // 但**本隧道自己的 runtime 占的端口要放行**：否则把 listen_port 改成它正在用的那个值
-  // （幂等编辑 / 失败重试 / 还原夹具）会被自己挡回去，症状是 502 port_taken 但端口明明
-  // 就是这条隧道在听（实测踩到过）。
+  const isPreferred = input.preferredPort != null;
   const ownRuntimeIds = new Set(input.ownRuntimeIds ?? []);
-  for (const holder of await agentUsedPorts(input.nodeId)) {
-    if (!isValidPort(holder.port)) continue;
-    if (holder.runtime_id && ownRuntimeIds.has(holder.runtime_id)) continue;
-    reserved.add(holder.port);
+  const reservations: AgentPortHolder[] = [];
+  for (const value of input.reservedPorts ?? []) {
+    if (typeof value === "number") reservations.push({ port: value });
+    else if (value) reservations.push(value);
   }
-
-  // 预分配默认 TTL：NULL expiry 的预分配是 reconcile 收不回的孤儿
-  // （删隧道会把 tunnel_id 打成 NULL，无法与「活着的新建中」区分）。
-  const expiresAt =
-    input.tunnelId === null || input.tunnelId === undefined
-      ? (input.expiresAt ?? new Date(Date.now() + PREALLOC_TTL_S * 1000))
-      : (input.expiresAt ?? null);
-
-  const pool = portCandidates(range, input.preferredPort ?? null);
-  const attempts = isPreferred ? pool : pool.slice(0, MAX_ATTEMPTS);
+  const agentFacts = await agentUsedPorts(input.nodeId);
+  const activeRows = await pdb.nodePortLease.findMany({
+    where: { node_id: input.nodeId, status: LEASE_STATUS.active },
+  }) as LeaseRow[];
+  // Only a closed, ready placement with this exact binding can explain its own
+  // aggregate used_ports entry. A runtime ID alone cannot exempt another Link,
+  // another scope, or a failed/updating placement. A protocol-less aggregate is
+  // explained only for the requested known lane; all other requests still see it.
+  const ownedLinkFacts = new Set(agentFacts.filter((holder) => input.linkId != null &&
+    holder.link_id === input.linkId && holder.node_id === input.nodeId && holder.lease_type === input.leaseType &&
+    holder.owner_ready === true && protocol !== "unknown" && leaseProtocol(holder.protocol) === protocol &&
+    typeof holder.bind_scope === "string" && normalizeBindScope(holder.bind_scope) === bindScope));
+  const ownedLinkPorts = new Set([...ownedLinkFacts].map((holder) => holder.port));
+  const ownsBinding = (port: number, rows: readonly LeaseRow[]) => rows.some((row) =>
+    row.node_id === input.nodeId && row.port === port && row.status === LEASE_STATUS.active && sameOwner(row, input) &&
+    row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope);
+  const reserved = (port: number, rows: readonly LeaseRow[] = activeRows) => {
+    if (reservations.some((holder) => holder.port === port && bindingOverlaps(holder, protocol, bindScope))) return true;
+    const ownsLinkBinding = ownedLinkPorts.has(port) && ownsBinding(port, rows);
+    return agentFacts.some((holder) => {
+      if (holder.port !== port || !bindingOverlaps(holder, protocol, bindScope)) return false;
+      if (holder.link_id != null) return !(ownsLinkBinding && ownedLinkFacts.has(holder));
+      if (holder.runtime_id && ownRuntimeIds.has(holder.runtime_id)) return false;
+      // Explicit unowned facts remain reservations, including draining work at
+      // this same port. Never infer ownership from another port or from DB alone.
+      return !(holder.aggregate === true && !holder.runtime_id && ownsLinkBinding);
+    });
+  };
+  const ownedLink = input.linkId != null && !isPreferred
+    ? activeRows.find((row) => sameOwner(row, input) && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope)
+    : undefined;
+  const blocked = (port: number) => reserved(port) || activeRows.some((row) =>
+    row.port === port && bindingOverlaps(row, protocol, bindScope) &&
+    !((isPreferred || ownedLink === row) && sameOwner(row, input) && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope));
+  const candidates = ownedLink ? [ownedLink.port] : portCandidates(range, input.preferredPort ?? null);
+  const attempts = isPreferred || ownedLink ? candidates : candidates.filter((port) => !blocked(port)).slice(0, MAX_ATTEMPTS);
+  const expiresAt = input.linkId != null || input.tunnelId != null
+    ? (input.expiresAt ?? null)
+    : (input.expiresAt ?? new Date(Date.now() + PREALLOC_TTL_S * 1000));
 
   for (const port of attempts) {
-    // 硬性校验（端口形态 / 黑名单 / 区间）。
-    //   · user-specified：**中止**并给出具体原因 —— 绝不允许「用户点名要 80」
-    //     被悄悄改成分到别的端口，调用方会拿到和自己请求不一致的结果；
-    //   · auto：跳到下一个候选。候选集由 expandAvailablePorts 生成，黑名单与
-    //     区间已在那里剔除，所以这几行对 auto 实际不可达；保留跳过只是防御。
     if (!isValidPort(port) || isBlacklistedPort(port) || port < range.min || port > range.max) {
       if (!isPreferred) continue;
-      const code = !isValidPort(port)
-        ? "port_out_of_range"
-        : isBlacklistedPort(port)
-          ? "port_blacklisted"
-          : "port_outside_node_range";
-      return { ok: false, code, port };
+      return { ok: false, port, code: !isValidPort(port) ? "port_out_of_range" : isBlacklistedPort(port) ? "port_blacklisted" : "port_outside_node_range" };
     }
-    // 软性校验（已占用）：auto 的下一个候选，user-specified 直接失败。
-    // 两者的区别只在「候选集长度」，不在判定本身——这正是 §7.6 要的
-    // 「同一规则」：没有白名单绕过项，也没有 auto 专属的绕过项。
-    if (reserved.has(port)) {
+    if (blocked(port)) {
       if (isPreferred) return { ok: false, code: "port_taken", port };
       continue;
     }
-
     const gotLock = await tryLock(rdb, scope, input.nodeId, port, lockTtlS);
     try {
-      // 3a. 认领一条已释放的行（端口回收再用的唯一途径）。
-      const revived = (await pdb.nodePortLease.updateMany({
-        where: { node_id: input.nodeId, port, status: LEASE_STATUS.released },
-        data: {
-          status: LEASE_STATUS.active,
-          lease_type: input.leaseType,
-          tunnel_id: input.tunnelId ?? null,
-          expires_at: expiresAt,
-          created_at: new Date(),
-        },
-      })) as { count: number };
-      if (revived.count > 0) {
-        const row = (await pdb.nodePortLease.findUnique({
-          where: { node_id_port: { node_id: input.nodeId, port } },
-        })) as LeaseRow | null;
-        return {
-          ok: true,
-          result: {
-            port,
-            leaseId: row?.id ?? -1,
-            leaseType: input.leaseType,
-            tunnelId: input.tunnelId ?? null,
-            reused: true,
-          },
-        };
-      }
-
-      // 3b. 没有可认领的 released 行 → 全新插入。
-      try {
-        const row = (await pdb.nodePortLease.create({
-          data: {
-            node_id: input.nodeId,
-            port,
-            lease_type: input.leaseType,
-            tunnel_id: input.tunnelId ?? null,
-            status: LEASE_STATUS.active,
-            expires_at: expiresAt,
-          },
-        })) as LeaseRow;
-        return {
-          ok: true,
-          result: {
-            port,
-            leaseId: row.id,
-            leaseType: input.leaseType,
-            tunnelId: input.tunnelId ?? null,
-            reused: false,
-          },
-        };
-      } catch (e) {
-        if (!isUniqueConflict(e)) throw e;
-        // 并发的重复 apply 可能在 activeRows 快照之后抢先创建了同一租约。
-        // 重新读 holder：只有同 Tunnel + 同方向才按幂等成功收敛；其它情况仍是冲突。
-        if (input.tunnelId !== null && input.tunnelId !== undefined) {
-          const holder = (await pdb.nodePortLease.findUnique({
-            where: { node_id_port: { node_id: input.nodeId, port } },
-          })) as LeaseRow | null;
-          if (
-            holder?.status === LEASE_STATUS.active &&
-            holder.tunnel_id === input.tunnelId &&
-            holder.lease_type === input.leaseType
-          ) {
-            return {
-              ok: true,
-              result: {
-                port,
-                leaseId: holder.id,
-                leaseType: holder.lease_type,
-                tunnelId: holder.tunnel_id,
-                reused: true,
-              },
+      // Exact-binding uniqueness cannot protect wildcard/concrete overlap.
+      // Lock the node+port index range, including an empty gap, in MySQL. With
+      // Serializable, concurrent empty-gap inserts deadlock rather than admit
+      // overlapping scopes; the victim retries and sees the committed owner.
+      for (let retry = 0; retry < 4; retry++) {
+        try {
+          const outcome = await pdb.$transaction(async (tx) => {
+            await tx.$queryRawUnsafe(
+              "SELECT id FROM node_port_lease FORCE INDEX (node_port_lease_node_id_port_idx) WHERE node_id = ? AND port = ? FOR UPDATE",
+              input.nodeId, port,
+            );
+            const rows = await tx.nodePortLease.findMany({ where: { node_id: input.nodeId, port } }) as LeaseRow[];
+            const current = rows.filter((row) => row.status === LEASE_STATUS.active);
+            const owned = current.find((row) => sameOwner(row, input) && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope);
+            if (current.some((row) => row !== owned && bindingOverlaps(row, protocol, bindScope))) return null;
+            if (reserved(port, current)) return null;
+            if (owned) return leaseResult(owned, true);
+            const data = {
+              node_id: input.nodeId, port, protocol, bind_scope: bindScope,
+              lease_type: input.leaseType, tunnel_id: input.tunnelId ?? null,
+              link_id: input.linkId ?? null, status: LEASE_STATUS.active,
+              expires_at: expiresAt, created_at: new Date(),
             };
-          }
+            const released = rows.find((row) => row.status === LEASE_STATUS.released && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope);
+            if (released) {
+              const revived = await tx.nodePortLease.updateMany({ where: { id: released.id, status: LEASE_STATUS.released }, data }) as { count: number };
+              if (!revived.count) return null;
+              const row = await tx.nodePortLease.findUnique({ where: { id: released.id } }) as LeaseRow;
+              return leaseResult(row, true);
+            }
+            return leaseResult(await tx.nodePortLease.create({ data }) as LeaseRow, false);
+          }, { isolationLevel: "Serializable" });
+          if (outcome) return { ok: true, result: outcome };
+          break;
+        } catch (error) {
+          const info = error as { code?: string; meta?: { code?: string }; message?: string };
+          const retryable = info.code === "P2034" || isUniqueConflict(error) ||
+            info.meta?.code === "1213" || info.meta?.code === "1205" || /deadlock|lock wait timeout/i.test(info.message ?? "");
+          if (!retryable) throw error;
+          if (retry === 3) break;
         }
-        // 已被其它所有者占用 → 下一个候选端口；user-specified 最终返回 port_taken。
       }
     } finally {
       if (gotLock) await unlock(rdb, scope, input.nodeId, port);
     }
   }
-
-  if (attempts.length === 0) return { ok: false, code: "no_available_port" };
-  return { ok: false, code: "port_taken" };
+  return { ok: false, code: isPreferred ? "port_taken" : "no_available_port", ...(isPreferred ? { port: input.preferredPort! } : {}) };
 }
 
-/**
- * 释放租约（软删除：置 `status='released'`，保留行）。
- *
- * 三种粒度（按参数优先级）：
- *   · `leaseId`   —— 精确释放一条；
- *   · `tunnelId`  —— 释放该隧道持有的全部 active 租约（编排器删隧道/改
- *                    目标池的补偿路径）；
- *   · `nodeId`    —— 释放该节点全部 active 租约（节点下线/撤销角色）。
- *
- * 返回 false 表示「没有 active 租约被释放」——可能是从来没租过，也可能是已被
- * {@link reconcileLeases} 抢先回收。两者都**不是错误**，调用方不该重试。
- */
+/** Soft release by leaseId, tunnelId, linkId, or nodeId (in that order). Link retirement requires every owner process to confirm stop. */
 export async function releaseLease(
-  args: { leaseId?: number; tunnelId?: number; nodeId?: number },
+  args: { leaseId?: number; tunnelId?: number; linkId?: number; nodeId?: number },
   inject?: PortPoolDeps,
 ): Promise<boolean> {
   const { db: pdb } = deps(inject);
@@ -705,6 +700,15 @@ export async function releaseLease(
     return res.count > 0;
   }
 
+  // The Link runner calls this only after all owner processes confirm Stop.
+  if (args.linkId !== undefined) {
+    const res = await pdb.nodePortLease.updateMany({
+      where: { link_id: args.linkId, status: LEASE_STATUS.active },
+      data: { status: LEASE_STATUS.released },
+    }) as { count: number };
+    return res.count > 0;
+  }
+
   if (args.nodeId !== undefined) {
     const res = (await pdb.nodePortLease.updateMany({
       where: { node_id: args.nodeId, status: LEASE_STATUS.active },
@@ -727,22 +731,35 @@ export async function leaseHolder(
   nodeId: number,
   port: number,
   inject?: PortPoolDeps,
+  binding?: { protocol?: string | null; bindScope?: string | null },
 ): Promise<{
   leaseId: number;
   leaseType: LeaseDirection;
   tunnelId: number | null;
+  linkId: number | null;
+  protocol: LeaseProtocol;
+  bindScope: string;
   status: LeaseStatus;
   expiresAt: Date | null;
 } | null> {
   const { db: pdb } = deps(inject);
-  const row = (await pdb.nodePortLease.findUnique({
-    where: { node_id_port: { node_id: nodeId, port } },
-  })) as LeaseRow | null;
+  const rows = await pdb.nodePortLease.findMany({ where: { node_id: nodeId, port } }) as LeaseRow[];
+  const matches = binding
+    ? rows.filter((row) => row.protocol === (binding.protocol === undefined ? "tcp" : leaseProtocol(binding.protocol)) && normalizeBindScope(row.bind_scope) === normalizeBindScope(binding.bindScope))
+    : rows;
+  const active = matches.filter((row) => row.status === LEASE_STATUS.active);
+  // A legacy number-only lookup must never silently select one of two owners.
+  const eligible = active.length ? active : matches;
+  if (eligible.length > 1) throw new Error("ambiguous port lease holder: protocol and bindScope are required");
+  const row = eligible[0];
   if (!row) return null;
   return {
     leaseId: row.id,
     leaseType: row.lease_type,
     tunnelId: row.tunnel_id,
+    linkId: row.link_id ?? null,
+    protocol: leaseProtocol(row.protocol),
+    bindScope: normalizeBindScope(row.bind_scope),
     status: row.status,
     expiresAt: row.expires_at,
   };
@@ -756,18 +773,26 @@ export async function leaseHolder(
  */
 export async function availablePorts(
   nodeId: number,
-  reserved?: Iterable<number | null | undefined>,
+  reserved?: Iterable<PortReservation | null | undefined>,
   inject?: PortPoolDeps,
+  binding?: { protocol?: string | null; bindScope?: string | null },
 ): Promise<number[]> {
   const pdb = deps(inject).db;
   const context = await resolveContext(pdb, nodeId);
   if (!context.ok) return [];
   const rows = (await pdb.nodePortLease.findMany({
     where: { node_id: nodeId, status: LEASE_STATUS.active },
-    select: { port: true },
-  })) as { port: number }[];
-  const taken = new Set<number>(rows.map((r) => r.port));
-  for (const p of reserved ?? []) if (isValidPort(p)) taken.add(p);
+  })) as LeaseRow[];
+  const protocol = binding?.protocol === undefined ? "tcp" : leaseProtocol(binding.protocol);
+  const bindScope = normalizeBindScope(binding?.bindScope);
+  const taken = new Set<number>(rows.filter((row) => bindingOverlaps(row, protocol, bindScope)).map((row) => row.port));
+  for (const value of reserved ?? []) {
+    if (typeof value === "number" && isValidPort(value)) taken.add(value);
+    else if (value && typeof value === "object" && bindingOverlaps(value, protocol, bindScope)) taken.add(value.port);
+  }
+  for (const holder of await deps(inject).agentUsedPorts(nodeId)) {
+    if (bindingOverlaps(holder, protocol, bindScope)) taken.add(holder.port);
+  }
   return expandAvailablePorts(context.ctx.range).filter((p) => !taken.has(p));
 }
 
@@ -812,7 +837,7 @@ export async function reconcileLeases(
 
   const active = (await pdb.nodePortLease.findMany({
     where: { status: LEASE_STATUS.active },
-    select: { id: true, node_id: true, port: true, tunnel_id: true, expires_at: true },
+    select: { id: true, node_id: true, port: true, tunnel_id: true, link_id: true, expires_at: true },
   })) as LeaseRow[];
 
   // 有 tunnel_id 的行一次性反查 Tunnel 存在性（批量，N+1 是错的做法）。
@@ -831,6 +856,9 @@ export async function reconcileLeases(
   const danglingTunnel: number[] = [];
   const expired: number[] = [];
   for (const row of active) {
+    // Link process lifetime is independent of business Tunnel lifetime. Only
+    // confirmed runner stop/retirement can release these owner reservations.
+    if (row.link_id != null) continue;
     if (row.tunnel_id !== null && !existing.has(row.tunnel_id)) {
       danglingTunnel.push(row.id);
       continue;

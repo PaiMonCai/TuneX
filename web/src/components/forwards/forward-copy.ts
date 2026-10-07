@@ -14,6 +14,7 @@
  * 再建一条」，所以本模块不新增任何 API 调用。
  */
 import type { ForwardCreateInput, PortForward } from "@/lib/types";
+import { FORWARD_POLICY_FIELDS, forwardPolicyDraft, forwardPolicyDraftValues, type ForwardPolicyDraft } from "@/lib/forward-policy";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   forwardProtocolFields,
@@ -22,7 +23,7 @@ import {
 } from "@/lib/forward-protocol";
 
 /** 编辑器 / 创建表单共用的草稿形状（全字符串，便于受控输入与表单预检）。 */
-export type ForwardDraft = {
+export type ForwardDraft = ForwardPolicyDraft & {
   name: string;
   mode: "direct" | "relay";
   ingressId: string;
@@ -58,6 +59,7 @@ export type ForwardCopyDraft = ForwardDraft & {
 
 /** 后端 `ForwardCreateSchema` 的字段集（`.strict()`：键集合必须完全一致）。 */
 export const FORWARD_CREATE_KEYS = [
+  ...FORWARD_POLICY_FIELDS,
   "name",
   "mode",
   "protocol",
@@ -77,6 +79,7 @@ export const FORWARD_TLS_CREATE_KEYS = ["tls_cert_path", "tls_key_path"] as cons
  * 把源行整行 spread 进 create（那会让 `.strict()` 400，或更糟：污染运行态）。
  */
 export const FORWARD_COPY_FORBIDDEN_FIELDS = [
+  "link_resource_id",
   "id",
   "status",
   "desired_status",
@@ -135,6 +138,7 @@ export function forwardCopyDraft(forward: PortForward, suffix: string): ForwardC
   const mode: "direct" | "relay" = forward.mode === "relay" ? "relay" : "direct";
   const protocol = forwardProtocolForCreate(forward.protocol) ?? DEFAULT_FORWARD_PROTOCOL;
   return {
+    ...forwardPolicyDraft(forward),
     name: forwardCopyName(forward, suffix),
     mode,
     ingressId: forward.ingress_node_id ? String(forward.ingress_node_id) : "",
@@ -163,6 +167,7 @@ export function forwardCopyCreateInput(draft: ForwardCopyDraft): ForwardCreateIn
   const listen = draft.listenPort.trim() ? Number(draft.listenPort.trim()) : null;
   const egress = draft.mode === "relay" && draft.egressId ? Number(draft.egressId) : null;
   return {
+    ...forwardPolicyDraftValues(draft),
     name: draft.name.trim().slice(0, FORWARD_NAME_MAX),
     mode: draft.mode,
     ingress_node_id: Number(draft.ingressId),
