@@ -119,6 +119,18 @@ describe("identity: the new container is the SAME node", () => {
     expect(script).not.toContain("docker stop -t 15 tunex-agent");
   });
 
+  test("a custom container name still has to prove it belongs to this agent_id", () => {
+    const { script } = renderNodeUpgradeScript(facts, "ghcr.io/tunex/agent:1.4.0", {
+      panelURL: "https://panel.example.com",
+      containerName: "custom-agent-container",
+    });
+    expect(script).toContain('CONTAINER="custom-agent-container"');
+    expect(script).toContain('CONTAINER_AGENT_ID="$(docker inspect --format');
+    expect(script).toContain('[ "$CONTAINER_AGENT_ID" = "$AGENT_ID" ] || die');
+    expect(script).toContain("属于另一个 Agent");
+    expect(script).toContain("没有可验证的当前 agent_id 标签");
+  });
+
   test("no new enrollment happens, and the script says so", () => {
     const { script, preserves } = render();
     // No enrollment API call and no one-time token: identity comes from the host
