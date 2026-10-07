@@ -522,6 +522,7 @@ func (m *Manager) observeLocked(id string) Observation {
 		return Observation{ID: id, State: "absent"}
 	}
 	o := Observation{UpdateMode: "stop_start", ID: id, LinkID: r.LinkID, WorkspaceID: r.WorkspaceID, NodeID: r.NodeID, Role: r.Role, Generation: r.Highest, DesiredConfigDigest: r.DesiredDigest, State: r.State, LastError: r.LastError}
+	o.TrafficStatus = m.trafficStatusLocked(id)
 	if r.UpdateMode != "" {
 		o.UpdateMode = r.UpdateMode
 	}

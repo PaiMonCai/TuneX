@@ -29,6 +29,8 @@ type child struct {
 	cmd                                              *exec.Cmd
 	path                                             string
 	trafficProducer                                  string
+	rotationPath                                     string
+	trafficStartedAt                                 time.Time
 	done                                             chan struct{}
 	ready                                            chan struct{}
 	leaseChanged                                     chan struct{}
@@ -179,6 +181,11 @@ func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, e
 	if traffic.producer != "" {
 		args = append(args, "-managed-traffic", traffic.path, "-managed-traffic-producer", traffic.producer)
 		p.trafficProducer = traffic.producer
+		p.trafficStartedAt = time.Now().UTC()
+		if traffic.rotationPath != "" {
+			p.rotationPath = traffic.rotationPath
+			args = append(args, "-managed-traffic-rotation-v1", traffic.rotationPath)
+		}
 	}
 	p.cmd = exec.Command(binaryPath, args...)
 	p.cmd.Stdout = p
@@ -210,6 +217,9 @@ func startChild(binaryPath, runtimeDir string, cfg Config, deadline time.Time, e
 		_ = p.cmd.Wait()
 		release()
 		_ = os.Remove(p.path)
+		if p.rotationPath != "" {
+			_ = os.Remove(p.rotationPath)
+		}
 		p.mu.Lock()
 		p.exited = true
 		p.exitCode = p.cmd.ProcessState.ExitCode()

@@ -6,7 +6,7 @@ import { linksCopy } from "../links-copy";
 import { bindingFromForward, canEditLinkEndpoints, canRetireLink, createLinksScopeFence, linkErrorMessage, linkLiveState, placementState, linkIdFromSelection } from "../link-state";
 import { LinkedForwardGuide, linkedForwardHref, isLinkManagedError } from "../linked-forward-guide";
 import { ApiError } from "@/lib/api/core";
-import { binding, forward, link, traffic } from "./links-fixtures";
+import { binding, forward, link, traffic, statistics } from "./links-fixtures";
 import { projectLinkDetail, type LinkDetail } from "@/lib/links-types";
 import { localizedLabel, userConsoleNav } from "@/lib/nav";
 
@@ -148,6 +148,115 @@ describe("historical forward traffic, not live readiness", () => {
     expect(html).not.toContain("never-visible"); expect(html).not.toContain(copy.statusRunning);
   });
 });
+describe("placement statistics status independent of traffic totals and readiness", () => {
+  const now = Date.parse("2029-01-01T00:00:00Z");
+  function withStatistics(over: Parameters<typeof statistics>[0] = {}) {
+    const data = link({ forwards: [forward({ traffic: traffic() })] });
+    data.deployment!.placements[0].observation = { state: "ready", ready: true, observed_generation: 4, traffic_status: statistics(over) };
+    return data;
+  }
+  function section(html: string) { return html.match(/<section aria-label="(?:统计状态|Statistics status)"[\s\S]*?<\/section>/)![0]; }
+  function fact(html: string, label: string) {
+    return html.split(`${label}</dt>`)[1]?.match(/^<dd[^>]*>([^<]*)<\/dd>/)?.[1];
+  }
+  test("backlog and blocking are visible in both languages, capacity stays inside collapsed support details", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      for (const state of ["idle", "collecting", "backlogged", "blocked"] as const) {
+        const data = withStatistics({ state }); const html = markup(projectLinkDetail(data, 5), false, now, labels);
+        const stats = section(html);
+        const expected = { idle: labels.statisticsIdle, collecting: labels.statisticsCollecting,
+          backlogged: labels.statisticsBacklogged, blocked: labels.statisticsBlocked };
+        expect(fact(stats, labels.statisticsState)).toBe(expected[state]);
+        expect(fact(stats, labels.statisticsLastAck)).toBe(statistics().last_ack_at!);
+        expect(stats).toContain(labels.statisticsAckHint);
+        const details = stats.match(/<details\b[\s\S]*?<\/details>/)![0];
+        expect(details).not.toMatch(/<details[^>]*\bopen(?:=|\s|>)/);
+        for (const [label, value] of [[labels.statisticsProducers, "2"], [labels.statisticsSamples, "500"],
+          [labels.statisticsRules, "250"], [labels.statisticsSpool, "123456"], [labels.statisticsRotation, labels.statisticsSupported]]) {
+          expect(fact(details, label)).toBe(value); expect(stats.slice(0, stats.indexOf("<details"))).not.toContain(label);
+        }
+        if (state === "backlogged") expect(stats).toContain(labels.statisticsBacklogHint);
+        if (state === "blocked") expect(stats).toContain(labels.statisticsBlockedHint);
+        expect(placementState(data, data.deployment!.placements[0], now)).toBe("ready");
+        expect(fact(html, labels.trafficIn)).toBe("1024 B"); expect(fact(html, labels.trafficConnections)).toBe("7");
+      }
+    }
+  });
+  test("optional status and null remain unknown, distinct from known zero and no ACK", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      for (const traffic_status of [undefined, null]) {
+        const data = withStatistics(); data.deployment!.placements[0].observation!.traffic_status = traffic_status;
+        const stats = section(markup(projectLinkDetail(data, 5), false, now, labels));
+        expect(fact(stats, labels.statisticsState)).toBe(labels.statisticsUnknown);
+        expect(fact(stats, labels.statisticsLastAck)).toBe(labels.unknown);
+        for (const label of [labels.statisticsProducers, labels.statisticsSamples, labels.statisticsRules, labels.statisticsSpool, labels.statisticsRotation]) {
+          expect(fact(stats, label)).toBe(labels.unknown);
+        }
+        expect(stats).not.toContain(labels.statisticsNoAck);
+      }
+      const stats = section(markup(withStatistics({ state: "idle", rotation_supported: false, producer_count: 0,
+        sample_count: 0, rule_count: 0, spool_bytes: 0, last_ack_at: null }), false, now, labels));
+      for (const label of [labels.statisticsProducers, labels.statisticsSamples, labels.statisticsRules, labels.statisticsSpool]) {
+        expect(fact(stats, label)).toBe("0");
+      }
+      expect(fact(stats, labels.statisticsRotation)).toBe(labels.statisticsUnsupported);
+      expect(fact(stats, labels.statisticsLastAck)).toBe(labels.statisticsNoAck);
+    }
+  });
+  test("fresh statistics ACK does not grant readiness to a failed or updating runtime", () => {
+    const data = withStatistics();
+    for (const state of ["failed", "updating", "closed", "exited"]) {
+      Object.assign(data.deployment!.placements[0].observation!, { state, ready: false });
+      const html = markup(data, false); expect(html).not.toContain(copy.statusRunning);
+      expect(fact(section(html), copy.statisticsLastAck)).toBe(statistics().last_ack_at!);
+      expect(fact(html, copy.trafficIn)).toBe("1024 B");
+    }
+  });
+  test("blocked statistics remain visible when a child cannot report a live generation", () => {
+    for (const labels of [copy, linksCopy("en")]) {
+      for (const state of ["failed", "exited", "closed", "passive", "mismatch"]) {
+        const data = withStatistics({ state: "blocked" });
+        Object.assign(data.deployment!.placements[0].observation!, { state, ready: false, observed_generation: 0 });
+        const html = markup(projectLinkDetail(data, 5), false, now, labels);
+        expect(fact(section(html), labels.statisticsState)).toBe(labels.statisticsBlocked);
+        expect(fact(section(html), labels.statisticsLastAck)).toBe(statistics().last_ack_at!);
+        expect(html).not.toContain(labels.statusRunning);
+      }
+    }
+  });
+  test("stale or mismatched runtime, expired lease and changed resource generation hide known capacity", () => {
+    const cases: LinkDetail[] = [];
+    for (const state of ["stale", "unknown", "absent", "mismatch", "expired", "unrecognized_runtime"]) {
+      const data = withStatistics(); data.deployment!.placements[0].observation!.state = state; cases.push(data);
+    }
+    const observedMismatch = withStatistics(); observedMismatch.deployment!.placements[0].observation!.observed_generation = 3; cases.push(observedMismatch);
+    const placementMismatch = withStatistics(); placementMismatch.deployment!.placements[0].generation = 3; cases.push(placementMismatch);
+    const deploymentMismatch = withStatistics(); deploymentMismatch.deployment!.generation = 3; cases.push(deploymentMismatch);
+    const expired = withStatistics(); expired.deployment!.lease_expires_at = new Date(now).toISOString(); cases.push(expired);
+    const unknownLease = withStatistics(); unknownLease.deployment!.lease_expires_at = "invalid"; cases.push(unknownLease);
+    for (const status of ["retired", "retiring"]) { const data = withStatistics(); data.status = status; cases.push(data); }
+    for (const data of cases) {
+      const stats = section(markup(data, false)); expect(fact(stats, copy.statisticsState)).toBe(copy.statisticsUnknown);
+      expect(fact(stats, copy.statisticsLastAck)).toBe(copy.unknown); expect(fact(stats, copy.statisticsSpool)).toBe(copy.unknown);
+      expect(stats).not.toContain(statistics().last_ack_at!);
+    }
+    expect(fact(section(markup(withStatistics(), false, Date.parse("2031-01-01T00:00:00Z"))), copy.statisticsState)).toBe(copy.statisticsUnknown);
+  });
+  test("per-node observations remain separate and secret extras never render", () => {
+    const raw = withStatistics(); const p = raw.deployment!.placements[0];
+    const data = projectLinkDetail({ ...raw, deployment: { ...raw.deployment, placements: [
+      { ...p, observation: { ...p.observation, traffic_status: { ...statistics(), credential: "never-visible", producer_id: "never-visible",
+        runner_config: { key: "never-visible" }, path: "never-visible" } } }, raw.deployment!.placements[1],
+    ] } }, 5);
+    const html = markup(data, false); expect(html).not.toContain("never-visible");
+    const sections = html.match(/<section aria-label="统计状态"[\s\S]*?<\/section>/g)!;
+    expect(sections).toHaveLength(2);
+    expect(fact(sections[0], copy.statisticsState)).toBe(copy.statisticsBacklogged);
+    expect(fact(sections[1], copy.statisticsState)).toBe(copy.statisticsUnknown);
+    expect(fact(sections[1], copy.statisticsLastAck)).toBe(copy.unknown);
+  });
+});
+
 describe("truthful deployment and references", () => {
   test("suspended references block endpoint moves and tunnel retirement", () => {
     const data = link({ forwards: [forward({ desired_status: "inactive", apply_status: "suspended" })] });

@@ -17,6 +17,10 @@
 
 Link 页面曾通过隔离浏览器 fixtures 验证；新流量 UI 有 parser/组件回归，但尚无该切片的真实后端浏览器全流程证据。细节见 [组件验证记录](../web/src/components/links/__tests__/EVIDENCE.md)。上述绿色 CI 没有自动开启 FXP 默认开关或公开支持矩阵。
 
+F1 本地已验证 500 规则/30 模拟日、统计准备各崩溃点、缺失/降级拒绝、并发计数与迟到 ACK。真实 FXP 回归连续切换五个统计段，保持原 TCP 会话和 UDP 目标 socket，精确确认后释放旧段。此为本地程序证据，真实 Linux 四节点候选门禁与实际跨日/长期运行分别记录，不能用模拟日期代替真实跨日证据。
+
+F1 统计状态另在隔离 Chrome HTTP fixtures 上验证：积压/受阻/未知状态可见，支持详情可展开，未知不显示虚构零值，新鲜 ACK 仍保留失败运行状态；375px 移动视口没有横向溢出、控制台无错误。这里使用生产组件，但不是实际 Panel/Agent 的浏览器验收。
+
 ## 自动检查
 
 以下命令从仓库根开始，在独立开发/CI 环境执行。后端完整测试需要测试 MySQL/Redis 和环境配置；DB 用量测试必须使用专用测试库，不指向生产。
@@ -68,6 +72,8 @@ bash scripts/integration/abcd-core-gate.sh
 ```
 
 脚本启用 FXP、构建候选 backend/Agent、创建四节点测试拓扑，执行真实载体、TCP/UDP/both、限制、共享更新、授权、恢复、删除和运行事实检查。结果写入 `scripts/integration/evidence/abcd-links-result.txt`；脱敏诊断与对应镜像/SHA 一起保存。
+
+F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 
 原生回归和删除/精确端口复用：
 

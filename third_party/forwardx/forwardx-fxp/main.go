@@ -512,7 +512,13 @@ func main() {
 	configPath := flag.String("config", "", "config file")
 	trafficPath := flag.String("managed-traffic", "", "private managed traffic snapshot")
 	trafficProducer := flag.String("managed-traffic-producer", "", "managed process traffic epoch")
+	trafficRotation := flag.String("managed-traffic-rotation-v1", "", "private managed traffic rotation control")
+	trafficCapabilities := flag.Bool("managed-traffic-capabilities", false, "report managed traffic protocol capabilities")
 	flag.Parse()
+	if *trafficCapabilities {
+		fmt.Println(`{"managed_traffic_rotation":1}`)
+		return
+	}
 	if *configPath == "" {
 		log.Fatal("missing -config")
 	}
@@ -528,12 +534,24 @@ func main() {
 		if cfg.Role != "entry-group" || !managedEnabled(*configPath) {
 			log.Fatal("managed traffic requires managed ingress")
 		}
-		traffic, err = newManagedTraffic(*trafficPath, *trafficProducer)
+		version := 1
+		if *trafficRotation != "" {
+			version = 2
+		}
+		traffic, err = newManagedTrafficVersion(*trafficPath, *trafficProducer, version)
 		if err != nil {
 			log.Fatal("managed traffic initialization failed")
 		}
+		if *trafficRotation != "" {
+			if err := traffic.enableRotation(*trafficRotation); err != nil {
+				log.Fatal("managed traffic rotation initialization failed")
+			}
+		}
 		managedTrafficSink.Store(traffic)
 		traffic.run()
+	}
+	if *trafficRotation != "" && traffic == nil {
+		log.Fatal("managed traffic rotation requires managed traffic")
 	}
 	log.Printf(
 		"forwardx-fxp runtime version=%s role=%s tunnel=%d rule=%d listen=:%d udpListen=:%d protocol=%s exit=%s:%d udpExit=%d relayNext=%s:%d udpRelayNext=%d target=%s:%d proxyReceive=%v proxySend=%v proxyExitReceive=%v proxyExitSend=%v limits=maxConnections:%d,maxIPs:%d,limitIn:%d,limitOut:%d",

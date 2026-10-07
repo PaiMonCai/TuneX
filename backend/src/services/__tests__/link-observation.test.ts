@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { linkObservation } from "../link-observation.ts";
+import type { ReportedTrafficStatus } from "../node-state-report.ts";
 const now = new Date("2030-01-01T00:00:00Z");
 const expected = { runtime_id: "tunex-link-7-p12-egress", node_id: 12, role: "egress", generation: 8, config_digest: "51".repeat(32) };
 const fact = { id: expected.runtime_id, node_id: 12, workspace_id: 3, link_id: 7, role: "egress",
@@ -16,4 +17,50 @@ test("ACK history never becomes a live Link observation; exact fresh leased fact
   expect(linkObservation(expected, 3, 7, { ...report, link_placements: [{ ...fact, workspace_id: 9 }] }, now).state).toBe("absent");
   expect(linkObservation(expected, 3, 7, { ...report, link_placements: [{ ...fact, lease_expires_at: now.toISOString() }] }, now).state).toBe("expired");
   expect(linkObservation(expected, 3, 7, { ...report, link_placements: [{ ...fact, state: "passive", ready: false }] }, now)).toMatchObject({ state: "passive", ready: false });
+});
+
+describe("capacity follows exact fresh observation identity and never replaces Ready", () => {
+  const statistics: ReportedTrafficStatus = { rotation_supported: true, producer_count: 1, sample_count: 3, rule_count: 2,
+    spool_bytes: 1234, last_ack_at: now.toISOString(), state: "blocked" };
+  const capacityFact = { ...fact, traffic_status: statistics };
+  function observe(patch: Record<string, unknown> = {}, reported_at = now) {
+    return linkObservation(expected, 3, 7, { reported_at, link_placements: [{ ...capacityFact, ...patch }] }, now);
+  }
+  test("matching capacity is projected for ready and non-ready runtimes independently", () => {
+    expect(observe()).toEqual({ state: "ready", ready: true, observed_generation: 8, traffic_status: statistics });
+    for (const state of ["updating", "failed", "passive", "cached", "closed", "exited"]) {
+      expect(observe({ ready: false, state })).toEqual({ state, ready: false, observed_generation: 8, traffic_status: statistics });
+    }
+    expect(observe({ traffic_status: { ...statistics, last_ack_at: null }, state: "failed", ready: false }).ready).toBe(false);
+    const legacy = linkObservation(expected, 3, 7, { reported_at: now, link_placements: [fact] }, now);
+    expect(legacy).not.toHaveProperty("traffic_status");
+  });
+  test("unknown, stale, foreign, mismatched and expired observations carry no known capacity", () => {
+    for (const reported_at of [new Date(now.getTime() - 60001), new Date(now.getTime() + 5001), new Date(NaN)]) {
+      expect(observe({}, reported_at)).not.toHaveProperty("traffic_status");
+    }
+    expect(observe({}, new Date(now.getTime() - 60000))).toHaveProperty("traffic_status", statistics);
+    for (const patch of [{ id: "another-placement" }, { node_id: 13 }, { role: "ingress" }, { workspace_id: 9 }, { link_id: 9 },
+      { generation: 9 }, { observed_generation: 7 }, { config_digest: "52".repeat(32) }, { desired_config_digest: "53".repeat(32) },
+      { lease_expires_at: now.toISOString() }, { lease_expires_at: "" }, { ready: false, state: "expired" },
+      { traffic_status: { ...statistics, key: "never-visible" } }]) {
+      expect(observe(patch)).not.toHaveProperty("traffic_status");
+    }
+    expect(linkObservation(expected, 3, 7, null, now)).not.toHaveProperty("traffic_status");
+    expect(linkObservation(expected, 3, 7, { reported_at: now, link_placements: [] }, now)).not.toHaveProperty("traffic_status");
+  });
+  test("stopped or starting child with no live generation can still report blocked storage", () => {
+    for (const state of ["failed", "exited", "closed", "passive", "updating", "cached"]) {
+      const result = observe({ ready: false, state, observed_generation: 0 });
+      expect(result.ready).toBe(false); expect(result.observed_generation).toBe(0);
+      expect(result.traffic_status).toEqual(statistics);
+    }
+    expect(observe({ ready: false, state: "failed", observed_generation: 0, config_digest: "52".repeat(32) }))
+      .not.toHaveProperty("traffic_status");
+  });
+  test("closed statistics projection does not alias the stored report", () => {
+    const result = observe(); result.traffic_status!.producer_count = 99;
+    expect(statistics.producer_count).toBe(1);
+    expect(observe().traffic_status).toEqual(statistics);
+  });
 });

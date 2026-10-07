@@ -1,6 +1,11 @@
 package reporter
 
-import "github.com/tunex/agent/internal/linkrunner"
+import (
+	"regexp"
+	"time"
+
+	"github.com/tunex/agent/internal/linkrunner"
+)
 
 // LinkPlacement is the closed, secret-free runtime fact sent to the panel.
 // It is deliberately separate from Observation, which also contains child logs.
@@ -19,6 +24,47 @@ type LinkPlacement struct {
 	LeaseExpiresAt      string              `json:"lease_expires_at"`
 	Ports               []LinkPlacementPort `json:"ports"`
 	RuntimeIDs          []string            `json:"runtime_ids"`
+	TrafficStatus       *LinkTrafficStatus  `json:"traffic_status,omitempty"`
+}
+
+// LinkTrafficStatus is a closed copy of the in-memory capacity observation.
+// LastAckAt is a durable statistics receipt, never evidence of runtime Ready.
+type LinkTrafficStatus struct {
+	RotationSupported bool    `json:"rotation_supported"`
+	ProducerCount     int     `json:"producer_count"`
+	SampleCount       int     `json:"sample_count"`
+	RuleCount         int     `json:"rule_count"`
+	SpoolBytes        int64   `json:"spool_bytes"`
+	LastAckAt         *string `json:"last_ack_at"`
+	State             string  `json:"state"`
+}
+
+var trafficAckPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$`)
+
+func reportedTrafficStatus(in *linkrunner.TrafficStatus) *LinkTrafficStatus {
+	if in == nil || in.ProducerCount < 0 || in.ProducerCount > 128 ||
+		in.SampleCount < 0 || in.SampleCount > 262144 || in.RuleCount < 0 || in.RuleCount > 262144 ||
+		in.SpoolBytes < 0 || in.SpoolBytes > 403701760 {
+		return nil
+	}
+	switch in.State {
+	case "idle", "collecting", "backlogged", "blocked":
+	default:
+		return nil
+	}
+	var ack *string
+	if in.LastAckAt != nil {
+		if !trafficAckPattern.MatchString(*in.LastAckAt) {
+			return nil
+		}
+		if _, err := time.Parse(time.RFC3339Nano, *in.LastAckAt); err != nil {
+			return nil
+		}
+		value := *in.LastAckAt
+		ack = &value
+	}
+	return &LinkTrafficStatus{RotationSupported: in.RotationSupported, ProducerCount: in.ProducerCount,
+		SampleCount: in.SampleCount, RuleCount: in.RuleCount, SpoolBytes: in.SpoolBytes, LastAckAt: ack, State: in.State}
 }
 
 type LinkPlacementPort struct {
@@ -56,6 +102,7 @@ func reportedLinkPlacements(in []linkrunner.Observation) *[]LinkPlacement {
 			ConfigDigest: o.ConfigDigest, DesiredConfigDigest: o.DesiredConfigDigest,
 			Ready: o.Ready, State: o.State, LeaseExpiresAt: o.LeaseExpiresAt,
 			Ports: ports, RuntimeIDs: runtimeIDs,
+			TrafficStatus: reportedTrafficStatus(o.TrafficStatus),
 		})
 	}
 	return &out

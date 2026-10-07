@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -37,6 +39,7 @@ type TrafficSample struct {
 type childTraffic struct {
 	enabled        bool
 	producer, path string
+	rotationPath   string
 }
 type trafficKey struct {
 	producer string
@@ -72,6 +75,15 @@ func (m *Manager) EnableTraffic() error {
 		}
 		m.traffic = &trafficStore{dir: dir}
 	}
+	m.traffic.rotation = probeTrafficRotation(m.binaryPath)
+	m.traffic.epochAge = 24 * time.Hour
+	if raw := strings.TrimSpace(os.Getenv("TUNEX_FXP_TRAFFIC_EPOCH_SECONDS")); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 30 || seconds > 86400 {
+			return ErrTraffic
+		}
+		m.traffic.epochAge = time.Duration(seconds) * time.Second
+	}
 	_, err := m.scanTrafficLocked()
 	return err
 }
@@ -89,6 +101,25 @@ func (m *Manager) TrafficSamples() ([]TrafficSample, error) {
 	if err != nil {
 		return nil, m.trafficFailureLocked(err)
 	}
+	// A new accounting epoch does not restart the business process. Keep the
+	// sealed old epoch intact until its complete final totals are committed.
+	for _, p := range producers {
+		child := m.running[p.manifest.PlacementID]
+		if child != nil && child.trafficProducer == p.manifest.ProducerID && child.rotationPath != "" &&
+			child.live() && (trafficRotationDue(p) || !child.trafficStartedAt.IsZero() && time.Since(child.trafficStartedAt) >= m.traffic.epochAge) {
+			cfg := m.records[p.manifest.PlacementID].Config
+			if cfg == nil {
+				return nil, m.trafficFailureLocked(ErrTraffic)
+			}
+			if err := m.rotateTrafficLocked(child, *cfg); err != nil {
+				return nil, m.trafficFailureLocked(err)
+			}
+		}
+	}
+	producers, err = m.scanTrafficLocked()
+	if err != nil {
+		return nil, m.trafficFailureLocked(err)
+	}
 	var out []TrafficSample
 	for _, p := range producers {
 		out = append(out, p.samples()...)
@@ -96,7 +127,7 @@ func (m *Manager) TrafficSamples() ([]TrafficSample, error) {
 	return out, nil
 }
 
-// AckTraffic never deletes active files. A stopped producer is reclaimed only
+// AckTraffic never deletes active files. A stopped or sealed producer is reclaimed only
 // when every current persisted rule/day total is exactly acknowledged. Stale or
 // partial ACKs retain it; duplicate calls after deletion are harmless.
 func (m *Manager) AckTraffic(samples []TrafficSample) error {
@@ -145,6 +176,11 @@ func (m *Manager) AckTraffic(samples []TrafficSample) error {
 			return ErrTrafficAck
 		}
 	}
+	for _, s := range samples {
+		if p, exists := byID[s.ProducerID]; exists {
+			m.markTrafficAckLocked(p.manifest.PlacementID)
+		}
+	}
 	for _, p := range producers {
 		if m.trafficActiveLocked(p.manifest.ProducerID) {
 			continue
@@ -168,6 +204,10 @@ func (m *Manager) AckTraffic(samples []TrafficSample) error {
 		if err := m.finishTrafficDeletionLocked(p.manifest.ProducerID); err != nil {
 			return m.trafficFailureLocked(err)
 		}
+	}
+	_, err = m.scanTrafficLocked()
+	if err != nil {
+		return m.trafficFailureLocked(err)
 	}
 	return nil
 }
@@ -198,6 +238,10 @@ func (m *Manager) startChildLocked(cfg Config, deadline time.Time, expected []li
 			return nil, m.trafficFailureLocked(ErrTraffic)
 		}
 		manifest := trafficManifest{Version: 1, ProducerID: options.producer, PlacementID: cfg.ID, LinkID: cfg.LinkID, WorkspaceID: cfg.WorkspaceID, NodeID: cfg.NodeID, Role: cfg.Role, Last: []trafficCounter{}}
+		if m.traffic.rotation {
+			manifest.Version = 2
+			options.rotationPath = filepath.Join(m.runtimeDir, "fxp-traffic-rotate-"+options.producer+".json")
+		}
 		if err := addTrafficRules(&manifest, cfg); err != nil {
 			return nil, m.trafficFailureLocked(err)
 		}
@@ -232,9 +276,18 @@ func (m *Manager) extendTrafficLocked(child *child, cfg Config) error {
 		if manifest.PlacementID != cfg.ID || manifest.LinkID != cfg.LinkID || manifest.WorkspaceID != cfg.WorkspaceID || manifest.NodeID != cfg.NodeID {
 			return m.trafficFailureLocked(ErrTraffic)
 		}
-		if err := addTrafficRules(&manifest, cfg); err != nil {
+		candidate := manifest
+		candidate.Rules = append([]trafficRule(nil), manifest.Rules...)
+		if err := addTrafficRules(&candidate, cfg); err != nil {
 			return m.trafficFailureLocked(err)
 		}
+		if child.rotationPath != "" && len(candidate.Rules) >= trafficRotationThreshold {
+			if err := m.rotateTrafficLocked(child, cfg); err != nil {
+				return m.trafficFailureLocked(err)
+			}
+			return nil
+		}
+		manifest = candidate
 		if len(manifest.Rules) == len(p.manifest.Rules) {
 			return nil
 		}
@@ -288,6 +341,9 @@ func (m *Manager) trafficActiveLocked(producer string) bool {
 }
 
 func (m *Manager) trafficFailureLocked(err error) error {
+	if m.traffic != nil {
+		m.traffic.blocked = true
+	}
 	var failures []error
 	for id, p := range m.running {
 		if p.trafficProducer != "" {

@@ -26,6 +26,11 @@ The receipt timestamp is separate from runtime readiness. At age **>= 60 seconds
 
 ## Verification
 
+Optional ingress `observation.traffic_status` reports collection/backlog/blocked
+state, retained capacity and the most recent committed ACK. Missing or stale
+telemetry stays unknown. These facts do not change runtime readiness; capacity
+numbers and rotation capability are collapsed support details.
+
 From `web/`:
 
 ```powershell
@@ -43,5 +48,9 @@ bun run src/components/links/__tests__/browser-server.ts
 ```
 
 Open `http://127.0.0.1:41973`. This loopback-only contract harness imports the actual production React components and shared request layer, with disposable in-memory HTTP fixtures under `__tests__`. It is not mounted by Next.js and never connects to a database or Agent. `/__test/scenario` accepts `enabled`, `conflict`, `partial`, `delay` and `reset` to test feature-off, stale edits, partial apply and scope switching. The fixture is distinct from real Panel/MySQL/Redis/multi-Agent forwarding acceptance.
+
+`statistics` can seed `idle`, `collecting`, `backlogged`, `blocked`, or `unknown`
+statistics on a failed ingress. This verifies that even a fresh accounting ACK
+does not turn a failed runtime into a ready one.
 
 The backend feature defaults off. `fxp_links_not_enabled` is shown as a failed operation, with no success notification. Enabling the server feature and final real multi-node validation belong to the backend/runtime rollout.

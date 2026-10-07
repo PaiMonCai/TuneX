@@ -39,3 +39,13 @@ and [acceptance guide](../../docs/testing.md) for rollout and capacity boundarie
 The default remains upstream-compatible for reference regression tests. This does
 not enable FXP in the public TuneX support matrix; managed lifecycle, provenance,
 endpoint-version checks and network acceptance remain separate gates.
+
+F1 adds opt-in `-managed-traffic-rotation-v1 <private-control-path>`, negotiated
+through `-managed-traffic-capabilities`. Live epoch snapshots are v2 and final
+sealed snapshots v3. Under the same accounting mutex the executable persists
+an empty successor, seals predecessor totals, then redirects future deltas to
+the new random producer identity. Listeners, sessions, UDP mappings and admission
+budgets remain alive. Repeated controls never reset cumulative data. The Agent
+persists authorized preparation before control, verifies both durable snapshots,
+and reclaims sealed totals only after exact authenticated storage acknowledgement.
+Legacy invocations retain snapshot v1 and receive no rotation control argument.

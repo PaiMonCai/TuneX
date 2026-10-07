@@ -45,18 +45,24 @@ type managedTrafficKey struct {
 // FXP receives no panel credential. The Agent owns authenticated delivery and
 // binds this private cumulative payload spool to a deployment manifest.
 type managedTraffic struct {
-	mu       sync.Mutex
-	path     string
-	producer string
-	values   map[managedTrafficKey]trafficBatchValue
-	dirty    bool
-	done     chan struct{}
-	stopped  chan struct{}
-	stopOnce sync.Once
-	failed   func()
+	mu           sync.Mutex
+	path         string
+	producer     string
+	version      int
+	rotationPath string
+	values       map[managedTrafficKey]trafficBatchValue
+	dirty        bool
+	done         chan struct{}
+	stopped      chan struct{}
+	stopOnce     sync.Once
+	failed       func()
 }
 
 func newManagedTraffic(path, producer string) (*managedTraffic, error) {
+	return newManagedTrafficVersion(path, producer, 1)
+}
+
+func newManagedTrafficVersion(path, producer string, version int) (*managedTraffic, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !managedProducerPattern.MatchString(producer) {
 		return nil, errors.New("invalid managed traffic destination")
 	}
@@ -75,7 +81,7 @@ func newManagedTraffic(path, producer string) (*managedTraffic, error) {
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		return nil, errors.New("managed traffic destination already exists")
 	}
-	s := &managedTraffic{path: path, producer: producer, values: make(map[managedTrafficKey]trafficBatchValue), dirty: true,
+	s := &managedTraffic{path: path, producer: producer, version: version, values: make(map[managedTrafficKey]trafficBatchValue), dirty: true,
 		done: make(chan struct{}), stopped: make(chan struct{}), failed: func() { os.Exit(1) }}
 	if err := s.flush(); err != nil {
 		return nil, err
@@ -111,6 +117,10 @@ func (s *managedTraffic) record(cfg config, bytesIn, bytesOut, connections uint6
 func (s *managedTraffic) flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.flushLocked()
+}
+
+func (s *managedTraffic) flushLocked() error {
 	if !s.dirty {
 		return nil
 	}
@@ -124,7 +134,7 @@ func (s *managedTraffic) flush() error {
 		}
 		return keys[i].rule < keys[j].rule
 	})
-	snapshot := managedTrafficSnapshot{Version: 1, ProducerID: s.producer, Samples: make([]managedTrafficSample, 0, len(keys))}
+	snapshot := managedTrafficSnapshot{Version: s.version, ProducerID: s.producer, Samples: make([]managedTrafficSample, 0, len(keys))}
 	for _, key := range keys {
 		value := s.values[key]
 		snapshot.Samples = append(snapshot.Samples, managedTrafficSample{ForwardID: key.rule, Date: key.date,
@@ -187,6 +197,12 @@ func (s *managedTraffic) run() {
 		defer close(s.stopped)
 		ticker := time.NewTicker(managedTrafficInterval)
 		defer ticker.Stop()
+		var rotation <-chan time.Time
+		if s.rotationPath != "" {
+			poll := time.NewTicker(100 * time.Millisecond)
+			defer poll.Stop()
+			rotation = poll.C
+		}
 		for {
 			select {
 			case <-ticker.C:
@@ -196,6 +212,11 @@ func (s *managedTraffic) run() {
 				}
 			case <-s.done:
 				return
+			case <-rotation:
+				if s.rotateFromControl() != nil {
+					s.failed()
+					return
+				}
 			}
 		}
 	}()

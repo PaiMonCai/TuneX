@@ -1,6 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import {
@@ -182,6 +183,93 @@ describe("Link traffic accounting with injected transactional storage", () => {
     assert.equal(store.checkpoints.size, 3);
     assert.equal(fact(store).traffic, 330);
     assert.equal(fact(store, 41, "2026-11-02").traffic_cost, 15);
+  });
+
+  test("F1 rotates producers without a deployment change; lost ACK and replay after local reclamation keep both epochs", async () => {
+    const store = memoryStore();
+    const oldStart = sample({ producer_id: randomBytes(16).toString("hex") });
+    const newStart = sample({ producer_id: randomBytes(16).toString("hex"),
+      bytes_in: "5", bytes_out: "10", connections: "1" });
+    assert.notEqual(newStart.producer_id, oldStart.producer_id);
+    const oldFinal = { ...oldStart, bytes_in: "130", bytes_out: "250", connections: "4" };
+    const newFinal = { ...newStart, bytes_in: "15", bytes_out: "25", connections: "2" };
+    // Only local snapshot retention is modeled here; the real receiver owns all accounting.
+    const localSnapshots = new Map([[oldFinal.producer_id, oldFinal]]);
+    const delayedRetry = structuredClone(oldFinal);
+    assert.deepEqual(await send(store, [oldStart, newStart]), { ok: true, accepted: [oldStart, newStart] });
+    assert.equal(fact(store).traffic, 315);
+
+    store.failure = "commit";
+    assert.deepEqual(await send(store, [oldFinal]),
+      { ok: false, status: 503, reason: "link_traffic_storage_failure" });
+    assert.ok(localSnapshots.has(oldFinal.producer_id), "an uncommitted final snapshot remains pending");
+    assert.equal(fact(store).traffic, 315);
+    store.failure = null;
+    // The transaction commits, but the caller loses the response and retains its sealed snapshot.
+    await send(store, [oldFinal]);
+    assert.equal(fact(store).traffic, 395, "the old epoch tail commits before its ACK is received");
+    assert.ok(localSnapshots.has(oldFinal.producer_id));
+    assert.deepEqual(await send(store, [newFinal]), { ok: true, accepted: [newFinal] });
+    assert.deepEqual(await send(store, [localSnapshots.get(oldFinal.producer_id)!]),
+      { ok: true, accepted: [oldFinal] }, "retry returns the exact committed final snapshot");
+    localSnapshots.delete(oldFinal.producer_id);
+    assert.equal(localSnapshots.size, 0);
+    assert.equal(store.checkpoints.size, 2, "local reclamation must leave both DB high-water marks intact");
+
+    assert.deepEqual(await send(store, [delayedRetry, oldStart, newFinal]),
+      { ok: true, accepted: [delayedRetry, oldStart, newFinal] });
+    assert.deepEqual(fact(store), { workspace_id: 3, traffic: 420, traffic_cost: 420 },
+      "both epoch finals count once even after a delayed retry of the reclaimed snapshot");
+    for (const [producer, expected] of [[oldFinal.producer_id, [130n, 250n, 4n]],
+      [newFinal.producer_id, [15n, 25n, 2n]]] as const) {
+      const row = store.checkpoints.get(`11:${producer}:41:2026-11-01`)!;
+      assert.deepEqual([row.bytes_in, row.bytes_out, row.connections], expected);
+      assert.equal(row.generation, 2);
+      assert.equal(row.config_digest, oldStart.config_digest);
+    }
+  });
+
+  test("F1 epoch tails retain historical generation/digest authorization after the rule is removed", async () => {
+    const store = memoryStore();
+    const oldStart = sample({ producer_id: randomBytes(16).toString("hex") });
+    const newStart = sample({ producer_id: randomBytes(16).toString("hex"), generation: 3,
+      config_digest: "ef".repeat(32), bytes_in: "5", bytes_out: "10", connections: "1" });
+    store.history.set("7:3", deployment({ generation: 3,
+      binding_snapshot: { spec: { link_id: 7, workspace_id: 3, generation: 3,
+        ingress: { id: 11, workspace_id: 3 }, bindings: [{ forward_id: 41 }] } },
+      placements: [{ node_id: 11, role: "ingress", generation: 3, config_digest: newStart.config_digest }],
+    }));
+    assert.deepEqual(await send(store, [oldStart, newStart]), { ok: true, accepted: [oldStart, newStart] });
+    // No live Forward table exists in this fixture. The latest deployment no longer binds the rule.
+    for (const history of store.history.values()) Object.assign(history, {
+      status: "retired", lease_expires_at: new Date("2020-01-01"), link: { workspace_id: 3, generation: 4 },
+    });
+    store.history.set("7:4", deployment({ generation: 4,
+      binding_snapshot: { spec: { link_id: 7, workspace_id: 3, generation: 4,
+        ingress: { id: 11, workspace_id: 3 }, bindings: [] } },
+      placements: [{ node_id: 11, role: "ingress", generation: 4, config_digest: "01".repeat(32) }],
+    }));
+    const oldFinal = { ...oldStart, bytes_in: "130", bytes_out: "250", connections: "4" };
+    const newFinal = { ...newStart, bytes_in: "15", bytes_out: "25", connections: "2" };
+    for (const forged of [{ ...oldFinal, config_digest: newStart.config_digest },
+      { ...newFinal, config_digest: oldStart.config_digest },
+      { ...newFinal, generation: 4, config_digest: "01".repeat(32) }]) {
+      assert.deepEqual(await send(store, [oldFinal, forged]),
+        { ok: false, status: 403, reason: "link_traffic_not_owned" });
+      assert.equal(fact(store).traffic, 315, "invalid historical identity rolls back every epoch tail");
+    }
+    assert.deepEqual(await send(store, [newFinal, oldFinal]), { ok: true, accepted: [newFinal, oldFinal] });
+    assert.deepEqual(await send(store, [oldFinal, newFinal]), { ok: true, accepted: [oldFinal, newFinal] });
+    assert.deepEqual(fact(store), { workspace_id: 3, traffic: 420, traffic_cost: 420 },
+      "deleting a rule cannot discard either historically authorized epoch tail");
+    assert.equal(store.checkpoints.size, 2);
+    for (const final of [oldFinal, newFinal]) {
+      const row = store.checkpoints.get(`11:${final.producer_id}:41:2026-11-01`)!;
+      assert.equal(row.generation, final.generation);
+      assert.equal(row.config_digest, final.config_digest);
+      assert.deepEqual([row.bytes_in, row.bytes_out, row.connections],
+        [BigInt(final.bytes_in), BigInt(final.bytes_out), BigInt(final.connections)]);
+    }
   });
 
   test("cross-workspace/node/egress, bad generation/digest and absent bindings are unauthorized", async () => {
@@ -408,8 +496,15 @@ test("HTTP route uses Bearer-derived node identity and exact persisted ACKs with
   const path = (relative: string) => JSON.stringify(new URL(relative, import.meta.url).href);
   const scenario = `
     import assert from "node:assert/strict";
+    import { randomBytes } from "node:crypto";
     import { registerHooks } from "node:module";
-    process.env.DATABASE_URL = "mysql://unused:unused@127.0.0.1:1/unused";
+    registerHooks({ resolve(specifier, context, next) {
+      const resolved = next(specifier, context);
+      if (new URL(resolved.url).pathname.endsWith('/src/db.ts')) {
+        return { url: 'data:text/javascript,export const db = {};', shortCircuit: true };
+      }
+      return resolved;
+    } });
     const real = await import(${path("../link-traffic.ts")});
     const deployment = ${deployment.toString()};
     const LinkTrafficError = real.LinkTrafficError;
@@ -445,6 +540,37 @@ test("HTTP route uses Bearer-derived node identity and exact persisted ACKs with
     response = await request({ samples: [old] });
     assert.deepEqual(await response.json(), { data: { accepted: [old] } });
     assert.equal([...store.daily.values()][0].traffic, 300);
+
+    const epochStore = (${memoryStore.toString()})();
+    globalThis.store = epochStore;
+    const oldEpoch = { ...first, producer_id: randomBytes(16).toString('hex') };
+    const newEpoch = { ...first, producer_id: randomBytes(16).toString('hex'),
+      bytes_in: '5', bytes_out: '10', connections: '1' };
+    assert.notEqual(oldEpoch.producer_id, newEpoch.producer_id);
+    const oldFinal = { ...oldEpoch, bytes_in: '130', bytes_out: '250', connections: '4' };
+    const newFinal = { ...newEpoch, bytes_in: '15', bytes_out: '25', connections: '2' };
+    let pendingOld = oldFinal;
+    const delayedRetry = structuredClone(oldFinal);
+    response = await request({ samples: [oldEpoch, newEpoch] });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { data: { accepted: [oldEpoch, newEpoch] } });
+    // Deliberately drop this HTTP response after the old final has committed.
+    await request({ samples: [oldFinal] });
+    assert.equal([...epochStore.daily.values()][0].traffic, 395);
+    assert.ok(pendingOld);
+    response = await request({ samples: [newFinal, pendingOld] });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { data: { accepted: [newFinal, oldFinal] } });
+    pendingOld = null; // Local reclamation follows the exact committed ACK above.
+    assert.equal(epochStore.checkpoints.size, 2);
+    response = await request({ samples: [delayedRetry, oldEpoch] });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { data: { accepted: [delayedRetry, oldEpoch] } });
+    assert.deepEqual([...epochStore.daily.values()][0], { workspace_id: 3, traffic: 420, traffic_cost: 420 });
+    assert.equal(pendingOld, null);
+    assert.equal(epochStore.checkpoints.size, 2, 'reclaimed local snapshots retain server deduplication');
+    globalThis.store = store;
+
     response = await request({ samples: [first] }, {}); assert.equal(response.status, 401);
     response = await request('{'); assert.equal(response.status, 400);
     response = await request(' '.repeat(1048577)); assert.equal(response.status, 400);

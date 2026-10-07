@@ -1,7 +1,7 @@
 /** Browser-only contract fixture. No database, no Agent or production credentials. */
 import { resolve } from "node:path";
 import type { LinkBindingInput, LinkDetail } from "@/lib/links-types";
-import { link } from "./links-fixtures";
+import { link, statistics } from "./links-fixtures";
 
 const bundle = await Bun.build({ entrypoints: [resolve(import.meta.dir, "browser-entry.tsx")], target: "browser",
   define: { "process.env.NEXT_PUBLIC_API_MOCK": '"0"', "process.env.SERVER_API_BASE": '""', "process.env.NODE_ENV": '"development"' } });
@@ -25,9 +25,20 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
   if (path === "/favicon.ico") return new Response(null, { status: 204 });
   if (path === "/__test/state") return response({ links, calls });
   if (path === "/__test/scenario") {
-    const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean };
+    const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean;
+      statistics?: "idle" | "collecting" | "backlogged" | "blocked" | "unknown" };
     enabled = input.enabled ?? true; conflict = input.conflict ?? false; partial = input.partial ?? false; delay = input.delay ?? false;
     if (input.reset) { links = []; calls.length = 0; }
+    if (input.statistics !== undefined) {
+      if (!links.length) links.push(link());
+      for (const row of links) for (const placement of row.deployment?.placements ?? []) {
+        if (placement.role === "ingress") placement.observation = {
+          state: "failed", ready: false, observed_generation: row.generation,
+          ...(input.statistics === "unknown" ? {} : { traffic_status: statistics({
+            state: input.statistics, last_ack_at: new Date().toISOString() }) }),
+        };
+      }
+    }
     return response({ enabled, conflict, partial, delay });
   }
   const workspaceId = Number(req.headers.get("x-workspace-id"));

@@ -1,14 +1,16 @@
 {
   "upstream_commit": "cb0ef0bb156dc114e4344c887328018491fbd638",
   "modified_by": "TuneX core ABCD integration",
-  "date": "2026-10-07",
+  "date": "2026-10-08",
   "summary": [
     "Opt-in exact rule/protocol/target authorization",
     "Private managed config reload with digest confirmation and unchanged sibling preservation",
     "Both protocol lanes share limiters and admission",
     "Managed rule shutdown closes both stream endpoints and cancels limiter waits",
     "Opt-in managed entry payload traffic snapshots with per-producer/rule/Shanghai-day cumulative counters",
-    "Private atomic bounded traffic files, one-second sampling/final flush and fail-closed persistence errors; no node credentials in FXP"
+    "Private atomic bounded traffic files, one-second sampling/final flush and fail-closed persistence errors; no node credentials in FXP",
+    "Negotiated same-process traffic epochs with durable prepare/seal recovery and exact acknowledged reclamation without restarting TCP/UDP sessions",
+    "Strict private bounded no-follow rotation controls and a secret-free executable capability probe"
   ],
   "files": [
     {
@@ -38,7 +40,7 @@
     {
       "path": "forwardx-fxp/main.go",
       "original_sha256": "f138489498e0a87fe58abe3c8780928998d441a08c56e21a41d427fbcbbc9411",
-      "modified_sha256": "f537e8bdc9278e6254bc38856d5fde31e7aef054e499a3b232ba9ccc715324b1",
+      "modified_sha256": "5f6a1aa65fa129cd6c4982522768ff924465270c30f7a0a4682c6c482a42cd6c",
       "change": "modified"
     },
     {
@@ -62,7 +64,7 @@
     {
       "path": "forwardx-fxp/managed_traffic.go",
       "original_sha256": null,
-      "modified_sha256": "3f7a263053a826c5d15ed97cdcc96a6264014a093e0476bd3e5ba2a8d6fe945c",
+      "modified_sha256": "ce3a9e37190916772e429039f35f557c8e47115366f81b946dfe715ea8e49d4c",
       "change": "added"
     },
     {
@@ -76,6 +78,36 @@
       "original_sha256": "3315b15f6794631ad4868f18ef3a52d696d69e5f3b989fee086550a5bc15a26d",
       "modified_sha256": "4e4474acc82dcca17e2e1b4480a84f86c2fea58e6823f6deecd8180130a90417",
       "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_control_linux.go",
+      "original_sha256": null,
+      "modified_sha256": "f487a3588b3fcb1a91a29b237f29c4581b9abd249878a316f65bacebe07ee16d",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_control_windows.go",
+      "original_sha256": null,
+      "modified_sha256": "67d7fc001d1b9a65f59c877d6f5d569d356e6a5ab70658c403cac74cd275a112",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_control_unsupported.go",
+      "original_sha256": null,
+      "modified_sha256": "478131c2a967af6a20324c3088e09f55e3cc8ed40d6c9c98606f255c1bbaac34",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_rotation.go",
+      "original_sha256": null,
+      "modified_sha256": "38021ffdd79fc3a6ce4481954505ae88261c25f1e5c3a27f98667fa05d2bf078",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_rotation_test.go",
+      "original_sha256": null,
+      "modified_sha256": "c50a7aa5b1b76a06dd5c140ab346fe0fe997bd742d0f97be5f062216086c8094",
+      "change": "added"
     }
   ],
   "hash_format": "SHA256 of canonical Git source blobs; checkout line-ending conversion is not included"

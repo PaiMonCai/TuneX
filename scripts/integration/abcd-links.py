@@ -273,7 +273,8 @@ def main():
             return (tcp_payload(held_b, b"B-traffic-keepalive")
                     and udp_payload(udp_b, 21081, b"B-traffic-keepalive"))
         initial_traffic = wait_traffic(link_id, [a, b], keepalive=keep_b_alive)
-        H.check(all(int(row["connections"]) > 0 for row in initial_traffic),
+        H.check(all(any(row["forward_id"] == fid and int(row["connections"]) > 0
+                        for row in initial_traffic) for fid in (a, b)),
                 "ABCD real TCP/UDP payload commits both byte directions and accepted connections")
         replay_traffic(link_id, [a, b], initial_traffic)
         old_a_samples = [row for row in initial_traffic if row["forward_id"] == a]
@@ -291,6 +292,25 @@ def main():
         H.check(all(total > prior for total, prior in zip(
             traffic_totals([r for r in later_traffic if r["date"] in days]), before_bytes)),
             "ABCD later payload adds to both same-day cumulative directions, not a once-only sample")
+        epoch_ids = {row["producer_id"] for row in later_traffic}
+        rotated = wait_traffic(link_id, [b], lambda rows: any(
+            row["producer_id"] not in epoch_ids and int(row["bytes_in"]) > 0 for row in rows),
+            keepalive=keep_b_alive)
+        H.check(bool(epoch_ids < {row["producer_id"] for row in rotated}),
+                "F1 running FXP changes accounting epoch while retaining committed history")
+        H.check(tcp_payload(held_b, b"B-after-accounting-epoch") and
+                udp_payload(udp_b, 21081, b"B-udp-after-accounting-epoch") and
+                targets[0].udp.sources.get(b"B-udp-after-accounting-epoch") == original_udp_source,
+                "F1 accounting rotation preserves held TCP and the exact UDP target socket")
+        def reclaimed_epoch():
+            current = request("GET", base)
+            ingress = next(p for p in current["deployment"]["placements"] if p["role"] == "ingress")
+            status = ingress.get("observation", {}).get("traffic_status", {})
+            return (status.get("rotation_supported") is True and status.get("producer_count") == 1
+                    and status.get("last_ack_at") is not None)
+        H.check(bool(H.wait_until(reclaimed_epoch, timeout=60, interval=2)),
+                "F1 exact storage ACK reclaims sealed epochs and reports bounded active capacity")
+        replay_traffic(link_id, [b], rotated)
         detail = request("GET", base)
         prior_generation = detail["generation"]
         conflict_status, _, _ = H.req("POST", base + "/forwards", binding("conflicting", 21081, 0))

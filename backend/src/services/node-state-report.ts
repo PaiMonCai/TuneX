@@ -8,6 +8,23 @@ const id = z.number().int().min(1).max(2147483647);
 const generation = z.number().int().min(0).max(2147483647);
 const runtimeID = z.string().min(1).max(160).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/);
 const digest = z.union([z.literal(""), z.string().regex(/^[a-f0-9]{64}$/)]);
+// In-memory capacity facts, never counters to add to historical usage or Ready.
+const trafficAckAt = z.string().max(64).refine((value) => {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  if (!match || match[0] !== value) return false;
+  const local = Date.parse(`${match[1]}Z`);
+  return Number.isFinite(local) && new Date(local).toISOString().slice(0, 19) === match[1]
+    && Number.isFinite(Date.parse(value));
+});
+const trafficStatus = z.object({
+  rotation_supported: z.boolean(),
+  producer_count: z.number().int().min(0).max(128),
+  sample_count: z.number().int().min(0).max(262144),
+  rule_count: z.number().int().min(0).max(262144),
+  spool_bytes: z.number().int().min(0).max(403701760),
+  last_ack_at: trafficAckAt.nullable(),
+  state: z.enum(["idle", "collecting", "backlogged", "blocked"]),
+}).strict();
 const port = z.object({
   protocol: z.enum(["tcp", "udp"]),
   host: z.string().max(255).refine((value) => !/[\s\u0000-\u001f]/.test(value)),
@@ -23,6 +40,7 @@ const placement = z.object({
   lease_expires_at: z.union([z.literal(""), z.string().max(64).datetime({ offset: true })]),
   ports: z.array(port).max(1024),
   runtime_ids: z.array(runtimeID).max(4096),
+  traffic_status: trafficStatus.optional(),
 }).strict().refine((value) => value.observed_generation <= value.generation)
   .refine((value) => !value.ready || (
     (value.state === "ready" || value.state === "rolled_back") && value.observed_generation > 0 &&
@@ -32,6 +50,7 @@ const placement = z.object({
   .refine((value) => new Set(value.ports.map((p) => `${p.protocol}/${p.host}/${p.port}`)).size === value.ports.length);
 
 export type ReportedLinkPlacement = z.infer<typeof placement>;
+export type ReportedTrafficStatus = z.infer<typeof trafficStatus>;
 export type LinkReportRejection = "bad_link_placements" | "link_placement_node_mismatch" |
   "link_placement_workspace_mismatch" | "link_placement_not_owned";
 type ParsedLinkReport = { ok: true; placements: ReportedLinkPlacement[] | null } |

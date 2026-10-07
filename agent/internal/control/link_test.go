@@ -222,6 +222,14 @@ func TestLinkAdmissionAndNoLegacyLKGSecrets(t *testing.T) {
 }
 
 func TestFXPCapabilitiesRequireRuntimeFacts(t *testing.T) {
+	for _, facts := range []RuntimeFacts{{}, {FXPLink: true}, {TrafficRotation: true}, {PolicyRuntime: true, TrafficRotation: true}} {
+		if slices.Contains(Capabilities(facts), CapabilityTrafficRotation) {
+			t.Fatal("unconstructed or legacy FXP advertises epoch rotation", facts)
+		}
+	}
+	if !slices.Contains(Capabilities(RuntimeFacts{FXPLink: true, TrafficRotation: true}), CapabilityTrafficRotation) {
+		t.Fatal("negotiated FXP omits epoch rotation")
+	}
 	if !slices.Contains(Capabilities(RuntimeFacts{PolicyRuntime: true}), CapabilityRuntimePolicy) || slices.Contains(Capabilities(RuntimeFacts{PolicyRuntime: true}), CapabilityFXPLink) {
 		t.Fatal("native policy runtime must advertise independently of optional FXP")
 	}

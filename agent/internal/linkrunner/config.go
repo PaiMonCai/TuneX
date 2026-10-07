@@ -44,24 +44,37 @@ type Port struct {
 // is the durable command fence; ObservedGeneration identifies the running config
 // and can be lower after a failed update has rolled back.
 type Observation struct {
-	UpdateMode          string   `json:"update_mode"`
-	ID                  string   `json:"id"`
-	LinkID              int64    `json:"link_id"`
-	WorkspaceID         int64    `json:"workspace_id"`
-	NodeID              int64    `json:"node_id"`
-	Role                string   `json:"role"`
-	Generation          int64    `json:"generation"`
-	ObservedGeneration  int64    `json:"observed_generation"`
-	ConfigDigest        string   `json:"config_digest"`
-	DesiredConfigDigest string   `json:"desired_config_digest"`
-	LeaseExpiresAt      string   `json:"lease_expires_at"`
-	RuntimeIDs          []string `json:"runtime_ids"`
-	Ports               []Port   `json:"ports"`
-	State               string   `json:"state"`
-	Ready               bool     `json:"ready"`
-	PID                 int      `json:"pid,omitempty"`
-	LastError           string   `json:"last_error,omitempty"`
-	Logs                []string `json:"logs,omitempty"`
+	UpdateMode          string         `json:"update_mode"`
+	ID                  string         `json:"id"`
+	LinkID              int64          `json:"link_id"`
+	WorkspaceID         int64          `json:"workspace_id"`
+	NodeID              int64          `json:"node_id"`
+	Role                string         `json:"role"`
+	Generation          int64          `json:"generation"`
+	ObservedGeneration  int64          `json:"observed_generation"`
+	ConfigDigest        string         `json:"config_digest"`
+	DesiredConfigDigest string         `json:"desired_config_digest"`
+	LeaseExpiresAt      string         `json:"lease_expires_at"`
+	RuntimeIDs          []string       `json:"runtime_ids"`
+	Ports               []Port         `json:"ports"`
+	State               string         `json:"state"`
+	Ready               bool           `json:"ready"`
+	PID                 int            `json:"pid,omitempty"`
+	LastError           string         `json:"last_error,omitempty"`
+	Logs                []string       `json:"logs,omitempty"`
+	TrafficStatus       *TrafficStatus `json:"traffic_status,omitempty"`
+}
+
+// Accounting receipt is independent of runtime readiness. Counts describe
+// retained private epochs; no producer identities or paths are exposed.
+type TrafficStatus struct {
+	RotationSupported bool    `json:"rotation_supported"`
+	ProducerCount     int     `json:"producer_count"`
+	SampleCount       int     `json:"sample_count"`
+	RuleCount         int     `json:"rule_count"`
+	SpoolBytes        int64   `json:"spool_bytes"`
+	LastAckAt         *string `json:"last_ack_at"`
+	State             string  `json:"state"`
 }
 
 var (

@@ -47,11 +47,12 @@ const (
 	// it is a separate action instead of a diagnose: it needs its own admission
 	// (public-only literals, enforced on both sides), its own caps and its own
 	// audit story. See internal/diag/lookingglass.go for the agent-side half.
-	ActionLookingGlass      = "looking_glass"
-	ActionApplyLink         = "apply_link"
-	ActionRemoveLink        = "remove_link"
-	CapabilityFXPLink       = "forward.link.fxp.v1"
-	CapabilityRuntimePolicy = "forward.policy.runtime.v1"
+	ActionLookingGlass        = "looking_glass"
+	ActionApplyLink           = "apply_link"
+	ActionRemoveLink          = "remove_link"
+	CapabilityFXPLink         = "forward.link.fxp.v1"
+	CapabilityRuntimePolicy   = "forward.policy.runtime.v1"
+	CapabilityTrafficRotation = "forward.traffic.rotation.v1"
 )
 
 // advertisedActions is the single source of truth for what this agent
@@ -68,13 +69,16 @@ var advertisedActions = []string{
 
 // Capabilities returns the actions this agent implements, sorted. The caller
 // gets a copy: a state report must not be able to mutate the agent's own list.
-type RuntimeFacts struct{ FXPLink, PolicyRuntime bool }
+type RuntimeFacts struct{ FXPLink, PolicyRuntime, TrafficRotation bool }
 
 func Capabilities(facts ...RuntimeFacts) []string {
 	out := make([]string, len(advertisedActions))
 	copy(out, advertisedActions)
 	if len(facts) > 0 && facts[0].FXPLink {
 		out = append(out, ActionApplyLink, ActionRemoveLink, CapabilityFXPLink)
+		if facts[0].TrafficRotation {
+			out = append(out, CapabilityTrafficRotation)
+		}
 	}
 	if len(facts) > 0 && (facts[0].FXPLink || facts[0].PolicyRuntime) {
 		out = append(out, CapabilityRuntimePolicy)

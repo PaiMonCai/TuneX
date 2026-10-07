@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError, API_MOCK, setActiveWorkspace } from "@/lib/api/core";
 import { linksApi, linkErrorInfo } from "@/lib/links-api";
 import { projectLinkDetail, projectLinkList, LinksPayloadError } from "@/lib/links-types";
-import { binding, forward, link, traffic } from "./links-fixtures";
+import { binding, forward, link, traffic, statistics } from "./links-fixtures";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; setActiveWorkspace(null); });
@@ -86,6 +86,74 @@ describe("real links API transport contract", () => {
     const projected = projectLinkDetail(raw, 5);
     expect(projected.status).toBe("degraded"); expect(projected.deployment!.status).toBe("policy_blocked");
     expect(projected.deployment!.placements[0].observation).toEqual({ state: "removed", ready: false, observed_generation: 4 });
+  });
+});
+
+describe("optional placement traffic status closed projection", () => {
+  function project(value: unknown) {
+    const raw = link(); const p = raw.deployment!.placements[0];
+    return projectLinkDetail({ ...raw, deployment: { ...raw.deployment, placements: [{ ...p,
+      observation: { state: "ready", ready: true, observed_generation: 4, traffic_status: value } }] } }, 5)
+      .deployment!.placements[0].observation!;
+  }
+  test("omitted status stays optional and null remains unknown", () => {
+    expect(project(undefined)).toEqual({ state: "ready", ready: true, observed_generation: 4 });
+    expect(project(null).traffic_status).toBeNull();
+    expect(project(statistics()).traffic_status).toEqual(statistics());
+  });
+  test("all states, actual zero and inclusive upper bounds retain values without affecting Ready", () => {
+    for (const state of ["idle", "collecting", "backlogged", "blocked"] as const) {
+      expect(project(statistics({ state }))).toEqual({ state: "ready", ready: true, observed_generation: 4, traffic_status: statistics({ state }) });
+    }
+    for (const status of [statistics({ rotation_supported: false, producer_count: 0, sample_count: 0, rule_count: 0, spool_bytes: 0, last_ack_at: null }),
+      statistics({ producer_count: 128, sample_count: 262144, rule_count: 262144, spool_bytes: 403701760 })]) {
+      expect(project(status).traffic_status).toEqual(status);
+    }
+  });
+  test("secret extras are dropped at every nested projection", () => {
+    const projected = project({ ...statistics(), credential: "never-visible", key: "never-visible", producer_id: "never-visible",
+      runner_config: { key: "never-visible" }, path: "never-visible", raw_process: "never-visible", ready: true });
+    expect(projected.traffic_status).toEqual(statistics()); expect(JSON.stringify(projected)).not.toContain("never-visible");
+  });
+  test("present but incomplete or non-object status is rejected", () => {
+    for (const value of [false, 0, "unknown", [], {}]) expect(() => project(value)).toThrow(LinksPayloadError);
+    for (const field of Object.keys(statistics())) {
+      const incomplete: Record<string, unknown> = { ...statistics() }; delete incomplete[field];
+      expect(() => project(incomplete)).toThrow(LinksPayloadError);
+    }
+  });
+  test("bounded integers, booleans and states are strict", () => {
+    for (const [field, max] of [["producer_count", 128], ["sample_count", 262144], ["rule_count", 262144], ["spool_bytes", 403701760]] as const) {
+      for (const value of [undefined, null, false, "0", -1, 0.5, max + 1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() => project({ ...statistics(), [field]: value })).toThrow(LinksPayloadError);
+      }
+    }
+    for (const value of [undefined, null, 0, 1, "true"]) {
+      expect(() => project({ ...statistics(), rotation_supported: value })).toThrow(LinksPayloadError);
+    }
+    for (const state of [undefined, null, 0, "ready", "Blocked", "blocked\n", "credential=secret"]) {
+      expect(() => project({ ...statistics(), state })).toThrow(LinksPayloadError);
+    }
+  });
+  test("ACK timestamps require real ISO instants with timezone or explicit null", () => {
+    for (const last_ack_at of [null, "2028-02-29T23:59:59Z", "2029-01-01T08:00:00.123+08:00", "2029-01-01T00:00:00.123456789-05:30"]) {
+      expect(project({ ...statistics(), last_ack_at }).traffic_status!.last_ack_at).toBe(last_ack_at);
+    }
+    for (const last_ack_at of [undefined, 0, true, "", "invalid", "2029-01-01", "2029-01-01T00:00:00",
+      "2029-02-29T00:00:00Z", "2029-02-30T00:00:00Z", "2029-04-31T00:00:00+08:00", "2029-13-01T00:00:00Z",
+      "2029-01-01T24:00:00Z", "2029-01-01T00:60:00Z", "2029-01-01T00:00:60Z", "2029-01-01T00:00:00+24:00",
+      "2029-01-01T00:00:00+08:60", "2029-01-01T00:00:00Z\n", "2029-01-01T00:00:00Z "]) {
+      expect(() => project({ ...statistics(), last_ack_at })).toThrow(LinksPayloadError);
+    }
+  });
+  test("successful detail HTTP responses still reject malformed statistics", async () => {
+    const raw = link(); raw.deployment!.placements[0].observation = { state: "failed", ready: false, observed_generation: 4, traffic_status: statistics() };
+    globalThis.fetch = (async () => Response.json({ data: raw })) as typeof fetch;
+    const detail = await linksApi.detail(5, 3);
+    expect(detail.deployment!.placements[0].observation!.ready).toBe(false);
+    expect(detail.deployment!.placements[0].observation!.traffic_status).toEqual(statistics());
+    raw.deployment!.placements[0].observation!.traffic_status!.spool_bytes = 403701761;
+    await expect(linksApi.detail(5, 3)).rejects.toThrow(LinksPayloadError);
   });
 });
 

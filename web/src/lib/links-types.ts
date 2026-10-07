@@ -18,7 +18,15 @@ export interface LinkPlacement {
   status: string; last_error_code: string | null; updated_at: string | null;
   observation?: LinkObservation | null;
 }
-export interface LinkObservation { state: string; ready: boolean | null; observed_generation: number | null }
+/** Capacity snapshot; a durable statistics ACK is independent of runtime Ready. */
+export interface LinkTrafficStatus {
+  rotation_supported: boolean; producer_count: number; sample_count: number; rule_count: number;
+  spool_bytes: number; last_ack_at: string | null; state: "idle" | "collecting" | "backlogged" | "blocked";
+}
+export interface LinkObservation {
+  state: string; ready: boolean | null; observed_generation: number | null;
+  traffic_status?: LinkTrafficStatus | null;
+}
 export interface LinkDeployment {
   generation: number; version?: number | null; status: string; lease_expires_at: string; placements: LinkPlacement[];
 }
@@ -80,12 +88,30 @@ function projectTraffic(value: unknown): LinkTraffic | null {
   return { bytes_in: counter(raw.bytes_in), bytes_out: counter(raw.bytes_out),
     connections: counter(raw.connections), last_received_at: trafficReceivedAt(raw.last_received_at) };
 }
+function projectTrafficStatus(value: unknown): LinkTrafficStatus | null {
+  if (value == null) return null;
+  const raw = object(value);
+  if (typeof raw.rotation_supported !== "boolean" || !["idle", "collecting", "backlogged", "blocked"].includes(text(raw.state))) {
+    throw new LinksPayloadError();
+  }
+  const bounded = (value: unknown, max: number) => {
+    const result = number(value);
+    if (result > max) throw new LinksPayloadError();
+    return result;
+  };
+  return { rotation_supported: raw.rotation_supported, producer_count: bounded(raw.producer_count, 128),
+    sample_count: bounded(raw.sample_count, 262144), rule_count: bounded(raw.rule_count, 262144),
+    spool_bytes: bounded(raw.spool_bytes, 403701760),
+    last_ack_at: raw.last_ack_at === null ? null : trafficReceivedAt(raw.last_ack_at),
+    state: raw.state as LinkTrafficStatus["state"] };
+}
 function projectObservation(value: unknown): LinkObservation | null {
   if (value == null) return null;
   const raw = object(value);
   if (raw.ready !== null && typeof raw.ready !== "boolean") throw new LinksPayloadError();
   return { state: text(raw.state), ready: raw.ready,
-    observed_generation: nullableNumber(raw.observed_generation) };
+    observed_generation: nullableNumber(raw.observed_generation),
+    ...(raw.traffic_status === undefined ? {} : { traffic_status: projectTrafficStatus(raw.traffic_status) }) };
 }
 function array(value: unknown): unknown[] {
   if (!Array.isArray(value)) throw new LinksPayloadError();

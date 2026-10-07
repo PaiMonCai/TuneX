@@ -75,8 +75,12 @@ Cache secrets and permanent tombstones are authenticated together with AES-GCM i
 state.enc.json. The random machine.key is independent of AUTH_SECRET. Missing keys
 with existing ciphertext, corrupt/foreign caches, symlinks and uncertain writes
 fail closed. Directories use 0700, files 0600. Windows uses atomic MoveFileEx and
-a KILL_ON_JOB_CLOSE child job; Linux uses rename/directory sync and parent-death
-kill. POSIX mode flags do not set Windows ACLs: provision the state directory for
+a KILL_ON_JOB_CLOSE child job; Windows creates the child suspended, binds the
+job, verifies its unique initial thread and only then resumes execution. Linux
+uses rename/directory sync and parent-death kill. A parent crash before Windows
+job attachment can leave a suspended, unexecuted process requiring service-account
+cleanup, but it cannot start listeners or write traffic. POSIX mode flags do not
+set Windows ACLs: provision the state directory for
 the Agent service account only. Link configs never enter legacy LKG.
 
 Runtime opt-in: `TUNEX_FXP_LINKS_ENABLED=true`; executable `TUNEX_FXP_BINARY`, default
@@ -126,6 +130,27 @@ runtime.go, link_test.go, manifest.go/test and Agent runtime.go.
 
 ## Durable ingress traffic collector
 
+F1 negotiates `-managed-traffic-capabilities` before starting children. Supported
+programs receive a private rotation control path; legacy programs keep the v1
+collector. v2 is an active accounting epoch and v3 its sealed immutable final
+snapshot. A durable encrypted PreparedFrom manifest precedes each request; the
+runner persists the empty successor before sealing old totals and redirecting
+new deltas under its counter mutex. The Agent verifies both snapshots before
+transferring the child's active producer. A whole exact committed ACK can then
+reclaim the predecessor without stopping the process or business sessions.
+
+An old accounting day, 1024 rule/day or rule mappings, or maximum epoch age
+triggers rotation. `TUNEX_FXP_TRAFFIC_EPOCH_SECONDS` is 30–86400 (default 86400).
+Current and candidate bindings are authorized before switching so rejected
+reloads and late reporter deltas have no blind spot. Missing empty preparation
+can be recovered after exit only before predecessor sealing; missing successor
+after sealing fails closed. Manifest format v2 intentionally prevents unsafe
+old-Agent downgrade. The database keeps historical checkpoints and deployments.
+
+Optional secret-free TrafficStatus reports retained capacity and last ACK from
+memory separately from Ready; it may become unknown after restart. Controls do
+not carry keys or credentials. Capability probes also exclude node/auth secrets.
+
 Collection is **disabled by default**. Call `EnableTraffic()` immediately after
 `New`, before the first `Apply` or `Restore`. Late opt-in returns
 `ErrTrafficStarted`. Existing fake/legacy process invocations remain unchanged
@@ -136,12 +161,16 @@ Managed traffic is supported only on Linux and Windows; other GOOS builds have
 an explicit fail-closed opener and `EnableTraffic` rejects the unsupported platform.
 
 Each fresh ingress process gets a cryptographically random 32-lowercase-hex
-producer ID and only these additional CLI arguments:
+producer ID and these additional CLI arguments:
 
 ```text
 -managed-traffic <private-absolute-stateDir/traffic/producer.snapshot.json>
 -managed-traffic-producer <producer>
 ```
+
+Negotiated programs also receive `-managed-traffic-rotation-v1` with a private
+control-file path. Each subsequent epoch gets a new random producer ID without
+restarting the ingress process.
 
 The destination is new, not pre-created by the Agent: FXP atomically creates its
 initial empty snapshot before starting listeners. `AUTH_SECRET` is always
@@ -152,17 +181,20 @@ also excluded, including for egress. The child receives no panel credentials.
 machine-key cache AEAD. Authentication binds the Agent ID and filename producer.
 Its secret-free contents bind producer to placement ID, node, workspace, link
 and ingress role, and map each actual authorized entry-group `ruleId` to its
-**first-known generation/config digest for that process**. TCP and UDP of a
+**first-known generation/config digest for that epoch**. TCP and UDP of a
 `both` rule share one forward ID. New mappings are synced before publishing a
 managed candidate config; a rejected proposal can conservatively retain its
-mapping. Existing/removed/re-added rule mappings are never rebased or evicted.
+mapping. Existing/removed/re-added rule mappings are never rebased or evicted
+within an epoch; a sealed, exactly acknowledged epoch is reclaimed as a whole.
 No runner JSON, transport key or network credential enters the traffic spool.
 
-FXP snapshots have exactly `version:1`, `producer_id`, and `samples`, containing
+FXP snapshots have exactly `version`, `producer_id`, and `samples`, containing
 `forward_id`, `date`, and decimal-string `bytes_in`, `bytes_out`, `connections`.
 Dates are FXP's Asia/Shanghai accounting dates; the collector does not re-bucket
-them. Totals are cumulative per process/rule/day across managed updates, not
-deltas. Counters and input+output totals must stay within `9007199254740991`.
+them. Version 1 is the legacy process-wide collector, version 2 is an active
+epoch, and version 3 is its sealed final snapshot. Totals are cumulative per
+producer/rule/day across managed updates, not deltas. Counters and input+output
+totals must stay within `9007199254740991`.
 The exported `TrafficSample` wire fields are exactly:
 
 ```text
@@ -194,19 +226,19 @@ reader to close; the existing atomic writer's bounded retry remains required.
 
 `AckTraffic` compares full metadata and all current persisted totals. It never
 removes an active producer, even when its snapshot is empty or its lease has
-expired but exit is unconfirmed. Only a stopped producer whose entire current
-snapshot is exactly covered by ACKs is reclaimed. Partial/stale ACKs retain data;
+expired but exit is unconfirmed. Only a stopped or sealed producer whose entire
+current snapshot is exactly covered by ACKs is reclaimed. Partial/stale ACKs retain data;
 repeated ACKs are idempotent. A durable exact-total deletion intent and ordered
 snapshot/manifest unlinks allow interrupted ACK cleanup to recover safely. A
 changed snapshot during that cleanup is an error, never permission to delete it.
-`AckTraffic(nil)` can reclaim stopped empty producers without a network request;
+`AckTraffic(nil)` can reclaim stopped or sealed empty producers without a network request;
 it retains all active producers and all nonzero/unacknowledged samples.
 
 The runtime owns the sole 10-second delivery loop, HTTP authentication and the
 shared **current** panel URL callback. Send a whole producer (at most 2048
 samples) per request and pass only acknowledged samples to `AckTraffic`. Call
 `AckTraffic(nil)` after successful flushes, including empty flushes, to reclaim
-stopped zero-traffic producers. There is deliberately no second delivery loop,
+stopped or sealed zero-traffic producers. There is deliberately no second delivery loop,
 reporter integration or HTTP client in linkrunner.
 
 Limits: 1 MiB per manifest/snapshot, 2048 samples and historical rule mappings
@@ -217,7 +249,8 @@ evicted to make room. Private directories are 0700 and files 0600; Windows
 service-account ACL provisioning is still required. Capacity, validation or
 uncertain persistence failures reject launch/update and stop traffic-enabled
 ingress children; data remains for explicit recovery. Missing snapshots are
-errors except during an already-authenticated ACK deletion. A failed launch
+errors except during an already-authenticated ACK deletion or recoverable empty
+epoch preparation described above. A failed launch
 before FXP initializes can leave a conservative manifest requiring operator
 inspection/recovery, rather than guessing that missing data was zero.
 
@@ -242,7 +275,8 @@ Collector files: `traffic.go`, `traffic_store.go`, `traffic_file_linux.go`,
 fallback), `platform_unsupported.go` (conservative native-build portability),
 lifecycle hooks in
 `manager.go`/`managed.go`/`process.go`, and `traffic_test.go`,
-`traffic_windows_test.go`, `traffic_real_test.go`.
+`traffic_windows_test.go`, `traffic_real_test.go`, `traffic_rotation.go`,
+`traffic_rotation_test.go` and `traffic_rotation_real_test.go`.
 The optional real-binary acceptance checks known BOTH TCP+UDP payloads while TCP
 remains open, rule deletion, active ACK retention, final snapshots, Close/reopen,
 Restore and producer replacement:

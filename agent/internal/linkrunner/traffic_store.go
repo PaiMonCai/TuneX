@@ -28,7 +28,15 @@ const (
 	trafficSnapshotSuffix = ".snapshot.json"
 )
 
-type trafficStore struct{ dir string }
+type trafficStore struct {
+	dir      string
+	rotation bool
+	epochAge time.Duration
+	stats    map[string]TrafficStatus
+	lastAck  map[string]time.Time
+	started  map[string]time.Time
+	blocked  bool
+}
 
 type trafficCounter struct {
 	ForwardID   int64  `json:"forward_id"`
@@ -53,16 +61,17 @@ type trafficRule struct {
 // No runner JSON, transport keys or node credentials are persisted here. Last
 // is a durable high-water checkpoint; Discard is a crash-safe exact-total ACK.
 type trafficManifest struct {
-	Version     int              `json:"version"`
-	ProducerID  string           `json:"producer_id"`
-	PlacementID string           `json:"placement_id"`
-	LinkID      int64            `json:"link_id"`
-	WorkspaceID int64            `json:"workspace_id"`
-	NodeID      int64            `json:"node_id"`
-	Role        string           `json:"role"`
-	Rules       []trafficRule    `json:"rules"`
-	Last        []trafficCounter `json:"last"`
-	Discard     bool             `json:"discard"`
+	Version      int              `json:"version"`
+	ProducerID   string           `json:"producer_id"`
+	PlacementID  string           `json:"placement_id"`
+	LinkID       int64            `json:"link_id"`
+	WorkspaceID  int64            `json:"workspace_id"`
+	NodeID       int64            `json:"node_id"`
+	Role         string           `json:"role"`
+	Rules        []trafficRule    `json:"rules"`
+	Last         []trafficCounter `json:"last"`
+	Discard      bool             `json:"discard"`
+	PreparedFrom string           `json:"prepared_from,omitempty"`
 }
 
 type trafficEnvelope struct {
@@ -351,7 +360,10 @@ func (m *Manager) readTrafficManifestLocked(producer string) (trafficManifest, e
 	if err != nil || decodeTrafficJSON(plain, &manifest) != nil {
 		return manifest, ErrTraffic
 	}
-	if manifest.Version != 1 || manifest.ProducerID != producer || !trafficHex(producer, 32) || manifest.Role != "ingress" || !safeTrafficInt(manifest.LinkID) || !safeTrafficInt(manifest.WorkspaceID) || !safeTrafficInt(manifest.NodeID) || len(manifest.Rules) == 0 || len(manifest.Rules) > maxTrafficSamples || manifest.Last == nil {
+	if (manifest.Version != 1 && manifest.Version != 2) || manifest.ProducerID != producer || !trafficHex(producer, 32) || manifest.Role != "ingress" || !safeTrafficInt(manifest.LinkID) || !safeTrafficInt(manifest.WorkspaceID) || !safeTrafficInt(manifest.NodeID) || len(manifest.Rules) == 0 || len(manifest.Rules) > maxTrafficSamples || manifest.Last == nil {
+		return manifest, ErrTraffic
+	}
+	if manifest.PreparedFrom != "" && (manifest.Version != 2 || !trafficHex(manifest.PreparedFrom, 32) || manifest.PreparedFrom == producer || len(manifest.Last) != 0 || manifest.Discard) {
 		return manifest, ErrTraffic
 	}
 	r, exists := m.records[manifest.PlacementID]
@@ -387,11 +399,15 @@ func (m *Manager) scanTrafficLocked() ([]trafficProducer, error) {
 			producers = append(producers, trafficProducer{manifest: manifest})
 			continue
 		}
+		if errors.Is(err, os.ErrNotExist) && manifest.PreparedFrom != "" && !m.trafficActiveLocked(id) {
+			producers = append(producers, trafficProducer{manifest: manifest})
+			continue
+		}
 		if err != nil {
 			return nil, ErrTraffic
 		}
 		var snapshot trafficSnapshot
-		if decodeTrafficJSON(data, &snapshot) != nil || snapshot.Version != 1 || snapshot.ProducerID != id || snapshot.Samples == nil {
+		if decodeTrafficJSON(data, &snapshot) != nil || !trafficSnapshotVersion(manifest.Version, snapshot.Version) || snapshot.ProducerID != id || snapshot.Samples == nil {
 			return nil, ErrTraffic
 		}
 		rules := make(map[int64]bool, len(manifest.Rules))
@@ -416,9 +432,21 @@ func (m *Manager) scanTrafficLocked() ([]trafficProducer, error) {
 		}
 		producers = append(producers, trafficProducer{manifest, snapshot})
 	}
+	if err := m.validatePreparedTrafficLocked(producers); err != nil {
+		return nil, err
+	}
 	// Validate the entire inventory before checkpointing or recovering any ACK.
 	result := make([]trafficProducer, 0, len(producers))
 	for _, p := range producers {
+		if p.manifest.PreparedFrom != "" {
+			p.manifest.PreparedFrom = ""
+			if p.snapshot.Version == 0 {
+				p.manifest.Discard = true
+			}
+			if err := m.writeTrafficManifestLocked(p.manifest); err != nil {
+				return nil, err
+			}
+		}
 		if p.manifest.Discard {
 			if err := m.finishTrafficDeletionLocked(p.manifest.ProducerID); err != nil {
 				return nil, err
@@ -433,6 +461,7 @@ func (m *Manager) scanTrafficLocked() ([]trafficProducer, error) {
 		}
 		result = append(result, p)
 	}
+	m.updateTrafficStatsLocked(result)
 	return result, nil
 }
 
@@ -451,7 +480,7 @@ func (m *Manager) finishTrafficDeletionLocked(producer string) error {
 		for _, rule := range manifest.Rules {
 			rules[rule.ForwardID] = true
 		}
-		if decodeTrafficJSON(data, &snapshot) != nil || snapshot.Version != 1 || snapshot.ProducerID != producer || snapshot.Samples == nil || validateTrafficCounters(snapshot.Samples, rules) != nil || !reflect.DeepEqual(snapshot.Samples, manifest.Last) {
+		if decodeTrafficJSON(data, &snapshot) != nil || !trafficSnapshotVersion(manifest.Version, snapshot.Version) || snapshot.ProducerID != producer || snapshot.Samples == nil || validateTrafficCounters(snapshot.Samples, rules) != nil || !reflect.DeepEqual(snapshot.Samples, manifest.Last) {
 			return ErrTraffic
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {

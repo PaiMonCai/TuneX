@@ -2,7 +2,7 @@
 
 import { Button } from "@/components/ui/button";
 import { Badge, Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { LinkDetail, LinkForward, LinkForwardAction } from "@/lib/links-types";
+import type { LinkDetail, LinkForward, LinkForwardAction, LinkPlacement } from "@/lib/links-types";
 import type { LinksCopy } from "./links-copy";
 import { canEditLinkEndpoints, canRetireLink, linkStatusLabel, placementState, placementAckState } from "./link-state";
 import { LinkErrorDetails } from "./link-error-details";
@@ -50,6 +50,7 @@ export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, on
               <p>{copy.appliedAck}: {placementAckState(link, p) === "passive" ? copy.passiveDesired : linkStatusLabel(placementAckState(link, p), copy)}</p>
               <p>{copy.runtimeState}: <Badge variant={["error", "failed", "mismatch", "expired"].includes(state) ? "destructive" : "outline"}>{state === "passive" ? copy.passiveLive : label}</Badge></p>
               <p>{copy.desired}: {p.generation} · {copy.applied}: {p.applied_generation ?? copy.notApplied}</p>
+              <PlacementStatistics link={link} placement={p} copy={copy} now={now} />
               {placementAckState(link, p) === "passive" && <p className="text-[var(--muted-foreground)]">{copy.passiveHint}</p>}
               {p.last_error_code && <LinkErrorDetails codes={[safeCode(p.last_error_code)]} copy={copy} />}
             </div>;
@@ -107,6 +108,42 @@ export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, on
       </CardContent>
     </Card>
   </div>;
+}
+function PlacementStatistics({ link, placement, copy, now }: {
+  link: LinkDetail; placement: LinkPlacement; copy: LinksCopy; now: number;
+}) {
+  const observation = placement.observation;
+  const expiry = Date.parse(link.deployment?.lease_expires_at ?? "");
+  // Preserve the backend's identity/freshness fence even when older UI data is
+  // still visible after a lease expires or the desired generation changes.
+  const current = Number.isFinite(now) && Number.isFinite(expiry) && expiry > now &&
+    !["retired", "retiring"].includes(link.status) && link.deployment?.generation === link.generation &&
+    placement.generation === link.generation && observation != null &&
+    (observation.observed_generation === link.generation || (observation.observed_generation === 0 && observation.ready === false)) &&
+    (["ready", "rolled_back", "updating", "failed", "passive", "cached", "closed", "exited", "removed"].includes(observation.state) ||
+      (observation.state === "mismatch" && observation.observed_generation === 0 && observation.ready === false));
+  const status = current ? observation?.traffic_status : null;
+  const labels = { idle: copy.statisticsIdle, collecting: copy.statisticsCollecting,
+    backlogged: copy.statisticsBacklogged, blocked: copy.statisticsBlocked };
+  return <section aria-label={copy.statisticsState} className="space-y-2 border-t border-[var(--border)] pt-2">
+    <dl className="grid gap-3 sm:grid-cols-2">
+      <Fact label={copy.statisticsState} value={status ? labels[status.state] : copy.statisticsUnknown} />
+      <Fact label={copy.statisticsLastAck} value={status ? status.last_ack_at ?? copy.statisticsNoAck : copy.unknown} />
+    </dl>
+    <p className="text-[var(--muted-foreground)]">{copy.statisticsAckHint}</p>
+    {status?.state === "backlogged" && <p role="status">{copy.statisticsBacklogHint}</p>}
+    {status?.state === "blocked" && <p role="status" className="text-[var(--destructive)]">{copy.statisticsBlockedHint}</p>}
+    <details className="text-[var(--muted-foreground)]">
+      <summary className="cursor-pointer">{copy.statisticsDetails}</summary>
+      <dl className="mt-2 grid gap-3 sm:grid-cols-2">
+        <Fact label={copy.statisticsRotation} value={status ? status.rotation_supported ? copy.statisticsSupported : copy.statisticsUnsupported : copy.unknown} />
+        <Fact label={copy.statisticsProducers} value={status ? String(status.producer_count) : copy.unknown} />
+        <Fact label={copy.statisticsSamples} value={status ? String(status.sample_count) : copy.unknown} />
+        <Fact label={copy.statisticsRules} value={status ? String(status.rule_count) : copy.unknown} />
+        <Fact label={copy.statisticsSpool} value={status ? String(status.spool_bytes) : copy.unknown} />
+      </dl>
+    </details>
+  </section>;
 }
 function ForwardTraffic({ traffic, copy, now }: { traffic: LinkForward["traffic"]; copy: LinksCopy; now: number }) {
   const received = Date.parse(traffic?.last_received_at ?? "");

@@ -143,6 +143,7 @@ services:
   ingress-agent:
     environment:
       TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
+      TUNEX_FXP_TRAFFIC_EPOCH_SECONDS: ${TUNEX_FXP_TRAFFIC_EPOCH_SECONDS:-86400}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-ingress-agent
     restart: unless-stopped
@@ -184,6 +185,7 @@ services:
   egress-agent:
     environment:
       TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
+      TUNEX_FXP_TRAFFIC_EPOCH_SECONDS: ${TUNEX_FXP_TRAFFIC_EPOCH_SECONDS:-86400}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-egress-agent
     restart: unless-stopped
@@ -223,6 +225,7 @@ services:
   ingress-agent-b:
     environment:
       TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
+      TUNEX_FXP_TRAFFIC_EPOCH_SECONDS: ${TUNEX_FXP_TRAFFIC_EPOCH_SECONDS:-86400}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-ingress-agent-b
     restart: unless-stopped
@@ -263,6 +266,7 @@ services:
   egress-agent-b:
     environment:
       TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
+      TUNEX_FXP_TRAFFIC_EPOCH_SECONDS: ${TUNEX_FXP_TRAFFIC_EPOCH_SECONDS:-86400}
     image: ${TUNEX_IT_AGENT_IMAGE:?required}
     container_name: tunex-it-egress-agent-b
     restart: unless-stopped
