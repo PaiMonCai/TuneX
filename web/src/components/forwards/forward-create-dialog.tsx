@@ -110,9 +110,9 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
       <div className="flex flex-col gap-4">
         <section data-testid="forward-create-basic" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
           <div>
-            <div className="text-sm font-medium">{t("forward.basicInfo")}</div>
+            <div className="text-sm font-medium">{t("forward.createBasicInfo")}</div>
             <div className="mt-0.5 text-xs text-[var(--muted-foreground)]">
-              {t("forward.pathMode")}: {draft.mode === "relay" ? t("forward.relay") : t("forward.direct")}
+              {t("forward.createPathMode")}: {draft.mode === "relay" ? t("forward.relay") : t("forward.direct")}
             </div>
           </div>
           <Field label={t("common.name")}><Input value={draft.name} onChange={(e) => patch({ name: e.target.value })} placeholder="web-hk" /></Field>
@@ -135,7 +135,7 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
 
         <section data-testid="forward-create-path" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
           <div>
-            <div className="text-sm font-medium">{t("forward.networkPath")}</div>
+            <div className="text-sm font-medium">{t("forward.createNetworkPath")}</div>
             <div className="mt-0.5 text-xs text-[var(--muted-foreground)]">
               {draft.mode === "relay" ? t("forward.relayDesc") : t("forward.directDesc")}
             </div>
@@ -179,12 +179,12 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
 
           <ForwardPathPreview model={pathPreview} locale={locale} />
           <p className="text-xs text-[var(--muted-foreground)]" data-testid="forward-routing-policy-note">
-            {t("forward.routingPolicyNote")}
+            {t("forward.createRoutingPolicyNote")}
           </p>
         </section>
 
         <section data-testid="forward-create-target" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
-          <div className="text-sm font-medium">{t("forward.targetSection")}</div>
+          <div className="text-sm font-medium">{t("forward.createTargetSection")}</div>
           <Field label={t("forward.targetHost")}><Input value={draft.targetHost} onChange={(e) => patch({ targetHost: e.target.value })} placeholder="example.com" /></Field>
           <Field label={t("forward.targetPort")}><Input inputMode="numeric" value={draft.targetPort} onChange={(e) => patch({ targetPort: e.target.value })} placeholder="443" /></Field>
         </section>
