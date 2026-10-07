@@ -323,16 +323,14 @@ describe("对话框集成冒烟（挂载路径不炸 + 模型算得出来）", (
         }}
         ingressNodes={[node(), node({ id: 2, node_id: "jp-out-01", connect_ip: "10.0.0.21", role: "egress" })]}
         selectedBindings={over.bindings ?? []}
-        availableEgressNodes={[]}
+        egressNodes={[node({ id: 2, node_id: "jp-out-01", connect_ip: "10.0.0.21", role: "egress" })]}
         canManageNodes
-        bindingBusy={false}
         busy={false}
         locale="zh"
         t={(key) => String(key)}
         text={(key) => String(key)}
         onOpenChange={() => {}}
         onDraftChange={() => {}}
-        onBindEgress={() => {}}
         onCreate={() => {}}
         bindingsUnavailable={over.bindingsUnavailable ?? false}
       />,
