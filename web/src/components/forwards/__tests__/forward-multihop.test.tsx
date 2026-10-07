@@ -472,7 +472,7 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
   test("en 文案无中文，且三态都有话可说", () => {
     const html = section({ locale: "en" });
     expect(html).not.toMatch(/[\u4e00-\u9fff]/);
-    expect(html).toContain("Middle hop");
+    expect(html).toContain("Middle node");
     expect(html).not.toContain("healthy");
   });
 });
