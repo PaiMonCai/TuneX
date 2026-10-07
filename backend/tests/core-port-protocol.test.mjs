@@ -172,7 +172,8 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         assert.equal(rows.length, 1);
         const winner = outcomes.findIndex((outcome) => outcome.ok);
         // Submission order does not determine the winner of real MySQL locks.
-        assert.equal(rows[0].protocol, protocols[winner]);
+        // TLS/WS are business fronts over the same physical TCP namespace.
+        assert.equal(rows[0].protocol, protocols[winner] === "udp" ? "udp" : "tcp");
         assert.equal(rows[0].tunnel_id, f.owners[winner].id);
       }
     });

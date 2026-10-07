@@ -1014,7 +1014,9 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         },
       });
       created.extraNodeIds.push(bare.id);
-      assert.deepEqual(await buildDesiredNodeSnapshot(bare.id), { version: "tunex-v3", tunnels: [], skipped: [] });
+      assert.deepEqual(await buildDesiredNodeSnapshot(bare.id), {
+        version: "tunex-v3", node_db_id: bare.id, links: [], tunnels: [], skipped: [],
+      });
       // 本文件里前面的用例可能已经留下活跃联邦腿，所以这里按**增量**断言，而不是裸的 0/1。
       const before = await buildDesiredNodeSnapshot(node.id);
 

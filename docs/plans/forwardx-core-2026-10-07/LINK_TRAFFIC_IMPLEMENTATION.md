@@ -59,4 +59,10 @@ Link 详情显示双向累计 payload 字节、累计已接纳连接/UDP 映射�
 | Agent 核心回归 + Go vet + Linux amd64 构建 | 六个核心包全部通过，含真实 FXP；Windows 原子替换通过 no-follow/共享删除句柄修复，未下调安全校验；非 Linux/Windows 的 FXP 统计保守拒绝 |
 | Linux MySQL、镜像、多 Agent | 本机未运行；PR CI 必须实际通过 |
 
+### 第二轮 CI：已实证与剩余失败
+
+统计切片已提交推送 `777a94b`。CI `37636876875` 的真实四 Agent、Panel/Worker、MySQL/Redis 拓扑已通过 **35 项 / 0 失败**：包含共享 TCP 会话和 UDP 目标 socket 保留、载荷记账、同日增量、旧样本重复去重、删除历史保留、端口复用、重启恢复和新 producer 增量。Linux Agent 全量测试/vet/build、web 全量测试/build、ops 与秘密扫描也通过；backend 全量 unit/contract、迁移和类型检查通过。
+
+整体 `required` 仍失败，原因是 backend 数据库集成的四项：三项旧 fixture 与协议/快照/能力广告新契约不匹配；一项新独立数据库并发统计事务未全部提交，尚需记录闭集 ORM/SQL 错误码并定位，不能把多 Agent 顺序统计通过当成并发账本通过。下一步不降低这些门禁或放开实验矩阵。
+
 下一优先级：修复并重跑首版失败门禁 → 完成统计链路的 Linux 验收与长期 spool 裁剪 → 可信客户端来源透传/IP_HASH 和 FXP 多目标主备。复杂拓扑、运营和支付不抢占这些核心验收。

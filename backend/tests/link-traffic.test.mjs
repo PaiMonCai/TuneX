@@ -20,7 +20,21 @@ if (!enabled) {
   const { PrismaClient } = await import("@prisma/client");
   const { createPrismaLinkTrafficStore, submitLinkTraffic } = await import("../src/services/link-traffic.ts");
   const client = new PrismaClient({ datasources: { db: { url: url.href } }, log: [] });
-  const store = createPrismaLinkTrafficStore(client);
+  const realStore = createPrismaLinkTrafficStore(client);
+  // Report only closed error classifications, never ORM messages, SQL input
+  // or credentials. A generic 503 alone cannot diagnose a real locking race.
+  const storageErrors = [];
+  const store = { async transaction(work) {
+    try { return await realStore.transaction(work); }
+    catch (error) {
+      const knownNames = ["PrismaClientKnownRequestError", "PrismaClientUnknownRequestError",
+        "PrismaClientValidationError", "PrismaClientInitializationError", "TypeError", "Error"];
+      storageErrors.push({ type: knownNames.includes(error?.name) ? error.name : "Error",
+        orm_code: /^P[0-9]{4}$/.test(error?.code ?? "") ? error.code : null,
+        sql_code: /^[0-9]{1,5}$/.test(String(error?.meta?.code ?? "")) ? String(error.meta.code) : null });
+      throw error;
+    }
+  } };
   const workspaceId = randomInt(1_000_000_000, 1_100_000_000);
   const nodeId = randomInt(1_100_000_000, 1_200_000_000);
   const forwardIds = [randomInt(1_200_000_000, 1_300_000_000), randomInt(1_300_000_000, 1_400_000_000)];
@@ -66,7 +80,10 @@ if (!enabled) {
       return send(n % 2 ? batch.reverse() : batch);
     });
     const results = await Promise.all(requests);
-    assert.ok(results.every((result) => result.ok), "concurrent transactions should all commit");
+    assert.ok(results.every((result) => result.ok), "concurrent transactions should all commit: "
+      + JSON.stringify({ accepted: results.filter((result) => result.ok).length,
+        rejected: results.filter((result) => !result.ok).map((result) => ({ status: result.status, reason: result.reason })),
+        storage_errors: storageErrors }));
     const rows = await client.linkTrafficCheckpoint.findMany({ where: { node_id: nodeId } });
     assert.equal(rows.length, 4);
     for (const row of rows) assert.deepEqual([row.bytes_in, row.bytes_out, row.connections], [90n, 180n, 9n]);
