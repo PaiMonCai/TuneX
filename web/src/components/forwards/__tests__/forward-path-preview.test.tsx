@@ -201,7 +201,7 @@ describe("出口关系三态：取不到 ≠ 没有可用出口", () => {
     const html = render(noneModel());
     const text = visibleText(html);
     expect(html).toContain('data-testid="forward-path-bindings-none"');
-    expect(text).toContain("还没有可用出口");
+    expect(text).toContain("目前没有已准备的出口关系");
     expect(text).toContain("3 台候选出口");
     expect(html).not.toContain('data-testid="forward-path-bindings-unavailable"');
   });
@@ -221,7 +221,7 @@ describe("出口关系三态：取不到 ≠ 没有可用出口", () => {
     const withoutNegation = text.replace(/这不等于「没有可用出口」/g, "").replace(/这不等于/g, "");
     expect(withoutNegation).not.toContain("没有可用出口");
     // 也不许退化成"确实没有可用出口"那句话（那是另一态）。
-    expect(text).not.toContain("还没有可用出口");
+    expect(text).not.toContain("目前没有已准备的出口关系");
     expect(html).not.toContain('data-testid="forward-path-bindings-none"');
   });
 
@@ -323,16 +323,14 @@ describe("对话框集成冒烟（挂载路径不炸 + 模型算得出来）", (
         }}
         ingressNodes={[node(), node({ id: 2, node_id: "jp-out-01", connect_ip: "10.0.0.21", role: "egress" })]}
         selectedBindings={over.bindings ?? []}
-        availableEgressNodes={[]}
+        egressNodes={[node({ id: 2, node_id: "jp-out-01", connect_ip: "10.0.0.21", role: "egress" })]}
         canManageNodes
-        bindingBusy={false}
         busy={false}
         locale="zh"
         t={(key) => String(key)}
         text={(key) => String(key)}
         onOpenChange={() => {}}
         onDraftChange={() => {}}
-        onBindEgress={() => {}}
         onCreate={() => {}}
         bindingsUnavailable={over.bindingsUnavailable ?? false}
       />,

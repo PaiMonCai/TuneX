@@ -72,6 +72,11 @@ import {
   missingHopAddresses,
   type HopAddressCandidate,
 } from "./node-address.ts";
+import {
+  ensureForwardPathRelations,
+  requiredForwardPathRelations,
+  type ForwardPathRelation,
+} from "./forward-path-setup.ts";
 export type { ForwardMode, ForwardProtocol } from "./forward-contract.ts";
 import { billingDayKeyStamp } from "./billing-time.ts";
 import { dayKeyOf, fillDays } from "./traffic.ts";
@@ -99,8 +104,8 @@ export interface ForwardCreateInput {
   ingress_node_id: number;
   egress_node_id?: number | null;
   /**
-   * V5.4：三跳路由的中间跳（省略 = 单跳）。给了它就意味着入口 → 中间 → 出口，
-   * 且相邻两段都必须已有 NodeBinding（校验在创建/更新路径上统一做）。
+   * V5.4：三跳路由的中间跳（省略 = 单跳）。给了它就意味着入口 → 中间 → 出口。
+   * 创建 Forward 时缺失的本地路径关系可以在节点管理权限允许时原子补齐。
    */
   middle_node_id?: number | null;
   listen_port?: number | null;
@@ -114,6 +119,14 @@ export interface ForwardCreateInput {
    * `validateForwardCandidate` 的互斥判定）。
    */
   federated_egress_peer?: string | null;
+}
+
+export interface ForwardCreateOptions {
+  /**
+   * Missing local NodeBinding rows may be prepared as part of Forward creation
+   * only when the caller already has node-management permission.
+   */
+  canManageNodes?: boolean;
 }
 
 export interface ForwardListInput {
@@ -671,6 +684,7 @@ export async function createForward(
   userId: number,
   workspaceId: number,
   input: ForwardCreateInput,
+  options: ForwardCreateOptions = {},
 ): Promise<ForwardServiceResult<ReturnType<typeof forwardView>>> {
   const protocol = normalizeForwardProtocol(input.protocol);
   if (protocol === null) {
@@ -699,31 +713,36 @@ export async function createForward(
   }
 
   const egressId = input.egress_node_id ?? null;
+  const middleId = input.middle_node_id ?? null;
   // 出口腿"在哪一侧"是这次创建的一部分。声明了 peer 时本机没有出口
-  // 节点，这不是"缺出口"，而是"出口在另一侧"（互斥判定在 validateForwardCandidate）。
+  // 节点，这不是"缺出口"，而是"出口在另一侧"。
   const federatedPeer = normalizeFederatedEgressPeer(input.federated_egress_peer);
   if (federatedPeer !== null && input.mode !== "relay") {
     return error(400, "invalid_input", "只有 RELAY 转发才有独立的出口跳，DIRECT 不能声明远端出口");
   }
-  if (federatedPeer !== null) {
-    // 声明必须**当场**成立（存在 + trusted + 联邦已开启）：否则会出现一条"保存成功、
-    // 每次都失败在远端"的 Forward，而用户只看到一次 201。失败给契约 §6 的错误码，
-    // 不压成 500 —— 用户/管理员据此知道下一步是去 Admin Console 建信任。
-    const declared = await validateFederatedEgressDeclaration(federatedPeer);
-    if (!declared.ok) {
-      return error(409, declared.code, `远端出口腿不可用：${declared.message}`);
-    }
-  }
   if (input.mode === "direct" && egressId !== null) {
     return error(400, "invalid_input", "DIRECT 转发不能指定出口节点");
+  }
+  if (input.mode === "direct" && middleId !== null) {
+    return error(400, "invalid_input", "DIRECT 转发不能指定中间节点");
   }
   if (input.mode === "relay" && egressId === null && federatedPeer === null) {
     return error(400, "invalid_input", "RELAY 转发必须指定出口节点");
   }
-  // 互斥：两处同时声明出口时，运行期没人知道该信哪个（本地会去分端口、远端也会去
-  // 租一条腿，而它们代表同一跳）。
+  // 本地中间节点的下一跳必须是本地出口节点；远端出口腿没有本地 NodeBinding 可表达
+  // middle → remote-peer 这段，因此当前契约明确拒绝，而不是静默忽略 middle。
+  if (federatedPeer !== null && middleId !== null) {
+    return error(400, "invalid_input", "远端出口暂不支持本地中间节点");
+  }
+  // 互斥：两处同时声明出口时，运行期没人知道该信哪个。
   if (federatedPeer !== null && egressId !== null) {
     return error(400, "invalid_input", "远端出口 peer 与本机出口节点互斥：出口腿只能在一侧");
+  }
+  if (federatedPeer !== null) {
+    const declared = await validateFederatedEgressDeclaration(federatedPeer);
+    if (!declared.ok) {
+      return error(409, declared.code, `远端出口腿不可用：${declared.message}`);
+    }
   }
 
   const ingress = await loadWorkspaceNode(input.ingress_node_id, workspaceId);
@@ -731,8 +750,6 @@ export async function createForward(
   if (ingress.role !== "ingress" && ingress.role !== "both") {
     return error(409, "conflict", "该节点不具备入口能力");
   }
-  // §13.4.2：active 才接受新业务。role 判定回答「有没有能力」，这里回答
-  // 「现在允不允许接」——二者正交，一个 ingress 节点可以正处于 maintenance。
   const ingressAdmission = nodeAdmissionError(ingress);
   if (ingressAdmission) {
     return error(409, ingressAdmission.code, ingressAdmission.message, {
@@ -752,8 +769,6 @@ export async function createForward(
     return error(409, "conflict", "选择的节点不具备出口能力");
   }
   if (egress) {
-    // §13.4.2：出口节点同样必须过准入（maintenance/disabled/retiring/waiting
-    // 都不接受新业务）。不能只判入口——RELAY 的两端都是新 runtime 的落点。
     const egressAdmission = nodeAdmissionError(egress);
     if (egressAdmission) {
       return error(409, egressAdmission.code, egressAdmission.message, {
@@ -762,66 +777,56 @@ export async function createForward(
     }
   }
 
-  if (egress) {
-    // V5.4：三跳路由的两段邻接是 (入口→中间) 与 (中间→出口)，而 (入口→出口) 那条
-    // **不被使用** —— 只查后者会让三跳路由在没有许可的情况下被创建出来，然后在下发时才炸。
-    const middleId = input.middle_node_id ?? null;
-    if (middleId != null) {
-      const pairs = await db.nodeBinding.findMany({
-        where: {
-          OR: [
-            { ingress_node_id: ingress.id, egress_node_id: middleId },
-            { ingress_node_id: middleId, egress_node_id: egress.id },
-          ],
-        },
-        select: { ingress_node_id: true, egress_node_id: true },
-      });
-      const ok1 = pairs.some((b) => b.ingress_node_id === ingress.id && b.egress_node_id === middleId);
-      const ok2 = pairs.some((b) => b.ingress_node_id === middleId && b.egress_node_id === egress.id);
-      if (!ok1 || !ok2) {
-        return error(409, "binding_required", "三跳路由要求入口→中间、中间→出口两段都已绑定");
-      }
-    } else {
-      const binding = await db.nodeBinding.findUnique({
-        where: {
-          ingress_node_id_egress_node_id: {
-            ingress_node_id: ingress.id,
-            egress_node_id: egress.id,
-          },
-        },
-        select: { id: true },
-      });
-      if (!binding) {
-        return error(409, "binding_required", "该出口尚未绑定到当前入口节点");
-      }
+  let middle: Awaited<ReturnType<typeof loadWorkspaceNode>> = null;
+  if (middleId !== null) {
+    if (!egress) {
+      return error(400, "invalid_input", "中间节点只能用于本地出口的自定义路径");
     }
+    middle = await loadWorkspaceNode(middleId, workspaceId);
+    if (!middle) return error(404, "not_found", "中间节点不存在");
+    if (middle.id === ingress.id || middle.id === egress.id) {
+      return error(409, "conflict", "入口、中间、出口必须是三台不同节点");
+    }
+    // 中间节点既是第一段的目标，又是第二段的来源，因此必须同时具备两种能力。
+    if (middle.role !== "both") {
+      return error(409, "conflict", "中间节点必须同时具备入口与出口能力");
+    }
+    const middleAdmission = nodeAdmissionError(middle);
+    if (middleAdmission) {
+      return error(409, middleAdmission.code, middleAdmission.message, {
+        data: middleAdmission.data,
+      });
+    }
+  }
 
+  const pathRelations: ForwardPathRelation[] = requiredForwardPathRelations({
+    mode: input.mode,
+    ingress_node_id: ingress.id,
+    egress_node_id: egress?.id ?? null,
+    middle_node_id: middle?.id ?? null,
+    federated_egress_peer: federatedPeer,
+  });
+
+  if (egress) {
     /**
-     * 每一跳都必须有**可拨号地址**（`connect_ip`）——在下发前就说清，而不是让用户拿到
-     * `502 apply_failed / invariant_violated`。
-     *
-     * 背景：RELAY 的入口腿要拨下一跳的 `host:port`（`upstream.next_hop`），地址的唯一来源是
-     * 那一跳节点的 `connect_ip`。没有地址时计划自检失败，最终以 `invariant_violated` 结束 ——
-     * 那条文案既没说是哪台机器，也没说该怎么办。这里把判定提前到创建路径，给出**可操作**的
-     * 错误码与文案（哪台节点 / 缺什么 / 去哪补）。
-     *
-     * 为什么放在绑定校验之后：绑定缺失是"还差一步绑定"（更靠前的先决条件），
-     * 地址缺失是"绑好了也拨不通"，顺序与用户修复顺序一致。
-     *
-     * 为什么**不**从上报里学地址：节点上报里没有任何"我自己可以被拨的地址"字段
-     * （`node_state_report` 只有版本/角色/revision/tunnels/used_ports/egress_pools/
-     * last_error 与主机指标，没有自我地址线索），而 `connect_ip` 是**运维声明的可拨号身份**
-     * （NAT/公网入口无法从容器内部观测得到）。因此这里只做"缺就说清"，不猜。
+     * 每一跳都必须有可拨号地址（connect_ip）。路径关系可以由创建事务安全补齐，
+     * 但地址不能猜：它是运维声明的可拨号身份。
      */
     const hopNodes: HopAddressCandidate[] = [];
-    if (middleId != null) {
-      const middle = await loadWorkspaceNode(middleId, workspaceId);
-      if (!middle) return error(404, "not_found", "中间跳节点不存在");
-      hopNodes.push({ id: middle.id, name: middle.node_id, position: "中间跳", connectIp: middle.connect_ip });
+    if (middle) {
+      hopNodes.push({
+        id: middle.id,
+        name: middle.node_id,
+        position: "中间跳",
+        connectIp: middle.connect_ip,
+      });
     }
-    hopNodes.push({ id: egress.id, name: egress.node_id, position: "出口跳", connectIp: egress.connect_ip });
-    // 判据与文案都来自 `services/node-address.ts`：PATCH 入口与创建入口必须用同一份，
-    // 否则会出现"补得进去但创建仍然拒绝"（或反之）的漂移。
+    hopNodes.push({
+      id: egress.id,
+      name: egress.node_id,
+      position: "出口跳",
+      connectIp: egress.connect_ip,
+    });
     const addresslessHops = missingHopAddresses(hopNodes);
     if (addresslessHops.length > 0) {
       return error(409, "hop_address_missing", hopAddressMissingMessage(addresslessHops), {
@@ -868,6 +873,18 @@ export async function createForward(
           select: { id: true },
         });
         if (conflict) return { conflict: true } as const;
+      }
+
+      // Path setup is part of the same transaction as the Forward row. Existing
+      // relations are always reusable; missing ones are created only when the
+      // actor already has node-management permission.
+      const pathSetup = await ensureForwardPathRelations(
+        tx,
+        pathRelations,
+        options.canManageNodes === true,
+      );
+      if (!pathSetup.ok) {
+        return { pathSetupDenied: pathSetup } as const;
       }
 
       const tunnel = await tx.tunnel.create({
@@ -966,6 +983,24 @@ export async function createForward(
   }
   if ("conflict" in reserved) {
     return error(409, "port_conflict", "该入口端口已被占用");
+  }
+  if ("pathSetupDenied" in reserved && reserved.pathSetupDenied) {
+    const missing = reserved.pathSetupDenied.missing;
+    return error(
+      403,
+      "path_setup_permission_required",
+      "所选路径需要建立节点关系，但当前角色没有节点管理权限",
+      {
+        error_layer: "rbac",
+        data: {
+          missing_relations: missing.map((relation) => ({
+            from_node_id: relation.from_node_id,
+            to_node_id: relation.to_node_id,
+            segment: relation.segment,
+          })),
+        },
+      },
+    );
   }
 
   const tunnelId =

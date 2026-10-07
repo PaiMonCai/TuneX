@@ -4,23 +4,17 @@
  *
  * ── 事实基础（都读过并核对过后端源码，不是推断）──
  *
- *  1. **服务端在创建时判的就是"两段绑定是否都已存在"**：`forward-service.ts:764-783`
- *     —— 三跳用到的两条邻接是 (入口→中间) 与 (中间→出口)，缺任何一段即 409
- *     `binding_required`（`(入口→出口)` 那条**不被使用**）。它**只查绑定存在性，不查角色**。
- *  2. **角色检查在"绑定创建"处**（`routes/nodes.ts:378-383`）：同一条路由同时要求
- *     **源** ∈ {ingress, both} 且 **目标** ∈ {egress, both}。于是：
- *       · 第一段 `入口→中间`：中间是**目标** ⇒ 需 `egress|both`；
- *       · 第二段 `中间→出口`：中间是**源** ⇒ 需 `ingress|both`；
- *       · ⇒ 通过 API 能**同时建成两段**的只有 `role === "both"`（Lead 已采纳此结论）。
- *     绑定写入还需 `node:manage`（`nodes.ts:50-53`）。
- *  3. 因此本模型的口径是：**可用性 = 服务端真实判据（两段都在）**；只有缺段时才看角色——
- *     能补建才给"去绑定"的下一步，不能补建就进"不可选 + 原因"，绝不把用户引到一个撞 409 的死路。
- *  4. **DIRECT 绝不携带 `middle_node_id`**：后端 create 路径只在 `if (egress)` 里校验两段
- *     （`forward-service.ts:761`），DIRECT 的 `middle_node_id` 会被**静默落库且永不使用**
- *     —— 那是后端目前的一处缺口，前端不踩它（{@link multihopCreateFields} 里 fail-closed）。
+ *  1. 三节点路径只使用两条相邻关系：入口→中间、中间→出口；入口→出口不参与这条路径。
+ *  2. 中间节点必须 `role === "both"`：它既是第一段的目标，又是第二段的来源。
+ *     服务端创建 Forward 时会重新校验这一点，并同时校验三台节点不能重复、节点准入状态与可拨号地址。
+ *  3. NodeBinding 是可复用的内部基础设施关系：已存在就直接复用；缺失时，只有拥有
+ *     `node:manage` 的调用者才允许在创建 Forward 的同一事务里自动准备。没有该权限时，
+ *     缺关系仍然 fail-closed，但用户不需要被迫先离开创建流程去手工建关系。
+ *  4. DIRECT 绝不携带 `middle_node_id`：后端现在也显式拒绝这种无效组合，前端同样结构上不发送。
  *
  * ── 展示纪律（行为测试钉住）──
- *   · "取不到" 与 "确实没有某段绑定" 是两个分支：`null` 事实一律判 `facts_unavailable`；
+ *   · 关系事实取不到时：有 `node:manage` 可继续按角色选择并交由服务端最终校验/准备；
+ *     没有 `node:manage` 才按 `facts_unavailable` 阻断；
  *   · 文案里不出现「正常 / 健康 / 可达 / 连通」，也不宣称列表/详情读数能看到中间跳
  *     （`forwardView` 不含 `middle_node`，只有 topology 有三段）。
  */
@@ -35,6 +29,7 @@ export type MultihopReasonCode =
   | "same_as_egress"
   | "facts_unavailable"
   | "unknown_node"
+  | "role_not_both"
   | "segment_ingress_to_middle_missing"
   | "segment_middle_to_egress_missing";
 
@@ -51,7 +46,7 @@ export interface MultihopCandidate {
   inboundBound: boolean | null;
   /** 第二段 `该节点→出口` 是否已绑定；`null` = 事实取不到。 */
   outboundBound: boolean | null;
-  /** true ⇔ 服务端会接受它当中间跳（两段都已存在）。 */
+  /** true ⇔ 当前已知角色/组合允许提交；缺关系可在有权限时由服务端自动准备。 */
   selectable: boolean;
   /** 不可选的原因；可选时为 `null`。 */
   reason: MultihopReasonCode | null;
@@ -60,7 +55,7 @@ export interface MultihopCandidate {
    *
    *   · 第一段把该节点当**目标** ⇒ 需 `egress|both`；
    *   · 第二段把该节点当**源** ⇒ 需 `ingress|both`。
-   * 两段都不行（角色不满足且没有 `node:manage`）时，展示层**不得**给"去绑定"的死路。
+   * 没有 `node:manage` 时这里只能复用已有关系；角色不满足时无论权限如何都不可选。
    */
   canCreateInbound: boolean;
   canCreateOutbound: boolean;
@@ -70,7 +65,7 @@ export interface ForwardMultihopModel {
   /** 只有 relay 才有中间跳（DIRECT 不适用）。 */
   applicable: boolean;
   phase: MultihopPhase;
-  /** 可选的候选（两段都已绑定）。 */
+  /** 可选的候选（关系已存在，或当前权限允许创建时自动准备）。 */
   candidates: MultihopCandidate[];
   /** 不可选的候选（**列出来并说明原因**，而不是从界面上消失）。 */
   excluded: MultihopCandidate[];
@@ -187,13 +182,19 @@ function classify(input: {
         ? "same_as_egress"
         : input.node === null
           ? "unknown_node"
-          : inboundBound === null || outboundBound === null
-            ? "facts_unavailable"
-            : inboundBound && outboundBound
-              ? null
-              : !inboundBound
-                ? "segment_ingress_to_middle_missing"
-                : "segment_middle_to_egress_missing";
+          : role !== "both"
+            ? "role_not_both"
+            : inboundBound === null || outboundBound === null
+              ? canManageNodes
+                ? null
+                : "facts_unavailable"
+              : inboundBound && outboundBound
+                ? null
+                : canManageNodes
+                  ? null
+                  : !inboundBound
+                    ? "segment_ingress_to_middle_missing"
+                    : "segment_middle_to_egress_missing";
   return { ...base, selectable: reason === null, reason };
 }
 
@@ -215,8 +216,8 @@ export function buildForwardMultihopModel(input: MultihopInput): ForwardMultihop
   const facts = factsUsable ? input.facts : null;
   const inboundBindings = bindingsOf(facts, input.ingressId.trim());
 
-  if (facts === null) {
-    // 连"入口到达了哪些节点"都取不到：不给任何候选结论，也**不**说"没有候选"。
+  if (facts === null && !input.canManageNodes) {
+    // 没有自动准备权限时，关系事实不可读就无法判断这条路径是否已经准备好。
     const selectedId = input.middleNodeId.trim();
     return {
       applicable: true,
@@ -227,9 +228,9 @@ export function buildForwardMultihopModel(input: MultihopInput): ForwardMultihop
         selectedId === ""
           ? null
           : classify({
-              node: null,
+              node: input.nodes.find((node) => String(node.id) === selectedId) ?? null,
               nodeId: selectedId,
-              role: null,
+              role: input.nodes.find((node) => String(node.id) === selectedId)?.role ?? null,
               inboundBound: null,
               outboundBound: null,
               ingressId: input.ingressId.trim(),
@@ -397,6 +398,8 @@ export interface MultihopFailureInfo {
 interface FailureCopy {
   bindingRequiredTitle: string;
   bindingRequiredNext: string;
+  pathPermissionTitle: string;
+  pathPermissionNext: string;
   conflictTitle: string;
   conflictNext: string;
   portConflictTitle: string;
@@ -410,9 +413,10 @@ interface FailureCopy {
 }
 
 const FAILURE_ZH: FailureCopy = {
-  bindingRequiredTitle: "两段邻接绑定不完整",
-  bindingRequiredNext:
-    "先补齐两段绑定：「入口 → 中间」与「中间 → 出口」各建一条，再回来提交（节点页的绑定，或下面 relay 的「绑定并使用」）。",
+  bindingRequiredTitle: "路径关系尚未准备好",
+  bindingRequiredNext: "刷新后重试；如果仍然失败，请检查节点路径关系与权限。",
+  pathPermissionTitle: "自动准备路径需要节点管理权限",
+  pathPermissionNext: "请选择已经准备好的路径，或联系有节点管理权限的成员完成创建。",
   conflictTitle: "节点角色或组合不被接受",
   conflictNext:
     "检查三台节点的角色：中间跳必须同时能当第一段的出口与第二段的入口（role = both），且入口/中间/出口不能是同一台。",
@@ -427,9 +431,10 @@ const FAILURE_ZH: FailureCopy = {
 };
 
 const FAILURE_EN: FailureCopy = {
-  bindingRequiredTitle: "Two adjacent bindings are not in place",
-  bindingRequiredNext:
-    "Create both bindings first — ingress → middle and middle → egress — then submit again (node page bindings, or the relay “bind and use” control below).",
+  bindingRequiredTitle: "Path relationships are not ready",
+  bindingRequiredNext: "Reload and retry. If it still fails, check the node path relationships and permissions.",
+  pathPermissionTitle: "Automatic path setup needs node-management permission",
+  pathPermissionNext: "Choose a path that is already prepared, or ask a member with node-management permission to create it.",
   conflictTitle: "Node roles or the chosen combination are not accepted",
   conflictNext:
     "Check the three nodes' roles: the middle hop must be able to act as the egress of segment one and the ingress of segment two (role = both), and ingress/middle/egress must not be the same node.",
@@ -465,6 +470,9 @@ export function multihopFailureInfo(locale: Locale, error: unknown): MultihopFai
 
   if (code === "binding_required") {
     return { code, message, title: copy.bindingRequiredTitle, next: copy.bindingRequiredNext, retryable: false };
+  }
+  if (code === "path_setup_permission_required") {
+    return { code, message, title: copy.pathPermissionTitle, next: copy.pathPermissionNext, retryable: false };
   }
   if (code === "conflict") {
     // admission 拒绝（maintenance/disabled/retiring/waiting_install…）也走 `conflict`，

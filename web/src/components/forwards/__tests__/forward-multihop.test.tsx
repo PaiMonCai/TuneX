@@ -95,7 +95,7 @@ function section(over: Partial<Parameters<typeof ForwardMultihopSection>[0]> = {
 /* 模型：判据、不可选原因、载荷                                          */
 /* ================================================================== */
 
-describe("可用性判据 = 服务端真实判据（两段绑定都已存在）", () => {
+describe("可用性判据 = 角色安全条件 + 可自动准备的路径关系", () => {
   test("两段都在 ⇒ 可选；候选全集内的其余节点 ⇒ 不可选并给对应原因", () => {
     const ready = model();
     expect(ready.phase).toBe("ready");
@@ -118,15 +118,13 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
         byIngress: { "1": [binding(1, 6, MIDDLE)], "5": [], "6": [binding(6, 4, EGRESS)], "7": [] },
       },
     });
-    expect(ready.candidates.map((row) => row.nodeId)).toEqual(["6"]);
-    // 5 是 role=both（唯一能建成两段的角色）⇒ 必须列出来并说明缺哪一段；
-    // 7 是 role=egress 且与入口无绑定 ⇒ 结构上不可能当中间跳，不进噪音清单。
-    expect(ready.excluded.map((row) => row.nodeId)).toEqual(["5"]);
-    expect(ready.excluded[0]!.reason).toBe("segment_ingress_to_middle_missing");
+    // 有 node:manage 时，role=both 的 5 即使两段都没建也可选：服务端会原子补齐。
+    expect(ready.candidates.map((row) => row.nodeId)).toEqual(["6", "5"]);
+    expect(ready.excluded).toEqual([]);
   });
 
-  test("中间跳的 role=both 不是前端自造的闸门：两段都在的节点就是可选", () => {
-    // 角色是 egress、但两段绑定都已存在的节点（历史角色变更）也必须可选 —— 服务端只查绑定存在性。
+  test("中间节点必须 role=both：历史关系存在也不能绕过角色安全条件", () => {
+    // 新服务端会在创建时重新校验中间节点必须同时具备入口/出口能力。
     const legacy = node({ id: 9, node_id: "legacy-01", role: "egress", connect_ip: "10.0.0.91" });
     const ready = model({
       nodes: [INGRESS, MIDDLE, EGRESS, legacy],
@@ -139,7 +137,8 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
         },
       },
     });
-    expect(ready.candidates.map((row) => row.nodeId).sort()).toEqual(["6", "9"]);
+    expect(ready.candidates.map((row) => row.nodeId)).toEqual(["6"]);
+    expect(ready.excluded.find((row) => row.nodeId === "9")?.reason).toBe("role_not_both");
   });
 
   test("同节点：与入口/出口相同的 id 各有独立原因", () => {
@@ -156,8 +155,8 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
       nodes: [INGRESS, MIDDLE],
       facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } },
     });
-    const both = roleBoth.excluded.find((item) => item.nodeId === "6")!;
-    expect(both.reason).toBe("segment_ingress_to_middle_missing");
+    const both = roleBoth.candidates.find((item) => item.nodeId === "6")!;
+    expect(both.reason).toBeNull();
     expect(both.canCreateInbound).toBe(true);
     expect(multihopMissingSegment(both)).toEqual({ segment: "ingress_to_middle", creatable: true });
 
@@ -168,7 +167,7 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
       facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE), binding(1, 9, legacy)], "9": [] } },
     });
     const outRow = missingOutbound.excluded.find((item) => item.nodeId === "9")!;
-    expect(outRow.reason).toBe("segment_middle_to_egress_missing");
+    expect(outRow.reason).toBe("role_not_both");
     expect(outRow.canCreateOutbound).toBe(false);
     expect(multihopMissingSegment(outRow)).toEqual({ segment: "middle_to_egress", creatable: false });
 
@@ -177,7 +176,8 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
       nodes: [INGRESS, MIDDLE],
       facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } },
     });
-    const outBoth = missingOutboundBoth.excluded.find((item) => item.nodeId === "6")!;
+    const outBoth = missingOutboundBoth.candidates.find((item) => item.nodeId === "6")!;
+    expect(outBoth.reason).toBeNull();
     expect(multihopMissingSegment(outBoth)).toEqual({ segment: "middle_to_egress", creatable: true });
   });
 
@@ -194,7 +194,9 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
 
     // 反例：同样缺段但有 node:manage ⇒ 能补（证明这一位真的在起作用）。
     const withManage = model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [] } } });
-    expect(multihopMissingSegment(withManage.excluded.find((item) => item.nodeId === "6")!).creatable).toBe(true);
+    const auto = withManage.candidates.find((item) => item.nodeId === "6")!;
+    expect(auto.reason).toBeNull();
+    expect(multihopMissingSegment(auto)?.creatable).toBe(true);
   });
 
   test("DIRECT：不适用（不渲染，也不产生候选）", () => {
@@ -213,26 +215,31 @@ describe("可用性判据 = 服务端真实判据（两段绑定都已存在）"
 });
 
 describe("取不到 ≠ 没有", () => {
-  test("facts=null ⇒ unavailable，且不产生任何「没有可用节点」式结论", () => {
-    const row = model({ facts: null });
-    expect(row.phase).toBe("unavailable");
-    expect(row.candidates).toEqual([]);
-    expect(row.excluded).toEqual([]);
+  test("facts=null：有管理权限仍可按角色选择并交给服务端准备；无权限才 unavailable", () => {
+    const manageable = model({ facts: null });
+    expect(manageable.phase).toBe("ready");
+    expect(manageable.candidates.map((row) => row.nodeId)).toEqual(["6"]);
+
+    const readonly = model({ facts: null, canManageNodes: false });
+    expect(readonly.phase).toBe("unavailable");
+    expect(readonly.candidates).toEqual([]);
   });
 
-  test("作用域不符（切了 Workspace）⇒ 事实作废，判成取不到", () => {
-    const row = model({ scopeKey: "ws:99" });
-    expect(row.phase).toBe("unavailable");
-    expect(row.submitBlockedReason).toBeNull(); // 还没选中间跳 ⇒ 只是"取不到"，不是"阻止提交"
-    const chosen = model({ scopeKey: "ws:99", middleNodeId: "6" });
-    expect(chosen.submitBlockedReason).toBe("facts_unavailable");
+  test("作用域不符：有管理权限可由服务端重建事实；无权限保持 fail-closed", () => {
+    const manageable = model({ scopeKey: "ws:99", middleNodeId: "6" });
+    expect(manageable.phase).toBe("ready");
+    expect(manageable.submitBlockedReason).toBeNull();
+
+    const readonly = model({ scopeKey: "ws:99", middleNodeId: "6", canManageNodes: false });
+    expect(readonly.phase).toBe("unavailable");
+    expect(readonly.submitBlockedReason).toBe("facts_unavailable");
   });
 
   test("没登记到某个来源的绑定 ⇒ 那一段是「取不到」，不是「没有绑定」", () => {
     const row = model({ facts: { scopeKey: SCOPE, byIngress: { "6": [binding(6, 4, EGRESS)] } } });
-    const candidate = row.excluded.find((item) => item.nodeId === "6")!;
+    const candidate = row.candidates.find((item) => item.nodeId === "6")!;
     expect(candidate.inboundBound).toBeNull();
-    expect(candidate.reason).toBe("facts_unavailable");
+    expect(candidate.reason).toBeNull();
   });
 
   test("选中的 id 连节点都不认识 ⇒ unknown_node；认识但事实没登记 ⇒ facts_unavailable", () => {
@@ -246,8 +253,8 @@ describe("取不到 ≠ 没有", () => {
       nodes: [INGRESS, MIDDLE],
       facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)] } },
     });
-    expect(known.selected?.reason).toBe("facts_unavailable");
-    expect(known.submitBlockedReason).toBe("facts_unavailable");
+    expect(known.selected?.reason).toBeNull();
+    expect(known.submitBlockedReason).toBeNull();
   });
 });
 
@@ -256,7 +263,7 @@ describe("载荷 fail-closed（唯一的生成点）", () => {
     expect(multihopCreateFields("relay", "6", model({ middleNodeId: "6" }))).toEqual({ middle_node_id: 6 });
   });
 
-  test("DIRECT 一律不发（后端对 DIRECT 既不校验也不使用它）", () => {
+  test("DIRECT 一律不发（后端同样显式拒绝 DIRECT + middle 的无效组合）", () => {
     expect(multihopCreateFields("direct", "6", model({ mode: "direct" }))).toEqual({});
   });
 
@@ -269,7 +276,7 @@ describe("载荷 fail-closed（唯一的生成点）", () => {
 
   test("选中项此刻不可提交 ⇒ 不发（由界面给出原因并禁用提交）", () => {
     expect(multihopCreateFields("relay", "5", model({ middleNodeId: "5" }))).toEqual({});
-    expect(multihopCreateFields("relay", "6", model({ scopeKey: "ws:99", middleNodeId: "6" }))).toEqual({});
+    expect(multihopCreateFields("relay", "6", model({ scopeKey: "ws:99", middleNodeId: "6" }))).toEqual({ middle_node_id: 6 });
   });
 
   test("从原始事实直接生成（workspace 的载荷路径）与模型路径结果一致", () => {
@@ -285,8 +292,8 @@ describe("载荷 fail-closed（唯一的生成点）", () => {
       bindingsUnavailable: false,
     };
     expect(multihopCreateFieldsFor(raw)).toEqual({ middle_node_id: 6 });
-    expect(multihopCreateFieldsFor({ ...raw, bindingsUnavailable: true })).toEqual({});
-    expect(multihopCreateFieldsFor({ ...raw, egressId: "5" })).toEqual({});
+    expect(multihopCreateFieldsFor({ ...raw, bindingsUnavailable: true })).toEqual({ middle_node_id: 6 });
+    expect(multihopCreateFieldsFor({ ...raw, egressId: "5" })).toEqual({ middle_node_id: 6 });
   });
 
   test("事实装配：bindingsUnavailable ⇒ byIngress 整份为 null（唯一装配点）", () => {
@@ -306,18 +313,28 @@ describe("载荷 fail-closed（唯一的生成点）", () => {
 /* ================================================================== */
 
 describe("创建失败的 409 分支逐条有人话与下一步", () => {
-  test("binding_required（真实后端小写）⇒ 明说两段并给可执行下一步", () => {
+  test("binding_required 作为兼容错误仍有人话，但不再要求用户手工绑定", () => {
     const info = multihopFailureInfo("zh", {
       status: 409,
       message: "三跳路由要求入口→中间、中间→出口两段都已绑定",
       data: { error: "三跳路由要求入口→中间、中间→出口两段都已绑定", code: "binding_required" },
     });
     expect(info.code).toBe("binding_required");
-    expect(info.title).toContain("两段");
-    expect(info.next).toContain("入口 → 中间");
-    expect(info.next).toContain("中间 → 出口");
+    expect(info.title).toContain("路径关系");
+    expect(info.next).toContain("刷新");
     expect(info.message).toContain("三跳路由要求");
     expect(info.retryable).toBe(false);
+  });
+
+  test("path_setup_permission_required ⇒ 明确是节点管理权限，而不是让用户猜绑定", () => {
+    const info = multihopFailureInfo("zh", {
+      status: 403,
+      message: "所选路径需要建立节点关系，但当前角色没有节点管理权限",
+      data: { code: "path_setup_permission_required" },
+    });
+    expect(info.code).toBe("path_setup_permission_required");
+    expect(info.title).toContain("节点管理权限");
+    expect(info.next).toContain("已经准备好的路径");
   });
 
   test("mock 既有的大写码也认（大小写不敏感），不因为码风格不同就丢掉下一步", () => {
@@ -384,13 +401,15 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
     expect(html).toContain("中间 → 出口");
   });
 
-  test("事实取不到 ⇒ 独立 testid + 明说「不等于没有可用节点」", () => {
-    const html = section({ model: model({ facts: null }) });
-    expect(html).toContain('data-testid="forward-multihop-facts-unavailable"');
-    expect(html).toContain("节点关系暂时取不到");
-    expect(html).toContain("不等于「没有可用节点」");
-    expect(html).not.toContain('data-testid="forward-multihop-none"');
-    expect(html).not.toContain('data-testid="forward-multihop-select"');
+  test("事实取不到：无节点管理权限才展示不可判断；有权限可交给服务端准备", () => {
+    const readonly = section({ model: model({ facts: null, canManageNodes: false }) });
+    expect(readonly).toContain('data-testid="forward-multihop-facts-unavailable"');
+    expect(readonly).toContain("节点关系暂时取不到");
+    expect(readonly).not.toContain('data-testid="forward-multihop-select"');
+
+    const manageable = section({ model: model({ facts: null }) });
+    expect(manageable).toContain('data-testid="forward-multihop-select"');
+    expect(manageable).toContain('data-testid="forward-multihop-option-6"');
   });
 
   test("ready：可选节点进下拉；不可选的**列出来并说明原因**", () => {
@@ -403,37 +422,65 @@ describe("选择器渲染：三态 + 不可选原因 + 禁词", () => {
     expect(html).toContain("它与出口节点是同一台");
 
     const missing = section({
-      model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } } }),
+      model: model({
+        middleNodeId: "6",
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } },
+      }),
+      value: "6",
     });
-    expect(missing).toContain('data-testid="forward-multihop-excluded-6"');
-    expect(missing).toContain("入口 → 该节点 这一段关系尚未准备好");
+    expect(missing).toContain('data-testid="forward-multihop-option-6"');
+    expect(missing).toContain('data-testid="forward-multihop-auto-setup"');
+    expect(missing).toContain("自动准备");
   });
 
-  test("缺段且能补 ⇒ 给「去绑定」；缺段但不能补 ⇒ 只说角色原因，不给死路", () => {
-    const bothMissingInbound = section({
-      model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } } }),
+  test("缺关系 + 有权限 ⇒ 自动准备；角色不满足 ⇒ 仍然明确阻断", () => {
+    const automatic = section({
+      model: model({
+        middleNodeId: "6",
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [], "6": [binding(6, 4, EGRESS)] } },
+      }),
+      value: "6",
     });
-    expect(bothMissingInbound).toContain("启用并使用");
-    expect(bothMissingInbound).not.toContain("角色不能接在入口之后");
+    expect(automatic).toContain("自动准备");
+    expect(automatic).not.toContain("去节点页");
 
-    // 缺第二段且角色是 egress（不能当第二段的源）⇒ 只说角色原因，不给"去绑定"。
     const legacy = node({ id: 9, node_id: "legacy-01", role: "egress", connect_ip: "10.0.0.91" });
     const roleBlocked = section({
       model: model({
+        middleNodeId: "9",
         nodes: [INGRESS, MIDDLE, legacy],
         facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 9, legacy)], "9": [] } },
       }),
+      value: "9",
     });
-    expect(roleBlocked).toContain("角色不能继续转到下一跳");
-    expect(roleBlocked).not.toContain("第二段需要到节点页配置");
+    expect(roleBlocked).toContain('data-testid="forward-multihop-blocked"');
+    expect(roleBlocked).toContain("中间节点必须同时具备入口与出口能力");
   });
 
-  test("第二段缺失 ⇒ 指向节点页（它只能在节点页以中间跳为源创建）", () => {
-    const html = section({
-      model: model({ nodes: [INGRESS, MIDDLE], facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } } }),
+  test("缺第二段：有权限自动准备；无权限明确提示找节点管理员", () => {
+    const automatic = section({
+      model: model({
+        middleNodeId: "6",
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } },
+      }),
+      value: "6",
     });
-    expect(html).toContain("第二段需要到节点页配置");
-    expect(html).toContain('href="/nodes"');
+    expect(automatic).toContain("自动准备");
+
+    const readonly = section({
+      model: model({
+        middleNodeId: "6",
+        canManageNodes: false,
+        nodes: [INGRESS, MIDDLE],
+        facts: { scopeKey: SCOPE, byIngress: { "1": [binding(1, 6, MIDDLE)], "6": [] } },
+      }),
+      value: "6",
+    });
+    expect(readonly).toContain("节点管理权限");
+    expect(readonly).not.toContain('href="/nodes"');
   });
 
   test("选中可提交 ⇒ 明说这条路是四步三段；不可提交 ⇒ 独立告警 + 原因", () => {
@@ -617,23 +664,29 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
     expect(topology.body.segments.map((row) => row.segment)).toEqual(["ingress_to_middle", "middle_to_egress"]);
   });
 
-  test("缺一段 ⇒ 409 binding_required（与后端同判据、同码风格），且**没有**建出转发", async () => {
-    const before = getStore().tunnels.length;
-    const res = await call<{ code: string; message: string }>("POST", "forwards", {
+  test("三跳缺一段 ⇒ 创建时自动补齐关系并成功", async () => {
+    // 用合法的 role=both 中间节点 6，先人为移除第二段 6→4。
+    const store = getStore();
+    store.nodeBindings = store.nodeBindings.filter(
+      (row) => !(Number(row.ingress_node_id) === 6 && Number(row.egress_node_id) === 4),
+    );
+    expect(store.nodeBindings.some((row) => Number(row.ingress_node_id) === 6 && Number(row.egress_node_id) === 4)).toBe(false);
+
+    const res = await call<{ id: number }>("POST", "forwards", {
       body: {
         mode: "relay",
-        name: "缺段",
+        name: "自动补段",
         ingress_node_id: 1,
         egress_node_id: 4,
-        middle_node_id: 5,
+        middle_node_id: 6,
         target_host: "example.com",
         target_port: 443,
       },
     });
-    expect(res.status).toBe(409);
-    expect(res.body.code).toBe("binding_required");
-    expect(res.body.message).toContain("入口→中间");
-    expect(getStore().tunnels.length).toBe(before);
+    expect(res.status).toBe(200);
+    expect(getStore().nodeBindings.some(
+      (row) => Number(row.ingress_node_id) === 6 && Number(row.egress_node_id) === 4,
+    )).toBe(true);
   });
 
   test("不带 middle_node_id 的 relay 仍是两段（老路径零回归）", async () => {
@@ -645,47 +698,29 @@ describe("mock：POST /forwards 接住 middle_node_id（不再忽略）", () => 
     expect(topology.body.segments.map((row) => row.segment)).toEqual(["ingress_to_egress"]);
   });
 
-  test("错误码大小写与真机一致：单跳缺绑定与三跳缺段都输出小写 binding_required", async () => {
-    /*
-     * 真机逐字（scratch Panel 实测）：`{"error":"该出口尚未绑定到当前入口节点","code":"binding_required"}`
-     * 与三跳的 `{"error":"三跳路由要求入口→中间、中间→出口两段都已绑定","code":"binding_required"}`。
-     * mock 过去对单跳输出大写 `BINDING_REQUIRED`（同一份 mock 的编辑路径却用小写）——
-     * 这里把"码风格与真机一致"钉成行为断言，同时保证读取方两种都认。
-     */
-    const single = await call<{ code: string }>("POST", "forwards", {
-      body: { mode: "relay", name: "单跳缺绑定", ingress_node_id: 1, egress_node_id: 5, target_host: "example.com", target_port: 443 },
+  test("缺失的单跳关系自动创建；历史 binding_required 大小写仍能被界面兼容读取", async () => {
+    const store = getStore();
+    store.nodeBindings = store.nodeBindings.filter(
+      (row) => !(Number(row.ingress_node_id) === 1 && Number(row.egress_node_id) === 4),
+    );
+    const single = await call<{ id: number }>("POST", "forwards", {
+      body: { mode: "relay", name: "单跳自动关系", ingress_node_id: 1, egress_node_id: 4, target_host: "example.com", target_port: 443 },
     });
-    expect(single.status).toBe(409);
-    expect(single.body.code).toBe("binding_required");
+    expect(single.status).toBe(200);
+    expect(getStore().nodeBindings.some(
+      (row) => Number(row.ingress_node_id) === 1 && Number(row.egress_node_id) === 4,
+    )).toBe(true);
 
-    const multi = await call<{ code: string }>("POST", "forwards", {
-      body: {
-        mode: "relay",
-        name: "三跳缺段",
-        ingress_node_id: 1,
-        egress_node_id: 4,
-        middle_node_id: 5,
-        target_host: "example.com",
-        target_port: 443,
-      },
-    });
-    expect(multi.status).toBe(409);
-    expect(multi.body.code).toBe("binding_required");
-
-    // 过渡期两种大小写都能被界面读懂（历史 mock/网关可能仍回大写）。
+    // 旧服务/网关若仍回这一历史码，展示层继续大小写不敏感，避免升级窗口丢提示。
     expect(multihopFailureInfo("zh", { status: 409, message: "x", data: { code: "BINDING_REQUIRED" } }).code).toBe(
       "binding_required",
     );
   });
 
-  test("DIRECT 带上 middle_node_id：mock 与真后端同样不校验（已知缺口，UI 结构上不发送）", async () => {
-    // 真后端 create 只在 `if (egress)` 里校验两段（forward-service.ts:761）⇒ DIRECT 不校验。
-    // 这条断言的作用是**把这个缺口钉在明处**，避免日后有人以为 mock 漏了校验。
-    const res = await call<{ id: number }>("POST", "forwards", {
+  test("DIRECT 带 middle_node_id ⇒ 400（服务端不再静默保存无效中间节点）", async () => {
+    const res = await call<{ code?: string; message?: string }>("POST", "forwards", {
       body: { mode: "direct", name: "direct+middle", ingress_node_id: 1, middle_node_id: 6, target_host: "example.com", target_port: 443 },
     });
-    expect(res.status).toBe(200);
-    const topology = await call<{ segments: unknown[] }>("GET", `forwards/${res.body.id}/topology`);
-    expect(topology.body.segments).toEqual([]); // DIRECT：段数 0 是设计结论
+    expect(res.status).toBe(400);
   });
 });

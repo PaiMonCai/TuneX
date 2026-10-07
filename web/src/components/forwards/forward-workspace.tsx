@@ -131,7 +131,6 @@ export function ForwardWorkspace() {
   const [createOpen, setCreateOpen] = useState(false);
   const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
   const [createDraft, setCreateDraft] = useState(() => emptyForwardCreateDraft("direct"));
-  const [bindingBusy, setBindingBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<number | null>(null);
   /**
@@ -166,19 +165,11 @@ export function ForwardWorkspace() {
     return out;
   }, [bindings]);
   const selectedBindings = createDraft.ingressId ? bindings[Number(createDraft.ingressId)] ?? [] : [];
-  const availableEgressNodes = useMemo(() => {
-    if (!createDraft.ingressId) return [];
+  const egressCandidates = useMemo(() => {
+    if (!createDraft.ingressId) return egressNodes;
     const ingress = Number(createDraft.ingressId);
-    const bound = new Set(
-      (bindings[ingress] ?? []).map((binding) => Number(binding.egress_node_id)),
-    );
-    return nodes.filter(
-      (node) =>
-        isEgress(node) &&
-        Number(node.id) !== ingress &&
-        !bound.has(Number(node.id)),
-    );
-  }, [nodes, bindings, createDraft.ingressId]);
+    return egressNodes.filter((node) => Number(node.id) !== ingress);
+  }, [egressNodes, createDraft.ingressId]);
 
   const pageCount = forwardPageCount(total, pageSize);
   const hasFilters =
@@ -416,33 +407,6 @@ export function ForwardWorkspace() {
     setCreateOpen(true);
   }
 
-  async function bindSelectedEgress() {
-    if (!canManageNodes) { toast.error(PERMISSION_DENIED); return; }
-    const ingress = Number(createDraft.ingressId);
-    const egress = Number(createDraft.bindEgressId);
-    if (!Number.isInteger(ingress) || !Number.isInteger(egress)) return;
-
-    setBindingBusy(true);
-    try {
-      const binding = await api.nodes.bindEgress(ingress, egress);
-      setBindings((current) => {
-        const existing = current[ingress] ?? [];
-        const next = existing.some(
-          (row) => Number(row.egress_node_id) === Number(binding.egress_node_id),
-        )
-          ? existing
-          : [...existing, binding];
-        return { ...current, [ingress]: next };
-      });
-      setCreateDraft((draft) => ({ ...draft, egressId: String(binding.egress_node_id), bindEgressId: "" }));
-      toast.success(t("node.bindSuccess"));
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("forward.bindFailed"));
-    } finally {
-      setBindingBusy(false);
-    }
-  }
-
   /**
    * V5-WP5-A1：tls 路径的形态预检（与 create payload builder 成对，见
    * `lib/forward-protocol.ts`）。
@@ -496,9 +460,8 @@ export function ForwardWorkspace() {
         target_host: createDraft.targetHost.trim(),
         target_port: targetPortNum,
         egress_node_id: createDraft.mode === "relay" ? Number(createDraft.egressId) : null,
-        // 中间跳（三跳）：由同一个纯函数判定后生成 —— 不是 relay / 没选 / 选中的节点此刻
-        // 两段绑定不齐 / 事实取不到 ⇒ 一律**不发**这个键（不发一个必然 409 的字段，
-        // 也不在 DIRECT 上发它：后端对 DIRECT 的 middle_node_id 既不校验也不使用）。
+        // 中间节点（三节点路径）：由同一个纯模型判定。缺少的节点关系在当前角色有
+        // node-management 权限时由服务端与 Forward 创建原子补齐；真正的角色/组合问题仍阻断。
         ...multihopCreateFieldsFor({
           mode: createDraft.mode,
           ingressId: createDraft.ingressId,
@@ -519,6 +482,8 @@ export function ForwardWorkspace() {
       // 新行按默认排序（order_by asc）不一定落在当前页，回到第 1 页更容易被看到。
       setPage(1);
       reloadList();
+      // 自动路径准备可能新建了节点关系；刷新参考事实，让下一次创建立即看到最新状态。
+      void loadReference();
     } catch (err) {
       /**
        * 创建失败：既有的 `writeFailureText` 处理准入（`condition`）与编排错误；**多跳**
@@ -529,7 +494,9 @@ export function ForwardWorkspace() {
        * 其余错误码仍走既有唯一映射，不产生第二套判定。
        */
       const multihop = multihopFailureInfo(locale, err);
-      const next = multihop.code === "binding_required" && multihop.next ? ` ${multihop.next}` : "";
+      const explainPathSetup =
+        multihop.code === "binding_required" || multihop.code === "path_setup_permission_required";
+      const next = explainPathSetup && multihop.next ? ` ${multihop.next}` : "";
       toast.error(`${writeFailureText(err, t("forward.createFailed"))}${next}`);
     } finally {
       setBusy(false);
@@ -765,7 +732,7 @@ export function ForwardWorkspace() {
         draft={createDraft}
         ingressNodes={ingressNodes}
         selectedBindings={selectedBindings}
-        availableEgressNodes={availableEgressNodes}
+        egressNodes={egressCandidates}
         // 事实取不到（读失败 / 还没读到 / 没读权限）时，预览必须说"取不到"，
         // 而不是"没有可用出口"；动作块保留（读取失败不代表绑定动作无效）。
         bindingsUnavailable={bindingsFactsUnavailable}
@@ -774,14 +741,12 @@ export function ForwardWorkspace() {
         bindingsByIngress={bindingMapForDialog}
         workspaceId={currentId}
         canManageNodes={canManageNodes}
-        bindingBusy={bindingBusy}
         busy={busy}
         locale={locale}
         t={t}
         text={L}
         onOpenChange={setCreateOpen}
         onDraftChange={setCreateDraft}
-        onBindEgress={() => void bindSelectedEgress()}
         onCreate={() => void createForward()}
       />
 

@@ -6,9 +6,9 @@
  * ── 它只做一件事 ──
  *
  * 把 {@link ForwardMultihopModel}（纯函数产物）画出来，让用户在**提交前**就看清：
- *   · 哪些节点能当中间跳（两段邻接绑定都已存在 —— 这正是服务端创建时会判的判据）；
- *   · 哪些**不能**、**为什么不能**，以及缺的那一段能不能补（补不了就绝不给"去绑定"的死路）；
- *   · 事实取不到时说"取不到"，**不**说"没有可用节点"。
+ *   · 哪些节点能当中间节点（角色/节点组合满足真实安全条件）；
+ *   · 缺少的相邻节点关系是否能在创建 Forward 时由服务端自动准备；
+ *   · 没有节点管理权限时，哪些路径只能复用已有关系而不能越权补建。
  *
  * ── 三条话术纪律（行为测试钉住）──
  *  1. **这是前置说明，不是连通性结论**：全文不出现「正常 / 健康 / 可达」，也不承诺这条路径此刻可用；
@@ -20,7 +20,6 @@
  * 文案走组件内 zh/en 表（`locale` 由 props 传入），**不写** `lib/i18n/dictionaries.ts`。
  */
 
-import Link from "next/link";
 import type {
   ForwardMultihopModel,
   MultihopCandidate,
@@ -42,12 +41,10 @@ export interface ForwardMultihopCopy {
   noMiddleOption: string;
   threeSegments: string;
   visibilityNote: string;
-  /** 去节点页绑定的链接文案（第二段只能在节点页建：绑定以该节点为源）。 */
-  bindHint: string;
-  /** 第一段可补：对话框下面 relay 的「绑定并使用」就能补齐。 */
-  bindInboundHint: string;
-  /** 第二段可补：以中间跳为源的绑定只能在节点页建。 */
-  bindOutboundHint: string;
+  /** 当前权限允许时，缺少的两段会随 Forward 创建原子补齐。 */
+  autoSetupNote: string;
+  /** 没有节点管理权限时，缺少关系不能由 Forward 创建越权补齐。 */
+  permissionHint: string;
   /** 角色不允许建第一段（该节点当目标 ⇒ 需 egress|both）。 */
   roleHintInbound: string;
   /** 角色不允许建第二段（该节点当源 ⇒ 需 ingress|both）。 */
@@ -74,9 +71,8 @@ const ZH: ForwardMultihopCopy = {
   threeSegments: "已选中间节点：路径是 入口 → 中间 → 出口 → 目标（三段）。",
   visibilityNote:
     "创建后可在该转发详情页的「路径」卡片查看完整节点链；列表页只展示路径摘要。",
-  bindHint: "去节点页",
-  bindInboundHint: "第一段可以在上面的出口区域里选择这台节点并「启用并使用」。",
-  bindOutboundHint: "第二段需要到节点页配置：让这台节点可以继续转到所选出口。",
+  autoSetupNote: "缺少的节点路径关系会在创建转发时自动准备。",
+  permissionHint: "这条路径还缺节点关系；请联系有节点管理权限的成员创建，或选择已经准备好的路径。",
   roleHintInbound: "该节点角色不能接在入口之后；请把角色调整为出口或兼任。",
   roleHintOutbound: "该节点角色不能继续转到下一跳；请把角色调整为入口或兼任。",
   blockedTitle: "当前选中的中间节点还不能使用：",
@@ -85,6 +81,7 @@ const ZH: ForwardMultihopCopy = {
     same_as_egress: "它与出口节点是同一台（中间节点必须是另一台机器）。",
     facts_unavailable: "暂时取不到它的节点关系，无法判断能否使用；请刷新后重试。",
     unknown_node: "这台节点不在当前已知的节点列表里。",
+    role_not_both: "中间节点必须同时具备入口与出口能力。",
     segment_ingress_to_middle_missing: "入口 → 该节点 这一段关系尚未准备好。",
     segment_middle_to_egress_missing: "该节点 → 出口 这一段关系尚未准备好。",
   },
@@ -109,9 +106,8 @@ const EN: ForwardMultihopCopy = {
   threeSegments: "Middle node chosen: this forward's path is ingress → middle → egress → target (three segments).",
   visibilityNote:
     "After creating it, the forward detail page's “path” card shows the complete node chain; the list only shows a path summary.",
-  bindHint: "nodes page",
-  bindInboundHint: "The first segment can be prepared above by choosing this node and clicking “enable and use”.",
-  bindOutboundHint: "The second segment must be prepared on the nodes page so this node can continue to the selected egress.",
+  autoSetupNote: "Missing node path relationships will be prepared automatically when the Forward is created.",
+  permissionHint: "This path still needs node relationships. Ask a member with node-management permission to create it, or choose a path that is already prepared.",
   roleHintInbound: "This node cannot receive the first segment with its current role; change it to egress or both.",
   roleHintOutbound: "This node cannot forward the second segment with its current role; change it to ingress or both.",
   blockedTitle: "The selected middle node cannot be used yet:",
@@ -120,6 +116,7 @@ const EN: ForwardMultihopCopy = {
     same_as_egress: "It is the same node as the egress (the middle node must be a different machine).",
     facts_unavailable: "Its node relationship facts are unavailable, so TuneX cannot determine whether it can be used; reload and try again.",
     unknown_node: "This node is not in the currently known node list.",
+    role_not_both: "The middle node must have both ingress and egress capability.",
     segment_ingress_to_middle_missing: "The ingress → this node relationship is not ready.",
     segment_middle_to_egress_missing: "The this node → egress relationship is not ready.",
   },
@@ -134,16 +131,19 @@ export function forwardMultihopCopy(locale: Locale): ForwardMultihopCopy {
 }
 
 /**
- * 候选一行的动作建议：缺的是哪一段、能不能补、怎么补。
+ * 候选一行的动作建议：缺的是哪一段，以及它能否由 Forward 创建流程自动准备。
  *
- * 两段的补法**不一样**：第一段以入口为源（对话框里 relay 的「绑定并使用」就能建），
- * 第二段以中间跳为源（只能在节点页建）——把它们都说成"去绑定"会让用户在第一段上白跑一趟。
+ * 关系创建仍受 node:manage 约束；这里不提供绕过权限的第二条写路径。
  */
-function candidateNextStep(candidate: MultihopCandidate): { text: "bind" | "role" | null; segment: "inbound" | "outbound" | null } {
+function candidateNextStep(candidate: MultihopCandidate): { text: "auto" | "permission" | "role" | null; segment: "inbound" | "outbound" | null } {
   const missing = multihopMissingSegment(candidate);
   if (missing === null) return { text: null, segment: null };
+  const roleCanCarrySegment =
+    missing.segment === "ingress_to_middle"
+      ? candidate.role === "egress" || candidate.role === "both"
+      : candidate.role === "ingress" || candidate.role === "both";
   return {
-    text: missing.creatable ? "bind" : "role",
+    text: missing.creatable ? "auto" : roleCanCarrySegment ? "permission" : "role",
     segment: missing.segment === "ingress_to_middle" ? "inbound" : "outbound",
   };
 }
@@ -162,22 +162,13 @@ function NextStepNote({ candidate, copy }: { candidate: MultihopCandidate; copy:
         {next.segment === "inbound" ? copy.segmentInbound : copy.segmentOutbound}
       </span>
       {" · "}
-      {next.text === "bind" ? (
-        next.segment === "inbound" ? (
-          copy.bindInboundHint
-        ) : (
-          <>
-            {copy.bindOutboundHint}{" "}
-            <Link href="/nodes" className="underline underline-offset-2">
-              {copy.bindHint}
-            </Link>
-          </>
-        )
-      ) : next.segment === "inbound" ? (
-        copy.roleHintInbound
-      ) : (
-        copy.roleHintOutbound
-      )}
+      {next.text === "auto"
+        ? copy.autoSetupNote
+        : next.text === "permission"
+          ? copy.permissionHint
+          : next.segment === "inbound"
+            ? copy.roleHintInbound
+            : copy.roleHintOutbound}
     </span>
   );
 }
@@ -283,9 +274,17 @@ export function ForwardMultihopSection({
           ) : null}
 
           {value.trim() !== "" && model.selected?.selectable ? (
-            <p className="text-xs" data-testid="forward-multihop-three-segments">
-              {copy.threeSegments}
-            </p>
+            <>
+              <p className="text-xs" data-testid="forward-multihop-three-segments">
+                {copy.threeSegments}
+              </p>
+              {(model.selected.inboundBound !== true || model.selected.outboundBound !== true) &&
+              (model.selected.canCreateInbound || model.selected.canCreateOutbound) ? (
+                <p className="text-xs text-[var(--muted-foreground)]" data-testid="forward-multihop-auto-setup">
+                  {copy.autoSetupNote}
+                </p>
+              ) : null}
+            </>
           ) : null}
 
           <ExcludedNote model={model} copy={copy} />

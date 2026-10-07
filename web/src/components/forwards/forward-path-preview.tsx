@@ -70,10 +70,10 @@ const ZH: ForwardPathCopy = {
     "DIRECT 没有节点之间的跳：这是这条路径的设计结论，不是缺数据，也不代表少了什么配置。",
   relayHeadline: "入口 → 出口 → 目标",
   relayNote:
-    "自定义路径由入口节点接收连接，再经出口节点访问目标；所选出口必须已为这台入口启用。",
+    "自定义路径由入口节点接收连接，再经出口节点访问目标；缺少的节点关系会在权限允许时随创建自动准备。",
   relayThreeHeadline: "入口 → 中间 → 出口 → 目标",
   relayThreeNote:
-    "你选了中间节点：路径由入口 → 中间 → 出口 → 目标组成。创建时 TuneX 会校验相邻节点关系是否已经准备好。",
+    "你选了中间节点：路径由入口 → 中间 → 出口 → 目标组成。创建时 TuneX 会校验并在权限允许时自动准备相邻节点关系。",
   ingressRole: "入口",
   middleRole: "中间",
   egressRole: "出口",
@@ -86,27 +86,27 @@ const ZH: ForwardPathCopy = {
     ingress_address_unreported: "入口节点还没有上报连接地址（它上线后会带上）。",
     egress_address_unreported: "出口节点还没有上报连接地址（它上线后会带上）。",
     egress_not_chosen: "还没有选择出口节点（RELAY 必需）。",
-    egress_not_bound: "所选出口尚未为这台入口启用；下面的「启用并使用」可以补齐。",
+    egress_not_bound: "所选出口的节点关系尚未准备好；有节点管理权限时会随创建自动补齐。",
     target_host_missing: "还没有填目标地址。",
     target_port_missing: "还没有填目标端口。",
     bindings_unavailable:
       "出口关系暂时取不到：无法判断这台入口目前可用哪些出口。这不等于「没有可用出口」，请刷新后重试。",
     middle_address_unreported: "中间跳节点还没有上报连接地址（它上线后会带上）。",
-    middle_segment_ingress_missing: "入口 → 中间 的节点关系尚未准备好，当前无法创建这条路径。",
-    middle_segment_egress_missing: "中间 → 出口 的节点关系尚未准备好，当前无法创建这条路径。",
+    middle_segment_ingress_missing: "入口 → 中间 的节点关系尚未准备好；有节点管理权限时会随创建自动补齐。",
+    middle_segment_egress_missing: "中间 → 出口 的节点关系尚未准备好；有节点管理权限时会随创建自动补齐。",
     middle_segments_unavailable:
       "中间节点的两段关系暂时取不到：无法判断缺哪一段，请刷新后重试。",
   },
   middleVisibilityNote:
     "中间跳只会出现在该转发详情页的「链路」卡片（三段）里：列表与详情读数不显示它。",
   bindingsBound: (count) => `已有 ${count} 台可用出口，可以直接选择。`,
-  bindingsNone: "这台入口还没有可用出口。",
-  bindingsNoneNext: "下一步：在下面选择一台出口并点「启用并使用」。",
+  bindingsNone: "这台入口目前没有已准备的出口关系。",
+  bindingsNoneNext: "可直接选择出口；创建时 TuneX 会根据你的权限自动准备缺少的节点关系。",
   bindingsNoneWithCandidates: (count) =>
-    `下一步：在下面从 ${count} 台候选出口里选一台，点「启用并使用」。`,
+    `可直接从 ${count} 台候选出口里选择；创建时 TuneX 会根据你的权限准备缺少的节点关系。`,
   bindingsUnavailable:
     "出口关系暂时取不到：可能仍在读取，也可能读取失败。这不等于「没有可用出口」。",
-  bindingsUnavailableNext: "下一步：刷新页面（或稍候）再看一次；若仍取不到，请检查节点接口与权限。",
+  bindingsUnavailableNext: "仍可选择路径；提交时服务端会重新校验。若需要新建关系，则必须具备节点管理权限。",
 };
 
 const EN: ForwardPathCopy = {
@@ -120,10 +120,10 @@ const EN: ForwardPathCopy = {
     "A DIRECT forward has no hop between nodes: that is the design conclusion for this path, not missing data and not a missing setting.",
   relayHeadline: "Ingress → egress → target",
   relayNote:
-    "A custom path accepts the connection on the ingress node and forwards it to the target from the egress node; that egress must be enabled for this ingress.",
+    "A custom path accepts the connection on the ingress node and forwards it to the target from the egress node; missing node relationships are prepared on create when your permissions allow it.",
   relayThreeHeadline: "Ingress → middle → egress → target",
   relayThreeNote:
-    "You chose a middle node: the path is ingress → middle → egress → target. TuneX validates that the adjacent node relationships are ready when creating it.",
+    "You chose a middle node: the path is ingress → middle → egress → target. TuneX validates and, when permitted, prepares adjacent node relationships on create.",
   ingressRole: "Ingress",
   middleRole: "Middle",
   egressRole: "Egress",
@@ -136,28 +136,28 @@ const EN: ForwardPathCopy = {
     ingress_address_unreported: "The ingress node has not reported a connection address yet (it will once it comes up).",
     egress_address_unreported: "The egress node has not reported a connection address yet (it will once it comes up).",
     egress_not_chosen: "No egress node chosen yet (required for RELAY).",
-    egress_not_bound: "The chosen egress is not enabled for this ingress yet; use \"enable and use\" below.",
+    egress_not_bound: "The chosen egress relationship is not ready yet; TuneX prepares it on create when node-management permission allows.",
     target_host_missing: "Target host is still empty.",
     target_port_missing: "Target port is still empty.",
     bindings_unavailable:
       "Egress relationship facts are unavailable: cannot tell which egress nodes are available to this ingress. That is not the same as \"no egress available\"; reload and try again.",
     middle_address_unreported: "The middle-hop node has not reported a connection address yet (it will once it comes up).",
-    middle_segment_ingress_missing: "The ingress → middle node relationship is not ready, so this path cannot be created yet.",
-    middle_segment_egress_missing: "The middle → egress node relationship is not ready, so this path cannot be created yet.",
+    middle_segment_ingress_missing: "The ingress → middle relationship is not ready; TuneX prepares it on create when node-management permission allows.",
+    middle_segment_egress_missing: "The middle → egress relationship is not ready; TuneX prepares it on create when node-management permission allows.",
     middle_segments_unavailable:
       "The middle node's two relationship facts are unavailable, so TuneX cannot tell which segment is missing. Reload and try again.",
   },
   middleVisibilityNote:
     "The middle hop only shows up on the forward detail page's \"path\" card (three segments): list and detail reads do not include it.",
   bindingsBound: (count) => `${count} egress node(s) are available and selectable.`,
-  bindingsNone: "This ingress has no available egress yet.",
-  bindingsNoneNext: "Next: pick an egress below and click \"enable and use\".",
+  bindingsNone: "This ingress currently has no prepared egress relationship.",
+  bindingsNoneNext: "Choose an egress directly; TuneX prepares missing node relationships on create when your permissions allow.",
   bindingsNoneWithCandidates: (count) =>
-    `Next: pick one of the ${count} candidate egress nodes below and click "enable and use".`,
+    `Choose one of the ${count} candidate egress nodes directly; TuneX prepares missing node relationships on create when your permissions allow.`,
   bindingsUnavailable:
     "Egress relationship facts are unavailable: the read may still be running, or it may have failed. That is not the same as \"no egress available\".",
   bindingsUnavailableNext:
-    "Next: reload the page (or wait a moment). If it stays unavailable, check the nodes API and your permissions.",
+    "You may still choose a path; the server validates it again on create. Creating missing relationships requires node-management permission.",
 };
 
 const COPY: Record<Locale, ForwardPathCopy> = { zh: ZH, en: EN };

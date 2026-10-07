@@ -1,11 +1,9 @@
 "use client";
 
-import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input, Label } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { bindingUsageView, hasBindingUsage } from "@/components/forwards/forward-binding-usage";
 import { listenPortHintKey, listenPortPlaceholderKey } from "@/components/forwards/forward-copy";
 import { changeForwardCreateEgress, changeForwardCreateIngress, changeForwardCreateProtocol, forwardCreateProtocolErrors, type ForwardCreateDraft } from "@/components/forwards/forward-create-model";
 import { buildForwardMultihopModel, buildMultihopFacts } from "@/components/forwards/forward-multihop-model";
@@ -20,13 +18,13 @@ import type { ForwardListTextKey } from "@/components/forwards/forward-list-mode
 type Translate = (key: string, params?: Record<string, string | number>) => string;
 type ListText = (key: ForwardListTextKey, params?: Record<string, string | number>) => string;
 
-export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBindings, availableEgressNodes, canManageNodes,
-  bindingBusy, busy, locale, t, text, onOpenChange, onDraftChange, onBindEgress, onCreate,
+export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBindings, egressNodes, canManageNodes,
+  busy, locale, t, text, onOpenChange, onDraftChange, onCreate,
   bindingsUnavailable = false, workspaceId = null, bindingsByIngress = null }: {
   open: boolean; draft: ForwardCreateDraft; ingressNodes: UserNode[]; selectedBindings: NodeBinding[];
-  availableEgressNodes: UserNode[]; canManageNodes: boolean; bindingBusy: boolean; busy: boolean; locale: Locale;
+  egressNodes: UserNode[]; canManageNodes: boolean; busy: boolean; locale: Locale;
   t: Translate; text: ListText; onOpenChange: (open: boolean) => void; onDraftChange: (draft: ForwardCreateDraft) => void;
-  onBindEgress: () => void; onCreate: () => void;
+  onCreate: () => void;
   /**
    * 绑定事实此刻**不可信**（仍在读取 / 读取失败 / 晚到）：调用方已知这件事时传 `true`。
    *
@@ -57,8 +55,16 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
   const egress = resolveEgressNode({
     egressId: draft.egressId,
     bindings: bindingsUnavailable ? null : selectedBindings,
-    nodes: ingressNodes,
+    nodes: [...ingressNodes, ...egressNodes],
   });
+  const boundEgressIds = new Set(selectedBindings.map((binding) => String(binding.egress_node_id)));
+  const egressRelationLabel = (nodeId: string) => {
+    if (bindingsUnavailable) return t("forward.pathRelationServerCheck");
+    if (boundEgressIds.has(nodeId)) return t("forward.pathRelationReady");
+    return canManageNodes
+      ? t("forward.pathRelationWillPrepare")
+      : t("forward.pathRelationNeedsPermission");
+  };
   const scopeKey = forwardPathScopeKey({ workspaceId, ingressId: draft.ingressId });
   /**
    * 中间跳（三跳）模型：作用域键只跟 workspace 走（这份事实是"按来源节点分组"的，
@@ -86,7 +92,8 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
     scopeKey,
     // 取不到 ⇒ 传 `null` 事实（模型据此判 `unavailable`，绝不判成"没有绑定"）。
     bindingsFacts: { scopeKey, bindings: bindingsUnavailable ? null : selectedBindings },
-    bindableEgressCount: availableEgressNodes.length,
+    bindableEgressCount: egressNodes.length,
+    autoSetupAllowed: canManageNodes,
     // 三跳事实来自上面那一份模型（判定只有一处实现），预览只负责画。
     middle: middleChosen
       ? {
@@ -97,9 +104,6 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
         }
       : null,
   });
-  /** 事实不可信 + 列表为空 ⇒ 出口字段不能再说"没有可用出口"。 */
-  const egressFactsUnknown = bindingsUnavailable && selectedBindings.length === 0;
-
   return <Dialog open={open} onOpenChange={onOpenChange}>
     <DialogContent>
       <DialogHeader>
@@ -148,26 +152,22 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
             </Select>
           </Field>
 
-          {draft.mode === "relay" ? <Field label={t("forward.egressNode")}><div className="flex flex-col gap-3">
-            {selectedBindings.length > 0 ? <Select value={draft.egressId} onValueChange={(egressId) => onDraftChange(changeForwardCreateEgress(draft, egressId))}>
+          {draft.mode === "relay" ? <Field label={t("forward.egressNode")}><div className="flex flex-col gap-2">
+            <Select value={draft.egressId} onValueChange={(egressId) => onDraftChange(changeForwardCreateEgress(draft, egressId))}>
               <SelectTrigger><SelectValue placeholder={t("forward.chooseEgress")} /></SelectTrigger>
-              <SelectContent>{selectedBindings.map((binding) => <SelectItem key={String(binding.egress_node_id)} value={String(binding.egress_node_id)}>
-                {binding.egress_node.node_id} · {binding.egress_node.connect_ip ?? t("node.waiting")}
-                {hasBindingUsage(binding) ? ` · ${text("forward.bindingUsageUsed", { count: bindingUsageView(binding).used_by_forward_count })}` : ""}
-              </SelectItem>)}</SelectContent>
-            </Select> : egressFactsUnknown ? (
-              <div data-testid="forward-create-bindings-unavailable" className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]">
-                <div>{copy.bindingsUnavailable}</div>
-                <div className="mt-1 text-xs">{copy.bindingsUnavailableNext}</div>
-              </div>
-            ) : <div className="rounded-md border border-dashed border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]"><div>{t("forward.noBoundEgress")}</div><div className="mt-1 text-xs">{t("forward.bindFirstHint")}</div></div>}
-            {canManageNodes && availableEgressNodes.length > 0 ? <div className="rounded-md border border-[var(--border)] p-3">
-              <div className="mb-2 text-xs font-medium text-[var(--muted-foreground)]">{selectedBindings.length > 0 ? t("forward.bindAnotherEgress") : t("forward.bindInline")}</div>
-              <div className="flex flex-col gap-2 sm:flex-row"><Select value={draft.bindEgressId} onValueChange={(bindEgressId) => patch({ bindEgressId })}>
-                <SelectTrigger className="min-w-0 flex-1"><SelectValue placeholder={t("forward.chooseUnboundEgress")} /></SelectTrigger>
-                <SelectContent>{availableEgressNodes.map((node) => <SelectItem key={String(node.id)} value={String(node.id)}>{node.node_id} · {node.connect_ip ?? t("node.waiting")}</SelectItem>)}</SelectContent>
-              </Select><Button type="button" variant="outline" onClick={onBindEgress} disabled={bindingBusy || !draft.bindEgressId}>{t("forward.bindAndUse")}</Button></div>
-            </div> : selectedBindings.length === 0 && !egressFactsUnknown ? <div className="text-xs text-[var(--muted-foreground)]">{t("forward.noAvailableEgress")}{" "}<Link href="/nodes" className="underline underline-offset-2">{t("common.nodes")}</Link></div> : null}
+              <SelectContent>{egressNodes.map((node) => (
+                <SelectItem key={String(node.id)} value={String(node.id)}>
+                  {node.node_id} · {node.connect_ip ?? t("node.waiting")} · {egressRelationLabel(String(node.id))}
+                </SelectItem>
+              ))}</SelectContent>
+            </Select>
+            {egressNodes.length === 0 ? (
+              <p className="text-xs text-[var(--muted-foreground)]">{t("forward.noAvailableEgress")}</p>
+            ) : (
+              <p className="text-xs text-[var(--muted-foreground)]" data-testid="forward-path-auto-setup-hint">
+                {t("forward.pathAutoSetupHint")}
+              </p>
+            )}
           </div></Field> : null}
 
           <ForwardMultihopSection
@@ -190,7 +190,7 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
         </section>
       </div>}
       <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-        <Button onClick={onCreate} disabled={busy || ingressNodes.length === 0 || !protocolReady || multihopBlocked || (draft.mode === "relay" && (!draft.egressId || selectedBindings.length === 0))}>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</Button>
+        <Button onClick={onCreate} disabled={busy || ingressNodes.length === 0 || !protocolReady || multihopBlocked || (draft.mode === "relay" && !draft.egressId)}>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>;
