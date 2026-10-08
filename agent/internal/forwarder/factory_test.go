@@ -204,7 +204,8 @@ func TestEveryAdvertisedProtocolHasABuilder(t *testing.T) {
 	}
 	streamBuilders := RegisteredBuilders()
 	datagramBuilders := RegisteredDatagramBuilders()
-	all := append(append([]string{}, streamBuilders...), datagramBuilders...)
+	mixedBuilders := RegisteredMixedBuilders()
+	all := append(append(append([]string{}, streamBuilders...), datagramBuilders...), mixedBuilders...)
 	sort.Strings(all)
 	if strings.Join(advertised, ",") != strings.Join(all, ",") {
 		t.Fatalf("advertised protocols %v and registered builders %v must match", advertised, all)
@@ -222,6 +223,9 @@ func TestEveryAdvertisedProtocolHasABuilder(t *testing.T) {
 		if transport == TransportDatagram {
 			registry = datagramBuilders
 		}
+		if transport == TransportMixed {
+			registry = mixedBuilders
+		}
 		if !containsString(registry, name) {
 			t.Fatalf("protocol %q resolves to the %q transport but has no builder in that registry (%v)",
 				name, transport, registry)
@@ -232,7 +236,7 @@ func TestEveryAdvertisedProtocolHasABuilder(t *testing.T) {
 func TestParseForwardTransportFailsClosed(t *testing.T) {
 	// The datagram transport is supported, so it is outside the fail-closed list
 	// together with its protocol — the two leaves this list only as a pair.
-	for _, want := range []ForwardTransport{TransportStream, TransportDatagram} {
+	for _, want := range []ForwardTransport{TransportStream, TransportDatagram, TransportMixed} {
 		if got, err := ParseForwardTransport(string(want)); err != nil || got != want {
 			t.Fatalf("%s must parse, got %q / %v", want, got, err)
 		}

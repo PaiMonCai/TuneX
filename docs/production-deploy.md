@@ -74,6 +74,8 @@ F2 多目标绑定要求两端实际报告 `forward.targets.fxp.v1`；Agent 探�
 
 F3 来源绑定额外要求双方实际 `forward.client-source.fxp.v1`；先升级数据库/Panel/Worker，再升级 Agent/FXP。首版仅共享 TCP，受信 CIDR 应限实际代理；先在支持 PROXY 的测试目标核对 v1/v2、来源和限额，再启用业务规则。回退先创建显式关闭接收/发送的修订（IP_HASH 改为已有策略），仍保留来源配置及兼容 runner；旧程序不得忽略字段继续传输。不能直接删除来源列/缓存或把双向节点地址当客户端。
 
+F4 原生 both 仍默认 `FORWARD_NATIVE_BOTH_ENABLED=false`。先执行 legacy 协议投影可空的数据库迁移、更新 Panel/Worker，再升级参与节点，确认新鲜 `forward.protocol.both.native.v1`，候选自身门禁通过后才在有限 Workspace opt-in。首版限定 plain DIRECT/自有单跳 RELAY，禁止中间/联邦/来源/TLS/WS 组合；不是新增加密载体。关闭开关只禁止新建/切入 both，已存在配置仍须兼容恢复。回滚旧二进制前须通过正常修订迁移或完整停止两协议并确认端口回收，不能让旧程序把 null legacy 类型猜成 TCP；不可回滚持久 epoch 或删除缓存规避失败。
+
 `FORWARD_BATCH_DELETE_ENABLED` 也是独立默认关闭功能，开启前完成原生/远端适用范围的真实清理验收。支付开关与上述转发能力无关，当前不作为核心发布前置；不能因 FXP 验收通过就开启未审查的支付流程。
 
 ## 备份、回退与节点状态

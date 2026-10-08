@@ -51,6 +51,7 @@ import {
   type TopologyEndpointFact,
 } from "@/lib/api/forwards";
 import { useI18nOptional } from "@/components/providers";
+import { forwardProtocolLabel } from "@/lib/forward-protocol";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
 import type { Locale } from "@/lib/i18n";
@@ -142,7 +143,7 @@ const ZH: TopologyCopy = {
     "协议诊断：没有（null）= 这次上报里没有这块事实。它不等于「没有丢包」，也不等于「没有错误」。",
   diagEmpty:
     "协议诊断：上报里有这块，但没有任何标量事实（{}）。它不等于「没有丢包」。",
-  diagFactsTitle: (protocol) => `协议诊断（${protocol}）`,
+  diagFactsTitle: (protocol) => `协议诊断（${forwardProtocolLabel(protocol)}）`,
   diagTruncated: "视图做过有界化：下面不是原始块的全部键。",
   ledgerTitle: "累计流量",
   ledgerTitleSuffix: `（${LEDGER_TIME_ZONE} 日界 · 归档账本）`,
@@ -194,7 +195,7 @@ const EN: TopologyCopy = {
     "Protocol diagnostics: none (null) = no such block in this report. It does not mean \"no packet loss\" and not \"no errors\".",
   diagEmpty:
     "Protocol diagnostics: the block is present but carries no scalar fact ({}). It does not mean \"no packet loss\".",
-  diagFactsTitle: (protocol) => `Protocol diagnostics (${protocol})`,
+  diagFactsTitle: (protocol) => `Protocol diagnostics (${forwardProtocolLabel(protocol)})`,
   diagTruncated: "The view is bounded: the keys below are not the whole original block.",
   ledgerTitle: "Total traffic",
   ledgerTitleSuffix: `(${LEDGER_TIME_ZONE} day boundary · archived ledger)`,
@@ -350,6 +351,7 @@ function revisionText(
  * 有键（真的报了，例如 `drops: 0`）。三者的渲染与 testid 都不同。
  */
 export function DiagFacts({ diag, copy }: { diag: TopologyDiagFact | null; copy: TopologyCopy }) {
+  const locale = useI18nOptional()?.locale ?? "zh";
   if (!diag) {
     return (
       <p className="mt-1 text-[var(--muted-foreground)]" data-testid="forward-topology-diag-none">
@@ -370,6 +372,9 @@ export function DiagFacts({ diag, copy }: { diag: TopologyDiagFact | null; copy:
       <div className="text-[var(--muted-foreground)]">
         {copy.diagFactsTitle(diag.protocol ?? "—")}
       </div>
+      {diag.protocol === "both" ? <p data-testid="forward-mixed-stats-note" className="text-[var(--muted-foreground)]">{locale === "en"
+        ? "Mixed runtime facts: bytes sum TCP + UDP; live connections count TCP only, live mappings, packet and drop counts are separate UDP facts. One shared total/per-IP budget. Only reported counters are shown; missing is unreported, not zero. Neither an unknown nor a failed leg is Ready; revision matches alone do not prove readiness or connectivity."
+        : "混合运行态事实：字节数为 TCP + UDP 合计；活跃连接仅计 TCP，活跃映射、报文与丢弃计数分别是 UDP 事实。共用总并发与每 IP 预算。仅展示实际上报的计数；缺失是未上报，不是零。任一侧未知或失败都不能视为就绪；仅版本相同不证明就绪或连通性。"}</p> : null}
       <ul className="mt-1 space-y-0.5 font-mono">
         {entries.map(([key, value]) => (
           <li key={key}>

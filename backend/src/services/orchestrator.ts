@@ -35,6 +35,7 @@ import {
   FORWARD_PROTOCOL_SPECS,
   firstConnectIp,
   wireTunnelTypeForForwardProtocol,
+  forwardHasDatagramLane,
   type ForwardProtocol,
 } from "./forward-contract.ts";
 
@@ -639,6 +640,9 @@ export class Orchestrator {
     protocol: ForwardProtocol,
     input: { tlsCertPath?: string | null; tlsKeyPath?: string | null },
   ): { tls_cert_path?: string; tls_key_path?: string } {
+    if (protocol === "both" && (input.tlsCertPath || input.tlsKeyPath)) {
+      throw new AgentTransportError(RELAY_DISPATCH_ERROR_CODES.agent_rejected, "native_both_tls_unsupported");
+    }
     if (protocol !== "tls") return {};
     const cert = typeof input.tlsCertPath === "string" ? input.tlsCertPath.trim() : "";
     const key = typeof input.tlsKeyPath === "string" ? input.tlsKeyPath.trim() : "";
@@ -725,6 +729,8 @@ export class Orchestrator {
     nextHop: string;
     protocol?: ForwardProtocol;
   }): Promise<{ ok: true; host: string } | DispatchFailure> {
+    if (input.protocol === "both") return { ok: false,
+      error_code: RELAY_DISPATCH_ERROR_CODES.route_not_dispatchable, error: "native_both_middle_unsupported" };
     const [host, portRaw] = input.nextHop.split(":");
     const nextPort = Number(portRaw);
     if (!host || !Number.isFinite(nextPort) || nextPort <= 0) {
@@ -766,6 +772,9 @@ export class Orchestrator {
    * 连不上的静默故障（这也是既有两段式一直遵守的规则）。
    */
   async dispatchRoute(input: DispatchRouteInput): Promise<RouteDispatchOutcome> {
+    if (input.protocol === "both" && input.plan.hops.length !== 2) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.route_not_dispatchable, error: "native_both_middle_unsupported" };
+    }
     const hops = [...input.plan.hops];
     const last = hops[hops.length - 1];
     if (last === undefined) {
@@ -1021,7 +1030,7 @@ export class Orchestrator {
     // The gate is the TRANSPORT, not the protocol name: "a datagram exit attests its
     // ingress" is a property of the datagram hop, so a future datagram protocol
     // inherits it instead of quietly missing it.
-    const isDatagram = FORWARD_PROTOCOL_SPECS[protocol].transport === "datagram";
+    const isDatagram = forwardHasDatagramLane(protocol);
     const hopPeer = (input.hopPeer ?? "").trim();
     if (isDatagram && hopPeer === "") {
       return {
@@ -1044,7 +1053,9 @@ export class Orchestrator {
       targets,
       // Absent when there is no signal at all, so the wire says "nothing to say"
       // rather than "every target is unknown".
-      ...(targetHealth ? { target_health: targetHealth } : {}),
+      // Current target observations are TCP probes, not UDP evidence. Mixed
+      // runtimes must not feed that untyped health into both lane selectors.
+      ...(protocol !== "both" && targetHealth ? { target_health: targetHealth } : {}),
       // Only datagram tunnels carry it: for a stream hop the field would be a fact
       // nobody reads, and an unread fact is how two paths drift apart.
       ...(isDatagram && hopPeer ? { hop_peer: hopPeer } : {}),

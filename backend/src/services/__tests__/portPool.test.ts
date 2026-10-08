@@ -341,10 +341,41 @@ describe("protocol, bind scope and independent Link ownership", () => {
     for (const known of ["tcp", "udp"]) expect(await request(h, { protocol: known, tunnelId: 2 })).toMatchObject({ ok: false, code: "port_taken" });
   });
 
-  test("native both stays closed", async () => {
+  test("Link composite allocation stays closed; FXP must reserve explicit lanes", async () => {
     const h = harness(); seedNode(1, [19000, 19000]);
     expect(await request(h, { protocol: "both", linkId: 1 })).toEqual({ ok: false, code: "unsupported_protocol" });
     expect(leases).toHaveLength(0);
+  });
+
+  test("native both reserves one conservative lease, blocks each lane, retries and releases as one owner", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const first = await request(h, { protocol: "both", tunnelId: 10 });
+    expect(first).toMatchObject({ ok: true, result: { port: 19000, protocol: "unknown", tunnelId: 10 } });
+    if (!first.ok) throw new Error("missing lease");
+    expect(leases).toHaveLength(1);
+    for (const protocol of ["tcp", "udp", "both"]) {
+      expect(await request(h, { protocol, tunnelId: 11 })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    expect(await request(h, { protocol: "both", tunnelId: 10 })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, reused: true } });
+    expect(await request(h, { protocol: "both", tunnelId: 10, preferredPort: undefined })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, reused: true } });
+    expect(await request(h, { protocol: "tcp", tunnelId: 10 })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, protocol: "unknown" } });
+    expect(leases).toHaveLength(1);
+    await pool.releaseLease({ tunnelId: 10 }, h.deps);
+    expect(leases[0]!.status).toBe("released");
+    expect((await request(h, { protocol: "udp", tunnelId: 11 })).ok).toBe(true);
+  });
+
+  test("transition into both widens the same lease under the range lock, never steals an occupied lane", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const tcp = await request(h, { tunnelId: 10 });
+    const udp = await request(h, { tunnelId: 11, protocol: "udp" });
+    if (!tcp.ok || !udp.ok) throw new Error("missing disjoint leases");
+    expect(await request(h, { tunnelId: 10, protocol: "both" })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(leases[0]!.protocol).toBe("tcp");
+    await pool.releaseLease({ tunnelId: 11 }, h.deps);
+    expect(await request(h, { tunnelId: 10, protocol: "both" })).toMatchObject({ ok: true,
+      result: { leaseId: tcp.result.leaseId, protocol: "unknown", reused: true } });
+    expect(leases.filter((l) => l.status === "active")).toHaveLength(1);
   });
 
   test("same Link owner retries are idempotent with preferred or automatic allocation", async () => {

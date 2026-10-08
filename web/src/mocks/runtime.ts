@@ -1089,7 +1089,7 @@ export function tunnelRuntimeAction(
     t.apply_status = "pending";
     // retry 重放相同 desired revision：mock 里同步完成后 revision 不变，
     // 与 WP8 的 dispatchIngress 相同 revision 语义一致（不抬高）。
-    completeOrchestration(t);
+    if (forwardProtocolFact(t.forward_protocol, t.tunnel_type) !== "both") completeOrchestration(t);
     return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision ?? null, reentered: true } satisfies TunnelRuntimeAction);
   }
   if (action === "suspend") {
@@ -1113,8 +1113,10 @@ export function tunnelRuntimeAction(
   t.status = "active";
   // resume 重新走编排：revision +1（与 WP8「revision 必须继续前进」一致）
   t.config_revision = (t.config_revision ?? 0) + 1;
-  completeOrchestration(t);
-  t.online = true;
+  if (forwardProtocolFact(t.forward_protocol, t.tunnel_type) !== "both") {
+    completeOrchestration(t);
+    t.online = true;
+  }
   return ok({ tunnel: t, apply_status: t.apply_status, config_revision: t.config_revision } satisfies TunnelRuntimeAction);
 }
 
@@ -1364,6 +1366,8 @@ export function mockForwardView(db: Store, tunnel: Tunnel): PortForward {
 
   return {
     id: tunnel.id,
+    ...Object.fromEntries(["bytes_per_second_in", "bytes_per_second_out", "max_connections", "max_connections_per_ip"].map((key) =>
+      [key, (tunnel as unknown as Record<string, unknown>)[key]])),
     creator_user_id: tunnel.user_id ?? null,
     name: tunnel.name,
     /*

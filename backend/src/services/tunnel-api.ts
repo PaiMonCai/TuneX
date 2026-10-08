@@ -41,7 +41,7 @@ import {
 } from "./capability-policy.ts";
 import { releaseLease } from "./portPool.ts";
 import { checkForwardRuntimeUse, type RuntimeUseDenied, type RuntimeUseResource } from "./forward-capability.ts";
-import { normalizeForwardProtocol } from "./forward-contract.ts";
+import { normalizeForwardProtocol, persistedForwardProtocol } from "./forward-contract.ts";
 
 /* ================================================================== */
 /* 常量                                                               */
@@ -133,7 +133,7 @@ export function toTunnelApiError(e: unknown, fallback = "操作失败，请稍�
 export interface TunnelRow {
   id: number;
   name: string;
-  tunnel_type: string;
+  tunnel_type: string | null;
   listen_ip: string | null;
   listen_port: number | null;
   status: string;
@@ -579,7 +579,9 @@ export async function createTunnel(
   if (mode === null) return err("invalid_input", "隧道模式非法（direct/relay）");
 
   const protocol = normalizeForwardProtocol(input.tunnelType);
-  if (protocol === null) {
+  // The legacy creation API has neither native capability preflight nor an
+  // honest composite TunnelType projection. Native both uses /forwards only.
+  if (protocol === null || protocol === "both") {
     return err("invalid_input", "当前 v3/V5 runtime 仅支持已开放的 Forward 协议");
   }
 
@@ -805,7 +807,9 @@ export async function runTunnelAction(
   if (!compat.ok) return err("invalid_state", compat.message);
 
   if (action === "retry" || action === "resume") {
-    const denied = await (over?.runtimeUse ?? checkForwardRuntimeUse)(workspaceId, tunnel);
+    const denied = await (over?.runtimeUse ?? checkForwardRuntimeUse)(workspaceId, {
+      ...tunnel, protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
+    });
     if (denied) return { ...err(denied.code, denied.message), reason: denied.reason, error_layer: denied.error_layer };
   }
 

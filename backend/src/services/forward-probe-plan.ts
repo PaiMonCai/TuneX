@@ -9,9 +9,12 @@
  */
 
 import type { ForwardForDiagnose } from "./agent-diagnose.ts";
+import { nativeBothShapeError } from "./forward-native-both.ts";
 
 /** 与 Agent 侧上限一致。 */
 export const PROBE_MAX_TARGETS_PER_SEGMENT = 8;
+// This is the probe's evidence lane, never the Forward's runtime protocol.
+const TCP_PROBE_EVIDENCE_PROTOCOL = "tcp" as const;
 
 export interface DiagnoseProbeTarget {
   host: string;
@@ -28,6 +31,8 @@ export type SegmentName =
 
 /** 真正发出去的 TCP 探测（只针对目标，不针对任何业务监听端口）。 */
 export interface TcpProbeSegment {
+  /** A TCP target probe is never evidence for the composite's UDP lane. */
+  protocol?: "tcp";
   kind: "tcp_probe";
   segment: SegmentName;
   node_id: number;
@@ -85,6 +90,8 @@ export function runtimeIdFor(forwardId: number, mode: "direct" | "relay", role: 
  * 探测（例如对没有出口端口的 RELAY 探 next-hop）。
  */
 export function probeTargetsForForward(forward: ForwardForDiagnose): ProbePlan {
+  const shape = nativeBothShapeError(forward);
+  if (shape) return { ok: false, code: shape, message: "原生 both 的该组合不受支持，不能作为普通 TCP 探针解释" };
   if (!forward.ingress_node_id) {
     return { ok: false, code: "no_ingress_node", message: "该转发还没有入口节点，无法诊断" };
   }
@@ -98,6 +105,7 @@ export function probeTargetsForForward(forward: ForwardForDiagnose): ProbePlan {
       ok: true,
       segments: [{
         kind: "tcp_probe",
+        ...(forward.protocol === "both" ? { protocol: TCP_PROBE_EVIDENCE_PROTOCOL } : {}),
         segment: "ingress_to_target",
         node_id: forward.ingress_node_id,
         node_key: ingressNodeKey,
@@ -194,6 +202,7 @@ export function probeTargetsForForward(forward: ForwardForDiagnose): ProbePlan {
       {
         kind: "tcp_probe",
         segment: "egress_to_target",
+        ...(forward.protocol === "both" ? { protocol: TCP_PROBE_EVIDENCE_PROTOCOL } : {}),
         node_id: forward.egress_node_id,
         node_key: forward.egress_node_key || String(forward.egress_node_id),
         targets: validTargets.map((t) => ({ host: t.host.trim(), port: t.port })),

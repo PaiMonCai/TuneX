@@ -51,9 +51,10 @@ export function copiedForwardCreateDraft(forward: PortForward, copySuffix: strin
 }
 
 export function changeForwardCreateProtocol(draft: ForwardCreateDraft, protocol: ForwardProtocol): ForwardCreateDraft {
-  return protocol === "tls"
+  const next = protocol === "tls"
     ? { ...draft, protocol }
     : { ...draft, protocol, tlsCertPath: "", tlsKeyPath: "" };
+  return protocol === "both" ? { ...next, middleNodeId: "" } : next;
 }
 
 export function changeForwardCreateIngress(draft: ForwardCreateDraft, ingressId: string): ForwardCreateDraft {

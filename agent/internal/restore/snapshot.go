@@ -81,6 +81,7 @@ func decodeSnapshot(version string, tunnels []tunnelPayload) (*Snapshot, error) 
 			RemoteHost:             t.RemoteHost,
 			RemotePort:             t.RemotePort,
 			NextHop:                t.NextHop,
+			HopPeer:                t.HopPeer,
 			LBStrategy:             forwarder.LBStrategy(t.LBStrategy),
 			Protocol:               protocol,
 			SpeedLimit:             t.SpeedLimit,

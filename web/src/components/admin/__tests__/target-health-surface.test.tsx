@@ -352,7 +352,7 @@ describe("B. 五态各自可辨，且 unknown 只能读成「没有证据」", (
       expect(body, `${fn} 不得有 default`).not.toMatch(/\bdefault:/);
     }
     // 文案表用 Record<TargetHealthState, …>：漏一个状态同样是编译错误
-    expect(MIRROR).toContain("Record<\n  TargetHealthState,");
+    expect(MIRROR).toMatch(/Record<\r?\n  TargetHealthState,/);
     expect(Object.keys(TARGET_HEALTH_STATE_TEXT).sort()).toEqual([...TARGET_HEALTH_STATES].sort());
     expect(Object.keys(TARGET_HEALTH_REASON_TEXT).sort()).toEqual([...TARGET_HEALTH_REASONS].sort());
     // 徽标组件本身不许自己写状态判断（必须走那三个穷尽函数）。

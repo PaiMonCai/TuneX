@@ -421,7 +421,7 @@ export function checkTunnelCreation(policy: EffectivePolicy, ctx: TunnelCreateCo
   if (policy.deny_scope) {
     return deny(policy.deny_reason ?? "no_active_policy", {});
   }
-  if (!policy.entitlements.tunnel_types.includes(ctx.protocol)) {
+  if (!(ctx.protocol === "both" ? ["tcp", "udp"] : [ctx.protocol]).every((p) => policy.entitlements.tunnel_types.includes(p))) {
     return deny("protocol_not_allowed", { protocol: ctx.protocol });
   }
   if (!ctx.inGroupOwned && !sharedGroupAllowed(policy.entitlements.allowed_in_group_ids, ctx.inGroupId)) {

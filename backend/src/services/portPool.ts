@@ -554,8 +554,10 @@ export async function acquirePort(
   input: AcquirePortInput,
   inject?: PortPoolDeps,
 ): Promise<AcquirePortOutcome> {
-  // Native both is closed. FXP's two children acquire explicit TCP/UDP bindings.
-  if (typeof input.protocol === "string" && input.protocol.trim().toLowerCase() === "both") {
+  // Native composite owns one coarse, conservative lease. Shared FXP still
+  // acquires explicit child bindings; a Link must not take a composite lease.
+  if (typeof input.protocol === "string" && input.protocol.trim().toLowerCase() === "both" &&
+      (input.tunnelId == null || input.linkId != null)) {
     return { ok: false, code: "unsupported_protocol" };
   }
   if (input.linkId != null && input.tunnelId != null) throw new Error("port lease has exactly one business owner: linkId or tunnelId");
@@ -585,6 +587,11 @@ export async function acquirePort(
     holder.owner_ready === true && protocol !== "unknown" && leaseProtocol(holder.protocol) === protocol &&
     typeof holder.bind_scope === "string" && normalizeBindScope(holder.bind_scope) === bindScope));
   const ownedLinkPorts = new Set([...ownedLinkFacts].map((holder) => holder.port));
+  // Never narrow an active composite lease before the old UDP/TCP lane has
+  // drained. A coarse reservation remains safe across both -> single changes.
+  const reusableNative = (row: LeaseRow) => input.tunnelId != null && sameOwner(row, input) &&
+    row.lease_type === input.leaseType && normalizeBindScope(row.bind_scope) === bindScope &&
+    (row.protocol === protocol || row.protocol === "unknown" || protocol === "unknown" && input.protocol === "both");
   const ownsBinding = (port: number, rows: readonly LeaseRow[]) => rows.some((row) =>
     row.node_id === input.nodeId && row.port === port && row.status === LEASE_STATUS.active && sameOwner(row, input) &&
     row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope);
@@ -603,11 +610,16 @@ export async function acquirePort(
   const ownedLink = input.linkId != null && !isPreferred
     ? activeRows.find((row) => sameOwner(row, input) && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope)
     : undefined;
+  const ownedNative = input.tunnelId != null && !isPreferred
+    ? activeRows.find((row) => reusableNative(row) && (input.protocol === "both" || row.protocol === "unknown"))
+    : undefined;
+  const ownedAutomatic = ownedLink ?? ownedNative;
   const blocked = (port: number) => reserved(port) || activeRows.some((row) =>
     row.port === port && bindingOverlaps(row, protocol, bindScope) &&
-    !((isPreferred || ownedLink === row) && sameOwner(row, input) && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope));
-  const candidates = ownedLink ? [ownedLink.port] : portCandidates(range, input.preferredPort ?? null);
-  const attempts = isPreferred || ownedLink ? candidates : candidates.filter((port) => !blocked(port)).slice(0, MAX_ATTEMPTS);
+    !((isPreferred || ownedAutomatic === row) && sameOwner(row, input) &&
+      (row.protocol === protocol || reusableNative(row)) && normalizeBindScope(row.bind_scope) === bindScope));
+  const candidates = ownedAutomatic ? [ownedAutomatic.port] : portCandidates(range, input.preferredPort ?? null);
+  const attempts = isPreferred || ownedAutomatic ? candidates : candidates.filter((port) => !blocked(port)).slice(0, MAX_ATTEMPTS);
   const expiresAt = input.linkId != null || input.tunnelId != null
     ? (input.expiresAt ?? null)
     : (input.expiresAt ?? new Date(Date.now() + PREALLOC_TTL_S * 1000));
@@ -636,10 +648,19 @@ export async function acquirePort(
             );
             const rows = await tx.nodePortLease.findMany({ where: { node_id: input.nodeId, port } }) as LeaseRow[];
             const current = rows.filter((row) => row.status === LEASE_STATUS.active);
-            const owned = current.find((row) => sameOwner(row, input) && row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope);
+            const owned = current.find((row) => sameOwner(row, input) &&
+              (row.protocol === protocol || reusableNative(row)) && normalizeBindScope(row.bind_scope) === bindScope);
             if (current.some((row) => row !== owned && bindingOverlaps(row, protocol, bindScope))) return null;
             if (reserved(port, current)) return null;
-            if (owned) return leaseResult(owned, true);
+            if (owned) {
+              if (protocol === "unknown" && owned.protocol !== "unknown" && input.protocol === "both") {
+                const advanced = await tx.nodePortLease.updateMany({ where: { id: owned.id, status: LEASE_STATUS.active,
+                  protocol: owned.protocol, tunnel_id: input.tunnelId, link_id: null }, data: { protocol: "unknown" } }) as { count: number };
+                if (!advanced.count) return null;
+                return leaseResult({ ...owned, protocol: "unknown" }, true);
+              }
+              return leaseResult(owned, true);
+            }
             const data = {
               node_id: input.nodeId, port, protocol, bind_scope: bindScope,
               lease_type: input.leaseType, tunnel_id: input.tunnelId ?? null,

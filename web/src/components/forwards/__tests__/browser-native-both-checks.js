@@ -1,0 +1,88 @@
+/* Execute in the local fixture tab only. Real DOM interactions, not React state injection. */
+window.runNativeBothFixtureChecks = async function () {
+  const results = [];
+  const pause = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
+  const wait = async (condition, message) => {
+    for (let i = 0; i < 100; i++) { if (condition()) return; await pause(); }
+    throw new Error(message);
+  };
+  const assert = (condition, message) => { if (!condition) throw new Error(message); results.push(message); };
+  const button = (label) => [...document.querySelectorAll('button')].find((el) => el.textContent.trim() === label);
+  const click = async (label) => { const el = button(label); if (!el) throw new Error(`Missing ${label}`); el.click(); await pause(); };
+  const gates = () => document.querySelector('[data-testid="fixture-gates"]')?.textContent ?? '';
+  const close = async () => { const el = button('Cancel'); if (el) { el.click(); await wait(() => !document.querySelector('[role="dialog"]'), 'dialog closed'); } };
+  const openProtocol = async (edit = false) => {
+    const el = document.querySelector(`[data-testid="${edit ? 'forward-edit-protocol-select' : 'forward-protocol-select'}"]`);
+    if (!el) throw new Error('Missing protocol select');
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await wait(() => document.querySelector('[role="listbox"]'), 'protocol options opened');
+  };
+  const both = () => [...document.querySelectorAll('[role="option"]')].find((el) => el.textContent.trim() === 'TCP + UDP');
+  const chooseBoth = async () => {
+    await openProtocol(); const el = both(); assert(el && !el.hasAttribute('data-disabled'), 'both selectable only with actual native facts');
+    el.click(); await wait(() => !document.querySelector('[role="listbox"]'), 'both selected');
+  };
+  const input = async (el, value) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true })); await pause();
+  };
+  const state = async () => (await (await fetch('/__test/state')).json()).data;
+  await close();
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await pause();
+  await click('Reset fixture gates'); await wait(() => gates() === 'flag on · native nodes 2', 'gates loaded');
+  assert(document.querySelector('[data-testid="forward-both-probe-scope"]').textContent.includes('UDP'), 'TCP probe is not UDP proof');
+  const facts = document.querySelector('[data-testid="forward-topology-diag-facts"]').textContent;
+  assert(facts.includes('live_connections: 0') && !facts.includes('live_mappings: 0'), 'reported TCP zero retained; missing UDP never zero');
+  assert(facts.includes('bytes sum TCP + UDP') && facts.includes('live connections count TCP only'), 'mixed byte/TCP/UDP semantics not conflated');
+  await click('Create DIRECT fixture'); await chooseBoth();
+  assert(document.querySelector('[data-testid="forward-path-mixed"]'), 'DIRECT mixed path label is a plan');
+  await input(document.querySelector('[data-testid="forward-max_connections"]'), '9');
+  await input(document.querySelector('[data-testid="forward-max_connections_per_ip"]'), '2');
+  await click('New direct forward'); await wait(() => !document.querySelector('[role="dialog"]'), 'DIRECT submitted');
+  const direct = (await state()).calls.filter((call) => call.path === '/api/forwards' && call.method === 'POST').at(-1);
+  assert(direct.body.protocol === 'both' && direct.body.listen_port === null, 'one DIRECT create preserves both and auto-port');
+  assert(direct.body.max_connections === 9 && direct.body.max_connections_per_ip === 2, 'shared budget values are not doubled');
+  assert(!('tls_cert_path' in direct.body) && !('tcp' in direct.body) && !('udp' in direct.body), 'no TLS or split-rule payload');
+  await click('Create RELAY fixture'); await chooseBoth();
+  assert(!document.querySelector('[role="dialog"]').textContent.includes('Middle node'), 'native both has no middle-hop control');
+  await click('New custom path'); await wait(() => !document.querySelector('[role="dialog"]'), 'RELAY submitted');
+  const relay = (await state()).calls.filter((call) => call.path === '/api/forwards' && call.method === 'POST').at(-1);
+  assert(relay.body.mode === 'relay' && relay.body.egress_node_id === 12 && relay.body.protocol === 'both', 'one single-hop local RELAY create');
+  await click('Flag off'); await wait(() => gates().startsWith('flag off'), 'flag disabled');
+  await click('Copy existing both fixture');
+  assert(document.querySelector('[data-testid="forward-protocol-select"]').textContent === 'TCP + UDP', 'flag-off copy preserves both fact, no TCP downgrade');
+  assert(document.querySelector('[data-testid="forward-native-both-gate"]').textContent.includes('disabled'), 'flag-off copy provides a clear refusal reason');
+  assert(button('New direct forward').disabled, 'flag-off copy cannot create both'); await close();
+  await click('Edit existing both fixture');
+  assert(document.querySelector('[data-testid="forward-edit-protocol-select"]').textContent === 'TCP + UDP', 'flag-off edit retains both fact');
+  await input(document.querySelector('[role="dialog"] input'), 'existing both renamed');
+  await wait(() => button('Save') && !button('Save').disabled, 'flag-off existing edit preview accepted');
+  await click('Save'); await wait(() => !document.querySelector('[role="dialog"]'), 'existing edit saved');
+  const patch = (await state()).calls.filter((call) => call.path === '/api/forwards/40' && call.method === 'PATCH').at(-1);
+  assert(patch.body.name === 'existing both renamed' && !('protocol' in patch.body) && patch.body.expected_revision === 7, 'single metadata PATCH does not silently rewrite both and keeps desired revision');
+  await click('Edit existing both fixture');
+  await input(document.querySelector('[role="dialog"] input[placeholder="example.com"]'), '127.0.0.2');
+  await wait(() => document.querySelector('[role="dialog"]').textContent.includes('fully replaces both'), 'replacement impact loaded');
+  assert(document.querySelector('[role="dialog"]').textContent.includes('no atomic partial retarget'), 'retarget truthfully describes full replacement of both legs'); await close();
+  await click('Edit TCP fixture'); await openProtocol(true);
+  assert(both().hasAttribute('data-disabled'), 'flag-off transition into both disabled');
+  document.querySelector('[role="listbox"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await pause(); await close();
+  await click('Reset fixture gates'); await wait(() => gates() === 'flag on · native nodes 2', 'reset gates');
+  await click('Separate TCP UDP only'); await wait(() => gates() === 'flag on · native nodes 0', 'legacy separate caps loaded');
+  await click('Create DIRECT fixture'); await openProtocol();
+  assert(both().hasAttribute('data-disabled'), 'separate TCP plus UDP is not native both');
+  document.querySelector('[role="listbox"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await pause(); await close();
+  await click('Reset fixture gates'); await wait(() => gates() === 'flag on · native nodes 2', 'reset stale scenario');
+  await click('Stale native report'); await wait(() => gates() === 'flag on · native nodes 0', 'stale runtime facts loaded');
+  await click('Create DIRECT fixture'); await openProtocol();
+  assert(both().hasAttribute('data-disabled'), 'stale native advertisement cannot enable both even with admission');
+  document.querySelector('[role="listbox"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await pause(); await close();
+  await click('Malformed flag'); await wait(() => gates().startsWith('flag unknown'), 'malformed capability stays unknown');
+  await click('Copy existing both fixture'); assert(button('New direct forward').disabled, 'malformed flag cannot enable both create'); await close();
+  await click('Reset fixture gates'); await wait(() => gates() === 'flag on · native nodes 2', 'reset scope facts');
+  await click('Delay scope facts'); await click('Switch fixture workspace');
+  await wait(() => document.querySelector('[data-testid="fixture-scope"]').textContent === 'Workspace 6' && gates() === 'flag off · native nodes 0', 'new workspace facts loaded');
+  await pause(1300);
+  assert(gates() === 'flag off · native nodes 0', 'late old-workspace capabilities cannot enable both');
+  return { assertions: results.length, results, fixtureOnly: true };
+};

@@ -70,6 +70,7 @@ describe("V4 forward edit UX — 字段集等同于创建表单", () => {
         "listen_port",
         "mode",
         "name",
+        "protocol",
         "target_host",
         "target_port",
       ].sort(),

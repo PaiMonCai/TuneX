@@ -26,8 +26,11 @@ import { acquirePort, type PortPoolDb } from "../portPool.ts";
 // `isRevisionBehind` 是 reconciler 的落后判定（applied < config）：rollout 落账
 // 是否让「编辑后」安静下来，必须用真实判定函数而不是在测试里重抄一遍条件。
 import { isRevisionBehind } from "../reconciler.ts";
+import { capabilityFactsFromStoredV2 } from "../capability-manifest.ts";
+import { FORWARD_NATIVE_BOTH_CAPABILITY } from "../forward-native-both.ts";
 import {
   executeRollout,
+  compensateRollout,
   readKeySet,
   registerRollout,
   type RolloutDb,
@@ -212,8 +215,9 @@ const fakeDb = () => {
       // V5.3 新契约：回滚产生新世代 ⇒ 补偿为"内容 = 基线"的新 revision 写快照。
       create: async (args: unknown) => {
         const a = args as { data: { tunnel_id: number; revision: number } };
-        snapshots.push({ ...a.data });
-        return a.data;
+        const snapshot = { id: seq++, ...a.data };
+        snapshots.push(snapshot);
+        return snapshot;
       },
     },
     forwardRollout: {
@@ -327,6 +331,85 @@ const fakeDb = () => {
     addTunnel: (t: Record<string, unknown>) => tunnels.push({ id: 1, user_id: 1, workspace_id: 1, tunnel_type: "tcp", ...t }),
   };
 };
+
+const nativeBothFacts = () => capabilityFactsFromStoredV2({ control_protocol_version: 2,
+  capabilities: ["apply_tunnel", "remove_tunnel", FORWARD_NATIVE_BOTH_CAPABILITY], reported_at: new Date(),
+  capability_manifest: { schema_version: 2, protocols: ["tcp", "udp", "both"], transports: ["stream", "datagram", "mixed"], runtime: [], diagnostics: [] } });
+
+it("native both rollback restores the baseline protocol, full projection and policy at a new durable revision", async () => {
+  const { f, deps, orch } = directEnv();
+  Object.assign(f.snapshots.find((s) => s.revision === 6)!, { protocol: "both", max_connections: 4 });
+  Object.assign(f.snapshots.find((s) => s.revision === 7)!, { protocol: "tcp", max_connections: 8 });
+  Object.assign(f.tunnels[0]!, { forward_protocol: "tcp", max_connections: 8 });
+  f.leases[0]!.protocol = "unknown";
+  deps.loadCapabilityFacts = async () => nativeBothFacts();
+  const checked: string[] = [];
+  deps.runtimeUse = async (_id, resource) => { checked.push(resource.protocol!); return null; };
+  const dispatch = orch.dispatchDirect;
+  orch.dispatchDirect = (async (input: Record<string, unknown>) => {
+    const result = await dispatch(input as unknown as Record<string, unknown>);
+    return orch.calls.dispatchDirect.length === 1 ? { ok: false, error_code: "agent_rejected", error: "bind failed" } : result;
+  }) as typeof orch.dispatchDirect;
+  const registration = await registerRollout({ tunnelId: 1, revision: 7, baseRevision: 6,
+    impact: impact({ listen_port_change: true, listener_replacement: true }) }, deps);
+  expect(registration.rolloutId).not.toBeNull();
+  const result = await executeRollout(registration.rolloutId!, deps);
+  expect(result.phase).toBe("failed");
+  expect(orch.calls.dispatchDirect.map((c) => c.protocol)).toEqual(["tcp", "both"]);
+  expect(checked).toContain("both");
+  const rollback = f.snapshots.find((s) => s.revision === 8)!;
+  expect(f.tunnels[0]).toMatchObject({ forward_protocol: "both", tunnel_type: null, config_revision: 8,
+    applied_revision: 8, desired_revision_id: rollback.id, listen_port: 10001, max_connections: 4 });
+});
+
+it("native both rollback rechecks fresh capabilities before replay; removal still proceeds without them", async () => {
+  const { f, deps, orch } = directEnv();
+  Object.assign(f.snapshots.find((s) => s.revision === 6)!, { protocol: "both" });
+  Object.assign(f.snapshots.find((s) => s.revision === 7)!, { protocol: "tcp" });
+  f.tunnels[0]!.forward_protocol = "tcp";
+  const registration = await registerRollout({ tunnelId: 1, revision: 7, baseRevision: 6,
+    impact: impact({ listen_port_change: true, listener_replacement: true }) }, deps);
+  deps.loadCapabilityFacts = async () => null;
+  const dispatchedBeforeCompensation = orch.calls.dispatchDirect.length;
+  const result = await compensateRollout(registration.rolloutId!, deps);
+  expect(result.ok).toBe(false); expect(result.error).toContain("protocol_not_supported");
+  expect(orch.calls.removeTunnel.length).toBeGreaterThan(0);
+  expect(orch.calls.dispatchDirect).toHaveLength(dispatchedBeforeCompensation);
+  expect(f.tunnels[0]!.forward_protocol).toBe("tcp");
+});
+
+it("relay both compensation retains hop_peer from the baseline ingress after a failed placement/protocol change", async () => {
+  const { f, deps, orch } = directEnv();
+  Object.assign(f.snapshots.find((s) => s.revision === 6)!, { protocol: "both", mode: "relay", egress_node_id: 21,
+    egress_port: 31000, targets: [{ host: "10.9.9.9", port: 8080, weight: 1, order_by: 10 }] });
+  Object.assign(f.snapshots.find((s) => s.revision === 7)!, { protocol: "tcp", ingress_node_id: 12 });
+  Object.assign(f.tunnels[0]!, { forward_protocol: "tcp", ingress_node_id: 12,
+    ingress_node: { connect_ip: "10.0.0.12" } });
+  deps.loadCapabilityFacts = async () => nativeBothFacts();
+  const registration = await registerRollout({ tunnelId: 1, revision: 7, baseRevision: 6,
+    impact: impact({ ingress_node_change: true, listener_replacement: true }) }, deps);
+  // Inject the persisted failure phase; compensation's terminal CAS must never
+  // be exercised on a done rollout (registration executes eagerly).
+  f.rollouts.find((r) => r.id === registration.rolloutId)!.phase = "compensating";
+  const outcome = await compensateRollout(registration.rolloutId!, deps);
+  expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+  expect(orch.calls.dispatchEgress.at(-1)).toMatchObject({ protocol: "both", hopPeer: "10.0.0.11", egressPort: 31000 });
+  expect(orch.calls.dispatchIngress.at(-1)).toMatchObject({ protocol: "both", revision: 8, ingressNode: { id: 11 } });
+});
+
+it("both automatic PREPARE lease reuse is not released when a later PREPARE step fails", async () => {
+  const { f, deps } = modeSwitchEnv();
+  f.snapshots.forEach((s) => { s.protocol = "both"; }); f.tunnels[0]!.forward_protocol = "both";
+  f.snapshots.find((s) => s.revision === 7)!.listen_port = null;
+  const leaseId = f.addLease({ node_id: 11, port: 10001, lease_type: "ingress", tunnel_id: 1, protocol: "unknown" });
+  deps.loadCapabilityFacts = async () => nativeBothFacts();
+  deps.orchestrator = fakeOrchestrator({ failOn: { dispatchEgress: true } });
+  const registration = await registerRollout({ tunnelId: 1, revision: 7, baseRevision: 6,
+    impact: impact({ mode_change: true, listener_replacement: true }) }, deps);
+  const result = await executeRollout(registration.rolloutId!, deps);
+  expect(result.phase).toBe("failed");
+  expect(f.leases.find((l) => l.id === leaseId)).toMatchObject({ status: "active", protocol: "unknown" });
+});
 
 /* ------------------------------------------------------------------ */
 /* 假 orchestrator                                                      */

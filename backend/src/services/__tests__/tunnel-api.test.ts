@@ -26,6 +26,7 @@
  * —— 它不会因为换 worktree / CI 路径而静默失效。
  */
 import { test, expect, describe, beforeEach } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
   APPLY_STATUSES,
   TUNNEL_ACTIONS,
@@ -858,6 +859,35 @@ describe("B. CRUD", () => {
 /* ================================================================== */
 
 describe("WP10 runtime-use admission", () => {
+  for (const action of ["retry", "resume", "suspend", "delete"] as const) {
+    test(`native both ${action} remains compatible with flag off and NULL legacy projection`, async () => {
+      const previous = process.env.FORWARD_NATIVE_BOTH_ENABLED;
+      process.env.FORWARD_NATIVE_BOTH_ENABLED = "false";
+      try {
+        const row = seedTunnel({ id: 995, forward_protocol: "both", tunnel_type: null,
+          apply_status: action === "retry" ? "error" : action === "resume" ? "suspended" : "active" });
+        const protocols: Array<string | undefined> = [];
+        const result = await runTunnelAction(row.id, action, 7, deps({
+          applyReapply: successReapply(), runtimeUse: async (_id, resource) => { protocols.push(resource.protocol); return null; },
+        }));
+        expect(result.ok).toBe(true);
+        expect(protocols).toEqual(action === "retry" || action === "resume" ? ["both"] : []);
+        if (action === "delete") expect(tunnels.has(row.id)).toBe(false);
+        else expect(row.forward_protocol).toBe("both");
+      } finally {
+        if (previous === undefined) delete process.env.FORWARD_NATIVE_BOTH_ENABLED;
+        else process.env.FORWARD_NATIVE_BOTH_ENABLED = previous;
+      }
+    });
+  }
+
+  test("legacy creation does not gain an unguarded both path from the Forward whitelist", async () => {
+    const before = tunnels.size;
+    expect(await createTunnel({ name: "legacy-both", mode: "direct", tunnelType: "both", inNodeGroupId: 10,
+      userId: 1, workspaceId: 7, personalWorkspaceId: 7,
+      outNodeGroupId: null, forwardAddresses: ["127.0.0.1:8080"] }, deps())).toMatchObject({ ok: false, code: "invalid_input" });
+    expect(tunnels.size).toBe(before);
+  });
   for (const action of ["retry", "resume"] as const) {
     test(`${action}: revoked capability rejects before desired mutation or dispatch`, async () => {
       const t = seedTunnel({ id: 990, apply_status: action === "retry" ? "error" : "suspended", desired_status: "inactive" });
@@ -1215,7 +1245,7 @@ describe("E. 结构约束", () => {
     // 不得出现 createCommand / dispatchEgress / dispatchIngress /
     // transport 调用 / listen。真下发只允许在 WP8 orchestrator.ts。
     const src = await Bun.file(
-      new URL("../tunnel-api.ts", import.meta.url).pathname,
+      fileURLToPath(new URL("../tunnel-api.ts", import.meta.url)),
     ).text();
     for (const forbidden of [
       "createCommand(",
@@ -1236,7 +1266,7 @@ describe("E. 结构约束", () => {
   });
 
   test("E1b. 创建额度不得使用硬编码 0，且必须经过 workspace quota critical section", async () => {
-    const code = await Bun.file(new URL("../tunnel-api.ts", import.meta.url).pathname).text();
+    const code = await Bun.file(fileURLToPath(new URL("../tunnel-api.ts", import.meta.url))).text();
     expect(code).toContain("deps.quotaLock(input.workspaceId");
     expect(code).toContain("tx.tunnel.count");
     expect(code).toContain("tx.tunnelTraffic.aggregate");
@@ -1246,7 +1276,7 @@ describe("E. 结构约束", () => {
 
   test("E2. 服务层唯一的下发出口是 scheduler 的两个编排入口", async () => {
     const src = await Bun.file(
-      new URL("../tunnel-api.ts", import.meta.url).pathname,
+      fileURLToPath(new URL("../tunnel-api.ts", import.meta.url)),
     ).text();
     // createRelayTunnel（创建）与 reapplyRelayTunnel（重入）是唯二被引用的编排函数。
     expect(src.includes("createRelayTunnel")).toBe(true);

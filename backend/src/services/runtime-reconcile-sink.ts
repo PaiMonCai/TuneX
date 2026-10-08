@@ -34,6 +34,7 @@
  */
 import { Orchestrator, type OrchestratorNode } from "./orchestrator.ts";
 import { dispatchFactsFromRow, persistedForwardProtocol } from "./forward-contract.ts";
+import { admitRuntimeFromStore, type CapabilityFactsLoader } from "./runtime-admission.ts";
 import type { ReconcileSink } from "./reconciler.ts";
 import type { RuntimeUseChecker } from "./forward-rollout-exec.ts";
 import type { RuntimeUseDenied } from "./forward-capability.ts";
@@ -61,7 +62,9 @@ export interface SinkTunnel {
   id: number;
   workspace_id: number;
   user_id: number;
-  tunnel_type?: string;
+  tunnel_type?: string | null;
+  federated_egress_peer?: string | null;
+  link_source_config?: unknown;
   /**
    * Canonical protocol fact (V5-WP0). It must be present on the projection: this
    * sink issues real commands, and `admitPersistedProtocol` fails closed when the
@@ -231,6 +234,7 @@ export interface RuntimeReconcileSinkDeps {
   now?: () => Date;
   /** Production defaults to the real latest grant/policy/traffic check. */
   runtimeUse?: RuntimeUseChecker;
+  loadCapabilityFacts?: CapabilityFactsLoader;
 }
 
 /** 懒加载 relay-wiring：顶层 import 会连带 eager 建 Redis/Prisma 连接。 */
@@ -268,6 +272,13 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
       await ledger.markBlocked?.({ tunnelId: tunnel.id, revision, denied });
       throw new Error(`[${denied.reason}:${denied.error_layer}] ${denied.message}`);
     }
+    if (tunnel.forward_protocol === "both") {
+      const admission = await admitRuntimeFromStore([
+        { nodeId: tunnel.ingress_node!.id, role: "ingress" },
+        ...(tunnel.tunnel_mode === "relay" ? [{ nodeId: tunnel.egress_node!.id, role: "egress" as const }] : []),
+      ], { action: "apply_tunnel", protocol: "both" }, deps.loadCapabilityFacts);
+      if (!admission.ok) throw new Error(`[runtime_admission:${admission.reason}] ${admission.detail}`);
+    }
   };
 
   return {
@@ -298,6 +309,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
         // orchestrator defaults an absent protocol to tcp — and the panel would
         // report a successful reconcile of a Forward it must not run.
         const facts = dispatchFactsFromRow({
+          ...tunnel,
           forward_protocol: tunnel.forward_protocol,
           tunnel_type: tunnel.tunnel_type,
           tls_cert_path: tunnel.tls_cert_path,
@@ -348,6 +360,7 @@ export function createRuntimeReconcileSink(deps: RuntimeReconcileSinkDeps = {}):
       // Same rule as the DIRECT branch above: the replay carries the persisted
       // protocol, so a historical non-TCP Forward cannot be reconciled as TCP.
       const relayFacts = dispatchFactsFromRow({
+        ...tunnel,
         forward_protocol: tunnel.forward_protocol,
         tunnel_type: tunnel.tunnel_type,
         tls_cert_path: tunnel.tls_cert_path,

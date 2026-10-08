@@ -36,9 +36,8 @@ export type ForwardDraft = ForwardPolicyDraft & {
 /**
  * 创建/复制草稿 = 编辑草稿 + 协议字段。
  *
- * 分开定义（而不是把协议塞进 {@link ForwardDraft}）是因为**协议本身不可编辑**：
- * 后端 `ForwardPatchSchema` 不接受 `protocol`（把 tcp 改成 tls 不是一次编辑），
- * 编辑器草稿里放一个永远不会被保存的字段，是让人误以为能改的地方。
+ * 创建协议受契约白名单约束；编辑草稿另接受持久化协议事实，只开放普通
+ * tcp / udp / 原生 both 切换，TLS / WS / 历史协议仍然固定。
  *
  * （tls 的证书路径**可以**编辑，所以编辑器草稿里另有这两个字段 —— 见
  * `forward-edit-dialog.tsx` 的编辑草稿类型。）

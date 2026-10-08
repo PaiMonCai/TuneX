@@ -12,6 +12,8 @@
 import { Prisma } from "@prisma/client";
 import type { TunnelType } from "@prisma/client";
 import { db } from "../db.ts";
+import { nativeBothEntryDisabled, nativeBothShapeError } from "./forward-native-both.ts";
+import { admitRuntimeFromStore } from "./runtime-admission.ts";
 import { bindScopesOverlap, protocolsOverlap } from "../integrations/forwardx/bind-scope.ts";
 import { forwardPolicyErrors, forwardPolicyValues, resolveForwardPolicy, type ForwardPolicyInput } from "./forward-policy.ts";
 import {
@@ -66,6 +68,7 @@ import {
   type ForwardProtocol,
   tlsPathsForProtocol,
   legacyTunnelTypeColumn,
+  FORWARD_PROTOCOL_SPECS,
   // 可拨号地址的唯一判据（`connect_ip` 可能是逗号分隔的候选列表，取第一个非空项）。
   firstConnectIp,
 } from "./forward-contract.ts";
@@ -140,6 +143,7 @@ export interface ForwardListInput {
 }
 
 export interface ForwardPatchInput extends ForwardPolicyInput {
+  protocol?: "tcp" | "udp" | "both";
   name?: string;
   /**  §13.3.1：创建后可编辑的全部业务字段。 */
   mode?: ForwardMode;
@@ -307,6 +311,7 @@ export function forwardView(t: any) {
         : null;
 
   const protocol = persistedForwardProtocol(t.forward_protocol, t.tunnel_type);
+  const nativeProtocol = normalizeForwardProtocol(protocol);
   return {
     id: t.id,
     link_resource_id: t.link_resource_id ?? null,
@@ -314,9 +319,10 @@ export function forwardView(t: any) {
     creator_user_id: t.user_id ?? null,
     name: t.name,
     protocol,
+    transport: nativeProtocol === null ? null : FORWARD_PROTOCOL_SPECS[nativeProtocol].transport,
     protocol_supported: t.link_resource_id != null
       ? process.env.TUNEX_FXP_LINKS_ENABLED === "true" && ["tcp", "udp", "both"].includes(protocol)
-      : normalizeForwardProtocol(protocol) !== null,
+      : normalizeForwardProtocol(protocol) !== null && nativeBothShapeError({ ...t, forward_protocol: protocol }) === null,
     // : the paths are part of a tls Forward's configuration, so the view
     // carries them. Without them the detail page can say "TLS" but never which
     // certificate, and an operator cannot verify a path without reading the DB —
@@ -703,6 +709,9 @@ export async function createForward(
   if (protocol === null) {
     return error(400, "invalid_input", "当前版本不支持该转发协议");
   }
+  if (nativeBothEntryDisabled(protocol)) return error(409, "feature_disabled", "原生 both 转发尚未启用");
+  const bothShape = nativeBothShapeError({ ...input, protocol });
+  if (bothShape) return error(400, "invalid_input", "原生 both 只支持普通 DIRECT 或自有单跳 RELAY", { data: { reasons: [bothShape] } });
   // : a tls front needs both paths, and only a tls front accepts them.
   // The panel cannot check that the files exist (they live on the node); what it
   // must not do is dispatch "serve TLS" without a certificate, or quietly attach
@@ -852,6 +861,19 @@ export async function createForward(
 
   const target = targetAddress(input.target_host.trim(), input.target_port);
 
+  // Admission must precede row/pool/path reservation, even without a worker.
+  if (protocol === "both") {
+    const selectorShape = nativeBothShapeError({ ...input, protocol, lb_strategy: egress?.lb_strategy });
+    if (selectorShape) return error(400, "invalid_input", "原生 both 不支持 IP_HASH", { data: { reasons: [selectorShape] } });
+    const admission = await admitRuntimeFromStore([
+      { nodeId: ingress.id, role: "ingress" },
+      ...(egress ? [{ nodeId: egress.id, role: "egress" as const }] : []),
+    ], { action: "apply_tunnel", protocol });
+    if (!admission.ok) return error(409, admission.body.code, admission.body.error, {
+      error_layer: "runtime_admission", data: { condition: admission.reason, node_id: admission.node_id, node_role: admission.node_role },
+    });
+  }
+
   const reserved = await withWorkspaceQuotaLock(
     workspaceId,
     async (tx, policy) => {
@@ -918,7 +940,7 @@ export async function createForward(
           // boundary between the two. It is `TunnelType`, not `string`: a value
           // the enum does not know must be a compile error, which is exactly the
           // bug this line was written to fix (`ws` has no legacy enum value).
-          ...(legacyTunnelTypeColumn(protocol) as { tunnel_type?: TunnelType }),
+          ...(legacyTunnelTypeColumn(protocol) as { tunnel_type?: TunnelType | null }),
           forward_protocol: protocol,
           ...requestedForwardPolicy,
           ...tlsPaths.columns,
@@ -1449,6 +1471,8 @@ async function resolveForwardCandidate(
   const current = await loadForwardRow(id, workspaceId);
   if (!current) return { ok: false, error: error(404, "not_found", "端口转发不存在") };
   if (current.link_resource_id != null || "link_resource_id" in patch) return { ok: false, error: linkManagedForward() };
+  const storedBothShape = nativeBothShapeError(current);
+  if (storedBothShape) return { ok: false, error: error(400, "invalid_input", "该原生 both 组合不受支持", { data: { reasons: [storedBothShape] } }) };
 
   const row = current as unknown as ForwardRevisionRow;
   const base = currentDesiredConfig(row);
@@ -1457,6 +1481,18 @@ async function resolveForwardCandidate(
     base.target_port = current.egress_pool.targets[0].port;
   }
   const candidate = mergeForwardCandidate(base, patch);
+
+  const candidateShape = nativeBothShapeError({ ...current, ...candidate, forward_protocol: candidate.protocol,
+    tunnel_mode: candidate.mode });
+  if (candidateShape) return { ok: false, error: error(400, "invalid_input", "该原生 both 组合不受支持", { data: { reasons: [candidateShape] } }) };
+
+  if (patch.protocol !== undefined && patch.protocol !== base.protocol &&
+      (!["tcp", "udp", "both"].includes(base.protocol ?? "") || !["tcp", "udp", "both"].includes(patch.protocol))) {
+    return { ok: false, error: error(400, "invalid_input", "TLS/WS 前端不能转为原生 socket 协议", { data: { reasons: ["native_both_transition_unsupported"] } }) };
+  }
+  if (nativeBothEntryDisabled(candidate.protocol, base.protocol)) {
+    return { ok: false, error: error(409, "feature_disabled", "原生 both 转发尚未启用") };
+  }
 
   // 纯形态校验失败 → 不读库（preview / update 同一短路顺序）。
   const pure = validateForwardCandidate(candidate);
@@ -1507,14 +1543,14 @@ async function resolveForwardCandidate(
       ? Promise.resolve([])
       : db.nodePortLease.findMany({
           where: { node_id: candidate.ingress_node_id, port: candidate.listen_port, status: "active" },
-          select: { tunnel_id: true, port: true },
+          select: { tunnel_id: true, port: true, protocol: true, bind_scope: true },
         }),
     db.tunnel.findMany({
       where: {
         ingress_node_id: candidate.ingress_node_id,
         listen_port: candidate.listen_port ?? undefined,
       },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, forward_protocol: true, tunnel_type: true, listen_ip: true },
     }),
   ]);
 
@@ -1584,7 +1620,8 @@ async function resolveForwardCandidate(
   // 端口占用：DB 租约 + 同节点其它 Forward（含 legacy DIRECT）。
   const takenByOther = new Set<number>();
   for (const h of portHolders) {
-    if (h.tunnel_id !== null && h.tunnel_id !== id && h.port === candidate.listen_port) {
+    if (h.tunnel_id !== id && h.port === candidate.listen_port && protocolsOverlap(h.protocol, candidate.protocol) &&
+        bindScopesOverlap(h.bind_scope, current.listen_ip)) {
       takenByOther.add(h.port);
     }
   }
@@ -1592,7 +1629,9 @@ async function resolveForwardCandidate(
     if (
       s.id !== id &&
       candidate.listen_port !== null &&
-      s.listen_port === candidate.listen_port
+      s.listen_port === candidate.listen_port &&
+      protocolsOverlap(persistedForwardProtocol(s.forward_protocol, s.tunnel_type), candidate.protocol) &&
+      bindScopesOverlap(s.listen_ip, current.listen_ip)
     ) {
       takenByOther.add(candidate.listen_port);
     }
@@ -1678,6 +1717,15 @@ async function resolveForwardCandidate(
     if (rejected) {
       return { ok: false, error: error(403, rejected.reason, rejected.message, {
         data: { error_layer: rejected.error_layer },
+      }) };
+    }
+    if (admittedProtocol === "both") {
+      const admission = await admitRuntimeFromStore([
+        { nodeId: ingress.id, role: "ingress" },
+        ...(egress ? [{ nodeId: egress.id, role: "egress" as const }] : []),
+      ], { action: "apply_tunnel", protocol: admittedProtocol });
+      if (!admission.ok) return { ok: false, error: error(409, admission.body.code, admission.body.error, {
+        error_layer: "runtime_admission", data: { condition: admission.reason, node_id: admission.node_id, node_role: admission.node_role },
       }) };
     }
   }

@@ -65,6 +65,9 @@ export async function checkForwardRuntimeUse(
     }
   }
   const policy = await deps.policy(workspaceId);
+  if (resource.protocol === "both" && (ingress!.workspace_id !== workspaceId || egress && egress.workspace_id !== workspaceId)) {
+    return { code: "forbidden", reason: "native_both_self_owned_required", error_layer: "resource_scope", message: "原生 both 只支持自有节点" };
+  }
   const decision = checkTunnelUse(policy, {
     trafficUsed: await deps.traffic(workspaceId, policy.limits.traffic_period),
     protocol: resource.protocol ?? DEFAULT_FORWARD_PROTOCOL,

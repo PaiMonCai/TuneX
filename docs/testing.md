@@ -73,6 +73,10 @@ bash scripts/integration/abcd-core-gate.sh
 
 脚本启用 FXP、构建候选 backend/Agent、创建四节点测试拓扑，执行真实载体、TCP/UDP/both、限制、共享更新、授权、恢复、删除和运行事实检查。结果写入 `scripts/integration/evidence/abcd-links-result.txt`；脱敏诊断与对应镜像/SHA 一起保存。
 
+F3 精确候选 `47594c4` 的 [CI 37724092872](https://github.com/PaiMonCai/TuneX/actions/runs/37724092872)：四节点共享 gate 73 PASS / 0 FAIL、backend 3197 通过、数据库/HTTP 119 通过且零跳过、web 1482 通过，required 成功。主分支专用 race/历史生产升级回放未在该候选运行，真实 Panel 浏览器验收仍单独要求。
+
+F4 同一入口额外 opt-in `FORWARD_NATIVE_BOTH_ENABLED=true` 并运行 `native-both.py`，结果单独保存 `native-both-result.txt`。使用实际 API/Worker/Agent 验证 plain DIRECT/单跳 RELAY 同号两协议、共享并发、两协议目标同步更新、UDP 真实 OS 占用导致的半绑定失败、正常重试、暂停/恢复、重启和删除后精确复用。失败不跳过、不注入 Ready，也不手工删租约。F4 必须看对应候选 SHA 的 gate；F3 的绿色不覆盖这些新增场景。
+
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 
 F2 同一 gate 新增真实目标 3044/3045：完整策略 API 往返、辅助 TCP 健康、主目标实际关闭、10 秒失败/恢复窗口、全故障、恢复后的新 TCP 与保持备用 UDP 映射、RR、random、固定 UDP 来源及 Agent 重启。每次等待继续使用 B 的原 TCP 和 UDP socket；不改数据库健康状态或伪造 Ready。窗口抖动、未知 UDP、nonce/replay 和未授权目标另由真实 runner 回归覆盖。Windows 本地不能代替该 Linux 门禁。

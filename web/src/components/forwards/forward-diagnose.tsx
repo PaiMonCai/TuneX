@@ -18,6 +18,8 @@
 import { useState } from "react";
 import { api } from "@/lib/api";
 import type { DiagnoseProbeResult, DiagnoseReport, DiagnoseSegment, ID } from "@/lib/types";
+import { forwardTransportFor } from "@/lib/forward-protocol";
+import { useI18nOptional } from "@/components/providers";
 
 const SEGMENT_LABEL: Record<DiagnoseSegment["segment"], string> = {
   ingress_to_target: "入口节点 → 目标",
@@ -62,11 +64,12 @@ export function segmentTone(segment: DiagnoseSegment): "ok" | "unverified" | "ba
 
 export type ForwardDiagnoseProps = {
   forwardId: ID;
+  protocol?: string;
   /** 便于测试注入；生产用 api.forwards.diagnose。 */
   runDiagnose?: (id: ID) => Promise<DiagnoseReport>;
 };
 
-export function ForwardDiagnose({ forwardId, runDiagnose }: ForwardDiagnoseProps) {
+export function ForwardDiagnose({ forwardId, protocol, runDiagnose }: ForwardDiagnoseProps) {
   const [report, setReport] = useState<DiagnoseReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -110,7 +113,7 @@ export function ForwardDiagnose({ forwardId, runDiagnose }: ForwardDiagnoseProps
         </p>
       ) : null}
 
-      {report ? <ForwardDiagnoseReportView report={report} /> : null}
+      {report ? <ForwardDiagnoseReportView report={report} protocol={protocol} /> : null}
     </section>
   );
 }
@@ -123,9 +126,14 @@ export function ForwardDiagnose({ forwardId, runDiagnose }: ForwardDiagnoseProps
  * 一个 report 直接渲染出来，否则那些语义（未验证标记、下一步文案）就只能靠源码
  * 字符串扫描来"证明"，等于没测。
  */
-export function ForwardDiagnoseReportView({ report }: { report: DiagnoseReport }) {
+export function ForwardDiagnoseReportView({ report, protocol }: { report: DiagnoseReport; protocol?: string }) {
+  const mixed = forwardTransportFor(protocol ?? report.protocol) === "mixed";
+  const en = useI18nOptional()?.locale === "en";
   return (
     <div className="mt-3 space-y-3">
+      {mixed ? <p data-testid="forward-both-probe-scope" className="text-xs text-neutral-500">{en
+        ? "TCP + UDP: a TCP probe verifies only the TCP target, not UDP mappings, datagrams or the entire mixed path. Runtime facts are not connectivity proof."
+        : "TCP + UDP：TCP 探测只证明 TCP 目标可达，不验证 UDP 映射、UDP 报文或整个混合链路；节点运行态事实也不是连通性证明。"}</p> : null}
       {report.segments.map((segment) => (
         <div
           key={`${segment.segment}-${segment.node_id}`}
@@ -135,7 +143,7 @@ export function ForwardDiagnoseReportView({ report }: { report: DiagnoseReport }
             <span className="font-medium">{SEGMENT_LABEL[segment.segment]}</span>
             <span className="text-xs text-neutral-500">（{segment.node_key}）</span>
             <span data-tone={segmentTone(segment)} className="text-xs">
-              {OUTCOME_TEXT[segment.outcome]}
+              {mixed && segment.method === "tcp_probe" && segment.outcome === "ok" ? (en ? "TCP probe passed (UDP unverified)" : "TCP 探测通过（UDP 未验证）") : OUTCOME_TEXT[segment.outcome]}
             </span>
             {!segment.verified ? (
               <span

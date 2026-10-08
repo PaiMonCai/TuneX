@@ -55,6 +55,7 @@ func (c TunnelConfig) hasPolicy() bool {
 // payload; a cancelled context interrupts even a multi-year low-rate wait.
 type DataPlanePolicy struct {
 	mu      sync.Mutex
+	paused  bool
 	active  int64
 	byIP    map[string]int
 	max     int64
@@ -123,6 +124,9 @@ func (p *DataPlanePolicy) Acquire(peer net.Addr) (func(), error) {
 	ip := policySourceIP(peer)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.paused {
+		return nil, ErrPolicyCapacity
+	}
 	if p.max > 0 && p.active >= p.max {
 		return nil, ErrPolicyCapacity
 	}
@@ -148,6 +152,13 @@ func (p *DataPlanePolicy) Acquire(peer net.Addr) (func(), error) {
 			}
 		})
 	}, nil
+}
+
+// A mixed runtime opens admission only after BOTH listeners bind successfully.
+func (p *DataPlanePolicy) pauseAdmission(paused bool) {
+	p.mu.Lock()
+	p.paused = paused
+	p.mu.Unlock()
 }
 
 func policySourceIP(peer net.Addr) string {

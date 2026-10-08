@@ -61,6 +61,7 @@ import type { RuntimeUseDenied } from "./forward-capability.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   admitPersistedProtocol,
+  forwardHasDatagramLane,
   buildForwardRuntimePlan,
   addressPartOfEndpoint,
   datagramHopPeerFor,
@@ -142,7 +143,7 @@ async function correctDatagramHopPeerAfterIngressAck(args: {
   | { ok: false; revision: number; error: string; hopPeer: string | null }
 > {
   const learned = addressPartOfEndpoint(args.ingressAckHopLocalAddr);
-  if (args.protocol !== "udp" || !learned || learned === firstConnectIp(args.connectIp)) {
+  if (!forwardHasDatagramLane(args.protocol) || !learned || learned === firstConnectIp(args.connectIp)) {
     // 没有纠正要做：不是 datagram、agent 没报（老 Agent）、或报的就是首次下发用的那个地址。
     return { ok: true, revision: args.revision, corrected: false, hopPeer: learned ?? null };
   }
@@ -235,7 +236,9 @@ export async function createRelayTunnel(
 
   /* ---------------- V5-WP0 protocol admission ---------------- */
   const protocol = normalizeForwardProtocol(input.tunnelType);
-  if (protocol === null) {
+  // Do not open the compatibility create path when Forward's whitelist grows.
+  // Native both is created through the atomic /forwards reservation flow.
+  if (protocol === null || protocol === "both") {
     return fail(
       "auth_quota",
       SCHEDULER_ERROR_CODES.unsupported_protocol,

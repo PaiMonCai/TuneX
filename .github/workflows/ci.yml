@@ -307,6 +307,7 @@ jobs:
           name: abcd-core-result
           path: |
             scripts/integration/evidence/abcd-links-result.txt
+            scripts/integration/evidence/native-both-result.txt
             scripts/integration/evidence/abcd-core-diagnostics.json
           if-no-files-found: ignore
       - name: Stop disposable topology
@@ -342,6 +343,7 @@ jobs:
           python3 -m py_compile scripts/integration/a00-delete-reuse.py
           bash -n scripts/integration/abcd-core-gate.sh
           python3 -m py_compile scripts/integration/abcd-links.py
+            python3 -m py_compile scripts/integration/native-both.py
       - name: Current deployment contract
         run: bash scripts/ops/tests/installer-static.sh
 

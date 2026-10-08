@@ -47,7 +47,8 @@ test("view preserves Link identity/relay target and only marks Link both support
     process.env.TUNEX_FXP_LINKS_ENABLED = "true";
     expect(forwardView(state.rows[0])).toMatchObject({ link_resource_id: 5, protocol: "both", protocol_supported: true,
       target_host: "business.example", target_port: 8080, max_connections: 0 });
-    expect(forwardView({ ...state.rows[0], link_resource_id: null }).protocol_supported).toBe(false);
+    expect(forwardView({ ...state.rows[0], link_resource_id: null }).protocol_supported).toBe(true);
+    expect(forwardView({ ...state.rows[0], link_resource_id: null, middle_node_id: 33 })).toMatchObject({ protocol: "both", protocol_supported: false });
     process.env.TUNEX_FXP_LINKS_ENABLED = "false";
     expect(forwardView(state.rows[0]).protocol_supported).toBe(false);
   } finally {

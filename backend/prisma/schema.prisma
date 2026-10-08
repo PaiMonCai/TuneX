@@ -591,7 +591,7 @@ enum TunnelCategory {
 model Tunnel {
   id                         Int             @id @default(autoincrement())
   name                       String          @db.VarChar(255)
-  tunnel_type                TunnelType      @default(wss)
+  tunnel_type                TunnelType?     @default(wss)
   category                   TunnelCategory  @default(port_forward)
   listen_ip                  String?
   listen_port                Int?

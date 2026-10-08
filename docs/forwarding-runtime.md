@@ -12,10 +12,10 @@
 
 | 路径 | 当前支持 | 边界 |
 | --- | --- | --- |
-| 原生普通 Forward | TCP、UDP；TCP 客户端 TLS/WS 前端；DIRECT/RELAY | 普通 both 未开放。客户端 TLS/WS 不表示节点间 hop 已加密，legacy native hop 仅按私网/可信网络边界使用。 |
+| 原生普通 Forward | TCP、UDP；TCP 客户端 TLS/WS 前端；DIRECT/RELAY；原生 both 候选 | both 默认关闭、首版仅 plain DIRECT/自有单跳 RELAY，需实际能力与自身验收。客户端 TLS/WS 不表示节点间 hop 已加密，legacy native hop 仅按私网/可信网络边界使用。 |
 | 托管共享 FXP | 固定双节点、加密 TCP/UDP/both、规则复用、每规则有序多目标 | 实验开关默认关闭，公共矩阵 planned；多目标需要双方实际能力，尚无共享安全多跳/多出口。 |
 | 原生目标池 | fallback、RR/random/weighted 选择及健康恢复 | 仅适用已有出口池路径，DIRECT 业务 API 仍为单目标；不能推广到 FXP。 |
-| IP_HASH / PROXY | 共享 FXP TCP 来源切片已实现，候选验收中 | 须显式 `client_source` 及双方真实能力；UDP/both 拒绝。原生 RELAY 来源门禁不变。 |
+| IP_HASH / PROXY | 共享 FXP TCP 来源切片 `47594c4` 已通过自身候选验收 | 须显式 `client_source` 及双方真实能力；UDP/both 拒绝。原生 RELAY 来源门禁不变。 |
 
 支持维度以 [core-contract.ts](../backend/src/integrations/forwardx/core-contract.ts) 为准；实验 Link 编译和节点准入见 [link-compiler.ts](../backend/src/integrations/forwardx/link-compiler.ts)。枚举中存在 GOST/WireGuard/更多驱动的名称不代表运行支持。
 
@@ -46,6 +46,10 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 ## 运行限额与状态
 
 原生与 FXP 下发双向 bytes/sec、总并发、每来源 IP 并发，当前作用域为每规则、每入口 runtime。both 的 TCP/UDP 共享规则预算；UDP 并发是活跃映射。FXP 字段 maxIPs 表示每来源并发，不表示不同 IP 个数。
+
+原生 both 候选使用一个 ID/修订，创建或切入须服务端 `FORWARD_NATIVE_BOTH_ENABLED=true`、参与节点新鲜 `forward.protocol.both.native.v1`，并同时满足 TCP、UDP 权限。发现接口为已认证的 `/api/forwards/capabilities`；关闭开关不降级既有协议、不撤销合法恢复。中间跳/联邦/TLS/WS/来源组合拒绝；来源扩展没有借 F4 打开。原生 hop 仍不是加密载体。
+
+原生 both 两监听完成绑定才准入，任一失败清理另一侧，不能半 Ready；同号替换需重建时会中断受影响规则，两协议目标同步更新。补偿仅重建仍获授权的旧修订，保持有效续租，绝不回滚已观察的所有权 epoch。运行流量是 TCP+UDP payload 聚合；连接数为 TCP，映射/包/丢弃为 UDP。现有出口目标账本以 TCP 拨号为证据，不能把它当成 UDP 应用健康。
 
 规则请求值 0 表示未另设规则上限，仍受 Workspace 天花板约束；Workspace 0 额度禁止转发。现有控制面额度检查与租约不等于多节点严格共享的带宽/连接预算池，也存在统计上报及租约生效窗口。
 

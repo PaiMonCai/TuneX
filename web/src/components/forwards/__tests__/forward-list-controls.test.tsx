@@ -13,6 +13,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared-runtime";
 import { I18nProvider } from "@/components/providers";
 import {
   FORWARD_BATCH_MAX_IDS,
@@ -44,7 +45,9 @@ const CREATE_DIALOG = readFileSync(new URL("../forward-create-dialog.tsx", impor
 const render = (locale: "zh" | "en") =>
   renderToStaticMarkup(
     <I18nProvider locale={locale} dict={getDictionary(locale)}>
-      <WorkspaceContext.Provider value={workspace}><ForwardWorkspace /></WorkspaceContext.Provider>
+      <AppRouterContext.Provider value={{ back() {}, forward() {}, push() {}, replace() {}, refresh() {}, prefetch() {} }}>
+        <WorkspaceContext.Provider value={workspace}><ForwardWorkspace /></WorkspaceContext.Provider>
+      </AppRouterContext.Provider>
     </I18nProvider>,
   );
 

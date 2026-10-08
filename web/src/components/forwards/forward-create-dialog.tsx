@@ -15,6 +15,7 @@ import { ForwardPathPreview, forwardPathCopy } from "@/components/forwards/forwa
 import { FORWARD_PROTOCOLS, FORWARD_TLS_PATH_MAX, forwardProtocolLabel, forwardProtocolNote, type ForwardProtocol } from "@/lib/forward-protocol";
 import type { Locale } from "@/lib/i18n";
 import type { NodeBinding, UserNode } from "@/lib/types";
+import { nativeBothBlock, nativeBothBlockText, type ForwardCapabilities } from "@/lib/forward-native-both";
 
 import type { ForwardListTextKey } from "@/components/forwards/forward-list-model";
 type Translate = (key: string, params?: Record<string, string | number>) => string;
@@ -22,7 +23,7 @@ type ListText = (key: ForwardListTextKey, params?: Record<string, string | numbe
 
 export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBindings, egressNodes, canManageNodes,
   busy, locale, t, text, onOpenChange, onDraftChange, onCreate,
-  bindingsUnavailable = false, workspaceId = null, bindingsByIngress = null }: {
+  bindingsUnavailable = false, workspaceId = null, bindingsByIngress = null, capabilities = null }: {
   open: boolean; draft: ForwardCreateDraft; ingressNodes: UserNode[]; selectedBindings: NodeBinding[];
   egressNodes: UserNode[]; canManageNodes: boolean; busy: boolean; locale: Locale;
   t: Translate; text: ListText; onOpenChange: (open: boolean) => void; onDraftChange: (draft: ForwardCreateDraft) => void;
@@ -47,6 +48,7 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
    * 这份事实不可信（读取失败/仍在读/旧作用域），模型会如实判成"取不到"。
    */
   bindingsByIngress?: Record<string, NodeBinding[]> | null;
+  capabilities?: ForwardCapabilities | null;
 }) {
   const protocolErrors = forwardCreateProtocolErrors(draft);
   const protocolReady = Object.keys(protocolErrors).length === 0 && Object.keys(forwardPolicyDraftErrors(draft)).length === 0;
@@ -59,6 +61,10 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
     bindings: bindingsUnavailable ? null : selectedBindings,
     nodes: [...ingressNodes, ...egressNodes],
   });
+  // Runtime facts come from diagnostics-enriched nodes, not a stale binding projection.
+  const bothBlock = nativeBothBlock({ capabilities, mode: draft.mode, ingress,
+    egress: egressNodes.find((node) => String(node.id) === draft.egressId), middleNodeId: draft.middleNodeId });
+  const bothBlocked = draft.protocol === "both" && bothBlock !== null;
   const boundEgressIds = new Set(selectedBindings.map((binding) => String(binding.egress_node_id)));
   const egressRelationLabel = (nodeId: string) => {
     if (bindingsUnavailable) return t("forward.pathRelationServerCheck");
@@ -125,9 +131,10 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
           <Field label={t("forward.protocol")} hint={forwardProtocolNote(locale, draft.protocol)}>
             <Select value={draft.protocol} onValueChange={(value) => onDraftChange(changeForwardCreateProtocol(draft, value as ForwardProtocol))}>
               <SelectTrigger data-testid="forward-protocol-select"><SelectValue /></SelectTrigger>
-              <SelectContent>{FORWARD_PROTOCOLS.map((value) => <SelectItem key={value} value={value} data-testid={`forward-protocol-${value}`}>{forwardProtocolLabel(value)}</SelectItem>)}</SelectContent>
+              <SelectContent>{FORWARD_PROTOCOLS.map((value) => <SelectItem key={value} value={value} disabled={value === "both" && bothBlock !== null} data-testid={`forward-protocol-${value}`}>{forwardProtocolLabel(value)}</SelectItem>)}</SelectContent>
             </Select>
           </Field>
+          {bothBlock ? <p data-testid="forward-native-both-gate" role={bothBlocked ? "alert" : undefined} className="text-xs text-[var(--muted-foreground)]">{nativeBothBlockText(locale, bothBlock)}</p> : null}
           {draft.protocol === "tls" ? <>
             <Field label={t("forward.tlsCertPath")} hint={t("forward.tlsPathsHint")} error={protocolErrors.tls_cert_path ? t(protocolErrors.tls_cert_path) : undefined}>
               <Input value={draft.tlsCertPath} maxLength={FORWARD_TLS_PATH_MAX} placeholder="/etc/tunex/tls/front.crt" data-testid="forward-tls-cert-path" required aria-invalid={protocolErrors.tls_cert_path ? true : undefined} onChange={(e) => patch({ tlsCertPath: e.target.value })} />
@@ -172,14 +179,14 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
             )}
           </div></Field> : null}
 
-          <ForwardMultihopSection
+          {draft.protocol !== "both" ? <ForwardMultihopSection
             model={multihopModel}
             locale={locale}
             value={draft.middleNodeId ?? ""}
             onChange={(next) => patch({ middleNodeId: next })}
-          />
+          /> : null}
 
-          <ForwardPathPreview model={pathPreview} locale={locale} />
+          <ForwardPathPreview model={pathPreview} locale={locale} protocol={draft.protocol} />
           <p className="text-xs text-[var(--muted-foreground)]" data-testid="forward-routing-policy-note">
             {t("forward.createRoutingPolicyNote")}
           </p>
@@ -193,7 +200,7 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
         </section>
       </div>}
       <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
-        <Button onClick={onCreate} disabled={busy || ingressNodes.length === 0 || !protocolReady || multihopBlocked || (draft.mode === "relay" && !draft.egressId)}>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</Button>
+        <Button onClick={onCreate} disabled={busy || ingressNodes.length === 0 || !protocolReady || bothBlocked || multihopBlocked || (draft.mode === "relay" && !draft.egressId)}>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>;

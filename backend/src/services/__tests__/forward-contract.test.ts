@@ -24,8 +24,8 @@ describe("V5-WP0 Forward protocol contract", () => {
     // V5-WP5-A1/A2: tls and ws joined the product protocol list, each together
     // with its own Gate. This assertion is the deliberate, reviewable act of
     // opening a protocol — it must never change silently.
-    expect(FORWARD_PROTOCOLS).toEqual(["tcp", "tls", "ws", "udp"]);
-    expect(FORWARD_TRANSPORTS).toEqual(["stream", "datagram"]);
+    expect(FORWARD_PROTOCOLS).toEqual(["tcp", "tls", "ws", "udp", "both"]);
+    expect(FORWARD_TRANSPORTS).toEqual(["stream", "datagram", "mixed"]);
     // V5-WP2 补全了计划的其余事实（revision / placement / listener / upstream），
     // 所以这里不再断言"只有三个字段" —— 那正是 WP2 要改的东西。协议的判定
     // 仍然只看这三个维度。

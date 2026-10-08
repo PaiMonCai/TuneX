@@ -1,6 +1,6 @@
 # 以隧道转发为核心的后续开发方案
 
-更新：2026-10-08。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 首个切片 `4e50f20` 与 F2 候选 `932d15e` 已通过各自 CI；当前实施 F3 共享 FXP TCP 来源切片，后续工作包及公开发布条件分别验收。
+更新：2026-10-08。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 `4e50f20`、F2 `932d15e`、F3 共享 FXP TCP 来源切片 `47594c4` 已通过各自 CI；当前实施 F4 原生 both，后续工作包及公开发布条件分别验收。
 
 ## 1. 目标和范围
 
@@ -18,15 +18,15 @@
 | --- | --- | --- | --- |
 | 规则与共享连接分离 | 独立 tunnels，多个 rules 引用 | 已有 LinkResource、独立部署和规则引用 | 保留，扩展版本化变更和复杂拓扑。 |
 | 加密双节点 TCP/UDP | FXP v1 TCP/UDP 运行与密钥 | 已导入真实 FXP，固定两个自有节点 | F0 收口发布条件，F6 扩展路径。 |
-| TCP/UDP 同号与 both | 两种业务协议及 both | FXP 已有；普通原生 Forward 的 both 未开放 | F4。 |
+| TCP/UDP 同号与 both | 两种业务协议及 both | FXP 已有；普通原生 both 正在按完整候选验证，默认关闭 | F4。 |
 | 双向速率限制 | FXP limitIn/limitOut | 原生与 FXP 已有每规则、每入口 runtime 限额 | 保留；多入口总预算另做分配。 |
 | 总并发、每源 IP 并发 | FXP connGate；maxIPs 是每来源并发 | 已有；UDP 并发是活跃映射 | F3 补可信来源；不改成不同 IP 数量限制。 |
 | 共享规则热更新 | 上游运行逻辑加 TuneX 托管更新 | A 更新时保持未变 B 的 TCP/UDP；载体变更仍重启 | F5 做在线载体迁移。 |
 | 每规则流量及额度 | 方向计数和规则/用户聚合 | 已有入口累计、持久重投、水位去重、日事实入账 | F1 解决长期历史容量。 |
 | 多目标主备 | rules 目标列表、fallback、故障/恢复窗口 | 原生出口池部分可用；FXP 最多 10 目标切片已通过候选 CI | F2；UDP 辅助探测和映射切换边界见运行说明。 |
 | RR/random/weighted | 目标或出口组策略 | FXP 新目标集支持 RR/random；原生 weighted 保留现有路径 | F2 实流量验收；FXP weighted 后续按需求扩展。 |
-| IP_HASH | 原始客户端来源参与选择 | 共享 FXP TCP 已接可信来源/IP_HASH，候选验收中；原生 RELAY 门禁不变 | F3，不能推广到未验证路径。 |
-| PROXY v1/v2 | 入出口接收/发送开关、版本与兼容性 | 共享 FXP TCP 已接受信接收和目标发送 v1/v2，候选验收中 | F3；UDP/both 暂拒绝。 |
+| IP_HASH | 原始客户端来源参与选择 | 共享 FXP TCP 已通过自身候选验收；原生 RELAY 门禁不变 | F3 原生来源仍待开发，不能推广证据。 |
+| PROXY v1/v2 | 入出口接收/发送开关、版本与兼容性 | 共享 FXP TCP 已通过受信接收和目标发送 v1/v2 候选验收 | F3；UDP/both 暂拒绝。 |
 | 部署/运行/可用状态 | 分开 desired、deployed、running、available | Link 已有代次/digest/租约匹配的运行事实 | F0/F8 加目标可达性和真实浏览器流程。 |
 | 重启、失联、撤权恢复 | Agent runtime recovery | 已有加密缓存、持久墓碑、有限租约与 reconcile | 各阶段加入跨版本恢复及故障注入。 |
 | 共享连接在线改端点/密钥 | 共享修改影响引用规则 | 已部署端点禁止修改；密钥轮换限零引用 | F5，先影响预览，再受控迁移。 |
@@ -107,7 +107,7 @@
 
 F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/actions/runs/37697539412) required 全绿：四节点 61 PASS / 0 FAIL，数据库/HTTP 118 通过且零跳过。上述记录限定该候选，不替代后续来源协议的验收。
 
-### F3：可信客户端 IP、PROXY 与 IP_HASH——当前实施项
+### F3：可信客户端 IP、PROXY 与 IP_HASH——共享 TCP 首切片已验收
 
 依赖：F2 的目标身份与选择接口；协议/信任设计可提前并行。估算：6–10 工程人日。
 
@@ -122,7 +122,7 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 
 回退：配置和元数据协议能力协商；旧节点拒绝新要求。撤销功能生成新修订并提示受影响连接，保持既有目标集授权。
 
-### F4：普通原生 Forward 的 both 完整覆盖
+### F4：普通原生 Forward 的 both 完整覆盖——当前实施项
 
 依赖：现有协议/地址端口租约与运行限额。估算：5–8 工程人日。
 
@@ -133,6 +133,10 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 交付标准：DIRECT 与 RELAY both 实网、同号 TCP/UDP、单侧冲突、半部署失败、重启恢复、删除及精确端口复用；两协议共享规则预算；未知历史协议继续保守占位；跨租户竞争不产生重复监听。
 
 回退：新创建路径能力关闭，已发布 both 配置按版本保留兼容恢复；不能删除其中一个子 runtime 后把业务状态报成成功。
+
+本切片契约：`both → mixed / connection_and_mapping`，legacy TunnelType 投影为空，不能假填 TCP。独立实际能力 `forward.protocol.both.native.v1` 与新鲜报告控制完整路径准入；Workspace 须同时授权 TCP 和 UDP。`FORWARD_NATIVE_BOTH_ENABLED=true` 只开放新建/切入 both，不阻止既有 both 的恢复与移除。禁止中间跳、联邦、TLS/WS 前端及客户端来源组合。
+
+Agent 使用一个 ID、一个修订和 TCP/UDP 两个真实 OS 槽位；两子监听均成功才开放入口准入，半失败关闭已准备监听。目标变化首版完整重建，两协议不能分开热改；同号替换失败时重建旧已应用配置，重新验证有效续租及单调所有权围栏。失败候选不得改变当前运行的租约时钟。流量为两协议 payload 聚合，TCP 连接与 UDP 映射分项展示。真实验收新增 `scripts/integration/native-both.py`，不能用本机测试或前一切片 CI 代替。
 
 ### F5：共享连接在线端点变更与密钥轮换
 

@@ -127,6 +127,7 @@ type pipeTracker struct {
 	// tunnel down.
 	wrapConn     func(net.Conn) (net.Conn, error)
 	policy       *DataPlanePolicy
+	sharedPolicy *DataPlanePolicy
 	policyCtx    context.Context
 	policyCancel context.CancelFunc
 	pending      map[net.Conn]struct{}
@@ -155,10 +156,14 @@ func (t *pipeTracker) start(p pick) error {
 		t.mu.Unlock()
 		return ErrAlreadyStarted
 	}
-	policy, err := NewDataPlanePolicy(t.cfg)
-	if err != nil {
-		t.mu.Unlock()
-		return err
+	policy := t.sharedPolicy
+	if policy == nil {
+		var err error
+		policy, err = NewDataPlanePolicy(t.cfg)
+		if err != nil {
+			t.mu.Unlock()
+			return err
+		}
 	}
 	ln, err := net.Listen("tcp", t.cfg.ListenAddr())
 	if err != nil {

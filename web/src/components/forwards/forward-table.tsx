@@ -10,6 +10,7 @@ import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableR
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
 import { applyErrorAction, forwardProductBadgeVariant, forwardProductStatus } from "@/lib/forward-status";
 import { formatDateTime } from "@/lib/utils";
+import { forwardTransportFor } from "@/lib/forward-protocol";
 import type { Locale } from "@/lib/i18n";
 import type { PortForward } from "@/lib/types";
 import type { ForwardSortKey, ForwardSortOrder } from "@/components/forwards/forward-list-model";
@@ -72,7 +73,7 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
                 onChange={(event) => onSelect(Number(forward.id), event.target.checked)} /></TableCell>
               <TableCell className="font-medium"><Link href={"/forwards/" + forward.id} className="hover:underline">{forward.name}</Link></TableCell>
               <TableCell><Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>{forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}</Badge></TableCell>
-              <TableCell><ForwardProtocolBadge forward={forward} /></TableCell>
+              <TableCell><ForwardProtocolBadge forward={forward} />{forwardTransportFor(forward.protocol) === "mixed" ? <p data-testid="forward-row-mixed" className="text-xs text-[var(--muted-foreground)]">{locale === "en" ? "TCP streams + UDP mappings · one shared budget" : "TCP 流 + UDP 映射 · 一条共享预算"}</p> : null}</TableCell>
               <TableCell>{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
               <TableCell>{forward.egress_node?.node_id ?? "—"}</TableCell>
               <TableCell className="font-mono text-xs">{forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`}</TableCell>

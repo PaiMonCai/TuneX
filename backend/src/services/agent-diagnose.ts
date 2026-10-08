@@ -25,6 +25,7 @@ import {
   type PlannedSegment,
 } from "./forward-probe-plan.ts";
 import { redact } from "./redaction.ts";
+import { persistedForwardProtocol } from "./forward-contract.ts";
 
 /** 面板侧对一次诊断的最大目标数（与 Agent 侧上限一致，超出即拒绝而不是截断）。 */
 export const DIAGNOSE_MAX_TARGETS = 8;
@@ -53,6 +54,7 @@ export type DiagnoseSegmentName =
 export type DiagnoseSegmentMethod = "tcp_probe" | "node_facts";
 
 export interface DiagnoseSegment {
+  protocol?: "tcp";
   segment: DiagnoseSegmentName;
   method: DiagnoseSegmentMethod;
   /** `false` = 这一段没有做过连通性验证，结论只来自节点上报的事实。 */
@@ -142,6 +144,9 @@ export interface DiagnoseDeps {
 
 /** 诊断需要的最小 Forward 投影（全部来自 desired state）。 */
 export interface ForwardForDiagnose {
+  protocol?: string;
+  federated_egress_peer?: string | null;
+  tls_cert_path?: string | null; tls_key_path?: string | null; link_source_config?: unknown;
   id: number;
   mode: "direct" | "relay";
   ingress_node_id: number | null;
@@ -213,6 +218,7 @@ export async function diagnoseForward(
     const segment: DiagnoseSegment = {
       segment: planned.segment,
       method: "tcp_probe",
+      ...(planned.protocol ? { protocol: planned.protocol } : {}),
       verified: true,
       node_id: planned.node_id,
       node_key: planned.node_key,
@@ -476,6 +482,9 @@ export function defaultDiagnoseDeps(): DiagnoseDeps {
             })) as { port: number } | null)?.port ?? null;
       return {
         id: row.id,
+        protocol: persistedForwardProtocol(row.forward_protocol, row.tunnel_type),
+        federated_egress_peer: row.federated_egress_peer,
+        tls_cert_path: row.tls_cert_path, tls_key_path: row.tls_key_path, link_source_config: row.link_source_config,
         mode: (row.tunnel_mode ?? "direct") as "direct" | "relay",
         ingress_node_id: row.ingress_node?.id ?? null,
         ingress_node_key: row.ingress_node?.node_id ?? String(row.ingress_node_id ?? ""),

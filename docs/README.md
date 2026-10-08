@@ -11,7 +11,7 @@
 
 ## 当前基线
 
-开发位于 `feat/forward-core-abcd`；[PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 仍是草稿。F1 候选 `4e50f20` 与 F2 候选 `932d15e` required 全绿；F3 候选状态查看 PR 检查。ABCD、流量和来源切片属于该分支，不能据此判断已经正式发布或进入当前 `main`。
+开发位于 `feat/forward-core-abcd`；[PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 仍是草稿。F1 候选 `4e50f20`、F2 候选 `932d15e` 与 F3 候选 `47594c4` required 全绿。ABCD、流量和来源切片属于该分支，不能据此判断已经正式发布或进入当前 `main`。
 
 共享 FXP 连接、TCP/UDP/both、运行限额、规则隔离热更新和持久流量接收已实现并通过候选提交 CI。FXP 开关仍默认关闭，公共支持矩阵仍为 planned；[测试说明](testing.md) 列出已验证与待验证范围。
 
@@ -19,7 +19,9 @@ F1 已接入同进程统计分段与安全回收、持久准备恢复及页面�
 
 F2 已接入每规则 1–10 个有序业务目标、主备/RR/random、故障/恢复窗口、可信的新鲜目标观测及完整编辑流程。辅助 TCP 探测不证明 UDP 应用健康；UDP 静默保持未知。无探测 TCP 仍有有界半开恢复。候选四节点验收 61 PASS / 0 FAIL，数据库/HTTP 118 通过且零跳过；实验开关及公开 planned 状态保持不变。
 
-当前推进 F3 首个切片：共享 FXP TCP 的可信来源、受信 PROXY v1/v2 接收/发送及 IP_HASH。来源策略保存于修订和部署，旧节点/客户端不能悄悄丢配置；UDP/both 和原生 RELAY 来源扩展暂未开放。验收以 F3 候选自己的检查为准，不沿用 F2 绿色结果。
+F3 首个共享 FXP TCP 来源切片已通过自身四节点验收，73 PASS / 0 FAIL；UDP/both 和原生 RELAY 来源扩展仍未开放。
+
+当前推进 F4 普通原生 TCP+UDP：一个业务修订同时管理两个监听及共享预算，首版限定 plain DIRECT/自有单跳 RELAY。服务端 `FORWARD_NATIVE_BOTH_ENABLED` 默认关闭；新创建须有双方实际能力。半失败补偿、有效续租恢复和两类端口回收随切片验证，验收以 F4 候选自身检查为准，不沿用 F3 结果。支付及其他外围功能继续后置。
 
 ForwardX 对标基线为项目 2.3.281、提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。实际导入组件及来源说明见 [third_party/forwardx](../third_party/forwardx/README.md)。本地 `Forwardx/` 是参考源码，不是构建依赖，也不属于本次文档清理范围。
 

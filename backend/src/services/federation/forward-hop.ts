@@ -74,7 +74,7 @@ export const FEDERATED_EGRESS_HOP_ROLE = "egress" as const;
  * 远端腿拒绝的协议：`tls` 需要**节点本地**的证书路径，而 apply 形状里没有它。
  * 其余（tcp / ws）不需要任何节点本地文件，可以原样交给 host。
  */
-export const FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS: readonly string[] = ["tls"];
+export const FEDERATED_EGRESS_UNSUPPORTED_PROTOCOLS: readonly string[] = ["tls", "both"];
 
 /**
  * 确定性 intent id：`fw-<tunnelId>-<revision>`。

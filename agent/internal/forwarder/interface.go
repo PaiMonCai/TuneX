@@ -77,6 +77,8 @@ const (
 	// UDP remain fail-closed. Full semantics live in
 	// the datagram runtime contract.
 	ProtocolUDP ForwardProtocol = "udp"
+	// Both is one rule with separate TCP connections and UDP mappings.
+	ProtocolBoth ForwardProtocol = "both"
 )
 
 // ForwardTransport is the data-plane lifecycle contract that carries a protocol.
@@ -100,6 +102,7 @@ const (
 	//   - "the upstream address" is not a per-client fact, so retargeting moves
 	//     only the mappings created afterwards (§3.4).
 	TransportDatagram ForwardTransport = "datagram"
+	TransportMixed    ForwardTransport = "mixed"
 )
 
 // protocolRuntime binds a protocol to the transport contract that actually
@@ -119,6 +122,7 @@ var protocolRuntimes = []protocolRuntime{
 	{Protocol: ProtocolTLS, Transport: TransportStream},
 	{Protocol: ProtocolWS, Transport: TransportStream},
 	{Protocol: ProtocolUDP, Transport: TransportDatagram},
+	{Protocol: ProtocolBoth, Transport: TransportMixed},
 }
 
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
@@ -486,7 +490,7 @@ func (c *TunnelConfig) Validate() error {
 	}
 	// The UDP exit has its own owner/runtime. Until it wires the shared policy
 	// helper, refuse policy there rather than acknowledging ineffective limits.
-	if protocol == ProtocolUDP && mode == ModeEgress && c.hasPolicy() {
+	if (protocol == ProtocolUDP || protocol == ProtocolBoth) && mode == ModeEgress && c.hasPolicy() {
 		return errors.New("forwarder: udp EGRESS policy is not wired; enforce limits at DIRECT/RELAY ingress")
 	}
 
@@ -500,6 +504,9 @@ func (c *TunnelConfig) Validate() error {
 		if strings.TrimSpace(c.TLSCertPath) == "" || strings.TrimSpace(c.TLSKeyPath) == "" {
 			return fmt.Errorf("forwarder: tls tunnel %s needs tls_cert_path and tls_key_path", c.ID)
 		}
+	}
+	if protocol == ProtocolBoth && (c.TLSCertPath != "" || c.TLSKeyPath != "") {
+		return errors.New("forwarder: both requires a plain TCP front and UDP, not TLS paths")
 	}
 	// WS is a client-facing front like TLS: an EGRESS listener faces the ingress
 	// node, and that hop is plain TCP by contract.
@@ -516,11 +523,11 @@ func (c *TunnelConfig) Validate() error {
 	//   - RELAY: allowed. The ingress keeps one socket toward the exit and carries
 	//     every client mapping over it, tagged with a hop header; `next_hop` names
 	//     that socket's destination, so an empty one is refused with that name.
-	if protocol == ProtocolUDP && mode == ModeEgress && strings.TrimSpace(c.HopPeer) == "" {
+	if (protocol == ProtocolUDP || protocol == ProtocolBoth) && mode == ModeEgress && strings.TrimSpace(c.HopPeer) == "" {
 		return fmt.Errorf(
 			"forwarder: udp EGRESS tunnel %s needs hop_peer (the paired ingress address); refusing to accept hop packets from an unattested source", c.ID)
 	}
-	if protocol == ProtocolUDP && mode == ModeRelay && strings.TrimSpace(c.NextHop) == "" {
+	if (protocol == ProtocolUDP || protocol == ProtocolBoth) && mode == ModeRelay && strings.TrimSpace(c.NextHop) == "" {
 		return fmt.Errorf(
 			"forwarder: udp RELAY tunnel %s needs next_hop (the egress node address) to send client datagrams to", c.ID)
 	}

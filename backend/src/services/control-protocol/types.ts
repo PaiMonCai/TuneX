@@ -72,6 +72,7 @@ export const TUNNEL_TYPES = [
   // services/forward-contract.ts, which omits the column for exactly this case
   // rather than writing `wss` and asserting "WebSocket over TLS".
   "ws",
+  "both",
   "mtcp",
   "udp",
   "tunex",

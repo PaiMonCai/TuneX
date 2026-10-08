@@ -52,6 +52,7 @@ type tunnelPayload struct {
 	RemoteHost  string `json:"remote_host"`
 	RemotePort  int    `json:"remote_port"`
 	NextHop     string `json:"next_hop"`
+	HopPeer     string `json:"hop_peer"`
 	Targets     []struct {
 		Host   string `json:"host"`
 		Port   int    `json:"port"`

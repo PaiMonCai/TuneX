@@ -356,7 +356,8 @@ export type TunnelDesiredStatus = "active" | "inactive";
 export interface Tunnel {
   id: ID;
   name: string;
-  tunnel_type: TunnelType;
+  /** No legacy enum value represents native both (or plain WS). */
+  tunnel_type: TunnelType | null;
   category: TunnelCategory;
   listen_ip: string | null;
   listen_port: number | null;
@@ -611,7 +612,7 @@ export type TrafficPeriod = "day" | "month" | "total";
 export interface TunnelTrafficGroup {
   tunnel_id: ID;
   name: string;
-  tunnel_type: TunnelType;
+  tunnel_type: TunnelType | null;
   in_node_group_id: ID | null;
   in_node_group_name: string | null;
   traffic: number;

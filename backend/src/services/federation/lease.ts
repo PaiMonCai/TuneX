@@ -1127,7 +1127,7 @@ export function validateLegLink(hopRole: string, raw: unknown): ParseResult<Fede
 
   let protocol: string | null = null;
   if (obj.protocol !== undefined && obj.protocol !== null) {
-    if (typeof obj.protocol !== "string" || !(FORWARD_PROTOCOLS as readonly string[]).includes(obj.protocol)) {
+    if (typeof obj.protocol !== "string" || obj.protocol === "both" || !(FORWARD_PROTOCOLS as readonly string[]).includes(obj.protocol)) {
       return bad(`link.protocol "${String(obj.protocol)}" is not a supported forward protocol`);
     }
     protocol = obj.protocol;

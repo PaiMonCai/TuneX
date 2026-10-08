@@ -6,6 +6,8 @@
  * edits create a new revision while provenance/placement facts remain auditable.
  */
 import { Prisma } from "@prisma/client";
+import type { TunnelType } from "@prisma/client";
+import { nativeBothEntryDisabled, nativeBothShapeError } from "./forward-native-both.ts";
 import { db } from "../db.ts";
 import { forwardPolicyErrors, forwardPolicyValues, mergeForwardPolicy, sameForwardPolicy, type ForwardPolicyInput } from "./forward-policy.ts";
 import {
@@ -13,6 +15,7 @@ import {
   persistedForwardProtocol,
   type ForwardMode,
   tlsPathsForProtocol,
+  legacyTunnelTypeColumn,
 } from "./forward-contract.ts";
 // 远端出口腿支持边界只有一处定义（`federation/forward-hop.ts`），
 // 校验与运行期必须用同一个集合 —— 各写一份就是"preview 放行、rollout 拒绝"的来源。
@@ -436,6 +439,11 @@ export function validateForwardCandidate(candidate: ForwardCandidateConfig): For
   // while PATCH silently discarded them — the same rule with two behaviours, which
   // is worse than either behaviour on its own.
   const admittedProtocol = normalizeForwardProtocol(candidate.protocol);
+  const bothShape = nativeBothShapeError(candidate);
+  if (bothShape) {
+    errors.push("原生 both 只支持普通 DIRECT 或自有单跳 RELAY"); reasons.push(bothShape);
+    return { ok: false, errors, warnings, reasons };
+  }
   if (admittedProtocol !== null) {
     const paths = tlsPathsForProtocol(
       admittedProtocol,
@@ -622,6 +630,9 @@ export function validateForwardCandidateWithDb(
     reasons.push("node_unavailable");
   }
 
+  const bothShape = nativeBothShapeError({ ...candidate, lb_strategy: candidate.mode === "relay" ? ctx.egress?.lb_strategy : null });
+  if (bothShape) { errors.push("原生 both 不支持该目标选择策略"); reasons.push(bothShape); }
+
   if (candidate.mode === "relay") {
     // 声明了远端出口 peer 时，本机**没有**出口节点 —— 这不是"缺出口"，
     // 而是"出口在另一侧"。远端那一跳的容量与准入由 host 的 grant 决定（契约 §1/§3.1）。
@@ -740,7 +751,9 @@ export function computeForwardImpact(input: {
   // listener 是否需要重建：端口变化、入口节点迁移、模式切换。
   // target 热换**不重建** listener（§13.3.4：旧连接继续、新连接走新目标）。
   const listenerReplacement =
-    !metadataOnly && (listenPortChange || ingressNodeChange || modeChange || !sameForwardPolicy(input.current, input.candidate));
+    !metadataOnly && (listenPortChange || ingressNodeChange || modeChange ||
+      input.current.protocol !== input.candidate.protocol || input.current.protocol === "both" ||
+      input.candidate.protocol === "both" || !sameForwardPolicy(input.current, input.candidate));
 
   const changesExternalAddress = !metadataOnly && (listenPortChange || ingressNodeChange);
 
@@ -1083,6 +1096,9 @@ export async function createForwardRevision(
         tunnel_mode: true,
         tunnel_type: true,
         forward_protocol: true,
+        middle_node_id: true,
+        tls_cert_path: true,
+        tls_key_path: true,
         ingress_node_id: true,
         egress_node_id: true,
         listen_ip: true,
@@ -1109,6 +1125,17 @@ export async function createForwardRevision(
     }
     const linkedBoth = input.candidate.protocol === "both" && linkedId != null &&
       linkedId === row.link_resource_id && input.link_resource_id === row.link_resource_id;
+    // Shared FXP authorization remains separate; adding native both cannot
+    // accidentally authorize a forged or missing Link provenance.
+    if (linkedId != null && input.candidate.protocol === "both" && !linkedBoth)
+      throw new ForwardRevisionError("invalid_input", "Link both requires explicit persisted Link authorization");
+    if (linkedId == null && input.candidate.protocol === "both") {
+      if (nativeBothEntryDisabled("both", row.forward_protocol))
+        throw new ForwardRevisionError("invalid_input", "feature_disabled");
+      const shape = nativeBothShapeError({ ...row, ...input.candidate,
+        forward_protocol: "both", tunnel_mode: input.candidate.mode });
+      if (shape) throw new ForwardRevisionError("invalid_input", shape);
+    }
     const policy = forwardPolicyValues({ ...row, ...mergeForwardPolicy(row, input.candidate) });
 
     const [maxSnapshot] = await tx.forwardRevision.findMany({
@@ -1229,6 +1256,7 @@ export async function createForwardRevision(
         name: input.candidate.name.trim(),
         tunnel_mode: input.candidate.mode,
         forward_protocol: protocol,
+        ...(linkedId == null ? legacyTunnelTypeColumn(protocol) as { tunnel_type?: TunnelType | null } : {}),
         ...policy,
         ingress_node_id: input.candidate.ingress_node_id,
         egress_node_id: input.candidate.egress_node_id,

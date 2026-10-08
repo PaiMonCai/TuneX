@@ -42,6 +42,7 @@
 
 import { businessRejectionCode, lifecycleAcceptsBusiness } from "./node-lifecycle.ts";
 import type { ForwardImpact } from "./forward-revision.ts";
+import type { ForwardPolicyInput } from "./forward-policy.ts";
 
 /* ================================================================== */
 /* 契约类型                                                            */
@@ -195,7 +196,9 @@ export interface RolloutPlan {
  * 它由调用方从  `forward_revision` 行或兼容投影列合成——本模块不碰 IO，
  * 因此**不复制 runtime 事实**这件事在类型层面成立。
  */
-export interface RolloutSnapshot {
+export interface RolloutSnapshot extends ForwardPolicyInput {
+  protocol?: string;
+  tls_cert_path?: string | null; tls_key_path?: string | null;
   name: string;
   mode: "direct" | "relay";
   ingress_node_id: number;
@@ -344,7 +347,7 @@ export function classifyRolloutStrategy(input: {
   if (impact.mode_change) return "mode_switch";
   // 入口或出口节点迁移（含「端口 + 入口节点同时改」合并为一档）。
   if (impact.ingress_node_change || impact.egress_node_change || impact.middle_node_change) return "node_migration";
-  if (impact.listen_port_change) return "listener_replace";
+  if (impact.listen_port_change || impact.listener_replacement) return "listener_replace";
   return "target_hot_swap";
 }
 
@@ -531,7 +534,10 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
 
   if (relay) {
     const egressNode = nodes.egress;
-    const egressIsNew = impact.egress_node_change || impact.mode_change;
+    // Composite protocol changes must reserve both sockets on the exit before
+    // rebuilding it; retaining a previous TCP-only lease would be unsafe.
+    const egressIsNew = impact.egress_node_change || impact.mode_change ||
+      desired.protocol === "both" && applied?.protocol !== "both";
     // ── 入口要重切时，出口**必须再准备一次**（）──
     //
     // `prepare_egress` 是**唯一**登记出口可寻址 host 的地方（`recordNextHop` 用

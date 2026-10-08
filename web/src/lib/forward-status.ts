@@ -62,7 +62,7 @@ export function forwardProductStatus(
   forward: Pick<
     PortForward,
     "apply_status" | "config_revision" | "applied_revision" | "latest_revision"
-  > | null | undefined,
+  > & Partial<Pick<PortForward, "protocol">> | null | undefined,
 ): ForwardProductStatus {
   const desired = forward?.config_revision ?? forward?.latest_revision ?? null;
   const applied = forward?.applied_revision ?? null;
@@ -74,6 +74,11 @@ export function forwardProductStatus(
     return { state: "pending", applied, desired };
   }
   if (status === "pending" || status === "applying") {
+    return { state: "pending", applied, desired };
+  }
+  // Legacy's missing-fields shortcut is never evidence for a native mixed rule.
+  // Trust only an explicit aggregate backend ACK for the same desired revision.
+  if (forward?.protocol === "both" && (status !== "active" || applied === null || desired === null || applied !== desired)) {
     return { state: "pending", applied, desired };
   }
   return { state: "synced", applied, desired };

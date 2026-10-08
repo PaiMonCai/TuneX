@@ -22,11 +22,14 @@ import { InfoRow } from "@/components/ui/form";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
+import { withForwardRuntimeCapabilities, type ForwardCapabilities } from "@/lib/forward-native-both";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
 import {
   TLS_FORWARD_PROTOCOL,
   forwardProtocolFact,
   forwardProtocolHasConnections,
+  forwardProtocolNote,
+  forwardTransportFor,
 } from "@/lib/forward-protocol";
 import {
   applyErrorAction,
@@ -68,25 +71,33 @@ export function ForwardDetail({
   // V4-WP4：编辑 = 全字段编辑器（不再只有改名）。
   const [editOpen, setEditOpen] = useState(false);
   const [nodes, setNodes] = useState<UserNode[]>([]);
+  const [forwardCapabilities, setForwardCapabilities] = useState<ForwardCapabilities | null>(null);
   const [bindings, setBindings] = useState<Record<string, NodeBinding[]>>({});
 
   useEffect(() => {
+    setForwardCapabilities(null);
+    setNodes([]); setBindings({});
     if (!editOpen || !can("node:read")) return;
     let cancelled = false;
+    void api.forwards.capabilities().then((value) => { if (!cancelled) setForwardCapabilities(value); }).catch(() => {});
     void (async () => {
       try {
         const rows = await api.nodes.list();
         if (cancelled) return;
-        setNodes(rows);
+        setNodes(rows.map((node) => ({ ...node, capabilities: null })));
+        const runtimeTask = withForwardRuntimeCapabilities(rows, api.nodes.diagnostics).then((value) => {
+          if (!cancelled) setNodes(value);
+        });
         const ingressRows = rows.filter(
           (node) => node.role === "ingress" || node.role === "both",
         );
         const map: Record<string, NodeBinding[]> = {};
         for (const node of ingressRows) {
-          const list = await api.nodes.bindings(node.id);
+          const list = await api.nodes.bindings(node.id).catch(() => []);
           map[String(node.id)] = list;
         }
         if (!cancelled) setBindings(map);
+        await runtimeTask;
       } catch {
         // 节点列表只服务于编辑器的下拉；取不到时编辑器仍可打开，
         // 由表单自身的必填校验提示用户。
@@ -200,6 +211,7 @@ export function ForwardDetail({
    * `false` 才是「确认没有连接」；`null`（未开放的协议）不说任何话。
    */
   const datagram = forwardProtocolHasConnections(forward.protocol) === false;
+  const mixed = forwardTransportFor(forward.protocol) === "mixed";
   const isTls = forwardProtocolFact(forward.protocol) === TLS_FORWARD_PROTOCOL;
   // 失败时给可执行的一步（后端原文优先；没有已知动作时不编造）。
   const applyNextStep = forward.apply_error
@@ -216,6 +228,7 @@ export function ForwardDetail({
   </div>;
   return (
     <div className="flex flex-col gap-5" data-testid="forward-detail">
+      {mixed ? <p data-testid="forward-mixed-lifecycle" className="text-sm text-[var(--muted-foreground)]">{forwardProtocolNote(locale, "both")}</p> : null}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <Button variant="ghost" size="sm" asChild>
           <Link href="/forwards">
@@ -478,9 +491,10 @@ export function ForwardDetail({
       </Card>
 
       {/* V4-WP11C：诊断入口。只读，不需要变更权限——能看这条转发的人就能诊断它。 */}
-      <ForwardDiagnose forwardId={forward.id} />
+      <ForwardDiagnose forwardId={forward.id} protocol={forward.protocol} />
 
       <ForwardEditDialog
+        capabilities={forwardCapabilities}
         open={editOpen && canUpdate}
         onOpenChange={setEditOpen}
         forward={forward}

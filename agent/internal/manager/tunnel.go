@@ -135,6 +135,15 @@ type OwnershipGuard interface {
 	Admit(cfg forwarder.TunnelConfig) error
 }
 
+// Production ownership separates irreversible fence observation from committing
+// the clock of the actual installed runtime. Legacy/test gates still implement
+// Admit only and retain their refusal semantics.
+type activationGuard interface {
+	CheckActivation(forwarder.TunnelConfig) error
+	CommitActivation(forwarder.TunnelConfig) error
+	CompensationConfig(forwarder.TunnelConfig) forwarder.TunnelConfig
+}
+
 // SetOwnershipGuard installs the activation gate. It is safe to call at any time
 // and passing nil removes the gate. It is a setter rather than a constructor
 // argument because the guard is built after the managers (it needs their
@@ -160,17 +169,52 @@ func (m *TunnelManager) AdmitActivation(cfg forwarder.TunnelConfig) error {
 	return m.admitOwnership(cfg)
 }
 
-// admitOwnership runs the activation gate outside the manager's lock: the guard
-// may write a durable file, and holding m.mu across an fsync would stall every
-// other tunnel operation behind one activation.
+// Production fence observations serialize on the mutation lock, including
+// preflight: an early candidate cannot raise the fence while another activation
+// is binding/committing. Durable fence IO is bounded state work, not network IO.
+// Legacy gates remain outside the lock, preserving their existing contract.
 func (m *TunnelManager) admitOwnership(cfg forwarder.TunnelConfig) error {
-	m.mu.RLock()
+	m.mu.Lock()
 	guard := m.ownership
-	m.mu.RUnlock()
+	if phased, ok := guard.(activationGuard); ok {
+		defer m.mu.Unlock()
+		if cur, ok := m.tunnels[cfg.ID]; ok && cfg.Revision == cur.cfg.Revision &&
+			(cfg.OwnershipEpoch == cur.cfg.OwnershipEpoch || cfg.OwnershipEpoch == 0 && cfg.LeaseExpiresAt == "") {
+			// A live idempotent replay may carry the original, now-expired
+			// timestamp. Borrow only this running identity's effective renewal.
+			if cfg.OwnershipEpoch == 0 {
+				cfg.OwnershipEpoch = cur.cfg.OwnershipEpoch
+			}
+			cfg = phased.CompensationConfig(cfg)
+		}
+		return phased.CheckActivation(cfg)
+	}
+	m.mu.Unlock()
 	if guard == nil {
 		return nil
 	}
 	return guard.Admit(cfg)
+}
+
+func (m *TunnelManager) commitOwnershipLocked(cfg forwarder.TunnelConfig) error {
+	if phased, ok := m.ownership.(activationGuard); ok {
+		if err := phased.CommitActivation(cfg); err != nil {
+			if live, ok := m.tunnels[cfg.ID]; ok {
+				_ = live.fwd.Stop()
+				delete(m.tunnels, cfg.ID)
+				m.rebuildPortGuardLocked()
+			}
+			return err // Never ACK an installed runtime that lost authorization.
+		}
+	}
+	return nil
+}
+
+func (m *TunnelManager) checkCurrentOwnershipLocked(cfg forwarder.TunnelConfig) error {
+	if phased, ok := m.ownership.(activationGuard); ok {
+		return phased.CheckActivation(cfg)
+	}
+	return nil
 }
 
 // SetMutationHook installs the post-mutation observer. It is safe to call at any
@@ -188,7 +232,8 @@ func (m *TunnelManager) fingerprint() string {
 	m.mu.RLock()
 	parts := make([]string, 0, len(m.tunnels))
 	for id, e := range m.tunnels {
-		parts = append(parts, fmt.Sprintf("%s:%d:%s:%s", id, e.cfg.Revision, e.cfg.Protocol, portGuardKey(e.cfg)))
+		parts = append(parts, fmt.Sprintf("%s:%d:%s:%s:%d:%s", id, e.cfg.Revision, e.cfg.Protocol,
+			portGuardKey(e.cfg), e.cfg.OwnershipEpoch, e.cfg.LeaseExpiresAt))
 	}
 	m.mu.RUnlock()
 	sort.Strings(parts)
@@ -235,6 +280,18 @@ func portGuardKey(cfg forwarder.TunnelConfig) string {
 
 func portBinding(cfg forwarder.TunnelConfig) portlease.Binding {
 	return portlease.New(string(cfg.Protocol), cfg.ListenPort(), cfg.ListenHost)
+}
+
+// The comparison key can be "both", but owned/reportable sockets must remain
+// separate OS namespaces so one teardown cannot release half a rule early.
+func portBindings(cfg forwarder.TunnelConfig) []portlease.Binding {
+	if cfg.Protocol == forwarder.ProtocolBoth {
+		return []portlease.Binding{
+			portlease.New("tcp", cfg.ListenPort(), cfg.ListenHost),
+			portlease.New("udp", cfg.ListenPort(), cfg.ListenHost),
+		}
+	}
+	return []portlease.Binding{portBinding(cfg)}
 }
 
 // checkPortAvailableLocked checks the single runtime registry and its existing
@@ -413,9 +470,7 @@ func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.R
 func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	before := m.fingerprint()
 	fwd, err := m.applyInner(cfg)
-	if err == nil {
-		m.notifyIfChanged(before)
-	}
+	m.notifyIfChanged(before)
 	return fwd, err
 }
 
@@ -453,14 +508,40 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 		if normalized.Revision == cur.cfg.Revision && normalized.Revision != revisionUnknown {
 			// Idempotent: the very same revision is already live. Do not
 			// churn listeners or reassign ports.
+			// Same desired revision can carry a refreshed owner/lease. Only
+			// these control facts change; payload configuration stays applied.
+			m.refreshEffectiveOwnershipLocked(&cur.cfg, normalized)
+			if err := m.commitOwnershipLocked(cur.cfg); err != nil {
+				return nil, err
+			}
 			return cur.fwd, nil
 		}
 	}
 	fwd, err := m.applyLocked(normalized)
 	if err == nil {
+		if err := m.commitOwnershipLocked(normalized); err != nil {
+			return nil, err
+		}
 		delete(m.removedRevision, normalized.ID)
 	}
 	return fwd, err
+}
+
+func refreshOwnershipFacts(applied *forwarder.TunnelConfig, offered forwarder.TunnelConfig) {
+	// Missing legacy facts never erase a tracked owner/clock.
+	if offered.OwnershipEpoch > 0 {
+		applied.OwnershipEpoch = offered.OwnershipEpoch
+	}
+	if offered.LeaseExpiresAt != "" {
+		applied.LeaseExpiresAt = offered.LeaseExpiresAt
+	}
+}
+
+func (m *TunnelManager) refreshEffectiveOwnershipLocked(applied *forwarder.TunnelConfig, offered forwarder.TunnelConfig) {
+	refreshOwnershipFacts(applied, offered)
+	if phased, ok := m.ownership.(activationGuard); ok {
+		*applied = phased.CompensationConfig(*applied)
+	}
 }
 
 // buildLocked builds the data-plane runtime. Caller must hold m.mu.
@@ -563,6 +644,14 @@ func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Ru
 	// stopping the old runtime. Disjoint listener moves use bind-first Replace.
 	if old, ok := m.tunnels[cfg.ID]; ok && old.cfg.ListenPort() == port {
 		_ = old.fwd.Stop()
+		if err := fwd.Start(); err != nil {
+			_ = fwd.Stop()
+			if old.cfg.Protocol == forwarder.ProtocolBoth || cfg.Protocol == forwarder.ProtocolBoth {
+				return m.restoreStoppedEntryLocked(cfg.ID, old, err)
+			}
+			return err
+		}
+		return nil
 	}
 	return fwd.Start()
 }
@@ -571,7 +660,9 @@ func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Ru
 // m.mu.
 func (m *TunnelManager) markPortUsedLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
-		m.usedPort[portGuardKey(cfg)] = true
+		for _, binding := range portBindings(cfg) {
+			m.usedPort[binding.Key()] = true
+		}
 	}
 }
 
@@ -591,9 +682,12 @@ func (m *TunnelManager) noteStoppingLocked(cfg forwarder.TunnelConfig) {
 	if cfg.ListenPort() <= 0 {
 		return
 	}
-	m.stoppingPorts[portGuardKey(cfg)] = stoppingNote{
-		count: m.stoppingPorts[portGuardKey(cfg)].count + 1,
-		until: time.Now().Add(stoppingPortGrace),
+	for _, binding := range portBindings(cfg) {
+		key := binding.Key()
+		m.stoppingPorts[key] = stoppingNote{
+			count: m.stoppingPorts[key].count + 1,
+			until: time.Now().Add(stoppingPortGrace),
+		}
 	}
 }
 
@@ -603,11 +697,13 @@ func (m *TunnelManager) clearStoppingLocked(cfg forwarder.TunnelConfig) {
 	if cfg.ListenPort() <= 0 {
 		return
 	}
-	key := portGuardKey(cfg)
-	if n := m.stoppingPorts[key]; n.count > 1 {
-		m.stoppingPorts[key] = stoppingNote{count: n.count - 1, until: n.until}
-	} else {
-		delete(m.stoppingPorts, key)
+	for _, binding := range portBindings(cfg) {
+		key := binding.Key()
+		if n := m.stoppingPorts[key]; n.count > 1 {
+			m.stoppingPorts[key] = stoppingNote{count: n.count - 1, until: n.until}
+		} else {
+			delete(m.stoppingPorts, key)
+		}
 	}
 }
 
@@ -623,7 +719,9 @@ func (m *TunnelManager) rebuildPortGuardLocked() {
 	next := make(map[string]bool, len(m.tunnels)+len(m.stoppingPorts))
 	for _, e := range m.tunnels {
 		if e.cfg.ListenPort() > 0 {
-			next[portGuardKey(e.cfg)] = true
+			for _, binding := range portBindings(e.cfg) {
+				next[binding.Key()] = true
+			}
 		}
 	}
 	for _, bindings := range m.externalPorts {
@@ -650,7 +748,9 @@ func (m *TunnelManager) rebuildPortGuardLocked() {
 // releasePortLocked frees the port held by cfg. Caller must hold m.mu.
 func (m *TunnelManager) releasePortLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
-		delete(m.usedPort, portGuardKey(cfg))
+		for _, binding := range portBindings(cfg) {
+			delete(m.usedPort, binding.Key())
+		}
 	}
 }
 
@@ -859,6 +959,9 @@ func (m *TunnelManager) DatagramStats(id string) (forwarder.DatagramStats, bool)
 	if !ok {
 		return forwarder.DatagramStats{}, false
 	}
+	if mixed, ok := e.fwd.(forwarder.MixedRuntime); ok {
+		return mixed.Datagram().Stats(), true
+	}
 	d, ok := e.fwd.(forwarder.DatagramRuntime)
 	if !ok {
 		return forwarder.DatagramStats{}, false
@@ -893,15 +996,16 @@ func (m *TunnelManager) MaxRevision() int64 {
 // work is its mappings, so that is what is returned, and LiveMappings is the
 // explicit form callers should prefer when they know the transport.
 func (m *TunnelManager) LiveConns(id string) int {
-	live, ok := m.LiveMappings(id)
-	if ok {
-		return live
-	}
 	m.mu.RLock()
 	e, ok := m.tunnels[id]
 	m.mu.RUnlock()
 	if !ok {
 		return 0
+	}
+	// A mixed rule has two distinct observables. Its TCP count must not be
+	// replaced by the UDP count just because LiveMappings is also available.
+	if d, ok := e.fwd.(forwarder.DatagramRuntime); ok {
+		return d.LiveMappings() // Preserve the legacy UDP-only API convention.
 	}
 	type counter interface{ LiveConns() int }
 	if c, ok := e.fwd.(counter); ok {
@@ -919,6 +1023,9 @@ func (m *TunnelManager) LiveMappings(id string) (int, bool) {
 	m.mu.RUnlock()
 	if !ok {
 		return 0, false
+	}
+	if mixed, ok := e.fwd.(forwarder.MixedRuntime); ok {
+		return mixed.Datagram().LiveMappings(), true
 	}
 	d, ok := e.fwd.(forwarder.DatagramRuntime)
 	if !ok {

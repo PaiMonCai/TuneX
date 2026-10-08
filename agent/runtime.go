@@ -131,6 +131,7 @@ func startRuntime(ctx context.Context, cfg *agentconfig.Config) *agentRuntime {
 	// The native TunnelManager also enforces the shared runtime policy gate;
 	// its capability is independent of the optional FXP executable.
 	rt.linkFacts.PolicyRuntime = true
+	rt.linkFacts.NativeBoth = true
 	if rt.links != nil {
 		fromCache, err := control.RestoreLinks(ctx, linkrunner.HTTPSource{PanelURL: cfg.PanelHTTPURL, Credential: cfg.NodeCredential, AgentID: cfg.AgentID}, rt.links)
 		rt.restoredFromCache = fromCache

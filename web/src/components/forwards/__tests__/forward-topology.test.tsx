@@ -453,7 +453,7 @@ describe("diag 三态：null / 空 facts / 有键，必须互不相同", () => {
     expect(text).toContain("mappings: 3");
     expect(text).toContain("idle_timeout_seconds: 60");
     expect(text).toContain("future_key: x");
-    expect(text).toContain("协议诊断（udp）");
+    expect(text).toContain("协议诊断（UDP）");
   });
 
   test("truncated 必须显式说出来（有界化不能静默）", () => {

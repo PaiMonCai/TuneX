@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
+import { nativeBothBlock, nativeBothBlockText, withForwardRuntimeCapabilities, type ForwardCapabilities } from "@/lib/forward-native-both";
 import {
   forwardAccessAddress,
   forwardCopyDraft,
@@ -114,6 +115,7 @@ export function ForwardWorkspace() {
   const canCreate = can("forward:create") && canReadNodes;
   const canManageNodes = can("node:manage");
   const [nodes, setNodes] = useState<UserNode[]>([]);
+  const [forwardCapabilities, setForwardCapabilities] = useState<ForwardCapabilities | null>(null);
   const [bindings, setBindings] = useState<Record<number, NodeBinding[]>>({});
   const [summary, setSummary] = useState<ForwardSummary | null>(null);
   const [forwards, setForwards] = useState<PortForward[]>([]);
@@ -249,6 +251,10 @@ export function ForwardWorkspace() {
     setReferenceLoaded(false);
     setBindingsUnavailable(false);
     setBatchDeleteEnabled(false);
+    setForwardCapabilities(null);
+    const forwardCapabilityTask = canRead ? api.forwards.capabilities().then((value) => {
+      if (current()) setForwardCapabilities(value);
+    }).catch(() => {}) : Promise.resolve();
     const batchCapabilityTask = canRead ? api.forwards.batchCapabilities().then((value) => {
       if (current()) setBatchDeleteEnabled(value.delete_enabled === true);
     }).catch(() => {}) : Promise.resolve();
@@ -260,7 +266,10 @@ export function ForwardWorkspace() {
     }) : Promise.resolve();
     const nodesTask = canReadNodes ? api.nodes.list().then(async (nodeRows) => {
       if (!current()) return;
-      setNodes(nodeRows);
+      setNodes(nodeRows.map((node) => ({ ...node, capabilities: null, capabilities_fresh: false })));
+      const runtimeTask = withForwardRuntimeCapabilities(nodeRows, api.nodes.diagnostics).then((rows) => {
+        if (current()) setNodes(rows);
+      });
       const rows = await Promise.all(nodeRows.filter(isIngress).map(async (node) => ({
         id: Number(node.id), bindings: await api.nodes.bindings(node.id).catch(() => null),
       })));
@@ -277,6 +286,7 @@ export function ForwardWorkspace() {
       if (bindingsFailed) toast.error(t("forward.bindingsLoadFailed"));
       setBindings(map);
       setBindingsUnavailable(bindingsFailed);
+      await runtimeTask;
     }).catch((err) => {
       // **整张节点表取不到**（网络失败 / 权限刚被撤）也必须算"事实取不到"：
       // 否则 `setBindingsUnavailable` 不执行、而 `setReferenceLoaded(true)` 仍执行，
@@ -287,7 +297,7 @@ export function ForwardWorkspace() {
         toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
       }
     }) : Promise.resolve();
-    await Promise.all([summaryTask, nodesTask, batchCapabilityTask]);
+    await Promise.all([summaryTask, nodesTask, batchCapabilityTask, forwardCapabilityTask]);
     if (current()) setReferenceLoaded(true);
   }
 
@@ -440,6 +450,12 @@ export function ForwardWorkspace() {
   const protocolReady = Object.keys(protocolErrors).length === 0;
   async function createForward() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
+    if (createDraft.protocol === "both") {
+      const block = nativeBothBlock({ capabilities: forwardCapabilities, mode: createDraft.mode,
+        ingress: nodes.find((node) => String(node.id) === createDraft.ingressId),
+        egress: nodes.find((node) => String(node.id) === createDraft.egressId), middleNodeId: createDraft.middleNodeId });
+      if (block) { toast.error(nativeBothBlockText(locale, block)); return; }
+    }
     if (Object.keys(forwardPolicyDraftErrors(createDraft)).length) { toast.error(t("forward.createFailed")); return; }
     const ingress = Number(createDraft.ingressId);
     const targetPortNum = Number(createDraft.targetPort);
@@ -822,6 +838,7 @@ export function ForwardWorkspace() {
       )}
 
       <ForwardCreateDialog
+        capabilities={forwardCapabilities}
         open={createOpen && canCreate}
         draft={createDraft}
         ingressNodes={ingressNodes}
@@ -865,6 +882,7 @@ export function ForwardWorkspace() {
 
       {/* V4-WP4：列表行进入全字段编辑；保存后按 updated 回填行，保持列表可用 */}
       <ForwardEditDialog
+        capabilities={forwardCapabilities}
         open={editTarget !== null && canForward(editTarget, "update")}
         onOpenChange={(open) => {
           if (!open) setEditTarget(null);

@@ -38,6 +38,7 @@ services:
       AUDIT_LOG_ENABLED: "true"
       # Destructive batch Forward deletion is default-off; A00 gate opts in explicitly.
       FORWARD_BATCH_DELETE_ENABLED: ${FORWARD_BATCH_DELETE_ENABLED:-false}
+      FORWARD_NATIVE_BOTH_ENABLED: ${FORWARD_NATIVE_BOTH_ENABLED:-false}
       TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
       TUNEX_LINK_SEAL_KEY: ${TUNEX_LINK_SEAL_KEY:-}
     networks:
@@ -72,6 +73,7 @@ services:
       TUNEX_LICENSE_KEY: ${TUNEX_LICENSE_KEY:?required}
       JWT_ISSUER: integration
       DISABLE_WORKER: "false"
+      FORWARD_NATIVE_BOTH_ENABLED: ${FORWARD_NATIVE_BOTH_ENABLED:-false}
       TUNEX_FXP_LINKS_ENABLED: ${TUNEX_FXP_LINKS_ENABLED:-false}
       TUNEX_LINK_SEAL_KEY: ${TUNEX_LINK_SEAL_KEY:-}
     command: ["bun", "src/worker.ts"]
