@@ -6,6 +6,7 @@ No fake runtime facts, direct admin activation or manual port-lease release.
 from __future__ import annotations
 import importlib.util
 import json
+import re
 import signal
 import socket
 import time
@@ -24,7 +25,19 @@ RESULT = HERE / "evidence" / "native-both-result.txt"
 def request(method, path, body=None):
     status, response, _ = H.req(method, path, body)
     if status not in (200, 201):
-        raise RuntimeError(f"{method} {path}: status={status} code={response.get('code', 'unknown')}")
+        # Keep the actual admission/apply code, not just the HTTP wrapper. Do
+        # not publish raw responses, Agent config, credentials or error text.
+        def code(key):
+            value = response.get(key)
+            return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", value) else "unknown"
+        message = str(response.get("message", ""))
+        markers = [value for value in (
+            "address already in use", "unsupported_protocol", "revision_mismatch",
+            "stale_revision", "ownership", "lease_expired", "port_conflict",
+            "payload_invalid", "invariant_violated", "native_both", "next_hop",
+        ) if value in message]
+        raise RuntimeError(f"{method} {path}: status={status} code={code('code')} "
+                           f"apply_error_code={code('apply_error_code')} markers={markers}")
     return H.unwrap(response)
 
 

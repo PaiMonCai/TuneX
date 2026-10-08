@@ -79,6 +79,10 @@ func TestNativeBothRegistryRevisionStatsRemoveAndRestore(t *testing.T) {
 		t.Fatal(got)
 	}
 	udpPoll(t, time.Second, func() bool { return m.Stats(cfg.ID) == 12 }, "aggregate byte stats")
+	// Closing the TCP client is asynchronous at the server. Wait for its
+	// handler to retire before asserting that the still-live UDP mapping is
+	// not counted as a TCP connection.
+	udpPoll(t, 2*time.Second, func() bool { return m.LiveConns(cfg.ID) == 0 }, "TCP connection closes independently of UDP mapping")
 	if m.LiveConns(cfg.ID) != 0 {
 		t.Fatal("UDP mapping misreported as TCP connection")
 	}

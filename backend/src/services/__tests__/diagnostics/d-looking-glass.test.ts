@@ -1034,8 +1034,8 @@ const BOUNDARIES: readonly Boundary[] = [
   {
     site: "⑨ Agent 侧：动作被广告（否则面板永远不下发）",
     file: "../../agent/internal/control/protocol.go",
-    anchor: "ActionLookingGlass = \"looking_glass\"",
-    required: ["advertisedActions", "ActionLookingGlass,"],
+    anchor: "var advertisedActions = []string{",
+    required: ["ActionLookingGlass,"],
   },
 ];
 
