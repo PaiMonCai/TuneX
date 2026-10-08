@@ -1955,6 +1955,9 @@ func handleExitSessionWithStartup(conn net.Conn, cfg config, startupComplete fun
 			}
 			defer target.Close()
 			hello.TargetIP, hello.TargetPort = targetPool.set.Targets[index].Host, targetPool.set.Targets[index].Port
+			if hello.SourceVersion == 1 {
+				return managed.handleSourceTCP(sec, hello, target)
+			}
 			return handleExitTCP(sec, hello, target)
 		}
 		if managed != nil {
@@ -1963,6 +1966,9 @@ func handleExitSessionWithStartup(conn net.Conn, cfg config, startupComplete fun
 				return err
 			}
 			defer target.Close()
+			if hello.SourceVersion == 1 {
+				return managed.handleSourceTCP(sec, hello, target)
+			}
 			return handleExitTCP(sec, hello, target)
 		}
 		return handleExitTCP(sec, hello)

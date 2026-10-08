@@ -18,11 +18,36 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 const managedPollInterval = 20 * time.Millisecond
 const managedMaxConfigBytes = 1 << 20
+
+// Fixed stage codes only: never publish an OS error's path or config contents.
+type managedSnapshotError string
+
+func (e managedSnapshotError) Error() string { return string(e) }
+
+func snapshotReadError(stage string, err error) error {
+	if transientManagedSnapshotOpen(err) {
+		return managedSnapshotError(stage + "_sharing")
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return managedSnapshotError(stage + "_missing")
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return managedSnapshotError(stage + "_access")
+	}
+	return managedSnapshotError(stage + "_other")
+}
+
+func transientManagedSnapshotOpen(err error) bool {
+	// Windows atomic replacement can briefly deny a concurrent Open. Only the
+	// two sharing/lock codes are retryable; permissions/missing files are not.
+	return runtime.GOOS == "windows" && (errors.Is(err, syscall.Errno(32)) || errors.Is(err, syscall.Errno(33)))
+}
 
 type managedIdentity struct {
 	tunnel, port, udpPort int
@@ -51,6 +76,7 @@ type managedExitState struct {
 	mu           sync.RWMutex
 	policy       atomic.Pointer[managedPolicy]
 	clients      sync.Map // net.Conn -> ruleID
+	tcpTargets   sync.Map // source-attested target net.Conn -> ruleID
 	udp          sync.Map // *udpDirectExitSession -> ruleID
 	udpCarriers  sync.Map // net.Conn -> managedUDPBinding (legacy framed UDP)
 	digest       string
@@ -116,6 +142,13 @@ func (s *managedExitState) apply(cfg config, digests ...string) {
 		if changed[value.(int)] {
 			_ = key.(net.Conn).Close()
 			s.clients.Delete(key)
+		}
+		return true
+	})
+	s.tcpTargets.Range(func(key, value any) bool {
+		if changed[value.(int)] {
+			_ = key.(net.Conn).Close()
+			s.tcpTargets.Delete(key)
 		}
 		return true
 	})
@@ -245,28 +278,77 @@ func managedEnabled(path string) bool {
 	return json.Unmarshal(data, &flags) == nil && flags.ManagedReload
 }
 
+func readManagedPrivateSnapshot(path string, info os.FileInfo) ([]byte, error) {
+	return readManagedPrivateSnapshotWith(path, info, os.Lstat, os.Open)
+}
+
+// Explicit IO functions let regression tests place replacement at each boundary
+// without timing sleeps, mutable globals or relaxing production file checks.
+func readManagedPrivateSnapshotWith(path string, info os.FileInfo, lstat func(string) (os.FileInfo, error), open func(string) (*os.File, error)) ([]byte, error) {
+	parent, err := lstat(filepath.Dir(path))
+	if err != nil {
+		return nil, snapshotReadError("parent", err)
+	}
+	if !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || (runtime.GOOS != "windows" && parent.Mode().Perm()&0o077 != 0) {
+		return nil, managedSnapshotError("parent")
+	}
+	// Agent replaces the complete file atomically. A replacement between Lstat
+	// and Open is not a malformed candidate: refresh the identity, then repeat
+	// every permission/type check. Never accept a symlink or relax digest checks.
+	for attempt := 0; attempt < 3; attempt++ {
+		if info == nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > managedMaxConfigBytes || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
+			return nil, managedSnapshotError("file")
+		}
+		f, err := open(path)
+		if err != nil {
+			if transientManagedSnapshotOpen(err) && attempt < 2 {
+				time.Sleep(5 * time.Millisecond)
+				info, err = lstat(path)
+				if err != nil {
+					return nil, snapshotReadError("identity", err)
+				}
+				continue
+			}
+			return nil, snapshotReadError("open", err)
+		}
+		opened, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, snapshotReadError("stat", err)
+		}
+		current, statErr := lstat(path)
+		if statErr != nil {
+			_ = f.Close()
+			return nil, snapshotReadError("identity", statErr)
+		}
+		if !current.Mode().IsRegular() || current.Size() <= 0 || current.Size() > managedMaxConfigBytes || (runtime.GOOS != "windows" && current.Mode().Perm()&0o077 != 0) {
+			_ = f.Close()
+			return nil, managedSnapshotError("file")
+		}
+		if !os.SameFile(info, opened) || !os.SameFile(current, opened) {
+			_ = f.Close()
+			info = current
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(f, managedMaxConfigBytes+1))
+		_ = f.Close()
+		if err != nil || len(data) > managedMaxConfigBytes {
+			return nil, snapshotReadError("read", err)
+		}
+		return data, nil
+	}
+	return nil, managedSnapshotError("identity")
+}
+
 func readManagedConfig(path string, targetsEnabled ...bool) (config, string, error) {
 	var cfg config
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > managedMaxConfigBytes || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
-		return cfg, "", errors.New("private config file rejected")
-	}
-	parent, err := os.Lstat(filepath.Dir(path))
-	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 || (runtime.GOOS != "windows" && parent.Mode().Perm()&0o077 != 0) {
-		return cfg, "", errors.New("private config directory rejected")
-	}
-	f, err := os.Open(path)
 	if err != nil {
-		return cfg, "", errors.New("config read failed")
+		return cfg, "", snapshotReadError("file", err)
 	}
-	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil || !os.SameFile(info, opened) {
-		return cfg, "", errors.New("config identity changed")
-	}
-	data, err := io.ReadAll(io.LimitReader(f, managedMaxConfigBytes+1))
-	if err != nil || len(data) > managedMaxConfigBytes {
-		return cfg, "", errors.New("config read failed")
+	data, err := readManagedPrivateSnapshot(path, info)
+	if err != nil {
+		return cfg, "", err
 	}
 	sum := sha256.Sum256(data)
 	digest := hex.EncodeToString(sum[:])
@@ -481,6 +563,7 @@ func runManaged(done <-chan struct{}, path string, targetsEnabled ...bool) error
 		if m.exit != nil {
 			m.exit.stopTargets()
 			m.exit.clients.Range(func(k, v any) bool { _ = k.(net.Conn).Close(); return true })
+			m.exit.tcpTargets.Range(func(k, v any) bool { _ = k.(net.Conn).Close(); return true })
 			m.exit.udp.Range(func(k, v any) bool { k.(*udpDirectExitSession).close(); return true })
 		}
 	}()
@@ -546,6 +629,10 @@ func runManaged(done <-chan struct{}, path string, targetsEnabled ...bool) error
 			lastSeen = nextDigest
 			if readErr != nil {
 				if nextDigest == "" {
+					var snapshotErr managedSnapshotError
+					if errors.As(readErr, &snapshotErr) {
+						log.Printf("managed snapshot rejected code=%s", snapshotErr)
+					}
 					nextDigest = hex.EncodeToString(make([]byte, 32))
 				}
 				log.Printf("managed rejected sha256=%s code=invalid", nextDigest)

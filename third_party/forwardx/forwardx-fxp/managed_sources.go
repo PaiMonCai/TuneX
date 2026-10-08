@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -173,7 +174,7 @@ func readManagedProxyHeader(conn net.Conn, timeout time.Duration) (proxyProtocol
 			}
 			buf = append(buf, ch[0])
 		}
-		parts := strings.Fields(string(buf))
+		parts := strings.Split(string(buf[:len(buf)-2]), " ")
 		for _, ch := range buf[:len(buf)-2] {
 			if ch < 32 || ch > 126 {
 				return proxyProtocolInfo{}, errors.New("invalid PROXY header byte")
@@ -182,6 +183,9 @@ func readManagedProxyHeader(conn net.Conn, timeout time.Duration) (proxyProtocol
 		info, rest, ok, err := consumeProxyProtocolV1(buf)
 		if err != nil || !ok || len(rest) != 0 || len(parts) != 6 || !validSourceInfo(info) {
 			return proxyProtocolInfo{}, errors.New("invalid PROXY source")
+		}
+		if parts[4] != strconv.Itoa(info.SourcePort) || parts[5] != strconv.Itoa(info.DestPort) {
+			return proxyProtocolInfo{}, errors.New("non-canonical PROXY port")
 		}
 		src, _ := sourceIP(info.SourceIP)
 		if (parts[1] == "TCP4") != src.Is4() {
@@ -282,4 +286,51 @@ func authorizeManagedSource(cfg config, hello *helloFrame) error {
 
 func sourcePoliciesEqual(a, b config, rule int) bool {
 	return reflect.DeepEqual(managedSourceFor(a, rule), managedSourceFor(b, rule))
+}
+
+// Linearize authorization + PROXY emission with source revocation. Never hold
+// the policy lock over business payload proxying. The bounded header write ends
+// before an update can complete; targets are then revoked alongside carriers.
+func (s *managedExitState) prepareSourceTCP(sec *secureConn, target net.Conn, hello *helloFrame) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	policy := s.policy.Load().cfg
+	rule, registered := s.clients.Load(sec.conn)
+	if !registered || rule.(int) != hello.RuleID || !authorizedTarget(policy, hello.RuleID, "tcp", hello.TargetIP, hello.TargetPort) {
+		return errors.New("source carrier or target revoked")
+	}
+	if err := authorizeManagedSource(policy, hello); err != nil {
+		return err
+	}
+	s.tcpTargets.Store(target, hello.RuleID)
+	if !hello.ProxyProtocolExitSend {
+		return nil
+	}
+	if err := target.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		return err
+	}
+	defer target.SetWriteDeadline(time.Time{})
+	header := formatProxyProtocol(*hello)
+	for len(header) > 0 {
+		n, err := target.Write(header)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		header = header[n:]
+	}
+	return nil
+}
+
+func (s *managedExitState) handleSourceTCP(sec *secureConn, hello helloFrame, target net.Conn) error {
+	defer func() {
+		_ = target.Close()
+		s.tcpTargets.Delete(target)
+	}()
+	if err := s.prepareSourceTCP(sec, target, &hello); err != nil {
+		return err
+	}
+	return proxyPlainSecure(target, sec, nil, nil, nil)
 }

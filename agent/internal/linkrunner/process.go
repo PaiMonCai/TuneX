@@ -24,6 +24,7 @@ const (
 
 var listenerLog = regexp.MustCompile(`^(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)? )?(entry|exit) (tcp|udp) listening on :([0-9]+) tunnel=([0-9]+)(?: rule=([0-9]+))?$`)
 var managedLog = regexp.MustCompile(`^(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)? )?managed (applied|rejected) sha256=([0-9a-f]{64})(?: code=(invalid|immutable|bind))?$`)
+var managedSnapshotLog = regexp.MustCompile(`^(?:[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)? )?managed snapshot rejected code=((?:file|parent|open|stat|identity|read)(?:_(?:missing|access|sharing|other))?)$`)
 
 type child struct {
 	cmd                                              *exec.Cmd
@@ -81,11 +82,15 @@ func (p *child) readLineLocked(line string) {
 		return
 	}
 	if p.managed {
+		if match := managedSnapshotLog.FindStringSubmatch(line); match != nil {
+			p.logLocked("managed snapshot rejected code=" + match[1])
+			return
+		}
 		if match := managedLog.FindStringSubmatch(line); match != nil {
 			digest := match[2]
 			if digest != p.currentDigest && digest != p.pendingDigest {
 				p.tampered = true
-				p.logLocked("unauthorized config change; stopping process")
+				p.logLocked("unauthorized config change sha256=" + digest + "; stopping process")
 				go p.stop()
 				return
 			}

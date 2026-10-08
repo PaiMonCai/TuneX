@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -131,7 +133,7 @@ func TestManagedProxyBoundedStrictHeadersAndAbsoluteDeadline(t *testing.T) {
 	oversize := formatProxyProtocolV2(helloFrame{ProxySourceIP: "198.51.100.2", ProxyDestIP: "192.0.2.10", ProxySourcePort: 1, ProxyDestPort: 2})
 	binary.BigEndian.PutUint16(oversize[14:16], 65535)
 	local := formatProxyProtocolV2Local()
-	for _, data := range [][]byte{[]byte("PROXY UNKNOWN\r\n"), []byte("PROXY TCP4 bad 192.0.2.10 1 2\r\n"), []byte("PROXY TCP6 198.51.100.2 192.0.2.10 1 2\r\n"), []byte("PROXY TCP4 198.51.100.2 192.0.2.10 0 2\r\n"), append([]byte("PROXY "), bytes.Repeat([]byte("x"), 102)...), oversize, local} {
+	for _, data := range [][]byte{[]byte("PROXY  TCP4 198.51.100.2 192.0.2.10 1 2\r\n"), []byte("PROXY TCP4 198.51.100.2 192.0.2.10 1 2 \r\n"), []byte("PROXY TCP4 198.51.100.2 192.0.2.10 0001 2\r\n"), []byte("PROXY UNKNOWN\r\n"), []byte("PROXY TCP4 bad 192.0.2.10 1 2\r\n"), []byte("PROXY TCP6 198.51.100.2 192.0.2.10 1 2\r\n"), []byte("PROXY TCP4 198.51.100.2 192.0.2.10 0 2\r\n"), append([]byte("PROXY "), bytes.Repeat([]byte("x"), 102)...), oversize, local} {
 		a, b := net.Pipe()
 		done := make(chan struct{})
 		go func() { defer close(done); defer b.Close(); _, _ = b.Write(data) }()
@@ -232,5 +234,157 @@ func TestManagedSourcePolicyEditClosesOnlyAffectedRuleAndRejectsOldAttestation(t
 	h = helloFrame{TunnelID: 71, RuleID: 102, Network: "udp", TargetIP: "127.0.0.1", TargetPort: 444, ProxyProtocolExitSend: true}
 	if err := authorizeHello(next, &h); err != nil || h.ProxyProtocolExitSend {
 		t.Fatal("hello controlled legacy PROXY send", err)
+	}
+}
+
+func TestManagedSourceRevocationBetweenDialAndHeaderWrite(t *testing.T) {
+	source := sourceFixture(false, "v1")
+	source.RuleID = 101
+	cfg := managedFixture()
+	cfg.ClientSources = []managedClientSource{source}
+	enableManagedSources(&cfg, true)
+	s := &managedExitState{}
+	s.policy.Store(policyFor(cfg))
+	carrier, carrierPeer := net.Pipe()
+	defer carrier.Close()
+	defer carrierPeer.Close()
+	target, peer := net.Pipe()
+	defer target.Close()
+	defer peer.Close()
+	s.clients.Store(carrier, 101)
+	oldHello := sourceHello(source, "198.51.100.2")
+	// Barrier: the target has been dialled, but the policy update completes
+	// before the old session is allowed to register/write its target header.
+	next := cfg
+	next.ClientSources = append([]managedClientSource(nil), cfg.ClientSources...)
+	next.ClientSources[0].SendProxy = "off"
+	s.apply(next)
+	if err := s.prepareSourceTCP(&secureConn{conn: carrier}, target, &oldHello); err == nil {
+		t.Fatal("old attestation emitted after revocation")
+	}
+	if _, ok := s.tcpTargets.Load(target); ok {
+		t.Fatal("revoked target registered")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+	n, _ := peer.Read(make([]byte, 108))
+	if n != 0 {
+		t.Fatal("stale PROXY header reached target")
+	}
+}
+
+func TestManagedSourceRevocationClosesRegisteredTargetWithCarrier(t *testing.T) {
+	source := sourceFixture(false, "off")
+	source.RuleID = 101
+	cfg := managedFixture()
+	cfg.ClientSources = []managedClientSource{source}
+	enableManagedSources(&cfg, true)
+	s := &managedExitState{}
+	s.policy.Store(policyFor(cfg))
+	carrier, carrierPeer := net.Pipe()
+	defer carrier.Close()
+	defer carrierPeer.Close()
+	target, peer := net.Pipe()
+	defer target.Close()
+	defer peer.Close()
+	s.clients.Store(carrier, 101)
+	h := sourceHello(source, "198.51.100.2")
+	if err := s.prepareSourceTCP(&secureConn{conn: carrier}, target, &h); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.tcpTargets.Load(target); !ok {
+		t.Fatal("target not tracked")
+	}
+	next := cfg
+	next.ClientSources = append([]managedClientSource(nil), cfg.ClientSources...)
+	next.ClientSources[0].SendProxy = "v2"
+	s.apply(next)
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatal("target outlived source revocation", err)
+	}
+	if _, ok := s.tcpTargets.Load(target); ok {
+		t.Fatal("revoked target tracking leaked")
+	}
+}
+
+type sourceCloseBarrierConn struct {
+	net.Conn
+	entered, revoked chan struct{}
+	closed           sync.Once
+	closeCalls       atomic.Int32
+	failure          string
+}
+
+func (c *sourceCloseBarrierConn) SetWriteDeadline(deadline time.Time) error {
+	if c.failure == "deadline" {
+		return io.ErrClosedPipe
+	}
+	return c.Conn.SetWriteDeadline(deadline)
+}
+func (c *sourceCloseBarrierConn) Write(data []byte) (int, error) {
+	if c.failure == "write" {
+		return 0, io.ErrClosedPipe
+	}
+	return c.Conn.Write(data)
+}
+func (c *sourceCloseBarrierConn) Close() error {
+	if c.closeCalls.Add(1) == 1 {
+		close(c.entered)
+		<-c.revoked
+	} else {
+		c.closed.Do(func() { close(c.revoked) })
+	}
+	return c.Conn.Close()
+}
+
+func TestManagedSourceFailedHeaderTargetRemainsTrackedUntilClosed(t *testing.T) {
+	for _, failure := range []string{"deadline", "write", "timeout"} {
+		t.Run(failure, func(t *testing.T) {
+			source := sourceFixture(false, "v1")
+			source.RuleID = 101
+			cfg := managedFixture()
+			cfg.ClientSources = []managedClientSource{source}
+			enableManagedSources(&cfg, true)
+			s := &managedExitState{}
+			s.policy.Store(policyFor(cfg))
+			carrier, cp := net.Pipe()
+			defer carrier.Close()
+			defer cp.Close()
+			plain, peer := net.Pipe()
+			defer peer.Close()
+			target := &sourceCloseBarrierConn{Conn: plain, entered: make(chan struct{}), revoked: make(chan struct{}), failure: failure}
+			defer func() { target.closed.Do(func() { close(target.revoked) }); _ = plain.Close() }()
+			s.clients.Store(carrier, 101)
+			finished := make(chan error, 1)
+			go func() {
+				finished <- s.handleSourceTCP(&secureConn{conn: carrier}, sourceHello(source, "198.51.100.2"), target)
+			}()
+			select {
+			case <-target.entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("bounded header failure never began cleanup")
+			}
+			if _, ok := s.tcpTargets.Load(target); !ok {
+				t.Fatal("failed header removed target before Close completed")
+			}
+			next := cfg
+			next.ClientSources = append([]managedClientSource(nil), cfg.ClientSources...)
+			next.ClientSources[0].SendProxy = "off"
+			s.apply(next)
+			if target.closeCalls.Load() < 2 {
+				t.Fatal("revocation missed a target still closing")
+			}
+			select {
+			case err := <-finished:
+				if err == nil {
+					t.Fatal("failed header accepted")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("revoked target cleanup stuck")
+			}
+			if _, ok := s.tcpTargets.Load(target); ok {
+				t.Fatal("closed target tracking leaked")
+			}
+		})
 	}
 }

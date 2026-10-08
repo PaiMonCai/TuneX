@@ -27,7 +27,7 @@ func managedCompatible(oldRaw, nextRaw json.RawMessage) bool {
 		return false
 	}
 	if a["role"] == "exit" {
-		for _, k := range []string{"allowedBindings", "udpTargets", "targetSets"} {
+		for _, k := range []string{"allowedBindings", "udpTargets", "targetSets", "clientSources"} {
 			delete(a, k)
 			delete(b, k)
 		}

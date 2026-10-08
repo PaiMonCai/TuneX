@@ -65,6 +65,11 @@ func TestManagedAckTimeoutFailsClosedAndKeepsCommittedCache(t *testing.T) {
 }
 
 func TestManagedTransportClassifier(t *testing.T) {
+	exit := json.RawMessage(`{"role":"exit","managedReload":true,"tunnelId":1,"key":"private","listenPort":80}`)
+	sourcedExit := json.RawMessage(`{"role":"exit","managedReload":true,"tunnelId":1,"key":"private","listenPort":80,"clientSources":[{"version":1,"ruleId":2,"receiveProxy":false,"trustedCIDRs":[],"sendProxy":"v2"}]}`)
+	if !managedCompatible(exit, sourcedExit) || !managedCompatible(sourcedExit, exit) {
+		t.Fatal("source policy edit classified as shared exit restart")
+	}
 	old := json.RawMessage(`{"role":"entry-group","tunnelId":1,"managedReload":true,"entries":[{"ruleId":2,"key":"private","listenPort":80,"protocol":"both","targetPort":443}]}`)
 	next := json.RawMessage(`{"role":"entry-group","tunnelId":1,"managedReload":true,"entries":[{"ruleId":2,"key":"private","listenPort":80,"protocol":"both","targetPort":444,"maxConnections":3},{"ruleId":3,"key":"private","listenPort":81,"protocol":"both"}]}`)
 	if !managedCompatible(old, next) {
@@ -81,5 +86,21 @@ func TestManagedTransportClassifier(t *testing.T) {
 		if managedCompatible(old, json.RawMessage(raw)) {
 			t.Fatal("immutable transport accepted for managed update")
 		}
+	}
+}
+
+func TestManagedSnapshotLogsAreFixedAndSecretFree(t *testing.T) {
+	p := &child{managed: true}
+	_, _ = p.Write([]byte("2026/10/08 09:01:02 managed snapshot rejected code=open_sharing\n"))
+	for _, line := range []string{
+		"managed snapshot rejected code=" + fixtureKey,
+		"managed snapshot rejected code=open_sharing path=" + fixtureKey,
+		"managed snapshot rejected code=open_sharing\x00" + fixtureKey,
+		"managed snapshot rejected code=open_unknown",
+	} {
+		_, _ = p.Write([]byte(line + "\n"))
+	}
+	if len(p.logs) != 1 || p.logs[0] != "managed snapshot rejected code=open_sharing" {
+		t.Fatal("snapshot diagnostics retained non-whitelisted text", p.logs)
 	}
 }

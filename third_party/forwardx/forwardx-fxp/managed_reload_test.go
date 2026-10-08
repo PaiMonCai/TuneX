@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -66,6 +70,128 @@ func TestManagedPrivateSourceBoundary(t *testing.T) {
 	if err := os.Symlink(path, link); err == nil {
 		if _, _, err := readManagedConfig(link); err == nil {
 			t.Fatal("symlink source accepted")
+		}
+	}
+}
+
+func TestManagedPrivateSnapshotRetriesAtomicReplacement(t *testing.T) {
+	path := managedFile(t, managedFixture())
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The reader's Lstat observed the old inode, but Open will see the new one.
+	if err := os.Rename(path, path+".old"); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(`{"managedReload":true,"candidate":"replacement"}`)
+	if err := os.WriteFile(path, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readManagedPrivateSnapshot(path, before)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("complete atomic replacement rejected: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readManagedPrivateSnapshot(path, before); err == nil {
+			t.Fatal("replacement bypassed private permissions")
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(path+".old", path); err == nil {
+		if _, err := readManagedPrivateSnapshot(path, before); err == nil {
+			t.Fatal("replacement bypassed no-follow check")
+		}
+	}
+}
+
+func TestManagedPrivateSnapshotReplacementAfterOpenIsBounded(t *testing.T) {
+	for _, replaceEveryTime := range []bool{false, true} {
+		t.Run(fmt.Sprintf("continuous=%v", replaceEveryTime), func(t *testing.T) {
+			path := managedFile(t, managedFixture())
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var opened []*os.File
+			want := []byte(`{"managedReload":true,"candidate":"after-open"}`)
+			candidates := []string{path}
+			for i := 1; i <= 3; i++ {
+				candidate := fmt.Sprintf("%s.candidate-%d", path, i)
+				if err := os.WriteFile(candidate, want, 0600); err != nil {
+					t.Fatal(err)
+				}
+				candidates = append(candidates, candidate)
+			}
+			lstat := func(name string) (os.FileInfo, error) {
+				if name == path {
+					// Model the path already pointing at a replacement after
+					// Open obtained its prior inode. Windows cannot rename an
+					// open FD without share-delete, so inject exact observations.
+					index := 1
+					if replaceEveryTime {
+						index = len(opened)
+					}
+					return os.Lstat(candidates[index])
+				}
+				return os.Lstat(name)
+			}
+			open := func(name string) (*os.File, error) {
+				f, err := os.Open(candidates[len(opened)])
+				if err == nil {
+					opened = append(opened, f)
+				}
+				return f, err
+			}
+			got, err := readManagedPrivateSnapshotWith(path, before, lstat, open)
+			if replaceEveryTime {
+				if err != managedSnapshotError("identity") || len(opened) != 3 {
+					t.Fatalf("retry unbounded or replacement accepted: attempts=%d err=%v", len(opened), err)
+				}
+			} else if err != nil || !bytes.Equal(got, want) || len(opened) != 2 {
+				t.Fatalf("post-open replacement rejected: attempts=%d err=%v", len(opened), err)
+			}
+			for _, f := range opened {
+				if _, err := f.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+					t.Fatal("snapshot file descriptor leaked", err)
+				}
+			}
+		})
+	}
+}
+
+func TestManagedPrivateSnapshotOpenErrorRetriesAreNarrow(t *testing.T) {
+	for _, failure := range []error{syscall.Errno(32), syscall.Errno(33), os.ErrPermission, os.ErrNotExist, io.ErrUnexpectedEOF} {
+		for _, persistent := range []bool{false, true} {
+			path := managedFile(t, managedFixture())
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			open := func(name string) (*os.File, error) {
+				calls++
+				if persistent || calls == 1 {
+					return nil, failure
+				}
+				return os.Open(name)
+			}
+			_, err = readManagedPrivateSnapshotWith(path, info, os.Lstat, open)
+			if transientManagedSnapshotOpen(failure) {
+				if persistent && (err != managedSnapshotError("open_sharing") || calls != 3) {
+					t.Fatal("persistent sharing failure escaped bounded rejection", calls, err)
+				}
+				if !persistent && (err != nil || calls != 2) {
+					t.Fatal("atomic-replacement sharing failure not recovered", calls, err)
+				}
+			} else if err == nil || calls != 1 {
+				t.Fatal("non-transient failure was retried or accepted", calls, err)
+			}
 		}
 	}
 }
