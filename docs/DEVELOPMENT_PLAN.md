@@ -138,7 +138,7 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 
 Agent 使用一个 ID、一个修订和 TCP/UDP 两个真实 OS 槽位；两子监听均成功才开放入口准入，半失败关闭已准备监听。目标变化首版完整重建，两协议不能分开热改；同号替换失败时重建旧已应用配置，重新验证有效续租及单调所有权围栏。失败候选不得改变当前运行的租约时钟。流量为两协议 payload 聚合，TCP 连接与 UDP 映射分项展示。真实验收新增 `scripts/integration/native-both.py`，不能用本机测试或前一切片 CI 代替。
 
-2026-10-09 收尾：旧候选 `c273122` 的实网门禁在 DIRECT 目标更新时报告 `port_port_taken`，不能标成 F4 完成。已补规范 runtime 与数字占用汇总的归属匹配、显式未知协议汇总拒绝及 RELAY 目标修改叠加入口重建时的出口准备步骤，并新增真实 socket 生命周期回归。后续 `4c4d6e9` 仍暴露 PATCH 将 `connect_ip` 写成 `listen_ip` 的作用域漂移；已修正服务层保持绑定作用域和补偿删除栅栏。`010b74a` 实网确认 DIRECT 目标更新和两种模式暂停/恢复通过，但 RELAY 目标同步、运行操作后的基线恢复及脚本 helper 尚未通过；继续补 actual applied 基线冻结、带标签的出口命令 socket 回归及脚本契约/脱敏诊断。完整交付仍以修复候选的 [PR 75 当前检查](https://github.com/PaiMonCai/TuneX/pull/75/checks) 和 `native-both-result.txt` 为准。门禁通过后再进入 F5，不提前启用默认关闭的入口。
+2026-10-09 收尾：已修正同一 both runtime 的数字占用汇总归属、PATCH 保持监听作用域、实际 applied 基线冻结及补偿/重试删除栅栏；RELAY 更新前发布实际 hop 事实。`4ea426c` 的 [CI 37868714916](https://github.com/PaiMonCai/TuneX/actions/runs/37868714916) 共享 gate 73 PASS / 0 FAIL、F4 34 PASS / 1 FAIL，确认两种模式目标更新、恢复及 half-bind 正常 retry，通过后仅剩删除后立即复用端口失败；Agent gate 同时有短租约启动时序失败。当前候选补真实 Stop 完成等待、删除/暂停后的串行完整报告、取消/失败保留占用及确定性租约回归，并增加定向 race gate。F4 仍须看修复候选的 [PR 75 当前检查](https://github.com/PaiMonCai/TuneX/pull/75/checks) 和 `native-both-result.txt`，不提前标完成。门禁通过后再进入 F5，不启用默认关闭的入口。
 
 ### F5：共享连接在线端点变更与密钥轮换
 

@@ -107,6 +107,80 @@ func TestNativeBothPublishesActualHopBeforeApplyAck(t *testing.T) {
 	}
 }
 
+func TestNativeBothRemovalPublishesReleasedSocketsBeforeAck(t *testing.T) {
+	for _, action := range []string{ActionRemoveTunnel, ActionSuspendTunnel} {
+		for _, mode := range []forwarder.TunnelMode{forwarder.ModeDirect, forwarder.ModeRelay, forwarder.ModeEgress} {
+			t.Run(action+"/"+string(mode), func(t *testing.T) {
+				em := manager.NewEgressManager()
+				m := manager.NewTunnelManager(em, "127.0.0.1")
+				t.Cleanup(m.StopAll)
+				var states []reporter.StatePayload
+				r := reporter.New(reporter.Config{PanelURL: "http://fixture.invalid", Credential: "fixture"},
+					reporter.WithTunnels(m), reporter.WithPorts(m),
+					reporter.WithPost(func(_ context.Context, _ string, body []byte, _ map[string]string) error {
+						var state reporter.StatePayload
+						if err := json.Unmarshal(body, &state); err != nil {
+							return err
+						}
+						states = append(states, state)
+						return nil
+					}),
+				)
+				c := New(Config{ReportLinkState: r.ReportOnce}, m, em)
+				cmd := egressCommand(bothCommandPort(t))
+				cmd.Config.Mode, cmd.Config.Protocol = mode, forwarder.ProtocolBoth
+				cmd.Config.IngressPort = cmd.Config.EgressPort
+				cmd.Config.RemoteHost, cmd.Config.RemotePort = "127.0.0.1", 9
+				cmd.Config.NextHop, cmd.Config.HopPeer = "127.0.0.1:9", "127.0.0.1"
+				cmd.Config.Revision, cmd.Envelope.Revision = 2, 2
+				if ack := c.execute(context.Background(), cmd); !ack.OK {
+					t.Fatal(ack)
+				}
+				port := cmd.Config.ListenPort()
+				sibling := relayCommand(t, "unrelated", bothCommandPort(t), "127.0.0.1:9", 1)
+				sibling.Config.Protocol = forwarder.ProtocolBoth
+				if ack := c.execute(context.Background(), sibling); !ack.OK {
+					t.Fatal(ack)
+				}
+				remove := &QueuedCommand{Envelope: cmd.Envelope}
+				remove.Envelope.Action, remove.Envelope.Revision = action, 1
+				if ack := c.execute(context.Background(), remove); ack.OK || len(states) != 2 {
+					t.Fatal("stale removal emitted success facts")
+				}
+				remove.Envelope.Revision = 2
+				if ack := c.execute(context.Background(), remove); !ack.OK {
+					t.Fatal(ack)
+				}
+				if len(states) != 3 {
+					t.Fatal("removal ACK preceded actual state publication")
+				}
+				state := states[2]
+				if len(state.Tunnels) != 1 || state.Tunnels[0].ID != sibling.Config.ID ||
+					len(state.UsedPorts) != 1 || state.UsedPorts[0] != sibling.Config.ListenPort() ||
+					len(em.Snapshot()) != 0 {
+					t.Fatal("removal report retained sockets/pool or erased an unrelated runtime")
+				}
+				// Rebind both OS lanes immediately, without a periodic report or sleep.
+				tcp, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tcp.Close()
+				udp, err := net.ListenPacket("udp", tcp.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer udp.Close()
+				c.cfg.ReportLinkState = func(context.Context) error { return errors.New("offline fixture") }
+				remove.Envelope.ResourceID, remove.Envelope.Revision = sibling.Config.ID, 1
+				if ack := c.execute(context.Background(), remove); !ack.OK {
+					t.Fatal("telemetry failure changed confirmed removal outcome")
+				}
+			})
+		}
+	}
+}
+
 func bothCommandPort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

@@ -314,17 +314,43 @@ func TestLeaseExpiryRenewalAndExpiredRestore(t *testing.T) {
 	dir := t.TempDir()
 	m := newTestManager(t, helperBinary(t), dir)
 	cfg := exitConfig(t, "leased", "tcp", freePort(t, "tcp"), 1)
-	cfg.LeaseExpiresAt = time.Now().Add(500 * time.Millisecond).Format(time.RFC3339Nano)
+	// Leave enough budget for the real subprocess startup timeout, not just
+	// its usual unloaded latency. Renewal must survive the ORIGINAL deadline.
+	originalDeadline := time.Now().Add(startupTimeout + time.Second)
+	cfg.LeaseExpiresAt = originalDeadline.Format(time.RFC3339Nano)
 	o, err := m.Apply(cfg)
 	requireReady(t, o, err)
 	pid := o.PID
-	cfg.LeaseExpiresAt = time.Now().Add(time.Second).Format(time.RFC3339Nano)
+	renewedDeadline := originalDeadline.Add(2 * time.Second)
+	cfg.LeaseExpiresAt = renewedDeadline.Format(time.RFC3339Nano)
 	o, err = m.Apply(cfg)
 	requireReady(t, o, err)
 	if o.PID != pid {
 		t.Fatal("same-generation renewal restarted child")
 	}
-	waitFor(t, func() bool { s := m.Status()[0]; return !s.Ready && s.State == "expired" })
+	m.mu.Lock()
+	leasedChild := m.running[cfg.ID]
+	m.mu.Unlock()
+	originalTimer := time.NewTimer(time.Until(originalDeadline.Add(100 * time.Millisecond)))
+	defer originalTimer.Stop()
+	select {
+	case <-leasedChild.done:
+		t.Fatal("renewal did not extend the original lease")
+	case <-originalTimer.C:
+	}
+	if !m.Status()[0].Ready {
+		t.Fatal("renewed child did not remain ready after the original deadline")
+	}
+	expiryTimer := time.NewTimer(time.Until(renewedDeadline) + 2*stopTimeout)
+	defer expiryTimer.Stop()
+	select {
+	case <-leasedChild.done:
+	case <-expiryTimer.C:
+		t.Fatal("renewed lease did not stop its child")
+	}
+	if s := m.Status()[0]; s.Ready || s.State != "expired" {
+		t.Fatalf("expired lease observation: %+v", s)
+	}
 	waitFor(t, func() bool {
 		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.Ports[0].Port))
 		if err != nil {
@@ -350,22 +376,57 @@ func TestLeaseExpiryRenewalAndExpiredRestore(t *testing.T) {
 func TestLeaseWatchNotBlockedByOtherPlacementStartup(t *testing.T) {
 	m := newTestManager(t, helperBinary(t), t.TempDir())
 	a := exitConfig(t, "lease", "tcp", freePort(t, "tcp"), 1)
-	a.LeaseExpiresAt = time.Now().Add(400 * time.Millisecond).Format(time.RFC3339Nano)
 	o, err := m.Apply(a)
 	requireReady(t, o, err)
+	m.mu.Lock()
+	leasedChild := m.running[a.ID]
+	m.mu.Unlock()
 	b := testMode(t, exitConfig(t, "slow", "tcp", freePort(t, "tcp"), 1), "nomarkers")
-	b.LeaseExpiresAt = time.Now().Add(1200 * time.Millisecond).Format(time.RFC3339Nano)
 	finished := make(chan error, 1)
 	go func() { _, err := m.Apply(b); finished <- err }()
-	time.Sleep(650 * time.Millisecond)
+	// A bound socket without a readiness marker proves the other Apply is in
+	// startup holding m.mu. Do not spend a short lease on subprocess launch:
+	// loaded CI hosts can take longer to launch than the former 400ms budget.
+	waitFor(t, func() bool {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", b.Ports[0].Port), 50*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	})
+	select {
+	case err := <-finished:
+		t.Fatalf("slow startup completed before lease watch was tested: %v", err)
+	default:
+	}
+	// Arm the real child watcher only after both subprocesses have started.
+	// This private timer seam does not weaken public lease-regression checks.
+	if !leasedChild.renew(time.Now().Add(200 * time.Millisecond)) {
+		t.Fatal("ready child could not arm its lease watcher")
+	}
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-leasedChild.done:
+	case err := <-finished:
+		t.Fatalf("another startup completed before the leased child stopped: %v", err)
+	case <-timer.C:
+		t.Fatal("another startup blocked the lease watcher")
+	}
 	// Checking the socket bypasses the manager mutex held by slow startup.
 	ln, bindErr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", a.Ports[0].Port))
 	if bindErr != nil {
 		t.Fatal("another startup extended the old lease", bindErr)
 	}
 	ln.Close()
-	if err := <-finished; !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("slow process should expire before ready: %v", err)
+	select {
+	case err := <-finished:
+		t.Fatalf("slow startup did not overlap lease expiry: %v", err)
+	default:
+	}
+	if err := <-finished; !errors.Is(err, ErrReadyTimeout) {
+		t.Fatalf("missing readiness marker should time out: %v", err)
 	}
 }
 

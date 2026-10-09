@@ -87,6 +87,10 @@ F4 更新回归另覆盖显式未知协议汇总的 both→TCP/UDP 拒绝、目�
 
 `52eeab2` 的 Linux 门禁为 F4 **30 PASS / 2 FAIL**，证实恢复已修好，但 RELAY 目标更新只有 TCP 到新目标、UDP 无回复，half-bind 的首次 retry 被拒。原生 apply 现在复用 Link 的串行完整报告发布机制，在 ACK 前发送实际 hop/socket 事实，避免下一次更新回退到另一张网的 `connect_ip`；报告失败仍不伪造 runtime 失败。另以 Agent 的 `incoming <= removedRevision` 规则验证 DIRECT/RELAY 清理失败世代，不再提前封住下一次正常 retry。完整门禁仍须看更新候选，不能把旧 SHA 的局部通过推广为全部通过。
 
+`4ea426c` 的 [CI 37868714916](https://github.com/PaiMonCai/TuneX/actions/runs/37868714916) 为共享 gate **73 PASS / 0 FAIL**、F4 **34 PASS / 1 FAIL**：RELAY 两协议目标更新与 half-bind 正常 retry 已通过，删除后立即复用原端口仍被旧占用报告阻断。修复候选让控制命令等待实际 Stop/守卫释放后发布串行完整报告，再确认删除/暂停；等待有 5 秒上界，不持管理器锁，取消/失败保留真实占用与墓碑，重复命令加入同一关闭或重试失败 Stop。真实双 socket 回归覆盖 DIRECT/RELAY/EGRESS × remove/suspend、旧修订拒绝、无关规则保持、报告故障与立即重绑；管理器屏障回归覆盖取消重发、Stop 失败、挂账过期仍不释放和重试。CI 增加针对这些路径的 race 检测，不冒充主分支的全量 race。
+
+同轮 Agent gate 还暴露 400ms 租约在子进程启动期间耗尽的测试时序问题。并发租约测试先确认两个实际子进程就绪/绑定，再启动真实 watcher 的短预算，检查另一个 Apply 仍在启动时 socket 已释放；公开续租/过期缓存恢复回归使用完整启动预算和真实截止时点，检查跨越原截止仍 Ready、续租截止后停止。没有跳过租约保护或改生产时钟。当前修复仍须以新 SHA 的完整 required 为准。
+
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 
 F2 同一 gate 新增真实目标 3044/3045：完整策略 API 往返、辅助 TCP 健康、主目标实际关闭、10 秒失败/恢复窗口、全故障、恢复后的新 TCP 与保持备用 UDP 映射、RR、random、固定 UDP 来源及 Agent 重启。每次等待继续使用 B 的原 TCP 和 UDP socket；不改数据库健康状态或伪造 Ready。窗口抖动、未知 UDP、nonce/replay 和未授权目标另由真实 runner 回归覆盖。Windows 本地不能代替该 Linux 门禁。

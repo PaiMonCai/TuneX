@@ -224,6 +224,8 @@ jobs:
         run: |
           go -C ../third_party/forwardx/forwardx-fxp build -trimpath -o /tmp/tunex-fxp .
           TUNEX_TEST_FXP_BINARY=/tmp/tunex-fxp go test ./...
+      - name: Race detector for acknowledged native removal
+        run: go test -race ./internal/manager ./internal/control -run 'Removal|StoppingScope|PublishesActualHop'
       # Race instrumentation is intentionally off the PR hot path; normal tests
       # still cover these packages on PRs, while main validates the heavier race run.
       - name: Race detector for concurrent runtime owners

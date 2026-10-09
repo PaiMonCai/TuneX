@@ -575,7 +575,11 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		rev := cmd.Envelope.Revision
 		ack.AppliedRevision = &rev
 	case ActionRemoveTunnel, ActionSuspendTunnel:
-		if err := c.tunnels.RemoveAtRevision(cmd.Envelope.ResourceID, cmd.Envelope.Revision); err != nil {
+		// Native teardown is asynchronous for local callers. A control ACK must
+		// wait for actual Stop before the panel releases its durable leases.
+		stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := c.tunnels.RemoveAtRevisionAndWait(stopCtx, cmd.Envelope.ResourceID, cmd.Envelope.Revision); err != nil {
 			ack.ErrorCode, ack.Error = "remove_failed", err.Error()
 			return ack
 		}
@@ -588,6 +592,7 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 		ack.OK = true
 		rev := cmd.Envelope.Revision
 		ack.AppliedRevision = &rev
+		c.reportLinkState(ctx)
 	default:
 		ack.ErrorCode = "unsupported_action"
 		ack.Error = "unsupported action: " + cmd.Envelope.Action

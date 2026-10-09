@@ -14,6 +14,7 @@
 package manager
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -57,6 +58,15 @@ type entry struct {
 	fwd forwarder.Runtime
 }
 
+// removal keeps a completion fact separate from the desired registry. A
+// cancelled command must not lose a still-stopping socket; a replay waits for
+// the same Stop rather than acknowledging an absent registry entry as stopped.
+type removal struct {
+	entry *entry
+	done  chan struct{}
+	err   error // Written before done closes.
+}
+
 // TunnelManager is the concurrency-safe registry of running tunnels.
 type TunnelManager struct {
 	mu      sync.RWMutex
@@ -66,6 +76,7 @@ type TunnelManager struct {
 	// must not be able to resurrect that runtime merely because the live entry
 	// is no longer present in the registry.
 	removedRevision map[string]int64
+	removals        map[string][]*removal
 	usedPort        map[string]bool // "<socket namespace>:<port>@<bind scope>" derived guard
 
 	// stoppingPorts 记录"Stop 已经发起、但监听还没真正关闭"的端口 —— 带**截止时间**的挂账。
@@ -259,6 +270,7 @@ func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 	return &TunnelManager{
 		tunnels:         make(map[string]*entry),
 		removedRevision: make(map[string]int64),
+		removals:        make(map[string][]*removal),
 		usedPort:        make(map[string]bool),
 		stoppingPorts:   make(map[string]stoppingNote),
 		externalPorts:   make(map[string][]portlease.Binding),
@@ -314,6 +326,13 @@ func (m *TunnelManager) bindingConflictLocked(wanted portlease.Binding, replaced
 	for key := range m.stoppingPorts {
 		if stopping, ok := portlease.ParseKey(key); ok && wanted.Conflicts(stopping) {
 			return true
+		}
+	}
+	for _, pending := range m.removals {
+		for _, stop := range pending {
+			if wanted.Conflicts(portBinding(stop.entry.cfg)) {
+				return true
+			}
 		}
 	}
 	for owner, bindings := range m.externalPorts {
@@ -742,6 +761,15 @@ func (m *TunnelManager) rebuildPortGuardLocked() {
 		}
 		next[key] = true
 	}
+	// Failed/cancelled removals remain owners until Stop confirms completion.
+	// Their reservations must not disappear just because a grace note aged out.
+	for _, pending := range m.removals {
+		for _, stop := range pending {
+			for _, binding := range portBindings(stop.entry.cfg) {
+				next[binding.Key()] = true
+			}
+		}
+	}
 	m.usedPort = next
 }
 
@@ -821,6 +849,31 @@ func (m *TunnelManager) RemoveAtRevision(id string, revision int64) error {
 	return err
 }
 
+// RemoveAtRevisionAndWait is the acknowledged control-plane deletion. Registry
+// removal/fencing happens immediately, but success requires actual Stop and
+// guard release. Waiting never holds m.mu and is bounded by the caller's context.
+func (m *TunnelManager) RemoveAtRevisionAndWait(ctx context.Context, id string, revision int64) error {
+	before := m.fingerprint()
+	removed, pending, err := m.removeInnerIfWithCompletion(id, nil, revision)
+	if err != nil {
+		return err
+	}
+	if removed {
+		m.notifyIfChanged(before)
+	}
+	for _, stop := range pending {
+		select {
+		case <-stop.done:
+			if stop.err != nil {
+				return stop.err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 // RemoveIf removes a tunnel only while cond still holds for its live config.
 //
 // Lease-clock removals are intentionally unversioned: they are local safety
@@ -846,25 +899,49 @@ func (m *TunnelManager) removeInnerIf(
 	cond func(forwarder.TunnelConfig) bool,
 	revision int64,
 ) (bool, error) {
+	removed, _, err := m.removeInnerIfWithCompletion(id, cond, revision)
+	return removed, err
+}
+
+func (m *TunnelManager) removeInnerIfWithCompletion(
+	id string,
+	cond func(forwarder.TunnelConfig) bool,
+	revision int64,
+) (bool, []*removal, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending := append([]*removal(nil), m.removals[id]...)
+	for _, stop := range pending {
+		if isStale(revision, stop.entry.cfg.Revision) {
+			return false, nil, ErrStaleRevision
+		}
+	}
 	e, ok := m.tunnels[id]
 	if !ok {
 		if revision != revisionUnknown && revision > m.removedRevision[id] {
 			m.removedRevision[id] = revision
 		}
-		m.mu.Unlock()
-		return false, nil
+		// Retry a previously failed Stop; an in-flight Stop is only joined.
+		for i, stop := range pending {
+			select {
+			case <-stop.done:
+				if stop.err != nil {
+					m.forgetRemovalLocked(id, stop)
+					pending[i] = m.startRemovalLocked(stop.entry)
+				}
+			default:
+			}
+		}
+		return false, pending, nil
 	}
 	if cond != nil && !cond(e.cfg) {
 		// The tunnel changed under us (renewed or replaced): leave it alone.
-		m.mu.Unlock()
-		return false, nil
+		return false, nil, nil
 	}
 	if revision != revisionUnknown &&
 		e.cfg.Revision != revisionUnknown &&
 		revision < e.cfg.Revision {
-		m.mu.Unlock()
-		return false, ErrStaleRevision
+		return false, nil, ErrStaleRevision
 	}
 	delete(m.tunnels, id)
 	if revision != revisionUnknown && revision > m.removedRevision[id] {
@@ -874,10 +951,47 @@ func (m *TunnelManager) removeInnerIf(
 	// deletion and the revision tombstone still take effect immediately.
 	m.noteStoppingLocked(e.cfg)
 	m.rebuildPortGuardLocked()
-	m.mu.Unlock()
+	pending = append(pending, m.startRemovalLocked(e))
+	return true, pending, nil
+}
 
-	m.stopEntryAsync(e, m.releasePortAfterStop(e.cfg))
-	return true, nil
+// Caller holds m.mu; the Stop and all completion waits run outside it.
+func (m *TunnelManager) startRemovalLocked(e *entry) *removal {
+	stop := &removal{entry: e, done: make(chan struct{})}
+	m.removals[e.cfg.ID] = append(m.removals[e.cfg.ID], stop)
+	go func() {
+		err := e.fwd.Stop()
+		m.mu.Lock()
+		stop.err = err
+		if err == nil {
+			m.clearStoppingLocked(e.cfg)
+			m.forgetRemovalLocked(e.cfg.ID, stop)
+		}
+		m.rebuildPortGuardLocked()
+		close(stop.done)
+		m.mu.Unlock()
+		if err != nil {
+			logx.Warn("tunnel stop failed", "id", e.cfg.ID, "err", err.Error())
+		} else {
+			logx.Info("tunnel removed", "id", e.cfg.ID, "mode", string(e.cfg.Mode), "port", e.cfg.ListenPort())
+		}
+	}()
+	return stop
+}
+
+func (m *TunnelManager) forgetRemovalLocked(id string, stop *removal) {
+	pending := m.removals[id]
+	for i, candidate := range pending {
+		if candidate == stop {
+			pending = append(pending[:i], pending[i+1:]...)
+			break
+		}
+	}
+	if len(pending) == 0 {
+		delete(m.removals, id)
+	} else {
+		m.removals[id] = pending
+	}
 }
 
 // Get returns the live cfg for a tunnel.
