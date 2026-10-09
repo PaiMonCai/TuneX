@@ -18,10 +18,14 @@
  * `components/forwards/forward-protocol-badge.tsx`。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ForwardPolicyFields } from "./forward-policy-fields";
+import { FORWARD_POLICY_FIELDS, forwardPolicyDraft, forwardPolicyDraftErrors, forwardPolicyDraftPatch } from "@/lib/forward-policy";
 import { AlertTriangle, Copy, Info, Link2, Loader2, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
+import { forwardProductStatus } from "@/lib/forward-status";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
+import { nativeBothBlock, nativeBothBlockText, nativeBothTransitionAllowed, type ForwardCapabilities } from "@/lib/forward-native-both";
 import { useI18n } from "@/components/providers";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/card";
@@ -36,12 +40,14 @@ import {
   FORWARD_TLS_PATH_MAX,
   TLS_FORWARD_PROTOCOL,
   forwardProtocolFact,
+  forwardProtocolLabel,
   forwardProtocolNote,
   forwardProtocolPatchFields,
   forwardTransportFor,
   isForwardProtocol,
   tlsPathFieldErrors,
   type TlsPathFieldErrors,
+  type ForwardProtocolFact,
 } from "@/lib/forward-protocol";
 import {
   Dialog,
@@ -61,6 +67,7 @@ import type { ForwardPatchInput, NodeBinding, PortForward, UserNode } from "@/li
  * 任何字段从这里消失，`forward-edit-dialog.test.ts` 的字段集断言会失败。
  */
 export const FORWARD_EDIT_FIELDS = [
+  ...FORWARD_POLICY_FIELDS,
   "name",
   "mode",
   "ingress_node_id",
@@ -68,6 +75,7 @@ export const FORWARD_EDIT_FIELDS = [
   "listen_port",
   "target_host",
   "target_port",
+  "protocol",
 ] as const;
 
 export type ForwardEditField = (typeof FORWARD_EDIT_FIELDS)[number];
@@ -79,12 +87,12 @@ export type ForwardEditField = (typeof FORWARD_EDIT_FIELDS)[number];
  *
  * V5-WP5-A1：草稿额外带 tls 的证书/私钥路径 —— 这两列现在**可编辑**
  * （后端 patch schema 已接受，规则与创建相同：只有 tls 能带、必须成对）。
- * 协议本身仍在 `forward` 上（只读），所以草稿里没有 `protocol`：草稿里放一个永远
- * 不会被保存的字段，就是让人以为能改的地方。
+ * 草稿携带协议事实；只允许普通 tcp / udp / 原生 both 之间的增量切换。
  */
-type Draft = ForwardDraft & { tlsCertPath: string; tlsKeyPath: string };
+type Draft = ForwardDraft & { protocol?: ForwardProtocolFact; tlsCertPath: string; tlsKeyPath: string };
 
 const EMPTY_DRAFT: Draft = {
+  ...forwardPolicyDraft(),
   name: "",
   mode: "direct",
   ingressId: "",
@@ -98,7 +106,9 @@ const EMPTY_DRAFT: Draft = {
 
 function draftFrom(forward: PortForward): Draft {
   return {
+    ...forwardPolicyDraft(forward),
     name: forward.name ?? "",
+    protocol: forward.protocol,
     mode: forward.mode === "relay" ? "relay" : "direct",
     ingressId: forward.ingress_node_id ? String(forward.ingress_node_id) : "",
     egressId: forward.egress_node_id ? String(forward.egress_node_id) : "",
@@ -120,7 +130,10 @@ function draftFrom(forward: PortForward): Draft {
  * 「清空路径」是表单预检的失败，不是一次可提交的编辑）。
  */
 export function draftToPatch(forward: PortForward, draft: Draft): ForwardPatchInput {
-  const patch: ForwardPatchInput = {};
+  const patch: ForwardPatchInput = Object.keys(forwardPolicyDraftErrors(draft)).length ? {} : forwardPolicyDraftPatch(forward, draft);
+  if (draft.protocol !== undefined && draft.protocol !== forward.protocol && nativeBothTransitionAllowed(forward.protocol, draft.protocol)) {
+    patch.protocol = draft.protocol;
+  }
   if (draft.name.trim() !== (forward.name ?? "")) patch.name = draft.name.trim();
   if (draft.mode !== (forward.mode === "relay" ? "relay" : "direct")) {
     patch.mode = draft.mode;
@@ -146,7 +159,7 @@ export function draftToPatch(forward: PortForward, draft: Draft): ForwardPatchIn
   Object.assign(
     patch,
     forwardProtocolPatchFields(
-      forward.protocol,
+      draft.protocol ?? forward.protocol,
       { cert: forward.tls_cert_path, key: forward.tls_key_path },
       { cert: draft.tlsCertPath ?? "", key: draft.tlsKeyPath ?? "" },
     ),
@@ -160,6 +173,7 @@ export function draftFormErrors(
   t: (key: string) => string,
 ): Partial<Record<ForwardEditField, string>> {
   const errors: Partial<Record<ForwardEditField, string>> = {};
+  Object.assign(errors, forwardPolicyDraftErrors(draft));
   if (!draft.name.trim()) errors.name = t("forward.saveFailed");
   if (!draft.ingressId) errors.ingress_node_id = t("forward.chooseIngress");
   const listen = draft.listenPort.trim();
@@ -212,6 +226,7 @@ export function ForwardEditDialog({
   bindings,
   onSaved,
   onReload,
+  capabilities = null,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -222,6 +237,7 @@ export function ForwardEditDialog({
   bindings: Record<string, NodeBinding[]>;
   onSaved: (updated: PortForward) => void;
   onReload: () => void;
+  capabilities?: ForwardCapabilities | null;
 }) {
   const { t, locale } = useI18n();
   const { currentId, permissions, canForward } = useWorkspace();
@@ -235,17 +251,14 @@ export function ForwardEditDialog({
   const expectedRevision = forward.config_revision ?? forward.latest_revision ?? 0;
 
   /**
-   * V5-WP5-A1：协议只读提示。
-   *
-   * 后端 `ForwardPatchSchema` 只接受 `tls_cert_path` / `tls_key_path`（tls 行的证书
-   * 路径可改），**不接受** `protocol`：把 tcp 改成 tls 不是一次编辑（端口租约、目标
-   * 语义、RELAY 形态都会变），§6.1 没有冻结那套语义，所以 schema 用「不接受这个键」
-   * 而不是猜一个行为。这里只读展示事实 + 一句「为什么改不了」，而不是摆一个点了
-   * 注定失败的下拉框。
+   * Plain protocol transitions are preview-validated; TLS / WS / legacy keep
+   * their read-only explanation. The persisted badge is never rewritten by a draft.
    */
-  const protocolFact = isForwardProtocol(forward.protocol) ? forward.protocol : null;
+  const selectedProtocol = draft.protocol ?? forward.protocol;
+  const plainProtocol = ["tcp", "udp", "both"].includes(forward.protocol);
+  const protocolFact = isForwardProtocol(selectedProtocol) ? selectedProtocol : null;
   const protocolHint = protocolFact
-    ? `${t("forward.protocolFixedHint")} ${forwardProtocolNote(locale, protocolFact)}`
+    ? `${plainProtocol ? (locale === "en" ? "Desired protocol; preview validates the transition. " : "期望协议；切换由预览校验。") : t("forward.protocolFixedHint")} ${forwardProtocolNote(locale, protocolFact)}`
     : t("forward.protocolFixedHint");
 
   /** 该行是不是 tls：决定渲染哪些协议专属字段（路径只属于 tls）。 */
@@ -256,6 +269,7 @@ export function ForwardEditDialog({
    * 措辞：那种行根本不会被下发（preview 会先拒绝），措辞不可能被用户看到。
    */
   const datagram = forwardTransportFor(forward.protocol) === "datagram";
+  const mixed = forwardTransportFor(forward.protocol) === "mixed" || forwardTransportFor(selectedProtocol) === "mixed";
   // 打开时重置草稿；forward 变化（刷新后）也重置，避免拿旧草稿覆盖别人保存。
   useEffect(() => {
     if (open) {
@@ -275,6 +289,12 @@ export function ForwardEditDialog({
   const tlsErrors = useMemo(() => draftTlsPathErrors(forward, draft), [forward, draft]);
   const hasTlsError = Object.keys(tlsErrors).length > 0;
   const empty = patchKeys.length === 0;
+  const pathChanged = patch.mode !== undefined || patch.ingress_node_id !== undefined || patch.egress_node_id !== undefined;
+  const bothBlock = nativeBothBlock({ capabilities, mode: draft.mode,
+    ingress: nodes.find((node) => String(node.id) === draft.ingressId),
+    egress: nodes.find((node) => String(node.id) === draft.egressId),
+    existingBoth: forward.protocol === "both", pathChanged });
+  const hasBothError = selectedProtocol === "both" && bothBlock !== null;
 
   useEffect(() => {
     if (!open || !allowed) return;
@@ -282,7 +302,7 @@ export function ForwardEditDialog({
       setPreview({ kind: "idle" });
       return;
     }
-    if (hasFormError || hasTlsError) {
+    if (hasFormError || hasTlsError || hasBothError) {
       setPreview({ kind: "idle" });
       return;
     }
@@ -320,7 +340,7 @@ export function ForwardEditDialog({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [open, empty, hasFormError, hasTlsError, forward.id, patch, t, allowed, currentId, permissions]);
+  }, [open, empty, hasFormError, hasTlsError, hasBothError, forward.id, patch, t, allowed, currentId, permissions]);
 
   const ingressNodes = useMemo(
     () => nodes.filter((node) => node.role === "ingress" || node.role === "both"),
@@ -357,6 +377,7 @@ export function ForwardEditDialog({
     // tls 行缺路径（或路径不合法）时不允许保存：后端候选校验要求成对，发过去只会
     // 换一个 400（而且 patch 侧目前会静默丢弃，见任务回报的契约缺口）。
     hasTlsError ||
+    hasBothError ||
     preview.kind !== "ready" ||
     conflict !== null;
 
@@ -428,10 +449,10 @@ export function ForwardEditDialog({
     const lines: string[] = [];
     if (impact.changes_external_address) lines.push(t("forward.impactExternalAddress"));
     if (impact.listener_replacement) {
-      lines.push(datagram ? t("forward.impactListenerDatagram") : t("forward.impactListener"));
+      lines.push(mixed ? mixedReplaceNote(locale) : datagram ? t("forward.impactListenerDatagram") : t("forward.impactListener"));
     }
-    if (impact.target_change && !impact.mode_change) {
-      lines.push(datagram ? t("forward.impactTargetDatagram") : t("forward.impactTarget"));
+    if (impact.target_change && !impact.mode_change && (!mixed || !impact.listener_replacement)) {
+      lines.push(mixed ? mixedReplaceNote(locale) : datagram ? t("forward.impactTargetDatagram") : t("forward.impactTarget"));
     }
     if (impact.ingress_node_change) lines.push(t("forward.impactIngress"));
     if (impact.egress_node_change) lines.push(t("forward.impactEgress"));
@@ -448,7 +469,7 @@ export function ForwardEditDialog({
       );
     }
     return lines;
-  }, [preview, t, datagram, patch]);
+  }, [preview, t, datagram, mixed, locale, patch]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -490,12 +511,18 @@ export function ForwardEditDialog({
             </Field>
 
             <Field label={t("forward.protocol")} hint={protocolHint}>
+              {plainProtocol ? <Select value={selectedProtocol} onValueChange={(protocol) => setDraft((d) => ({ ...d, protocol }))}>
+                <SelectTrigger data-testid="forward-edit-protocol-select"><SelectValue /></SelectTrigger>
+                <SelectContent>{["tcp", "udp", "both"].map((protocol) => <SelectItem key={protocol} value={protocol}
+                  disabled={protocol === "both" && bothBlock !== null && forward.protocol !== "both"}>{forwardProtocolLabel(protocol)}</SelectItem>)}</SelectContent>
+              </Select> : null}
               <div
                 className="flex h-9 items-center rounded-md border border-[var(--border)] bg-[var(--muted)]/40 px-3"
                 data-testid="forward-edit-protocol"
               >
                 <ForwardProtocolBadge forward={forward} />
               </div>
+              {hasBothError ? <p role="alert" data-testid="forward-native-both-gate">{nativeBothBlockText(locale, bothBlock!)}</p> : null}
             </Field>
 
             <Field label={t("forward.mode")}>
@@ -595,6 +622,7 @@ export function ForwardEditDialog({
               规则与创建完全相同：只有 tls 能带、必须成对）。
               只在 tls 行出现：tcp/ws 携带路径是 400，udp 更没有 TLS 前端可言。
             */}
+            <ForwardPolicyFields draft={draft} onChange={(patch) => setDraft((d) => ({ ...d, ...patch }))} locale={locale} />
             {isTlsForward ? (
               <>
                 <Field
@@ -758,6 +786,12 @@ export function ForwardEditDialog({
   );
 }
 
+export function mixedReplaceNote(locale: string): string {
+  return locale === "en"
+    ? "A native both runtime edit (including a target change) fully replaces both TCP and UDP legs in the first release; there is no atomic partial retarget. Existing TCP streams and UDP mappings are interrupted. Desired state is not runtime proof; neither an unknown nor a failed leg can be Ready."
+    : "首版原生 both 的运行配置变更（包括改目标）会完整替换 TCP 与 UDP 两侧，不支持原子部分改目标。存量 TCP 流与 UDP 映射会中断。期望状态不是运行证明；任一侧未知或失败都不能视为就绪。";
+}
+
 /** 地址复制（result UX：保存后的访问地址必须能一键复制）。 */
 export function CopyAddress({ value }: { value: string | null }) {
   const { t } = useI18n();
@@ -793,18 +827,7 @@ export function forwardRunningState(forward: PortForward): {
   applied: number | null;
   desired: number | null;
 } {
-  const desired = forward.config_revision ?? forward.latest_revision ?? null;
-  const applied = forward.applied_revision ?? null;
-  const status = forward.apply_status ?? null;
-  if (status === "suspended") return { state: "suspended", applied, desired };
-  if (status === "error") return { state: "error", applied, desired };
-  if (desired !== null && applied !== null && applied < desired) {
-    return { state: "pending", applied, desired };
-  }
-  if (status === "pending" || status === "applying") {
-    return { state: "pending", applied, desired };
-  }
-  return { state: "synced", applied, desired };
+  return forwardProductStatus(forward);
 }
 
 /** running-vs-desired 的状态语义（§13.4：产品状态，不堆 revision 数字）。 */

@@ -1,0 +1,254 @@
+/**
+ * Optional real MySQL lock/rollback test. Never uses ambient DATABASE_URL.
+ * Requires an already migrated, dedicated loopback scratch database whose name
+ * ends in _link_traffic_test, TUNEX_DB_TEST=1, and
+ * TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL. No migrations are applied by this test.
+ */
+import { after, test } from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes, randomInt } from "node:crypto";
+
+const enabled = process.env.TUNEX_DB_TEST === "1" && !!process.env.TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL;
+if (!enabled) {
+  test("Link traffic MySQL concurrency/rollback (dedicated scratch DB required)", { skip: true }, () => {});
+} else {
+  const url = new URL(process.env.TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL);
+  if (url.protocol !== "mysql:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+    || !/^\/[A-Za-z0-9_]+_link_traffic_test$/.test(url.pathname)) {
+    throw new Error("Link traffic DB tests require a dedicated loopback *_link_traffic_test database");
+  }
+  const { Prisma, PrismaClient } = await import("@prisma/client");
+  const { createPrismaLinkTrafficStore, submitLinkTraffic } = await import("../src/services/link-traffic.ts");
+  const client = new PrismaClient({ datasources: { db: { url: url.href } }, log: [] });
+  const realStore = createPrismaLinkTrafficStore(client);
+  // Report only closed error classifications, never ORM messages, SQL input
+  // or credentials. A generic 503 alone cannot diagnose a real locking race.
+  const storageErrors = [];
+  const store = { async transaction(work) {
+    try { return await realStore.transaction(work); }
+    catch (error) {
+      const knownNames = ["PrismaClientKnownRequestError", "PrismaClientUnknownRequestError",
+        "PrismaClientValidationError", "PrismaClientInitializationError", "TypeError", "Error"];
+      storageErrors.push({ type: knownNames.includes(error?.name) ? error.name : "Error",
+        orm_code: /^P[0-9]{4}$/.test(error?.code ?? "") ? error.code : null,
+        sql_code: /^[0-9]{1,5}$/.test(String(error?.meta?.code ?? "")) ? String(error.meta.code) : null });
+      throw error;
+    }
+  } };
+  const workspaceId = randomInt(1_000_000_000, 1_100_000_000);
+  const nodeId = randomInt(1_100_000_000, 1_200_000_000);
+  const forwardIds = [randomInt(1_200_000_000, 1_300_000_000), randomInt(1_300_000_000, 1_400_000_000)];
+  const producerIds = [randomBytes(16).toString("hex"), randomBytes(16).toString("hex")];
+  const date = new Date("2037-11-01T00:00:00Z");
+  let linkId;
+  after(async () => {
+    try {
+      await client.linkTrafficCheckpoint.deleteMany({ where: { node_id: nodeId, workspace_id: workspaceId } });
+      await client.tunnelTraffic.deleteMany({ where: { workspace_id: { in: [workspaceId, workspaceId + 1] },
+        tunnel_id: { in: forwardIds } } });
+      if (linkId) {
+        await client.linkPlacement.deleteMany({ where: { deployment: { link_id: linkId } } });
+        await client.linkDeployment.deleteMany({ where: { link_id: linkId } });
+        await client.linkResource.delete({ where: { id: linkId } });
+      }
+    } finally { await client.$disconnect(); }
+  });
+
+  test("real native upsert/row locks dedupe concurrent reversed batches and roll back conflicting facts", async (t) => {
+    const link = await client.linkResource.create({ data: {
+      workspace_id: workspaceId, name: `traffic-test-${randomBytes(12).toString("hex")}`,
+      created_by: 1, generation: 99, status: "retired",
+    } });
+    linkId = link.id;
+    // No live Forward or Node is created. Historical ownership is sufficient,
+    // including an expired/retired generation while the Link has moved on.
+    await client.linkDeployment.create({ data: {
+      link_id: linkId, generation: 2, version: 1, status: "retired", lease_expires_at: new Date("2020-01-01"),
+      binding_snapshot: { spec: { link_id: linkId, workspace_id: workspaceId, generation: 2,
+        ingress: { id: nodeId, workspace_id: workspaceId }, bindings: forwardIds.map((forward_id) => ({ forward_id })) } },
+      placements: { create: [{ node_id: nodeId, role: "ingress", generation: 2,
+        runtime_id: `traffic-test-${nodeId}`, config_digest: "ab".repeat(32) }] },
+    } });
+    const sample = (n, forward_id = forwardIds[0], producer_id = producerIds[0]) => ({
+      node_id: nodeId, producer_id, forward_id, link_id: linkId, workspace_id: workspaceId,
+      generation: 2, config_digest: "ab".repeat(32), date: "2037-11-01",
+      bytes_in: String(n * 10), bytes_out: String(n * 20), connections: String(n),
+    });
+    const send = (samples) => submitLinkTraffic(nodeId, { samples }, { store });
+    const requests = [9, 2, 8, 1, 9, 5, 3, 4, 7, 6].map((n) => {
+      const batch = forwardIds.flatMap((forward) => producerIds.map((producer) => sample(n, forward, producer)));
+      return send(n % 2 ? batch.reverse() : batch);
+    });
+    const results = await Promise.all(requests);
+    assert.ok(results.every((result) => result.ok), "concurrent transactions should all commit: "
+      + JSON.stringify({ accepted: results.filter((result) => result.ok).length,
+        rejected: results.filter((result) => !result.ok).map((result) => ({ status: result.status, reason: result.reason })),
+        storage_errors: storageErrors }));
+    const rows = await client.linkTrafficCheckpoint.findMany({ where: { node_id: nodeId } });
+    assert.equal(rows.length, 4);
+    for (const row of rows) assert.deepEqual([row.bytes_in, row.bytes_out, row.connections], [90n, 180n, 9n]);
+    const facts = await client.tunnelTraffic.findMany({ where: { workspace_id: workspaceId } });
+    assert.equal(facts.length, 2);
+    for (const fact of facts) assert.deepEqual([fact.traffic, fact.traffic_cost], [540, 540]);
+
+    const old = sample(1);
+    assert.deepEqual(await send([old]), { ok: true, accepted: [old] });
+    const original = rows.find((row) => row.forward_id === old.forward_id && row.producer_id === old.producer_id);
+    const staleRow = await client.linkTrafficCheckpoint.findUnique({ where: { id: original.id } });
+    assert.equal(staleRow.updated_at.getTime(), original.updated_at.getTime());
+    assert.deepEqual(await send([sample(10), { ...sample(10), forward_id: 1 }]),
+      { ok: false, status: 403, reason: "link_traffic_not_owned" });
+
+    await client.tunnelTraffic.update({ where: { tunnel_id_date: { tunnel_id: forwardIds[1], date } },
+      data: { workspace_id: workspaceId + 1 } });
+    assert.deepEqual(await send([sample(10, forwardIds[0]), sample(10, forwardIds[1])]),
+      { ok: false, status: 409, reason: "link_traffic_identity_conflict" });
+    const unchanged = await client.linkTrafficCheckpoint.findMany({ where: { node_id: nodeId } });
+    for (const row of unchanged) assert.deepEqual([row.bytes_in, row.bytes_out, row.connections], [90n, 180n, 9n]);
+    const firstFact = await client.tunnelTraffic.findUnique({ where: { tunnel_id_date: { tunnel_id: forwardIds[0], date } } });
+    assert.equal(firstFact.traffic, 540, "the earlier daily increment rolled back with the later conflict");
+    // Restore fixture attribution so cleanup only removes this test's rows.
+    await client.tunnelTraffic.update({ where: { tunnel_id_date: { tunnel_id: forwardIds[1], date } },
+      data: { workspace_id: workspaceId } });
+    const restarted = sample(1, forwardIds[0], randomBytes(16).toString("hex"));
+    assert.equal((await send([restarted, restarted])).ok, true);
+    const afterRestart = await client.tunnelTraffic.findUnique({ where: { tunnel_id_date: { tunnel_id: forwardIds[0], date } } });
+    assert.equal(afterRestart.traffic, 570);
+
+    // Exercise creation contention repeatedly, not only the already-existing
+    // checkpoint path. A one-off green batch can conceal an InnoDB deadlock.
+    const rounds = 20;
+    for (let round = 0; round < rounds; round++) {
+      const freshProducers = [randomBytes(16).toString("hex"), randomBytes(16).toString("hex")];
+      const errorStart = storageErrors.length;
+      const concurrent = await Promise.all([9, 2, 8, 1, 9, 5, 3, 4, 7, 6].map((n) => {
+        const batch = forwardIds.flatMap((forward) => freshProducers.map((producer) => sample(n, forward, producer)));
+        return send(n % 2 ? batch.reverse() : batch);
+      }));
+      assert.ok(concurrent.every((result) => result.ok), "fresh producer contention should commit: "
+        + JSON.stringify({ round, accepted: concurrent.filter((result) => result.ok).length,
+          rejected: concurrent.filter((result) => !result.ok).map((result) => ({ status: result.status, reason: result.reason })),
+          storage_errors: storageErrors.slice(errorStart) }));
+      const freshRows = await client.linkTrafficCheckpoint.findMany({ where: {
+        node_id: nodeId, producer_id: { in: freshProducers },
+      } });
+      assert.equal(freshRows.length, 4);
+      for (const row of freshRows) assert.deepEqual([row.bytes_in, row.bytes_out, row.connections], [90n, 180n, 9n]);
+      for (const [index, forward] of forwardIds.entries()) {
+        const daily = await client.tunnelTraffic.findUnique({ where: { tunnel_id_date: { tunnel_id: forward, date } } });
+        const expected = (index === 0 ? 570 : 540) + (round + 1) * 540;
+        assert.deepEqual([daily.traffic, daily.traffic_cost], [expected, expected], "each producer's delta counted exactly once");
+      }
+    }
+
+    // Deterministic stale-snapshot interleaving: authorization can establish a
+    // REPEATABLE READ snapshot before a concurrent reporter creates the rows.
+    // The current-row locks and native writes must still see that committed
+    // producer and daily fact. Retrying P2025 would hide the underlying bug.
+    const snapshotProducer = randomBytes(16).toString("hex");
+    const snapshotDate = new Date("2037-11-02T00:00:00Z");
+    const firstSnapshotSample = { ...sample(1, forwardIds[0], snapshotProducer), date: "2037-11-02" };
+    const nextSnapshotSample = { ...firstSnapshotSample, bytes_in: "20", bytes_out: "40", connections: "2" };
+    const snapshotResult = await client.$transaction(async (tx) => {
+      const unseen = () => tx.linkTrafficCheckpoint.findMany({ where: {
+        node_id: nodeId, producer_id: snapshotProducer, date: snapshotDate,
+      } });
+      assert.equal((await unseen()).length, 0);
+      assert.equal((await tx.tunnelTraffic.findMany({ where: { tunnel_id: forwardIds[0], date: snapshotDate } })).length, 0);
+      assert.equal((await send([firstSnapshotSample])).ok, true);
+      assert.equal((await unseen()).length, 0, "the consistent snapshot predates the committed producer");
+      const scopedStore = createPrismaLinkTrafficStore({ $transaction: (work) => work(tx) });
+      return submitLinkTraffic(nodeId, { samples: [nextSnapshotSample] }, { store: scopedStore });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 });
+    assert.deepEqual(snapshotResult, { ok: true, accepted: [nextSnapshotSample] });
+    const snapshotFact = await client.tunnelTraffic.findUnique({ where: {
+      tunnel_id_date: { tunnel_id: forwardIds[0], date: snapshotDate },
+    } });
+    assert.deepEqual([snapshotFact.traffic, snapshotFact.traffic_cost], [60, 60]);
+    const snapshotCheckpoint = await client.linkTrafficCheckpoint.findFirst({ where: {
+      node_id: nodeId, producer_id: snapshotProducer, date: snapshotDate,
+    } });
+    assert.deepEqual([snapshotCheckpoint.bytes_in, snapshotCheckpoint.bytes_out, snapshotCheckpoint.connections], [20n, 40n, 2n]);
+
+    // The latest retired deployment has no rule; earlier immutable bindings authorize its tail.
+    await client.linkDeployment.create({ data: {
+      link_id: linkId, generation: 99, version: 1, status: "retired", lease_expires_at: new Date("2020-01-01"),
+      binding_snapshot: { spec: { link_id: linkId, workspace_id: workspaceId, generation: 99,
+        ingress: { id: nodeId, workspace_id: workspaceId }, bindings: [] } },
+      placements: { create: [{ node_id: nodeId, role: "ingress", generation: 99,
+        runtime_id: `traffic-test-${nodeId}-99`, config_digest: "01".repeat(32) }] },
+    } });
+    for (const [label, newGeneration, day] of [
+      ["same FXP process rotates producers within one deployment", 2, "2037-11-03"],
+      ["removed rule retains generation/digest authorization for both epoch tails", 3, "2037-11-04"],
+    ]) {
+      await t.test(`F1 ${label}: lost ACK and replay after local reclamation count both finals once`, async () => {
+        const oldStart = { ...sample(10, forwardIds[0], randomBytes(16).toString("hex")), date: day };
+        const newStart = { ...sample(1, forwardIds[0], randomBytes(16).toString("hex")), date: day,
+          generation: newGeneration, config_digest: newGeneration === 2 ? "ab".repeat(32) : "ef".repeat(32),
+          bytes_in: "5", bytes_out: "10", connections: "1" };
+        assert.notEqual(oldStart.producer_id, newStart.producer_id);
+        if (newGeneration === 3) await client.linkDeployment.create({ data: {
+          link_id: linkId, generation: 3, version: 1, status: "retired", lease_expires_at: new Date("2020-01-01"),
+          binding_snapshot: { spec: { link_id: linkId, workspace_id: workspaceId, generation: 3,
+            ingress: { id: nodeId, workspace_id: workspaceId }, bindings: [{ forward_id: forwardIds[0] }] } },
+          placements: { create: [{ node_id: nodeId, role: "ingress", generation: 3,
+            runtime_id: `traffic-test-${nodeId}-3`, config_digest: newStart.config_digest }] },
+        } });
+        assert.equal(await client.tunnel.count({ where: { id: forwardIds[0] } }), 0,
+          "there is no live Forward to authorize the removed rule's final samples");
+        const oldFinal = { ...oldStart, bytes_in: "130", bytes_out: "250", connections: "11" };
+        const newFinal = { ...newStart, bytes_in: "15", bytes_out: "25", connections: "2" };
+        // This models local snapshot retention only; all counters pass through the real receiver/store.
+        const localSnapshots = new Map([[oldFinal.producer_id, oldFinal]]);
+        const delayedRetry = structuredClone(oldFinal);
+        const dayDate = new Date(`${day}T00:00:00Z`);
+        const daily = () => client.tunnelTraffic.findUnique({ where: {
+          tunnel_id_date: { tunnel_id: forwardIds[0], date: dayDate },
+        } });
+        assert.deepEqual(await send([oldStart, newStart]), { ok: true, accepted: [oldStart, newStart] });
+        assert.equal((await daily()).traffic, 315);
+        for (const forged of [{ ...oldFinal, config_digest: "01".repeat(32) },
+          { ...newFinal, generation: 99, config_digest: "01".repeat(32) },
+          ...(newGeneration === 3 ? [{ ...newFinal, config_digest: oldStart.config_digest }] : [])]) {
+          assert.deepEqual(await send([oldFinal, forged]),
+            { ok: false, status: 403, reason: "link_traffic_not_owned" });
+          assert.equal((await daily()).traffic, 315, "invalid history cannot commit another epoch's tail");
+        }
+
+        // Lose the ACK after the DB commit. The sealed old snapshot stays locally pending.
+        await send([oldFinal]);
+        assert.equal((await daily()).traffic, 395);
+        assert.ok(localSnapshots.has(oldFinal.producer_id));
+        assert.deepEqual(await send([newFinal]), { ok: true, accepted: [newFinal] });
+        assert.deepEqual(await send([localSnapshots.get(oldFinal.producer_id)]),
+          { ok: true, accepted: [oldFinal] });
+        localSnapshots.delete(oldFinal.producer_id);
+        assert.equal(localSnapshots.size, 0, "only the exactly ACKed local snapshot is reclaimed");
+
+        const retryBatches = [[delayedRetry, newFinal], [newFinal, oldStart]];
+        const retries = await Promise.all(retryBatches.map(send));
+        retries.forEach((result, index) => assert.deepEqual(result, { ok: true, accepted: retryBatches[index] }));
+        const finalFact = await daily();
+        assert.deepEqual([finalFact.workspace_id, finalFact.traffic, finalFact.traffic_cost],
+          [workspaceId, 420, 420], "both epoch finals remain counted once after the removed rule's late replay");
+        const retained = await client.linkTrafficCheckpoint.findMany({ where: {
+          node_id: nodeId, forward_id: forwardIds[0], date: dayDate,
+          producer_id: { in: [oldFinal.producer_id, newFinal.producer_id] },
+        } });
+        assert.equal(retained.length, 2, "local reclamation never removes a DB checkpoint");
+        for (const final of [oldFinal, newFinal]) {
+          const row = retained.find((checkpoint) => checkpoint.producer_id === final.producer_id);
+          assert.deepEqual([row.bytes_in, row.bytes_out, row.connections],
+            [BigInt(final.bytes_in), BigInt(final.bytes_out), BigInt(final.connections)]);
+          assert.deepEqual([row.generation, row.config_digest], [final.generation, final.config_digest]);
+        }
+        const epochTotals = await client.linkTrafficCheckpoint.aggregate({ where: {
+          node_id: nodeId, forward_id: forwardIds[0], date: dayDate,
+          producer_id: { in: [oldFinal.producer_id, newFinal.producer_id] },
+        }, _sum: { bytes_in: true, bytes_out: true, connections: true } });
+        assert.deepEqual(epochTotals._sum, { bytes_in: 145n, bytes_out: 275n, connections: 13n });
+      });
+    }
+  });
+}

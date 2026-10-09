@@ -1,10 +1,14 @@
 "use client";
+import { forwardPolicyDraftErrors, forwardPolicyDraftValues } from "@/lib/forward-policy";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { LinkedForwardGuide, linkedForwardHref, linkedForwardText, isLinkManagedError } from "@/components/links/linked-forward-guide";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { PERMISSION_DENIED } from "@/lib/workspace-permissions";
+import { nativeBothBlock, nativeBothBlockText, withForwardRuntimeCapabilities, type ForwardCapabilities } from "@/lib/forward-native-both";
 import {
   forwardAccessAddress,
   forwardCopyDraft,
@@ -104,12 +108,14 @@ const EMPTY_FORWARD: PortForward = {
 
 export function ForwardWorkspace() {
   const { t, locale } = useI18n();
+  const router = useRouter();
   const { currentId, permissions, permissionsLoading, can, canForward } = useWorkspace();
   const canRead = can("forward:read");
   const canReadNodes = can("node:read");
   const canCreate = can("forward:create") && canReadNodes;
   const canManageNodes = can("node:manage");
   const [nodes, setNodes] = useState<UserNode[]>([]);
+  const [forwardCapabilities, setForwardCapabilities] = useState<ForwardCapabilities | null>(null);
   const [bindings, setBindings] = useState<Record<number, NodeBinding[]>>({});
   const [summary, setSummary] = useState<ForwardSummary | null>(null);
   const [forwards, setForwards] = useState<PortForward[]>([]);
@@ -215,6 +221,7 @@ export function ForwardWorkspace() {
    * 管理员）。没有任何已知动作时只给原文 —— 不编造通用建议。
    */
   function writeFailureText(err: unknown, fallback: string): string {
+    if (isLinkManagedError(err)) return linkedForwardText(locale);
     const info = forwardErrorInfo(err);
     const actions = forwardErrorActions(locale, info);
     const parts = [...actions, info.message || fallback].filter((s) => s !== "");
@@ -244,6 +251,10 @@ export function ForwardWorkspace() {
     setReferenceLoaded(false);
     setBindingsUnavailable(false);
     setBatchDeleteEnabled(false);
+    setForwardCapabilities(null);
+    const forwardCapabilityTask = canRead ? api.forwards.capabilities().then((value) => {
+      if (current()) setForwardCapabilities(value);
+    }).catch(() => {}) : Promise.resolve();
     const batchCapabilityTask = canRead ? api.forwards.batchCapabilities().then((value) => {
       if (current()) setBatchDeleteEnabled(value.delete_enabled === true);
     }).catch(() => {}) : Promise.resolve();
@@ -255,7 +266,10 @@ export function ForwardWorkspace() {
     }) : Promise.resolve();
     const nodesTask = canReadNodes ? api.nodes.list().then(async (nodeRows) => {
       if (!current()) return;
-      setNodes(nodeRows);
+      setNodes(nodeRows.map((node) => ({ ...node, capabilities: null, capabilities_fresh: false })));
+      const runtimeTask = withForwardRuntimeCapabilities(nodeRows, api.nodes.diagnostics).then((rows) => {
+        if (current()) setNodes(rows);
+      });
       const rows = await Promise.all(nodeRows.filter(isIngress).map(async (node) => ({
         id: Number(node.id), bindings: await api.nodes.bindings(node.id).catch(() => null),
       })));
@@ -272,6 +286,7 @@ export function ForwardWorkspace() {
       if (bindingsFailed) toast.error(t("forward.bindingsLoadFailed"));
       setBindings(map);
       setBindingsUnavailable(bindingsFailed);
+      await runtimeTask;
     }).catch((err) => {
       // **整张节点表取不到**（网络失败 / 权限刚被撤）也必须算"事实取不到"：
       // 否则 `setBindingsUnavailable` 不执行、而 `setReferenceLoaded(true)` 仍执行，
@@ -282,7 +297,7 @@ export function ForwardWorkspace() {
         toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
       }
     }) : Promise.resolve();
-    await Promise.all([summaryTask, nodesTask, batchCapabilityTask]);
+    await Promise.all([summaryTask, nodesTask, batchCapabilityTask, forwardCapabilityTask]);
     if (current()) setReferenceLoaded(true);
   }
 
@@ -413,6 +428,8 @@ export function ForwardWorkspace() {
    * 草稿留空并由表单预检拦下（见 `forwardCopyDraft`）。
    */
   function copyForward(forward: PortForward) {
+    const linked = linkedForwardHref(forward);
+    if (linked) { router.push(linked); return; }
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
     setCreateDraft(copiedForwardCreateDraft(forward, L("forward.copySuffix")));
     setCreateOpen(true);
@@ -433,6 +450,13 @@ export function ForwardWorkspace() {
   const protocolReady = Object.keys(protocolErrors).length === 0;
   async function createForward() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
+    if (createDraft.protocol === "both") {
+      const block = nativeBothBlock({ capabilities: forwardCapabilities, mode: createDraft.mode,
+        ingress: nodes.find((node) => String(node.id) === createDraft.ingressId),
+        egress: nodes.find((node) => String(node.id) === createDraft.egressId), middleNodeId: createDraft.middleNodeId });
+      if (block) { toast.error(nativeBothBlockText(locale, block)); return; }
+    }
+    if (Object.keys(forwardPolicyDraftErrors(createDraft)).length) { toast.error(t("forward.createFailed")); return; }
     const ingress = Number(createDraft.ingressId);
     const targetPortNum = Number(createDraft.targetPort);
     const listenPortNum = createDraft.listenPort ? Number(createDraft.listenPort) : null;
@@ -464,6 +488,7 @@ export function ForwardWorkspace() {
     setBusy(true);
     try {
       const created = await api.forwards.create({
+        ...forwardPolicyDraftValues(createDraft),
         mode: createDraft.mode,
         ingress_node_id: ingress,
         name: createDraft.name.trim(),
@@ -515,16 +540,26 @@ export function ForwardWorkspace() {
   }
 
   async function runAction(forward: PortForward, action: "retry" | "suspend" | "resume") {
+    const linked = linkedForwardHref(forward);
+    if (linked) { router.push(linked); return; }
     if (!canForward(forward, "update")) { toast.error(PERMISSION_DENIED); return; }
     setActionBusy(Number(forward.id));
     try {
       await api.forwards.action(forward.id, action);
       reloadList();
     } catch (err) {
+      if (isLinkManagedError(err)) { await guideManagedForward(forward); return; }
       toast.error(writeFailureText(err, t("forward.loadFailed")));
     } finally {
       setActionBusy(null);
     }
+  }
+
+  async function guideManagedForward(forward: Pick<PortForward, "id" | "link_resource_id">) {
+    const scope = currentId;
+    const latest = await api.forwards.detail(forward.id).catch(() => null);
+    if (getActiveWorkspace() !== scope) return;
+    router.push(linkedForwardHref(latest ?? forward) ?? "/links");
   }
 
   /* ------------------------------------------------------------------ */
@@ -535,7 +570,7 @@ export function ForwardWorkspace() {
   function toggleSelected(id: number, checked: boolean) {
     const row = forwards.find((f) => Number(f.id) === id);
     if (batchFlight.current) return;
-    if (checked && (!row || (!canForward(row, "update") && !(batchDeleteEnabled && canForward(row, "delete"))))) return;
+    if (checked && (!row || linkedForwardHref(row) || (!canForward(row, "update") && !(batchDeleteEnabled && canForward(row, "delete"))))) return;
     setSelectedIds((current) => {
       const next = new Set(current);
       if (checked) next.add(id);
@@ -551,7 +586,7 @@ export function ForwardWorkspace() {
 
   const pageIds = useMemo(
     () => forwards
-      .filter((row) => canForward(row, "update") || (batchDeleteEnabled && canForward(row, "delete")))
+      .filter((row) => !linkedForwardHref(row) && (canForward(row, "update") || (batchDeleteEnabled && canForward(row, "delete"))))
       .map((row) => Number(row.id)),
     [forwards, permissions, batchDeleteEnabled],
   );
@@ -586,6 +621,8 @@ export function ForwardWorkspace() {
   async function runBatch(action: ForwardBatchAction) {
     if (batchFlight.current) return;
     const ids = [...selectedIds];
+    const linked = forwards.find((row) => selectedIds.has(Number(row.id)) && linkedForwardHref(row));
+    if (linked) { router.push(linkedForwardHref(linked)!); return; }
     const mutation = action === "delete" ? "delete" : "update";
     if (!can(`forward:${mutation}`)) { setBatchError(PERMISSION_DENIED); return; }
     if (ids.length === 0) return;
@@ -624,6 +661,13 @@ export function ForwardWorkspace() {
       if (!result) return;
 
       const failures = result.results.filter((row) => !row.ok);
+      const managedFailure = failures.find((row) => row.code === "link_managed_forward");
+      if (managedFailure) {
+        toast.warning(linkedForwardText(locale));
+        reloadList();
+        await guideManagedForward({ id: managedFailure.id });
+        return;
+      }
       const reconciliation = result.results.filter((row) => row.ok && row.reconciliation_pending);
       if (failures.length > 0 || reconciliation.length > 0) {
         const summary = L("forward.batchResult", {
@@ -656,6 +700,7 @@ export function ForwardWorkspace() {
       reloadList();
     } catch (err) {
       if (!current()) return;
+      if (isLinkManagedError(err)) { router.push("/links"); return; }
       const message = writeFailureText(err, L("forward.batchFailed"));
       setBatchError(message);
       toast.error(message);
@@ -668,6 +713,8 @@ export function ForwardWorkspace() {
   }
 
   async function removeForward(forward: PortForward) {
+    const linked = linkedForwardHref(forward);
+    if (linked) { router.push(linked); return; }
     if (!canForward(forward, "delete")) { toast.error(PERMISSION_DENIED); return; }
     if (!confirm(t("forward.deleteConfirm").replace("{name}", forward.name))) return;
     setActionBusy(Number(forward.id));
@@ -680,7 +727,8 @@ export function ForwardWorkspace() {
       }
       reloadList();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("forward.loadFailed"));
+      if (isLinkManagedError(err)) { await guideManagedForward(forward); return; }
+      toast.error(writeFailureText(err, t("forward.loadFailed")));
     } finally {
       setActionBusy(null);
     }
@@ -704,6 +752,8 @@ export function ForwardWorkspace() {
       />
 
       <ForwardSummaryCards summary={summary} loading={loading} t={t} />
+      {!loading && !error && forwards.filter((forward) => linkedForwardHref(forward)).map((forward) =>
+        <LinkedForwardGuide key={String(forward.id)} forward={forward} locale={locale} />)}
 
       {error ? (
         <div
@@ -772,15 +822,15 @@ export function ForwardWorkspace() {
             locale={locale}
             t={t}
             text={L}
-            canUpdate={(forward) => canForward(forward, "update")}
-            canDelete={(forward) => canForward(forward, "delete")}
-            canSelect={(forward) => canForward(forward, "update") || (batchDeleteEnabled && canForward(forward, "delete"))}
+            canUpdate={(forward) => !linkedForwardHref(forward) && canForward(forward, "update")}
+            canDelete={(forward) => !linkedForwardHref(forward) && canForward(forward, "delete")}
+            canSelect={(forward) => !linkedForwardHref(forward) && (canForward(forward, "update") || (batchDeleteEnabled && canForward(forward, "delete")))}
             selectionBusy={batchBusy}
             onSort={toggleSort}
             onSelectAll={toggleSelectAllOnPage}
             onSelect={toggleSelected}
             onAction={(forward, action) => void runAction(forward, action)}
-            onEdit={setEditTarget}
+            onEdit={(forward) => { const linked = linkedForwardHref(forward); if (linked) router.push(linked); else setEditTarget(forward); }}
             onCopy={copyForward}
             onDelete={(forward) => void removeForward(forward)}
           />
@@ -788,6 +838,7 @@ export function ForwardWorkspace() {
       )}
 
       <ForwardCreateDialog
+        capabilities={forwardCapabilities}
         open={createOpen && canCreate}
         draft={createDraft}
         ingressNodes={ingressNodes}
@@ -831,6 +882,7 @@ export function ForwardWorkspace() {
 
       {/* V4-WP4：列表行进入全字段编辑；保存后按 updated 回填行，保持列表可用 */}
       <ForwardEditDialog
+        capabilities={forwardCapabilities}
         open={editTarget !== null && canForward(editTarget, "update")}
         onOpenChange={(open) => {
           if (!open) setEditTarget(null);

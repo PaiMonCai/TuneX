@@ -74,7 +74,11 @@ type datagramEgressMapping struct {
 	// conn is the connected target socket for this mapping.
 	conn net.Conn
 	// target is the address conn is connected to, kept for diagnostics.
-	target string
+	target   string
+	selected Target
+	// feedback records only the first real outcome. DialUDP alone proves no
+	// reachability, so a half-open probe succeeds only on a target reply.
+	feedback atomic.Bool
 	// lastActivity is the idle clock in unix nanoseconds, refreshed on traffic in
 	// EITHER direction.
 	lastActivity atomic.Int64
@@ -109,19 +113,19 @@ type DatagramEgress struct {
 	stopOnce  sync.Once
 
 	// counters (see DatagramStats for the frozen meaning of each)
-	packetsIn         atomic.Int64
-	bytesIn           atomic.Int64
-	packetsOut        atomic.Int64
-	bytesOut          atomic.Int64
-	mappingsCreated   atomic.Int64
-	mappingsExpired   atomic.Int64
-	mappingsRejected  atomic.Int64
-	drops             atomic.Int64
-	dropsUnknownSrc   atomic.Int64
-	dropsCeiling      atomic.Int64
-	dropsSendError    atomic.Int64
-	dropsMalformed    atomic.Int64
-	lastActivityAt    atomic.Int64
+	packetsIn        atomic.Int64
+	bytesIn          atomic.Int64
+	packetsOut       atomic.Int64
+	bytesOut         atomic.Int64
+	mappingsCreated  atomic.Int64
+	mappingsExpired  atomic.Int64
+	mappingsRejected atomic.Int64
+	drops            atomic.Int64
+	dropsUnknownSrc  atomic.Int64
+	dropsCeiling     atomic.Int64
+	dropsSendError   atomic.Int64
+	dropsMalformed   atomic.Int64
+	lastActivityAt   atomic.Int64
 }
 
 // NewDatagramEgress builds the exit-side datagram runtime.
@@ -140,6 +144,9 @@ func NewDatagramEgress(cfg TunnelConfig, sel TargetSelector, opts DatagramEgress
 	}
 	if sel == nil {
 		return nil, errors.New("forwarder: datagram EGRESS requires a target selector")
+	}
+	if selectorRequiresClientIP(sel, cfg) {
+		return nil, ErrClientIPRequired
 	}
 	peers, err := parseHopPeer(cfg.HopPeer)
 	if err != nil {
@@ -218,6 +225,9 @@ func (e *DatagramEgress) attested(addr *net.UDPAddr) bool {
 
 // Start binds the exit port and begins forwarding.
 func (e *DatagramEgress) Start() error {
+	if selectorRequiresClientIP(e.sel, e.cfg) {
+		return ErrClientIPRequired
+	}
 	e.mu.Lock()
 	if e.running {
 		e.mu.Unlock()
@@ -330,6 +340,9 @@ func (e *DatagramEgress) handlePacket(conn *net.UDPConn, header datagramHopHeade
 		return // dropped and counted inside mappingFor
 	}
 	if _, err := m.conn.Write(payload); err != nil {
+		if m.feedback.CompareAndSwap(false, true) {
+			e.reportTargetOutcome(m.selected, false)
+		}
 		e.drops.Add(1)
 		e.dropsSendError.Add(1)
 		return
@@ -391,7 +404,17 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 		e.mappingsRejected.Add(1)
 		return nil
 	}
-	target := e.sel.Select()
+	if selectorRequiresClientIP(e.sel, e.cfg) {
+		e.mu.Unlock()
+		e.drops.Add(1)
+		e.mappingsRejected.Add(1)
+		return nil
+	}
+	// The legacy hop header has no original client IP. src is the attested
+	// ingress endpoint, not a client identity; mapping IDs are not IPs either.
+	// Client-aware selectors therefore receive an unknown source. Selection is
+	// performed only here, when creating a mapping, so live mappings stay pinned.
+	target := selectTargetForClient(e.sel, "")
 	if target.Host == "" || target.Port <= 0 {
 		e.mu.Unlock()
 		e.drops.Add(1)
@@ -403,6 +426,7 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 	raddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		e.mu.Unlock()
+		e.reportTargetOutcome(target, false)
 		e.reportTargetFailure(TargetStats{Host: target.Host, Port: target.Port, LastErr: err.Error()})
 		e.drops.Add(1)
 		e.dropsSendError.Add(1)
@@ -412,6 +436,7 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 	c, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
 		e.mu.Unlock()
+		e.reportTargetOutcome(target, false)
 		e.reportTargetFailure(TargetStats{Host: target.Host, Port: target.Port, LastErr: err.Error()})
 		e.drops.Add(1)
 		e.dropsSendError.Add(1)
@@ -426,6 +451,7 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 		peer:       peer,
 		conn:       c,
 		target:     addr,
+		selected:   target,
 	}
 	m.lastActivity.Store(time.Now().UnixNano())
 	e.mappings[header.MappingID] = m
@@ -439,16 +465,22 @@ func (e *DatagramEgress) mappingFor(conn *net.UDPConn, header datagramHopHeader,
 // replyLoop returns target traffic to the ingress, re-framing it with the hop
 // header the mapping answers to.
 func (e *DatagramEgress) replyLoop(listener *net.UDPConn, mappingID uint32, m *datagramEgressMapping) {
-	// One byte more than the ceiling: a reply larger than the hop budget is then
-	// truncated and REFUSED by the framing check (counted as a drop) instead of
-	// being silently shortened to something the ingress would deliver as if it
-	// were the whole answer.
-	buf := make([]byte, datagramHopMaxPayload+1)
+	// Read a complete UDP payload before applying the hop budget. On Windows,
+	// a datagram larger than the read buffer returns WSAEMSGSIZE rather than a
+	// successful truncated read, which would bypass the framing check and end
+	// this mapping's reply loop without counting the oversized packet.
+	buf := make([]byte, datagramMaxPayload)
 	wire := make([]byte, 0, datagramHopMTU)
 	for {
 		n, err := m.conn.Read(buf)
 		if err != nil {
+			if !m.closed.Load() && !e.isShuttingDown() && m.feedback.CompareAndSwap(false, true) {
+				e.reportTargetOutcome(m.selected, false)
+			}
 			return // the mapping was closed (expiry, take-over or shutdown)
+		}
+		if m.feedback.CompareAndSwap(false, true) {
+			e.reportTargetOutcome(m.selected, true)
 		}
 		wire, err = appendDatagramHop(wire[:0], datagramHopHeader{
 			MappingID:  mappingID,
@@ -548,26 +580,32 @@ func (e *DatagramEgress) reportTargetFailure(stats TargetStats) {
 	}
 }
 
+func (e *DatagramEgress) reportTargetOutcome(target Target, ok bool) {
+	if reporter, reports := e.sel.(TargetReporter); reports {
+		reporter.ReportDial(target, ok)
+	}
+}
+
 // Stats reports the frozen datagram facts (§6.1).
 func (e *DatagramEgress) Stats() DatagramStats {
 	e.mu.Lock()
 	mappings := int64(len(e.mappings))
 	e.mu.Unlock()
 	return DatagramStats{
-		Mappings:          mappings,
-		MappingsCreated:   e.mappingsCreated.Load(),
-		MappingsExpired:   e.mappingsExpired.Load(),
-		MappingsRejected:  e.mappingsRejected.Load(),
-		PacketsIn:         e.packetsIn.Load(),
-		BytesIn:           e.bytesIn.Load(),
-		PacketsOut:        e.packetsOut.Load(),
-		BytesOut:          e.bytesOut.Load(),
-		Drops:             e.drops.Load(),
+		Mappings:           mappings,
+		MappingsCreated:    e.mappingsCreated.Load(),
+		MappingsExpired:    e.mappingsExpired.Load(),
+		MappingsRejected:   e.mappingsRejected.Load(),
+		PacketsIn:          e.packetsIn.Load(),
+		BytesIn:            e.bytesIn.Load(),
+		PacketsOut:         e.packetsOut.Load(),
+		BytesOut:           e.bytesOut.Load(),
+		Drops:              e.drops.Load(),
 		DropsUnknownSource: e.dropsUnknownSrc.Load(),
-		DropsCeiling:      e.dropsCeiling.Load(),
-		DropsSendError:    e.dropsSendError.Load(),
-		DropsMalformed:    e.dropsMalformed.Load(),
-		LastActivityAt:    e.lastActivityAt.Load(),
+		DropsCeiling:       e.dropsCeiling.Load(),
+		DropsSendError:     e.dropsSendError.Load(),
+		DropsMalformed:     e.dropsMalformed.Load(),
+		LastActivityAt:     e.lastActivityAt.Load(),
 	}
 }
 

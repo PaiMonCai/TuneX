@@ -47,6 +47,14 @@ EOF
   set -a; . "$ENVF"; set +a
 fi
 export DATABASE_URL
+if [[ "${TUNEX_FXP_LINKS_ENABLED:-false}" == "true" && -z "${TUNEX_LINK_SEAL_KEY:-}" ]]; then
+  # A disposable installation still needs one stable independent seal key across
+  # Panel/Worker restarts. Write it only into the existing private test env file.
+  TUNEX_LINK_SEAL_KEY="$(openssl rand -hex 32)"
+  printf '\nTUNEX_LINK_SEAL_KEY=%s\n' "$TUNEX_LINK_SEAL_KEY" >> "$ENVF"
+  chmod 600 "$ENVF"
+  export TUNEX_LINK_SEAL_KEY
+fi
 
 if [[ -f "$PASSF" ]]; then
   set -a; . "$PASSF"; set +a
@@ -66,7 +74,7 @@ if [[ -z "${TUNEX_BACKEND_IMAGE:-}" ]]; then
 fi
 if [[ -z "${TUNEX_IT_AGENT_IMAGE:-}" ]]; then
   say "从当前 checkout 构建 Agent"
-  docker build -t tunex-it-agent:ci -f "$REPO/agent/Dockerfile" "$REPO"
+  docker build --build-arg "AGENT_VERSION=${TUNEX_IT_AGENT_VERSION:-unknown}" -t tunex-it-agent:ci -f "$REPO/agent/Dockerfile" "$REPO"
   export TUNEX_IT_AGENT_IMAGE=tunex-it-agent:ci
 fi
 echo "images: backend=$TUNEX_BACKEND_IMAGE agent=$TUNEX_IT_AGENT_IMAGE"

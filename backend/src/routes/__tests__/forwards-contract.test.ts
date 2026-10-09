@@ -20,9 +20,10 @@ describe("Forward request contracts", () => {
     }).success).toBe(true);
   });
 
-  test("PATCH is fail-closed for unknown fields and protocol mutation", () => {
+  test("PATCH accepts native socket protocols but refuses unknown fields and TLS/WS mutations", () => {
     expect(ForwardPatchSchema.safeParse({ name: "x", unknown: true }).success).toBe(false);
-    expect(ForwardPatchSchema.safeParse({ protocol: "udp" }).success).toBe(false);
+    for (const protocol of ["tcp", "udp", "both"]) expect(ForwardPatchSchema.safeParse({ protocol }).success).toBe(true);
+    for (const protocol of ["tls", "ws", "wss", "quic"]) expect(ForwardPatchSchema.safeParse({ protocol }).success).toBe(false);
   });
 
   test("expected_revision remains optional, nullable and non-negative when paired with an edit", () => {

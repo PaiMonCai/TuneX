@@ -9,22 +9,21 @@
 //
 // Ports: a BOTH node runs ingress and egress tunnels in
 // one process and the two pools can overlap numerically, so a single shared
-// usedPorts guard owns every port this manager binds (skill note: agent-side
-// TunnelManager and EgressManager must share one usedPorts map). This guard is
-// the only port ownership in the process after the duplicate data-plane engine was removed; the old engine's
-// private usedPorts map.
+// guard describes each socket protocol and bind scope. It is derived from this
+// single registry and its bounded teardown notes; EGRESS uses the same owner.
 package manager
 
 import (
+	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/portlease"
 )
 
 // Revision rules (enforced by the manager so the command layer
@@ -59,6 +58,15 @@ type entry struct {
 	fwd forwarder.Runtime
 }
 
+// removal keeps a completion fact separate from the desired registry. A
+// cancelled command must not lose a still-stopping socket; a replay waits for
+// the same Stop rather than acknowledging an absent registry entry as stopped.
+type removal struct {
+	entry *entry
+	done  chan struct{}
+	err   error // Written before done closes.
+}
+
 // TunnelManager is the concurrency-safe registry of running tunnels.
 type TunnelManager struct {
 	mu      sync.RWMutex
@@ -68,7 +76,8 @@ type TunnelManager struct {
 	// must not be able to resurrect that runtime merely because the live entry
 	// is no longer present in the registry.
 	removedRevision map[string]int64
-	usedPort        map[string]bool // "<socket namespace>:<port>" guard shared with EgressManager
+	removals        map[string][]*removal
+	usedPort        map[string]bool // "<socket namespace>:<port>@<bind scope>" derived guard
 
 	// stoppingPorts 记录"Stop 已经发起、但监听还没真正关闭"的端口 —— 带**截止时间**的挂账。
 	//
@@ -84,6 +93,10 @@ type TunnelManager struct {
 	// （端口早已无人监听，守卫却一直占着）。超过 {@link stoppingPortGrace} 后挂账自动失效，
 	// 以内核为准：内核里真占着，bind 会如实失败；已经不占了，端口就该能被复用。
 	stoppingPorts map[string]stoppingNote
+	// externalPorts are process reservations made by the Link runner. They use
+	// this manager's lock and derived guard, without inventing native tunnel IDs.
+	// The runner retains old bindings until every owning process has stopped.
+	externalPorts map[string][]portlease.Binding
 
 	egress *EgressManager
 	// listenHost is the interface ingress/egress tunnels bind when the config
@@ -133,6 +146,15 @@ type OwnershipGuard interface {
 	Admit(cfg forwarder.TunnelConfig) error
 }
 
+// Production ownership separates irreversible fence observation from committing
+// the clock of the actual installed runtime. Legacy/test gates still implement
+// Admit only and retain their refusal semantics.
+type activationGuard interface {
+	CheckActivation(forwarder.TunnelConfig) error
+	CommitActivation(forwarder.TunnelConfig) error
+	CompensationConfig(forwarder.TunnelConfig) forwarder.TunnelConfig
+}
+
 // SetOwnershipGuard installs the activation gate. It is safe to call at any time
 // and passing nil removes the gate. It is a setter rather than a constructor
 // argument because the guard is built after the managers (it needs their
@@ -158,17 +180,52 @@ func (m *TunnelManager) AdmitActivation(cfg forwarder.TunnelConfig) error {
 	return m.admitOwnership(cfg)
 }
 
-// admitOwnership runs the activation gate outside the manager's lock: the guard
-// may write a durable file, and holding m.mu across an fsync would stall every
-// other tunnel operation behind one activation.
+// Production fence observations serialize on the mutation lock, including
+// preflight: an early candidate cannot raise the fence while another activation
+// is binding/committing. Durable fence IO is bounded state work, not network IO.
+// Legacy gates remain outside the lock, preserving their existing contract.
 func (m *TunnelManager) admitOwnership(cfg forwarder.TunnelConfig) error {
-	m.mu.RLock()
+	m.mu.Lock()
 	guard := m.ownership
-	m.mu.RUnlock()
+	if phased, ok := guard.(activationGuard); ok {
+		defer m.mu.Unlock()
+		if cur, ok := m.tunnels[cfg.ID]; ok && cfg.Revision == cur.cfg.Revision &&
+			(cfg.OwnershipEpoch == cur.cfg.OwnershipEpoch || cfg.OwnershipEpoch == 0 && cfg.LeaseExpiresAt == "") {
+			// A live idempotent replay may carry the original, now-expired
+			// timestamp. Borrow only this running identity's effective renewal.
+			if cfg.OwnershipEpoch == 0 {
+				cfg.OwnershipEpoch = cur.cfg.OwnershipEpoch
+			}
+			cfg = phased.CompensationConfig(cfg)
+		}
+		return phased.CheckActivation(cfg)
+	}
+	m.mu.Unlock()
 	if guard == nil {
 		return nil
 	}
 	return guard.Admit(cfg)
+}
+
+func (m *TunnelManager) commitOwnershipLocked(cfg forwarder.TunnelConfig) error {
+	if phased, ok := m.ownership.(activationGuard); ok {
+		if err := phased.CommitActivation(cfg); err != nil {
+			if live, ok := m.tunnels[cfg.ID]; ok {
+				_ = live.fwd.Stop()
+				delete(m.tunnels, cfg.ID)
+				m.rebuildPortGuardLocked()
+			}
+			return err // Never ACK an installed runtime that lost authorization.
+		}
+	}
+	return nil
+}
+
+func (m *TunnelManager) checkCurrentOwnershipLocked(cfg forwarder.TunnelConfig) error {
+	if phased, ok := m.ownership.(activationGuard); ok {
+		return phased.CheckActivation(cfg)
+	}
+	return nil
 }
 
 // SetMutationHook installs the post-mutation observer. It is safe to call at any
@@ -179,14 +236,15 @@ func (m *TunnelManager) SetMutationHook(fn func()) {
 	m.mu.Unlock()
 }
 
-// fingerprint summarises the running registry (id, revision, bound port). It is
+// fingerprint summarises the running registry (id, revision, protocol and scope). It is
 // compared before/after a mutation so an idempotent apply — same revision, no
 // listener churn — does not wake the hook.
 func (m *TunnelManager) fingerprint() string {
 	m.mu.RLock()
 	parts := make([]string, 0, len(m.tunnels))
 	for id, e := range m.tunnels {
-		parts = append(parts, fmt.Sprintf("%s:%d:%d", id, e.cfg.Revision, e.cfg.ListenPort()))
+		parts = append(parts, fmt.Sprintf("%s:%d:%s:%s:%d:%s", id, e.cfg.Revision, e.cfg.Protocol,
+			portGuardKey(e.cfg), e.cfg.OwnershipEpoch, e.cfg.LeaseExpiresAt))
 	}
 	m.mu.RUnlock()
 	sort.Strings(parts)
@@ -212,8 +270,10 @@ func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 	return &TunnelManager{
 		tunnels:         make(map[string]*entry),
 		removedRevision: make(map[string]int64),
+		removals:        make(map[string][]*removal),
 		usedPort:        make(map[string]bool),
 		stoppingPorts:   make(map[string]stoppingNote),
+		externalPorts:   make(map[string][]portlease.Binding),
 		egress:          egress,
 		listenHost:      listenHost,
 	}
@@ -227,46 +287,143 @@ func NewTunnelManager(egress *EgressManager, listenHost string) *TunnelManager {
 // datagram contract). tls/ws are TCP sockets, so all three stream protocols
 // share one namespace; only a datagram runtime gets "udp:".
 func portGuardKey(cfg forwarder.TunnelConfig) string {
-	return portKey(socketNamespace(cfg.Protocol), cfg.ListenPort())
+	return portBinding(cfg).Key()
 }
 
-// portKey renders one namespaced guard key.
-func portKey(namespace string, port int) string {
-	return namespace + strconv.Itoa(port)
+func portBinding(cfg forwarder.TunnelConfig) portlease.Binding {
+	return portlease.New(string(cfg.Protocol), cfg.ListenPort(), cfg.ListenHost)
 }
 
-// socketNamespace is the OS socket family a protocol's listener binds in.
-func socketNamespace(protocol forwarder.ForwardProtocol) string {
-	if transport, ok := forwarder.TransportForProtocol(protocol); ok && transport == forwarder.TransportDatagram {
-		return "udp:"
+// The comparison key can be "both", but owned/reportable sockets must remain
+// separate OS namespaces so one teardown cannot release half a rule early.
+func portBindings(cfg forwarder.TunnelConfig) []portlease.Binding {
+	if cfg.Protocol == forwarder.ProtocolBoth {
+		return []portlease.Binding{
+			portlease.New("tcp", cfg.ListenPort(), cfg.ListenHost),
+			portlease.New("udp", cfg.ListenPort(), cfg.ListenHost),
+		}
 	}
-	return "tcp:"
+	return []portlease.Binding{portBinding(cfg)}
 }
 
-// portBoundLocked reports whether this node already owns the port number in ANY
-// namespace.
-//
-// The kernel would happily take TCP 19000 and UDP 19000 at the same time, but the
-// port lease above this manager does not: NodePortLease's unique key is
-// (node_id, port), protocol-free, and §5.2 of the datagram contract freezes that
-// stricter rule rather than expanding the lease. So a namespaced key must never
-// be the ONLY exclusion check, or the guard would allow a pair the panel's port
-// pool treats as one port — the exact "two owners for one number" failure the
-// guard exists to prevent.
-//
-// Caller must hold m.mu.
-func (m *TunnelManager) portBoundLocked(port int) bool {
-	return m.usedPort[portKey("tcp:", port)] || m.usedPort[portKey("udp:", port)]
+// checkPortAvailableLocked checks the single runtime registry and its existing
+// teardown notes. Only the entry actually being replaced is exempt; a same-id
+// replacement cannot bypass another rule's reservation. Caller must hold m.mu.
+func (m *TunnelManager) checkPortAvailableLocked(cfg forwarder.TunnelConfig, replacedID string) error {
+	m.rebuildPortGuardLocked()
+	if m.bindingConflictLocked(portBinding(cfg), replacedID, "") {
+		return portConflict(cfg)
+	}
+	return nil
+}
+
+func (m *TunnelManager) bindingConflictLocked(wanted portlease.Binding, replacedID, externalOwner string) bool {
+	for id, e := range m.tunnels {
+		if id != replacedID && wanted.Conflicts(portBinding(e.cfg)) {
+			return true
+		}
+	}
+	for key := range m.stoppingPorts {
+		if stopping, ok := portlease.ParseKey(key); ok && wanted.Conflicts(stopping) {
+			return true
+		}
+	}
+	for _, pending := range m.removals {
+		for _, stop := range pending {
+			if wanted.Conflicts(portBinding(stop.entry.cfg)) {
+				return true
+			}
+		}
+	}
+	for owner, bindings := range m.externalPorts {
+		if owner == externalOwner {
+			continue
+		}
+		for _, binding := range bindings {
+			if wanted.Conflicts(binding) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ReserveExternal atomically replaces an external owner's COMPLETE binding
+// list. The owner must include all prepared, active and stopping process sockets
+// until their stop is confirmed. A refusal preserves the previous list.
+func (m *TunnelManager) ReserveExternal(owner string, bindings []portlease.Binding) error {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return fmt.Errorf("manager: external port owner is required")
+	}
+	normalized := make([]portlease.Binding, 0, len(bindings))
+	seen := make(map[string]bool, len(bindings))
+	for _, binding := range bindings {
+		binding = portlease.New(binding.Network, binding.Port, binding.Host)
+		if (binding.Network != "tcp" && binding.Network != "udp") || binding.Port <= 0 || binding.Port > 65535 {
+			return fmt.Errorf("manager: invalid external binding for %s: %+v", owner, binding)
+		}
+		if !seen[binding.Key()] {
+			normalized = append(normalized, binding)
+			seen[binding.Key()] = true
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closing {
+		return ErrNodeShuttingDown
+	}
+	m.rebuildPortGuardLocked()
+	for _, binding := range normalized {
+		if m.bindingConflictLocked(binding, "", owner) {
+			return fmt.Errorf("manager: external owner %s: %s port %d bind scope %q is already reserved", owner, binding.Network, binding.Port, binding.Host)
+		}
+	}
+	if len(normalized) == 0 {
+		delete(m.externalPorts, owner)
+	} else {
+		m.externalPorts[owner] = normalized
+	}
+	m.rebuildPortGuardLocked()
+	return nil
+}
+
+// ReleaseExternal is called only after the runner confirms every owner process
+// has stopped. It never releases a native or another external owner's binding.
+func (m *TunnelManager) ReleaseExternal(owner string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.externalPorts, strings.TrimSpace(owner))
+	m.rebuildPortGuardLocked()
+}
+
+func portConflict(cfg forwarder.TunnelConfig) error {
+	logx.Warn("apply rejected: port is guarded by another runtime",
+		"id", cfg.ID, "port", cfg.ListenPort(), "protocol", string(cfg.Protocol),
+		"listen_host", cfg.ListenHost, "revision", cfg.Revision)
+	return fmt.Errorf("manager: port %d is already used by another tunnel (%s bind scope %q)",
+		cfg.ListenPort(), portBinding(cfg).Network, cfg.ListenHost)
+}
+
+// normalizeConfig applies the manager default before canonicalizing the host
+// used by both the socket and the guard. Caller holds m.mu or m.mu.RLock.
+func (m *TunnelManager) normalizeConfig(cfg forwarder.TunnelConfig) (forwarder.TunnelConfig, error) {
+	normalized := cfg.Clone()
+	if strings.TrimSpace(normalized.ListenHost) == "" {
+		normalized.ListenHost = m.listenHost
+	}
+	normalized.ListenHost = portlease.NormalizeHost(normalized.ListenHost)
+	err := normalized.Validate()
+	return normalized, err
 }
 
 // New builds the runtime for cfg without starting it. It is exported so the
 // API layer / tests can inspect what a config would produce.
 func (m *TunnelManager) New(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
-	normalized := cfg.Clone()
-	if normalized.ListenHost == "" {
-		normalized.ListenHost = m.listenHost
-	}
-	if err := normalized.Validate(); err != nil {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	normalized, err := m.normalizeConfig(cfg)
+	if err != nil {
 		return nil, err
 	}
 	fwd, err := m.buildLocked(normalized)
@@ -328,13 +485,11 @@ func (m *TunnelManager) attachLedger(cfg forwarder.TunnelConfig, fwd forwarder.R
 //
 // The revision gate and the port guard live here (and in ReplaceListener,
 // which shares applyLocked); the ordering inside is applyLocked's job, and it
-// is the same sequence for both entry points so the two cannot drift.
+// uses the same admission check for both entry points so the two cannot drift.
 func (m *TunnelManager) Apply(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	before := m.fingerprint()
 	fwd, err := m.applyInner(cfg)
-	if err == nil {
-		m.notifyIfChanged(before)
-	}
+	m.notifyIfChanged(before)
 	return fwd, err
 }
 
@@ -347,16 +502,12 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 	if err := m.admitOwnership(cfg); err != nil {
 		return nil, err
 	}
-	normalized := cfg.Clone()
-	if normalized.ListenHost == "" {
-		normalized.ListenHost = m.listenHost
-	}
-	if err := normalized.Validate(); err != nil {
-		return nil, err
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	normalized, err := m.normalizeConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	// Refuse work once shutdown has begun. Checked before the revision
 	// gate so a config cannot "win" by carrying a newer revision.
@@ -376,14 +527,40 @@ func (m *TunnelManager) applyInner(cfg forwarder.TunnelConfig) (forwarder.Runtim
 		if normalized.Revision == cur.cfg.Revision && normalized.Revision != revisionUnknown {
 			// Idempotent: the very same revision is already live. Do not
 			// churn listeners or reassign ports.
+			// Same desired revision can carry a refreshed owner/lease. Only
+			// these control facts change; payload configuration stays applied.
+			m.refreshEffectiveOwnershipLocked(&cur.cfg, normalized)
+			if err := m.commitOwnershipLocked(cur.cfg); err != nil {
+				return nil, err
+			}
 			return cur.fwd, nil
 		}
 	}
 	fwd, err := m.applyLocked(normalized)
 	if err == nil {
+		if err := m.commitOwnershipLocked(normalized); err != nil {
+			return nil, err
+		}
 		delete(m.removedRevision, normalized.ID)
 	}
 	return fwd, err
+}
+
+func refreshOwnershipFacts(applied *forwarder.TunnelConfig, offered forwarder.TunnelConfig) {
+	// Missing legacy facts never erase a tracked owner/clock.
+	if offered.OwnershipEpoch > 0 {
+		applied.OwnershipEpoch = offered.OwnershipEpoch
+	}
+	if offered.LeaseExpiresAt != "" {
+		applied.LeaseExpiresAt = offered.LeaseExpiresAt
+	}
+}
+
+func (m *TunnelManager) refreshEffectiveOwnershipLocked(applied *forwarder.TunnelConfig, offered forwarder.TunnelConfig) {
+	refreshOwnershipFacts(applied, offered)
+	if phased, ok := m.ownership.(activationGuard); ok {
+		*applied = phased.CompensationConfig(*applied)
+	}
 }
 
 // buildLocked builds the data-plane runtime. Caller must hold m.mu.
@@ -471,39 +648,40 @@ func egressObserver(tunnelID string) forwarder.TargetObserver {
 // the node itself holds. Same-port replacement is exactly the hot-update case
 // the panel hits when it re-sends a tunnel with a new revision — including the
 // case where the new revision changes the listener's TRANSPORT (a udp binding
-// replaced by a tcp one on the same number), which is why the takeover below
-// frees the key under the OLD runtime's namespace, not the new one's.
+// replaced by a tcp one on the same number). Other owners are checked before
+// the old runtime is touched, using the destination protocol and bind scope.
 func (m *TunnelManager) startLocked(cfg forwarder.TunnelConfig, fwd forwarder.Runtime) error {
 	port := cfg.ListenPort()
 	if port <= 0 {
 		return fwd.Start()
 	}
-	// 先按事实重建一次：挂账到期必须**立刻**失效，不能等到下一次 Apply/Remove 才被抹平
-	// （否则面板按 DB 发的端口会在这里被一个"早就该过期"的挂账挡回去）。
-	m.rebuildPortGuardLocked()
-	if !m.portBoundLocked(port) {
-		return fwd.Start()
+	if err := m.checkPortAvailableLocked(cfg, cfg.ID); err != nil {
+		return err
 	}
-	// The port is taken. If the taker is the entry this Apply replaces, the
-	// port is genuinely available to us: the old runtime is stopped first
-	// and its listener closed, and only then does the new one bind it.
+	// Same-number Apply retains its rebuild semantics. Check every OTHER
+	// owner first, including a rule on the destination socket protocol, before
+	// stopping the old runtime. Disjoint listener moves use bind-first Replace.
 	if old, ok := m.tunnels[cfg.ID]; ok && old.cfg.ListenPort() == port {
 		_ = old.fwd.Stop()
-		delete(m.usedPort, portGuardKey(old.cfg))
-		return fwd.Start()
+		if err := fwd.Start(); err != nil {
+			_ = fwd.Stop()
+			if old.cfg.Protocol == forwarder.ProtocolBoth || cfg.Protocol == forwarder.ProtocolBoth {
+				return m.restoreStoppedEntryLocked(cfg.ID, old, err)
+			}
+			return err
+		}
+		return nil
 	}
-	// 端口被拒绝必须留痕。这次定位根因时，"Agent 为什么拒绝"在日志里完全没有痕迹，
-	// 只能从数据库里的 apply_error 反推 —— 决策不留痕的机制与从未运行过的机制无法区分。
-	logx.Warn("apply rejected: port is guarded by another runtime",
-		"id", cfg.ID, "port", port, "protocol", string(cfg.Protocol), "revision", cfg.Revision)
-	return fmt.Errorf("manager: port %d is already used by another tunnel", port)
+	return fwd.Start()
 }
 
 // markPortUsedLocked records the port of a now-running tunnel. Caller must hold
 // m.mu.
 func (m *TunnelManager) markPortUsedLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
-		m.usedPort[portGuardKey(cfg)] = true
+		for _, binding := range portBindings(cfg) {
+			m.usedPort[binding.Key()] = true
+		}
 	}
 }
 
@@ -523,9 +701,12 @@ func (m *TunnelManager) noteStoppingLocked(cfg forwarder.TunnelConfig) {
 	if cfg.ListenPort() <= 0 {
 		return
 	}
-	m.stoppingPorts[portGuardKey(cfg)] = stoppingNote{
-		count: m.stoppingPorts[portGuardKey(cfg)].count + 1,
-		until: time.Now().Add(stoppingPortGrace),
+	for _, binding := range portBindings(cfg) {
+		key := binding.Key()
+		m.stoppingPorts[key] = stoppingNote{
+			count: m.stoppingPorts[key].count + 1,
+			until: time.Now().Add(stoppingPortGrace),
+		}
 	}
 }
 
@@ -535,11 +716,13 @@ func (m *TunnelManager) clearStoppingLocked(cfg forwarder.TunnelConfig) {
 	if cfg.ListenPort() <= 0 {
 		return
 	}
-	key := portGuardKey(cfg)
-	if n := m.stoppingPorts[key]; n.count > 1 {
-		m.stoppingPorts[key] = stoppingNote{count: n.count - 1, until: n.until}
-	} else {
-		delete(m.stoppingPorts, key)
+	for _, binding := range portBindings(cfg) {
+		key := binding.Key()
+		if n := m.stoppingPorts[key]; n.count > 1 {
+			m.stoppingPorts[key] = stoppingNote{count: n.count - 1, until: n.until}
+		} else {
+			delete(m.stoppingPorts, key)
+		}
 	}
 }
 
@@ -555,7 +738,14 @@ func (m *TunnelManager) rebuildPortGuardLocked() {
 	next := make(map[string]bool, len(m.tunnels)+len(m.stoppingPorts))
 	for _, e := range m.tunnels {
 		if e.cfg.ListenPort() > 0 {
-			next[portGuardKey(e.cfg)] = true
+			for _, binding := range portBindings(e.cfg) {
+				next[binding.Key()] = true
+			}
+		}
+	}
+	for _, bindings := range m.externalPorts {
+		for _, binding := range bindings {
+			next[binding.Key()] = true
 		}
 	}
 	now := time.Now()
@@ -571,38 +761,30 @@ func (m *TunnelManager) rebuildPortGuardLocked() {
 		}
 		next[key] = true
 	}
+	// Failed/cancelled removals remain owners until Stop confirms completion.
+	// Their reservations must not disappear just because a grace note aged out.
+	for _, pending := range m.removals {
+		for _, stop := range pending {
+			for _, binding := range portBindings(stop.entry.cfg) {
+				next[binding.Key()] = true
+			}
+		}
+	}
 	m.usedPort = next
 }
 
 // releasePortLocked frees the port held by cfg. Caller must hold m.mu.
 func (m *TunnelManager) releasePortLocked(cfg forwarder.TunnelConfig) {
 	if p := cfg.ListenPort(); p > 0 {
-		delete(m.usedPort, portGuardKey(cfg))
+		for _, binding := range portBindings(cfg) {
+			delete(m.usedPort, binding.Key())
+		}
 	}
 }
 
-// stopEntry stops a forwarder in the background. Stop drains live connections
-// and may block for drainTimeout, so it must never run while m.mu is held or
-// the whole manager stalls behind one tunnel's teardown.
-//
-// The port guard is deliberately NOT touched here: a goroutine reaching into
-// m.usedPort would race every Apply/StopAll that reads it (the -race detector
-// flags this exact pair). Callers release the port under the lock instead —
-// see releasePortLocked — which also makes "Remove frees the port" hold the
-// instant Remove returns rather than "eventually".
-//
-// onStopped runs after Stop returned, i.e. after the old listener is really
-// closed and its port is reclaimable at the OS level. Releasing a reservation
-// before that point would let the guard advertise a port the kernel still has
-// bound, and the next Apply would fail its bind on a port the map says is free.
-// It is nil on the teardown paths that release under the lock themselves.
-func (m *TunnelManager) stopEntry(e *entry) {
-	m.stopEntryAsync(e, nil)
-}
-
-// stopEntryAsync is stopEntry with a post-stop hook. Caller must not hold m.mu
-// (Stop blocks for drainTimeout); onStopped is invoked from the goroutine, after
-// Stop returned. A nil hook is the plain "Stop and log" case.
+// stopEntryAsync starts teardown without blocking the manager lock. Paths that
+// registered a stopping note supply its matching completion hook; an already
+// stopped same-binding replacement supplies nil and cannot clear another note.
 func (m *TunnelManager) stopEntryAsync(e *entry, onStopped func()) {
 	// 注意：**不在这里加锁**。调用方可能仍持有 m.mu（applyLocked 的 defer 就是这种情形），
 	// 同步取锁会直接死锁（实测把整个套件挂住 30s+）。"正在关闭"的登记由**持锁的改动路径**
@@ -613,11 +795,6 @@ func (m *TunnelManager) stopEntryAsync(e *entry, onStopped func()) {
 			// Fall through anyway: the forwarder is out of the registry, so
 			// the port is ours to keep or free whatever Stop managed to do.
 		}
-		// Stop 返回 = 监听已关 = 端口真的可以再分配：清掉"正在关闭"标记并按事实重建守卫。
-		m.mu.Lock()
-		m.clearStoppingLocked(e.cfg)
-		m.rebuildPortGuardLocked()
-		m.mu.Unlock()
 		if onStopped != nil {
 			onStopped()
 		}
@@ -640,12 +817,10 @@ func (m *TunnelManager) releasePortAfterStop(cfg forwarder.TunnelConfig) func() 
 	return func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		for _, e := range m.tunnels {
-			if e.cfg.ID != cfg.ID && e.cfg.ListenPort() == cfg.ListenPort() {
-				return
-			}
-		}
-		m.releasePortLocked(cfg)
+		m.clearStoppingLocked(cfg)
+		// Rebuild instead of deleting a key: a late teardown may have the
+		// same ID and scope as a newer runtime, or share its numeric port.
+		m.rebuildPortGuardLocked()
 	}
 }
 
@@ -674,6 +849,31 @@ func (m *TunnelManager) RemoveAtRevision(id string, revision int64) error {
 	return err
 }
 
+// RemoveAtRevisionAndWait is the acknowledged control-plane deletion. Registry
+// removal/fencing happens immediately, but success requires actual Stop and
+// guard release. Waiting never holds m.mu and is bounded by the caller's context.
+func (m *TunnelManager) RemoveAtRevisionAndWait(ctx context.Context, id string, revision int64) error {
+	before := m.fingerprint()
+	removed, pending, err := m.removeInnerIfWithCompletion(id, nil, revision)
+	if err != nil {
+		return err
+	}
+	if removed {
+		m.notifyIfChanged(before)
+	}
+	for _, stop := range pending {
+		select {
+		case <-stop.done:
+			if stop.err != nil {
+				return stop.err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 // RemoveIf removes a tunnel only while cond still holds for its live config.
 //
 // Lease-clock removals are intentionally unversioned: they are local safety
@@ -699,38 +899,99 @@ func (m *TunnelManager) removeInnerIf(
 	cond func(forwarder.TunnelConfig) bool,
 	revision int64,
 ) (bool, error) {
+	removed, _, err := m.removeInnerIfWithCompletion(id, cond, revision)
+	return removed, err
+}
+
+func (m *TunnelManager) removeInnerIfWithCompletion(
+	id string,
+	cond func(forwarder.TunnelConfig) bool,
+	revision int64,
+) (bool, []*removal, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending := append([]*removal(nil), m.removals[id]...)
+	for _, stop := range pending {
+		if isStale(revision, stop.entry.cfg.Revision) {
+			return false, nil, ErrStaleRevision
+		}
+	}
 	e, ok := m.tunnels[id]
 	if !ok {
 		if revision != revisionUnknown && revision > m.removedRevision[id] {
 			m.removedRevision[id] = revision
 		}
-		m.mu.Unlock()
-		return false, nil
+		// Retry a previously failed Stop; an in-flight Stop is only joined.
+		for i, stop := range pending {
+			select {
+			case <-stop.done:
+				if stop.err != nil {
+					m.forgetRemovalLocked(id, stop)
+					pending[i] = m.startRemovalLocked(stop.entry)
+				}
+			default:
+			}
+		}
+		return false, pending, nil
 	}
 	if cond != nil && !cond(e.cfg) {
 		// The tunnel changed under us (renewed or replaced): leave it alone.
-		m.mu.Unlock()
-		return false, nil
+		return false, nil, nil
 	}
 	if revision != revisionUnknown &&
 		e.cfg.Revision != revisionUnknown &&
 		revision < e.cfg.Revision {
-		m.mu.Unlock()
-		return false, ErrStaleRevision
+		return false, nil, ErrStaleRevision
 	}
 	delete(m.tunnels, id)
 	if revision != revisionUnknown && revision > m.removedRevision[id] {
 		m.removedRevision[id] = revision
 	}
-	m.releasePortLocked(e.cfg)
-	// Remove means the listener is no longer part of desired local runtime.
-	// Rebuild the derived port guard immediately, exactly as the legacy path did.
+	// Keep this scope reserved until Stop really releases the socket. Desired
+	// deletion and the revision tombstone still take effect immediately.
+	m.noteStoppingLocked(e.cfg)
 	m.rebuildPortGuardLocked()
-	m.mu.Unlock()
+	pending = append(pending, m.startRemovalLocked(e))
+	return true, pending, nil
+}
 
-	m.stopEntry(e)
-	return true, nil
+// Caller holds m.mu; the Stop and all completion waits run outside it.
+func (m *TunnelManager) startRemovalLocked(e *entry) *removal {
+	stop := &removal{entry: e, done: make(chan struct{})}
+	m.removals[e.cfg.ID] = append(m.removals[e.cfg.ID], stop)
+	go func() {
+		err := e.fwd.Stop()
+		m.mu.Lock()
+		stop.err = err
+		if err == nil {
+			m.clearStoppingLocked(e.cfg)
+			m.forgetRemovalLocked(e.cfg.ID, stop)
+		}
+		m.rebuildPortGuardLocked()
+		close(stop.done)
+		m.mu.Unlock()
+		if err != nil {
+			logx.Warn("tunnel stop failed", "id", e.cfg.ID, "err", err.Error())
+		} else {
+			logx.Info("tunnel removed", "id", e.cfg.ID, "mode", string(e.cfg.Mode), "port", e.cfg.ListenPort())
+		}
+	}()
+	return stop
+}
+
+func (m *TunnelManager) forgetRemovalLocked(id string, stop *removal) {
+	pending := m.removals[id]
+	for i, candidate := range pending {
+		if candidate == stop {
+			pending = append(pending[:i], pending[i+1:]...)
+			break
+		}
+	}
+	if len(pending) == 0 {
+		delete(m.removals, id)
+	} else {
+		m.removals[id] = pending
+	}
 }
 
 // Get returns the live cfg for a tunnel.
@@ -812,6 +1073,9 @@ func (m *TunnelManager) DatagramStats(id string) (forwarder.DatagramStats, bool)
 	if !ok {
 		return forwarder.DatagramStats{}, false
 	}
+	if mixed, ok := e.fwd.(forwarder.MixedRuntime); ok {
+		return mixed.Datagram().Stats(), true
+	}
 	d, ok := e.fwd.(forwarder.DatagramRuntime)
 	if !ok {
 		return forwarder.DatagramStats{}, false
@@ -846,15 +1110,16 @@ func (m *TunnelManager) MaxRevision() int64 {
 // work is its mappings, so that is what is returned, and LiveMappings is the
 // explicit form callers should prefer when they know the transport.
 func (m *TunnelManager) LiveConns(id string) int {
-	live, ok := m.LiveMappings(id)
-	if ok {
-		return live
-	}
 	m.mu.RLock()
 	e, ok := m.tunnels[id]
 	m.mu.RUnlock()
 	if !ok {
 		return 0
+	}
+	// A mixed rule has two distinct observables. Its TCP count must not be
+	// replaced by the UDP count just because LiveMappings is also available.
+	if d, ok := e.fwd.(forwarder.DatagramRuntime); ok {
+		return d.LiveMappings() // Preserve the legacy UDP-only API convention.
 	}
 	type counter interface{ LiveConns() int }
 	if c, ok := e.fwd.(counter); ok {
@@ -872,6 +1137,9 @@ func (m *TunnelManager) LiveMappings(id string) (int, bool) {
 	m.mu.RUnlock()
 	if !ok {
 		return 0, false
+	}
+	if mixed, ok := e.fwd.(forwarder.MixedRuntime); ok {
+		return mixed.Datagram().LiveMappings(), true
 	}
 	d, ok := e.fwd.(forwarder.DatagramRuntime)
 	if !ok {
@@ -908,21 +1176,16 @@ func (m *TunnelManager) StopAll() {
 
 // UsedPorts returns a copy of the shared port guard (for /health and tests).
 //
-// The flat number set is still the correct answer to "is this port really bound
-// on this node" because §5.2 freezes the one-number-one-binding rule: TCP and UDP
-// may not share a number here, so a number present in either namespace means the
-// same thing. What the flat view cannot say is WHICH protocol owns it — a caller
-// that needs that (or the reporter projection that has to stop flattening two
-// namespaces) reads UsedPortsByProtocol instead; neither view lies about the
-// other.
+// The flat view is the union of all socket protocols and bind scopes. TCP and
+// UDP can share a number; callers needing that distinction use the protocol view.
 func (m *TunnelManager) UsedPorts() map[int]bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rebuildPortGuardLocked()
 	out := make(map[int]bool, len(m.usedPort))
 	for k := range m.usedPort {
-		namespace, port := splitPortGuardKey(k)
+		_, port := splitPortGuardKey(k)
 		if port > 0 {
-			_ = namespace
 			out[port] = true
 		}
 	}
@@ -933,8 +1196,9 @@ func (m *TunnelManager) UsedPorts() map[int]bool {
 // "udp"), the protocol-dimension view of the same facts (§5.3: the namespaces
 // must be preserved somewhere, not flattened away everywhere).
 func (m *TunnelManager) UsedPortsByProtocol() map[string]map[int]bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rebuildPortGuardLocked()
 	out := map[string]map[int]bool{"tcp": {}, "udp": {}}
 	for k := range m.usedPort {
 		namespace, port := splitPortGuardKey(k)
@@ -950,19 +1214,15 @@ func (m *TunnelManager) UsedPortsByProtocol() map[string]map[int]bool {
 	return out
 }
 
-// splitPortGuardKey parses a "tcp:<port>" / "udp:<port>" guard key. An
+// splitPortGuardKey parses a protocol:port@scope (or legacy protocol:port) key. An
 // unparseable key returns a zero port, which every caller treats as "not a
 // binding" rather than as port 0 being taken.
 func splitPortGuardKey(key string) (namespace string, port int) {
-	namespace, portStr, ok := strings.Cut(key, ":")
+	binding, ok := portlease.ParseKey(key)
 	if !ok {
 		return "", 0
 	}
-	p, err := strconv.Atoi(portStr)
-	if err != nil {
-		return "", 0
-	}
-	return namespace + ":", p
+	return binding.Network + ":", binding.Port
 }
 
 // SetTargetDialer installs the dialer EGRESS pools use for their upstreams.

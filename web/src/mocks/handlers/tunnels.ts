@@ -106,7 +106,7 @@ export async function handleTunnelsMock(ctx: rt.MockAuthedRouteContext): Promise
             : "direct";
       const relay = mode === "relay";
 
-      const tunnelType = (reqStr(body.tunnel_type) || "tcp") as Tunnel["tunnel_type"];
+      const tunnelType = (reqStr(body.tunnel_type) || "tcp") as NonNullable<Tunnel["tunnel_type"]>;
       const newId = nextId(db.tunnels);
 
       // forward 目标只在 DIRECT 下必填；RELAY 的目标在 EgressTarget 上（池内），
@@ -230,12 +230,14 @@ export async function handleTunnelsMock(ctx: rt.MockAuthedRouteContext): Promise
             : parseList(body.forward_addresses) ?? [];
           if (forward.length === 0) return badRequest("至少需要一个转发目标");
           t.forward_addresses = forward;
-          t.forward_addresses_protocol = forward.map(() => t.tunnel_type);
+          const legacy = t.tunnel_type;
+          t.forward_addresses_protocol = legacy === null ? null : forward.map(() => legacy);
         }
         if (body.tunnel_type !== undefined) {
-          t.tunnel_type = reqStr(body.tunnel_type) as Tunnel["tunnel_type"];
-          t.listen_protocol = [t.tunnel_type];
-          t.forward_addresses_protocol = t.forward_addresses.map(() => t.tunnel_type);
+          const legacy = reqStr(body.tunnel_type) as NonNullable<Tunnel["tunnel_type"]>;
+          t.tunnel_type = legacy;
+          t.listen_protocol = [legacy];
+          t.forward_addresses_protocol = t.forward_addresses.map(() => legacy);
         }
         if (body.load_balance_type !== undefined) t.load_balance_type = reqStr(body.load_balance_type) as Tunnel["load_balance_type"];
         if (body.ip_type !== undefined) t.ip_type = reqStr(body.ip_type) as Tunnel["ip_type"];

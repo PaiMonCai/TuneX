@@ -34,6 +34,8 @@
  * mock.module**（那个会随 worktree / CI 路径静默打歪）。
  */
 import type { LifecycleConditionCode, NodeImpact } from "./node-lifecycle.ts";
+import { capabilityFactsFromStoredV2, type CapabilityManifestRow } from "./capability-manifest.ts";
+import { admitSelectorFromStore, type SelectorAdmissionReason } from "./selector-admission.ts";
 
 /* ================================================================== */
 /* 常量                                                                */
@@ -48,7 +50,7 @@ export const EGRESS_STATUSES = ["active", "inactive"] as const;
 export type EgressStatusValue = (typeof EGRESS_STATUSES)[number];
 
 /** 负载均衡策略（schema `enum LBStrategy`）。 */
-export const LB_STRATEGIES = ["round", "rand", "weighted_round"] as const;
+export const LB_STRATEGIES = ["round", "rand", "weighted_round", "fallback", "ip_hash"] as const;
 export type LbStrategyValue = (typeof LB_STRATEGIES)[number];
 
 /** 每个出口节点自动维护的默认池名（schema `EgressPool` 注释）。 */
@@ -107,7 +109,8 @@ export interface NodeAdminError {
    * `GET /api/admin/node/:id/impact` 预检的 `role_check.condition` **同源**
    * （同一个 {@link checkRoleChange} 返回的 condition 原样透传）。
    */
-  condition?: LifecycleConditionCode;
+  condition?: LifecycleConditionCode | SelectorAdmissionReason;
+  error_layer?: "runtime_admission";
   /** 被拒时的依赖清单（与 impact 预检同一形状），Web 可直接渲染「要清什么」。 */
   dependencies?: NodeImpact;
 }
@@ -165,6 +168,7 @@ export interface StateReportRow {
   control_protocol_version?: number | null;
   /** V4-WP11B：Agent 上报的能力清单（null = 未上报；数组 = 已上报）。 */
   capabilities?: unknown;
+  capability_manifest?: unknown;
 }
 
 export interface EgressPoolRow {
@@ -253,6 +257,30 @@ export interface NodeAdminDeps {
   db?: NodeAdminDb;
   /** 覆盖「陈旧」判定用的当前时间（测试注入）。 */
   now?: () => Date;
+}
+
+/** Egress policies have no original client-IP source, including inherited defaults. */
+export async function guardEgressSelector(
+  pd: NodeAdminDb,
+  nodeId: number,
+  strategy: unknown,
+): Promise<NodeAdminError | null> {
+  const decision = await admitSelectorFromStore(nodeId, { strategy, mode: "EGRESS" }, async (id) => {
+    const row = asRow<CapabilityManifestRow & { node?: { credential_rotated_at?: Date | null } | null }>(
+      await pd.nodeStateReport.findUnique({
+        where: { node_id: id },
+        select: {
+          control_protocol_version: true, capabilities: true, capability_manifest: true, reported_at: true,
+          node: { select: { credential_rotated_at: true } },
+        },
+      }),
+    );
+    return row ? capabilityFactsFromStoredV2({ ...row, credential_rotated_at: row.node?.credential_rotated_at }) : null;
+  });
+  return decision.ok ? null : {
+    ok: false, code: "invalid_state", message: decision.detail,
+    condition: decision.reason, error_layer: decision.error_layer,
+  };
 }
 
 /**
@@ -362,11 +390,11 @@ export function parsePortRange(min: unknown, max: unknown): ParseResult<{ min: n
 
 export function parseLbStrategy(input: unknown): ParseResult<LbStrategyValue | null> {
   if (input === null || input === undefined || input === "") return parseOk(null);
-  if (typeof input !== "string") return parseFail("负载均衡策略必须是 round / rand");
+  if (typeof input !== "string") return parseFail("负载均衡策略必须是 round / rand / weighted_round / fallback / ip_hash");
   const v = input.trim().toLowerCase();
   if (v === "") return parseOk(null);
   if ((LB_STRATEGIES as readonly string[]).includes(v)) return parseOk(v as LbStrategyValue);
-  return parseFail("负载均衡策略必须是 round / rand");
+  return parseFail("负载均衡策略必须是 round / rand / weighted_round / fallback / ip_hash");
 }
 
 export function parseEgressStatus(input: unknown): ParseResult<EgressStatusValue> {

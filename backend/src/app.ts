@@ -38,6 +38,7 @@ import { dashboardRoutes } from "./routes/dashboard.ts";
 import { meRoutes } from "./routes/me.ts";
 import { tunnelsRoutes } from "./routes/tunnels.ts";
 import { forwardsRoutes } from "./routes/forwards.ts";
+import { linksRoutes } from "./routes/links.ts";
 import { ddnsRoutes } from "./routes/ddns.ts";
 // User/workspace announcements and the Admin announcement surface share the same backend truth.
 import { announcementRoutes } from "./routes/announcements.ts";
@@ -171,6 +172,7 @@ export function createApp() {
   app.route("/api/me", meRoutes);
   app.route("/api/tunnels", tunnelsRoutes);
   app.route("/api/forwards", forwardsRoutes);
+  app.route("/api/links", linksRoutes);
   app.route("/api/ddns", ddnsRoutes);
   app.route("/api/workspaces", workspaceRoutes);
   app.route("/api/workspaces", workspaceRolesRoutes);

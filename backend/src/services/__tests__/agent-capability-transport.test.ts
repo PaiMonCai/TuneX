@@ -7,6 +7,7 @@
  * 为网络问题）。
  */
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { OutboundAgentTransport, type CommandBusStore } from "../agent-command-bus.ts";
 import type { AgentV2CapabilityFacts } from "../runtime-admission.ts";
 
@@ -108,17 +109,47 @@ describe("WP11B outbound capability gate", () => {
     expect(writes).toEqual([]);
   });
 
-  test("an explicitly advertised action passes the gate (no refusal, queueing begins)", async () => {
-    const { transport } = transportFor(v2Facts({ capabilities: ["apply_tunnel"], protocolVersion: 1 }));
-    // The gate lets it through; the next step needs a database for the node
-    // scope, so any error from here on must NOT be a capability refusal.
-    const failure = await transport
-      .applyDirect(node, config, envelope)
-      .then(() => null)
-      .catch((error: unknown) => error as Error);
-    if (failure) {
-      expect(failure.message).not.toMatch(/未上报控制协议能力|未实现/);
-    }
+  test("an explicitly advertised action queues and consumes a matching ACK", () => {
+    // The positive path reaches scope lookup AND waits for an Agent ACK. A
+    // store that never answers cannot prove admission by catching any error.
+    const scenario = `
+      import { mock } from "bun:test";
+      import assert from "node:assert/strict";
+      mock.module("ioredis", () => ({ default: class { on() { return this; } } }));
+      let scopeReads = 0;
+      mock.module(${JSON.stringify(fileURLToPath(new URL("../../db.ts", import.meta.url)))}, () => ({ db: {
+        node: { findUnique: async () => { scopeReads++; return { node_group: { workspace_id: 1 } }; } },
+      } }));
+      const { OutboundAgentTransport } = await import(${JSON.stringify(fileURLToPath(new URL("../agent-command-bus.ts", import.meta.url)))});
+      const ledger = new Map();
+      let queued;
+      const store = {
+        get: async (key) => ledger.get(key) ?? null,
+        del: async (key) => ledger.delete(key),
+        set: async (key, value) => { ledger.set(key, value); },
+        setIfAbsent: async (key, value) => { ledger.set(key, value); return "OK"; },
+        shift: async () => null,
+        push: async (key, value) => {
+          queued = JSON.parse(value);
+          ledger.set(key.replace(/:queue$/, ":ack:" + queued.envelope.command_id),
+            JSON.stringify({ command_id: queued.envelope.command_id, ok: true, applied_revision: 3 }));
+        },
+      };
+      const facts = ${JSON.stringify(v2Facts({ capabilities: ["apply_tunnel"], protocolVersion: 1 }))};
+      const transport = new OutboundAgentTransport(async () => facts, store);
+      assert.deepEqual(await transport.applyDirect(${JSON.stringify(node)}, ${JSON.stringify(config)}, ${JSON.stringify(envelope)}),
+        { ok: true, applied_revision: 3 });
+      assert.equal(scopeReads, 1);
+      assert.equal(queued.envelope.command_id, "cmd-1");
+      assert.equal(queued.envelope.action, "apply_tunnel");
+      assert.equal(ledger.size, 0, "the matching ACK and pending record were consumed");
+      console.log("capability-admission-ack-ok");
+    `;
+    const child = Bun.spawnSync([process.execPath, "--eval", scenario], {
+      stdout: "pipe", stderr: "pipe", timeout: 5000,
+    });
+    expect(child.exitCode, new TextDecoder().decode(child.stderr)).toBe(0);
+    expect(new TextDecoder().decode(child.stdout)).toContain("capability-admission-ack-ok");
   });
 
   test("unparseable stored capabilities are refused instead of degrading to baseline", async () => {

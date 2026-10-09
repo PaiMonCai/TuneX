@@ -106,6 +106,7 @@ import type {
   WorkspaceTrafficSummary,
 } from "../types";
 import { normalizeHealthSummary } from "../node-health";
+import { projectForwardCapabilities } from "../forward-native-both";
 // 公告类型单独维护在 announcements.ts。
 import type { Announcement } from "../announcements";
 // 目标健康状态与理由码在 target-health.ts 维护。
@@ -422,6 +423,8 @@ export interface ForwardThroughputResponse {
 }
 
 export const forwardsApi = {
+    capabilities: async (cookie?: string) =>
+      projectForwardCapabilities(await get<unknown>("/forwards/capabilities", undefined, cookie)),
     summary: (cookie?: string) =>
       get<ForwardSummary>("/forwards/summary", undefined, cookie),
     /**

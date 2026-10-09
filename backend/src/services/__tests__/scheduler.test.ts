@@ -1,6 +1,8 @@
 import { test, expect, describe, beforeEach } from "bun:test";
 import type { EffectivePolicy } from "../capability-policy.ts";
 import type { AgentV2CapabilityFacts as AgentV2Facts } from "../capability-manifest.ts";
+import type { LbStrategyValue } from "../node-admin-core.ts";
+import { SELECTOR_RUNTIME_CAPABILITIES } from "../selector-admission.ts";
 import { forwardRuntimePlanViolations } from "../forward-contract.ts";
 
 /**
@@ -73,7 +75,7 @@ interface NodeRow {
   connect_ip: string | null;
   port_range_min: number | null;
   port_range_max: number | null;
-  lb_strategy: "round" | "rand" | "weighted_round" | null;
+  lb_strategy: LbStrategyValue | null;
   status: "active" | "inactive";
   last_seen_at: Date | null;
   node_group_id: number;
@@ -95,7 +97,7 @@ interface EgressPoolRow {
   id: number;
   node_id: number;
   name: string;
-  lb_strategy: "round" | "rand" | "weighted_round" | null;
+  lb_strategy: LbStrategyValue | null;
   status: "active" | "inactive";
 }
 
@@ -113,6 +115,8 @@ interface LeaseRow {
   id: number;
   node_id: number;
   port: number;
+  protocol?: string;
+  bind_scope?: string;
   tunnel_id: number | null;
   lease_type: "ingress" | "egress";
   status: "active" | "released";
@@ -157,6 +161,18 @@ function rowOrNull<T extends { id: number }>(t: T | null): T | null {
  */
 function makeDb() {
   return {
+    async $queryRawUnsafe(query: string, ..._values: unknown[]): Promise<unknown> {
+      expect(query).toContain("FOR UPDATE");
+      expect(query).toContain("node_id = ? AND port = ?");
+      return [];
+    },
+    async $transaction<T>(
+      run: (tx: import("../portPool.ts").PortPoolTransaction) => Promise<T>,
+      options: { isolationLevel: string },
+    ): Promise<T> {
+      expect(options.isolationLevel).toBe("Serializable");
+      return run(makeDb() as unknown as import("../portPool.ts").PortPoolTransaction);
+    },
     tunnel: {
       async create({ data }: { data: Partial<TunnelRow> }) {
         const t: TunnelRow = {
@@ -262,7 +278,8 @@ function makeDb() {
     /* WP3 portPool 通过注入的 deps 使用，不从这里走（见 makePortPoolDeps）。 */
     nodePortLease: {
       async create({ data }: { data: Partial<LeaseRow> }) {
-        const clash = leases.find((l) => l.node_id === data.node_id && l.port === data.port);
+        const clash = leases.find((l) => l.node_id === data.node_id && l.port === data.port &&
+          (l.protocol ?? "tcp") === (data.protocol ?? "tcp") && (l.bind_scope ?? "*") === (data.bind_scope ?? "*"));
         if (clash) {
           const e = new Error("Unique constraint failed on the fields: (`node_id`,`port`)");
           (e as Error & { code: string }).code = "P2002";
@@ -272,6 +289,8 @@ function makeDb() {
           id: nextId++,
           node_id: Number(data.node_id),
           port: Number(data.port),
+          protocol: data.protocol ?? "tcp",
+          bind_scope: data.bind_scope ?? "*",
           tunnel_id: (data.tunnel_id as number | null) ?? null,
           lease_type: (data.lease_type as LeaseRow["lease_type"]) ?? "ingress",
           status: "active",
@@ -354,6 +373,8 @@ interface RecordedApply {
 
 class FakeAgentTransport {
   readonly applies: RecordedApply[] = [];
+  enforceRemovalFences = false;
+  readonly removedRevisions = new Map<string, number>();
   /** 注入失败：下一次 apply 的 kind → 失败模式。 */
   failNext: {
     kind: "direct" | "egress" | "relay" | "remove";
@@ -371,7 +392,7 @@ class FakeAgentTransport {
   async applyDirect(node: { id: number }, config: Record<string, unknown>) {
     return this.record("direct", node, config);
   }
-  async removeTunnel(node: { id: number }, tunnelId: string) {
+  async removeTunnel(node: { id: number }, tunnelId: string, envelope?: { revision: number }) {
     this.applies.push({ kind: "remove", nodeId: node.id, config: { tunnelId } });
     const script = this.takeFailure("remove");
     if (script) {
@@ -380,6 +401,7 @@ class FakeAgentTransport {
       throw new AgentTransportErrorLike(code, `agent ${node.id} failed remove`);
     }
     // remove 的补偿必须幂等：假 Agent 对未知 id 也报 ok（与 WP4 一致）。
+    if (this.enforceRemovalFences) this.removedRevisions.set(`${node.id}:${tunnelId}`, envelope?.revision ?? 0);
     return { ok: true, id: tunnelId };
   }
   async isReachable() {
@@ -402,6 +424,9 @@ class FakeAgentTransport {
         return { ok: false, error: "revision mismatch" };
       }
       throw new AgentTransportErrorLike("agent_rejected", `agent ${node.id} rejected apply`);
+    }
+    if (this.enforceRemovalFences && Number(config.revision) <= (this.removedRevisions.get(`${node.id}:${config.id}`) ?? 0)) {
+      throw new AgentTransportErrorLike("agent_rejected", "stale_revision: removal tombstone");
     }
     return { ok: true, revision: Number(config.revision ?? 0) };
   }
@@ -604,6 +629,7 @@ beforeEach(async () => {
   orchestratorModule = orchestratorModule ?? (await import("../orchestrator.ts"));
   orch = new orchestratorModule.Orchestrator({
     transport: fakeAgent as never,
+    loadCapabilityFacts: async (nodeId: number) => capabilityFacts.get(nodeId) ?? null,
   });
   deps = {
     db: makeDb() as unknown as NonNullable<typeof deps>["db"],
@@ -617,13 +643,31 @@ beforeEach(async () => {
     loadCapabilityFacts: async (nodeId: number) => capabilityFacts.get(nodeId) ?? null,
     now: () => NOW,
     validator: (orch as unknown as { validator: never }).validator,
-    portPoolDeps: { db: makeDb(), redis: makeRedis() } as unknown as NonNullable<typeof deps>["portPoolDeps"],
+    portPoolDeps: { db: makeDb(), redis: makeRedis(), agentUsedPorts: async () => [] } as unknown as NonNullable<typeof deps>["portPoolDeps"],
   };
 });
 
 /* ================================================================== */
 /* A. 编排顺序（§7.11）                                                 */
 /* ================================================================== */
+
+for (const mode of ["direct", "relay"] as const) {
+  test(`${mode} failed apply cleanup fences the failed generation, not the next normal retry`, async () => {
+    fakeAgent.enforceRemovalFences = true;
+    const existing = seedTunnel({ tunnel_mode: mode, config_revision: 0, applied_revision: null,
+      listen_port: 20005, apply_status: "error", desired_status: "inactive",
+      ...(mode === "direct" ? { out_node_group_id: null, egress_node_id: null, egress_pool_id: null,
+        remote_host: "127.0.0.1", remote_port: 8080 } : {}) });
+    tunnels.push(existing);
+    fakeAgent.failNext = { kind: mode === "direct" ? "direct" : "relay", mode: "reject" };
+    const reapply = mode === "direct" ? scheduler.reapplyDirectTunnel : scheduler.reapplyRelayTunnel;
+    expect((await reapply(existing.id, orch, deps)).ok).toBe(false);
+    expect(fakeAgent.removedRevisions.size).toBeGreaterThan(0);
+    const result = await reapply(existing.id, orch, deps);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(existing.applied_revision).toBeGreaterThan(Math.max(...fakeAgent.removedRevisions.values()));
+  });
+}
 
 describe("A. 编排顺序（§7.11 十条步骤）", () => {
   test("A1. 成功路径：十条步骤全部 ok，顺序与 §7.11 逐条对应", async () => {
@@ -883,18 +927,19 @@ describe("B. 失败补偿", () => {
     expect(active).toEqual([]);
   });
 
-  test("B6. 补偿用 revision+1：Agent 侧闸门放行（失败那次可能已推进版本）", async () => {
+  test("B6. 补偿撤失败 revision 本身：封住迟到 apply，不封死下一次重试", async () => {
+    fakeAgent.enforceRemovalFences = true;
     fakeAgent.failNext = { kind: "relay", mode: "reject" };
     const result = await scheduler.createRelayTunnel(input(), orch, deps);
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    // remove 信封的 revision 必须比失败的那次高 1，否则会被判 stale 撤不掉。
+    // Agent accepts removing the current generation, then rejects apply <= it.
     const removeCall = fakeAgent.applies.find((a) => a.kind === "remove")!;
     expect(removeCall.config).toBeDefined();
     // revision 存在 envelope 里而不是 config 里；这里断言编排记录的 meta。
     const applyStep = result.steps.find((s) => s.step === "apply_egress")!;
     expect(applyStep.meta!.revision).toBe(1); // 失败在 revision 1
-    // 补偿的 revision = 2（见 orchestrator.removeTunnel 入参）。
+    expect([...fakeAgent.removedRevisions.values()]).toEqual([1, 1]);
     expect(result.steps.find((s) => s.step === "bump_revision")!.meta!.revision).toBe(1);
   });
 
@@ -952,7 +997,7 @@ describe("B. 失败补偿", () => {
   });
 
   test("B11b. fail helper 必须 await persistFailure，禁止 fire-and-forget 终态", async () => {
-    const code = await Bun.file(new URL("../scheduler.ts", import.meta.url).pathname).text();
+    const code = await Bun.file(new URL("../scheduler.ts", import.meta.url)).text();
     expect(code).not.toContain("void persistFailure(");
     expect(code).not.toContain("persistFailure(store, tunnelId, { code, detail, revision: ctx.revision }).catch");
   });
@@ -1940,5 +1985,56 @@ describe("K. weighted_round policy survives every scheduler delivery path", () =
     const egress = fakeAgent.applies.find((apply) => apply.kind === "egress");
     expect(egress?.config?.lb_strategy).toBe("WEIGHTED_ROUND_ROBIN");
     expect(egress?.config?.revision).toBe(5);
+  });
+});
+
+describe("D. selector admission covers create and retry before allocation", () => {
+  const selectorFacts: AgentV2Facts = {
+    protocolVersion: 2, capabilities: ["apply_tunnel", "remove_tunnel"], capabilitiesMalformed: false, manifestMalformed: false,
+    manifest: { schema_version: 2, protocols: ["tcp"], transports: ["stream"], runtime: [SELECTOR_RUNTIME_CAPABILITIES.fallback], diagnostics: [] },
+  };
+  for (const inherited of [false, true]) {
+    test(`IP_HASH ${inherited ? "node inheritance" : "pool override"} is refused before ports or commands`, async () => {
+      pools[0]!.lb_strategy = inherited ? null : "ip_hash";
+      nodes[1]!.lb_strategy = inherited ? "ip_hash" : "round";
+      const result = await scheduler.createRelayTunnel(input(), orch, deps);
+      expect(result).toMatchObject({ ok: false, error_code: scheduler.SCHEDULER_ERROR_CODES.runtime_capability_denied });
+      if (!result.ok) expect(result.error).toContain("selector_client_ip_required");
+      expect(leases).toHaveLength(0);
+      expect(fakeAgent.applies).toHaveLength(0);
+    });
+  }
+
+  test("retry rejects an inherited IP_HASH policy without advancing revision or allocating ports", async () => {
+    pools[0]!.lb_strategy = null;
+    nodes[1]!.lb_strategy = "ip_hash";
+    const existing = seedTunnel({ config_revision: 4, applied_revision: 3 });
+    tunnels.push(existing);
+    const result = await scheduler.reapplyRelayTunnel(existing.id, orch, deps);
+    expect(result.ok).toBe(false);
+    expect(existing.config_revision).toBe(4);
+    expect(leases).toHaveLength(0);
+    expect(fakeAgent.applies).toHaveLength(0);
+  });
+
+  test("fallback without capability is refused before allocation", async () => {
+    pools[0]!.lb_strategy = "fallback";
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(false);
+    expect(leases).toHaveLength(0);
+    expect(fakeAgent.applies).toHaveLength(0);
+  });
+
+  test("advertised fallback survives node inheritance, create and retry", async () => {
+    nodes[1]!.lb_strategy = "fallback";
+    pools[0]!.lb_strategy = null;
+    capabilityFacts.set(2, selectorFacts);
+    const result = await scheduler.createRelayTunnel(input(), orch, deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(fakeAgent.applies.find((a) => a.kind === "egress")?.config?.lb_strategy).toBe("FALLBACK");
+    fakeAgent.applies.length = 0;
+    expect((await scheduler.reapplyRelayTunnel(result.tunnelId, orch, deps)).ok).toBe(true);
+    expect(fakeAgent.applies.find((a) => a.kind === "egress")?.config?.lb_strategy).toBe("FALLBACK");
   });
 });

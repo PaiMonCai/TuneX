@@ -8,6 +8,26 @@
  */
 import { Orchestrator } from "./orchestrator.ts";
 import { OutboundAgentTransport } from "./agent-command-bus.ts";
+import { db } from "../db.ts";
+import { getEffectivePolicy } from "./policy-service.ts";
+import type { ForwardPolicySource } from "./orchestrator.ts";
+
+/** One revision request, intersected at delivery time; never persist effective caps. */
+export const loadForwardPolicyForDispatch: ForwardPolicySource = async (tunnelId, revision) => {
+  const row = await db.tunnel.findUnique({
+    where: { id: tunnelId },
+    select: { workspace_id: true, config_revision: true, bytes_per_second_in: true,
+      bytes_per_second_out: true, max_connections: true, max_connections_per_ip: true },
+  });
+  if (!row) throw new Error("Forward policy source not found");
+  const snapshot = await db.forwardRevision.findUnique({
+    where: { tunnel_id_revision: { tunnel_id: tunnelId, revision } },
+    select: { bytes_per_second_in: true, bytes_per_second_out: true, max_connections: true, max_connections_per_ip: true },
+  });
+  if (!snapshot && row.config_revision !== revision) throw new Error("Forward policy revision not found");
+  const fresh = await getEffectivePolicy(row.workspace_id, { noCache: true });
+  return { requested: snapshot ?? row, workspace: fresh.limits };
+};
 
 let singleton: Orchestrator | null = null;
 let wiringError: string | null = null;
@@ -18,6 +38,7 @@ export function getOrchestrator(): Orchestrator | null {
   try {
     singleton = new Orchestrator({
       transport: new OutboundAgentTransport(),
+      loadForwardPolicy: loadForwardPolicyForDispatch,
       // Transport reachability is proven by ACK; do not probe Agent inbound.
       probeReachable: false,
     });

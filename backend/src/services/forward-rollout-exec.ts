@@ -9,16 +9,23 @@
 
 import { acquirePort, releaseLease } from "./portPool.ts";
 import type { AcquirePortOutcome } from "./portPool.ts";
+import { leaseProtocol, normalizeBindScope } from "../integrations/forwardx/bind-scope.ts";
 import { Orchestrator } from "./orchestrator.ts";
 import { ACTIVE_ROLLOUT_PHASES, planRollout, ROLLOUT_STAGE_SEQUENCE, rolloutStepKey } from "./forward-rollout.ts";
 import {
   dispatchFactsFromRow,
   persistedForwardProtocol,
+  normalizeForwardProtocol,
+  legacyTunnelTypeColumn,
   type DispatchFacts,
 } from "./forward-contract.ts";
 import type { PlanRolloutInput, RolloutPlan, RolloutSnapshot, RolloutStep } from "./forward-rollout.ts";
 import { admitRoute } from "./forward-route.ts";
 import type { RuntimeUseDenied, RuntimeUseResource } from "./forward-capability.ts";
+import { admitRuntimeFromStore } from "./runtime-admission.ts";
+import { nativeBothShapeError } from "./forward-native-both.ts";
+import { forwardPolicyValues } from "./forward-policy.ts";
+import type { ForwardPolicyInput } from "./forward-policy.ts";
 // 远端出口腿的委托。编排只调这里的入口 —— 签名/重试/幂等键/镜像行
 // 全部有且只有一个实现（`federation/forward-hop.ts`），rollout 不再自己拼一遍。
 import {
@@ -43,7 +50,10 @@ export type { RuntimeUseChecker, RolloutStatus, RolloutExecContext, PreparedReso
 /* ================================================================== */
 
 /** tunnel 行里 register 需要的投影。 */
-interface TunnelProjection {
+interface TunnelProjection extends ForwardPolicyInput {
+  forward_protocol?: string | null;
+  tls_cert_path?: string | null;
+  tls_key_path?: string | null;
   id: number;
   name: string;
   tunnel_mode: string;
@@ -144,6 +154,12 @@ async function loadRolloutNodes(
   })) as Array<Record<string, unknown>>;
 
   const snapshotToRollout = (s: Record<string, unknown>): FederatedRolloutSnapshot => ({
+    ...forwardPolicyValues(s),
+    protocol: persistedForwardProtocol(s.protocol ?? row.forward_protocol),
+    // Legacy revision rows have no TLS columns; paths remain node-local facts
+    // on Tunnel. Socket-only protocols must never inherit those paths.
+    tls_cert_path: (s.protocol ?? row.forward_protocol) === "tls" ? row.tls_cert_path ?? null : null,
+    tls_key_path: (s.protocol ?? row.forward_protocol) === "tls" ? row.tls_key_path ?? null : null,
     name: String(s.name ?? row.name),
     mode: String(s.mode ?? row.tunnel_mode) === "relay" ? "relay" : "direct",
     ingress_node_id: Number(s.ingress_node_id ?? row.ingress_node_id ?? 0),
@@ -172,6 +188,8 @@ async function loadRolloutNodes(
   const desired: FederatedRolloutSnapshot = desiredRow
     ? snapshotToRollout(desiredRow)
     : {
+        ...forwardPolicyValues(row),
+        protocol: persistedForwardProtocol(row.forward_protocol),
         name: row.name,
         mode: row.tunnel_mode === "relay" ? "relay" : "direct",
         ingress_node_id: row.ingress_node_id ?? 0,
@@ -340,14 +358,26 @@ async function rolloutRuntimeDenial(
       (!federatedEgress && desired.mode === "relay" && !validId(egress?.node_group_id))) {
     return { code: "forbidden", reason: "scope_revoked", error_layer: "resource_scope", message: "转发归属或候选节点组已失效，无法应用目标配置" };
   }
-  return (deps.runtimeUse ?? defaultRuntimeUse)(tunnel.workspace_id, {
+  const denied = await (deps.runtimeUse ?? defaultRuntimeUse)(tunnel.workspace_id, {
     user_id: tunnel.user_id,
     in_node_group_id: ingress.node_group_id,
     out_node_group_id: !federatedEgress && desired.mode === "relay" ? egress!.node_group_id! : null,
     // Policy checks use the canonical product protocol; the legacy DB projection
     // is only a persisted-fact fallback.
-    protocol: persistedForwardProtocol(tunnel.forward_protocol, tunnel.tunnel_type),
+    protocol: persistedForwardProtocol(desired.protocol ?? tunnel.forward_protocol, tunnel.tunnel_type),
   });
+  if (denied) return denied;
+  if (persistedForwardProtocol(desired.protocol ?? tunnel.forward_protocol, tunnel.tunnel_type) === "both") {
+    const shape = nativeBothShapeError({ ...tunnel, ...desired, forward_protocol: "both", tunnel_mode: desired.mode,
+      lb_strategy: await loadEgressPoolLb(deps, desired.egress_pool_id) });
+    if (shape) return { code: "policy_denied", reason: shape, error_layer: "capability", message: shape };
+    const admission = await admitRuntimeFromStore([
+      { nodeId: desired.ingress_node_id!, role: "ingress" },
+      ...(desired.mode === "relay" ? [{ nodeId: desired.egress_node_id!, role: "egress" as const }] : []),
+    ], { action: "apply_tunnel", protocol: "both" }, deps.loadCapabilityFacts);
+    if (!admission.ok) return { code: "policy_denied", reason: admission.reason, error_layer: "capability", message: admission.detail };
+  }
+  return null;
 }
 
 /* ================================================================== */
@@ -529,24 +559,31 @@ async function runStep(
           ? await existingIngressPort(deps, ctx.tunnelId)
           : null);
       const leaseType = step.direction === "egress" ? "egress" : "ingress";
+      const portProtocol = (await dispatchFactsFor(ctx.tunnelId, deps.db))?.protocol ?? null;
+      const portBindScope = step.direction === "ingress" ? ctx.desired.listen_ip : "*";
       // `AcquirePortResult.reused` 同时覆盖“已有 active lease”与“revive released row”，
       // 但失败补偿只应保留前者。先拍一张 active ownership 快照，才能区分这两种语义。
       let preexistingActiveLeaseId: number | null = null;
-      if (preferredPort != null) {
+      if (preferredPort != null || portProtocol === "both" || ctx.applied?.protocol === "both") {
         const before = (await deps.db.nodePortLease.findMany({
           where: {
             node_id: nodeId,
-            port: preferredPort,
+            ...(preferredPort != null ? { port: preferredPort } : {}),
             tunnel_id: ctx.tunnelId,
+            link_id: null,
+            bind_scope: normalizeBindScope(portBindScope),
             lease_type: leaseType,
             status: "active",
           },
-          select: { id: true, node_id: true, port: true, tunnel_id: true, lease_type: true, status: true },
+          select: { id: true, node_id: true, port: true, tunnel_id: true, link_id: true, protocol: true, bind_scope: true, lease_type: true, status: true },
         })) as Array<{
           id: number;
           node_id?: number;
           port?: number;
           tunnel_id?: number | null;
+          link_id?: number | null;
+          protocol?: string;
+          bind_scope?: string;
           lease_type?: string;
           status?: string;
         }>;
@@ -554,8 +591,11 @@ async function runStep(
           (row) =>
             row.id > 0 &&
             (row.node_id === undefined || row.node_id === nodeId) &&
-            (row.port === undefined || row.port === preferredPort) &&
+            (preferredPort == null || row.port === undefined || row.port === preferredPort) &&
             (row.tunnel_id === undefined || row.tunnel_id === ctx.tunnelId) &&
+            row.link_id == null &&
+            (row.protocol === undefined || row.protocol === leaseProtocol(portProtocol) || row.protocol === "unknown" || portProtocol === "both") &&
+            (row.bind_scope === undefined || normalizeBindScope(row.bind_scope) === normalizeBindScope(portBindScope)) &&
             (row.lease_type === undefined || row.lease_type === leaseType) &&
             (row.status === undefined || row.status === "active"),
         );
@@ -568,6 +608,10 @@ async function runStep(
           leaseType,
           preferredPort,
           tunnelId: ctx.tunnelId,
+          // Use the same actual protocol facts as dispatch. Missing facts are
+          // conservative unknown reservations, never a silent TCP fallback.
+          protocol: portProtocol,
+          bindScope: portBindScope,
           // 同上：本隧道自己的腿占着的端口不算冲突（幂等编辑/重试/还原端口都必须能过）。
           ownRuntimeIds: Orchestrator.localRuntimeIdsForTunnel(ctx.tunnelId),
         },
@@ -1128,6 +1172,7 @@ async function runStep(
 async function dispatchFactsFor(
   tunnelId: number,
   store: RolloutDeps["db"],
+  baseline?: RolloutSnapshot,
 ): Promise<DispatchFacts | null> {
   // Read through the INJECTED store, never the process-wide singleton: this
   // module is exercised offline with a stub, and reaching for `db` directly made
@@ -1141,6 +1186,11 @@ async function dispatchFactsFor(
     where: { id: tunnelId },
     select: {
       forward_protocol: true,
+      tunnel_mode: true,
+      middle_node_id: true,
+      federated_egress_peer: true,
+      link_resource_id: true,
+      link_source_config: true,
       tunnel_type: true,
       tls_cert_path: true,
       tls_key_path: true,
@@ -1162,8 +1212,19 @@ async function dispatchFactsFor(
     tls_key_path?: unknown;
     ingress_node?: { connect_ip?: unknown; state_report?: { tunnels?: unknown } | null } | null;
   } | null;
+  // Compensation must attest the baseline ingress, not the failed desired
+  // placement's address. Node IDs survive migrations; row relations do not.
+  const baselineIngress = baseline && baseline.protocol === "both" && baseline.mode === "relay"
+    ? await store.node.findUnique({ where: { id: baseline.ingress_node_id },
+        select: { connect_ip: true, state_report: { select: { tunnels: true } } } })
+    : null;
   return row
-    ? dispatchFactsFromRow({ ...row, ingress_runtime_id: Orchestrator.relayTunnelId(tunnelId) })
+    ? dispatchFactsFromRow({ ...row,
+        ...(baseline ? { forward_protocol: baseline.protocol ?? row.forward_protocol, tunnel_mode: baseline.mode,
+          middle_node_id: baseline.middle_node_id ?? null, federated_egress_peer: federatedEgressPeerOf(baseline),
+          tls_cert_path: baseline.tls_cert_path ?? null, tls_key_path: baseline.tls_key_path ?? null } : {}),
+        ...(baselineIngress ? { ingress_node: baselineIngress as NonNullable<typeof row>["ingress_node"] } : {}),
+        ingress_runtime_id: Orchestrator.relayTunnelId(tunnelId) })
     : null;
 }
 
@@ -1307,7 +1368,10 @@ export async function compensateRollout(
   // ① 撤新 runtime（两端）。revision+1 让闸门放行。
   // 用 plan 里存的 desired 快照，而不是重读 tunnel 行：补偿必须针对**本次
   // 尝试切过去的那个**拓扑，而 tunnel 行可能已被后续编辑改写。
-  const removeRevision = row.revision + 1;
+  // Fence the failed generation itself: an equal/older delayed apply is then
+  // stale, while the baseline replay at revision+1 remains strictly newer.
+  // Removing at revision+1 would tombstone that replay on the same Agent ID.
+  const removeRevision = row.revision;
   const planned = planSnapshot(row.steps, "desired");
   const baselinePlanned = planSnapshot(row.steps, "applied");
   const plannedMiddle = (planned as { middle_node_id?: number | null }).middle_node_id ?? null;
@@ -1379,6 +1443,7 @@ export async function compensateRollout(
 
   /** 回滚世代（内容 = 基线）。null = 没有基线可回（首次部署失败：撤干净即正确）。 */
   let rollbackRevision: number | null = null;
+  let rollbackSnapshotId: number | null = null;
 
   // ② 重放基线。base_revision 为 null ⇒ 没有旧 runtime 可回，只需要撤新的
   //    （首次部署失败的情形：撤干净即回到「没有 runtime」这个正确状态）。
@@ -1402,14 +1467,23 @@ export async function compensateRollout(
         revision?: unknown;
       };
       // 新世代的快照必须存在，否则后续 rollout 按 revision 找基线会报"不存在"。
-      await deps.db.forwardRevision
+      const rollbackSnapshot = await deps.db.forwardRevision
         .create({ data: { ...baselineFields, tunnel_id: row.tunnel_id, revision: rollbackGeneration } } as never)
         .catch((e: unknown) => {
           errors.push(`rollback snapshot revision=${rollbackGeneration} 写入失败：${(e as Error)?.message ?? String(e)}`);
         });
+      rollbackSnapshotId = (rollbackSnapshot as { id?: number } | undefined)?.id ?? null;
+      const baselineDenied = baselinePlanned.protocol === "both"
+        ? await rolloutRuntimeDenial(row.tunnel_id, baselinePlanned, deps)
+        : null;
       const ingressNodeId = Number(baseline.ingress_node_id);
       const listenPort = baseline.listen_port == null ? null : Number(baseline.listen_port);
-      if (!ingressNodeId || listenPort == null) {
+      if (baselineDenied) {
+        errors.push(`replay baseline: [${baselineDenied.reason}] ${baselineDenied.message}`);
+      } else if (!rollbackSnapshot) {
+        // A revision without a durable snapshot must never reach an Agent.
+        errors.push("replay baseline: rollback snapshot unavailable");
+      } else if (!ingressNodeId || listenPort == null) {
         errors.push("baseline snapshot 缺 ingress_node_id / listen_port");
       } else if (String(baseline.mode) === "relay") {
         const baselinePeer = federatedEgressPeerOf(baselinePlanned);
@@ -1418,7 +1492,7 @@ export async function compensateRollout(
         const targets = Array.isArray(baseline.targets)
           ? (baseline.targets as Array<{ host: string; port: number; weight?: number; order_by?: number }>)
           : [];
-        const replayEgressFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+        const replayEgressFacts = await dispatchFactsFor(row.tunnel_id, deps.db, baselinePlanned);
         /**
          * 回滚后的出口事实（host + 监听端口）。
          *
@@ -1553,7 +1627,7 @@ export async function compensateRollout(
           // NOTE: `row` here is the ROLLOUT row; the protocol fact lives on the
           // TUNNEL row. Reading it off the rollout row would always look like "no
           // fact at all" and refuse every replay.
-          const replayDirectFacts = await dispatchFactsFor(row.tunnel_id, deps.db);
+          const replayDirectFacts = await dispatchFactsFor(row.tunnel_id, deps.db, baselinePlanned);
           if (replayDirectFacts === null) {
             errors.push(`replay direct: 协议未通过当前 runtime Gate（tunnel ${row.tunnel_id}）`);
           } else {
@@ -1594,6 +1668,25 @@ export async function compensateRollout(
                 apply_error: `rollout ${rolloutId} 补偿完成：没有旧 runtime 可回（首次部署失败）`,
               }
             : {
+                ...(baselinePlanned.protocol ? { forward_protocol: baselinePlanned.protocol,
+                  ...legacyTunnelTypeColumn(normalizeForwardProtocol(baselinePlanned.protocol)!) } : {}),
+                ...forwardPolicyValues(baselinePlanned),
+                // The HTTP desired builder reads projection columns. Restoring
+                // only revision numbers would restart the failed configuration.
+                tunnel_mode: baselinePlanned.mode,
+                ingress_node_id: baselinePlanned.ingress_node_id,
+                egress_node_id: baselinePlanned.egress_node_id,
+                middle_node_id: baselinePlanned.middle_node_id ?? null,
+                listen_ip: baselinePlanned.listen_ip,
+                listen_port: baselinePlanned.listen_port,
+                remote_host: baselinePlanned.target_host,
+                remote_port: baselinePlanned.target_port,
+                egress_pool_id: baselinePlanned.egress_pool_id,
+                egress_port: baselinePlanned.egress_port,
+                federated_egress_peer: federatedEgressPeerOf(baselinePlanned),
+                tls_cert_path: baselinePlanned.tls_cert_path ?? null,
+                tls_key_path: baselinePlanned.tls_key_path ?? null,
+                ...(rollbackSnapshotId != null ? { desired_revision_id: rollbackSnapshotId } : {}),
                 config_revision: rollbackRevision,
                 applied_revision: rollbackRevision,
                 apply_status: "active",

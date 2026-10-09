@@ -16,6 +16,7 @@ import { authenticateNode, hashNodeCredential } from "./node-credential.ts";
 import { normalizeCapabilities } from "./agent-capability.ts";
 import { normalizeCapabilityManifest, type CapabilityManifest } from "./capability-manifest.ts";
 import { isPlainObject, type TunnelProtocolDiag } from "./tunnel-diag.ts";
+import { parseLinkPlacements, storeLinkPlacementReport, type ReportedLinkPlacement } from "./node-state-report.ts";
 import {
   appendLatencySamples,
   defaultLatencyHistoryDeps,
@@ -89,6 +90,7 @@ export interface StateReportInput {
   target_observations?: ReportedTargetObservation[];
   used_ports?: number[];
   egress_pools?: Record<string, ReportedEgressPool>;
+  link_placements?: ReportedLinkPlacement[];
   reported_revision?: number;
   last_error?: string | null;
 
@@ -171,6 +173,7 @@ export interface StateSnapshot {
   reported_revision: number | null;
   tunnels: unknown;
   egress_pools: unknown;
+  link_placements?: unknown;
   used_ports: unknown;
   last_error: string | null;
   reported_at: Date;
@@ -200,6 +203,7 @@ export type StateReportRejection =
   | "bad_tunnels"
   | "bad_used_ports"
   | "bad_egress_pools"
+  | "bad_link_placements"
   | "bad_revision"
   | "bad_last_error"
   /**：遥测字段形状坏（类型错 / 负计数 / 非法 unix 秒）。 */
@@ -431,6 +435,8 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
   // 一律坏形状（Agent 不会把状态报成一个列表）。
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, reason: "invalid_json" };
   const b = body as Record<string, unknown>;
+  const linkReport = parseLinkPlacements(b.link_placements);
+  if (!linkReport.ok) return { ok: false, reason: "bad_link_placements" };
 
   if (b.agent_id !== undefined && (typeof b.agent_id !== "string" || b.agent_id.length === 0 || b.agent_id.length > 64)) {
     return { ok: false, reason: "bad_agent_id" };
@@ -580,6 +586,7 @@ export function validateStateReport(body: unknown): { ok: true; report: StateRep
       tunnels: projectReportedTunnels(b.tunnels as ReportedTunnel[] | undefined),
       used_ports: b.used_ports as number[] | undefined,
       egress_pools: b.egress_pools as Record<string, ReportedEgressPool> | undefined,
+      link_placements: linkReport.placements ?? undefined,
       reported_revision: b.reported_revision as number | undefined,
       last_error: b.last_error as string | null | undefined,
       known_revision: b.known_revision as number | undefined,
@@ -930,6 +937,8 @@ export async function submitStateReport(
   if (!validated.ok) return { ok: false, status: 400, reason: validated.reason };
 
   const report = validated.report;
+  const linkReport = parseLinkPlacements(report.link_placements);
+  if (!linkReport.ok) return { ok: false, status: 400, reason: linkReport.reason };
   // Credential remains the authentication truth. agent_id is an immutable
   // runtime-instance guard: new Agents report it and must match the Node row.
   // Older Agents that do not report agent_id remain temporarily compatible.
@@ -946,15 +955,30 @@ export async function submitStateReport(
     // 与「还没报过」不同（后者在 DB 里表现为没有这一行）。
     tunnels: (report.tunnels ?? []) as never,
     egress_pools: (report.egress_pools ?? {}) as never,
+    // A newer heartbeat from an old build must clear stale Link claims.
+    link_placements: linkReport.placements === null ? Prisma.DbNull : linkReport.placements as unknown as Prisma.InputJsonValue,
     used_ports: (report.used_ports ?? []) as never,
     last_error: report.last_error ?? null,
     reported_at: reportedAt,
   };
-  await db.nodeStateReport.upsert({
-    where: { node_id: auth.node_id },
-    create: { node_id: auth.node_id, ...core, ...telemetry },
-    update: { ...core, ...telemetry },
-  });
+  if (linkReport.placements === null) {
+    await db.nodeStateReport.upsert({
+      where: { node_id: auth.node_id },
+      create: { node_id: auth.node_id, ...core, ...telemetry },
+      update: { ...core, ...telemetry },
+    });
+  } else {
+    const placements = linkReport.placements;
+    let stored;
+    try {
+      stored = await db.$transaction((tx) => storeLinkPlacementReport(
+        tx, auth.node_id, auth.scope, placements, { ...core, ...telemetry },
+      ), { isolationLevel: "Serializable" });
+    } catch {
+      return { ok: false, status: 503, reason: "link_placement_store_unavailable" };
+    }
+    if (!stored.ok) return { ok: false, status: 400, reason: stored.reason };
+  }
 
   // ──：本人续约 ──
   //
@@ -1064,6 +1088,7 @@ export async function loadNodeSnapshot(nodeDbId: number): Promise<StateSnapshot 
       // 读取侧用 `services/tunnel-diag.ts` 的 `tunnelDiagsById(snapshot.tunnels)` 取类型化视图。
       tunnels: true,
       egress_pools: true,
+      link_placements: true,
       used_ports: true,
       last_error: true,
       reported_at: true,
@@ -1128,6 +1153,7 @@ export function snapshotFingerprint(snapshot: StateSnapshot | null): string {
       t: snapshot.tunnels ?? null,
       p: snapshot.used_ports ?? null,
       e: snapshot.egress_pools ?? null,
+      lp: snapshot.link_placements ?? null,
       kr: snapshot.known_revision ?? null,
       ec: snapshot.error_count ?? null,
       le: snapshot.last_error_at ? new Date(snapshot.last_error_at).toISOString() : null,

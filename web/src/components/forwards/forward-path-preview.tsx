@@ -30,6 +30,7 @@ import type {
   PathBindingsStatus,
 } from "@/components/forwards/forward-path-model";
 import type { Locale } from "@/lib/i18n";
+import { forwardProtocolNote } from "@/lib/forward-protocol";
 
 export interface ForwardPathCopy {
   title: string;
@@ -247,9 +248,11 @@ function BindingsNote({
 export function ForwardPathPreview({
   model,
   locale,
+  protocol,
 }: {
   model: ForwardPathPreviewModel;
   locale: Locale;
+  protocol?: string;
 }) {
   const copy = forwardPathCopy(locale);
   return (
@@ -263,6 +266,7 @@ export function ForwardPathPreview({
         <div className="text-xs font-medium">{copy.title}</div>
         <p className="mt-0.5 text-xs text-[var(--muted-foreground)]">{copy.planNote}</p>
       </header>
+      {protocol === "both" ? <p data-testid="forward-path-mixed" className="mt-2 text-xs text-[var(--muted-foreground)]">{forwardProtocolNote(locale, "both")}</p> : null}
 
       <p className="mt-2 text-sm font-medium" data-testid="forward-path-headline">
         {model.pathKind === "direct"

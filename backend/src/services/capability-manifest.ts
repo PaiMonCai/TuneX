@@ -15,6 +15,7 @@ import {
   normalizeProtocolVersion,
 } from "./agent-capability.ts";
 import { FORWARD_PROTOCOLS, FORWARD_TRANSPORTS } from "./forward-contract.ts";
+import { FORWARD_NATIVE_BOTH_CAPABILITY } from "./forward-native-both.ts";
 
 /* ================================================================== */
 /* 协议常量                                                            */
@@ -173,6 +174,8 @@ function normalizeManifestList(value: unknown, field: string): string[] {
  * 模块存在的意义抹掉。
  */
 export interface AgentV2CapabilityFacts {
+  /** Current report with an explicit timestamp, after credential rotation. */
+  advertisementCurrent?: boolean;
   /** Agent 上报的控制协议版本（null = 未上报）。 */
   protocolVersion: number | null;
   /** null = 未上报；[] = 明确上报「什么都不支持」。 */
@@ -240,6 +243,13 @@ export function capabilityFactsFromStoredV2(row: CapabilityManifestRow | null | 
   }
 
   return {
+    advertisementCurrent: (() => {
+      const reported = toTime(row.reported_at);
+      const rotated = toTime(row.credential_rotated_at);
+      const now = Date.now();
+      return reported !== null && reported <= now + 30_000 && now - reported <= 120_000 &&
+        (row.credential_rotated_at == null || rotated !== null && reported > rotated);
+    })(),
     protocolVersion: capabilitiesMalformed ? safeProtocolVersion(row.control_protocol_version) : actions?.protocolVersion ?? null,
     capabilities: actions?.capabilities ?? null,
     capabilitiesMalformed,
@@ -360,6 +370,11 @@ export function decideProtocolCapability(
   facts: AgentV2CapabilityFacts | null | undefined,
   protocol: unknown,
 ): ManifestDecision {
+  if (protocol === "both" && (!facts?.advertisementCurrent || facts.capabilitiesMalformed ||
+      !facts.capabilities?.includes(FORWARD_NATIVE_BOTH_CAPABILITY))) {
+    return { supported: false, reason: "protocol_not_supported",
+      detail: `Native both requires a current advertisement of ${FORWARD_NATIVE_BOTH_CAPABILITY}` };
+  }
   return decideDimension(facts, "protocol", protocol, BASELINE_PROTOCOLS, "protocol_not_supported");
 }
 

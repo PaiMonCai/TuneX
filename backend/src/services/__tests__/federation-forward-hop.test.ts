@@ -16,6 +16,7 @@
  *   G. 释放：按同一 intent 键 DELETE、镜像行落 expired、重复释放幂等。
  */
 import { describe, expect, it } from "bun:test";
+import { fileURLToPath } from "node:url";
 
 import {
   checkFederatedEgressForSnapshot,
@@ -335,6 +336,11 @@ describe("B. 第一阶段边界：只允许一个远端 hop，且必须在 egres
 
   it("B1. 合法形状放行", () => {
     expect(checkFederatedEgressTopology(base, "peer-b")).toEqual({ ok: true, peer_panel_id: "peer-b" });
+  });
+
+  it("native both is never admitted as a federated egress hop", () => {
+    expect(checkFederatedEgressTopology({ ...base, protocol: "both" }, "peer-b")).toMatchObject({
+      ok: false, code: "unsupported_topology" });
   });
 
   it("B2. 未声明 peer ⇒ message_malformed（这个分支根本不该被调用）", () => {
@@ -930,7 +936,7 @@ describe("G. 释放：移除声明 / 改回本机出口 / 删除 Forward 共用�
   });
 
   it("G11. scheduler source treats stale cleanup as a hard precondition, never log-and-continue", async () => {
-    const scheduler = await Bun.file(new URL("../scheduler.ts", import.meta.url).pathname).text();
+    const scheduler = await Bun.file(fileURLToPath(new URL("../scheduler.ts", import.meta.url))).text();
     const start = scheduler.indexOf("let stale: Awaited<ReturnType<typeof releaseStaleFederatedEgressForTunnel>>");
     const end = scheduler.indexOf("const delegated = await delegateFederatedEgress", start);
     const block = scheduler.slice(start, end);

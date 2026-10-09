@@ -204,6 +204,21 @@ describe("RELAY 只换入口节点也必须准备出口（V5.3 round 19）", () 
 });
 
 describe("RELAY ordering（§13.3.5 / orchestrator 铁律）", () => {
+  it.each(["both", "tcp"] as const)("%s retarget with listener replacement still prepares the existing exit before ingress cutover", (protocol) => {
+    const applied = snapshot({ mode: "relay", protocol, egress_node_id: NODE_EGRESS.id,
+      egress_port: 31000, target_host: "10.9.9.9", target_port: 8080 });
+    const input = planInput({ applied, desired: { ...applied, target_port: 8081 },
+      impact: impact({ listener_replacement: true, target_change: true, egress_target_change: true }),
+      nodes: { ingress: NODE_INGRESS, egress: NODE_EGRESS, ingress_previous: null, egress_previous: null } });
+    const steps = shape(input);
+    expect(steps).toContain("prepare:prepare_egress");
+    expect(steps.indexOf("prepare:prepare_egress")).toBeLessThan(steps.indexOf("cutover:cutover_ingress"));
+    expect(steps.indexOf("cutover:cutover_egress")).toBeLessThan(steps.indexOf("cutover:cutover_ingress"));
+    // Retargeting does not allocate a second exit lease or retire this runtime ID.
+    expect(planRollout(input, 42).steps.filter((s) => s.kind === "acquire_port" && s.direction === "egress")).toHaveLength(0);
+    expect(steps.some((s) => s.startsWith("drain:") || s.startsWith("cleanup:"))).toBe(false);
+  });
+
   it("prepare_egress 严格早于 cutover_ingress", () => {
     const input = planInput({
       desired: snapshot({ mode: "relay", target_host: null, target_port: null, egress_node_id: NODE_EGRESS.id }),

@@ -21,6 +21,8 @@ TuneX 由 Panel 与 Agent 组成。Panel 提供 Web 管理、策略编排和状�
 
 普通用户主要通过 **线路（Route Profile）→ 转发（Forward）** 使用 TuneX；Node、NodeGroup、容量、健康和 Federation 等基础设施能力由管理员维护。
 
+文档入口：[当前文档](docs/README.md) · [转发核心开发方案](docs/DEVELOPMENT_PLAN.md) · [生产部署](docs/production-deploy.md)。共享 FXP 及各路径的支持范围见 [转发运行边界](docs/forwarding-runtime.md)，候选分支能力不等于已正式发布。
+
 ## 快速部署
 
 需要 Docker 与 Docker Compose v2。

@@ -18,7 +18,7 @@
  */
 import { useI18n } from "@/components/providers";
 import { Badge } from "@/components/ui/card";
-import { forwardProtocolLabel, forwardTransportFor } from "@/lib/forward-protocol";
+import { forwardProtocolFact, forwardProtocolLabel, forwardTransportFor } from "@/lib/forward-protocol";
 import type { PortForward } from "@/lib/types";
 
 export function ForwardProtocolBadge({
@@ -47,7 +47,7 @@ export function ForwardProtocolBadge({
     >
       <Badge
         variant={supported ? "secondary" : "outline"}
-        data-testid={`forward-protocol-${label.toLowerCase()}`}
+        data-testid={`forward-protocol-${forwardProtocolFact(forward.protocol)}`}
       >
         {label}
       </Badge>

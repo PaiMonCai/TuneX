@@ -17,9 +17,10 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const SRC = new URL("../..", import.meta.url).pathname;
+const SRC = fileURLToPath(new URL("../..", import.meta.url));
 
 /** 会真正向 Agent 下发命令的方法名（Orchestrator 的下发面）。 */
 const DISPATCH_METHODS = [
@@ -46,6 +47,12 @@ function sourceFiles(dir: string): string[] {
 /** 去掉注释，避免注释里提到的 `protocol:` 让守卫自己放行。 */
 function stripComments(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+function tcpLiteralAssignments(text: string): RegExpMatchArray[] {
+  // A type union declares allowed facts. `"tcp" || fallback` still assigns
+  // TCP at runtime and must not be mistaken for a union.
+  return [...text.matchAll(/\bprotocol\s*:\s*"tcp"(?!\s*\|(?!\|))/g)];
 }
 
 interface CallSite {
@@ -75,7 +82,7 @@ function dispatchCallSites(): CallSite[] {
             }
           }
         }
-        sites.push({ file: file.replace(`${SRC}/`, ""), method, args: text.slice(match.index, end + 1) });
+        sites.push({ file: relative(SRC, file).split(sep).join("/"), method, args: text.slice(match.index, end + 1) });
       }
     }
   }
@@ -113,11 +120,18 @@ describe("V5-G0 every dispatch path carries the protocol fact", () => {
     const offenders: string[] = [];
     for (const file of sourceFiles(SRC)) {
       const text = stripComments(readFileSync(file, "utf8"));
-      for (const match of text.matchAll(/protocol\s*:\s*"tcp"/g)) {
-        offenders.push(`${file.replace(`${SRC}/`, "")}:${text.slice(0, match.index).split("\n").length}`);
+      for (const match of tcpLiteralAssignments(text)) {
+        offenders.push(`${relative(SRC, file)}:${text.slice(0, match.index).split("\n").length}`);
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  test("literal guard distinguishes type unions from hardcoded runtime protocols", () => {
+    expect(tcpLiteralAssignments('ports: Array<{ protocol: "tcp" | "udp"; port: number }>')).toHaveLength(0);
+    expect(tcpLiteralAssignments('const config = { protocol: "tcp", port: 1234 };')).toHaveLength(1);
+    expect(tcpLiteralAssignments('const config = { protocol: "tcp" || row.protocol };')).toHaveLength(1);
+    expect(tcpLiteralAssignments('const config = { protocol: row.protocol };')).toHaveLength(0);
   });
 
   test("the desired-state snapshot resolves the protocol per row", () => {

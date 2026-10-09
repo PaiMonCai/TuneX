@@ -46,6 +46,10 @@ export interface NodeEnrollmentIssued {
 /** 用户侧 Node-first 列表的安全节点投影。 */
 export interface UserNode extends Node {
   agent_id: string;
+  /** Actual reported runtime capabilities; null/missing is unknown, not TCP+UDP fallback. */
+  capabilities?: string[] | null;
+  /** Diagnostics-enriched only: server report freshness, never admission/online inference. */
+  capabilities_fresh?: boolean;
   registered?: boolean;
   has_credential?: boolean;
   /**
@@ -91,7 +95,17 @@ export interface NodeBinding {
   unbind_blocked: boolean;
 }
 
-export interface PortForward {
+export interface ForwardPolicyInput {
+  /** bytes/sec, runtime client entrance; 0 unlimited subject to workspace ceilings. */
+  bytes_per_second_in?: number | null;
+  bytes_per_second_out?: number | null;
+  /** TCP connections / UDP active mappings; not distinct-IP counts. */
+  max_connections?: number | null;
+  max_connections_per_ip?: number | null;
+}
+
+export interface PortForward extends ForwardPolicyInput {
+  link_resource_id?: number | null;
   /** Missing/null creator is read-only in own mutation scope. */
   creator_user_id?: number | null;
   id: ID;
@@ -100,7 +114,7 @@ export interface PortForward {
    * 这一行的**协议事实**（后端投影：`forward_protocol` 优先，回落
    * legacy `tunnel_type`，所以协议列出现之前的行也会报告它当时是什么）。
    *
-   * 联合类型给出本契约开放的取值（`tcp` / `tls` / `ws` / `udp`，见
+   * 联合类型给出本契约开放的取值（`tcp` / `tls` / `ws` / `udp` / `both`，见
    * `lib/forward-protocol.ts`）；开口的那一支让历史事实（`wss` / `quic` …）保持
    * 诚实 —— 界面只渲染行上写着的东西，绝不改写它。是否被当前运行时开放看
    * {@link protocol_supported}。
@@ -146,7 +160,7 @@ export interface PortForward {
   updated_at: string;
 }
 
-export interface PortForwardCreateInput {
+export interface PortForwardCreateInput extends ForwardPolicyInput {
   name: string;
   listen_port?: number | null;
   target_host: string;
@@ -190,11 +204,12 @@ export interface ForwardCreateInput extends PortForwardCreateInput {
  * —— 证书路径属于一条转发的 desired 配置，运维换文件名不该被迫删了重建（重建还会
  * 重新分配监听端口）。规则与创建完全相同（只有 tls 能带、且必须成对）。
  *
- * `protocol` 仍然**不可编辑**：把 tcp 改成 tls 不是一次编辑（端口租约、目标语义、
- * RELAY 形态全都变），§6.1 没有冻结这套语义，所以后端 schema 用「不接受该键」
- * 而不是猜一个行为。编辑器因此只读展示协议。
+ * `protocol` 只允许普通 tcp / udp / 原生 both 之间切换；进入 both 受服务器开关与
+ * 新鲜运行能力双重校验。TLS / WS / 历史协议仍固定，preview 是最终契约裁决。
  */
-export interface ForwardPatchInput {
+export interface ForwardPatchInput extends ForwardPolicyInput {
+  /** Plain TCP/UDP/native-both transition; preview remains authoritative. */
+  protocol?: ForwardProtocolFact;
   name?: string;
   mode?: "direct" | "relay";
   ingress_node_id?: ID;
@@ -214,7 +229,7 @@ export interface ForwardPatchInput {
 }
 
 /** preview 的候选 config 投影（与后端 ForwardCandidateConfig 同形）。 */
-export interface ForwardPreviewConfig {
+export interface ForwardPreviewConfig extends ForwardPolicyInput {
   name: string;
   mode: "direct" | "relay";
   /** 持久化协议事实（后端 ForwardCandidateConfig.protocol）。 */

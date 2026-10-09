@@ -7,6 +7,8 @@
  * metadata and never a product-support signal.
  */
 
+import { nativeBothShapeError } from "./forward-native-both.ts";
+
 export const FORWARD_MODES = ["direct", "relay"] as const;
 export type ForwardMode = (typeof FORWARD_MODES)[number];
 
@@ -20,7 +22,7 @@ export type ForwardMode = (typeof FORWARD_MODES)[number];
  * (DEVELOPMENT.md §6.2, `docs/v5-1b-datagram-contract-draft.md`), and it is the
  * first protocol whose TRANSPORT is not `stream`; `quic` comes last.
  */
-export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws", "udp"] as const;
+export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws", "udp", "both"] as const;
 export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
 
 /**
@@ -38,11 +40,11 @@ export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
  * is a MAPPING that expires by idle timeout and whose target side has no holdable
  * object at all (there is no FIN to observe in UDP).
  */
-export const FORWARD_TRANSPORTS = ["stream", "datagram"] as const;
+export const FORWARD_TRANSPORTS = ["stream", "datagram", "mixed"] as const;
 export type ForwardTransport = (typeof FORWARD_TRANSPORTS)[number];
 
 export interface ForwardTransportSpec {
-  readonly lifecycle: "connection" | "mapping";
+  readonly lifecycle: "connection" | "mapping" | "connection_and_mapping";
 }
 
 export const FORWARD_TRANSPORT_SPECS: Readonly<
@@ -50,6 +52,7 @@ export const FORWARD_TRANSPORT_SPECS: Readonly<
 > = {
   stream: { lifecycle: "connection" },
   datagram: { lifecycle: "mapping" },
+  mixed: { lifecycle: "connection_and_mapping" },
 };
 
 export interface ForwardProtocolSpec {
@@ -89,7 +92,13 @@ export const FORWARD_PROTOCOL_SPECS: Readonly<
   // `udp` has been in the wire vocabulary and the DB enum since long before V5,
   // which is why V5.1b needs no protocol migration (only an entitlement one).
   udp: { transport: "datagram", legacy_tunnel_type: "udp" },
+  both: { transport: "mixed", legacy_tunnel_type: null },
 };
+
+/** UDP lane attestation applies to datagram and composite mixed runtimes. */
+export function forwardHasDatagramLane(protocol: ForwardProtocol): boolean {
+  return FORWARD_PROTOCOL_SPECS[protocol].transport !== "stream";
+}
 
 export function normalizeForwardTransport(
   value: unknown,
@@ -196,10 +205,14 @@ export function legacyTunnelTypeForForwardProtocol(
 export function admitPersistedProtocol(row: {
   forward_protocol?: unknown;
   tunnel_type?: unknown;
+  tunnel_mode?: unknown; mode?: unknown; middle_node_id?: unknown;
+  federated_egress_peer?: unknown; link_resource_id?: unknown;
+  tls_cert_path?: unknown; tls_key_path?: unknown; link_source_config?: unknown;
 }): ForwardProtocol | null {
   // Persisted rows must carry a protocol fact. Missing projection columns fail
   // closed instead of silently reinterpreting the runtime as TCP.
   if (row.forward_protocol == null && row.tunnel_type == null) return null;
+  if (nativeBothShapeError(row)) return null;
   try {
     return normalizeForwardProtocol(persistedForwardProtocol(row.forward_protocol, row.tunnel_type));
   } catch {
@@ -267,9 +280,9 @@ export function wireTunnelTypeForForwardProtocol(protocol: ForwardProtocol): str
  */
 export function legacyTunnelTypeColumn(
   protocol: ForwardProtocol,
-): { tunnel_type?: string } {
+): { tunnel_type?: string | null } {
   const legacy = legacyTunnelTypeForForwardProtocol(protocol);
-  return legacy === null ? {} : { tunnel_type: legacy };
+  return protocol === "both" ? { tunnel_type: null } : legacy === null ? {} : { tunnel_type: legacy };
 }
 
 /**
@@ -362,6 +375,8 @@ export function datagramHopPeerFor(input: {
 export function dispatchFactsFromRow(row: {
   forward_protocol?: unknown;
   tunnel_type?: unknown;
+  tunnel_mode?: unknown; middle_node_id?: unknown; federated_egress_peer?: unknown;
+  link_resource_id?: unknown; link_source_config?: unknown;
   tls_cert_path?: unknown;
   tls_key_path?: unknown;
   /** 配对入口节点（只有 datagram 协议会用到；缺了它 = 出口无法取证）。 */
@@ -385,7 +400,7 @@ export function dispatchFactsFromRow(row: {
   // site: two sites deriving it independently is how `next_hop` and `hop_peer`
   // would end up naming different addresses for the same hop.
   const hopPeer =
-    FORWARD_PROTOCOL_SPECS[protocol].transport === "datagram"
+    forwardHasDatagramLane(protocol)
       ? datagramHopPeerFor({
           ingressRuntimeId: typeof row.ingress_runtime_id === "string" ? row.ingress_runtime_id : null,
           ingressConnectIp: row.ingress_node?.connect_ip as string | null | undefined,

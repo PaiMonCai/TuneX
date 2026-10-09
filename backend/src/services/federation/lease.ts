@@ -186,6 +186,10 @@ async function defaultAllocatePort(input: Parameters<PortAllocateHook>[0]) {
     leaseType: input.hop_role === "ingress" ? "ingress" : "egress",
     preferredPort: input.requested_port,
     tunnelId: null,
+    // Reserve intents carry no socket protocol. Keep both namespaces reserved
+    // until that wire contract provides a concrete forwarding protocol.
+    protocol: null,
+    bindScope: "*",
     expiresAt: input.expires_at,
     reservedPorts: input.reserved_ports ?? [],
   });
@@ -1123,7 +1127,7 @@ export function validateLegLink(hopRole: string, raw: unknown): ParseResult<Fede
 
   let protocol: string | null = null;
   if (obj.protocol !== undefined && obj.protocol !== null) {
-    if (typeof obj.protocol !== "string" || !(FORWARD_PROTOCOLS as readonly string[]).includes(obj.protocol)) {
+    if (typeof obj.protocol !== "string" || obj.protocol === "both" || !(FORWARD_PROTOCOLS as readonly string[]).includes(obj.protocol)) {
       return bad(`link.protocol "${String(obj.protocol)}" is not a supported forward protocol`);
     }
     protocol = obj.protocol;

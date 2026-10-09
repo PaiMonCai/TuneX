@@ -29,8 +29,8 @@ const KEY = "/etc/tunex/tls/site.key";
 
 describe("tls is a protocol, not a transport", () => {
   test("tls is open and rides the stream transport", () => {
-    // ws joined in V5-WP5-A2; both are stream protocols.
-    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp"]);
+    // TLS and WS are stream fronts; native both is a separate mixed runtime.
+    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp", "both"]);
     expect(FORWARD_PROTOCOL_SPECS.tls.transport).toBe("stream");
     expect(FORWARD_PROTOCOL_SPECS.tls.legacy_tunnel_type).toBe("tls");
     // The plan shape is unchanged: a tls Forward is a stream plan like any other.
@@ -82,7 +82,11 @@ describe("the legacy column is a projection, and says 'none' when it must", () =
     for (const protocol of FORWARD_PROTOCOLS) {
       const legacy = legacyTunnelTypeForForwardProtocol(protocol);
       const column = legacyTunnelTypeColumn(protocol);
-      if (legacy === null) {
+      if (protocol === "both") {
+        // Explicit NULL clears a previous single-lane projection on transition.
+        expect(legacy).toBeNull();
+        expect(column).toEqual({ tunnel_type: null });
+      } else if (legacy === null) {
         expect(column).toEqual({});
       } else {
         expect(column).toEqual({ tunnel_type: legacy });

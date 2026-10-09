@@ -24,6 +24,7 @@ jobs:
       agent: ${{ steps.scope.outputs.agent }}
       ops: ${{ steps.scope.outputs.ops }}
       security: ${{ steps.scope.outputs.security }}
+      core: ${{ steps.scope.outputs.core }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,15 +60,16 @@ jobs:
             agent=true
             ops=true
           else
-            backend="$(match '^(backend/|shared/|Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env\.production\.example$)')"
+            backend="$(match '^(backend/|third_party/forwardx/|shared/|Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env\.production\.example$)')"
             web="$(match '^(web/|shared/|Dockerfile$)')"
-            agent="$(match '^(agent/|shared/)')"
+            agent="$(match '^(agent/|third_party/forwardx/|shared/)')"
             ops="$(match '^(scripts/(ops|integration)/|Dockerfile$|backend/Dockerfile$|agent/Dockerfile$|docker-compose(\.prod|\.standalone)?\.ya?ml$|\.env(\.production)?\.example$|docs/production-deploy\.md$)')"
           fi
 
           # Cheap secret scan is the one repository-wide invariant worth running
           # for every source/config PR. Docs-only edits skip it.
           security="$(match '^(backend/|web/|agent/|shared/|scripts/|\.github/|Dockerfile$|docker-compose|\.env)')"
+          core="$(match '^(agent/|third_party/forwardx/|backend/(prisma/|src/|Dockerfile)|scripts/integration/|\.github/workflows/ci\.yml$)')"
 
           {
             echo "backend=$backend"
@@ -75,6 +77,7 @@ jobs:
             echo "agent=$agent"
             echo "ops=$ops"
             echo "security=$security"
+            echo "core=$core"
           } >> "$GITHUB_OUTPUT"
 
   secret-scan:
@@ -123,6 +126,16 @@ jobs:
         with:
           node-version: "24"
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: third_party/forwardx/forwardx-fxp/go.mod
+          cache-dependency-path: third_party/forwardx/forwardx-fxp/go.sum
+      - name: Verify and build the pinned FXP executable
+        run: |
+          go -C ../third_party/forwardx/forwardx-fxp mod verify
+          go -C ../third_party/forwardx/forwardx-fxp test ./...
+          go -C ../third_party/forwardx/forwardx-fxp build -trimpath -o /tmp/tunex-fxp .
+          echo "TUNEX_TEST_FXP_BINARY=/tmp/tunex-fxp" >> "$GITHUB_ENV"
       - name: Install locked backend dependencies
         run: bun ci
       - name: Apply migrations on an empty database
@@ -133,10 +146,20 @@ jobs:
           bunx tsc --noEmit
       - name: Backend unit and contract tests
         run: bun run test:unit
+      - name: Prepare dedicated Link traffic and target-set test databases
+        run: |
+          printf 'CREATE DATABASE IF NOT EXISTS tunex_link_traffic_test;\n' | bunx prisma db execute --schema prisma/schema.prisma --stdin
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_traffic_test # secret-scan:allow
+          bunx prisma migrate deploy
+          printf 'CREATE DATABASE IF NOT EXISTS tunex_link_target_sets_test;\n' | bunx prisma db execute --schema prisma/schema.prisma --stdin
+          export DATABASE_URL=mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_target_sets_test # secret-scan:allow
+          bunx prisma migrate deploy
       - name: Backend database and HTTP integration tests
         run: bun run test:integration
         env:
           TUNEX_DB_TEST: "1"
+          TUNEX_LINK_TRAFFIC_TEST_DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_traffic_test # secret-scan:allow
+          TUNEX_LINK_TARGET_SETS_TEST_DATABASE_URL: mysql://root:ci-only-password@127.0.0.1:3306/tunex_link_target_sets_test # secret-scan:allow
           ALLOW_REGISTER_FALLBACK: "true"
       # Historical database upgrade replay is valuable release evidence, but it
       # is not a per-PR merge gate. Run it once after the commit lands on main.
@@ -198,7 +221,11 @@ jobs:
       - name: Vet Agent
         run: go vet ./...
       - name: Agent tests
-        run: go test ./...
+        run: |
+          go -C ../third_party/forwardx/forwardx-fxp build -trimpath -o /tmp/tunex-fxp .
+          TUNEX_TEST_FXP_BINARY=/tmp/tunex-fxp go test ./...
+      - name: Race detector for acknowledged native removal
+        run: go test -race ./internal/manager ./internal/control -run 'Removal|StoppingScope|PublishesActualHop'
       # Race instrumentation is intentionally off the PR hot path; normal tests
       # still cover these packages on PRs, while main validates the heavier race run.
       - name: Race detector for concurrent runtime owners
@@ -206,6 +233,99 @@ jobs:
         run: go test -race ./internal/forwarder ./internal/control
       - name: Build Agent
         run: go build -buildvcs=false ./...
+
+  core-integration:
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - name: Real shared Link acceptance on disposable MySQL, Redis and Agents
+        run: bash scripts/integration/abcd-core-gate.sh
+      - name: Capture redacted core diagnostics
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, subprocess
+
+          out = pathlib.Path("scripts/integration/evidence")
+          out.mkdir(parents=True, exist_ok=True)
+          report = {"panel": {"exception_evidence": "unknown"}, "agents": {"status": "unknown"}}
+
+          def docker(args):
+              try:
+                  return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=20)
+              except (OSError, subprocess.TimeoutExpired):
+                  return None
+
+          # Never archive raw logs: ORM messages can contain SQL/config/secrets.
+          logs = docker(["logs", "--tail", "600", "tunex-it-panel"])
+          if logs is not None and logs.returncode == 0:
+              raw = logs.stdout + logs.stderr
+              types = sorted(set(re.findall(r"\b(?:PrismaClient(?:KnownRequest|UnknownRequest|Validation|Initialization|RustPanic)Error|TypeError|RangeError|SyntaxError|LinkResourceError|Error)\b", raw)))
+              codes = sorted(set(re.findall(r"\bP[0-9]{4}\b", raw)))
+              symbols = sorted(set(re.findall(r"\b(?:agent_version_invalid|agent_fxp_capability_missing|link_operation_failed|link_seal_key_required)\b", raw)))
+              report["panel"] = {"exception_evidence": "logged_types_only" if types or codes else "unknown_not_logged",
+                                 "error_types": types, "orm_codes": codes, "symbolic_codes": symbols}
+
+          try:
+              state = json.loads(pathlib.Path("scripts/integration/state.json").read_text())
+              ids = sorted({int(node["id"]) for node in state["nodes"].values()})
+              # Only read identity/version/advertisement facts from the disposable
+              # Panel container. No config, credentials, messages or ORM input.
+              js = '''import { PrismaClient } from "@prisma/client";
+              const db = new PrismaClient({log:[]});
+              const ids = IDS;
+              const safeVersion = value => value === "unknown" || /^(?:v)?[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)*$/.test(value ?? "") ? value : null;
+              try {
+                const nodes = await db.node.findMany({where:{id:{in:ids}},select:{id:true,version:true}});
+                const facts = await db.nodeStateReport.findMany({where:{node_id:{in:ids}},select:{node_id:true,version:true,capabilities:true,reported_at:true}});
+                console.log(JSON.stringify({status:"read_only_facts",nodes:ids.map(id => {
+                  const node=nodes.find(n=>n.id===id), fact=facts.find(f=>f.node_id===id);
+                  const caps=Array.isArray(fact?.capabilities) ? fact.capabilities : null;
+                  return {node_id:id,report_present:!!fact,legacy_version:safeVersion(node?.version),reported_version:safeVersion(fact?.version),reported_at:fact?.reported_at ?? null,
+                    fxp_advertised:caps?.includes("forward.link.fxp.v1") ?? null,apply_link_advertised:caps?.includes("apply_link") ?? null,remove_link_advertised:caps?.includes("remove_link") ?? null};
+                })}));
+              } catch(e) {
+                const names=["PrismaClientKnownRequestError","PrismaClientUnknownRequestError","PrismaClientValidationError","PrismaClientInitializationError","PrismaClientRustPanicError","TypeError","Error"];
+                console.log(JSON.stringify({status:"fact_read_failed",error_type:names.includes(e.name)?e.name:"Error",orm_code:/^P[0-9]{4}$/.test(e.code ?? "")?e.code:null}));
+              } finally { await db.$disconnect(); }'''.replace("IDS", json.dumps(ids))
+              facts = docker(["exec", "tunex-it-panel", "bun", "--eval", js])
+              if facts is not None and facts.returncode == 0:
+                  parsed = json.loads(facts.stdout.strip().splitlines()[-1])
+                  # Rebuild the output with a closed key set, even on failures.
+                  report["agents"] = {key: parsed[key] for key in ("status", "nodes", "error_type", "orm_code") if key in parsed}
+          except (OSError, ValueError, KeyError, IndexError, TypeError):
+              report["agents"] = {"status": "unknown_no_provisioned_facts"}
+
+          (out / "abcd-core-diagnostics.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report))
+          PY
+      - name: Preserve acceptance result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abcd-core-result
+          path: |
+            scripts/integration/evidence/abcd-links-result.txt
+            scripts/integration/evidence/native-both-result.txt
+            scripts/integration/evidence/abcd-core-diagnostics.json
+          if-no-files-found: ignore
+      - name: Stop disposable topology
+        if: always()
+        run: |
+          if [[ -f scripts/integration/.env.integration ]]; then
+            # setup.sh runs in a child shell; its provisioned exports do not
+            # survive into this step. These parse-only defaults are used solely
+            # for `down`, including failures before any Agent was provisioned.
+            export TUNEX_IT_AGENT_IMAGE=tunex-it-agent:ci
+            export TUNEX_IT_INGRESS_AGENT_ID=UNPROVISIONED
+            export TUNEX_IT_EGRESS_AGENT_ID=UNPROVISIONED
+            export TUNEX_IT_INGRESS_CREDENTIAL=UNPROVISIONED
+            export TUNEX_IT_EGRESS_CREDENTIAL=UNPROVISIONED
+            docker compose -f scripts/integration/docker-compose.yaml --env-file scripts/integration/.env.integration down --remove-orphans
+          fi
 
   ops:
     needs: changes
@@ -223,6 +343,10 @@ jobs:
           bash -n scripts/ops/restore.sh
           bash -n scripts/integration/a00-core-gate.sh
           python3 -m py_compile scripts/integration/a00-delete-reuse.py
+          bash -n scripts/integration/abcd-core-gate.sh
+          python3 -m py_compile scripts/integration/abcd-links.py
+          python3 -m py_compile scripts/integration/native-both.py
+          python3 -B -m unittest discover -s scripts/integration/tests -p 'test_*.py'
       - name: Current deployment contract
         run: bash scripts/ops/tests/installer-static.sh
 
@@ -230,7 +354,7 @@ jobs:
   # intentionally skipped when that surface did not change.
   required:
     if: always()
-    needs: [changes, secret-scan, backend, web, agent, ops]
+    needs: [changes, secret-scan, backend, web, agent, core-integration, ops]
     runs-on: ubuntu-latest
     steps:
       - name: Require all selected CI surfaces to pass
@@ -240,10 +364,11 @@ jobs:
           BACKEND: ${{ needs.backend.result }}
           WEB: ${{ needs.web.result }}
           AGENT: ${{ needs.agent.result }}
+          CORE: ${{ needs.core-integration.result }}
           OPS: ${{ needs.ops.result }}
         run: |
           set -euo pipefail
-          for result in "$CHANGES" "$SECURITY" "$BACKEND" "$WEB" "$AGENT" "$OPS"; do
+          for result in "$CHANGES" "$SECURITY" "$BACKEND" "$WEB" "$AGENT" "$CORE" "$OPS"; do
             case "$result" in
               success|skipped) ;;
               *) echo "Selected CI surface failed or was cancelled: $result" >&2; exit 1 ;;

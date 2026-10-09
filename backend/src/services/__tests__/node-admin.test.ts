@@ -25,6 +25,7 @@
  *     `resolveAdminRoute()` 对每个端点都能解析到 `nodes` 资源（fail-closed 反证）。
  */
 import { test, expect, describe, beforeEach } from "bun:test";
+import { SELECTOR_RUNTIME_CAPABILITIES } from "../selector-admission.ts";
 import {
   DEFAULT_POOL_NAME,
   NODE_STATE_STALE_SECONDS,
@@ -593,6 +594,54 @@ function seedDefaultPool(node: NodeRow): PoolRow {
 
 beforeEach(() => {
   resetState();
+});
+
+describe("D selector policies are admitted before admin writes", () => {
+  test("node IP_HASH updates fail closed before changing defaults or roles", async () => {
+    const node = seedEgressNode();
+    const result = await updateNodeRole(node.id, { lbStrategy: "ip_hash" }, deps());
+    expect(result).toMatchObject({ ok: false, code: "invalid_state", condition: "selector_client_ip_required", error_layer: "runtime_admission" });
+    expect(node.lb_strategy).toBe(null);
+    expect(pools).toHaveLength(0);
+    expect(trace).not.toContain("node.update");
+  });
+
+  test("pool create/update rejects explicit and inherited IP_HASH without mutation", async () => {
+    const node = seedEgressNode();
+    const pool = seedDefaultPool(node);
+    expect(await createEgressPool(node.id, { name: "hash", lbStrategy: "ip_hash" }, deps()))
+      .toMatchObject({ ok: false, condition: "selector_client_ip_required" });
+    expect(await updateEgressPool(pool.id, { lbStrategy: "ip_hash" }, deps()))
+      .toMatchObject({ ok: false, condition: "selector_client_ip_required" });
+    expect(pool.lb_strategy).toBe("round");
+    node.lb_strategy = "ip_hash"; // persisted invalid policy from a previous panel
+    expect(await createEgressPool(node.id, { name: "inherited" }, deps()))
+      .toMatchObject({ ok: false, condition: "selector_client_ip_required" });
+    expect(await updateEgressPool(pool.id, { lbStrategy: null }, deps()))
+      .toMatchObject({ ok: false, condition: "selector_client_ip_required" });
+    pool.lb_strategy = "ip_hash";
+    expect(await updateEgressPool(pool.id, { name: "renamed" }, deps()))
+      .toMatchObject({ ok: false, condition: "selector_client_ip_required" });
+    expect(pool.name).toBe("default");
+    expect(pools).toHaveLength(1);
+  });
+
+  test("fallback requires a current capability for both node and pool changes", async () => {
+    const node = seedEgressNode();
+    const pool = seedDefaultPool(node);
+    expect(await updateNodeRole(node.id, { lbStrategy: "fallback" }, deps())).toMatchObject({ ok: false, condition: "upgrade_required" });
+    expect(await updateEgressPool(pool.id, { lbStrategy: "fallback" }, deps())).toMatchObject({ ok: false, condition: "upgrade_required" });
+    seedStateReport(node.id, {
+      reported_at: new Date("2026-10-07T12:00:00Z"), control_protocol_version: 2,
+      capabilities: ["apply_tunnel"],
+      capability_manifest: { schema_version: 2, protocols: ["tcp"], transports: ["stream"], runtime: [SELECTOR_RUNTIME_CAPABILITIES.fallback], diagnostics: [] },
+    });
+    expect((await updateNodeRole(node.id, { lbStrategy: "fallback" }, deps())).ok).toBe(true);
+    expect((await updateEgressPool(pool.id, { lbStrategy: "fallback" }, deps())).ok).toBe(true);
+    const created = await createEgressPool(node.id, { name: "inherited-fallback" }, deps());
+    expect(created.ok).toBe(true);
+    if (created.ok) expect(created.pool.lb_strategy).toBe("fallback");
+  });
 });
 
 /* ---- 依赖行种子（角色/区间收缩的 impact 判定输入） ---- */
@@ -1718,7 +1767,7 @@ describe("getNodeDetail", () => {
 describe("WP10 边界：只改 desired state，不做下发", () => {
   test("服务与路由源码不 import socket / control-protocol / portPool", async () => {
     for (const file of ["../node-admin.ts", "../../routes/node-admin.ts"]) {
-      const src = await Bun.file(new URL(file, import.meta.url).pathname).text();
+      const src = await Bun.file(new URL(file, import.meta.url)).text();
       expect(src).not.toMatch(/from "\.\.\/(socket|services\/control-protocol|services\/portPool)/);
       expect(src).not.toMatch(/configPusher|pushConfig|revision\+\+/);
       expect(src).not.toMatch(/\blisten\s*\(/);

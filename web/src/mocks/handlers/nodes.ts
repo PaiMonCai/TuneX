@@ -143,7 +143,7 @@ export async function handleNodesMock(ctx: rt.MockAuthedRouteContext): Promise<r
                   version: (state as { version?: string }).version ?? null,
                   role: (state as { role?: string }).role ?? null,
                   control_protocol_version: 1,
-                  capabilities: ["apply_tunnel", "remove_tunnel", "suspend_tunnel", "diagnose_tunnel", "collect_diagnostics"],
+                  capabilities: state.capabilities ?? null,
                   reported_revision: 1,
                   known_revision: 1,
                   reported_at: (state as { reported_at?: string }).reported_at ?? null,

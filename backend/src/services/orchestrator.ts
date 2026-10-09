@@ -16,6 +16,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { forwardPolicyAgentConfig, type ForwardPolicyInput, type ForwardWorkspacePolicy } from "./forward-policy.ts";
 
 import {
   ControlValidator,
@@ -27,11 +28,14 @@ import type { CommandAction, ResourceStatus } from "./control-protocol/index.ts"
 import { targetHealthWireEntries } from "./target-health-read.ts";
 import { claimLease, releaseLease as releasePlacementLease } from "./placement-lease.ts";
 import type { RoutePlan } from "./forward-route.ts";
+import { admitSelectorFromStore, normalizeSelectorStrategy, selectorAdmissionDetail } from "./selector-admission.ts";
+import type { CapabilityFactsLoader } from "./runtime-admission.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   FORWARD_PROTOCOL_SPECS,
   firstConnectIp,
   wireTunnelTypeForForwardProtocol,
+  forwardHasDatagramLane,
   type ForwardProtocol,
 } from "./forward-contract.ts";
 
@@ -49,7 +53,8 @@ export interface OrchestratorNode {
 }
 
 /** Agent runtime configuration mirrored by the Go forwarder contract. */
-export interface AgentTunnelConfig {
+export interface AgentTunnelConfig extends ForwardPolicyInput {
+  policy_scope?: "runtime";
   /** 稳定 id：`tunex-<tunnelId>-<direction>`。Agent 以它为幂等键。 */
   id: string;
   /** EGRESS = exit-side runtime; RELAY = ingress-side runtime. */
@@ -91,7 +96,7 @@ export interface AgentTunnelConfig {
     age_ms: number | null;
     evidence: boolean;
   }[];
-  lb_strategy: "ROUND_ROBIN" | "RANDOM" | "WEIGHTED_ROUND_ROBIN";
+  lb_strategy: "ROUND_ROBIN" | "RANDOM" | "WEIGHTED_ROUND_ROBIN" | "FALLBACK" | "IP_HASH";
   /**
    * : the product protocol this config carries, taken from the forward's
    * RuntimePlan. It is no longer typed as the literal "tcp": the plan is the
@@ -420,7 +425,16 @@ export interface DispatchEgressInput {
   hopPeer?: string | null;
 }
 
-export interface DispatchIngressInput {
+/** Requested policy facts; production intersects fresh workspace ceilings. */
+export interface OrchestratorTunnel extends ForwardPolicyInput {
+  workspace_id?: number;
+}
+export type ForwardPolicySource = (tunnelId: number, revision: number) => Promise<{
+  requested: ForwardPolicyInput;
+  workspace: ForwardWorkspacePolicy;
+}>;
+
+export interface DispatchIngressInput extends OrchestratorTunnel {
   tunnelId: number;
   /**
    *：覆盖运行时 id（联邦远端入口腿用 `federatedTunnelId(ref,"relay")`）。
@@ -442,7 +456,7 @@ export interface DispatchIngressInput {
   tlsKeyPath?: string | null;
 }
 
-export interface DispatchDirectInput {
+export interface DispatchDirectInput extends OrchestratorTunnel {
   tunnelId: number;
   revision: number;
   ingressNode: OrchestratorNode;
@@ -507,6 +521,9 @@ export type TargetHealthSource = (
 }[]>;
 
 export interface OrchestratorOptions {
+  loadForwardPolicy?: ForwardPolicySource;
+  /** Selector admission reads the same advertised facts as runtime admission. */
+  loadCapabilityFacts?: CapabilityFactsLoader;
   /**：健康来源；省略则读观测投影并做  合成。 */
   healthSource?: TargetHealthSource;
   transport: AgentTransport;
@@ -586,6 +603,7 @@ function parseAgentAck(
  * {@link removeTunnel} 是补偿专用：失败回滚时撤掉已经 ACK 的那一端。
  */
 export class Orchestrator {
+  private readonly loadForwardPolicy: ForwardPolicySource | undefined;
   private readonly transport: AgentTransport;
   private readonly validator: ControlValidator;
   private readonly probe: boolean;
@@ -595,12 +613,15 @@ export class Orchestrator {
    * including the empty case, without a database.
    */
   private readonly healthSource: TargetHealthSource;
+  private readonly loadCapabilityFacts: CapabilityFactsLoader | undefined;
 
   constructor(opts: OrchestratorOptions) {
+    this.loadForwardPolicy = opts.loadForwardPolicy;
     this.transport = opts.transport;
     this.validator = opts.validator ?? new ControlValidator();
     this.probe = opts.probeReachable ?? true;
     this.healthSource = opts.healthSource ?? defaultTargetHealthSource;
+    this.loadCapabilityFacts = opts.loadCapabilityFacts;
   }
 
   /* ---------------------------------------------------------------- */
@@ -619,6 +640,9 @@ export class Orchestrator {
     protocol: ForwardProtocol,
     input: { tlsCertPath?: string | null; tlsKeyPath?: string | null },
   ): { tls_cert_path?: string; tls_key_path?: string } {
+    if (protocol === "both" && (input.tlsCertPath || input.tlsKeyPath)) {
+      throw new AgentTransportError(RELAY_DISPATCH_ERROR_CODES.agent_rejected, "native_both_tls_unsupported");
+    }
     if (protocol !== "tls") return {};
     const cert = typeof input.tlsCertPath === "string" ? input.tlsCertPath.trim() : "";
     const key = typeof input.tlsKeyPath === "string" ? input.tlsKeyPath.trim() : "";
@@ -705,6 +729,8 @@ export class Orchestrator {
     nextHop: string;
     protocol?: ForwardProtocol;
   }): Promise<{ ok: true; host: string } | DispatchFailure> {
+    if (input.protocol === "both") return { ok: false,
+      error_code: RELAY_DISPATCH_ERROR_CODES.route_not_dispatchable, error: "native_both_middle_unsupported" };
     const [host, portRaw] = input.nextHop.split(":");
     const nextPort = Number(portRaw);
     if (!host || !Number.isFinite(nextPort) || nextPort <= 0) {
@@ -746,6 +772,9 @@ export class Orchestrator {
    * 连不上的静默故障（这也是既有两段式一直遵守的规则）。
    */
   async dispatchRoute(input: DispatchRouteInput): Promise<RouteDispatchOutcome> {
+    if (input.protocol === "both" && input.plan.hops.length !== 2) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.route_not_dispatchable, error: "native_both_middle_unsupported" };
+    }
     const hops = [...input.plan.hops];
     const last = hops[hops.length - 1];
     if (last === undefined) {
@@ -955,6 +984,12 @@ export class Orchestrator {
     const resourceId = egressId;
     const protocol = input.protocol ?? DEFAULT_FORWARD_PROTOCOL;
 
+    const selector = await admitSelectorFromStore(input.egressNode.id,
+      { strategy: input.lbStrategy, mode: "EGRESS" }, this.loadCapabilityFacts);
+    if (!selector.ok) {
+      return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_rejected, error: selectorAdmissionDetail(selector) };
+    }
+
     const unreachable = await this.reachable(input.egressNode);
     if (unreachable) return unreachable;
 
@@ -995,7 +1030,7 @@ export class Orchestrator {
     // The gate is the TRANSPORT, not the protocol name: "a datagram exit attests its
     // ingress" is a property of the datagram hop, so a future datagram protocol
     // inherits it instead of quietly missing it.
-    const isDatagram = FORWARD_PROTOCOL_SPECS[protocol].transport === "datagram";
+    const isDatagram = forwardHasDatagramLane(protocol);
     const hopPeer = (input.hopPeer ?? "").trim();
     if (isDatagram && hopPeer === "") {
       return {
@@ -1018,11 +1053,13 @@ export class Orchestrator {
       targets,
       // Absent when there is no signal at all, so the wire says "nothing to say"
       // rather than "every target is unknown".
-      ...(targetHealth ? { target_health: targetHealth } : {}),
+      // Current target observations are TCP probes, not UDP evidence. Mixed
+      // runtimes must not feed that untyped health into both lane selectors.
+      ...(protocol !== "both" && targetHealth ? { target_health: targetHealth } : {}),
       // Only datagram tunnels carry it: for a stream hop the field would be a fact
       // nobody reads, and an unread fact is how two paths drift apart.
       ...(isDatagram && hopPeer ? { hop_peer: hopPeer } : {}),
-      lb_strategy: normalizeLbStrategy(input.lbStrategy),
+      lb_strategy: selector.strategy,
       protocol,
       speed_limit: 0,
       revision: input.revision,
@@ -1065,6 +1102,11 @@ export class Orchestrator {
   /* ⑧⑨ 入口下发                                                      */
   /* ---------------------------------------------------------------- */
 
+  private async ingressPolicy(input: OrchestratorTunnel & { tunnelId: number; revision: number }) {
+    const source = this.loadForwardPolicy ? await this.loadForwardPolicy(input.tunnelId, input.revision) : null;
+    return forwardPolicyAgentConfig(source?.requested ?? input, source?.workspace ?? {});
+  }
+
   async dispatchIngress(input: DispatchIngressInput): Promise<RelayDispatchOutcome> {
     // V5.3：RELAY 的**归属持有者是入口节点**（客户端连的 listener 在它身上，被降级时必须
     // 停止服务的也是它），所以认领发生在这里，而不是在出口腿。
@@ -1100,6 +1142,7 @@ export class Orchestrator {
     }
 
     const tlsFields = Orchestrator.tlsFields(protocol, input);
+    const policy = input.runtimeId === undefined ? await this.ingressPolicy(input) : {};
     const config: AgentTunnelConfig = {
       id: relayId,
       mode: "RELAY",
@@ -1112,6 +1155,7 @@ export class Orchestrator {
       lb_strategy: "ROUND_ROBIN",
       protocol,
       speed_limit: 0,
+      ...policy,
       revision: input.revision,
       ...tlsFields,
       ...ownershipFields,
@@ -1167,6 +1211,7 @@ export class Orchestrator {
       return { ok: false, error_code: RELAY_DISPATCH_ERROR_CODES.agent_unreachable, error: ownership.error };
     }
 
+    const policy = await this.ingressPolicy(input);
     const config: AgentTunnelConfig = {
       id: directId,
       mode: "DIRECT",
@@ -1178,7 +1223,7 @@ export class Orchestrator {
       targets: [],
       lb_strategy: "ROUND_ROBIN",
       protocol,
-      speed_limit: 0,
+      ...policy,
       revision: input.revision,
       ...tlsFields,
       ...ownership.fields,
@@ -1492,18 +1537,7 @@ export function splitNextHop(value: string): { host: string; port: number } | nu
 
 /** DB 的 LBStrategy（round/rand）→ Agent 的 LBStrategy（ROUND_ROBIN/...）。 */
 export function normalizeLbStrategy(value: string | null | undefined): AgentTunnelConfig["lb_strategy"] {
-  switch (String(value ?? "").trim().toLowerCase()) {
-    case "rand":
-    case "random":
-      return "RANDOM";
-    case "weighted_round":
-    case "weighted_round_robin":
-      // Agent LoadBalancer executes target weights for this strategy.
-      // Keep the canonical wire spelling so live dispatch and startup restore agree.
-      return "WEIGHTED_ROUND_ROBIN";
-    default:
-      return "ROUND_ROBIN";
-  }
+  return normalizeSelectorStrategy(value) ?? "ROUND_ROBIN";
 }
 
 /** 命令动作联合的类型守卫（供测试/上层复用）。 */

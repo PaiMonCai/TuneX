@@ -75,7 +75,7 @@ describe("A. 协议白名单：前端镜像后端契约，不多不少", () => {
     expect([...FORWARD_PROTOCOLS]).toEqual(backendValues);
     // V5.1b：udp 已经**是**契约值（它过去被用作「枚举里有、运行时没开」的例子，
     // 那个例子现在由 quic/mtcp 之类的值承担）。
-    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp"]);
+    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp", "both"]);
   });
 
   test("FORWARD_TRANSPORTS / 每协议的 transport + lifecycle 逐条等于后端", () => {
@@ -100,7 +100,7 @@ describe("A. 协议白名单：前端镜像后端契约，不多不少", () => {
     // 生命周期取值同样镜像（datagram 的 mapping 是这一维度存在的全部理由）
     for (const transport of FORWARD_TRANSPORTS) {
       const lifecycle = new RegExp(
-        `${transport}: \\{ lifecycle: "(connection|mapping)" \\}`,
+        `${transport}: \\{ lifecycle: "(connection|mapping|connection_and_mapping)" \\}`,
       ).exec(source)?.[1];
       expect(lifecycle, `${transport} 的 lifecycle`).toBeTruthy();
       expect(FORWARD_TRANSPORT_SPECS[transport].lifecycle).toBe(lifecycle);
@@ -510,18 +510,20 @@ describe("D. 渲染：tls / ws / 历史值都照事实，不存在 unknown 兜�
   });
 
 
-  test("编辑器里协议只读（后端 patch 仍不接受 protocol），并给出原因", () => {
+  test("原生普通协议支持增量切换；TLS/WS/历史值仍保留只读说明", () => {
     expect(EDIT_DIALOG).toContain('data-testid="forward-edit-protocol"');
     expect(EDIT_DIALOG).toContain("forward.protocolFixedHint");
-    // 编辑 patch 里不得混入协议字段（后端 ForwardPatchSchema 是 .strict()）
-    expect(EDIT_DIALOG).not.toContain("patch.protocol");
+    // 普通协议转换使用一个增量 patch（后端 ForwardPatchSchema 是 .strict()）。
+    expect(EDIT_DIALOG).toContain("patch.protocol");
+    expect(EDIT_DIALOG).toContain("nativeBothTransitionAllowed");
+    expect(EDIT_DIALOG).toContain('data-testid="forward-edit-protocol-select"');
     const patchBlock =
       /const ForwardPatchSchema = z([\s\S]*?)\.strict\(\)/.exec(BACKEND("src/routes/forwards.ts"))?.[1] ?? "";
     expect(patchBlock).not.toBe("");
-    // 协议仍然不可编辑：schema 里没有 protocol 字段（把 tcp 改成 tls 不是一次编辑）。
-    // 注释里当然会**提到** protocol，所以先剥注释再断言字段声明不存在。
+    // schema 接受 protocol；TLS/WS/历史转换仍由候选校验拒绝，不做隐式转换。
+    // 剥去注释，只断言真实字段声明。
     const patchCode = patchBlock.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    expect(patchCode).not.toContain("protocol");
+    expect(patchCode).toContain("protocol");
     // 但 tls 的路径**已经**可编辑（A1 修订）：schema 必须接受这两列，规则与创建相同
     expect(patchBlock).toContain(
       'tls_cert_path: z.string().trim().min(1).max(512).startsWith("/").optional()',

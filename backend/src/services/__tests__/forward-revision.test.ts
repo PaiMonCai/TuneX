@@ -47,6 +47,11 @@ import {
 /* ------------------------------------------------------------------ */
 
 const BASE_CONFIG: ForwardCandidateConfig = {
+  bytes_per_second_in: 0,
+  bytes_per_second_out: 0,
+  max_connections: 0,
+  max_connections_per_ip: 0,
+  link_resource_id: null,
   name: "web-prod",
   mode: "direct",
   protocol: "tcp",
@@ -453,13 +458,18 @@ describe("F. snapshot 契约形状", () => {
     // V5-WP0 后 protocol 与 topology mode 正交，也必须进入不可变 runtime snapshot。
     const keys = Object.keys(BASE_CONFIG).sort();
     expect(keys).toEqual([
+      "bytes_per_second_in",
+      "bytes_per_second_out",
       "egress_node_id",
       // V5.5 WP15：出口腿"在哪一侧"（本机 / 某个 peer）与入出口节点是同一类放置事实，
       // 因此同样属于不可变 runtime snapshot —— 少了它，重放/补偿会去本机找一条
       // 其实在另一个面板上的腿。
       "federated_egress_peer",
       "ingress_node_id",
+      "link_resource_id",
       "listen_port",
+      "max_connections",
+      "max_connections_per_ip",
       // V5.4：中间跳是运行时放置事实（谁承载这条路由），因此与入出口一样属于不可变
       // runtime snapshot —— 少了它，重放出来的路由会与被批准的那一条不同。
       "middle_node_id",

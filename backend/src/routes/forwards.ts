@@ -7,6 +7,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
+import { FORWARD_POLICY_MAX } from "../services/forward-policy.ts";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { db } from "../db.ts";
 import { canWorkspaceResourceAction, resolveWorkspaceAccess } from "../services/workspace.ts";
@@ -68,6 +69,7 @@ import { forwardBatchDeleteEnabled, parseForwardBatchRequest } from "../services
 import { BILLING_TIME_ZONE, billingDayKeyStamp, billingDayStart } from "../services/billing-time.ts";
 import { dayKeyOf, fillDays } from "../services/traffic.ts";
 import { FORWARD_PROTOCOLS } from "../services/forward-contract.ts";
+import { forwardNativeBothEnabled } from "../services/forward-native-both.ts";
 import {
   forwardListShape,
   forwardOrderBy,
@@ -159,6 +161,10 @@ function send<T>(
 
 export const ForwardCreateSchema = z
   .object({
+    bytes_per_second_in: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
+    bytes_per_second_out: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
+    max_connections: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
+    max_connections_per_ip: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
     name: z.string().trim().min(1).max(60),
     mode: z.enum(["direct", "relay"]),
     protocol: z.enum(FORWARD_PROTOCOLS).optional(),
@@ -193,8 +199,14 @@ export const ForwardCreateSchema = z
  */
 export const ForwardPatchSchema = z
   .object({
+    bytes_per_second_in: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
+    bytes_per_second_out: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
+    max_connections: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
+    max_connections_per_ip: z.number().int().min(0).max(FORWARD_POLICY_MAX).optional(),
     name: z.string().trim().min(1).max(60).optional(),
     mode: z.enum(["direct", "relay"]).optional(),
+    // Native socket protocol changes retain the same Forward identity/port.
+    protocol: z.enum(["tcp", "udp", "both"]).optional(),
     ingress_node_id: z.number().int().positive().optional(),
     egress_node_id: z.number().int().positive().nullable().optional(),
     /** V5.4：中间跳（`null` = 回到单跳）。与入出口同样是运行态放置事实。 */
@@ -227,6 +239,10 @@ export const ForwardPatchSchema = z
   );
 
 const ACTIONS = new Set<ForwardAction>(["retry", "suspend", "resume"]);
+
+forwardsRoutes.get("/capabilities", (c) => c.json({
+  data: { native_both_enabled: forwardNativeBothEnabled() },
+}));
 
 /**
  *  §13.6：列表改为**服务端**分页 / 排序。

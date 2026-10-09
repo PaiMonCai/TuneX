@@ -157,9 +157,10 @@ type Guard struct {
 	report   func(string)
 	onStop   func(cfg forwarder.TunnelConfig)
 
-	mu       sync.Mutex
-	leases   map[string]lease
-	refusals int64
+	mu              sync.Mutex
+	leases          map[string]lease
+	clockGeneration uint64 // CAS stamp for a census-based prune.
+	refusals        int64
 	// leaseStops counts tunnels this guard stopped because their authorisation
 	// lapsed. It is the counter behind "lease expiry means stop" being a fact.
 	leaseStops int64
@@ -281,6 +282,16 @@ func LeaseTunnelRef(agentTunnelID string) (int64, bool) {
 // Every refusal is logged and filed in the error ledger, so it is a fact the
 // panel can read rather than a command that silently did nothing.
 func (g *Guard) Admit(cfg forwarder.TunnelConfig) error {
+	if err := g.CheckActivation(cfg); err != nil {
+		return err
+	}
+	return g.CommitActivation(cfg)
+}
+
+// CheckActivation observes the monotonic fence, but never replaces the LIVE
+// lease clock. A candidate can fail validation, revision admission or binding
+// after this check; only its successful installation may commit the clock.
+func (g *Guard) CheckActivation(cfg forwarder.TunnelConfig) error {
 	if g == nil {
 		return nil
 	}
@@ -340,32 +351,60 @@ func (g *Guard) Admit(cfg forwarder.TunnelConfig) error {
 		})
 	}
 
-	g.record(tunnelID, LeaseFact{
-		TunnelID:   tunnelID,
-		Epoch:      epoch,
-		ExpiresAt:  expires,
-		Revision:   cfg.Revision,
-		Source:     "config",
-		ObservedAt: now,
-	}, hasExpiry)
 	return nil
 }
 
-// record stores one tunnel's deadline.
-//
-// A config that states an epoch but NO deadline leaves any existing deadline
-// alone, and that asymmetry is deliberate: erasing an authorisation must never
-// be possible from a statement that carries no authorisation. A replayed or
-// stale config without ownership facts would otherwise be a way to switch a
-// fenced tunnel's lease clock off and let it serve forever. The only thing that
-// drops a deadline is the sweep's prune, i.e. the tunnel no longer running.
-func (g *Guard) record(tunnelID string, fact LeaseFact, hasClock bool) {
-	if !hasClock {
-		return
+// CommitActivation is called with the manager's actual installed revision.
+// Heartbeat renewal can race installation: keep its later deadline for the same
+// epoch rather than shortening it back to the original command's timestamp.
+func (g *Guard) CommitActivation(cfg forwarder.TunnelConfig) error {
+	if g == nil {
+		return nil
+	}
+	if err := g.CheckActivation(cfg); err != nil {
+		return err
+	}
+	expires, ok := ParseDeadline(strings.TrimSpace(cfg.LeaseExpiresAt))
+	if !ok {
+		g.mu.Lock()
+		g.clockGeneration++ // Even a legacy activation invalidates a census.
+		g.mu.Unlock()
+		return nil // Ownership without a lease does not erase an existing clock.
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.leases[tunnelID] = lease{fact: fact, expires: fact.ExpiresAt, hasClock: true}
+	prev := g.leases[cfg.ID]
+	if prev.hasClock && prev.fact.Epoch == cfg.OwnershipEpoch {
+		if prev.fact.Revision > cfg.Revision {
+			return fmt.Errorf("ownership: applied revision %d is behind committed revision %d", cfg.Revision, prev.fact.Revision)
+		}
+		if prev.expires.After(expires) {
+			expires = prev.expires
+		}
+	}
+	g.leases[cfg.ID] = lease{fact: LeaseFact{TunnelID: cfg.ID, Epoch: cfg.OwnershipEpoch,
+		ExpiresAt: expires, Revision: cfg.Revision, Source: "config", ObservedAt: g.now()},
+		expires: expires, hasClock: true}
+	g.clockGeneration++
+	return nil
+}
+
+// CompensationConfig retains only the effective renewal of THIS applied
+// epoch/revision. It never borrows authorization from a newer candidate/owner.
+func (g *Guard) CompensationConfig(cfg forwarder.TunnelConfig) forwarder.TunnelConfig {
+	if g == nil {
+		return cfg
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if current, ok := g.leases[cfg.ID]; ok && current.hasClock &&
+		current.fact.Epoch == cfg.OwnershipEpoch && current.fact.Revision == cfg.Revision {
+		offered, valid := ParseDeadline(cfg.LeaseExpiresAt)
+		if !valid || current.expires.After(offered) {
+			cfg.LeaseExpiresAt = current.expires.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return cfg
 }
 
 // ObserveRenewals applies the ownership facts the panel returned in a state
@@ -392,11 +431,11 @@ func (g *Guard) ObserveRenewals(renewals []Renewal, at time.Time) (int, int) {
 	// running. This is the join, and building it from the registry (rather than
 	// caching an id table) means a removed or renamed tunnel cannot be renewed
 	// by a stale entry.
-	byRef := map[int64][]string{}
+	byRef := map[int64][]forwarder.TunnelConfig{}
 	if g.registry != nil {
 		for _, cfg := range g.registry.List() {
 			if ref, ok := LeaseTunnelRef(cfg.ID); ok {
-				byRef[ref] = append(byRef[ref], cfg.ID)
+				byRef[ref] = append(byRef[ref], cfg)
 			}
 		}
 	}
@@ -421,20 +460,22 @@ func (g *Guard) ObserveRenewals(renewals []Renewal, at time.Time) (int, int) {
 			missed++
 			continue
 		}
-		for _, id := range ids {
+		for _, cfg := range ids {
+			id := cfg.ID
 			prev := g.leases[id]
-			// A renewal may raise the epoch's clock but never the fence: the
-			// fence is raised by Admit, i.e. by an activation, and the panel's
-			// renewal answer is not one. The epoch is still recorded so the diag
-			// surface shows the generation the panel currently grants.
-			epoch := prev.fact.Epoch
-			if r.Epoch > epoch {
-				epoch = r.Epoch
+			// Match both the census captured above and the clock committed under
+			// this lock. A candidate can never renew an older applied revision;
+			// a stale census cannot renew a newer runtime installed meanwhile.
+			if !prev.hasClock || r.Epoch != cfg.OwnershipEpoch || r.Revision != cfg.Revision ||
+				r.Epoch != prev.fact.Epoch || r.Revision != prev.fact.Revision ||
+				expires.Before(prev.expires) {
+				missed++
+				continue
 			}
 			g.leases[id] = lease{
 				fact: LeaseFact{
 					TunnelID:   id,
-					Epoch:      epoch,
+					Epoch:      r.Epoch,
 					ExpiresAt:  expires,
 					Revision:   r.Revision,
 					Source:     "report",
@@ -498,12 +539,15 @@ func (g *Guard) SweepOnce(now time.Time) []string {
 	if g == nil || g.registry == nil {
 		return nil
 	}
+	g.mu.Lock()
+	clockGeneration := g.clockGeneration
+	g.mu.Unlock()
 	running := g.registry.List()
 	live := make(map[string]bool, len(running))
 	for _, cfg := range running {
 		live[cfg.ID] = true
 	}
-	g.pruneLeases(live)
+	g.pruneLeases(live, clockGeneration)
 
 	var expired []forwarder.TunnelConfig
 	for _, cfg := range running {
@@ -570,9 +614,14 @@ func (g *Guard) noteLeaseStop(tunnelID string, deadline, at time.Time) {
 
 // pruneLeases drops deadlines for tunnels this node no longer runs, so the table
 // stays bounded by the running set instead of growing with history.
-func (g *Guard) pruneLeases(live map[string]bool) {
+func (g *Guard) pruneLeases(live map[string]bool, generation uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// An activation committed after the census stamp: this live set cannot
+	// prove its clock is orphaned. Retry pruning on the next fresh sweep.
+	if generation != g.clockGeneration {
+		return
+	}
 	for id := range g.leases {
 		if !live[id] {
 			delete(g.leases, id)

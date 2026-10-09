@@ -77,6 +77,8 @@ const (
 	// UDP remain fail-closed. Full semantics live in
 	// the datagram runtime contract.
 	ProtocolUDP ForwardProtocol = "udp"
+	// Both is one rule with separate TCP connections and UDP mappings.
+	ProtocolBoth ForwardProtocol = "both"
 )
 
 // ForwardTransport is the data-plane lifecycle contract that carries a protocol.
@@ -100,6 +102,7 @@ const (
 	//   - "the upstream address" is not a per-client fact, so retargeting moves
 	//     only the mappings created afterwards (§3.4).
 	TransportDatagram ForwardTransport = "datagram"
+	TransportMixed    ForwardTransport = "mixed"
 )
 
 // protocolRuntime binds a protocol to the transport contract that actually
@@ -119,6 +122,7 @@ var protocolRuntimes = []protocolRuntime{
 	{Protocol: ProtocolTLS, Transport: TransportStream},
 	{Protocol: ProtocolWS, Transport: TransportStream},
 	{Protocol: ProtocolUDP, Transport: TransportDatagram},
+	{Protocol: ProtocolBoth, Transport: TransportMixed},
 }
 
 // ParseForwardProtocol normalises a wire value and fails closed for protocols
@@ -381,9 +385,34 @@ type TunnelConfig struct {
 	Targets    []Target        `json:"targets,omitempty"`
 	LBStrategy LBStrategy      `json:"lb_strategy"`
 	Protocol   ForwardProtocol `json:"protocol"`
-	SpeedLimit int64           `json:"speed_limit"`
-	Revision   int64           `json:"revision"`
-	ListenHost string          `json:"listen_host,omitempty"`
+	// SpeedLimit is the legacy ceiling in payload bytes/second PER DIRECTION,
+	// shared by this runtime's clients. Zero is unlimited. A positive value is
+	// combined with each explicit directional limit by taking the lower ceiling.
+	SpeedLimit int64 `json:"speed_limit"`
+	// PolicyScope currently supports only "runtime" (empty means runtime):
+	// one listener/runtime owns one gate and two shared directional buckets.
+	// It does not pool capacity across nodes, transports, or tunnel IDs.
+	PolicyScope PolicyScope `json:"policy_scope,omitempty"`
+	// In means client -> target/hop; Out means target/hop -> client. These meter
+	// payload bytes, excluding TLS, WebSocket and datagram-hop framing.
+	BytesPerSecondIn  int64 `json:"bytes_per_second_in,omitempty"`
+	BytesPerSecondOut int64 `json:"bytes_per_second_out,omitempty"`
+	// RateBurstBytes is the capacity of EACH directional bucket. Zero selects
+	// 100ms of its rate, bounded to [1, 32768] bytes; buckets start full.
+	RateBurstBytes int64 `json:"rate_burst_bytes,omitempty"`
+	// Stream ceilings include pending handshakes/dials; UDP counts mappings.
+	// Source IP is the socket
+	// peer's normalized IP, never its port or a count of distinct IPs. At egress
+	// the socket peer is the previous hop, not the original end user.
+	MaxConnections      int64 `json:"max_connections,omitempty"`
+	MaxConnectionsPerIP int   `json:"max_connections_per_ip,omitempty"`
+	// UDP ceilings count client mappings, not TCP connections. The effective total
+	// is the lower of this ceiling and the runtime's MaxMappings safety ceiling.
+	// Zero adds no policy ceiling; the existing safety ceiling remains in force.
+	MaxMappings            int64  `json:"max_mappings,omitempty"`
+	MaxMappingsPerSourceIP int    `json:"max_mappings_per_source_ip,omitempty"`
+	Revision               int64  `json:"revision"`
+	ListenHost             string `json:"listen_host,omitempty"`
 	// TargetHealth is the panel's per-target health, parallel to Targets
 	// the same identities in the same order, carrying a
 	// different kind of fact.
@@ -456,6 +485,14 @@ func (c *TunnelConfig) Validate() error {
 		return err
 	}
 	c.Protocol = protocol
+	if err := c.validatePolicy(); err != nil {
+		return err
+	}
+	// The UDP exit has its own owner/runtime. Until it wires the shared policy
+	// helper, refuse policy there rather than acknowledging ineffective limits.
+	if (protocol == ProtocolUDP || protocol == ProtocolBoth) && mode == ModeEgress && c.hasPolicy() {
+		return errors.New("forwarder: udp EGRESS policy is not wired; enforce limits at DIRECT/RELAY ingress")
+	}
 
 	// A TLS front is a client-facing listener. EGRESS listens for the ingress
 	// node, not for a client, and the hop is plain TCP by contract — so asking
@@ -467,6 +504,9 @@ func (c *TunnelConfig) Validate() error {
 		if strings.TrimSpace(c.TLSCertPath) == "" || strings.TrimSpace(c.TLSKeyPath) == "" {
 			return fmt.Errorf("forwarder: tls tunnel %s needs tls_cert_path and tls_key_path", c.ID)
 		}
+	}
+	if protocol == ProtocolBoth && (c.TLSCertPath != "" || c.TLSKeyPath != "") {
+		return errors.New("forwarder: both requires a plain TCP front and UDP, not TLS paths")
 	}
 	// WS is a client-facing front like TLS: an EGRESS listener faces the ingress
 	// node, and that hop is plain TCP by contract.
@@ -483,11 +523,11 @@ func (c *TunnelConfig) Validate() error {
 	//   - RELAY: allowed. The ingress keeps one socket toward the exit and carries
 	//     every client mapping over it, tagged with a hop header; `next_hop` names
 	//     that socket's destination, so an empty one is refused with that name.
-	if protocol == ProtocolUDP && mode == ModeEgress && strings.TrimSpace(c.HopPeer) == "" {
+	if (protocol == ProtocolUDP || protocol == ProtocolBoth) && mode == ModeEgress && strings.TrimSpace(c.HopPeer) == "" {
 		return fmt.Errorf(
 			"forwarder: udp EGRESS tunnel %s needs hop_peer (the paired ingress address); refusing to accept hop packets from an unattested source", c.ID)
 	}
-	if protocol == ProtocolUDP && mode == ModeRelay && strings.TrimSpace(c.NextHop) == "" {
+	if (protocol == ProtocolUDP || protocol == ProtocolBoth) && mode == ModeRelay && strings.TrimSpace(c.NextHop) == "" {
 		return fmt.Errorf(
 			"forwarder: udp RELAY tunnel %s needs next_hop (the egress node address) to send client datagrams to", c.ID)
 	}

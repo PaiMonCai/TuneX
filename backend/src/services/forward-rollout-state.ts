@@ -96,6 +96,8 @@ export interface RolloutExecResult {
 
 /** `executeRollout` 的依赖注入（测试替身）。 */
 export interface RolloutDeps {
+  /** Offline seam for all-node native composite admission before side effects. */
+  loadCapabilityFacts?: import("./runtime-admission.ts").CapabilityFactsLoader;
   /**
    * 数据访问。**必填** 调用方（route/worker）显式传 `db`，测试传内存替身。
    * 做成可选会让「忘了注入就静默走进程单例」成为可能——而那正是 rollout

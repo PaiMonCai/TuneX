@@ -47,6 +47,17 @@ if (process.env.TUNEX_DB_TEST !== "1") {
         credential_revoked: false,
       },
     });
+    // This fixture ACKs current policy-bearing commands. Advertise that fact
+    // through the authenticated machine endpoint; never weaken the runtime gate.
+    const state = await app.request("http://localhost/api/internal/node/state", {
+      method: "POST",
+      headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
+      body: JSON.stringify({ agent_id: node.agent_id, version: "0.0.0-ci", role: "ingress",
+        control_protocol_version: 2,
+        capabilities: ["apply_tunnel", "remove_tunnel", "suspend_tunnel", "forward.policy.runtime.v1"],
+        tunnels: [], used_ports: [] }),
+    });
+    assert.equal(state.status, 200, `fake Agent policy advertisement failed: ${state.status}`);
     return { node, credential };
   }
 

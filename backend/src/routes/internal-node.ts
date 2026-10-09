@@ -18,6 +18,7 @@
 import { Hono } from "hono";
 import type { AppVariables } from "../middlewares/auth.ts";
 import { authenticateNode } from "../services/node-credential.ts";
+import { LinkTrafficError, readLinkTrafficBody, submitLinkTraffic } from "../services/link-traffic.ts";
 import {
   buildReconnectSnapshot,
   extractBearerCredential,
@@ -97,6 +98,20 @@ async function authedNode(
   }
   return { ok: true, node_id: auth.node_id, scope: auth.scope };
 }
+
+/** POST /api/internal/node/link-traffic: ingress cumulative totals, committed before ACK. */
+internalNodeRoutes.post("/node/link-traffic", async (c) => {
+  try {
+    const auth = await authedNode(c.req.header("authorization"));
+    if (!auth.ok) return c.json({ ok: false, error: auth.reason }, auth.status);
+    const result = await submitLinkTraffic(auth.node_id, await readLinkTrafficBody(c.req.raw));
+    if (!result.ok) return c.json({ ok: false, error: result.reason }, result.status);
+    return c.json({ data: { accepted: result.accepted } });
+  } catch (error) {
+    if (error instanceof LinkTrafficError) return c.json({ ok: false, error: error.code }, error.status);
+    return c.json({ ok: false, error: "link_traffic_storage_failure" }, 503);
+  }
+});
 
 /**
  * POST /api/internal/node/state —— 状态上报

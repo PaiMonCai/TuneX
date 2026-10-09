@@ -1,0 +1,168 @@
+{
+  "upstream_commit": "cb0ef0bb156dc114e4344c887328018491fbd638",
+  "modified_by": "TuneX core ABCD integration",
+  "date": "2026-10-08",
+  "summary": [
+    "Opt-in exact rule/protocol/target authorization",
+    "Private managed config reload with digest confirmation and unchanged sibling preservation",
+    "Both protocol lanes share limiters and admission",
+    "Managed rule shutdown closes both stream endpoints and cancels limiter waits",
+    "Opt-in managed entry payload traffic snapshots with per-producer/rule/Shanghai-day cumulative counters",
+    "Private atomic bounded traffic files, one-second sampling/final flush and fail-closed persistence errors; no node credentials in FXP",
+    "Negotiated same-process traffic epochs with durable prepare/seal recovery and exact acknowledged reclamation without restarting TCP/UDP sessions",
+    "Strict private bounded no-follow rotation controls and a secret-free executable capability probe",
+    "Negotiated ordered business target sets with exact per-rule/protocol authorization, fallback/RR/random and bounded failure/recovery observations",
+    "Fixed UDP source mappings retarget sockets without resetting AEAD sequence or replay state; bounded closed-session wire history across policy reloads",
+    "Bounded auxiliary TCP probe workers, no-probe TCP half-open recovery, and secret-free digest-bound target status",
+    "Negotiated shared TCP client source policies reuse PROXY codecs/IP_HASH with canonical trusted CIDRs, bounded absolute header reads and authenticated rule/policy source attestations",
+    "Exit-owned PROXY send/version and canonical source selection; per-effective-source admission and changed-rule-only policy revocation, legacy/UDP source combinations fail closed",
+    "Source edits preserve shared carrier processes; bounded PROXY emission is linearized with current-policy revocation and tracked target closure; strict v1 grammar and bounded safe atomic-config snapshot retries"
+  ],
+  "files": [
+    {
+      "path": "forwardx-fxp/binding_auth.go",
+      "original_sha256": null,
+      "modified_sha256": "f4ca46f98a9b7b3c26bce8683f80c8825e64bcd95f59c409f047aa4ee82bae59",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/binding_auth_test.go",
+      "original_sha256": null,
+      "modified_sha256": "df8000ccdeab9ce0f0bef12fa1fca79b530d8cb8b356bfff1f2a6f280b275b6a",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/config.go",
+      "original_sha256": "d637af32bc06f83995be8ff295e84cbc85c6bf5a0f33e3a2d5c27365480c40aa",
+      "modified_sha256": "99d584ca0a18a9a12d4e9fe7b7859e72690f1ed4baa1b83625be71aa2c0d0b0a",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/config_types.go",
+      "original_sha256": "90c05ffae2ba96716b62405c1f6cf3f2231638cef3ca2a5f9271689d6754d310",
+      "modified_sha256": "9fd926f5108b25ec6159930d3c7d8b7ab7360173f207d47eeb373bd5fa85368d",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/main.go",
+      "original_sha256": "f138489498e0a87fe58abe3c8780928998d441a08c56e21a41d427fbcbbc9411",
+      "modified_sha256": "35afb4009d9fde893bbd09b71684f33fab6e701dd1ba562c6f4d7ab0a8d316cf",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/managed_reload.go",
+      "original_sha256": null,
+      "modified_sha256": "033d9ed101c44dda7f45357d1bdc8d2c375f1a975a26c9bd3c8ab79154d4e248",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_reload_test.go",
+      "original_sha256": null,
+      "modified_sha256": "9295635b7f0e9eeb47abec08142ddcd4a82be5f7573d45c73beddcca3d9802c8",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_sources.go",
+      "original_sha256": null,
+      "modified_sha256": "c21361597fa3a42628b8311398dbc903c087d23a1311928370d7bf2844c49642",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_sources_integration_test.go",
+      "original_sha256": null,
+      "modified_sha256": "c7ed09fc997374e344b37c8c459e3c1d0e45c7b72fe81302edde46605129bab3",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_sources_test.go",
+      "original_sha256": null,
+      "modified_sha256": "0ef67998d8c8a9e25ce32abca7b5b934a8e98815c2ec270d1ca182f3838071c6",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_targets.go",
+      "original_sha256": null,
+      "modified_sha256": "fc66d582626478b97c11d907be640103aaee08b51e6e54f7ca4528feaf189207",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_targets_integration_test.go",
+      "original_sha256": null,
+      "modified_sha256": "56b351767bfb71270e07bc7de53468ae8ca0bc7984978e14d3687d404b0ce914",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_targets_test.go",
+      "original_sha256": null,
+      "modified_sha256": "deeda9cabb00055c891cac0dc7d451900c86fb761ba9e5688763264ef1de323b",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_targets_udp.go",
+      "original_sha256": null,
+      "modified_sha256": "cfef82b263164e68d59718a9497b1e6aac0cfae958b12997273841904d4b1e35",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_targets_wire.go",
+      "original_sha256": null,
+      "modified_sha256": "f5ad5a076c71fc8306cc59c1c7a213285d06fb946a1bca2ac57f4c8b7c23a6f1",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic.go",
+      "original_sha256": null,
+      "modified_sha256": "ce3a9e37190916772e429039f35f557c8e47115366f81b946dfe715ea8e49d4c",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_control_linux.go",
+      "original_sha256": null,
+      "modified_sha256": "f487a3588b3fcb1a91a29b237f29c4581b9abd249878a316f65bacebe07ee16d",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_control_unsupported.go",
+      "original_sha256": null,
+      "modified_sha256": "478131c2a967af6a20324c3088e09f55e3cc8ed40d6c9c98606f255c1bbaac34",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_control_windows.go",
+      "original_sha256": null,
+      "modified_sha256": "67d7fc001d1b9a65f59c877d6f5d569d356e6a5ab70658c403cac74cd275a112",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_rotation.go",
+      "original_sha256": null,
+      "modified_sha256": "38021ffdd79fc3a6ce4481954505ae88261c25f1e5c3a27f98667fa05d2bf078",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_rotation_test.go",
+      "original_sha256": null,
+      "modified_sha256": "c50a7aa5b1b76a06dd5c140ab346fe0fe997bd742d0f97be5f062216086c8094",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/managed_traffic_test.go",
+      "original_sha256": null,
+      "modified_sha256": "1ce24d309ca17906c2692f25da5e393334613a60a1d4e20c27f5b5afea7843b0",
+      "change": "added"
+    },
+    {
+      "path": "forwardx-fxp/traffic.go",
+      "original_sha256": "da3a0cac909081759c4b0de3ebcebe42fc0b929ea2d7ef20387cee938f468216",
+      "modified_sha256": "9155904110a10449c81ac215a3cc9c46a88a14c4a1bfa007aaf08005ad327ab7",
+      "change": "modified"
+    },
+    {
+      "path": "forwardx-fxp/udp_direct.go",
+      "original_sha256": "3315b15f6794631ad4868f18ef3a52d696d69e5f3b989fee086550a5bc15a26d",
+      "modified_sha256": "e1e038f41456553f57f08a0a853ff2077e0bfcaaa3716493a835e52e23187039",
+      "change": "modified"
+    }
+  ],
+  "hash_format": "SHA256 of canonical Git source blobs; checkout line-ending conversion is not included"
+}

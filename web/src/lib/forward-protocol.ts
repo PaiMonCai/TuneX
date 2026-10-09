@@ -27,7 +27,7 @@ import type { Locale } from "./i18n";
  * （含 `wss` / `mtls` / `tunex` 等历史实现名）。「枚举里有这个名字」不等于
  * 「产品支持这个协议」（V5-WP0 立的规矩）。
  */
-export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws", "udp"] as const;
+export const FORWARD_PROTOCOLS = ["tcp", "tls", "ws", "udp", "both"] as const;
 
 export type ForwardProtocol = (typeof FORWARD_PROTOCOLS)[number];
 
@@ -44,7 +44,7 @@ export const TLS_FORWARD_PROTOCOL: ForwardProtocol = "tls";
  * V5.1b 增加 `datagram`（DEVELOPMENT.md §6.2）：udp 是第一个**不在** stream 上的
  * 协议。传输是**派生**量，永远不是第二个用户字段。
  */
-export const FORWARD_TRANSPORTS = ["stream", "datagram"] as const;
+export const FORWARD_TRANSPORTS = ["stream", "datagram", "mixed"] as const;
 
 export type ForwardTransport = (typeof FORWARD_TRANSPORTS)[number];
 
@@ -58,22 +58,23 @@ export type ForwardTransport = (typeof FORWARD_TRANSPORTS)[number];
  *
  * 界面凡是要说「连接」的地方，都必须先问这里：datagram 上说「连接」就是错的事实。
  */
-export type ForwardTransportLifecycle = "connection" | "mapping";
+export type ForwardTransportLifecycle = "connection" | "mapping" | "connection_and_mapping";
 
 export const FORWARD_TRANSPORT_SPECS: Readonly<
   Record<ForwardTransport, { readonly lifecycle: ForwardTransportLifecycle }>
 > = {
   stream: { lifecycle: "connection" },
   datagram: { lifecycle: "mapping" },
+  mixed: { lifecycle: "connection_and_mapping" },
 };
 
 export interface ForwardProtocolSpec {
   readonly transport: ForwardTransport;
   /**
    * legacy `Tunnel.tunnel_type` 的兼容值；`null` = 该枚举里没有能表达这个协议的
-   * 名字（`ws` 是唯一一例：枚举里只有历史 wrapper 名 `wss`，写它就是撒谎）。
+   * 名字（`ws` / `both`：历史 wrapper `wss` 或独立 `tcp` 都不能替代它们）。
    */
-  readonly legacy_tunnel_type: string | null;
+  readonly legacy_tunnel_type: "tcp" | "tls" | "udp" | null;
 }
 
 /** 协议 → 传输/兼容列的唯一映射表（逐字镜像后端 `FORWARD_PROTOCOL_SPECS`）。 */
@@ -86,6 +87,7 @@ export const FORWARD_PROTOCOL_SPECS: Readonly<
   // V5.1b：udp 是 datagram 的第一位成员。legacy 枚举里一直有 `udp`，所以这次
   // 不需要协议迁移（与 ws 的处境不同）。
   udp: { transport: "datagram", legacy_tunnel_type: "udp" },
+  both: { transport: "mixed", legacy_tunnel_type: null },
 };
 
 /** 后端 zod schema 对证书/私钥路径的长度上限（`max(512)`）。 */
@@ -105,7 +107,7 @@ export type ForwardProtocolFact = ForwardProtocol | (string & {});
 export const FORWARD_PROTOCOL_OPTIONS: readonly {
   value: ForwardProtocol;
   label: string;
-}[] = FORWARD_PROTOCOLS.map((value) => ({ value, label: value.toUpperCase() }));
+}[] = FORWARD_PROTOCOLS.map((value) => ({ value, label: forwardProtocolLabel(value) }));
 
 export function isForwardProtocol(value: unknown): value is ForwardProtocol {
   return (
@@ -150,7 +152,7 @@ export function forwardTransportLifecycle(
  */
 export function forwardProtocolHasConnections(value: unknown): boolean | null {
   const lifecycle = forwardTransportLifecycle(value);
-  return lifecycle === null ? null : lifecycle === "connection";
+  return lifecycle === null ? null : lifecycle !== "mapping";
 }
 
 /**
@@ -181,7 +183,8 @@ export function forwardProtocolSupported(value: unknown, legacy?: unknown): bool
  * 替换掉。
  */
 export function forwardProtocolLabel(value: unknown, legacy?: unknown): string {
-  return forwardProtocolFact(value, legacy).toUpperCase();
+  const fact = forwardProtocolFact(value, legacy);
+  return fact === "both" ? "TCP + UDP" : fact.toUpperCase();
 }
 
 /**
@@ -295,6 +298,10 @@ export function forwardProtocolNote(
 ): string {
   const zh = locale !== "en";
   switch (protocol) {
+    case "both":
+      return zh
+        ? "原生普通 TCP + UDP，一个业务 ID、一个监听端口、一条共享预算；TCP 流与 UDP 活跃映射共享总并发、每来源 IP 并发及双向速率上限。仅支持 DIRECT 或本地单跳 RELAY，不支持中间跳、联邦、TLS、WS 或来源透传。"
+        : "Native plain TCP + UDP: one business ID, one listen port and one shared budget for TCP streams + active UDP mappings, including total/per-source-IP concurrency and directional rates. DIRECT or single-hop local RELAY only; no middle hop, federation, TLS, WS or client-source forwarding.";
     case "udp":
       // datagram：工作单位是**映射**，不是连接（§6.2）。措辞里必须出现「没有连接」，
       // 因为这个协议最容易被人按 TCP 的连接模型理解。

@@ -14,6 +14,7 @@
  * 再建一条」，所以本模块不新增任何 API 调用。
  */
 import type { ForwardCreateInput, PortForward } from "@/lib/types";
+import { FORWARD_POLICY_FIELDS, forwardPolicyDraft, forwardPolicyDraftValues, type ForwardPolicyDraft } from "@/lib/forward-policy";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   forwardProtocolFields,
@@ -22,7 +23,7 @@ import {
 } from "@/lib/forward-protocol";
 
 /** 编辑器 / 创建表单共用的草稿形状（全字符串，便于受控输入与表单预检）。 */
-export type ForwardDraft = {
+export type ForwardDraft = ForwardPolicyDraft & {
   name: string;
   mode: "direct" | "relay";
   ingressId: string;
@@ -35,9 +36,8 @@ export type ForwardDraft = {
 /**
  * 创建/复制草稿 = 编辑草稿 + 协议字段。
  *
- * 分开定义（而不是把协议塞进 {@link ForwardDraft}）是因为**协议本身不可编辑**：
- * 后端 `ForwardPatchSchema` 不接受 `protocol`（把 tcp 改成 tls 不是一次编辑），
- * 编辑器草稿里放一个永远不会被保存的字段，是让人误以为能改的地方。
+ * 创建协议受契约白名单约束；编辑草稿另接受持久化协议事实，只开放普通
+ * tcp / udp / 原生 both 切换，TLS / WS / 历史协议仍然固定。
  *
  * （tls 的证书路径**可以**编辑，所以编辑器草稿里另有这两个字段 —— 见
  * `forward-edit-dialog.tsx` 的编辑草稿类型。）
@@ -58,6 +58,7 @@ export type ForwardCopyDraft = ForwardDraft & {
 
 /** 后端 `ForwardCreateSchema` 的字段集（`.strict()`：键集合必须完全一致）。 */
 export const FORWARD_CREATE_KEYS = [
+  ...FORWARD_POLICY_FIELDS,
   "name",
   "mode",
   "protocol",
@@ -77,6 +78,7 @@ export const FORWARD_TLS_CREATE_KEYS = ["tls_cert_path", "tls_key_path"] as cons
  * 把源行整行 spread 进 create（那会让 `.strict()` 400，或更糟：污染运行态）。
  */
 export const FORWARD_COPY_FORBIDDEN_FIELDS = [
+  "link_resource_id",
   "id",
   "status",
   "desired_status",
@@ -135,6 +137,7 @@ export function forwardCopyDraft(forward: PortForward, suffix: string): ForwardC
   const mode: "direct" | "relay" = forward.mode === "relay" ? "relay" : "direct";
   const protocol = forwardProtocolForCreate(forward.protocol) ?? DEFAULT_FORWARD_PROTOCOL;
   return {
+    ...forwardPolicyDraft(forward),
     name: forwardCopyName(forward, suffix),
     mode,
     ingressId: forward.ingress_node_id ? String(forward.ingress_node_id) : "",
@@ -163,6 +166,7 @@ export function forwardCopyCreateInput(draft: ForwardCopyDraft): ForwardCreateIn
   const listen = draft.listenPort.trim() ? Number(draft.listenPort.trim()) : null;
   const egress = draft.mode === "relay" && draft.egressId ? Number(draft.egressId) : null;
   return {
+    ...forwardPolicyDraftValues(draft),
     name: draft.name.trim().slice(0, FORWARD_NAME_MAX),
     mode: draft.mode,
     ingress_node_id: Number(draft.ingressId),

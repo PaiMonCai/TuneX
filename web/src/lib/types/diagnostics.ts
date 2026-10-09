@@ -55,6 +55,8 @@ export interface DiagnoseSegment {
 
 export interface DiagnoseReport {
   forward_id: number;
+  /** Desired protocol, if projected; never means the runtime has converged. */
+  protocol?: string;
   mode: "direct" | "relay";
   generated_at: string;
   segments: DiagnoseSegment[];

@@ -1,4 +1,6 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { fileURLToPath } from "node:url";
+import type { ReportedLinkPlacement } from "../node-state-report.ts";
 
 /**
  * WP3 — NodePortLease / Port Allocator 离线测试（不连 MySQL / Redis）。
@@ -38,6 +40,9 @@ interface LeaseRow {
   node_id: number;
   port: number;
   tunnel_id: number | null;
+  link_id: number | null;
+  protocol: string;
+  bind_scope: string;
   lease_type: "ingress" | "egress";
   status: "active" | "released";
   expires_at: Date | null;
@@ -120,7 +125,18 @@ function makeRedis(opts: { alwaysFailLock?: boolean } = {}) {
 
 /** 内存 Prisma 替身（只实现 portPool 用到的五个方法）。 */
 function makeDb() {
-  return {
+  let tail: Promise<unknown> = Promise.resolve();
+  const db = {
+    async $queryRawUnsafe(query: string, ..._values: unknown[]) {
+      if (!query.includes("FOR UPDATE") || !query.includes("node_id = ? AND port = ?")) throw new Error("missing node+port range lock");
+      return [];
+    },
+    async $transaction<T>(fn: (tx: import("../portPool.ts").PortPoolTransaction) => Promise<T>, options?: { isolationLevel: "Serializable" }): Promise<T> {
+      expect(options?.isolationLevel).toBe("Serializable");
+      const next = tail.then(() => fn(db as unknown as import("../portPool.ts").PortPoolTransaction));
+      tail = next.catch(() => undefined);
+      return next;
+    },
     node: {
       async findUnique(args: { where: { id: number } }): Promise<NodeRow | null> {
         return nodes.get(args.where.id) ?? null;
@@ -137,19 +153,25 @@ function makeDb() {
           node_id: number;
           port: number;
           tunnel_id: number | null;
+          link_id?: number | null;
+          protocol?: string;
+          bind_scope?: string;
           lease_type: "ingress" | "egress";
           status: string;
           expires_at: Date | null;
         };
       }): Promise<LeaseRow> {
         // @@unique([node_id, port]) —— 与 status 无关，released 行同样占位。
-        const clash = leases.find((l) => l.node_id === args.data.node_id && l.port === args.data.port);
+        const clash = leases.find((l) => l.node_id === args.data.node_id && l.port === args.data.port && l.protocol === (args.data.protocol ?? "tcp") && l.bind_scope === (args.data.bind_scope ?? "*"));
         if (clash) throw prismaUniqueError("node_id, port");
         const row: LeaseRow = {
           id: nextLeaseId++,
           node_id: args.data.node_id,
           port: args.data.port,
           tunnel_id: args.data.tunnel_id,
+          link_id: args.data.link_id ?? null,
+          protocol: args.data.protocol ?? "tcp",
+          bind_scope: args.data.bind_scope ?? "*",
           lease_type: args.data.lease_type,
           status: args.data.status as LeaseRow["status"],
           expires_at: args.data.expires_at,
@@ -173,13 +195,14 @@ function makeDb() {
         return leases.find((l) => l.id === args.where.id) ?? null;
       },
       async findMany(args: {
-        where: { node_id?: number; status?: string };
+        where: { node_id?: number; port?: number; status?: string };
         select?: Record<string, boolean>;
       }): Promise<Record<string, unknown>[]> {
         let out = leases.filter(
           (l) =>
             (args.where.node_id === undefined || l.node_id === args.where.node_id) &&
-            (args.where.status === undefined || l.status === args.where.status),
+            (args.where.status === undefined || l.status === args.where.status) &&
+            (args.where.port === undefined || l.port === args.where.port),
         );
         if (!args.select) return out as unknown as Record<string, unknown>[];
         return out.map((l) => {
@@ -204,6 +227,7 @@ function makeDb() {
           node_id?: number;
           port?: number;
           tunnel_id?: number;
+          link_id?: number;
           status?: string;
         };
         data: Partial<LeaseRow>;
@@ -219,6 +243,7 @@ function makeDb() {
           if (w.node_id !== undefined && l.node_id !== w.node_id) continue;
           if (w.port !== undefined && l.port !== w.port) continue;
           if (w.tunnel_id !== undefined && l.tunnel_id !== w.tunnel_id) continue;
+          if (w.link_id !== undefined && l.link_id !== w.link_id) continue;
           if (w.status !== undefined && l.status !== w.status) continue;
           Object.assign(l, args.data);
           count++;
@@ -227,6 +252,7 @@ function makeDb() {
       },
     },
   };
+  return db;
 }
 
 /**
@@ -246,8 +272,17 @@ function harness(opts: { alwaysFailLock?: boolean } = {}) {
   const db = makeDb();
   const redis = makeRedis(opts);
   // 内存替身直接通过 AcquirePortInput.deps / 第二参传进去。
-  const deps = { db, redis } as unknown as Parameters<typeof pool.acquirePort>[1];
+  const deps = { db, redis, agentUsedPorts: async () => [] } as unknown as Parameters<typeof pool.acquirePort>[1];
   return { db, redis, deps };
+}
+
+function carrierReport(overrides: Partial<ReportedLinkPlacement> = {}): ReportedLinkPlacement {
+  return { id: "tunex-link-30-p1-egress", link_id: 30, workspace_id: 7, node_id: 1, role: "egress",
+    generation: 2, observed_generation: 2, config_digest: "a".repeat(64), desired_config_digest: "a".repeat(64),
+    ready: true, state: "ready", lease_expires_at: new Date(Date.now() + 60_000).toISOString(),
+    runtime_ids: ["link-30-v1-exit-tcp", "link-30-v1-exit-udp"],
+    ports: [{ protocol: "tcp", host: "", port: 19000 }, { protocol: "udp", host: "", port: 19000 }],
+    ...overrides };
 }
 
 beforeEach(() => {
@@ -256,6 +291,410 @@ beforeEach(() => {
 
 afterEach(() => {
   resetState();
+});
+
+describe("protocol, bind scope and independent Link ownership", () => {
+  function request(h: ReturnType<typeof harness>, extra: Partial<Parameters<typeof pool.acquirePort>[0]> = {}) {
+    return pool.acquirePort({ nodeId: 1, leaseType: "ingress", preferredPort: 19000, deps: h.deps, ...extra });
+  }
+
+  test("TCP and UDP use the same numeric port with different owners; release and revive preserve the other", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const tcp = await request(h, { tunnelId: 10 });
+    const udp = await request(h, { tunnelId: 11, protocol: "udp" });
+    expect(tcp.ok && udp.ok).toBe(true);
+    if (!tcp.ok || !udp.ok) throw new Error("independent sockets must allocate");
+    expect(tcp.result.protocol).toBe("tcp"); expect(tcp.result.bindScope).toBe("*");
+    expect(tcp.result.leaseId).not.toBe(udp.result.leaseId);
+    for (const protocol of ["tcp", "tls", "ws", "udp"]) expect(await request(h, { protocol, tunnelId: 12 })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(await pool.releaseLease({ leaseId: tcp.result.leaseId }, h.deps)).toBe(true);
+    expect((await pool.leaseHolder(1, 19000, h.deps, { protocol: "udp" }))?.status).toBe("active");
+    const reused = await request(h, { tunnelId: 12, protocol: "tls" });
+    expect(reused).toMatchObject({ ok: true, result: { leaseId: tcp.result.leaseId, reused: true, protocol: "tcp" } });
+  });
+
+  test("concrete scopes coexist; wildcard, IPv4 mapped and unresolved scopes collide", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    for (const [tunnelId, bindScope] of [[1, "127.0.0.1"], [2, "127.0.0.2"], [3, "::1"]] as const) {
+      expect((await request(h, { tunnelId, bindScope })).ok).toBe(true);
+    }
+    for (const bindScope of ["*", "0.0.0.0", "::", "::ffff:127.0.0.1", "localhost", "[0:0:0:0:0:0:0:1]"]) {
+      expect(await request(h, { tunnelId: 9, bindScope })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    expect((await request(h, { tunnelId: 9, protocol: "udp", bindScope: "*" })).ok).toBe(true);
+  });
+
+  test("scope deletion permits exact reuse and does not free an independent scope", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const first = await request(h, { tunnelId: 1, bindScope: "127.0.0.1" });
+    expect((await request(h, { tunnelId: 2, bindScope: "127.0.0.2" })).ok).toBe(true);
+    if (!first.ok) throw new Error("first scope must allocate");
+    await pool.releaseLease({ tunnelId: 1 }, h.deps);
+    expect(await request(h, { tunnelId: 3, bindScope: "::ffff:127.0.0.1" })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, bindScope: "127.0.0.1", reused: true } });
+    expect(await request(h, { tunnelId: 3, bindScope: "127.0.0.2" })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(await request(h, { tunnelId: 3, bindScope: "*" })).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test.each([null, "", "future-protocol"])("unknown acquisition %p reserves TCP and UDP", async (protocol) => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    expect(await request(h, { protocol, tunnelId: 1 })).toMatchObject({ ok: true, result: { protocol: "unknown" } });
+    for (const known of ["tcp", "udp"]) expect(await request(h, { protocol: known, tunnelId: 2 })).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("Link composite allocation stays closed; FXP must reserve explicit lanes", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    expect(await request(h, { protocol: "both", linkId: 1 })).toEqual({ ok: false, code: "unsupported_protocol" });
+    expect(leases).toHaveLength(0);
+  });
+
+  test("native both reserves one conservative lease, blocks each lane, retries and releases as one owner", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const first = await request(h, { protocol: "both", tunnelId: 10 });
+    expect(first).toMatchObject({ ok: true, result: { port: 19000, protocol: "unknown", tunnelId: 10 } });
+    if (!first.ok) throw new Error("missing lease");
+    expect(leases).toHaveLength(1);
+    for (const protocol of ["tcp", "udp", "both"]) {
+      expect(await request(h, { protocol, tunnelId: 11 })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    expect(await request(h, { protocol: "both", tunnelId: 10 })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, reused: true } });
+    expect(await request(h, { protocol: "both", tunnelId: 10, preferredPort: undefined })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, reused: true } });
+    expect(await request(h, { protocol: "tcp", tunnelId: 10 })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, protocol: "unknown" } });
+    expect(leases).toHaveLength(1);
+    await pool.releaseLease({ tunnelId: 10 }, h.deps);
+    expect(leases[0]!.status).toBe("released");
+    expect((await request(h, { protocol: "udp", tunnelId: 11 })).ok).toBe(true);
+  });
+
+  test("transition into both widens the same lease under the range lock, never steals an occupied lane", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const tcp = await request(h, { tunnelId: 10 });
+    const udp = await request(h, { tunnelId: 11, protocol: "udp" });
+    if (!tcp.ok || !udp.ok) throw new Error("missing disjoint leases");
+    expect(await request(h, { tunnelId: 10, protocol: "both" })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(leases[0]!.protocol).toBe("tcp");
+    await pool.releaseLease({ tunnelId: 11 }, h.deps);
+    expect(await request(h, { tunnelId: 10, protocol: "both" })).toMatchObject({ ok: true,
+      result: { leaseId: tcp.result.leaseId, protocol: "unknown", reused: true } });
+    expect(leases.filter((l) => l.status === "active")).toHaveLength(1);
+  });
+
+  test.each([
+    { mode: "DIRECT", leaseType: "ingress" as const, used_ports: { tcp: { "19000": true }, udp: { "19000": true } } },
+    { mode: "RELAY", leaseType: "ingress" as const, used_ports: { tcp: [19000], udp: [19000] } },
+      { mode: "EGRESS", leaseType: "egress" as const, used_ports: [19000] },
+  ])("native both reuses its own durable binding with real aggregate report %p", async ({ mode, leaseType, used_ports }) => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const first = await request(h, { tunnelId: 10, protocol: "both", leaseType });
+    if (!first.ok) throw new Error("native both must allocate");
+    const id = `tunex-10-${mode.toLowerCase()}`;
+    const agentUsedPorts = async () => pool.agentPortHoldersFromReport({ used_ports,
+      tunnels: [{ id, mode, ingress_port: 19000, egress_port: 19000, protocol: "both",
+        // The real disposable Agents use a concrete --listen-ip, although the
+        // product's unspecified listen_ip owns a conservative wildcard lease.
+        listen_host: mode === "DIRECT" ? "172.28.0.10" : "0.0.0.0" }] });
+    for (const preferredPort of [19000, undefined]) {
+      expect(await request(h, { tunnelId: 10, protocol: "both", leaseType, preferredPort,
+        ownRuntimeIds: [id], deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: true,
+          result: { leaseId: first.result.leaseId, port: 19000, protocol: "unknown", reused: true } });
+    }
+    expect(leases).toHaveLength(1);
+    expect(await request(h, { tunnelId: 11, protocol: "both", leaseType,
+      ownRuntimeIds: [id], deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("reported native runtime mode is normalized before deriving lease direction", () => {
+    expect(pool.agentPortHoldersFromReport({ tunnels: [
+      { id: "d", mode: " direct ", ingress_port: 19000, egress_port: 19001, protocol: "both" },
+      { id: "r", mode: "relay", ingress_port: 19002, protocol: "both" },
+      { id: "e", mode: " EGRESS ", ingress_port: 19003, egress_port: 19004, protocol: "both" },
+    ] })).toMatchObject([
+      { port: 19000, runtime_id: "d", protocol: "both", lease_type: "ingress" },
+      { port: 19002, runtime_id: "r", protocol: "both", lease_type: "ingress" },
+      { port: 19004, runtime_id: "e", protocol: "both", lease_type: "egress" },
+    ] as const);
+  });
+
+  test("native aggregate self-reuse needs the exact owner, direction, scope and actual lanes", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const bindScope = "127.0.0.1";
+    const first = await request(h, { tunnelId: 10, protocol: "both", bindScope });
+    if (!first.ok) throw new Error("native both must allocate");
+    const native = { id: "tunex-10-direct", mode: "DIRECT", ingress_port: 19000,
+      protocol: "both", listen_host: bindScope };
+    for (const override of [
+      { id: "tunex-11-direct" }, { mode: "EGRESS", egress_port: 19000 },
+      { listen_host: "127.0.0.2" }, { listen_host: "0.0.0.0" }, { listen_host: undefined },
+      { protocol: "tcp" }, { protocol: undefined }, { protocol: "future-protocol" },
+      { ingress_port: 19001 },
+    ]) {
+      const agentUsedPorts = async () => pool.agentPortHoldersFromReport({
+        used_ports: { tcp: [19000], udp: [19000] }, tunnels: [{ ...native, ...override }] });
+      expect(await request(h, { tunnelId: 10, protocol: "both", bindScope, ownRuntimeIds: [native.id],
+        deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    // A separate unowned/draining fact is not a duplicate numeric summary.
+    const agentUsedPorts = async () => [...pool.agentPortHoldersFromReport({
+      used_ports: { tcp: [19000], udp: [19000] }, tunnels: [native] }),
+      { port: 19000, protocol: "udp", runtime_id: null }];
+    expect(await request(h, { tunnelId: 10, protocol: "both", bindScope, ownRuntimeIds: [native.id],
+      deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+    // A runtime ID and its summary cannot replace durable ownership.
+    await pool.releaseLease({ leaseId: first.result.leaseId }, h.deps);
+    expect(await request(h, { tunnelId: 10, protocol: "both", bindScope, ownRuntimeIds: [native.id],
+      deps: { ...h.deps, agentUsedPorts: async () => pool.agentPortHoldersFromReport({
+        used_ports: { tcp: [19000], udp: [19000] }, tunnels: [native] }) } }))
+      .toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test.each(["future-protocol", "unknown", ""])("native both and single-lane transitions cannot explain explicitly unknown %p aggregate occupancy", async (summaryProtocol) => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    expect((await request(h, { tunnelId: 10, protocol: "both" })).ok).toBe(true);
+    const native = { id: "tunex-10-direct", mode: "DIRECT", ingress_port: 19000, protocol: "both", listen_host: "0.0.0.0" };
+    const agentUsedPorts = async () => pool.agentPortHoldersFromReport({
+      used_ports: { [summaryProtocol]: [19000] }, tunnels: [native] });
+    for (const protocol of ["both", "tcp", "udp"]) {
+      expect(await request(h, { tunnelId: 10, protocol, ownRuntimeIds: [native.id],
+        deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+  });
+
+  test("same Link owner retries are idempotent with preferred or automatic allocation", async () => {
+    const h = harness(); seedNode(1, [19000, 19010]);
+    const first = await request(h, { linkId: 30, preferredPort: undefined });
+    if (!first.ok) throw new Error("Link must allocate");
+    const attempts = await Promise.all(Array.from({ length: 8 }, () => request(h, { linkId: 30, preferredPort: undefined })));
+    for (const attempt of attempts) expect(attempt).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, port: first.result.port, linkId: 30, tunnelId: null, reused: true } });
+    expect(await request(h, { linkId: 30, preferredPort: first.result.port })).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId } });
+    expect(leases).toHaveLength(1);
+    expect(await request(h, { tunnelId: 30, preferredPort: first.result.port })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(leases[0]!.expires_at).toBeNull();
+  });
+
+  test.each([
+    { label: "protocol map", used_ports: { tcp: { "19000": true }, udp: { "19000": true } } },
+    { label: "protocol arrays", used_ports: { tcp: [19000], udp: [19000] } },
+    { label: "legacy numeric summary", used_ports: [19000] },
+  ])("second rule reuses its Link carrier with %p", async ({ used_ports }) => {
+    const h = harness(); seedNode(1, [19000, 19010]); seedNode(2, [19000, 19010]);
+    const original = await Promise.all(["tcp", "udp"].map((protocol) => request(h, { linkId: 30, protocol, leaseType: "egress" })));
+    const agentUsedPorts = async (nodeId: number) => nodeId === 1
+      ? pool.agentPortHoldersFromReport({ used_ports, link_placements: [carrierReport()] }) : [];
+    // The second business listener adds a binding at ingress; the carrier is
+    // shared by the Link and keeps its owner/leases across compiler versions.
+    for (const protocol of ["tcp", "udp"]) {
+      expect((await pool.acquirePort({ nodeId: 2, leaseType: "ingress", preferredPort: 19001,
+        linkId: 30, protocol }, { ...h.deps, agentUsedPorts })).ok).toBe(true);
+    }
+    const retries = await Promise.all(Array.from({ length: 6 }, (_, i) => request(h, {
+      linkId: 30, protocol: i % 2 ? "udp" : "tcp", leaseType: "egress",
+      preferredPort: i % 3 ? 19000 : undefined,
+      ownRuntimeIds: ["tunex-link-30-p1-egress", "link-30-v2-exit-tcp", "link-30-v2-exit-udp"],
+      deps: { ...h.deps, agentUsedPorts },
+    })));
+    for (const [index, retry] of retries.entries()) {
+      const first = original[index % 2];
+      if (!first?.ok) throw new Error("carrier must initially allocate");
+      expect(retry).toMatchObject({ ok: true, result: {
+        leaseId: first.result.leaseId, port: 19000, linkId: 30, tunnelId: null, reused: true,
+      } });
+    }
+    expect(leases).toHaveLength(4);
+    expect(await request(h, { linkId: 31, leaseType: "egress", deps: { ...h.deps, agentUsedPorts } }))
+      .toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("only the exact Link/node/direction/protocol/scope owner can explain aggregate occupancy", async () => {
+    const h = harness(); seedNode(1, [19000, 19010]);
+    const scope = "127.0.0.1";
+    const first = await request(h, { linkId: 30, leaseType: "egress", bindScope: scope });
+    if (!first.ok) throw new Error("carrier must allocate");
+    const placement = carrierReport({ ports: [{ protocol: "tcp", host: "[::ffff:127.0.0.1]", port: 19000 }] });
+    const retry = (link_placements: unknown) => request(h, { linkId: 30, leaseType: "egress", bindScope: scope,
+      ownRuntimeIds: [placement.id], deps: { ...h.deps, agentUsedPorts: async () =>
+        pool.agentPortHoldersFromReport({ used_ports: [19000], link_placements }) } });
+    expect(await retry([placement])).toMatchObject({ ok: true, result: { leaseId: first.result.leaseId, reused: true } });
+    for (const override of [
+      { link_id: 31 }, { node_id: 2 }, { role: "ingress" as const },
+      { ports: [{ protocol: "tcp" as const, host: "127.0.0.2", port: 19000 }] },
+      { ports: [{ protocol: "udp" as const, host: scope, port: 19000 }] },
+      { ports: [{ protocol: "tcp" as const, host: scope, port: 19001 }] },
+      { ports: [] },
+    ]) expect(await retry([{ ...placement, ...override }])).toMatchObject({ ok: false, code: "port_taken" });
+    for (const value of [undefined, null, [], [{ ...placement, unexpected_field: true }]]) {
+      expect(await retry(value)).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    // A known owned TCP lane does not explain an unknown UDP claim at the same
+    // number, and a DB owner without a matching runtime fact explains nothing.
+    expect(await request(h, { linkId: 30, leaseType: "egress", protocol: "udp", bindScope: scope,
+      deps: { ...h.deps, agentUsedPorts: async () => pool.agentPortHoldersFromReport({
+        used_ports: [19000], link_placements: [placement],
+      }) } })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(leases).toHaveLength(1);
+  });
+
+  test("failed/updating/expired placements cannot erase their coarse claims even with ownRuntimeIds", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    await request(h, { linkId: 30, leaseType: "egress" });
+    for (const state of ["failed", "updating", "expired", "removed", "cached", "closed", "exited", "passive"] as const) {
+      const placement = carrierReport({ ready: false, state });
+      expect(await request(h, { linkId: 30, leaseType: "egress", ownRuntimeIds: [placement.id],
+        deps: { ...h.deps, agentUsedPorts: async () => pool.agentPortHoldersFromReport({
+          used_ports: { tcp: [19000] }, link_placements: [placement],
+        }) } })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    const placement = carrierReport({ lease_expires_at: new Date(0).toISOString() });
+    expect(await request(h, { linkId: 30, leaseType: "egress", deps: { ...h.deps,
+      agentUsedPorts: async () => pool.agentPortHoldersFromReport({ used_ports: [19000], link_placements: [placement] }),
+    } })).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("draining/unowned facts survive exact own carrier summary disambiguation", async () => {
+    const h = harness(); seedNode(1, [19000, 19010]);
+    const first = await request(h, { linkId: 30, leaseType: "egress" });
+    if (!first.ok) throw new Error("carrier must allocate");
+    const report = { used_ports: [19000, 19001], link_placements: [carrierReport()] };
+    const retry = (holders: Awaited<ReturnType<typeof pool.agentPortHoldersFromReport>>) => request(h, {
+      linkId: 30, leaseType: "egress", ownRuntimeIds: [carrierReport().id],
+      deps: { ...h.deps, agentUsedPorts: async () => holders },
+    });
+    expect(await retry(pool.agentPortHoldersFromReport(report))).toMatchObject({ ok: true });
+    for (const holder of [
+      { port: 19000 }, { port: 19000, protocol: "tcp", bind_scope: "::", runtime_id: null },
+      { port: 19000, protocol: "tcp", bind_scope: "", runtime_id: "foreign-draining" },
+    ]) expect(await retry([...pool.agentPortHoldersFromReport(report), holder]))
+      .toMatchObject({ ok: false, code: "port_taken" });
+    expect(await retry(pool.agentPortHoldersFromReport({ ...report, used_ports: [19000, { port: 19000 }] })))
+      .toMatchObject({ ok: false, code: "port_taken" });
+    expect(await retry(pool.agentPortHoldersFromReport({ ...report,
+      link_placements: [carrierReport(), carrierReport({ id: "foreign-link", link_id: 31 })],
+    }))).toMatchObject({ ok: false, code: "port_taken" });
+    expect(await request(h, { linkId: 30, leaseType: "egress", preferredPort: 19001,
+      deps: { ...h.deps, agentUsedPorts: async () => pool.agentPortHoldersFromReport(report) },
+    })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(await pool.availablePorts(1, [], { ...h.deps, agentUsedPorts: async () => pool.agentPortHoldersFromReport(report) },
+      { protocol: "udp" })).not.toContain(19000);
+    await pool.releaseLease({ leaseId: first.result.leaseId }, h.deps);
+    expect(await retry(pool.agentPortHoldersFromReport(report))).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("carrier reuse rechecks its durable owner under the node+port transaction lock", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    await request(h, { linkId: 30, leaseType: "egress" });
+    const transaction = h.db.$transaction.bind(h.db);
+    h.db.$transaction = async (run, options) => {
+      // Retirement raced the Agent snapshot read. The snapshot alone must not
+      // revive a released lease while its old claim still appears occupied.
+      leases[0]!.status = "released";
+      return transaction(run, options);
+    };
+    expect(await request(h, { linkId: 30, leaseType: "egress", deps: { ...h.deps,
+      agentUsedPorts: async () => pool.agentPortHoldersFromReport({ used_ports: [19000], link_placements: [carrierReport()] }),
+    } })).toMatchObject({ ok: false, code: "port_taken" });
+    expect(leases[0]!.status).toBe("released");
+    expect(leases).toHaveLength(1);
+  });
+
+  test("default Agent snapshot query reads Link placements for same-carrier reuse", () => {
+    const dbModule = JSON.stringify(fileURLToPath(new URL("../../db.ts", import.meta.url)));
+    const poolModule = JSON.stringify(fileURLToPath(new URL("../portPool.ts", import.meta.url)));
+    const report = JSON.stringify({ used_ports: [19000], tunnels: [], link_placements: [carrierReport()] });
+    // Isolate module mocks from every other suite; exercise the real default
+    // Agent facts reader rather than an injected pre-parsed holder callback.
+    const scenario = `
+      import { mock } from "bun:test";
+      import assert from "node:assert/strict";
+      process.env.AUTH_SECRET="offline-carrier-port-test";
+      process.env.DATABASE_URL="mysql://unused:unused@127.0.0.1:1/unused";
+      const lease={id:77,node_id:1,port:19000,lease_type:"egress",tunnel_id:null,link_id:30,
+        protocol:"tcp",bind_scope:"*",status:"active",expires_at:null};
+      let reads=0;
+      const db={
+        node:{findUnique:async()=>({id:1,port_range_min:19000,port_range_max:19000,node_group:{workspace_id:7}})},
+        nodeStateReport:{findUnique:async({where,select})=>{assert.equal(where.node_id,1);
+          assert.equal(select.link_placements,true);assert.equal(select.used_ports,true);reads++;return ${report};}},
+        nodePortLease:{findMany:async()=>[lease],create:async()=>{throw new Error("must reuse carrier");}},
+        $queryRawUnsafe:async()=>[], $transaction:async(run)=>run(db),
+      };
+      mock.module(${dbModule},()=>({db}));
+      mock.module("ioredis",()=>({default:class OfflineRedis {on(){return this;}}}));
+      const {acquirePort}=await import(${poolModule});
+      const outcome=await acquirePort({nodeId:1,leaseType:"egress",preferredPort:19000,linkId:30,
+        protocol:"tcp",ownRuntimeIds:["tunex-link-30-p1-egress"]},
+        {redis:{set:async()=>null,del:async()=>0,scan:async()=>["0",[]]}});
+      assert.equal(outcome.ok,true,JSON.stringify(outcome));
+      assert.equal(outcome.result.leaseId,77);assert.equal(outcome.result.reused,true);assert.equal(reads,1);
+    `;
+    const child = Bun.spawnSync([process.execPath, "--eval", scenario], { stdout: "pipe", stderr: "pipe" });
+    if (child.exitCode !== 0) throw new Error(child.stderr.toString());
+    expect(child.exitCode).toBe(0);
+  });
+
+  test("Link release covers its TCP/UDP children only, and reconcile never expires Link rows", async () => {
+    const h = harness(); seedNode(1, [19000, 19010]);
+    for (const protocol of ["tcp", "udp"]) expect((await request(h, { linkId: 30, protocol, expiresAt: new Date(0) })).ok).toBe(true);
+    expect((await request(h, { tunnelId: 30, preferredPort: 19001 })).ok).toBe(true);
+    tunnels.add(30);
+    expect(await pool.reconcileLeases({ deps: h.deps })).toEqual({ releasedDanglingTunnel: 0, releasedExpired: 0 });
+    expect(await pool.releaseLease({ tunnelId: 30 }, h.deps)).toBe(true);
+    expect(leases.filter((row) => row.link_id === 30 && row.status === "active")).toHaveLength(2);
+    expect(await pool.releaseLease({ linkId: 30 }, h.deps)).toBe(true);
+    expect(await pool.releaseLease({ linkId: 30 }, h.deps)).toBe(false);
+    expect((await request(h, { linkId: 31, protocol: "udp" })).ok).toBe(true);
+  });
+
+  test("Link and Tunnel cannot both own one row", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    await expect(request(h, { linkId: 1, tunnelId: 1 })).rejects.toThrow("exactly one business owner");
+    expect(leases).toHaveLength(0);
+  });
+
+  test("concurrent wildcard and concrete scopes are serialized even without Redis", async () => {
+    const h = harness({ alwaysFailLock: true }); seedNode(1, [19000, 19000]);
+    const results = await Promise.all(Array.from({ length: 24 }, (_, tunnelId) => request(h, { tunnelId, bindScope: tunnelId % 2 ? "0.0.0.0" : "127.0.0.1" })));
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(leases).toHaveLength(1);
+  });
+
+  test("concurrent TCP and UDP claims admit exactly one owner in each namespace", async () => {
+    const h = harness({ alwaysFailLock: true }); seedNode(1, [19000, 19000]);
+    const results = await Promise.all(Array.from({ length: 24 }, (_, tunnelId) => request(h, { tunnelId, protocol: tunnelId % 2 ? "udp" : "tcp" })));
+    expect(results.filter((result) => result.ok)).toHaveLength(2);
+    expect(new Set(leases.map((row) => row.protocol))).toEqual(new Set(["tcp", "udp"]));
+  });
+
+  test("availability and holder queries preserve scope and protocol", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    await request(h, { protocol: "tcp", bindScope: "127.0.0.1", tunnelId: 1 });
+    expect(await pool.availablePorts(1, [], h.deps, { protocol: "udp" })).toEqual([19000]);
+    expect(await pool.availablePorts(1, [], h.deps, { protocol: "tcp", bindScope: "127.0.0.2" })).toEqual([19000]);
+    expect(await pool.availablePorts(1, [], h.deps, { protocol: "tcp", bindScope: "::" })).toEqual([]);
+    await request(h, { protocol: "udp", bindScope: "*", linkId: 2 });
+    await expect(pool.leaseHolder(1, 19000, h.deps)).rejects.toThrow("ambiguous");
+    expect(await pool.leaseHolder(1, 19000, h.deps, { protocol: "udp" })).toMatchObject({ linkId: 2, tunnelId: null, protocol: "udp" });
+  });
+
+  test("Agent unknown facts and numeric reservations block both namespaces; explicit TCP facts allow UDP", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    for (const protocol of ["tcp", "udp"]) {
+      expect(await request(h, { protocol, deps: { ...h.deps, agentUsedPorts: async () => [{ port: 19000, runtime_id: "unknown-owner" }] } })).toMatchObject({ ok: false, code: "port_taken" });
+      expect(await request(h, { protocol, reservedPorts: [19000] })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    const agentUsedPorts = async () => [{ port: 19000, runtime_id: "native-tcp", protocol: "tls", bind_scope: "*" }];
+    expect((await request(h, { protocol: "udp", deps: { ...h.deps, agentUsedPorts } })).ok).toBe(true);
+    expect(await request(h, { protocol: "tcp", deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("Agent report keeps draining unowned facts and the correct local socket port", () => {
+    const holders = pool.agentPortHoldersFromReport({
+      tunnels: [
+        { id: "eg", mode: "EGRESS", protocol: "udp", egress_port: 19000, ingress_port: 19001 },
+        { id: "direct", mode: "DIRECT", protocol: "tcp", ingress_port: 19002, egress_port: 19003, listen_host: "127.0.0.1" },
+      ], used_ports: { udp: [19000, 19004], tcp: { "19002": true, "19005": true } },
+    });
+    expect(holders.filter((holder) => holder.runtime_id != null).map((holder) => holder.port)).toEqual([19000, 19002]);
+    expect(holders).toContainEqual({ port: 19004, runtime_id: null, protocol: "udp", aggregate: true });
+    expect(pool.agentPortHoldersFromReport({ used_ports: [19000] })).toEqual([{ port: 19000, runtime_id: null, protocol: undefined, aggregate: true }]);
+  });
 });
 
 /* ================================================================== */
@@ -462,7 +901,7 @@ describe("2. Redis 丢锁后 DB unique 兜底（§7.6 DoD）", () => {
         throw new Error("redis down");
       },
     };
-    const deps = { db, redis: brokenRedis };
+    const deps = { db, redis: brokenRedis, agentUsedPorts: async () => [] };
     seedNode(1, [19000, 19100]);
 
     const first = await pool.acquirePort({ nodeId: 1, leaseType: "ingress", tunnelId: 1, deps });

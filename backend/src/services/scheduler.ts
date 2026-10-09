@@ -61,6 +61,7 @@ import type { RuntimeUseDenied } from "./forward-capability.ts";
 import {
   DEFAULT_FORWARD_PROTOCOL,
   admitPersistedProtocol,
+  forwardHasDatagramLane,
   buildForwardRuntimePlan,
   addressPartOfEndpoint,
   datagramHopPeerFor,
@@ -72,6 +73,7 @@ import {
   type ForwardProtocol,
 } from "./forward-contract.ts";
 import { admitRuntimeFromStore, admissionFailureDetail, type AdmissionTarget, type CapabilityFactsLoader, type RuntimeAdmissionDenied } from "./runtime-admission.ts";
+import { admitSelectorFromStore, selectorAdmissionDetail } from "./selector-admission.ts";
 import { normalizeFederatedEgressPeer } from "./forward-revision.ts";
 import {
   checkFederatedEgressTopology,
@@ -141,7 +143,7 @@ async function correctDatagramHopPeerAfterIngressAck(args: {
   | { ok: false; revision: number; error: string; hopPeer: string | null }
 > {
   const learned = addressPartOfEndpoint(args.ingressAckHopLocalAddr);
-  if (args.protocol !== "udp" || !learned || learned === firstConnectIp(args.connectIp)) {
+  if (!forwardHasDatagramLane(args.protocol) || !learned || learned === firstConnectIp(args.connectIp)) {
     // 没有纠正要做：不是 datagram、agent 没报（老 Agent）、或报的就是首次下发用的那个地址。
     return { ok: true, revision: args.revision, corrected: false, hopPeer: learned ?? null };
   }
@@ -182,8 +184,8 @@ async function correctDatagramHopPeerAfterIngressAck(args: {
       orchestrator: args.orchestrator,
       // Reverse of activation order: near side first, then far side.
       removals: [
-        { tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason },
-        { tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason },
+        { tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision, reason },
+        { tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision, reason },
       ],
       portPoolDeps: args.deps.portPoolDeps,
     });
@@ -234,7 +236,9 @@ export async function createRelayTunnel(
 
   /* ---------------- V5-WP0 protocol admission ---------------- */
   const protocol = normalizeForwardProtocol(input.tunnelType);
-  if (protocol === null) {
+  // Do not open the compatibility create path when Forward's whitelist grows.
+  // Native both is created through the atomic /forwards reservation flow.
+  if (protocol === null || protocol === "both") {
     return fail(
       "auth_quota",
       SCHEDULER_ERROR_CODES.unsupported_protocol,
@@ -470,6 +474,14 @@ export async function createRelayTunnel(
     });
   }
 
+  const selectorAdmission = await admitSelectorFromStore(egressPick.node.id, {
+    strategy: pool?.lb_strategy ?? egressPick.node.lb_strategy, mode: "EGRESS",
+  }, deps.loadCapabilityFacts);
+  if (!selectorAdmission.ok) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied,
+      selectorAdmissionDetail(selectorAdmission), { tunnelId });
+  }
+
   await store.tunnel.update({
     where: { id: tunnelId },
     data: {
@@ -489,24 +501,28 @@ export async function createRelayTunnel(
   const [inReserved, outReserved] = await Promise.all([
     store.tunnel.findMany({
       where: { in_node_group_id: input.inNodeGroupId },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
     }),
     store.tunnel.findMany({
       where: { out_node_group_id: input.outNodeGroupId },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
     }),
   ]);
   const ingressReserved = collectReservedPorts(
     (inReserved as { id: number; listen_port: number | null }[]).filter((t) => t.id !== tunnelId),
+    { protocol: protocol, bindScope: input.listenIp },
   );
   const egressReserved = collectReservedPorts(
     (outReserved as { id: number; listen_port: number | null }[]).filter((t) => t.id !== tunnelId),
+    { protocol: protocol, bindScope: "*" },
   );
 
   const ingressAlloc = await allocateTunnelPort(
     {
       nodeId: ingressPick.node.id,
       direction: "ingress",
+      protocol: protocol,
+      bindScope: input.listenIp,
       preferred: input.listenPort ?? null,
       tunnelId,
       reservedPorts: ingressReserved,
@@ -524,6 +540,8 @@ export async function createRelayTunnel(
     {
       nodeId: egressPick.node.id,
       direction: "egress",
+      protocol: protocol,
+      bindScope: "*",
       preferred: null, // 出口端口是节点间内部端口，永不接受用户指定
       tunnelId,
       reservedPorts: egressReserved,
@@ -652,7 +670,7 @@ export async function createRelayTunnel(
           tunnelId,
           node: egressPick.node,
           direction: "egress",
-          revision: revision + 1,
+          revision,
           reason: "egress apply failed",
         },
       ],
@@ -719,7 +737,7 @@ export async function createRelayTunnel(
       tunnelId,
       orchestrator,
       removals: [
-        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" },
+        { tunnelId, node: egressPick.node, direction: "egress", revision, reason: "runtime plan invalid" },
       ],
       portPoolDeps: deps.portPoolDeps,
     });
@@ -751,8 +769,8 @@ export async function createRelayTunnel(
       tunnelId,
       orchestrator,
       removals: [
-        { tunnelId, node: ingressPick.node, direction: "ingress", revision: revision + 1, reason: "ingress apply failed" },
-        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" },
+        { tunnelId, node: ingressPick.node, direction: "ingress", revision, reason: "ingress apply failed" },
+        { tunnelId, node: egressPick.node, direction: "egress", revision, reason: "ingress apply failed" },
       ],
       portPoolDeps: deps.portPoolDeps,
     });
@@ -963,6 +981,10 @@ export async function reapplyRelayTunnel(
       `隧道 ${tunnelId} 不存在（重推前必须已落库）`,
     );
   }
+  if (row.link_resource_id != null) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      `Forward ${tunnelId} is managed by a shared Link resource`);
+  }
   if (row.tunnel_mode !== "relay") {
     return fail(
       "bind_nodes",
@@ -1120,6 +1142,13 @@ export async function reapplyRelayTunnel(
       },
     });
   }
+  const selectorAdmission = await admitSelectorFromStore(egressPick.node.id, {
+    strategy: pool?.lb_strategy ?? egressPick.node.lb_strategy, mode: "EGRESS",
+  }, deps.loadCapabilityFacts);
+  if (!selectorAdmission.ok) {
+    return fail("bind_nodes", SCHEDULER_ERROR_CODES.runtime_capability_denied,
+      selectorAdmissionDetail(selectorAdmission), {});
+  }
   const targetDenied = await checkExistingRuntime(row, deps, { ingress: ingressPick.node, egress: egressPick.node });
   if (targetDenied) return blockRuntimeUse(targetDenied);
   await store.tunnel.update({
@@ -1141,21 +1170,23 @@ export async function reapplyRelayTunnel(
     (
       await store.tunnel.findMany({
         where: { in_node_group_id: inNodeGroupId },
-        select: { id: true, listen_port: true },
+        select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
       })
     )
       .map((t) => t as { id: number; listen_port: number | null })
       .filter((t) => t.id !== tunnelId),
+    { protocol: reapplyProtocol, bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null },
   );
   const egressReserved = collectReservedPorts(
     (
       await store.tunnel.findMany({
         where: { out_node_group_id: outNodeGroupId },
-        select: { id: true, listen_port: true },
+        select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
       })
     )
       .map((t) => t as { id: number; listen_port: number | null })
       .filter((t) => t.id !== tunnelId),
+    { protocol: reapplyProtocol, bindScope: "*" },
   );
 
   // Even when the Tunnel row already contains a port, the durable
@@ -1169,6 +1200,8 @@ export async function reapplyRelayTunnel(
     {
       nodeId: ingressPick.node.id,
       direction: "ingress",
+      protocol: reapplyProtocol,
+      bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null,
       preferred: existingIngressPort,
       tunnelId,
       reservedPorts: ingressReserved,
@@ -1186,6 +1219,8 @@ export async function reapplyRelayTunnel(
     {
       nodeId: egressPick.node.id,
       direction: "egress",
+      protocol: reapplyProtocol,
+      bindScope: "*",
       preferred: existingEgressPort,
       tunnelId,
       reservedPorts: egressReserved,
@@ -1215,7 +1250,7 @@ export async function reapplyRelayTunnel(
   let transitNode: { id: number; node_id: string; connect_ip: string | null; role: "both" | "egress" | "ingress" | null } | null = null;
   if (middleNodeId != null) {
     const middleAlloc = await allocateTunnelPort(
-      { nodeId: middleNodeId, direction: "egress", preferred: null, tunnelId, reservedPorts: [] },
+      { nodeId: middleNodeId, direction: "egress", protocol: reapplyProtocol, bindScope: "*", preferred: null, tunnelId, reservedPorts: [] },
       deps.portPoolDeps,
     );
     if (!middleAlloc.ok) {
@@ -1323,7 +1358,7 @@ export async function reapplyRelayTunnel(
         tunnelId,
         node: ingressPick.node,
         direction: "ingress",
-        revision: revision + 1,
+        revision,
         reason: `${reason} (ingress)`,
       },
     ];
@@ -1332,7 +1367,7 @@ export async function reapplyRelayTunnel(
         tunnelId,
         node: transitNode,
         direction: "egress",
-        revision: revision + 1,
+        revision,
         reason: `${reason} (transit)`,
       });
     }
@@ -1340,7 +1375,7 @@ export async function reapplyRelayTunnel(
       tunnelId,
       node: egressPick.node,
       direction: "egress",
-      revision: revision + 1,
+      revision,
       reason,
     });
     const compensation = await compensateRuntimesThenRelease({
@@ -1659,17 +1694,20 @@ async function applyFederatedRelayTunnel(
     (
       await store.tunnel.findMany({
         where: { in_node_group_id: inNodeGroupId },
-        select: { id: true, listen_port: true },
+        select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
       })
     )
       .map((t) => t as { id: number; listen_port: number | null })
       .filter((t) => t.id !== tunnelId),
+    { protocol: protocol, bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null },
   );
   const existingIngressPort = row.listen_port === null ? null : Number(row.listen_port);
   const ingressAlloc = await allocateTunnelPort(
     {
       nodeId: ingressPick.node.id,
       direction: "ingress",
+      protocol: protocol,
+      bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null,
       preferred: existingIngressPort,
       tunnelId,
       reservedPorts: ingressReserved,
@@ -1715,7 +1753,7 @@ async function applyFederatedRelayTunnel(
         tunnelId,
         node: ingressPick.node,
         direction: "ingress",
-        revision: revision + 1,
+        revision,
         reason,
       });
       if (removed.ok) ingressRemoved = true;
@@ -1937,6 +1975,10 @@ export async function reapplyDirectTunnel(
       retryable: false,
     };
   }
+  if (row.link_resource_id != null) {
+    return { ok: false, tunnelId, error_code: SCHEDULER_ERROR_CODES.mode_topology_mismatch,
+      error: `Forward ${tunnelId} is managed by a shared Link resource`, retryable: false };
+  }
   if (row.tunnel_mode !== "direct") {
     return {
       ok: false,
@@ -2057,15 +2099,18 @@ export async function reapplyDirectTunnel(
   const reserved = collectReservedPorts(
     (await store.tunnel.findMany({
       where: { in_node_group_id: inNodeGroupId },
-      select: { id: true, listen_port: true },
+      select: { id: true, listen_port: true, listen_ip: true, forward_protocol: true, tunnel_type: true },
     }) as unknown as { id: number; listen_port: number | null }[])
       .filter((t) => t.id !== tunnelId),
+    { protocol: directProtocol, bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null },
   );
 
   let ingressPort = row.listen_port == null ? null : Number(row.listen_port);
   const alloc = await allocateTunnelPort({
     nodeId: pick.node.id,
     direction: "ingress",
+    protocol: directProtocol,
+    bindScope: typeof row.listen_ip === "string" ? row.listen_ip : null,
     preferred: ingressPort,
     tunnelId,
     reservedPorts: reserved,
@@ -2121,7 +2166,7 @@ export async function reapplyDirectTunnel(
           tunnelId,
           node: pick.node,
           direction: "direct",
-          revision: revision + 1,
+          revision,
           reason: "direct runtime plan invalid",
         },
       ],
@@ -2165,7 +2210,7 @@ export async function reapplyDirectTunnel(
           tunnelId,
           node: pick.node,
           direction: "direct",
-          revision: revision + 1,
+          revision,
           reason: "direct apply failed",
         },
       ],

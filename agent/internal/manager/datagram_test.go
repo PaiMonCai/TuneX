@@ -272,10 +272,9 @@ func TestUDPRefusedOnRelayAndEgressLeavesNoPortReserved(t *testing.T) {
 	}
 }
 
-// §5.2: the kernel would allow TCP 19000 and UDP 19000 at once, the port lease
-// does not, and the agent guard must implement the STRICTER rule. The guard is
-// still namespaced, because the key is a reported fact (§5.3).
-func TestTCPAndUDPCannotShareAPortNumber(t *testing.T) {
+// Independent TCP and UDP rules may share a numeric port. The reported guard
+// must preserve both socket protocols while its flat view reports their union.
+func TestTCPAndUDPShareAPortNumber(t *testing.T) {
 	tm := NewTunnelManager(NewEgressManager(), "127.0.0.1")
 	defer tm.StopAll()
 
@@ -289,16 +288,16 @@ func TestTCPAndUDPCannotShareAPortNumber(t *testing.T) {
 	}
 
 	udpCfg := udpDirectCfg("tunex-udp-direct", port, 3040, 1)
-	if _, err := tm.Apply(udpCfg); err == nil {
-		t.Fatal("a second tunnel must be refused the same port number, whatever the protocol")
+	if _, err := tm.Apply(udpCfg); err != nil {
+		t.Fatalf("a UDP rule must share a TCP rule's numeric port: %v", err)
 	}
 
 	byProto := tm.UsedPortsByProtocol()
 	if !byProto["tcp"][port] {
 		t.Fatalf("the tcp namespace must own %d, got %v", port, byProto)
 	}
-	if byProto["udp"][port] {
-		t.Fatalf("the udp namespace must NOT claim %d, got %v", port, byProto)
+	if !byProto["udp"][port] {
+		t.Fatalf("the udp namespace must also own %d, got %v", port, byProto)
 	}
 	if !tm.UsedPorts()[port] {
 		t.Fatal("the flat view must still report the number as bound")

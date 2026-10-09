@@ -26,7 +26,7 @@ export type LicenseType = "none" | "personal" | "business";
 /** 节点角色。NULL = 尚未声明，不可默认成 ingress。 */
 export type NodeRole = "ingress" | "egress" | "both";
 /** 出口池默认策略；池内策略优先于节点默认值。 */
-export type LBStrategy = "round" | "rand" | "weighted_round";
+export type LBStrategy = "round" | "rand" | "weighted_round" | "fallback" | "ip_hash";
 
 export interface User {
   id: ID;
@@ -356,7 +356,8 @@ export type TunnelDesiredStatus = "active" | "inactive";
 export interface Tunnel {
   id: ID;
   name: string;
-  tunnel_type: TunnelType;
+  /** No legacy enum value represents native both (or plain WS). */
+  tunnel_type: TunnelType | null;
   category: TunnelCategory;
   listen_ip: string | null;
   listen_port: number | null;
@@ -611,7 +612,7 @@ export type TrafficPeriod = "day" | "month" | "total";
 export interface TunnelTrafficGroup {
   tunnel_id: ID;
   name: string;
-  tunnel_type: TunnelType;
+  tunnel_type: TunnelType | null;
   in_node_group_id: ID | null;
   in_node_group_name: string | null;
   traffic: number;

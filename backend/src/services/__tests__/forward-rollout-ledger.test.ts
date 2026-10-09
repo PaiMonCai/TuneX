@@ -21,6 +21,7 @@ import { describe, expect, it } from "bun:test";
 
 import type { ForwardImpact } from "../forward-revision.ts";
 import type { RolloutPlan, RolloutSnapshot } from "../forward-rollout.ts";
+import type { PortPoolDb } from "../portPool.ts";
 import {
   executeRollout,
   readKeySet,
@@ -63,7 +64,16 @@ const fakeDb = () => {
   const leases: Array<Record<string, unknown>> = [];
   let seq = 1;
 
-  const db: RolloutDb = {
+  const db: RolloutDb & Pick<PortPoolDb, "$transaction"> = {
+    async $transaction(run, options) {
+      expect(options?.isolationLevel).toBe("Serializable");
+      return run({ ...db, $queryRawUnsafe: async (query, nodeId, port) => {
+        expect(query).toContain("FOR UPDATE");
+        expect(typeof nodeId).toBe("number");
+        expect(typeof port).toBe("number");
+        return [];
+      } });
+    },
     node: {
       findUnique: async (args: unknown) => {
         const a = args as { where: { id: number }; select?: Record<string, boolean> };
@@ -93,8 +103,9 @@ const fakeDb = () => {
     nodePortLease: {
       create: async (args: unknown) => {
         const a = args as { data: Record<string, unknown> };
-        leases.push({ id: leases.length + 1, status: "active", ...a.data });
-        return { id: leases.length };
+        const row = { id: leases.length + 1, status: "active", ...a.data };
+        leases.push(row);
+        return row;
       },
       findUnique: async (args: unknown) => {
         const a = args as { where: { id: number } };
@@ -128,10 +139,13 @@ const fakeDb = () => {
       },
       updateMany: async (args: unknown) => {
         const a = args as { where: Record<string, unknown>; data: Record<string, unknown> };
+        let count = 0;
         for (const l of leases) {
-          if (a.where.status === undefined || l.status === a.where.status) Object.assign(l, a.data);
+          if (!Object.entries(a.where).every(([key, value]) => value === undefined || l[key] === value)) continue;
+          Object.assign(l, a.data);
+          count++;
         }
-        return { count: 1 };
+        return { count };
       },
     },
     tunnel: {
@@ -713,7 +727,11 @@ describe("compensated + compensation_error：§13.3.5 第三张表的两个终�
 
   it("PREPARE 失败且清理未确认 ⇒ 不伪装 failed，保持 degraded + 可见清理错误", async () => {
     const { f } = modeSwitchEnv();
-    const d2 = { db: f.db, runtimeUse: async () => null, orchestrator: fakeOrchestrator({ failOn: { dispatchEgress: true } }) } as RolloutDeps;
+    // A rejected PREPARE creates no acknowledged runtime. Fail the release of
+    // its newly acquired lease to actually model unconfirmed cleanup.
+    f.db.nodePortLease.update = async () => { throw new Error("simulated lease cleanup failure"); };
+    const orch = fakeOrchestrator({ failOn: { dispatchEgress: true } });
+    const d2 = { db: f.db, runtimeUse: async () => null, orchestrator: orch } as RolloutDeps;
     const res = await registerRollout(
       {
         tunnelId: 1,
@@ -728,6 +746,10 @@ describe("compensated + compensation_error：§13.3.5 第三张表的两个终�
     expect(f.rollouts[0]!.compensated).toBe(false);
     expect(f.rollouts[0]!.compensation_error).toBeTruthy();
     expect(String(f.rollouts[0]!.last_error_code)).toBe("compensation_failed");
+    expect(String(f.rollouts[0]!.compensation_error)).toContain("simulated lease cleanup failure");
+    expect(await f.db.nodePortLease.findMany({ where: { status: "active" } })).toMatchObject([
+      { status: "active", tunnel_id: 1 }, { status: "active", tunnel_id: 1 },
+    ]);
   });
 });
 

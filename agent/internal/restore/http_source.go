@@ -52,6 +52,7 @@ type tunnelPayload struct {
 	RemoteHost  string `json:"remote_host"`
 	RemotePort  int    `json:"remote_port"`
 	NextHop     string `json:"next_hop"`
+	HopPeer     string `json:"hop_peer"`
 	Targets     []struct {
 		Host   string `json:"host"`
 		Port   int    `json:"port"`
@@ -59,11 +60,19 @@ type tunnelPayload struct {
 		Order  int    `json:"order"`
 		Remark string `json:"remark"`
 	} `json:"targets"`
-	LBStrategy string `json:"lb_strategy"`
-	Protocol   string `json:"protocol"`
-	SpeedLimit int64  `json:"speed_limit"`
-	Revision   int64  `json:"revision"`
-	ListenHost string `json:"listen_host"`
+	LBStrategy             string `json:"lb_strategy"`
+	Protocol               string `json:"protocol"`
+	SpeedLimit             int64  `json:"speed_limit"`
+	PolicyScope            string `json:"policy_scope"`
+	BytesPerSecondIn       int64  `json:"bytes_per_second_in"`
+	BytesPerSecondOut      int64  `json:"bytes_per_second_out"`
+	MaxConnections         int64  `json:"max_connections"`
+	MaxConnectionsPerIP    int    `json:"max_connections_per_ip"`
+	RateBurstBytes         int64  `json:"rate_burst_bytes"`
+	MaxMappings            int64  `json:"max_mappings"`
+	MaxMappingsPerSourceIP int    `json:"max_mappings_per_source_ip"`
+	Revision               int64  `json:"revision"`
+	ListenHost             string `json:"listen_host"`
 	// The TLS front's certificate paths. They MUST be decoded here: this payload
 	// is the desired-state snapshot an Agent pulls after every restart, and a
 	// decoder that drops them turns a working tls Forward into an unbuildable

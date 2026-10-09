@@ -1,0 +1,142 @@
+{
+  "upstream": "https://github.com/poouo/Forwardx",
+  "version": "2.3.281",
+  "commit": "cb0ef0bb156dc114e4344c887328018491fbd638",
+  "license": "AGPL-3.0-only",
+  "component": "forwardx-fxp",
+  "integration": "separate managed executable; TuneX agent remains stdlib-only",
+  "original_files": [
+    {
+      "path": "forwardx-fxp/buffer_pool.go",
+      "sha256": "4df4d2c34758b0fc5a3fad29626979f328c12f8d4e9e4b939cae0b14103a977a"
+    },
+    {
+      "path": "forwardx-fxp/buffer_pool_test.go",
+      "sha256": "264c3d6ff648325c96ad1153585df2a7ebabfb234714a1cc4c7d0b3425710551"
+    },
+    {
+      "path": "forwardx-fxp/config.go",
+      "sha256": "d637af32bc06f83995be8ff295e84cbc85c6bf5a0f33e3a2d5c27365480c40aa"
+    },
+    {
+      "path": "forwardx-fxp/config_types.go",
+      "sha256": "90c05ffae2ba96716b62405c1f6cf3f2231638cef3ca2a5f9271689d6754d310"
+    },
+    {
+      "path": "forwardx-fxp/entry_group_test.go",
+      "sha256": "6eb9ebee01aecfa24db238b0b7b87229d41e60c4d189837c48e0d94a2f26dd70"
+    },
+    {
+      "path": "forwardx-fxp/go.mod",
+      "sha256": "dd7ca2dce2c42bf96ad1a8346a8e3ee92ae575d428cce57c96596cd063d34cae"
+    },
+    {
+      "path": "forwardx-fxp/go.sum",
+      "sha256": "182aaf3e5ad42e58b67447f033fd764d6fb4af0eb75e4ef066a2e4e150bf698a"
+    },
+    {
+      "path": "forwardx-fxp/logging.go",
+      "sha256": "f923fc4c4ea0509db8f24e4d7f282f8452fd7d53a10010d38a2611ee3209001e"
+    },
+    {
+      "path": "forwardx-fxp/logging_test.go",
+      "sha256": "a2ddb588449cf0529b64bab300e1f1fff9c1a6af00c3d1fa285a3909adb969e7"
+    },
+    {
+      "path": "forwardx-fxp/main.go",
+      "sha256": "f138489498e0a87fe58abe3c8780928998d441a08c56e21a41d427fbcbbc9411"
+    },
+    {
+      "path": "forwardx-fxp/main_test.go",
+      "sha256": "ef09edf1a2232e586fc15d4f69f266ce7d15211bc8dcb3e8007eeae5af2f6eab"
+    },
+    {
+      "path": "forwardx-fxp/panel_auth.go",
+      "sha256": "08df934be2709ca8b48c9b165ba8512d2cef71f1b768c6f5cb7469501dd8d93f"
+    },
+    {
+      "path": "forwardx-fxp/panel_auth_test.go",
+      "sha256": "3f9ff625fb6e3a1e47531c9d618db92411b01efa5efe5f684dc59b622a9bda98"
+    },
+    {
+      "path": "forwardx-fxp/replay_cache_test.go",
+      "sha256": "3a1beba03fd6e280352dcaff6b14a97531989a5719921be0120ccc0f2ca2e346"
+    },
+    {
+      "path": "forwardx-fxp/resource_limits_test.go",
+      "sha256": "fedad5988c8d580dc6a28761b5e8457c0537d54767000f65c17684649f13ef63"
+    },
+    {
+      "path": "forwardx-fxp/shutdown_test.go",
+      "sha256": "4fcbd4e6127bbddfc0838433f7587f0cfe18b14608a6bf269ff5c72b7e4daf6f"
+    },
+    {
+      "path": "forwardx-fxp/tcp_fastopen_linux.go",
+      "sha256": "7cd9406451f6b0d1de6c6abc6ca9916ecf20043ba0bed460b05675d3b1ed076a"
+    },
+    {
+      "path": "forwardx-fxp/tcp_fastopen_other.go",
+      "sha256": "95b336737b70d4e63061eaad59d9759c522e754c98813fafc72170d0b74f22b8"
+    },
+    {
+      "path": "forwardx-fxp/traffic.go",
+      "sha256": "da3a0cac909081759c4b0de3ebcebe42fc0b929ea2d7ef20387cee938f468216"
+    },
+    {
+      "path": "forwardx-fxp/traffic_counter.go",
+      "sha256": "a7d7381dcaacbc50c13a63d4ad15a4a3da0e59a40ddf81b61ec5b34320a85d95"
+    },
+    {
+      "path": "forwardx-fxp/traffic_test.go",
+      "sha256": "2216acb4d15bbb735c2cf872dbac4eb52d11c98d0251551dc9bf6c01ba1c9849"
+    },
+    {
+      "path": "forwardx-fxp/udp_codec_test.go",
+      "sha256": "7912756a1b4e937c26b38149937d898b7c299781209ee9106b1335d7ffbf5267"
+    },
+    {
+      "path": "forwardx-fxp/udp_direct.go",
+      "sha256": "3315b15f6794631ad4868f18ef3a52d696d69e5f3b989fee086550a5bc15a26d"
+    },
+    {
+      "path": "forwardx-fxp/udp_fragment.go",
+      "sha256": "16eb678ede1e8c5b94dda260081435c04989648020cf296044adaea859b00e13"
+    },
+    {
+      "path": "forwardx-fxp/udp_fragment_test.go",
+      "sha256": "73d017c4ef5fcd57e29ee8a2e9fbd50dad843aeaab5e356c96e2aeab7eac80c9"
+    },
+    {
+      "path": "forwardx-fxp/udp_queue_budget.go",
+      "sha256": "87598e138c1f1326d72e40f1eee4531056c8274b1a408aa7387dd88a56407384"
+    },
+    {
+      "path": "forwardx-fxp/udp_queue_budget_test.go",
+      "sha256": "9897df3e98fe7cda1a2e40cc62a7ab6957ed0e190d322befb26a2ba30996221c"
+    },
+    {
+      "path": "forwardx-fxp/udp_regression_test.go",
+      "sha256": "2ee41d6182c03fe570606af9a4ac79be0127d96213b7638618587391b704368c"
+    },
+    {
+      "path": "forwardx-fxp/udp_sequence_test.go",
+      "sha256": "d8440d12a083854dd1c238c54637d51c31ba65bf3922056df9b5a1d84581e67e"
+    },
+    {
+      "path": "forwardx-fxp/udp_session_lifecycle.go",
+      "sha256": "33d1bf71d6c4d0a8d6ac2c126522e3871bd097c12c1b510e2a99bfdbbf59285f"
+    },
+    {
+      "path": "forwardx-fxp/udp_session_lifecycle_test.go",
+      "sha256": "635a4253e09a5620014be618a2bfa7a51414a67e4fe19a900e6d29d77a8a55a8"
+    },
+    {
+      "path": "forwardx-fxp/udp_tuning.go",
+      "sha256": "ff8724830594de1cf3cccf106d90540866bdf696cb65903f652e56ee75fa90b9"
+    },
+    {
+      "path": "forwardx-fxp/udp_tuning_test.go",
+      "sha256": "f4da123d1fcb830bf4679b6be11ca93da349a9e5b871a7ef0aa345fb4c9c7762"
+    }
+  ]
+}

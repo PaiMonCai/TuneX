@@ -292,6 +292,12 @@ func BuildRuntime(cfg TunnelConfig, deps BuildDeps) (Runtime, error) {
 		return BuildStream(cfg, deps.StreamBuildDeps)
 	case TransportDatagram:
 		return BuildDatagram(cfg, deps.Datagram)
+	case TransportMixed:
+		builder, ok := mixedBuilders[target.Protocol]
+		if !ok {
+			return nil, fmt.Errorf("forwarder: protocol %q has no mixed builder", target.Protocol)
+		}
+		return builder(cfg, deps)
 	default:
 		return nil, fmt.Errorf(
 			"forwarder: protocol %q resolves to transport %q, which has no runtime in this binary",

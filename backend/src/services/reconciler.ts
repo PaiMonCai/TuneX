@@ -779,7 +779,7 @@ export function defaultReconcileDeps(): ReconcileDeps {
     async tunnels() {
       const { db } = await import("../db.ts");
       const rows = await db.tunnel.findMany({
-        where: { config_revision: { not: null } },
+        where: { config_revision: { not: null }, link_resource_id: null },
         select: {
           id: true,
           name: true,

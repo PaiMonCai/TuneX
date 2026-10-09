@@ -8,9 +8,12 @@
  * buildDesiredNodeSnapshot().
  */
 import { db } from "../db.ts";
+import { forwardPolicyAgentConfig, forwardPolicyValues, hasForwardPolicy, forwardPolicyCapabilitySupported, FORWARD_POLICY_CAPABILITY, type ForwardPolicyInput, type ForwardWorkspacePolicy } from "./forward-policy.ts";
+import { getEffectivePolicy } from "./policy-service.ts";
 import { redis, scopedKey } from "../redis.ts";
 import { validatePayload, LOOKING_GLASS_MAX_TIMEOUT_MS, type CommandEnvelope } from "./control-protocol/index.ts";
-import { admitPersistedProtocol, datagramHopPeerFor, firstConnectIp } from "./forward-contract.ts";
+import { admitPersistedProtocol, datagramHopPeerFor, firstConnectIp, forwardHasDatagramLane } from "./forward-contract.ts";
+import { nativeBothShapeError } from "./forward-native-both.ts";
 import {
   targetHealthWireEntries,
   type TargetHealthWireEntry,
@@ -19,21 +22,24 @@ import {
   admissionLayerLabel,
   admitAction,
   admitOnNode,
+  admitRuntimeFromStore,
   loadNodeCapabilityFacts,
   type AgentV2CapabilityFacts,
 } from "./runtime-admission.ts";
 import { randomUUID } from "node:crypto";
+import { admitSelector, selectorAdmissionDetail } from "./selector-admission.ts";
+import type { FxpPlacementConfig } from "../integrations/forwardx/link-compiler.ts";
 import {
   AgentTransportError,
   Orchestrator,
   RELAY_DISPATCH_ERROR_CODES,
-  normalizeLbStrategy,
   type AgentTransport,
   type AgentTunnelConfig,
   type OrchestratorNode,
 } from "./orchestrator.ts";
 
 export interface QueuedAgentCommand {
+  link?: FxpPlacementConfig | null;
   envelope: CommandEnvelope;
   config: AgentTunnelConfig | null;
   /**  diagnose payload; delivered beside the envelope, like `config`. */
@@ -257,11 +263,13 @@ export async function enqueueAgentCommand(
    * 而在别处被静默改成传错的形状。
    */
   lookingGlass?: QueuedLookingGlassRequest | null,
+  link?: FxpPlacementConfig | null,
 ): Promise<{ scope: number }> {
   const scope = await (deps.resolveScope ?? nodeScope)(nodeId);
   const item: QueuedAgentCommand = {
     envelope,
     config,
+    ...(link ? { link } : {}),
     ...(probe ? { probe } : {}),
     ...(lookingGlass ? { looking_glass: lookingGlass } : {}),
     queued_at: new Date().toISOString(),
@@ -742,6 +750,21 @@ export class OutboundAgentTransport implements AgentTransport {
         `${decision.detail}（原因=${decision.reason}，维度=${admissionLayerLabel(decision.layer)}）`,
       );
     }
+    if (config && action === "apply_tunnel") {
+      if (hasForwardPolicy(config) && !forwardPolicyCapabilitySupported(facts)) {
+        throw new AgentTransportError(RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+          `节点 ${node.id} 未广告 ${FORWARD_POLICY_CAPABILITY}，拒绝非零 Forward 策略；请升级 Agent`);
+      }
+      // Final gate before enqueue, including callers that bypass Orchestrator.
+      // Legacy relay configs carry no authenticated original client address.
+      const selector = admitSelector({ strategy: config.lb_strategy, mode: config.mode }, facts);
+      if (!selector.ok) {
+        throw new AgentTransportError(
+          RELAY_DISPATCH_ERROR_CODES.agent_rejected,
+          selectorAdmissionDetail(selector),
+        );
+      }
+    }
   }
 
   private async send(
@@ -1073,7 +1096,11 @@ function hostPort(host: string, port: number): string {
  * instead of silent.
  */
 /** 一行 desired 状态（`buildDesiredNodeSnapshot` 的输入投影）。 */
-export interface DesiredRowProjection {
+export interface DesiredRowProjection extends ForwardPolicyInput {
+  federated_egress_peer?: string | null;
+  link_source_config?: unknown;
+  workspace_id?: number;
+  link_resource_id?: number | null;
   id: number;
   tunnel_mode: string | null;
   desired_status: string | null;
@@ -1089,10 +1116,11 @@ export interface DesiredRowProjection {
   remote_host: string | null;
   remote_port: number | null;
   egress_port: number | null;
-  egress_node?: { connect_ip: string | null; lb_strategy?: string | null } | null;
+  egress_node?: { connect_ip: string | null; lb_strategy?: string | null; node_group?: { workspace_id: number } } | null;
   middle_node?: { connect_ip: string | null } | null;
   /** V5.1b：datagram 出口的取证地址来自**入口**节点（优先用它的上报）。 */
   ingress_node?: {
+    node_group?: { workspace_id: number };
     connect_ip: string | null;
     state_report?: { tunnels?: unknown } | null;
   } | null;
@@ -1124,17 +1152,45 @@ export function desiredTunnelConfigFor(
    * 是 IO 结果。由调用方（快照构建）读一次、传进来，纯函数只负责把两类事实并排放好。
    */
   healthByTunnel: ReadonlyMap<number, readonly TargetHealthWireEntry[]> = new Map(),
+  selectorFacts: AgentV2CapabilityFacts | null = null,
+  workspacePolicy: ForwardWorkspacePolicy = {},
 ): DesiredRowOutcome {
+  if (row.link_resource_id != null) return { kind: "skip", reason: "link_managed_forward" };
   const revision = row.config_revision ?? 0;
   if (revision <= 0) return { kind: "not_for_node" };
+  const shape = nativeBothShapeError(row);
+  if (shape) return { kind: "skip", reason: shape };
 
   // One row, one protocol: resolved once and used by every leg below, so the
   // three branches cannot disagree about which protocol this Forward is.
-  const protocol = admitPersistedProtocol({
-    forward_protocol: row.forward_protocol,
-    tunnel_type: row.tunnel_type,
-  });
+  const protocol = admitPersistedProtocol(row);
   if (protocol === null) return { kind: "skip", reason: "protocol_not_supported" };
+  if (protocol === "both") {
+    const admission = admitOnNode({ nodeId, role: row.egress_node_id === nodeId ? "egress" : "ingress", facts: selectorFacts },
+      { action: "apply_tunnel", protocol });
+    if (!admission.ok) return { kind: "skip", reason: admission.reason };
+  }
+  const clientIngress = row.ingress_node_id === nodeId && (row.tunnel_mode === "direct" || row.tunnel_mode === "relay");
+  let policy: ReturnType<typeof forwardPolicyAgentConfig> | undefined;
+  if (clientIngress) {
+    try { policy = forwardPolicyAgentConfig(row, workspacePolicy); }
+    catch { return { kind: "skip", reason: "forward_policy_invalid" }; }
+    if (hasForwardPolicy(policy) && !forwardPolicyCapabilitySupported(selectorFacts)) {
+      return { kind: "skip", reason: "forward_policy_upgrade_required" };
+    }
+  }
+
+  if (row.tunnel_mode === "relay") {
+    const selector = admitSelector(
+      { strategy: row.egress_pool?.lb_strategy ?? row.egress_node?.lb_strategy, mode: "EGRESS" },
+      null,
+    );
+    // An invalid source policy cannot restore any leg of this relay. Capability
+    // negotiation for FALLBACK belongs to the exit node, checked below.
+    if (!selector.ok && selector.reason !== "upgrade_required") {
+      return { kind: "skip", reason: selector.reason };
+    }
+  }
 
   // : a tls front needs both paths. Without them the row is a broken
   // configuration, and the honest outcome is to keep it out of the snapshot —
@@ -1167,6 +1223,7 @@ export function desiredTunnelConfigFor(
         protocol,
         ...tlsPaths,
         speed_limit: 0,
+        ...policy,
         revision,
         listen_host: row.listen_ip ?? undefined,
       },
@@ -1207,7 +1264,12 @@ export function desiredTunnelConfigFor(
     if (!row.egress_port) return { kind: "not_for_node" };
     // Match the live dispatch/reconcile path: a NULL pool policy inherits the
     // node default. An Agent restart must not silently switch traffic to RR.
-    const strategy = normalizeLbStrategy(row.egress_pool?.lb_strategy ?? row.egress_node?.lb_strategy);
+    const selector = admitSelector(
+      { strategy: row.egress_pool?.lb_strategy ?? row.egress_node?.lb_strategy, mode: "EGRESS" },
+      selectorFacts,
+    );
+    if (!selector.ok) return { kind: "skip", reason: selector.reason };
+    const strategy = selector.strategy;
     const poolTargets = (row.egress_pool?.targets ?? []).map((x) => ({
       host: x.host,
       port: x.port,
@@ -1224,13 +1286,14 @@ export function desiredTunnelConfigFor(
       poolTargets.some((t) => t.host === h.host && t.port === h.port),
     );
     const hopPeer =
-      protocol === "udp"
+      forwardHasDatagramLane(protocol)
         ? datagramHopPeerFor({
             ingressRuntimeId: `tunex-${row.id}-relay`,
             ingressConnectIp: row.ingress_node?.connect_ip ?? null,
             ingressReportedTunnels: row.ingress_node?.state_report?.tunnels,
           })
         : null;
+    if (protocol === "both" && !hopPeer) return { kind: "skip", reason: "datagram_hop_peer_missing" };
     return {
       kind: "config",
       config: {
@@ -1242,7 +1305,7 @@ export function desiredTunnelConfigFor(
         remote_port: 0,
         next_hop: "",
         targets: poolTargets,
-        ...(healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
+        ...(protocol !== "both" && healthForTargets.length > 0 ? { target_health: healthForTargets } : {}),
         // V5.1b : the datagram exit attests its ingress. Omitted when there is
         // no address to attest — the exit then refuses to build, which is the honest
         // outcome (a datagram exit that accepts anyone is a relay for whoever finds
@@ -1286,6 +1349,7 @@ export function desiredTunnelConfigFor(
         protocol,
         ...tlsPaths,
         speed_limit: 0,
+        ...policy,
         revision,
         listen_host: row.listen_ip ?? undefined,
       },
@@ -1413,10 +1477,11 @@ async function collectFederatedLegRows(
 
 export async function buildDesiredNodeSnapshot(
   nodeId: number,
-): Promise<{ version: string; tunnels: AgentTunnelConfig[]; skipped: Array<{ id: number; reason: string }> }> {
-  const rows = await db.tunnel.findMany({
+): Promise<{ version: string; node_db_id: number; links: FxpPlacementConfig[]; tunnels: AgentTunnelConfig[]; skipped: Array<{ id: number; reason: string }> }> {
+  const persistedRows = await db.tunnel.findMany({
     where: {
       desired_status: "active",
+      link_resource_id: null,
       // ── V5.4：**从未成功应用过**的转发不得出现在期望状态里 ──
       //
       // `desired_status=active` 只说明用户**想要**它跑；`applied_revision IS NULL` 说明它
@@ -1432,7 +1497,7 @@ export async function buildDesiredNodeSnapshot(
       OR: [{ ingress_node_id: nodeId }, { egress_node_id: nodeId }, { middle_node_id: nodeId }],
     },
     include: {
-      egress_node: { select: { id: true, connect_ip: true, lb_strategy: true } },
+      egress_node: { select: { id: true, connect_ip: true, lb_strategy: true, node_group: { select: { workspace_id: true } } } },
       middle_node: { select: { id: true, connect_ip: true } },
       // V5.1b : a datagram exit is told which ingress may feed it, and the
       // ingress address is this node's. The command path reads it from the dispatch
@@ -1442,7 +1507,7 @@ export async function buildDesiredNodeSnapshot(
       // restart, which is precisely the class of bug V5-G2 found on health.
       // V5.1b：`state_report` 一起带出来，因为**真正为真的**取证地址是入口自己
       // 上报的跳端点（多宿节点上 `connect_ip` 是错的——见 forward-contract 的说明）。
-      ingress_node: { select: { id: true, connect_ip: true, state_report: { select: { tunnels: true } } } },
+      ingress_node: { select: { id: true, connect_ip: true, node_group: { select: { workspace_id: true } }, state_report: { select: { tunnels: true } } } },
       // V5.4: a three-hop ingress needs the middle node's lease to reconstruct
       // its next_hop, while the middle node needs its own lease to restore its
       // EGRESS-shaped transit runtime. Keep all active leases for this Forward;
@@ -1461,6 +1526,20 @@ export async function buildDesiredNodeSnapshot(
       },
     },
     orderBy: { id: "asc" },
+  });
+
+  // Compensation creates a new generation from a baseline snapshot. Read policy
+  // from the generation being restored, just like command dispatch; compatible
+  // projection columns remain the fallback for historical rows without snapshots.
+  const policySnapshots = persistedRows.length ? await db.forwardRevision.findMany({
+    where: { OR: persistedRows.map((t) => ({ tunnel_id: t.id, revision: t.config_revision ?? 0 })) },
+    select: { tunnel_id: true, revision: true, bytes_per_second_in: true, bytes_per_second_out: true,
+      max_connections: true, max_connections_per_ip: true },
+  }) : [];
+  const requestedByRevision = new Map(policySnapshots.map((s) => [`${s.tunnel_id}:${s.revision}`, s]));
+  const rows = persistedRows.map((t) => {
+    const snapshot = requestedByRevision.get(`${t.id}:${t.config_revision ?? 0}`);
+    return snapshot ? { ...t, ...forwardPolicyValues(snapshot) } : t;
   });
 
   // : read the health for the egress pools this snapshot will publish, ONCE,
@@ -1482,6 +1561,33 @@ export async function buildDesiredNodeSnapshot(
     }
   }
 
+  // Share the live dispatch negotiation facts; a restart must not bypass the
+  // selector gate. Baseline policies and impossible source scopes need no read.
+  const needsSelectorFacts = (rows as unknown as DesiredRowProjection[]).some((t) => {
+    if (t.tunnel_mode !== "relay" || t.egress_node_id !== nodeId) return false;
+    const admission = admitSelector(
+      { strategy: t.egress_pool?.lb_strategy ?? t.egress_node?.lb_strategy, mode: "EGRESS" },
+      null,
+    );
+    return !admission.ok && admission.reason === "upgrade_required";
+  });
+  const workspacePolicies = new Map<number, ForwardWorkspacePolicy>();
+  const bothEntitled = new Set<number>();
+  await Promise.all([...new Set(rows.filter((t) => t.ingress_node_id === nodeId || t.forward_protocol === "both").map((t) => t.workspace_id))].map(async (id) => {
+    const policy = await getEffectivePolicy(id, { noCache: true });
+    workspacePolicies.set(id, policy.limits);
+    if (!policy.deny_scope && ["tcp", "udp"].every((p) => policy.entitlements.tunnel_types.includes(p))) bothEntitled.add(id);
+  }));
+  const needsPolicyFacts = (rows as unknown as DesiredRowProjection[]).some((t) => {
+    if (t.ingress_node_id !== nodeId) return false;
+    try { return hasForwardPolicy(forwardPolicyAgentConfig(t, workspacePolicies.get(t.workspace_id!))); }
+    catch { return false; } // The per-row projection below rejects forbidden ceilings.
+  });
+  const needsBothFacts = rows.some((t) => t.forward_protocol === "both");
+  const selectorFacts = needsSelectorFacts || needsPolicyFacts || needsBothFacts
+    ? await loadNodeCapabilityFacts(nodeId).catch(() => null)
+    : null;
+
   // : ownership facts ride the snapshot as well, for the same reason health
   // does — an agent that restarts must still know its epoch, or the stale-epoch guard
   // resets to "never seen anything" and a demoted node could serve again.
@@ -1494,7 +1600,20 @@ export async function buildDesiredNodeSnapshot(
   const tunnels: AgentTunnelConfig[] = [];
   const skipped: Array<{ id: number; reason: string }> = [];
   for (const t of rows as unknown as DesiredRowProjection[]) {
-    const outcome = desiredTunnelConfigFor(t, nodeId, healthByTunnel);
+    if (t.forward_protocol === "both") {
+      if (!bothEntitled.has(t.workspace_id!)) { skipped.push({ id: t.id, reason: "protocol_not_allowed" }); continue; }
+      if (t.ingress_node?.node_group?.workspace_id !== t.workspace_id ||
+          t.tunnel_mode === "relay" && t.egress_node?.node_group?.workspace_id !== t.workspace_id) {
+        skipped.push({ id: t.id, reason: "native_both_self_owned_required" }); continue;
+      }
+      const admission = await admitRuntimeFromStore([
+        { nodeId: t.ingress_node_id!, role: "ingress" },
+        ...(t.tunnel_mode === "relay" && t.egress_node_id != null ? [{ nodeId: t.egress_node_id, role: "egress" as const }] : []),
+      ], { action: "apply_tunnel", protocol: "both" },
+      (id) => id === nodeId ? Promise.resolve(selectorFacts) : loadNodeCapabilityFacts(id));
+      if (!admission.ok) { skipped.push({ id: t.id, reason: admission.reason }); continue; }
+    }
+    const outcome = desiredTunnelConfigFor(t, nodeId, healthByTunnel, selectorFacts, workspacePolicies.get(t.workspace_id!));
     if (outcome.kind === "skip") {
       skipped.push({ id: t.id, reason: outcome.reason });
     } else if (outcome.kind === "config") {
@@ -1522,5 +1641,7 @@ export async function buildDesiredNodeSnapshot(
     for (const s of appended.skipped) skipped.push(s);
   }
 
-  return { version: "tunex-v3", tunnels, skipped };
+  const { desiredNodeLinks } = await import("./link-resource.ts");
+  const links = await desiredNodeLinks(nodeId);
+  return { version: "tunex-v3", node_db_id: nodeId, links, tunnels, skipped };
 }

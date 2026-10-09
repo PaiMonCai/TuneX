@@ -217,8 +217,9 @@ const redisMock = {
 // 副作用提醒：这是进程级替换。本文件把 db/redis 的**全部**导出面都补齐了
 // （redis 的 RedisKeys 直接转发真模块），同进程后续加载的测试文件拿到的
 // 替身仍是可用的，见 redisStub 上方的批注。
-mock.module(new URL("../../db.ts", import.meta.url).pathname, () => ({ db: dbStub }));
-mock.module(new URL("../../redis.ts", import.meta.url).pathname, () => redisMock);
+import { fileURLToPath } from "node:url";
+mock.module(fileURLToPath(new URL("../../db.ts", import.meta.url)), () => ({ db: dbStub }));
+mock.module(fileURLToPath(new URL("../../redis.ts", import.meta.url)), () => redisMock);
 
 // 复用 user-keys 测试的初始化顺序：db/redis 替身注册完，再 import 被测模块。
 const cred = await import("../node-credential.ts");
@@ -1070,9 +1071,9 @@ describe("reconnect snapshot", () => {
 describe("NAT Agent 只靠出站连接工作", () => {
   test("服务模块不 import 任何传输层（无 http / socket.io / net）", async () => {
     const credSrc = await Bun.file(
-      new URL("../node-credential.ts", import.meta.url).pathname,
+      new URL("../node-credential.ts", import.meta.url),
     ).text();
-    const stateSrc = await Bun.file(new URL("../node-state.ts", import.meta.url).pathname).text();
+    const stateSrc = await Bun.file(new URL("../node-state.ts", import.meta.url)).text();
     for (const src of [credSrc, stateSrc]) {
       expect(src).not.toMatch(/from "(node:)?(net|http|https|dgram|socket\.io)"/);
       expect(src).not.toMatch(/\blisten\s*\(/);

@@ -59,8 +59,7 @@ func TestPortGuardIsFreedAfterRuntimeLifecycle(t *testing.T) {
 	}
 
 	// 复用同一端口：这就是现场失败的那一步（新路由拿到刚释放的端口）。
-	// 按既有契约，Remove 会**立即**释放守卫，而内核层面的监听关闭是稍后完成的；
-	// 因此这里等它真正关闭再复用（面板侧另有防线：分配器把节点上报的 used_ports 也算作占用）。
+	// Remove 先删除 desired entry；守卫在 Stop 返回后释放，内核 socket 此时也必须已经关闭。
 	waitForPortClosed(t, port)
 	if _, err := tm.Apply(egressCfgFor("t-new", port, 1)); err != nil {
 		t.Fatalf("reusing a freed port must work, got: %v", err)

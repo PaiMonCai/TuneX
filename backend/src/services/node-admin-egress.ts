@@ -6,6 +6,7 @@
  */
 import { DEFAULT_POOL_NAME, err, toAdminError, deps, asRow, asRows, falsy, parseOk, parseFail, parseNodeRole, isValidTargetPort, parsePortRange, parseLbStrategy, parseEgressStatus, parseRequiredHost, parseOptionalHost, parsePoolName, parseTargetPort, parseWeight, parseOrderBy, parseRemark, hasEgressCapability, poolHasViableTarget, isRoleMismatch, stateAgeSeconds, isStaleState, credentialStateOf, jsonOr } from "./node-admin-core.ts";
 import type { NodeRoleValue, EgressStatusValue, NodeAdminError, NodeRow, StateReportRow, EgressPoolRow, EgressTargetRow, NodeAdminDb, NodeAdminDeps, ParseResult, NodeCredentialState } from "./node-admin-core.ts";
+import { guardEgressSelector } from "./node-admin-core.ts";
 
 /* ================================================================== */
 /* EgressPool CRUD                                                     */
@@ -51,6 +52,9 @@ export async function createEgressPool(
   if (nameParsed.value === DEFAULT_POOL_NAME) {
     return err("conflict", `池名 ${DEFAULT_POOL_NAME} 保留给自动创建的默认池`);
   }
+
+  const selectorDenied = await guardEgressSelector(pd, nodeId, lbParsed.value ?? node.lb_strategy);
+  if (selectorDenied) return selectorDenied;
 
   try {
     const pool = asRow<EgressPoolRow>(
@@ -125,6 +129,14 @@ export async function updateEgressPool(
   }
 
   if (Object.keys(data).length === 0) return { ok: true, pool };
+
+  const poolStrategy = input.lbStrategy !== undefined ? data.lb_strategy : pool.lb_strategy;
+  const node = poolStrategy == null
+    ? asRow<{ lb_strategy: string | null }>(await pd.node.findUnique({ where: { id: pool.node_id }, select: { lb_strategy: true } }))
+    : null;
+  if (poolStrategy == null && !node) return err("not_found", "节点不存在");
+  const selectorDenied = await guardEgressSelector(pd, pool.node_id, poolStrategy ?? node?.lb_strategy);
+  if (selectorDenied) return selectorDenied;
 
   try {
     const updated = asRow<EgressPoolRow>(

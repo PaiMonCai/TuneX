@@ -137,6 +137,8 @@ describe("A. 统一命令（§7.9 六个动作 + V4-WP11C 诊断）", () => {
     // 之所以不能复用一个既有动作：diagnose_tunnel 的目标契约写死了"来自面板自己的
     // desired 状态"，把用户输入塞进那条通道会让"目标归谁管"这件事失去唯一答案。
     expect([...COMMAND_ACTIONS]).toEqual([
+      "apply_link",
+      "remove_link",
       "apply_tunnel",
       "remove_tunnel",
       "update_targets",
@@ -152,6 +154,8 @@ describe("A. 统一命令（§7.9 六个动作 + V4-WP11C 诊断）", () => {
     }
     // 只有四个变更动作用于 revision 闸门；state_request/command_ack/diagnose 不走闸门。
     expect(COMMAND_ACTIONS.filter((a) => ACTION_SPECS[a].mutating)).toEqual([
+      "apply_link",
+      "remove_link",
       "apply_tunnel",
       "remove_tunnel",
       "update_targets",

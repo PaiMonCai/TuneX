@@ -472,6 +472,7 @@ func TestRenewalKeepsATunnelServingPastTheConfigDeadline(t *testing.T) {
 	applied, missed := g.ObserveRenewals([]Renewal{{
 		TunnelRef: 42,
 		Epoch:     3,
+		Revision:  cfg.Revision,
 		ExpiresAt: clk.Now().Add(30 * time.Second).UTC().Format(time.RFC3339),
 	}}, clk.Now())
 	if applied != 1 || missed != 0 {
@@ -522,6 +523,7 @@ func TestCancelledRenewalCannotExtendADeadline(t *testing.T) {
 	applied, _ := g.ObserveRenewals([]Renewal{{
 		TunnelRef: 5,
 		Epoch:     1,
+		Revision:  cfg.Revision,
 		ExpiresAt: clk.Now().Add(time.Minute).UTC().Format(time.RFC3339),
 	}}, clk.Now())
 	if applied != 1 {

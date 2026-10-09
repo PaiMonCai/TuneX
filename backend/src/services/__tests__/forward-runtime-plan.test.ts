@@ -82,17 +82,18 @@ describe("plan facts", () => {
     // udp, the first protocol on `datagram`. Both halves matter: a new protocol
     // must not need a new transport, and a new transport must not appear without
     // a protocol that derives it — transport is never a user field (WP0).
-    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp"]);
-    expect([...FORWARD_TRANSPORTS]).toEqual(["stream", "datagram"]);
+    expect([...FORWARD_PROTOCOLS]).toEqual(["tcp", "tls", "ws", "udp", "both"]);
+    expect([...FORWARD_TRANSPORTS]).toEqual(["stream", "datagram", "mixed"]);
 
     const expected: Record<
       (typeof FORWARD_PROTOCOLS)[number],
-      { name: "stream" | "datagram"; lifecycle: "connection" | "mapping" }
+      { name: "stream" | "datagram" | "mixed"; lifecycle: "connection" | "mapping" | "connection_and_mapping" }
     > = {
       tcp: { name: "stream", lifecycle: "connection" },
       tls: { name: "stream", lifecycle: "connection" },
       ws: { name: "stream", lifecycle: "connection" },
       udp: { name: "datagram", lifecycle: "mapping" },
+      both: { name: "mixed", lifecycle: "connection_and_mapping" },
     };
     for (const protocol of FORWARD_PROTOCOLS) {
       const plan = buildForwardRuntimePlan("direct", protocol);

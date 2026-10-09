@@ -62,6 +62,8 @@ export const LB_STRATEGIES: OptionMeta[] = [
   { value: "round", zh: "轮询", en: "Round" },
   { value: "rand", zh: "随机", en: "Random" },
   { value: "weighted_round", zh: "加权轮询", en: "Weighted round robin" },
+  { value: "fallback", zh: "目标主备", en: "Primary / backup" },
+  { value: "ip_hash", zh: "来源 IP 哈希", en: "Source IP hash" },
 ];
 
 export const CATEGORY_OPTIONS: OptionMeta[] = [

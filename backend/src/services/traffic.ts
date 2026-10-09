@@ -92,7 +92,7 @@ export interface TrafficAggRow {
   tunnel?: {
     name: string;
     forward_protocol?: string | null;
-    tunnel_type: string;
+    tunnel_type: string | null;
     in_node_group_id: number | null;
     in_node_group?: { name: string } | null;
   } | null;

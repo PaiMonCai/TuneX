@@ -121,9 +121,10 @@ func TestPlanForwardSwapDecisionTable(t *testing.T) {
 			wantStrategy: SwapNoop,
 		},
 		{
-			name:         "same everything is metadata at worst",
+			name:         "speed limit changes effective policy and needs rebuilding",
 			mutate:       func(c *forwarder.TunnelConfig) { c.SpeedLimit = 4096 },
-			wantStrategy: SwapMetadata,
+			wantStrategy: SwapRecreate,
+			wantDrain:    true,
 		},
 		{
 			name:         "upstream only is a target hot swap",
@@ -994,12 +995,11 @@ func TestDrainTunnelStopsAcceptingButKeepsThePort(t *testing.T) {
 		t.Fatalf("a drained tunnel still relayed %d bytes: the manager drain did not stop accepting", n)
 	}
 
-	// Remove is what releases it: the port must become reusable right away,
-	// because the old forwarder is stopped with it.
+	// Remove is what releases it after Stop returns and the socket is closed.
 	if err := tm.Remove("drainy"); err != nil {
 		t.Fatalf("Remove after drain: %v", err)
 	}
-	if tm.UsedPorts()[port] {
+	if !portFreedWithin(t, tm.UsedPorts, port, 5*time.Second) {
 		t.Fatal("Remove after a drain left the port reserved")
 	}
 	waitForPortClosed(t, port)

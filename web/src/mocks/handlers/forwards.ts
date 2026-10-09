@@ -42,6 +42,9 @@ import type { TopologyDiagFact } from "@/lib/api/forwards";
 import type { TargetHealthTargetView, TargetPoolHealth } from "@/lib/target-health";
 import type { MockNodeBinding, MockWorkspaceInvite } from "../state";
 import type { ForwardProtocol } from "@/lib/forward-protocol";
+import { mockForwardCapabilities, mockForwardMiddleHops as middleHopsOf, mockNativeBothGate } from "../forward-native-both";
+import { FORWARD_PROTOCOL_SPECS } from "@/lib/forward-protocol";
+import { FORWARD_POLICY_FIELDS, forwardPolicyDraft, forwardPolicyDraftErrors, forwardPolicyDraftValues } from "@/lib/forward-policy";
 import * as rt from "../runtime";
 import type { MockRequest, MockResponse, Store, MockForwardBatchAction, MockForwardBatchItemResult } from "../runtime";
 
@@ -115,17 +118,6 @@ function mockTopologyDiag(entry: unknown): TopologyDiagFact | null {
  *   ② 键是 store 对象 ⇒ `resetStore()` 换对象即自动归零，不需要改 `mocks/state.ts`。
  * 它只在两处被读：创建时的两段校验、topology 的三段构造。
  */
-const MOCK_MIDDLE_HOPS = new WeakMap<Store, Map<number, number>>();
-
-function middleHopsOf(db: Store): Map<number, number> {
-  let rows = MOCK_MIDDLE_HOPS.get(db);
-  if (!rows) {
-    rows = new Map<number, number>();
-    MOCK_MIDDLE_HOPS.set(db, rows);
-  }
-  return rows;
-}
-
 /** 账本日界（与真机 `BILLING_TIME_ZONE` 同值；mock 不 import 后端模块）。 */
 const LEDGER_TZ = "Asia/Shanghai";
 
@@ -133,6 +125,7 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
   const { method, clean, seg, q, db, user, req, scopeId } = ctx;
   if (seg[0] === "forwards") {
     const id = parseId(seg[1]);
+    if (method === "GET" && seg[1] === "capabilities" && seg.length === 2) return ok(mockForwardCapabilities());
     if (method === "GET" && seg[1] === "batch" && seg[2] === "capabilities") {
       return ok({ delete_enabled: process.env.NEXT_PUBLIC_MOCK_FORWARD_BATCH_DELETE_ENABLED === "true", stage: "experimental" });
     }
@@ -196,6 +189,7 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
             ];
       return ok({
         forward_id: id,
+        protocol: view.protocol,
         mode: view.mode,
         generated_at: nowIso(),
         segments,
@@ -357,6 +351,8 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
       const targetHost = reqStr(body.target_host);
       const targetPort = reqNum(body.target_port);
       const listenPort = numOrNull(body.listen_port);
+      const policyDraft = forwardPolicyDraft(Object.fromEntries(FORWARD_POLICY_FIELDS.map((key) => [key, body[key]])));
+      if (Object.keys(forwardPolicyDraftErrors(policyDraft)).length) return badRequest("并发与速率上限不合法");
 
       if (
         !name ||
@@ -422,6 +418,13 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
       }
 
       const middleId = numOrNull(body.middle_node_id);
+      if (protocol === "both") {
+        if (["client_source", "link_source_config", "link_resource_id", "federation_lease_id", "federated_egress_peer", "tls_cert_path", "tls_key_path"].some((key) => body[key] !== undefined)) {
+          return badRequest("原生 both 不支持来源透传、Link、联邦或 TLS 配置");
+        }
+        const gate = mockNativeBothGate(db, { mode, ingress, egress, middleNodeId: middleId === null ? "" : String(middleId) });
+        if (gate) return failFlat(409, gate.message, gate.code, { details: gate.details });
+      }
       let middle: UserNode | null = null;
       if (mode === "direct" && middleId !== null) {
         return badRequest("DIRECT 转发不能指定中间节点");
@@ -479,15 +482,10 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
           : `${targetHost}:${targetPort}`;
       const created: Tunnel = {
         id: newId,
+        ...forwardPolicyDraftValues(policyDraft),
         name,
-        /*
-         * legacy `tunnel_type` 只写契约给出的镜像值；`ws` 在 legacy 枚举里没有
-         * 对应值，**不写**这一列（后端的 `legacyTunnelTypeColumn("ws")` 返回空对象，
-         * 于是列保留 DB 默认值；`forward_protocol` 才是唯一的协议事实）。
-         * 这里之所以仍写一个具体值，是因为 mock 的 store 行必须有值才自洽 ——
-         * 用默认的 `wss` 模拟「列保留默认」的行为。
-         */
-        tunnel_type: protocol === "ws" ? "wss" : protocol,
+        // No legacy enum value represents plain WS or native both.
+        tunnel_type: FORWARD_PROTOCOL_SPECS[protocol].legacy_tunnel_type,
         forward_protocol: protocol,
         tls_cert_path: tlsCertPath === "" ? null : tlsCertPath,
         tls_key_path: tlsKeyPath === "" ? null : tlsKeyPath,
@@ -536,7 +534,8 @@ export async function handleForwardsMock(ctx: rt.MockAuthedRouteContext): Promis
       db.tunnels.unshift(created);
       // 记住中间跳：`forwardView` 不投影它（与真后端一致），但 topology 要按三段画。
       if (mode === "relay" && middleId !== null) middleHopsOf(db).set(newId, middleId);
-      completeOrchestration(created);
+      // A fixture has no native manager and cannot prove both listeners were constructed.
+      if (protocol !== "both") completeOrchestration(created);
       created.online = true;
       return ok(mockForwardView(db, created));
     }

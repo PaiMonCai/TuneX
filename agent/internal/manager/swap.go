@@ -12,6 +12,7 @@ import (
 
 	"github.com/tunex/agent/internal/forwarder"
 	"github.com/tunex/agent/internal/logx"
+	"github.com/tunex/agent/internal/portlease"
 )
 
 // ---------------------------------------------------------------------------
@@ -37,8 +38,8 @@ type SwapStrategy string
 const (
 	// SwapNoop is an identical config: nothing to do at all.
 	SwapNoop SwapStrategy = "noop"
-	// SwapMetadata is a change with no data-plane effect (name /
-	// speed-limit class fields). The listener and the upstream stay.
+	// SwapMetadata is a change with no data-plane effect, such as name.
+	// The listener and the upstream stay.
 	SwapMetadata SwapStrategy = "metadata_only"
 	// SwapTargetSwap is an upstream-only change on the same listener: the
 	// §13.3.4 "Target Host / Port" row. Live connections survive.
@@ -103,6 +104,9 @@ func PlanForwardSwap(old, new_ forwarder.TunnelConfig) SwapPlan {
 
 	oldPort, newPort := old.ListenPort(), new_.ListenPort()
 	portMoved := oldPort != newPort
+	hostMoved := portlease.NormalizeHost(old.ListenHost) != portlease.NormalizeHost(new_.ListenHost)
+	protocolMoved := !sameListenerProtocol(old, new_)
+	policyMoved := !forwarder.SameDataPlanePolicy(old, new_)
 	modeMoved := old.Mode != new_.Mode
 	upstreamMoved := old.UpstreamAddr() != new_.UpstreamAddr()
 
@@ -116,6 +120,25 @@ func PlanForwardSwap(old, new_ forwarder.TunnelConfig) SwapPlan {
 			Reason: fmt.Sprintf("listen port %d -> %d requires a new listener",
 				oldPort, newPort),
 		}
+	case hostMoved:
+		return SwapPlan{
+			Strategy: SwapListener, DrainOld: true, FreeOldPort: true,
+			Upstream: new_.UpstreamAddr(), Reason: "listen bind scope changed",
+		}
+	case protocolMoved:
+		return SwapPlan{
+			Strategy: SwapRecreate, DrainOld: true,
+			FreeOldPort: portBinding(old).Network != portBinding(new_).Network,
+			Reason:      "listener protocol changed; a target swap cannot change the socket front",
+		}
+	case policyMoved:
+		return SwapPlan{
+			Strategy: SwapRecreate, DrainOld: true,
+			Reason: "effective data-plane policy changed; a target swap cannot update runtime policy",
+		}
+	case (old.Protocol == forwarder.ProtocolBoth || new_.Protocol == forwarder.ProtocolBoth) && (modeMoved || upstreamMoved):
+		return SwapPlan{Strategy: SwapRecreate, DrainOld: true,
+			Reason: "mixed runtime changes both children together; partial retarget is not supported"}
 	case modeMoved:
 		// DIRECT <-> RELAY keeps the port but changes what the listener
 		// dials. §13.3.4 lets this stay on the same listener (it is an
@@ -236,9 +259,7 @@ func (m *TunnelManager) DrainTunnel(id string, timeout time.Duration) error {
 func (m *TunnelManager) ReplaceListener(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
 	before := m.fingerprint()
 	fwd, err := m.replaceListenerInner(cfg)
-	if err == nil {
-		m.notifyIfChanged(before)
-	}
+	m.notifyIfChanged(before)
 	return fwd, err
 }
 
@@ -259,11 +280,8 @@ func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwar
 		return nil, ErrNodeShuttingDown
 	}
 
-	normalized := cfg.Clone()
-	if normalized.ListenHost == "" {
-		normalized.ListenHost = m.listenHost
-	}
-	if err := normalized.Validate(); err != nil {
+	normalized, err := m.normalizeConfig(cfg)
+	if err != nil {
 		return nil, err
 	}
 
@@ -281,6 +299,10 @@ func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwar
 			// listener. Rebinding or draining here would interrupt
 			// traffic for nothing (and would break the reconciler's
 			// "resend the same revision" repair path).
+			m.refreshEffectiveOwnershipLocked(&cur.cfg, normalized)
+			if err := m.commitOwnershipLocked(cur.cfg); err != nil {
+				return nil, err
+			}
 			return cur.fwd, nil
 		}
 	}
@@ -297,11 +319,21 @@ func (m *TunnelManager) replaceListenerInner(cfg forwarder.TunnelConfig) (forwar
 		if normalized.Revision == sibling.cfg.Revision && normalized.Revision != revisionUnknown {
 			return nil, fmt.Errorf("manager: mode transition %s -> %s requires a newer revision", siblingID, normalized.ID)
 		}
-		return m.adoptIngressModeSiblingLocked(siblingID, sibling, normalized)
+		fwd, err := m.adoptIngressModeSiblingLocked(siblingID, sibling, normalized)
+		if err == nil {
+			if err := m.commitOwnershipLocked(normalized); err != nil {
+				return nil, err
+			}
+			delete(m.removedRevision, normalized.ID)
+		}
+		return fwd, err
 	}
 
 	fwd, err := m.applyRoutedLocked(normalized)
 	if err == nil {
+		if err := m.commitOwnershipLocked(normalized); err != nil {
+			return nil, err
+		}
 		delete(m.removedRevision, normalized.ID)
 	}
 	return fwd, err
@@ -344,30 +376,29 @@ func (m *TunnelManager) adoptIngressModeSiblingLocked(
 	old *entry,
 	cfg forwarder.TunnelConfig,
 ) (forwarder.Runtime, error) {
-	if old.cfg.ListenPort() == cfg.ListenPort() {
-		transportsDiffer, err := transportChange(old.cfg, cfg)
-		if err != nil {
-			return nil, err
-		}
-		if transportsDiffer {
-			// The wire resource id changed AND the listener's transport changed
-			// (udp DIRECT <-> tcp RELAY are the two shapes one Forward takes).
-			// "Swap the upstream" cannot turn a UDP socket into a TCP one, so the
-			// one runtime is replaced rather than retargeted.
-			return m.replaceSiblingTransportLocked(oldID, old, cfg)
-		}
+	if err := m.checkCurrentOwnershipLocked(cfg); err != nil {
+		return nil, err
+	}
+	if err := m.checkPortAvailableLocked(cfg, oldID); err != nil {
+		return nil, err
+	}
+	if cfg.Protocol != forwarder.ProtocolBoth && portGuardKey(old.cfg) == portGuardKey(cfg) && sameListenerProtocol(old.cfg, cfg) && forwarder.SameDataPlanePolicy(old.cfg, cfg) {
 		if err := retargetRuntime(old.cfg, old.fwd, cfg.UpstreamAddr()); err != nil {
 			return nil, fmt.Errorf("manager: mode switch upstream swap refused: %w", err)
 		}
 		delete(m.tunnels, oldID)
 		old.cfg = cfg
 		m.tunnels[cfg.ID] = old
-		m.markPortUsedLocked(cfg)
+		m.rebuildPortGuardLocked()
 		logx.Info("tunnel ingress mode hot-swapped",
 			"old_id", oldID, "id", cfg.ID, "mode", string(cfg.Mode),
 			"port", cfg.ListenPort(), "upstream", cfg.UpstreamAddr(),
 			"revision", cfg.Revision)
 		return old.fwd, nil
+	}
+	if old.cfg.ListenPort() == cfg.ListenPort() &&
+		(portBinding(old.cfg).Conflicts(portBinding(cfg)) || !sameListenerProtocol(old.cfg, cfg)) {
+		return m.replaceSiblingTransportLocked(oldID, old, cfg)
 	}
 
 	fwd, err := m.buildLocked(cfg)
@@ -375,13 +406,15 @@ func (m *TunnelManager) adoptIngressModeSiblingLocked(
 		return nil, err
 	}
 	m.attachLedger(cfg, fwd)
-	if err := m.startLocked(cfg, fwd); err != nil {
+	if err := fwd.Start(); err != nil {
 		return nil, err
 	}
 	m.markPortUsedLocked(cfg)
 
 	delete(m.tunnels, oldID)
 	m.tunnels[cfg.ID] = &entry{cfg: cfg, fwd: fwd}
+	m.noteStoppingLocked(old.cfg)
+	m.rebuildPortGuardLocked()
 	m.stopEntryAsync(old, m.releasePortAfterStop(old.cfg))
 	logx.Info("tunnel ingress mode listener replaced",
 		"old_id", oldID, "id", cfg.ID, "mode", string(cfg.Mode),
@@ -394,10 +427,9 @@ func (m *TunnelManager) adoptIngressModeSiblingLocked(
 // different TRANSPORT on the SAME port number.
 //
 // Unlike a target swap or a mode switch inside one transport, this cannot be
-// absorbed by the running runtime: the socket kind itself changes, and §5.2
-// freezes one-number-one-binding on this node, so the old runtime must be gone
-// before the new one binds. That is a momentary outage for this Forward — the
-// honest price of changing what its listener IS.
+// absorbed by the running runtime: the listener front or overlapping scope
+// changes. This rule is rebuilt after checking every other owner; it does not
+// exclude independent TCP and UDP rules from sharing the same port number.
 //
 // The new runtime is BUILT before the old one is touched, so an unusable config
 // (a bad certificate, an unimplemented protocol) fails without an outage. If the
@@ -409,6 +441,9 @@ func (m *TunnelManager) replaceSiblingTransportLocked(
 	old *entry,
 	cfg forwarder.TunnelConfig,
 ) (forwarder.Runtime, error) {
+	if err := m.checkPortAvailableLocked(cfg, oldID); err != nil {
+		return nil, err
+	}
 	fwd, err := m.buildLocked(cfg)
 	if err != nil {
 		return nil, err
@@ -420,7 +455,11 @@ func (m *TunnelManager) replaceSiblingTransportLocked(
 	delete(m.tunnels, oldID)
 
 	if err := fwd.Start(); err != nil {
-		m.releasePortLocked(cfg)
+		_ = fwd.Stop()
+		if old.cfg.Protocol == forwarder.ProtocolBoth || cfg.Protocol == forwarder.ProtocolBoth {
+			err = m.restoreStoppedEntryLocked(oldID, old, err)
+		}
+		m.rebuildPortGuardLocked()
 		return nil, err
 	}
 	m.markPortUsedLocked(cfg)
@@ -432,20 +471,52 @@ func (m *TunnelManager) replaceSiblingTransportLocked(
 	return fwd, nil
 }
 
-// transportChange reports whether cfg is carried by a different transport than
-// running. A config whose protocol this binary cannot resolve is an error rather
-// than "no change": treating an unknown protocol as the same transport would
-// install a config whose runtime does not exist.
-func transportChange(running, cfg forwarder.TunnelConfig) (bool, error) {
-	from, err := forwarder.ResolveRuntimeTarget(running)
-	if err != nil {
-		return false, err
+// A mixed candidate may bind TCP and then fail UDP. Stop consumed runtimes are
+// never restartable: compensation builds a fresh copy of the last applied
+// config. Re-check the current ownership gate before that NEW activation, and
+// remove the old registry entry if authorization or compensation fails. Holding
+// the mutation lock here serializes the rare compensating activation (including
+// the guard's durable check); it cannot overwrite a concurrent newer revision.
+func (m *TunnelManager) restoreStoppedEntryLocked(id string, old *entry, cause error) error {
+	delete(m.tunnels, id)
+	cfg := old.cfg
+	if m.ownership != nil {
+		var err error
+		if phased, ok := m.ownership.(activationGuard); ok {
+			cfg = phased.CompensationConfig(cfg)
+			err = phased.CheckActivation(cfg)
+		} else {
+			err = m.ownership.Admit(cfg)
+		}
+		if err != nil {
+			m.rebuildPortGuardLocked()
+			return fmt.Errorf("%w; old runtime compensation authorization refused: %v", cause, err)
+		}
 	}
-	to, err := forwarder.ResolveRuntimeTarget(cfg)
-	if err != nil {
-		return false, err
+	restored, err := m.buildLocked(cfg)
+	if err == nil {
+		err = restored.Start()
 	}
-	return from.Transport != to.Transport, nil
+	if err != nil {
+		if restored != nil {
+			_ = restored.Stop()
+		}
+		m.rebuildPortGuardLocked()
+		return fmt.Errorf("%w; old runtime compensation failed: %v", cause, err)
+	}
+	m.attachLedger(cfg, restored)
+	m.tunnels[id] = &entry{cfg: cfg, fwd: restored}
+	if err := m.commitOwnershipLocked(cfg); err != nil {
+		return fmt.Errorf("%w; old runtime compensation lost authorization: %v", cause, err)
+	}
+	m.rebuildPortGuardLocked()
+	return cause // The candidate still failed; never ACK it as applied.
+}
+
+func sameListenerProtocol(a, b forwarder.TunnelConfig) bool {
+	from, fromErr := forwarder.ParseForwardProtocol(string(a.Protocol))
+	to, toErr := forwarder.ParseForwardProtocol(string(b.Protocol))
+	return fromErr == nil && toErr == nil && from == to
 }
 
 // retargetRuntime moves where a RUNNING runtime sends its new work, without
@@ -482,6 +553,9 @@ func retargetRuntime(cfg forwarder.TunnelConfig, fwd forwarder.Runtime, addr str
 // keep the listener bound — a rolled-out tunnel keeps its port reserved — and
 // both are irreversible.
 func drainRuntime(fwd forwarder.Runtime, timeout time.Duration) error {
+	if mixed, ok := fwd.(forwarder.MixedRuntime); ok {
+		return mixed.Drain(timeout)
+	}
 	if d, ok := fwd.(forwarder.DatagramRuntime); ok {
 		return d.DrainMappings(timeout)
 	}
@@ -498,6 +572,9 @@ func drainRuntime(fwd forwarder.Runtime, timeout time.Duration) error {
 // control-plane command path and the admin API cannot disagree about what a
 // change means. Caller must hold m.mu.
 func (m *TunnelManager) applyRoutedLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	if err := m.checkCurrentOwnershipLocked(cfg); err != nil {
+		return nil, err
+	}
 	// A first-ever apply has no running instance to classify against: a diff
 	// against a zero config always looks like a listener move. Take Apply's
 	// path, which also runs the port-guard check a fresh bind needs.
@@ -532,16 +609,9 @@ func (m *TunnelManager) hotSwapUpstreamLocked(cfg forwarder.TunnelConfig) (forwa
 	if !ok {
 		return m.applyLocked(cfg)
 	}
-	// A protocol change on the same port is not a target swap: the listener's
-	// transport changes with the protocol, and only a rebuild can produce the
-	// other kind of socket. Falling back to Apply's path is what keeps the
-	// registry from describing, say, a UDP socket as running a TCP config.
-	targetsDiffer, err := transportChange(e.cfg, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if targetsDiffer {
-		logx.Info("tunnel listener transport changed, rebuilding",
+	// Retargeting cannot update the listener front, bind scope or runtime policy.
+	if portGuardKey(e.cfg) != portGuardKey(cfg) || !sameListenerProtocol(e.cfg, cfg) || !forwarder.SameDataPlanePolicy(e.cfg, cfg) {
+		logx.Info("tunnel listener or effective policy changed, rebuilding",
 			"id", cfg.ID, "port", cfg.ListenPort(), "revision", cfg.Revision)
 		return m.applyLocked(cfg)
 	}
@@ -576,7 +646,18 @@ func (m *TunnelManager) hotSwapUpstreamLocked(cfg forwarder.TunnelConfig) (forwa
 // still reserved, which is exactly "PREPARE failed, the old applied revision
 // keeps running".
 func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	if err := m.checkCurrentOwnershipLocked(cfg); err != nil {
+		return nil, err
+	}
 	old, hadOld := m.tunnels[cfg.ID]
+	if err := m.checkPortAvailableLocked(cfg, cfg.ID); err != nil {
+		return nil, err
+	}
+	// A wildcard expansion on the same socket cannot bind beside its old
+	// listener. Use the same guarded rebuild path as Apply in that case.
+	if hadOld && portBinding(old.cfg).Conflicts(portBinding(cfg)) {
+		return m.applyLocked(cfg)
+	}
 
 	fwd, err := m.buildLocked(cfg)
 	if err != nil {
@@ -589,7 +670,7 @@ func (m *TunnelManager) replaceListenerLocked(cfg forwarder.TunnelConfig) (forwa
 	m.markPortUsedLocked(cfg)
 
 	if hadOld {
-		if old.cfg.ListenPort() != cfg.ListenPort() {
+		if portGuardKey(old.cfg) != portGuardKey(cfg) {
 			// The old port becomes free once the old forwarder has really
 			// stopped — releasing it before the listener is closed would
 			// advertise a port the kernel still has bound. The reservation
@@ -629,6 +710,9 @@ func oldPortOf(e *entry, ok bool) int {
 // sequence without duplicating it. Caller must hold m.mu and have already
 // passed the revision gate.
 func (m *TunnelManager) applyLocked(cfg forwarder.TunnelConfig) (forwarder.Runtime, error) {
+	if err := m.checkCurrentOwnershipLocked(cfg); err != nil {
+		return nil, err
+	}
 	fwd, err := m.buildLocked(cfg)
 	if err != nil {
 		return nil, err

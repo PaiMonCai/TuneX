@@ -23,7 +23,14 @@ import {
   TLS_FORWARD_PROTOCOL,
   forwardProtocolFact,
   tlsPathFieldErrors,
+  FORWARD_PROTOCOL_SPECS,
+  isForwardProtocol,
 } from "@/lib/forward-protocol";
+import { nativeBothTransitionAllowed } from "@/lib/forward-native-both";
+import { mockForwardMiddleHops, mockNativeBothGate } from "./forward-native-both";
+import { mockUserNodeStatus } from "./node-lifecycle";
+import { FORWARD_POLICY_FIELDS, forwardPolicyDraft, forwardPolicyDraftErrors } from "@/lib/forward-policy";
+import type { ForwardPolicyInput } from "@/lib/types";
 
 /** WP1 错误码（与 backend FORWARD_REVISION_ERROR_CODES 同名同义）。 */
 export const FORWARD_MOCK_ERRORS = {
@@ -48,7 +55,7 @@ export interface ForwardMockError {
 }
 
 /** mock 端完整候选 config（与后端 ForwardCandidateConfig 同形）。 */
-export interface MockForwardCandidate {
+export interface MockForwardCandidate extends ForwardPolicyInput {
   name: string;
   mode: "direct" | "relay";
   ingress_node_id: number;
@@ -99,8 +106,9 @@ export function rowOf(db: MockStore, tunnel: Tunnel): MockForwardBase {
       : parsed);
   return {
     id: tunnel.id,
+    ...Object.fromEntries(FORWARD_POLICY_FIELDS.map((key) => [key, (tunnel as Tunnel & ForwardPolicyInput)[key]])),
     name: tunnel.name,
-    protocol: tunnel.forward_protocol ?? tunnel.tunnel_type ?? null,
+    protocol: tunnel.forward_protocol ?? tunnel.tunnel_type ?? undefined,
     tls_cert_path: tunnel.tls_cert_path ?? null,
     tls_key_path: tunnel.tls_key_path ?? null,
     mode: (tunnel.tunnel_mode ?? "direct") as "direct" | "relay",
@@ -180,6 +188,7 @@ function normalizeNodeId(value: unknown): number | null | undefined {
 /** 当前 desired config：mock 的 desired 指针由 tunnel 行自身承担。 */
 export function mockCurrentDesiredConfig(row: MockForwardBase): MockForwardCandidate {
   return {
+    ...Object.fromEntries(FORWARD_POLICY_FIELDS.map((key) => [key, row[key]])),
     name: row.name,
     mode: row.mode,
     ingress_node_id: row.ingress_node_id,
@@ -216,6 +225,7 @@ export function mergeMockForwardCandidate(
   })();
   return {
     name: patch.name !== undefined ? normalizeName(patch.name) ?? base.name : base.name,
+    ...Object.fromEntries(FORWARD_POLICY_FIELDS.map((key) => [key, patch[key] !== undefined ? patch[key] : base[key]])),
     mode: patch.mode !== undefined ? patch.mode : base.mode,
     ingress_node_id: ingress === undefined ? base.ingress_node_id : (ingress ?? base.ingress_node_id),
     egress_node_id: egress === undefined ? base.egress_node_id : egress,
@@ -225,10 +235,8 @@ export function mergeMockForwardCandidate(
       listen === undefined ? base.listen_port : listen.ok ? listen.port : base.listen_port,
     target_host: targetHost === undefined ? base.target_host : targetHost,
     target_port: targetPort === undefined ? base.target_port : targetPort,
-    // protocol 不在 ForwardPatchInput 里（后端 ForwardPatchSchema 不接受它），
-    // 所以这里只有 tls 路径可合并 —— 与后端 `mergeForwardCandidate` 的
-    // 「undefined = 沿用当前值」同义。
-    protocol: base.protocol,
+    // Plain protocol transitions merge incrementally; omission retains the fact.
+    protocol: patch.protocol ?? base.protocol,
     tls_cert_path:
       patch.tls_cert_path === undefined
         ? (base.tls_cert_path ?? null)
@@ -247,6 +255,8 @@ export function isMockMetadataOnlyPatch(
 ): boolean {
   return (
     base.mode === candidate.mode &&
+    base.protocol === candidate.protocol &&
+    FORWARD_POLICY_FIELDS.every((key) => (base[key] ?? 0) === (candidate[key] ?? 0)) &&
     base.ingress_node_id === candidate.ingress_node_id &&
     (base.egress_node_id ?? null) === (candidate.egress_node_id ?? null) &&
     (base.listen_port ?? null) === (candidate.listen_port ?? null) &&
@@ -450,7 +460,9 @@ export function computeMockForwardImpact(input: {
     egressNodeChange || (input.candidate.mode === "relay" && targetChange);
 
   const listenerReplacement =
-    !metadataOnly && (listenPortChange || ingressNodeChange || modeChange);
+    !metadataOnly && (listenPortChange || ingressNodeChange || modeChange || input.current.protocol !== input.candidate.protocol ||
+      input.current.protocol === "both" || input.candidate.protocol === "both" ||
+      FORWARD_POLICY_FIELDS.some((key) => (input.current[key] ?? 0) !== (input.candidate[key] ?? 0)));
   const changesExternalAddress = !metadataOnly && (listenPortChange || ingressNodeChange);
 
   const nodesPrepareDrain = new Set<string>();
@@ -515,7 +527,7 @@ export function mockForwardEnvironment(
       ...node,
       agent_id: node.agent_id ?? `mock-agent-${node.id}`,
       role,
-      online: Boolean(node.online) && node.status === "active",
+      ...mockUserNodeStatus(db, node),
     };
   };
   const ingress = project(findNode(candidate.ingress_node_id));
@@ -552,6 +564,20 @@ export function resolveMockForwardCandidate(
   const current = mockCurrentDesiredConfig(base);
   const candidate = mergeMockForwardCandidate(current, patch);
   const env = mockForwardEnvironment(db, candidate, base.id);
+  if (Object.keys(forwardPolicyDraftErrors(forwardPolicyDraft(candidate))).length) return invalid("并发与速率上限不合法");
+  if (patch.protocol !== undefined && (!isForwardProtocol(patch.protocol) || !nativeBothTransitionAllowed(current.protocol ?? "tcp", patch.protocol))) {
+    return invalid("该协议切换不受支持");
+  }
+  if (candidate.protocol === "both") {
+    if (["middle_node_id", "client_source", "link_source_config", "link_resource_id", "federation_lease_id", "federated_egress_peer"]
+      .some((key) => key in patch)) return invalid("原生 both 不接受中间跳、来源透传、Link 或联邦配置");
+    const gate = mockNativeBothGate(db, { mode: candidate.mode, ingress: env.ingress, egress: env.egress,
+      middleNodeId: String(mockForwardMiddleHops(db).get(base.id) ?? ""),
+      existingBoth: current.protocol === "both", pathChanged: current.mode !== candidate.mode ||
+        current.ingress_node_id !== candidate.ingress_node_id || current.egress_node_id !== candidate.egress_node_id });
+    if (gate) return invalid(gate.message, { reasons: [gate.details.reason] });
+    if (patch.tls_cert_path !== undefined || patch.tls_key_path !== undefined) return invalid("原生 both 不接受 TLS 路径");
+  }
 
   const pure = validateMockCandidate(candidate);
   if (!pure.ok) {
@@ -660,6 +686,13 @@ export function applyMockForwardPatch(
   }
 
   tunnel.name = candidate.name;
+  for (const key of FORWARD_POLICY_FIELDS) {
+    if (candidate[key] !== undefined) (tunnel as Tunnel & ForwardPolicyInput)[key] = candidate[key];
+  }
+  if (isForwardProtocol(candidate.protocol)) {
+    tunnel.forward_protocol = candidate.protocol;
+    tunnel.tunnel_type = FORWARD_PROTOCOL_SPECS[candidate.protocol].legacy_tunnel_type;
+  }
   /*
    * tls 路径落库：与后端 `tlsPathsForCandidate` 同一口径 —— 只有 tls 候选可以携带，
    * 且必须成对且是绝对路径；不满足就写 null（不留半份路径）。非 tls 行永远写 null，
@@ -710,6 +743,8 @@ export function applyMockForwardPatch(
   tunnel.apply_error = null;
   tunnel.apply_error_code = null;
   tunnel.updated_at = new Date().toISOString();
+  // Native both has no constructed runtime in this mock: never fabricate a dual-leg ACK.
+  if (candidate.protocol === "both") return { ok: true, view: viewMockForward(db, tunnel) };
   // 假 Agent ACK（与 create/retry/resume 的 mock 语义一致）。
   tunnel.applied_revision = tunnel.config_revision;
   tunnel.apply_status = "active";
