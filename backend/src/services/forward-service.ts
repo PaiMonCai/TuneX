@@ -1170,9 +1170,12 @@ export async function patchForward(
     return { ok: true, data: forwardView(renamed) };
   }
 
-  // 存量/创建路径自愈：已经有真实 applied runtime 但还没有 snapshot 指针时，
-  // 先冻结当前 applied revision，保证首次 listener replacement 有旧 runtime。
-  if (current.applied_revision != null && current.desired_revision_id == null) {
+  // Runtime actions (suspend/resume/retry) can advance the ACKed generation
+  // without creating a product-edit snapshot. An older non-null pointer is not
+  // evidence that the ACTUAL applied revision has a compensation baseline.
+  // Freeze it before mutating the pool/projection; the helper is idempotent and
+  // refuses to freeze an unapplied desired generation (applied != config).
+  if (current.applied_revision != null) {
     try {
       await ensureForwardBaselineRevision(current.id, ctx.userId);
     } catch {

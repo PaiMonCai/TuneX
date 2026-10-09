@@ -83,6 +83,8 @@ F4 更新回归另覆盖显式未知协议汇总的 both→TCP/UDP 拒绝、目�
 
 服务层目标更新回归覆盖 DIRECT/RELAY × TCP/UDP/both × IPv4 wildcard/IPv6 wildcard/具体监听 IP 的 18 组合，确保修订快照与投影不把 `connect_ip` 当 `listen_ip`。DIRECT/RELAY 补偿夹具执行 `incoming <= removedRevision` 拒绝规则，验证恢复高于删除栅栏；实网以 foreign UDP 占用候选端口，实际 PATCH 移动已有 both 监听并失败，验证更高修订恢复原端口的两协议且候选端口无半监听。
 
+运行操作推进 applied 修订后，旧 snapshot 指针不能代替当前基线：编辑前冻结实际已 ACK 的一代，DIRECT/RELAY × TCP/UDP/both 离线回归覆盖此缺口。`agent/internal/control/native_both_retarget_test.go` 通过真实带标签的 TCP/UDP 目标与完整命令路径验证出口 PREPARE、幂等重发及入口切换，保留活跃 UDP 客户端验证新目标，不仅检查收到 echo。`python -B -m unittest discover -s scripts/integration/tests -p 'test_*.py'` 检查 Docker helper 契约和错误脱敏，不替代实网验收。实网失败额外记录旧/新目标命中、修订和恢复条件的脱敏事实；故障创建返回的 502 不能当作成功 apply。
+
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 
 F2 同一 gate 新增真实目标 3044/3045：完整策略 API 往返、辅助 TCP 健康、主目标实际关闭、10 秒失败/恢复窗口、全故障、恢复后的新 TCP 与保持备用 UDP 映射、RR、random、固定 UDP 来源及 Agent 重启。每次等待继续使用 B 的原 TCP 和 UDP socket；不改数据库健康状态或伪造 Ready。窗口抖动、未知 UDP、nonce/replay 和未授权目标另由真实 runner 回归覆盖。Windows 本地不能代替该 Linux 门禁。

@@ -119,7 +119,9 @@ test("protocol transition commits one revision/CAS with same rule and port; tran
   // No real worker in this fixture: service must accurately say saved/not applied.
   expect(await patchForward(71, 7, { protocol: "both", expected_revision: 7 })).toMatchObject({ ok: false, status: 503, code: "apply_failed" });
   expect(f.rows).toHaveLength(1); expect(f.rows[0]).toMatchObject({ id: 71, listen_port: 23000, forward_protocol: "both", tunnel_type: null, config_revision: 8 });
-  expect(f.snapshots).toHaveLength(1); expect(f.snapshots[0]).toMatchObject({ tunnel_id: 71, revision: 8, protocol: "both" });
+  expect(f.snapshots).toHaveLength(2);
+  expect(f.snapshots.find((s) => s.revision === 7)).toMatchObject({ protocol: "tcp" });
+  expect(f.snapshots.find((s) => s.revision === 8)).toMatchObject({ tunnel_id: 71, protocol: "both" });
   resetBothFixture(); const before = seed(); before.forward_protocol = "tcp"; f.failCommit = true;
   await patchForward(71, 7, { protocol: "both", expected_revision: 7 }).catch(() => {});
   expect(f.rows[0]).toMatchObject({ forward_protocol: "tcp", config_revision: 7 }); expect(f.snapshots).toHaveLength(0);
@@ -137,8 +139,30 @@ test("target edits preserve the bound scope instead of replacing it with the nod
         expect(await patchForward(71, 7, { target_port: 8081, expected_revision: 7 }))
           .toMatchObject({ ok: false, status: 503, code: "apply_failed" });
         expect(f.rows[0]).toMatchObject({ listen_ip: host, listen_port: 23000, config_revision: 8 });
-        expect(f.snapshots[0]).toMatchObject({ listen_ip: host, listen_port: 23000, protocol });
+        const desired = f.snapshots.find((s) => s.revision === 8);
+        expect(desired).toMatchObject({ listen_ip: host, listen_port: 23000, protocol });
+        if (mode === "relay") expect(desired.targets).toEqual([{ host: "127.0.0.1", port: 8081, weight: 1, order_by: 1000 }]);
       }
+    }
+  }
+});
+
+test("editing after suspend/resume freezes the actual applied generation even with an older snapshot pointer", async () => {
+  for (const protocol of ["both", "tcp", "udp"] as const) {
+    for (const mode of ["direct", "relay"] as const) {
+      resetBothFixture(); const row = seed(mode);
+      row.forward_protocol = protocol;
+      // Resume has ACKed revision 10, while the last product edit was revision 7.
+      // The old pointer must not suppress a revision-10 rollback baseline.
+      row.config_revision = row.applied_revision = 10;
+      f.snapshots.push({ id: 1, tunnel_id: 71, revision: 7, listen_port: 23000 });
+      expect(await patchForward(71, 7, { listen_port: 23002, expected_revision: 10 }))
+        .toMatchObject({ ok: false, status: 503, code: "apply_failed" });
+      const baseline = f.snapshots.find((s) => s.revision === 10);
+      expect(baseline).toMatchObject({ protocol, mode, listen_port: 23000, listen_ip: "0.0.0.0" });
+      if (mode === "direct") expect(baseline).toMatchObject({ target_host: "127.0.0.1", target_port: 8080 });
+      else expect(baseline.targets).toEqual([{ host: "127.0.0.1", port: 8080, weight: 1, order_by: 1 }]);
+      expect(f.snapshots.find((s) => s.revision === 11)).toMatchObject({ listen_port: 23002 });
     }
   }
 });

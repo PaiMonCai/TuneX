@@ -343,7 +343,8 @@ jobs:
           python3 -m py_compile scripts/integration/a00-delete-reuse.py
           bash -n scripts/integration/abcd-core-gate.sh
           python3 -m py_compile scripts/integration/abcd-links.py
-            python3 -m py_compile scripts/integration/native-both.py
+          python3 -m py_compile scripts/integration/native-both.py
+          python3 -B -m unittest discover -s scripts/integration/tests -p 'test_*.py'
       - name: Current deployment contract
         run: bash scripts/ops/tests/installer-static.sh
 

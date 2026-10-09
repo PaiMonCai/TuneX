@@ -22,6 +22,31 @@ H, C = A.H, A.C
 RESULT = HERE / "evidence" / "native-both-result.txt"
 
 
+def agent_sh(command, allow=False):
+    # The shared harness exposes docker(), not an Agent-specific shell API.
+    return H.docker(["exec", H.INGRESS_CONTAINER, "sh", "-c", command], allow=allow)
+
+
+def safe_code(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", value) else "unknown"
+
+
+def retarget_facts(fid, target_port):
+    # Only bounded boolean/numeric facts leave the disposable DB, never raw
+    # reports, target addresses, command configs, error strings or credentials.
+    return H.db("""const t=await db.tunnel.findUnique({where:{id:%d}});
+      const s=t.desired_revision_id?await db.forwardRevision.findUnique({where:{id:t.desired_revision_id}}):null;
+      const reports=await db.nodeStateReport.findMany({where:{node_id:{in:[t.ingress_node_id,t.egress_node_id].filter(Boolean)}}});
+      return {config_revision:t.config_revision,applied_revision:t.applied_revision,
+        snapshot_revision:s?.revision,snapshot_target_matches:s?.target_port===%d || s?.targets?.[0]?.port===%d,
+        runtimes:reports.flatMap(r=>(Array.isArray(r.tunnels)?r.tunnels:r.tunnels?.tunnels??[])
+          .filter(c=>['tunex-%d-direct','tunex-%d-relay','tunex-%d-egress'].includes(c.id))
+          .map(c=>({mode:['DIRECT','RELAY','EGRESS'].includes(c.mode)?c.mode:'unknown',
+            revision:Number.isSafeInteger(c.revision)?c.revision:null,both:c.protocol==='both',
+            target_matches:c.remote_port===%d || c.targets?.[0]?.port===%d})))};
+      """ % (fid, target_port, target_port, fid, fid, fid, target_port, target_port))
+
+
 def request(method, path, body=None):
     status, response, _ = H.req(method, path, body)
     if status not in (200, 201):
@@ -121,9 +146,17 @@ def native_cases():
                     f"F4 {mode} target edit does not promise single-lane hot swap")
             request("PATCH", f"/api/forwards/{fid}", body)
             marker = f"F4-{mode}-retarget".encode()
-            H.check(H.wait_active(fid) and bool(H.wait_until(lambda: payload(port, marker), timeout=60, interval=2))
-                    and marker+b"-tcp" in servers[1].messages and marker+b"-udp" in servers[1].udp.sources,
-                    f"F4 {mode} target revision moves both actual protocols together")
+            active = H.wait_active(fid)
+            forwarded = bool(H.wait_until(lambda: payload(port, marker), timeout=60, interval=2))
+            tcp_new, udp_new = marker+b"-tcp" in servers[1].messages, marker+b"-udp" in servers[1].udp.sources
+            evidence = ""
+            if not (active and forwarded and tcp_new and udp_new):
+                facts = {"active": active, "payload": forwarded, "tcp_new": tcp_new, "udp_new": udp_new,
+                         "tcp_old": marker+b"-tcp" in servers[0].messages, "udp_old": marker+b"-udp" in servers[0].udp.sources,
+                         "runtime": retarget_facts(fid, 3051)}
+                evidence = " facts=" + json.dumps(facts, sort_keys=True)
+            H.check(active and forwarded and tcp_new and udp_new,
+                    f"F4 {mode} target revision moves both actual protocols together" + evidence)
             request("POST", f"/api/forwards/{fid}/suspend")
             H.check(bool(H.wait_until(lambda: no_payload(port), timeout=90, interval=2)),
                     f"F4 {mode} suspend stops both lanes")
@@ -155,7 +188,7 @@ def native_cases():
         H.docker(["exec", "-d", H.INGRESS_CONTAINER, "sh", "-c",
                   f"echo $$ > {fault_pid}; exec nc -u -l -p 21090"])
         fault_running = True
-        H.check(bool(H.wait_until(lambda: ":21090" in H.agent_sh("netstat -uln"), timeout=10, interval=1)),
+        H.check(bool(H.wait_until(lambda: ":21090" in agent_sh("netstat -uln"), timeout=10, interval=1)),
                 "F4 OS fault injection holds only the candidate UDP socket")
         # Move an already serving rule onto the genuinely occupied port. This
         # exercises Panel compensation and the Agent's removal tombstone, not
@@ -166,17 +199,31 @@ def native_cases():
         H.check(status == 502 and response.get("code") == "apply_failed",
                 "F4 real foreign UDP socket rejects an existing both rule's listener move")
         restored = request("GET", f"/api/forwards/{rules[0]}")
-        H.check(restored["listen_port"] == 21086
-                and restored["config_revision"] > before["config_revision"] + 1
-                and H.wait_active(rules[0]) and bool(H.wait_until(lambda: payload(21086), timeout=60, interval=2)),
-                "F4 failed listener move restores both baseline lanes above the removal fence")
+        active = H.wait_active(rules[0])
+        forwarded = bool(H.wait_until(lambda: payload(21086), timeout=60, interval=2))
+        restored_ok = (restored["listen_port"] == 21086
+                       and restored["config_revision"] > before["config_revision"] + 1 and active and forwarded)
+        evidence = "" if restored_ok else " facts=" + json.dumps({
+            "original_port": restored["listen_port"] == 21086, "before_revision": before["config_revision"],
+            "restored_revision": restored["config_revision"], "active": active, "payload": forwarded,
+            "apply_error_code": safe_code(restored.get("apply_error_code")),
+            "request_error_code": safe_code(response.get("apply_error_code"))}, sort_keys=True)
+        H.check(restored_ok, "F4 failed listener move restores both baseline lanes above the removal fence" + evidence)
         H.check(no_payload(21090), "F4 compensated candidate leaves no half-serving TCP listener")
-        half = create("half-bind", 21090, targets["direct"])
+        status, response, _ = H.req("POST", "/api/forwards", {
+            "name": f"{H.FIXTURE_PREFIX}-F4-half-bind", "protocol": "both", "mode": "direct",
+            "ingress_node_id": H.ING, "listen_port": 21090, "target_host": targets["direct"], "target_port": 3050})
+        # Creation is synchronous: the bind refusal is a 502 with the persisted
+        # rule ID, not a successful activation. Retry that ID through normal API.
+        half = H.unwrap(response).get("id")
+        if not isinstance(half, int):
+            raise RuntimeError(f"half-bind has no persisted rule: status={status} code={safe_code(response.get('code'))}")
         rules.append(half)
         failed = H.wait_until(lambda: H.tunnel_row(half).split("|")[0] == "error", timeout=90, interval=2)
-        H.check(bool(failed) and no_payload(21090), "F4 failed UDP bind cannot leave TCP serving or ACK a full apply")
+        H.check(status == 502 and response.get("code") == "apply_failed" and bool(failed) and no_payload(21090),
+                "F4 failed UDP bind cannot leave TCP serving or ACK a full apply")
         H.check(payload(21086) and payload(21087), "F4 half-bind failure leaves unrelated complete rules serving")
-        H.agent_sh(f"kill $(cat {fault_pid}); rm -f {fault_pid}")
+        agent_sh(f"kill $(cat {fault_pid}); rm -f {fault_pid}")
         fault_running = False
         request("POST", f"/api/forwards/{half}/retry")
         H.check(H.wait_active(half) and bool(H.wait_until(lambda: payload(21090), timeout=90, interval=2)),
@@ -197,7 +244,7 @@ def native_cases():
                     f"F4 deletion releases the exact numeric TCP+UDP port {port} through normal leases")
     finally:
         if fault_running:
-            H.agent_sh(f"test ! -f {fault_pid} || kill $(cat {fault_pid}); rm -f {fault_pid}", allow=True)
+            agent_sh(f"test ! -f {fault_pid} || kill $(cat {fault_pid}); rm -f {fault_pid}", allow=True)
         for fid in list(rules):
             status, _, _ = H.req("DELETE", f"/api/forwards/{fid}")
             if status not in (200, 404):

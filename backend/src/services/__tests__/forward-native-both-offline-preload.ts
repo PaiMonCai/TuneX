@@ -75,6 +75,7 @@ const models: any = {
       if (!row) throw new Error("missing pool"); bothFixture.writes.push("egressPool.update"); Object.assign(row, data); return row; },
   },
   egressTarget: {
+    findMany: async ({ where }: any) => bothFixture.pools.find((p) => p.id === where.pool_id)?.targets ?? [],
     deleteMany: async ({ where }: any) => { const row = bothFixture.pools.find((p) => p.id === where.pool_id);
       if (!row) throw new Error("missing pool"); const count = row.targets.length; row.targets = []; return { count }; },
     create: async ({ data }: any) => { const row = bothFixture.pools.find((p) => p.id === data.pool_id);
