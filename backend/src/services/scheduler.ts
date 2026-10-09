@@ -184,8 +184,8 @@ async function correctDatagramHopPeerAfterIngressAck(args: {
       orchestrator: args.orchestrator,
       // Reverse of activation order: near side first, then far side.
       removals: [
-        { tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision + 1, reason },
-        { tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision + 1, reason },
+        { tunnelId: args.tunnelId, node: args.ingressNode, direction: "ingress", revision: correctedRevision, reason },
+        { tunnelId: args.tunnelId, node: args.egressNode, direction: "egress", revision: correctedRevision, reason },
       ],
       portPoolDeps: args.deps.portPoolDeps,
     });
@@ -670,7 +670,7 @@ export async function createRelayTunnel(
           tunnelId,
           node: egressPick.node,
           direction: "egress",
-          revision: revision + 1,
+          revision,
           reason: "egress apply failed",
         },
       ],
@@ -737,7 +737,7 @@ export async function createRelayTunnel(
       tunnelId,
       orchestrator,
       removals: [
-        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "runtime plan invalid" },
+        { tunnelId, node: egressPick.node, direction: "egress", revision, reason: "runtime plan invalid" },
       ],
       portPoolDeps: deps.portPoolDeps,
     });
@@ -769,8 +769,8 @@ export async function createRelayTunnel(
       tunnelId,
       orchestrator,
       removals: [
-        { tunnelId, node: ingressPick.node, direction: "ingress", revision: revision + 1, reason: "ingress apply failed" },
-        { tunnelId, node: egressPick.node, direction: "egress", revision: revision + 1, reason: "ingress apply failed" },
+        { tunnelId, node: ingressPick.node, direction: "ingress", revision, reason: "ingress apply failed" },
+        { tunnelId, node: egressPick.node, direction: "egress", revision, reason: "ingress apply failed" },
       ],
       portPoolDeps: deps.portPoolDeps,
     });
@@ -1358,7 +1358,7 @@ export async function reapplyRelayTunnel(
         tunnelId,
         node: ingressPick.node,
         direction: "ingress",
-        revision: revision + 1,
+        revision,
         reason: `${reason} (ingress)`,
       },
     ];
@@ -1367,7 +1367,7 @@ export async function reapplyRelayTunnel(
         tunnelId,
         node: transitNode,
         direction: "egress",
-        revision: revision + 1,
+        revision,
         reason: `${reason} (transit)`,
       });
     }
@@ -1375,7 +1375,7 @@ export async function reapplyRelayTunnel(
       tunnelId,
       node: egressPick.node,
       direction: "egress",
-      revision: revision + 1,
+      revision,
       reason,
     });
     const compensation = await compensateRuntimesThenRelease({
@@ -1753,7 +1753,7 @@ async function applyFederatedRelayTunnel(
         tunnelId,
         node: ingressPick.node,
         direction: "ingress",
-        revision: revision + 1,
+        revision,
         reason,
       });
       if (removed.ok) ingressRemoved = true;
@@ -2166,7 +2166,7 @@ export async function reapplyDirectTunnel(
           tunnelId,
           node: pick.node,
           direction: "direct",
-          revision: revision + 1,
+          revision,
           reason: "direct runtime plan invalid",
         },
       ],
@@ -2210,7 +2210,7 @@ export async function reapplyDirectTunnel(
           tunnelId,
           node: pick.node,
           direction: "direct",
-          revision: revision + 1,
+          revision,
           reason: "direct apply failed",
         },
       ],

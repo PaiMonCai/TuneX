@@ -37,14 +37,21 @@ def retarget_facts(fid, target_port):
     return H.db("""const t=await db.tunnel.findUnique({where:{id:%d}});
       const s=t.desired_revision_id?await db.forwardRevision.findUnique({where:{id:t.desired_revision_id}}):null;
       const reports=await db.nodeStateReport.findMany({where:{node_id:{in:[t.ingress_node_id,t.egress_node_id].filter(Boolean)}}});
+      const runtimes=reports.flatMap(r=>Array.isArray(r.tunnels)?r.tunnels:r.tunnels?.tunnels??[]);
+      const ingress=runtimes.find(c=>c.id==='tunex-%d-relay');
+      const exit=runtimes.find(c=>c.id==='tunex-%d-egress');
+      const endpoint=ingress?.diag?.hop_local_addr;
+      const peer=typeof endpoint==='string' ? endpoint.startsWith('[')?endpoint.slice(1,endpoint.indexOf(']')):
+        endpoint.slice(0,endpoint.lastIndexOf(':')) : null;
       return {config_revision:t.config_revision,applied_revision:t.applied_revision,
         snapshot_revision:s?.revision,snapshot_target_matches:s?.target_port===%d || s?.targets?.[0]?.port===%d,
-        runtimes:reports.flatMap(r=>(Array.isArray(r.tunnels)?r.tunnels:r.tunnels?.tunnels??[])
+        hop_peer_matches:peer!=null && exit?.hop_peer===peer,
+        runtimes:runtimes
           .filter(c=>['tunex-%d-direct','tunex-%d-relay','tunex-%d-egress'].includes(c.id))
           .map(c=>({mode:['DIRECT','RELAY','EGRESS'].includes(c.mode)?c.mode:'unknown',
             revision:Number.isSafeInteger(c.revision)?c.revision:null,both:c.protocol==='both',
             target_matches:c.remote_port===%d || c.targets?.[0]?.port===%d})))};
-      """ % (fid, target_port, target_port, fid, fid, fid, target_port, target_port))
+      """ % (fid, fid, fid, target_port, target_port, fid, fid, fid, target_port, target_port))
 
 
 def request(method, path, body=None):

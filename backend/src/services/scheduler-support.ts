@@ -593,6 +593,8 @@ export type CompensationRemoval = Parameters<Orchestrator["removeTunnel"]>[0];
  * NodePortLease may be released. If any runtime cannot be confirmed removed,
  * keep every lease owned by the tunnel so the allocator cannot hand a possibly
  * still-listening port to another runtime. Reconcile can retry cleanup later.
+ * Removal revisions fence the FAILED generation itself, not revision+1: Agent
+ * rejects apply <= removedRevision, and the next normal retry is revision+1.
  */
 export async function compensateRuntimesThenRelease(input: {
   tunnelId: number;

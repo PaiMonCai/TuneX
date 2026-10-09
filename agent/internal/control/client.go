@@ -49,8 +49,9 @@ type Config struct {
 	// cache are available. Numeric node identity comes from desired metadata.
 	Links        *linkrunner.Manager
 	RuntimeFacts RuntimeFacts
-	// ReportLinkState publishes fresh runtime facts after a successful Link
-	// mutation and before its ACK. Failure leaves the successful runtime ACK
+	// ReportLinkState (historical name) publishes the complete authenticated
+	// runtime state after successful Link/native mutations and before their ACK.
+	// Failure leaves the successful runtime ACK
 	// intact; the panel retains conservative port facts until a later report.
 	ReportLinkState func(context.Context) error
 
@@ -520,6 +521,10 @@ func (c *Client) execute(ctx context.Context, cmd *QueuedCommand) ackPayload {
 				ack.HopLocalAddr = diag.HopLocalAddr
 			}
 		}
+		// A following rollout needs the actual routed UDP hop address NOW,
+		// not connect_ip or a report from before this native apply. Reuse the
+		// serialized full-state publisher already used by Link mutations.
+		c.reportLinkState(ctx)
 	case ActionDiagnoseTunnel:
 		if cmd.Probe == nil {
 			ack.ErrorCode, ack.Error = "invalid_payload", "missing probe request"
@@ -596,7 +601,7 @@ func (c *Client) reportLinkState(ctx context.Context) {
 			// The state reporter already observes reachability. Do not put raw
 			// transport errors into the command ACK or turn an applied change
 			// into a runtime failure because its telemetry channel is unavailable.
-			logx.Debug("managed link state report failed; awaiting periodic report")
+			logx.Debug("runtime state report failed; awaiting periodic report")
 		}
 	}
 }
