@@ -30,7 +30,7 @@ def request(method, path, body=None):
         def code(key):
             value = response.get(key)
             return value if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", value) else "unknown"
-        message = str(response.get("message", ""))
+        message = str(response.get("error", response.get("message", "")))
         markers = [value for value in (
             "address already in use", "unsupported_protocol", "revision_mismatch",
             "stale_revision", "ownership", "lease_expired", "port_conflict",

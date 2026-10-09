@@ -336,6 +336,33 @@ const nativeBothFacts = () => capabilityFactsFromStoredV2({ control_protocol_ver
   capabilities: ["apply_tunnel", "remove_tunnel", FORWARD_NATIVE_BOTH_CAPABILITY], reported_at: new Date(),
   capability_manifest: { schema_version: 2, protocols: ["tcp", "udp", "both"], transports: ["stream", "datagram", "mixed"], runtime: [], diagnostics: [] } });
 
+it("relay both retarget rebuild resolves the ACKed exit before cutting over ingress and keeps both durable leases", async () => {
+  const { f, deps, orch } = modeSwitchEnv();
+  const baseline = f.snapshots.find((s) => s.revision === 6)!;
+  const desired = f.snapshots.find((s) => s.revision === 7)!;
+  Object.assign(baseline, { mode: "relay", protocol: "both", egress_node_id: 21, egress_port: 31000,
+    target_host: "10.8.8.8", target_port: 80,
+    targets: [{ host: "10.8.8.8", port: 80, weight: 1, order_by: 10 }] });
+  Object.assign(desired, { protocol: "both", target_host: "10.8.8.8", target_port: 81,
+    targets: [{ host: "10.8.8.8", port: 81, weight: 1, order_by: 10 }] });
+  Object.assign(f.tunnels[0]!, { forward_protocol: "both", tunnel_type: null,
+    ingress_node: { connect_ip: "10.0.0.11" } });
+  const ingressLease = f.addLease({ node_id: 11, port: 10001, lease_type: "ingress", tunnel_id: 1, protocol: "unknown" });
+  const egressLease = f.addLease({ node_id: 21, port: 31000, lease_type: "egress", tunnel_id: 1, protocol: "unknown" });
+  deps.loadCapabilityFacts = async () => nativeBothFacts();
+  const registration = await registerRollout({ tunnelId: 1, revision: 7, baseRevision: 6,
+    impact: impact({ listener_replacement: true, target_change: true, egress_target_change: true }) }, deps);
+  expect(registration.rolloutId).not.toBeNull();
+  const result = await executeRollout(registration.rolloutId!, deps);
+  expect(result.phase, JSON.stringify(result)).toBe("done");
+  expect(orch.calls.dispatchEgress[0]).toMatchObject({ protocol: "both", egressPort: 31000,
+    targets: [{ host: "10.8.8.8", port: 81 }], hopPeer: "10.0.0.11" });
+  expect(orch.calls.dispatchIngress).toHaveLength(1);
+  expect(orch.calls.dispatchIngress[0]).toMatchObject({ protocol: "both", revision: 7, nextHop: "10.0.1.21:31000" });
+  expect(orch.calls.removeTunnel).toHaveLength(0);
+  expect(f.leases.filter((l) => l.status === "active").map((l) => l.id)).toEqual([ingressLease, egressLease]);
+});
+
 it("native both rollback restores the baseline protocol, full projection and policy at a new durable revision", async () => {
   const { f, deps, orch } = directEnv();
   Object.assign(f.snapshots.find((s) => s.revision === 6)!, { protocol: "both", max_connections: 4 });

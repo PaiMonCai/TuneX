@@ -576,10 +576,10 @@ function buildSteps(input: PlanRolloutInput, tunnelId: number): RolloutStep[] {
         direction: "egress",
         port: desired.egress_port ?? null,
       });
-    } else if (impact.egress_target_change) {
-      // 同出口节点、只换池内目标：PREPARE 无事可做，切换发生在 CUTOVER。
     } else if (ingressWillRecut) {
-      // 出口一点没变，但**入口要重切** ⇒ 仍然要准备出口：只为拿到它的可寻址 host，
+      // 入口重切必须先登记出口地址，即使同一次编辑还改变了出口目标。
+      // 只有目标改变且入口不重切时，才仅在 CUTOVER 更新出口。
+      // **入口要重切** ⇒ 仍然要准备出口：拿到它的可寻址 host，
       // 否则入口的 next_hop 无法解析（这就是只换入口节点的迁移长期失败的原因）。
       push("prepare", "prepare_egress", {
         node_id: egressNode?.id ?? desired.egress_node_id,

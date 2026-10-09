@@ -1,6 +1,6 @@
 # 以隧道转发为核心的后续开发方案
 
-更新：2026-10-08。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 `4e50f20`、F2 `932d15e`、F3 共享 FXP TCP 来源切片 `47594c4` 已通过各自 CI；当前实施 F4 原生 both，后续工作包及公开发布条件分别验收。
+更新：2026-10-09。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 `4e50f20`、F2 `932d15e`、F3 共享 FXP TCP 来源切片 `47594c4` 已通过各自 CI；当前实施 F4 原生 both，后续工作包及公开发布条件分别验收。
 
 ## 1. 目标和范围
 
@@ -137,6 +137,8 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 本切片契约：`both → mixed / connection_and_mapping`，legacy TunnelType 投影为空，不能假填 TCP。独立实际能力 `forward.protocol.both.native.v1` 与新鲜报告控制完整路径准入；Workspace 须同时授权 TCP 和 UDP。`FORWARD_NATIVE_BOTH_ENABLED=true` 只开放新建/切入 both，不阻止既有 both 的恢复与移除。禁止中间跳、联邦、TLS/WS 前端及客户端来源组合。
 
 Agent 使用一个 ID、一个修订和 TCP/UDP 两个真实 OS 槽位；两子监听均成功才开放入口准入，半失败关闭已准备监听。目标变化首版完整重建，两协议不能分开热改；同号替换失败时重建旧已应用配置，重新验证有效续租及单调所有权围栏。失败候选不得改变当前运行的租约时钟。流量为两协议 payload 聚合，TCP 连接与 UDP 映射分项展示。真实验收新增 `scripts/integration/native-both.py`，不能用本机测试或前一切片 CI 代替。
+
+2026-10-09 收尾：旧候选 `c273122` 的实网门禁在 DIRECT 目标更新时报告 `port_port_taken`，不能标成 F4 完成。已补规范 runtime 与数字占用汇总的归属匹配、显式未知协议汇总拒绝及 RELAY 目标修改叠加入口重建时的出口准备步骤，并新增真实 socket 生命周期回归；完整交付仍以修复候选的 [PR 75 当前检查](https://github.com/PaiMonCai/TuneX/pull/75/checks) 和 `native-both-result.txt` 为准。门禁通过后再进入 F5，不提前启用默认关闭的入口。
 
 ### F5：共享连接在线端点变更与密钥轮换
 

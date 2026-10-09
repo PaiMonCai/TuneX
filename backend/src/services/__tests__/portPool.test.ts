@@ -378,6 +378,86 @@ describe("protocol, bind scope and independent Link ownership", () => {
     expect(leases.filter((l) => l.status === "active")).toHaveLength(1);
   });
 
+  test.each([
+    { mode: "DIRECT", leaseType: "ingress" as const, used_ports: { tcp: { "19000": true }, udp: { "19000": true } } },
+    { mode: "RELAY", leaseType: "ingress" as const, used_ports: { tcp: [19000], udp: [19000] } },
+      { mode: "EGRESS", leaseType: "egress" as const, used_ports: [19000] },
+  ])("native both reuses its own durable binding with real aggregate report %p", async ({ mode, leaseType, used_ports }) => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const first = await request(h, { tunnelId: 10, protocol: "both", leaseType });
+    if (!first.ok) throw new Error("native both must allocate");
+    const id = `tunex-10-${mode.toLowerCase()}`;
+    const agentUsedPorts = async () => pool.agentPortHoldersFromReport({ used_ports,
+      tunnels: [{ id, mode, ingress_port: 19000, egress_port: 19000, protocol: "both",
+        // The real disposable Agents use a concrete --listen-ip, although the
+        // product's unspecified listen_ip owns a conservative wildcard lease.
+        listen_host: mode === "DIRECT" ? "172.28.0.10" : "0.0.0.0" }] });
+    for (const preferredPort of [19000, undefined]) {
+      expect(await request(h, { tunnelId: 10, protocol: "both", leaseType, preferredPort,
+        ownRuntimeIds: [id], deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: true,
+          result: { leaseId: first.result.leaseId, port: 19000, protocol: "unknown", reused: true } });
+    }
+    expect(leases).toHaveLength(1);
+    expect(await request(h, { tunnelId: 11, protocol: "both", leaseType,
+      ownRuntimeIds: [id], deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test("reported native runtime mode is normalized before deriving lease direction", () => {
+    expect(pool.agentPortHoldersFromReport({ tunnels: [
+      { id: "d", mode: " direct ", ingress_port: 19000, egress_port: 19001, protocol: "both" },
+      { id: "r", mode: "relay", ingress_port: 19002, protocol: "both" },
+      { id: "e", mode: " EGRESS ", ingress_port: 19003, egress_port: 19004, protocol: "both" },
+    ] })).toMatchObject([
+      { port: 19000, runtime_id: "d", protocol: "both", lease_type: "ingress" },
+      { port: 19002, runtime_id: "r", protocol: "both", lease_type: "ingress" },
+      { port: 19004, runtime_id: "e", protocol: "both", lease_type: "egress" },
+    ] as const);
+  });
+
+  test("native aggregate self-reuse needs the exact owner, direction, scope and actual lanes", async () => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    const bindScope = "127.0.0.1";
+    const first = await request(h, { tunnelId: 10, protocol: "both", bindScope });
+    if (!first.ok) throw new Error("native both must allocate");
+    const native = { id: "tunex-10-direct", mode: "DIRECT", ingress_port: 19000,
+      protocol: "both", listen_host: bindScope };
+    for (const override of [
+      { id: "tunex-11-direct" }, { mode: "EGRESS", egress_port: 19000 },
+      { listen_host: "127.0.0.2" }, { listen_host: "0.0.0.0" }, { listen_host: undefined },
+      { protocol: "tcp" }, { protocol: undefined }, { protocol: "future-protocol" },
+      { ingress_port: 19001 },
+    ]) {
+      const agentUsedPorts = async () => pool.agentPortHoldersFromReport({
+        used_ports: { tcp: [19000], udp: [19000] }, tunnels: [{ ...native, ...override }] });
+      expect(await request(h, { tunnelId: 10, protocol: "both", bindScope, ownRuntimeIds: [native.id],
+        deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+    // A separate unowned/draining fact is not a duplicate numeric summary.
+    const agentUsedPorts = async () => [...pool.agentPortHoldersFromReport({
+      used_ports: { tcp: [19000], udp: [19000] }, tunnels: [native] }),
+      { port: 19000, protocol: "udp", runtime_id: null }];
+    expect(await request(h, { tunnelId: 10, protocol: "both", bindScope, ownRuntimeIds: [native.id],
+      deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+    // A runtime ID and its summary cannot replace durable ownership.
+    await pool.releaseLease({ leaseId: first.result.leaseId }, h.deps);
+    expect(await request(h, { tunnelId: 10, protocol: "both", bindScope, ownRuntimeIds: [native.id],
+      deps: { ...h.deps, agentUsedPorts: async () => pool.agentPortHoldersFromReport({
+        used_ports: { tcp: [19000], udp: [19000] }, tunnels: [native] }) } }))
+      .toMatchObject({ ok: false, code: "port_taken" });
+  });
+
+  test.each(["future-protocol", "unknown", ""])("native both and single-lane transitions cannot explain explicitly unknown %p aggregate occupancy", async (summaryProtocol) => {
+    const h = harness(); seedNode(1, [19000, 19000]);
+    expect((await request(h, { tunnelId: 10, protocol: "both" })).ok).toBe(true);
+    const native = { id: "tunex-10-direct", mode: "DIRECT", ingress_port: 19000, protocol: "both", listen_host: "0.0.0.0" };
+    const agentUsedPorts = async () => pool.agentPortHoldersFromReport({
+      used_ports: { [summaryProtocol]: [19000] }, tunnels: [native] });
+    for (const protocol of ["both", "tcp", "udp"]) {
+      expect(await request(h, { tunnelId: 10, protocol, ownRuntimeIds: [native.id],
+        deps: { ...h.deps, agentUsedPorts } })).toMatchObject({ ok: false, code: "port_taken" });
+    }
+  });
+
   test("same Link owner retries are idempotent with preferred or automatic allocation", async () => {
     const h = harness(); seedNode(1, [19000, 19010]);
     const first = await request(h, { linkId: 30, preferredPort: undefined });

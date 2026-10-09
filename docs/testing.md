@@ -1,6 +1,6 @@
 # 转发测试与验收
 
-更新：2026-10-08。类型检查、fixtures、单进程 echo、真实多节点、浏览器和生产验证分别记录，不能互相替代。
+更新：2026-10-09。类型检查、fixtures、单进程 echo、真实多节点、浏览器和生产验证分别记录，不能互相替代。
 
 ## 已确认的候选证据
 
@@ -76,6 +76,10 @@ bash scripts/integration/abcd-core-gate.sh
 F3 精确候选 `47594c4` 的 [CI 37724092872](https://github.com/PaiMonCai/TuneX/actions/runs/37724092872)：四节点共享 gate 73 PASS / 0 FAIL、backend 3197 通过、数据库/HTTP 119 通过且零跳过、web 1482 通过，required 成功。主分支专用 race/历史生产升级回放未在该候选运行，真实 Panel 浏览器验收仍单独要求。
 
 F4 同一入口额外 opt-in `FORWARD_NATIVE_BOTH_ENABLED=true` 并运行 `native-both.py`，结果单独保存 `native-both-result.txt`。使用实际 API/Worker/Agent 验证 plain DIRECT/单跳 RELAY 同号两协议、共享并发、两协议目标同步更新、UDP 真实 OS 占用导致的半绑定失败、正常重试、暂停/恢复、重启和删除后精确复用。失败不跳过、不注入 Ready，也不手工删租约。F4 必须看对应候选 SHA 的 gate；F3 的绿色不覆盖这些新增场景。
+
+端口单测须使用实际报告组合：规范 `tunnels` 加 `used_ports` 的 TCP/UDP 数字汇总，覆盖 DIRECT、RELAY、EGRESS 的同号重建；不能只注入空 Agent 占用数组来证明幂等重用。异步 TCP 关闭须等待真实计数归零，再断言活跃 UDP 映射不计入 TCP；不以固定 sleep 或跳过测试掩盖生命周期差异。实网失败工件仅保留 HTTP/应用符号码和固定错误分类，不记录原始配置、凭证或完整错误响应。
+
+F4 更新回归另覆盖显式未知协议汇总的 both→TCP/UDP 拒绝、目标变化与入口重建叠加时的出口准备顺序，以及实际出口 ACK 地址进入入口 next-hop。`mixed_target_rebuild_test.go` 用真实 TCP/UDP socket 验证活跃 UDP 映射与 TCP 客户端关闭叠加的完整重建：4 个 bind host × Apply/ReplaceListener × ownership guard × 等待/不等待 TCP 退场，共 32 场景；Windows amd64 五轮通过是本地程序证据，不替代 Linux 四节点门禁。后端执行器的本地离线验证隔离默认 MySQL/Redis IO，不作为数据库验收。
 
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 

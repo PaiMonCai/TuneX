@@ -51,6 +51,10 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 原生 both 两监听完成绑定才准入，任一失败清理另一侧，不能半 Ready；同号替换需重建时会中断受影响规则，两协议目标同步更新。补偿仅重建仍获授权的旧修订，保持有效续租，绝不回滚已观察的所有权 epoch。运行流量是 TCP+UDP payload 聚合；连接数为 TCP，映射/包/丢弃为 UDP。现有出口目标账本以 TCP 拨号为证据，不能把它当成 UDP 应用健康。
 
+同号重建时，Agent 的运行配置和 `used_ports` 数字汇总是同一监听的两类事实，不是两个端口持有者。数字汇总只有在真实协议、入口/出口方向和同 owner 的 active 持久租约匹配，且租约覆盖实际监听作用域时才能解释为本隧道占用；单独 runtime ID 或数据库行不够。未指定产品监听 IP 的 wildcard 租约可覆盖 Agent 配置的数据网 IP，具体 IP 租约不能覆盖 wildcard 或另一 IP。未知协议、其他持有者和显式无 owner/关闭中占用仍阻断申请，不通过删租约或忽略实际占用解决自冲突。
+
+RELAY 的目标修改若同时要求入口重建，必须先 `prepare_egress` 获取真实 ACK 出口地址，再执行出口/入口 cutover。不能因为目标变化而跳过出口准备，导致 `next_hop_unresolved`。仅换出口目标且入口不重切的既有路径仍只在 CUTOVER 更新出口，不额外重建入口。
+
 规则请求值 0 表示未另设规则上限，仍受 Workspace 天花板约束；Workspace 0 额度禁止转发。现有控制面额度检查与租约不等于多节点严格共享的带宽/连接预算池，也存在统计上报及租约生效窗口。
 
 部署 ACK 是历史确认。当前运行事实必须匹配节点身份、代次、摘要、租约和报告新鲜度：缺观测为 unknown、过期为 stale、入口零规则为 passive；只有有效 ready=true 才表示 runtime Ready。Ready 不自动证明目标服务可达，统计接收时间也不证明正在运行。

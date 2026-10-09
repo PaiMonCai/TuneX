@@ -325,11 +325,14 @@ export function agentPortHoldersFromReport(row: AgentPortReport | null): AgentPo
       if (value === null || typeof value !== "object") continue;
       const rec = value as Record<string, unknown>;
       const id = typeof rec.id === "string" ? rec.id : null;
-      const mode = typeof rec.mode === "string" ? rec.mode.toUpperCase() : "";
+      const mode = typeof rec.mode === "string" ? rec.mode.trim().toUpperCase() : "";
       const keys = mode === "EGRESS" ? ["egress_port"] : mode === "DIRECT" || mode === "RELAY" ? ["ingress_port"] : ["ingress_port", "egress_port"];
+      const leaseType = mode === "EGRESS" ? "egress" as const
+        : mode === "DIRECT" || mode === "RELAY" ? "ingress" as const : undefined;
       for (const key of keys) {
         const port = Number(rec[key]);
-        if (isValidPort(port)) out.push({ port, runtime_id: id, protocol: rec.protocol, bind_scope: rec.listen_host });
+        if (isValidPort(port)) out.push({ port, runtime_id: id, protocol: rec.protocol, bind_scope: rec.listen_host,
+          ...(leaseType ? { lease_type: leaseType } : {}) });
       }
     }
   }
@@ -595,6 +598,32 @@ export async function acquirePort(
   const ownsBinding = (port: number, rows: readonly LeaseRow[]) => rows.some((row) =>
     row.node_id === input.nodeId && row.port === port && row.status === LEASE_STATUS.active && sameOwner(row, input) &&
     row.protocol === protocol && normalizeBindScope(row.bind_scope) === bindScope);
+  // Native reports contain BOTH the canonical runtime config and numeric
+  // used_ports summaries for its sockets. Rebuilding the same listener must not
+  // treat those summaries as a second, foreign owner. Require a matching actual
+  // lane/direction and a scope covered by its active durable lease; neither an ID nor a DB
+  // row alone explains occupancy. Unknown runtime protocols explain no lanes.
+  const ownedNativeFacts = agentFacts.filter((holder) => input.tunnelId != null && holder.link_id == null &&
+    holder.runtime_id != null && ownRuntimeIds.has(holder.runtime_id) && holder.lease_type === input.leaseType &&
+    // An unspecified product listen_ip reserves wildcard conservatively, while
+    // the Agent may bind its configured concrete data-network IP. That socket
+    // is covered by the wildcard lease, never the reverse.
+    typeof holder.bind_scope === "string" && (bindScope === "*" || normalizeBindScope(holder.bind_scope) === bindScope) &&
+    (leaseProtocol(holder.protocol) !== "unknown" || holder.protocol === "both"));
+  const ownsNativeSummary = (holder: AgentPortHolder, rows: readonly LeaseRow[]) => {
+    if (protocol === "unknown" && input.protocol !== "both") return false;
+    const summaryLane = leaseProtocol(holder.protocol);
+    // Only the legacy protocol-less numeric list is a coarse socket summary.
+    // An explicitly unknown lane is an independent reservation, not proof of
+    // this runtime's known TCP/UDP socket, even if it shares the same number.
+    if (summaryLane === "unknown" && holder.protocol !== undefined && holder.protocol !== "both") return false;
+    const lane = summaryLane === "unknown" ? protocol : summaryLane;
+    return ownedNativeFacts.some((native) => native.port === holder.port &&
+      (native.protocol === "both" || lane !== "unknown" && leaseProtocol(native.protocol) === lane) &&
+      rows.some((row) => row.node_id === input.nodeId && row.port === holder.port &&
+        row.status === LEASE_STATUS.active && reusableNative(row) &&
+        (row.protocol === "unknown" || lane !== "unknown" && row.protocol === lane)));
+  };
   const reserved = (port: number, rows: readonly LeaseRow[] = activeRows) => {
     if (reservations.some((holder) => holder.port === port && bindingOverlaps(holder, protocol, bindScope))) return true;
     const ownsLinkBinding = ownedLinkPorts.has(port) && ownsBinding(port, rows);
@@ -604,7 +633,8 @@ export async function acquirePort(
       if (holder.runtime_id && ownRuntimeIds.has(holder.runtime_id)) return false;
       // Explicit unowned facts remain reservations, including draining work at
       // this same port. Never infer ownership from another port or from DB alone.
-      return !(holder.aggregate === true && !holder.runtime_id && ownsLinkBinding);
+      return !(holder.aggregate === true && !holder.runtime_id &&
+        (ownsLinkBinding || ownsNativeSummary(holder, rows)));
     });
   };
   const ownedLink = input.linkId != null && !isPreferred
