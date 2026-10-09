@@ -2,6 +2,21 @@
 
 更新：2026-10-09。类型检查、fixtures、单进程 echo、真实多节点、浏览器和生产验证分别记录，不能互相替代。
 
+## F4 本轮收尾证据
+
+源码 `dd108568ce59f583bd977461313bc8ef8b26c69b` 的 [CI 37870458038](https://github.com/PaiMonCai/TuneX/actions/runs/37870458038) required 全绿，已下载并核对 `abcd-core-result` 的两个结果文件：
+
+| 范围 | 当前候选结果 |
+| --- | --- |
+| Linux 原生 both | `native-both-result.txt`：37 PASS / 0 FAIL。plain DIRECT/自有单跳 RELAY，真实双协议目标更新、共享预算、OS UDP 半绑定故障、补偿、正常 retry、暂停/恢复、Agent 重启、删除和精确端口复用。 |
+| Linux 共享 FXP | `abcd-links-result.txt`：73 PASS / 0 FAIL，保留 F1–F3 真实共享连接、目标、来源及统计场景。 |
+| Backend | 3237 pass / 0 fail；类型检查、空库迁移通过。数据库/HTTP 119 pass / 0 fail / 0 skipped。 |
+| Web | 1507 pass / 0 fail；类型检查和 mock 构建通过，不是实际 Panel 浏览器验收。 |
+| Agent | Linux 全量测试、vet、真实 FXP、构建通过；新增删除完成路径的定向 race 通过。仅 main 的较广 race/历史升级回放未在此 PR 执行。 |
+| Ops / secrets / required | 全部通过。功能开关保持默认关闭，未合并 main、未部署生产。 |
+
+Windows amd64 的 control/reporter/manager/forwarder 定向回归及使用本次构建真实 FXP 的 linkrunner 包通过；额外 `go test ./...` **没有全绿**：diag 缺少可用的 ping/traceroute 测试工具，restore 的 `TestConcurrentCacheWritesStayValid` 出现文件共享冲突，selfinfo 的脱敏测试未消除 JSON 转义后的临时路径（测试名含 credential）。这些问题不在本轮 Linux F4 证据覆盖范围内，不能标为已修复或宣传 Windows 全量验收通过；并发恢复缓存错误保留为核心恢复加固项。
+
 ## 已确认的候选证据
 
 以下表格对应 F1 源码 `4e50f20b8c3b16af512bcae942d42f3c08b1e578` 的 [CI 37658464950](https://github.com/PaiMonCai/TuneX/actions/runs/37658464950)，该次 required 全绿。F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/actions/runs/37697539412) 同样全绿：3186 后端单元/契约、118 数据库/HTTP（零跳过）、1466 前端、四节点 61 PASS / 0 FAIL。F3 及后续提交查看 [PR 75 的候选检查](https://github.com/PaiMonCai/TuneX/pull/75/checks)；本文不是持续同步的 CI 状态页。
@@ -85,11 +100,11 @@ F4 更新回归另覆盖显式未知协议汇总的 both→TCP/UDP 拒绝、目�
 
 运行操作推进 applied 修订后，旧 snapshot 指针不能代替当前基线：编辑前冻结实际已 ACK 的一代，DIRECT/RELAY × TCP/UDP/both 离线回归覆盖此缺口。`agent/internal/control/native_both_retarget_test.go` 通过真实带标签的 TCP/UDP 目标与完整命令路径验证出口 PREPARE、幂等重发及入口切换，保留活跃 UDP 客户端验证新目标，不仅检查收到 echo。`python -B -m unittest discover -s scripts/integration/tests -p 'test_*.py'` 检查 Docker helper 契约和错误脱敏，不替代实网验收。实网失败额外记录旧/新目标命中、修订和恢复条件的脱敏事实；故障创建返回的 502 不能当作成功 apply。
 
-`52eeab2` 的 Linux 门禁为 F4 **30 PASS / 2 FAIL**，证实恢复已修好，但 RELAY 目标更新只有 TCP 到新目标、UDP 无回复，half-bind 的首次 retry 被拒。原生 apply 现在复用 Link 的串行完整报告发布机制，在 ACK 前发送实际 hop/socket 事实，避免下一次更新回退到另一张网的 `connect_ip`；报告失败仍不伪造 runtime 失败。另以 Agent 的 `incoming <= removedRevision` 规则验证 DIRECT/RELAY 清理失败世代，不再提前封住下一次正常 retry。完整门禁仍须看更新候选，不能把旧 SHA 的局部通过推广为全部通过。
+失败定位历史：`52eeab2` 的 Linux 门禁为 F4 **30 PASS / 2 FAIL**，当时 RELAY 目标更新只有 TCP 到新目标、UDP 无回复，half-bind 的首次 retry 被拒。原生 apply 现复用 Link 的串行完整报告发布机制，在 ACK 前发送实际 hop/socket 事实，避免下一次更新回退到另一张网的 `connect_ip`；报告失败不伪造 runtime 失败。另以 Agent 的 `incoming <= removedRevision` 规则验证 DIRECT/RELAY 清理失败世代，不提前封住下一次正常 retry。后续 `dd10856` 的完整结果见本页收尾证据，不复用旧 SHA 的局部通过。
 
 `4ea426c` 的 [CI 37868714916](https://github.com/PaiMonCai/TuneX/actions/runs/37868714916) 为共享 gate **73 PASS / 0 FAIL**、F4 **34 PASS / 1 FAIL**：RELAY 两协议目标更新与 half-bind 正常 retry 已通过，删除后立即复用原端口仍被旧占用报告阻断。修复候选让控制命令等待实际 Stop/守卫释放后发布串行完整报告，再确认删除/暂停；等待有 5 秒上界，不持管理器锁，取消/失败保留真实占用与墓碑，重复命令加入同一关闭或重试失败 Stop。真实双 socket 回归覆盖 DIRECT/RELAY/EGRESS × remove/suspend、旧修订拒绝、无关规则保持、报告故障与立即重绑；管理器屏障回归覆盖取消重发、Stop 失败、挂账过期仍不释放和重试。CI 增加针对这些路径的 race 检测，不冒充主分支的全量 race。
 
-同轮 Agent gate 还暴露 400ms 租约在子进程启动期间耗尽的测试时序问题。并发租约测试先确认两个实际子进程就绪/绑定，再启动真实 watcher 的短预算，检查另一个 Apply 仍在启动时 socket 已释放；公开续租/过期缓存恢复回归使用完整启动预算和真实截止时点，检查跨越原截止仍 Ready、续租截止后停止。没有跳过租约保护或改生产时钟。当前修复仍须以新 SHA 的完整 required 为准。
+同轮 Agent gate 还暴露 400ms 租约在子进程启动期间耗尽的测试时序问题。并发租约测试先确认两个实际子进程就绪/绑定，再启动真实 watcher 的短预算，检查另一个 Apply 仍在启动时 socket 已释放；公开续租/过期缓存恢复回归使用完整启动预算和真实截止时点，检查跨越原截止仍 Ready、续租截止后停止。没有跳过租约保护或改生产时钟；修复已随 `dd10856` 的完整 required 验证。
 
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 

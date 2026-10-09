@@ -1,6 +1,6 @@
 # 以隧道转发为核心的后续开发方案
 
-更新：2026-10-09。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 `4e50f20`、F2 `932d15e`、F3 共享 FXP TCP 来源切片 `47594c4` 已通过各自 CI；当前实施 F4 原生 both，后续工作包及公开发布条件分别验收。
+更新：2026-10-09。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 `4e50f20`、F2 `932d15e`、F3 共享 FXP TCP 来源切片 `47594c4`、F4 原生 both 限定组合 `dd10856` 已通过各自候选 CI；下一工作包为 F5，公开发布条件仍单独验收。
 
 ## 1. 目标和范围
 
@@ -18,7 +18,7 @@
 | --- | --- | --- | --- |
 | 规则与共享连接分离 | 独立 tunnels，多个 rules 引用 | 已有 LinkResource、独立部署和规则引用 | 保留，扩展版本化变更和复杂拓扑。 |
 | 加密双节点 TCP/UDP | FXP v1 TCP/UDP 运行与密钥 | 已导入真实 FXP，固定两个自有节点 | F0 收口发布条件，F6 扩展路径。 |
-| TCP/UDP 同号与 both | 两种业务协议及 both | FXP 已有；普通原生 both 正在按完整候选验证，默认关闭 | F4。 |
+| TCP/UDP 同号与 both | 两种业务协议及 both | FXP 已有；普通原生 both 限定组合已通过 Linux 候选验收，默认关闭 | F4 候选已验收；F0 发布准入仍需完成。 |
 | 双向速率限制 | FXP limitIn/limitOut | 原生与 FXP 已有每规则、每入口 runtime 限额 | 保留；多入口总预算另做分配。 |
 | 总并发、每源 IP 并发 | FXP connGate；maxIPs 是每来源并发 | 已有；UDP 并发是活跃映射 | F3 补可信来源；不改成不同 IP 数量限制。 |
 | 共享规则热更新 | 上游运行逻辑加 TuneX 托管更新 | A 更新时保持未变 B 的 TCP/UDP；载体变更仍重启 | F5 做在线载体迁移。 |
@@ -122,7 +122,7 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 
 回退：配置和元数据协议能力协商；旧节点拒绝新要求。撤销功能生成新修订并提示受影响连接，保持既有目标集授权。
 
-### F4：普通原生 Forward 的 both 完整覆盖——当前实施项
+### F4：普通原生 Forward 的 both——限定组合候选已验收
 
 依赖：现有协议/地址端口租约与运行限额。估算：5–8 工程人日。
 
@@ -138,7 +138,9 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 
 Agent 使用一个 ID、一个修订和 TCP/UDP 两个真实 OS 槽位；两子监听均成功才开放入口准入，半失败关闭已准备监听。目标变化首版完整重建，两协议不能分开热改；同号替换失败时重建旧已应用配置，重新验证有效续租及单调所有权围栏。失败候选不得改变当前运行的租约时钟。流量为两协议 payload 聚合，TCP 连接与 UDP 映射分项展示。真实验收新增 `scripts/integration/native-both.py`，不能用本机测试或前一切片 CI 代替。
 
-2026-10-09 收尾：已修正同一 both runtime 的数字占用汇总归属、PATCH 保持监听作用域、实际 applied 基线冻结及补偿/重试删除栅栏；RELAY 更新前发布实际 hop 事实。`4ea426c` 的 [CI 37868714916](https://github.com/PaiMonCai/TuneX/actions/runs/37868714916) 共享 gate 73 PASS / 0 FAIL、F4 34 PASS / 1 FAIL，确认两种模式目标更新、恢复及 half-bind 正常 retry，通过后仅剩删除后立即复用端口失败；Agent gate 同时有短租约启动时序失败。当前候选补真实 Stop 完成等待、删除/暂停后的串行完整报告、取消/失败保留占用及确定性租约回归，并增加定向 race gate。F4 仍须看修复候选的 [PR 75 当前检查](https://github.com/PaiMonCai/TuneX/pull/75/checks) 和 `native-both-result.txt`，不提前标完成。门禁通过后再进入 F5，不启用默认关闭的入口。
+2026-10-09 收尾：源码 `dd108568ce59f583bd977461313bc8ef8b26c69b` 的 [CI 37870458038](https://github.com/PaiMonCai/TuneX/actions/runs/37870458038) required 全绿；脱敏工件确认 F4 **37 PASS / 0 FAIL**、共享 gate **73 PASS / 0 FAIL**。已修正同 runtime 占用汇总归属、监听作用域漂移、实际 applied 基线、补偿/重试栅栏及 RELAY 实际 hop 发布；删除/暂停等待真实 Stop 后报告端口事实再 ACK，取消/失败仍保留占用，重发能等待或重试。两模式目标更新、半绑定故障及补偿、正常 retry、共享预算、重启恢复、删除和精确端口复用均通过当前 Linux 拓扑；定向删除 race、后端 3237 单元/契约、119 数据库/HTTP（零跳过）、web 1507 也通过。
+
+此记录仅确认 plain DIRECT/自有单跳 RELAY 的 Linux 候选，不打开默认开关、不承诺新组合或生产发布。真实 Panel 浏览器、独立原生 A00 发布 gate、长期运行和跨版本升级条件仍按 F0/统一标准交付。Windows 额外全量回归还发现并发 LKG 文件共享错误及诊断/脱敏测试的平台问题，详见 [验证边界](testing.md#f4-本轮收尾证据)；恢复缓存须独立加固后再扩大 Windows 支持承诺。F5 从影响预览和迁移契约开始，不直接放开有引用的端点/密钥修改。
 
 ### F5：共享连接在线端点变更与密钥轮换
 
