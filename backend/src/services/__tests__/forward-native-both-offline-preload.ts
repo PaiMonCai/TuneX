@@ -68,8 +68,17 @@ const models: any = {
     create: async ({ data }: any) => { bothFixture.writes.push("forwardRevision.create"); const row = { id: bothFixture.snapshots.length + 1, ...data }; bothFixture.snapshots.push(row); return row; },
   },
   egressPool: {
-    create: async ({ data }: any) => { bothFixture.writes.push("egressPool.create"); const row = { id: 91, ...data, targets: [data.targets.create] }; bothFixture.pools.push(row); return row; },
-    findUnique: async ({ where }: any) => bothFixture.pools.find((p) => p.id === where.id) ?? null,
+    create: async ({ data }: any) => { bothFixture.writes.push("egressPool.create"); const row = { id: 91, ...data, targets: data.targets?.create ? [data.targets.create] : [] }; bothFixture.pools.push(row); return row; },
+    findUnique: async ({ where }: any) => bothFixture.pools.find((p) => where.node_id_name
+      ? p.node_id === where.node_id_name.node_id && p.name === where.node_id_name.name : p.id === where.id) ?? null,
+    update: async ({ where, data }: any) => { const row = bothFixture.pools.find((p) => p.id === where.id);
+      if (!row) throw new Error("missing pool"); bothFixture.writes.push("egressPool.update"); Object.assign(row, data); return row; },
+  },
+  egressTarget: {
+    deleteMany: async ({ where }: any) => { const row = bothFixture.pools.find((p) => p.id === where.pool_id);
+      if (!row) throw new Error("missing pool"); const count = row.targets.length; row.targets = []; return { count }; },
+    create: async ({ data }: any) => { const row = bothFixture.pools.find((p) => p.id === data.pool_id);
+      if (!row) throw new Error("missing pool"); row.targets.push(data); return data; },
   },
   nodeBinding: { findUnique: async () => ({ id: 1 }), findMany: async () => [] },
   nodePortLease: { findMany: async () => [] },

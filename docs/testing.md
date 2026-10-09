@@ -81,6 +81,8 @@ F4 同一入口额外 opt-in `FORWARD_NATIVE_BOTH_ENABLED=true` 并运行 `nativ
 
 F4 更新回归另覆盖显式未知协议汇总的 both→TCP/UDP 拒绝、目标变化与入口重建叠加时的出口准备顺序，以及实际出口 ACK 地址进入入口 next-hop。`mixed_target_rebuild_test.go` 用真实 TCP/UDP socket 验证活跃 UDP 映射与 TCP 客户端关闭叠加的完整重建：4 个 bind host × Apply/ReplaceListener × ownership guard × 等待/不等待 TCP 退场，共 32 场景；Windows amd64 五轮通过是本地程序证据，不替代 Linux 四节点门禁。后端执行器的本地离线验证隔离默认 MySQL/Redis IO，不作为数据库验收。
 
+服务层目标更新回归覆盖 DIRECT/RELAY × TCP/UDP/both × IPv4 wildcard/IPv6 wildcard/具体监听 IP 的 18 组合，确保修订快照与投影不把 `connect_ip` 当 `listen_ip`。DIRECT/RELAY 补偿夹具执行 `incoming <= removedRevision` 拒绝规则，验证恢复高于删除栅栏；实网以 foreign UDP 占用候选端口，实际 PATCH 移动已有 both 监听并失败，验证更高修订恢复原端口的两协议且候选端口无半监听。
+
 F1 gate 默认设置统计段最长 30 秒，让真实计数切换跨越持续 B TCP/UDP；验证实际数据库出现新 producer、旧历史保持、原目标 socket 未变，以及精确确认后的段数与页面观测。普通 Agent 的默认最长段龄为 86400 秒；此参数是明确的运行配置，验收没有伪造流量或修改计数快照。
 
 F2 同一 gate 新增真实目标 3044/3045：完整策略 API 往返、辅助 TCP 健康、主目标实际关闭、10 秒失败/恢复窗口、全故障、恢复后的新 TCP 与保持备用 UDP 映射、RR、random、固定 UDP 来源及 Agent 重启。每次等待继续使用 B 的原 TCP 和 UDP socket；不改数据库健康状态或伪造 Ready。窗口抖动、未知 UDP、nonce/replay 和未授权目标另由真实 runner 回归覆盖。Windows 本地不能代替该 Linux 门禁。

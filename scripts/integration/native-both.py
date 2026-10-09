@@ -157,6 +157,20 @@ def native_cases():
         fault_running = True
         H.check(bool(H.wait_until(lambda: ":21090" in H.agent_sh("netstat -uln"), timeout=10, interval=1)),
                 "F4 OS fault injection holds only the candidate UDP socket")
+        # Move an already serving rule onto the genuinely occupied port. This
+        # exercises Panel compensation and the Agent's removal tombstone, not
+        # only the manager's local failed-bind cleanup on a new rule.
+        before = request("GET", f"/api/forwards/{rules[0]}")
+        status, response, _ = H.req("PATCH", f"/api/forwards/{rules[0]}",
+            {"listen_port": 21090, "expected_revision": before["config_revision"]})
+        H.check(status == 502 and response.get("code") == "apply_failed",
+                "F4 real foreign UDP socket rejects an existing both rule's listener move")
+        restored = request("GET", f"/api/forwards/{rules[0]}")
+        H.check(restored["listen_port"] == 21086
+                and restored["config_revision"] > before["config_revision"] + 1
+                and H.wait_active(rules[0]) and bool(H.wait_until(lambda: payload(21086), timeout=60, interval=2)),
+                "F4 failed listener move restores both baseline lanes above the removal fence")
+        H.check(no_payload(21090), "F4 compensated candidate leaves no half-serving TCP listener")
         half = create("half-bind", 21090, targets["direct"])
         rules.append(half)
         failed = H.wait_until(lambda: H.tunnel_row(half).split("|")[0] == "error", timeout=90, interval=2)

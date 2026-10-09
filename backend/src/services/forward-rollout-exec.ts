@@ -1368,7 +1368,10 @@ export async function compensateRollout(
   // ① 撤新 runtime（两端）。revision+1 让闸门放行。
   // 用 plan 里存的 desired 快照，而不是重读 tunnel 行：补偿必须针对**本次
   // 尝试切过去的那个**拓扑，而 tunnel 行可能已被后续编辑改写。
-  const removeRevision = row.revision + 1;
+  // Fence the failed generation itself: an equal/older delayed apply is then
+  // stale, while the baseline replay at revision+1 remains strictly newer.
+  // Removing at revision+1 would tombstone that replay on the same Agent ID.
+  const removeRevision = row.revision;
   const planned = planSnapshot(row.steps, "desired");
   const baselinePlanned = planSnapshot(row.steps, "applied");
   const plannedMiddle = (planned as { middle_node_id?: number | null }).middle_node_id ?? null;

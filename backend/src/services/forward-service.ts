@@ -1202,9 +1202,10 @@ export async function patchForward(
           desiredStatus,
           createdById: ctx.userId,
           egressTargets: resources.targets,
-          resolvedListenIp: ctx.ingress?.connect_ip
-            ? String(ctx.ingress.connect_ip).split(",").map((x) => x.trim()).find(Boolean) ?? null
-            : null,
+          // connect_ip is the node's advertised address, not the rule's bind
+          // scope. Leave resolution to the persisted listen_ip; rewriting a
+          // wildcard lease to a concrete address creates self-conflicts and
+          // silently changes which local interfaces receive client traffic.
           egressPort: resources.egressPort,
           egressPoolId: resources.poolId,
           routeProfile: options.routeProfile,

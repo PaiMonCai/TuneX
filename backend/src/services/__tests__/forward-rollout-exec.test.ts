@@ -363,6 +363,51 @@ it("relay both retarget rebuild resolves the ACKed exit before cutting over ingr
   expect(f.leases.filter((l) => l.status === "active").map((l) => l.id)).toEqual([ingressLease, egressLease]);
 });
 
+it.each(["direct", "relay"] as const)("%s both failed cutover restores a revision strictly above each removal fence", async (mode) => {
+  const { f, deps, orch } = mode === "direct" ? directEnv() : modeSwitchEnv();
+  f.snapshots.forEach((s) => { s.protocol = "both"; s.listen_port = 10001; });
+  if (mode === "relay") Object.assign(f.snapshots.find((s) => s.revision === 6)!, {
+    mode, egress_node_id: 21, egress_port: 31000,
+    targets: [{ host: "10.9.9.9", port: 8080, weight: 1, order_by: 10 }] });
+  Object.assign(f.tunnels[0]!, { forward_protocol: "both", tunnel_type: null, listen_port: 10001,
+    ingress_node: { connect_ip: "10.0.0.11" } });
+  if (mode === "direct") f.leases[0]!.protocol = "unknown";
+  else {
+    f.addLease({ node_id: 11, port: 10001, lease_type: "ingress", tunnel_id: 1, protocol: "unknown" });
+    f.addLease({ node_id: 21, port: 31000, lease_type: "egress", tunnel_id: 1, protocol: "unknown" });
+  }
+  deps.loadCapabilityFacts = async () => nativeBothFacts();
+  const fences = new Map<string, number>();
+  const remove = orch.removeTunnel;
+  orch.removeTunnel = (async (input: Record<string, any>) => {
+    const result = await remove(input);
+    fences.set(`${input.node.id}:${input.direction}`, Number(input.revision));
+    return result;
+  }) as typeof orch.removeTunnel;
+  for (const [method, nodeKey, direction] of [
+    ["dispatchDirect", "ingressNode", "direct"], ["dispatchIngress", "ingressNode", "ingress"],
+    ["dispatchEgress", "egressNode", "egress"],
+  ] as const) {
+    const dispatch = orch[method];
+    const fencedDispatch = async (input: Record<string, any>) => {
+      const result = await dispatch(input);
+      if (direction !== "egress" && Number(input.revision) === 7)
+        return { ok: false, error_code: "agent_rejected", error: "candidate bind failed" };
+      // Match Agent ReplaceListener: incoming <= removedRevision is stale.
+      if (Number(input.revision) <= (fences.get(`${input[nodeKey].id}:${direction}`) ?? 0))
+        return { ok: false, error_code: "stale_revision", error: "removal fence" };
+      return result;
+    };
+    Object.assign(orch, { [method]: fencedDispatch });
+  }
+  const registration = await registerRollout({ tunnelId: 1, revision: 7, baseRevision: 6,
+    impact: impact({ listener_replacement: true, target_change: true, egress_target_change: mode === "relay" }) }, deps);
+  const result = await executeRollout(registration.rolloutId!, deps);
+  expect(result.phase, JSON.stringify(result)).toBe("failed");
+  expect(f.tunnels[0]).toMatchObject({ forward_protocol: "both", applied_revision: 8, config_revision: 8 });
+  expect(Math.max(...fences.values())).toBeLessThan(8);
+});
+
 it("native both rollback restores the baseline protocol, full projection and policy at a new durable revision", async () => {
   const { f, deps, orch } = directEnv();
   Object.assign(f.snapshots.find((s) => s.revision === 6)!, { protocol: "both", max_connections: 4 });

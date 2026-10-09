@@ -55,6 +55,8 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 RELAY 的目标修改若同时要求入口重建，必须先 `prepare_egress` 获取真实 ACK 出口地址，再执行出口/入口 cutover。不能因为目标变化而跳过出口准备，导致 `next_hop_unresolved`。仅换出口目标且入口不重切的既有路径仍只在 CUTOVER 更新出口，不额外重建入口。
 
+`connect_ip` 是节点公布的连接地址，不是规则的监听作用域。PATCH 修改目标或协议保持现有 `listen_ip`，不能把 wildcard 租约偷偷缩成具体 IP。失败补偿以失败候选修订删除 runtime，基线内容以更高修订恢复；删除栅栏不得占用恢复修订，迟到的失败候选仍被拒绝。
+
 规则请求值 0 表示未另设规则上限，仍受 Workspace 天花板约束；Workspace 0 额度禁止转发。现有控制面额度检查与租约不等于多节点严格共享的带宽/连接预算池，也存在统计上报及租约生效窗口。
 
 部署 ACK 是历史确认。当前运行事实必须匹配节点身份、代次、摘要、租约和报告新鲜度：缺观测为 unknown、过期为 stale、入口零规则为 passive；只有有效 ready=true 才表示 runtime Ready。Ready 不自动证明目标服务可达，统计接收时间也不证明正在运行。

@@ -34,7 +34,7 @@ function seed(mode: "direct" | "relay" = "direct") {
     remote_port: mode === "direct" ? 8080 : null, egress_port: mode === "relay" ? 23001 : null, egress_pool_id: mode === "relay" ? 91 : null,
     desired_status: "active", apply_status: "active", config_revision: 7, applied_revision: 7, desired_revision_id: 1,
     bytes_per_second_in: 100, bytes_per_second_out: 200, max_connections: 4, max_connections_per_ip: 2 };
-  f.rows.push(row); if (mode === "relay") f.pools.push({ id: 91, node_id: 22, lb_strategy: "round", targets: [{ host: "127.0.0.1", port: 8080, weight: 1, order_by: 1 }] });
+  f.rows.push(row); if (mode === "relay") f.pools.push({ id: 91, name: "forward-71", node_id: 22, lb_strategy: "round", targets: [{ host: "127.0.0.1", port: 8080, weight: 1, order_by: 1 }] });
   return row;
 }
 test("real auth and workspace middleware protect discovery, default-off/exact true with no Forward/lease write", async () => {
@@ -123,6 +123,24 @@ test("protocol transition commits one revision/CAS with same rule and port; tran
   resetBothFixture(); const before = seed(); before.forward_protocol = "tcp"; f.failCommit = true;
   await patchForward(71, 7, { protocol: "both", expected_revision: 7 }).catch(() => {});
   expect(f.rows[0]).toMatchObject({ forward_protocol: "tcp", config_revision: 7 }); expect(f.snapshots).toHaveLength(0);
+});
+
+test("target edits preserve the bound scope instead of replacing it with the node connect address", async () => {
+  for (const protocol of ["both", "tcp", "udp"] as const) {
+    for (const mode of ["direct", "relay"] as const) {
+      for (const host of ["0.0.0.0", "::", "127.0.0.1"]) {
+        resetBothFixture(); const row = seed(mode);
+        row.forward_protocol = protocol; row.listen_ip = host;
+        const preview = await previewForwardUpdate(71, 7, { target_port: 8081, expected_revision: 7 });
+        expect(preview.ok).toBe(true);
+        // The fixture has no worker; persistence still follows the real service path.
+        expect(await patchForward(71, 7, { target_port: 8081, expected_revision: 7 }))
+          .toMatchObject({ ok: false, status: 503, code: "apply_failed" });
+        expect(f.rows[0]).toMatchObject({ listen_ip: host, listen_port: 23000, config_revision: 8 });
+        expect(f.snapshots[0]).toMatchObject({ listen_ip: host, listen_port: 23000, protocol });
+      }
+    }
+  }
 });
 test("listing and metadata checks preserve unsupported both fact without claiming topology is supported", async () => {
   const row = seed(); row.middle_node_id = 33 as any;
