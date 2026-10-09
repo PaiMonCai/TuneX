@@ -1,6 +1,6 @@
 # 生产部署与转发功能发布
 
-更新：2026-10-08。说明按当前仓库 Compose 和脚本整理，本次文档工作没有执行生产部署。使用已构建并发布的版本；开发分支与 CI 绿色结果不自动构成可用的发行镜像。
+更新：2026-10-10。说明按当前仓库 Compose 和脚本整理，本次文档工作没有执行生产部署。PR #75 已合并不等于发行；F5 预览仍在未合并草稿 PR #76，源码验收状态见 [文档入口](README.md)。使用已构建并发布的版本；开发分支与 CI 绿色结果不自动构成可用的发行镜像。
 
 ## 生产栈与入口
 
@@ -63,10 +63,12 @@ Agent 先在 Panel 创建 Node，使用该节点生成的安装/enrollment 和 u
 
 1. 备份数据库、配置与节点私有状态；先执行当前完整迁移，包含 `20261101005000_link_traffic_checkpoints`、`20261101006000_link_target_sets` 和 `20261101007000_link_client_sources`，部署兼容的 Panel/Worker 接收端。
 2. Panel 和 Worker 设置一致、独立生成的 32 字节/64 位 hex `TUNEX_LINK_SEAL_KEY`，并开启 FXP 实验开关；不使用 AUTH_SECRET 代替，不在运行中随意更换封存密钥。
-3. 升级兼容 Agent 与实际 FXP，开启同名开关。Agent state 目录持久且只允许服务账户访问；Linux 目录/文件模式 0700/0600，Windows 使用对应服务账户 ACL。
+3. 升级兼容 Agent 与实际 FXP，开启同名开关。Agent state 目录持久且只允许服务账户访问；Linux 目录/文件模式 0700/0600。当前验收与发布范围限定 Linux，Windows 适配暂停；已有 Windows 文件处理代码或 ACL 要求不构成完整平台支持承诺。
 4. 先在有限节点创建双节点 Link，验证零规则 passive、单条 TCP/UDP/both、限制、流量回执、共享 A/B 更新、失败补偿及删除端口复用；核对真实镜像与最小能力。
 
 先升级接收端，再启用新 Agent，避免未提交统计获得错误确认。关闭开关不等于所有监听瞬时停止，必须结合移除/租约到期和实际报告验证。当前有引用资源的在线端点修改和密钥轮换尚未开放，按 [运行边界](forwarding-runtime.md) 操作。
+
+F5 预览首切片没有新增数据库迁移或 Agent 协议，仅提供 `POST /api/links/:id/maintenance/preview` 和只读页面。`execution.supported=false`；预览不会预留端口、生成密钥或修改部署，结果 60 秒过期。它不是生产维护工具，也不放开已部署端点修改或有引用密钥轮换；后续执行器须另行验收发布，不能据预览手工改库、清租约或重启 carrier。
 
 F1 Agent 只有探测到实际程序的统计分段能力才传递新协议参数并上报 `forward.traffic.rotation.v1`；旧 FXP 沿用有界 v1 模式。可在 Agent 服务环境设置 `TUNEX_FXP_TRAFFIC_EPOCH_SECONDS`（30–86400，默认 86400），较短段龄会增加数据库身份行及离线段数。产生 v2 manifest 后旧 Agent 会拒绝读取，回退必须排空或保留统计、核对兼容性，不能删除水位/私有文件绕过错误。
 
@@ -97,5 +99,7 @@ backup 默认交互获取加密口令；自动任务通过受保护的配置提�
 版本回退使用 `rollback.sh --to previous`，实际目标、确认和备份条件由脚本检查；只退镜像不撤销数据库迁移。数据恢复 `restore.sh <backup-id-or-path>` 会覆盖数据库，按已审查的恢复点及维护窗口操作。standalone 部署还需保留相应 overlay 与 Caddy 持久卷。
 
 Panel 备份不能自动备份各 Agent 的 machine.key、加密缓存/墓碑和 traffic spool。节点升级与灾难恢复必须单独保留这些文件的对应身份，不能把另一节点缓存复制过来。保留 LinkTrafficCheckpoint 与日事实；禁止清水位或删未确认 spool，以免重复入账或遗失用量。
+
+原生 Agent LKG 是既有失联/重启恢复缓存，不是可按性能收益随意删除的临时文件。本轮保持其恢复行为，Windows 并发文件读取问题及性能优化均暂停，边界见 [平台问题记录](testing.md#windows-deferred)。
 
 跨版本回退前核对 runner/config/cache/traffic 协议兼容性；不兼容时先受控停止再按恢复方案处理。升级后继续核对真实 payload、统计重投不重复、旧 owner 租约失效及删除清理，保留对应版本的脱敏证据。

@@ -16,6 +16,8 @@ test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores 
     let reportedVersion = "0.0.0-dev", legacyVersion = "unknown", fxpAdvertised = true;
     const targetCapNodes = new Set([11,12]);
     const sourceCapNodes = new Set([11,12]);
+    const staleCapNodes = new Set();
+    let previewTxOnly=false,previewTx=null,liveReports=[];
     const jsonFields = new Set(["link_target_config","link_source_config","targets","binding_snapshot","config"]);
     const matches = (r,w={}) => Object.entries(w).every(([k,v]) => {
       if (v && typeof v === "object" && "in" in v) return v.in.includes(r[k]);
@@ -50,21 +52,27 @@ test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores 
       linkResource:table("link"),linkVersion:table("version"),linkTransportCredential:table("credential"),
       linkDeployment:table("deployment"),linkPlacement:table("placement"),tunnel:table("tunnel"),
       nodePortLease:table("lease"),forwardRevision:table("revision"),
-      nodeStateReport:{findMany:async()=>[]},
+      nodeStateReport:{findMany:async()=>liveReports},
       linkTrafficCheckpoint:{groupBy:async({where})=>{assert.equal(where.workspace_id,3);assert.equal(where.link_id,1);return usageRows.filter(row=>where.forward_id.in.includes(row.forward_id));}},
       node:{ findMany:async({where,include})=> {assert.equal(include.state_report.select.version,true);return [11,12].filter(id=>where.id.in.includes(id)&&where.node_group.workspace_id===3).map(id=>({id,
         lifecycle:"active",role:id===11?"ingress":"egress",node_group_id:id,connect_ip:"127.0.0.1",version:legacyVersion,
         state_report:reportedVersion===null?null:{version:reportedVersion},node_group:{workspace_id:3}}));} },
-      $queryRaw:async()=>[], $transaction:async(fn)=>fn(db),
+      $queryRaw:async()=>[], $transaction:async(fn)=>fn(previewTxOnly?previewTx:db),
     };
+    const nodeReader=db.node.findMany;
+    previewTx={...db,node:{findMany:nodeReader}};
+    db.node.findMany=async(args)=>{assert.equal(previewTxOnly,false,"global node reads would deadlock a one-connection pool");return nodeReader(args);};
     const policy={deny_scope:null,limits:{max_tunnels:100,traffic_limit:null,traffic_period:"month",bandwidth_limit:null,client_limit:null,ip_limit:null},
       entitlements:{tunnel_types:["tcp","udp"],allowed_in_group_ids:null,allowed_out_group_ids:null}};
     mock.module(${modulePath("../../db.ts")},()=>({db}));
     let trafficUsed=0;
     mock.module(${modulePath("../policy-service.ts")},()=>({getEffectivePolicy:async()=>policy, countWorkspaceTunnels:async()=>tables.tunnel.length,
       sumWorkspaceTraffic:async()=>trafficUsed,withWorkspaceQuotaLock:async(_id,fn)=>fn(db,policy)}));
-    mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async(id)=>({capabilities:fxpAdvertised
-      ? ["forward.link.fxp.v1",...(targetCapNodes.has(id)?["forward.targets.fxp.v1"]:[]),...(sourceCapNodes.has(id)?["forward.client-source.fxp.v1"]:[])] : []})}));
+    mock.module(${modulePath("../runtime-admission.ts")},()=>({loadNodeCapabilityFacts:async(id,client)=>{
+      if(previewTxOnly)assert.equal(client,previewTx,"capability reads must use the locked transaction");
+      return {advertisementCurrent:!staleCapNodes.has(id),capabilities:fxpAdvertised
+        ? ["forward.link.fxp.v1",...(targetCapNodes.has(id)?["forward.targets.fxp.v1"]:[]),...(sourceCapNodes.has(id)?["forward.client-source.fxp.v1"]:[])] : []};
+    }}));
     let blocked=false,failIngress=false,lateAck=false,lateAckForwardId=null;
     const sent=[], acquired=[];
     mock.module(${modulePath("../portPool.ts")},()=>({
@@ -96,6 +104,58 @@ test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores 
     const rule=(name,listen_port)=>({name,protocol:"both",listen_port,listen_host:"127.0.0.1",target_host:"127.0.0.1",target_port:27000});
     const a=await service.createLinkForward(3,link.id,8,rule("A",26000));
     const b=await service.createLinkForward(3,link.id,8,rule("B",26001));
+    // A compiler-backed F5 read must never reserve sockets, dispatch or write credentials/revisions.
+    const maintenanceState=()=>structuredClone(tables);
+    const previewInput=()=>({expected_version:tables.link[0].desired_version,
+      expected_generation:tables.link[0].generation,change:{type:"rotate_key"}});
+    const beforePreview=maintenanceState(),beforeSent=sent.length,beforeAcquired=acquired.length;
+    previewTxOnly=true;
+    const rotationPreview=await service.previewLinkMaintenance(3,link.id,previewInput());
+    previewTxOnly=false;
+    staleCapNodes.add(11);
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,previewInput()),e=>e.code==="agent_fxp_capability_stale");
+    staleCapNodes.clear();
+    assert.equal(rotationPreview.references.total,2);assert.equal(rotationPreview.references.active,2);
+    assert.equal(rotationPreview.runtime.state,"unknown","ACK without a fresh report never grants Ready");
+    const previewDeployment=db.linkDeployment.expand(tables.deployment.at(-1));
+    liveReports=previewDeployment.placements.map(p=>({node_id:p.node_id,reported_at:new Date(),link_placements:[{
+      id:p.runtime_id,link_id:link.id,workspace_id:3,node_id:p.node_id,role:p.role,generation:p.generation,
+      observed_generation:p.generation,config_digest:p.config_digest,desired_config_digest:p.config_digest,
+      ready:true,state:"ready",lease_expires_at:previewDeployment.lease_expires_at.toISOString(),ports:[],runtime_ids:[]}]}));
+    const baselinePreview=await service.previewLinkMaintenance(3,link.id,previewInput());
+    assert.equal(baselinePreview.runtime.state,"ready");
+    policy.limits.bandwidth_limit=1;
+    const policyDriftPreview=await service.previewLinkMaintenance(3,link.id,previewInput());
+    assert.equal(policyDriftPreview.runtime.state,"not_ready");
+    assert.notEqual(policyDriftPreview.snapshot.state_token,baselinePreview.snapshot.state_token);
+    policy.limits.bandwidth_limit=null;liveReports=[];
+    assert.equal(rotationPreview.runtime.tcp_connections,null);assert.equal(rotationPreview.runtime.udp_mappings,null);
+    assert.equal(rotationPreview.execution.supported,false);assert.equal(rotationPreview.ports.reserved,false);
+    assert.equal(rotationPreview.ports.candidate.filter(p=>p.role==="egress").length,2);
+    const moved=await service.previewLinkMaintenance(3,link.id,{...previewInput(),change:{type:"update_endpoints",
+      config:{...initial.config,carrier_port:25001}}});
+    assert.equal(moved.candidate.version,2);assert.equal(moved.changes.carrier_port_changed,true);
+    assert.equal(moved.references.total,2);assert.equal(moved.impact.tcp,"drain_required");
+    assert.notEqual(moved.snapshot.state_token,rotationPreview.snapshot.state_token);
+    assert.deepEqual(maintenanceState(),beforePreview);assert.equal(sent.length,beforeSent);assert.equal(acquired.length,beforeAcquired);
+    await assert.rejects(()=>service.previewLinkMaintenance(4,link.id,previewInput()),e=>e.code==="link_not_found"&&e.status===404);
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,{...previewInput(),expected_version:2}),e=>e.code==="link_version_conflict");
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,{...previewInput(),expected_generation:0}),e=>e.code==="link_generation_conflict");
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,{...previewInput(),change:{type:"update_endpoints",
+      config:{...initial.config,egress_node_id:999}}}),e=>e.code==="link_node_not_found");
+    process.env.TUNEX_FXP_LINKS_ENABLED="false";
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,previewInput()),e=>e.code==="fxp_links_not_enabled");
+    process.env.TUNEX_FXP_LINKS_ENABLED="true";
+    await assert.rejects(()=>service.updateLink(3,link.id,1,{...initial.config,carrier_port:25001}),e=>e.code==="link_has_references");
+    await assert.rejects(()=>service.deployLink(3,link.id,true),e=>e.code==="link_has_references");
+    const baseReferenceCount=tables.tunnel.length;
+    tables.tunnel.push(...Array.from({length:499},(_,i)=>({...tables.tunnel[0],id:1000+i,desired_status:"inactive"})));
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,previewInput()),e=>e.code==="link_maintenance_preview_too_large");
+    tables.tunnel.splice(baseReferenceCount);
+    tables.lease.push(...Array.from({length:2049},(_,i)=>({id:i+1,link_id:link.id,status:"active"})));
+    await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,previewInput()),e=>e.code==="link_maintenance_preview_too_large");
+    tables.lease.length=0;
+    assert.deepEqual(maintenanceState(),beforePreview);assert.equal(sent.length,beforeSent);assert.equal(acquired.length,beforeAcquired);
     assert.equal((await service.getLink(3,link.id)).forwards[0].traffic,null);
     usageRows=[{forward_id:a.id,_sum:{bytes_in:9007199254740993n,bytes_out:43n,connections:2n},_max:{updated_at:new Date("2026-10-07T12:00:00Z")}}];
     const accounted=await service.getLink(3,link.id);
@@ -204,6 +264,9 @@ test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores 
     }
     await service.actionLinkForward(3,link.id,c.id,"suspend",8);assertSaved(edited,"inactive");
     assert.equal(current().apply_status,"suspended");
+    const suspendedPreview=await service.previewLinkMaintenance(3,link.id,previewInput());
+    assert.equal(suspendedPreview.references.total,3);assert.equal(suspendedPreview.references.suspended,1);
+    assert.equal(suspendedPreview.references.forwards.find(r=>r.id===c.id).config_revision,current().config_revision);
     assert.equal(tables.deployment.at(-1).binding_snapshot.spec.bindings.some(r=>r.forward_id===c.id),false);
     assert.equal(sent.at(-2).config.runner_config.allowedBindings.some(r=>r.ruleId===c.id),false);
     const suspendedSet={...structuredClone(edited),strategy:"round_robin",failure_seconds:3600,recover_seconds:10};

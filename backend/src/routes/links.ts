@@ -5,7 +5,7 @@ import type { AppVariables } from "../middlewares/auth.ts";
 import { resolveWorkspaceAccess } from "../services/workspace.ts";
 import {
   LinkResourceError, listLinks, getLink, createLink, updateLink, deployLink,
-  retireLink, createLinkForward, updateLinkForward, actionLinkForward,
+  retireLink, createLinkForward, updateLinkForward, actionLinkForward, previewLinkMaintenance,
 } from "../services/link-resource.ts";
 
 export const linksRoutes = new Hono<{ Variables: AppVariables }>();
@@ -40,6 +40,12 @@ linksRoutes.get("/:id", async (c) => c.json({ data: await getLink(c.get("workspa
 linksRoutes.put("/:id/config", async (c) => {
   const input = z.object({ expected_version: positive, config: z.unknown() }).strict().parse(await c.req.json());
   return c.json({ data: await updateLink(c.get("workspace")!.id, positive.parse(c.req.param("id")), input.expected_version, input.config) });
+});
+linksRoutes.post("/:id/maintenance/preview", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const raw = await c.req.json().catch(() => { throw new LinkResourceError("invalid_input", 400); });
+  return c.json({ data: await previewLinkMaintenance(c.get("workspace")!.id,
+    positive.parse(c.req.param("id")), raw) });
 });
 linksRoutes.post("/:id/deploy", async (c) => c.json({ data: await deployLink(c.get("workspace")!.id, positive.parse(c.req.param("id"))) }));
 linksRoutes.post("/:id/rotate-key", async (c) => c.json({ data: await deployLink(c.get("workspace")!.id, positive.parse(c.req.param("id")), true) }));

@@ -1,6 +1,6 @@
 # 以隧道转发为核心的后续开发方案
 
-更新：2026-10-09。TuneX 开发起点：`7396f2460e7e89da744125313ae3826414d4a35f`，开发分支 `feat/forward-core-abcd`。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。F1 `4e50f20`、F2 `932d15e`、F3 共享 FXP TCP 来源切片 `47594c4`、F4 原生 both 限定组合 `dd10856` 已通过各自候选 CI；下一工作包为 F5，公开发布条件仍单独验收。
+更新：2026-10-10。F1/F2 首切片、F3 共享 FXP TCP 来源和 F4 Linux 原生 both 限定组合已由 [PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 合入 `main`（`ef159eb`），不等于 F0–F4 所有目标已完成。F5 开发分支 `feat/forward-link-maintenance` 的 [PR #76](https://github.com/PaiMonCai/TuneX/pull/76) 仍为未合并草稿；源码 `cdb8470` 的只读预览首切片通过自身 CI，迁移执行器尚未实现。ForwardX 对标基线：2.3.281，提交 `cb0ef0bb156dc114e4344c887328018491fbd638`。固定源码验收记录见 [测试说明](testing.md)，公开发布条件仍单独验收。
 
 ## 1. 目标和范围
 
@@ -10,26 +10,28 @@
 
 支付、套餐经营、优惠券、插件、AI、移动端、营销页面后置。核心功能需要的权限检查、密钥保护、运行观测和错误恢复随功能一起交付。既有外围功能的缺陷不因本方案而视为已修复；恢复相关开发时单独审查。
 
+2026-10-09 用户调整：Windows 适配暂停，不作为下一阶段前置。原生 Agent LKG 是失联重启时的恢复缓存，不是已证明的转发性能优化；本轮不修改，仍记录 Windows 并发读取缺陷，但不以此阻塞限定 Linux 的 F5 开发。没有性能基线和明显收益时，不另起缓存优化工作包。
+
 ## 2. 当前能力与差距
 
-“已实现”指当前分支，验证范围见 [测试说明](testing.md)；“部分”表示必须看具体运行路径。ForwardX 的协议、载体、驱动也有组合限制，不能将其枚举做笛卡尔积后全部宣称支持。
+下表已有运行能力属于已合并基线；只有 F5 预览属于未合并开发分支。“部分”表示必须看具体运行路径，验证范围见 [测试说明](testing.md)。ForwardX 的协议、载体、驱动也有组合限制，不能将其枚举做笛卡尔积后全部宣称支持。
 
 | 核心能力 | ForwardX 参考处理 | TuneX 当前状态 | 后续工作 |
 | --- | --- | --- | --- |
 | 规则与共享连接分离 | 独立 tunnels，多个 rules 引用 | 已有 LinkResource、独立部署和规则引用 | 保留，扩展版本化变更和复杂拓扑。 |
 | 加密双节点 TCP/UDP | FXP v1 TCP/UDP 运行与密钥 | 已导入真实 FXP，固定两个自有节点 | F0 收口发布条件，F6 扩展路径。 |
-| TCP/UDP 同号与 both | 两种业务协议及 both | FXP 已有；普通原生 both 限定组合已通过 Linux 候选验收，默认关闭 | F4 候选已验收；F0 发布准入仍需完成。 |
+| TCP/UDP 同号与 both | 两种业务协议及 both | FXP 已有；普通原生 both 限定组合已合入 main 并通过 Linux 验收，默认关闭 | F0 发布准入；额外协议/拓扑组合单独开发。 |
 | 双向速率限制 | FXP limitIn/limitOut | 原生与 FXP 已有每规则、每入口 runtime 限额 | 保留；多入口总预算另做分配。 |
-| 总并发、每源 IP 并发 | FXP connGate；maxIPs 是每来源并发 | 已有；UDP 并发是活跃映射 | F3 补可信来源；不改成不同 IP 数量限制。 |
+| 总并发、每源 IP 并发 | FXP connGate；maxIPs 是每来源并发 | 已有；UDP 并发是活跃映射，共享 TCP 可信来源随 F3 补齐 | 原生来源扩展；不改成不同 IP 数量限制。 |
 | 共享规则热更新 | 上游运行逻辑加 TuneX 托管更新 | A 更新时保持未变 B 的 TCP/UDP；载体变更仍重启 | F5 做在线载体迁移。 |
 | 每规则流量及额度 | 方向计数和规则/用户聚合 | 已有入口累计、持久重投、水位去重、日事实入账 | F1 解决长期历史容量。 |
-| 多目标主备 | rules 目标列表、fallback、故障/恢复窗口 | 原生出口池部分可用；FXP 最多 10 目标切片已通过候选 CI | F2；UDP 辅助探测和映射切换边界见运行说明。 |
-| RR/random/weighted | 目标或出口组策略 | FXP 新目标集支持 RR/random；原生 weighted 保留现有路径 | F2 实流量验收；FXP weighted 后续按需求扩展。 |
-| IP_HASH | 原始客户端来源参与选择 | 共享 FXP TCP 已通过自身候选验收；原生 RELAY 门禁不变 | F3 原生来源仍待开发，不能推广证据。 |
-| PROXY v1/v2 | 入出口接收/发送开关、版本与兼容性 | 共享 FXP TCP 已通过受信接收和目标发送 v1/v2 候选验收 | F3；UDP/both 暂拒绝。 |
+| 多目标主备 | rules 目标列表、fallback、故障/恢复窗口 | 原生出口池部分可用；FXP 最多 10 目标首切片已合入 main，实网已验收 | 长期/发布验收；UDP 辅助探测和映射切换边界见运行说明。 |
+| RR/random/weighted | 目标或出口组策略 | FXP 新目标集支持 RR/random 且已实测；原生 weighted 保留现有路径 | 原生独立发布 gate；FXP weighted 后续按需求扩展。 |
+| IP_HASH | 原始客户端来源参与选择 | 共享 FXP TCP 已验收并合入 main；原生 RELAY 门禁不变 | F3 原生来源仍待开发，不能推广证据。 |
+| PROXY v1/v2 | 入出口接收/发送开关、版本与兼容性 | 共享 FXP TCP 受信接收和目标发送 v1/v2 已验收并合入 main | F3 原生来源扩展；UDP/both 暂拒绝。 |
 | 部署/运行/可用状态 | 分开 desired、deployed、running、available | Link 已有代次/digest/租约匹配的运行事实 | F0/F8 加目标可达性和真实浏览器流程。 |
 | 重启、失联、撤权恢复 | Agent runtime recovery | 已有加密缓存、持久墓碑、有限租约与 reconcile | 各阶段加入跨版本恢复及故障注入。 |
-| 共享连接在线改端点/密钥 | 共享修改影响引用规则 | 已部署端点禁止修改；密钥轮换限零引用 | F5，先影响预览，再受控迁移。 |
+| 共享连接在线改端点/密钥 | 共享修改影响引用规则 | main 仍禁止已部署端点编辑，轮换限零引用；开发分支只读影响预览已验收 | F5 持久状态机、提交 CAS、双代迁移及补偿。 |
 | 安全多跳 | chain、逐跳载体和成员 | 原生 RouteProfile 最多 3 节点；共享 FXP 固定 2 节点 | F6a。 |
 | 多出口故障切换 | exit/failover groups | 调度候选和单条运行路径已有；共享多出口未完成 | F6b，先固定主备。 |
 | 多入口同时服务 | entry groups | NodeGroup 是基础设施池，不能表示多入口部署 | F6c，最后做多活及预算分配。 |
@@ -61,7 +63,7 @@
 
 ### F0：发布基线与能力准入
 
-依赖：当前分支通过完整 CI。估算：2–4 工程人日。
+依赖：对应候选通过选中范围 CI，并单独补齐发布专用验证。估算：2–4 工程人日。
 
 - 选择明确的候选发布组合，记录 Panel/Agent/FXP 源码、镜像 digest 和实际版本；FXP 程序内部版本 2.2.117 与项目版本 2.3.281 分开记录。
 - 基于认证 NodeStateReport 和构造成功的 runtime capability 准入；为每个新组合设置真实最低 Agent/runner 能力要求，拒绝过期报告、未识别版本和缺依赖节点。
@@ -76,7 +78,7 @@
 
 原有活动 producer 的历史日条目、删除过的规则映射和已见水位不会回收，2048 条上限不能支撑 500 条规则长期跨日运行。本轮通过同进程统计分段解决：runner 写入新段空快照，再封存旧段最终累计，原子切换后续计数；Agent 持久化准备身份和水位，精确数据库 ACK 后回收封存段。规则会话、监听和预算保持，旧段身份从不重用。协议及边界见 [运行说明](forwarding-runtime.md#traffic)。
 
-首个切片已实现 Agent/FXP 分段、崩溃恢复、容量/确认观测及页面；包含 500 规则/30 模拟日、并发计数、迟到 ACK、真实 held TCP/UDP 测试。候选 `4e50f20` 的 [CI 37658464950](https://github.com/PaiMonCai/TuneX/actions/runs/37658464950) required 全绿，Linux 四节点 41 PASS / 0 FAIL。真实跨日/长期运行与数据库历史归档仍分别留证，不能将首个切片等同整个 F1 交付。数据库水位和部署历史继续保留，尚未自动归档清理。
+首个切片已实现 Agent/FXP 分段、崩溃恢复、容量/确认观测及页面；包含 500 规则/30 模拟日、并发计数、迟到 ACK、真实 held TCP/UDP 测试，固定候选结果见 [历史切片证据](testing.md#历史切片证据索引)。真实跨日/长期运行与数据库历史归档仍分别留证，不能将首个切片等同整个 F1 交付。数据库水位和部署历史继续保留，尚未自动归档清理。
 
 - 已实现 FXP 版本化分段协议：旧段封存后不再接收增量，新段以新身份累计；Agent 收到数据库提交后的全段精确确认，再删除旧段快照与授权映射。runner 不原地裁剪活动段或重用累计身份。
 - 已实现加密 manifest 的准备记录、Rules/Last 水位和持久删除意图；完整验证所有文件后才恢复准备或回收。缺项和回退检测继续有效，未确认数据不能为了腾出容量而丢弃。
@@ -105,13 +107,13 @@
 
 回退：新目标集有独立能力版本；旧节点拒绝新配置。需要退回单目标时创建明确修订并提示影响，不能在接收失败后偷偷选第一个目标。
 
-F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/actions/runs/37697539412) required 全绿：四节点 61 PASS / 0 FAIL，数据库/HTTP 118 通过且零跳过。上述记录限定该候选，不替代后续来源协议的验收。
+F2 固定候选结果见 [历史切片证据](testing.md#历史切片证据索引)，不替代后续来源协议或新提交的验收。
 
 ### F3：可信客户端 IP、PROXY 与 IP_HASH——共享 TCP 首切片已验收
 
 依赖：F2 的目标身份与选择接口；协议/信任设计可提前并行。估算：6–10 工程人日。
 
-首个切片限定**共享 FXP TCP**。版本化 `client_source` 明确 socket/受信 PROXY、CIDR 和目标发送模式；实际 runner 能力控制双方准入，认证 Hello 绑定规则及来源策略摘要，出口重建选择键/发送模式而不采信客户端字段。IP_HASH 复用上游选择器；每源并发在验证来源后准入。UDP/both 明确拒绝此组合，原生 DIRECT/RELAY 来源扩展尚未纳入此切片，不将共享路径证据推广过去。真实 Panel 浏览器、Linux 四节点和新数据库迁移以该候选分别验收；公开功能仍默认关闭。
+首个切片限定**共享 FXP TCP**。版本化 `client_source` 明确 socket/受信 PROXY、CIDR 和目标发送模式；实际 runner 能力控制双方准入，认证 Hello 绑定规则及来源策略摘要，出口重建选择键/发送模式而不采信客户端字段。IP_HASH 复用上游选择器；每源并发在验证来源后准入。UDP/both 明确拒绝此组合，原生 DIRECT/RELAY 来源扩展尚未纳入此切片，不将共享路径证据推广过去。Linux 四节点和数据库验收已通过；真实 Panel 浏览器仍待完成，fixtures 不替代；公开功能仍默认关闭。
 
 - 区分入口 socket 原地址、可信上游 PROXY 声明和普通用户输入。配置 receive/send、入口/出口位置、v1/v2、受信网段与长度/超时边界；UDP 不支持的组合明确拒绝。
 - 将可信来源放入经过认证、绑定规则的内部元数据。复用上游 PROXY 解析/发送处理并适配 TuneX 的身份校验，禁止出口用载体节点 IP 冒充客户端 IP。
@@ -122,7 +124,7 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 
 回退：配置和元数据协议能力协商；旧节点拒绝新要求。撤销功能生成新修订并提示受影响连接，保持既有目标集授权。
 
-### F4：普通原生 Forward 的 both——限定组合候选已验收
+### F4：普通原生 Forward 的 both——Linux 限定组合已验收并合并
 
 依赖：现有协议/地址端口租约与运行限额。估算：5–8 工程人日。
 
@@ -138,15 +140,32 @@ F2 候选 `932d15e` 的 [CI 37697539412](https://github.com/PaiMonCai/TuneX/acti
 
 Agent 使用一个 ID、一个修订和 TCP/UDP 两个真实 OS 槽位；两子监听均成功才开放入口准入，半失败关闭已准备监听。目标变化首版完整重建，两协议不能分开热改；同号替换失败时重建旧已应用配置，重新验证有效续租及单调所有权围栏。失败候选不得改变当前运行的租约时钟。流量为两协议 payload 聚合，TCP 连接与 UDP 映射分项展示。真实验收新增 `scripts/integration/native-both.py`，不能用本机测试或前一切片 CI 代替。
 
-2026-10-09 收尾：源码 `dd108568ce59f583bd977461313bc8ef8b26c69b` 的 [CI 37870458038](https://github.com/PaiMonCai/TuneX/actions/runs/37870458038) required 全绿；脱敏工件确认 F4 **37 PASS / 0 FAIL**、共享 gate **73 PASS / 0 FAIL**。已修正同 runtime 占用汇总归属、监听作用域漂移、实际 applied 基线、补偿/重试栅栏及 RELAY 实际 hop 发布；删除/暂停等待真实 Stop 后报告端口事实再 ACK，取消/失败仍保留占用，重发能等待或重试。两模式目标更新、半绑定故障及补偿、正常 retry、共享预算、重启恢复、删除和精确端口复用均通过当前 Linux 拓扑；定向删除 race、后端 3237 单元/契约、119 数据库/HTTP（零跳过）、web 1507 也通过。
+2026-10-09 收尾并合入 `main`：同 runtime 占用归属、监听作用域、实际 applied 基线、补偿/重试栅栏、RELAY 实际 hop、Stop 完成后报告/ACK 已修正并验收。`ef159eb` 的 main CI 通过，含主分支 race 和最早支持数据库升级；固定提交及结果统一见 [F4 验收记录](testing.md#f4-本轮收尾证据)，不在开发方案重复测试流水账。
 
-此记录仅确认 plain DIRECT/自有单跳 RELAY 的 Linux 候选，不打开默认开关、不承诺新组合或生产发布。真实 Panel 浏览器、独立原生 A00 发布 gate、长期运行和跨版本升级条件仍按 F0/统一标准交付。Windows 额外全量回归还发现并发 LKG 文件共享错误及诊断/脱敏测试的平台问题，详见 [验证边界](testing.md#f4-本轮收尾证据)；恢复缓存须独立加固后再扩大 Windows 支持承诺。F5 从影响预览和迁移契约开始，不直接放开有引用的端点/密钥修改。
+仅确认 plain DIRECT/自有单跳 RELAY 的 Linux 路径，不打开默认开关、不承诺新组合或生产发布。真实 Panel 浏览器、独立原生 A00 发布 gate、长期运行和跨版本升级条件仍按 F0/统一标准交付。Windows LKG 并发文件读取及诊断/脱敏测试问题已记录在 [验证边界](testing.md#windows-deferred)，按用户指示暂停，不作为当前 F5 前置；扩大 Windows 支持前另行加固验收。
 
 ### F5：共享连接在线端点变更与密钥轮换
 
 依赖：F1/F2，稳定部署与统计归属。估算：6–10 工程人日。
 
-- 增加影响预览：引用规则、活动连接、节点、端口、候选版本、预期中断；CAS 冲突重读，禁止覆盖别人更改。
+首个切片为**只读影响预览与版本化迁移契约**：实际 `/links` 页面可预览端点/端口变更或密钥轮换，API 校验 Workspace、管理权限、期望版本与部署代次，返回全部引用（含暂停规则）、候选监听、现有持有端口、预期中断及状态 token。通过现有编译器检查候选，不创建版本/代次/密钥、不预留端口、不下发命令。活动 TCP/UDP 数没有可信实时来源时为未知；待暂停/删除或旧代次运行不能报成无影响。候选编号仅预测，预览 60 秒过期，超过 500 引用或 2048 现有占用明确拒绝，不截断引用集合。此切片没有迁移执行器，既有端点和密钥限制保持，完整 F5 尚未交付。证据见 [测试说明](testing.md#f5-影响预览首切片)。
+
+后续依次实现：持久化迁移状态机及提交 CAS → 候选代次/双端实际能力与端口预留 → 出口准备与新鲜事实验证 → 入口切换及明确 drain 窗口 → 旧路径退役与端口释放 → 每个故障点的补偿、重启恢复与精确统计归属。不得把预览 token 当作授权或已有 Ready；执行时必须重新验证策略、引用、能力、运行事实和占用。
+
+<a id="f5-next-slice"></a>
+
+#### 下一切片：持久迁移状态机与提交 CAS（待开发）
+
+先完成执行基础，不在此切片直接开放有引用维护：
+
+1. 冻结迁移记录、阶段与终态契约，保存不可变旧/候选配置、引用修订和统计归属；明确 LinkVersion/LinkDeployment 与迁移记录的职责，避免第二个 desired 写入源。
+2. 提交重新检查 Workspace、管理权限、功能开关、策略、双方新鲜能力、完整引用 CAS、运行基线及端口占用。拒绝过期/变更后的预览；token 不代替授权，也不分配版本或租约。
+3. 定义同 Link 并发维护/业务编辑的互斥规则、幂等重试和单调代次围栏。重复提交不能创建第二个迁移；迟到命令/ACK 不能推进新阶段或释放新所有者端口。
+4. 先验收事务回滚、并发冲突、重复提交、权限/策略漂移、Worker 重启及未知 runtime 的保守恢复。执行器接入前，页面保持 `execution.supported=false`，原端点/密钥门禁不放开。
+
+随后分别交付候选预留/出口准备、入口切换/排空、旧代退役/故障补偿，各切片均增加自身的真实 Linux gate；双代窗口、跨代统计授权和升级/回退格式必须先冻结再实现。
+
+- 已交付只读影响预览：引用规则、节点、端口、候选版本和预期中断；实时活动连接数保持未知，CAS 冲突重读，不覆盖别人更改。待执行器补齐才开放提交。
 - 为同一 Link 建立候选 carrier generation：预留新端口/密钥、准备出口授权、确认入口切换、关闭旧路径并回收。双代重叠时间有界，旧代不能继续无限接收。
 - 旧 TCP 会话在明确 drain 窗口内结束，UDP 按迁移策略重建。旧/新 producer 都有不可变身份和准确流量归属；已确认旧版本不替代新版本 Ready。
 - 处理出口准备失败、入口切换失败、失联、迟到 ACK、撤权和升级重启；补偿失败保留降级事实及占用，不能先释放旧端口。
@@ -199,11 +218,11 @@ TFO、出站地址/接口、协议阻断和特殊伪装按驱动的实际能力�
 | M3：连接维护与安全多跳 | F5 + F6a/F6b | 有引用连接可维护；固定加密多跳、固定多出口主备。 |
 | M4：更多组和载体 | F6c + 按需求选择 F7 | 多入口及预算分配、GOST/WireGuard 或特定驱动。 |
 
-优先队列：**F1 → F2 → F3 → F4 → F5 → F6a → F6b**。F0 与 F1 并行；F8 随每个阶段交付。F6c/F7 根据真实使用场景选择顺序，外围经营功能随后再排。
+当前开发队列：**F5 状态机/CAS → 候选准备 → 切换/排空 → 退役/补偿 → F6a → F6b**。F1/F2 首切片、F3 共享 TCP、F4 Linux both 已合并，不重复列为尚未开始；F0 发布验收、F1 真实跨日/归档、F3 原生来源扩展仍未完成。F8 随每个阶段交付；F6c/F7 按真实场景选择，Windows/缓存优化暂停，外围经营功能后置。
 
-关键路径是统计持久协议 → 长期运行验收 → 多目标产品闭环 → 新组合公开发布。F2 可提前开发，但不能绕过 F1 直接打开全量 FXP。可信来源协议设计可与 F2 并行；前端/API/Agent 在字段、版本、信任和回退约定确定后并行实现，每个共享编译入口保留单一负责人。
+开发关键路径是 F5 提交契约 → 候选出口 → 入口切换 → 旧代退役/补偿。公开发布另受长期计量、实际程序能力、真实 Panel 浏览器和跨版本验收约束；F5 CI 绿色不能绕过这些条件打开全量 FXP。前端/API/Agent 在字段、版本、信任和回退约定确定后并行实现，每个共享编译入口保留单一负责人。
 
-人日是工程工作量初估，含定向测试、真实网络验收和文档更新；假设现有 Linux Docker CI 可继续使用、无需框架迁移。M1 约 18–32 人日，不能直接折算为单人几天或多人的线性日历工期。复杂跨版本协议、容量问题或新依赖引入后，按切片重新估算；完整 ForwardX 功能对齐不属于 M1。
+各工作包人日是原始范围的工程工作量初估，**不是当前剩余工期**，含定向测试、真实网络验收和文档更新；假设现有 Linux Docker CI 可继续使用、无需框架迁移。M1 原始估算约 18–32 人日，不能直接折算为单人几天或多人的线性日历工期。复杂跨版本协议、容量问题或新依赖引入后，按剩余切片重新估算；完整 ForwardX 功能对齐不属于 M1。
 
 ## 6. 统一交付标准
 
@@ -219,10 +238,11 @@ TFO、出站地址/接口、协议阻断和特殊伪装按驱动的实际能力�
 | --- | --- | --- |
 | 维度、版本与组合 | [core-contract.ts](../backend/src/integrations/forwardx/core-contract.ts)、[link-compiler.ts](../backend/src/integrations/forwardx/link-compiler.ts) | `shared/forwardTypes.ts`、`server/tunnelRuntimePlan.ts` |
 | 共享编排 | [link-resource.ts](../backend/src/services/link-resource.ts)、[links.ts](../backend/src/routes/links.ts) | `server/routers/tunnels.ts`、`server/routers/rules.crud.ts` |
+| 维护预览契约 | [link-maintenance.ts](../backend/src/integrations/forwardx/link-maintenance.ts)、[预览表单](../web/src/components/links/link-maintenance-preview.tsx) | 参考连接修改的引用影响；TuneX CAS/租约/迁移一致性单独约束。 |
 | 运行与修改 | [linkrunner](../agent/internal/linkrunner/README.md)、[FXP 来源](../third_party/forwardx/README.md) | `forwardx-fxp/main.go`、`config_types.go`、`agent/actions.go` |
 | 统计与容量 | [managed_traffic.go](../third_party/forwardx/forwardx-fxp/managed_traffic.go)、[traffic_store.go](../agent/internal/linkrunner/traffic_store.go)、[link-traffic.ts](../backend/src/services/link-traffic.ts) | `forwardx-fxp/traffic.go`、`server/hostTrafficRuntimePlan.ts` |
 | 目标与来源 | [egress.go](../agent/internal/forwarder/egress.go)、[target-health.ts](../backend/src/services/target-health.ts) | `shared/exitStrategy.ts`、`server/routers/rules.crud.ts`、`server/routers/forwardGroups.ts` |
 | 路由与多载体 | [route-profile-compiler.ts](../backend/src/services/route-profile-compiler.ts) | `server/gostTunnelProtocol.ts`、`server/forwardXWireGuard.ts`、`agent/wireguard_runtime.go` |
 | 用户流程 | [Link 页面说明](../web/src/components/links/README.md) | `client/` 中的规则、连接和转发组页面 |
 
-F1 回收握手和 F2 UDP 探测/映射规则已冻结，见运行说明；数据库水位仍保留，归档策略另行确定。后续实施前冻结 F3 受信来源模型、F5 双代窗口、F6c 全局预算分配，不需要先重建整个产品。
+F1 回收握手、F2 UDP 探测/映射、F3 共享 TCP 受信来源和 F5 只读预览 v1 已冻结，见运行说明；数据库水位仍保留，归档策略另行确定。尚需冻结 F3 原生来源扩展、F5 提交/双代窗口/跨代统计、F6c 全局预算分配，不需要先重建整个产品。

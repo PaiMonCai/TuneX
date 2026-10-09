@@ -28,6 +28,7 @@ import {
   type ForwardProtocol,
   type ForwardTransport,
 } from "./forward-contract.ts";
+import type { Prisma } from "@prisma/client";
 
 /* ================================================================== */
 /* 形状                                                                */
@@ -256,9 +257,10 @@ export interface AdmissionTarget {
  * 建立连接。读失败按「无事实」处理（baseline 动作仍可下发），但**坏形状的库值
  * 不在此处吞掉**——`capabilityFactsFromStoredV2` 把它记成 flag，判定会 fail-closed。
  */
-export async function loadNodeCapabilityFacts(nodeId: number): Promise<AgentV2CapabilityFacts | null> {
-  const { db } = await import("../db.ts");
-  const row = await db.nodeStateReport.findUnique({
+export async function loadNodeCapabilityFacts(nodeId: number,
+  client?: Pick<Prisma.TransactionClient, "nodeStateReport">): Promise<AgentV2CapabilityFacts | null> {
+  const reader = client ?? (await import("../db.ts")).db;
+  const row = await reader.nodeStateReport.findUnique({
     where: { node_id: nodeId },
     select: {
       control_protocol_version: true,

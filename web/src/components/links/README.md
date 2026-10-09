@@ -14,7 +14,17 @@
 - A `policy_blocked` deployment keeps the resource's existing `degraded` status. The page explains that authorization or traffic policy prevents lease renewal, while removed/expired runtime observations remain independent. Policy recovery uses the server's newer deployment generation; it cannot inherit a previous generation's ready observation or applied rule revision. No additional public resource-status enum is introduced.
 - Errors after partial deployment re-read persisted desired state and close the editor so a create is not accidentally repeated. Machine codes are collapsed support details; keys, executable JSON and raw exception messages never enter product UI state.
 
-Saving or changing rules reapplies the carrier and may interrupt existing connections. This module makes no claim of lossless reload. The shared reload work requires separate measured acceptance before changing that copy.
+Managed rule reload rebuilds changed rules and may interrupt their connections. Real Linux acceptance preserves unchanged sibling TCP sessions and exact UDP target sockets across the measured rule changes; immutable carrier/endpoint/key changes remain potentially resource-wide interruptions. This module makes no blanket lossless-reload claim. Current scope and fixed-source evidence are maintained in [runtime boundaries](../../../../docs/forwarding-runtime.md) and [acceptance](../../../../docs/testing.md).
+
+## F5 read-only maintenance preview
+
+This slice belongs to draft/unmerged PR #76 on `feat/forward-link-maintenance`, not the merged PR #75 runtime baseline. The production component uses `POST /api/links/:id/maintenance/preview` through the existing session/CSRF/Workspace request layer. The closed request captures `expected_version`, `expected_generation`, and either complete `update_endpoints` config (`ingress_node_id`, `egress_node_id`, `carrier_port`) or `rotate_key` with no client-supplied key.
+
+The preview includes all references (including suspended rules), current/candidate listeners, held/candidate ports, interruption warnings and a state-bound token. Current TCP connections/UDP mappings remain unknown, not cumulative traffic totals. Candidate numbers are predictions: `reserved=false`, `availability=not_checked`; `execution.supported=false`. There is no execute button, version/credential write, command dispatch or port reservation. Existing endpoint and key-rotation restrictions remain intact.
+
+The strict projection rejects malformed scope, dates, reference/port bounds and invented runtime counts, and does not retain key/ciphertext/runner/target configuration. A preview expires after 60 seconds. Input, read, mutation, permission, resource or Workspace changes fence outstanding results; read-only preview does not use the persisted-write success/reload lifecycle. The 15-second detail polling invalidates results while preserving draft operation and input via `invalidationEpoch`, not a keyed form remount. Complete graphs are limited to 500 references / 2048 held ports, never a silently truncated impact report.
+
+Actual migration, bounded dual generations, egress prepare/verify, ingress cutover, drain/retirement, failure recovery and cross-generation accounting are future executor work. See [the next slice](../../../../docs/DEVELOPMENT_PLAN.md#f5-next-slice).
 
 ## Forward traffic snapshots
 
@@ -63,7 +73,7 @@ From `web/`:
 
 ```powershell
 $env:NEXT_PUBLIC_API_MOCK = "0"
-bun test src/components/links/__tests__/links-api.test.ts src/components/links/__tests__/links-ui.test.tsx src/components/links/__tests__/links-targets.test.tsx src/components/links/__tests__/links-client-source.test.tsx src/components/console/__tests__/console-boundary.test.ts
+bun test src/components/links/__tests__ src/components/console/__tests__/console-boundary.test.ts
 npm run typecheck -- --incremental false
 ```
 
@@ -92,6 +102,16 @@ Start from a freshly loaded Chinese fixture with management permission. The runn
 Additional target freshness scenarios are `old_checked`, `future_checked` and `initial_unknown`. `probe_none_silent` supplies unknown state without response evidence; `probe_none` supplies healthy passive reply evidence with no active probing. The replay advances only the isolated page clock to test cached health expiry, including passive none health, without a minute-long wait; it restores the clock afterward.
 
 The backend feature defaults off. `fxp_links_not_enabled` is shown as a failed operation, with no success notification. Enabling the server feature and final real multi-node validation belong to the backend/runtime rollout.
+
+F5 browser checks also use this isolated loopback harness. Reset fixture state before page initialization, start with a fresh Chinese management page, then run each replay from a fresh reset/reload:
+
+```js
+await (await import('/__test/f5-checks.js')).runF5BrowserChecks()
+// Separately, from a fresh reset/reload; waits for actual 15-second polling:
+await (await import('/__test/f5-checks.js')).runF5PollingDraftChecks()
+```
+
+The source-candidate replay results were 45/45 flow checks and 5/5 polling-draft checks; F2 44/44 and F3 39/39 also passed. These are production-component/HTTP-fixture browser interactions, not actual Panel/Agent E2E. Fixed-source evidence and limitations are in [F5 verification evidence](./__tests__/EVIDENCE.md#f5-preview).
 
 F3 browser checks reuse the loopback fixture. Reset disposable fixture state **before loading/reloading the page**, then start with the fresh Chinese management harness and run:
 
