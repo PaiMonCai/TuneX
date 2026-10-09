@@ -1,6 +1,6 @@
 # 当前转发能力与运行边界
 
-更新：2026-10-09。[PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 已合入 `main`（`ef159eb`），尚不代表正式发布。F5 分支 `feat/forward-link-maintenance` 增加只读影响预览，不放开在线迁移。后续范围统一维护在 [开发方案](DEVELOPMENT_PLAN.md)。
+更新：2026-10-10。运行基线为 [PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 已合并的 `main`（`ef159eb`），尚不代表正式发布。下述 F5 预览仅在 `feat/forward-link-maintenance` 的未合并草稿 [PR #76](https://github.com/PaiMonCai/TuneX/pull/76)；源码 `cdb8470` 已通过自身 CI，不放开在线迁移。具体证据见 [测试说明](testing.md)，后续范围统一维护在 [开发方案](DEVELOPMENT_PLAN.md)。
 
 ## 资源与部署
 
@@ -12,10 +12,11 @@
 
 | 路径 | 当前支持 | 边界 |
 | --- | --- | --- |
-| 原生普通 Forward | TCP、UDP；TCP 客户端 TLS/WS 前端；DIRECT/RELAY；原生 both 限定候选已验收 | both 默认关闭、首版仅 plain DIRECT/自有单跳 RELAY，需实际能力准入。Linux 候选证据见测试说明，不代表 Windows 全量或生产发布。客户端 TLS/WS 不表示节点间 hop 已加密，legacy native hop 仅按私网/可信网络边界使用。 |
+| 原生普通 Forward | TCP、UDP；TCP 客户端 TLS/WS 前端；DIRECT/RELAY；原生 both 限定组合已合并 | both 默认关闭、首版仅 plain DIRECT/自有单跳 RELAY，需实际能力准入。Linux 证据见测试说明，不代表 Windows 全量或生产发布。客户端 TLS/WS 不表示节点间 hop 已加密，legacy native hop 仅按私网/可信网络边界使用。 |
 | 托管共享 FXP | 固定双节点、加密 TCP/UDP/both、规则复用、每规则有序多目标 | 实验开关默认关闭，公共矩阵 planned；多目标需要双方实际能力，尚无共享安全多跳/多出口。 |
 | 原生目标池 | fallback、RR/random/weighted 选择及健康恢复 | 仅适用已有出口池路径，DIRECT 业务 API 仍为单目标；不能推广到 FXP。 |
-| IP_HASH / PROXY | 共享 FXP TCP 来源切片 `47594c4` 已通过自身候选验收 | 须显式 `client_source` 及双方真实能力；UDP/both 拒绝。原生 RELAY 来源门禁不变。 |
+| IP_HASH / PROXY | 共享 FXP TCP 来源首切片已验收并合入 main | 须显式 `client_source` 及双方真实能力；UDP/both 拒绝。原生 RELAY 来源门禁不变。 |
+| 共享连接维护预览 | F5 开发分支只读预览端点/端口变更或轮换密钥的影响 | 未合并；不分配版本/密钥/端口、不执行迁移，既有端点/密钥门禁保持。 |
 
 支持维度以 [core-contract.ts](../backend/src/integrations/forwardx/core-contract.ts) 为准；实验 Link 编译和节点准入见 [link-compiler.ts](../backend/src/integrations/forwardx/link-compiler.ts)。枚举中存在 GOST/WireGuard/更多驱动的名称不代表运行支持。
 
@@ -49,9 +50,26 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 `POST /api/links/:id/maintenance/preview` 使用既有认证、CSRF、Workspace `node:manage` 权限和 FXP 功能开关，响应 `Cache-Control: no-store`。请求为闭合的 `expected_version`、`expected_generation`、`change`：`update_endpoints` 携带完整三字段端点配置，或 `rotate_key`，不接收密钥。版本/代次不匹配返回 409，跨 Workspace 资源不可见。候选节点角色、Workspace、运行能力、目标/来源组合及策略复用原有检查与编译器。
 
+请求示例（版本/代次取当前详情；下列编号只示范结构）：
+
+```json
+{
+  "expected_version": 1,
+  "expected_generation": 2,
+  "change": {
+    "type": "update_endpoints",
+    "config": { "ingress_node_id": 11, "egress_node_id": 12, "carrier_port": 22081 }
+  }
+}
+```
+
+密钥轮换预览仅替换 `change` 为 `{ "type": "rotate_key" }`。并发修改分别返回 `link_version_conflict` 或 `link_generation_conflict`；完整图超限返回 `link_maintenance_preview_too_large`，不返回截断结果。候选能力读取使用同一事务内 reader，避免锁下额外申请数据库连接；当前运行基线同时检查完整已部署绑定与解析后的有效策略上限，不能只比较修订号。
+
 预览捕获 Link 锁下的一致引用/配置/部署/占用快照，`schema_version=1`；含期望启用/暂停规则与修订、当前/候选监听、持有/候选端口、节点运行状态、TCP reconnect/drain 和 UDP 重建需求。运行 Ready 还要求已部署绑定修订与当前期望集合完全一致，沿用认证报告的 node/Workspace/Link/runtime、代次/digest、新鲜度与有效租约守卫；暂停/删除尚未生效以及部分部署失败时按可能仍有旧连接保守提示。累计流量连接数与限制不是实时连接数：`tcp_connections`、`udp_mappings` 为 null。
 
 `snapshot.state_token` 绑定租户、身份、期望/部署状态、全部引用修订、持有占用和请求变更；不是凭证或执行许可。预览 60 秒过期，页面输入变化、资源/Workspace 切换、重读、写入或状态失效后重新生成。候选版本/代次只是预测；`ports.reserved=false`、`availability=not_checked`，不承诺 OS 或数据库端口空闲。最多完整预览 500 引用、2048 持有端口，超过时拒绝，不能略过暂停规则。
+
+预览请求是独立只读流程，不触发保存成功通知或持久写入刷新。页面 15 秒轮询会使已有结果失效，但保留正在编辑的端点与操作草稿；使用失效 epoch 拒绝旧请求/结果，不通过重挂载表单丢弃输入。公开投影不含密钥、密文、runner JSON 或原始目标配置。
 
 `execution.supported=false`。计划顺序是预留候选 → 准备/验证出口 → 切换/验证入口 → 旧连接排空 → 确认退役 → 释放旧端口；本切片**不执行这些步骤**，不生成/解封真实密钥，不写版本/部署/租约，不启动/重启进程。当前端点编辑与密钥轮换门禁继续生效。后续执行器必须重新检查授权、策略、能力、引用 CAS、租约和所有权，加入持久迁移状态、故障补偿及不可变统计归属后再开放有引用维护。
 
@@ -59,11 +77,11 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 原生与 FXP 下发双向 bytes/sec、总并发、每来源 IP 并发，当前作用域为每规则、每入口 runtime。both 的 TCP/UDP 共享规则预算；UDP 并发是活跃映射。FXP 字段 maxIPs 表示每来源并发，不表示不同 IP 个数。
 
-原生 both 候选使用一个 ID/修订，创建或切入须服务端 `FORWARD_NATIVE_BOTH_ENABLED=true`、参与节点新鲜 `forward.protocol.both.native.v1`，并同时满足 TCP、UDP 权限。发现接口为已认证的 `/api/forwards/capabilities`；关闭开关不降级既有协议、不撤销合法恢复。中间跳/联邦/TLS/WS/来源组合拒绝；来源扩展没有借 F4 打开。原生 hop 仍不是加密载体。
+原生 both 使用一个 ID/修订，创建或切入须服务端 `FORWARD_NATIVE_BOTH_ENABLED=true`、参与节点新鲜 `forward.protocol.both.native.v1`，并同时满足 TCP、UDP 权限。发现接口为已认证的 `/api/forwards/capabilities`；关闭开关不降级既有协议、不撤销合法恢复。中间跳/联邦/TLS/WS/来源组合拒绝；来源扩展没有借 F4 打开。原生 hop 仍不是加密载体。
 
 原生 both 两监听完成绑定才准入，任一失败清理另一侧，不能半 Ready；同号替换需重建时会中断受影响规则，两协议目标同步更新。补偿仅重建仍获授权的旧修订，保持有效续租，绝不回滚已观察的所有权 epoch。运行流量是 TCP+UDP payload 聚合；连接数为 TCP，映射/包/丢弃为 UDP。现有出口目标账本以 TCP 拨号为证据，不能把它当成 UDP 应用健康。
 
-源码 `dd10856` 的 [Linux 候选验收](https://github.com/PaiMonCai/TuneX/actions/runs/37870458038) 为原生 37 PASS / 0 FAIL、共享 73 PASS / 0 FAIL，required 全绿；包括失败补偿后的两协议恢复、正常 retry 和删除后立即同号复用。详细证据与尚未完成的发布/平台条件见 [测试说明](testing.md#f4-本轮收尾证据)。
+已合并 Linux 基线验证了失败补偿后的两协议恢复、正常 retry 和删除后立即同号复用。固定源码/CI 与尚未完成的发布及平台条件见 [测试说明](testing.md#f4-本轮收尾证据)；Windows 适配按用户指示暂停，保留现有恢复缓存，不新增无性能证据的优化。
 
 同号重建时，Agent 的运行配置和 `used_ports` 数字汇总是同一监听的两类事实，不是两个端口持有者。数字汇总只有在真实协议、入口/出口方向和同 owner 的 active 持久租约匹配，且租约覆盖实际监听作用域时才能解释为本隧道占用；单独 runtime ID 或数据库行不够。未指定产品监听 IP 的 wildcard 租约可覆盖 Agent 配置的数据网 IP，具体 IP 租约不能覆盖 wildcard 或另一 IP。未知协议、其他持有者和显式无 owner/关闭中占用仍阻断申请，不通过删租约或忽略实际占用解决自冲突。
 

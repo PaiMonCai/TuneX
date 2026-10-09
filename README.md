@@ -23,6 +23,15 @@ TuneX 由 Panel 与 Agent 组成。Panel 提供 Web 管理、策略编排和状�
 
 文档入口：[当前文档](docs/README.md) · [转发核心开发方案](docs/DEVELOPMENT_PLAN.md) · [生产部署](docs/production-deploy.md)。共享 FXP 及各路径的支持范围见 [转发运行边界](docs/forwarding-runtime.md)，候选分支能力不等于已正式发布。
 
+### 核心开发状态（2026-10-10）
+
+- 已合并：PR #75 / `main` 基线 `ef159eb`，包含共享 FXP 统计分段、多目标、共享 TCP PROXY/IP_HASH 首切片，以及 Linux plain DIRECT/自有单跳 RELAY 的原生 TCP+UDP both。
+- 开发中：草稿 PR #76 / `feat/forward-link-maintenance`，F5 只读维护预览源码 `cdb8470` 已验收；有引用的在线端点变更/密钥轮换执行器尚未完成。
+- FXP 与原生 both 的开关仍默认关闭；本轮没有生产发布。真实 Panel 浏览器、长期运行等发布条件见 [验收说明](docs/testing.md)，不能由 CI 绿色替代。
+- 优先完善转发核心；支付后置、Windows 适配暂停。保留既有 Agent 恢复缓存，没有明显性能收益时不新增缓存优化。
+
+上方能力列表是模块概览，不是所有协议/拓扑/驱动组合的可用承诺；当前维护状态以 [文档入口](docs/README.md) 和运行支持范围为准。
+
 ## 快速部署
 
 需要 Docker 与 Docker Compose v2。
