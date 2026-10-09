@@ -17,12 +17,13 @@ import { normalizeBindScope } from "../integrations/forwardx/bind-scope.ts";
 import { checkAgentVersion } from "../integrations/forwardx/agent-version.ts";
 import { LinkTargetSetSchema, persistedLinkTargetSet, targetSetMatchesFirst } from "../integrations/forwardx/target-set.ts";
 import { LinkClientSourceSchema, persistedLinkClientSource, validateLinkClientSourceBinding } from "../integrations/forwardx/client-source.ts";
+import { buildLinkMaintenancePreview, LinkEndpointConfigSchema, LinkMaintenancePreviewSchema,
+  LINK_MAINTENANCE_REFERENCE_LIMIT, LINK_MAINTENANCE_PORT_LIMIT,
+  type MaintenanceForward, type MaintenancePort } from "../integrations/forwardx/link-maintenance.ts";
 
 const id = z.number().int().positive().max(2_147_483_647);
 const port = id.max(65_535);
-export const LinkConfigSchema = z.object({
-  ingress_node_id: id, egress_node_id: id, carrier_port: port,
-}).strict().refine((v) => v.ingress_node_id !== v.egress_node_id, "point_to_point_requires_distinct_nodes");
+export const LinkConfigSchema = LinkEndpointConfigSchema;
 export const LinkCreateSchema = z.object({
   name: z.string().trim().min(1).max(255), config: LinkConfigSchema,
 }).strict();
@@ -72,8 +73,9 @@ async function lockLink(tx: Prisma.TransactionClient, workspaceId: number, linkI
   if (link.status === "retiring") throw new LinkResourceError("link_retiring");
   return link;
 }
-async function endpoints(workspaceId: number, config: LinkConfig) {
-  const nodes = await db.node.findMany({ where: { id: { in: [config.ingress_node_id, config.egress_node_id] },
+async function endpoints(workspaceId: number, config: LinkConfig,
+  client: Pick<Prisma.TransactionClient, "node" | "nodeStateReport"> = db, requireCurrent = false) {
+  const nodes = await client.node.findMany({ where: { id: { in: [config.ingress_node_id, config.egress_node_id] },
     node_group: { workspace_id: workspaceId } }, include: { node_group: true,
       state_report: { select: { version: true } } } });
   const ingress = nodes.find((n) => n.id === config.ingress_node_id);
@@ -84,7 +86,9 @@ async function endpoints(workspaceId: number, config: LinkConfig) {
   for (const node of nodes) {
     if (node.lifecycle !== "active") throw new LinkResourceError("link_node_unavailable");
   }
-  const [inFacts, outFacts] = await Promise.all([loadNodeCapabilityFacts(ingress.id), loadNodeCapabilityFacts(egress.id)]);
+  const [inFacts, outFacts] = await Promise.all([loadNodeCapabilityFacts(ingress.id, client), loadNodeCapabilityFacts(egress.id, client)]);
+  if (requireCurrent && (!inFacts?.advertisementCurrent || !outFacts?.advertisementCurrent))
+    throw new LinkResourceError("agent_fxp_capability_stale");
   const fact = (node: typeof ingress, capabilities: string[] | null | undefined) => {
     // Node.version is a historical display field (new rows default to unknown).
     // Authenticated heartbeats write NodeStateReport.version, not Node.version.
@@ -187,6 +191,78 @@ export async function updateLink(workspaceId: number, linkId: number, expectedVe
     const version = expectedVersion + 1;
     await tx.linkVersion.create({ data: { link_id: linkId, version, config, config_digest: canonicalConfigDigest(config) } });
     return tx.linkResource.update({ where: { id: linkId }, data: { desired_version: version } });
+  });
+}
+
+/** Coherent, secret-free dry run. Does not allocate a revision, port, credential or process. */
+export async function previewLinkMaintenance(workspaceId: number, linkId: number, raw: unknown) {
+  assertLinkFeature();
+  const input = LinkMaintenancePreviewSchema.parse(raw);
+  return db.$transaction(async (tx) => {
+    // Every Link binding/config writer already takes this lock. Include inactive
+    // references, so suspended rules cannot disappear from a later migration.
+    const link = await lockLink(tx, workspaceId, linkId);
+    if (link.desired_version !== input.expected_version) throw new LinkResourceError("link_version_conflict");
+    if (link.generation !== input.expected_generation) throw new LinkResourceError("link_generation_conflict");
+    const version = await tx.linkVersion.findUniqueOrThrow({ where: {
+      link_id_version: { link_id: linkId, version: link.desired_version } } });
+    const config = LinkConfigSchema.parse(version.config);
+    const candidate = input.change.type === "update_endpoints" ? input.change.config : config;
+    const nodes = await endpoints(workspaceId, candidate, tx, true);
+    const rows = await tx.tunnel.findMany({ where: { workspace_id: workspaceId, link_resource_id: linkId },
+      orderBy: { id: "asc" }, take: LINK_MAINTENANCE_REFERENCE_LIMIT + 1 });
+    if (rows.length > LINK_MAINTENANCE_REFERENCE_LIMIT) throw new LinkResourceError("link_maintenance_preview_too_large");
+    const policy = await getEffectivePolicy(workspaceId, { client: tx, noCache: true });
+    const trafficUsed = await sumWorkspaceTraffic(workspaceId, policy.limits.traffic_period, new Date(), tx);
+    const active = rows.filter((row) => row.desired_status === "active");
+    for (const row of active) for (const protocol of row.forward_protocol === "both" ? ["tcp", "udp"] : [row.forward_protocol ?? ""]) {
+      const decision = checkTunnelUse(policy, { trafficUsed, protocol, inGroupOwned: true, outGroupOwned: true,
+        inGroupId: nodes.ingress.node_group_id, outGroupId: nodes.egress.node_group_id });
+      if (!decision.allowed) throw new LinkResourceError(decision.reason ?? "policy_denied", 403);
+    }
+    const now = new Date();
+    const spec = { link_id: linkId, workspace_id: workspaceId,
+      version: link.desired_version + (input.change.type === "update_endpoints" && canonicalConfigDigest(candidate) !== canonicalConfigDigest(config) ? 1 : 0),
+      generation: link.generation + 1, ingress: nodes.inFact, egress: nodes.outFact,
+      carrier_port: candidate.carrier_port, lease_expires_at: new Date(now.getTime() + LEASE_MS).toISOString(),
+      bindings: active.map((r) => ({ forward_id: r.id, protocol: r.forward_protocol as "tcp" | "udp" | "both",
+        listen_port: r.listen_port!, listen_host: (r.listen_ip === "127.0.0.1" || r.listen_ip === "::1" ? r.listen_ip : "") as "" | "127.0.0.1" | "::1",
+        target_host: r.remote_host!, target_port: r.remote_port!,
+        ...(r.link_target_config == null ? {} : { target_set: persistedLinkTargetSet(r.link_target_config) }),
+        ...(r.link_source_config == null ? {} : { client_source: persistedLinkClientSource(r.link_source_config) }),
+        ...resolveForwardPolicy(r, policy.limits) })) };
+    let compiled;
+    try { compiled = compileFxpLink(spec, "00".repeat(32)); }
+    catch (error) { throw new LinkResourceError(error instanceof Error && /^[a-z_]{1,64}$/.test(error.message)
+      ? error.message : "link_binding_invalid"); }
+    const deployment = await tx.linkDeployment.findUnique({ where: {
+      link_id_generation: { link_id: linkId, generation: link.generation } }, include: { placements: true } });
+    const reports = deployment ? await tx.nodeStateReport.findMany({ where: {
+      node_id: { in: deployment.placements.map((p) => p.node_id) } },
+      select: { node_id: true, reported_at: true, link_placements: true } }) : [];
+    const leases = await tx.nodePortLease.findMany({ where: { link_id: linkId, status: "active" },
+      orderBy: { id: "asc" }, take: LINK_MAINTENANCE_PORT_LIMIT + 1 });
+    if (leases.length > LINK_MAINTENANCE_PORT_LIMIT) throw new LinkResourceError("link_maintenance_preview_too_large");
+    const deployedSnapshot = deployment ? DeploymentSnapshotSchema.parse(deployment.binding_snapshot) : null;
+    const ports: MaintenancePort[] = [compiled.egress, compiled.ingress].flatMap((p) => p.ports.map((slot) => ({
+      node_id: p.node_id, role: p.role, protocol: slot.protocol, bind_scope: normalizeBindScope(slot.host), port: slot.port,
+    })));
+    return buildLinkMaintenancePreview({
+      link, config, forwards: rows.map((r): MaintenanceForward => ({ id: r.id, name: r.name,
+        forward_protocol: r.forward_protocol as MaintenanceForward["forward_protocol"],
+        desired_status: r.desired_status as MaintenanceForward["desired_status"], config_revision: r.config_revision ?? 0,
+        ingress_node_id: r.ingress_node_id!, listen_ip: r.listen_ip ?? "", listen_port: r.listen_port! })),
+      held_ports: leases.map((p) => ({ id: p.id, node_id: p.node_id, role: p.lease_type,
+        protocol: p.protocol, bind_scope: p.bind_scope, port: p.port })),
+      deployment: deployment ? { id: deployment.id, version: deployment.version, generation: deployment.generation,
+        status: deployment.status, lease_expires_at: deployment.lease_expires_at.toISOString(),
+        bindings_current: deploymentBindingsMatch(deployedSnapshot!, spec.bindings,
+          active.map((r) => ({ id: r.id, revision: r.config_revision ?? 0 }))),
+        bindings: deployedSnapshot!.spec.bindings.map((b) => ({ forward_id: b.forward_id, protocol: b.protocol,
+          revision: deployedSnapshot!.revisions.find((r) => r.id === b.forward_id)?.revision ?? -1 })),
+        placements: deployment.placements.map((p) => ({ ...p, observation: linkObservation(p, workspaceId, linkId,
+          reports.find((report) => report.node_id === p.node_id) ?? null, now) })) } : null,
+    }, input, ports, now);
   });
 }
 
@@ -552,9 +628,14 @@ async function deploymentIsCurrent(link: Awaited<ReturnType<typeof scopedLink>>,
       ...(row.link_source_config == null ? {} : { client_source: persistedLinkClientSource(row.link_source_config) }),
     ...resolveForwardPolicy(row, policy.limits) }));
   return latest.desired_version === deployment.version &&
-    canonicalConfigDigest(bindings) === canonicalConfigDigest(snapshot.spec.bindings) &&
-    canonicalConfigDigest(rows.map((row) => ({ id: row.id, revision: row.config_revision ?? 0 }))) ===
-      canonicalConfigDigest(snapshot.revisions);
+    deploymentBindingsMatch(snapshot, bindings, rows.map((row) => ({ id: row.id, revision: row.config_revision ?? 0 })));
+}
+
+/** Shared pure fence: includes complete targets/source policy and effective hard ceilings. */
+function deploymentBindingsMatch(snapshot: z.infer<typeof DeploymentSnapshotSchema>, bindings: unknown,
+  revisions: { id: number; revision: number }[]): boolean {
+  return canonicalConfigDigest(bindings) === canonicalConfigDigest(snapshot.spec.bindings) &&
+    canonicalConfigDigest(revisions) === canonicalConfigDigest(snapshot.revisions);
 }
 
 /** Startup/reconnect and periodic renewal use the same immutable merge compiler. */

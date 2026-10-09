@@ -1,6 +1,7 @@
 import { ApiError, request } from "@/lib/api/core";
 import { projectLinkDetail, projectLinkList, projectLinkResource, type LinkBindingInput,
   type LinkConfig, type LinkCreateInput, type LinkForwardAction, LinksPayloadError } from "./links-types";
+import { projectLinkMaintenanceInput, projectLinkMaintenancePreview, type LinkMaintenancePreviewInput } from "./link-maintenance-types";
 
 function matchingId<T extends { id: number }>(value: T, expectedId: number): T {
   if (value.id !== expectedId) throw new LinksPayloadError();
@@ -11,6 +12,13 @@ function matchingId<T extends { id: number }>(value: T, expectedId: number): T {
 export const linksApi = {
   list: async (workspaceId: number) => projectLinkList(await request<unknown>("/links", { workspaceId }), workspaceId),
   detail: async (workspaceId: number, id: number) => matchingId(projectLinkDetail(await request<unknown>(`/links/${id}`, { workspaceId }), workspaceId), id),
+  previewMaintenance: async (workspaceId: number, id: number, raw: LinkMaintenancePreviewInput) => {
+    if (![workspaceId, id].every((v) => Number.isSafeInteger(v) && v > 0 && v <= 2_147_483_647)) throw new LinksPayloadError();
+    const input = projectLinkMaintenanceInput(raw);
+    return projectLinkMaintenancePreview(await request<unknown>(`/links/${id}/maintenance/preview`, {
+      method: "POST", workspaceId, body: input, cache: "no-store",
+    }), workspaceId, id, input);
+  },
   create: async (workspaceId: number, input: LinkCreateInput) => projectLinkResource(
     await request<unknown>("/links", { method: "POST", workspaceId, body: input }), workspaceId),
   updateConfig: async (workspaceId: number, id: number, expected_version: number, config: LinkConfig) => matchingId(projectLinkResource(
@@ -45,6 +53,6 @@ export function linkErrorInfo(error: unknown): LinkErrorInfo {
   const raw = data?.code ?? (error && typeof error === "object" && "code" in error ? error.code : null);
   const code = typeof raw === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(raw) ? raw
     : error instanceof ApiError && error.status === 403 ? "permission_denied" : "link_request_failed";
-  return { code, conflict: code === "revision_conflict" || code === "link_version_conflict",
+  return { code, conflict: ["revision_conflict", "link_version_conflict", "link_generation_conflict"].includes(code),
     disabled: code === "fxp_links_not_enabled", denied: error instanceof ApiError && [401, 403].includes(error.status) };
 }

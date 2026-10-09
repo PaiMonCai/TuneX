@@ -1,7 +1,9 @@
 /** Browser-only contract fixture. No database, no Agent or production credentials. */
 import { resolve } from "node:path";
 import { projectLinkClientSource, projectLinkTargetSet, type LinkBindingInput, type LinkDetail } from "@/lib/links-types";
-import { link, statistics, targetLink } from "./links-fixtures";
+import { forward, link, statistics, targetLink } from "./links-fixtures";
+import { maintenancePreview } from "./maintenance-fixtures";
+import { projectLinkMaintenanceInput } from "@/lib/link-maintenance-types";
 
 const bundle = await Bun.build({ entrypoints: [resolve(import.meta.dir, "browser-entry.tsx")], target: "browser",
   define: { "process.env.NEXT_PUBLIC_API_MOCK": '"0"', "process.env.SERVER_API_BASE": '""', "process.env.NODE_ENV": '"development"' } });
@@ -14,6 +16,10 @@ let partial = false;
 let delay = false;
 let targetsCapabilityMissing = false;
 let sourceError: string | null = null;
+let previewError: string | null = null;
+let previewDelay = false;
+let previewLifetime = 60_000;
+let previewTamper: "workspace" | "live" | "secret" | null = null;
 const calls: { path: string; method: string; workspaceId: number; body: unknown }[] = [];
 const response = (data: unknown, status = 200) => Response.json({ data }, { status });
 const failure = (code: string, status = 409) => Response.json({ code, error: code }, { status });
@@ -26,16 +32,29 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
   if (path === "/bundle.js") return new Response(js, { headers: { "Content-Type": "text/javascript" } });
   if (path === "/__test/f2-checks.js") return new Response(Bun.file(resolve(import.meta.dir, "browser-targets-checks.js")), { headers: { "Content-Type": "text/javascript" } });
   if (path === "/__test/f3-checks.js") return new Response(Bun.file(resolve(import.meta.dir, "browser-client-source-checks.js")), { headers: { "Content-Type": "text/javascript" } });
+  if (path === "/__test/f5-checks.js") return new Response(Bun.file(resolve(import.meta.dir, "browser-maintenance-checks.js")), { headers: { "Content-Type": "text/javascript" } });
   if (path === "/favicon.ico") return new Response(null, { status: 204 });
   if (path === "/__test/state") return response({ links, calls });
   if (path === "/__test/scenario") {
     const input = await req.json() as { enabled?: boolean; conflict?: boolean; partial?: boolean; delay?: boolean; reset?: boolean; targetsCapabilityMissing?: boolean; sourceError?: "link_client_source_required" | "agent_fxp_source_capability_missing" | "client_source_tcp_only" | "ip_hash_requires_client_source";
+      maintenance?: boolean; maintenanceSecond?: boolean; previewError?: string; previewDelay?: boolean; previewLifetime?: number; previewTamper?: "workspace" | "live" | "secret";
+      advance?: "version" | "generation" | "revision" | "remove";
       targetObservation?: "healthy" | "all_unavailable" | "stale" | "digest_mismatch" | "expired" | "missing" | "ingress_only" | "not_ready" | "probe_none" | "probe_none_silent" | "legacy" | "old_checked" | "future_checked" | "initial_unknown";
       statistics?: "idle" | "collecting" | "backlogged" | "blocked" | "unknown" };
     enabled = input.enabled ?? true; conflict = input.conflict ?? false; partial = input.partial ?? false; delay = input.delay ?? false;
     targetsCapabilityMissing = input.targetsCapabilityMissing ?? false;
     sourceError = input.sourceError ?? null;
+    previewError = input.previewError ?? null; previewDelay = input.previewDelay ?? false;
+    previewLifetime = input.previewLifetime ?? 60_000; previewTamper = input.previewTamper ?? null;
     if (input.reset) { links = []; calls.length = 0; }
+    if (input.maintenance) links = [link({ forwards: [forward(), forward({ id: 8, name: "Desired suspended UDP", desired_status: "inactive", forward_protocol: "udp" })], ref_count: 2 })];
+    if (input.maintenanceSecond) links.push(link({ id: 4, name: "Second maintenance scope" }));
+    if (input.advance) for (const row of links) {
+      if (input.advance === "version") row.desired_version++;
+      if (input.advance === "generation") row.generation++;
+      if (input.advance === "revision") row.forwards[0].config_revision++;
+      if (input.advance === "remove") { row.forwards.pop(); row.ref_count = row.forwards.length; }
+    }
     if (input.targetObservation) {
       if (!links.length) links.push(targetLink());
       for (const row of links) {
@@ -96,6 +115,21 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
   if (!row) return failure("link_not_found", 404);
   const suffix = match![2];
   if (!suffix && req.method === "GET") return response(row);
+  if (suffix === "/maintenance/preview" && req.method === "POST") {
+    const captured = { error: previewError, tamper: previewTamper, delay: previewDelay };
+    let input;
+    try { input = projectLinkMaintenanceInput(body); } catch { return failure("invalid_input", 400); }
+    if (input.expected_version !== row.desired_version) return failure("link_version_conflict");
+    if (input.expected_generation !== row.generation) return failure("link_generation_conflict");
+    const result = maintenancePreview(row, input);
+    result.expires_at = new Date(Date.parse(result.created_at) + previewLifetime).toISOString();
+    if (captured.tamper === "workspace") result.workspace_id = 6;
+    if (captured.tamper === "live") Object.assign(result.runtime, { tcp_connections: 0 });
+    if (captured.tamper === "secret") Object.assign(result, { runner_config: { key: "NEVER_RENDER_THIS_SECRET" } });
+    if (captured.delay) await Bun.sleep(1200);
+    if (captured.error) return failure(captured.error, captured.error === "permission_denied" ? 403 : 409);
+    return response(result);
+  }
   if (!suffix && req.method === "DELETE") { if (row.forwards.length) return failure("link_has_references"); row.status = "retired"; return response({ id: row.id, status: "retired" }); }
   if (suffix === "/config") {
     const input = body as { expected_version: number; config: LinkDetail["config"] };

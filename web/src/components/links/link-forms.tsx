@@ -76,16 +76,17 @@ export function parseLinkBindingForm(data: FormData, fixedProtocol?: LinkBinding
 function Field({ label, id, children }: { label: string; id: string; children: ReactNode }) {
   return <div className="grid gap-2"><Label htmlFor={id}>{label}</Label>{children}</div>;
 }
-function FormFooter({ copy, busy, onCancel }: { copy: LinksCopy; busy: boolean; onCancel: () => void }) {
+function FormFooter({ copy, busy, onCancel, submitLabel = copy.save }: { copy: LinksCopy; busy: boolean; onCancel: () => void; submitLabel?: string }) {
   return <div className="flex flex-wrap justify-end gap-2">
     <Button type="button" variant="outline" onClick={onCancel} disabled={busy}>{copy.cancel}</Button>
-    <Button type="submit" disabled={busy}>{busy ? copy.working : copy.save}</Button>
+    <Button type="submit" disabled={busy}>{busy ? copy.working : submitLabel}</Button>
   </div>;
 }
 
-export function LinkConfigForm({ copy, nodes, nodesError, initial, busy, onCancel, onSubmit }: {
+export function LinkConfigForm({ copy, nodes, nodesError, initial, busy, onCancel, onSubmit, submitLabel, ariaLabel, onInputChange }: {
   copy: LinksCopy; nodes: UserNode[]; nodesError: boolean; initial?: LinkConfig;
   busy: boolean; onCancel: () => void; onSubmit: (input: LinkCreateInput) => Promise<void>;
+  submitLabel?: string; ariaLabel?: string; onInputChange?: () => void;
 }) {
   const prefix = useId();
   const [invalid, setInvalid] = useState(false);
@@ -109,13 +110,13 @@ export function LinkConfigForm({ copy, nodes, nodesError, initial, busy, onCance
       {rows.map((node) => <option key={node.id} value={node.id}>{node.node_id}{node.connect_ip ? ` · ${node.connect_ip}` : ""}</option>)}
     </select>
   </Field>;
-  return <form onSubmit={(e) => void submit(e)} className="space-y-4" aria-label={initial ? copy.edit : copy.create}>
+  return <form onSubmit={(e) => void submit(e)} onChange={onInputChange} className="space-y-4" aria-label={ariaLabel ?? (initial ? copy.edit : copy.create)}>
     <fieldset className="space-y-4" disabled={busy || nodesError || !ingress.length || !egress.length}>
       {!initial && <Field id={`${prefix}-name`} label={copy.name}><Input id={`${prefix}-name`} name="name" required maxLength={255} /></Field>}
       <div className="grid gap-4 sm:grid-cols-2">{nodeSelect("ingress", ingress)}{nodeSelect("egress", egress)}</div>
       <Field id={`${prefix}-carrier`} label={copy.carrierPort}><Input id={`${prefix}-carrier`} name="carrier_port" type="number" min={1} max={65_535} step={1} required defaultValue={initial?.carrier_port} aria-describedby={`${prefix}-hint`} /></Field>
       <p id={`${prefix}-hint`} className="text-sm text-[var(--muted-foreground)]">{copy.carrierHint}</p>
-      <FormFooter copy={copy} busy={busy} onCancel={onCancel} />
+      <FormFooter copy={copy} busy={busy} onCancel={onCancel} submitLabel={submitLabel} />
     </fieldset>
     {(nodesError || !ingress.length || !egress.length) && <p role="alert">{nodesError ? copy.nodesFailed : copy.noNodes}</p>}
     {invalid && <p role="alert" className="text-sm text-[var(--destructive)]">{copy.validation}</p>}

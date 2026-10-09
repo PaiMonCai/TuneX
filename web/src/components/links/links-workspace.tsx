@@ -8,10 +8,12 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { request } from "@/lib/api/core";
 import { linksApi, linkErrorInfo, type LinkErrorInfo } from "@/lib/links-api";
 import type { LinkDetail, LinkForward, LinkResource } from "@/lib/links-types";
+import { isLinkMaintenancePreviewCurrent, type LinkMaintenancePreviewInput } from "@/lib/link-maintenance-types";
 import type { UserNode } from "@/lib/types";
 import { linksCopy, type LinksCopy } from "./links-copy";
 import { LinkBindingForm, LinkConfigForm, selectClass } from "./link-forms";
 import { LinkDetailView } from "./link-detail";
+import { LinkMaintenancePanel } from "./link-maintenance-preview";
 import { LinkErrorDetails } from "./link-error-details";
 import { bindingFromForward, createLinksScopeFence, linkErrorMessage, linkIdFromSelection } from "./link-state";
 
@@ -39,6 +41,7 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
 }) {
   const fence = useRef(createLinksScopeFence());
   const busyRef = useRef(false);
+  const readTicket = useRef<ReturnType<ReturnType<typeof createLinksScopeFence>["next"]> | null>(null);
   const [list, setList] = useState<LinkResource[] | null>(null);
   const [nodes, setNodes] = useState<UserNode[]>([]);
   const [nodesError, setNodesError] = useState(false);
@@ -53,14 +56,21 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
   const [notice, setNotice] = useState<string | null>(null);
   const [editor, setEditor] = useState<Editor | null>(null);
   const [confirm, setConfirm] = useState<Confirmation | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewEpoch, setPreviewEpoch] = useState(0);
   const [now, setNow] = useState(Date.now);
+  const invalidatePreview = useCallback(() => {
+    fence.current.next("preview"); setPreviewEpoch((v) => v + 1);
+  }, []);
 
   useEffect(() => {
     fence.current.setScope(workspaceId);
     return () => { fence.current.setScope(null); };
   }, [workspaceId]);
   const reload = useCallback(async (target = selected): Promise<boolean> => {
+    invalidatePreview();
     const ticket = fence.current.next("read");
+    readTicket.current = ticket;
     setLoading(true);
     const [resources, nodeResult, selectedResult] = await Promise.allSettled([
       linksApi.list(workspaceId), request<UserNode[]>("/nodes", { workspaceId }),
@@ -79,7 +89,7 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
     setReadError(failed); setNow(Date.now()); setLoading(false);
     if (failed?.disabled) setBlocked(true);
     return failed === null;
-  }, [workspaceId, selected]);
+  }, [workspaceId, selected, invalidatePreview]);
   useEffect(() => { setDetail(null); void reload(); }, [reload]);
   useEffect(() => {
     const clock = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -91,6 +101,7 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
 
   const run = async (operation: () => Promise<unknown>, message = copy.submitted): Promise<boolean> => {
     if (busyRef.current || !canManage || blocked) return false;
+    invalidatePreview();
     busyRef.current = true; setBusy(true); setError(null); setNotice(null);
     fence.current.next("read");
     const ticket = fence.current.next("mutation");
@@ -120,6 +131,20 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
   };
   const refresh = () => { setError(null); setNotice(null); setBlocked(false); void reload(); };
   const mutationDisabled = busy || loading || blocked || !!readError;
+  const previewMaintenance = async (input: LinkMaintenancePreviewInput) => {
+    // POST for authorization/CSRF, but no write lifecycle, re-read, notice or editor changes.
+    if (!canManage || mutationDisabled || busyRef.current || !detail || detail.id !== selected || !readTicket.current) return null;
+    const capturedRead = readTicket.current;
+    const ticket = fence.current.next("preview");
+    const current = () => fence.current.current(ticket) && fence.current.current(capturedRead);
+    try {
+      const result = await linksApi.previewMaintenance(workspaceId, detail.id, input);
+      return current() && isLinkMaintenancePreviewCurrent(result, detail, Date.now()) ? result : null;
+    } catch (failure) {
+      if (!current()) return null;
+      throw failure;
+    }
+  };
   const nodeLabel = (id: number) => nodes.find((n) => n.id === id)?.node_id ?? `#${id}`;
   const showError = error ?? readError;
   return <div className="space-y-5" aria-busy={busy || loading}>
@@ -138,7 +163,7 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
     {loading && <p role="status" className="text-sm">{copy.loading}</p>}
     {list !== null && list.length === 0 && !loading && <Card><CardContent className="pt-5">{copy.empty}</CardContent></Card>}
     {!!list?.length && <div className="grid gap-2"><label htmlFor="links-selected" className="text-sm font-medium">{copy.select}</label>
-      <select id="links-selected" className={`${selectClass} max-w-xl`} value={selected ?? ""} disabled={busy || !!editor || !!confirm} onChange={(e) => { fence.current.next("read"); setDetail(null); setError(null); setNotice(null); setSelected(Number(e.target.value)); }}>
+      <select id="links-selected" className={`${selectClass} max-w-xl`} value={selected ?? ""} disabled={busy || !!editor || !!confirm} onChange={(e) => { invalidatePreview(); setPreviewOpen(false); fence.current.next("read"); setDetail(null); setError(null); setNotice(null); setSelected(Number(e.target.value)); }}>
         {list.map((link) => <option key={link.id} value={link.id}>{link.name}</option>)}
       </select>
     </div>}
@@ -180,9 +205,13 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
         </div>
       </CardContent>
     </Card>}
+    {previewOpen && detail && canManage && !readError && !blocked && <LinkMaintenancePanel invalidationEpoch={previewEpoch}
+      link={detail} copy={copy} nodes={nodes} nodesError={nodesError} busy={mutationDisabled} now={now} nodeLabel={nodeLabel}
+      onClose={() => { invalidatePreview(); setPreviewOpen(false); }} onPreview={previewMaintenance} />}
     {detail && !readError && <LinkDetailView link={detail} copy={copy} now={now} canManage={canManage} busy={mutationDisabled || !!editor || !!confirm}
       canCreateForward={canCreateForward} canUpdateForward={canUpdateForward} canDeleteForward={canDeleteForward}
       nodeLabel={nodeLabel} onEdit={() => setEditor({ type: "config", link: detail })}
+      onPreview={previewOpen ? undefined : () => { invalidatePreview(); setPreviewOpen(true); }}
       onDeploy={() => void run(() => linksApi.deploy(workspaceId, detail.id))}
       onRotate={() => setConfirm({ type: "rotate", link: detail })} onRetire={() => setConfirm({ type: "retire", link: detail })}
       onAdd={() => setEditor({ type: "binding", linkId: detail.id })}

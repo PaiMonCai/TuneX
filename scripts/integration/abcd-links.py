@@ -462,6 +462,80 @@ def replay_traffic(link_id, forward_ids, samples):
         H.docker(["unpause", H.INGRESS_CONTAINER], timeout=15)
 
 
+def maintenance_preview(base, link_id, held_a, held_b, udp_b, target, original_udp_source):
+    """F5 preview uses real API/DB/runtime without changing any desired owner."""
+    detail = request("GET", base)
+    input_data = {"expected_version": detail["desired_version"], "expected_generation": detail["generation"],
+                  "change": {"type": "rotate_key"}}
+    # Deliberately exclude traffic counters, report timestamps and lease renewal:
+    # these continue legitimately while a read-only preview is open.
+    def durable_state():
+        return H.db("return {link:await db.linkResource.findUnique({where:{id:%d},"
+                    "select:{id:true,status:true,desired_version:true,generation:true}}),"
+                    "versions:await db.linkVersion.count({where:{link_id:%d}}),"
+                    "deployments:await db.linkDeployment.count({where:{link_id:%d}}),"
+                    "credentials:await db.linkTransportCredential.count({where:{link_id:%d}}),"
+                    "forwards:await db.tunnel.findMany({where:{link_resource_id:%d},orderBy:{id:'asc'},"
+                    "select:{id:true,name:true,config_revision:true,applied_revision:true,desired_revision_id:true,desired_status:true,"
+                    "ingress_node_id:true,egress_node_id:true,listen_ip:true,listen_port:true,forward_protocol:true,"
+                    "remote_host:true,remote_port:true,bytes_per_second_in:true,bytes_per_second_out:true,"
+                    "max_connections:true,max_connections_per_ip:true,link_target_config:true,link_source_config:true}}),"
+                    "revisions:await db.forwardRevision.findMany({where:{link_resource_id:%d},orderBy:{id:'asc'},"
+                    "select:{id:true,tunnel_id:true,revision:true,desired_status:true,protocol:true,listen_ip:true,listen_port:true,"
+                    "ingress_node_id:true,egress_node_id:true,targets:true,link_target_config:true,link_source_config:true,"
+                    "bytes_per_second_in:true,bytes_per_second_out:true,max_connections:true,max_connections_per_ip:true}}),"
+                    "leases:await db.nodePortLease.findMany({where:{link_id:%d,status:'active'},"
+                    "select:{id:true,node_id:true,port:true,protocol:true,bind_scope:true},orderBy:{id:'asc'}})};"
+                    % (link_id, link_id, link_id, link_id, link_id, link_id, link_id))
+    before = durable_state()
+    status, response, headers = H.req("POST", base + "/maintenance/preview", input_data)
+    if status != 200 or not isinstance(response.get("data"), dict):
+        raise RuntimeError("F5 preview HTTP failed: status=%d" % status)
+    rotation = response["data"]
+    H.check(headers.get("cache-control") == "no-store", "F5 preview response is not cacheable")
+    unauthenticated, _, _ = H.req("POST", base + "/maintenance/preview", input_data, cookie="", retry_auth=False)
+    H.check(unauthenticated == 401, "F5 preview rejects unauthenticated requests")
+    H.check(rotation.get("schema_version") == 1 and rotation.get("operation") == "rotate_key"
+            and rotation.get("execution", {}).get("supported") is False
+            and rotation.get("ports", {}).get("reserved") is False
+            and rotation.get("ports", {}).get("availability") == "not_checked"
+            and rotation.get("runtime", {}).get("tcp_connections", "missing") is None
+            and rotation.get("runtime", {}).get("udp_mappings", "missing") is None,
+            "F5 real preview does not invent live concurrency, execution or port availability")
+    H.check(rotation.get("references", {}).get("total") == len(detail["forwards"])
+            and {row["id"] for row in rotation["references"]["forwards"]} == {row["id"] for row in detail["forwards"]},
+            "F5 real preview includes the complete referenced Forward set")
+    def secret_free(value):
+        if isinstance(value, dict):
+            return not ({"key", "secret", "secret_enc", "runner_config", "binding_snapshot"} & set(value)) and all(
+                secret_free(item) for item in value.values())
+        return not isinstance(value, list) or all(secret_free(item) for item in value)
+    H.check(secret_free(rotation), "F5 public preview excludes credentials and runner configurations")
+    move_input = {**input_data, "change": {"type": "update_endpoints",
+        "config": {**detail["config"], "carrier_port": detail["config"]["carrier_port"] + 1}}}
+    moved = request("POST", base + "/maintenance/preview", move_input)
+    H.check(moved["changes"]["carrier_port_changed"] is True
+            and moved["snapshot"]["state_token"] != rotation["snapshot"]["state_token"]
+            and moved["candidate"]["version"] == detail["desired_version"] + 1,
+            "F5 endpoint preview fences the requested change without allocating a version")
+    for field in ("expected_version", "expected_generation"):
+        bad = {**input_data, field: input_data[field] + 1}
+        status, payload, _ = H.req("POST", base + "/maintenance/preview", bad)
+        expected_code = "link_version_conflict" if field == "expected_version" else "link_generation_conflict"
+        H.check(status == 409 and payload.get("code") == expected_code, "F5 stale " + field + " is rejected")
+    edit_status, edit_payload, _ = H.req("PUT", base + "/config", {
+        "expected_version": detail["desired_version"], "config": move_input["change"]["config"]})
+    rotate_status, rotate_payload, _ = H.req("POST", base + "/rotate-key")
+    H.check(edit_status == 409 and edit_payload.get("code") == "link_has_references"
+            and rotate_status == 409 and rotate_payload.get("code") == "link_has_references",
+            "F5 preview does not unlock unsafe live endpoint edits or key rotation")
+    H.check(durable_state() == before, "F5 previews leave resource, rules/revisions, versions, credentials, deployments and held leases unchanged")
+    marker = b"F5-unchanged-UDP-B"
+    H.check(tcp_payload(held_a, b"F5-unchanged-TCP-A") and tcp_payload(held_b, b"F5-unchanged-TCP-B")
+            and udp_payload(udp_b, 21081, marker) and target.udp.sources.get(marker) == original_udp_source,
+            "F5 previews preserve both held TCP sessions and the exact B UDP target socket")
+
+
 def main():
     signal.signal(signal.SIGALRM, H.alarm)
     signal.setitimer(signal.ITIMER_REAL, 600)
@@ -537,6 +611,7 @@ def main():
         def keep_b_alive():
             return (tcp_payload(held_b, b"B-traffic-keepalive")
                     and udp_payload(udp_b, 21081, b"B-traffic-keepalive"))
+        maintenance_preview(base, link_id, held_a, held_b, udp_b, targets[0], original_udp_source)
         initial_traffic = wait_traffic(link_id, [a, b], keepalive=keep_b_alive)
         H.check(all(any(row["forward_id"] == fid and int(row["connections"]) > 0
                         for row in initial_traffic) for fid in (a, b)),

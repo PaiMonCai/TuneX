@@ -2,6 +2,27 @@
 
 更新：2026-10-09。类型检查、fixtures、单进程 echo、真实多节点、浏览器和生产验证分别记录，不能互相替代。
 
+## F5 影响预览首切片
+
+从已合并 `main` 的 `ef159eb` 开始开发，只交付只读预览，不交付有引用端点变更/密钥轮换执行器。Windows 适配及原生 LKG 缓存性能优化按用户指示暂停；保留已有缺陷记录，不算已修复，也不作为限定 Linux F5 的前置条件。
+
+定向回归：
+
+```sh
+cd backend
+bun test src/integrations/forwardx/__tests__/link-maintenance.test.ts src/services/__tests__/link-resource.test.ts src/routes/__tests__/links-maintenance-route.test.ts src/services/__tests__/link-observation.test.ts src/services/__tests__/runtime-admission-client.test.ts
+bun run typecheck
+cd ../web
+bun test src/components/links/__tests__
+npm run typecheck
+```
+
+覆盖闭合请求、跨 Workspace、管理权限、CAS、只读零写入/零预留/零下发、事务内候选读取（不另占连接）、候选能力报告过期/未来/凭据轮换、暂停引用、待删除/待暂停/部署快照及有效策略上限不匹配、旧代次/未知状态、token 状态绑定、未知实时连接数、受限完整输出、密钥脱敏、页面过期/作用域 fence 和旧门禁保留。前端定向 191 通过，隔离浏览器 F5 50/50、F2 44/44、F3 39/39；这些 fixtures 不是实际 Panel 浏览器证据。
+
+本地当前代码：后端上述定向 19 pass / 0 fail、web 全量 1570 pass / 0 fail，两端类型检查通过。后端本机没有 Redis，全量尝试出现连接拒绝/超时后终止，不记录为通过；全量后端、数据库/HTTP 与多 Agent 实网由该切片的新 CI 验证，不跳过失败或借旧提交证据。
+
+`scripts/integration/abcd-links.py` 增加真实 Panel/MySQL/Redis/Agent 预览场景：HTTP no-store/未认证拒绝、完整引用、未知实时数、不泄露 runner/密钥、不同候选 token、旧版本/代次冲突、既有维护门禁、版本/部署/凭据/持有租约不变；原有 A/B TCP 会话及 B 的实际 UDP 目标 socket 必须保持。新候选 CI 结果单独留证，不能借 PR #75 的 73 PASS 宣称这些新增场景通过。未发布生产，迁移执行与长期运行仍待后续切片。
+
 ## F4 本轮收尾证据
 
 源码 `dd108568ce59f583bd977461313bc8ef8b26c69b` 的 [CI 37870458038](https://github.com/PaiMonCai/TuneX/actions/runs/37870458038) required 全绿，已下载并核对 `abcd-core-result` 的两个结果文件：
@@ -13,9 +34,11 @@
 | Backend | 3237 pass / 0 fail；类型检查、空库迁移通过。数据库/HTTP 119 pass / 0 fail / 0 skipped。 |
 | Web | 1507 pass / 0 fail；类型检查和 mock 构建通过，不是实际 Panel 浏览器验收。 |
 | Agent | Linux 全量测试、vet、真实 FXP、构建通过；新增删除完成路径的定向 race 通过。仅 main 的较广 race/历史升级回放未在此 PR 执行。 |
-| Ops / secrets / required | 全部通过。功能开关保持默认关闭，未合并 main、未部署生产。 |
+| Ops / secrets / required | 全部通过。该候选验收时尚未合并；PR #75 随后合入 main 的 `ef159eb`，未部署生产。功能开关仍默认关闭。 |
 
 Windows amd64 的 control/reporter/manager/forwarder 定向回归及使用本次构建真实 FXP 的 linkrunner 包通过；额外 `go test ./...` **没有全绿**：diag 缺少可用的 ping/traceroute 测试工具，restore 的 `TestConcurrentCacheWritesStayValid` 出现文件共享冲突，selfinfo 的脱敏测试未消除 JSON 转义后的临时路径（测试名含 credential）。这些问题不在本轮 Linux F4 证据覆盖范围内，不能标为已修复或宣传 Windows 全量验收通过；并发恢复缓存错误保留为核心恢复加固项。
+
+PR #75 合并后的 [main CI 37944370097](https://github.com/PaiMonCai/TuneX/actions/runs/37944370097) required 全绿；工件仍为 native both 37 PASS / 0 FAIL、共享 FXP 73 PASS / 0 FAIL，且 main 的较广并发 race 与最早支持数据库基线升级步骤通过。此记录只属于 `ef159eb`，不替代 F5 新增场景。Windows diag 实际实现也依赖 Linux 工具路径/权限/参数，不能仅归因测试环境缺少工具；selfinfo 的路径误报不是凭据泄漏证据。
 
 ## 已确认的候选证据
 

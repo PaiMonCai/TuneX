@@ -10,11 +10,12 @@ import { ForwardTargets } from "./link-target-details";
 import { ForwardClientSource } from "./link-client-source-details";
 
 export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, onEdit, onDeploy, onRotate,
-  onRetire, onAdd, onEditForward, onAction, canCreateForward = canManage, canUpdateForward = () => canManage, canDeleteForward = () => canManage }: {
+  onRetire, onAdd, onEditForward, onAction, onPreview, canCreateForward = canManage, canUpdateForward = () => canManage, canDeleteForward = () => canManage }: {
   link: LinkDetail; copy: LinksCopy; now: number; canManage: boolean; busy: boolean;
   nodeLabel: (id: number) => string; onEdit: () => void; onDeploy: () => void; onRotate: () => void;
   onRetire: () => void; onAdd: () => void; onEditForward: (forward: LinkForward) => void;
   onAction: (forward: LinkForward, action: LinkForwardAction) => void;
+  onPreview?: () => void;
   canCreateForward?: boolean; canUpdateForward?: (forward: LinkForward) => boolean; canDeleteForward?: (forward: LinkForward) => boolean;
 }) {
   const mutable = canManage && !["retired", "retiring"].includes(link.status);
@@ -69,6 +70,7 @@ export function LinkDetailView({ link, copy, now, canManage, busy, nodeLabel, on
           <Button variant="outline" disabled={busy || !editEndpoints || !link.config} onClick={onEdit}>{copy.edit}</Button>
           <Button variant="outline" disabled={busy || !link.generation || !zeroRefs} onClick={onRotate}>{copy.rotate}</Button>
           <Button variant="destructive" disabled={busy || !zeroRefs} onClick={onRetire}>{copy.retire}</Button>
+          {onPreview && <Button variant="outline" disabled={busy || !link.config} onClick={onPreview}>{copy.maintenancePreview}</Button>}
         </div>}
       </CardContent>
     </Card>

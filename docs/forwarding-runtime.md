@@ -1,6 +1,6 @@
 # 当前转发能力与运行边界
 
-更新：2026-10-09。ABCD 基线 `095089edd7ba2343cacc82aec2707435ad9c3876`，F1 接续 `7396f24`；对应 [PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 开发分支，尚不代表正式发布。后续范围统一维护在 [开发方案](DEVELOPMENT_PLAN.md)。
+更新：2026-10-09。[PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 已合入 `main`（`ef159eb`），尚不代表正式发布。F5 分支 `feat/forward-link-maintenance` 增加只读影响预览，不放开在线迁移。后续范围统一维护在 [开发方案](DEVELOPMENT_PLAN.md)。
 
 ## 资源与部署
 
@@ -44,6 +44,16 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 | 资源退役 | 引用必须为零，暂停规则仍算引用；先停入口，再停出口，持久 fence 后确认释放。 |
 
 共享 A/B 实网验收证明指定业务变更保持未变化 B 的 TCP 会话及固定 UDP 目标 socket；不能据此宣传所有载体变更无损。确认超时、未知 digest 或补偿无法确认时保守停止，保留可诊断失败事实。
+
+## 共享链路维护预览（F5 首切片）
+
+`POST /api/links/:id/maintenance/preview` 使用既有认证、CSRF、Workspace `node:manage` 权限和 FXP 功能开关，响应 `Cache-Control: no-store`。请求为闭合的 `expected_version`、`expected_generation`、`change`：`update_endpoints` 携带完整三字段端点配置，或 `rotate_key`，不接收密钥。版本/代次不匹配返回 409，跨 Workspace 资源不可见。候选节点角色、Workspace、运行能力、目标/来源组合及策略复用原有检查与编译器。
+
+预览捕获 Link 锁下的一致引用/配置/部署/占用快照，`schema_version=1`；含期望启用/暂停规则与修订、当前/候选监听、持有/候选端口、节点运行状态、TCP reconnect/drain 和 UDP 重建需求。运行 Ready 还要求已部署绑定修订与当前期望集合完全一致，沿用认证报告的 node/Workspace/Link/runtime、代次/digest、新鲜度与有效租约守卫；暂停/删除尚未生效以及部分部署失败时按可能仍有旧连接保守提示。累计流量连接数与限制不是实时连接数：`tcp_connections`、`udp_mappings` 为 null。
+
+`snapshot.state_token` 绑定租户、身份、期望/部署状态、全部引用修订、持有占用和请求变更；不是凭证或执行许可。预览 60 秒过期，页面输入变化、资源/Workspace 切换、重读、写入或状态失效后重新生成。候选版本/代次只是预测；`ports.reserved=false`、`availability=not_checked`，不承诺 OS 或数据库端口空闲。最多完整预览 500 引用、2048 持有端口，超过时拒绝，不能略过暂停规则。
+
+`execution.supported=false`。计划顺序是预留候选 → 准备/验证出口 → 切换/验证入口 → 旧连接排空 → 确认退役 → 释放旧端口；本切片**不执行这些步骤**，不生成/解封真实密钥，不写版本/部署/租约，不启动/重启进程。当前端点编辑与密钥轮换门禁继续生效。后续执行器必须重新检查授权、策略、能力、引用 CAS、租约和所有权，加入持久迁移状态、故障补偿及不可变统计归属后再开放有引用维护。
 
 ## 运行限额与状态
 
