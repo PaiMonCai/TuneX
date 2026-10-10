@@ -421,15 +421,6 @@ export function ForwardWorkspace() {
     setCreateChoiceOpen(true);
   }
 
-  function openCreate(mode: "direct" | "relay") {
-    if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
-    const filteredIngress = ingressFilter !== "all"
-      ? ingressNodes.find((node) => String(node.id) === ingressFilter)
-      : undefined;
-    setCreateDraft(emptyForwardCreateDraft(mode, filteredIngress ?? ingressNodes[0]));
-    setCreateOpen(true);
-  }
-
   /**
    * V4-WP9 §13.6 复制 Forward（列表行入口）。
    *
