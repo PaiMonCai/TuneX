@@ -3,7 +3,8 @@ import { forwardPolicyDraftErrors, forwardPolicyDraftValues } from "@/lib/forwar
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { LinkedForwardGuide, linkedForwardHref, linkedForwardText, isLinkManagedError } from "@/components/links/linked-forward-guide";
+import { linkedForwardHref, linkedForwardText, isLinkManagedError } from "@/components/links/linked-forward-guide";
+import { EncryptedForwardCreateDialog } from "@/components/forwards/encrypted-forward-create-dialog";
 import { toast } from "sonner";
 import { api, getActiveWorkspace } from "@/lib/api";
 import { useWorkspace } from "@/components/workspace/workspace-context";
@@ -136,6 +137,8 @@ export function ForwardWorkspace() {
   /** 写操作后强制重取当前页（页码/筛选都没变，靠它触发）。 */
   const [reloadToken, setReloadToken] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createChoiceOpen, setCreateChoiceOpen] = useState(false);
+  const [encryptedCreateOpen, setEncryptedCreateOpen] = useState(false);
   const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
   const [createDraft, setCreateDraft] = useState(() => emptyForwardCreateDraft("direct"));
   const [busy, setBusy] = useState(false);
@@ -332,7 +335,8 @@ export function ForwardWorkspace() {
     batchFlight.current = null;
     setBatchBusy(false);
     setBatchError(null);
-    setSelectedIds(new Set()); setEditTarget(null); setCreateOpen(false); setCreatedForward(null);
+    setSelectedIds(new Set()); setEditTarget(null); setCreateOpen(false); setCreateChoiceOpen(false);
+    setEncryptedCreateOpen(false); setCreatedForward(null);
   }, [currentId, permissions]);
 
   /**
@@ -404,6 +408,11 @@ export function ForwardWorkspace() {
     setSort(next.sort);
     setOrder(next.order);
     setPage(1);
+  }
+
+  function openCreateChoice() {
+    if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
+    setCreateChoiceOpen(true);
   }
 
   function openCreate(mode: "direct" | "relay") {
@@ -749,7 +758,7 @@ export function ForwardWorkspace() {
         onIngress={(value) => changeFilter(setIngressFilter, value)}
         onEgress={(value) => changeFilter(setEgressFilter, value)}
         onKeyword={setKeywordInput}
-        onCreate={openCreate}
+        onCreate={openCreateChoice}
         onRefresh={reloadList}
         loading={loading}
         onReset={() => {
@@ -757,8 +766,11 @@ export function ForwardWorkspace() {
           setIngressFilter("all"); setEgressFilter("all"); setPage(1); clearSelection();
         }}
       />
-      {!loading && !error && forwards.filter((forward) => linkedForwardHref(forward)).map((forward) =>
-        <LinkedForwardGuide key={String(forward.id)} forward={forward} locale={locale} />)}
+      {!loading && !error && forwards.some((forward) => linkedForwardHref(forward)) && <p className="rounded-md border border-[var(--border)] p-3 text-sm text-[var(--muted-foreground)]" data-testid="forward-link-ownership">
+        {locale === "en"
+          ? "Encrypted FXP rules appear in this list, but their edits and actions are owned by the corresponding Link. Select an FXP badge to manage its connection."
+          : "加密 FXP 规则也显示在这里，但其编辑和启停操作由对应加密连接管理。点击 FXP 标识进入连接详情。"}
+      </p>}
 
       {error ? (
         <div
@@ -786,7 +798,7 @@ export function ForwardWorkspace() {
 
       {/* 出错时不能落到「还没建转发」的空态：那会把一次加载失败讲成「你没有数据」 */}
       {!loading && !error && total === 0 && !hasFilters ? (
-        <ForwardEmptyState canCreate={canCreate} t={t} onCreate={openCreate} />
+        <ForwardEmptyState canCreate={canCreate} t={t} onCreate={openCreateChoice} />
       ) : (
         <div className="flex flex-col gap-3">
           <ForwardListControls
@@ -841,6 +853,56 @@ export function ForwardWorkspace() {
           />
         </div>
       )}
+
+      <Dialog open={createChoiceOpen && canCreate} onOpenChange={setCreateChoiceOpen}>
+        <DialogContent data-testid="forward-create-choice">
+          <DialogHeader>
+            <DialogTitle>{t("forward.createForward")}</DialogTitle>
+            <DialogDescription>{locale === "en"
+              ? "Choose how traffic travels between nodes. Business rules are listed together, but encrypted rules are deployed by their Link."
+              : "先选择节点间传输方式。转发规则统一展示，加密规则则由所属 Link 独立部署与维护。"}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <section className="rounded-md border border-[var(--border)] p-3">
+              <h3 className="font-medium">{t("forward.nativeType")}</h3>
+              <p className="mb-3 text-sm text-[var(--muted-foreground)]">{t("forward.nativeTypeHint")}</p>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" onClick={() => { setCreateChoiceOpen(false); openCreate("direct"); }}>{t("forward.createDirect")}</Button>
+                <Button variant="outline" onClick={() => { setCreateChoiceOpen(false); openCreate("relay"); }}>{t("forward.createRelay")}</Button>
+              </div>
+            </section>
+            <section className="rounded-md border border-[var(--border)] p-3">
+              <h3 className="font-medium">{t("forward.encryptedType")}</h3>
+              <p className="mb-3 text-sm text-[var(--muted-foreground)]">{t("forward.encryptedTypeHint")}</p>
+              <Button disabled={!canManageNodes || currentId === null} data-testid="forward-choose-fxp"
+                onClick={() => { setCreateChoiceOpen(false); setEncryptedCreateOpen(true); }}>
+                {locale === "en" ? "Use encrypted FXP" : "使用加密 FXP"}
+              </Button>
+              {!canManageNodes && <p className="mt-2 text-xs text-[var(--muted-foreground)]">{locale === "en"
+                ? "FXP Link administration requires node:manage permission."
+                : "加密连接的创建和规则写入需要 node:manage 权限。"}</p>}
+              <p className="mt-2 text-xs text-[var(--muted-foreground)]">{locale === "en"
+                ? "FXP availability depends on the server feature flag and node capabilities."
+                : "FXP 是否可用取决于服务端功能开关和节点实际能力。"}</p>
+            </section>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {encryptedCreateOpen && currentId !== null && <EncryptedForwardCreateDialog
+        key={currentId}
+        workspaceId={currentId}
+        nodes={nodes}
+        canManageNodes={canManageNodes}
+        onClose={() => setEncryptedCreateOpen(false)}
+        onCreated={(linkId) => {
+          setEncryptedCreateOpen(false);
+          setPage(1);
+          reloadList();
+          toast.success(locale === "en" ? "Encrypted forwarding rule created" : "加密转发规则已创建");
+          router.push(`/links?selected=${linkId}`);
+        }}
+      />}
 
       <ForwardCreateDialog
         capabilities={forwardCapabilities}
