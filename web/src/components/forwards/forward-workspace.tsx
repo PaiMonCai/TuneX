@@ -138,7 +138,8 @@ export function ForwardWorkspace() {
   const [reloadToken, setReloadToken] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [createChoiceOpen, setCreateChoiceOpen] = useState(false);
-  const [encryptedCreateOpen, setEncryptedCreateOpen] = useState(false);
+  const [createTransport, setCreateTransport] = useState<"native" | "fxp">("native");
+  const [fxpCreateBusy, setFxpCreateBusy] = useState(false);
   const [createdForward, setCreatedForward] = useState<PortForward | null>(null);
   const [createDraft, setCreateDraft] = useState(() => emptyForwardCreateDraft("direct"));
   const [busy, setBusy] = useState(false);
@@ -336,7 +337,7 @@ export function ForwardWorkspace() {
     setBatchBusy(false);
     setBatchError(null);
     setSelectedIds(new Set()); setEditTarget(null); setCreateOpen(false); setCreateChoiceOpen(false);
-    setEncryptedCreateOpen(false); setCreatedForward(null);
+    setCreateTransport("native"); setFxpCreateBusy(false); setCreatedForward(null);
   }, [currentId, permissions]);
 
   /**
@@ -412,6 +413,11 @@ export function ForwardWorkspace() {
 
   function openCreateChoice() {
     if (!canCreate) { toast.error(PERMISSION_DENIED); return; }
+    const filteredIngress = ingressFilter !== "all"
+      ? ingressNodes.find((node) => String(node.id) === ingressFilter)
+      : undefined;
+    setCreateDraft(emptyForwardCreateDraft("direct", filteredIngress ?? ingressNodes[0]));
+    setCreateTransport("native");
     setCreateChoiceOpen(true);
   }
 
@@ -524,6 +530,7 @@ export function ForwardWorkspace() {
       });
       setCreatedForward(created);
       setCreateOpen(false);
+      setCreateChoiceOpen(false);
       // 新行按默认排序（order_by asc）不一定落在当前页，回到第 1 页更容易被看到。
       setPage(1);
       reloadList();
@@ -854,55 +861,85 @@ export function ForwardWorkspace() {
         </div>
       )}
 
-      <Dialog open={createChoiceOpen && canCreate} onOpenChange={setCreateChoiceOpen}>
-        <DialogContent data-testid="forward-create-choice">
+      <Dialog open={createChoiceOpen && canCreate} onOpenChange={(open) => {
+        if (!open && (busy || fxpCreateBusy)) return;
+        setCreateChoiceOpen(open);
+      }}>
+        <DialogContent className="max-w-2xl" data-testid="forward-create-choice">
           <DialogHeader>
             <DialogTitle>{t("forward.createForward")}</DialogTitle>
             <DialogDescription>{locale === "en"
-              ? "Choose how traffic travels between nodes. Business rules are listed together, but encrypted rules are deployed by their Link."
-              : "先选择节点间传输方式。转发规则统一展示，加密规则则由所属 Link 独立部署与维护。"}</DialogDescription>
+              ? "Select the forwarding type, then configure this forwarding rule in one place."
+              : "选择转发方式，并在此处完成转发规则配置。"}</DialogDescription>
           </DialogHeader>
-          <div className="space-y-3">
-            <section className="rounded-md border border-[var(--border)] p-3">
-              <h3 className="font-medium">{t("forward.nativeType")}</h3>
-              <p className="mb-3 text-sm text-[var(--muted-foreground)]">{t("forward.nativeTypeHint")}</p>
-              <div className="flex flex-wrap gap-2">
-                <Button variant="outline" onClick={() => { setCreateChoiceOpen(false); openCreate("direct"); }}>{t("forward.createDirect")}</Button>
-                <Button variant="outline" onClick={() => { setCreateChoiceOpen(false); openCreate("relay"); }}>{t("forward.createRelay")}</Button>
-              </div>
-            </section>
-            <section className="rounded-md border border-[var(--border)] p-3">
-              <h3 className="font-medium">{t("forward.encryptedType")}</h3>
-              <p className="mb-3 text-sm text-[var(--muted-foreground)]">{t("forward.encryptedTypeHint")}</p>
-              <Button disabled={!canManageNodes || currentId === null} data-testid="forward-choose-fxp"
-                onClick={() => { setCreateChoiceOpen(false); setEncryptedCreateOpen(true); }}>
-                {locale === "en" ? "Use encrypted FXP" : "使用加密 FXP"}
-              </Button>
-              {!canManageNodes && <p className="mt-2 text-xs text-[var(--muted-foreground)]">{locale === "en"
-                ? "FXP Link administration requires node:manage permission."
-                : "加密连接的创建和规则写入需要 node:manage 权限。"}</p>}
-              <p className="mt-2 text-xs text-[var(--muted-foreground)]">{locale === "en"
-                ? "FXP availability depends on the server feature flag and node capabilities."
-                : "FXP 是否可用取决于服务端功能开关和节点实际能力。"}</p>
-            </section>
+          <div className="space-y-2">
+            <label htmlFor="forward-create-transport" className="text-sm font-medium">{locale === "en" ? "Forwarding type" : "转发方式"}</label>
+            <select id="forward-create-transport" data-testid="forward-create-transport"
+              className="h-10 w-full rounded-md border border-[var(--input)] bg-[var(--card)] px-3 text-sm"
+              value={createTransport} disabled={busy || fxpCreateBusy}
+              onChange={(e) => setCreateTransport(e.target.value as "native" | "fxp")}>
+              <option value="native">{t("forward.nativeType")}</option>
+              <option value="fxp" disabled={!canManageNodes || currentId === null}>{t("forward.encryptedType")}</option>
+            </select>
+            <p className="text-xs text-[var(--muted-foreground)]">{createTransport === "fxp"
+              ? t("forward.encryptedTypeHint") : t("forward.nativeTypeHint")}</p>
+            {!canManageNodes && <p className="text-xs text-[var(--muted-foreground)]">{locale === "en"
+              ? "Encrypted FXP requires node management permission."
+              : "选择 FXP 加密模式需要节点管理权限。"}</p>}
           </div>
+          {createTransport === "native" ? <>
+            <div className="space-y-2">
+              <label htmlFor="forward-create-native-path" className="text-sm font-medium">{locale === "en" ? "Network path" : "转发路径"}</label>
+              <select id="forward-create-native-path" data-testid="forward-create-native-path"
+                className="h-10 w-full rounded-md border border-[var(--input)] bg-[var(--card)] px-3 text-sm"
+                disabled={busy}
+                value={createDraft.mode}
+                onChange={(e) => {
+                  const mode = e.target.value as "direct" | "relay";
+                  setCreateDraft((draft) => ({ ...draft, mode, middleNodeId: "", egressId: mode === "direct" ? "" : draft.egressId }));
+                }}>
+                <option value="direct">{t("forward.direct")}</option>
+                <option value="relay">{t("forward.relay")}</option>
+              </select>
+            </div>
+            <ForwardCreateDialog
+              embedded
+              capabilities={forwardCapabilities}
+              open={createChoiceOpen && canCreate}
+              draft={createDraft}
+              ingressNodes={ingressNodes}
+              selectedBindings={selectedBindings}
+              egressNodes={egressCandidates}
+              bindingsUnavailable={bindingsFactsUnavailable}
+              bindingsByIngress={bindingMapForDialog}
+              workspaceId={currentId}
+              canManageNodes={canManageNodes}
+              busy={busy}
+              locale={locale}
+              t={t}
+              text={L}
+              onOpenChange={setCreateChoiceOpen}
+              onDraftChange={setCreateDraft}
+              onCreate={() => void createForward()}
+            />
+          </> : currentId !== null && canManageNodes ? <EncryptedForwardCreateDialog
+            key={currentId}
+            embedded
+            workspaceId={currentId}
+            nodes={nodes}
+            canManageNodes={canManageNodes}
+            onBusyChange={setFxpCreateBusy}
+            onClose={() => setCreateChoiceOpen(false)}
+            onCreated={(_linkId, forwardId) => {
+              setCreateChoiceOpen(false);
+              setPage(1);
+              reloadList();
+              toast.success(locale === "en" ? "Encrypted forwarding rule created" : "加密转发规则已创建");
+              router.push(`/forwards/${forwardId}`);
+            }}
+          /> : <p role="alert">{PERMISSION_DENIED}</p>}
         </DialogContent>
       </Dialog>
-
-      {encryptedCreateOpen && currentId !== null && <EncryptedForwardCreateDialog
-        key={currentId}
-        workspaceId={currentId}
-        nodes={nodes}
-        canManageNodes={canManageNodes}
-        onClose={() => setEncryptedCreateOpen(false)}
-        onCreated={(linkId) => {
-          setEncryptedCreateOpen(false);
-          setPage(1);
-          reloadList();
-          toast.success(locale === "en" ? "Encrypted forwarding rule created" : "加密转发规则已创建");
-          router.push(`/links?selected=${linkId}`);
-        }}
-      />}
 
       <ForwardCreateDialog
         capabilities={forwardCapabilities}
