@@ -2,6 +2,10 @@
 
 同步：2026-10-10。此文件保留各次前端任务的历史范围，早期段落中的分支、数量、“未提交/未运行”等仅指该次验证，不表示当前项目状态。当前合并、源码 CI 与发布边界统一见 [验收说明](../../../../../docs/testing.md)。下面的浏览器结果均为隔离 HTTP fixtures，不是实际 Panel/MySQL/Redis/Agent 的浏览器 E2E。
 
+## F5 持久维护计划（PR #77 待合并）
+
+源码 `0ebb16ebb4466909c741a0c35ae24108c6507669`：Web CI 通过；本地全量 1578/0、TypeScript 通过；新增 `runF5IntentBrowserChecks` 11/11，既有 F5 45+5、F2 44、F3 39 回放均通过。新增流程使用真实生产组件、session/CSRF/Workspace 请求层及 loopback HTTP fixture，覆盖保存通知、持久状态重读、逻辑编辑围栏、取消状态 CAS、权限切换和 Workspace 隔离；没有实际 Panel/Agent 浏览器 E2E 证明。后端/四 Agent 独立实网结果见 [中央验收记录](../../../../../docs/testing.md#f5-intent-evidence)。
+
 <a id="f5-preview"></a>
 
 ## F5 只读维护预览（2026-10-09 验收）

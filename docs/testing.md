@@ -9,12 +9,24 @@
 | 已合并 main 基线 | `ef159eb6a9add92f25a4eaed88cdf783dec963eb`，[CI 37944370097](https://github.com/PaiMonCai/TuneX/actions/runs/37944370097) | PR #75 已合并；required 通过，包含主分支 Agent/race 和最早支持数据库升级。 |
 | F5 预览历史源码候选 | `cdb847039772b0ca07291c83044aee88a88e1dc6`，[CI 37952731562](https://github.com/PaiMonCai/TuneX/actions/runs/37952731562) | 当时为 PR #76 草稿；只读预览已验收，不是完整 F5 或生产发布。 |
 | 最新已合并 main | `54542d384117abd5d92d1a85a2d048e11425ff1a`，[CI 37957715413](https://github.com/PaiMonCai/TuneX/actions/runs/37957715413) | PR #76 已合并；required 通过。 |
+| F5 持久计划源码 | `0ebb16ebb4466909c741a0c35ae24108c6507669`，[CI 38010987884](https://github.com/PaiMonCai/TuneX/actions/runs/38010987884) | PR #77 尚未合并；选中检查及 required 通过。没有在线执行器/生产发布。 |
 
 以下数量只属于各行固定源码/运行，不是持续更新的分支 HEAD 检查页。新代码的 CI 须单独查看；不把历史绿色改写为新 SHA 的结果。
 
+<a id="f5-intent-evidence"></a>
+
 ## F5 持久计划与提交 CAS（当前开发分支）
 
-从 `54542d3` 创建 `feat/link-maintenance-state`；新增记录/事件、签名回执、幂等提交、取消 CAS、并发编辑围栏及元数据重验。当前不执行迁移，也不检查/预留候选端口。自身 Linux CI 尚待运行，不能复用 main 或预览切片证据。
+从 `54542d3` 创建 `feat/link-maintenance-state`；新增记录/事件、签名回执、幂等提交、取消 CAS、并发编辑围栏及元数据重验。当前不执行迁移，也不检查/预留候选端口。源码 `0ebb16e` 的自身 Linux CI 已完成，已下载并核对 `abcd-core-result` 与 backend 日志；不是复用 main 或预览切片证据。
+
+| 范围 | 固定源码 `0ebb16e` 结果 |
+| --- | --- |
+| Backend unit/contract | 3255 pass / 0 fail，CI 实际构建 pinned FXP。 |
+| MySQL/HTTP | 124 pass / 0 fail / 0 skipped，含新增五项真实维护数据库场景。空库/专用库完整迁移通过。 |
+| Linux 共享 FXP | `abcd-links-result.txt`：95 PASS / 0 FAIL，含新增 11 项真实维护计划检查；实际 Panel/Worker/MySQL/Redis/四 Agent。 |
+| Linux 原生 both 回归 | `native-both-result.txt`：37 PASS / 0 FAIL。 |
+| Web / ops / secrets / required | 全部选中检查通过；Web 单测、类型与 mock 构建，不是实际 Panel 浏览器验收。 |
+| 未执行边界 | Agent 独立 job 因源码未变化而 skipped；四 Agent 实网实际构建运行。main-only 广域 race/最早支持 DB 升级回放未在 PR 执行；无 Windows/生产/长期运行/实际 Panel 浏览器证明。 |
 
 本地：backend 状态契约 5 项、预览 10 项、真实编译器服务隔离场景/维护服务/HTTP 路由各 1 项；web 全量 1578 pass / 0 fail；两端类型检查、Prisma schema validate 通过。新增浏览器 `runF5IntentBrowserChecks` 11/11、只读预览 45/45、真实 15 秒轮询 5/5、既有 F2 44/44、F3 39/39（真实生产组件/HTTP fixture）；不等于实际 Panel/Agent E2E。
 

@@ -73,9 +73,13 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 `execution.supported=false`。计划顺序是预留候选 → 准备/验证出口 → 切换/验证入口 → 旧连接排空 → 确认退役 → 释放旧端口；本切片**不执行这些步骤**，不生成/解封真实密钥，不写版本/部署/租约，不启动/重启进程。当前端点编辑与密钥轮换门禁继续生效。后续执行器必须重新检查授权、策略、能力、引用 CAS、租约和所有权，加入持久迁移状态、故障补偿及不可变统计归属后再开放有引用维护。
 
+<a id="link-maintenance-intents"></a>
+
 ## 共享链路持久维护计划（F5 状态基础）
 
 本段属于 `feat/link-maintenance-state`，不是在线迁移执行器。默认 `TUNEX_LINK_MAINTENANCE_ENABLED=false`；Panel/Worker 同时设为精确 `true` 才可提交。预览本身仍零写入：开关开启时另返回 `submission.supported=true` 与 `snapshot.receipt`。回执使用独立用途的 HMAC（现有 seal key），有效期 60 秒，绑定 Workspace/Link、完整状态 token 和请求摘要；不代替现有认证/CSRF/权限校验。令牌和私有快照不得进入日志、Support Bundle 或公开历史。
+
+源码 `0ebb16e` 已通过独立 CI 与限定 Linux/MySQL 实网，PR #77 尚未合并/发布，详见 [测试说明](testing.md#f5-intent-evidence)。
 
 | API（前缀 `/api/links/:id/maintenance`） | 契约 |
 | --- | --- |
