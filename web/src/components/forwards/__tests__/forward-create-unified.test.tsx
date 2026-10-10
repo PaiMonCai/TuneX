@@ -42,9 +42,9 @@ describe("unified Forward product entry", () => {
     expect(workspaceSource).toContain('id="forward-create-native-path"');
     expect(workspaceSource).toContain('value="direct"');
     expect(workspaceSource).toContain('value="relay"');
-    expect(workspaceSource).toContain("<ForwardCreateDialog\\n              embedded");
-    expect(workspaceSource).toContain("<EncryptedForwardCreateDialog\\n            key={currentId}\\n            embedded");
-    expect(workspaceSource).toContain('router.push(`/forwards/${forwardId}`)');
+    expect(workspaceSource).toMatch(/<ForwardCreateDialog\s+embedded/);
+    expect(workspaceSource).toMatch(/<EncryptedForwardCreateDialog\s+key=\{currentId\}\s+embedded/);
+    expect(workspaceSource).toContain('onCreated={(_linkId) => {');
     expect(workspaceSource).not.toContain("encryptedCreateOpen");
   });
 
