@@ -34,11 +34,18 @@ describe("unified Forward product entry", () => {
     });
   }
 
-  test("all Forward creations start at one choice; native retains direct/relay path", () => {
+  test("one Forward form chooses transport and native path without an extra creation dialog", () => {
     expect(workspaceSource).toContain("forward-create-choice");
-    expect(workspaceSource).toContain('openCreate("direct")');
-    expect(workspaceSource).toContain('openCreate("relay")');
-    expect(workspaceSource).toContain("<EncryptedForwardCreateDialog");
+    expect(workspaceSource).toContain('id="forward-create-transport"');
+    expect(workspaceSource).toContain('value="native"');
+    expect(workspaceSource).toContain('value="fxp"');
+    expect(workspaceSource).toContain('id="forward-create-native-path"');
+    expect(workspaceSource).toContain('value="direct"');
+    expect(workspaceSource).toContain('value="relay"');
+    expect(workspaceSource).toMatch(/<ForwardCreateDialog\s+embedded/);
+    expect(workspaceSource).toMatch(/<EncryptedForwardCreateDialog\s+key=\{currentId\}\s+embedded/);
+    expect(workspaceSource).toContain('onCreated={(_linkId) => {');
+    expect(workspaceSource).not.toContain("encryptedCreateOpen");
   });
 
   test("FXP creation stays under Link writer, not ordinary Forward mutation", () => {

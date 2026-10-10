@@ -18,9 +18,10 @@ type ReadState = "loading" | "ready" | "failed";
  * Unified Forward creation keeps the Link as the sole writer for FXP-managed rules.
  * Neither the native Forward API nor its runtime is used here.
  */
-export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNodes, onClose, onCreated }: {
+export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNodes, onClose, onCreated, embedded = false, onBusyChange }: {
   workspaceId: number; nodes: UserNode[]; canManageNodes: boolean;
   onClose: () => void; onCreated: (linkId: number, forwardId: number) => void;
+  embedded?: boolean; onBusyChange?: (busy: boolean) => void;
 }) {
   const { locale } = useI18n();
   const copy = linksCopy(locale);
@@ -37,7 +38,9 @@ export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNode
     let current = true;
     linksApi.list(workspaceId).then((result) => {
       if (!current) return;
-      setLinks(result.filter((link) => !["retiring", "retired"].includes(link.status)));
+      const eligible = result.filter((link) => !["retiring", "retired"].includes(link.status));
+      setLinks(eligible);
+      if (eligible.length === 0) setNewLink(true);
       setReadState("ready");
     }).catch(() => { if (current) setReadState("failed"); });
     return () => { current = false; };
@@ -45,7 +48,7 @@ export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNode
 
   const onNewLink = async (input: LinkCreateInput) => {
     if (busy || !canManageNodes) return;
-    setBusy(true); setErrorCode(null);
+    setBusy(true); onBusyChange?.(true); setErrorCode(null);
     try {
       const created = await linksApi.create(workspaceId, input);
       setLinks((rows) => [created, ...rows]);
@@ -55,13 +58,13 @@ export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNode
       setErrorCode(linkErrorInfo(error).code);
       // A lost response may follow a committed write. Don't offer blind retry.
       setWriteUnconfirmed(true);
-    } finally { setBusy(false); }
+    } finally { setBusy(false); onBusyChange?.(false); }
   };
 
   const onCreateForward = async (binding: LinkBindingInput) => {
     const id = Number(linkId);
     if (busy || writeUnconfirmed || !Number.isSafeInteger(id) || id <= 0) return;
-    setBusy(true); setErrorCode(null);
+    setBusy(true); onBusyChange?.(true); setErrorCode(null);
     try {
       const created = await linksApi.createForward(workspaceId, id, binding);
       onCreated(id, created.id);
@@ -69,18 +72,17 @@ export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNode
       setErrorCode(linkErrorInfo(error).code);
       // The Forward revision can persist before Link deployment fails.
       setWriteUnconfirmed(true);
-    } finally { setBusy(false); }
+    } finally { setBusy(false); onBusyChange?.(false); }
   };
 
   const selected = links.find((link) => String(link.id) === linkId);
-  return <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
-    <DialogContent className="max-w-2xl" data-testid="encrypted-forward-create">
-      <DialogHeader>
+  const content = <>
+      {!embedded && <DialogHeader>
         <DialogTitle>{zh ? "创建加密转发" : "Create encrypted forward"}</DialogTitle>
         <DialogDescription>{zh
           ? "每条转发规则绑定一个可复用的 FXP 加密连接；节点间连接端口与业务监听端口分别配置。"
           : "Bind a forwarding rule to a reusable FXP link. The carrier port is separate from the business listener."}</DialogDescription>
-      </DialogHeader>
+      </DialogHeader>}
       {!canManageNodes ? <p role="alert">{zh ? "创建或使用加密连接需要节点管理权限。" : "Managing an encrypted link requires node management permission."}</p>
       : readState === "loading" ? <p role="status">{copy.loading}</p>
       : readState === "failed" ? <div className="space-y-2"><p role="alert">{copy.readFailed}</p>
@@ -126,6 +128,7 @@ export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNode
           : null}
         </>}
       </>}
-    </DialogContent>
-  </Dialog>;
+  </>;
+  return embedded ? <div className="space-y-3" data-testid="encrypted-forward-create">{content}</div>
+    : <Dialog open onOpenChange={(open) => { if (!open && !busy) onClose(); }}><DialogContent className="max-w-2xl">{content}</DialogContent></Dialog>;
 }

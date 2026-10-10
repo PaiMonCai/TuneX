@@ -23,7 +23,7 @@ type ListText = (key: ForwardListTextKey, params?: Record<string, string | numbe
 
 export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBindings, egressNodes, canManageNodes,
   busy, locale, t, text, onOpenChange, onDraftChange, onCreate,
-  bindingsUnavailable = false, workspaceId = null, bindingsByIngress = null, capabilities = null }: {
+  bindingsUnavailable = false, workspaceId = null, bindingsByIngress = null, capabilities = null, embedded = false }: {
   open: boolean; draft: ForwardCreateDraft; ingressNodes: UserNode[]; selectedBindings: NodeBinding[];
   egressNodes: UserNode[]; canManageNodes: boolean; busy: boolean; locale: Locale;
   t: Translate; text: ListText; onOpenChange: (open: boolean) => void; onDraftChange: (draft: ForwardCreateDraft) => void;
@@ -49,6 +49,8 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
    */
   bindingsByIngress?: Record<string, NodeBinding[]> | null;
   capabilities?: ForwardCapabilities | null;
+  /** Use the same native form inside the unified Create Forward dialog. */
+  embedded?: boolean;
 }) {
   const protocolErrors = forwardCreateProtocolErrors(draft);
   const protocolReady = Object.keys(protocolErrors).length === 0 && Object.keys(forwardPolicyDraftErrors(draft)).length === 0;
@@ -112,12 +114,11 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
         }
       : null,
   });
-  return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent>
-      <DialogHeader>
+  const content = <>
+      {!embedded && <DialogHeader>
         <DialogTitle>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</DialogTitle>
         <DialogDescription>{draft.mode === "relay" ? t("forward.relayDesc") : t("forward.directDesc")}</DialogDescription>
-      </DialogHeader>
+      </DialogHeader>}
       {ingressNodes.length === 0 ? <div className="rounded-md border border-[var(--border)] p-4 text-sm text-[var(--muted-foreground)]">{t("forward.noIngress")}</div> :
       <div className="flex flex-col gap-4">
         <section data-testid="forward-create-basic" className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
@@ -202,8 +203,9 @@ export function ForwardCreateDialog({ open, draft, ingressNodes, selectedBinding
       <DialogFooter><Button variant="outline" onClick={() => onOpenChange(false)}>{t("common.cancel")}</Button>
         <Button onClick={onCreate} disabled={busy || ingressNodes.length === 0 || !protocolReady || bothBlocked || multihopBlocked || (draft.mode === "relay" && !draft.egressId)}>{draft.mode === "relay" ? t("forward.createRelay") : t("forward.createDirect")}</Button>
       </DialogFooter>
-    </DialogContent>
-  </Dialog>;
+  </>;
+  return embedded ? <div className="space-y-4" data-testid="native-forward-create-fields">{content}</div>
+    : <Dialog open={open} onOpenChange={onOpenChange}><DialogContent>{content}</DialogContent></Dialog>;
 }
 
 function Field({ label, hint, error, children }: { label: string; hint?: string; error?: string; children: React.ReactNode }) {
