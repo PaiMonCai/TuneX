@@ -402,7 +402,7 @@ export const zh = {
   },
   forward: {
     title: "转发管理",
-    subtitle: "统一查看普通与加密转发；在创建时选择传输方式，节点与加密连接在网络资源中管理"
+    subtitle: "统一查看普通与加密转发；在创建时选择传输方式，节点与加密连接在网络资源中管理",
     createForward: "创建转发",
     nativeType: "普通转发",
     nativeTypeHint: "支持直连和自定义节点路径；传统节点间中继不等于加密。",
@@ -1542,7 +1542,7 @@ export const en: Dict = {
   },
   forward: {
     title: "Forward Management",
-    subtitle: "Manage native and encrypted forwarding rules together; choose the transport when creating a forward"
+    subtitle: "Manage native and encrypted forwarding rules together; choose the transport when creating a forward",
     createForward: "Create forward",
     nativeType: "Native forward",
     nativeTypeHint: "Direct or custom node path. Traditional relay hops are not automatically encrypted.",
