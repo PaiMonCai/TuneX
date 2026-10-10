@@ -1,6 +1,6 @@
 "use client";
 
-import { Plus, RefreshCw, Route, Search, X } from "lucide-react";
+import { Plus, RefreshCw, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -18,7 +18,7 @@ export function ForwardToolbar({
   ingressNodes: UserNode[]; egressNodes: UserNode[]; canCreate: boolean; t: Translate; text: ListText;
   onMode: (value: ForwardModeFilter) => void; onStatus: (value: ForwardStatusFilter) => void;
   onIngress: (value: string) => void; onEgress: (value: string) => void; onKeyword: (value: string) => void;
-  onCreate: (mode: "direct" | "relay") => void; onRefresh?: () => void; onReset?: () => void; loading?: boolean;
+  onCreate: () => void; onRefresh?: () => void; onReset?: () => void; loading?: boolean;
 }) {
   const filtered = !!keyword.trim() || mode !== "all" || status !== "all" || ingress !== "all" || egress !== "all";
   return (
@@ -36,8 +36,7 @@ export function ForwardToolbar({
           {onRefresh && <Button size="icon" variant="outline" disabled={loading} onClick={onRefresh} aria-label={t("common.refresh")} title={t("common.refresh")}>
             <RefreshCw className={loading ? "animate-spin motion-reduce:animate-none" : ""} />
           </Button>}
-          <Button disabled={!canCreate} variant="outline" onClick={() => onCreate("direct")}><Plus />{t("forward.createDirect")}</Button>
-          <Button disabled={!canCreate} onClick={() => onCreate("relay")}><Route />{t("forward.createRelay")}</Button>
+          <Button disabled={!canCreate} data-testid="forward-create-unified" onClick={onCreate}><Plus />{t("forward.createForward")}</Button>
         </div>
       </div>
       <div className="grid grid-cols-1 gap-2 border-t border-[var(--border)] bg-[var(--background)]/40 p-3 sm:grid-cols-2 sm:p-4 xl:grid-cols-[minmax(180px,1.5fr)_repeat(3,minmax(140px,1fr))_auto]">

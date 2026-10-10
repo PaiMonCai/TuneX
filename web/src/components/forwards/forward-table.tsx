@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { forwardAccessAddress } from "@/components/forwards/forward-copy";
+import { linkedForwardHref } from "@/components/links/linked-forward-guide";
 import { applyErrorAction, forwardProductBadgeVariant, forwardProductStatus } from "@/lib/forward-status";
 import { formatDateTime } from "@/lib/utils";
 import { forwardTransportFor } from "@/lib/forward-protocol";
@@ -72,7 +73,9 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
                 aria-label={text("forward.selectRow")} disabled={selectionBusy || !(canSelect ? canSelect(forward) : canUpdate(forward))} checked={selectedIds.has(Number(forward.id))}
                 onChange={(event) => onSelect(Number(forward.id), event.target.checked)} /></TableCell>
               <TableCell className="min-w-40 max-w-60 break-words font-medium"><Link href={"/forwards/" + forward.id} className="hover:underline">{forward.name}</Link></TableCell>
-              <TableCell><Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>{forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}</Badge></TableCell>
+              <TableCell>{linkedForwardHref(forward) ? <Link href={linkedForwardHref(forward)!} data-testid={`forward-fxp-${forward.id}`}>
+                <Badge variant="outline">{locale === "en" ? "Encrypted FXP" : "加密 FXP"}</Badge>
+              </Link> : <Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>{forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}</Badge>}</TableCell>
               <TableCell className="min-w-32"><ForwardProtocolBadge forward={forward} />{forwardTransportFor(forward.protocol) === "mixed" ? <p data-testid="forward-row-mixed" className="text-xs text-[var(--muted-foreground)]">{locale === "en" ? "TCP streams + UDP mappings · one shared budget" : "TCP 流 + UDP 映射 · 一条共享预算"}</p> : null}</TableCell>
               <TableCell className="whitespace-nowrap">{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
               <TableCell className="whitespace-nowrap">{forward.egress_node?.node_id ?? "—"}</TableCell>
