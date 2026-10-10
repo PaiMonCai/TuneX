@@ -38,7 +38,7 @@ export async function UserShell({
   const resolvedSubtitle = subtitle ?? (subtitleKey ? t(subtitleKey) : undefined);
 
   return (
-    <div className="flex min-h-screen bg-[var(--background)]" data-lang={locale} data-console="user">
+    <div className="flex min-h-svh bg-[var(--background)]" data-lang={locale} data-console="user">
       <Sidebar
         groups={visibleNavGroups("user")}
         locale={locale}
@@ -46,14 +46,14 @@ export async function UserShell({
         console="user"
         activeHref={activeHref}
       />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col" data-console-content>
         <Topbar
           title={resolvedTitle}
           subtitle={resolvedSubtitle}
           console="user"
           showAdminEntry={canEnterAdminConsole(persona)}
         />
-        <main className="mx-auto w-full max-w-[1400px] flex-1 p-4 pt-16 lg:p-6 lg:pt-6">{children}</main>
+        <main id="console-main" className="console-main max-w-[1400px]" tabIndex={-1}>{children}</main>
       </div>
     </div>
   );

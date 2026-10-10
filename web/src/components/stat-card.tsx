@@ -22,14 +22,14 @@ export function StatCard({
       <CardContent className="flex items-start justify-between gap-3 p-5">
         <div className="min-w-0">
           <p className="text-xs text-[var(--muted-foreground)]">{title}</p>
-          <p className="mt-1.5 truncate text-2xl font-semibold" data-testid={testId}>
+          <p className="mt-2 truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl" data-testid={testId}>
             {value}
           </p>
           {hint && <p className="mt-1 truncate text-xs text-[var(--muted-foreground)]">{hint}</p>}
         </div>
         {Icon && (
-          <div className="grid size-9 shrink-0 place-items-center rounded-md bg-[var(--muted)] text-[var(--muted-foreground)]">
-            <Icon className="size-4" />
+          <div className="console-stat-icon">
+            <Icon className="size-5" />
           </div>
         )}
       </CardContent>

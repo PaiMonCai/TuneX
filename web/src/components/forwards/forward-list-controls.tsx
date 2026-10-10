@@ -44,13 +44,13 @@ export function ForwardListControls({
 }) {
   return (
     <div
-      className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] p-3"
+      className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--card)] p-3 sm:px-4"
       data-testid="forward-list-controls"
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-[var(--muted-foreground)]">{t("fields.orderBy")}</span>
         <Select value={sort} onValueChange={(value) => onSortChange(value as ForwardSortKey)}>
-          <SelectTrigger className="h-9 w-36" data-testid="forward-sort-select">
+          <SelectTrigger className="h-9 w-36" aria-label={t("fields.orderBy")} data-testid="forward-sort-select">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -78,7 +78,7 @@ export function ForwardListControls({
         </span>
         <span className="text-xs text-[var(--muted-foreground)]">{text("forward.pageSize")}</span>
         <Select value={String(pageSize)} onValueChange={(value) => onPageSizeChange(Number(value))}>
-          <SelectTrigger className="h-9 w-24" data-testid="forward-page-size">
+          <SelectTrigger className="h-9 w-20" aria-label={text("forward.pageSize")} data-testid="forward-page-size">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

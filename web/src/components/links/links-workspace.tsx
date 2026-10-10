@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Network, Plus, RefreshCw } from "lucide-react";
 import { useI18n } from "@/components/providers";
 import { useWorkspace } from "@/components/workspace/workspace-context";
 import { Button } from "@/components/ui/button";
@@ -11,7 +12,8 @@ import type { LinkDetail, LinkForward, LinkResource } from "@/lib/links-types";
 import { isLinkMaintenancePreviewCurrent, type LinkMaintenancePreviewInput } from "@/lib/link-maintenance-types";
 import type { UserNode } from "@/lib/types";
 import { linksCopy, type LinksCopy } from "./links-copy";
-import { LinkBindingForm, LinkConfigForm, selectClass } from "./link-forms";
+import { LinkBindingForm, LinkConfigForm } from "./link-forms";
+import { LinkResourceCollection } from "./link-resource-collection";
 import { LinkDetailView } from "./link-detail";
 import { LinkMaintenancePanel } from "./link-maintenance-preview";
 import { LinkMaintenancePlans } from "./link-maintenance-plans";
@@ -151,10 +153,10 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
   const showError = error ?? readError;
   return <div className="space-y-5" aria-busy={busy || loading}>
     <div className="flex flex-wrap items-center justify-between gap-3">
-      <p className="text-sm text-[var(--muted-foreground)]">{canManage ? copy.subtitle : copy.readonly}</p>
+      <p className="max-w-2xl text-sm leading-6 text-[var(--muted-foreground)]">{canManage ? copy.subtitle : copy.readonly}</p>
       <div className="flex flex-wrap gap-2">
-        <Button variant="outline" disabled={busy || loading} onClick={refresh}>{copy.refresh}</Button>
-        {canManage && <Button disabled={mutationDisabled || !!editor || !!confirm} onClick={() => { setNotice(null); setError(null); setEditor({ type: "create" }); }}>{copy.create}</Button>}
+        <Button variant="outline" disabled={busy || loading} onClick={refresh}><RefreshCw className={loading ? "animate-spin motion-reduce:animate-none" : ""} />{copy.refresh}</Button>
+        {canManage && <Button disabled={mutationDisabled || !!editor || !!confirm} onClick={() => { setNotice(null); setError(null); setEditor({ type: "create" }); }}><Plus />{copy.create}</Button>}
       </div>
     </div>
     {showError && <div role="alert" className="space-y-2 rounded-md border border-[var(--destructive)] p-4 text-sm">
@@ -163,12 +165,11 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
     </div>}
     {notice && <p role="status" className="text-sm">{notice}</p>}
     {loading && <p role="status" className="text-sm">{copy.loading}</p>}
-    {list !== null && list.length === 0 && !loading && <Card><CardContent className="pt-5">{copy.empty}</CardContent></Card>}
-    {!!list?.length && <div className="grid gap-2"><label htmlFor="links-selected" className="text-sm font-medium">{copy.select}</label>
-      <select id="links-selected" className={`${selectClass} max-w-xl`} value={selected ?? ""} disabled={busy || !!editor || !!confirm} onChange={(e) => { invalidatePreview(); setPreviewOpen(false); fence.current.next("read"); setDetail(null); setError(null); setNotice(null); setSelected(Number(e.target.value)); }}>
-        {list.map((link) => <option key={link.id} value={link.id}>{link.name}</option>)}
-      </select>
-    </div>}
+    {list !== null && list.length === 0 && !loading && <Card><CardContent className="flex flex-col items-center gap-3 py-12 text-center">
+      <div className="console-stat-icon"><Network className="size-5" /></div><p className="text-sm">{copy.empty}</p>
+    </CardContent></Card>}
+    {!!list?.length && <LinkResourceCollection links={list} selected={selected} disabled={busy || !!editor || !!confirm} copy={copy}
+      onSelect={(id) => { if (id === selected) return; invalidatePreview(); setPreviewOpen(false); fence.current.next("read"); setDetail(null); setError(null); setNotice(null); setSelected(id); }} />}
     {editor && canManage && !blocked && <Card>
       <CardHeader><CardTitle>{editor.type === "create" ? copy.create : editor.type === "config" ? copy.edit : editor.forward ? copy.editForward : copy.addForward}</CardTitle></CardHeader>
       <CardContent>

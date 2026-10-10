@@ -30,7 +30,7 @@ export async function AdminShell({
 
   return (
     <div
-      className="flex min-h-screen bg-[var(--background)]"
+      className="flex min-h-svh bg-[var(--background)]"
       data-lang={locale}
       data-console="admin"
       data-admin-access={adminAccessState(user)}
@@ -42,9 +42,9 @@ export async function AdminShell({
         console="admin"
         activeHref={activeHref}
       />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-w-0 flex-1 flex-col" data-console-content>
         <Topbar title={resolvedTitle} subtitle={resolvedSubtitle} console="admin" />
-        <main className="mx-auto w-full max-w-[1800px] flex-1 p-4 pt-16 lg:px-6 lg:py-4 lg:pt-4">
+        <main id="console-main" className="console-main max-w-[1800px]" tabIndex={-1}>
           {children}
         </main>
       </div>
