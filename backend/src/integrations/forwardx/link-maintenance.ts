@@ -41,6 +41,8 @@ export interface MaintenanceState {
     bindings: { forward_id: number; protocol: "tcp" | "udp" | "both"; revision: number }[] } | null;
   forwards: MaintenanceForward[];
   held_ports: (MaintenancePort & { id: number })[];
+  /** Secret-free desired bindings, endpoints and effective policy, excluding lease/report clocks. */
+  admission_digest?: string;
 }
 
 /** Versioned planning order, not an implemented executor or zero-downtime promise. */
@@ -99,6 +101,7 @@ export function buildLinkMaintenancePreview(state: MaintenanceState, input: Link
     link: { id: link.id, workspace_id: link.workspace_id, status: link.status,
       desired_version: link.desired_version, generation: link.generation },
     config, operation: input.change.type, candidate,
+    ...(state.admission_digest ? { admission_digest: state.admission_digest } : {}),
     deployment: deployment ? { id: deployment.id, version: deployment.version, generation: deployment.generation,
       status: deployment.status, bindings_current: deployment.bindings_current,
       bindings: [...deployment.bindings].sort((a, b) => a.forward_id - b.forward_id),

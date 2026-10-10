@@ -51,7 +51,7 @@ test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores 
     const db = {
       linkResource:table("link"),linkVersion:table("version"),linkTransportCredential:table("credential"),
       linkDeployment:table("deployment"),linkPlacement:table("placement"),tunnel:table("tunnel"),
-      nodePortLease:table("lease"),forwardRevision:table("revision"),
+      nodePortLease:table("lease"),forwardRevision:table("revision"),linkMaintenanceMigration:table("maintenance"),
       nodeStateReport:{findMany:async()=>liveReports},
       linkTrafficCheckpoint:{groupBy:async({where})=>{assert.equal(where.workspace_id,3);assert.equal(where.link_id,1);return usageRows.filter(row=>where.forward_id.in.includes(row.forward_id));}},
       node:{ findMany:async({where,include})=> {assert.equal(include.state_report.select.version,true);return [11,12].filter(id=>where.id.in.includes(id)&&where.node_group.workspace_id===3).map(id=>({id,
@@ -146,6 +146,20 @@ test("Link lifecycle preserves F2 targets and F3 sources, gates writes/restores 
     process.env.TUNEX_FXP_LINKS_ENABLED="false";
     await assert.rejects(()=>service.previewLinkMaintenance(3,link.id,previewInput()),e=>e.code==="fxp_links_not_enabled");
     process.env.TUNEX_FXP_LINKS_ENABLED="true";
+    // The production writer entrypoints, not only the guard helper, must respect the same Link fence.
+    tables.maintenance.push({id:1,link_id:link.id,active_link_id:link.id,status:"awaiting_executor",
+      state_version:1,hold_expires_at:new Date(Date.now()+300000)});
+    const fencedState=maintenanceState(),fencedSent=sent.length,fencedAcquired=acquired.length;
+    for(const write of [
+      ()=>service.createLinkForward(3,link.id,8,rule("fenced",26002)),
+      ()=>service.updateLinkForward(3,link.id,a.id,8,1,rule("fenced A",26000)),
+      ()=>service.updateLink(3,link.id,1,{...initial.config,carrier_port:25001}),
+      ()=>service.deployLink(3,link.id),()=>service.deployLink(3,link.id,true),()=>service.retireLink(3,link.id),
+      ...["suspend","resume","retry","delete"].map(action=>()=>service.actionLinkForward(3,link.id,a.id,action,8)),
+    ]) await assert.rejects(write,e=>e.code==="link_maintenance_in_progress");
+    await service.previewLinkMaintenance(3,link.id,previewInput()); // Read-only previews remain allowed.
+    assert.deepEqual(maintenanceState(),fencedState);assert.equal(sent.length,fencedSent);assert.equal(acquired.length,fencedAcquired);
+    tables.maintenance.length=0;
     await assert.rejects(()=>service.updateLink(3,link.id,1,{...initial.config,carrier_port:25001}),e=>e.code==="link_has_references");
     await assert.rejects(()=>service.deployLink(3,link.id,true),e=>e.code==="link_has_references");
     const baseReferenceCount=tables.tunnel.length;

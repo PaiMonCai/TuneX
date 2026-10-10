@@ -56,8 +56,10 @@ const worker = new Worker(
     const started = Date.now();
     switch (job.name) {
       case "cron_link_reconcile": {
+        const { reconcileLinkMaintenance } = await import("./services/link-maintenance.ts");
+        const maintenance = await reconcileLinkMaintenance();
         const { reconcileLinks } = await import("./services/link-resource.ts");
-        return reconcileLinks();
+        return { ...await reconcileLinks(), maintenance };
       }
       case "cron_save_traffic": {
         // Redis traffic buffer → MySQL archive. SETNX + unique key + consume/delete keep it idempotent.

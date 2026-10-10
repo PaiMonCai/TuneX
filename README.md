@@ -26,7 +26,8 @@ TuneX 由 Panel 与 Agent 组成。Panel 提供 Web 管理、策略编排和状�
 ### 核心开发状态（2026-10-10）
 
 - 已合并：PR #75 / `main` 基线 `ef159eb`，包含共享 FXP 统计分段、多目标、共享 TCP PROXY/IP_HASH 首切片，以及 Linux plain DIRECT/自有单跳 RELAY 的原生 TCP+UDP both。
-- 开发中：草稿 PR #76 / `feat/forward-link-maintenance`，F5 只读维护预览源码 `cdb8470` 已验收；有引用的在线端点变更/密钥轮换执行器尚未完成。
+- 已合并：PR #76 / `main` 基线 `54542d3`，F5 只读维护预览与文档整理；main CI required 通过。
+- 开发中：`feat/link-maintenance-state`，新增持久维护计划、幂等提交/CAS、取消与过期/漂移回收；不执行有引用的在线端点变更/密钥轮换。
 - FXP 与原生 both 的开关仍默认关闭；本轮没有生产发布。真实 Panel 浏览器、长期运行等发布条件见 [验收说明](docs/testing.md)，不能由 CI 绿色替代。
 - 优先完善转发核心；支付后置、Windows 适配暂停。保留既有 Agent 恢复缓存，没有明显性能收益时不新增缓存优化。
 

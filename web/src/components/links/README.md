@@ -18,13 +18,19 @@ Managed rule reload rebuilds changed rules and may interrupt their connections. 
 
 ## F5 read-only maintenance preview
 
-This slice belongs to draft/unmerged PR #76 on `feat/forward-link-maintenance`, not the merged PR #75 runtime baseline. The production component uses `POST /api/links/:id/maintenance/preview` through the existing session/CSRF/Workspace request layer. The closed request captures `expected_version`, `expected_generation`, and either complete `update_endpoints` config (`ingress_node_id`, `egress_node_id`, `carrier_port`) or `rotate_key` with no client-supplied key.
+PR #76 merged this slice into main at `54542d3`. The production component uses `POST /api/links/:id/maintenance/preview` through the existing session/CSRF/Workspace request layer. The closed request captures `expected_version`, `expected_generation`, and either complete `update_endpoints` config (`ingress_node_id`, `egress_node_id`, `carrier_port`) or `rotate_key` with no client-supplied key.
 
 The preview includes all references (including suspended rules), current/candidate listeners, held/candidate ports, interruption warnings and a state-bound token. Current TCP connections/UDP mappings remain unknown, not cumulative traffic totals. Candidate numbers are predictions: `reserved=false`, `availability=not_checked`; `execution.supported=false`. There is no execute button, version/credential write, command dispatch or port reservation. Existing endpoint and key-rotation restrictions remain intact.
 
 The strict projection rejects malformed scope, dates, reference/port bounds and invented runtime counts, and does not retain key/ciphertext/runner/target configuration. A preview expires after 60 seconds. Input, read, mutation, permission, resource or Workspace changes fence outstanding results; read-only preview does not use the persisted-write success/reload lifecycle. The 15-second detail polling invalidates results while preserving draft operation and input via `invalidationEpoch`, not a keyed form remount. Complete graphs are limited to 500 references / 2048 held ports, never a silently truncated impact report.
 
 Actual migration, bounded dual generations, egress prepare/verify, ingress cutover, drain/retirement, failure recovery and cross-generation accounting are future executor work. See [the next slice](../../../../docs/DEVELOPMENT_PLAN.md#f5-next-slice).
+
+## F5 durable intent (development branch)
+
+`feat/link-maintenance-state` optionally enables a separate **Save maintenance plan (no cutover)** action when the server supplies a fresh receipt and submission support. The preview remains read-only. Save uses the normal fenced write lifecycle and canonical UUID, then reloads metadata history; cancellation sends persisted `state_version` CAS. Scoped history is available to readers, cancellation only to managers; pending intents disable conflicting detail actions. Closed projections reject invented execution, reserved ports, mismatched candidate/scopes and malformed terminal state. No private snapshot, receipt or target data is retained in history.
+
+The five-minute fence is logical only; old runtime ownership remains unchanged. Read unknown writes back before retrying; exact receipt/UUID retries are idempotent server-side, different UUIDs cannot create a second live intent. Submission is default-off; endpoints/key direct-write restrictions remain. Browser `runF5IntentBrowserChecks()` passed 11/11 on the loopback HTTP fixture, not actual Panel/Agent E2E.
 
 ## Forward traffic snapshots
 

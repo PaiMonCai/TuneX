@@ -12,6 +12,7 @@ test("F5 preview HTTP preserves manage permission, Workspace scoping, strict inp
     import { Hono } from "hono";
     import { HTTPException } from "hono/http-exception";
     import { LinkMaintenancePreviewSchema } from ${modulePath("../../integrations/forwardx/link-maintenance.ts")};
+    import { LinkMaintenanceCommitSchema, LinkMaintenanceCancelSchema } from ${modulePath("../../integrations/forwardx/link-maintenance-state.ts")};
     let authed=true, allowed=true, failure=null;
     const calls=[], permissions=[];
     mock.module(${modulePath("../../services/workspace.ts")},()=>({resolveWorkspaceAccess:async(c,action,resource)=>{
@@ -22,6 +23,16 @@ test("F5 preview HTTP preserves manage permission, Workspace scoping, strict inp
     }}));
     class LinkResourceError extends Error { constructor(code,status=409){super(code);this.code=code;this.status=status;} }
     const unused=async()=>{throw Error("unexpected_mutation");};
+    let replay=false;
+    const maintenanceCalls=[];
+    mock.module(${modulePath("../../services/link-maintenance.ts")},()=>({
+      commitLinkMaintenance:async(ws,id,actor,raw)=>{const input=LinkMaintenanceCommitSchema.parse(raw);
+        maintenanceCalls.push(["commit",ws,id,actor,input]);return{migration:{id:19,status:"awaiting_executor"},replayed:replay};},
+      listLinkMaintenance:async(ws,id)=>{maintenanceCalls.push(["list",ws,id]);return[];},
+      getLinkMaintenance:async(ws,id,migration)=>{maintenanceCalls.push(["get",ws,id,migration]);return{id:migration};},
+      cancelLinkMaintenance:async(ws,id,migration,actor,raw)=>{const input=LinkMaintenanceCancelSchema.parse(raw);
+        maintenanceCalls.push(["cancel",ws,id,migration,actor,input]);return{id:migration,status:"cancelled"};},
+    }));
     mock.module(${modulePath("../../services/link-resource.ts")},()=>({LinkResourceError,
       listLinks:unused,getLink:unused,createLink:unused,updateLink:unused,deployLink:unused,retireLink:unused,
       createLinkForward:unused,updateLinkForward:unused,actionLinkForward:unused,
@@ -52,6 +63,25 @@ test("F5 preview HTTP preserves manage permission, Workspace scoping, strict inp
     }
     failure=Error("runner key=must-not-leak");response=await req();assert.equal(response.status,503);
     assert.deepEqual(await response.json(),{error:"连接资源操作未完成",code:"link_operation_failed"});
+    failure=null;
+    const intent={...body,idempotency_key:"4fcd5c30-8ee9-4a1e-8dc5-64267c5ee04a",receipt:"signed-receipt"};
+    const call=(suffix,method="GET",data)=>app.request("http://localhost/api/links/3/maintenance/migrations"+suffix,{
+      method,headers:{"content-type":"application/json","x-workspace-id":"999"},...(data?{body:JSON.stringify(data)}:{})});
+    response=await call("","POST",intent);assert.equal(response.status,201);assert.equal(response.headers.get("cache-control"),"no-store");
+    assert.deepEqual(maintenanceCalls.at(-1),["commit",5,3,8,intent]);
+    replay=true;response=await call("","POST",intent);assert.equal(response.status,200);
+    response=await call("");assert.equal(response.status,200);assert.deepEqual(maintenanceCalls.at(-1),["list",5,3]);
+    response=await call("/19");assert.equal(response.status,200);assert.deepEqual(maintenanceCalls.at(-1),["get",5,3,19]);
+    response=await call("/19/cancel","POST",{expected_state_version:1});assert.equal(response.status,200);
+    assert.deepEqual(maintenanceCalls.at(-1),["cancel",5,3,19,8,{expected_state_version:1}]);
+    const total=maintenanceCalls.length;
+    for(const [suffix,method,data] of [["","POST",{...intent,execute:true}],["/19/cancel","POST",{expected_state_version:0}],
+      ["/2147483648","GET",null]]){response=await call(suffix,method,data);assert.equal(response.status,400);}
+    assert.equal(maintenanceCalls.length,total);
+    allowed=false;for(const [suffix,method,data]of[["","GET",null],["","POST",intent],["/19/cancel","POST",{expected_state_version:1}]]){
+      response=await call(suffix,method,data);assert.equal(response.status,403);assert.equal(response.headers.get("cache-control"),"no-store");}
+    allowed=true;authed=false;response=await call("","POST",intent);assert.equal(response.status,401);
+    assert.equal(maintenanceCalls.length,total);
   `;
   writeFileSync(fixture, scenario, { flag: "wx" });
   try {

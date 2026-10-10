@@ -7,9 +7,11 @@ import {
   LinkResourceError, listLinks, getLink, createLink, updateLink, deployLink,
   retireLink, createLinkForward, updateLinkForward, actionLinkForward, previewLinkMaintenance,
 } from "../services/link-resource.ts";
+import { commitLinkMaintenance, listLinkMaintenance, getLinkMaintenance, cancelLinkMaintenance } from "../services/link-maintenance.ts";
 
 export const linksRoutes = new Hono<{ Variables: AppVariables }>();
 linksRoutes.use("*", async (c, next) => {
+  if (/\/maintenance\//.test(c.req.path)) c.header("Cache-Control", "no-store");
   // Carrier administration owns every binding it manages, like node routes.
   const action = ["GET", "HEAD"].includes(c.req.method) ? "read" : "manage";
   c.set("workspace", await resolveWorkspaceAccess(c, action, "node"));
@@ -24,7 +26,12 @@ linksRoutes.use("*", async (c, next) => {
   await next();
 });
 linksRoutes.onError((error, c) => {
-  if (error instanceof HTTPException) return error.getResponse();
+  if (error instanceof HTTPException) {
+    const response = error.getResponse();
+    if (!/\/maintenance\//.test(c.req.path)) return response;
+    const headers = new Headers(response.headers); headers.set("Cache-Control", "no-store");
+    return new Response(response.body, { status: response.status, headers });
+  }
   if (error instanceof LinkResourceError) return c.json({ error: error.code, code: error.code }, error.status);
   if (error instanceof z.ZodError) return c.json({ error: "参数不合法", code: "invalid_input" }, 400);
   const code = (error as { code?: unknown }).code;
@@ -46,6 +53,20 @@ linksRoutes.post("/:id/maintenance/preview", async (c) => {
   const raw = await c.req.json().catch(() => { throw new LinkResourceError("invalid_input", 400); });
   return c.json({ data: await previewLinkMaintenance(c.get("workspace")!.id,
     positive.parse(c.req.param("id")), raw) });
+});
+linksRoutes.post("/:id/maintenance/migrations", async (c) => {
+  const raw = await c.req.json().catch(() => { throw new LinkResourceError("invalid_input", 400); });
+  const result = await commitLinkMaintenance(c.get("workspace")!.id, positive.parse(c.req.param("id")), c.get("user")!.id, raw);
+  return c.json({ data: result }, result.replayed ? 200 : 201);
+});
+linksRoutes.get("/:id/maintenance/migrations", async (c) => c.json({ data: await listLinkMaintenance(c.get("workspace")!.id,
+  positive.parse(c.req.param("id"))) }));
+linksRoutes.get("/:id/maintenance/migrations/:migrationId", async (c) => c.json({ data: await getLinkMaintenance(c.get("workspace")!.id,
+  positive.parse(c.req.param("id")), positive.parse(c.req.param("migrationId"))) }));
+linksRoutes.post("/:id/maintenance/migrations/:migrationId/cancel", async (c) => {
+  const raw = await c.req.json().catch(() => { throw new LinkResourceError("invalid_input", 400); });
+  return c.json({ data: await cancelLinkMaintenance(c.get("workspace")!.id, positive.parse(c.req.param("id")),
+    positive.parse(c.req.param("migrationId")), c.get("user")!.id, raw) });
 });
 linksRoutes.post("/:id/deploy", async (c) => c.json({ data: await deployLink(c.get("workspace")!.id, positive.parse(c.req.param("id"))) }));
 linksRoutes.post("/:id/rotate-key", async (c) => c.json({ data: await deployLink(c.get("workspace")!.id, positive.parse(c.req.param("id")), true) }));

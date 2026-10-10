@@ -14,7 +14,8 @@
 | 层级 | 已确认状态 |
 | --- | --- |
 | 已合并基线 | [PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 已合入 `main`，合并提交 `ef159eb`；[main CI 37944370097](https://github.com/PaiMonCai/TuneX/actions/runs/37944370097) required 通过。包含 F1/F2 首切片、F3 共享 TCP 来源、F4 Linux 原生 both 限定组合，不等于全部工作包或发布条件完成。 |
-| 当前开发 | `feat/forward-link-maintenance`，[PR #76](https://github.com/PaiMonCai/TuneX/pull/76) 为未合并草稿。F5 只读影响预览与迁移契约源码 `cdb8470` 的 [CI 37952731562](https://github.com/PaiMonCai/TuneX/actions/runs/37952731562) required 通过；在线迁移执行器尚未交付。 |
+| 已合并 F5 预览 | [PR #76](https://github.com/PaiMonCai/TuneX/pull/76) 已合入 `main`，提交 `54542d3`；[main CI 37957715413](https://github.com/PaiMonCai/TuneX/actions/runs/37957715413) required 通过。在线迁移执行器尚未交付。 |
+| 当前开发 | `feat/link-maintenance-state`：持久计划、幂等提交/CAS、取消/过期/漂移回收及逻辑编辑围栏。此分支尚未合并；自身 CI/实网证据单独记录，不能复用 PR #76 结果。 |
 | 发布边界 | 本轮没有生产部署、tag 或发行；`TUNEX_FXP_LINKS_ENABLED`、`FORWARD_NATIVE_BOTH_ENABLED` 仍默认关闭，公共 FXP 支持矩阵仍为 planned。 |
 
 当前功能范围与限制统一看 [运行边界](forwarding-runtime.md)，对应源码 SHA、实网结果和未运行项统一看 [测试说明](testing.md)。文档提交不改变上述源码验收归属，不用旧 CI 为新代码背书。

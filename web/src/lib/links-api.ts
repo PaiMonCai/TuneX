@@ -2,6 +2,7 @@ import { ApiError, request } from "@/lib/api/core";
 import { projectLinkDetail, projectLinkList, projectLinkResource, type LinkBindingInput,
   type LinkConfig, type LinkCreateInput, type LinkForwardAction, LinksPayloadError } from "./links-types";
 import { projectLinkMaintenanceInput, projectLinkMaintenancePreview, type LinkMaintenancePreviewInput } from "./link-maintenance-types";
+import { projectMaintenanceCommit, projectMaintenanceList, projectMaintenanceMigration, type LinkMaintenanceCommitInput } from "./link-maintenance-migrations";
 
 function matchingId<T extends { id: number }>(value: T, expectedId: number): T {
   if (value.id !== expectedId) throw new LinksPayloadError();
@@ -10,6 +11,30 @@ function matchingId<T extends { id: number }>(value: T, expectedId: number): T {
 
 /** Uses the shared session, CSRF, error and Workspace transport; never the global scope implicitly. */
 export const linksApi = {
+  listMaintenance: async (workspaceId: number, id: number) => projectMaintenanceList(await request<unknown>(
+    `/links/${id}/maintenance/migrations`, { workspaceId, cache: "no-store" }), workspaceId, id),
+  commitMaintenance: async (workspaceId: number, id: number, raw: LinkMaintenanceCommitInput) => {
+    const input = projectMaintenanceCommit(raw);
+    const result = await request<{ migration: unknown; replayed: unknown }>(`/links/${id}/maintenance/migrations`, {
+      workspaceId, method: "POST", body: input, cache: "no-store" });
+    if (!result || typeof result.replayed !== "boolean") throw new LinksPayloadError();
+    const migration = projectMaintenanceMigration(result.migration, workspaceId, id);
+    if (migration.operation !== input.change.type || migration.expected_version !== input.expected_version
+      || migration.expected_generation !== input.expected_generation) throw new LinksPayloadError();
+      if (input.change.type === "update_endpoints") {
+        const config = input.change.config;
+        if ((Object.keys(config) as (keyof typeof config)[])
+          .some((key) => migration.candidate_config[key] !== config[key])) throw new LinksPayloadError();
+      }
+    return { migration, replayed: result.replayed };
+  },
+  cancelMaintenance: async (workspaceId: number, id: number, migrationId: number, expected_state_version: number) => {
+    if (![workspaceId, id, migrationId, expected_state_version].every((v) => Number.isSafeInteger(v) && v > 0 && v <= 2_147_483_646)) throw new LinksPayloadError();
+    const result = projectMaintenanceMigration(await request<unknown>(`/links/${id}/maintenance/migrations/${migrationId}/cancel`, {
+      workspaceId, method: "POST", body: { expected_state_version }, cache: "no-store" }), workspaceId, id);
+    if (result.id !== migrationId || result.status !== "cancelled") throw new LinksPayloadError();
+    return result;
+  },
   list: async (workspaceId: number) => projectLinkList(await request<unknown>("/links", { workspaceId }), workspaceId),
   detail: async (workspaceId: number, id: number) => matchingId(projectLinkDetail(await request<unknown>(`/links/${id}`, { workspaceId }), workspaceId), id),
   previewMaintenance: async (workspaceId: number, id: number, raw: LinkMaintenancePreviewInput) => {
@@ -53,6 +78,7 @@ export function linkErrorInfo(error: unknown): LinkErrorInfo {
   const raw = data?.code ?? (error && typeof error === "object" && "code" in error ? error.code : null);
   const code = typeof raw === "string" && /^[a-z][a-z0-9_]{0,95}$/.test(raw) ? raw
     : error instanceof ApiError && error.status === 403 ? "permission_denied" : "link_request_failed";
-  return { code, conflict: ["revision_conflict", "link_version_conflict", "link_generation_conflict"].includes(code),
+  return { code, conflict: ["revision_conflict", "link_version_conflict", "link_generation_conflict", "link_maintenance_state_conflict",
+    "link_maintenance_idempotency_conflict", "link_maintenance_in_progress", "link_maintenance_preview_invalid", "link_maintenance_preview_expired"].includes(code),
     disabled: code === "fxp_links_not_enabled", denied: error instanceof ApiError && [401, 403].includes(error.status) };
 }

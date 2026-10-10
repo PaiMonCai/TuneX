@@ -7,9 +7,20 @@
 | 代码状态 | 固定提交与 CI | 结论 |
 | --- | --- | --- |
 | 已合并 main 基线 | `ef159eb6a9add92f25a4eaed88cdf783dec963eb`，[CI 37944370097](https://github.com/PaiMonCai/TuneX/actions/runs/37944370097) | PR #75 已合并；required 通过，包含主分支 Agent/race 和最早支持数据库升级。 |
-| F5 预览源码候选 | `cdb847039772b0ca07291c83044aee88a88e1dc6`，[CI 37952731562](https://github.com/PaiMonCai/TuneX/actions/runs/37952731562) | PR #76 为未合并草稿；选中检查及 required 通过。只读预览已验收，不是完整 F5 或生产发布。 |
+| F5 预览历史源码候选 | `cdb847039772b0ca07291c83044aee88a88e1dc6`，[CI 37952731562](https://github.com/PaiMonCai/TuneX/actions/runs/37952731562) | 当时为 PR #76 草稿；只读预览已验收，不是完整 F5 或生产发布。 |
+| 最新已合并 main | `54542d384117abd5d92d1a85a2d048e11425ff1a`，[CI 37957715413](https://github.com/PaiMonCai/TuneX/actions/runs/37957715413) | PR #76 已合并；required 通过。 |
 
-以下数量只属于各行固定源码/运行，不是持续更新的分支 HEAD 检查页。后续文档提交或新代码的 CI 须单独查看 [PR #76 检查](https://github.com/PaiMonCai/TuneX/pull/76/checks)；不把历史绿色改写为新 SHA 的结果。
+以下数量只属于各行固定源码/运行，不是持续更新的分支 HEAD 检查页。新代码的 CI 须单独查看；不把历史绿色改写为新 SHA 的结果。
+
+## F5 持久计划与提交 CAS（当前开发分支）
+
+从 `54542d3` 创建 `feat/link-maintenance-state`；新增记录/事件、签名回执、幂等提交、取消 CAS、并发编辑围栏及元数据重验。当前不执行迁移，也不检查/预留候选端口。自身 Linux CI 尚待运行，不能复用 main 或预览切片证据。
+
+本地：backend 状态契约 5 项、预览 10 项、真实编译器服务隔离场景/维护服务/HTTP 路由各 1 项；web 全量 1578 pass / 0 fail；两端类型检查、Prisma schema validate 通过。新增浏览器 `runF5IntentBrowserChecks` 11/11、只读预览 45/45、真实 15 秒轮询 5/5、既有 F2 44/44、F3 39/39（真实生产组件/HTTP fixture）；不等于实际 Panel/Agent E2E。
+
+真实 MySQL 新增 `backend/tests/link-maintenance.test.mjs` 五项，用 CI 现有专用 scratch DB 执行，覆盖行锁并发幂等、唯一活计划/CHECK、终态 CAS、事件失败原子回滚、逻辑过期及零部署/租约写入。本机没有 MySQL/Redis/Docker，未本地执行此类集成。
+
+`abcd-links.py` 扩展真实 API/DB/Worker 检查：伪造回执、同 UUID 并发、元数据脱敏、全部冲突写入、Worker 重启后实际恢复服务重验、取消 CAS/终态重试，以及 A/B held TCP 和固定 B UDP 目标 socket。显式调用生产恢复服务保证确定性，不声称已经观察到特定 cron tick。五分钟逻辑过期由独立 MySQL/单测验收，不冒称实网等待了五分钟。候选切换、双代、密钥失效/端口释放/跨代统计仍未验收。
 
 ## F5 影响预览首切片
 

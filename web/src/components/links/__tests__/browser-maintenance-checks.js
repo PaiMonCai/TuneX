@@ -1,4 +1,54 @@
 /** Disposable loopback replay of production Workspace, preview panel and shared transport. */
+export async function runF5IntentBrowserChecks() {
+  if (location.origin !== "http://127.0.0.1:41973") throw new Error("fixture_only");
+  const checks = [], pause = () => new Promise((resolve) => setTimeout(resolve, 30));
+  const check = (value, label) => { if (!value) throw new Error(label); checks.push(label); };
+  const until = async (fn, label) => { const end = performance.now() + 10000;
+    while (performance.now() < end) { const value = await fn(); if (value) return value; await pause(); } throw new Error(`timeout: ${label}`); };
+  const button = (name) => [...document.querySelectorAll("button")].find((b) => b.textContent.trim() === name);
+  const click = async (name) => { (await until(() => { const b = button(name); return b && !b.disabled && b; }, name)).click(); await pause(); };
+  const state = async () => (await (await fetch("/__test/state")).json()).data;
+  const scenario = (body) => fetch("/__test/scenario", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!button("Refresh")) await click("Toggle test language");
+  await scenario({ reset: true, maintenance: true, submission: true }); await click("Refresh");
+  await until(() => document.querySelector('main [aria-busy="false"]'), "idle");
+  const before = structuredClone((await state()).links);
+  await click("Maintenance preview");
+  const port = await until(() => document.querySelector('form[aria-label="Preview endpoint changes"] [name="carrier_port"]'), "port");
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(port, "26002");
+  port.dispatchEvent(new Event("input", { bubbles: true })); await pause();
+  await click("Generate preview");
+  await until(() => button("Save maintenance plan (no cutover)"), "explicit save");
+  check(document.body.textContent.includes("no port reservation, key generation or execution"), "save action explicitly promises only durable intent");
+  await click("Save maintenance plan (no cutover)");
+  await until(() => button("Cancel maintenance plan"), "persisted cancel");
+  check(document.body.textContent.includes("Awaiting executor (no automatic cutover)"), "history does not fabricate a successful cutover");
+  check(document.body.textContent.includes("Maintenance plan saved; no cutover has executed."), "write notice separates saved intent from execution");
+  let snapshot = await state();
+  const commits = snapshot.calls.filter((c) => c.method === "POST" && c.path.endsWith("/maintenance/migrations"));
+  check(commits.length === 1 && Object.keys(commits[0].body).length === 5 && commits[0].workspaceId === 5
+    && /^[0-9a-f-]{36}$/.test(commits[0].body.idempotency_key), "save uses canonical UUID, receipt, scope and version/generation CAS");
+  check(JSON.stringify(snapshot.links) === JSON.stringify(before), "save leaves actual fixture desired versions, bindings and deployments unchanged");
+  const blocked = [...document.querySelectorAll("button")].filter((b) => ["Add rule", "Deploy", "Edit"].includes(b.textContent.trim()));
+  check(blocked.length > 0 && blocked.every((b) => b.disabled), "pending intent disables conflicting detail actions");
+  await click("Toggle test permission");
+  await until(() => !button("Cancel maintenance plan"), "read-only history");
+  check(document.body.textContent.includes("Awaiting executor (no automatic cutover)"), "read-only actor retains scoped history without a cancellation control");
+  await click("Toggle test permission"); await until(() => button("Cancel maintenance plan"), "permission restored");
+  await click("Switch test workspace");
+  await until(() => !document.body.textContent.includes("Awaiting executor (no automatic cutover)"), "scope isolation");
+  check(!button("Cancel maintenance plan"), "another workspace never sees or cancels the previous plan");
+  await click("Switch test workspace"); await until(() => button("Cancel maintenance plan"), "scope restored");
+  await click("Cancel maintenance plan");
+  await until(() => document.body.textContent.includes("Plan cancelled") && !button("Cancel maintenance plan"), "cancelled history");
+  snapshot = await state();
+  const cancellation = snapshot.calls.filter((c) => c.path.endsWith("/cancel")).at(-1);
+  check(cancellation.method === "POST" && cancellation.workspaceId === 5 && cancellation.body.expected_state_version === 1, "cancel sends the persisted state CAS through the same transport");
+  check(document.body.textContent.includes("Maintenance plan cancelled; the running Link is unchanged."), "cancel notice never promises runtime teardown");
+  check(JSON.stringify(snapshot.links) === JSON.stringify(before), "cancellation releases intent only, not existing fixture ownership");
+  return { passed: checks.length, checks };
+}
+
 export async function runF5BrowserChecks() {
   if (location.origin !== "http://127.0.0.1:41973") throw new Error("fixture_only");
   const checks = [];

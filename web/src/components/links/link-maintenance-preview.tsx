@@ -12,12 +12,14 @@ import type { LinksCopy } from "./links-copy";
 import { LinkConfigForm, selectClass } from "./link-forms";
 import { LinkErrorDetails } from "./link-error-details";
 import { linkStatusLabel } from "./link-state";
+import type { LinkMaintenanceCommitInput } from "@/lib/link-maintenance-migrations";
 
-/** Independent read-only request lifecycle; never enters persisted-write handling. */
-export function LinkMaintenancePanel({ link, copy, nodes, nodesError, busy, now, nodeLabel, onClose, onPreview, invalidationEpoch = 0 }: {
+/** Preview reads stay independent; optional intent submission uses the parent's fenced write lifecycle. */
+export function LinkMaintenancePanel({ link, copy, nodes, nodesError, busy, now, nodeLabel, onClose, onPreview, onCommit, invalidationEpoch = 0 }: {
   link: LinkDetail; copy: LinksCopy; nodes: UserNode[]; nodesError: boolean; busy: boolean; now: number;
   nodeLabel: (id: number) => string; onClose: () => void;
   onPreview: (input: LinkMaintenancePreviewInput) => Promise<LinkMaintenancePreview | null>;
+  onCommit?: (input: LinkMaintenanceCommitInput) => Promise<boolean>;
   invalidationEpoch?: number;
 }) {
   const id = useId();
@@ -28,6 +30,8 @@ export function LinkMaintenancePanel({ link, copy, nodes, nodesError, busy, now,
   const resultEpoch = useRef(invalidationEpoch);
   const [error, setError] = useState<LinkErrorInfo | null>(null);
   const [stale, setStale] = useState(false);
+  const request = useRef<LinkMaintenancePreviewInput | null>(null);
+  const commitKey = useRef<{ receipt: string; key: string } | null>(null);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current++; }; }, []);
   const invalidate = () => {
     sequence.current++; pendingRef.current = false; setPending(false); setResult(null); setError(null); setStale(false);
@@ -45,9 +49,10 @@ export function LinkMaintenancePanel({ link, copy, nodes, nodesError, busy, now,
     const ticket = ++sequence.current;
     pendingRef.current = true; setPending(true); setResult(null); setError(null); setStale(false);
     try {
-      const preview = await onPreview({ expected_version: link.desired_version, expected_generation: link.generation, change });
+      const input = { expected_version: link.desired_version, expected_generation: link.generation, change };
+      const preview = await onPreview(input);
       if (!mounted.current || sequence.current !== ticket) return;
-      if (preview && isLinkMaintenancePreviewCurrent(preview, link, Date.now())) { resultEpoch.current = invalidationEpoch; setResult(preview); }
+      if (preview && isLinkMaintenancePreviewCurrent(preview, link, Date.now())) { resultEpoch.current = invalidationEpoch; request.current = input; setResult(preview); }
       else setStale(true);
     } catch (failure) {
       if (mounted.current && sequence.current === ticket) setError(linkErrorInfo(failure));
@@ -79,6 +84,14 @@ export function LinkMaintenancePanel({ link, copy, nodes, nodesError, busy, now,
       </div>}
       {(stale || (result && resultEpoch.current === invalidationEpoch && !current)) && <p role="status" className="text-sm">{copy.previewStale}</p>}
       {result && current && <LinkMaintenanceResult preview={result} copy={copy} nodeLabel={nodeLabel} />}
+      {result && current && result.submission?.supported && result.snapshot.receipt && onCommit && request.current
+        && result.runtime.state === "ready" && !result.execution.blockers.includes("link_no_change") && <div className="space-y-2">
+          <p>{copy.maintenancePlanNoExecution}</p><Button type="button" disabled={blocked || pending} onClick={() => {
+            if (!request.current || !result.snapshot.receipt || !isLinkMaintenancePreviewCurrent(result, link, Date.now())) return;
+            if (commitKey.current?.receipt !== result.snapshot.receipt) commitKey.current = { receipt: result.snapshot.receipt, key: crypto.randomUUID() };
+            void onCommit({ ...request.current, receipt: result.snapshot.receipt, idempotency_key: commitKey.current.key });
+          }}>{copy.maintenancePlanSave}</Button>
+        </div>}
       <Button type="button" variant="outline" onClick={onClose}>{copy.previewClose}</Button>
     </CardContent>
   </Card>;

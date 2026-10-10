@@ -13,6 +13,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -534,6 +536,118 @@ def maintenance_preview(base, link_id, held_a, held_b, udp_b, target, original_u
     H.check(tcp_payload(held_a, b"F5-unchanged-TCP-A") and tcp_payload(held_b, b"F5-unchanged-TCP-B")
             and udp_payload(udp_b, 21081, marker) and target.udp.sources.get(marker) == original_udp_source,
             "F5 previews preserve both held TCP sessions and the exact B UDP target socket")
+    maintenance_intent(base, link_id, input_data, durable_state, held_a, held_b, udp_b, target, original_udp_source)
+
+
+def maintenance_intent(base, link_id, preview_input, durable_state, held_a, held_b, udp_b, target, original_udp_source):
+    """Actual Panel/MySQL/Worker intent lifecycle; no fake reports or candidate dispatch."""
+    def ready_preview():
+        value = request("POST", base + "/maintenance/preview", preview_input)
+        return value if value["runtime"]["state"] == "ready" else None
+
+    if not H.wait_until(ready_preview, timeout=60, interval=2):
+        raise RuntimeError("F5 fresh Ready preview prerequisite failed")
+    preview = ready_preview()
+    if not preview or preview.get("submission", {}).get("supported") is not True:
+        raise RuntimeError("F5 signed fresh Ready preview prerequisite failed")
+    body = {**preview_input, "idempotency_key": str(uuid.uuid4()), "receipt": preview["snapshot"]["receipt"]}
+    endpoint = base + "/maintenance/migrations"
+    before = durable_state()
+    count = lambda: H.db("return await db.linkMaintenanceMigration.count({where:{link_id:%d}});" % link_id)
+    before_count = count()
+    forged = {**body, "receipt": body["receipt"][:-1] + ("1" if body["receipt"][-1] == "0" else "0")}
+    status, payload, headers = H.req("POST", endpoint, forged)
+    H.check(status == 409 and payload.get("code") == "link_maintenance_preview_invalid"
+            and headers.get("cache-control") == "no-store" and count() == before_count,
+            "F5 forged freshness receipt fails without a durable write")
+    migration_id = None
+    try:
+        # urllib requests use the same authenticated fixture identity, not a mock DB publisher.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            replies = list(pool.map(lambda _: H.req("POST", endpoint, body), range(3)))
+        accepted = [reply[1].get("data", {}) for reply in replies]
+        if not accepted or not isinstance(accepted[0].get("migration"), dict):
+            raise RuntimeError("F5 concurrent submission failed: status=%s" % [r[0] for r in replies])
+        migration_id = accepted[0]["migration"]["id"]
+        row = accepted[0]["migration"]
+        H.check(sorted(r[0] for r in replies) == [200, 200, 201]
+                and all(r[2].get("cache-control") == "no-store" for r in replies)
+                and all(v.get("migration", {}).get("id") == migration_id for v in accepted)
+                and sum(v.get("replayed") is False for v in accepted) == 1,
+                "F5 concurrent exact retry creates one intent and returns two canonical replays")
+        private = H.db("const r=await db.linkMaintenanceMigration.findUniqueOrThrow({where:{id:%d}});"
+            "const {canonicalConfigDigest}=await import('./src/integrations/forwardx/core-contract.ts');"
+            "return {count:await db.linkMaintenanceMigration.count({where:{link_id:%d}}),"
+            "events:await db.linkMaintenanceEvent.count({where:{migration_id:r.id}}),"
+            "fence:r.active_link_id===r.link_id,digest:r.snapshot_digest,"
+            "valid:canonicalConfigDigest(r.snapshot)===r.snapshot_digest,refs:r.snapshot.admission.references.length};"
+            % (migration_id, link_id))
+        H.check(private["count"] == before_count + 1 and private["events"] == 1 and private["fence"]
+                and private["valid"] and private["refs"] == row["references"]["total"]
+                and row["status"] == "awaiting_executor" and row["state_version"] == 1
+                and row["execution"]["supported"] is False and row["ports"] == {"reserved": False, "availability": "not_checked"},
+                "F5 MySQL records one immutable snapshot/event and a logical fence, not candidate execution or ports")
+        public = request("GET", endpoint + "/%d" % migration_id)
+        forbidden = {"snapshot", "receipt", "idempotency_key", "request_digest", "binding_snapshot", "runner_config",
+                     "key", "secret", "secret_enc", "target_host", "target_port", "target_set", "client_source"}
+        def closed_metadata(value):
+            if isinstance(value, dict):
+                return not forbidden.intersection(value) and all(closed_metadata(v) for v in value.values())
+            return not isinstance(value, list) or all(closed_metadata(v) for v in value)
+        H.check(closed_metadata(public) and len(public["events"]) == 1
+                and any(r["id"] == migration_id for r in request("GET", endpoint)),
+                "F5 history exposes scoped closed metadata, never private references or receipts")
+        for altered, code in (({**body, "idempotency_key": str(uuid.uuid4())}, "link_maintenance_in_progress"),
+                              ({**body, "receipt": forged["receipt"]}, "link_maintenance_idempotency_conflict")):
+            status, payload, _ = H.req("POST", endpoint, altered)
+            H.check(status == 409 and payload.get("code") == code, "F5 concurrent intent rejects " + code)
+        detail = request("GET", base)
+        forward = detail["forwards"][0]
+        binding = {"name": forward["name"], "protocol": forward["forward_protocol"],
+                   "listen_port": forward["listen_port"], "listen_host": "", "target_host": forward["remote_host"],
+                   "target_port": forward["remote_port"], "max_connections": forward["max_connections"],
+                   "max_connections_per_ip": forward["max_connections_per_ip"]}
+        changes = [("POST", base + "/forwards", {**binding, "name": "fenced addition", "listen_port": 21089}),
+                   ("PUT", base + "/forwards/%d" % forward["id"], {"expected_revision": forward["config_revision"], "binding": binding}),
+                   ("PUT", base + "/config", {"expected_version": detail["desired_version"], "config": detail["config"]}),
+                   ("POST", base + "/deploy", None), ("POST", base + "/rotate-key", None), ("DELETE", base, None)]
+        changes += [("POST", base + "/forwards/%d/actions" % forward["id"], {"action": action})
+                    for action in ("suspend", "resume", "retry", "delete")]
+        fenced = [H.req(method, path, value) for method, path, value in changes]
+        H.check(all(status == 409 and value.get("code") == "link_maintenance_in_progress" for status, value, _ in fenced)
+                and durable_state() == before, "F5 logical fence blocks every conflicting writer before revisions or runtime ownership change")
+        H.docker(["restart", "tunex-it-worker"], timeout=120)
+        # Invoke the same production recovery service deterministically, rather than claiming a cron tick occurred.
+        recovery = H.db("const {reconcileLinkMaintenance}=await import('./src/services/link-maintenance.ts');"
+                        "try{return await reconcileLinkMaintenance();}finally{"
+                        "const {redis}=await import('./src/redis.ts');redis.disconnect();"
+                        "const {db:serviceDb}=await import('./src/db.ts');await serviceDb.$disconnect();}")
+        recovered = request("GET", endpoint + "/%d" % migration_id)
+        immutable = H.db("const r=await db.linkMaintenanceMigration.findUniqueOrThrow({where:{id:%d}});"
+                         "return {digest:r.snapshot_digest,events:await db.linkMaintenanceEvent.count({where:{migration_id:r.id}})};" % migration_id)
+        H.check(recovery["errors"] == 0 and recovered["status"] == "awaiting_executor"
+                and immutable == {"digest": private["digest"], "events": 1} and durable_state() == before,
+                "F5 Worker restart plus real recovery retains the healthy immutable intent without redeployment")
+        status, payload, _ = H.req("POST", endpoint + "/%d/cancel" % migration_id, {"expected_state_version": 2})
+        H.check(status == 409 and payload.get("code") == "link_maintenance_state_conflict", "F5 cancel rejects a wrong state CAS")
+        cancelled = request("POST", endpoint + "/%d/cancel" % migration_id, {"expected_state_version": 1})
+        repeated = request("POST", endpoint + "/%d/cancel" % migration_id, {"expected_state_version": 1})
+        replay = request("POST", endpoint, body)
+        terminal = H.db("const r=await db.linkMaintenanceMigration.findUniqueOrThrow({where:{id:%d}});"
+                        "return {fence:r.active_link_id,events:await db.linkMaintenanceEvent.count({where:{migration_id:r.id}})};" % migration_id)
+        H.check(cancelled == repeated and cancelled["status"] == "cancelled" and cancelled["state_version"] == 2
+                and replay["replayed"] is True and replay["migration"] == cancelled
+                and terminal == {"fence": None, "events": 2} and durable_state() == before,
+                "F5 cancellation is CAS/idempotent, releases only the intent fence, and old submission never reopens it")
+        marker = b"F5-intent-UDP-B"
+        H.check(tcp_payload(held_a, b"F5-intent-TCP-A") and tcp_payload(held_b, b"F5-intent-TCP-B")
+                and udp_payload(udp_b, 21081, marker) and target.udp.sources.get(marker) == original_udp_source,
+                "F5 save/replay/recovery/cancel preserve both held TCP sessions and the exact B UDP target socket")
+    finally:
+        if migration_id is not None:
+            status, payload, _ = H.req("GET", endpoint + "/%d" % migration_id)
+            if status == 200 and payload.get("data", {}).get("status") == "awaiting_executor":
+                request("POST", endpoint + "/%d/cancel" % migration_id, {"expected_state_version": payload["data"]["state_version"]})
 
 
 def main():
