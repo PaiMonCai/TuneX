@@ -390,15 +390,15 @@ describe("workspace fencing and navigation", () => {
   test("links is a real bilingual user-console route", () => {
     const item = userConsoleNav.flatMap((g) => g.items).find((item) => item.href === "/links")!;
     expect(item.status ?? "available").toBe("available");
-    expect(localizedLabel("zh", item.labelKey, item.labelZh!, item.labelEn!)).toBe("加密隧道");
-    expect(localizedLabel("en", item.labelKey, item.labelZh!, item.labelEn!)).toBe("Encrypted tunnels");
+    expect(localizedLabel("zh", item.labelKey, item.labelZh!, item.labelEn!)).toBe("加密连接");
+    expect(localizedLabel("en", item.labelKey, item.labelZh!, item.labelEn!)).toBe("Encrypted links");
   });
   test("linked native rows guide to the exact carrier and selection input stays bounded", () => {
     expect(linkedForwardHref({ link_resource_id: 3 })).toBe("/links?selected=3");
     expect(linkedForwardHref({ link_resource_id: -1 })).toBe(null);
     expect(linkedForwardHref({ link_resource_id: null })).toBe(null);
     const html = renderToStaticMarkup(<LinkedForwardGuide forward={{ name: "Shared rule", link_resource_id: 3 }} locale="zh" />);
-    expect(html).toContain('href="/links?selected=3"'); expect(html).toContain("前往隧道管理");
+    expect(html).toContain('href="/links?selected=3"'); expect(html).toContain("前往连接管理");
     expect(isLinkManagedError(new ApiError(409, "managed", { code: "link_managed_forward" }))).toBe(true);
     for (const value of [null, "", "0", "-1", "3.1", "2147483648", "3?other", "03"]) expect(linkIdFromSelection(value)).toBe(null);
     expect(linkIdFromSelection("3")).toBe(3);
