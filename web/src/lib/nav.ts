@@ -113,7 +113,7 @@ export const userConsoleNav: NavGroup[] = [
     items: [
       { href: "/nodes", labelKey: "common.nodes", iconKey: "nodes" },
       {
-        href: "/links", labelKey: "links.title", labelZh: "加密隧道", labelEn: "Encrypted tunnels", iconKey: "tunnels",
+        href: "/links", labelKey: "links.title", labelZh: "加密连接", labelEn: "Encrypted links", iconKey: "tunnels",
       },
       {
         /** 用户侧只暴露可消费的路由策略，不展示 selector / transit 等编排术语。 */
