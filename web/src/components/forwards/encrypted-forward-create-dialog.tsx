@@ -38,7 +38,9 @@ export function EncryptedForwardCreateDialog({ workspaceId, nodes, canManageNode
     let current = true;
     linksApi.list(workspaceId).then((result) => {
       if (!current) return;
-      setLinks(result.filter((link) => !["retiring", "retired"].includes(link.status)));
+      const eligible = result.filter((link) => !["retiring", "retired"].includes(link.status));
+      setLinks(eligible);
+      if (eligible.length === 0) setNewLink(true);
       setReadState("ready");
     }).catch(() => { if (current) setReadState("failed"); });
     return () => { current = false; };
