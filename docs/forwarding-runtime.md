@@ -1,6 +1,6 @@
 # 当前转发能力与运行边界
 
-更新：2026-10-10。运行基线为 [PR #75](https://github.com/PaiMonCai/TuneX/pull/75) 已合并的 `main`（`ef159eb`），尚不代表正式发布。下述 F5 预览仅在 `feat/forward-link-maintenance` 的未合并草稿 [PR #76](https://github.com/PaiMonCai/TuneX/pull/76)；源码 `cdb8470` 已通过自身 CI，不放开在线迁移。具体证据见 [测试说明](testing.md)，后续范围统一维护在 [开发方案](DEVELOPMENT_PLAN.md)。
+更新：2026-10-10。PR #75 与 [PR #76](https://github.com/PaiMonCai/TuneX/pull/76) 已合入 `main`（`54542d3`），含 F5 只读预览，尚不代表正式发布。持久维护计划新增于未合并分支 `feat/link-maintenance-state`，不放开在线迁移。具体证据见 [测试说明](testing.md)，后续范围统一维护在 [开发方案](DEVELOPMENT_PLAN.md)。
 
 ## 资源与部署
 
@@ -16,7 +16,7 @@
 | 托管共享 FXP | 固定双节点、加密 TCP/UDP/both、规则复用、每规则有序多目标 | 实验开关默认关闭，公共矩阵 planned；多目标需要双方实际能力，尚无共享安全多跳/多出口。 |
 | 原生目标池 | fallback、RR/random/weighted 选择及健康恢复 | 仅适用已有出口池路径，DIRECT 业务 API 仍为单目标；不能推广到 FXP。 |
 | IP_HASH / PROXY | 共享 FXP TCP 来源首切片已验收并合入 main | 须显式 `client_source` 及双方真实能力；UDP/both 拒绝。原生 RELAY 来源门禁不变。 |
-| 共享连接维护预览 | F5 开发分支只读预览端点/端口变更或轮换密钥的影响 | 未合并；不分配版本/密钥/端口、不执行迁移，既有端点/密钥门禁保持。 |
+| 共享连接维护 | main 已有 F5 只读影响预览；开发分支另有持久维护计划 | 计划保存/取消不分配版本/密钥/端口、不执行迁移，既有端点/密钥门禁保持。 |
 
 支持维度以 [core-contract.ts](../backend/src/integrations/forwardx/core-contract.ts) 为准；实验 Link 编译和节点准入见 [link-compiler.ts](../backend/src/integrations/forwardx/link-compiler.ts)。枚举中存在 GOST/WireGuard/更多驱动的名称不代表运行支持。
 
@@ -73,7 +73,31 @@ NodePortLease 与 Agent 守卫都检查 node/protocol/bind_scope/port 和 wildca
 
 `execution.supported=false`。计划顺序是预留候选 → 准备/验证出口 → 切换/验证入口 → 旧连接排空 → 确认退役 → 释放旧端口；本切片**不执行这些步骤**，不生成/解封真实密钥，不写版本/部署/租约，不启动/重启进程。当前端点编辑与密钥轮换门禁继续生效。后续执行器必须重新检查授权、策略、能力、引用 CAS、租约和所有权，加入持久迁移状态、故障补偿及不可变统计归属后再开放有引用维护。
 
+<a id="link-maintenance-intents"></a>
+
+## 共享链路持久维护计划（F5 状态基础）
+
+本段属于 `feat/link-maintenance-state`，不是在线迁移执行器。默认 `TUNEX_LINK_MAINTENANCE_ENABLED=false`；Panel/Worker 同时设为精确 `true` 才可提交。预览本身仍零写入：开关开启时另返回 `submission.supported=true` 与 `snapshot.receipt`。回执使用独立用途的 HMAC（现有 seal key），有效期 60 秒，绑定 Workspace/Link、完整状态 token 和请求摘要；不代替现有认证/CSRF/权限校验。令牌和私有快照不得进入日志、Support Bundle 或公开历史。
+
+源码 `0ebb16e` 已通过独立 CI 与限定 Linux/MySQL 实网，PR #77 尚未合并/发布，详见 [测试说明](testing.md#f5-intent-evidence)。
+
+| API（前缀 `/api/links/:id/maintenance`） | 契约 |
+| --- | --- |
+| `POST /migrations` | 原预览请求加 `receipt` 与小写规范 UUID `idempotency_key`，严格五字段。新记录 201；同 actor、同请求、同回执精确重试 200 `replayed=true`，包括回执过期后或记录终止后的重试。改请求/actor/回执复用 UUID 返回冲突，终态不会重开。 |
+| `GET /migrations` | 当前空间最近 20 条闭合元数据，沿用 `node:read`；不返回完整目标、来源策略、runner、receipt 或私有快照。 |
+| `GET /migrations/:migrationId` | scoped 详情及有限状态事件；其他空间/Link 不可见。 |
+| `POST /migrations/:migrationId/cancel` | `node:manage`；严格 `{expected_state_version:1}` CAS，同取消可幂等重试，其他终态不能重开。 |
+
+所有维护响应（含权限错误）`Cache-Control: no-store`。提交在 Link 行锁下重新读策略/能力/完整引用及 Ready 基线，要求真实变更；完整私有快照上限 4 MiB。迁移表和初始事件原子保存，`active_link_id` 唯一围栏限制同 Link 一个活计划。记录状态仅 `awaiting_executor`（version 1）→ `cancelled`/`invalidated`/`expired`（version 2），没有执行中/执行成功状态。
+
+计划持有五分钟**逻辑编辑围栏**，阻止同 Link 的新增/修改/动作、部署、轮换和退役；只读预览不受阻，旧配置仍走原续租/传输路径。不可变快照保存旧配置、部署身份、全部启用/暂停引用、候选配置及有效策略/持有端口身份，不写 LinkVersion/Deployment/ForwardRevision/密钥/NodePortLease。不检查或预留候选端口：`execution.supported=false`、`ports.reserved=false`、`availability=not_checked` 始终真实。
+
+Worker 在常规 Link reconcile 前每轮最多重验 100 条（按到期时间排序）：期限届满→expired；已知状态/策略/能力漂移或未知运行事实→invalidated；数据库/未知基础设施异常保持计划并计入 errors。普通写入也惰性处理到期记录，Worker 停机不造成无期限锁死。关闭提交开关不阻止读取/取消；Worker 可将已有计划失效。取消/过期/失效只清逻辑围栏，永不清旧运行租约或释放 OS 端口。
+
+页面保存使用现有持久写入流程，随后重读历史；网络未知结果先重读，不能把保存成功当切换成功。新 receipt 使用新 UUID；服务器唯一围栏阻止不确定结果重复创建。候选代次/端口预留、出口实际准备、入口切换/drain、旧代退役、补偿和跨代计量全部留到后续执行切片。
+
 ## 运行限额与状态
+
 
 原生与 FXP 下发双向 bytes/sec、总并发、每来源 IP 并发，当前作用域为每规则、每入口 runtime。both 的 TCP/UDP 共享规则预算；UDP 并发是活跃映射。FXP 字段 maxIPs 表示每来源并发，不表示不同 IP 个数。
 

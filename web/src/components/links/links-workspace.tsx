@@ -14,6 +14,7 @@ import { linksCopy, type LinksCopy } from "./links-copy";
 import { LinkBindingForm, LinkConfigForm, selectClass } from "./link-forms";
 import { LinkDetailView } from "./link-detail";
 import { LinkMaintenancePanel } from "./link-maintenance-preview";
+import { LinkMaintenancePlans } from "./link-maintenance-plans";
 import { LinkErrorDetails } from "./link-error-details";
 import { bindingFromForward, createLinksScopeFence, linkErrorMessage, linkIdFromSelection } from "./link-state";
 
@@ -58,6 +59,7 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
   const [confirm, setConfirm] = useState<Confirmation | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewEpoch, setPreviewEpoch] = useState(0);
+  const [maintenancePending, setMaintenancePending] = useState(false);
   const [now, setNow] = useState(Date.now);
   const invalidatePreview = useCallback(() => {
     fence.current.next("preview"); setPreviewEpoch((v) => v + 1);
@@ -207,8 +209,12 @@ function ScopedLinksWorkspace({ workspaceId, copy, canManage, selectedId, canCre
     </Card>}
     {previewOpen && detail && canManage && !readError && !blocked && <LinkMaintenancePanel invalidationEpoch={previewEpoch}
       link={detail} copy={copy} nodes={nodes} nodesError={nodesError} busy={mutationDisabled} now={now} nodeLabel={nodeLabel}
-      onClose={() => { invalidatePreview(); setPreviewOpen(false); }} onPreview={previewMaintenance} />}
-    {detail && !readError && <LinkDetailView link={detail} copy={copy} now={now} canManage={canManage} busy={mutationDisabled || !!editor || !!confirm}
+      onClose={() => { invalidatePreview(); setPreviewOpen(false); }} onPreview={previewMaintenance}
+      onCommit={(input) => run(() => linksApi.commitMaintenance(workspaceId, detail.id, input), copy.maintenancePlanSaved)} />}
+    {detail && !readError && <LinkMaintenancePlans key={`${workspaceId}:${detail.id}`} workspaceId={workspaceId} linkId={detail.id}
+      epoch={previewEpoch} now={now} copy={copy} canManage={canManage} busy={mutationDisabled} onPendingChange={setMaintenancePending}
+      onCancel={(row) => run(() => linksApi.cancelMaintenance(workspaceId, detail.id, row.id, row.state_version), copy.maintenancePlanCancelledNotice)} />}
+    {detail && !readError && <LinkDetailView link={detail} copy={copy} now={now} canManage={canManage} busy={mutationDisabled || maintenancePending || !!editor || !!confirm}
       canCreateForward={canCreateForward} canUpdateForward={canUpdateForward} canDeleteForward={canDeleteForward}
       nodeLabel={nodeLabel} onEdit={() => setEditor({ type: "config", link: detail })}
       onPreview={previewOpen ? undefined : () => { invalidatePreview(); setPreviewOpen(true); }}

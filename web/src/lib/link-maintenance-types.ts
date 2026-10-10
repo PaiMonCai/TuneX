@@ -22,7 +22,8 @@ export interface LinkMaintenanceReference {
 export interface LinkMaintenancePreview {
   schema_version: 1; link_id: number; workspace_id: number; operation: LinkMaintenanceOperation;
   created_at: string; expires_at: string;
-  snapshot: { desired_version: number; generation: number; state_token: string };
+  snapshot: { desired_version: number; generation: number; state_token: string; receipt?: string };
+  submission?: { supported: boolean; hold_seconds: 300 };
   candidate: { config: LinkConfig; version: number; generation: number; key_action: "rotate" | "preserve" };
   changes: { ingress_changed: boolean; egress_changed: boolean; carrier_port_changed: boolean; credentials_changed: boolean };
   references: { total: number; active: number; suspended: number; forwards: LinkMaintenanceReference[] };
@@ -98,6 +99,17 @@ export function projectLinkMaintenancePreview(value: unknown, workspaceId: numbe
   const snap = object(raw.snapshot), cand = object(raw.candidate), diff = object(raw.changes);
   if (snap.desired_version !== input.expected_version || snap.generation !== input.expected_generation) fail();
   const token = text(snap.state_token, 64); if (!/^[0-9a-f]{64}$/.test(token)) fail();
+  let submission: LinkMaintenancePreview["submission"];
+  let receipt: string | undefined;
+  if (raw.submission !== undefined) {
+    const value = object(raw.submission);
+    if (value.hold_seconds !== 300) fail();
+    submission = { supported: boolean(value.supported), hold_seconds: 300 };
+    if (submission.supported) {
+      receipt = text(snap.receipt, 2048);
+      if (!/^lm1\.[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test(receipt)) fail();
+    }
+  }
   const created_at = timestamp(raw.created_at), expires_at = timestamp(raw.expires_at);
   const duration = Date.parse(expires_at) - Date.parse(created_at);
   if (duration <= 0 || duration > 60_000) fail();
@@ -144,7 +156,8 @@ export function projectLinkMaintenancePreview(value: unknown, workspaceId: numbe
   const udp = choice(impact.udp, ["none", "mapping_rebuild_required"]);
   if (impact.listener_move !== changes.ingress_changed) fail();
   return { schema_version: 1, workspace_id: workspaceId, link_id: linkId, operation: input.change.type, created_at, expires_at,
-    snapshot: { desired_version: input.expected_version, generation: input.expected_generation, state_token: token },
+    snapshot: { desired_version: input.expected_version, generation: input.expected_generation, state_token: token,
+      ...(receipt ? { receipt } : {}) }, ...(submission ? { submission } : {}),
     candidate: { config: candidateConfig, version, generation, key_action: rotate ? "rotate" : "preserve" }, changes,
     references: { total, active, suspended, forwards }, runtime: { state, placements, tcp_connections: null, udp_mappings: null },
     ports: { held: rows(ports.held, LINK_MAINTENANCE_PORT_LIMIT).map(port), candidate: rows(ports.candidate, LINK_MAINTENANCE_PORT_LIMIT).map(port), availability: "not_checked", reserved: false },

@@ -20,6 +20,10 @@ import { LinkClientSourceSchema, persistedLinkClientSource, validateLinkClientSo
 import { buildLinkMaintenancePreview, LinkEndpointConfigSchema, LinkMaintenancePreviewSchema,
   LINK_MAINTENANCE_REFERENCE_LIMIT, LINK_MAINTENANCE_PORT_LIMIT,
   type MaintenanceForward, type MaintenancePort } from "../integrations/forwardx/link-maintenance.ts";
+import { LinkResourceError } from "./link-errors.ts";
+export { LinkResourceError } from "./link-errors.ts";
+import { assertNoMaintenanceIntent } from "./link-maintenance-guard.ts";
+import { signMaintenanceReceipt, maintenanceRequestDigest, LINK_MAINTENANCE_HOLD_MS } from "../integrations/forwardx/link-maintenance-state.ts";
 
 const id = z.number().int().positive().max(2_147_483_647);
 const port = id.max(65_535);
@@ -46,12 +50,7 @@ const LEASE_MS = 180_000;
 const DeploymentSnapshotSchema = z.object({ spec: FxpLinkInputSchema,
   revisions: z.array(z.object({ id, revision: z.number().int().min(0) }).strict()) }).strict();
 
-export class LinkResourceError extends Error {
-  constructor(readonly code: string, readonly status: 400 | 403 | 404 | 409 | 503 = 409) {
-    super(code); this.name = "LinkResourceError";
-  }
-}
-function sealKey(): string {
+export function sealKey(): string {
   const secret = process.env.TUNEX_LINK_SEAL_KEY ?? "";
   if (!/^[0-9a-f]{64}$/i.test(secret)) throw new LinkResourceError("link_seal_key_required", 503);
   return secret;
@@ -65,12 +64,17 @@ async function scopedLink(workspaceId: number, linkId: number, client = db) {
   if (!link) throw new LinkResourceError("link_not_found", 404);
   return link;
 }
-async function lockLink(tx: Prisma.TransactionClient, workspaceId: number, linkId: number) {
+export async function lockScopedLink(tx: Prisma.TransactionClient, workspaceId: number, linkId: number) {
   await tx.$queryRaw(Prisma.sql`SELECT id FROM link_resource WHERE id=${linkId} AND workspace_id=${workspaceId} FOR UPDATE`);
   const link = await tx.linkResource.findFirst({ where: { id: linkId, workspace_id: workspaceId } });
   if (!link) throw new LinkResourceError("link_not_found", 404);
+  return link;
+}
+export async function lockLink(tx: Prisma.TransactionClient, workspaceId: number, linkId: number, guardMaintenance = true) {
+  const link = await lockScopedLink(tx, workspaceId, linkId);
   if (link.status === "retired") throw new LinkResourceError("link_retired");
   if (link.status === "retiring") throw new LinkResourceError("link_retiring");
+  if (guardMaintenance) await assertNoMaintenanceIntent(tx, linkId);
   return link;
 }
 async function endpoints(workspaceId: number, config: LinkConfig,
@@ -198,10 +202,15 @@ export async function updateLink(workspaceId: number, linkId: number, expectedVe
 export async function previewLinkMaintenance(workspaceId: number, linkId: number, raw: unknown) {
   assertLinkFeature();
   const input = LinkMaintenancePreviewSchema.parse(raw);
-  return db.$transaction(async (tx) => {
+  return db.$transaction(async (tx) => (await captureLinkMaintenance(tx, workspaceId, linkId, input)).preview);
+}
+
+/** Shared transaction reader for preview, commit admission and restart recovery; no runtime writes. */
+export async function captureLinkMaintenance(tx: Prisma.TransactionClient, workspaceId: number, linkId: number,
+  input: z.infer<typeof LinkMaintenancePreviewSchema>, now = new Date()) {
     // Every Link binding/config writer already takes this lock. Include inactive
     // references, so suspended rules cannot disappear from a later migration.
-    const link = await lockLink(tx, workspaceId, linkId);
+    const link = await lockLink(tx, workspaceId, linkId, false);
     if (link.desired_version !== input.expected_version) throw new LinkResourceError("link_version_conflict");
     if (link.generation !== input.expected_generation) throw new LinkResourceError("link_generation_conflict");
     const version = await tx.linkVersion.findUniqueOrThrow({ where: {
@@ -220,7 +229,6 @@ export async function previewLinkMaintenance(workspaceId: number, linkId: number
         inGroupId: nodes.ingress.node_group_id, outGroupId: nodes.egress.node_group_id });
       if (!decision.allowed) throw new LinkResourceError(decision.reason ?? "policy_denied", 403);
     }
-    const now = new Date();
     const spec = { link_id: linkId, workspace_id: workspaceId,
       version: link.desired_version + (input.change.type === "update_endpoints" && canonicalConfigDigest(candidate) !== canonicalConfigDigest(config) ? 1 : 0),
       generation: link.generation + 1, ingress: nodes.inFact, egress: nodes.outFact,
@@ -247,7 +255,17 @@ export async function previewLinkMaintenance(workspaceId: number, linkId: number
     const ports: MaintenancePort[] = [compiled.egress, compiled.ingress].flatMap((p) => p.ports.map((slot) => ({
       node_id: p.node_id, role: p.role, protocol: slot.protocol, bind_scope: normalizeBindScope(slot.host), port: slot.port,
     })));
-    return buildLinkMaintenancePreview({
+    const { lease_expires_at: _candidateLease, ...candidateSpec } = spec;
+    const referenceFacts = rows.map((r) => ({ id: r.id, revision: r.config_revision ?? 0,
+      name: r.name, protocol: r.forward_protocol, desired_status: r.desired_status,
+      ingress_node_id: r.ingress_node_id, listen_ip: r.listen_ip, listen_port: r.listen_port,
+      target_host: r.remote_host, target_port: r.remote_port,
+      target_set: r.link_target_config ?? null, client_source: r.link_source_config ?? null,
+      ...resolveForwardPolicy(r, policy.limits) }));
+    const admission = { candidate: candidateSpec, references: referenceFacts,
+      policy: { deny_scope: policy.deny_scope, limits: policy.limits, entitlements: policy.entitlements } };
+    const preview = buildLinkMaintenancePreview({
+      admission_digest: canonicalConfigDigest(admission),
       link, config, forwards: rows.map((r): MaintenanceForward => ({ id: r.id, name: r.name,
         forward_protocol: r.forward_protocol as MaintenanceForward["forward_protocol"],
         desired_status: r.desired_status as MaintenanceForward["desired_status"], config_revision: r.config_revision ?? 0,
@@ -263,7 +281,18 @@ export async function previewLinkMaintenance(workspaceId: number, linkId: number
         placements: deployment.placements.map((p) => ({ ...p, observation: linkObservation(p, workspaceId, linkId,
           reports.find((report) => report.node_id === p.node_id) ?? null, now) })) } : null,
     }, input, ports, now);
-  });
+    const submissionEnabled = process.env.TUNEX_LINK_MAINTENANCE_ENABLED === "true";
+    return { preview: { ...preview,
+      snapshot: { ...preview.snapshot, ...(submissionEnabled ? { receipt: signMaintenanceReceipt({ workspace_id: workspaceId,
+        link_id: linkId, state_token: preview.snapshot.state_token, request_digest: maintenanceRequestDigest(input) }, sealKey(), now) } : {}) },
+      submission: { supported: submissionEnabled, hold_seconds: LINK_MAINTENANCE_HOLD_MS / 1000 } },
+      snapshot: { schema_version: 1, request: input, state_token: preview.snapshot.state_token, admission,
+        baseline: { config, generation: link.generation, desired_version: link.desired_version,
+          deployment_id: deployment?.id ?? null, binding_snapshot: deployedSnapshot,
+          placements: deployment?.placements.map((p) => ({ node_id: p.node_id, role: p.role, runtime_id: p.runtime_id,
+            generation: p.generation, config_digest: p.config_digest, applied_generation: p.applied_generation })) ?? [] },
+        held_ports: leases.map((p) => ({ id: p.id, node_id: p.node_id, role: p.lease_type,
+          protocol: p.protocol, bind_scope: p.bind_scope, port: p.port })) } };
 }
 
 type Deployment = Awaited<ReturnType<typeof prepareDeployment>>;
@@ -566,8 +595,12 @@ export async function actionLinkForward(workspaceId: number, linkId: number, for
 
 export async function retireLink(workspaceId: number, linkId: number) {
   assertLinkFeature();
-  if (await db.tunnel.count({ where: { link_resource_id: linkId } })) throw new LinkResourceError("link_has_references");
-  const current = await scopedLink(workspaceId, linkId);
+  const current = await db.$transaction(async (tx) => {
+    const link = await lockScopedLink(tx, workspaceId, linkId);
+    await assertNoMaintenanceIntent(tx, linkId);
+    if (await tx.tunnel.count({ where: { link_resource_id: linkId } })) throw new LinkResourceError("link_has_references");
+    return link;
+  });
   if (current.status === "retired") return { id: linkId, status: "retired" };
   const prepared = current.status === "retiring" ? await hydrateDeployment(current) : await prepareDeployment(workspaceId, linkId, false, true);
   // Ingress stops first. Tombstones are persisted before freeing any DB lease.

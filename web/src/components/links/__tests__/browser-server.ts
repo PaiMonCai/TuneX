@@ -4,6 +4,7 @@ import { projectLinkClientSource, projectLinkTargetSet, type LinkBindingInput, t
 import { forward, link, statistics, targetLink } from "./links-fixtures";
 import { maintenancePreview } from "./maintenance-fixtures";
 import { projectLinkMaintenanceInput } from "@/lib/link-maintenance-types";
+import { projectMaintenanceCommit, type LinkMaintenanceMigration } from "@/lib/link-maintenance-migrations";
 
 const bundle = await Bun.build({ entrypoints: [resolve(import.meta.dir, "browser-entry.tsx")], target: "browser",
   define: { "process.env.NEXT_PUBLIC_API_MOCK": '"0"', "process.env.SERVER_API_BASE": '""', "process.env.NODE_ENV": '"development"' } });
@@ -20,6 +21,8 @@ let previewError: string | null = null;
 let previewDelay = false;
 let previewLifetime = 60_000;
 let previewTamper: "workspace" | "live" | "secret" | null = null;
+let submission = false;
+let plans: { row: LinkMaintenanceMigration; request: string; key: string }[] = [];
 const calls: { path: string; method: string; workspaceId: number; body: unknown }[] = [];
 const response = (data: unknown, status = 200) => Response.json({ data }, { status });
 const failure = (code: string, status = 409) => Response.json({ code, error: code }, { status });
@@ -46,8 +49,12 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
     sourceError = input.sourceError ?? null;
     previewError = input.previewError ?? null; previewDelay = input.previewDelay ?? false;
     previewLifetime = input.previewLifetime ?? 60_000; previewTamper = input.previewTamper ?? null;
-    if (input.reset) { links = []; calls.length = 0; }
+    submission = (input as { submission?: boolean }).submission ?? false;
+    if (input.reset) { links = []; calls.length = 0; plans = []; }
     if (input.maintenance) links = [link({ forwards: [forward(), forward({ id: 8, name: "Desired suspended UDP", desired_status: "inactive", forward_protocol: "udp" })], ref_count: 2 })];
+    if (submission) for (const row of links) row.deployment?.placements.forEach((p) => {
+      p.observation = { state: "ready", ready: true, observed_generation: row.generation };
+    });
     if (input.maintenanceSecond) links.push(link({ id: 4, name: "Second maintenance scope" }));
     if (input.advance) for (const row of links) {
       if (input.advance === "version") row.desired_version++;
@@ -103,7 +110,7 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
     { id: 12, node_id: "Exit lab", role: "egress", lifecycle: "active", accepts_new_business: true, connect_ip: "127.0.0.2" },
   ]);
   if (path === "/api/links" && req.method === "GET") return response(links.filter((row) => row.workspace_id === workspaceId));
-  if (!enabled && req.method !== "GET") return failure("fxp_links_not_enabled");
+  if (!enabled && req.method !== "GET" && !/\/maintenance\/migrations\/\d+\/cancel$/.test(path)) return failure("fxp_links_not_enabled");
   if (path === "/api/links" && req.method === "POST") {
     const input = body as { name: string; config: LinkDetail["config"] };
     const row = link({ id: links.length + 1, workspace_id: workspaceId, name: input.name, config: input.config,
@@ -114,6 +121,34 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
   const row = links.find((l) => l.id === Number(match?.[1]) && l.workspace_id === workspaceId);
   if (!row) return failure("link_not_found", 404);
   const suffix = match![2];
+  if (suffix === "/maintenance/migrations" && req.method === "GET") return response(plans.filter((p) => p.row.workspace_id === workspaceId && p.row.link_id === row.id).map((p) => p.row));
+  if (suffix === "/maintenance/migrations" && req.method === "POST") {
+    if (!submission) return failure("link_maintenance_not_enabled");
+    let input;
+    try { input = projectMaintenanceCommit(body); } catch { return failure("invalid_input", 400); }
+    const previous = plans.find((p) => p.row.link_id === row.id && p.key === input.idempotency_key);
+    if (previous) return previous.request === JSON.stringify(input) ? response({ migration: previous.row, replayed: true }) : failure("link_maintenance_idempotency_conflict");
+    if (plans.some((p) => p.row.link_id === row.id && p.row.status === "awaiting_executor")) return failure("link_maintenance_in_progress");
+    if (input.expected_version !== row.desired_version || input.expected_generation !== row.generation) return failure("link_maintenance_state_conflict");
+    const now = Date.now(), active = row.forwards.filter((f) => f.desired_status === "active").length;
+    const plan: LinkMaintenanceMigration = { schema_version: 1, id: plans.length + 1, link_id: row.id, workspace_id: workspaceId, created_by: 1,
+      operation: input.change.type, status: "awaiting_executor", state_version: 1, expected_version: row.desired_version, expected_generation: row.generation,
+      candidate_config: input.change.type === "update_endpoints" ? input.change.config : row.config!, references: { total: row.forwards.length, active, suspended: row.forwards.length - active },
+      created_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString(), hold_expires_at: new Date(now + 300000).toISOString(), reason_code: null,
+      execution: { supported: false }, ports: { reserved: false, availability: "not_checked" } };
+    plans.push({ row: plan, request: JSON.stringify(input), key: input.idempotency_key });
+    return response({ migration: plan, replayed: false }, 201);
+  }
+  const cancel = /^\/maintenance\/migrations\/(\d+)\/cancel$/.exec(suffix);
+  if (cancel && req.method === "POST") {
+    const plan = plans.find((p) => p.row.id === Number(cancel[1]) && p.row.link_id === row.id && p.row.workspace_id === workspaceId)?.row;
+    if (!plan) return failure("link_maintenance_not_found", 404);
+    const expected = (body as { expected_state_version: number }).expected_state_version;
+    if (plan.status === "cancelled" && [1, 2].includes(expected)) return response(plan);
+    if (expected !== plan.state_version) return failure("link_maintenance_state_conflict");
+    Object.assign(plan, { status: "cancelled", state_version: 2, reason_code: "link_maintenance_cancelled", updated_at: new Date().toISOString() });
+    return response(plan);
+  }
   if (!suffix && req.method === "GET") return response(row);
   if (suffix === "/maintenance/preview" && req.method === "POST") {
     const captured = { error: previewError, tamper: previewTamper, delay: previewDelay };
@@ -122,6 +157,8 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
     if (input.expected_version !== row.desired_version) return failure("link_version_conflict");
     if (input.expected_generation !== row.generation) return failure("link_generation_conflict");
     const result = maintenancePreview(row, input);
+    result.submission = { supported: submission, hold_seconds: 300 };
+    if (submission) result.snapshot.receipt = "lm1.Zml4dHVyZQ." + "a".repeat(64);
     result.expires_at = new Date(Date.parse(result.created_at) + previewLifetime).toISOString();
     if (captured.tamper === "workspace") result.workspace_id = 6;
     if (captured.tamper === "live") Object.assign(result.runtime, { tcp_connections: 0 });
@@ -130,6 +167,7 @@ Bun.serve({ hostname: "127.0.0.1", port: 41973, async fetch(req) {
     if (captured.error) return failure(captured.error, captured.error === "permission_denied" ? 403 : 409);
     return response(result);
   }
+  if (req.method !== "GET" && plans.some((p) => p.row.link_id === row.id && p.row.status === "awaiting_executor")) return failure("link_maintenance_in_progress");
   if (!suffix && req.method === "DELETE") { if (row.forwards.length) return failure("link_has_references"); row.status = "retired"; return response({ id: row.id, status: "retired" }); }
   if (suffix === "/config") {
     const input = body as { expected_version: number; config: LinkDetail["config"] };

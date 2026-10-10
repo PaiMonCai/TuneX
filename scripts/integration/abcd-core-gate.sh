@@ -4,6 +4,7 @@ set -euo pipefail
 REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 HERE="$REPO/scripts/integration"
 export TUNEX_FXP_LINKS_ENABLED=true
+export TUNEX_LINK_MAINTENANCE_ENABLED=true
 export FORWARD_NATIVE_BOTH_ENABLED=true
 export TUNEX_FXP_TRAFFIC_EPOCH_SECONDS=${TUNEX_FXP_TRAFFIC_EPOCH_SECONDS:-30}
 export TUNEX_IT_AGENT_VERSION=${TUNEX_IT_AGENT_VERSION:-0.0.0-it}

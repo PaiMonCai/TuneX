@@ -1141,10 +1141,56 @@ model LinkResource {
   versions LinkVersion[]
   deployments LinkDeployment[]
   credentials LinkTransportCredential[]
+  maintenance_migrations LinkMaintenanceMigration[]
   forwards Tunnel[]
   @@unique([workspace_id, name])
   @@index([workspace_id, status])
   @@map("link_resource")
+}
+
+/// F5 intent only: never consumed as Agent desired state or a port/key allocation.
+model LinkMaintenanceMigration {
+  id Int @id @default(autoincrement())
+  link_id Int
+  link LinkResource @relation(fields: [link_id], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  workspace_id Int
+  created_by Int
+  idempotency_key String @db.VarChar(36)
+  request_digest String @db.Char(64)
+  operation String @db.VarChar(24)
+  status String @default("awaiting_executor") @db.VarChar(24)
+  state_version Int @default(1)
+  /// Non-null only for a live intent. Unique constraint serializes one intent per Link.
+  active_link_id Int? @unique
+  expected_version Int
+  expected_generation Int
+  state_token String @db.Char(64)
+  snapshot_digest String @db.Char(64)
+  /// Immutable secret-free old/candidate/reference/placement and policy facts; private.
+  snapshot Json
+  hold_expires_at DateTime
+  reason_code String? @db.VarChar(64)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  events LinkMaintenanceEvent[]
+  @@unique([link_id, idempotency_key])
+  @@index([status, hold_expires_at])
+  @@index([workspace_id, link_id, id])
+  @@map("link_maintenance_migration")
+}
+
+/// Append-only transition facts; no config, receipt or secret in public event history.
+model LinkMaintenanceEvent {
+  id Int @id @default(autoincrement())
+  migration_id Int
+  migration LinkMaintenanceMigration @relation(fields: [migration_id], references: [id], onDelete: Restrict)
+  state_version Int
+  status String @db.VarChar(24)
+  reason_code String? @db.VarChar(64)
+  created_by Int?
+  created_at DateTime @default(now())
+  @@unique([migration_id, state_version])
+  @@map("link_maintenance_event")
 }
 
 model LinkVersion {
