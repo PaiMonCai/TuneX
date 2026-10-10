@@ -23,7 +23,8 @@ CREATE TABLE `link_maintenance_migration` (
   UNIQUE INDEX `link_maintenance_migration_link_id_idempotency_key_key` (`link_id`, `idempotency_key`),
   INDEX `link_maintenance_migration_status_hold_expires_at_idx` (`status`, `hold_expires_at`),
   INDEX `link_maintenance_migration_workspace_id_link_id_id_idx` (`workspace_id`, `link_id`, `id`),
-  CONSTRAINT `link_maintenance_migration_link_id_fkey` FOREIGN KEY (`link_id`) REFERENCES `link_resource` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE,
+  -- Ownership IDs are immutable. MySQL forbids a CHECK on an ON UPDATE CASCADE column.
+  CONSTRAINT `link_maintenance_migration_link_id_fkey` FOREIGN KEY (`link_id`) REFERENCES `link_resource` (`id`) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT `link_maintenance_migration_state_check` CHECK (
     `state_version` > 0 AND ((`status` = 'awaiting_executor' AND `active_link_id` IS NOT NULL AND `active_link_id` = `link_id`)
     OR (`status` IN ('cancelled', 'invalidated', 'expired') AND `active_link_id` IS NULL)))

@@ -60,6 +60,8 @@ if (!enabled) {
   test("DB unique fence and CHECK reject a second intent or false terminal state", async () => {
     await assert.rejects(() => client.linkMaintenanceMigration.create({ data: data(linkId) }), (e) => e.code === "P2002");
     await assert.rejects(() => client.linkMaintenanceMigration.create({ data: { ...data(links[1]), active_link_id: null } }));
+    await assert.rejects(() => client.linkMaintenanceMigration.create({ data: { ...data(links[1]), active_link_id: linkId + 1000000 } }));
+    await assert.rejects(() => client.linkResource.update({ where: { id: linkId }, data: { id: linkId + 1000000 } }), (e) => e.code === "P2003");
     await assert.rejects(() => client.linkMaintenanceMigration.create({ data: { ...data(links[1]), status: "completed" } }));
     await assert.rejects(() => client.linkMaintenanceMigration.create({ data: { ...data(links[1]), status: "cancelled" } }));
     assert.equal(await client.linkMaintenanceMigration.count({ where: { link_id: links[1] } }), 0);

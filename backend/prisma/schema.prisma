@@ -1152,7 +1152,7 @@ model LinkResource {
 model LinkMaintenanceMigration {
   id Int @id @default(autoincrement())
   link_id Int
-  link LinkResource @relation(fields: [link_id], references: [id], onDelete: Restrict)
+  link LinkResource @relation(fields: [link_id], references: [id], onDelete: Restrict, onUpdate: Restrict)
   workspace_id Int
   created_by Int
   idempotency_key String @db.VarChar(36)

@@ -58,7 +58,7 @@ export async function commitLinkMaintenance(workspaceId: number, linkId: number,
     if (await currentMaintenanceIntent(tx, linkId, now)) throw new LinkResourceError("link_maintenance_in_progress");
     const captured = await captureLinkMaintenance(tx, workspaceId, linkId, request, now);
     verifyMaintenanceReceipt(input.receipt, { workspace_id: workspaceId, link_id: linkId,
-      state_token: captured.preview.snapshot.state_token, request_digest: maintenanceRequestDigest(request) }, sealKey(), now);
+      state_token: captured.preview.snapshot.state_token, request_digest: maintenanceRequestDigest(request) }, sealKey(), new Date());
     if (!input.expected_generation) throw new LinkResourceError("link_not_deployed");
     if (captured.preview.runtime.state !== "ready") throw new LinkResourceError("link_runtime_unconfirmed");
     if (!Object.values(captured.preview.changes).some(Boolean)) throw new LinkResourceError("link_no_change");

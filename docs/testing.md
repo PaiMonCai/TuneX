@@ -20,6 +20,8 @@
 
 真实 MySQL 新增 `backend/tests/link-maintenance.test.mjs` 五项，用 CI 现有专用 scratch DB 执行，覆盖行锁并发幂等、唯一活计划/CHECK、终态 CAS、事件失败原子回滚、逻辑过期及零部署/租约写入。本机没有 MySQL/Redis/Docker，未本地执行此类集成。
 
+首轮 `1704a3b` / [CI 38010795643](https://github.com/PaiMonCai/TuneX/actions/runs/38010795643) 在 MySQL 迁移阶段失败：所有权 CHECK 不允许关联列使用外键 ON UPDATE CASCADE（3823），实际 payload 尚未执行。修复为不可变 Link ID 的 ON UPDATE RESTRICT，保留 CHECK，并新增错 owner/关联 ID 修改拒绝回归；必须按修复后的 SHA 重新验收。
+
 `abcd-links.py` 扩展真实 API/DB/Worker 检查：伪造回执、同 UUID 并发、元数据脱敏、全部冲突写入、Worker 重启后实际恢复服务重验、取消 CAS/终态重试，以及 A/B held TCP 和固定 B UDP 目标 socket。显式调用生产恢复服务保证确定性，不声称已经观察到特定 cron tick。五分钟逻辑过期由独立 MySQL/单测验收，不冒称实网等待了五分钟。候选切换、双代、密钥失效/端口释放/跨代统计仍未验收。
 
 ## F5 影响预览首切片
