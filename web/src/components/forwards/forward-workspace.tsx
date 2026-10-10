@@ -921,12 +921,11 @@ export function ForwardWorkspace() {
             canManageNodes={canManageNodes}
             onBusyChange={setFxpCreateBusy}
             onClose={() => setCreateChoiceOpen(false)}
-            onCreated={(_linkId, forwardId) => {
+            onCreated={(_linkId) => {
               setCreateChoiceOpen(false);
               setPage(1);
               reloadList();
               toast.success(locale === "en" ? "Encrypted forwarding rule created" : "加密转发规则已创建");
-              router.push(`/forwards/${forwardId}`);
             }}
           /> : <p role="alert">{PERMISSION_DENIED}</p>}
         </DialogContent>
