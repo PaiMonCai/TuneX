@@ -47,8 +47,8 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
   onCopy: (forward: PortForward) => void; onDelete: (forward: PortForward) => void;
 }) {
   return (
-    <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)]">
-      <Table>
+    <div className="overflow-x-auto rounded-[var(--radius)] border border-[var(--border)] bg-[var(--card)]">
+      <Table className="min-w-[1200px]">
         <TableHeader><TableRow>
           <TableHead className="w-10"><input type="checkbox" className="size-4 cursor-pointer" data-testid="forward-select-all"
             aria-label={text("forward.selectAll")} disabled={!canUpdateAny || forwards.length === 0}
@@ -71,14 +71,14 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
               <TableCell><input type="checkbox" className="size-4 cursor-pointer" data-testid={`forward-select-${forward.id}`}
                 aria-label={text("forward.selectRow")} disabled={selectionBusy || !(canSelect ? canSelect(forward) : canUpdate(forward))} checked={selectedIds.has(Number(forward.id))}
                 onChange={(event) => onSelect(Number(forward.id), event.target.checked)} /></TableCell>
-              <TableCell className="font-medium"><Link href={"/forwards/" + forward.id} className="hover:underline">{forward.name}</Link></TableCell>
+              <TableCell className="min-w-40 max-w-60 break-words font-medium"><Link href={"/forwards/" + forward.id} className="hover:underline">{forward.name}</Link></TableCell>
               <TableCell><Badge variant={forward.mode === "relay" ? "outline" : "secondary"}>{forward.mode === "relay" ? t("forward.relay") : t("forward.direct")}</Badge></TableCell>
-              <TableCell><ForwardProtocolBadge forward={forward} />{forwardTransportFor(forward.protocol) === "mixed" ? <p data-testid="forward-row-mixed" className="text-xs text-[var(--muted-foreground)]">{locale === "en" ? "TCP streams + UDP mappings · one shared budget" : "TCP 流 + UDP 映射 · 一条共享预算"}</p> : null}</TableCell>
-              <TableCell>{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
-              <TableCell>{forward.egress_node?.node_id ?? "—"}</TableCell>
-              <TableCell className="font-mono text-xs">{forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`}</TableCell>
-              <TableCell className="font-mono text-xs">{forwardAccessAddress(forward) ?? t("forward.addressPending")}</TableCell>
-              <TableCell className="font-mono text-xs">{forward.target_host ?? "—"}{forward.target_port ? ":" + forward.target_port : ""}</TableCell>
+              <TableCell className="min-w-32"><ForwardProtocolBadge forward={forward} />{forwardTransportFor(forward.protocol) === "mixed" ? <p data-testid="forward-row-mixed" className="text-xs text-[var(--muted-foreground)]">{locale === "en" ? "TCP streams + UDP mappings · one shared budget" : "TCP 流 + UDP 映射 · 一条共享预算"}</p> : null}</TableCell>
+              <TableCell className="whitespace-nowrap">{forward.ingress_node?.node_id ?? forward.ingress_node_id}</TableCell>
+              <TableCell className="whitespace-nowrap">{forward.egress_node?.node_id ?? "—"}</TableCell>
+              <TableCell className="whitespace-nowrap font-mono text-xs">{forward.listen_port == null ? t("forward.addressPending") : `:${forward.listen_port}`}</TableCell>
+              <TableCell className="whitespace-nowrap font-mono text-xs">{forwardAccessAddress(forward) ?? t("forward.addressPending")}</TableCell>
+              <TableCell className="whitespace-nowrap font-mono text-xs">{forward.target_host ?? "—"}{forward.target_port ? ":" + forward.target_port : ""}</TableCell>
               <TableCell><div className="flex flex-col gap-1">
                 <Badge variant={forwardProductBadgeVariant(product.state)} data-testid={`forward-status-${forward.id}`}>{t(`forward.product.${product.state}`)}</Badge>
                 {forward.apply_error ? <span className="max-w-52 text-xs text-[var(--destructive)]">
@@ -86,8 +86,8 @@ export function ForwardTable({ forwards, loading, sort, order, selectedIds, allP
                   <span className="block truncate font-mono opacity-70">{forward.apply_error}</span>
                 </span> : null}
               </div></TableCell>
-              <TableCell className="text-xs text-[var(--muted-foreground)]">{formatDateTime(forward.created_at)}</TableCell>
-              <TableCell><DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" disabled={actionBusy === Number(forward.id)}><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger>
+              <TableCell className="whitespace-nowrap text-xs text-[var(--muted-foreground)]">{formatDateTime(forward.created_at)}</TableCell>
+              <TableCell><DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" aria-label={`${t("common.actions")}: ${forward.name}`} disabled={actionBusy === Number(forward.id)}><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   {canUpdate(forward) && forward.apply_status === "error" ? <DropdownMenuItem onClick={() => onAction(forward, "retry")}>{t("forward.retry")}</DropdownMenuItem> : null}
                   {canUpdate(forward) && forward.apply_status === "active" ? <DropdownMenuItem onClick={() => onAction(forward, "suspend")}>{t("forward.suspend")}</DropdownMenuItem> : null}

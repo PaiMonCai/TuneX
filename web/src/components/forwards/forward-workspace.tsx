@@ -739,6 +739,7 @@ export function ForwardWorkspace() {
   return (
     <div className="flex flex-col gap-5">
       {!can("forward:update") && <p className="text-sm text-[var(--muted-foreground)]">只读：当前有效权限不允许修改转发。</p>}
+      <ForwardSummaryCards summary={summary} loading={loading} t={t} />
       <ForwardToolbar
         mode={modeFilter} status={statusFilter} ingress={ingressFilter} egress={egressFilter}
         keyword={keywordInput} ingressNodes={ingressNodes} egressNodes={egressNodes} canCreate={canCreate}
@@ -749,9 +750,13 @@ export function ForwardWorkspace() {
         onEgress={(value) => changeFilter(setEgressFilter, value)}
         onKeyword={setKeywordInput}
         onCreate={openCreate}
+        onRefresh={reloadList}
+        loading={loading}
+        onReset={() => {
+          setKeywordInput(""); setKeyword(""); setModeFilter("all"); setStatusFilter("all");
+          setIngressFilter("all"); setEgressFilter("all"); setPage(1); clearSelection();
+        }}
       />
-
-      <ForwardSummaryCards summary={summary} loading={loading} t={t} />
       {!loading && !error && forwards.filter((forward) => linkedForwardHref(forward)).map((forward) =>
         <LinkedForwardGuide key={String(forward.id)} forward={forward} locale={locale} />)}
 

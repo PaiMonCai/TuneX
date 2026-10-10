@@ -22,6 +22,8 @@ export async function runF5IntentBrowserChecks() {
   check(document.body.textContent.includes("no port reservation, key generation or execution"), "save action explicitly promises only durable intent");
   await click("Save maintenance plan (no cutover)");
   await until(() => button("Cancel maintenance plan"), "persisted cancel");
+  // History can finish reading before the write lifecycle's follow-up read and notice.
+  await until(() => document.body.textContent.includes("Maintenance plan saved; no cutover has executed."), "save completion notice");
   check(document.body.textContent.includes("Awaiting executor (no automatic cutover)"), "history does not fabricate a successful cutover");
   check(document.body.textContent.includes("Maintenance plan saved; no cutover has executed."), "write notice separates saved intent from execution");
   let snapshot = await state();
@@ -33,6 +35,8 @@ export async function runF5IntentBrowserChecks() {
   check(blocked.length > 0 && blocked.every((b) => b.disabled), "pending intent disables conflicting detail actions");
   await click("Toggle test permission");
   await until(() => !button("Cancel maintenance plan"), "read-only history");
+  // Permission changes remount the scoped view; wait for its history read to finish.
+  await until(() => document.body.textContent.includes("Awaiting executor (no automatic cutover)"), "read-only history loaded");
   check(document.body.textContent.includes("Awaiting executor (no automatic cutover)"), "read-only actor retains scoped history without a cancellation control");
   await click("Toggle test permission"); await until(() => button("Cancel maintenance plan"), "permission restored");
   await click("Switch test workspace");
@@ -41,6 +45,7 @@ export async function runF5IntentBrowserChecks() {
   await click("Switch test workspace"); await until(() => button("Cancel maintenance plan"), "scope restored");
   await click("Cancel maintenance plan");
   await until(() => document.body.textContent.includes("Plan cancelled") && !button("Cancel maintenance plan"), "cancelled history");
+  await until(() => document.body.textContent.includes("Maintenance plan cancelled; the running Link is unchanged."), "cancel completion notice");
   snapshot = await state();
   const cancellation = snapshot.calls.filter((c) => c.path.endsWith("/cancel")).at(-1);
   check(cancellation.method === "POST" && cancellation.workspaceId === 5 && cancellation.body.expected_state_version === 1, "cancel sends the persisted state CAS through the same transport");

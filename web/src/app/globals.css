@@ -3,27 +3,29 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --background: oklch(0.99 0.002 250);
-  --foreground: oklch(0.21 0.02 260);
+  --background: oklch(0.975 0.003 260);
+  --foreground: oklch(0.2 0.012 260);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.21 0.02 260);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.21 0.02 260);
-  --primary: oklch(0.55 0.19 258);
+  --primary: oklch(0.22 0.012 260);
   --primary-foreground: oklch(0.99 0 0);
   --secondary: oklch(0.96 0.005 260);
   --secondary-foreground: oklch(0.3 0.02 260);
   --muted: oklch(0.96 0.005 260);
-  --muted-foreground: oklch(0.55 0.02 260);
-  --accent: oklch(0.95 0.02 258);
-  --accent-foreground: oklch(0.3 0.04 258);
+  --muted-foreground: oklch(0.49 0.016 260);
+  --accent: oklch(0.94 0.008 260);
+  --accent-foreground: oklch(0.22 0.012 260);
   --destructive: oklch(0.58 0.22 27);
   --destructive-foreground: oklch(0.99 0 0);
   --success: oklch(0.6 0.16 150);
-  --border: oklch(0.92 0.005 260);
-  --input: oklch(0.92 0.005 260);
+  --border: oklch(0.9 0.006 260);
+  --input: oklch(0.88 0.008 260);
   --ring: oklch(0.55 0.19 258);
-  --radius: 0.65rem;
+  --sidebar: oklch(0.988 0.002 260);
+  --sidebar-accent: oklch(0.935 0.008 260);
+  --radius: 0.75rem;
   /* 图表分类色板（OKLCH）：供 recharts 等纯客户端图表通过 var(--chart-n) 取色 */
   --chart-1: oklch(0.55 0.19 258);
   --chart-2: oklch(0.62 0.16 150);
@@ -34,26 +36,28 @@
 }
 
 .dark {
-  --background: oklch(0.19 0.015 260);
+  --background: oklch(0.145 0.01 260);
   --foreground: oklch(0.96 0.005 260);
-  --card: oklch(0.23 0.018 260);
+  --card: oklch(0.19 0.012 260);
   --card-foreground: oklch(0.96 0.005 260);
-  --popover: oklch(0.23 0.018 260);
+  --popover: oklch(0.21 0.014 260);
   --popover-foreground: oklch(0.96 0.005 260);
-  --primary: oklch(0.65 0.17 258);
+  --primary: oklch(0.93 0.005 260);
   --primary-foreground: oklch(0.15 0.02 260);
   --secondary: oklch(0.28 0.02 260);
   --secondary-foreground: oklch(0.96 0.005 260);
   --muted: oklch(0.28 0.02 260);
   --muted-foreground: oklch(0.7 0.02 260);
-  --accent: oklch(0.31 0.03 258);
+  --accent: oklch(0.265 0.018 260);
   --accent-foreground: oklch(0.96 0.005 260);
   --destructive: oklch(0.6 0.2 25);
   --destructive-foreground: oklch(0.98 0 0);
   --success: oklch(0.65 0.15 150);
-  --border: oklch(0.3 0.02 260);
-  --input: oklch(0.32 0.02 260);
+  --border: oklch(0.29 0.015 260);
+  --input: oklch(0.32 0.015 260);
   --ring: oklch(0.65 0.17 258);
+  --sidebar: oklch(0.17 0.012 260);
+  --sidebar-accent: oklch(0.25 0.018 260);
   /* 暗色下提高亮度，保证浅色背景上的对比度 */
   --chart-1: oklch(0.68 0.17 258);
   --chart-2: oklch(0.7 0.15 150);
@@ -104,6 +108,35 @@
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
       "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
     -webkit-font-smoothing: antialiased;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+}
+
+@utility console-main {
+  @apply mx-auto w-full min-w-0 max-w-[1600px] flex-1 p-3 sm:p-6 xl:p-8;
+}
+
+@utility console-toolbar {
+  @apply flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--card)] p-3 sm:p-4;
+}
+
+@utility console-segmented {
+  @apply inline-flex max-w-full items-center gap-1 rounded-lg bg-[var(--muted)] p-1;
+}
+
+@utility console-stat-icon {
+  @apply grid size-10 shrink-0 place-items-center rounded-xl border border-[var(--border)] bg-[var(--background)] text-[var(--muted-foreground)];
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }
 

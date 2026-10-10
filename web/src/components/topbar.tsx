@@ -40,11 +40,11 @@ export function Topbar({
   return (
     <header
       data-console={variant}
-      className="sticky top-0 z-20 flex h-14 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--background)]/85 px-4 backdrop-blur supports-[backdrop-filter]:bg-[var(--background)]/70 lg:px-6"
+      className="sticky top-0 z-20 flex min-h-16 flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-[var(--border)] bg-[var(--card)]/95 px-3 py-3 backdrop-blur sm:flex-nowrap sm:px-6 lg:px-8"
     >
-      <div className="min-w-0 pl-12 lg:pl-0">
+      <div className="min-w-0 flex-1 pl-11 lg:pl-0">
         <div className="flex items-center gap-2">
-          <h1 className="truncate text-base font-semibold leading-tight" data-testid="page-title">
+          <h1 className="truncate text-base font-semibold tracking-tight sm:text-lg" data-testid="page-title">
             {title}
           </h1>
           {isAdmin && (
@@ -66,14 +66,14 @@ export function Topbar({
           </p>
         )}
       </div>
-      <div className="flex shrink-0 items-center gap-1">
+      <div className="flex min-w-0 max-w-full shrink-0 items-center gap-1 max-sm:w-full" data-testid="topbar-actions">
         {!isAdmin && <WorkspaceSwitcher />}
         <LocaleSwitcher />
         <ThemeToggle />
         <span aria-hidden="true" className="mx-1 hidden h-5 w-px bg-[var(--border)] sm:block" />
         {isAdmin ? (
           <Button variant="outline" size="sm" asChild>
-            <Link href="/dashboard">
+            <Link href="/dashboard" aria-label={t("admin.backToSite")}>
               <ExternalLink className="size-4" />
               <span className="hidden sm:inline">{t("admin.backToSite")}</span>
             </Link>
@@ -81,7 +81,7 @@ export function Topbar({
         ) : (
           showAdminEntry && (
             <Button variant="outline" size="sm" asChild data-testid="topbar-admin-entry">
-              <Link href="/admin">
+              <Link href="/admin" aria-label={t("common.admin")}>
                 <LayoutGrid className="size-4" />
                 <span className="hidden sm:inline">{t("common.admin")}</span>
               </Link>

@@ -58,7 +58,7 @@ export function WorkspaceSwitcher() {
           <Button
             variant="outline"
             size="sm"
-            className="max-w-[13rem] gap-1.5"
+            className="max-w-[10rem] gap-1.5 sm:max-w-[13rem]"
             data-testid="workspace-switcher"
             aria-label={t("workspace.switch")}
           >

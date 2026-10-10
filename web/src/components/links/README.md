@@ -4,6 +4,7 @@
 
 ## Public workflows
 
+- The console lists searchable resource cards with deployment status and reference counts, plus a native resource selector. Selecting the current card keeps its detail loaded; active editors and confirmations lock both selection controls. Cards do not infer live readiness from deployment metadata.
 - Create an FXP resource with entry node, exit node and explicit carrier port. Deployment is a separate action.
 - Edit endpoints only before any deployment and with zero references. Deployed resources must be retired before replacement; they cannot leave a remote carrier behind by changing metadata.
 - Rotate keys and retire resources only with zero references. Suspended rules remain references.

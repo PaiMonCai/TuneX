@@ -1,1 +1,21 @@
-import { Card, CardContent } from "@/components/ui/card";import { formatBytes } from "@/lib/utils";import type { ForwardSummary } from "@/lib/types";type Translate=(key:string)=>string;export function ForwardSummaryCards({summary,loading,t}:{summary:ForwardSummary|null;loading:boolean;t:Translate}){return <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Card><CardContent className="p-4"><div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTotal")}</div><div className="mt-1 text-2xl font-semibold">{summary?.total??(loading?"—":0)}</div><div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.direct")} {summary?.direct??0} · {t("forward.relay")} {summary?.relay??0}</div></CardContent></Card><Card><CardContent className="p-4"><div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorActive")}</div><div className="mt-1 text-2xl font-semibold">{summary?.active??(loading?"—":0)}</div><div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.statusPending")} {summary?.pending??0} · {t("forward.statusSuspended")} {summary?.suspended??0}</div></CardContent></Card><Card><CardContent className="p-4"><div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttention")}</div><div className="mt-1 text-2xl font-semibold">{summary?.error??(loading?"—":0)}</div><div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorAttentionHint")}</div></CardContent></Card><Card><CardContent className="p-4"><div className="text-xs text-[var(--muted-foreground)]">{t("forward.monitorTraffic")}</div><div className="mt-1 text-2xl font-semibold">{formatBytes(summary?.traffic??0)}</div><div className="mt-1 text-xs text-[var(--muted-foreground)]">{t("forward.monitorTrafficHint")}</div></CardContent></Card></div>}
+import { Activity, ArrowRightLeft, CircleAlert, Waves } from "lucide-react";
+import { StatCard } from "@/components/stat-card";
+import { formatBytes } from "@/lib/utils";
+import type { ForwardSummary } from "@/lib/types";
+
+export function ForwardSummaryCards({ summary, loading, t }: {
+  summary: ForwardSummary | null; loading: boolean; t: (key: string) => string;
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-3 min-[400px]:grid-cols-2 xl:grid-cols-4" aria-busy={loading && !summary}>
+      <StatCard title={t("forward.monitorTotal")} icon={ArrowRightLeft} value={summary ? String(summary.total) : "—"}
+        hint={summary ? `${t("forward.direct")} ${summary.direct} · ${t("forward.relay")} ${summary.relay}` : undefined} />
+      <StatCard title={t("forward.monitorActive")} icon={Activity} value={summary ? String(summary.active) : "—"}
+        hint={summary ? `${t("forward.statusPending")} ${summary.pending} · ${t("forward.statusSuspended")} ${summary.suspended}` : undefined} />
+      <StatCard title={t("forward.monitorAttention")} icon={CircleAlert} value={summary ? String(summary.error) : "—"}
+        hint={t("forward.monitorAttentionHint")} />
+      <StatCard title={t("forward.monitorTraffic")} icon={Waves} value={summary ? formatBytes(summary.traffic) : "—"}
+        hint={t("forward.monitorTrafficHint")} />
+    </div>
+  );
+}

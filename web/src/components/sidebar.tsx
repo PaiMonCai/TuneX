@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { LogOut, Menu, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { LogOut, Menu, PanelLeftClose, PanelLeftOpen, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { NavIcon } from "@/components/nav-icon";
 import { useI18n } from "@/components/providers";
@@ -35,7 +35,22 @@ export function Sidebar({
   const router = useRouter();
   const { t, locale: cur } = useI18n();
   const [open, setOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const mobilePanel = useRef<HTMLDivElement>(null);
+  const menuButton = useRef<HTMLButtonElement>(null);
   const isAdmin = consoleId === "admin";
+  const collapseLabel = cur === "zh" ? "收起侧栏" : "Collapse sidebar";
+  const expandLabel = cur === "zh" ? "展开侧栏" : "Expand sidebar";
+
+  useEffect(() => {
+    try { setCollapsed(window.localStorage.getItem("tunex.sidebar.collapsed") === "true"); } catch { /* Storage is optional. */ }
+  }, []);
+
+  function toggleCollapsed() {
+    const next = !collapsed;
+    setCollapsed(next);
+    try { window.localStorage.setItem("tunex.sidebar.collapsed", String(next)); } catch { /* Storage is optional. */ }
+  }
 
   // 路由变化后自动收起移动端抽屉
   useEffect(() => {
@@ -45,15 +60,33 @@ export function Sidebar({
   // 抽屉打开时：Esc 关闭 + 锁定背景滚动
   useEffect(() => {
     if (!open) return;
+    const desktop = window.matchMedia("(min-width: 1024px)");
+    const closeOnDesktop = () => { if (desktop.matches) setOpen(false); };
+    desktop.addEventListener("change", closeOnDesktop);
+    const content = document.querySelector<HTMLElement>("[data-console-content]");
+    const previousInert = content?.inert ?? false;
+    if (content) content.inert = true;
+    mobilePanel.current?.querySelector<HTMLElement>("button, a[href]")?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
+      if (e.key !== "Tab") return;
+      const items = mobilePanel.current?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled), [tabindex="0"]');
+      if (!items?.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     };
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = prevOverflow;
+      if (content) content.inert = previousInert;
       window.removeEventListener("keydown", onKey);
+      desktop.removeEventListener("change", closeOnDesktop);
+      if (!desktop.matches) menuButton.current?.focus();
+      else content?.querySelector<HTMLElement>("a[href], button")?.focus();
     };
   }, [open]);
 
@@ -69,13 +102,13 @@ export function Sidebar({
   }
 
   const brand = (
-    <div className={cn("flex items-center gap-2 px-3", isAdmin ? "py-3" : "py-4")}>
-      <div className="grid size-8 place-items-center rounded-md bg-[var(--primary)] text-sm font-bold text-[var(--primary-foreground)]">
+    <div className={cn("flex h-16 shrink-0 items-center gap-3 border-b border-[var(--border)] px-5", collapsed && "lg:justify-center lg:px-2")}>
+      <div className="grid size-9 shrink-0 place-items-center rounded-xl bg-[var(--primary)] text-sm font-bold tracking-tight text-[var(--primary-foreground)]">
         TX
       </div>
-      <div className="leading-tight">
-        <div className="text-sm font-semibold">{t("common.siteName")}</div>
-        <div className="text-[11px] text-[var(--muted-foreground)]">
+      <div className={cn("min-w-0 leading-tight", collapsed && "lg:sr-only")}>
+        <div className="text-base font-semibold tracking-tight">{t("common.siteName")}</div>
+        <div className="mt-0.5 truncate text-[11px] text-[var(--muted-foreground)]">
           {isAdmin ? t("admin.title") : t("common.tagline")}
         </div>
       </div>
@@ -92,6 +125,7 @@ export function Sidebar({
       return (
         <span
           key={item.href}
+          aria-label={label}
           aria-disabled="true"
           data-nav-href={item.href}
           data-nav-group={group.id}
@@ -104,12 +138,13 @@ export function Sidebar({
           )}
           className={cn(
             "relative flex cursor-not-allowed items-center gap-2.5 rounded-md px-3 text-sm text-[var(--muted-foreground)]/60",
-            isAdmin ? "py-1.5" : "py-2",
+            "min-h-10 py-2",
+            collapsed && "lg:justify-center lg:px-0",
           )}
         >
           <NavIcon name={item.iconKey} className="size-4 shrink-0" />
-          <span className="truncate">{label}</span>
-          <span className="ml-auto rounded-sm border border-[var(--border)] px-1 text-[10px] leading-4">
+          <span className={cn("truncate", collapsed && "lg:sr-only")}>{label}</span>
+          <span className={cn("ml-auto rounded-sm border border-[var(--border)] px-1 text-[10px] leading-4", collapsed && "lg:hidden")}>
             {localizedLabel(cur, "console.planned", "未开放", "Soon")}
           </span>
         </span>
@@ -120,35 +155,33 @@ export function Sidebar({
       <Link
         key={item.href}
         href={item.href}
+        aria-label={label}
+        title={collapsed ? label : undefined}
         aria-current={active ? "page" : undefined}
         data-nav-href={item.href}
         data-nav-group={group.id}
         data-nav-status="available"
         onClick={() => setOpen(false)}
         className={cn(
-          "relative flex items-center gap-2.5 rounded-md px-3 text-sm transition-colors",
-          isAdmin ? "py-1.5" : "py-2",
+          "relative flex min-h-10 items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
+          collapsed && "lg:justify-center lg:px-0",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]",
           active
-            ? "bg-[var(--accent)] font-medium text-[var(--accent-foreground)]"
+            ? "bg-[var(--sidebar-accent)] font-semibold text-[var(--foreground)]"
             : "text-[var(--muted-foreground)] hover:bg-[var(--muted)] hover:text-[var(--foreground)]",
         )}
       >
-        {active && (
-          <span
-            aria-hidden="true"
-            className="absolute inset-y-1.5 -left-2 w-0.5 rounded-full bg-[var(--primary)]"
-          />
-        )}
-        <NavIcon name={item.iconKey} className="size-4 shrink-0" />
-        <span className="truncate">{label}</span>
+        <NavIcon name={item.iconKey} className="size-[18px] shrink-0" />
+        <span className={cn("truncate", collapsed && "lg:sr-only")}>{label}</span>
       </Link>
     );
   };
 
   const renderNav = (testId: string) => (
     <nav
-      className="flex flex-1 flex-col gap-0.5 overflow-y-auto px-2 py-1"
+      className={cn("flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-3 py-4", collapsed && "lg:px-2")}
+      id={testId}
+      aria-label={isAdmin ? t("admin.title") : t("common.menu")}
       data-testid={testId}
       data-lang={locale}
       data-console={consoleId}
@@ -159,8 +192,8 @@ export function Sidebar({
           {!group.plain && (
             <div
               className={cn(
-                "px-3 pt-3 text-[10px] font-medium tracking-wide text-[var(--muted-foreground)]",
-                isAdmin ? "uppercase" : "",
+                "px-3 pb-1 text-[11px] font-medium text-[var(--muted-foreground)]",
+                collapsed && "lg:sr-only",
               )}
             >
               {navGroupLabel(locale, group)}
@@ -173,33 +206,36 @@ export function Sidebar({
   );
 
   const footer = (
-    <div className="border-t border-[var(--border)] p-3">
-      <div className="mb-2 flex items-center gap-2 px-1">
+    <div className={cn("shrink-0 border-t border-[var(--border)] p-3", collapsed && "lg:px-2")}>
+      <div className={cn("mb-2 flex items-center gap-3 rounded-lg px-1 py-2", collapsed && "lg:justify-center")}>
         <div className="grid size-7 place-items-center rounded-full bg-[var(--muted)] text-xs font-medium">
           {user.email.slice(0, 1).toUpperCase()}
         </div>
-        <div className="min-w-0 flex-1">
+        <div className={cn("min-w-0 flex-1", collapsed && "lg:sr-only")}>
           <div className="truncate text-xs font-medium">{user.email}</div>
           <div className="text-[11px] text-[var(--muted-foreground)]">
-            ¥{user.balance.toFixed(2)}
-            {user.super_admin ? " · admin" : ""}
+            {process.env.NEXT_PUBLIC_PAYMENTS_ENABLED === "true" ? `¥${user.balance.toFixed(2)}` : user.super_admin ? t("common.admin") : t("common.tagline")}
           </div>
         </div>
       </div>
-      <Button variant="ghost" size="sm" className="w-full justify-start" onClick={logout} data-testid="logout">
+      <Button variant="ghost" size="sm" className={cn("w-full justify-start", collapsed && "lg:justify-center lg:px-0")} onClick={logout} data-testid="logout" aria-label={t("common.logout")} title={collapsed ? t("common.logout") : undefined}>
         <LogOut className="size-4" />
-        {t("common.logout")}
+        <span className={cn(collapsed && "lg:sr-only")}>{t("common.logout")}</span>
       </Button>
     </div>
   );
 
   return (
     <>
+      <a href="#console-main" className="sr-only fixed left-4 top-4 z-[60] rounded-lg bg-[var(--card)] p-3 text-sm shadow-lg focus:not-sr-only focus:outline-2 focus:outline-[var(--ring)]">
+        {cur === "zh" ? "跳至主要内容" : "Skip to content"}
+      </a>
       {/* 移动端菜单按钮 */}
       <Button
         variant="ghost"
         size="icon"
-        className="fixed left-3 top-2.5 z-40 lg:hidden"
+        ref={menuButton}
+        className="fixed left-3 top-3 z-40 lg:hidden"
         aria-expanded={open}
         aria-controls="app-sidebar-mobile"
         // 图标按钮没有可见文字：这个可访问名称就是它的全部语义，必须跟随语言
@@ -214,28 +250,39 @@ export function Sidebar({
       <aside
         data-testid="sidebar"
         data-nav-console={consoleId}
+        data-collapsed={collapsed}
         className={cn(
-          "hidden shrink-0 flex-col border-r border-[var(--border)] bg-[var(--card)] lg:flex",
-          isAdmin ? "w-64" : "w-60",
+          "sticky top-0 hidden h-svh shrink-0 flex-col border-r border-[var(--border)] bg-[var(--sidebar)] transition-[width] duration-200 motion-reduce:transition-none lg:flex",
+          collapsed ? "w-[76px]" : "w-64",
         )}
       >
         {brand}
         {renderNav("sidebar-nav")}
+        <div className="px-3 pb-3">
+          <Button variant="ghost" size="sm" onClick={toggleCollapsed} className={cn("w-full justify-start text-[var(--muted-foreground)]", collapsed && "justify-center px-0")}
+            aria-label={collapsed ? expandLabel : collapseLabel} title={collapsed ? expandLabel : collapseLabel}
+            aria-expanded={!collapsed} aria-controls="sidebar-nav" data-testid="sidebar-collapse">
+            {collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+            {!collapsed && <span>{collapseLabel}</span>}
+          </Button>
+        </div>
         {footer}
       </aside>
 
       {/* 移动端侧栏 */}
       {open && (
-        <div className="fixed inset-0 z-30 flex lg:hidden">
+        <div className="fixed inset-0 z-50 flex lg:hidden">
           <div
             id="app-sidebar-mobile"
+            ref={mobilePanel}
             role="dialog"
             aria-modal="true"
+            aria-label={t("common.menu")}
             className={cn(
-              "flex flex-col border-r border-[var(--border)] bg-[var(--card)] shadow-xl",
-              isAdmin ? "w-72" : "w-64",
+              "relative flex h-svh w-72 max-w-[85vw] flex-col border-r border-[var(--border)] bg-[var(--sidebar)] shadow-xl",
             )}
           >
+            <Button variant="ghost" size="icon" className="absolute right-2 top-3" aria-label={t("common.closeMenu")} onClick={() => setOpen(false)}><X /></Button>
             {brand}
             {renderNav("sidebar-nav-mobile")}
             {footer}
