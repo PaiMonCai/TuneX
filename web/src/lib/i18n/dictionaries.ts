@@ -402,7 +402,13 @@ export const zh = {
   },
   forward: {
     title: "转发管理",
-    subtitle: "统一管理转发服务；节点提供网络能力，路径决定流量怎么走",
+    subtitle: "统一查看普通与加密转发；在创建时选择传输方式，节点与加密连接在网络资源中管理"
+    createForward: "创建转发",
+    nativeType: "普通转发",
+    nativeTypeHint: "支持直连和自定义节点路径；传统节点间中继不等于加密。",
+    encryptedType: "加密转发（FXP）",
+    encryptedTypeHint: "复用两节点之间的加密连接；规则由对应 Link 托管。",
+    emptyUnifiedHint: "同一列表查看全部业务规则；创建时选择普通转发或加密转发。",
     createDirect: "新建直连",
     createRelay: "新建自定义路径",
     direct: "直连",
@@ -1536,7 +1542,13 @@ export const en: Dict = {
   },
   forward: {
     title: "Forward Management",
-    subtitle: "Manage forward services in one place; nodes provide network capacity and the path decides how traffic moves",
+    subtitle: "Manage native and encrypted forwarding rules together; choose the transport when creating a forward"
+    createForward: "Create forward",
+    nativeType: "Native forward",
+    nativeTypeHint: "Direct or custom node path. Traditional relay hops are not automatically encrypted.",
+    encryptedType: "Encrypted forward (FXP)",
+    encryptedTypeHint: "Reuse an encrypted two-node link; the Link owns rule deployment and actions.",
+    emptyUnifiedHint: "View all business rules here. Choose native or encrypted forwarding when creating.",
     createDirect: "New direct forward",
     createRelay: "New custom path",
     direct: "Direct",
